@@ -1,0 +1,8 @@
+*.o
+callgrind.*
+.DS_Store
+build/*
+database/*
+*.sublime-workspace
+*.swp
+alpaca.key

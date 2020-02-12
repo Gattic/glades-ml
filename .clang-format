@@ -1,0 +1,19 @@
+---
+Language: Cpp
+Standard: Cpp03
+BasedOnStyle: LLVM
+ColumnLimit: 100
+AccessModifierOffset: -4
+IndentWidth: 4
+TabWidth: 4
+UseTab: Always
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: None
+DerivePointerAlignment: false
+PointerAlignment: Left
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: true
+  AfterControlStatement: true
+  AfterFunction: true
+  BeforeElse: true
