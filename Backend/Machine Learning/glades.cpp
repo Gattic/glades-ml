@@ -15,9 +15,9 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "glades.h"
-#include "../../include/Backend/Database/gtable.h"
-#include "../../include/Backend/Database/gtype.h"
 #include "../../main.h"
+#include "Backend/Database/gtable.h"
+#include "Backend/Database/gtype.h"
 #include "GMath/gmath.h"
 #include "RNN.h"
 #include "State/layer.h"
@@ -27,12 +27,6 @@
 #include "network.h"
 
 using namespace glades;
-
-std::map<std::string, glades::MetaNetwork*>* glades::metaNets =
-	new std::map<std::string, glades::MetaNetwork*>();
-std::map<std::string, glades::NNetwork*>* glades::neuralNets =
-	new std::map<std::string, glades::NNetwork*>();
-pthread_mutex_t* glades::nnetworkMutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
 
 bool glades::doesDatabaseExist()
 {
@@ -56,65 +50,8 @@ void glades::createDatabase()
 void glades::init()
 {
 	// initialize the mutex
-	pthread_mutex_init(getNNetworkMutex(), NULL);
 	if (!doesDatabaseExist())
 		createDatabase();
-}
-
-/*!
- * @brief cleanup glades
- * @details destroy the old metaNets
- */
-void glades::cleanup()
-{
-	pthread_mutex_lock(getNNetworkMutex());
-	std::map<std::string, glades::MetaNetwork*>::iterator itr = metaNets->begin();
-	for (; itr != metaNets->end(); ++itr)
-		delete itr->second;
-	metaNets->clear();
-	pthread_mutex_unlock(getNNetworkMutex());
-
-	// destroy the neural network mutex
-	pthread_mutex_destroy(nnetworkMutex);
-	free(nnetworkMutex);
-}
-
-/*!
- * @brief get neural net mutex
- * @details retrieves glades' neural network mutex
- * @return the neural network mutex
- */
-pthread_mutex_t* glades::getNNetworkMutex()
-{
-	return nnetworkMutex;
-}
-
-glades::NNetwork* glades::getNeuralNetwork(const std::string& netName)
-{
-	glades::NNetwork* cNetwork = new glades::NNetwork();
-	if (!cNetwork->load(netName))
-	{
-		char buffer[256];
-		sprintf(buffer, "Unable to load \"%s\"", netName.c_str());
-		puts(buffer);
-		return NULL;
-	}
-
-	return cNetwork;
-}
-
-glades::RNN* glades::getRNN(const std::string& netName)
-{
-	glades::RNN* cNetwork = new glades::RNN();
-	if (!cNetwork->load(netName))
-	{
-		char buffer[256];
-		sprintf(buffer, "Unable to load \"%s\"", netName.c_str());
-		puts(buffer);
-		return NULL;
-	}
-
-	return cNetwork;
 }
 
 bool glades::saveNeuralNetwork(glades::NNetwork* newNet)
@@ -131,46 +68,7 @@ bool glades::saveNeuralNetwork(glades::NNetwork* newNet)
 		return false;
 	}
 
-	// Add the Neural net in container
-	(*neuralNets)[newNet->getName()] = newNet;
-	char buffer[256];
-	sprintf(buffer, "Saved \"%s\"", newNet->getName().c_str());
 	return true;
-}
-
-/*!
- * @brief add a MetaNetwork
- * @details adds a MetaNetwork to glades' existing metaNets
- * @param newNet the MetaNetwork to add
- */
-void glades::addMetaNetwork(glades::MetaNetwork* newNet)
-{
-	if (newNet)
-	{
-		std::string netName = newNet->getName();
-		if (metaNets->find(netName) == metaNets->end())
-		{
-			pthread_mutex_lock(getNNetworkMutex());
-			metaNets->insert(std::pair<std::string, glades::MetaNetwork*>(netName, newNet));
-			pthread_mutex_unlock(getNNetworkMutex());
-		}
-	}
-}
-
-/*!
- * @brief remove a MetaNetwork
- * @details remove a MetaNetwork by name from glades' existing metaNets, if it exists
- * @param netName the name of the MetaNetwork to remove
- */
-void glades::removeMetaNetwork(const std::string& netName)
-{
-	if (metaNets->find(netName) != metaNets->end())
-	{
-		// delete it from the data structure
-		pthread_mutex_lock(getNNetworkMutex());
-		metaNets->erase(metaNets->find(netName));
-		pthread_mutex_unlock(getNNetworkMutex());
-	}
 }
 
 /*!
@@ -196,10 +94,6 @@ glades::MetaNetwork* glades::train(NNInfo* networkInfo, const shmea::GTable& dat
 	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 		subnets[i]->run(dataTable, Arnold, glades::NNetwork::RUN_TRAIN);
-
-	// Add the new metanet to the collection
-	if (cMetaNetwork)
-		glades::addMetaNetwork(cMetaNetwork);
 
 	return cMetaNetwork;
 }
@@ -228,10 +122,6 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, const shmea::GTab
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 		subnets[i]->run(dataTable, Arnold, glades::NNetwork::RUN_TRAIN);
 
-	// Add the new metanet to the collection
-	if (cMetaNetwork)
-		glades::addMetaNetwork(cMetaNetwork);
-
 	return cMetaNetwork;
 }
 
@@ -252,9 +142,6 @@ glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
 	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 		subnets[i]->run(dataTable, Arnold, glades::NNetwork::RUN_TRAIN);
-
-	// Add the new metanet to the collection
-	glades::addMetaNetwork(cMetaNetwork);
 
 	return cMetaNetwork;
 }
@@ -282,10 +169,6 @@ glades::MetaNetwork* glades::test(NNInfo* networkInfo, const shmea::GTable& data
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 		subnets[i]->run(dataTable, NULL, glades::NNetwork::RUN_TEST);
 
-	// Add the new metanet to the collection
-	if (cMetaNetwork)
-		glades::addMetaNetwork(cMetaNetwork);
-
 	return cMetaNetwork;
 }
 
@@ -312,10 +195,6 @@ glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, const shmea::GT
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 		subnets[i]->run(dataTable, NULL, glades::NNetwork::RUN_TEST);
 
-	// Add the new metanet to the collection
-	if (cMetaNetwork)
-		glades::addMetaNetwork(cMetaNetwork);
-
 	return cMetaNetwork;
 }
 
@@ -335,9 +214,6 @@ glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, const shmea
 	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 		subnets[i]->run(dataTable, NULL, glades::NNetwork::RUN_TEST);
-
-	// Add the new metanet to the collection
-	glades::addMetaNetwork(cMetaNetwork);
 
 	return cMetaNetwork;
 }

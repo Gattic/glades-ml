@@ -58,8 +58,14 @@ public:
 
 	~Crypt()
 	{
+		if (eText)
+			free(eText);
 		eText = NULL;
+
+		if (dText)
+			free(dText);
 		dText = NULL;
+
 		size = 0;
 		linesRead = 0;
 		cTime = 0L;

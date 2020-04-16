@@ -28,10 +28,15 @@
 
 namespace GNet {
 
+class GServer;
+class Sockets;
 class newServiceArgs;
 
 class Service
 {
+	friend GServer;
+	friend Sockets;
+
 private:
 	// timestamp variable to store service start and end time
 	static std::string name;
@@ -42,12 +47,14 @@ private:
 	void StartService(newServiceArgs*);
 	void ExitService(newServiceArgs*);
 
+	static void ExecuteService(GServer* serverInstance, const shmea::GList&,
+							   class Instance* = NULL);
+
 public:
 	Service();
 	virtual ~Service();
 
-	static void ExecuteService(const shmea::GList&, class Instance* = NULL);
-	virtual Service* MakeService() const = 0;
+	virtual Service* MakeService(GServer*) const = 0;
 	virtual std::string getName() const = 0;
 };
 };

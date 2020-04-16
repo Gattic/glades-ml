@@ -10,7 +10,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 #Compiler Flags
 set(CMAKE_BUILD_TYPE Debug) # -g
 set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+#set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 #Project
@@ -34,6 +34,7 @@ include(GNUInstallDirs)
 
 #Subdirectories
 include_directories(${CMAKE_SOURCE_DIR})
+include_directories("include")
 include_directories("services")
 add_subdirectory("Backend/Machine Learning")
 

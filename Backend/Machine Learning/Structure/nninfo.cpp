@@ -15,12 +15,12 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "nninfo.h"
-#include "../../../include/Backend/Database/gtable.h"
-#include "../../../include/Backend/Database/gtype.h"
-#include "../../../include/Backend/Database/saveitem.h"
-#include "../../../include/Backend/Database/savelist.h"
-#include "../../../include/Backend/Networking/main.h"
 #include "../../../main.h"
+#include "Backend/Database/gtable.h"
+#include "Backend/Database/gtype.h"
+#include "Backend/Database/saveitem.h"
+#include "Backend/Database/savelist.h"
+#include "Backend/Networking/main.h"
 #include "hiddenlayerinfo.h"
 #include "inputlayerinfo.h"
 #include "layerinfo.h"

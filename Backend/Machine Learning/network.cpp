@@ -18,12 +18,12 @@
 // #include "../../Frontend/GFXUtilities/point2.h"
 // #include "../../Frontend/GPanels/nncreator.h"
 // #include "../../Frontend/GPanels/simulation.h"
-#include "../../include/Backend/Database/GList.h"
-#include "../../include/Backend/Database/gtable.h"
-#include "../../include/Backend/Database/gtype.h"
-#include "../../include/Backend/Database/maxid.h"
-#include "../../include/Backend/Networking/main.h"
 #include "../../main.h"
+#include "Backend/Database/GList.h"
+#include "Backend/Database/gtable.h"
+#include "Backend/Database/gtype.h"
+#include "Backend/Database/maxid.h"
+#include "Backend/Networking/main.h"
 #include "GMath/OHE.h"
 #include "GMath/cmatrix.h"
 #include "GMath/gmath.h"
@@ -38,7 +38,6 @@
 using namespace glades;
 
 // for stopping ml  training instances
-bool glades::NNetwork::caboose = false;
 
 /*!
  * @brief NNetwork constructor
@@ -46,6 +45,7 @@ bool glades::NNetwork::caboose = false;
  */
 glades::NNetwork::NNetwork()
 {
+	running = false;
 	skeleton = NULL;
 	meat = NULL;
 	confusionMatrix = NULL;
@@ -65,6 +65,7 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo)
 	if (!newNNInfo)
 		return;
 
+	running = false;
 	skeleton = NULL;
 	meat = NULL;
 	confusionMatrix = NULL;
@@ -135,8 +136,8 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 	resetGraphs();
 
 	// arbitrary independent var (time dimension)
-	caboose = false;
-	while (!caboose)
+	running = true;
+	while (running)
 	{
 		/*if (DEBUG_ADVANCED)
 			printf("[NN] Expected\tPredicted\tError\t\tError^2\t\tAccuracy\tPrecise\n");*/
@@ -259,7 +260,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 			break;
 
 		// Shut it down?
-		if ((caboose) || (!GNet::getRunning()) || (runType == RUN_TEST))
+		if (runType == RUN_TEST)
 			break;
 	}
 
@@ -283,7 +284,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 	printf("\n");
 
 	// So the network doesnt immediately quit next time and we can prematurely start our net
-	caboose = false;
+	running = false;
 }
 
 void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows, int runType)

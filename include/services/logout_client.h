@@ -23,14 +23,36 @@
 
 class Logout_Client : public GNet::Service
 {
+private:
+	GNet::GServer* serverInstance;
+
 public:
+	Logout_Client()
+	{
+		serverInstance = NULL;
+	}
+
+	Logout_Client(GNet::GServer* newInstance)
+	{
+		serverInstance = newInstance;
+	}
+
+	~Logout_Client()
+	{
+		serverInstance = NULL; // Not ours to delete
+	}
+
 	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
 	{
 		shmea::GList retList;
+
+		if (!serverInstance)
+			return retList;
+
 		printf("[CLOGOUT] %s\n", cInstance->getIP().c_str());
 
 		// delete it from the data structure
-		GNet::removeClientInstance(cInstance);
+		serverInstance->removeClientInstance(cInstance);
 
 		// Clean up the instance
 		cInstance->finish();
@@ -38,9 +60,9 @@ public:
 		return retList;
 	}
 
-	GNet::Service* MakeService() const
+	GNet::Service* MakeService(GNet::GServer* newInstance) const
 	{
-		return new Logout_Client();
+		return new Logout_Client(newInstance);
 	}
 
 	std::string getName() const

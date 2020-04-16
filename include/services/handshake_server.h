@@ -24,11 +24,33 @@
 
 class Handshake_Server : public GNet::Service
 {
+private:
+	GNet::GServer* serverInstance;
+
 public:
+	Handshake_Server()
+	{
+		serverInstance = NULL;
+	}
+
+	Handshake_Server(GNet::GServer* newInstance)
+	{
+		serverInstance = newInstance;
+	}
+
+	~Handshake_Server()
+	{
+		serverInstance = NULL; // Not ours to delete
+	}
+
 	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
 	{
 		// Log the client into the server
 		shmea::GList retList;
+
+		if (!serverInstance)
+			return retList;
+
 		if (data.size() < 1)
 			return retList;
 
@@ -38,7 +60,7 @@ public:
 			cInstance->setName(clientName);
 
 		// generate a new key for the sockets
-		if (cInstance->getIP() != GNet::Sockets::LOCALHOST)
+		// if (cInstance->getIP() != GNet::Sockets::LOCALHOST)
 		{
 			int64_t newKey = GNet::Instance::generateKey();
 
@@ -47,7 +69,8 @@ public:
 			wData.addString("Handshake_Client");
 			wData.addString(cInstance->getName());
 			wData.addLong(newKey);
-			GNet::Sockets::writeConnection(cInstance, cInstance->sockfd, wData, GNet::ACK_TYPE);
+			// GNet::Service::ExecuteService(serverInstance, wData, cInstance);
+			serverInstance->NewService(wData, cInstance, GNet::GServer::ACK_TYPE);
 
 			// Set the new instance key
 			cInstance->setKey(newKey);
@@ -61,9 +84,9 @@ public:
 		return "Handshake_Server";
 	}
 
-	GNet::Service* MakeService() const
+	GNet::Service* MakeService(GNet::GServer* newInstance) const
 	{
-		return new Handshake_Server();
+		return new Handshake_Server(newInstance);
 	}
 };
 
