@@ -17,7 +17,7 @@
 #ifndef _NNETWORK
 #define _NNETWORK
 
-#include "../../include/Backend/Database/GList.h"
+#include "Backend/Database/GList.h"
 #include <algorithm>
 #include <map>
 #include <stdio.h>
