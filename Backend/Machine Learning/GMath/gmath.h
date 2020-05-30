@@ -17,7 +17,7 @@
 #ifndef _GMATH
 #define _GMATH
 
-#include "../../../include/Backend/Database/GList.h"
+#include "Backend/Database/GList.h"
 #include <float.h>
 #include <math.h>
 #include <stdio.h>

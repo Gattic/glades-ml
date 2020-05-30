@@ -17,7 +17,6 @@
 #ifndef _GLADESML
 #define _GLADESML
 
-// The Truly Relative Database
 #include <algorithm>
 #include <map>
 #include <pthread.h>
@@ -41,18 +40,9 @@ class RNN;
 class Layer;
 class Terminator;
 
-extern std::map<std::string, MetaNetwork*>* metaNets; // meta networks we loaded
-extern std::map<std::string, NNetwork*>* neuralNets;  // neural networks we loaded
-extern pthread_mutex_t* nnetworkMutex;
-
 void init();
-void cleanup();
-pthread_mutex_t* getNNetworkMutex();
-NNetwork* getNeuralNetwork(const std::string&);
 RNN* getRNN(const std::string&);
 bool saveNeuralNetwork(NNetwork*);
-void addMetaNetwork(MetaNetwork*);
-void removeMetaNetwork(const std::string&);
 
 // Machine Learning Functions
 MetaNetwork* train(NNInfo*, const shmea::GTable&, Terminator*);

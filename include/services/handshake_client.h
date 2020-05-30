@@ -23,11 +23,33 @@
 
 class Handshake_Client : public GNet::Service
 {
+private:
+	GNet::GServer* serverInstance;
+
 public:
+	Handshake_Client()
+	{
+		serverInstance = NULL;
+	}
+
+	Handshake_Client(GNet::GServer* newInstance)
+	{
+		serverInstance = newInstance;
+	}
+
+	~Handshake_Client()
+	{
+		serverInstance = NULL; // Not ours to delete
+	}
+
 	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
 	{
 		// Log the server into the client
 		shmea::GList retList;
+
+		if (!serverInstance)
+			return retList;
+
 		if (data.size() < 2)
 			return retList;
 
@@ -46,9 +68,9 @@ public:
 		return retList;
 	}
 
-	GNet::Service* MakeService() const
+	GNet::Service* MakeService(GNet::GServer* newInstance) const
 	{
-		return new Handshake_Client();
+		return new Handshake_Client(newInstance);
 	}
 
 	std::string getName() const

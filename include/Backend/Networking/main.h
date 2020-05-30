@@ -18,6 +18,7 @@
 #define _GNET
 
 #include "../Database/GList.h"
+#include "socket.h"
 #include <iostream>
 #include <map>
 #include <openssl/bio.h>
@@ -59,73 +60,92 @@ namespace GNet {
 class Instance;
 class Service;
 
-class LaunchInstanceHelperArgs
-{
-public:
-	std::string clientName;
-	std::string serverIP;
-};
-
 // Service Arguments Class
 class newServiceArgs
 {
 public:
+	class GServer* serverInstance;
 	class Instance* cInstance;
 	shmea::GList sockData;
 	pthread_t* sThread;
 	std::string command;
 };
 
-namespace {
-extern std::map<std::string, Instance*>*
-	clientInstanceList; // ip, instance pointer;instances of client connections
-extern std::map<std::string, Instance*>*
-	serverInstanceList; // ip, instance pointer;instances of client connections
-extern int sockfd;
-extern Instance* localInstance;
-extern pthread_mutex_t* clientMutex;
-extern pthread_mutex_t* serverMutex;
-extern bool LOCAL_ONLY;
-extern bool running;
-extern std::map<std::string, Service*>* service_depot;
+class GServer
+{
+	friend Service;
+
+	GNet::Sockets socks;
+
+	// ip, instance pointer;instances of client connections
+	std::map<std::string, Instance*>* clientInstanceList;
+	std::map<std::string, Instance*>* serverInstanceList;
+
+	int sockfd;
+	Instance* localInstance;
+	pthread_t* commandThread;
+	pthread_t* writerThread;
+	pthread_mutex_t* clientMutex;
+	pthread_mutex_t* serverMutex;
+	bool LOCAL_ONLY;
+	bool running;
+	std::map<std::string, Service*>* service_depot;
+
+	static void* commandLauncher(void*);
+	void commandCatcher(void*);
+	static void* LaunchInstanceLauncher(void*);
+	void LaunchInstanceHelper(void*);
+	void* ListWriter(void*);
+	void LaunchInstance(const std::string&, const std::string&);
+	void LaunchLocalInstance(const std::string&);
+	void LogoutInstance(Instance*);
+
+public:
+	static const int CONTENT_TYPE = 0;
+	static const int RESPONSE_TYPE = 1;
+	static const int ACK_TYPE = 2;
+
+	GServer();
+	~GServer();
+
+	void NewService(const shmea::GList&, GNet::Instance* = NULL, int = CONTENT_TYPE, bool = false);
+	Service* ServiceLookup(std::string);
+
+	unsigned int addService(std::string, Service*);
+	const bool& getRunning();
+	void stop();
+	void run(bool);
+
+	bool isConnection(int, const fd_set&);
+	Instance* setupNewConnection(int);
+	Instance* findExistingConnectionInstance(const std::vector<Instance*>&, const fd_set&);
+
+	int getSockFD();
+	Instance* getLocalInstance();
+	const std::map<std::string, Instance*>& getClientInstanceList();
+	void removeClientInstance(Instance*);
+	const std::map<std::string, Instance*>& getServerInstanceList();
+	void removeServerInstance(Instance*);
+	pthread_mutex_t* getClientMutex();
+	pthread_mutex_t* getServerMutex();
+
+	bool isNetworkingDisabled();
+
+	static void GetDirInfo(std::string, std::vector<std::string>&,
+						   std::map<std::string, std::string>&);
+	static void GetURLInfo(std::string, std::string&, std::string&, std::string&, bool&);
+	static std::string getWebContents(std::string);
+
+}; // GServer
+
+class LaunchInstanceHelperArgs
+{
+public:
+	GServer* serverInstance;
+	std::string clientName;
+	std::string serverIP;
 };
 
-const int CONTENT_TYPE = 0;
-const int RESPONSE_TYPE = 1;
-const int ACK_TYPE = 2;
-
-void NewService(const shmea::GList&, GNet::Instance* = NULL, int = CONTENT_TYPE, bool = false);
-Service* ServiceLookup(std::string);
-
-unsigned int addService(std::string, Service*);
-const bool& getRunning();
-void stop();
-void run(pthread_t*&, pthread_t*&, bool);
-
-bool isConnection(int, const fd_set&);
-Instance* setupNewConnection(int);
-Instance* findExistingConnectionInstance(const std::vector<Instance*>&, const fd_set&);
-
-int getSockFD();
-Instance* getLocalInstance();
-const std::map<std::string, Instance*>& getClientInstanceList();
-void removeClientInstance(Instance*);
-const std::map<std::string, Instance*>& getServerInstanceList();
-void removeServerInstance(Instance*);
-pthread_mutex_t* getClientMutex();
-pthread_mutex_t* getServerMutex();
-
-void* commandCatcher(void*);
-void* LaunchInstanceHelper(void*);
-void* ListWriter(void*);
-void LaunchInstance(const std::string&, const std::string&);
-void LaunchLocalInstance(const std::string&);
-void LogoutInstance(Instance*);
-
-void GetDirInfo(std::string, std::vector<std::string>&, std::map<std::string, std::string>&);
-void GetURLInfo(std::string, std::string&, std::string&, std::string&, bool&);
-std::string getWebContents(std::string);
-bool isNetworkingDisabled();
-};
+}; // GNet
 
 #endif

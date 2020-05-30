@@ -17,7 +17,7 @@
 #ifndef _NNETWORK
 #define _NNETWORK
 
-#include "../../include/Backend/Database/GList.h"
+#include "Backend/Database/GList.h"
 #include <algorithm>
 #include <map>
 #include <stdio.h>
@@ -54,6 +54,7 @@ private:
 	LayerBuilder* meat;
 	CMatrix* confusionMatrix;
 
+	bool running;
 	int netType;
 	int epochs;
 	bool saveInstance;
@@ -102,9 +103,6 @@ public:
 	static const int RUN_TRAIN = 0;
 	static const int RUN_TEST = 1;
 	static const int RUN_VALIDATE = 2;
-
-	// For stopping manually
-	static bool caboose;
 
 	NNetwork();
 	NNetwork(NNInfo*);

@@ -17,7 +17,7 @@
 #ifndef _GQL_INPUTLAYERINFO
 #define _GQL_INPUTLAYERINFO
 
-#include "../../../include/Backend/Database/GList.h"
+#include "Backend/Database/GList.h"
 #include "layerinfo.h"
 #include <stdio.h>
 #include <stdlib.h>

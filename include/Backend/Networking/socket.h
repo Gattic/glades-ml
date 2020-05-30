@@ -35,56 +35,60 @@
 #include <vector>
 
 namespace GNet {
+class GServer;
 class Instance;
 
 class Sockets
 {
 private:
 	static const int64_t DEFAULT_KEY = 420l;
-
 	static const std::string ANYADDR;
-	static const std::string PORT;
 
-	static int64_t* overflow;
-	static unsigned int overflowLen;
-	static pthread_mutex_t* inMutex;
-	static pthread_mutex_t* outMutex;
-	static pthread_cond_t* inWaitCond; // not used yet
-	static pthread_cond_t* outWaitCond;
-	static std::queue<shmea::GList> inboundLists;
-	static std::queue<std::pair<Instance*, shmea::GList> > outboundLists;
+	std::string PORT;
+	int64_t* overflow;
+	unsigned int overflowLen;
+	pthread_mutex_t* inMutex;
+	pthread_mutex_t* outMutex;
+	pthread_cond_t* inWaitCond; // not used yet
+	pthread_cond_t* outWaitCond;
+	std::queue<shmea::GList> inboundLists;
+	std::queue<std::pair<Instance*, shmea::GList> > outboundLists;
 
-	// static GList emptyResponseList();
+	void initSockets();
+
+	// GList emptyResponseList();
 
 public:
 	static const std::string LOCALHOST;
 
+	Sockets();
+	Sockets(const std::string&);
+	~Sockets();
+
 	// functions
-	static void initSockets();
-	static void closeSockets();
-	static const std::string getPort();
-	static int openServerConnection();
-	static int openClientConnection(const std::string&);
-	static int64_t* reader(const int&, unsigned int&);
-	static void readConnection(Instance*, const int&, const std::string&,
-							   std::vector<shmea::GList>&);
-	static void readConnectionHelper(Instance*, const int&, const std::string&,
-									 std::vector<shmea::GList>&);
-	static int writeConnection(const class Instance* cInstance, const int&, const shmea::GList&,
-							   int);
-	static void closeConnection(const int&);
+	void initSockets(const std::string&);
+	void closeSockets();
+	const std::string getPort();
+	int openServerConnection();
+	int openClientConnection(const std::string&);
+	int64_t* reader(const int&, unsigned int&);
+	void readConnection(Instance*, const int&, const std::string&, std::vector<shmea::GList>&);
+	void readConnectionHelper(Instance*, const int&, const std::string&,
+							  std::vector<shmea::GList>&);
+	int writeConnection(const class Instance* cInstance, const int&, const shmea::GList&, int);
+	void closeConnection(const int&);
 
-	static pthread_mutex_t* getInMutex();
-	static pthread_mutex_t* getOutMutex();
-	static pthread_cond_t* getInWaitCond();
-	static pthread_cond_t* getOutWaitCond();
-	static bool anyInboundLists();
-	static bool anyOutboundLists();
+	pthread_mutex_t* getInMutex();
+	pthread_mutex_t* getOutMutex();
+	pthread_cond_t* getInWaitCond();
+	pthread_cond_t* getOutWaitCond();
+	bool anyInboundLists();
+	bool anyOutboundLists();
 
-	static bool readLists(Instance*);
-	static void processLists(Instance*);
-	static bool writeLists();
-	static void addResponseList(Instance*, const shmea::GList&);
+	bool readLists(Instance*);
+	void processLists(GServer*, Instance*);
+	bool writeLists();
+	void addResponseList(Instance*, const shmea::GList&);
 };
 };
 

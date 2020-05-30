@@ -17,8 +17,8 @@
 #ifndef _CMATRIX
 #define _CMATRIX
 
-#include "../../../include/Backend/Database/GList.h"
-#include "../../../include/Backend/Database/gtable.h"
+#include "Backend/Database/GList.h"
+#include "Backend/Database/gtable.h"
 #include <string>
 #include <vector>
 
