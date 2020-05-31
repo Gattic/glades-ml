@@ -19,11 +19,9 @@
 
 #include "../Database/GList.h"
 #include "socket.h"
+#include <errno.h>
 #include <iostream>
 #include <map>
-#include <openssl/bio.h>
-#include <openssl/err.h>
-#include <openssl/ssl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +30,9 @@
 #include <sys/signal.h>
 #include <unistd.h>
 #include <vector>
+/*#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>*/
 
 class GList;
 
@@ -57,7 +58,7 @@ class GList;
 
 namespace GNet {
 
-class Instance;
+class Connection;
 class Service;
 
 // Service Arguments Class
@@ -65,7 +66,7 @@ class newServiceArgs
 {
 public:
 	class GServer* serverInstance;
-	class Instance* cInstance;
+	class Connection* cConnection;
 	shmea::GList sockData;
 	pthread_t* sThread;
 	std::string command;
@@ -73,32 +74,48 @@ public:
 
 class GServer
 {
+	friend Sockets;
 	friend Service;
 
 	GNet::Sockets socks;
 
-	// ip, instance pointer;instances of client connections
-	std::map<std::string, Instance*>* clientInstanceList;
-	std::map<std::string, Instance*>* serverInstanceList;
+	// Key is ip address
+	std::map<std::string, Connection*>* clientConnections;
+	std::map<std::string, Connection*>* serverConnections;
 
 	int sockfd;
-	Instance* localInstance;
+	Connection* localConnection;
 	pthread_t* commandThread;
 	pthread_t* writerThread;
 	pthread_mutex_t* clientMutex;
 	pthread_mutex_t* serverMutex;
+	pthread_mutex_t* writersMutex;
+	pthread_cond_t* writersBlock;
 	bool LOCAL_ONLY;
 	bool running;
 	std::map<std::string, Service*>* service_depot;
 
 	static void* commandLauncher(void*);
 	void commandCatcher(void*);
+
 	static void* LaunchInstanceLauncher(void*);
 	void LaunchInstanceHelper(void*);
-	void* ListWriter(void*);
-	void LaunchInstance(const std::string&, const std::string&);
+
+	void wakeWriter();
+	static void* ListWLauncher(void*);
+	void ListWriter(void*);
 	void LaunchLocalInstance(const std::string&);
-	void LogoutInstance(Instance*);
+	void LogoutInstance(Connection*);
+
+	int getSockFD();
+	const std::map<std::string, Connection*>& getClientConnections();
+	const std::map<std::string, Connection*>& getServerConnections();
+	pthread_mutex_t* getClientMutex();
+	pthread_mutex_t* getServerMutex();
+
+	bool isConnection(int, const fd_set&);
+	Connection* setupNewConnection(int);
+	Connection* findExistingConnection(const std::vector<Connection*>&, const fd_set&);
 
 public:
 	static const int CONTENT_TYPE = 0;
@@ -108,34 +125,21 @@ public:
 	GServer();
 	~GServer();
 
-	void NewService(const shmea::GList&, GNet::Instance* = NULL, int = CONTENT_TYPE, bool = false);
-	Service* ServiceLookup(std::string);
+	void NewService(const shmea::GList&, GNet::Connection* = NULL, int = CONTENT_TYPE,
+					bool = false);
 
+	Service* ServiceLookup(std::string);
 	unsigned int addService(std::string, Service*);
+	Connection* getConnection(std::string);
+	void LaunchInstance(const std::string&, const std::string&);
 	const bool& getRunning();
 	void stop();
 	void run(bool);
-
-	bool isConnection(int, const fd_set&);
-	Instance* setupNewConnection(int);
-	Instance* findExistingConnectionInstance(const std::vector<Instance*>&, const fd_set&);
-
-	int getSockFD();
-	Instance* getLocalInstance();
-	const std::map<std::string, Instance*>& getClientInstanceList();
-	void removeClientInstance(Instance*);
-	const std::map<std::string, Instance*>& getServerInstanceList();
-	void removeServerInstance(Instance*);
-	pthread_mutex_t* getClientMutex();
-	pthread_mutex_t* getServerMutex();
-
 	bool isNetworkingDisabled();
 
-	static void GetDirInfo(std::string, std::vector<std::string>&,
-						   std::map<std::string, std::string>&);
-	static void GetURLInfo(std::string, std::string&, std::string&, std::string&, bool&);
-	static std::string getWebContents(std::string);
-
+	Connection* getLocalConnection();
+	void removeClientConnection(Connection*);
+	void removeServerConnection(Connection*);
 }; // GServer
 
 class LaunchInstanceHelperArgs

@@ -14,13 +14,11 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GQL2_SAVEITEM
-#define _GQL2_SAVEITEM
+#ifndef _GSAVEFOLDER
+#define _GSAVEFOLDER
 
-#include "gtable.h"
-#include <fstream>
+#include <dirent.h>
 #include <pthread.h>
-#include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,42 +27,35 @@
 #include <vector>
 
 namespace shmea {
-class SaveItem
+
+class GTable;
+class SaveTable;
+
+class SaveFolder
 {
 private:
-	int64_t id;
+	std::vector<SaveTable*> saveItems;
 	std::string dname;
-	std::string name;
-	GTable value;
 
 	std::string getPath() const;
-
-protected:
-	friend class SaveList;
-
-	// Load functions
-	void loadByID(int64_t);
-
-	// Save Functions
-	void saveByID(const GTable&);
-
+	void addItem(SaveTable*);
 	void clean();
 
 public:
 	// constructors & destructor
-	SaveItem(const std::string&, const std::string&);
-	~SaveItem();
+	SaveFolder(const std::string&);
+	~SaveFolder();
 
-	// Database operations
-	void loadByName();
-	void saveByName(const GTable&) const;
-	bool deleteByName();
+	SaveTable* loadItem(const std::string&);
+	bool deleteItem(const std::string&);
+	SaveTable* newItem(const std::string&, const GTable&);
+	void load();
+	static std::vector<SaveFolder*> loadFolders();
 
 	// gets
-	int64_t getID() const;
 	std::string getName() const;
-	GTable getTable() const;
-	void print() const;
+	const std::vector<SaveTable*>& getItems() const;
+	int size() const;
 };
 };
 

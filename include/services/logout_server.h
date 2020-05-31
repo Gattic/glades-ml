@@ -42,20 +42,20 @@ public:
 		serverInstance = NULL; // Not ours to delete
 	}
 
-	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
+	shmea::GList execute(class GNet::Connection* cConnection, const shmea::GList& data)
 	{
 		shmea::GList retList;
 
 		if (!serverInstance)
 			return retList;
 
-		printf("[SLOGOUT] %s\n", cInstance->getIP().c_str());
+		printf("[SLOGOUT] %s\n", cConnection->getIP().c_str());
 
 		// delete it from the data structure
-		serverInstance->removeServerInstance(cInstance);
+		serverInstance->removeServerConnection(cConnection);
 
-		// Clean up the instance
-		cInstance->finish();
+		// Clean up the Connection
+		cConnection->finish();
 
 		return retList;
 	}

@@ -17,7 +17,7 @@
 #ifndef _GLIST
 #define _GLIST
 
-#include "gtype.h"
+#include "GType.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

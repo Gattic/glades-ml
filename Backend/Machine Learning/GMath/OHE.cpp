@@ -15,8 +15,8 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "OHE.h"
-#include "Backend/Database/gtable.h"
-#include "Backend/Database/gtype.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GType.h"
 
 using namespace glades;
 

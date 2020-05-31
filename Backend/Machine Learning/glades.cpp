@@ -16,8 +16,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "glades.h"
 #include "../../main.h"
-#include "Backend/Database/gtable.h"
-#include "Backend/Database/gtype.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GType.h"
 #include "GMath/gmath.h"
 #include "RNN.h"
 #include "State/layer.h"

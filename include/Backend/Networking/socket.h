@@ -36,7 +36,7 @@
 
 namespace GNet {
 class GServer;
-class Instance;
+class Connection;
 
 class Sockets
 {
@@ -45,14 +45,12 @@ private:
 	static const std::string ANYADDR;
 
 	std::string PORT;
-	int64_t* overflow;
+	int64_t* overflow; // dont free this
 	unsigned int overflowLen;
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
-	pthread_cond_t* inWaitCond; // not used yet
-	pthread_cond_t* outWaitCond;
 	std::queue<shmea::GList> inboundLists;
-	std::queue<std::pair<Instance*, shmea::GList> > outboundLists;
+	std::queue<std::pair<Connection*, shmea::GList> > outboundLists;
 
 	void initSockets();
 
@@ -72,23 +70,19 @@ public:
 	int openServerConnection();
 	int openClientConnection(const std::string&);
 	int64_t* reader(const int&, unsigned int&);
-	void readConnection(Instance*, const int&, const std::string&, std::vector<shmea::GList>&);
-	void readConnectionHelper(Instance*, const int&, const std::string&,
+	void readConnection(Connection*, const int&, const std::string&, std::vector<shmea::GList>&);
+	void readConnectionHelper(Connection*, const int&, const std::string&,
 							  std::vector<shmea::GList>&);
-	int writeConnection(const class Instance* cInstance, const int&, const shmea::GList&, int);
+	int writeConnection(const Connection*, const int&, const shmea::GList&, int);
 	void closeConnection(const int&);
 
-	pthread_mutex_t* getInMutex();
-	pthread_mutex_t* getOutMutex();
-	pthread_cond_t* getInWaitCond();
-	pthread_cond_t* getOutWaitCond();
 	bool anyInboundLists();
 	bool anyOutboundLists();
 
-	bool readLists(Instance*);
-	void processLists(GServer*, Instance*);
-	bool writeLists();
-	void addResponseList(Instance*, const shmea::GList&);
+	bool readLists(Connection*);
+	void processLists(GServer*, Connection*);
+	void writeLists(GServer*);
+	void addResponseList(GServer*, Connection*, const shmea::GList&);
 };
 };
 

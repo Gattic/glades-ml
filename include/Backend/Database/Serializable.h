@@ -18,7 +18,7 @@
 #define _GSERIALIZABLE
 
 #include "GList.h"
-#include "gtable.h"
+#include "GTable.h"
 #include <algorithm>
 #include <dirent.h>
 #include <map>

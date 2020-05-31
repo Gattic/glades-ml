@@ -18,7 +18,7 @@
 #define _GTABLE
 
 #include "GList.h"
-#include "gtype.h"
+#include "GType.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -44,7 +44,6 @@ private:
 	std::vector<unsigned int> outputColumns; // sparse boolean array
 
 	void importFromFile(const std::string&);
-	void importFromUrl(const std::string&);
 	void importFromString(const std::string&);
 
 public:

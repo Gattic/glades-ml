@@ -15,7 +15,7 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "metanetwork.h"
-#include "../../include/Backend/Database/gtable.h"
+#include "Backend/Database/GTable.h"
 #include "State/Terminator.h"
 #include "Structure/nninfo.h"
 #include "network.h"

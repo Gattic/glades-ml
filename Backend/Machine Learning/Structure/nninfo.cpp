@@ -16,10 +16,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "nninfo.h"
 #include "../../../main.h"
-#include "Backend/Database/gtable.h"
-#include "Backend/Database/gtype.h"
-#include "Backend/Database/saveitem.h"
-#include "Backend/Database/savelist.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GType.h"
+#include "Backend/Database/SaveFolder.h"
+#include "Backend/Database/SaveTable.h"
 #include "Backend/Networking/main.h"
 #include "hiddenlayerinfo.h"
 #include "inputlayerinfo.h"
@@ -666,12 +666,12 @@ bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable&
 bool glades::NNInfo::load(const std::string& netName)
 {
 	name = netName;
-	shmea::SaveList* slItem = new shmea::SaveList("neuralnetworks");
+	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
 	return fromGTable(name, slItem->loadItem(name)->getTable());
 }
 
 void glades::NNInfo::save() const
 {
-	shmea::SaveList* slItem = new shmea::SaveList("neuralnetworks");
+	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
 	slItem->newItem(name, toGTable());
 }

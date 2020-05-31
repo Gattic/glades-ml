@@ -42,7 +42,7 @@ public:
 		serverInstance = NULL; // Not ours to delete
 	}
 
-	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
+	shmea::GList execute(class GNet::Connection* cConnection, const shmea::GList& data)
 	{
 		shmea::GList retList;
 		if (!serverInstance)

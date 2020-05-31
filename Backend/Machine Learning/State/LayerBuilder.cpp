@@ -21,11 +21,11 @@
 #include "../Structure/nninfo.h"
 #include "../network.h"
 #include "Backend/Database/GList.h"
-#include "Backend/Database/gtable.h"
-#include "Backend/Database/gtype.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GType.h"
+#include "Backend/Database/SaveFolder.h"
+#include "Backend/Database/SaveTable.h"
 #include "Backend/Database/maxid.h"
-#include "Backend/Database/saveitem.h"
-#include "Backend/Database/savelist.h"
 #include "NetworkState.h"
 #include "edge.h"
 #include "layer.h"
@@ -802,7 +802,7 @@ void glades::LayerBuilder::clean()
 
 		Layer* layer = new Layer(layerId, layerType, layerBiasWeight);
 
-		SaveItem* layerFile = new SaveItem("layers");
+		SaveTable* layerFile = new SaveTable("layers");
 		layerFile->load_id(layerId);
 		shmea::GTable* layerData = layerFile->getTable();
 		if (!layerData)
@@ -815,7 +815,7 @@ void glades::LayerBuilder::clean()
 			Node* node = new Node();
 			node->setID(nodeId);
 
-			SaveItem* nodeFile = new SaveItem("nodes");
+			SaveTable* nodeFile = new SaveTable("nodes");
 			nodeFile->load_id(nodeId);
 			shmea::GTable* nodeData = nodeFile->getTable();
 			if (!nodeData)
@@ -830,7 +830,7 @@ void glades::LayerBuilder::clean()
 				Edge* edge = new Edge(nodeRow, edgeWeight);
 				edge->setPrevDelta(edgePrevDelta);
 				edges.push_back(edge);
-				// SaveItem* edgeFile = new SaveItem("edges");
+				// SaveTable* edgeFile = new SaveTable("edges");
 				// edgeFile->load_id(edgeId);
 				// shmea::GTable* edgeData = edgeFile->getTable();
 				// if (!edgeData)
@@ -868,7 +868,7 @@ bool glades::LayerBuilder::load(const std::string& netName)
  */
 bool glades::LayerBuilder::save(const std::string& netName) const
 {
-	shmea::SaveList* nnList = new shmea::SaveList(netName);
+	shmea::SaveFolder* nnList = new shmea::SaveFolder(netName);
 
 	std::vector<std::string> layerHeaders, edgeHeaders;
 	layerHeaders.push_back("BiasWeight");

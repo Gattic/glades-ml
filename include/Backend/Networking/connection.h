@@ -14,8 +14,8 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _INSTANCE
-#define _INSTANCE
+#ifndef _GCONNECTION
+#define _GCONNECTION
 
 #include <pthread.h>
 #include <stdio.h>
@@ -30,7 +30,7 @@ namespace GNet {
 class newServiceArgs;
 class Service;
 
-class Instance
+class Connection
 {
 private:
 	std::string name;
@@ -55,8 +55,9 @@ public:
 	unsigned int overflowLen;
 	std::vector<Service*> sThreads; // all the active service threads
 
-	Instance(int, int, std::string);
-	~Instance();
+	Connection(int, int, std::string);
+	Connection(const Connection&);
+	~Connection();
 	void finish();
 
 	// gets

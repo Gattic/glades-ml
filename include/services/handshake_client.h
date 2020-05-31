@@ -18,7 +18,7 @@
 #define _HANDSHAKE_CLIENT
 
 #include "../Backend/Database/GList.h"
-#include "../Backend/Networking/instance.h"
+#include "../Backend/Networking/connection.h"
 #include "../Backend/Networking/service.h"
 
 class Handshake_Client : public GNet::Service
@@ -42,7 +42,7 @@ public:
 		serverInstance = NULL; // Not ours to delete
 	}
 
-	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
+	shmea::GList execute(class GNet::Connection* cConnection, const shmea::GList& data)
 	{
 		// Log the server into the client
 		shmea::GList retList;
@@ -55,15 +55,15 @@ public:
 
 		// Check the characters in the name
 		std::string clientName = data.getString(0);
-		if (!GNet::Instance::validName(clientName))
+		if (!GNet::Connection::validName(clientName))
 			clientName = "";
-		cInstance->setName(clientName);
+		cConnection->setName(clientName);
 
 		// get the new encryption key
 		int64_t newKey = data.getLong(1);
 
-		// Set the new instance key
-		cInstance->setKey(newKey);
+		// Set the new Connection key
+		cConnection->setKey(newKey);
 
 		return retList;
 	}

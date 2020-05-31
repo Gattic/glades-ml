@@ -14,8 +14,8 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _SERVICE
-#define _SERVICE
+#ifndef _GSERVICE
+#define _GSERVICE
 
 #include "../Database/GList.h"
 #include <pthread.h>
@@ -30,6 +30,7 @@ namespace GNet {
 
 class GServer;
 class Sockets;
+class Connection;
 class newServiceArgs;
 
 class Service
@@ -43,12 +44,11 @@ private:
 	int64_t timeExecuted;
 
 	static void* launchService(void* y);
-	virtual shmea::GList execute(class Instance*, const shmea::GList&) = 0;
+	virtual shmea::GList execute(Connection*, const shmea::GList&) = 0;
 	void StartService(newServiceArgs*);
 	void ExitService(newServiceArgs*);
 
-	static void ExecuteService(GServer* serverInstance, const shmea::GList&,
-							   class Instance* = NULL);
+	static void ExecuteService(GServer*, const shmea::GList&, Connection* = NULL);
 
 public:
 	Service();

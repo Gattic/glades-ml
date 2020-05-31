@@ -43,7 +43,7 @@ public:
 		serverInstance = NULL; // Not ours to delete
 	}
 
-	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
+	shmea::GList execute(class GNet::Connection* cConnection, const shmea::GList& data)
 	{
 		// Log the client into the server
 		shmea::GList retList;
@@ -56,24 +56,24 @@ public:
 
 		// Check the characters in the name
 		std::string clientName = data.getString(0);
-		if (GNet::Instance::validName(clientName))
-			cInstance->setName(clientName);
+		if (GNet::Connection::validName(clientName))
+			cConnection->setName(clientName);
 
 		// generate a new key for the sockets
-		// if (cInstance->getIP() != GNet::Sockets::LOCALHOST)
+		// if (cConnection->getIP() != GNet::Sockets::LOCALHOST)
 		{
-			int64_t newKey = GNet::Instance::generateKey();
+			int64_t newKey = GNet::Connection::generateKey();
 
 			// tell the client the good news
 			shmea::GList wData;
 			wData.addString("Handshake_Client");
-			wData.addString(cInstance->getName());
+			wData.addString(cConnection->getName());
 			wData.addLong(newKey);
-			// GNet::Service::ExecuteService(serverInstance, wData, cInstance);
-			serverInstance->NewService(wData, cInstance, GNet::GServer::ACK_TYPE);
+			// GNet::Service::ExecuteService(serverInstance, wData, cConnection);
+			serverInstance->NewService(wData, cConnection, GNet::GServer::ACK_TYPE);
 
-			// Set the new instance key
-			cInstance->setKey(newKey);
+			// Set the new Connection key
+			cConnection->setKey(newKey);
 		}
 
 		return retList;
