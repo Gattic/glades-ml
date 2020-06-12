@@ -70,7 +70,6 @@ export(TARGETS ${PROJECT_NAME} FILE gladesConfig.cmake)
 #make fmt
 add_custom_target(fmt ALL
 	COMMAND ./clang-format-all
-	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
