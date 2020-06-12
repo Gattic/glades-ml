@@ -68,7 +68,7 @@ install(EXPORT gladesConfig DESTINATION share/glades/cmake)
 export(TARGETS ${PROJECT_NAME} FILE gladesConfig.cmake)
 
 #make fmt
-add_custom_target(fmt ALL
+add_custom_target(fmt
 	COMMAND ./clang-format-all
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
@@ -78,11 +78,6 @@ add_custom_target(local
 	COMMAND ${PROJECT_NAME} local
 	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
-#make docs
-add_custom_target(docs
-	COMMAND google-chrome index.html
-	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/docs/html/
 )
 
 #make debug
