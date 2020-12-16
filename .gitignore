@@ -6,3 +6,4 @@ database/*
 *.sublime-workspace
 *.swp
 alpaca.key
+.gdb_history
