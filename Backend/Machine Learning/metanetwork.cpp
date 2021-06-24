@@ -217,7 +217,7 @@ glades::NNetwork* glades::MetaNetwork::getSubnetByName(std::string newName) cons
 void glades::MetaNetwork::crossValidate(std::string fNames, Terminator* Arnold)
 {
 	// populate the input data
-	shmea::GTable cinputFile(fNames, ',', shmea::GTable::TYPE_FILE);
+	shmea::GTable cinputFile(fNames.c_str(), ',', shmea::GTable::TYPE_FILE);
 
 	float cvAccuracy = 0.0f;
 	std::vector<shmea::GTable*> stratifiedInputFiles =

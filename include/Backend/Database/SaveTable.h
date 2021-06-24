@@ -17,6 +17,7 @@
 #ifndef _GSAVETABLE
 #define _GSAVETABLE
 
+#include "GString.h"
 #include "GTable.h"
 #include <fstream>
 #include <pthread.h>
@@ -33,11 +34,11 @@ class SaveTable
 {
 private:
 	int64_t id;
-	std::string dname;
-	std::string name;
+	GString dname;
+	GString name;
 	GTable value;
 
-	std::string getPath() const;
+	GString getPath() const;
 
 protected:
 	friend class SaveList;
@@ -52,8 +53,8 @@ protected:
 
 public:
 	// constructors & destructor
-	SaveTable(const std::string&, const std::string&);
-	~SaveTable();
+	SaveTable(const GString&, const GString&);
+	virtual ~SaveTable();
 
 	// Database operations
 	void loadByName();
@@ -62,7 +63,7 @@ public:
 
 	// gets
 	int64_t getID() const;
-	std::string getName() const;
+	GString getName() const;
 	GTable getTable() const;
 	void print() const;
 };

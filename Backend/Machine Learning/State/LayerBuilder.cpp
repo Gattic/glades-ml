@@ -470,7 +470,7 @@ shmea::GTable glades::LayerBuilder::standardizeInputTable(const NNInfo* skeleton
 					float cell = 0.0f;
 
 					// translate string to cell value for this col
-					std::string cString = cCell.getString();
+					std::string cString = cCell.c_str();
 					std::vector<float> featureVector = OHEVector[cString];
 					cell = featureVector[cInt];
 
@@ -479,8 +479,8 @@ shmea::GTable glades::LayerBuilder::standardizeInputTable(const NNInfo* skeleton
 				}
 
 				// generic new header since OHE turns 1 col to many
-				std::string newHeader = newInputTable.getHeader(c);
-				newHeader += shmea::GType::intTOstring(cInt);
+				shmea::GString newHeader = newInputTable.getHeader(c).c_str();
+				newHeader += shmea::GString::intTOstring(cInt);
 
 				// add the standardized newCol to the standardizedTable
 				standardizedTable.addCol(newHeader, newCol);
@@ -868,9 +868,9 @@ bool glades::LayerBuilder::load(const std::string& netName)
  */
 bool glades::LayerBuilder::save(const std::string& netName) const
 {
-	shmea::SaveFolder* nnList = new shmea::SaveFolder(netName);
+	shmea::SaveFolder* nnList = new shmea::SaveFolder(netName.c_str());
 
-	std::vector<std::string> layerHeaders, edgeHeaders;
+	std::vector<shmea::GString> layerHeaders, edgeHeaders;
 	layerHeaders.push_back("BiasWeight");
 	edgeHeaders.push_back("layerID");
 	edgeHeaders.push_back("nodeID");

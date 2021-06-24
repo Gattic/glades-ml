@@ -17,7 +17,8 @@
 #ifndef _LOGOUT_SERVER
 #define _LOGOUT_SERVER
 
-#include "../Backend/Database/GList.h"
+#include "../Backend/Database/GString.h"
+#include "../Backend/Database/ServiceData.h"
 #include "../Backend/Networking/main.h"
 #include "../Backend/Networking/service.h"
 
@@ -42,22 +43,22 @@ public:
 		serverInstance = NULL; // Not ours to delete
 	}
 
-	shmea::GList execute(class GNet::Connection* cConnection, const shmea::GList& data)
+	shmea::ServiceData* execute(const shmea::ServiceData* data)
 	{
-		shmea::GList retList;
+		class GNet::Connection* destination = data->getConnection();
 
 		if (!serverInstance)
-			return retList;
+			return NULL;
 
-		printf("[SLOGOUT] %s\n", cConnection->getIP().c_str());
+		printf("[SLOGOUT] %s\n", destination->getIP().c_str());
 
 		// delete it from the data structure
-		serverInstance->removeServerConnection(cConnection);
+		serverInstance->removeServerConnection(destination);
 
 		// Clean up the Connection
-		cConnection->finish();
+		destination->finish();
 
-		return retList;
+		return NULL;
 	}
 
 	GNet::Service* MakeService(GNet::GServer* newInstance) const
@@ -65,7 +66,7 @@ public:
 		return new Logout_Server(newInstance);
 	}
 
-	std::string getName() const
+	shmea::GString getName() const
 	{
 		return "Logout_Server";
 	}

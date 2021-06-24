@@ -14,8 +14,8 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GSERVICE
-#define _GSERVICE
+#ifndef _GSERVICEDATA
+#define _GSERVICEDATA
 
 #include "../Database/GString.h"
 #include <pthread.h>
@@ -26,40 +26,65 @@
 #include <time.h>
 #include <vector>
 
-namespace shmea {
-class ServiceData;
+namespace GNet {
+class Connection;
 };
 
-namespace GNet {
+namespace shmea {
+	class GList;
+	class GTable;
+	class GObject;
+	class Serializable;
 
-class GServer;
-class Sockets;
-class Connection;
-class newServiceArgs;
-
-class Service
+class ServiceData
 {
-	friend GServer;
-	friend Sockets;
-
 private:
-	// timestamp variable to store service start and end time
-	static shmea::GString name;
-	int64_t timeExecuted;
 
-	static void* launchService(void* y);
-	virtual shmea::ServiceData* execute(const shmea::ServiceData*) = 0;
-	void StartService(newServiceArgs*);
-	void ExitService(newServiceArgs*);
+	GNet::Connection* cConnection;
+	shmea::GString sid;
+	shmea::GString command;
+	int type;
 
-	static void ExecuteService(GServer*, const shmea::ServiceData*, Connection* = NULL);
+	shmea::GList* repList;
+	shmea::GTable* repTable;
+	shmea::GObject* repObj;
 
 public:
-	Service();
-	virtual ~Service();
 
-	virtual Service* MakeService(GServer*) const = 0;
-	virtual shmea::GString getName() const = 0;
+	static const int SID_LENGTH = 12;
+
+	static const int TYPE_ACK = 0;//default
+	static const int TYPE_LIST = 1;
+	static const int TYPE_TABLE = 2;
+	static const int TYPE_NETWORK_POINTER = 3;
+
+	ServiceData(GNet::Connection*);
+	ServiceData(GNet::Connection*, shmea::GString);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::GList*);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::GTable*);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::Serializable*);
+	ServiceData(const ServiceData&);
+	virtual ~ServiceData();
+
+	GNet::Connection* getConnection() const;
+	shmea::GString getSID() const;
+	shmea::GString getCommand() const;
+	int getType() const;
+
+	void setSID(shmea::GString);
+	void setCommand(shmea::GString);
+	void setType(int);
+
+	const GList* getList() const;
+	const GTable* getTable() const;
+	const GObject* getObj() const;
+
+	void setList(GList*);
+	void setTable(GTable*);
+	void setObj(GObject*);
+
+	static bool validSID(const shmea::GString&);
+	static shmea::GString generateSID();
 };
 };
 

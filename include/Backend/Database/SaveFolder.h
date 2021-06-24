@@ -17,6 +17,7 @@
 #ifndef _GSAVEFOLDER
 #define _GSAVEFOLDER
 
+#include "GString.h"
 #include <dirent.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -35,25 +36,25 @@ class SaveFolder
 {
 private:
 	std::vector<SaveTable*> saveItems;
-	std::string dname;
+	GString dname;
 
-	std::string getPath() const;
+	GString getPath() const;
 	void addItem(SaveTable*);
 	void clean();
 
 public:
 	// constructors & destructor
-	SaveFolder(const std::string&);
-	~SaveFolder();
+	SaveFolder(const GString&);
+	virtual ~SaveFolder();
 
-	SaveTable* loadItem(const std::string&);
-	bool deleteItem(const std::string&);
-	SaveTable* newItem(const std::string&, const GTable&);
+	SaveTable* loadItem(const GString&);
+	bool deleteItem(const GString&);
+	SaveTable* newItem(const GString&, const GTable&);
 	void load();
 	static std::vector<SaveFolder*> loadFolders();
 
 	// gets
-	std::string getName() const;
+	GString getName() const;
 	const std::vector<SaveTable*>& getItems() const;
 	int size() const;
 };

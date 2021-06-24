@@ -320,7 +320,7 @@ float glades::NNInfo::getActivationParam(unsigned int index) const
  */
 void glades::NNInfo::print() const
 {
-	std::vector<std::string> headers;
+	std::vector<shmea::GString> headers;
 	headers.push_back("Layer");
 	headers.push_back("Size");
 	headers.push_back("pInput");
@@ -364,7 +364,7 @@ void glades::NNInfo::print() const
 		for (unsigned int col = 0; col < printTable.numberOfCols(); ++col)
 		{
 			shmea::GType cell = printTable.getCell(row, col);
-			std::string word = cell.getString();
+			shmea::GString word = cell;
 			if (atoi(word.c_str()) == -1)
 				printf("\t");
 			else
@@ -596,7 +596,7 @@ void glades::NNInfo::removeHiddenLayer(unsigned int index)
  */
 shmea::GTable glades::NNInfo::toGTable() const
 {
-	std::vector<std::string> headers;
+	std::vector<shmea::GString> headers;
 	headers.push_back("Size");
 	headers.push_back("pInput");
 	headers.push_back("batchSize");
@@ -667,11 +667,11 @@ bool glades::NNInfo::load(const std::string& netName)
 {
 	name = netName;
 	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
-	return fromGTable(name, slItem->loadItem(name)->getTable());
+	return fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
 }
 
 void glades::NNInfo::save() const
 {
 	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
-	slItem->newItem(name, toGTable());
+	slItem->newItem(name.c_str(), toGTable());
 }

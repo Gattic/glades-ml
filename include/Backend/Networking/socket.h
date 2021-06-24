@@ -17,7 +17,7 @@
 #ifndef _GSOCKET
 #define _GSOCKET
 
-#include "../Database/GList.h"
+#include "../Database/GString.h"
 #include <arpa/inet.h>
 #include <iostream>
 #include <netdb.h>
@@ -34,6 +34,10 @@
 #include <utility>
 #include <vector>
 
+namespace shmea {
+class ServiceData;
+};
+
 namespace GNet {
 class GServer;
 class Connection;
@@ -42,38 +46,37 @@ class Sockets
 {
 private:
 	static const int64_t DEFAULT_KEY = 420l;
-	static const std::string ANYADDR;
+	static const shmea::GString ANYADDR;
 
-	std::string PORT;
+	shmea::GString PORT;
 	int64_t* overflow; // dont free this
 	unsigned int overflowLen;
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
-	std::queue<shmea::GList> inboundLists;
-	std::queue<std::pair<Connection*, shmea::GList> > outboundLists;
+	std::queue<const shmea::ServiceData*> inboundLists;
+	std::queue<std::pair<Connection*, const shmea::ServiceData*> > outboundLists;
 
 	void initSockets();
 
-	// GList emptyResponseList();
+	// ServiceData* emptyResponseList();
 
 public:
-	static const std::string LOCALHOST;
+	static const shmea::GString LOCALHOST;
 
 	Sockets();
-	Sockets(const std::string&);
+	Sockets(const shmea::GString&);
 	~Sockets();
 
 	// functions
-	void initSockets(const std::string&);
+	void initSockets(const shmea::GString&);
 	void closeSockets();
-	const std::string getPort();
+	const shmea::GString getPort();
 	int openServerConnection();
-	int openClientConnection(const std::string&);
+	int openClientConnection(const shmea::GString&);
 	int64_t* reader(const int&, unsigned int&);
-	void readConnection(Connection*, const int&, const std::string&, std::vector<shmea::GList>&);
-	void readConnectionHelper(Connection*, const int&, const std::string&,
-							  std::vector<shmea::GList>&);
-	int writeConnection(const Connection*, const int&, const shmea::GList&, int);
+	void readConnection(Connection*, const int&, std::vector<const shmea::ServiceData*>&);
+	void readConnectionHelper(Connection*, const int&, std::vector<const shmea::ServiceData*>&);
+	int writeConnection(const Connection*, const int&, const shmea::ServiceData*);
 	void closeConnection(const int&);
 
 	bool anyInboundLists();
@@ -82,7 +85,7 @@ public:
 	bool readLists(Connection*);
 	void processLists(GServer*, Connection*);
 	void writeLists(GServer*);
-	void addResponseList(GServer*, Connection*, const shmea::GList&);
+	void addResponseList(GServer*, Connection*, const shmea::ServiceData*);
 };
 };
 

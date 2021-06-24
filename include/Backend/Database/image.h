@@ -25,6 +25,8 @@ class RUBackgroundComponent;
 
 namespace shmea {
 
+class GString;
+
 // 32 bit color pixel density
 class RGBA
 {
@@ -69,11 +71,11 @@ private:
 		}
 	}
 
-	bool LoadPPM(const std::string&);
-	bool LoadPBM(const std::string&);
-	bool SavePPM(const std::string&) const;
-	bool SavePBM(const std::string&) const;
-	void LoadBMP(const std::string&);
+	bool LoadPPM(const GString&);
+	bool LoadPBM(const GString&);
+	bool SavePPM(const GString&) const;
+	bool SavePBM(const GString&) const;
+	void LoadBMP(const GString&);
 
 public:
 	Image() : width(0), height(0), pitch(0), data(NULL)

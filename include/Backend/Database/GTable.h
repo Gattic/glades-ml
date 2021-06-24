@@ -19,6 +19,7 @@
 
 #include "GList.h"
 #include "GType.h"
+#include "GString.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -35,7 +36,7 @@ private:
 	friend Serializable;
 
 	char delimiter;
-	std::vector<std::string> header;
+	std::vector<GString> header;
 	std::vector<GList> cells;
 	float xMin;
 	float xMax;
@@ -43,8 +44,8 @@ private:
 
 	std::vector<unsigned int> outputColumns; // sparse boolean array
 
-	void importFromFile(const std::string&);
-	void importFromString(const std::string&);
+	void importFromFile(const GString&);
+	void importFromString(const GString&);
 
 public:
 	static const int TYPE_FILE = 0;
@@ -53,16 +54,16 @@ public:
 
 	GTable();
 	GTable(char);
-	GTable(char, const std::vector<std::string>&);
-	GTable(const std::string&, char, int);
+	GTable(char, const std::vector<GString>&);
+	GTable(const GString&, char, int);
 	GTable(const GTable&);
-	~GTable();
+	virtual ~GTable();
 	void copy(const GTable&);
 
 	// gets
 	char getDelimiter() const;
-	std::vector<std::string> getHeaders() const;
-	std::string getHeader(unsigned int) const;
+	std::vector<GString> getHeaders() const;
+	GString getHeader(unsigned int) const;
 	GType getCell(unsigned int, unsigned int) const;
 	GList getRow(unsigned int) const;
 	unsigned int numberOfCols() const;
@@ -71,7 +72,7 @@ public:
 	void printHeaders() const;
 	GList getCol(unsigned int) const;
 	GList getCol(const char*) const;
-	GList getCol(const std::string&) const;
+	GList getCol(const GString&) const;
 	float getMin() const;
 	float getMax() const;
 	float getRange() const;
@@ -84,16 +85,16 @@ public:
 	void addRow(const GList&);
 	void removeRow(unsigned int);
 	void clear();
-	void addCol(const std::string&, const GList&,
+	void addCol(const GString&, const GList&,
 				unsigned int = -1); // largest col, will be set to numberOfCols
 	void removeCol(unsigned int);
 	void swapCol(unsigned int, unsigned int);
 	void moveCol(unsigned int, unsigned int);
 	void append(const GTable&);
 	void append(const GTable*);
-	void setHeaders(const std::vector<std::string>&);
-	void addHeader(unsigned int, const std::string&);
-	void save(const std::string&) const;
+	void setHeaders(const std::vector<GString>&);
+	void addHeader(unsigned int, const GString&);
+	void save(const GString&) const;
 	void toggleOutput(unsigned int);
 	void clearOutputs();
 	void setMin(float);
@@ -101,8 +102,10 @@ public:
 	void setRange(float);
 
 	// operators
+	const GList& operator[](int) const;
+	const GList& operator[](unsigned int) const;
 	GList operator[](const char*) const;
-	GList operator[](const std::string&) const;
+	GList operator[](const GString&) const;
 	void operator=(const GTable&);
 
 	static std::vector<GTable*> stratify(const GTable&, unsigned int = 10);
