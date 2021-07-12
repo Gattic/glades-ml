@@ -9,6 +9,15 @@ https://github.com/MeeseeksLookAtMe/glades-ml
 
 ---
 
+## Website
+http://glades-ml.com/
+
+## Github
+
+https://github.com/MeeseeksLookAtMe/glades-ml
+
+---
+
 ## Discord
 
 https://discord.gg/4DN2WMm
