@@ -52,6 +52,7 @@ public:
 	const shmea::ServiceData* sockData;
 	pthread_t* sThread;
 	shmea::GString command;
+	int stIndex;
 };
 
 class GServer

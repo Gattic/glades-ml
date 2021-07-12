@@ -95,7 +95,7 @@ public:
 	GString substr(unsigned int, unsigned int=0) const;
 
 	// Member helpers
-	static GType* Typify(const char*, unsigned int);
+	static GType Typify(const char*, unsigned int);
 	bool isWhitespace() const;
 	bool isInteger() const;
 	bool isFloat() const;

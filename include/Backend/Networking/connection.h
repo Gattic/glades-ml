@@ -50,9 +50,7 @@ public:
 	static const int CLIENT_TYPE = 1;
 
 	int sockfd;
-	int64_t* overflow;
-	unsigned int overflowLen;
-	std::vector<pthread_t*> sThreads; // all the active service threads
+	shmea::GString overflow;
 
 	Connection(int, int, shmea::GString);
 	Connection(const Connection&);

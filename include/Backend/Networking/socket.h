@@ -49,8 +49,6 @@ private:
 	static const shmea::GString ANYADDR;
 
 	shmea::GString PORT;
-	int64_t* overflow; // dont free this
-	unsigned int overflowLen;
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
 	std::queue<const shmea::ServiceData*> inboundLists;
@@ -73,7 +71,7 @@ public:
 	const shmea::GString getPort();
 	int openServerConnection();
 	int openClientConnection(const shmea::GString&);
-	int64_t* reader(const int&, unsigned int&);
+	shmea::GString reader(const int&);
 	void readConnection(Connection*, const int&, std::vector<const shmea::ServiceData*>&);
 	void readConnectionHelper(Connection*, const int&, std::vector<const shmea::ServiceData*>&);
 	int writeConnection(const Connection*, const int&, const shmea::ServiceData*);

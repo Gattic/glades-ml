@@ -46,6 +46,7 @@ private:
 	// timestamp variable to store service start and end time
 	static shmea::GString name;
 	int64_t timeExecuted;
+	pthread_t* cThread;
 
 	static void* launchService(void* y);
 	virtual shmea::ServiceData* execute(const shmea::ServiceData*) = 0;
