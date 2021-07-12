@@ -14,62 +14,53 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _LOGOUT_CLIENT
-#define _LOGOUT_CLIENT
+#ifndef _GOBJECT
+#define _GOBJECT
 
-#include "../Backend/Database/GString.h"
-#include "../Backend/Database/ServiceData.h"
-#include "../Backend/Networking/main.h"
-#include "../Backend/Networking/service.h"
+#include "GTable.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <vector>
 
-class Logout_Client : public GNet::Service
+namespace shmea {
+class Serializable;
+
+class GObject
 {
+	friend Serializable;
+
 private:
-	GNet::GServer* serverInstance;
+	//
+	GTable members;
+	std::vector<GTable> memberTables;
 
 public:
-	Logout_Client()
-	{
-		serverInstance = NULL;
-	}
+	GObject();
+	GObject(const GObject&);
+	~GObject();
 
-	Logout_Client(GNet::GServer* newInstance)
-	{
-		serverInstance = newInstance;
-	}
+	// sets
+	void copy(const GObject&);
+	void addTable(const GTable&);
+	void insertTable(unsigned int, const GTable&);
+	void setTable(unsigned int, const GTable&);
+	void setMembers(const GTable&);
+	void remove(unsigned int);
+	void clear();
 
-	~Logout_Client()
-	{
-		serverInstance = NULL; // Not ours to delete
-	}
+	// gets
+	GTable getTable(unsigned int) const;
+	const GTable& getMembers() const;
+	unsigned int size() const;
+	bool empty() const;
 
-	shmea::ServiceData* execute(const shmea::ServiceData* data)
-	{
-		class GNet::Connection* destination = data->getConnection();
-
-		if (!serverInstance)
-			return NULL;
-
-		printf("[CLOGOUT] %s\n", destination->getIP().c_str());
-
-		// delete it from the data structure
-		serverInstance->removeClientConnection(destination);
-
-		// Clean up the Connection
-		destination->finish();
-
-		return NULL;
-	}
-
-	GNet::Service* MakeService(GNet::GServer* newInstance) const
-	{
-		return new Logout_Client(newInstance);
-	}
-
-	shmea::GString getName() const
-	{
-		return "Logout_Client";
-	}
+	// operators
+	GTable operator[](unsigned int);
+	const GTable operator[](unsigned int) const;
+	void operator=(const GObject&);
+};
 };
 
 #endif

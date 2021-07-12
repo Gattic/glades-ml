@@ -14,8 +14,8 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GCONNECTION
-#define _GCONNECTION
+#ifndef _GSERVICEDATA
+#define _GSERVICEDATA
 
 #include "../Database/GString.h"
 #include <pthread.h>
@@ -27,50 +27,64 @@
 #include <vector>
 
 namespace GNet {
+class Connection;
+};
 
-class newServiceArgs;
-class Service;
+namespace shmea {
+	class GList;
+	class GTable;
+	class GObject;
+	class Serializable;
 
-class Connection
+class ServiceData
 {
 private:
-	shmea::GString name;
-	shmea::GString ip;
-	int connectionType;
-	int64_t key;
-	bool finished;
+
+	GNet::Connection* cConnection;
+	shmea::GString sid;
+	shmea::GString command;
+	int type;
+
+	shmea::GList* repList;
+	shmea::GTable* repTable;
+	shmea::GObject* repObj;
 
 public:
-	// member limits
-	static const int KEY_LENGTH = 6;
 
-	// connectionType
-	static const int EMPTY_TYPE = -1;
-	static const int SERVER_TYPE = 0;
-	static const int CLIENT_TYPE = 1;
+	static const int SID_LENGTH = 12;
 
-	int sockfd;
-	shmea::GString overflow;
+	static const int TYPE_ACK = 0;//default
+	static const int TYPE_LIST = 1;
+	static const int TYPE_TABLE = 2;
+	static const int TYPE_NETWORK_POINTER = 3;
 
-	Connection(int, int, shmea::GString);
-	Connection(const Connection&);
-	~Connection();
-	void finish();
+	ServiceData(GNet::Connection*);
+	ServiceData(GNet::Connection*, shmea::GString);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::GList*);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::GTable*);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::Serializable*);
+	ServiceData(const ServiceData&);
+	virtual ~ServiceData();
 
-	// gets
-	shmea::GString getName() const;
-	shmea::GString getIP() const;
-	int getConnectionType() const;
-	int64_t getKey() const;
-	bool isFinished() const;
+	GNet::Connection* getConnection() const;
+	shmea::GString getSID() const;
+	shmea::GString getCommand() const;
+	int getType() const;
 
-	// sets
-	void setName(shmea::GString);
-	void setIP(shmea::GString);
-	void setKey(int64_t);
+	void setSID(shmea::GString);
+	void setCommand(shmea::GString);
+	void setType(int);
 
-	static bool validName(const shmea::GString&);
-	static int64_t generateKey();
+	const GList* getList() const;
+	const GTable* getTable() const;
+	const GObject* getObj() const;
+
+	void setList(GList*);
+	void setTable(GTable*);
+	void setObj(GObject*);
+
+	static bool validSID(const shmea::GString&);
+	static shmea::GString generateSID();
 };
 };
 

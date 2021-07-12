@@ -17,7 +17,7 @@
 #ifndef _GSERVICE
 #define _GSERVICE
 
-#include "../Database/GList.h"
+#include "../Database/GString.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +25,10 @@
 #include <string>
 #include <time.h>
 #include <vector>
+
+namespace shmea {
+class ServiceData;
+};
 
 namespace GNet {
 
@@ -40,22 +44,23 @@ class Service
 
 private:
 	// timestamp variable to store service start and end time
-	static std::string name;
+	static shmea::GString name;
 	int64_t timeExecuted;
+	pthread_t* cThread;
 
 	static void* launchService(void* y);
-	virtual shmea::GList execute(Connection*, const shmea::GList&) = 0;
+	virtual shmea::ServiceData* execute(const shmea::ServiceData*) = 0;
 	void StartService(newServiceArgs*);
 	void ExitService(newServiceArgs*);
 
-	static void ExecuteService(GServer*, const shmea::GList&, Connection* = NULL);
+	static void ExecuteService(GServer*, const shmea::ServiceData*, Connection* = NULL);
 
 public:
 	Service();
 	virtual ~Service();
 
 	virtual Service* MakeService(GServer*) const = 0;
-	virtual std::string getName() const = 0;
+	virtual shmea::GString getName() const = 0;
 };
 };
 

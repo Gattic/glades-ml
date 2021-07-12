@@ -17,8 +17,7 @@
 #ifndef _GNET
 #define _GNET
 
-#include "../Database/GList.h"
-#include "socket.h"
+#include "../Database/GString.h"
 #include <errno.h>
 #include <iostream>
 #include <map>
@@ -34,32 +33,15 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>*/
 
-class GList;
-
-/*
- * THE ENGINE
- *
- * Handshake Client
- * HANDSHAKE_CLIENT|name\|
- *
- * Handshake Server
- * HANDSHAKE_SERVER|name|encKey\|
- *
- * Logout Server
- * LOGOUT_SERVER\|
- *
- * Logout Client
- * LOGOUT_CLIENT\|
- *
- * Bad Request
- * BAD_REQUEST\|
- *
- */
+namespace shmea {
+class ServiceData;
+};
 
 namespace GNet {
 
 class Connection;
 class Service;
+class Sockets;
 
 // Service Arguments Class
 class newServiceArgs
@@ -67,9 +49,10 @@ class newServiceArgs
 public:
 	class GServer* serverInstance;
 	class Connection* cConnection;
-	shmea::GList sockData;
+	const shmea::ServiceData* sockData;
 	pthread_t* sThread;
-	std::string command;
+	shmea::GString command;
+	int stIndex;
 };
 
 class GServer
@@ -77,11 +60,11 @@ class GServer
 	friend Sockets;
 	friend Service;
 
-	GNet::Sockets socks;
+	GNet::Sockets* socks;
 
 	// Key is ip address
-	std::map<std::string, Connection*>* clientConnections;
-	std::map<std::string, Connection*>* serverConnections;
+	std::map<shmea::GString, Connection*>* clientConnections;
+	std::map<shmea::GString, Connection*>* serverConnections;
 
 	int sockfd;
 	Connection* localConnection;
@@ -93,7 +76,7 @@ class GServer
 	pthread_cond_t* writersBlock;
 	bool LOCAL_ONLY;
 	bool running;
-	std::map<std::string, Service*>* service_depot;
+	std::map<shmea::GString, Service*>* service_depot;
 
 	static void* commandLauncher(void*);
 	void commandCatcher(void*);
@@ -104,12 +87,12 @@ class GServer
 	void wakeWriter();
 	static void* ListWLauncher(void*);
 	void ListWriter(void*);
-	void LaunchLocalInstance(const std::string&);
+	void LaunchLocalInstance(const shmea::GString&);
 	void LogoutInstance(Connection*);
 
 	int getSockFD();
-	const std::map<std::string, Connection*>& getClientConnections();
-	const std::map<std::string, Connection*>& getServerConnections();
+	const std::map<shmea::GString, Connection*>& getClientConnections();
+	const std::map<shmea::GString, Connection*>& getServerConnections();
 	pthread_mutex_t* getClientMutex();
 	pthread_mutex_t* getServerMutex();
 
@@ -118,20 +101,16 @@ class GServer
 	Connection* findExistingConnection(const std::vector<Connection*>&, const fd_set&);
 
 public:
-	static const int CONTENT_TYPE = 0;
-	static const int RESPONSE_TYPE = 1;
-	static const int ACK_TYPE = 2;
 
 	GServer();
 	~GServer();
 
-	void NewService(const shmea::GList&, GNet::Connection* = NULL, int = CONTENT_TYPE,
-					bool = false);
+	void send(const shmea::ServiceData*, bool = false);
 
-	Service* ServiceLookup(std::string);
-	unsigned int addService(std::string, Service*);
-	Connection* getConnection(std::string);
-	void LaunchInstance(const std::string&, const std::string&);
+	Service* ServiceLookup(shmea::GString);
+	unsigned int addService(shmea::GString, Service*);
+	Connection* getConnection(shmea::GString);
+	void LaunchInstance(const shmea::GString&, const shmea::GString&);
 	const bool& getRunning();
 	void stop();
 	void run(bool);
@@ -146,8 +125,8 @@ class LaunchInstanceHelperArgs
 {
 public:
 	GServer* serverInstance;
-	std::string clientName;
-	std::string serverIP;
+	shmea::GString clientName;
+	shmea::GString serverIP;
 };
 
 }; // GNet

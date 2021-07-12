@@ -18,8 +18,6 @@
 #define _GTYPES
 
 #include <ctime>
-#include <iomanip>
-#include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,12 +27,15 @@ namespace shmea {
 
 class GType
 {
-private:
+protected:
 	char* block;
 	unsigned int blockSize;
 	int type;
 
 public:
+
+	const static unsigned int npos = -1;
+
 	// valueType
 	static const int NULL_TYPE = -1;
 	static const int BOOLEAN_TYPE = 0;
@@ -56,15 +57,14 @@ public:
 	GType(const int64_t&);
 	GType(const float&);
 	GType(const double&);
-	GType(const std::string&);
+	GType(const char*);
+	GType(const char*, unsigned int);
 	GType(int, const void*, int64_t);
-	~GType();
+	virtual ~GType();
 
 	// gets
-	char* getBlockCopy() const;
 	int getType() const;
-	std::string getString() const;
-	const char* getCString() const;
+	const char* c_str() const;
 	char getChar() const;
 	short getShort() const;
 	int getInt() const;
@@ -72,6 +72,8 @@ public:
 	float getFloat() const;
 	double getDouble() const;
 	bool getBoolean() const;
+
+	operator const char*() const;
 	operator char() const;
 	operator short() const;
 	operator int() const;
@@ -79,8 +81,6 @@ public:
 	operator float() const;
 	operator double() const;
 	operator bool() const;
-	operator std::string() const;
-	operator const char*() const;
 	unsigned int size() const;
 
 	// sets
@@ -88,71 +88,89 @@ public:
 	void clean();
 
 	//= operators
-	void operator=(const GType&);
-	void operator=(const char&);
-	void operator=(const short&);
-	void operator=(const int&);
-	void operator=(const int64_t&);
-	void operator=(const float&);
-	void operator=(const double&);
-	void operator=(const char*);
-	void operator=(const std::string&);
-	void operator=(const bool&);
+	GType& operator=(const GType&);
+	GType& operator=(const char&);
+	GType& operator=(const short&);
+	GType& operator=(const int&);
+	GType& operator=(const int64_t&);
+	GType& operator=(const float&);
+	GType& operator=(const double&);
+	GType& operator=(const char*);
+	GType& operator=(const bool&);
 
 	//== operators
-	bool operator==(const GType&);
-	bool operator==(const char&);
-	bool operator==(const short&);
-	bool operator==(const int&);
-	bool operator==(const int64_t&);
-	bool operator==(const float&);
-	bool operator==(const double&);
-	bool operator==(const char*);
-	bool operator==(const std::string&);
-	bool operator==(const bool&);
+	bool operator==(const GType&) const;
+	bool operator==(const char&) const;
+	bool operator==(const short&) const;
+	bool operator==(const int&) const;
+	bool operator==(const int64_t&) const;
+	bool operator==(const float&) const;
+	bool operator==(const double&) const;
+	bool operator==(const char*) const;
+	bool operator==(const bool&) const;
 
 	//!= operators
-	bool operator!=(const GType&);
-	bool operator!=(const char&);
-	bool operator!=(const short&);
-	bool operator!=(const int&);
-	bool operator!=(const int64_t&);
-	bool operator!=(const float&);
-	bool operator!=(const double&);
-	bool operator!=(const char*);
-	bool operator!=(const std::string&);
-	bool operator!=(const bool&);
+	bool operator!=(const GType&) const;
+	bool operator!=(const char&) const;
+	bool operator!=(const short&) const;
+	bool operator!=(const int&) const;
+	bool operator!=(const int64_t&) const;
+	bool operator!=(const float&) const;
+	bool operator!=(const double&) const;
+	bool operator!=(const char*) const;
+	bool operator!=(const bool&) const;
 
-	// helpers
-	static bool isWhitespace(const char);
-	static bool isWhitespace(const char*);
-	static bool isWhitespace(const std::string);
-	static bool isInteger(const char*);
-	static bool isInteger(const std::string);
-	static bool isFloat(const char*);
-	static bool isFloat(const std::string);
-	static bool isUpper(const char);
-	static bool isUpper(const std::string);
-	static char toUpper(char);
-	static std::string toUpper(const std::string);
-	static bool isLower(const char);
-	static bool isLower(const std::string);
-	static char toLower(char);
-	static std::string toLower(const std::string);
-	static char toggleCase(char);
-	static std::string toggleCase(const std::string);
-	static std::string trim(std::string);
-	static std::string trim(char*);
-	static std::string charTOstring(const char);
-	static std::string shortTOstring(const short);
-	static std::string intTOstring(const int);
-	static std::string longTOstring(const int64_t);
-	static std::string floatTOstring(const float);
-	static std::string doubleTOstring(const double);
-	static std::string datetimeTOstring(const int64_t);
-	static std::string dateTOstring(const int64_t);
-	static std::string timeTOstring(const int64_t);
-	static unsigned int cfind(const char, const char*, const unsigned int);
+	//< operators
+	bool operator<(const GType&) const;
+	bool operator<(const char&) const;
+	bool operator<(const short&) const;
+	bool operator<(const int&) const;
+	bool operator<(const int64_t&) const;
+	bool operator<(const float&) const;
+	bool operator<(const double&) const;
+	bool operator<(const char*) const;
+	bool operator<(const bool&) const;
+
+	//> operators
+	bool operator>(const GType&) const;
+	bool operator>(const char&) const;
+	bool operator>(const short&) const;
+	bool operator>(const int&) const;
+	bool operator>(const int64_t&) const;
+	bool operator>(const float&) const;
+	bool operator>(const double&) const;
+	bool operator>(const char*) const;
+	bool operator>(const bool&) const;
+
+	//<= operators
+	bool operator<=(const GType&) const;
+	bool operator<=(const char&) const;
+	bool operator<=(const short&) const;
+	bool operator<=(const int&) const;
+	bool operator<=(const int64_t&) const;
+	bool operator<=(const float&) const;
+	bool operator<=(const double&) const;
+	bool operator<=(const char*) const;
+	bool operator<=(const bool&) const;
+
+	//>= operators
+	bool operator>=(const GType&) const;
+	bool operator>=(const char&) const;
+	bool operator>=(const short&) const;
+	bool operator>=(const int&) const;
+	bool operator>=(const int64_t&) const;
+	bool operator>=(const float&) const;
+	bool operator>=(const double&) const;
+	bool operator>=(const char*) const;
+	bool operator>=(const bool&) const;
+
+	// Member helpers
+	unsigned int cfind(char) const;
+	unsigned int find(const char*, unsigned int) const;
+
+	// Static helpers
+	static unsigned int cfind(char, const char*, unsigned int);
+	static unsigned int find(const char*, unsigned int, const char*, unsigned int);
 };
 };
 
