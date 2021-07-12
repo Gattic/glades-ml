@@ -16,7 +16,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "inputlayerinfo.h"
 #include "Backend/Database/GList.h"
-#include "Backend/Database/gtype.h"
+#include "Backend/Database/GType.h"
 
 using namespace glades;
 

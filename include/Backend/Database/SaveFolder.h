@@ -14,9 +14,10 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GQL2_SAVELIST
-#define _GQL2_SAVELIST
+#ifndef _GSAVEFOLDER
+#define _GSAVEFOLDER
 
+#include "GString.h"
 #include <dirent.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -29,32 +30,32 @@
 namespace shmea {
 
 class GTable;
-class SaveItem;
+class SaveTable;
 
-class SaveList
+class SaveFolder
 {
 private:
-	std::vector<SaveItem*> saveItems;
-	std::string dname;
+	std::vector<SaveTable*> saveItems;
+	GString dname;
 
-	std::string getPath() const;
-	void addItem(SaveItem*);
+	GString getPath() const;
+	void addItem(SaveTable*);
 	void clean();
 
 public:
 	// constructors & destructor
-	SaveList(const std::string&);
-	~SaveList();
+	SaveFolder(const GString&);
+	virtual ~SaveFolder();
 
-	SaveItem* loadItem(const std::string&);
-	bool deleteItem(const std::string&);
-	SaveItem* newItem(const std::string&, const GTable&);
+	SaveTable* loadItem(const GString&);
+	bool deleteItem(const GString&);
+	SaveTable* newItem(const GString&, const GTable&);
 	void load();
-	static std::vector<SaveList*> loadFolders();
+	static std::vector<SaveFolder*> loadFolders();
 
 	// gets
-	std::string getName() const;
-	const std::vector<SaveItem*>& getItems() const;
+	GString getName() const;
+	const std::vector<SaveTable*>& getItems() const;
 	int size() const;
 };
 };

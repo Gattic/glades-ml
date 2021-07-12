@@ -16,10 +16,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "nninfo.h"
 #include "../../../main.h"
-#include "Backend/Database/gtable.h"
-#include "Backend/Database/gtype.h"
-#include "Backend/Database/saveitem.h"
-#include "Backend/Database/savelist.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GType.h"
+#include "Backend/Database/SaveFolder.h"
+#include "Backend/Database/SaveTable.h"
 #include "Backend/Networking/main.h"
 #include "hiddenlayerinfo.h"
 #include "inputlayerinfo.h"
@@ -320,7 +320,7 @@ float glades::NNInfo::getActivationParam(unsigned int index) const
  */
 void glades::NNInfo::print() const
 {
-	std::vector<std::string> headers;
+	std::vector<shmea::GString> headers;
 	headers.push_back("Layer");
 	headers.push_back("Size");
 	headers.push_back("pInput");
@@ -364,7 +364,7 @@ void glades::NNInfo::print() const
 		for (unsigned int col = 0; col < printTable.numberOfCols(); ++col)
 		{
 			shmea::GType cell = printTable.getCell(row, col);
-			std::string word = cell.getString();
+			shmea::GString word = cell;
 			if (atoi(word.c_str()) == -1)
 				printf("\t");
 			else
@@ -596,7 +596,7 @@ void glades::NNInfo::removeHiddenLayer(unsigned int index)
  */
 shmea::GTable glades::NNInfo::toGTable() const
 {
-	std::vector<std::string> headers;
+	std::vector<shmea::GString> headers;
 	headers.push_back("Size");
 	headers.push_back("pInput");
 	headers.push_back("batchSize");
@@ -666,12 +666,12 @@ bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable&
 bool glades::NNInfo::load(const std::string& netName)
 {
 	name = netName;
-	shmea::SaveList* slItem = new shmea::SaveList("neuralnetworks");
-	return fromGTable(name, slItem->loadItem(name)->getTable());
+	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
+	return fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
 }
 
 void glades::NNInfo::save() const
 {
-	shmea::SaveList* slItem = new shmea::SaveList("neuralnetworks");
-	slItem->newItem(name, toGTable());
+	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
+	slItem->newItem(name.c_str(), toGTable());
 }

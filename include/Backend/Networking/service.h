@@ -14,10 +14,10 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _SERVICE
-#define _SERVICE
+#ifndef _GSERVICE
+#define _GSERVICE
 
-#include "../Database/GList.h"
+#include "../Database/GString.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,10 +26,15 @@
 #include <time.h>
 #include <vector>
 
+namespace shmea {
+class ServiceData;
+};
+
 namespace GNet {
 
 class GServer;
 class Sockets;
+class Connection;
 class newServiceArgs;
 
 class Service
@@ -39,23 +44,23 @@ class Service
 
 private:
 	// timestamp variable to store service start and end time
-	static std::string name;
+	static shmea::GString name;
 	int64_t timeExecuted;
+	pthread_t* cThread;
 
 	static void* launchService(void* y);
-	virtual shmea::GList execute(class Instance*, const shmea::GList&) = 0;
+	virtual shmea::ServiceData* execute(const shmea::ServiceData*) = 0;
 	void StartService(newServiceArgs*);
 	void ExitService(newServiceArgs*);
 
-	static void ExecuteService(GServer* serverInstance, const shmea::GList&,
-							   class Instance* = NULL);
+	static void ExecuteService(GServer*, const shmea::ServiceData*, Connection* = NULL);
 
 public:
 	Service();
 	virtual ~Service();
 
 	virtual Service* MakeService(GServer*) const = 0;
-	virtual std::string getName() const = 0;
+	virtual shmea::GString getName() const = 0;
 };
 };
 

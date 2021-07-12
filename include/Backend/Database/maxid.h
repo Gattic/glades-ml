@@ -28,22 +28,23 @@
 #include <sys/signal.h>
 #include <sys/stat.h>
 #include <vector>
+#include "GString.h"
 
 namespace shmea {
 
 class MaxID
 {
 private:
-	static std::map<std::string, int64_t> maxID;
+	static std::map<GString, int64_t> maxID;
 
-	static std::string buildMaxIDFName(const std::string&);
-	static void parseMaxIDFile(const std::string&, char*, int64_t);
-	static void loadMaxID(const std::string&);
-	static void saveMaxID(const std::string&);
+	static GString buildMaxIDFName(const GString&);
+	static void parseMaxIDFile(const GString&, char*, int64_t);
+	static void loadMaxID(const GString&);
+	static void saveMaxID(const GString&);
 
 public:
-	static int64_t generateID(const std::string&);
-	static int64_t getMaxID(const std::string&);
+	static int64_t generateID(const GString&);
+	static int64_t getMaxID(const GString&);
 };
 };
 

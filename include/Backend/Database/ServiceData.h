@@ -14,9 +14,10 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _INSTANCE
-#define _INSTANCE
+#ifndef _GSERVICEDATA
+#define _GSERVICEDATA
 
+#include "../Database/GString.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,81 +27,64 @@
 #include <vector>
 
 namespace GNet {
+class Connection;
+};
 
-class newServiceArgs;
-class Service;
+namespace shmea {
+	class GList;
+	class GTable;
+	class GObject;
+	class Serializable;
 
-class Instance
+class ServiceData
 {
 private:
-	std::string name;
-	// std::string sid;//session id
-	std::string ip;
-	int connectionType;
-	int64_t key;
-	bool finished;
+
+	GNet::Connection* cConnection;
+	shmea::GString sid;
+	shmea::GString command;
+	int type;
+
+	shmea::GList* repList;
+	shmea::GTable* repTable;
+	shmea::GObject* repObj;
 
 public:
-	// member limits
-	static const int KEY_LENGTH = 6;
+
 	static const int SID_LENGTH = 12;
 
-	// connectionType
-	static const int EMPTY_TYPE = -1;
-	static const int SERVER_TYPE = 0;
-	static const int CLIENT_TYPE = 1;
+	static const int TYPE_ACK = 0;//default
+	static const int TYPE_LIST = 1;
+	static const int TYPE_TABLE = 2;
+	static const int TYPE_NETWORK_POINTER = 3;
 
-	int sockfd;
-	int64_t* overflow;
-	unsigned int overflowLen;
-	std::vector<Service*> sThreads; // all the active service threads
+	ServiceData(GNet::Connection*);
+	ServiceData(GNet::Connection*, shmea::GString);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::GList*);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::GTable*);
+	ServiceData(GNet::Connection*, shmea::GString, shmea::Serializable*);
+	ServiceData(const ServiceData&);
+	virtual ~ServiceData();
 
-	Instance(int, int, std::string);
-	~Instance();
-	void finish();
+	GNet::Connection* getConnection() const;
+	shmea::GString getSID() const;
+	shmea::GString getCommand() const;
+	int getType() const;
 
-	// gets
-	std::string getName() const
-	{
-		return name;
-	}
-	// std::string getSID() const { return sid; }
-	std::string getIP() const
-	{
-		return ip;
-	}
-	int getConnectionType() const
-	{
-		return connectionType;
-	}
-	int64_t getKey() const
-	{
-		return key;
-	}
-	bool isFinished() const
-	{
-		return finished;
-	}
+	void setSID(shmea::GString);
+	void setCommand(shmea::GString);
+	void setType(int);
 
-	// sets
-	void setName(std::string newName)
-	{
-		name = newName;
-	}
-	// void setSID(std::string newSID) { sid=newSID; }
-	void setIP(std::string newIP)
-	{
-		ip = newIP;
-	}
-	void setKey(int64_t newKey)
-	{
-		key = newKey;
-	}
+	const GList* getList() const;
+	const GTable* getTable() const;
+	const GObject* getObj() const;
 
-	static bool validName(const std::string&);
-	static int64_t generateKey();
-	// static bool validSID(const std::string&);
-	// static std::string generateSID();
+	void setList(GList*);
+	void setTable(GTable*);
+	void setObj(GObject*);
+
+	static bool validSID(const shmea::GString&);
+	static shmea::GString generateSID();
 };
 };
 

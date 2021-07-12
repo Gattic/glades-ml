@@ -15,8 +15,8 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "OHE.h"
-#include "Backend/Database/gtable.h"
-#include "Backend/Database/gtype.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GString.h"
 
 using namespace glades;
 
@@ -209,9 +209,8 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 {
 	for (unsigned int r = 0; r < gTable.numberOfRows(); ++r)
 	{
-		shmea::GType cCell = gTable.getCell(r, featureCol);
-		std::string word = cCell.getString();
-		addString(word);
+		shmea::GString cCell = gTable.getCell(r, featureCol);
+		addString(cCell);
 	}
 }
 

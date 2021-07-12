@@ -14,62 +14,64 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _LOGOUT_CLIENT
-#define _LOGOUT_CLIENT
+#ifndef _GCONNECTION
+#define _GCONNECTION
 
-#include "../Backend/Database/GString.h"
-#include "../Backend/Database/ServiceData.h"
-#include "../Backend/Networking/main.h"
-#include "../Backend/Networking/service.h"
+#include "../Database/GString.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <time.h>
+#include <vector>
 
-class Logout_Client : public GNet::Service
+namespace GNet {
+
+class newServiceArgs;
+class Service;
+
+class Connection
 {
 private:
-	GNet::GServer* serverInstance;
+	shmea::GString name;
+	shmea::GString ip;
+	int connectionType;
+	int64_t key;
+	bool finished;
 
 public:
-	Logout_Client()
-	{
-		serverInstance = NULL;
-	}
+	// member limits
+	static const int KEY_LENGTH = 6;
 
-	Logout_Client(GNet::GServer* newInstance)
-	{
-		serverInstance = newInstance;
-	}
+	// connectionType
+	static const int EMPTY_TYPE = -1;
+	static const int SERVER_TYPE = 0;
+	static const int CLIENT_TYPE = 1;
 
-	~Logout_Client()
-	{
-		serverInstance = NULL; // Not ours to delete
-	}
+	int sockfd;
+	shmea::GString overflow;
 
-	shmea::ServiceData* execute(const shmea::ServiceData* data)
-	{
-		class GNet::Connection* destination = data->getConnection();
+	Connection(int, int, shmea::GString);
+	Connection(const Connection&);
+	~Connection();
+	void finish();
 
-		if (!serverInstance)
-			return NULL;
+	// gets
+	shmea::GString getName() const;
+	shmea::GString getIP() const;
+	int getConnectionType() const;
+	int64_t getKey() const;
+	bool isFinished() const;
 
-		printf("[CLOGOUT] %s\n", destination->getIP().c_str());
+	// sets
+	void setName(shmea::GString);
+	void setIP(shmea::GString);
+	void setKey(int64_t);
 
-		// delete it from the data structure
-		serverInstance->removeClientConnection(destination);
-
-		// Clean up the Connection
-		destination->finish();
-
-		return NULL;
-	}
-
-	GNet::Service* MakeService(GNet::GServer* newInstance) const
-	{
-		return new Logout_Client(newInstance);
-	}
-
-	shmea::GString getName() const
-	{
-		return "Logout_Client";
-	}
+	static bool validName(const shmea::GString&);
+	static int64_t generateKey();
+};
 };
 
 #endif

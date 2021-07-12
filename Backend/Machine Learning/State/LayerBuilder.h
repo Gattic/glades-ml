@@ -17,7 +17,7 @@
 #ifndef _GQL_LAYERBUILDER
 #define _GQL_LAYERBUILDER
 
-#include "../../../include/Backend/Database/gtable.h"
+#include "Backend/Database/GTable.h"
 #include <map>
 #include <math.h>
 #include <stdio.h>

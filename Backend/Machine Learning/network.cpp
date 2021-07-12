@@ -15,15 +15,10 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "network.h"
-// #include "../../Frontend/GFXUtilities/point2.h"
-// #include "../../Frontend/GPanels/nncreator.h"
-// #include "../../Frontend/GPanels/simulation.h"
 #include "../../main.h"
 #include "Backend/Database/GList.h"
-#include "Backend/Database/gtable.h"
-#include "Backend/Database/gtype.h"
-#include "Backend/Database/maxid.h"
-#include "Backend/Networking/main.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GType.h"
 #include "GMath/OHE.h"
 #include "GMath/cmatrix.h"
 #include "GMath/gmath.h"

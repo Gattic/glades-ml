@@ -1,4 +1,13 @@
-# glades v0.55 Alpha
+# glades v0.56 Beta
+
+## Website
+http://glades-ml.com/
+
+## Github
+
+https://github.com/MeeseeksLookAtMe/glades-ml
+
+---
 
 ## Website
 http://glades-ml.com/

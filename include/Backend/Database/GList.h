@@ -17,7 +17,8 @@
 #ifndef _GLIST
 #define _GLIST
 
-#include "gtype.h"
+#include "GType.h"
+#include "GString.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +46,7 @@ public:
 	GList();
 	GList(const GList&);
 	GList(int, const GType&);
-	~GList();
+	virtual ~GList();
 
 	// sets
 	void copy(const GList&);
@@ -63,8 +64,8 @@ public:
 	void insertDouble(unsigned int, double);
 	void addBoolean(bool);
 	void insertBoolean(unsigned int, bool);
-	void addString(const std::string&);
-	void insertString(unsigned int, const std::string&);
+	void addString(const GString&);
+	void insertString(unsigned int, const GString&);
 	void addString(const char*);
 	void insertString(unsigned int, const char*);
 	void addGType(const GType&);
@@ -74,8 +75,8 @@ public:
 	void clear();
 
 	// gets
-	std::string getString(unsigned int) const;
-	const char* getCString(unsigned int) const;
+	GString getString(unsigned int) const;
+	const char* c_str(unsigned int) const;
 	char getChar(unsigned int) const;
 	short getShort(unsigned int) const;
 	int getInt(unsigned int) const;

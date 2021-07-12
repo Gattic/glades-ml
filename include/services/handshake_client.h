@@ -17,8 +17,10 @@
 #ifndef _HANDSHAKE_CLIENT
 #define _HANDSHAKE_CLIENT
 
+#include "../Backend/Database/GString.h"
 #include "../Backend/Database/GList.h"
-#include "../Backend/Networking/instance.h"
+#include "../Backend/Database/ServiceData.h"
+#include "../Backend/Networking/connection.h"
 #include "../Backend/Networking/service.h"
 
 class Handshake_Client : public GNet::Service
@@ -42,30 +44,34 @@ public:
 		serverInstance = NULL; // Not ours to delete
 	}
 
-	shmea::GList execute(class GNet::Instance* cInstance, const shmea::GList& data)
+	shmea::ServiceData* execute(const shmea::ServiceData* data)
 	{
 		// Log the server into the client
-		shmea::GList retList;
+		class GNet::Connection* destination = data->getConnection();
 
 		if (!serverInstance)
-			return retList;
+			return NULL;
 
-		if (data.size() < 2)
-			return retList;
+		const shmea::GList* cList = data->getList();
+		if (!cList)
+			return NULL;
+
+		if ((data->getType() != shmea::ServiceData::TYPE_LIST) || cList->size() < 2)
+			return NULL;
 
 		// Check the characters in the name
-		std::string clientName = data.getString(0);
-		if (!GNet::Instance::validName(clientName))
+		shmea::GString clientName = cList->getString(0);
+		if (!GNet::Connection::validName(clientName))
 			clientName = "";
-		cInstance->setName(clientName);
+		destination->setName(clientName);
 
 		// get the new encryption key
-		int64_t newKey = data.getLong(1);
+		int64_t newKey = cList->getLong(1);
 
-		// Set the new instance key
-		cInstance->setKey(newKey);
+		// Set the new Connection key
+		destination->setKey(newKey);
 
-		return retList;
+		return NULL;
 	}
 
 	GNet::Service* MakeService(GNet::GServer* newInstance) const
@@ -73,7 +79,7 @@ public:
 		return new Handshake_Client(newInstance);
 	}
 
-	std::string getName() const
+	shmea::GString getName() const
 	{
 		return "Handshake_Client";
 	}

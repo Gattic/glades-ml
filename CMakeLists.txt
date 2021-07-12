@@ -16,7 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #Project
 project(glades)
 set(G_VERSION_MAJOR 0)
-set(G_VERSION_MINOR 55)
+set(G_VERSION_MINOR 56)
 
 set(DEFAULT_BUILD_TYPE "Release")
 
@@ -68,9 +68,8 @@ install(EXPORT gladesConfig DESTINATION share/glades/cmake)
 export(TARGETS ${PROJECT_NAME} FILE gladesConfig.cmake)
 
 #make fmt
-add_custom_target(fmt ALL
+add_custom_target(fmt
 	COMMAND ./clang-format-all
-	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
@@ -79,11 +78,6 @@ add_custom_target(local
 	COMMAND ${PROJECT_NAME} local
 	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
-#make docs
-add_custom_target(docs
-	COMMAND google-chrome index.html
-	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/docs/html/
 )
 
 #make debug
@@ -104,5 +98,11 @@ add_custom_target(debug
 	add_custom_target(profile
 	COMMAND valgrind --tool=callgrind ./build/${PROJECT_NAME}
 	DEPENDS ${PROJECT_NAME}
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+#make uninstall
+	add_custom_target(uninstall
+	COMMAND sudo xargs rm < ./build/install_manifest.txt
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
