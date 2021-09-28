@@ -65,10 +65,6 @@ public:
 	Sockets(const shmea::GString&);
 	~Sockets();
 
-	Sockets();
-	Sockets(const std::string&);
-	~Sockets();
-
 	// functions
 	void initSockets(const shmea::GString&);
 	void closeSockets();

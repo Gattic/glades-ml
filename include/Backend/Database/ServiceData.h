@@ -18,6 +18,9 @@
 #define _GSERVICEDATA
 
 #include "../Database/GString.h"
+#include "../Database/GList.h"
+#include "../Database/GTable.h"
+#include "../Database/GObject.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,9 +48,9 @@ private:
 	shmea::GString command;
 	int type;
 
-	shmea::GList* repList;
-	shmea::GTable* repTable;
-	shmea::GObject* repObj;
+	shmea::GList repList;
+	shmea::GTable repTable;
+	shmea::GObject repObj;
 
 public:
 
@@ -60,9 +63,9 @@ public:
 
 	ServiceData(GNet::Connection*);
 	ServiceData(GNet::Connection*, shmea::GString);
-	ServiceData(GNet::Connection*, shmea::GString, shmea::GList*);
-	ServiceData(GNet::Connection*, shmea::GString, shmea::GTable*);
-	ServiceData(GNet::Connection*, shmea::GString, shmea::Serializable*);
+	ServiceData(GNet::Connection*, shmea::GString, const shmea::GList&);
+	ServiceData(GNet::Connection*, shmea::GString, const shmea::GTable&);
+	ServiceData(GNet::Connection*, shmea::GString, const shmea::Serializable&);
 	ServiceData(const ServiceData&);
 	virtual ~ServiceData();
 
@@ -75,13 +78,13 @@ public:
 	void setCommand(shmea::GString);
 	void setType(int);
 
-	const GList* getList() const;
-	const GTable* getTable() const;
-	const GObject* getObj() const;
+	const GList& getList() const;
+	const GTable& getTable() const;
+	const GObject& getObj() const;
 
-	void setList(GList*);
-	void setTable(GTable*);
-	void setObj(GObject*);
+	void setList(const GList&);
+	void setTable(const GTable&);
+	void setObj(const GObject&);
 
 	static bool validSID(const shmea::GString&);
 	static shmea::GString generateSID();

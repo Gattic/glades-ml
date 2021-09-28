@@ -18,6 +18,7 @@
 #define _GNET
 
 #include "../Database/GString.h"
+#include "socket.h"
 #include <errno.h>
 #include <iostream>
 #include <map>
@@ -63,8 +64,8 @@ class GServer
 	GNet::Sockets* socks;
 
 	// Key is ip address
-	std::map<shmea::GString, Connection*>* clientConnections;
-	std::map<shmea::GString, Connection*>* serverConnections;
+	std::map<shmea::GString, Connection*> clientConnections;
+	std::map<shmea::GString, Connection*> serverConnections;
 
 	int sockfd;
 	Connection* localConnection;
@@ -76,7 +77,7 @@ class GServer
 	pthread_cond_t* writersBlock;
 	bool LOCAL_ONLY;
 	bool running;
-	std::map<shmea::GString, Service*>* service_depot;
+	std::map<shmea::GString, Service*> service_depot;
 
 	static void* commandLauncher(void*);
 	void commandCatcher(void*);
@@ -108,7 +109,7 @@ public:
 	void send(const shmea::ServiceData*, bool = false);
 
 	Service* ServiceLookup(shmea::GString);
-	unsigned int addService(shmea::GString, Service*);
+	unsigned int addService(Service*);
 	Connection* getConnection(shmea::GString);
 	void LaunchInstance(const shmea::GString&, const shmea::GString&);
 	const bool& getRunning();

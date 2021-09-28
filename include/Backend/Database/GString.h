@@ -151,6 +151,8 @@ public:
 	static GString datetimeTOstring(int64_t);
 	static GString dateTOstring(int64_t);
 	static GString timeTOstring(int64_t);
+	static int64_t parseDate(const std::string, const std::string, const std::string,
+		const std::string = "00", const std::string = "00", const std::string = "00");
 };
 };
 

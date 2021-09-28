@@ -63,8 +63,8 @@ public:
 	static void Deserialize(GObject&, const GString& serial);	// from byte stream
 	static void Deserialize(ServiceData*, const GString& serial);	// from byte stream
 
-	virtual GObject* serialize() const = 0;
-	virtual void deserialize(const GObject*) = 0;
+	virtual GObject serialize() const = 0;
+	virtual void deserialize(const GObject&) = 0;
 
 };
 };
