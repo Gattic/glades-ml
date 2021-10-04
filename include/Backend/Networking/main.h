@@ -106,7 +106,7 @@ public:
 	GServer();
 	~GServer();
 
-	void send(const shmea::ServiceData*, bool = false);
+	void send(const shmea::ServiceData*, bool = true, bool = false);
 
 	Service* ServiceLookup(shmea::GString);
 	unsigned int addService(Service*);
