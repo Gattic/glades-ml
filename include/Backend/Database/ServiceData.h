@@ -34,9 +34,6 @@ class Connection;
 };
 
 namespace shmea {
-	class GList;
-	class GTable;
-	class GObject;
 	class Serializable;
 
 class ServiceData
@@ -44,9 +41,11 @@ class ServiceData
 private:
 
 	GNet::Connection* cConnection;
+	int64_t timesent;
 	shmea::GString sid;
 	shmea::GString command;
 	int type;
+	shmea::GList argList;
 
 	shmea::GList repList;
 	shmea::GTable repTable;
@@ -65,18 +64,23 @@ public:
 	ServiceData(GNet::Connection*, shmea::GString);
 	ServiceData(GNet::Connection*, shmea::GString, const shmea::GList&);
 	ServiceData(GNet::Connection*, shmea::GString, const shmea::GTable&);
+	ServiceData(GNet::Connection*, shmea::GString, const shmea::GObject&);
 	ServiceData(GNet::Connection*, shmea::GString, const shmea::Serializable&);
 	ServiceData(const ServiceData&);
 	virtual ~ServiceData();
 
 	GNet::Connection* getConnection() const;
+	int64_t getTimesent() const;
 	shmea::GString getSID() const;
 	shmea::GString getCommand() const;
 	int getType() const;
+	const GList& getArgList() const;
 
+	void setTimesent(int64_t);
 	void setSID(shmea::GString);
 	void setCommand(shmea::GString);
 	void setType(int);
+	void setArgList(const GList&);
 
 	const GList& getList() const;
 	const GTable& getTable() const;

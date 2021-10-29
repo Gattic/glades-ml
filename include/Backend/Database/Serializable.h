@@ -54,10 +54,12 @@ private:
 	static GString deserializeContent(const GString&);
 
 public:
+
 	static GString Serialize(const GList&, bool = false);		// to byte stream
 	static GString Serialize(const GTable&, bool = false);		// to byte stream
 	static GString Serialize(const GObject&, bool = false);		// to byte stream
 	static GString Serialize(const ServiceData*);			// to byte stream
+
 	static int Deserialize(GList&, const GString& serial, int = 0);// from byte stream; make this private?
 	static void Deserialize(GTable&, const GString& serial);	// from byte stream
 	static void Deserialize(GObject&, const GString& serial);	// from byte stream

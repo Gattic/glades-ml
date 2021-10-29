@@ -52,7 +52,7 @@ private:
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
 	std::queue<const shmea::ServiceData*> inboundLists;
-	std::queue<std::pair<Connection*, const shmea::ServiceData*> > outboundLists;
+	std::queue<const shmea::ServiceData*> outboundLists;
 
 	void initSockets();
 
