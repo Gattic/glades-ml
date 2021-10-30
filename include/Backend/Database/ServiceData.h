@@ -44,6 +44,7 @@ private:
 	int64_t timesent;
 	shmea::GString sid;
 	shmea::GString command;
+	int64_t serviceNum;
 	int type;
 	shmea::GList argList;
 
@@ -73,12 +74,15 @@ public:
 	int64_t getTimesent() const;
 	shmea::GString getSID() const;
 	shmea::GString getCommand() const;
+	int64_t getServiceNum() const;
 	int getType() const;
 	const GList& getArgList() const;
 
 	void setTimesent(int64_t);
 	void setSID(shmea::GString);
 	void setCommand(shmea::GString);
+	void assignServiceNum();
+	void setServiceNum(int64_t);
 	void setType(int);
 	void setArgList(const GList&);
 
@@ -92,6 +96,9 @@ public:
 
 	static bool validSID(const shmea::GString&);
 	static shmea::GString generateSID();
+
+	bool operator<(const ServiceData&) const;
+	bool operator>(const ServiceData&) const;
 };
 };
 

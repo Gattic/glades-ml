@@ -22,6 +22,7 @@
 #include <iostream>
 #include <netdb.h>
 #include <pthread.h>
+#include <map>
 #include <queue>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,8 +52,8 @@ private:
 	shmea::GString PORT;
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
-	std::queue<const shmea::ServiceData*> inboundLists;
-	std::queue<const shmea::ServiceData*> outboundLists;
+	std::map<int64_t, shmea::ServiceData*> inboundLists; // Vector of sds instead? Make the key advanced to take hostnames, usernames,  etc; too
+	std::queue<shmea::ServiceData*> outboundLists; // Vector of sds instead?
 
 	void initSockets();
 
@@ -72,9 +73,9 @@ public:
 	int openServerConnection();
 	int openClientConnection(const shmea::GString&);
 	shmea::GString reader(const int&);
-	void readConnection(Connection*, const int&, std::vector<const shmea::ServiceData*>&);
-	void readConnectionHelper(Connection*, const int&, std::vector<const shmea::ServiceData*>&);
-	int writeConnection(const Connection*, const int&, const shmea::ServiceData*);
+	void readConnection(Connection*, const int&, std::vector<shmea::ServiceData*>&);
+	void readConnectionHelper(Connection*, const int&, std::vector<shmea::ServiceData*>&);
+	int writeConnection(const Connection*, const int&, shmea::ServiceData*);
 	void closeConnection(const int&);
 
 	bool anyInboundLists();
@@ -83,7 +84,7 @@ public:
 	bool readLists(Connection*);
 	void processLists(GServer*, Connection*);
 	void writeLists(GServer*);
-	void addResponseList(GServer*, Connection*, const shmea::ServiceData*);
+	void addResponseList(GServer*, Connection*, shmea::ServiceData*);
 };
 };
 
