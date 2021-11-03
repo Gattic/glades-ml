@@ -53,7 +53,7 @@ private:
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
 	std::map<int64_t, shmea::ServiceData*> inboundLists; // Vector of sds instead? Make the key advanced to take hostnames, usernames,  etc; too
-	std::queue<shmea::ServiceData*> outboundLists; // Vector of sds instead?
+	std::map<int64_t, shmea::ServiceData*> outboundLists; // Vector of sds instead?
 
 	void initSockets();
 
