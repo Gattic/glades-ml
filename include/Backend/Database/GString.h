@@ -92,7 +92,7 @@ public:
 
 	// Strng Helpers
 	void initEmpty();
-	GString substr(unsigned int, unsigned int=0) const;
+	GString substr(unsigned int, unsigned int=npos) const;
 
 	// Member helpers
 	static GType Typify(const char*, unsigned int);
