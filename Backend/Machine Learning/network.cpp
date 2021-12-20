@@ -19,6 +19,8 @@
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
+#include "Backend/Database/ServiceData.h"
+#include "Backend/Networking/main.h"
 #include "GMath/OHE.h"
 #include "GMath/cmatrix.h"
 #include "GMath/gmath.h"
@@ -44,6 +46,8 @@ glades::NNetwork::NNetwork()
 	skeleton = NULL;
 	meat = NULL;
 	confusionMatrix = NULL;
+	serverInstance = NULL;
+	cConnection = NULL;
 	clean();
 	meat = new LayerBuilder();
 	confusionMatrix = new glades::CMatrix();
@@ -64,6 +68,8 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo)
 	skeleton = NULL;
 	meat = NULL;
 	confusionMatrix = NULL;
+	serverInstance = NULL;
+	cConnection = NULL;
 	clean();
 	meat = new LayerBuilder();
 	confusionMatrix = new glades::CMatrix();
@@ -218,29 +224,39 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 
 		if (runType == RUN_TRAIN)
 		{
-			// First epoch is random
-			if (epochs > 0)
+			// Update the GUI with the metrics
+			//if(guiEnabled)
+			if(serverInstance && cConnection)
 			{
-				// Update the learning curve graph
-				// learningCurve.addFloat(overallTotalError);
-				// if ((Frontend::simulationPanel) && (Frontend::simulationPanel->isFocused()))
-				// 	Frontend::simulationPanel->PlotLearningCurve(getLearningCurve());
-				// if ((Frontend::nnCreatorPanel) && (Frontend::nnCreatorPanel->isFocused()))
-				// 	Frontend::nnCreatorPanel->PlotLearningCurve(getLearningCurve());
-			}
+				// First epoch is random
+				if (epochs > 0)
+				{
+					// Update the learning curve
+					shmea::GList wData;
+					wData.addInt(epochs-1); // -1 because we dont plot the first point
+					wData.addFloat(overallTotalError);
 
-			if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
-				(skeleton->getOutputType() == GMath::KL))
-			{
-				// Update the ROC Curve
-				// rocCurve.push_back(new Point2(confusionMatrix->getOverallFalseAlarm(),
-				// 							  confusionMatrix->getOverallRecall()));
-				// if ((Frontend::nnCreatorPanel) && (Frontend::nnCreatorPanel->isFocused()))
-				// 	Frontend::nnCreatorPanel->PlotROCCurve(getROCCurve());
+					shmea::GList argData;
+					argData.addString("PROGRESSIVE");
 
-				// // Update the conf matrix in the GUI
-				// if ((Frontend::nnCreatorPanel) && (Frontend::nnCreatorPanel->isFocused()))
-				// 	Frontend::nnCreatorPanel->updateConfMatrixTable(confusionMatrix->getMatrix());
+					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback", wData);
+					cData->setArgList(argData);
+					serverInstance->send(cData);
+				}
+
+				if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
+					(skeleton->getOutputType() == GMath::KL))
+				{
+					// Update the ROC Curve and Conf Matrix
+					shmea::GList argData;
+					argData.addString("CONF");
+					argData.addFloat(confusionMatrix->getOverallFalseAlarm());
+					argData.addFloat(confusionMatrix->getOverallRecall());
+
+					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback", confusionMatrix->getMatrix()[confusionMatrix->getMatrix().numberOfRows()-1]);
+					cData->setArgList(argData);
+					serverInstance->send(cData);
+				}
 			}
 		}
 
@@ -697,6 +713,12 @@ bool glades::NNetwork::save() const
 	/// return meat->save(skeleton->getName());
 }
 
+void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
+{
+	serverInstance = newServer;
+	cConnection = newConnection;
+}
+
 shmea::GList glades::NNetwork::getLearningCurve() const
 {
 	return learningCurve;
@@ -718,6 +740,8 @@ void glades::NNetwork::clean()
 	skeleton = NULL;
 	meat = NULL;
 	confusionMatrix = NULL;
+	serverInstance = NULL;
+	cConnection = NULL;
 	results.clear();
 	epochs = 0;
 	overallTotalError = 0.0f;

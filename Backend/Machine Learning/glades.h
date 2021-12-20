@@ -32,6 +32,11 @@ namespace shmea {
 class GTable;
 };
 
+namespace GNet {
+class GServer;
+class Connection;
+};
+
 namespace glades {
 class NNInfo;
 class MetaNetwork;
@@ -45,14 +50,14 @@ RNN* getRNN(const std::string&);
 bool saveNeuralNetwork(NNetwork*);
 
 // Machine Learning Functions
-MetaNetwork* train(NNInfo*, const shmea::GTable&, Terminator*);
-MetaNetwork* train(NNetwork*, const shmea::GTable&, Terminator*);
-MetaNetwork* train(MetaNetwork*, const shmea::GTable&, Terminator*);
-MetaNetwork* test(NNInfo*, const shmea::GTable&);
-MetaNetwork* test(NNetwork*, const shmea::GTable&);
-MetaNetwork* test(MetaNetwork*, const shmea::GTable&);
-MetaNetwork* crossValidate(NNInfo*, std::string, bool, int);
-MetaNetwork* crossValidate(std::string, std::vector<std::string>, float, bool, int);
+MetaNetwork* train(NNInfo*, const shmea::GTable&, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* train(NNetwork*, const shmea::GTable&, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* train(MetaNetwork*, const shmea::GTable&, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* test(NNInfo*, const shmea::GTable&, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* test(NNetwork*, const shmea::GTable&, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* test(MetaNetwork*, const shmea::GTable&, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* crossValidate(NNInfo*, std::string, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* crossValidate(std::string, std::vector<std::string>, float, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
 
 // Database Setup
 bool doesDatabaseExist();
