@@ -253,7 +253,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 					argData.addFloat(confusionMatrix->getOverallFalseAlarm());
 					argData.addFloat(confusionMatrix->getOverallRecall());
 
-					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback", confusionMatrix->getMatrix()[confusionMatrix->getMatrix().numberOfRows()-1]);
+					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback", confusionMatrix->getMatrix());
 					cData->setArgList(argData);
 					serverInstance->send(cData);
 				}
