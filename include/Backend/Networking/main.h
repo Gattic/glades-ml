@@ -53,6 +53,7 @@ public:
 	const shmea::ServiceData* sockData;
 	pthread_t* sThread;
 	shmea::GString command;
+	shmea::GString serviceKey;
 	int stIndex;
 };
 
@@ -78,6 +79,7 @@ class GServer
 	bool LOCAL_ONLY;
 	bool running;
 	std::map<shmea::GString, Service*> service_depot;
+	std::map<shmea::GString, Service*> running_services;
 
 	static void* commandLauncher(void*);
 	void commandCatcher(void*);
@@ -108,8 +110,8 @@ public:
 
 	void send(shmea::ServiceData*, bool = true, bool = false);
 
-	Service* ServiceLookup(shmea::GString);
 	unsigned int addService(Service*);
+	Service* DoService(shmea::GString, shmea::GString = "");
 	Connection* getConnection(shmea::GString);
 	void LaunchInstance(const shmea::GString&, const shmea::GString&);
 	const bool& getRunning();

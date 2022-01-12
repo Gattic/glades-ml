@@ -44,6 +44,7 @@ private:
 	int64_t timesent;
 	shmea::GString sid;
 	shmea::GString command;
+	shmea::GString serviceKey;
 	int64_t serviceNum;
 	int type;
 	shmea::GList argList;
@@ -63,17 +64,24 @@ public:
 
 	ServiceData(GNet::Connection*);
 	ServiceData(GNet::Connection*, shmea::GString);
-	ServiceData(GNet::Connection*, shmea::GString, const shmea::GList&);
-	ServiceData(GNet::Connection*, shmea::GString, const shmea::GTable&);
-	ServiceData(GNet::Connection*, shmea::GString, const shmea::GObject&);
-	ServiceData(GNet::Connection*, shmea::GString, const shmea::Serializable&);
 	ServiceData(const ServiceData&);
 	virtual ~ServiceData();
+
+	void set(shmea::GString);
+	void set(shmea::GString, const shmea::GList&);
+	void set(shmea::GString, const shmea::GTable&);
+	void set(shmea::GString, const shmea::GObject&);
+	void set(shmea::GString, const shmea::Serializable&);
+	void set(const shmea::GList&);
+	void set(const shmea::GTable&);
+	void set(const shmea::GObject&);
+	void set(const shmea::Serializable&);
 
 	GNet::Connection* getConnection() const;
 	int64_t getTimesent() const;
 	shmea::GString getSID() const;
 	shmea::GString getCommand() const;
+	shmea::GString getServiceKey() const;
 	int64_t getServiceNum() const;
 	int getType() const;
 	const GList& getArgList() const;
@@ -81,6 +89,7 @@ public:
 	void setTimesent(int64_t);
 	void setSID(shmea::GString);
 	void setCommand(shmea::GString);
+	void setServiceKey(shmea::GString);
 	void assignServiceNum();
 	void setServiceNum(int64_t);
 	void setType(int);

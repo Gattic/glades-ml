@@ -42,11 +42,12 @@ class Service
 	friend GServer;
 	friend Sockets;
 
-private:
+protected:
 	// timestamp variable to store service start and end time
 	static shmea::GString name;
 	int64_t timeExecuted;
 	pthread_t* cThread;
+	bool running;
 
 	static void* launchService(void* y);
 	virtual shmea::ServiceData* execute(const shmea::ServiceData*) = 0;
@@ -58,6 +59,8 @@ private:
 public:
 	Service();
 	virtual ~Service();
+
+	bool getRunning() const;
 
 	virtual Service* MakeService(GServer*) const = 0;
 	virtual shmea::GString getName() const = 0;

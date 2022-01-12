@@ -239,7 +239,8 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 					shmea::GList argData;
 					argData.addString("PROGRESSIVE");
 
-					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback", wData);
+					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback");
+					cData->set(wData);
 					cData->setArgList(argData);
 					serverInstance->send(cData);
 				}
@@ -253,7 +254,8 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 					argData.addFloat(confusionMatrix->getOverallFalseAlarm());
 					argData.addFloat(confusionMatrix->getOverallRecall());
 
-					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback", confusionMatrix->getMatrix());
+					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback");
+					cData->set(confusionMatrix->getMatrix());
 					cData->setArgList(argData);
 					serverInstance->send(cData);
 				}
