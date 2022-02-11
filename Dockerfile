@@ -1,4 +1,4 @@
-FROM gattic/gfxplusplus:latest
+FROM haskellol/gfxplusplus:docker-pants
 MAINTAINER Lerring
 
 WORKDIR /
