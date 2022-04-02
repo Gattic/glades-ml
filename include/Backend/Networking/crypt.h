@@ -66,6 +66,8 @@ public:
 		brej = 0;
 		error = 0;
 	}
+
+	int64_t getTimesent() const;
 };
 };
 

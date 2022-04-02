@@ -92,7 +92,7 @@ public:
 
 	// Strng Helpers
 	void initEmpty();
-	GString substr(unsigned int, unsigned int=0) const;
+	GString substr(unsigned int, unsigned int=npos) const;
 
 	// Member helpers
 	static GType Typify(const char*, unsigned int);
@@ -151,6 +151,8 @@ public:
 	static GString datetimeTOstring(int64_t);
 	static GString dateTOstring(int64_t);
 	static GString timeTOstring(int64_t);
+	static int64_t parseDate(const shmea::GString, const shmea::GString, const shmea::GString,
+		const shmea::GString = "00", const shmea::GString = "00", const shmea::GString = "00");
 };
 };
 
