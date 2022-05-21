@@ -43,7 +43,7 @@ public:
 	MetaNetwork(std::string);
 	MetaNetwork(NNInfo*, int = 1);
 	MetaNetwork(std::string metaNetName, std::string nname, int = 1);
-	~MetaNetwork();
+	virtual ~MetaNetwork();
 
 	// manipulations/functions
 	void clearSubnets();

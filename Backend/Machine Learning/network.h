@@ -113,7 +113,10 @@ public:
 
 	NNetwork();
 	NNetwork(NNInfo*);
-	~NNetwork();
+	virtual ~NNetwork();
+	bool getRunning() const;
+	int getEpochs() const;
+	void stop();
 
 	// Database
 	bool load(const std::string&);

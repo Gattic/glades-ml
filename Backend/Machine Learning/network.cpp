@@ -84,6 +84,21 @@ glades::NNetwork::~NNetwork()
 	resetGraphs();
 }
 
+bool glades::NNetwork::getRunning() const
+{
+	return running;
+}
+
+int glades::NNetwork::getEpochs() const
+{
+	return epochs;
+}
+
+void glades::NNetwork::stop()
+{
+	running = false;
+}
+
 void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator* Arnold,
 						   int runType)
 {
@@ -94,7 +109,8 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 		return;
 
 	// Get the input, expected, and layers/nodes/edges
-	meat->build(skeleton, newInputTable, netType);
+	if(epochs == 0)
+		meat->build(skeleton, newInputTable, netType);
 	minibatchSize = skeleton->getBatchSize(); // Set the mini batch size
 	const shmea::GTable inputTable = meat->getInput();
 	const shmea::GTable expected = meat->getExpected();
