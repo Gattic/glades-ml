@@ -29,7 +29,7 @@ namespace shmea {
 class GType
 {
 protected:
-	char* block;
+	GPointer<char> block;
 	unsigned int blockSize;
 	int type;
 
@@ -86,7 +86,6 @@ public:
 
 	// sets
 	void set(int, const void*, int64_t);
-	void clean();
 
 	//= operators
 	GType& operator=(const GType&);

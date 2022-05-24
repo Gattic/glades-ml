@@ -31,7 +31,7 @@ class GPointer
 protected:
 
 	T* data;
-	unsigned int refCount;
+	unsigned int* refCount;
 	pthread_mutex_t* refMutex;
 
 public:
@@ -39,19 +39,19 @@ public:
 	explicit GPointer(T* newData = NULL)
 	{
 		data = newData;
-		refCount = 1;//inc
-
-		refMutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
-		pthread_mutex_init(refMutex, NULL);
+		refCount = new unsigned int();
+		*refCount = 0;
+		refMutex = NULL;//(pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
+		//pthread_mutex_init(refMutex, NULL);
+		increment();
 	}
 
 	GPointer(const GPointer<T>& g2)
 	{
-		pthread_mutex_lock(g2.refMutex);
-		data = g2.data;
-		refCount = g2.refCount+1;//inc
-		refMutex = g2.refMutex;
-		pthread_mutex_unlock(g2.refMutex);
+		data = NULL;
+		refCount = NULL;
+		refMutex = NULL;
+		copy(g2);
 	}
 
 	virtual ~GPointer()
@@ -61,15 +61,24 @@ public:
 
 	void reset()
 	{
+		// Return if its a fresh instance
+		if(!refCount)
+			return;
+
 		if(decrement() == 0)
 		{
-			delete data;
+			if(data)
+				delete data;
 			data=NULL;
-			refCount = 0;
+			if(refCount)
+				delete refCount;
+			refCount=NULL;
 
-			pthread_mutex_destroy(refMutex);
-			if (refMutex)
+			/*if (refMutex)
+			{
+				pthread_mutex_destroy(refMutex);
 				free(refMutex);
+			}*/
 			refMutex=NULL;
 		}
 	}
@@ -79,13 +88,28 @@ public:
 		return data;
 	}
 
+	unsigned int increment()
+	{
+		if(data)
+		{
+			//pthread_mutex_lock(refMutex);
+			++(*refCount); //inc
+			//pthread_mutex_unlock(refMutex);
+		}
+
+		return *refCount;
+	}
+
 	unsigned int decrement()
 	{
-		//pthread_mutex_lock(refMutex);
-		--refCount; //dec
-		//pthread_mutex_unlock(refMutex);
+		if(data)
+		{
+			//pthread_mutex_lock(refMutex);
+			--(*refCount); //dec
+			//pthread_mutex_unlock(refMutex);
+		}
 
-		return refCount;
+		return *refCount;
 	}
 
 	T& operator*()
@@ -108,25 +132,27 @@ public:
 		return (data!=NULL);
 	}
 
-	GPointer<T>& operator=(const GPointer<T>& g2)
+	GPointer<T>& copy(const GPointer<T>& g2)
 	{
 		if(this != &g2)
 		{
 			// All done?
-			if((decrement() == 0) && (data != NULL))
-			{
-				delete data;
-				refCount = 0;
-			}
+			reset();
 
-			pthread_mutex_lock(refMutex);
+			//pthread_mutex_lock(refMutex);
 			data = g2.data;
-			refCount = g2.refCount+1;
+			refCount = g2.refCount;
 			refMutex = g2.refMutex;
-			pthread_mutex_unlock(refMutex);
+			increment();
+			//pthread_mutex_unlock(refMutex);
 		}
 
 		return *this;
+	}
+
+	GPointer<T>& operator=(const GPointer<T>& g2)
+	{
+		return copy(g2);
 	}
 };
 };
