@@ -25,6 +25,12 @@ glades::OHE::OHE()
 	OHEStrings.clear();
 }
 
+glades::OHE::OHE(const OHE& ohe2)
+{
+	OHEStrings = ohe2.OHEStrings;
+	classCount = ohe2.classCount;
+}
+
 glades::OHE::~OHE()
 {
 	OHEStrings.clear();
@@ -40,7 +46,12 @@ void glades::OHE::addString(const std::string& newString)
 {
 	// GType nodeContents(newString);
 	if (!contains(newString))
+	{
 		OHEStrings.push_back(newString);
+		classCount[newString]=1;
+	}
+	else
+		++classCount[newString];
 }
 
 unsigned int glades::OHE::size() const
@@ -123,6 +134,17 @@ int glades::OHE::indexAt(const std::string& needle) const
 	}
 
 	return -1;
+}
+
+std::string glades::OHE::classAt(int cid) const
+{
+	if(cid < 0)
+		return "";
+
+	if(cid >= OHEStrings.size())
+		return "";
+
+	return OHEStrings[cid];
 }
 
 std::vector<float> glades::OHE::operator[](const char* needle) const
@@ -212,6 +234,11 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 		shmea::GString cCell = gTable.getCell(r, featureCol);
 		addString(cCell);
 	}
+
+	// Normalize
+	/*std::map<std::string, double>::iterator itr = classCount.begin();
+	for (; itr != classCount.end(); ++itr)
+		itr->second /= gTable.numberOfRows();*/
 }
 
 void glades::OHE::printFeatures() const

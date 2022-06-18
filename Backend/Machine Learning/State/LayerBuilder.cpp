@@ -259,11 +259,8 @@ void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 	layers.push_back(cLayer);
 }
 
-glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int inputRowCounter,
-																   unsigned int cInputLayerCounter,
-																   unsigned int cOutputLayerCounter,
-																   unsigned int cInputNodeCounter,
-																   unsigned int cOutputNodeCounter)
+glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int inputRowCounter, unsigned int cInputLayerCounter,
+	unsigned int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	// Base case and Error case
 	if (cOutputLayerCounter >= layers.size())
@@ -382,9 +379,7 @@ shmea::GTable glades::LayerBuilder::getExpected() const
 	return expectedTable;
 }
 
-shmea::GTable glades::LayerBuilder::standardizeInputTable(const NNInfo* skeleton,
-														  const shmea::GTable& newInputTable,
-														  int standardizeFlag)
+shmea::GTable glades::LayerBuilder::standardizeInputTable(const NNInfo* skeleton, const shmea::GTable& newInputTable, int standardizeFlag)
 {
 	shmea::GTable standardizedTable(',');
 

@@ -14,57 +14,40 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _ONEHOTENCODING
-#define _ONEHOTENCODING
+#ifndef _GNAIVEBAYES
+#define _GNAIVEBAYES
 
-#include <map>
+#include "Backend/Database/GTable.h"
+#include "GMath/OHE.h"
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <string>
 #include <vector>
-
-namespace shmea {
-// class GStr;
-class GTable;
-};
+#include <map>
 
 namespace glades {
 
-class OHE
+class NaiveBayes
 {
 private:
-	std::vector<std::string> OHEStrings;
+
+	// <class id, class probility> <C, P(C)>
+	std::map<int, double> classes;
+
+	// <class id, <attribute id, probability> > <C, <x, P(x|C)> >
+	std::map<int, std::map<int, double> > attributesPerClass;
+
+	std::vector<OHE> OHEMaps;
 
 public:
 
-	std::map<std::string, double> classCount;
+	NaiveBayes()
+	{
+		//
+	}
 
-	// constructors and destructors
-	OHE();
-	OHE(const OHE&);
-	virtual ~OHE();
+	shmea::GTable import(const shmea::GTable&);
 
-	// sets
-	void addString(const char*);
-	void addString(const std::string&);
-	void mapFeatureSpace(const shmea::GTable&, int);
-
-	// gets
-	unsigned int size() const;
-	std::vector<std::string> getStrings() const;
-	bool contains(const std::string&) const;
-	void print() const;
-	void printFeatures() const;
-	int indexAt(const char*) const;
-	int indexAt(const std::string&) const;
-	std::string classAt(int) const;
-
-	// operators
-	std::vector<float> operator[](const char*) const;
-	std::vector<float> operator[](const std::string&) const;
-	std::string operator[](const std::vector<int>&) const;
-	std::string operator[](const std::vector<float>&) const;
+	void train(const shmea::GTable&);
+	int predict(const shmea::GList&);
 };
 };
 

@@ -15,6 +15,7 @@ set(ML_src_files
 	network.h
 	RNN.cpp
 	RNN.h
+	bayes.cpp
 )
 add_library(ML ${ML_src_files})
 
