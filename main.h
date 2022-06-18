@@ -19,6 +19,6 @@
 
 //#include "core/version.h"
 
-// extern Version version("0.55");
+// extern Version version("0.57");
 
 #endif

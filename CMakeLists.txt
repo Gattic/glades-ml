@@ -16,7 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #Project
 project(glades)
 set(G_VERSION_MAJOR 0)
-set(G_VERSION_MINOR 56)
+set(G_VERSION_MINOR 57)
 
 set(DEFAULT_BUILD_TYPE "Release")
 
