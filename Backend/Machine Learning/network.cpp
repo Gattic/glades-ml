@@ -332,6 +332,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 
 	// Reset the results
 	results.clear();
+	nbRecord.clear();
 
 	// Forward Pass and trigger events
 	beforeFwd();
@@ -351,6 +352,25 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 		beforeBack();
 		BackPropagation(inputRowCounter, cOutputLayerCounter - 1, cOutputLayerCounter, 0, 0);
 		afterBack();
+
+		// Save the autotuning data
+		float learningRate = skeleton->getLearningRate(cOutputLayerCounter - 1);
+		shmea::GList nbRow;
+		nbRow.addFloat(overallTotalAccuracy);
+		nbRow.addFloat(learningRate);
+		nbRecord.addRow(nbRow);
+
+		// Create a bayes net
+		/*shmea::GTable bTable = bModel.import(nbRecord);
+		//bTable.print();
+		bModel.train(bTable);
+
+		// predict with a new learning rate
+		shmea::GList testList;
+		testList.addFloat(0.0f); // we want 0 error
+		float newLearningRate = bModel.predict(testList);*/
+		//printf("Predicted learning rate %f\n", newLearningRate);
+		//skeleton->setLearningRate(cOutputLayerCounter - 1, newLearningRate);
 
 		// Clear past dropout state
 		meat->clearDropout();
@@ -761,6 +781,7 @@ void glades::NNetwork::clean()
 	serverInstance = NULL;
 	cConnection = NULL;
 	results.clear();
+	nbRecord.clear();
 	epochs = 0;
 	overallTotalError = 0.0f;
 	overallTotalAccuracy = 0.0f;

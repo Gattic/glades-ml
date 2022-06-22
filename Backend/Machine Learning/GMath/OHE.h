@@ -58,7 +58,7 @@ public:
 	void printFeatures() const;
 	int indexAt(const char*) const;
 	int indexAt(const std::string&) const;
-	std::string classAt(int) const;
+	std::string classAt(unsigned int) const;
 
 	// operators
 	std::vector<float> operator[](const char*) const;

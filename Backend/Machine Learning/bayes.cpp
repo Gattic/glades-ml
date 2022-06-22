@@ -100,16 +100,13 @@ void NaiveBayes::train(const shmea::GTable& data)
 	std::map<int, std::map<int, double> >::iterator itr = attributesPerClass.begin();
 	for (; itr != attributesPerClass.end(); ++itr)
 	{
-		printf("+------Class %d;%s------+\n", itr->first, OHEMaps[outCol].classAt(itr->first).c_str());
 		std::map<int, double>::iterator itr2 = itr->second.begin();
 		for (; itr2 != itr->second.end(); ++itr2)
 		{
 			itr2->second /= classes[itr->first]; // normalization
-			printf("Attribute P(x=%d| C=%d) = %f\n", itr2->first, itr->first, itr2->second);
 		}
 
 		classes[itr->first] /= data.numberOfRows(); // normalization
-		printf("Class P(C=%d) = %f\n", itr->first, classes[itr->first]);
 	}
 }
 
@@ -135,6 +132,32 @@ int NaiveBayes::predict(const shmea::GList& attributes)
 		}
 	}
 
-	printf("Predicted Class: %d(%s) P(C|x) =%f\n", maxcid, OHEMaps[outCol].classAt(maxcid).c_str(), maxp);
+	//printf("Predicted Class: %d(%s) P(C|x) =%f\n", maxcid, OHEMaps[outCol].classAt(maxcid).c_str(), maxp);
 	return maxcid;
+}
+
+void NaiveBayes::print() const
+{
+	int outCol = OHEMaps.size()-1;
+	std::map<int, std::map<int, double> >::const_iterator itr = attributesPerClass.begin();
+	for (; itr != attributesPerClass.end(); ++itr)
+	{
+		printf("+------Class %d;%s------+\n", itr->first, OHEMaps[outCol].classAt(itr->first).c_str());
+		std::map<int, double>::const_iterator itr2 = itr->second.begin();
+		for (; itr2 != itr->second.end(); ++itr2)
+		{
+			printf("Attribute P(x=%d| C=%d) = %f\n", itr2->first, itr->first, itr2->second);
+		}
+
+		std::map<int, double>::const_iterator itr3 = classes.find(itr->first);
+		if(itr3 != classes.end())
+			printf("Class P(C=%d) = %f\n", itr3->first, itr3->second);
+	}
+}
+
+void NaiveBayes::reset()
+{
+	classes.clear();
+	attributesPerClass.clear();
+	OHEMaps.clear();
 }

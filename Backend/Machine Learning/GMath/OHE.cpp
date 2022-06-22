@@ -136,9 +136,9 @@ int glades::OHE::indexAt(const std::string& needle) const
 	return -1;
 }
 
-std::string glades::OHE::classAt(int cid) const
+std::string glades::OHE::classAt(unsigned int cid) const
 {
-	if(cid < 0)
+	if(cid == (unsigned int)-1)
 		return "";
 
 	if(cid >= OHEStrings.size())
