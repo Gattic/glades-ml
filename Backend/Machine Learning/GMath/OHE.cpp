@@ -23,17 +23,26 @@ using namespace glades;
 glades::OHE::OHE()
 {
 	OHEStrings.clear();
+	fMin = 0.0f;
+	fMax = 0.0f;
+	fMean = 0.0f;
 }
 
 glades::OHE::OHE(const OHE& ohe2)
 {
 	OHEStrings = ohe2.OHEStrings;
 	classCount = ohe2.classCount;
+	fMin = ohe2.fMin;
+	fMax = ohe2.fMax;
+	fMean = ohe2.fMean;
 }
 
 glades::OHE::~OHE()
 {
 	OHEStrings.clear();
+	fMin = 0.0f;
+	fMax = 0.0f;
+	fMean = 0.0f;
 }
 
 void glades::OHE::addString(const char* newCharString)
@@ -231,14 +240,60 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 {
 	for (unsigned int r = 0; r < gTable.numberOfRows(); ++r)
 	{
-		shmea::GString cCell = gTable.getCell(r, featureCol);
-		addString(cCell);
+		float cell = 0.0f;
+		shmea::GType cCell = gTable.getCell(r, featureCol);
+		if (cCell.getType() == shmea::GType::STRING_TYPE)
+		{
+			shmea::GString strCell = cCell;
+			addString(cCell);
+			continue;
+		}
+		else if (cCell.getType() == shmea::GType::CHAR_TYPE)
+			cell = cCell.getChar();
+		else if (cCell.getType() == shmea::GType::SHORT_TYPE)
+			cell = cCell.getShort();
+		else if (cCell.getType() == shmea::GType::INT_TYPE)
+			cell = cCell.getInt();
+		else if (cCell.getType() == shmea::GType::LONG_TYPE)
+			cell = cCell.getLong();
+		else if (cCell.getType() == shmea::GType::FLOAT_TYPE)
+			cell = cCell.getFloat();
+		else if (cCell.getType() == shmea::GType::DOUBLE_TYPE)
+			cell = cCell.getDouble();
+		else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
+			cell = cCell.getBoolean() ? 1.0f : 0.0f;
+
+		if (r == 0)
+		{
+			fMin = cell;
+			fMax = cell;
+		}
+
+		// Check the mins and maxes
+		if (cell < fMin)
+			fMin = cell;
+		if (cell > fMax)
+			fMax = cell;
+
+		// update mean
+		fMean += cell;
 	}
 
+	fMean /= gTable.numberOfRows();
 	// Normalize
 	/*std::map<std::string, double>::iterator itr = classCount.begin();
 	for (; itr != classCount.end(); ++itr)
 		itr->second /= gTable.numberOfRows();*/
+}
+
+float glades::OHE::standardize(float val) const
+{
+	// find the range of this feature
+	float xRange = fMax - fMin;
+	if (xRange == 0.0f)
+		return 0.0f;
+
+	return ((((val - fMin) / (xRange)) * 0.98f) + 0.01f);
 }
 
 void glades::OHE::printFeatures() const

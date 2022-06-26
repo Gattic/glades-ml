@@ -25,6 +25,65 @@
 
 using namespace glades;
 
+shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
+{
+	shmea::GTable standardizedTable(',');
+	standardizedTable.setHeaders(newInputTable.getHeaders());
+
+	// Standardize the initialization of the weights
+	if ((newInputTable.numberOfRows() <= 0) || (newInputTable.numberOfCols() <= 0))
+		return standardizedTable;
+
+	// iterate through the cols
+	for (unsigned int c = 0; c < newInputTable.numberOfCols(); ++c)
+	{
+		// Set the min and max for this feature (col)
+		OHE cOHE;
+		cOHE.mapFeatureSpace(newInputTable, c);
+		OHEMaps.push_back(cOHE);
+	}
+
+	// Convert to classMap table
+	for (unsigned int r = 0; r < newInputTable.numberOfRows(); ++r)
+	{
+		shmea::GList newRow;
+		for (unsigned int c = 0; c < newInputTable.numberOfCols(); ++c)
+		{
+			const OHE& cOHE = OHEMaps[c];
+			float cell = 0.0f;
+			shmea::GType cCell = newInputTable.getCell(r, c);
+			if (cCell.getType() == shmea::GType::STRING_TYPE)
+			{
+			//
+				shmea::GString cString = cCell;
+				int featureInt = cOHE.indexAt(cString);
+				newRow.addInt(featureInt);
+			}
+			else if (cCell.getType() == shmea::GType::CHAR_TYPE)
+				cell = cCell.getChar();
+			else if (cCell.getType() == shmea::GType::SHORT_TYPE)
+				cell = cCell.getShort();
+			else if (cCell.getType() == shmea::GType::INT_TYPE)
+				cell = cCell.getInt();
+			else if (cCell.getType() == shmea::GType::LONG_TYPE)
+				cell = cCell.getLong();
+			else if (cCell.getType() == shmea::GType::FLOAT_TYPE)
+				cell = cCell.getFloat();
+			else if (cCell.getType() == shmea::GType::DOUBLE_TYPE)
+				cell = cCell.getDouble();
+			else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
+				cell = cCell.getBoolean() ? 1.0f : 0.0f;
+
+			newRow.addFloat(cOHE.standardize(cell));
+		}
+
+		standardizedTable.addRow(newRow);
+	}
+
+	return standardizedTable;
+}
+
+
 shmea::GTable glades::NaiveBayes::import(const shmea::GTable& newInputTable)
 {
 	shmea::GTable standardizedTable(',');

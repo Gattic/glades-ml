@@ -34,7 +34,11 @@ namespace glades {
 class OHE
 {
 private:
+
 	std::vector<std::string> OHEStrings;
+	float fMin;
+	float fMax;
+	float fMean;
 
 public:
 
@@ -59,6 +63,7 @@ public:
 	int indexAt(const char*) const;
 	int indexAt(const std::string&) const;
 	std::string classAt(unsigned int) const;
+	float standardize(float) const;
 
 	// operators
 	std::vector<float> operator[](const char*) const;
