@@ -261,7 +261,22 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 					serverInstance->send(cData);
 				}
 
-				if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
+				if (skeleton->getOutputType() == GMath::REGRESSION)
+				{
+					shmea::GList argData;
+					argData.addString("ACC");
+
+					shmea::GList wData;
+					wData.addInt(epochs);
+					wData.addFloat(overallTotalAccuracy);
+
+					// Update the Accuracy label
+					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback");
+					cData->set(wData);
+					cData->setArgList(argData);
+					serverInstance->send(cData);
+				}
+				else if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 					(skeleton->getOutputType() == GMath::KL))
 				{
 					// Update the ROC Curve and Conf Matrix
