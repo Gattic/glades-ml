@@ -105,6 +105,6 @@ add_custom_target(debug
 
 #make uninstall
 	add_custom_target(uninstall
-	COMMAND sudo xargs rm < ./build/install_manifest.txt
+	COMMAND xargs rm < ./build/install_manifest.txt
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
