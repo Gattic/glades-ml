@@ -18,6 +18,8 @@
 #define _NNETWORK
 
 #include "Backend/Database/GList.h"
+#include "Backend/Database/GTable.h"
+#include "bayes.h"
 #include <algorithm>
 #include <map>
 #include <stdio.h>
@@ -60,6 +62,7 @@ private:
 	CMatrix* confusionMatrix;
 	GNet::GServer* serverInstance;
 	GNet::Connection* cConnection;
+	glades::NaiveBayes bModel;
 
 	bool running;
 	int netType;
@@ -79,6 +82,7 @@ private:
 	shmea::GList learningCurve;
 	std::vector<Point2*> rocCurve;
 	shmea::GList results;
+	shmea::GTable nbRecord;
 
 	void SGDHelper(unsigned int, int, int); // Stochastic Gradient Descent
 
