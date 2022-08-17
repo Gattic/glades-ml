@@ -35,6 +35,9 @@ class GList
 private:
 	//
 	std::vector<GType> items;
+	float xMin;
+	float xMax;
+	float xRange;
 
 	//
 	void addPrimitive(int, const void*);
@@ -88,6 +91,8 @@ public:
 	int getType(unsigned int) const;
 	unsigned int size() const;
 	bool empty() const;
+	void standardize();
+	float unstandardize(float) const;
 	void print() const;
 
 	// operators
