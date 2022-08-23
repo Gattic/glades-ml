@@ -141,12 +141,12 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 	// debugging topbar
 	if (runType == RUN_TRAIN)
 	{
-		if (skeleton->getOutputType() == GMath::REGRESSION)
+		/*if (skeleton->getOutputType() == GMath::REGRESSION)
 			printf("[NN] Epochs\tAccuracy\n");
 
 		if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 			(skeleton->getOutputType() == GMath::KL))
-			printf("[NN] Epochs\tAccuracy\tPrecision\tRecall\t\tSpecificity\tF1 Score\n");
+			printf("[NN] Epochs\tAccuracy\tPrecision\tRecall\t\tSpecificity\tF1 Score\n");*/
 	}
 
 	// Reset the different graphcs e.g. learning curve
@@ -184,8 +184,8 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 			{
 				// if (DEBUG_SIMPLE)
 				{
-					printf("\33[2K[NN] %d\t%f%%\r", epochs, overallTotalAccuracy);
-					fflush(stdout);
+					//printf("\33[2K[NN] %d\t%f%%\r", epochs, overallTotalAccuracy);
+					//fflush(stdout);
 				}
 				/*else if (DEBUG_ADVANCED)
 				{
@@ -211,7 +211,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 			{
 				// if (DEBUG_SIMPLE)
 				{
-					if (epochs < 100)
+					/*if (epochs < 100)
 					{
 						printf("\33[2K[NN] %d\t\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
 							   overallClassAccuracy, overallClassPrecision, overallClassRecall,
@@ -224,7 +224,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 							   overallClassAccuracy, overallClassPrecision, overallClassRecall,
 							   overallClassSpecificity, overallClassF1);
 						fflush(stdout);
-					}
+					}*/
 				}
 				/*else if (DEBUG_ADVANCED)
 				{
@@ -347,7 +347,6 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 
 	// Reset the results
 	results.clear();
-	nbRecord.clear();
 
 	// Forward Pass and trigger events
 	beforeFwd();
@@ -371,21 +370,28 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 		// Save the autotuning data
 		float learningRate = skeleton->getLearningRate(cOutputLayerCounter - 1);
 		shmea::GList nbRow;
-		nbRow.addFloat(overallTotalAccuracy);
+		nbRow.addFloat(overallTotalError);
 		nbRow.addFloat(learningRate);
 		nbRecord.addRow(nbRow);
+		printf("lr[%d]: %f\n", epochs, learningRate);
 
 		// Create a bayes net
-		/*shmea::GTable bTable = bModel.import(nbRecord);
+		shmea::GTable bTable = bModel.import2(nbRecord);
+		printf("+----+\n");
 		//bTable.print();
+		printf("------\n");
 		bModel.train(bTable);
 
-		// predict with a new learning rate
-		shmea::GList testList;
-		testList.addFloat(0.0f); // we want 0 error
-		float newLearningRate = bModel.predict(testList);*/
-		//printf("Predicted learning rate %f\n", newLearningRate);
-		//skeleton->setLearningRate(cOutputLayerCounter - 1, newLearningRate);
+		// Hopefully we have a large enough sample size
+		if(epochs > 5)
+		{
+			// predict with a new learning rate
+			shmea::GList testList;
+			testList.addFloat(0.01f); // we want 0 error
+			float newLearningRate = bModel.predict(testList);
+			printf("Predicted learning rate %f\n", newLearningRate);
+			//skeleton->setLearningRate(cOutputLayerCounter - 1, newLearningRate);
+		}
 
 		// Clear past dropout state
 		meat->clearDropout();
