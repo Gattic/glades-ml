@@ -122,6 +122,11 @@ public:
 		return data;
 	}
 
+	T* operator->() const
+	{
+		return data;
+	}
+
 	operator T*() const
 	{
 		return data;
