@@ -71,13 +71,8 @@ private:
 		}
 	}
 
-	bool LoadPPM(const GString&);
-	bool LoadPBM(const GString&);
-	bool SavePPM(const GString&) const;
-	bool SavePBM(const GString&) const;
-	void LoadBMP(const GString&);
-
 public:
+
 	Image() : width(0), height(0), pitch(0), data(NULL)
 	{
 		//
@@ -157,6 +152,13 @@ public:
 
 		data[y * width + x] = value;
 	}
+
+	bool LoadPPM(const GString&);
+	bool LoadPBM(const GString&);
+	bool SavePPM(const GString&) const;
+	bool SavePBM(const GString&) const;
+	void LoadBMP(const GString&);
+
 };
 };
 
