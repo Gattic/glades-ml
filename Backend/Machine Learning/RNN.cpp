@@ -20,6 +20,7 @@
 #include "State/node.h"
 #include "Structure/nninfo.h"
 #include "network.h"
+#include "GMath/cmatrix.h"
 
 /*!
  * @brief RNN constructor
@@ -27,7 +28,19 @@
  */
 glades::RNN::RNN()
 {
+	running = false;
+	skeleton = NULL;
+	meat = NULL;
+	confusionMatrix = NULL;
+	serverInstance = NULL;
+	cConnection = NULL;
+	clean();
+	meat = new LayerBuilder(TYPE_RNN);
+	confusionMatrix = new glades::CMatrix();
+	netType = TYPE_DFF;
+	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 	netType = TYPE_RNN;
+	printf("RNN Conststructor %d\n", netType);
 }
 
 /*!
@@ -46,8 +59,8 @@ void glades::RNN::beforeFwdEdge(const NetworkState* netState)
 
 void glades::RNN::beforeFwdNode(const NetworkState* netState)
 {
-	netState->cOutputNode->setActivationScalar(meat->getTimeState(
-		netState->cOutputLayerCounter, netState->cOutputNodeCounter, netState->cInputNodeCounter));
+	//netState->cOutputNode->setActivationScalar(meat->getTimeState(
+		//netState->cOutputLayerCounter, netState->cOutputNodeCounter, netState->cInputNodeCounter));
 }
 
 void glades::RNN::beforeFwdLayer(const NetworkState* netState)
@@ -93,10 +106,7 @@ void glades::RNN::afterFwdNode(const NetworkState* netState, float cOutputNodeAc
 
 void glades::RNN::afterFwdLayer(const NetworkState* netState, float cOutputLayerActivation)
 {
-	int cLayer = netState->cOutputLayerCounter > 0 ? netState->cInputLayerCounter + 1
-												   : netState->cInputLayerCounter;
-	meat->setTimeState(netState->cOutputLayerCounter, netState->cOutputNodeCounter,
-					   netState->cInputNodeCounter, cOutputLayerActivation);
+	//
 }
 
 void glades::RNN::afterFwd()

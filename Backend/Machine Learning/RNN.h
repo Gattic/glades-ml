@@ -52,7 +52,7 @@ private:
 
 public:
 	RNN();
-	~RNN();
+	virtual ~RNN();
 };
 };
 

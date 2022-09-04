@@ -108,6 +108,8 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 	if ((newInputTable.numberOfRows() <= 0) || (newInputTable.numberOfCols() <= 0))
 		return;
 
+	printf("DERP0\n");
+
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
 		meat->build(skeleton, newInputTable, netType);
@@ -502,6 +504,15 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 		netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
 	}
 
+	//TODO: Change this meat call to a netState call via adding a contextNode like biasWeight
+	// Fixed weight of 1
+	if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() != Layer::OUTPUT_TYPE))
+	{
+		float cEdgeActivation = meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->getEdgeWeight(0) * meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->getWeight();
+		meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->setActivation(0, cEdgeActivation);
+	}
+
+
 	afterFwdEdge(netState);
 
 	// Last Input Node for the Output Node
@@ -520,6 +531,10 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 		// Input Layer fundamentally cannot have a bias
 		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
 			cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
+
+		//TODO: Change this meat call to a netState call
+		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() != Layer::OUTPUT_TYPE))
+			cOutputNodeActivation += meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->getActivation();
 
 		// Set Our prediction based on the cOutputNode activation
 		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
@@ -653,9 +668,8 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		float baseError = learningRate * cOutNetErrDer;
 
 		// Add the weight delta
-		netState->cOutputNode->getDelta(cInputNodeCounter, baseError,
-										netState->cInputNode->getWeight(), learningRate,
-										momentumFactor, weightDecay);
+		netState->cOutputNode->getDelta(cInputNodeCounter, baseError, netState->cInputNode->getWeight(),
+			learningRate,momentumFactor, weightDecay);
 
 		// Apply all deltas if we've hit the minibatch size
 		if ((inputRowCounter % minibatchSize) == 0)
@@ -666,8 +680,16 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 
 		// Update the bias (inputs fundamentally cannot have a bias)
 		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
-			netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() -
-												 baseError);
+			netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() - baseError);
+
+		// Update the context nodes
+		if ((netType == TYPE_RNN) && (netState->cInputLayer->getType() != Layer::INPUT_TYPE))
+		{
+			float oldHiddenWeight = netState->cInputLayer->
+				getChildren()[cInputNodeCounter]->getWeight();
+			meat->getContextNode(cInputLayerCounter, cInputNodeCounter)
+				->setWeight(oldHiddenWeight);
+		}
 	}
 
 	afterBackEdge(netState);

@@ -74,19 +74,6 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const shmea::GTable& ne
 	// Build the hidden layer
 	buildHiddenLayers(skeleton);
 
-	if (netType == NNetwork::TYPE_RNN)
-	{
-		// Build the time state vec
-		for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
-		{
-			int hSize = skeleton->getHiddenLayerSize(i);
-			std::vector<float> newVecEdges(hSize, 1.0f);
-			std::vector<std::vector<float> > newVecNodes(skeleton->getHiddenLayerSize(i),
-														 newVecEdges);
-			timeState.push_back(newVecNodes);
-		}
-	}
-
 	// Build the output layer
 	buildOutputLayer(skeleton);
 
@@ -184,6 +171,31 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton)
 
 void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 {
+	printf("Hidden Build! %d\n", netType);
+	if (netType == NNetwork::TYPE_RNN)
+	{
+		printf("RNN Build!\n");
+		// Build the time state vec
+		for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
+		{
+			// Create the context layer
+			int cLayerSize = skeleton->getHiddenLayerSize(i);
+			Layer* cLayer = new Layer(Layer::CONTEXT_TYPE);
+
+			for (int j = 0; j < cLayerSize; ++j)
+			{
+				int randomNum = rand() % 100 + 1; //+1 so we dont divide by zero
+				float randomFloat = ((float)(randomNum)) / (((float)100));
+				Node* contextNode = new Node();
+				contextNode->setWeight(randomFloat);
+				cLayer->addNode(contextNode);
+			}
+
+			printf("context: %ld", contextLayers.size());
+			contextLayers.push_back(cLayer);
+		}
+	}
+
 	int inputLayerSize = inputLayers[0]->size();
 	int outputLayerSize = skeleton->getOutputLayerSize();
 	int prevLayerSize = inputLayerSize;
@@ -328,21 +340,6 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	return newLoc;
 }
 
-void glades::LayerBuilder::setTimeState(unsigned int cLayerCounter, unsigned int cNodeCounter,
-										unsigned int cEdgeCounter, float newTimeState)
-{
-	if (cLayerCounter >= timeState.size())
-		return;
-
-	if (cNodeCounter >= timeState[cLayerCounter].size())
-		return;
-
-	if (cEdgeCounter >= timeState[cLayerCounter][cNodeCounter].size())
-		return;
-
-	timeState[cLayerCounter][cNodeCounter][cEdgeCounter] = newTimeState;
-}
-
 unsigned int glades::LayerBuilder::getInputLayersSize() const
 {
 	return inputLayers.size();
@@ -353,20 +350,25 @@ unsigned int glades::LayerBuilder::getLayersSize() const
 	return layers.size();
 }
 
-float glades::LayerBuilder::getTimeState(unsigned int cLayerCounter, unsigned int cNodeCounter,
-										 unsigned int cEdgeCounter) const
+Layer* glades::LayerBuilder::getContextLayer(unsigned int cLayerCounter)
 {
 	// Return 1.0f on error to retain old state
-	if (cLayerCounter >= timeState.size())
-		return 1.0f;
+	if (cLayerCounter >= contextLayers.size())
+		return NULL;
 
-	if (cNodeCounter >= timeState[cLayerCounter].size())
-		return 1.0f;
+	return contextLayers[cLayerCounter];
+}
 
-	if (cEdgeCounter >= timeState[cLayerCounter][cNodeCounter].size())
-		return 1.0f;
+Node* glades::LayerBuilder::getContextNode(unsigned int cLayerCounter, unsigned int cNodeCounter)
+{
+	// Return 1.0f on error to retain old state
+	if (cLayerCounter >= contextLayers.size())
+		return NULL;
 
-	return timeState[cLayerCounter][cNodeCounter][cEdgeCounter];
+	if (cNodeCounter >= contextLayers[cLayerCounter]->size())
+		return NULL;
+
+	return contextLayers[cLayerCounter]->getNode(cNodeCounter);
 }
 
 shmea::GTable glades::LayerBuilder::getInput() const
@@ -766,7 +768,7 @@ void glades::LayerBuilder::clean()
 {
 	inputLayers.clear();
 	layers.clear();
-	timeState.clear();
+	contextLayers.clear();
 	xMin = 0.0f;
 	xMax = 0.0f;
 	xRange = 0.0f;

@@ -47,7 +47,7 @@ private:
 	float xRange;
 	std::vector<OHE*> OHEMaps;
 	std::vector<bool> featureIsCategorical;
-	std::vector<std::vector<std::vector<float> > > timeState;
+	std::vector<Layer*> contextLayers;
 
 	void seperateTables(const shmea::GTable&);
 	void buildInputLayers(const NNInfo*);
@@ -60,15 +60,15 @@ private:
 public:
 	LayerBuilder();
 	LayerBuilder(int);
-	~LayerBuilder();
+	virtual ~LayerBuilder();
 
 	bool build(const NNInfo*, const shmea::GTable&, bool = false);
 	NetworkState* getNetworkStateFromLoc(unsigned int, unsigned int, unsigned int, unsigned int,
 										 unsigned int);
-	void setTimeState(unsigned int, unsigned int, unsigned int, float);
 	unsigned int getInputLayersSize() const;
 	unsigned int getLayersSize() const;
-	float getTimeState(unsigned int, unsigned int, unsigned int) const;
+	Layer* getContextLayer(unsigned int);
+	Node* getContextNode(unsigned int, unsigned int);
 	shmea::GTable getInput() const;
 	shmea::GTable getExpected() const;
 	void scrambleDropout(unsigned int, float, const std::vector<float>&);
