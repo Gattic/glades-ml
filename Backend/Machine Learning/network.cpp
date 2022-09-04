@@ -40,7 +40,7 @@ using namespace glades;
  * @brief NNetwork constructor
  * @details creates an empty nnetwork
  */
-glades::NNetwork::NNetwork()
+glades::NNetwork::NNetwork(int newNetType)
 {
 	running = false;
 	skeleton = NULL;
@@ -49,9 +49,9 @@ glades::NNetwork::NNetwork()
 	serverInstance = NULL;
 	cConnection = NULL;
 	clean();
-	meat = new LayerBuilder();
+	meat = new LayerBuilder(newNetType);
 	confusionMatrix = new glades::CMatrix();
-	netType = TYPE_DFF;
+	netType = newNetType;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 }
 
@@ -59,7 +59,7 @@ glades::NNetwork::NNetwork()
  * @brief NNetwork destructor
  * @details destroys the NNetwork object
  */
-glades::NNetwork::NNetwork(NNInfo* newNNInfo)
+glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 {
 	if (!newNNInfo)
 		return;
@@ -71,10 +71,10 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo)
 	serverInstance = NULL;
 	cConnection = NULL;
 	clean();
-	meat = new LayerBuilder();
+	meat = new LayerBuilder(newNetType);
 	confusionMatrix = new glades::CMatrix();
 	skeleton = newNNInfo;
-	netType = TYPE_DFF;
+	netType = newNetType;
 	minibatchSize = skeleton->getBatchSize();
 }
 
@@ -352,9 +352,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	nbRecord.clear();
 
 	// Forward Pass and trigger events
-	beforeFwd();
 	ForwardPass(inputRowCounter, numInputRows, 0, 0, 0, 0);
-	afterFwd();
 
 	// Add current results to cmatrix for accuracy vars
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
@@ -366,9 +364,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	{
 		// Start with the last output layer
 		int cOutputLayerCounter = meat->getLayersSize() - 1;
-		beforeBack();
 		BackPropagation(inputRowCounter, cOutputLayerCounter - 1, cOutputLayerCounter, 0, 0);
-		afterBack();
 
 		// Save the autotuning data
 		float learningRate = skeleton->getLearningRate(cOutputLayerCounter - 1);
@@ -394,90 +390,6 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	}
 }
 
-void glades::NNetwork::beforeFwdEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeFwdNode(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeFwdLayer(const NetworkState* netState)
-{
-	// To not display 0 for h[0]
-	int cLayer = netState->cOutputLayerCounter > 0 ? netState->cInputLayerCounter + 1
-												   : netState->cInputLayerCounter;
-}
-
-void glades::NNetwork::beforeFwd()
-{
-	//
-}
-
-void glades::NNetwork::beforeBackEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeBackNode(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeBackLayer(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeBack()
-{
-	//
-}
-
-void glades::NNetwork::afterFwdEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterFwdNode(const NetworkState* netState, float cOutputNodeActivation)
-{
-	//
-}
-
-void glades::NNetwork::afterFwdLayer(const NetworkState* netState, float cOutputLayerActivation)
-{
-	// To not display 0 for h[0]
-	int cLayer = netState->cOutputLayerCounter > 0 ? netState->cInputLayerCounter + 1
-												   : netState->cInputLayerCounter;
-}
-
-void glades::NNetwork::afterFwd()
-{
-	//
-}
-
-void glades::NNetwork::afterBackEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterBackNode(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterBackLayer(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterBack()
-{
-	//
-}
-
 void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
 								   int cInputLayerCounter, int cOutputLayerCounter,
 								   unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
@@ -487,11 +399,6 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 									 cInputNodeCounter, cOutputNodeCounter);
 	if (!netState)
 		return;
-
-	// Event triggered
-	beforeFwdLayer(netState);
-
-	beforeFwdEdge(netState);
 
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
@@ -513,16 +420,12 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 	}
 
 
-	afterFwdEdge(netState);
-
 	// Last Input Node for the Output Node
 	float cOutputLayerActivation = 0.0f;
 	if (netState->lastValidInputNode)
 	{
 		// Get the current output node activation
-		beforeFwdNode(netState);
 		float cOutputNodeActivation = netState->cOutputNode->getActivation();
-		afterFwdNode(netState, cOutputNodeActivation);
 
 		// Clean the output node activation for next run (cleanup)
 		netState->cOutputNode->clearActivation();
@@ -591,7 +494,6 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
 	{
 		// Next Output Layer
-		afterFwdLayer(netState, cOutputLayerActivation);
 		ForwardPass(inputRowCounter, numInputRows, cOutputLayerCounter, cOutputLayerCounter + 1, 0,
 					0);
 	}
@@ -612,17 +514,13 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 }
 
 void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCounter,
-									   int cOutputLayerCounter, unsigned int cInputNodeCounter,
-									   unsigned int cOutputNodeCounter)
+	int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	NetworkState* netState =
 		meat->getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
 									 cInputNodeCounter, cOutputNodeCounter);
 	if (!netState)
 		return;
-
-	// Event triggered
-	beforeBackLayer(netState);
 
 	// Output Layer Error Derivative Calculation
 	float cOutputDer = 1.0f; // Output der is linear so its 1
@@ -646,8 +544,6 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 			GMath::activationErrDer(netState->cOutputNode->getWeight(), cActivationFx, 0.01f);
 	}
 
-	beforeBackEdge(netState);
-
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
 
@@ -667,6 +563,15 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		float weightDecay = skeleton->getWeightDecay(cInputLayerCounter);
 		float baseError = learningRate * cOutNetErrDer;
 
+		// Update the context nodes
+		if ((netType == TYPE_RNN) && (netState->cInputLayer->getType() != Layer::INPUT_TYPE))
+		{
+			float oldHiddenWeight = netState->cInputLayer->
+				getChildren()[cInputNodeCounter]->getWeight();
+			meat->getContextNode(cInputLayerCounter, cInputNodeCounter)
+				->setWeight(oldHiddenWeight);
+		}
+
 		// Add the weight delta
 		netState->cOutputNode->getDelta(cInputNodeCounter, baseError, netState->cInputNode->getWeight(),
 			learningRate,momentumFactor, weightDecay);
@@ -681,32 +586,18 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		// Update the bias (inputs fundamentally cannot have a bias)
 		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
 			netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() - baseError);
-
-		// Update the context nodes
-		if ((netType == TYPE_RNN) && (netState->cInputLayer->getType() != Layer::INPUT_TYPE))
-		{
-			float oldHiddenWeight = netState->cInputLayer->
-				getChildren()[cInputNodeCounter]->getWeight();
-			meat->getContextNode(cInputLayerCounter, cInputNodeCounter)
-				->setWeight(oldHiddenWeight);
-		}
 	}
 
-	afterBackEdge(netState);
-
 	// Update the error partials for the next recursive calls
-	beforeBackNode(netState);
 	float cInNetErrDer = netState->cInputNode->getErrDer() +
 						 (cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
 	netState->cInputNode->setErrDer(cOutputNodeCounter, cInNetErrDer);
-	afterBackNode(netState);
 
 	// Recursive Calls
 	if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
 		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
 	{
 		// Next Input Layer
-		afterBackLayer(netState);
 		if ((cInputLayerCounter == 0) && (cOutputLayerCounter == 1)) // Last recursive layer case
 			BackPropagation(inputRowCounter, 0, 0, 0, 0);
 		else

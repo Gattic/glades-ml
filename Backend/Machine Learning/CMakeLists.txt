@@ -13,8 +13,6 @@ set(ML_src_files
 	metanetwork.h
 	network.cpp
 	network.h
-	RNN.cpp
-	RNN.h
 	bayes.cpp
 )
 add_library(ML ${ML_src_files})
