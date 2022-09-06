@@ -33,22 +33,22 @@
 
 using namespace glades;
 
-glades::LayerBuilder::LayerBuilder()
+LayerBuilder::LayerBuilder()
 {
 	netType = NNetwork::TYPE_DFF;
 }
 
-glades::LayerBuilder::LayerBuilder(int newNetType)
+LayerBuilder::LayerBuilder(int newNetType)
 {
 	netType = newNetType;
 }
 
-glades::LayerBuilder::~LayerBuilder()
+LayerBuilder::~LayerBuilder()
 {
 	clean();
 }
 
-bool glades::LayerBuilder::build(const NNInfo* skeleton, const shmea::GTable& newInputTable,
+bool LayerBuilder::build(const NNInfo* skeleton, const shmea::GTable& newInputTable,
 								 bool standardizeWeightsFlag)
 {
 	if (!skeleton)
@@ -90,7 +90,7 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const shmea::GTable& ne
 	return true;
 }
 
-void glades::LayerBuilder::seperateTables(const shmea::GTable& newInputTable)
+void LayerBuilder::seperateTables(const shmea::GTable& newInputTable)
 {
 	inputTable.copy(newInputTable);
 
@@ -107,7 +107,7 @@ void glades::LayerBuilder::seperateTables(const shmea::GTable& newInputTable)
 	}
 }
 
-void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton)
+void LayerBuilder::buildInputLayers(const NNInfo* skeleton)
 {
 	// Input and Output columns
 	if (inputTable.numberOfCols() < 1)
@@ -120,7 +120,7 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton)
 	inputLayers.clear();
 	for (unsigned int r = 0; r < inputTable.numberOfRows(); ++r)
 	{
-		Layer* cLayer = new Layer(Layer::INPUT_TYPE, false);
+		shmea::GPointer<Layer> cLayer(new Layer(Layer::INPUT_TYPE, false));
 		for (unsigned int c = 0; c < inputTable.numberOfCols(); ++c)
 		{
 			// We can probably get rid of most of these conditions becuase Gtype auto types
@@ -151,7 +151,7 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton)
 				newWeight = cCell.getBoolean() ? 1.0f : 0.0f;
 
 			// Error
-			Node* node = new Node();
+			shmea::GPointer<Node> node(new Node());
 			if (!node)
 				continue;
 
@@ -169,7 +169,7 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton)
 	}
 }
 
-void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
+void LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 {
 	printf("Hidden Build! %d\n", netType);
 	if (netType == NNetwork::TYPE_RNN)
@@ -180,13 +180,13 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 		{
 			// Create the context layer
 			int cLayerSize = skeleton->getHiddenLayerSize(i);
-			Layer* cLayer = new Layer(Layer::CONTEXT_TYPE);
+			shmea::GPointer<Layer> cLayer(new Layer(Layer::CONTEXT_TYPE));
 
 			for (int j = 0; j < cLayerSize; ++j)
 			{
 				int randomNum = rand() % 100 + 1; //+1 so we dont divide by zero
 				float randomFloat = ((float)(randomNum)) / (((float)100));
-				Node* contextNode = new Node();
+				shmea::GPointer<Node> contextNode(new Node());
 				contextNode->setWeight(randomFloat);
 				cLayer->addNode(contextNode);
 			}
@@ -209,7 +209,7 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 		activationType = skeleton->getActivationType(i);
 		// Get the current layer size
 		int cLayerSize = skeleton->getHiddenLayerSize(i);
-		Layer* cLayer = new Layer(Layer::HIDDEN_TYPE);
+		shmea::GPointer<Layer> cLayer(new Layer(Layer::HIDDEN_TYPE));
 
 		if (isPositive)
 		{
@@ -238,7 +238,7 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 	}
 }
 
-void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
+void LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 {
 	int inputLayerSize = inputLayers[0]->size();
 	int outputLayerSize = skeleton->getOutputLayerSize();
@@ -263,7 +263,7 @@ void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 	}
 
 	// Create the output layer
-	Layer* cLayer = new Layer(Layer::OUTPUT_TYPE);
+	shmea::GPointer<Layer> cLayer(new Layer(Layer::OUTPUT_TYPE));
 	if (isPositive)
 		cLayer->initWeights(prevLayerSize, outputLayerSize, Node::INIT_POSXAVIER, activationType);
 	else
@@ -271,7 +271,7 @@ void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 	layers.push_back(cLayer);
 }
 
-glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int inputRowCounter, unsigned int cInputLayerCounter,
+NetworkState* LayerBuilder::getNetworkStateFromLoc(unsigned int inputRowCounter, unsigned int cInputLayerCounter,
 	unsigned int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	// Base case and Error case
@@ -282,7 +282,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 		return NULL;
 
 	// Current Input Layer
-	Layer* cInputLayer = NULL;
+	shmea::GPointer<Layer> cInputLayer;
 	if ((cInputLayerCounter == 0) && (cOutputLayerCounter == 0))
 		cInputLayer = inputLayers[inputRowCounter];
 	else
@@ -295,12 +295,12 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 		return NULL;
 
 	// Current Input Node
-	Node* cInputNode = cInputLayer->getNode(cInputNodeCounter);
+	shmea::GPointer<Node> cInputNode = cInputLayer->getNode(cInputNodeCounter);
 	if (!cInputNode)
 		return NULL;
 
 	// Current Output Layer
-	Layer* cOutputLayer = layers[cOutputLayerCounter];
+	shmea::GPointer<Layer> cOutputLayer = layers[cOutputLayerCounter];
 	if (!cOutputLayer)
 		return NULL;
 
@@ -313,7 +313,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 		return NULL;
 
 	// Current Output Node
-	Node* cOutputNode = (*cOutputLayer)[cOutputNodeCounter];
+	shmea::GPointer<Node> cOutputNode = (*cOutputLayer)[cOutputNodeCounter];
 	if (!cOutputNode)
 		return NULL;
 
@@ -332,7 +332,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	bool lastValidOutputNode = (cOutputNodeCounter == cOutputLayer->lastValidPath());
 
 	// Create the return structure
-	glades::NetworkState* newLoc = new glades::NetworkState(
+	NetworkState* newLoc = new NetworkState(
 		cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cInputLayer,
 		cOutputLayer, cInputNode, cOutputNode, firstValidInputNode, lastValidInputNode,
 		firstValidOutputNode, lastValidOutputNode, validInputNode, validOutputNode);
@@ -340,48 +340,48 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	return newLoc;
 }
 
-unsigned int glades::LayerBuilder::getInputLayersSize() const
+unsigned int LayerBuilder::getInputLayersSize() const
 {
 	return inputLayers.size();
 }
 
-unsigned int glades::LayerBuilder::getLayersSize() const
+unsigned int LayerBuilder::getLayersSize() const
 {
 	return layers.size();
 }
 
-Layer* glades::LayerBuilder::getContextLayer(unsigned int cLayerCounter)
+shmea::GPointer<Layer> LayerBuilder::getContextLayer(unsigned int cLayerCounter)
 {
 	// Return 1.0f on error to retain old state
 	if (cLayerCounter >= contextLayers.size())
-		return NULL;
+		return shmea::GPointer<Layer>();
 
 	return contextLayers[cLayerCounter];
 }
 
-Node* glades::LayerBuilder::getContextNode(unsigned int cLayerCounter, unsigned int cNodeCounter)
+shmea::GPointer<Node> LayerBuilder::getContextNode(unsigned int cLayerCounter, unsigned int cNodeCounter)
 {
 	// Return 1.0f on error to retain old state
 	if (cLayerCounter >= contextLayers.size())
-		return NULL;
+		return shmea::GPointer<Node>();
 
 	if (cNodeCounter >= contextLayers[cLayerCounter]->size())
-		return NULL;
+		return shmea::GPointer<Node>();
 
 	return contextLayers[cLayerCounter]->getNode(cNodeCounter);
 }
 
-shmea::GTable glades::LayerBuilder::getInput() const
+shmea::GTable LayerBuilder::getInput() const
 {
 	return inputTable;
 }
 
-shmea::GTable glades::LayerBuilder::getExpected() const
+shmea::GTable LayerBuilder::getExpected() const
 {
 	return expectedTable;
 }
 
-shmea::GTable glades::LayerBuilder::standardizeInputTable(const NNInfo* skeleton, const shmea::GTable& newInputTable, int standardizeFlag)
+shmea::GTable LayerBuilder::standardizeInputTable(const NNInfo* skeleton, const shmea::GTable& newInputTable, int standardizeFlag)
 {
 	shmea::GTable standardizedTable(',');
 
@@ -603,7 +603,7 @@ shmea::GTable glades::LayerBuilder::standardizeInputTable(const NNInfo* skeleton
 	return standardizedTable;
 }
 
-void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
+void LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 {
 	// Structure required!
 	if (!skeleton)
@@ -633,7 +633,7 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 			isPositive = true;
 
 		// iterate through the nodes
-		std::vector<Node*> cChildren = layers[i]->getChildren();
+		std::vector<shmea::GPointer<Node> > cChildren = layers[i]->getChildren();
 		for (unsigned int j = 0; j < cChildren.size(); ++j)
 		{
 			// iterate through the node weights
@@ -665,7 +665,7 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 	{
 
 		// iterate through the nodes
-		std::vector<Node*> cChildren = layers[i]->getChildren();
+		std::vector<shmea::GPointer<Node> > cChildren = layers[i]->getChildren();
 		for (unsigned int j = 0; j < cChildren.size(); ++j)
 		{
 			// iterate through the node weights
@@ -683,12 +683,12 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 	}
 }
 
-float glades::LayerBuilder::unstandardize(float value)
+float LayerBuilder::unstandardize(float value)
 {
 	return ((value + 0.5f) * xRange) + xMin;
 }
 
-void glades::LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float pInput,
+void LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float pInput,
 										   const std::vector<float>& pHidden)
 {
 	// Invalid arg
@@ -698,7 +698,7 @@ void glades::LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float p
 	if (inputRowCounter >= inputLayers.size())
 		return;
 
-	Layer* cInputLayer = inputLayers[inputRowCounter];
+	shmea::GPointer<Layer> cInputLayer = inputLayers[inputRowCounter];
 	if (!cInputLayer)
 		return;
 
@@ -716,13 +716,13 @@ void glades::LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float p
 	}
 }
 
-void glades::LayerBuilder::clearDropout()
+void LayerBuilder::clearDropout()
 {
 	for (unsigned int i = 0; i < layers.size(); ++i)
 		layers[i]->clearDropout();
 }
 
-void glades::LayerBuilder::print(const NNInfo* skeleton, bool override) const
+void LayerBuilder::print(const NNInfo* skeleton, bool override) const
 {
 	if (inputLayers.size() == 0)
 		return;
@@ -764,7 +764,7 @@ void glades::LayerBuilder::print(const NNInfo* skeleton, bool override) const
 	}
 }
 
-void glades::LayerBuilder::clean()
+void LayerBuilder::clean()
 {
 	inputLayers.clear();
 	layers.clear();
@@ -784,7 +784,7 @@ void glades::LayerBuilder::clean()
  * @param networkData the table of neural network architecture information
  * @return whether or not the load was successful
  */
-/*bool glades::LayerBuilder::load(const shmea::GTable& networkData)
+/*bool LayerBuilder::load(const shmea::GTable& networkData)
 {
 	// We dont need to load the old instance (for now?)
 	if (!networkData)
@@ -797,7 +797,7 @@ void glades::LayerBuilder::clean()
 		int layerType = networkData.getCell(networkRow, 1)->getInt();
 		float layerBiasWeight = networkData.getCell(networkRow, 2)->getFloat();
 
-		Layer* layer = new Layer(layerId, layerType, layerBiasWeight);
+		shmea::GPointer<Layer> cLayer(new Layer(layerId, layerType, layerBiasWeight));
 
 		SaveTable* layerFile = new SaveTable("layers");
 		layerFile->load_id(layerId);
@@ -809,7 +809,7 @@ void glades::LayerBuilder::clean()
 		{
 			int64_t nodeId = layerData.getCell(layerRow, 0)->getLong();
 
-			Node* node = new Node();
+			shmea::GPointer<Node> node(new Node());
 			node->setID(nodeId);
 
 			SaveTable* nodeFile = new SaveTable("nodes");
@@ -818,13 +818,13 @@ void glades::LayerBuilder::clean()
 			if (!nodeData)
 				return false;
 
-			std::vector<Edge*> edges;
+			std::vector<std::GPointer<Edge> > edges;
 			for (int nodeRow = 0; nodeRow < nodeData->numberOfRows(); ++nodeRow)
 			{
 				float edgeWeight = nodeData.getCell(nodeRow, 0)->getFloat();
 				float edgePrevDelta = nodeData.getCell(nodeRow, 1)->getFloat();
 
-				Edge* edge = new Edge(nodeRow, edgeWeight);
+				shmea::GPointer<Edge> edge(new Edge(nodeRow, edgeWeight));
 				edge->setPrevDelta(edgePrevDelta);
 				edges.push_back(edge);
 				// SaveTable* edgeFile = new SaveTable("edges");
@@ -837,7 +837,7 @@ void glades::LayerBuilder::clean()
 				// {
 				// 	float edgeWeight = edgeData.getCell(edgeRow, 0)->getFloat();
 				// 	float edgePrevDelta = nodeData.getCell(edgeRow, 1)->getFloat();
-				// 	Edge* edge = new Edge(edgeId, edgeWeight);
+				// 	shmea::GPointer<Edge> edge(new Edge(edgeId, edgeWeight));
 				// 	edge->setPrevDelta(edgePrevDelta);
 				// 	edges.push_back(edge);
 				// }
@@ -853,7 +853,7 @@ void glades::LayerBuilder::clean()
 	return false;
 }*/
 
-bool glades::LayerBuilder::load(const std::string& netName)
+bool LayerBuilder::load(const std::string& netName)
 {
 	return false;
 }
@@ -863,7 +863,7 @@ bool glades::LayerBuilder::load(const std::string& netName)
  * @details save all the information in the NNetwork to GTables
  * @return whether or not the save went through
  */
-bool glades::LayerBuilder::save(const std::string& netName) const
+bool LayerBuilder::save(const std::string& netName) const
 {
 	shmea::SaveFolder* nnList = new shmea::SaveFolder(netName.c_str());
 
@@ -877,7 +877,7 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 	shmea::GTable edgeTable(',', edgeHeaders);
 	for (unsigned int layerIdx = 0; layerIdx < getLayersSize(); ++layerIdx)
 	{
-		Layer* layer = layers[layerIdx];
+		shmea::GPointer<Layer> layer = layers[layerIdx];
 		if (!layer)
 			continue;
 
@@ -887,7 +887,7 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 		layerTable.addRow(layerRow);
 
 		// Save each edge in the edgeTable
-		std::vector<Node*> nodes = layer->getChildren();
+		std::vector<shmea::GPointer<Node> > nodes = layer->getChildren();
 		for (unsigned int nodeIdx = 0; nodeIdx < nodes.size(); ++nodeIdx)
 		{
 			// Add each edge to the edge file

@@ -20,7 +20,7 @@
 
 using namespace glades;
 
-glades::Node::Node()
+Node::Node()
 {
 	clean();
 	activationMutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
@@ -29,19 +29,19 @@ glades::Node::Node()
 	pthread_mutex_init(edMutex, NULL);
 }
 
-glades::Node::Node(const Node& node2)
+Node::Node(const Node& node2)
 {
 	copy(node2);
 }
 
-glades::Node::~Node()
+Node::~Node()
 {
 	clean();
 	pthread_mutex_destroy(activationMutex);
 	pthread_mutex_destroy(edMutex);
 }
 
-void glades::Node::copy(const Node& node2)
+void Node::copy(const Node& node2)
 {
 	id = node2.id;
 	weight = node2.weight;
@@ -51,17 +51,17 @@ void glades::Node::copy(const Node& node2)
 	edMutex = node2.edMutex;
 }
 
-int64_t glades::Node::getID() const
+int64_t Node::getID() const
 {
 	return id;
 }
 
-float glades::Node::getWeight() const
+float Node::getWeight() const
 {
 	return weight;
 }
 
-float glades::Node::getEdgeWeight(unsigned int index) const
+float Node::getEdgeWeight(unsigned int index) const
 {
 	if (index >= edges.size())
 		return 0.0f;
@@ -75,7 +75,7 @@ float glades::Node::getEdgeWeight(unsigned int index) const
  * @param index the edge location in the edges vector
  * @return the edge id at the requested index
  */
-int64_t glades::Node::getEdgeID(unsigned int index) const
+int64_t Node::getEdgeID(unsigned int index) const
 {
 	if (index >= edges.size())
 		return 0L;
@@ -83,7 +83,7 @@ int64_t glades::Node::getEdgeID(unsigned int index) const
 	return edges[index]->getID();
 }
 
-float glades::Node::getActivation() const
+float Node::getActivation() const
 {
 	float fullActivation = 0.0f;
 	for (unsigned int i = 0; i < edges.size(); ++i)
@@ -96,12 +96,12 @@ float glades::Node::getActivation() const
 	return fullActivation; // * activationScalar;
 }
 
-float glades::Node::getActivationScalar() const
+float Node::getActivationScalar() const
 {
 	return activationScalar;
 }
 
-float glades::Node::getErrDer() const
+float Node::getErrDer() const
 {
 	float fullED = 0.0f;
 	std::map<int, float>::const_iterator itr = errorDer.begin();
@@ -110,12 +110,12 @@ float glades::Node::getErrDer() const
 	return fullED;
 }
 
-unsigned int glades::Node::numEdges() const
+unsigned int Node::numEdges() const
 {
 	return edges.size();
 }
 
-std::vector<float> glades::Node::getPrevDeltas(unsigned int index) const
+std::vector<float> Node::getPrevDeltas(unsigned int index) const
 {
 	std::vector<float> empty;
 	if (index >= edges.size())
@@ -124,7 +124,7 @@ std::vector<float> glades::Node::getPrevDeltas(unsigned int index) const
 	return edges[index]->getPrevDeltas();
 }
 
-float glades::Node::getLastPrevDelta(unsigned int index) const
+float Node::getLastPrevDelta(unsigned int index) const
 {
 	if (index >= edges.size())
 		return 0.0f;
@@ -132,22 +132,22 @@ float glades::Node::getLastPrevDelta(unsigned int index) const
 	return edges[index]->getPrevDelta(edges[index]->numPrevDeltas() - 1);
 }
 
-void glades::Node::setID(int64_t newID)
+void Node::setID(int64_t newID)
 {
 	id = newID;
 }
 
-void glades::Node::setWeight(float newWeight)
+void Node::setWeight(float newWeight)
 {
 	weight = newWeight;
 }
 
-void glades::Node::setEdges(const std::vector<glades::Edge*>& newEdges)
+void Node::setEdges(const std::vector<shmea::GPointer<Edge> >& newEdges)
 {
 	edges = newEdges;
 }
 
-void glades::Node::setEdgeWeight(unsigned int wIndex, float newWeight)
+void Node::setEdgeWeight(unsigned int wIndex, float newWeight)
 {
 	if (wIndex >= edges.size())
 		return;
@@ -155,7 +155,7 @@ void glades::Node::setEdgeWeight(unsigned int wIndex, float newWeight)
 	edges[wIndex]->setWeight(newWeight);
 }
 
-void glades::Node::setActivation(unsigned int aIndex, float newActivation)
+void Node::setActivation(unsigned int aIndex, float newActivation)
 {
 	if (aIndex >= edges.size())
 		return;
@@ -165,12 +165,12 @@ void glades::Node::setActivation(unsigned int aIndex, float newActivation)
 	pthread_mutex_unlock(activationMutex);
 }
 
-void glades::Node::setActivationScalar(float newActivationScalar)
+void Node::setActivationScalar(float newActivationScalar)
 {
 	activationScalar = newActivationScalar;
 }
 
-void glades::Node::clearActivation()
+void Node::clearActivation()
 {
 	pthread_mutex_lock(activationMutex);
 	for (unsigned int i = 0; i < edges.size(); ++i)
@@ -178,21 +178,21 @@ void glades::Node::clearActivation()
 	pthread_mutex_unlock(activationMutex);
 }
 
-void glades::Node::setErrDer(int edIndex, float newErrorDer)
+void Node::setErrDer(int edIndex, float newErrorDer)
 {
 	pthread_mutex_lock(edMutex);
 	errorDer[edIndex] = newErrorDer;
 	pthread_mutex_unlock(edMutex);
 }
 
-void glades::Node::clearErrDer()
+void Node::clearErrDer()
 {
 	pthread_mutex_lock(edMutex);
 	errorDer.clear();
 	pthread_mutex_unlock(edMutex);
 }
 
-void glades::Node::addPrevDelta(unsigned int index, float newPrevDelta)
+void Node::addPrevDelta(unsigned int index, float newPrevDelta)
 {
 	if (index >= edges.size())
 		return;
@@ -200,7 +200,7 @@ void glades::Node::addPrevDelta(unsigned int index, float newPrevDelta)
 	edges[index]->addPrevDelta(newPrevDelta);
 }
 
-void glades::Node::clearPrevDeltas(unsigned int index)
+void Node::clearPrevDeltas(unsigned int index)
 {
 	if (index >= edges.size())
 		return;
@@ -208,13 +208,13 @@ void glades::Node::clearPrevDeltas(unsigned int index)
 	edges[index]->clearPrevDeltas();
 }
 
-void glades::Node::clean()
+void Node::clean()
 {
 	id = -1;
 	weight = 0.0f;
 }
 
-void glades::Node::print() const
+void Node::print() const
 {
 	printf(" [");
 	for (unsigned int i = 0; i < edges.size(); ++i)
@@ -228,7 +228,7 @@ void glades::Node::print() const
 	printf("]");
 }
 
-void glades::Node::initWeights(unsigned int newNumEdges, int initType)
+void Node::initWeights(unsigned int newNumEdges, int initType)
 {
 	while (numEdges() < newNumEdges)
 	{
@@ -236,20 +236,20 @@ void glades::Node::initWeights(unsigned int newNumEdges, int initType)
 		{
 			int randomNum = rand() % 100 + 1; //+1 so we dont divide by zero
 			float randomFloat = ((float)(randomNum)) / (((float)100));
-			edges.push_back(new glades::Edge(numEdges(), randomFloat));
+			edges.push_back(shmea::GPointer<Edge>(new Edge(numEdges(), randomFloat)));
 		}
 		else if (initType == INIT_POSRAND)
 		{
 			int randomNum = rand() % 100 + 1; //+1 so we dont divide by zero
 			float randomFloat = ((float)(randomNum)) / (((float)100));
-			edges.push_back(new glades::Edge(numEdges(), randomFloat));
+			edges.push_back(shmea::GPointer<Edge>(new Edge(numEdges(), randomFloat)));
 		}
 		else if (initType == INIT_EMPTY)
-			edges.push_back(new glades::Edge(numEdges(), 0.0f));
+			edges.push_back(shmea::GPointer<Edge>(new Edge(numEdges(), 0.0f)));
 	}
 }
 
-void glades::Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
+void Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
 							   unsigned int num_layers, int initType, int activationType)
 {
 	float std_dev;
@@ -282,11 +282,11 @@ void glades::Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
 			}
 		}
 		candidate_x = candidate_x * std_dev;
-		edges.push_back(new glades::Edge(numEdges(), candidate_x));
+		edges.push_back(shmea::GPointer<Edge>(new Edge(numEdges(), candidate_x)));
 	}
 }
 
-void glades::Node::getDelta(unsigned int index, float baseError, float cInputNodeWeight,
+void Node::getDelta(unsigned int index, float baseError, float cInputNodeWeight,
 							float learningRate, float momentumFactor, float weightDecay)
 {
 	if (index >= edges.size())
@@ -301,7 +301,7 @@ void glades::Node::getDelta(unsigned int index, float baseError, float cInputNod
 	addPrevDelta(index, deltaW);
 }
 
-void glades::Node::applyDeltas(unsigned int index, int minibatchSize)
+void Node::applyDeltas(unsigned int index, int minibatchSize)
 {
 	if (index >= edges.size())
 		return;

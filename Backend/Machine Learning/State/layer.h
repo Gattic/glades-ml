@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
+#include "Backend/Database/GPointer.h"
 
 namespace glades {
 
@@ -29,7 +30,7 @@ class Node;
 class Layer
 {
 private:
-	std::vector<Node*> children;
+	std::vector<shmea::GPointer<Node> > children;
 	std::vector<bool> dropoutFlag;
 	int64_t id;
 	float biasWeight;
@@ -61,17 +62,16 @@ public:
 	void setType(int);
 
 	// children
-	const std::vector<glades::Node*>& getChildren() const;
-	Node* getNode(unsigned int);
+	const std::vector<shmea::GPointer<Node> >& getChildren() const;
+	shmea::GPointer<Node> getNode(unsigned int);
 	void generateDropout(float);
 	void clearDropout();
-	void addNode(Node*);
+	void addNode(const shmea::GPointer<Node>&);
 	void initWeights(int, unsigned int, int, int);
-	std::vector<Node*>::iterator removeNode(Node*);
 	void clean();
 	void print() const;
 
-	Node* operator[](unsigned int);
+	shmea::GPointer<Node> operator[](unsigned int);
 };
 };
 

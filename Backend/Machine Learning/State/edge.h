@@ -38,7 +38,7 @@ private:
 
 public:
 	Edge(int64_t, float);
-	~Edge();
+	virtual ~Edge();
 
 	// gets
 	int64_t getID() const;

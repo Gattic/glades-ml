@@ -62,7 +62,7 @@ private:
 	CMatrix* confusionMatrix;
 	GNet::GServer* serverInstance;
 	GNet::Connection* cConnection;
-	glades::NaiveBayes bModel;
+	NaiveBayes bModel;
 
 	bool running;
 	int netType;

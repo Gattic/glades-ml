@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include "Backend/Database/GPointer.h"
 
 namespace glades {
 
@@ -32,16 +33,18 @@ class Node;
 class NetworkState
 {
 public:
-	NetworkState(unsigned int, unsigned int, unsigned int, unsigned int, glades::Layer*,
-				 glades::Layer*, glades::Node*, glades::Node*, bool, bool, bool, bool, bool, bool);
+	NetworkState(unsigned int, unsigned int, unsigned int, unsigned int,
+		shmea::GPointer<Layer>, shmea::GPointer<Layer>, shmea::GPointer<Node>,
+		shmea::GPointer<Node>, bool, bool, bool, bool, bool, bool);
+
 	unsigned int cInputLayerCounter;
 	unsigned int cOutputLayerCounter;
 	unsigned int cInputNodeCounter;
 	unsigned int cOutputNodeCounter;
-	Layer* cInputLayer;
-	Layer* cOutputLayer;
-	Node* cInputNode;
-	Node* cOutputNode;
+	shmea::GPointer<Layer> cInputLayer;
+	shmea::GPointer<Layer> cOutputLayer;
+	shmea::GPointer<Node> cInputNode;
+	shmea::GPointer<Node> cOutputNode;
 	bool firstValidInputNode, lastValidInputNode, firstValidOutputNode, lastValidOutputNode,
 		validInputNode, validOutputNode;
 };

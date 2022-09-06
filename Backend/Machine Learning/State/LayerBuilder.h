@@ -25,6 +25,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "Backend/Database/GPointer.h"
 
 namespace glades {
 
@@ -40,14 +41,14 @@ private:
 	int netType;
 	shmea::GTable inputTable;
 	shmea::GTable expectedTable;
-	std::vector<Layer*> inputLayers;
-	std::vector<Layer*> layers;
+	std::vector<shmea::GPointer<Layer> > inputLayers;
+	std::vector<shmea::GPointer<Layer> > layers;
 	float xMin;
 	float xMax;
 	float xRange;
 	std::vector<OHE*> OHEMaps;
 	std::vector<bool> featureIsCategorical;
-	std::vector<Layer*> contextLayers;
+	std::vector<shmea::GPointer<Layer> > contextLayers;
 
 	void seperateTables(const shmea::GTable&);
 	void buildInputLayers(const NNInfo*);
@@ -67,8 +68,8 @@ public:
 										 unsigned int);
 	unsigned int getInputLayersSize() const;
 	unsigned int getLayersSize() const;
-	Layer* getContextLayer(unsigned int);
-	Node* getContextNode(unsigned int, unsigned int);
+	shmea::GPointer<Layer> getContextLayer(unsigned int);
+	shmea::GPointer<Node> getContextNode(unsigned int, unsigned int);
 	shmea::GTable getInput() const;
 	shmea::GTable getExpected() const;
 	void scrambleDropout(unsigned int, float, const std::vector<float>&);

@@ -20,21 +20,21 @@
 
 using namespace glades;
 
-glades::Layer::Layer(int64_t newID, int newType, float newBias)
+Layer::Layer(int64_t newID, int newType, float newBias)
 {
 	id = newID;
 	biasWeight = newBias;
 	type = newType;
 }
 
-glades::Layer::Layer(int newType)
+Layer::Layer(int newType)
 {
 	id = -1;
 	biasWeight = 0.0f;
 	type = newType;
 }
 
-glades::Layer::~Layer()
+Layer::~Layer()
 {
 	id = -1;
 	biasWeight = 0.0f;
@@ -43,54 +43,54 @@ glades::Layer::~Layer()
 	dropoutFlag.clear();
 }
 
-int64_t glades::Layer::getID() const
+int64_t Layer::getID() const
 {
 	return id;
 }
 
-float glades::Layer::getBiasWeight() const
+float Layer::getBiasWeight() const
 {
 	return biasWeight;
 }
 
-int glades::Layer::getType() const
+int Layer::getType() const
 {
 	return type;
 }
 
-unsigned int glades::Layer::size() const
+unsigned int Layer::size() const
 {
 	return children.size();
 }
 
-void glades::Layer::setID(int64_t newID)
+void Layer::setID(int64_t newID)
 {
 	id = newID;
 }
-void glades::Layer::setBiasWeight(float newBiasWeight)
+void Layer::setBiasWeight(float newBiasWeight)
 {
 	biasWeight = newBiasWeight;
 }
 
-void glades::Layer::setType(int newType)
+void Layer::setType(int newType)
 {
 	type = newType;
 }
 
-const std::vector<glades::Node*>& glades::Layer::getChildren() const
+const std::vector<shmea::GPointer<Node> >& Layer::getChildren() const
 {
 	return children;
 }
 
-glades::Node* glades::Layer::getNode(unsigned int index)
+shmea::GPointer<Node> Layer::getNode(unsigned int index)
 {
 	if (index >= children.size())
-		return NULL;
+		return shmea::GPointer<Node>();
 
 	return children[index];
 }
 
-void glades::Layer::generateDropout(float p)
+void Layer::generateDropout(float p)
 {
 	int cDropoutRate = p * 100.0f;
 	if (cDropoutRate < 0)
@@ -122,7 +122,7 @@ void glades::Layer::generateDropout(float p)
 	} while (fullLayerDropped);
 }
 
-bool glades::Layer::possiblePath(unsigned int index) const
+bool Layer::possiblePath(unsigned int index) const
 {
 	// cannot perform dropout on this layer
 	if (type == OUTPUT_TYPE)
@@ -138,7 +138,7 @@ bool glades::Layer::possiblePath(unsigned int index) const
 	return !dropoutFlag[index];
 }
 
-unsigned int glades::Layer::firstValidPath() const
+unsigned int Layer::firstValidPath() const
 {
 	// cannot perform dropout on this layer
 	if (type == OUTPUT_TYPE)
@@ -154,7 +154,7 @@ unsigned int glades::Layer::firstValidPath() const
 	return (unsigned int)-1;
 }
 
-unsigned int glades::Layer::lastValidPath() const
+unsigned int Layer::lastValidPath() const
 {
 	// cannot perform dropout on this layer
 	// output layer dropoutFlag.size() == 0
@@ -171,18 +171,18 @@ unsigned int glades::Layer::lastValidPath() const
 	return (unsigned int)-1;
 }
 
-void glades::Layer::clearDropout()
+void Layer::clearDropout()
 {
 	dropoutFlag.clear();
 }
 
-void glades::Layer::addNode(Node* child)
+void Layer::addNode(const shmea::GPointer<Node>& child)
 {
 	if (child)
 		children.push_back(child);
 }
 
-void glades::Layer::initWeights(int prevLayerSize, unsigned int cLayerSize, int initType,
+void Layer::initWeights(int prevLayerSize, unsigned int cLayerSize, int initType,
 								int activationType)
 {
 	if (initType == Node::INIT_XAVIER || initType == Node::INIT_POSXAVIER)
@@ -199,7 +199,7 @@ void glades::Layer::initWeights(int prevLayerSize, unsigned int cLayerSize, int 
 		zigg_layers[num_layers] = 0;
 		while (size() < cLayerSize)
 		{
-			Node* newNode = new Node();
+			shmea::GPointer<Node> newNode(new Node());
 			newNode->initWeights(prevLayerSize, zigg_layers, num_layers, initType, activationType);
 			addNode(newNode);
 		}
@@ -208,44 +208,30 @@ void glades::Layer::initWeights(int prevLayerSize, unsigned int cLayerSize, int 
 	{
 		while (size() < cLayerSize)
 		{
-			Node* newNode = new Node();
+			shmea::GPointer<Node> newNode(new Node());
 			newNode->initWeights(prevLayerSize, initType);
 			addNode(newNode);
 		}
 	}
 }
 
-std::vector<Node*>::iterator glades::Layer::removeNode(Node* child)
+void Layer::clean()
 {
-	if (child)
-	{
-		std::vector<Node*>::iterator itr = children.begin();
-		for (; itr != children.end(); ++itr)
-		{
-			if ((*itr) == child)
-				return children.erase(itr);
-		}
-	}
-	return children.end();
-}
-
-void glades::Layer::clean()
-{
-	std::vector<Node*>::iterator itr = children.begin();
+	std::vector<shmea::GPointer<Node> >::iterator itr = children.begin();
 	for (; itr != children.end(); ++itr)
 	{
 		if (((*itr)->getWeight() < 0.1f) && ((*itr)->getWeight() > -0.1f))
 		{
-			itr = removeNode(*itr);
+			itr = children.erase(itr);
 			--itr;
 		}
 	}
 }
 
-void glades::Layer::print() const
+void Layer::print() const
 {
 	printf("[");
-	std::vector<Node*>::const_iterator itr = children.begin();
+	std::vector<shmea::GPointer<Node> >::const_iterator itr = children.begin();
 	while (itr != children.end())
 	{
 		printf("%f(%d)", (*itr)->getWeight(), (*itr)->numEdges());
@@ -268,10 +254,10 @@ void glades::Layer::print() const
 	printf("\n");
 }
 
-Node* glades::Layer::operator[](unsigned int index)
+shmea::GPointer<Node> Layer::operator[](unsigned int index)
 {
 	if (index >= size())
-		return NULL;
+		return shmea::GPointer<Node>();
 
 	return children[index];
 }

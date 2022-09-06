@@ -40,7 +40,7 @@ using namespace glades;
  * @brief NNetwork constructor
  * @details creates an empty nnetwork
  */
-glades::NNetwork::NNetwork(int newNetType)
+NNetwork::NNetwork(int newNetType)
 {
 	running = false;
 	skeleton = NULL;
@@ -50,7 +50,7 @@ glades::NNetwork::NNetwork(int newNetType)
 	cConnection = NULL;
 	clean();
 	meat = new LayerBuilder(newNetType);
-	confusionMatrix = new glades::CMatrix();
+	confusionMatrix = new CMatrix();
 	netType = newNetType;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 }
@@ -59,7 +59,7 @@ glades::NNetwork::NNetwork(int newNetType)
  * @brief NNetwork destructor
  * @details destroys the NNetwork object
  */
-glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
+NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 {
 	if (!newNNInfo)
 		return;
@@ -72,34 +72,34 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 	cConnection = NULL;
 	clean();
 	meat = new LayerBuilder(newNetType);
-	confusionMatrix = new glades::CMatrix();
+	confusionMatrix = new CMatrix();
 	skeleton = newNNInfo;
 	netType = newNetType;
 	minibatchSize = skeleton->getBatchSize();
 }
 
-glades::NNetwork::~NNetwork()
+NNetwork::~NNetwork()
 {
 	clean();
 	resetGraphs();
 }
 
-bool glades::NNetwork::getRunning() const
+bool NNetwork::getRunning() const
 {
 	return running;
 }
 
-int glades::NNetwork::getEpochs() const
+int NNetwork::getEpochs() const
 {
 	return epochs;
 }
 
-void glades::NNetwork::stop()
+void NNetwork::stop()
 {
 	running = false;
 }
 
-void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator* Arnold,
+void NNetwork::run(const shmea::GTable& newInputTable, const Terminator* Arnold,
 						   int runType)
 {
 	if (!skeleton)
@@ -333,7 +333,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 	running = false;
 }
 
-void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows, int runType)
+void NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows, int runType)
 {
 	if ((!skeleton) || (!meat))
 		return;
@@ -390,7 +390,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	}
 }
 
-void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
+void NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
 								   int cInputLayerCounter, int cOutputLayerCounter,
 								   unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
@@ -513,7 +513,7 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 	delete netState;
 }
 
-void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCounter,
+void NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCounter,
 	int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	NetworkState* netState =
@@ -624,12 +624,12 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
  * @details get the network's unique ID
  * @return the network's ID
  */
-int64_t glades::NNetwork::getID() const
+int64_t NNetwork::getID() const
 {
 	return id;
 }
 
-std::string glades::NNetwork::getName() const
+std::string NNetwork::getName() const
 {
 	if (!skeleton)
 		return "";
@@ -637,7 +637,7 @@ std::string glades::NNetwork::getName() const
 	return skeleton->getName();
 }
 
-NNInfo* glades::NNetwork::getNNInfo()
+NNInfo* NNetwork::getNNInfo()
 {
 	if (!skeleton)
 		return NULL;
@@ -645,12 +645,12 @@ NNInfo* glades::NNetwork::getNNInfo()
 	return skeleton;
 }
 
-float glades::NNetwork::getAccuracy() const
+float NNetwork::getAccuracy() const
 {
 	return overallTotalAccuracy;
 }
 
-bool glades::NNetwork::load(const std::string& netName)
+bool NNetwork::load(const std::string& netName)
 {
 	if (!meat)
 		return false;
@@ -666,7 +666,7 @@ bool glades::NNetwork::load(const std::string& netName)
 	return meat->load(netName);*/
 }
 
-bool glades::NNetwork::save() const
+bool NNetwork::save() const
 {
 	if (!meat)
 		return false;
@@ -679,13 +679,13 @@ bool glades::NNetwork::save() const
 	/// return meat->save(skeleton->getName());
 }
 
-void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
+void NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
 {
 	serverInstance = newServer;
 	cConnection = newConnection;
 }
 
-shmea::GList glades::NNetwork::getLearningCurve() const
+shmea::GList NNetwork::getLearningCurve() const
 {
 	return learningCurve;
 }
@@ -695,12 +695,12 @@ shmea::GList glades::NNetwork::getLearningCurve() const
 // 	return rocCurve;
 // }
 
-shmea::GList glades::NNetwork::getResults() const
+shmea::GList NNetwork::getResults() const
 {
 	return results;
 }
 
-void glades::NNetwork::clean()
+void NNetwork::clean()
 {
 	id = -1;
 	skeleton = NULL;
@@ -720,7 +720,7 @@ void glades::NNetwork::clean()
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 }
 
-void glades::NNetwork::resetGraphs()
+void NNetwork::resetGraphs()
 {
 	learningCurve.clear();
 
