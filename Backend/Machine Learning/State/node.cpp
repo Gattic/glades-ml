@@ -295,7 +295,8 @@ void Node::getDelta(unsigned int index, float baseError, float cInputNodeWeight,
 	// calculate the optimized delta rule
 	float deltaW =
 		((baseError * cInputNodeWeight) + (momentumFactor * getLastPrevDelta(index)) // momentum
-		 + (weightDecay * learningRate * cInputNodeWeight));						 // weight decay
+		 + learningRate * (weightDecay * abs(baseError))						 // L1 weight decay
+		 + learningRate * (weightDecay * baseError*baseError));						 // L2 weight decay
 
 	// Add the new PrevDelta
 	addPrevDelta(index, deltaW);
