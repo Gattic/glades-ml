@@ -261,3 +261,15 @@ shmea::GPointer<Node> Layer::operator[](unsigned int index)
 
 	return children[index];
 }
+
+void Layer::setupContext()
+{
+	for(unsigned int i=0;i<children.size();++i)
+	{
+		printf("SETUP CONTEXT: %u\n", i);
+		shmea::GPointer<Node> newNode(new Node());
+		newNode->initWeights(1, Node::INIT_POSRAND);
+		children[i]->setContextNode(newNode);
+	}
+}
+

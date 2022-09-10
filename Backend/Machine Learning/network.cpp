@@ -411,15 +411,6 @@ void NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
 		netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
 	}
 
-	//TODO: Change this meat call to a netState call via adding a contextNode like biasWeight
-	// Fixed weight of 1
-	if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() != Layer::OUTPUT_TYPE))
-	{
-		float cEdgeActivation = meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->getEdgeWeight(0) * meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->getWeight();
-		meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->setActivation(0, cEdgeActivation);
-	}
-
-
 	// Last Input Node for the Output Node
 	float cOutputLayerActivation = 0.0f;
 	if (netState->lastValidInputNode)
@@ -427,17 +418,27 @@ void NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
 		// Get the current output node activation
 		float cOutputNodeActivation = netState->cOutputNode->getActivation();
 
-		// Clean the output node activation for next run (cleanup)
-		netState->cOutputNode->clearActivation();
+		// Context Nodes
+		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		{
+			float cContextEdgeActivation =
+				netState->cOutputNode->getContextNode()->getEdgeWeight(0) *
+				netState->cOutputNode->getContextNode()->getWeight();
+			cOutputNodeActivation += cContextEdgeActivation;
+		}
 
 		// Add the bias if we are in a hidden layer or output layer
 		// Input Layer fundamentally cannot have a bias
 		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
 			cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
 
-		//TODO: Change this meat call to a netState call
-		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() != Layer::OUTPUT_TYPE))
-			cOutputNodeActivation += meat->getContextNode(cOutputLayerCounter, cOutputNodeCounter)->getActivation();
+		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		{
+			netState->cOutputNode->getContextNode()->setWeight(netState->cOutputNode->getActivation());
+		}
+
+		// Clean the output node activation for next run (cleanup)
+		netState->cOutputNode->clearActivation();
 
 		// Set Our prediction based on the cOutputNode activation
 		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
@@ -563,22 +564,25 @@ void NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCoun
 		float weightDecay = skeleton->getWeightDecay(cInputLayerCounter);
 		float baseError = learningRate * cOutNetErrDer;
 
-		// Update the context nodes
-		if ((netType == TYPE_RNN) && (netState->cInputLayer->getType() != Layer::INPUT_TYPE))
-		{
-			float oldHiddenWeight = netState->cInputLayer->
-				getChildren()[cInputNodeCounter]->getWeight();
-			meat->getContextNode(cInputLayerCounter, cInputNodeCounter)
-				->setWeight(oldHiddenWeight);
-		}
-
 		// Add the weight delta
 		netState->cOutputNode->getDelta(cInputNodeCounter, baseError, netState->cInputNode->getWeight(),
-			learningRate,momentumFactor, weightDecay);
+			learningRate, momentumFactor, weightDecay);
+
+		if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		{
+			netState->cOutputNode->getContextNode()->getDelta(0, baseError,
+				netState->cOutputNode->getContextNode()->getWeight(), learningRate, momentumFactor, weightDecay);
+		}
 
 		// Apply all deltas if we've hit the minibatch size
 		if ((inputRowCounter % minibatchSize) == 0)
 		{
+			if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+			{
+				netState->cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
+				netState->cOutputNode->getContextNode()->clearPrevDeltas(0);
+			}
+
 			netState->cOutputNode->applyDeltas(cInputNodeCounter, minibatchSize);
 			netState->cOutputNode->clearPrevDeltas(cInputNodeCounter);
 		}
@@ -590,7 +594,7 @@ void NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCoun
 
 	// Update the error partials for the next recursive calls
 	float cInNetErrDer = netState->cInputNode->getErrDer() +
-						 (cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
+		(cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
 	netState->cInputNode->setErrDer(cOutputNodeCounter, cInNetErrDer);
 
 	// Recursive Calls

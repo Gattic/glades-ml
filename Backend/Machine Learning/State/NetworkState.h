@@ -24,11 +24,10 @@
 #include <string.h>
 #include <string>
 #include "Backend/Database/GPointer.h"
+#include "node.h"
+#include "layer.h"
 
 namespace glades {
-
-class Layer;
-class Node;
 
 class NetworkState
 {

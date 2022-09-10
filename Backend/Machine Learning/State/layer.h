@@ -40,7 +40,6 @@ public:
 	static const int INPUT_TYPE = 0;
 	static const int HIDDEN_TYPE = 1;
 	static const int OUTPUT_TYPE = 2;
-	static const int CONTEXT_TYPE = 3;
 
 	// constructors and destructors
 	Layer(int64_t, int, float = 0.0f);
@@ -72,6 +71,8 @@ public:
 	void print() const;
 
 	shmea::GPointer<Node> operator[](unsigned int);
+
+	void setupContext();
 };
 };
 

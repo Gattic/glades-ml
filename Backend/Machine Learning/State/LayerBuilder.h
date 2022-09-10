@@ -48,7 +48,6 @@ private:
 	float xRange;
 	std::vector<OHE*> OHEMaps;
 	std::vector<bool> featureIsCategorical;
-	std::vector<shmea::GPointer<Layer> > contextLayers;
 
 	void seperateTables(const shmea::GTable&);
 	void buildInputLayers(const NNInfo*);
@@ -68,8 +67,6 @@ public:
 										 unsigned int);
 	unsigned int getInputLayersSize() const;
 	unsigned int getLayersSize() const;
-	shmea::GPointer<Layer> getContextLayer(unsigned int);
-	shmea::GPointer<Node> getContextNode(unsigned int, unsigned int);
 	shmea::GTable getInput() const;
 	shmea::GTable getExpected() const;
 	void scrambleDropout(unsigned int, float, const std::vector<float>&);

@@ -171,31 +171,6 @@ void LayerBuilder::buildInputLayers(const NNInfo* skeleton)
 
 void LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 {
-	printf("Hidden Build! %d\n", netType);
-	if (netType == NNetwork::TYPE_RNN)
-	{
-		printf("RNN Build!\n");
-		// Build the time state vec
-		for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
-		{
-			// Create the context layer
-			int cLayerSize = skeleton->getHiddenLayerSize(i);
-			shmea::GPointer<Layer> cLayer(new Layer(Layer::CONTEXT_TYPE));
-
-			for (int j = 0; j < cLayerSize; ++j)
-			{
-				int randomNum = rand() % 100 + 1; //+1 so we dont divide by zero
-				float randomFloat = ((float)(randomNum)) / (((float)100));
-				shmea::GPointer<Node> contextNode(new Node());
-				contextNode->setWeight(randomFloat);
-				cLayer->addNode(contextNode);
-			}
-
-			printf("context: %ld", contextLayers.size());
-			contextLayers.push_back(cLayer);
-		}
-	}
-
 	int inputLayerSize = inputLayers[0]->size();
 	int outputLayerSize = skeleton->getOutputLayerSize();
 	int prevLayerSize = inputLayerSize;
@@ -232,6 +207,8 @@ void LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 
 			cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_XAVIER, activationType);
 		}
+
+		cLayer->setupContext();
 
 		layers.push_back(cLayer);
 		prevLayerSize = cLayerSize;
@@ -348,27 +325,6 @@ unsigned int LayerBuilder::getInputLayersSize() const
 unsigned int LayerBuilder::getLayersSize() const
 {
 	return layers.size();
-}
-
-shmea::GPointer<Layer> LayerBuilder::getContextLayer(unsigned int cLayerCounter)
-{
-	// Return 1.0f on error to retain old state
-	if (cLayerCounter >= contextLayers.size())
-		return shmea::GPointer<Layer>();
-
-	return contextLayers[cLayerCounter];
-}
-
-shmea::GPointer<Node> LayerBuilder::getContextNode(unsigned int cLayerCounter, unsigned int cNodeCounter)
-{
-	// Return 1.0f on error to retain old state
-	if (cLayerCounter >= contextLayers.size())
-		return shmea::GPointer<Node>();
-
-	if (cNodeCounter >= contextLayers[cLayerCounter]->size())
-		return shmea::GPointer<Node>();
-
-	return contextLayers[cLayerCounter]->getNode(cNodeCounter);
 }
 
 shmea::GTable LayerBuilder::getInput() const
@@ -768,7 +724,6 @@ void LayerBuilder::clean()
 {
 	inputLayers.clear();
 	layers.clear();
-	contextLayers.clear();
 	xMin = 0.0f;
 	xMax = 0.0f;
 	xRange = 0.0f;

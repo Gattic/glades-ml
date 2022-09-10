@@ -45,7 +45,10 @@ private:
 	pthread_mutex_t* activationMutex;
 	pthread_mutex_t* edMutex;
 
+	shmea::GPointer<Node> contextNode;
+
 public:
+
 	static const int INIT_EMPTY = 0;
 	static const int INIT_RANDOM = 1;
 	static const int INIT_POSRAND = 2;
@@ -90,6 +93,9 @@ public:
 	void initWeights(unsigned int, float[], unsigned int, int, int);
 	void getDelta(unsigned int, float, float, float, float, float);
 	void applyDeltas(unsigned int, int);
+
+	void setContextNode(const shmea::GPointer<Node>&);
+	shmea::GPointer<Node> getContextNode();
 };
 };
 

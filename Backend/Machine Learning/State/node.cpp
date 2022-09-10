@@ -49,6 +49,7 @@ void Node::copy(const Node& node2)
 	errorDer = node2.errorDer;
 	activationMutex = node2.activationMutex;
 	edMutex = node2.edMutex;
+	contextNode = node2.contextNode;
 }
 
 int64_t Node::getID() const
@@ -247,6 +248,9 @@ void Node::initWeights(unsigned int newNumEdges, int initType)
 		else if (initType == INIT_EMPTY)
 			edges.push_back(shmea::GPointer<Edge>(new Edge(numEdges(), 0.0f)));
 	}
+
+	//unsigned int numContextNodes = 1;
+	//setupContextNodes(numContextNodes);
 }
 
 void Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
@@ -287,7 +291,7 @@ void Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
 }
 
 void Node::getDelta(unsigned int index, float baseError, float cInputNodeWeight,
-							float learningRate, float momentumFactor, float weightDecay)
+	float learningRate, float momentumFactor, float weightDecay)
 {
 	if (index >= edges.size())
 		return;
@@ -315,4 +319,14 @@ void Node::applyDeltas(unsigned int index, int minibatchSize)
 
 	// Set the new weight
 	setEdgeWeight(index, getEdgeWeight(index) - deltaW);
+}
+
+void Node::setContextNode(const shmea::GPointer<Node>& newContextNode)
+{
+	contextNode = newContextNode;
+}
+
+shmea::GPointer<Node> Node::getContextNode()
+{
+	return contextNode;
 }
