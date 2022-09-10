@@ -108,8 +108,6 @@ void NNetwork::run(const shmea::GTable& newInputTable, const Terminator* Arnold,
 	if ((newInputTable.numberOfRows() <= 0) || (newInputTable.numberOfCols() <= 0))
 		return;
 
-	printf("DERP0\n");
-
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
 		meat->build(skeleton, newInputTable, netType);

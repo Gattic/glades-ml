@@ -119,13 +119,11 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, const shmea::GTab
 
 	// Add the Neural Network
 	cMetaNetwork->addSubnet(cNetwork);
-	printf("HERP0\n");
 
 	// Train the Neural Network
 	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 	{
-	printf("HERP1: %u\n", i);
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
 		subnets[i]->run(dataTable, Arnold, glades::NNetwork::RUN_TRAIN);
