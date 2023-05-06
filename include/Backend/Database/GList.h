@@ -40,10 +40,10 @@ private:
 	float xRange;
 
 	//
-	void addPrimitive(int, const void*);
-	void insertPrimitive(unsigned int, int, const void*);
-	void addObject(int, const void*, int64_t);
-	void insertObject(unsigned int, int, const void*, int64_t);
+	void addPrimitive(GType::Type, const void*);
+	void insertPrimitive(unsigned int, GType::Type, const void*);
+	void addObject(GType::Type, const void*, int64_t);
+	void insertObject(unsigned int, GType::Type, const void*, int64_t);
 
 public:
 	GList();
