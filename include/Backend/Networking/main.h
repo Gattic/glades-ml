@@ -116,7 +116,7 @@ public:
 	void LaunchInstance(const shmea::GString&, const shmea::GString&);
 	const bool& getRunning();
 	void stop();
-	void run(bool);
+	void run(shmea::GString, bool);
 	bool isNetworkingDisabled();
 
 	Connection* getLocalConnection();
