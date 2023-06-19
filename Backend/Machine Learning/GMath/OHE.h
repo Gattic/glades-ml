@@ -48,6 +48,7 @@ public:
 	OHE();
 	OHE(const OHE&);
 	virtual ~OHE();
+	void reset();
 
 	// sets
 	void addString(const char*);
@@ -64,6 +65,7 @@ public:
 	int indexAt(const std::string&) const;
 	std::string classAt(unsigned int) const;
 	float standardize(float) const;
+	float unstandardize(float) const;
 
 	// operators
 	std::vector<float> operator[](const char*) const;

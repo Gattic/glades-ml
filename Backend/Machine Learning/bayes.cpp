@@ -27,6 +27,7 @@ using namespace glades;
 
 shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
 {
+	reset();
 	shmea::GTable standardizedTable(',');
 	standardizedTable.setHeaders(newInputTable.getHeaders());
 
@@ -49,7 +50,7 @@ shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
 		shmea::GList newRow;
 		for (unsigned int c = 0; c < newInputTable.numberOfCols(); ++c)
 		{
-			const OHE& cOHE = OHEMaps[c];
+			OHE cOHE = OHEMaps[c];
 			float cell = 0.0f;
 			shmea::GType cCell = newInputTable.getCell(r, c);
 			if (cCell.getType() == shmea::GType::STRING_TYPE)
@@ -74,6 +75,7 @@ shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
 			else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
 				cell = cCell.getBoolean() ? 1.0f : 0.0f;
 
+			//printf("cell[%u][%u]: %f\n", r, c, cell);
 			newRow.addFloat(cOHE.standardize(cell));
 		}
 
@@ -83,9 +85,9 @@ shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
 	return standardizedTable;
 }
 
-
 shmea::GTable glades::NaiveBayes::import(const shmea::GTable& newInputTable)
 {
+	reset();
 	shmea::GTable standardizedTable(',');
 	standardizedTable.setHeaders(newInputTable.getHeaders());
 
@@ -192,7 +194,9 @@ int NaiveBayes::predict(const shmea::GList& attributes)
 	}
 
 	//printf("Predicted Class: %d(%s) P(C|x) =%f\n", maxcid, OHEMaps[outCol].classAt(maxcid).c_str(), maxp);
-	return maxcid;
+	OHE cOHE = OHEMaps[outCol];
+	return cOHE.unstandardize(maxcid);
+	//return maxcid;
 }
 
 void NaiveBayes::print() const

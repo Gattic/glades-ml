@@ -22,10 +22,7 @@ using namespace glades;
 
 glades::OHE::OHE()
 {
-	OHEStrings.clear();
-	fMin = 0.0f;
-	fMax = 0.0f;
-	fMean = 0.0f;
+	reset();
 }
 
 glades::OHE::OHE(const OHE& ohe2)
@@ -39,7 +36,13 @@ glades::OHE::OHE(const OHE& ohe2)
 
 glades::OHE::~OHE()
 {
+	reset();
+}
+
+void glades::OHE::reset()
+{
 	OHEStrings.clear();
+	classCount.clear();
 	fMin = 0.0f;
 	fMax = 0.0f;
 	fMean = 0.0f;
@@ -263,6 +266,7 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 		else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
 			cell = cCell.getBoolean() ? 1.0f : 0.0f;
 
+		//printf("INNER[%u][%d]: %f\n", r, featureCol, cell);
 		if (r == 0)
 		{
 			fMin = cell;
@@ -279,7 +283,8 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 		fMean += cell;
 	}
 
-	fMean /= gTable.numberOfRows();
+	fMean /= (float)gTable.numberOfRows();
+	//printf("FINAL[%d]: %f\n", featureCol, fMean);
 	// Normalize
 	/*std::map<std::string, double>::iterator itr = classCount.begin();
 	for (; itr != classCount.end(); ++itr)
@@ -289,11 +294,21 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 float glades::OHE::standardize(float val) const
 {
 	// find the range of this feature
-	float xRange = fMax - fMin;
-	if (xRange == 0.0f)
+	float fRange = fMax - fMin;
+	if (fRange == 0.0f)
 		return 0.0f;
 
-	return ((((val - fMin) / (xRange)) * 0.98f) + 0.01f);
+	return ((((val - fMin) / (fRange)) * 0.98f) + 0.01f);
+}
+
+float glades::OHE::unstandardize(float val) const
+{
+	// find the range of this feature
+	float fRange = fMax - fMin;
+	if (fRange == 0.0f)
+		return 0.0f;
+
+	return (((val + 0.1f) / 0.98f) * fRange) + fMin;
 }
 
 void glades::OHE::printFeatures() const
