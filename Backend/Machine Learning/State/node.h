@@ -25,8 +25,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
-
-class GType;
+#include "Backend/Database/GPointer.h"
 
 namespace glades {
 
@@ -41,12 +40,15 @@ private:
 	float activationScalar;
 
 	// ml
-	std::vector<glades::Edge*> edges;
+	std::vector<shmea::GPointer<Edge> > edges;
 	std::map<int, float> errorDer;
 	pthread_mutex_t* activationMutex;
 	pthread_mutex_t* edMutex;
 
+	shmea::GPointer<Node> contextNode;
+
 public:
+
 	static const int INIT_EMPTY = 0;
 	static const int INIT_RANDOM = 1;
 	static const int INIT_POSRAND = 2;
@@ -54,9 +56,8 @@ public:
 	static const int INIT_POSXAVIER = 4;
 
 	Node();
-	Node(GType*);
 	Node(const Node&); // copy contstructor
-	~Node();
+	virtual ~Node();
 	void copy(const Node&);
 
 	// gets
@@ -75,7 +76,7 @@ public:
 	// sets
 	void setID(int64_t);
 	void setWeight(float);
-	void setEdges(const std::vector<glades::Edge*>&);
+	void setEdges(const std::vector<shmea::GPointer<Edge> >&);
 	void setEdgeWeight(unsigned int, float);
 	void setActivation(unsigned int, float);
 	void setActivationScalar(float);
@@ -92,6 +93,9 @@ public:
 	void initWeights(unsigned int, float[], unsigned int, int, int);
 	void getDelta(unsigned int, float, float, float, float, float);
 	void applyDeltas(unsigned int, int);
+
+	void setContextNode(const shmea::GPointer<Node>&);
+	shmea::GPointer<Node> getContextNode();
 };
 };
 

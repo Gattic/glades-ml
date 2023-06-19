@@ -16,14 +16,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "NetworkState.h"
 
-glades::NetworkState::NetworkState(unsigned int newInputLayerCounter,
-								   unsigned int newOutputLayerCounter,
-								   unsigned int newInputNodeCounter,
-								   unsigned int newOutputNodeCounter, Layer* newInputLayer,
-								   Layer* newOutputLayer, Node* newInputNode, Node* newOutputNode,
-								   bool newFirstValidInputNode, bool newLastValidInputNode,
-								   bool newFirstValidOutputNode, bool newLastValidOutputNode,
-								   bool newValidInputNode, bool newValidOutputNode)
+glades::NetworkState::NetworkState(unsigned int newInputLayerCounter, unsigned int newOutputLayerCounter,
+	unsigned int newInputNodeCounter, unsigned int newOutputNodeCounter, shmea::GPointer<Layer> newInputLayer,
+	shmea::GPointer<Layer> newOutputLayer, shmea::GPointer<Node> newInputNode, shmea::GPointer<Node> newOutputNode,
+	bool newFirstValidInputNode, bool newLastValidInputNode,
+	bool newFirstValidOutputNode, bool newLastValidOutputNode,
+	bool newValidInputNode, bool newValidOutputNode)
 {
 	cInputLayerCounter = newInputLayerCounter;
 	cOutputLayerCounter = newOutputLayerCounter;

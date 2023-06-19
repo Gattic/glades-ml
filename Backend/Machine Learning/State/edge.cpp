@@ -18,7 +18,7 @@
 
 using namespace glades;
 
-glades::Edge::Edge(int64_t newID, float newWeight)
+Edge::Edge(int64_t newID, float newWeight)
 {
 	id = newID;
 	weight = newWeight;
@@ -27,7 +27,7 @@ glades::Edge::Edge(int64_t newID, float newWeight)
 	activation = 0.0f;
 }
 
-glades::Edge::~Edge()
+Edge::~Edge()
 {
 	id = 0;
 	weight = 0.0f;
@@ -36,22 +36,22 @@ glades::Edge::~Edge()
 	activation = 0.0f;
 }
 
-int64_t glades::Edge::getID() const
+int64_t Edge::getID() const
 {
 	return id;
 }
 
-float glades::Edge::getWeight() const
+float Edge::getWeight() const
 {
 	return weight;
 }
 
-std::vector<float> glades::Edge::getPrevDeltas() const
+std::vector<float> Edge::getPrevDeltas() const
 {
 	return prevDelta;
 }
 
-float glades::Edge::getPrevDelta(unsigned int index) const
+float Edge::getPrevDelta(unsigned int index) const
 {
 	if (index >= prevDelta.size())
 		return 0.0f;
@@ -59,48 +59,48 @@ float glades::Edge::getPrevDelta(unsigned int index) const
 	return prevDelta[index];
 }
 
-int glades::Edge::numPrevDeltas() const
+int Edge::numPrevDeltas() const
 {
 	return prevDelta.size();
 }
 
-bool glades::Edge::getActivated() const
+bool Edge::getActivated() const
 {
 	return activated;
 }
 
-float glades::Edge::getActivation() const
+float Edge::getActivation() const
 {
 	return activation;
 }
 
-void glades::Edge::setID(int64_t newID)
+void Edge::setID(int64_t newID)
 {
 	id = newID;
 }
 
-void glades::Edge::setWeight(float newWeight)
+void Edge::setWeight(float newWeight)
 {
 	weight = newWeight;
 }
 
-void glades::Edge::addPrevDelta(float newPrevDelta)
+void Edge::addPrevDelta(float newPrevDelta)
 {
 	prevDelta.push_back(newPrevDelta);
 }
 
-void glades::Edge::setActivation(float newActivation)
+void Edge::setActivation(float newActivation)
 {
 	activation = newActivation;
 	activated = true;
 }
 
-void glades::Edge::clearPrevDeltas()
+void Edge::clearPrevDeltas()
 {
 	prevDelta.clear();
 }
 
-void glades::Edge::Deactivate()
+void Edge::Deactivate()
 {
 	activation = 0.0f;
 	activated = false;

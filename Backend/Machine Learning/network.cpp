@@ -40,7 +40,7 @@ using namespace glades;
  * @brief NNetwork constructor
  * @details creates an empty nnetwork
  */
-glades::NNetwork::NNetwork()
+NNetwork::NNetwork(int newNetType)
 {
 	running = false;
 	skeleton = NULL;
@@ -49,9 +49,9 @@ glades::NNetwork::NNetwork()
 	serverInstance = NULL;
 	cConnection = NULL;
 	clean();
-	meat = new LayerBuilder();
-	confusionMatrix = new glades::CMatrix();
-	netType = TYPE_DFF;
+	meat = new LayerBuilder(newNetType);
+	confusionMatrix = new CMatrix();
+	netType = newNetType;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 }
 
@@ -59,7 +59,7 @@ glades::NNetwork::NNetwork()
  * @brief NNetwork destructor
  * @details destroys the NNetwork object
  */
-glades::NNetwork::NNetwork(NNInfo* newNNInfo)
+NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 {
 	if (!newNNInfo)
 		return;
@@ -71,35 +71,35 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo)
 	serverInstance = NULL;
 	cConnection = NULL;
 	clean();
-	meat = new LayerBuilder();
-	confusionMatrix = new glades::CMatrix();
+	meat = new LayerBuilder(newNetType);
+	confusionMatrix = new CMatrix();
 	skeleton = newNNInfo;
-	netType = TYPE_DFF;
+	netType = newNetType;
 	minibatchSize = skeleton->getBatchSize();
 }
 
-glades::NNetwork::~NNetwork()
+NNetwork::~NNetwork()
 {
 	clean();
 	resetGraphs();
 }
 
-bool glades::NNetwork::getRunning() const
+bool NNetwork::getRunning() const
 {
 	return running;
 }
 
-int glades::NNetwork::getEpochs() const
+int NNetwork::getEpochs() const
 {
 	return epochs;
 }
 
-void glades::NNetwork::stop()
+void NNetwork::stop()
 {
 	running = false;
 }
 
-void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator* Arnold,
+void NNetwork::run(const shmea::GTable& newInputTable, const Terminator* Arnold,
 						   int runType)
 {
 	if (!skeleton)
@@ -331,7 +331,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 	running = false;
 }
 
-void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows, int runType)
+void NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows, int runType)
 {
 	if ((!skeleton) || (!meat))
 		return;
@@ -350,9 +350,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	nbRecord.clear();
 
 	// Forward Pass and trigger events
-	beforeFwd();
 	ForwardPass(inputRowCounter, numInputRows, 0, 0, 0, 0);
-	afterFwd();
 
 	// Add current results to cmatrix for accuracy vars
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
@@ -364,9 +362,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	{
 		// Start with the last output layer
 		int cOutputLayerCounter = meat->getLayersSize() - 1;
-		beforeBack();
 		BackPropagation(inputRowCounter, cOutputLayerCounter - 1, cOutputLayerCounter, 0, 0);
-		afterBack();
 
 		// Save the autotuning data
 		float learningRate = skeleton->getLearningRate(cOutputLayerCounter - 1);
@@ -392,91 +388,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	}
 }
 
-void glades::NNetwork::beforeFwdEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeFwdNode(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeFwdLayer(const NetworkState* netState)
-{
-	// To not display 0 for h[0]
-	int cLayer = netState->cOutputLayerCounter > 0 ? netState->cInputLayerCounter + 1
-												   : netState->cInputLayerCounter;
-}
-
-void glades::NNetwork::beforeFwd()
-{
-	//
-}
-
-void glades::NNetwork::beforeBackEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeBackNode(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeBackLayer(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::beforeBack()
-{
-	//
-}
-
-void glades::NNetwork::afterFwdEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterFwdNode(const NetworkState* netState, float cOutputNodeActivation)
-{
-	//
-}
-
-void glades::NNetwork::afterFwdLayer(const NetworkState* netState, float cOutputLayerActivation)
-{
-	// To not display 0 for h[0]
-	int cLayer = netState->cOutputLayerCounter > 0 ? netState->cInputLayerCounter + 1
-												   : netState->cInputLayerCounter;
-}
-
-void glades::NNetwork::afterFwd()
-{
-	//
-}
-
-void glades::NNetwork::afterBackEdge(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterBackNode(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterBackLayer(const NetworkState* netState)
-{
-	//
-}
-
-void glades::NNetwork::afterBack()
-{
-	//
-}
-
-void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
+void NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
 								   int cInputLayerCounter, int cOutputLayerCounter,
 								   unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
@@ -485,11 +397,6 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 									 cInputNodeCounter, cOutputNodeCounter);
 	if (!netState)
 		return;
-
-	// Event triggered
-	beforeFwdLayer(netState);
-
-	beforeFwdEdge(netState);
 
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
@@ -502,24 +409,34 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 		netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
 	}
 
-	afterFwdEdge(netState);
-
 	// Last Input Node for the Output Node
 	float cOutputLayerActivation = 0.0f;
 	if (netState->lastValidInputNode)
 	{
 		// Get the current output node activation
-		beforeFwdNode(netState);
 		float cOutputNodeActivation = netState->cOutputNode->getActivation();
-		afterFwdNode(netState, cOutputNodeActivation);
 
-		// Clean the output node activation for next run (cleanup)
-		netState->cOutputNode->clearActivation();
+		// Context Nodes
+		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		{
+			float cContextEdgeActivation =
+				netState->cOutputNode->getContextNode()->getEdgeWeight(0) *
+				netState->cOutputNode->getContextNode()->getWeight();
+			cOutputNodeActivation += cContextEdgeActivation;
+		}
 
 		// Add the bias if we are in a hidden layer or output layer
 		// Input Layer fundamentally cannot have a bias
 		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
 			cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
+
+		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		{
+			netState->cOutputNode->getContextNode()->setWeight(netState->cOutputNode->getActivation());
+		}
+
+		// Clean the output node activation for next run (cleanup)
+		netState->cOutputNode->clearActivation();
 
 		// Set Our prediction based on the cOutputNode activation
 		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
@@ -576,7 +493,6 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
 	{
 		// Next Output Layer
-		afterFwdLayer(netState, cOutputLayerActivation);
 		ForwardPass(inputRowCounter, numInputRows, cOutputLayerCounter, cOutputLayerCounter + 1, 0,
 					0);
 	}
@@ -596,18 +512,14 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 	delete netState;
 }
 
-void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCounter,
-									   int cOutputLayerCounter, unsigned int cInputNodeCounter,
-									   unsigned int cOutputNodeCounter)
+void NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCounter,
+	int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	NetworkState* netState =
 		meat->getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
 									 cInputNodeCounter, cOutputNodeCounter);
 	if (!netState)
 		return;
-
-	// Event triggered
-	beforeBackLayer(netState);
 
 	// Output Layer Error Derivative Calculation
 	float cOutputDer = 1.0f; // Output der is linear so its 1
@@ -631,8 +543,6 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 			GMath::activationErrDer(netState->cOutputNode->getWeight(), cActivationFx, 0.01f);
 	}
 
-	beforeBackEdge(netState);
-
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
 
@@ -653,38 +563,43 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		float baseError = learningRate * cOutNetErrDer;
 
 		// Add the weight delta
-		netState->cOutputNode->getDelta(cInputNodeCounter, baseError,
-										netState->cInputNode->getWeight(), learningRate,
-										momentumFactor, weightDecay);
+		netState->cOutputNode->getDelta(cInputNodeCounter, baseError, netState->cInputNode->getWeight(),
+			learningRate, momentumFactor, weightDecay);
+
+		if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		{
+			netState->cOutputNode->getContextNode()->getDelta(0, baseError,
+				netState->cOutputNode->getContextNode()->getWeight(), learningRate, momentumFactor, weightDecay);
+		}
 
 		// Apply all deltas if we've hit the minibatch size
 		if ((inputRowCounter % minibatchSize) == 0)
 		{
+			if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+			{
+				netState->cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
+				netState->cOutputNode->getContextNode()->clearPrevDeltas(0);
+			}
+
 			netState->cOutputNode->applyDeltas(cInputNodeCounter, minibatchSize);
 			netState->cOutputNode->clearPrevDeltas(cInputNodeCounter);
 		}
 
 		// Update the bias (inputs fundamentally cannot have a bias)
 		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
-			netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() -
-												 baseError);
+			netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() - baseError);
 	}
 
-	afterBackEdge(netState);
-
 	// Update the error partials for the next recursive calls
-	beforeBackNode(netState);
 	float cInNetErrDer = netState->cInputNode->getErrDer() +
-						 (cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
+		(cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
 	netState->cInputNode->setErrDer(cOutputNodeCounter, cInNetErrDer);
-	afterBackNode(netState);
 
 	// Recursive Calls
 	if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
 		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
 	{
 		// Next Input Layer
-		afterBackLayer(netState);
 		if ((cInputLayerCounter == 0) && (cOutputLayerCounter == 1)) // Last recursive layer case
 			BackPropagation(inputRowCounter, 0, 0, 0, 0);
 		else
@@ -711,12 +626,12 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
  * @details get the network's unique ID
  * @return the network's ID
  */
-int64_t glades::NNetwork::getID() const
+int64_t NNetwork::getID() const
 {
 	return id;
 }
 
-std::string glades::NNetwork::getName() const
+std::string NNetwork::getName() const
 {
 	if (!skeleton)
 		return "";
@@ -724,7 +639,7 @@ std::string glades::NNetwork::getName() const
 	return skeleton->getName();
 }
 
-NNInfo* glades::NNetwork::getNNInfo()
+NNInfo* NNetwork::getNNInfo()
 {
 	if (!skeleton)
 		return NULL;
@@ -732,12 +647,12 @@ NNInfo* glades::NNetwork::getNNInfo()
 	return skeleton;
 }
 
-float glades::NNetwork::getAccuracy() const
+float NNetwork::getAccuracy() const
 {
 	return overallTotalAccuracy;
 }
 
-bool glades::NNetwork::load(const std::string& netName)
+bool NNetwork::load(const std::string& netName)
 {
 	if (!meat)
 		return false;
@@ -753,7 +668,7 @@ bool glades::NNetwork::load(const std::string& netName)
 	return meat->load(netName);*/
 }
 
-bool glades::NNetwork::save() const
+bool NNetwork::save() const
 {
 	if (!meat)
 		return false;
@@ -766,13 +681,13 @@ bool glades::NNetwork::save() const
 	/// return meat->save(skeleton->getName());
 }
 
-void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
+void NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
 {
 	serverInstance = newServer;
 	cConnection = newConnection;
 }
 
-shmea::GList glades::NNetwork::getLearningCurve() const
+shmea::GList NNetwork::getLearningCurve() const
 {
 	return learningCurve;
 }
@@ -782,12 +697,12 @@ shmea::GList glades::NNetwork::getLearningCurve() const
 // 	return rocCurve;
 // }
 
-shmea::GList glades::NNetwork::getResults() const
+shmea::GList NNetwork::getResults() const
 {
 	return results;
 }
 
-void glades::NNetwork::clean()
+void NNetwork::clean()
 {
 	id = -1;
 	skeleton = NULL;
@@ -807,7 +722,7 @@ void glades::NNetwork::clean()
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 }
 
-void glades::NNetwork::resetGraphs()
+void NNetwork::resetGraphs()
 {
 	learningCurve.clear();
 

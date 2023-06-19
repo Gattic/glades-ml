@@ -46,7 +46,6 @@ class Layer;
 class Terminator;
 
 void init();
-RNN* getRNN(const std::string&);
 bool saveNeuralNetwork(NNetwork*);
 
 // Machine Learning Functions
