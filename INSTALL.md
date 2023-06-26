@@ -10,6 +10,8 @@
 
 `g++`
 
+`libpng-dev`
+
 ---
 
 ## Compilation
