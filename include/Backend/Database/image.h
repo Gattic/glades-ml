@@ -159,6 +159,8 @@ public:
 	bool SavePBM(const GString&) const;
 	void LoadBMP(const GString&);
 
+	void LoadPNG(const GString&);
+
 };
 };
 
