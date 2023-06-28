@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include "GDeleter.h"
 #include "GPointer.h"
 
 namespace shmea {
@@ -43,7 +44,7 @@ public:
 		FUNCTION_TYPE = 8,
 	};
 protected:
-	GPointer<char> block;
+	GPointer<char, array_deleter<char> > block;
 	unsigned int blockSize;
 	Type type;
 public:

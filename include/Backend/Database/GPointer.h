@@ -17,6 +17,7 @@
 #ifndef _GPOINTER
 #define _GPOINTER
 
+#include "GDeleter.h"
 #include <ctime>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +26,7 @@
 
 namespace shmea {
 
-template <typename T>
+template <typename T, void(*Deleter)(T*) = default_deleter<T> >
 class GPointer
 {
 protected:
@@ -46,7 +47,7 @@ public:
 		increment();
 	}
 
-	GPointer(const GPointer<T>& g2)
+	GPointer(const GPointer<T, Deleter>& g2)
 	{
 		data = NULL;
 		refCount = NULL;
@@ -68,7 +69,7 @@ public:
 		if(decrement() == 0)
 		{
 			if(data)
-				delete data;
+				Deleter(data);
 			data=NULL;
 			if(refCount)
 				delete refCount;
@@ -137,7 +138,7 @@ public:
 		return (data!=NULL);
 	}
 
-	GPointer<T>& copy(const GPointer<T>& g2)
+	GPointer<T, Deleter>& copy(const GPointer<T, Deleter>& g2)
 	{
 		if(this != &g2)
 		{
@@ -155,7 +156,7 @@ public:
 		return *this;
 	}
 
-	GPointer<T>& operator=(const GPointer<T>& g2)
+	GPointer<T, Deleter>& operator=(const GPointer<T, Deleter>& g2)
 	{
 		return copy(g2);
 	}
