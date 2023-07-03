@@ -163,6 +163,7 @@ public:
 	void LoadPNG(const GString&);
 
 	shmea::GList flatten() const;
+	bool unflatten(const shmea::GList&);
 
 };
 };
