@@ -108,6 +108,10 @@ private:
 	void BackPropagation(unsigned int, int, int, unsigned int, unsigned int);
 
 public:
+	static const int TYPE_CSV = 0;
+	static const int TYPE_IMAGE = 1;
+	static const int TYPE_TEXT = 2;
+
 	static const int TYPE_DFF = 0;
 	static const int TYPE_RNN = 1;
 

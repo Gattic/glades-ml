@@ -165,6 +165,10 @@ public:
 	shmea::GList flatten() const;
 	bool unflatten(const shmea::GList&);
 
+	shmea::GString hash() const;
+	bool operator<(const Image&) const;
+	bool operator>(const Image&) const;
+
 };
 };
 

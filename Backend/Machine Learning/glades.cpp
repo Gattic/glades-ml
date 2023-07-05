@@ -26,6 +26,7 @@
 #include "Structure/nninfo.h"
 #include "metanetwork.h"
 #include "network.h"
+#include "ImageInput.h"
 
 using namespace glades;
 

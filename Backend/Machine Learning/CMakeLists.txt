@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 set(ML_src_files
 	glades.cpp
 	glades.h
+	ImageInput.cpp
 	metanetwork.cpp
 	metanetwork.h
 	network.cpp
