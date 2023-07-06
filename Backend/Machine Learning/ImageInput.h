@@ -28,7 +28,7 @@ namespace glades {
 
 class ImageInput
 {
-private:
+public:
 
 	// Path, Label
 	shmea::GTable trainingData;
@@ -38,14 +38,28 @@ private:
 	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > trainImages;
 	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > testImages;
 
-public:
+	shmea::GString name;
+	bool loaded;
 
 	ImageInput()
 	{
 		//
+		loaded = false;
+	}
+
+	~ImageInput()
+	{
+	    name = "";
+	    loaded = false;
+	    trainingData.clear();
+	    testingData.clear();
+	    trainImages.clear();
+	    testImages.clear();
 	}
 
 	void import(shmea::GString);
+	const shmea::GPointer<shmea::Image> getTrainingImage(unsigned int) const;
+	const shmea::GPointer<shmea::Image> getTestingImage(unsigned int) const;
 };
 };
 

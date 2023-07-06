@@ -23,6 +23,11 @@ using namespace glades;
 
 void ImageInput::import(shmea::GString fname)
 {
+    if(loaded)
+	return;
+
+    name = fname;
+
     //
     shmea::GString basePath = "datasets/images/" + fname + "/";
 
@@ -60,7 +65,7 @@ void ImageInput::import(shmea::GString fname)
 	if(trainImages[label].find(path) == trainImages[label].end())
 	{
 	    trainImages[label].insert(std::pair<shmea::GString, shmea::GPointer<shmea::Image> >(path, img));
-	    printf("trainImages[%s].size() = %lu\n", label.c_str(), trainImages[label].size());
+	    //printf("trainImages[%s].size() = %lu\n", label.c_str(), trainImages[label].size());
 	}
     }
 
@@ -85,7 +90,55 @@ void ImageInput::import(shmea::GString fname)
 	if(testImages[label].find(path) == testImages[label].end())
 	{
 	    testImages[label].insert(std::pair<shmea::GString, shmea::GPointer<shmea::Image> >(path, img));
-	    printf("testImages[%s].size() = %lu\n", label.c_str(), trainImages[label].size());
+	    //printf("testImages[%s].size() = %lu\n", label.c_str(), trainImages[label].size());
 	}
     }
+
+    // Set the loaded flag
+    loaded = true;
 }
+
+const shmea::GPointer<shmea::Image> ImageInput::getTrainingImage(unsigned int row) const
+{
+    if(row >= trainingData.numberOfRows())
+	return shmea::GPointer<shmea::Image>(new shmea::Image());
+
+    shmea::GString label = shmea::GString::intTOstring(trainingData.getCell(row, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + trainingData.getCell(row, 0).c_str();
+
+    // Check if the label exists
+    if(trainImages.find(label) == trainImages.end())
+	return shmea::GPointer<shmea::Image>(new shmea::Image());
+
+    // Check if the image exists
+    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
+	= trainImages.at(label).find(fname);
+    if(itr == trainImages.at(label).end())
+	return shmea::GPointer<shmea::Image>(new shmea::Image());
+
+    // Return the image
+    return itr->second;
+}
+
+const shmea::GPointer<shmea::Image> ImageInput::getTestingImage(unsigned int row) const
+{
+    if(row >= testingData.numberOfRows())
+	return shmea::GPointer<shmea::Image>(new shmea::Image());
+
+    shmea::GString label = shmea::GString::intTOstring(testingData.getCell(row, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + testingData.getCell(row, 0).c_str();
+
+    // Check if the label exists
+    if(testImages.find(label) == testImages.end())
+	return shmea::GPointer<shmea::Image>(new shmea::Image());
+
+    // Check if the image exists
+    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
+	= testImages.at(label).find(fname);
+    if(itr == testImages.at(label).end())
+	return shmea::GPointer<shmea::Image>(new shmea::Image());
+
+    // Return the image
+    return itr->second;
+}
+
