@@ -35,20 +35,21 @@ void ImageInput::import(shmea::GString fname)
     shmea::GString testFName = basePath + "test.csv";
     int importType = shmea::GTable::TYPE_FILE;
 
-    trainingData = shmea::GTable(trainFName, ',', importType);
-    testingData = shmea::GTable(testFName, ',', importType);
+    trainingLegend = shmea::GTable(trainFName, ',', importType);
+    testingLegend = shmea::GTable(testFName, ',', importType);
 
-    if ((trainingData.numberOfRows() == 0) || (testingData.numberOfRows() == 0))
+    if ((trainingLegend.numberOfRows() == 0) || (testingLegend.numberOfRows() == 0))
     {
 	printf("[NNDATA] Could not load data\n");
 	return;
     }
 
     // Load training images
-    for(unsigned int i = 0; i < trainingData.numberOfRows(); ++i)
+    printf("Rows: %d\n", trainingLegend.numberOfRows());
+    for(unsigned int i = 0; i < trainingLegend.numberOfRows(); ++i)
     {
-	shmea::GString label = shmea::GString::intTOstring(trainingData.getCell(i, 1).getInt());
-	shmea::GString path = basePath + trainingData.getCell(i, 0).c_str();
+	shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(i, 1).getInt());
+	shmea::GString path = basePath + trainingLegend.getCell(i, 0).c_str();
 	printf("[NNDATA] Loading %s\n", path.c_str());
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
@@ -65,15 +66,16 @@ void ImageInput::import(shmea::GString fname)
 	if(trainImages[label].find(path) == trainImages[label].end())
 	{
 	    trainImages[label].insert(std::pair<shmea::GString, shmea::GPointer<shmea::Image> >(path, img));
+	    trainingData.addRow(img->flatten());
 	    //printf("trainImages[%s].size() = %lu\n", label.c_str(), trainImages[label].size());
 	}
     }
 
     // Load testing data
-    for(unsigned int i = 0; i < testingData.numberOfRows(); ++i)
+    for(unsigned int i = 0; i < testingLegend.numberOfRows(); ++i)
     {
-	shmea::GString label = shmea::GString::intTOstring(testingData.getCell(i, 1).getInt());
-	shmea::GString path = basePath + testingData.getCell(i, 0).c_str();
+	shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(i, 1).getInt());
+	shmea::GString path = basePath + testingLegend.getCell(i, 0).c_str();
 	printf("[NNDATA] Loading %s\n", path.c_str());
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
@@ -90,7 +92,8 @@ void ImageInput::import(shmea::GString fname)
 	if(testImages[label].find(path) == testImages[label].end())
 	{
 	    testImages[label].insert(std::pair<shmea::GString, shmea::GPointer<shmea::Image> >(path, img));
-	    //printf("testImages[%s].size() = %lu\n", label.c_str(), trainImages[label].size());
+	    testingData.addRow(img->flatten());
+	    //printf("testImages[%s].size() = %lu\n", label.c_str(), testImages[label].size());
 	}
     }
 
@@ -100,11 +103,11 @@ void ImageInput::import(shmea::GString fname)
 
 const shmea::GPointer<shmea::Image> ImageInput::getTrainingImage(unsigned int row) const
 {
-    if(row >= trainingData.numberOfRows())
+    if(row >= trainingLegend.numberOfRows())
 	return shmea::GPointer<shmea::Image>(new shmea::Image());
 
-    shmea::GString label = shmea::GString::intTOstring(trainingData.getCell(row, 1).getInt());
-    shmea::GString fname = "datasets/images/" + name + "/" + trainingData.getCell(row, 0).c_str();
+    shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(row, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(row, 0).c_str();
 
     // Check if the label exists
     if(trainImages.find(label) == trainImages.end())
@@ -122,11 +125,11 @@ const shmea::GPointer<shmea::Image> ImageInput::getTrainingImage(unsigned int ro
 
 const shmea::GPointer<shmea::Image> ImageInput::getTestingImage(unsigned int row) const
 {
-    if(row >= testingData.numberOfRows())
+    if(row >= testingLegend.numberOfRows())
 	return shmea::GPointer<shmea::Image>(new shmea::Image());
 
-    shmea::GString label = shmea::GString::intTOstring(testingData.getCell(row, 1).getInt());
-    shmea::GString fname = "datasets/images/" + name + "/" + testingData.getCell(row, 0).c_str();
+    shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(row, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(row, 0).c_str();
 
     // Check if the label exists
     if(testImages.find(label) == testImages.end())
@@ -142,12 +145,12 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestingImage(unsigned int row
     return itr->second;
 }
 
-shmea::GTable ImageInput::getTrainingTable() const
+const shmea::GTable& ImageInput::getTrainingTable() const
 {
-    //
+    return trainingData;
 }
 
-shmea::GTable ImageInput::getTestingTable() const
+const shmea::GTable& ImageInput::getTestingTable() const
 {
-    //
+    return testingData;
 }

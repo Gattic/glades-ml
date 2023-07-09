@@ -25,8 +25,8 @@ class DataInput
 {
 public:
 
-	virtual shmea::GTable getTrainingTable() const = 0;
-	virtual shmea::GTable getTestingTable() const = 0;
+	virtual const shmea::GTable& getTrainingTable() const = 0;
+	virtual const shmea::GTable& getTestingTable() const = 0;
 };
 };
 

@@ -31,9 +31,12 @@ class ImageInput : public DataInput
 {
 public:
 
-	// Path, Label
 	shmea::GTable trainingData;
 	shmea::GTable testingData;
+
+	// Path, Label
+	shmea::GTable trainingLegend;
+	shmea::GTable testingLegend;
 
 	// <Label, <Path, Image> >
 	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > trainImages;
@@ -45,7 +48,14 @@ public:
 	ImageInput()
 	{
 		//
-		loaded = false;
+	    name = "";
+	    loaded = false;
+	    trainingData.clear();
+	    testingData.clear();
+	    trainingLegend.clear();
+	    testingLegend.clear();
+	    trainImages.clear();
+	    testImages.clear();
 	}
 
 	virtual ~ImageInput()
@@ -54,6 +64,8 @@ public:
 	    loaded = false;
 	    trainingData.clear();
 	    testingData.clear();
+	    trainingLegend.clear();
+	    testingLegend.clear();
 	    trainImages.clear();
 	    testImages.clear();
 	}
@@ -62,8 +74,8 @@ public:
 	const shmea::GPointer<shmea::Image> getTrainingImage(unsigned int) const;
 	const shmea::GPointer<shmea::Image> getTestingImage(unsigned int) const;
 
-	virtual shmea::GTable getTrainingTable() const;
-	virtual shmea::GTable getTestingTable() const;
+	virtual const shmea::GTable& getTrainingTable() const;
+	virtual const shmea::GTable& getTestingTable() const;
 };
 };
 
