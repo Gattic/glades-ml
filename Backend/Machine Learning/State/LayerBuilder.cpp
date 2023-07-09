@@ -19,7 +19,7 @@
 #include "../GMath/OHE.h"
 #include "../GMath/gmath.h"
 #include "../Structure/nninfo.h"
-#include "../network.h"
+#include "../Networks/network.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"

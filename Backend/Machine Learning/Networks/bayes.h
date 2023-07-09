@@ -18,7 +18,7 @@
 #define _GNAIVEBAYES
 
 #include "Backend/Database/GTable.h"
-#include "GMath/OHE.h"
+#include "../GMath/OHE.h"
 #include <stdio.h>
 #include <vector>
 #include <map>

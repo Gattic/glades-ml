@@ -142,3 +142,12 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestingImage(unsigned int row
     return itr->second;
 }
 
+shmea::GTable ImageInput::getTrainingTable() const
+{
+    //
+}
+
+shmea::GTable ImageInput::getTestingTable() const
+{
+    //
+}

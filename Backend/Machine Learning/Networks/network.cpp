@@ -15,22 +15,21 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "network.h"
-#include "../../main.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
 #include "Backend/Database/ServiceData.h"
 #include "Backend/Networking/main.h"
-#include "GMath/OHE.h"
-#include "GMath/cmatrix.h"
-#include "GMath/gmath.h"
-#include "State/LayerBuilder.h"
-#include "State/NetworkState.h"
-#include "State/Terminator.h"
-#include "State/edge.h"
-#include "State/layer.h"
-#include "State/node.h"
-#include "Structure/nninfo.h"
+#include "../GMath/OHE.h"
+#include "../GMath/cmatrix.h"
+#include "../GMath/gmath.h"
+#include "../State/LayerBuilder.h"
+#include "../State/NetworkState.h"
+#include "../State/Terminator.h"
+#include "../State/edge.h"
+#include "../State/layer.h"
+#include "../State/node.h"
+#include "../Structure/nninfo.h"
 
 using namespace glades;
 

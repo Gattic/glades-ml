@@ -15,18 +15,17 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "glades.h"
-#include "../../main.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
 #include "Backend/Networking/main.h"
 #include "GMath/gmath.h"
-#include "RNN.h"
+#include "Networks/RNN.h"
 #include "State/layer.h"
 #include "State/node.h"
 #include "Structure/nninfo.h"
-#include "metanetwork.h"
-#include "network.h"
-#include "ImageInput.h"
+#include "Networks/metanetwork.h"
+#include "Networks/network.h"
+#include "DataObjects/ImageInput.h"
 
 using namespace glades;
 

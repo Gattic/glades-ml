@@ -14,53 +14,6 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GIMAGEINPUT
-#define _GIMAGEINPUT
+#include "DataInput.h"
 
-#include "Backend/Database/GString.h"
-#include "Backend/Database/GTable.h"
-#include "Backend/Database/image.h"
-#include <stdio.h>
-#include <vector>
-#include <map>
-
-namespace glades {
-
-class ImageInput
-{
-public:
-
-	// Path, Label
-	shmea::GTable trainingData;
-	shmea::GTable testingData;
-
-	// <Label, <Path, Image> >
-	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > trainImages;
-	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > testImages;
-
-	shmea::GString name;
-	bool loaded;
-
-	ImageInput()
-	{
-		//
-		loaded = false;
-	}
-
-	~ImageInput()
-	{
-	    name = "";
-	    loaded = false;
-	    trainingData.clear();
-	    testingData.clear();
-	    trainImages.clear();
-	    testImages.clear();
-	}
-
-	void import(shmea::GString);
-	const shmea::GPointer<shmea::Image> getTrainingImage(unsigned int) const;
-	const shmea::GPointer<shmea::Image> getTestingImage(unsigned int) const;
-};
-};
-
-#endif
+using namespace glades;

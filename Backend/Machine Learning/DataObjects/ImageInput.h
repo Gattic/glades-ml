@@ -14,56 +14,56 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GMETANETWORK
-#define _GMETANETWORK
+#ifndef _GIMAGEINPUT
+#define _GIMAGEINPUT
 
-#include "State/Terminator.h"
+#include "DataInput.h"
+#include "Backend/Database/GString.h"
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/image.h"
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <string>
 #include <vector>
+#include <map>
 
 namespace glades {
 
-class NNInfo;
-class NNetwork;
-
-class MetaNetwork
+class ImageInput : public DataInput
 {
-private:
-	const static int ONE_TO_ONE = 0;
-	const static int ONE_TO_MANY = 1;
-
-	std::string name;
-	int collectionType;
-	std::vector<NNetwork*> subnets;
-
 public:
-	MetaNetwork(std::string);
-	MetaNetwork(NNInfo*, int = 1);
-	MetaNetwork(std::string metaNetName, std::string nname, int = 1);
-	virtual ~MetaNetwork();
 
-	// manipulations/functions
-	void clearSubnets();
+	// Path, Label
+	shmea::GTable trainingData;
+	shmea::GTable testingData;
 
-	// sets
-	void setName(std::string);
-	void addSubnet(NNInfo*);
-	void addSubnet(NNetwork*);
-	void addSubnet(const std::string nNetName);
+	// <Label, <Path, Image> >
+	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > trainImages;
+	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > testImages;
 
-	// gets
-	std::string getName() const;
-	int size() const;
-	std::vector<NNetwork*> getSubnets() const;
-	NNetwork* getSubnet(unsigned int);
-	std::string getSubnetName(unsigned int) const;
-	NNetwork* getSubnetByName(std::string) const;
+	shmea::GString name;
+	bool loaded;
 
-	// verification functions
-	void crossValidate(std::string fNames, Terminator* Arnold);
+	ImageInput()
+	{
+		//
+		loaded = false;
+	}
+
+	virtual ~ImageInput()
+	{
+	    name = "";
+	    loaded = false;
+	    trainingData.clear();
+	    testingData.clear();
+	    trainImages.clear();
+	    testImages.clear();
+	}
+
+	void import(shmea::GString);
+	const shmea::GPointer<shmea::Image> getTrainingImage(unsigned int) const;
+	const shmea::GPointer<shmea::Image> getTestingImage(unsigned int) const;
+
+	virtual shmea::GTable getTrainingTable() const;
+	virtual shmea::GTable getTestingTable() const;
 };
 };
 
