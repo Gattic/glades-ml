@@ -34,21 +34,7 @@ void NumberInput::import(shmea::GString fname)
     // Load and Normalize/Standardize the data
     standardizeInputTable(fname);
 
-    // Seperate the TRAIN table into an input table and an expected table
-    int removedCounter = 0;
-    for (unsigned int i = 0; i < trainTable.numberOfCols(); ++i)
-    {
-	    // Remove output columns from the input table
-	    if (trainTable.isOutput(i))
-	    {
-		    trainTable.removeCol(i - removedCounter);
-		    trainExpectedTable.addCol(trainTable.getHeader(i), trainTable.getCol(i));
-		    ++removedCounter;
-	    }
-    }
-
-    // Seperate the TEST table into an input table and an expected table
-    // TODO
+    // TODO: test table stuff
 
     // Set the loaded flag
     loaded = true;
@@ -154,10 +140,13 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 				newHeader += shmea::GString::intTOstring(cInt);
 
 				// add the standardized newCol to the trainTable
-				trainTable.addCol(newHeader, newCol);
-
 				if (rawTable.isOutput(c))
-					trainTable.toggleOutput(trainTable.numberOfCols() - 1);
+				{
+				    trainExpectedTable.addCol(newHeader, newCol);
+				    trainExpectedTable.toggleOutput(trainExpectedTable.numberOfCols() - 1);
+				}
+				else
+				    trainTable.addCol(newHeader, newCol);
 			}
 		}
 		else
@@ -205,7 +194,6 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 					if (found) // CLASSIFICATION
 					{
 						// [0.01, 0.99] bounds
-						printf("found: %d\n", c);
 						cell = ((((cell - fMin) / (xRange)) * 0.98f) + 0.01f);
 					}
 					else // REGRESSION
@@ -229,10 +217,13 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 				}
 
 				// add the standardized newCol to the trainTable
-				trainTable.addCol(rawTable.getHeader(c), newCol);
-
 				if (rawTable.isOutput(c))
-					trainTable.toggleOutput(trainTable.numberOfCols() - 1);
+				{
+					trainExpectedTable.addCol(rawTable.getHeader(c), newCol);
+					trainExpectedTable.toggleOutput(trainTable.numberOfCols() - 1);
+				}
+				else
+				    trainTable.addCol(rawTable.getHeader(c), newCol);
 			}
 			else if (standardizeFlag == GMath::ZSCORE)
 			{
@@ -280,10 +271,13 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 				}
 
 				// add the standardized newCol to the trainTable
-				trainTable.addCol(rawTable.getHeader(c), newCol);
-
 				if (rawTable.isOutput(c))
-					trainTable.toggleOutput(trainTable.numberOfCols() - 1);
+				{
+					trainExpectedTable.addCol(rawTable.getHeader(c), newCol);
+					trainExpectedTable.toggleOutput(trainTable.numberOfCols() - 1);
+				}
+				else
+				    trainTable.addCol(rawTable.getHeader(c), newCol);
 			}
 		}
 	}

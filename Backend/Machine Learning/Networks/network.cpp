@@ -104,15 +104,12 @@ void glades::NNetwork::stop()
 
 void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, int runType)
 {
-	printf("HERE1\n");
 	if (!skeleton)
 		return;
 
-	printf("HERE1.1\n");
 	if(!newDataInput)
 		return;
 
-	printf("HERE2\n");
 	di = newDataInput;
 	if ((di->getTrainSize() <= 0) || (di->getFeatureCount() <= 0))
 		return;
@@ -124,7 +121,6 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	// inputTable.print();
 	// expected.print();
 
-	printf("HERE3\n");
 	// Set the mini batch size
 	minibatchSize = skeleton->getBatchSize();
 	// Valid layers?
@@ -134,7 +130,6 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	if ((di->getTrainSize() <= 0) || (di->getFeatureCount() <= 0))
 		return;
 
-	printf("HERE4\n");
 	// Build empty confusion matrix
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 		(skeleton->getOutputType() == GMath::KL))
@@ -756,11 +751,9 @@ bool glades::NNetwork::load(const shmea::GString& netName)
 		skeleton = new NNInfo(netName);
 
 	// Load the nn state information
-	printf("HERE0\n");
 	if (!skeleton->load(netName))
 		return false;
 
-	printf("HERE0.1\n");
 	//return meat->load(netName);
 	return true;
 }
