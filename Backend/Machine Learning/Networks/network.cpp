@@ -30,6 +30,8 @@
 #include "../State/layer.h"
 #include "../State/node.h"
 #include "../Structure/nninfo.h"
+#include "../DataObjects/NumberInput.h"
+#include "../DataObjects/ImageInput.h"
 
 using namespace glades;
 
@@ -42,6 +44,7 @@ using namespace glades;
 glades::NNetwork::NNetwork()
 {
 	running = false;
+	di = NULL;
 	skeleton = NULL;
 	meat = NULL;
 	confusionMatrix = NULL;
@@ -64,6 +67,7 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo)
 		return;
 
 	running = false;
+	di = NULL;
 	skeleton = NULL;
 	meat = NULL;
 	confusionMatrix = NULL;
@@ -98,32 +102,39 @@ void glades::NNetwork::stop()
 	running = false;
 }
 
-void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator* Arnold,
-						   int runType)
+void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, int runType)
 {
+	printf("HERE1\n");
 	if (!skeleton)
 		return;
 
-	if ((newInputTable.numberOfRows() <= 0) || (newInputTable.numberOfCols() <= 0))
+	printf("HERE1.1\n");
+	if(!newDataInput)
+		return;
+
+	printf("HERE2\n");
+	di = newDataInput;
+	if ((di->getTrainSize() <= 0) || (di->getFeatureCount() <= 0))
 		return;
 
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
-		meat->build(skeleton, newInputTable, netType);
-	minibatchSize = skeleton->getBatchSize(); // Set the mini batch size
-	const shmea::GTable inputTable = meat->getInput();
-	const shmea::GTable expected = meat->getExpected();
+		meat->build(skeleton, di, netType);
 
 	// inputTable.print();
 	// expected.print();
 
+	printf("HERE3\n");
+	// Set the mini batch size
+	minibatchSize = skeleton->getBatchSize();
 	// Valid layers?
 	if ((meat->getInputLayersSize() <= 0) || (meat->getLayersSize() <= 0))
 		return;
 
-	if ((expected.numberOfRows() <= 0) || (expected.numberOfCols() <= 0))
+	if ((di->getTrainSize() <= 0) || (di->getFeatureCount() <= 0))
 		return;
 
+	printf("HERE4\n");
 	// Build empty confusion matrix
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 		(skeleton->getOutputType() == GMath::KL))
@@ -169,7 +180,7 @@ void glades::NNetwork::run(const shmea::GTable& newInputTable, const Terminator*
 
 		// Recursive FwdPass/BackProp
 		for (unsigned int r = 0; r < meat->getInputLayersSize(); ++r)
-			SGDHelper(r, inputTable.numberOfRows(), runType);
+			SGDHelper(r, di->getTrainSize(), runType);
 
 		// Update the network vars
 		++epochs;
@@ -533,7 +544,7 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 			// Get the prediction and expected vars
 			float prediction = netState->cOutputNode->getWeight();
 			shmea::GType expectedCell =
-				meat->getExpected().getCell(inputRowCounter, cOutputNodeCounter);
+				di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
 			float expectation = expectedCell;
 
 			// Add the expected and predicted to the result row
@@ -616,7 +627,7 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		float prediction = netState->cOutputNode->getWeight();
 		float expectation = 0.0f;
 		shmea::GType expectedCell =
-			meat->getExpected().getCell(inputRowCounter, cOutputNodeCounter);
+			di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
 		expectation = expectedCell.getFloat();
 
 		int costFx = skeleton->getOutputType();
@@ -715,7 +726,7 @@ int64_t glades::NNetwork::getID() const
 	return id;
 }
 
-std::string glades::NNetwork::getName() const
+shmea::GString glades::NNetwork::getName() const
 {
 	if (!skeleton)
 		return "";
@@ -736,7 +747,7 @@ float glades::NNetwork::getAccuracy() const
 	return overallTotalAccuracy;
 }
 
-bool glades::NNetwork::load(const std::string& netName)
+bool glades::NNetwork::load(const shmea::GString& netName)
 {
 	if (!meat)
 		return false;
@@ -744,12 +755,14 @@ bool glades::NNetwork::load(const std::string& netName)
 	if (!skeleton)
 		skeleton = new NNInfo(netName);
 
-	return skeleton->load(netName);
-
-	/*if (!skeleton->load(netName))
+	// Load the nn state information
+	printf("HERE0\n");
+	if (!skeleton->load(netName))
 		return false;
 
-	return meat->load(netName);*/
+	printf("HERE0.1\n");
+	//return meat->load(netName);
+	return true;
 }
 
 bool glades::NNetwork::save() const

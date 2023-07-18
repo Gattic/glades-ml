@@ -14,8 +14,8 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GIMAGEINPUT
-#define _GIMAGEINPUT
+#ifndef _GNUMBERINPUT
+#define _GNUMBERINPUT
 
 #include "DataInput.h"
 #include "Backend/Database/GString.h"
@@ -27,46 +27,47 @@
 
 namespace glades {
 
-class ImageInput : public DataInput
+class NumberInput : public DataInput
 {
 public:
 
 	// Path, Label
-	shmea::GTable trainingLegend;
-	shmea::GTable testingLegend;
-
-	// <Label, <Path, Image> >
-	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > trainImages;
-	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > testImages;
+	shmea::GTable trainTable;
+	shmea::GTable trainExpectedTable;
+	shmea::GTable testTable;
+	shmea::GTable testExpectedTable;
 
 	shmea::GList emptyRow;
 	shmea::GString name;
 	bool loaded;
 
-	ImageInput()
+	NumberInput()
 	{
 		//
 	    name = "";
 	    loaded = false;
-	    trainingLegend.clear();
-	    testingLegend.clear();
-	    trainImages.clear();
-	    testImages.clear();
+	    OHEMaps.clear();
+	    featureIsCategorical.clear();
+	    trainTable.clear();
+	    trainExpectedTable.clear();
+	    testTable.clear();
+	    testExpectedTable.clear();
 	}
 
-	virtual ~ImageInput()
+	virtual ~NumberInput()
 	{
 	    name = "";
 	    loaded = false;
-	    trainingLegend.clear();
-	    testingLegend.clear();
-	    trainImages.clear();
-	    testImages.clear();
+	    OHEMaps.clear();
+	    featureIsCategorical.clear();
+	    trainTable.clear();
+	    trainExpectedTable.clear();
+	    testTable.clear();
+	    testExpectedTable.clear();
 	}
 
 	virtual void import(shmea::GString);
-	const shmea::GPointer<shmea::Image> getTrainImage(unsigned int) const;
-	const shmea::GPointer<shmea::Image> getTestImage(unsigned int) const;
+	void standardizeInputTable(const shmea::GString&, int = 0);
 
 	virtual shmea::GList getTrainRow(unsigned int) const;
 	virtual shmea::GList getTrainExpectedRow(unsigned int) const;

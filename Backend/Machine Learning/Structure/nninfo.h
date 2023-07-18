@@ -22,6 +22,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "Backend/Database/GString.h"
 
 namespace shmea {
 class GTable;
@@ -42,7 +43,8 @@ private:
 	friend NNetwork;
 	friend RNN;
 
-	std::string name;
+	shmea::GString name;
+	int inputType; // DataInput enum: 0 = csv, 1 = image, 2 = text
 	InputLayerInfo* inputLayer;
 	OutputLayerInfo* outputLayer;
 	std::vector<HiddenLayerInfo*> layers;
@@ -51,10 +53,10 @@ private:
 
 	//
 	shmea::GTable toGTable() const;
-	bool fromGTable(const std::string&, const shmea::GTable&);
+	bool fromGTable(const shmea::GString&, const shmea::GTable&);
 
 	// Database
-	bool load(const std::string&);
+	bool load(const shmea::GString&);
 	void save() const;
 
 public:
@@ -75,14 +77,15 @@ public:
 	static const int COL_ACTIVATION_PARAM = 8;
 	static const int COL_OUTPUT_TYPE = 9;
 
-	NNInfo(const std::string&);
-	NNInfo(const std::string&, const shmea::GTable&);
-	NNInfo(const std::string&, InputLayerInfo*, const std::vector<HiddenLayerInfo*>&,
+	NNInfo(const shmea::GString&);
+	NNInfo(const shmea::GString&, const shmea::GTable&);
+	NNInfo(const shmea::GString&, InputLayerInfo*, const std::vector<HiddenLayerInfo*>&,
 		   OutputLayerInfo*);
 	~NNInfo();
 
 	// gets
-	std::string getName() const;
+	shmea::GString getName() const;
+	int getInputType() const;
 	int getOutputType() const;
 	float getPInput() const;
 	int getBatchSize() const;
@@ -100,7 +103,8 @@ public:
 	void print() const;
 
 	// sets
-	void setName(std::string);
+	void setName(shmea::GString);
+	void setInputType(int);
 	void setOutputType(int);
 	void setOutputSize(int);
 	void setPInput(float);

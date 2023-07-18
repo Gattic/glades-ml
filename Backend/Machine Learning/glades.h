@@ -28,10 +28,6 @@
 #include <sys/stat.h>
 #include <vector>
 
-namespace shmea {
-class GTable;
-};
-
 namespace GNet {
 class GServer;
 class Connection;
@@ -44,18 +40,19 @@ class NNetwork;
 class RNN;
 class Layer;
 class Terminator;
+class DataInput;
 
 void init();
 RNN* getRNN(const std::string&);
 bool saveNeuralNetwork(NNetwork*);
 
 // Machine Learning Functions
-MetaNetwork* train(NNInfo*, const shmea::GTable&, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* train(NNetwork*, const shmea::GTable&, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* train(MetaNetwork*, const shmea::GTable&, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* test(NNInfo*, const shmea::GTable&, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* test(NNetwork*, const shmea::GTable&, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* test(MetaNetwork*, const shmea::GTable&, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* train(NNInfo*, DataInput*, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* train(NNetwork*, DataInput*, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* train(MetaNetwork*, DataInput*, Terminator*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* test(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* test(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* test(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* crossValidate(NNInfo*, std::string, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* crossValidate(std::string, std::vector<std::string>, float, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
 

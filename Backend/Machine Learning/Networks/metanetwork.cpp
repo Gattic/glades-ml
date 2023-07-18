@@ -27,7 +27,7 @@ using namespace glades;
  * @param newName the lookup name of the metanetwork
  * @details user probably wants to manually call addSubnet
  */
-glades::MetaNetwork::MetaNetwork(std::string newName)
+glades::MetaNetwork::MetaNetwork(shmea::GString newName)
 {
 	name = newName;
 	collectionType = ONE_TO_ONE;
@@ -55,7 +55,7 @@ glades::MetaNetwork::MetaNetwork(NNInfo* networkInfo, int subnetCount)
 		addSubnet(networkInfo);
 }
 
-glades::MetaNetwork::MetaNetwork(std::string metaNetName, std::string nname, int k)
+glades::MetaNetwork::MetaNetwork(shmea::GString metaNetName, shmea::GString nname, int k)
 {
 	name = metaNetName;
 	if (k > 1)
@@ -83,7 +83,7 @@ glades::MetaNetwork::~MetaNetwork()
  * @details sets the name of a MetaNetwork
  * @param newName the new name for this MetaNetwork
  */
-void glades::MetaNetwork::setName(std::string newName)
+void glades::MetaNetwork::setName(shmea::GString newName)
 {
 	name = newName;
 }
@@ -103,7 +103,7 @@ void glades::MetaNetwork::addSubnet(NNInfo* networkInfo)
 	subnets.push_back(cNetwork);
 }
 
-void glades::MetaNetwork::addSubnet(const std::string nNetName)
+void glades::MetaNetwork::addSubnet(const shmea::GString nNetName)
 {
 	if (nNetName.length() <= 0)
 		return;
@@ -142,7 +142,7 @@ void glades::MetaNetwork::clearSubnets()
  * @details retrieves a MetaNetwork's name
  * @return the MetaNetwork's name
  */
-std::string glades::MetaNetwork::getName() const
+shmea::GString glades::MetaNetwork::getName() const
 {
 	return name;
 }
@@ -187,7 +187,7 @@ glades::NNetwork* glades::MetaNetwork::getSubnet(unsigned int index)
  * @param index the index of the desired subnet in the MetaNetwork
  * @return the name of the subnet at the requested index, or empty string if the index is invalid
  */
-std::string glades::MetaNetwork::getSubnetName(unsigned int index) const
+shmea::GString glades::MetaNetwork::getSubnetName(unsigned int index) const
 {
 	if (index >= subnets.size())
 		return "";
@@ -202,7 +202,7 @@ std::string glades::MetaNetwork::getSubnetName(unsigned int index) const
  * @return the subnet with the requested name, or NULL if a subnet of the requested name is not
  * present
  */
-glades::NNetwork* glades::MetaNetwork::getSubnetByName(std::string newName) const
+glades::NNetwork* glades::MetaNetwork::getSubnetByName(shmea::GString newName) const
 {
 	for (unsigned int i = 0; i < subnets.size(); ++i)
 	{
@@ -214,7 +214,7 @@ glades::NNetwork* glades::MetaNetwork::getSubnetByName(std::string newName) cons
 	return NULL;
 }
 
-void glades::MetaNetwork::crossValidate(std::string fNames, Terminator* Arnold)
+void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDataInput, Terminator* Arnold)
 {
 	// populate the input data
 	shmea::GTable cinputFile(fNames.c_str(), ',', shmea::GTable::TYPE_FILE);
@@ -237,13 +237,13 @@ void glades::MetaNetwork::crossValidate(std::string fNames, Terminator* Arnold)
 		}
 
 		//
-		subnets[i]->run(trainInputFile, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
 
 		shmea::GTable testInputFile = *stratifiedInputFiles[i];
 		if (testInputFile.numberOfCols() > 0)
 		{
 			// Test our validation set
-			subnets[i]->run(testInputFile, Arnold, glades::NNetwork::RUN_TEST);
+			subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TEST);
 			cvAccuracy += subnets[i]->getAccuracy();
 		}
 	}

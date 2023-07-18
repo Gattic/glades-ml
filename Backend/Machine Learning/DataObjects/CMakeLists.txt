@@ -1,5 +1,6 @@
 set(DO_src_files
 	DataInput.cpp
+	NumberInput.cpp
 	ImageInput.cpp
 )
 add_library(DataObjects ${DO_src_files})

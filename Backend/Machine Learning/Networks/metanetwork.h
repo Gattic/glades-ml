@@ -18,6 +18,7 @@
 #define _GMETANETWORK
 
 #include "../State/Terminator.h"
+#include "Backend/Database/GString.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@ namespace glades {
 
 class NNInfo;
 class NNetwork;
+class DataInput;
 
 class MetaNetwork
 {
@@ -35,35 +37,35 @@ private:
 	const static int ONE_TO_ONE = 0;
 	const static int ONE_TO_MANY = 1;
 
-	std::string name;
+	shmea::GString name;
 	int collectionType;
 	std::vector<NNetwork*> subnets;
 
 public:
-	MetaNetwork(std::string);
+	MetaNetwork(shmea::GString);
 	MetaNetwork(NNInfo*, int = 1);
-	MetaNetwork(std::string metaNetName, std::string nname, int = 1);
+	MetaNetwork(shmea::GString metaNetName, shmea::GString nname, int = 1);
 	virtual ~MetaNetwork();
 
 	// manipulations/functions
 	void clearSubnets();
 
 	// sets
-	void setName(std::string);
+	void setName(shmea::GString);
 	void addSubnet(NNInfo*);
 	void addSubnet(NNetwork*);
-	void addSubnet(const std::string nNetName);
+	void addSubnet(const shmea::GString);
 
 	// gets
-	std::string getName() const;
+	shmea::GString getName() const;
 	int size() const;
 	std::vector<NNetwork*> getSubnets() const;
 	NNetwork* getSubnet(unsigned int);
-	std::string getSubnetName(unsigned int) const;
-	NNetwork* getSubnetByName(std::string) const;
+	shmea::GString getSubnetName(unsigned int) const;
+	NNetwork* getSubnetByName(shmea::GString) const;
 
 	// verification functions
-	void crossValidate(std::string fNames, Terminator* Arnold);
+	void crossValidate(shmea::GString, DataInput*, Terminator*);
 };
 };
 

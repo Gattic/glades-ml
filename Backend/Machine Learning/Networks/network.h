@@ -41,6 +41,7 @@ class Connection;
 
 namespace glades {
 
+class DataInput;
 class NNInfo;
 class Layer;
 class Node;
@@ -57,6 +58,7 @@ private:
 	friend RNN;
 	friend MetaNetwork;
 
+	DataInput* di;
 	NNInfo* skeleton;
 	LayerBuilder* meat;
 	CMatrix* confusionMatrix;
@@ -108,10 +110,6 @@ private:
 	void BackPropagation(unsigned int, int, int, unsigned int, unsigned int);
 
 public:
-	static const int TYPE_CSV = 0;
-	static const int TYPE_IMAGE = 1;
-	static const int TYPE_TEXT = 2;
-
 	static const int TYPE_DFF = 0;
 	static const int TYPE_RNN = 1;
 
@@ -127,15 +125,15 @@ public:
 	void stop();
 
 	// Database
-	bool load(const std::string&);
+	bool load(const shmea::GString&);
 	bool save() const;
 	void setServer(GNet::GServer*, GNet::Connection*);
 
 	// Stochastic Gradient Descent
-	void run(const shmea::GTable&, const Terminator*, int);
+	void run(DataInput*, const Terminator*, int);
 
 	int64_t getID() const;
-	std::string getName() const;
+	shmea::GString getName() const;
 	NNInfo* getNNInfo();
 	float getAccuracy() const;
 

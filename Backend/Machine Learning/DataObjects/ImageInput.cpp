@@ -29,10 +29,8 @@ void ImageInput::import(shmea::GString fname)
     name = fname;
 
     //
-    shmea::GString basePath = "datasets/images/" + fname + "/";
-
-    shmea::GString trainFName = basePath + "train.csv";
-    shmea::GString testFName = basePath + "test.csv";
+    shmea::GString trainFName = fname + "train.csv";
+    shmea::GString testFName = fname + "test.csv";
     int importType = shmea::GTable::TYPE_FILE;
 
     trainingLegend = shmea::GTable(trainFName, ',', importType);
@@ -49,7 +47,7 @@ void ImageInput::import(shmea::GString fname)
     for(unsigned int i = 0; i < trainingLegend.numberOfRows(); ++i)
     {
 	shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(i, 1).getInt());
-	shmea::GString path = basePath + trainingLegend.getCell(i, 0).c_str();
+	shmea::GString path = fname + trainingLegend.getCell(i, 0).c_str();
 	printf("[NNDATA] Loading %s\n", path.c_str());
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
@@ -66,7 +64,7 @@ void ImageInput::import(shmea::GString fname)
 	if(trainImages[label].find(path) == trainImages[label].end())
 	{
 	    trainImages[label].insert(std::pair<shmea::GString, shmea::GPointer<shmea::Image> >(path, img));
-	    trainingData.addRow(img->flatten());
+	    //trainingData.addRow(img->flatten());
 	    //printf("trainImages[%s].size() = %lu\n", label.c_str(), trainImages[label].size());
 	}
     }
@@ -75,7 +73,7 @@ void ImageInput::import(shmea::GString fname)
     for(unsigned int i = 0; i < testingLegend.numberOfRows(); ++i)
     {
 	shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(i, 1).getInt());
-	shmea::GString path = basePath + testingLegend.getCell(i, 0).c_str();
+	shmea::GString path = fname + testingLegend.getCell(i, 0).c_str();
 	printf("[NNDATA] Loading %s\n", path.c_str());
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
@@ -92,7 +90,7 @@ void ImageInput::import(shmea::GString fname)
 	if(testImages[label].find(path) == testImages[label].end())
 	{
 	    testImages[label].insert(std::pair<shmea::GString, shmea::GPointer<shmea::Image> >(path, img));
-	    testingData.addRow(img->flatten());
+	    //testingData.addRow(img->flatten());
 	    //printf("testImages[%s].size() = %lu\n", label.c_str(), testImages[label].size());
 	}
     }
@@ -101,7 +99,7 @@ void ImageInput::import(shmea::GString fname)
     loaded = true;
 }
 
-const shmea::GPointer<shmea::Image> ImageInput::getTrainingImage(unsigned int row) const
+const shmea::GPointer<shmea::Image> ImageInput::getTrainImage(unsigned int row) const
 {
     if(row >= trainingLegend.numberOfRows())
 	return shmea::GPointer<shmea::Image>(new shmea::Image());
@@ -123,7 +121,7 @@ const shmea::GPointer<shmea::Image> ImageInput::getTrainingImage(unsigned int ro
     return itr->second;
 }
 
-const shmea::GPointer<shmea::Image> ImageInput::getTestingImage(unsigned int row) const
+const shmea::GPointer<shmea::Image> ImageInput::getTestImage(unsigned int row) const
 {
     if(row >= testingLegend.numberOfRows())
 	return shmea::GPointer<shmea::Image>(new shmea::Image());
@@ -145,12 +143,115 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestingImage(unsigned int row
     return itr->second;
 }
 
-const shmea::GTable& ImageInput::getTrainingTable() const
+shmea::GList ImageInput::getTrainRow(unsigned int index) const
 {
-    return trainingData;
+    if(index >= trainingLegend.numberOfRows())
+	return emptyRow;
+
+    shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(index, 0).c_str();
+
+    // Check if the label exists
+    if(trainImages.find(label) == trainImages.end())
+	return emptyRow;
+	
+    // Check if the image exists
+    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
+	= trainImages.at(label).find(fname);
+    if(itr == trainImages.at(label).end())
+	return emptyRow;
+	
+    // Return the image
+    return itr->second->flatten();
 }
 
-const shmea::GTable& ImageInput::getTestingTable() const
+shmea::GList ImageInput::getTrainExpectedRow(unsigned int index) const
 {
-    return testingData;
+    if(index >= trainingLegend.numberOfRows())
+	return emptyRow;
+
+    shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(index, 0).c_str();
+
+    // Check if the label exists
+    if(trainImages.find(label) == trainImages.end())
+	return emptyRow;
+	
+    // Check if the image exists
+    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
+	= trainImages.at(label).find(fname);
+    if(itr == trainImages.at(label).end())
+	return emptyRow;
+	
+    // Return the label
+    shmea::GList retList;
+    retList.addString(itr->first);
+    return retList;
+}
+
+shmea::GList ImageInput::getTestExpectedRow(unsigned int index) const
+{
+    if(index >= testingLegend.numberOfRows())
+	return shmea::GList();
+
+    shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(index, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(index, 0).c_str();
+
+    // Check if the label exists
+    if(testImages.find(label) == testImages.end())
+	return shmea::GList();
+	
+    // Check if the image exists
+    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
+	= testImages.at(label).find(fname);
+    if(itr == testImages.at(label).end())
+	return shmea::GList();
+	
+    // Return the label
+    shmea::GList retList;
+    retList.addString(itr->first);
+    return retList;
+}
+
+shmea::GList ImageInput::getTestRow(unsigned int index) const
+{
+    if(index >= testingLegend.numberOfRows())
+	return shmea::GList();
+
+    shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(index, 1).getInt());
+    shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(index, 0).c_str();
+
+    // Check if the label exists
+    if(testImages.find(label) == testImages.end())
+	return shmea::GList();
+	
+    // Check if the image exists
+    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
+	= testImages.at(label).find(fname);
+    if(itr == testImages.at(label).end())
+	return shmea::GList();
+	
+    // Return the image
+    return itr->second->flatten();
+}
+
+
+unsigned int ImageInput::getTrainSize() const
+{
+    return trainImages.size();
+}
+
+unsigned int ImageInput::getTestSize() const
+{
+    return testImages.size();
+}
+
+unsigned int ImageInput::getFeatureCount() const
+{
+    return 1;//Only one feature, the image
+}
+
+int ImageInput::getType() const
+{
+    return IMAGE;
 }
