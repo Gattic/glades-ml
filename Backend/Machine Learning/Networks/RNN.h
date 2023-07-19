@@ -32,23 +32,23 @@ class NetworkState;
 class RNN : public NNetwork
 {
 private:
-	virtual void beforeFwdEdge(const NetworkState*);
-	virtual void beforeFwdNode(const NetworkState*);
-	virtual void beforeFwdLayer(const NetworkState*);
-	virtual void beforeFwd();
-	virtual void beforeBackEdge(const NetworkState*);
-	virtual void beforeBackNode(const NetworkState*);
-	virtual void beforeBackLayer(const NetworkState*);
-	virtual void beforeBack();
+	void beforeFwdEdge(const NetworkState*);
+	void beforeFwdNode(const NetworkState*);
+	void beforeFwdLayer(const NetworkState*);
+	void beforeFwd();
+	void beforeBackEdge(const NetworkState*);
+	void beforeBackNode(const NetworkState*);
+	void beforeBackLayer(const NetworkState*);
+	void beforeBack();
 
-	virtual void afterFwdEdge(const NetworkState*);
-	virtual void afterFwdNode(const NetworkState*, float = 0.0f);
-	virtual void afterFwdLayer(const NetworkState*, float = 0.0f);
-	virtual void afterFwd();
-	virtual void afterBackEdge(const NetworkState*);
-	virtual void afterBackNode(const NetworkState*);
-	virtual void afterBackLayer(const NetworkState*);
-	virtual void afterBack();
+	void afterFwdEdge(const NetworkState*);
+	void afterFwdNode(const NetworkState*, float = 0.0f);
+	void afterFwdLayer(const NetworkState*, float = 0.0f);
+	void afterFwd();
+	void afterBackEdge(const NetworkState*);
+	void afterBackNode(const NetworkState*);
+	void afterBackLayer(const NetworkState*);
+	void afterBack();
 
 public:
 	RNN();
