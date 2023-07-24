@@ -1,26 +1,17 @@
 add_subdirectory("Structure")
 add_subdirectory("State")
 add_subdirectory("GMath")
-
-#Threading lib
-include(FindPkgConfig)
-find_package(Threads REQUIRED)
+add_subdirectory("Networks")
+add_subdirectory("DataObjects")
 
 set(ML_src_files
 	glades.cpp
 	glades.h
-	metanetwork.cpp
-	metanetwork.h
-	network.cpp
-	network.h
-	RNN.cpp
-	RNN.h
-	bayes.cpp
 )
 add_library(ML ${ML_src_files})
 
 #Link libraries
-target_link_libraries(ML MLStructure MLState GMath ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(ML Networks MLStructure MLState DataObjects GMath)
 
 install(TARGETS ML EXPORT gladesConfig
     ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}

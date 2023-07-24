@@ -16,10 +16,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "LayerBuilder.h"
 #include "../../../main.h"
-#include "../GMath/OHE.h"
 #include "../GMath/gmath.h"
 #include "../Structure/nninfo.h"
-#include "../network.h"
+#include "../Networks/network.h"
+#include "../DataObjects/DataInput.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
@@ -45,26 +45,16 @@ glades::LayerBuilder::LayerBuilder(int newNetType)
 
 glades::LayerBuilder::~LayerBuilder()
 {
-	clean();
+    //
 }
 
-bool glades::LayerBuilder::build(const NNInfo* skeleton, const shmea::GTable& newInputTable,
-								 bool standardizeWeightsFlag)
+bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInput, bool standardizeWeightsFlag)
 {
 	if (!skeleton)
 		return false;
 
-	// Avoid Repopulating
-	clean();
-
-	// Normalize/Standardize the data
-	shmea::GTable standardizedTable = standardizeInputTable(skeleton, newInputTable);
-
-	// Seperat the new table into two tables
-	seperateTables(standardizedTable);
-
 	// Construct the input layers
-	buildInputLayers(skeleton);
+	buildInputLayers(skeleton, newInput);
 	if (inputLayers.size() <= 0)
 	{
 		printf("[GQL] Invalid data format[0] %s\n", skeleton->getName().c_str());
@@ -103,46 +93,29 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const shmea::GTable& ne
 	return true;
 }
 
-void glades::LayerBuilder::seperateTables(const shmea::GTable& newInputTable)
+void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataInput* di)
 {
-	inputTable.copy(newInputTable);
-
-	// Remove output columns from the input table
-	int removedCounter = 0;
-	for (unsigned int i = 0; i < newInputTable.numberOfCols(); ++i)
-	{
-		if (newInputTable.isOutput(i))
-		{
-			inputTable.removeCol(i - removedCounter);
-			expectedTable.addCol(newInputTable.getHeader(i), newInputTable.getCol(i));
-			++removedCounter;
-		}
-	}
-}
-
-void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton)
-{
-	// Input and Output columns
-	if (inputTable.numberOfCols() < 1)
+	// Needs something to train/test on
+	if (di->getTrainSize() == 0)
 		return;
 
-	// Needs something to train/test on
-	if (!(inputTable.numberOfRows() > 0))
+	// Input and Output columns
+	if (di->getFeatureCount() < 1)
 		return;
 
 	inputLayers.clear();
-	for (unsigned int r = 0; r < inputTable.numberOfRows(); ++r)
+	for (unsigned int r = 0; r < di->getTrainSize(); ++r)
 	{
 		Layer* cLayer = new Layer(Layer::INPUT_TYPE, false);
-		for (unsigned int c = 0; c < inputTable.numberOfCols(); ++c)
+		for (unsigned int c = 0; c < di->getFeatureCount(); ++c)
 		{
 			// We can probably get rid of most of these conditions becuase Gtype auto types
 			float newWeight = 0.0f;
-			shmea::GType cCell = inputTable.getCell(r, c);
+			shmea::GType cCell = di->getTrainRow(r)[c];
 			if (cCell.getType() == shmea::GType::STRING_TYPE)
 			{
 				// columns w/ strings NEED to be labeled categorical
-				if (!featureIsCategorical[c])
+				if (!di->featureIsCategorical[c])
 				{
 					inputLayers.clear();
 					return;
@@ -175,7 +148,7 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton)
 			cLayer->addNode(node);
 
 			// add the input layer to the dataset
-			bool lastCol = (c == (inputTable.numberOfCols() - 1));
+			bool lastCol = (c == (di->getFeatureCount() - 1));
 			if (lastCol)
 				inputLayers.push_back(cLayer);
 		}
@@ -369,238 +342,6 @@ float glades::LayerBuilder::getTimeState(unsigned int cLayerCounter, unsigned in
 	return timeState[cLayerCounter][cNodeCounter][cEdgeCounter];
 }
 
-shmea::GTable glades::LayerBuilder::getInput() const
-{
-	return inputTable;
-}
-
-shmea::GTable glades::LayerBuilder::getExpected() const
-{
-	return expectedTable;
-}
-
-shmea::GTable glades::LayerBuilder::standardizeInputTable(const NNInfo* skeleton, const shmea::GTable& newInputTable, int standardizeFlag)
-{
-	shmea::GTable standardizedTable(',');
-
-	// Standardize the initialization of the weights
-	if ((newInputTable.numberOfRows() <= 0) || (newInputTable.numberOfCols() <= 0))
-		return standardizedTable;
-
-	// default cols to non-categorical
-	for (unsigned int c = 0; c < newInputTable.numberOfCols(); ++c)
-		featureIsCategorical.push_back(false);
-
-	// iterate through the cols
-	for (unsigned int c = 0; c < newInputTable.numberOfCols(); ++c)
-	{
-		// Set the min and max for this feature (col)
-		float fMin = 0.0f;
-		float fMax = 0.0f;
-		float fMean = 0.0f;
-
-		// iterate through the rows
-		OHE* cOHE = new OHE();
-		for (unsigned int r = 0; r < newInputTable.numberOfRows(); ++r)
-		{
-			// check if already marked categorical
-			if (featureIsCategorical[c])
-				continue;
-
-			float cell = 0.0f;
-			shmea::GType cCell = newInputTable.getCell(r, c);
-
-			if (cCell.getType() == shmea::GType::STRING_TYPE)
-			{
-				cOHE->mapFeatureSpace(newInputTable, c);
-				featureIsCategorical[c] = true;
-				continue;
-			}
-			else if (cCell.getType() == shmea::GType::CHAR_TYPE)
-				cell = cCell.getChar();
-			else if (cCell.getType() == shmea::GType::SHORT_TYPE)
-				cell = cCell.getShort();
-			else if (cCell.getType() == shmea::GType::INT_TYPE)
-				cell = cCell.getInt();
-			else if (cCell.getType() == shmea::GType::LONG_TYPE)
-				cell = cCell.getLong();
-			else if (cCell.getType() == shmea::GType::FLOAT_TYPE)
-				cell = cCell.getFloat();
-			else if (cCell.getType() == shmea::GType::DOUBLE_TYPE)
-				cell = cCell.getDouble();
-			else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
-				cell = cCell.getBoolean() ? 1.0f : 0.0f;
-
-			if ((r == 0) && (c == 0))
-			{
-				fMin = cell;
-				fMax = cell;
-			}
-
-			// Check the mins and maxes
-			if (cell < fMin)
-				fMin = cell;
-			if (cell > fMax)
-				fMax = cell;
-
-			// update mean
-			fMean += cell;
-			if (r == (newInputTable.numberOfRows() - 1))
-				fMean /= newInputTable.numberOfRows();
-		}
-		OHEMaps.push_back(cOHE);
-
-		if (featureIsCategorical[c])
-		{
-			OHE OHEVector = *OHEMaps[c];
-
-			// iterate over feature (col) space
-			for (unsigned int cInt = 0; cInt < OHEVector.size(); ++cInt)
-			{
-				// iterate over rows
-				shmea::GList newCol;
-				for (unsigned int r = 0; r < newInputTable.numberOfRows(); ++r)
-				{
-					shmea::GType cCell = newInputTable.getCell(r, c);
-					float cell = 0.0f;
-
-					// translate string to cell value for this col
-					std::string cString = cCell.c_str();
-					std::vector<float> featureVector = OHEVector[cString];
-					cell = featureVector[cInt];
-
-					// add cell to newCol
-					newCol.addFloat(cell);
-				}
-
-				// generic new header since OHE turns 1 col to many
-				shmea::GString newHeader = newInputTable.getHeader(c).c_str();
-				newHeader += shmea::GString::intTOstring(cInt);
-
-				// add the standardized newCol to the standardizedTable
-				standardizedTable.addCol(newHeader, newCol);
-
-				if (newInputTable.isOutput(c))
-					standardizedTable.toggleOutput(standardizedTable.numberOfCols() - 1);
-			}
-		}
-		else
-		{
-			if (standardizeFlag == GMath::MINMAX)
-			{
-				// find the range of this feature
-				float xRange = fMax - fMin;
-				if (xRange == 0.0f)
-				{
-					// This column is just a constant, add and skip standardization
-					standardizedTable.addCol(newInputTable.getHeader(c), newInputTable.getCol(c));
-					continue;
-				}
-
-				// iterate through the rows
-				shmea::GList newCol;
-				for (unsigned int r = 0; r < newInputTable.numberOfRows(); ++r)
-				{
-					// acquire original cell value
-					shmea::GType cCell = newInputTable.getCell(r, c);
-					float cell = 0.0f;
-					if (cCell.getType() == shmea::GType::STRING_TYPE)
-					{
-						// for errors - strings MUST be categorical
-						standardizedTable.clear();
-						return standardizedTable;
-					}
-					else
-						cell = cCell.getFloat();
-
-					// standardize cell value based on network vars
-					int activationType = skeleton->getActivationType(0);
-					int outputType = skeleton->getOutputType();
-					if (outputType == GMath::REGRESSION)
-					{
-						/*if ((activationType == GMath::SIGMOID) || (activationType ==
-						GMath::SIGMOIDP)
-						||
-							(activationType == GMath::RELU) || (activationType == GMath::LEAKY))
-							cell = ((cell - fMin) / (xRange)); // [0.0, 1.0] bounds
-						else
-							cell = ((((cell - fMin) / (xRange)) * 2.0f) - 1.0f); // [-1.0, 1.0]
-						bounds*/
-						cell = ((cell - fMin) / (xRange)); // [0.0, 1.0] bounds
-					}
-					else if (outputType == GMath::CLASSIFICATION)
-					{
-						cell =
-							((((cell - fMin) / (xRange)) * 0.98f) + 0.01f); // [0.01, 0.99] bounds
-					}
-
-					// add cell to newCol
-					newCol.addFloat(cell);
-				}
-
-				// add the standardized newCol to the standardizedTable
-				standardizedTable.addCol(newInputTable.getHeader(c), newCol);
-
-				if (newInputTable.isOutput(c))
-					standardizedTable.toggleOutput(standardizedTable.numberOfCols() - 1);
-			}
-			else if (standardizeFlag == GMath::ZSCORE)
-			{
-				// second pass for stdev
-				float fStDev = 0.0f;
-				shmea::GList newCol;
-				for (unsigned int r = 0; r < newInputTable.numberOfRows(); ++r)
-				{
-					// acquire original cell value
-					shmea::GType cCell = newInputTable.getCell(r, c);
-					float cell = 0.0f;
-					if (cCell.getType() == shmea::GType::STRING_TYPE)
-					{
-						// for errors - strings MUST be categorical
-						standardizedTable.clear();
-						return standardizedTable;
-					}
-					else
-						cell = cCell.getFloat();
-
-					fStDev += ((cell - fMean) * (cell - fMean));
-				}
-
-				// calculate stdev
-				fStDev = sqrt(fStDev / (newInputTable.numberOfRows() - 1));
-
-				for (unsigned int r = 0; r < newInputTable.numberOfRows(); ++r)
-				{
-					// acquire original cell value
-					shmea::GType cCell = newInputTable.getCell(r, c);
-					float cell = 0.0f;
-					if (cCell.getType() == shmea::GType::STRING_TYPE)
-					{
-						// for errors - strings MUST be categorical
-						standardizedTable.clear();
-						return standardizedTable;
-					}
-					else
-						cell = cCell.getFloat();
-
-					cell = ((cell - fMean) / fStDev);
-
-					// add cell to newCol
-					newCol.addFloat(cell);
-				}
-
-				// add the standardized newCol to the standardizedTable
-				standardizedTable.addCol(newInputTable.getHeader(c), newCol);
-
-				if (newInputTable.isOutput(c))
-					standardizedTable.toggleOutput(standardizedTable.numberOfCols() - 1);
-			}
-		}
-	}
-
-	return standardizedTable;
-}
-
 void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 {
 	// Structure required!
@@ -770,9 +511,6 @@ void glades::LayerBuilder::clean()
 	xMin = 0.0f;
 	xMax = 0.0f;
 	xRange = 0.0f;
-
-	inputTable.clear();
-	expectedTable.clear();
 }
 
 // Database

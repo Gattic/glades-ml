@@ -14,12 +14,11 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GQL_LAYERBUILDER
-#define _GQL_LAYERBUILDER
+#ifndef _GMETANETWORK
+#define _GMETANETWORK
 
-#include "Backend/Database/GTable.h"
-#include <map>
-#include <math.h>
+#include "../State/Terminator.h"
+#include "Backend/Database/GString.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,51 +27,45 @@
 
 namespace glades {
 
-class Node;
-class Layer;
 class NNInfo;
-class NetworkState;
-class OHE;
+class NNetwork;
 class DataInput;
 
-class LayerBuilder
+class MetaNetwork
 {
 private:
-	int netType;
-	std::vector<Layer*> inputLayers;
-	std::vector<Layer*> layers;
-	float xMin;
-	float xMax;
-	float xRange;
-	std::vector<std::vector<std::vector<float> > > timeState;
+	const static int ONE_TO_ONE = 0;
+	const static int ONE_TO_MANY = 1;
 
-	void seperateTables(const shmea::GTable&);
-	void buildInputLayers(const NNInfo*, const DataInput*);
-	void buildHiddenLayers(const NNInfo*);
-	void buildOutputLayer(const NNInfo*);
-	void standardizeWeights(const NNInfo*);
-	float unstandardize(float);
+	shmea::GString name;
+	int collectionType;
+	std::vector<NNetwork*> subnets;
 
 public:
-	LayerBuilder();
-	LayerBuilder(int);
-	~LayerBuilder();
+	MetaNetwork(shmea::GString);
+	MetaNetwork(NNInfo*, int = 1);
+	MetaNetwork(shmea::GString metaNetName, shmea::GString nname, int = 1);
+	virtual ~MetaNetwork();
 
-	bool build(const NNInfo*, const DataInput*, bool = false);
-	NetworkState* getNetworkStateFromLoc(unsigned int, unsigned int, unsigned int, unsigned int,
-										 unsigned int);
-	void setTimeState(unsigned int, unsigned int, unsigned int, float);
-	unsigned int getInputLayersSize() const;
-	unsigned int getLayersSize() const;
-	float getTimeState(unsigned int, unsigned int, unsigned int) const;
-	void scrambleDropout(unsigned int, float, const std::vector<float>&);
-	void clearDropout();
-	void print(const NNInfo*, bool = false) const;
-	void clean();
+	// manipulations/functions
+	void clearSubnets();
 
-	// Database
-	bool load(const std::string&);
-	bool save(const std::string&) const;
+	// sets
+	void setName(shmea::GString);
+	void addSubnet(NNInfo*);
+	void addSubnet(NNetwork*);
+	void addSubnet(const shmea::GString);
+
+	// gets
+	shmea::GString getName() const;
+	int size() const;
+	std::vector<NNetwork*> getSubnets() const;
+	NNetwork* getSubnet(unsigned int);
+	shmea::GString getSubnetName(unsigned int) const;
+	NNetwork* getSubnetByName(shmea::GString) const;
+
+	// verification functions
+	void crossValidate(shmea::GString, DataInput*, Terminator*);
 };
 };
 

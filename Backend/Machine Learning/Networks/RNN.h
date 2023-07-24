@@ -14,12 +14,10 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GQL_LAYERBUILDER
-#define _GQL_LAYERBUILDER
+#ifndef _GML_RNN
+#define _GML_RNN
 
-#include "Backend/Database/GTable.h"
-#include <map>
-#include <math.h>
+#include "network.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,51 +26,33 @@
 
 namespace glades {
 
-class Node;
-class Layer;
 class NNInfo;
 class NetworkState;
-class OHE;
-class DataInput;
 
-class LayerBuilder
+class RNN : public NNetwork
 {
 private:
-	int netType;
-	std::vector<Layer*> inputLayers;
-	std::vector<Layer*> layers;
-	float xMin;
-	float xMax;
-	float xRange;
-	std::vector<std::vector<std::vector<float> > > timeState;
+	void beforeFwdEdge(const NetworkState*);
+	void beforeFwdNode(const NetworkState*);
+	void beforeFwdLayer(const NetworkState*);
+	void beforeFwd();
+	void beforeBackEdge(const NetworkState*);
+	void beforeBackNode(const NetworkState*);
+	void beforeBackLayer(const NetworkState*);
+	void beforeBack();
 
-	void seperateTables(const shmea::GTable&);
-	void buildInputLayers(const NNInfo*, const DataInput*);
-	void buildHiddenLayers(const NNInfo*);
-	void buildOutputLayer(const NNInfo*);
-	void standardizeWeights(const NNInfo*);
-	float unstandardize(float);
+	void afterFwdEdge(const NetworkState*);
+	void afterFwdNode(const NetworkState*, float = 0.0f);
+	void afterFwdLayer(const NetworkState*, float = 0.0f);
+	void afterFwd();
+	void afterBackEdge(const NetworkState*);
+	void afterBackNode(const NetworkState*);
+	void afterBackLayer(const NetworkState*);
+	void afterBack();
 
 public:
-	LayerBuilder();
-	LayerBuilder(int);
-	~LayerBuilder();
-
-	bool build(const NNInfo*, const DataInput*, bool = false);
-	NetworkState* getNetworkStateFromLoc(unsigned int, unsigned int, unsigned int, unsigned int,
-										 unsigned int);
-	void setTimeState(unsigned int, unsigned int, unsigned int, float);
-	unsigned int getInputLayersSize() const;
-	unsigned int getLayersSize() const;
-	float getTimeState(unsigned int, unsigned int, unsigned int) const;
-	void scrambleDropout(unsigned int, float, const std::vector<float>&);
-	void clearDropout();
-	void print(const NNInfo*, bool = false) const;
-	void clean();
-
-	// Database
-	bool load(const std::string&);
-	bool save(const std::string&) const;
+	RNN();
+	~RNN();
 };
 };
 

@@ -15,17 +15,17 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "glades.h"
-#include "../../main.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
 #include "Backend/Networking/main.h"
 #include "GMath/gmath.h"
-#include "RNN.h"
+#include "Networks/RNN.h"
 #include "State/layer.h"
 #include "State/node.h"
 #include "Structure/nninfo.h"
-#include "metanetwork.h"
-#include "network.h"
+#include "Networks/metanetwork.h"
+#include "Networks/network.h"
+#include "DataObjects/ImageInput.h"
 
 using namespace glades;
 
@@ -76,19 +76,22 @@ bool glades::saveNeuralNetwork(glades::NNetwork* newNet)
  * @brief train network
  * @details train a neural network
  * @param networkInfo the incoming or desired neural net info
- * @param dataTable the data to use in training
+ * @param newDataInput the data to use in training
  * @return the trained MetaNetwork object
  */
-glades::MetaNetwork* glades::train(NNInfo* networkInfo, const shmea::GTable& dataTable, Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput, Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
+	printf("CHIRP\n");
 	if (!networkInfo)
 		return NULL;
 
 	// metanetwork for aggregation
 	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(networkInfo->getName());
 
+	printf("DERP\n");
 	// Add the Neural Network
 	cMetaNetwork->addSubnet(networkInfo);
+	printf("HERP: %d\n", cMetaNetwork->getSubnets().size());
 
 	// Train the Neural Network
 	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
@@ -96,7 +99,7 @@ glades::MetaNetwork* glades::train(NNInfo* networkInfo, const shmea::GTable& dat
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(dataTable, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
 	}
 
 	return cMetaNetwork;
@@ -106,10 +109,10 @@ glades::MetaNetwork* glades::train(NNInfo* networkInfo, const shmea::GTable& dat
  * @brief train network
  * @details train a neural network
  * @param networkInfo the incoming or desired neural net info
- * @param dataTable the data to use in training
+ * @param newDataInput the data to use in training
  * @return the trained MetaNetwork object
  */
-glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, const shmea::GTable& dataTable,
+glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDataInput,
 								   Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!cNetwork)
@@ -127,7 +130,7 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, const shmea::GTab
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(dataTable, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
 	}
 
 	return cMetaNetwork;
@@ -137,11 +140,11 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, const shmea::GTab
  * @brief train a metanetwork
  * @details train a set of neural networks
  * @param networkInfo the incoming or desired neural net info
- * @param dataTable the data to use in training
+ * @param newDataInput the data to use in training
  * @return the trained MetaNetwork object
  */
 glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
-								   const shmea::GTable& dataTable, Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+								   DataInput* newDataInput, Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!cMetaNetwork)
 		return NULL;
@@ -152,7 +155,7 @@ glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(dataTable, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
 	}
 
 	return cMetaNetwork;
@@ -162,10 +165,10 @@ glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
  * @brief test network
  * @details test a network
  * @param networkInfo the incoming network's relevant information
- * @param dataTable the data to use in testing
+ * @param newDataInput the data to use in testing
  * @return the tested MetaNetwork object
  */
-glades::MetaNetwork* glades::test(NNInfo* networkInfo, const shmea::GTable& dataTable, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+glades::MetaNetwork* glades::test(NNInfo* networkInfo, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!networkInfo)
 		return NULL;
@@ -182,7 +185,7 @@ glades::MetaNetwork* glades::test(NNInfo* networkInfo, const shmea::GTable& data
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(dataTable, NULL, glades::NNetwork::RUN_TEST);
+		subnets[i]->run(newDataInput, NULL, glades::NNetwork::RUN_TEST);
 	}
 
 	return cMetaNetwork;
@@ -192,10 +195,10 @@ glades::MetaNetwork* glades::test(NNInfo* networkInfo, const shmea::GTable& data
  * @brief test network
  * @details test a network
  * @param networkInfo the incoming network's relevant information
- * @param dataTable the data to use in testing
+ * @param newDataInput the data to use in testing
  * @return the tested MetaNetwork object
  */
-glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, const shmea::GTable& dataTable, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!networkInfo)
 		return NULL;
@@ -212,7 +215,7 @@ glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, const shmea::GT
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(dataTable, NULL, glades::NNetwork::RUN_TEST);
+		subnets[i]->run(newDataInput, NULL, glades::NNetwork::RUN_TEST);
 	}
 
 	return cMetaNetwork;
@@ -222,10 +225,10 @@ glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, const shmea::GT
  * @brief test a metanetwork
  * @details test a set of neural networks
  * @param networkInfo the incoming or desired neural net info
- * @param dataTable the data to use in testing
+ * @param newDataInput the data to use in testing
  * @return the tested MetaNetwork object
  */
-glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, const shmea::GTable& dataTable, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!cMetaNetwork)
 		return NULL;
@@ -236,7 +239,7 @@ glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, const shmea
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(dataTable, NULL, glades::NNetwork::RUN_TEST);
+		subnets[i]->run(newDataInput, NULL, glades::NNetwork::RUN_TEST);
 	}
 
 	return cMetaNetwork;

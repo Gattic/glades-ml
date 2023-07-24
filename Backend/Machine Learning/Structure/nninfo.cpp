@@ -33,9 +33,10 @@ using namespace glades;
  * @details create a new NNInfo object
  * @param newName the NNInfo object's desired name
  */
-glades::NNInfo::NNInfo(const std::string& newName)
+glades::NNInfo::NNInfo(const shmea::GString& newName)
 {
 	name = newName;
+	inputType = 0;
 	hiddenLayerCount = 0;
 }
 
@@ -47,10 +48,11 @@ glades::NNInfo::NNInfo(const std::string& newName)
  * @param hidden the desired hidden layers
  * @param newOutputLayer the desired output layer
  */
-glades::NNInfo::NNInfo(const std::string& newName, InputLayerInfo* newInputLayer,
+glades::NNInfo::NNInfo(const shmea::GString& newName, InputLayerInfo* newInputLayer,
 					   const std::vector<HiddenLayerInfo*>& hidden, OutputLayerInfo* newOutputLayer)
 {
 	name = newName;
+	inputType = 0;
 	hiddenLayerCount = hidden.size();
 	inputLayer = newInputLayer;
 	outputLayer = newOutputLayer;
@@ -65,7 +67,7 @@ glades::NNInfo::NNInfo(const std::string& newName, InputLayerInfo* newInputLayer
  * @details create a new NNInfo object from a GTable
  * @param  newTable the table storing the NNInfo data
  */
-glades::NNInfo::NNInfo(const std::string& newName, const shmea::GTable& newTable)
+glades::NNInfo::NNInfo(const shmea::GString& newName, const shmea::GTable& newTable)
 {
 	int rows = newTable.numberOfRows(), cols = newTable.numberOfCols(), r = 0;
 	if (cols < 10)
@@ -86,6 +88,7 @@ glades::NNInfo::NNInfo(const std::string& newName, const shmea::GTable& newTable
 glades::NNInfo::~NNInfo()
 {
 	name = "";
+	inputType = 0;
 	hiddenLayerCount = 0;
 	for (unsigned int i = 0; i < layers.size(); ++i)
 		delete layers[i];
@@ -105,9 +108,14 @@ glades::NNInfo::~NNInfo()
  * @details get NNInfo's name
  * @return the NNInfo's name
  */
-std::string glades::NNInfo::getName() const
+shmea::GString glades::NNInfo::getName() const
 {
 	return name;
+}
+
+int glades::NNInfo::getInputType() const
+{
+	return inputType;
 }
 
 /*!
@@ -379,9 +387,14 @@ void glades::NNInfo::print() const
  * @details set NNInfo's name
  * @param newName the desired name for this NNInfo object
  */
-void glades::NNInfo::setName(std::string newName)
+void glades::NNInfo::setName(shmea::GString newName)
 {
 	name = newName;
+}
+
+void glades::NNInfo::setInputType(int newInputype)
+{
+	inputType = newInputype;
 }
 
 /*!
@@ -621,7 +634,7 @@ shmea::GTable glades::NNInfo::toGTable() const
  * @brief NNInfo to GTable
  * @details convert the layers in an NNInfo object to a GTable object
  */
-bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable& newTable)
+bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTable& newTable)
 {
 	if (newTable.numberOfRows() < 2)
 		return false;
@@ -663,7 +676,7 @@ bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable&
 	return true;
 }
 
-bool glades::NNInfo::load(const std::string& netName)
+bool glades::NNInfo::load(const shmea::GString& netName)
 {
 	name = netName;
 	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
