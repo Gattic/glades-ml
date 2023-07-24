@@ -21,12 +21,13 @@
 
 using namespace glades;
 
-void ImageInput::import(shmea::GString fname)
+void ImageInput::import(shmea::GString newName)
 {
     if(loaded)
 	return;
 
-    name = fname;
+    name = newName;
+    shmea::GString fname = "datasets/images/" + name + "/";
 
     //
     shmea::GString trainFName = fname + "train.csv";
