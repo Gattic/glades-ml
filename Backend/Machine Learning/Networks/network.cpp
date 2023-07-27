@@ -175,7 +175,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 
 		// Recursive FwdPass/BackProp
 		for (unsigned int r = 0; r < meat->getInputLayersSize(); ++r)
-			SGDHelper(r, di->getTrainSize(), runType);
+			SGDHelper(r, runType);
 
 		// Update the network vars
 		++epochs;
@@ -336,7 +336,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	running = false;
 }
 
-void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows, int runType)
+void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 {
 	if ((!skeleton) || (!meat))
 		return;
@@ -355,7 +355,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	nbRecord.clear();
 
 	// Forward Pass and trigger events
-	ForwardPass(inputRowCounter, numInputRows, 0, 0, 0, 0);
+	ForwardPass(inputRowCounter, 0, 0, 0, 0);
 
 	// Add current results to cmatrix for accuracy vars
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
@@ -393,9 +393,9 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int numInputRows,
 	}
 }
 
-void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRows,
-								   int cInputLayerCounter, int cOutputLayerCounter,
-								   unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
+void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
+		int cInputLayerCounter, int cOutputLayerCounter,
+		unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	NetworkState* netState =
 		meat->getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
@@ -450,7 +450,7 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 			results.addFloat(prediction);
 
 			// Cost function calculations
-			float dataSize = (float)(numInputRows * netState->cOutputLayer->size());
+			float dataSize = (float)(di->getTrainSize() * netState->cOutputLayer->size());
 			int costFx = skeleton->getOutputType();
 			float cOutputCost = GMath::outputNodeCost(expectation, prediction, dataSize, costFx);
 
@@ -484,19 +484,19 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter, int numInputRow
 		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
 	{
 		// Next Output Layer
-		ForwardPass(inputRowCounter, numInputRows, cOutputLayerCounter, cOutputLayerCounter + 1, 0,
+		ForwardPass(inputRowCounter, cOutputLayerCounter, cOutputLayerCounter + 1, 0,
 					0);
 	}
 	else if (cInputNodeCounter == netState->cInputLayer->size() - 1)
 	{
 		// Next Output Node
-		ForwardPass(inputRowCounter, numInputRows, cInputLayerCounter, cOutputLayerCounter, 0,
+		ForwardPass(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, 0,
 					cOutputNodeCounter + 1);
 	}
 	else
 	{
 		// Next Input Node
-		ForwardPass(inputRowCounter, numInputRows, cInputLayerCounter, cOutputLayerCounter,
+		ForwardPass(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
 					cInputNodeCounter + 1, cOutputNodeCounter);
 	}
 
