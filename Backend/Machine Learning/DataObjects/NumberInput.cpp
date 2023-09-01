@@ -50,8 +50,23 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 		return;
 
 	// default cols to non-categorical
+	bool isClassification = false;
 	for (unsigned int c = 0; c < rawTable.numberOfCols(); ++c)
+	{
+		OHE* cOHE = new OHE();
 		featureIsCategorical.push_back(false);
+
+		shmea::GType cCell = rawTable.getCell(0, c); // get the first cell of the col
+		if (cCell.getType() == shmea::GType::STRING_TYPE)
+		{
+			cOHE->mapFeatureSpace(rawTable, c);
+			featureIsCategorical[c] = true;
+			isClassification = true;
+			cOHE->print();
+		}
+
+		OHEMaps.push_back(cOHE);
+	}
 
 	// iterate through the cols
 	for (unsigned int c = 0; c < rawTable.numberOfCols(); ++c)
@@ -62,7 +77,6 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 		float fMean = 0.0f;
 
 		// iterate through the rows
-		OHE* cOHE = new OHE();
 		for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r)
 		{
 			// check if already marked categorical
@@ -73,11 +87,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 			shmea::GType cCell = rawTable.getCell(r, c);
 
 			if (cCell.getType() == shmea::GType::STRING_TYPE)
-			{
-				cOHE->mapFeatureSpace(rawTable, c);
-				featureIsCategorical[c] = true;
-				continue;
-			}
+				continue; // mapped strings in a previous loop
 			else if (cCell.getType() == shmea::GType::CHAR_TYPE)
 				cell = cCell.getChar();
 			else if (cCell.getType() == shmea::GType::SHORT_TYPE)
@@ -110,14 +120,15 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 			if (r == (rawTable.numberOfRows() - 1))
 				fMean /= rawTable.numberOfRows();
 		}
-		OHEMaps.push_back(cOHE);
+		printf("c: %d:%u, fMin: %f, fMax: %f, fMean: %f\n", c, rawTable.numberOfCols(), fMin, fMax, fMean);
 
 		if (featureIsCategorical[c])
 		{
-			OHE OHEVector = *OHEMaps[c];
+			OHE* OHEVector = OHEMaps[c];
+			printf("OHEVector size: %d\n", OHEVector->size());
 
 			// iterate over feature (col) space
-			for (unsigned int cInt = 0; cInt < OHEVector.size(); ++cInt)
+			for (unsigned int cInt = 0; cInt < OHEVector->size(); ++cInt)
 			{
 				// iterate over rows
 				shmea::GList newCol;
@@ -128,7 +139,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 
 					// translate string to cell value for this col
 					std::string cString = cCell.c_str();
-					std::vector<float> featureVector = OHEVector[cString];
+					std::vector<float> featureVector = (*OHEVector)[cString];
 					cell = featureVector[cInt];
 
 					// add cell to newCol
@@ -172,6 +183,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 					if (cCell.getType() == shmea::GType::STRING_TYPE)
 					{
 						// for errors - strings MUST be categorical
+						printf("ERROR: String found in non-categorical column.\n");
 						trainTable.clear();
 						return;
 					}
@@ -179,19 +191,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 						cell = cCell.getFloat();
 
 					// standardize cell value based on network vars
-					//Check if featureIsCategorical has a true value at this index
-					bool found = false;
-					for (unsigned int i = 0; i < featureIsCategorical.size(); ++i)
-					{
-						if (featureIsCategorical[i])
-						{
-							found = true;
-							break;
-						}
-					}
-
-					
-					if (found) // CLASSIFICATION
+					if (isClassification) // CLASSIFICATION
 					{
 						// [0.01, 0.99] bounds
 						cell = ((((cell - fMin) / (xRange)) * 0.98f) + 0.01f);
@@ -258,6 +258,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 					if (cCell.getType() == shmea::GType::STRING_TYPE)
 					{
 						// for errors - strings MUST be categorical
+						printf("ERROR: String found in non-categorical column.\n");
 						trainTable.clear();
 						return;
 					}

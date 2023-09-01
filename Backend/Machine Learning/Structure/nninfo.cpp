@@ -200,11 +200,18 @@ int glades::NNInfo::getInputLayerSize() const
 int glades::NNInfo::getHiddenLayerSize(unsigned int index) const
 {
 	if (index >= layers.size())
+	{
+	    printf("ERROR: NNInfo::getHiddenLayerSize(%d) >= layers.size() (%d)\n", index, layers.size());
 		return 0;
+	}
 
 	if (!layers[index])
+	{
+	    printf("ERROR: NNInfo::getHiddenLayerSize(%d) !layers[index]\n", index);
 		return 0;
+	}
 
+	printf("getHiddenLayerSize(%d) = %d\n", index, layers[index]->size());
 	return layers[index]->size();
 }
 

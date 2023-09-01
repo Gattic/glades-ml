@@ -167,6 +167,7 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 	// Create each hidden layer
 	for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
 	{
+	    printf("[GQL] Creating hidden layer %d\n", i);
 		activationType = skeleton->getActivationType(i);
 		// Get the current layer size
 		int cLayerSize = skeleton->getHiddenLayerSize(i);
@@ -183,6 +184,7 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 			if ((activationType == GMath::SIGMOID) || (activationType == GMath::RELU) ||
 				(activationType == GMath::LEAKY) || (outputType == GMath::CLASSIFICATION))
 			{
+				printf("[GQL] Invalid data format[2] %s\n", skeleton->getName().c_str());
 				isPositive = true;
 				i = -1;
 				for (unsigned int j = 0; j < layers.size(); ++j)
@@ -197,6 +199,7 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 		layers.push_back(cLayer);
 		prevLayerSize = cLayerSize;
 	}
+	printf("[GQL] Created %lu hidden layers\n", layers.size());
 }
 
 void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
@@ -208,9 +211,10 @@ void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 	bool isPositive = false;
 	int activationType;
 
-	// Create each hidden layer
+	// Walk through each hidden layer
 	for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
 	{
+	    printf("[GQL] Creating output layer %d\n", i);
 		activationType = skeleton->getActivationType(i);
 		// Get the current layer size
 		int cLayerSize = skeleton->getHiddenLayerSize(i);
@@ -236,7 +240,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	unsigned int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	// Base case and Error case
-	if (cOutputLayerCounter >= layers.size())
+	if (cOutputLayerCounter > layers.size())
 		return NULL;
 
 	if (cInputLayerCounter >= layers.size())
@@ -244,10 +248,10 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 
 	// Current Input Layer
 	Layer* cInputLayer = NULL;
-	if ((cInputLayerCounter == 0) && (cOutputLayerCounter == 0))
+	if (cInputLayerCounter == 0)
 		cInputLayer = inputLayers[inputRowCounter];
 	else
-		cInputLayer = layers[cInputLayerCounter];
+		cInputLayer = layers[cInputLayerCounter-1];
 	if (!cInputLayer)
 		return NULL;
 
@@ -261,7 +265,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 		return NULL;
 
 	// Current Output Layer
-	Layer* cOutputLayer = layers[cOutputLayerCounter];
+	Layer* cOutputLayer = layers[cOutputLayerCounter-1];
 	if (!cOutputLayer)
 		return NULL;
 

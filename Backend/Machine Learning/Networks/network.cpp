@@ -117,6 +117,9 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
 		meat->build(skeleton, di, netType);
+	
+	meat->print(skeleton, true);
+	skeleton->print();
 
 	// inputTable.print();
 	// expected.print();
@@ -323,7 +326,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	}
 
 	// Print the results
-	meat->print(skeleton);
+	meat->print(skeleton, true);
 
 	// Clean confusion matrix
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
@@ -355,7 +358,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 	nbRecord.clear();
 
 	// Forward Pass and trigger events
-	ForwardPass(inputRowCounter, 0, 0, 0, 0);
+	ForwardPass(inputRowCounter, 0, 1, 0, 0);
 
 	// Add current results to cmatrix for accuracy vars
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
@@ -366,7 +369,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 	if (runType == RUN_TRAIN)
 	{
 		// Start with the last output layer
-		int cOutputLayerCounter = meat->getLayersSize() - 1;
+		int cOutputLayerCounter = meat->getLayersSize();
 		BackPropagation(inputRowCounter, cOutputLayerCounter - 1, cOutputLayerCounter, 0, 0);
 
 		// Save the autotuning data
@@ -391,6 +394,8 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		// Clear past dropout state
 		meat->clearDropout();
 	}
+
+	printf("===========================================================\n\n");
 }
 
 void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
@@ -402,6 +407,9 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 									 cInputNodeCounter, cOutputNodeCounter);
 	if (!netState)
 		return;
+
+	//printf("Forward Pass: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
+		//cInputNodeCounter, cOutputNodeCounter);
 
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
@@ -448,11 +456,14 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			// Add the expected and predicted to the result row
 			results.addFloat(expectation);
 			results.addFloat(prediction);
+			//results.print();
 
 			// Cost function calculations
 			float dataSize = (float)(di->getTrainSize() * netState->cOutputLayer->size());
 			int costFx = skeleton->getOutputType();
 			float cOutputCost = GMath::outputNodeCost(expectation, prediction, dataSize, costFx);
+			//printf("expected: %f\tprediction: %f\tdatasize: %f\tcostfx: %d\tcost: %f\n",
+				   //expectation, prediction, dataSize, costFx, cOutputCost);
 
 			// Error across every input instance
 			overallTotalError += cOutputCost;
@@ -460,6 +471,7 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			// Accuracy vars
 			float percentError = GMath::PercentError(prediction, expectation, cOutputCost);
 			float calculatedError = GMath::error(expectation, prediction);
+			//printf("-----------------------------------------------------------\n");
 			bool isCorrect = percentError < GMath::OUTLIER;
 			float accuracy = (1.0f - percentError) * 100.0f;
 			if (accuracy < 0.0f)
@@ -481,23 +493,17 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 
 	// Recursive Calls
 	if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
-		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
-	{
-		// Next Output Layer
-		ForwardPass(inputRowCounter, cOutputLayerCounter, cOutputLayerCounter + 1, 0,
-					0);
-	}
+	    (cOutputNodeCounter == netState->cOutputLayer->size() - 1))
+	    	ForwardPass(inputRowCounter, cOutputLayerCounter, cOutputLayerCounter + 1, 0, 0);
 	else if (cInputNodeCounter == netState->cInputLayer->size() - 1)
 	{
-		// Next Output Node
-		ForwardPass(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, 0,
-					cOutputNodeCounter + 1);
+	// Next Output Node
+	ForwardPass(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, 0, cOutputNodeCounter + 1);
 	}
 	else
 	{
-		// Next Input Node
-		ForwardPass(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
-					cInputNodeCounter + 1, cOutputNodeCounter);
+	// Next Input Node
+	ForwardPass(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter + 1, cOutputNodeCounter);
 	}
 
 	delete netState;
@@ -513,6 +519,9 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	if (!netState)
 		return;
 
+	//printf("Backpropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter,
+		   //cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+
 	// Output Layer Error Derivative Calculation
 	float cOutputDer = 1.0f; // Output der is linear so its 1
 	if (netState->cOutputLayer->getType() == Layer::OUTPUT_TYPE)
@@ -520,12 +529,14 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		// Cost function error derivative for output layer(s)
 		float prediction = netState->cOutputNode->getWeight();
 		float expectation = 0.0f;
-		shmea::GType expectedCell =
+		const shmea::GType& expectedCell =
 			di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
 		expectation = expectedCell.getFloat();
 
 		int costFx = skeleton->getOutputType();
 		netState->cOutputNode->setErrDer(0, GMath::costErrDer(expectation, prediction, costFx));
+		/*printf("cOutputDer[%d][%d][%d][%d][%d]: \t%f\n", inputRowCounter, cInputLayerCounter,
+			   cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cOutputDer);*/
 	}
 	else if (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE)
 	{
@@ -533,8 +544,10 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
 		cOutputDer =
 			GMath::activationErrDer(netState->cOutputNode->getWeight(), cActivationFx, 0.01f);
+	//printf("cOutputDer[%d][%d][%d][%d][%d]: \t%f\n", inputRowCounter, cInputLayerCounter,
+		   //cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cOutputDer);
 	}
-
+	
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
 
@@ -543,10 +556,16 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	if (!dropout)
 	{
 		cOutNetErrDer *= cOutputDer; // current error partial
+	//printf("cOutNetErrDer[%d][%d][%d][%d][%d]: \t%f\n", inputRowCounter, cInputLayerCounter,
+		   //cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cOutNetErrDer);
+
 
 		// Clean the output node err der (cleanup)
 		if (cInputNodeCounter == netState->cInputLayer->size() - 1)
-			netState->cOutputNode->clearErrDer();
+		{
+		    //printf("Clearing ErrDer: %ld\n", netState->cInputLayer->size());
+			//netState->cOutputNode->clearErrDer();
+		}
 
 		// MSE applied through gradient descent
 		float learningRate = skeleton->getLearningRate(cInputLayerCounter);
@@ -568,24 +587,33 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 
 		// Update the bias (inputs fundamentally cannot have a bias)
 		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
+		{
 			netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() -
 												 baseError);
+			/*printf("Bias and Base Error[%d][%d][%d][%d][%d]: \t%f\t%f\n", inputRowCounter,
+				   cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter,
+				   cOutputNodeCounter, netState->cInputLayer->getBiasWeight(), baseError);*/
+		}
 	}
 
 	// Update the error partials for the next recursive calls
+	/*printf("ErrorDer[%d][%d][%d][%d][%d]\n", inputRowCounter,
+		    cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter,
+		    cOutputNodeCounter);*/
+	// Why does this not print for the output layer and H-1?
+	// Answer: 
 	float cInNetErrDer = netState->cInputNode->getErrDer() +
 						 (cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
 	netState->cInputNode->setErrDer(cOutputNodeCounter, cInNetErrDer);
+	//printf("------\n");
 
 	// Recursive Calls
 	if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
 		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
 	{
+	    //printf("Backpropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
 		// Next Input Layer
-		if ((cInputLayerCounter == 0) && (cOutputLayerCounter == 1)) // Last recursive layer case
-			BackPropagation(inputRowCounter, 0, 0, 0, 0);
-		else
-			BackPropagation(inputRowCounter, cInputLayerCounter - 1, cInputLayerCounter, 0, 0);
+		BackPropagation(inputRowCounter, cInputLayerCounter - 1, cInputLayerCounter, 0, 0);
 	}
 	else if (cOutputNodeCounter == netState->cOutputLayer->size() - 1)
 	{
@@ -598,6 +626,27 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		// Next Output Node
 		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter,
 						cOutputNodeCounter + 1);
+	}
+
+	// Fix and Redo the recursive calls below:
+	// Code:
+	 if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
+	    (cOutputNodeCounter == netState->cOutputLayer->size() - 1))
+	{
+		// Next Input Layer
+		BackPropagation(inputRowCounter, cInputLayerCounter - 1, cInputLayerCounter, 0, 0);
+	}
+	else if (cOutputNodeCounter == netState->cOutputLayer->size() - 1)
+	{
+		// Next Input Node
+		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
+			cInputNodeCounter + 1, 0);
+	}
+	else
+	{
+		// Next Output Node
+		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter,
+			cOutputNodeCounter + 1);
 	}
 
 	delete netState;

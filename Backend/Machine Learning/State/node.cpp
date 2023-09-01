@@ -104,9 +104,20 @@ float glades::Node::getActivationScalar() const
 float glades::Node::getErrDer() const
 {
 	float fullED = 0.0f;
+	unsigned int nCounter = 0;
 	std::map<int, float>::const_iterator itr = errorDer.begin();
 	for (; itr != errorDer.end(); ++itr)
+	{
 		fullED += (itr->second);
+		++nCounter;
+	}
+	
+	if(nCounter != numEdges())
+	{
+	    //printf("ERROR: Node::getErrDer() - nCounter != numEdges(): %d != %d\n", nCounter, numEdges());
+	    return 0.0f;
+	}
+
 	return fullED;
 }
 
@@ -183,6 +194,7 @@ void glades::Node::setErrDer(int edIndex, float newErrorDer)
 	pthread_mutex_lock(edMutex);
 	errorDer[edIndex] = newErrorDer;
 	pthread_mutex_unlock(edMutex);
+	//printf("Node::setErrDer.Size: %d/%ld\n", edIndex, errorDer.size());
 }
 
 void glades::Node::clearErrDer()
