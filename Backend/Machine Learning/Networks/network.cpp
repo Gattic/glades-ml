@@ -628,27 +628,6 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 						cOutputNodeCounter + 1);
 	}
 
-	// Fix and Redo the recursive calls below:
-	// Code:
-	 if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
-	    (cOutputNodeCounter == netState->cOutputLayer->size() - 1))
-	{
-		// Next Input Layer
-		BackPropagation(inputRowCounter, cInputLayerCounter - 1, cInputLayerCounter, 0, 0);
-	}
-	else if (cOutputNodeCounter == netState->cOutputLayer->size() - 1)
-	{
-		// Next Input Node
-		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
-			cInputNodeCounter + 1, 0);
-	}
-	else
-	{
-		// Next Output Node
-		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter,
-			cOutputNodeCounter + 1);
-	}
-
 	delete netState;
 }
 
