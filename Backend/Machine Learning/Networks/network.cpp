@@ -395,7 +395,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		meat->clearDropout();
 	}
 
-	printf("===========================================================\n\n");
+	//printf("===========================================================\n\n");
 }
 
 void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
@@ -564,7 +564,7 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		if (cInputNodeCounter == netState->cInputLayer->size() - 1)
 		{
 		    //printf("Clearing ErrDer: %ld\n", netState->cInputLayer->size());
-			//netState->cOutputNode->clearErrDer();
+		    netState->cOutputNode->clearErrDer();
 		}
 
 		// MSE applied through gradient descent
