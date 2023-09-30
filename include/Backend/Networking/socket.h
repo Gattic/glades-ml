@@ -18,7 +18,9 @@
 #define _GSOCKET
 
 #include "../Database/GString.h"
+#include "../Database/GLogger.h"
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <iostream>
 #include <netdb.h>
 #include <pthread.h>
@@ -48,6 +50,8 @@ class Sockets
 private:
 	static const int64_t DEFAULT_KEY = 420l;
 	static const shmea::GString ANYADDR;
+
+	shmea::GLogger logger;
 
 	shmea::GString PORT;
 	pthread_mutex_t* inMutex;
