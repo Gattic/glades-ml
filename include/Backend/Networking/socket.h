@@ -18,7 +18,9 @@
 #define _GSOCKET
 
 #include "../Database/GString.h"
+#include "../Database/GLogger.h"
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <iostream>
 #include <netdb.h>
 #include <pthread.h>
@@ -49,6 +51,8 @@ private:
 	static const int64_t DEFAULT_KEY = 420l;
 	static const shmea::GString ANYADDR;
 
+	shmea::GLogger logger;
+
 	shmea::GString PORT;
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
@@ -72,7 +76,6 @@ public:
 	const shmea::GString getPort();
 	int openServerConnection();
 	int openClientConnection(const shmea::GString&);
-	shmea::GString reader(const int&);
 	void readConnection(Connection*, const int&, std::vector<shmea::ServiceData*>&);
 	void readConnectionHelper(Connection*, const int&, std::vector<shmea::ServiceData*>&);
 	int writeConnection(const Connection*, const int&, shmea::ServiceData*);

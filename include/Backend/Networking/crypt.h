@@ -56,6 +56,7 @@ public:
 
 	void encrypt(const char*, int64_t, unsigned int);
 	void decrypt(const int64_t*, int64_t, unsigned int);
+	void decryptHeader(const shmea::GString&, int64_t);
 
 	~Crypt()
 	{
