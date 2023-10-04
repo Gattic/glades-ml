@@ -369,7 +369,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 	if (runType == RUN_TRAIN)
 	{
 		// Start with the last output layer
-		int cOutputLayerCounter = meat->getLayersSize();
+		int cOutputLayerCounter = meat->getLayersSize()-1;
 		BackPropagation(inputRowCounter, cOutputLayerCounter - 1, cOutputLayerCounter, 0, 0);
 
 		// Save the autotuning data

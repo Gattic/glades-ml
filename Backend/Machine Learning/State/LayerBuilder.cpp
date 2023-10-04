@@ -240,7 +240,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	unsigned int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	// Base case and Error case
-	if (cOutputLayerCounter > layers.size())
+	if (cOutputLayerCounter >= layers.size())
 		return NULL;
 
 	if (cInputLayerCounter >= layers.size())
@@ -265,7 +265,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 		return NULL;
 
 	// Current Output Layer
-	Layer* cOutputLayer = layers[cOutputLayerCounter-1];
+	Layer* cOutputLayer = layers[cOutputLayerCounter];
 	if (!cOutputLayer)
 		return NULL;
 
