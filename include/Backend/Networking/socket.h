@@ -51,8 +51,6 @@ private:
 	static const int64_t DEFAULT_KEY = 420l;
 	static const shmea::GString ANYADDR;
 
-	shmea::GLogger logger;
-
 	shmea::GString PORT;
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
@@ -66,14 +64,17 @@ private:
 public:
 	static const shmea::GString LOCALHOST;
 
+	shmea::GPointer<shmea::GLogger> logger;
+
 	Sockets();
-	Sockets(const shmea::GString&);
+	Sockets(const GServer*);
 	~Sockets();
 
 	// functions
 	void initSockets(const shmea::GString&);
 	void closeSockets();
 	const shmea::GString getPort();
+	void setPort(shmea::GString);
 	int openServerConnection();
 	int openClientConnection(const shmea::GString&);
 	void readConnection(Connection*, const int&, std::vector<shmea::ServiceData*>&);
