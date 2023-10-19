@@ -18,7 +18,9 @@
 #define _GSOCKET
 
 #include "../Database/GString.h"
+#include "../Database/GLogger.h"
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <iostream>
 #include <netdb.h>
 #include <pthread.h>
@@ -62,17 +64,19 @@ private:
 public:
 	static const shmea::GString LOCALHOST;
 
+	shmea::GPointer<shmea::GLogger> logger;
+
 	Sockets();
-	Sockets(const shmea::GString&);
+	Sockets(const GServer*);
 	~Sockets();
 
 	// functions
 	void initSockets(const shmea::GString&);
 	void closeSockets();
 	const shmea::GString getPort();
+	void setPort(shmea::GString);
 	int openServerConnection();
 	int openClientConnection(const shmea::GString&);
-	shmea::GString reader(const int&);
 	void readConnection(Connection*, const int&, std::vector<shmea::ServiceData*>&);
 	void readConnectionHelper(Connection*, const int&, std::vector<shmea::ServiceData*>&);
 	int writeConnection(const Connection*, const int&, shmea::ServiceData*);

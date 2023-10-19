@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include "GType.h"
 #include <vector>
+#include <stdarg.h>
 
 namespace shmea {
 
@@ -108,6 +109,7 @@ public:
 	GString toggleCase() const;
 	GString trim() const;
 	GString Stringify() const;
+	static shmea::GString format(const char*, ...);
 
 	// Static helpers
 	static bool isWhitespace(char);

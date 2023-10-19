@@ -18,6 +18,7 @@
 #define _GNET
 
 #include "../Database/GString.h"
+#include "../Database/GLogger.h"
 #include "socket.h"
 #include <errno.h>
 #include <iostream>
@@ -62,7 +63,7 @@ class GServer
 	friend Sockets;
 	friend Service;
 
-	GNet::Sockets* socks;
+	shmea::GPointer<GNet::Sockets> socks;
 
 	// Key is ip address
 	std::map<shmea::GString, Connection*> clientConnections;
@@ -107,6 +108,8 @@ public:
 
 	GServer();
 	~GServer();
+
+	shmea::GPointer<shmea::GLogger> logger;
 
 	void send(shmea::ServiceData*, bool = true, bool = false);
 
