@@ -80,7 +80,7 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInp
 	// Build the output layer
 	buildOutputLayer(skeleton);
 
-	if (layers.size() <= 0)
+	if (layers.size() < 2)
 	{
 		printf("[GQL] Invalid data format[1] %s\n", skeleton->getName().c_str());
 		return false;
@@ -153,6 +153,7 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 				inputLayers.push_back(cLayer);
 		}
 	}
+	layers.push_back(inputLayers[0]); // dummy slot
 }
 
 void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
@@ -185,9 +186,14 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 			{
 				isPositive = true;
 				i = -1;
-				for (unsigned int j = 0; j < layers.size(); ++j)
-					delete layers[j];
-				layers.clear();
+				//for (unsigned int j = 0; j < layers.size(); ++j)
+					//delete layers[j];
+				while(layers.size() > 1)
+				{
+					//delete layers[0];
+					layers.erase(layers.begin());
+				}
+				//layers.clear();
 				continue;
 			}
 
@@ -244,7 +250,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 
 	// Current Input Layer
 	Layer* cInputLayer = NULL;
-	if ((cInputLayerCounter == 0) && (cOutputLayerCounter == 0))
+	if (cInputLayerCounter == 0)
 		cInputLayer = inputLayers[inputRowCounter];
 	else
 		cInputLayer = layers[cInputLayerCounter];
@@ -321,7 +327,15 @@ unsigned int glades::LayerBuilder::getInputLayersSize() const
 	return inputLayers.size();
 }
 
-unsigned int glades::LayerBuilder::getLayersSize() const
+unsigned int glades::LayerBuilder::getLayerSize(unsigned int newIndex) const
+{
+	if (newIndex >= layers.size())
+		return 0;
+
+	return layers[newIndex]->size();
+}
+
+unsigned int glades::LayerBuilder::numLayers() const
 {
 	return layers.size();
 }
@@ -349,7 +363,7 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 		return;
 
 	// Standardize the initialization of the weights
-	if (getLayersSize() <= 0)
+	if (layers.size() <= 0)
 		return;
 
 	// Set the min and max of the weights
@@ -360,8 +374,8 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 	int outputType = skeleton->getOutputType();
 	bool isPositive = false;
 
-	// iterate through the layers
-	for (unsigned int i = 0; i < getLayersSize(); ++i)
+	// iterate through the layers (skip the input layer)
+	for (unsigned int i = 1; i < layers.size(); ++i)
 	{
 		// Check layer vars
 		int activationType = skeleton->getActivationType(i);
@@ -399,8 +413,8 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 	if (xRange <= 0.0f)
 		return;
 
-	// iterate through the layers
-	for (unsigned int i = 0; i < getLayersSize(); ++i)
+	// iterate through the layers (skip the input layer)
+	for (unsigned int i = 1; i < layers.size(); ++i)
 	{
 
 		// iterate through the nodes
@@ -431,7 +445,7 @@ void glades::LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float p
 										   const std::vector<float>& pHidden)
 {
 	// Invalid arg
-	if (layers.size() - 1 != pHidden.size())
+	if (layers.size() - 2 != pHidden.size())
 		return;
 
 	if (inputRowCounter >= inputLayers.size())
@@ -444,8 +458,8 @@ void glades::LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float p
 	// Input layer
 	cInputLayer->generateDropout(pInput);
 
-	// Hidden layers dropout
-	for (unsigned int i = 0; i < layers.size(); ++i)
+	// Hidden layers dropout (skip the input layer)
+	for (unsigned int i = 1; i < layers.size(); ++i)
 	{
 		if (layers[i]->getType() == Layer::OUTPUT_TYPE)
 			continue;
@@ -457,7 +471,8 @@ void glades::LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float p
 
 void glades::LayerBuilder::clearDropout()
 {
-	for (unsigned int i = 0; i < layers.size(); ++i)
+	// Skip the input layer
+	for (unsigned int i = 1; i < layers.size(); ++i)
 		layers[i]->clearDropout();
 }
 
@@ -494,7 +509,7 @@ void glades::LayerBuilder::print(const NNInfo* skeleton, bool override) const
 	if (override)
 	{
 		printf("[GQL] Network\n");
-		for (unsigned int i = 0; i < layers.size(); ++i)
+		for (unsigned int i = 1; i < layers.size(); ++i)
 		{
 			printf("%d [%d]: ", i + 1, layers[i]->getType());
 			layers[i]->print();
@@ -611,7 +626,7 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 	// Save all the layers in a
 	shmea::GTable layerTable(',', layerHeaders);
 	shmea::GTable edgeTable(',', edgeHeaders);
-	for (unsigned int layerIdx = 0; layerIdx < getLayersSize(); ++layerIdx)
+	for (unsigned int layerIdx = 0; layerIdx < layers.size(); ++layerIdx)
 	{
 		Layer* layer = layers[layerIdx];
 		if (!layer)
