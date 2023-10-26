@@ -35,24 +35,24 @@ class GLogger
 private:
 	// Keys are categories
 	int printLevel;
-	shmea::GList infoKeys;
 	shmea::GList verboseKeys;
 	shmea::GList debugKeys;
+	shmea::GList infoKeys;
 	shmea::GList warningKeys;
 	shmea::GList errorKeys;
 	shmea::GList fatalKeys;
 	// The above and below lists are aligned
-	shmea::GList infoLog;
 	shmea::GList verboseLog;
 	shmea::GList debugLog;
+	shmea::GList infoLog;
 	shmea::GList warningLog;
 	shmea::GList errorLog;
 	shmea::GList fatalLog;
 
 	// override variables to disable specific output
-	bool surpressInfo;
 	bool surpressVerbose;
 	bool surpressDebug;
+	bool surpressInfo;
 	bool surpressWarning;
 	bool surpressError;
 	bool surpressFatal;
@@ -60,12 +60,20 @@ private:
 public:
 
 	const static int LOG_NONE = -1;
-	const static int LOG_INFO = 0;
-	const static int LOG_VERBOSE = 1;
-	const static int LOG_DEBUG = 2;
+	const static int LOG_VERBOSE = 0;
+	const static int LOG_DEBUG = 1;
+	const static int LOG_INFO = 2;
 	const static int LOG_WARNING = 3;
 	const static int LOG_ERROR = 4;
 	const static int LOG_FATAL = 5;
+
+	const static char LOG_VERBOSE_SYMBOL = 'v';
+	const static char LOG_DEBUG_SYMBOL = 'd';
+	const static char LOG_INFO_SYMBOL = 'i';
+	const static char LOG_WARNING_SYMBOL = 'W';
+	const static char LOG_ERROR_SYMBOL = 'E';
+	const static char LOG_FATAL_SYMBOL = 'F';
+	static const shmea::GString LOG_SYMBOLS;
 
 	GLogger();
 	GLogger(int);
@@ -80,10 +88,12 @@ public:
 	void unsurpress(int);
 	bool surpressCheck(int) const;
 
+	shmea::GString getDateTime() const;
+	shmea::GString generateLogFName() const;
 	void log(int, shmea::GString, shmea::GString);
-	void info(shmea::GString, shmea::GString);
 	void verbose(shmea::GString, shmea::GString);
 	void debug(shmea::GString, shmea::GString);
+	void info(shmea::GString, shmea::GString);
 	void warning(shmea::GString, shmea::GString);
 	void error(shmea::GString, shmea::GString);
 	void fatal(shmea::GString, shmea::GString);
