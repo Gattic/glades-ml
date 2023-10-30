@@ -501,7 +501,7 @@ void glades::LayerBuilder::print(const NNInfo* skeleton, bool override) const
 		skeleton->print();
 	else
 	{
-		printf("[GQL] Hidden Layers (%ld)\n", layers.size() - 1); // minus the output layer
+		printf("[GQL] Hidden Layers (%ld)\n", layers.size() - 2); // minus the output layer
 		printf("[GQL] Output Layer Size (%d)\n", layers[layers.size() - 1]->size());
 	}
 
