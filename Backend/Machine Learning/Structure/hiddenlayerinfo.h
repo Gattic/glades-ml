@@ -33,36 +33,14 @@ namespace glades {
 
 class HiddenLayerInfo : public LayerInfo
 {
-private:
-	float learningRate;
-	float momentumFactor;
-	float weightDecay;
-	float pHidden;
-	int activationType;
-	float activationParam;
-
 public:
 	HiddenLayerInfo(int, float, float, float, float, int, float);
-	~HiddenLayerInfo();
-
-	void copyParamsFrom(const HiddenLayerInfo*);
+	virtual ~HiddenLayerInfo();
 
 	// gets
-	float getLearningRate() const;
-	float getMomentumFactor() const;
-	float getWeightDecay() const;
-	float getPHidden() const;
-	int getActivationType() const;
-	float getActivationParam() const;
 	shmea::GList getGTableRow() const;
 
 	// sets
-	void setLearningRate(float);
-	void setMomentumFactor(float);
-	void setWeightDecay(float);
-	void setPHidden(float);
-	void setActivationType(int);
-	void setActivationParam(float);
 
 	int getLayerType() const;
 };

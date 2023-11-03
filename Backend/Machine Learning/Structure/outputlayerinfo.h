@@ -37,7 +37,7 @@ public:
 	static const int CLASSIFICATION = 1;
 
 	OutputLayerInfo(int, int);
-	~OutputLayerInfo();
+	virtual ~OutputLayerInfo();
 
 	// gets
 	int getOutputType() const;

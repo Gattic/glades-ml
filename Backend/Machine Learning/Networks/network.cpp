@@ -347,7 +347,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 	// New Dropout probabilities
 	std::vector<float> pHiddenVec;
 	for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
-		pHiddenVec.push_back(skeleton->getPHidden(i));
+		pHiddenVec.push_back(skeleton->getPDropout(i));
 	meat->scrambleDropout(inputRowCounter, skeleton->getPInput(), pHiddenVec);
 
 	// Reset the results
@@ -355,18 +355,20 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 	nbRecord.clear();
 
 	// Forward Pass and trigger events
-	ForwardPass(inputRowCounter, 0, 0, 0, 0);
+	ForwardPass(inputRowCounter, 0, 1, 0, 0);
 
 	// Add current results to cmatrix for accuracy vars
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 		(skeleton->getOutputType() == GMath::KL))
 		confusionMatrix->addResult(results);
 
+	printf("-------------------------------\n");
+
 	// Back Propagation and trigger events
 	if (runType == RUN_TRAIN)
 	{
 		// Start with the last output layer
-		int cOutputLayerCounter = meat->getLayersSize() - 1;
+		int cOutputLayerCounter = meat->getLayersSize();
 		BackPropagation(inputRowCounter, cOutputLayerCounter - 1, cOutputLayerCounter, 0, 0);
 
 		// Save the autotuning data
@@ -391,6 +393,8 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		// Clear past dropout state
 		meat->clearDropout();
 	}
+
+	printf("=========================================\n");
 }
 
 void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
@@ -402,6 +406,9 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 									 cInputNodeCounter, cOutputNodeCounter);
 	if (!netState)
 		return;
+
+	printf("ForwardPass: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
+		   cInputNodeCounter, cOutputNodeCounter);
 
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
@@ -430,8 +437,9 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
 
 		// Set Our prediction based on the cOutputNode activation
-		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
-		float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
+		printf("cInputLayerCounter: %d\n", cInputLayerCounter);
+		int cActivationFx = skeleton->getActivationType(0);
+		float cActivationParam = skeleton->getActivationParam(0);
 		cOutputLayerActivation =
 			GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
 		netState->cOutputNode->setWeight(cOutputLayerActivation);
@@ -513,6 +521,9 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	if (!netState)
 		return;
 
+	printf("BackPropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter,
+		   cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+
 	// Output Layer Error Derivative Calculation
 	float cOutputDer = 1.0f; // Output der is linear so its 1
 	if (netState->cOutputLayer->getType() == Layer::OUTPUT_TYPE)
@@ -530,7 +541,7 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	else if (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE)
 	{
 		// Activation error derivative
-		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
+		int cActivationFx = skeleton->getActivationType(0);
 		cOutputDer =
 			GMath::activationErrDer(netState->cOutputNode->getWeight(), cActivationFx, 0.01f);
 	}
@@ -549,10 +560,11 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 			netState->cOutputNode->clearErrDer();
 
 		// MSE applied through gradient descent
-		float learningRate = skeleton->getLearningRate(cInputLayerCounter);
-		float momentumFactor = skeleton->getMomentumFactor(cInputLayerCounter);
-		float weightDecay = skeleton->getWeightDecay(cInputLayerCounter);
+		float learningRate = skeleton->getLearningRate(0);
+		float momentumFactor = skeleton->getMomentumFactor(0);
+		float weightDecay = skeleton->getWeightDecay(0);
 		float baseError = learningRate * cOutNetErrDer;
+		printf("cInputLayerCounter: %d\n", cInputLayerCounter);
 
 		// Add the weight delta
 		netState->cOutputNode->getDelta(cInputNodeCounter, baseError,
@@ -578,7 +590,7 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	netState->cInputNode->setErrDer(cOutputNodeCounter, cInNetErrDer);
 
 	// Recursive Calls
-	if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
+	/*if ((cInputNodeCounter == netState->cInputLayer->size() - 1) &&
 		(cOutputNodeCounter == netState->cOutputLayer->size() - 1))
 	{
 		// Next Input Layer
@@ -598,6 +610,24 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		// Next Output Node
 		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter,
 						cOutputNodeCounter + 1);
+	}*/
+
+	if (cOutputNodeCounter < netState->cOutputLayer->size() - 1)
+	{
+		// Next Output Node
+		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter,
+						cOutputNodeCounter + 1);
+	}
+	else if (cInputNodeCounter < netState->cInputLayer->size() - 1)
+	{
+		// Next Input Node
+		BackPropagation(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
+						cInputNodeCounter + 1, 0);
+	}
+	else if(cOutputLayerCounter > 1)
+	{
+		// Next Input Layer
+		BackPropagation(inputRowCounter, cInputLayerCounter - 1, cInputLayerCounter, 0, 0);
 	}
 
 	delete netState;

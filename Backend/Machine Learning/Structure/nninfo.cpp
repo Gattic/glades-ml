@@ -142,7 +142,7 @@ float glades::NNInfo::getPInput() const
 	if (!inputLayer)
 		return 0.0f;
 
-	return inputLayer->getDropoutRate();
+	return inputLayer->getPDropout();
 }
 
 /*!
@@ -279,7 +279,7 @@ float glades::NNInfo::getWeightDecay(unsigned int index) const
  * @param index the layer index
  * @return the NNInfo's hidden layer dropout rate
  */
-float glades::NNInfo::getPHidden(unsigned int index) const
+float glades::NNInfo::getPDropout(unsigned int index) const
 {
 	if (index >= layers.size())
 		return 1.0f;
@@ -287,7 +287,7 @@ float glades::NNInfo::getPHidden(unsigned int index) const
 	if (!layers[index])
 		return 1.0f;
 
-	return layers[index]->getPHidden();
+	return layers[index]->getPDropout();
 }
 
 /*!
@@ -336,7 +336,7 @@ void glades::NNInfo::print() const
 	headers.push_back("lrnRate");
 	headers.push_back("mFactor");
 	headers.push_back("wDecay");
-	headers.push_back("pHidden");
+	headers.push_back("pDropout");
 	headers.push_back("actvtn");
 	headers.push_back("actParam");
 	headers.push_back("cost");
@@ -407,7 +407,7 @@ void glades::NNInfo::setPInput(float newPInput)
 	if (!inputLayer)
 		return;
 
-	inputLayer->setDropoutRate(newPInput);
+	inputLayer->setPDropout(newPInput);
 }
 
 /*!
@@ -515,9 +515,9 @@ void glades::NNInfo::setWeightDecay(unsigned int index, float newWeightDecay)
  * @brief set the p hidden
  * @details set the dropout rate for hidden layer index
  * @param index the layer index
- * @param newPHidden the desired input dropout rate
+ * @param newPDropout the desired input dropout rate
  */
-void glades::NNInfo::setPHidden(unsigned int index, float newPHidden)
+void glades::NNInfo::setPDropout(unsigned int index, float newPDropout)
 {
 	if (index >= layers.size())
 		return;
@@ -525,7 +525,7 @@ void glades::NNInfo::setPHidden(unsigned int index, float newPHidden)
 	if (!layers[index])
 		return;
 
-	layers[index]->setPHidden(newPHidden);
+	layers[index]->setPDropout(newPDropout);
 }
 
 /*!
@@ -616,7 +616,7 @@ shmea::GTable glades::NNInfo::toGTable() const
 	headers.push_back("learningRate");
 	headers.push_back("momentumFactor");
 	headers.push_back("weightDecay");
-	headers.push_back("pHidden");
+	headers.push_back("pDropout");
 	headers.push_back("activationType");
 	headers.push_back("activationParam");
 	headers.push_back("outputType");
@@ -646,8 +646,7 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 		if (i == 0)
 		{
 			// Input Layer
-			inputLayer = new InputLayerInfo(newTable.getCell(i, COL_PINPUT).getFloat(),
-											newTable.getCell(i, COL_BATCH_SIZE).getLong());
+			inputLayer = new InputLayerInfo(newTable.getCell(i, COL_BATCH_SIZE).getLong());
 		}
 		else if (i == newTable.numberOfRows() - 1)
 		{
@@ -663,7 +662,7 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
 									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
 									newTable.getCell(i, COL_WEIGHT_DECAY).getFloat(),
-									newTable.getCell(i, COL_PHIDDEN).getFloat(),
+									newTable.getCell(i, COL_PDROPOUT).getFloat(),
 									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
 									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());
 			layers.push_back(newLayer);
