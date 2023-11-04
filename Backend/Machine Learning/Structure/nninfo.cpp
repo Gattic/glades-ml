@@ -160,6 +160,16 @@ int glades::NNInfo::getBatchSize() const
 }
 
 /*!
+ * @brief get input layer
+ * @details get NNInfo's input layer
+ * @return the NNInfo's input layer
+ */
+InputLayerInfo* glades::NNInfo::getInputLayer() const
+{
+	return inputLayer;
+}
+
+/*!
  * @brief get layers
  * @details get NNInfo's layers
  * @return the NNInfo's layers, a vector where index `i` is the number of neurons in the `i`th layer
@@ -611,7 +621,6 @@ shmea::GTable glades::NNInfo::toGTable() const
 {
 	std::vector<shmea::GString> headers;
 	headers.push_back("Size");
-	headers.push_back("pInput");
 	headers.push_back("batchSize");
 	headers.push_back("learningRate");
 	headers.push_back("momentumFactor");

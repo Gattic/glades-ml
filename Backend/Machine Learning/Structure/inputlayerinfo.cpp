@@ -65,11 +65,13 @@ shmea::GList glades::InputLayerInfo::getGTableRow() const
 	// -1 = "blank"/placeholder
 	row.addLong(-1);
 	row.addLong(getBatchSize());
-	for (int i = 0; i < 4; ++i)
-		row.addFloat(-1.0f);
-	row.addLong(-1);
-	row.addFloat(-1.0f);
-	row.addLong(-1);
+	row.addFloat(learningRate);
+	row.addFloat(momentumFactor);
+	row.addFloat(weightDecay);
+	row.addFloat(pDropout);
+	row.addLong(activationType);
+	row.addFloat(activationParam);
+	row.addLong(-1);//no output type for input layer
 
 	return row;
 }

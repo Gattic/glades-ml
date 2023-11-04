@@ -88,6 +88,7 @@ public:
 	int getOutputType() const;
 	float getPInput() const;
 	int getBatchSize() const;
+	InputLayerInfo* getInputLayer() const;
 	std::vector<HiddenLayerInfo*> getLayers() const;
 	int numHiddenLayers() const;
 	int getInputLayerSize() const;
