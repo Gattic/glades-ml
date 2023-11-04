@@ -33,7 +33,7 @@ private:
 	int batchSize;
 
 public:
-	InputLayerInfo(int);
+	InputLayerInfo(int, float, float, float, float, int, float);
 	virtual ~InputLayerInfo();
 
 	// gets

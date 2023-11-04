@@ -362,7 +362,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		(skeleton->getOutputType() == GMath::KL))
 		confusionMatrix->addResult(results);
 
-	printf("-------------------------------\n");
+	//printf("-------------------------------\n");
 
 	// Back Propagation and trigger events
 	if (runType == RUN_TRAIN)
@@ -394,7 +394,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		meat->clearDropout();
 	}
 
-	printf("=========================================\n");
+	//printf("=========================================\n");
 }
 
 void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
@@ -407,8 +407,8 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 	if (!netState)
 		return;
 
-	printf("ForwardPass: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
-		   cInputNodeCounter, cOutputNodeCounter);
+	//printf("ForwardPass: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
+		   //cInputNodeCounter, cOutputNodeCounter);
 
 	// Does Dropout occur?
 	bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
@@ -437,9 +437,8 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
 
 		// Set Our prediction based on the cOutputNode activation
-		printf("cInputLayerCounter: %d\n", cInputLayerCounter);
-		int cActivationFx = skeleton->getActivationType(0);
-		float cActivationParam = skeleton->getActivationParam(0);
+		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
+		float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
 		cOutputLayerActivation =
 			GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
 		netState->cOutputNode->setWeight(cOutputLayerActivation);
@@ -521,8 +520,8 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	if (!netState)
 		return;
 
-	printf("BackPropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter,
-		   cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+	//printf("BackPropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter,
+		   //cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
 
 	// Output Layer Error Derivative Calculation
 	float cOutputDer = 1.0f; // Output der is linear so its 1
@@ -541,7 +540,7 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	else if (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE)
 	{
 		// Activation error derivative
-		int cActivationFx = skeleton->getActivationType(0);
+		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
 		cOutputDer =
 			GMath::activationErrDer(netState->cOutputNode->getWeight(), cActivationFx, 0.01f);
 	}
@@ -560,11 +559,10 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 			netState->cOutputNode->clearErrDer();
 
 		// MSE applied through gradient descent
-		float learningRate = skeleton->getLearningRate(0);
-		float momentumFactor = skeleton->getMomentumFactor(0);
-		float weightDecay = skeleton->getWeightDecay(0);
+		float learningRate = skeleton->getLearningRate(cInputLayerCounter);
+		float momentumFactor = skeleton->getMomentumFactor(cInputLayerCounter);
+		float weightDecay = skeleton->getWeightDecay(cInputLayerCounter);
 		float baseError = learningRate * cOutNetErrDer;
-		printf("cInputLayerCounter: %d\n", cInputLayerCounter);
 
 		// Add the weight delta
 		netState->cOutputNode->getDelta(cInputNodeCounter, baseError,

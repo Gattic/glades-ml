@@ -26,9 +26,19 @@ using namespace glades;
  * @param newSize the InputLayerInfo object's desired size
  * @param newDropout the dropout rate for the input layer
  */
-glades::InputLayerInfo::InputLayerInfo(int newBatchSize) : LayerInfo(0)
+glades::InputLayerInfo::InputLayerInfo(int newBatchSize,
+    float newLearningRate, float newMomentumFactor,
+    float newWeightDecay, float newPDropout,
+    int newActivationType, float newActivationParam)
+	: LayerInfo(0)
 {
 	batchSize = newBatchSize;
+	learningRate = newLearningRate;
+	momentumFactor = newMomentumFactor;
+	weightDecay = newWeightDecay;
+	pDropout = newPDropout;
+	activationType = newActivationType;
+	activationParam = newActivationParam;
 }
 
 /*!
