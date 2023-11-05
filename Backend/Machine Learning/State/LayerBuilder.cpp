@@ -326,6 +326,17 @@ unsigned int glades::LayerBuilder::getLayersSize() const
 	return layers.size();
 }
 
+unsigned int glades::LayerBuilder::getLayerSize(unsigned int index) const
+{
+    if(index > layers.size()+1)
+	return 0;
+
+    if(index == 0)
+	return inputLayers[0]->size();
+	
+    return layers[index-1]->size();
+}
+
 float glades::LayerBuilder::getTimeState(unsigned int cLayerCounter, unsigned int cNodeCounter,
 										 unsigned int cEdgeCounter) const
 {
