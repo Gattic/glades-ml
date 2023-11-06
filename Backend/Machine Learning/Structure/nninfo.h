@@ -63,16 +63,16 @@ public:
 	static const int BATCH_FULL = 0;
 	static const int BATCH_STOCHASTIC = 1;
 
-	// structure: size, pInput, batchSize, learningRate, momentumFactor, weightDecay, pHidden,
+	// structure: size, pInput, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout,
 	// activationType,
 	// activationParam, outputType
 	static const int COL_SIZE = 0;
-	static const int COL_PINPUT = 1;
-	static const int COL_BATCH_SIZE = 2;
-	static const int COL_LEARNING_RATE = 3;
-	static const int COL_MOMENTUM_FACTOR = 4;
-	static const int COL_WEIGHT_DECAY = 5;
-	static const int COL_PHIDDEN = 6;
+	static const int COL_BATCH_SIZE = 1;
+	static const int COL_LEARNING_RATE = 2;
+	static const int COL_MOMENTUM_FACTOR = 3;
+	static const int COL_WEIGHT_DECAY1 = 4;
+	static const int COL_WEIGHT_DECAY2 = 5;
+	static const int COL_PDROPOUT = 6;
 	static const int COL_ACTIVATION_TYPE = 7;
 	static const int COL_ACTIVATION_PARAM = 8;
 	static const int COL_OUTPUT_TYPE = 9;
@@ -89,6 +89,7 @@ public:
 	int getOutputType() const;
 	float getPInput() const;
 	int getBatchSize() const;
+	InputLayerInfo* getInputLayer() const;
 	std::vector<HiddenLayerInfo*> getLayers() const;
 	int numHiddenLayers() const;
 	int getInputLayerSize() const;
@@ -96,8 +97,9 @@ public:
 	unsigned int getOutputLayerSize() const;
 	float getLearningRate(unsigned int) const;
 	float getMomentumFactor(unsigned int) const;
-	float getWeightDecay(unsigned int) const;
-	float getPHidden(unsigned int) const;
+	float getWeightDecay1(unsigned int) const;
+	float getWeightDecay2(unsigned int) const;
+	float getPDropout(unsigned int) const;
 	int getActivationType(unsigned int) const;
 	float getActivationParam(unsigned int) const;
 	void print() const;
@@ -112,8 +114,9 @@ public:
 	void setLayers(const std::vector<HiddenLayerInfo*>&);
 	void setLearningRate(unsigned int, float);
 	void setMomentumFactor(unsigned int, float);
-	void setWeightDecay(unsigned int, float);
-	void setPHidden(unsigned int, float);
+	void setWeightDecay1(unsigned int, float);
+	void setWeightDecay2(unsigned int, float);
+	void setPDropout(unsigned int, float);
 	void setActivationType(unsigned int, int);
 	void setActivationParam(unsigned int, float);
 	void addHiddenLayer(HiddenLayerInfo*);

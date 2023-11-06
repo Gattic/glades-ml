@@ -236,7 +236,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	unsigned int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
 	// Base case and Error case
-	if (cOutputLayerCounter >= layers.size())
+	if (cOutputLayerCounter > layers.size())
 		return NULL;
 
 	if (cInputLayerCounter >= layers.size())
@@ -244,10 +244,10 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 
 	// Current Input Layer
 	Layer* cInputLayer = NULL;
-	if ((cInputLayerCounter == 0) && (cOutputLayerCounter == 0))
+	if (cInputLayerCounter == 0)
 		cInputLayer = inputLayers[inputRowCounter];
 	else
-		cInputLayer = layers[cInputLayerCounter];
+		cInputLayer = layers[cInputLayerCounter-1];
 	if (!cInputLayer)
 		return NULL;
 
@@ -261,7 +261,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 		return NULL;
 
 	// Current Output Layer
-	Layer* cOutputLayer = layers[cOutputLayerCounter];
+	Layer* cOutputLayer = layers[cOutputLayerCounter-1];
 	if (!cOutputLayer)
 		return NULL;
 
@@ -324,6 +324,17 @@ unsigned int glades::LayerBuilder::getInputLayersSize() const
 unsigned int glades::LayerBuilder::getLayersSize() const
 {
 	return layers.size();
+}
+
+unsigned int glades::LayerBuilder::getLayerSize(unsigned int index) const
+{
+    if(index > layers.size()+1)
+	return 0;
+
+    if(index == 0)
+	return inputLayers[0]->size();
+	
+    return layers[index-1]->size();
 }
 
 float glades::LayerBuilder::getTimeState(unsigned int cLayerCounter, unsigned int cNodeCounter,

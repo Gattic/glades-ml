@@ -81,17 +81,14 @@ bool glades::saveNeuralNetwork(glades::NNetwork* newNet)
  */
 glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput, Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
-	printf("CHIRP\n");
 	if (!networkInfo)
 		return NULL;
 
 	// metanetwork for aggregation
 	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(networkInfo->getName());
 
-	printf("DERP\n");
 	// Add the Neural Network
 	cMetaNetwork->addSubnet(networkInfo);
-	printf("HERP: %d\n", cMetaNetwork->getSubnets().size());
 
 	// Train the Neural Network
 	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();

@@ -31,8 +31,15 @@ namespace glades {
 
 class LayerInfo
 {
-private:
+protected:
 	int lSize;
+	float learningRate;
+	float momentumFactor;
+	float weightDecay1;
+	float weightDecay2;
+	float pDropout;
+	int activationType;
+	float activationParam;
 
 public:
 	static const int INPUT = 0;
@@ -42,12 +49,28 @@ public:
 	LayerInfo(int);
 	virtual ~LayerInfo();
 
+	void copyParamsFrom(const LayerInfo*);
+
 	// gets
 	unsigned int size() const;
+	float getLearningRate() const;
+	float getMomentumFactor() const;
+	float getWeightDecay1() const;
+	float getWeightDecay2() const;
+	float getPDropout() const;
+	int getActivationType() const;
+	float getActivationParam() const;
 	virtual shmea::GList getGTableRow() const = 0;
 
 	// sets
 	void setSize(int);
+	void setLearningRate(float);
+	void setMomentumFactor(float);
+	void setWeightDecay1(float);
+	void setWeightDecay2(float);
+	void setPDropout(float);
+	void setActivationType(int);
+	void setActivationParam(float);
 
 	// type
 	virtual int getLayerType() const = 0;

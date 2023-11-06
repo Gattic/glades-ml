@@ -86,9 +86,9 @@ private:
 	shmea::GList results;
 	shmea::GTable nbRecord;
 
-	void SGDHelper(unsigned int, int, int); // Stochastic Gradient Descent
+	void SGDHelper(unsigned int, int); // Stochastic Gradient Descent
 
-	void ForwardPass(unsigned int, int, int, int, unsigned int, unsigned int);
+	void ForwardPass(unsigned int, int, int, unsigned int, unsigned int);
 	void BackPropagation(unsigned int, int, int, unsigned int, unsigned int);
 
 public:
