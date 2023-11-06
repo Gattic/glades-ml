@@ -29,14 +29,15 @@ using namespace glades;
  * @param newActivationType the activation type for the hidden layer
  */
 glades::HiddenLayerInfo::HiddenLayerInfo(int newSize, float newLearningRate,
-										 float newMomentumFactor, float newWeightDecay,
-										 float newPDropout, int newActivationType,
-										 float newActivationParam)
+    float newMomentumFactor, float newWeightDecay1, float newWeightDecay2,
+    float newPDropout, int newActivationType,
+    float newActivationParam)
 	: LayerInfo(newSize)
 {
 	learningRate = newLearningRate;
 	momentumFactor = newMomentumFactor;
-	weightDecay = newWeightDecay;
+	weightDecay1 = newWeightDecay1;
+	weightDecay2 = newWeightDecay2;
 	pDropout = newPDropout;
 	activationType = newActivationType;
 	activationParam = newActivationParam;
@@ -50,7 +51,8 @@ glades::HiddenLayerInfo::~HiddenLayerInfo()
 {
 	learningRate = 0.0f;
 	momentumFactor = 0.0f;
-	weightDecay = 0.0f;
+	weightDecay1 = 0.0f;
+	weightDecay2 = 0.0f;
 	pDropout = 0.0f;
 	activationType = 0;
 	activationParam = 0;
@@ -64,14 +66,15 @@ glades::HiddenLayerInfo::~HiddenLayerInfo()
 shmea::GList glades::HiddenLayerInfo::getGTableRow() const
 {
 	shmea::GList row;
-	// structure: size, batchSize, learningRate, momentumFactor, weightDecay, pDropout, activationType,
+	// structure: size, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout, activationType,
 	// activationParam, outputType
 	// -1 = "blank"/placeholder
 	row.addLong(size());
 	row.addLong(1);
 	row.addFloat(getLearningRate());
 	row.addFloat(getMomentumFactor());
-	row.addFloat(getWeightDecay());
+	row.addFloat(getWeightDecay1());
+	row.addFloat(getWeightDecay2());
 	row.addFloat(getPDropout());
 	row.addLong(getActivationType());
 	row.addFloat(getActivationParam());

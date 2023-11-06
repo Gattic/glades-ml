@@ -287,7 +287,7 @@ void glades::Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
 }
 
 void glades::Node::getDelta(unsigned int index, float baseError, float cInputNodeWeight,
-							float learningRate, float momentumFactor, float weightDecay)
+							float learningRate, float momentumFactor, float weightDecay1, float weightDecay2)
 {
 	if (index >= edges.size())
 		return;
@@ -295,7 +295,8 @@ void glades::Node::getDelta(unsigned int index, float baseError, float cInputNod
 	// calculate the optimized delta rule
 	float deltaW =
 		((baseError * cInputNodeWeight) + (momentumFactor * getLastPrevDelta(index)) // momentum
-		 + (weightDecay * learningRate * cInputNodeWeight));						 // weight decay
+		 + (weightDecay1 * learningRate * abs(cInputNodeWeight)) // weight decay L1
+		 + (weightDecay2 * learningRate * cInputNodeWeight)); // weight decay L2
 
 	// Add the new PrevDelta
 	addPrevDelta(index, deltaW);

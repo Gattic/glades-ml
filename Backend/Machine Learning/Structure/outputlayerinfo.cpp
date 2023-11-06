@@ -59,13 +59,13 @@ int glades::OutputLayerInfo::getOutputType() const
 shmea::GList glades::OutputLayerInfo::getGTableRow() const
 {
 	shmea::GList row;
-	// structure: size, batchSize, learningRate, momentumFactor, weightDecay, pDropout,
+	// structure: size, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout,
 	// activationType,
 	// activationParam, outputType
 	// -1 = "blank"/placeholder
 	row.addLong(size());
 	row.addLong(1);
-	for (int i = 0; i < 4; ++i)
+	for (int i = 0; i < 5; ++i)
 		row.addFloat(-1.0f);
 	row.addLong(-1);
 	row.addFloat(-1.0f);

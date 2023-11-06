@@ -559,13 +559,14 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 			    // MSE applied through gradient descent
 			    float learningRate = skeleton->getLearningRate(cInputLayerCounter);
 			    float momentumFactor = skeleton->getMomentumFactor(cInputLayerCounter);
-			    float weightDecay = skeleton->getWeightDecay(cInputLayerCounter);
+			    float weightDecay1 = skeleton->getWeightDecay1(cInputLayerCounter);
+			    float weightDecay2 = skeleton->getWeightDecay2(cInputLayerCounter);
 			    float baseError = learningRate * cOutNetErrDer;
 
 			    // Add the weight delta
 			    netState->cOutputNode->getDelta(cInputNodeCounter, baseError,
 											    netState->cInputNode->getWeight(), learningRate,
-											    momentumFactor, weightDecay);
+											    momentumFactor, weightDecay1, weightDecay2);
 
 			    // Apply all deltas if we've hit the minibatch size
 			    if ((inputRowCounter % minibatchSize) == 0)

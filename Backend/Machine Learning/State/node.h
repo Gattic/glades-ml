@@ -90,7 +90,7 @@ public:
 	// weights functions
 	void initWeights(unsigned int, int);
 	void initWeights(unsigned int, float[], unsigned int, int, int);
-	void getDelta(unsigned int, float, float, float, float, float);
+	void getDelta(unsigned int, float, float, float, float, float, float);
 	void applyDeltas(unsigned int, int);
 };
 };

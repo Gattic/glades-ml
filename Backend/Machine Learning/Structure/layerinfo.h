@@ -35,7 +35,8 @@ protected:
 	int lSize;
 	float learningRate;
 	float momentumFactor;
-	float weightDecay;
+	float weightDecay1;
+	float weightDecay2;
 	float pDropout;
 	int activationType;
 	float activationParam;
@@ -54,7 +55,8 @@ public:
 	unsigned int size() const;
 	float getLearningRate() const;
 	float getMomentumFactor() const;
-	float getWeightDecay() const;
+	float getWeightDecay1() const;
+	float getWeightDecay2() const;
 	float getPDropout() const;
 	int getActivationType() const;
 	float getActivationParam() const;
@@ -64,7 +66,8 @@ public:
 	void setSize(int);
 	void setLearningRate(float);
 	void setMomentumFactor(float);
-	void setWeightDecay(float);
+	void setWeightDecay1(float);
+	void setWeightDecay2(float);
 	void setPDropout(float);
 	void setActivationType(int);
 	void setActivationParam(float);

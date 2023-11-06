@@ -34,7 +34,7 @@ namespace glades {
 class HiddenLayerInfo : public LayerInfo
 {
 public:
-	HiddenLayerInfo(int, float, float, float, float, int, float);
+	HiddenLayerInfo(int, float, float, float, float, float, int, float);
 	virtual ~HiddenLayerInfo();
 
 	// gets

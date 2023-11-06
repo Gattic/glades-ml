@@ -272,23 +272,43 @@ float glades::NNInfo::getMomentumFactor(unsigned int index) const
 }
 
 /*!
- * @brief get weight decay
+ * @brief get weight decay L1
  * @details get NNInfo's weight decay
  * @param index the layer index
  * @return the NNInfo's weight decay
  */
-float glades::NNInfo::getWeightDecay(unsigned int index) const
+float glades::NNInfo::getWeightDecay1(unsigned int index) const
 {
 	if (index > layers.size())
 		return 0.0f;
 
 	if(index == 0)
-	    return inputLayer->getWeightDecay();
+	    return inputLayer->getWeightDecay1();
 
 	if (!layers[index-1])
 		return 0.0f;
 
-	return layers[index-1]->getWeightDecay();
+	return layers[index-1]->getWeightDecay1();
+}
+
+/*!
+ * @brief get weight decay L2
+ * @details get NNInfo's weight decay
+ * @param index the layer index
+ * @return the NNInfo's weight decay
+ */
+float glades::NNInfo::getWeightDecay2(unsigned int index) const
+{
+	if (index > layers.size())
+		return 0.0f;
+
+	if(index == 0)
+	    return inputLayer->getWeightDecay1();
+
+	if (!layers[index-1])
+		return 0.0f;
+
+	return layers[index-1]->getWeightDecay2();
 }
 
 /*!
@@ -534,24 +554,46 @@ void glades::NNInfo::setMomentumFactor(unsigned int index, float newMomentumFact
 }
 
 /*!
- * @brief set weight decay
+ * @brief set weight decay L1
  * @details set NNInfo's weight decay
  * @param index the layer index
  * @param newWeightDecay the desired weight decay for this NNInfo object
  */
-void glades::NNInfo::setWeightDecay(unsigned int index, float newWeightDecay)
+void glades::NNInfo::setWeightDecay1(unsigned int index, float newWeightDecay1)
 {
 	if (index > layers.size())
 		return;
 
 	if(index == 0)
-	    inputLayer->setWeightDecay(newWeightDecay);
+	    inputLayer->setWeightDecay1(newWeightDecay1);
 	else
 	{
 	    if (!layers[index-1])
 		    return;
 
-	    layers[index-1]->setWeightDecay(newWeightDecay);
+	    layers[index-1]->setWeightDecay1(newWeightDecay1);
+	}
+}
+
+/*!
+ * @brief set weight decay L2
+ * @details set NNInfo's weight decay
+ * @param index the layer index
+ * @param newWeightDecay the desired weight decay for this NNInfo object
+ */
+void glades::NNInfo::setWeightDecay2(unsigned int index, float newWeightDecay2)
+{
+	if (index > layers.size())
+		return;
+
+	if(index == 0)
+	    inputLayer->setWeightDecay2(newWeightDecay2);
+	else
+	{
+	    if (!layers[index-2])
+		    return;
+
+	    layers[index-2]->setWeightDecay2(newWeightDecay2);
 	}
 }
 
@@ -648,7 +690,7 @@ void glades::NNInfo::copyHiddenLayer(unsigned int dst, unsigned int src)
 
 void glades::NNInfo::resizeHiddenLayers(unsigned int newCount)
 {
-	layers.resize(newCount, new HiddenLayerInfo(2, 0.01, 0.0, 0.0, 0.0, 0, 0.0));
+	layers.resize(newCount, new HiddenLayerInfo(2, 0.01, 0.0, 0.0, 0.0, 0.0, 0, 0.0));
 }
 
 void glades::NNInfo::removeHiddenLayer(unsigned int index)
@@ -673,7 +715,8 @@ shmea::GTable glades::NNInfo::toGTable() const
 	headers.push_back("batchSize");
 	headers.push_back("learningRate");
 	headers.push_back("momentumFactor");
-	headers.push_back("weightDecay");
+	headers.push_back("weightDecay1");
+	headers.push_back("weightDecay2");
 	headers.push_back("pDropout");
 	headers.push_back("activationType");
 	headers.push_back("activationParam");
@@ -707,7 +750,8 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 			inputLayer = new InputLayerInfo(newTable.getCell(i, COL_BATCH_SIZE).getLong(),//batch size not layer size
 									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
 									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
-									newTable.getCell(i, COL_WEIGHT_DECAY).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
 									newTable.getCell(i, COL_PDROPOUT).getFloat(),
 									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
 									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());
@@ -725,7 +769,8 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 				new HiddenLayerInfo(newTable.getCell(i, COL_SIZE).getInt(),
 									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
 									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
-									newTable.getCell(i, COL_WEIGHT_DECAY).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
 									newTable.getCell(i, COL_PDROPOUT).getFloat(),
 									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
 									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());

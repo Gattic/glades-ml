@@ -28,14 +28,15 @@ using namespace glades;
  */
 glades::InputLayerInfo::InputLayerInfo(int newBatchSize,
     float newLearningRate, float newMomentumFactor,
-    float newWeightDecay, float newPDropout,
+    float newWeightDecay1, float newWeightDecay2, float newPDropout,
     int newActivationType, float newActivationParam)
 	: LayerInfo(0)
 {
 	batchSize = newBatchSize;
 	learningRate = newLearningRate;
 	momentumFactor = newMomentumFactor;
-	weightDecay = newWeightDecay;
+	weightDecay1 = newWeightDecay1;
+	weightDecay2 = newWeightDecay2;
 	pDropout = newPDropout;
 	activationType = newActivationType;
 	activationParam = newActivationParam;
@@ -69,7 +70,7 @@ int glades::InputLayerInfo::getBatchSize() const
 shmea::GList glades::InputLayerInfo::getGTableRow() const
 {
 	shmea::GList row;
-	// structure: size, batchSize, learningRate, momentumFactor, weightDecay, pDropout,
+	// structure: size, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout,
 	// activationType,
 	// activationParam, outputType
 	// -1 = "blank"/placeholder
@@ -77,7 +78,8 @@ shmea::GList glades::InputLayerInfo::getGTableRow() const
 	row.addLong(getBatchSize());
 	row.addFloat(learningRate);
 	row.addFloat(momentumFactor);
-	row.addFloat(weightDecay);
+	row.addFloat(weightDecay1);
+	row.addFloat(weightDecay2);
 	row.addFloat(pDropout);
 	row.addLong(activationType);
 	row.addFloat(activationParam);

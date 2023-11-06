@@ -28,7 +28,8 @@ glades::LayerInfo::LayerInfo(int newSize)
 	lSize = newSize;
 	learningRate = 0.0f;
 	momentumFactor = 0.0f;
-	weightDecay = 0.0f;
+	weightDecay1 = 0.0f;
+	weightDecay2 = 0.0f;
 	pDropout = 0.0f;
 	activationType = 0;
 	activationParam = 0;
@@ -58,7 +59,8 @@ void glades::LayerInfo::copyParamsFrom(const LayerInfo* src)
 	setSize(src->size());
 	learningRate = src->getLearningRate();
 	momentumFactor = src->getMomentumFactor();
-	weightDecay = src->getWeightDecay();
+	weightDecay1 = src->getWeightDecay1();
+	weightDecay2 = src->getWeightDecay2();
 	pDropout = src->getPDropout();
 	activationType = src->getActivationType();
 }
@@ -83,13 +85,23 @@ float glades::LayerInfo::getMomentumFactor() const
 }
 
 /*!
- * @brief get weight decay
+ * @brief get weight decay L1
  * @details get LayerInfo's weight decay
  * @return the LayerInfo's weight decay
  */
-float glades::LayerInfo::getWeightDecay() const
+float glades::LayerInfo::getWeightDecay1() const
 {
-	return weightDecay;
+	return weightDecay1;
+}
+
+/*!
+ * @brief get weight decay L2
+ * @details get LayerInfo's weight decay
+ * @return the LayerInfo's weight decay
+ */
+float glades::LayerInfo::getWeightDecay2() const
+{
+	return weightDecay2;
 }
 
 /*!
@@ -158,9 +170,19 @@ void glades::LayerInfo::setMomentumFactor(float newMomentumFactor)
  * @details set LayerInfo's weight decay
  * @param newWeightDecay the desired weight decay for this LayerInfo object
  */
-void glades::LayerInfo::setWeightDecay(float newWeightDecay)
+void glades::LayerInfo::setWeightDecay1(float newWeightDecay1)
 {
-	weightDecay = newWeightDecay;
+	weightDecay1 = newWeightDecay1;
+}
+
+/*!
+ * @brief set weight decay
+ * @details set LayerInfo's weight decay
+ * @param newWeightDecay the desired weight decay for this LayerInfo object
+ */
+void glades::LayerInfo::setWeightDecay2(float newWeightDecay2)
+{
+	weightDecay2 = newWeightDecay2;
 }
 
 /*!
