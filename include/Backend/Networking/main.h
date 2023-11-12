@@ -115,9 +115,11 @@ public:
 
 	unsigned int addService(Service*);
 	Service* DoService(shmea::GString, shmea::GString = "");
-	Connection* getConnection(shmea::GString);
-	void LaunchInstance(const shmea::GString&, const shmea::GString&);
-	const bool& getRunning();
+	Connection* getConnection(shmea::GString, shmea::GString = "45019");
+	Connection* getConnectionFromName(shmea::GString);
+	void LaunchInstance(const shmea::GString&, const shmea::GString&, const shmea::GString&);
+	const bool& getRunning() const;
+	shmea::GString getPort() const;
 	void stop();
 	void run(shmea::GString, bool);
 	bool isNetworkingDisabled();
@@ -133,6 +135,7 @@ public:
 	GServer* serverInstance;
 	shmea::GString clientName;
 	shmea::GString serverIP;
+	shmea::GString serverPort;
 };
 
 }; // GNet
