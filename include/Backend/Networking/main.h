@@ -70,6 +70,7 @@ class GServer
 	std::map<shmea::GString, Connection*> serverConnections;
 
 	int sockfd;
+	bool cryptEnabled;
 	Connection* localConnection;
 	pthread_t* commandThread;
 	pthread_t* writerThread;
@@ -123,6 +124,9 @@ public:
 	void stop();
 	void run(shmea::GString, bool);
 	bool isNetworkingDisabled();
+	bool isEncryptedByDefault() const;
+	void enableEncryption();
+	void disableEncryption();
 
 	Connection* getLocalConnection();
 	void removeClientConnection(Connection*);
