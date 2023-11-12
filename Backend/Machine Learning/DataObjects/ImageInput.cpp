@@ -18,6 +18,7 @@
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/SaveFolder.h"
 #include "Backend/Database/SaveTable.h"
+#include "../GMath/OHE.h"
 
 using namespace glades;
 
@@ -44,7 +45,6 @@ void ImageInput::import(shmea::GString newName)
     }
 
     // Load training images
-    printf("Rows: %d\n", trainingLegend.numberOfRows());
     for(unsigned int i = 0; i < trainingLegend.numberOfRows(); ++i)
     {
 	shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(i, 1).getInt());
@@ -95,6 +95,32 @@ void ImageInput::import(shmea::GString newName)
 	    //printf("testImages[%s].size() = %lu\n", label.c_str(), testImages[label].size());
 	}
     }
+
+    // TODO FIX!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    // Setup the Classifier object
+    for(unsigned int c = 0; c < trainingLegend.numberOfCols(); ++c)
+    {
+	for(unsigned int r = 0; r < trainingLegend.numberOfRows(); ++r)
+	{
+	    shmea::GString label = trainingLegend.getCell(r, c);
+	    //printf("label = %s\n", label.c_str());
+	}
+	OHE* cOHE = new OHE();
+	featureIsCategorical.push_back(false);
+
+	const shmea::GType& cCell = trainingLegend.getCell(0, c); // get the first cell of the col
+	if (cCell.getType() == shmea::GType::STRING_TYPE)
+	{
+	    //printf("Col %d is categorical\n", c);
+	    cOHE->mapFeatureSpace(trainingLegend, c);
+	    featureIsCategorical[c] = true;
+	    //cOHE->print();
+	}
+
+	OHEMaps.push_back(cOHE);
+    }
+
+    //printf("OHEMaps.size() = %lu\n", OHEMaps.size());
 
     // Set the loaded flag
     loaded = true;
@@ -163,31 +189,43 @@ shmea::GList ImageInput::getTrainRow(unsigned int index) const
 	return emptyRow;
 	
     // Return the image
-    return itr->second->flatten();
+    shmea::GList retList = itr->second->flatten();
+    retList.standardize();
+    return retList;
 }
 
 shmea::GList ImageInput::getTrainExpectedRow(unsigned int index) const
 {
+    printf("Number of rows in trainingLegend = %u\n", trainingLegend.numberOfRows());
     if(index >= trainingLegend.numberOfRows())
 	return emptyRow;
 
-    shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
-    shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(index, 0).c_str();
+    // TODO: FIX THIS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
+    OHE* OHEVector = OHEMaps[1];
+    //return OHEVector->getOHEVector(label); // HERE!!!!!!!
 
-    // Check if the label exists
-    if(trainImages.find(label) == trainImages.end())
-	return emptyRow;
-	
-    // Check if the image exists
-    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
-	= trainImages.at(label).find(fname);
-    if(itr == trainImages.at(label).end())
-	return emptyRow;
-	
-    // Return the label
-    shmea::GList retList;
-    retList.addString(itr->first);
-    return retList;
+
+
+
+    shmea::GString cCell = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
+    printf("label[%u] = %s\n", index, cCell.c_str());
+
+    // translate string to cell value for this col
+    std::string cString = cCell.c_str();
+    std::vector<float> featureVector = (*OHEVector)[cString];
+    printf("featureVector.size() = %lu\n", featureVector.size());
+    for(unsigned int i=0;i<featureVector.size();++i)
+	printf("%f ", featureVector[i]);
+    printf("\n");
+
+    shmea::GList retRow;
+    for(unsigned int i=0;i<featureVector.size();++i)
+	retRow.addFloat(featureVector[i]);
+
+    printf("retRow.size() = %lu\n", retRow.size());
+    retRow.print();
+    return retRow;
 }
 
 shmea::GList ImageInput::getTestExpectedRow(unsigned int index) const
@@ -195,23 +233,24 @@ shmea::GList ImageInput::getTestExpectedRow(unsigned int index) const
     if(index >= testingLegend.numberOfRows())
 	return shmea::GList();
 
-    shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(index, 1).getInt());
-    shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(index, 0).c_str();
+    // TODO: FIX THIS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    //shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(index, 1).getInt());
+    OHE* OHEVector = OHEMaps[1];
+    //return OHEVector->getOHEVector(label); // HERE!!!!!!!
 
-    // Check if the label exists
-    if(testImages.find(label) == testImages.end())
-	return shmea::GList();
-	
-    // Check if the image exists
-    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
-	= testImages.at(label).find(fname);
-    if(itr == testImages.at(label).end())
-	return shmea::GList();
-	
-    // Return the label
-    shmea::GList retList;
-    retList.addString(itr->first);
-    return retList;
+
+
+
+    shmea::GString cCell = shmea::GString::intTOstring(testingLegend.getCell(index, 1).getInt());
+
+    // translate string to cell value for this col
+    std::string cString = cCell.c_str();
+    std::vector<float> featureVector = (*OHEVector)[cString];
+
+    shmea::GList retRow;
+    for(unsigned int i=0;i<featureVector.size();++i)
+	retRow.addFloat(featureVector[i]);
+    return retRow;
 }
 
 shmea::GList ImageInput::getTestRow(unsigned int index) const
@@ -233,23 +272,29 @@ shmea::GList ImageInput::getTestRow(unsigned int index) const
 	return shmea::GList();
 	
     // Return the image
-    return itr->second->flatten();
+    shmea::GList retList = itr->second->flatten();
+    retList.standardize();
+    return retList;
 }
 
 
 unsigned int ImageInput::getTrainSize() const
 {
-    return trainImages.size();
+    return trainingLegend.numberOfRows();
 }
 
 unsigned int ImageInput::getTestSize() const
 {
-    return testImages.size();
+    return testingLegend.numberOfRows();
 }
 
 unsigned int ImageInput::getFeatureCount() const
 {
-    return 1;//Only one feature, the image
+    if(trainImages.size() == 0)
+	return 0;
+
+    unsigned int retVal = trainImages.begin()->second.begin()->second->getPixelCount();
+    return retVal;
 }
 
 int ImageInput::getType() const

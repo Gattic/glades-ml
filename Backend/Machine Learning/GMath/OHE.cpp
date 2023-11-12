@@ -241,7 +241,7 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 	for (unsigned int r = 0; r < gTable.numberOfRows(); ++r)
 	{
 		float cell = 0.0f;
-		shmea::GType cCell = gTable.getCell(r, featureCol);
+		const shmea::GType& cCell = gTable.getCell(r, featureCol);
 		if (cCell.getType() == shmea::GType::STRING_TYPE)
 		{
 			shmea::GString strCell = cCell;
