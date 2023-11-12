@@ -125,6 +125,11 @@ public:
 		return height;
 	}
 
+	int getPixelCount() const
+	{
+		return width*height;
+	}
+
 	RGBA GetPixel(int x, int y) const
 	{
 		if (!(x >= 0 && x < width))
