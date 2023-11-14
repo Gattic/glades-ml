@@ -533,7 +533,8 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 			    expectation = expectedCell.getFloat();
 
 			    int costFx = skeleton->getOutputType();
-			    netState->cOutputNode->setErrDer(0, GMath::costErrDer(expectation, prediction, costFx));
+			    netState->cOutputNode->clearErrDer();
+			    netState->cOutputNode->adjustErrDer(GMath::costErrDer(expectation, prediction, costFx));
 		    }
 		    else if (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE)
 		    {
@@ -584,7 +585,7 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		    // Update the error partials for the next recursive calls
 		    float cInNetErrDer = netState->cInputNode->getErrDer() +
 						 (cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
-		    netState->cInputNode->setErrDer(cOutputNodeCounter, cInNetErrDer);
+		    netState->cInputNode->adjustErrDer(cInNetErrDer);
 
 		    delete netState;
 		}

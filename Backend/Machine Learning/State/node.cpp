@@ -25,8 +25,6 @@ glades::Node::Node()
 	clean();
 	activationMutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
 	pthread_mutex_init(activationMutex, NULL);
-	edMutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
-	pthread_mutex_init(edMutex, NULL);
 }
 
 glades::Node::Node(const Node& node2)
@@ -38,7 +36,6 @@ glades::Node::~Node()
 {
 	clean();
 	pthread_mutex_destroy(activationMutex);
-	pthread_mutex_destroy(edMutex);
 }
 
 void glades::Node::copy(const Node& node2)
@@ -48,7 +45,6 @@ void glades::Node::copy(const Node& node2)
 	edges = node2.edges;
 	errorDer = node2.errorDer;
 	activationMutex = node2.activationMutex;
-	edMutex = node2.edMutex;
 }
 
 int64_t glades::Node::getID() const
@@ -103,11 +99,7 @@ float glades::Node::getActivationScalar() const
 
 float glades::Node::getErrDer() const
 {
-	float fullED = 0.0f;
-	std::map<int, float>::const_iterator itr = errorDer.begin();
-	for (; itr != errorDer.end(); ++itr)
-		fullED += (itr->second);
-	return fullED;
+	return errorDer;
 }
 
 unsigned int glades::Node::numEdges() const
@@ -178,18 +170,14 @@ void glades::Node::clearActivation()
 	pthread_mutex_unlock(activationMutex);
 }
 
-void glades::Node::setErrDer(int edIndex, float newErrorDer)
+void glades::Node::adjustErrDer(float newErrorDer)
 {
-	pthread_mutex_lock(edMutex);
-	errorDer[edIndex] = newErrorDer;
-	pthread_mutex_unlock(edMutex);
+	errorDer += newErrorDer;
 }
 
 void glades::Node::clearErrDer()
 {
-	pthread_mutex_lock(edMutex);
-	errorDer.clear();
-	pthread_mutex_unlock(edMutex);
+	errorDer = 0;
 }
 
 void glades::Node::addPrevDelta(unsigned int index, float newPrevDelta)
@@ -212,6 +200,7 @@ void glades::Node::clean()
 {
 	id = -1;
 	weight = 0.0f;
+	errorDer = 0.0f;
 }
 
 void glades::Node::print() const
