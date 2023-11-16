@@ -122,7 +122,8 @@ void ImageInput::import(shmea::GString newName)
 
     //printf("OHEMaps.size() = %lu\n", OHEMaps.size());
 
-    // Set the loaded flag
+    // Set class data
+    featureCount = trainImages.begin()->second.begin()->second->getPixelCount();
     loaded = true;
 }
 
@@ -290,11 +291,7 @@ unsigned int ImageInput::getTestSize() const
 
 unsigned int ImageInput::getFeatureCount() const
 {
-    if(trainImages.size() == 0)
-	return 0;
-
-    unsigned int retVal = trainImages.begin()->second.begin()->second->getPixelCount();
-    return retVal;
+    return featureCount;
 }
 
 int ImageInput::getType() const

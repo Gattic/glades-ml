@@ -115,7 +115,7 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 			// We can probably get rid of most of these conditions becuase Gtype auto types
 			float newWeight = 0.0f;
 			shmea::GType cCell = di->getTrainRow(r)[c];
-			printf("[GQL] Fetched train row %d, col %d\n", r, c);
+			//printf("[GQL] Fetched train row %d, col %d\n", r, c);
 			if (cCell.getType() == shmea::GType::STRING_TYPE)
 			{
 				// columns w/ strings NEED to be labeled categorical

@@ -76,10 +76,9 @@ std::vector<std::string> glades::OHE::getStrings() const
 bool glades::OHE::contains(const std::string& newString) const
 {
 	// check if the string is already in the vector
-	std::vector<std::string>::const_iterator itr = OHEStrings.begin();
-	for (; itr != OHEStrings.end(); ++itr)
+	for (unsigned int i = 0; i < OHEStrings.size(); ++i)
 	{
-		if ((*itr) == newString)
+		if (OHEStrings[i] == newString)
 			return true;
 	}
 
