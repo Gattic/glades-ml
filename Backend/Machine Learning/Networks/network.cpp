@@ -174,7 +174,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 			confusionMatrix->reset();
 
 		// Recursive FwdPass/BackProp
-		printf("Input Layers Size: %d\n", meat->getInputLayersSize());
+		//printf("Input Layers Size: %d\n", meat->getInputLayersSize());
 		for (unsigned int r = 0; r < meat->getInputLayersSize(); ++r)
 			SGDHelper(r, runType);
 
@@ -460,7 +460,7 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 				    shmea::GType expectedCell =
 					    di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
 				    float expectation = expectedCell;
-				    printf("Expectation: %f Prediction: %f\n", expectation, prediction);
+				    //printf("Expectation: %f Prediction: %f\n", expectation, prediction);
 
 				    // Add the expected and predicted to the result row
 				    results.addFloat(expectation);

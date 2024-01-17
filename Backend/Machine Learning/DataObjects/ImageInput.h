@@ -42,14 +42,12 @@ public:
 	shmea::GList emptyRow;
 	shmea::GString name;
 	bool loaded;
-	unsigned int featureCount;
 
 	ImageInput()
 	{
 		//
 	    name = "";
 	    loaded = false;
-	    featureCount = 0;
 	    trainingLegend.clear();
 	    testingLegend.clear();
 	    trainImages.clear();
@@ -60,7 +58,6 @@ public:
 	{
 	    name = "";
 	    loaded = false;
-	    featureCount = 0;
 	    trainingLegend.clear();
 	    testingLegend.clear();
 	    trainImages.clear();
