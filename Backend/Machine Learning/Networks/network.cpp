@@ -159,6 +159,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 
 	// arbitrary independent var (time dimension)
 	running = true;
+	firstRunActivation = false;
 	while (running)
 	{
 		/*if (DEBUG_ADVANCED)
@@ -265,6 +266,45 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 					cData->set(wData);
 					cData->setArgList(argData);
 					serverInstance->send(cData);
+
+					//Update the weights of the Neural Network
+		//TODO: Send meat to the frontend to create the Neural Network Visualization 
+					argData.clear();
+
+					argData.addString("ACTIVATIONS");
+					cData = new shmea::ServiceData(cConnection, "GUI_Callback");
+					if(!firstRunActivation)
+					{
+						firstRunActivation = true;
+						shmea::GList layerSizes;
+						for(unsigned int cLayerCounter = 0; cLayerCounter < skeleton->numHiddenLayers() + 2; ++cLayerCounter)
+						{
+						    layerSizes.addInt(meat->getLayerSize(cLayerCounter));
+						}
+
+						cData->set(layerSizes);
+						cData->setArgList(argData);
+					} else 
+					{
+					    cData->set(cNodeActivations);
+					    cData->setArgList(argData);
+					}
+					serverInstance->send(cData);
+					cNodeActivations.clear();
+
+
+					argData.clear();
+					shmea::GList obtainedWeights = meat->getWeights();
+
+					argData.addString("WEIGHTS");
+					cData = new shmea::ServiceData(cConnection, "GUI_Callback");
+					cData->set(obtainedWeights);
+					cData->setArgList(argData);
+					serverInstance->send(cData);
+
+
+					//shmea::GList obtainedActivations = meat->getActivations()
+					//cData->set(
 				}
 
 				if (skeleton->getOutputType() == GMath::REGRESSION)
@@ -402,10 +442,13 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 		int cInputLayerCounter, int cOutputLayerCounter,
 		unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
+    
+
 	for(unsigned int cLayerCounter = 0; cLayerCounter < skeleton->numHiddenLayers()+1; ++cLayerCounter)
 	{
 	    cInputLayerCounter = cLayerCounter;
 	    cOutputLayerCounter = cLayerCounter + 1;
+
 	    for(cOutputNodeCounter = 0; cOutputNodeCounter < meat->getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
 	    {
 		for(cInputNodeCounter = 0; cInputNodeCounter < meat->getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
@@ -429,8 +472,8 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 								netState->cInputNode->getWeight();
 			    netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
 		    }
-
 		    // Last Input Node for the Output Node
+
 		    float cOutputLayerActivation = 0.0f;
 		    if (netState->lastValidInputNode)
 		    {
@@ -450,6 +493,14 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			    float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
 			    cOutputLayerActivation =
 				    GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
+
+
+			    //We add the current node activation to the list of activations that will be sent on the network for visualization purposes
+			    if(inputRowCounter == di->getTrainSize()-1)
+			    {
+				cNodeActivations.addFloat(cOutputNodeActivation);
+			    }
+
 			    netState->cOutputNode->setWeight(cOutputLayerActivation);
 
 			    // Output layer calculations
@@ -496,9 +547,18 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			    }
 		    }
 
+		    
+
+
 		    delete netState;
 		}
+		
+	
 	    }
+	if(inputRowCounter == di->getTrainSize()-1)
+	       {
+		   cNodeActivations.addString(",");
+		}
 	}
 }
 
