@@ -72,6 +72,10 @@ public:
 	void print(const NNInfo*, bool = false) const;
 	void clean();
 
+	// Getters
+	shmea::GList getWeights();
+	shmea::GList getActivations();
+
 	// Database
 	bool load(const std::string&);
 	bool save(const std::string&) const;

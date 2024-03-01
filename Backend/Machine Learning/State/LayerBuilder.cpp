@@ -360,6 +360,28 @@ float glades::LayerBuilder::getTimeState(unsigned int cLayerCounter, unsigned in
 	return timeState[cLayerCounter][cNodeCounter][cEdgeCounter];
 }
 
+shmea::GList glades::LayerBuilder::getWeights()
+{
+   shmea::GList weights; 
+   //We start with 1 because the first layer (input layer) doesn't have the data of the weights
+    for(unsigned int i = 0; i < getLayersSize(); ++i)
+    {
+	std::vector<Node*> cChildren = layers[i]->getChildren();
+	for(unsigned int j = 0; j < cChildren.size(); ++j)
+	{
+	   for(unsigned int k = 0; k < cChildren[j]->numEdges(); ++k)
+	   {
+		float cWeight = cChildren[j]->getEdgeWeight(k);
+		weights.addFloat(cWeight);
+	   }
+	   weights.addString(',');
+	}
+	weights.addString(';');
+    }
+
+    return weights;
+}
+
 void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 {
 	// Structure required!
