@@ -284,7 +284,8 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 
 						cData->set(layerSizes);
 						cData->setArgList(argData);
-					} else 
+					} 
+					else 
 					{
 					    cData->set(cNodeActivations);
 					    cData->setArgList(argData);
@@ -442,8 +443,6 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 		int cInputLayerCounter, int cOutputLayerCounter,
 		unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
-    
-
 	for(unsigned int cLayerCounter = 0; cLayerCounter < skeleton->numHiddenLayers()+1; ++cLayerCounter)
 	{
 	    cInputLayerCounter = cLayerCounter;
@@ -473,7 +472,6 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			    netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
 		    }
 		    // Last Input Node for the Output Node
-
 		    float cOutputLayerActivation = 0.0f;
 		    if (netState->lastValidInputNode)
 		    {
@@ -493,7 +491,6 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			    float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
 			    cOutputLayerActivation =
 				    GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
-
 
 			    //We add the current node activation to the list of activations that will be sent on the network for visualization purposes
 			    if(inputRowCounter == di->getTrainSize()-1)
