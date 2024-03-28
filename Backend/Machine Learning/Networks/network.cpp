@@ -276,6 +276,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 					if(!firstRunActivation)
 					{
 						firstRunActivation = true;
+						//TODO: Create in header file
 						shmea::GList layerSizes;
 						for(unsigned int cLayerCounter = 0; cLayerCounter < skeleton->numHiddenLayers() + 2; ++cLayerCounter)
 						{
