@@ -54,10 +54,11 @@ public:
 class Image
 {
 	friend RUBackgroundComponent;
+	friend class PNGHelper;
 
-private:
-	int width;
-	int height;
+protected:
+	unsigned int width;
+	unsigned int height;
 	int pitch;
 	RGBA* data;
 
@@ -65,9 +66,9 @@ private:
 	{
 		pitch = image.pitch;
 		Allocate(image.getWidth(), image.getHeight());
-		for (int i = 0; i < image.getWidth(); i++)
+		for (unsigned int i = 0; i < image.getWidth(); i++)
 		{
-			for (int j = 0; j < image.getHeight(); j++)
+			for (unsigned int j = 0; j < image.getHeight(); j++)
 				this->SetPixel(i, j, image.GetPixel(i, j));
 		}
 	}
@@ -91,7 +92,7 @@ public:
 		return *this;
 	}
 
-	~Image()
+	virtual ~Image()
 	{
 		delete[] data;
 	}
@@ -115,22 +116,27 @@ public:
 	}
 
 	// gets
-	int getWidth() const
+	unsigned int getWidth() const
 	{
 		return width;
 	}
 
-	int getHeight() const
+	unsigned int getHeight() const
 	{
 		return height;
 	}
 
-	RGBA GetPixel(int x, int y) const
+	unsigned int getPixelCount() const
 	{
-		if (!(x >= 0 && x < width))
+		return width*height;
+	}
+
+	RGBA GetPixel(unsigned int x, unsigned int y) const
+	{
+		if (!(x < width))
 			return RGBA();
 
-		if (!(y >= 0 && y < height))
+		if (!(y < height))
 			return RGBA();
 
 		return data[y * width + x];
@@ -139,16 +145,16 @@ public:
 	// sets
 	void SetAllPixels(const RGBA& value)
 	{
-		for (int i = 0; i < width * height; i++)
+		for (unsigned int i = 0; i < width * height; i++)
 			data[i] = value;
 	}
 
-	void SetPixel(int x, int y, const RGBA& value)
+	void SetPixel(unsigned int x, unsigned int y, const RGBA& value)
 	{
-		if (!(x >= 0 && x < width))
+		if (!(x < width))
 			return;
 
-		if (!(y >= 0 && y < height))
+		if (!(y < height))
 			return;
 
 		data[y * width + x] = value;

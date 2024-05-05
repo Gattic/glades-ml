@@ -54,6 +54,7 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInp
 		return false;
 
 	// Construct the input layers
+	printf("[GQL] Building input layers\n");
 	buildInputLayers(skeleton, newInput);
 	if (inputLayers.size() <= 0)
 	{
@@ -103,15 +104,18 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 	if (di->getFeatureCount() < 1)
 		return;
 
+	// TODO: SPEED THIS UP FOR IMAGES!!!!!!!!!!!
 	inputLayers.clear();
 	for (unsigned int r = 0; r < di->getTrainSize(); ++r)
 	{
+		printf("[GQL] Building input layer %d\n", r);
 		Layer* cLayer = new Layer(Layer::INPUT_TYPE, false);
 		for (unsigned int c = 0; c < di->getFeatureCount(); ++c)
 		{
 			// We can probably get rid of most of these conditions becuase Gtype auto types
 			float newWeight = 0.0f;
 			shmea::GType cCell = di->getTrainRow(r)[c];
+			//printf("[GQL] Fetched train row %d, col %d\n", r, c);
 			if (cCell.getType() == shmea::GType::STRING_TYPE)
 			{
 				// columns w/ strings NEED to be labeled categorical
@@ -150,7 +154,10 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 			// add the input layer to the dataset
 			bool lastCol = (c == (di->getFeatureCount() - 1));
 			if (lastCol)
+			{
+			    printf("Adding input layer[%u:%u]: %d\n", r, di->getTrainSize(), inputLayers.size());
 				inputLayers.push_back(cLayer);
+			}
 		}
 	}
 }
@@ -351,6 +358,28 @@ float glades::LayerBuilder::getTimeState(unsigned int cLayerCounter, unsigned in
 		return 1.0f;
 
 	return timeState[cLayerCounter][cNodeCounter][cEdgeCounter];
+}
+
+shmea::GList glades::LayerBuilder::getWeights()
+{
+   shmea::GList weights; 
+   //We start with 1 because the first layer (input layer) doesn't have the data of the weights
+    for(unsigned int i = 0; i < getLayersSize(); ++i)
+    {
+	std::vector<Node*> cChildren = layers[i]->getChildren();
+	for(unsigned int j = 0; j < cChildren.size(); ++j)
+	{
+	   for(unsigned int k = 0; k < cChildren[j]->numEdges(); ++k)
+	   {
+		float cWeight = cChildren[j]->getEdgeWeight(k);
+		weights.addFloat(cWeight);
+	   }
+	   weights.addString(',');
+	}
+	weights.addString(';');
+    }
+
+    return weights;
 }
 
 void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)

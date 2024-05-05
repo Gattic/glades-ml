@@ -80,11 +80,15 @@ private:
 	int minibatchSize;
 	int64_t id;
 
+	bool firstRunActivation;
+
 	// for tables & graphs
 	shmea::GList learningCurve;
 	std::vector<Point2*> rocCurve;
 	shmea::GList results;
 	shmea::GTable nbRecord;
+	//Only for sending on the network
+	shmea::GList cNodeActivations;
 
 	void SGDHelper(unsigned int, int); // Stochastic Gradient Descent
 
