@@ -20,7 +20,7 @@
 #include <iostream>
 #include <cstring>
 #include <cmath>
-#include <png.h>
+//#include <png.h>
 
 namespace shmea
 {
@@ -31,13 +31,16 @@ class PNGHelper
 {
 
 public:
-    static void applyRainbowFilter(png_bytep, png_bytep, png_uint_32, png_byte);
+    /*static void applyRainbowFilter(png_bytep, png_bytep, png_uint_32, png_byte);
 
     static void readImage(const char* inputPath, png_structp& png, png_infop& info, png_bytep*& rowPointers, png_uint_32& width, png_uint_32& height, png_byte& bitDepth, png_byte& colorType);
-    static void writeImage(const char* outputPath, png_structp png, png_infop info, png_bytep* rowPointers, png_uint_32 width, png_uint_32 height, png_byte bitDepth, png_byte colorType);
+    static void writeImage(const char* outputPath, png_structp png, png_infop info, png_bytep* rowPointers, png_uint_32 width, png_uint_32 height, png_byte bitDepth, png_byte colorType);*/
+
+    static void applyRainbowFilter(Image&, unsigned int);
 
     static void pngTest(const char*, const char*);
     static void LoadPNG(Image&, const char*);
+    static void LoadPNG(Image&, const unsigned char*, unsigned int, unsigned int);
 
 };
 
