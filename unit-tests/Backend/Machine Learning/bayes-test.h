@@ -5,18 +5,16 @@
 // modification, transfer, or transmittal of this work for any purpose
 // in any form or by any means without the written permission of
 // Robert Carneiro is strictly prohibited.
-#include "main.h"
-#include "Backend/Machine Learning/pca-test.h"
-#include "Backend/Machine Learning/bayes-test.h"
+#ifndef _UT_BAYES
+#define _UT_BAYES
 
-int main(int argc, char* argv[])
-{
-	PCAUnitTest();
-	BayesUnitTest();
+#include <iostream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <unistd.h>
 
-	printf("========================\n");
-	printf("| Unit Tests Completed |\n");
-	printf("========================\n");
+void BayesUnitTest();
 
-	pthread_exit(EXIT_SUCCESS);
-}
+#endif

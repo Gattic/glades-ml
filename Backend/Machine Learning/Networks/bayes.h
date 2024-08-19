@@ -50,6 +50,8 @@ public:
 	int predict(const shmea::GList&);
 	void print() const;
 	void reset();
+
+	std::string getClassName(int) const;
 };
 };
 

@@ -220,3 +220,12 @@ void NaiveBayes::reset()
 	attributesPerClass.clear();
 	OHEMaps.clear();
 }
+
+std::string NaiveBayes::getClassName(int classID) const
+{
+    if(classID < 0)
+	return "";
+
+    int outCol = OHEMaps.size()-1;
+    return OHEMaps[outCol].classAt(classID);
+}
