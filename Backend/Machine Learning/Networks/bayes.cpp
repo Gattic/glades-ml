@@ -25,7 +25,7 @@
 
 using namespace glades;
 
-shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
+shmea::GTable NaiveBayes::import(const shmea::GTable& newInputTable)
 {
 	shmea::GTable standardizedTable(',');
 	standardizedTable.setHeaders(newInputTable.getHeaders());
@@ -57,7 +57,8 @@ shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
 			//
 				shmea::GString cString = cCell;
 				int featureInt = cOHE.indexAt(cString);
-				newRow.addInt(featureInt);
+				newRow.addFloat(featureInt);
+				continue;
 			}
 			else if (cCell.getType() == shmea::GType::CHAR_TYPE)
 				cell = cCell.getChar();
@@ -83,47 +84,6 @@ shmea::GTable NaiveBayes::import2(const shmea::GTable& newInputTable)
 	return standardizedTable;
 }
 
-
-shmea::GTable glades::NaiveBayes::import(const shmea::GTable& newInputTable)
-{
-	shmea::GTable standardizedTable(',');
-	standardizedTable.setHeaders(newInputTable.getHeaders());
-
-	if ((newInputTable.numberOfRows() <= 0) || (newInputTable.numberOfCols() <= 0))
-		return standardizedTable;
-
-	// iterate through the cols
-	for (unsigned int c = 0; c < newInputTable.numberOfCols(); ++c)
-	{
-		// iterate through the rows
-		OHE cOHE;
-		cOHE.mapFeatureSpace(newInputTable, c);
-		OHEMaps.push_back(cOHE);
-	}
-
-	// Convert to classMap table
-	for (unsigned int r = 0; r < newInputTable.numberOfRows(); ++r)
-	{
-		shmea::GList newRow;
-
-		for (unsigned int c = 0; c < newInputTable.numberOfCols(); ++c)
-		{
-			shmea::GType cCell = newInputTable.getCell(r, c);
-			if (cCell.getType() != shmea::GType::STRING_TYPE)
-				continue;
-
-			//
-			OHE cOHE = OHEMaps[c];
-			shmea::GString cString = cCell;
-			int featureInt = cOHE.indexAt(cString);
-			newRow.addInt(featureInt);
-		}
-		standardizedTable.addRow(newRow);
-	}
-
-	return standardizedTable;
-}
-
 void NaiveBayes::train(const shmea::GTable& data)
 {
 	int outCol = data.numberOfCols()-1;
@@ -131,7 +91,7 @@ void NaiveBayes::train(const shmea::GTable& data)
 	// count all classes and attributes
 	for(unsigned int i =0; i < data.numberOfRows(); ++i)
 	{
-		shmea::GList row = data[i];
+		const shmea::GList& row = data[i];
 		if(classes.find(row[outCol]) == classes.end())
 		{
 			classes[row[outCol]]=1;
