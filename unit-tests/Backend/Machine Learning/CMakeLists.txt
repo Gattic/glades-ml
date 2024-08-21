@@ -1,4 +1,5 @@
 set(PCATests_src_files
+nn-test.cpp
 pca-test.cpp
 bayes-test.cpp
 )

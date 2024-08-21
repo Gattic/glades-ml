@@ -6,11 +6,16 @@
 // in any form or by any means without the written permission of
 // Robert Carneiro is strictly prohibited.
 #include "main.h"
+#include "Backend/Machine Learning/nn-test.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
 
 int main(int argc, char* argv[])
 {
+	// For random numbers
+	srand(time(NULL));
+
+	NNUnitTest();
 	PCAUnitTest();
 	BayesUnitTest();
 
