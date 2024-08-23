@@ -38,6 +38,7 @@ void BayesUnitTest()
     printf("\n-----------------------------------\n");
     printf("Bayes Prediction: %d \"%s\"\n", prediction, bModel.getClassName(prediction).c_str());
     printf("-----------------------------------\n");
+    G_assert (__FILE__, __LINE__, "==============Bayes-test::Accuracy() Failed==============", bModel.getClassName(prediction) == "Happy");
     printf("\n===================================\n");
 
     // Classifier 2
@@ -59,6 +60,8 @@ void BayesUnitTest()
     printf("\n-----------------------------------\n");
     printf("Bayes Prediction: %d \"%s\"\n", prediction, bModel2.getClassName(prediction).c_str());
     printf("-----------------------------------\n");
+    
+    G_assert (__FILE__, __LINE__, "==============Bayes-test2::Accuracy() Failed==============", bModel2.getClassName(prediction) == "Angry");
 
     printf("\n============================================================\n");
 }
