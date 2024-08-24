@@ -25,6 +25,22 @@
 
 using namespace glades;
 
+shmea::GTable NaiveBayes::import(const shmea::GList& tokenizedWords)
+{
+	shmea::GTable newTable(',');
+
+	// Skip the last word
+	for(unsigned int i = 0; i < tokenizedWords.size()-1; ++i)
+	{
+		shmea::GList newRow;
+		newRow.addString(tokenizedWords[i].c_str());
+		newRow.addString(tokenizedWords[i+1].c_str());
+		newTable.addRow(newRow);
+	}
+
+	return import(newTable);
+}
+
 shmea::GTable NaiveBayes::import(const shmea::GTable& newInputTable)
 {
 	shmea::GTable standardizedTable(',');
