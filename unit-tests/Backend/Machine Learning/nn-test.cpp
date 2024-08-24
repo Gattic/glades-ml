@@ -127,9 +127,61 @@ void NNUnitTest()
     Arnold2->setAccuracy(95);
     G_assert (__FILE__, __LINE__, "==============NN2-test::Accuracy() Failed==============", cNetwork2.getAccuracy() < 95.0f);
     
+
+    printf("-----------------------------------\n");
+    printf("NN Test 3\n");
+    printf("-----------------------------------\n");
+
+    glades::NNetwork cNetwork3;
+    netName = "xorgateText";
+    inputFName = "xorgateText.csv";
+    inputType = glades::DataInput::CSV;
+    //int inputType = glades::DataInput::IMAGE;
+    //int inputType = glades::DataInput::TEXT;
+    
+    // Modify the paths to properly load the data later
+    glades::DataInput* di3 = NULL;
+    if (inputType == glades::DataInput::CSV)
+    {
+    	inputFName = "datasets/" + inputFName;
+    	di3 = new glades::NumberInput();
+    }
+    else if (inputType == glades::DataInput::IMAGE)
+    {
+    	// inputFName = "datasets/images/" + inputFName + "/";
+    	di3 = new glades::ImageInput();
+    }
+    else if (inputType == glades::DataInput::TEXT)
+    {
+    	// TODO
+    	return;
+    }
+    else
+    	return;
+    
+    if (!di3)
+    	return;
+    
+    // Load the input data
+    di3->import(inputFName);
+    
+    // Load the neural network
+    if ((cNetwork3.getEpochs() == 0) && (!cNetwork3.load(netName)))
+    {
+    	printf("[NN] Unable to load \"%s\"", netName.c_str());
+    	return;
+    }
+    
+    // Termination Conditions
+    glades::Terminator* Arnold3 = new glades::Terminator();
+    //Arnold3->setTimestamp(maxTimeStamp);
+    Arnold3->setEpoch(100000);
+    Arnold3->setAccuracy(95);
+    G_assert (__FILE__, __LINE__, "==============NN3-test::Accuracy() Failed==============", cNetwork3.getAccuracy() < 95.0f);
+    
     // Run the training and retrieve a metanetwork
-    glades::MetaNetwork* newTrainNet2 =
-    	glades::train(&cNetwork2, di2, Arnold2);
+    glades::MetaNetwork* newTrainNet3 =
+    	glades::train(&cNetwork3, di3, Arnold3);
 
     printf("\n============================================================\n");
 }
