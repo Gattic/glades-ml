@@ -55,6 +55,7 @@ public:
 
 	// sets
 	void copy(const GList&);
+	void loadWords(const GString&);
 	void addChar(char);
 	void insertChar(unsigned int, char);
 	void addShort(short);

@@ -116,6 +116,8 @@ public:
 	static bool isWhitespace(const char*);
 	static bool isWhitespace(const char*, unsigned int);
 	static bool isWhitespace(const GString&);
+	static bool isAlphaNum(char);
+	GString makeAlphaNum() const;
 	static bool isInteger(const char*);
 	static bool isInteger(const char*, unsigned int);
 	static bool isInteger(const GString&);
