@@ -96,7 +96,7 @@ glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput,
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->train(newDataInput, Arnold);
 	}
 
 	return cMetaNetwork;
@@ -127,7 +127,7 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDat
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->train(newDataInput, Arnold);
 	}
 
 	return cMetaNetwork;
@@ -152,7 +152,7 @@ glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->train(newDataInput, Arnold);
 	}
 
 	return cMetaNetwork;
@@ -182,7 +182,7 @@ glades::MetaNetwork* glades::test(NNInfo* networkInfo, DataInput* newDataInput, 
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(newDataInput, NULL, glades::NNetwork::RUN_TEST);
+		subnets[i]->test(newDataInput, NULL);
 	}
 
 	return cMetaNetwork;
@@ -212,7 +212,7 @@ glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, DataInput* newD
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(newDataInput, NULL, glades::NNetwork::RUN_TEST);
+		subnets[i]->test(newDataInput, NULL);
 	}
 
 	return cMetaNetwork;
@@ -236,7 +236,7 @@ glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, DataInput* 
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->run(newDataInput, NULL, glades::NNetwork::RUN_TEST);
+		subnets[i]->test(newDataInput, NULL);
 	}
 
 	return cMetaNetwork;
@@ -304,14 +304,14 @@ glades::MetaNetwork* glades::crossValidate(NNInfo* networkInfo, std::string fnam
 		{
 			if (serverInstance && cConnection)
 				cNetwork->setServer(serverInstance, cConnection);
-			cNetwork->run(glades::NNetwork::RUN_TRAIN, trainInputFile);
+			cNetwork->train(trainInputFile);
 
 			//test the network
 			shmea::GTable* testInputFile=stratifiedInputFiles[i];
 			if(testInputFile->numberOfCols() > 0)
 			{
 				//Test our validation set
-				cNetwork->run(glades::NNetwork::RUN_TEST, testInputFile);
+				cNetwork->test(testInputFile);
 				cvAccuracy+=cNetwork->getAccuracy();
 			}
 			else
@@ -395,14 +395,14 @@ glades::MetaNetwork* glades::crossValidate(std::string netName, std::vector<std:
 		if (serverInstance && cConnection)
 			cNetwork->setServer(serverInstance, cConnection);
 		glades::NNetwork* cNetwork = cMetaNetwork->subnets[i];
-		cNetwork->run(glades::NNetwork::RUN_TRAIN, trainInputFile);
+		cNetwork->train(trainInputFile);
 
 		//test the network
 		shmea::GTable* testInputFile=stratifiedInputFiles[i];
 		if(testInputFile->numberOfCols() > 0)
 		{
 			//Test our validation set
-			cNetwork->run(glades::NNetwork::RUN_TEST, testInputFile);
+			cNetwork->test(testInputFile);
 			cvAccuracy+=cNetwork->getAccuracy();
 		}
 		else

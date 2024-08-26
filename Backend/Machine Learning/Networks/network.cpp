@@ -102,6 +102,16 @@ void glades::NNetwork::stop()
 	running = false;
 }
 
+void glades::NNetwork::train(DataInput* newDataInput, const Terminator* Arnold)
+{
+    run(newDataInput, Arnold, RUN_TRAIN);
+}
+
+void glades::NNetwork::test(DataInput* newDataInput, const Terminator* Arnold)
+{
+    run(newDataInput, Arnold, RUN_TEST);
+}
+
 void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, int runType)
 {
 	if (!skeleton)

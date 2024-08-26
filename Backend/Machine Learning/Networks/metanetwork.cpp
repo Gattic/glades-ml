@@ -237,13 +237,13 @@ void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDat
 		}
 
 		//
-		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->train(newDataInput, Arnold);
 
 		shmea::GTable testInputFile = *stratifiedInputFiles[i];
 		if (testInputFile.numberOfCols() > 0)
 		{
 			// Test our validation set
-			subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TEST);
+			subnets[i]->test(newDataInput, Arnold);
 			cvAccuracy += subnets[i]->getAccuracy();
 		}
 	}

@@ -90,6 +90,7 @@ private:
 	//Only for sending on the network
 	shmea::GList cNodeActivations;
 
+	void run(DataInput*, const Terminator*, int);
 	void SGDHelper(unsigned int, int); // Stochastic Gradient Descent
 
 	void ForwardPass(unsigned int, int, int, unsigned int, unsigned int);
@@ -116,7 +117,8 @@ public:
 	void setServer(GNet::GServer*, GNet::Connection*);
 
 	// Stochastic Gradient Descent
-	void run(DataInput*, const Terminator*, int);
+	void train(DataInput*, const Terminator*);
+	void test(DataInput*, const Terminator*);
 
 	int64_t getID() const;
 	shmea::GString getName() const;
