@@ -79,7 +79,7 @@ bool glades::saveNeuralNetwork(glades::NNetwork* newNet)
  * @param newDataInput the data to use in training
  * @return the trained MetaNetwork object
  */
-glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput, Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!networkInfo)
 		return NULL;
@@ -96,7 +96,7 @@ glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput,
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->train(newDataInput, Arnold);
+		subnets[i]->train(newDataInput);
 	}
 
 	return cMetaNetwork;
@@ -110,7 +110,7 @@ glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput,
  * @return the trained MetaNetwork object
  */
 glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDataInput,
-								   Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+    GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!cNetwork)
 		return NULL;
@@ -127,7 +127,7 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDat
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->train(newDataInput, Arnold);
+		subnets[i]->train(newDataInput);
 	}
 
 	return cMetaNetwork;
@@ -141,7 +141,7 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDat
  * @return the trained MetaNetwork object
  */
 glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
-								   DataInput* newDataInput, Terminator* Arnold, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+    DataInput* newDataInput, GNet::GServer* serverInstance, GNet::Connection* cConnection)
 {
 	if (!cMetaNetwork)
 		return NULL;
@@ -152,7 +152,7 @@ glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->train(newDataInput, Arnold);
+		subnets[i]->train(newDataInput);
 	}
 
 	return cMetaNetwork;
@@ -182,7 +182,7 @@ glades::MetaNetwork* glades::test(NNInfo* networkInfo, DataInput* newDataInput, 
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->test(newDataInput, NULL);
+		subnets[i]->test(newDataInput);
 	}
 
 	return cMetaNetwork;
@@ -212,7 +212,7 @@ glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, DataInput* newD
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->test(newDataInput, NULL);
+		subnets[i]->test(newDataInput);
 	}
 
 	return cMetaNetwork;
@@ -236,7 +236,7 @@ glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, DataInput* 
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->test(newDataInput, NULL);
+		subnets[i]->test(newDataInput);
 	}
 
 	return cMetaNetwork;

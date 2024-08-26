@@ -65,15 +65,14 @@ void NNUnitTest()
     }
     
     // Termination Conditions
-    glades::Terminator* Arnold = new glades::Terminator();
-    //Arnold->setTimestamp(maxTimeStamp);
-    Arnold->setEpoch(100000);
-    Arnold->setAccuracy(95);
+    //cNetwork.setTimestamp(maxTimeStamp);
+    cNetwork.terminator.setEpoch(100000);
+    cNetwork.terminator.setAccuracy(95);
     G_assert (__FILE__, __LINE__, "==============NN1-test::Accuracy() Failed==============", cNetwork.getAccuracy() < 95.0f);
     
     // Run the training and retrieve a metanetwork
     glades::MetaNetwork* newTrainNet =
-    	glades::train(&cNetwork, di, Arnold);
+    	glades::train(&cNetwork, di);
 
 
     printf("-----------------------------------\n");
@@ -121,10 +120,9 @@ void NNUnitTest()
     }
     
     // Termination Conditions
-    glades::Terminator* Arnold2 = new glades::Terminator();
-    //Arnold2->setTimestamp(maxTimeStamp);
-    Arnold2->setEpoch(100000);
-    Arnold2->setAccuracy(95);
+    //cNetwork2.setTimestamp(maxTimeStamp);
+    cNetwork2.terminator.setEpoch(100000);
+    cNetwork2.terminator.setAccuracy(95);
     G_assert (__FILE__, __LINE__, "==============NN2-test::Accuracy() Failed==============", cNetwork2.getAccuracy() < 95.0f);
     
 
@@ -173,15 +171,14 @@ void NNUnitTest()
     }
     
     // Termination Conditions
-    glades::Terminator* Arnold3 = new glades::Terminator();
-    //Arnold3->setTimestamp(maxTimeStamp);
-    Arnold3->setEpoch(100000);
-    Arnold3->setAccuracy(95);
+    //cNetwork3.setTimestamp(maxTimeStamp);
+    cNetwork3.terminator.setEpoch(100000);
+    cNetwork3.terminator.setAccuracy(95);
     G_assert (__FILE__, __LINE__, "==============NN3-test::Accuracy() Failed==============", cNetwork3.getAccuracy() < 95.0f);
     
     // Run the training and retrieve a metanetwork
     glades::MetaNetwork* newTrainNet3 =
-    	glades::train(&cNetwork3, di3, Arnold3);
+    	glades::train(&cNetwork3, di3);
 
     printf("\n============================================================\n");
 }

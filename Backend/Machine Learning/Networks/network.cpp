@@ -102,17 +102,17 @@ void glades::NNetwork::stop()
 	running = false;
 }
 
-void glades::NNetwork::train(DataInput* newDataInput, const Terminator* Arnold)
+void glades::NNetwork::train(DataInput* newDataInput)
 {
-    run(newDataInput, Arnold, RUN_TRAIN);
+    run(newDataInput, RUN_TRAIN);
 }
 
-void glades::NNetwork::test(DataInput* newDataInput, const Terminator* Arnold)
+void glades::NNetwork::test(DataInput* newDataInput)
 {
-    run(newDataInput, Arnold, RUN_TEST);
+    run(newDataInput, RUN_TEST);
 }
 
-void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, int runType)
+void glades::NNetwork::run(DataInput* newDataInput, int runType)
 {
 	if (!skeleton)
 		return;
@@ -358,7 +358,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 			Frontend::nnCreatorPanel->PlotScatter(getResults());*/
 
 		// Shut it down?
-		if ((Arnold) && (Arnold->triggered(time(NULL), epochs, overallTotalAccuracy)))
+		if (terminator.triggered(time(NULL), epochs, overallTotalAccuracy))
 			break;
 
 		// Shut it down?
