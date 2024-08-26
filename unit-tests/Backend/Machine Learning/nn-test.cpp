@@ -8,7 +8,7 @@
 #include "nn-test.h"
 #include "../../unit-test.h"
 #include "Backend/Database/GList.h"
-#include "../../../Backend/Machine Learning/glades.h"
+#include "../../../Backend/Machine Learning/main.h"
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"

@@ -5,8 +5,8 @@ add_subdirectory("Networks")
 add_subdirectory("DataObjects")
 
 set(ML_src_files
-	glades.cpp
-	glades.h
+	main.cpp
+	main.h
 )
 add_library(ML ${ML_src_files})
 
