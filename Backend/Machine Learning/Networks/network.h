@@ -20,6 +20,8 @@
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "../State/Terminator.h"
+#include "../GMath/cmatrix.h"
+#include "../State/LayerBuilder.h"
 #include "bayes.h"
 #include <algorithm>
 #include <map>
@@ -60,8 +62,8 @@ private:
 
 	DataInput* di;
 	NNInfo* skeleton;
-	LayerBuilder* meat;
-	CMatrix* confusionMatrix;
+	LayerBuilder meat;
+	CMatrix confusionMatrix;
 	GNet::GServer* serverInstance;
 	GNet::Connection* cConnection;
 	glades::NaiveBayes bModel;
