@@ -17,7 +17,6 @@
 #ifndef _GMETANETWORK
 #define _GMETANETWORK
 
-#include "../State/Terminator.h"
 #include "Backend/Database/GString.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +64,7 @@ public:
 	NNetwork* getSubnetByName(shmea::GString) const;
 
 	// verification functions
-	void crossValidate(shmea::GString, DataInput*, Terminator*);
+	void crossValidate(shmea::GString, DataInput*);
 };
 };
 

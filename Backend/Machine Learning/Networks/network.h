@@ -19,6 +19,9 @@
 
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
+#include "../State/Terminator.h"
+#include "../GMath/cmatrix.h"
+#include "../State/LayerBuilder.h"
 #include "bayes.h"
 #include <algorithm>
 #include <map>
@@ -47,7 +50,6 @@ class Layer;
 class Node;
 class NetworkState;
 class LayerBuilder;
-class Terminator;
 class CMatrix;
 class MetaNetwork;
 class RNN;
@@ -60,8 +62,8 @@ private:
 
 	DataInput* di;
 	NNInfo* skeleton;
-	LayerBuilder* meat;
-	CMatrix* confusionMatrix;
+	LayerBuilder meat;
+	CMatrix confusionMatrix;
 	GNet::GServer* serverInstance;
 	GNet::Connection* cConnection;
 	glades::NaiveBayes bModel;
@@ -90,6 +92,7 @@ private:
 	//Only for sending on the network
 	shmea::GList cNodeActivations;
 
+	void run(DataInput*, int);
 	void SGDHelper(unsigned int, int); // Stochastic Gradient Descent
 
 	void ForwardPass(unsigned int, int, int, unsigned int, unsigned int);
@@ -102,6 +105,8 @@ public:
 	static const int RUN_TRAIN = 0;
 	static const int RUN_TEST = 1;
 	static const int RUN_VALIDATE = 2;
+
+	Terminator terminator;
 
 	NNetwork();
 	NNetwork(NNInfo*);
@@ -116,7 +121,8 @@ public:
 	void setServer(GNet::GServer*, GNet::Connection*);
 
 	// Stochastic Gradient Descent
-	void run(DataInput*, const Terminator*, int);
+	void train(DataInput*);
+	void test(DataInput*);
 
 	int64_t getID() const;
 	shmea::GString getName() const;

@@ -46,13 +46,9 @@ glades::NNetwork::NNetwork()
 	running = false;
 	di = NULL;
 	skeleton = NULL;
-	meat = NULL;
-	confusionMatrix = NULL;
 	serverInstance = NULL;
 	cConnection = NULL;
 	clean();
-	meat = new LayerBuilder();
-	confusionMatrix = new glades::CMatrix();
 	netType = TYPE_DFF;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 }
@@ -69,13 +65,9 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo)
 	running = false;
 	di = NULL;
 	skeleton = NULL;
-	meat = NULL;
-	confusionMatrix = NULL;
 	serverInstance = NULL;
 	cConnection = NULL;
 	clean();
-	meat = new LayerBuilder();
-	confusionMatrix = new glades::CMatrix();
 	skeleton = newNNInfo;
 	netType = TYPE_DFF;
 	minibatchSize = skeleton->getBatchSize();
@@ -102,7 +94,17 @@ void glades::NNetwork::stop()
 	running = false;
 }
 
-void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, int runType)
+void glades::NNetwork::train(DataInput* newDataInput)
+{
+    run(newDataInput, RUN_TRAIN);
+}
+
+void glades::NNetwork::test(DataInput* newDataInput)
+{
+    run(newDataInput, RUN_TEST);
+}
+
+void glades::NNetwork::run(DataInput* newDataInput, int runType)
 {
 	if (!skeleton)
 		return;
@@ -116,7 +118,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
-		meat->build(skeleton, di, netType);
+		meat.build(skeleton, di, netType);
 
 	// inputTable.print();
 	// expected.print();
@@ -124,7 +126,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	// Set the mini batch size
 	minibatchSize = skeleton->getBatchSize();
 	// Valid layers?
-	if ((meat->getInputLayersSize() <= 0) || (meat->getLayersSize() <= 0))
+	if ((meat.getInputLayersSize() <= 0) || (meat.getLayersSize() <= 0))
 		return;
 
 	if ((di->getTrainSize() <= 0) || (di->getFeatureCount() <= 0))
@@ -133,10 +135,10 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	// Build empty confusion matrix
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 		(skeleton->getOutputType() == GMath::KL))
-		confusionMatrix->build(skeleton->getOutputLayerSize());
+		confusionMatrix.build(skeleton->getOutputLayerSize());
 
 	// if (DEBUG_ADVANCED)
-	//	meat->print(skeleton);
+	//	meat.print(skeleton);
 
 	if (runType == RUN_TRAIN)
 		printf("[NN] Training...\n");
@@ -172,17 +174,17 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 		// Reset confusion matrix
 		if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 			(skeleton->getOutputType() == GMath::KL))
-			confusionMatrix->reset();
+			confusionMatrix.reset();
 
 		// Recursive FwdPass/BackProp
-		//printf("Input Layers Size: %d\n", meat->getInputLayersSize());
-		for (unsigned int r = 0; r < meat->getInputLayersSize(); ++r)
+		//printf("Input Layers Size: %d\n", meat.getInputLayersSize());
+		for (unsigned int r = 0; r < meat.getInputLayersSize(); ++r)
 			SGDHelper(r, runType);
 
 		// Update the network vars
 		++epochs;
 		overallTotalAccuracy /=
-			((float)meat->getInputLayersSize()) * ((float)skeleton->getOutputLayerSize());
+			((float)meat.getInputLayersSize()) * ((float)skeleton->getOutputLayerSize());
 
 		if (skeleton->getOutputType() == GMath::REGRESSION)
 		{
@@ -205,13 +207,13 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 		else if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 				 (skeleton->getOutputType() == GMath::KL))
 		{
-			confusionMatrix->updateResultParams();
+			confusionMatrix.updateResultParams();
 
-			overallClassAccuracy = (confusionMatrix->getOverallAccuracy() * 100.0f);
-			overallClassPrecision = (confusionMatrix->getOverallPrecision() * 100.0f);
-			overallClassRecall = (confusionMatrix->getOverallRecall() * 100.0f);
-			overallClassSpecificity = (confusionMatrix->getOverallSpecificity() * 100.0f);
-			overallClassF1 = confusionMatrix->getOverallF1Score() * 100.0f;
+			overallClassAccuracy = (confusionMatrix.getOverallAccuracy() * 100.0f);
+			overallClassPrecision = (confusionMatrix.getOverallPrecision() * 100.0f);
+			overallClassRecall = (confusionMatrix.getOverallRecall() * 100.0f);
+			overallClassSpecificity = (confusionMatrix.getOverallSpecificity() * 100.0f);
+			overallClassF1 = confusionMatrix.getOverallF1Score() * 100.0f;
 
 			// Display and debugging
 			if (runType == RUN_TRAIN)
@@ -239,7 +241,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 					printf("[NN] \t%d\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\n", epochs,
 						   overallClassAccuracy, overallClassPrecision, overallClassRecall,
 						   overallClassSpecificity, overallClassF1);
-					confusionMatrix->print();
+					confusionMatrix.print();
 					printf("===========================================================\n\n");
 				}*/
 			}
@@ -280,7 +282,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 						shmea::GList layerSizes;
 						for(unsigned int cLayerCounter = 0; cLayerCounter < skeleton->numHiddenLayers() + 2; ++cLayerCounter)
 						{
-						    layerSizes.addInt(meat->getLayerSize(cLayerCounter));
+						    layerSizes.addInt(meat.getLayerSize(cLayerCounter));
 						}
 
 						cData->set(layerSizes);
@@ -296,7 +298,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 
 
 					argData.clear();
-					shmea::GList obtainedWeights = meat->getWeights();
+					shmea::GList obtainedWeights = meat.getWeights();
 
 					argData.addString("WEIGHTS");
 					cData = new shmea::ServiceData(cConnection, "GUI_Callback");
@@ -305,7 +307,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 					serverInstance->send(cData);
 
 
-					//shmea::GList obtainedActivations = meat->getActivations()
+					//shmea::GList obtainedActivations = meat.getActivations()
 					//cData->set(
 				}
 
@@ -330,11 +332,11 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 					// Update the ROC Curve and Conf Matrix
 					shmea::GList argData;
 					argData.addString("CONF");
-					argData.addFloat(confusionMatrix->getOverallFalseAlarm());
-					argData.addFloat(confusionMatrix->getOverallRecall());
+					argData.addFloat(confusionMatrix.getOverallFalseAlarm());
+					argData.addFloat(confusionMatrix.getOverallRecall());
 
 					shmea::ServiceData* cData = new shmea::ServiceData(cConnection, "GUI_Callback");
-					cData->set(confusionMatrix->getMatrix());
+					cData->set(confusionMatrix.getMatrix());
 					cData->setArgList(argData);
 					serverInstance->send(cData);
 				}
@@ -348,7 +350,7 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 			Frontend::nnCreatorPanel->PlotScatter(getResults());*/
 
 		// Shut it down?
-		if ((Arnold) && (Arnold->triggered(time(NULL), epochs, overallTotalAccuracy)))
+		if (terminator.triggered(time(NULL), epochs, overallTotalAccuracy))
 			break;
 
 		// Shut it down?
@@ -366,12 +368,12 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 	}
 
 	// Print the results
-	meat->print(skeleton);
+	meat.print(skeleton);
 
 	// Clean confusion matrix
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 		(skeleton->getOutputType() == GMath::KL))
-		confusionMatrix->clean();
+		confusionMatrix.clean();
 
 	printf("\n");
 
@@ -381,17 +383,17 @@ void glades::NNetwork::run(DataInput* newDataInput, const Terminator* Arnold, in
 
 void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 {
-	if ((!skeleton) || (!meat))
+	if (!skeleton)
 		return;
 
-	if (meat->getLayersSize() <= 0)
+	if (meat.getLayersSize() <= 0)
 		return;
 
 	// New Dropout probabilities
 	std::vector<float> pHiddenVec;
 	for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
 		pHiddenVec.push_back(skeleton->getPDropout(i));
-	meat->scrambleDropout(inputRowCounter, skeleton->getPInput(), pHiddenVec);
+	meat.scrambleDropout(inputRowCounter, skeleton->getPInput(), pHiddenVec);
 
 	// Reset the results
 	results.clear();
@@ -403,7 +405,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 	// Add current results to cmatrix for accuracy vars
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 		(skeleton->getOutputType() == GMath::KL))
-		confusionMatrix->addResult(results);
+		confusionMatrix.addResult(results);
 
 	//printf("-------------------------------\n");
 
@@ -411,7 +413,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 	if (runType == RUN_TRAIN)
 	{
 		// Start with the last output layer
-		int cOutputLayerCounter = meat->getLayersSize();
+		int cOutputLayerCounter = meat.getLayersSize();
 		BackPropagation(inputRowCounter, cOutputLayerCounter - 1, cOutputLayerCounter, 0, 0);
 
 		// Save the autotuning data
@@ -434,7 +436,7 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		//skeleton->setLearningRate(cOutputLayerCounter - 1, newLearningRate);
 
 		// Clear past dropout state
-		meat->clearDropout();
+		meat.clearDropout();
 	}
 
 	//printf("=========================================\n");
@@ -449,12 +451,12 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 	    cInputLayerCounter = cLayerCounter;
 	    cOutputLayerCounter = cLayerCounter + 1;
 
-	    for(cOutputNodeCounter = 0; cOutputNodeCounter < meat->getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
+	    for(cOutputNodeCounter = 0; cOutputNodeCounter < meat.getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
 	    {
-		for(cInputNodeCounter = 0; cInputNodeCounter < meat->getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
+		for(cInputNodeCounter = 0; cInputNodeCounter < meat.getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
 		{
 		    NetworkState* netState =
-			    meat->getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
+			    meat.getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
 									 cInputNodeCounter, cOutputNodeCounter);
 		    if (!netState)
 			    return;
@@ -568,12 +570,12 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 	{
 	    cOutputLayerCounter = cLayerCounter;
 	    cInputLayerCounter = cLayerCounter - 1;
-	    for(cInputNodeCounter = 0; cInputNodeCounter < meat->getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
+	    for(cInputNodeCounter = 0; cInputNodeCounter < meat.getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
 	    {
-		for(cOutputNodeCounter = 0; cOutputNodeCounter < meat->getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
+		for(cOutputNodeCounter = 0; cOutputNodeCounter < meat.getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
 		{
 		    NetworkState* netState =
-			    meat->getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
+			    meat.getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
 									 cInputNodeCounter, cOutputNodeCounter);
 		    if (!netState)
 			    return;
@@ -686,9 +688,6 @@ float glades::NNetwork::getAccuracy() const
 
 bool glades::NNetwork::load(const shmea::GString& netName)
 {
-	if (!meat)
-		return false;
-
 	if (!skeleton)
 		skeleton = new NNInfo(netName);
 
@@ -696,21 +695,18 @@ bool glades::NNetwork::load(const shmea::GString& netName)
 	if (!skeleton->load(netName))
 		return false;
 
-	//return meat->load(netName);
+	//return meat.load(netName);
 	return true;
 }
 
 bool glades::NNetwork::save() const
 {
-	if (!meat)
-		return false;
-
 	if (!skeleton)
 		return false;
 
 	skeleton->save();
 	return true;
-	/// return meat->save(skeleton->getName());
+	/// return meat.save(skeleton->getName());
 }
 
 void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
@@ -738,8 +734,7 @@ void glades::NNetwork::clean()
 {
 	id = -1;
 	skeleton = NULL;
-	meat = NULL;
-	confusionMatrix = NULL;
+	confusionMatrix.clean();
 	serverInstance = NULL;
 	cConnection = NULL;
 	results.clear();

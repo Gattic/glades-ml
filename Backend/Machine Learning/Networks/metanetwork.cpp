@@ -17,7 +17,6 @@
 #include "metanetwork.h"
 #include "network.h"
 #include "Backend/Database/GTable.h"
-#include "../State/Terminator.h"
 #include "../Structure/nninfo.h"
 
 using namespace glades;
@@ -214,7 +213,7 @@ glades::NNetwork* glades::MetaNetwork::getSubnetByName(shmea::GString newName) c
 	return NULL;
 }
 
-void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDataInput, Terminator* Arnold)
+void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDataInput)
 {
 	// populate the input data
 	shmea::GTable cinputFile(fNames.c_str(), ',', shmea::GTable::TYPE_FILE);
@@ -237,13 +236,13 @@ void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDat
 		}
 
 		//
-		subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TRAIN);
+		subnets[i]->train(newDataInput);
 
 		shmea::GTable testInputFile = *stratifiedInputFiles[i];
 		if (testInputFile.numberOfCols() > 0)
 		{
 			// Test our validation set
-			subnets[i]->run(newDataInput, Arnold, glades::NNetwork::RUN_TEST);
+			subnets[i]->test(newDataInput);
 			cvAccuracy += subnets[i]->getAccuracy();
 		}
 	}
