@@ -39,6 +39,8 @@ public:
 
     void addSample(float x, float y);
     void fit();
+    void printInput() const;
+    void print() const;
 
     std::pair<float, float> predict(float x) const;
 
@@ -65,15 +67,19 @@ private:
 // Bayesian Optimization with Gaussian Process
 class BayesianOptimizer
 {
+private:
+    float best_param_;
+    float best_score_;
+    GaussianProcess gp_;
+
 public:
-    BayesianOptimizer(float min, float max, size_t num_iterations, float length_scale = 1.0, float variance = 1.0)
-        : min_val(min), max_val(max), iterations(num_iterations), best_param_(min), best_score_(-std::numeric_limits<float>::max()), gp_(length_scale, variance)
-{
+    BayesianOptimizer()
+    {
         srand(static_cast<unsigned>(time(0)));
     }
 
-    void optimize();
-
+    float optimize(const std::vector<std::pair<float, float> >);
+    void update(const std::pair<float, float>);
     float getBestParam() const { return best_param_; }
     float getBestScore() const { return best_score_; }
     const GaussianProcess& getGP() const { return gp_; }
@@ -89,36 +95,25 @@ public:
 	return exp(-0.5 * x * x) / sqrt(2 * M_PI);
     }
 
-// Acquisition Function: Expected Improvement
-float expectedImprovement(float x, const GaussianProcess& gp, float best_y)
-{
-    std::pair<float, float> prediction = gp.predict(x);
-    float mu = prediction.first;
-    float sigma2 = prediction.second;
-    float sigma = sqrt(sigma2);
-
-    float z = (mu - best_y) / sigma;
-    return (mu - best_y) * cdf(z) + sigma * pdf(z);
-}
-
-
-private:
-    float min_val;
-    float max_val;
-    size_t iterations;
-    float best_param_;
-    float best_score_;
-    GaussianProcess gp_;
-
-    float randomSample() const;
-    float findNextSample();
-
-    // Objective function: For demonstration, we'll use a quadratic function
-    static float objectiveFunction(float x)
+    // Acquisition Function: Expected Improvement
+    float expectedImprovement(float x, const GaussianProcess& gp, float best_y)
     {
-	return -pow(x - 3.0, 2) + 10.0; // Maximize this function
+	std::pair<float, float> prediction = gp.predict(x);
+	float mu = prediction.first;
+	float sigma2 = prediction.second;
+	float sigma = sqrt(sigma2);
+
+	float z = (mu - best_y) / sigma;
+	return (mu - best_y) * cdf(z) + sigma * pdf(z);
     }
 
+    void print() const
+    {
+	std::cout << "Best parameter: " << best_param_ << std::endl;
+	std::cout << "Best score: " << best_score_ << std::endl;
+
+	gp_.print();
+    }
 };
 
 };

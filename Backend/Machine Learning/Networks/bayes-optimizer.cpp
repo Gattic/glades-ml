@@ -10,17 +10,17 @@ void GaussianProcess::addSample(float x, float y)
 
 void GaussianProcess::fit()
 {
-    int n = X_.size();
+    unsigned int n = X_.size();
     K_.resize(n);
-    for (int i = 0; i < n; ++i)
+    for (unsigned int i = 0; i < n; ++i)
     {
         K_[i].resize(n);
     }
 
     // Build the covariance matrix
-    for (int i = 0; i < n; ++i)
+    for (unsigned int i = 0; i < n; ++i)
     {
-        for (int j = 0; j < n; ++j)
+        for (unsigned int j = 0; j < n; ++j)
         {
             K_[i][j] = rbfKernel(X_[i], X_[j], length_scale_, variance_);
         }
@@ -33,20 +33,20 @@ void GaussianProcess::fit()
 
 std::pair<float, float> GaussianProcess::predict(float x) const
 {
-    int n = X_.size();
+    unsigned int n = X_.size();
     std::vector<float> k(n);
 
     // Compute k vector
-    for (int i = 0; i < n; ++i)
+    for (unsigned int i = 0; i < n; ++i)
     {
         k[i] = rbfKernel(X_[i], x, length_scale_, variance_);
     }
 
     // Compute mean prediction (mu)
     float mu = 0.0f;
-    for (int i = 0; i < n; ++i)
+    for (unsigned int i = 0; i < n; ++i)
     {
-        for (int j = 0; j < n; ++j)
+        for (unsigned int j = 0; j < n; ++j)
         {
             mu += k[i] * K_inv_[i][j] * y_[j];
         }
@@ -54,9 +54,9 @@ std::pair<float, float> GaussianProcess::predict(float x) const
 
     // Compute variance (sigma^2)
     float sigma2 = rbfKernel(x, x, length_scale_, variance_);
-    for (int i = 0; i < n; ++i)
+    for (unsigned int i = 0; i < n; ++i)
     {
-        for (int j = 0; j < n; ++j)
+        for (unsigned int j = 0; j < n; ++j)
         {
             sigma2 -= k[i] * K_inv_[i][j] * k[j];
         }
@@ -68,31 +68,31 @@ std::pair<float, float> GaussianProcess::predict(float x) const
 // Matrix inversion using Gaussian elimination (for small matrices)
 std::vector<std::vector<float> > GaussianProcess::invertMatrix(const std::vector<std::vector<float> >& matrix) const
 {
-    int n = matrix.size();
+    unsigned int n = matrix.size();
     std::vector<std::vector<float> > inv_matrix(n, std::vector<float>(n, 0.0f));
     std::vector<std::vector<float> > A = matrix;
 
     // Initialize the identity matrix
-    for (int i = 0; i < n; ++i)
+    for (unsigned int i = 0; i < n; ++i)
     {
         inv_matrix[i][i] = 1.0f;
     }
 
     // Gaussian elimination
-    for (int i = 0; i < n; ++i)
+    for (unsigned int i = 0; i < n; ++i)
     {
         float diag_element = A[i][i];
-        for (int j = 0; j < n; ++j)
+        for (unsigned int j = 0; j < n; ++j)
         {
             A[i][j] /= diag_element;
             inv_matrix[i][j] /= diag_element;
         }
-        for (int k = 0; k < n; ++k)
+        for (unsigned int k = 0; k < n; ++k)
         {
             if (k != i)
     	{
                 float factor = A[k][i];
-                for (int j = 0; j < n; ++j)
+                for (unsigned int j = 0; j < n; ++j)
     	    {
                     A[k][j] -= factor * A[i][j];
                     inv_matrix[k][j] -= factor * inv_matrix[i][j];
@@ -104,63 +104,101 @@ std::vector<std::vector<float> > GaussianProcess::invertMatrix(const std::vector
     return inv_matrix;
 }
 
-void BayesianOptimizer::optimize()
+void GaussianProcess::printInput() const
 {
-    // Initial random sampling
-    for (int i = 0; i < 10; ++i)
-    {
-        float param = randomSample();
-        float score = objectiveFunction(param);
-        gp_.addSample(param, score);
-        if (score > best_score_)
-        {
-            best_score_ = score;
-            best_param_ = param;
-        }
-    }
+	printf("X: ");
+	for (unsigned int i = 0; i < X_.size(); ++i)
+	{
+		printf("%f ", X_[i]);
+	}
+	printf("\n");
 
-    gp_.fit();
-
-    // Iteratively sample using EI acquisition function
-    for (size_t i = 0; i < iterations; ++i)
-    {
-        float param = findNextSample();
-        float score = objectiveFunction(param);
-        gp_.addSample(param, score);
-        gp_.fit();
-
-        if (score > best_score_)
-        {
-            best_score_ = score;
-            best_param_ = param;
-        }
-
-        // Print out the current iteration
-	printf("[BAYES OPT] Iteration %lu: param = %f, score = %f\n", i + 1, param, score);
-    }
-
-    printf("[BAYES OPT] Best parameter found: %f with score: %f\n", best_param_, best_score_);
+	printf("Y: ");
+	for (unsigned int i = 0; i < y_.size(); ++i)
+	{
+		printf("%f ", y_[i]);
+	}
+	printf("\n");
 }
 
-float BayesianOptimizer::randomSample() const
+void GaussianProcess::print() const
 {
-    return min_val + static_cast<float>(rand()) / (static_cast<float>(RAND_MAX / (max_val - min_val)));
+	printf("K: \n");
+	for (unsigned int i = 0; i < K_.size(); ++i)
+	{
+		for (unsigned int j = 0; j < K_[i].size(); ++j)
+		{
+			printf("%f ", K_[i][j]);
+		}
+		printf("\n");
+	}
+
+	printf("K_inv: \n");
+	for (unsigned int i = 0; i < K_inv_.size(); ++i)
+	{
+		for (unsigned int j = 0; j < K_inv_[i].size(); ++j)
+		{
+			printf("%f ", K_inv_[i][j]);
+		}
+		printf("\n");
+	}
 }
 
-float BayesianOptimizer::findNextSample()
+float BayesianOptimizer::optimize(std::vector<std::pair<float, float> > data)
 {
-    float best_ei = -std::numeric_limits<float>::max();
-    float best_x = min_val;
+	// Step 1: Initialize the Gaussian Process
+	for (unsigned int i = 0; i < data.size(); ++i)
+	{
+		//printf("Adding sample: %f\t %f\n", data[i].first, data[i].second);
+		gp_.addSample(data[i].first, data[i].second);
+	}
+	gp_.fit();
 
-    for (float x = min_val; x <= max_val; x += 0.01f)
-    {
-        float ei = expectedImprovement(x, gp_, best_score_);
-        if (ei > best_ei)
-        {
-            best_ei = ei;
-            best_x = x;
-        }
-    }
+	printf("--------------------\n");
 
-    return best_x;
+	// Step 2: Optimize the acquisition function
+	float best_score = -1.0f;
+	float best_param = 0.0f;
+	for (float x = 0.001f; x <= 0.3; x += 0.001f)
+	{
+		float score = expectedImprovement(x, gp_, best_score);
+		//printf("x:score: %f\t: %f\n", x, score);
+		if (score > best_score)
+		{
+			//printf("New Best Score: %f\n", score);
+			best_score = score;
+			best_param = x;
+		}
+	}
+
+	std::cout << "Best parameter: " << best_param << std::endl;
+	std::cout << "Best score: " << best_score << std::endl;
+
+    return best_param;
+}
+
+void BayesianOptimizer::update(std::pair<float, float> row)
+{
+	// Step 3: Evaluate the objective function
+	float y = row.second;
+	gp_.addSample(row.first, y);
+	gp_.fit();
+
+	// Repeat Steps 2 and 3 until convergence
+	
+	// Step 2: Optimize the acquisition function
+	float best_score = -1.0f;
+	float best_param = 0.0f;
+	for (float x = 0.0f; x <= 10.0f; x += 0.01f)
+	{
+		float score = expectedImprovement(x, gp_, best_score);
+		if (score > best_score)
+		{
+			best_score = score;
+			best_param = x;
+		}
+	}
+
+	std::cout << "Best parameter: " << best_param << std::endl;
+	std::cout << "Best score: " << best_score << std::endl;
 }
