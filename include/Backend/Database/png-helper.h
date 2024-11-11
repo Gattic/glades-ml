@@ -18,6 +18,9 @@
 #define _PNG_HELPER
 
 #include <iostream>
+#include <sstream>
+#include <errno.h>
+#include <sys/stat.h>
 #include <cstring>
 #include <string>
 #include <cmath>

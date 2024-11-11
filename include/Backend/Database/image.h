@@ -134,6 +134,10 @@ public:
 
 	std::vector<unsigned char> getPixels() const;
 
+	void drawVerticalGradient(int, int, RGBA, RGBA, int);
+
+	RGBA averageColor(int, int, int, int);
+
 	RGBA GetPixel(unsigned int x, unsigned int y) const
 	{
 		if (!(x < width))
