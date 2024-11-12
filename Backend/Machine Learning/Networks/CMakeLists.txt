@@ -6,6 +6,7 @@ set(Networks_src_files
 	RNN.cpp
 	RNN.h
 	bayes.cpp
+	bayes-optimizer.cpp
 )
 add_library(Networks ${Networks_src_files})
 

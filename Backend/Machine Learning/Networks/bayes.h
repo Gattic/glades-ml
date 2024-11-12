@@ -44,12 +44,14 @@ public:
 		//
 	}
 
+	shmea::GTable import(const shmea::GList&);
 	shmea::GTable import(const shmea::GTable&);
-	shmea::GTable import2(const shmea::GTable&);
 	void train(const shmea::GTable&);
 	int predict(const shmea::GList&);
 	void print() const;
 	void reset();
+
+	std::string getClassName(int) const;
 };
 };
 

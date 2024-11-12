@@ -39,18 +39,18 @@ glades::RNN::~RNN()
 	//
 }
 
-void glades::RNN::beforeFwdEdge(const NetworkState* netState)
+void glades::RNN::beforeFwdEdge(const NetworkState& netState)
 {
 	//
 }
 
-void glades::RNN::beforeFwdNode(const NetworkState* netState)
+void glades::RNN::beforeFwdNode(const NetworkState& netState)
 {
-	netState->cOutputNode->setActivationScalar(meat->getTimeState(
-		netState->cOutputLayerCounter, netState->cOutputNodeCounter, netState->cInputNodeCounter));
+	netState.cOutputNode->setActivationScalar(meat.getTimeState(
+		netState.cOutputLayerCounter, netState.cOutputNodeCounter, netState.cInputNodeCounter));
 }
 
-void glades::RNN::beforeFwdLayer(const NetworkState* netState)
+void glades::RNN::beforeFwdLayer(const NetworkState& netState)
 {
 	//
 }
@@ -60,17 +60,17 @@ void glades::RNN::beforeFwd()
 	//
 }
 
-void glades::RNN::beforeBackEdge(const NetworkState* netState)
+void glades::RNN::beforeBackEdge(const NetworkState& netState)
 {
 	//
 }
 
-void glades::RNN::beforeBackNode(const NetworkState* netState)
+void glades::RNN::beforeBackNode(const NetworkState& netState)
 {
 	//
 }
 
-void glades::RNN::beforeBackLayer(const NetworkState* netState)
+void glades::RNN::beforeBackLayer(const NetworkState& netState)
 {
 	//
 }
@@ -80,23 +80,23 @@ void glades::RNN::beforeBack()
 	//
 }
 
-void glades::RNN::afterFwdEdge(const NetworkState* netState)
+void glades::RNN::afterFwdEdge(const NetworkState& netState)
 {
 	//
 }
 
-void glades::RNN::afterFwdNode(const NetworkState* netState, float cOutputNodeActivation)
+void glades::RNN::afterFwdNode(const NetworkState& netState, float cOutputNodeActivation)
 {
-	/*meat->setTimeState(netState->cOutputLayerCounter, netState->cOutputNodeCounter,
-					   netState->cOutputNode->getActivation());*/
+	/*meat.setTimeState(netState.cOutputLayerCounter, netState.cOutputNodeCounter,
+					   netState.cOutputNode->getActivation());*/
 }
 
-void glades::RNN::afterFwdLayer(const NetworkState* netState, float cOutputLayerActivation)
+void glades::RNN::afterFwdLayer(const NetworkState& netState, float cOutputLayerActivation)
 {
-	int cLayer = netState->cOutputLayerCounter > 0 ? netState->cInputLayerCounter + 1
-												   : netState->cInputLayerCounter;
-	meat->setTimeState(netState->cOutputLayerCounter, netState->cOutputNodeCounter,
-					   netState->cInputNodeCounter, cOutputLayerActivation);
+	int cLayer = netState.cOutputLayerCounter > 0 ? netState.cInputLayerCounter + 1
+												   : netState.cInputLayerCounter;
+	meat.setTimeState(netState.cOutputLayerCounter, netState.cOutputNodeCounter,
+					   netState.cInputNodeCounter, cOutputLayerActivation);
 }
 
 void glades::RNN::afterFwd()
@@ -104,17 +104,17 @@ void glades::RNN::afterFwd()
 	//
 }
 
-void glades::RNN::afterBackEdge(const NetworkState* netState)
+void glades::RNN::afterBackEdge(const NetworkState& netState)
 {
 	//
 }
 
-void glades::RNN::afterBackNode(const NetworkState* netState)
+void glades::RNN::afterBackNode(const NetworkState& netState)
 {
 	//
 }
 
-void glades::RNN::afterBackLayer(const NetworkState* netState)
+void glades::RNN::afterBackLayer(const NetworkState& netState)
 {
 	//
 }

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <vector> 
 
 class RUBackgroundComponent;
 
@@ -131,6 +132,12 @@ public:
 		return width*height;
 	}
 
+	std::vector<unsigned char> getPixels() const;
+
+	void drawVerticalGradient(int, int, RGBA, RGBA, int);
+
+	RGBA averageColor(int, int, int, int);
+
 	RGBA GetPixel(unsigned int x, unsigned int y) const
 	{
 		if (!(x < width))
@@ -165,7 +172,7 @@ public:
 	bool SavePPM(const GString&) const;
 	bool SavePBM(const GString&) const;
 	void LoadBMP(const GString&);
-
+	void SavePNG(const GString&) const;
 	void LoadPNG(const GString&);
 
 	shmea::GList flatten() const;
