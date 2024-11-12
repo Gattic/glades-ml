@@ -33,9 +33,10 @@ using namespace glades;
  * @details create a new NNInfo object
  * @param newName the NNInfo object's desired name
  */
-glades::NNInfo::NNInfo(const std::string& newName)
+glades::NNInfo::NNInfo(const shmea::GString& newName)
 {
 	name = newName;
+	inputType = 0;
 	hiddenLayerCount = 0;
 }
 
@@ -47,10 +48,11 @@ glades::NNInfo::NNInfo(const std::string& newName)
  * @param hidden the desired hidden layers
  * @param newOutputLayer the desired output layer
  */
-glades::NNInfo::NNInfo(const std::string& newName, InputLayerInfo* newInputLayer,
+glades::NNInfo::NNInfo(const shmea::GString& newName, InputLayerInfo* newInputLayer,
 					   const std::vector<HiddenLayerInfo*>& hidden, OutputLayerInfo* newOutputLayer)
 {
 	name = newName;
+	inputType = 0;
 	hiddenLayerCount = hidden.size();
 	inputLayer = newInputLayer;
 	outputLayer = newOutputLayer;
@@ -65,7 +67,7 @@ glades::NNInfo::NNInfo(const std::string& newName, InputLayerInfo* newInputLayer
  * @details create a new NNInfo object from a GTable
  * @param  newTable the table storing the NNInfo data
  */
-glades::NNInfo::NNInfo(const std::string& newName, const shmea::GTable& newTable)
+glades::NNInfo::NNInfo(const shmea::GString& newName, const shmea::GTable& newTable)
 {
 	int rows = newTable.numberOfRows(), cols = newTable.numberOfCols(), r = 0;
 	if (cols < 10)
@@ -86,6 +88,7 @@ glades::NNInfo::NNInfo(const std::string& newName, const shmea::GTable& newTable
 glades::NNInfo::~NNInfo()
 {
 	name = "";
+	inputType = 0;
 	hiddenLayerCount = 0;
 	for (unsigned int i = 0; i < layers.size(); ++i)
 		delete layers[i];
@@ -105,9 +108,14 @@ glades::NNInfo::~NNInfo()
  * @details get NNInfo's name
  * @return the NNInfo's name
  */
-std::string glades::NNInfo::getName() const
+shmea::GString glades::NNInfo::getName() const
 {
 	return name;
+}
+
+int glades::NNInfo::getInputType() const
+{
+	return inputType;
 }
 
 /*!
@@ -134,7 +142,7 @@ float glades::NNInfo::getPInput() const
 	if (!inputLayer)
 		return 0.0f;
 
-	return inputLayer->getDropoutRate();
+	return inputLayer->getPDropout();
 }
 
 /*!
@@ -149,6 +157,16 @@ int glades::NNInfo::getBatchSize() const
 		return 1;
 
 	return inputLayer->getBatchSize();
+}
+
+/*!
+ * @brief get input layer
+ * @details get NNInfo's input layer
+ * @return the NNInfo's input layer
+ */
+InputLayerInfo* glades::NNInfo::getInputLayer() const
+{
+	return inputLayer;
 }
 
 /*!
@@ -221,13 +239,16 @@ unsigned int glades::NNInfo::getOutputLayerSize() const
  */
 float glades::NNInfo::getLearningRate(unsigned int index) const
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return 0.01f;
 
-	if (!layers[index])
+	if(index == 0)
+	    return inputLayer->getLearningRate();
+
+	if (!layers[index-1])
 		return 0.01f;
 
-	return layers[index]->getLearningRate();
+	return layers[index-1]->getLearningRate();
 }
 
 /*!
@@ -238,30 +259,56 @@ float glades::NNInfo::getLearningRate(unsigned int index) const
  */
 float glades::NNInfo::getMomentumFactor(unsigned int index) const
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return 0.0f;
 
-	if (!layers[index])
+	if(index == 0)
+	    return inputLayer->getMomentumFactor();
+
+	if (!layers[index-1])
 		return 0.0f;
 
-	return layers[index]->getMomentumFactor();
+	return layers[index-1]->getMomentumFactor();
 }
 
 /*!
- * @brief get weight decay
+ * @brief get weight decay L1
  * @details get NNInfo's weight decay
  * @param index the layer index
  * @return the NNInfo's weight decay
  */
-float glades::NNInfo::getWeightDecay(unsigned int index) const
+float glades::NNInfo::getWeightDecay1(unsigned int index) const
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return 0.0f;
 
-	if (!layers[index])
+	if(index == 0)
+	    return inputLayer->getWeightDecay1();
+
+	if (!layers[index-1])
 		return 0.0f;
 
-	return layers[index]->getWeightDecay();
+	return layers[index-1]->getWeightDecay1();
+}
+
+/*!
+ * @brief get weight decay L2
+ * @details get NNInfo's weight decay
+ * @param index the layer index
+ * @return the NNInfo's weight decay
+ */
+float glades::NNInfo::getWeightDecay2(unsigned int index) const
+{
+	if (index > layers.size())
+		return 0.0f;
+
+	if(index == 0)
+	    return inputLayer->getWeightDecay1();
+
+	if (!layers[index-1])
+		return 0.0f;
+
+	return layers[index-1]->getWeightDecay2();
 }
 
 /*!
@@ -271,15 +318,18 @@ float glades::NNInfo::getWeightDecay(unsigned int index) const
  * @param index the layer index
  * @return the NNInfo's hidden layer dropout rate
  */
-float glades::NNInfo::getPHidden(unsigned int index) const
+float glades::NNInfo::getPDropout(unsigned int index) const
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return 1.0f;
 
-	if (!layers[index])
+	if(index == 0)
+	    return inputLayer->getPDropout();
+
+	if (!layers[index-1])
 		return 1.0f;
 
-	return layers[index]->getPHidden();
+	return layers[index-1]->getPDropout();
 }
 
 /*!
@@ -290,12 +340,16 @@ float glades::NNInfo::getPHidden(unsigned int index) const
  */
 int glades::NNInfo::getActivationType(unsigned int index) const
 {
-	if (index >= layers.size())
-		return 0;
-	if (!layers[index])
+	if (index > layers.size())
 		return 0;
 
-	return layers[index]->getActivationType();
+	if(index == 0)
+	    return inputLayer->getActivationType();
+
+	if (!layers[index-1])
+		return 0;
+
+	return layers[index-1]->getActivationType();
 }
 
 /*!
@@ -306,12 +360,16 @@ int glades::NNInfo::getActivationType(unsigned int index) const
  */
 float glades::NNInfo::getActivationParam(unsigned int index) const
 {
-	if (index >= layers.size())
-		return 0;
-	if (!layers[index])
+	if (index > layers.size())
 		return 0;
 
-	return layers[index]->getActivationParam();
+	if(index == 0)
+	    return inputLayer->getActivationParam();
+
+	if (!layers[index-1])
+		return 0;
+
+	return layers[index-1]->getActivationParam();
 }
 
 /*!
@@ -323,12 +381,11 @@ void glades::NNInfo::print() const
 	std::vector<shmea::GString> headers;
 	headers.push_back("Layer");
 	headers.push_back("Size");
-	headers.push_back("pInput");
 	headers.push_back("batchSize");
 	headers.push_back("lrnRate");
 	headers.push_back("mFactor");
 	headers.push_back("wDecay");
-	headers.push_back("pHidden");
+	headers.push_back("pDropout");
 	headers.push_back("actvtn");
 	headers.push_back("actParam");
 	headers.push_back("cost");
@@ -379,9 +436,14 @@ void glades::NNInfo::print() const
  * @details set NNInfo's name
  * @param newName the desired name for this NNInfo object
  */
-void glades::NNInfo::setName(std::string newName)
+void glades::NNInfo::setName(shmea::GString newName)
 {
 	name = newName;
+}
+
+void glades::NNInfo::setInputType(int newInputype)
+{
+	inputType = newInputype;
 }
 
 /*!
@@ -394,7 +456,7 @@ void glades::NNInfo::setPInput(float newPInput)
 	if (!inputLayer)
 		return;
 
-	inputLayer->setDropoutRate(newPInput);
+	inputLayer->setPDropout(newPInput);
 }
 
 /*!
@@ -455,13 +517,18 @@ void glades::NNInfo::setLayers(const std::vector<HiddenLayerInfo*>& newLayers)
  */
 void glades::NNInfo::setLearningRate(unsigned int index, float newLearningRate)
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return;
+	
+	if(index == 0)
+	    inputLayer->setLearningRate(newLearningRate);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
 
-	if (!layers[index])
-		return;
-
-	layers[index]->setLearningRate(newLearningRate);
+	    layers[index-1]->setLearningRate(newLearningRate);
+	}
 }
 
 /*!
@@ -472,47 +539,84 @@ void glades::NNInfo::setLearningRate(unsigned int index, float newLearningRate)
  */
 void glades::NNInfo::setMomentumFactor(unsigned int index, float newMomentumFactor)
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return;
 
-	if (!layers[index])
-		return;
+	if(index == 0)
+	    inputLayer->setMomentumFactor(newMomentumFactor);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
 
-	layers[index]->setMomentumFactor(newMomentumFactor);
+	    layers[index-1]->setMomentumFactor(newMomentumFactor);
+	}
 }
 
 /*!
- * @brief set weight decay
+ * @brief set weight decay L1
  * @details set NNInfo's weight decay
  * @param index the layer index
  * @param newWeightDecay the desired weight decay for this NNInfo object
  */
-void glades::NNInfo::setWeightDecay(unsigned int index, float newWeightDecay)
+void glades::NNInfo::setWeightDecay1(unsigned int index, float newWeightDecay1)
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return;
 
-	if (!layers[index])
+	if(index == 0)
+	    inputLayer->setWeightDecay1(newWeightDecay1);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
+
+	    layers[index-1]->setWeightDecay1(newWeightDecay1);
+	}
+}
+
+/*!
+ * @brief set weight decay L2
+ * @details set NNInfo's weight decay
+ * @param index the layer index
+ * @param newWeightDecay the desired weight decay for this NNInfo object
+ */
+void glades::NNInfo::setWeightDecay2(unsigned int index, float newWeightDecay2)
+{
+	if (index > layers.size())
 		return;
 
-	layers[index]->setWeightDecay(newWeightDecay);
+	if(index == 0)
+	    inputLayer->setWeightDecay2(newWeightDecay2);
+	else
+	{
+	    if (!layers[index-2])
+		    return;
+
+	    layers[index-2]->setWeightDecay2(newWeightDecay2);
+	}
 }
 
 /*!
  * @brief set the p hidden
  * @details set the dropout rate for hidden layer index
  * @param index the layer index
- * @param newPHidden the desired input dropout rate
+ * @param newPDropout the desired input dropout rate
  */
-void glades::NNInfo::setPHidden(unsigned int index, float newPHidden)
+void glades::NNInfo::setPDropout(unsigned int index, float newPDropout)
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return;
 
-	if (!layers[index])
-		return;
+	if(index == 0)
+	    inputLayer->setPDropout(newPDropout);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
 
-	layers[index]->setPHidden(newPHidden);
+	    layers[index-1]->setPDropout(newPDropout);
+	}
 }
 
 /*!
@@ -523,13 +627,18 @@ void glades::NNInfo::setPHidden(unsigned int index, float newPHidden)
  */
 void glades::NNInfo::setActivationType(unsigned int index, int newActivationType)
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return;
 
-	if (!layers[index])
-		return;
+	if(index == 0)
+	    inputLayer->setActivationType(newActivationType);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
 
-	layers[index]->setActivationType(newActivationType);
+	    layers[index-1]->setActivationType(newActivationType);
+	}
 }
 
 /*!
@@ -540,13 +649,18 @@ void glades::NNInfo::setActivationType(unsigned int index, int newActivationType
  */
 void glades::NNInfo::setActivationParam(unsigned int index, float newActivationParam)
 {
-	if (index >= layers.size())
+	if (index > layers.size())
 		return;
 
-	if (!layers[index])
-		return;
+	if(index == 0)
+	    inputLayer->setActivationParam(newActivationParam);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
 
-	layers[index]->setActivationParam(newActivationParam);
+	    layers[index-1]->setActivationParam(newActivationParam);
+	}
 }
 
 void glades::NNInfo::addHiddenLayer(HiddenLayerInfo* newLayer)
@@ -576,7 +690,7 @@ void glades::NNInfo::copyHiddenLayer(unsigned int dst, unsigned int src)
 
 void glades::NNInfo::resizeHiddenLayers(unsigned int newCount)
 {
-	layers.resize(newCount, new HiddenLayerInfo(2, 0.01, 0.0, 0.0, 0.0, 0, 0.0));
+	layers.resize(newCount, new HiddenLayerInfo(2, 0.01, 0.0, 0.0, 0.0, 0.0, 0, 0.0));
 }
 
 void glades::NNInfo::removeHiddenLayer(unsigned int index)
@@ -598,12 +712,12 @@ shmea::GTable glades::NNInfo::toGTable() const
 {
 	std::vector<shmea::GString> headers;
 	headers.push_back("Size");
-	headers.push_back("pInput");
 	headers.push_back("batchSize");
 	headers.push_back("learningRate");
 	headers.push_back("momentumFactor");
-	headers.push_back("weightDecay");
-	headers.push_back("pHidden");
+	headers.push_back("weightDecay1");
+	headers.push_back("weightDecay2");
+	headers.push_back("pDropout");
 	headers.push_back("activationType");
 	headers.push_back("activationParam");
 	headers.push_back("outputType");
@@ -621,7 +735,7 @@ shmea::GTable glades::NNInfo::toGTable() const
  * @brief NNInfo to GTable
  * @details convert the layers in an NNInfo object to a GTable object
  */
-bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable& newTable)
+bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTable& newTable)
 {
 	if (newTable.numberOfRows() < 2)
 		return false;
@@ -633,8 +747,14 @@ bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable&
 		if (i == 0)
 		{
 			// Input Layer
-			inputLayer = new InputLayerInfo(newTable.getCell(i, COL_PINPUT).getFloat(),
-											newTable.getCell(i, COL_BATCH_SIZE).getLong());
+			inputLayer = new InputLayerInfo(newTable.getCell(i, COL_BATCH_SIZE).getLong(),//batch size not layer size
+									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
+									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
+									newTable.getCell(i, COL_PDROPOUT).getFloat(),
+									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
+									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());
 		}
 		else if (i == newTable.numberOfRows() - 1)
 		{
@@ -649,8 +769,9 @@ bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable&
 				new HiddenLayerInfo(newTable.getCell(i, COL_SIZE).getInt(),
 									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
 									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
-									newTable.getCell(i, COL_WEIGHT_DECAY).getFloat(),
-									newTable.getCell(i, COL_PHIDDEN).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
+									newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
+									newTable.getCell(i, COL_PDROPOUT).getFloat(),
 									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
 									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());
 			layers.push_back(newLayer);
@@ -663,7 +784,7 @@ bool glades::NNInfo::fromGTable(const std::string& netName, const shmea::GTable&
 	return true;
 }
 
-bool glades::NNInfo::load(const std::string& netName)
+bool glades::NNInfo::load(const shmea::GString& netName)
 {
 	name = netName;
 	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");

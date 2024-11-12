@@ -38,7 +38,8 @@ namespace shmea {
 class Serializable
 {
 private:
-	static const GString NEED_ESCAPING;
+	/* static const GString NEED_ESCAPING; */
+	static const char* NEED_ESCAPING;
 	static const char ESC_CHAR;
 
 	static GString escapeSeparators(const GType&);

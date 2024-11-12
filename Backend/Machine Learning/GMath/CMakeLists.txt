@@ -1,4 +1,5 @@
 set(GMath_src_files
+	pca.cpp
 	cmatrix.cpp
 	cmatrix.h
 	OHE.cpp

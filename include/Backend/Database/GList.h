@@ -19,6 +19,7 @@
 
 #include "GType.h"
 #include "GString.h"
+#include "GVector.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,13 +35,17 @@ class GList
 
 private:
 	//
+	//GVector<GType> items;
 	std::vector<GType> items;
+	float xMin;
+	float xMax;
+	float xRange;
 
 	//
-	void addPrimitive(int, const void*);
-	void insertPrimitive(unsigned int, int, const void*);
-	void addObject(int, const void*, int64_t);
-	void insertObject(unsigned int, int, const void*, int64_t);
+	void addPrimitive(GType::Type, const void*);
+	void insertPrimitive(unsigned int, GType::Type, const void*);
+	void addObject(GType::Type, const void*, int64_t);
+	void insertObject(unsigned int, GType::Type, const void*, int64_t);
 
 public:
 	GList();
@@ -50,6 +55,7 @@ public:
 
 	// sets
 	void copy(const GList&);
+	void loadWords(const GString&);
 	void addChar(char);
 	void insertChar(unsigned int, char);
 	void addShort(short);
@@ -88,6 +94,8 @@ public:
 	int getType(unsigned int) const;
 	unsigned int size() const;
 	bool empty() const;
+	void standardize();
+	float unstandardize(float) const;
 	void print() const;
 
 	// operators

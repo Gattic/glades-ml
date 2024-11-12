@@ -38,13 +38,12 @@ class Node
 private:
 	int64_t id;
 	float weight;
+	float errorDer;
 	float activationScalar;
 
 	// ml
 	std::vector<glades::Edge*> edges;
-	std::map<int, float> errorDer;
 	pthread_mutex_t* activationMutex;
-	pthread_mutex_t* edMutex;
 
 public:
 	static const int INIT_EMPTY = 0;
@@ -80,7 +79,7 @@ public:
 	void setActivation(unsigned int, float);
 	void setActivationScalar(float);
 	void clearActivation();
-	void setErrDer(int, float);
+	void adjustErrDer(float);
 	void clearErrDer();
 	void addPrevDelta(unsigned int, float);
 	void clearPrevDeltas(unsigned int);
@@ -90,7 +89,7 @@ public:
 	// weights functions
 	void initWeights(unsigned int, int);
 	void initWeights(unsigned int, float[], unsigned int, int, int);
-	void getDelta(unsigned int, float, float, float, float, float);
+	void getDelta(unsigned int, float, float, float, float, float, float);
 	void applyDeltas(unsigned int, int);
 };
 };

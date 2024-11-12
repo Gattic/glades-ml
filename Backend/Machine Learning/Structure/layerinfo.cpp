@@ -26,6 +26,13 @@ using namespace glades;
 glades::LayerInfo::LayerInfo(int newSize)
 {
 	lSize = newSize;
+	learningRate = 0.0f;
+	momentumFactor = 0.0f;
+	weightDecay1 = 0.0f;
+	weightDecay2 = 0.0f;
+	pDropout = 0.0f;
+	activationType = 0;
+	activationParam = 0;
 }
 
 /*!
@@ -47,6 +54,87 @@ unsigned int glades::LayerInfo::size() const
 	return lSize;
 }
 
+void glades::LayerInfo::copyParamsFrom(const LayerInfo* src)
+{
+	setSize(src->size());
+	learningRate = src->getLearningRate();
+	momentumFactor = src->getMomentumFactor();
+	weightDecay1 = src->getWeightDecay1();
+	weightDecay2 = src->getWeightDecay2();
+	pDropout = src->getPDropout();
+	activationType = src->getActivationType();
+}
+/*!
+ * @brief get learning rate
+ * @details get LayerInfo's learning rate
+ * @return the LayerInfo's learning rate
+ */
+float glades::LayerInfo::getLearningRate() const
+{
+	return learningRate;
+}
+
+/*!
+ * @brief get momentum factor
+ * @details get LayerInfo's momentum factor
+ * @return the LayerInfo's momentum factor
+ */
+float glades::LayerInfo::getMomentumFactor() const
+{
+	return momentumFactor;
+}
+
+/*!
+ * @brief get weight decay L1
+ * @details get LayerInfo's weight decay
+ * @return the LayerInfo's weight decay
+ */
+float glades::LayerInfo::getWeightDecay1() const
+{
+	return weightDecay1;
+}
+
+/*!
+ * @brief get weight decay L2
+ * @details get LayerInfo's weight decay
+ * @return the LayerInfo's weight decay
+ */
+float glades::LayerInfo::getWeightDecay2() const
+{
+	return weightDecay2;
+}
+
+/*!
+ * @brief get layer dropout rate
+ * @details get LayerInfo's layer dropout rate, the probability that training will drop
+ * neuron N
+ * @return the LayerInfo's layer dropout rate
+ */
+float glades::LayerInfo::getPDropout() const
+{
+	return pDropout;
+}
+
+/*!
+ * @brief get layer activation type
+ * @details get LayerInfo's layer activation type
+ * @return the LayerInfo's layer activation type
+ */
+int glades::LayerInfo::getActivationType() const
+{
+	return activationType;
+}
+
+/*!
+ * @brief get layer activation parameter
+ * @details get LayerInfo's layer activation parameter
+ * @return the LayerInfo's layer activation parameter
+ */
+float glades::LayerInfo::getActivationParam() const
+{
+	return activationParam;
+}
+
 /*!
  * @brief set size
  * @details set LayerInfo's size
@@ -55,4 +143,74 @@ unsigned int glades::LayerInfo::size() const
 void glades::LayerInfo::setSize(int newSize)
 {
 	lSize = newSize;
+}
+
+/*!
+ * @brief set learning rate
+ * @details set LayerInfo's learning rate
+ * @param newLearningRate the desired learning rate for this LayerInfo object
+ */
+void glades::LayerInfo::setLearningRate(float newLearningRate)
+{
+	learningRate = newLearningRate;
+}
+
+/*!
+ * @brief set momentum factor
+ * @details set LayerInfo's momentum factor
+ * @param newMomentumFactor the desired momentum factor for this LayerInfo object
+ */
+void glades::LayerInfo::setMomentumFactor(float newMomentumFactor)
+{
+	momentumFactor = newMomentumFactor;
+}
+
+/*!
+ * @brief set weight decay
+ * @details set LayerInfo's weight decay
+ * @param newWeightDecay the desired weight decay for this LayerInfo object
+ */
+void glades::LayerInfo::setWeightDecay1(float newWeightDecay1)
+{
+	weightDecay1 = newWeightDecay1;
+}
+
+/*!
+ * @brief set weight decay
+ * @details set LayerInfo's weight decay
+ * @param newWeightDecay the desired weight decay for this LayerInfo object
+ */
+void glades::LayerInfo::setWeightDecay2(float newWeightDecay2)
+{
+	weightDecay2 = newWeightDecay2;
+}
+
+/*!
+ * @brief set the p dropout
+ * @details set the dropout rate for layer index
+ * @param newPDropout the desired input dropout rate
+ */
+void LayerInfo::setPDropout(float newPDropout)
+{
+	pDropout = newPDropout;
+}
+
+/*!
+ * @brief set the activation type
+ * @details set the activation type
+ * @param newActivationType the desired activation type
+ */
+void glades::LayerInfo::setActivationType(int newActivationType)
+{
+	activationType = newActivationType;
+}
+
+/*!
+ * @brief set the activation parameter
+ * @details set the activation parameter to be used with certain activation types
+ * @param newActivationParam the desired activation parameter
+ */
+void glades::LayerInfo::setActivationParam(float newActivationParam)
+{
+	activationParam = newActivationParam;
 }

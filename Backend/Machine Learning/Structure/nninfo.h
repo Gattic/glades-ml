@@ -22,6 +22,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "Backend/Database/GString.h"
 
 namespace shmea {
 class GTable;
@@ -42,7 +43,8 @@ private:
 	friend NNetwork;
 	friend RNN;
 
-	std::string name;
+	shmea::GString name;
+	int inputType; // DataInput enum: 0 = csv, 1 = image, 2 = text
 	InputLayerInfo* inputLayer;
 	OutputLayerInfo* outputLayer;
 	std::vector<HiddenLayerInfo*> layers;
@@ -51,41 +53,43 @@ private:
 
 	//
 	shmea::GTable toGTable() const;
-	bool fromGTable(const std::string&, const shmea::GTable&);
+	bool fromGTable(const shmea::GString&, const shmea::GTable&);
 
 	// Database
-	bool load(const std::string&);
+	bool load(const shmea::GString&);
 	void save() const;
 
 public:
 	static const int BATCH_FULL = 0;
 	static const int BATCH_STOCHASTIC = 1;
 
-	// structure: size, pInput, batchSize, learningRate, momentumFactor, weightDecay, pHidden,
+	// structure: size, pInput, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout,
 	// activationType,
 	// activationParam, outputType
 	static const int COL_SIZE = 0;
-	static const int COL_PINPUT = 1;
-	static const int COL_BATCH_SIZE = 2;
-	static const int COL_LEARNING_RATE = 3;
-	static const int COL_MOMENTUM_FACTOR = 4;
-	static const int COL_WEIGHT_DECAY = 5;
-	static const int COL_PHIDDEN = 6;
+	static const int COL_BATCH_SIZE = 1;
+	static const int COL_LEARNING_RATE = 2;
+	static const int COL_MOMENTUM_FACTOR = 3;
+	static const int COL_WEIGHT_DECAY1 = 4;
+	static const int COL_WEIGHT_DECAY2 = 5;
+	static const int COL_PDROPOUT = 6;
 	static const int COL_ACTIVATION_TYPE = 7;
 	static const int COL_ACTIVATION_PARAM = 8;
 	static const int COL_OUTPUT_TYPE = 9;
 
-	NNInfo(const std::string&);
-	NNInfo(const std::string&, const shmea::GTable&);
-	NNInfo(const std::string&, InputLayerInfo*, const std::vector<HiddenLayerInfo*>&,
+	NNInfo(const shmea::GString&);
+	NNInfo(const shmea::GString&, const shmea::GTable&);
+	NNInfo(const shmea::GString&, InputLayerInfo*, const std::vector<HiddenLayerInfo*>&,
 		   OutputLayerInfo*);
 	~NNInfo();
 
 	// gets
-	std::string getName() const;
+	shmea::GString getName() const;
+	int getInputType() const;
 	int getOutputType() const;
 	float getPInput() const;
 	int getBatchSize() const;
+	InputLayerInfo* getInputLayer() const;
 	std::vector<HiddenLayerInfo*> getLayers() const;
 	int numHiddenLayers() const;
 	int getInputLayerSize() const;
@@ -93,14 +97,16 @@ public:
 	unsigned int getOutputLayerSize() const;
 	float getLearningRate(unsigned int) const;
 	float getMomentumFactor(unsigned int) const;
-	float getWeightDecay(unsigned int) const;
-	float getPHidden(unsigned int) const;
+	float getWeightDecay1(unsigned int) const;
+	float getWeightDecay2(unsigned int) const;
+	float getPDropout(unsigned int) const;
 	int getActivationType(unsigned int) const;
 	float getActivationParam(unsigned int) const;
 	void print() const;
 
 	// sets
-	void setName(std::string);
+	void setName(shmea::GString);
+	void setInputType(int);
 	void setOutputType(int);
 	void setOutputSize(int);
 	void setPInput(float);
@@ -108,8 +114,9 @@ public:
 	void setLayers(const std::vector<HiddenLayerInfo*>&);
 	void setLearningRate(unsigned int, float);
 	void setMomentumFactor(unsigned int, float);
-	void setWeightDecay(unsigned int, float);
-	void setPHidden(unsigned int, float);
+	void setWeightDecay1(unsigned int, float);
+	void setWeightDecay2(unsigned int, float);
+	void setPDropout(unsigned int, float);
 	void setActivationType(unsigned int, int);
 	void setActivationParam(unsigned int, float);
 	void addHiddenLayer(HiddenLayerInfo*);

@@ -22,32 +22,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include "GDeleter.h"
 #include "GPointer.h"
 
 namespace shmea {
 
 class GType
 {
+public:
+	enum Type
+	{
+		NULL_TYPE = -1,
+		BOOLEAN_TYPE = 0,
+		CHAR_TYPE = 1,
+		SHORT_TYPE = 2,
+		INT_TYPE = 3,
+		LONG_TYPE = 4,
+		FLOAT_TYPE = 5,
+		DOUBLE_TYPE = 6,
+		STRING_TYPE = 7,
+		FUNCTION_TYPE = 8,
+	};
 protected:
-	GPointer<char> block;
+	GPointer<char, array_deleter<char> > block;
 	unsigned int blockSize;
-	int type;
-
+	Type type;
 public:
 
 	const static unsigned int npos = -1;
-
-	// valueType
-	static const int NULL_TYPE = -1;
-	static const int BOOLEAN_TYPE = 0;
-	static const int CHAR_TYPE = 1;
-	static const int SHORT_TYPE = 2;
-	static const int INT_TYPE = 3;
-	static const int LONG_TYPE = 4;
-	static const int FLOAT_TYPE = 5;
-	static const int DOUBLE_TYPE = 6;
-	static const int STRING_TYPE = 7;
-	static const int FUNCTION_TYPE = 8;
 
 	GType();
 	GType(const GType&);
@@ -60,11 +62,12 @@ public:
 	GType(const double&);
 	GType(const char*);
 	GType(const char*, unsigned int);
-	GType(int, const void*, int64_t);
+	/* GType(int, const void*, int64_t); */
+	GType(Type, const void*, int64_t);
 	virtual ~GType();
 
 	// gets
-	int getType() const;
+	Type getType() const;
 	const char* c_str() const;
 	char getChar() const;
 	short getShort() const;
@@ -85,7 +88,7 @@ public:
 	unsigned int size() const;
 
 	// sets
-	void set(int, const void*, int64_t);
+	void set(Type, const void*, int64_t);
 
 	//= operators
 	GType& operator=(const GType&);

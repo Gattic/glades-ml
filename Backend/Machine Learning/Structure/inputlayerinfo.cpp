@@ -26,10 +26,20 @@ using namespace glades;
  * @param newSize the InputLayerInfo object's desired size
  * @param newDropout the dropout rate for the input layer
  */
-glades::InputLayerInfo::InputLayerInfo(float newDropout, int newBatchSize) : LayerInfo(0)
+glades::InputLayerInfo::InputLayerInfo(int newBatchSize,
+    float newLearningRate, float newMomentumFactor,
+    float newWeightDecay1, float newWeightDecay2, float newPDropout,
+    int newActivationType, float newActivationParam)
+	: LayerInfo(0)
 {
-	dropoutRate = newDropout;
 	batchSize = newBatchSize;
+	learningRate = newLearningRate;
+	momentumFactor = newMomentumFactor;
+	weightDecay1 = newWeightDecay1;
+	weightDecay2 = newWeightDecay2;
+	pDropout = newPDropout;
+	activationType = newActivationType;
+	activationParam = newActivationParam;
 }
 
 /*!
@@ -38,18 +48,7 @@ glades::InputLayerInfo::InputLayerInfo(float newDropout, int newBatchSize) : Lay
  */
 glades::InputLayerInfo::~InputLayerInfo()
 {
-	dropoutRate = 0.0f;
-}
-
-/*!
- * @brief get input layer dropout rate
- * @details get InputLayerInfo's dropout rate, the probability that training will use input node
- * N
- * @return the InputLayerInfo's dropout rate
- */
-float glades::InputLayerInfo::getDropoutRate() const
-{
-	return dropoutRate;
+	batchSize = 0;
 }
 
 /*!
@@ -71,30 +70,22 @@ int glades::InputLayerInfo::getBatchSize() const
 shmea::GList glades::InputLayerInfo::getGTableRow() const
 {
 	shmea::GList row;
-	// structure: size, pInput, batchSize, learningRate, momentumFactor, weightDecay, pHidden,
+	// structure: size, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout,
 	// activationType,
 	// activationParam, outputType
 	// -1 = "blank"/placeholder
 	row.addLong(-1);
-	row.addFloat(getDropoutRate());
 	row.addLong(getBatchSize());
-	for (int i = 0; i < 4; ++i)
-		row.addFloat(-1.0f);
-	row.addLong(-1);
-	row.addFloat(-1.0f);
-	row.addLong(-1);
+	row.addFloat(learningRate);
+	row.addFloat(momentumFactor);
+	row.addFloat(weightDecay1);
+	row.addFloat(weightDecay2);
+	row.addFloat(pDropout);
+	row.addLong(activationType);
+	row.addFloat(activationParam);
+	row.addLong(-1);//no output type for input layer
 
 	return row;
-}
-
-/*!
- * @brief set the dropout rate
- * @details set the dropout rate for this InputLayerInfo object
- * @param newDropout the desired dropout rate
- */
-void glades::InputLayerInfo::setDropoutRate(float newDropout)
-{
-	dropoutRate = newDropout;
 }
 
 /*!

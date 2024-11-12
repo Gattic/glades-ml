@@ -30,20 +30,17 @@ namespace glades {
 class InputLayerInfo : public LayerInfo
 {
 private:
-	float dropoutRate;
 	int batchSize;
 
 public:
-	InputLayerInfo(float, int);
-	~InputLayerInfo();
+	InputLayerInfo(int, float, float, float, float, float, int, float);
+	virtual ~InputLayerInfo();
 
 	// gets
-	float getDropoutRate() const;
 	int getBatchSize() const;
 	shmea::GList getGTableRow() const;
 
 	// sets
-	void setDropoutRate(float);
 	void setBatchSize(int);
 
 	int getLayerType() const;

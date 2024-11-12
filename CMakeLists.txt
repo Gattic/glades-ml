@@ -2,23 +2,31 @@ if(NOT (${CMAKE_BINARY_DIR} STREQUAL "${CMAKE_SOURCE_DIR}/build"))
 	message(FATAL_ERROR "Must be in \"build\" directory")
 endif()
 
+set (CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "default install path" FORCE)
+file(MAKE_DIRECTORY ${CMAKE_INSTALL_PREFIX}/include)
+
 #Init
 cmake_minimum_required(VERSION 3.5.1)
 set(CMAKE_CXX_STANDARD 98)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 #Compiler Flags
+#set(DEFAULT_BUILD_TYPE "Release")
 set(CMAKE_BUILD_TYPE Debug) # -g
-set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter")
-#set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(WIN32)
+	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static")
+else()
+	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC") # its set below
+	set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter")
+endif()
+
+set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 
 #Project
 project(glades)
 set(G_VERSION_MAJOR 0)
 set(G_VERSION_MINOR 57)
-
-set(DEFAULT_BUILD_TYPE "Release")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
@@ -103,6 +111,6 @@ add_custom_target(debug
 
 #make uninstall
 	add_custom_target(uninstall
-	COMMAND sudo xargs rm < ./build/install_manifest.txt
+	COMMAND xargs rm < ./build/install_manifest.txt
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )

@@ -20,6 +20,7 @@
 #include "GList.h"
 #include "GType.h"
 #include "GString.h"
+#include "GVector.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -36,8 +37,12 @@ private:
 	friend Serializable;
 
 	char delimiter;
+	//shmea::GVector<GString> header;
+	//shmea::GVector<GList> cells;
 	std::vector<GString> header;
 	std::vector<GList> cells;
+	/* std::vector<GString> header; */
+	/* std::vector<GList> cells; */
 	float xMin;
 	float xMax;
 	float xRange;
@@ -54,6 +59,7 @@ public:
 
 	GTable();
 	GTable(char);
+	//GTable(char, const GVector<GString>&);
 	GTable(char, const std::vector<GString>&);
 	GTable(const GString&, char, int);
 	GTable(const GTable&);
@@ -62,6 +68,8 @@ public:
 
 	// gets
 	char getDelimiter() const;
+	/* std::vector<GString> getHeaders() const; */
+	//GVector<GString> getHeaders() const;
 	std::vector<GString> getHeaders() const;
 	GString getHeader(unsigned int) const;
 	GType getCell(unsigned int, unsigned int) const;
@@ -92,6 +100,8 @@ public:
 	void moveCol(unsigned int, unsigned int);
 	void append(const GTable&);
 	void append(const GTable*);
+	/* void setHeaders(const std::vector<GString>&); */
+	//void setHeaders(const GVector<GString>&);
 	void setHeaders(const std::vector<GString>&);
 	void addHeader(unsigned int, const GString&);
 	void save(const GString&) const;

@@ -33,28 +33,24 @@ class Layer;
 class NNInfo;
 class NetworkState;
 class OHE;
+class DataInput;
 
 class LayerBuilder
 {
 private:
 	int netType;
-	shmea::GTable inputTable;
-	shmea::GTable expectedTable;
 	std::vector<Layer*> inputLayers;
 	std::vector<Layer*> layers;
 	float xMin;
 	float xMax;
 	float xRange;
-	std::vector<OHE*> OHEMaps;
-	std::vector<bool> featureIsCategorical;
 	std::vector<std::vector<std::vector<float> > > timeState;
 
 	void seperateTables(const shmea::GTable&);
-	void buildInputLayers(const NNInfo*);
+	void buildInputLayers(const NNInfo*, const DataInput*);
 	void buildHiddenLayers(const NNInfo*);
 	void buildOutputLayer(const NNInfo*);
 	void standardizeWeights(const NNInfo*);
-	shmea::GTable standardizeInputTable(const NNInfo*, const shmea::GTable&, int = 0);
 	float unstandardize(float);
 
 public:
@@ -62,19 +58,23 @@ public:
 	LayerBuilder(int);
 	~LayerBuilder();
 
-	bool build(const NNInfo*, const shmea::GTable&, bool = false);
+	bool build(const NNInfo*, const DataInput*, bool = false);
 	NetworkState* getNetworkStateFromLoc(unsigned int, unsigned int, unsigned int, unsigned int,
 										 unsigned int);
 	void setTimeState(unsigned int, unsigned int, unsigned int, float);
 	unsigned int getInputLayersSize() const;
 	unsigned int getLayersSize() const;
+	unsigned int getLayerSize(unsigned int) const;
+	unsigned int sizeOfLayer(unsigned int) const;
 	float getTimeState(unsigned int, unsigned int, unsigned int) const;
-	shmea::GTable getInput() const;
-	shmea::GTable getExpected() const;
 	void scrambleDropout(unsigned int, float, const std::vector<float>&);
 	void clearDropout();
 	void print(const NNInfo*, bool = false) const;
 	void clean();
+
+	// Getters
+	shmea::GList getWeights();
+	shmea::GList getActivations();
 
 	// Database
 	bool load(const std::string&);

@@ -37,6 +37,7 @@ private:
 	shmea::GString name;
 	shmea::GString ip;
 	int connectionType;
+	bool cryptEnabled;
 	int64_t key;
 	bool finished;
 
@@ -61,12 +62,15 @@ public:
 	shmea::GString getName() const;
 	shmea::GString getIP() const;
 	int getConnectionType() const;
+	bool isEncrypted() const;
 	int64_t getKey() const;
 	bool isFinished() const;
 
 	// sets
 	void setName(shmea::GString);
 	void setIP(shmea::GString);
+	void enableEncryption();
+	void disableEncryption();
 	void setKey(int64_t);
 
 	static bool validName(const shmea::GString&);
