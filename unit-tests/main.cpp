@@ -10,6 +10,7 @@
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
 #include "Backend/Machine Learning/bayes-optimizer-test.h"
+#include "Backend/Machine Learning/ohe-test.h"
 
 int main(int argc, char* argv[])
 {
@@ -20,6 +21,7 @@ int main(int argc, char* argv[])
 	PCAUnitTest();
 	BayesUnitTest();
 	BayesOptimizerUnitTest();
+	OHEUnitTest();
 
 	printf("========================\n");
 	printf("| Unit Tests Completed |\n");
