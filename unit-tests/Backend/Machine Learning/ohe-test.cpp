@@ -7,11 +7,16 @@
 // Robert Carneiro is strictly prohibited.
 
 #include "ohe-test.h"
-// #include "Backend/Database/GTable.h"
+#include "Backend/Database/GTable.h"
 
 #include "../../unit-test.h"
-// #include "Backend/Database/GList.h"
+#include "Backend/Database/GList.h"
 #include "../../../Backend/Machine Learning/GMath/OHE.h"
+#include "Backend/Database/GString.h"
+#include "Backend/Database/GList.h"
+#include "Backend/Database/GType.h"
+#include "Backend/Database/GString.h"
+#include "Backend/Database/GVector.h"
 
 
 // === Primary unit testing function ===
@@ -48,6 +53,21 @@ void OHEUnitTest() {
     G_assert(__FILE__, __LINE__, "Index retrieval for non-existing string failed", ohe.indexAt("bird") == -1);
 
 
+      
+    // Test mapFeatureSpace
+  	shmea::GString sampleData( "First,Last,Age\nMickey,Mouse,100\nDonald,Duck,99\n" );
+	shmea::GTable sampleDataTable( sampleData, ',', shmea::GTable::TYPE_STRING );
+
+    ohe.mapFeatureSpace(sampleDataTable, 0); // Column 0
+
+    G_assert(__FILE__, __LINE__, "Failed to get string 'Mickey'", ohe.contains("Mickey"));
+    G_assert(__FILE__, __LINE__, "Failed to get string 'Donald'", ohe.contains("Donald"));
+    
+    
+    // Test Print features (visual validation or mock testing for printf)
+    ohe.printFeatures(); // Expected output: "[OHE] cat dog Mickey Donald "
+
+  
     printf("OHEUnitTest completed successfully.\n");
 
 }
