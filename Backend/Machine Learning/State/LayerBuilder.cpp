@@ -30,6 +30,9 @@
 #include "edge.h"
 #include "layer.h"
 #include "node.h"
+// #include <ctime>    // For clock()
+// #include <cstdio>   // For printf
+// #include <vector>   // For vector
 
 using namespace glades;
 
@@ -96,50 +99,70 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInp
 
 void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataInput* di)
 {
+	clock_t startFunction = clock();  // Overall function start time
+
+	unsigned int featureCount = di->getFeatureCount(); 
+	unsigned int trainsize = di->getTrainSize();
+	unsigned int inputLayerssize = inputLayers.size();
 	// Needs something to train/test on
-	if (di->getTrainSize() == 0)
+	if (trainsize == 0)
 		return;
 
 	// Input and Output columns
-	if (di->getFeatureCount() < 1)
+	if (featureCount < 1)
 		return;
 
 	// TODO: SPEED THIS UP FOR IMAGES!!!!!!!!!!!
 	inputLayers.clear();
-	for (unsigned int r = 0; r < di->getTrainSize(); ++r)
+	// unsigned int t = di->getTrainSize();
+	printf("Train size: %d\n", trainsize);
+
+	clock_t startOuterLoop = clock();  // Start time for the outer loop
+	for (unsigned int r = 0; r < trainsize; ++r)
 	{
+		clock_t startInnerLoop = clock();  // Start time for the inner loop
+
 		printf("[GQL] Building input layer %d\n", r);
 		Layer* cLayer = new Layer(Layer::INPUT_TYPE, false);
-		for (unsigned int c = 0; c < di->getFeatureCount(); ++c)
+
+		// for (unsigned int c = 0; c < featureCount; ++c)
+		// {
+		// 	// We can probably get rid of most of these conditions becuase Gtype auto types
+		// 	float newWeight = 0.0f;
+		// 	shmea::GType cCell = di->getTrainRow(r)[c];
+		// }
+
+		for (unsigned int c = 0; c < featureCount; ++c)
 		{
 			// We can probably get rid of most of these conditions becuase Gtype auto types
 			float newWeight = 0.0f;
 			shmea::GType cCell = di->getTrainRow(r)[c];
-			//printf("[GQL] Fetched train row %d, col %d\n", r, c);
-			if (cCell.getType() == shmea::GType::STRING_TYPE)
-			{
-				// columns w/ strings NEED to be labeled categorical
-				if (!di->featureIsCategorical[c])
-				{
-					inputLayers.clear();
-					return;
-				}
-			}
-			else if (cCell.getType() == shmea::GType::CHAR_TYPE)
-				newWeight = cCell.getChar();
-			else if (cCell.getType() == shmea::GType::SHORT_TYPE)
-				newWeight = cCell.getShort();
-			else if (cCell.getType() == shmea::GType::INT_TYPE)
-				newWeight = cCell.getInt();
-			else if (cCell.getType() == shmea::GType::LONG_TYPE)
-				newWeight = cCell.getLong();
-			else if (cCell.getType() == shmea::GType::FLOAT_TYPE)
-				newWeight = cCell.getFloat();
-			else if (cCell.getType() == shmea::GType::DOUBLE_TYPE)
-				newWeight = cCell.getDouble();
-			else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
-				newWeight = cCell.getBoolean() ? 1.0f : 0.0f;
 
+			shmea::GType::Type cellType = cCell.getType(); 
+			// printf("Cell type %s",cellType);
+
+			switch (cellType)
+			{
+				case shmea::GType::STRING_TYPE:
+					if (!di->featureIsCategorical[c])
+					{
+						inputLayers.clear();
+						return;
+					}
+					break;
+				case shmea::GType::CHAR_TYPE:   newWeight = cCell.getChar();   break;
+				case shmea::GType::SHORT_TYPE:  newWeight = cCell.getShort();  break;
+				case shmea::GType::INT_TYPE:    newWeight = cCell.getInt();    break;
+				case shmea::GType::LONG_TYPE:   newWeight = cCell.getLong();   break;
+				case shmea::GType::FLOAT_TYPE:  newWeight = cCell.getFloat();  break;
+				case shmea::GType::DOUBLE_TYPE: newWeight = cCell.getDouble(); break;
+				case shmea::GType::BOOLEAN_TYPE:
+					newWeight = cCell.getBoolean() ? 1.0f : 0.0f;
+					break;
+				default:
+					break;  // Skip unsupported types
+			}
+			
 			// Error
 			Node* node = new Node();
 			if (!node)
@@ -152,13 +175,17 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 			cLayer->addNode(node);
 
 			// add the input layer to the dataset
-			bool lastCol = (c == (di->getFeatureCount() - 1));
-			if (lastCol)
+			// bool lastCol = (c == featureCount - 1);
+			if (c == featureCount - 1)
 			{
-			    printf("Adding input layer[%u:%u]: %d\n", r, di->getTrainSize(), inputLayers.size());
+			    printf("Adding input layer[%u:%u]: %d\n", r, trainsize, inputLayers.size());
 				inputLayers.push_back(cLayer);
 			}
 		}
+		
+		clock_t endInnerLoop = clock();  // End time for the inner loop
+        printf("Time for inner loop (row %u): %.3f ms\n", r,
+               1000.0 * (endInnerLoop - startInnerLoop) / CLOCKS_PER_SEC);
 	}
 }
 

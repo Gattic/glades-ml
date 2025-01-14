@@ -172,8 +172,9 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestImage(unsigned int row) c
 
 shmea::GList ImageInput::getTrainRow(unsigned int index) const
 {
-    if(index >= trainingLegend.numberOfRows())
-	return emptyRow;
+    static const unsigned int numRows = trainingLegend.numberOfRows(); // Cache number of rows
+    if (index >= numRows)
+        return emptyRow;
 
     shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
     shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(index, 0).c_str();
