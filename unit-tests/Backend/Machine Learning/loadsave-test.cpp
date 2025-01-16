@@ -104,6 +104,21 @@ void RunNNTest(const std::string& netName, const std::string& inputFileName, int
         printf("Trained network saved to: %s\n", savePath.c_str());
     }
 
+    // TEST LOADING THE FILES
+    printf("TEST LOADING THE FILES TO GTABLE");
+	shmea::SaveFolder* nnList2 = new shmea::SaveFolder("xornet_model");
+	nnList2->load();
+    // nnList2->loadFolders();
+	std::vector<shmea::SaveTable*> saveTables = nnList2->getItems();
+	for (unsigned int i = 0; i < saveTables.size(); ++i)
+	{
+		shmea::SaveTable* cItem = saveTables[i];
+		if (!cItem)
+			continue;
+
+	}
+
+
 
     // Clean up
     delete dataInput;
