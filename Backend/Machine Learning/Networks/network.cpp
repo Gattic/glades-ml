@@ -699,6 +699,27 @@ bool glades::NNetwork::load(const shmea::GString& netName)
 	return true;
 }
 
+shmea::GList glades::NNetwork::getWeightsNew() 
+{
+	// glades::LayerBuilder glades::NNetwork::meat
+	
+	// shmea::GList obtainedWeights = meat.getWeights();
+	shmea::GList weights = meat.getWeights();
+	printf("\nstart getWeightsNew\n");
+	weights.print();
+	printf("\nend getWeightsNew \n");
+	return weights; 
+}
+
+bool glades::NNetwork::saveBiasWeight(const std::string& netName) 
+{
+	
+	meat.save(netName);
+
+	return true;
+
+}
+
 bool glades::NNetwork::save() const
 {
 	if (!skeleton)

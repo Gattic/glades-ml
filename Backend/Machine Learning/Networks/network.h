@@ -128,7 +128,9 @@ public:
 	shmea::GString getName() const;
 	NNInfo* getNNInfo();
 	float getAccuracy() const;
-
+	shmea::GList getWeightsNew() ;
+	bool saveBiasWeight(const std::string& netName);
+	unsigned int getLayersSize() const;
 	// graphing
 	shmea::GList getLearningCurve() const;
 	// const std::vector<Point2*>& getROCCurve() const;
