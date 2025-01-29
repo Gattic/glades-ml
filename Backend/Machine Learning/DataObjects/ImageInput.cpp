@@ -172,6 +172,7 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestImage(unsigned int row) c
 
 shmea::GList ImageInput::getTrainRow(unsigned int index) const
 {
+    int inputType = glades::DataInput::IMAGE;
     static const unsigned int numRows = trainingLegend.numberOfRows(); // Cache number of rows
     if (index >= numRows)
         return emptyRow;
@@ -191,7 +192,7 @@ shmea::GList ImageInput::getTrainRow(unsigned int index) const
 	
     // Return the image
     shmea::GList retList = itr->second->flatten();
-    retList.standardize();
+    retList.standardize(inputType);
     return retList;
 }
 
@@ -274,7 +275,7 @@ shmea::GList ImageInput::getTestRow(unsigned int index) const
 	
     // Return the image
     shmea::GList retList = itr->second->flatten();
-    retList.standardize();
+    retList.standardize(glades::DataInput::IMAGE);
     return retList;
 }
 
