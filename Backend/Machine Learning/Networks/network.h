@@ -129,7 +129,7 @@ public:
 	NNInfo* getNNInfo();
 	float getAccuracy() const;
 	shmea::GList getWeightsNew() ;
-	bool saveBiasWeight(const std::string& netName);
+	bool saveModel(const std::string& netName);
 	unsigned int getLayersSize() const;
 	// graphing
 	shmea::GList getLearningCurve() const;

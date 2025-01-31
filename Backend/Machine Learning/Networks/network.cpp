@@ -711,7 +711,7 @@ shmea::GList glades::NNetwork::getWeightsNew()
 	return weights; 
 }
 
-bool glades::NNetwork::saveBiasWeight(const std::string& netName) 
+bool glades::NNetwork::saveModel(const std::string& netName) 
 {
 	
 	meat.save(netName);
