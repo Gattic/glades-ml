@@ -4,7 +4,6 @@ callgrind.*
 build/*
 unit-tests/build/*
 database/*
-unit-tests/database/*
 *.sublime-workspace
 *.swp
 alpaca.key
