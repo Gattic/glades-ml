@@ -79,6 +79,13 @@ glades::NNetwork::~NNetwork()
 	resetGraphs();
 }
 
+int64_t NNetwork::getCurrentTimeMilliseconds() const
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return static_cast<unsigned long long>(tv.tv_sec) * 1000ULL + tv.tv_usec / 1000ULL;
+}
+
 bool glades::NNetwork::getRunning() const
 {
 	return running;
@@ -162,6 +169,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 	// arbitrary independent var (time dimension)
 	running = true;
 	firstRunActivation = false;
+	int64_t lastUpdateTime = 0;
 	while (running)
 	{
 		/*if (DEBUG_ADVANCED)
@@ -251,8 +259,11 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 		{
 			// Update the GUI with the metrics
 			//if(guiEnabled)
-			if(serverInstance && cConnection)
+			int64_t ms = getCurrentTimeMilliseconds();
+			int64_t timeDiff = ms - lastUpdateTime;
+			if ((serverInstance && cConnection) && ((epochs < 10) || (timeDiff > 16))) // 60fps
 			{
+				//printf("\n\nms - lastUpdateTime == diff;   %lld - %lld == %lld\n\n", ms, lastUpdateTime, timeDiff);
 				// First epoch is random
 				if (epochs > 0)
 				{
@@ -294,7 +305,6 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					    cData->setArgList(argData);
 					}
 					serverInstance->send(cData);
-					cNodeActivations.clear();
 
 
 					argData.clear();
@@ -340,8 +350,12 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					cData->setArgList(argData);
 					serverInstance->send(cData);
 				}
+
+				lastUpdateTime = ms;
 			}
 		}
+
+		cNodeActivations.clear();
 
 		// Update the scatter plot graph
 		/*if ((Frontend::simulationPanel) && (Frontend::simulationPanel->isFocused()))

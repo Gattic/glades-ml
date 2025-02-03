@@ -30,6 +30,8 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <iostream>
+#include <sys/time.h>
 
 class Point2;
 
@@ -111,6 +113,7 @@ public:
 	NNetwork();
 	NNetwork(NNInfo*);
 	virtual ~NNetwork();
+	int64_t getCurrentTimeMilliseconds() const;
 	bool getRunning() const;
 	int getEpochs() const;
 	void stop();
