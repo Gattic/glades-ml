@@ -72,10 +72,10 @@ void RunNNTest(const std::string& netName, const std::string& inputFileName, int
     printf("Network loaded successfully.\n");
 
     // Set network parameters
-    network.terminator.setEpoch(1);
+    network.terminator.setEpoch(100);
     shmea::GString val = network.getEpochs();
     printf("Current Epoch: %s\n", val.c_str());
-    network.terminator.setAccuracy(95);
+    network.terminator.setAccuracy(97);
 
     // Train the network
     try {
@@ -87,6 +87,7 @@ void RunNNTest(const std::string& netName, const std::string& inputFileName, int
         return;
     }
 
+    G_assert (__FILE__, __LINE__, "==============test::Accuracy() Failed==============", network.getAccuracy() < 97.0f);
     // Save the trained network
     if (!network.saveModel(savePath)) {
         printf("Error: Failed to save trained network to: %s\n", savePath.c_str());
