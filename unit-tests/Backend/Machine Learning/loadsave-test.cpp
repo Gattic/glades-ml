@@ -30,7 +30,7 @@ void RunNNTest(const std::string& netName, const std::string& inputFileName, int
     {
         dataInput = new glades::NumberInput();
     } 
-    else if (inputType == glades::DataInput::IMAGE)
+    else if (inputType == glades::DataInput::IMAGE) 
     {
         fullInputPath = "datasets/images/" + inputFileName;
         dataInput = new glades::ImageInput();
@@ -49,68 +49,68 @@ void RunNNTest(const std::string& netName, const std::string& inputFileName, int
     }
 
     // Import data
-    try 
-    {
-        dataInput->import(fullInputPath.c_str()); // Use standard C-string for import
-    } catch (...) 
-    {
+    try {
+        if (fullInputPath.empty()) {
+            printf("Error: Input file path is empty.\n");
+            // delete dataInput;
+            return;
+        }
+        dataInput->import(fullInputPath.c_str());
+    } catch (...) {
         printf("Failed to import data from %s\n", fullInputPath.c_str());
-       
+        // delete dataInput;  // Prevent memory leak
         return;
     }
 
-    printf("start %s",netName.c_str());
-    network.load(netName.c_str());
-    printf("end");
+    // Load the network
+    printf("Starting to load network: %s\n", netName.c_str());
+    if (!network.load(netName.c_str())) {
+        printf("Error: Failed to load network: %s\n", netName.c_str());
+        // delete dataInput;
+        return;
+    }
+    printf("Network loaded successfully.\n");
 
+    // Set network parameters
     network.terminator.setEpoch(1);
-    shmea::GString val ;
-    val = network.getEpochs();
-    printf("===== %f",val);
+    shmea::GString val = network.getEpochs();
+    printf("Current Epoch: %s\n", val.c_str());
     network.terminator.setAccuracy(95);
 
     // Train the network
-    network.train(dataInput);
+    try {
+        network.train(dataInput);
+        printf("Training completed successfully.\n");
+    } catch (...) {
+        printf("Error: Training failed for network: %s\n", netName.c_str());
+        // delete dataInput;
+        return;
+    }
 
-    
-    shmea::GTable saveMe;
-    shmea::SaveFolder* nnList = new shmea::SaveFolder(savePath.c_str());
-    
-
-    // Save the trained network directly using std::string
-    if (!network.saveModel(savePath)) 
-    {
-        printf("Failed to save trained network to: %s\n", savePath.c_str());
-    } 
-    else 
-    {
+    // Save the trained network
+    if (!network.saveModel(savePath)) {
+        printf("Error: Failed to save trained network to: %s\n", savePath.c_str());
+        // delete dataInput;
+        return;
+    } else {
         printf("Trained network saved to: %s\n", savePath.c_str());
     }
 
-    // TEST LOADING THE MODEL
-    printf("TEST LOADING THE FILES TO GTABLE");
-	shmea::SaveFolder* nnList2 = new shmea::SaveFolder(savePath.c_str());
-	// nnList2->load();
- 
-	// std::vector<shmea::SaveTable*> saveTables = nnList2->getItems();
-	// for (unsigned int i = 0; i < saveTables.size(); ++i)
-	// {
-	// 	shmea::SaveTable* cItem = saveTables[i];
-	// 	if (!cItem)
-	// 		continue;
+    // Test loading the saved model
+    printf("Testing loading the files into GTable...\n");
+    shmea::SaveFolder* nnList2 = new shmea::SaveFolder(savePath.c_str());
+    if (!nnList2) {
+        printf("Error: Failed to allocate memory for SaveFolder.\n");
+        // delete dataInput;
+        return;
+    }
 
-	// }
+    nnList2->loadItem(savePath.c_str());
 
-
-
-    // Clean up
-    delete dataInput;
-    printf("Test for network %s completed.\n", netName.c_str());
+    printf("Test for network %s completed successfully.\n", netName.c_str());
 }
 
-// Main function to run all tests
-void loadsave() 
-{
+void loadsave() {
     printf("============================================================\n");
     printf("Starting Neural Network Unit Tests\n");
     printf("============================================================\n");
@@ -122,4 +122,3 @@ void loadsave()
     printf("All Neural Network Unit Tests Completed\n");
     printf("============================================================\n");
 }
-
