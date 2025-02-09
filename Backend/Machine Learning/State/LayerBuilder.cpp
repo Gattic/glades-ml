@@ -561,7 +561,7 @@ void glades::LayerBuilder::clean()
  * @return whether or not the load was successful
  */
 bool glades::LayerBuilder::load(const shmea::GTable& networkData)
-{
+/*{
 	// We dont need to load the old instance (for now?)
 	if (!networkData)
 		return true;
@@ -627,12 +627,12 @@ bool glades::LayerBuilder::load(const shmea::GTable& networkData)
 	}
 
 	return false;
-}
+}*/
 
-// bool glades::LayerBuilder::load(const std::string& netName)
-// {
-// 	return false;
-// }
+bool glades::LayerBuilder::load(const std::string& netName)
+{
+	return false;
+}
 
 /*!
  * @brief save NNetwork
