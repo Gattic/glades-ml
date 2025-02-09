@@ -1,0 +1,4 @@
+Size,batchSize,learningRate,momentumFactor,weightDecay1,weightDecay2,pDropout,activationType,activationParam,outputType
+-1,1,0.001000,0.000000,0.000000,0.000000,0.000000,0,0.000000,-1
+3,1,0.001000,0.000000,0.000000,0.000000,0.000000,0,0.000000,-1
+2,1,-1.000000,-1.000000,-1.000000,-1.000000,-1.000000,-1,-1.000000,0
