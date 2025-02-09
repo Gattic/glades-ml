@@ -53,6 +53,9 @@ void ImageInput::import(shmea::GString newName)
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
 
+    // Convert the label to a string for classification
+    trainingLegend.setCell(i, 1, label);
+
 	// Add a label if it doesn't exist
 	if(trainImages.find(label) == trainImages.end())
 	{
@@ -79,6 +82,8 @@ void ImageInput::import(shmea::GString newName)
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
 
+    // Convert the label to a string for classification
+    testingLegend.setCell(i, 1, label);
 	// Add a label if it doesn't exist
 	if(testImages.find(label) == testImages.end())
 	{
@@ -257,6 +262,7 @@ shmea::GList ImageInput::getTestExpectedRow(unsigned int index) const
 
 shmea::GList ImageInput::getTestRow(unsigned int index) const
 {
+    int inputType = glades::DataInput::IMAGE;
     if(index >= testingLegend.numberOfRows())
 	return shmea::GList();
 
@@ -275,7 +281,7 @@ shmea::GList ImageInput::getTestRow(unsigned int index) const
 	
     // Return the image
     shmea::GList retList = itr->second->flatten();
-    retList.standardize(glades::DataInput::IMAGE);
+    retList.standardize(inputType);
     return retList;
 }
 
