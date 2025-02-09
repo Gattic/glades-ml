@@ -15,6 +15,6 @@
 #include <string>
 #include <unistd.h>
 
-void loadsave();
+void ModelSaveLoadTest();
 
 #endif

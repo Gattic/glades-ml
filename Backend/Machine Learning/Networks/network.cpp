@@ -720,6 +720,16 @@ bool glades::NNetwork::saveModel(const std::string& netName)
 
 }
 
+bool glades::NNetwork::loadModel(const std::string& netName) 
+{
+	
+	meat.loadmodel();
+
+	return true;
+
+}
+
+
 bool glades::NNetwork::save() const
 {
 	if (!skeleton)

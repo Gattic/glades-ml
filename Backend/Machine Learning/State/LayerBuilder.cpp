@@ -560,7 +560,7 @@ void glades::LayerBuilder::clean()
  * @param networkData the table of neural network architecture information
  * @return whether or not the load was successful
  */
-/*bool glades::LayerBuilder::load(const shmea::GTable& networkData)
+bool glades::LayerBuilder::load(const shmea::GTable& networkData)
 {
 	// We dont need to load the old instance (for now?)
 	if (!networkData)
@@ -627,12 +627,12 @@ void glades::LayerBuilder::clean()
 	}
 
 	return false;
-}*/
-
-bool glades::LayerBuilder::load(const std::string& netName)
-{
-	return false;
 }
+
+// bool glades::LayerBuilder::load(const std::string& netName)
+// {
+// 	return false;
+// }
 
 /*!
  * @brief save NNetwork

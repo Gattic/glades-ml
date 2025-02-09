@@ -10,7 +10,7 @@
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
 #include "Backend/Machine Learning/bayes-optimizer-test.h"
-#include "Backend/Machine Learning/loadsave-test.h"
+#include "Backend/Machine Learning/modelsaveload-test.h"
 
 int main(int argc, char* argv[])
 {
@@ -21,7 +21,7 @@ int main(int argc, char* argv[])
 	PCAUnitTest();
 	BayesUnitTest();
 	BayesOptimizerUnitTest();
-	loadsave();
+	ModelSaveLoadTest();
 
 	printf("========================\n");
 	printf("| Unit Tests Completed |\n");
