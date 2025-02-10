@@ -321,7 +321,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					//cData->set(
 				}
 
-				if (skeleton->getOutputType() == GMath::REGRESSION)
+				// Update the accuracy label
 				{
 					shmea::GList argData;
 					argData.addString("ACC");
@@ -336,7 +336,8 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					cData->setArgList(argData);
 					serverInstance->send(cData);
 				}
-				else if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
+
+				if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 					(skeleton->getOutputType() == GMath::KL))
 				{
 					// Update the ROC Curve and Conf Matrix
