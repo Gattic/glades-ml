@@ -448,9 +448,6 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		float newLearningRate = bModel.predict(testList);*/
 		//printf("Predicted learning rate %f\n", newLearningRate);
 		//skeleton->setLearningRate(cOutputLayerCounter - 1, newLearningRate);
-
-		// Clear past dropout state
-		meat.clearDropout();
 	}
 
 	//printf("=========================================\n");
