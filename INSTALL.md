@@ -10,7 +10,7 @@
 
 `g++`
 
-`libpng-dev`
+`libfreetype6-dev`
 
 ---
 
