@@ -3,8 +3,6 @@ set(Networks_src_files
 	metanetwork.h
 	network.cpp
 	network.h
-	RNN.cpp
-	RNN.h
 	bayes.cpp
 	bayes-optimizer.cpp
 )

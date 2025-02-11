@@ -45,6 +45,8 @@ private:
 	std::vector<glades::Edge*> edges;
 	pthread_mutex_t* activationMutex;
 
+	Node* contextNode;
+
 public:
 	static const int INIT_EMPTY = 0;
 	static const int INIT_RANDOM = 1;
@@ -91,6 +93,8 @@ public:
 	void initWeights(unsigned int, float[], unsigned int, int, int);
 	void getDelta(unsigned int, float, float, float, float, float, float);
 	void applyDeltas(unsigned int, int);
+	void setContextNode(Node*);
+	Node* getContextNode();
 };
 };
 

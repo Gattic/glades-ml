@@ -54,12 +54,10 @@ class NetworkState;
 class LayerBuilder;
 class CMatrix;
 class MetaNetwork;
-class RNN;
 
 class NNetwork
 {
 private:
-	friend RNN;
 	friend MetaNetwork;
 
 	DataInput* di;
@@ -110,8 +108,8 @@ public:
 
 	Terminator terminator;
 
-	NNetwork();
-	NNetwork(NNInfo*);
+	NNetwork(int=TYPE_DFF);
+	NNetwork(NNInfo*, int=TYPE_DFF);
 	virtual ~NNetwork();
 	int64_t getCurrentTimeMilliseconds() const;
 	bool getRunning() const;

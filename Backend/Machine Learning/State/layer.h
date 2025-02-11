@@ -71,6 +71,8 @@ public:
 	void print() const;
 
 	Node* operator[](unsigned int);
+
+	void setupContext();
 };
 };
 
