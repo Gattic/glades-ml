@@ -41,7 +41,7 @@ using namespace glades;
  * @brief NNetwork constructor
  * @details creates an empty nnetwork
  */
-glades::NNetwork::NNetwork()
+glades::NNetwork::NNetwork(int newNetType)
 {
 	running = false;
 	di = NULL;
@@ -49,7 +49,7 @@ glades::NNetwork::NNetwork()
 	serverInstance = NULL;
 	cConnection = NULL;
 	clean();
-	netType = TYPE_DFF;
+	netType = newNetType;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 }
 
@@ -57,7 +57,7 @@ glades::NNetwork::NNetwork()
  * @brief NNetwork destructor
  * @details destroys the NNetwork object
  */
-glades::NNetwork::NNetwork(NNInfo* newNNInfo)
+glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 {
 	if (!newNNInfo)
 		return;
@@ -69,7 +69,7 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo)
 	cConnection = NULL;
 	clean();
 	skeleton = newNNInfo;
-	netType = TYPE_DFF;
+	netType = newNetType;
 	minibatchSize = skeleton->getBatchSize();
 }
 
@@ -495,13 +495,27 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			    // Get the current output node activation
 			    float cOutputNodeActivation = netState->cOutputNode->getActivation();
 
-			    // Clean the output node activation for next run (cleanup)
-			    netState->cOutputNode->clearActivation();
+				// Context Nodes
+				if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+				{
+					float cContextEdgeActivation =
+						netState->cOutputNode->getContextNode()->getEdgeWeight(0) *
+						netState->cOutputNode->getContextNode()->getWeight();
+					cOutputNodeActivation += cContextEdgeActivation;
+				}
 
 			    // Add the bias if we are in a hidden layer or output layer
 			    // Input Layer fundamentally cannot have a bias
 			    if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
 				    cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
+
+				if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+				{
+					netState->cOutputNode->getContextNode()->setWeight(netState->cOutputNode->getActivation());
+				}
+
+			    // Clean the output node activation for next run (cleanup)
+			    netState->cOutputNode->clearActivation();
 
 			    // Set Our prediction based on the cOutputNode activation
 			    int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
@@ -645,9 +659,21 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 											    netState->cInputNode->getWeight(), learningRate,
 											    momentumFactor, weightDecay1, weightDecay2);
 
+				if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+				{
+					netState->cOutputNode->getContextNode()->getDelta(0, baseError,
+						netState->cOutputNode->getContextNode()->getWeight(), learningRate, momentumFactor, weightDecay1, weightDecay2);
+				}
+
 			    // Apply all deltas if we've hit the minibatch size
 			    if ((inputRowCounter % minibatchSize) == 0)
 			    {
+					if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+					{
+						netState->cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
+						netState->cOutputNode->getContextNode()->clearPrevDeltas(0);
+					}
+
 				    netState->cOutputNode->applyDeltas(cInputNodeCounter, minibatchSize);
 				    netState->cOutputNode->clearPrevDeltas(cInputNodeCounter);
 			    }

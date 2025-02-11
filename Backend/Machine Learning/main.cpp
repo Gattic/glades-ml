@@ -19,7 +19,6 @@
 #include "Backend/Database/GType.h"
 #include "Backend/Networking/main.h"
 #include "GMath/gmath.h"
-#include "Networks/RNN.h"
 #include "State/layer.h"
 #include "State/node.h"
 #include "Structure/nninfo.h"
