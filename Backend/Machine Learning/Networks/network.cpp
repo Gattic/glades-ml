@@ -321,7 +321,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					//cData->set(
 				}
 
-				if (skeleton->getOutputType() == GMath::REGRESSION)
+				// Update the accuracy label
 				{
 					shmea::GList argData;
 					argData.addString("ACC");
@@ -336,7 +336,8 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					cData->setArgList(argData);
 					serverInstance->send(cData);
 				}
-				else if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
+
+				if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 					(skeleton->getOutputType() == GMath::KL))
 				{
 					// Update the ROC Curve and Conf Matrix
@@ -448,9 +449,6 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 		float newLearningRate = bModel.predict(testList);*/
 		//printf("Predicted learning rate %f\n", newLearningRate);
 		//skeleton->setLearningRate(cOutputLayerCounter - 1, newLearningRate);
-
-		// Clear past dropout state
-		meat.clearDropout();
 	}
 
 	//printf("=========================================\n");
