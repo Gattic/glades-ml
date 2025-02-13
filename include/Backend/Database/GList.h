@@ -46,7 +46,6 @@ private:
 	void insertPrimitive(unsigned int, GType::Type, const void*);
 	void addObject(GType::Type, const void*, int64_t);
 	void insertObject(unsigned int, GType::Type, const void*, int64_t);
-
 public:
 	GList();
 	GList(const GList&);
