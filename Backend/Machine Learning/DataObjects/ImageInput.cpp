@@ -53,6 +53,9 @@ void ImageInput::import(shmea::GString newName)
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
 
+    // Convert the label to a string for classification
+    trainingLegend.setCell(i, 1, label);
+
 	// Add a label if it doesn't exist
 	if(trainImages.find(label) == trainImages.end())
 	{
@@ -79,6 +82,8 @@ void ImageInput::import(shmea::GString newName)
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
 
+    // Convert the label to a string for classification
+    testingLegend.setCell(i, 1, label);
 	// Add a label if it doesn't exist
 	if(testImages.find(label) == testImages.end())
 	{
@@ -172,8 +177,10 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestImage(unsigned int row) c
 
 shmea::GList ImageInput::getTrainRow(unsigned int index) const
 {
-    if(index >= trainingLegend.numberOfRows())
-	return emptyRow;
+    int inputType = glades::DataInput::IMAGE;
+    static const unsigned int numRows = trainingLegend.numberOfRows(); // Cache number of rows
+    if (index >= numRows)
+        return emptyRow;
 
     shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
     shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(index, 0).c_str();
@@ -190,7 +197,7 @@ shmea::GList ImageInput::getTrainRow(unsigned int index) const
 	
     // Return the image
     shmea::GList retList = itr->second->flatten();
-    retList.standardize();
+    retList.standardize(inputType);
     return retList;
 }
 
@@ -255,6 +262,7 @@ shmea::GList ImageInput::getTestExpectedRow(unsigned int index) const
 
 shmea::GList ImageInput::getTestRow(unsigned int index) const
 {
+    int inputType = glades::DataInput::IMAGE;
     if(index >= testingLegend.numberOfRows())
 	return shmea::GList();
 
@@ -273,7 +281,7 @@ shmea::GList ImageInput::getTestRow(unsigned int index) const
 	
     // Return the image
     shmea::GList retList = itr->second->flatten();
-    retList.standardize();
+    retList.standardize(inputType);
     return retList;
 }
 

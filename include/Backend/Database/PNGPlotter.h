@@ -45,6 +45,14 @@ class PNGPlotter
 		RGBA color_bullish;
 		RGBA color_bearish;
 
+		unsigned int headerPenXStarting;
+		unsigned int headerPenYStarting;
+		unsigned int headerXSpacing;
+		unsigned int headerYSpacing;
+
+		std::vector<std::vector<unsigned int> > headerSpacings;
+
+		std::map<int, std::string> AGG_SIZE;
 		//font
 		FT_Library ft;
 		FT_Face face;
@@ -67,7 +75,6 @@ class PNGPlotter
 	public:
 
 		
-
 		static const int TARGET_WIDTH = 2400;
 		static const int TARGET_HEIGHT = 1200;
 		static const int SUPERSAMPLE_SCALE = 4;
@@ -89,8 +96,10 @@ class PNGPlotter
 		void drawYGrid();
 		void drawXGrid(int64_t, int64_t);
 
-		void HeaderPNG(const std::string&, unsigned int);
+		void HeaderPNG(const std::string&, unsigned int, unsigned int = 0, unsigned int = 0, RGBA = RGBA(0xFF, 0xFF, 0xFF, 0xFF));
 		void GraphLabel(unsigned int, unsigned int, const std::string&, unsigned int, unsigned int=0, unsigned int=0, bool = false, RGBA = RGBA(0xFF, 0xFF, 0xFF, 0xFF), RGBA = RGBA(0xFF, 0xFF, 0xFF, 0xFF) );
+
+		std::string aggString(int);
 };
 };
 #endif

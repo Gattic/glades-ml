@@ -90,8 +90,20 @@ glades::Node* glades::Layer::getNode(unsigned int index)
 	return children[index];
 }
 
+void glades::Layer::setupDropout()
+{
+	// Populate the dropout vector
+	while (dropoutFlag.size() < size())
+	{
+		dropoutFlag.push_back(false);
+	}
+}
+
 void glades::Layer::generateDropout(float p)
 {
+	if (dropoutFlag.size() < size())
+	    setupDropout();
+	
 	int cDropoutRate = p * 100.0f;
 	if (cDropoutRate < 0)
 		return;
@@ -102,11 +114,10 @@ void glades::Layer::generateDropout(float p)
 	bool fullLayerDropped = true;
 	do
 	{
-		clearDropout();
 		fullLayerDropped = true;
 
 		// generate the dropout probabilities
-		while (dropoutFlag.size() < size())
+		for (unsigned int i = 0; i < size(); ++i)
 		{
 			bool cDropped = false;
 			int dart = (rand() % 100) + 1; // 1-100 (100 possibilities)
@@ -116,7 +127,7 @@ void glades::Layer::generateDropout(float p)
 				fullLayerDropped = false;
 
 			// Populate the dropout vector
-			dropoutFlag.push_back(cDropped);
+			dropoutFlag[i] = cDropped;
 		}
 
 	} while (fullLayerDropped);

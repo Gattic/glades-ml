@@ -46,7 +46,6 @@ private:
 	void insertPrimitive(unsigned int, GType::Type, const void*);
 	void addObject(GType::Type, const void*, int64_t);
 	void insertObject(unsigned int, GType::Type, const void*, int64_t);
-
 public:
 	GList();
 	GList(const GList&);
@@ -94,7 +93,7 @@ public:
 	int getType(unsigned int) const;
 	unsigned int size() const;
 	bool empty() const;
-	void standardize();
+	void standardize(unsigned int);
 	float unstandardize(float) const;
 	void print() const;
 
