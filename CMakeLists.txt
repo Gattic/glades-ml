@@ -36,7 +36,20 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 #Import libs
-find_package(shmea REQUIRED)
+if(EMSCRIPTEN)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
+    find_library(SHMEA_PATH NAMES shmea PATHS "$ENV{HOME}/.local/lib/" NO_DEFAULT_PATH)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY) # Restore cross-compilation defaults
+else()
+    find_package(shmea REQUIRED)
+endif()
+
+if(NOT SHMEA_PATH)
+    message(FATAL_ERROR "Failed to find shmea. Looked in: $ENV{HOME}/.local/lib")
+else()
+    message(STATUS "Found libshmea.a at: ${SHMEA_PATH}")
+endif()
+
 
 include(GNUInstallDirs)
 
@@ -51,7 +64,11 @@ set(MAIN_SRC_FILES
 	main.h
 )
 
-add_library(${PROJECT_NAME} SHARED ${MAIN_SRC_FILES})
+if(EMSCRIPTEN)
+    add_library(${PROJECT_NAME} STATIC ${MAIN_SRC_FILES})
+else()
+    add_library(${PROJECT_NAME} SHARED ${MAIN_SRC_FILES})
+endif()
 
 #Link libraries
 target_link_libraries(${PROJECT_NAME}
