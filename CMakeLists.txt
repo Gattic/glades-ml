@@ -40,16 +40,14 @@ if(EMSCRIPTEN)
     set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
     find_library(SHMEA_PATH NAMES shmea PATHS "$ENV{HOME}/.local/lib/" NO_DEFAULT_PATH)
     set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY) # Restore cross-compilation defaults
+    if(NOT SHMEA_PATH)
+	message(FATAL_ERROR "Failed to find shmea. Looked in: $ENV{HOME}/.local/lib")
+    else()
+	message(STATUS "Found libshmea.a at: ${SHMEA_PATH}")
+    endif()
 else()
     find_package(shmea REQUIRED)
 endif()
-
-if(NOT SHMEA_PATH)
-    message(FATAL_ERROR "Failed to find shmea. Looked in: $ENV{HOME}/.local/lib")
-else()
-    message(STATUS "Found libshmea.a at: ${SHMEA_PATH}")
-endif()
-
 
 include(GNUInstallDirs)
 
