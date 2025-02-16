@@ -4,8 +4,6 @@ emcmake cmake ..
 emmake make -j4
 emmake make install
 
-exit 0
-
 mkdir MLDataObjects
 cd MLDataObjects
 emar x "../Backend/Machine Learning/DataObjects/libDataObjects.a"
