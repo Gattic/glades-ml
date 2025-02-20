@@ -219,7 +219,7 @@ shmea::GList ImageInput::getTrainExpectedRow(unsigned int index) const
     printf("label[%u] = %s\n", index, cCell.c_str());
 
     // translate string to cell value for this col
-    std::string cString = cCell.c_str();
+    shmea::GString cString = cCell.c_str();
     std::vector<float> featureVector = (*OHEVector)[cString];
     printf("featureVector.size() = %lu\n", featureVector.size());
     for(unsigned int i=0;i<featureVector.size();++i)
@@ -251,7 +251,7 @@ shmea::GList ImageInput::getTestExpectedRow(unsigned int index) const
     shmea::GString cCell = shmea::GString::intTOstring(testingLegend.getCell(index, 1).getInt());
 
     // translate string to cell value for this col
-    std::string cString = cCell.c_str();
+    shmea::GString cString = cCell.c_str();
     std::vector<float> featureVector = (*OHEVector)[cString];
 
     shmea::GList retRow;

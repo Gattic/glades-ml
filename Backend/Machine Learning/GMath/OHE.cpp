@@ -45,13 +45,7 @@ glades::OHE::~OHE()
 	fMean = 0.0f;
 }
 
-void glades::OHE::addString(const char* newCharString)
-{
-	std::string newString(newCharString);
-	addString(newString);
-}
-
-void glades::OHE::addString(const std::string& newString)
+void glades::OHE::addString(const shmea::GString& newString)
 {
 	// GType nodeContents(newString);
 	if (!contains(newString))
@@ -68,18 +62,17 @@ unsigned int glades::OHE::size() const
 	return OHEStrings.size();
 }
 
-std::vector<std::string> glades::OHE::getStrings() const
+std::vector<shmea::GString> glades::OHE::getStrings() const
 {
 	return OHEStrings;
 }
 
-bool glades::OHE::contains(const std::string& newString) const
+bool glades::OHE::contains(const shmea::GString& newString) const
 {
 	// check if the string is already in the vector
-	std::vector<std::string>::const_iterator itr = OHEStrings.begin();
-	for (; itr != OHEStrings.end(); ++itr)
+	for (unsigned int i = 0; i < OHEStrings.size(); ++i)
 	{
-		if ((*itr) == newString)
+		if (OHEStrings[i] == newString)
 			return true;
 	}
 
@@ -113,28 +106,12 @@ void glades::OHE::print() const
 	printf("]\n\n");
 }
 
-int glades::OHE::indexAt(const char* needle) const
-{
-	std::string needleString(needle);
-
-	int counter = 0;
-	std::vector<std::string>::const_iterator itr = OHEStrings.begin();
-	for (; itr != OHEStrings.end(); ++itr)
-	{
-		if ((*itr) == needleString)
-			return counter;
-		++counter;
-	}
-
-	return -1;
-}
-
-int glades::OHE::indexAt(const std::string& needle) const
+int glades::OHE::indexAt(const shmea::GString& needle) const
 {
 	std::vector<int> retVal(size(), 0);
 
 	int counter = 0;
-	std::vector<std::string>::const_iterator itr = OHEStrings.begin();
+	std::vector<shmea::GString>::const_iterator itr = OHEStrings.begin();
 	for (; itr != OHEStrings.end(); ++itr)
 	{
 		if ((*itr) == needle)
@@ -145,7 +122,7 @@ int glades::OHE::indexAt(const std::string& needle) const
 	return -1;
 }
 
-std::string glades::OHE::classAt(unsigned int cid) const
+shmea::GString glades::OHE::classAt(unsigned int cid) const
 {
 	if(cid == (unsigned int)-1)
 		return "";
@@ -158,11 +135,11 @@ std::string glades::OHE::classAt(unsigned int cid) const
 
 std::vector<float> glades::OHE::operator[](const char* needle) const
 {
-	std::string needleString(needle);
+	shmea::GString needleString(needle);
 	std::vector<float> retVal(size(), 0.01);
 
 	int counter = 0;
-	std::vector<std::string>::const_iterator itr = OHEStrings.begin();
+	std::vector<shmea::GString>::const_iterator itr = OHEStrings.begin();
 	for (; itr != OHEStrings.end(); ++itr)
 	{
 		if ((*itr) == needleString)
@@ -177,12 +154,12 @@ std::vector<float> glades::OHE::operator[](const char* needle) const
 	return retVal;
 }
 
-std::vector<float> glades::OHE::operator[](const std::string& needle) const
+std::vector<float> glades::OHE::operator[](const shmea::GString& needle) const
 {
 	std::vector<float> retVal(size(), 0.01);
 
 	int counter = 0;
-	std::vector<std::string>::const_iterator itr = OHEStrings.begin();
+	std::vector<shmea::GString>::const_iterator itr = OHEStrings.begin();
 	for (; itr != OHEStrings.end(); ++itr)
 	{
 		if ((*itr) == needle)
@@ -199,7 +176,7 @@ std::vector<float> glades::OHE::operator[](const std::string& needle) const
 
 // ONLY SUPPORTS FIRST HOT FOUND
 // EXPAND TO SUPPORT MULTIDIMENSIONALITY
-std::string glades::OHE::operator[](const std::vector<int>& needle) const
+shmea::GString glades::OHE::operator[](const std::vector<int>& needle) const
 {
 	// check if the string is already in the vector
 	int counter = 0;
@@ -214,7 +191,7 @@ std::string glades::OHE::operator[](const std::vector<int>& needle) const
 	return "";
 }
 
-std::string glades::OHE::operator[](const std::vector<float>& needle) const
+shmea::GString glades::OHE::operator[](const std::vector<float>& needle) const
 {
 	// check if the string is already in the vector
 	float max = 0.0f;
@@ -281,7 +258,7 @@ void glades::OHE::mapFeatureSpace(const shmea::GTable& gTable, int featureCol)
 
 	fMean /= gTable.numberOfRows();
 	// Normalize
-	/*std::map<std::string, double>::iterator itr = classCount.begin();
+	/*std::map<shmea::GString, double>::iterator itr = classCount.begin();
 	for (; itr != classCount.end(); ++itr)
 		itr->second /= gTable.numberOfRows();*/
 }
@@ -302,7 +279,7 @@ void glades::OHE::printFeatures() const
 
 	for (unsigned int i = 0; i < size(); ++i)
 	{
-		std::string word = OHEStrings[i];
+		shmea::GString word = OHEStrings[i];
 		printf("%s ", word.c_str());
 	}
 

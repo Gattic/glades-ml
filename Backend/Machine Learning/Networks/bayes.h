@@ -51,7 +51,7 @@ public:
 	void print() const;
 	void reset();
 
-	std::string getClassName(int) const;
+	shmea::GString getClassName(int) const;
 };
 };
 

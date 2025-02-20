@@ -138,7 +138,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 					float cell = 0.0f;
 
 					// translate string to cell value for this col
-					std::string cString = cCell.c_str();
+					shmea::GString cString = cCell.c_str();
 					std::vector<float> featureVector = (*OHEVector)[cString];
 					cell = featureVector[cInt];
 

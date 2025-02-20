@@ -23,6 +23,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "Backend/Database/GString.h"
 
 namespace shmea {
 // class GStr;
@@ -35,14 +36,14 @@ class OHE
 {
 private:
 
-	std::vector<std::string> OHEStrings;
+	std::vector<shmea::GString> OHEStrings;
 	float fMin;
 	float fMax;
 	float fMean;
 
 public:
 
-	std::map<std::string, double> classCount;
+	std::map<shmea::GString, double> classCount;
 
 	// constructors and destructors
 	OHE();
@@ -50,26 +51,24 @@ public:
 	virtual ~OHE();
 
 	// sets
-	void addString(const char*);
-	void addString(const std::string&);
+	void addString(const shmea::GString&);
 	void mapFeatureSpace(const shmea::GTable&, int);
 
 	// gets
 	unsigned int size() const;
-	std::vector<std::string> getStrings() const;
-	bool contains(const std::string&) const;
+	std::vector<shmea::GString> getStrings() const;
+	bool contains(const shmea::GString&) const;
 	void print() const;
 	void printFeatures() const;
-	int indexAt(const char*) const;
-	int indexAt(const std::string&) const;
-	std::string classAt(unsigned int) const;
+	int indexAt(const shmea::GString&) const;
+	shmea::GString classAt(unsigned int) const;
 	float standardize(float) const;
 
 	// operators
 	std::vector<float> operator[](const char*) const;
-	std::vector<float> operator[](const std::string&) const;
-	std::string operator[](const std::vector<int>&) const;
-	std::string operator[](const std::vector<float>&) const;
+	std::vector<float> operator[](const shmea::GString&) const;
+	shmea::GString operator[](const std::vector<int>&) const;
+	shmea::GString operator[](const std::vector<float>&) const;
 };
 };
 
