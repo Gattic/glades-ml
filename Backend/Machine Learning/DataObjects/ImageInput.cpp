@@ -44,17 +44,78 @@ void ImageInput::import(shmea::GString newName)
 	return;
     }
 
+
+    float fMin = 0.0f;
+    float fMax = 0.0f;
+    float fMean = 0.0f;
+
     // Load training images
-    for(unsigned int i = 0; i < trainingLegend.numberOfRows(); ++i)
+    unsigned int inputCol = 0;
+    unsigned int outputCol = 1;
+    for(unsigned int r = 0; r < trainingLegend.numberOfRows(); ++r)
     {
-	shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(i, 1).getInt());
-	shmea::GString path = fname + trainingLegend.getCell(i, 0).c_str();
+	shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(r, outputCol).getInt());
+	shmea::GString path = fname + trainingLegend.getCell(r, inputCol).c_str();
 	printf("[NNDATA] Loading %s\n", path.c_str());
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
 
-    // Convert the label to a string for classification
-    trainingLegend.setCell(i, 1, label);
+	// Convert the label to a string for classification
+	trainingLegend.setCell(r, outputCol, label);
+
+	if (r == 0)
+	{
+	    // Really only need it for the output column for images so the first OHE will be empty
+	    for(unsigned int c = 0; c < trainingLegend.numberOfCols(); ++c)
+	    {
+		OHE* cOHE = new OHE();
+		featureIsCategorical.push_back(false);
+		OHEMaps.push_back(cOHE);
+	    }
+	}
+
+	float cell = 0.0f;
+	const shmea::GType& cCell = trainingLegend.getCell(r, outputCol); // get the first cell of the col
+	if (cCell.getType() == shmea::GType::STRING_TYPE)
+	{
+		shmea::GString strCell = cCell;
+		OHEMaps[outputCol]->addString(cCell);
+		featureIsCategorical[outputCol] = true;
+		//continue;
+	}
+	else if (cCell.getType() == shmea::GType::CHAR_TYPE)
+		cell = cCell.getChar();
+	else if (cCell.getType() == shmea::GType::SHORT_TYPE)
+		cell = cCell.getShort();
+	else if (cCell.getType() == shmea::GType::INT_TYPE)
+		cell = cCell.getInt();
+	else if (cCell.getType() == shmea::GType::LONG_TYPE)
+		cell = cCell.getLong();
+	else if (cCell.getType() == shmea::GType::FLOAT_TYPE)
+		cell = cCell.getFloat();
+	else if (cCell.getType() == shmea::GType::DOUBLE_TYPE)
+		cell = cCell.getDouble();
+	else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
+		cell = cCell.getBoolean() ? 1.0f : 0.0f;
+
+	if (r == 0)
+	{
+		fMin = cell;
+		fMax = cell;
+	}
+
+	// Check the mins and maxes
+	if (cell < fMin)
+		fMin = cell;
+	if (cell > fMax)
+		fMax = cell;
+
+	// update mean
+	fMean += cell;
+
+
+
+
 
 	// Add a label if it doesn't exist
 	if(trainImages.find(label) == trainImages.end())
@@ -73,17 +134,22 @@ void ImageInput::import(shmea::GString newName)
 	}
     }
 
+    fMean /= trainingLegend.numberOfRows();
+    OHEMaps[outputCol]->setMin(fMin);
+    OHEMaps[outputCol]->setMax(fMax);
+    OHEMaps[outputCol]->setMean(fMean);
+
     // Load testing data
-    for(unsigned int i = 0; i < testingLegend.numberOfRows(); ++i)
+    for(unsigned int r = 0; r < testingLegend.numberOfRows(); ++r)
     {
-	shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(i, 1).getInt());
-	shmea::GString path = fname + testingLegend.getCell(i, 0).c_str();
+	shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(r, outputCol).getInt());
+	shmea::GString path = fname + testingLegend.getCell(r, inputCol).c_str();
 	printf("[NNDATA] Loading %s\n", path.c_str());
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
 
     // Convert the label to a string for classification
-    testingLegend.setCell(i, 1, label);
+    testingLegend.setCell(r, outputCol, label);
 	// Add a label if it doesn't exist
 	if(testImages.find(label) == testImages.end())
 	{
@@ -101,30 +167,6 @@ void ImageInput::import(shmea::GString newName)
 	}
     }
 
-    // TODO FIX!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    // Setup the Classifier object
-    for(unsigned int c = 0; c < trainingLegend.numberOfCols(); ++c)
-    {
-	for(unsigned int r = 0; r < trainingLegend.numberOfRows(); ++r)
-	{
-	    shmea::GString label = trainingLegend.getCell(r, c);
-	    //printf("label = %s\n", label.c_str());
-	}
-	OHE* cOHE = new OHE();
-	featureIsCategorical.push_back(false);
-
-	const shmea::GType& cCell = trainingLegend.getCell(0, c); // get the first cell of the col
-	if (cCell.getType() == shmea::GType::STRING_TYPE)
-	{
-	    //printf("Col %d is categorical\n", c);
-	    cOHE->mapFeatureSpace(trainingLegend, c);
-	    featureIsCategorical[c] = true;
-	    //cOHE->print();
-	}
-
-	OHEMaps.push_back(cOHE);
-    }
-
     //printf("OHEMaps.size() = %lu\n", OHEMaps.size());
 
     // Set the loaded flag
@@ -136,7 +178,7 @@ const shmea::GPointer<shmea::Image> ImageInput::getTrainImage(unsigned int row) 
     if(row >= trainingLegend.numberOfRows())
 	return shmea::GPointer<shmea::Image>(new shmea::Image());
 
-    shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(row, 1).getInt());
+    shmea::GString label = trainingLegend.getCell(row, 1);
     shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(row, 0).c_str();
 
     // Check if the label exists
@@ -158,7 +200,7 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestImage(unsigned int row) c
     if(row >= testingLegend.numberOfRows())
 	return shmea::GPointer<shmea::Image>(new shmea::Image());
 
-    shmea::GString label = shmea::GString::intTOstring(testingLegend.getCell(row, 1).getInt());
+    shmea::GString label = testingLegend.getCell(row, 1);
     shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(row, 0).c_str();
 
     // Check if the label exists
@@ -182,7 +224,7 @@ shmea::GList ImageInput::getTrainRow(unsigned int index) const
     if (index >= numRows)
         return emptyRow;
 
-    shmea::GString label = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
+    shmea::GString label = trainingLegend.getCell(index, 1);
     shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(index, 0).c_str();
 
     // Check if the label exists
@@ -203,7 +245,6 @@ shmea::GList ImageInput::getTrainRow(unsigned int index) const
 
 shmea::GList ImageInput::getTrainExpectedRow(unsigned int index) const
 {
-    printf("Number of rows in trainingLegend = %u\n", trainingLegend.numberOfRows());
     if(index >= trainingLegend.numberOfRows())
 	return emptyRow;
 
@@ -216,22 +257,15 @@ shmea::GList ImageInput::getTrainExpectedRow(unsigned int index) const
 
 
     shmea::GString cCell = shmea::GString::intTOstring(trainingLegend.getCell(index, 1).getInt());
-    printf("label[%u] = %s\n", index, cCell.c_str());
 
     // translate string to cell value for this col
     shmea::GString cString = cCell.c_str();
     std::vector<float> featureVector = (*OHEVector)[cString];
-    printf("featureVector.size() = %lu\n", featureVector.size());
-    for(unsigned int i=0;i<featureVector.size();++i)
-	printf("%f ", featureVector[i]);
-    printf("\n");
 
     shmea::GList retRow;
     for(unsigned int i=0;i<featureVector.size();++i)
 	retRow.addFloat(featureVector[i]);
 
-    printf("retRow.size() = %lu\n", retRow.size());
-    retRow.print();
     return retRow;
 }
 

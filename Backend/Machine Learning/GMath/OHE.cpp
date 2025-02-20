@@ -57,9 +57,39 @@ void glades::OHE::addString(const shmea::GString& newString)
 		++classCount[newString];
 }
 
+void glades::OHE::setMin(float newMin)
+{
+	fMin = newMin;
+}
+
+void glades::OHE::setMax(float newMax)
+{
+	fMax = newMax;
+}
+
+void glades::OHE::setMean(float newMean)
+{
+	fMean = newMean;
+}
+
 unsigned int glades::OHE::size() const
 {
 	return OHEStrings.size();
+}
+
+float glades::OHE::getMin() const
+{
+	return fMin;
+}
+
+float glades::OHE::getMax() const
+{
+	return fMax;
+}
+
+float glades::OHE::getMean() const
+{
+	return fMean;
 }
 
 std::vector<shmea::GString> glades::OHE::getStrings() const

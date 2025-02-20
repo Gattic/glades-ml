@@ -52,10 +52,16 @@ public:
 
 	// sets
 	void addString(const shmea::GString&);
+	void setMin(float);
+	void setMax(float);
+	void setMean(float);
 	void mapFeatureSpace(const shmea::GTable&, int);
 
 	// gets
 	unsigned int size() const;
+	float getMin() const;
+	float getMax() const;
+	float getMean() const;
 	std::vector<shmea::GString> getStrings() const;
 	bool contains(const shmea::GString&) const;
 	void print() const;
