@@ -144,7 +144,7 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 			switch (cellType)
 			{
 				case shmea::GType::STRING_TYPE:
-					if (!di->featureIsCategorical[c])
+					if (!di->trainingFeatureIsCategorical[c])
 					{
 						inputLayers.clear();
 						return;

@@ -46,8 +46,10 @@ public:
 		//
 	    name = "";
 	    loaded = false;
-	    OHEMaps.clear();
-	    featureIsCategorical.clear();
+	    trainingOHEMaps.clear();
+	    testingOHEMaps.clear();
+	    trainingFeatureIsCategorical.clear();
+	    testingFeatureIsCategorical.clear();
 	    trainTable.clear();
 	    trainExpectedTable.clear();
 	    testTable.clear();
@@ -58,8 +60,10 @@ public:
 	{
 	    name = "";
 	    loaded = false;
-	    OHEMaps.clear();
-	    featureIsCategorical.clear();
+	    trainingOHEMaps.clear();
+	    testingOHEMaps.clear();
+	    trainingFeatureIsCategorical.clear();
+	    testingFeatureIsCategorical.clear();
 	    trainTable.clear();
 	    trainExpectedTable.clear();
 	    testTable.clear();

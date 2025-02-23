@@ -145,7 +145,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 		confusionMatrix.build(skeleton->getOutputLayerSize());
 
 	// if (DEBUG_ADVANCED)
-	//	meat.print(skeleton);
+		//meat.print(skeleton, true);
 
 	if (runType == RUN_TRAIN)
 		printf("[NN] Training...\n");
@@ -484,6 +484,7 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 		    {
 			    float cEdgeActivation = netState->cOutputNode->getEdgeWeight(cInputNodeCounter) *
 								netState->cInputNode->getWeight();
+			    //printf("\n\nEdge Activation[%d][%d][%d][%d][%d]: %f\n\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cEdgeActivation);
 			    netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
 		    }
 		    // Last Input Node for the Output Node
