@@ -378,7 +378,7 @@ float glades::NNInfo::getActivationParam(unsigned int index) const
  */
 void glades::NNInfo::print() const
 {
-	std::vector<shmea::GString> headers;
+	shmea::GVector<shmea::GString> headers;
 	headers.push_back("Size");
 	headers.push_back("batchSize");
 	headers.push_back("learningRate");
@@ -702,7 +702,7 @@ void glades::NNInfo::removeHiddenLayer(unsigned int index)
  */
 shmea::GTable glades::NNInfo::toGTable() const
 {
-	std::vector<shmea::GString> headers;
+	shmea::GVector<shmea::GString> headers;
 	headers.push_back("Size");
 	headers.push_back("batchSize");
 	headers.push_back("learningRate");

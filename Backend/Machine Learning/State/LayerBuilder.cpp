@@ -670,7 +670,7 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 {
 	shmea::SaveFolder* nnList = new shmea::SaveFolder(netName.c_str());
 
-	std::vector<shmea::GString> layerHeaders, edgeHeaders;
+	shmea::GVector<shmea::GString> layerHeaders, edgeHeaders;
 	layerHeaders.push_back("BiasWeight");
 	edgeHeaders.push_back("layerID");
 	edgeHeaders.push_back("nodeID");

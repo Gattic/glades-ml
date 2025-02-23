@@ -219,7 +219,7 @@ void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDat
 	shmea::GTable cinputFile(fNames.c_str(), ',', shmea::GTable::TYPE_FILE);
 
 	float cvAccuracy = 0.0f;
-	std::vector<shmea::GTable*> stratifiedInputFiles =
+	shmea::GVector<shmea::GTable*> stratifiedInputFiles =
 		shmea::GTable::stratify(cinputFile, subnets.size()); // split it up into k segments
 
 	for (unsigned int i = 0; i < stratifiedInputFiles.size(); ++i)

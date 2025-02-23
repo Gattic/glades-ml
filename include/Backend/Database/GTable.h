@@ -37,17 +37,13 @@ private:
 	friend Serializable;
 
 	char delimiter;
-	//shmea::GVector<GString> header;
-	//shmea::GVector<GList> cells;
-	std::vector<GString> header;
-	std::vector<GList> cells;
-	/* std::vector<GString> header; */
-	/* std::vector<GList> cells; */
+	shmea::GVector<GString> header;
+	shmea::GVector<GList> cells;
 	float xMin;
 	float xMax;
 	float xRange;
 
-	std::vector<unsigned int> outputColumns; // sparse boolean array
+	shmea::GVector<unsigned int> outputColumns; // sparse boolean array
 
 	void importFromFile(const GString&);
 	void importFromString(const GString&);
@@ -59,8 +55,7 @@ public:
 
 	GTable();
 	GTable(char);
-	//GTable(char, const GVector<GString>&);
-	GTable(char, const std::vector<GString>&);
+	GTable(char, const GVector<GString>&);
 	GTable(const GString&, char, int);
 	GTable(const GTable&);
 	virtual ~GTable();
@@ -68,9 +63,7 @@ public:
 
 	// gets
 	char getDelimiter() const;
-	/* std::vector<GString> getHeaders() const; */
-	//GVector<GString> getHeaders() const;
-	std::vector<GString> getHeaders() const;
+	GVector<GString> getHeaders() const;
 	GString getHeader(unsigned int) const;
 	GType getCell(unsigned int, unsigned int) const;
 	GList getRow(unsigned int) const;
@@ -100,9 +93,7 @@ public:
 	void moveCol(unsigned int, unsigned int);
 	void append(const GTable&);
 	void append(const GTable*);
-	/* void setHeaders(const std::vector<GString>&); */
-	//void setHeaders(const GVector<GString>&);
-	void setHeaders(const std::vector<GString>&);
+	void setHeaders(const GVector<GString>&);
 	void addHeader(unsigned int, const GString&);
 	void save(const GString&) const;
 	void toggleOutput(unsigned int);
@@ -118,8 +109,8 @@ public:
 	GList operator[](const GString&) const;
 	void operator=(const GTable&);
 
-	static std::vector<GTable*> stratify(const GTable&, unsigned int = 10);
-	static std::vector<GTable*> stratify(const std::vector<GTable*>, unsigned int = 10);
+	static shmea::GVector<GTable*> stratify(const GTable&, unsigned int = 10);
+	static shmea::GVector<GTable*> stratify(const shmea::GVector<GTable*>, unsigned int = 10);
 	void standardize();
 	float unstandardize(float) const;
 };

@@ -37,21 +37,16 @@ protected:
 
 public:
 
-	explicit GPointer(T* newData = NULL)
-	{
-		data = newData;
-		refCount = new unsigned int();
-		*refCount = 0;
-		refMutex = NULL;//(pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
-		//pthread_mutex_init(refMutex, NULL);
-		increment();
-	}
+	explicit GPointer(T* newData = NULL) : 
+		data(newData),
+		refCount(newData ? new unsigned int(1) : NULL),
+		refMutex(NULL) {}
 
-	GPointer(const GPointer<T, Deleter>& g2)
+	GPointer(const GPointer<T, Deleter>& g2) :
+		data(NULL),
+		refCount(NULL),
+		refMutex(NULL)
 	{
-		data = NULL;
-		refCount = NULL;
-		refMutex = NULL;
 		copy(g2);
 	}
 
@@ -62,25 +57,22 @@ public:
 
 	void reset()
 	{
-		// Return if its a fresh instance
-		if(!refCount)
+		if (!refCount) {
 			return;
-
-		if(decrement() == 0)
-		{
-			if(data)
+		}
+		
+		if (decrement() == 0) {
+			if (data) {
 				Deleter(data);
-			data=NULL;
-			if(refCount)
-				delete refCount;
-			refCount=NULL;
-
-			/*if (refMutex)
-			{
-				pthread_mutex_destroy(refMutex);
-				free(refMutex);
-			}*/
-			refMutex=NULL;
+				data = NULL;
+			}
+			delete refCount;
+			refCount = NULL;
+			refMutex = NULL;
+		} else {
+			data = NULL;
+			refCount = NULL;
+			refMutex = NULL;
 		}
 	}
 
@@ -91,26 +83,18 @@ public:
 
 	unsigned int increment()
 	{
-		if(data)
-		{
-			//pthread_mutex_lock(refMutex);
-			++(*refCount); //inc
-			//pthread_mutex_unlock(refMutex);
+		if (refCount) {
+			++(*refCount);
 		}
-
-		return *refCount;
+		return refCount ? *refCount : 0;
 	}
 
 	unsigned int decrement()
 	{
-		if(data)
-		{
-			//pthread_mutex_lock(refMutex);
-			--(*refCount); //dec
-			//pthread_mutex_unlock(refMutex);
+		if (refCount) {
+			--(*refCount);
 		}
-
-		return *refCount;
+		return refCount ? *refCount : 0;
 	}
 
 	T& operator*()
@@ -142,15 +126,13 @@ public:
 	{
 		if(this != &g2)
 		{
-			// All done?
 			reset();
-
-			//pthread_mutex_lock(refMutex);
+			
 			data = g2.data;
 			refCount = g2.refCount;
 			refMutex = g2.refMutex;
+			
 			increment();
-			//pthread_mutex_unlock(refMutex);
 		}
 
 		return *this;
