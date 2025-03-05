@@ -54,18 +54,18 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 	for (unsigned int c = 0; c < rawTable.numberOfCols(); ++c)
 	{
 		OHE* cOHE = new OHE();
-		featureIsCategorical.push_back(false);
+		trainingFeatureIsCategorical.push_back(false);
 
 		shmea::GType cCell = rawTable.getCell(0, c); // get the first cell of the col
 		if (cCell.getType() == shmea::GType::STRING_TYPE)
 		{
 			cOHE->mapFeatureSpace(rawTable, c);
-			featureIsCategorical[c] = true;
+			trainingFeatureIsCategorical[c] = true;
 			isClassification = true;
 			cOHE->print();
 		}
 
-		OHEMaps.push_back(cOHE);
+		trainingOHEMaps.push_back(cOHE);
 	}
 
 	// iterate through the cols
@@ -80,7 +80,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 		for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r)
 		{
 			// check if already marked categorical
-			if (featureIsCategorical[c])
+			if (trainingFeatureIsCategorical[c])
 				continue;
 
 			float cell = 0.0f;
@@ -122,9 +122,9 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 		}
 		printf("c: %d:%u, fMin: %f, fMax: %f, fMean: %f\n", c, rawTable.numberOfCols(), fMin, fMax, fMean);
 
-		if (featureIsCategorical[c])
+		if (trainingFeatureIsCategorical[c])
 		{
-			OHE* OHEVector = OHEMaps[c];
+			OHE* OHEVector = trainingOHEMaps[c];
 			printf("OHEVector size: %d\n", OHEVector->size());
 
 			// iterate over feature (col) space
@@ -138,7 +138,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
 					float cell = 0.0f;
 
 					// translate string to cell value for this col
-					std::string cString = cCell.c_str();
+					shmea::GString cString = cCell.c_str();
 					std::vector<float> featureVector = (*OHEVector)[cString];
 					cell = featureVector[cInt];
 

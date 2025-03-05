@@ -43,7 +43,7 @@ public:
 	GVector(size_type capacity) :
 		m_size(0),
 		m_capacity(capacity),
-		m_data(new T[capacity]) {}
+		m_data(capacity > 0 ? new T[capacity] : NULL) {}
 
 	GVector(size_type capacity, const T& value) :
 		m_size(0),
@@ -61,7 +61,10 @@ public:
 		for (size_type i = 0; i < value.m_size; i++)
 			this->push_back(value[i]);
 	}
-	virtual ~GVector() { this->clear(); }
+	virtual ~GVector() 
+	{ 
+		clear();
+	}
 
 	iterator begin() { return m_data; }
 	const_iterator cbegin() const { return m_data; }
@@ -71,7 +74,7 @@ public:
 	size_type max_size() const { return 0 - 1; }
 	size_type size() const { return m_size; }
 	size_type capacity() const { return m_capacity; }
-	bool empty() const { return m_size == 0; }
+	bool empty() const { return (m_size == 0 || !m_data); }
 
 	void reserve(size_type new_cap)
 	{
@@ -85,14 +88,32 @@ public:
 		m_capacity = new_cap;
 		m_data = newBuffer;
 	}
-	void clear() { m_size = 0; }
+	void clear() 
+	{ 
+		if (m_data) {
+			m_size = 0;
+			// Let the GPointer handle deletion when it goes out of scope
+			m_data.reset();
+			m_capacity = 0;
+		}
+	}
 	void push_back(T newValue)
 	{
-		if (m_size == m_capacity) this->expand();
-		m_data[this->size()] = newValue;
-		m_size++;
+		if (m_size >= m_capacity) 
+			this->expand();
+		
+		if (!m_data)
+			return;
+
+		m_data[m_size] = newValue;
+		++m_size;
 	}
-	T pop_back() { return m_data[--m_size]; }
+	T pop_back() 
+	{ 
+		if (!m_data || m_size == 0)
+			return T();
+		return m_data[--m_size]; 
+	}
 	void erase(size_type idx)
 	{
 		if (empty())
@@ -152,14 +173,19 @@ public:
 private:
 	void expand()
 	{
-		if (m_capacity == 0)
-		{
-			/* m_data = new T[1]; */
-			m_data = shmea::GPointer<T, array_deleter<T> >(new T[1]);
-			m_capacity = 1;
-			return;
+		size_type newCap = (m_capacity == 0) ? 1 : m_capacity * 2;
+		T* newArray = new T[newCap];
+		
+		if (m_data && m_size > 0) {
+			for (size_type i = 0; i < m_size; ++i)
+				newArray[i] = m_data[i];
 		}
-		reserve(m_capacity * 2);
+
+		// Create new GPointer before resetting old one to avoid premature deletion
+		shmea::GPointer<T, array_deleter<T> > newBuffer(newArray);
+		m_data.reset();
+		m_data = newBuffer;
+		m_capacity = newCap;
 	}
 };
 }

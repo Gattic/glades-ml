@@ -197,7 +197,7 @@ void NaiveBayes::reset()
 	OHEMaps.clear();
 }
 
-std::string NaiveBayes::getClassName(int classID) const
+shmea::GString NaiveBayes::getClassName(int classID) const
 {
     if(classID < 0)
 	return "";

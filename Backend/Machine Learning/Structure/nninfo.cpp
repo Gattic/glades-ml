@@ -378,17 +378,17 @@ float glades::NNInfo::getActivationParam(unsigned int index) const
  */
 void glades::NNInfo::print() const
 {
-	std::vector<shmea::GString> headers;
-	headers.push_back("Layer");
+	shmea::GVector<shmea::GString> headers;
 	headers.push_back("Size");
 	headers.push_back("batchSize");
-	headers.push_back("lrnRate");
-	headers.push_back("mFactor");
-	headers.push_back("wDecay");
+	headers.push_back("learningRate");
+	headers.push_back("momentumFactor");
+	headers.push_back("weightDecay1");
+	headers.push_back("weightDecay2");
 	headers.push_back("pDropout");
-	headers.push_back("actvtn");
-	headers.push_back("actParam");
-	headers.push_back("cost");
+	headers.push_back("activationType");
+	headers.push_back("activationParam");
+	headers.push_back("outputType");
 
 	// put everything in a GTable
 	shmea::GTable printTable(',', headers);
@@ -418,15 +418,7 @@ void glades::NNInfo::print() const
 		else
 			printf("Output\t");
 
-		for (unsigned int col = 0; col < printTable.numberOfCols(); ++col)
-		{
-			shmea::GType cell = printTable.getCell(row, col);
-			shmea::GString word = cell;
-			if (atoi(word.c_str()) == -1)
-				printf("\t");
-			else
-				printf("%s\t", word.c_str());
-		}
+		printTable[row].print();
 		printf("\n");
 	}
 }
@@ -710,7 +702,7 @@ void glades::NNInfo::removeHiddenLayer(unsigned int index)
  */
 shmea::GTable glades::NNInfo::toGTable() const
 {
-	std::vector<shmea::GString> headers;
+	shmea::GVector<shmea::GString> headers;
 	headers.push_back("Size");
 	headers.push_back("batchSize");
 	headers.push_back("learningRate");

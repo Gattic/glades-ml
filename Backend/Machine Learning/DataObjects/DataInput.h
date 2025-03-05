@@ -31,8 +31,10 @@ public:
 	const static int IMAGE = 1;
 	const static int TEXT = 2;
 
-	std::vector<OHE*> OHEMaps;
-	std::vector<bool> featureIsCategorical;
+	std::vector<OHE*> trainingOHEMaps;
+	std::vector<bool> trainingFeatureIsCategorical;
+	std::vector<OHE*> testingOHEMaps;
+	std::vector<bool> testingFeatureIsCategorical;
 
 	virtual void import(shmea::GString) = 0;
 

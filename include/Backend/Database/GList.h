@@ -35,8 +35,7 @@ class GList
 
 private:
 	//
-	//GVector<GType> items;
-	std::vector<GType> items;
+	GVector<GType> items;
 	float xMin;
 	float xMax;
 	float xRange;
@@ -46,7 +45,6 @@ private:
 	void insertPrimitive(unsigned int, GType::Type, const void*);
 	void addObject(GType::Type, const void*, int64_t);
 	void insertObject(unsigned int, GType::Type, const void*, int64_t);
-
 public:
 	GList();
 	GList(const GList&);

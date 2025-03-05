@@ -62,6 +62,7 @@ public:
 	// children
 	const std::vector<glades::Node*>& getChildren() const;
 	Node* getNode(unsigned int);
+	void setupDropout();
 	void generateDropout(float);
 	void clearDropout();
 	void addNode(Node*);

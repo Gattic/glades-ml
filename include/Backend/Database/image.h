@@ -176,7 +176,7 @@ public:
 	void LoadPNG(const GString&);
 
 	shmea::GList flatten() const;
-	bool unflatten(const shmea::GList&);
+	float RGBtoHue(const RGBA&) const;
 
 	shmea::GString hash() const;
 	bool operator<(const Image&) const;

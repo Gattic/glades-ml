@@ -68,12 +68,12 @@ void NNUnitTest()
     //cNetwork.setTimestamp(maxTimeStamp);
     cNetwork.terminator.setEpoch(100000);
     cNetwork.terminator.setAccuracy(95);
-    G_assert (__FILE__, __LINE__, "==============NN1-test::Accuracy() Failed==============", cNetwork.getAccuracy() < 95.0f);
     
     // Run the training and retrieve a metanetwork
     glades::MetaNetwork* newTrainNet =
     	glades::train(&cNetwork, di);
 
+    G_assert (__FILE__, __LINE__, "==============NN1-test::Accuracy() Failed==============", cNetwork.getAccuracy() >= 95.0f);
 
     printf("-----------------------------------\n");
     printf("NN Test 2\n");
@@ -123,8 +123,13 @@ void NNUnitTest()
     //cNetwork2.setTimestamp(maxTimeStamp);
     cNetwork2.terminator.setEpoch(100000);
     cNetwork2.terminator.setAccuracy(95);
-    G_assert (__FILE__, __LINE__, "==============NN2-test::Accuracy() Failed==============", cNetwork2.getAccuracy() < 95.0f);
     
+    // Run the training and retrieve a metanetwork
+    glades::MetaNetwork* newTrainNet2 =
+    	glades::train(&cNetwork2, di2);
+    
+    G_assert (__FILE__, __LINE__, "==============NN2-test::Accuracy() Failed==============", cNetwork2.getAccuracy() >= 95.0f);
+
 
     printf("-----------------------------------\n");
     printf("NN Test 3\n");
@@ -174,11 +179,12 @@ void NNUnitTest()
     //cNetwork3.setTimestamp(maxTimeStamp);
     cNetwork3.terminator.setEpoch(100000);
     cNetwork3.terminator.setAccuracy(95);
-    G_assert (__FILE__, __LINE__, "==============NN3-test::Accuracy() Failed==============", cNetwork3.getAccuracy() < 95.0f);
     
     // Run the training and retrieve a metanetwork
     glades::MetaNetwork* newTrainNet3 =
     	glades::train(&cNetwork3, di3);
+
+    G_assert (__FILE__, __LINE__, "==============NN3-test::Accuracy() Failed==============", cNetwork3.getAccuracy() >= 95.0f);
 
     printf("\n============================================================\n");
 }
