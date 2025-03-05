@@ -228,6 +228,7 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 			cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_XAVIER, activationType);
 		}
 
+		cLayer->setupContext();
 		layers.push_back(cLayer);
 		prevLayerSize = cLayerSize;
 	}

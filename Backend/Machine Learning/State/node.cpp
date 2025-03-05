@@ -45,6 +45,7 @@ void glades::Node::copy(const Node& node2)
 	edges = node2.edges;
 	errorDer = node2.errorDer;
 	activationMutex = node2.activationMutex;
+	contextNode = node2.contextNode;
 }
 
 int64_t glades::Node::getID() const
@@ -304,4 +305,14 @@ void glades::Node::applyDeltas(unsigned int index, int minibatchSize)
 
 	// Set the new weight
 	setEdgeWeight(index, getEdgeWeight(index) - deltaW);
+}
+
+void glades::Node::setContextNode(Node* newContextNode)
+{
+	contextNode = newContextNode;
+}
+
+Node* glades::Node::getContextNode()
+{
+	return contextNode;
 }
