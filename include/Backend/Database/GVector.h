@@ -90,7 +90,8 @@ public:
 	}
 	void clear() 
 	{ 
-		if (m_data) {
+		if (m_data)
+		{
 			m_size = 0;
 			// Let the GPointer handle deletion when it goes out of scope
 			m_data.reset();
@@ -132,10 +133,11 @@ public:
 		}
 		else
 		{
-			// NOTE: the allocator should be responsible for this
-			(void)memmove(&m_data[idx],
-					&m_data[idx+1],
-					sizeof(T) * (m_size - idx - 1));// because we remove 1
+			 // Manual element-wise copy instead of memmove
+			for (size_type i = idx; i < m_size - 1; ++i)
+			{
+				m_data[i] = m_data[i+1];
+			}
 			m_size--;
 		}
 	}
@@ -149,10 +151,14 @@ public:
 		}
 		else
 		{
-			// NOTE: the allocator should be responsible for this
-			(void)memmove(&m_data[idx + 1],
-					&m_data[idx],
-					sizeof(T) * (m_size - idx));
+			if (m_size >= m_capacity)
+				this->expand();
+
+			// Manual element-wise copy instead of memmove
+			for (size_type i = m_size; i > idx; --i)
+			{
+				m_data[i] = m_data[i-1];
+			}
 			m_data[idx] = value;
 			m_size++;
 		}
@@ -170,23 +176,137 @@ public:
 	}
 	T& operator[](size_type idx) { return at(idx); }
 	const T& operator[](size_type idx) const { return at(idx); }
+
+	GVector& operator=(const GVector& other)
+	{
+		if (this != &other)
+		{
+			// Create new array and copy data before clearing old one
+			T* newArray = new T[other.m_capacity];
+			for (size_type i = 0; i < other.m_size; ++i)
+			{
+				new (&newArray[i]) T(other.m_data[i]);
+			}
+			
+			// Only after new data is ready, clear old data
+			clear();
+			m_size = other.m_size;
+			m_capacity = other.m_capacity;
+			m_data = shmea::GPointer<T, array_deleter<T> >(newArray);
+		}
+		return *this;
+	}
+
 private:
 	void expand()
 	{
 		size_type newCap = (m_capacity == 0) ? 1 : m_capacity * 2;
 		T* newArray = new T[newCap];
 		
-		if (m_data && m_size > 0) {
+		// Copy existing elements before modifying m_data
+		if (m_data && m_size > 0)
+		{
 			for (size_type i = 0; i < m_size; ++i)
-				newArray[i] = m_data[i];
+			{
+				// Use copy constructor
+				new (&newArray[i]) T(m_data[i]);
+			}
 		}
 
-		// Create new GPointer before resetting old one to avoid premature deletion
+		// Create new pointer and only then release old one
 		shmea::GPointer<T, array_deleter<T> > newBuffer(newArray);
-		m_data.reset();
+		m_data.reset();  // Reset after new data is ready
 		m_data = newBuffer;
 		m_capacity = newCap;
 	}
 };
+
+typedef GVector<GVector<float> > GMatrix;
+
+// FLOAT HELPERS
+
+inline static GVector<float> vectorStandardize(const GVector<float>& vec)
+{
+    GVector<float> newVec(vec.size(), 0.0f);
+
+    // 1) If there's no data, nothing to do
+    if (vec.size() == 0)
+        return newVec;
+
+    // Find min & max via first pass
+    float xMin = 0.0f;
+    float xMax = 0.0f;
+
+    bool firstNumericValue = true;
+    for (unsigned int r = 0; r < vec.size(); ++r)
+    {
+        const float& cell = vec[r];
+
+        // Update xMin, xMax
+        if (firstNumericValue)
+        {
+            xMin = cell;
+            xMax = cell;
+            firstNumericValue = false;
+        }
+        else
+        {
+            if (cell < xMin) xMin = cell;
+            if (cell > xMax) xMax = cell;
+        }
+    }
+
+    // 3) Compute xRange
+    float xRange = xMax - xMin;
+    if (xRange == 0.0f)
+        return vec; // All values are the same => no transformation needed
+
+    // 4) Second pass: normalize + shift in-place
+    for (unsigned int r = 0; r < vec.size(); ++r)
+    {
+        float cell = vec[r];
+
+        // Scale from [xMin..xMax] to [0..1], then shift => [-0.5..+0.5]
+        cell = ((cell - xMin) / xRange) - 0.5f;
+
+        newVec[r] = cell;
+    }
+
+    return newVec;
 }
+
+// GVector print function
+inline static void printVector(const GVector<float>& vec)
+{
+	for (unsigned int i = 0; i < vec.size(); i++)
+	{
+		if(i == vec.size() - 1)
+		    printf("%f", vec[i]);
+		else
+		    printf("%f, ", vec[i]);
+	}
+
+	printf("\n");
+
+}
+
+// GMatrix print function
+inline static void printMatrix(const GMatrix& matrix)
+{
+	for (unsigned int i = 0; i < matrix.size(); i++)
+	{
+		for (unsigned int j = 0; j < matrix[i].size(); j++)
+		{
+			if(j == matrix[i].size() - 1)
+			    printf("%f", matrix[i][j]);
+			else
+			    printf("%f, ", matrix[i][j]);
+		}
+		printf("\n");
+	}
+
+}
+
+};
+
 #endif // !GVECTOR_H_

@@ -47,14 +47,10 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
     unsigned int outputCol = 1;
     for(unsigned int r = 0; r < cTable.numberOfRows(); ++r)
     {
-	shmea::GString label = shmea::GString::intTOstring(cTable.getCell(r, outputCol).getInt());
 	shmea::GString path = fname + cTable.getCell(r, inputCol).c_str();
 	printf("[NNDATA] Loading %s\n", path.c_str());
 	shmea::GPointer<shmea::Image> img(new shmea::Image());
 	img->LoadPNG(path);
-
-	// Convert the label to a string for classification
-	cTable.setCell(r, outputCol, label);
 
 	if (r == 0)
 	{
@@ -67,33 +63,48 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
 	    }
 	}
 
-	float cell = 0.0f;
+	// Convert the label to a string for classification
+	shmea::GString label = "";
 	const shmea::GType& cCell = cTable.getCell(r, outputCol); // get the first cell of the col
 	shmea::GType::Type cType = cCell.getType();
-	if (cType == shmea::GType::STRING_TYPE)
-	{
-		shmea::GString strCell = cCell;
-		OHEMaps[outputCol]->addString(cCell);
-		featureIsCategorical[outputCol] = true;
-		//cell = OHEMaps[outputCol]->indexAt(strCell); // TODO FIX?
-		//continue;
-	}
-	else if (cType == shmea::GType::CHAR_TYPE)
-		cell = cCell.getChar();
+	if (cType == shmea::GType::CHAR_TYPE)
+		label = shmea::GString::intTOstring(cCell.getChar());
 	else if (cType == shmea::GType::SHORT_TYPE)
-		cell = cCell.getShort();
+		label = shmea::GString::intTOstring(cCell.getShort());
 	else if (cType == shmea::GType::INT_TYPE)
-		cell = cCell.getInt();
+		label = shmea::GString::intTOstring(cCell.getInt());
 	else if (cType == shmea::GType::LONG_TYPE)
-		cell = cCell.getLong();
+		label = shmea::GString::longTOstring(cCell.getLong());
 	else if (cType == shmea::GType::FLOAT_TYPE)
-		cell = cCell.getFloat();
+	{
+	    printf("Invalid type for image classification\n");
+	    return;
+	}
 	else if (cType == shmea::GType::DOUBLE_TYPE)
-		cell = cCell.getDouble();
+	{
+	    printf("Invalid type for image classification\n");
+	    return;
+	}
 	else if (cType == shmea::GType::BOOLEAN_TYPE)
-		cell = cCell.getBoolean() ? 1.0f : 0.0f;
+	{
+		if(cCell.getBoolean())
+		    label = "true";
+		else
+		    label = "false";
+	}
+	
+	if (label.length() == 0)
+	{
+	    printf("Invalid type for image classification\n");
+	    return;
+	}
 
-	if (r == 0)
+	cTable.setCell(r, outputCol, label);
+	OHEMaps[outputCol]->addString(label);
+	featureIsCategorical[outputCol] = true;
+	//float cell = OHEMaps[outputCol]->getFloat(label);
+
+	/*if (r == 0)
 	{
 		fMin = cell;
 		fMax = cell;
@@ -106,7 +117,7 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
 		fMax = cell;
 
 	// update mean
-	fMean += cell;
+	fMean += cell;*/
 
 	// Add a label if it doesn't exist
 	if(images.find(label) == images.end())
@@ -123,11 +134,11 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
 	}
     }
 
-    fMean /= cTable.numberOfRows();
-    OHEMaps[outputCol]->setMin(fMin);
-    OHEMaps[outputCol]->setMax(fMax);
-    OHEMaps[outputCol]->setMean(fMean);
-    printf("[NNDATA] Min: %f, Max: %f, Mean: %f\n", fMin, fMax, fMean);
+    //fMean /= cTable.numberOfRows();
+    //OHEMaps[outputCol]->setMin(fMin);
+    //OHEMaps[outputCol]->setMax(fMax);
+    //OHEMaps[outputCol]->setMean(fMean);
+    //printf("[NNDATA] Min: %f, Max: %f, Mean: %f\n", fMin, fMax, fMean);
 
     //printf("OHEMaps.size() = %lu\n", OHEMaps.size());
 }
@@ -205,7 +216,7 @@ const shmea::GPointer<shmea::Image> ImageInput::getTestImage(unsigned int row) c
     return itr->second;
 }
 
-shmea::GList ImageInput::getTrainRow(unsigned int index) const
+shmea::GVector<float> ImageInput::getTrainRow(unsigned int index) const
 {
     int inputType = glades::DataInput::IMAGE;
     static const unsigned int numRows = trainingLegend.numberOfRows(); // Cache number of rows
@@ -226,12 +237,12 @@ shmea::GList ImageInput::getTrainRow(unsigned int index) const
 	return emptyRow;
 	
     // Return the image
-    shmea::GList retList = itr->second->flatten();
-    retList.standardize();
+    shmea::GVector<float> retList = itr->second->flatten();
+    retList = shmea::vectorStandardize(retList);
     return retList;
 }
 
-shmea::GList ImageInput::getTrainExpectedRow(unsigned int index) const
+shmea::GVector<float> ImageInput::getTrainExpectedRow(unsigned int index) const
 {
     if(index >= trainingLegend.numberOfRows())
 	return emptyRow;
@@ -240,54 +251,44 @@ shmea::GList ImageInput::getTrainExpectedRow(unsigned int index) const
 
     // translate string to cell value for this col
     OHE* OHEVector = trainingOHEMaps[1];
-    std::vector<float> featureVector = (*OHEVector)[cCell];
-
-    shmea::GList retRow;
-    for(unsigned int i=0;i<featureVector.size();++i)
-	retRow.addFloat(featureVector[i]);
-
-    return retRow;
+    return (*OHEVector)[cCell];
 }
 
-shmea::GList ImageInput::getTestExpectedRow(unsigned int index) const
+shmea::GVector<float> ImageInput::getTestExpectedRow(unsigned int index) const
 {
     if(index >= testingLegend.numberOfRows())
-	return shmea::GList();
+	return shmea::GVector<float>();
 
     const shmea::GString& cCell = testingLegend.getCell(index, 1);
 
     // translate string to cell value for this col
     OHE* OHEVector = testingOHEMaps[1];
-    std::vector<float> featureVector = (*OHEVector)[cCell];
-
-    shmea::GList retRow;
-    for(unsigned int i=0;i<featureVector.size();++i)
-	retRow.addFloat(featureVector[i]);
-    return retRow;
+    return (*OHEVector)[cCell];
+    return shmea::GVector<float>();
 }
 
-shmea::GList ImageInput::getTestRow(unsigned int index) const
+shmea::GVector<float> ImageInput::getTestRow(unsigned int index) const
 {
     int inputType = glades::DataInput::IMAGE;
     if(index >= testingLegend.numberOfRows())
-	return shmea::GList();
+	return shmea::GVector<float>();
 
     const shmea::GString& label = testingLegend.getCell(index, 1);
     shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(index, 0).c_str();
 
     // Check if the label exists
     if(testImages.find(label) == testImages.end())
-	return shmea::GList();
+	return shmea::GVector<float>();
 	
     // Check if the image exists
     std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
 	= testImages.at(label).find(fname);
     if(itr == testImages.at(label).end())
-	return shmea::GList();
+	return shmea::GVector<float>();
 	
     // Return the image
-    shmea::GList retList = itr->second->flatten();
-    retList.standardize();
+    shmea::GVector<float> retList = itr->second->flatten();
+    retList = shmea::vectorStandardize(retList);
     return retList;
 }
 

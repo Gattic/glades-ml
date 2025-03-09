@@ -57,19 +57,31 @@ public:
 
 	void reset()
 	{
-		if (!refCount) {
+		if (!refCount)
+		{
 			return;
 		}
 		
-		if (decrement() == 0) {
-			if (data) {
-				Deleter(data);
-				data = NULL;
-			}
-			delete refCount;
+		unsigned int count = decrement();
+		if (count == 0)
+		{
+			// Store local copies before nulling members
+			T* dataToDelete = data;
+			unsigned int* countToDelete = refCount;
+			
+			// Null members first
+			data = NULL;
 			refCount = NULL;
 			refMutex = NULL;
+			
+			// Delete after members are nulled
+			if (dataToDelete)
+			{
+				Deleter(dataToDelete);
+			}
+			delete countToDelete;
 		} else {
+			// Just null our references
 			data = NULL;
 			refCount = NULL;
 			refMutex = NULL;
@@ -83,7 +95,8 @@ public:
 
 	unsigned int increment()
 	{
-		if (refCount) {
+		if (refCount)
+		{
 			++(*refCount);
 		}
 		return refCount ? *refCount : 0;
@@ -91,7 +104,8 @@ public:
 
 	unsigned int decrement()
 	{
-		if (refCount) {
+		if (refCount)
+		{
 			--(*refCount);
 		}
 		return refCount ? *refCount : 0;

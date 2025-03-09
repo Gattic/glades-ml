@@ -160,7 +160,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 
 		if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 			(skeleton->getOutputType() == GMath::KL))
-			printf("[NN] Epochs\tAccuracy\tPrecision\tRecall\t\tSpecificity\tF1 Score\n");
+			printf("[NN] Epochs\tAccuracy\tMCC\t\tPrecision\tRecall\t\tSpecificity\tF1 Score\n");
 	}
 
 	// Reset the different graphcs e.g. learning curve
@@ -222,6 +222,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 			overallClassRecall = (confusionMatrix.getOverallRecall() * 100.0f);
 			overallClassSpecificity = (confusionMatrix.getOverallSpecificity() * 100.0f);
 			overallClassF1 = confusionMatrix.getOverallF1Score() * 100.0f;
+			float mcc = confusionMatrix.getOverallMCC();
 
 			// Display and debugging
 			if (runType == RUN_TRAIN)
@@ -230,14 +231,14 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 				{
 					if (epochs < 100)
 					{
-						printf("\33[2K[NN] %d\t\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
-							   overallClassAccuracy, overallClassPrecision, overallClassRecall,
+						printf("\33[2K[NN] %d\t\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
+							   overallClassAccuracy, mcc, overallClassPrecision, overallClassRecall,
 							   overallClassSpecificity, overallClassF1);
 						fflush(stdout);
 					}
 					else
 					{
-						printf("\33[2K[NN] %d\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
+						printf("\33[2K[NN] %d\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
 							   overallClassAccuracy, overallClassPrecision, overallClassRecall,
 							   overallClassSpecificity, overallClassF1);
 						fflush(stdout);
@@ -535,9 +536,8 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			    {
 				    // Get the prediction and expected vars
 				    float prediction = netState->cOutputNode->getWeight();
-				    shmea::GType expectedCell =
+				    float expectation =
 					    di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
-				    float expectation = expectedCell;
 				    //printf("Expectation: %f Prediction: %f\n", expectation, prediction);
 
 				    // Add the expected and predicted to the result row
@@ -616,10 +616,8 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		    {
 			    // Cost function error derivative for output layer(s)
 			    float prediction = netState->cOutputNode->getWeight();
-			    float expectation = 0.0f;
-			    shmea::GType expectedCell =
+			    float expectation =
 				    di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
-			    expectation = expectedCell.getFloat();
 
 			    int costFx = skeleton->getOutputType();
 			    netState->cOutputNode->clearErrDer();

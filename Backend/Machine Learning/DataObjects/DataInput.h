@@ -38,11 +38,11 @@ public:
 
 	virtual void import(shmea::GString) = 0;
 
-	virtual shmea::GList getTrainRow(unsigned int) const = 0;
-	virtual shmea::GList getTrainExpectedRow(unsigned int) const = 0;
+	virtual shmea::GVector<float> getTrainRow(unsigned int) const = 0;
+	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int) const = 0;
 
-	virtual shmea::GList getTestRow(unsigned int) const = 0;
-	virtual shmea::GList getTestExpectedRow(unsigned int) const = 0;
+	virtual shmea::GVector<float> getTestRow(unsigned int) const = 0;
+	virtual shmea::GVector<float> getTestExpectedRow(unsigned int) const = 0;
 
 	virtual unsigned int getTrainSize() const = 0;
 	virtual unsigned int getTestSize() const = 0;
@@ -50,6 +50,7 @@ public:
 
 	virtual int getType() const = 0;
 };
+
 };
 
 #endif

@@ -265,6 +265,34 @@ float glades::CMatrix::getOverallF1Score() const
 	return totalF1Score;
 }
 
+float glades::CMatrix::getClassMCC(unsigned int index) const
+{
+	if (index > matrix.numberOfRows())
+		return 0.0f;
+
+	float tp = ((float)(truePositive.getInt(index)));
+	float tn = ((float)(trueNegative.getInt(index)));
+	float fp = ((float)(falsePositive.getInt(index)));
+	float fn = ((float)(falseNegative.getInt(index)));
+
+	float numerator = (tp * tn) - (fp * fn);
+	float denominator = sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn));
+
+	return (numerator / denominator);
+}
+
+float glades::CMatrix::getOverallMCC() const
+{
+	float totalMCC = 0.0f;
+
+	for (unsigned int i = 0; i < matrix.numberOfRows(); ++i)
+		totalMCC += getClassMCC(i);
+
+	totalMCC /= ((float)(matrix.numberOfRows()));
+
+	return totalMCC;
+}
+
 void glades::CMatrix::print() const
 {
 	// bare print for now, pretty it up later

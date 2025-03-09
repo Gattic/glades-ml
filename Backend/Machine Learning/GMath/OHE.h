@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include "Backend/Database/GString.h"
+#include "Backend/Database/GVector.h"
 
 namespace shmea {
 // class GStr;
@@ -36,7 +37,7 @@ class OHE
 {
 private:
 
-	std::vector<shmea::GString> OHEStrings;
+	shmea::GVector<shmea::GString> OHEStrings;
 	float fMin;
 	float fMax;
 	float fMean;
@@ -62,7 +63,7 @@ public:
 	float getMin() const;
 	float getMax() const;
 	float getMean() const;
-	std::vector<shmea::GString> getStrings() const;
+	shmea::GVector<shmea::GString> getStrings() const;
 	bool contains(const shmea::GString&) const;
 	void print() const;
 	void printFeatures() const;
@@ -71,10 +72,10 @@ public:
 	float standardize(float) const;
 
 	// operators
-	std::vector<float> operator[](const char*) const;
-	std::vector<float> operator[](const shmea::GString&) const;
-	shmea::GString operator[](const std::vector<int>&) const;
-	shmea::GString operator[](const std::vector<float>&) const;
+	shmea::GVector<float> operator[](const char*) const;
+	shmea::GVector<float> operator[](const shmea::GString&) const;
+	shmea::GString operator[](const shmea::GVector<int>&) const;
+	shmea::GString operator[](const shmea::GVector<float>&) const;
 };
 };
 

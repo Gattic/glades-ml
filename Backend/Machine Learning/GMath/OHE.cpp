@@ -92,7 +92,7 @@ float glades::OHE::getMean() const
 	return fMean;
 }
 
-std::vector<shmea::GString> glades::OHE::getStrings() const
+shmea::GVector<shmea::GString> glades::OHE::getStrings() const
 {
 	return OHEStrings;
 }
@@ -138,15 +138,12 @@ void glades::OHE::print() const
 
 int glades::OHE::indexAt(const shmea::GString& needle) const
 {
-	std::vector<int> retVal(size(), 0);
+	shmea::GVector<int> retVal(size(), 0);
 
-	int counter = 0;
-	std::vector<shmea::GString>::const_iterator itr = OHEStrings.begin();
-	for (; itr != OHEStrings.end(); ++itr)
+	for (unsigned int counter = 0; counter < OHEStrings.size(); ++counter)
 	{
-		if ((*itr) == needle)
+		if (OHEStrings[counter] == needle)
 			return counter;
-		++counter;
 	}
 
 	return -1;
@@ -163,42 +160,34 @@ shmea::GString glades::OHE::classAt(unsigned int cid) const
 	return OHEStrings[cid];
 }
 
-std::vector<float> glades::OHE::operator[](const char* needle) const
+shmea::GVector<float> glades::OHE::operator[](const char* needle) const
 {
 	shmea::GString needleString(needle);
-	std::vector<float> retVal(size(), 0.01);
+	shmea::GVector<float> retVal(size(), 0.01);
 
-	int counter = 0;
-	std::vector<shmea::GString>::const_iterator itr = OHEStrings.begin();
-	for (; itr != OHEStrings.end(); ++itr)
+	for (unsigned int counter = 0; counter < OHEStrings.size(); ++counter)
 	{
-		if ((*itr) == needleString)
+		if (OHEStrings[counter] == needleString)
 		{
 			retVal[counter] = 0.99;
 			break;
 		}
-
-		++counter;
 	}
 
 	return retVal;
 }
 
-std::vector<float> glades::OHE::operator[](const shmea::GString& needle) const
+shmea::GVector<float> glades::OHE::operator[](const shmea::GString& needle) const
 {
-	std::vector<float> retVal(size(), 0.01);
+	shmea::GVector<float> retVal(size(), 0.01);
 
-	int counter = 0;
-	std::vector<shmea::GString>::const_iterator itr = OHEStrings.begin();
-	for (; itr != OHEStrings.end(); ++itr)
+	for (unsigned int counter = 0; counter < OHEStrings.size(); ++counter)
 	{
-		if ((*itr) == needle)
+		if (OHEStrings[counter] == needle)
 		{
 			retVal[counter] = 0.99;
 			break;
 		}
-
-		++counter;
 	}
 
 	return retVal;
@@ -206,38 +195,33 @@ std::vector<float> glades::OHE::operator[](const shmea::GString& needle) const
 
 // ONLY SUPPORTS FIRST HOT FOUND
 // EXPAND TO SUPPORT MULTIDIMENSIONALITY
-shmea::GString glades::OHE::operator[](const std::vector<int>& needle) const
+shmea::GString glades::OHE::operator[](const shmea::GVector<int>& needle) const
 {
 	// check if the string is already in the vector
-	int counter = 0;
-	std::vector<int>::const_iterator itr = needle.begin();
-	for (; itr != needle.end(); ++itr)
+	for (unsigned int counter = 0; counter < needle.size(); ++counter)
 	{
-		if ((*itr) == 1)
+		if (needle[counter] == 1)
 			return OHEStrings[counter];
-		++counter;
 	}
 
 	return "";
 }
 
-shmea::GString glades::OHE::operator[](const std::vector<float>& needle) const
+shmea::GString glades::OHE::operator[](const shmea::GVector<float>& needle) const
 {
 	// check if the string is already in the vector
 	float max = 0.0f;
-	int counter = 0, index = -1;
-	std::vector<float>::const_iterator itr = needle.begin();
-	for (; itr != needle.end(); ++itr)
+	unsigned int index = -1;
+	for (unsigned int counter = 0; counter < needle.size(); ++counter)
 	{
-		if ((*itr) >= max)
+		if (needle[counter] >= max)
 		{
-			max = (*itr);
+			max = needle[counter];
 			index = counter;
 		}
-		++counter;
 	}
 
-	if (index >= 0)
+	if (index != -1)
 		return OHEStrings[index];
 
 	return "";
@@ -300,7 +284,7 @@ float glades::OHE::standardize(float val) const
 	if (xRange == 0.0f)
 		return 0.0f;
 
-	return ((((val - fMin) / (xRange)) * 0.98f) + 0.01f);
+	return ((((val - fMin) / (xRange)) * 0.99f) + 0.01f);
 }
 
 void glades::OHE::printFeatures() const

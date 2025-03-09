@@ -8,7 +8,9 @@
 #include "pca-test.h"
 #include "../../unit-test.h"
 #include "Backend/Database/GList.h"
+#include "Backend/Database/image.h"
 #include "../../../Backend/Machine Learning/GMath/pca.h"
+#include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
@@ -104,4 +106,31 @@ void PCAUnitTest()
      *
      *  Reconstruction error: 54430.9
      */
+
+    printf("============================================================\n");
+    return;
+    // This test takes forever
+
+    //shmea::GString path = "datasets/images/MNIST/train/0/1000.png";
+    shmea::GString path = "MNIST";
+    glades::DataInput* di = new glades::ImageInput();
+    di->import(path);
+
+    std::vector<std::vector<double> > img_data;
+    unsigned int trainSize = di->getTrainSize();
+    for(unsigned int i = 0; i < trainSize; ++i)
+    {
+	shmea::GVector<float> flattenedImg = di->getTrainRow(i);
+	std::vector<double> imgVec;
+	for(unsigned int j = 0; j < flattenedImg.size(); ++j)
+	{
+	    imgVec.push_back(flattenedImg[j]);
+	}
+
+	img_data.push_back(imgVec);
+    }
+
+    transformed_data.clear();
+    sorted_eig_vecs.clear();
+    compute_pca(img_data, transformed_data, sorted_eig_vecs);
 }

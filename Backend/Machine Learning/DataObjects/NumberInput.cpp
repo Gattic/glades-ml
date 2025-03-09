@@ -27,7 +27,9 @@ using namespace glades;
 void NumberInput::import(shmea::GString fname)
 {
     if(loaded)
-	return;
+    {
+        return;
+    }
 
     name = fname;
 
@@ -42,293 +44,220 @@ void NumberInput::import(shmea::GString fname)
 
 void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName, int standardizeFlag)
 {
-	trainTable = shmea::GTable(',');
-	shmea::GTable rawTable = shmea::GTable(inputFName, ',', shmea::GTable::TYPE_FILE);
+    shmea::GTable rawTable = shmea::GTable(inputFName, ',', shmea::GTable::TYPE_FILE);
 
-	// Standardize the initialization of the weights
-	if ((rawTable.numberOfRows() <= 0) || (rawTable.numberOfCols() <= 0))
-		return;
+    // Standardize the initialization of the weights
+    if ((rawTable.numberOfRows() <= 0) || (rawTable.numberOfCols() <= 0))
+        return;
 
-	// default cols to non-categorical
-	bool isClassification = false;
-	for (unsigned int c = 0; c < rawTable.numberOfCols(); ++c)
-	{
-		OHE* cOHE = new OHE();
-		trainingFeatureIsCategorical.push_back(false);
+    // Initialize matrices with proper dimensions
+    unsigned int inputColIdx = 0;
+    unsigned int outputColIdx = 0;
+    unsigned int totalInputCols = 0;
+    unsigned int totalOutputCols = 0;
 
-		shmea::GType cCell = rawTable.getCell(0, c); // get the first cell of the col
-		if (cCell.getType() == shmea::GType::STRING_TYPE)
-		{
-			cOHE->mapFeatureSpace(rawTable, c);
-			trainingFeatureIsCategorical[c] = true;
-			isClassification = true;
-			cOHE->print();
-		}
+    // default cols to non-categorical
+    bool isClassification = false;
+    for (unsigned int c = 0; c < rawTable.numberOfCols(); ++c)
+    {
+        OHE* cOHE = new OHE();
+        trainingFeatureIsCategorical.push_back(false);
 
-		trainingOHEMaps.push_back(cOHE);
-	}
+        shmea::GType cCell = rawTable.getCell(0, c); // get the first cell of the col
+        if (cCell.getType() == shmea::GType::STRING_TYPE)
+        {
+            cOHE->mapFeatureSpace(rawTable, c);
+            trainingFeatureIsCategorical[c] = true;
+            isClassification = true;
+            cOHE->print();
+        }
 
-	// iterate through the cols
-	for (unsigned int c = 0; c < rawTable.numberOfCols(); ++c)
-	{
-		// Set the min and max for this feature (col)
-		float fMin = 0.0f;
-		float fMax = 0.0f;
-		float fMean = 0.0f;
+        trainingOHEMaps.push_back(cOHE);
 
-		// iterate through the rows
-		for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r)
-		{
-			// check if already marked categorical
-			if (trainingFeatureIsCategorical[c])
-				continue;
+	// Count dimensions
+        if (rawTable.isOutput(c)) 
+        {
+            if (trainingFeatureIsCategorical[c]) 
+            {
+                totalOutputCols += trainingOHEMaps[c]->size();
+            } 
+            else 
+            {
+                totalOutputCols++;
+            }
+        } 
+        else 
+        {
+            if (trainingFeatureIsCategorical[c]) 
+            {
+                totalInputCols += trainingOHEMaps[c]->size();
+            } 
+            else 
+            {
+                totalInputCols++;
+            }
+        }
+    }
 
-			float cell = 0.0f;
-			shmea::GType cCell = rawTable.getCell(r, c);
+    // Initialize matrices
+    trainMatrix = shmea::GMatrix(rawTable.numberOfRows(), shmea::GVector<float>(totalInputCols, 0.0f));
+    trainExpectedMatrix = shmea::GMatrix(rawTable.numberOfRows(), shmea::GVector<float>(totalOutputCols, 0.0f));
+    
+    // Second pass: populate matrices
+    for (unsigned int c = 0; c < rawTable.numberOfCols(); c++) 
+    {
+        if (trainingFeatureIsCategorical[c]) 
+        {
+            OHE* OHEVector = trainingOHEMaps[c];
+            for (unsigned int cInt = 0; cInt < OHEVector->size(); ++cInt) 
+            {
+                for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r) 
+                {
+                    shmea::GType cCell = rawTable.getCell(r, c);
+                    shmea::GString cString = cCell.c_str();
+                    shmea::GVector<float> featureVector = (*OHEVector)[cString];
+                    float cell = featureVector[cInt];
 
-			if (cCell.getType() == shmea::GType::STRING_TYPE)
-				continue; // mapped strings in a previous loop
-			else if (cCell.getType() == shmea::GType::CHAR_TYPE)
-				cell = cCell.getChar();
-			else if (cCell.getType() == shmea::GType::SHORT_TYPE)
-				cell = cCell.getShort();
-			else if (cCell.getType() == shmea::GType::INT_TYPE)
-				cell = cCell.getInt();
-			else if (cCell.getType() == shmea::GType::LONG_TYPE)
-				cell = cCell.getLong();
-			else if (cCell.getType() == shmea::GType::FLOAT_TYPE)
-				cell = cCell.getFloat();
-			else if (cCell.getType() == shmea::GType::DOUBLE_TYPE)
-				cell = cCell.getDouble();
-			else if (cCell.getType() == shmea::GType::BOOLEAN_TYPE)
-				cell = cCell.getBoolean() ? 1.0f : 0.0f;
+                    if (rawTable.isOutput(c)) 
+                    {
+                        trainExpectedMatrix[r][outputColIdx] = cell;
+                    } 
+                    else 
+                    {
+                        trainMatrix[r][inputColIdx] = cell;
+                    }
+                }
+                if (rawTable.isOutput(c)) 
+                {
+                    outputColIdx++;
+                } 
+                else 
+                {
+                    inputColIdx++;
+                }
+            }
+        } 
+        else 
+        {
+            // Handle numeric columns
+            float fMin = 0.0f;
+            float fMax = 0.0f;
+            float fMean = 0.0f;
 
-			if ((r == 0) && (c == 0))
-			{
-				fMin = cell;
-				fMax = cell;
-			}
+            // First get min/max/mean
+            for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r) 
+            {
+                float cell = rawTable.getCell(r, c).getFloat();
+                if (r == 0) 
+                {
+                    fMin = cell;
+                    fMax = cell;
+                }
+                if (cell < fMin) fMin = cell;
+                if (cell > fMax) fMax = cell;
+                fMean += cell;
+            }
+            fMean /= rawTable.numberOfRows();
 
-			// Check the mins and maxes
-			if (cell < fMin)
-				fMin = cell;
-			if (cell > fMax)
-				fMax = cell;
+            // Then standardize and store
+            float xRange = fMax - fMin;
+            for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r) 
+            {
+                float cell = rawTable.getCell(r, c).getFloat();
+                
+                if (xRange != 0.0f) 
+                {
+                    if (standardizeFlag == GMath::MINMAX) 
+                    {
+                        cell = ((cell - fMin) / xRange);
+                    } 
+                    else if (standardizeFlag == GMath::ZSCORE) 
+                    {
+                        // Calculate standard deviation
+                        float fStDev = 0.0f;
+                        for (unsigned int i = 0; i < rawTable.numberOfRows(); ++i) 
+                        {
+                            float val = rawTable.getCell(i, c).getFloat();
+                            fStDev += ((val - fMean) * (val - fMean));
+                        }
+                        fStDev = sqrt(fStDev / (rawTable.numberOfRows() - 1));
+                        if (fStDev != 0.0f) 
+                        {
+                            cell = ((cell - fMean) / fStDev);
+                        }
+                    }
+                }
 
-			// update mean
-			fMean += cell;
-			if (r == (rawTable.numberOfRows() - 1))
-				fMean /= rawTable.numberOfRows();
-		}
-		printf("c: %d:%u, fMin: %f, fMax: %f, fMean: %f\n", c, rawTable.numberOfCols(), fMin, fMax, fMean);
-
-		if (trainingFeatureIsCategorical[c])
-		{
-			OHE* OHEVector = trainingOHEMaps[c];
-			printf("OHEVector size: %d\n", OHEVector->size());
-
-			// iterate over feature (col) space
-			for (unsigned int cInt = 0; cInt < OHEVector->size(); ++cInt)
-			{
-				// iterate over rows
-				shmea::GList newCol;
-				for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r)
-				{
-					shmea::GType cCell = rawTable.getCell(r, c);
-					float cell = 0.0f;
-
-					// translate string to cell value for this col
-					shmea::GString cString = cCell.c_str();
-					std::vector<float> featureVector = (*OHEVector)[cString];
-					cell = featureVector[cInt];
-
-					// add cell to newCol
-					newCol.addFloat(cell);
-				}
-
-				// generic new header since OHE turns 1 col to many
-				shmea::GString newHeader = rawTable.getHeader(c).c_str();
-				newHeader += shmea::GString::intTOstring(cInt);
-
-				// add the standardized newCol to the trainTable
-				if (rawTable.isOutput(c))
-				{
-				    trainExpectedTable.addCol(newHeader, newCol);
-				    trainExpectedTable.toggleOutput(trainExpectedTable.numberOfCols() - 1);
-				}
-				else
-				    trainTable.addCol(newHeader, newCol);
-			}
-		}
-		else
-		{
-			if (standardizeFlag == GMath::MINMAX)
-			{
-				// find the range of this feature
-				float xRange = fMax - fMin;
-				if (xRange == 0.0f)
-				{
-					// This column is just a constant, add and skip standardization
-					trainTable.addCol(rawTable.getHeader(c), rawTable.getCol(c));
-					continue;
-				}
-
-				// iterate through the rows
-				shmea::GList newCol;
-				for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r)
-				{
-					// acquire original cell value
-					shmea::GType cCell = rawTable.getCell(r, c);
-					float cell = 0.0f;
-					if (cCell.getType() == shmea::GType::STRING_TYPE)
-					{
-						// for errors - strings MUST be categorical
-						printf("ERROR: String found in non-categorical column.\n");
-						trainTable.clear();
-						return;
-					}
-					else
-						cell = cCell.getFloat();
-
-					// standardize cell value based on network vars
-					if (isClassification) // CLASSIFICATION
-					{
-						// [0.01, 0.99] bounds
-						cell = ((((cell - fMin) / (xRange)) * 0.98f) + 0.01f);
-					}
-					else // REGRESSION
-					{
-						/*int activationType = skeleton->getActivationType(0); // 0 because first layer
-						if ((activationType == GMath::SIGMOID) || (activationType ==
-						GMath::SIGMOIDP)
-						||
-							(activationType == GMath::RELU) || (activationType == GMath::LEAKY))
-							cell = ((cell - fMin) / (xRange)); // [0.0, 1.0] bounds
-						else
-							cell = ((((cell - fMin) / (xRange)) * 2.0f) - 1.0f); // [-1.0, 1.0]
-						bounds*/
-
-						// [0.0, 1.0] bounds
-						cell = ((cell - fMin) / (xRange));
-					}
-
-					// add cell to newCol
-					newCol.addFloat(cell);
-				}
-
-				// add the standardized newCol to the trainTable
-				if (rawTable.isOutput(c))
-				{
-					trainExpectedTable.addCol(rawTable.getHeader(c), newCol);
-					trainExpectedTable.toggleOutput(trainTable.numberOfCols() - 1);
-				}
-				else
-				    trainTable.addCol(rawTable.getHeader(c), newCol);
-			}
-			else if (standardizeFlag == GMath::ZSCORE)
-			{
-				// second pass for stdev
-				float fStDev = 0.0f;
-				shmea::GList newCol;
-				for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r)
-				{
-					// acquire original cell value
-					shmea::GType cCell = rawTable.getCell(r, c);
-					float cell = 0.0f;
-					if (cCell.getType() == shmea::GType::STRING_TYPE)
-					{
-						// for errors - strings MUST be categorical
-						trainTable.clear();
-						return;
-					}
-					else
-						cell = cCell.getFloat();
-
-					fStDev += ((cell - fMean) * (cell - fMean));
-				}
-
-				// calculate stdev
-				fStDev = sqrt(fStDev / (rawTable.numberOfRows() - 1));
-
-				for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r)
-				{
-					// acquire original cell value
-					shmea::GType cCell = rawTable.getCell(r, c);
-					float cell = 0.0f;
-					if (cCell.getType() == shmea::GType::STRING_TYPE)
-					{
-						// for errors - strings MUST be categorical
-						printf("ERROR: String found in non-categorical column.\n");
-						trainTable.clear();
-						return;
-					}
-					else
-						cell = cCell.getFloat();
-
-					cell = ((cell - fMean) / fStDev);
-
-					// add cell to newCol
-					newCol.addFloat(cell);
-				}
-
-				// add the standardized newCol to the trainTable
-				if (rawTable.isOutput(c))
-				{
-					trainExpectedTable.addCol(rawTable.getHeader(c), newCol);
-					trainExpectedTable.toggleOutput(trainTable.numberOfCols() - 1);
-				}
-				else
-				    trainTable.addCol(rawTable.getHeader(c), newCol);
-			}
-		}
-	}
+                if (rawTable.isOutput(c)) 
+                {
+                    trainExpectedMatrix[r][outputColIdx] = cell;
+                } 
+                else 
+                {
+                    trainMatrix[r][inputColIdx] = cell;
+                }
+            }
+            if (rawTable.isOutput(c)) 
+            {
+                outputColIdx++;
+            } 
+            else 
+            {
+                inputColIdx++;
+            }
+        }
+    }
 }
 
-shmea::GList NumberInput::getTrainRow(unsigned int index) const
+shmea::GVector<float> NumberInput::getTrainRow(unsigned int index) const
 {
-    if(index >= trainTable.numberOfRows())
-	return emptyRow;
-
-    return trainTable.getRow(index);
+    if(index >= trainMatrix.size())
+    {
+        return emptyRow;
+    }
+    return trainMatrix[index];
 }
 
-shmea::GList NumberInput::getTrainExpectedRow(unsigned int index) const
+shmea::GVector<float> NumberInput::getTrainExpectedRow(unsigned int index) const
 {
-    if(index >= trainExpectedTable.numberOfRows())
-	return emptyRow;
-
-    return trainExpectedTable.getRow(index);
+    if(index >= trainExpectedMatrix.size())
+    {
+        return emptyRow;
+    }
+    return trainExpectedMatrix[index];
 }
 
-shmea::GList NumberInput::getTestRow(unsigned int index) const
+shmea::GVector<float> NumberInput::getTestRow(unsigned int index) const
 {
-    if(index >= testTable.numberOfRows())
-	return shmea::GList();
-
-    return testTable.getRow(index);
+    if(index >= testMatrix.size())
+    {
+        return shmea::GVector<float>();
+    }
+    return testMatrix[index];
 }
 
-shmea::GList NumberInput::getTestExpectedRow(unsigned int index) const
+shmea::GVector<float> NumberInput::getTestExpectedRow(unsigned int index) const
 {
-    if(index >= testExpectedTable.numberOfRows())
-	return shmea::GList();
-
-    return testExpectedTable.getRow(index);
+    if(index >= testExpectedMatrix.size())
+    {
+        return shmea::GVector<float>();
+    }
+    return testExpectedMatrix[index];
 }
 
 unsigned int NumberInput::getTrainSize() const
 {
-    return trainTable.numberOfRows();
+    return trainMatrix.size();
 }
 
 unsigned int NumberInput::getTestSize() const
 {
-    return testTable.numberOfRows();
+    return testMatrix.size();
 }
 
 unsigned int NumberInput::getFeatureCount() const
 {
-    return trainTable[0].size();
+    return trainMatrix[0].size();
 }
 
 int NumberInput::getType() const

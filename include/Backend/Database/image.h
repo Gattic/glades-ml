@@ -21,6 +21,7 @@
 #include <string.h>
 #include <string>
 #include <vector> 
+#include "GVector.h"
 
 class RUBackgroundComponent;
 
@@ -175,8 +176,8 @@ public:
 	void SavePNG(const GString&) const;
 	void LoadPNG(const GString&);
 
-	shmea::GList flatten() const;
-	float RGBtoHue(const RGBA&) const;
+	shmea::GVector<float> flatten() const;
+	float rgbaToHueIntensity(const RGBA&) const;
 
 	shmea::GString hash() const;
 	bool operator<(const Image&) const;

@@ -125,44 +125,11 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 		printf("[GQL] Building input layer %d\n", r);
 		Layer* cLayer = new Layer(Layer::INPUT_TYPE, false);
 
-		// for (unsigned int c = 0; c < featureCount; ++c)
-		// {
-		// 	// We can probably get rid of most of these conditions becuase Gtype auto types
-		// 	float newWeight = 0.0f;
-		// 	shmea::GType cCell = di->getTrainRow(r)[c];
-		// }
-
 		for (unsigned int c = 0; c < featureCount; ++c)
 		{
 			// We can probably get rid of most of these conditions becuase Gtype auto types
-			float newWeight = 0.0f;
-			shmea::GType cCell = di->getTrainRow(r)[c];
+			float newWeight = di->getTrainRow(r)[c];
 
-			shmea::GType::Type cellType = cCell.getType(); 
-			// printf("Cell type %s",cellType);
-
-			switch (cellType)
-			{
-				case shmea::GType::STRING_TYPE:
-					if (!di->trainingFeatureIsCategorical[c])
-					{
-						inputLayers.clear();
-						return;
-					}
-					break;
-				case shmea::GType::CHAR_TYPE:   newWeight = cCell.getChar();   break;
-				case shmea::GType::SHORT_TYPE:  newWeight = cCell.getShort();  break;
-				case shmea::GType::INT_TYPE:    newWeight = cCell.getInt();    break;
-				case shmea::GType::LONG_TYPE:   newWeight = cCell.getLong();   break;
-				case shmea::GType::FLOAT_TYPE:  newWeight = cCell.getFloat();  break;
-				case shmea::GType::DOUBLE_TYPE: newWeight = cCell.getDouble(); break;
-				case shmea::GType::BOOLEAN_TYPE:
-					newWeight = cCell.getBoolean() ? 1.0f : 0.0f;
-					break;
-				default:
-					break;  // Skip unsupported types
-			}
-			
 			// Error
 			Node* node = new Node();
 			if (!node)

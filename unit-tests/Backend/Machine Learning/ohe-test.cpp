@@ -38,8 +38,8 @@ void OHEUnitTest() {
     G_assert(__FILE__, __LINE__, "OHE does not contain 'dog'", ohe.contains("dog"));
 
     //  One-hot encoding vector for strings
-    std::vector<float> catEncoding = ohe["cat"];
-    std::vector<float> dogEncoding = ohe["dog"];
+    shmea::GVector<float> catEncoding = ohe["cat"];
+    shmea::GVector<float> dogEncoding = ohe["dog"];
 
     G_assert(__FILE__, __LINE__, "One-hot encoding size mismatch", catEncoding.size() == 2);
     G_assert(__FILE__, __LINE__, "One-hot encoding size mismatch", dogEncoding.size() == 2);

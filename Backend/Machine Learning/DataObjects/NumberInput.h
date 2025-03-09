@@ -25,35 +25,35 @@
 #include <vector>
 #include <map>
 
-namespace glades {
+namespace glades 
+{
 
 class NumberInput : public DataInput
 {
 public:
 
 	// Path, Label
-	shmea::GTable trainTable;
-	shmea::GTable trainExpectedTable;
-	shmea::GTable testTable;
-	shmea::GTable testExpectedTable;
+	shmea::GMatrix trainMatrix;
+	shmea::GMatrix trainExpectedMatrix;
+	shmea::GMatrix testMatrix;
+	shmea::GMatrix testExpectedMatrix;
 
-	shmea::GList emptyRow;
+	shmea::GVector<float> emptyRow;
 	shmea::GString name;
 	bool loaded;
 
-	NumberInput()
+	NumberInput() :
+	    name(""),
+	    loaded(false)
 	{
-		//
-	    name = "";
-	    loaded = false;
 	    trainingOHEMaps.clear();
 	    testingOHEMaps.clear();
 	    trainingFeatureIsCategorical.clear();
 	    testingFeatureIsCategorical.clear();
-	    trainTable.clear();
-	    trainExpectedTable.clear();
-	    testTable.clear();
-	    testExpectedTable.clear();
+	    trainMatrix.clear();
+	    trainExpectedMatrix.clear();
+	    testMatrix.clear();
+	    testExpectedMatrix.clear();
 	}
 
 	virtual ~NumberInput()
@@ -64,20 +64,20 @@ public:
 	    testingOHEMaps.clear();
 	    trainingFeatureIsCategorical.clear();
 	    testingFeatureIsCategorical.clear();
-	    trainTable.clear();
-	    trainExpectedTable.clear();
-	    testTable.clear();
-	    testExpectedTable.clear();
+	    trainMatrix.clear();
+	    trainExpectedMatrix.clear();
+	    testMatrix.clear();
+	    testExpectedMatrix.clear();
 	}
 
 	virtual void import(shmea::GString);
 	void standardizeInputTable(const shmea::GString&, int = 0);
 
-	virtual shmea::GList getTrainRow(unsigned int) const;
-	virtual shmea::GList getTrainExpectedRow(unsigned int) const;
+	virtual shmea::GVector<float> getTrainRow(unsigned int) const;
+	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int) const;
 
-	virtual shmea::GList getTestRow(unsigned int) const;
-	virtual shmea::GList getTestExpectedRow(unsigned int) const;
+	virtual shmea::GVector<float> getTestRow(unsigned int) const;
+	virtual shmea::GVector<float> getTestExpectedRow(unsigned int) const;
 
 	virtual unsigned int getTrainSize() const;
 	virtual unsigned int getTestSize() const;
@@ -85,6 +85,7 @@ public:
 
 	virtual int getType() const;
 };
+
 };
 
 #endif

@@ -57,6 +57,8 @@ public:
 	float getOverallFalseAlarm() const;
 	float getClassF1Score(unsigned int) const;
 	float getOverallF1Score() const;
+	float getClassMCC(unsigned int) const;
+	float getOverallMCC() const;
 	void print() const;
 
 	void reset();

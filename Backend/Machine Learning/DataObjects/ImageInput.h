@@ -39,7 +39,7 @@ public:
 	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > trainImages;
 	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > testImages;
 
-	shmea::GList emptyRow;
+	shmea::GVector<float> emptyRow;
 	shmea::GString name;
 	bool loaded;
 
@@ -70,11 +70,11 @@ public:
 	const shmea::GPointer<shmea::Image> getTrainImage(unsigned int) const;
 	const shmea::GPointer<shmea::Image> getTestImage(unsigned int) const;
 
-	virtual shmea::GList getTrainRow(unsigned int) const;
-	virtual shmea::GList getTrainExpectedRow(unsigned int) const;
+	virtual shmea::GVector<float> getTrainRow(unsigned int) const;
+	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int) const;
 
-	virtual shmea::GList getTestRow(unsigned int) const;
-	virtual shmea::GList getTestExpectedRow(unsigned int) const;
+	virtual shmea::GVector<float> getTestRow(unsigned int) const;
+	virtual shmea::GVector<float> getTestExpectedRow(unsigned int) const;
 
 	virtual unsigned int getTrainSize() const;
 	virtual unsigned int getTestSize() const;
