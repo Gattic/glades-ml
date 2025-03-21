@@ -10,13 +10,68 @@
 #include "Backend/Database/GList.h"
 #include "Backend/Database/image.h"
 #include "../../../Backend/Machine Learning/GMath/pca.h"
+#include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
+#include "Backend/Database/PNGPlotter.h"
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
 
+void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<double> >& compute_data, const std::vector<std::vector<double> >& transformed_data, const std::vector<std::vector<double> >& sorted_eig_vecs, const std::vector<std::vector<double> >& reconstructed_data)
+{
+    std::string imagePath = "datasets";
+
+    shmea::GString imageName = newImageName + "_pca_original.png";
+    shmea::GString imageName2 = newImageName + "_pca_transformed.png";
+    shmea::GString imageName3 = newImageName + "_pca_reconstructed.png";
+
+    int margin_top = 0;
+    int margin_right = 0;
+    int margin_bottom = 0;
+    int margin_left = 0;
+
+    float min_compute = 0.0f;
+    float max_compute = 0.0f;
+
+    // Save the original points
+    shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+
+    shmea::RGBA RED(0xFF, 0x00, 0x00, 0xFF);
+    plotterPNG.addDataPointsPCA(compute_data, RED);
+
+    shmea::RGBA BLUE(0x00, 0x00, 0xFF, 0xFF);
+    plotterPNG.addArrow(sorted_eig_vecs, BLUE, 100);
+
+    printf("[PCA] Image Saved\n");
+    plotterPNG.SavePNG(imageName.c_str(), imagePath);
+
+    shmea::PNGPlotter plotterPNG2(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+
+    shmea::RGBA GREEN(0x00, 0xFF, 0x00, 0xFF);
+    plotterPNG2.addDataPointsPCA(transformed_data, GREEN);
+
+    plotterPNG2.addArrow(sorted_eig_vecs, BLUE, 100);
+
+    printf("[PCA] Image Saved\n");
+    plotterPNG2.SavePNG(imageName2.c_str(), imagePath);
+
+    shmea::PNGPlotter plotterPNG3(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+
+    shmea::RGBA PURPLE(0xFF, 0x00, 0xFF, 0xFF);
+    plotterPNG3.addDataPointsPCA(transformed_data, PURPLE);
+
+    plotterPNG3.addArrow(sorted_eig_vecs, BLUE, 100);
+
+    printf("[PCA] Image Saved\n");
+    plotterPNG3.SavePNG(imageName3.c_str(), imagePath);
+}
+
 void PCAUnitTest()
 {
+    printf("============================================================\n");
+    printf("-----------------------------------\n");
+    printf("PCA Test y=x\n");
+    printf("-----------------------------------\n");
     // Generate example data
     std::vector<std::vector<double> > example_data;
     int graphSize = 200; // pos and neg
@@ -33,7 +88,8 @@ void PCAUnitTest()
 
     std::vector<std::vector<double> > transformed_data;
     std::vector<std::vector<double> > sorted_eig_vecs;
-    compute_pca(example_data, transformed_data, sorted_eig_vecs);
+    std::vector<std::vector<double> > reconstructed_data;
+    reconstructed_data = compute_pca(example_data, transformed_data, sorted_eig_vecs);
 
     /* Expected Output:
      * ----------
@@ -61,15 +117,19 @@ void PCAUnitTest()
      *  Reconstruction error: 4.6284e-28
      */
 
+    createPCAImage("yequalsx", example_data, transformed_data, sorted_eig_vecs, reconstructed_data);
+
     printf("============================================================\n");
+    printf("-----------------------------------\n");
+    printf("PCA Test x*x\n");
+    printf("-----------------------------------\n");
 
     // Generate example data
     example_data.clear();
     for (int i = -graphSize; i < graphSize; ++i)
     {
 	double x = static_cast<double>(i) / graphSize * 10.0;
-	double y = 0.5 * x + 0.5 * std::sin(3.0 * x) + 0.5 * std::cos(2.0 * x) + 0.5 * std::sin(5.0 * x) + 0.5 * std::cos(7.0 * x);
-	//double y = x; // easy visual example for testing
+	double y = x*x;
 
 	std::vector<double> point;
 	point.push_back(x);
@@ -79,7 +139,33 @@ void PCAUnitTest()
 
     transformed_data.clear();
     sorted_eig_vecs.clear();
-    compute_pca(example_data, transformed_data, sorted_eig_vecs);
+    reconstructed_data.clear();
+    reconstructed_data = compute_pca(example_data, transformed_data, sorted_eig_vecs);
+
+    createPCAImage("xsquared", example_data, transformed_data, sorted_eig_vecs, reconstructed_data);
+
+    printf("============================================================\n");
+    printf("-----------------------------------\n");
+    printf("PCA Test Trig\n");
+    printf("-----------------------------------\n");
+
+    // Generate example data
+    example_data.clear();
+    for (int i = -graphSize; i < graphSize; ++i)
+    {
+	double x = static_cast<double>(i) / graphSize * 10.0;
+	double y = 0.5 * x + 0.5 * std::sin(3.0 * x) + 0.5 * std::cos(2.0 * x) + 0.5 * std::sin(5.0 * x) + 0.5 * std::cos(7.0 * x);
+
+	std::vector<double> point;
+	point.push_back(x);
+	point.push_back(y);
+	example_data.push_back(point);
+    }
+
+    transformed_data.clear();
+    sorted_eig_vecs.clear();
+    reconstructed_data.clear();
+    reconstructed_data = compute_pca(example_data, transformed_data, sorted_eig_vecs);
 
     /* Expected Output:
      * ----------
@@ -107,20 +193,56 @@ void PCAUnitTest()
      *  Reconstruction error: 54430.9
      */
 
-    printf("============================================================\n");
-    return;
-    // This test takes forever
+    createPCAImage("trig", example_data, transformed_data, sorted_eig_vecs, reconstructed_data);
 
-    //shmea::GString path = "datasets/images/MNIST/train/0/1000.png";
-    shmea::GString path = "MNIST";
-    glades::DataInput* di = new glades::ImageInput();
+    printf("============================================================\n");
+    printf("-----------------------------------\n");
+    printf("PCA Test Iris\n");
+    printf("-----------------------------------\n");
+
+    shmea::GString path = "datasets/iris.data";
+    glades::DataInput* di = new glades::NumberInput();
     di->import(path);
 
-    std::vector<std::vector<double> > img_data;
+    std::vector<std::vector<double> > compute_data;
     unsigned int trainSize = di->getTrainSize();
     for(unsigned int i = 0; i < trainSize; ++i)
     {
-	shmea::GVector<float> flattenedImg = di->getTrainRow(i);
+	shmea::GVector<float> cRow = di->getTrainRow(i);
+	std::vector<double> dataVec;
+	for(unsigned int j = 0; j < cRow.size(); ++j)
+	{
+	    dataVec.push_back(cRow[j]);
+	}
+
+	compute_data.push_back(dataVec);
+    }
+
+    transformed_data.clear();
+    sorted_eig_vecs.clear();
+    reconstructed_data.clear();
+    reconstructed_data = compute_pca(compute_data, transformed_data, sorted_eig_vecs);
+
+    // Save a PNG representation of the PCA
+    createPCAImage("iris", compute_data, transformed_data, sorted_eig_vecs, reconstructed_data);
+
+    printf("============================================================\n");
+    return;
+    // This test takes forever
+    printf("-----------------------------------\n");
+    printf("PCA Test MNIST\n");
+    printf("-----------------------------------\n");
+
+    //shmea::GString path = "datasets/images/MNIST/train/0/1000.png";
+    path = "MNIST";
+    glades::DataInput* di2 = new glades::ImageInput();
+    di2->import(path);
+
+    std::vector<std::vector<double> > img_data;
+    trainSize = di2->getTrainSize();
+    for(unsigned int i = 0; i < trainSize; ++i)
+    {
+	shmea::GVector<float> flattenedImg = di2->getTrainRow(i);
 	std::vector<double> imgVec;
 	for(unsigned int j = 0; j < flattenedImg.size(); ++j)
 	{
@@ -132,5 +254,6 @@ void PCAUnitTest()
 
     transformed_data.clear();
     sorted_eig_vecs.clear();
-    compute_pca(img_data, transformed_data, sorted_eig_vecs);
+    reconstructed_data.clear();
+    reconstructed_data = compute_pca(img_data, transformed_data, sorted_eig_vecs);
 }

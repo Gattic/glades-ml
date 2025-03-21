@@ -67,10 +67,10 @@ class PNGPlotter
 
 		void drawFourQuadrants();	
 
-		void drawPoint(int, int, int, RGBA&);
-		void drawLine(int, int, int, int, RGBA&, int = 6);
+		void drawPoint(int, int, int, const RGBA&);
+		void drawLine(int, int, int, int, const RGBA&, int = 6);
 		void drawCandleStick(Image&, int, int, int, int, int, RGBA&);
-		void drawArrow(int, int, int, int, RGBA&, int);
+		void drawArrow(int, int, int, int, const RGBA&, int);
 		void drawHistogram(int, int, int, RGBA&);
 	public:
 
@@ -84,8 +84,8 @@ class PNGPlotter
 		PNGPlotter(unsigned int, unsigned int, int, double, double, int = 0, int=0, int=0, int=0, int=0, bool = false);
 		void addDataPointWithIndicator(double, int = 0, std::string = "", std::string = "");
 		void addDataPoint(double, int = 0, bool = true, RGBA* = NULL, int = 6);
-		void addDataPointsPCA(std::vector<std::vector<double> >&, RGBA&);
-		void addArrow(std::vector<std::vector<double> >&, RGBA&, int = 10);
+		void addDataPointsPCA(const std::vector<std::vector<double> >&, const RGBA&);
+		void addArrow(const std::vector<std::vector<double> >&, const RGBA&, int = 10);
 		void addHistogram(std::vector<int>&, RGBA&);
 		void drawNewCandle(long, float, float, float, float);
 		void SavePNG(const std::string&, const std::string&);

@@ -103,7 +103,7 @@ void gramSchmidt(std::vector<std::vector<double> >& matrix)
 }
 
 // Main function to compute PCA
-void compute_pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs)
+std::vector<std::vector<double> > compute_pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs)
 {
     size_t num_samples = data.size();
     size_t num_features = data[0].size();
@@ -161,20 +161,27 @@ void compute_pca(const std::vector<std::vector<double> >& data, std::vector<std:
 
     double epsilon = 0.0001;
     double max_off_diag = 1.0;
-
-    while (max_off_diag > epsilon)
+    
+    // Add maximum iteration count to prevent infinite loops
+    const int MAX_ITERATIONS = 1000;
+    int iteration_count = 0;
+    
+    while (max_off_diag > epsilon && iteration_count < MAX_ITERATIONS)
     {
+        iteration_count++;
+        printf("Iteration %d, Max off diag: %f\n", iteration_count, max_off_diag);
         max_off_diag = 0.0;
         size_t p = 0;
         size_t q = 0;
 
+        // Find maximum off-diagonal element
         for (size_t i = 0; i < num_features; ++i)
-	{
+        {
             for (size_t j = i + 1; j < num_features; ++j)
-	    {
+            {
                 double off_diag = std::abs(A[i][j]);
                 if (off_diag > max_off_diag)
-		{
+                {
                     max_off_diag = off_diag;
                     p = i;
                     q = j;
@@ -182,23 +189,60 @@ void compute_pca(const std::vector<std::vector<double> >& data, std::vector<std:
             }
         }
 
-        double theta = 0.5 * std::atan2(2.0 * A[p][q], A[q][q] - A[p][p]);
+        // Check if we've reached convergence
+        if (max_off_diag <= epsilon)
+            break;
 
-        std::vector<std::vector<double> > J(num_features, std::vector<double>(num_features, 0.0));
-        for (size_t i = 0; i < num_features; ++i)
-	{
-            J[i][i] = 1.0;
+        // Improved Jacobi rotation calculation with numerical stability
+        double app = A[p][p];
+        double aqq = A[q][q];
+        double apq = A[p][q];
+        
+        // Calculate rotation angle with improved numerical stability
+        double tau = (aqq - app) / (2.0 * apq);
+        double t = 1.0 / (std::abs(tau) + std::sqrt(1.0 + tau * tau));
+        if (tau < 0.0) t = -t;
+        
+        double c = 1.0 / std::sqrt(1.0 + t * t);
+        double s = t * c;
+        
+        // Apply Jacobi rotation to A
+        for (size_t i = 0; i < num_features; ++i) {
+            if (i != p && i != q) {
+                double aip = A[i][p];
+                double aiq = A[i][q];
+                A[i][p] = aip * c - aiq * s;
+                A[p][i] = A[i][p];
+                A[i][q] = aiq * c + aip * s;
+                A[q][i] = A[i][q];
+            }
         }
-        J[p][p] = std::cos(theta);
-        J[p][q] = -std::sin(theta);
-        J[q][p] = std::sin(theta);
-        J[q][q] = std::cos(theta);
+        
+        // Update diagonal elements
+        double new_app = app * c * c - 2.0 * apq * c * s + aqq * s * s;
+        double new_aqq = app * s * s + 2.0 * apq * c * s + aqq * c * c;
+        A[p][p] = new_app;
+        A[q][q] = new_aqq;
+        
+        // Zero out the rotated elements
+        A[p][q] = 0.0;
+        A[q][p] = 0.0;
+        
+        // Update eigenvector matrix V
+        for (size_t i = 0; i < num_features; ++i) {
+            double vip = V[i][p];
+            double viq = V[i][q];
+            V[i][p] = vip * c - viq * s;
+            V[i][q] = viq * c + vip * s;
+        }
+    }
 
-        // Update A: A = J^T * A * J
-        A = matrixMultiply(matrixMultiply(J, A), J);
-
-        // Update V: V = V * J
-        V = matrixMultiply(V, J);
+    // Check if we terminated due to max iterations
+    if (iteration_count >= MAX_ITERATIONS) {
+        printf("Warning: Jacobi algorithm did not converge after %d iterations.\n", MAX_ITERATIONS);
+        printf("Final max off-diagonal element: %f\n", max_off_diag);
+    } else {
+        printf("Jacobi algorithm converged after %d iterations.\n", iteration_count);
     }
 
     std::vector<double> eig_vals(num_features, 0.0);
@@ -336,6 +380,8 @@ void compute_pca(const std::vector<std::vector<double> >& data, std::vector<std:
     }
 
     std::cout << "Reconstruction error: " << reconstruction_error << std::endl;
+
+    return reconstructed_data;
 }
 
 void calculate_arrow_head(double x1, double y1, double x2, double y2)

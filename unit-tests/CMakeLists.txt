@@ -36,8 +36,10 @@ include(GNUInstallDirs)
 #Import libs
 find_package(shmea REQUIRED)
 find_package(glades REQUIRED)
+find_package(Freetype REQUIRED)
 
 #Subdirectories
+include_directories(${FREETYPE_INCLUDE_DIRS})
 include_directories("../include")
 add_subdirectory("Backend/Machine Learning")
 
@@ -56,9 +58,13 @@ target_link_libraries(${PROJECT_NAME}
 
 target_include_directories(${PROJECT_NAME} PRIVATE "Backend")
 
+if(NOT DEFINED EXEC_ARGS)
+	set(EXEC_ARGS "")
+endif()
+
 #make run
 add_custom_target(run
-	COMMAND ${PROJECT_NAME}
+	COMMAND ${PROJECT_NAME} ${EXEC_ARGS}
 	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )

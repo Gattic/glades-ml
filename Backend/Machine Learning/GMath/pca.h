@@ -40,8 +40,8 @@ std::vector<std::vector<double> > matrixMultiply(const std::vector<std::vector<d
 // Gram-Schmidt orthogonalization
 void gramSchmidt(std::vector<std::vector<double> >& matrix);
 
-// Main function to compute PCA
-void compute_pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs);
+// Main function to compute PCA, return reconstructed data
+std::vector<std::vector<double> > compute_pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs);
 
 void calculate_arrow_head(double x1, double y1, double x2, double y2);
 

@@ -17,11 +17,29 @@ int main(int argc, char* argv[])
 	// For random numbers
 	srand(time(NULL));
 
-	NNUnitTest();
-	PCAUnitTest();
-	BayesUnitTest();
-	BayesOptimizerUnitTest();
-	OHEUnitTest();
+	if (argc == 1)
+	{
+	    NNUnitTest();
+	    PCAUnitTest();
+	    BayesUnitTest();
+	    BayesOptimizerUnitTest();
+	    OHEUnitTest();
+	}
+	else if (argc > 1)
+	{
+	    if (strcmp(argv[1], "nn") == 0)
+		NNUnitTest();
+	    else if (strcmp(argv[1], "pca") == 0)
+		PCAUnitTest();
+	    else if (strcmp(argv[1], "bayes") == 0)
+		BayesUnitTest();
+	    else if (strcmp(argv[1], "bayes-optimizer") == 0)
+		BayesOptimizerUnitTest();
+	    else if (strcmp(argv[1], "ohe") == 0)
+		OHEUnitTest();
+	    else
+		printf("Invalid test: %s\n", argv[1]);
+	}
 
 	printf("========================\n");
 	printf("| Unit Tests Completed |\n");
