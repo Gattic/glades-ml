@@ -16,8 +16,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "pca.h"
 
+using namespace glades;
+
 // Helper function to compute the mean of a vector of numbers
-double compute_mean(const std::vector<double>& data)
+double PCA::compute_mean(const std::vector<double>& data)
 {
     double sum = 0.0;
     for (size_t i = 0; i < data.size(); ++i)
@@ -28,7 +30,7 @@ double compute_mean(const std::vector<double>& data)
 }
 
 // Helper function to compute the dot product of two vectors
-double dot_product(const std::vector<double>& vec1, const std::vector<double>& vec2)
+double PCA::dot_product(const std::vector<double>& vec1, const std::vector<double>& vec2)
 {
     double result = 0.0;
     for (size_t i = 0; i < vec1.size(); ++i)
@@ -39,7 +41,7 @@ double dot_product(const std::vector<double>& vec1, const std::vector<double>& v
 }
 
 // Helper function to perform matrix-vector multiplication
-std::vector<double> matrix_vector_multiply(const std::vector<std::vector<double> >& matrix, const std::vector<double>& vec)
+std::vector<double> PCA::matrix_vector_multiply(const std::vector<std::vector<double> >& matrix, const std::vector<double>& vec)
 {
     std::vector<double> result(matrix.size(), 0.0);
     for (size_t i = 0; i < matrix.size(); ++i)
@@ -50,13 +52,13 @@ std::vector<double> matrix_vector_multiply(const std::vector<std::vector<double>
 }
 
 // Custom comparison function for sorting in descending order
-bool compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2)
+bool PCA::compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2)
 {
     return pair1.first > pair2.first;
 }
 
 // Multiply two matrices: C = A * B
-std::vector<std::vector<double> > matrixMultiply(const std::vector<std::vector<double> >& A,
+std::vector<std::vector<double> > PCA::matrixMultiply(const std::vector<std::vector<double> >& A,
 	const std::vector<std::vector<double> >& B)
 {
     size_t rows_A = A.size();
@@ -80,7 +82,7 @@ std::vector<std::vector<double> > matrixMultiply(const std::vector<std::vector<d
 }
 
 // Gram-Schmidt orthogonalization
-void gramSchmidt(std::vector<std::vector<double> >& matrix)
+void PCA::gramSchmidt(std::vector<std::vector<double> >& matrix)
 {
     size_t num_cols = matrix[0].size();
 
@@ -103,8 +105,13 @@ void gramSchmidt(std::vector<std::vector<double> >& matrix)
 }
 
 // Main function to compute PCA
-std::vector<std::vector<double> > compute_pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs)
+void PCA::compute(const std::vector<std::vector<double> >& data)
 {
+    transformed_data.clear();
+    sorted_eig_vecs.clear();
+    variance_explained.clear();
+    reconstructed_data.clear();
+
     size_t num_samples = data.size();
     size_t num_features = data[0].size();
 
@@ -337,7 +344,7 @@ std::vector<std::vector<double> > compute_pca(const std::vector<std::vector<doub
 	total_variance += eig_vals[i];
     }
 
-    std::vector<double> variance_explained(num_features, 0.0);
+    variance_explained = std::vector<double>(num_features, 0.0);
     for (size_t i = 0; i < num_features; ++i)
     {
 	variance_explained[i] = eig_vals[i] / total_variance;
@@ -380,11 +387,9 @@ std::vector<std::vector<double> > compute_pca(const std::vector<std::vector<doub
     }
 
     std::cout << "Reconstruction error: " << reconstruction_error << std::endl;
-
-    return reconstructed_data;
 }
 
-void calculate_arrow_head(double x1, double y1, double x2, double y2)
+void PCA::calculate_arrow_head(double x1, double y1, double x2, double y2)
 {
     // Arrow line: x1, y1, x2, y2
 
@@ -401,7 +406,7 @@ void calculate_arrow_head(double x1, double y1, double x2, double y2)
     // x2, y2, arrowX2, arrowY2
 }
 
-void pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs)
+void pca_example(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs)
 {
     // Generate example data
     std::vector<std::vector<double> > dataset;
@@ -419,7 +424,8 @@ void pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<
     }
 
     // Compute PCA
-    compute_pca(dataset, transformed_data, sorted_eig_vecs);
+    PCA pca;
+    pca.compute(dataset);
 
     for (size_t i = 0; i < sorted_eig_vecs.size(); ++i)
     {
@@ -443,12 +449,12 @@ void pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<
 	double arrowX2 = arrowX1 + normX;
 	double arrowY2 = arrowY1 - normY;
 
-	calculate_arrow_head(arrowX1, arrowY1, arrowX2, arrowY2);
+	PCA::calculate_arrow_head(arrowX1, arrowY1, arrowX2, arrowY2);
 
 	// Add thickness to the arrows
-	calculate_arrow_head(arrowX1 + 1, arrowY1, arrowX2 + 1, arrowY2);
-	calculate_arrow_head(arrowX1 - 1, arrowY1, arrowX2 - 1, arrowY2);
-	calculate_arrow_head(arrowX1, arrowY1 + 1, arrowX2, arrowY2 + 1);
-	calculate_arrow_head(arrowX1, arrowY1 - 1, arrowX2, arrowY2 - 1);
+	PCA::calculate_arrow_head(arrowX1 + 1, arrowY1, arrowX2 + 1, arrowY2);
+	PCA::calculate_arrow_head(arrowX1 - 1, arrowY1, arrowX2 - 1, arrowY2);
+	PCA::calculate_arrow_head(arrowX1, arrowY1 + 1, arrowX2, arrowY2 + 1);
+	PCA::calculate_arrow_head(arrowX1, arrowY1 - 1, arrowX2, arrowY2 - 1);
     }
 }

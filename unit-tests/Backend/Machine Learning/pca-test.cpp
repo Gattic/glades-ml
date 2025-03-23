@@ -17,7 +17,7 @@
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
 
-void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<double> >& compute_data, const std::vector<std::vector<double> >& transformed_data, const std::vector<std::vector<double> >& sorted_eig_vecs, const std::vector<std::vector<double> >& reconstructed_data)
+void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<double> >& compute_data, const glades::PCA& pca)
 {
     std::string imagePath = "datasets";
 
@@ -40,7 +40,7 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     plotterPNG.addDataPointsPCA(compute_data, RED);
 
     shmea::RGBA BLUE(0x00, 0x00, 0xFF, 0xFF);
-    plotterPNG.addArrow(sorted_eig_vecs, BLUE, 100);
+    plotterPNG.addArrow(pca.sorted_eig_vecs, BLUE, 100);
 
     printf("[PCA] Image Saved\n");
     plotterPNG.SavePNG(imageName.c_str(), imagePath);
@@ -48,9 +48,9 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     shmea::PNGPlotter plotterPNG2(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
 
     shmea::RGBA GREEN(0x00, 0xFF, 0x00, 0xFF);
-    plotterPNG2.addDataPointsPCA(transformed_data, GREEN);
+    plotterPNG2.addDataPointsPCA(pca.transformed_data, GREEN);
 
-    plotterPNG2.addArrow(sorted_eig_vecs, BLUE, 100);
+    plotterPNG2.addArrow(pca.sorted_eig_vecs, BLUE, 100);
 
     printf("[PCA] Image Saved\n");
     plotterPNG2.SavePNG(imageName2.c_str(), imagePath);
@@ -58,9 +58,9 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     shmea::PNGPlotter plotterPNG3(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
 
     shmea::RGBA PURPLE(0xFF, 0x00, 0xFF, 0xFF);
-    plotterPNG3.addDataPointsPCA(transformed_data, PURPLE);
+    plotterPNG3.addDataPointsPCA(pca.transformed_data, PURPLE);
 
-    plotterPNG3.addArrow(sorted_eig_vecs, BLUE, 100);
+    plotterPNG3.addArrow(pca.sorted_eig_vecs, BLUE, 100);
 
     printf("[PCA] Image Saved\n");
     plotterPNG3.SavePNG(imageName3.c_str(), imagePath);
@@ -86,10 +86,8 @@ void PCAUnitTest()
 	example_data.push_back(point);
     }
 
-    std::vector<std::vector<double> > transformed_data;
-    std::vector<std::vector<double> > sorted_eig_vecs;
-    std::vector<std::vector<double> > reconstructed_data;
-    reconstructed_data = compute_pca(example_data, transformed_data, sorted_eig_vecs);
+    glades::PCA pca1;
+    pca1.compute(example_data);
 
     /* Expected Output:
      * ----------
@@ -117,7 +115,7 @@ void PCAUnitTest()
      *  Reconstruction error: 4.6284e-28
      */
 
-    createPCAImage("yequalsx", example_data, transformed_data, sorted_eig_vecs, reconstructed_data);
+    createPCAImage("yequalsx", example_data, pca1);
 
     printf("============================================================\n");
     printf("-----------------------------------\n");
@@ -137,12 +135,10 @@ void PCAUnitTest()
 	example_data.push_back(point);
     }
 
-    transformed_data.clear();
-    sorted_eig_vecs.clear();
-    reconstructed_data.clear();
-    reconstructed_data = compute_pca(example_data, transformed_data, sorted_eig_vecs);
+    glades::PCA pca2;
+    pca2.compute(example_data);
 
-    createPCAImage("xsquared", example_data, transformed_data, sorted_eig_vecs, reconstructed_data);
+    createPCAImage("xsquared", example_data, pca2);
 
     printf("============================================================\n");
     printf("-----------------------------------\n");
@@ -162,10 +158,8 @@ void PCAUnitTest()
 	example_data.push_back(point);
     }
 
-    transformed_data.clear();
-    sorted_eig_vecs.clear();
-    reconstructed_data.clear();
-    reconstructed_data = compute_pca(example_data, transformed_data, sorted_eig_vecs);
+    glades::PCA pca3;
+    pca3.compute(example_data);
 
     /* Expected Output:
      * ----------
@@ -193,7 +187,7 @@ void PCAUnitTest()
      *  Reconstruction error: 54430.9
      */
 
-    createPCAImage("trig", example_data, transformed_data, sorted_eig_vecs, reconstructed_data);
+    createPCAImage("trig", example_data, pca3);
 
     printf("============================================================\n");
     printf("-----------------------------------\n");
@@ -218,13 +212,17 @@ void PCAUnitTest()
 	compute_data.push_back(dataVec);
     }
 
-    transformed_data.clear();
-    sorted_eig_vecs.clear();
-    reconstructed_data.clear();
-    reconstructed_data = compute_pca(compute_data, transformed_data, sorted_eig_vecs);
+    glades::PCA pca4;
+    pca4.compute(compute_data);
 
     // Save a PNG representation of the PCA
-    createPCAImage("iris", compute_data, transformed_data, sorted_eig_vecs, reconstructed_data);
+    createPCAImage("iris", compute_data, pca4);
+
+    std::cout << "Variance explained by each principal component: " << std::endl;
+    for(unsigned int i = 0; i < pca4.variance_explained.size(); ++i)
+    {
+	std::cout << "Principal Component " << i << ": " << pca4.variance_explained[i]*100.0f << "%" << std::endl;
+    }
 
     printf("============================================================\n");
     return;
@@ -252,8 +250,6 @@ void PCAUnitTest()
 	img_data.push_back(imgVec);
     }
 
-    transformed_data.clear();
-    sorted_eig_vecs.clear();
-    reconstructed_data.clear();
-    reconstructed_data = compute_pca(img_data, transformed_data, sorted_eig_vecs);
+    glades::PCA pca5;
+    pca5.compute(img_data);
 }

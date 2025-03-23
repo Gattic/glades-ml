@@ -21,31 +21,48 @@
 #include <fstream>
 #include <iostream>
 
-// Helper function to compute the mean of a vector of numbers
-double compute_mean(const std::vector<double>& data);
+namespace glades
+{
 
-// Helper function to compute the dot product of two vectors
-double dot_product(const std::vector<double>& vec1, const std::vector<double>& vec2);
+class PCA
+{
+protected:
+    //
+    // Custom comparison function for sorting in descending order
+    static bool compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2);
 
-// Helper function to perform matrix-vector multiplication
-std::vector<double> matrix_vector_multiply(const std::vector<std::vector<double> >& matrix, const std::vector<double>& vec);
+    // Helper function to compute the mean of a vector of numbers
+    double compute_mean(const std::vector<double>& data);
 
-// Custom comparison function for sorting in descending order
-bool compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2);
+    // Helper function to compute the dot product of two vectors
+    double dot_product(const std::vector<double>& vec1, const std::vector<double>& vec2);
 
-// Multiply two matrices: C = A * B
-std::vector<std::vector<double> > matrixMultiply(const std::vector<std::vector<double> >& A,
+    // Helper function to perform matrix-vector multiplication
+    std::vector<double> matrix_vector_multiply(const std::vector<std::vector<double> >& matrix, const std::vector<double>& vec);
+
+    // Multiply two matrices: C = A * B
+    std::vector<std::vector<double> > matrixMultiply(const std::vector<std::vector<double> >& A,
 	const std::vector<std::vector<double> >& B);
 
-// Gram-Schmidt orthogonalization
-void gramSchmidt(std::vector<std::vector<double> >& matrix);
+    // Gram-Schmidt orthogonalization
+    void gramSchmidt(std::vector<std::vector<double> >& matrix);
 
-// Main function to compute PCA, return reconstructed data
-std::vector<std::vector<double> > compute_pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs);
+public:
 
-void calculate_arrow_head(double x1, double y1, double x2, double y2);
+    std::vector<std::vector<double> > transformed_data;
+    std::vector<std::vector<double> > sorted_eig_vecs;
+    std::vector<double> variance_explained;
+    std::vector<std::vector<double> >  reconstructed_data;
+
+    // Main function to compute PCA, return reconstructed data
+    void compute(const std::vector<std::vector<double> >& data);
+
+    static void calculate_arrow_head(double x1, double y1, double x2, double y2);
+};
+
+};
 
 
 // CALL THIS
 // Top level function
-void pca(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs);
+void pca_example(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs);
