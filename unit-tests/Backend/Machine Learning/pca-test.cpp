@@ -40,7 +40,7 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     plotterPNG.addDataPointsPCA(compute_data, RED);
 
     shmea::RGBA BLUE(0x00, 0x00, 0xFF, 0xFF);
-    plotterPNG.addArrow(pca.sorted_eig_vecs, BLUE, 100);
+    plotterPNG.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
 
     printf("[PCA] Image Saved\n");
     plotterPNG.SavePNG(imageName.c_str(), imagePath);
@@ -50,7 +50,7 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     shmea::RGBA GREEN(0x00, 0xFF, 0x00, 0xFF);
     plotterPNG2.addDataPointsPCA(pca.transformed_data, GREEN);
 
-    plotterPNG2.addArrow(pca.sorted_eig_vecs, BLUE, 100);
+    plotterPNG2.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
 
     printf("[PCA] Image Saved\n");
     plotterPNG2.SavePNG(imageName2.c_str(), imagePath);
@@ -60,10 +60,31 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     shmea::RGBA PURPLE(0xFF, 0x00, 0xFF, 0xFF);
     plotterPNG3.addDataPointsPCA(pca.transformed_data, PURPLE);
 
-    plotterPNG3.addArrow(pca.sorted_eig_vecs, BLUE, 100);
+    plotterPNG3.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
 
     printf("[PCA] Image Saved\n");
     plotterPNG3.SavePNG(imageName3.c_str(), imagePath);
+
+    // Combine the features to cluster the classes using the first two principal components
+    std::vector<std::vector<double> > combined_features;
+    for(unsigned int i = 0; i < pca.transformed_data.size(); ++i)
+    {
+	std::vector<double> point;
+	point.push_back(pca.transformed_data[i][0]);
+	point.push_back(pca.transformed_data[i][1]);
+	combined_features.push_back(point);
+    }
+
+    // Show the classes in the first two principal components
+    shmea::PNGPlotter plotterPNG4(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+
+    plotterPNG4.addDataPointsPCA(combined_features, PURPLE);
+
+    //plotterPNG4.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
+
+    printf("[PCA] Image Saved\n");
+    shmea::GString imageName4 = newImageName + "_pca_score.png";
+    plotterPNG4.SavePNG(imageName4.c_str(), imagePath);
 }
 
 void PCAUnitTest()

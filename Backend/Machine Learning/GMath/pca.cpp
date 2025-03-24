@@ -57,6 +57,13 @@ bool PCA::compare_pairs(const std::pair<double, std::vector<double> >& pair1, co
     return pair1.first > pair2.first;
 }
 
+// New comparison function for sorting eigenvalue pairs in descending order by absolute value
+struct CompareEigPairs {
+    bool operator()(const std::pair<double, size_t>& a, const std::pair<double, size_t>& b) const {
+        return fabs(a.first) > fabs(b.first);
+    }
+};
+
 // Multiply two matrices: C = A * B
 std::vector<std::vector<double> > PCA::matrixMultiply(const std::vector<std::vector<double> >& A,
 	const std::vector<std::vector<double> >& B)
@@ -166,7 +173,7 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         V[i][i] = 1.0;
     }
 
-    double epsilon = 0.0001;
+    double epsilon = 0.0000001; // Increased precision
     double max_off_diag = 1.0;
     
     // Add maximum iteration count to prevent infinite loops
@@ -186,7 +193,7 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         {
             for (size_t j = i + 1; j < num_features; ++j)
             {
-                double off_diag = std::abs(A[i][j]);
+                double off_diag = fabs(A[i][j]);
                 if (off_diag > max_off_diag)
                 {
                     max_off_diag = off_diag;
@@ -207,10 +214,10 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         
         // Calculate rotation angle with improved numerical stability
         double tau = (aqq - app) / (2.0 * apq);
-        double t = 1.0 / (std::abs(tau) + std::sqrt(1.0 + tau * tau));
+        double t = 1.0 / (fabs(tau) + sqrt(1.0 + tau * tau));
         if (tau < 0.0) t = -t;
         
-        double c = 1.0 / std::sqrt(1.0 + t * t);
+        double c = 1.0 / sqrt(1.0 + t * t);
         double s = t * c;
         
         // Apply Jacobi rotation to A
@@ -282,13 +289,16 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         eig_pairs.push_back(std::make_pair(eig_vals[i], i));
     }
 
-    std::sort(eig_pairs.begin(), eig_pairs.end(), compare_pairs);
+    // Sort in descending order by absolute eigenvalue
+    std::sort(eig_pairs.begin(), eig_pairs.end(), CompareEigPairs());
 
-    // Copy sorted eigenvectors into sorted_eig_vecs
+    // Copy sorted eigenvectors and eigenvalues
+    std::vector<double> sorted_eig_vals(num_features, 0.0);
     sorted_eig_vecs.resize(num_features, std::vector<double>(num_features, 0.0));
     for (size_t i = 0; i < num_features; ++i)
     {
         size_t index = eig_pairs[i].second;
+        sorted_eig_vals[i] = eig_vals[index]; // Keep track of sorted eigenvalues
         for (size_t j = 0; j < num_features; ++j)
         {
             sorted_eig_vecs[i][j] = eig_vecs[index][j];
@@ -341,13 +351,13 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     double total_variance = 0.0;
     for (size_t i = 0; i < num_features; ++i)
     {
-	total_variance += eig_vals[i];
+	total_variance += fabs(sorted_eig_vals[i]); // Use sorted eigenvalues and fabs value
     }
 
     variance_explained = std::vector<double>(num_features, 0.0);
     for (size_t i = 0; i < num_features; ++i)
     {
-	variance_explained[i] = eig_vals[i] / total_variance;
+	variance_explained[i] = fabs(sorted_eig_vals[i]) / total_variance; // Use fabs value
     }
 
     std::cout << "Variance explained by each principal component: " << std::endl;
@@ -359,16 +369,16 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     std::cout << std::endl;
 
     // Step 8: Reconstruct the original data from the transformed data
-    // The reconstructed data is the dot product of the transformed data and the eigenvectors
-    // The reconstructed data has the same number of samples as the original data
-    // The reconstructed data has the same number of features as the original data
-    // The reconstructed data is an approximation of the original data
-    std::vector<std::vector<double> > reconstructed_data(num_samples, std::vector<double>(num_features, 0.0));
+    printf("Reconstructing the original data from the transformed data...\n");
+    reconstructed_data.resize(num_samples, std::vector<double>(num_features, 0.0));
     for (size_t i = 0; i < num_samples; ++i)
     {
 	for (size_t j = 0; j < num_features; ++j)
 	{
-	    reconstructed_data[i][j] = dot_product(transformed_data[i], sorted_eig_vecs[j]);
+	    for (size_t k = 0; k < num_features; ++k)
+	    {
+	        reconstructed_data[i][j] += transformed_data[i][k] * sorted_eig_vecs[k][j];
+	    }
 	}
     }
 
@@ -382,7 +392,8 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     {
 	for (size_t j = 0; j < num_features; ++j)
 	{
-	    reconstruction_error += std::pow(data[i][j] - reconstructed_data[i][j], 2);
+	    double diff = data[i][j] - reconstructed_data[i][j];
+	    reconstruction_error += diff * diff; // Replace pow with simple multiplication
 	}
     }
 

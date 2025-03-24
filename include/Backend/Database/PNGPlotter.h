@@ -85,7 +85,7 @@ class PNGPlotter
 		void addDataPointWithIndicator(double, int = 0, std::string = "", std::string = "");
 		void addDataPoint(double, int = 0, bool = true, RGBA* = NULL, int = 6);
 		void addDataPointsPCA(const std::vector<std::vector<double> >&, const RGBA&);
-		void addArrow(const std::vector<std::vector<double> >&, const RGBA&, int = 10);
+		void addArrow(const std::vector<std::vector<double> >&, const std::vector<double>&, const RGBA&);
 		void addHistogram(std::vector<int>&, RGBA&);
 		void drawNewCandle(long, float, float, float, float);
 		void SavePNG(const std::string&, const std::string&);
