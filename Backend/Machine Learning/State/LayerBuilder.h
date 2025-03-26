@@ -79,6 +79,13 @@ public:
 	// Database
 	bool load(const std::string&);
 	bool save(const std::string&) const;
+	bool saveWeights(const std::string&);
+	bool loadWeights(const std::string& netName);
+
+
+	// Setters
+	bool setWeights(const shmea::GList& weights);
+
 };
 };
 

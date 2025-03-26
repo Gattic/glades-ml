@@ -63,6 +63,7 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 		return;
 
 	running = false;
+	meatloaded = false;
 	di = NULL;
 	skeleton = NULL;
 	serverInstance = NULL;
@@ -111,7 +112,7 @@ void glades::NNetwork::test(DataInput* newDataInput)
     run(newDataInput, RUN_TEST);
 }
 
-void glades::NNetwork::run(DataInput* newDataInput, int runType)
+void glades::NNetwork::build(DataInput* newDataInput)
 {
 	if (!skeleton)
 		return;
@@ -126,6 +127,27 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
 		meat.build(skeleton, di, netType);
+
+	meatloaded = true;
+}
+
+void glades::NNetwork::run(DataInput* newDataInput, int runType)
+{
+	if (!skeleton)
+		return;
+
+	if(!newDataInput)
+		return;
+
+	di = newDataInput;
+	if ((di->getTrainSize() <= 0) || (di->getFeatureCount() <= 0))
+		return;
+
+	// Get the input, expected, and layers/nodes/edges
+	if(epochs == 0 && !meatloaded)
+		meat.build(skeleton, di, netType);
+	
+	meatloaded = true;
 
 	// inputTable.print();
 	// expected.print();
@@ -744,6 +766,20 @@ bool glades::NNetwork::save() const
 	skeleton->save();
 	return true;
 	/// return meat.save(skeleton->getName());
+}
+
+bool glades::NNetwork::saveNNmodel(const std::string& netName)
+{ 
+	
+	meat.saveWeights(netName);
+	return true;
+
+}
+
+bool glades::NNetwork::setNewWeights(const shmea::GList& weights)
+{
+	meat.setWeights(weights);
+	return true;
 }
 
 void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)

@@ -11,6 +11,7 @@
 #include "Backend/Machine Learning/bayes-test.h"
 #include "Backend/Machine Learning/bayes-optimizer-test.h"
 #include "Backend/Machine Learning/ohe-test.h"
+#include "Backend/Machine Learning/nnmodelsaveload-test.h"
 
 int main(int argc, char* argv[])
 {
@@ -24,6 +25,7 @@ int main(int argc, char* argv[])
 	    BayesUnitTest();
 	    BayesOptimizerUnitTest();
 	    OHEUnitTest();
+		NNModelSaveLoadUnitTest();
 	}
 	else if (argc > 1)
 	{
@@ -37,6 +39,8 @@ int main(int argc, char* argv[])
 		BayesOptimizerUnitTest();
 	    else if (strcmp(argv[1], "ohe") == 0)
 		OHEUnitTest();
+	    else if (strcmp(argv[1], "nn-model-save-load") == 0)
+		NNModelSaveLoadUnitTest();
 	    else
 		printf("Invalid test: %s\n", argv[1]);
 	}

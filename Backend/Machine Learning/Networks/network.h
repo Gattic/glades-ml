@@ -69,6 +69,7 @@ private:
 	glades::NaiveBayes bModel;
 
 	bool running;
+	bool meatloaded;
 	int netType;
 	int epochs;
 	bool saveInstance;
@@ -119,6 +120,7 @@ public:
 	// Database
 	bool load(const shmea::GString&);
 	bool save() const;
+	void build(DataInput*);
 	void setServer(GNet::GServer*, GNet::Connection*);
 
 	// Stochastic Gradient Descent
@@ -136,6 +138,9 @@ public:
 	shmea::GList getResults() const;
 	void clean();
 	void resetGraphs();
+
+	bool saveNNmodel(const std::string& netName);
+	bool setNewWeights(const shmea::GList& weights);
 };
 };
 

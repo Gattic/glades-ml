@@ -369,7 +369,7 @@ shmea::GList glades::LayerBuilder::getWeights()
 		float cWeight = cChildren[j]->getEdgeWeight(k);
 		weights.addFloat(cWeight);
 	   }
-	   weights.addString(',');
+	   weights.addString('!');
 	}
 	weights.addString(';');
     }
@@ -674,4 +674,119 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 	nnList->newItem("edges", edgeTable);
 
 	return true;
+}
+
+/**
+ * @brief Saves the weights of the neural network to a specified file.
+ *
+ * This function retrieves the weights of the neural network and saves them to a file
+ * with the given network name. The weights are stored in a table format with a single
+ * column labeled "weight".
+ *
+ * @param netName The name of the network to save the weights for with the weights appended to the end.
+ * @return true if the weights were successfully saved.
+ */
+bool glades::LayerBuilder::saveWeights(const std::string& netName)
+ {
+    shmea::GString fileName = shmea::GString(netName.c_str()) + "_weights";
+    shmea::SaveFolder* nnList = new shmea::SaveFolder(fileName);
+    shmea::GList weights = getWeights();
+
+	shmea::GTable saveweights;
+    saveweights.addHeader(0,"Weights");
+	saveweights.addRow(weights);
+
+
+	nnList->newItem("weights", saveweights);
+
+    delete nnList;
+    return true;
+}
+
+/**
+ * @brief Sets the weights of the neural network from a GList.
+ *
+ * This function updates the weights of the neural network's edges based on the provided
+ * GList of weights. The GList is expected to contain a sequence of floating-point
+ * numbers representing the weights, interspersed with special separator strings:
+ *   - "!" separates the weights of different nodes within a layer.
+ *   - ";" separates the weights of different layers.
+ *
+ * The function iterates through each layer, node, and edge, assigning the corresponding
+ * weight from the GList. It performs several checks to ensure the integrity of the
+ * weight data and the network structure:
+ *   - It verifies that there are enough weights in the GList for all edges.
+ *   - It checks for the correct placement of the separator strings "!" and ";".
+ *   - It ensures that no invalid separator strings are used as weights.
+ *   - It confirms that all weights in the GList are used.
+ *
+ * @param weights A GList containing the new weights for the network's edges, along with
+ *                separator strings.
+ * @return true if the weights were successfully set, false otherwise.
+ *         Returns false if:
+ *           - The GList does not contain enough weights.
+ *           - An invalid separator is found in the weight data.
+ *           - A separator is missing or misplaced.
+ *           - Not all weights in the GList are used.
+ */
+bool glades::LayerBuilder::setWeights(const shmea::GList& weights) {
+    printf("setWeights: Starting to set weights...\n");
+    printf("setWeights: Number of weights to set: %zu\n", weights.size());
+
+    unsigned int weightIndex = 0;
+    for (unsigned int i = 0; i < getLayersSize(); ++i) {
+        printf("setWeights: Processing layer %u\n", i);
+        std::vector<Node*> cChildren = layers[i]->getChildren();
+        printf("setWeights: Layer %u has %zu children\n", i, cChildren.size());
+        for (unsigned int j = 0; j < cChildren.size(); ++j) {
+            printf("setWeights: Processing child %u in layer %u\n", j, i);
+            for (unsigned int k = 0; k < cChildren[j]->numEdges(); ++k) {
+                printf("setWeights: Processing edge %u of child %u in layer %u\n", k, j, i);
+                //check for separators
+                if (weightIndex >= weights.size()) {
+                    printf("setWeights: Error: Not enough weights. weightIndex: %u, weights.size(): %zu\n", weightIndex, weights.size());
+                    return false; // Not enough weights
+                }
+                
+                if(weights.getString(weightIndex) == "!" || weights.getString(weightIndex) == ";")
+                {
+                    printf("setWeights: Error: Found invalid separator '%s' at weightIndex: %u\n", weights.getGType(weightIndex).c_str(), weightIndex);
+                    return false;
+                }
+                
+                float newWeight = weights.getFloat(weightIndex);
+                printf("setWeights: Setting edge weight to %f at weightIndex: %u\n", newWeight, weightIndex);
+                cChildren[j]->setEdgeWeight(k, newWeight);
+                weightIndex++;
+            }
+            //check for separator
+            if (weightIndex >= weights.size()) {
+                printf("setWeights: Error: Not enough weights for separator after child %u in layer %u. weightIndex: %u, weights.size(): %zu\n", j, i, weightIndex, weights.size());
+                return false; // Not enough weights
+            }
+            if(weights.getString(weightIndex)!= "!")
+            {
+                printf("setWeights: Error: Expected '!' separator after child %u in layer %u, but found '%s' at weightIndex: %u\n", j, i, weights.getGType(weightIndex).c_str(), weightIndex);
+                return false;
+            }
+            printf("setWeights: Found ',' separator after child %u in layer %u at weightIndex: %u\n", j, i, weightIndex);
+            weightIndex++;
+        }
+        //check for separator
+        if (weightIndex >= weights.size()) {
+            printf("setWeights: Error: Not enough weights for separator after layer %u. weightIndex: %u, weights.size(): %zu\n", i, weightIndex, weights.size());
+            return false; // Not enough weights
+        }
+        if(weights.getString(weightIndex) != ";")
+        {
+            printf("setWeights: Error: Expected ';' separator after layer %u, but found '%s' at weightIndex: %u\n", i, weights.getGType(weightIndex).c_str(), weightIndex);
+            return false;
+        }
+        printf("setWeights: Found ';' separator after layer %u at weightIndex: %u\n", i, weightIndex);
+         weightIndex++;
+    }
+    printf("setWeights: Finished setting weights. weightIndex: %u, weights.size(): %zu\n", weightIndex, weights.size());
+    bool result = weightIndex == weights.size(); // Check if all weights were used
+    printf("setWeights: Result: %s\n", result ? "true" : "false");
+    return result;
 }
