@@ -1,4 +1,5 @@
 set(GMath_src_files
+	kmeans.cpp
 	pca.cpp
 	cmatrix.cpp
 	cmatrix.h

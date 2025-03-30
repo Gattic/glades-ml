@@ -1,6 +1,7 @@
 set(PCATests_src_files
 nn-test.cpp
 pca-test.cpp
+kmeans-test.cpp
 bayes-test.cpp
 bayes-optimizer-test.cpp
 ohe-test.cpp

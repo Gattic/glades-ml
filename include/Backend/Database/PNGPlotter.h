@@ -72,6 +72,9 @@ class PNGPlotter
 		void drawCandleStick(Image&, int, int, int, int, int, RGBA&);
 		void drawArrow(int, int, int, int, const RGBA&, int);
 		void drawHistogram(int, int, int, RGBA&);
+		void drawCentroidCircle(int x, int y, int radius, const RGBA& color);
+		void drawClusterCircle(int x, int y, int radius, const RGBA& color);
+		void drawCirclePoints(int x, int y, int x0, int y0, const RGBA& color);
 	public:
 
 		
@@ -85,6 +88,7 @@ class PNGPlotter
 		void addDataPointWithIndicator(double, int = 0, std::string = "", std::string = "");
 		void addDataPoint(double, int = 0, bool = true, RGBA* = NULL, int = 6);
 		void addDataPointsPCA(const std::vector<std::vector<double> >&, const RGBA&);
+		void addDataPointsKMeans(const std::string&, const std::vector<std::vector<double> >& data, const std::vector<int>& labels, const std::vector<std::vector<float> >& centroids);
 		void addArrow(const std::vector<std::vector<double> >&, const std::vector<double>&, const RGBA&);
 		void addHistogram(std::vector<int>&, RGBA&);
 		void drawNewCandle(long, float, float, float, float);

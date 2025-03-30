@@ -8,6 +8,7 @@
 #include "main.h"
 #include "Backend/Machine Learning/nn-test.h"
 #include "Backend/Machine Learning/pca-test.h"
+#include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
 #include "Backend/Machine Learning/bayes-optimizer-test.h"
 #include "Backend/Machine Learning/ohe-test.h"
@@ -21,6 +22,7 @@ int main(int argc, char* argv[])
 	{
 	    NNUnitTest();
 	    PCAUnitTest();
+	    KMeansUnitTest();
 	    BayesUnitTest();
 	    BayesOptimizerUnitTest();
 	    OHEUnitTest();
@@ -31,6 +33,8 @@ int main(int argc, char* argv[])
 		NNUnitTest();
 	    else if (strcmp(argv[1], "pca") == 0)
 		PCAUnitTest();
+	    else if (strcmp(argv[1], "kmeans") == 0)
+		KMeansUnitTest();
 	    else if (strcmp(argv[1], "bayes") == 0)
 		BayesUnitTest();
 	    else if (strcmp(argv[1], "bayes-optimizer") == 0)
