@@ -13,7 +13,7 @@
 #include "../../../Backend/Machine Learning/GMath/pca.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
-#include "Backend/Database/PNGPlotter.h"
+#include "Backend/Plotter/PNGPlotter.h"
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
