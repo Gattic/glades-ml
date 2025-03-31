@@ -15,6 +15,7 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "pca.h"
+#include <cmath>
 
 using namespace glades;
 
@@ -60,7 +61,7 @@ bool PCA::compare_pairs(const std::pair<double, std::vector<double> >& pair1, co
 // New comparison function for sorting eigenvalue pairs in descending order by absolute value
 struct CompareEigPairs {
     bool operator()(const std::pair<double, size_t>& a, const std::pair<double, size_t>& b) const {
-        return fabs(a.first) > fabs(b.first);
+        return std::fabs(a.first) > std::fabs(b.first);
     }
 };
 
@@ -120,7 +121,16 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     reconstructed_data.clear();
 
     size_t num_samples = data.size();
+    if (num_samples == 0) {
+        printf("Error: Empty dataset provided to PCA.\n");
+        return;
+    }
+    
     size_t num_features = data[0].size();
+    if (num_features == 0) {
+        printf("Error: Dataset contains empty feature vectors.\n");
+        return;
+    }
 
     // Step 1: Compute the mean of the data
     printf("----------\n");
@@ -140,6 +150,11 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     printf("----------\n");
     printf("Computing the covariance matrix...\n");
     std::vector<std::vector<double> > cov_mat(num_features, std::vector<double>(num_features, 0.0));
+    if (num_samples <= 1) {
+        printf("Error: Need at least 2 samples to compute covariance matrix.\n");
+        return;
+    }
+    
     for (size_t i = 0; i < num_features; ++i)
     {
 	std::cout << "Covariance Matrix Row " << i << ": [";
@@ -173,27 +188,29 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         V[i][i] = 1.0;
     }
 
-    double epsilon = 0.0000001; // Increased precision
+    double epsilon = 1e-10;
     double max_off_diag = 1.0;
     
-    // Add maximum iteration count to prevent infinite loops
     const int MAX_ITERATIONS = 1000;
     int iteration_count = 0;
     
     while (max_off_diag > epsilon && iteration_count < MAX_ITERATIONS)
     {
         iteration_count++;
-        printf("Iteration %d, Max off diag: %f\n", iteration_count, max_off_diag);
+        
+        if (iteration_count % 100 == 0 || iteration_count == 1) {
+            printf("Iteration %d, Max off diag: %.10f\n", iteration_count, max_off_diag);
+        }
+        
         max_off_diag = 0.0;
         size_t p = 0;
         size_t q = 0;
 
-        // Find maximum off-diagonal element
         for (size_t i = 0; i < num_features; ++i)
         {
             for (size_t j = i + 1; j < num_features; ++j)
             {
-                double off_diag = fabs(A[i][j]);
+                double off_diag = std::fabs(A[i][j]);
                 if (off_diag > max_off_diag)
                 {
                     max_off_diag = off_diag;
@@ -203,24 +220,17 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
             }
         }
 
-        // Check if we've reached convergence
         if (max_off_diag <= epsilon)
             break;
 
-        // Improved Jacobi rotation calculation with numerical stability
         double app = A[p][p];
         double aqq = A[q][q];
         double apq = A[p][q];
         
-        // Calculate rotation angle with improved numerical stability
-        double tau = (aqq - app) / (2.0 * apq);
-        double t = 1.0 / (fabs(tau) + sqrt(1.0 + tau * tau));
-        if (tau < 0.0) t = -t;
+        double theta = 0.5 * std::atan2(2.0 * apq, aqq - app);
+        double c = std::cos(theta);
+        double s = std::sin(theta);
         
-        double c = 1.0 / sqrt(1.0 + t * t);
-        double s = t * c;
-        
-        // Apply Jacobi rotation to A
         for (size_t i = 0; i < num_features; ++i) {
             if (i != p && i != q) {
                 double aip = A[i][p];
@@ -232,17 +242,14 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
             }
         }
         
-        // Update diagonal elements
         double new_app = app * c * c - 2.0 * apq * c * s + aqq * s * s;
         double new_aqq = app * s * s + 2.0 * apq * c * s + aqq * c * c;
         A[p][p] = new_app;
         A[q][q] = new_aqq;
         
-        // Zero out the rotated elements
         A[p][q] = 0.0;
         A[q][p] = 0.0;
         
-        // Update eigenvector matrix V
         for (size_t i = 0; i < num_features; ++i) {
             double vip = V[i][p];
             double viq = V[i][q];
@@ -251,10 +258,9 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         }
     }
 
-    // Check if we terminated due to max iterations
     if (iteration_count >= MAX_ITERATIONS) {
         printf("Warning: Jacobi algorithm did not converge after %d iterations.\n", MAX_ITERATIONS);
-        printf("Final max off-diagonal element: %f\n", max_off_diag);
+        printf("Final max off-diagonal element: %.10f\n", max_off_diag);
     } else {
         printf("Jacobi algorithm converged after %d iterations.\n", iteration_count);
     }
@@ -289,30 +295,45 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         eig_pairs.push_back(std::make_pair(eig_vals[i], i));
     }
 
-    // Sort in descending order by absolute eigenvalue
     std::sort(eig_pairs.begin(), eig_pairs.end(), CompareEigPairs());
 
-    // Copy sorted eigenvectors and eigenvalues
     std::vector<double> sorted_eig_vals(num_features, 0.0);
     sorted_eig_vecs.resize(num_features, std::vector<double>(num_features, 0.0));
     for (size_t i = 0; i < num_features; ++i)
     {
         size_t index = eig_pairs[i].second;
-        sorted_eig_vals[i] = eig_vals[index]; // Keep track of sorted eigenvalues
+        sorted_eig_vals[i] = eig_vals[index];
         for (size_t j = 0; j < num_features; ++j)
         {
             sorted_eig_vecs[i][j] = eig_vecs[index][j];
         }
     }
 
-    // Step 5: Run Gram-Schmidt orthogonalization on the eigenvectors
-    // This is done to ensure that the eigenvectors are orthogonal to each other
-    // This is necessary because the eigenvectors are not guaranteed to be orthogonal
-    // The eigenvectors are orthogonalized in descending order of eigenvalues
+    for (size_t i = 0; i < num_features; ++i)
+    {
+        double mag = 0.0;
+        for (size_t j = 0; j < num_features; ++j)
+        {
+            mag += sorted_eig_vecs[i][j] * sorted_eig_vecs[i][j];
+        }
+        mag = std::sqrt(mag);
+        
+        if (mag > 1e-10)
+        {
+            for (size_t j = 0; j < num_features; ++j)
+            {
+                sorted_eig_vecs[i][j] /= mag;
+            }
+        }
+        else
+        {
+            printf("Warning: Found zero-magnitude eigenvector, skipping normalization.\n");
+        }
+    }
+
     printf("Running Gram-Schmidt orthogonalization on the eigenvectors...\n");
     gramSchmidt(sorted_eig_vecs);
 
-    // Print the sorted_eig_vecs
     printf("----------\n");
     for (size_t i = 0; i < num_features; ++i)
     {
@@ -328,14 +349,6 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     }
     printf("----------\n");
 
-    // Step 6: Reduce the dimensionality of the data
-    // Transform the data using the eigenvectors
-    // The transformed data is the dot product of the original data and the eigenvectors
-    // The transformed data has the same number of samples as the original data
-    // The transformed data has the same number of features as the number of eigenvectors
-    // The principal components are the directions of maximum variance in the data.
-    // The dimensionality of the data is reduced by projecting the data onto the first k principal components
-    // The first k principal components are the eigenvectors with the k largest eigenvalues
     printf("Transforming the data using the eigenvectors...\n");
     transformed_data.resize(num_samples, std::vector<double>(num_features, 0.0));
     for (size_t i = 0; i < num_samples; ++i)
@@ -346,18 +359,29 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         }
     }
 
-    // Step 7: Compute the percentage of variance explained by each principal component
     printf("Computing the percentage of variance explained by each principal component...\n");
     double total_variance = 0.0;
     for (size_t i = 0; i < num_features; ++i)
     {
-	total_variance += fabs(sorted_eig_vals[i]); // Use sorted eigenvalues and fabs value
+	total_variance += std::fabs(sorted_eig_vals[i]);
     }
 
     variance_explained = std::vector<double>(num_features, 0.0);
-    for (size_t i = 0; i < num_features; ++i)
+    if (total_variance > 1e-10)
     {
-	variance_explained[i] = fabs(sorted_eig_vals[i]) / total_variance; // Use fabs value
+        for (size_t i = 0; i < num_features; ++i)
+        {
+            variance_explained[i] = std::fabs(sorted_eig_vals[i]) / total_variance;
+        }
+    }
+    else
+    {
+        printf("Warning: Total variance is zero or near-zero, setting all variance explained to equal values.\n");
+        double equal_variance = 1.0 / num_features;
+        for (size_t i = 0; i < num_features; ++i)
+        {
+            variance_explained[i] = equal_variance;
+        }
     }
 
     std::cout << "Variance explained by each principal component: " << std::endl;
@@ -368,7 +392,6 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
 
     std::cout << std::endl;
 
-    // Step 8: Reconstruct the original data from the transformed data
     printf("Reconstructing the original data from the transformed data...\n");
     reconstructed_data.resize(num_samples, std::vector<double>(num_features, 0.0));
     for (size_t i = 0; i < num_samples; ++i)
@@ -382,18 +405,13 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
 	}
     }
 
-    // Step 9: Compute the reconstruction error
-    // The reconstruction error is the difference between the original data and the reconstructed data
-    // The reconstruction error is the sum of the squared differences between the original data and the reconstructed data
-    // The reconstruction error is the Frobenius norm of the difference between the original data and the reconstructed data
-    // The reconstruction error is the sum of the squared singular values that were discarded
     double reconstruction_error = 0.0;
     for (size_t i = 0; i < num_samples; ++i)
     {
 	for (size_t j = 0; j < num_features; ++j)
 	{
 	    double diff = data[i][j] - reconstructed_data[i][j];
-	    reconstruction_error += diff * diff; // Replace pow with simple multiplication
+	    reconstruction_error += diff * diff;
 	}
     }
 
@@ -402,31 +420,22 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
 
 void PCA::calculate_arrow_head(double x1, double y1, double x2, double y2)
 {
-    // Arrow line: x1, y1, x2, y2
-
-    // Calculate arrow head
     double angle = std::atan2(static_cast<double>(y2 - y1), static_cast<double>(x2 - x1));
     double arrowSize = 10.0;
-    double arrowX1 = x2 - arrowSize * std::cos(angle + M_PI / 6); // M_PI / 6 = 30 degrees
+    double arrowX1 = x2 - arrowSize * std::cos(angle + M_PI / 6);
     double arrowY1 = y2 - arrowSize * std::sin(angle + M_PI / 6);
     double arrowX2 = x2 - arrowSize * std::cos(angle - M_PI / 6);
     double arrowY2 = y2 - arrowSize * std::sin(angle - M_PI / 6);
-
-    // Arrow head
-    // x2, y2, arrowX1, arrowY1
-    // x2, y2, arrowX2, arrowY2
 }
 
 void pca_example(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs)
 {
-    // Generate example data
     std::vector<std::vector<double> > dataset;
-    int graphSize = 200; // pos and neg
+    int graphSize = 200;
     for (int i = -graphSize; i < graphSize; ++i)
     {
 	double x = static_cast<double>(i) / graphSize * 10.0;
 	double y = 0.5 * x + 0.5 * std::sin(3.0 * x) + 0.5 * std::cos(2.0 * x) + 0.5 * std::sin(5.0 * x) + 0.5 * std::cos(7.0 * x);
-	//double y = x; // easy visual example for testing
 
 	std::vector<double> point;
 	point.push_back(x);
@@ -434,7 +443,6 @@ void pca_example(const std::vector<std::vector<double> >& data, std::vector<std:
 	dataset.push_back(point);
     }
 
-    // Compute PCA
     PCA pca;
     pca.compute(dataset);
 
@@ -443,26 +451,14 @@ void pca_example(const std::vector<std::vector<double> >& data, std::vector<std:
 	double arrowX1 = 0;
 	double arrowY1 = 0;
 
-	// Normalize the eigenvectors to fit the screen dimensions
-	/*double normX = sorted_eig_vecs[i][0] * (screenWidth / 2);
-	double normY = sorted_eig_vecs[i][1] * (screenHeight / 2);
-
-	// Scale the normalized values by a factor for visibility
-	double scaleFactor = 0.5;  // Adjust this factor as needed
-	double arrowX2 = arrowX1 + normX * scaleFactor;
-	double arrowY2 = arrowY1 - normY * scaleFactor;  // Flip the Y-coordinate
-	*/
-
 	double normX = sorted_eig_vecs[i][0];
 	double normY = sorted_eig_vecs[i][1];
 
-	// Scale the normalized values by a factor for visibility
 	double arrowX2 = arrowX1 + normX;
 	double arrowY2 = arrowY1 - normY;
 
 	PCA::calculate_arrow_head(arrowX1, arrowY1, arrowX2, arrowY2);
 
-	// Add thickness to the arrows
 	PCA::calculate_arrow_head(arrowX1 + 1, arrowY1, arrowX2 + 1, arrowY2);
 	PCA::calculate_arrow_head(arrowX1 - 1, arrowY1, arrowX2 - 1, arrowY2);
 	PCA::calculate_arrow_head(arrowX1, arrowY1 + 1, arrowX2, arrowY2 + 1);
