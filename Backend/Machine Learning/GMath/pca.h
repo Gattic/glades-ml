@@ -56,6 +56,7 @@ public:
     std::vector<std::vector<double> > sorted_eig_vecs;
     std::vector<double> variance_explained;
     std::vector<std::vector<double> >  reconstructed_data;
+    std::vector<size_t> component_mapping; // Maps sorted component index to original feature index
 
     // Main function to compute PCA, return reconstructed data
     void compute(const std::vector<std::vector<double> >& data);

@@ -119,6 +119,7 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     sorted_eig_vecs.clear();
     variance_explained.clear();
     reconstructed_data.clear();
+    component_mapping.clear(); // Clear the component mapping
 
     size_t num_samples = data.size();
     if (num_samples == 0) {
@@ -299,9 +300,12 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
 
     std::vector<double> sorted_eig_vals(num_features, 0.0);
     sorted_eig_vecs.resize(num_features, std::vector<double>(num_features, 0.0));
+    component_mapping.resize(num_features); // Resize the mapping vector
+    
     for (size_t i = 0; i < num_features; ++i)
     {
         size_t index = eig_pairs[i].second;
+        component_mapping[i] = index; // Store the original index for each sorted component
         sorted_eig_vals[i] = eig_vals[index];
         for (size_t j = 0; j < num_features; ++j)
         {
