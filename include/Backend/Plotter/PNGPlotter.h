@@ -116,6 +116,8 @@ public:
                   const std::vector<double>& variance_explained, 
                   const RGBA& arrowColor);
     void addHistogram(const std::vector<int>& bins, RGBA& barColor);
+    void addHistogramWithLabels(const std::vector<int>& bins, RGBA& barColor, 
+                                 const std::vector<std::string>& labels);
     
     // Candlestick charting
     void drawNewCandle(long timestamp, float open, float close, float high, float low);
