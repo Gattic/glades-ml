@@ -42,7 +42,14 @@ void createKMeansImage(shmea::GString newImageName, const glades::PCA& pca, cons
 	combined_features.push_back(point);
     }
 
-    shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, combined_features.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    std::map<std::string, std::string> options;
+    options["title"] = "Sample Data Visualization";
+    options["x_axis_label"] = "Time (s)";
+    options["y_axis_label"] = "Amplitude";
+    options["four_quadrants"] = "true";
+
+    //shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, combined_features.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, combined_features.size(), options);
 
     plotterPNG.addDataPointsKMeans(newImageName.c_str(), combined_features, kmeans.labels, kmeans.getCentroids());
 

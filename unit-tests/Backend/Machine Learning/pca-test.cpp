@@ -34,7 +34,15 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     float max_compute = 0.0f;
 
     // Save the original points
-    shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    //shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size());
+    std::map<std::string, std::string> options;
+    options["title"] = "Sample Data Visualization";
+    options["x_axis_label"] = "Time (s)";
+    options["y_axis_label"] = "Amplitude";
+    options["four_quadrants"] = "true";
+    
+    // Create the plotter with high-resolution for quality output
+    shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), options);
 
     shmea::RGBA RED(0xFF, 0x00, 0x00, 0xFF);
     plotterPNG.addDataPointsPCA(compute_data, RED);
@@ -45,7 +53,8 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     printf("[PCA] Image Saved\n");
     plotterPNG.SavePNG(imageName.c_str(), imagePath);
 
-    shmea::PNGPlotter plotterPNG2(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    //shmea::PNGPlotter plotterPNG2(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    shmea::PNGPlotter plotterPNG2(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), options);
 
     shmea::RGBA GREEN(0x00, 0xFF, 0x00, 0xFF);
     plotterPNG2.addDataPointsPCA(pca.transformed_data, GREEN);
@@ -55,7 +64,8 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     printf("[PCA] Image Saved\n");
     plotterPNG2.SavePNG(imageName2.c_str(), imagePath);
 
-    shmea::PNGPlotter plotterPNG3(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    //shmea::PNGPlotter plotterPNG3(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    shmea::PNGPlotter plotterPNG3(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), options);
 
     shmea::RGBA PURPLE(0xFF, 0x00, 0xFF, 0xFF);
     plotterPNG3.addDataPointsPCA(pca.transformed_data, PURPLE);
@@ -76,7 +86,8 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     }
 
     // Show the classes in the first two principal components
-    shmea::PNGPlotter plotterPNG4(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    //shmea::PNGPlotter plotterPNG4(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    shmea::PNGPlotter plotterPNG4(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), options);
 
     plotterPNG4.addDataPointsPCA(combined_features, PURPLE);
 

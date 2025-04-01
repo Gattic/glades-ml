@@ -148,9 +148,6 @@ public:
     const std::string& getXAxisLabel() const { return xAxisLabel; }
     const std::string& getYAxisLabel() const { return yAxisLabel; }
     
-    // Redraw all titles and labels (useful after changing settings)
-    void redrawTitlesAndLabels();
-    
     // Legend methods
     void addLegendEntry(const std::string& label, const RGBA& color);
     void drawLegend();
