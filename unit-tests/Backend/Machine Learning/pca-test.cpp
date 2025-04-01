@@ -36,9 +36,9 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     // Save the original points
     //shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size());
     std::map<std::string, std::string> options;
-    options["title"] = "Sample Data Visualization";
-    options["x_axis_label"] = "Time (s)";
-    options["y_axis_label"] = "Amplitude";
+    options["title"] = newImageName.c_str();
+    options["x_axis_label"] = "Principal Component 1";
+    options["y_axis_label"] = "Principal Component 2";
     options["four_quadrants"] = "true";
     
     // Create the plotter with high-resolution for quality output
