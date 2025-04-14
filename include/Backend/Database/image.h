@@ -14,8 +14,8 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GIMAGE_H_
-#define _GIMAGE_H_
+#ifndef IMAGE_H
+#define IMAGE_H
 
 #include <stdio.h>
 #include <string.h>
@@ -30,23 +30,15 @@ namespace shmea {
 class GString;
 class GList;
 
-// 32 bit color pixel density
-class RGBA
-{
-public:
-	RGBA(unsigned char red = 0xFF, unsigned char green = 0xFF, unsigned char blue = 0xFF,
-		 unsigned char alpha = 0xFF)
-		: r(red), g(green), b(blue), a(alpha)
-	{
-		//
-	}
-
-	bool isWhite() const
-	{
-		return r == 0xFF && g == 0xFF && b == 0xFF;
-	}
-
-	unsigned char r, g, b, a;
+struct RGBA {
+	unsigned char r;
+	unsigned char g;
+	unsigned char b;
+	unsigned char a;
+	
+	RGBA() : r(0), g(0), b(0), a(0) {}
+	RGBA(unsigned char r_, unsigned char g_, unsigned char b_, unsigned char a_)
+		: r(r_), g(g_), b(b_), a(a_) {}
 };
 
 //	bmp, png	(when T == RGBA)
@@ -100,10 +92,10 @@ public:
 	}
 
 	// initialize an image of a specific size
-	void Allocate(int w, int h)
+	void Allocate(unsigned int width, unsigned int height)
 	{
-		width = w;
-		height = h;
+		this->width = width;
+		this->height = height;
 		delete[] data;
 		if (width == 0 && height == 0)
 		{
@@ -135,9 +127,10 @@ public:
 
 	std::vector<unsigned char> getPixels() const;
 
-	void drawVerticalGradient(int, int, RGBA, RGBA, int);
+	void drawVerticalGradient(int x, int y, const RGBA& topColor, const RGBA& bottomColor, int cornerRadius = 0);
+	void drawHorizontalGradient(int x, int y, const RGBA& leftColor, const RGBA& rightColor, int cornerRadius = 0);
 
-	RGBA averageColor(int, int, int, int);
+	RGBA averageColor(int startX, int startY, int width, int height) const;
 
 	RGBA GetPixel(unsigned int x, unsigned int y) const
 	{

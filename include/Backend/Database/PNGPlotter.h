@@ -23,10 +23,10 @@ class PNGPlotter
 		unsigned int width;
 		unsigned int height;
 		float min_price, max_price;
-		const int margin_top;
-		const int margin_right;
-		const int margin_bottom;
-		const int margin_left;
+		const unsigned int margin_top;
+		const unsigned int margin_right;
+		const unsigned int margin_bottom;
+		const unsigned int margin_left;
 		const bool fourQuadrants;
 		long last_timestamp;
 		int total_candles_drawn;
