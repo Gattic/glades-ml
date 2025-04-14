@@ -205,3 +205,45 @@ std::string NaiveBayes::getClassName(int classID) const
     int outCol = OHEMaps.size()-1;
     return OHEMaps[outCol].classAt(classID);
 }
+
+shmea::GTable NaiveBayes::importNTuple(const shmea::GList& tokenizedWords ,unsigned int n){
+	shmea::GTable newTable(',');
+	if(tokenizedWords.size() <= n || n<1)
+	  return newTable;
+
+	for(unsigned int i =0;i<=tokenizedWords.size() - (n+1); ++i)
+	{
+		shmea :: GList newRow;
+		for(unsigned int j =0; j<n ; ++j){
+			newRow.addString(tokenizedWords[i+j].c_str());
+		}
+		newRow.addString(tokenizedWords[i+n].c_str());
+		newTable.addRow(newRow);
+	}  
+	return import(newTable);
+}
+int NaiveBayes::predictWithContext(const shmea::GList& context)
+{
+	int outCol =OHEMaps.size() - 1;
+	if(context.size()<1)
+	return -1;
+    if (context.size() != outCol)
+    {
+        printf("Warning: Context size (%lu) doesn't match model features (%d)\n", 
+               context.size(), outCol);
+        // Try to use the last word at least for prediction if model was trained with single words
+        if (outCol == 1 && context.size() > 0)
+        {
+            shmea::GList singleContext;
+            singleContext.addString(context[context.size()-1].c_str());
+            return predict(singleContext);
+        }
+        return -1;
+    }
+	return predict(context);
+}
+unsigned int NaiveBayes::getContextSize() const
+{
+    return OHEMaps.size() - 1; 
+
+}	

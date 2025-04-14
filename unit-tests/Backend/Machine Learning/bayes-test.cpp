@@ -111,6 +111,63 @@ void BayesUnitTest()
     
     G_assert (__FILE__, __LINE__, "==============Bayes-test4::Accuracy() Failed==============", bModel4.getClassName(prediction) == "forest");
     printf("\n===================================\n");
+    printf("\n===================================\n");
+printf("N-Tuple (Multi-word context) Test\n");
+printf("===================================\n");
+
+// Test with bigrams (n=2): predict based on 2 previous words
+shmea::GList trainingList5;
+// These sample phrases demonstrate how words can follow different patterns
+// based on context
+trainingList5.addString("the");
+trainingList5.addString("quick");
+trainingList5.addString("brown");
+trainingList5.addString("fox");
+trainingList5.addString("jumps");
+trainingList5.addString("over");
+trainingList5.addString("the");
+trainingList5.addString("lazy");
+trainingList5.addString("dog");
+trainingList5.addString("the");
+trainingList5.addString("lazy");
+trainingList5.addString("cat");
+trainingList5.addString("sleeps");
+trainingList5.addString("all");
+trainingList5.addString("day");
+trainingList5.addString("the");
+trainingList5.addString("brown");
+trainingList5.addString("bear");
+trainingList5.addString("eats");
+trainingList5.addString("honey");
+
+// Create a bayes net with n-tuple (n=2)
+glades::NaiveBayes bModel5;
+shmea::GTable bTable5 = bModel5.importNTuple(trainingList5, 2);
+bModel5.train(bTable5);
+
+// Test prediction with two words of context: "the lazy"
+shmea::GList testContext1;
+testContext1.addString("the");
+testContext1.addString("lazy");
+int prediction5 = bModel5.predictWithContext(testContext1);
+printf("-----------------------------------\n");
+printf("Context: \"the lazy\"\n");
+printf("Bayes Prediction: %d \"%s\"\n", prediction5, bModel5.getClassName(prediction5).c_str());
+printf("-----------------------------------\n");
+G_assert(__FILE__, __LINE__, "==============Bayes-nTuple-test1::Accuracy() Failed==============", 
+         bModel5.getClassName(prediction5) == "dog" || bModel5.getClassName(prediction5) == "cat");
+
+// Test with another context: "the brown"
+shmea::GList testContext2;
+testContext2.addString("the");
+testContext2.addString("brown");
+int prediction6 = bModel5.predictWithContext(testContext2);
+printf("-----------------------------------\n");
+printf("Context: \"the brown\"\n");
+printf("Bayes Prediction: %d \"%s\"\n", prediction6, bModel5.getClassName(prediction6).c_str());
+printf("-----------------------------------\n");
+G_assert(__FILE__, __LINE__, "==============Bayes-nTuple-test2::Accuracy() Failed==============", 
+         bModel5.getClassName(prediction6) == "bear" || bModel5.getClassName(prediction6) == "fox");
 
     printf("\n============================================================\n");
 }
