@@ -231,7 +231,7 @@ int NaiveBayes::predictWithContext(const shmea::GList& context)
     {
         printf("Warning: Context size (%lu) doesn't match model features (%d)\n", 
                context.size(), outCol);
-        // Try to use the last word at least for prediction if model was trained with single words
+
         if (outCol == 1 && context.size() > 0)
         {
             shmea::GList singleContext;
