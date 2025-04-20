@@ -76,13 +76,14 @@ void BayesUnitTest()
     bModel3.train(bTable3);
 
     // predict with a new learning rate
+    shmea::GString needle = "hello";
     shmea::GList testList3;
-    testList3.addString("hello");
+    testList3.addString(needle);
     prediction = bModel3.predict(testList3);
     printf("-----------------------------------\n");
     bModel3.print();
     printf("\n-----------------------------------\n");
-    printf("Bayes Prediction: %d \"%s\"\n", prediction, bModel3.getClassName(prediction).c_str());
+    printf("Bayes Prediction: %d \"%s\" -> \"%s\"\n", prediction, needle.c_str(), bModel3.getClassName(prediction).c_str());
     printf("-----------------------------------\n");
     
     G_assert (__FILE__, __LINE__, "==============Bayes-test3::Accuracy() Failed==============", bModel3.getClassName(prediction) == "world");
@@ -100,13 +101,14 @@ void BayesUnitTest()
     bModel4.train(bTable4);
 
     // predict with a new learning rate
+    needle = "the";
     shmea::GList testList4;
-    testList4.addString("the");
+    testList4.addString(needle);
     prediction = bModel4.predict(testList4);
     printf("-----------------------------------\n");
     //bModel4.print();
     printf("\n-----------------------------------\n");
-    printf("Bayes Prediction: %d \"%s\"\n", prediction, bModel4.getClassName(prediction).c_str());
+    printf("Bayes Prediction: %d \"%s\" -> \"%s\"\n", prediction, needle.c_str(), bModel4.getClassName(prediction).c_str());
     printf("-----------------------------------\n");
     
     G_assert (__FILE__, __LINE__, "==============Bayes-test4::Accuracy() Failed==============", bModel4.getClassName(prediction) == "forest");

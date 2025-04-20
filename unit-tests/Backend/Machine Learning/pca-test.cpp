@@ -12,7 +12,7 @@
 #include "../../../Backend/Machine Learning/GMath/pca.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
-#include "Backend/Database/PNGPlotter.h"
+#include "Backend/Plotter/Plotter.h"
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
@@ -20,71 +20,138 @@
 void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<double> >& compute_data, const glades::PCA& pca)
 {
     std::string imagePath = "datasets";
+    std::string nameStr = newImageName.c_str(); // Convert GString to std::string
 
-    shmea::GString imageName = newImageName + "_pca_original.png";
-    shmea::GString imageName2 = newImageName + "_pca_transformed.png";
-    shmea::GString imageName3 = newImageName + "_pca_reconstructed.png";
-
-    int margin_top = 0;
-    int margin_right = 0;
-    int margin_bottom = 0;
-    int margin_left = 0;
-
-    float min_compute = 0.0f;
-    float max_compute = 0.0f;
-
-    // Save the original points
-    shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
-
-    shmea::RGBA RED(0xFF, 0x00, 0x00, 0xFF);
-    plotterPNG.addDataPointsPCA(compute_data, RED);
-
-    shmea::RGBA BLUE(0x00, 0x00, 0xFF, 0xFF);
-    plotterPNG.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
-
-    printf("[PCA] Image Saved\n");
-    plotterPNG.SavePNG(imageName.c_str(), imagePath);
-
-    shmea::PNGPlotter plotterPNG2(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
-
-    shmea::RGBA GREEN(0x00, 0xFF, 0x00, 0xFF);
-    plotterPNG2.addDataPointsPCA(pca.transformed_data, GREEN);
-
-    plotterPNG2.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
-
-    printf("[PCA] Image Saved\n");
-    plotterPNG2.SavePNG(imageName2.c_str(), imagePath);
-
-    shmea::PNGPlotter plotterPNG3(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
-
-    shmea::RGBA PURPLE(0xFF, 0x00, 0xFF, 0xFF);
-    plotterPNG3.addDataPointsPCA(pca.transformed_data, PURPLE);
-
-    plotterPNG3.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
-
-    printf("[PCA] Image Saved\n");
-    plotterPNG3.SavePNG(imageName3.c_str(), imagePath);
-
-    // Combine the features to cluster the classes using the first two principal components
-    std::vector<std::vector<double> > combined_features;
-    for(unsigned int i = 0; i < pca.transformed_data.size(); ++i)
-    {
-	std::vector<double> point;
-	point.push_back(pca.transformed_data[i][0]);
-	point.push_back(pca.transformed_data[i][1]);
-	combined_features.push_back(point);
+    // Create a plotter with default dimensions and supersampling factor of 4
+    shmea::Plotter plotter(1800, 1000, 4);
+    
+    // Convert 2D data points to Plotter's Point format for original data
+    std::vector<shmea::Point> original_points;
+    for (size_t i = 0; i < compute_data.size(); ++i) {
+        shmea::Point p;
+        if (compute_data[i].size() >= 2) {
+            p.x = compute_data[i][0];
+            p.y = compute_data[i][1];
+            original_points.push_back(p);
+        }
+    }
+    
+    // Save the original data plot
+    plotter.chart()
+        .title(nameStr + ": Original Data", 36)
+        .grid(true)
+        .axes(true)
+        .cornerRadius(15)
+        .logo("logo.png")
+        .axisLabels("Feature 1", "Feature 2", 28)
+        .originAxes(true)  // Enable four quadrant origin axes
+        .autoMargins(shmea::CHART_SCATTER)
+        .addSeries("Original Data", original_points, shmea::RGBA(0xFF, 0x00, 0x00, 0xFF), shmea::SERIES_SCATTER, 2, 8)
+        .saveAs(nameStr + "_pca_original.png", imagePath);
+    
+    printf("[PCA] Original data image saved\n");
+    
+    // Create a second plotter for transformed data
+    shmea::Plotter plotter2(1800, 1000, 4);
+    
+    // Convert 2D data points to Plotter's Point format for transformed data
+    std::vector<shmea::Point> transformed_points;
+    for (size_t i = 0; i < pca.transformed_data.size(); ++i) {
+        shmea::Point p;
+        if (pca.transformed_data[i].size() >= 2) {
+            p.x = pca.transformed_data[i][0];
+            p.y = pca.transformed_data[i][1];
+            transformed_points.push_back(p);
+        }
     }
 
-    // Show the classes in the first two principal components
-    shmea::PNGPlotter plotterPNG4(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, compute_data.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
-
-    plotterPNG4.addDataPointsPCA(combined_features, PURPLE);
-
-    //plotterPNG4.addArrow(pca.sorted_eig_vecs, pca.variance_explained, BLUE);
-
-    printf("[PCA] Image Saved\n");
-    shmea::GString imageName4 = newImageName + "_pca_score.png";
-    plotterPNG4.SavePNG(imageName4.c_str(), imagePath);
+    // Use the pca.sorted_eigen_vecs to create arrows for the diagram
+    std::vector<shmea::Arrow> diagramArrows;
+    for(unsigned int i = 0; i < pca.sorted_eig_vecs.size(); ++i)
+    {
+	shmea::Arrow arrow;
+	arrow.start.x = 0.0f;
+	arrow.start.y = 0.0f;
+	arrow.end.x = pca.sorted_eig_vecs[i][0];
+	arrow.end.y = pca.sorted_eig_vecs[i][1];
+	arrow.color = shmea::RGBA(0x00, 0x00, 0xFF, 0xFF); // Blue color for arrows
+	diagramArrows.push_back(arrow);
+    }
+    
+    // Save the transformed data plot
+    plotter2.chart()
+        .title(nameStr + ": Transformed Data", 36)
+        .grid(true)
+        .axes(true)
+        .cornerRadius(15)
+        .logo("logo.png")
+        .axisLabels("Principal Component 1", "Principal Component 2", 28)
+        .originAxes(true)  // Enable four quadrant origin axes
+        .autoMargins(shmea::CHART_SCATTER)
+        .addSeries("Transformed Data", transformed_points, shmea::RGBA(0x00, 0xFF, 0x00, 0xFF), shmea::SERIES_SCATTER, 2, 8)
+        .addArrows(diagramArrows)
+        .saveAs(nameStr + "_pca_transformed.png", imagePath);
+    
+    printf("[PCA] Transformed data image saved\n");
+    
+    // Create a third plotter for reconstructed data
+    shmea::Plotter plotter3(1800, 1000, 4);
+    
+    // Convert 2D data points to Plotter's Point format for reconstructed data
+    std::vector<shmea::Point> reconstructed_points;
+    for (size_t i = 0; i < pca.reconstructed_data.size(); ++i) {
+        shmea::Point p;
+        if (pca.reconstructed_data[i].size() >= 2) {
+            p.x = pca.reconstructed_data[i][0];
+            p.y = pca.reconstructed_data[i][1];
+            reconstructed_points.push_back(p);
+        }
+    }
+    
+    // Save the reconstructed data plot
+    plotter3.chart()
+        .title(nameStr + ": Reconstructed Data", 36)
+        .grid(true)
+        .axes(true)
+        .cornerRadius(15)
+        .logo("logo.png")
+        .axisLabels("Feature 1", "Feature 2", 28)
+        .originAxes(true)  // Enable four quadrant origin axes
+        .autoMargins(shmea::CHART_SCATTER)
+        .addSeries("Reconstructed Data", reconstructed_points, shmea::RGBA(0xFF, 0x00, 0xFF, 0xFF), shmea::SERIES_SCATTER, 2, 8)
+        .saveAs(nameStr + "_pca_reconstructed.png", imagePath);
+    
+    printf("[PCA] Reconstructed data image saved\n");
+    
+    // Combine the features to cluster the classes using the first two principal components
+    std::vector<shmea::Point> pca_score_points;
+    for(unsigned int i = 0; i < pca.transformed_data.size(); ++i)
+    {
+        shmea::Point p;
+        if (pca.transformed_data[i].size() >= 2) {
+            p.x = pca.transformed_data[i][0];
+            p.y = pca.transformed_data[i][1];
+            pca_score_points.push_back(p);
+        }
+    }
+    
+    // Create a fourth plotter for score plot (first two principal components)
+    shmea::Plotter plotter4(1800, 1000, 4);
+    
+    // Save the score plot
+    plotter4.chart()
+        .title(nameStr + ": PCA Score Plot (PC1 vs PC2)", 36)
+        .grid(true)
+        .axes(true)
+        .cornerRadius(15)
+        .logo("logo.png")
+        .axisLabels("Principal Component 1", "Principal Component 2", 28)
+        .originAxes(true)  // Enable four quadrant origin axes
+        .autoMargins(shmea::CHART_SCATTER)
+        .addSeries("PC Score", pca_score_points, shmea::RGBA(0xFF, 0x00, 0xFF, 0xFF), shmea::SERIES_SCATTER, 2, 8)
+        .saveAs(nameStr + "_pca_score.png", imagePath);
+    
+    printf("[PCA] Score plot image saved\n");
 }
 
 void PCAUnitTest()

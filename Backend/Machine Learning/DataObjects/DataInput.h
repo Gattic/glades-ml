@@ -18,6 +18,7 @@
 #define _GDATAINPUT
 
 #include "Backend/Database/GTable.h"
+#include <limits>
 
 namespace glades {
 
@@ -25,11 +26,22 @@ class OHE;
 
 class DataInput
 {
+protected:
+
+    float min;
+    float max;
+
 public:
 
 	const static int CSV = 0;
 	const static int IMAGE = 1;
 	const static int TEXT = 2;
+
+	DataInput()
+	{
+	    min = std::numeric_limits<float>::max();
+	    max = std::numeric_limits<float>::min();
+	}
 
 	std::vector<OHE*> trainingOHEMaps;
 	std::vector<bool> trainingFeatureIsCategorical;
@@ -47,6 +59,10 @@ public:
 	virtual unsigned int getTrainSize() const = 0;
 	virtual unsigned int getTestSize() const = 0;
 	virtual unsigned int getFeatureCount() const = 0;
+
+	float getMin() const;
+	float getMax() const;
+	float getRange() const;
 
 	virtual int getType() const = 0;
 };

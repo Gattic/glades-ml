@@ -169,6 +169,8 @@ void ImageInput::import(shmea::GString newName)
     importHelper(testingLegend, testingOHEMaps, testingFeatureIsCategorical, testImages);
 
     // Set the loaded flag
+    min = 0;
+    max = 255;
     loaded = true;
 }
 

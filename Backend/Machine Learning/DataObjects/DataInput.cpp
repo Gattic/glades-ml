@@ -17,3 +17,18 @@
 #include "DataInput.h"
 
 using namespace glades;
+
+float DataInput::getMin() const
+{
+    return min;
+}
+
+float DataInput::getMax() const
+{
+    return max;
+}
+
+float DataInput::getRange() const
+{
+    return max - min;
+}

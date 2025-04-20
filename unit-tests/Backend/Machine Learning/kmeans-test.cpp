@@ -13,7 +13,8 @@
 #include "../../../Backend/Machine Learning/GMath/pca.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
-#include "Backend/Database/PNGPlotter.h"
+#include "Backend/Plotter/Plotter.h"
+#include <sstream>
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
@@ -21,33 +22,53 @@
 void createKMeansImage(shmea::GString newImageName, const glades::PCA& pca, const glades::KMeans& kmeans)
 {
     std::string imagePath = "datasets";
+    std::string nameStr = newImageName.c_str(); // Convert GString to std::string
 
-    shmea::GString imageName = newImageName + "_kmeans_original.png";
-
-    int margin_top = 0;
-    int margin_right = 0;
-    int margin_bottom = 0;
-    int margin_left = 0;
-
-    float min_compute = 0.0f;
-    float max_compute = 0.0f;
+    // Create a string for the K value (C++03 compatible)
+    std::stringstream ss;
+    ss << kmeans.getClassCount(); // Use kmeans.k to access the K value directly
+    std::string kValueStr = ss.str();
 
     // Combine the features to cluster the classes using the first two principal components
-    std::vector<std::vector<double> > combined_features;
+    std::vector<std::vector<double> > clusterData;
+    std::vector<int> clusterLabels;
     for(unsigned int i = 0; i < pca.transformed_data.size(); ++i)
     {
-	std::vector<double> point;
-	point.push_back(pca.transformed_data[i][0]);
-	point.push_back(pca.transformed_data[i][1]);
-	combined_features.push_back(point);
+        std::vector<double> point;
+        point.push_back(pca.transformed_data[i][0]);
+        point.push_back(pca.transformed_data[i][1]);
+        clusterData.push_back(point);
+        clusterLabels.push_back(kmeans.labels[i]);
     }
 
-    shmea::PNGPlotter plotterPNG(shmea::PNGPlotter::SUPERSAMPLE_WIDTH, shmea::PNGPlotter::SUPERSAMPLE_HEIGHT, combined_features.size(), max_compute, min_compute, 0, margin_top, margin_right, margin_bottom, margin_left, true);
+    // Get centroids as vector<vector<double>>
+    std::vector<std::vector<double> > centroids;
+    std::vector<std::vector<float> > floatCentroids = kmeans.getCentroids();
+    for (unsigned int i = 0; i < floatCentroids.size(); ++i) {
+        std::vector<double> centroid;
+        for (unsigned int j = 0; j < 2 && j < floatCentroids[i].size(); ++j) {
+            centroid.push_back(static_cast<double>(floatCentroids[i][j]));
+        }
+        centroids.push_back(centroid);
+    }
 
-    plotterPNG.addDataPointsKMeans(newImageName.c_str(), combined_features, kmeans.labels, kmeans.getCentroids());
+    // Create a plotter with default dimensions and supersampling factor of 4
+    shmea::Plotter plotter(1800, 1000, 4);
+    
+    // Plot the K-means clusters
+    plotter.chart()
+        .title(nameStr + ": K-Means Clustering (K=" + kValueStr + ")", 36)
+        .grid(true)
+        .axes(true)
+        .originAxes(true)  // Enable four quadrant origin axes
+        .cornerRadius(15)
+        .logo("logo.png")
+        .axisLabels("Principal Component 1", "Principal Component 2", 28)
+        .autoMargins(shmea::CHART_CLUSTER)
+        .addClusterData(clusterData, clusterLabels, centroids)
+        .saveAs(nameStr + "_kmeans_original.png", imagePath);
 
     printf("[KMEANS] Image Saved\n");
-    plotterPNG.SavePNG(imageName.c_str(), imagePath);
 }
 
 void KMeansUnitTest()
@@ -66,17 +87,17 @@ void KMeansUnitTest()
     unsigned int trainSize = di->getTrainSize();
     for(unsigned int i = 0; i < trainSize; ++i)
     {
-	shmea::GVector<float> cRow = di->getTrainRow(i);
-	std::vector<float> dataVec;
-	std::vector<double> dblVec;
-	for(unsigned int j = 0; j < cRow.size(); ++j)
-	{
-	    dataVec.push_back(cRow[j]);
-	    dblVec.push_back(cRow[j]);
-	}
+        shmea::GVector<float> cRow = di->getTrainRow(i);
+        std::vector<float> dataVec;
+        std::vector<double> dblVec;
+        for(unsigned int j = 0; j < cRow.size(); ++j)
+        {
+            dataVec.push_back(cRow[j]);
+            dblVec.push_back(cRow[j]);
+        }
 
-	points.push_back(dataVec);
-	compute_data.push_back(dblVec);
+        points.push_back(dataVec);
+        compute_data.push_back(dblVec);
     }
 
     glades::PCA pca;

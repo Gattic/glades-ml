@@ -159,6 +159,12 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
             }
             fMean /= rawTable.numberOfRows();
 
+	    // Set the class min/max
+	    if (fMin < min)
+		min = fMin;
+	    if (fMax > max)
+		max = fMax;
+
             // Then standardize and store
             float xRange = fMax - fMin;
             for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r) 
