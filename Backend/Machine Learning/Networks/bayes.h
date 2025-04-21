@@ -55,6 +55,10 @@ public:
 	void reset();
 
 	std::string getClassName(int) const;
+
+	// Added missing method declarations
+	int predictWithContext(const shmea::GList& context);
+	unsigned int getContextSize() const;
 };
 };
 
