@@ -48,9 +48,10 @@ protected:
     // Gram-Schmidt orthogonalization
     void gramSchmidt(std::vector<std::vector<double> >& matrix);
 
-    // Internal component mappings
-    std::vector<size_t> component_mapping; // Maps sorted component index to original feature index
-    std::map<size_t, size_t> reverse_component_mapping; // Maps original feature index to sorted component index
+    // Maps principal component index (0-based) to original feature index
+    // This preserves the order of variance_explained, so component_mapping[i] 
+    // tells which original feature the i-th principal component maps to
+    std::vector<size_t> component_mapping; 
 
 public:
     // Custom comparison function for sorting in descending order
@@ -72,9 +73,6 @@ public:
     
     // Get the original feature index for a given principal component
     size_t getOriginalFeatureIndex(size_t component_index) const;
-    
-    // Get the principal component index for a given original feature
-    size_t getComponentIndex(size_t feature_index) const;
     
     // Display information about component mappings
     void printComponentMapping() const;

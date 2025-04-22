@@ -194,7 +194,6 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     variance_explained.clear();
     reconstructed_data.clear();
     component_mapping.clear(); // Clear the component mapping
-    reverse_component_mapping.clear(); // Clear the reverse component mapping
 
     size_t num_samples = data.size();
     if (num_samples == 0) {
@@ -377,7 +376,7 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     sorted_eig_vecs.resize(num_features, std::vector<double>(num_features, 0.0));
     component_mapping.resize(num_features); // Resize the mapping vector
     
-    // Create both forward and reverse mappings
+    // Create the mapping from sorted eigenvectors to original features
     for (size_t i = 0; i < num_features; ++i)
     {
         size_t index = eig_pairs[i].second;
@@ -404,29 +403,33 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         
         // Map this principal component to the original feature it most represents
         component_mapping[i] = max_feature_idx;
-        reverse_component_mapping[max_feature_idx] = i;
     }
     
-    // Handle any missing mappings (if a feature wasn't mapped to any PC)
+    // Check for duplicate mappings and resolve if necessary
     std::vector<bool> original_features_mapped(num_features, false);
+    std::vector<size_t> duplicate_pcs;
+    
+    // First pass: mark features that are mapped and collect PCs with duplicate mappings
     for (size_t i = 0; i < num_features; ++i) {
-        original_features_mapped[component_mapping[i]] = true;
+        size_t feature_idx = component_mapping[i];
+        if (original_features_mapped[feature_idx]) {
+            // This feature is already mapped, this PC needs reassignment
+            duplicate_pcs.push_back(i);
+        } else {
+            original_features_mapped[feature_idx] = true;
+        }
     }
     
-    // For any unmapped original features, map them to the remaining PCs
-    size_t pc_index = 0;
-    for (size_t i = 0; i < num_features; ++i) {
-        if (!original_features_mapped[i]) {
-            // Find next unmapped PC
-            while (pc_index < num_features && 
-                   reverse_component_mapping.find(component_mapping[pc_index]) != reverse_component_mapping.end()) {
-                pc_index++;
-            }
-            
-            if (pc_index < num_features) {
-                component_mapping[pc_index] = i;
-                reverse_component_mapping[i] = pc_index;
-                pc_index++;
+    // Second pass: assign unmapped features to duplicate PCs
+    for (size_t i = 0; i < duplicate_pcs.size(); ++i) {
+        size_t pc_idx = duplicate_pcs[i];
+        
+        // Find an unmapped feature
+        for (size_t j = 0; j < num_features; ++j) {
+            if (!original_features_mapped[j]) {
+                component_mapping[pc_idx] = j;
+                original_features_mapped[j] = true;
+                break;
             }
         }
     }
@@ -438,13 +441,6 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
                static_cast<unsigned int>(i), 
                static_cast<unsigned int>(component_mapping[i]),
                std::fabs(sorted_eig_vecs[i][component_mapping[i]]));
-    }
-    
-    printf("Reverse mapping (original feature -> PC index):\n");
-    for (size_t i = 0; i < num_features; ++i) {
-        printf("  Original Feature %u -> PC %u\n", 
-               static_cast<unsigned int>(i), 
-               static_cast<unsigned int>(reverse_component_mapping[i]));
     }
 
     for (size_t i = 0; i < num_features; ++i)
@@ -610,20 +606,6 @@ size_t PCA::getOriginalFeatureIndex(size_t component_index) const
     return component_mapping[component_index];
 }
 
-// Get the principal component index for a given original feature
-size_t PCA::getComponentIndex(size_t feature_index) const
-{
-    std::map<size_t, size_t>::const_iterator it = reverse_component_mapping.find(feature_index);
-    
-    if (it == reverse_component_mapping.end()) {
-        printf("Error: Feature index %u not found in component mapping.\n", 
-               static_cast<unsigned int>(feature_index));
-        return 0;
-    }
-    
-    return it->second;
-}
-
 // Display information about component mappings
 void PCA::printComponentMapping() const
 {
@@ -688,13 +670,6 @@ void pca_example(const std::vector<std::vector<double> >& data, std::vector<std:
     
     // Example of using the mapping functions
     printf("\nMapping examples:\n");
-    
-    // Original features to principal components
-    for (size_t i = 0; i < 2; ++i) {
-        printf("Original feature %u is represented by PC %u\n", 
-               static_cast<unsigned int>(i), 
-               static_cast<unsigned int>(pca.getComponentIndex(i)));
-    }
     
     // Principal components to original features
     for (size_t i = 0; i < 2; ++i) {
