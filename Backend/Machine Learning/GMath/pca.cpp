@@ -22,6 +22,12 @@ using namespace glades;
 // Helper function to compute the mean of a vector of numbers
 double PCA::compute_mean(const std::vector<double>& data)
 {
+    // Check for empty vector
+    if (data.empty()) {
+        printf("Error: Empty vector in mean calculation\n");
+        return 0.0;
+    }
+    
     double sum = 0.0;
     for (size_t i = 0; i < data.size(); ++i)
     {
@@ -33,6 +39,19 @@ double PCA::compute_mean(const std::vector<double>& data)
 // Helper function to compute the dot product of two vectors
 double PCA::dot_product(const std::vector<double>& vec1, const std::vector<double>& vec2)
 {
+    // Check for empty vectors
+    if (vec1.empty() || vec2.empty()) {
+        printf("Error: Empty vector in dot product calculation\n");
+        return 0.0;
+    }
+    
+    // Check dimensions
+    if (vec1.size() != vec2.size()) {
+        printf("Error: Vector dimensions don't match for dot product: %zu and %zu\n", 
+               vec1.size(), vec2.size());
+        return 0.0;
+    }
+    
     double result = 0.0;
     for (size_t i = 0; i < vec1.size(); ++i)
     {
@@ -44,34 +63,72 @@ double PCA::dot_product(const std::vector<double>& vec1, const std::vector<doubl
 // Helper function to perform matrix-vector multiplication
 std::vector<double> PCA::matrix_vector_multiply(const std::vector<std::vector<double> >& matrix, const std::vector<double>& vec)
 {
+    // Check for empty matrix or vector
+    if (matrix.empty() || matrix[0].empty() || vec.empty()) {
+        printf("Error: Empty matrix or vector in matrix-vector multiplication\n");
+        return std::vector<double>();
+    }
+    
+    // Check dimensions compatibility
+    if (matrix[0].size() != vec.size()) {
+        printf("Error: Incompatible dimensions in matrix-vector multiplication: Matrix columns (%zu) != Vector size (%zu)\n", 
+               matrix[0].size(), vec.size());
+        return std::vector<double>();
+    }
+    
     std::vector<double> result(matrix.size(), 0.0);
     for (size_t i = 0; i < matrix.size(); ++i)
     {
+        if (matrix[i].size() != vec.size()) {
+            printf("Error: Inconsistent row length in matrix at row %zu\n", i);
+            return std::vector<double>();
+        }
         result[i] = dot_product(matrix[i], vec);
     }
     return result;
 }
 
-// Custom comparison function for sorting in descending order
-bool PCA::compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2)
-{
-    return pair1.first > pair2.first;
-}
-
-// New comparison function for sorting eigenvalue pairs in descending order by absolute value
+// Custom comparison function for sorting in descending order by absolute value
 struct CompareEigPairs {
     bool operator()(const std::pair<double, size_t>& a, const std::pair<double, size_t>& b) const {
         return std::fabs(a.first) > std::fabs(b.first);
     }
 };
 
+// Custom comparison function for sorting in descending order
+bool PCA::compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2)
+{
+    return std::fabs(pair1.first) > std::fabs(pair2.first);
+}
+
+// Custom comparison function for sorting pairs of (value, index) in descending order by absolute value
+bool PCA::compare_value_index_pairs(const std::pair<double, size_t>& pair1, const std::pair<double, size_t>& pair2)
+{
+    return std::fabs(pair1.first) > std::fabs(pair2.first);
+}
+
 // Multiply two matrices: C = A * B
 std::vector<std::vector<double> > PCA::matrixMultiply(const std::vector<std::vector<double> >& A,
 	const std::vector<std::vector<double> >& B)
 {
     size_t rows_A = A.size();
+    
+    // Check for empty matrices
+    if (rows_A == 0 || A[0].size() == 0 || B.size() == 0 || B[0].size() == 0) {
+        printf("Error: Empty matrix in multiplication\n");
+        return std::vector<std::vector<double> >();
+    }
+    
     size_t cols_A = A[0].size();
+    size_t rows_B = B.size();
     size_t cols_B = B[0].size();
+    
+    // Check for compatible dimensions
+    if (cols_A != rows_B) {
+        printf("Error: Incompatible matrix dimensions for multiplication: %zu x %zu and %zu x %zu\n", 
+               rows_A, cols_A, rows_B, cols_B);
+        return std::vector<std::vector<double> >();
+    }
 
     std::vector<std::vector<double> > C(rows_A, std::vector<double>(cols_B, 0.0));
 
@@ -94,19 +151,36 @@ void PCA::gramSchmidt(std::vector<std::vector<double> >& matrix)
 {
     size_t num_cols = matrix[0].size();
 
-    for (size_t i = 1; i < num_cols; ++i)
+    for (size_t i = 0; i < num_cols; ++i)
     {
-        for (size_t j = 0; j < i; ++j)
-	{
+        // First normalize the current vector
+        double mag = 0.0;
+        for (size_t k = 0; k < num_cols; ++k)
+        {
+            mag += matrix[k][i] * matrix[k][i];
+        }
+        mag = std::sqrt(mag);
+        
+        if (mag > 1e-10)
+        {
+            for (size_t k = 0; k < num_cols; ++k)
+            {
+                matrix[k][i] /= mag;
+            }
+        }
+        
+        // Now make it orthogonal to all subsequent vectors
+        for (size_t j = i + 1; j < num_cols; ++j)
+        {
             double dot_product = 0.0;
             for (size_t k = 0; k < num_cols; ++k)
-	    {
+            {
                 dot_product += matrix[k][i] * matrix[k][j];
             }
 
             for (size_t k = 0; k < num_cols; ++k)
-	    {
-                matrix[k][i] -= dot_product * matrix[k][j];
+            {
+                matrix[k][j] -= dot_product * matrix[k][i];
             }
         }
     }
@@ -119,6 +193,8 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     sorted_eig_vecs.clear();
     variance_explained.clear();
     reconstructed_data.clear();
+    component_mapping.clear(); // Clear the component mapping
+    reverse_component_mapping.clear(); // Clear the reverse component mapping
 
     size_t num_samples = data.size();
     if (num_samples == 0) {
@@ -299,6 +375,9 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
 
     std::vector<double> sorted_eig_vals(num_features, 0.0);
     sorted_eig_vecs.resize(num_features, std::vector<double>(num_features, 0.0));
+    component_mapping.resize(num_features); // Resize the mapping vector
+    
+    // Create both forward and reverse mappings
     for (size_t i = 0; i < num_features; ++i)
     {
         size_t index = eig_pairs[i].second;
@@ -307,6 +386,65 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
         {
             sorted_eig_vecs[i][j] = eig_vecs[index][j];
         }
+    }
+
+    // Find the most important original feature for each principal component
+    for (size_t i = 0; i < num_features; ++i) {
+        // Find the original feature that has the highest contribution to this PC
+        size_t max_feature_idx = 0;
+        double max_contribution = std::fabs(sorted_eig_vecs[i][0]);
+        
+        for (size_t j = 1; j < num_features; ++j) {
+            double contribution = std::fabs(sorted_eig_vecs[i][j]);
+            if (contribution > max_contribution) {
+                max_contribution = contribution;
+                max_feature_idx = j;
+            }
+        }
+        
+        // Map this principal component to the original feature it most represents
+        component_mapping[i] = max_feature_idx;
+        reverse_component_mapping[max_feature_idx] = i;
+    }
+    
+    // Handle any missing mappings (if a feature wasn't mapped to any PC)
+    std::vector<bool> original_features_mapped(num_features, false);
+    for (size_t i = 0; i < num_features; ++i) {
+        original_features_mapped[component_mapping[i]] = true;
+    }
+    
+    // For any unmapped original features, map them to the remaining PCs
+    size_t pc_index = 0;
+    for (size_t i = 0; i < num_features; ++i) {
+        if (!original_features_mapped[i]) {
+            // Find next unmapped PC
+            while (pc_index < num_features && 
+                   reverse_component_mapping.find(component_mapping[pc_index]) != reverse_component_mapping.end()) {
+                pc_index++;
+            }
+            
+            if (pc_index < num_features) {
+                component_mapping[pc_index] = i;
+                reverse_component_mapping[i] = pc_index;
+                pc_index++;
+            }
+        }
+    }
+
+    // Print component mapping information for debugging
+    printf("Component mapping (PC index -> original feature):\n");
+    for (size_t i = 0; i < num_features; ++i) {
+        printf("  PC %u -> Original Feature %u (contribution: %.4f)\n", 
+               static_cast<unsigned int>(i), 
+               static_cast<unsigned int>(component_mapping[i]),
+               std::fabs(sorted_eig_vecs[i][component_mapping[i]]));
+    }
+    
+    printf("Reverse mapping (original feature -> PC index):\n");
+    for (size_t i = 0; i < num_features; ++i) {
+        printf("  Original Feature %u -> PC %u\n", 
+               static_cast<unsigned int>(i), 
+               static_cast<unsigned int>(reverse_component_mapping[i]));
     }
 
     for (size_t i = 0; i < num_features; ++i)
@@ -418,6 +556,105 @@ void PCA::compute(const std::vector<std::vector<double> >& data)
     std::cout << "Reconstruction error: " << reconstruction_error << std::endl;
 }
 
+// Get the importance of each original feature based on the principal components
+std::vector<double> PCA::getFeatureImportance() const
+{
+    size_t num_features = variance_explained.size();
+    std::vector<double> feature_importance(num_features, 0.0);
+    
+    if (num_features == 0) {
+        printf("Warning: No components found. Run compute() first.\n");
+        return feature_importance;
+    }
+    
+    // Calculate feature importance by considering contributions from all principal components
+    for (size_t i = 0; i < num_features; ++i) {  // For each PC
+        for (size_t j = 0; j < num_features; ++j) {  // For each original feature
+            // Add the weighted contribution of this feature to this PC
+            double weight = std::fabs(sorted_eig_vecs[i][j]);
+            feature_importance[j] += weight * weight * variance_explained[i];
+        }
+    }
+    
+    // Normalize feature importance to sum to 1.0
+    double total_importance = 0.0;
+    for (size_t i = 0; i < num_features; ++i) {
+        total_importance += feature_importance[i];
+    }
+    
+    if (total_importance > 1e-10) {
+        for (size_t i = 0; i < num_features; ++i) {
+            feature_importance[i] /= total_importance;
+        }
+    } else {
+        // If total importance is near zero, distribute evenly
+        double equal_importance = 1.0 / num_features;
+        for (size_t i = 0; i < num_features; ++i) {
+            feature_importance[i] = equal_importance;
+        }
+    }
+    
+    return feature_importance;
+}
+
+// Get the original feature index for a given principal component
+size_t PCA::getOriginalFeatureIndex(size_t component_index) const
+{
+    if (component_index >= component_mapping.size()) {
+        printf("Error: Component index %u out of bounds (max: %u).\n", 
+               static_cast<unsigned int>(component_index), 
+               component_mapping.size() > 0 ? static_cast<unsigned int>(component_mapping.size() - 1) : 0);
+        return 0;
+    }
+    
+    return component_mapping[component_index];
+}
+
+// Get the principal component index for a given original feature
+size_t PCA::getComponentIndex(size_t feature_index) const
+{
+    std::map<size_t, size_t>::const_iterator it = reverse_component_mapping.find(feature_index);
+    
+    if (it == reverse_component_mapping.end()) {
+        printf("Error: Feature index %u not found in component mapping.\n", 
+               static_cast<unsigned int>(feature_index));
+        return 0;
+    }
+    
+    return it->second;
+}
+
+// Display information about component mappings
+void PCA::printComponentMapping() const
+{
+    printf("\n--------- PCA Component Mapping ---------\n");
+    
+    if (component_mapping.empty()) {
+        printf("No component mapping available. Run compute() first.\n");
+        return;
+    }
+    
+    printf("PC Index | Original Feature | Variance Explained\n");
+    printf("------------------------------------------\n");
+    
+    for (size_t i = 0; i < component_mapping.size(); ++i) {
+        printf("  %3u    |       %3u        |     %.2f%%\n", 
+               static_cast<unsigned int>(i), 
+               static_cast<unsigned int>(component_mapping[i]), 
+               variance_explained[i] * 100.0);
+    }
+    
+    printf("\nFeature Importance (based on variance explained):\n");
+    std::vector<double> importance = getFeatureImportance();
+    for (size_t i = 0; i < importance.size(); ++i) {
+        printf("  Feature %3u: %.2f%%\n", 
+               static_cast<unsigned int>(i), 
+               importance[i] * 100.0);
+    }
+    
+    printf("------------------------------------------\n\n");
+}
+
 void PCA::calculate_arrow_head(double x1, double y1, double x2, double y2)
 {
     double angle = std::atan2(static_cast<double>(y2 - y1), static_cast<double>(x2 - x1));
@@ -445,6 +682,39 @@ void pca_example(const std::vector<std::vector<double> >& data, std::vector<std:
 
     PCA pca;
     pca.compute(dataset);
+    
+    // Display the component mapping information
+    pca.printComponentMapping();
+    
+    // Example of using the mapping functions
+    printf("\nMapping examples:\n");
+    
+    // Original features to principal components
+    for (size_t i = 0; i < 2; ++i) {
+        printf("Original feature %u is represented by PC %u\n", 
+               static_cast<unsigned int>(i), 
+               static_cast<unsigned int>(pca.getComponentIndex(i)));
+    }
+    
+    // Principal components to original features
+    for (size_t i = 0; i < 2; ++i) {
+        printf("PC %u corresponds to original feature %u\n", 
+               static_cast<unsigned int>(i), 
+               static_cast<unsigned int>(pca.getOriginalFeatureIndex(i)));
+    }
+    
+    // Get feature importance
+    std::vector<double> importance = pca.getFeatureImportance();
+    printf("\nFeature importance:\n");
+    for (size_t i = 0; i < importance.size(); ++i) {
+        printf("Feature %u importance: %.2f%%\n", 
+               static_cast<unsigned int>(i), 
+               importance[i] * 100.0);
+    }
+    
+    // Copy the results to the output parameters
+    transformed_data = pca.transformed_data;
+    sorted_eig_vecs = pca.sorted_eig_vecs;
 
     for (size_t i = 0; i < sorted_eig_vecs.size(); ++i)
     {

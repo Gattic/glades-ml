@@ -23,6 +23,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <map>
 
 namespace glades
 {
@@ -31,9 +32,6 @@ class PCA
 {
 protected:
     //
-    // Custom comparison function for sorting in descending order
-    static bool compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2);
-
     // Helper function to compute the mean of a vector of numbers
     double compute_mean(const std::vector<double>& data);
 
@@ -50,15 +48,36 @@ protected:
     // Gram-Schmidt orthogonalization
     void gramSchmidt(std::vector<std::vector<double> >& matrix);
 
+    // Internal component mappings
+    std::vector<size_t> component_mapping; // Maps sorted component index to original feature index
+    std::map<size_t, size_t> reverse_component_mapping; // Maps original feature index to sorted component index
+
 public:
+    // Custom comparison function for sorting in descending order
+    static bool compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2);
+    
+    // Same function but for pairs of double and size_t
+    static bool compare_value_index_pairs(const std::pair<double, size_t>& pair1, const std::pair<double, size_t>& pair2);
 
     std::vector<std::vector<double> > transformed_data;
     std::vector<std::vector<double> > sorted_eig_vecs;
     std::vector<double> variance_explained;
-    std::vector<std::vector<double> >  reconstructed_data;
+    std::vector<std::vector<double> > reconstructed_data;
 
     // Main function to compute PCA, return reconstructed data
     void compute(const std::vector<std::vector<double> >& data);
+    
+    // Get the importance of each original feature
+    std::vector<double> getFeatureImportance() const;
+    
+    // Get the original feature index for a given principal component
+    size_t getOriginalFeatureIndex(size_t component_index) const;
+    
+    // Get the principal component index for a given original feature
+    size_t getComponentIndex(size_t feature_index) const;
+    
+    // Display information about component mappings
+    void printComponentMapping() const;
 
     static void calculate_arrow_head(double x1, double y1, double x2, double y2);
 };

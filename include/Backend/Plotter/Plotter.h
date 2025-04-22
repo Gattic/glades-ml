@@ -147,6 +147,9 @@ public:
     ChartBuilder& addHistogramData(const std::vector<int>& bins, 
                                   const RGBA& color = RGBA(), 
                                   bool showXAxisLabels = true);
+    ChartBuilder& addHistogramDataWithLabels(const std::vector<int>& bins, 
+                                           const std::vector<std::string>& labels,
+                                           const RGBA& color = RGBA());
     ChartBuilder& addCandlestickData(const std::vector<CandleData>& candles,
                                     const RGBA& bullishColor = RGBA(0x03, 0xC0, 0x3C, 0xFF),
                                     const RGBA& bearishColor = RGBA(0xFF, 0x47, 0x45, 0xFF));
@@ -175,6 +178,8 @@ private:
     std::vector<int> histogramBins;
     RGBA histogramColor;
     bool histogramShowXAxisLabels;
+    bool hasLabeledHistogramData;
+    std::vector<std::string> histogramLabels;
     bool hasCandlestickData;
     std::vector<CandleData> candlestickData;
     RGBA bullishColor;
@@ -234,7 +239,7 @@ public:
     void setYAxisLabel(const std::string& label);
     
     // Logo handling
-    void loadLogo(const std::string& logoPath);
+    void loadLogo(const std::string& logoPath, bool = false);
     void drawLogo();
     
     // Output methods
@@ -251,10 +256,6 @@ public:
                   const std::string& xAxisLabel = "X Value",
                   const std::string& yAxisLabel = "Y Value");
                   
-    // Legacy API support - maintained for backward compatibility
-    void plotPoints(const std::vector<Point>& points, const RGBA& color, int pointSize = 8, bool redrawBackground = true);
-    void plotLine(const std::vector<Point>& points, const RGBA& color, int lineWidth = 2, bool redrawBackground = true);
-    
     // Arrow visualization methods
     void plotArrows(const std::vector<Arrow>& arrows, bool redrawBackground = false);
     void plotArrow(const Arrow& arrow, bool redrawBackground = false);
@@ -279,6 +280,14 @@ public:
                       const std::string& xAxisLabel,
                       const std::string& yAxisLabel);
                       
+    // New method for histograms with custom labels
+    void plotHistogramWithLabels(const std::vector<int>& bins,
+                               const std::vector<std::string>& labels,
+                               const RGBA& color = RGBA(),
+                               const std::string& title = "Data Distribution",
+                               const std::string& xAxisLabel = "Value",
+                               const std::string& yAxisLabel = "Frequency");
+                      
     void plotCandlestickChart(const std::vector<CandleData>& candles,
                              const RGBA& bullishColor,
                              const RGBA& bearishColor,
@@ -296,15 +305,6 @@ public:
     // Control centroid alignment with cluster centers (public API)
     void setAlignCentroidsWithClusters(bool align);
     bool getAlignCentroidsWithClusters() const;
-    
-    // Legacy multi-series method - now wrapped by plotChart
-    void plotMultiSeries(const std::vector<std::vector<Point> >& seriesData,
-                        const std::vector<std::string>& seriesLabels,
-                        const std::vector<RGBA>& seriesColors,
-                        const std::vector<bool>& isLineStyleSeries,
-                        const std::string& title = "Multi-Series Visualization",
-                        const std::string& xAxisLabel = "X Value",
-                        const std::string& yAxisLabel = "Y Value");
     
     // Direct access to GridRenderer for Y-axis ticks - consider using chart builder instead
     GridRenderer& getGridRenderer() { return *gridRenderer; }
@@ -334,6 +334,10 @@ private:
     static bool logoLoaded;
     static bool hasLogo;
     static Image logoImage;
+    static int logoWidth;
+    static int logoHeight;
+    static int logoWidthScaled;
+    static int logoHeightScaled;
     
     // Data axis ranges for origin axes
     DataMapper::AxisRange currentXAxisRange;
