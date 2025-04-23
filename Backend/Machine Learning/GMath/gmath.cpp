@@ -19,6 +19,10 @@
 
 using namespace glades;
 
+// Define static class constants
+const float glades::GMath::INLIER = 0.954f;
+const float glades::GMath::OUTLIER = 0.046f;
+
 float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 {
 	float netOutput = 0.0f;
