@@ -60,9 +60,6 @@ class NNetwork
 private:
 	friend MetaNetwork;
 
-	DataInput* di;
-	NNInfo* skeleton;
-	LayerBuilder meat;
 	CMatrix confusionMatrix;
 	GNet::GServer* serverInstance;
 	GNet::Connection* cConnection;
@@ -85,7 +82,6 @@ private:
 	bool firstRunActivation;
 
 	// for tables & graphs
-	shmea::GList learningCurve;
 	std::vector<Point2*> rocCurve;
 	shmea::GList results;
 	shmea::GTable nbRecord;
@@ -106,6 +102,9 @@ public:
 	static const int RUN_TEST = 1;
 	static const int RUN_VALIDATE = 2;
 
+	DataInput* di;
+	NNInfo* skeleton;
+	LayerBuilder meat;
 	Terminator terminator;
 
 	NNetwork(int=TYPE_DFF);
@@ -131,8 +130,6 @@ public:
 	float getAccuracy() const;
 
 	// graphing
-	shmea::GList getLearningCurve() const;
-	// const std::vector<Point2*>& getROCCurve() const;
 	shmea::GList getResults() const;
 	void clean();
 	void resetGraphs();

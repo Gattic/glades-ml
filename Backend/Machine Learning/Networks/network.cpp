@@ -752,16 +752,6 @@ void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* new
 	cConnection = newConnection;
 }
 
-shmea::GList glades::NNetwork::getLearningCurve() const
-{
-	return learningCurve;
-}
-
-// const std::vector<Point2*>& NNetwork::getROCCurve() const
-// {
-// 	return rocCurve;
-// }
-
 shmea::GList glades::NNetwork::getResults() const
 {
 	return results;
@@ -788,13 +778,6 @@ void glades::NNetwork::clean()
 
 void glades::NNetwork::resetGraphs()
 {
-	learningCurve.clear();
-
-	/*for (unsigned int i = 0; i < rocCurve.size(); ++i)
-		delete rocCurve[i];*/
-	rocCurve.clear();
-	rocCurve.reserve(10000); // arbitrary number
-
 	// create the results again
 	results.clear();
 }
