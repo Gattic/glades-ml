@@ -31,8 +31,8 @@ namespace glades {
 class GMath
 {
 public:
-	static const float INLIER = 0.954f;
-	static const float OUTLIER = 0.046f;
+	static const float INLIER;
+	static const float OUTLIER;
 
 	// cost function flags
 	static const int REGRESSION = 0;

@@ -54,11 +54,19 @@ public:
 	void print() const;
 	void reset();
 
+<<<<<<< HEAD
 	std::string getClassName(int) const;
  
  	// Added missing method declarations
  	int predictWithContext(const shmea::GList& context);
  	unsigned int getContextSize() const;
+=======
+	shmea::GString getClassName(int) const;
+
+	// Added missing method declarations
+	int predictWithContext(const shmea::GList& context);
+	unsigned int getContextSize() const;
+>>>>>>> origin/bayes-context
 };
 };
 
