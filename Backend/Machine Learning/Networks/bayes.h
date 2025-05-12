@@ -46,12 +46,19 @@ public:
 
 	shmea::GTable import(const shmea::GList&);
 	shmea::GTable import(const shmea::GTable&);
+
+	// New method for n-tuple import
+	shmea::GTable importNTuple(const shmea::GList& tokenizedWords, unsigned int n);
 	void train(const shmea::GTable&);
 	int predict(const shmea::GList&);
 	void print() const;
 	void reset();
 
 	shmea::GString getClassName(int) const;
+
+	// Added missing method declarations
+	int predictWithContext(const shmea::GList& context);
+	unsigned int getContextSize() const;
 };
 };
 
