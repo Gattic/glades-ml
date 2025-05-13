@@ -279,6 +279,18 @@ void glades::Layer::print() const
 	printf("\n");
 }
 
+void glades::Layer::perform1DConvolution(const std::vector<float>& input, std::vector<float>& output, int contextWindowSize) {
+    // Implement 1D convolution operation
+    // Ensure the method handles context windows appropriately
+    for (size_t i = 0; i < input.size() - contextWindowSize + 1; ++i) {
+        float sum = 0.0f;
+        for (int j = 0; j < contextWindowSize; ++j) {
+            sum += input[i + j] * getNode(j)->getWeight();
+        }
+        output[i] = sum;
+    }
+}
+
 Node* glades::Layer::operator[](unsigned int index)
 {
 	if (index >= size())
@@ -287,13 +299,4 @@ Node* glades::Layer::operator[](unsigned int index)
 	return children[index];
 }
 
-void Layer::setupContext()
-{
-	for(unsigned int i=0;i<children.size();++i)
-	{
-		printf("SETUP CONTEXT: %u\n", i);
-		shmea::GPointer<Node> newNode(new Node());
-		newNode->initWeights(1, Node::INIT_POSRAND);
-		children[i]->setContextNode(newNode);
-	}
-}
+

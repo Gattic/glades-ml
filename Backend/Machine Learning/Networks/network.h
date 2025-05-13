@@ -58,8 +58,12 @@ class MetaNetwork;
 class NNetwork
 {
 private:
+	friend RNN;
 	friend MetaNetwork;
 
+	DataInput* di;
+	NNInfo* skeleton;
+	LayerBuilder meat;
 	CMatrix confusionMatrix;
 	GNet::GServer* serverInstance;
 	GNet::Connection* cConnection;
@@ -82,6 +86,7 @@ private:
 	bool firstRunActivation;
 
 	// for tables & graphs
+	shmea::GList learningCurve;
 	std::vector<Point2*> rocCurve;
 	shmea::GList results;
 	shmea::GTable nbRecord;
@@ -102,13 +107,10 @@ public:
 	static const int RUN_TEST = 1;
 	static const int RUN_VALIDATE = 2;
 
-	DataInput* di;
-	NNInfo* skeleton;
-	LayerBuilder meat;
 	Terminator terminator;
 
-	NNetwork(int=TYPE_DFF);
-	NNetwork(NNInfo*, int=TYPE_DFF);
+	NNetwork();
+	NNetwork(NNInfo*);
 	virtual ~NNetwork();
 	int64_t getCurrentTimeMilliseconds() const;
 	bool getRunning() const;
@@ -123,7 +125,7 @@ public:
 	// Stochastic Gradient Descent
 	void train(DataInput*);
 	void test(DataInput*);
-
+	void setInputData(const std::vector<std::vector<float>>& images, const std::vector<int>& labels);	
 	int64_t getID() const;
 	shmea::GString getName() const;
 	NNInfo* getNNInfo();
@@ -131,6 +133,8 @@ public:
 
 	// graphing
 	shmea::GList getResults() const;
+	// const std::vector<Point2*>& getROCCurve() const;
+	shmea::GList getResults() const;	
 	void clean();
 	void resetGraphs();
 };

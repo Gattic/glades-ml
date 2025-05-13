@@ -128,7 +128,33 @@ void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataIn
 		for (unsigned int c = 0; c < featureCount; ++c)
 		{
 			// We can probably get rid of most of these conditions becuase Gtype auto types
-			float newWeight = di->getTrainRow(r)[c];
+			float newWeight = 0.0f;
+			shmea::GType cCell = di->getTrainRow(r)[c];
+
+			shmea::GType::Type cellType = cCell.getType(); 
+			// printf("Cell type %s",cellType);
+
+			switch (cellType)
+			{
+				case shmea::GType::STRING_TYPE:
+					if (!di->featureIsCategorical[c])
+					{
+						inputLayers.clear();
+						return;
+					}
+					break;
+				case shmea::GType::CHAR_TYPE:   newWeight = cCell.getChar();   break;
+				case shmea::GType::SHORT_TYPE:  newWeight = cCell.getShort();  break;
+				case shmea::GType::INT_TYPE:    newWeight = cCell.getInt();    break;
+				case shmea::GType::LONG_TYPE:   newWeight = cCell.getLong();   break;
+				case shmea::GType::FLOAT_TYPE:  newWeight = cCell.getFloat();  break;
+				case shmea::GType::DOUBLE_TYPE: newWeight = cCell.getDouble(); break;
+				case shmea::GType::BOOLEAN_TYPE:
+					newWeight = cCell.getBoolean() ? 1.0f : 0.0f;
+					break;
+				default:
+					break;  // Skip unsupported types
+			}
 
 			// Error
 			Node* node = new Node();
@@ -194,8 +220,6 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 
 			cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_XAVIER, activationType);
 		}
-
-		cLayer->setupContext();
 		layers.push_back(cLayer);
 		prevLayerSize = cLayerSize;
 	}
@@ -548,6 +572,44 @@ void glades::LayerBuilder::clean()
 	xRange = 0.0f;
 }
 
+void glades::LayerBuilder::build1DConvolutionalLayers(const NNInfo* skeleton) {
+    int inputLayerSize = inputLayers[0]->size();
+    int outputLayerSize = skeleton->getOutputLayerSize();
+    int prevLayerSize = inputLayerSize;
+    int outputType = skeleton->getOutputType();
+    bool isPositive = false;
+    int activationType;
+
+    // Create each 1D convolutional layer
+    for (int i = 0; i < skeleton->numHiddenLayers(); ++i) {
+        activationType = skeleton->getActivationType(i);
+        // Get the current layer size
+        int cLayerSize = skeleton->getHiddenLayerSize(i);
+        Layer* cLayer = new Layer(Layer::HIDDEN_TYPE);
+
+        if (isPositive) {
+            // Create the 1D convolutional layer
+            cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_POSXAVIER, activationType);
+        } else {
+            // Check if positive
+            if ((activationType == GMath::SIGMOID) || (activationType == GMath::RELU) ||
+                (activationType == GMath::LEAKY) || (outputType == GMath::CLASSIFICATION)) {
+                isPositive = true;
+                i = -1;
+                for (unsigned int j = 0; j < layers.size(); ++j)
+                    delete layers[j];
+                layers.clear();
+                continue;
+            }
+
+            cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_XAVIER, activationType);
+        }
+
+        layers.push_back(cLayer);
+        prevLayerSize = cLayerSize;
+    }
+}
+
 // Database
 /*!
  * @brief load network
@@ -638,7 +700,7 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 {
 	shmea::SaveFolder* nnList = new shmea::SaveFolder(netName.c_str());
 
-	shmea::GVector<shmea::GString> layerHeaders, edgeHeaders;
+	std::vector<shmea::GString> layerHeaders, edgeHeaders;
 	layerHeaders.push_back("BiasWeight");
 	edgeHeaders.push_back("layerID");
 	edgeHeaders.push_back("nodeID");
