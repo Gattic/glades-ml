@@ -548,6 +548,44 @@ void glades::LayerBuilder::clean()
 	xRange = 0.0f;
 }
 
+void glades::LayerBuilder::build1DConvolutionalLayers(const NNInfo* skeleton) {
+    int inputLayerSize = inputLayers[0]->size();
+    int outputLayerSize = skeleton->getOutputLayerSize();
+    int prevLayerSize = inputLayerSize;
+    int outputType = skeleton->getOutputType();
+    bool isPositive = false;
+    int activationType;
+
+    // Create each 1D convolutional layer
+    for (int i = 0; i < skeleton->numHiddenLayers(); ++i) {
+        activationType = skeleton->getActivationType(i);
+        // Get the current layer size
+        int cLayerSize = skeleton->getHiddenLayerSize(i);
+        Layer* cLayer = new Layer(Layer::HIDDEN_TYPE);
+
+        if (isPositive) {
+            // Create the 1D convolutional layer
+            cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_POSXAVIER, activationType);
+        } else {
+            // Check if positive
+            if ((activationType == GMath::SIGMOID) || (activationType == GMath::RELU) ||
+                (activationType == GMath::LEAKY) || (outputType == GMath::CLASSIFICATION)) {
+                isPositive = true;
+                i = -1;
+                for (unsigned int j = 0; j < layers.size(); ++j)
+                    delete layers[j];
+                layers.clear();
+                continue;
+            }
+
+            cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_XAVIER, activationType);
+        }
+
+        layers.push_back(cLayer);
+        prevLayerSize = cLayerSize;
+    }
+}
+
 // Database
 /*!
  * @brief load network
