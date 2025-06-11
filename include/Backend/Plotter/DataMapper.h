@@ -29,6 +29,17 @@ public:
             : timestamp(t), open(o), close(c), high(h), low(l) {}
     };
 
+    struct CandleXAxis
+    {
+	double timestamp;
+        std::string timeLabel;
+        CandleXAxis() : timestamp(0.0), timeLabel("0") {}
+        CandleXAxis(double t, std::string tl)
+	    : timestamp(t), timeLabel(tl) {}
+
+
+    };
+
     struct AxisRange {
         double min;
         double max;

@@ -3,6 +3,7 @@
 
 #include "../Database/image.h"
 #include "DataMapper.h"
+#include <map>
 #include <string>
 #include <vector>
 #include <ft2build.h>
@@ -194,8 +195,11 @@ private:
 // Plotter class that handles visualization using the component classes
 class Plotter {
 public:
+    static std::map<unsigned int, std::string> AGG_SIZE;
     // Constructor and destructor
     Plotter(unsigned int width = 800, unsigned int height = 600, unsigned int ssaa_factor = 1);
+
+    void initAggSize();
 
     void initialize_font(const std::string);
     
@@ -235,7 +239,7 @@ public:
     void addTitle(const std::string& text, unsigned int fontSize = 24);
     void addAxisLabels(const std::string& xLabel, const std::string& yLabel, unsigned int fontSize = 18);
     int addLegend(const std::vector<std::string>& labels, const std::vector<RGBA>& colors,
-                  int x, int y, unsigned int fontSize = 18);
+                  int x, int y, unsigned int fontSize = 18, bool _new = false, bool redraw = false);
     void setYAxisLabel(const std::string& label);
     
     // Logo handling
@@ -255,7 +259,13 @@ public:
                   const std::string& title = "Chart Visualization",
                   const std::string& xAxisLabel = "X Value",
                   const std::string& yAxisLabel = "Y Value");
-                  
+         
+    void plotChart(const std::vector<Series>& seriesList,
+                        const DataMapper::AxisRange& xRange,
+                        const DataMapper::AxisRange& yRange,
+			const std::vector<CandleData>& candles = std::vector<CandleData>());
+
+         
     // Arrow visualization methods
     void plotArrows(const std::vector<Arrow>& arrows, bool redrawBackground = false);
     void plotArrow(const Arrow& arrow, bool redrawBackground = false);
@@ -288,7 +298,7 @@ public:
                                const std::string& xAxisLabel = "Value",
                                const std::string& yAxisLabel = "Frequency");
                       
-    void plotCandlestickChart(const std::vector<CandleData>& candles,
+    void plotCandlestickChart(const std::vector<DataMapper::CandleData>& candles,
                              const RGBA& bullishColor,
                              const RGBA& bearishColor,
                              const std::string& title,
@@ -312,6 +322,11 @@ public:
 private:
     friend class ChartBuilder;
     
+    RGBA bullishColor;
+    RGBA bearishColor;
+    int lastLegendY;
+    
+
     // Component pointers
     ColorManager* colorManager;
     SuperSamplingManager* ssaaManager;
@@ -392,7 +407,7 @@ private:
     void calculateCandlestickRanges(const std::vector<DataMapper::CandleData>& candles,
                                   DataMapper::AxisRange& timeRange,
                                   DataMapper::AxisRange& priceRange);
-    std::vector<std::string> createTimeLabels(double minTime, double maxTime, int numLabels);
+    std::vector<DataMapper::CandleXAxis> createTimeLabels(double minTime, double maxTime,int numLabels);
     
     // Helper methods - cluster specific
     std::vector<RGBA> prepareClusterColors(int numClusters);

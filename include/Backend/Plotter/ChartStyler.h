@@ -32,7 +32,7 @@ public:
     
     // Add a legend to the chart
     int addLegend(const std::vector<std::string>& labels, const std::vector<RGBA>& colors, 
-                 int x, int y, unsigned int fontSize = 18);
+                 int x, int y, unsigned int fontSize = 18, bool _new = false, bool redraw = false);
     
     // Histogram styling
     void drawHistogramStats(const std::vector<int>& bins, int maxBinValue, int legendY, unsigned int fontSize = 16);
@@ -81,6 +81,8 @@ private:
     TextRenderer& text;
     GridRenderer& grid;
     DataMapper& dataMapper;
+    std::vector<std::string> legendLabels;
+    std::vector<RGBA> legendColors;
 };
 
 } // namespace shmea

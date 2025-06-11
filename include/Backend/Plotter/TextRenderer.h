@@ -28,9 +28,6 @@ public:
     // Draw text rotated for y-axis labels
     void drawVerticalText(const std::string& text, int x, int y, int fontSize, const RGBA& color);
     
-    // Add title to the visualization
-    void addTitle(const std::string& text, unsigned int fontSize = 36);
-    
     // Add axis labels
     void drawAxisLabels(const std::string& xLabel, const std::string& yLabel, 
                        unsigned int fontSize, bool centerX = true);
