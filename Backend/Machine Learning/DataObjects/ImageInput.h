@@ -67,6 +67,7 @@ public:
 	void importHelper(shmea::GTable&, std::vector<OHE*>&, std::vector<bool>&, std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > >&);
 
 	virtual void import(shmea::GString);
+	virtual void import(const shmea::GTable&);
 	const shmea::GPointer<shmea::Image> getTrainImage(unsigned int) const;
 	const shmea::GPointer<shmea::Image> getTestImage(unsigned int) const;
 

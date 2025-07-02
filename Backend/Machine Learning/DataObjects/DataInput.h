@@ -49,6 +49,7 @@ public:
 	std::vector<bool> testingFeatureIsCategorical;
 
 	virtual void import(shmea::GString) = 0;
+	virtual void import(const shmea::GTable&) = 0;
 
 	virtual shmea::GVector<float> getTrainRow(unsigned int) const = 0;
 	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int) const = 0;

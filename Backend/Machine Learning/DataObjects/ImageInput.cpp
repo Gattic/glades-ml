@@ -174,6 +174,10 @@ void ImageInput::import(shmea::GString newName)
     loaded = true;
 }
 
+void ImageInput::import(const shmea::GTable&)
+{
+}
+
 const shmea::GPointer<shmea::Image> ImageInput::getTrainImage(unsigned int row) const
 {
     if(row >= trainingLegend.numberOfRows())

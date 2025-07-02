@@ -71,7 +71,9 @@ public:
 	}
 
 	virtual void import(shmea::GString);
-	void standardizeInputTable(const shmea::GString&, int = 0);
+	virtual void import(const shmea::GTable&);
+//	void standardizeInputTable(const shmea::GString&, int = 0, bool = true);
+	void standardizeInputTable(const shmea::GTable&, int = 0, bool = true);
 
 	virtual shmea::GVector<float> getTrainRow(unsigned int) const;
 	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int) const;
