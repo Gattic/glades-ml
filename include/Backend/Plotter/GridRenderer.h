@@ -7,6 +7,7 @@
 #include "ChartLayout.h"
 #include "ShapeRenderer.h"
 #include "DataMapper.h"
+#include "Plotter.h"
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
@@ -42,6 +43,7 @@ public:
     
     // Draw X-axis and Y-axis tick marks and labels
     void drawCandleXAxisTicks(const std::vector<DataMapper::CandleData>& candles, const std::vector<DataMapper::CandleXAxis>& labels, int startingOffset=1, int candleOffset=0);
+    void drawXAxisTicks(const std::vector<DataMapper::CandleXAxis>& labels, const Series& series);
     void drawXAxisTicks(const std::vector<std::string>& labels, int numTicks, XPositionMode xMode = X_START, int startingOffset = 0);
     void drawXAxisTicks(double minValue, double maxValue, int numTicks, int precision = 1);
     void drawYAxisTicks(double minValue, double maxValue, int numTicks, bool isInteger = false, 
