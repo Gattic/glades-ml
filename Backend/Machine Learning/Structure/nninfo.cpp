@@ -870,7 +870,19 @@ bool glades::NNInfo::load(const shmea::GString& netName)
 {
 	name = netName;
 	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
-	return fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
+	bool success = fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
+	if(success)
+	{
+	    //for each hidden layer:
+	    for(unsigned int i = 0; i < layers.size(); ++i)
+	    {
+		layers[i]->setUseBatchNorm(true);  // Enable for first hidden layer
+		layers[i]->setBatchNormMomentum(0.9f);
+	        layers[i]->setBatchNormEpsilon(1e-5f);
+	    }
+	}
+
+	return success;
 }
 
 void glades::NNInfo::save() const

@@ -34,7 +34,7 @@ void NumberInput::import(shmea::GString fname)
     name = fname;
 
     // Load and Normalize/Standardize the data
-    standardizeInputTable(fname);
+    standardizeInputTable(fname, 1);
 
     // TODO: test table stuff
 
