@@ -116,6 +116,7 @@ void glades::CMatrix::updateResultParams()
 			}
 			else
 			{
+                /*
 				// row == col needs third loop for TN's
 				for (int itr = 0; itr < size; ++itr)
 				{
@@ -124,7 +125,14 @@ void glades::CMatrix::updateResultParams()
 					else
 						trueNegative.setGType(itr, (trueNegative.getInt(itr) + value.getInt()));
 				}
+                */
+                truePositive.setGType(row, value);
 			}
+            for (int itr = 0; itr < size; ++itr)
+            {
+                if (itr != row && itr != col)
+                    trueNegative.setGType(itr, (trueNegative.getInt(itr) + value.getInt()));
+            }
 		}
 	}
 }
@@ -278,15 +286,17 @@ float glades::CMatrix::getClassMCC(unsigned int index) const
 	float numerator = (tp * tn) - (fp * fn);
 	float denominator = sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn));
 
-	return (numerator / denominator);
+	return 100 * (numerator / denominator);
 }
 
 float glades::CMatrix::getOverallMCC() const
 {
 	float totalMCC = 0.0f;
 
-	for (unsigned int i = 0; i < matrix.numberOfRows(); ++i)
-		totalMCC += getClassMCC(i);
+	for (unsigned int i = 0; i < matrix.numberOfRows(); ++i) {
+        float classMCC = getClassMCC(i);
+		totalMCC += std::isnan(classMCC) ? 0 : classMCC;
+    }
 
 	totalMCC /= ((float)(matrix.numberOfRows()));
 
