@@ -16,5 +16,6 @@
 #include <unistd.h>
 
 void NNCFUnitTest();
+void NNCFUnitTestNew();
 
 #endif
