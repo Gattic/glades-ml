@@ -102,6 +102,12 @@ public:
 	float applyBatchNorm(unsigned int index, float input, bool training = true);
 	float getBatchNormGradient(unsigned int index, float gradient);
 	void resetBatchNormCache();
+	
+	// Batch normalization parameter updates
+	void updateBatchNormGamma(unsigned int index, float gradient, float learningRate);
+	void updateBatchNormBeta(unsigned int index, float gradient, float learningRate);
+	float getBatchNormGammaGradient(unsigned int index, float inputGradient, float normalized);
+	float getBatchNormBetaGradient(unsigned int index, float inputGradient);
 };
 };
 

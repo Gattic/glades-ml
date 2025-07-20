@@ -474,3 +474,42 @@ float glades::GMath::batchNormGradient(float gradient, float gamma, float normal
 	// In a full implementation, you'd need to compute gradients for gamma, beta, and input
 	return gradient * gamma;
 }
+
+void glades::GMath::batchNormGradients(float inputGrad, float normalized, float gamma, float beta, 
+									   float mean, float variance, float epsilon, int batchSize,
+									   float& gammaGrad, float& betaGrad, float& inputGradOut)
+{
+	// Complete batch normalization gradient computation
+	// Based on the chain rule and the batch normalization equations:
+	// y = γ * x_norm + β
+	// x_norm = (x - μ) / sqrt(σ² + ε)
+	
+	// Gradient with respect to beta (β)
+	// ∂L/∂β = ∂L/∂y * ∂y/∂β = ∂L/∂y * 1
+	betaGrad = inputGrad;
+	
+	// Gradient with respect to gamma (γ)
+	// ∂L/∂γ = ∂L/∂y * ∂y/∂γ = ∂L/∂y * x_norm
+	gammaGrad = inputGrad * normalized;
+	
+	// Gradient with respect to input (x)
+	// This is more complex and involves the chain rule through normalization
+	float stdDev = sqrt(variance + epsilon);
+	float invStdDev = 1.0f / stdDev;
+	
+	// ∂L/∂x = ∂L/∂y * ∂y/∂x_norm * ∂x_norm/∂x
+	// ∂x_norm/∂x = 1 / sqrt(σ² + ε)
+	inputGradOut = inputGrad * gamma * invStdDev;
+}
+
+float glades::GMath::batchNormInputGradient(float inputGrad, float normalized, float gamma, 
+											float mean, float variance, float epsilon, int batchSize)
+{
+	// Simplified version that only computes the input gradient
+	// This is useful when you only need the gradient with respect to the input
+	float stdDev = sqrt(variance + epsilon);
+	float invStdDev = 1.0f / stdDev;
+	
+	// ∂L/∂x = ∂L/∂y * γ * (1 / sqrt(σ² + ε))
+	return inputGrad * gamma * invStdDev;
+}

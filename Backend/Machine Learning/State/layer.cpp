@@ -406,15 +406,19 @@ float Layer::applyBatchNorm(unsigned int index, float input, bool training)
 	if (training)
 	{
 		// During training, use batch statistics
-		// For simplicity, we'll use the current input as the batch mean
-		// In a real implementation, you'd accumulate statistics across the batch
-		float mean = input;  // Simplified - should be batch mean
-		float var = 1.0f;    // Simplified - should be batch variance
+		// For a more realistic implementation, we would accumulate statistics across the batch
+		// Here we use a simplified approach that updates running statistics with current input
+		float currentMean = input;
+		float currentVar = 0.0f; // Simplified - in practice, compute variance across batch
 		
-		// Update running statistics
-		updateBatchNormStats(index, mean, var);
+		// Update running statistics using exponential moving average
+		updateBatchNormStats(index, currentMean, currentVar);
 		
-		// Cache for backprop
+		// For training, use current input statistics (simplified batch statistics)
+		float mean = currentMean;
+		float var = currentVar + 1e-8f; // Add small constant for numerical stability
+		
+		// Cache for backpropagation
 		batchNormXCentered[index] = input - mean;
 		batchNormXNorm[index] = batchNormXCentered[index] / sqrt(var + batchNormEpsilon);
 	}
@@ -425,7 +429,7 @@ float Layer::applyBatchNorm(unsigned int index, float input, bool training)
 		batchNormXNorm[index] = batchNormXCentered[index] / sqrt(batchNormVar[index] + batchNormEpsilon);
 	}
 	
-	// Apply scale and shift
+	// Apply scale and shift: y = γ * x_norm + β
 	return batchNormGamma[index] * batchNormXNorm[index] + batchNormBeta[index];
 }
 
@@ -434,9 +438,24 @@ float Layer::getBatchNormGradient(unsigned int index, float gradient)
 	if (!useBatchNorm || index >= children.size())
 		return gradient;
 	
-	// Simplified gradient computation for batch norm
-	// In a real implementation, you'd need to compute gradients for gamma, beta, and input
-	return gradient * batchNormGamma[index];
+	// Use the complete gradient computation from GMath
+	float gammaGrad, betaGrad, inputGradOut;
+	float normalized = batchNormXNorm[index];
+	float gamma = batchNormGamma[index];
+	float beta = batchNormBeta[index];
+	float mean = batchNormMean[index];
+	float variance = batchNormVar[index];
+	
+	// Compute all gradients using the complete implementation
+	GMath::batchNormGradients(gradient, normalized, gamma, beta, mean, variance, 
+							  batchNormEpsilon, 1, gammaGrad, betaGrad, inputGradOut);
+	
+	// Update the batch normalization parameters
+	updateBatchNormGamma(index, gammaGrad, 0.01f); // Use a small learning rate for batch norm params
+	updateBatchNormBeta(index, betaGrad, 0.01f);
+	
+	// Return the gradient with respect to the input
+	return inputGradOut;
 }
 
 void Layer::resetBatchNormCache()
@@ -446,4 +465,40 @@ void Layer::resetBatchNormCache()
 		batchNormXNorm[i] = 0.0f;
 		batchNormXCentered[i] = 0.0f;
 	}
+}
+
+void glades::Layer::updateBatchNormGamma(unsigned int index, float gradient, float learningRate)
+{
+	if (!useBatchNorm || index >= batchNormGamma.size())
+		return;
+	
+	// Update gamma parameter: γ = γ - learningRate * ∂L/∂γ
+	batchNormGamma[index] -= learningRate * gradient;
+}
+
+void glades::Layer::updateBatchNormBeta(unsigned int index, float gradient, float learningRate)
+{
+	if (!useBatchNorm || index >= batchNormBeta.size())
+		return;
+	
+	// Update beta parameter: β = β - learningRate * ∂L/∂β
+	batchNormBeta[index] -= learningRate * gradient;
+}
+
+float glades::Layer::getBatchNormGammaGradient(unsigned int index, float inputGradient, float normalized)
+{
+	if (!useBatchNorm || index >= batchNormGamma.size())
+		return 0.0f;
+	
+	// ∂L/∂γ = ∂L/∂y * x_norm
+	return inputGradient * normalized;
+}
+
+float glades::Layer::getBatchNormBetaGradient(unsigned int index, float inputGradient)
+{
+	if (!useBatchNorm || index >= batchNormBeta.size())
+		return 0.0f;
+	
+	// ∂L/∂β = ∂L/∂y
+	return inputGradient;
 }

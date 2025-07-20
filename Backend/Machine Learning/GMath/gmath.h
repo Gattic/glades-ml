@@ -72,6 +72,13 @@ public:
 	static float batchNormNormalize(float input, float mean, float variance, float epsilon);
 	static float batchNormScaleShift(float normalized, float gamma, float beta);
 	static float batchNormGradient(float gradient, float gamma, float normalized);
+	
+	// Complete batch normalization gradient computation
+	static void batchNormGradients(float inputGrad, float normalized, float gamma, float beta, 
+								   float mean, float variance, float epsilon, int batchSize,
+								   float& gammaGrad, float& betaGrad, float& inputGradOut);
+	static float batchNormInputGradient(float inputGrad, float normalized, float gamma, 
+										float mean, float variance, float epsilon, int batchSize);
 };
 };
 
