@@ -37,7 +37,7 @@ void NumberInput::import(shmea::GString fname)
     // Load and Normalize/Standardize the data
     shmea::GTable rawTable = shmea::GTable(fname, ',', shmea::GTable::TYPE_FILE);
 //    standardizeInputTable(fname);
-    standardizeInputTable(rawTable);
+    standardizeInputTable(rawTable, 1);
 
     // TODO: test table stuff
 
