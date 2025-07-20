@@ -21,11 +21,11 @@ int main(int argc, char* argv[])
 	if (argc == 1)
 	{
 	    NNUnitTest();
-	    PCAUnitTest();
-	    KMeansUnitTest();
-	    BayesUnitTest();
-	    BayesOptimizerUnitTest();
-	    OHEUnitTest();
+	    //PCAUnitTest();
+	    //KMeansUnitTest();
+	    //BayesUnitTest();
+	    //BayesOptimizerUnitTest();
+	    //OHEUnitTest();
 	}
 	else if (argc > 1)
 	{

@@ -239,7 +239,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					else
 					{
 						printf("\33[2K[NN] %d\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
-							   overallClassAccuracy, overallClassPrecision, overallClassRecall,
+							   overallClassAccuracy, mcc, overallClassPrecision, overallClassRecall,
 							   overallClassSpecificity, overallClassF1);
 						fflush(stdout);
 					}
@@ -517,6 +517,12 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 			    // Clean the output node activation for next run (cleanup)
 			    netState->cOutputNode->clearActivation();
 
+			    // Apply batch normalization if enabled
+			    if (netState->cOutputLayer->isBatchNormEnabled())
+			    {
+				    cOutputNodeActivation = netState->cOutputLayer->applyBatchNorm(cOutputNodeCounter, cOutputNodeActivation, true);
+			    }
+			    
 			    // Set Our prediction based on the cOutputNode activation
 			    int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
 			    float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
@@ -639,6 +645,12 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 		    if (!dropout)
 		    {
 			    cOutNetErrDer *= cOutputDer; // current error partial
+			    
+			    // Apply batch normalization gradient if enabled
+			    if (netState->cOutputLayer->isBatchNormEnabled())
+			    {
+				    cOutNetErrDer = netState->cOutputLayer->getBatchNormGradient(cOutputNodeCounter, cOutNetErrDer);
+			    }
 
 			    // Clean the output node err der (cleanup)
 			    if (cInputNodeCounter == netState->cInputLayer->size() - 1)

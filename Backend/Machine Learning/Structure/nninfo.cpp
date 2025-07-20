@@ -372,6 +372,48 @@ float glades::NNInfo::getActivationParam(unsigned int index) const
 	return layers[index-1]->getActivationParam();
 }
 
+bool glades::NNInfo::getUseBatchNorm(unsigned int index) const
+{
+	if (index > layers.size())
+		return false;
+
+	if(index == 0)
+	    return inputLayer->getUseBatchNorm();
+
+	if (!layers[index-1])
+		return false;
+
+	return layers[index-1]->getUseBatchNorm();
+}
+
+float glades::NNInfo::getBatchNormMomentum(unsigned int index) const
+{
+	if (index > layers.size())
+		return 0.9f;
+
+	if(index == 0)
+	    return inputLayer->getBatchNormMomentum();
+
+	if (!layers[index-1])
+		return 0.9f;
+
+	return layers[index-1]->getBatchNormMomentum();
+}
+
+float glades::NNInfo::getBatchNormEpsilon(unsigned int index) const
+{
+	if (index > layers.size())
+		return 1e-5f;
+
+	if(index == 0)
+	    return inputLayer->getBatchNormEpsilon();
+
+	if (!layers[index-1])
+		return 1e-5f;
+
+	return layers[index-1]->getBatchNormEpsilon();
+}
+
 /*!
  * @brief Prints NNInfo
  * @details Prints the values contained in the inputLayer, layers, and outputLayer
@@ -652,6 +694,54 @@ void glades::NNInfo::setActivationParam(unsigned int index, float newActivationP
 		    return;
 
 	    layers[index-1]->setActivationParam(newActivationParam);
+	}
+}
+
+void glades::NNInfo::setUseBatchNorm(unsigned int index, bool newUseBatchNorm)
+{
+	if (index > layers.size())
+		return;
+
+	if(index == 0)
+	    inputLayer->setUseBatchNorm(newUseBatchNorm);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
+
+	    layers[index-1]->setUseBatchNorm(newUseBatchNorm);
+	}
+}
+
+void glades::NNInfo::setBatchNormMomentum(unsigned int index, float newBatchNormMomentum)
+{
+	if (index > layers.size())
+		return;
+
+	if(index == 0)
+	    inputLayer->setBatchNormMomentum(newBatchNormMomentum);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
+
+	    layers[index-1]->setBatchNormMomentum(newBatchNormMomentum);
+	}
+}
+
+void glades::NNInfo::setBatchNormEpsilon(unsigned int index, float newBatchNormEpsilon)
+{
+	if (index > layers.size())
+		return;
+
+	if(index == 0)
+	    inputLayer->setBatchNormEpsilon(newBatchNormEpsilon);
+	else
+	{
+	    if (!layers[index-1])
+		    return;
+
+	    layers[index-1]->setBatchNormEpsilon(newBatchNormEpsilon);
 	}
 }
 

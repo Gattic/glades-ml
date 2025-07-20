@@ -33,6 +33,9 @@ glades::LayerInfo::LayerInfo(int newSize)
 	pDropout = 0.0f;
 	activationType = 0;
 	activationParam = 0;
+	useBatchNorm = false;
+	batchNormMomentum = 0.9f;
+	batchNormEpsilon = 1e-5f;
 }
 
 /*!
@@ -63,6 +66,9 @@ void glades::LayerInfo::copyParamsFrom(const LayerInfo* src)
 	weightDecay2 = src->getWeightDecay2();
 	pDropout = src->getPDropout();
 	activationType = src->getActivationType();
+	useBatchNorm = src->getUseBatchNorm();
+	batchNormMomentum = src->getBatchNormMomentum();
+	batchNormEpsilon = src->getBatchNormEpsilon();
 }
 /*!
  * @brief get learning rate
@@ -213,4 +219,34 @@ void glades::LayerInfo::setActivationType(int newActivationType)
 void glades::LayerInfo::setActivationParam(float newActivationParam)
 {
 	activationParam = newActivationParam;
+}
+
+bool glades::LayerInfo::getUseBatchNorm() const
+{
+	return useBatchNorm;
+}
+
+float glades::LayerInfo::getBatchNormMomentum() const
+{
+	return batchNormMomentum;
+}
+
+float glades::LayerInfo::getBatchNormEpsilon() const
+{
+	return batchNormEpsilon;
+}
+
+void glades::LayerInfo::setUseBatchNorm(bool newUseBatchNorm)
+{
+	useBatchNorm = newUseBatchNorm;
+}
+
+void glades::LayerInfo::setBatchNormMomentum(float newBatchNormMomentum)
+{
+	batchNormMomentum = newBatchNormMomentum;
+}
+
+void glades::LayerInfo::setBatchNormEpsilon(float newBatchNormEpsilon)
+{
+	batchNormEpsilon = newBatchNormEpsilon;
 }

@@ -290,7 +290,7 @@ float glades::CMatrix::getOverallMCC() const
 
 	totalMCC /= ((float)(matrix.numberOfRows()));
 
-	return totalMCC;
+	return totalMCC*100.0f;
 }
 
 void glades::CMatrix::print() const

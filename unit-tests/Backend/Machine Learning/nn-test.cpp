@@ -13,6 +13,7 @@
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/State/Terminator.h"
+#include "../../../Backend/Machine Learning/Structure/nninfo.h"
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
@@ -185,6 +186,59 @@ void NNUnitTest()
     	glades::train(&cNetwork3, di3);
 
     G_assert (__FILE__, __LINE__, "==============NN3-test::Accuracy() Failed==============", cNetwork3.getAccuracy() >= 95.0f);
+
+    printf("\n============================================================\n");
+    
+    printf("-----------------------------------\n");
+    printf("NN Test 4 - Batch Normalization\n");
+    printf("-----------------------------------\n");
+
+    glades::NNetwork cNetwork4;
+    netName = "iris";
+    inputFName = "iris.data";
+    inputType = glades::DataInput::CSV;
+    
+    // Modify the paths to properly load the data later
+    glades::DataInput* di4 = NULL;
+    if (inputType == glades::DataInput::CSV)
+    {
+    	inputFName = "datasets/" + inputFName;
+    	di4 = new glades::NumberInput();
+    }
+    else
+    	return;
+    
+    if (!di4)
+    	return;
+    
+    // Load the input data
+    di4->import(inputFName);
+    
+    // Load the neural network
+    if ((cNetwork4.getEpochs() == 0) && (!cNetwork4.load(netName)))
+    {
+    	printf("[NN] Unable to load \"%s\"", netName.c_str());
+    	return;
+    }
+    
+    // Enable batch normalization for the first hidden layer
+    glades::NNInfo* nnInfo = cNetwork4.getNNInfo();
+    if (nnInfo && nnInfo->numHiddenLayers() > 0)
+    {
+        nnInfo->setUseBatchNorm(1, true);  // Enable for first hidden layer
+        nnInfo->setBatchNormMomentum(1, 0.9f);
+        nnInfo->setBatchNormEpsilon(1, 1e-5f);
+    }
+    
+    // Termination Conditions
+    cNetwork4.terminator.setEpoch(100000);
+    cNetwork4.terminator.setAccuracy(95);
+    
+    // Run the training and retrieve a metanetwork
+    glades::MetaNetwork* newTrainNet4 =
+    	glades::train(&cNetwork4, di4);
+    
+    G_assert (__FILE__, __LINE__, "==============NN4-test::BatchNorm Accuracy() Failed==============", cNetwork4.getAccuracy() >= 95.0f);
 
     printf("\n============================================================\n");
 }

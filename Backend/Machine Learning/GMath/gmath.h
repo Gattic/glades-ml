@@ -67,6 +67,11 @@ public:
 	static float normal_pdf(float);
 	static std::vector<int> naiveVectorDecomp(const std::vector<float>&);
 	static shmea::GList naiveVectorDecomp(const shmea::GList&);
+	
+	// Batch normalization functions
+	static float batchNormNormalize(float input, float mean, float variance, float epsilon);
+	static float batchNormScaleShift(float normalized, float gamma, float beta);
+	static float batchNormGradient(float gradient, float gamma, float normalized);
 };
 };
 

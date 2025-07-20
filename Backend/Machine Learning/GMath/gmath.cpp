@@ -457,3 +457,20 @@ shmea::GList glades::GMath::naiveVectorDecomp(const shmea::GList& needle)
 
 	return retList;
 }
+
+float glades::GMath::batchNormNormalize(float input, float mean, float variance, float epsilon)
+{
+	return (input - mean) / sqrt(variance + epsilon);
+}
+
+float glades::GMath::batchNormScaleShift(float normalized, float gamma, float beta)
+{
+	return gamma * normalized + beta;
+}
+
+float glades::GMath::batchNormGradient(float gradient, float gamma, float normalized)
+{
+	// Simplified gradient computation for batch normalization
+	// In a full implementation, you'd need to compute gradients for gamma, beta, and input
+	return gradient * gamma;
+}

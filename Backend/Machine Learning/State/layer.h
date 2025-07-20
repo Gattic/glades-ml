@@ -34,6 +34,17 @@ private:
 	int64_t id;
 	float biasWeight;
 	int type;
+	
+	// Batch normalization parameters
+	bool useBatchNorm;
+	std::vector<float> batchNormGamma;  // Scale parameter
+	std::vector<float> batchNormBeta;   // Shift parameter
+	std::vector<float> batchNormMean;   // Running mean
+	std::vector<float> batchNormVar;    // Running variance
+	std::vector<float> batchNormXNorm;  // Normalized input cache
+	std::vector<float> batchNormXCentered; // Centered input cache
+	float batchNormMomentum;            // Momentum for running statistics
+	float batchNormEpsilon;             // Small constant for numerical stability
 
 public:
 	static const int INPUT_TYPE = 0;
@@ -74,6 +85,23 @@ public:
 	Node* operator[](unsigned int);
 
 	void setupContext();
+	
+	// Batch normalization methods
+	void setupBatchNorm(float momentum = 0.9f, float epsilon = 1e-5f);
+	bool isBatchNormEnabled() const;
+	void enableBatchNorm(bool enable);
+	float getBatchNormGamma(unsigned int index) const;
+	float getBatchNormBeta(unsigned int index) const;
+	float getBatchNormMean(unsigned int index) const;
+	float getBatchNormVar(unsigned int index) const;
+	void setBatchNormGamma(unsigned int index, float value);
+	void setBatchNormBeta(unsigned int index, float value);
+	void setBatchNormMean(unsigned int index, float value);
+	void setBatchNormVar(unsigned int index, float value);
+	void updateBatchNormStats(unsigned int index, float mean, float var);
+	float applyBatchNorm(unsigned int index, float input, bool training = true);
+	float getBatchNormGradient(unsigned int index, float gradient);
+	void resetBatchNormCache();
 };
 };
 
