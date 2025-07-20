@@ -421,3 +421,18 @@ glades::MetaNetwork* glades::crossValidate(std::string netName, std::vector<std:
 
 	return NULL;
 }
+
+glades::MetaNetwork* glades::crossValidate(std::vector<glades::NNetwork*> networks, 
+                                           const shmea::GTable& inputTbl, 
+                                           const int inputType,
+                                           std::vector<float>& averageAccuracies, 
+                                           unsigned int foldsNum)
+{
+    if (networks.size() == 0 || networks[0] == NULL) {
+        return NULL;
+    }
+	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(networks[0]->getName());
+    cMetaNetwork->crossValidate(inputTbl, inputType, networks, averageAccuracies, foldsNum);
+    return cMetaNetwork;
+}
+

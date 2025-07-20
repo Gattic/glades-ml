@@ -28,6 +28,10 @@
 #include <sys/stat.h>
 #include <vector>
 
+namespace shmea {
+class GTable;
+};
+
 namespace GNet {
 class GServer;
 class Connection;
@@ -54,6 +58,7 @@ MetaNetwork* test(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection
 MetaNetwork* test(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* crossValidate(NNInfo*, std::string, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* crossValidate(std::string, std::vector<std::string>, float, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* crossValidate(std::vector<glades::NNetwork*>, const shmea::GTable&, const int, std::vector<float>&, unsigned int = 5);
 
 // Database Setup
 bool doesDatabaseExist();
