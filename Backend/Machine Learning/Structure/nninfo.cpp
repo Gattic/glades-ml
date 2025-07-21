@@ -372,48 +372,6 @@ float glades::NNInfo::getActivationParam(unsigned int index) const
 	return layers[index-1]->getActivationParam();
 }
 
-bool glades::NNInfo::getUseBatchNorm(unsigned int index) const
-{
-	if (index > layers.size())
-		return false;
-
-	if(index == 0)
-	    return inputLayer->getUseBatchNorm();
-
-	if (!layers[index-1])
-		return false;
-
-	return layers[index-1]->getUseBatchNorm();
-}
-
-float glades::NNInfo::getBatchNormMomentum(unsigned int index) const
-{
-	if (index > layers.size())
-		return 0.9f;
-
-	if(index == 0)
-	    return inputLayer->getBatchNormMomentum();
-
-	if (!layers[index-1])
-		return 0.9f;
-
-	return layers[index-1]->getBatchNormMomentum();
-}
-
-float glades::NNInfo::getBatchNormEpsilon(unsigned int index) const
-{
-	if (index > layers.size())
-		return 1e-5f;
-
-	if(index == 0)
-	    return inputLayer->getBatchNormEpsilon();
-
-	if (!layers[index-1])
-		return 1e-5f;
-
-	return layers[index-1]->getBatchNormEpsilon();
-}
-
 /*!
  * @brief Prints NNInfo
  * @details Prints the values contained in the inputLayer, layers, and outputLayer
@@ -697,54 +655,6 @@ void glades::NNInfo::setActivationParam(unsigned int index, float newActivationP
 	}
 }
 
-void glades::NNInfo::setUseBatchNorm(unsigned int index, bool newUseBatchNorm)
-{
-	if (index > layers.size())
-		return;
-
-	if(index == 0)
-	    inputLayer->setUseBatchNorm(newUseBatchNorm);
-	else
-	{
-	    if (!layers[index-1])
-		    return;
-
-	    layers[index-1]->setUseBatchNorm(newUseBatchNorm);
-	}
-}
-
-void glades::NNInfo::setBatchNormMomentum(unsigned int index, float newBatchNormMomentum)
-{
-	if (index > layers.size())
-		return;
-
-	if(index == 0)
-	    inputLayer->setBatchNormMomentum(newBatchNormMomentum);
-	else
-	{
-	    if (!layers[index-1])
-		    return;
-
-	    layers[index-1]->setBatchNormMomentum(newBatchNormMomentum);
-	}
-}
-
-void glades::NNInfo::setBatchNormEpsilon(unsigned int index, float newBatchNormEpsilon)
-{
-	if (index > layers.size())
-		return;
-
-	if(index == 0)
-	    inputLayer->setBatchNormEpsilon(newBatchNormEpsilon);
-	else
-	{
-	    if (!layers[index-1])
-		    return;
-
-	    layers[index-1]->setBatchNormEpsilon(newBatchNormEpsilon);
-	}
-}
-
 void glades::NNInfo::addHiddenLayer(HiddenLayerInfo* newLayer)
 {
 	if (!newLayer)
@@ -870,28 +780,7 @@ bool glades::NNInfo::load(const shmea::GString& netName)
 {
 	name = netName;
 	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
-	bool success = fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
-	if(success)
-	{
-	    //inputLayer->setUseBatchNorm(true);  // Enable for first hidden layer
-	    //inputLayer->setBatchNormMomentum(0.9f);
-	    //inputLayer->setBatchNormEpsilon(1e-5f);
-
-	    printf("Enabling batch norm for layers\n");
-	    for(unsigned int i = 0; i < layers.size(); ++i)
-	    {
-		printf("Enabling batch norm for layer %d\n", i);
-		layers[i]->setUseBatchNorm(true);  // Enable for first hidden layer
-		layers[i]->setBatchNormMomentum(0.9f);
-	        layers[i]->setBatchNormEpsilon(1e-5f);
-	    }
-
-	    outputLayer->setUseBatchNorm(true);  // Enable for first hidden layer
-	    outputLayer->setBatchNormMomentum(0.9f);
-	    outputLayer->setBatchNormEpsilon(1e-5f);
-	}
-
-	return success;
+	return fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
 }
 
 void glades::NNInfo::save() const

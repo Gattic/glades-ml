@@ -102,9 +102,6 @@ public:
 	float getPDropout(unsigned int) const;
 	int getActivationType(unsigned int) const;
 	float getActivationParam(unsigned int) const;
-	bool getUseBatchNorm(unsigned int) const;
-	float getBatchNormMomentum(unsigned int) const;
-	float getBatchNormEpsilon(unsigned int) const;
 	void print() const;
 
 	// sets
@@ -122,9 +119,6 @@ public:
 	void setPDropout(unsigned int, float);
 	void setActivationType(unsigned int, int);
 	void setActivationParam(unsigned int, float);
-	void setUseBatchNorm(unsigned int, bool);
-	void setBatchNormMomentum(unsigned int, float);
-	void setBatchNormEpsilon(unsigned int, float);
 	void addHiddenLayer(HiddenLayerInfo*);
 	void copyHiddenLayer(unsigned int, unsigned int);
 	void resizeHiddenLayers(unsigned int);

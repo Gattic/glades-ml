@@ -41,11 +41,6 @@ protected:
 	int activationType;
 	float activationParam;
 
-	// Batch normalization parameters
-	bool useBatchNorm;
-	float batchNormMomentum;
-	float batchNormEpsilon;
-
 public:
 	static const int INPUT = 0;
 	static const int HIDDEN = 1;
@@ -65,9 +60,6 @@ public:
 	float getPDropout() const;
 	int getActivationType() const;
 	float getActivationParam() const;
-	bool getUseBatchNorm() const;
-	float getBatchNormMomentum() const;
-	float getBatchNormEpsilon() const;
 	virtual shmea::GList getGTableRow() const = 0;
 
 	// sets
@@ -79,9 +71,6 @@ public:
 	void setPDropout(float);
 	void setActivationType(int);
 	void setActivationParam(float);
-	void setUseBatchNorm(bool);
-	void setBatchNormMomentum(float);
-	void setBatchNormEpsilon(float);
 
 	// type
 	virtual int getLayerType() const = 0;
