@@ -200,8 +200,11 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 		// Setup batch normalization if enabled for this layer
 		if (skeleton->getUseBatchNorm(i))
 		{
-			cLayer->setupBatchNorm(skeleton->getBatchNormMomentum(i), skeleton->getBatchNormEpsilon(i));
+		    printf("[GLADES] Setting up batch normalization for layer %d\n", i);
+		    cLayer->setupBatchNorm(skeleton->getBatchNormMomentum(i), skeleton->getBatchNormEpsilon(i));
 		}
+		else
+		    printf("[GLADES] Skipping batch normalization for layer %d\n", i);
 		
 		layers.push_back(cLayer);
 		prevLayerSize = cLayerSize;
@@ -540,6 +543,9 @@ void glades::LayerBuilder::print(const NNInfo* skeleton, bool override) const
 		{
 			printf("%d [%d]: ", i + 1, layers[i]->getType());
 			layers[i]->print();
+			
+			// Print batch normalization state for each layer
+			layers[i]->printBatchNormState();
 		}
 		printf("\n");
 	}

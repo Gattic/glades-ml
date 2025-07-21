@@ -34,7 +34,7 @@ private:
 	int64_t id;
 	float biasWeight;
 	int type;
-	
+
 	// Batch normalization parameters
 	bool useBatchNorm;
 	std::vector<float> batchNormGamma;  // Scale parameter
@@ -108,6 +108,9 @@ public:
 	void updateBatchNormBeta(unsigned int index, float gradient, float learningRate);
 	float getBatchNormGammaGradient(unsigned int index, float inputGradient, float normalized);
 	float getBatchNormBetaGradient(unsigned int index, float inputGradient);
+	
+	// Debug methods
+	void printBatchNormState() const;
 };
 };
 

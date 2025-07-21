@@ -384,7 +384,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 	}
 
 	// Print the results
-	meat.print(skeleton);
+	meat.print(skeleton, true);
 
 	// Clean confusion matrix
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||

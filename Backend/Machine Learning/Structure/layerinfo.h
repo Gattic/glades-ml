@@ -40,7 +40,7 @@ protected:
 	float pDropout;
 	int activationType;
 	float activationParam;
-	
+
 	// Batch normalization parameters
 	bool useBatchNorm;
 	float batchNormMomentum;

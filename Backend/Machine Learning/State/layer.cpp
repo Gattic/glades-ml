@@ -325,6 +325,19 @@ void Layer::setupBatchNorm(float momentum, float epsilon)
 	batchNormVar.resize(children.size(), 1.0f);
 	batchNormXNorm.resize(children.size(), 0.0f);
 	batchNormXCentered.resize(children.size(), 0.0f);
+	
+	// Debug output for batch normalization setup
+	printf("[BATCHNORM_SETUP] Layer %d: Enabled batch normalization\n", type);
+	printf("  Layer size: %zu, Momentum: %f, Epsilon: %f\n", children.size(), momentum, epsilon);
+	printf("  Initial gamma values: ");
+	for (unsigned int i = 0; i < batchNormGamma.size(); ++i) {
+		printf("%f ", batchNormGamma[i]);
+	}
+	printf("\n  Initial beta values: ");
+	for (unsigned int i = 0; i < batchNormBeta.size(); ++i) {
+		printf("%f ", batchNormBeta[i]);
+	}
+	printf("\n");
 }
 
 bool Layer::isBatchNormEnabled() const
@@ -393,8 +406,16 @@ void Layer::updateBatchNormStats(unsigned int index, float mean, float var)
 {
 	if (index < batchNormMean.size() && index < batchNormVar.size())
 	{
+		float oldMean = batchNormMean[index];
+		float oldVar = batchNormVar[index];
+		
 		batchNormMean[index] = batchNormMomentum * batchNormMean[index] + (1.0f - batchNormMomentum) * mean;
 		batchNormVar[index] = batchNormMomentum * batchNormVar[index] + (1.0f - batchNormMomentum) * var;
+		
+		// Debug output for running statistics updates
+		printf("[BATCHNORM_STATS] Layer %d, Node %d:\n", type, index);
+		printf("  Mean: %f -> %f (new: %f, momentum: %f)\n", oldMean, batchNormMean[index], mean, batchNormMomentum);
+		printf("  Variance: %f -> %f (new: %f, momentum: %f)\n", oldVar, batchNormVar[index], var, batchNormMomentum);
 	}
 }
 
@@ -421,22 +442,43 @@ float Layer::applyBatchNorm(unsigned int index, float input, bool training)
 		// Cache for backpropagation
 		batchNormXCentered[index] = input - mean;
 		batchNormXNorm[index] = batchNormXCentered[index] / sqrt(var + batchNormEpsilon);
+		
+		// Debug output for batch normalization
+		printf("[BATCHNORM] Layer %d, Node %d - Training Mode:\n", type, index);
+		printf("  Input: %f, Mean: %f, Var: %f\n", input, mean, var);
+		printf("  X_centered: %f, X_norm: %f\n", batchNormXCentered[index], batchNormXNorm[index]);
+		printf("  Gamma: %f, Beta: %f\n", batchNormGamma[index], batchNormBeta[index]);
 	}
 	else
 	{
 		// During inference, use running statistics
 		batchNormXCentered[index] = input - batchNormMean[index];
 		batchNormXNorm[index] = batchNormXCentered[index] / sqrt(batchNormVar[index] + batchNormEpsilon);
+		
+		// Debug output for inference
+		printf("[BATCHNORM] Layer %d, Node %d - Inference Mode:\n", type, index);
+		printf("  Input: %f, Running Mean: %f, Running Var: %f\n", input, batchNormMean[index], batchNormVar[index]);
+		printf("  X_centered: %f, X_norm: %f\n", batchNormXCentered[index], batchNormXNorm[index]);
+		printf("  Gamma: %f, Beta: %f\n", batchNormGamma[index], batchNormBeta[index]);
 	}
 	
 	// Apply scale and shift: y = γ * x_norm + β
-	return batchNormGamma[index] * batchNormXNorm[index] + batchNormBeta[index];
+	float output = batchNormGamma[index] * batchNormXNorm[index] + batchNormBeta[index];
+	printf("  Output: %f\n", output);
+	
+	return output;
 }
 
 float Layer::getBatchNormGradient(unsigned int index, float gradient)
 {
 	if (!useBatchNorm || index >= children.size())
 		return gradient;
+	
+	// Debug output for gradient computation
+	printf("[BATCHNORM_GRAD] Layer %d, Node %d:\n", type, index);
+	printf("  Input gradient: %f\n", gradient);
+	printf("  Current gamma: %f, beta: %f\n", batchNormGamma[index], batchNormBeta[index]);
+	printf("  Cached x_norm: %f, x_centered: %f\n", batchNormXNorm[index], batchNormXCentered[index]);
 	
 	// Use the complete gradient computation from GMath
 	float gammaGrad, betaGrad, inputGradOut;
@@ -450,9 +492,16 @@ float Layer::getBatchNormGradient(unsigned int index, float gradient)
 	GMath::batchNormGradients(gradient, normalized, gamma, beta, mean, variance, 
 							  batchNormEpsilon, 1, gammaGrad, betaGrad, inputGradOut);
 	
+	printf("  Computed gradients - Gamma: %f, Beta: %f, Input: %f\n", gammaGrad, betaGrad, inputGradOut);
+	
 	// Update the batch normalization parameters
+	float oldGamma = batchNormGamma[index];
+	float oldBeta = batchNormBeta[index];
 	updateBatchNormGamma(index, gammaGrad, 0.01f); // Use a small learning rate for batch norm params
 	updateBatchNormBeta(index, betaGrad, 0.01f);
+	
+	printf("  Parameter updates - Gamma: %f -> %f, Beta: %f -> %f\n", 
+		   oldGamma, batchNormGamma[index], oldBeta, batchNormBeta[index]);
 	
 	// Return the gradient with respect to the input
 	return inputGradOut;
@@ -472,8 +521,13 @@ void glades::Layer::updateBatchNormGamma(unsigned int index, float gradient, flo
 	if (!useBatchNorm || index >= batchNormGamma.size())
 		return;
 	
+	float oldValue = batchNormGamma[index];
 	// Update gamma parameter: γ = γ - learningRate * ∂L/∂γ
 	batchNormGamma[index] -= learningRate * gradient;
+	
+	// Debug output for gamma updates
+	printf("[BATCHNORM_GAMMA] Layer %d, Node %d: %f -> %f (gradient: %f, lr: %f)\n", 
+		   type, index, oldValue, batchNormGamma[index], gradient, learningRate);
 }
 
 void glades::Layer::updateBatchNormBeta(unsigned int index, float gradient, float learningRate)
@@ -481,8 +535,13 @@ void glades::Layer::updateBatchNormBeta(unsigned int index, float gradient, floa
 	if (!useBatchNorm || index >= batchNormBeta.size())
 		return;
 	
+	float oldValue = batchNormBeta[index];
 	// Update beta parameter: β = β - learningRate * ∂L/∂β
 	batchNormBeta[index] -= learningRate * gradient;
+	
+	// Debug output for beta updates
+	printf("[BATCHNORM_BETA] Layer %d, Node %d: %f -> %f (gradient: %f, lr: %f)\n", 
+		   type, index, oldValue, batchNormBeta[index], gradient, learningRate);
 }
 
 float glades::Layer::getBatchNormGammaGradient(unsigned int index, float inputGradient, float normalized)
@@ -501,4 +560,27 @@ float glades::Layer::getBatchNormBetaGradient(unsigned int index, float inputGra
 	
 	// ∂L/∂β = ∂L/∂y
 	return inputGradient;
+}
+
+void glades::Layer::printBatchNormState() const
+{
+	if (!useBatchNorm)
+	{
+		printf("[BATCHNORM_STATE] Layer %d: Batch normalization is disabled\n", type);
+		return;
+	}
+	else
+	    printf("[BATCHNORM_STATE] Layer %d: Batch normalization is enabled\n", type);
+	
+	printf("[BATCHNORM_STATE] Layer %d: Batch normalization state:\n", type);
+	printf("  Enabled: %s, Momentum: %f, Epsilon: %f\n", useBatchNorm ? "true" : "false", batchNormMomentum, batchNormEpsilon);
+	printf("  Layer size: %zu\n", children.size());
+	
+	for (unsigned int i = 0; i < children.size() && i < batchNormGamma.size(); ++i)
+	{
+		printf("  Node %d:\n", i);
+		printf("    Gamma: %f, Beta: %f\n", batchNormGamma[i], batchNormBeta[i]);
+		printf("    Running Mean: %f, Running Variance: %f\n", batchNormMean[i], batchNormVar[i]);
+		printf("    Cached X_norm: %f, X_centered: %f\n", batchNormXNorm[i], batchNormXCentered[i]);
+	}
 }
