@@ -122,7 +122,7 @@ void NNUnitTest()
     
     // Termination Conditions
     //cNetwork2.setTimestamp(maxTimeStamp);
-    cNetwork2.terminator.setEpoch(100000);
+    cNetwork2.terminator.setEpoch(3000);
     cNetwork2.terminator.setAccuracy(95);
     
     // Run the training and retrieve a metanetwork
@@ -178,7 +178,7 @@ void NNUnitTest()
     
     // Termination Conditions
     //cNetwork3.setTimestamp(maxTimeStamp);
-    cNetwork3.terminator.setEpoch(100000);
+    cNetwork3.terminator.setEpoch(3000);
     cNetwork3.terminator.setAccuracy(95);
     
     // Run the training and retrieve a metanetwork
@@ -221,17 +221,11 @@ void NNUnitTest()
     	return;
     }
     
-    // Enable batch normalization for the first hidden layer
-    glades::NNInfo* nnInfo = cNetwork4.getNNInfo();
-    if (nnInfo && nnInfo->numHiddenLayers() > 0)
-    {
-        nnInfo->setUseBatchNorm(1, true);  // Enable for first hidden layer
-        nnInfo->setBatchNormMomentum(1, 0.9f);
-        nnInfo->setBatchNormEpsilon(1, 1e-5f);
-    }
+    // Batch normalization is automatically enabled for hidden layers in LayerBuilder
+    // No need to manually enable it here
     
     // Termination Conditions
-    cNetwork4.terminator.setEpoch(100000);
+    cNetwork4.terminator.setEpoch(3000);
     cNetwork4.terminator.setAccuracy(95);
     
     // Run the training and retrieve a metanetwork

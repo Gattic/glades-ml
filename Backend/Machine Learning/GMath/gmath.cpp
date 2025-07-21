@@ -16,6 +16,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "gmath.h"
 #include "Backend/Database/GType.h"
+#include <cmath>
 
 using namespace glades;
 
@@ -479,6 +480,30 @@ void glades::GMath::batchNormGradients(float inputGrad, float normalized, float 
 									   float mean, float variance, float epsilon, int batchSize,
 									   float& gammaGrad, float& betaGrad, float& inputGradOut)
 {
+	// Add numerical stability checks
+	if (std::isnan(inputGrad) || std::isinf(inputGrad))
+	{
+		gammaGrad = 0.0f;
+		betaGrad = 0.0f;
+		inputGradOut = 0.0f;
+		return;
+	}
+	
+	if (std::isnan(normalized) || std::isinf(normalized))
+	{
+		normalized = 0.0f;
+	}
+	
+	if (std::isnan(gamma) || std::isinf(gamma))
+	{
+		gamma = 1.0f;
+	}
+	
+	if (std::isnan(variance) || std::isinf(variance) || variance <= 0.0f)
+	{
+		variance = epsilon;
+	}
+	
 	// Complete batch normalization gradient computation
 	// Based on the chain rule and the batch normalization equations:
 	// y = γ * x_norm + β
@@ -495,21 +520,76 @@ void glades::GMath::batchNormGradients(float inputGrad, float normalized, float 
 	// Gradient with respect to input (x)
 	// This is more complex and involves the chain rule through normalization
 	float stdDev = sqrt(variance + epsilon);
+	
+	// Add numerical stability check for standard deviation
+	if (stdDev <= 0.0f || std::isnan(stdDev) || std::isinf(stdDev))
+	{
+		stdDev = sqrt(epsilon);
+	}
+	
 	float invStdDev = 1.0f / stdDev;
+	
+	// Add numerical stability check for inverse standard deviation
+	if (std::isnan(invStdDev) || std::isinf(invStdDev))
+	{
+		invStdDev = 1.0f / sqrt(epsilon);
+	}
 	
 	// ∂L/∂x = ∂L/∂y * ∂y/∂x_norm * ∂x_norm/∂x
 	// ∂x_norm/∂x = 1 / sqrt(σ² + ε)
 	inputGradOut = inputGrad * gamma * invStdDev;
+	
+	// Final numerical stability checks
+	if (std::isnan(gammaGrad) || std::isinf(gammaGrad))
+		gammaGrad = 0.0f;
+	
+	if (std::isnan(betaGrad) || std::isinf(betaGrad))
+		betaGrad = 0.0f;
+	
+	if (std::isnan(inputGradOut) || std::isinf(inputGradOut))
+		inputGradOut = inputGrad; // Fall back to original gradient
 }
 
 float glades::GMath::batchNormInputGradient(float inputGrad, float normalized, float gamma, 
 											float mean, float variance, float epsilon, int batchSize)
 {
+	// Add numerical stability checks
+	if (std::isnan(inputGrad) || std::isinf(inputGrad))
+		return 0.0f;
+	
+	if (std::isnan(normalized) || std::isinf(normalized))
+		normalized = 0.0f;
+	
+	if (std::isnan(gamma) || std::isinf(gamma))
+		gamma = 1.0f;
+	
+	if (std::isnan(variance) || std::isinf(variance) || variance <= 0.0f)
+		variance = epsilon;
+	
 	// Simplified version that only computes the input gradient
 	// This is useful when you only need the gradient with respect to the input
 	float stdDev = sqrt(variance + epsilon);
+	
+	// Add numerical stability check for standard deviation
+	if (stdDev <= 0.0f || std::isnan(stdDev) || std::isinf(stdDev))
+	{
+		stdDev = sqrt(epsilon);
+	}
+	
 	float invStdDev = 1.0f / stdDev;
 	
+	// Add numerical stability check for inverse standard deviation
+	if (std::isnan(invStdDev) || std::isinf(invStdDev))
+	{
+		invStdDev = 1.0f / sqrt(epsilon);
+	}
+	
 	// ∂L/∂x = ∂L/∂y * γ * (1 / sqrt(σ² + ε))
-	return inputGrad * gamma * invStdDev;
+	float result = inputGrad * gamma * invStdDev;
+	
+	// Final numerical stability check
+	if (std::isnan(result) || std::isinf(result))
+		return inputGrad; // Fall back to original gradient
+	
+	return result;
 }

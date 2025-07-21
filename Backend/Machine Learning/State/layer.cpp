@@ -17,6 +17,7 @@
 #include "layer.h"
 #include "../GMath/gmath.h"
 #include "node.h"
+#include <cmath>
 
 using namespace glades;
 
@@ -340,6 +341,9 @@ void Layer::setupBatchNorm(float momentum, float epsilon)
 		printf("%f ", batchNormBeta[i]);
 	}
 	printf("\n");
+	
+	// Validate all parameters to ensure they are valid
+	validateBatchNormParams();
 }
 
 bool Layer::isBatchNormEnabled() const
@@ -426,47 +430,82 @@ float Layer::applyBatchNorm(unsigned int index, float input, bool training)
 	if (!useBatchNorm || index >= children.size())
 		return input;
 	
+	// Validate batch normalization parameters before processing
+	validateBatchNormParams();
+	
+	// Add numerical stability check
+	if (std::isnan(input) || std::isinf(input))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid input value %f\n", type, index, input);
+		return 0.0f;
+	}
+	
 	if (training)
 	{
-		// During training, use batch statistics
-		// For a more realistic implementation, we would accumulate statistics across the batch
-		// Here we use a simplified approach that updates running statistics with current input
-		float currentMean = input;
-		float currentVar = 0.0f; // Simplified - in practice, compute variance across batch
+		// During training, we need to accumulate statistics across the batch
+		// For now, we'll use a simplified approach that updates running statistics
+		// In a proper implementation, you would accumulate across the entire batch
 		
 		// Update running statistics using exponential moving average
-		updateBatchNormStats(index, currentMean, currentVar);
+		// Use the current input to update the running mean and variance
+		float oldMean = batchNormMean[index];
+		float oldVar = batchNormVar[index];
 		
-		// For training, use current input statistics (simplified batch statistics)
-		float mean = currentMean;
-		float var = currentVar + 1e-8f; // Add small constant for numerical stability
+		// Update running mean: μ_new = α * μ_old + (1-α) * x
+		batchNormMean[index] = batchNormMomentum * oldMean + (1.0f - batchNormMomentum) * input;
+		
+		// Update running variance using unbiased estimator
+		// σ²_new = α * σ²_old + (1-α) * (x - μ_old)²
+		float delta = input - oldMean;
+		batchNormVar[index] = batchNormMomentum * oldVar + (1.0f - batchNormMomentum) * delta * delta;
+		
+		// Ensure variance is never zero or negative
+		if (batchNormVar[index] <= 0.0f)
+			batchNormVar[index] = batchNormEpsilon;
+		
+		// Use running statistics for normalization during training
+		// This is a simplified approach - in practice, you'd use batch statistics
+		float mean = batchNormMean[index];
+		float var = batchNormVar[index];
 		
 		// Cache for backpropagation
 		batchNormXCentered[index] = input - mean;
 		batchNormXNorm[index] = batchNormXCentered[index] / sqrt(var + batchNormEpsilon);
 		
-		// Debug output for batch normalization
-		//printf("[BATCHNORM] Layer %d, Node %d - Training Mode:\n", type, index);
-		//printf("  Input: %f, Mean: %f, Var: %f\n", input, mean, var);
-		//printf("  X_centered: %f, X_norm: %f\n", batchNormXCentered[index], batchNormXNorm[index]);
-		//printf("  Gamma: %f, Beta: %f\n", batchNormGamma[index], batchNormBeta[index]);
+		// Add numerical stability check for normalized value
+		if (std::isnan(batchNormXNorm[index]) || std::isinf(batchNormXNorm[index]))
+		{
+			printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid normalized value %f\n", type, index, batchNormXNorm[index]);
+			batchNormXNorm[index] = 0.0f;
+		}
 	}
 	else
 	{
 		// During inference, use running statistics
+		// Ensure running variance is never zero or negative
+		if (batchNormVar[index] <= 0.0f)
+			batchNormVar[index] = batchNormEpsilon;
+		
 		batchNormXCentered[index] = input - batchNormMean[index];
 		batchNormXNorm[index] = batchNormXCentered[index] / sqrt(batchNormVar[index] + batchNormEpsilon);
 		
-		// Debug output for inference
-		//printf("[BATCHNORM] Layer %d, Node %d - Inference Mode:\n", type, index);
-		//printf("  Input: %f, Running Mean: %f, Running Var: %f\n", input, batchNormMean[index], batchNormVar[index]);
-		//printf("  X_centered: %f, X_norm: %f\n", batchNormXCentered[index], batchNormXNorm[index]);
-		//printf("  Gamma: %f, Beta: %f\n", batchNormGamma[index], batchNormBeta[index]);
+		// Add numerical stability check for normalized value
+		if (std::isnan(batchNormXNorm[index]) || std::isinf(batchNormXNorm[index]))
+		{
+			printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid normalized value %f\n", type, index, batchNormXNorm[index]);
+			batchNormXNorm[index] = 0.0f;
+		}
 	}
 	
 	// Apply scale and shift: y = γ * x_norm + β
 	float output = batchNormGamma[index] * batchNormXNorm[index] + batchNormBeta[index];
-	//printf("  Output: %f\n", output);
+	
+	// Add final numerical stability check
+	if (std::isnan(output) || std::isinf(output))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid output value %f\n", type, index, output);
+		output = batchNormBeta[index]; // Return just the bias if normalization fails
+	}
 	
 	return output;
 }
@@ -476,11 +515,12 @@ float Layer::getBatchNormGradient(unsigned int index, float gradient)
 	if (!useBatchNorm || index >= children.size())
 		return gradient;
 	
-	// Debug output for gradient computation
-	//printf("[BATCHNORM_GRAD] Layer %d, Node %d:\n", type, index);
-	//printf("  Input gradient: %f\n", gradient);
-	//printf("  Current gamma: %f, beta: %f\n", batchNormGamma[index], batchNormBeta[index]);
-	//printf("  Cached x_norm: %f, x_centered: %f\n", batchNormXNorm[index], batchNormXCentered[index]);
+	// Add numerical stability check for input gradient
+	if (std::isnan(gradient) || std::isinf(gradient))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid input gradient %f\n", type, index, gradient);
+		return 0.0f;
+	}
 	
 	// Use the complete gradient computation from GMath
 	float gammaGrad, betaGrad, inputGradOut;
@@ -490,20 +530,61 @@ float Layer::getBatchNormGradient(unsigned int index, float gradient)
 	float mean = batchNormMean[index];
 	float variance = batchNormVar[index];
 	
+	// Add numerical stability checks for batch norm parameters
+	if (std::isnan(normalized) || std::isinf(normalized))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid normalized value %f\n", type, index, normalized);
+		normalized = 0.0f;
+	}
+	
+	if (std::isnan(gamma) || std::isinf(gamma))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid gamma value %f\n", type, index, gamma);
+		gamma = 1.0f;
+	}
+	
+	if (std::isnan(variance) || std::isinf(variance) || variance <= 0.0f)
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid variance value %f\n", type, index, variance);
+		variance = batchNormEpsilon;
+	}
+	
 	// Compute all gradients using the complete implementation
 	GMath::batchNormGradients(gradient, normalized, gamma, beta, mean, variance, 
 							  batchNormEpsilon, 1, gammaGrad, betaGrad, inputGradOut);
 	
-	//printf("  Computed gradients - Gamma: %f, Beta: %f, Input: %f\n", gammaGrad, betaGrad, inputGradOut);
+	// Add numerical stability checks for computed gradients
+	if (std::isnan(gammaGrad) || std::isinf(gammaGrad))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid gamma gradient %f\n", type, index, gammaGrad);
+		gammaGrad = 0.0f;
+	}
 	
-	// Update the batch normalization parameters
-	float oldGamma = batchNormGamma[index];
-	float oldBeta = batchNormBeta[index];
+	if (std::isnan(betaGrad) || std::isinf(betaGrad))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid beta gradient %f\n", type, index, betaGrad);
+		betaGrad = 0.0f;
+	}
+	
+	if (std::isnan(inputGradOut) || std::isinf(inputGradOut))
+	{
+		printf("[BATCHNORM_WARNING] Layer %d, Node %d: Invalid input gradient output %f\n", type, index, inputGradOut);
+		inputGradOut = gradient; // Fall back to original gradient
+	}
+	
+	// Update the batch normalization parameters with gradient clipping
+	float maxGradNorm = 1.0f; // Clip gradients to prevent explosion
+	
+	// Clip gamma gradient
+	if (std::abs(gammaGrad) > maxGradNorm)
+		gammaGrad = (gammaGrad > 0) ? maxGradNorm : -maxGradNorm;
+	
+	// Clip beta gradient
+	if (std::abs(betaGrad) > maxGradNorm)
+		betaGrad = (betaGrad > 0) ? maxGradNorm : -maxGradNorm;
+	
 	updateBatchNormGamma(index, gammaGrad, 0.01f); // Use a small learning rate for batch norm params
 	updateBatchNormBeta(index, betaGrad, 0.01f);
-	
-	//printf("  Parameter updates - Gamma: %f -> %f, Beta: %f -> %f\n", 
-		   //oldGamma, batchNormGamma[index], oldBeta, batchNormBeta[index]);
 	
 	// Return the gradient with respect to the input
 	return inputGradOut;
@@ -515,6 +596,52 @@ void Layer::resetBatchNormCache()
 	{
 		batchNormXNorm[i] = 0.0f;
 		batchNormXCentered[i] = 0.0f;
+	}
+}
+
+void Layer::resetBatchNormStats()
+{
+	for (unsigned int i = 0; i < batchNormMean.size(); ++i)
+	{
+		batchNormMean[i] = 0.0f;
+		batchNormVar[i] = 1.0f;  // Initialize variance to 1.0 for stability
+	}
+}
+
+void Layer::validateBatchNormParams()
+{
+	if (!useBatchNorm)
+		return;
+		
+	for (unsigned int i = 0; i < children.size(); ++i)
+	{
+		// Validate gamma
+		if (i < batchNormGamma.size() && (std::isnan(batchNormGamma[i]) || std::isinf(batchNormGamma[i])))
+		{
+			printf("[BATCHNORM_FIX] Layer %d, Node %d: Fixing invalid gamma %f -> 1.0\n", type, i, batchNormGamma[i]);
+			batchNormGamma[i] = 1.0f;
+		}
+		
+		// Validate beta
+		if (i < batchNormBeta.size() && (std::isnan(batchNormBeta[i]) || std::isinf(batchNormBeta[i])))
+		{
+			printf("[BATCHNORM_FIX] Layer %d, Node %d: Fixing invalid beta %f -> 0.0\n", type, i, batchNormBeta[i]);
+			batchNormBeta[i] = 0.0f;
+		}
+		
+		// Validate mean
+		if (i < batchNormMean.size() && (std::isnan(batchNormMean[i]) || std::isinf(batchNormMean[i])))
+		{
+			printf("[BATCHNORM_FIX] Layer %d, Node %d: Fixing invalid mean %f -> 0.0\n", type, i, batchNormMean[i]);
+			batchNormMean[i] = 0.0f;
+		}
+		
+		// Validate variance
+		if (i < batchNormVar.size() && (std::isnan(batchNormVar[i]) || std::isinf(batchNormVar[i]) || batchNormVar[i] <= 0.0f))
+		{
+			printf("[BATCHNORM_FIX] Layer %d, Node %d: Fixing invalid variance %f -> 1.0\n", type, i, batchNormVar[i]);
+			batchNormVar[i] = 1.0f;
+		}
 	}
 }
 
