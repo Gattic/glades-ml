@@ -873,9 +873,9 @@ bool glades::NNInfo::load(const shmea::GString& netName)
 	bool success = fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
 	if(success)
 	{
-	    inputLayer->setUseBatchNorm(true);  // Enable for first hidden layer
-	    inputLayer->setBatchNormMomentum(0.9f);
-	    inputLayer->setBatchNormEpsilon(1e-5f);
+	    //inputLayer->setUseBatchNorm(true);  // Enable for first hidden layer
+	    //inputLayer->setBatchNormMomentum(0.9f);
+	    //inputLayer->setBatchNormEpsilon(1e-5f);
 
 	    printf("Enabling batch norm for layers\n");
 	    for(unsigned int i = 0; i < layers.size(); ++i)
