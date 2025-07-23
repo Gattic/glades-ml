@@ -66,6 +66,7 @@ public:
 	unsigned int getLayersSize() const;
 	unsigned int getLayerSize(unsigned int) const;
 	unsigned int sizeOfLayer(unsigned int) const;
+	Layer* getLayer(unsigned int) const;
 	float getTimeState(unsigned int, unsigned int, unsigned int) const;
 	void scrambleDropout(unsigned int, float, const std::vector<float>&);
 	void clearDropout();

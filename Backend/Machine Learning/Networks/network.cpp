@@ -51,6 +51,9 @@ glades::NNetwork::NNetwork(int newNetType)
 	clean();
 	netType = newNetType;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
+	currentMinibatchSize = 0;
+	minibatchStartIndex = 0;
+	minibatchInProgress = false;
 }
 
 /*!
@@ -71,6 +74,9 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 	skeleton = newNNInfo;
 	netType = newNetType;
 	minibatchSize = skeleton->getBatchSize();
+	currentMinibatchSize = 0;
+	minibatchStartIndex = 0;
+	minibatchInProgress = false;
 }
 
 glades::NNetwork::~NNetwork()
@@ -184,10 +190,26 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 			(skeleton->getOutputType() == GMath::KL))
 			confusionMatrix.reset();
 
-		// Recursive FwdPass/BackProp
+		// Recursive FwdPass/BackProp with proper minibatch handling
 		//printf("Input Layers Size: %d\n", meat.getInputLayersSize());
 		for (unsigned int r = 0; r < meat.getInputLayersSize(); ++r)
+		{
 			SGDHelper(r, runType);
+			
+			// Track minibatch progress
+			if (runType == RUN_TRAIN)
+			{
+				currentMinibatchSize++;
+				
+				// Check if minibatch is complete or if this is the last sample
+				if (currentMinibatchSize >= minibatchSize || r == meat.getInputLayersSize() - 1)
+				{
+					// Apply accumulated gradients
+					applyMinibatchUpdates(currentMinibatchSize);
+					currentMinibatchSize = 0;
+				}
+			}
+		}
 
 		// Update the network vars
 		++epochs;
@@ -395,6 +417,54 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 
 	// So the network doesnt immediately quit next time and we can prematurely start our net
 	running = false;
+}
+
+void glades::NNetwork::applyMinibatchUpdates(int actualMinibatchSize)
+{
+	if (!skeleton || actualMinibatchSize <= 0)
+		return;
+
+	// Apply accumulated weight deltas for all layers
+	// Note: meat.getLayersSize() returns the number of hidden + output layers
+	for (unsigned int layerIndex = 0; layerIndex < meat.getLayersSize(); ++layerIndex)
+	{
+		Layer* currentLayer = meat.getLayer(layerIndex);
+		if (!currentLayer)
+			continue;
+
+		// Apply weight deltas for all nodes in this layer
+		for (unsigned int nodeIndex = 0; nodeIndex < currentLayer->size(); ++nodeIndex)
+		{
+			Node* currentNode = currentLayer->getNode(nodeIndex);
+			if (!currentNode)
+				continue;
+
+			// Apply deltas for all edges of this node
+			for (unsigned int edgeIndex = 0; edgeIndex < currentNode->numEdges(); ++edgeIndex)
+			{
+				currentNode->applyDeltas(edgeIndex, actualMinibatchSize);
+				currentNode->clearPrevDeltas(edgeIndex);
+			}
+
+			// Apply context node deltas for RNN
+			if (netType == TYPE_RNN && currentLayer->getType() == Layer::HIDDEN_TYPE)
+			{
+				Node* contextNode = currentNode->getContextNode();
+				if (contextNode)
+				{
+					contextNode->applyDeltas(0, actualMinibatchSize);
+					contextNode->clearPrevDeltas(0);
+				}
+			}
+		}
+
+		// Apply bias deltas for this layer
+		if (currentLayer->getType() != Layer::INPUT_TYPE)
+		{
+			currentLayer->applyBiasDelta();
+			currentLayer->clearBiasDelta();
+		}
+	}
 }
 
 void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
@@ -651,7 +721,7 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 			    float weightDecay2 = skeleton->getWeightDecay2(cInputLayerCounter);
 			    float baseError = learningRate * cOutNetErrDer;
 
-			    // Add the weight delta
+			    // Add the weight delta (accumulate for minibatch)
 			    netState->cOutputNode->getDelta(cInputNodeCounter, baseError,
 											    netState->cInputNode->getWeight(), learningRate,
 											    momentumFactor, weightDecay1, weightDecay2);
@@ -662,23 +732,12 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputL
 						netState->cOutputNode->getContextNode()->getWeight(), learningRate, momentumFactor, weightDecay1, weightDecay2);
 				}
 
-			    // Apply all deltas if we've hit the minibatch size
-			    if ((inputRowCounter % minibatchSize) == 0)
-			    {
-					if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
-					{
-						netState->cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
-						netState->cOutputNode->getContextNode()->clearPrevDeltas(0);
-					}
-
-				    netState->cOutputNode->applyDeltas(cInputNodeCounter, minibatchSize);
-				    netState->cOutputNode->clearPrevDeltas(cInputNodeCounter);
-			    }
-
-			    // Update the bias (inputs fundamentally cannot have a bias)
+			    // Accumulate bias updates (don't apply immediately)
 			    if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
-				    netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() -
-												 baseError);
+			    {
+				    // Store bias delta for later application
+				    netState->cInputLayer->addBiasDelta(baseError);
+			    }
 		    }
 
 		    // Update the error partials for the next recursive calls
@@ -774,6 +833,9 @@ void glades::NNetwork::clean()
 	overallClassRecall = 0.0f;
 	overallClassF1 = 0.0f;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
+	currentMinibatchSize = 0;
+	minibatchStartIndex = 0;
+	minibatchInProgress = false;
 }
 
 void glades::NNetwork::resetGraphs()

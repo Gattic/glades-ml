@@ -34,6 +34,9 @@ private:
 	int64_t id;
 	float biasWeight;
 	int type;
+	
+	// Minibatch bias accumulation
+	float biasDelta;
 
 public:
 	static const int INPUT_TYPE = 0;
@@ -74,6 +77,11 @@ public:
 	Node* operator[](unsigned int);
 
 	void setupContext();
+	
+	// Minibatch bias methods
+	void addBiasDelta(float delta);
+	void applyBiasDelta();
+	void clearBiasDelta();
 };
 };
 

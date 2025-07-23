@@ -79,6 +79,11 @@ private:
 	int minibatchSize;
 	int64_t id;
 
+	// Minibatch tracking
+	int currentMinibatchSize;
+	int minibatchStartIndex;
+	bool minibatchInProgress;
+
 	bool firstRunActivation;
 
 	// for tables & graphs
@@ -93,6 +98,7 @@ private:
 
 	void ForwardPass(unsigned int, int, int, unsigned int, unsigned int);
 	void BackPropagation(unsigned int, int, int, unsigned int, unsigned int);
+	void applyMinibatchUpdates(int actualMinibatchSize);
 
 public:
 	static const int TYPE_DFF = 0;

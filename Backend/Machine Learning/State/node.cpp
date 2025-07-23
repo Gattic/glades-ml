@@ -292,16 +292,21 @@ void glades::Node::getDelta(unsigned int index, float baseError, float cInputNod
 	addPrevDelta(index, deltaW);
 }
 
-void glades::Node::applyDeltas(unsigned int index, int minibatchSize)
+void glades::Node::applyDeltas(unsigned int index, int actualMinibatchSize)
 {
 	if (index >= edges.size())
 		return;
 
 	float deltaW = 0.0f;
-	for (int i = 0; i < minibatchSize; ++i)
+	int numDeltas = edges[index]->numPrevDeltas();
+	
+	// Use the actual number of accumulated deltas
+	for (int i = 0; i < numDeltas; ++i)
 		deltaW += edges[index]->getPrevDelta(i);
 
-	deltaW /= minibatchSize;
+	// Average the deltas
+	if (numDeltas > 0)
+		deltaW /= numDeltas;
 
 	// Set the new weight
 	setEdgeWeight(index, getEdgeWeight(index) - deltaW);

@@ -25,6 +25,7 @@ glades::Layer::Layer(int64_t newID, int newType, float newBias)
 	id = newID;
 	biasWeight = newBias;
 	type = newType;
+	biasDelta = 0.0f;
 }
 
 glades::Layer::Layer(int newType)
@@ -32,6 +33,7 @@ glades::Layer::Layer(int newType)
 	id = -1;
 	biasWeight = 0.0f;
 	type = newType;
+	biasDelta = 0.0f;
 }
 
 glades::Layer::~Layer()
@@ -39,6 +41,7 @@ glades::Layer::~Layer()
 	id = -1;
 	biasWeight = 0.0f;
 	type = 0;
+	biasDelta = 0.0f;
 	children.clear();
 	dropoutFlag.clear();
 }
@@ -296,4 +299,19 @@ void Layer::setupContext()
 		newNode->initWeights(1, Node::INIT_POSRAND);
 		children[i]->setContextNode(newNode);
 	}
+}
+
+void Layer::addBiasDelta(float delta)
+{
+	biasDelta += delta;
+}
+
+void Layer::applyBiasDelta()
+{
+	biasWeight -= biasDelta;
+}
+
+void Layer::clearBiasDelta()
+{
+	biasDelta = 0.0f;
 }
