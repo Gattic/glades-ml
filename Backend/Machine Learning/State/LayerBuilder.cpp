@@ -234,6 +234,68 @@ void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 	layers.push_back(cLayer);
 }
 
+glades::Layer* glades::LayerBuilder::getInputLayer(unsigned int inputRowCounter, unsigned int cInputLayerCounter)
+{
+	if (cInputLayerCounter >= layers.size())
+		return NULL;
+
+	// Current Input Layer
+	Layer* cInputLayer = NULL;
+	if (cInputLayerCounter == 0)
+		cInputLayer = inputLayers[inputRowCounter];
+	else
+		cInputLayer = layers[cInputLayerCounter-1];
+	if (!cInputLayer)
+		return NULL;
+	
+	return cInputLayer;
+}
+
+glades::Layer* glades::LayerBuilder::getOutputLayer(unsigned int cOutputLayerCounter)
+{
+	if (cOutputLayerCounter > layers.size())
+		return NULL;
+
+	// Current Output Layer
+	Layer* cOutputLayer = layers[cOutputLayerCounter-1];
+	if (!cOutputLayer)
+		return NULL;
+
+	// Why would this happen??
+	if (cOutputLayer->getType() == Layer::INPUT_TYPE)
+		return NULL;
+	
+	return cOutputLayer;
+}
+
+glades::Node* glades::LayerBuilder::getInputNode(Layer* cInputLayer, unsigned int cInputNodeCounter)
+{
+	// Current Input Node Error Check
+	if (cInputNodeCounter >= cInputLayer->size())
+		return NULL;
+
+	// Current Input Node
+	Node* cInputNode = cInputLayer->getNode(cInputNodeCounter);
+	if (!cInputNode)
+		return NULL;
+
+	return cInputNode;
+}
+
+glades::Node* glades::LayerBuilder::getOutputNode(Layer* cOutputLayer, unsigned int cOutputNodeCounter)
+{
+	// Current Output Node Error Check
+	if (cOutputNodeCounter >= cOutputLayer->size())
+		return NULL;
+
+	// Current Output Node
+	Node* cOutputNode = (*cOutputLayer)[cOutputNodeCounter];
+	if (!cOutputNode)
+		return NULL;
+
+	return cOutputNode;
+}
+
 glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int inputRowCounter, unsigned int cInputLayerCounter,
 	unsigned int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
