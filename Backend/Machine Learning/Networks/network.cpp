@@ -239,7 +239,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 					else
 					{
 						printf("\33[2K[NN] %d\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
-							   overallClassAccuracy, overallClassPrecision, overallClassRecall,
+							   overallClassAccuracy, mcc, overallClassPrecision, overallClassRecall,
 							   overallClassSpecificity, overallClassF1);
 						fflush(stdout);
 					}
@@ -596,12 +596,6 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter,
 	    for(cOutputNodeCounter = 0; cOutputNodeCounter < meat.getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
 	    {
 		Node* cOutputNode =  meat.getOutputNode(cOutputLayer, cOutputNodeCounter);
-		NetworkState* netState =
-		    meat.getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
-
-		if (!netState)
-		    return;
-
 		//printf("BackPropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
 
 		// Output Layer Error Derivative Calculation
@@ -623,8 +617,14 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter,
 		    cOutputDer = GMath::activationErrDer(cOutputNode->getWeight(), cActivationFx, 0.01f);
 		}
 
+		// Input Dropout Check
+		bool validInputNode = cInputLayer->possiblePath(cInputNodeCounter);
+
+		// Output Dropout Check
+		bool validOutputNode = cOutputLayer->possiblePath(cOutputNodeCounter);
+
 		// Does Dropout occur?
-		bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
+		bool dropout = (!((validInputNode) && (validOutputNode)));
 
 		// Node error derivative
 		float cOutNetErrDer = cOutputNode->getErrDer();
@@ -674,8 +674,6 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter,
 		// Update the error partials for the next recursive calls
 		float cInNetErrDer = cInputNode->getErrDer() + (cOutNetErrDer * cOutputNode->getEdgeWeight(cInputNodeCounter));
 		cInputNode->adjustErrDer(cInNetErrDer);
-
-		delete netState;
 	    }
 	}
     }

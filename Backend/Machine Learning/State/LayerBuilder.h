@@ -63,8 +63,7 @@ public:
 	Layer* getOutputLayer(unsigned int);
 	Node* getInputNode(Layer*, unsigned int);
 	Node* getOutputNode(Layer*, unsigned int);
-	NetworkState* getNetworkStateFromLoc(unsigned int, unsigned int, unsigned int, unsigned int,
-										 unsigned int);
+
 	void setTimeState(unsigned int, unsigned int, unsigned int, float);
 	unsigned int getInputLayersSize() const;
 	unsigned int getLayersSize() const;
