@@ -20,7 +20,6 @@ using namespace glades;
 
 glades::Edge::Edge(int64_t newID, float newWeight)
 {
-	id = newID;
 	weight = newWeight;
 	prevDelta.clear();
 	activated = false;
@@ -29,16 +28,10 @@ glades::Edge::Edge(int64_t newID, float newWeight)
 
 glades::Edge::~Edge()
 {
-	id = 0;
 	weight = 0.0f;
 	prevDelta.clear();
 	activated = false;
 	activation = 0.0f;
-}
-
-int64_t glades::Edge::getID() const
-{
-	return id;
 }
 
 float glades::Edge::getWeight() const
@@ -72,11 +65,6 @@ bool glades::Edge::getActivated() const
 float glades::Edge::getActivation() const
 {
 	return activation;
-}
-
-void glades::Edge::setID(int64_t newID)
-{
-	id = newID;
 }
 
 void glades::Edge::setWeight(float newWeight)

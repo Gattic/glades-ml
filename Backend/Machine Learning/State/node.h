@@ -36,7 +36,6 @@ class Edge;
 class Node
 {
 private:
-	int64_t id;
 	float weight;
 	float errorDer;
 	float activationScalar;
