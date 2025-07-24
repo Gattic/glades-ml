@@ -488,85 +488,85 @@ void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
 
 		// Last Input Node for the Output Node
 		float cOutputLayerActivation = 0.0f;
-		if (netState->lastValidInputNode)
+		if (!netState->lastValidInputNode)
+		    continue;
+
+		// Get the current output node activation
+		float cOutputNodeActivation = netState->cOutputNode->getActivation();
+
+		// Context Nodes
+		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
 		{
-		    // Get the current output node activation
-		    float cOutputNodeActivation = netState->cOutputNode->getActivation();
+		    float cContextEdgeActivation =
+		        netState->cOutputNode->getContextNode()->getEdgeWeight(0) * netState->cOutputNode->getContextNode()->getWeight();
+		    cOutputNodeActivation += cContextEdgeActivation;
+		}
 
-		    // Context Nodes
-		    if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		// Add the bias if we are in a hidden layer or output layer
+		// Input Layer fundamentally cannot have a bias
+		if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
+		    cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
+
+		if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		{
+		    netState->cOutputNode->getContextNode()->setWeight(netState->cOutputNode->getActivation());
+		}
+
+		// Clean the output node activation for next run (cleanup)
+		netState->cOutputNode->clearActivation();
+
+		// Set Our prediction based on the cOutputNode activation
+		int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
+		float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
+		cOutputLayerActivation = GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
+
+		//We add the current node activation to the list of activations that will be sent on the network for visualization purposes
+		if(inputRowCounter == di->getTrainSize()-1)
+		{
+		    cNodeActivations.addFloat(cOutputNodeActivation);
+		}
+
+		netState->cOutputNode->setWeight(cOutputLayerActivation);
+
+		// Output layer calculations
+		if (netState->cOutputLayer->getType() == Layer::OUTPUT_TYPE)
+		{
+		    // Get the prediction and expected vars
+		    float prediction = netState->cOutputNode->getWeight();
+		    float expectation = di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
+		    //printf("Expectation: %f Prediction: %f\n", expectation, prediction);
+
+		    // Add the expected and predicted to the result row
+		    results.addFloat(expectation);
+		    results.addFloat(prediction);
+
+		    // Cost function calculations
+		    float dataSize = (float)(di->getTrainSize() * netState->cOutputLayer->size());
+		    int costFx = skeleton->getOutputType();
+		    float cOutputCost = GMath::outputNodeCost(expectation, prediction, dataSize, costFx);
+
+		    // Error across every input instance
+		    overallTotalError += cOutputCost;
+
+		    // Accuracy vars
+		    float percentError = GMath::PercentError(prediction, expectation, cOutputCost);
+		    float calculatedError = GMath::error(expectation, prediction);
+		    bool isCorrect = percentError < GMath::OUTLIER;
+		    float accuracy = (1.0f - percentError) * 100.0f;
+		    if (accuracy < 0.0f)
+		        accuracy = 0.0f;
+		    overallTotalAccuracy += accuracy;
+
+		    // Advanced Debugging
+		    /*if (DEBUG_ADVANCED)
 		    {
-			float cContextEdgeActivation =
-			    netState->cOutputNode->getContextNode()->getEdgeWeight(0) * netState->cOutputNode->getContextNode()->getWeight();
-			cOutputNodeActivation += cContextEdgeActivation;
-		    }
+		        printf("%f\t%f\t%f\t%f\t%f%%\t(%s)\n", expectation, prediction, calculatedError,
+		    	cOutputCost, (1.0f - percentError) * 100.0f, isCorrect ? "True" : "False");
 
-		    // Add the bias if we are in a hidden layer or output layer
-		    // Input Layer fundamentally cannot have a bias
-		    if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
-			cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
-
-		    if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
-		    {
-			netState->cOutputNode->getContextNode()->setWeight(netState->cOutputNode->getActivation());
-		    }
-
-		    // Clean the output node activation for next run (cleanup)
-		    netState->cOutputNode->clearActivation();
-
-		    // Set Our prediction based on the cOutputNode activation
-		    int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
-		    float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
-		    cOutputLayerActivation = GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
-
-		    //We add the current node activation to the list of activations that will be sent on the network for visualization purposes
-		    if(inputRowCounter == di->getTrainSize()-1)
-		    {
-			cNodeActivations.addFloat(cOutputNodeActivation);
-		    }
-
-		    netState->cOutputNode->setWeight(cOutputLayerActivation);
-
-		    // Output layer calculations
-		    if (netState->cOutputLayer->getType() == Layer::OUTPUT_TYPE)
-		    {
-			// Get the prediction and expected vars
-			float prediction = netState->cOutputNode->getWeight();
-			float expectation = di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
-			//printf("Expectation: %f Prediction: %f\n", expectation, prediction);
-
-			// Add the expected and predicted to the result row
-			results.addFloat(expectation);
-			results.addFloat(prediction);
-
-			// Cost function calculations
-			float dataSize = (float)(di->getTrainSize() * netState->cOutputLayer->size());
-			int costFx = skeleton->getOutputType();
-			float cOutputCost = GMath::outputNodeCost(expectation, prediction, dataSize, costFx);
-
-			// Error across every input instance
-			overallTotalError += cOutputCost;
-
-			// Accuracy vars
-			float percentError = GMath::PercentError(prediction, expectation, cOutputCost);
-			float calculatedError = GMath::error(expectation, prediction);
-			bool isCorrect = percentError < GMath::OUTLIER;
-			float accuracy = (1.0f - percentError) * 100.0f;
-			if (accuracy < 0.0f)
-			    accuracy = 0.0f;
-			overallTotalAccuracy += accuracy;
-
-			// Advanced Debugging
-			/*if (DEBUG_ADVANCED)
-			{
-			    printf("%f\t%f\t%f\t%f\t%f%%\t(%s)\n", expectation, prediction, calculatedError,
-				cOutputCost, (1.0f - percentError) * 100.0f, isCorrect ? "True" : "False");
-
-			// Multiple output nodes
-			if (netState->cOutputLayer->size() > 1)
-			    printf("-----------------------------------------------------------\n");
-			}*/
-		    }
+		    // Multiple output nodes
+		    if (netState->cOutputLayer->size() > 1)
+		        printf("-----------------------------------------------------------\n");
+		    }*/
 		}
 
 		delete netState;
