@@ -456,240 +456,225 @@ void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
 }
 
 void glades::NNetwork::ForwardPass(unsigned int inputRowCounter,
-		int cInputLayerCounter, int cOutputLayerCounter,
-		unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
+    int cInputLayerCounter, int cOutputLayerCounter,
+    unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
 {
-	for(unsigned int cLayerCounter = 0; cLayerCounter < skeleton->numHiddenLayers()+1; ++cLayerCounter)
+    for(unsigned int cLayerCounter = 0; cLayerCounter < skeleton->numHiddenLayers()+1; ++cLayerCounter)
+    {
+	cInputLayerCounter = cLayerCounter;
+	cOutputLayerCounter = cLayerCounter + 1;
+
+	for(cOutputNodeCounter = 0; cOutputNodeCounter < meat.getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
 	{
-	    cInputLayerCounter = cLayerCounter;
-	    cOutputLayerCounter = cLayerCounter + 1;
-
-	    for(cOutputNodeCounter = 0; cOutputNodeCounter < meat.getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
-	    {
-		for(cInputNodeCounter = 0; cInputNodeCounter < meat.getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
-		{
-		    NetworkState* netState =
-			    meat.getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
-									 cInputNodeCounter, cOutputNodeCounter);
-		    if (!netState)
-			    return;
-
-		    //printf("ForwardPass: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
-			    //cInputNodeCounter, cOutputNodeCounter);
-
-		    // Does Dropout occur?
-		    bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
-
-		    // Add the input node activation to the output node
-		    if (!dropout)
-		    {
-			    float cEdgeActivation = netState->cOutputNode->getEdgeWeight(cInputNodeCounter) *
-								netState->cInputNode->getWeight();
-			    //printf("\n\nEdge Activation[%d][%d][%d][%d][%d]: %f\n\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cEdgeActivation);
-			    netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
-		    }
-		    // Last Input Node for the Output Node
-		    float cOutputLayerActivation = 0.0f;
-		    if (netState->lastValidInputNode)
-		    {
-			    // Get the current output node activation
-			    float cOutputNodeActivation = netState->cOutputNode->getActivation();
-
-				// Context Nodes
-				if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
-				{
-					float cContextEdgeActivation =
-						netState->cOutputNode->getContextNode()->getEdgeWeight(0) *
-						netState->cOutputNode->getContextNode()->getWeight();
-					cOutputNodeActivation += cContextEdgeActivation;
-				}
-
-			    // Add the bias if we are in a hidden layer or output layer
-			    // Input Layer fundamentally cannot have a bias
-			    if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
-				    cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
-
-				if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
-				{
-					netState->cOutputNode->getContextNode()->setWeight(netState->cOutputNode->getActivation());
-				}
-
-			    // Clean the output node activation for next run (cleanup)
-			    netState->cOutputNode->clearActivation();
-
-			    // Set Our prediction based on the cOutputNode activation
-			    int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
-			    float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
-			    cOutputLayerActivation =
-				    GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
-
-			    //We add the current node activation to the list of activations that will be sent on the network for visualization purposes
-			    if(inputRowCounter == di->getTrainSize()-1)
-			    {
-				cNodeActivations.addFloat(cOutputNodeActivation);
-			    }
-
-			    netState->cOutputNode->setWeight(cOutputLayerActivation);
-
-			    // Output layer calculations
-			    if (netState->cOutputLayer->getType() == Layer::OUTPUT_TYPE)
-			    {
-				    // Get the prediction and expected vars
-				    float prediction = netState->cOutputNode->getWeight();
-				    float expectation =
-					    di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
-				    //printf("Expectation: %f Prediction: %f\n", expectation, prediction);
-
-				    // Add the expected and predicted to the result row
-				    results.addFloat(expectation);
-				    results.addFloat(prediction);
-
-				    // Cost function calculations
-				    float dataSize = (float)(di->getTrainSize() * netState->cOutputLayer->size());
-				    int costFx = skeleton->getOutputType();
-				    float cOutputCost = GMath::outputNodeCost(expectation, prediction, dataSize, costFx);
-
-				    // Error across every input instance
-				    overallTotalError += cOutputCost;
-
-				    // Accuracy vars
-				    float percentError = GMath::PercentError(prediction, expectation, cOutputCost);
-				    float calculatedError = GMath::error(expectation, prediction);
-				    bool isCorrect = percentError < GMath::OUTLIER;
-				    float accuracy = (1.0f - percentError) * 100.0f;
-				    if (accuracy < 0.0f)
-					    accuracy = 0.0f;
-				    overallTotalAccuracy += accuracy;
-
-				    // Advanced Debugging
-				    /*if (DEBUG_ADVANCED)
-				    {
-					    printf("%f\t%f\t%f\t%f\t%f%%\t(%s)\n", expectation, prediction, calculatedError,
-						    cOutputCost, (1.0f - percentError) * 100.0f, isCorrect ? "True" : "False");
-
-					    // Multiple output nodes
-					    if (netState->cOutputLayer->size() > 1)
-						    printf("-----------------------------------------------------------\n");
-				    }*/
-			    }
-		    }
-
-		    
-
-
-		    delete netState;
-		}
-		
-	
-	    }
-	if(inputRowCounter == di->getTrainSize()-1)
-	       {
-		   cNodeActivations.addString(",");
-		}
-	}
-}
-
-void glades::NNetwork::BackPropagation(unsigned int inputRowCounter, int cInputLayerCounter,
-									   int cOutputLayerCounter, unsigned int cInputNodeCounter,
-									   unsigned int cOutputNodeCounter)
-{
-	for(unsigned int cLayerCounter = skeleton->numHiddenLayers()+1; cLayerCounter > 0; --cLayerCounter)
-	{
-	    cOutputLayerCounter = cLayerCounter;
-	    cInputLayerCounter = cLayerCounter - 1;
 	    for(cInputNodeCounter = 0; cInputNodeCounter < meat.getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
 	    {
-		for(cOutputNodeCounter = 0; cOutputNodeCounter < meat.getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
+		NetworkState* netState =
+		    meat.getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+		if (!netState)
+		    return;
+
+		//printf("ForwardPass: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+
+		// Does Dropout occur?
+		bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
+
+		// Add the input node activation to the output node
+		if (!dropout)
 		{
-		    NetworkState* netState =
-			    meat.getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter,
-									 cInputNodeCounter, cOutputNodeCounter);
-		    if (!netState)
-			    return;
+		    float cEdgeActivation = netState->cOutputNode->getEdgeWeight(cInputNodeCounter) * netState->cInputNode->getWeight();
+		    //printf("\n\nEdge Activation[%d][%d][%d][%d][%d]: %f\n\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cEdgeActivation);
+		    netState->cOutputNode->setActivation(cInputNodeCounter, cEdgeActivation);
+		}
 
-		    //printf("BackPropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter,
-			    //cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+		// Last Input Node for the Output Node
+		float cOutputLayerActivation = 0.0f;
+		if (netState->lastValidInputNode)
+		{
+		    // Get the current output node activation
+		    float cOutputNodeActivation = netState->cOutputNode->getActivation();
 
-		    // Output Layer Error Derivative Calculation
-		    float cOutputDer = 1.0f; // Output der is linear so its 1
+		    // Context Nodes
+		    if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		    {
+			float cContextEdgeActivation =
+			    netState->cOutputNode->getContextNode()->getEdgeWeight(0) * netState->cOutputNode->getContextNode()->getWeight();
+			cOutputNodeActivation += cContextEdgeActivation;
+		    }
+
+		    // Add the bias if we are in a hidden layer or output layer
+		    // Input Layer fundamentally cannot have a bias
+		    if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
+			cOutputNodeActivation += netState->cInputLayer->getBiasWeight();
+
+		    if ((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		    {
+			netState->cOutputNode->getContextNode()->setWeight(netState->cOutputNode->getActivation());
+		    }
+
+		    // Clean the output node activation for next run (cleanup)
+		    netState->cOutputNode->clearActivation();
+
+		    // Set Our prediction based on the cOutputNode activation
+		    int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
+		    float cActivationParam = skeleton->getActivationParam(cInputLayerCounter);
+		    cOutputLayerActivation = GMath::squash(cOutputNodeActivation, cActivationFx, cActivationParam);
+
+		    //We add the current node activation to the list of activations that will be sent on the network for visualization purposes
+		    if(inputRowCounter == di->getTrainSize()-1)
+		    {
+			cNodeActivations.addFloat(cOutputNodeActivation);
+		    }
+
+		    netState->cOutputNode->setWeight(cOutputLayerActivation);
+
+		    // Output layer calculations
 		    if (netState->cOutputLayer->getType() == Layer::OUTPUT_TYPE)
 		    {
-			    // Cost function error derivative for output layer(s)
-			    float prediction = netState->cOutputNode->getWeight();
-			    float expectation =
-				    di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
+			// Get the prediction and expected vars
+			float prediction = netState->cOutputNode->getWeight();
+			float expectation = di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
+			//printf("Expectation: %f Prediction: %f\n", expectation, prediction);
 
-			    int costFx = skeleton->getOutputType();
-			    netState->cOutputNode->clearErrDer();
-			    netState->cOutputNode->adjustErrDer(GMath::costErrDer(expectation, prediction, costFx));
+			// Add the expected and predicted to the result row
+			results.addFloat(expectation);
+			results.addFloat(prediction);
+
+			// Cost function calculations
+			float dataSize = (float)(di->getTrainSize() * netState->cOutputLayer->size());
+			int costFx = skeleton->getOutputType();
+			float cOutputCost = GMath::outputNodeCost(expectation, prediction, dataSize, costFx);
+
+			// Error across every input instance
+			overallTotalError += cOutputCost;
+
+			// Accuracy vars
+			float percentError = GMath::PercentError(prediction, expectation, cOutputCost);
+			float calculatedError = GMath::error(expectation, prediction);
+			bool isCorrect = percentError < GMath::OUTLIER;
+			float accuracy = (1.0f - percentError) * 100.0f;
+			if (accuracy < 0.0f)
+			    accuracy = 0.0f;
+			overallTotalAccuracy += accuracy;
+
+			// Advanced Debugging
+			/*if (DEBUG_ADVANCED)
+			{
+			    printf("%f\t%f\t%f\t%f\t%f%%\t(%s)\n", expectation, prediction, calculatedError,
+				cOutputCost, (1.0f - percentError) * 100.0f, isCorrect ? "True" : "False");
+
+			// Multiple output nodes
+			if (netState->cOutputLayer->size() > 1)
+			    printf("-----------------------------------------------------------\n");
+			}*/
 		    }
-		    else if (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE)
-		    {
-			    // Activation error derivative
-			    int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
-			    cOutputDer =
-				    GMath::activationErrDer(netState->cOutputNode->getWeight(), cActivationFx, 0.01f);
-		    }
-
-		    // Does Dropout occur?
-		    bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
-
-		    // Node error derivative
-		    float cOutNetErrDer = netState->cOutputNode->getErrDer();
-		    if (!dropout)
-		    {
-			    cOutNetErrDer *= cOutputDer; // current error partial
-
-			    // Clean the output node err der (cleanup)
-			    if (cInputNodeCounter == netState->cInputLayer->size() - 1)
-				    netState->cOutputNode->clearErrDer();
-
-			    // MSE applied through gradient descent
-			    float learningRate = skeleton->getLearningRate(cInputLayerCounter);
-			    float momentumFactor = skeleton->getMomentumFactor(cInputLayerCounter);
-			    float weightDecay1 = skeleton->getWeightDecay1(cInputLayerCounter);
-			    float weightDecay2 = skeleton->getWeightDecay2(cInputLayerCounter);
-			    float baseError = learningRate * cOutNetErrDer;
-
-			    // Add the weight delta
-			    netState->cOutputNode->getDelta(cInputNodeCounter, baseError,
-											    netState->cInputNode->getWeight(), learningRate,
-											    momentumFactor, weightDecay1, weightDecay2);
-
-				if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
-				{
-					netState->cOutputNode->getContextNode()->getDelta(0, baseError,
-						netState->cOutputNode->getContextNode()->getWeight(), learningRate, momentumFactor, weightDecay1, weightDecay2);
-				}
-
-			    // Apply all deltas if we've hit the minibatch size
-			    if ((inputRowCounter % minibatchSize) == 0)
-			    {
-					if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
-					{
-						netState->cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
-						netState->cOutputNode->getContextNode()->clearPrevDeltas(0);
-					}
-
-				    netState->cOutputNode->applyDeltas(cInputNodeCounter, minibatchSize);
-				    netState->cOutputNode->clearPrevDeltas(cInputNodeCounter);
-			    }
-
-			    // Update the bias (inputs fundamentally cannot have a bias)
-			    if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
-				    netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() -
-												 baseError);
-		    }
-
-		    // Update the error partials for the next recursive calls
-		    float cInNetErrDer = netState->cInputNode->getErrDer() +
-						 (cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
-		    netState->cInputNode->adjustErrDer(cInNetErrDer);
-
-		    delete netState;
 		}
+
+		delete netState;
 	    }
 	}
+
+	if(inputRowCounter == di->getTrainSize()-1)
+	{
+	    cNodeActivations.addString(",");
+	}
+    }
+}
+
+void glades::NNetwork::BackPropagation(unsigned int inputRowCounter,
+    int cInputLayerCounter, int cOutputLayerCounter,
+    unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
+{
+    for(unsigned int cLayerCounter = skeleton->numHiddenLayers()+1; cLayerCounter > 0; --cLayerCounter)
+    {
+	cOutputLayerCounter = cLayerCounter;
+	cInputLayerCounter = cLayerCounter - 1;
+	for(cInputNodeCounter = 0; cInputNodeCounter < meat.getLayerSize(cInputLayerCounter); ++cInputNodeCounter)
+	{
+	    for(cOutputNodeCounter = 0; cOutputNodeCounter < meat.getLayerSize(cOutputLayerCounter); ++cOutputNodeCounter)
+	    {
+		NetworkState* netState =
+		    meat.getNetworkStateFromLoc(inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+
+		if (!netState)
+		    return;
+
+		//printf("BackPropagation: %d %d %d %d %d\n", inputRowCounter, cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter);
+
+		// Output Layer Error Derivative Calculation
+		float cOutputDer = 1.0f; // Output der is linear so its 1
+		if (netState->cOutputLayer->getType() == Layer::OUTPUT_TYPE)
+		{
+		    // Cost function error derivative for output layer(s)
+		    float prediction = netState->cOutputNode->getWeight();
+		    float expectation = di->getTrainExpectedRow(inputRowCounter)[cOutputNodeCounter];
+
+		    int costFx = skeleton->getOutputType();
+		    netState->cOutputNode->clearErrDer();
+		    netState->cOutputNode->adjustErrDer(GMath::costErrDer(expectation, prediction, costFx));
+		}
+		else if (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE)
+		{
+		    // Activation error derivative
+		    int cActivationFx = skeleton->getActivationType(cInputLayerCounter);
+		    cOutputDer = GMath::activationErrDer(netState->cOutputNode->getWeight(), cActivationFx, 0.01f);
+		}
+
+		// Does Dropout occur?
+		bool dropout = (!((netState->validInputNode) && (netState->validOutputNode)));
+
+		// Node error derivative
+		float cOutNetErrDer = netState->cOutputNode->getErrDer();
+		if (!dropout)
+		{
+		    cOutNetErrDer *= cOutputDer; // current error partial
+
+		    // Clean the output node err der (cleanup)
+		    if (cInputNodeCounter == netState->cInputLayer->size() - 1)
+		        netState->cOutputNode->clearErrDer();
+
+		    // MSE applied through gradient descent
+		    float learningRate = skeleton->getLearningRate(cInputLayerCounter);
+		    float momentumFactor = skeleton->getMomentumFactor(cInputLayerCounter);
+		    float weightDecay1 = skeleton->getWeightDecay1(cInputLayerCounter);
+		    float weightDecay2 = skeleton->getWeightDecay2(cInputLayerCounter);
+		    float baseError = learningRate * cOutNetErrDer;
+
+		    // Add the weight delta
+		    netState->cOutputNode->getDelta(cInputNodeCounter, baseError, netState->cInputNode->getWeight(),
+		        learningRate, momentumFactor, weightDecay1, weightDecay2);
+
+		    if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		    {
+		        netState->cOutputNode->getContextNode()->getDelta(0, baseError,
+		    	netState->cOutputNode->getContextNode()->getWeight(), learningRate, momentumFactor, weightDecay1, weightDecay2);
+		    }
+
+		    // Apply all deltas if we've hit the minibatch size
+		    if ((inputRowCounter % minibatchSize) == 0)
+		    {
+		        if((netType == TYPE_RNN) && (netState->cOutputLayer->getType() == Layer::HIDDEN_TYPE))
+		        {
+		    	netState->cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
+		    	netState->cOutputNode->getContextNode()->clearPrevDeltas(0);
+		        }
+
+		        netState->cOutputNode->applyDeltas(cInputNodeCounter, minibatchSize);
+		        netState->cOutputNode->clearPrevDeltas(cInputNodeCounter);
+		    }
+
+		    // Update the bias (inputs fundamentally cannot have a bias)
+		    if (netState->cInputLayer->getType() != Layer::INPUT_TYPE)
+		        netState->cInputLayer->setBiasWeight(netState->cInputLayer->getBiasWeight() - baseError);
+		}
+
+		// Update the error partials for the next recursive calls
+		float cInNetErrDer = netState->cInputNode->getErrDer() + (cOutNetErrDer * netState->cOutputNode->getEdgeWeight(cInputNodeCounter));
+		netState->cInputNode->adjustErrDer(cInNetErrDer);
+
+		delete netState;
+	    }
+	}
+    }
 }
 
 /*!
