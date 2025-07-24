@@ -658,8 +658,8 @@ void glades::NNetwork::BackPropagation(unsigned int inputRowCounter,
 		    {
 		        if((netType == TYPE_RNN) && (cOutputLayer->getType() == Layer::HIDDEN_TYPE))
 		        {
-		    	cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
-		    	cOutputNode->getContextNode()->clearPrevDeltas(0);
+			   cOutputNode->getContextNode()->applyDeltas(0, minibatchSize);
+			   cOutputNode->getContextNode()->clearPrevDeltas(0);
 		        }
 
 		        cOutputNode->applyDeltas(cInputNodeCounter, minibatchSize);
