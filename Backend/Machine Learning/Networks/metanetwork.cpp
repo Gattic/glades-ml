@@ -256,7 +256,8 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
                                         const int inputType,
                                         std::vector<glades::NNetwork*>& networks, 
                                         std::vector<float>& averageAccuracies, 
-                                        unsigned int foldsNum)
+                                        unsigned int foldsNum,
+                                        bool timingSeries)
 {
     shmea::GVector<shmea::GTable*> stratTbls = shmea::GTable::stratify(inputGTable, foldsNum);
     averageAccuracies.clear();
@@ -265,7 +266,12 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
         averageAccuracies.push_back(0.0f);
     }
 
-    for (unsigned int i = 0; i < stratTbls.size(); ++i) {
+    unsigned int i = 0;
+    if (timingSeries) {
+        i = 1;
+    }
+
+    for (; i < stratTbls.size(); ++i) {
 	    printf("===================================\n");
 	    printf("===================================\n");
 	    printf("Fold %d\n", i+1);
@@ -292,7 +298,7 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
             return;
 
         // Load the input data
-        shmea::GTable* trainGTable = shmea::GTable::unionFolds(stratTbls, i);
+        shmea::GTable* trainGTable = shmea::GTable::unionFolds(stratTbls, i, timingSeries);
         
         diTrain->import(*trainGTable);
         diTest->import(*stratTbls[i]);
@@ -342,7 +348,7 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
     if (rowNum <= testRowNum + validationRowNum) {
         return;
     }
-    unsigned int foldsNum = (rowNum - validationRowNum) / testRowNum;
+    unsigned int foldsNum = (rowNum - validationRowNum + testRowNum - 1) / testRowNum; //ceiling
     if (foldsNum == 0) {
         foldsNum = 1;
     }

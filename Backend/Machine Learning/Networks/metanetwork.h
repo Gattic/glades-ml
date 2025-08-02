@@ -66,8 +66,8 @@ public:
 
 	// verification functions
 	void crossValidate(shmea::GString, DataInput*);
-    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, unsigned int = 5);
-    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, std::vector<float>&, unsigned int = 10, unsigned int = 30);
+    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, unsigned int = 5, bool = false);
+    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, std::vector<float>&, unsigned int = 10, unsigned int = 20);
 };
 };
 
