@@ -433,7 +433,7 @@ glades::MetaNetwork* glades::crossValidate(std::vector<glades::NNetwork*> networ
         return NULL;
     }
 	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(networks[0]->getName());
-    cMetaNetwork->crossValidate(inputTbl, inputType, networks, averageAccuracies, foldsNum);
+    cMetaNetwork->crossValidate(inputTbl, inputType, networks, averageAccuracies, foldsNum, timingSeries);
     return cMetaNetwork;
 }
 
