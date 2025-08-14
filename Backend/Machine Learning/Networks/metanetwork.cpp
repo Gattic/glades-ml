@@ -259,7 +259,7 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
                                         unsigned int foldsNum,
                                         bool timingSeries)
 {
-    shmea::GVector<shmea::GTable*> stratTbls = shmea::GTable::stratify(inputGTable, foldsNum);
+    shmea::GVector<shmea::GTable*> stratTbls = shmea::GTable::stratify(inputGTable, foldsNum, timingSeries);
     averageAccuracies.clear();
     for (unsigned int netNum = 0; netNum < networks.size(); ++netNum) {
         addSubnet(networks[netNum]);
