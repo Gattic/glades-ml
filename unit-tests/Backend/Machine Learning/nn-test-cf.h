@@ -17,5 +17,6 @@
 
 void NNCFUnitTest();
 void NNCFUnitTestNew();
+void NNCFUnitTestValidation();
 
 #endif
