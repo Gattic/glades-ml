@@ -31,6 +31,9 @@ public:
     RGBA blendColors(const RGBA& baseColor, const RGBA& overlayColor, float alpha) const;
     RGBA blendRGBA(const RGBA& base, const RGBA& over) const;
     
+    //Color Generation  
+    RGBA HSVtoRGBA(float h, float s, float v);
+    
     // Get color collections
     const std::vector<RGBA>& getThemeColors() const;
     const std::map<std::string, RGBA>& getElementColors() const;

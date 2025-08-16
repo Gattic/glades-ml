@@ -1,6 +1,6 @@
 set(PCATests_src_files
 nn-test.cpp
-nn-test-cf.cpp
+nn-cv-test.cpp
 pca-test.cpp
 kmeans-test.cpp
 bayes-test.cpp

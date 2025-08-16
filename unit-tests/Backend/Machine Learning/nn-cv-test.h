@@ -5,8 +5,8 @@
 // modification, transfer, or transmittal of this work for any purpose
 // in any form or by any means without the written permission of
 // Robert Carneiro is strictly prohibited.
-#ifndef _UT_NNCF
-#define _UT_NNCF
+#ifndef _UT_NNCV
+#define _UT_NNCV
 
 #include <iostream>
 #include <stdio.h>
@@ -15,8 +15,6 @@
 #include <string>
 #include <unistd.h>
 
-void NNCFUnitTest();
-void NNCFUnitTestNew();
-void NNCFUnitTestValidation();
+void NNCVUnitTestValidation();
 
 #endif
