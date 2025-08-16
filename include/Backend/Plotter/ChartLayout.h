@@ -67,7 +67,15 @@ public:
     // Origin axes (four quadrants) visibility
     void setShowOriginAxes(bool show);
     bool areOriginAxesVisible() const;
-    
+   
+    //Decision if we want to display dates
+    void setDateLabel(bool date);
+    bool isDateLabelShown() const;
+
+    //Decision if Legend is displayed
+    void setLegendLabels(bool legend);
+    bool isLegendVisible() const;
+
     // Supersampling factor
     unsigned int getSsaaFactor() const;
     void setSsaaFactor(unsigned int factor);
@@ -96,6 +104,8 @@ private:
     bool showGrid;
     bool showAxes;
     bool showOriginAxes;  // Whether to show origin-centered axes (four quadrants)
+    bool dateLabel;
+    bool legendLabel;
     unsigned int ssaaFactor;
     Image ssaaImage; // Reference to the supersampled image
     int logoWidth;  // Width of the logo image

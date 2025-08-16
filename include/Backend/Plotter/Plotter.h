@@ -36,6 +36,12 @@ enum ChartType {
     CHART_CLUSTER
 };
 
+// Normalization mode for series plotting
+enum NormalizationMode {
+    NORMALIZE_TOGETHER,    // All series normalized together on the same scale
+    NORMALIZE_INDEPENDENT  // Each series normalized independently on its own scale
+};
+
 // Series type for multi-series charts
 enum SeriesType {
     SERIES_LINE,
@@ -139,7 +145,9 @@ public:
     ChartBuilder& cornerRadius(int radius);
     ChartBuilder& logo(const std::string& logoPath);
     ChartBuilder& colors(const std::vector<RGBA>& colors);
-    
+    ChartBuilder& dateLabels(bool date);
+    ChartBuilder& legendLabels(bool legend);
+
     // Data visualization methods
     ChartBuilder& addSeries(const Series& series);
     ChartBuilder& addSeries(const std::string& name, const std::vector<Point>& data, 
@@ -160,6 +168,9 @@ public:
     
     // Centroid positioning method
     ChartBuilder& alignCentroidsWithClusters(bool align = true);
+    
+    // Normalization control
+    ChartBuilder& normalizeSeries(NormalizationMode mode = NORMALIZE_TOGETHER);
     
     // Arrow visualization
     ChartBuilder& addArrows(const std::vector<Arrow>& arrows);
@@ -190,6 +201,7 @@ private:
     std::vector<int> clusterLabels;
     std::vector<std::vector<double> > centroids;
     bool alignCentroids; // Whether to force centroids to align with cluster centers
+    NormalizationMode normalizationMode; // How to normalize series data
 };
 
 // Plotter class that handles visualization using the component classes
@@ -233,7 +245,13 @@ public:
     // Custom color manager
     void setCustomColors(const std::vector<RGBA>& clusterColors);
     void use10ClusterColorScheme(); // Use the 10-cluster color scheme
-    
+   
+    //Custom Date Labels decision
+    void setDateLabels(bool date);
+
+    //Custom Legend Labels
+    void setLegendLabels(bool legend);
+
     // Basic drawing methods
     void prepareCanvas();
     void addTitle(const std::string& text, unsigned int fontSize = 24);
@@ -258,12 +276,14 @@ public:
     void plotChart(const std::vector<Series>& seriesList,
                   const std::string& title = "Chart Visualization",
                   const std::string& xAxisLabel = "X Value",
-                  const std::string& yAxisLabel = "Y Value");
+                  const std::string& yAxisLabel = "Y Value",
+                  NormalizationMode normalizationMode = NORMALIZE_TOGETHER);
          
     void plotChart(const std::vector<Series>& seriesList,
                         const DataMapper::AxisRange& xRange,
                         const DataMapper::AxisRange& yRange,
-			const std::vector<CandleData>& candles = std::vector<CandleData>());
+			const std::vector<CandleData>& candles = std::vector<CandleData>(),
+                        NormalizationMode normalizationMode = NORMALIZE_TOGETHER);
 
          
     // Arrow visualization methods
