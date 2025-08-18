@@ -143,7 +143,7 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
     //printf("OHEMaps.size() = %lu\n", OHEMaps.size());
 }
 
-void ImageInput::import(shmea::GString newName)
+void ImageInput::import(shmea::GString newName, int standardizeFlag)
 {
     if(loaded)
 	return;
@@ -174,7 +174,7 @@ void ImageInput::import(shmea::GString newName)
     loaded = true;
 }
 
-void ImageInput::import(const shmea::GTable&)
+void ImageInput::import(const shmea::GTable&, int standardizeFlag)
 {
 }
 

@@ -70,8 +70,8 @@ public:
 	    testExpectedMatrix.clear();
 	}
 
-	virtual void import(shmea::GString);
-	virtual void import(const shmea::GTable&);
+	virtual void import(shmea::GString, int = 0);
+	virtual void import(const shmea::GTable&, int = 0);
 //	void standardizeInputTable(const shmea::GString&, int = 0, bool = true);
 	void standardizeInputTable(const shmea::GTable&, int = 0, bool = true);
 

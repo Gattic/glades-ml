@@ -25,7 +25,7 @@
 
 using namespace glades;
 
-void NumberInput::import(shmea::GString fname)
+void NumberInput::import(shmea::GString fname, int standardizeFlag)
 {
     if(loaded)
     {
@@ -37,7 +37,7 @@ void NumberInput::import(shmea::GString fname)
     // Load and Normalize/Standardize the data
     shmea::GTable rawTable = shmea::GTable(fname, ',', shmea::GTable::TYPE_FILE);
 //    standardizeInputTable(fname);
-    standardizeInputTable(rawTable, 1);
+    standardizeInputTable(rawTable, standardizeFlag);
 
     // TODO: test table stuff
 
@@ -45,7 +45,7 @@ void NumberInput::import(shmea::GString fname)
     loaded = true;
 }
 
-void NumberInput::import(const shmea::GTable& rawTable)
+void NumberInput::import(const shmea::GTable& rawTable, int standardizeFlag)
 {
     if(loaded)
     {
@@ -53,7 +53,7 @@ void NumberInput::import(const shmea::GTable& rawTable)
     }
 
     // Load and Normalize/Standardize the data
-    standardizeInputTable(rawTable, 0, false);
+    standardizeInputTable(rawTable, standardizeFlag, false);
 
     loaded = true;
 }
