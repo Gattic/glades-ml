@@ -311,10 +311,12 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
             
             // Run the training and retrieve a metanetwork
             printf("Train\n");
+            cNetwork->setChangeInputLayers(true);
             cNetwork->train(diTrain);
 
             // Run the test and retrieve a metanetwork
             printf("Test\n");
+            cNetwork->setChangeInputLayers(true);
             cNetwork->test(diTest);
 
             averageAccuracies[netInd] += cNetwork->getAccuracy();
@@ -383,6 +385,7 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
         glades::NNetwork* cNetwork = getSubnet(netInd);
         
         // Run the validation
+        cNetwork->setChangeInputLayers(true);
         cNetwork->test(diValidation);
         validationAccuracies[netInd] = cNetwork->getAccuracy();
     }

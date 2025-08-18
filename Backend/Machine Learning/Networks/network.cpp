@@ -63,6 +63,7 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 		return;
 
 	running = false;
+    changeInputLayers = false;
 	di = NULL;
 	skeleton = NULL;
 	serverInstance = NULL;
@@ -127,7 +128,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
 		meat.build(skeleton, di, netType);
-    else {
+    else if (changeInputLayers) {
         meat.rebuildInputLayers(skeleton, di);
         starting_epochs = epochs;
     }
@@ -394,6 +395,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 
 	// So the network doesnt immediately quit next time and we can prematurely start our net
 	running = false;
+    changeInputLayers = false;
 }
 
 void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
@@ -783,3 +785,14 @@ void glades::NNetwork::resetGraphs()
 	// create the results again
 	results.clear();
 }
+
+bool glades::NNetwork::getChangeInputLayers() const
+{
+    return changeInputLayers;
+}
+
+void glades::NNetwork::setChangeInputLayers(bool cIL)
+{
+    changeInputLayers = cIL;
+}
+
