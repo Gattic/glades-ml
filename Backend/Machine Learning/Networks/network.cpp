@@ -366,7 +366,8 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 			Frontend::nnCreatorPanel->PlotScatter(getResults());*/
 
 		// Shut it down?
-		if (terminator.triggered(time(NULL), epochs - starting_epochs, overallTotalAccuracy))
+//		if (terminator.triggered(time(NULL), epochs - starting_epochs, overallTotalAccuracy))
+		if (terminator.triggered(time(NULL), epochs - starting_epochs, getAccuracy()))
 			break;
 
 		// Shut it down?
