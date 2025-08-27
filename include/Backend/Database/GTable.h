@@ -109,8 +109,12 @@ public:
 	GList operator[](const GString&) const;
 	void operator=(const GTable&);
 
-	static shmea::GVector<GTable*> stratify(const GTable&, unsigned int = 10);
+	static shmea::GVector<GTable*> stratify(const GTable&, unsigned int = 10, bool = false);
 	static shmea::GVector<GTable*> stratify(const shmea::GVector<GTable*>, unsigned int = 10);
+    static shmea::GTable* unionFolds(const shmea::GVector<GTable*>&, unsigned int, bool = false);
+    static shmea::GTable* shuffleRows(const GTable&);
+    static shmea::GTable* firstNRows(const GTable&, unsigned int);
+    static shmea::GTable* lastNRows(const GTable&, unsigned int);
 	void standardize();
 	float unstandardize(float) const;
 };

@@ -59,6 +59,7 @@ public:
 	~LayerBuilder();
 
 	bool build(const NNInfo*, const DataInput*, bool = false);
+	void rebuildInputLayers(const NNInfo*, const DataInput*);
 	Layer* getInputLayer(unsigned int, unsigned int);
 	Layer* getOutputLayer(unsigned int);
 	Node* getInputNode(Layer*, unsigned int);

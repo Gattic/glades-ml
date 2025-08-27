@@ -18,6 +18,8 @@
 #include "network.h"
 #include "Backend/Database/GTable.h"
 #include "../Structure/nninfo.h"
+#include "../DataObjects/NumberInput.h"
+#include "../DataObjects/ImageInput.h"
 
 using namespace glades;
 
@@ -249,3 +251,143 @@ void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDat
 
 	printf("cvAccuracy: %f \t\n", cvAccuracy / subnets.size());
 }
+
+void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable, 
+                                        const int inputType,
+                                        std::vector<glades::NNetwork*>& networks, 
+                                        std::vector<float>& averageAccuracies, 
+                                        unsigned int foldsNum,
+                                        bool timingSeries)
+{
+    shmea::GVector<shmea::GTable*> stratTbls = shmea::GTable::stratify(inputGTable, foldsNum, timingSeries);
+    averageAccuracies.clear();
+    for (unsigned int netNum = 0; netNum < networks.size(); ++netNum) {
+        addSubnet(networks[netNum]);
+        averageAccuracies.push_back(0.0f);
+    }
+
+    unsigned int i = 0;
+    if (timingSeries) {
+        i = 1;
+    }
+
+    for (; i < stratTbls.size(); ++i) {
+	    printf("===================================\n");
+	    printf("===================================\n");
+	    printf("Fold %d\n", i+1);
+	    printf("-----------------------------------\n");
+        
+        glades::DataInput* diTrain = NULL;
+        glades::DataInput* diTest = NULL;
+        if (inputType == glades::DataInput::CSV) {
+            diTrain = new glades::NumberInput();
+            diTest = new glades::NumberInput();
+        }
+        else if (inputType == glades::DataInput::IMAGE) {
+            diTrain = new glades::ImageInput();
+            diTest = new glades::ImageInput();
+        }
+        else if (inputType == glades::DataInput::TEXT) {
+        // TODO
+            return;
+        }
+        else
+            return;
+        
+        if (!diTrain || !diTest)
+            return;
+
+        // Load the input data
+        shmea::GTable* trainGTable = shmea::GTable::unionFolds(stratTbls, i, timingSeries);
+        
+        diTrain->import(*trainGTable);
+        diTest->import(*stratTbls[i]);
+
+        for (int netInd = 0; netInd < size(); ++netInd) {
+            printf("-----------------------------------\n");
+            printf("Network %d\n", netInd+1);
+            printf("-----------------------------------\n");
+            glades::NNetwork* cNetwork = getSubnet(netInd);
+            
+            // Run the training and retrieve a metanetwork
+            printf("Train\n");
+            cNetwork->setChangeInputLayers(true);
+            cNetwork->train(diTrain);
+
+            // Run the test and retrieve a metanetwork
+            printf("Test\n");
+            cNetwork->setChangeInputLayers(true);
+            cNetwork->test(diTest);
+
+            averageAccuracies[netInd] += cNetwork->getAccuracy();
+        }
+    }
+
+    for (int netInd = 0; netInd < size(); ++netInd) {
+        averageAccuracies[netInd] /= (float)stratTbls.size();
+    }
+}
+
+void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable, 
+                                        const int inputType,
+                                        std::vector<glades::NNetwork*>& networks, 
+                                        std::vector<float>& averageAccuracies, 
+                                        std::vector<float>& validationAccuracies, 
+                                        unsigned int validationPercent,
+                                        unsigned int testPercent)
+{
+    averageAccuracies.clear();
+    validationAccuracies.clear();
+    unsigned int rowNum = inputGTable.numberOfRows();
+    unsigned int validationRowNum = rowNum * validationPercent / 100;
+    if (validationRowNum == 0) {
+        ++validationRowNum;
+    }
+    unsigned int testRowNum = rowNum * testPercent / 100;
+    if (testRowNum == 0) {
+        ++testRowNum;
+    }
+    if (rowNum <= testRowNum + validationRowNum) {
+        return;
+    }
+    unsigned int foldsNum = (rowNum - validationRowNum + testRowNum - 1) / testRowNum; //ceiling
+    if (foldsNum == 0) {
+        foldsNum = 1;
+    }
+
+    shmea::GTable* inputGTableTT = shmea::GTable::firstNRows(inputGTable, rowNum - validationRowNum);
+    shmea::GTable* inputGTableV = shmea::GTable::lastNRows(inputGTable, validationRowNum);
+
+    crossValidate(*inputGTableTT, inputType, networks, averageAccuracies, foldsNum);
+
+    glades::DataInput* diValidation = NULL;
+    if (inputType == glades::DataInput::CSV) {
+        diValidation = new glades::NumberInput();
+    }
+    else if (inputType == glades::DataInput::IMAGE) {
+        diValidation = new glades::ImageInput();
+    }
+    else if (inputType == glades::DataInput::TEXT) {
+    // TODO
+        return;
+    }
+    else
+        return;
+        
+    diValidation->import(inputGTableV);
+
+    validationAccuracies.clear();
+    for (unsigned int netNum = 0; netNum < networks.size(); ++netNum) {
+        validationAccuracies.push_back(0.0f);
+    }
+
+    for (int netInd = 0; netInd < size(); ++netInd) {
+        glades::NNetwork* cNetwork = getSubnet(netInd);
+        
+        // Run the validation
+        cNetwork->setChangeInputLayers(true);
+        cNetwork->test(diValidation);
+        validationAccuracies[netInd] = cNetwork->getAccuracy();
+    }
+}
+

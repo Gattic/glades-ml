@@ -582,10 +582,10 @@ void glades::NNInfo::setWeightDecay2(unsigned int index, float newWeightDecay2)
 	    inputLayer->setWeightDecay2(newWeightDecay2);
 	else
 	{
-	    if (!layers[index-2])
+	    if (!layers[index-1])
 		    return;
 
-	    layers[index-2]->setWeightDecay2(newWeightDecay2);
+	    layers[index-1]->setWeightDecay2(newWeightDecay2);
 	}
 }
 

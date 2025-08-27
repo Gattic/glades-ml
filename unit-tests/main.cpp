@@ -7,6 +7,7 @@
 // Robert Carneiro is strictly prohibited.
 #include "main.h"
 #include "Backend/Machine Learning/nn-test.h"
+#include "Backend/Machine Learning/nn-cv-test.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
@@ -41,6 +42,8 @@ int main(int argc, char* argv[])
 		BayesOptimizerUnitTest();
 	    else if (strcmp(argv[1], "ohe") == 0)
 		OHEUnitTest();
+	    else if (strcmp(argv[1], "cv") == 0)
+		NNCVUnitTestValidation();
 	    else
 		printf("Invalid test: %s\n", argv[1]);
 	}

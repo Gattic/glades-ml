@@ -335,7 +335,10 @@ public:
     // Control centroid alignment with cluster centers (public API)
     void setAlignCentroidsWithClusters(bool align);
     bool getAlignCentroidsWithClusters() const;
-    
+   
+   //Color methods
+    RGBA GetUniqueColor(int, int);
+    RGBA GetThemeColor(int);
     // Direct access to GridRenderer for Y-axis ticks - consider using chart builder instead
     GridRenderer& getGridRenderer() { return *gridRenderer; }
     

@@ -48,7 +48,8 @@ public:
 	std::vector<OHE*> testingOHEMaps;
 	std::vector<bool> testingFeatureIsCategorical;
 
-	virtual void import(shmea::GString) = 0;
+	virtual void import(shmea::GString, int = 0) = 0;
+	virtual void import(const shmea::GTable&, int = 0) = 0;
 
 	virtual shmea::GVector<float> getTrainRow(unsigned int) const = 0;
 	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int) const = 0;
