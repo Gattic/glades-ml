@@ -63,6 +63,7 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 		return;
 
 	running = false;
+    changeInputLayers = false;
 	di = NULL;
 	skeleton = NULL;
 	serverInstance = NULL;
@@ -123,9 +124,19 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 	if ((di->getTrainSize() <= 0) || (di->getFeatureCount() <= 0))
 		return;
 
+    int starting_epochs = 0;
 	// Get the input, expected, and layers/nodes/edges
 	if(epochs == 0)
 		meat.build(skeleton, di, netType);
+    else if (changeInputLayers) {
+        meat.rebuildInputLayers(skeleton, di);
+        starting_epochs = epochs;
+    }
+
+	// Clean confusion matrix
+	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
+		(skeleton->getOutputType() == GMath::KL))
+		confusionMatrix.clean();
 
 	// inputTable.print();
 	// expected.print();
@@ -229,20 +240,10 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 			{
 				// if (DEBUG_SIMPLE)
 				{
-					if (epochs < 100)
-					{
-						printf("\33[2K[NN] %d\t\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
-							   overallClassAccuracy, mcc, overallClassPrecision, overallClassRecall,
-							   overallClassSpecificity, overallClassF1);
-						fflush(stdout);
-					}
-					else
-					{
-						printf("\33[2K[NN] %d\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
-							   overallClassAccuracy, overallClassPrecision, overallClassRecall,
-							   overallClassSpecificity, overallClassF1);
-						fflush(stdout);
-					}
+                    printf("\33[2K[NN] %d\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\t%f%%\r", epochs,
+                           overallClassAccuracy, mcc, overallClassPrecision, overallClassRecall,
+                           overallClassSpecificity, overallClassF1);
+                    fflush(stdout);
 				}
 				/*else if (DEBUG_ADVANCED)
 				{
@@ -262,7 +263,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 			//if(guiEnabled)
 			int64_t ms = getCurrentTimeMilliseconds();
 			int64_t timeDiff = ms - lastUpdateTime;
-			if ((serverInstance && cConnection) && ((epochs < 10) || (timeDiff > 16))) // 60fps
+			if ((serverInstance && cConnection) && ((epochs - starting_epochs < 10) || (timeDiff > 16))) // 60fps
 			{
 				//printf("\n\nms - lastUpdateTime == diff;   %lld - %lld == %lld\n\n", ms, lastUpdateTime, timeDiff);
 				// First epoch is random
@@ -366,7 +367,8 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 			Frontend::nnCreatorPanel->PlotScatter(getResults());*/
 
 		// Shut it down?
-		if (terminator.triggered(time(NULL), epochs, overallTotalAccuracy))
+//		if (terminator.triggered(time(NULL), epochs - starting_epochs, overallTotalAccuracy))
+		if (terminator.triggered(time(NULL), epochs - starting_epochs, getAccuracy()))
 			break;
 
 		// Shut it down?
@@ -381,20 +383,19 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 	{
 		// Update the network vars and print
 		printf("[NN] %s Accuracy: %f%%\n", skeleton->getName().c_str(), overallTotalAccuracy);
+        if (skeleton->getOutputType() == GMath::CLASSIFICATION) {
+            printf("[NN] %s MCC: %f%%\n", skeleton->getName().c_str(), getAccuracy());
+        }
 	}
 
 	// Print the results
 	meat.print(skeleton);
 
-	// Clean confusion matrix
-	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
-		(skeleton->getOutputType() == GMath::KL))
-		confusionMatrix.clean();
-
 	printf("\n");
 
 	// So the network doesnt immediately quit next time and we can prematurely start our net
 	running = false;
+    changeInputLayers = false;
 }
 
 void glades::NNetwork::SGDHelper(unsigned int inputRowCounter, int runType)
@@ -720,7 +721,10 @@ NNInfo* glades::NNetwork::getNNInfo()
 
 float glades::NNetwork::getAccuracy() const
 {
-	return overallTotalAccuracy;
+	if (skeleton->getOutputType() == GMath::CLASSIFICATION)
+        return confusionMatrix.getOverallMCC();
+	
+    return overallTotalAccuracy;
 }
 
 bool glades::NNetwork::load(const shmea::GString& netName)
@@ -781,3 +785,14 @@ void glades::NNetwork::resetGraphs()
 	// create the results again
 	results.clear();
 }
+
+bool glades::NNetwork::getChangeInputLayers() const
+{
+    return changeInputLayers;
+}
+
+void glades::NNetwork::setChangeInputLayers(bool cIL)
+{
+    changeInputLayers = cIL;
+}
+

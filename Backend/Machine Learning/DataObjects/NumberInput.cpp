@@ -21,10 +21,11 @@
 #include "../GMath/OHE.h"
 #include "../GMath/gmath.h"
 #include "../Structure/nninfo.h"
+#include <vector>
 
 using namespace glades;
 
-void NumberInput::import(shmea::GString fname)
+void NumberInput::import(shmea::GString fname, int standardizeFlag)
 {
     if(loaded)
     {
@@ -34,7 +35,9 @@ void NumberInput::import(shmea::GString fname)
     name = fname;
 
     // Load and Normalize/Standardize the data
-    standardizeInputTable(fname);
+    shmea::GTable rawTable = shmea::GTable(fname, ',', shmea::GTable::TYPE_FILE);
+//    standardizeInputTable(fname);
+    standardizeInputTable(rawTable, standardizeFlag);
 
     // TODO: test table stuff
 
@@ -42,9 +45,23 @@ void NumberInput::import(shmea::GString fname)
     loaded = true;
 }
 
-void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName, int standardizeFlag)
+void NumberInput::import(const shmea::GTable& rawTable, int standardizeFlag)
 {
-    shmea::GTable rawTable = shmea::GTable(inputFName, ',', shmea::GTable::TYPE_FILE);
+    if(loaded)
+    {
+        return;
+    }
+
+    // Load and Normalize/Standardize the data
+    standardizeInputTable(rawTable, standardizeFlag, false);
+
+    loaded = true;
+}
+
+//void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName, int standardizeFlag, bool changeValues)
+void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, int standardizeFlag, bool changeValues)
+{
+//    shmea::GTable rawTable = shmea::GTable(inputFName, ',', shmea::GTable::TYPE_FILE);
 
     // Standardize the initialization of the weights
     if ((rawTable.numberOfRows() <= 0) || (rawTable.numberOfCols() <= 0))
@@ -171,7 +188,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GString& inputFName
             {
                 float cell = rawTable.getCell(r, c).getFloat();
                 
-                if (xRange != 0.0f) 
+                if (xRange != 0.0f && changeValues) 
                 {
                     if (standardizeFlag == GMath::MINMAX) 
                     {

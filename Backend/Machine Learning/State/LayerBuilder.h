@@ -59,6 +59,7 @@ public:
 	~LayerBuilder();
 
 	bool build(const NNInfo*, const DataInput*, bool = false);
+	void rebuildInputLayers(const NNInfo*, const DataInput*);
 	NetworkState* getNetworkStateFromLoc(unsigned int, unsigned int, unsigned int, unsigned int,
 										 unsigned int);
 	void setTimeState(unsigned int, unsigned int, unsigned int, float);

@@ -81,6 +81,8 @@ private:
 
 	bool firstRunActivation;
 
+    bool changeInputLayers;
+
 	// for tables & graphs
 	std::vector<Point2*> rocCurve;
 	shmea::GList results;
@@ -114,6 +116,8 @@ public:
 	bool getRunning() const;
 	int getEpochs() const;
 	void stop();
+    bool getChangeInputLayers() const;
+    void setChangeInputLayers(bool);
 
 	// Database
 	bool load(const shmea::GString&);

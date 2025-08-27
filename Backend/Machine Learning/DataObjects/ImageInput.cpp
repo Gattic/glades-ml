@@ -143,7 +143,7 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
     //printf("OHEMaps.size() = %lu\n", OHEMaps.size());
 }
 
-void ImageInput::import(shmea::GString newName)
+void ImageInput::import(shmea::GString newName, int standardizeFlag)
 {
     if(loaded)
 	return;
@@ -172,6 +172,10 @@ void ImageInput::import(shmea::GString newName)
     min = 0;
     max = 255;
     loaded = true;
+}
+
+void ImageInput::import(const shmea::GTable&, int standardizeFlag)
+{
 }
 
 const shmea::GPointer<shmea::Image> ImageInput::getTrainImage(unsigned int row) const

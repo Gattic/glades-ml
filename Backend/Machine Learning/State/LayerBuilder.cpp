@@ -97,6 +97,11 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInp
 	return true;
 }
 
+void glades::LayerBuilder::rebuildInputLayers(const NNInfo* skeleton, const DataInput* newInput)
+{
+    buildInputLayers(skeleton, newInput);
+}
+
 void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataInput* di)
 {
 	clock_t startFunction = clock();  // Overall function start time

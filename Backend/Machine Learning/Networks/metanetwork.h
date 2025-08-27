@@ -18,6 +18,7 @@
 #define _GMETANETWORK
 
 #include "Backend/Database/GString.h"
+#include "Backend/Database/GTable.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,8 @@ public:
 
 	// verification functions
 	void crossValidate(shmea::GString, DataInput*);
+    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, unsigned int = 5, bool = false);
+    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, std::vector<float>&, unsigned int = 10, unsigned int = 20);
 };
 };
 
