@@ -40,17 +40,11 @@ glades::Node::~Node()
 
 void glades::Node::copy(const Node& node2)
 {
-	id = node2.id;
 	weight = node2.weight;
 	edges = node2.edges;
 	errorDer = node2.errorDer;
 	activationMutex = node2.activationMutex;
 	contextNode = node2.contextNode;
-}
-
-int64_t glades::Node::getID() const
-{
-	return id;
 }
 
 float glades::Node::getWeight() const
@@ -64,20 +58,6 @@ float glades::Node::getEdgeWeight(unsigned int index) const
 		return 0.0f;
 
 	return edges[index]->getWeight();
-}
-
-/*!
- * @brief get an edge id
- * @details get the id for edge at the requested index
- * @param index the edge location in the edges vector
- * @return the edge id at the requested index
- */
-int64_t glades::Node::getEdgeID(unsigned int index) const
-{
-	if (index >= edges.size())
-		return 0L;
-
-	return edges[index]->getID();
 }
 
 float glades::Node::getActivation() const
@@ -123,11 +103,6 @@ float glades::Node::getLastPrevDelta(unsigned int index) const
 		return 0.0f;
 
 	return edges[index]->getPrevDelta(edges[index]->numPrevDeltas() - 1);
-}
-
-void glades::Node::setID(int64_t newID)
-{
-	id = newID;
 }
 
 void glades::Node::setWeight(float newWeight)
@@ -199,7 +174,6 @@ void glades::Node::clearPrevDeltas(unsigned int index)
 
 void glades::Node::clean()
 {
-	id = -1;
 	weight = 0.0f;
 	errorDer = 0.0f;
 }

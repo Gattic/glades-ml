@@ -30,7 +30,6 @@ class Edge
 {
 private:
 	// edge
-	int64_t id;
 	float weight;
 	std::vector<float> prevDelta;
 	bool activated;
@@ -41,7 +40,6 @@ public:
 	~Edge();
 
 	// gets
-	int64_t getID() const;
 	float getWeight() const;
 	std::vector<float> getPrevDeltas() const;
 	float getPrevDelta(unsigned int) const;
@@ -50,7 +48,6 @@ public:
 	float getActivation() const;
 
 	// sets
-	void setID(int64_t);
 	void setWeight(float);
 	void addPrevDelta(float);
 	void setActivation(float);

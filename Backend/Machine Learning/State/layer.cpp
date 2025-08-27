@@ -22,30 +22,22 @@ using namespace glades;
 
 glades::Layer::Layer(int64_t newID, int newType, float newBias)
 {
-	id = newID;
 	biasWeight = newBias;
 	type = newType;
 }
 
 glades::Layer::Layer(int newType)
 {
-	id = -1;
 	biasWeight = 0.0f;
 	type = newType;
 }
 
 glades::Layer::~Layer()
 {
-	id = -1;
 	biasWeight = 0.0f;
 	type = 0;
 	children.clear();
 	dropoutFlag.clear();
-}
-
-int64_t glades::Layer::getID() const
-{
-	return id;
 }
 
 float glades::Layer::getBiasWeight() const
@@ -63,10 +55,6 @@ unsigned int glades::Layer::size() const
 	return children.size();
 }
 
-void glades::Layer::setID(int64_t newID)
-{
-	id = newID;
-}
 void glades::Layer::setBiasWeight(float newBiasWeight)
 {
 	biasWeight = newBiasWeight;

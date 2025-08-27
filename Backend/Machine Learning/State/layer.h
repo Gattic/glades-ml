@@ -31,7 +31,6 @@ class Layer
 private:
 	std::vector<Node*> children;
 	std::vector<bool> dropoutFlag;
-	int64_t id;
 	float biasWeight;
 	int type;
 
@@ -46,7 +45,6 @@ public:
 	~Layer();
 
 	// gets
-	int64_t getID() const;
 	float getBiasWeight() const;
 	int getType() const;
 	unsigned int size() const;
@@ -55,7 +53,6 @@ public:
 	unsigned int lastValidPath() const;
 
 	// sets
-	void setID(int64_t);
 	void setBiasWeight(float);
 	void setType(int);
 

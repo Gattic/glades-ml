@@ -60,8 +60,11 @@ public:
 
 	bool build(const NNInfo*, const DataInput*, bool = false);
 	void rebuildInputLayers(const NNInfo*, const DataInput*);
-	NetworkState* getNetworkStateFromLoc(unsigned int, unsigned int, unsigned int, unsigned int,
-										 unsigned int);
+	Layer* getInputLayer(unsigned int, unsigned int);
+	Layer* getOutputLayer(unsigned int);
+	Node* getInputNode(Layer*, unsigned int);
+	Node* getOutputNode(Layer*, unsigned int);
+
 	void setTimeState(unsigned int, unsigned int, unsigned int, float);
 	unsigned int getInputLayersSize() const;
 	unsigned int getLayersSize() const;

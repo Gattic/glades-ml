@@ -239,13 +239,8 @@ void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 	layers.push_back(cLayer);
 }
 
-glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int inputRowCounter, unsigned int cInputLayerCounter,
-	unsigned int cOutputLayerCounter, unsigned int cInputNodeCounter, unsigned int cOutputNodeCounter)
+glades::Layer* glades::LayerBuilder::getInputLayer(unsigned int inputRowCounter, unsigned int cInputLayerCounter)
 {
-	// Base case and Error case
-	if (cOutputLayerCounter > layers.size())
-		return NULL;
-
 	if (cInputLayerCounter >= layers.size())
 		return NULL;
 
@@ -257,14 +252,13 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 		cInputLayer = layers[cInputLayerCounter-1];
 	if (!cInputLayer)
 		return NULL;
+	
+	return cInputLayer;
+}
 
-	// Current Input Node Error Check
-	if (cInputNodeCounter >= cInputLayer->size())
-		return NULL;
-
-	// Current Input Node
-	Node* cInputNode = cInputLayer->getNode(cInputNodeCounter);
-	if (!cInputNode)
+glades::Layer* glades::LayerBuilder::getOutputLayer(unsigned int cOutputLayerCounter)
+{
+	if (cOutputLayerCounter > layers.size())
 		return NULL;
 
 	// Current Output Layer
@@ -275,7 +269,26 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	// Why would this happen??
 	if (cOutputLayer->getType() == Layer::INPUT_TYPE)
 		return NULL;
+	
+	return cOutputLayer;
+}
 
+glades::Node* glades::LayerBuilder::getInputNode(Layer* cInputLayer, unsigned int cInputNodeCounter)
+{
+	// Current Input Node Error Check
+	if (cInputNodeCounter >= cInputLayer->size())
+		return NULL;
+
+	// Current Input Node
+	Node* cInputNode = cInputLayer->getNode(cInputNodeCounter);
+	if (!cInputNode)
+		return NULL;
+
+	return cInputNode;
+}
+
+glades::Node* glades::LayerBuilder::getOutputNode(Layer* cOutputLayer, unsigned int cOutputNodeCounter)
+{
 	// Current Output Node Error Check
 	if (cOutputNodeCounter >= cOutputLayer->size())
 		return NULL;
@@ -285,27 +298,7 @@ glades::NetworkState* glades::LayerBuilder::getNetworkStateFromLoc(unsigned int 
 	if (!cOutputNode)
 		return NULL;
 
-	// Input Dropout Check
-	bool validInputNode = cInputLayer->possiblePath(cInputNodeCounter);
-
-	// Output Dropout Check
-	bool validOutputNode = cOutputLayer->possiblePath(cOutputNodeCounter);
-
-	// Input helper vars
-	bool firstValidInputNode = (cInputNodeCounter == cInputLayer->firstValidPath());
-	bool lastValidInputNode = (cInputNodeCounter == cInputLayer->lastValidPath());
-
-	// Output helper vars
-	bool firstValidOutputNode = (cOutputNodeCounter == cOutputLayer->firstValidPath());
-	bool lastValidOutputNode = (cOutputNodeCounter == cOutputLayer->lastValidPath());
-
-	// Create the return structure
-	glades::NetworkState* newLoc = new glades::NetworkState(
-		cInputLayerCounter, cOutputLayerCounter, cInputNodeCounter, cOutputNodeCounter, cInputLayer,
-		cOutputLayer, cInputNode, cOutputNode, firstValidInputNode, lastValidInputNode,
-		firstValidOutputNode, lastValidOutputNode, validInputNode, validOutputNode);
-
-	return newLoc;
+	return cOutputNode;
 }
 
 void glades::LayerBuilder::setTimeState(unsigned int cLayerCounter, unsigned int cNodeCounter,
