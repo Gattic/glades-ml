@@ -79,6 +79,7 @@ void NNSaveLoadUnitTest()
     }
 
     //Create layers
+    cNetwork1.setMustdBuildMeat(false);
     cNetwork1.meat.build(cNetwork.skeleton, di, false);
 
     //Load the biases and weights from file
@@ -86,6 +87,14 @@ void NNSaveLoadUnitTest()
     	printf("[NN Save Load] Unable to load the network biases and weights");
     	return;
     }
+    
+    // Termination Conditions
+    //cNetwork.setTimestamp(maxTimeStamp);
+    cNetwork1.terminator.setEpoch(100000);
+    cNetwork1.terminator.setAccuracy(95);
+    
+    // Run the training and retrieve a metanetwork
+    glades::MetaNetwork* newTrainNet1 = glades::train(&cNetwork1, di);
 
     printf("\n============================================================\n");
 }
