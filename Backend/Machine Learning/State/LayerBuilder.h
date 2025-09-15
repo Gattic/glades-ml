@@ -83,6 +83,7 @@ public:
 	// Getters
 	shmea::GList getWeights();
 	shmea::GList getActivations();
+	void addBiasWeights(shmea::GList&) const;
 
 	// Database
 	bool load(const std::string&);

@@ -375,6 +375,15 @@ shmea::GList glades::LayerBuilder::getWeights()
     return weights;
 }
 
+void glades::LayerBuilder::addBiasWeights(shmea::GList& weights) const
+{
+    weights.addString('B');
+    for(unsigned int i = 0; i < getLayersSize(); ++i)
+    {
+		weights.addFloat(layers[i]->getBiasWeight());
+    }
+}
+
 void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 {
 	// Structure required!
