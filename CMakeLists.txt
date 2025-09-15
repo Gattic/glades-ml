@@ -110,6 +110,13 @@ add_custom_target(debug
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+#make ddd
+add_custom_target(ddd
+	COMMAND ddd ./build/${PROJECT_NAME}
+	DEPENDS ${PROJECT_NAME}
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
 #make mem
 	add_custom_target(mem
 	COMMAND valgrind --leak-check=full --track-origins=yes ./build/${PROJECT_NAME}
