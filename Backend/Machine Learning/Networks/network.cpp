@@ -324,6 +324,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 
 					argData.clear();
 					shmea::GList obtainedWeights = meat.getWeights();
+                    meat.addBiasWeights(obtainedWeights);
 
 					argData.addString("WEIGHTS");
 					cData = new shmea::ServiceData(cConnection, "GUI_Callback");
