@@ -36,6 +36,7 @@ class Connection
 private:
 	shmea::GString name;
 	shmea::GString ip;
+	shmea::GString port;
 	int connectionType;
 	bool cryptEnabled;
 	int64_t key;
@@ -54,6 +55,7 @@ public:
 	shmea::GString overflow;
 
 	Connection(int, int, shmea::GString);
+	Connection(int, int, shmea::GString, shmea::GString);
 	Connection(const Connection&);
 	~Connection();
 	void finish();
@@ -61,6 +63,7 @@ public:
 	// gets
 	shmea::GString getName() const;
 	shmea::GString getIP() const;
+	shmea::GString getPort() const;
 	int getConnectionType() const;
 	bool isEncrypted() const;
 	int64_t getKey() const;
@@ -69,6 +72,7 @@ public:
 	// sets
 	void setName(shmea::GString);
 	void setIP(shmea::GString);
+	void setPort(shmea::GString);
 	void enableEncryption();
 	void disableEncryption();
 	void setKey(int64_t);

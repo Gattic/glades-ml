@@ -38,6 +38,8 @@ private:
 	size_type m_capacity;
 	shmea::GPointer<T, array_deleter<T> > m_data;
 public:
+	const static unsigned int npos = -1;
+
 	GVector() : m_size(0), m_capacity(0), m_data(0) {}
 
 	GVector(size_type capacity) :
@@ -176,6 +178,26 @@ public:
 	}
 	T& operator[](size_type idx) { return at(idx); }
 	const T& operator[](size_type idx) const { return at(idx); }
+
+	bool contains(const T& value) const
+	{
+		for (size_type i = 0; i < m_size; ++i)
+		{
+			if (m_data[i] == value)
+				return true;
+		}
+		return false;
+	}
+
+	size_type find(const T& value) const
+	{
+		for (size_type i = 0; i < m_size; ++i)
+		{
+			if (m_data[i] == value)
+				return i;
+		}
+		return npos;
+	}
 
 	GVector& operator=(const GVector& other)
 	{
