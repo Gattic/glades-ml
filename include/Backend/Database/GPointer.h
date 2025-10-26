@@ -155,6 +155,16 @@ public:
 		return (data!=NULL);
 	}
 
+	bool operator==(const GPointer<T, Deleter>& other) const
+	{
+		return data == other.data;
+	}
+
+	bool operator!=(const GPointer<T, Deleter>& other) const
+	{
+		return data != other.data;
+	}
+
 	GPointer<T, Deleter>& copy(const GPointer<T, Deleter>& g2)
 	{
 		if(this != &g2)

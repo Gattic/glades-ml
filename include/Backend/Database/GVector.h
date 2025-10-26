@@ -183,7 +183,7 @@ public:
 	{
 		for (size_type i = 0; i < m_size; ++i)
 		{
-			if (m_data[i] == value)
+			if (valuesEqual(m_data[i], value))
 				return true;
 		}
 		return false;
@@ -193,7 +193,7 @@ public:
 	{
 		for (size_type i = 0; i < m_size; ++i)
 		{
-			if (m_data[i] == value)
+			if (valuesEqual(m_data[i], value))
 				return i;
 		}
 		return npos;
@@ -220,6 +220,22 @@ public:
 	}
 
 private:
+	// Helper: default equality uses operator==
+	template<typename X>
+	static bool valuesEqual(const X& lhs, const X& rhs)
+	{
+		return lhs == rhs;
+	}
+
+	// Helper overload: if T is a GPointer<U, D>, compare pointed values when both non-null
+	template<typename U, void(*D)(U*)>
+	static bool valuesEqual(const shmea::GPointer<U, D>& lhs, const shmea::GPointer<U, D>& rhs)
+	{
+		if (!lhs && !rhs) return true;
+		if (!lhs || !rhs) return false;
+		return (*lhs) == (*rhs);
+	}
+
 	void expand()
 	{
 		size_type newCap = (m_capacity == 0) ? 1 : m_capacity * 2;

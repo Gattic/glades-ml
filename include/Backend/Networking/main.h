@@ -93,7 +93,6 @@ class GServer
 
 	int sockfd;
 	bool cryptEnabled;
-	Connection* localConnection;
 	pthread_t* commandThread;
 	pthread_t* writerThread;
 	pthread_mutex_t* clientMutex;
@@ -140,12 +139,16 @@ public:
 
 	shmea::GPointer<shmea::GLogger> logger;
 
-	void send(shmea::ServiceData*, bool = true, bool = false);
+	void send(shmea::ServiceData*);
 
 	unsigned int addService(Service*);
 	Service* DoService(shmea::GString, shmea::GString = "");
-	Connection* getConnection(shmea::GString, shmea::GString = "Mar", shmea::GString = "45019");
+	// Set the getConnection port to socks if not specified
+	Connection* getConnection(shmea::GString, shmea::GString = "admin", shmea::GString = "-1");
 	Connection* getConnectionFromName(shmea::GString);
+	// UDP helpers
+	void LaunchUDPInstance(const shmea::GString&, const shmea::GString&, const shmea::GString&);
+	Connection* getOrCreateUDPConnection(const shmea::GString&, const shmea::GString&, const shmea::GString&);
 	void LaunchInstance(const shmea::GString&, const shmea::GString&, const shmea::GString&);
 	const bool& getRunning() const;
 	shmea::GString getPort() const;
