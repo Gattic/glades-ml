@@ -38,7 +38,6 @@ private:
 	std::vector<SaveTable*> saveItems;
 	GString dname;
 
-	GString getPath() const;
 	void addItem(SaveTable*);
 	void clean();
 
@@ -47,8 +46,10 @@ public:
 	SaveFolder(const GString&);
 	virtual ~SaveFolder();
 
+	GString getPath() const;
 	SaveTable* loadItem(const GString&);
 	bool deleteItem(const GString&);
+	bool checkFolder();
 	SaveTable* newItem(const GString&, const GTable&);
 	void load();
 	static std::vector<SaveFolder*> loadFolders();
