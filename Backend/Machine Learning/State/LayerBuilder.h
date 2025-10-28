@@ -25,6 +25,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <fstream>
 
 namespace glades {
 
@@ -53,6 +54,9 @@ private:
 	void standardizeWeights(const NNInfo*);
 	float unstandardize(float);
 
+    bool saveLayer(Layer*, std::ofstream&) const;
+    bool loadLayer(Layer*, unsigned int, unsigned int, std::ifstream&);
+
 public:
 	LayerBuilder();
 	LayerBuilder(int);
@@ -79,10 +83,14 @@ public:
 	// Getters
 	shmea::GList getWeights();
 	shmea::GList getActivations();
+	void addBiasWeights(shmea::GList&) const;
 
 	// Database
 	bool load(const std::string&);
 	bool save(const std::string&) const;
+
+    bool saveState(const char*) const;
+    bool loadState(const NNInfo*, const char*);
 };
 };
 

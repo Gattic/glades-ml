@@ -375,6 +375,15 @@ shmea::GList glades::LayerBuilder::getWeights()
     return weights;
 }
 
+void glades::LayerBuilder::addBiasWeights(shmea::GList& weights) const
+{
+    weights.addString('B');
+    for(unsigned int i = 0; i < getLayersSize(); ++i)
+    {
+		weights.addFloat(layers[i]->getBiasWeight());
+    }
+}
+
 void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 {
 	// Structure required!
@@ -673,3 +682,255 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 
 	return true;
 }
+
+/*!
+ * @brief saves bias and weights of a single layer to a file 
+ * @details writes the layer’s bias, size, number of edges
+ *          and edge weights directly to the file
+ * @param layer the layer to be saved to the file
+ * @param out the output file stream to write to
+ * @return whether or not the layer save went through
+*/
+bool glades::LayerBuilder::saveLayer(glades::Layer* layer, std::ofstream& out) const
+{
+    if (!layer)
+        return false;
+
+    const std::vector<Node*>& nodes = layer->getChildren();
+
+    out << layer->getBiasWeight() << " ";
+    out << nodes.size() << " ";
+    if (nodes.size() > 0 && nodes[0]->numEdges() > 0)
+        out << nodes[0]->numEdges() << "\n";
+    else
+        out << "0" << "\n";
+//    out << layer->getType() << " ";
+//    out << nodes.size() << "\n";
+
+    for (unsigned int j = 0; j < nodes.size(); ++j) {
+        Node* node = nodes[j];
+        if (!node)
+            continue;
+
+//        out << node->getWeight() << " ";
+//        out << node->numEdges() << "\n";
+
+        for (unsigned int k = 0; k < node->numEdges(); ++k) {
+            out << node->getEdgeWeight(k) << " ";
+ /*           std::vector<float> prevDeltas = edge->getPrevDeltas();
+
+            out << edge->getActivation() << " ";
+            if (edge->getActivated())
+                out << 1 << " ";
+            else
+                out << 0 << " ";
+            out << prevDeltas.size() << " ";
+
+            for (unsigned int l = 0; l < prevDeltas.size(); ++l) {
+                out << prevDeltas[l] << " ";
+            }
+*/
+        }
+    }
+    out << "\n";
+    return true;
+}
+
+/*!
+ * @brief saves biases and weights to a file 
+ * @details writes directly to the file to avoid copying all 
+ *          values into a new GTable object, which would be inefficient 
+ *          for large networks with billions of parameters
+ * @param fileName the name of the file to save to
+ * @return whether or not the save went through
+*/
+bool glades::LayerBuilder::saveState(const char* fileName) const
+{
+	shmea::SaveFolder* folderToSave = new shmea::SaveFolder("nn-state");
+    if (!folderToSave->checkFolder()) {
+        return false;
+    }
+
+    std::ofstream out((folderToSave->getPath() + fileName).c_str());
+    if (!out) {
+        return false;
+    }
+
+    unsigned int layersCount = getLayersSize();
+//    out << layersCount << "\n";
+
+    for (unsigned int i = 0; i < layersCount; ++i) {
+        Layer* layer = layers[i];
+        if (!layer)
+            continue;
+        saveLayer(layer, out);
+    }
+    return true;
+}
+
+/*!
+ * @brief loads bias and weights of a single layer from a file 
+ * @details reads the layer’s bias and edge weights directly from the file;
+ *          verifies that the layer size and the number of edges in the input 
+ *          file match to the expected skeleton values
+ * @param layer the layer to be loaded from the file
+ * @param nodesCount expected layer size
+ * @param edgeCount expected number of edges
+ * @param in the input file stream to read from
+ * @return whether or not the layer load went through
+*/
+bool glades::LayerBuilder::loadLayer(Layer* layer, unsigned int nodesCount, unsigned int edgeCount, std::ifstream& in)
+{
+    if (!layer) {
+        printf("Something wrong with the layer");
+        return false;
+    }
+
+    float bias;
+    if (!(in >> bias)) {
+        printf("Error during reading the layer bias from file");
+        return false;
+    }
+    layer->setBiasWeight(bias);
+
+    unsigned int fileLayerSize;
+    if (!(in >> fileLayerSize)) {
+        printf("Error during reading the layer size from file");
+        return false;
+    }
+
+    unsigned int fileEdgeCount;
+    if (!(in >> fileEdgeCount)) {
+        printf("Error during reading the edge count from file");
+        return false;
+    }
+
+    if (fileLayerSize != nodesCount) {
+        printf("Inconvenience between the layer size in file and the skeleton or input data layer size");
+        return false;
+    }
+
+    if (fileEdgeCount != edgeCount) {
+        printf("Inconvenience between the edge count in file and the skeleton or input data edge count");
+        return false;
+    }
+
+    unsigned int layerSize = layer->size();
+
+    const std::vector<Node*>& nodes = layer->getChildren();
+    for (unsigned int i = 0; i < nodesCount; ++i) {
+        bool it_is_a_new_node = false;
+        Node* node = NULL;
+        if (i > layerSize - 1) {
+            Node* node = new Node();
+            it_is_a_new_node = true;
+        }
+        else
+            node = nodes[i];
+
+        if (!node)
+            return false;
+
+/*        float nodeWeight;
+        in >> nodeWeight;
+        node->setWeight(nodeWeight);
+
+        unsigned int edgeCount;
+        in >> edgeCount;
+*/
+        bool number_of_edges_is_less_then_skeleton_edgeCount = node->numEdges() < edgeCount;
+
+        std::vector<glades::Edge*> edges;
+
+        for (unsigned int k = 0; k < edgeCount; ++k) {
+            float edgeWeight;
+            if (!(in >> edgeWeight)) {
+                printf("Error during reading the edge weight from file");
+                return false;
+            }
+
+            if (number_of_edges_is_less_then_skeleton_edgeCount) {
+                Edge* edge = new Edge(-1, edgeWeight);
+                edges.push_back(edge);
+            } else {
+                node->setEdgeWeight(k, edgeWeight);
+            }
+
+/*
+            Edge* edge = new Edge(-1, edgeWeight);
+
+            float edgeActivation;
+            in >> edgeActivation;
+            edge->setActivation(edgeActivation);
+
+            int edgeActivated;
+            in >> edgeActivated;
+            edge->setActivated(bool(edgeActivation));
+
+            unsigned int prevDeltasCount;
+            in >> prevDeltasCount;
+            for (unsigned int l = 0; l < prevDeltasCount; ++l) {
+                float prevDelta;
+                in >> prevDelta;
+                edge->addPrevDelta(prevDelta);
+            }
+            edges.push_back(edge);
+*/
+        }
+        if (number_of_edges_is_less_then_skeleton_edgeCount) {
+            node->setEdges(edges);
+        }
+        if (it_is_a_new_node) 
+            layer->addNode(node);
+    }
+    return true;
+}
+
+/*!
+ * @brief loads biases and weights from a file 
+ * @details reads directly from the file to avoid first loading values into a GTable object
+ *          and then copying them into the LayerBuilder, which would be inefficient
+ *          for large networks with billions of parameters
+ * @param skeleton the expected network structure; the file’s contents must match
+ *        this skeleton (number of layers, layer sizes, number of edges)
+ * @param fileName the name of the file to load from
+ * @return whether or not the load went through
+*/
+bool glades::LayerBuilder::loadState(const NNInfo* skeleton, const char* fileName)
+{
+    std::ifstream in((std::string("database/nn-state/") + fileName).c_str());
+    if (!in) {
+        return false;
+    }
+
+    unsigned int layerCount = skeleton->numHiddenLayers() + 1;
+    if (layers.size() < layerCount)
+        layers.resize(layerCount);
+
+    for (unsigned int i = 0; i < layerCount; ++i) {
+        if (!layers[i])
+            if (i == layerCount - 1)
+                layers[i] = new Layer(Layer::HIDDEN_TYPE);
+            else
+                layers[i] = new Layer(Layer::OUTPUT_TYPE);
+
+        unsigned int curLayerSize = 0;
+        if (i == layerCount - 1)
+            curLayerSize = skeleton->getOutputLayerSize();
+        else {
+            curLayerSize = skeleton->getHiddenLayerSize(i);
+        }
+
+        unsigned int prLayerSize = 0;
+        if (i > 0)
+            prLayerSize = skeleton->getHiddenLayerSize(i-1);
+        else {
+            prLayerSize = getLayerSize(0);
+        }
+
+        if (!loadLayer(layers[i], curLayerSize, prLayerSize, in))
+            return false;
+    }
+    return true;
+}
+

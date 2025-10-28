@@ -96,6 +96,7 @@ private:
 	void ForwardPass(unsigned int, int, int, unsigned int, unsigned int);
 	void BackPropagation(unsigned int, int, int, unsigned int, unsigned int);
 
+    bool mustBuildMeat;
 public:
 	static const int TYPE_DFF = 0;
 	static const int TYPE_RNN = 1;
@@ -137,6 +138,9 @@ public:
 	shmea::GList getResults() const;
 	void clean();
 	void resetGraphs();
+
+    bool getMustdBuildMeat() const;
+    void setMustdBuildMeat(bool);
 };
 };
 

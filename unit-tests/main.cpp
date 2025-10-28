@@ -8,6 +8,7 @@
 #include "main.h"
 #include "Backend/Machine Learning/nn-test.h"
 #include "Backend/Machine Learning/nn-cv-test.h"
+#include "Backend/Machine Learning/nn-save-load-test.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
@@ -44,6 +45,8 @@ int main(int argc, char* argv[])
 		OHEUnitTest();
 	    else if (strcmp(argv[1], "cv") == 0)
 		NNCVUnitTestValidation();
+	    else if (strcmp(argv[1], "save-load") == 0)
+		NNSaveLoadUnitTest();
 	    else
 		printf("Invalid test: %s\n", argv[1]);
 	}

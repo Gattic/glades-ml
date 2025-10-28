@@ -51,6 +51,7 @@ glades::NNetwork::NNetwork(int newNetType)
 	clean();
 	netType = newNetType;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
+    mustBuildMeat = true;
 }
 
 /*!
@@ -72,6 +73,7 @@ glades::NNetwork::NNetwork(NNInfo* newNNInfo, int newNetType)
 	skeleton = newNNInfo;
 	netType = newNetType;
 	minibatchSize = skeleton->getBatchSize();
+    mustBuildMeat = true;
 }
 
 glades::NNetwork::~NNetwork()
@@ -126,9 +128,10 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 
     int starting_epochs = 0;
 	// Get the input, expected, and layers/nodes/edges
-	if(epochs == 0)
-		meat.build(skeleton, di, netType);
-    else if (changeInputLayers) {
+	if(epochs == 0 && mustBuildMeat)
+        meat.build(skeleton, di, netType);
+
+    if (changeInputLayers) {
         meat.rebuildInputLayers(skeleton, di);
         starting_epochs = epochs;
     }
@@ -321,6 +324,7 @@ void glades::NNetwork::run(DataInput* newDataInput, int runType)
 
 					argData.clear();
 					shmea::GList obtainedWeights = meat.getWeights();
+                    meat.addBiasWeights(obtainedWeights);
 
 					argData.addString("WEIGHTS");
 					cData = new shmea::ServiceData(cConnection, "GUI_Callback");
@@ -791,5 +795,15 @@ bool glades::NNetwork::getChangeInputLayers() const
 void glades::NNetwork::setChangeInputLayers(bool cIL)
 {
     changeInputLayers = cIL;
+}
+
+bool glades::NNetwork::getMustdBuildMeat() const
+{
+    return mustBuildMeat;
+}
+
+void glades::NNetwork::setMustdBuildMeat(bool newMustdBuildMeat)
+{
+    mustBuildMeat = newMustdBuildMeat;
 }
 
