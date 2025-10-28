@@ -45,6 +45,24 @@ class Connection;
 class Service;
 class Sockets;
 
+// Listener interface for logout callbacks
+class LogoutListener
+{
+public:
+	virtual ~LogoutListener() {}
+	virtual void onClientLogout(Connection*) = 0;
+	virtual void onServerLogout(Connection*) = 0;
+};
+
+// Listener interface for login callbacks
+class LoginListener
+{
+public:
+	virtual ~LoginListener() {}
+	virtual void onClientLogin(Connection*) = 0;  // when a client connects to this server
+	virtual void onServerLogin(Connection*) = 0;  // when this node connects out to another server
+};
+
 // Service Arguments Class
 class newServiceArgs
 {
@@ -75,7 +93,6 @@ class GServer
 
 	int sockfd;
 	bool cryptEnabled;
-	Connection* localConnection;
 	pthread_t* commandThread;
 	pthread_t* writerThread;
 	pthread_mutex_t* clientMutex;
@@ -86,6 +103,12 @@ class GServer
 	bool running;
 	std::map<shmea::GString, Service*> service_depot;
 	std::map<shmea::GString, Service*> running_services;
+
+	// Logout listener (supports class member functions)
+	shmea::GPointer<LogoutListener> logoutListener;
+
+	// Login listener
+	shmea::GPointer<LoginListener> loginListener;
 
 	static void* commandLauncher(void*);
 	void commandCatcher(void*);
@@ -116,12 +139,16 @@ public:
 
 	shmea::GPointer<shmea::GLogger> logger;
 
-	void send(shmea::ServiceData*, bool = true, bool = false);
+	void send(shmea::ServiceData*);
 
 	unsigned int addService(Service*);
 	Service* DoService(shmea::GString, shmea::GString = "");
-	Connection* getConnection(shmea::GString, shmea::GString = "Mar", shmea::GString = "45019");
+	// Set the getConnection port to socks if not specified
+	Connection* getConnection(shmea::GString, shmea::GString = "admin", shmea::GString = "-1");
 	Connection* getConnectionFromName(shmea::GString);
+	// UDP helpers
+	void LaunchUDPInstance(const shmea::GString&, const shmea::GString&, const shmea::GString&);
+	Connection* getOrCreateUDPConnection(const shmea::GString&, const shmea::GString&, const shmea::GString&);
 	void LaunchInstance(const shmea::GString&, const shmea::GString&, const shmea::GString&);
 	const bool& getRunning() const;
 	shmea::GString getPort() const;
@@ -135,6 +162,15 @@ public:
 	Connection* getLocalConnection();
 	void removeClientConnection(Connection*);
 	void removeServerConnection(Connection*);
+
+	// Callbacks
+	void setLogoutListener(shmea::GPointer<LogoutListener> listener) { logoutListener = listener; }
+	void notifyClientLogout(Connection* c) { if (logoutListener) logoutListener->onClientLogout(c); }
+	void notifyServerLogout(Connection* c) { if (logoutListener) logoutListener->onServerLogout(c); }
+
+	void setLoginListener(shmea::GPointer<LoginListener> listener) { loginListener = listener; }
+	void notifyClientLogin(Connection* c)  { if (loginListener) loginListener->onClientLogin(c); }
+	void notifyServerLogin(Connection* c)  { if (loginListener) loginListener->onServerLogin(c); }
 }; // GServer
 
 class LaunchInstanceHelperArgs

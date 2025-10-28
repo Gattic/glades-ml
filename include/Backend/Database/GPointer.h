@@ -37,6 +37,10 @@ protected:
 
 public:
 
+	// Allow cross-specialization access for aliasing conversions
+	template <typename U, void(*UDeleter)(U*)>
+	friend class GPointer;
+
 	explicit GPointer(T* newData = NULL) : 
 		data(newData),
 		refCount(newData ? new unsigned int(1) : NULL),
@@ -48,6 +52,21 @@ public:
 		refMutex(NULL)
 	{
 		copy(g2);
+	}
+
+	// Converting constructor: enable GPointer<Derived> -> GPointer<Base>
+	// Shares ownership (same refCount) and performs pointer upcast
+	template <typename U, void(*UDeleter)(U*)>
+	GPointer(const GPointer<U, UDeleter>& g2) :
+		data(NULL),
+		refCount(NULL),
+		refMutex(NULL)
+	{
+		reset();
+		data = static_cast<T*>(g2.data);
+		refCount = g2.refCount;
+		refMutex = g2.refMutex;
+		increment();
 	}
 
 	virtual ~GPointer()
@@ -136,6 +155,16 @@ public:
 		return (data!=NULL);
 	}
 
+	bool operator==(const GPointer<T, Deleter>& other) const
+	{
+		return data == other.data;
+	}
+
+	bool operator!=(const GPointer<T, Deleter>& other) const
+	{
+		return data != other.data;
+	}
+
 	GPointer<T, Deleter>& copy(const GPointer<T, Deleter>& g2)
 	{
 		if(this != &g2)
@@ -155,6 +184,22 @@ public:
 	GPointer<T, Deleter>& operator=(const GPointer<T, Deleter>& g2)
 	{
 		return copy(g2);
+	}
+
+	// Converting assignment: enable GPointer<Derived> -> GPointer<Base>
+	template <typename U, void(*UDeleter)(U*)>
+	GPointer<T, Deleter>& operator=(const GPointer<U, UDeleter>& g2)
+	{
+		if ((void*)this == (const void*)&g2)
+		{
+			return *this;
+		}
+		reset();
+		data = static_cast<T*>(g2.data);
+		refCount = g2.refCount;
+		refMutex = g2.refMutex;
+		increment();
+		return *this;
 	}
 };
 };

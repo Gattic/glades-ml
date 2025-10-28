@@ -38,6 +38,8 @@ private:
 	size_type m_capacity;
 	shmea::GPointer<T, array_deleter<T> > m_data;
 public:
+	const static unsigned int npos = -1;
+
 	GVector() : m_size(0), m_capacity(0), m_data(0) {}
 
 	GVector(size_type capacity) :
@@ -177,6 +179,26 @@ public:
 	T& operator[](size_type idx) { return at(idx); }
 	const T& operator[](size_type idx) const { return at(idx); }
 
+	bool contains(const T& value) const
+	{
+		for (size_type i = 0; i < m_size; ++i)
+		{
+			if (valuesEqual(m_data[i], value))
+				return true;
+		}
+		return false;
+	}
+
+	size_type find(const T& value) const
+	{
+		for (size_type i = 0; i < m_size; ++i)
+		{
+			if (valuesEqual(m_data[i], value))
+				return i;
+		}
+		return npos;
+	}
+
 	GVector& operator=(const GVector& other)
 	{
 		if (this != &other)
@@ -198,6 +220,22 @@ public:
 	}
 
 private:
+	// Helper: default equality uses operator==
+	template<typename X>
+	static bool valuesEqual(const X& lhs, const X& rhs)
+	{
+		return lhs == rhs;
+	}
+
+	// Helper overload: if T is a GPointer<U, D>, compare pointed values when both non-null
+	template<typename U, void(*D)(U*)>
+	static bool valuesEqual(const shmea::GPointer<U, D>& lhs, const shmea::GPointer<U, D>& rhs)
+	{
+		if (!lhs && !rhs) return true;
+		if (!lhs || !rhs) return false;
+		return (*lhs) == (*rhs);
+	}
+
 	void expand()
 	{
 		size_type newCap = (m_capacity == 0) ? 1 : m_capacity * 2;
