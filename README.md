@@ -1,4 +1,4 @@
-# glades v0.58
+# glades v0.59
 
 ## Website
 http://glades-ml.com/
