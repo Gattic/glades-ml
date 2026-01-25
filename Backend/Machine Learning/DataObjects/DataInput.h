@@ -43,6 +43,11 @@ public:
 	    max = std::numeric_limits<float>::min();
 	}
 
+	virtual ~DataInput()
+    {
+        //
+    }
+
 	std::vector<OHE*> trainingOHEMaps;
 	std::vector<bool> trainingFeatureIsCategorical;
 	std::vector<OHE*> testingOHEMaps;
