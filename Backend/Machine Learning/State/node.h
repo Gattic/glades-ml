@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -17,8 +17,9 @@
 #ifndef _GQL_NODE
 #define _GQL_NODE
 
+#include "Backend/Database/GPointer.h"
+#include "edge.h"
 #include <map>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,8 +31,6 @@ class GType;
 
 namespace glades {
 
-class Edge;
-
 // Makes up the graph
 class Node
 {
@@ -39,12 +38,14 @@ private:
 	float weight;
 	float errorDer;
 	float activationScalar;
+	// For gated recurrent nets (LSTM): per-node cell state (c_t).
+	// Kept separate from weight (h_t) so forward/test can expose both if needed.
+	float cellState;
 
 	// ml
-	std::vector<glades::Edge*> edges;
-	pthread_mutex_t* activationMutex;
+	std::vector<shmea::GPointer<glades::Edge> > edges;
 
-	Node* contextNode;
+	shmea::GPointer<Node> contextNode;
 
 public:
 	static const int INIT_EMPTY = 0;
@@ -56,12 +57,14 @@ public:
 	Node();
 	Node(GType*);
 	Node(const Node&); // copy contstructor
+	Node& operator=(const Node&);
 	~Node();
 	void copy(const Node&);
 
 	// gets
 	int64_t getID() const;
 	float getWeight() const;
+	float getCellState() const;
 	float getDropout() const;
 	float getEdgeWeight(unsigned int) const;
 	int64_t getEdgeID(unsigned int) const;
@@ -75,7 +78,8 @@ public:
 	// sets
 	void setID(int64_t);
 	void setWeight(float);
-	void setEdges(const std::vector<glades::Edge*>&);
+	void setCellState(float);
+	void setEdges(const std::vector<shmea::GPointer<glades::Edge> >&);
 	void setEdgeWeight(unsigned int, float);
 	void setActivation(unsigned int, float);
 	void setActivationScalar(float);
@@ -92,7 +96,7 @@ public:
 	void initWeights(unsigned int, float[], unsigned int, int, int);
 	void getDelta(unsigned int, float, float, float, float, float, float);
 	void applyDeltas(unsigned int, int);
-	void setContextNode(Node*);
+	void setContextNode(const shmea::GPointer<Node>&);
 	Node* getContextNode();
 };
 };

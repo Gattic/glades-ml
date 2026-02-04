@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -19,10 +19,65 @@
 #include "Backend/Database/SaveFolder.h"
 #include "Backend/Database/SaveTable.h"
 #include "../GMath/OHE.h"
+#include <algorithm>
+#include <string>
 
 using namespace glades;
 
-void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps, std::vector<bool>& featureIsCategorical, std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > >& images)
+namespace {
+static inline std::string to_std_string(const shmea::GString& s)
+{
+	return std::string(s.c_str());
+}
+
+static inline shmea::GString to_gstring(const std::string& s)
+{
+	return shmea::GString(s.c_str());
+}
+
+// Normalize the legend's label column to a string, matching the logic in importHelper().
+// This is used for test legends, where we want consistent encoding without expanding
+// the label space beyond what training saw.
+static inline void normalizeLegendLabelColumnToString(shmea::GTable& table, unsigned int labelCol)
+{
+	if (table.numberOfRows() == 0 || table.numberOfCols() == 0)
+		return;
+	if (labelCol >= table.numberOfCols())
+		return;
+
+	for (unsigned int r = 0; r < table.numberOfRows(); ++r)
+	{
+		shmea::GString label = "";
+		const shmea::GType& cCell = table.getCell(r, labelCol);
+		const shmea::GType::Type cType = cCell.getType();
+		if (cType == shmea::GType::STRING_TYPE)
+		{
+			// Already normalized.
+			continue;
+		}
+		else if (cType == shmea::GType::CHAR_TYPE)
+			label = shmea::GString::intTOstring(cCell.getChar());
+		else if (cType == shmea::GType::SHORT_TYPE)
+			label = shmea::GString::intTOstring(cCell.getShort());
+		else if (cType == shmea::GType::INT_TYPE)
+			label = shmea::GString::intTOstring(cCell.getInt());
+		else if (cType == shmea::GType::LONG_TYPE)
+			label = shmea::GString::longTOstring(cCell.getLong());
+		else if (cType == shmea::GType::BOOLEAN_TYPE)
+			label = cCell.getBoolean() ? "true" : "false";
+		else
+		{
+			// FLOAT/DOUBLE and others are not valid for classification labels here.
+			// Leave as-is.
+			continue;
+		}
+
+		table.setCell(r, labelCol, label);
+	}
+}
+} // namespace
+
+void ImageInput::importHelper(shmea::GTable& cTable, std::vector<shmea::GPointer<OHE> >& OHEMaps, std::vector<bool>& featureIsCategorical, std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > >& images)
 {
     if(loaded)
 	return;
@@ -36,7 +91,9 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
 	return;
     }
 
-    shmea::GString fname = "datasets/images/" + name + "/";
+    // NOTE: In streaming mode we no longer preload images into the 'images' map.
+    // We only build label mappings (OHE) and ensure legend labels are normalized to string type.
+    shmea::GString fname = "datasets/images/" + name + "/"; // kept for backward-compat logs
 
     float fMin = 0.0f;
     float fMax = 0.0f;
@@ -47,17 +104,15 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
     unsigned int outputCol = 1;
     for(unsigned int r = 0; r < cTable.numberOfRows(); ++r)
     {
+	// Build the fully-qualified path (for streaming later)
 	shmea::GString path = fname + cTable.getCell(r, inputCol).c_str();
-	printf("[NNDATA] Loading %s\n", path.c_str());
-	shmea::GPointer<shmea::Image> img(new shmea::Image());
-	img->LoadPNG(path);
 
 	if (r == 0)
 	{
 	    // Really only need it for the output column for images so the first OHE will be empty
 	    for(unsigned int c = 0; c < cTable.numberOfCols(); ++c)
 	    {
-		OHE* cOHE = new OHE();
+		shmea::GPointer<OHE> cOHE(new OHE());
 		featureIsCategorical.push_back(false);
 		OHEMaps.push_back(cOHE);
 	    }
@@ -119,19 +174,8 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<OHE*>& OHEMaps,
 	// update mean
 	fMean += cell;*/
 
-	// Add a label if it doesn't exist
-	if(images.find(label) == images.end())
-	{
-	    images.insert(
-		std::pair<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > >
-		    (label, std::map<shmea::GString, shmea::GPointer<shmea::Image> >()));
-	}
-
-	// Add the image to the label
-	if(images[label].find(path) == images[label].end())
-	{
-	    images[label].insert(std::pair<shmea::GString, shmea::GPointer<shmea::Image> >(path, img));
-	}
+	// Streaming: do not store decoded images in memory.
+	(void)images;
     }
 
     //fMean /= cTable.numberOfRows();
@@ -165,8 +209,54 @@ void ImageInput::import(shmea::GString newName, int standardizeFlag)
 	return;
     }
 
+    // Build label->one-hot mappings from TRAINING ONLY.
+    // IMPORTANT: output dimensionality MUST NOT change based on the test set.
     importHelper(trainingLegend, trainingOHEMaps, trainingFeatureIsCategorical, trainImages);
-    importHelper(testingLegend, testingOHEMaps, testingFeatureIsCategorical, testImages);
+
+    // Normalize test labels to string type, but do NOT add them to the OHE map.
+    normalizeLegendLabelColumnToString(testingLegend, /*labelCol*/ 1u);
+
+    // Use the training label space for test encoding.
+    testingOHEMaps = trainingOHEMaps;
+    testingFeatureIsCategorical = trainingFeatureIsCategorical;
+
+    // Precompute one-hot vectors for the label space (avoid per-row allocations in hot paths).
+    oneHotByIndex.clear();
+    if (trainingOHEMaps.size() > 1u && trainingOHEMaps[1])
+    {
+        const unsigned int K = trainingOHEMaps[1]->size();
+        oneHotByIndex.resize(K);
+        for (unsigned int i = 0; i < K; ++i)
+        {
+            oneHotByIndex[i] = shmea::GVector<float>(K, 0.0f);
+            oneHotByIndex[i][i] = 1.0f;
+        }
+    }
+
+    // Precompute fully qualified paths for streaming access.
+    trainingPaths.clear();
+    testingPaths.clear();
+    trainingPaths.reserve(trainingLegend.numberOfRows());
+    testingPaths.reserve(testingLegend.numberOfRows());
+    for (unsigned int r = 0; r < trainingLegend.numberOfRows(); ++r)
+        trainingPaths.push_back(to_std_string(fname + trainingLegend.getCell(r, 0).c_str()));
+    for (unsigned int r = 0; r < testingLegend.numberOfRows(); ++r)
+        testingPaths.push_back(to_std_string(fname + testingLegend.getCell(r, 0).c_str()));
+
+    // Determine feature count by loading one image (first training row).
+    featureCount = 0;
+    if (!trainingPaths.empty())
+    {
+        shmea::Image img;
+        img.LoadPNG(to_gstring(trainingPaths[0]));
+        featureCount = img.getPixelCount();
+    }
+
+    // Reset row cache
+    rowCacheOrder.clear();
+    rowCache.clear();
+    scratchRow.clear();
+    scratchExpected.clear();
 
     // Set the loaded flag
     min = 0;
@@ -180,72 +270,64 @@ void ImageInput::import(const shmea::GTable&, int standardizeFlag)
 
 const shmea::GPointer<shmea::Image> ImageInput::getTrainImage(unsigned int row) const
 {
-    if(row >= trainingLegend.numberOfRows())
-	return shmea::GPointer<shmea::Image>(new shmea::Image());
-
-    const shmea::GString& label = trainingLegend.getCell(row, 1);
-    shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(row, 0).c_str();
-
-    // Check if the label exists
-    if(trainImages.find(label) == trainImages.end())
-	return shmea::GPointer<shmea::Image>(new shmea::Image());
-
-    // Check if the image exists
-    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
-	= trainImages.at(label).find(fname);
-    if(itr == trainImages.at(label).end())
-	return shmea::GPointer<shmea::Image>(new shmea::Image());
-
-    // Return the image
-    return itr->second;
+    // Streaming: load image on demand.
+    if (row >= trainingPaths.size())
+        return shmea::GPointer<shmea::Image>(new shmea::Image());
+    shmea::GPointer<shmea::Image> img(new shmea::Image());
+    img->LoadPNG(to_gstring(trainingPaths[row]));
+    return img;
 }
 
 const shmea::GPointer<shmea::Image> ImageInput::getTestImage(unsigned int row) const
 {
-    if(row >= testingLegend.numberOfRows())
-	return shmea::GPointer<shmea::Image>(new shmea::Image());
-
-    const shmea::GString& label = testingLegend.getCell(row, 1);
-    shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(row, 0).c_str();
-
-    // Check if the label exists
-    if(testImages.find(label) == testImages.end())
-	return shmea::GPointer<shmea::Image>(new shmea::Image());
-
-    // Check if the image exists
-    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
-	= testImages.at(label).find(fname);
-    if(itr == testImages.at(label).end())
-	return shmea::GPointer<shmea::Image>(new shmea::Image());
-
-    // Return the image
-    return itr->second;
+    if (row >= testingPaths.size())
+        return shmea::GPointer<shmea::Image>(new shmea::Image());
+    shmea::GPointer<shmea::Image> img(new shmea::Image());
+    img->LoadPNG(to_gstring(testingPaths[row]));
+    return img;
 }
 
 shmea::GVector<float> ImageInput::getTrainRow(unsigned int index) const
 {
-    int inputType = glades::DataInput::IMAGE;
-    static const unsigned int numRows = trainingLegend.numberOfRows(); // Cache number of rows
-    if (index >= numRows)
+    if (index >= trainingPaths.size())
         return emptyRow;
 
-    const shmea::GString& label = trainingLegend.getCell(index, 1);
-    shmea::GString fname = "datasets/images/" + name + "/" + trainingLegend.getCell(index, 0).c_str();
+    const std::string& path = trainingPaths[index];
 
-    // Check if the label exists
-    if(trainImages.find(label) == trainImages.end())
-	return emptyRow;
-	
-    // Check if the image exists
-    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
-	= trainImages.at(label).find(fname);
-    if(itr == trainImages.at(label).end())
-	return emptyRow;
-	
-    // Return the image
-    shmea::GVector<float> retList = itr->second->flatten();
-    retList = shmea::vectorStandardize(retList);
-    return retList;
+    // LRU cache lookup
+    std::map<std::string, RowCacheEntry>::iterator it = rowCache.find(path);
+    if (it != rowCache.end())
+    {
+        // touch
+        rowCacheOrder.erase(it->second.lruIt);
+        rowCacheOrder.push_front(path);
+        it->second.lruIt = rowCacheOrder.begin();
+        return it->second.row;
+    }
+
+    // Load -> flatten -> standardize
+    shmea::Image img;
+    img.LoadPNG(to_gstring(path));
+    shmea::GVector<float> row = img.flatten();
+    row = shmea::vectorStandardize(row);
+
+    // insert into cache
+    if (rowCacheMaxEntries > 0)
+    {
+        if (rowCache.size() >= rowCacheMaxEntries && !rowCacheOrder.empty())
+        {
+            const std::string evictKey = rowCacheOrder.back();
+            rowCacheOrder.pop_back();
+            rowCache.erase(evictKey);
+        }
+        rowCacheOrder.push_front(path);
+        RowCacheEntry e;
+        e.row = row;
+        e.lruIt = rowCacheOrder.begin();
+        rowCache[path] = e;
+    }
+
+    return row;
 }
 
 shmea::GVector<float> ImageInput::getTrainExpectedRow(unsigned int index) const
@@ -256,7 +338,7 @@ shmea::GVector<float> ImageInput::getTrainExpectedRow(unsigned int index) const
     const shmea::GString& cCell = trainingLegend.getCell(index, 1);
 
     // translate string to cell value for this col
-    OHE* OHEVector = trainingOHEMaps[1];
+    const shmea::GPointer<OHE>& OHEVector = trainingOHEMaps[1];
     return (*OHEVector)[cCell];
 }
 
@@ -268,34 +350,48 @@ shmea::GVector<float> ImageInput::getTestExpectedRow(unsigned int index) const
     const shmea::GString& cCell = testingLegend.getCell(index, 1);
 
     // translate string to cell value for this col
-    OHE* OHEVector = testingOHEMaps[1];
+    const shmea::GPointer<OHE>& OHEVector = testingOHEMaps[1];
     return (*OHEVector)[cCell];
     return shmea::GVector<float>();
 }
 
 shmea::GVector<float> ImageInput::getTestRow(unsigned int index) const
 {
-    int inputType = glades::DataInput::IMAGE;
-    if(index >= testingLegend.numberOfRows())
-	return shmea::GVector<float>();
+    if (index >= testingPaths.size())
+        return shmea::GVector<float>();
 
-    const shmea::GString& label = testingLegend.getCell(index, 1);
-    shmea::GString fname = "datasets/images/" + name + "/" + testingLegend.getCell(index, 0).c_str();
+    const std::string& path = testingPaths[index];
 
-    // Check if the label exists
-    if(testImages.find(label) == testImages.end())
-	return shmea::GVector<float>();
-	
-    // Check if the image exists
-    std::map<shmea::GString, shmea::GPointer<shmea::Image> >::const_iterator itr
-	= testImages.at(label).find(fname);
-    if(itr == testImages.at(label).end())
-	return shmea::GVector<float>();
-	
-    // Return the image
-    shmea::GVector<float> retList = itr->second->flatten();
-    retList = shmea::vectorStandardize(retList);
-    return retList;
+    std::map<std::string, RowCacheEntry>::iterator it = rowCache.find(path);
+    if (it != rowCache.end())
+    {
+        rowCacheOrder.erase(it->second.lruIt);
+        rowCacheOrder.push_front(path);
+        it->second.lruIt = rowCacheOrder.begin();
+        return it->second.row;
+    }
+
+    shmea::Image img;
+    img.LoadPNG(to_gstring(path));
+    shmea::GVector<float> row = img.flatten();
+    row = shmea::vectorStandardize(row);
+
+    if (rowCacheMaxEntries > 0)
+    {
+        if (rowCache.size() >= rowCacheMaxEntries && !rowCacheOrder.empty())
+        {
+            const std::string evictKey = rowCacheOrder.back();
+            rowCacheOrder.pop_back();
+            rowCache.erase(evictKey);
+        }
+        rowCacheOrder.push_front(path);
+        RowCacheEntry e;
+        e.row = row;
+        e.lruIt = rowCacheOrder.begin();
+        rowCache[path] = e;
+    }
+
+    return row;
 }
 
 
@@ -311,14 +407,178 @@ unsigned int ImageInput::getTestSize() const
 
 unsigned int ImageInput::getFeatureCount() const
 {
-	if(trainImages.size() == 0)
-		return 0;
-
-	unsigned int retVal = trainImages.begin()->second.begin()->second->getPixelCount();
-	return retVal;
+	return featureCount;
 }
 
 int ImageInput::getType() const
 {
     return IMAGE;
+}
+
+bool ImageInput::getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+    outData = NULL;
+    outSize = 0u;
+    if (index >= trainingPaths.size())
+        return false;
+
+    const std::string& path = trainingPaths[index];
+
+    std::map<std::string, RowCacheEntry>::iterator it = rowCache.find(path);
+    if (it != rowCache.end())
+    {
+        // touch
+        rowCacheOrder.erase(it->second.lruIt);
+        rowCacheOrder.push_front(path);
+        it->second.lruIt = rowCacheOrder.begin();
+        outData = it->second.row.data();
+        outSize = static_cast<unsigned int>(it->second.row.size());
+        return (outData != NULL && outSize > 0u);
+    }
+
+    // Cache miss: materialize the row once.
+    shmea::Image img;
+    img.LoadPNG(to_gstring(path));
+    shmea::GVector<float> row = img.flatten();
+    row = shmea::vectorStandardize(row);
+
+    if (rowCacheMaxEntries > 0)
+    {
+        if (rowCache.size() >= rowCacheMaxEntries && !rowCacheOrder.empty())
+        {
+            const std::string evictKey = rowCacheOrder.back();
+            rowCacheOrder.pop_back();
+            rowCache.erase(evictKey);
+        }
+        rowCacheOrder.push_front(path);
+        RowCacheEntry e;
+        e.row = row;
+        e.lruIt = rowCacheOrder.begin();
+        rowCache[path] = e;
+
+        outData = rowCache[path].row.data();
+        outSize = static_cast<unsigned int>(rowCache[path].row.size());
+        return (outData != NULL && outSize > 0u);
+    }
+
+    // No caching: keep the row alive in scratch storage.
+    scratchRow = row;
+    outData = scratchRow.data();
+    outSize = static_cast<unsigned int>(scratchRow.size());
+    return (outData != NULL && outSize > 0u);
+}
+
+bool ImageInput::getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+    outData = NULL;
+    outSize = 0u;
+    if (index >= testingPaths.size())
+        return false;
+
+    const std::string& path = testingPaths[index];
+
+    std::map<std::string, RowCacheEntry>::iterator it = rowCache.find(path);
+    if (it != rowCache.end())
+    {
+        rowCacheOrder.erase(it->second.lruIt);
+        rowCacheOrder.push_front(path);
+        it->second.lruIt = rowCacheOrder.begin();
+        outData = it->second.row.data();
+        outSize = static_cast<unsigned int>(it->second.row.size());
+        return (outData != NULL && outSize > 0u);
+    }
+
+    shmea::Image img;
+    img.LoadPNG(to_gstring(path));
+    shmea::GVector<float> row = img.flatten();
+    row = shmea::vectorStandardize(row);
+
+    if (rowCacheMaxEntries > 0)
+    {
+        if (rowCache.size() >= rowCacheMaxEntries && !rowCacheOrder.empty())
+        {
+            const std::string evictKey = rowCacheOrder.back();
+            rowCacheOrder.pop_back();
+            rowCache.erase(evictKey);
+        }
+        rowCacheOrder.push_front(path);
+        RowCacheEntry e;
+        e.row = row;
+        e.lruIt = rowCacheOrder.begin();
+        rowCache[path] = e;
+
+        outData = rowCache[path].row.data();
+        outSize = static_cast<unsigned int>(rowCache[path].row.size());
+        return (outData != NULL && outSize > 0u);
+    }
+
+    scratchRow = row;
+    outData = scratchRow.data();
+    outSize = static_cast<unsigned int>(scratchRow.size());
+    return (outData != NULL && outSize > 0u);
+}
+
+bool ImageInput::getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+    outData = NULL;
+    outSize = 0u;
+    if (index >= trainingLegend.numberOfRows())
+        return false;
+
+    // Fast path: cached one-hot vectors.
+    if (!oneHotByIndex.empty() && trainingOHEMaps.size() > 1u && trainingOHEMaps[1])
+    {
+        const shmea::GString& label = trainingLegend.getCell(index, 1);
+        const int idx = trainingOHEMaps[1]->indexAt(label);
+        if (idx >= 0 && static_cast<unsigned int>(idx) < oneHotByIndex.size())
+        {
+            outData = oneHotByIndex[static_cast<unsigned int>(idx)].data();
+            outSize = static_cast<unsigned int>(oneHotByIndex[static_cast<unsigned int>(idx)].size());
+            return (outData != NULL && outSize > 0u);
+        }
+        // Unknown label: return an all-zeros vector of the right size.
+        const unsigned int K = static_cast<unsigned int>(oneHotByIndex.size());
+        if (scratchExpected.size() != K)
+            scratchExpected = shmea::GVector<float>(K, 0.0f);
+        outData = scratchExpected.data();
+        outSize = static_cast<unsigned int>(scratchExpected.size());
+        return (outData != NULL && outSize > 0u);
+    }
+
+    // Fallback (legacy): materialize via OHE operator[].
+    scratchExpected = getTrainExpectedRow(index);
+    outData = scratchExpected.data();
+    outSize = static_cast<unsigned int>(scratchExpected.size());
+    return (outData != NULL && outSize > 0u);
+}
+
+bool ImageInput::getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+    outData = NULL;
+    outSize = 0u;
+    if (index >= testingLegend.numberOfRows())
+        return false;
+
+    if (!oneHotByIndex.empty() && testingOHEMaps.size() > 1u && testingOHEMaps[1])
+    {
+        const shmea::GString& label = testingLegend.getCell(index, 1);
+        const int idx = testingOHEMaps[1]->indexAt(label);
+        if (idx >= 0 && static_cast<unsigned int>(idx) < oneHotByIndex.size())
+        {
+            outData = oneHotByIndex[static_cast<unsigned int>(idx)].data();
+            outSize = static_cast<unsigned int>(oneHotByIndex[static_cast<unsigned int>(idx)].size());
+            return (outData != NULL && outSize > 0u);
+        }
+        const unsigned int K = static_cast<unsigned int>(oneHotByIndex.size());
+        if (scratchExpected.size() != K)
+            scratchExpected = shmea::GVector<float>(K, 0.0f);
+        outData = scratchExpected.data();
+        outSize = static_cast<unsigned int>(scratchExpected.size());
+        return (outData != NULL && outSize > 0u);
+    }
+
+    scratchExpected = getTestExpectedRow(index);
+    outData = scratchExpected.data();
+    outSize = static_cast<unsigned int>(scratchExpected.size());
+    return (outData != NULL && outSize > 0u);
 }

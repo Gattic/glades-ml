@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -28,6 +28,8 @@
 #include <sys/stat.h>
 #include <vector>
 
+#include "Backend/Database/GPointer.h"
+
 namespace shmea {
 class GTable;
 };
@@ -50,6 +52,8 @@ RNN* getRNN(const std::string&);
 bool saveNeuralNetwork(NNetwork*);
 
 // Machine Learning Functions
+//
+// Legacy API: these return raw pointers that the caller must delete.
 MetaNetwork* train(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* train(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* train(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
@@ -60,6 +64,17 @@ MetaNetwork* crossValidate(NNInfo*, std::string, bool, int, GNet::GServer* = NUL
 MetaNetwork* crossValidate(std::string, std::vector<std::string>, float, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* crossValidate(std::vector<glades::NNetwork*>, const shmea::GTable&, const int, std::vector<float>&, unsigned int = 5, bool = false);
 MetaNetwork* crossValidate(std::vector<glades::NNetwork*>, const shmea::GTable&, const int, std::vector<float>&, std::vector<float>&, unsigned int = 10, unsigned int = 20);
+
+// Safer ownership API: returns RAII pointer (ref-counted).
+//
+// These wrap the legacy functions but transfer ownership into a `GPointer` so callers
+// don't need to remember to `delete` returned MetaNetwork instances.
+shmea::GPointer<MetaNetwork> trainOwned(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+shmea::GPointer<MetaNetwork> trainOwned(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+shmea::GPointer<MetaNetwork> trainOwned(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+shmea::GPointer<MetaNetwork> testOwned(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+shmea::GPointer<MetaNetwork> testOwned(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+shmea::GPointer<MetaNetwork> testOwned(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 
 // Database Setup
 bool doesDatabaseExist();

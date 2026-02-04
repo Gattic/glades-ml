@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -150,7 +150,10 @@ float glades::CMatrix::getClassAccuracy(unsigned int index) const
 	float truth = ((float)(truePositive.getInt(index) + trueNegative.getInt(index)));
 	float untruth = ((float)(falsePositive.getInt(index) + falseNegative.getInt(index)));
 
-	return (truth / (truth + untruth));
+	const float denom = truth + untruth;
+	if (denom <= 0.0f)
+		return 0.0f;
+	return (truth / denom);
 }
 
 float glades::CMatrix::getOverallAccuracy() const
@@ -170,8 +173,12 @@ float glades::CMatrix::getClassPrecision(unsigned int index) const
 	if (index > matrix.numberOfRows())
 		return 0.0f;
 
-	return (((float)(truePositive.getInt(index))) /
-			((float)(truePositive.getInt(index) + falsePositive.getInt(index))));
+	const float tp = (float)truePositive.getInt(index);
+	const float fp = (float)falsePositive.getInt(index);
+	const float denom = tp + fp;
+	if (denom <= 0.0f)
+		return 0.0f;
+	return (tp / denom);
 }
 
 float glades::CMatrix::getOverallPrecision() const
@@ -191,8 +198,12 @@ float glades::CMatrix::getClassRecall(unsigned int index) const
 	if (index > matrix.numberOfRows())
 		return 0.0f;
 
-	return (((float)(truePositive.getInt(index))) /
-			((float)(truePositive.getInt(index) + falseNegative.getInt(index))));
+	const float tp = (float)truePositive.getInt(index);
+	const float fn = (float)falseNegative.getInt(index);
+	const float denom = tp + fn;
+	if (denom <= 0.0f)
+		return 0.0f;
+	return (tp / denom);
 }
 
 float glades::CMatrix::getOverallRecall() const
@@ -212,8 +223,12 @@ float glades::CMatrix::getClassSpecificity(unsigned int index) const
 	if (index > matrix.numberOfRows())
 		return 0.0f;
 
-	return (((float)(trueNegative.getInt(index))) /
-			((float)(trueNegative.getInt(index) + falsePositive.getInt(index))));
+	const float tn = (float)trueNegative.getInt(index);
+	const float fp = (float)falsePositive.getInt(index);
+	const float denom = tn + fp;
+	if (denom <= 0.0f)
+		return 0.0f;
+	return (tn / denom);
 }
 
 float glades::CMatrix::getOverallSpecificity() const
@@ -234,8 +249,12 @@ float glades::CMatrix::getClassFalseAlarm(unsigned int index) const
 		return 0.0f;
 
 	// also 1.0f - specificity
-	return (((float)(falsePositive.getInt(index))) /
-			((float)(trueNegative.getInt(index) + falsePositive.getInt(index))));
+	const float tn = (float)trueNegative.getInt(index);
+	const float fp = (float)falsePositive.getInt(index);
+	const float denom = tn + fp;
+	if (denom <= 0.0f)
+		return 0.0f;
+	return (fp / denom);
 }
 
 float glades::CMatrix::getOverallFalseAlarm() const
@@ -258,7 +277,10 @@ float glades::CMatrix::getClassF1Score(unsigned int index) const
 	float cRecall = getClassRecall(index);
 	float cPrecision = getClassPrecision(index);
 
-	return ((2.0f * cRecall * cPrecision) / (cRecall + cPrecision));
+	const float denom = cRecall + cPrecision;
+	if (denom <= 0.0f)
+		return 0.0f;
+	return ((2.0f * cRecall * cPrecision) / denom);
 }
 
 float glades::CMatrix::getOverallF1Score() const
@@ -286,7 +308,9 @@ float glades::CMatrix::getClassMCC(unsigned int index) const
 	float numerator = (tp * tn) - (fp * fn);
 	float denominator = sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn));
 
-	return 100 * (numerator / denominator);
+	if (denominator <= 0.0f)
+		return 0.0f;
+	return 100.0f * (numerator / denominator);
 }
 
 float glades::CMatrix::getOverallMCC() const

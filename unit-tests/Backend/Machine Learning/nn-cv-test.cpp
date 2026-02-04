@@ -1,10 +1,19 @@
-// Confidential, unpublished property of Robert Carneiro
-
-// The access and distribution of this material is limited solely to
-// authorized personnel.  The use, disclosure, reproduction,
-// modification, transfer, or transmittal of this work for any purpose
-// in any form or by any means without the written permission of
-// Robert Carneiro is strictly prohibited.
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+// associated documentation files (the "Software"), to deal in the Software without restriction,
+// including without limitation the rights to use, copy, modify, merge, publish, distribute,
+// sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or
+// substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+// NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "nn-cv-test.h"
 #include "../../unit-test.h"
 #include "Backend/Database/GList.h"
@@ -59,22 +68,31 @@ void NNCVUnitTestValidation()
         return;
     }
 
-    irisNetwork1.terminator.setEpoch(10000);
-    irisNetwork1.terminator.setAccuracy(95);
+    irisNetwork1.getTerminatorMutable().setEpoch(10000);
+    irisNetwork1.getTerminatorMutable().setAccuracy(99);
 
-    irisNetwork2.terminator.setEpoch(10000);
-    irisNetwork2.terminator.setAccuracy(95);
+    irisNetwork2.getTerminatorMutable().setEpoch(10000);
+    irisNetwork2.getTerminatorMutable().setAccuracy(99);
 
-    irisNetwork1.skeleton->setLearningRate(0, 0.0003f);
-    irisNetwork1.skeleton->setWeightDecay1(0, 0.001f);
-    irisNetwork1.skeleton->setWeightDecay2(0, 0.001f);
+    if (irisNetwork1.getNNInfoMutable())
+    {
+        irisNetwork1.getNNInfoMutable()->setLearningRate(0, 0.0003f);
+        irisNetwork1.getNNInfoMutable()->setWeightDecay1(0, 0.001f);
+        irisNetwork1.getNNInfoMutable()->setWeightDecay2(0, 0.001f);
+    }
 
-    irisNetwork1.skeleton->setLearningRate(1, 0.0003f);
-    irisNetwork1.skeleton->setWeightDecay1(1, 0.001f);
-    irisNetwork1.skeleton->setWeightDecay2(1, 0.001f);
+    if (irisNetwork1.getNNInfoMutable())
+    {
+        irisNetwork1.getNNInfoMutable()->setLearningRate(1, 0.0003f);
+        irisNetwork1.getNNInfoMutable()->setWeightDecay1(1, 0.001f);
+        irisNetwork1.getNNInfoMutable()->setWeightDecay2(1, 0.001f);
+    }
 
-    irisNetwork2.skeleton->setLearningRate(0, 0.0005f);
-    irisNetwork2.skeleton->setLearningRate(1, 0.0005f);
+    if (irisNetwork2.getNNInfoMutable())
+    {
+        irisNetwork2.getNNInfoMutable()->setLearningRate(0, 0.0005f);
+        irisNetwork2.getNNInfoMutable()->setLearningRate(1, 0.0005f);
+    }
 
     std::vector<glades::NNetwork*> irisNetworks;
     irisNetworks.push_back(&irisNetwork1);
@@ -140,11 +158,11 @@ void NNCVUnitTestValidation()
     }
 
     // Termination Conditions
-    rnnNetwork1.terminator.setEpoch(50000);
-    rnnNetwork1.terminator.setAccuracy(95);
+    rnnNetwork1.getTerminatorMutable().setEpoch(50000);
+    rnnNetwork1.getTerminatorMutable().setAccuracy(99);
 
-    rnnNetwork2.terminator.setEpoch(50000);
-    rnnNetwork2.terminator.setAccuracy(95);
+    rnnNetwork2.getTerminatorMutable().setEpoch(50000);
+    rnnNetwork2.getTerminatorMutable().setAccuracy(99);
 
     std::vector<glades::NNetwork*> networks;
     networks.push_back(&rnnNetwork1);

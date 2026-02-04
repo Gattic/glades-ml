@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -19,6 +19,7 @@
 
 #include "Backend/Database/GString.h"
 #include "Backend/Database/GTable.h"
+#include "Backend/Database/GPointer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,7 @@ private:
 
 	shmea::GString name;
 	int collectionType;
+	std::vector<shmea::GPointer<NNetwork> > ownedSubnets;
 	std::vector<NNetwork*> subnets;
 
 public:

@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -95,7 +95,13 @@ glades::MetaNetwork* glades::train(NNInfo* networkInfo, DataInput* newDataInput,
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->train(newDataInput);
+		const glades::NNetworkStatus st = subnets[i]->train(newDataInput);
+		if (!st.ok())
+		{
+			printf("[NN] Train failed: %s\n", st.message.c_str());
+			delete cMetaNetwork;
+			return NULL;
+		}
 	}
 
 	return cMetaNetwork;
@@ -126,7 +132,13 @@ glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDat
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->train(newDataInput);
+		const glades::NNetworkStatus st = subnets[i]->train(newDataInput);
+		if (!st.ok())
+		{
+			printf("[NN] Train failed: %s\n", st.message.c_str());
+			delete cMetaNetwork;
+			return NULL;
+		}
 	}
 
 	return cMetaNetwork;
@@ -151,7 +163,12 @@ glades::MetaNetwork* glades::train(glades::MetaNetwork* cMetaNetwork,
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->train(newDataInput);
+		const glades::NNetworkStatus st = subnets[i]->train(newDataInput);
+		if (!st.ok())
+		{
+			printf("[NN] Train failed: %s\n", st.message.c_str());
+			return NULL;
+		}
 	}
 
 	return cMetaNetwork;
@@ -181,7 +198,13 @@ glades::MetaNetwork* glades::test(NNInfo* networkInfo, DataInput* newDataInput, 
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->test(newDataInput);
+		const glades::NNetworkStatus st = subnets[i]->test(newDataInput);
+		if (!st.ok())
+		{
+			printf("[NN] Test failed: %s\n", st.message.c_str());
+			delete cMetaNetwork;
+			return NULL;
+		}
 	}
 
 	return cMetaNetwork;
@@ -211,7 +234,13 @@ glades::MetaNetwork* glades::test(glades::NNetwork* networkInfo, DataInput* newD
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->test(newDataInput);
+		const glades::NNetworkStatus st = subnets[i]->test(newDataInput);
+		if (!st.ok())
+		{
+			printf("[NN] Test failed: %s\n", st.message.c_str());
+			delete cMetaNetwork;
+			return NULL;
+		}
 	}
 
 	return cMetaNetwork;
@@ -235,10 +264,68 @@ glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, DataInput* 
 	{
 		if (serverInstance && cConnection)
 			subnets[i]->setServer(serverInstance, cConnection);
-		subnets[i]->test(newDataInput);
+		const glades::NNetworkStatus st = subnets[i]->test(newDataInput);
+		if (!st.ok())
+		{
+			printf("[NN] Test failed: %s\n", st.message.c_str());
+			return NULL;
+		}
 	}
 
 	return cMetaNetwork;
+}
+
+// ===== Safer ownership wrappers (RAII) =====
+//
+// These functions wrap the legacy raw-pointer API and return a ref-counted `GPointer`.
+// This avoids forcing callers to remember to `delete` the returned MetaNetwork.
+
+shmea::GPointer<glades::MetaNetwork> glades::trainOwned(glades::NNInfo* networkInfo,
+                                                       glades::DataInput* newDataInput,
+                                                       GNet::GServer* serverInstance,
+                                                       GNet::Connection* cConnection)
+{
+	return shmea::GPointer<glades::MetaNetwork>(glades::train(networkInfo, newDataInput, serverInstance, cConnection));
+}
+
+shmea::GPointer<glades::MetaNetwork> glades::trainOwned(glades::NNetwork* cNetwork,
+                                                       glades::DataInput* newDataInput,
+                                                       GNet::GServer* serverInstance,
+                                                       GNet::Connection* cConnection)
+{
+	return shmea::GPointer<glades::MetaNetwork>(glades::train(cNetwork, newDataInput, serverInstance, cConnection));
+}
+
+shmea::GPointer<glades::MetaNetwork> glades::trainOwned(glades::MetaNetwork* cMetaNetwork,
+                                                       glades::DataInput* newDataInput,
+                                                       GNet::GServer* serverInstance,
+                                                       GNet::Connection* cConnection)
+{
+	return shmea::GPointer<glades::MetaNetwork>(glades::train(cMetaNetwork, newDataInput, serverInstance, cConnection));
+}
+
+shmea::GPointer<glades::MetaNetwork> glades::testOwned(glades::NNInfo* networkInfo,
+                                                      glades::DataInput* newDataInput,
+                                                      GNet::GServer* serverInstance,
+                                                      GNet::Connection* cConnection)
+{
+	return shmea::GPointer<glades::MetaNetwork>(glades::test(networkInfo, newDataInput, serverInstance, cConnection));
+}
+
+shmea::GPointer<glades::MetaNetwork> glades::testOwned(glades::NNetwork* networkInfo,
+                                                      glades::DataInput* newDataInput,
+                                                      GNet::GServer* serverInstance,
+                                                      GNet::Connection* cConnection)
+{
+	return shmea::GPointer<glades::MetaNetwork>(glades::test(networkInfo, newDataInput, serverInstance, cConnection));
+}
+
+shmea::GPointer<glades::MetaNetwork> glades::testOwned(glades::MetaNetwork* cMetaNetwork,
+                                                      glades::DataInput* newDataInput,
+                                                      GNet::GServer* serverInstance,
+                                                      GNet::Connection* cConnection)
+{
+	return shmea::GPointer<glades::MetaNetwork>(glades::test(cMetaNetwork, newDataInput, serverInstance, cConnection));
 }
 
 /*!

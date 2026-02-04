@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -54,12 +54,12 @@ glades::NNInfo::NNInfo(const shmea::GString& newName, InputLayerInfo* newInputLa
 	name = newName;
 	inputType = 0;
 	hiddenLayerCount = hidden.size();
-	inputLayer = newInputLayer;
-	outputLayer = newOutputLayer;
+	inputLayer = shmea::GPointer<InputLayerInfo>(newInputLayer);
+	outputLayer = shmea::GPointer<OutputLayerInfo>(newOutputLayer);
 
 	// populate the hidden layers
 	for (int i = 0; i < hiddenLayerCount; ++i)
-		layers.push_back(hidden[i]);
+		layers.push_back(shmea::GPointer<HiddenLayerInfo>(hidden[i]));
 }
 
 /*!
@@ -70,6 +70,9 @@ glades::NNInfo::NNInfo(const shmea::GString& newName, InputLayerInfo* newInputLa
 glades::NNInfo::NNInfo(const shmea::GString& newName, const shmea::GTable& newTable)
 {
 	int rows = newTable.numberOfRows(), cols = newTable.numberOfCols(), r = 0;
+	// Backward compatible schema:
+	// - Old: 10 columns (no tbpttWindow)
+	// - New: 11 columns (includes tbpttWindow)
 	if (cols < 10)
 		printf("[NNINFO] Bad table size: (%d,%d)\n", rows, cols);
 	if (newTable.getHeader(0) != "Size")
@@ -90,17 +93,10 @@ glades::NNInfo::~NNInfo()
 	name = "";
 	inputType = 0;
 	hiddenLayerCount = 0;
-	for (unsigned int i = 0; i < layers.size(); ++i)
-		delete layers[i];
 	layers.clear();
 
-	if (inputLayer)
-		delete inputLayer;
-	inputLayer = NULL;
-
-	if (outputLayer)
-		delete outputLayer;
-	outputLayer = NULL;
+	inputLayer.reset();
+	outputLayer.reset();
 }
 
 /*!
@@ -159,6 +155,13 @@ int glades::NNInfo::getBatchSize() const
 	return inputLayer->getBatchSize();
 }
 
+int glades::NNInfo::getTBPTTWindow() const
+{
+	if (!inputLayer)
+		return 0;
+	return inputLayer->getTBPTTWindow();
+}
+
 /*!
  * @brief get input layer
  * @details get NNInfo's input layer
@@ -166,7 +169,7 @@ int glades::NNInfo::getBatchSize() const
  */
 InputLayerInfo* glades::NNInfo::getInputLayer() const
 {
-	return inputLayer;
+	return inputLayer.get();
 }
 
 /*!
@@ -176,7 +179,11 @@ InputLayerInfo* glades::NNInfo::getInputLayer() const
  */
 std::vector<HiddenLayerInfo*> glades::NNInfo::getLayers() const
 {
-	return layers;
+	std::vector<HiddenLayerInfo*> ret;
+	ret.reserve(layers.size());
+	for (unsigned int i = 0; i < layers.size(); ++i)
+		ret.push_back(layers[i].get());
+	return ret;
 }
 
 /*!
@@ -303,7 +310,7 @@ float glades::NNInfo::getWeightDecay2(unsigned int index) const
 		return 0.0f;
 
 	if(index == 0)
-	    return inputLayer->getWeightDecay1();
+	    return inputLayer->getWeightDecay2();
 
 	if (!layers[index-1])
 		return 0.0f;
@@ -389,6 +396,7 @@ void glades::NNInfo::print() const
 	headers.push_back("activationType");
 	headers.push_back("activationParam");
 	headers.push_back("outputType");
+	headers.push_back("tbpttWindow");
 
 	// put everything in a GTable
 	shmea::GTable printTable(',', headers);
@@ -464,6 +472,13 @@ void glades::NNInfo::setBatchSize(int newBatchSize)
 	inputLayer->setBatchSize(newBatchSize);
 }
 
+void glades::NNInfo::setTBPTTWindow(int newTBPTTWindow)
+{
+	if (!inputLayer)
+		return;
+	inputLayer->setTBPTTWindow(newTBPTTWindow);
+}
+
 /*!
  * @brief set the output layer type
  * @details set the output layer type
@@ -498,7 +513,10 @@ void glades::NNInfo::setOutputSize(int newOutputSize)
  */
 void glades::NNInfo::setLayers(const std::vector<HiddenLayerInfo*>& newLayers)
 {
-	layers = newLayers;
+	layers.clear();
+	layers.reserve(newLayers.size());
+	for (unsigned int i = 0; i < newLayers.size(); ++i)
+		layers.push_back(shmea::GPointer<HiddenLayerInfo>(newLayers[i]));
 }
 
 /*!
@@ -660,7 +678,7 @@ void glades::NNInfo::addHiddenLayer(HiddenLayerInfo* newLayer)
 	if (!newLayer)
 		return;
 
-	layers.push_back(newLayer);
+	layers.push_back(shmea::GPointer<HiddenLayerInfo>(newLayer));
 }
 
 void glades::NNInfo::copyHiddenLayer(unsigned int dst, unsigned int src)
@@ -682,7 +700,17 @@ void glades::NNInfo::copyHiddenLayer(unsigned int dst, unsigned int src)
 
 void glades::NNInfo::resizeHiddenLayers(unsigned int newCount)
 {
-	layers.resize(newCount, new HiddenLayerInfo(2, 0.01, 0.0, 0.0, 0.0, 0.0, 0, 0.0));
+	if (newCount <= layers.size())
+	{
+		layers.resize(newCount);
+		return;
+	}
+
+	while (layers.size() < newCount)
+	{
+		layers.push_back(shmea::GPointer<HiddenLayerInfo>(
+			new HiddenLayerInfo(2, 0.01, 0.0, 0.0, 0.0, 0.0, 0, 0.0)));
+	}
 }
 
 void glades::NNInfo::removeHiddenLayer(unsigned int index)
@@ -713,6 +741,7 @@ shmea::GTable glades::NNInfo::toGTable() const
 	headers.push_back("activationType");
 	headers.push_back("activationParam");
 	headers.push_back("outputType");
+	headers.push_back("tbpttWindow");
 
 	shmea::GTable newTable(',', headers);
 	newTable.addRow(inputLayer->getGTableRow());
@@ -734,25 +763,42 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 
 	//
 	name = netName;
+	const unsigned int cols = static_cast<unsigned int>(newTable.numberOfCols());
 	for (unsigned int i = 0; i < newTable.numberOfRows(); ++i)
 	{
 		if (i == 0)
 		{
 			// Input Layer
-			inputLayer = new InputLayerInfo(newTable.getCell(i, COL_BATCH_SIZE).getLong(),//batch size not layer size
+			const int minibatch = static_cast<int>(newTable.getCell(i, COL_BATCH_SIZE).getLong());
+			int tbpttWindow = 0;
+			if (cols > static_cast<unsigned int>(COL_TBPTT_WINDOW))
+			{
+				tbpttWindow = static_cast<int>(newTable.getCell(i, COL_TBPTT_WINDOW).getLong());
+			}
+			else
+			{
+				// Legacy mapping: older models overloaded batchSize to mean TBPTT window for recurrent nets.
+				// Preserve behavior by defaulting tbpttWindow = batchSize when batchSize > 1.
+				tbpttWindow = (minibatch > 1) ? minibatch : 0;
+			}
+
+			inputLayer = shmea::GPointer<InputLayerInfo>(
+				new InputLayerInfo(minibatch, // minibatch size (NOT layer size)
 									newTable.getCell(i, COL_LEARNING_RATE).getFloat(),
 									newTable.getCell(i, COL_MOMENTUM_FACTOR).getFloat(),
 									newTable.getCell(i, COL_WEIGHT_DECAY1).getFloat(),
 									newTable.getCell(i, COL_WEIGHT_DECAY2).getFloat(),
 									newTable.getCell(i, COL_PDROPOUT).getFloat(),
 									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
-									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());
+									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat(),
+									tbpttWindow));
 		}
 		else if (i == newTable.numberOfRows() - 1)
 		{
 			// Output Layer
-			outputLayer = new OutputLayerInfo(newTable.getCell(i, COL_SIZE).getInt(),
-											  newTable.getCell(i, COL_OUTPUT_TYPE).getFloat());
+			outputLayer = shmea::GPointer<OutputLayerInfo>(
+				new OutputLayerInfo(newTable.getCell(i, COL_SIZE).getInt(),
+											  newTable.getCell(i, COL_OUTPUT_TYPE).getFloat()));
 		}
 		else
 		{
@@ -766,7 +812,7 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 									newTable.getCell(i, COL_PDROPOUT).getFloat(),
 									newTable.getCell(i, COL_ACTIVATION_TYPE).getInt(),
 									newTable.getCell(i, COL_ACTIVATION_PARAM).getFloat());
-			layers.push_back(newLayer);
+			layers.push_back(shmea::GPointer<HiddenLayerInfo>(newLayer));
 		}
 	}
 
@@ -779,12 +825,15 @@ bool glades::NNInfo::fromGTable(const shmea::GString& netName, const shmea::GTab
 bool glades::NNInfo::load(const shmea::GString& netName)
 {
 	name = netName;
-	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
-	return fromGTable(name.c_str(), slItem->loadItem(name.c_str())->getTable());
+	shmea::SaveFolder slItem("neuralnetworks");
+	shmea::SaveTable* item = slItem.loadItem(name.c_str());
+	if (!item)
+		return false;
+	return fromGTable(name.c_str(), item->getTable());
 }
 
 void glades::NNInfo::save() const
 {
-	shmea::SaveFolder* slItem = new shmea::SaveFolder("neuralnetworks");
-	slItem->newItem(name.c_str(), toGTable());
+	shmea::SaveFolder slItem("neuralnetworks");
+	slItem.newItem(name.c_str(), toGTable());
 }

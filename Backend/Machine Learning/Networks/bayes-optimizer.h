@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -75,7 +75,8 @@ private:
 public:
     BayesianOptimizer()
     {
-        srand(static_cast<unsigned>(time(0)));
+        // Deterministic by default: do not seed global rand().
+        // If optimization requires randomness, use glades::rng (seeded explicitly by caller).
     }
 
     float optimize(const std::vector<std::pair<float, float> >);

@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -22,6 +22,7 @@
 #include "../GMath/gmath.h"
 #include "../Structure/nninfo.h"
 #include <vector>
+#include <limits>
 
 using namespace glades;
 
@@ -53,7 +54,8 @@ void NumberInput::import(const shmea::GTable& rawTable, int standardizeFlag)
     }
 
     // Load and Normalize/Standardize the data
-    standardizeInputTable(rawTable, standardizeFlag, false);
+    const bool changeValues = (standardizeFlag != GMath::NONE);
+    standardizeInputTable(rawTable, standardizeFlag, changeValues);
 
     loaded = true;
 }
@@ -67,6 +69,15 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
     if ((rawTable.numberOfRows() <= 0) || (rawTable.numberOfCols() <= 0))
         return;
 
+    // Reset global min/max tracking for this import.
+    // DataInput initializes these to sentinel extremes, but NumberInput may be reused or
+    // may contain only categorical columns (in which case we must not leave infinities).
+    const float initMin = std::numeric_limits<float>::max();
+    const float initMax = -std::numeric_limits<float>::max();
+    min = initMin;
+    max = initMax;
+    bool sawNumeric = false;
+
     // Initialize matrices with proper dimensions
     unsigned int inputColIdx = 0;
     unsigned int outputColIdx = 0;
@@ -74,10 +85,9 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
     unsigned int totalOutputCols = 0;
 
     // default cols to non-categorical
-    bool isClassification = false;
     for (unsigned int c = 0; c < rawTable.numberOfCols(); ++c)
     {
-        OHE* cOHE = new OHE();
+        shmea::GPointer<OHE> cOHE(new OHE());
         trainingFeatureIsCategorical.push_back(false);
 
         shmea::GType cCell = rawTable.getCell(0, c); // get the first cell of the col
@@ -85,7 +95,6 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
         {
             cOHE->mapFeatureSpace(rawTable, c);
             trainingFeatureIsCategorical[c] = true;
-            isClassification = true;
             cOHE->print();
         }
 
@@ -125,7 +134,7 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
     {
         if (trainingFeatureIsCategorical[c]) 
         {
-            OHE* OHEVector = trainingOHEMaps[c];
+            const shmea::GPointer<OHE>& OHEVector = trainingOHEMaps[c];
             for (unsigned int cInt = 0; cInt < OHEVector->size(); ++cInt) 
             {
                 for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r) 
@@ -159,12 +168,17 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
             // Handle numeric columns
             float fMin = 0.0f;
             float fMax = 0.0f;
-            float fMean = 0.0f;
+            sawNumeric = true;
+            // Use stable one-pass stats for ZSCORE.
+            // (Welford) gives mean and unbiased variance in O(n).
+            double mean = 0.0;
+            double m2 = 0.0;
+            unsigned int count = 0;
 
-            // First get min/max/mean
+            // First get min/max/mean/(m2)
             for (unsigned int r = 0; r < rawTable.numberOfRows(); ++r) 
             {
-                float cell = rawTable.getCell(r, c).getFloat();
+                const float cell = rawTable.getCell(r, c).getFloat();
                 if (r == 0) 
                 {
                     fMin = cell;
@@ -172,9 +186,24 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
                 }
                 if (cell < fMin) fMin = cell;
                 if (cell > fMax) fMax = cell;
-                fMean += cell;
+
+                // Running mean/variance (unconditionally; it's cheap and avoids branching).
+                ++count;
+                const double x = static_cast<double>(cell);
+                const double delta = x - mean;
+                mean += delta / static_cast<double>(count);
+                const double delta2 = x - mean;
+                m2 += delta * delta2;
             }
-            fMean /= rawTable.numberOfRows();
+
+            // Compute stdev once per column (unbiased estimator: divide by n-1).
+            float fStDev = 0.0f;
+            if (count > 1)
+            {
+                const double variance = m2 / static_cast<double>(count - 1);
+                if (variance > 0.0)
+                    fStDev = static_cast<float>(sqrt(variance));
+            }
 
 	    // Set the class min/max
 	    if (fMin < min)
@@ -196,17 +225,9 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
                     } 
                     else if (standardizeFlag == GMath::ZSCORE) 
                     {
-                        // Calculate standard deviation
-                        float fStDev = 0.0f;
-                        for (unsigned int i = 0; i < rawTable.numberOfRows(); ++i) 
-                        {
-                            float val = rawTable.getCell(i, c).getFloat();
-                            fStDev += ((val - fMean) * (val - fMean));
-                        }
-                        fStDev = sqrt(fStDev / (rawTable.numberOfRows() - 1));
                         if (fStDev != 0.0f) 
                         {
-                            cell = ((cell - fMean) / fStDev);
+                            cell = static_cast<float>((static_cast<double>(cell) - mean) / static_cast<double>(fStDev));
                         }
                     }
                 }
@@ -229,6 +250,14 @@ void glades::NumberInput::standardizeInputTable(const shmea::GTable& rawTable, i
                 inputColIdx++;
             }
         }
+    }
+
+    // If there were no numeric columns at all, min/max were never updated from sentinels.
+    // Keep this well-defined for downstream consumers.
+    if (!sawNumeric)
+    {
+        min = 0.0f;
+        max = 0.0f;
     }
 }
 
@@ -268,6 +297,62 @@ shmea::GVector<float> NumberInput::getTestExpectedRow(unsigned int index) const
     return testExpectedMatrix[index];
 }
 
+bool NumberInput::getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+	outData = NULL;
+	outSize = 0u;
+	if (index >= trainMatrix.size())
+		return false;
+	const shmea::GVector<float>& row = trainMatrix[index];
+	if (row.size() == 0)
+		return false;
+	outData = row.data();
+	outSize = static_cast<unsigned int>(row.size());
+	return (outData != NULL);
+}
+
+bool NumberInput::getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+	outData = NULL;
+	outSize = 0u;
+	if (index >= trainExpectedMatrix.size())
+		return false;
+	const shmea::GVector<float>& row = trainExpectedMatrix[index];
+	if (row.size() == 0)
+		return false;
+	outData = row.data();
+	outSize = static_cast<unsigned int>(row.size());
+	return (outData != NULL);
+}
+
+bool NumberInput::getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+	outData = NULL;
+	outSize = 0u;
+	if (index >= testMatrix.size())
+		return false;
+	const shmea::GVector<float>& row = testMatrix[index];
+	if (row.size() == 0)
+		return false;
+	outData = row.data();
+	outSize = static_cast<unsigned int>(row.size());
+	return (outData != NULL);
+}
+
+bool NumberInput::getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+{
+	outData = NULL;
+	outSize = 0u;
+	if (index >= testExpectedMatrix.size())
+		return false;
+	const shmea::GVector<float>& row = testExpectedMatrix[index];
+	if (row.size() == 0)
+		return false;
+	outData = row.data();
+	outSize = static_cast<unsigned int>(row.size());
+	return (outData != NULL);
+}
+
 unsigned int NumberInput::getTrainSize() const
 {
     return trainMatrix.size();
@@ -280,6 +365,8 @@ unsigned int NumberInput::getTestSize() const
 
 unsigned int NumberInput::getFeatureCount() const
 {
+    if (trainMatrix.size() == 0)
+        return 0;
     return trainMatrix[0].size();
 }
 

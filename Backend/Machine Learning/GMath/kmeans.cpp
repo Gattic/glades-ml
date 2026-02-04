@@ -1,4 +1,5 @@
 #include "kmeans.h"
+#include "../rng.h"
 
 using namespace glades;
 
@@ -8,7 +9,6 @@ KMeans::KMeans(int clusters, int iterations, float tol)
     k = clusters;
     maxIterations = iterations;
     tolerance = tol;
-    std::srand((unsigned int)std::time(0)); // Seed random generator
 }
 
 // Compute Euclidean distance (optimized loop)
@@ -30,7 +30,7 @@ void KMeans::initializeCentroids(const std::vector<std::vector<float> >& points)
     int n = points.size();
 
     // Select first centroid randomly
-    int firstIndex = std::rand() % n;
+    int firstIndex = glades::rng::uniform_int(0, n - 1);
     centroids.push_back(points[firstIndex]);
 
     // Select remaining centroids using distance-based probability
@@ -58,7 +58,7 @@ void KMeans::initializeCentroids(const std::vector<std::vector<float> >& points)
             totalDist += distances[i] * distances[i];
         }
 
-        float r = ((float)std::rand() / RAND_MAX) * totalDist;
+        float r = glades::rng::uniform_float(0.0f, totalDist);
         float cumulative = 0.0f;
 
         for (int i = 0; i < n; ++i)

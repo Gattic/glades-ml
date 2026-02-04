@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -81,9 +81,26 @@ public:
 	virtual shmea::GVector<float> getTestRow(unsigned int) const;
 	virtual shmea::GVector<float> getTestExpectedRow(unsigned int) const;
 
+	// Zero-copy views into the underlying matrices.
+	virtual bool getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
+	virtual bool getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
+	virtual bool getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
+	virtual bool getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
+
 	virtual unsigned int getTrainSize() const;
 	virtual unsigned int getTestSize() const;
 	virtual unsigned int getFeatureCount() const;
+
+	// Fast shape contract (prevents TrainingCore from materializing rows to validate sizes).
+	virtual bool hasFixedTrainRowSize() const { return (trainMatrix.size() > 0) && (trainMatrix[0].size() > 0); }
+	virtual unsigned int getFixedTrainRowSize() const { return getFeatureCount(); }
+	virtual bool hasFixedTrainExpectedRowSize() const { return (trainExpectedMatrix.size() > 0) && (trainExpectedMatrix[0].size() > 0); }
+	virtual unsigned int getFixedTrainExpectedRowSize() const
+	{
+		if (trainExpectedMatrix.size() == 0)
+			return 0u;
+		return static_cast<unsigned int>(trainExpectedMatrix[0].size());
+	}
 
 	virtual int getType() const;
 };

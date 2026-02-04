@@ -1,14 +1,24 @@
-// Confidential, unpublished property of Robert Carneiro
-
-// The access and distribution of this material is limited solely to
-// authorized personnel.  The use, disclosure, reproduction,
-// modification, transfer, or transmittal of this work for any purpose
-// in any form or by any means without the written permission of
-// Robert Carneiro is strictly prohibited.
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+// associated documentation files (the "Software"), to deal in the Software without restriction,
+// including without limitation the rights to use, copy, modify, merge, publish, distribute,
+// sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or
+// substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+// NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "main.h"
 #include "Backend/Machine Learning/nn-test.h"
 #include "Backend/Machine Learning/nn-cv-test.h"
 #include "Backend/Machine Learning/nn-save-load-test.h"
+#include "Backend/Machine Learning/nn-benchmarks.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
@@ -33,6 +43,10 @@ int main(int argc, char* argv[])
 	{
 	    if (strcmp(argv[1], "nn") == 0)
 		NNUnitTest();
+	    else if (strcmp(argv[1], "nn-recurrent") == 0)
+		NNRecurrentUnitTest();
+	    else if (strcmp(argv[1], "nn-bench") == 0)
+		NNBenchmarks(argc, argv);
 	    else if (strcmp(argv[1], "pca") == 0)
 		PCAUnitTest();
 	    else if (strcmp(argv[1], "kmeans") == 0)

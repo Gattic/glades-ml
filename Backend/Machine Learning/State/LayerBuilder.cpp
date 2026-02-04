@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -23,6 +23,7 @@
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
+#include "Backend/Database/GLogger.h"
 #include "Backend/Database/SaveFolder.h"
 #include "Backend/Database/SaveTable.h"
 #include "Backend/Database/maxid.h"
@@ -36,14 +37,32 @@
 
 using namespace glades;
 
+namespace {
+static inline shmea::GLogger& ml_logger()
+{
+	// Default logger for ML subsystem code that is not attached to a server instance.
+	// This keeps LayerBuilder free of hard dependencies on networking/server lifetime.
+	static shmea::GLogger logger(shmea::GLogger::LOG_INFO);
+	return logger;
+}
+} // namespace
+
 glades::LayerBuilder::LayerBuilder()
 {
 	netType = NNetwork::TYPE_DFF;
+	inputLayer.reset();
+	inputRowCount = 0;
+	inputFeatureCount = 0;
+	dataInput = NULL;
 }
 
 glades::LayerBuilder::LayerBuilder(int newNetType)
 {
 	netType = newNetType;
+	inputLayer.reset();
+	inputRowCount = 0;
+	inputFeatureCount = 0;
+	dataInput = NULL;
 }
 
 glades::LayerBuilder::~LayerBuilder()
@@ -51,17 +70,29 @@ glades::LayerBuilder::~LayerBuilder()
     //
 }
 
+bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInput, int newNetType, bool standardizeWeightsFlag)
+{
+	netType = newNetType;
+	return build(skeleton, newInput, standardizeWeightsFlag);
+}
+
 bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInput, bool standardizeWeightsFlag)
 {
+	lastError.clear();
 	if (!skeleton)
+	{
+		setError("LayerBuilder::build: skeleton is NULL");
+		ml_logger().error("LayerBuilder", lastError.c_str());
 		return false;
+	}
 
 	// Construct the input layers
-	printf("[GQL] Building input layers\n");
+	ml_logger().info("LayerBuilder", "Building input layer");
 	buildInputLayers(skeleton, newInput);
-	if (inputLayers.size() <= 0)
+	if (!inputLayer || inputRowCount == 0 || inputFeatureCount == 0)
 	{
-		printf("[GQL] Invalid data format[0] %s\n", skeleton->getName().c_str());
+		setError("LayerBuilder::build: invalid input data (empty train size or feature count is zero)");
+		ml_logger().error("LayerBuilder", lastError.c_str());
 		return false;
 	}
 
@@ -86,7 +117,8 @@ bool glades::LayerBuilder::build(const NNInfo* skeleton, const DataInput* newInp
 
 	if (layers.size() <= 0)
 	{
-		printf("[GQL] Invalid data format[1] %s\n", skeleton->getName().c_str());
+		setError("LayerBuilder::build: no layers were constructed (invalid skeleton?)");
+		ml_logger().error("LayerBuilder", lastError.c_str());
 		return false;
 	}
 
@@ -104,71 +136,75 @@ void glades::LayerBuilder::rebuildInputLayers(const NNInfo* skeleton, const Data
 
 void glades::LayerBuilder::buildInputLayers(const NNInfo* skeleton, const DataInput* di)
 {
-	clock_t startFunction = clock();  // Overall function start time
+	// Keep a non-owning pointer to the current dataset for on-demand row materialization.
+	dataInput = di;
+	// Historically the engine assumed "training rows" were the only rows.
+	// For production evaluation/inference, DataInput may contain only a test split.
+	// Keep the training count as the default, but fall back to test size when training is empty.
+	inputRowCount = (di ? (di->getTrainSize() > 0u ? di->getTrainSize() : di->getTestSize()) : 0u);
+	inputFeatureCount = (di ? di->getFeatureCount() : 0);
 
-	unsigned int featureCount = di->getFeatureCount(); 
-	unsigned int trainsize = di->getTrainSize();
-	unsigned int inputLayerssize = inputLayers.size();
-	// Needs something to train/test on
-	if (trainsize == 0)
-		return;
-
-	// Input and Output columns
-	if (featureCount < 1)
-		return;
-
-	// TODO: SPEED THIS UP FOR IMAGES!!!!!!!!!!!
-	inputLayers.clear();
-	// unsigned int t = di->getTrainSize();
-	printf("Train size: %d\n", trainsize);
-
-	clock_t startOuterLoop = clock();  // Start time for the outer loop
-	for (unsigned int r = 0; r < trainsize; ++r)
+	if (inputRowCount == 0 || inputFeatureCount == 0)
 	{
-		clock_t startInnerLoop = clock();  // Start time for the inner loop
+		setError("LayerBuilder::buildInputLayers: inputRowCount==0 or inputFeatureCount==0");
+		return;
+	}
 
-		printf("[GQL] Building input layer %d\n", r);
-		Layer* cLayer = new Layer(Layer::INPUT_TYPE, false);
+	// Build a single reusable input layer of size = featureCount.
+	// We'll overwrite node weights from the requested row in getInputLayer().
+	inputLayer = shmea::GPointer<Layer>(new Layer(Layer::INPUT_TYPE));
+	if (!inputLayer)
+	{
+		setError("LayerBuilder::buildInputLayers: failed to allocate input layer");
+		return;
+	}
 
-		for (unsigned int c = 0; c < featureCount; ++c)
-		{
-			// We can probably get rid of most of these conditions becuase Gtype auto types
-			float newWeight = di->getTrainRow(r)[c];
-
-			// Error
-			Node* node = new Node();
-			if (!node)
-				continue;
-
-			// set the node weight
-			node->setWeight(newWeight);
-
-			// add the new input node to the layer
-			cLayer->addNode(node);
-
-			// add the input layer to the dataset
-			// bool lastCol = (c == featureCount - 1);
-			if (c == featureCount - 1)
-			{
-			    printf("Adding input layer[%u:%u]: %d\n", r, trainsize, inputLayers.size());
-				inputLayers.push_back(cLayer);
-			}
-		}
-		
-		clock_t endInnerLoop = clock();  // End time for the inner loop
-        printf("Time for inner loop (row %u): %.3f ms\n", r,
-               1000.0 * (endInnerLoop - startInnerLoop) / CLOCKS_PER_SEC);
+	for (unsigned int c = 0; c < inputFeatureCount; ++c)
+	{
+		shmea::GPointer<Node> node(new Node());
+		if (!node)
+			continue;
+		node->setWeight(0.0f);
+		inputLayer->addNode(node);
 	}
 }
 
 void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 {
-	int inputLayerSize = inputLayers[0]->size();
+	const int inputLayerSize = (inputLayer ? static_cast<int>(inputLayer->size()) : 0);
 	int outputLayerSize = skeleton->getOutputLayerSize();
 	int prevLayerSize = inputLayerSize;
 	int outputType = skeleton->getOutputType();
-	bool isPositive = false;
+	// Weight init policy:
+	// Historically this function would start building with Xavier, then if it encountered any
+	// "positive-only" activation (sigmoid/relu/leaky) *or* a classification output, it would
+	// throw away everything built so far, switch to POSXAVIER, and rebuild all hidden layers.
+	//
+	// That control-flow hack (rewinding the loop and clearing `layers`) is fragile and obscures
+	// intent. We compute the policy up-front instead.
+	bool usePosXavier = (outputType == GMath::CLASSIFICATION);
+	for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
+	{
+		const int act = skeleton->getActivationType(i);
+		if ((act == GMath::SIGMOID) || (act == GMath::RELU) || (act == GMath::LEAKY))
+		{
+			usePosXavier = true;
+			break;
+		}
+	}
+
 	int activationType;
+	unsigned int gateCount = 1;
+	if (netType == NNetwork::TYPE_GRU)
+		gateCount = 3;
+	else if (netType == NNetwork::TYPE_LSTM)
+		gateCount = 4;
+
+	if (inputLayerSize <= 0)
+	{
+		setError("LayerBuilder::buildHiddenLayers: input layer size is zero");
+		return;
+	}
 
 	// Create each hidden layer
 	for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
@@ -176,31 +212,15 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 		activationType = skeleton->getActivationType(i);
 		// Get the current layer size
 		int cLayerSize = skeleton->getHiddenLayerSize(i);
-		Layer* cLayer = new Layer(Layer::HIDDEN_TYPE);
+		shmea::GPointer<Layer> cLayer(new Layer(Layer::HIDDEN_TYPE));
 
-		if (isPositive)
-		{
-			// Create the hidden layer
-			cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_POSXAVIER, activationType);
-		}
+		const int init = usePosXavier ? Node::INIT_POSXAVIER : Node::INIT_XAVIER;
+		if (gateCount > 1)
+			cLayer->initGatedWeights(prevLayerSize, cLayerSize, init, activationType, gateCount);
 		else
-		{
-			// Create the hidden layer
-			if ((activationType == GMath::SIGMOID) || (activationType == GMath::RELU) ||
-				(activationType == GMath::LEAKY) || (outputType == GMath::CLASSIFICATION))
-			{
-				isPositive = true;
-				i = -1;
-				for (unsigned int j = 0; j < layers.size(); ++j)
-					delete layers[j];
-				layers.clear();
-				continue;
-			}
+			cLayer->initWeights(prevLayerSize, cLayerSize, init, activationType);
 
-			cLayer->initWeights(prevLayerSize, cLayerSize, Node::INIT_XAVIER, activationType);
-		}
-
-		cLayer->setupContext();
+		cLayer->setupContext(gateCount);
 		layers.push_back(cLayer);
 		prevLayerSize = cLayerSize;
 	}
@@ -208,17 +228,25 @@ void glades::LayerBuilder::buildHiddenLayers(const NNInfo* skeleton)
 
 void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 {
-	int inputLayerSize = inputLayers[0]->size();
+	const int inputLayerSize = (inputLayer ? static_cast<int>(inputLayer->size()) : 0);
 	int outputLayerSize = skeleton->getOutputLayerSize();
 	int prevLayerSize = inputLayerSize;
 	int outputType = skeleton->getOutputType();
 	bool isPositive = false;
-	int activationType;
+	// Activation types in this engine are indexed by the *input-side* layer counter
+	// (i.e. by transition). The output layer uses index == numHiddenLayers().
+	const int outputActivationType = skeleton->getActivationType(skeleton->numHiddenLayers());
+
+	if (inputLayerSize <= 0)
+	{
+		setError("LayerBuilder::buildOutputLayer: input layer size is zero");
+		return;
+	}
 
 	// Create each hidden layer
 	for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
 	{
-		activationType = skeleton->getActivationType(i);
+		const int activationType = skeleton->getActivationType(i);
 		// Get the current layer size
 		int cLayerSize = skeleton->getHiddenLayerSize(i);
 
@@ -230,16 +258,29 @@ void glades::LayerBuilder::buildOutputLayer(const NNInfo* skeleton)
 		prevLayerSize = cLayerSize;
 	}
 
+	// Output-layer activation also affects weight init heuristics.
+	if ((outputActivationType == GMath::SIGMOID) || (outputActivationType == GMath::RELU) ||
+		(outputActivationType == GMath::LEAKY) || (outputType == GMath::CLASSIFICATION))
+		isPositive = true;
+
 	// Create the output layer
-	Layer* cLayer = new Layer(Layer::OUTPUT_TYPE);
+	shmea::GPointer<Layer> cLayer(new Layer(Layer::OUTPUT_TYPE));
 	if (isPositive)
-		cLayer->initWeights(prevLayerSize, outputLayerSize, Node::INIT_POSXAVIER, activationType);
+		cLayer->initWeights(prevLayerSize, outputLayerSize, Node::INIT_POSXAVIER, outputActivationType);
 	else
-		cLayer->initWeights(prevLayerSize, outputLayerSize, Node::INIT_XAVIER, activationType);
+		cLayer->initWeights(prevLayerSize, outputLayerSize, Node::INIT_XAVIER, outputActivationType);
 	layers.push_back(cLayer);
 }
 
 glades::Layer* glades::LayerBuilder::getInputLayer(unsigned int inputRowCounter, unsigned int cInputLayerCounter)
+{
+	// Backward-compatible default: historically this always materialized from the training split.
+	return getInputLayer(inputRowCounter, cInputLayerCounter, SPLIT_TRAIN);
+}
+
+glades::Layer* glades::LayerBuilder::getInputLayer(unsigned int inputRowCounter,
+                                                   unsigned int cInputLayerCounter,
+                                                   glades::LayerBuilder::InputSplit split)
 {
 	if (cInputLayerCounter >= layers.size())
 		return NULL;
@@ -247,9 +288,54 @@ glades::Layer* glades::LayerBuilder::getInputLayer(unsigned int inputRowCounter,
 	// Current Input Layer
 	Layer* cInputLayer = NULL;
 	if (cInputLayerCounter == 0)
-		cInputLayer = inputLayers[inputRowCounter];
+	{
+		// Materialize the requested row into the reusable input layer.
+		if (!inputLayer || !dataInput)
+			return NULL;
+
+		// Select the correct split. This is critical for evaluation/inference runs.
+		// NOTE: We do *not* use inputRowCount for bounds checks here; inputRowCount is a build-time
+		// convenience and may refer to either split depending on dataset population.
+		shmea::GVector<float> row;
+		if (split == SPLIT_TEST)
+		{
+			if (inputRowCounter >= dataInput->getTestSize())
+				return NULL;
+			row = dataInput->getTestRow(inputRowCounter);
+		}
+		else
+		{
+			if (inputRowCounter >= dataInput->getTrainSize())
+				return NULL;
+			row = dataInput->getTrainRow(inputRowCounter);
+		}
+		const unsigned int layerSize = static_cast<unsigned int>(inputLayer->size());
+		const unsigned int rowSize = static_cast<unsigned int>(row.size());
+		const unsigned int n = std::min(rowSize, layerSize);
+
+		// Copy known features.
+		for (unsigned int c = 0; c < n; ++c)
+		{
+			Node* node = inputLayer->getNode(c);
+			if (node)
+				node->setWeight(row[c]);
+		}
+
+		// IMPORTANT invariant:
+		// If a row is shorter than the expected feature count, remaining input nodes must be
+		// cleared to 0.0f. Otherwise those nodes retain stale weights from the previous row,
+		// corrupting both forward-pass outputs and training gradients.
+		for (unsigned int c = n; c < layerSize; ++c)
+		{
+			Node* node = inputLayer->getNode(c);
+			if (node)
+				node->setWeight(0.0f);
+		}
+
+		cInputLayer = inputLayer.get();
+	}
 	else
-		cInputLayer = layers[cInputLayerCounter-1];
+		cInputLayer = layers[cInputLayerCounter-1].get();
 	if (!cInputLayer)
 		return NULL;
 	
@@ -262,7 +348,7 @@ glades::Layer* glades::LayerBuilder::getOutputLayer(unsigned int cOutputLayerCou
 		return NULL;
 
 	// Current Output Layer
-	Layer* cOutputLayer = layers[cOutputLayerCounter-1];
+	Layer* cOutputLayer = layers[cOutputLayerCounter-1].get();
 	if (!cOutputLayer)
 		return NULL;
 
@@ -318,7 +404,7 @@ void glades::LayerBuilder::setTimeState(unsigned int cLayerCounter, unsigned int
 
 unsigned int glades::LayerBuilder::getInputLayersSize() const
 {
-	return inputLayers.size();
+	return inputRowCount;
 }
 
 unsigned int glades::LayerBuilder::getLayersSize() const
@@ -332,7 +418,7 @@ unsigned int glades::LayerBuilder::getLayerSize(unsigned int index) const
 	return 0;
 
     if(index == 0)
-	return inputLayers[0]->size();
+	return inputLayer ? inputLayer->size() : 0;
 	
     return layers[index-1]->size();
 }
@@ -353,17 +439,31 @@ float glades::LayerBuilder::getTimeState(unsigned int cLayerCounter, unsigned in
 	return timeState[cLayerCounter][cNodeCounter][cEdgeCounter];
 }
 
-shmea::GList glades::LayerBuilder::getWeights()
+shmea::GList glades::LayerBuilder::getWeights() const
 {
    shmea::GList weights; 
    //We start with 1 because the first layer (input layer) doesn't have the data of the weights
     for(unsigned int i = 0; i < getLayersSize(); ++i)
     {
-	std::vector<Node*> cChildren = layers[i]->getChildren();
+	// Bias unification:
+	// Biases are stored as per-neuron bias *edge weights* (the final edge in each (fanIn+1) block,
+	// per gate for GRU/LSTM). For GUI/export we do not include those bias edges here to avoid
+	// duplicating bias information: callers that need bias visualization should use addBiasWeights().
+	//
+	// Determine fan-in for this layer so we can identify bias edges by index.
+	const unsigned int prevSize =
+	    (i == 0) ? (inputLayer ? static_cast<unsigned int>(inputLayer->size()) : 0u)
+	             : static_cast<unsigned int>(layers[i - 1] ? layers[i - 1]->size() : 0u);
+	const unsigned int stride = prevSize + 1u;
+
+	const std::vector<shmea::GPointer<Node> >& cChildren = layers[i]->getChildren();
 	for(unsigned int j = 0; j < cChildren.size(); ++j)
 	{
 	   for(unsigned int k = 0; k < cChildren[j]->numEdges(); ++k)
 	   {
+		// Skip per-neuron (per-gate) bias edges.
+		if (stride > 0u && (k % stride) == prevSize)
+			continue;
 		float cWeight = cChildren[j]->getEdgeWeight(k);
 		weights.addFloat(cWeight);
 	   }
@@ -382,6 +482,56 @@ void glades::LayerBuilder::addBiasWeights(shmea::GList& weights) const
     {
 		weights.addFloat(layers[i]->getBiasWeight());
     }
+}
+
+void glades::LayerBuilder::resetContextState(float value)
+{
+	for (unsigned int i = 0; i < layers.size(); ++i)
+	{
+		Layer* layer = layers[i].get();
+		if (!layer)
+			continue;
+		if (layer->getType() != Layer::HIDDEN_TYPE)
+			continue;
+
+		const std::vector<shmea::GPointer<Node> >& nodes = layer->getChildren();
+		for (unsigned int j = 0; j < nodes.size(); ++j)
+		{
+			Node* node = nodes[j].get();
+			if (!node)
+				continue;
+			Node* ctx = node->getContextNode();
+			if (!ctx)
+				continue;
+			ctx->setWeight(value);
+		}
+	}
+}
+
+void glades::LayerBuilder::updateContextFromHiddenActivations()
+{
+	for (unsigned int i = 0; i < layers.size(); ++i)
+	{
+		Layer* layer = layers[i].get();
+		if (!layer)
+			continue;
+		if (layer->getType() != Layer::HIDDEN_TYPE)
+			continue;
+
+		const std::vector<shmea::GPointer<Node> >& nodes = layer->getChildren();
+		for (unsigned int j = 0; j < nodes.size(); ++j)
+		{
+			Node* node = nodes[j].get();
+			if (!node)
+				continue;
+			Node* ctx = node->getContextNode();
+			if (!ctx)
+				continue;
+
+			// Store the hidden node's *output activation* as next timestep's context.
+			ctx->setWeight(node->getWeight());
+		}
+	}
 }
 
 void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
@@ -413,13 +563,24 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 			(activationType == GMath::LEAKY) || (outputType == GMath::CLASSIFICATION))
 			isPositive = true;
 
+		// Determine fan-in for this layer's nodes so we can skip per-neuron bias edges.
+		const unsigned int prevSize =
+		    (i == 0) ? (inputLayer ? static_cast<unsigned int>(inputLayer->size()) : 0u)
+		             : static_cast<unsigned int>(layers[i - 1] ? layers[i - 1]->size() : 0);
+		const unsigned int stride = prevSize + 1u;
+
 		// iterate through the nodes
-		std::vector<Node*> cChildren = layers[i]->getChildren();
+		const std::vector<shmea::GPointer<Node> >& cChildren = layers[i]->getChildren();
 		for (unsigned int j = 0; j < cChildren.size(); ++j)
 		{
 			// iterate through the node weights
 			for (unsigned int k = 0; k < cChildren[j]->numEdges(); ++k)
 			{
+				// Bias edges are at index == prevSize for dense layers, and at each
+				// gate block's final index for gated recurrent layers.
+				// Canonical rule: (k % (prevSize+1)) == prevSize.
+				if (stride > 0u && (k % stride) == prevSize)
+					continue;
 				float cWeight = cChildren[j]->getEdgeWeight(k);
 				if ((i == 0) && (j == 0) && (k == 0))
 				{
@@ -444,14 +605,21 @@ void glades::LayerBuilder::standardizeWeights(const NNInfo* skeleton)
 	// iterate through the layers
 	for (unsigned int i = 0; i < getLayersSize(); ++i)
 	{
+		const unsigned int prevSize =
+		    (i == 0) ? (inputLayer ? static_cast<unsigned int>(inputLayer->size()) : 0u)
+		             : static_cast<unsigned int>(layers[i - 1] ? layers[i - 1]->size() : 0);
+		const unsigned int stride = prevSize + 1u;
 
 		// iterate through the nodes
-		std::vector<Node*> cChildren = layers[i]->getChildren();
+		const std::vector<shmea::GPointer<Node> >& cChildren = layers[i]->getChildren();
 		for (unsigned int j = 0; j < cChildren.size(); ++j)
 		{
 			// iterate through the node weights
 			for (unsigned int k = 0; k < cChildren[j]->numEdges(); ++k)
 			{
+				// Do not standardize per-neuron (per-gate) bias edges.
+				if (stride > 0u && (k % stride) == prevSize)
+					continue;
 				float cWeight = cChildren[j]->getEdgeWeight(k);
 
 				// Adjust the children
@@ -476,10 +644,10 @@ void glades::LayerBuilder::scrambleDropout(unsigned int inputRowCounter, float p
 	if (layers.size() - 1 != pHidden.size())
 		return;
 
-	if (inputRowCounter >= inputLayers.size())
+	if (inputRowCounter >= inputRowCount)
 		return;
 
-	Layer* cInputLayer = inputLayers[inputRowCounter];
+	Layer* cInputLayer = inputLayer.get();
 	if (!cInputLayer)
 		return;
 
@@ -505,21 +673,19 @@ void glades::LayerBuilder::clearDropout()
 
 void glades::LayerBuilder::print(const NNInfo* skeleton, bool override) const
 {
-	if (inputLayers.size() == 0)
+	if (!inputLayer || inputRowCount == 0)
 		return;
 
 	if (layers.size() == 0)
 		return;
 
 	// print input layer info
-	printf("[GQL] Input(r,c): (%ld,%d)\n", inputLayers.size(), inputLayers[0]->size());
+	printf("[GQL] Input(r,c): (%u,%d)\n", inputRowCount, (int)inputLayer->size());
 	if (override)
 	{
-		for (unsigned int i = 0; i < inputLayers.size(); ++i)
-		{
-			printf("%d [%d]: ", i + 1, inputLayers[i]->getType());
-			inputLayers[i]->print();
-		}
+		// We no longer store per-row input layers. Print the current reusable input layer.
+		printf("Input [type=%d]: ", inputLayer->getType());
+		inputLayer->print();
 		printf("\n");
 	}
 
@@ -547,7 +713,10 @@ void glades::LayerBuilder::print(const NNInfo* skeleton, bool override) const
 
 void glades::LayerBuilder::clean()
 {
-	inputLayers.clear();
+	inputLayer.reset();
+	inputRowCount = 0;
+	inputFeatureCount = 0;
+	dataInput = NULL;
 	layers.clear();
 	timeState.clear();
 	xMin = 0.0f;
@@ -643,7 +812,7 @@ bool glades::LayerBuilder::load(const std::string& netName)
  */
 bool glades::LayerBuilder::save(const std::string& netName) const
 {
-	shmea::SaveFolder* nnList = new shmea::SaveFolder(netName.c_str());
+	shmea::SaveFolder nnList(netName.c_str());
 
 	shmea::GVector<shmea::GString> layerHeaders, edgeHeaders;
 	layerHeaders.push_back("BiasWeight");
@@ -655,7 +824,7 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 	shmea::GTable edgeTable(',', edgeHeaders);
 	for (unsigned int layerIdx = 0; layerIdx < getLayersSize(); ++layerIdx)
 	{
-		Layer* layer = layers[layerIdx];
+		Layer* layer = layers[layerIdx].get();
 		if (!layer)
 			continue;
 
@@ -665,7 +834,7 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 		layerTable.addRow(layerRow);
 
 		// Save each edge in the edgeTable
-		std::vector<Node*> nodes = layer->getChildren();
+		const std::vector<shmea::GPointer<Node> >& nodes = layer->getChildren();
 		for (unsigned int nodeIdx = 0; nodeIdx < nodes.size(); ++nodeIdx)
 		{
 			// Add each edge to the edge file
@@ -677,8 +846,8 @@ bool glades::LayerBuilder::save(const std::string& netName) const
 	}
 
 	// Save the layer information and edges
-	nnList->newItem("layers", layerTable);
-	nnList->newItem("edges", edgeTable);
+	nnList.newItem("layers", layerTable);
+	nnList.newItem("edges", edgeTable);
 
 	return true;
 }
@@ -696,7 +865,7 @@ bool glades::LayerBuilder::saveLayer(glades::Layer* layer, std::ofstream& out) c
     if (!layer)
         return false;
 
-    const std::vector<Node*>& nodes = layer->getChildren();
+    const std::vector<shmea::GPointer<Node> >& nodes = layer->getChildren();
 
     out << layer->getBiasWeight() << " ";
     out << nodes.size() << " ";
@@ -708,7 +877,7 @@ bool glades::LayerBuilder::saveLayer(glades::Layer* layer, std::ofstream& out) c
 //    out << nodes.size() << "\n";
 
     for (unsigned int j = 0; j < nodes.size(); ++j) {
-        Node* node = nodes[j];
+        Node* node = nodes[j].get();
         if (!node)
             continue;
 
@@ -746,26 +915,14 @@ bool glades::LayerBuilder::saveLayer(glades::Layer* layer, std::ofstream& out) c
 */
 bool glades::LayerBuilder::saveState(const char* fileName) const
 {
-	shmea::SaveFolder* folderToSave = new shmea::SaveFolder("nn-state");
-    if (!folderToSave->checkFolder()) {
-        return false;
-    }
+	if (!fileName)
+		return false;
 
-    std::ofstream out((folderToSave->getPath() + fileName).c_str());
-    if (!out) {
-        return false;
-    }
+	shmea::SaveFolder folderToSave("nn-state");
+	if (!folderToSave.checkFolder())
+		return false;
 
-    unsigned int layersCount = getLayersSize();
-//    out << layersCount << "\n";
-
-    for (unsigned int i = 0; i < layersCount; ++i) {
-        Layer* layer = layers[i];
-        if (!layer)
-            continue;
-        saveLayer(layer, out);
-    }
-    return true;
+	return saveStateToFile(std::string((folderToSave.getPath() + fileName).c_str()));
 }
 
 /*!
@@ -786,12 +943,11 @@ bool glades::LayerBuilder::loadLayer(Layer* layer, unsigned int nodesCount, unsi
         return false;
     }
 
-    float bias;
-    if (!(in >> bias)) {
+    float legacyLayerBias = 0.0f;
+    if (!(in >> legacyLayerBias)) {
         printf("Error during reading the layer bias from file");
         return false;
     }
-    layer->setBiasWeight(bias);
 
     unsigned int fileLayerSize;
     if (!(in >> fileLayerSize)) {
@@ -810,23 +966,32 @@ bool glades::LayerBuilder::loadLayer(Layer* layer, unsigned int nodesCount, unsi
         return false;
     }
 
-    if (fileEdgeCount != edgeCount) {
-        printf("Inconvenience between the edge count in file and the skeleton or input data edge count");
+    // Backward compatibility:
+    // - Old saved models stored *no per-neuron bias edge* (edgeCount == prevLayerSize).
+    // - New models store an additional final bias edge per node (edgeCount == prevLayerSize + 1).
+    //
+    // We accept either:
+    //   fileEdgeCount == edgeCount          (new format)
+    //   fileEdgeCount == edgeCount - 1      (old format; bias edge will be initialized from layer bias)
+    if (!(fileEdgeCount == edgeCount || (edgeCount > 0 && fileEdgeCount == edgeCount - 1))) {
+        printf("Inconvenience between the edge count in file and the expected edge count");
         return false;
     }
 
     unsigned int layerSize = layer->size();
 
-    const std::vector<Node*>& nodes = layer->getChildren();
+    const std::vector<shmea::GPointer<Node> >& nodes = layer->getChildren();
     for (unsigned int i = 0; i < nodesCount; ++i) {
         bool it_is_a_new_node = false;
         Node* node = NULL;
+        shmea::GPointer<Node> ownedNode;
         if (i > layerSize - 1) {
-            Node* node = new Node();
+            ownedNode = shmea::GPointer<Node>(new Node());
+            node = ownedNode.get();
             it_is_a_new_node = true;
         }
         else
-            node = nodes[i];
+            node = nodes[i].get();
 
         if (!node)
             return false;
@@ -840,9 +1005,10 @@ bool glades::LayerBuilder::loadLayer(Layer* layer, unsigned int nodesCount, unsi
 */
         bool number_of_edges_is_less_then_skeleton_edgeCount = node->numEdges() < edgeCount;
 
-        std::vector<glades::Edge*> edges;
+        std::vector<shmea::GPointer<glades::Edge> > edges;
 
-        for (unsigned int k = 0; k < edgeCount; ++k) {
+        // Read as many edges as exist in the file, then fill any missing final bias edge.
+        for (unsigned int k = 0; k < fileEdgeCount; ++k) {
             float edgeWeight;
             if (!(in >> edgeWeight)) {
                 printf("Error during reading the edge weight from file");
@@ -850,8 +1016,7 @@ bool glades::LayerBuilder::loadLayer(Layer* layer, unsigned int nodesCount, unsi
             }
 
             if (number_of_edges_is_less_then_skeleton_edgeCount) {
-                Edge* edge = new Edge(-1, edgeWeight);
-                edges.push_back(edge);
+                edges.push_back(shmea::GPointer<glades::Edge>(new Edge(-1, edgeWeight)));
             } else {
                 node->setEdgeWeight(k, edgeWeight);
             }
@@ -877,11 +1042,21 @@ bool glades::LayerBuilder::loadLayer(Layer* layer, unsigned int nodesCount, unsi
             edges.push_back(edge);
 */
         }
+        // If we're loading an old-format layer (missing the final bias edge), initialize it
+        // from the layer's legacy bias scalar.
+        if (fileEdgeCount + 1 == edgeCount)
+        {
+            const float b = legacyLayerBias;
+            if (number_of_edges_is_less_then_skeleton_edgeCount)
+                edges.push_back(shmea::GPointer<glades::Edge>(new Edge(-1, b)));
+            else
+                node->setEdgeWeight(edgeCount - 1, b);
+        }
         if (number_of_edges_is_less_then_skeleton_edgeCount) {
             node->setEdges(edges);
         }
         if (it_is_a_new_node) 
-            layer->addNode(node);
+            layer->addNode(ownedNode);
     }
     return true;
 }
@@ -898,39 +1073,423 @@ bool glades::LayerBuilder::loadLayer(Layer* layer, unsigned int nodesCount, unsi
 */
 bool glades::LayerBuilder::loadState(const NNInfo* skeleton, const char* fileName)
 {
-    std::ifstream in((std::string("database/nn-state/") + fileName).c_str());
-    if (!in) {
-        return false;
-    }
+	if (!fileName)
+		return false;
 
-    unsigned int layerCount = skeleton->numHiddenLayers() + 1;
-    if (layers.size() < layerCount)
-        layers.resize(layerCount);
+	return loadStateFromFile(skeleton, std::string("database/nn-state/") + fileName);
+}
 
-    for (unsigned int i = 0; i < layerCount; ++i) {
-        if (!layers[i])
-            if (i == layerCount - 1)
-                layers[i] = new Layer(Layer::HIDDEN_TYPE);
-            else
-                layers[i] = new Layer(Layer::OUTPUT_TYPE);
+bool glades::LayerBuilder::saveStateToFile(const std::string& filePath) const
+{
+	if (filePath.empty())
+		return false;
 
-        unsigned int curLayerSize = 0;
-        if (i == layerCount - 1)
-            curLayerSize = skeleton->getOutputLayerSize();
-        else {
-            curLayerSize = skeleton->getHiddenLayerSize(i);
-        }
+	std::ofstream out(filePath.c_str());
+	if (!out)
+		return false;
 
-        unsigned int prLayerSize = 0;
-        if (i > 0)
-            prLayerSize = skeleton->getHiddenLayerSize(i-1);
-        else {
-            prLayerSize = getLayerSize(0);
-        }
+	// === LayerBuilder state file format v2 ===
+	//
+	// This fixes historical persistence bugs for recurrent/gated nets:
+	// - v1 saved only per-node (feedforward) edges and did NOT persist context-node edges
+	//   (RNN Whh, GRU/LSTM U matrices). Loading such a file for recurrent nets produces a
+	//   silently-wrong model.
+	//
+	// v2 persists:
+	// - inputSize (so load does not depend on a pre-built input layer)
+	// - netType (so we can compute gateCount and expected edge counts)
+	// - per-layer: node-edge weights AND context-node edge weights where applicable
+	//
+	// Backwards compatibility:
+	// - loadStateFromFile() still accepts v1 files (no magic header).
+	static const char* kMagic = "GLADES_LAYER_STATE";
+	static const int kVersion = 2;
 
-        if (!loadLayer(layers[i], curLayerSize, prLayerSize, in))
-            return false;
-    }
-    return true;
+	const unsigned int inputSize = (inputLayer ? static_cast<unsigned int>(inputLayer->size()) : 0u);
+	const unsigned int layerCount = getLayersSize();
+
+	out << kMagic << "\n";
+	out << "version " << kVersion << "\n";
+	out << "netType " << netType << "\n";
+	out << "inputSize " << inputSize << "\n";
+	out << "layers " << layerCount << "\n";
+
+	// gateCount for GRU/LSTM context layouts
+	unsigned int gateCount = 1u;
+	if (netType == NNetwork::TYPE_GRU)
+		gateCount = 3u;
+	else if (netType == NNetwork::TYPE_LSTM)
+		gateCount = 4u;
+
+	for (unsigned int i = 0; i < layerCount; ++i)
+	{
+		Layer* layer = layers[i].get();
+		if (!layer)
+			return false;
+
+		const unsigned int nodeCount = static_cast<unsigned int>(layer->size());
+		// prevSize is needed to define the expected node-edge count.
+		const unsigned int prevSize =
+		    (i == 0) ? inputSize : static_cast<unsigned int>(layers[i - 1] ? layers[i - 1]->size() : 0u);
+		const unsigned int curSize = nodeCount;
+		const bool isOutput = (layer->getType() == Layer::OUTPUT_TYPE);
+
+		unsigned int nodeEdges = 0u;
+		unsigned int ctxEdges = 0u;
+
+		if (isOutput)
+		{
+			// Output layer is always dense: [prevSize weights] + [1 bias]
+			nodeEdges = prevSize + 1u;
+			ctxEdges = 0u;
+		}
+		else
+		{
+			// Hidden layers
+			if (netType == NNetwork::TYPE_GRU || netType == NNetwork::TYPE_LSTM)
+			{
+				nodeEdges = gateCount * (prevSize + 1u);
+				ctxEdges = gateCount * curSize;
+			}
+			else if (netType == NNetwork::TYPE_RNN)
+			{
+				nodeEdges = prevSize + 1u;
+				ctxEdges = curSize; // Wh row per hidden unit
+			}
+			else
+			{
+				// DFF
+				nodeEdges = prevSize + 1u;
+				ctxEdges = 0u;
+			}
+		}
+
+		// Write layer header. biasAvg is included for legacy/debug only; biases live in edge weights.
+		out << "layer " << i
+		    << " type " << layer->getType()
+		    << " biasAvg " << layer->getBiasWeight()
+		    << " nodes " << nodeCount
+		    << " nodeEdges " << nodeEdges
+		    << " ctxEdges " << ctxEdges
+		    << "\n";
+
+		for (unsigned int j = 0; j < nodeCount; ++j)
+		{
+			Node* node = layer->getNode(j);
+			if (!node)
+				return false;
+
+			out << "n " << j;
+			for (unsigned int k = 0; k < nodeEdges; ++k)
+				out << " " << node->getEdgeWeight(k);
+
+			if (ctxEdges > 0u)
+			{
+				Node* ctx = node->getContextNode();
+				for (unsigned int k = 0; k < ctxEdges; ++k)
+					out << " " << (ctx ? ctx->getEdgeWeight(k) : 0.0f);
+			}
+			out << "\n";
+		}
+	}
+
+	return static_cast<bool>(out);
+}
+
+bool glades::LayerBuilder::loadStateFromFile(const NNInfo* skeleton, const std::string& filePath)
+{
+	if (!skeleton)
+		return false;
+	if (filePath.empty())
+		return false;
+
+	std::ifstream in(filePath.c_str());
+	if (!in)
+		return false;
+
+	// Detect v2 by magic header on the first line.
+	std::string firstLine;
+	if (!std::getline(in, firstLine))
+		return false;
+	// Tolerate Windows line endings when state files are moved across platforms.
+	if (!firstLine.empty() && firstLine[firstLine.size() - 1] == '\r')
+		firstLine.erase(firstLine.size() - 1);
+
+	static const char* kMagic = "GLADES_LAYER_STATE";
+	const bool isV2 = (firstLine == kMagic);
+
+	if (!isV2)
+	{
+		// Legacy v1: rewind and use the historical loader (node-edge-only).
+		in.clear();
+		in.seekg(0, std::ios::beg);
+
+		const unsigned int layerCount = static_cast<unsigned int>(skeleton->numHiddenLayers()) + 1;
+		if (layers.size() < layerCount)
+			layers.resize(layerCount);
+
+		for (unsigned int i = 0; i < layerCount; ++i)
+		{
+			if (!layers[i])
+			{
+				if (i == layerCount - 1)
+					layers[i] = shmea::GPointer<Layer>(new Layer(Layer::OUTPUT_TYPE));
+				else
+					layers[i] = shmea::GPointer<Layer>(new Layer(Layer::HIDDEN_TYPE));
+			}
+
+			unsigned int curLayerSize = 0;
+			if (i == layerCount - 1)
+				curLayerSize = skeleton->getOutputLayerSize();
+			else
+				curLayerSize = static_cast<unsigned int>(skeleton->getHiddenLayerSize(i));
+
+			unsigned int prLayerSize = 0;
+			if (i > 0)
+				prLayerSize = static_cast<unsigned int>(skeleton->getHiddenLayerSize(i - 1));
+			else
+				prLayerSize = getLayerSize(0);
+
+			// Legacy v1 stores only per-node edges. For GRU/LSTM hidden layers those edges
+			// include all gates, so we must compute the correct per-node edge count.
+			//
+			// IMPORTANT: v1 does NOT persist context-node edges (RNN Whh / GRU/LSTM U), so
+			// recurrent models loaded from v1 are incomplete by construction.
+			unsigned int nodeEdgeCount = prLayerSize + 1u;
+			if (i != layerCount - 1)
+			{
+				if (netType == NNetwork::TYPE_GRU)
+					nodeEdgeCount = 3u * (prLayerSize + 1u);
+				else if (netType == NNetwork::TYPE_LSTM)
+					nodeEdgeCount = 4u * (prLayerSize + 1u);
+			}
+
+			if (!loadLayer(layers[i].get(), curLayerSize, nodeEdgeCount, in))
+				return false;
+		}
+		return true;
+	}
+
+	// === v2 loader ===
+	// Expected header:
+	//   version <int>
+	//   netType <int>
+	//   inputSize <uint>
+	//   layers <uint>
+	std::string tag;
+	int version = 0;
+	int fileNetType = NNetwork::TYPE_DFF;
+	unsigned int inputSize = 0u;
+	unsigned int fileLayerCount = 0u;
+
+	if (!(in >> tag) || tag != "version" || !(in >> version))
+		return false;
+	if (version != 2)
+		return false;
+	if (!(in >> tag) || tag != "netType" || !(in >> fileNetType))
+		return false;
+	if (!(in >> tag) || tag != "inputSize" || !(in >> inputSize))
+		return false;
+	if (!(in >> tag) || tag != "layers" || !(in >> fileLayerCount))
+		return false;
+
+	// Install file netType so future saves preserve the loaded layout.
+	netType = fileNetType;
+
+	// Ensure an input layer exists so getLayerSize(0) is well-defined for any legacy callers.
+	if (!inputLayer || static_cast<unsigned int>(inputLayer->size()) != inputSize)
+	{
+		inputLayer = shmea::GPointer<Layer>(new Layer(Layer::INPUT_TYPE));
+		for (unsigned int i = 0; i < inputSize; ++i)
+		{
+			shmea::GPointer<Node> n(new Node());
+			if (n)
+			{
+				n->setWeight(0.0f);
+				inputLayer->addNode(n);
+			}
+		}
+		inputRowCount = 0u;
+		inputFeatureCount = inputSize;
+	}
+
+	const unsigned int expectedLayerCount = static_cast<unsigned int>(skeleton->numHiddenLayers()) + 1u;
+	if (fileLayerCount != expectedLayerCount)
+		return false;
+
+	// gateCount derived from netType
+	unsigned int gateCount = 1u;
+	if (netType == NNetwork::TYPE_GRU)
+		gateCount = 3u;
+	else if (netType == NNetwork::TYPE_LSTM)
+		gateCount = 4u;
+
+	if (layers.size() < expectedLayerCount)
+		layers.resize(expectedLayerCount);
+
+	// Helper for allocating edge vectors
+	struct EdgeFactory
+	{
+		static std::vector<shmea::GPointer<glades::Edge> > make(unsigned int n, float fill = 0.0f)
+		{
+			std::vector<shmea::GPointer<glades::Edge> > v;
+			v.reserve(n);
+			for (unsigned int i = 0; i < n; ++i)
+				v.push_back(shmea::GPointer<glades::Edge>(new glades::Edge(-1, fill)));
+			return v;
+		}
+	};
+
+	for (unsigned int li = 0; li < expectedLayerCount; ++li)
+	{
+		// Parse layer header
+		unsigned int layerIdx = 0u;
+		int layerType = 0;
+		float biasAvg = 0.0f;
+		unsigned int nodeCount = 0u;
+		unsigned int nodeEdges = 0u;
+		unsigned int ctxEdges = 0u;
+
+		if (!(in >> tag) || tag != "layer" || !(in >> layerIdx) || layerIdx != li)
+			return false;
+		if (!(in >> tag) || tag != "type" || !(in >> layerType))
+			return false;
+		if (!(in >> tag) || tag != "biasAvg" || !(in >> biasAvg))
+			return false;
+		if (!(in >> tag) || tag != "nodes" || !(in >> nodeCount))
+			return false;
+		if (!(in >> tag) || tag != "nodeEdges" || !(in >> nodeEdges))
+			return false;
+		if (!(in >> tag) || tag != "ctxEdges" || !(in >> ctxEdges))
+			return false;
+
+		// Compute expected shape from skeleton + file netType.
+		const bool isOutput = (li == expectedLayerCount - 1u);
+		const unsigned int curSize = isOutput ? static_cast<unsigned int>(skeleton->getOutputLayerSize())
+		                                      : static_cast<unsigned int>(skeleton->getHiddenLayerSize(li));
+		const unsigned int prevSize =
+		    isOutput
+		        ? (expectedLayerCount == 1u ? inputSize : static_cast<unsigned int>(skeleton->getHiddenLayerSize(expectedLayerCount - 2u)))
+		        : (li == 0u ? inputSize : static_cast<unsigned int>(skeleton->getHiddenLayerSize(li - 1u)));
+
+		unsigned int expectNodeEdges = 0u;
+		unsigned int expectCtxEdges = 0u;
+		if (isOutput)
+		{
+			expectNodeEdges = prevSize + 1u;
+			expectCtxEdges = 0u;
+		}
+		else
+		{
+			if (netType == NNetwork::TYPE_GRU || netType == NNetwork::TYPE_LSTM)
+			{
+				expectNodeEdges = gateCount * (prevSize + 1u);
+				expectCtxEdges = gateCount * curSize;
+			}
+			else if (netType == NNetwork::TYPE_RNN)
+			{
+				expectNodeEdges = prevSize + 1u;
+				expectCtxEdges = curSize;
+			}
+			else
+			{
+				expectNodeEdges = prevSize + 1u;
+				expectCtxEdges = 0u;
+			}
+		}
+
+		if (nodeCount != curSize)
+			return false;
+		if (nodeEdges != expectNodeEdges)
+			return false;
+		if (ctxEdges != expectCtxEdges)
+			return false;
+
+		// Ensure layer object exists and has the correct type.
+		if (!layers[li])
+		{
+			layers[li] = shmea::GPointer<Layer>(new Layer(isOutput ? Layer::OUTPUT_TYPE : Layer::HIDDEN_TYPE));
+		}
+		Layer* layer = layers[li].get();
+		if (!layer)
+			return false;
+		layer->setType(isOutput ? Layer::OUTPUT_TYPE : Layer::HIDDEN_TYPE);
+
+		// Ensure correct number of nodes.
+		if (layer->size() > nodeCount)
+			return false;
+		while (layer->size() < nodeCount)
+		{
+			shmea::GPointer<Node> n(new Node());
+			if (!n)
+				return false;
+			n->setEdges(EdgeFactory::make(nodeEdges, 0.0f));
+			if (ctxEdges > 0u)
+			{
+				shmea::GPointer<Node> ctx(new Node());
+				if (!ctx)
+					return false;
+				ctx->setEdges(EdgeFactory::make(ctxEdges, 0.0f));
+				n->setContextNode(ctx);
+			}
+			layer->addNode(n);
+		}
+
+		// Load per-node weights (and context-node weights).
+		for (unsigned int ni = 0; ni < nodeCount; ++ni)
+		{
+			unsigned int nIdx = 0u;
+			if (!(in >> tag) || tag != "n" || !(in >> nIdx) || nIdx != ni)
+				return false;
+
+			Node* node = layer->getNode(ni);
+			if (!node)
+				return false;
+
+			// Ensure edge vector shape matches.
+			if (node->numEdges() != nodeEdges)
+				node->setEdges(EdgeFactory::make(nodeEdges, 0.0f));
+
+			for (unsigned int k = 0; k < nodeEdges; ++k)
+			{
+				float w = 0.0f;
+				if (!(in >> w))
+					return false;
+				node->setEdgeWeight(k, w);
+			}
+
+			if (ctxEdges > 0u)
+			{
+				Node* ctx = node->getContextNode();
+				if (!ctx)
+				{
+					shmea::GPointer<Node> ownedCtx(new Node());
+					if (!ownedCtx)
+						return false;
+					ownedCtx->setEdges(EdgeFactory::make(ctxEdges, 0.0f));
+					node->setContextNode(ownedCtx);
+					ctx = node->getContextNode();
+				}
+				if (ctx->numEdges() != ctxEdges)
+					ctx->setEdges(EdgeFactory::make(ctxEdges, 0.0f));
+
+				for (unsigned int k = 0; k < ctxEdges; ++k)
+				{
+					float w = 0.0f;
+					if (!(in >> w))
+						return false;
+					ctx->setEdgeWeight(k, w);
+				}
+			}
+			else
+			{
+				// Ensure we do not retain stale context nodes when loading a non-recurrent model.
+				shmea::GPointer<Node> empty;
+				node->setContextNode(empty);
+			}
+		}
+	}
+
+	return true;
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -31,7 +31,17 @@ class Edge
 private:
 	// edge
 	float weight;
-	std::vector<float> prevDelta;
+	// === SGD state ===
+	// Historical implementation stored a vector<float> of per-sample deltas ("prevDelta")
+	// to support minibatching. That is extremely allocation-heavy and scales poorly.
+	//
+	// We now store:
+	// - velocity: last update step for momentum (persists across minibatches)
+	// - deltaAccum: sum of update steps accumulated for current minibatch
+	// - deltaCount: number of accumulated steps (for diagnostics only; averaging uses the caller's minibatchSize)
+	float velocity;
+	float deltaAccum;
+	unsigned int deltaCount;
 	bool activated;
 	float activation;
 
@@ -41,16 +51,23 @@ public:
 
 	// gets
 	float getWeight() const;
+	// Deprecated: prevDelta vectors were removed. These remain only for API compatibility.
 	std::vector<float> getPrevDeltas() const;
 	float getPrevDelta(unsigned int) const;
 	int numPrevDeltas() const;
+	float getVelocity() const;
+	float getDeltaAccum() const;
+	unsigned int getDeltaCount() const;
 	bool getActivated() const;
 	float getActivation() const;
 
 	// sets
 	void setWeight(float);
+	// Accumulate a single per-sample update step into the minibatch accumulator.
+	// Also updates the velocity (momentum state) to this step.
 	void addPrevDelta(float);
 	void setActivation(float);
+	// Clears minibatch accumulation (but does NOT reset velocity/momentum).
 	void clearPrevDeltas();
 	void Deactivate();
 };

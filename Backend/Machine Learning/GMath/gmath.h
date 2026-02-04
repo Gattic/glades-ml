@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -52,6 +52,8 @@ public:
 	// standardization flags
 	static const int MINMAX = 0;
 	static const int ZSCORE = 1;
+	// Disable standardization/normalization.
+	static const int NONE = 2;
 
 	static float squash(float, int, float = 0.1f);
 	static float unsquash(float, int, float = 0.1f);

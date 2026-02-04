@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -23,6 +23,10 @@
 #include <string>
 #include <vector>
 #include "Backend/Database/GString.h"
+#include "Backend/Database/GPointer.h"
+#include "hiddenlayerinfo.h"
+#include "inputlayerinfo.h"
+#include "outputlayerinfo.h"
 
 namespace shmea {
 class GTable;
@@ -30,10 +34,6 @@ class GTable;
 
 namespace glades {
 
-class LayerInfo;
-class InputLayerInfo;
-class HiddenLayerInfo;
-class OutputLayerInfo;
 class NNetwork;
 class RNN;
 
@@ -45,9 +45,9 @@ private:
 
 	shmea::GString name;
 	int inputType; // DataInput enum: 0 = csv, 1 = image, 2 = text
-	InputLayerInfo* inputLayer;
-	OutputLayerInfo* outputLayer;
-	std::vector<HiddenLayerInfo*> layers;
+	shmea::GPointer<InputLayerInfo> inputLayer;
+	shmea::GPointer<OutputLayerInfo> outputLayer;
+	std::vector<shmea::GPointer<HiddenLayerInfo> > layers;
 	int hiddenLayerCount;
 	int batchSize;
 
@@ -76,6 +76,9 @@ public:
 	static const int COL_ACTIVATION_TYPE = 7;
 	static const int COL_ACTIVATION_PARAM = 8;
 	static const int COL_OUTPUT_TYPE = 9;
+	// Optional (newer schema): truncated BPTT window length for recurrent nets.
+	// If missing in stored table, the loader will set it to a backward-compatible value.
+	static const int COL_TBPTT_WINDOW = 10;
 
 	NNInfo(const shmea::GString&);
 	NNInfo(const shmea::GString&, const shmea::GTable&);
@@ -89,6 +92,7 @@ public:
 	int getOutputType() const;
 	float getPInput() const;
 	int getBatchSize() const;
+	int getTBPTTWindow() const;
 	InputLayerInfo* getInputLayer() const;
 	std::vector<HiddenLayerInfo*> getLayers() const;
 	int numHiddenLayers() const;
@@ -111,6 +115,7 @@ public:
 	void setOutputSize(int);
 	void setPInput(float);
 	void setBatchSize(int);
+	void setTBPTTWindow(int);
 	void setLayers(const std::vector<HiddenLayerInfo*>&);
 	void setLearningRate(unsigned int, float);
 	void setMomentumFactor(unsigned int, float);

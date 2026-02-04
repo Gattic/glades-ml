@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -17,14 +17,13 @@
 #include "node.h"
 #include "../GMath/gmath.h"
 #include "edge.h"
+#include "../rng.h"
 
 using namespace glades;
 
 glades::Node::Node()
 {
 	clean();
-	activationMutex = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));
-	pthread_mutex_init(activationMutex, NULL);
 }
 
 glades::Node::Node(const Node& node2)
@@ -35,7 +34,13 @@ glades::Node::Node(const Node& node2)
 glades::Node::~Node()
 {
 	clean();
-	pthread_mutex_destroy(activationMutex);
+}
+
+glades::Node& glades::Node::operator=(const Node& node2)
+{
+	if (this != &node2)
+		copy(node2);
+	return *this;
 }
 
 void glades::Node::copy(const Node& node2)
@@ -43,13 +48,19 @@ void glades::Node::copy(const Node& node2)
 	weight = node2.weight;
 	edges = node2.edges;
 	errorDer = node2.errorDer;
-	activationMutex = node2.activationMutex;
+	activationScalar = node2.activationScalar;
+	cellState = node2.cellState;
 	contextNode = node2.contextNode;
 }
 
 float glades::Node::getWeight() const
 {
 	return weight;
+}
+
+float glades::Node::getCellState() const
+{
+	return cellState;
 }
 
 float glades::Node::getEdgeWeight(unsigned int index) const
@@ -94,7 +105,8 @@ std::vector<float> glades::Node::getPrevDeltas(unsigned int index) const
 	if (index >= edges.size())
 		return empty;
 
-	return edges[index]->getPrevDeltas();
+	// Deprecated: we no longer store per-sample delta vectors on edges.
+	return empty;
 }
 
 float glades::Node::getLastPrevDelta(unsigned int index) const
@@ -102,7 +114,8 @@ float glades::Node::getLastPrevDelta(unsigned int index) const
 	if (index >= edges.size())
 		return 0.0f;
 
-	return edges[index]->getPrevDelta(edges[index]->numPrevDeltas() - 1);
+	// Momentum uses the edge's velocity (last update step).
+	return edges[index]->getVelocity();
 }
 
 void glades::Node::setWeight(float newWeight)
@@ -110,7 +123,12 @@ void glades::Node::setWeight(float newWeight)
 	weight = newWeight;
 }
 
-void glades::Node::setEdges(const std::vector<glades::Edge*>& newEdges)
+void glades::Node::setCellState(float newCellState)
+{
+	cellState = newCellState;
+}
+
+void glades::Node::setEdges(const std::vector<shmea::GPointer<glades::Edge> >& newEdges)
 {
 	edges = newEdges;
 }
@@ -128,9 +146,7 @@ void glades::Node::setActivation(unsigned int aIndex, float newActivation)
 	if (aIndex >= edges.size())
 		return;
 
-	pthread_mutex_lock(activationMutex);
 	edges[aIndex]->setActivation(newActivation);
-	pthread_mutex_unlock(activationMutex);
 }
 
 void glades::Node::setActivationScalar(float newActivationScalar)
@@ -140,10 +156,8 @@ void glades::Node::setActivationScalar(float newActivationScalar)
 
 void glades::Node::clearActivation()
 {
-	pthread_mutex_lock(activationMutex);
 	for (unsigned int i = 0; i < edges.size(); ++i)
 		edges[i]->Deactivate();
-	pthread_mutex_unlock(activationMutex);
 }
 
 void glades::Node::adjustErrDer(float newErrorDer)
@@ -176,6 +190,10 @@ void glades::Node::clean()
 {
 	weight = 0.0f;
 	errorDer = 0.0f;
+	activationScalar = 0.0f;
+	cellState = 0.0f;
+	edges.clear();
+	contextNode.reset();
 }
 
 void glades::Node::print() const
@@ -198,18 +216,18 @@ void glades::Node::initWeights(unsigned int newNumEdges, int initType)
 	{
 		if (initType == INIT_RANDOM)
 		{
-			int randomNum = rand() % 100 + 1; //+1 so we dont divide by zero
-			float randomFloat = ((float)(randomNum)) / (((float)100));
-			edges.push_back(new glades::Edge(numEdges(), randomFloat));
+			const int randomNum = glades::rng::uniform_int(1, 100); // 1..100
+			const float randomFloat = (static_cast<float>(randomNum)) / 100.0f;
+			edges.push_back(shmea::GPointer<glades::Edge>(new glades::Edge(numEdges(), randomFloat)));
 		}
 		else if (initType == INIT_POSRAND)
 		{
-			int randomNum = rand() % 100 + 1; //+1 so we dont divide by zero
-			float randomFloat = ((float)(randomNum)) / (((float)100));
-			edges.push_back(new glades::Edge(numEdges(), randomFloat));
+			const int randomNum = glades::rng::uniform_int(1, 100); // 1..100
+			const float randomFloat = (static_cast<float>(randomNum)) / 100.0f;
+			edges.push_back(shmea::GPointer<glades::Edge>(new glades::Edge(numEdges(), randomFloat)));
 		}
 		else if (initType == INIT_EMPTY)
-			edges.push_back(new glades::Edge(numEdges(), 0.0f));
+			edges.push_back(shmea::GPointer<glades::Edge>(new glades::Edge(numEdges(), 0.0f)));
 	}
 }
 
@@ -227,8 +245,9 @@ void glades::Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
 		float candidate_x;
 		while (!accepted)
 		{
-			int layer = rand() % 2048;
-			candidate_x = rand() / (RAND_MAX / zigg_layers[layer]);
+			const int layer = glades::rng::uniform_int(0, 2047);
+			// candidate_x in [0, zigg_layers[layer])
+			candidate_x = static_cast<float>(glades::rng::uniform_double(0.0, static_cast<double>(zigg_layers[layer])));
 			if (layer == 0) // tail; possibly not worth calculating values past 3 std devs, maybe
 							// revisit another day
 				continue;
@@ -236,7 +255,7 @@ void glades::Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
 				accepted = true;
 			else if (candidate_x > zigg_layers[layer + 1])
 			{
-				float randU = rand() / RAND_MAX;
+				const float randU = static_cast<float>(glades::rng::uniform_double(0.0, 1.0));
 				float candidate_y =
 					GMath::normal_pdf(zigg_layers[layer]) +
 					randU * (GMath::normal_pdf(zigg_layers[layer - 1] -
@@ -246,7 +265,7 @@ void glades::Node::initWeights(unsigned int newNumEdges, float zigg_layers[],
 			}
 		}
 		candidate_x = candidate_x * std_dev;
-		edges.push_back(new glades::Edge(numEdges(), candidate_x));
+		edges.push_back(shmea::GPointer<glades::Edge>(new glades::Edge(numEdges(), candidate_x)));
 	}
 }
 
@@ -256,11 +275,22 @@ void glades::Node::getDelta(unsigned int index, float baseError, float cInputNod
 	if (index >= edges.size())
 		return;
 
-	// calculate the optimized delta rule
-	float deltaW =
-		((baseError * cInputNodeWeight) + (momentumFactor * getLastPrevDelta(index)) // momentum
-		 + (weightDecay1 * learningRate * abs(cInputNodeWeight)) // weight decay L1
-		 + (weightDecay2 * learningRate * cInputNodeWeight)); // weight decay L2
+	// Calculate the optimized delta rule.
+	//
+	// IMPORTANT: weightDecay1/2 are regularization terms on the *weight*, not on the input
+	// activation. The historical implementation incorrectly used cInputNodeWeight, which
+	// makes the "decay" depend on data scale rather than parameter magnitude.
+	//
+	// L1: lambda1 * sign(w)
+	// L2: lambda2 * w
+	const float w = getEdgeWeight(index);
+	const float wSign = (w > 0.0f) ? 1.0f : ((w < 0.0f) ? -1.0f : 0.0f);
+
+	const float deltaW =
+		((baseError * cInputNodeWeight) +
+		 (momentumFactor * getLastPrevDelta(index)) +
+		 (weightDecay1 * learningRate * wSign) +
+		 (weightDecay2 * learningRate * w));
 
 	// Add the new PrevDelta
 	addPrevDelta(index, deltaW);
@@ -271,17 +301,20 @@ void glades::Node::applyDeltas(unsigned int index, int minibatchSize)
 	if (index >= edges.size())
 		return;
 
-	float deltaW = 0.0f;
-	for (int i = 0; i < minibatchSize; ++i)
-		deltaW += edges[index]->getPrevDelta(i);
+	if (minibatchSize <= 0)
+		return;
 
-	deltaW /= minibatchSize;
+	// We accumulate update steps for this edge during the minibatch window.
+	// Historically, missing deltas were treated as 0 (via getPrevDelta() bounds checks),
+	// so we intentionally divide by the caller-supplied minibatchSize rather than by
+	// the number of accumulated steps.
+	const float deltaW = edges[index]->getDeltaAccum() / static_cast<float>(minibatchSize);
 
 	// Set the new weight
 	setEdgeWeight(index, getEdgeWeight(index) - deltaW);
 }
 
-void glades::Node::setContextNode(Node* newContextNode)
+void glades::Node::setContextNode(const shmea::GPointer<Node>& newContextNode)
 {
 	contextNode = newContextNode;
 }

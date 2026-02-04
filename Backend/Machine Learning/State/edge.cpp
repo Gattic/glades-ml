@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -21,7 +21,9 @@ using namespace glades;
 glades::Edge::Edge(int64_t newID, float newWeight)
 {
 	weight = newWeight;
-	prevDelta.clear();
+	velocity = 0.0f;
+	deltaAccum = 0.0f;
+	deltaCount = 0u;
 	activated = false;
 	activation = 0.0f;
 }
@@ -29,7 +31,9 @@ glades::Edge::Edge(int64_t newID, float newWeight)
 glades::Edge::~Edge()
 {
 	weight = 0.0f;
-	prevDelta.clear();
+	velocity = 0.0f;
+	deltaAccum = 0.0f;
+	deltaCount = 0u;
 	activated = false;
 	activation = 0.0f;
 }
@@ -41,20 +45,38 @@ float glades::Edge::getWeight() const
 
 std::vector<float> glades::Edge::getPrevDeltas() const
 {
-	return prevDelta;
+	// Deprecated compatibility shim: historical engine stored a vector of deltas.
+	// The production path no longer allocates per-sample delta vectors.
+	return std::vector<float>();
 }
 
 float glades::Edge::getPrevDelta(unsigned int index) const
 {
-	if (index >= prevDelta.size())
-		return 0.0f;
-
-	return prevDelta[index];
+	// Deprecated compatibility shim.
+	(void)index;
+	return 0.0f;
 }
 
 int glades::Edge::numPrevDeltas() const
 {
-	return prevDelta.size();
+	// Deprecated compatibility shim: we no longer store a delta history vector.
+	// Return 0 to indicate "no vector history".
+	return 0;
+}
+
+float glades::Edge::getVelocity() const
+{
+	return velocity;
+}
+
+float glades::Edge::getDeltaAccum() const
+{
+	return deltaAccum;
+}
+
+unsigned int glades::Edge::getDeltaCount() const
+{
+	return deltaCount;
 }
 
 bool glades::Edge::getActivated() const
@@ -74,7 +96,11 @@ void glades::Edge::setWeight(float newWeight)
 
 void glades::Edge::addPrevDelta(float newPrevDelta)
 {
-	prevDelta.push_back(newPrevDelta);
+	// Treat "prevDelta" as "update step" in legacy terminology.
+	// Store last step for momentum and accumulate for minibatch averaging.
+	velocity = newPrevDelta;
+	deltaAccum += newPrevDelta;
+	++deltaCount;
 }
 
 void glades::Edge::setActivation(float newActivation)
@@ -85,7 +111,9 @@ void glades::Edge::setActivation(float newActivation)
 
 void glades::Edge::clearPrevDeltas()
 {
-	prevDelta.clear();
+	// Clear minibatch accumulation; keep velocity (momentum state) intact.
+	deltaAccum = 0.0f;
+	deltaCount = 0u;
 }
 
 void glades::Edge::Deactivate()

@@ -3,6 +3,15 @@ set(Networks_src_files
 	metanetwork.h
 	network.cpp
 	network.h
+	model_persistence.cpp
+	sgd_dff.cpp
+	sgd_rnn.cpp
+	sgd_gru.cpp
+	sgd_lstm.cpp
+	trainer.cpp
+	trainer.h
+	training_core.cpp
+	training_core.h
 	bayes.cpp
 	bayes-optimizer.cpp
 )

@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -29,10 +29,11 @@ using namespace glades;
 glades::InputLayerInfo::InputLayerInfo(int newBatchSize,
     float newLearningRate, float newMomentumFactor,
     float newWeightDecay1, float newWeightDecay2, float newPDropout,
-    int newActivationType, float newActivationParam)
+    int newActivationType, float newActivationParam, int newTBPTTWindow)
 	: LayerInfo(0)
 {
 	batchSize = newBatchSize;
+	tbpttWindow = newTBPTTWindow;
 	learningRate = newLearningRate;
 	momentumFactor = newMomentumFactor;
 	weightDecay1 = newWeightDecay1;
@@ -49,6 +50,7 @@ glades::InputLayerInfo::InputLayerInfo(int newBatchSize,
 glades::InputLayerInfo::~InputLayerInfo()
 {
 	batchSize = 0;
+	tbpttWindow = 0;
 }
 
 /*!
@@ -62,6 +64,11 @@ int glades::InputLayerInfo::getBatchSize() const
 	return batchSize;
 }
 
+int glades::InputLayerInfo::getTBPTTWindow() const
+{
+	return tbpttWindow;
+}
+
 /*!
  * @brief get GTable row
  * @details get the GTable row from this layer
@@ -72,7 +79,7 @@ shmea::GList glades::InputLayerInfo::getGTableRow() const
 	shmea::GList row;
 	// structure: size, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout,
 	// activationType,
-	// activationParam, outputType
+	// activationParam, outputType, tbpttWindow
 	// -1 = "blank"/placeholder
 	row.addLong(-1);
 	row.addLong(getBatchSize());
@@ -84,6 +91,7 @@ shmea::GList glades::InputLayerInfo::getGTableRow() const
 	row.addLong(activationType);
 	row.addFloat(activationParam);
 	row.addLong(-1);//no output type for input layer
+	row.addLong(getTBPTTWindow());
 
 	return row;
 }
@@ -96,6 +104,11 @@ shmea::GList glades::InputLayerInfo::getGTableRow() const
 void glades::InputLayerInfo::setBatchSize(int newBatchSize)
 {
 	batchSize = newBatchSize;
+}
+
+void glades::InputLayerInfo::setTBPTTWindow(int newTBPTTWindow)
+{
+	tbpttWindow = newTBPTTWindow;
 }
 
 /*!

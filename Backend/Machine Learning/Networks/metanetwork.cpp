@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -100,18 +100,20 @@ void glades::MetaNetwork::addSubnet(NNInfo* networkInfo)
 	if (!networkInfo)
 		return;
 
-	glades::NNetwork* cNetwork = new glades::NNetwork(networkInfo);
-	subnets.push_back(cNetwork);
+	shmea::GPointer<glades::NNetwork> cNetwork(new glades::NNetwork(networkInfo));
+	ownedSubnets.push_back(cNetwork);
+	subnets.push_back(cNetwork.get());
 }
 
 void glades::MetaNetwork::addSubnet(const shmea::GString nNetName)
 {
 	if (nNetName.length() <= 0)
 		return;
-	glades::NNetwork* cNetwork = new glades::NNetwork();
+	shmea::GPointer<glades::NNetwork> cNetwork(new glades::NNetwork());
 	if (cNetwork->load(nNetName))
 	{
-		subnets.push_back(cNetwork);
+		ownedSubnets.push_back(cNetwork);
+		subnets.push_back(cNetwork.get());
 	}
 }
 
@@ -135,6 +137,7 @@ void glades::MetaNetwork::addSubnet(glades::NNetwork* cNetwork)
  */
 void glades::MetaNetwork::clearSubnets()
 {
+	ownedSubnets.clear();
 	subnets.clear();
 }
 
@@ -238,13 +241,25 @@ void glades::MetaNetwork::crossValidate(shmea::GString fNames, DataInput* newDat
 		}
 
 		//
-		subnets[i]->train(newDataInput);
+		{
+			const glades::NNetworkStatus st = subnets[i]->train(newDataInput);
+			if (!st.ok())
+			{
+				printf("[NN] CrossValidate train failed: %s\n", st.message.c_str());
+				return;
+			}
+		}
 
 		shmea::GTable testInputFile = *stratifiedInputFiles[i];
 		if (testInputFile.numberOfCols() > 0)
 		{
 			// Test our validation set
-			subnets[i]->test(newDataInput);
+			const glades::NNetworkStatus st = subnets[i]->test(newDataInput);
+			if (!st.ok())
+			{
+				printf("[NN] CrossValidate test failed: %s\n", st.message.c_str());
+				return;
+			}
 			cvAccuracy += subnets[i]->getAccuracy();
 		}
 	}
@@ -312,12 +327,26 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
             // Run the training and retrieve a metanetwork
             printf("Train\n");
             cNetwork->setChangeInputLayers(true);
-            cNetwork->train(diTrain);
+            {
+                const glades::NNetworkStatus st = cNetwork->train(diTrain);
+                if (!st.ok())
+                {
+                    printf("[NN] CV train failed: %s\n", st.message.c_str());
+                    return;
+                }
+            }
 
             // Run the test and retrieve a metanetwork
             printf("Test\n");
             cNetwork->setChangeInputLayers(true);
-            cNetwork->test(diTest);
+            {
+                const glades::NNetworkStatus st = cNetwork->test(diTest);
+                if (!st.ok())
+                {
+                    printf("[NN] CV test failed: %s\n", st.message.c_str());
+                    return;
+                }
+            }
 
             averageAccuracies[netInd] += cNetwork->getAccuracy();
         }
@@ -386,7 +415,14 @@ void glades::MetaNetwork::crossValidate(const shmea::GTable& inputGTable,
         
         // Run the validation
         cNetwork->setChangeInputLayers(true);
-        cNetwork->test(diValidation);
+        {
+            const glades::NNetworkStatus st = cNetwork->test(diValidation);
+            if (!st.ok())
+            {
+                printf("[NN] Validation test failed: %s\n", st.message.c_str());
+                return;
+            }
+        }
         validationAccuracies[netInd] = cNetwork->getAccuracy();
     }
 }

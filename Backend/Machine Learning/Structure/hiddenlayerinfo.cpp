@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -67,7 +67,7 @@ shmea::GList glades::HiddenLayerInfo::getGTableRow() const
 {
 	shmea::GList row;
 	// structure: size, batchSize, learningRate, momentumFactor, weightDecay1, weightDecay2, pDropout, activationType,
-	// activationParam, outputType
+	// activationParam, outputType, tbpttWindow
 	// -1 = "blank"/placeholder
 	row.addLong(size());
 	row.addLong(1);
@@ -78,6 +78,7 @@ shmea::GList glades::HiddenLayerInfo::getGTableRow() const
 	row.addFloat(getPDropout());
 	row.addLong(getActivationType());
 	row.addFloat(getActivationParam());
+	row.addLong(-1);
 	row.addLong(-1);
 	return row;
 }

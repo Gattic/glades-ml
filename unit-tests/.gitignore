@@ -1,1 +1,3 @@
 datasets/*.png
+database/models/
+logs/

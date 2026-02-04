@@ -78,6 +78,11 @@ public:
 	size_type capacity() const { return m_capacity; }
 	bool empty() const { return (m_size == 0 || !m_data); }
 
+	// Raw pointer access (contiguous storage).
+	// NOTE: Returned pointer is invalidated by reserve()/expand()/clear()/assignment.
+	T* data() { return m_data.get(); }
+	const T* data() const { return m_data.get(); }
+
 	void reserve(size_type new_cap)
 	{
 		if (new_cap <= m_capacity) return;

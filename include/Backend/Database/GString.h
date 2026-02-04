@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -57,6 +57,8 @@ public:
 	unsigned int length() const;
 
 	//operators
+	GString& operator=(const GString&);
+
 	const char& operator[](const unsigned int&) const;
 	char& operator[](const unsigned int&);
 

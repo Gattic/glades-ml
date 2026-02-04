@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -18,6 +18,35 @@
 #include "Backend/Database/GType.h"
 
 using namespace glades;
+
+namespace {
+// Epsilon choices:
+// - For probabilities going into log()/division: keep away from {0,1}.
+// - For divisors: avoid division-by-zero while preserving sign where relevant.
+static inline float clampf(float x, float lo, float hi)
+{
+	if (x < lo)
+		return lo;
+	if (x > hi)
+		return hi;
+	return x;
+}
+
+static inline float clamp_prob01(float p)
+{
+	// Small enough to avoid biasing typical training, large enough to prevent inf/NaN.
+	const float eps = 1e-7f;
+	return clampf(p, eps, 1.0f - eps);
+}
+
+static inline float safe_div(float num, float den)
+{
+	const float eps = 1e-12f;
+	if (den > -eps && den < eps)
+		return num / (den < 0.0f ? -eps : eps);
+	return num / den;
+}
+} // namespace
 
 // Define static class constants
 const float glades::GMath::INLIER = 0.954f;
@@ -48,7 +77,18 @@ float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 	}
 	case SIGMOID:
 	{
-		netOutput = 1.0f / (1.0f + exp(-netInput));
+		// Numerically-stable sigmoid.
+		// Avoids overflow in exp() for large-magnitude inputs.
+		if (netInput >= 0.0f)
+		{
+			const float z = static_cast<float>(exp(-netInput));
+			netOutput = 1.0f / (1.0f + z);
+		}
+		else
+		{
+			const float z = static_cast<float>(exp(netInput));
+			netOutput = z / (1.0f + z);
+		}
 
 		break;
 	}
@@ -59,13 +99,26 @@ float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 		else if (netInput > 1.0f - fxParam)
 			netOutput = 0.99f;
 		else
-			netOutput = 1.0f / (1.0f + exp(-netInput));
+		{
+			// Same stable sigmoid core as SIGMOID.
+			if (netInput >= 0.0f)
+			{
+				const float z = static_cast<float>(exp(-netInput));
+				netOutput = 1.0f / (1.0f + z);
+			}
+			else
+			{
+				const float z = static_cast<float>(exp(netInput));
+				netOutput = z / (1.0f + z);
+			}
+		}
 
 		break;
 	}
 	case RELU:
 	{
-		if (netInput < OUTLIER) // including negative vals
+		// Standard ReLU threshold is 0.0 (not OUTLIER).
+		if (netInput <= 0.0f) // including negative vals
 			netOutput = 0.0f;
 		else
 			netOutput = netInput;
@@ -77,8 +130,9 @@ float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 		if (fxParam > 0.1f)
 			printf("[MATH] WARNING: Passed activation param too large for Leaky ReLU\n");
 
-		if (netInput < OUTLIER)
-			netOutput = fxParam * netInput; // fxParam should be small
+		// Standard Leaky ReLU threshold is 0.0 (not OUTLIER).
+		if (netInput <= 0.0f)
+			netOutput = fxParam * netInput; // fxParam should be small positive (e.g. 0.01)
 		else
 			netOutput = netInput;
 
@@ -112,42 +166,45 @@ float glades::GMath::unsquash(float netInput, int activationFx, float fxParam)
 	{
 	case TANH:
 	{
-		netOutput = atanh(netInput);
+		// Inverse tanh; clamp away from {-1, 1} to avoid inf.
+		netOutput = atanh(clampf(netInput, -1.0f + 1e-7f, 1.0f - 1e-7f));
 
 		break;
 	}
 	case TANHP:
 	{
+		// "TANHP" is a clipped tanh in squash(). Here we do best-effort inverse for values
+		// in (-1, 1), and saturate outside.
 		if (netInput <= -1.0f)
-			netOutput = -fxParam;
+			netOutput = -INLIER; // large negative; avoid returning a tiny value
 		else if (netInput >= 1.0f)
-			netOutput = fxParam;
+			netOutput = INLIER;
 		else
-			netOutput = atanh(netInput);
+			netOutput = atanh(clampf(netInput, -1.0f + 1e-7f, 1.0f - 1e-7f));
 
 		break;
 	}
 	case SIGMOID:
 	{
-		netOutput = (1.0f + exp(-netInput));
+		// Inverse sigmoid (logit). Previous implementation was incorrect.
+		const float p = clamp_prob01(netInput);
+		netOutput = log(safe_div(p, (1.0f - p)));
 
 		break;
 	}
 	case SIGMOIDP:
 	{
-		if (netInput <= 0.0f)
-			netOutput = 1 - fxParam;
-		else if (netInput >= 1.0f)
-			netOutput = fxParam;
-		else
-			netOutput = (1.0f + exp(-netInput));
+		// Best-effort inverse for "SIGMOIDP" outputs.
+		// squash(SIGMOIDP) clamps outputs into [0.01, 0.99] in some ranges; clamp here too.
+		const float p = clamp_prob01(netInput);
+		netOutput = log(safe_div(p, (1.0f - p)));
 
 		break;
 	}
 	case RELU:
 	{
 		if (netInput <= 0.0f)
-			netOutput = OUTLIER;
+			netOutput = 0.0f;
 		else
 			netOutput = netInput;
 
@@ -158,8 +215,8 @@ float glades::GMath::unsquash(float netInput, int activationFx, float fxParam)
 		if (fxParam > 0.1f)
 			printf("[MATH] WARNING: Passed activation param too large for Leaky ReLU\n");
 
-		if (netInput <= OUTLIER * fxParam)
-			netOutput = netInput / fxParam; // fxParam should be small
+		if (netInput <= 0.0f)
+			netOutput = safe_div(netInput, fxParam); // fxParam should be small positive
 		else
 			netOutput = netInput;
 
@@ -167,7 +224,13 @@ float glades::GMath::unsquash(float netInput, int activationFx, float fxParam)
 	}
 	case LINEAR:
 	{
-		netOutput = netInput / fxParam;
+		if (fxParam == 0.0f)
+		{
+			printf("[MATH] WARNING: Linear unsquash with fxParam=0\n");
+			netOutput = 0.0f;
+		}
+		else
+			netOutput = netInput / fxParam;
 
 		break;
 	}
@@ -217,15 +280,9 @@ float glades::GMath::activationErrDer(float netInput, int activationFx, float fx
 	}
 	case LEAKY:
 	{
-		// Leaky ReLU der: 1 if x > 0; fxParam otherwise
-		if (netInput > 0.0f)
-			netErrDer = 1.0f;
-		else
-			// Leaky part of deriv should be negative
-			if (fxParam < 0)
-			netErrDer = fxParam;
-		else
-			netErrDer = -fxParam;
+		// Standard Leaky ReLU derivative: 1 if x > 0; fxParam otherwise.
+		// fxParam should be small positive (e.g. 0.01).
+		netErrDer = (netInput > 0.0f) ? 1.0f : fxParam;
 
 		break;
 	}
@@ -257,15 +314,16 @@ float glades::GMath::PercentError(float prediction, float expectation, float mea
 {
 	float percentError = 0.0f;
 
-	// Cannot divide by zero
-	// if (expectation == 0.0f)
-	// 	percentError = (prediction - expectation);
-	// else
-	// 	percentError = ((prediction - expectation) / expectation);
-	percentError = (prediction - expectation);
-
-	if (percentError < 0.0f)
-		percentError = -percentError;
+	// Historically this behaved like a clipped absolute error in [0,1].
+	// Make it a defensible "percent-like" error while keeping the old behavior
+	// for expectation ~= 0 to avoid massive spikes.
+	(void)meanSqErr; // kept for API compatibility
+	const float absDiff = fabs(prediction - expectation);
+	const float denom = fabs(expectation);
+	if (denom < 1e-7f)
+		percentError = absDiff;
+	else
+		percentError = absDiff / denom;
 
 	if (percentError > 1.0f)
 		percentError = 1.0f;
@@ -281,17 +339,29 @@ float glades::GMath::MeanSquaredError(float expectation, float prediction)
 
 float glades::GMath::CrossEntropyCost(float expectation, float prediction)
 {
-	return -((expectation * log(prediction)) + ((1 - expectation) * log(1 - prediction)));
+	// Binary cross-entropy; clamp prediction to avoid log(0).
+	const float y = clampf(expectation, 0.0f, 1.0f);
+	const float p = clamp_prob01(prediction);
+	return -((y * log(p)) + ((1.0f - y) * log(1.0f - p)));
 }
 
 float glades::GMath::KLDivergence(float expectation, float prediction)
 {
-	return log(expectation / prediction);
+	// Element-wise KL contribution: p * log(p / q).
+	// If p == 0, contribution is 0 by continuity.
+	if (expectation <= 0.0f)
+		return 0.0f;
+
+	const float p = clamp_prob01(expectation);
+	const float q = clamp_prob01(prediction);
+	return p * log(safe_div(p, q));
 }
 
 float glades::GMath::outputNodeCost(float expectation, float prediction, float dataSize, int costFx)
 {
 	float netCost = 0.0f;
+	if (dataSize <= 0.0f)
+		dataSize = 1.0f;
 
 	switch (costFx)
 	{
@@ -340,14 +410,20 @@ float glades::GMath::costErrDer(float expectation, float prediction, int costFx)
 	case CLASSIFICATION:
 	{
 		// classification uses XENT cost
-		netErrDer = (prediction - expectation) / ((1 - prediction) * prediction);
+		// d/dp BCE(y,p) = (p - y) / (p(1-p)), but clamp p for stability.
+		const float y = clampf(expectation, 0.0f, 1.0f);
+		const float p = clamp_prob01(prediction);
+		netErrDer = safe_div((p - y), (p * (1.0f - p)));
 
 		break;
 	}
 	case KL:
 	{
 		// Kullback–Leibler divergence cost
-		netErrDer = -(expectation / prediction);
+		if (expectation <= 0.0f)
+			netErrDer = 0.0f;
+		else
+			netErrDer = -safe_div(expectation, clamp_prob01(prediction));
 
 		break;
 	}

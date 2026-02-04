@@ -1,4 +1,4 @@
-// Copyright 2020 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 // associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -31,17 +31,27 @@ class InputLayerInfo : public LayerInfo
 {
 private:
 	int batchSize;
+	// Truncated backprop-through-time window length for recurrent nets (RNN/GRU/LSTM).
+	// - 0 means "no truncation" (full sequence BPTT).
+	// - >0 means "truncate to this many timesteps per window".
+	//
+	// IMPORTANT: This is intentionally separate from minibatch size.
+	// Historically, this engine overloaded batchSize to mean TBPTT length for recurrent nets.
+	int tbpttWindow;
 
 public:
-	InputLayerInfo(int, float, float, float, float, float, int, float);
+	// newTBPTTWindow defaults to 0 (full BPTT).
+	InputLayerInfo(int, float, float, float, float, float, int, float, int newTBPTTWindow = 0);
 	virtual ~InputLayerInfo();
 
 	// gets
 	int getBatchSize() const;
+	int getTBPTTWindow() const;
 	shmea::GList getGTableRow() const;
 
 	// sets
 	void setBatchSize(int);
+	void setTBPTTWindow(int);
 
 	int getLayerType() const;
 };
