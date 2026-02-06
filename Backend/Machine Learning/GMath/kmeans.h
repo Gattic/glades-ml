@@ -8,6 +8,8 @@
 #include <iostream>
 #include <limits>
 
+#include "../rng.h"
+
 namespace glades
 {
 
@@ -18,6 +20,9 @@ private:
     int maxIterations;       // Maximum iterations
     float tolerance;         // Stopping threshold
     std::vector<std::vector<float> > centroids;  // Centroid positions
+    // Optional explicit RNG engine for deterministic behavior.
+    // If NULL, initialization falls back to glades::rng::default_engine().
+    glades::rng::Engine* rngEngine_;
 
     float euclideanDistance(const std::vector<float>& a, const std::vector<float>& b) const;
     void assignClusters(const std::vector<std::vector<float> >& points);
@@ -29,6 +34,7 @@ public:
     std::vector<int> labels;
 
     KMeans(int clusters, int iterations = 100, float tol = 1e-4);
+    void setRngEngine(glades::rng::Engine* e) { rngEngine_ = e; }
     void fit(const std::vector<std::vector<float> >& points);
     int predict(const std::vector<float>& point) const;
     std::vector<std::vector<float> > getCentroids() const;

@@ -17,12 +17,23 @@
 #include "OHE.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GString.h"
+#include <limits>
 
 using namespace glades;
+
+namespace {
+static inline std::string key_from_gstring(const shmea::GString& s)
+{
+	// Normalize keys as std::string for unordered_map lookup.
+	// OHEStrings remains the authoritative index->class ordering.
+	return std::string(s.c_str());
+}
+} // namespace
 
 glades::OHE::OHE()
 {
 	OHEStrings.clear();
+	indexByString.clear();
 	fMin = 0.0f;
 	fMax = 0.0f;
 	fMean = 0.0f;
@@ -32,6 +43,9 @@ glades::OHE::OHE(const OHE& ohe2)
 {
 	OHEStrings = ohe2.OHEStrings;
 	classCount = ohe2.classCount;
+	indexByString.clear();
+	for (unsigned int i = 0; i < OHEStrings.size(); ++i)
+		indexByString[key_from_gstring(OHEStrings[i])] = static_cast<int>(i);
 	fMin = ohe2.fMin;
 	fMax = ohe2.fMax;
 	fMean = ohe2.fMean;
@@ -40,6 +54,7 @@ glades::OHE::OHE(const OHE& ohe2)
 glades::OHE::~OHE()
 {
 	OHEStrings.clear();
+	indexByString.clear();
 	fMin = 0.0f;
 	fMax = 0.0f;
 	fMean = 0.0f;
@@ -47,14 +62,22 @@ glades::OHE::~OHE()
 
 void glades::OHE::addString(const shmea::GString& newString)
 {
-	// GType nodeContents(newString);
-	if (!contains(newString))
+	const std::string key = key_from_gstring(newString);
+	std::map<std::string, int>::iterator it = indexByString.find(key);
+	if (it == indexByString.end())
 	{
 		OHEStrings.push_back(newString);
-		classCount[newString]=1;
+		indexByString[key] = static_cast<int>(OHEStrings.size() - 1u);
+		classCount[newString] = 1;
 	}
 	else
-		++classCount[newString];
+	{
+		const int idx = it->second;
+		if (idx >= 0 && static_cast<unsigned int>(idx) < OHEStrings.size())
+			++classCount[OHEStrings[static_cast<unsigned int>(idx)]];
+		else
+			++classCount[newString]; // fallback; should not happen
+	}
 }
 
 void glades::OHE::setMin(float newMin)
@@ -99,14 +122,7 @@ shmea::GVector<shmea::GString> glades::OHE::getStrings() const
 
 bool glades::OHE::contains(const shmea::GString& newString) const
 {
-	// check if the string is already in the vector
-	for (unsigned int i = 0; i < OHEStrings.size(); ++i)
-	{
-		if (OHEStrings[i] == newString)
-			return true;
-	}
-
-	return false;
+	return (indexByString.find(key_from_gstring(newString)) != indexByString.end());
 }
 
 void glades::OHE::print() const
@@ -138,15 +154,10 @@ void glades::OHE::print() const
 
 int glades::OHE::indexAt(const shmea::GString& needle) const
 {
-	shmea::GVector<int> retVal(size(), 0);
-
-	for (unsigned int counter = 0; counter < OHEStrings.size(); ++counter)
-	{
-		if (OHEStrings[counter] == needle)
-			return counter;
-	}
-
-	return -1;
+	std::map<std::string, int>::const_iterator it = indexByString.find(key_from_gstring(needle));
+	if (it == indexByString.end())
+		return -1;
+	return it->second;
 }
 
 shmea::GString glades::OHE::classAt(unsigned int cid) const
@@ -163,32 +174,27 @@ shmea::GString glades::OHE::classAt(unsigned int cid) const
 shmea::GVector<float> glades::OHE::operator[](const char* needle) const
 {
 	shmea::GString needleString(needle);
-	shmea::GVector<float> retVal(size(), 0.01);
+	// Production semantics: strict one-hot encoding (0/1).
+	// NOTE: The older engine used 0.99/0.01 "soft" one-hot; that is *not* a valid
+	// probability distribution for multi-class softmax training and caused inconsistent
+	// behavior across DataInput implementations.
+	shmea::GVector<float> retVal(size(), 0.0f);
 
-	for (unsigned int counter = 0; counter < OHEStrings.size(); ++counter)
-	{
-		if (OHEStrings[counter] == needleString)
-		{
-			retVal[counter] = 0.99;
-			break;
-		}
-	}
+	const int idx = indexAt(needleString);
+	if (idx >= 0 && static_cast<unsigned int>(idx) < retVal.size())
+		retVal[static_cast<unsigned int>(idx)] = 1.0f;
 
 	return retVal;
 }
 
 shmea::GVector<float> glades::OHE::operator[](const shmea::GString& needle) const
 {
-	shmea::GVector<float> retVal(size(), 0.01);
+	// Strict one-hot encoding (0/1). Unknown category => all zeros.
+	shmea::GVector<float> retVal(size(), 0.0f);
 
-	for (unsigned int counter = 0; counter < OHEStrings.size(); ++counter)
-	{
-		if (OHEStrings[counter] == needle)
-		{
-			retVal[counter] = 0.99;
-			break;
-		}
-	}
+	const int idx = indexAt(needle);
+	if (idx >= 0 && static_cast<unsigned int>(idx) < retVal.size())
+		retVal[static_cast<unsigned int>(idx)] = 1.0f;
 
 	return retVal;
 }
@@ -209,20 +215,29 @@ shmea::GString glades::OHE::operator[](const shmea::GVector<int>& needle) const
 
 shmea::GString glades::OHE::operator[](const shmea::GVector<float>& needle) const
 {
-	// check if the string is already in the vector
-	float max = 0.0f;
-	unsigned int index = -1;
+	// Argmax decode for a one-hot / probability-like vector.
+	// If the vector is all zeros, treat it as "unknown" and return "".
+	float max = -std::numeric_limits<float>::infinity();
+	int index = -1;
+	bool anyNonZero = false;
 	for (unsigned int counter = 0; counter < needle.size(); ++counter)
 	{
-		if (needle[counter] >= max)
+		const float v = needle[counter];
+		if (v != 0.0f)
+			anyNonZero = true;
+		if (v > max)
 		{
-			max = needle[counter];
-			index = counter;
+			max = v;
+			index = static_cast<int>(counter);
 		}
 	}
 
-	if (index != -1)
-		return OHEStrings[index];
+	if (!anyNonZero || index < 0)
+		return "";
+	if (static_cast<unsigned int>(index) >= OHEStrings.size())
+		return "";
+
+	return OHEStrings[static_cast<unsigned int>(index)];
 
 	return "";
 }

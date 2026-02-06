@@ -14,29 +14,10 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#include "NetworkState.h"
+#ifndef _UT_NN_MIXED_PRECISION_TEST
+#define _UT_NN_MIXED_PRECISION_TEST
 
-glades::NetworkState::NetworkState(unsigned int newInputLayerCounter,
-								   unsigned int newOutputLayerCounter,
-								   unsigned int newInputNodeCounter,
-								   unsigned int newOutputNodeCounter, Layer* newInputLayer,
-								   Layer* newOutputLayer, Node* newInputNode, Node* newOutputNode,
-								   bool newFirstValidInputNode, bool newLastValidInputNode,
-								   bool newFirstValidOutputNode, bool newLastValidOutputNode,
-								   bool newValidInputNode, bool newValidOutputNode)
-{
-	cInputLayerCounter = newInputLayerCounter;
-	cOutputLayerCounter = newOutputLayerCounter;
-	cInputNodeCounter = newInputNodeCounter;
-	cOutputNodeCounter = newOutputNodeCounter;
-	cInputLayer = newInputLayer;
-	cOutputLayer = newOutputLayer;
-	cInputNode = newInputNode;
-	cOutputNode = newOutputNode;
-	firstValidInputNode = newFirstValidInputNode;
-	lastValidInputNode = newLastValidInputNode;
-	firstValidOutputNode = newFirstValidOutputNode;
-	lastValidOutputNode = newLastValidOutputNode;
-	validInputNode = newValidInputNode;
-	validOutputNode = newValidOutputNode;
-}
+void NNMixedPrecisionUnitTest();
+
+#endif
+

@@ -17,167 +17,131 @@
 #include "nn-cv-test.h"
 #include "../../unit-test.h"
 #include "Backend/Database/GList.h"
-#include "../../../Backend/Machine Learning/main.h"
+#include "Backend/Database/GTable.h"
 #include "../../../Backend/Machine Learning/Networks/network.h"
-#include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
-#include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
-#include "../../../Backend/Machine Learning/State/Terminator.h"
+#include "../../../Backend/Machine Learning/Networks/cross_validation.h"
+#include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
+#include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
+#include "../../../Backend/Machine Learning/Structure/hiddenlayerinfo.h"
+#include "../../../Backend/Machine Learning/Structure/outputlayerinfo.h"
+#include <cmath>
 
 // === This is the primary unit testing function:
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
 
 void NNCVUnitTestValidation()
 {
-///////////////////////Test Iris/////////////////////////
-    shmea::GString inputFName = "iris.data";
-    int inputType = glades::DataInput::CSV;
-    //int inputType = glades::DataInput::IMAGE;
-    //int inputType = glades::DataInput::TEXT;
-    
-    if (inputType == glades::DataInput::CSV) {
-        inputFName = "datasets/" + inputFName;
-    }
-    else if (inputType == glades::DataInput::IMAGE) {
-        // inputFName = "datasets/images/" + inputFName + "/";
-    }
-    else if (inputType == glades::DataInput::TEXT) {
-	// TODO
-        return;
-    }
-    else
-        return;
-	    
-    // Load the input data to GTable
-    shmea::GTable inputIrisTable = shmea::GTable(inputFName, ',', shmea::GTable::TYPE_FILE);
-    shmea::GTable* shuffled_inputIrisTable = shmea::GTable::shuffleRows(inputIrisTable);
-    shuffled_inputIrisTable->standardize();
+	printf("============================================================\n");
+	printf("NN Cross-Validation Unit Test Suite (modern)\n");
+	printf("============================================================\n");
 
-    shmea::GString netName1 = "iris";
-    glades::NNetwork irisNetwork1;
-    shmea::GString netName2 = "iris";
-    glades::NNetwork irisNetwork2;
+	// Build a tiny in-memory classification dataset:
+	// - 2 numeric features
+	// - 1 string label output column (binary)
+	shmea::GVector<shmea::GString> headers;
+	headers.push_back("x1");
+	headers.push_back("x2");
+	headers.push_back("label");
+	shmea::GTable tbl(',', headers);
+	tbl.toggleOutput(2u); // "label"
 
-    if ((irisNetwork1.getEpochs() == 0) && (!irisNetwork1.load(netName1))) {
-        printf("[NN] Unable to load \"%s\"", netName1.c_str());
-        return;
-    }
+	for (int i = 0; i < 10; ++i)
+	{
+		const float x1 = (i < 5) ? -1.0f : 1.0f;
+		const float x2 = static_cast<float>(i);
+		const char* lab = (i < 5) ? "A" : "B";
+		shmea::GList row;
+		row.addFloat(x1);
+		row.addFloat(x2);
+		row.addString(lab);
+		tbl.addRow(row);
+	}
 
-    if ((irisNetwork2.getEpochs() == 0) && (!irisNetwork2.load(netName1))) {
-        printf("[NN] Unable to load \"%s\"", netName2.c_str());
-        return;
-    }
+	// Simple DFF binary classifier (no hidden layers).
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	    /*batchSize*/ 10,
+	    /*learningRate*/ 0.20f,
+	    /*momentumFactor*/ 0.0f,
+	    /*weightDecay1*/ 0.0f,
+	    /*weightDecay2*/ 0.0f,
+	    /*pDropout*/ 0.0f,
+	    /*activationType*/ glades::GMath::LINEAR,
+	    /*activationParam*/ 1.0f);
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(2, glades::OutputLayerInfo::CLASSIFICATION);
+	glades::NNInfo* info = new glades::NNInfo("ut_cv_bin", in, hidden, out);
 
-    irisNetwork1.getTerminatorMutable().setEpoch(10000);
-    irisNetwork1.getTerminatorMutable().setAccuracy(99);
+	glades::NNetwork net1(info, glades::NNetwork::TYPE_DFF);
+	glades::NNetwork net2(info, glades::NNetwork::TYPE_DFF);
+	net1.setSeed(123u);
+	net2.setSeed(456u);
+	net1.getTerminatorMutable().setEpoch(3);
+	net2.getTerminatorMutable().setEpoch(3);
 
-    irisNetwork2.getTerminatorMutable().setEpoch(10000);
-    irisNetwork2.getTerminatorMutable().setAccuracy(99);
+	std::vector<glades::NNetwork*> models;
+	models.push_back(&net1);
+	models.push_back(&net2);
 
-    if (irisNetwork1.getNNInfoMutable())
-    {
-        irisNetwork1.getNNInfoMutable()->setLearningRate(0, 0.0003f);
-        irisNetwork1.getNNInfoMutable()->setWeightDecay1(0, 0.001f);
-        irisNetwork1.getNNInfoMutable()->setWeightDecay2(0, 0.001f);
-    }
+	printf("-----------------------------------\n");
+	printf("CV Test A (k-fold deterministic API)\n");
+	printf("-----------------------------------\n");
+	{
+		glades::CrossValidationConfig cfg;
+		cfg.kFolds = 5u;
+		cfg.shuffle = true;
+		cfg.seed = 2026u;
+		cfg.timeSeries = false;
+		cfg.stratify = true;
+		cfg.standardizeFlag = glades::GMath::ZSCORE;
 
-    if (irisNetwork1.getNNInfoMutable())
-    {
-        irisNetwork1.getNNInfoMutable()->setLearningRate(1, 0.0003f);
-        irisNetwork1.getNNInfoMutable()->setWeightDecay1(1, 0.001f);
-        irisNetwork1.getNNInfoMutable()->setWeightDecay2(1, 0.001f);
-    }
+		glades::CrossValidationResults r1;
+		const glades::NNetworkStatus st1 = glades::crossValidateTableCSV(tbl, models, cfg, &r1);
+		G_assert(__FILE__, __LINE__, "==============NNCV::A Status Failed==============", st1.ok());
+		G_assert(__FILE__, __LINE__, "==============NNCV::A MeanSizeMismatch Failed==============", r1.meanTestAccuracy.size() == models.size());
+		G_assert(__FILE__, __LINE__, "==============NNCV::A FoldOuterSizeMismatch Failed==============", r1.foldTestAccuracy.size() == models.size());
+		G_assert(__FILE__, __LINE__, "==============NNCV::A FoldsUsedNonZero Failed==============", r1.foldsUsed > 0u);
+		for (unsigned int m = 0; m < r1.meanTestAccuracy.size(); ++m)
+		{
+			const float a = r1.meanTestAccuracy[m];
+			G_assert(__FILE__, __LINE__, "==============NNCV::A MeanNonFinite Failed==============", std::isfinite(a));
+			G_assert(__FILE__, __LINE__, "==============NNCV::A MeanRange Failed==============", (a >= 0.0f) && (a <= 100.0f));
+			G_assert(__FILE__, __LINE__, "==============NNCV::A FoldCount Failed==============", r1.foldTestAccuracy[m].size() == r1.foldsUsed);
+		}
 
-    if (irisNetwork2.getNNInfoMutable())
-    {
-        irisNetwork2.getNNInfoMutable()->setLearningRate(0, 0.0005f);
-        irisNetwork2.getNNInfoMutable()->setLearningRate(1, 0.0005f);
-    }
+		// Determinism: same config => identical results.
+		glades::CrossValidationResults r2;
+		const glades::NNetworkStatus st2 = glades::crossValidateTableCSV(tbl, models, cfg, &r2);
+		G_assert(__FILE__, __LINE__, "==============NNCV::A2 Status Failed==============", st2.ok());
+		G_assert(__FILE__, __LINE__, "==============NNCV::A2 Determinism MeanSize Failed==============", r2.meanTestAccuracy.size() == r1.meanTestAccuracy.size());
+		for (unsigned int m = 0; m < r1.meanTestAccuracy.size(); ++m)
+		{
+			G_assert(__FILE__, __LINE__, "==============NNCV::A2 Determinism MeanMismatch Failed==============",
+			         fabs(r2.meanTestAccuracy[m] - r1.meanTestAccuracy[m]) < 1e-6f);
+		}
+	}
 
-    std::vector<glades::NNetwork*> irisNetworks;
-    irisNetworks.push_back(&irisNetwork1);
-    irisNetworks.push_back(&irisNetwork2);
+	printf("-----------------------------------\n");
+	printf("CV Test B (walk-forward folds skip empty-train)\n");
+	printf("-----------------------------------\n");
+	{
+		glades::CrossValidationConfig cfg;
+		cfg.kFolds = 5u;
+		cfg.timeSeries = true;
+		cfg.shuffle = false;
+		cfg.stratify = false;
+		cfg.seed = 7u;
+		cfg.standardizeFlag = glades::GMath::NONE;
 
-    std::vector<float> averageAccuracies; 
-    std::vector<float> validationAccuracies; 
-    unsigned int validationPercent = 10;
-    unsigned int testPercent = 20;
-    glades::MetaNetwork* cMetaNetwork = glades::crossValidate(irisNetworks , *shuffled_inputIrisTable, glades::DataInput::CSV, 
-                                         averageAccuracies, validationAccuracies, validationPercent, testPercent);
+		glades::CrossValidationResults r;
+		const glades::NNetworkStatus st = glades::crossValidateTableCSV(tbl, models, cfg, &r);
+		G_assert(__FILE__, __LINE__, "==============NNCV::B Status Failed==============", st.ok());
+		// For N=10, k=5, the first fold has empty train (start=0) and is skipped -> 4 usable folds.
+		G_assert(__FILE__, __LINE__, "==============NNCV::B FoldsUsed Failed==============", r.foldsUsed == 4u);
+	}
 
-    for (unsigned int i = 0; i < averageAccuracies.size(); ++i) {
-        printf("-----------------------------------\n");
-        printf("Network %d\n", i+1);
-        printf("Test Average accuracy %f\n", averageAccuracies[i]);
-        printf("-----------------------------------\n");
-    }
+	delete info;
 
-    for (unsigned int i = 0; i < averageAccuracies.size(); ++i) {
-        printf("-----------------------------------\n");
-        printf("Network %d\n", i+1);
-        printf("Validateion Average accuracy %f\n", validationAccuracies[i]);
-        printf("-----------------------------------\n");
-    }
-
-///////////////Timing series////////////
-    inputFName = "tscv.csv";
-    inputType = glades::DataInput::CSV;
-    //int inputType = glades::DataInput::IMAGE;
-    //int inputType = glades::DataInput::TEXT;
-    
-    if (inputType == glades::DataInput::CSV) {
-        inputFName = "datasets/" + inputFName;
-    }
-    else if (inputType == glades::DataInput::IMAGE) {
-        // inputFName = "datasets/images/" + inputFName + "/";
-    }
-    else if (inputType == glades::DataInput::TEXT) {
-	// TODO
-        return;
-    }
-    else
-        return;
-	    
-    // Load the input data to GTable
-    shmea::GTable inputTable = shmea::GTable(inputFName, ',', shmea::GTable::TYPE_FILE);
-    inputTable.standardize();
-
-    netName1 = "tscv";
-    glades::NNetwork rnnNetwork1;
-    netName2 = "tscv";
-    glades::NNetwork rnnNetwork2;
-
-    if ((rnnNetwork1.getEpochs() == 0) && (!rnnNetwork1.load(netName1))) {
-        printf("[NN] Unable to load \"%s\"", netName1.c_str());
-        return;
-    }
-
-    if ((rnnNetwork2.getEpochs() == 0) && (!rnnNetwork2.load(netName1))) {
-        printf("[NN] Unable to load \"%s\"", netName2.c_str());
-        return;
-    }
-
-    // Termination Conditions
-    rnnNetwork1.getTerminatorMutable().setEpoch(50000);
-    rnnNetwork1.getTerminatorMutable().setAccuracy(99);
-
-    rnnNetwork2.getTerminatorMutable().setEpoch(50000);
-    rnnNetwork2.getTerminatorMutable().setAccuracy(99);
-
-    std::vector<glades::NNetwork*> networks;
-    networks.push_back(&rnnNetwork1);
-    networks.push_back(&rnnNetwork2);
-
-    unsigned int foldsNum = 5;
-    bool timingSeries = true;
-    cMetaNetwork = glades::crossValidate(networks, inputTable, glades::DataInput::CSV, averageAccuracies, foldsNum, timingSeries);
-
-    for (unsigned int i = 0; i < averageAccuracies.size(); ++i) {
-        printf("-----------------------------------\n");
-        printf("Network %d\n", i+1);
-        printf("Average accuracy %f\n", averageAccuracies[i]);
-        printf("-----------------------------------\n");
-    }
-
+	printf("\n============================================================\n");
 }
 

@@ -26,5 +26,6 @@
 
 void NNUnitTest();
 void NNRecurrentUnitTest();
+void NNTransformerUnitTest();
 
 #endif

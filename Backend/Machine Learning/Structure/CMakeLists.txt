@@ -19,7 +19,3 @@ install(TARGETS MLStructure EXPORT gladesConfig
     ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR})
-
-install(EXPORT gladesConfig DESTINATION share/glades/cmake)
-
-export(TARGETS MLStructure FILE gladesConfig.cmake)

@@ -9,10 +9,13 @@ The engine is **deterministic by default**.
 
 - **RNG**
   - All ML randomness (weight init, dropout, etc.) must go through `glades::rng::*`.
-  - `Trainer::run()` installs the network’s RNG engine (`NNetwork::rngEngine`) as the thread-local
-    “current” RNG via `glades::rng::ScopedEngine`.
+  - ML code must draw randomness explicitly from an `Engine&` (typically `NNetwork::rngEngine`).
+    Do not rely on implicit global/TLS RNG state.
   - `NNetwork::setSeed(seed)` fully controls randomness for that network’s subsequent runs.
   - If you want different runs to be different, you must explicitly supply different seeds.
+  - Inference/generation APIs use per-call/per-request RNG engines and do **not** mutate
+    `NNetwork::rngEngine`. For stochastic sampling variation across calls, pass explicit
+    per-call seeds (e.g. `TransformerGenerateConfig::rngSeedOverride`).
 
 - **Data order**
   - Training and evaluation currently iterate data in a fixed order (no implicit shuffling).
@@ -34,7 +37,7 @@ The engine is **deterministic by default**.
 
 - **Multiple networks**
   - Different `NNetwork` instances **may** be run concurrently on different threads.
-  - RNG cross-talk is avoided because each thread uses its own thread-local “current RNG engine”.
+  - RNG cross-talk is avoided by using separate `Engine` instances per network/callsite.
 
 - **DataInput thread-safety**
   - `DataInput` implementations are not guaranteed to be thread-safe.

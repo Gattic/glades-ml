@@ -5,8 +5,6 @@
 
 #include "../DataObjects/DataInput.h"
 #include "../GMath/gmath.h"
-#include "../State/layer.h"
-#include "../State/node.h"
 
 #include <algorithm>
 #include <cmath>
@@ -28,7 +26,7 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 
 	// NOTE: Proper dropout-through-time requires saving/restoring dropout masks per timestep.
 	// For correctness, we disable per-timestep scrambling in the BPTT path.
-	meat.clearDropout();
+	// (dropout-through-time not implemented in this scalar BPTT path)
 
 	const unsigned int seqCount = di ? (isTrain ? di->getTrainSequenceCount() : di->getTestSequenceCount()) : 0;
 	if (seqCount == 0)
@@ -66,101 +64,21 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 	const float gradClip = trainingConfig.perElementGradClip;
 	const int costFx = skeleton->getOutputType();
 
-	// Layer pointers + sizes
-	std::vector<Layer*> hiddenLayers;
-	std::vector<unsigned int> hiddenSizes;
-	hiddenLayers.resize(H);
-	hiddenSizes.resize(H);
-	for (int l = 0; l < H; ++l)
+	// Ensure packed tensor parameters exist (modern/tensor-only).
+	if (!ensureTensorParametersInitialized())
 	{
-		hiddenLayers[l] = meat.getOutputLayer(static_cast<unsigned int>(l) + 1);
-		hiddenSizes[l] = meat.getLayerSize(static_cast<unsigned int>(l) + 1);
-		if (!hiddenLayers[l] || hiddenSizes[l] == 0)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_RNN: hidden layer pointer/size invalid");
-			running = false;
-			return;
-		}
+		running = false;
+		return;
 	}
-	Layer* outLayer = meat.getOutputLayer(static_cast<unsigned int>(H) + 1);
-	if (!outLayer)
+	if (!tensorRnn.initialized)
 	{
-		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_RNN: output layer is NULL");
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_RNN: tensor state not initialized");
 		running = false;
 		return;
 	}
 
-	// === Tensor-kernel vectorization: pack weights into contiguous arrays ===
-	// Initialize (or reinitialize) the tensor state if the network shape changed.
-	{
-		bool mismatch = (!tensorRnn.initialized) || (tensorRnn.inputSize != inputSize) || (tensorRnn.outSize != outSize) ||
-		                (tensorRnn.hiddenSizes != hiddenSizes) || (tensorRnn.H.size() != static_cast<size_t>(H));
-		if (mismatch)
-		{
-			tensorRnn.reset();
-			tensorRnn.initialized = true;
-			tensorRnn.inputSize = inputSize;
-			tensorRnn.outSize = outSize;
-			tensorRnn.hiddenSizes = hiddenSizes;
-			tensorRnn.H.resize(static_cast<size_t>(H));
-
-			for (int l = 0; l < H; ++l)
-			{
-				const unsigned int prevSize = (l == 0) ? inputSize : hiddenSizes[l - 1];
-				const unsigned int curSize = hiddenSizes[l];
-				TensorRNNState::Hidden& hl = tensorRnn.H[static_cast<size_t>(l)];
-				hl.in = prevSize;
-				hl.h = curSize;
-				hl.Wxh.assign(static_cast<size_t>(curSize) * static_cast<size_t>(prevSize), 0.0f);
-				hl.Whh.assign(static_cast<size_t>(curSize) * static_cast<size_t>(curSize), 0.0f);
-				hl.vWxh.assign(hl.Wxh.size(), 0.0f);
-				hl.vWhh.assign(hl.Whh.size(), 0.0f);
-				hl.gWxh.assign(hl.Wxh.size(), 0.0f);
-				hl.gWhh.assign(hl.Whh.size(), 0.0f);
-				hl.bias.assign(curSize, 0.0f);
-				hl.gBias.assign(curSize, 0.0f);
-
-				Layer* layer = hiddenLayers[l];
-				for (unsigned int i = 0; i < curSize; ++i)
-				{
-					Node* node = meat.getOutputNode(layer, i);
-					if (!node)
-						continue;
-					for (unsigned int p = 0; p < prevSize; ++p)
-						hl.Wxh[static_cast<size_t>(i) * static_cast<size_t>(prevSize) + p] = node->getEdgeWeight(rnn_wx_edge(p));
-					hl.bias[i] = node->getEdgeWeight(rnn_bias_edge(prevSize));
-					Node* ctx = node->getContextNode();
-					if (ctx)
-					{
-						for (unsigned int j = 0; j < curSize; ++j)
-							hl.Whh[static_cast<size_t>(i) * static_cast<size_t>(curSize) + j] = ctx->getEdgeWeight(rnn_wh_edge(j));
-					}
-				}
-			}
-
-			// Output transition
-			{
-				const unsigned int prevSize = hiddenSizes[H - 1];
-				tensorRnn.O.in = prevSize;
-				tensorRnn.O.out = outSize;
-				tensorRnn.O.Why.assign(static_cast<size_t>(outSize) * static_cast<size_t>(prevSize), 0.0f);
-				tensorRnn.O.vWhy.assign(tensorRnn.O.Why.size(), 0.0f);
-				tensorRnn.O.gWhy.assign(tensorRnn.O.Why.size(), 0.0f);
-				tensorRnn.O.bias.assign(outSize, 0.0f);
-				tensorRnn.O.gBias.assign(outSize, 0.0f);
-
-				for (unsigned int k = 0; k < outSize; ++k)
-				{
-					Node* node = meat.getOutputNode(outLayer, k);
-					if (!node)
-						continue;
-					for (unsigned int i = 0; i < prevSize; ++i)
-						tensorRnn.O.Why[static_cast<size_t>(k) * static_cast<size_t>(prevSize) + i] = node->getEdgeWeight(dense_weight_edge(i));
-					tensorRnn.O.bias[k] = node->getEdgeWeight(dense_bias_edge(prevSize));
-				}
-			}
-		}
-	}
+	// Sizes from tensor state (authoritative).
+	std::vector<unsigned int> hiddenSizes = tensorRnn.hiddenSizes;
 
 	// Reset per-epoch bookkeeping (RNN uses explicit per-sequence forward here).
 	results.clear();
@@ -175,8 +93,19 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 	// users expect when they configure a batch size.
 	//
 	// We now treat `minibatchSize` as "number of TBPTT windows to accumulate" before applying
-	// an update. The effective averaging divisor is the total number of timesteps across those
-	// windows, preserving the old behavior when minibatchSize==1.
+	// an update.
+	//
+	// IMPORTANT (minibatch semantics):
+	// For recurrent nets, a "batch element" is a TBPTT window (or a full sequence when tbptt==0).
+	// We optimize for *sequence/window-level* averaging (sample averaging), not token/timestep
+	// averaging:
+	// - Within a window of length winLen, we accumulate gradients as the mean over timesteps
+	//   (scale each timestep's gradient contribution by 1/winLen).
+	// - Across a minibatch group, we apply gradients as the mean over windows
+	//   (scale by 1/windowsInBatch in ApplyBatch()).
+	//
+	// This prevents longer sequences from dominating updates purely due to length and makes
+	// "batch size" behave as users expect for sequence data.
 	const unsigned int windowBatchMax =
 	    (minibatchSize > 0 ? static_cast<unsigned int>(minibatchSize) : 1u);
 	unsigned int windowsInBatch = 0u;
@@ -228,7 +157,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		float& lastGradNormScale;
 		NNetworkStatus& lastStatus;
 		bool& running;
-		bool& graphWeightsDirty;
 		TensorRNNState& tensorRnn;
 		int H;
 		unsigned int outSize;
@@ -241,20 +169,20 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		      lastGradNormScale(net.lastGradNormScale),
 		      lastStatus(net.lastStatus),
 		      running(net.running),
-		      graphWeightsDirty(net.graphWeightsDirty),
 		      tensorRnn(tr),
 		      H(h),
 		      outSize(os)
 		{
 		}
 
-		bool operator()(int batchCount) const
+		bool operator()(int windowsInBatch) const
 		{
 			using namespace glades::sgd_detail;
-			if (batchCount <= 0)
+			if (windowsInBatch <= 0)
 				return true;
 
-			const float invBatch = 1.0f / static_cast<float>(batchCount);
+			// NOTE: recurrent minibatch averaging is by windows/sequences, not timesteps.
+			const float invBatch = 1.0f / static_cast<float>(windowsInBatch);
 
 			// Output transition hyperparams live at index == H.
 			const unsigned int outIdx = static_cast<unsigned int>(H);
@@ -450,16 +378,12 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 				}
 			}
 
-			// Defer syncing tensors -> Node/Edge graph until an epoch boundary.
-			graphWeightsDirty = true;
 			return true;
 		}
 	};
 	ApplyBatch applyBatch(*this, tensorRnn, H, outSize);
 
-	// NOTE: overallTotalAccuracy is divided in run() by (meat.getInputLayersSize() * outSize).
-	// For RNNs, meat.getInputLayersSize() still equals the flat train row count, so we keep
-	// timestep-averaged reporting for compatibility.
+	// NOTE: overallTotalAccuracy is reported timestep-averaged for compatibility.
 
 	// Process each sequence independently (hidden state resets at each sequence boundary).
 	for (unsigned int s = 0; s < seqCount; ++s)
@@ -467,11 +391,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		const unsigned int seqLen = isTrain ? di->getTrainSequenceLength(s) : di->getTestSequenceLength(s);
 		if (seqLen == 0)
 			continue;
-
-		// Maintain historical semantics/visualization expectations:
-		// - context-node "state" is reset at each sequence boundary
-		// - context-node weight tracks the hidden activation after each timestep
-		meat.resetContextState(0.0f);
 
 		// Hidden state carried forward across TBPTT windows within a sequence.
 		std::vector< std::vector<float> > hPrev;
@@ -525,7 +444,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 				// Hidden layers
 				for (int l = 0; l < H; ++l)
 				{
-					Layer* curLayer = hiddenLayers[l];
 					const unsigned int curSize = hiddenSizes[l];
 					const unsigned int prevSize = (l == 0) ? inputSize : hiddenSizes[l - 1];
 					std::vector<float>& hL = hFlat[l];
@@ -541,10 +459,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 
 					for (unsigned int i = 0; i < curSize; ++i)
 					{
-						Node* node = meat.getOutputNode(curLayer, i);
-						if (!node)
-							continue;
-
 						TensorRNNState::Hidden& hl = tensorRnn.H[static_cast<size_t>(l)];
 						float net = (i < hl.bias.size()) ? hl.bias[i] : 0.0f;
 						// Feedforward contribution
@@ -556,8 +470,7 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 									: hFlat[l - 1][static_cast<size_t>(t) * static_cast<size_t>(hiddenSizes[l - 1]) + p];
 							net += hl.Wxh[static_cast<size_t>(i) * static_cast<size_t>(prevSize) + p] * inAct;
 						}
-						// Recurrent contribution (full matrix Wh row stored in context node edges)
-						Node* ctx = node->getContextNode();
+						// Recurrent contribution
 						for (unsigned int j = 0; j < curSize; ++j)
 							net += hl.Whh[static_cast<size_t>(i) * static_cast<size_t>(curSize) + j] * hPrev[l][j];
 
@@ -575,11 +488,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 							return;
 						}
 						hL[tOffCur + i] = a;
-
-						// Keep node weights aligned with the "current timestep" for visualization/tests.
-						node->setWeight(a);
-						if (ctx)
-							ctx->setWeight(a);
 					}
 
 					// Update carried state for next timestep
@@ -603,10 +511,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 					const size_t tOffOut = static_cast<size_t>(t) * static_cast<size_t>(outSize);
 					for (unsigned int k = 0; k < outSize; ++k)
 					{
-						Node* outNode = meat.getOutputNode(outLayer, k);
-						if (!outNode)
-							continue;
-
 						const unsigned int prevSize = hiddenSizes[H - 1];
 						float net = (k < tensorRnn.O.bias.size()) ? tensorRnn.O.bias[k] : 0.0f;
 						const size_t rowOff = static_cast<size_t>(k) * static_cast<size_t>(prevSize);
@@ -640,7 +544,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 								return;
 							}
 							yFlat[tOffOut + k] = a;
-							outNode->setWeight(a);
 						}
 					}
 
@@ -657,9 +560,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 								return;
 							}
 							yFlat[tOffOut + k] = p;
-							Node* outNode = meat.getOutputNode(outLayer, k);
-							if (outNode)
-								outNode->setWeight(outProbs[k]);
 						}
 					}
 				}
@@ -750,6 +650,10 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 					timeStepsInBatch = 0u;
 				}
 
+				// Per-window normalization so each window contributes equally regardless of winLen.
+				// This implements "mean loss per timestep within a window" semantics.
+				const float invWinLen = (winLen > 0u) ? (1.0f / static_cast<float>(winLen)) : 1.0f;
+
 				std::fill(deltaY.begin(), deltaY.end(), 0.0f);
 				for (int l = 0; l < H; ++l)
 				{
@@ -819,8 +723,8 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 							const size_t rowOff = static_cast<size_t>(k) * static_cast<size_t>(outIn);
 							const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(outIn);
 							for (unsigned int i = 0; i < outIn; ++i)
-								tensorRnn.O.gWhy[rowOff + i] += (deltaY[k] * hFlat[H - 1][hOff + i]);
-							tensorRnn.O.gBias[k] += deltaY[k];
+								tensorRnn.O.gWhy[rowOff + i] += (deltaY[k] * invWinLen) * hFlat[H - 1][hOff + i];
+							tensorRnn.O.gBias[k] += (deltaY[k] * invWinLen);
 						}
 					}
 
@@ -831,7 +735,6 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 						const int actFx = skeleton->getActivationType(actIdx);
 						const float actParam = skeleton->getActivationParam(actIdx);
 
-						Layer* curLayer = hiddenLayers[l];
 						const unsigned int curSize = hiddenSizes[l];
 						const unsigned int prevSize = (l == 0) ? inputSize : hiddenSizes[l - 1];
 						const size_t tOffCur = static_cast<size_t>(t) * static_cast<size_t>(curSize);
@@ -889,17 +792,17 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 									(l == 0)
 										? xFlat[static_cast<size_t>(t) * static_cast<size_t>(inputSize) + p]
 										: hFlat[l - 1][static_cast<size_t>(t) * static_cast<size_t>(hiddenSizes[l - 1]) + p];
-								hl.gWxh[static_cast<size_t>(i) * static_cast<size_t>(prevSize) + p] += (deltaH[l][i] * inAct);
+								hl.gWxh[static_cast<size_t>(i) * static_cast<size_t>(prevSize) + p] += (deltaH[l][i] * invWinLen) * inAct;
 							}
 
 							// Bias gradient
-							hl.gBias[i] += deltaH[l][i];
+							hl.gBias[i] += (deltaH[l][i] * invWinLen);
 
 							// Recurrent weight deltas: dWh_ij += delta_i(t) * h_j(t-1)
 							for (unsigned int j = 0; j < curSize; ++j)
 							{
 								const float prevH = hPrevAtTFlat[l][tOffCur + j];
-								hl.gWhh[static_cast<size_t>(i) * static_cast<size_t>(curSize) + j] += (deltaH[l][i] * prevH);
+								hl.gWhh[static_cast<size_t>(i) * static_cast<size_t>(curSize) + j] += (deltaH[l][i] * invWinLen) * prevH;
 							}
 						} // i
 					} // l
@@ -914,7 +817,7 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 				++windowsInBatch;
 				if (windowsInBatch >= windowBatchMax)
 				{
-					if (!applyBatch(static_cast<int>(timeStepsInBatch)))
+					if (!applyBatch(static_cast<int>(windowsInBatch)))
 						return;
 					windowsInBatch = 0u;
 					timeStepsInBatch = 0u;
@@ -926,9 +829,9 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 	} // sequences
 
 	// Flush any partial minibatch group.
-	if (runType == RUN_TRAIN && windowsInBatch > 0u && timeStepsInBatch > 0u)
+	if (runType == RUN_TRAIN && windowsInBatch > 0u)
 	{
-		if (!applyBatch(static_cast<int>(timeStepsInBatch)))
+		if (!applyBatch(static_cast<int>(windowsInBatch)))
 			return;
 		windowsInBatch = 0u;
 		timeStepsInBatch = 0u;

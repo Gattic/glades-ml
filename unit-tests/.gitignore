@@ -1,3 +1,7 @@
+build/*
 datasets/*.png
 database/models/
+database/mapped_datasets/
+database/tokeninput_ut/
+database/checkpoints/
 logs/

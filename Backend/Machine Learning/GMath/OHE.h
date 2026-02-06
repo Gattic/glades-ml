@@ -38,6 +38,9 @@ class OHE
 private:
 
 	shmea::GVector<shmea::GString> OHEStrings;
+	// Fast lookup from class string -> index in OHEStrings.
+	// NOTE: OHEStrings remains the source of truth for index->string ordering.
+	std::map<std::string, int> indexByString;
 	float fMin;
 	float fMax;
 	float fMean;

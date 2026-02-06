@@ -35,6 +35,7 @@ struct NNetworkEpochMetrics
 	      startingEpoch(0),
 	      epoch(0),
 	      totalError(0.0f),
+	      perplexity(0.0f),
 	      totalAccuracy(0.0f),
 	      regMAE(0.0f),
 	      regRMSE(0.0f),
@@ -58,6 +59,10 @@ struct NNetworkEpochMetrics
 	int epoch;
 
 	float totalError;
+	// Token LM extra (valid only when training a token language model):
+	// - totalError should be mean NLL per non-pad token (natural log)
+	// - perplexity = exp(totalError)
+	float perplexity;
 	// Meaning depends on outputType:
 	// - REGRESSION: totalError = MSE, totalAccuracy = R^2 * 100
 	// - CLASSIFICATION/KL: totalError = mean cross-entropy / KL per sample, totalAccuracy = overall (macro) accuracy * 100

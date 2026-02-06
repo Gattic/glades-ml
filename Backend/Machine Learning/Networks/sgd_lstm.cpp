@@ -5,8 +5,6 @@
 
 #include "../DataObjects/DataInput.h"
 #include "../GMath/gmath.h"
-#include "../State/layer.h"
-#include "../State/node.h"
 
 #include <algorithm>
 #include <cmath>
@@ -26,7 +24,7 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 	if (inputRowCounter != 0)
 		return;
 
-	meat.clearDropout();
+	// (dropout-through-time not implemented in this scalar BPTT path)
 
 	const unsigned int seqCount = di ? (isTrain ? di->getTrainSequenceCount() : di->getTestSequenceCount()) : 0;
 	if (seqCount == 0)
@@ -60,116 +58,21 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 	const float gradClip = trainingConfig.perElementGradClip;
 	const int costFx = skeleton->getOutputType();
 
-	std::vector<Layer*> hiddenLayers;
-	std::vector<unsigned int> hiddenSizes;
-	hiddenLayers.resize(H);
-	hiddenSizes.resize(H);
-	for (int l = 0; l < H; ++l)
+	// Ensure packed tensor parameters exist (modern/tensor-only).
+	if (!ensureTensorParametersInitialized())
 	{
-		hiddenLayers[l] = meat.getOutputLayer(static_cast<unsigned int>(l) + 1);
-		hiddenSizes[l] = meat.getLayerSize(static_cast<unsigned int>(l) + 1);
-		if (!hiddenLayers[l] || hiddenSizes[l] == 0)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_LSTM: hidden layer pointer/size invalid");
-			running = false;
-			return;
-		}
+		running = false;
+		return;
 	}
-	Layer* outLayer = meat.getOutputLayer(static_cast<unsigned int>(H) + 1);
-	if (!outLayer)
+	if (!tensorLstm.initialized)
 	{
-		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_LSTM: output layer is NULL");
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_LSTM: tensor state not initialized");
 		running = false;
 		return;
 	}
 
-	// === Tensor-kernel vectorization: pack weights into contiguous arrays ===
-	{
-		const unsigned int gateCount = 4u;
-		bool mismatch = (!tensorLstm.initialized) || (tensorLstm.inputSize != inputSize) || (tensorLstm.outSize != outSize) ||
-		                (tensorLstm.hiddenSizes != hiddenSizes) || (tensorLstm.H.size() != static_cast<size_t>(H)) ||
-		                (tensorLstm.gateCount != gateCount);
-		if (mismatch)
-		{
-			tensorLstm.reset();
-			tensorLstm.initialized = true;
-			tensorLstm.inputSize = inputSize;
-			tensorLstm.outSize = outSize;
-			tensorLstm.gateCount = gateCount;
-			tensorLstm.hiddenSizes = hiddenSizes;
-			tensorLstm.H.resize(static_cast<size_t>(H));
-
-			for (int l = 0; l < H; ++l)
-			{
-				const unsigned int prevSize = (l == 0) ? inputSize : hiddenSizes[l - 1];
-				const unsigned int curSize = hiddenSizes[l];
-				TensorGatedState::Hidden& hl = tensorLstm.H[static_cast<size_t>(l)];
-				hl.in = prevSize;
-				hl.h = curSize;
-				hl.W.assign(static_cast<size_t>(gateCount) * static_cast<size_t>(curSize) * static_cast<size_t>(prevSize), 0.0f);
-				hl.U.assign(static_cast<size_t>(gateCount) * static_cast<size_t>(curSize) * static_cast<size_t>(curSize), 0.0f);
-				hl.vW.assign(hl.W.size(), 0.0f);
-				hl.vU.assign(hl.U.size(), 0.0f);
-				hl.gW.assign(hl.W.size(), 0.0f);
-				hl.gU.assign(hl.U.size(), 0.0f);
-				hl.bias.assign(static_cast<size_t>(gateCount) * static_cast<size_t>(curSize), 0.0f);
-				hl.gBias.assign(hl.bias.size(), 0.0f);
-
-				Layer* layer = hiddenLayers[l];
-				const Gated layout = {prevSize, curSize, gateCount};
-				for (unsigned int i = 0; i < curSize; ++i)
-				{
-					Node* node = meat.getOutputNode(layer, i);
-					if (!node)
-						continue;
-					Node* ctx = node->getContextNode();
-					for (unsigned int g = 0; g < gateCount; ++g)
-					{
-						for (unsigned int p = 0; p < prevSize; ++p)
-						{
-							const size_t wIdx = (static_cast<size_t>(g) * static_cast<size_t>(curSize) + static_cast<size_t>(i)) *
-							                    static_cast<size_t>(prevSize) +
-							                    static_cast<size_t>(p);
-							hl.W[wIdx] = node->getEdgeWeight(layout.w_edge(g, p));
-						}
-						hl.bias[static_cast<size_t>(g) * static_cast<size_t>(curSize) + static_cast<size_t>(i)] = node->getEdgeWeight(layout.b_edge(g));
-						if (ctx)
-						{
-							for (unsigned int j = 0; j < curSize; ++j)
-							{
-								const size_t uIdx = (static_cast<size_t>(g) * static_cast<size_t>(curSize) + static_cast<size_t>(i)) *
-								                    static_cast<size_t>(curSize) +
-								                    static_cast<size_t>(j);
-								hl.U[uIdx] = ctx->getEdgeWeight(layout.u_edge(g, j));
-							}
-						}
-					}
-				}
-			}
-
-			// Output transition
-			{
-				const unsigned int prevSize = hiddenSizes[H - 1];
-				tensorLstm.O.in = prevSize;
-				tensorLstm.O.out = outSize;
-				tensorLstm.O.Why.assign(static_cast<size_t>(outSize) * static_cast<size_t>(prevSize), 0.0f);
-				tensorLstm.O.vWhy.assign(tensorLstm.O.Why.size(), 0.0f);
-				tensorLstm.O.gWhy.assign(tensorLstm.O.Why.size(), 0.0f);
-				tensorLstm.O.bias.assign(outSize, 0.0f);
-				tensorLstm.O.gBias.assign(outSize, 0.0f);
-
-				for (unsigned int k = 0; k < outSize; ++k)
-				{
-					Node* node = meat.getOutputNode(outLayer, k);
-					if (!node)
-						continue;
-					for (unsigned int i = 0; i < prevSize; ++i)
-						tensorLstm.O.Why[static_cast<size_t>(k) * static_cast<size_t>(prevSize) + i] = node->getEdgeWeight(dense_weight_edge(i));
-					tensorLstm.O.bias[k] = node->getEdgeWeight(dense_bias_edge(prevSize));
-				}
-			}
-		}
-	}
+	// Sizes from tensor state (authoritative).
+	std::vector<unsigned int> hiddenSizes = tensorLstm.hiddenSizes;
 
 	results.clear();
 	// Evaluation should not destroy any caller-visible training records.
@@ -266,7 +169,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 		float& lastGradNormScale;
 		NNetworkStatus& lastStatus;
 		bool& running;
-		bool& graphWeightsDirty;
 		TensorGatedState& tensorLstm;
 		int H;
 		unsigned int outSize;
@@ -279,19 +181,19 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 		      lastGradNormScale(net.lastGradNormScale),
 		      lastStatus(net.lastStatus),
 		      running(net.running),
-		      graphWeightsDirty(net.graphWeightsDirty),
 		      tensorLstm(tl),
 		      H(h),
 		      outSize(os)
 		{
 		}
 
-		bool operator()(int batchCount) const
+		bool operator()(int windowsInBatch) const
 		{
 			using namespace glades::sgd_detail;
-			if (batchCount <= 0)
+			if (windowsInBatch <= 0)
 				return true;
-			const float invBatch = 1.0f / static_cast<float>(batchCount);
+			// NOTE: recurrent minibatch averaging is by windows/sequences, not timesteps.
+			const float invBatch = 1.0f / static_cast<float>(windowsInBatch);
 
 			// Output transition hyperparams live at index == H
 			const unsigned int outIdx = static_cast<unsigned int>(H);
@@ -481,7 +383,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 				}
 			}
 
-			graphWeightsDirty = true;
 			return true;
 		}
 	};
@@ -498,8 +399,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 		const unsigned int seqLen = isTrain ? di->getTrainSequenceLength(s) : di->getTestSequenceLength(s);
 		if (seqLen == 0)
 			continue;
-
-		meat.resetContextState(0.0f);
 
 		std::vector< std::vector<float> > hPrev;
 		std::vector< std::vector<float> > cPrev;
@@ -563,7 +462,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 
 				for (int l = 0; l < H; ++l)
 				{
-					Layer* curLayer = hiddenLayers[l];
 					const unsigned int curSize = hiddenSizes[l];
 					const unsigned int prevSize = (l == 0) ? inputSize : hiddenSizes[l - 1];
 					const Gated layout = {prevSize, curSize, gateCount};
@@ -578,11 +476,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 
 					for (unsigned int u = 0; u < curSize; ++u)
 					{
-						Node* node = meat.getOutputNode(curLayer, u);
-						if (!node)
-							continue;
-						Node* ctx = node->getContextNode();
-
 						float netI = th.bias[static_cast<size_t>(GI) * static_cast<size_t>(curSize) + static_cast<size_t>(u)];
 						float netF = th.bias[static_cast<size_t>(GF) * static_cast<size_t>(curSize) + static_cast<size_t>(u)];
 						float netO = th.bias[static_cast<size_t>(GO) * static_cast<size_t>(curSize) + static_cast<size_t>(u)];
@@ -656,11 +549,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 							return;
 						}
 						hFlat[l][tOffCur + u] = hNew;
-
-						node->setWeight(hNew);
-						node->setCellState(cNew);
-						if (ctx)
-							ctx->setWeight(hNew);
 					}
 
 					for (unsigned int i = 0; i < curSize; ++i)
@@ -686,10 +574,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 					const size_t tOffOut = static_cast<size_t>(t) * static_cast<size_t>(outSize);
 					for (unsigned int k = 0; k < outSize; ++k)
 					{
-						Node* outNode = meat.getOutputNode(outLayer, k);
-						if (!outNode)
-							continue;
-
 						const unsigned int prevSize = hiddenSizes[H - 1];
 						float net = (k < tensorLstm.O.bias.size()) ? tensorLstm.O.bias[k] : 0.0f;
 						const size_t rowOff = static_cast<size_t>(k) * static_cast<size_t>(prevSize);
@@ -715,7 +599,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 								return;
 							}
 							yFlat[tOffOut + k] = a;
-							outNode->setWeight(a);
 						}
 					}
 
@@ -732,9 +615,6 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 								return;
 							}
 							yFlat[tOffOut + k] = p;
-							Node* outNode = meat.getOutputNode(outLayer, k);
-							if (outNode)
-								outNode->setWeight(outProbs[k]);
 						}
 					}
 				}
@@ -825,6 +705,9 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 					timeStepsInBatch = 0u;
 				}
 
+				// Per-window normalization so each window contributes equally regardless of winLen.
+				const float invWinLen = (winLen > 0u) ? (1.0f / static_cast<float>(winLen)) : 1.0f;
+
 				std::fill(deltaY.begin(), deltaY.end(), 0.0f);
 				for (int l = 0; l < H; ++l)
 				{
@@ -892,15 +775,14 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 							const size_t rowOff = static_cast<size_t>(k) * static_cast<size_t>(outIn);
 							const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(outIn);
 							for (unsigned int i = 0; i < outIn; ++i)
-								tensorLstm.O.gWhy[rowOff + i] += (deltaY[k] * hFlat[H - 1][hOff + i]);
-							tensorLstm.O.gBias[k] += deltaY[k];
+								tensorLstm.O.gWhy[rowOff + i] += (deltaY[k] * invWinLen) * hFlat[H - 1][hOff + i];
+							tensorLstm.O.gBias[k] += (deltaY[k] * invWinLen);
 						}
 					}
 
 					dInputFromAbove = NULL;
 					for (int l = H - 1; l >= 0; --l)
 					{
-						Layer* curLayer = hiddenLayers[l];
 						const unsigned int curSize = hiddenSizes[l];
 						const unsigned int prevSize = (l == 0) ? inputSize : hiddenSizes[l - 1];
 						const Gated layout = {prevSize, curSize, gateCount};
@@ -1023,16 +905,16 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 								    (l == 0)
 								        ? xFlat[static_cast<size_t>(t) * static_cast<size_t>(inputSize) + p]
 								        : hFlat[l - 1][static_cast<size_t>(t) * static_cast<size_t>(hiddenSizes[l - 1]) + p];
-								thl.gW[wiOff + p] += (daI[u] * inAct);
-								thl.gW[wfOff + p] += (daF[u] * inAct);
-								thl.gW[woOff + p] += (daO[u] * inAct);
-								thl.gW[wgOff + p] += (daG[u] * inAct);
+								thl.gW[wiOff + p] += (daI[u] * invWinLen) * inAct;
+								thl.gW[wfOff + p] += (daF[u] * invWinLen) * inAct;
+								thl.gW[woOff + p] += (daO[u] * invWinLen) * inAct;
+								thl.gW[wgOff + p] += (daG[u] * invWinLen) * inAct;
 							}
 
-							thl.gBias[static_cast<size_t>(GI) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += daI[u];
-							thl.gBias[static_cast<size_t>(GF) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += daF[u];
-							thl.gBias[static_cast<size_t>(GO) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += daO[u];
-							thl.gBias[static_cast<size_t>(GG) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += daG[u];
+							thl.gBias[static_cast<size_t>(GI) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += (daI[u] * invWinLen);
+							thl.gBias[static_cast<size_t>(GF) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += (daF[u] * invWinLen);
+							thl.gBias[static_cast<size_t>(GO) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += (daO[u] * invWinLen);
+							thl.gBias[static_cast<size_t>(GG) * static_cast<size_t>(curSize) + static_cast<size_t>(u)] += (daG[u] * invWinLen);
 
 							const size_t uiOff = (static_cast<size_t>(GI) * static_cast<size_t>(curSize) + static_cast<size_t>(u)) * static_cast<size_t>(curSize);
 							const size_t ufOff = (static_cast<size_t>(GF) * static_cast<size_t>(curSize) + static_cast<size_t>(u)) * static_cast<size_t>(curSize);
@@ -1041,10 +923,10 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 							for (unsigned int j = 0; j < curSize; ++j)
 							{
 								const float prevH = hPrevAtTFlat[l][tOffCur + j];
-								thl.gU[uiOff + j] += (daI[u] * prevH);
-								thl.gU[ufOff + j] += (daF[u] * prevH);
-								thl.gU[uoOff + j] += (daO[u] * prevH);
-								thl.gU[ugOff + j] += (daG[u] * prevH);
+								thl.gU[uiOff + j] += (daI[u] * invWinLen) * prevH;
+								thl.gU[ufOff + j] += (daF[u] * invWinLen) * prevH;
+								thl.gU[uoOff + j] += (daO[u] * invWinLen) * prevH;
+								thl.gU[ugOff + j] += (daG[u] * invWinLen) * prevH;
 							}
 						}
 
@@ -1057,7 +939,7 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 				++windowsInBatch;
 				if (windowsInBatch >= windowBatchMax)
 				{
-					if (!applyBatch(static_cast<int>(timeStepsInBatch)))
+					if (!applyBatch(static_cast<int>(windowsInBatch)))
 						return;
 					windowsInBatch = 0u;
 					timeStepsInBatch = 0u;
@@ -1069,9 +951,9 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 	} // sequences
 
 	// Flush any partial minibatch group.
-	if (runType == RUN_TRAIN && windowsInBatch > 0u && timeStepsInBatch > 0u)
+	if (runType == RUN_TRAIN && windowsInBatch > 0u)
 	{
-		if (!applyBatch(static_cast<int>(timeStepsInBatch)))
+		if (!applyBatch(static_cast<int>(windowsInBatch)))
 			return;
 		windowsInBatch = 0u;
 		timeStepsInBatch = 0u;

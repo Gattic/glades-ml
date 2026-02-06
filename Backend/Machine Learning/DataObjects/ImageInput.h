@@ -37,13 +37,6 @@ public:
 	shmea::GTable trainingLegend;
 	shmea::GTable testingLegend;
 
-	// <Label, <Path, Image> >
-	//
-	// NOTE (2026): legacy field kept for source compatibility only.
-	// ImageInput now streams images from disk (no eager preload into RAM).
-	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > trainImages;
-	std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > > testImages;
-
 	shmea::GVector<float> emptyRow;
 	shmea::GString name;
 	bool loaded;
@@ -80,8 +73,6 @@ public:
 	    loaded = false;
 	    trainingLegend.clear();
 	    testingLegend.clear();
-	    trainImages.clear();
-	    testImages.clear();
 	    trainingPaths.clear();
 	    testingPaths.clear();
 	    featureCount = 0;
@@ -96,8 +87,6 @@ public:
 	    loaded = false;
 	    trainingLegend.clear();
 	    testingLegend.clear();
-	    trainImages.clear();
-	    testImages.clear();
 	    trainingPaths.clear();
 	    testingPaths.clear();
 	    featureCount = 0;
@@ -105,7 +94,7 @@ public:
 	    rowCache.clear();
 	}
 
-	void importHelper(shmea::GTable&, std::vector<shmea::GPointer<OHE> >&, std::vector<bool>&, std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > >&);
+	void importHelper(shmea::GTable&, std::vector<shmea::GPointer<OHE> >&, std::vector<bool>&);
 
 	virtual void import(shmea::GString, int = 0);
 	virtual void import(const shmea::GTable&, int = 0);

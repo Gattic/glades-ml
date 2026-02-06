@@ -6,7 +6,7 @@ set (CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "default install path" 
 file(MAKE_DIRECTORY ${CMAKE_INSTALL_PREFIX}/include)
 
 #Init
-cmake_minimum_required(VERSION 3.5.1)
+cmake_minimum_required(VERSION 3.10)
 set(CMAKE_CXX_STANDARD 98)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -35,6 +35,11 @@ include(GNUInstallDirs)
 
 #Import libs
 find_package(shmea REQUIRED)
+
+# Prefer the in-tree build of glades (../build) when present.
+# This avoids accidentally linking unit tests against an older installed copy.
+# The glades root build exports `gladesConfig.cmake` into its build directory.
+list(APPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/../build")
 find_package(glades REQUIRED)
 find_package(Freetype REQUIRED)
 

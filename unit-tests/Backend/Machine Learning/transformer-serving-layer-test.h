@@ -14,20 +14,10 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-//
-// TrainingCore is retained as a stable API surface for existing callers.
-// The training loop is implemented by `Trainer` to separate training orchestration from model code.
-//
-#include "training_core.h"
+#ifndef _UT_TRANSFORMER_SERVING_LAYER
+#define _UT_TRANSFORMER_SERVING_LAYER
 
-#include "network.h"
-#include "trainer.h"
+void TransformerServingLayerUnitTest();
 
-glades::NNetworkStatus glades::TrainingCore::run(glades::NNetwork& net,
-                                                const glades::DataInput* data,
-                                                int runType,
-                                                glades::ITrainingCallbacks* callbacks)
-{
-	return glades::Trainer::run(net, data, runType, callbacks);
-}
+#endif
 

@@ -16,69 +16,125 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include "ohe-test.h"
-#include "Backend/Database/GTable.h"
 
 #include "../../unit-test.h"
-#include "Backend/Database/GList.h"
-#include "../../../Backend/Machine Learning/GMath/OHE.h"
-#include "Backend/Database/GString.h"
-#include "Backend/Database/GList.h"
-#include "Backend/Database/GType.h"
-#include "Backend/Database/GString.h"
-#include "Backend/Database/GVector.h"
 
+#include <string>
+
+#include "Backend/Database/GTable.h"
+#include "Backend/Database/GVector.h"
+#include "../../../Backend/Machine Learning/GMath/OHE.h"
 
 // === Primary unit testing function ===
 // void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
 
-void OHEUnitTest() {
-    // Check Initialization of object
-    glades::OHE ohe;
-    G_assert(__FILE__, __LINE__, "Initialization failed: OHE size is not 0", ohe.size() == 0);
+static bool vec_is_one_hot_at(const shmea::GVector<float>& v, unsigned int hotIdx)
+{
+	if (v.size() == 0u)
+		return false;
+	for (unsigned int i = 0; i < v.size(); ++i)
+	{
+		const float want = (i == hotIdx) ? 1.0f : 0.0f;
+		if (v[i] != want)
+			return false;
+	}
+	return true;
+}
 
-    //  Add strings and verify
-    ohe.addString("cat");
-    ohe.addString("dog");
-    ohe.addString("cat"); // Duplicate
+static bool vec_is_all_zeros(const shmea::GVector<float>& v)
+{
+	for (unsigned int i = 0; i < v.size(); ++i)
+		if (v[i] != 0.0f)
+			return false;
+	return true;
+}
 
-// Test Duplicate string handling
-    G_assert(__FILE__, __LINE__, "Failed to add strings or handle duplicates correctly", ohe.size() == 2);
-    G_assert(__FILE__, __LINE__, "OHE does not contain 'cat'", ohe.contains("cat"));
-    G_assert(__FILE__, __LINE__, "OHE does not contain 'dog'", ohe.contains("dog"));
+static std::string to_std_string_safe(const shmea::GString& s)
+{
+	const char* p = s.c_str();
+	return p ? std::string(p) : std::string();
+}
 
-    //  One-hot encoding vector for strings
-    shmea::GVector<float> catEncoding = ohe["cat"];
-    shmea::GVector<float> dogEncoding = ohe["dog"];
+void OHEUnitTest()
+{
+	// Basic construction
+	{
+		glades::OHE ohe;
+		G_assert(__FILE__, __LINE__, "Initialization failed: OHE size is not 0", ohe.size() == 0u);
+		G_assert(__FILE__, __LINE__, "Initialization failed: contains() should be false", !ohe.contains("cat"));
+		G_assert(__FILE__, __LINE__, "Initialization failed: indexAt() should be -1", ohe.indexAt("cat") == -1);
+	}
 
-    G_assert(__FILE__, __LINE__, "One-hot encoding size mismatch", catEncoding.size() == 2);
-    G_assert(__FILE__, __LINE__, "One-hot encoding size mismatch", dogEncoding.size() == 2);
-    G_assert(__FILE__, __LINE__, "One-hot encoding mismatch for 'cat'", catEncoding[0] == 0.99f && catEncoding[1] == 0.01f);
-    G_assert(__FILE__, __LINE__, "One-hot encoding mismatch for 'dog'", dogEncoding[0] == 0.01f && dogEncoding[1] == 0.99f);
+	// addString()/contains()/indexAt()/operator[] encoding
+	{
+		glades::OHE ohe;
+		ohe.addString("cat");
+		ohe.addString("dog");
+		ohe.addString("cat"); // duplicate
 
+		G_assert(__FILE__, __LINE__, "Failed to add strings or handle duplicates correctly", ohe.size() == 2u);
+		G_assert(__FILE__, __LINE__, "OHE does not contain 'cat'", ohe.contains("cat"));
+		G_assert(__FILE__, __LINE__, "OHE does not contain 'dog'", ohe.contains("dog"));
 
-    // Index retrieval for strings
-    G_assert(__FILE__, __LINE__, "Index retrieval for 'cat' failed", ohe.indexAt("cat") == 0);
-    G_assert(__FILE__, __LINE__, "Index retrieval for 'dog' failed", ohe.indexAt("dog") == 1);
-    G_assert(__FILE__, __LINE__, "Index retrieval for non-existing string failed", ohe.indexAt("bird") == -1);
+		G_assert(__FILE__, __LINE__, "Index retrieval for 'cat' failed", ohe.indexAt("cat") == 0);
+		G_assert(__FILE__, __LINE__, "Index retrieval for 'dog' failed", ohe.indexAt("dog") == 1);
+		G_assert(__FILE__, __LINE__, "Index retrieval for non-existing string failed", ohe.indexAt("bird") == -1);
 
+		const shmea::GVector<float> catEnc = ohe["cat"];
+		const shmea::GVector<float> dogEnc = ohe["dog"];
+		const shmea::GVector<float> birdEnc = ohe["bird"]; // unknown => all-zeros
 
-      
-    // Test mapFeatureSpace
-  	shmea::GString sampleData( "First,Last,Age\nMickey,Mouse,100\nDonald,Duck,99\n" );
-	shmea::GTable sampleDataTable( sampleData, ',', shmea::GTable::TYPE_STRING );
+		G_assert(__FILE__, __LINE__, "One-hot encoding size mismatch", catEnc.size() == 2u);
+		G_assert(__FILE__, __LINE__, "One-hot encoding size mismatch", dogEnc.size() == 2u);
+		G_assert(__FILE__, __LINE__, "Unknown encoding size mismatch", birdEnc.size() == 2u);
 
-    ohe.mapFeatureSpace(sampleDataTable, 0); // Column 0
+		G_assert(__FILE__, __LINE__, "One-hot encoding mismatch for 'cat' (must be strict 0/1)", vec_is_one_hot_at(catEnc, 0u));
+		G_assert(__FILE__, __LINE__, "One-hot encoding mismatch for 'dog' (must be strict 0/1)", vec_is_one_hot_at(dogEnc, 1u));
+		G_assert(__FILE__, __LINE__, "Unknown encoding must be all-zeros", vec_is_all_zeros(birdEnc));
 
-    G_assert(__FILE__, __LINE__, "Failed to get string 'Mickey'", ohe.contains("Mickey"));
-    G_assert(__FILE__, __LINE__, "Failed to get string 'Donald'", ohe.contains("Donald"));
-    
-    
-    // Test Print features (visual validation or mock testing for printf)
-    ohe.printFeatures(); // Expected output: "[OHE] cat dog Mickey Donald "
+		// Decode (int one-hot) and (float argmax)
+		shmea::GVector<int> catInt(2u, 0);
+		catInt[0] = 1;
+		shmea::GVector<float> dogFloat(2u, 0.0f);
+		dogFloat[1] = 0.25f;
+		dogFloat[0] = 0.10f;
 
-  
-    printf("OHEUnitTest completed successfully.\n");
+		const shmea::GString catDec = ohe[catInt];
+		const shmea::GString dogDec = ohe[dogFloat];
+		G_assert(__FILE__, __LINE__, "Decode from int one-hot failed", to_std_string_safe(catDec) == "cat");
+		G_assert(__FILE__, __LINE__, "Decode from float argmax failed", to_std_string_safe(dogDec) == "dog");
 
+		shmea::GVector<float> allZero(2u, 0.0f);
+		const shmea::GString unkDec = ohe[allZero];
+		G_assert(__FILE__, __LINE__, "All-zeros decode should return empty string", to_std_string_safe(unkDec).empty());
+	}
+
+	// Copy constructor must preserve lookup behavior (indexByString rebuilt)
+	{
+		glades::OHE ohe;
+		ohe.addString("red");
+		ohe.addString("green");
+		ohe.addString("blue");
+
+		glades::OHE copy(ohe);
+		G_assert(__FILE__, __LINE__, "Copy ctor: size mismatch", copy.size() == ohe.size());
+		G_assert(__FILE__, __LINE__, "Copy ctor: indexAt mismatch for 'red'", copy.indexAt("red") == ohe.indexAt("red"));
+		G_assert(__FILE__, __LINE__, "Copy ctor: indexAt mismatch for 'blue'", copy.indexAt("blue") == ohe.indexAt("blue"));
+		G_assert(__FILE__, __LINE__, "Copy ctor: unknown lookup should be -1", copy.indexAt("purple") == -1);
+	}
+
+	// mapFeatureSpace() should add unique string values from a column
+	{
+		shmea::GString sampleData("First,Last,Age\nMickey,Mouse,100\nDonald,Duck,99\nMickey,Mouse,101\n");
+		shmea::GTable tbl(sampleData, ',', shmea::GTable::TYPE_STRING);
+
+		glades::OHE ohe;
+		ohe.mapFeatureSpace(tbl, 0); // First name column
+
+		G_assert(__FILE__, __LINE__, "mapFeatureSpace: missing 'Mickey'", ohe.contains("Mickey"));
+		G_assert(__FILE__, __LINE__, "mapFeatureSpace: missing 'Donald'", ohe.contains("Donald"));
+		G_assert(__FILE__, __LINE__, "mapFeatureSpace: expected 2 unique strings in column", ohe.size() == 2u);
+	}
 }
 
 

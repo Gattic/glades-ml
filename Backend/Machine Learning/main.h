@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "Backend/Database/GPointer.h"
+#include "Networks/metanetwork.h" // ensure MetaNetwork is complete for GPointer default deleter
 
 namespace shmea {
 class GTable;
@@ -41,10 +42,8 @@ class Connection;
 
 namespace glades {
 class NNInfo;
-class MetaNetwork;
 class NNetwork;
 class RNN;
-class Layer;
 class DataInput;
 
 void init();
@@ -60,10 +59,6 @@ MetaNetwork* train(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connec
 MetaNetwork* test(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* test(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* test(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* crossValidate(NNInfo*, std::string, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* crossValidate(std::string, std::vector<std::string>, float, bool, int, GNet::GServer* = NULL, GNet::Connection* = NULL);
-MetaNetwork* crossValidate(std::vector<glades::NNetwork*>, const shmea::GTable&, const int, std::vector<float>&, unsigned int = 5, bool = false);
-MetaNetwork* crossValidate(std::vector<glades::NNetwork*>, const shmea::GTable&, const int, std::vector<float>&, std::vector<float>&, unsigned int = 10, unsigned int = 20);
 
 // Safer ownership API: returns RAII pointer (ref-counted).
 //

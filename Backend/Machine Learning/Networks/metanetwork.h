@@ -30,7 +30,6 @@ namespace glades {
 
 class NNInfo;
 class NNetwork;
-class DataInput;
 
 class MetaNetwork
 {
@@ -65,11 +64,6 @@ public:
 	NNetwork* getSubnet(unsigned int);
 	shmea::GString getSubnetName(unsigned int) const;
 	NNetwork* getSubnetByName(shmea::GString) const;
-
-	// verification functions
-	void crossValidate(shmea::GString, DataInput*);
-    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, unsigned int = 5, bool = false);
-    void crossValidate(const shmea::GTable&, const int, std::vector<glades::NNetwork*>&, std::vector<float>&, std::vector<float>&, unsigned int = 10, unsigned int = 20);
 };
 };
 

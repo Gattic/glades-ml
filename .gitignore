@@ -2,7 +2,6 @@
 callgrind.*
 .DS_Store
 build/*
-unit-tests/build/*
 database/*
 *.sublime-workspace
 *.swp

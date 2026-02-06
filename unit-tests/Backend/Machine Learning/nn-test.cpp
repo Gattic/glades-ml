@@ -14,289 +14,1180 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #include "nn-test.h"
 #include "../../unit-test.h"
-#include "Backend/Database/GList.h"
-#include "../../../Backend/Machine Learning/main.h"
+
 #include "../../../Backend/Machine Learning/Networks/network.h"
-#include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
+#include "../../../Backend/Machine Learning/Networks/training_callbacks.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
+#include "../../../Backend/Machine Learning/DataObjects/TokenInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
-#include "../../../Backend/Machine Learning/State/Terminator.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_ops.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/hiddenlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/outputlayerinfo.h"
-#include "../../../Backend/Machine Learning/State/node.h"
-#include <cmath>
 
-// === This is the primary unit testing function:
-// void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool expr)
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <sys/stat.h>
+
+namespace {
+struct EnvVarGuard
+{
+	std::string name;
+	bool hadOld;
+	std::string oldValue;
+
+	explicit EnvVarGuard(const char* n)
+	    : name(n ? n : ""),
+	      hadOld(false),
+	      oldValue()
+	{
+		if (!name.empty())
+		{
+			const char* v = ::getenv(name.c_str());
+			if (v)
+			{
+				hadOld = true;
+				oldValue = v;
+			}
+		}
+	}
+
+	void set(const char* v)
+	{
+		if (name.empty())
+			return;
+#if defined(_WIN32)
+		// Windows CRT: set/unset via putenv style.
+		// _putenv_s(name, "") unsets.
+		(void)::_putenv_s(name.c_str(), v ? v : "");
+#else
+		(void)::setenv(name.c_str(), v ? v : "", 1);
+#endif
+	}
+
+	void unset()
+	{
+		if (name.empty())
+			return;
+#if defined(_WIN32)
+		(void)::_putenv_s(name.c_str(), "");
+#else
+		(void)::unsetenv(name.c_str());
+#endif
+	}
+
+	~EnvVarGuard()
+	{
+		if (name.empty())
+			return;
+		if (hadOld)
+			set(oldValue.c_str());
+		else
+			unset();
+	}
+
+private:
+	EnvVarGuard(const EnvVarGuard&);
+	EnvVarGuard& operator=(const EnvVarGuard&);
+};
+
+struct CaptureEpochMetricsCb : public glades::ITrainingCallbacks
+{
+	glades::NNetworkEpochMetrics last;
+	bool saw;
+	CaptureEpochMetricsCb() : last(), saw(false) {}
+	virtual void onRunStart(const glades::NNetwork&, int) {}
+	virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
+	{
+		last = m;
+		saw = true;
+		return false;
+	}
+	virtual void onRunEnd(const glades::NNetwork&, int) {}
+};
+
+struct StopAtMinThen100Cb : public glades::ITrainingCallbacks
+{
+	glades::NNetworkEpochMetrics last;
+	bool saw;
+	bool reached;
+	int minEpochs;
+	int maxEpochs;
+	StopAtMinThen100Cb(int minE, int maxE) : last(), saw(false), reached(false), minEpochs(minE), maxEpochs(maxE) {}
+	virtual void onRunStart(const glades::NNetwork&, int) {}
+	virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
+	{
+		last = m;
+		saw = true;
+
+		if (maxEpochs > 0 && m.epoch >= maxEpochs)
+			return true;
+
+		if (m.epoch >= minEpochs && m.totalAccuracy >= 100.0f - 1e-6f)
+		{
+			reached = true;
+			return true;
+		}
+		return false;
+	}
+	virtual void onRunEnd(const glades::NNetwork&, int) {}
+};
+
+// In-memory token-id dataset for token language model tests.
+//
+// IMPORTANT:
+// Token LM training now requires integer token-id accessors (`get*TokenId` / `get*ExpectedTokenId`).
+// This DataInput provides those without representing token IDs as floats internally.
+class InMemoryTokenIdInput : public glades::DataInput
+{
+public:
+	InMemoryTokenIdInput()
+	    : padTokenId(-1),
+	      scratchTok(0.0f),
+	      scratchNext(0.0f),
+	      one(1, 0.0f),
+	      empty()
+	{
+	}
+
+	void setTrainTokens(const std::vector<unsigned int>& toks, int pad)
+	{
+		padTokenId = pad;
+		trainTok.clear();
+		trainNextTok.clear();
+		trainTok.reserve(toks.size());
+		for (size_t i = 0; i < toks.size(); ++i)
+			trainTok.push_back(static_cast<int>(toks[i]));
+		build_next(trainTok, padTokenId, trainNextTok);
+	}
+
+	void setTestTokens(const std::vector<unsigned int>& toks, int pad)
+	{
+		padTokenId = pad;
+		testTok.clear();
+		testNextTok.clear();
+		testTok.reserve(toks.size());
+		for (size_t i = 0; i < toks.size(); ++i)
+			testTok.push_back(static_cast<int>(toks[i]));
+		build_next(testTok, padTokenId, testNextTok);
+	}
+
+	void mirrorTrainToTest()
+	{
+		testTok = trainTok;
+		testNextTok = trainNextTok;
+	}
+
+	// DataInput API (no-op imports; dataset is constructed programmatically).
+	virtual void import(shmea::GString, int = 0) {}
+	virtual void import(const shmea::GTable&, int = 0) {}
+
+	virtual shmea::GVector<float> getTrainRow(unsigned int i) const
+	{
+		if (i >= trainTok.size())
+			return empty;
+		one[0] = static_cast<float>(trainTok[i]);
+		return one;
+	}
+	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int i) const
+	{
+		if (i >= trainNextTok.size())
+			return empty;
+		one[0] = static_cast<float>(trainNextTok[i]);
+		return one;
+	}
+	virtual shmea::GVector<float> getTestRow(unsigned int i) const
+	{
+		if (i >= testTok.size())
+			return empty;
+		one[0] = static_cast<float>(testTok[i]);
+		return one;
+	}
+	virtual shmea::GVector<float> getTestExpectedRow(unsigned int i) const
+	{
+		if (i >= testNextTok.size())
+			return empty;
+		one[0] = static_cast<float>(testNextTok[i]);
+		return one;
+	}
+
+	virtual bool getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+	{
+		outData = NULL;
+		outSize = 0u;
+		if (index >= trainTok.size())
+			return false;
+		scratchTok = static_cast<float>(trainTok[index]);
+		outData = &scratchTok;
+		outSize = 1u;
+		return true;
+	}
+	virtual bool getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+	{
+		outData = NULL;
+		outSize = 0u;
+		if (index >= trainNextTok.size())
+			return false;
+		scratchNext = static_cast<float>(trainNextTok[index]);
+		outData = &scratchNext;
+		outSize = 1u;
+		return true;
+	}
+	virtual bool getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+	{
+		outData = NULL;
+		outSize = 0u;
+		if (index >= testTok.size())
+			return false;
+		scratchTok = static_cast<float>(testTok[index]);
+		outData = &scratchTok;
+		outSize = 1u;
+		return true;
+	}
+	virtual bool getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
+	{
+		outData = NULL;
+		outSize = 0u;
+		if (index >= testNextTok.size())
+			return false;
+		scratchNext = static_cast<float>(testNextTok[index]);
+		outData = &scratchNext;
+		outSize = 1u;
+		return true;
+	}
+
+	// Token-id accessors (first-class ints).
+	virtual bool getTrainTokenId(unsigned int index, int& outTokenId) const
+	{
+		outTokenId = 0;
+		if (index >= trainTok.size())
+			return false;
+		outTokenId = trainTok[index];
+		return true;
+	}
+	virtual bool getTrainExpectedTokenId(unsigned int index, int& outTokenId) const
+	{
+		outTokenId = 0;
+		if (index >= trainNextTok.size())
+			return false;
+		outTokenId = trainNextTok[index];
+		return true;
+	}
+	virtual bool getTestTokenId(unsigned int index, int& outTokenId) const
+	{
+		outTokenId = 0;
+		if (index >= testTok.size())
+			return false;
+		outTokenId = testTok[index];
+		return true;
+	}
+	virtual bool getTestExpectedTokenId(unsigned int index, int& outTokenId) const
+	{
+		outTokenId = 0;
+		if (index >= testNextTok.size())
+			return false;
+		outTokenId = testNextTok[index];
+		return true;
+	}
+
+	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok.size()); }
+	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok.size()); }
+	virtual unsigned int getFeatureCount() const { return 1u; }
+	virtual int getType() const { return TEXT; }
+
+private:
+	static void build_next(const std::vector<int>& toks, int pad, std::vector<int>& outNext)
+	{
+		outNext.clear();
+		outNext.reserve(toks.size());
+		for (size_t i = 0; i < toks.size(); ++i)
+		{
+			if (i + 1u < toks.size())
+				outNext.push_back(toks[i + 1u]);
+			else
+				outNext.push_back(pad);
+		}
+	}
+
+	int padTokenId;
+	std::vector<int> trainTok;
+	std::vector<int> trainNextTok;
+	std::vector<int> testTok;
+	std::vector<int> testNextTok;
+
+	mutable float scratchTok;
+	mutable float scratchNext;
+	mutable shmea::GVector<float> one;
+	shmea::GVector<float> empty;
+};
+
+static bool read_u32_le(std::istream& in, unsigned int& outV)
+{
+	unsigned char b[4];
+	in.read(reinterpret_cast<char*>(b), 4);
+	if (!in)
+		return false;
+	outV = (static_cast<unsigned int>(b[0]) << 0) |
+	       (static_cast<unsigned int>(b[1]) << 8) |
+	       (static_cast<unsigned int>(b[2]) << 16) |
+	       (static_cast<unsigned int>(b[3]) << 24);
+	return true;
+}
+
+static bool read_u64_le(std::istream& in, unsigned long long& outV)
+{
+	unsigned char b[8];
+	in.read(reinterpret_cast<char*>(b), 8);
+	if (!in)
+		return false;
+	outV =
+	    (static_cast<unsigned long long>(b[0]) << 0) |
+	    (static_cast<unsigned long long>(b[1]) << 8) |
+	    (static_cast<unsigned long long>(b[2]) << 16) |
+	    (static_cast<unsigned long long>(b[3]) << 24) |
+	    (static_cast<unsigned long long>(b[4]) << 32) |
+	    (static_cast<unsigned long long>(b[5]) << 40) |
+	    (static_cast<unsigned long long>(b[6]) << 48) |
+	    (static_cast<unsigned long long>(b[7]) << 56);
+	return true;
+}
+
+static bool read_f32_le(std::istream& in, float& outF)
+{
+	unsigned int bits = 0u;
+	if (!read_u32_le(in, bits))
+		return false;
+	std::memcpy(&outF, &bits, sizeof(float));
+	return true;
+}
+
+static void write_u32_le(std::ostream& out, unsigned int v)
+{
+	unsigned char b[4];
+	b[0] = static_cast<unsigned char>((v >> 0) & 0xFFu);
+	b[1] = static_cast<unsigned char>((v >> 8) & 0xFFu);
+	b[2] = static_cast<unsigned char>((v >> 16) & 0xFFu);
+	b[3] = static_cast<unsigned char>((v >> 24) & 0xFFu);
+	out.write(reinterpret_cast<const char*>(b), 4);
+}
+
+static void write_u64_le(std::ostream& out, unsigned long long v)
+{
+	unsigned char b[8];
+	b[0] = static_cast<unsigned char>((v >> 0) & 0xFFull);
+	b[1] = static_cast<unsigned char>((v >> 8) & 0xFFull);
+	b[2] = static_cast<unsigned char>((v >> 16) & 0xFFull);
+	b[3] = static_cast<unsigned char>((v >> 24) & 0xFFull);
+	b[4] = static_cast<unsigned char>((v >> 32) & 0xFFull);
+	b[5] = static_cast<unsigned char>((v >> 40) & 0xFFull);
+	b[6] = static_cast<unsigned char>((v >> 48) & 0xFFull);
+	b[7] = static_cast<unsigned char>((v >> 56) & 0xFFull);
+	out.write(reinterpret_cast<const char*>(b), 8);
+}
+
+static void write_f32_le(std::ostream& out, float f)
+{
+	unsigned int bits = 0u;
+	std::memcpy(&bits, &f, sizeof(float));
+	write_u32_le(out, bits);
+}
+
+static bool write_vec_f32(std::ostream& out, const std::vector<float>& v)
+{
+	write_u64_le(out, static_cast<unsigned long long>(v.size()));
+	for (size_t i = 0; i < v.size(); ++i)
+		write_f32_le(out, v[i]);
+	return static_cast<bool>(out);
+}
+
+static bool read_and_accum_vec_l2(std::istream& in, double& sumsq)
+{
+	unsigned long long n = 0ull;
+	if (!read_u64_le(in, n))
+		return false;
+	if (n > (1ull << 31))
+		return false;
+	for (unsigned long long i = 0; i < n; ++i)
+	{
+		float f = 0.0f;
+		if (!read_f32_le(in, f))
+			return false;
+		const double d = static_cast<double>(f);
+		sumsq += d * d;
+	}
+	return true;
+}
+
+static bool write_weights_header_bin(std::ostream& out, unsigned int netType)
+{
+	char magic[32];
+	std::memset(magic, 0, sizeof(magic));
+	const char* want = "GLADES_TENSOR_WEIGHTS_BIN";
+	const size_t wantLen = strlen(want);
+	std::memcpy(magic, want, (wantLen < sizeof(magic) ? wantLen : sizeof(magic)));
+	out.write(magic, 32);
+	write_u32_le(out, 1u);        // version
+	write_u32_le(out, netType);   // netType
+	write_u32_le(out, 0u);        // reserved
+	write_u32_le(out, 0u);        // reserved
+	return static_cast<bool>(out);
+}
+
+static bool transformer_weights_l2_from_file(const std::string& weightsPath, double& outL2)
+{
+	outL2 = 0.0;
+	std::ifstream in(weightsPath.c_str(), std::ios::in | std::ios::binary);
+	if (!in)
+		return false;
+
+	// header
+	char magic[32];
+	in.read(magic, 32);
+	if (!in)
+		return false;
+	const char* want = "GLADES_TENSOR_WEIGHTS_BIN";
+	const size_t wantLen = strlen(want);
+	if (wantLen > sizeof(magic) || std::memcmp(magic, want, wantLen) != 0)
+		return false;
+	unsigned int version = 0u, netType = 0u, r0 = 0u, r1 = 0u;
+	if (!read_u32_le(in, version) || !read_u32_le(in, netType) || !read_u32_le(in, r0) || !read_u32_le(in, r1))
+		return false;
+	if (version != 1u)
+		return false;
+	// Transformer net types: encoder=4, decoder=5
+	if (!(netType == 4u || netType == 5u))
+		return false;
+
+	// transformer scalar config
+	unsigned int causal = 0u, nLayers = 0u;
+	unsigned int inputSize = 0u, dModel = 0u, dFF = 0u, nHeads = 0u, outSize = 0u;
+	if (!read_u32_le(in, causal) || !read_u32_le(in, nLayers) ||
+	    !read_u32_le(in, inputSize) || !read_u32_le(in, dModel) || !read_u32_le(in, dFF) ||
+	    !read_u32_le(in, nHeads) || !read_u32_le(in, outSize))
+		return false;
+	{
+		unsigned int nKVHeads = 0u, ffnKind = 0u;
+		unsigned int tokenModel = 0u, vocabSize = 0u, padTok = 0u, tieEmb = 0u;
+		if (!read_u32_le(in, nKVHeads) || !read_u32_le(in, ffnKind))
+			return false;
+		if (!read_u32_le(in, tokenModel) || !read_u32_le(in, vocabSize) || !read_u32_le(in, padTok) || !read_u32_le(in, tieEmb))
+			return false;
+		(void)nKVHeads; (void)ffnKind;
+		(void)tokenModel; (void)vocabSize; (void)padTok; (void)tieEmb;
+	}
+	(void)causal; (void)inputSize; (void)dModel; (void)dFF; (void)nHeads; (void)outSize;
+
+	double ss = 0.0;
+	// global vectors
+	if (!read_and_accum_vec_l2(in, ss)) return false; // WIn
+	if (!read_and_accum_vec_l2(in, ss)) return false; // bIn
+	if (!read_and_accum_vec_l2(in, ss)) return false; // WOut
+	if (!read_and_accum_vec_l2(in, ss)) return false; // bOut
+	if (!read_and_accum_vec_l2(in, ss)) return false; // tokE
+	if (!read_and_accum_vec_l2(in, ss)) return false; // lmBias
+	for (unsigned int l = 0; l < nLayers; ++l)
+	{
+		// block vectors (fixed order, 18 vectors)
+		if (!read_and_accum_vec_l2(in, ss)) return false; // ln1Gamma
+		if (!read_and_accum_vec_l2(in, ss)) return false; // ln1Beta
+		if (!read_and_accum_vec_l2(in, ss)) return false; // Wq
+		if (!read_and_accum_vec_l2(in, ss)) return false; // Wk
+		if (!read_and_accum_vec_l2(in, ss)) return false; // Wv
+		if (!read_and_accum_vec_l2(in, ss)) return false; // Wo
+		if (!read_and_accum_vec_l2(in, ss)) return false; // bq
+		if (!read_and_accum_vec_l2(in, ss)) return false; // bk
+		if (!read_and_accum_vec_l2(in, ss)) return false; // bv
+		if (!read_and_accum_vec_l2(in, ss)) return false; // bo
+		if (!read_and_accum_vec_l2(in, ss)) return false; // ln2Gamma
+		if (!read_and_accum_vec_l2(in, ss)) return false; // ln2Beta
+		if (!read_and_accum_vec_l2(in, ss)) return false; // W1
+		if (!read_and_accum_vec_l2(in, ss)) return false; // b1
+		if (!read_and_accum_vec_l2(in, ss)) return false; // W2
+		if (!read_and_accum_vec_l2(in, ss)) return false; // b2
+	}
+	outL2 = sqrt(ss);
+	return true;
+}
+
+static void mkdir_if_missing(const std::string& path)
+{
+	// Best-effort (matches style used by other UTs).
+	::mkdir(path.c_str(), 0777);
+}
+
+static std::vector<float> tokE_identity(unsigned int vocab, unsigned int dModel)
+{
+	std::vector<float> E(static_cast<size_t>(vocab) * static_cast<size_t>(dModel), 0.0f);
+	const unsigned int diag = (vocab < dModel) ? vocab : dModel;
+	for (unsigned int i = 0; i < diag; ++i)
+		E[static_cast<size_t>(i) * static_cast<size_t>(dModel) + i] = 1.0f;
+	return E;
+}
+
+static float sinusoidal_pe(unsigned int pos, unsigned int i, unsigned int dModel)
+{
+	// Match the formula used by the training path (sgd_transformer.cpp) and inference path (transformer_infer.cpp).
+	const unsigned int idx = i / 2u;
+	const double exponent = (2.0 * static_cast<double>(idx)) / static_cast<double>(dModel);
+	const double denom = pow(10000.0, exponent);
+	const double angle = static_cast<double>(pos) / denom;
+	const double v = ((i % 2u) == 0u) ? sin(angle) : cos(angle);
+	return static_cast<float>(v);
+}
+
+static bool write_transformer_decoder_tokenlm_weights(const std::string& weightsPath,
+                                                     unsigned int nLayers,
+                                                     unsigned int dModel,
+                                                     unsigned int dFF,
+                                                     unsigned int nHeads,
+                                                     unsigned int nKVHeads,
+                                                     unsigned int vocabSize,
+                                                     unsigned int padTokenId,
+                                                     unsigned int ffnKind, // TransformerRunConfig::FFNKind
+                                                     const std::vector<float>& tokE, // [vocab, dModel]
+                                                     const std::vector<float>& lmBias, // [vocab]
+                                                     bool zeroAllBlocks)
+{
+	if (nLayers == 0u || dModel == 0u || dFF == 0u || nHeads == 0u || nKVHeads == 0u || vocabSize == 0u)
+		return false;
+	if ((dModel % nHeads) != 0u)
+		return false;
+	if ((nHeads % nKVHeads) != 0u)
+		return false;
+
+	const unsigned int dHead = dModel / nHeads;
+	const unsigned int dModelKV = nKVHeads * dHead;
+	const unsigned int ff1Width = (ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFF) : dFF;
+
+	if (tokE.size() != static_cast<size_t>(vocabSize) * static_cast<size_t>(dModel))
+		return false;
+	if (!lmBias.empty() && lmBias.size() != static_cast<size_t>(vocabSize))
+		return false;
+
+	std::ofstream fp(weightsPath.c_str(), std::ios::out | std::ios::binary);
+	if (!fp)
+		return false;
+	// netType=5 (Transformer decoder)
+	if (!write_weights_header_bin(fp, /*netType*/ 5u))
+		return false;
+
+	// Transformer scalar config (must match `network.cpp` save/load order).
+	write_u32_le(fp, /*causal*/ 1u);
+	write_u32_le(fp, /*nLayers*/ nLayers);
+	write_u32_le(fp, /*inputSize*/ 1u);
+	write_u32_le(fp, /*dModel*/ dModel);
+	write_u32_le(fp, /*dFF*/ dFF);
+	write_u32_le(fp, /*nHeads*/ nHeads);
+	write_u32_le(fp, /*outSize*/ vocabSize);
+	write_u32_le(fp, /*nKVHeads*/ nKVHeads);
+	write_u32_le(fp, /*ffnKind*/ ffnKind);
+	write_u32_le(fp, /*tokenModel*/ 1u);
+	write_u32_le(fp, /*vocabSize*/ vocabSize);
+	write_u32_le(fp, /*padTokenId*/ padTokenId);
+	write_u32_le(fp, /*tieEmbeddings*/ 1u);
+
+	// Global vectors: WIn, bIn, WOut, bOut, tokE, lmBias
+	{
+		std::vector<float> WIn(static_cast<size_t>(dModel) * 1u, 0.0f);
+		std::vector<float> bIn(static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> WOut(static_cast<size_t>(vocabSize) * static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> bOut(static_cast<size_t>(vocabSize), 0.0f);
+		std::vector<float> bLm = lmBias;
+		if (bLm.empty())
+			bLm.assign(vocabSize, 0.0f);
+
+		if (!write_vec_f32(fp, WIn)) return false;
+		if (!write_vec_f32(fp, bIn)) return false;
+		if (!write_vec_f32(fp, WOut)) return false;
+		if (!write_vec_f32(fp, bOut)) return false;
+		if (!write_vec_f32(fp, tokE)) return false;
+		if (!write_vec_f32(fp, bLm)) return false;
+	}
+
+	for (unsigned int l = 0; l < nLayers; ++l)
+	{
+		// ln1Gamma/beta
+		std::vector<float> ln1Gamma(dModel, 1.0f);
+		std::vector<float> ln1Beta(dModel, 0.0f);
+		// projections
+		std::vector<float> Wq(static_cast<size_t>(dModel) * static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> Wk(static_cast<size_t>(dModelKV) * static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> Wv(static_cast<size_t>(dModelKV) * static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> Wo(static_cast<size_t>(dModel) * static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> bq(dModel, 0.0f);
+		std::vector<float> bk(dModelKV, 0.0f);
+		std::vector<float> bv(dModelKV, 0.0f);
+		std::vector<float> bo(dModel, 0.0f);
+		// ln2Gamma/beta
+		std::vector<float> ln2Gamma(dModel, 1.0f);
+		std::vector<float> ln2Beta(dModel, 0.0f);
+		// ffn
+		std::vector<float> W1(static_cast<size_t>(ff1Width) * static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> b1(ff1Width, 0.0f);
+		std::vector<float> W2(static_cast<size_t>(dModel) * static_cast<size_t>(dFF), 0.0f);
+		std::vector<float> b2(dModel, 0.0f);
+
+		// Optionally make blocks "non-trivial" (for tests that want to ensure blocks are actually loaded).
+		// Otherwise, leaving them all-zero is a useful "no-op block" baseline.
+		if (!zeroAllBlocks)
+		{
+			// A tiny deterministic perturbation so the block changes h but stays numerically stable.
+			// Wq/Wk/Wv/Wo will remain 0 for simplicity; we use FFN biases only.
+			if (b1.size() >= 1u) b1[0] = 0.01f;
+			if (b2.size() >= 1u) b2[0] = 0.01f;
+		}
+
+		if (!write_vec_f32(fp, ln1Gamma)) return false;
+		if (!write_vec_f32(fp, ln1Beta)) return false;
+		if (!write_vec_f32(fp, Wq)) return false;
+		if (!write_vec_f32(fp, Wk)) return false;
+		if (!write_vec_f32(fp, Wv)) return false;
+		if (!write_vec_f32(fp, Wo)) return false;
+		if (!write_vec_f32(fp, bq)) return false;
+		if (!write_vec_f32(fp, bk)) return false;
+		if (!write_vec_f32(fp, bv)) return false;
+		if (!write_vec_f32(fp, bo)) return false;
+		if (!write_vec_f32(fp, ln2Gamma)) return false;
+		if (!write_vec_f32(fp, ln2Beta)) return false;
+		if (!write_vec_f32(fp, W1)) return false;
+		if (!write_vec_f32(fp, b1)) return false;
+		if (!write_vec_f32(fp, W2)) return false;
+		if (!write_vec_f32(fp, b2)) return false;
+	}
+
+	return static_cast<bool>(fp);
+}
+
+static bool write_dff_weights_dense(const std::string& weightsPath,
+                                   unsigned int in,
+                                   unsigned int out,
+                                   const std::vector<float>& W_rowMajor_out_in,
+                                   const std::vector<float>& bias)
+{
+	if (in == 0u || out == 0u)
+		return false;
+	if (W_rowMajor_out_in.size() != static_cast<size_t>(in) * static_cast<size_t>(out))
+		return false;
+	if (bias.size() != static_cast<size_t>(out))
+		return false;
+
+	std::ofstream fp(weightsPath.c_str(), std::ios::out | std::ios::binary);
+	if (!fp)
+		return false;
+
+	if (!write_weights_header_bin(fp, /*netType*/ 0u))
+		return false;
+
+	// transitions
+	write_u32_le(fp, 1u);
+	// transition 0
+	write_u32_le(fp, in);
+	write_u32_le(fp, out);
+	if (!write_vec_f32(fp, W_rowMajor_out_in))
+		return false;
+	if (!write_vec_f32(fp, bias))
+		return false;
+	return static_cast<bool>(fp);
+}
+
+static bool write_dff_weights(const std::string& weightsPath, float w, float b)
+{
+	std::vector<float> W(1, w);
+	std::vector<float> bias(1, b);
+	return write_dff_weights_dense(weightsPath, /*in*/ 1u, /*out*/ 1u, W, bias);
+}
+
+static bool read_first_dff_weight(const std::string& weightsPath, float& outW)
+{
+	outW = 0.0f;
+	std::ifstream in(weightsPath.c_str(), std::ios::in | std::ios::binary);
+	if (!in)
+		return false;
+
+	char magic[32];
+	in.read(magic, 32);
+	if (!in)
+		return false;
+	const char* want = "GLADES_TENSOR_WEIGHTS_BIN";
+	const size_t wantLen = strlen(want);
+	if (wantLen > sizeof(magic) || std::memcmp(magic, want, wantLen) != 0)
+		return false;
+	unsigned int version = 0u, netType = 0u, r0 = 0u, r1 = 0u;
+	if (!read_u32_le(in, version) || !read_u32_le(in, netType) || !read_u32_le(in, r0) || !read_u32_le(in, r1))
+		return false;
+	if (!(version == 1u && netType == 0u))
+		return false;
+
+	unsigned int transitions = 0u;
+	if (!read_u32_le(in, transitions) || transitions == 0u)
+		return false;
+	unsigned int inSize = 0u, outSize = 0u;
+	if (!read_u32_le(in, inSize) || !read_u32_le(in, outSize))
+		return false;
+	(void)inSize; (void)outSize;
+
+	// W vector: read count then first float
+	unsigned long long n = 0ull;
+	if (!read_u64_le(in, n) || n == 0ull)
+		return false;
+	if (!read_f32_le(in, outW))
+		return false;
+	return true;
+}
+
+static bool write_rnn_weights_1x1x1(const std::string& weightsPath,
+                                   float Wxh, float Whh, float bh,
+                                   float Why, float by)
+{
+	std::ofstream out(weightsPath.c_str(), std::ios::out | std::ios::binary);
+	if (!out)
+		return false;
+
+	if (!write_weights_header_bin(out, /*netType*/ 1u))
+		return false;
+	// hiddenLayers, inputSize, outSize
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	// hidden layer 0: in=1, h=1
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	{
+		std::vector<float> v(1);
+		v[0] = Wxh;
+		if (!write_vec_f32(out, v)) return false;
+		v[0] = Whh;
+		if (!write_vec_f32(out, v)) return false;
+		v[0] = bh;
+		if (!write_vec_f32(out, v)) return false;
+	}
+	// output: in=1, out=1
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	{
+		std::vector<float> v(1);
+		v[0] = Why;
+		if (!write_vec_f32(out, v)) return false;
+		v[0] = by;
+		if (!write_vec_f32(out, v)) return false;
+	}
+	return static_cast<bool>(out);
+}
+
+static bool read_rnn_out_bias_1x1x1(const std::string& weightsPath, float& outBy)
+{
+	outBy = 0.0f;
+	std::ifstream in(weightsPath.c_str(), std::ios::in | std::ios::binary);
+	if (!in)
+		return false;
+
+	// header
+	char magic[32];
+	in.read(magic, 32);
+	if (!in)
+		return false;
+	const char* want = "GLADES_TENSOR_WEIGHTS_BIN";
+	const size_t wantLen = strlen(want);
+	if (wantLen > sizeof(magic) || std::memcmp(magic, want, wantLen) != 0)
+		return false;
+	unsigned int version = 0u, netType = 0u, r0 = 0u, r1 = 0u;
+	if (!read_u32_le(in, version) || !read_u32_le(in, netType) || !read_u32_le(in, r0) || !read_u32_le(in, r1))
+		return false;
+	if (!(version == 1u && netType == 1u))
+		return false;
+
+	// rnn header: hiddenLayers, inputSize, outSize
+	unsigned int hiddenLayers = 0u, inputSize = 0u, outSize = 0u;
+	if (!read_u32_le(in, hiddenLayers) || !read_u32_le(in, inputSize) || !read_u32_le(in, outSize))
+		return false;
+	(void)inputSize;
+
+	// hidden layer(s)
+	for (unsigned int l = 0u; l < hiddenLayers; ++l)
+	{
+		unsigned int inSize = 0u, hSize = 0u;
+		if (!read_u32_le(in, inSize) || !read_u32_le(in, hSize))
+			return false;
+		(void)inSize; (void)hSize;
+		// Wxh, Whh, bh
+		double dummy = 0.0;
+		if (!read_and_accum_vec_l2(in, dummy)) return false;
+		if (!read_and_accum_vec_l2(in, dummy)) return false;
+		if (!read_and_accum_vec_l2(in, dummy)) return false;
+	}
+
+	// output: in, out, Why, by
+	unsigned int oIn = 0u, oOut = 0u;
+	if (!read_u32_le(in, oIn) || !read_u32_le(in, oOut))
+		return false;
+	(void)oIn; (void)oOut;
+	{
+		double dummy = 0.0;
+		if (!read_and_accum_vec_l2(in, dummy)) return false; // Why
+	}
+	{
+		unsigned long long n = 0ull;
+		if (!read_u64_le(in, n) || n != static_cast<unsigned long long>(outSize))
+			return false;
+		// outSize==1 in this test helper
+		if (!read_f32_le(in, outBy))
+			return false;
+	}
+	return true;
+}
+
+static bool write_gated_weights_1layer_1x1x1(const std::string& weightsPath,
+                                            unsigned int netType,
+                                            unsigned int gateCount,
+                                            float Why,
+                                            float by)
+{
+	std::ofstream out(weightsPath.c_str(), std::ios::out | std::ios::binary);
+	if (!out)
+		return false;
+	if (!write_weights_header_bin(out, netType))
+		return false;
+	// gated header: gateCount, hiddenLayers, inputSize, outSize
+	write_u32_le(out, gateCount);
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	// hidden layer 0: in=1, h=1
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	{
+		std::vector<float> v(gateCount, 0.0f);
+		if (!write_vec_f32(out, v)) return false; // W
+		if (!write_vec_f32(out, v)) return false; // U
+		if (!write_vec_f32(out, v)) return false; // bias
+	}
+	// output: in=1, out=1
+	write_u32_le(out, 1u);
+	write_u32_le(out, 1u);
+	{
+		std::vector<float> v(1);
+		v[0] = Why;
+		if (!write_vec_f32(out, v)) return false;
+		v[0] = by;
+		if (!write_vec_f32(out, v)) return false;
+	}
+	return static_cast<bool>(out);
+}
+
+static bool read_gated_out_bias_1layer_1x1x1(const std::string& weightsPath,
+                                            unsigned int wantNetType,
+                                            float& outBy)
+{
+	outBy = 0.0f;
+	std::ifstream in(weightsPath.c_str(), std::ios::in | std::ios::binary);
+	if (!in)
+		return false;
+
+	// header
+	char magic[32];
+	in.read(magic, 32);
+	if (!in)
+		return false;
+	const char* want = "GLADES_TENSOR_WEIGHTS_BIN";
+	const size_t wantLen = strlen(want);
+	if (wantLen > sizeof(magic) || std::memcmp(magic, want, wantLen) != 0)
+		return false;
+	unsigned int version = 0u, netType = 0u, r0 = 0u, r1 = 0u;
+	if (!read_u32_le(in, version) || !read_u32_le(in, netType) || !read_u32_le(in, r0) || !read_u32_le(in, r1))
+		return false;
+	if (!(version == 1u && netType == wantNetType))
+		return false;
+
+	// gated header: gateCount, hiddenLayers, inputSize, outSize
+	unsigned int gateCount = 0u, hiddenLayers = 0u, inputSize = 0u, outSize = 0u;
+	if (!read_u32_le(in, gateCount) || !read_u32_le(in, hiddenLayers) || !read_u32_le(in, inputSize) || !read_u32_le(in, outSize))
+		return false;
+	(void)gateCount; (void)inputSize;
+
+	for (unsigned int l = 0u; l < hiddenLayers; ++l)
+	{
+		unsigned int inSize = 0u, hSize = 0u;
+		if (!read_u32_le(in, inSize) || !read_u32_le(in, hSize))
+			return false;
+		(void)inSize; (void)hSize;
+		// W, U, bias
+		double dummy = 0.0;
+		if (!read_and_accum_vec_l2(in, dummy)) return false;
+		if (!read_and_accum_vec_l2(in, dummy)) return false;
+		if (!read_and_accum_vec_l2(in, dummy)) return false;
+	}
+
+	// output: in, out, Why, by
+	unsigned int oIn = 0u, oOut = 0u;
+	if (!read_u32_le(in, oIn) || !read_u32_le(in, oOut))
+		return false;
+	(void)oIn; (void)oOut;
+	{
+		double dummy = 0.0;
+		if (!read_and_accum_vec_l2(in, dummy)) return false; // Why
+	}
+	{
+		unsigned long long n = 0ull;
+		if (!read_u64_le(in, n) || n != static_cast<unsigned long long>(outSize))
+			return false;
+		// outSize==1 in this test helper
+		if (!read_f32_le(in, outBy))
+			return false;
+	}
+	return true;
+}
+
+static bool read_last_result_pred(const glades::NNetwork& net, float& outPred)
+{
+	outPred = 0.0f;
+	const shmea::GList r = net.getResults();
+	if (r.size() < 2u)
+		return false;
+	// Results are stored as [expectation, prediction] for the last processed sample/timestep.
+	outPred = r.getFloat(1);
+	return true;
+}
+
+static glades::NNetwork load_with_overridden_weights_DFF(const glades::NNInfo* info,
+                                                        const glades::NumberInput* di,
+                                                        const std::string& modelName,
+                                                        unsigned int seed,
+                                                        float w,
+                                                        float b)
+{
+	// These override-style tests intentionally patch weights.bin after saveModel().
+	// Ensure file integrity verification is disabled regardless of caller environment.
+	EnvVarGuard verify("GLADES_MODEL_VERIFY_FILES");
+	verify.unset();
+
+	// 1) Create a model package from the architecture.
+	glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_DFF);
+	bootstrap.setSeed(seed);
+	bootstrap.getTerminatorMutable().setEpoch(1);
+	bootstrap.getTerminatorMutable().setAccuracy(0);
+	// Ensure test split is present (the runtime uses test split for net.test()).
+	// These unit tests often only populate trainMatrix/trainExpectedMatrix.
+	glades::NumberInput* diMut = const_cast<glades::NumberInput*>(di);
+	if (diMut && diMut->getTestSize() == 0u && diMut->getTrainSize() > 0u)
+	{
+		diMut->testMatrix = diMut->trainMatrix;
+		diMut->testExpectedMatrix = diMut->trainExpectedMatrix;
+	}
+
+	const glades::NNetworkStatus stInit = bootstrap.test(di);
+	G_assert(__FILE__, __LINE__, "==============NN::DFF_InitTestStatus() Failed==============", stInit.ok());
+	const glades::NNetworkStatus stSave0 = bootstrap.saveModel(modelName);
+	G_assert(__FILE__, __LINE__, "==============NN::DFF_SaveBootstrapModel() Failed==============", stSave0.ok());
+
+	// 2) Override weights.bin with deterministic packed tensors.
+	G_assert(__FILE__, __LINE__, "==============NN::DFF_WriteOverrideWeights() Failed==============",
+	         write_dff_weights("database/models/" + modelName + "/weights.bin", w, b));
+
+	// 3) Load into a fresh net (ensures runtime uses the overridden packed weights).
+	glades::NNetwork net(glades::NNetwork::TYPE_DFF);
+	const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+	G_assert(__FILE__, __LINE__, "==============NN::DFF_LoadOverrideModel() Failed==============", stLoad.ok());
+	return net;
+}
+
+static glades::NNetwork load_with_overridden_weights_RNN_1x1x1(const glades::NNInfo* info,
+                                                               const glades::NumberInput* di,
+                                                               const std::string& modelName,
+                                                               unsigned int seed,
+                                                               float Wxh, float Whh, float bh,
+                                                               float Why, float by)
+{
+	// These override-style tests intentionally patch weights.bin after saveModel().
+	// Ensure file integrity verification is disabled regardless of caller environment.
+	EnvVarGuard verify("GLADES_MODEL_VERIFY_FILES");
+	verify.unset();
+
+	glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_RNN);
+	bootstrap.setSeed(seed);
+	bootstrap.getTerminatorMutable().setEpoch(1);
+	bootstrap.getTerminatorMutable().setAccuracy(0);
+	glades::NumberInput* diMut = const_cast<glades::NumberInput*>(di);
+	if (diMut && diMut->getTestSize() == 0u && diMut->getTrainSize() > 0u)
+	{
+		diMut->testMatrix = diMut->trainMatrix;
+		diMut->testExpectedMatrix = diMut->trainExpectedMatrix;
+	}
+
+	const glades::NNetworkStatus stInit = bootstrap.test(di);
+	G_assert(__FILE__, __LINE__, "==============NN::RNN_InitTestStatus() Failed==============", stInit.ok());
+	const glades::NNetworkStatus stSave0 = bootstrap.saveModel(modelName);
+	G_assert(__FILE__, __LINE__, "==============NN::RNN_SaveBootstrapModel() Failed==============", stSave0.ok());
+
+	G_assert(__FILE__, __LINE__, "==============NN::RNN_WriteOverrideWeights() Failed==============",
+	         write_rnn_weights_1x1x1("database/models/" + modelName + "/weights.bin", Wxh, Whh, bh, Why, by));
+
+	glades::NNetwork net(glades::NNetwork::TYPE_RNN);
+	const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+	G_assert(__FILE__, __LINE__, "==============NN::RNN_LoadOverrideModel() Failed==============", stLoad.ok());
+	return net;
+}
+
+static glades::NNetwork load_with_overridden_weights_Gated_1layer_1x1x1(const glades::NNInfo* info,
+                                                                        const glades::NumberInput* di,
+                                                                        const std::string& modelName,
+                                                                        int netType,
+                                                                        unsigned int seed,
+                                                                        unsigned int gateCount,
+                                                                        float Why,
+                                                                        float by)
+{
+	// Ensure file integrity verification is disabled regardless of caller environment.
+	EnvVarGuard verify("GLADES_MODEL_VERIFY_FILES");
+	verify.unset();
+
+	glades::NNetwork bootstrap(info, netType);
+	bootstrap.setSeed(seed);
+	bootstrap.getTerminatorMutable().setEpoch(1);
+	bootstrap.getTerminatorMutable().setAccuracy(0);
+	glades::NumberInput* diMut = const_cast<glades::NumberInput*>(di);
+	if (diMut && diMut->getTestSize() == 0u && diMut->getTrainSize() > 0u)
+	{
+		diMut->testMatrix = diMut->trainMatrix;
+		diMut->testExpectedMatrix = diMut->trainExpectedMatrix;
+	}
+
+	const glades::NNetworkStatus stInit = bootstrap.test(di);
+	G_assert(__FILE__, __LINE__, "==============NN::Gated_InitTestStatus() Failed==============", stInit.ok());
+	const glades::NNetworkStatus stSave0 = bootstrap.saveModel(modelName);
+	G_assert(__FILE__, __LINE__, "==============NN::Gated_SaveBootstrapModel() Failed==============", stSave0.ok());
+
+	G_assert(__FILE__, __LINE__, "==============NN::Gated_WriteOverrideWeights() Failed==============",
+	         write_gated_weights_1layer_1x1x1("database/models/" + modelName + "/weights.bin",
+	                                          static_cast<unsigned int>(netType),
+	                                          gateCount,
+	                                          Why,
+	                                          by));
+
+	glades::NNetwork net(netType);
+	const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+	G_assert(__FILE__, __LINE__, "==============NN::Gated_LoadOverrideModel() Failed==============", stLoad.ok());
+	return net;
+}
+
+static bool text_file_contains_prefix(const std::string& path, const std::string& prefix)
+{
+	std::ifstream in(path.c_str());
+	if (!in)
+		return false;
+	std::string line;
+	while (std::getline(in, line))
+	{
+		if (line.size() >= prefix.size() && std::memcmp(line.data(), prefix.data(), prefix.size()) == 0)
+			return true;
+	}
+	return false;
+}
+
+static void ModelPackageIntegrityVerificationUnitTest()
+{
+	EnvVarGuard verify("GLADES_MODEL_VERIFY_FILES");
+	verify.set("1"); // opt-in verification
+
+	glades::NumberInput* di = new glades::NumberInput();
+	di->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
+	di->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
+	di->trainMatrix[0][0] = 1.0f;
+	di->trainExpectedMatrix[0][0] = 0.0f;
+	// Make test split available.
+	di->testMatrix = di->trainMatrix;
+	di->testExpectedMatrix = di->trainExpectedMatrix;
+
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	    /*batchSize*/ 1,
+	    /*learningRate*/ 0.1f,
+	    /*momentumFactor*/ 0.0f,
+	    /*weightDecay1*/ 0.0f,
+	    /*weightDecay2*/ 0.0f,
+	    /*pDropout*/ 0.0f,
+	    /*activationType*/ glades::GMath::LINEAR,
+	    /*activationParam*/ 1.0f);
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+	glades::NNInfo* info = new glades::NNInfo("ut_pkg_verify_integrity", in, hidden, out);
+
+	const std::string modelName = "ut_pkg_verify_integrity";
+	{
+		glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_DFF);
+		bootstrap.setSeed(123u);
+		bootstrap.getTerminatorMutable().setEpoch(1);
+		bootstrap.getTerminatorMutable().setAccuracy(0);
+		const glades::NNetworkStatus stInit = bootstrap.test(di);
+		G_assert(__FILE__, __LINE__, "==============NN::PkgVerify_InitTestStatus() Failed==============", stInit.ok());
+		const glades::NNetworkStatus stSave = bootstrap.saveModel(modelName);
+		G_assert(__FILE__, __LINE__, "==============NN::PkgVerify_SaveModel() Failed==============", stSave.ok());
+	}
+
+	// Ensure v3+ packaging fields exist (best-effort; do not hardcode exact version).
+	G_assert(__FILE__, __LINE__, "==============NN::PkgVerify_ManifestMissingWeightsHash() Failed==============",
+	         text_file_contains_prefix("database/models/" + modelName + "/manifest.txt", "weights.fnv1a64="));
+	G_assert(__FILE__, __LINE__, "==============NN::PkgVerify_ManifestMissingWeightsBytes() Failed==============",
+	         text_file_contains_prefix("database/models/" + modelName + "/manifest.txt", "weights.bytes="));
+
+	// Baseline: load must succeed with verification enabled.
+	{
+		glades::NNetwork net(glades::NNetwork::TYPE_DFF);
+		const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__, "==============NN::PkgVerify_LoadBaseline() Failed==============", stLoad.ok());
+	}
+
+	// Tamper weights.bin without updating manifest: load must fail when verification is enabled.
+	G_assert(__FILE__, __LINE__, "==============NN::PkgVerify_TamperWeights() Failed==============",
+	         write_dff_weights("database/models/" + modelName + "/weights.bin", /*w*/ 2.0f, /*b*/ 0.0f));
+	{
+		glades::NNetwork net(glades::NNetwork::TYPE_DFF);
+		const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__, "==============NN::PkgVerify_LoadTamperedShouldFail() Failed==============", !stLoad.ok());
+	}
+
+	delete di;
+	delete info;
+}
+} // namespace
+
+static void NumberInputTrainTestSplitUnitTest();
 
 void NNUnitTest()
 {
-    printf("============================================================\n");
-    printf("NN Test 1\n");
-    printf("-----------------------------------\n");
- 
-    shmea::GString netName = "xornet";
-    shmea::GString inputFName = "xorgate.csv";
-    int inputType = glades::DataInput::CSV;
-    //int inputType = glades::DataInput::IMAGE;
-    //int inputType = glades::DataInput::TEXT;
-    
-    // Modify the paths to properly load the data later
-    glades::DataInput* di = NULL;
-    if (inputType == glades::DataInput::CSV)
-    {
-    	inputFName = "datasets/" + inputFName;
-    	di = new glades::NumberInput();
-    }
-    else if (inputType == glades::DataInput::IMAGE)
-    {
-    	// inputFName = "datasets/images/" + inputFName + "/";
-    	di = new glades::ImageInput();
-    }
-    else if (inputType == glades::DataInput::TEXT)
-    {
-    	// TODO
-    	return;
-    }
-    else
-    	return;
-    
-    if (!di)
-    	return;
-    
-    // Load the input data
-    di->import(inputFName);
-    
-    // Deterministic, hardcoded config (replaces on-disk config load).
-    // Historical config source: unit-tests/database/neuralnetworks/xornet
-    glades::InputLayerInfo* in1 = new glades::InputLayerInfo(
-        /*batchSize*/ 1,
-        /*learningRate*/ 0.003f,
-        /*momentumFactor*/ 0.0f,
-        /*weightDecay1*/ 0.0f,
-        /*weightDecay2*/ 0.0f,
-        /*pDropout*/ 0.0f,
-        /*activationType*/ glades::GMath::TANH,
-        /*activationParam*/ 0.0f
-    );
-    std::vector<glades::HiddenLayerInfo*> hidden1;
-    hidden1.push_back(new glades::HiddenLayerInfo(
-        /*size*/ 2,
-        /*learningRate*/ 0.003f,
-        /*momentumFactor*/ 0.0f,
-        /*weightDecay1*/ 0.0f,
-        /*weightDecay2*/ 0.0f,
-        /*pDropout*/ 0.0f,
-        /*activationType*/ glades::GMath::TANH,
-        /*activationParam*/ 0.0f
-    ));
-    glades::OutputLayerInfo* out1 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-    glades::NNInfo* info1 = new glades::NNInfo(netName, in1, hidden1, out1);
-    glades::NNetwork cNetwork(info1);
-    delete info1;
-    cNetwork.setSeed(0xC0FFEE01ULL);
-    
-    // Termination Conditions
-    //cNetwork.setTimestamp(maxTimeStamp);
-    cNetwork.getTerminatorMutable().setEpoch(100000);
-    cNetwork.getTerminatorMutable().setAccuracy(95);
-    
-    // Run the training and retrieve a metanetwork
-    glades::MetaNetwork* newTrainNet =
-    	glades::train(&cNetwork, di);
-    G_assert (__FILE__, __LINE__, "==============NN1-test::TrainStatus() Failed==============", newTrainNet != NULL);
+	printf("============================================================\n");
+	printf("NN Unit Test Suite (modern-only)\n");
+	printf("============================================================\n");
 
-    G_assert (__FILE__, __LINE__, "==============NN1-test::Accuracy() Failed==============", cNetwork.getAccuracy() >= 95.0f);
-    delete newTrainNet;
-    delete di;
+	printf("-----------------------------------\n");
+	printf("NN Test: model package integrity verification\n");
+	printf("-----------------------------------\n");
+	{
+		ModelPackageIntegrityVerificationUnitTest();
+		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+	}
 
     printf("-----------------------------------\n");
-    printf("NN Test 2\n");
+	printf("NN Test A (DFF minibatch end-of-batch update)\n");
     printf("-----------------------------------\n");
- 
-    netName = "iris";
-    inputFName = "iris.data";
-    inputType = glades::DataInput::CSV;
-    //int inputType = glades::DataInput::IMAGE;
-    //int inputType = glades::DataInput::TEXT;
-    
-    // Modify the paths to properly load the data later
-    glades::DataInput* di2 = NULL;
-    if (inputType == glades::DataInput::CSV)
-    {
-    	inputFName = "datasets/" + inputFName;
-    	di2 = new glades::NumberInput();
-    }
-    else if (inputType == glades::DataInput::IMAGE)
-    {
-    	// inputFName = "datasets/images/" + inputFName + "/";
-    	di2 = new glades::ImageInput();
-    }
-    else if (inputType == glades::DataInput::TEXT)
-    {
-    	// TODO
-    	return;
-    }
-    else
-    	return;
-    
-    if (!di2)
-    	return;
-    
-    // Load the input data
-    di2->import(inputFName);
-    
-    // Deterministic, hardcoded config (replaces on-disk config load).
-    // Historical config source: unit-tests/database/neuralnetworks/iris
-    glades::InputLayerInfo* in2 = new glades::InputLayerInfo(
-        /*batchSize*/ 1,
-        /*learningRate*/ 0.01f,
-        /*momentumFactor*/ 0.0f,
-        /*weightDecay1*/ 0.0f,
-        /*weightDecay2*/ 0.0f,
-        /*pDropout*/ 0.0f,
-        /*activationType*/ glades::GMath::SIGMOID,
-        /*activationParam*/ 0.0f
-    );
-    std::vector<glades::HiddenLayerInfo*> hidden2;
-    hidden2.push_back(new glades::HiddenLayerInfo(
-        /*size*/ 5,
-        /*learningRate*/ 0.01f,
-        /*momentumFactor*/ 0.0f,
-        /*weightDecay1*/ 0.0f,
-        /*weightDecay2*/ 0.0f,
-        /*pDropout*/ 0.0f,
-        /*activationType*/ glades::GMath::SIGMOID,
-        /*activationParam*/ 0.0f
-    ));
-    glades::OutputLayerInfo* out2 = new glades::OutputLayerInfo(3, glades::OutputLayerInfo::CLASSIFICATION);
-    glades::NNInfo* info2 = new glades::NNInfo(netName, in2, hidden2, out2);
-    glades::NNetwork cNetwork2(info2);
-    delete info2;
-    cNetwork2.setSeed(0xC0FFEE02ULL);
-    
-    // Termination Conditions
-    //cNetwork2.setTimestamp(maxTimeStamp);
-    cNetwork2.getTerminatorMutable().setEpoch(100000);
-    cNetwork2.getTerminatorMutable().setAccuracy(95);
-    
-    // Run the training and retrieve a metanetwork
-    glades::MetaNetwork* newTrainNet2 =
-    	glades::train(&cNetwork2, di2);
-    G_assert (__FILE__, __LINE__, "==============NN2-test::TrainStatus() Failed==============", newTrainNet2 != NULL);
-    
-    G_assert (__FILE__, __LINE__, "==============NN2-test::Accuracy() Failed==============", cNetwork2.getAccuracy() >= 95.0f);
-    delete newTrainNet2;
-    delete di2;
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
+		di->trainMatrix[0][0] = 1.0f;
+		di->trainExpectedMatrix[0][0] = 0.0f;
+		di->trainMatrix[1][0] = 2.0f;
+		di->trainExpectedMatrix[1][0] = 1.0f;
 
-
-    printf("-----------------------------------\n");
-    printf("NN Test 3\n");
-    printf("-----------------------------------\n");
- 
-    netName = "xorgateText";
-    inputFName = "xorgateText.csv";
-    inputType = glades::DataInput::CSV;
-    //int inputType = glades::DataInput::IMAGE;
-    //int inputType = glades::DataInput::TEXT;
-    
-    // Modify the paths to properly load the data later
-    glades::DataInput* di3 = NULL;
-    if (inputType == glades::DataInput::CSV)
-    {
-    	inputFName = "datasets/" + inputFName;
-    	di3 = new glades::NumberInput();
-    }
-    else if (inputType == glades::DataInput::IMAGE)
-    {
-    	// inputFName = "datasets/images/" + inputFName + "/";
-    	di3 = new glades::ImageInput();
-    }
-    else if (inputType == glades::DataInput::TEXT)
-    {
-    	// TODO
-    	return;
-    }
-    else
-    	return;
-    
-    if (!di3)
-    	return;
-    
-    // Load the input data
-    di3->import(inputFName);
-    
-    // Deterministic, hardcoded config (replaces on-disk config load).
-    // Historical config source: unit-tests/database/neuralnetworks/xorgateText
-    glades::InputLayerInfo* in3 = new glades::InputLayerInfo(
-        /*batchSize*/ 1,
-        /*learningRate*/ 0.001f,
-        /*momentumFactor*/ 0.0f,
-        /*weightDecay1*/ 0.0f,
-        /*weightDecay2*/ 0.0f,
-        /*pDropout*/ 0.0f,
-        /*activationType*/ glades::GMath::TANH,
-        /*activationParam*/ 0.0f
-    );
-    std::vector<glades::HiddenLayerInfo*> hidden3;
-    hidden3.push_back(new glades::HiddenLayerInfo(
-        /*size*/ 3,
-        /*learningRate*/ 0.001f,
-        /*momentumFactor*/ 0.0f,
-        /*weightDecay1*/ 0.0f,
-        /*weightDecay2*/ 0.0f,
-        /*pDropout*/ 0.0f,
-        /*activationType*/ glades::GMath::TANH,
-        /*activationParam*/ 0.0f
-    ));
-    glades::OutputLayerInfo* out3 = new glades::OutputLayerInfo(2, glades::OutputLayerInfo::REGRESSION);
-    glades::NNInfo* info3 = new glades::NNInfo(netName, in3, hidden3, out3);
-    glades::NNetwork cNetwork3(info3);
-    delete info3;
-    cNetwork3.setSeed(0xC0FFEE03ULL);
-    
-    // Termination Conditions
-    //cNetwork3.setTimestamp(maxTimeStamp);
-    cNetwork3.getTerminatorMutable().setEpoch(100000);
-    cNetwork3.getTerminatorMutable().setAccuracy(95);
-    
-    // Run the training and retrieve a metanetwork
-    glades::MetaNetwork* newTrainNet3 =
-    	glades::train(&cNetwork3, di3);
-    G_assert (__FILE__, __LINE__, "==============NN3-test::TrainStatus() Failed==============", newTrainNet3 != NULL);
-
-    G_assert (__FILE__, __LINE__, "==============NN3-test::Accuracy() Failed==============", cNetwork3.getAccuracy() >= 95.0f);
-    delete newTrainNet3;
-    delete di3;
-
-    printf("-----------------------------------\n");
-    printf("NN Test 4 (Minibatch application timing)\n");
-    printf("-----------------------------------\n");
-
-    // This test specifically guards against the historical minibatch bug where updates were applied
-    // on inputRowCounter == 0 (first sample) instead of end-of-batch, and where partial batches
-    // (minibatchSize > trainSize) would ignore most samples.
-    //
-    // We build a tiny 1->1 regression network with linear activation and deterministic weights,
-    // run exactly 1 epoch, and verify the weight update reflects *both* samples.
-    {
-        // Toy dataset (2 samples, 1 feature, 1 target)
-        glades::NumberInput* di4 = new glades::NumberInput();
-        di4->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di4->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di4->trainMatrix[0][0] = 1.0f;
-        di4->trainExpectedMatrix[0][0] = 0.0f;
-        di4->trainMatrix[1][0] = 2.0f;
-        di4->trainExpectedMatrix[1][0] = 1.0f;
-
-        // Build a minimal NNInfo:
-        // - minibatchSize intentionally larger than trainSize to exercise partial batch behavior
-        // - linear activation so gradients are easy to reason about
-        glades::InputLayerInfo* in4 = new glades::InputLayerInfo(
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
             /*batchSize*/ 10,
             /*learningRate*/ 0.1f,
             /*momentumFactor*/ 0.0f,
@@ -304,142 +1195,89 @@ void NNUnitTest()
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden4;
-        glades::OutputLayerInfo* out4 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info4 = new glades::NNInfo("ut_minibatch_timing", in4, hidden4, out4);
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_minibatch_timing", in, hidden, out);
 
-        glades::NNetwork cNetwork4(info4);
-        cNetwork4.getTerminatorMutable().setEpoch(1);     // exactly 1 epoch
-        cNetwork4.getTerminatorMutable().setAccuracy(0);  // don't terminate by accuracy
+		glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_minibatch", 123u, /*w*/ 1.0f, /*b*/ 0.0f);
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
 
-        // Pre-build "meat" so we can set deterministic weights, then prevent rebuild in train()
-        cNetwork4.graphMutable().build(info4, di4, glades::NNetwork::TYPE_DFF);
-        cNetwork4.setMustdBuildMeat(false);
+		const glades::NNetworkStatus st = net.train(di);
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_Minibatch TrainStatus() Failed==============", st.ok());
+		const glades::NNetworkStatus stSave = net.saveModel("ut_pkg_dff_minibatch_after");
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_Minibatch SaveModel() Failed==============", stSave.ok());
 
-        // Set deterministic initial weight: w0 = 1.0 (single edge: input0 -> output0)
-        glades::Layer* outLayer4 = cNetwork4.graphMutable().getOutputLayer(1);
-        glades::Node* outNode4 = cNetwork4.graphMutable().getOutputNode(outLayer4, 0);
-        outNode4->setEdgeWeight(0, 1.0f);
-
-        // Train
-        const glades::NNetworkStatus st = cNetwork4.train(di4);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN4-test::TrainStatus() Failed==============",
-                 st.ok());
-
-        // Parameters are tensor-first; the Node/Edge graph is a derived view.
-        // Materialize it on demand before inspecting weights through Node APIs.
-        cNetwork4.materializeGraphParameters();
-
-        // Expected update (MSE, linear activation, no momentum/decay, batchCount=2):
-        // delta(sample) = lr * 2 * (p - y) * x
-        // sample1: x=1, y=0, p=1 => delta1 = 0.2
-        // sample2: x=2, y=1, p=2 => delta2 = 0.4
-        // avg delta = (0.2 + 0.4) / 2 = 0.3 => w1 = 1.0 - 0.3 = 0.7
-        const float wFinal = outNode4->getEdgeWeight(0);
+		float wFinal = 0.0f;
+		const bool okW = read_first_dff_weight("database/models/ut_pkg_dff_minibatch_after/weights.bin", wFinal);
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_Minibatch ReadWeight() Failed==============", okW);
         const float expectedW = 0.7f;
         const float tol = 1e-3f;
-
-        printf("[UT] NN4 final weight = %f (expected ~%f)\n", wFinal, expectedW);
-
-        /* For this toy dataset the accuracy can easily show 0% even though the gradient update is correct.
-         * The weight assertion is the real signal here
-         */
-        G_assert(__FILE__, __LINE__,
-                 "==============NN4-test::MinibatchUpdate() Failed==============",
+		printf("[UT] DFF minibatch final weight = %f (expected ~%f)\n", wFinal, expectedW);
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_MinibatchUpdate() Failed==============",
                  (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
 
-        delete di4;
-        delete info4; // owns in4/out4
+		delete di;
+		delete info;
     }
 
     printf("-----------------------------------\n");
-    printf("NN Test 4b (Weight decay: L2 decays weights)\n");
+	printf("NN Test B (DFF weight decay L2)\n");
     printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
 
-    // This test verifies that weightDecay2 (L2) actually decays the *weight* (not the input),
-    // and that it works even when the data gradient is exactly zero.
-    //
-    // We use x=0, y=0 so dLoss/dw == 0, and initialize w0=1.
-    // With lr=0.1 and weightDecay2=1.0:
-    //   delta = lr * (lambda2 * w) = 0.1 * 1 * 1 = 0.1
-    //   w1 = w0 - delta = 0.9
-    {
-        glades::NumberInput* di4b = new glades::NumberInput();
-        di4b->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di4b->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di4b->trainMatrix[0][0] = 0.0f;
-        di4b->trainExpectedMatrix[0][0] = 0.0f;
-
-        const float lr = 0.1f;
-        glades::InputLayerInfo* in4b = new glades::InputLayerInfo(
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
             /*batchSize*/ 1,
-            /*learningRate*/ lr,
+		    /*learningRate*/ 0.1f,
             /*momentumFactor*/ 0.0f,
             /*weightDecay1*/ 0.0f,
             /*weightDecay2*/ 1.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden4b;
-        glades::OutputLayerInfo* out4b = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info4b = new glades::NNInfo("ut_weight_decay_l2", in4b, hidden4b, out4b);
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l2", in, hidden, out);
 
-        glades::NNetwork net4b(info4b);
-        net4b.getTerminatorMutable().setEpoch(1);
-        net4b.getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l2", 321u, /*w*/ 1.0f, /*b*/ 0.0f);
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
 
-        net4b.graphMutable().build(info4b, di4b, glades::NNetwork::TYPE_DFF);
-        net4b.setMustdBuildMeat(false);
+		const glades::NNetworkStatus st = net.train(di);
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2 TrainStatus() Failed==============", st.ok());
+		const glades::NNetworkStatus stSave = net.saveModel("ut_pkg_dff_l2_after");
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2 SaveModel() Failed==============", stSave.ok());
 
-        glades::Layer* outLayer4b = net4b.graphMutable().getOutputLayer(1);
-        glades::Node* outNode4b = net4b.graphMutable().getOutputNode(outLayer4b, 0);
-        outNode4b->setEdgeWeight(0, 1.0f);
-
-        net4b.train(di4b);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN4b-test::TrainStatus() Failed==============",
-                 net4b.getLastStatus().ok());
-
-        net4b.materializeGraphParameters();
-
-        const float wFinal = outNode4b->getEdgeWeight(0);
+		float wFinal = 0.0f;
+		const bool okW = read_first_dff_weight("database/models/ut_pkg_dff_l2_after/weights.bin", wFinal);
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2 ReadWeight() Failed==============", okW);
         const float expectedW = 0.9f;
         const float tol = 1e-3f;
-        printf("[UT] NN4b L2 final weight = %f (expected ~%f)\n", wFinal, expectedW);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN4b-test::L2WeightDecay() Failed==============",
+		printf("[UT] DFF L2 final weight = %f (expected ~%f)\n", wFinal, expectedW);
+		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2WeightDecay() Failed==============",
                  (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
 
-        delete di4b;
-        delete info4b;
+		delete di;
+		delete info;
     }
 
     printf("-----------------------------------\n");
-    printf("NN Test 4c (Weight decay: L1 decays weights toward 0)\n");
+	printf("NN Test C (DFF weight decay L1)\n");
     printf("-----------------------------------\n");
-
-    // This test verifies L1 regularization behavior for both positive and negative weights.
-    // With x=0,y=0 => no data gradient, only L1 decay:
-    //   w1 = w0 - lr*lambda1*sign(w0)
-    // For lr=0.1, lambda1=1:
-    //   w0=+1 => w1=0.9
-    //   w0=-1 => w1=-0.9
-    {
-        glades::NumberInput* di4c = new glades::NumberInput();
-        di4c->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di4c->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di4c->trainMatrix[0][0] = 0.0f;
-        di4c->trainExpectedMatrix[0][0] = 0.0f;
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
 
         const float lr = 0.1f;
         const float lambda1 = 1.0f;
         const float tol = 1e-3f;
 
-        // Case 1: w0 = +1
+		// w0=+1 => w1=0.9
         {
             glades::InputLayerInfo* in = new glades::InputLayerInfo(
                 /*batchSize*/ 1,
@@ -449,40 +1287,26 @@ void NNUnitTest()
                 /*weightDecay2*/ 0.0f,
                 /*pDropout*/ 0.0f,
                 /*activationType*/ glades::GMath::LINEAR,
-                /*activationParam*/ 1.0f
-            );
+			    /*activationParam*/ 1.0f);
             std::vector<glades::HiddenLayerInfo*> hidden;
             glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
             glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l1_pos", in, hidden, out);
-
-            glades::NNetwork net(info);
+			glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_pos", 777u, /*w*/ 1.0f, /*b*/ 0.0f);
             net.getTerminatorMutable().setEpoch(1);
             net.getTerminatorMutable().setAccuracy(0);
-            net.graphMutable().build(info, di4c, glades::NNetwork::TYPE_DFF);
-            net.setMustdBuildMeat(false);
-
-            glades::Layer* outLayer = net.graphMutable().getOutputLayer(1);
-            glades::Node* outNode = net.graphMutable().getOutputNode(outLayer, 0);
-            outNode->setEdgeWeight(0, 1.0f);
-
-            net.train(di4c);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN4c-test::TrainStatus_Pos() Failed==============",
-                     net.getLastStatus().ok());
-
-            net.materializeGraphParameters();
-
-            const float wFinal = outNode->getEdgeWeight(0);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) TrainStatus() Failed==============", net.train(di).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) SaveModel() Failed==============", net.saveModel("ut_pkg_dff_l1_pos_after").ok());
+			float wFinal = 0.0f;
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) ReadWeight() Failed==============",
+			         read_first_dff_weight("database/models/ut_pkg_dff_l1_pos_after/weights.bin", wFinal));
             const float expectedW = 0.9f;
-            printf("[UT] NN4c L1(+1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN4c-test::L1WeightDecay_Pos() Failed==============",
+			printf("[UT] DFF L1(+1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) WeightDecay() Failed==============",
                      (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
-
             delete info;
         }
 
-        // Case 2: w0 = -1
+		// w0=-1 => w1=-0.9
         {
             glades::InputLayerInfo* in = new glades::InputLayerInfo(
                 /*batchSize*/ 1,
@@ -492,1463 +1316,123 @@ void NNUnitTest()
                 /*weightDecay2*/ 0.0f,
                 /*pDropout*/ 0.0f,
                 /*activationType*/ glades::GMath::LINEAR,
-                /*activationParam*/ 1.0f
-            );
+			    /*activationParam*/ 1.0f);
             std::vector<glades::HiddenLayerInfo*> hidden;
             glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
             glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l1_neg", in, hidden, out);
-
-            glades::NNetwork net(info);
+			glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_neg", 778u, /*w*/ -1.0f, /*b*/ 0.0f);
             net.getTerminatorMutable().setEpoch(1);
             net.getTerminatorMutable().setAccuracy(0);
-            net.graphMutable().build(info, di4c, glades::NNetwork::TYPE_DFF);
-            net.setMustdBuildMeat(false);
-
-            glades::Layer* outLayer = net.graphMutable().getOutputLayer(1);
-            glades::Node* outNode = net.graphMutable().getOutputNode(outLayer, 0);
-            outNode->setEdgeWeight(0, -1.0f);
-
-            net.train(di4c);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN4c-test::TrainStatus_Neg() Failed==============",
-                     net.getLastStatus().ok());
-
-            net.materializeGraphParameters();
-
-            const float wFinal = outNode->getEdgeWeight(0);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) TrainStatus() Failed==============", net.train(di).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) SaveModel() Failed==============", net.saveModel("ut_pkg_dff_l1_neg_after").ok());
+			float wFinal = 0.0f;
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) ReadWeight() Failed==============",
+			         read_first_dff_weight("database/models/ut_pkg_dff_l1_neg_after/weights.bin", wFinal));
             const float expectedW = -0.9f;
-            printf("[UT] NN4c L1(-1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN4c-test::L1WeightDecay_Neg() Failed==============",
+			printf("[UT] DFF L1(-1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) WeightDecay() Failed==============",
                      (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
-
             delete info;
         }
 
-        delete di4c;
+		delete di;
     }
 
     printf("-----------------------------------\n");
-    printf("NN Test 5 (RNN context nodes)\n");
+	printf("NN Test D (Regression metrics on test)\n");
     printf("-----------------------------------\n");
-
-    // This test validates the RNN "context node" mechanism:
-    // - Context state is reset at the start of an epoch/run.
-    // - Context is updated from the hidden node's *output activation* (post-squash),
-    //   not just the input-edge activation sum.
-    //
-    // We create a tiny 1->1->1 RNN with linear activations:
-    //   h_t = Wx*x_t + Wh*h_{t-1}
-    //   y_t = Wy*h_t
-    //
-    // With Wx=Wh=Wy=1, x1=2, x2=3, and h0=0:
-    //   h1=2, h2=5, y2=5
-    {
-        glades::NumberInput* di0 = new glades::NumberInput();
-        di0->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di0->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di0->trainMatrix[0][0] = 2.0f;
-        di0->trainMatrix[1][0] = 3.0f;
-        di0->trainExpectedMatrix[0][0] = 0.0f; // not used by this assertion
-        di0->trainExpectedMatrix[1][0] = 0.0f; // not used by this assertion
-
-        // Evaluation semantics: test() reads the test split.
-        // For deterministic forward-pass unit tests, mirror train->test.
-        di0->testMatrix = di0->trainMatrix;
-        di0->testExpectedMatrix = di0->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in0 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden0;
-        hidden0.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out0 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info0 = new glades::NNInfo("ut_rnn_context", in0, hidden0, out0);
-
-        glades::NNetwork rnnNet0(info0, glades::NNetwork::TYPE_RNN);
-        rnnNet0.getTerminatorMutable().setEpoch(1);
-        rnnNet0.getTerminatorMutable().setAccuracy(0);
-
-        // Pre-build so we can set deterministic weights, then prevent rebuild in test()
-        rnnNet0.graphMutable().build(info0, di0, glades::NNetwork::TYPE_RNN);
-        rnnNet0.setMustdBuildMeat(false);
-
-        // Hidden layer (counter=1) and output layer (counter=2)
-        glades::Layer* hiddenLayer0 = rnnNet0.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer0 = rnnNet0.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode0 = rnnNet0.graphMutable().getOutputNode(hiddenLayer0, 0);
-        glades::Node* outNode0 = rnnNet0.graphMutable().getOutputNode(outLayer0, 0);
-
-        // Deterministic weights: Wx=1, Wh=1, Wy=1; biases=0
-        hiddenLayer0->setBiasWeight(0.0f);
-        outLayer0->setBiasWeight(0.0f);
-        hiddenNode0->setEdgeWeight(0, 1.0f); // Wx
-        outNode0->setEdgeWeight(0, 1.0f);    // Wy
-
-        // Context edge weight Wh and a non-zero starting state to ensure reset works
-        glades::Node* ctx0 = hiddenNode0->getContextNode();
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5-test::ContextNodeMissing() Failed==============",
-                 ctx0 != NULL);
-        if (ctx0)
-        {
-            ctx0->setEdgeWeight(0, 1.0f); // Wh
-            ctx0->setWeight(10.0f);       // should be reset to 0 at run start
-        }
-
-        // Run inference (no weight updates)
-        const glades::NNetworkStatus stTest0 = rnnNet0.test(di0);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5-test::TestStatus() Failed==============",
-                 stTest0.ok());
-
-        const float expected = 5.0f;
-        const float tol = 1e-3f;
-        const float y2 = outNode0->getWeight();
-        const float h2 = hiddenNode0->getWeight();
-        const float ctxAfter = (ctx0 ? ctx0->getWeight() : 0.0f);
-
-        printf("[UT] RNN y2=%f h2=%f ctx=%f (expected ~%f)\n", y2, h2, ctxAfter, expected);
-
-        // Core signal: context must reflect h2 and output must reflect the recurrence.
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5-test::RNNOutputWithContext() Failed==============",
-                 (y2 > expected - tol) && (y2 < expected + tol));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5-test::RNNHiddenState() Failed==============",
-                 (h2 > expected - tol) && (h2 < expected + tol));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5-test::RNNContextUpdatedFromHidden() Failed==============",
-                 (ctxAfter > expected - tol) && (ctxAfter < expected + tol));
-
-        delete di0;
-        delete info0; // owns in0/hidden0/out0
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 5b (RNN multiple sequences reset at boundaries)\n");
-    printf("-----------------------------------\n");
-
-    // This test validates the "proper sequence" abstraction:
-    // - DataInput can represent multiple sequences with boundaries.
-    // - RNN forward pass must reset hidden context at each sequence boundary.
-    //
-    // We create a 1->1->1 linear RNN with Wx=Wh=Wy=1, bias=0.
-    // Sequence 1: x=[2,3] => y_last = 5
-    // Sequence 2: x=[7,11] => y_last = 18  (NOT 23, which would happen if context leaked from seq1)
-    {
-        glades::NumberInput* di5b = new glades::NumberInput();
-        di5b->trainMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
-        di5b->trainExpectedMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
-        di5b->trainMatrix[0][0] = 2.0f;
-        di5b->trainMatrix[1][0] = 3.0f;
-        di5b->trainMatrix[2][0] = 7.0f;
-        di5b->trainMatrix[3][0] = 11.0f;
-
-        // Mirror train->test so test() evaluates the same rows.
-        di5b->testMatrix = di5b->trainMatrix;
-        di5b->testExpectedMatrix = di5b->trainExpectedMatrix;
-
-        std::vector<glades::DataInput::SequenceSpan> spans;
-        spans.push_back(glades::DataInput::SequenceSpan(0u, 2u));
-        spans.push_back(glades::DataInput::SequenceSpan(2u, 2u));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5b-test::SetTrainSequences() Failed==============",
-                 di5b->setTrainSequences(spans));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5b-test::SetTestSequences() Failed==============",
-                 di5b->setTestSequences(spans));
-
-        glades::InputLayerInfo* in5b = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden5b;
-        hidden5b.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out5b = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info5b = new glades::NNInfo("ut_rnn_multi_seq_reset", in5b, hidden5b, out5b);
-
-        glades::NNetwork rnnNet5b(info5b, glades::NNetwork::TYPE_RNN);
-        rnnNet5b.getTerminatorMutable().setEpoch(1);
-        rnnNet5b.getTerminatorMutable().setAccuracy(0);
-
-        rnnNet5b.graphMutable().build(info5b, di5b, glades::NNetwork::TYPE_RNN);
-        rnnNet5b.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer = rnnNet5b.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer = rnnNet5b.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode = rnnNet5b.graphMutable().getOutputNode(hiddenLayer, 0);
-        glades::Node* outNode = rnnNet5b.graphMutable().getOutputNode(outLayer, 0);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN5b-test::NodesMissing() Failed==============",
-                 (hiddenLayer != NULL) && (outLayer != NULL) && (hiddenNode != NULL) && (outNode != NULL));
-
-        if (hiddenLayer && outLayer && hiddenNode && outNode)
-        {
-            hiddenLayer->setBiasWeight(0.0f);
-            outLayer->setBiasWeight(0.0f);
-            hiddenNode->setEdgeWeight(0, 1.0f); // Wx
-            outNode->setEdgeWeight(0, 1.0f);    // Wy
-
-            glades::Node* ctx = hiddenNode->getContextNode();
-            G_assert(__FILE__, __LINE__,
-                     "==============NN5b-test::ContextNodeMissing() Failed==============",
-                     ctx != NULL);
-            if (ctx)
-            {
-                ctx->setEdgeWeight(0, 1.0f); // Wh
-                ctx->setWeight(999.0f);      // should be reset at sequence boundary
-            }
-
-            const glades::NNetworkStatus st = rnnNet5b.test(di5b);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN5b-test::TestStatus() Failed==============",
-                     st.ok());
-
-            const float expected = 18.0f;
-            const float tol = 1e-3f;
-            const float yLast = outNode->getWeight();
-            printf("[UT] RNN(multi-seq) yLast=%f (expected ~%f)\n", yLast, expected);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN5b-test::RNNResetsAtSequenceBoundaries() Failed==============",
-                     (yLast > expected - tol) && (yLast < expected + tol));
-        }
-
-        delete di5b;
-        delete info5b;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 6 (RNN dataset: rnn.csv)\n");
-    printf("-----------------------------------\n");
-
-    // This test loads the rnn.csv dataset and runs a deterministic RNN forward pass over it.
-    // We explicitly mark the output column to avoid relying on default heuristics.
-    //
-    // Dataset columns: x,y,z (z is output).
-    // We'll configure a 2->1(hidden)->1(output) RNN with linear activations where:
-    // - hidden tracks y (Wx_y=1, Wx_x=0, Wh=0, bias=0)
-    // - output computes z = 0.5*y - 1.5
-    //
-    // This also exercises the RNN context update path over many timesteps.
-    {
-        shmea::GTable raw("datasets/rnn.csv", ',', shmea::GTable::TYPE_FILE);
-        raw.clearOutputs();
-        raw.toggleOutput(2); // z
-
-        glades::NumberInput* di6 = new glades::NumberInput();
-        // Keep raw values so the deterministic mapping below stays exact.
-        di6->import(raw, /*standardizeFlag*/ glades::GMath::NONE);
-
-        // Mirror train->test so test() evaluates the same imported rows.
-        di6->testMatrix = di6->trainMatrix;
-        di6->testExpectedMatrix = di6->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in6 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden6;
-        hidden6.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out6 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info6 = new glades::NNInfo("ut_rnn_csv_forward", in6, hidden6, out6);
-
-        glades::NNetwork rnnNet6(info6, glades::NNetwork::TYPE_RNN);
-        rnnNet6.getTerminatorMutable().setEpoch(1);
-        rnnNet6.getTerminatorMutable().setAccuracy(0);
-
-        rnnNet6.graphMutable().build(info6, di6, glades::NNetwork::TYPE_RNN);
-        rnnNet6.setMustdBuildMeat(false);
-
-        // Hidden layer (counter=1) and output layer (counter=2)
-        glades::Layer* hiddenLayer6 = rnnNet6.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer6 = rnnNet6.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode6 = rnnNet6.graphMutable().getOutputNode(hiddenLayer6, 0);
-        glades::Node* outNode6 = rnnNet6.graphMutable().getOutputNode(outLayer6, 0);
-
-        hiddenLayer6->setBiasWeight(0.0f);
-        outLayer6->setBiasWeight(-1.5f);
-
-        // Inputs are [x,y] in that order; output is z.
-        hiddenNode6->setEdgeWeight(0, 0.0f); // Wx_x
-        hiddenNode6->setEdgeWeight(1, 1.0f); // Wx_y
-
-        glades::Node* ctx6 = hiddenNode6->getContextNode();
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6-test::ContextNodeMissing() Failed==============",
-                 ctx6 != NULL);
-        if (ctx6)
-        {
-            ctx6->setEdgeWeight(0, 0.0f); // Wh = 0 so recurrence doesn't affect mapping
-            ctx6->setWeight(12345.0f);    // should be reset to 0 at run start
-        }
-
-        outNode6->setEdgeWeight(0, 0.5f); // Wy
-
-        rnnNet6.test(di6);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6-test::TestStatus() Failed==============",
-                 rnnNet6.getLastStatus().ok());
-
-        // Last row in dataset is: x=350.5, y=201, z=99
-        const float expectedHLast = 201.0f;
-        const float expectedZLast = 99.0f;
-        const float tol = 1e-3f;
-
-        const float zLast = outNode6->getWeight();
-        const float hLast = hiddenNode6->getWeight();
-        const float ctxLast = (ctx6 ? ctx6->getWeight() : 0.0f);
-
-        printf("[UT] RNN(csv) last h=%f ctx=%f z=%f (expected h~%f z~%f)\n",
-               hLast, ctxLast, zLast, expectedHLast, expectedZLast);
-
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6-test::RNNCSV_LastHidden() Failed==============",
-                 (hLast > expectedHLast - tol) && (hLast < expectedHLast + tol));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6-test::RNNCSV_ContextTracksHidden() Failed==============",
-                 (ctxLast > expectedHLast - tol) && (ctxLast < expectedHLast + tol));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6-test::RNNCSV_LastOutput() Failed==============",
-                 (zLast > expectedZLast - tol) && (zLast < expectedZLast + tol));
-
-        // Should be effectively perfect on this dataset
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6-test::RNNCSV_Accuracy() Failed==============",
-                 rnnNet6.getAccuracy() > 99.0f);
-
-        delete di6;
-        delete info6; // owns in6/hidden6/out6
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 6b (GRU deterministic forward pass)\n");
-    printf("-----------------------------------\n");
-
-    // Deterministic GRU forward semantics over 2 timesteps.
-    //
-    // We use a 1->1(GRU)->1 regression model with weights chosen to simplify the GRU:
-    //   z_t = sigmoid(0) = 0.5
-    //   r_t = sigmoid(0) = 0.5
-    //   h~_t = tanh(Wh*x_t) with Wh=1
-    //   h_t = (1 - z_t)*h_{t-1} + z_t*h~_t
-    //   y_t = Wy*h_t with Wy=1
-    //
-    // With h0=0, x1=0, x2=2:
-    //   h1 = 0.5*tanh(0) = 0
-    //   h2 = 0.5*h1 + 0.5*tanh(2) = 0.5*tanh(2)
-    {
-        glades::NumberInput* di6b = new glades::NumberInput();
-        di6b->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di6b->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di6b->trainMatrix[0][0] = 0.0f;
-        di6b->trainMatrix[1][0] = 2.0f;
-        // Not used by assertions (regression expected values only needed for shape checks)
-        di6b->trainExpectedMatrix[0][0] = 0.0f;
-        di6b->trainExpectedMatrix[1][0] = 0.0f;
-
-        // Mirror train->test so test() evaluates the same two timesteps.
-        di6b->testMatrix = di6b->trainMatrix;
-        di6b->testExpectedMatrix = di6b->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in6b = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden6b;
-        hidden6b.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out6b = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info6b = new glades::NNInfo("ut_gru_forward", in6b, hidden6b, out6b);
-
-        glades::NNetwork gruNet(info6b, glades::NNetwork::TYPE_GRU);
-        gruNet.getTerminatorMutable().setEpoch(1);
-        gruNet.getTerminatorMutable().setAccuracy(0);
-
-        // Pre-build so we can set deterministic weights, then prevent rebuild in test()
-        gruNet.graphMutable().build(info6b, di6b, glades::NNetwork::TYPE_GRU);
-        gruNet.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer = gruNet.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer = gruNet.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode = gruNet.graphMutable().getOutputNode(hiddenLayer, 0);
-        glades::Node* outNode = gruNet.graphMutable().getOutputNode(outLayer, 0);
-
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6b-test::NodesMissing() Failed==============",
-                 (hiddenLayer != NULL) && (outLayer != NULL) && (hiddenNode != NULL) && (outNode != NULL));
-
-        if (hiddenLayer && outLayer && hiddenNode && outNode)
-        {
-            hiddenLayer->setBiasWeight(0.0f);
-            outLayer->setBiasWeight(0.0f);
-
-            // GRU layout for 1 input, 1 hidden:
-            // Node edges: gateCount*(fanIn+1) = 3*(1+1) = 6
-            //   z: Wz at 0, bz at 1
-            //   r: Wr at 2, br at 3
-            //   h: Wh at 4, bh at 5
-            hiddenNode->setEdgeWeight(0, 0.0f); // Wz
-            hiddenNode->setEdgeWeight(1, 0.0f); // bz
-            hiddenNode->setEdgeWeight(2, 0.0f); // Wr
-            hiddenNode->setEdgeWeight(3, 0.0f); // br
-            hiddenNode->setEdgeWeight(4, 1.0f); // Wh
-            hiddenNode->setEdgeWeight(5, 0.0f); // bh
-
-            // Context edges: gateCount*hiddenSize = 3*1 = 3 => Uz, Ur, Uh
-            glades::Node* ctx = hiddenNode->getContextNode();
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6b-test::ContextNodeMissing() Failed==============",
-                     ctx != NULL);
-            if (ctx)
-            {
-                ctx->setEdgeWeight(0, 0.0f); // Uz
-                ctx->setEdgeWeight(1, 0.0f); // Ur
-                ctx->setEdgeWeight(2, 0.0f); // Uh
-                ctx->setWeight(123.0f);       // should be reset at run start
-            }
-
-            // Output: y = Wy*h + b, with Wy=1 and b=0 (per-neuron bias edge)
-            outNode->setEdgeWeight(0, 1.0f); // Wy
-            outNode->setEdgeWeight(1, 0.0f); // b
-
-            const glades::NNetworkStatus st = gruNet.test(di6b);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6b-test::TestStatus() Failed==============",
-                     st.ok());
-
-            const float expected = 0.5f * static_cast<float>(tanh(2.0));
-            const float tol = 1e-3f;
-            const float yLast = outNode->getWeight();
-            const float hLast = hiddenNode->getWeight();
-            const float ctxLast = (ctx ? ctx->getWeight() : 0.0f);
-            printf("[UT] GRU yLast=%f hLast=%f ctx=%f (expected ~%f)\n", yLast, hLast, ctxLast, expected);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6b-test::GRUForward_Output() Failed==============",
-                     (yLast > expected - tol) && (yLast < expected + tol));
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6b-test::GRUForward_Hidden() Failed==============",
-                     (hLast > expected - tol) && (hLast < expected + tol));
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6b-test::GRUForward_ContextTracksHidden() Failed==============",
-                     (ctxLast > expected - tol) && (ctxLast < expected + tol));
-        }
-
-        delete di6b;
-        delete info6b; // owns in6b/hidden6b/out6b
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 6c (LSTM deterministic forward pass)\n");
-    printf("-----------------------------------\n");
-
-    // Deterministic LSTM forward semantics over 2 timesteps.
-    //
-    // We use a 1->1(LSTM)->1 regression model with weights chosen to simplify the LSTM:
-    //   i_t = sigmoid(0) = 0.5
-    //   f_t = sigmoid(0) = 0.5
-    //   o_t = sigmoid(0) = 0.5
-    //   g_t = tanh(Wg*x_t) with Wg=1
-    //   c_t = f_t*c_{t-1} + i_t*g_t
-    //   h_t = o_t*tanh(c_t)
-    //   y_t = Wy*h_t with Wy=1
-    //
-    // With c0=h0=0, x1=0, x2=2:
-    //   c1=0, h1=0
-    //   c2=0.5*tanh(2), h2=0.5*tanh(c2)
-    {
-        glades::NumberInput* di6c = new glades::NumberInput();
-        di6c->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di6c->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di6c->trainMatrix[0][0] = 0.0f;
-        di6c->trainMatrix[1][0] = 2.0f;
-        di6c->trainExpectedMatrix[0][0] = 0.0f;
-        di6c->trainExpectedMatrix[1][0] = 0.0f;
-
-        di6c->testMatrix = di6c->trainMatrix;
-        di6c->testExpectedMatrix = di6c->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in6c = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden6c;
-        hidden6c.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out6c = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info6c = new glades::NNInfo("ut_lstm_forward", in6c, hidden6c, out6c);
-
-        glades::NNetwork lstmNet(info6c, glades::NNetwork::TYPE_LSTM);
-        lstmNet.getTerminatorMutable().setEpoch(1);
-        lstmNet.getTerminatorMutable().setAccuracy(0);
-
-        lstmNet.graphMutable().build(info6c, di6c, glades::NNetwork::TYPE_LSTM);
-        lstmNet.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer = lstmNet.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer = lstmNet.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode = lstmNet.graphMutable().getOutputNode(hiddenLayer, 0);
-        glades::Node* outNode = lstmNet.graphMutable().getOutputNode(outLayer, 0);
-
-        G_assert(__FILE__, __LINE__,
-                 "==============NN6c-test::NodesMissing() Failed==============",
-                 (hiddenLayer != NULL) && (outLayer != NULL) && (hiddenNode != NULL) && (outNode != NULL));
-
-        if (hiddenLayer && outLayer && hiddenNode && outNode)
-        {
-            hiddenLayer->setBiasWeight(0.0f);
-            outLayer->setBiasWeight(0.0f);
-
-            // LSTM layout for 1 input, 1 hidden:
-            // Node edges: gateCount*(fanIn+1) = 4*(1+1) = 8
-            //   i: Wi at 0, bi at 1
-            //   f: Wf at 2, bf at 3
-            //   o: Wo at 4, bo at 5
-            //   g: Wg at 6, bg at 7
-            hiddenNode->setEdgeWeight(0, 0.0f); // Wi
-            hiddenNode->setEdgeWeight(1, 0.0f); // bi
-            hiddenNode->setEdgeWeight(2, 0.0f); // Wf
-            hiddenNode->setEdgeWeight(3, 0.0f); // bf
-            hiddenNode->setEdgeWeight(4, 0.0f); // Wo
-            hiddenNode->setEdgeWeight(5, 0.0f); // bo
-            hiddenNode->setEdgeWeight(6, 1.0f); // Wg
-            hiddenNode->setEdgeWeight(7, 0.0f); // bg
-
-            // Context edges: gateCount*hiddenSize = 4*1 = 4 => Ui, Uf, Uo, Ug
-            glades::Node* ctx = hiddenNode->getContextNode();
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6c-test::ContextNodeMissing() Failed==============",
-                     ctx != NULL);
-            if (ctx)
-            {
-                ctx->setEdgeWeight(0, 0.0f); // Ui
-                ctx->setEdgeWeight(1, 0.0f); // Uf
-                ctx->setEdgeWeight(2, 0.0f); // Uo
-                ctx->setEdgeWeight(3, 0.0f); // Ug
-                ctx->setWeight(456.0f);      // should be reset at run start
-            }
-
-            outNode->setEdgeWeight(0, 1.0f); // Wy
-            outNode->setEdgeWeight(1, 0.0f); // b
-
-            const glades::NNetworkStatus st = lstmNet.test(di6c);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6c-test::TestStatus() Failed==============",
-                     st.ok());
-
-            const float c2 = 0.5f * static_cast<float>(tanh(2.0));
-            const float expected = 0.5f * static_cast<float>(tanh(static_cast<double>(c2)));
-            const float tol = 1e-3f;
-            const float yLast = outNode->getWeight();
-            const float hLast = hiddenNode->getWeight();
-            const float ctxLast = (ctx ? ctx->getWeight() : 0.0f);
-            printf("[UT] LSTM yLast=%f hLast=%f ctx=%f (expected ~%f)\n", yLast, hLast, ctxLast, expected);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6c-test::LSTMForward_Output() Failed==============",
-                     (yLast > expected - tol) && (yLast < expected + tol));
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6c-test::LSTMForward_Hidden() Failed==============",
-                     (hLast > expected - tol) && (hLast < expected + tol));
-            G_assert(__FILE__, __LINE__,
-                     "==============NN6c-test::LSTMForward_ContextTracksHidden() Failed==============",
-                     (ctxLast > expected - tol) && (ctxLast < expected + tol));
-        }
-
-        delete di6c;
-        delete info6c; // owns in6c/hidden6c/out6c
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 7 (RNN full BPTT: future loss updates earlier Wx)\n");
-    printf("-----------------------------------\n");
-
-    // This test detects whether gradients propagate through time (BPTT).
-    //
-    // We use a 1->1->1 linear RNN (no biases) with weights:
-    //   h_t = Wx*x_t + Wh*h_{t-1}
-    //   y_t = Wy*h_t
-    // Initialize Wx=Wh=Wy=1, h0=0
-    //
-    // Sequence: x1=1, x2=0
-    // Targets:  y1=1 (matches initial y1), y2=0 (incurs loss only at t=2)
-    //
-    // With full BPTT, the loss at t=2 should backprop to t=1 and update Wx (because x1 influences h1,
-    // which influences y2 via recurrence). Without BPTT, Wx would not change because x2=0.
-    //
-    // With lr=0.1 and mean-over-T update (T=2), expected Wx becomes ~0.9 after 1 epoch.
-    {
-        glades::NumberInput* di7 = new glades::NumberInput();
-        di7->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di7->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di7->trainMatrix[0][0] = 1.0f;  // x1
-        di7->trainMatrix[1][0] = 0.0f;  // x2
-        di7->trainExpectedMatrix[0][0] = 1.0f; // y1 target (no loss at t=1)
-        di7->trainExpectedMatrix[1][0] = 0.0f; // y2 target (loss at t=2)
-
-        glades::InputLayerInfo* in7 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.1f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden7;
-        hidden7.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.1f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out7 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info7 = new glades::NNInfo("ut_rnn_bptt", in7, hidden7, out7);
-
-        glades::NNetwork rnnNet7(info7, glades::NNetwork::TYPE_RNN);
-        rnnNet7.getTerminatorMutable().setEpoch(1);
-        rnnNet7.getTerminatorMutable().setAccuracy(0);
-
-        rnnNet7.graphMutable().build(info7, di7, glades::NNetwork::TYPE_RNN);
-        rnnNet7.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer7 = rnnNet7.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer7 = rnnNet7.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode7 = rnnNet7.graphMutable().getOutputNode(hiddenLayer7, 0);
-        glades::Node* outNode7 = rnnNet7.graphMutable().getOutputNode(outLayer7, 0);
-
-        hiddenLayer7->setBiasWeight(0.0f);
-        outLayer7->setBiasWeight(0.0f);
-
-        // Wx=1, Wy=1
-        hiddenNode7->setEdgeWeight(0, 1.0f);
-        outNode7->setEdgeWeight(0, 1.0f);
-
-        // Wh=1 and ensure context resets from a non-zero starting value
-        glades::Node* ctx7 = hiddenNode7->getContextNode();
-        G_assert(__FILE__, __LINE__,
-                 "==============NN7-test::ContextNodeMissing() Failed==============",
-                 ctx7 != NULL);
-        if (ctx7)
-        {
-            ctx7->setEdgeWeight(0, 1.0f); // Wh
-            ctx7->setWeight(10.0f);       // should be reset to 0 at run start
-        }
-
-        // Train exactly 1 epoch
-        const glades::NNetworkStatus stTrain7 = rnnNet7.train(di7);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN7-test::TrainStatus() Failed==============",
-                 stTrain7.ok());
-
-        rnnNet7.materializeGraphParameters();
-
-        /*
-         * Accuracy is not meant to be 100%
-         */
-        const float wxFinal = hiddenNode7->getEdgeWeight(0);
-        const float expectedWx = 0.9f;
-        const float tol = 1e-3f;
-        printf("[UT] RNN(BPTT) Wx final=%f (expected ~%f)\n", wxFinal, expectedWx);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN7-test::RNNBPTT_UpdatesWxFromFutureLoss() Failed==============",
-                 (wxFinal > expectedWx - tol) && (wxFinal < expectedWx + tol));
-
-        delete di7;
-        delete info7;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 8 (RNN train on rnn.csv with BPTT)\n");
-    printf("-----------------------------------\n");
-
-    // This test trains an RNN end-to-end on datasets/rnn.csv and expects high accuracy.
-    // It is similar in spirit to Tests 1-3: train the network and assert accuracy threshold.
-    //
-    // Dataset columns: x,y,z (z is output).
-    // We'll use a small linear RNN. Context recurrence is allowed but initialized to 0.
-    {
-        shmea::GTable raw("datasets/rnn.csv", ',', shmea::GTable::TYPE_FILE);
-        raw.clearOutputs();
-        raw.toggleOutput(2); // z
-
-        glades::NumberInput* di8 = new glades::NumberInput();
-        // Use NumberInput's built-in min-max normalization; for this dataset it makes
-        // y_norm == z_norm exactly (since y = 2z + 3), which is ideal for a stability-focused
-        // end-to-end training test.
-        di8->import(raw, /*standardizeFlag*/ glades::GMath::MINMAX);
-
-        // Mirror train->test so test() evaluates the same imported rows.
-        di8->testMatrix = di8->trainMatrix;
-        di8->testExpectedMatrix = di8->trainExpectedMatrix;
-
-        const float lr = 0.05f;
-        glades::InputLayerInfo* in8 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden8;
-        hidden8.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out8 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info8 = new glades::NNInfo("ut_rnn_csv_train_bptt", in8, hidden8, out8);
-
-        glades::NNetwork rnnNet8(info8, glades::NNetwork::TYPE_RNN);
-        rnnNet8.getTerminatorMutable().setEpoch(500);
-
-        // Build so we can set deterministic starting weights, then prevent rebuild in train()
-        rnnNet8.graphMutable().build(info8, di8, glades::NNetwork::TYPE_RNN);
-        rnnNet8.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer8 = rnnNet8.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer8 = rnnNet8.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode8 = rnnNet8.graphMutable().getOutputNode(hiddenLayer8, 0);
-        glades::Node* outNode8 = rnnNet8.graphMutable().getOutputNode(outLayer8, 0);
-
-        hiddenLayer8->setBiasWeight(0.0f);
-        // In MINMAX space for this dataset:
-        //   y_norm = (y - 3) / 198
-        //   z_norm = (z - 0) / 99
-        // Since y = 2z + 3, we have y_norm == z_norm exactly.
-        outLayer8->setBiasWeight(0.0f);
-
-        // Inputs are [x,y] in that order. Start close to the known mapping: z ≈ 0.5*y - 1.5
-        // but not perfect, so training must still move.
-        hiddenNode8->setEdgeWeight(0, 0.0f); // Wx_x
-        hiddenNode8->setEdgeWeight(1, 1.0f); // Wx_y (copy y_norm)
-        outNode8->setEdgeWeight(0, 0.8f);    // Wy (close to 1.0 but not perfect)
-
-        glades::Node* ctx8 = hiddenNode8->getContextNode();
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::ContextNodeMissing() Failed==============",
-                 ctx8 != NULL);
-        if (ctx8)
-        {
-            ctx8->setEdgeWeight(0, 0.0f); // Wh initialized to 0
-            ctx8->setWeight(0.0f);
-        }
-
-        const glades::NNetworkStatus stTrain8 = rnnNet8.train(di8);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::TrainStatus() Failed==============",
-                 stTrain8.ok());
-
-        // Evaluate full-sequence accuracy over timesteps (RUN_TEST path reports timestep-average)
-        const glades::NNetworkStatus stTest8 = rnnNet8.test(di8);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::TestStatus() Failed==============",
-                 stTest8.ok());
-
-        printf("[UT] RNN(rnn.csv) accuracy=%f%%\n", rnnNet8.getAccuracy());
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::RNNCSV_TrainAccuracy() Failed==============",
-                 rnnNet8.getAccuracy() >= 95.0f);
-
-        delete di8;
-        delete info8;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 9 (GRU deterministic forward)\n");
-    printf("-----------------------------------\n");
-
-    // Deterministic 1->1->1 GRU forward pass.
-    // Gates are saturated so the recurrence is easy to predict:
-    // - z ~= 1, r ~= 1 (bias +20, weights 0)
-    // - candidate = tanh(x) (Wh=1, Uh=0, bias 0)
-    // - output = hidden (Wy=1, bias 0)
-    // Sequence: x=[0,1] => y2 ~= tanh(1)
-    {
-        glades::NumberInput* di9 = new glades::NumberInput();
-        di9->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di9->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di9->trainMatrix[0][0] = 0.0f;
-        di9->trainMatrix[1][0] = 1.0f;
-
-        // Mirror train->test so test() evaluates the same rows.
-        di9->testMatrix = di9->trainMatrix;
-        di9->testExpectedMatrix = di9->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in9 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden9;
-        hidden9.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out9 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info9 = new glades::NNInfo("ut_gru_forward", in9, hidden9, out9);
-
-        glades::NNetwork gruNet(info9, glades::NNetwork::TYPE_GRU);
-        gruNet.getTerminatorMutable().setEpoch(1);
-        gruNet.getTerminatorMutable().setAccuracy(0);
-
-        gruNet.graphMutable().build(info9, di9, glades::NNetwork::TYPE_GRU);
-        gruNet.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer9 = gruNet.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer9 = gruNet.graphMutable().getOutputLayer(2);
-        glades::Node* hNode9 = gruNet.graphMutable().getOutputNode(hiddenLayer9, 0);
-        glades::Node* yNode9 = gruNet.graphMutable().getOutputNode(outLayer9, 0);
-
-        G_assert(__FILE__, __LINE__,
-                 "==============NN9-test::NodesMissing() Failed==============",
-                 (hiddenLayer9 != NULL) && (outLayer9 != NULL) && (hNode9 != NULL) && (yNode9 != NULL));
-
-        glades::Node* ctx9 = (hNode9 ? hNode9->getContextNode() : NULL);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN9-test::ContextNodeMissing() Failed==============",
-                 ctx9 != NULL);
-
-        if (hNode9 && yNode9 && ctx9)
-        {
-            // Hidden node edge layout (prevSize=1, stride=2):
-            // z: [w0,b] => idx 0,1
-            // r: [w0,b] => idx 2,3
-            // h: [w0,b] => idx 4,5
-            hNode9->setEdgeWeight(0, 0.0f);  // Wz
-            hNode9->setEdgeWeight(1, 20.0f); // bz
-            hNode9->setEdgeWeight(2, 0.0f);  // Wr
-            hNode9->setEdgeWeight(3, 20.0f); // br
-            hNode9->setEdgeWeight(4, 1.0f);  // Wh
-            hNode9->setEdgeWeight(5, 0.0f);  // bh
-
-            // Recurrent weights: [Uz,Ur,Uh] each length hiddenSize(=1)
-            ctx9->setEdgeWeight(0, 0.0f);
-            ctx9->setEdgeWeight(1, 0.0f);
-            ctx9->setEdgeWeight(2, 0.0f);
-
-            // Output: y = h
-            yNode9->setEdgeWeight(0, 1.0f);
-            yNode9->setEdgeWeight(1, 0.0f); // bias edge
-        }
-
-        const glades::NNetworkStatus st9 = gruNet.test(di9);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN9-test::TestStatus() Failed==============",
-                 st9.ok());
-
-        const float expected = static_cast<float>(tanh(1.0));
-        const float y2 = (yNode9 ? yNode9->getWeight() : 0.0f);
-        const float tol = 1e-3f;
-        printf("[UT] GRU y2=%f (expected ~%f)\n", y2, expected);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN9-test::GRUForward() Failed==============",
-                 (y2 > expected - tol) && (y2 < expected + tol));
-
-        delete di9;
-        delete info9;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 10 (LSTM deterministic forward)\n");
-    printf("-----------------------------------\n");
-
-    // Deterministic 1->1->1 LSTM forward pass.
-    // Gates are saturated so the dynamics are easy to predict:
-    // - i ~= 1, f ~= 0, o ~= 1 (bias +20, -20, +20; weights 0)
-    // - g = tanh(x) (Wg=1, Ug=0, bias 0)
-    // => c2 = tanh(1), h2 = tanh(c2) = tanh(tanh(1))
-    {
-        glades::NumberInput* di10 = new glades::NumberInput();
-        di10->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di10->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di10->trainMatrix[0][0] = 0.0f;
-        di10->trainMatrix[1][0] = 1.0f;
-
-        // Mirror train->test so test() evaluates the same rows.
-        di10->testMatrix = di10->trainMatrix;
-        di10->testExpectedMatrix = di10->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in10 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden10;
-        hidden10.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.0f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out10 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info10 = new glades::NNInfo("ut_lstm_forward", in10, hidden10, out10);
-
-        glades::NNetwork lstmNet(info10, glades::NNetwork::TYPE_LSTM);
-        lstmNet.getTerminatorMutable().setEpoch(1);
-        lstmNet.getTerminatorMutable().setAccuracy(0);
-
-        lstmNet.graphMutable().build(info10, di10, glades::NNetwork::TYPE_LSTM);
-        lstmNet.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer10 = lstmNet.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer10 = lstmNet.graphMutable().getOutputLayer(2);
-        glades::Node* hNode10 = lstmNet.graphMutable().getOutputNode(hiddenLayer10, 0);
-        glades::Node* yNode10 = lstmNet.graphMutable().getOutputNode(outLayer10, 0);
-
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::NodesMissing() Failed==============",
-                 (hiddenLayer10 != NULL) && (outLayer10 != NULL) && (hNode10 != NULL) && (yNode10 != NULL));
-
-        glades::Node* ctx10 = (hNode10 ? hNode10->getContextNode() : NULL);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::ContextNodeMissing() Failed==============",
-                 ctx10 != NULL);
-
-        if (hNode10 && yNode10 && ctx10)
-        {
-            // Hidden node edge layout (prevSize=1, stride=2), gate order [i,f,o,g]:
-            // i: idx 0,1
-            // f: idx 2,3
-            // o: idx 4,5
-            // g: idx 6,7
-            hNode10->setEdgeWeight(0, 0.0f);   // Wi
-            hNode10->setEdgeWeight(1, 20.0f);  // bi
-            hNode10->setEdgeWeight(2, 0.0f);   // Wf
-            hNode10->setEdgeWeight(3, -20.0f); // bf
-            hNode10->setEdgeWeight(4, 0.0f);   // Wo
-            hNode10->setEdgeWeight(5, 20.0f);  // bo
-            hNode10->setEdgeWeight(6, 1.0f);   // Wg
-            hNode10->setEdgeWeight(7, 0.0f);   // bg
-
-            // Recurrent weights: [Ui,Uf,Uo,Ug] each length hiddenSize(=1)
-            ctx10->setEdgeWeight(0, 0.0f);
-            ctx10->setEdgeWeight(1, 0.0f);
-            ctx10->setEdgeWeight(2, 0.0f);
-            ctx10->setEdgeWeight(3, 0.0f);
-
-            // Output: y = h
-            yNode10->setEdgeWeight(0, 1.0f);
-            yNode10->setEdgeWeight(1, 0.0f); // bias edge
-        }
-
-        const glades::NNetworkStatus st10 = lstmNet.test(di10);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::TestStatus() Failed==============",
-                 st10.ok());
-
-        const float expected = static_cast<float>(tanh(tanh(1.0)));
-        const float y2 = (yNode10 ? yNode10->getWeight() : 0.0f);
-        const float c2 = (hNode10 ? hNode10->getCellState() : 0.0f);
-        const float expectedC = static_cast<float>(tanh(1.0));
-        const float tol = 1e-3f;
-        printf("[UT] LSTM y2=%f c2=%f (expected y~%f c~%f)\n", y2, c2, expected, expectedC);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::LSTMForward() Failed==============",
-                 (y2 > expected - tol) && (y2 < expected + tol));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::LSTMCellState() Failed==============",
-                 (c2 > expectedC - tol) && (c2 < expectedC + tol));
-
-        delete di10;
-        delete info10;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 11 (GRU BPTT: future loss updates candidate Wx)\n");
-    printf("-----------------------------------\n");
-
-    // This test verifies that GRU gradients propagate through time (BPTT).
-    //
-    // We configure a 1->1->1 GRU to behave like a simple tanh RNN by saturating gates:
-    // - z ~= 1, r ~= 1 via large positive biases (weights 0)
-    // Then h_t = tanh(Wx * x_t + Uh * h_{t-1})
-    // and y_t = Wy * h_t.
-    //
-    // Sequence: x1=1, x2=0. Targets: y1 == y1_pred (no loss), y2=0 (loss only at t=2).
-    // With BPTT, that future loss must update Wx (since x1 influences h1 which influences y2).
-    {
-        glades::NumberInput* di11 = new glades::NumberInput();
-        di11->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di11->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di11->trainMatrix[0][0] = 1.0f; // x1
-        di11->trainMatrix[1][0] = 0.0f; // x2
-
-        const float a = static_cast<float>(tanh(1.0));   // h1 with Wx=1, Uh=1, h0=0
-        di11->trainExpectedMatrix[0][0] = a;             // y1 target matches prediction => no loss at t=1
-        di11->trainExpectedMatrix[1][0] = 0.0f;          // y2 target => loss at t=2 only
-
-        const float lr = 0.1f;
-        glades::InputLayerInfo* in11 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden11;
-        hidden11.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out11 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info11 = new glades::NNInfo("ut_gru_bptt", in11, hidden11, out11);
-
-        glades::NNetwork gruNet11(info11, glades::NNetwork::TYPE_GRU);
-        gruNet11.getTerminatorMutable().setEpoch(1);
-        gruNet11.getTerminatorMutable().setAccuracy(0);
-
-        gruNet11.graphMutable().build(info11, di11, glades::NNetwork::TYPE_GRU);
-        gruNet11.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer11 = gruNet11.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer11 = gruNet11.graphMutable().getOutputLayer(2);
-        glades::Node* hNode11 = gruNet11.graphMutable().getOutputNode(hiddenLayer11, 0);
-        glades::Node* yNode11 = gruNet11.graphMutable().getOutputNode(outLayer11, 0);
-        glades::Node* ctx11 = (hNode11 ? hNode11->getContextNode() : NULL);
-
-        G_assert(__FILE__, __LINE__,
-                 "==============NN11-test::NodesMissing() Failed==============",
-                 (hiddenLayer11 != NULL) && (outLayer11 != NULL) && (hNode11 != NULL) && (yNode11 != NULL) && (ctx11 != NULL));
-
-        if (hNode11 && yNode11 && ctx11)
-        {
-            // Hidden node edge layout (prevSize=1, stride=2):
-            // z: idx 0,1
-            // r: idx 2,3
-            // h: idx 4,5
-            hNode11->setEdgeWeight(0, 0.0f);  // Wz
-            hNode11->setEdgeWeight(1, 20.0f); // bz => z ~= 1
-            hNode11->setEdgeWeight(2, 0.0f);  // Wr
-            hNode11->setEdgeWeight(3, 20.0f); // br => r ~= 1
-            hNode11->setEdgeWeight(4, 1.0f);  // Wh (candidate input weight)  <-- we assert this changes
-            hNode11->setEdgeWeight(5, 0.0f);  // bh
-
-            // Recurrent weights: [Uz,Ur,Uh]
-            ctx11->setEdgeWeight(0, 0.0f);
-            ctx11->setEdgeWeight(1, 0.0f);
-            ctx11->setEdgeWeight(2, 1.0f); // Uh = 1 so future loss flows back to t=1
-            ctx11->setWeight(0.0f);
-
-            // Output: y = h (linear)
-            yNode11->setEdgeWeight(0, 1.0f);
-            yNode11->setEdgeWeight(1, 0.0f); // bias edge
-        }
-
-        const glades::NNetworkStatus st11 = gruNet11.train(di11);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN11-test::TrainStatus() Failed==============",
-                 st11.ok());
-
-        gruNet11.materializeGraphParameters();
-
-        // Expected update (mirrors network.cpp GRU math, with window length T=2 averaging):
-        // h1 = tanh(1) = a
-        // h2 = tanh(a) = b
-        // deltaY2 = 2*(b - 0) (linear output, MSE)
-        // daH2 = deltaY2 * (1 - b^2)
-        // dh1_from_future = daH2 * Uh (Uh=1)
-        // daH1 = dh1_from_future * (1 - a^2)
-        // Wx_new = 1 - lr * daH1 / T
-        const float b = static_cast<float>(tanh(static_cast<double>(a)));
-        const float deltaY2 = 2.0f * (b - 0.0f);
-        const float daH2 = deltaY2 * (1.0f - (b * b));
-        const float daH1 = daH2 * (1.0f - (a * a));
-        const float expectedWx = 1.0f - (lr * daH1 / 2.0f);
-
-        const float wxFinal = (hNode11 ? hNode11->getEdgeWeight(4) : 0.0f);
-        const float tol = 2e-3f;
-        printf("[UT] GRU(BPTT) Wx final=%f (expected ~%f)\n", wxFinal, expectedWx);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN11-test::GRUBPTT_UpdatesWxFromFutureLoss() Failed==============",
-                 (wxFinal > expectedWx - tol) && (wxFinal < expectedWx + tol));
-
-        delete di11;
-        delete info11;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 12 (Determinism: same seed => same trained weights)\n");
-    printf("-----------------------------------\n");
-
-    // This test verifies that the ML engine no longer depends on global rand()/srand()
-    // behavior and is reproducible when using NNetwork::setSeed().
-    //
-    // We train two identical networks with the same seed on the same dataset for the
-    // same number of epochs, with non-zero dropout to exercise stochasticity.
-    // The final weights must match (within floating tolerance).
-    {
-        // Toy dataset: 4 samples, 2 features, 1 regression output
-        glades::NumberInput* di12 = new glades::NumberInput();
-        di12->trainMatrix = shmea::GMatrix(4, shmea::GVector<float>(2, 0.0f));
-        di12->trainExpectedMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
-
-        di12->trainMatrix[0][0] = 0.0f; di12->trainMatrix[0][1] = 0.0f; di12->trainExpectedMatrix[0][0] = 0.0f;
-        di12->trainMatrix[1][0] = 1.0f; di12->trainMatrix[1][1] = 0.0f; di12->trainExpectedMatrix[1][0] = 1.0f;
-        di12->trainMatrix[2][0] = 0.0f; di12->trainMatrix[2][1] = 1.0f; di12->trainExpectedMatrix[2][0] = 1.0f;
-        di12->trainMatrix[3][0] = 1.0f; di12->trainMatrix[3][1] = 1.0f; di12->trainExpectedMatrix[3][0] = 2.0f;
-
-        const float lr = 0.05f;
-        glades::InputLayerInfo* in12a = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.5f, // exercise input dropout
-            /*activationType*/ glades::GMath::TANH,
-            /*activationParam*/ 0.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden12a;
-        hidden12a.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 3,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.5f, // exercise hidden dropout
-            /*activationType*/ glades::GMath::TANH,
-            /*activationParam*/ 0.0f
-        ));
-        glades::OutputLayerInfo* out12a = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info12a = new glades::NNInfo("ut_determinism_a", in12a, hidden12a, out12a);
-
-        // Create a second, identical skeleton (do not share the same NNInfo instance).
-        glades::InputLayerInfo* in12b = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.5f,
-            /*activationType*/ glades::GMath::TANH,
-            /*activationParam*/ 0.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden12b;
-        hidden12b.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 3,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.5f,
-            /*activationType*/ glades::GMath::TANH,
-            /*activationParam*/ 0.0f
-        ));
-        glades::OutputLayerInfo* out12b = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info12b = new glades::NNInfo("ut_determinism_b", in12b, hidden12b, out12b);
-
-        glades::NNetwork netA(info12a, glades::NNetwork::TYPE_DFF);
-        glades::NNetwork netB(info12b, glades::NNetwork::TYPE_DFF);
-        netA.getTerminatorMutable().setEpoch(3);
-        netA.getTerminatorMutable().setAccuracy(0);
-        netB.getTerminatorMutable().setEpoch(3);
-        netB.getTerminatorMutable().setAccuracy(0);
-
-        const uint64_t seed = 123456789ULL;
-
-        netA.setSeed(seed);
-        const glades::NNetworkStatus stA = netA.train(di12);
-        G_assert(__FILE__, __LINE__, "==============NN12-test::TrainStatus_A() Failed==============", stA.ok());
-
-        netB.setSeed(seed);
-        const glades::NNetworkStatus stB = netB.train(di12);
-        G_assert(__FILE__, __LINE__, "==============NN12-test::TrainStatus_B() Failed==============", stB.ok());
-
-        netA.materializeGraphParameters();
-        netB.materializeGraphParameters();
-
-        // Compare all feedforward weights (including bias edges) across layers.
-        double sumA = 0.0;
-        double sumB = 0.0;
-        unsigned int countA = 0;
-        unsigned int countB = 0;
-
-        const unsigned int layersA = netA.graphMutable().getLayersSize();
-        const unsigned int layersB = netB.graphMutable().getLayersSize();
-        G_assert(__FILE__, __LINE__, "==============NN12-test::LayerCountMismatch() Failed==============", layersA == layersB);
-
-        const unsigned int L = std::min(layersA, layersB);
-        for (unsigned int li = 1; li <= L; ++li)
-        {
-            glades::Layer* la = netA.graphMutable().getOutputLayer(li);
-            glades::Layer* lb = netB.graphMutable().getOutputLayer(li);
-            if (!la || !lb) continue;
-
-            const unsigned int na = la->size();
-            const unsigned int nb = lb->size();
-            if (na != nb) continue;
-
-            for (unsigned int j = 0; j < na; ++j)
-            {
-                glades::Node* a = netA.graphMutable().getOutputNode(la, j);
-                glades::Node* b = netB.graphMutable().getOutputNode(lb, j);
-                if (!a || !b) continue;
-                if (a->numEdges() != b->numEdges()) continue;
-
-                for (unsigned int e = 0; e < a->numEdges(); ++e)
-                {
-                    sumA += static_cast<double>(a->getEdgeWeight(e));
-                    sumB += static_cast<double>(b->getEdgeWeight(e));
-                    ++countA;
-                    ++countB;
-                }
-            }
-        }
-
-        printf("[UT] Determinism sums: A=%f B=%f (count=%u)\n", (float)sumA, (float)sumB, countA);
-        const double tol = 1e-6;
-        G_assert(__FILE__, __LINE__, "==============NN12-test::WeightCountMismatch() Failed==============", countA == countB && countA > 0);
-        G_assert(__FILE__, __LINE__, "==============NN12-test::DeterministicWeights() Failed==============", fabs(sumA - sumB) < tol);
-
-        delete di12;
-        delete info12a;
-        delete info12b;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 13 (LR schedule: exp decay multiplier + effective LR)\n");
-    printf("-----------------------------------\n");
-
-    // This test verifies the modern learning-rate schedule plumbing:
-    // - setLearningRateScheduleExp(gamma) produces lrMultiplier = gamma^(epoch-1)
-    // - the reported metrics.learningRate equals baseLR * lrMultiplier
-    // - base LR is restored after each epoch (no persistent mutation of NNInfo).
     {
         class CaptureMetricsCb : public glades::ITrainingCallbacks
         {
         public:
-            std::vector<glades::NNetworkEpochMetrics> epochs;
+			glades::NNetworkEpochMetrics last;
+			bool saw;
+			CaptureMetricsCb() : last(), saw(false) {}
+			virtual void onRunStart(const glades::NNetwork&, int) {}
             virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
             {
-                epochs.push_back(m);
+				last = m;
+				saw = true;
                 return false;
             }
-        };
+			virtual void onRunEnd(const glades::NNetwork&, int) {}
+		};
 
-        glades::NumberInput* di13 = new glades::NumberInput();
-        di13->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di13->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di13->trainMatrix[0][0] = 1.0f;
-        di13->trainExpectedMatrix[0][0] = 2.0f;
-        di13->trainMatrix[1][0] = 2.0f;
-        di13->trainExpectedMatrix[1][0] = 4.0f;
+		glades::NumberInput* di = new glades::NumberInput();
+		di->testMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
+		di->testExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
+		di->testMatrix[0][0] = 1.0f;
+		di->testExpectedMatrix[0][0] = 2.0f;
+		di->testMatrix[1][0] = 2.0f;
+		di->testExpectedMatrix[1][0] = 4.0f;
 
-        const float baseLR = 0.1f;
-        glades::InputLayerInfo* in13 = new glades::InputLayerInfo(
+		// Mirror test->train to keep the DataInput fully populated.
+		di->trainMatrix = di->testMatrix;
+		di->trainExpectedMatrix = di->testExpectedMatrix;
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
             /*batchSize*/ 1,
-            /*learningRate*/ baseLR,
+		    /*learningRate*/ 0.0f,
             /*momentumFactor*/ 0.0f,
             /*weightDecay1*/ 0.0f,
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden13;
-        glades::OutputLayerInfo* out13 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info13 = new glades::NNInfo("ut_lr_schedule_exp", in13, hidden13, out13);
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_reg_metrics", in, hidden, out);
 
-        glades::NNetwork net13(info13, glades::NNetwork::TYPE_DFF);
-        net13.getTerminatorMutable().setEpoch(3);
-        net13.getTerminatorMutable().setAccuracy(0);
-
-        const float gamma = 0.5f;
-        net13.setLearningRateScheduleExp(gamma);
+		glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_reg_metrics", 999u, /*w*/ 1.0f, /*b*/ 0.0f);
 
         CaptureMetricsCb cb;
-        const glades::NNetworkStatus st13 = net13.train(di13, &cb);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN13-test::TrainStatus() Failed==============",
-                 st13.ok());
+		const glades::NNetworkStatus st = net.test(di, &cb);
+		G_assert(__FILE__, __LINE__, "==============NN::RegMetrics TestStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::RegMetrics SawMetrics() Failed==============", cb.saw);
 
-        G_assert(__FILE__, __LINE__,
-                 "==============NN13-test::EpochCount() Failed==============",
-                 cb.epochs.size() == 3);
+		const float expMSE = 2.5f;
+		const float expMAE = 1.5f;
+		const float expRMSE = static_cast<float>(sqrt(2.5));
+		const float tol = 1e-4f;
+		if (cb.saw)
+		{
+			printf("[UT] Reg metrics: MSE=%f MAE=%f RMSE=%f\n", cb.last.totalError, cb.last.regMAE, cb.last.regRMSE);
+			G_assert(__FILE__, __LINE__, "==============NN::RegMetrics MSE() Failed==============", fabs(cb.last.totalError - expMSE) < tol);
+			G_assert(__FILE__, __LINE__, "==============NN::RegMetrics MAE() Failed==============", fabs(cb.last.regMAE - expMAE) < tol);
+			G_assert(__FILE__, __LINE__, "==============NN::RegMetrics RMSE() Failed==============", fabs(cb.last.regRMSE - expRMSE) < tol);
+		}
 
-        const float tol = 1e-6f;
-        if (cb.epochs.size() == 3)
-        {
-            const float m1 = cb.epochs[0].lrMultiplier;
-            const float m2 = cb.epochs[1].lrMultiplier;
-            const float m3 = cb.epochs[2].lrMultiplier;
-
-            // exp schedule: multiplier = gamma^(epoch-1)
-            G_assert(__FILE__, __LINE__,
-                     "==============NN13-test::MultiplierEpoch1() Failed==============",
-                     fabs(m1 - 1.0f) < tol);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN13-test::MultiplierEpoch2() Failed==============",
-                     fabs(m2 - gamma) < tol);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN13-test::MultiplierEpoch3() Failed==============",
-                     fabs(m3 - (gamma * gamma)) < tol);
-
-            // Effective LR should track baseLR * multiplier (output transition index == 0)
-            G_assert(__FILE__, __LINE__,
-                     "==============NN13-test::EffectiveLR_Epoch1() Failed==============",
-                     fabs(cb.epochs[0].learningRate - (baseLR * 1.0f)) < 1e-5f);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN13-test::EffectiveLR_Epoch2() Failed==============",
-                     fabs(cb.epochs[1].learningRate - (baseLR * gamma)) < 1e-5f);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN13-test::EffectiveLR_Epoch3() Failed==============",
-                     fabs(cb.epochs[2].learningRate - (baseLR * gamma * gamma)) < 1e-5f);
-        }
-
-        // Base LR must be restored after the run (no persistent scaling).
-        G_assert(__FILE__, __LINE__,
-                 "==============NN13-test::BaseLRRestored() Failed==============",
-                 (net13.getNNInfo() != NULL) && fabs(net13.getNNInfo()->getLearningRate(0) - baseLR) < 1e-6f);
-
-        delete di13;
-        delete info13;
+		delete di;
+		delete info;
     }
 
     printf("-----------------------------------\n");
-    printf("NN Test 14 (Global grad-norm clipping: DFF)\n");
+	printf("NN Test E (Grad clip disabled => scale=1)\n");
     printf("-----------------------------------\n");
-
-    // This test verifies global gradient-norm clipping for the DFF tensor path:
-    // - When clipNorm is small and gradients are large, metrics.gradNormScale < 1.
-    // - metrics.gradNorm reports the unclipped norm (before scaling).
     {
         class CaptureMetricsCb : public glades::ITrainingCallbacks
         {
         public:
             glades::NNetworkEpochMetrics last;
             bool saw;
-            CaptureMetricsCb() : saw(false) {}
+			CaptureMetricsCb() : last(), saw(false) {}
+			virtual void onRunStart(const glades::NNetwork&, int) {}
             virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
             {
                 last = m;
                 saw = true;
                 return false;
             }
-        };
+			virtual void onRunEnd(const glades::NNetwork&, int) {}
+		};
 
-        glades::NumberInput* di14 = new glades::NumberInput();
-        di14->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di14->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di14->trainMatrix[0][0] = 1000.0f;        // huge input => huge gradient
-        di14->trainExpectedMatrix[0][0] = 1000.0f; // huge target => large error if weights ~0
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
+		di->trainMatrix[0][0] = 10.0f;
+		di->trainExpectedMatrix[0][0] = 0.0f;
 
-        glades::InputLayerInfo* in14 = new glades::InputLayerInfo(
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
             /*batchSize*/ 1,
             /*learningRate*/ 0.1f,
             /*momentumFactor*/ 0.0f,
@@ -1956,549 +1440,364 @@ void NNUnitTest()
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden14;
-        glades::OutputLayerInfo* out14 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info14 = new glades::NNInfo("ut_global_grad_clip_dff", in14, hidden14, out14);
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_grad_clip_disabled", in, hidden, out);
 
-        glades::NNetwork net14(info14, glades::NNetwork::TYPE_DFF);
-        net14.getTerminatorMutable().setEpoch(1);
-        net14.getTerminatorMutable().setAccuracy(0);
-
-        // Build so we can force deterministic initial weights.
-        net14.graphMutable().build(info14, di14, glades::NNetwork::TYPE_DFF);
-        net14.setMustdBuildMeat(false);
-
-        glades::Layer* outLayer14 = net14.graphMutable().getOutputLayer(1);
-        glades::Node* outNode14 = net14.graphMutable().getOutputNode(outLayer14, 0);
-        if (outNode14)
-        {
-            // Weight edge (idx 0) = 0, bias edge (idx 1) = 0
-            outNode14->setEdgeWeight(0, 0.0f);
-            outNode14->setEdgeWeight(1, 0.0f);
-        }
-
-        const float clipNorm = 10.0f;
-        net14.setGlobalGradClipNorm(clipNorm);
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
 
         CaptureMetricsCb cb;
-        const glades::NNetworkStatus st14 = net14.train(di14, &cb);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN14-test::TrainStatus() Failed==============",
-                 st14.ok());
-        G_assert(__FILE__, __LINE__,
-                 "==============NN14-test::SawMetrics() Failed==============",
-                 cb.saw);
-
-        // The clip should trigger: large gradients => scale < 1 and norm > clipNorm.
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		G_assert(__FILE__, __LINE__, "==============NN::GradClipDisabled TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::GradClipDisabled SawMetrics() Failed==============", cb.saw);
         if (cb.saw)
         {
-            printf("[UT] Grad clip: norm=%g scale=%g clip=%g\n", cb.last.gradNorm, cb.last.gradNormScale, clipNorm);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN14-test::GradNormReported() Failed==============",
-                     cb.last.gradNorm > clipNorm);
-            G_assert(__FILE__, __LINE__,
-                     "==============NN14-test::GradNormScaleClips() Failed==============",
-                     cb.last.gradNormScale > 0.0f && cb.last.gradNormScale < 1.0f);
-        }
+			G_assert(__FILE__, __LINE__, "==============NN::GradClipDisabled ScaleIsOne() Failed==============", fabs(cb.last.gradNormScale - 1.0f) < 1e-6f);
+			G_assert(__FILE__, __LINE__, "==============NN::GradClipDisabled NormZero() Failed==============", fabs(cb.last.gradNorm - 0.0f) < 1e-6f);
+		}
 
-        delete di14;
-        delete info14;
+		delete di;
+		delete info;
     }
 
     printf("-----------------------------------\n");
-    printf("NN Test 15 (LR schedule: step decay)\n");
+	printf("NN Test F (DFF binary classification trains from Xavier to 100%%)\n");
     printf("-----------------------------------\n");
+	{
+		// 2D linearly separable classification with a *narrow margin*.
+		// We intentionally use many points near the decision boundary so Xavier init is very unlikely to be perfect.
+		glades::NumberInput* di = new glades::NumberInput();
+		const unsigned int N = 40u;
+		di->trainMatrix = shmea::GMatrix(N, shmea::GVector<float>(2, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(N, shmea::GVector<float>(2, 0.0f));
+		for (unsigned int i = 0; i < N / 2u; ++i)
+		{
+			const float y = static_cast<float>(static_cast<int>(i) - 9);
+			// class 0: x slightly negative
+			di->trainMatrix[i][0] = -0.1f;
+			di->trainMatrix[i][1] = y;
+			di->trainExpectedMatrix[i][0] = 1.0f;
+			di->trainExpectedMatrix[i][1] = 0.0f;
+		}
+		for (unsigned int i = N / 2u; i < N; ++i)
+		{
+			const float y = static_cast<float>(static_cast<int>(i - N / 2u) - 9);
+			// class 1: x slightly positive
+			di->trainMatrix[i][0] = 0.1f;
+			di->trainMatrix[i][1] = y;
+			di->trainExpectedMatrix[i][0] = 0.0f;
+			di->trainExpectedMatrix[i][1] = 1.0f;
+		}
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-    // Step schedule: multiplier = gamma^floor((epoch-1)/stepSize)
-    // We validate multipliers over 4 epochs with stepSize=2.
-    {
-        class CaptureMetricsCb : public glades::ITrainingCallbacks
-        {
-        public:
-            std::vector<glades::NNetworkEpochMetrics> epochs;
-            virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
-            {
-                epochs.push_back(m);
-                return false;
-            }
-        };
-
-        glades::NumberInput* di15 = new glades::NumberInput();
-        di15->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di15->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di15->trainMatrix[0][0] = 1.0f;
-        di15->trainExpectedMatrix[0][0] = 1.0f;
-
-        const float baseLR = 0.01f;
-        glades::InputLayerInfo* in15 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ baseLR,
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ static_cast<int>(N),
+		    /*learningRate*/ 0.15f,
             /*momentumFactor*/ 0.0f,
             /*weightDecay1*/ 0.0f,
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden15;
-        glades::OutputLayerInfo* out15 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info15 = new glades::NNInfo("ut_lr_schedule_step", in15, hidden15, out15);
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(2, glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_class_bin_train_100", in, hidden, out);
 
-        glades::NNetwork net15(info15, glades::NNetwork::TYPE_DFF);
-        net15.getTerminatorMutable().setEpoch(4);
-        net15.getTerminatorMutable().setAccuracy(0);
+		// Pick a deterministic seed where Xavier init is NOT already perfect.
+		glades::NNetwork* net = NULL;
+		float initAcc = 0.0f;
+		const uint64_t seeds[] = {424242u, 424243u, 424244u, 424245u, 424246u, 424247u};
+		const int seedCount = static_cast<int>(sizeof(seeds) / sizeof(seeds[0]));
+		for (int si = 0; si < seedCount; ++si)
+		{
+			glades::NNetwork* cand = new glades::NNetwork(info, glades::NNetwork::TYPE_DFF);
+			cand->setSeed(seeds[si]);
+			cand->getTerminatorMutable().setEpoch(0);
+			cand->getTerminatorMutable().setAccuracy(0.0f);
+			CaptureEpochMetricsCb cb0;
+			G_assert(__FILE__, __LINE__, "==============NN::ClassBin InitTest() Failed==============", cand->test(di, &cb0).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ClassBin InitTest SawMetrics() Failed==============", cb0.saw);
+			initAcc = cb0.last.totalAccuracy;
+			if (initAcc < 100.0f - 1e-6f)
+			{
+				net = cand;
+				break;
+			}
+			delete cand;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::ClassBin NonPerfectInitSeedNotFound() Failed==============", net != NULL);
+		printf("[UT] Class(bin) initAccuracy=%f\n", initAcc);
 
-        const int stepSize = 2;
-        const float gamma = 0.5f;
-        net15.setLearningRateScheduleStep(stepSize, gamma);
+		StopAtMinThen100Cb cb(/*minEpochs*/ 25, /*maxEpochs*/ 5000);
+		const glades::NNetworkStatus st = net->train(di, &cb);
+		G_assert(__FILE__, __LINE__, "==============NN::ClassBin TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ClassBin SawMetrics() Failed==============", cb.saw);
+		G_assert(__FILE__, __LINE__, "==============NN::ClassBin Reached100() Failed==============", cb.reached);
+		if (cb.saw)
+		{
+			printf("[UT] Class(bin) epochs=%d totalAccuracy=%f\n", cb.last.epoch, cb.last.totalAccuracy);
+			G_assert(__FILE__, __LINE__, "==============NN::ClassBin EpochsGE25() Failed==============", cb.last.epoch >= 25);
+			G_assert(__FILE__, __LINE__, "==============NN::ClassBin AccuracyIs100() Failed==============", fabs(cb.last.totalAccuracy - 100.0f) < 1e-6f);
+		}
+		delete net;
 
-        CaptureMetricsCb cb;
-        const glades::NNetworkStatus st15 = net15.train(di15, &cb);
-        G_assert(__FILE__, __LINE__, "==============NN15-test::TrainStatus() Failed==============", st15.ok());
-        G_assert(__FILE__, __LINE__, "==============NN15-test::EpochCount() Failed==============", cb.epochs.size() == 4);
-
-        const float tol = 1e-6f;
-        if (cb.epochs.size() == 4)
-        {
-            // epoch 1 => k=0 => 1
-            // epoch 2 => k=0 => 1
-            // epoch 3 => k=1 => gamma
-            // epoch 4 => k=1 => gamma
-            G_assert(__FILE__, __LINE__, "==============NN15-test::Mult1() Failed==============", fabs(cb.epochs[0].lrMultiplier - 1.0f) < tol);
-            G_assert(__FILE__, __LINE__, "==============NN15-test::Mult2() Failed==============", fabs(cb.epochs[1].lrMultiplier - 1.0f) < tol);
-            G_assert(__FILE__, __LINE__, "==============NN15-test::Mult3() Failed==============", fabs(cb.epochs[2].lrMultiplier - gamma) < tol);
-            G_assert(__FILE__, __LINE__, "==============NN15-test::Mult4() Failed==============", fabs(cb.epochs[3].lrMultiplier - gamma) < tol);
-
-            // Effective output LR should track baseLR * multiplier.
-            G_assert(__FILE__, __LINE__, "==============NN15-test::LR1() Failed==============", fabs(cb.epochs[0].learningRate - (baseLR * 1.0f)) < 1e-5f);
-            G_assert(__FILE__, __LINE__, "==============NN15-test::LR2() Failed==============", fabs(cb.epochs[1].learningRate - (baseLR * 1.0f)) < 1e-5f);
-            G_assert(__FILE__, __LINE__, "==============NN15-test::LR3() Failed==============", fabs(cb.epochs[2].learningRate - (baseLR * gamma)) < 1e-5f);
-            G_assert(__FILE__, __LINE__, "==============NN15-test::LR4() Failed==============", fabs(cb.epochs[3].learningRate - (baseLR * gamma)) < 1e-5f);
-        }
-
-        delete di15;
-        delete info15;
+		delete di;
+		delete info;
     }
 
     printf("-----------------------------------\n");
-    printf("NN Test 16 (LR schedule: cosine)\n");
+	printf("NN Test G (DFF 3-class identity trains from Xavier to 100%%)\n");
     printf("-----------------------------------\n");
+	{
+		// 3-class identity-like mapping with many samples per class.
+		// This is linearly separable but very unlikely to be perfect at Xavier init.
+		glades::NumberInput* di = new glades::NumberInput();
+		const unsigned int perClass = 10u;
+		const unsigned int N = 3u * perClass;
+		di->trainMatrix = shmea::GMatrix(N, shmea::GVector<float>(3, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(N, shmea::GVector<float>(3, 0.0f));
+		for (unsigned int k = 0; k < 3u; ++k)
+		{
+			for (unsigned int j = 0; j < perClass; ++j)
+			{
+				const unsigned int r = k * perClass + j;
+				const float t = static_cast<float>(static_cast<int>(j) - 5) * 0.02f;
+				// Base direction is one-hot, with tiny deterministic "shape" noise in other coords.
+				di->trainMatrix[r][k] = 1.0f;
+				di->trainMatrix[r][(k + 1u) % 3u] = t;
+				di->trainMatrix[r][(k + 2u) % 3u] = -t;
+				di->trainExpectedMatrix[r][k] = 1.0f;
+			}
+		}
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-    // Cosine schedule: multiplier = min + 0.5*(1-min)*(1+cos(pi*t/T))
-    // with t = min(epochFromStart, T). We validate epoch1 (t=0 => 1) and epoch(T+1) (t=T => min).
-    {
-        class CaptureMetricsCb : public glades::ITrainingCallbacks
-        {
-        public:
-            std::vector<glades::NNetworkEpochMetrics> epochs;
-            virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
-            {
-                epochs.push_back(m);
-                return false;
-            }
-        };
-
-        glades::NumberInput* di16 = new glades::NumberInput();
-        di16->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di16->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di16->trainMatrix[0][0] = 1.0f;
-        di16->trainExpectedMatrix[0][0] = 1.0f;
-
-        const float baseLR = 0.02f;
-        glades::InputLayerInfo* in16 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ baseLR,
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ static_cast<int>(N),
+		    /*learningRate*/ 0.10f,
             /*momentumFactor*/ 0.0f,
             /*weightDecay1*/ 0.0f,
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden16;
-        glades::OutputLayerInfo* out16 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info16 = new glades::NNInfo("ut_lr_schedule_cosine", in16, hidden16, out16);
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(3, glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_class_3way_train_100", in, hidden, out);
 
-        glades::NNetwork net16(info16, glades::NNetwork::TYPE_DFF);
-        const int tMax = 2; // so epoch3 has t=2 => minMultiplier
-        const float minMult = 0.1f;
-        net16.setLearningRateScheduleCosine(tMax, minMult);
-        net16.getTerminatorMutable().setEpoch(3);
-        net16.getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork* net = NULL;
+		float initAcc = 0.0f;
+		const uint64_t seeds[] = {424250u, 424251u, 424252u, 424253u, 424254u, 424255u};
+		const int seedCount = static_cast<int>(sizeof(seeds) / sizeof(seeds[0]));
+		for (int si = 0; si < seedCount; ++si)
+		{
+			glades::NNetwork* cand = new glades::NNetwork(info, glades::NNetwork::TYPE_DFF);
+			cand->setSeed(seeds[si]);
+			cand->getTerminatorMutable().setEpoch(0);
+			cand->getTerminatorMutable().setAccuracy(0.0f);
+			CaptureEpochMetricsCb cb0;
+			G_assert(__FILE__, __LINE__, "==============NN::Class3 InitTest() Failed==============", cand->test(di, &cb0).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::Class3 InitTest SawMetrics() Failed==============", cb0.saw);
+			initAcc = cb0.last.totalAccuracy;
+			if (initAcc < 100.0f - 1e-6f)
+			{
+				net = cand;
+				break;
+			}
+			delete cand;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::Class3 NonPerfectInitSeedNotFound() Failed==============", net != NULL);
+		printf("[UT] Class(3-way) initAccuracy=%f\n", initAcc);
 
-        CaptureMetricsCb cb;
-        const glades::NNetworkStatus st16 = net16.train(di16, &cb);
-        G_assert(__FILE__, __LINE__, "==============NN16-test::TrainStatus() Failed==============", st16.ok());
-        G_assert(__FILE__, __LINE__, "==============NN16-test::EpochCount() Failed==============", cb.epochs.size() == 3);
-
-        const float tol = 1e-5f;
-        if (cb.epochs.size() == 3)
-        {
-            // epoch1 (t=0): multiplier == 1
-            G_assert(__FILE__, __LINE__, "==============NN16-test::Mult1() Failed==============", fabs(cb.epochs[0].lrMultiplier - 1.0f) < tol);
-            // epoch3 (t=T): multiplier == minMult
-            G_assert(__FILE__, __LINE__, "==============NN16-test::Mult3() Failed==============", fabs(cb.epochs[2].lrMultiplier - minMult) < tol);
-
-            G_assert(__FILE__, __LINE__, "==============NN16-test::LR1() Failed==============", fabs(cb.epochs[0].learningRate - (baseLR * 1.0f)) < tol);
-            G_assert(__FILE__, __LINE__, "==============NN16-test::LR3() Failed==============", fabs(cb.epochs[2].learningRate - (baseLR * minMult)) < tol);
-        }
-
-        delete di16;
-        delete info16;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 17 (Regression metrics: MSE/MAE/RMSE values)\n");
-    printf("-----------------------------------\n");
-
-    // This test validates the computed regression metrics fields:
-    // - totalError == MSE
-    // - regMAE == MAE
-    // - regRMSE == sqrt(MSE)
-    //
-    // We use RUN_TEST to avoid weight updates; we set deterministic weights.
-    {
-        class CaptureMetricsCb : public glades::ITrainingCallbacks
-        {
-        public:
-            glades::NNetworkEpochMetrics last;
-            bool saw;
-            CaptureMetricsCb() : saw(false) {}
-            virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
-            {
-                last = m;
-                saw = true;
-                return false;
-            }
-        };
-
-        glades::NumberInput* di17 = new glades::NumberInput();
-        di17->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di17->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di17->trainMatrix[0][0] = 1.0f;
-        di17->trainExpectedMatrix[0][0] = 2.0f;
-        di17->trainMatrix[1][0] = 2.0f;
-        di17->trainExpectedMatrix[1][0] = 4.0f;
-
-        // Mirror train->test so test() evaluates the same rows.
-        di17->testMatrix = di17->trainMatrix;
-        di17->testExpectedMatrix = di17->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in17 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.0f, // irrelevant for test
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden17;
-        glades::OutputLayerInfo* out17 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info17 = new glades::NNInfo("ut_reg_metrics", in17, hidden17, out17);
-
-        glades::NNetwork net17(info17, glades::NNetwork::TYPE_DFF);
-        // Pre-build to set deterministic weights.
-        net17.graphMutable().build(info17, di17, glades::NNetwork::TYPE_DFF);
-        net17.setMustdBuildMeat(false);
-
-        glades::Layer* outLayer17 = net17.graphMutable().getOutputLayer(1);
-        glades::Node* outNode17 = net17.graphMutable().getOutputNode(outLayer17, 0);
-        if (outNode17)
-        {
-            // Set y = 1*x + 0, so predictions are [1,2] vs targets [2,4].
-            outNode17->setEdgeWeight(0, 1.0f);
-            outNode17->setEdgeWeight(1, 0.0f); // bias edge
-        }
-
-        CaptureMetricsCb cb;
-        const glades::NNetworkStatus st17 = net17.test(di17, &cb);
-        G_assert(__FILE__, __LINE__, "==============NN17-test::TestStatus() Failed==============", st17.ok());
-        G_assert(__FILE__, __LINE__, "==============NN17-test::SawMetrics() Failed==============", cb.saw);
-
-        // Expected:
-        // errors = [1,2]
-        // MSE = (1^2 + 2^2)/2 = 2.5
-        // MAE = (1+2)/2 = 1.5
-        // RMSE = sqrt(2.5)
-        const float expMSE = 2.5f;
-        const float expMAE = 1.5f;
-        const float expRMSE = static_cast<float>(sqrt(2.5));
-        const float tol = 1e-4f;
-
+		StopAtMinThen100Cb cb(/*minEpochs*/ 25, /*maxEpochs*/ 8000);
+		const glades::NNetworkStatus st = net->train(di, &cb);
+		G_assert(__FILE__, __LINE__, "==============NN::Class3 TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::Class3 SawMetrics() Failed==============", cb.saw);
+		G_assert(__FILE__, __LINE__, "==============NN::Class3 Reached100() Failed==============", cb.reached);
         if (cb.saw)
         {
-            printf("[UT] Reg metrics: MSE=%f MAE=%f RMSE=%f\n", cb.last.totalError, cb.last.regMAE, cb.last.regRMSE);
-            G_assert(__FILE__, __LINE__, "==============NN17-test::MSE() Failed==============", fabs(cb.last.totalError - expMSE) < tol);
-            G_assert(__FILE__, __LINE__, "==============NN17-test::MAE() Failed==============", fabs(cb.last.regMAE - expMAE) < tol);
-            G_assert(__FILE__, __LINE__, "==============NN17-test::RMSE() Failed==============", fabs(cb.last.regRMSE - expRMSE) < tol);
-        }
+			printf("[UT] Class(3-way) epochs=%d totalAccuracy=%f\n", cb.last.epoch, cb.last.totalAccuracy);
+			G_assert(__FILE__, __LINE__, "==============NN::Class3 EpochsGE25() Failed==============", cb.last.epoch >= 25);
+			G_assert(__FILE__, __LINE__, "==============NN::Class3 AccuracyIs100() Failed==============", fabs(cb.last.totalAccuracy - 100.0f) < 1e-6f);
+		}
+		delete net;
 
-        delete di17;
-        delete info17;
+		delete di;
+		delete info;
     }
 
     printf("-----------------------------------\n");
-    printf("NN Test 18 (Global grad-norm clip disabled => scale=1)\n");
+	printf("NN Test H (DFF hidden-layer classification trains from Xavier to 100%%)\n");
     printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		// XOR-style data cloud (not linearly separable), requires the hidden layer to solve.
+		// We generate a small deterministic cloud around each corner to make "perfect at init" extremely unlikely.
+		const unsigned int perCorner = 4u;
+		const unsigned int N = 4u * perCorner;
+		di->trainMatrix = shmea::GMatrix(N, shmea::GVector<float>(2, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(N, shmea::GVector<float>(2, 0.0f));
+		unsigned int r = 0u;
+		for (unsigned int j = 0; j < perCorner; ++j)
+		{
+			const float t = static_cast<float>(static_cast<int>(j) - 2) * 0.05f;
+			// (0,0) -> class 0
+			di->trainMatrix[r][0] = 0.0f + t; di->trainMatrix[r][1] = 0.0f - t;
+			di->trainExpectedMatrix[r][0] = 1.0f; di->trainExpectedMatrix[r][1] = 0.0f; ++r;
+			// (0,1) -> class 1
+			di->trainMatrix[r][0] = 0.0f + t; di->trainMatrix[r][1] = 1.0f - t;
+			di->trainExpectedMatrix[r][0] = 0.0f; di->trainExpectedMatrix[r][1] = 1.0f; ++r;
+			// (1,0) -> class 1
+			di->trainMatrix[r][0] = 1.0f - t; di->trainMatrix[r][1] = 0.0f + t;
+			di->trainExpectedMatrix[r][0] = 0.0f; di->trainExpectedMatrix[r][1] = 1.0f; ++r;
+			// (1,1) -> class 0
+			di->trainMatrix[r][0] = 1.0f - t; di->trainMatrix[r][1] = 1.0f + t;
+			di->trainExpectedMatrix[r][0] = 1.0f; di->trainExpectedMatrix[r][1] = 0.0f; ++r;
+		}
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-    // With grad clip disabled (default), gradNorm stays 0 and scale stays 1 in metrics.
-    {
-        class CaptureMetricsCb : public glades::ITrainingCallbacks
-        {
-        public:
-            glades::NNetworkEpochMetrics last;
-            bool saw;
-            CaptureMetricsCb() : saw(false) {}
-            virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
-            {
-                last = m;
-                saw = true;
-                return false;
-            }
-        };
-
-        glades::NumberInput* di18 = new glades::NumberInput();
-        di18->trainMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di18->trainExpectedMatrix = shmea::GMatrix(1, shmea::GVector<float>(1, 0.0f));
-        di18->trainMatrix[0][0] = 10.0f;
-        di18->trainExpectedMatrix[0][0] = 0.0f;
-
-        glades::InputLayerInfo* in18 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.1f,
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ static_cast<int>(N),
+		    /*learningRate*/ 0.20f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::SIGMOID,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 4,
+		    /*learningRate*/ 0.20f,
             /*momentumFactor*/ 0.0f,
             /*weightDecay1*/ 0.0f,
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden18;
-        glades::OutputLayerInfo* out18 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info18 = new glades::NNInfo("ut_grad_clip_disabled", in18, hidden18, out18);
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(2, glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_class_hidden_train_100", in, hidden, out);
 
-        glades::NNetwork net18(info18, glades::NNetwork::TYPE_DFF);
-        net18.getTerminatorMutable().setEpoch(1);
-        net18.getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork* net = NULL;
+		float initAcc = 0.0f;
+		const uint64_t seeds[] = {424260u, 424261u, 424262u, 424263u, 424264u, 424265u};
+		const int seedCount = static_cast<int>(sizeof(seeds) / sizeof(seeds[0]));
+		for (int si = 0; si < seedCount; ++si)
+		{
+			glades::NNetwork* cand = new glades::NNetwork(info, glades::NNetwork::TYPE_DFF);
+			cand->setSeed(seeds[si]);
+			cand->getTerminatorMutable().setEpoch(0);
+			cand->getTerminatorMutable().setAccuracy(0.0f);
+			CaptureEpochMetricsCb cb0;
+			G_assert(__FILE__, __LINE__, "==============NN::ClassHidden InitTest() Failed==============", cand->test(di, &cb0).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ClassHidden InitTest SawMetrics() Failed==============", cb0.saw);
+			initAcc = cb0.last.totalAccuracy;
+			if (initAcc < 100.0f - 1e-6f)
+			{
+				net = cand;
+				break;
+			}
+			delete cand;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::ClassHidden NonPerfectInitSeedNotFound() Failed==============", net != NULL);
+		printf("[UT] Class(hidden) initAccuracy=%f\n", initAcc);
 
-        CaptureMetricsCb cb;
-        const glades::NNetworkStatus st18 = net18.train(di18, &cb);
-        G_assert(__FILE__, __LINE__, "==============NN18-test::TrainStatus() Failed==============", st18.ok());
-        G_assert(__FILE__, __LINE__, "==============NN18-test::SawMetrics() Failed==============", cb.saw);
+		StopAtMinThen100Cb cb(/*minEpochs*/ 50, /*maxEpochs*/ 15000);
+		const glades::NNetworkStatus st = net->train(di, &cb);
+		G_assert(__FILE__, __LINE__, "==============NN::ClassHidden TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ClassHidden SawMetrics() Failed==============", cb.saw);
+		G_assert(__FILE__, __LINE__, "==============NN::ClassHidden Reached100() Failed==============", cb.reached);
         if (cb.saw)
         {
-            G_assert(__FILE__, __LINE__, "==============NN18-test::GradScaleIsOne() Failed==============", fabs(cb.last.gradNormScale - 1.0f) < 1e-6f);
-            G_assert(__FILE__, __LINE__, "==============NN18-test::GradNormZero() Failed==============", fabs(cb.last.gradNorm - 0.0f) < 1e-6f);
+			printf("[UT] Class(hidden) epochs=%d totalAccuracy=%f\n", cb.last.epoch, cb.last.totalAccuracy);
+			G_assert(__FILE__, __LINE__, "==============NN::ClassHidden EpochsGE50() Failed==============", cb.last.epoch >= 50);
+			G_assert(__FILE__, __LINE__, "==============NN::ClassHidden AccuracyIs100() Failed==============", fabs(cb.last.totalAccuracy - 100.0f) < 1e-6f);
         }
+		delete net;
 
-        delete di18;
-        delete info18;
+		delete di;
+		delete info;
     }
+
+	NumberInputTrainTestSplitUnitTest();
 
     printf("\n============================================================\n");
+}
+
+static void NumberInputTrainTestSplitUnitTest()
+{
+	printf("-----------------------------------\n");
+	printf("NumberInput train/test split (fit-on-train) smoke test\n");
+	printf("-----------------------------------\n");
+
+	// Build a tiny in-memory dataset:
+	// - 2 numeric inputs
+	// - 1 string label output column (binary)
+	shmea::GVector<shmea::GString> headers;
+	headers.push_back("x1");
+	headers.push_back("x2");
+	headers.push_back("label");
+	shmea::GTable tbl(',', headers);
+	tbl.toggleOutput(2u);
+	for (int i = 0; i < 20; ++i)
+	{
+		shmea::GList row;
+		row.addFloat((i < 10) ? -1.0f : 1.0f);
+		row.addFloat(static_cast<float>(i));
+		row.addString((i < 10) ? "A" : "B");
+		tbl.addRow(row);
+	}
+
+	glades::NumberInput di;
+	glades::NumberInput::TrainTestSplitConfig cfg;
+	cfg.testFraction = 0.25f;
+	cfg.shuffle = true;
+	cfg.stratify = true;
+	cfg.seed = 2026u;
+
+	const bool ok = di.importWithSplit(tbl, cfg, glades::GMath::ZSCORE);
+	G_assert(__FILE__, __LINE__, "==============NumberInput::importWithSplit() Failed==============", ok);
+	G_assert(__FILE__, __LINE__, "==============NumberInput Split TrainSize NonZero Failed==============", di.getTrainSize() > 0u);
+	G_assert(__FILE__, __LINE__, "==============NumberInput Split TestSize NonZero Failed==============", di.getTestSize() > 0u);
+	G_assert(__FILE__, __LINE__, "==============NumberInput Split TotalRows Match Failed==============", (di.getTrainSize() + di.getTestSize()) == tbl.numberOfRows());
+	G_assert(__FILE__, __LINE__, "==============NumberInput Split FeatureCount Match Failed==============", di.getFeatureCount() == 2u);
+
+	// Expected output should be 2-wide (A/B).
+	const float* y = NULL;
+	unsigned int yN = 0u;
+	G_assert(__FILE__, __LINE__, "==============NumberInput Split ExpectedRowView Failed==============", di.getTrainExpectedRowView(0u, y, yN));
+	G_assert(__FILE__, __LINE__, "==============NumberInput Split ExpectedDims Failed==============", yN == 2u);
 }
 
 void NNRecurrentUnitTest()
 {
     printf("============================================================\n");
-    printf("NN Recurrent Test Suite (RNN/GRU/LSTM)\n");
+	printf("NN Recurrent Test Suite (modern-only)\n");
     printf("============================================================\n");
 
     printf("-----------------------------------\n");
-    printf("NN Test 7 (RNN full BPTT: future loss updates earlier Wx)\n");
+	printf("RNN forward recurrence (1x1x1)\n");
     printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->testMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
+		di->testExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
+		di->testMatrix[0][0] = 2.0f;
+		di->testMatrix[1][0] = 3.0f;
+		// Expected outputs for the configured weights:
+		// h1 = x1 = 2, y1 = 2
+		// h2 = x2 + h1 = 3 + 2 = 5, y2 = 5
+		di->testExpectedMatrix[0][0] = 2.0f;
+		di->testExpectedMatrix[1][0] = 5.0f;
+		di->trainMatrix = di->testMatrix;
+		di->trainExpectedMatrix = di->testExpectedMatrix;
 
-    // Copied from NNUnitTest(): see NN Test 7 block.
-    {
-        glades::NumberInput* di7 = new glades::NumberInput();
-        di7->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di7->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di7->trainMatrix[0][0] = 1.0f;  // x1
-        di7->trainMatrix[1][0] = 0.0f;  // x2
-        di7->trainExpectedMatrix[0][0] = 1.0f; // y1 target (no loss at t=1)
-        di7->trainExpectedMatrix[1][0] = 0.0f; // y2 target (loss at t=2)
-
-        glades::InputLayerInfo* in7 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ 0.1f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden7;
-        hidden7.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ 0.1f,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out7 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info7 = new glades::NNInfo("ut_rnn_bptt", in7, hidden7, out7);
-
-        glades::NNetwork rnnNet7(info7, glades::NNetwork::TYPE_RNN);
-        rnnNet7.getTerminatorMutable().setEpoch(1);
-        rnnNet7.getTerminatorMutable().setAccuracy(0);
-
-        rnnNet7.graphMutable().build(info7, di7, glades::NNetwork::TYPE_RNN);
-        rnnNet7.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer7 = rnnNet7.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer7 = rnnNet7.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode7 = rnnNet7.graphMutable().getOutputNode(hiddenLayer7, 0);
-        glades::Node* outNode7 = rnnNet7.graphMutable().getOutputNode(outLayer7, 0);
-
-        hiddenLayer7->setBiasWeight(0.0f);
-        outLayer7->setBiasWeight(0.0f);
-
-        // Wx=1, Wy=1
-        hiddenNode7->setEdgeWeight(0, 1.0f);
-        outNode7->setEdgeWeight(0, 1.0f);
-
-        // Wh=1 and ensure context resets from a non-zero starting value
-        glades::Node* ctx7 = hiddenNode7->getContextNode();
-        G_assert(__FILE__, __LINE__,
-                 "==============NN7-test::ContextNodeMissing() Failed==============",
-                 ctx7 != NULL);
-        if (ctx7)
-        {
-            ctx7->setEdgeWeight(0, 1.0f); // Wh
-            ctx7->setWeight(10.0f);       // should be reset to 0 at run start
-        }
-
-        // Train exactly 1 epoch
-        const glades::NNetworkStatus stTrain7 = rnnNet7.train(di7);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN7-test::TrainStatus() Failed==============",
-                 stTrain7.ok());
-
-        rnnNet7.materializeGraphParameters();
-
-        const float wxFinal = hiddenNode7->getEdgeWeight(0);
-        const float expectedWx = 0.9f;
-        const float tol = 1e-3f;
-        printf("[UT] RNN(BPTT) Wx final=%f (expected ~%f)\n", wxFinal, expectedWx);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN7-test::RNNBPTT_UpdatesWxFromFutureLoss() Failed==============",
-                 (wxFinal > expectedWx - tol) && (wxFinal < expectedWx + tol));
-
-        delete di7;
-        delete info7;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 8 (RNN train on rnn.csv with BPTT)\n");
-    printf("-----------------------------------\n");
-
-    // Copied from NNUnitTest(): see NN Test 8 block.
-    {
-        shmea::GTable raw("datasets/rnn.csv", ',', shmea::GTable::TYPE_FILE);
-        raw.clearOutputs();
-        raw.toggleOutput(2); // z
-
-        glades::NumberInput* di8 = new glades::NumberInput();
-        di8->import(raw, /*standardizeFlag*/ glades::GMath::MINMAX);
-
-        di8->testMatrix = di8->trainMatrix;
-        di8->testExpectedMatrix = di8->trainExpectedMatrix;
-
-        const float lr = 0.05f;
-        glades::InputLayerInfo* in8 = new glades::InputLayerInfo(
-            /*batchSize*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden8;
-        hidden8.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ lr,
-            /*momentumFactor*/ 0.0f,
-            /*weightDecay1*/ 0.0f,
-            /*weightDecay2*/ 0.0f,
-            /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out8 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info8 = new glades::NNInfo("ut_rnn_csv_train_bptt", in8, hidden8, out8);
-
-        glades::NNetwork rnnNet8(info8, glades::NNetwork::TYPE_RNN);
-        rnnNet8.getTerminatorMutable().setEpoch(500);
-
-        rnnNet8.graphMutable().build(info8, di8, glades::NNetwork::TYPE_RNN);
-        rnnNet8.setMustdBuildMeat(false);
-
-        glades::Layer* hiddenLayer8 = rnnNet8.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer8 = rnnNet8.graphMutable().getOutputLayer(2);
-        glades::Node* hiddenNode8 = rnnNet8.graphMutable().getOutputNode(hiddenLayer8, 0);
-        glades::Node* outNode8 = rnnNet8.graphMutable().getOutputNode(outLayer8, 0);
-
-        hiddenLayer8->setBiasWeight(0.0f);
-        outLayer8->setBiasWeight(0.0f);
-
-        hiddenNode8->setEdgeWeight(0, 0.0f); // Wx_x
-        hiddenNode8->setEdgeWeight(1, 1.0f); // Wx_y
-        outNode8->setEdgeWeight(0, 0.8f);    // Wy
-
-        glades::Node* ctx8 = hiddenNode8->getContextNode();
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::ContextNodeMissing() Failed==============",
-                 ctx8 != NULL);
-        if (ctx8)
-        {
-            ctx8->setEdgeWeight(0, 0.0f); // Wh initialized to 0
-            ctx8->setWeight(0.0f);
-        }
-
-        const glades::NNetworkStatus stTrain8 = rnnNet8.train(di8);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::TrainStatus() Failed==============",
-                 stTrain8.ok());
-
-        // Evaluate on the mirrored test set
-        const glades::NNetworkStatus stTest8 = rnnNet8.test(di8);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::TestStatus() Failed==============",
-                 stTest8.ok());
-        G_assert(__FILE__, __LINE__,
-                 "==============NN8-test::Accuracy() Failed==============",
-                 rnnNet8.getAccuracy() > 99.0f);
-
-        delete di8;
-        delete info8;
-    }
-
-    printf("-----------------------------------\n");
-    printf("NN Test 10 (LSTM deterministic forward)\n");
-    printf("-----------------------------------\n");
-
-    // Copied from NNUnitTest(): see NN Test 10 block.
-    {
-        glades::NumberInput* di10 = new glades::NumberInput();
-        di10->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di10->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di10->trainMatrix[0][0] = 0.0f;
-        di10->trainMatrix[1][0] = 1.0f;
-
-        di10->testMatrix = di10->trainMatrix;
-        di10->testExpectedMatrix = di10->trainExpectedMatrix;
-
-        glades::InputLayerInfo* in10 = new glades::InputLayerInfo(
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
             /*batchSize*/ 1,
             /*learningRate*/ 0.0f,
             /*momentumFactor*/ 0.0f,
@@ -2506,10 +1805,9 @@ void NNRecurrentUnitTest()
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden10;
-        hidden10.push_back(new glades::HiddenLayerInfo(
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
             /*size*/ 1,
             /*learningRate*/ 0.0f,
             /*momentumFactor*/ 0.0f,
@@ -2517,173 +1815,2565 @@ void NNRecurrentUnitTest()
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out10 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info10 = new glades::NNInfo("ut_lstm_forward", in10, hidden10, out10);
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_rnn_forward", in, hidden, out);
 
-        glades::NNetwork lstmNet(info10, glades::NNetwork::TYPE_LSTM);
-        lstmNet.getTerminatorMutable().setEpoch(1);
-        lstmNet.getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_forward", 4242u,
+		                                                              /*Wxh*/ 1.0f, /*Whh*/ 1.0f, /*bh*/ 0.0f,
+		                                                              /*Why*/ 1.0f, /*by*/ 0.0f);
+		const glades::NNetworkStatus st = net.test(di);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward TestStatus() Failed==============", st.ok());
 
-        lstmNet.graphMutable().build(info10, di10, glades::NNetwork::TYPE_LSTM);
-        lstmNet.setMustdBuildMeat(false);
+		float pred = 0.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward GetPred() Failed==============", read_last_result_pred(net, pred));
+		// h1=2, h2=3 + 2 = 5, y2=5
+		const float expected = 5.0f;
+		const float tol = 1e-4f;
+		printf("[UT] RNN last pred = %f (expected %f)\n", pred, expected);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward PredMismatch() Failed==============", fabs(pred - expected) < tol);
 
-        glades::Layer* hiddenLayer10 = lstmNet.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer10 = lstmNet.graphMutable().getOutputLayer(2);
-        glades::Node* hNode10 = lstmNet.graphMutable().getOutputNode(hiddenLayer10, 0);
-        glades::Node* yNode10 = lstmNet.graphMutable().getOutputNode(outLayer10, 0);
+		// End-to-end persistence: save model, reload, and re-check the same prediction.
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward SaveModel() Failed==============",
+		         net.saveModel("ut_pkg_rnn_forward_after").ok());
+		glades::NNetwork net2(glades::NNetwork::TYPE_RNN);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward ReloadModel() Failed==============",
+		         net2.loadModel("ut_pkg_rnn_forward_after", di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward Reload TestStatus() Failed==============", net2.test(di).ok());
+		float pred2 = 0.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward Reload GetPred() Failed==============", read_last_result_pred(net2, pred2));
+		printf("[UT] RNN reload last pred = %f (expected %f)\n", pred2, expected);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward Reload PredMismatch() Failed==============", fabs(pred2 - expected) < tol);
 
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::NodesMissing() Failed==============",
-                 (hiddenLayer10 != NULL) && (outLayer10 != NULL) && (hNode10 != NULL) && (yNode10 != NULL));
-
-        glades::Node* ctx10 = (hNode10 ? hNode10->getContextNode() : NULL);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::ContextNodeMissing() Failed==============",
-                 ctx10 != NULL);
-
-        if (hNode10 && yNode10 && ctx10)
-        {
-            hNode10->setEdgeWeight(0, 0.0f);   // Wi
-            hNode10->setEdgeWeight(1, 20.0f);  // bi
-            hNode10->setEdgeWeight(2, 0.0f);   // Wf
-            hNode10->setEdgeWeight(3, -20.0f); // bf
-            hNode10->setEdgeWeight(4, 0.0f);   // Wo
-            hNode10->setEdgeWeight(5, 20.0f);  // bo
-            hNode10->setEdgeWeight(6, 1.0f);   // Wg
-            hNode10->setEdgeWeight(7, 0.0f);   // bg
-
-            ctx10->setEdgeWeight(0, 0.0f);
-            ctx10->setEdgeWeight(1, 0.0f);
-            ctx10->setEdgeWeight(2, 0.0f);
-            ctx10->setEdgeWeight(3, 0.0f);
-
-            yNode10->setEdgeWeight(0, 1.0f);
-            yNode10->setEdgeWeight(1, 0.0f); // bias edge
-        }
-
-        const glades::NNetworkStatus st10 = lstmNet.test(di10);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::TestStatus() Failed==============",
-                 st10.ok());
-
-        const float expected = static_cast<float>(tanh(tanh(1.0)));
-        const float y2 = (yNode10 ? yNode10->getWeight() : 0.0f);
-        const float c2 = (hNode10 ? hNode10->getCellState() : 0.0f);
-        const float expectedC = static_cast<float>(tanh(1.0));
-        const float tol = 1e-3f;
-        printf("[UT] LSTM y2=%f c2=%f (expected y~%f c~%f)\n", y2, c2, expected, expectedC);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::LSTMForward() Failed==============",
-                 (y2 > expected - tol) && (y2 < expected + tol));
-        G_assert(__FILE__, __LINE__,
-                 "==============NN10-test::LSTMCellState() Failed==============",
-                 (c2 > expectedC - tol) && (c2 < expectedC + tol));
-
-        delete di10;
-        delete info10;
+		delete di;
+		delete info;
     }
 
-    printf("-----------------------------------\n");
-    printf("NN Test 11 (GRU BPTT: future loss updates candidate Wx)\n");
-    printf("-----------------------------------\n");
+	printf("-----------------------------------\n");
+	printf("RNN minibatch semantics (average by sequences/windows, not timesteps)\n");
+	printf("-----------------------------------\n");
+	{
+		// Two sequences with different lengths:
+		// - seq0 length 1 has expected=1
+		// - seq1 length 3 has expected=0,0,0
+		//
+		// With y=0 and MSE dL/dy = 2(y - y*) this yields per-timestep deltas:
+		// - seq0: -2
+		// - seq1:  0
+		//
+		// Correct "sample averaging" semantics:
+		// mean(seq means) = (-2 + 0)/2 = -1  => by -= lr * (-1) => by = +1 (with lr=1, by0=0)
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix[0][0] = 1.0f;
+		di->trainExpectedMatrix[1][0] = 0.0f;
+		di->trainExpectedMatrix[2][0] = 0.0f;
+		di->trainExpectedMatrix[3][0] = 0.0f;
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
 
-    // Copied from NNUnitTest(): see NN Test 11 block.
-    {
-        glades::NumberInput* di11 = new glades::NumberInput();
-        di11->trainMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di11->trainExpectedMatrix = shmea::GMatrix(2, shmea::GVector<float>(1, 0.0f));
-        di11->trainMatrix[0][0] = 1.0f; // x1
-        di11->trainMatrix[1][0] = 0.0f; // x2
+		std::vector<glades::DataInput::SequenceSpan> spans;
+		spans.push_back(glades::DataInput::SequenceSpan(0u, 1u));
+		spans.push_back(glades::DataInput::SequenceSpan(1u, 3u));
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SetTrainSequences Failed==============", di->setTrainSequences(spans));
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SetTestSequences Failed==============", di->setTestSequences(spans));
 
-        const float a = static_cast<float>(tanh(1.0));
-        di11->trainExpectedMatrix[0][0] = a;
-        di11->trainExpectedMatrix[1][0] = 0.0f;
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 2,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 1,
+		    // NOTE: In the current NNInfo indexing scheme, recurrent output hyperparams
+		    // are retrieved via layer index == numHiddenLayers, which maps to the *last hidden*
+		    // layer (NNInfo does not expose output-layer LR/momentum/decay via getLearningRate()).
+		    // Therefore, we set the hidden-layer learning rate here to drive the output update.
+		    /*learningRate*/ 1.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_rnn_minibatch_semantics", in, hidden, out);
 
-        const float lr = 0.1f;
-        glades::InputLayerInfo* in11 = new glades::InputLayerInfo(
+		glades::NNetwork net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_minibatch_semantics", 1234u,
+		                                                              /*Wxh*/ 0.0f, /*Whh*/ 0.0f, /*bh*/ 0.0f,
+		                                                              /*Why*/ 0.0f, /*by*/ 0.0f);
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_rnn_minibatch_semantics_after").ok());
+
+		float byFinal = 0.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch ReadOutBias() Failed==============",
+		         read_rnn_out_bias_1x1x1("database/models/ut_pkg_rnn_minibatch_semantics_after/weights.bin", byFinal));
+		const float expectedBy = 1.0f;
+		const float tol = 1e-3f;
+		printf("[UT] RNN minibatch final out bias = %f (expected ~%f)\n", byFinal, expectedBy);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch OutBiasMismatch() Failed==============",
+		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
+
+		delete di;
+		delete info;
+	}
+
+	printf("-----------------------------------\n");
+	printf("GRU minibatch semantics (average by sequences/windows, not timesteps)\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix[0][0] = 1.0f;
+		di->trainExpectedMatrix[1][0] = 0.0f;
+		di->trainExpectedMatrix[2][0] = 0.0f;
+		di->trainExpectedMatrix[3][0] = 0.0f;
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+		std::vector<glades::DataInput::SequenceSpan> spans;
+		spans.push_back(glades::DataInput::SequenceSpan(0u, 1u));
+		spans.push_back(glades::DataInput::SequenceSpan(1u, 3u));
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SetTrainSequences Failed==============", di->setTrainSequences(spans));
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SetTestSequences Failed==============", di->setTestSequences(spans));
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 2,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 1,
+		    /*learningRate*/ 1.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_gru_minibatch_semantics", in, hidden, out);
+
+		glades::NNetwork net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_gru_minibatch_semantics",
+		                                                                       glades::NNetwork::TYPE_GRU,
+		                                                                       2233u,
+		                                                                       /*gateCount*/ 3u,
+		                                                                       /*Why*/ 0.0f,
+		                                                                       /*by*/ 0.0f);
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_gru_minibatch_semantics_after").ok());
+
+		float byFinal = 0.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch ReadOutBias() Failed==============",
+		         read_gated_out_bias_1layer_1x1x1("database/models/ut_pkg_gru_minibatch_semantics_after/weights.bin",
+		                                          static_cast<unsigned int>(glades::NNetwork::TYPE_GRU),
+		                                          byFinal));
+		const float expectedBy = 1.0f;
+		const float tol = 1e-3f;
+		printf("[UT] GRU minibatch final out bias = %f (expected ~%f)\n", byFinal, expectedBy);
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch OutBiasMismatch() Failed==============",
+		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
+
+		delete di;
+		delete info;
+	}
+
+	printf("-----------------------------------\n");
+	printf("LSTM minibatch semantics (average by sequences/windows, not timesteps)\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix[0][0] = 1.0f;
+		di->trainExpectedMatrix[1][0] = 0.0f;
+		di->trainExpectedMatrix[2][0] = 0.0f;
+		di->trainExpectedMatrix[3][0] = 0.0f;
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+		std::vector<glades::DataInput::SequenceSpan> spans;
+		spans.push_back(glades::DataInput::SequenceSpan(0u, 1u));
+		spans.push_back(glades::DataInput::SequenceSpan(1u, 3u));
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SetTrainSequences Failed==============", di->setTrainSequences(spans));
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SetTestSequences Failed==============", di->setTestSequences(spans));
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 2,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 1,
+		    /*learningRate*/ 1.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_lstm_minibatch_semantics", in, hidden, out);
+
+		glades::NNetwork net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_lstm_minibatch_semantics",
+		                                                                       glades::NNetwork::TYPE_LSTM,
+		                                                                       3344u,
+		                                                                       /*gateCount*/ 4u,
+		                                                                       /*Why*/ 0.0f,
+		                                                                       /*by*/ 0.0f);
+		net.getTerminatorMutable().setEpoch(1);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_lstm_minibatch_semantics_after").ok());
+
+		float byFinal = 0.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch ReadOutBias() Failed==============",
+		         read_gated_out_bias_1layer_1x1x1("database/models/ut_pkg_lstm_minibatch_semantics_after/weights.bin",
+		                                          static_cast<unsigned int>(glades::NNetwork::TYPE_LSTM),
+		                                          byFinal));
+		const float expectedBy = 1.0f;
+		const float tol = 1e-3f;
+		printf("[UT] LSTM minibatch final out bias = %f (expected ~%f)\n", byFinal, expectedBy);
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch OutBiasMismatch() Failed==============",
+		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
+
+		delete di;
+		delete info;
+	}
+
+	printf("-----------------------------------\n");
+	printf("GRU smoke test (save/load)\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		// A single sequence length 3.
+		di->trainMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
+		for (int t = 0; t < 3; ++t)
+		{
+			di->trainMatrix[t][0] = static_cast<float>(t);
+			di->trainExpectedMatrix[t][0] = static_cast<float>(t);
+		}
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.05f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 2,
+		    /*learningRate*/ 0.05f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_gru_smoke", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_GRU);
+		net.setSeed(9001u);
+		net.getTerminatorMutable().setEpoch(2);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Smoke TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Smoke SaveModel() Failed==============", net.saveModel("ut_pkg_gru_smoke").ok());
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_GRU);
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Smoke LoadModel() Failed==============", net2.loadModel("ut_pkg_gru_smoke", di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Smoke TestStatus() Failed==============", net2.test(di).ok());
+
+		delete di;
+		delete info;
+	}
+
+	printf("-----------------------------------\n");
+	printf("LSTM smoke test (save/load)\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
+		for (int t = 0; t < 3; ++t)
+		{
+			di->trainMatrix[t][0] = static_cast<float>(t);
+			di->trainExpectedMatrix[t][0] = static_cast<float>(t);
+		}
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.05f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 2,
+		    /*learningRate*/ 0.05f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_lstm_smoke", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_LSTM);
+		net.setSeed(9002u);
+		net.getTerminatorMutable().setEpoch(2);
+		net.getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Smoke TrainStatus() Failed==============", net.train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Smoke SaveModel() Failed==============", net.saveModel("ut_pkg_lstm_smoke").ok());
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_LSTM);
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Smoke LoadModel() Failed==============", net2.loadModel("ut_pkg_lstm_smoke", di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Smoke TestStatus() Failed==============", net2.test(di).ok());
+
+		delete di;
+		delete info;
+	}
+
+    printf("\n============================================================\n");
+}
+
+void NNTransformerUnitTest()
+{
+    printf("============================================================\n");
+	printf("NN Transformer Test Suite (modern-only)\n");
+	printf("============================================================\n");
+
+	// ===== Correctness gates (5) =====
+	//
+	// These are "stop-the-line" invariants. They are intentionally tiny and deterministic.
+	// If any of these fail, inference/training correctness is not trustworthy.
+	printf("-----------------------------------\n");
+	printf("Transformer correctness gates (5)\n");
+	printf("-----------------------------------\n");
+	{
+		// Gate 1: KV-cache incremental decode matches full forward logits (RoPE path).
+		{
+			const unsigned int vocab = 17u;
+			const unsigned int padTokenId = vocab - 1u;
+			const unsigned int T = 5u;
+			std::vector<unsigned int> toks;
+			toks.push_back(1u);
+			toks.push_back(2u);
+			toks.push_back(3u);
+			toks.push_back(4u);
+			toks.push_back(5u);
+
+			InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+			di->setTrainTokens(toks, static_cast<int>(padTokenId));
+			di->mirrorTrainToTest();
+
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=16
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_gate_kv_parity_rope", in, hidden, out);
+
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(4242u);
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+				cfg.transformer.nHeadsOverride = 4;
+				cfg.transformer.nKVHeadsOverride = 2;
+				cfg.transformer.dFFOverride = 32;
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+				cfg.transformer.ropeTheta = 10000.0f;
+				cfg.transformer.ropeDimOverride = 0;
+			}
+
+			G_assert(__FILE__, __LINE__, "==============Gate1 InitTestStatus Failed==============", net.test(di).ok());
+			glades::NNetwork::TransformerLmSession session;
+			G_assert(__FILE__, __LINE__, "==============Gate1 SessionReset Failed==============", net.transformerLmSessionReset(session, T).ok());
+
+			std::vector<unsigned int> prefix;
+			std::vector<float> logitsFull;
+			std::vector<float> logitsKv;
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				prefix.push_back(toks[t]);
+				G_assert(__FILE__, __LINE__, "==============Gate1 ForwardLastLogits Failed==============", net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+				G_assert(__FILE__, __LINE__, "==============Gate1 SessionAppend Failed==============", net.transformerLmSessionAppend(session, toks[t], &logitsKv).ok());
+				G_assert(__FILE__, __LINE__, "==============Gate1 LogitsSize Failed==============", logitsFull.size() == vocab && logitsKv.size() == vocab);
+				double maxAbs = 0.0;
+				for (unsigned int i = 0; i < vocab; ++i)
+				{
+					const double d = fabs((double)logitsFull[i] - (double)logitsKv[i]);
+					if (d > maxAbs) maxAbs = d;
+					G_assert(__FILE__, __LINE__, "==============Gate1 LogitFinite Failed==============", std::isfinite(logitsFull[i]) && std::isfinite(logitsKv[i]));
+				}
+				G_assert(__FILE__, __LINE__, "==============Gate1 ParityMismatch Failed==============", maxAbs < 1e-3);
+			}
+
+			delete di;
+			delete info;
+		}
+
+		// Gate 2: Determinism (same seed + config => same logits).
+		{
+			const unsigned int vocab = 19u;
+			const unsigned int padTokenId = vocab - 1u;
+			std::vector<unsigned int> prefix;
+			prefix.push_back(2u);
+			prefix.push_back(4u);
+			prefix.push_back(6u);
+
+			InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+			di->setTrainTokens(prefix, static_cast<int>(padTokenId));
+			di->mirrorTrainToTest();
+
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(12, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=12
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_gate_determinism", in, hidden, out);
+
+			glades::NNetwork a(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::NNetwork b(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			a.setSeed(9u);
+			b.setSeed(9u);
+			{
+				glades::TrainingConfig& cfgA = a.getTrainingConfigMutable();
+				cfgA.transformer.enableTokenEmbedding = true;
+				cfgA.transformer.vocabSizeOverride = static_cast<int>(vocab);
+				cfgA.transformer.tieEmbeddings = true;
+				cfgA.transformer.padTokenId = static_cast<int>(padTokenId);
+				cfgA.transformer.nHeadsOverride = 3; // dHead=4
+				cfgA.transformer.nKVHeadsOverride = 3;
+				cfgA.transformer.dFFOverride = 24;
+				cfgA.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+				cfgA.transformer.ffnActivation = glades::TransformerRunConfig::FFN_GELU;
+				cfgA.transformer.normType = glades::TransformerRunConfig::NORM_LAYERNORM;
+				cfgA.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_SINUSOIDAL;
+			}
+			b.getTrainingConfigMutable() = a.getTrainingConfigMutable();
+
+			G_assert(__FILE__, __LINE__, "==============Gate2 InitA Failed==============", a.test(di).ok());
+			G_assert(__FILE__, __LINE__, "==============Gate2 InitB Failed==============", b.test(di).ok());
+
+			std::vector<float> la, lb;
+			G_assert(__FILE__, __LINE__, "==============Gate2 ForwardA Failed==============", a.transformerLmForwardLastLogits(prefix, la).ok());
+			G_assert(__FILE__, __LINE__, "==============Gate2 ForwardB Failed==============", b.transformerLmForwardLastLogits(prefix, lb).ok());
+			G_assert(__FILE__, __LINE__, "==============Gate2 Size Failed==============", la.size() == vocab && lb.size() == vocab);
+			for (unsigned int i = 0; i < vocab; ++i)
+				G_assert(__FILE__, __LINE__, "==============Gate2 LogitsMismatch Failed==============", fabs((double)la[i] - (double)lb[i]) < 1e-7);
+
+			delete di;
+			delete info;
+		}
+
+		// Gate 3: Padding key-mask correctness (attention forward ignores masked keys).
+		{
+			const unsigned int T = 3u;
+			const unsigned int dK = 1u;
+			const unsigned int dV = 1u;
+			const float Q[T * dK] = {1.0f, 1.0f, 1.0f};
+			const float K[T * dK] = {0.0f, 100.0f, 0.0f};  // masked key has huge score if not masked
+			const float V[T * dV] = {1.0f, 999.0f, 3.0f};  // masked value would dominate if included
+			unsigned char keyAllowed[T] = {1u, 0u, 1u};    // middle position is padding/masked
+
+			float O[T * dV] = {0.0f, 0.0f, 0.0f};
+			glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
+			    Q, /*qStride*/ dK,
+			    K, /*kStride*/ dK,
+			    V, /*vStride*/ dV,
+			    T, dK, dV,
+			    /*causal*/ false,
+			    O, /*oStride*/ dV,
+			    keyAllowed);
+
+			// Only keys {0,2} are allowed and have equal scores (0), so output is uniform average: (1+3)/2 = 2.
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				G_assert(__FILE__, __LINE__, "==============Gate3 O Finite Failed==============", std::isfinite(O[t]));
+				G_assert(__FILE__, __LINE__, "==============Gate3 MaskedForward Wrong Failed==============", fabs((double)O[t] - 2.0) < 1e-5);
+			}
+		}
+
+		// Gate 4: Padding key-mask correctness (attention backward produces zero grads for masked keys).
+		{
+			const unsigned int T = 3u;
+			const unsigned int dK = 1u;
+			const unsigned int dV = 1u;
+			const float Q[T * dK] = {1.0f, 1.0f, 1.0f};
+			const float K[T * dK] = {0.0f, 100.0f, 0.0f};
+			const float V[T * dV] = {1.0f, 999.0f, 3.0f};
+			const float dO[T * dV] = {1.0f, -2.0f, 3.0f};
+			unsigned char keyAllowed[T] = {1u, 0u, 1u};
+
+			float dQ[T * dK] = {0.0f, 0.0f, 0.0f};
+			float dKbuf[T * dK] = {0.0f, 0.0f, 0.0f};
+			float dVbuf[T * dV] = {0.0f, 0.0f, 0.0f};
+			glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
+			    Q, /*qStride*/ dK,
+			    K, /*kStride*/ dK,
+			    V, /*vStride*/ dV,
+			    dO, /*dOStride*/ dV,
+			    T, dK, dV,
+			    /*causal*/ false,
+			    dQ, /*dQStride*/ dK,
+			    dKbuf, /*dKStride*/ dK,
+			    dVbuf, /*dVStride*/ dV,
+			    keyAllowed);
+
+			// Masked key/value at u=1 must have exactly zero gradients.
+			G_assert(__FILE__, __LINE__, "==============Gate4 Masked dK NotZero Failed==============", fabs((double)dKbuf[1]) == 0.0);
+			G_assert(__FILE__, __LINE__, "==============Gate4 Masked dV NotZero Failed==============", fabs((double)dVbuf[1]) == 0.0);
+			for (unsigned int i = 0; i < T; ++i)
+			{
+				G_assert(__FILE__, __LINE__, "==============Gate4 dQ Finite Failed==============", std::isfinite(dQ[i]));
+				G_assert(__FILE__, __LINE__, "==============Gate4 dK Finite Failed==============", std::isfinite(dKbuf[i]));
+				G_assert(__FILE__, __LINE__, "==============Gate4 dV Finite Failed==============", std::isfinite(dVbuf[i]));
+			}
+		}
+
+		// Gate 5: RoPE forward+inverse is identity (strided in-place kernel).
+		{
+			const unsigned int T = 4u;
+			const unsigned int dHead = 4u;
+			const unsigned int ropeDim = 4u;
+			const double theta = 10000.0;
+			std::vector<double> invFreq(ropeDim / 2u, 0.0);
+			for (unsigned int i = 0; i < ropeDim / 2u; ++i)
+				invFreq[i] = pow(theta, -2.0 * (double)i / (double)ropeDim);
+
+			std::vector<float> buf(T * dHead, 0.0f);
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				for (unsigned int j = 0; j < dHead; ++j)
+					buf[t * dHead + j] = (float)(0.1 * (double)(1u + t) + 0.01 * (double)j);
+			}
+			const std::vector<float> orig = buf;
+
+			glades::transformer_kernels::rope_apply_inplace_strided(&buf[0], T, /*rowStride*/ dHead, dHead, ropeDim, invFreq, /*inverse*/ false);
+			glades::transformer_kernels::rope_apply_inplace_strided(&buf[0], T, /*rowStride*/ dHead, dHead, ropeDim, invFreq, /*inverse*/ true);
+
+			double maxAbs = 0.0;
+			for (size_t i = 0; i < buf.size(); ++i)
+			{
+				const double d = fabs((double)buf[i] - (double)orig[i]);
+				if (d > maxAbs) maxAbs = d;
+			}
+			G_assert(__FILE__, __LINE__, "==============Gate5 RoPE Invertibility Failed==============", maxAbs < 1e-6);
+		}
+	}
+
+	// Minimal smoke test: ensure transformer can initialize tensors and run.
+	printf("-----------------------------------\n");
+	printf("Transformer smoke test\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		// A single sequence of length 3 (default DataInput sequence semantics: all rows are one sequence).
+		di->trainMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(3, shmea::GVector<float>(1, 0.0f));
+		for (int t = 0; t < 3; ++t)
+		{
+			di->trainMatrix[t][0] = static_cast<float>(t);
+			// Learn identity: y = x (simple but non-trivial; validates gradients are non-zero).
+			di->trainExpectedMatrix[t][0] = static_cast<float>(t);
+		}
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+        glades::InputLayerInfo* in = new glades::InputLayerInfo(
             /*batchSize*/ 1,
-            /*learningRate*/ lr,
+		    /*learningRate*/ 0.01f,
             /*momentumFactor*/ 0.0f,
             /*weightDecay1*/ 0.0f,
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
             /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        );
-        std::vector<glades::HiddenLayerInfo*> hidden11;
-        hidden11.push_back(new glades::HiddenLayerInfo(
-            /*size*/ 1,
-            /*learningRate*/ lr,
+		    /*activationParam*/ 1.0f);
+
+		// Transformer blocks are represented as hidden layers with constant size == dModel.
+		// Heads and dFF are configured via TrainingConfig.transformer overrides.
+        std::vector<glades::HiddenLayerInfo*> hidden;
+        hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 8,                 // dModel
+		    /*learningRate*/ 0.01f,
             /*momentumFactor*/ 0.0f,
             /*weightDecay1*/ 0.0f,
             /*weightDecay2*/ 0.0f,
             /*pDropout*/ 0.0f,
-            /*activationType*/ glades::GMath::LINEAR,
-            /*activationParam*/ 1.0f
-        ));
-        glades::OutputLayerInfo* out11 = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
-        glades::NNInfo* info11 = new glades::NNInfo("ut_gru_bptt", in11, hidden11, out11);
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
 
-        glades::NNetwork gruNet11(info11, glades::NNetwork::TYPE_GRU);
-        gruNet11.getTerminatorMutable().setEpoch(1);
-        gruNet11.getTerminatorMutable().setAccuracy(0);
+        glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_smoke", in, hidden, out);
 
-        gruNet11.graphMutable().build(info11, di11, glades::NNetwork::TYPE_GRU);
-        gruNet11.setMustdBuildMeat(false);
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+		net.setSeed(2026u);
+        net.getTerminatorMutable().setEpoch(5);
+        net.getTerminatorMutable().setAccuracy(0);
 
-        glades::Layer* hiddenLayer11 = gruNet11.graphMutable().getOutputLayer(1);
-        glades::Layer* outLayer11 = gruNet11.graphMutable().getOutputLayer(2);
-        glades::Node* hNode11 = gruNet11.graphMutable().getOutputNode(hiddenLayer11, 0);
-        glades::Node* yNode11 = gruNet11.graphMutable().getOutputNode(outLayer11, 0);
-        glades::Node* ctx11 = (hNode11 ? hNode11->getContextNode() : NULL);
+		// Exercise "modern LLM-style" transformer options:
+		// - RoPE positional encoding
+		// - RMSNorm
+		// - SwiGLU FFN
+		// - Grouped-query attention (KV heads < Q heads)
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.nHeadsOverride = 2;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.nKVHeadsOverride = 1; // with nHeads=2 => 2 query heads share 1 KV head
+			cfg.transformer.ropeTheta = 10000.0f;
+			cfg.transformer.ropeDimOverride = 0; // full head dim
+		}
 
-        G_assert(__FILE__, __LINE__,
-                 "==============NN11-test::NodesMissing() Failed==============",
-                 (hiddenLayer11 != NULL) && (outLayer11 != NULL) && (hNode11 != NULL) && (yNode11 != NULL) && (ctx11 != NULL));
+		// Force init (no updates), then snapshot weights to verify training updates parameters.
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke InitTestStatus() Failed==============", net.test(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke SaveModel(before) Failed==============", net.saveModel("ut_pkg_transformer_smoke_before").ok());
+		double l2Before = 0.0;
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke ReadWeights(before) Failed==============",
+		         transformer_weights_l2_from_file("database/models/ut_pkg_transformer_smoke_before/weights.bin", l2Before));
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke L2BeforeNonZero() Failed==============", l2Before > 0.0);
 
-        if (hNode11 && yNode11 && ctx11)
-        {
-            hNode11->setEdgeWeight(0, 0.0f);  // Wz
-            hNode11->setEdgeWeight(1, 20.0f); // bz => z ~= 1
-            hNode11->setEdgeWeight(2, 0.0f);  // Wr
-            hNode11->setEdgeWeight(3, 20.0f); // br => r ~= 1
-            hNode11->setEdgeWeight(4, 1.0f);  // Wh (candidate input weight)
-            hNode11->setEdgeWeight(5, 0.0f);  // bh
+		const glades::NNetworkStatus st = net.train(di);
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke SaveModel(after) Failed==============", net.saveModel("ut_pkg_transformer_smoke_after").ok());
+		double l2After = 0.0;
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke ReadWeights(after) Failed==============",
+		         transformer_weights_l2_from_file("database/models/ut_pkg_transformer_smoke_after/weights.bin", l2After));
+		// Assert that training actually updated parameters (non-trivial gradient path).
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Smoke ParamsUpdated() Failed==============", fabs(l2After - l2Before) > 1e-9);
 
-            ctx11->setEdgeWeight(0, 0.0f);
-            ctx11->setEdgeWeight(1, 0.0f);
-            ctx11->setEdgeWeight(2, 1.0f); // Uh = 1
-            ctx11->setWeight(0.0f);
-
-            yNode11->setEdgeWeight(0, 1.0f);
-            yNode11->setEdgeWeight(1, 0.0f); // bias edge
-        }
-
-        const glades::NNetworkStatus st11 = gruNet11.train(di11);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN11-test::TrainStatus() Failed==============",
-                 st11.ok());
-
-        gruNet11.materializeGraphParameters();
-
-        const float b = static_cast<float>(tanh(static_cast<double>(a)));
-        const float deltaY2 = 2.0f * (b - 0.0f);
-        const float daH2 = deltaY2 * (1.0f - (b * b));
-        const float daH1 = daH2 * (1.0f - (a * a));
-        const float expectedWx = 1.0f - (lr * daH1 / 2.0f);
-
-        const float wxFinal = (hNode11 ? hNode11->getEdgeWeight(4) : 0.0f);
-        const float tol = 2e-3f;
-        printf("[UT] GRU(BPTT) Wx final=%f (expected ~%f)\n", wxFinal, expectedWx);
-        G_assert(__FILE__, __LINE__,
-                 "==============NN11-test::GRUBPTT_UpdatesWxFromFutureLoss() Failed==============",
-                 (wxFinal > expectedWx - tol) && (wxFinal < expectedWx + tol));
-
-        delete di11;
-        delete info11;
+		delete di;
+		delete info;
     }
+
+	// Parity test: full forward (recompute) vs KV-cache incremental decode.
+	// This is the single most important correctness invariant for autoregressive inference.
+	printf("-----------------------------------\n");
+	printf("Transformer decoder KV parity (full forward vs KV-cache)\n");
+	printf("-----------------------------------\n");
+	{
+		// Small deterministic setup to keep this test fast and stable.
+		const unsigned int vocab = 32u;
+		const unsigned int padTokenId = vocab - 1u;
+		const unsigned int T = 6u;
+		std::vector<unsigned int> toks;
+		for (unsigned int i = 0; i < T; ++i)
+			toks.push_back(1u + i); // 1..6 (avoid padTokenId)
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		di->setTrainTokens(toks, static_cast<int>(padTokenId));
+		di->mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.01f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+
+		// Transformer blocks are represented as hidden layers with constant size == dModel.
+		// Heads/dFF are configured via TrainingConfig.transformer overrides.
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 16,                // dModel
+		    /*learningRate*/ 0.01f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 16,
+		    /*learningRate*/ 0.01f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(2026u);
+
+		// Configure token LM mode explicitly.
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			// Ensure we do not depend on legacy NNInfo hidden-layer encoding for heads/dFF.
+			// (Some unit-test hidden layer rows use activation metadata for other purposes.)
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+
+			// Use RoPE here because KV-cache inference applies RoPE to Q/K and should be parity-safe.
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.nKVHeadsOverride = 2; // GQA: 4 Q heads share 2 KV heads
+			cfg.transformer.ropeTheta = 10000.0f;
+			cfg.transformer.ropeDimOverride = 0;
+		}
+
+		// Initialize weights/tensors.
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity InitTestStatus() Failed==============", net.test(di).ok());
+
+		// Compare logits for each growing prefix.
+		glades::NNetwork::TransformerLmSession session;
+		G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity SessionReset() Failed==============",
+		         net.transformerLmSessionReset(session, T).ok());
+		std::vector<unsigned int> prefix;
+		std::vector<float> logitsFull;
+		std::vector<float> logitsKv;
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			prefix.push_back(toks[t]);
+			G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity ForwardLastLogits() Failed==============",
+			         net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity SessionAppend() Failed==============",
+			         net.transformerLmSessionAppend(session, toks[t], &logitsKv).ok());
+
+			G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity LogitsSizeMismatch() Failed==============",
+			         logitsFull.size() == logitsKv.size() && logitsFull.size() == vocab);
+
+			double maxAbsDiff = 0.0;
+			for (unsigned int i = 0; i < vocab; ++i)
+			{
+				const double d = fabs(static_cast<double>(logitsFull[i]) - static_cast<double>(logitsKv[i]));
+				if (d > maxAbsDiff) maxAbsDiff = d;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity LogitsMismatch() Failed==============",
+			         maxAbsDiff < 1e-3);
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// Parity test variants: exercise the other positional encoding modes too.
+	printf("-----------------------------------\n");
+	printf("Transformer decoder KV parity variants (NONE + SINUSOIDAL)\n");
+	printf("-----------------------------------\n");
+	{
+		struct ParityCase
+		{
+			static void run(glades::TransformerRunConfig::PositionalEncodingType pe)
+			{
+				const unsigned int vocab = 24u;
+				const unsigned int padTokenId = vocab - 1u;
+				const unsigned int T = 5u;
+				std::vector<unsigned int> toks;
+				for (unsigned int i = 0; i < T; ++i)
+					toks.push_back(2u + i); // avoid 0/1/pad
+
+				InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+				di->setTrainTokens(toks, static_cast<int>(padTokenId));
+				di->mirrorTrainToTest();
+
+				glades::InputLayerInfo* in = new glades::InputLayerInfo(
+				    /*batchSize*/ 1,
+				    /*learningRate*/ 0.01f,
+				    /*momentumFactor*/ 0.0f,
+				    /*weightDecay1*/ 0.0f,
+				    /*weightDecay2*/ 0.0f,
+				    /*pDropout*/ 0.0f,
+				    /*activationType*/ glades::GMath::LINEAR,
+				    /*activationParam*/ 1.0f);
+
+				std::vector<glades::HiddenLayerInfo*> hidden;
+				hidden.push_back(new glades::HiddenLayerInfo(
+				    /*size*/ 12,                // dModel
+				    /*learningRate*/ 0.01f,
+				    /*momentumFactor*/ 0.0f,
+				    /*weightDecay1*/ 0.0f,
+				    /*weightDecay2*/ 0.0f,
+				    /*pDropout*/ 0.0f,
+				    /*activationType*/ glades::GMath::LINEAR,
+				    /*activationParam*/ 1.0f));
+
+				glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+				glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity_variants", in, hidden, out);
+
+				glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+				net.setSeed(2026u);
+				{
+					glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+					cfg.transformer.enableTokenEmbedding = true;
+					cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+					cfg.transformer.tieEmbeddings = true;
+					cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+					cfg.transformer.nHeadsOverride = 3; // dModel=12 -> dHead=4
+					cfg.transformer.nKVHeadsOverride = 3;
+					cfg.transformer.dFFOverride = 24;
+					cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+					cfg.transformer.ffnActivation = glades::TransformerRunConfig::FFN_GELU;
+					cfg.transformer.normType = glades::TransformerRunConfig::NORM_LAYERNORM;
+					cfg.transformer.positionalEncoding = pe;
+				}
+
+				G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity Variants InitTestStatus() Failed==============", net.test(di).ok());
+				glades::NNetwork::TransformerLmSession session;
+				G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity Variants SessionReset() Failed==============",
+				         net.transformerLmSessionReset(session, T).ok());
+
+				std::vector<unsigned int> prefix;
+				std::vector<float> logitsFull;
+				std::vector<float> logitsKv;
+				for (unsigned int t = 0; t < T; ++t)
+				{
+					prefix.push_back(toks[t]);
+					G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity Variants ForwardLastLogits() Failed==============",
+					         net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+					G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity Variants SessionAppend() Failed==============",
+					         net.transformerLmSessionAppend(session, toks[t], &logitsKv).ok());
+
+					double maxAbsDiff = 0.0;
+					for (unsigned int i = 0; i < vocab; ++i)
+					{
+						const double d = fabs(static_cast<double>(logitsFull[i]) - static_cast<double>(logitsKv[i]));
+						if (d > maxAbsDiff) maxAbsDiff = d;
+					}
+					G_assert(__FILE__, __LINE__, "==============NN::Transformer Decoder KV Parity Variants LogitsMismatch() Failed==============",
+					         maxAbsDiff < 1e-3);
+				}
+
+				delete di;
+				delete info;
+			}
+		};
+
+		ParityCase::run(glades::TransformerRunConfig::POSENC_NONE);
+		ParityCase::run(glades::TransformerRunConfig::POSENC_SINUSOIDAL);
+	}
+
+	// KV parity with padding tokens interspersed:
+	// - padded positions must be masked out of attention as KEYS
+	// - full forward vs KV-cache incremental decode must remain identical
+	printf("-----------------------------------\n");
+	printf("Transformer decoder KV parity (padding token key-mask)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 23u;
+		const unsigned int padTokenId = vocab - 1u;
+		const unsigned int T = 7u;
+		// Include padding tokens in the prompt to validate key-masking parity.
+		// (Pad tokens are still processed as queries; they just can't be attended-to as keys.)
+		const unsigned int toksArr[T] = {2u, 3u, padTokenId, 4u, 5u, padTokenId, 6u};
+		std::vector<unsigned int> toks(toksArr, toksArr + T);
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		di->setTrainTokens(toks, static_cast<int>(padTokenId));
+		di->mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity_padding_mask", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(2026u);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;  // dHead=4
+			cfg.transformer.nKVHeadsOverride = 2; // GQA path
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.ropeTheta = 10000.0f;
+			cfg.transformer.ropeDimOverride = 0;
+		}
+
+		G_assert(__FILE__, __LINE__, "==============NN::KVPadMask InitTestStatus() Failed==============", net.test(di).ok());
+
+		glades::NNetwork::TransformerLmSession session;
+		G_assert(__FILE__, __LINE__, "==============NN::KVPadMask SessionReset Failed==============", net.transformerLmSessionReset(session, T).ok());
+
+		std::vector<unsigned int> prefix;
+		std::vector<float> logitsFull;
+		std::vector<float> logitsKv;
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			prefix.push_back(toks[t]);
+			G_assert(__FILE__, __LINE__, "==============NN::KVPadMask ForwardLastLogits Failed==============", net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::KVPadMask SessionAppend Failed==============", net.transformerLmSessionAppend(session, toks[t], &logitsKv).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::KVPadMask Size Failed==============", logitsFull.size() == vocab && logitsKv.size() == vocab);
+			double maxAbsDiff = 0.0;
+			for (unsigned int i = 0; i < vocab; ++i)
+			{
+				G_assert(__FILE__, __LINE__, "==============NN::KVPadMask Finite Failed==============", std::isfinite(logitsFull[i]) && std::isfinite(logitsKv[i]));
+				const double d = fabs(static_cast<double>(logitsFull[i]) - static_cast<double>(logitsKv[i]));
+				if (d > maxAbsDiff) maxAbsDiff = d;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::KVPadMask ParityMismatch Failed==============", maxAbsDiff < 1e-3);
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// KV parity for batched KV-cache sessions:
+	// - batch session must match per-sequence sessions for ragged prompts
+	// - both codepaths are used in serving (single request vs batch API)
+	printf("-----------------------------------\n");
+	printf("Transformer decoder KV parity (batch session vs per-sequence sessions)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 31u;
+		const unsigned int padTokenId = vocab - 1u;
+		const unsigned int batchSize = 2u;
+		const unsigned int maxLen = 6u;
+
+		// Ragged prompts.
+		const unsigned int p0Arr[6] = {2u, 3u, 4u, 5u, 6u, 7u};
+		const unsigned int p1Arr[3] = {8u, 9u, 10u};
+		std::vector<unsigned int> p0(p0Arr, p0Arr + 6u);
+		std::vector<unsigned int> p1(p1Arr, p1Arr + 3u);
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		di->setTrainTokens(p0, static_cast<int>(padTokenId));
+		di->mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_parity_batch_session", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(2026u);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 2; // exercise GQA
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.ropeTheta = 10000.0f;
+			cfg.transformer.ropeDimOverride = 0;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity InitTestStatus() Failed==============", net.test(di).ok());
+
+		// Reference: per-sequence sessions.
+		std::vector<float> ref0, ref1;
+		{
+			glades::NNetwork::TransformerLmSession s0;
+			G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity S0 Reset Failed==============", net.transformerLmSessionReset(s0, maxLen).ok());
+			for (size_t t = 0; t < p0.size(); ++t)
+				G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity S0 Append Failed==============", net.transformerLmSessionAppend(s0, p0[t], (t + 1u == p0.size()) ? &ref0 : NULL).ok());
+
+			glades::NNetwork::TransformerLmSession s1;
+			G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity S1 Reset Failed==============", net.transformerLmSessionReset(s1, maxLen).ok());
+			for (size_t t = 0; t < p1.size(); ++t)
+				G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity S1 Append Failed==============", net.transformerLmSessionAppend(s1, p1[t], (t + 1u == p1.size()) ? &ref1 : NULL).ok());
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity RefSize0 Failed==============", ref0.size() == vocab);
+		G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity RefSize1 Failed==============", ref1.size() == vocab);
+
+		// Batched session: ragged-safe append with active mask.
+		glades::NNetwork::TransformerLmBatchSession bs;
+		G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity BatchReset Failed==============", net.transformerLmBatchSessionReset(bs, batchSize, maxLen).ok());
+		std::vector<float> logitsFlat;
+		std::vector<float> got0, got1;
+		got0.assign(vocab, 0.0f);
+		got1.assign(vocab, 0.0f);
+		for (unsigned int step = 0u; step < maxLen; ++step)
+		{
+			std::vector<unsigned int> tokenIds(batchSize, padTokenId);
+			std::vector<unsigned char> active(batchSize, 0u);
+
+			if (step < static_cast<unsigned int>(p0.size()))
+			{
+				active[0] = 1u;
+				tokenIds[0] = p0[step];
+			}
+			if (step < static_cast<unsigned int>(p1.size()))
+			{
+				active[1] = 1u;
+				tokenIds[1] = p1[step];
+			}
+
+			G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity BatchAppend Failed==============",
+			         net.transformerLmBatchSessionAppendSelective(bs, tokenIds, active, &logitsFlat).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity FlatSize Failed==============", logitsFlat.size() == static_cast<size_t>(batchSize) * static_cast<size_t>(vocab));
+
+			// Inactive rows must be zeros by contract (helps downstream code avoid branching).
+			for (unsigned int b = 0u; b < batchSize; ++b)
+			{
+				if (active[b] == 0u)
+				{
+					for (unsigned int i = 0u; i < vocab; ++i)
+						G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity InactiveNotZero Failed==============", logitsFlat[b * vocab + i] == 0.0f);
+				}
+			}
+
+			if (step + 1u == static_cast<unsigned int>(p0.size()))
+			{
+				for (unsigned int i = 0u; i < vocab; ++i)
+					got0[i] = logitsFlat[0u * vocab + i];
+			}
+			if (step + 1u == static_cast<unsigned int>(p1.size()))
+			{
+				for (unsigned int i = 0u; i < vocab; ++i)
+					got1[i] = logitsFlat[1u * vocab + i];
+			}
+		}
+
+		// Compare batch vs per-sequence logits at the last prompt token.
+		double maxAbs0 = 0.0;
+		double maxAbs1 = 0.0;
+		for (unsigned int i = 0u; i < vocab; ++i)
+		{
+			const double d0 = fabs(static_cast<double>(got0[i]) - static_cast<double>(ref0[i]));
+			const double d1 = fabs(static_cast<double>(got1[i]) - static_cast<double>(ref1[i]));
+			if (d0 > maxAbs0) maxAbs0 = d0;
+			if (d1 > maxAbs1) maxAbs1 = d1;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity LogitsMismatch0 Failed==============", maxAbs0 < 1e-3);
+		G_assert(__FILE__, __LINE__, "==============NN::BatchKVParity LogitsMismatch1 Failed==============", maxAbs1 < 1e-3);
+
+		delete di;
+		delete info;
+	}
+
+	// KV-cache FP16 storage parity:
+	// - logits won't be bit-identical vs full forward (FP16 quantization), but should remain close
+	// - argmax should remain stable for small deterministic models
+	printf("-----------------------------------\n");
+	printf("Transformer decoder KV-cache FP16 storage parity (close + argmax stable)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 29u;
+		const unsigned int padTokenId = vocab - 1u;
+		const unsigned int T = 6u;
+		std::vector<unsigned int> toks;
+		for (unsigned int i = 0u; i < T; ++i)
+			toks.push_back(2u + i);
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		di->setTrainTokens(toks, static_cast<int>(padTokenId));
+		di->mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_cache_fp16_parity", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(2026u);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 2;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.ropeTheta = 10000.0f;
+			cfg.transformer.ropeDimOverride = 0;
+			cfg.transformer.kvCacheDType = glades::TransformerRunConfig::KV_CACHE_F16;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity InitTestStatus() Failed==============", net.test(di).ok());
+
+		glades::NNetwork::TransformerLmSession session;
+		G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity SessionReset Failed==============", net.transformerLmSessionReset(session, T).ok());
+
+		std::vector<unsigned int> prefix;
+		std::vector<float> logitsFull;
+		std::vector<float> logitsKv;
+		for (unsigned int t = 0u; t < T; ++t)
+		{
+			prefix.push_back(toks[t]);
+			G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity ForwardLastLogits Failed==============", net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity SessionAppend Failed==============", net.transformerLmSessionAppend(session, toks[t], &logitsKv).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity Size Failed==============", logitsFull.size() == vocab && logitsKv.size() == vocab);
+
+			// Argmax stability + reasonably small error bound.
+			unsigned int a0 = 0u, a1 = 0u;
+			for (unsigned int i = 1u; i < vocab; ++i)
+			{
+				if (logitsFull[i] > logitsFull[a0]) a0 = i;
+				if (logitsKv[i] > logitsKv[a1]) a1 = i;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity ArgmaxMismatch Failed==============", a0 == a1);
+
+			double maxAbsDiff = 0.0;
+			for (unsigned int i = 0u; i < vocab; ++i)
+			{
+				G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity Finite Failed==============", std::isfinite(logitsFull[i]) && std::isfinite(logitsKv[i]));
+				const double d = fabs(static_cast<double>(logitsFull[i]) - static_cast<double>(logitsKv[i]));
+				if (d > maxAbsDiff) maxAbsDiff = d;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::KVFP16Parity TooFar Failed==============", maxAbsDiff < 5e-2);
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// KV-cache BF16 storage parity:
+	// - logits won't be bit-identical vs full forward (BF16 quantization), but should remain close
+	// - argmax should remain stable for small deterministic models
+	printf("-----------------------------------\n");
+	printf("Transformer decoder KV-cache BF16 storage parity (close + argmax stable)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 29u;
+		const unsigned int padTokenId = vocab - 1u;
+		const unsigned int T = 6u;
+		std::vector<unsigned int> toks;
+		for (unsigned int i = 0u; i < T; ++i)
+			toks.push_back(2u + i);
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		di->setTrainTokens(toks, static_cast<int>(padTokenId));
+		di->mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_kv_cache_bf16_parity", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(2026u);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 2;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.ropeTheta = 10000.0f;
+			cfg.transformer.ropeDimOverride = 0;
+			cfg.transformer.kvCacheDType = glades::TransformerRunConfig::KV_CACHE_BF16;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity InitTestStatus() Failed==============", net.test(di).ok());
+
+		glades::NNetwork::TransformerLmSession session;
+		G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity SessionReset Failed==============", net.transformerLmSessionReset(session, T).ok());
+
+		std::vector<unsigned int> prefix;
+		std::vector<float> logitsFull;
+		std::vector<float> logitsKv;
+		for (unsigned int t = 0u; t < T; ++t)
+		{
+			prefix.push_back(toks[t]);
+			G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity ForwardLastLogits Failed==============", net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity SessionAppend Failed==============", net.transformerLmSessionAppend(session, toks[t], &logitsKv).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity Size Failed==============", logitsFull.size() == vocab && logitsKv.size() == vocab);
+
+			// Argmax stability + reasonably small error bound.
+			unsigned int a0 = 0u, a1 = 0u;
+			for (unsigned int i = 1u; i < vocab; ++i)
+			{
+				if (logitsFull[i] > logitsFull[a0]) a0 = i;
+				if (logitsKv[i] > logitsKv[a1]) a1 = i;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity ArgmaxMismatch Failed==============", a0 == a1);
+
+			double maxAbsDiff = 0.0;
+			for (unsigned int i = 0u; i < vocab; ++i)
+			{
+				G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity Finite Failed==============", std::isfinite(logitsFull[i]) && std::isfinite(logitsKv[i]));
+				const double d = fabs(static_cast<double>(logitsFull[i]) - static_cast<double>(logitsKv[i]));
+				if (d > maxAbsDiff) maxAbsDiff = d;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::KVBF16Parity TooFar Failed==============", maxAbsDiff < 5e-2);
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// RoPE edge-case: odd/small ropeDimOverride should not crash and must preserve KV-cache parity.
+	printf("-----------------------------------\n");
+	printf("Transformer decoder KV parity (RoPE ropeDimOverride edge cases)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 20u;
+		const unsigned int padTokenId = vocab - 1u;
+		const unsigned int T = 5u;
+		std::vector<unsigned int> toks;
+		for (unsigned int i = 0; i < T; ++i)
+			toks.push_back(2u + i);
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		di->setTrainTokens(toks, static_cast<int>(padTokenId));
+		di->mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.01f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ 12,                // dModel
+		    /*learningRate*/ 0.01f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_decoder_rope_dim_override", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(2026u);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 3; // dHead=4
+			cfg.transformer.nKVHeadsOverride = 1; // GQA
+			cfg.transformer.dFFOverride = 24;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.ropeTheta = 10000.0f;
+			cfg.transformer.ropeDimOverride = 1; // odd + <2 => rounds to 0, effectively disabling rotation but exercising the branch
+		}
+
+		G_assert(__FILE__, __LINE__, "==============NN::RoPEDimOverride InitTestStatus() Failed==============", net.test(di).ok());
+		glades::NNetwork::TransformerLmSession session;
+		G_assert(__FILE__, __LINE__, "==============NN::RoPEDimOverride SessionReset Failed==============",
+		         net.transformerLmSessionReset(session, T).ok());
+
+		std::vector<unsigned int> prefix;
+		std::vector<float> logitsFull;
+		std::vector<float> logitsKv;
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			prefix.push_back(toks[t]);
+			G_assert(__FILE__, __LINE__, "==============NN::RoPEDimOverride ForwardLastLogits Failed==============",
+			         net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::RoPEDimOverride SessionAppend Failed==============",
+			         net.transformerLmSessionAppend(session, toks[t], &logitsKv).ok());
+			double maxAbsDiff = 0.0;
+			for (unsigned int i = 0; i < vocab; ++i)
+			{
+				const double d = fabs(static_cast<double>(logitsFull[i]) - static_cast<double>(logitsKv[i]));
+				if (d > maxAbsDiff) maxAbsDiff = d;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::RoPEDimOverride LogitsMismatch Failed==============", maxAbsDiff < 1e-3);
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// RoPE parameter sensitivity: changing ropeTheta should change logits for positions > 0.
+	printf("-----------------------------------\n");
+	printf("Transformer decoder RoPE sensitivity (ropeTheta changes logits)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 16u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		{
+			std::vector<unsigned int> toks;
+			toks.push_back(2u);
+			toks.push_back(3u);
+			di->setTrainTokens(toks, static_cast<int>(padTokenId));
+			di->mirrorTrainToTest();
+		}
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_rope_theta_sensitivity", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(2026u);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 2;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			cfg.transformer.ropeDimOverride = 0;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::RoPEThetaSensitivity InitTestStatus() Failed==============", net.test(di).ok());
+
+		std::vector<unsigned int> prefix;
+		prefix.push_back(2u);
+		prefix.push_back(3u);
+
+		std::vector<float> logitsA, logitsB;
+		net.getTrainingConfigMutable().transformer.ropeTheta = 10000.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::RoPEThetaSensitivity ForwardA Failed==============", net.transformerLmForwardLastLogits(prefix, logitsA).ok());
+		net.getTrainingConfigMutable().transformer.ropeTheta = 500.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::RoPEThetaSensitivity ForwardB Failed==============", net.transformerLmForwardLastLogits(prefix, logitsB).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::RoPEThetaSensitivity Size Failed==============", logitsA.size() == logitsB.size() && logitsA.size() == vocab);
+
+		double maxAbsDiff = 0.0;
+		for (unsigned int i = 0; i < vocab; ++i)
+		{
+			const double d = fabs(static_cast<double>(logitsA[i]) - static_cast<double>(logitsB[i]));
+			if (d > maxAbsDiff) maxAbsDiff = d;
+		}
+		// If this fails, it likely means RoPE is not being applied, or the model collapsed into a degenerate state.
+		G_assert(__FILE__, __LINE__, "==============NN::RoPEThetaSensitivity NoEffect Failed==============", maxAbsDiff > 1e-6);
+
+		delete di;
+		delete info;
+	}
+
+	// Deterministic toy model: identity embedding + no-op blocks => logits are exactly predictable.
+	printf("-----------------------------------\n");
+	printf("Transformer decoder token LM deterministic logits (toy identity embedding)\n");
+	printf("-----------------------------------\n");
+	{
+		// Design:
+		// - vocab == dModel == 3
+		// - embedding E is identity (one-hot basis)
+		// - all block weights are zeros, so the transformer block is a no-op and the hidden state stays == embedding
+		// - logits are computed as h * E^T + bias => logits == h exactly (since E is identity and bias=0)
+		const unsigned int vocab = 3u;
+		const unsigned int dModel = 3u;
+		const unsigned int dFF = 4u;
+		const unsigned int nHeads = 1u;
+		const unsigned int nKVHeads = 1u;
+		const unsigned int nLayers = 1u;
+		const unsigned int padTokenId = vocab - 1u;
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		{
+			std::vector<unsigned int> toks;
+			toks.push_back(0u);
+			toks.push_back(1u);
+			di->setTrainTokens(toks, static_cast<int>(padTokenId));
+			di->mirrorTrainToTest();
+		}
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ static_cast<int>(dModel),
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_identity_logits", in, hidden, out);
+
+		// 1) Bootstrap a package with the right manifest config.
+		glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		bootstrap.setSeed(123u);
+		{
+			glades::TrainingConfig& cfg = bootstrap.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = static_cast<int>(nHeads);
+			cfg.transformer.nKVHeadsOverride = static_cast<int>(nKVHeads);
+			cfg.transformer.dFFOverride = static_cast<int>(dFF);
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_LAYERNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity InitTestStatus() Failed==============", bootstrap.test(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SaveModel(bootstrap) Failed==============", bootstrap.saveModel("ut_pkg_transformer_toy_identity").ok());
+
+		// 2) Override weights with deterministic values.
+		const std::vector<float> E = tokE_identity(vocab, dModel); // identity
+		const std::vector<float> bLm(vocab, 0.0f);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity WriteOverrideWeights Failed==============",
+		         write_transformer_decoder_tokenlm_weights("database/models/ut_pkg_transformer_toy_identity/weights.bin",
+		                                                   nLayers, dModel, dFF, nHeads, nKVHeads,
+		                                                   vocab, padTokenId,
+		                                                   static_cast<unsigned int>(glades::TransformerRunConfig::FFN_MLP),
+		                                                   E, bLm,
+		                                                   /*zeroAllBlocks*/ true));
+
+		// 3) Load the overridden model into a fresh net and assert exact logits.
+		glades::NNetwork net(glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity LoadModel Failed==============", net.loadModel("ut_pkg_transformer_toy_identity", di).ok());
+
+		std::vector<float> logits;
+		std::vector<unsigned int> toks;
+		toks.push_back(2u);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity ForwardLastLogits Failed==============", net.transformerLmForwardLastLogits(toks, logits).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity LogitsSize Failed==============", logits.size() == vocab);
+		// Expect logits == onehot(token=2): [0,0,1]
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit0 Failed==============", fabs(logits[0] - 0.0f) < 1e-6f);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit1 Failed==============", fabs(logits[1] - 0.0f) < 1e-6f);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit2 Failed==============", fabs(logits[2] - 1.0f) < 1e-6f);
+
+		// Same via session-based incremental decode.
+		glades::NNetwork::TransformerLmSession session;
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionReset Failed==============",
+		         net.transformerLmSessionReset(session, /*maxSeqLen*/ 4u).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen0 Failed==============", session.curLen == 0u);
+		std::vector<float> logitsKv;
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionAppend Failed==============",
+		         net.transformerLmSessionAppend(session, /*tokenId*/ 2u, &logitsKv).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen1 Failed==============", session.curLen == 1u);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity KvLogitsSize Failed==============", logitsKv.size() == vocab);
+		for (unsigned int i = 0; i < vocab; ++i)
+			G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity KvLogitsMismatch Failed==============", fabs(logitsKv[i] - logits[i]) < 1e-6f);
+
+		delete di;
+		delete info;
+	}
+
+	// Deterministic positional encoding test: with identity embeddings and no-op blocks, the logits are:
+	// logits[v] = 1_{v==token} + PE[pos, v]
+	printf("-----------------------------------\n");
+	printf("Transformer decoder sinusoidal positional encoding exactness (toy model)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 3u;
+		const unsigned int dModel = 3u;
+		const unsigned int dFF = 4u;
+		const unsigned int nHeads = 1u;
+		const unsigned int nKVHeads = 1u;
+		const unsigned int nLayers = 1u;
+		const unsigned int padTokenId = vocab - 1u;
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		{
+			std::vector<unsigned int> toks;
+			toks.push_back(0u);
+			toks.push_back(1u);
+			toks.push_back(2u);
+			di->setTrainTokens(toks, static_cast<int>(padTokenId));
+			di->mirrorTrainToTest();
+		}
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ static_cast<int>(dModel),
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_sinusoidal", in, hidden, out);
+
+		glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		{
+			glades::TrainingConfig& cfg = bootstrap.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = static_cast<int>(nHeads);
+			cfg.transformer.nKVHeadsOverride = static_cast<int>(nKVHeads);
+			cfg.transformer.dFFOverride = static_cast<int>(dFF);
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_SINUSOIDAL;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_LAYERNORM;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal InitTestStatus() Failed==============", bootstrap.test(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal SaveModel(bootstrap) Failed==============", bootstrap.saveModel("ut_pkg_transformer_toy_sinusoidal").ok());
+
+		const std::vector<float> E = tokE_identity(vocab, dModel);
+		G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal WriteOverrideWeights Failed==============",
+		         write_transformer_decoder_tokenlm_weights("database/models/ut_pkg_transformer_toy_sinusoidal/weights.bin",
+		                                                   nLayers, dModel, dFF, nHeads, nKVHeads,
+		                                                   vocab, padTokenId,
+		                                                   static_cast<unsigned int>(glades::TransformerRunConfig::FFN_MLP),
+		                                                   E, std::vector<float>(vocab, 0.0f),
+		                                                   /*zeroAllBlocks*/ true));
+
+		glades::NNetwork net(glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal LoadModel Failed==============", net.loadModel("ut_pkg_transformer_toy_sinusoidal", di).ok());
+
+		// Compare full-forward vs incremental session decode and against the closed-form expected logits.
+		glades::NNetwork::TransformerLmSession session;
+		G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal SessionReset Failed==============",
+		         net.transformerLmSessionReset(session, /*maxSeqLen*/ 8u).ok());
+		std::vector<unsigned int> prefix;
+		std::vector<float> logitsFull;
+		std::vector<float> logitsKv;
+		for (unsigned int t = 0; t < 3u; ++t)
+		{
+			const unsigned int tok = static_cast<unsigned int>(t);
+			prefix.push_back(tok);
+			G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal ForwardLastLogits Failed==============",
+			         net.transformerLmForwardLastLogits(prefix, logitsFull).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal SessionAppend Failed==============",
+			         net.transformerLmSessionAppend(session, tok, &logitsKv).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal LogitsSize Failed==============", logitsFull.size() == vocab && logitsKv.size() == vocab);
+
+			for (unsigned int v = 0; v < vocab; ++v)
+			{
+				const float exp = ((v == tok) ? 1.0f : 0.0f) + sinusoidal_pe(/*pos*/ t, /*i*/ v, /*dModel*/ dModel);
+				G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal FullExpectedMismatch Failed==============", fabs(logitsFull[v] - exp) < 1e-5f);
+				G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal KvExpectedMismatch Failed==============", fabs(logitsKv[v] - exp) < 1e-5f);
+			}
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// LLM inference API validation: verify that error paths return explicit statuses rather than silent no-ops.
+	printf("-----------------------------------\n");
+	printf("Transformer inference API validation (error paths)\n");
+	printf("-----------------------------------\n");
+	{
+		// Cache reset: maxSeqLen must be > 0.
+		{
+			glades::NNetwork dec(glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			dec.getTrainingConfigMutable().transformer.enableTokenEmbedding = true;
+			glades::NNetwork::TransformerLmSession session;
+			const glades::NNetworkStatus st = dec.transformerLmSessionReset(session, 0u);
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi MaxSeqLen0() Failed==============", !st.ok());
+		}
+
+		// Wrong net type.
+		{
+			glades::NNetwork dff(glades::NNetwork::TYPE_DFF);
+			glades::NNetwork::TransformerLmSession session;
+			const glades::NNetworkStatus st = dff.transformerLmSessionReset(session, 4u);
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi WrongNetType() Failed==============", !st.ok());
+		}
+
+		// Decoder net but token LM not enabled.
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_api", in, hidden, out);
+
+			glades::NNetwork dec(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::NNetwork::TransformerLmSession session;
+			const glades::NNetworkStatus st = dec.transformerLmSessionReset(session, 4u);
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi TokenLMDisabled() Failed==============", !st.ok());
+
+			delete info;
+		}
+
+		// Unknown positional encoding should fail fast in both reset() and append().
+		{
+			const unsigned int vocab = 8u;
+			InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+			{
+				std::vector<unsigned int> toks;
+				toks.push_back(1u);
+				toks.push_back(2u);
+				// padTokenId is irrelevant in this error-path test; use -1 to skip last target.
+				di->setTrainTokens(toks, -1);
+				di->mirrorTrainToTest();
+			}
+
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_bad_posenc", in, hidden, out);
+
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.nHeadsOverride = 2;
+				cfg.transformer.dFFOverride = 16;
+				cfg.transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc InitTestStatus() Failed==============", net.test(di).ok());
+			glades::NNetwork::TransformerLmSession session;
+			const glades::NNetworkStatus stReset = net.transformerLmSessionReset(session, 4u);
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc KvResetShouldFail Failed==============", !stReset.ok());
+
+			// Also validate the full forward API rejects the unknown encoding.
+			std::vector<unsigned int> toks;
+			toks.push_back(1u);
+			std::vector<float> logits;
+			const glades::NNetworkStatus stF = net.transformerLmForwardLastLogits(toks, logits);
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc ForwardShouldFail Failed==============", !stF.ok());
+
+			delete di;
+			delete info;
+		}
+
+		// Append/forward argument validation (uninitialized cache, tokenId bounds, empty prefix).
+		{
+			const unsigned int vocab = 8u;
+			InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+			{
+				std::vector<unsigned int> toks;
+				toks.push_back(1u);
+				toks.push_back(2u);
+				di->setTrainTokens(toks, -1);
+				di->mirrorTrainToTest();
+			}
+
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_append_bounds", in, hidden, out);
+
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.nHeadsOverride = 2;
+				cfg.transformer.dFFOverride = 16;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+			}
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi AppendBounds InitTestStatus() Failed==============", net.test(di).ok());
+
+			// Append before reset should fail.
+			{
+				glades::NNetwork::TransformerLmSession session; // not initialized
+				std::vector<float> logits;
+				const glades::NNetworkStatus st = net.transformerLmSessionAppend(session, 1u, &logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi AppendBeforeReset ShouldFail Failed==============", !st.ok());
+			}
+
+			// Empty prefix forward should fail.
+			{
+				std::vector<unsigned int> empty;
+				std::vector<float> logits;
+				const glades::NNetworkStatus st = net.transformerLmForwardLastLogits(empty, logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi EmptyPrefix ShouldFail Failed==============", !st.ok());
+			}
+
+			// Reset with maxLen=1 then append twice => second append should fail (cache full).
+			{
+				glades::NNetwork::TransformerLmSession session;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionReset1 Failed==============", net.transformerLmSessionReset(session, 1u).ok());
+				std::vector<float> logits;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionAppend0 Failed==============", net.transformerLmSessionAppend(session, 1u, &logits).ok());
+				const glades::NNetworkStatus st2 = net.transformerLmSessionAppend(session, 2u, &logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi KvAppendOverflow ShouldFail Failed==============", !st2.ok());
+			}
+
+			// Token id out of range should fail.
+			{
+				glades::NNetwork::TransformerLmSession session;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionReset2 Failed==============", net.transformerLmSessionReset(session, 2u).ok());
+				std::vector<float> logits;
+				const glades::NNetworkStatus st = net.transformerLmSessionAppend(session, /*tokenId*/ vocab, &logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi TokenOutOfRange ShouldFail Failed==============", !st.ok());
+			}
+
+			delete di;
+			delete info;
+		}
+
+		// Token LM enabled but tensors not initialized yet.
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_infer_api2", in, hidden, out);
+
+			glades::NNetwork dec(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			dec.getTrainingConfigMutable().transformer.enableTokenEmbedding = true;
+			dec.getTrainingConfigMutable().transformer.vocabSizeOverride = 8;
+			dec.getTrainingConfigMutable().transformer.tieEmbeddings = true;
+			glades::NNetwork::TransformerLmSession session;
+			const glades::NNetworkStatus st = dec.transformerLmSessionReset(session, 4u);
+			G_assert(__FILE__, __LINE__, "==============NN::InferApi UninitializedTensors() Failed==============", !st.ok());
+
+			delete info;
+		}
+	}
+
+	// TokenInput dataset parsing + sequence semantics (LLM data pipeline).
+	printf("-----------------------------------\n");
+	printf("TokenInput parsing + sequence semantics (train/test + mirroring)\n");
+	printf("-----------------------------------\n");
+	{
+		mkdir_if_missing("database");
+		mkdir_if_missing("database/tokeninput_ut");
+
+		// Directory semantics: read train.tok and (optional) test.tok.
+		{
+			{
+				std::ofstream tr("database/tokeninput_ut/train.tok");
+				tr << "1 2 3\n";
+				tr << "\n";          // empty line should be ignored
+				tr << "4 5\n";
+			}
+			{
+				std::ofstream te("database/tokeninput_ut/test.tok");
+				te << "7 8 9 10\n";
+			}
+
+			glades::TokenInput di;
+			di.setPadTokenId(99);
+			di.import(shmea::GString("database/tokeninput_ut/"), 0);
+
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSize Failed==============", di.getTrainSize() == 5u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSize Failed==============", di.getTestSize() == 4u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir FeatureCount Failed==============", di.getFeatureCount() == 1u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeqCount Failed==============", di.getTrainSequenceCount() == 2u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSeqCount Failed==============", di.getTestSequenceCount() == 1u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeq0Len Failed==============", di.getTrainSequenceLength(0u) == 3u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeq1Len Failed==============", di.getTrainSequenceLength(1u) == 2u);
+
+			// Verify next-token shift and pad at sequence end.
+			int tok = 0, nxt = 0;
+			G_assert(__FILE__, __LINE__, "==============TokenInput TokId0 Failed==============", di.getTrainTokenId(0u, tok) && tok == 1);
+			G_assert(__FILE__, __LINE__, "==============TokenInput NextId0 Failed==============", di.getTrainExpectedTokenId(0u, nxt) && nxt == 2);
+			G_assert(__FILE__, __LINE__, "==============TokenInput TokId2 Failed==============", di.getTrainTokenId(2u, tok) && tok == 3);
+			G_assert(__FILE__, __LINE__, "==============TokenInput NextId2 Pad Failed==============", di.getTrainExpectedTokenId(2u, nxt) && nxt == 99);
+			G_assert(__FILE__, __LINE__, "==============TokenInput TokId4 Failed==============", di.getTrainTokenId(4u, tok) && tok == 5);
+			G_assert(__FILE__, __LINE__, "==============TokenInput NextId4 Pad Failed==============", di.getTrainExpectedTokenId(4u, nxt) && nxt == 99);
+		}
+
+		// File semantics: train only, then mirror train->test.
+		{
+			{
+				std::ofstream tr("database/tokeninput_ut/onefile.tok");
+				tr << "2 3 4\n";
+			}
+			glades::TokenInput di;
+			di.setPadTokenId(-1);
+			di.import(shmea::GString("database/tokeninput_ut/onefile.tok"), 0);
+			// padTokenId < 0 => do not emit final timestep (avoids negative expected token ids).
+			G_assert(__FILE__, __LINE__, "==============TokenInput File TrainSize Failed==============", di.getTrainSize() == 2u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput File TestMirrored Failed==============", di.getTestSize() == 2u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput File SeqCount Failed==============", di.getTrainSequenceCount() == 1u && di.getTestSequenceCount() == 1u);
+		}
+
+		// Invalid token id (does not fit in int) should fail to load (trainSize stays 0).
+		{
+			{
+				std::ofstream tr("database/tokeninput_ut/bad.tok");
+				tr << "99999999999999999999\n";
+			}
+			glades::TokenInput di;
+			di.import(shmea::GString("database/tokeninput_ut/bad.tok"), 0);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Bad ShouldBeEmpty Failed==============", di.getTrainSize() == 0u);
+		}
+	}
+
+	// Token LM perplexity + pad skipping: make logits uniform (all zeros) so NLL is exactly ln(vocab).
+	printf("-----------------------------------\n");
+	printf("Transformer token LM perplexity + pad skipping (uniform toy model)\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 3u;
+		const unsigned int dModel = 4u;
+		const unsigned int dFF = 8u;
+		const unsigned int nHeads = 1u;
+		const unsigned int nKVHeads = 1u;
+		const unsigned int nLayers = 1u;
+		const unsigned int padTokenId = vocab - 1u;
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		{
+			// One sequence length 4; last target is pad => skipped.
+			std::vector<unsigned int> toks;
+			toks.push_back(0u);
+			toks.push_back(1u);
+			toks.push_back(0u);
+			toks.push_back(2u);
+			di->setTestTokens(toks, static_cast<int>(padTokenId));
+			di->setTrainTokens(toks, static_cast<int>(padTokenId));
+		}
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ static_cast<int>(dModel),
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_uniform", in, hidden, out);
+
+		glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		bootstrap.setSeed(7u);
+		{
+			glades::TrainingConfig& cfg = bootstrap.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = static_cast<int>(nHeads);
+			cfg.transformer.nKVHeadsOverride = static_cast<int>(nKVHeads);
+			cfg.transformer.dFFOverride = static_cast<int>(dFF);
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::ToyUniform InitTestStatus() Failed==============", bootstrap.test(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ToyUniform SaveModel(bootstrap) Failed==============", bootstrap.saveModel("ut_pkg_transformer_toy_uniform").ok());
+
+		// Override weights: all zeros (including tokE) => logits are all zeros => uniform softmax.
+		const std::vector<float> Ez(static_cast<size_t>(vocab) * static_cast<size_t>(dModel), 0.0f);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyUniform WriteOverrideWeights Failed==============",
+		         write_transformer_decoder_tokenlm_weights("database/models/ut_pkg_transformer_toy_uniform/weights.bin",
+		                                                   nLayers, dModel, dFF, nHeads, nKVHeads,
+		                                                   vocab, padTokenId,
+		                                                   static_cast<unsigned int>(glades::TransformerRunConfig::FFN_MLP),
+		                                                   Ez, std::vector<float>(vocab, 0.0f),
+		                                                   /*zeroAllBlocks*/ true));
+
+		glades::NNetwork net(glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyUniform LoadModel Failed==============", net.loadModel("ut_pkg_transformer_toy_uniform", di).ok());
+
+		CaptureEpochMetricsCb cb;
+		G_assert(__FILE__, __LINE__, "==============NN::ToyUniform TestStatus Failed==============", net.test(di, &cb).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ToyUniform SawMetrics Failed==============", cb.saw);
+		if (cb.saw)
+		{
+			const float expectedNll = static_cast<float>(log(static_cast<double>(vocab))); // uniform softmax
+			const float expectedPpl = static_cast<float>(vocab);
+			G_assert(__FILE__, __LINE__, "==============NN::ToyUniform NLLMismatch Failed==============", fabs(cb.last.totalError - expectedNll) < 1e-4f);
+			G_assert(__FILE__, __LINE__, "==============NN::ToyUniform PerplexityMismatch Failed==============", fabs(cb.last.perplexity - expectedPpl) < 1e-3f);
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// Batch generation correctness + determinism: serve-batch must match per-request generate under per-request RNG overrides.
+	// Also validates ragged prompt prefill, stop tokens, and per-request early stop behavior.
+	printf("-----------------------------------\n");
+	printf("Transformer serving: batch generation correctness + determinism\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 7u;
+		const unsigned int dModel = 8u;
+		const unsigned int dFF = 16u;
+		const unsigned int nHeads = 1u;
+		const unsigned int nKVHeads = 1u;
+		const unsigned int nLayers = 1u;
+		const unsigned int padTokenId = vocab - 1u; // 6
+		const unsigned int stopTok = 5u;
+
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		{
+			// Any tokens are fine; we just need a TokenInput-like DataInput to initialize and load a token LM package.
+			std::vector<unsigned int> toks;
+			toks.push_back(0u);
+			toks.push_back(1u);
+			toks.push_back(2u);
+			di->setTrainTokens(toks, static_cast<int>(padTokenId));
+			di->mirrorTrainToTest();
+		}
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    /*batchSize*/ 1,
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    /*size*/ static_cast<int>(dModel),
+		    /*learningRate*/ 0.0f,
+		    /*momentumFactor*/ 0.0f,
+		    /*weightDecay1*/ 0.0f,
+		    /*weightDecay2*/ 0.0f,
+		    /*pDropout*/ 0.0f,
+		    /*activationType*/ glades::GMath::LINEAR,
+		    /*activationParam*/ 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_toy_bias_only", in, hidden, out);
+
+		// 1) Bootstrap package.
+		glades::NNetwork bootstrap(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		bootstrap.setSeed(42u);
+		{
+			glades::TrainingConfig& cfg = bootstrap.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = static_cast<int>(nHeads);
+			cfg.transformer.nKVHeadsOverride = static_cast<int>(nKVHeads);
+			cfg.transformer.dFFOverride = static_cast<int>(dFF);
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+		}
+		G_assert(__FILE__, __LINE__, "==============NN::ServeBatch Bootstrap InitTestStatus() Failed==============", bootstrap.test(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::ServeBatch Bootstrap SaveModel Failed==============", bootstrap.saveModel("ut_pkg_transformer_toy_bias_only").ok());
+
+		// 2) Override weights: tokE all zeros => hidden state is zero; logits are exactly lmBias.
+		const std::vector<float> Ez(static_cast<size_t>(vocab) * static_cast<size_t>(dModel), 0.0f);
+		std::vector<float> bLm(vocab, 0.0f);
+		for (unsigned int i = 0u; i < vocab; ++i)
+			bLm[i] = 0.1f * static_cast<float>(i);
+		// Make stopTok the greedy argmax and make pad extremely unlikely.
+		bLm[stopTok] = 3.0f;
+		bLm[padTokenId] = -100.0f;
+		G_assert(__FILE__, __LINE__, "==============NN::ServeBatch WriteOverrideWeights Failed==============",
+		         write_transformer_decoder_tokenlm_weights("database/models/ut_pkg_transformer_toy_bias_only/weights.bin",
+		                                                   nLayers, dModel, dFF, nHeads, nKVHeads,
+		                                                   vocab, padTokenId,
+		                                                   static_cast<unsigned int>(glades::TransformerRunConfig::FFN_MLP),
+		                                                   Ez, bLm,
+		                                                   /*zeroAllBlocks*/ true));
+
+		// 3) Load as a fresh net for inference/generation tests.
+		glades::NNetwork net(glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		G_assert(__FILE__, __LINE__, "==============NN::ServeBatch LoadModel Failed==============", net.loadModel("ut_pkg_transformer_toy_bias_only", di).ok());
+
+		struct AssertSameGenerateResult
+		{
+			static void run(const glades::NNetwork::TransformerGenerateResult& a,
+			                const glades::NNetwork::TransformerGenerateResult& b,
+			                const char* msg)
+			{
+				G_assert(__FILE__, __LINE__, msg, a.tokens == b.tokens);
+				G_assert(__FILE__, __LINE__, msg, a.stoppedOnEos == b.stoppedOnEos);
+				G_assert(__FILE__, __LINE__, msg, a.stoppedByStopToken == b.stoppedByStopToken);
+				G_assert(__FILE__, __LINE__, msg, a.stoppedByCallback == b.stoppedByCallback);
+				G_assert(__FILE__, __LINE__, msg, a.stoppedByLimit == b.stoppedByLimit);
+				G_assert(__FILE__, __LINE__, msg, a.lastToken == b.lastToken);
+			}
+		};
+
+		// Case A: ragged prompts + per-request RNG overrides => batch == per-request generate exactly.
+		{
+			glades::NNetwork::TransformerGenerateConfig cfgA;
+			cfgA.includePromptInOutput = true;
+			cfgA.maxNewTokens = 6u;
+			cfgA.maxSeqLen = 0u; // promptLen + maxNewTokens
+			cfgA.temperature = 1.0f;
+			cfgA.topK = 0u;
+			cfgA.topP = 1.0f;
+			cfgA.eosTokenId = -1;
+			cfgA.stopOnEos = false;
+
+			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
+			reqs.resize(2);
+			reqs[0].promptTokens.clear(); // len 2
+			reqs[0].promptTokens.push_back(0u);
+			reqs[0].promptTokens.push_back(1u);
+			reqs[1].promptTokens.clear(); // len 3
+			reqs[1].promptTokens.push_back(2u);
+			reqs[1].promptTokens.push_back(3u);
+			reqs[1].promptTokens.push_back(4u);
+			reqs[0].cfg = cfgA;
+			reqs[1].cfg = cfgA;
+			reqs[0].cfg.rngSeedOverride = 111ULL;
+			reqs[1].cfg.rngSeedOverride = 222ULL;
+
+			glades::NNetwork::TransformerServeBatchResult outBatch;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA BatchStatus Failed==============",
+			         net.transformerLmServeGenerateBatch(reqs, outBatch, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA BatchSize Failed==============", outBatch.results.size() == reqs.size());
+
+			for (unsigned int r = 0u; r < static_cast<unsigned int>(reqs.size()); ++r)
+			{
+				glades::NNetwork::TransformerGenerateResult outSingle;
+				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA SingleStatus Failed==============",
+				         net.transformerLmGenerate(reqs[r].promptTokens, reqs[r].cfg, outSingle, NULL).ok());
+				AssertSameGenerateResult::run(outBatch.results[r], outSingle, "==============NN::ServeBatch CaseA BatchVsSingleMismatch Failed==============");
+			}
+
+			// Determinism: same requests twice => identical outputs (since per-request overrides are fixed).
+			glades::NNetwork::TransformerServeBatchResult outBatch2;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA Batch2Status Failed==============",
+			         net.transformerLmServeGenerateBatch(reqs, outBatch2, NULL).ok());
+			for (unsigned int r = 0u; r < static_cast<unsigned int>(reqs.size()); ++r)
+				AssertSameGenerateResult::run(outBatch.results[r], outBatch2.results[r], "==============NN::ServeBatch CaseA DeterminismMismatch Failed==============");
+
+			// Override isolation: request0 alone should match request0 in the 2-request batch.
+			std::vector<glades::NNetwork::TransformerServeRequest> req1;
+			req1.push_back(reqs[0]);
+			glades::NNetwork::TransformerServeBatchResult outSolo;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA SoloStatus Failed==============",
+			         net.transformerLmServeGenerateBatch(req1, outSolo, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA SoloSize Failed==============", outSolo.results.size() == 1u);
+			AssertSameGenerateResult::run(outBatch.results[0], outSolo.results[0], "==============NN::ServeBatch CaseA OverrideIsolationMismatch Failed==============");
+		}
+
+		// Case B: stop tokens work per-request and do not affect other requests.
+		{
+			glades::NNetwork::TransformerGenerateConfig cfgB;
+			cfgB.includePromptInOutput = true;
+			cfgB.maxNewTokens = 10u;
+			cfgB.temperature = 0.0f; // greedy => always emits stopTok
+			cfgB.topK = 0u;
+			cfgB.topP = 1.0f;
+			cfgB.eosTokenId = -1;
+			cfgB.stopOnEos = false;
+			cfgB.rngSeedOverride = 999ULL; // irrelevant for greedy, but keep explicit
+
+			glades::NNetwork::TransformerGenerateConfig cfgC = cfgB;
+			cfgC.maxNewTokens = 3u;   // short request to ensure it runs past genIdx=0
+			cfgC.temperature = 1.0f; // stochastic (still deterministic via override)
+			cfgC.rngSeedOverride = 1234ULL;
+
+			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
+			reqs.resize(2);
+			reqs[0].promptTokens.clear();
+			reqs[0].promptTokens.push_back(1u);
+			reqs[0].cfg = cfgB;
+			reqs[0].stopTokenIds.clear();
+			reqs[0].stopTokenIds.push_back(stopTok);
+
+			reqs[1].promptTokens.clear();
+			reqs[1].promptTokens.push_back(2u);
+			reqs[1].promptTokens.push_back(3u);
+			reqs[1].cfg = cfgC;
+
+			glades::NNetwork::TransformerServeBatchResult outBatch;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB BatchStatus Failed==============",
+			         net.transformerLmServeGenerateBatch(reqs, outBatch, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB Size Failed==============", outBatch.results.size() == 2u);
+
+			// Request0 should stop immediately after emitting stopTok.
+			const glades::NNetwork::TransformerGenerateResult& r0 = outBatch.results[0];
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB StopFlag Failed==============", r0.stoppedByStopToken);
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB StopByLimit False Failed==============", !r0.stoppedByLimit);
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB StopByCallback False Failed==============", !r0.stoppedByCallback);
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB StopToken Last Failed==============", r0.lastToken == stopTok);
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB StopToken Emitted Failed==============",
+			         !r0.tokens.empty() && r0.tokens[r0.tokens.size() - 1u] == stopTok);
+			// Exactly one generated token (plus prompt if included).
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB StopToken Count Failed==============", r0.tokens.size() == (reqs[0].promptTokens.size() + 1u));
+
+			// Request1 should run to its maxNewTokens limit.
+			const glades::NNetwork::TransformerGenerateResult& r1 = outBatch.results[1];
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB OtherReqLimit Failed==============", r1.stoppedByLimit);
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB OtherReqTokenCount Failed==============", r1.tokens.size() == (reqs[1].promptTokens.size() + cfgC.maxNewTokens));
+		}
+
+		// Case C: per-request callback early stop.
+		{
+			struct StopAfterOneCb : public glades::NNetwork::ITransformerServeCallbacks
+			{
+				virtual bool onToken(const glades::NNetwork& /*net*/, unsigned int requestIndex, unsigned int /*tokenId*/, unsigned int generatedIndex)
+				{
+					// Stop request 0 after emitting its first generated token.
+					return (requestIndex == 0u) && (generatedIndex == 0u);
+				}
+			};
+
+			glades::NNetwork::TransformerGenerateConfig cfg;
+			cfg.includePromptInOutput = true;
+			cfg.maxNewTokens = 5u;
+			cfg.temperature = 1.0f;
+			cfg.topK = 0u;
+			cfg.topP = 1.0f;
+			cfg.eosTokenId = -1;
+			cfg.stopOnEos = false;
+			cfg.rngSeedOverride = 2026ULL;
+
+			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
+			reqs.resize(2);
+			reqs[0].promptTokens.clear();
+			reqs[0].promptTokens.push_back(0u);
+			reqs[1].promptTokens.clear();
+			reqs[1].promptTokens.push_back(1u);
+			reqs[0].cfg = cfg;
+			reqs[1].cfg = cfg;
+			reqs[1].cfg.rngSeedOverride = 2027ULL;
+
+			glades::NNetwork::TransformerServeBatchResult outBatch;
+			StopAfterOneCb cb;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC BatchStatus Failed==============",
+			         net.transformerLmServeGenerateBatch(reqs, outBatch, &cb).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Size Failed==============", outBatch.results.size() == 2u);
+
+			// Request0 stopped by callback after 1 generated token.
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Req0 StopByCallback Failed==============", outBatch.results[0].stoppedByCallback);
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Req0 TokenCount Failed==============",
+			         outBatch.results[0].tokens.size() == (reqs[0].promptTokens.size() + 1u));
+
+			// Request1 should run to limit.
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Req1 Limit Failed==============", outBatch.results[1].stoppedByLimit);
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseC Req1 TokenCount Failed==============",
+			         outBatch.results[1].tokens.size() == (reqs[1].promptTokens.size() + cfg.maxNewTokens));
+		}
+
+		// Case D: single-call generation is deterministic even without rngSeedOverride.
+		// Policy: seed is derived from (network rngSeed ^ prompt hash) when rngSeedOverride==0.
+		{
+			glades::NNetwork::TransformerGenerateConfig cfg;
+			cfg.includePromptInOutput = true;
+			cfg.maxNewTokens = 8u;
+			cfg.maxSeqLen = 0u;
+			cfg.temperature = 1.0f; // stochastic
+			cfg.topK = 0u;
+			cfg.topP = 1.0f;
+			cfg.topPTopKCap = 0u; // disable approximation to ensure "pure" top-p policy (topP==1 anyway)
+			cfg.eosTokenId = -1;
+			cfg.stopOnEos = false;
+			cfg.rngSeedOverride = 0ULL; // derive from net seed + prompt
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(0u);
+			prompt.push_back(1u);
+
+			glades::NNetwork::TransformerGenerateResult a, b;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD GenAStatus Failed==============",
+			         net.transformerLmGenerate(prompt, cfg, a, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseD GenBStatus Failed==============",
+			         net.transformerLmGenerate(prompt, cfg, b, NULL).ok());
+			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseD DeterminismNoOverrideMismatch Failed==============");
+		}
+
+		// Case E: fast-by-design top-p cap semantics are explicit and equivalent:
+		//   (topP<1, topK==0, topPTopKCap=C) must behave identically to (topP<1, topK=C).
+		{
+			const unsigned int cap = 7u;
+			glades::NNetwork::TransformerGenerateConfig cfgCap;
+			cfgCap.includePromptInOutput = true;
+			cfgCap.maxNewTokens = 10u;
+			cfgCap.maxSeqLen = 0u;
+			cfgCap.temperature = 1.0f;
+			cfgCap.topK = 0u;        // enable cap path
+			cfgCap.topP = 0.80f;     // nucleus
+			cfgCap.topPTopKCap = cap; // approximation: cap candidate set
+			cfgCap.eosTokenId = -1;
+			cfgCap.stopOnEos = false;
+			cfgCap.rngSeedOverride = 424242ULL;
+
+			glades::NNetwork::TransformerGenerateConfig cfgExplicit = cfgCap;
+			cfgExplicit.topK = cap;
+			// Make the "cap" field irrelevant in the explicit-topK config to guard against bugs
+			// where both topK and cap might accidentally interact.
+			cfgExplicit.topPTopKCap = 0u;
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+
+			glades::NNetwork::TransformerGenerateResult a, b;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseE GenCapStatus Failed==============",
+			         net.transformerLmGenerate(prompt, cfgCap, a, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseE GenExplicitStatus Failed==============",
+			         net.transformerLmGenerate(prompt, cfgExplicit, b, NULL).ok());
+			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseE TopPCapSemanticsMismatch Failed==============");
+		}
+
+		// Case F: greedy semantics equivalence:
+		//   temperature<=0 (greedy) must equal temperature>0 with topK=1 (deterministic argmax).
+		{
+			glades::NNetwork::TransformerGenerateConfig greedy;
+			greedy.includePromptInOutput = true;
+			greedy.maxNewTokens = 6u;
+			greedy.maxSeqLen = 0u;
+			greedy.temperature = 0.0f; // greedy
+			greedy.topK = 0u;
+			greedy.topP = 1.0f;
+			greedy.eosTokenId = -1;
+			greedy.stopOnEos = false;
+			greedy.rngSeedOverride = 1ULL;
+
+			glades::NNetwork::TransformerGenerateConfig top1 = greedy;
+			top1.temperature = 1.0f;
+			top1.topK = 1u; // deterministic argmax
+			top1.rngSeedOverride = 999ULL; // should be irrelevant for deterministic topK=1
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(4u);
+			prompt.push_back(5u);
+
+			glades::NNetwork::TransformerGenerateResult a, b;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseF GreedyStatus Failed==============",
+			         net.transformerLmGenerate(prompt, greedy, a, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseF Top1Status Failed==============",
+			         net.transformerLmGenerate(prompt, top1, b, NULL).ok());
+			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseF GreedyVsTop1Mismatch Failed==============");
+		}
+
+		// Case G: full-vocab sampling parity:
+		//   topK==0 with topP==1 uses a specialized fast path; it must match explicit topK==vocab.
+		{
+			glades::NNetwork::TransformerGenerateConfig fast;
+			fast.includePromptInOutput = true;
+			fast.maxNewTokens = 10u;
+			fast.maxSeqLen = 0u;
+			fast.temperature = 1.0f;
+			fast.topK = 0u;   // fast full-vocab path
+			fast.topP = 1.0f; // no nucleus
+			fast.eosTokenId = -1;
+			fast.stopOnEos = false;
+			fast.rngSeedOverride = 777ULL;
+
+			glades::NNetwork::TransformerGenerateConfig explicitK = fast;
+			explicitK.topK = vocab; // explicit candidate list is full vocab
+
+			std::vector<unsigned int> prompt;
+			// Tokens must be in [0, vocab). Use a non-trivial prompt length >= 2.
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+
+			glades::NNetwork::TransformerGenerateResult a, b;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseG FastStatus Failed==============",
+			         net.transformerLmGenerate(prompt, fast, a, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseG ExplicitStatus Failed==============",
+			         net.transformerLmGenerate(prompt, explicitK, b, NULL).ok());
+			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseG FullVocabParityMismatch Failed==============");
+		}
+
+		// Case H: greedy sampling must ignore rngSeedOverride.
+		{
+			glades::NNetwork::TransformerGenerateConfig g0;
+			g0.includePromptInOutput = true;
+			g0.maxNewTokens = 5u;
+			g0.maxSeqLen = 0u;
+			g0.temperature = 0.0f; // greedy
+			g0.topK = 0u;
+			g0.topP = 1.0f;
+			g0.eosTokenId = -1;
+			g0.stopOnEos = false;
+			g0.rngSeedOverride = 1ULL;
+
+			glades::NNetwork::TransformerGenerateConfig g1 = g0;
+			g1.rngSeedOverride = 2ULL;
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(3u);
+			prompt.push_back(4u);
+
+			glades::NNetwork::TransformerGenerateResult a, b;
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseH GreedyAStatus Failed==============",
+			         net.transformerLmGenerate(prompt, g0, a, NULL).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseH GreedyBStatus Failed==============",
+			         net.transformerLmGenerate(prompt, g1, b, NULL).ok());
+			AssertSameGenerateResult::run(a, b, "==============NN::ServeBatch CaseH GreedySeedAffectsOutput Failed==============");
+		}
+
+		delete di;
+		delete info;
+	}
+
+	// Shape/config validation for transformer/LLM modes.
+	printf("-----------------------------------\n");
+	printf("Transformer config validation (reject invalid shapes)\n");
+	printf("-----------------------------------\n");
+	{
+		// Token LM mode requires integer token-id accessors; do not use NumberInput here.
+		InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+		{
+			std::vector<unsigned int> toks;
+			toks.push_back(0u);
+			di->setTrainTokens(toks, /*pad*/ -1);
+			di->mirrorTrainToTest();
+		}
+
+		// dModel must be divisible by nHeads.
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(10, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=10
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_heads", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.getTrainingConfigMutable().transformer.nHeadsOverride = 4; // 10 % 4 != 0
+			net.getTrainingConfigMutable().transformer.enableTokenEmbedding = true;
+			net.getTrainingConfigMutable().transformer.vocabSizeOverride = 8;
+			net.getTrainingConfigMutable().transformer.tieEmbeddings = true;
+			const glades::NNetworkStatus st = net.test(di);
+			G_assert(__FILE__, __LINE__, "==============NN::BadHeads ShouldFail Failed==============", !st.ok());
+			delete info;
+		}
+
+		// nKVHeads must divide nHeads (GQA grouping).
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(12, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // dModel=12
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_kv_heads", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.getTrainingConfigMutable().transformer.nHeadsOverride = 4;
+			net.getTrainingConfigMutable().transformer.nKVHeadsOverride = 3; // 4 % 3 != 0
+			net.getTrainingConfigMutable().transformer.enableTokenEmbedding = true;
+			net.getTrainingConfigMutable().transformer.vocabSizeOverride = 8;
+			net.getTrainingConfigMutable().transformer.tieEmbeddings = true;
+			const glades::NNetworkStatus st = net.test(di);
+			G_assert(__FILE__, __LINE__, "==============NN::BadKVHeads ShouldFail Failed==============", !st.ok());
+			delete info;
+		}
+
+		// Transformer requires constant hidden size across blocks.
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			hidden.push_back(new glades::HiddenLayerInfo(10, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f)); // mismatch
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_hidden_sizes", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.getTrainingConfigMutable().transformer.nHeadsOverride = 2;
+			net.getTrainingConfigMutable().transformer.enableTokenEmbedding = true;
+			net.getTrainingConfigMutable().transformer.vocabSizeOverride = 8;
+			net.getTrainingConfigMutable().transformer.tieEmbeddings = true;
+			const glades::NNetworkStatus st = net.test(di);
+			G_assert(__FILE__, __LINE__, "==============NN::BadHiddenSizes ShouldFail Failed==============", !st.ok());
+			delete info;
+		}
+
+		// Token LM mode currently requires tieEmbeddings=true (explicit invariant).
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_bad_tie", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.getTrainingConfigMutable().transformer.enableTokenEmbedding = true;
+			net.getTrainingConfigMutable().transformer.vocabSizeOverride = 8;
+			net.getTrainingConfigMutable().transformer.tieEmbeddings = false;
+			const glades::NNetworkStatus st = net.test(di);
+			G_assert(__FILE__, __LINE__, "==============NN::BadTieEmbeddings ShouldFail Failed==============", !st.ok());
+			delete info;
+		}
+
+		delete di;
+	}
+
+	// Transformer math-kernel unit tests (attention + numerics). These test the "LLM core" primitives directly.
+	printf("-----------------------------------\n");
+	printf("Transformer ops: attention forward/backward (causal + recompute parity)\n");
+	printf("-----------------------------------\n");
+	{
+		// Simple, exactly-solvable causal attention: Q=K=0 => uniform over allowed prefix.
+		{
+			const unsigned int T = 3u;
+			const unsigned int dK = 1u;
+			const unsigned int dV = 1u;
+			const float Q[T * dK] = {0.0f, 0.0f, 0.0f};
+			const float K[T * dK] = {0.0f, 0.0f, 0.0f};
+			const float V[T * dV] = {1.0f, 2.0f, 3.0f};
+			std::vector<float> O;
+			std::vector<float> probs;
+			glades::transformer_ops::scaled_dot_product_attention_forward(Q, K, V, T, dK, dV, /*causal*/ true, O, &probs);
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Simple O size Failed==============", O.size() == T * dV);
+			// Expected:
+			// t=0: only u=0 => O=1
+			// t=1: mean of {1,2} => 1.5
+			// t=2: mean of {1,2,3} => 2
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Simple O0 Failed==============", fabs(O[0] - 1.0f) < 1e-6f);
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Simple O1 Failed==============", fabs(O[1] - 1.5f) < 1e-6f);
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Simple O2 Failed==============", fabs(O[2] - 2.0f) < 1e-6f);
+			// Mask property: probs[t,u]=0 for u>t in causal mode.
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Simple Mask p01 Failed==============", fabs(probs[0u * T + 1u] - 0.0f) < 1e-6f);
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Simple Mask p02 Failed==============", fabs(probs[0u * T + 2u] - 0.0f) < 1e-6f);
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Simple Mask p12 Failed==============", fabs(probs[1u * T + 2u] - 0.0f) < 1e-6f);
+		}
+
+		// Stable masked softmax: extreme values should stay finite and sum to 1 over allowed.
+		{
+			const unsigned int T = 3u;
+			const float scores[T] = {1000.0f, 0.0f, -1000.0f};
+			std::vector<float> p;
+			glades::transformer_ops::softmax_masked_row_stable(scores, T, /*rowT*/ 2u, /*causal*/ false, p);
+			G_assert(__FILE__, __LINE__, "==============Ops::Softmax Extreme Size Failed==============", p.size() == T);
+			const float sum = p[0] + p[1] + p[2];
+			G_assert(__FILE__, __LINE__, "==============Ops::Softmax Extreme Sum Failed==============", fabs(sum - 1.0f) < 1e-6f);
+			G_assert(__FILE__, __LINE__, "==============Ops::Softmax Extreme Finite Failed==============", std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]));
+			G_assert(__FILE__, __LINE__, "==============Ops::Softmax Extreme Argmax Failed==============", p[0] > 0.999f);
+		}
+
+		// Backward parity: cached-probs backward should match recompute backward.
+		{
+			const unsigned int T = 3u;
+			const unsigned int dK = 2u;
+			const unsigned int dV = 2u;
+			const float Q[T * dK] = {
+			    0.1f, -0.2f,
+			    0.0f, 0.3f,
+			    -0.4f, 0.5f};
+			const float K[T * dK] = {
+			    -0.1f, 0.2f,
+			    0.4f, -0.3f,
+			    0.2f, 0.1f};
+			const float V[T * dV] = {
+			    0.2f, 0.0f,
+			    -0.1f, 0.3f,
+			    0.4f, -0.2f};
+			const float dO[T * dV] = {
+			    1.0f, 0.5f,
+			    -0.25f, 0.75f,
+			    0.1f, -0.2f};
+
+			std::vector<float> O;
+			std::vector<float> probs;
+			glades::transformer_ops::scaled_dot_product_attention_forward(Q, K, V, T, dK, dV, /*causal*/ true, O, &probs);
+
+			std::vector<float> dQ1, dK1, dV1;
+			glades::transformer_ops::scaled_dot_product_attention_backward(Q, K, V, dO, probs.data(), T, dK, dV, /*causal*/ true, dQ1, dK1, dV1);
+
+			std::vector<float> dQ2, dK2, dV2;
+			glades::transformer_ops::scaled_dot_product_attention_backward_recompute(Q, K, V, dO, T, dK, dV, /*causal*/ true, dQ2, dK2, dV2);
+
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Backward Size dQ Failed==============", dQ1.size() == dQ2.size());
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Backward Size dK Failed==============", dK1.size() == dK2.size());
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Backward Size dV Failed==============", dV1.size() == dV2.size());
+			double maxAbs = 0.0;
+			for (size_t i = 0; i < dQ1.size(); ++i) { const double d = fabs((double)dQ1[i] - (double)dQ2[i]); if (d > maxAbs) maxAbs = d; }
+			for (size_t i = 0; i < dK1.size(); ++i) { const double d = fabs((double)dK1[i] - (double)dK2[i]); if (d > maxAbs) maxAbs = d; }
+			for (size_t i = 0; i < dV1.size(); ++i) { const double d = fabs((double)dV1[i] - (double)dV2[i]); if (d > maxAbs) maxAbs = d; }
+			G_assert(__FILE__, __LINE__, "==============Ops::Attn Backward RecomputeMismatch Failed==============", maxAbs < 1e-4);
+		}
+	}
+
+	printf("-----------------------------------\n");
+	printf("Transformer ops: activation derivatives (finite-difference checks)\n");
+	printf("-----------------------------------\n");
+	{
+		// These are small numerical checks to catch accidental derivative regressions.
+		const double eps = 1e-3;
+		const float xs[] = {-3.0f, -1.0f, -0.2f, 0.0f, 0.3f, 1.0f, 3.0f};
+		const int N = static_cast<int>(sizeof(xs) / sizeof(xs[0]));
+		for (int i = 0; i < N; ++i)
+		{
+			const double x = static_cast<double>(xs[i]);
+
+			// SiLU
+			{
+				const double f1 = (double)glades::transformer_ops::silu((float)(x + eps));
+				const double f0 = (double)glades::transformer_ops::silu((float)(x - eps));
+				const double num = (f1 - f0) / (2.0 * eps);
+				const double ana = (double)glades::transformer_ops::silu_deriv((float)x);
+				G_assert(__FILE__, __LINE__, "==============Ops::SiLU DerivMismatch Failed==============", fabs(num - ana) < 5e-3);
+			}
+
+			// GELU
+			{
+				const double f1 = (double)glades::transformer_ops::gelu((float)(x + eps));
+				const double f0 = (double)glades::transformer_ops::gelu((float)(x - eps));
+				const double num = (f1 - f0) / (2.0 * eps);
+				const double ana = (double)glades::transformer_ops::gelu_deriv((float)x);
+				G_assert(__FILE__, __LINE__, "==============Ops::GELU DerivMismatch Failed==============", fabs(num - ana) < 5e-3);
+			}
+		}
+	}
 
     printf("\n============================================================\n");
 }

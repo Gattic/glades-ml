@@ -18,12 +18,17 @@
 #include "Backend/Machine Learning/nn-test.h"
 #include "Backend/Machine Learning/nn-cv-test.h"
 #include "Backend/Machine Learning/nn-save-load-test.h"
+#include "Backend/Machine Learning/nn-mixed-precision-test.h"
 #include "Backend/Machine Learning/nn-benchmarks.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
 #include "Backend/Machine Learning/bayes-optimizer-test.h"
 #include "Backend/Machine Learning/ohe-test.h"
+#include "Backend/Machine Learning/mapped-dataset-test.h"
+#include "Backend/Machine Learning/transformer-serving-layer-test.h"
+#include "Backend/Machine Learning/prop-fuzz-test.h"
+#include <vector>
 
 int main(int argc, char* argv[])
 {
@@ -33,11 +38,16 @@ int main(int argc, char* argv[])
 	if (argc == 1)
 	{
 	    NNUnitTest();
+	    NNRecurrentUnitTest();
+	    NNTransformerUnitTest();
+	    TransformerServingLayerUnitTest();
 	    PCAUnitTest();
 	    KMeansUnitTest();
 	    BayesUnitTest();
 	    BayesOptimizerUnitTest();
 	    OHEUnitTest();
+	    MappedDatasetUnitTest();
+	    NNMixedPrecisionUnitTest();
 	}
 	else if (argc > 1)
 	{
@@ -45,6 +55,10 @@ int main(int argc, char* argv[])
 		NNUnitTest();
 	    else if (strcmp(argv[1], "nn-recurrent") == 0)
 		NNRecurrentUnitTest();
+	    else if (strcmp(argv[1], "nn-transformer") == 0)
+		NNTransformerUnitTest();
+	    else if (strcmp(argv[1], "transformer-serving") == 0 || strcmp(argv[1], "serving") == 0)
+		TransformerServingLayerUnitTest();
 	    else if (strcmp(argv[1], "nn-bench") == 0)
 		NNBenchmarks(argc, argv);
 	    else if (strcmp(argv[1], "pca") == 0)
@@ -57,10 +71,54 @@ int main(int argc, char* argv[])
 		BayesOptimizerUnitTest();
 	    else if (strcmp(argv[1], "ohe") == 0)
 		OHEUnitTest();
+	    else if (strcmp(argv[1], "mapped") == 0)
+		MappedDatasetUnitTest();
 	    else if (strcmp(argv[1], "cv") == 0)
 		NNCVUnitTestValidation();
 	    else if (strcmp(argv[1], "save-load") == 0)
 		NNSaveLoadUnitTest();
+	    else if (strcmp(argv[1], "nn-mixed-precision") == 0 || strcmp(argv[1], "nn-mp") == 0)
+		NNMixedPrecisionUnitTest();
+	    else if (strcmp(argv[1], "prop-fuzz") == 0)
+		PropFuzzUnitTest();
+	    else if (strcmp(argv[1], "nnall") == 0)
+        {
+	        OHEUnitTest();
+		    MappedDatasetUnitTest();
+		    NNUnitTest();
+		    NNRecurrentUnitTest();
+		    NNTransformerUnitTest();
+		    TransformerServingLayerUnitTest();
+
+		    // Run a fixed benchmark configuration when invoked via `nnall`.
+		    // (Avoid forwarding `argc/argv` from the unit-test runner.)
+		    const char* bench_args[] = {
+			"nn-bench",
+			"--dataset", "datasets/rnn.csv",
+			"--epochs", "200",
+			"--hidden", "8",
+			"--repeats", "3",
+			"--lr", "0.05",
+			"--lr-schedule", "step",
+			"--step-size", "50",
+			"--gamma", "0.5",
+			"--clip-norm", "5",
+		    };
+		    const int bench_argc = (int)(sizeof(bench_args) / sizeof(bench_args[0]));
+
+		    std::vector<char*> bench_argv(bench_argc, (char*)0);
+		    for (int i = 0; i < bench_argc; ++i)
+			    bench_argv[i] = strdup(bench_args[i]);
+
+		    NNBenchmarks(bench_argc, &bench_argv[0]);
+
+		    for (int i = 0; i < bench_argc; ++i)
+			    free(bench_argv[i]);
+
+		    NNSaveLoadUnitTest();
+		    NNMixedPrecisionUnitTest();
+		    PropFuzzUnitTest();
+        }
 	    else
 		printf("Invalid test: %s\n", argv[1]);
 	}

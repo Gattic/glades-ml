@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,36 @@ struct BenchVariantConfig
 	float clipNorm; // DFF only; 0 disables
 };
 
+static bool is_finite(float x)
+{
+	return std::isfinite(x);
+}
+
+static bool validate_metrics(const glades::NNetworkEpochMetrics& m, std::string& outErr)
+{
+	outErr.clear();
+	if (!is_finite(m.totalError) || !is_finite(m.totalAccuracy) ||
+	    !is_finite(m.learningRate) || !is_finite(m.lrMultiplier) ||
+	    !is_finite(m.gradNorm) || !is_finite(m.gradNormScale))
+	{
+		outErr = "non-finite metrics detected (NaN/Inf)";
+		return false;
+	}
+	// For regression: regMAE/regRMSE should be finite.
+	if (!is_finite(m.regMAE) || !is_finite(m.regRMSE))
+	{
+		outErr = "non-finite regression metrics detected (NaN/Inf)";
+		return false;
+	}
+	// Grad norm scale should be in [0,1] for train passes.
+	if (m.gradNormScale < 0.0f || m.gradNormScale > 1.0f + 1e-6f)
+	{
+		outErr = "gradNormScale out of expected range";
+		return false;
+	}
+	return true;
+}
+
 static BenchResult run_one(const glades::NumberInput& data,
                            int netType,
                            int epochs,
@@ -180,6 +211,27 @@ static BenchResult run_one(const glades::NumberInput& data,
 	}
 	if (trainCb.saw)
 		r.trainLast = trainCb.last;
+	if (r.ok && trainCb.saw)
+	{
+		std::string err;
+		if (!validate_metrics(r.trainLast, err))
+		{
+			r.ok = false;
+			r.err = std::string("train: ") + err;
+		}
+		// Schedule sanity: "none" should keep multiplier at 1.
+		if (r.ok && cfg.schedule && streq(cfg.schedule, "none") && fabs(r.trainLast.lrMultiplier - 1.0f) > 1e-6f)
+		{
+			r.ok = false;
+			r.err = "train: lrMultiplier should be 1.0 for schedule=none";
+		}
+		// Clip sanity: when enabled, scale should not exceed 1.
+		if (r.ok && cfg.clipNorm > 0.0f && (r.trainLast.gradNormScale > 1.0f + 1e-6f))
+		{
+			r.ok = false;
+			r.err = "train: gradNormScale > 1 with clipping enabled";
+		}
+	}
 
 	// Test: evaluates the test split (bench harness may mirror train->test when absent).
 	CaptureMetricsCallbacks testCb;
@@ -195,6 +247,23 @@ static BenchResult run_one(const glades::NumberInput& data,
 	}
 	if (testCb.saw)
 		r.testLast = testCb.last;
+	if (r.ok && testCb.saw)
+	{
+		std::string err;
+		if (!validate_metrics(r.testLast, err))
+		{
+			r.ok = false;
+			if (!r.err.size())
+				r.err = std::string("test: ") + err;
+		}
+		// Evaluation should report neutral schedule/grad fields (set by Trainer).
+		if (r.ok && (fabs(r.testLast.lrMultiplier - 1.0f) > 1e-6f || fabs(r.testLast.learningRate - 0.0f) > 1e-6f))
+		{
+			r.ok = false;
+			if (!r.err.size())
+				r.err = "test: schedule fields not neutral (expected lrMultiplier=1, learningRate=0)";
+		}
+	}
 
 	delete info; // owns in/hidden/out
 	return r;

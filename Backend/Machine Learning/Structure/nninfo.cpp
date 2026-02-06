@@ -17,6 +17,7 @@
 #include "nninfo.h"
 #include "../../../main.h"
 #include "Backend/Database/GTable.h"
+#include "Backend/Database/GList.h"
 #include "Backend/Database/GType.h"
 #include "Backend/Database/SaveFolder.h"
 #include "Backend/Database/SaveTable.h"
@@ -27,6 +28,53 @@
 #include "outputlayerinfo.h"
 
 using namespace glades;
+
+namespace {
+static bool is_sentinel_minus_one_float(float v)
+{
+	// Stored placeholders use exactly -1.0f in this codebase.
+	return (v > -1.000001f) && (v < -0.999999f);
+}
+
+static void print_long_cell(int64_t v, const char* placeholder)
+{
+	if (v < 0)
+		printf("%s\t", placeholder ? placeholder : "-");
+	else
+		printf("%lld\t", static_cast<long long>(v));
+}
+
+static void print_float_cell(float v, const char* placeholder)
+{
+	if (is_sentinel_minus_one_float(v))
+		printf("%s\t", placeholder ? placeholder : "-");
+	else
+		printf("%f\t", v);
+}
+
+static void print_nninfo_row_cells(const shmea::GList& row, bool isInputRow)
+{
+	// Schema: Size(long), batchSize(long), learningRate(float), momentumFactor(float),
+	// weightDecay1(float), weightDecay2(float), pDropout(float),
+	// activationType(long), activationParam(float), outputType(long), tbpttWindow(long)
+	const int64_t sizeVal = row.getLong(0);
+	if (isInputRow && sizeVal < 0)
+		printf("auto\t");
+	else
+		print_long_cell(sizeVal, "-");
+
+	print_long_cell(row.getLong(1), "-");
+	print_float_cell(row.getFloat(2), "-");
+	print_float_cell(row.getFloat(3), "-");
+	print_float_cell(row.getFloat(4), "-");
+	print_float_cell(row.getFloat(5), "-");
+	print_float_cell(row.getFloat(6), "-");
+	print_long_cell(row.getLong(7), "-");
+	print_float_cell(row.getFloat(8), "-");
+	print_long_cell(row.getLong(9), "-");
+	print_long_cell(row.getLong(10), "-");
+}
+} // namespace
 
 /*!
  * @brief NNInfo constructor
@@ -398,13 +446,6 @@ void glades::NNInfo::print() const
 	headers.push_back("outputType");
 	headers.push_back("tbpttWindow");
 
-	// put everything in a GTable
-	shmea::GTable printTable(',', headers);
-	printTable.addRow(inputLayer->getGTableRow());
-	for (unsigned int i = 0; i < layers.size(); ++i)
-		printTable.addRow(layers[i]->getGTableRow());
-	printTable.addRow(outputLayer->getGTableRow());
-
 	// print headers
 	printf("[NNINFO] Current NNInfo Values\n");
 	printf("[NNINFO] ");
@@ -413,10 +454,11 @@ void glades::NNInfo::print() const
 	printf("\n");
 
 	// print layer info
-	for (unsigned int row = 0; row < printTable.numberOfRows(); ++row)
+	const unsigned int rowCount = 2u + static_cast<unsigned int>(layers.size()); // input + hidden + output
+	for (unsigned int row = 0; row < rowCount; ++row)
 	{
 		bool firstRow = (row == 0);
-		bool lastRow = (row == (printTable.numberOfRows() - 1));
+		bool lastRow = (row == (rowCount - 1));
 
 		printf("[NNINFO] ");
 		if (firstRow)
@@ -426,7 +468,10 @@ void glades::NNInfo::print() const
 		else
 			printf("Output\t");
 
-		printTable[row].print();
+		const shmea::GList rowList =
+		    firstRow ? inputLayer->getGTableRow()
+		             : (lastRow ? outputLayer->getGTableRow() : layers[row - 1u]->getGTableRow());
+		print_nninfo_row_cells(rowList, firstRow);
 		printf("\n");
 	}
 }

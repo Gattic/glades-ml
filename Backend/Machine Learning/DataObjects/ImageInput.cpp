@@ -77,12 +77,9 @@ static inline void normalizeLegendLabelColumnToString(shmea::GTable& table, unsi
 }
 } // namespace
 
-void ImageInput::importHelper(shmea::GTable& cTable, std::vector<shmea::GPointer<OHE> >& OHEMaps, std::vector<bool>& featureIsCategorical, std::map<shmea::GString, std::map<shmea::GString, shmea::GPointer<shmea::Image> > >& images)
+void ImageInput::importHelper(shmea::GTable& cTable, std::vector<shmea::GPointer<OHE> >& OHEMaps, std::vector<bool>& featureIsCategorical)
 {
     if(loaded)
-	return;
-
-    if(name.length() == 0)
 	return;
 
     if ((cTable.numberOfRows() == 0) || (cTable.numberOfCols() == 0))
@@ -93,20 +90,12 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<shmea::GPointer
 
     // NOTE: In streaming mode we no longer preload images into the 'images' map.
     // We only build label mappings (OHE) and ensure legend labels are normalized to string type.
-    shmea::GString fname = "datasets/images/" + name + "/"; // kept for backward-compat logs
-
-    float fMin = 0.0f;
-    float fMax = 0.0f;
-    float fMean = 0.0f;
 
     // Load the images
     unsigned int inputCol = 0;
     unsigned int outputCol = 1;
     for(unsigned int r = 0; r < cTable.numberOfRows(); ++r)
     {
-	// Build the fully-qualified path (for streaming later)
-	shmea::GString path = fname + cTable.getCell(r, inputCol).c_str();
-
 	if (r == 0)
 	{
 	    // Really only need it for the output column for images so the first OHE will be empty
@@ -157,34 +146,7 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<shmea::GPointer
 	cTable.setCell(r, outputCol, label);
 	OHEMaps[outputCol]->addString(label);
 	featureIsCategorical[outputCol] = true;
-	//float cell = OHEMaps[outputCol]->getFloat(label);
-
-	/*if (r == 0)
-	{
-		fMin = cell;
-		fMax = cell;
-	}
-
-	// Check the mins and maxes
-	if (cell < fMin)
-		fMin = cell;
-	if (cell > fMax)
-		fMax = cell;
-
-	// update mean
-	fMean += cell;*/
-
-	// Streaming: do not store decoded images in memory.
-	(void)images;
     }
-
-    //fMean /= cTable.numberOfRows();
-    //OHEMaps[outputCol]->setMin(fMin);
-    //OHEMaps[outputCol]->setMax(fMax);
-    //OHEMaps[outputCol]->setMean(fMean);
-    //printf("[NNDATA] Min: %f, Max: %f, Mean: %f\n", fMin, fMax, fMean);
-
-    //printf("OHEMaps.size() = %lu\n", OHEMaps.size());
 }
 
 void ImageInput::import(shmea::GString newName, int standardizeFlag)
@@ -211,7 +173,7 @@ void ImageInput::import(shmea::GString newName, int standardizeFlag)
 
     // Build label->one-hot mappings from TRAINING ONLY.
     // IMPORTANT: output dimensionality MUST NOT change based on the test set.
-    importHelper(trainingLegend, trainingOHEMaps, trainingFeatureIsCategorical, trainImages);
+    importHelper(trainingLegend, trainingOHEMaps, trainingFeatureIsCategorical);
 
     // Normalize test labels to string type, but do NOT add them to the OHE map.
     normalizeLegendLabelColumnToString(testingLegend, /*labelCol*/ 1u);
@@ -264,8 +226,78 @@ void ImageInput::import(shmea::GString newName, int standardizeFlag)
     loaded = true;
 }
 
-void ImageInput::import(const shmea::GTable&, int standardizeFlag)
+void ImageInput::import(const shmea::GTable& rawLegend, int standardizeFlag)
 {
+	(void)standardizeFlag;
+	if (loaded)
+		return;
+
+	// Interpret the provided table as a "legend" with at least:
+	// - column 0: image path (relative or absolute)
+	// - column 1: classification label (string/int/bool convertible)
+	//
+	// This overload intentionally does NOT create a test split; callers that want a
+	// train/test split should provide two tables or mirror the legend explicitly.
+	trainingLegend = rawLegend;
+	testingLegend = shmea::GTable(rawLegend.getDelimiter(), rawLegend.getHeaders());
+
+	trainingOHEMaps.clear();
+	testingOHEMaps.clear();
+	trainingFeatureIsCategorical.clear();
+	testingFeatureIsCategorical.clear();
+
+	trainingPaths.clear();
+	testingPaths.clear();
+	featureCount = 0u;
+
+	// Validate minimal legend schema.
+	if (trainingLegend.numberOfCols() < 2u || trainingLegend.numberOfRows() == 0u)
+	{
+		printf("[NNDATA] Could not load data (legend must have >=2 cols and >=1 row)\n");
+		return;
+	}
+
+	// Build label mappings from TRAINING ONLY (and normalize label column to string type).
+	importHelper(trainingLegend, trainingOHEMaps, trainingFeatureIsCategorical);
+	testingOHEMaps = trainingOHEMaps;
+	testingFeatureIsCategorical = trainingFeatureIsCategorical;
+
+	// Precompute one-hot vectors for the label space (avoid per-row allocations in hot paths).
+	oneHotByIndex.clear();
+	if (trainingOHEMaps.size() > 1u && trainingOHEMaps[1])
+	{
+		const unsigned int K = trainingOHEMaps[1]->size();
+		oneHotByIndex.resize(K);
+		for (unsigned int i = 0; i < K; ++i)
+		{
+			oneHotByIndex[i] = shmea::GVector<float>(K, 0.0f);
+			oneHotByIndex[i][i] = 1.0f;
+		}
+	}
+
+	// Precompute paths for streaming access.
+	trainingPaths.reserve(trainingLegend.numberOfRows());
+	for (unsigned int r = 0; r < trainingLegend.numberOfRows(); ++r)
+		trainingPaths.push_back(to_std_string(trainingLegend.getCell(r, 0).c_str()));
+
+	// Determine feature count by loading one image (first row).
+	if (!trainingPaths.empty())
+	{
+		shmea::Image img;
+		img.LoadPNG(to_gstring(trainingPaths[0]));
+		featureCount = img.getPixelCount();
+	}
+
+	// Reset row cache/scratch buffers.
+	rowCacheOrder.clear();
+	rowCache.clear();
+	scratchRow.clear();
+	scratchExpected.clear();
+
+	// Match the pixel min/max semantics (byte-range images).
+	min = 0;
+	max = 255;
+	loaded = true;
 }
 
 const shmea::GPointer<shmea::Image> ImageInput::getTrainImage(unsigned int row) const
@@ -352,7 +384,6 @@ shmea::GVector<float> ImageInput::getTestExpectedRow(unsigned int index) const
     // translate string to cell value for this col
     const shmea::GPointer<OHE>& OHEVector = testingOHEMaps[1];
     return (*OHEVector)[cCell];
-    return shmea::GVector<float>();
 }
 
 shmea::GVector<float> ImageInput::getTestRow(unsigned int index) const
@@ -544,12 +575,8 @@ bool ImageInput::getTrainExpectedRowView(unsigned int index, const float*& outDa
         outSize = static_cast<unsigned int>(scratchExpected.size());
         return (outData != NULL && outSize > 0u);
     }
-
-    // Fallback (legacy): materialize via OHE operator[].
-    scratchExpected = getTrainExpectedRow(index);
-    outData = scratchExpected.data();
-    outSize = static_cast<unsigned int>(scratchExpected.size());
-    return (outData != NULL && outSize > 0u);
+	// No cached one-hot space available (invalid/unsupported state).
+	return false;
 }
 
 bool ImageInput::getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
@@ -576,9 +603,6 @@ bool ImageInput::getTestExpectedRowView(unsigned int index, const float*& outDat
         outSize = static_cast<unsigned int>(scratchExpected.size());
         return (outData != NULL && outSize > 0u);
     }
-
-    scratchExpected = getTestExpectedRow(index);
-    outData = scratchExpected.data();
-    outSize = static_cast<unsigned int>(scratchExpected.size());
-    return (outData != NULL && outSize > 0u);
+	// No cached one-hot space available (invalid/unsupported state).
+	return false;
 }

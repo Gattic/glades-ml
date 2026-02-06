@@ -14,37 +14,10 @@
 // NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#ifndef _GNNETSTATE
-#define _GNNETSTATE
+#ifndef _UT_MAPPED_DATASET_TEST
+#define _UT_MAPPED_DATASET_TEST
 
-#include <float.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <string>
-
-namespace glades {
-
-class Layer;
-class Node;
-
-class NetworkState
-{
-public:
-	NetworkState(unsigned int, unsigned int, unsigned int, unsigned int, glades::Layer*,
-				 glades::Layer*, glades::Node*, glades::Node*, bool, bool, bool, bool, bool, bool);
-	unsigned int cInputLayerCounter;
-	unsigned int cOutputLayerCounter;
-	unsigned int cInputNodeCounter;
-	unsigned int cOutputNodeCounter;
-	Layer* cInputLayer;
-	Layer* cOutputLayer;
-	Node* cInputNode;
-	Node* cOutputNode;
-	bool firstValidInputNode, lastValidInputNode, firstValidOutputNode, lastValidOutputNode,
-		validInputNode, validOutputNode;
-};
-};
+void MappedDatasetUnitTest();
 
 #endif
+

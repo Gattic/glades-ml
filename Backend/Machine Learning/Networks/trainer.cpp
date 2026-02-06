@@ -58,13 +58,10 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		explicit RunDataAttachmentGuard(glades::NNetwork& n, const glades::DataInput* di) : net(n)
 		{
 			net.di = di;
-			// LayerBuilder needs access to DataInput only to materialize input rows on demand.
-			net.meat.attachDataInput(di);
 		}
 		~RunDataAttachmentGuard()
 		{
 			net.di = NULL;
-			net.meat.detachDataInput();
 		}
 	private:
 		RunDataAttachmentGuard(const RunDataAttachmentGuard&);
@@ -85,10 +82,9 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		return net.lastStatus;
 	}
 
-	// Install per-network RNG for the duration of this run.
-	// All legacy glades::rng::* call sites (weight init, dropout, etc.) will now draw
-	// from this network's engine, eliminating cross-network RNG interference.
-	glades::rng::ScopedEngine rngGuard(&net.rngEngine);
+	// RNG determinism:
+	// Training/inference code should draw randomness explicitly from `net.rngEngine`
+	// (no implicit global/TLS "current engine").
 
 	RunDataAttachmentGuard dataGuard(net, newDataInput);
 	const bool isTrainRun = (runType == glades::NNetwork::RUN_TRAIN);
@@ -103,11 +99,21 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	const unsigned int dataSize = isTrainRun ? net.di->getTrainSize() : net.di->getTestSize();
 	if ((dataSize <= 0u) || (net.di->getFeatureCount() <= 0))
 	{
+		// If the DataInput tracks a concrete import/load error, surface it here so callers
+		// don't have to debug a generic EMPTY_DATA later.
+		std::string extra;
+		{
+			const glades::NNetworkStatus diSt = net.di->getLastStatus();
+			if (!diSt.ok() && !diSt.message.empty())
+				extra = std::string(" (DataInput: ") + diSt.message + ")";
+		}
 		net.running = false;
 		net.lastStatus = NNetworkStatus(
 		    NNetworkStatus::EMPTY_DATA,
 		    isTrainRun ? "Trainer::run: empty training data or feature count is zero"
 		               : "Trainer::run: empty test data or feature count is zero");
+		if (!extra.empty())
+			net.lastStatus.message += extra;
 		return net.lastStatus;
 	}
 
@@ -115,6 +121,9 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	{
 		const unsigned int featureCount = net.di->getFeatureCount();
 		const unsigned int outSize = net.skeleton->getOutputLayerSize();
+		const bool tokenLM =
+		    ((net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) || (net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER)) &&
+		    net.trainingConfig.transformer.enableTokenEmbedding;
 
 		if (outSize == 0)
 		{
@@ -124,16 +133,18 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		}
 
 		// Recurrent paths require at least one hidden layer (state lives there).
-		if ((net.netType == glades::NNetwork::TYPE_RNN || net.netType == glades::NNetwork::TYPE_GRU || net.netType == glades::NNetwork::TYPE_LSTM) &&
+		if ((net.netType == glades::NNetwork::TYPE_RNN || net.netType == glades::NNetwork::TYPE_GRU || net.netType == glades::NNetwork::TYPE_LSTM ||
+		     net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER || net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) &&
 		    net.skeleton->numHiddenLayers() <= 0)
 		{
 			net.running = false;
-			net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "Trainer::run: recurrent net type requires at least one hidden layer");
+			net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "Trainer::run: sequence net type requires at least one hidden layer");
 			return net.lastStatus;
 		}
 
 		// Recurrent paths require a valid sequence model (even if it is just the default single sequence).
-		if (net.netType == glades::NNetwork::TYPE_RNN || net.netType == glades::NNetwork::TYPE_GRU || net.netType == glades::NNetwork::TYPE_LSTM)
+		if (net.netType == glades::NNetwork::TYPE_RNN || net.netType == glades::NNetwork::TYPE_GRU || net.netType == glades::NNetwork::TYPE_LSTM ||
+		    net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER || net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER)
 		{
 			std::string seqErr;
 			if (isTrainRun)
@@ -149,7 +160,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 				{
 					net.running = false;
 					net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-					                                "Trainer::run: recurrent net type requires at least one non-empty train sequence");
+					                                "Trainer::run: sequence net type requires at least one non-empty train sequence");
 					return net.lastStatus;
 				}
 			}
@@ -166,7 +177,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 				{
 					net.running = false;
 					net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-					                                "Trainer::run: recurrent net type requires at least one non-empty test sequence");
+					                                "Trainer::run: sequence net type requires at least one non-empty test sequence");
 					return net.lastStatus;
 				}
 			}
@@ -180,9 +191,12 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		// Instead, use DataInput's shape contract. Implementations with fixed shapes validate
 		// in O(1); others do a bounded spot-check.
 		std::string shapeErr;
+		const unsigned int expectedFeatureCount = tokenLM ? 1u : featureCount;
+		// Token LM expected rows are a single token id, not a dense one-hot of size outSize.
+		const unsigned int expectedOutSize = tokenLM ? 1u : outSize;
 		if (isTrainRun)
 		{
-			if (!net.di->validateTrainRowShapes(featureCount, outSize, &shapeErr))
+			if (!net.di->validateTrainRowShapes(expectedFeatureCount, expectedOutSize, &shapeErr))
 			{
 				net.running = false;
 				net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
@@ -192,7 +206,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		}
 		else
 		{
-			if (!net.di->validateTestRowShapes(featureCount, outSize, &shapeErr))
+			if (!net.di->validateTestRowShapes(expectedFeatureCount, expectedOutSize, &shapeErr))
 			{
 				net.running = false;
 				net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
@@ -202,32 +216,27 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		}
 	}
 
-	int starting_epochs = 0;
-	// Get the input, expected, and layers/nodes/edges
-	if (net.epochs == 0 && net.mustBuildMeat)
-	{
-		const bool ok = net.meat.build(net.skeleton, net.di, net.netType);
-		if (!ok)
-		{
-			net.running = false;
-			const std::string detail = net.meat.getLastError();
-			if (!detail.empty())
-				net.lastStatus = NNetworkStatus(NNetworkStatus::BUILD_FAILED, std::string("Trainer::run: failed to build network layers/weights: ") + detail);
-			else
-				net.lastStatus = NNetworkStatus(NNetworkStatus::BUILD_FAILED, "Trainer::run: failed to build network layers/weights (LayerBuilder::build returned false)");
-			return net.lastStatus;
-		}
-	}
+	// For learning-rate schedules, treat this run's start epoch as the baseline.
+	// This makes schedules work sensibly for resumed training.
+	int starting_epochs = isTrainRun ? net.epochs : 0;
 
-	if (net.changeInputLayers)
+	// Ensure weights/parameters exist for this shape before any SGD steps run.
+	if (!net.ensureTensorParametersInitialized())
 	{
-		net.meat.rebuildInputLayers(net.skeleton, net.di);
-		starting_epochs = net.epochs;
+		net.running = false;
+		if (net.lastStatus.ok())
+			net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "Trainer::run: failed to initialize tensor parameters");
+		return net.lastStatus;
 	}
 
 	// Clean confusion matrix
-	if ((net.skeleton->getOutputType() == glades::GMath::CLASSIFICATION) ||
-	    (net.skeleton->getOutputType() == glades::GMath::KL))
+	const bool tokenLM =
+	    ((net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) || (net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER)) &&
+	    net.trainingConfig.transformer.enableTokenEmbedding;
+	const bool useConfusionMatrix =
+	    !tokenLM && ((net.skeleton->getOutputType() == glades::GMath::CLASSIFICATION) ||
+	                 (net.skeleton->getOutputType() == glades::GMath::KL));
+	if (useConfusionMatrix)
 		net.confusionMatrix.clean();
 
 	// Set the mini batch size
@@ -236,42 +245,27 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		net.minibatchSize = (cfg > 0) ? cfg : net.skeleton->getBatchSize();
 	}
 
-	// Valid layers?
-	if ((net.meat.getLayersSize() <= 0))
-	{
-		net.running = false;
-		net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "Trainer::run: network has no valid layers (LayerBuilder not built or invalid input)");
-		return net.lastStatus;
-	}
-
-	// Post-build shape sanity checks.
-	if (net.meat.getLayerSize(0) != net.di->getFeatureCount())
-	{
-		net.running = false;
-		net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "Trainer::run: built input layer size does not match DataInput feature count");
-		return net.lastStatus;
-	}
-	if (net.meat.getLayerSize(net.meat.getLayersSize()) != net.skeleton->getOutputLayerSize())
-	{
-		net.running = false;
-		net.lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "Trainer::run: built output layer size does not match skeleton output layer size");
-		return net.lastStatus;
-	}
-
 	// Re-check the active split is non-empty post-build (build can succeed for featureCount-only cases).
 	if ((dataSize <= 0u) || (net.di->getFeatureCount() <= 0))
 	{
+		std::string extra;
+		{
+			const glades::NNetworkStatus diSt = net.di->getLastStatus();
+			if (!diSt.ok() && !diSt.message.empty())
+				extra = std::string(" (DataInput: ") + diSt.message + ")";
+		}
 		net.running = false;
 		net.lastStatus = NNetworkStatus(
 		    NNetworkStatus::EMPTY_DATA,
 		    isTrainRun ? "Trainer::run: empty training data or feature count is zero (post-build check)"
 		               : "Trainer::run: empty test data or feature count is zero (post-build check)");
+		if (!extra.empty())
+			net.lastStatus.message += extra;
 		return net.lastStatus;
 	}
 
 	// Build empty confusion matrix
-	if ((net.skeleton->getOutputType() == glades::GMath::CLASSIFICATION) ||
-	    (net.skeleton->getOutputType() == glades::GMath::KL))
+	if (useConfusionMatrix)
 		net.confusionMatrix.build(net.skeleton->getOutputLayerSize());
 
 	// Reset graphs (e.g. learning curve) for TRAIN runs only.
@@ -300,6 +294,13 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		// Global network statistics
 		net.overallTotalError = 0.0f;
 		net.overallTotalAccuracy = 0.0f;
+		// Always reset classification-derived metrics too. These are validated for finiteness
+		// even on regression runs; leaving them uninitialized/stale can abort training.
+		net.overallClassAccuracy = 0.0f;
+		net.overallClassPrecision = 0.0f;
+		net.overallClassRecall = 0.0f;
+		net.overallClassSpecificity = 0.0f;
+		net.overallClassF1 = 0.0f;
 		net.regSSE = 0.0;
 		net.regSAE = 0.0;
 		net.regSumY = 0.0;
@@ -309,26 +310,23 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		net.clsTotal = 0ULL;
 
 		// Reset confusion matrix
-		if ((net.skeleton->getOutputType() == glades::GMath::CLASSIFICATION) ||
-		    (net.skeleton->getOutputType() == glades::GMath::KL))
+		if (useConfusionMatrix)
 			net.confusionMatrix.reset();
 
-		// Recurrent: reset hidden-state at the start of each epoch/run iteration.
-		if (net.netType == glades::NNetwork::TYPE_RNN || net.netType == glades::NNetwork::TYPE_GRU || net.netType == glades::NNetwork::TYPE_LSTM)
-			net.meat.resetContextState(0.0f);
-
 		// Forward/backprop/update
-		const bool isRecurrent =
+		const bool isSequenceModel =
 		    (net.netType == glades::NNetwork::TYPE_RNN) ||
 		    (net.netType == glades::NNetwork::TYPE_GRU) ||
-		    (net.netType == glades::NNetwork::TYPE_LSTM);
+		    (net.netType == glades::NNetwork::TYPE_LSTM) ||
+		    (net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER) ||
+		    (net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 
 		// DFF paths step over individual rows. Recurrent paths run as a single "step" per epoch
 		// (the helper iterates sequences/timesteps internally).
-		const unsigned int steps = isRecurrent ? 1u : (isTrainRun ? net.di->getTrainSize() : net.di->getTestSize());
+		const unsigned int steps = isSequenceModel ? 1u : (isTrainRun ? net.di->getTrainSize() : net.di->getTestSize());
 		for (unsigned int step = 0; step < steps; ++step)
 		{
-			const unsigned int r = isRecurrent ? 0u : step;
+			const unsigned int r = isSequenceModel ? 0u : step;
 			const glades::NNetworkStatus stStep = net.SGDHelper(r, runType);
 			if (!stStep.ok())
 			{
@@ -399,7 +397,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		}
 
 		// Update confusion-matrix derived metrics once per epoch.
-		if ((outType == glades::GMath::CLASSIFICATION) || (outType == glades::GMath::KL))
+		if (useConfusionMatrix && ((outType == glades::GMath::CLASSIFICATION) || (outType == glades::GMath::KL)))
 		{
 			net.confusionMatrix.updateResultParams();
 			net.overallClassAccuracy = (net.confusionMatrix.getOverallAccuracy() * 100.0f);
@@ -411,6 +409,15 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			// Historically "overallTotalAccuracy" was used for GUI's single "ACC" label.
 			// For classification-style outputs, prefer the confusion-matrix accuracy.
 			net.overallTotalAccuracy = net.overallClassAccuracy;
+		}
+		else if ((outType == glades::GMath::CLASSIFICATION) || (outType == glades::GMath::KL))
+		{
+			// Token LM (or other non-confusion-matrix classification): use top-1 accuracy accumulated by SGDHelper.
+			if (net.clsTotal > 0ULL)
+				net.overallTotalAccuracy = static_cast<float>((100.0 * static_cast<double>(net.clsCorrect)) / static_cast<double>(net.clsTotal));
+			else
+				net.overallTotalAccuracy = 0.0f;
+			net.overallClassAccuracy = net.overallTotalAccuracy;
 		}
 
 		// Non-finite user-facing metrics are never acceptable.
@@ -436,6 +443,19 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		metrics.epoch = net.epochs;
 		metrics.totalError = net.overallTotalError;
 		metrics.totalAccuracy = net.overallTotalAccuracy;
+		// Token LM: perplexity = exp(mean NLL per token).
+		// (Only meaningful when the transformer is running in token LM mode with FULL softmax;
+		// sampled-softmax objectives are not exact NLL and must not be reported as perplexity.)
+		const bool tokenLMFullSoftmax =
+		    tokenLM && (net.trainingConfig.transformer.tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
+		if (tokenLMFullSoftmax && ((outType == glades::GMath::CLASSIFICATION) || (outType == glades::GMath::KL)))
+		{
+			double arg = static_cast<double>(metrics.totalError);
+			// Avoid overflow in exp(). float overflows around exp(88.7).
+			if (arg > 80.0) arg = 80.0;
+			if (arg < -80.0) arg = -80.0;
+			metrics.perplexity = static_cast<float>(exp(arg));
+		}
 		// Regression extras
 		if (outType == glades::GMath::REGRESSION && net.regCount > 0ULL)
 		{
@@ -449,7 +469,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		metrics.classRecall = net.overallClassRecall;
 		metrics.classSpecificity = net.overallClassSpecificity;
 		metrics.classF1 = net.overallClassF1;
-		metrics.classMCC = net.confusionMatrix.getOverallMCC();
+		metrics.classMCC = useConfusionMatrix ? net.confusionMatrix.getOverallMCC() : 0.0f;
 		// Schedule/gradient metadata:
 		// - For TRAIN: report the effective scheduled LR and the last observed grad-norm info.
 		// - For EVAL: these must be neutral values (never leak stale training metadata).
@@ -504,7 +524,6 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 
 	// So the network doesnt immediately quit next time and we can prematurely start our net
 	net.running = false;
-	net.changeInputLayers = false;
 
 	net.lastStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
 	return net.lastStatus;

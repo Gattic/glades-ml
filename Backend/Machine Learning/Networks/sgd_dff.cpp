@@ -5,8 +5,6 @@
 
 #include "../DataObjects/DataInput.h"
 #include "../GMath/gmath.h"
-#include "../State/layer.h"
-#include "../State/node.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,30 +21,95 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 	const unsigned int dataSize = isTrain ? (di ? di->getTrainSize() : 0u) : (di ? di->getTestSize() : 0u);
 	const float gradClip = trainingConfig.perElementGradClip;
 
-	// === DFF (TYPE_DFF): tensor-based forward/backward + SGD ===
-	//
-	// This replaces the historical Node/Edge activation bookkeeping with explicit
-	// contiguous buffers. LayerBuilder ("meat") remains responsible for:
-	// - constructing the network shape and initializing weights
-	// - generating dropout masks per-sample
-	// - providing a place to persist updated weights/biases for visualization/save
-	//
-	// The math here intentionally preserves the engine's "per-connection-index" hyperparam
-	// semantics (activation/lr/momentum/decay indexed by the *input-side* layer index).
-
-	// Dropout:
-	// - Train: scramble per-sample (historical behavior).
-	// - Eval: disable dropout (production-correct behavior).
-	if (isTrain)
+	// Ensure tensors exist (modern/tensor-only build).
+	if (!ensureTensorParametersInitialized())
 	{
-		std::vector<float> pHiddenVec;
-		for (int i = 0; i < skeleton->numHiddenLayers(); ++i)
-			pHiddenVec.push_back(skeleton->getPDropout(i));
-		meat.scrambleDropout(inputRowCounter, skeleton->getPInput(), pHiddenVec);
+		running = false;
+		return;
 	}
-	else
+	if (!tensorDff.initialized)
 	{
-		meat.clearDropout();
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_DFF: tensor state is not initialized");
+		running = false;
+		return;
+	}
+
+	// Input row: prefer sparse view when available.
+	const unsigned int in = tensorDff.sizes.empty() ? 0u : tensorDff.sizes[0];
+	const unsigned int* xIdx = NULL;
+	const float* xVal = NULL;
+	unsigned int xNNZ = 0u;
+	unsigned int xFullSize = 0u;
+	bool haveSparseX = false;
+	if (di)
+	{
+		if (isTrain)
+			haveSparseX = di->getTrainRowSparseView(inputRowCounter, xIdx, xVal, xNNZ, xFullSize);
+		else
+			haveSparseX = di->getTestRowSparseView(inputRowCounter, xIdx, xVal, xNNZ, xFullSize);
+	}
+	if (!(haveSparseX && xFullSize == in))
+	{
+		haveSparseX = false;
+		xIdx = NULL;
+		xVal = NULL;
+		xNNZ = 0u;
+		xFullSize = 0u;
+	}
+	// Filtered sparse features after (optional) input dropout.
+	std::vector<unsigned int> xIdxF;
+	std::vector<float> xValF;
+
+	// Dropout masks (tensor-only):
+	// - Layer 0 uses skeleton->getPInput()
+	// - Hidden layers use skeleton->getPDropout(hiddenIdx)
+	// Output layer is never dropped.
+	//
+	// IMPORTANT: This uses *inverted dropout* semantics:
+	// - During training, kept activations are scaled by 1/(1-p) so their expectation matches inference.
+	// - During evaluation, dropout is disabled (no scaling).
+	const int H = skeleton->numHiddenLayers();
+	std::vector<std::vector<unsigned char> > keepMasks;
+	keepMasks.resize(static_cast<size_t>(H) + 1u);
+	std::vector<float> keepScales;
+	keepScales.assign(keepMasks.size(), 1.0f);
+	{
+		const float pIn = skeleton->getPInput();
+		// Sparse input: never allocate a full per-feature dropout mask.
+		// We will apply dropout only to the active (nnz) indices.
+		if (!haveSparseX)
+			keepMasks[0].assign(in, 1u);
+		else
+			keepMasks[0].clear();
+		if (isTrain && pIn > 0.0f && !haveSparseX)
+		{
+			// Inverted dropout: scale kept activations by 1/(1-p).
+			// Guard p>=1 to avoid division-by-zero (all units will be dropped anyway).
+			if (pIn < 1.0f)
+				keepScales[0] = 1.0f / (1.0f - pIn);
+			for (unsigned int i = 0; i < in; ++i)
+				keepMasks[0][i] = (glades::rng::uniform_double(rngEngine, 0.0, 1.0) >= static_cast<double>(pIn)) ? 1u : 0u;
+		}
+		// Sparse input dropout is handled after we read xIdx/xVal (see forward pass).
+		if (isTrain && pIn > 0.0f && haveSparseX)
+		{
+			if (pIn < 1.0f)
+				keepScales[0] = 1.0f / (1.0f - pIn);
+		}
+	}
+	for (int h = 0; h < H; ++h)
+	{
+		const unsigned int layerIdx = static_cast<unsigned int>(h) + 1u;
+		const unsigned int sz = (layerIdx < tensorDff.sizes.size()) ? tensorDff.sizes[layerIdx] : 0u;
+		keepMasks[layerIdx].assign(sz, 1u);
+		const float p = skeleton->getPDropout(static_cast<unsigned int>(h));
+		if (isTrain && p > 0.0f)
+		{
+			if (p < 1.0f && layerIdx < keepScales.size())
+				keepScales[layerIdx] = 1.0f / (1.0f - p);
+			for (unsigned int j = 0; j < sz; ++j)
+				keepMasks[layerIdx][j] = (glades::rng::uniform_double(rngEngine, 0.0, 1.0) >= static_cast<double>(p)) ? 1u : 0u;
+		}
 	}
 
 	// Reset per-sample outputs
@@ -55,82 +118,13 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 	if (isTrain)
 		nbRecord.clear();
 
-	// (Re)initialize tensor buffers if shape changed or first use.
-	{
-		const unsigned int inSize = meat.getLayerSize(0);
-		const int H = skeleton->numHiddenLayers();
-		const unsigned int outSize = skeleton->getOutputLayerSize();
-
-		std::vector<unsigned int> wantSizes;
-		wantSizes.reserve(static_cast<size_t>(H) + 2);
-		wantSizes.push_back(inSize);
-		for (int l = 0; l < H; ++l)
-			wantSizes.push_back(meat.getLayerSize(static_cast<unsigned int>(l) + 1));
-		wantSizes.push_back(outSize);
-
-		const bool mismatch = (!tensorDff.initialized) || (tensorDff.sizes != wantSizes);
-		if (mismatch)
-		{
-			tensorDff.reset();
-			tensorDff.sizes = wantSizes;
-
-			const unsigned int numTransitions = (wantSizes.size() >= 2) ? static_cast<unsigned int>(wantSizes.size() - 1) : 0;
-			tensorDff.T.resize(numTransitions);
-			tensorDff.a.resize(wantSizes.size());
-			tensorDff.delta.resize(wantSizes.size());
-
-			for (unsigned int li = 0; li < wantSizes.size(); ++li)
-			{
-				tensorDff.a[li].assign(wantSizes[li], 0.0f);
-				if (li == 0)
-					tensorDff.delta[li].clear();
-				else
-					tensorDff.delta[li].assign(wantSizes[li], 0.0f);
-			}
-
-			for (unsigned int t = 0; t < numTransitions; ++t)
-			{
-				const unsigned int in = wantSizes[t];
-				const unsigned int out = wantSizes[t + 1];
-
-				TensorDFFState::Transition& tr = tensorDff.T[t];
-				tr.in = in;
-				tr.out = out;
-				tr.W.assign(static_cast<size_t>(out) * static_cast<size_t>(in), 0.0f);
-				tr.vW.assign(static_cast<size_t>(out) * static_cast<size_t>(in), 0.0f);
-				tr.gW.assign(static_cast<size_t>(out) * static_cast<size_t>(in), 0.0f);
-				tr.bias.assign(out, 0.0f);
-				tr.gBias.assign(out, 0.0f);
-
-				Layer* outLayer = meat.getOutputLayer(t + 1);
-				if (!outLayer)
-					continue;
-
-				for (unsigned int j = 0; j < out; ++j)
-				{
-					Node* node = meat.getOutputNode(outLayer, j);
-					if (!node)
-						continue;
-					for (unsigned int i = 0; i < in; ++i)
-						tr.W[static_cast<size_t>(j) * static_cast<size_t>(in) + i] = node->getEdgeWeight(i);
-
-					// Per-neuron bias is stored as the final edge weight.
-					tr.bias[j] = node->getEdgeWeight(dense_bias_edge(in));
-				}
-			}
-
-			tensorDff.batchCount = 0;
-			tensorDff.initialized = true;
-		}
-	}
+	// Tensor buffers are initialized in ensureTensorParametersInitialized().
 
 	// Forward pass for this sample
 	{
-		// In eval mode, we do not rely on LayerBuilder's row materialization (which is train-row based).
-		Layer* inLayer = isTrain ? meat.getInputLayer(inputRowCounter, 0, glades::LayerBuilder::SPLIT_TRAIN) : NULL;
 		const float* xData = NULL;
 		unsigned int xSize = 0u;
-		if (di)
+		if (!haveSparseX && di)
 		{
 			if (isTrain)
 				di->getTrainRowView(inputRowCounter, xData, xSize);
@@ -138,18 +132,61 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 				di->getTestRowView(inputRowCounter, xData, xSize);
 		}
 		// Hard safety check: reject non-finite inputs early (sampled for performance on huge rows).
-		if (!span_all_finite_bounded(xData, xSize, /*maxChecks*/ 32u))
+		if (!haveSparseX)
 		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_DFF: non-finite input data detected (NaN/Inf)");
-			running = false;
-			return;
+			if (!span_all_finite_bounded(xData, xSize, /*maxChecks*/ 32u))
+			{
+				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_DFF: non-finite input data detected (NaN/Inf)");
+				running = false;
+				return;
+			}
+			for (unsigned int i = 0; i < in; ++i)
+			{
+				const bool keep = (keepMasks[0].empty() ? true : (keepMasks[0][i] != 0u));
+				const float x = (xData && (i < xSize)) ? xData[i] : 0.0f;
+				tensorDff.a[0][i] = keep ? (x * keepScales[0]) : 0.0f;
+			}
 		}
-		const unsigned int in = tensorDff.sizes.empty() ? 0 : tensorDff.sizes[0];
-		for (unsigned int i = 0; i < in; ++i)
+		else
 		{
-			const bool keep = (isTrain ? (inLayer ? inLayer->possiblePath(i) : true) : true);
-			const float x = (xData && (i < xSize)) ? xData[i] : 0.0f;
-			tensorDff.a[0][i] = keep ? x : 0.0f;
+			// Sparse: build the post-dropout sparse view for this sample.
+			// (Never materialize tensorDff.a[0] as a dense vector.)
+			xIdxF.clear();
+			xValF.clear();
+			xIdxF.reserve(xNNZ);
+			xValF.reserve(xNNZ);
+
+			// Validate sparse input values (nnz is expected to be small).
+			for (unsigned int k = 0; k < xNNZ; ++k)
+			{
+				const unsigned int fi = xIdx[k];
+				const float xv = xVal[k];
+				if (!is_finite(xv))
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_DFF: non-finite sparse input value detected (NaN/Inf)");
+					running = false;
+					return;
+				}
+				// Enforce bounds defensively.
+				if (fi >= in)
+					continue;
+
+				// Optional input dropout: apply only to active indices.
+				const float pIn = skeleton->getPInput();
+				if (isTrain && pIn > 0.0f)
+				{
+					const bool keep = (glades::rng::uniform_double(rngEngine, 0.0, 1.0) >= static_cast<double>(pIn));
+					if (!keep)
+						continue;
+					xIdxF.push_back(fi);
+					xValF.push_back(xv * keepScales[0]);
+				}
+				else
+				{
+					xIdxF.push_back(fi);
+					xValF.push_back(xv);
+				}
+			}
 		}
 
 		// We record raw pre-activations for GUI visualization on the last sample only.
@@ -166,7 +203,6 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 		for (unsigned int t = 0; t < tensorDff.T.size(); ++t)
 		{
 			const TensorDFFState::Transition& tr = tensorDff.T[t];
-			Layer* outLayer = meat.getOutputLayer(t + 1);
 
 			const int actFx = skeleton->getActivationType(t);
 			const float actParam = skeleton->getActivationParam(t);
@@ -174,19 +210,40 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 			if (softmaxThisLayer)
 				outLogits.assign(tr.out, 0.0f);
 
+			const bool dropoutThisLayer = isTrain && (t < static_cast<unsigned int>(H));
+			const unsigned int outLayerIdx = t + 1u; // layer index in tensorDff.a / keepMasks (hidden only)
+			const float dropoutScale =
+			    (dropoutThisLayer && outLayerIdx < keepScales.size()) ? keepScales[outLayerIdx] : 1.0f;
+
 			for (unsigned int j = 0; j < tr.out; ++j)
 			{
-				// Node-scoped dropout: dropped nodes have zero activation and do not receive bias.
-				if (outLayer && !outLayer->possiblePath(j))
+				// Dropout: hidden layers only.
+				if (dropoutThisLayer)
 				{
-					tensorDff.a[t + 1][j] = 0.0f;
-					continue;
+					if (outLayerIdx < keepMasks.size() && (j < keepMasks[outLayerIdx].size()) && (keepMasks[outLayerIdx][j] == 0u))
+					{
+						tensorDff.a[t + 1][j] = 0.0f;
+						continue;
+					}
 				}
 
 				float z = (j < tr.bias.size()) ? tr.bias[j] : 0.0f;
 				const size_t rowOff = static_cast<size_t>(j) * static_cast<size_t>(tr.in);
-				for (unsigned int i = 0; i < tr.in; ++i)
-					z += tr.W[rowOff + i] * tensorDff.a[t][i];
+				if (haveSparseX && t == 0u)
+				{
+					// Sparse input only applies to the first transition.
+					for (unsigned int kk = 0; kk < static_cast<unsigned int>(xIdxF.size()); ++kk)
+					{
+						const unsigned int fi = xIdxF[kk];
+						// fi < tr.in is guaranteed by our filtering above.
+						z += tr.W[rowOff + fi] * xValF[kk];
+					}
+				}
+				else
+				{
+					for (unsigned int i = 0; i < tr.in; ++i)
+						z += tr.W[rowOff + i] * tensorDff.a[t][i];
+				}
 				if (!is_finite(z))
 				{
 					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_DFF: non-finite pre-activation detected (NaN/Inf)");
@@ -208,7 +265,8 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 						running = false;
 						return;
 					}
-					tensorDff.a[t + 1][j] = a;
+					// Inverted dropout scaling on hidden layers during training.
+					tensorDff.a[t + 1][j] = dropoutThisLayer ? (a * dropoutScale) : a;
 				}
 			}
 
@@ -327,8 +385,6 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 			const unsigned int lastLayer = numLayers - 1;
 			const unsigned int lastTransition = static_cast<unsigned int>(tensorDff.T.size() - 1);
 			const unsigned int outSize = tensorDff.sizes[lastLayer];
-
-			Layer* outLayer = meat.getOutputLayer(lastLayer);
 			const float* yData = NULL;
 			unsigned int ySize = 0u;
 			if (di)
@@ -340,11 +396,6 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 			// Output deltas
 			for (unsigned int k = 0; k < outSize; ++k)
 			{
-				if (outLayer && !outLayer->possiblePath(k))
-				{
-					tensorDff.delta[lastLayer][k] = 0.0f;
-					continue;
-				}
 				const float pred = tensorDff.a[lastLayer][k];
 					const float expv = (yData && (k < ySize)) ? yData[k] : 0.0f;
 				const bool useSoftmax =
@@ -386,14 +437,13 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 			{
 				const unsigned int l = static_cast<unsigned int>(li);
 				const TensorDFFState::Transition& nextTr = tensorDff.T[l]; // maps layer l -> l+1
-				Layer* curLayer = meat.getOutputLayer(l);
 
 				const int actFx = skeleton->getActivationType(l - 1);
 				const float actParam = skeleton->getActivationParam(l - 1);
 
 				for (unsigned int i = 0; i < tensorDff.sizes[l]; ++i)
 				{
-					if (curLayer && !curLayer->possiblePath(i))
+					if (l < keepMasks.size() && (i < keepMasks[l].size()) && (keepMasks[l][i] == 0u))
 					{
 						tensorDff.delta[l][i] = 0.0f;
 						continue;
@@ -404,8 +454,20 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					for (unsigned int j = 0; j < nextTr.out; ++j)
 						sum += tensorDff.delta[l + 1][j] * nextTr.W[static_cast<size_t>(j) * static_cast<size_t>(nextTr.in) + i];
 
-					const float a = tensorDff.a[l][i];
-					const float dA_dZ = GMath::activationErrDer(a, actFx, actParam);
+					// If dropout was applied to this hidden layer, tensorDff.a[l][i] stores the *scaled*
+					// activation. activationErrDer expects the *unscaled* activation output (e.g. tanh(x), sigmoid(x)),
+					// so undo the inverted-dropout scale here for correct derivatives.
+					float aUnscaled = tensorDff.a[l][i];
+					if (isTrain && l < keepScales.size())
+					{
+						const float sc = keepScales[l];
+						if (sc != 1.0f)
+						{
+							// Keep-mask is non-zero here (dropped units continued above).
+							aUnscaled = aUnscaled / sc;
+						}
+					}
+					const float dA_dZ = GMath::activationErrDer(aUnscaled, actFx, actParam);
 					// Basic gradient clipping for stability in extreme cases.
 					tensorDff.delta[l][i] = clipf_maybe(sum * dA_dZ, gradClip);
 					if (!is_finite(tensorDff.delta[l][i]))
@@ -436,13 +498,26 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					if (j < tr.gBias.size())
 						tr.gBias[j] += d;
 					const size_t rowOff = static_cast<size_t>(j) * static_cast<size_t>(in);
-					for (unsigned int i = 0; i < in; ++i)
-						tr.gW[rowOff + i] += d * tensorDff.a[t][i];
+					if (haveSparseX && t == 0u)
+					{
+						// Sparse input: only accumulate gradients for active indices.
+						for (unsigned int kk = 0; kk < static_cast<unsigned int>(xIdxF.size()); ++kk)
+						{
+							const unsigned int fi = xIdxF[kk];
+							// fi < in by construction.
+							tr.gW[rowOff + fi] += d * xValF[kk];
+						}
+					}
+					else
+					{
+						for (unsigned int i = 0; i < in; ++i)
+							tr.gW[rowOff + i] += d * tensorDff.a[t][i];
+					}
 				}
 			}
 			++tensorDff.batchCount;
 
-			// End-of-batch detection (mirrors legacy minibatch semantics)
+			// End-of-batch detection
 				const unsigned int trainSize = di ? di->getTrainSize() : 0;
 				const int effectiveMiniBatchSize = (minibatchSize > 0) ? minibatchSize : static_cast<int>(trainSize);
 				const bool isLastSample = (trainSize > 0) && (inputRowCounter + 1 >= trainSize);
@@ -556,7 +631,7 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 						}
 					}
 
-					// Per-neuron bias (no momentum/weight decay; matches legacy engine behavior).
+					// Per-neuron bias (no momentum/weight decay).
 					{
 						for (unsigned int j = 0; j < tr.out; ++j)
 						{
@@ -582,9 +657,6 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					}
 				}
 
-				// Defer syncing tensors -> Node/Edge graph until an epoch boundary.
-				// (Trainer will sync once per epoch before callbacks.)
-				graphWeightsDirty = true;
 				tensorDff.batchCount = 0;
 			}
 

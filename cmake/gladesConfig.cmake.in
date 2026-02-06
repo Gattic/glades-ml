@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+# Exported targets (glades, ML, Networks, etc.)
+include("${CMAKE_CURRENT_LIST_DIR}/gladesTargets.cmake")
+
+check_required_components(glades)
+

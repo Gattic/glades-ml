@@ -20,6 +20,7 @@
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GPointer.h"
 #include "../GMath/OHE.h"
+#include "../nnetwork_status.h"
 #include <vector>
 #include <limits>
 #include <string>
@@ -84,6 +85,16 @@ public:
 	virtual void import(shmea::GString, int = 0) = 0;
 	virtual void import(const shmea::GTable&, int = 0) = 0;
 
+	// === Status reporting (optional) ===
+	//
+	// DataInput historically provided no way to report import/load failures besides leaving
+	// the instance in an "empty" state. This makes debugging painful: downstream code sees
+	// only EMPTY_DATA.
+	//
+	// Implementations SHOULD override this to return the most recent load/import status.
+	// The default implementation reports OK.
+	virtual NNetworkStatus getLastStatus() const { return NNetworkStatus(); }
+
 	virtual shmea::GVector<float> getTrainRow(unsigned int) const = 0;
 	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int) const = 0;
 
@@ -107,6 +118,51 @@ public:
 	virtual bool getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const = 0;
 	virtual bool getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const = 0;
 	virtual bool getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const = 0;
+
+	// === Token-id access (optional; for language models) ===
+	//
+	// Some datasets (e.g. TokenInput for token language models) are naturally integer token IDs.
+	// The historical DataInput API is float-based, which can force callers to cast floats to ints
+	// and can introduce subtle unsigned wraparound bugs with negative pad/ignore ids.
+	//
+	// These optional accessors allow token datasets to expose IDs as first-class signed integers.
+	//
+	// Semantics:
+	// - Return true and write outTokenId on success.
+	// - Return false if not supported or index out of range.
+	virtual bool getTrainTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
+	virtual bool getTrainExpectedTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
+	virtual bool getTestTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
+	virtual bool getTestExpectedTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
+
+	// === Sparse row access (optional; primarily for high-cardinality one-hot inputs) ===
+	//
+	// This API allows DataInput implementations to provide a sparse representation of
+	// feature rows without materializing a dense float vector of size getFeatureCount().
+	//
+	// Semantics:
+	// - A sparse row is a set of (index, value) pairs over a logical dense vector of length outFullSize.
+	// - Indices must be in [0, outFullSize).
+	// - Implementations SHOULD return indices in strictly increasing order, but callers must not assume it.
+	// - If a feature index is not present, its value is assumed to be 0.0f.
+	//
+	// Lifetime: returned pointers follow the same lifetime rules as get*RowView().
+	virtual bool getTrainRowSparseView(unsigned int /*index*/,
+	                                  const unsigned int*& /*outIndices*/,
+	                                  const float*& /*outValues*/,
+	                                  unsigned int& /*outNNZ*/,
+	                                  unsigned int& /*outFullSize*/) const
+	{
+		return false;
+	}
+	virtual bool getTestRowSparseView(unsigned int /*index*/,
+	                                 const unsigned int*& /*outIndices*/,
+	                                 const float*& /*outValues*/,
+	                                 unsigned int& /*outNNZ*/,
+	                                 unsigned int& /*outFullSize*/) const
+	{
+		return false;
+	}
 
 	virtual unsigned int getTrainSize() const = 0;
 	virtual unsigned int getTestSize() const = 0;
@@ -171,6 +227,12 @@ public:
 	bool getTrainSequenceExpectedRowView(unsigned int seqIdx, unsigned int t, const float*& outData, unsigned int& outSize) const;
 	bool getTestSequenceRowView(unsigned int seqIdx, unsigned int t, const float*& outData, unsigned int& outSize) const;
 	bool getTestSequenceExpectedRowView(unsigned int seqIdx, unsigned int t, const float*& outData, unsigned int& outSize) const;
+
+	// Token-id sequence helpers (map SequenceSpan -> underlying row index).
+	bool getTrainSequenceTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const;
+	bool getTrainSequenceExpectedTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const;
+	bool getTestSequenceTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const;
+	bool getTestSequenceExpectedTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const;
 
 	// Configure explicit sequence spans. Returns false if spans are invalid *given
 	// the currently-loaded dataset sizes*. If called before import()/data load,
@@ -353,6 +415,66 @@ inline bool DataInput::getTestSequenceExpectedRowView(unsigned int seqIdx, unsig
 		return getTestExpectedRowView(s.start + t, outData, outSize);
 	}
 	return getTestExpectedRowView(t, outData, outSize);
+}
+
+inline bool DataInput::getTrainSequenceTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const
+{
+	outTokenId = 0;
+	if (!trainSequences.empty())
+	{
+		if (seqIdx >= trainSequences.size())
+			return false;
+		const SequenceSpan& s = trainSequences[seqIdx];
+		if (t >= s.length)
+			return false;
+		return getTrainTokenId(s.start + t, outTokenId);
+	}
+	return getTrainTokenId(t, outTokenId);
+}
+
+inline bool DataInput::getTrainSequenceExpectedTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const
+{
+	outTokenId = 0;
+	if (!trainSequences.empty())
+	{
+		if (seqIdx >= trainSequences.size())
+			return false;
+		const SequenceSpan& s = trainSequences[seqIdx];
+		if (t >= s.length)
+			return false;
+		return getTrainExpectedTokenId(s.start + t, outTokenId);
+	}
+	return getTrainExpectedTokenId(t, outTokenId);
+}
+
+inline bool DataInput::getTestSequenceTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const
+{
+	outTokenId = 0;
+	if (!testSequences.empty())
+	{
+		if (seqIdx >= testSequences.size())
+			return false;
+		const SequenceSpan& s = testSequences[seqIdx];
+		if (t >= s.length)
+			return false;
+		return getTestTokenId(s.start + t, outTokenId);
+	}
+	return getTestTokenId(t, outTokenId);
+}
+
+inline bool DataInput::getTestSequenceExpectedTokenId(unsigned int seqIdx, unsigned int t, int& outTokenId) const
+{
+	outTokenId = 0;
+	if (!testSequences.empty())
+	{
+		if (seqIdx >= testSequences.size())
+			return false;
+		const SequenceSpan& s = testSequences[seqIdx];
+		if (t >= s.length)
+			return false;
+		return getTestExpectedTokenId(s.start + t, outTokenId);
+	}
+	return getTestExpectedTokenId(t, outTokenId);
 }
 
 inline void DataInput::clearTrainSequences()
