@@ -3,14 +3,60 @@
 #include "param_layout.h"
 #include "sgd_utils.h"
 
+#include "Backend/Database/GLogger.h"
+
 #include "../DataObjects/DataInput.h"
 #include "../GMath/gmath.h"
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 #include <vector>
 
 using namespace glades;
+
+namespace {
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
+{
+	oss << ' ' << k << '=';
+	bool needQuote = false;
+	for (size_t i = 0; i < v.size(); ++i)
+	{
+		const char c = v[i];
+		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
+		{
+			needQuote = true;
+			break;
+		}
+	}
+	if (!needQuote)
+	{
+		oss << v;
+		return;
+	}
+	oss << '"';
+	for (size_t i = 0; i < v.size(); ++i)
+	{
+		const char c = v[i];
+		if (c == '\\' || c == '"')
+			oss << '\\' << c;
+		else if (c == '\n')
+			oss << "\\n";
+		else if (c == '\r')
+			oss << "\\r";
+		else if (c == '\t')
+			oss << "\\t";
+		else
+			oss << c;
+	}
+	oss << '"';
+}
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, int v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned int v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned long long v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, double v) { oss << ' ' << k << '=' << v; }
+} // namespace
 
 void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 {
@@ -375,6 +421,36 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
 		(skeleton->getOutputType() == GMath::KL))
 		confusionMatrix.addResult(results);
+
+	// Progress logs for long DFF epochs (bounded to ~20 messages per epoch).
+	// Note: this emits "loss_so_far" as the running aggregate; epoch-end callback logs the finalized metrics.
+	{
+		shmea::GLogger* logger = getLogger();
+		if (logger && dataSize > 0u)
+		{
+			unsigned int every = 1u;
+			if (dataSize > 20u)
+				every = dataSize / 20u;
+			if (every == 0u)
+				every = 1u;
+			const unsigned int done = inputRowCounter + 1u;
+			if (done == dataSize || (done % every) == 0u)
+			{
+				std::ostringstream oss;
+				oss << "event=nn_step_progress";
+				append_logfmt_kv(oss, "net_type", netType);
+				append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
+				append_logfmt_kv(oss, "epoch", epochs);
+				append_logfmt_kv(oss, "step", done);
+				append_logfmt_kv(oss, "steps_total", dataSize);
+				append_logfmt_kv(oss, "loss_so_far", overallTotalError);
+				append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+				append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+				append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+				logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+			}
+		}
+	}
 
 	// Backprop + SGD update (minibatched) for train
 	if (isTrain)

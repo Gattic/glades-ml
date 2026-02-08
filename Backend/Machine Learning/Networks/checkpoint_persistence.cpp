@@ -2826,4 +2826,3 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 }
 
 } // namespace glades
-

@@ -3,14 +3,60 @@
 #include "param_layout.h"
 #include "sgd_utils.h"
 
+#include "Backend/Database/GLogger.h"
+
 #include "../DataObjects/DataInput.h"
 #include "../GMath/gmath.h"
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 #include <vector>
 
 using namespace glades;
+
+namespace {
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
+{
+	oss << ' ' << k << '=';
+	bool needQuote = false;
+	for (size_t i = 0; i < v.size(); ++i)
+	{
+		const char c = v[i];
+		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
+		{
+			needQuote = true;
+			break;
+		}
+	}
+	if (!needQuote)
+	{
+		oss << v;
+		return;
+	}
+	oss << '"';
+	for (size_t i = 0; i < v.size(); ++i)
+	{
+		const char c = v[i];
+		if (c == '\\' || c == '"')
+			oss << '\\' << c;
+		else if (c == '\n')
+			oss << "\\n";
+		else if (c == '\r')
+			oss << "\\r";
+		else if (c == '\t')
+			oss << "\\t";
+		else
+			oss << c;
+	}
+	oss << '"';
+}
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, int v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned int v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned long long v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, double v) { oss << ' ' << k << '=' << v; }
+} // namespace
 
 void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 {
@@ -385,12 +431,25 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 
 	// NOTE: overallTotalAccuracy is reported timestep-averaged for compatibility.
 
+	// Progress logging (heartbeat) for long sequence epochs.
+	shmea::GLogger* logger = getLogger();
+	const int64_t epochStartMs = getCurrentTimeMilliseconds();
+	int64_t lastProgressMs = epochStartMs;
+	static const int64_t kProgressIntervalMs = 5000;
+	unsigned int progressEverySeq = 1u;
+	if (seqCount > 20u)
+		progressEverySeq = seqCount / 20u;
+	if (progressEverySeq == 0u)
+		progressEverySeq = 1u;
+	unsigned long long tokensProcessed = 0ULL;
+
 	// Process each sequence independently (hidden state resets at each sequence boundary).
 	for (unsigned int s = 0; s < seqCount; ++s)
 	{
 		const unsigned int seqLen = isTrain ? di->getTrainSequenceLength(s) : di->getTestSequenceLength(s);
 		if (seqLen == 0)
 			continue;
+		tokensProcessed += static_cast<unsigned long long>(seqLen);
 
 		// Hidden state carried forward across TBPTT windows within a sequence.
 		std::vector< std::vector<float> > hPrev;
@@ -826,6 +885,34 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 
 			t0 += winLen;
 		} // TBPTT windows
+
+		// Log at sequence boundaries (time- or count-based), excluding the final sequence (final epoch metrics are logged elsewhere).
+		if (logger && (s + 1u) < seqCount)
+		{
+			const int64_t nowMs = getCurrentTimeMilliseconds();
+			const bool dueBySeq = (((s + 1u) % progressEverySeq) == 0u);
+			const bool dueByTime = ((nowMs - lastProgressMs) >= kProgressIntervalMs);
+			if (dueBySeq || dueByTime)
+			{
+				lastProgressMs = nowMs;
+				const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
+				const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(tokensProcessed) / (elapsedMs / 1000.0)) : 0.0;
+				std::ostringstream oss;
+				oss << "event=nn_epoch_progress";
+				append_logfmt_kv(oss, "net_type", netType);
+				append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
+				append_logfmt_kv(oss, "epoch", epochs);
+				append_logfmt_kv(oss, "seq_done", s + 1u);
+				append_logfmt_kv(oss, "seq_total", seqCount);
+				append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
+				append_logfmt_kv(oss, "tokens_per_sec", tokPerSec);
+				append_logfmt_kv(oss, "loss_so_far", overallTotalError);
+				append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+				append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+				append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+				logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+			}
+		}
 	} // sequences
 
 	// Flush any partial minibatch group.

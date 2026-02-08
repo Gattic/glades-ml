@@ -3,6 +3,8 @@
 #include "sgd_utils.h"
 #include "transformer_kernels.h"
 
+#include "Backend/Database/GLogger.h"
+
 #include "../DataObjects/DataInput.h"
 #include "../GMath/gmath.h"
 #include "../rng.h"
@@ -21,6 +23,49 @@ static inline float clip_maybe(float v, float limit)
 {
 	return glades::sgd_detail::clipf_maybe(v, limit);
 }
+
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
+{
+	oss << ' ' << k << '=';
+	bool needQuote = false;
+	for (size_t i = 0; i < v.size(); ++i)
+	{
+		const char c = v[i];
+		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
+		{
+			needQuote = true;
+			break;
+		}
+	}
+	if (!needQuote)
+	{
+		oss << v;
+		return;
+	}
+	oss << '"';
+	for (size_t i = 0; i < v.size(); ++i)
+	{
+		const char c = v[i];
+		if (c == '\\' || c == '"')
+			oss << '\\' << c;
+		else if (c == '\n')
+			oss << "\\n";
+		else if (c == '\r')
+			oss << "\\r";
+		else if (c == '\t')
+			oss << "\\t";
+		else
+			oss << c;
+	}
+	oss << '"';
+}
+
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, int v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned int v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned long long v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, double v) { oss << ' ' << k << '=' << v; }
+static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, bool v) { oss << ' ' << k << '=' << (v ? 1 : 0); }
 
 static void add_positional_encoding(float* h,
                                     unsigned int T,
@@ -166,6 +211,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	// Only run once per epoch (Trainer loops over steps=1 for sequence models).
 	if (inputRowCounter != 0u)
 		return;
+
+	// Epoch-local progress logging (rate-limited by a fixed number of updates per epoch).
+	// This keeps long-running LLM epochs from appearing "stuck" while avoiding log spam.
+	shmea::GLogger* logger = getLogger();
+	const int64_t epochStartMs = getCurrentTimeMilliseconds();
+	const int epochIdx = epochs; // current epoch number for this run (Trainer increments after SGDHelper returns)
 
 	// Transformers do not use the graph's dropout masks (no node-level dropout here).
 	// (legacy graph dropout removed)
@@ -1045,11 +1096,24 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	double tokenLmNllSum = 0.0;
 	unsigned long long tokenLmTokenCount = 0ULL;
 
+	unsigned long long tokensProcessed = 0ULL;
+	unsigned long long targetsProcessed = 0ULL; // token LM: non-pad targets; else: timesteps
+
+	// Emit ~20 progress updates per epoch (plus final).
+	unsigned int progressEverySeq = 1u;
+	if (seqCount > 20u)
+		progressEverySeq = seqCount / 20u;
+	if (progressEverySeq == 0u)
+		progressEverySeq = 1u;
+	int64_t lastProgressMs = epochStartMs;
+	static const int64_t kProgressIntervalMs = 5000; // 5s heartbeat
+
 	for (unsigned int s = 0; s < seqCount; ++s)
 	{
 		const unsigned int T = isTrain ? di->getTrainSequenceLength(s) : di->getTestSequenceLength(s);
 		if (T == 0u)
 			continue;
+		tokensProcessed += static_cast<unsigned long long>(T);
 
 		// For sampled-softmax token LM, we do NOT allocate [T,vocab] logits/probs/dLogits.
 		// Instead, logits/probs are sized [T,(1+K)] for K negatives per token.
@@ -1174,6 +1238,28 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			for (unsigned int t = 0; t < T; ++t)
 				if (tokenIds[t] == padTokenId)
 					keyAllowed[t] = 0u;
+		}
+
+		// Progress counters:
+		// - tokenLM: count valid target tokens (non-pad) for loss normalization/throughput.
+		// - non-tokenLM: count timesteps.
+		if (tokenLM)
+		{
+			unsigned int valid = 0u;
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const int yid = targetIds[t];
+				if (padTokenId >= 0 && yid == padTokenId)
+					continue;
+				if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize)
+					continue;
+				++valid;
+			}
+			targetsProcessed += static_cast<unsigned long long>(valid);
+		}
+		else
+		{
+			targetsProcessed += static_cast<unsigned long long>(T);
 		}
 
 		// === Forward ===
@@ -1983,10 +2069,22 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						if (mpDynamicLossScaling)
 						{
+								const float prev = tt.mpLossScale;
 							tt.mpLossScale *= trainingConfig.mixedPrecision.backoffFactor;
 							if (tt.mpLossScale < trainingConfig.mixedPrecision.lossScaleMin)
 								tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMin;
 							tt.mpLossScaleGoodSteps = 0;
+								if (logger)
+								{
+									std::ostringstream oss;
+									oss << "event=nn_loss_scale_backoff";
+									append_logfmt_kv(oss, "net_type", netType);
+									append_logfmt_kv(oss, "epoch", epochIdx);
+									append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
+									append_logfmt_kv(oss, "loss_scale_prev", prev);
+									append_logfmt_kv(oss, "loss_scale_new", tt.mpLossScale);
+									logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+								}
 						}
 						clearGrads();
 					}
@@ -2005,10 +2103,22 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							tt.mpLossScaleGoodSteps += 1;
 							if (tt.mpLossScaleGoodSteps >= trainingConfig.mixedPrecision.growthInterval)
 							{
+									const float prev = tt.mpLossScale;
 								tt.mpLossScale *= trainingConfig.mixedPrecision.growthFactor;
 								if (tt.mpLossScale > trainingConfig.mixedPrecision.lossScaleMax)
 									tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMax;
 								tt.mpLossScaleGoodSteps = 0;
+									if (logger && tt.mpLossScale != prev)
+									{
+										std::ostringstream oss;
+										oss << "event=nn_loss_scale_grow";
+										append_logfmt_kv(oss, "net_type", netType);
+										append_logfmt_kv(oss, "epoch", epochIdx);
+										append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
+										append_logfmt_kv(oss, "loss_scale_prev", prev);
+										append_logfmt_kv(oss, "loss_scale_new", tt.mpLossScale);
+										logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+									}
 							}
 						}
 
@@ -2030,7 +2140,106 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				nbRecord.addRow(nbRow);
 			}
 		}
+
+		// Periodic progress logs within the epoch (exclude last; a final log is emitted below).
+		if (logger && (s + 1u) < seqCount)
+		{
+			const int64_t nowMs = getCurrentTimeMilliseconds();
+			const bool dueBySeq = (((s + 1u) % progressEverySeq) == 0u);
+			const bool dueByTime = ((nowMs - lastProgressMs) >= kProgressIntervalMs);
+			if (!(dueBySeq || dueByTime))
+				continue;
+			lastProgressMs = nowMs;
+			const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
+			const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
+
+			std::ostringstream oss;
+			oss << "event=nn_epoch_progress";
+			append_logfmt_kv(oss, "net_type", netType);
+			append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
+			append_logfmt_kv(oss, "epoch", epochIdx);
+			append_logfmt_kv(oss, "seq_done", s + 1u);
+			append_logfmt_kv(oss, "seq_total", seqCount);
+			append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
+			append_logfmt_kv(oss, "targets_seen", targetsProcessed);
+			append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
+			if (tokenLM)
+			{
+				const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
+				double ppl = 0.0;
+				if (tokenLmTokenCount > 0ULL)
+				{
+					double arg = meanNll;
+					if (arg > 80.0) arg = 80.0;
+					if (arg < -80.0) arg = -80.0;
+					ppl = exp(arg);
+				}
+				append_logfmt_kv(oss, "nll", meanNll);
+				append_logfmt_kv(oss, "perplexity", ppl);
+				append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+			}
+			else
+			{
+				append_logfmt_kv(oss, "loss_so_far", overallTotalError);
+			}
+			append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+			append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+			append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+			append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
+			if (mpUseLossScaling)
+				append_logfmt_kv(oss, "loss_scale", tt.mpLossScale);
+
+			logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+		}
 	} // sequences
+
+	// Progress log (final) and periodic log points.
+	// NOTE: emit at end of the epoch regardless of seqCount%progressEverySeq to provide a clear heartbeat.
+	if (logger)
+	{
+		const int64_t nowMs = getCurrentTimeMilliseconds();
+		const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
+		const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
+		double ppl = 0.0;
+		if (tokenLM && tokenLmTokenCount > 0ULL)
+		{
+			double arg = meanNll;
+			if (arg > 80.0) arg = 80.0;
+			if (arg < -80.0) arg = -80.0;
+			ppl = exp(arg);
+		}
+		const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
+
+		std::ostringstream oss;
+		oss << "event=nn_epoch_progress";
+		append_logfmt_kv(oss, "net_type", netType);
+		append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
+		append_logfmt_kv(oss, "epoch", epochIdx);
+		append_logfmt_kv(oss, "seq_done", seqCount);
+		append_logfmt_kv(oss, "seq_total", seqCount);
+		append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
+		append_logfmt_kv(oss, "targets_seen", targetsProcessed);
+		append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
+		// Token LM running loss (mean NLL); for non-tokenLM use overallTotalError accumulator.
+		if (tokenLM)
+		{
+			append_logfmt_kv(oss, "nll", meanNll);
+			append_logfmt_kv(oss, "perplexity", ppl);
+			append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+		}
+		else
+		{
+			append_logfmt_kv(oss, "loss_so_far", overallTotalError);
+		}
+		append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+		append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+		append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+		append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
+		if (mpUseLossScaling)
+			append_logfmt_kv(oss, "loss_scale", tt.mpLossScale);
+
+		logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+	}
 
 	// Normalize token LM loss: mean NLL per non-pad token.
 	// (Trainer expects overallTotalError to be an epoch-level mean-like quantity.)
