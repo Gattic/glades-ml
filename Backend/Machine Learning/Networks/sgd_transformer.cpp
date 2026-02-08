@@ -2165,26 +2165,47 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
 			if (tokenLM)
 			{
+				const bool tokenLmFullSoftmax = (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
+				append_logfmt_kv(oss, "token_lm_loss_kind", std::string(tokenLmFullSoftmax ? "full_softmax" : "sampled_softmax"));
 				const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
-				double ppl = 0.0;
-				if (tokenLmTokenCount > 0ULL)
-				{
-					double arg = meanNll;
-					if (arg > 80.0) arg = 80.0;
-					if (arg < -80.0) arg = -80.0;
-					ppl = exp(arg);
-				}
 				append_logfmt_kv(oss, "nll", meanNll);
-				append_logfmt_kv(oss, "perplexity", ppl);
-				append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+				if (tokenLmFullSoftmax)
+				{
+					double ppl = 0.0;
+					if (tokenLmTokenCount > 0ULL)
+					{
+						double arg = meanNll;
+						if (arg > 80.0) arg = 80.0;
+						if (arg < -80.0) arg = -80.0;
+						ppl = exp(arg);
+					}
+					append_logfmt_kv(oss, "perplexity", ppl);
+					append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+				}
+				else
+				{
+					// Sampled-softmax does not produce an exact perplexity, and we do not have a full-vocab argmax.
+					append_logfmt_kv(oss, "perplexity", std::string("na"));
+					append_logfmt_kv(oss, "acc_top1", std::string("na"));
+				}
 			}
 			else
 			{
 				append_logfmt_kv(oss, "loss_so_far", overallTotalError);
 			}
 			append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
-			append_logfmt_kv(oss, "grad_norm", lastGradNorm);
-			append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+			// Grad-norm is only computed when global grad clipping is enabled (for performance).
+			// Avoid printing misleading zeros when it is disabled.
+			if (trainingConfig.globalGradClipNorm > 0.0f)
+			{
+				append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+				append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+			}
+			else
+			{
+				append_logfmt_kv(oss, "grad_norm", std::string("na"));
+				append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
+			}
 			append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
 			if (mpUseLossScaling)
 				append_logfmt_kv(oss, "loss_scale", tt.mpLossScale);
@@ -2223,17 +2244,37 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		// Token LM running loss (mean NLL); for non-tokenLM use overallTotalError accumulator.
 		if (tokenLM)
 		{
+			const bool tokenLmFullSoftmax = (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
+			append_logfmt_kv(oss, "token_lm_loss_kind", std::string(tokenLmFullSoftmax ? "full_softmax" : "sampled_softmax"));
 			append_logfmt_kv(oss, "nll", meanNll);
-			append_logfmt_kv(oss, "perplexity", ppl);
-			append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+			if (tokenLmFullSoftmax)
+			{
+				append_logfmt_kv(oss, "perplexity", ppl);
+				append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+			}
+			else
+			{
+				append_logfmt_kv(oss, "perplexity", std::string("na"));
+				append_logfmt_kv(oss, "acc_top1", std::string("na"));
+			}
 		}
 		else
 		{
 			append_logfmt_kv(oss, "loss_so_far", overallTotalError);
 		}
 		append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
-		append_logfmt_kv(oss, "grad_norm", lastGradNorm);
-		append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+		// Grad-norm is only computed when global grad clipping is enabled (for performance).
+		// Avoid printing misleading zeros when it is disabled.
+		if (trainingConfig.globalGradClipNorm > 0.0f)
+		{
+			append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+			append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+		}
+		else
+		{
+			append_logfmt_kv(oss, "grad_norm", std::string("na"));
+			append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
+		}
 		append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
 		if (mpUseLossScaling)
 			append_logfmt_kv(oss, "loss_scale", tt.mpLossScale);

@@ -445,8 +445,18 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 				append_logfmt_kv(oss, "steps_total", dataSize);
 				append_logfmt_kv(oss, "loss_so_far", overallTotalError);
 				append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
-				append_logfmt_kv(oss, "grad_norm", lastGradNorm);
-				append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+				// Grad-norm is only computed when global grad clipping is enabled (for performance).
+				// Avoid printing misleading zeros when it is disabled.
+				if (trainingConfig.globalGradClipNorm > 0.0f)
+				{
+					append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+					append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+				}
+				else
+				{
+					append_logfmt_kv(oss, "grad_norm", std::string("na"));
+					append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
+				}
 				logger->info("NNetwork", shmea::GString(oss.str().c_str()));
 			}
 		}
