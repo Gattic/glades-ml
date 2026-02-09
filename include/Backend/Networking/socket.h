@@ -19,6 +19,8 @@
 
 #include "../Database/GString.h"
 #include "../Database/GLogger.h"
+#include "../Database/GPointer.h"
+#include "../Database/ServiceData.h"
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <iostream>
@@ -37,10 +39,6 @@
 #include <utility>
 #include <vector>
 
-namespace shmea {
-class ServiceData;
-};
-
 namespace GNet {
 class GServer;
 class Connection;
@@ -54,11 +52,34 @@ private:
 	shmea::GString PORT;
 	pthread_mutex_t* inMutex;
 	pthread_mutex_t* outMutex;
-	std::map<int64_t, shmea::ServiceData*> inboundLists; // Vector of sds instead? Make the key advanced to take hostnames, usernames,  etc; too
-	std::map<int64_t, shmea::ServiceData*> outboundLists; // Vector of sds instead?
+	// Queue keys must be scoped to a connection to avoid cross-connection collisions.
+	struct QueueKey
+	{
+		Connection* conn;
+		int64_t serviceNum;
+		QueueKey() : conn(NULL), serviceNum(0) {}
+		QueueKey(Connection* c, int64_t s) : conn(c), serviceNum(s) {}
+	};
+	struct QueueKeyLess
+	{
+		bool operator()(const QueueKey& a, const QueueKey& b) const
+		{
+			if (a.conn < b.conn)
+				return true;
+			if (a.conn > b.conn)
+				return false;
+			return a.serviceNum < b.serviceNum;
+		}
+	};
+
+	std::map<QueueKey, shmea::GPointer<shmea::ServiceData>, QueueKeyLess> inboundLists;
+	std::map<QueueKey, shmea::GPointer<shmea::ServiceData>, QueueKeyLess> outboundLists;
 	int udpfd;
+	unsigned int inboundQueueMax;
+	unsigned int outboundQueueMax;
 
 	void initSockets();
+	void maybeLogMetrics(const char* where);
 
 	// ServiceData* emptyResponseList();
 
@@ -80,8 +101,13 @@ public:
 	int openClientConnection(const shmea::GString&, const shmea::GString&);
 	int openUDPServerSocket();
 	int getUDPSocketFD() const { return udpfd; }
-	void readConnection(Connection*, const int&, std::vector<shmea::ServiceData*>&);
-	void readConnectionHelper(Connection*, const int&, std::vector<shmea::ServiceData*>&);
+	void readConnection(Connection*, const int&, std::vector<shmea::GPointer<shmea::ServiceData> >&);
+	// Returns:
+	//  1  => made progress (read bytes and/or parsed at least one complete frame)
+	//  0  => no new bytes available right now (EAGAIN/EWOULDBLOCK) and no frames parsed
+	// -1  => peer closed (EOF) with no remaining complete frames parsed
+	// -2  => fatal I/O or protocol error (caller should logout / close connection)
+	int readConnectionHelper(Connection*, const int&, std::vector<shmea::GPointer<shmea::ServiceData> >&);
 	int writeConnection(const Connection*, const int&, shmea::ServiceData*);
 	void closeConnection(const int&);
 
@@ -92,7 +118,10 @@ public:
 	bool readUDPDatagram(GServer*);
 	void processLists(GServer*);
 	void writeLists(GServer*);
-	void addResponseList(GServer*, Connection*, shmea::ServiceData*);
+	void addResponseList(GServer*, Connection*, shmea::GPointer<shmea::ServiceData>);
+	// Drop any queued inbound/outbound messages for a connection.
+	// Used during logout to prevent leaks and to keep pending-send bookkeeping correct.
+	void purgeConnection(Connection*);
 };
 };
 

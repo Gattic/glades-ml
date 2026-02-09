@@ -610,7 +610,7 @@ public:
 			ServiceDataSendPtr cData(new shmea::ServiceData(conn, "GUI_Callback"));
 			cData->set(wData);
 			cData->setArgList(argData);
-			server->send(cData.get());
+			server->send(cData);
 			cData.reset(); // explicit ownership transfer
 
 			// Activations: first message sends layer sizes, subsequent sends activations list
@@ -639,7 +639,7 @@ public:
 				cData->set(net.getNodeActivations());
 			}
 			cData->setArgList(argData);
-			server->send(cData.get());
+			server->send(cData);
 			cData.reset(); // explicit ownership transfer
 
 			// Weights: layer weights + bias weights
@@ -650,7 +650,7 @@ public:
 			cData = ServiceDataSendPtr(new shmea::ServiceData(conn, "GUI_Callback"));
 			cData->set(obtainedWeights);
 			cData->setArgList(argData);
-			server->send(cData.get());
+			server->send(cData);
 			cData.reset(); // explicit ownership transfer
 		}
 
@@ -666,7 +666,7 @@ public:
 			ServiceDataSendPtr cData(new shmea::ServiceData(conn, "GUI_Callback"));
 			cData->set(wData);
 			cData->setArgList(argData);
-			server->send(cData.get());
+			server->send(cData);
 			cData.reset(); // explicit ownership transfer
 		}
 
@@ -682,7 +682,7 @@ public:
 			ServiceDataSendPtr cData(new shmea::ServiceData(conn, "GUI_Callback"));
 			cData->set(cm.getMatrix());
 			cData->setArgList(argData);
-			server->send(cData.get());
+			server->send(cData);
 			cData.reset(); // explicit ownership transfer
 		}
 

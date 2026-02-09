@@ -35,6 +35,7 @@ class GLogger
 private:
 	// Keys are categories
 	int printLevel;
+	bool printToConsole;
 	shmea::GList verboseKeys;
 	shmea::GList debugKeys;
 	shmea::GList infoKeys;
@@ -84,6 +85,8 @@ public:
 	void clear();
 	void setPrintLevel(int);
 	int getPrintLevel() const;
+	void setPrintToConsole(bool);
+	bool getPrintToConsole() const;
 	void surpress(int);
 	void unsurpress(int);
 	bool surpressCheck(int) const;

@@ -18,6 +18,7 @@
 #define _GCONNECTION
 
 #include "../Database/GString.h"
+#include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,19 @@ private:
 	bool finished;
 	int protocol; // 0 = TCP, 1 = UDP
 	bool closeOnFinish;
+	// UDP peer bookkeeping / safe reclamation.
+	// These counters allow the server thread to prune idle UDP peers without
+	// freeing a Connection that is still referenced by a worker/writer thread.
+	// C++03 note: we can't use std::atomic. We rely on GCC/Clang __sync builtins
+	// (or best-effort volatile reads) for cross-thread bookkeeping.
+	volatile int inFlightServices;
+	volatile int pendingSends;
+	volatile int64_t lastSeenSec;
+
+	// Connections own/represent an OS socket descriptor (`sockfd`).
+	// Copying would duplicate the descriptor value and lead to double-close / UAF bugs.
+	Connection(const Connection&);
+	Connection& operator=(const Connection&);
 
 public:
 	// member limits
@@ -62,7 +76,6 @@ public:
 
 	Connection(int, int, shmea::GString);
 	Connection(int, int, shmea::GString, shmea::GString);
-	Connection(const Connection&);
 	~Connection();
 	void finish();
 
@@ -75,6 +88,9 @@ public:
 	int64_t getKey() const;
 	bool isFinished() const;
 	int getProtocol() const;
+	int64_t getLastSeenSec() const;
+	unsigned int getInFlightServices() const;
+	unsigned int getPendingSends() const;
 
 	// sets
 	void setName(shmea::GString);
@@ -85,6 +101,11 @@ public:
 	void setKey(int64_t);
 	void setProtocol(int);
 	void setCloseOnFinish(bool);
+	void noteSeen();
+	void incInFlight();
+	void decInFlight();
+	void incPendingSends();
+	void decPendingSends();
 
 	static bool validName(const shmea::GString&);
 	static int64_t generateKey();

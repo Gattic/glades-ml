@@ -21,6 +21,7 @@
 #include "../Database/GList.h"
 #include "../Database/GTable.h"
 #include "../Database/GObject.h"
+#include "../Database/GPointer.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,11 +37,18 @@ class Connection;
 namespace shmea {
 	class Serializable;
 
+	// Custom deleter so Connection can stay forward-declared here.
+	// (Avoids deleting an incomplete type via default_deleter.)
+	void delete_connection(GNet::Connection*);
+
 class ServiceData
 {
 private:
 
 	GNet::Connection* cConnection;
+	// Optional RAII owner for cases where the Connection is ephemeral (e.g. UDP datagram pseudo-connection).
+	// When empty, `cConnection` is treated as a non-owning observer pointer.
+	shmea::GPointer<GNet::Connection, shmea::delete_connection> connectionOwner;
 	int64_t timesent;
 	shmea::GString sid;
 	shmea::GString command;
@@ -65,6 +73,7 @@ public:
 
 	ServiceData(GNet::Connection*);
 	ServiceData(GNet::Connection*, shmea::GString);
+	ServiceData(shmea::GPointer<GNet::Connection, shmea::delete_connection>, shmea::GString);
 	ServiceData(const ServiceData&);
 	virtual ~ServiceData();
 
@@ -79,6 +88,7 @@ public:
 	void set(const shmea::Serializable&);
 
 	GNet::Connection* getConnection() const;
+	void setConnectionOwner(shmea::GPointer<GNet::Connection, shmea::delete_connection>);
 	int64_t getTimesent() const;
 	shmea::GString getSID() const;
 	shmea::GString getCommand() const;

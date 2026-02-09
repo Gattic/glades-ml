@@ -19,6 +19,7 @@
 
 #include "GDeleter.h"
 #include <ctime>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,7 +45,14 @@ public:
 	explicit GPointer(T* newData = NULL) : 
 		data(newData),
 		refCount(newData ? new unsigned int(1) : NULL),
-		refMutex(NULL) {}
+		refMutex(NULL)
+	{
+		if (newData)
+		{
+			refMutex = new pthread_mutex_t;
+			pthread_mutex_init(refMutex, NULL);
+		}
+	}
 
 	GPointer(const GPointer<T, Deleter>& g2) :
 		data(NULL),
@@ -87,6 +95,7 @@ public:
 			// Store local copies before nulling members
 			T* dataToDelete = data;
 			unsigned int* countToDelete = refCount;
+			pthread_mutex_t* mutexToDelete = refMutex;
 			
 			// Null members first
 			data = NULL;
@@ -99,6 +108,11 @@ public:
 				Deleter(dataToDelete);
 			}
 			delete countToDelete;
+			if (mutexToDelete)
+			{
+				pthread_mutex_destroy(mutexToDelete);
+				delete mutexToDelete;
+			}
 		} else {
 			// Just null our references
 			data = NULL;
@@ -116,18 +130,30 @@ public:
 	{
 		if (refCount)
 		{
+			if (refMutex)
+				pthread_mutex_lock(refMutex);
 			++(*refCount);
+			unsigned int v = *refCount;
+			if (refMutex)
+				pthread_mutex_unlock(refMutex);
+			return v;
 		}
-		return refCount ? *refCount : 0;
+		return 0;
 	}
 
 	unsigned int decrement()
 	{
 		if (refCount)
 		{
+			if (refMutex)
+				pthread_mutex_lock(refMutex);
 			--(*refCount);
+			unsigned int v = *refCount;
+			if (refMutex)
+				pthread_mutex_unlock(refMutex);
+			return v;
 		}
-		return refCount ? *refCount : 0;
+		return 0;
 	}
 
 	T& operator*()
