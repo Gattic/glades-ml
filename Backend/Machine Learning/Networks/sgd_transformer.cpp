@@ -2,6 +2,7 @@
 #include "network.h"
 #include "sgd_utils.h"
 #include "transformer_kernels.h"
+#include "glades_thread_pool.h"
 
 #include "Backend/Database/GLogger.h"
 
@@ -18,6 +19,32 @@
 using namespace glades;
 
 namespace {
+
+// Forward declarations for parallel helpers (defined below after context structs).
+struct LinearFwdCtx;
+static void linear_fwd_body(void* ud, unsigned int begin, unsigned int end);
+static void linear_forward_opt_parallel(const float* X, unsigned int T, unsigned int inSize,
+                                        const std::vector<float>& W, const std::vector<float>& b,
+                                        unsigned int outSize, float* Y);
+
+struct LinearBwdGWCtx;
+static void linear_bwd_gw_body(void* ud, unsigned int begin, unsigned int end);
+
+// LinearBwdDXCtx needs full definition here because linear_backward_accum_maybe_lowp uses it.
+struct LinearBwdDXCtx
+{
+	const float* dY;
+	const float* W;
+	unsigned int inSize;
+	unsigned int outSize;
+	float* dX;
+};
+static void linear_bwd_dx_body(void* ud, unsigned int begin, unsigned int end);
+
+static void linear_backward_accum_parallel(const float* X, const float* dY, unsigned int T,
+                                           unsigned int inSize, unsigned int outSize,
+                                           std::vector<float>& gW, std::vector<float>& gB,
+                                           const std::vector<float>& W, float* dXOut);
 
 static inline float clip_maybe(float v, float limit)
 {
@@ -97,17 +124,18 @@ static void linear_forward_maybe_lowp(const float* X,
 		if (WLowp.size() == static_cast<size_t>(outSize) * static_cast<size_t>(inSize))
 			glades::transformer_kernels::linear_forward_lowp(X, T, inSize, &WLowp[0], lowpDType, b, outSize, Y);
 		else
-			glades::transformer_kernels::linear_forward_opt(X, T, inSize, W, b, outSize, Y);
+			linear_forward_opt_parallel(X, T, inSize, W, b, outSize, Y);
 	}
 	else
 	{
-		glades::transformer_kernels::linear_forward_opt(X, T, inSize, W, b, outSize, Y);
+		linear_forward_opt_parallel(X, T, inSize, W, b, outSize, Y);
 	}
 }
 
 // Backprop linear:
 // - Accumulate gW += dY^T * X, gB += sum_t dY
 // - dX += dY * W  (W is [out,in])
+// Uses parallel_backward_accum_parallel for both gW/gB (over output rows) and dX (over timesteps).
 static void linear_backward_accum(const float* X,
                                   const float* dY,
                                   unsigned int T,
@@ -118,40 +146,7 @@ static void linear_backward_accum(const float* X,
                                   const std::vector<float>& W,
                                   float* dXOut /* optional; size [T*inSize] */)
 {
-	if (gW.size() != static_cast<size_t>(outSize) * static_cast<size_t>(inSize))
-		gW.assign(static_cast<size_t>(outSize) * static_cast<size_t>(inSize), 0.0f);
-	if (gB.size() != outSize)
-		gB.assign(outSize, 0.0f);
-
-	if (dXOut)
-		std::fill(dXOut, dXOut + (static_cast<size_t>(T) * static_cast<size_t>(inSize)), 0.0f);
-
-	for (unsigned int t = 0; t < T; ++t)
-	{
-		const size_t xOff = static_cast<size_t>(t) * static_cast<size_t>(inSize);
-		const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
-		for (unsigned int o = 0; o < outSize; ++o)
-		{
-			const float dy = dY[dyOff + o];
-			gB[o] += dy;
-			const size_t wOff = static_cast<size_t>(o) * static_cast<size_t>(inSize);
-			for (unsigned int i = 0; i < inSize; ++i)
-				gW[wOff + i] += dy * X[xOff + i];
-		}
-
-		if (dXOut)
-		{
-			const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(inSize);
-			for (unsigned int i = 0; i < inSize; ++i)
-			{
-				double acc = 0.0;
-				for (unsigned int o = 0; o < outSize; ++o)
-					acc += static_cast<double>(dY[dyOff + o]) *
-					       static_cast<double>(W[static_cast<size_t>(o) * static_cast<size_t>(inSize) + i]);
-				dXOut[dxOff + i] += static_cast<float>(acc);
-			}
-		}
-	}
+	linear_backward_accum_parallel(X, dY, T, inSize, outSize, gW, gB, W, dXOut);
 }
 
 static void linear_backward_accum_maybe_lowp(const float* X,
@@ -175,20 +170,54 @@ static void linear_backward_accum_maybe_lowp(const float* X,
 	std::fill(dXOut, dXOut + (static_cast<size_t>(T) * static_cast<size_t>(inSize)), 0.0f);
 
 	const bool haveLowp = useLowp && (WLowp.size() == static_cast<size_t>(outSize) * static_cast<size_t>(inSize));
-	for (unsigned int t = 0; t < T; ++t)
+	if (!haveLowp)
 	{
-		const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
-		const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(inSize);
-		for (unsigned int i = 0; i < inSize; ++i)
+		// Fast path: FP32 weights — parallel over timesteps.
+		const bool worthParallel = (static_cast<unsigned long long>(T) * outSize * inSize >= 500000ULL);
+		glades::ThreadPool& pool = glades::ThreadPool::instance();
+		if (worthParallel && T > 1u && pool.numThreads() > 1u)
 		{
-			double acc = 0.0;
+			LinearBwdDXCtx ctx;
+			ctx.dY = dY;
+			ctx.W = WMaster.empty() ? NULL : &WMaster[0];
+			ctx.inSize = inSize;
+			ctx.outSize = outSize;
+			ctx.dX = dXOut;
+			pool.parallel_for(T, linear_bwd_dx_body, &ctx);
+		}
+		else
+		{
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
+				const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(inSize);
+				for (unsigned int o = 0; o < outSize; ++o)
+				{
+					const float dy = dY[dyOff + o];
+					glades::transformer_kernels::axpy_f32(
+					    dXOut + dxOff,
+					    &WMaster[static_cast<size_t>(o) * static_cast<size_t>(inSize)],
+					    dy, inSize);
+				}
+			}
+		}
+	}
+	else
+	{
+		// Low-precision path: convert row-by-row for cache-friendly access, then SIMD axpy.
+		std::vector<float> wRowBuf(inSize);
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
+			const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(inSize);
 			for (unsigned int o = 0; o < outSize; ++o)
 			{
-				const size_t wIdx = static_cast<size_t>(o) * static_cast<size_t>(inSize) + static_cast<size_t>(i);
-				const float w = haveLowp ? glades::transformer_kernels::lowp_to_float(WLowp[wIdx], lowpDType) : WMaster[wIdx];
-				acc += static_cast<double>(dY[dyOff + o]) * static_cast<double>(w);
+				const float dy = dY[dyOff + o];
+				const size_t wRowOff = static_cast<size_t>(o) * static_cast<size_t>(inSize);
+				for (unsigned int i = 0; i < inSize; ++i)
+					wRowBuf[i] = glades::transformer_kernels::lowp_to_float(WLowp[wRowOff + i], lowpDType);
+				glades::transformer_kernels::axpy_f32(dXOut + dxOff, &wRowBuf[0], dy, inSize);
 			}
-			dXOut[dxOff + i] += static_cast<float>(acc);
 		}
 	}
 }
@@ -197,6 +226,413 @@ static void linear_backward_accum_maybe_lowp(const float* X,
 // share math conventions and future optimized kernels can be dropped in behind a stable API.
 
 // RoPE helpers moved to transformer_kernels.h (shared by train + inference).
+
+// ---- Parallel context structs and body functions ----
+
+// Region A: Multi-head attention forward
+struct AttnFwdCtx
+{
+	const float* Q;
+	const float* K;
+	const float* V;
+	float* O;
+	unsigned int dModel;
+	unsigned int dModelKV;
+	unsigned int dHead;
+	unsigned int nHeads;
+	unsigned int nKVHeads;
+	unsigned int T;
+	unsigned int groupSize;
+	bool causal;
+	const unsigned char* keyAllowed;
+};
+
+static void attn_fwd_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const AttnFwdCtx& c = *static_cast<const AttnFwdCtx*>(ud);
+	for (unsigned int h = begin; h < end; ++h)
+	{
+		const unsigned int kvHead = (c.nKVHeads == c.nHeads) ? h : (c.groupSize > 0u ? (h / c.groupSize) : 0u);
+		glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
+		    c.Q + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.dModel,
+		    c.K + static_cast<size_t>(kvHead) * static_cast<size_t>(c.dHead),
+		    c.dModelKV,
+		    c.V + static_cast<size_t>(kvHead) * static_cast<size_t>(c.dHead),
+		    c.dModelKV,
+		    c.T,
+		    c.dHead,
+		    c.dHead,
+		    c.causal,
+		    c.O + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.dModel,
+		    c.keyAllowed);
+	}
+}
+
+// Region B: Multi-head attention backward (parallelized over KV head groups)
+struct AttnBwdCtx
+{
+	const float* Q;
+	const float* K;
+	const float* V;
+	const float* dO;
+	float* dQ;
+	float* dK;
+	float* dV;
+	unsigned int dModel;
+	unsigned int dModelKV;
+	unsigned int dHead;
+	unsigned int nHeads;
+	unsigned int nKVHeads;
+	unsigned int T;
+	unsigned int groupSize;
+	bool causal;
+	const unsigned char* keyAllowed;
+};
+
+static void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const AttnBwdCtx& c = *static_cast<const AttnBwdCtx*>(ud);
+	for (unsigned int kvh = begin; kvh < end; ++kvh)
+	{
+		const unsigned int hStart = kvh * c.groupSize;
+		const unsigned int hEnd = hStart + c.groupSize;
+		for (unsigned int h = hStart; h < hEnd && h < c.nHeads; ++h)
+		{
+			glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
+			    c.Q + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+			    c.dModel,
+			    c.K + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+			    c.dModelKV,
+			    c.V + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+			    c.dModelKV,
+			    c.dO + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+			    c.dModel,
+			    c.T,
+			    c.dHead,
+			    c.dHead,
+			    c.causal,
+			    c.dQ + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+			    c.dModel,
+			    c.dK + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+			    c.dModelKV,
+			    c.dV + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+			    c.dModelKV,
+			    c.keyAllowed);
+		}
+	}
+}
+
+// Region C: Linear forward parallel (over timesteps)
+struct LinearFwdCtx
+{
+	const float* X;
+	unsigned int inSize;
+	const float* W;
+	const float* b;
+	unsigned int outSize;
+	unsigned int bSize;
+	float* Y;
+};
+
+static void linear_fwd_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const LinearFwdCtx& c = *static_cast<const LinearFwdCtx*>(ud);
+	for (unsigned int t = begin; t < end; ++t)
+	{
+		const float* xt = c.X + static_cast<size_t>(t) * static_cast<size_t>(c.inSize);
+		float* yt = c.Y + static_cast<size_t>(t) * static_cast<size_t>(c.outSize);
+		// Inline GEMV: yt[o] = b[o] + sum_i W[o*inSize+i] * xt[i]
+		for (unsigned int o = 0; o < c.outSize; ++o)
+		{
+			double acc = (o < c.bSize) ? static_cast<double>(c.b[o]) : 0.0;
+			const float* wRow = c.W + static_cast<size_t>(o) * static_cast<size_t>(c.inSize);
+			acc += static_cast<double>(glades::transformer_kernels::dot_f32(xt, wRow, c.inSize));
+			yt[o] = static_cast<float>(acc);
+		}
+	}
+}
+
+static void linear_forward_opt_parallel(const float* X,
+                                        unsigned int T,
+                                        unsigned int inSize,
+                                        const std::vector<float>& W,
+                                        const std::vector<float>& b,
+                                        unsigned int outSize,
+                                        float* Y)
+{
+	if (!X || !Y || T == 0u || inSize == 0u || outSize == 0u)
+		return;
+
+	const bool worthParallel = (static_cast<unsigned long long>(T) * outSize * inSize >= 500000ULL);
+	glades::ThreadPool& pool = glades::ThreadPool::instance();
+	if (worthParallel && T > 1u && pool.numThreads() > 1u)
+	{
+		LinearFwdCtx ctx;
+		ctx.X = X;
+		ctx.inSize = inSize;
+		ctx.W = W.empty() ? NULL : &W[0];
+		ctx.b = b.empty() ? NULL : &b[0];
+		ctx.bSize = static_cast<unsigned int>(b.size());
+		ctx.outSize = outSize;
+		ctx.Y = Y;
+		pool.parallel_for(T, linear_fwd_body, &ctx);
+	}
+	else
+	{
+		glades::transformer_kernels::linear_forward_opt(X, T, inSize, W, b, outSize, Y);
+	}
+}
+
+// Region D: Linear backward gW/gB accumulation (parallel over output rows)
+struct LinearBwdGWCtx
+{
+	const float* X;
+	const float* dY;
+	unsigned int T;
+	unsigned int inSize;
+	unsigned int outSize;
+	float* gW;
+	float* gB;
+};
+
+static void linear_bwd_gw_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const LinearBwdGWCtx& c = *static_cast<const LinearBwdGWCtx*>(ud);
+	for (unsigned int o = begin; o < end; ++o)
+	{
+		float* gWrow = c.gW + static_cast<size_t>(o) * static_cast<size_t>(c.inSize);
+		float gbAcc = 0.0f;
+		for (unsigned int t = 0; t < c.T; ++t)
+		{
+			const float dy = c.dY[static_cast<size_t>(t) * static_cast<size_t>(c.outSize) + o];
+			gbAcc += dy;
+			glades::transformer_kernels::axpy_f32(gWrow,
+			    c.X + static_cast<size_t>(t) * static_cast<size_t>(c.inSize), dy, c.inSize);
+		}
+		c.gB[o] += gbAcc;
+	}
+}
+
+// Region E: Linear backward dX computation (parallel over timesteps)
+// LinearBwdDXCtx defined above (forward declaration section).
+
+static void linear_bwd_dx_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const LinearBwdDXCtx& c = *static_cast<const LinearBwdDXCtx*>(ud);
+	for (unsigned int t = begin; t < end; ++t)
+	{
+		const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(c.outSize);
+		const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(c.inSize);
+		for (unsigned int o = 0; o < c.outSize; ++o)
+		{
+			const float dy = c.dY[dyOff + o];
+			glades::transformer_kernels::axpy_f32(
+			    c.dX + dxOff,
+			    &c.W[static_cast<size_t>(o) * static_cast<size_t>(c.inSize)],
+			    dy, c.inSize);
+		}
+	}
+}
+
+// Region F: RoPE forward/backward parallel (over heads)
+struct RopeFwdCtx
+{
+	float* buf;
+	unsigned int T;
+	unsigned int rowStride;
+	unsigned int dHead;
+	unsigned int ropeDim;
+	const std::vector<double>* invFreq;
+	bool inverse;
+};
+
+static void rope_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const RopeFwdCtx& c = *static_cast<const RopeFwdCtx*>(ud);
+	for (unsigned int h = begin; h < end; ++h)
+	{
+		glades::transformer_kernels::rope_apply_inplace_strided(
+		    c.buf + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.T, c.rowStride, c.dHead, c.ropeDim, *c.invFreq, c.inverse);
+	}
+}
+
+// Region G: LayerNorm/RMSNorm forward parallel (over timesteps)
+struct NormFwdCtx
+{
+	const float* X;
+	unsigned int D;
+	const float* gamma;
+	const float* beta;
+	unsigned int gammaSize;
+	unsigned int betaSize;
+	float eps;
+	float* Y;
+	float* meanOut;  // NULL for RMSNorm
+	float* invStdOut;
+	bool isRmsNorm;
+};
+
+static void norm_fwd_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const NormFwdCtx& c = *static_cast<const NormFwdCtx*>(ud);
+	for (unsigned int t = begin; t < end; ++t)
+	{
+		const size_t off = static_cast<size_t>(t) * static_cast<size_t>(c.D);
+		if (c.isRmsNorm)
+		{
+			double sumsq = 0.0;
+			for (unsigned int i = 0; i < c.D; ++i)
+			{
+				const double xd = static_cast<double>(c.X[off + i]);
+				sumsq += xd * xd;
+			}
+			const double mean2 = sumsq / static_cast<double>(c.D);
+			const double invRms = 1.0 / sqrt(mean2 + static_cast<double>(c.eps));
+			c.invStdOut[t] = static_cast<float>(invRms);
+			for (unsigned int i = 0; i < c.D; ++i)
+			{
+				const float g = (i < c.gammaSize) ? c.gamma[i] : 1.0f;
+				const float b = (i < c.betaSize) ? c.beta[i] : 0.0f;
+				c.Y[off + i] = (c.X[off + i] * static_cast<float>(invRms)) * g + b;
+			}
+		}
+		else
+		{
+			double sum = 0.0;
+			for (unsigned int i = 0; i < c.D; ++i)
+				sum += static_cast<double>(c.X[off + i]);
+			const double mean = sum / static_cast<double>(c.D);
+			double var = 0.0;
+			for (unsigned int i = 0; i < c.D; ++i)
+			{
+				const double d = static_cast<double>(c.X[off + i]) - mean;
+				var += d * d;
+			}
+			var /= static_cast<double>(c.D);
+			const double invStd = 1.0 / sqrt(var + static_cast<double>(c.eps));
+			if (c.meanOut)
+				c.meanOut[t] = static_cast<float>(mean);
+			c.invStdOut[t] = static_cast<float>(invStd);
+			for (unsigned int i = 0; i < c.D; ++i)
+			{
+				const float xn = static_cast<float>((static_cast<double>(c.X[off + i]) - mean) * invStd);
+				const float g = (i < c.gammaSize) ? c.gamma[i] : 1.0f;
+				const float b = (i < c.betaSize) ? c.beta[i] : 0.0f;
+				c.Y[off + i] = xn * g + b;
+			}
+		}
+	}
+}
+
+// Region H: Tied embedding logits forward parallel (over timesteps)
+struct TiedEmbLogitsCtx
+{
+	const float* H;
+	unsigned int dModel;
+	const float* tokE;
+	const float* lmBias;
+	unsigned int lmBiasSize;
+	unsigned int vocab;
+	float* logitsOut;
+};
+
+static void tied_emb_logits_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const TiedEmbLogitsCtx& c = *static_cast<const TiedEmbLogitsCtx*>(ud);
+	for (unsigned int t = begin; t < end; ++t)
+	{
+		const float* ht = c.H + static_cast<size_t>(t) * static_cast<size_t>(c.dModel);
+		float* zt = c.logitsOut + static_cast<size_t>(t) * static_cast<size_t>(c.vocab);
+		glades::transformer_kernels::gemv_rowmajor_bias_block4_unroll8_into(
+		    ht, c.dModel, c.tokE, c.vocab,
+		    c.lmBias, c.lmBiasSize, zt);
+	}
+}
+
+// Parallel wrappers for backward linear (split gW/gB and dX phases)
+static void linear_backward_accum_parallel(const float* X,
+                                           const float* dY,
+                                           unsigned int T,
+                                           unsigned int inSize,
+                                           unsigned int outSize,
+                                           std::vector<float>& gW,
+                                           std::vector<float>& gB,
+                                           const std::vector<float>& W,
+                                           float* dXOut)
+{
+	if (gW.size() != static_cast<size_t>(outSize) * static_cast<size_t>(inSize))
+		gW.assign(static_cast<size_t>(outSize) * static_cast<size_t>(inSize), 0.0f);
+	if (gB.size() != outSize)
+		gB.assign(outSize, 0.0f);
+
+	const bool worthParallel = (static_cast<unsigned long long>(T) * outSize * inSize >= 500000ULL);
+	glades::ThreadPool& pool = glades::ThreadPool::instance();
+	const bool doParallel = worthParallel && pool.numThreads() > 1u;
+
+	// gW/gB accumulation: parallel over output rows
+	if (doParallel && outSize > 1u)
+	{
+		LinearBwdGWCtx ctx;
+		ctx.X = X;
+		ctx.dY = dY;
+		ctx.T = T;
+		ctx.inSize = inSize;
+		ctx.outSize = outSize;
+		ctx.gW = &gW[0];
+		ctx.gB = &gB[0];
+		pool.parallel_for(outSize, linear_bwd_gw_body, &ctx);
+	}
+	else
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const size_t xOff = static_cast<size_t>(t) * static_cast<size_t>(inSize);
+			const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
+			for (unsigned int o = 0; o < outSize; ++o)
+			{
+				const float dy = dY[dyOff + o];
+				gB[o] += dy;
+				glades::transformer_kernels::axpy_f32(
+				    &gW[static_cast<size_t>(o) * static_cast<size_t>(inSize)],
+				    X + xOff, dy, inSize);
+			}
+		}
+	}
+
+	// dX computation: parallel over timesteps
+	if (!dXOut)
+		return;
+	std::fill(dXOut, dXOut + (static_cast<size_t>(T) * static_cast<size_t>(inSize)), 0.0f);
+	if (doParallel && T > 1u)
+	{
+		LinearBwdDXCtx ctx;
+		ctx.dY = dY;
+		ctx.W = W.empty() ? NULL : &W[0];
+		ctx.inSize = inSize;
+		ctx.outSize = outSize;
+		ctx.dX = dXOut;
+		pool.parallel_for(T, linear_bwd_dx_body, &ctx);
+	}
+	else
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
+			const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(inSize);
+			for (unsigned int o = 0; o < outSize; ++o)
+			{
+				const float dy = dY[dyOff + o];
+				glades::transformer_kernels::axpy_f32(
+				    dXOut + dxOff,
+				    &W[static_cast<size_t>(o) * static_cast<size_t>(inSize)],
+				    dy, inSize);
+			}
+		}
+	}
+}
 
 } // namespace
 
@@ -1325,15 +1761,37 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			float* x1 = transformerScratch.x1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 			float* ln1Mean = transformerScratch.ln1Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
 			float* ln1InvStd = transformerScratch.ln1InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			// Region G: LayerNorm/RMSNorm forward (parallel over timesteps)
 			{
-				// Store invRms in ln1InvStd; ln1Mean is unused for RMSNorm.
-				std::fill(ln1Mean, ln1Mean + T, 0.0f);
-				glades::transformer_kernels::rmsnorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1InvStd);
-			}
-			else
-			{
-				glades::transformer_kernels::layernorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1Mean, ln1InvStd);
+				const bool normWorthParallel = (static_cast<unsigned long long>(T) * dModel >= 65536ULL);
+				glades::ThreadPool& pool = glades::ThreadPool::instance();
+				if (normWorthParallel && T > 1u && pool.numThreads() > 1u)
+				{
+					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+						std::fill(ln1Mean, ln1Mean + T, 0.0f);
+					NormFwdCtx nctx;
+					nctx.X = hIn;
+					nctx.D = dModel;
+					nctx.gamma = b.ln1Gamma.empty() ? NULL : &b.ln1Gamma[0];
+					nctx.beta = b.ln1Beta.empty() ? NULL : &b.ln1Beta[0];
+					nctx.gammaSize = static_cast<unsigned int>(b.ln1Gamma.size());
+					nctx.betaSize = static_cast<unsigned int>(b.ln1Beta.size());
+					nctx.eps = lnEps;
+					nctx.Y = x1;
+					nctx.meanOut = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM)) ? NULL : ln1Mean;
+					nctx.invStdOut = ln1InvStd;
+					nctx.isRmsNorm = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM));
+					pool.parallel_for(T, norm_fwd_body, &nctx);
+				}
+				else if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+				{
+					std::fill(ln1Mean, ln1Mean + T, 0.0f);
+					glades::transformer_kernels::rmsnorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1InvStd);
+				}
+				else
+				{
+					glades::transformer_kernels::layernorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1Mean, ln1InvStd);
+				}
 			}
 
 			float* Q = transformerScratch.Q.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
@@ -1344,40 +1802,105 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			linear_forward_maybe_lowp(x1, T, dModel, b.Wk, b.WkLowp, useLowpWeights, lowpDType, b.bk, dModelKV, K);
 			linear_forward_maybe_lowp(x1, T, dModel, b.Wv, b.WvLowp, useLowpWeights, lowpDType, b.bv, dModelKV, V);
 
-			// RoPE on Q/K (in-place) if enabled.
-			// IMPORTANT: We rotate the packed Q/K buffers directly to avoid per-head gather/scatter.
-			// Backprop will invert-rotate gradients back into the linear-projection space.
+			// Region F: RoPE on Q/K (in-place) if enabled — parallel over heads.
 			if (useRope && ropeInvFreq)
 			{
-				for (unsigned int h = 0; h < nHeads; ++h)
-					glades::transformer_kernels::rope_apply_inplace_strided(
-					    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, /*inverse*/ false);
-				for (unsigned int hk = 0; hk < nKVHeads; ++hk)
-					glades::transformer_kernels::rope_apply_inplace_strided(
-					    K + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, /*inverse*/ false);
+				const bool ropeWorthParallel = (static_cast<unsigned long long>(T) * ropeDim >= 4096ULL);
+				glades::ThreadPool& pool = glades::ThreadPool::instance();
+				if (ropeWorthParallel && pool.numThreads() > 1u)
+				{
+					if (nHeads > 1u)
+					{
+						RopeFwdCtx rctx;
+						rctx.buf = Q;
+						rctx.T = T;
+						rctx.rowStride = dModel;
+						rctx.dHead = dHead;
+						rctx.ropeDim = ropeDim;
+						rctx.invFreq = ropeInvFreq;
+						rctx.inverse = false;
+						pool.parallel_for(nHeads, rope_body, &rctx);
+					}
+					else
+					{
+						glades::transformer_kernels::rope_apply_inplace_strided(Q, T, dModel, dHead, ropeDim, *ropeInvFreq, false);
+					}
+					if (nKVHeads > 1u)
+					{
+						RopeFwdCtx rctx;
+						rctx.buf = K;
+						rctx.T = T;
+						rctx.rowStride = dModelKV;
+						rctx.dHead = dHead;
+						rctx.ropeDim = ropeDim;
+						rctx.invFreq = ropeInvFreq;
+						rctx.inverse = false;
+						pool.parallel_for(nKVHeads, rope_body, &rctx);
+					}
+					else
+					{
+						for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+							glades::transformer_kernels::rope_apply_inplace_strided(
+							    K + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, false);
+					}
+				}
+				else
+				{
+					for (unsigned int h = 0; h < nHeads; ++h)
+						glades::transformer_kernels::rope_apply_inplace_strided(
+						    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, false);
+					for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+						glades::transformer_kernels::rope_apply_inplace_strided(
+						    K + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, false);
+				}
 			}
 
-			// Multi-head attention: for each head compute attention and concatenate.
+			// Region A: Multi-head attention forward — parallel over heads.
 			float* attnConcat = transformerScratch.attnConcat.data() +
 			                    (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 			std::fill(attnConcat, attnConcat + (static_cast<size_t>(T) * static_cast<size_t>(dModel)), 0.0f);
-			for (unsigned int h = 0; h < nHeads; ++h)
 			{
-				const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
-				glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
-				    /*Qbase*/ Q + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-				    /*qStride*/ dModel,
-				    /*Kbase*/ K + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-				    /*kStride*/ dModelKV,
-				    /*Vbase*/ V + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-				    /*vStride*/ dModelKV,
-				    T,
-				    /*dK*/ dHead,
-				    /*dV*/ dHead,
-				    causal,
-				    /*Obase*/ attnConcat + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-				    /*oStride*/ dModel,
-				    keyAllowed.empty() ? NULL : &keyAllowed[0]);
+				const bool attnWorthParallel = (static_cast<unsigned long long>(T) * T * dHead >= 32768ULL);
+				glades::ThreadPool& pool = glades::ThreadPool::instance();
+				if (attnWorthParallel && nHeads > 1u && pool.numThreads() > 1u)
+				{
+					AttnFwdCtx actx;
+					actx.Q = Q;
+					actx.K = K;
+					actx.V = V;
+					actx.O = attnConcat;
+					actx.dModel = dModel;
+					actx.dModelKV = dModelKV;
+					actx.dHead = dHead;
+					actx.nHeads = nHeads;
+					actx.nKVHeads = nKVHeads;
+					actx.T = T;
+					actx.groupSize = groupSize;
+					actx.causal = causal;
+					actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
+					pool.parallel_for(nHeads, attn_fwd_body, &actx);
+				}
+				else
+				{
+					for (unsigned int h = 0; h < nHeads; ++h)
+					{
+						const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
+						glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
+						    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead),
+						    dModel,
+						    K + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
+						    dModelKV,
+						    V + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
+						    dModelKV,
+						    T,
+						    dHead,
+						    dHead,
+						    causal,
+						    attnConcat + static_cast<size_t>(h) * static_cast<size_t>(dHead),
+						    dModel,
+						    keyAllowed.empty() ? NULL : &keyAllowed[0]);
+					}
+				}
 			}
 
 			// Apply Wo
@@ -1389,18 +1912,40 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
 				hAfterAttn[i] = hIn[i] + attnOut[i];
 
-			// LN2
+			// Region G: LN2 forward (parallel over timesteps)
 			float* x2 = transformerScratch.x2.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 			float* ln2Mean = transformerScratch.ln2Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
 			float* ln2InvStd = transformerScratch.ln2InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
 			{
-				std::fill(ln2Mean, ln2Mean + T, 0.0f);
-				glades::transformer_kernels::rmsnorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2InvStd);
-			}
-			else
-			{
-				glades::transformer_kernels::layernorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2Mean, ln2InvStd);
+				const bool normWorthParallel = (static_cast<unsigned long long>(T) * dModel >= 65536ULL);
+				glades::ThreadPool& pool = glades::ThreadPool::instance();
+				if (normWorthParallel && T > 1u && pool.numThreads() > 1u)
+				{
+					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+						std::fill(ln2Mean, ln2Mean + T, 0.0f);
+					NormFwdCtx nctx;
+					nctx.X = hAfterAttn;
+					nctx.D = dModel;
+					nctx.gamma = b.ln2Gamma.empty() ? NULL : &b.ln2Gamma[0];
+					nctx.beta = b.ln2Beta.empty() ? NULL : &b.ln2Beta[0];
+					nctx.gammaSize = static_cast<unsigned int>(b.ln2Gamma.size());
+					nctx.betaSize = static_cast<unsigned int>(b.ln2Beta.size());
+					nctx.eps = lnEps;
+					nctx.Y = x2;
+					nctx.meanOut = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM)) ? NULL : ln2Mean;
+					nctx.invStdOut = ln2InvStd;
+					nctx.isRmsNorm = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM));
+					pool.parallel_for(T, norm_fwd_body, &nctx);
+				}
+				else if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+				{
+					std::fill(ln2Mean, ln2Mean + T, 0.0f);
+					glades::transformer_kernels::rmsnorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2InvStd);
+				}
+				else
+				{
+					glades::transformer_kernels::layernorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2Mean, ln2InvStd);
+				}
 			}
 
 			// FFN
@@ -1449,7 +1994,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		{
 			if (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX)
 			{
-				// Token LM tied embedding head: logits[t, v] = dot(hFinal[t], E[v]) + lmBias[v]
+				// Region H: Token LM tied embedding head — parallel over timesteps.
 				if (useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty())
 				{
 					glades::transformer_kernels::tied_embedding_logits_forward_rows_lowp(hFinal, T, dModel, &tt.tokELowp[0], lowpDType, tt.lmBias,
@@ -1457,8 +2002,25 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				}
 				else
 				{
-					glades::transformer_kernels::tied_embedding_logits_forward_rows(hFinal, T, dModel, tt.tokE, tt.lmBias, vocabSize,
-					                                                               transformerScratch.logits.data());
+					const bool embWorthParallel = (static_cast<unsigned long long>(T) * vocabSize * dModel >= 500000ULL);
+					glades::ThreadPool& pool = glades::ThreadPool::instance();
+					if (embWorthParallel && T > 1u && pool.numThreads() > 1u)
+					{
+						TiedEmbLogitsCtx ectx;
+						ectx.H = hFinal;
+						ectx.dModel = dModel;
+						ectx.tokE = tt.tokE.empty() ? NULL : &tt.tokE[0];
+						ectx.lmBias = tt.lmBias.empty() ? NULL : &tt.lmBias[0];
+						ectx.lmBiasSize = static_cast<unsigned int>(tt.lmBias.size());
+						ectx.vocab = vocabSize;
+						ectx.logitsOut = transformerScratch.logits.data();
+						pool.parallel_for(T, tied_emb_logits_body, &ectx);
+					}
+					else
+					{
+						glades::transformer_kernels::tied_embedding_logits_forward_rows(hFinal, T, dModel, tt.tokE, tt.lmBias, vocabSize,
+						                                                               transformerScratch.logits.data());
+					}
 				}
 			}
 			else
@@ -1947,42 +2509,112 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				std::fill(dQfull.begin(), dQfull.end(), 0.0f);
 				std::fill(dKfull.begin(), dKfull.end(), 0.0f);
 				std::fill(dVfull.begin(), dVfull.end(), 0.0f);
-				for (unsigned int h = 0; h < nHeads; ++h)
+				// Region B: Attention backward — parallel over KV head groups.
 				{
-					const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
-					glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
-					    /*Qbase*/ Qfull + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-					    /*qStride*/ dModel,
-					    /*Kbase*/ Kfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-					    /*kStride*/ dModelKV,
-					    /*Vbase*/ Vfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-					    /*vStride*/ dModelKV,
-					    /*dObase*/ dAttnConcat.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-					    /*dOStride*/ dModel,
-					    T,
-					    /*dK*/ dHead,
-					    /*dV*/ dHead,
-					    causal,
-					    /*dQbase*/ dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-					    /*dQStride*/ dModel,
-					    /*dKbase*/ dKfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-					    /*dKStride*/ dModelKV,
-					    /*dVbase*/ dVfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-					    /*dVStride*/ dModelKV,
-					    keyAllowed.empty() ? NULL : &keyAllowed[0]);
+					const bool attnWorthParallel = (static_cast<unsigned long long>(T) * T * dHead >= 32768ULL);
+					glades::ThreadPool& pool = glades::ThreadPool::instance();
+					if (attnWorthParallel && nKVHeads > 1u && pool.numThreads() > 1u)
+					{
+						AttnBwdCtx actx;
+						actx.Q = Qfull;
+						actx.K = Kfull;
+						actx.V = Vfull;
+						actx.dO = dAttnConcat.data();
+						actx.dQ = dQfull.data();
+						actx.dK = dKfull.data();
+						actx.dV = dVfull.data();
+						actx.dModel = dModel;
+						actx.dModelKV = dModelKV;
+						actx.dHead = dHead;
+						actx.nHeads = nHeads;
+						actx.nKVHeads = nKVHeads;
+						actx.T = T;
+						actx.groupSize = groupSize;
+						actx.causal = causal;
+						actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
+						pool.parallel_for(nKVHeads, attn_bwd_body, &actx);
+					}
+					else
+					{
+						for (unsigned int h = 0; h < nHeads; ++h)
+						{
+							const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
+							glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
+							    Qfull + static_cast<size_t>(h) * static_cast<size_t>(dHead),
+							    dModel,
+							    Kfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
+							    dModelKV,
+							    Vfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
+							    dModelKV,
+							    dAttnConcat.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
+							    dModel,
+							    T,
+							    dHead,
+							    dHead,
+							    causal,
+							    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
+							    dModel,
+							    dKfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
+							    dModelKV,
+							    dVfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
+							    dModelKV,
+							    keyAllowed.empty() ? NULL : &keyAllowed[0]);
+						}
+					}
 				}
 
-				// Backprop through RoPE rotation (inverse rotation on gradients).
-				// Q/K were rotated in-place before the forward attention, so attention backward produces gradients
-				// in the rotated space; invert-rotate to map gradients back to the linear-projection outputs.
+				// Region F: Backprop through RoPE rotation — parallel over heads.
 				if (useRope && ropeInvFreq)
 				{
-					for (unsigned int h = 0; h < nHeads; ++h)
-						glades::transformer_kernels::rope_apply_inplace_strided(
-						    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, /*inverse*/ true);
-					for (unsigned int hk = 0; hk < nKVHeads; ++hk)
-						glades::transformer_kernels::rope_apply_inplace_strided(
-						    dKfull.data() + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, /*inverse*/ true);
+					const bool ropeWorthParallel = (static_cast<unsigned long long>(T) * ropeDim >= 4096ULL);
+					glades::ThreadPool& pool = glades::ThreadPool::instance();
+					if (ropeWorthParallel && pool.numThreads() > 1u)
+					{
+						if (nHeads > 1u)
+						{
+							RopeFwdCtx rctx;
+							rctx.buf = dQfull.data();
+							rctx.T = T;
+							rctx.rowStride = dModel;
+							rctx.dHead = dHead;
+							rctx.ropeDim = ropeDim;
+							rctx.invFreq = ropeInvFreq;
+							rctx.inverse = true;
+							pool.parallel_for(nHeads, rope_body, &rctx);
+						}
+						else
+						{
+							glades::transformer_kernels::rope_apply_inplace_strided(
+							    dQfull.data(), T, dModel, dHead, ropeDim, *ropeInvFreq, true);
+						}
+						if (nKVHeads > 1u)
+						{
+							RopeFwdCtx rctx;
+							rctx.buf = dKfull.data();
+							rctx.T = T;
+							rctx.rowStride = dModelKV;
+							rctx.dHead = dHead;
+							rctx.ropeDim = ropeDim;
+							rctx.invFreq = ropeInvFreq;
+							rctx.inverse = true;
+							pool.parallel_for(nKVHeads, rope_body, &rctx);
+						}
+						else
+						{
+							for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+								glades::transformer_kernels::rope_apply_inplace_strided(
+								    dKfull.data() + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, true);
+						}
+					}
+					else
+					{
+						for (unsigned int h = 0; h < nHeads; ++h)
+							glades::transformer_kernels::rope_apply_inplace_strided(
+							    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, true);
+						for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+							glades::transformer_kernels::rope_apply_inplace_strided(
+							    dKfull.data() + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, true);
+					}
 				}
 
 				// Backprop Q/K/V linear projections into x1

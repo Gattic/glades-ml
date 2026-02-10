@@ -28,6 +28,7 @@
 #include "Backend/Machine Learning/mapped-dataset-test.h"
 #include "Backend/Machine Learning/transformer-serving-layer-test.h"
 #include "Backend/Machine Learning/prop-fuzz-test.h"
+#include "Backend/Machine Learning/parallel-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -81,6 +82,8 @@ int main(int argc, char* argv[])
 		NNMixedPrecisionUnitTest();
 	    else if (strcmp(argv[1], "prop-fuzz") == 0)
 		PropFuzzUnitTest();
+	    else if (strcmp(argv[1], "parallel") == 0)
+		ParallelUnitTest();
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
 	        OHEUnitTest();
@@ -118,6 +121,7 @@ int main(int argc, char* argv[])
 		    NNSaveLoadUnitTest();
 		    NNMixedPrecisionUnitTest();
 		    PropFuzzUnitTest();
+		    ParallelUnitTest();
         }
 	    else
 		printf("Invalid test: %s\n", argv[1]);
@@ -127,5 +131,5 @@ int main(int argc, char* argv[])
 	printf("| Unit Tests Completed |\n");
 	printf("========================\n");
 
-	pthread_exit(EXIT_SUCCESS);
+	return EXIT_SUCCESS;
 }

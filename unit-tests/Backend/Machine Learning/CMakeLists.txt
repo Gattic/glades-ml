@@ -7,6 +7,7 @@ nn-mixed-precision-test.cpp
 nn-benchmarks.cpp
 transformer-serving-layer-test.cpp
 prop-fuzz-test.cpp
+parallel-test.cpp
 pca-test.cpp
 kmeans-test.cpp
 bayes-test.cpp

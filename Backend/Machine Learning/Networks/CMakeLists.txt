@@ -13,6 +13,7 @@ set(Networks_src_files
 	sgd_gru.cpp
 	sgd_lstm.cpp
 	sgd_transformer.cpp
+	glades_thread_pool.cpp
 	transformer_infer.cpp
 	transformer_generate.cpp
 	transformer_serving_layer.cpp
@@ -24,6 +25,7 @@ set(Networks_src_files
 	transformer_ops.h
 )
 add_library(Networks ${Networks_src_files})
+target_link_libraries(Networks pthread)
 
 install(TARGETS Networks EXPORT gladesConfig
     ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}

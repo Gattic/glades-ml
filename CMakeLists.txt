@@ -11,14 +11,13 @@ set(CMAKE_CXX_STANDARD 98)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 #Compiler Flags
-#set(DEFAULT_BUILD_TYPE "Release")
-set(CMAKE_BUILD_TYPE Debug) # -g
+set(CMAKE_BUILD_TYPE RelWithDebInfo) # -O2 -g
 
 if(WIN32)
 	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static")
 else()
 	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC") # its set below
-	set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter")
+	set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
 endif()
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
@@ -71,7 +70,7 @@ endif()
 
 #Link libraries
 target_link_libraries(${PROJECT_NAME}
-	ML GNet DB) #custom libs
+	ML GNet DB pthread) #custom libs
 
 target_include_directories(glades PRIVATE "include")
 target_include_directories(glades PRIVATE "Backend")

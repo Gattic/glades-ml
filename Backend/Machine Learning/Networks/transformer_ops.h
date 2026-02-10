@@ -16,6 +16,8 @@
 #include <cmath>
 #include <vector>
 
+#include "transformer_kernels.h"
+
 namespace glades {
 namespace transformer_ops {
 
@@ -865,10 +867,7 @@ inline void scaled_dot_product_attention_forward_flash_strided(const float* Qbas
 				continue;
 			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
 
-			double dot = 0.0;
-			for (unsigned int k = 0; k < dK; ++k)
-				dot += static_cast<double>(qt[k]) * static_cast<double>(ku[k]);
-			const float s = static_cast<float>(dot) * invSqrt;
+			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
 
 			if (!any)
 			{
@@ -957,6 +956,13 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 
 	const float invSqrt = 1.0f / static_cast<float>(sqrt(static_cast<double>(dK)));
 
+	// Per-row scratch: cache scores, probabilities, and dP to avoid recomputation across passes.
+	// This trades O(T) memory for eliminating redundant Q*K dot products, dO*V dot products,
+	// and exp() calls across the 3 passes (down from 3x to 1x for Q*K, 2x to 1x for dO*V).
+	std::vector<float> sCache(T);
+	std::vector<float> pCache(T);
+	std::vector<float> dPCache(T);
+
 	for (unsigned int t = 0; t < T; ++t)
 	{
 		const float* qt = Qbase + static_cast<size_t>(t) * static_cast<size_t>(qStride);
@@ -965,19 +971,20 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 
 		const unsigned int maxU = causal ? t : (T - 1u);
 
-		// Pass 1: compute softmax normalizer (m, l) online.
+		// Pass 1: compute scores (cached) and softmax normalizer (m, l) online.
 		float m = -1e30f;
 		double l = 0.0;
 		bool any = false;
 		for (unsigned int u = 0; u <= maxU; ++u)
 		{
 			if (keyAllowed && keyAllowed[u] == 0u)
+			{
+				sCache[u] = -1e30f;
 				continue;
+			}
 			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
-			double dot = 0.0;
-			for (unsigned int k = 0; k < dK; ++k)
-				dot += static_cast<double>(qt[k]) * static_cast<double>(ku[k]);
-			const float s = static_cast<float>(dot) * invSqrt;
+			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
+			sCache[u] = s;
 
 			if (!any)
 			{
@@ -999,64 +1006,49 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 		}
 		const double invL = 1.0 / l;
 
-		// Pass 2: accumulate rowDot and dV.
+		// Pass 2: accumulate dV and rowDot using cached scores.
+		// Cache probabilities and dP for reuse in pass 3.
 		double rowDot = 0.0;
 		for (unsigned int u = 0; u <= maxU; ++u)
 		{
 			if (keyAllowed && keyAllowed[u] == 0u)
+			{
+				pCache[u] = 0.0f;
+				dPCache[u] = 0.0f;
 				continue;
-			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
-			double dotQK = 0.0;
-			for (unsigned int k = 0; k < dK; ++k)
-				dotQK += static_cast<double>(qt[k]) * static_cast<double>(ku[k]);
-			const float s = static_cast<float>(dotQK) * invSqrt;
-			const double p = exp(static_cast<double>(s - m)) * invL;
+			}
+			const double p = exp(static_cast<double>(sCache[u] - m)) * invL;
+			const float pf = static_cast<float>(p);
+			pCache[u] = pf;
 
 			// dP = dot(dO[t], V[u])
 			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
-			double dP = 0.0;
-			for (unsigned int dv = 0; dv < dV; ++dv)
-				dP += static_cast<double>(dOt[dv]) * static_cast<double>(vu[dv]);
-			rowDot += p * dP;
+			const float dP = glades::transformer_kernels::dot_f32(dOt, vu, dV);
+			dPCache[u] = dP;
+			rowDot += p * static_cast<double>(dP);
 
 			// dV[u] += p * dO[t]
 			float* dVu = dVbase + static_cast<size_t>(u) * static_cast<size_t>(dVStride);
-			const float pf = static_cast<float>(p);
-			for (unsigned int dv = 0; dv < dV; ++dv)
-				dVu[dv] += pf * dOt[dv];
+			glades::transformer_kernels::axpy_f32(dVu, dOt, pf, dV);
 		}
 
-		// Pass 3: dQ and dK from dScores.
+		// Pass 3: dQ and dK from dScores, using cached p and dP.
 		for (unsigned int u = 0; u <= maxU; ++u)
 		{
 			if (keyAllowed && keyAllowed[u] == 0u)
 				continue;
-			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
-			double dotQK = 0.0;
-			for (unsigned int k = 0; k < dK; ++k)
-				dotQK += static_cast<double>(qt[k]) * static_cast<double>(ku[k]);
-			const float s = static_cast<float>(dotQK) * invSqrt;
-			const double p = exp(static_cast<double>(s - m)) * invL;
-			const float pf = static_cast<float>(p);
+			const float pf = pCache[u];
 			if (pf == 0.0f)
 				continue;
 
-			// dP = dot(dO[t], V[u]) again (no scratch)
-			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
-			double dP = 0.0;
-			for (unsigned int dv = 0; dv < dV; ++dv)
-				dP += static_cast<double>(dOt[dv]) * static_cast<double>(vu[dv]);
-
-			const float ds = (pf * (static_cast<float>(dP - rowDot))) * invSqrt;
+			const float ds = (pf * static_cast<float>(static_cast<double>(dPCache[u]) - rowDot)) * invSqrt;
 			if (ds == 0.0f)
 				continue;
 
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
 			float* dKu = dKbase + static_cast<size_t>(u) * static_cast<size_t>(dKStride);
-			for (unsigned int k = 0; k < dK; ++k)
-			{
-				dQt[k] += ds * ku[k];
-				dKu[k] += ds * qt[k];
-			}
+			glades::transformer_kernels::axpy_f32(dQt, ku, ds, dK);
+			glades::transformer_kernels::axpy_f32(dKu, qt, ds, dK);
 		}
 	}
 }
