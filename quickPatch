@@ -1,0 +1,37 @@
+diff --git a/.gitignore b/.gitignore
+index 2e2531f8d..c23028b81 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,3 +7,4 @@ database/*
+ *.swp
+ alpaca.key
+ .gdb_history
++.claude/
+diff --git a/unit-tests/CMakeLists.txt b/unit-tests/CMakeLists.txt
+index 669d57474..f168afbf0 100644
+--- a/unit-tests/CMakeLists.txt
++++ b/unit-tests/CMakeLists.txt
+@@ -63,13 +63,9 @@ target_link_libraries(${PROJECT_NAME}
+ 
+ target_include_directories(${PROJECT_NAME} PRIVATE "Backend")
+ 
+-if(NOT DEFINED EXEC_ARGS)
+-	set(EXEC_ARGS "")
+-endif()
+-
+ #make run
+ add_custom_target(run
+-	COMMAND ${PROJECT_NAME} ${EXEC_ARGS}
++	COMMAND ${PROJECT_NAME} $(ARGS)
+ 	DEPENDS ${PROJECT_NAME}
+ 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+ )
+@@ -97,7 +93,7 @@ add_custom_target(ddd
+ 
+ #make profile
+ 	add_custom_target(profile
+-	COMMAND valgrind --tool=callgrind ./build/${PROJECT_NAME}
++	COMMAND valgrind --tool=callgrind ./build/${PROJECT_NAME} $(ARGS)
+ 	DEPENDS ${PROJECT_NAME}
+ 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+ )

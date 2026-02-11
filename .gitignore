@@ -7,3 +7,4 @@ database/*
 *.swp
 alpaca.key
 .gdb_history
+.claude/

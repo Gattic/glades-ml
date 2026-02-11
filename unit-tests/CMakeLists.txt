@@ -63,13 +63,9 @@ target_link_libraries(${PROJECT_NAME}
 
 target_include_directories(${PROJECT_NAME} PRIVATE "Backend")
 
-if(NOT DEFINED EXEC_ARGS)
-	set(EXEC_ARGS "")
-endif()
-
 #make run
 add_custom_target(run
-	COMMAND ${PROJECT_NAME} ${EXEC_ARGS}
+	COMMAND ${PROJECT_NAME} $(ARGS)
 	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
@@ -97,7 +93,7 @@ add_custom_target(ddd
 
 #make profile
 	add_custom_target(profile
-	COMMAND valgrind --tool=callgrind ./build/${PROJECT_NAME}
+	COMMAND valgrind --tool=callgrind ./build/${PROJECT_NAME} $(ARGS)
 	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
