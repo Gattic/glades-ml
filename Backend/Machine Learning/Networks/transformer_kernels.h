@@ -33,25 +33,45 @@ static inline float dot_f32(const float* a, const float* b, unsigned int n)
 	if (!a || !b || n == 0u)
 		return 0.0f;
 #if defined(__AVX2__)
-	__m256 acc = _mm256_setzero_ps();
+	__m256 acc0 = _mm256_setzero_ps();
+	__m256 acc1 = _mm256_setzero_ps();
+	__m256 acc2 = _mm256_setzero_ps();
+	__m256 acc3 = _mm256_setzero_ps();
 	unsigned int i = 0u;
-	for (; (i + 7u) < n; i += 8u)
+	// Main loop: 4 accumulators x 8 floats = 32 floats/iter
+	for (; (i + 31u) < n; i += 32u)
 	{
-		const __m256 va = _mm256_loadu_ps(a + i);
-		const __m256 vb = _mm256_loadu_ps(b + i);
 #if defined(__FMA__)
-		acc = _mm256_fmadd_ps(va, vb, acc);
+		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
+		acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8u),  _mm256_loadu_ps(b + i + 8u),  acc1);
+		acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16u), _mm256_loadu_ps(b + i + 16u), acc2);
+		acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24u), _mm256_loadu_ps(b + i + 24u), acc3);
 #else
-		acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+		acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i)));
+		acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(a + i + 8u),  _mm256_loadu_ps(b + i + 8u)));
+		acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(_mm256_loadu_ps(a + i + 16u), _mm256_loadu_ps(b + i + 16u)));
+		acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(_mm256_loadu_ps(a + i + 24u), _mm256_loadu_ps(b + i + 24u)));
 #endif
 	}
+	// Remainder loop: single accumulator, 8 floats/iter
+	for (; (i + 7u) < n; i += 8u)
+	{
+#if defined(__FMA__)
+		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+#else
+		acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+#endif
+	}
+	// Combine accumulators
+	acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
 	// Horizontal sum
-	__m128 lo = _mm256_castps256_ps128(acc);
-	__m128 hi = _mm256_extractf128_ps(acc, 1);
+	__m128 lo = _mm256_castps256_ps128(acc0);
+	__m128 hi = _mm256_extractf128_ps(acc0, 1);
 	__m128 sum = _mm_add_ps(lo, hi);
 	sum = _mm_hadd_ps(sum, sum);
 	sum = _mm_hadd_ps(sum, sum);
 	float out = _mm_cvtss_f32(sum);
+	// Scalar tail for final <8 elements
 	for (; i < n; ++i)
 		out += a[i] * b[i];
 	return out;
@@ -473,67 +493,17 @@ inline void gemv_rowmajor_bias_block4_unroll8_into(const float* GLADES_RESTRICT 
 		const float* w2 = W + static_cast<size_t>(o + 2u) * static_cast<size_t>(inSize);
 		const float* w3 = W + static_cast<size_t>(o + 3u) * static_cast<size_t>(inSize);
 
-		float acc0 = (b && (o + 0u) < bSize) ? b[o + 0u] : 0.0f;
-		float acc1 = (b && (o + 1u) < bSize) ? b[o + 1u] : 0.0f;
-		float acc2 = (b && (o + 2u) < bSize) ? b[o + 2u] : 0.0f;
-		float acc3 = (b && (o + 3u) < bSize) ? b[o + 3u] : 0.0f;
-
-		unsigned int i = 0u;
-		for (; (i + 7u) < inSize; i += 8u)
-		{
-			const float x0 = x[i + 0u];
-			const float x1 = x[i + 1u];
-			const float x2 = x[i + 2u];
-			const float x3 = x[i + 3u];
-			const float x4 = x[i + 4u];
-			const float x5 = x[i + 5u];
-			const float x6 = x[i + 6u];
-			const float x7 = x[i + 7u];
-
-			acc0 += w0[i + 0u] * x0 + w0[i + 1u] * x1 + w0[i + 2u] * x2 + w0[i + 3u] * x3 +
-			        w0[i + 4u] * x4 + w0[i + 5u] * x5 + w0[i + 6u] * x6 + w0[i + 7u] * x7;
-			acc1 += w1[i + 0u] * x0 + w1[i + 1u] * x1 + w1[i + 2u] * x2 + w1[i + 3u] * x3 +
-			        w1[i + 4u] * x4 + w1[i + 5u] * x5 + w1[i + 6u] * x6 + w1[i + 7u] * x7;
-			acc2 += w2[i + 0u] * x0 + w2[i + 1u] * x1 + w2[i + 2u] * x2 + w2[i + 3u] * x3 +
-			        w2[i + 4u] * x4 + w2[i + 5u] * x5 + w2[i + 6u] * x6 + w2[i + 7u] * x7;
-			acc3 += w3[i + 0u] * x0 + w3[i + 1u] * x1 + w3[i + 2u] * x2 + w3[i + 3u] * x3 +
-			        w3[i + 4u] * x4 + w3[i + 5u] * x5 + w3[i + 6u] * x6 + w3[i + 7u] * x7;
-		}
-		for (; i < inSize; ++i)
-		{
-			const float xi = x[i];
-			acc0 += w0[i] * xi;
-			acc1 += w1[i] * xi;
-			acc2 += w2[i] * xi;
-			acc3 += w3[i] * xi;
-		}
-
-		y[o + 0u] = acc0;
-		y[o + 1u] = acc1;
-		y[o + 2u] = acc2;
-		y[o + 3u] = acc3;
+		y[o + 0u] = ((b && (o + 0u) < bSize) ? b[o + 0u] : 0.0f) + dot_f32(w0, x, inSize);
+		y[o + 1u] = ((b && (o + 1u) < bSize) ? b[o + 1u] : 0.0f) + dot_f32(w1, x, inSize);
+		y[o + 2u] = ((b && (o + 2u) < bSize) ? b[o + 2u] : 0.0f) + dot_f32(w2, x, inSize);
+		y[o + 3u] = ((b && (o + 3u) < bSize) ? b[o + 3u] : 0.0f) + dot_f32(w3, x, inSize);
 	}
 
 	// Tail rows.
 	for (; o < outSize; ++o)
 	{
 		const float* w = W + static_cast<size_t>(o) * static_cast<size_t>(inSize);
-		float acc = (b && o < bSize) ? b[o] : 0.0f;
-		unsigned int i = 0u;
-		for (; (i + 7u) < inSize; i += 8u)
-		{
-			acc += w[i + 0u] * x[i + 0u];
-			acc += w[i + 1u] * x[i + 1u];
-			acc += w[i + 2u] * x[i + 2u];
-			acc += w[i + 3u] * x[i + 3u];
-			acc += w[i + 4u] * x[i + 4u];
-			acc += w[i + 5u] * x[i + 5u];
-			acc += w[i + 6u] * x[i + 6u];
-			acc += w[i + 7u] * x[i + 7u];
-		}
-		for (; i < inSize; ++i)
-			acc += w[i] * x[i];
-		y[o] = acc;
+		y[o] = ((b && o < bSize) ? b[o] : 0.0f) + dot_f32(w, x, inSize);
 	}
 }
 
@@ -850,15 +820,15 @@ inline void rope_apply_inplace(float* buf,
 		for (unsigned int j = 0; j < ropeDim; j += 2u)
 		{
 			const unsigned int ii = j / 2u;
-			const double ang = static_cast<double>(tpos) * invFreq[static_cast<size_t>(ii)];
-			const double c = cos(ang);
-			double s = sin(ang);
+			const float ang = static_cast<float>(static_cast<double>(tpos) * invFreq[static_cast<size_t>(ii)]);
+			float c, s;
+			sincosf(ang, &s, &c);
 			if (inverse)
 				s = -s;
 			const float x0 = buf[base + j];
 			const float x1 = buf[base + j + 1u];
-			buf[base + j] = static_cast<float>(static_cast<double>(x0) * c - static_cast<double>(x1) * s);
-			buf[base + j + 1u] = static_cast<float>(static_cast<double>(x0) * s + static_cast<double>(x1) * c);
+			buf[base + j] = x0 * c - x1 * s;
+			buf[base + j + 1u] = x0 * s + x1 * c;
 		}
 	}
 }
@@ -888,13 +858,13 @@ inline void rope_apply_vec(float* vec,
 	for (unsigned int j = 0; j < ropeDim; j += 2u)
 	{
 		const unsigned int ii = j / 2u;
-		const double ang = static_cast<double>(pos) * invFreq[static_cast<size_t>(ii)];
-		const double c = cos(ang);
-		const double s = sin(ang);
+		const float ang = static_cast<float>(static_cast<double>(pos) * invFreq[static_cast<size_t>(ii)]);
+		float c, s;
+		sincosf(ang, &s, &c);
 		const float x0 = vec[j];
 		const float x1 = vec[j + 1u];
-		vec[j] = static_cast<float>(static_cast<double>(x0) * c - static_cast<double>(x1) * s);
-		vec[j + 1u] = static_cast<float>(static_cast<double>(x0) * s + static_cast<double>(x1) * c);
+		vec[j] = x0 * c - x1 * s;
+		vec[j + 1u] = x0 * s + x1 * c;
 	}
 }
 
@@ -929,15 +899,15 @@ inline void rope_apply_inplace_strided(float* buf,
 		for (unsigned int j = 0; j < ropeDim; j += 2u)
 		{
 			const unsigned int ii = j / 2u;
-			const double ang = static_cast<double>(tpos) * invFreq[static_cast<size_t>(ii)];
-			const double c = cos(ang);
-			double s = sin(ang);
+			const float ang = static_cast<float>(static_cast<double>(tpos) * invFreq[static_cast<size_t>(ii)]);
+			float c, s;
+			sincosf(ang, &s, &c);
 			if (inverse)
 				s = -s;
 			const float x0 = vec[j];
 			const float x1 = vec[j + 1u];
-			vec[j] = static_cast<float>(static_cast<double>(x0) * c - static_cast<double>(x1) * s);
-			vec[j + 1u] = static_cast<float>(static_cast<double>(x0) * s + static_cast<double>(x1) * c);
+			vec[j] = x0 * c - x1 * s;
+			vec[j + 1u] = x0 * s + x1 * c;
 		}
 	}
 }
@@ -954,9 +924,9 @@ inline void softmax_stable_inplace(std::vector<float>& scores)
 	double sum = 0.0;
 	for (size_t i = 0; i < scores.size(); ++i)
 	{
-		const double e = exp(static_cast<double>(scores[i] - maxv));
-		scores[i] = static_cast<float>(e);
-		sum += e;
+		const float e = expf(scores[i] - maxv);
+		scores[i] = e;
+		sum += static_cast<double>(e);
 	}
 	if (sum <= 0.0)
 	{
@@ -982,9 +952,9 @@ inline void softmax_stable_inplace(float* scores, size_t n)
 	double sum = 0.0;
 	for (size_t i = 0; i < n; ++i)
 	{
-		const double e = exp(static_cast<double>(scores[i] - maxv));
-		scores[i] = static_cast<float>(e);
-		sum += e;
+		const float e = expf(scores[i] - maxv);
+		scores[i] = e;
+		sum += static_cast<double>(e);
 	}
 	if (sum <= 0.0)
 	{
@@ -1010,9 +980,9 @@ inline void softmax_stable(const std::vector<float>& logits, std::vector<float>&
 	double sum = 0.0;
 	for (size_t i = 0; i < logits.size(); ++i)
 	{
-		const double e = exp(static_cast<double>(logits[i] - maxv));
-		probs[i] = static_cast<float>(e);
-		sum += e;
+		const float e = expf(logits[i] - maxv);
+		probs[i] = e;
+		sum += static_cast<double>(e);
 	}
 	if (sum <= 0.0)
 	{
@@ -1038,9 +1008,9 @@ inline void softmax_stable_into(const float* logits, size_t n, float* probsOut)
 	double sum = 0.0;
 	for (size_t i = 0; i < n; ++i)
 	{
-		const double e = exp(static_cast<double>(logits[i] - maxv));
-		probsOut[i] = static_cast<float>(e);
-		sum += e;
+		const float e = expf(logits[i] - maxv);
+		probsOut[i] = e;
+		sum += static_cast<double>(e);
 	}
 	if (sum <= 0.0)
 	{

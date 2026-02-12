@@ -27,6 +27,15 @@ set(Networks_src_files
 add_library(Networks ${Networks_src_files})
 target_link_libraries(Networks pthread)
 
+# CUDA GPU offloading
+if(GLADES_ENABLE_CUDA)
+	add_subdirectory(cuda)
+	target_link_libraries(Networks GladesCUDA)
+	target_include_directories(Networks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cuda)
+	target_include_directories(Networks PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+	target_compile_definitions(Networks PRIVATE GLADES_HAVE_CUDA=1)
+endif()
+
 install(TARGETS Networks EXPORT gladesConfig
     ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}

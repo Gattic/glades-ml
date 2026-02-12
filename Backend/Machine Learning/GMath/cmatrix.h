@@ -41,6 +41,7 @@ public:
 	// sets
 	void build(unsigned int);
 	void addResult(const shmea::GList&);
+	void addResultDirect(unsigned int expectedIdx, unsigned int predictedIdx);
 	void updateResultParams();
 
 	// gets

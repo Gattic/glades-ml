@@ -185,6 +185,13 @@ public:
 	virtual bool hasFixedTrainExpectedRowSize() const { return false; }
 	virtual unsigned int getFixedTrainExpectedRowSize() const { return 0u; }
 
+	// Test-set analogues of the fixed-row-size contracts above.
+	// Default: delegate to the train-side methods (covers datasets where test == train layout).
+	virtual bool hasFixedTestRowSize() const { return hasFixedTrainRowSize(); }
+	virtual unsigned int getFixedTestRowSize() const { return getFixedTrainRowSize(); }
+	virtual bool hasFixedTestExpectedRowSize() const { return hasFixedTrainExpectedRowSize(); }
+	virtual unsigned int getFixedTestExpectedRowSize() const { return getFixedTrainExpectedRowSize(); }
+
 	// Validate that (train row size >= expectedFeatureCount) and
 	// (expected row size >= expectedOutSize).
 	//
@@ -748,47 +755,85 @@ inline bool DataInput::validateTestRowShapes(unsigned int expectedFeatureCount,
 		return true;
 	}
 
-	const unsigned int wantChecks = (maxRowsToCheck == 0u ? 1u : maxRowsToCheck);
-	const unsigned int checks = (testSize < wantChecks ? testSize : wantChecks);
-	const unsigned int denom = (checks > 1u ? (checks - 1u) : 1u);
-
-	for (unsigned int k = 0; k < checks; ++k)
+	// O(1) validation for fixed-shape inputs.
+	if (hasFixedTestRowSize())
 	{
-		const unsigned int idx =
-		    (testSize == 1u)
-		        ? 0u
-		        : static_cast<unsigned int>((static_cast<unsigned long long>(k) * static_cast<unsigned long long>(testSize - 1u)) / denom);
-
-		const shmea::GVector<float> row = getTestRow(idx);
-		if (row.size() < expectedFeatureCount)
+		const unsigned int n = getFixedTestRowSize();
+		if (n < expectedFeatureCount)
 		{
 			if (errMsg)
 			{
 				char buf[256];
 				sprintf(buf,
-				        "test row %u has %u features but expected at least %u",
-				        idx,
-				        static_cast<unsigned int>(row.size()),
-				        expectedFeatureCount);
+				        "test feature count (%u) is smaller than expectedFeatureCount (%u)",
+				        n, expectedFeatureCount);
 				*errMsg = std::string(buf);
 			}
 			return false;
 		}
-
-		const shmea::GVector<float> exp = getTestExpectedRow(idx);
-		if (exp.size() < expectedOutSize)
+	}
+	if (hasFixedTestExpectedRowSize())
+	{
+		const unsigned int n = getFixedTestExpectedRowSize();
+		if (n < expectedOutSize)
 		{
 			if (errMsg)
 			{
 				char buf[256];
 				sprintf(buf,
-				        "test expected row %u has %u outputs but expected at least %u",
-				        idx,
-				        static_cast<unsigned int>(exp.size()),
-				        expectedOutSize);
+				        "test expected output count (%u) is smaller than expectedOutSize (%u)",
+				        n, expectedOutSize);
 				*errMsg = std::string(buf);
 			}
 			return false;
+		}
+	}
+
+	// If either fixed-size contract is missing, do a bounded materialization check.
+	if (!(hasFixedTestRowSize() && hasFixedTestExpectedRowSize()))
+	{
+		const unsigned int wantChecks = (maxRowsToCheck == 0u ? 1u : maxRowsToCheck);
+		const unsigned int checks = (testSize < wantChecks ? testSize : wantChecks);
+		const unsigned int denom = (checks > 1u ? (checks - 1u) : 1u);
+
+		for (unsigned int k = 0; k < checks; ++k)
+		{
+			const unsigned int idx =
+			    (testSize == 1u)
+			        ? 0u
+			        : static_cast<unsigned int>((static_cast<unsigned long long>(k) * static_cast<unsigned long long>(testSize - 1u)) / denom);
+
+			const shmea::GVector<float> row = getTestRow(idx);
+			if (row.size() < expectedFeatureCount)
+			{
+				if (errMsg)
+				{
+					char buf[256];
+					sprintf(buf,
+					        "test row %u has %u features but expected at least %u",
+					        idx,
+					        static_cast<unsigned int>(row.size()),
+					        expectedFeatureCount);
+					*errMsg = std::string(buf);
+				}
+				return false;
+			}
+
+			const shmea::GVector<float> exp = getTestExpectedRow(idx);
+			if (exp.size() < expectedOutSize)
+			{
+				if (errMsg)
+				{
+					char buf[256];
+					sprintf(buf,
+					        "test expected row %u has %u outputs but expected at least %u",
+					        idx,
+					        static_cast<unsigned int>(exp.size()),
+					        expectedOutSize);
+					*errMsg = std::string(buf);
+				}
+				return false;
+			}
 		}
 	}
 

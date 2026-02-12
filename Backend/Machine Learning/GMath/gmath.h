@@ -67,6 +67,7 @@ public:
 	static float outputNodeCost(float, float, float, int);
 	static float norm_inv_CDF(float); // inverse CDF of normal distribution
 	static float normal_pdf(float);
+	static int argmax(const float* data, unsigned int count);
 	static std::vector<int> naiveVectorDecomp(const std::vector<float>&);
 	static shmea::GList naiveVectorDecomp(const shmea::GList&);
 };

@@ -97,6 +97,14 @@ void glades::CMatrix::addResult(const shmea::GList& result)
 	}
 }
 
+void glades::CMatrix::addResultDirect(unsigned int expectedIdx, unsigned int predictedIdx)
+{
+	if (expectedIdx >= matrix.numberOfRows() || predictedIdx >= matrix.numberOfCols())
+		return;
+	int newCount = matrix.getCell(expectedIdx, predictedIdx).getInt() + 1;
+	matrix.setCell(expectedIdx, predictedIdx, newCount);
+}
+
 void glades::CMatrix::updateResultParams()
 {
 	// schema: expected -> row; predicted -> col

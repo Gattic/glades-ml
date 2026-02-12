@@ -415,12 +415,15 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 			running = false;
 			return;
 		}
-	}
 
-	// Add current results to cmatrix for accuracy vars
-	if ((skeleton->getOutputType() == GMath::CLASSIFICATION) ||
-		(skeleton->getOutputType() == GMath::KL))
-		confusionMatrix.addResult(results);
+		// Add current results to cmatrix for accuracy vars
+		if ((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL))
+		{
+			const int expIdx = GMath::argmax(yData, outSize);
+			const int predIdx = GMath::argmax(&tensorDff.a[last][0], outSize);
+			confusionMatrix.addResultDirect(static_cast<unsigned int>(expIdx), static_cast<unsigned int>(predIdx));
+		}
+	}
 
 	// Progress logs for long DFF epochs (bounded to ~20 messages per epoch).
 	// Note: this emits "loss_so_far" as the running aggregate; epoch-end callback logs the finalized metrics.

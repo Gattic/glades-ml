@@ -60,7 +60,7 @@ float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 	{
 	case TANH:
 	{
-		netOutput = tanh(netInput);
+		netOutput = tanhf(netInput);
 
 		break;
 	}
@@ -71,22 +71,22 @@ float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 		else if (netInput < fxParam - 1.0f)
 			netOutput = -1.0f;
 		else
-			netOutput = tanh(netInput);
+			netOutput = tanhf(netInput);
 
 		break;
 	}
 	case SIGMOID:
 	{
 		// Numerically-stable sigmoid.
-		// Avoids overflow in exp() for large-magnitude inputs.
+		// Avoids overflow in expf() for large-magnitude inputs.
 		if (netInput >= 0.0f)
 		{
-			const float z = static_cast<float>(exp(-netInput));
+			const float z = expf(-netInput);
 			netOutput = 1.0f / (1.0f + z);
 		}
 		else
 		{
-			const float z = static_cast<float>(exp(netInput));
+			const float z = expf(netInput);
 			netOutput = z / (1.0f + z);
 		}
 
@@ -103,12 +103,12 @@ float glades::GMath::squash(float netInput, int activationFx, float fxParam)
 			// Same stable sigmoid core as SIGMOID.
 			if (netInput >= 0.0f)
 			{
-				const float z = static_cast<float>(exp(-netInput));
+				const float z = expf(-netInput);
 				netOutput = 1.0f / (1.0f + z);
 			}
 			else
 			{
-				const float z = static_cast<float>(exp(netInput));
+				const float z = expf(netInput);
 				netOutput = z / (1.0f + z);
 			}
 		}
@@ -167,7 +167,7 @@ float glades::GMath::unsquash(float netInput, int activationFx, float fxParam)
 	case TANH:
 	{
 		// Inverse tanh; clamp away from {-1, 1} to avoid inf.
-		netOutput = atanh(clampf(netInput, -1.0f + 1e-7f, 1.0f - 1e-7f));
+		netOutput = atanhf(clampf(netInput, -1.0f + 1e-7f, 1.0f - 1e-7f));
 
 		break;
 	}
@@ -180,7 +180,7 @@ float glades::GMath::unsquash(float netInput, int activationFx, float fxParam)
 		else if (netInput >= 1.0f)
 			netOutput = INLIER;
 		else
-			netOutput = atanh(clampf(netInput, -1.0f + 1e-7f, 1.0f - 1e-7f));
+			netOutput = atanhf(clampf(netInput, -1.0f + 1e-7f, 1.0f - 1e-7f));
 
 		break;
 	}
@@ -188,7 +188,7 @@ float glades::GMath::unsquash(float netInput, int activationFx, float fxParam)
 	{
 		// Inverse sigmoid (logit). Previous implementation was incorrect.
 		const float p = clamp_prob01(netInput);
-		netOutput = log(safe_div(p, (1.0f - p)));
+		netOutput = logf(safe_div(p, (1.0f - p)));
 
 		break;
 	}
@@ -197,7 +197,7 @@ float glades::GMath::unsquash(float netInput, int activationFx, float fxParam)
 		// Best-effort inverse for "SIGMOIDP" outputs.
 		// squash(SIGMOIDP) clamps outputs into [0.01, 0.99] in some ranges; clamp here too.
 		const float p = clamp_prob01(netInput);
-		netOutput = log(safe_div(p, (1.0f - p)));
+		netOutput = logf(safe_div(p, (1.0f - p)));
 
 		break;
 	}
@@ -342,7 +342,7 @@ float glades::GMath::CrossEntropyCost(float expectation, float prediction)
 	// Binary cross-entropy; clamp prediction to avoid log(0).
 	const float y = clampf(expectation, 0.0f, 1.0f);
 	const float p = clamp_prob01(prediction);
-	return -((y * log(p)) + ((1.0f - y) * log(1.0f - p)));
+	return -((y * logf(p)) + ((1.0f - y) * logf(1.0f - p)));
 }
 
 float glades::GMath::KLDivergence(float expectation, float prediction)
@@ -354,7 +354,7 @@ float glades::GMath::KLDivergence(float expectation, float prediction)
 
 	const float p = clamp_prob01(expectation);
 	const float q = clamp_prob01(prediction);
-	return p * log(safe_div(p, q));
+	return p * logf(safe_div(p, q));
 }
 
 float glades::GMath::outputNodeCost(float expectation, float prediction, float dataSize, int costFx)
@@ -486,7 +486,24 @@ float glades::GMath::norm_inv_CDF(
 
 float glades::GMath::normal_pdf(float z)
 {
-	return (1 / sqrt(6.2831853)) * exp(-(z * z) / 2);
+	return (1.0f / sqrtf(6.2831853f)) * expf(-(z * z) / 2.0f);
+}
+
+int glades::GMath::argmax(const float* data, unsigned int count)
+{
+	if (!data || count == 0u)
+		return 0;
+	int best = 0;
+	float bestVal = data[0];
+	for (unsigned int i = 1; i < count; ++i)
+	{
+		if (data[i] > bestVal)
+		{
+			bestVal = data[i];
+			best = static_cast<int>(i);
+		}
+	}
+	return best;
 }
 
 std::vector<int> glades::GMath::naiveVectorDecomp(const std::vector<float>& needle)

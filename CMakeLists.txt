@@ -10,6 +10,17 @@ cmake_minimum_required(VERSION 3.10)
 set(CMAKE_CXX_STANDARD 98)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+# CUDA GPU offloading (optional, default OFF)
+option(GLADES_ENABLE_CUDA "Build with CUDA GPU offloading support" OFF)
+if(GLADES_ENABLE_CUDA)
+	cmake_minimum_required(VERSION 3.18) # for CUDA_ARCHITECTURES
+	include(${CMAKE_SOURCE_DIR}/cmake/CudaGlibcCompat.cmake)
+	cuda_glibc_compat_apply()
+	enable_language(CUDA)
+	add_definitions(-DGLADES_HAVE_CUDA=1)
+	message(STATUS "CUDA enabled: ${CMAKE_CUDA_COMPILER}")
+endif()
+
 #Compiler Flags
 set(CMAKE_BUILD_TYPE RelWithDebInfo) # -O2 -g
 

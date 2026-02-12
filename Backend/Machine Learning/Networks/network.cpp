@@ -89,6 +89,14 @@ glades::NNetwork::NNetwork(int newNetType)
 	// Initialize tensor gate packs (gateCount is fixed by architecture type).
 	tensorGru = TensorGatedState(3u);
 	tensorLstm = TensorGatedState(4u);
+	gpuTransformerWeights = NULL;
+	gpuTransformerScratch = NULL;
+	gpuDffWeights = NULL;
+	gpuDffScratch = NULL;
+	gpuRnnWeights = NULL;
+	gpuGruWeights = NULL;
+	gpuLstmWeights = NULL;
+	gpuStateReady = false;
 	clean();
 	netType = newNetType;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
@@ -124,6 +132,14 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	lastGradNormScale = 1.0f;
 	tensorGru = TensorGatedState(3u);
 	tensorLstm = TensorGatedState(4u);
+	gpuTransformerWeights = NULL;
+	gpuTransformerScratch = NULL;
+	gpuDffWeights = NULL;
+	gpuDffScratch = NULL;
+	gpuRnnWeights = NULL;
+	gpuGruWeights = NULL;
+	gpuLstmWeights = NULL;
+	gpuStateReady = false;
 	clean();
 
 	// Lifetime safety: clone and own the NNInfo rather than borrowing a raw pointer.
@@ -144,6 +160,7 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 
 glades::NNetwork::~NNetwork()
 {
+	freeGpuState();
 	clean();
 	resetGraphs();
 }
@@ -919,6 +936,7 @@ void glades::NNetwork::clean()
 	tensorLstm.reset();
 	tensorTransformer.reset();
 	transformerPosEncCache.reset();
+	freeGpuState();
 
 	// Epoch-scoped metric accumulators
 	regSSE = 0.0;
@@ -2302,5 +2320,198 @@ void glades::NNetwork::resetGraphs()
 {
 	// create the results again
 	results.clear();
+}
+
+// === GPU state lifecycle ===
+
+bool glades::NNetwork::ensureGpuState()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!trainingConfig.gpu.enable)
+		return false;
+
+	if (gpuStateReady)
+		return true;
+
+	// Initialize the CUDA device (idempotent).
+	if (!gpu::initDevice(trainingConfig.gpu.deviceId))
+		return false;
+
+	// Initialize cuBLAS.
+	if (!gpu::blasInit())
+		return false;
+
+	// Allocate GPU state based on network type.
+	const bool isTransformer = (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER);
+
+	if (isTransformer && tensorTransformer.initialized)
+	{
+		const TensorTransformerState& ts = tensorTransformer;
+		const unsigned int dHead = ts.dModel / ts.nHeads;
+		const unsigned int dModelKV = ts.nKVHeads * dHead;
+		const unsigned int ff1Width = (ts.ffnKind == 1) ? (2u * ts.dFF) : ts.dFF;
+
+		// Allocate weights
+		if (!gpuTransformerWeights)
+			gpuTransformerWeights = new gpu::GpuTransformerWeights();
+
+		if (!gpuTransformerWeights->initialized)
+		{
+			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
+			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
+			                                      ts.outSize, ts.ffnKind, ts.tokenModel,
+			                                      ts.tieEmbeddings))
+			{
+				return false;
+			}
+		}
+
+		// Upload weights
+		gpu::uploadTransformerWeights(*gpuTransformerWeights,
+		                              ts.tokE.empty() ? NULL : &ts.tokE[0], ts.tokE.size(),
+		                              ts.WIn.empty() ? NULL : &ts.WIn[0], ts.WIn.size(),
+		                              ts.bIn.empty() ? NULL : &ts.bIn[0], ts.bIn.size(),
+		                              ts.WOut.empty() ? NULL : &ts.WOut[0], ts.WOut.size(),
+		                              ts.bOut.empty() ? NULL : &ts.bOut[0], ts.bOut.size(),
+		                              ts.lmBias.empty() ? NULL : &ts.lmBias[0], ts.lmBias.size());
+
+		// Upload per-block weights
+		for (unsigned int l = 0; l < ts.nLayers; ++l)
+		{
+			const TensorTransformerState::Block& cb = ts.blocks[l];
+			gpu::uploadTransformerBlockWeights(gpuTransformerWeights->blocks[l],
+			                                   ts.dModel, dModelKV, ff1Width, ts.dFF,
+			                                   cb.ln1Gamma.empty() ? NULL : &cb.ln1Gamma[0],
+			                                   cb.ln1Beta.empty() ? NULL : &cb.ln1Beta[0],
+			                                   cb.Wq.empty() ? NULL : &cb.Wq[0],
+			                                   cb.Wk.empty() ? NULL : &cb.Wk[0],
+			                                   cb.Wv.empty() ? NULL : &cb.Wv[0],
+			                                   cb.Wo.empty() ? NULL : &cb.Wo[0],
+			                                   cb.bq.empty() ? NULL : &cb.bq[0],
+			                                   cb.bk.empty() ? NULL : &cb.bk[0],
+			                                   cb.bv.empty() ? NULL : &cb.bv[0],
+			                                   cb.bo.empty() ? NULL : &cb.bo[0],
+			                                   cb.ln2Gamma.empty() ? NULL : &cb.ln2Gamma[0],
+			                                   cb.ln2Beta.empty() ? NULL : &cb.ln2Beta[0],
+			                                   cb.W1.empty() ? NULL : &cb.W1[0],
+			                                   cb.W2.empty() ? NULL : &cb.W2[0],
+			                                   cb.b1.empty() ? NULL : &cb.b1[0],
+			                                   cb.b2.empty() ? NULL : &cb.b2[0]);
+		}
+
+		// Upload optimizer state (Adam m1/m2) for each weight tensor
+		for (unsigned int l = 0; l < ts.nLayers; ++l)
+		{
+			const TensorTransformerState::Block& cb = ts.blocks[l];
+			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[l];
+
+			// Upload optimizer state for LN, QKV, FFN
+			if (!cb.mLn1Gamma.empty()) gb.mLn1Gamma.upload(&cb.mLn1Gamma[0], cb.mLn1Gamma.size());
+			if (!cb.v2Ln1Gamma.empty()) gb.v2Ln1Gamma.upload(&cb.v2Ln1Gamma[0], cb.v2Ln1Gamma.size());
+			if (!cb.mLn1Beta.empty()) gb.mLn1Beta.upload(&cb.mLn1Beta[0], cb.mLn1Beta.size());
+			if (!cb.v2Ln1Beta.empty()) gb.v2Ln1Beta.upload(&cb.v2Ln1Beta[0], cb.v2Ln1Beta.size());
+
+			if (!cb.vWq.empty()) gb.vWq.upload(&cb.vWq[0], cb.vWq.size());
+			if (!cb.v2Wq.empty()) gb.v2Wq.upload(&cb.v2Wq[0], cb.v2Wq.size());
+			if (!cb.vWk.empty()) gb.vWk.upload(&cb.vWk[0], cb.vWk.size());
+			if (!cb.v2Wk.empty()) gb.v2Wk.upload(&cb.v2Wk[0], cb.v2Wk.size());
+			if (!cb.vWv.empty()) gb.vWv.upload(&cb.vWv[0], cb.vWv.size());
+			if (!cb.v2Wv.empty()) gb.v2Wv.upload(&cb.v2Wv[0], cb.v2Wv.size());
+			if (!cb.vWo.empty()) gb.vWo.upload(&cb.vWo[0], cb.vWo.size());
+			if (!cb.v2Wo.empty()) gb.v2Wo.upload(&cb.v2Wo[0], cb.v2Wo.size());
+
+			if (!cb.mBq.empty()) gb.mBq.upload(&cb.mBq[0], cb.mBq.size());
+			if (!cb.v2Bq.empty()) gb.v2Bq.upload(&cb.v2Bq[0], cb.v2Bq.size());
+			if (!cb.mBk.empty()) gb.mBk.upload(&cb.mBk[0], cb.mBk.size());
+			if (!cb.v2Bk.empty()) gb.v2Bk.upload(&cb.v2Bk[0], cb.v2Bk.size());
+			if (!cb.mBv.empty()) gb.mBv.upload(&cb.mBv[0], cb.mBv.size());
+			if (!cb.v2Bv.empty()) gb.v2Bv.upload(&cb.v2Bv[0], cb.v2Bv.size());
+			if (!cb.mBo.empty()) gb.mBo.upload(&cb.mBo[0], cb.mBo.size());
+			if (!cb.v2Bo.empty()) gb.v2Bo.upload(&cb.v2Bo[0], cb.v2Bo.size());
+
+			if (!cb.mLn2Gamma.empty()) gb.mLn2Gamma.upload(&cb.mLn2Gamma[0], cb.mLn2Gamma.size());
+			if (!cb.v2Ln2Gamma.empty()) gb.v2Ln2Gamma.upload(&cb.v2Ln2Gamma[0], cb.v2Ln2Gamma.size());
+			if (!cb.mLn2Beta.empty()) gb.mLn2Beta.upload(&cb.mLn2Beta[0], cb.mLn2Beta.size());
+			if (!cb.v2Ln2Beta.empty()) gb.v2Ln2Beta.upload(&cb.v2Ln2Beta[0], cb.v2Ln2Beta.size());
+
+			if (!cb.vW1.empty()) gb.vW1.upload(&cb.vW1[0], cb.vW1.size());
+			if (!cb.v2W1.empty()) gb.v2W1.upload(&cb.v2W1[0], cb.v2W1.size());
+			if (!cb.vW2.empty()) gb.vW2.upload(&cb.vW2[0], cb.vW2.size());
+			if (!cb.v2W2.empty()) gb.v2W2.upload(&cb.v2W2[0], cb.v2W2.size());
+			if (!cb.mB1.empty()) gb.mB1.upload(&cb.mB1[0], cb.mB1.size());
+			if (!cb.v2B1.empty()) gb.v2B1.upload(&cb.v2B1[0], cb.v2B1.size());
+			if (!cb.mB2.empty()) gb.mB2.upload(&cb.mB2[0], cb.mB2.size());
+			if (!cb.v2B2.empty()) gb.v2B2.upload(&cb.v2B2[0], cb.v2B2.size());
+		}
+
+		// Upload global optimizer state
+		if (ts.tokenModel)
+		{
+			if (!ts.vTokE.empty()) gpuTransformerWeights->vTokE.upload(&ts.vTokE[0], ts.vTokE.size());
+			if (!ts.v2TokE.empty()) gpuTransformerWeights->v2TokE.upload(&ts.v2TokE[0], ts.v2TokE.size());
+			if (!ts.mLmBias.empty()) gpuTransformerWeights->mLmBias.upload(&ts.mLmBias[0], ts.mLmBias.size());
+			if (!ts.v2LmBias.empty()) gpuTransformerWeights->v2LmBias.upload(&ts.v2LmBias[0], ts.v2LmBias.size());
+		}
+		else
+		{
+			if (!ts.vWIn.empty()) gpuTransformerWeights->vWIn.upload(&ts.vWIn[0], ts.vWIn.size());
+			if (!ts.v2WIn.empty()) gpuTransformerWeights->v2WIn.upload(&ts.v2WIn[0], ts.v2WIn.size());
+			if (!ts.mBIn.empty()) gpuTransformerWeights->mBIn.upload(&ts.mBIn[0], ts.mBIn.size());
+			if (!ts.v2BIn.empty()) gpuTransformerWeights->v2BIn.upload(&ts.v2BIn[0], ts.v2BIn.size());
+			if (!ts.vWOut.empty()) gpuTransformerWeights->vWOut.upload(&ts.vWOut[0], ts.vWOut.size());
+			if (!ts.v2WOut.empty()) gpuTransformerWeights->v2WOut.upload(&ts.v2WOut[0], ts.v2WOut.size());
+			if (!ts.mBOut.empty()) gpuTransformerWeights->mBOut.upload(&ts.mBOut[0], ts.mBOut.size());
+			if (!ts.v2BOut.empty()) gpuTransformerWeights->v2BOut.upload(&ts.v2BOut[0], ts.v2BOut.size());
+		}
+	}
+
+	gpuStateReady = true;
+	return true;
+#else
+	(void)0;
+	return false;
+#endif
+}
+
+void glades::NNetwork::freeGpuState()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (gpuTransformerWeights)
+	{
+		delete gpuTransformerWeights;
+		gpuTransformerWeights = NULL;
+	}
+	if (gpuTransformerScratch)
+	{
+		delete gpuTransformerScratch;
+		gpuTransformerScratch = NULL;
+	}
+	if (gpuDffWeights)
+	{
+		delete gpuDffWeights;
+		gpuDffWeights = NULL;
+	}
+	if (gpuDffScratch)
+	{
+		delete gpuDffScratch;
+		gpuDffScratch = NULL;
+	}
+	if (gpuRnnWeights)
+	{
+		delete gpuRnnWeights;
+		gpuRnnWeights = NULL;
+	}
+	if (gpuGruWeights)
+	{
+		delete gpuGruWeights;
+		gpuGruWeights = NULL;
+	}
+	if (gpuLstmWeights)
+	{
+		delete gpuLstmWeights;
+		gpuLstmWeights = NULL;
+	}
+#endif
+	gpuStateReady = false;
 }
 

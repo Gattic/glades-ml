@@ -4,6 +4,13 @@
 #include "transformer_kernels.h"
 #include "glades_thread_pool.h"
 
+#ifdef GLADES_HAVE_CUDA
+#include "cuda/gpu_dispatch.h"
+#include "cuda/gpu_kernels.h"
+#include "cuda/gpu_blas.h"
+#include "cuda/gpu_transformer_state.h"
+#endif
+
 #include "Backend/Database/GLogger.h"
 
 #include "../DataObjects/DataInput.h"
@@ -336,6 +343,41 @@ struct LinearFwdCtx
 	float* Y;
 };
 
+// Cache-blocked forward: parallel over tiles of output neurons.
+// Each tile of W rows (~96KB for TILE=32, inSize=768) stays in L2 cache while
+// we process ALL timesteps, reducing total weight reads from O(T*outSize*inSize)
+// to O(outSize*inSize + T*outSize*inSize/L2).
+static const unsigned int LINEAR_FWD_TILE = 32u;
+
+struct LinearFwdTiledCtx
+{
+	const float* X;
+	unsigned int T;
+	unsigned int inSize;
+	const float* W;
+	const float* b;
+	unsigned int outSize;
+	unsigned int bSize;
+	float* Y;
+};
+
+static void linear_fwd_tiled_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const LinearFwdTiledCtx& c = *static_cast<const LinearFwdTiledCtx*>(ud);
+	// begin..end is a range of output neurons (the tile)
+	for (unsigned int o = begin; o < end; ++o)
+	{
+		const float* wRow = c.W + static_cast<size_t>(o) * static_cast<size_t>(c.inSize);
+		const float bias = (o < c.bSize) ? c.b[o] : 0.0f;
+		for (unsigned int t = 0; t < c.T; ++t)
+		{
+			const float* xt = c.X + static_cast<size_t>(t) * static_cast<size_t>(c.inSize);
+			float* yt = c.Y + static_cast<size_t>(t) * static_cast<size_t>(c.outSize);
+			yt[o] = bias + glades::transformer_kernels::dot_f32(xt, wRow, c.inSize);
+		}
+	}
+}
+
 static void linear_fwd_body(void* ud, unsigned int begin, unsigned int end)
 {
 	const LinearFwdCtx& c = *static_cast<const LinearFwdCtx*>(ud);
@@ -367,17 +409,21 @@ static void linear_forward_opt_parallel(const float* X,
 
 	const bool worthParallel = (static_cast<unsigned long long>(T) * outSize * inSize >= 500000ULL);
 	glades::ThreadPool& pool = glades::ThreadPool::instance();
-	if (worthParallel && T > 1u && pool.numThreads() > 1u)
+	if (worthParallel && pool.numThreads() > 1u)
 	{
-		LinearFwdCtx ctx;
+		// Tiled approach: parallel over output neurons.
+		// Each thread processes a chunk of output rows across ALL timesteps,
+		// keeping its W tile in L2 cache.
+		LinearFwdTiledCtx ctx;
 		ctx.X = X;
+		ctx.T = T;
 		ctx.inSize = inSize;
 		ctx.W = W.empty() ? NULL : &W[0];
 		ctx.b = b.empty() ? NULL : &b[0];
 		ctx.bSize = static_cast<unsigned int>(b.size());
 		ctx.outSize = outSize;
 		ctx.Y = Y;
-		pool.parallel_for(T, linear_fwd_body, &ctx);
+		pool.parallel_for(outSize, linear_fwd_tiled_body, &ctx);
 	}
 	else
 	{
@@ -421,17 +467,24 @@ static void linear_bwd_gw_body(void* ud, unsigned int begin, unsigned int end)
 static void linear_bwd_dx_body(void* ud, unsigned int begin, unsigned int end)
 {
 	const LinearBwdDXCtx& c = *static_cast<const LinearBwdDXCtx*>(ud);
-	for (unsigned int t = begin; t < end; ++t)
+	// Process W in tiles so each tile stays warm in L2 cache across timesteps.
+	// Tile size: 32 output rows * inSize floats. For inSize=768, that's 96KB.
+	static const unsigned int DX_TILE = 32u;
+	for (unsigned int o0 = 0; o0 < c.outSize; o0 += DX_TILE)
 	{
-		const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(c.outSize);
-		const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(c.inSize);
-		for (unsigned int o = 0; o < c.outSize; ++o)
+		const unsigned int o1 = (o0 + DX_TILE < c.outSize) ? (o0 + DX_TILE) : c.outSize;
+		for (unsigned int t = begin; t < end; ++t)
 		{
-			const float dy = c.dY[dyOff + o];
-			glades::transformer_kernels::axpy_f32(
-			    c.dX + dxOff,
-			    &c.W[static_cast<size_t>(o) * static_cast<size_t>(c.inSize)],
-			    dy, c.inSize);
+			const size_t dyOff = static_cast<size_t>(t) * static_cast<size_t>(c.outSize);
+			const size_t dxOff = static_cast<size_t>(t) * static_cast<size_t>(c.inSize);
+			for (unsigned int o = o0; o < o1; ++o)
+			{
+				const float dy = c.dY[dyOff + o];
+				glades::transformer_kernels::axpy_f32(
+				    c.dX + dxOff,
+				    &c.W[static_cast<size_t>(o) * static_cast<size_t>(c.inSize)],
+				    dy, c.inSize);
+			}
 		}
 	}
 }
@@ -1544,6 +1597,1024 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	int64_t lastProgressMs = epochStartMs;
 	static const int64_t kProgressIntervalMs = 5000; // 5s heartbeat
 
+#ifdef GLADES_HAVE_CUDA
+	// === GPU accelerated training path ===
+	//
+	// When GPU is enabled and available, offload the entire forward/backward/optimizer
+	// loop to the GPU. Weights stay GPU-resident; only token inputs and loss/metrics
+	// cross PCIe per sequence.
+	//
+	// If ensureGpuState() fails, fall through to the CPU path silently.
+	if (trainingConfig.gpu.enable && isTrain)
+	{
+		const bool gpuReady = ensureGpuState();
+		if (gpuReady && gpuTransformerWeights && gpuTransformerWeights->initialized)
+		{
+			const unsigned int dHead = dModel / nHeads;
+			const unsigned int dModelKV = nKVHeads * dHead;
+			const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
+			const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+
+			for (unsigned int s = 0; s < seqCount; ++s)
+			{
+				if (!running)
+					break;
+
+				const unsigned int T = di->getTrainSequenceLength(s);
+				if (T == 0u)
+					continue;
+				tokensProcessed += static_cast<unsigned long long>(T);
+
+				// Ensure GPU scratch is big enough for this sequence.
+				if (!gpuTransformerScratch)
+					gpuTransformerScratch = new gpu::GpuTransformerScratch();
+
+				if (!gpuTransformerScratch->initialized || gpuTransformerScratch->T < T)
+				{
+					if (!gpuTransformerScratch->allocate(T, inputSize, outSize, dModel, dFF, dModelKV, nHeads, nLayers, ff1Width))
+					{
+						// GPU scratch allocation failed, fall through to CPU.
+						break;
+					}
+				}
+
+				// Upload token IDs for this sequence.
+				if (tokenLM)
+				{
+					std::vector<int> tokenIdsInt(T);
+					for (unsigned int t = 0; t < T; ++t)
+					{
+						int tid = 0;
+						di->getTrainSequenceTokenId(s, t, tid);
+						tokenIdsInt[t] = tid;
+					}
+					gpuTransformerScratch->tokenIds.upload(&tokenIdsInt[0], T);
+
+					// Forward: embedding gather
+					gpu::embedding_gather(
+					    gpuTransformerWeights->tokE.data(),
+					    gpuTransformerScratch->tokenIds.data(),
+					    static_cast<int>(T), static_cast<int>(vocabSize),
+					    static_cast<int>(dModel),
+					    gpuTransformerScratch->h.data());
+				}
+				else
+				{
+					// Upload input features and run linear projection.
+					std::vector<float> xHost(static_cast<size_t>(T) * inputSize);
+					for (unsigned int t = 0; t < T; ++t)
+					{
+						const float* row = NULL;
+						unsigned int rowSize = 0u;
+						di->getTrainSequenceRowView(s, t, row, rowSize);
+						const size_t off = static_cast<size_t>(t) * inputSize;
+						for (unsigned int f = 0; f < inputSize; ++f)
+							xHost[off + f] = (row && f < rowSize) ? row[f] : 0.0f;
+					}
+					gpuTransformerScratch->x.upload(&xHost[0], xHost.size());
+
+					// Input projection: h = x * WIn^T + bIn
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
+					                     1.0f,
+					                     gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
+					                     gpuTransformerWeights->WIn.data(), static_cast<int>(inputSize),
+					                     0.0f,
+					                     gpuTransformerScratch->h.data(), static_cast<int>(dModel));
+					gpu::add_bias(gpuTransformerScratch->h.data(),
+					              gpuTransformerWeights->bIn.data(),
+					              static_cast<int>(T), static_cast<int>(dModel));
+				}
+
+				// Upload RoPE invFreq to scratch (shared across all layers).
+				unsigned int fwdRopeHalfDim = 0u;
+				if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
+				{
+					const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
+					                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
+					fwdRopeHalfDim = rd / 2u;
+					std::vector<float> invFreqF(fwdRopeHalfDim);
+					for (unsigned int i = 0; i < fwdRopeHalfDim && i < transformerPosEncCache.ropeInvFreq.size(); ++i)
+						invFreqF[i] = static_cast<float>(transformerPosEncCache.ropeInvFreq[i]);
+					gpuTransformerScratch->gpuInvFreq.upload(&invFreqF[0], invFreqF.size());
+				}
+
+				// Per-layer transformer blocks.
+				for (unsigned int li = 0; li < nLayers; ++li)
+				{
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
+					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+
+					// Input to this layer is h (or hAfterFF from previous layer).
+					const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
+					                                 : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
+
+					float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
+					float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
+					float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
+
+					// Pre-LN 1
+					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					{
+						gpu::rmsnorm_forward(layerIn, gb.ln1Gamma.data(), lnEps,
+						                      static_cast<int>(T), static_cast<int>(dModel),
+						                      x1_l, ln1InvStd_l);
+					}
+					else
+					{
+						gpu::layernorm_forward(layerIn, gb.ln1Gamma.data(), gb.ln1Beta.data(),
+						                        lnEps, static_cast<int>(T), static_cast<int>(dModel),
+						                        x1_l, ln1Mean_l, ln1InvStd_l);
+					}
+
+					// QKV projections
+					float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
+					float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
+					float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
+
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+					                     1.0f, x1_l, static_cast<int>(dModel),
+					                     gb.Wq.data(), static_cast<int>(dModel),
+					                     0.0f, Q_l, static_cast<int>(dModel));
+					gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
+					                     1.0f, x1_l, static_cast<int>(dModel),
+					                     gb.Wk.data(), static_cast<int>(dModel),
+					                     0.0f, K_l, static_cast<int>(dModelKV));
+					gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
+					                     1.0f, x1_l, static_cast<int>(dModel),
+					                     gb.Wv.data(), static_cast<int>(dModel),
+					                     0.0f, V_l, static_cast<int>(dModelKV));
+					gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+
+					// RoPE (if enabled)
+					if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
+					{
+						const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
+						                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
+						// Use persistent gpuInvFreq from scratch (uploaded before layer loop).
+						gpu::rope_apply(Q_l, gpuTransformerScratch->gpuInvFreq.data(),
+						                 static_cast<int>(T), static_cast<int>(nHeads),
+						                 static_cast<int>(dHead), static_cast<int>(rd / 2u));
+						gpu::rope_apply(K_l, gpuTransformerScratch->gpuInvFreq.data(),
+						                 static_cast<int>(T), static_cast<int>(nKVHeads),
+						                 static_cast<int>(dHead), static_cast<int>(rd / 2u));
+					}
+
+					// Batched GEMM attention (replaces per-head flash attention).
+					// Q[T, dModel], K[T, dModelKV], V[T, dModelKV], attnConcat[T, dModel].
+					// Treat as batched over heads with stride = dHead between heads.
+					float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
+					float* scores = gpuTransformerScratch->attnScores.data();
+					float* attnP  = gpuTransformerScratch->attnProbs.data();
+					{
+						const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
+						const unsigned int groupSize = nHeads / nKVHeads;
+
+						// Loop over KV-head groups for GQA support.
+						for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
+						{
+							const unsigned int qStart = kvh * groupSize;
+							// S[groupSize, T, T] = Q_group[groupSize, T, dHead] * K_kvh[T, dHead]^T
+							// Q heads are strided at [T, dModel] with head offset = qStart*dHead.
+							// K head is at [T, dModelKV] with head offset = kvh*dHead.
+							// For each Q head in the group, we compute S_h = Q_h * K_kvh^T.
+							gpu::sgemm_batched_strided_abt(
+							    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
+							    invSqrt,
+							    Q_l + qStart * dHead, static_cast<int>(dModel),
+							    static_cast<long long>(T) * dModel,
+							    K_l + kvh * dHead, static_cast<int>(dModelKV),
+							    0LL,  // stride 0: all Q heads in group share same K head
+							    0.0f,
+							    scores + static_cast<size_t>(qStart) * T * T, static_cast<int>(T),
+							    static_cast<long long>(T) * T,
+							    static_cast<int>(groupSize));
+
+							// Causal mask + softmax on S[groupSize, T, T].
+							gpu::causal_mask_softmax_inplace(
+							    scores + static_cast<size_t>(qStart) * T * T,
+							    static_cast<int>(groupSize), static_cast<int>(T));
+
+							// Save probs for backward pass.
+							gpu::device_memcpy_d2d(
+							    attnP + static_cast<size_t>(qStart) * T * T,
+							    scores + static_cast<size_t>(qStart) * T * T,
+							    static_cast<size_t>(groupSize) * T * T * sizeof(float));
+
+							// O[groupSize, T, dHead] = P[groupSize, T, T] * V_kvh[T, dHead]
+							gpu::sgemm_batched_strided(
+							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+							    1.0f,
+							    scores + static_cast<size_t>(qStart) * T * T, static_cast<int>(T),
+							    static_cast<long long>(T) * T,
+							    V_l + kvh * dHead, static_cast<int>(dModelKV),
+							    0LL,  // stride 0: all Q heads in group share same V head
+							    0.0f,
+							    attnConcat_l + qStart * dHead, static_cast<int>(dModel),
+							    static_cast<long long>(T) * dModel,
+							    static_cast<int>(groupSize));
+						}
+					}
+
+					// Wo projection
+					float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+					                     1.0f, attnConcat_l, static_cast<int>(dModel),
+					                     gb.Wo.data(), static_cast<int>(dModel),
+					                     0.0f, attnOut_l, static_cast<int>(dModel));
+					gpu::add_bias(attnOut_l, gb.bo.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+					// Residual 1: hAfterAttn = layerIn + attnOut
+					float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
+					gpu::device_memcpy_d2d(hAfterAttn_l, layerIn, T * dModel * sizeof(float));
+					gpu::add_residual(hAfterAttn_l, attnOut_l, static_cast<int>(T * dModel));
+
+					// Pre-LN 2
+					float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
+					float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
+					float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
+
+					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					{
+						gpu::rmsnorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), lnEps,
+						                      static_cast<int>(T), static_cast<int>(dModel),
+						                      x2_l, ln2InvStd_l);
+					}
+					else
+					{
+						gpu::layernorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), gb.ln2Beta.data(),
+						                        lnEps, static_cast<int>(T), static_cast<int>(dModel),
+						                        x2_l, ln2Mean_l, ln2InvStd_l);
+					}
+
+					// FFN
+					float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
+					float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
+					float* ffOut_l = gpuTransformerScratch->ffOut.data() + static_cast<size_t>(li) * T * dModel;
+
+					// FF1: x2 * W1^T + b1
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
+					                     1.0f, x2_l, static_cast<int>(dModel),
+					                     gb.W1.data(), static_cast<int>(dModel),
+					                     0.0f, ff1_l, static_cast<int>(ff1Width));
+					gpu::add_bias(ff1_l, gb.b1.data(), static_cast<int>(T), static_cast<int>(ff1Width));
+
+					// Activation
+					if (ffnKind == 1) // SwiGLU
+					{
+						gpu::swiglu_forward(ff1_l, static_cast<int>(T), static_cast<int>(dFF), ff1Act_l);
+					}
+					else if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+					{
+						gpu::gelu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+					}
+					else
+					{
+						gpu::relu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+					}
+
+					// FF2: ffAct * W2^T + b2
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+					                     1.0f, ff1Act_l, static_cast<int>(dFF),
+					                     gb.W2.data(), static_cast<int>(dFF),
+					                     0.0f, ffOut_l, static_cast<int>(dModel));
+					gpu::add_bias(ffOut_l, gb.b2.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+					// Residual 2: hAfterFF = hAfterAttn + ffOut
+					float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li) * T * dModel;
+					gpu::device_memcpy_d2d(hAfterFF_l, hAfterAttn_l, T * dModel * sizeof(float));
+					gpu::add_residual(hAfterFF_l, ffOut_l, static_cast<int>(T * dModel));
+				}
+
+				// Output logits
+				const float* finalH = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(nLayers - 1) * T * dModel;
+				if (tokenLM && tieEmb)
+				{
+					// logits = finalH * E^T + lmBias
+					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
+					                     1.0f, finalH, static_cast<int>(dModel),
+					                     gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
+					                     0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize));
+					gpu::add_bias(gpuTransformerScratch->logits.data(),
+					              gpuTransformerWeights->lmBias.data(),
+					              static_cast<int>(T), static_cast<int>(vocabSize));
+				}
+
+				// Softmax
+				gpu::softmax_forward(gpuTransformerScratch->logits.data(),
+				                      static_cast<int>(T), static_cast<int>(outSize),
+				                      gpuTransformerScratch->probs.data());
+
+				// === Loss / metrics ===
+				std::vector<int> gpuTargetIds;
+				unsigned int gpuValidTargets = 0u;
+				if (tokenLM)
+				{
+					gpuTargetIds.resize(T);
+					for (unsigned int t = 0; t < T; ++t)
+					{
+						int yid = padTokenId;
+						di->getTrainSequenceExpectedTokenId(s, t, yid);
+						gpuTargetIds[t] = yid;
+					}
+					// Upload targets to persistent scratch buffer.
+					gpuTransformerScratch->gpuTargetsT.upload(&gpuTargetIds[0], T);
+
+					// GPU loss: cross-entropy NLL.
+					gpu::cross_entropy_nll_loss(
+					    gpuTransformerScratch->probs.data(),
+					    gpuTransformerScratch->gpuTargetsT.data(),
+					    static_cast<int>(T), static_cast<int>(vocabSize),
+					    padTokenId,
+					    gpuTransformerScratch->lossSum.data(),
+					    gpuTransformerScratch->lossCount.data());
+
+					// GPU accuracy: argmax match count.
+					gpu::argmax_count_matches(
+					    gpuTransformerScratch->probs.data(),
+					    gpuTransformerScratch->gpuTargetsT.data(),
+					    static_cast<int>(T), static_cast<int>(vocabSize),
+					    padTokenId,
+					    gpuTransformerScratch->correctCount.data(),
+					    gpuTransformerScratch->validCount.data());
+
+					// Download scalar results (16 bytes instead of T*vocabSize*4 bytes).
+					float lossVal = 0.0f;
+					int lossCountVal = 0, correctVal = 0, validVal = 0;
+					gpuTransformerScratch->lossSum.download(&lossVal, 1);
+					gpuTransformerScratch->lossCount.download(&lossCountVal, 1);
+					gpuTransformerScratch->correctCount.download(&correctVal, 1);
+					gpuTransformerScratch->validCount.download(&validVal, 1);
+
+					gpuValidTargets = static_cast<unsigned int>(lossCountVal);
+					tokenLmNllSum += static_cast<double>(lossVal);
+					tokenLmTokenCount += static_cast<unsigned long long>(lossCountVal);
+					clsCorrect += static_cast<unsigned long long>(correctVal);
+					clsTotal += static_cast<unsigned long long>(validVal);
+
+					targetsProcessed += static_cast<unsigned long long>(gpuValidTargets);
+				}
+				else
+				{
+					targetsProcessed += static_cast<unsigned long long>(T);
+				}
+
+				// === GPU Backward pass ===
+				if (seqInBatch == 0u)
+				{
+					gpu::zeroTransformerGradients(*gpuTransformerWeights);
+					timeStepsInBatch = 0u;
+				}
+
+				// Compute dLogits on GPU.
+				if (tokenLM)
+				{
+					// dLogits = probs - one_hot(targets)
+					gpu::softmax_cross_entropy_bwd(
+					    gpuTransformerScratch->probs.data(),
+					    gpuTransformerScratch->gpuTargetsT.data(),
+					    static_cast<int>(T), static_cast<int>(vocabSize),
+					    gpuTransformerScratch->dLogits.data());
+
+					// Backprop tied LM head: logits = hFinal * E^T + lmBias
+					// dH = dLogits * E
+					const float* finalH = gpuTransformerScratch->hAfterFF.data() +
+					    static_cast<size_t>(nLayers - 1) * T * dModel;
+
+					gpu::sgemm_rowmajor(
+					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(vocabSize),
+					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
+					    gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
+					    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
+
+					// gTokE += dLogits^T * hFinal  [vocabSize, dModel]
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(vocabSize), static_cast<int>(dModel), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
+					    finalH, static_cast<int>(dModel),
+					    1.0f, gpuTransformerWeights->gTokE.data(), static_cast<int>(dModel));
+
+					// gLmBias += sum_rows(dLogits)
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dLogits.data(),
+					    static_cast<int>(T), static_cast<int>(vocabSize),
+					    1.0f, gpuTransformerWeights->gLmBias.data());
+
+					timeStepsInBatch += gpuValidTargets;
+				}
+				else
+				{
+					// Non-tokenLM: dLogits computed from probs - expected on CPU, upload.
+					std::vector<float> probsHost(static_cast<size_t>(T) * outSize);
+					gpuTransformerScratch->probs.download(&probsHost[0], probsHost.size());
+					std::vector<float> dLogitsHost(static_cast<size_t>(T) * outSize, 0.0f);
+					for (unsigned int t = 0; t < T; ++t)
+					{
+						const float* expRow = NULL;
+						unsigned int expSize = 0u;
+						di->getTrainSequenceExpectedRowView(s, t, expRow, expSize);
+						const size_t off = static_cast<size_t>(t) * outSize;
+						for (unsigned int k = 0; k < outSize; ++k)
+						{
+							const float expv = (expRow && k < expSize) ? expRow[k] : 0.0f;
+							dLogitsHost[off + k] = probsHost[off + k] - expv;
+						}
+					}
+					gpuTransformerScratch->dLogits.upload(&dLogitsHost[0], dLogitsHost.size());
+
+					// dH = dLogits * WOut  [T, dModel]
+					gpu::sgemm_rowmajor(
+					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(outSize),
+					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
+					    gpuTransformerWeights->WOut.data(), static_cast<int>(dModel),
+					    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
+
+					// gWOut += dLogits^T * hFinal  [outSize, dModel]
+					const float* finalH = gpuTransformerScratch->hAfterFF.data() +
+					    static_cast<size_t>(nLayers - 1) * T * dModel;
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(outSize), static_cast<int>(dModel), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
+					    finalH, static_cast<int>(dModel),
+					    1.0f, gpuTransformerWeights->gWOut.data(), static_cast<int>(dModel));
+
+					// gBOut += sum_rows(dLogits)
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dLogits.data(),
+					    static_cast<int>(T), static_cast<int>(outSize),
+					    1.0f, gpuTransformerWeights->gBOut.data());
+
+					timeStepsInBatch += T;
+				}
+
+				// RoPE invFreq already uploaded to scratch before forward layer loop.
+				const unsigned int ropeHalfDim = fwdRopeHalfDim;
+
+				// Backprop through blocks (reverse order).
+				for (int li = static_cast<int>(nLayers) - 1; li >= 0; --li)
+				{
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
+					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+
+					const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
+					    : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
+					const float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
+					const float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
+					const float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
+					const float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
+					const float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
+					const float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
+
+					// dH is gradient w.r.t. hAfterFF[li].
+					// Residual: hAfterFF = hAfterAttn + ffOut => dFFOut = dH, dHAfterAttn (residual) = dH.
+					// Copy dH into dH2 for the residual-to-hAfterAttn path.
+					gpu::device_memcpy_d2d(gpuTransformerScratch->dH2.data(),
+					           gpuTransformerScratch->dH.data(),
+					           T * dModel * sizeof(float));
+
+					// --- FFN backward ---
+					// ffOut = W2 * ff1Act + b2  =>  dFF1Act = dH * W2^T, gW2 += dH^T * ff1Act
+					gpu::sgemm_rowmajor(
+					    static_cast<int>(T), static_cast<int>(dFF), static_cast<int>(dModel),
+					    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
+					    gb.W2.data(), static_cast<int>(dFF),
+					    0.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF));
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(dModel), static_cast<int>(dFF), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
+					    ff1Act_l, static_cast<int>(dFF),
+					    1.0f, gb.gW2.data(), static_cast<int>(dFF));
+					// gB2 += sum_rows(dH)
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dH.data(),
+					    static_cast<int>(T), static_cast<int>(dModel),
+					    1.0f, gb.gB2.data());
+
+					// Activation backward.
+					if (ffnKind == 1) // SwiGLU
+					{
+						gpu::swiglu_backward(
+						    gpuTransformerScratch->dFF1Act.data(), ff1_l,
+						    static_cast<int>(T), static_cast<int>(dFF),
+						    gpuTransformerScratch->dFF1Cat.data());
+						// ff1 = W1 * x2 + b1 => dX2 = dFF1Cat * W1^T, gW1 += dFF1Cat^T * x2
+						gpu::sgemm_rowmajor(
+						    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(ff1Width),
+						    1.0f, gpuTransformerScratch->dFF1Cat.data(), static_cast<int>(ff1Width),
+						    gb.W1.data(), static_cast<int>(dModel),
+						    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
+						gpu::sgemm_rowmajor_atb(
+						    static_cast<int>(ff1Width), static_cast<int>(dModel), static_cast<int>(T),
+						    1.0f, gpuTransformerScratch->dFF1Cat.data(), static_cast<int>(ff1Width),
+						    x2_l, static_cast<int>(dModel),
+						    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+						gpu::reduce_rows_sum(
+						    gpuTransformerScratch->dFF1Cat.data(),
+						    static_cast<int>(T), static_cast<int>(ff1Width),
+						    1.0f, gb.gB1.data());
+					}
+					else
+					{
+						// GELU/ReLU backward
+						if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+						{
+							gpu::gelu_backward(
+							    gpuTransformerScratch->dFF1Act.data(), ff1_l,
+							    static_cast<int>(T * dFF),
+							    gpuTransformerScratch->dFF1Act.data());
+						}
+						else
+						{
+							gpu::relu_backward(
+							    gpuTransformerScratch->dFF1Act.data(), ff1_l,
+							    static_cast<int>(T * dFF),
+							    gpuTransformerScratch->dFF1Act.data());
+						}
+						// ff1 = W1 * x2 + b1 => dX2, gW1
+						gpu::sgemm_rowmajor(
+						    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+						    1.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF),
+						    gb.W1.data(), static_cast<int>(dModel),
+						    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
+						gpu::sgemm_rowmajor_atb(
+						    static_cast<int>(dFF), static_cast<int>(dModel), static_cast<int>(T),
+						    1.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF),
+						    x2_l, static_cast<int>(dModel),
+						    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+						gpu::reduce_rows_sum(
+						    gpuTransformerScratch->dFF1Act.data(),
+						    static_cast<int>(T), static_cast<int>(dFF),
+						    1.0f, gb.gB1.data());
+					}
+
+					// --- LN2 backward ---
+					const float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
+					const float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
+					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					{
+						gpu::rmsnorm_backward(
+						    gpuTransformerScratch->dX2.data(), hAfterAttn_l,
+						    gb.ln2Gamma.data(), ln2InvStd_l,
+						    static_cast<int>(T), static_cast<int>(dModel),
+						    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+						    gb.gLn2Gamma.data());
+					}
+					else
+					{
+						gpu::layernorm_backward(
+						    gpuTransformerScratch->dX2.data(), hAfterAttn_l,
+						    gb.ln2Gamma.data(), ln2Mean_l, ln2InvStd_l,
+						    static_cast<int>(T), static_cast<int>(dModel),
+						    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+						    gb.gLn2Gamma.data(), gb.gLn2Beta.data());
+					}
+
+					// Combine: dHAfterAttn = dH2 (residual) + dHAfterAttnFromLN
+					gpu::add_residual(gpuTransformerScratch->dH2.data(),
+					    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+					    static_cast<int>(T * dModel));
+
+					// --- Wo backward ---
+					// attnOut = Wo * attnConcat + bo  =>  dAttnConcat, gWo
+					gpu::sgemm_rowmajor(
+					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+					    1.0f, gpuTransformerScratch->dH2.data(), static_cast<int>(dModel),
+					    gb.Wo.data(), static_cast<int>(dModel),
+					    0.0f, gpuTransformerScratch->dAttnConcat.data(), static_cast<int>(dModel));
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dH2.data(), static_cast<int>(dModel),
+					    attnConcat_l, static_cast<int>(dModel),
+					    1.0f, gb.gWo.data(), static_cast<int>(dModel));
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dH2.data(),
+					    static_cast<int>(T), static_cast<int>(dModel),
+					    1.0f, gb.gBo.data());
+
+					// dH = dH2 for the residual-to-hIn path (copy for next iteration).
+					gpu::device_memcpy_d2d(gpuTransformerScratch->dH.data(),
+					           gpuTransformerScratch->dH2.data(),
+					           T * dModel * sizeof(float));
+
+					// --- Attention backward (batched GEMM) ---
+					float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
+					float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
+					float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
+
+					// Zero dK/dV (dQ is overwritten per-head, but dK/dV accumulate for GQA).
+					gpu::device_memset_bytes(gpuTransformerScratch->dKfull.data(), 0, T * dModelKV * sizeof(float));
+					gpu::device_memset_bytes(gpuTransformerScratch->dVfull.data(), 0, T * dModelKV * sizeof(float));
+
+					{
+						const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
+						const unsigned int groupSize = nHeads / nKVHeads;
+						float* scores = gpuTransformerScratch->attnScores.data();
+						const float* attnP = gpuTransformerScratch->attnProbs.data();
+
+						for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
+						{
+							const unsigned int qStart = kvh * groupSize;
+							const float* P_group = attnP + static_cast<size_t>(qStart) * T * T;
+							float* dS = scores; // reuse attnScores as scratch for dS
+
+							// 1. dP[groupSize, T, T] = dO[groupSize, T, dHead] * V_kvh[T, dHead]^T
+							gpu::sgemm_batched_strided_abt(
+							    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
+							    1.0f,
+							    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
+							    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
+							    V_l + kvh * dHead,
+							    static_cast<int>(dModelKV), 0LL,
+							    0.0f,
+							    dS, static_cast<int>(T), static_cast<long long>(T) * T,
+							    static_cast<int>(groupSize));
+
+							// 2. softmax backward: dS = P * (dP - row_sum(dP * P))
+							gpu::softmax_backward_attn(P_group, dS,
+							    static_cast<int>(groupSize) * static_cast<int>(T),
+							    static_cast<int>(T), dS);
+
+							// Scale dS by invSqrt for the Q*K^T scaling
+							gpu::scale_array(dS, invSqrt,
+							    static_cast<int>(groupSize) * static_cast<int>(T) * static_cast<int>(T));
+
+							// 3. dQ[groupSize, T, dHead] = dS[groupSize, T, T] * K_kvh[T, dHead]
+							gpu::sgemm_batched_strided(
+							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+							    1.0f,
+							    dS, static_cast<int>(T), static_cast<long long>(T) * T,
+							    K_l + kvh * dHead, static_cast<int>(dModelKV), 0LL,
+							    0.0f,
+							    gpuTransformerScratch->dQfull.data() + qStart * dHead,
+							    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
+							    static_cast<int>(groupSize));
+
+							// 4. dK_kvh[T, dHead] += sum over group of dS_h^T[T, T] * Q_h[T, dHead]
+							// Use batched ATB: dK += dS^T * Q, beta=1.0 to accumulate.
+							gpu::sgemm_batched_strided_atb(
+							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+							    1.0f,
+							    dS, static_cast<int>(T), static_cast<long long>(T) * T,
+							    Q_l + qStart * dHead, static_cast<int>(dModel),
+							    static_cast<long long>(T) * dModel,
+							    1.0f,
+							    gpuTransformerScratch->dKfull.data() + kvh * dHead,
+							    static_cast<int>(dModelKV), 0LL,
+							    static_cast<int>(groupSize));
+
+							// 5. dV_kvh[T, dHead] += sum over group of P_h^T[T, T] * dO_h[T, dHead]
+							gpu::sgemm_batched_strided_atb(
+							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+							    1.0f,
+							    P_group, static_cast<int>(T), static_cast<long long>(T) * T,
+							    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
+							    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
+							    1.0f,
+							    gpuTransformerScratch->dVfull.data() + kvh * dHead,
+							    static_cast<int>(dModelKV), 0LL,
+							    static_cast<int>(groupSize));
+						}
+					}
+
+					// --- RoPE backward (inverse rotation) ---
+					if (useRope && gpuTransformerScratch->gpuInvFreq.allocated())
+					{
+						gpu::rope_apply(gpuTransformerScratch->dQfull.data(),
+						    gpuTransformerScratch->gpuInvFreq.data(),
+						    static_cast<int>(T), static_cast<int>(nHeads),
+						    static_cast<int>(dHead), static_cast<int>(ropeHalfDim), true);
+						gpu::rope_apply(gpuTransformerScratch->dKfull.data(),
+						    gpuTransformerScratch->gpuInvFreq.data(),
+						    static_cast<int>(T), static_cast<int>(nKVHeads),
+						    static_cast<int>(dHead), static_cast<int>(ropeHalfDim), true);
+					}
+
+					// --- Q/K/V projection backward ---
+					// dX1 = dQ*Wq^T + dK*Wk^T + dV*Wv^T
+					// Also accumulate gWq, gBq, gWk, gBk, gWv, gBv.
+
+					// Q: dXtmp = dQ * Wq^T
+					gpu::sgemm_rowmajor(
+					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+					    1.0f, gpuTransformerScratch->dQfull.data(), static_cast<int>(dModel),
+					    gb.Wq.data(), static_cast<int>(dModel),
+					    0.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dQfull.data(), static_cast<int>(dModel),
+					    x1_l, static_cast<int>(dModel),
+					    1.0f, gb.gWq.data(), static_cast<int>(dModel));
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dQfull.data(),
+					    static_cast<int>(T), static_cast<int>(dModel),
+					    1.0f, gb.gBq.data());
+
+					// K: dXtmp = dK * Wk^T, accumulate into dX1
+					gpu::sgemm_rowmajor(
+					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
+					    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
+					    gb.Wk.data(), static_cast<int>(dModel),
+					    0.0f, gpuTransformerScratch->dXtmp.data(), static_cast<int>(dModel));
+					gpu::add_residual(gpuTransformerScratch->dX1.data(),
+					    gpuTransformerScratch->dXtmp.data(), static_cast<int>(T * dModel));
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
+					    x1_l, static_cast<int>(dModel),
+					    1.0f, gb.gWk.data(), static_cast<int>(dModel));
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dKfull.data(),
+					    static_cast<int>(T), static_cast<int>(dModelKV),
+					    1.0f, gb.gBk.data());
+
+					// V: dXtmp = dV * Wv^T, accumulate into dX1
+					gpu::sgemm_rowmajor(
+					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
+					    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
+					    gb.Wv.data(), static_cast<int>(dModel),
+					    0.0f, gpuTransformerScratch->dXtmp.data(), static_cast<int>(dModel));
+					gpu::add_residual(gpuTransformerScratch->dX1.data(),
+					    gpuTransformerScratch->dXtmp.data(), static_cast<int>(T * dModel));
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
+					    x1_l, static_cast<int>(dModel),
+					    1.0f, gb.gWv.data(), static_cast<int>(dModel));
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dVfull.data(),
+					    static_cast<int>(T), static_cast<int>(dModelKV),
+					    1.0f, gb.gBv.data());
+
+					// --- LN1 backward ---
+					const float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
+					const float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
+					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					{
+						gpu::rmsnorm_backward(
+						    gpuTransformerScratch->dX1.data(), layerIn,
+						    gb.ln1Gamma.data(), ln1InvStd_l,
+						    static_cast<int>(T), static_cast<int>(dModel),
+						    gpuTransformerScratch->dHInFromLN.data(),
+						    gb.gLn1Gamma.data());
+					}
+					else
+					{
+						gpu::layernorm_backward(
+						    gpuTransformerScratch->dX1.data(), layerIn,
+						    gb.ln1Gamma.data(), ln1Mean_l, ln1InvStd_l,
+						    static_cast<int>(T), static_cast<int>(dModel),
+						    gpuTransformerScratch->dHInFromLN.data(),
+						    gb.gLn1Gamma.data(), gb.gLn1Beta.data());
+					}
+
+					// Combine into dH: dH += dHInFromLN
+					gpu::add_residual(gpuTransformerScratch->dH.data(),
+					    gpuTransformerScratch->dHInFromLN.data(),
+					    static_cast<int>(T * dModel));
+				} // layers backward
+
+				// Backprop through input embedding/projection.
+				if (tokenLM)
+				{
+					// gTokE[tokenId[t]] += dH[t] for each timestep.
+					gpu::embedding_scatter_add(
+					    gpuTransformerWeights->gTokE.data(),
+					    gpuTransformerScratch->tokenIds.data(),
+					    gpuTransformerScratch->dH.data(),
+					    static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel));
+				}
+				else
+				{
+					// gWIn += dH^T * x, gBIn += sum_rows(dH)
+					gpu::sgemm_rowmajor_atb(
+					    static_cast<int>(dModel), static_cast<int>(inputSize), static_cast<int>(T),
+					    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
+					    gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
+					    1.0f, gpuTransformerWeights->gWIn.data(), static_cast<int>(inputSize));
+					gpu::reduce_rows_sum(
+					    gpuTransformerScratch->dH.data(),
+					    static_cast<int>(T), static_cast<int>(dModel),
+					    1.0f, gpuTransformerWeights->gBIn.data());
+				}
+
+				++seqInBatch;
+
+				// === Optimizer step (when batch is complete) ===
+				if (seqInBatch >= seqBatchMax && timeStepsInBatch > 0u)
+				{
+					const float invBatch = 1.0f / static_cast<float>(timeStepsInBatch);
+					const float beta1 = trainingConfig.optimizer.adamBeta1;
+					const float beta2 = trainingConfig.optimizer.adamBeta2;
+					const float adamEps = trainingConfig.optimizer.adamEps;
+					tensorTransformer.optimizerStep += 1ULL;
+					const int stepInt = static_cast<int>(tensorTransformer.optimizerStep);
+
+					// Token embedding (layer index 0).
+					if (tokenLM)
+					{
+						const float lr = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
+						const float wd = skeleton->getWeightDecay2(0u);
+						const int tokEn = static_cast<int>(static_cast<size_t>(vocabSize) * dModel);
+						gpu::scale_array(gpuTransformerWeights->gTokE.data(), invBatch, tokEn);
+						gpu::adam_update(gpuTransformerWeights->tokE.data(),
+						    gpuTransformerWeights->gTokE.data(),
+						    gpuTransformerWeights->vTokE.data(),
+						    gpuTransformerWeights->v2TokE.data(),
+						    lr, beta1, beta2, adamEps, wd, stepInt, tokEn);
+
+						const int lbN = static_cast<int>(vocabSize);
+						gpu::scale_array(gpuTransformerWeights->gLmBias.data(), invBatch, lbN);
+						gpu::adam_update(gpuTransformerWeights->lmBias.data(),
+						    gpuTransformerWeights->gLmBias.data(),
+						    gpuTransformerWeights->mLmBias.data(),
+						    gpuTransformerWeights->v2LmBias.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lbN);
+					}
+
+					// Input projection (layer index 0).
+					{
+						const float lr = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
+						const float wd = skeleton->getWeightDecay2(0u);
+						const int wn = static_cast<int>(gpuTransformerWeights->WIn.size());
+						if (wn > 0)
+						{
+							gpu::scale_array(gpuTransformerWeights->gWIn.data(), invBatch, wn);
+							gpu::adam_update(gpuTransformerWeights->WIn.data(),
+							    gpuTransformerWeights->gWIn.data(),
+							    gpuTransformerWeights->vWIn.data(),
+							    gpuTransformerWeights->v2WIn.data(),
+							    lr, beta1, beta2, adamEps, wd, stepInt, wn);
+						}
+						const int bn = static_cast<int>(gpuTransformerWeights->bIn.size());
+						if (bn > 0)
+						{
+							gpu::scale_array(gpuTransformerWeights->gBIn.data(), invBatch, bn);
+							gpu::adam_update(gpuTransformerWeights->bIn.data(),
+							    gpuTransformerWeights->gBIn.data(),
+							    gpuTransformerWeights->mBIn.data(),
+							    gpuTransformerWeights->v2BIn.data(),
+							    lr, beta1, beta2, adamEps, 0.0f, stepInt, bn);
+						}
+					}
+
+					// Per-block weights (layer index 1..nLayers).
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						const unsigned int idx = bli + 1u;
+						const float lr = skeleton->getLearningRate(idx) * lrScheduleMultiplier;
+						const float wd = skeleton->getWeightDecay2(idx);
+
+						// Weight matrices.
+						const int wqN = static_cast<int>(gb.Wq.size());
+						gpu::scale_array(gb.gWq.data(), invBatch, wqN);
+						gpu::adam_update(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(),
+						    lr, beta1, beta2, adamEps, wd, stepInt, wqN);
+						const int wkN = static_cast<int>(gb.Wk.size());
+						gpu::scale_array(gb.gWk.data(), invBatch, wkN);
+						gpu::adam_update(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(),
+						    lr, beta1, beta2, adamEps, wd, stepInt, wkN);
+						const int wvN = static_cast<int>(gb.Wv.size());
+						gpu::scale_array(gb.gWv.data(), invBatch, wvN);
+						gpu::adam_update(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(),
+						    lr, beta1, beta2, adamEps, wd, stepInt, wvN);
+						const int woN = static_cast<int>(gb.Wo.size());
+						gpu::scale_array(gb.gWo.data(), invBatch, woN);
+						gpu::adam_update(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(),
+						    lr, beta1, beta2, adamEps, wd, stepInt, woN);
+						const int w1N = static_cast<int>(gb.W1.size());
+						gpu::scale_array(gb.gW1.data(), invBatch, w1N);
+						gpu::adam_update(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(),
+						    lr, beta1, beta2, adamEps, wd, stepInt, w1N);
+						const int w2N = static_cast<int>(gb.W2.size());
+						gpu::scale_array(gb.gW2.data(), invBatch, w2N);
+						gpu::adam_update(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(),
+						    lr, beta1, beta2, adamEps, wd, stepInt, w2N);
+
+						// Biases (no weight decay).
+						const int bqN = static_cast<int>(gb.bq.size());
+						gpu::scale_array(gb.gBq.data(), invBatch, bqN);
+						gpu::adam_update(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, bqN);
+						const int bkN = static_cast<int>(gb.bk.size());
+						gpu::scale_array(gb.gBk.data(), invBatch, bkN);
+						gpu::adam_update(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, bkN);
+						const int bvN = static_cast<int>(gb.bv.size());
+						gpu::scale_array(gb.gBv.data(), invBatch, bvN);
+						gpu::adam_update(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, bvN);
+						const int boN = static_cast<int>(gb.bo.size());
+						gpu::scale_array(gb.gBo.data(), invBatch, boN);
+						gpu::adam_update(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, boN);
+						const int b1N = static_cast<int>(gb.b1.size());
+						gpu::scale_array(gb.gB1.data(), invBatch, b1N);
+						gpu::adam_update(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, b1N);
+						const int b2N = static_cast<int>(gb.b2.size());
+						gpu::scale_array(gb.gB2.data(), invBatch, b2N);
+						gpu::adam_update(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, b2N);
+
+						// LN params (no weight decay).
+						const int lgN = static_cast<int>(gb.ln1Gamma.size());
+						gpu::scale_array(gb.gLn1Gamma.data(), invBatch, lgN);
+						gpu::adam_update(gb.ln1Gamma.data(), gb.gLn1Gamma.data(),
+						    gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lgN);
+						const int lbN = static_cast<int>(gb.ln1Beta.size());
+						gpu::scale_array(gb.gLn1Beta.data(), invBatch, lbN);
+						gpu::adam_update(gb.ln1Beta.data(), gb.gLn1Beta.data(),
+						    gb.mLn1Beta.data(), gb.v2Ln1Beta.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lbN);
+						const int lg2N = static_cast<int>(gb.ln2Gamma.size());
+						gpu::scale_array(gb.gLn2Gamma.data(), invBatch, lg2N);
+						gpu::adam_update(gb.ln2Gamma.data(), gb.gLn2Gamma.data(),
+						    gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lg2N);
+						const int lb2N = static_cast<int>(gb.ln2Beta.size());
+						gpu::scale_array(gb.gLn2Beta.data(), invBatch, lb2N);
+						gpu::adam_update(gb.ln2Beta.data(), gb.gLn2Beta.data(),
+						    gb.mLn2Beta.data(), gb.v2Ln2Beta.data(),
+						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lb2N);
+					}
+
+					// Output projection (non-tokenLM only).
+					if (!tokenLM)
+					{
+						const unsigned int idx = nLayers;
+						const float lr = skeleton->getLearningRate(idx) * lrScheduleMultiplier;
+						const float wd = skeleton->getWeightDecay2(idx);
+						const int woN = static_cast<int>(gpuTransformerWeights->WOut.size());
+						if (woN > 0)
+						{
+							gpu::scale_array(gpuTransformerWeights->gWOut.data(), invBatch, woN);
+							gpu::adam_update(gpuTransformerWeights->WOut.data(),
+							    gpuTransformerWeights->gWOut.data(),
+							    gpuTransformerWeights->vWOut.data(),
+							    gpuTransformerWeights->v2WOut.data(),
+							    lr, beta1, beta2, adamEps, wd, stepInt, woN);
+						}
+						const int boN = static_cast<int>(gpuTransformerWeights->bOut.size());
+						if (boN > 0)
+						{
+							gpu::scale_array(gpuTransformerWeights->gBOut.data(), invBatch, boN);
+							gpu::adam_update(gpuTransformerWeights->bOut.data(),
+							    gpuTransformerWeights->gBOut.data(),
+							    gpuTransformerWeights->mBOut.data(),
+							    gpuTransformerWeights->v2BOut.data(),
+							    lr, beta1, beta2, adamEps, 0.0f, stepInt, boN);
+						}
+					}
+
+					gpu::synchronize();
+					seqInBatch = 0u;
+					timeStepsInBatch = 0u;
+				}
+			}
+
+			// After GPU training loop: download updated weights back to CPU.
+			TensorTransformerState& ttMut = tensorTransformer;
+			gpu::downloadTransformerWeights(*gpuTransformerWeights,
+			                                ttMut.tokE.empty() ? NULL : &ttMut.tokE[0], ttMut.tokE.size(),
+			                                ttMut.WIn.empty() ? NULL : &ttMut.WIn[0], ttMut.WIn.size(),
+			                                ttMut.bIn.empty() ? NULL : &ttMut.bIn[0], ttMut.bIn.size(),
+			                                ttMut.WOut.empty() ? NULL : &ttMut.WOut[0], ttMut.WOut.size(),
+			                                ttMut.bOut.empty() ? NULL : &ttMut.bOut[0], ttMut.bOut.size(),
+			                                ttMut.lmBias.empty() ? NULL : &ttMut.lmBias[0], ttMut.lmBias.size());
+
+			// Download per-block weights.
+			for (unsigned int l = 0; l < nLayers; ++l)
+			{
+				TensorTransformerState::Block& cb = ttMut.blocks[l];
+				const gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[l];
+				if (gb.Wq.allocated()) gb.Wq.download(&cb.Wq[0], cb.Wq.size());
+				if (gb.Wk.allocated()) gb.Wk.download(&cb.Wk[0], cb.Wk.size());
+				if (gb.Wv.allocated()) gb.Wv.download(&cb.Wv[0], cb.Wv.size());
+				if (gb.Wo.allocated()) gb.Wo.download(&cb.Wo[0], cb.Wo.size());
+				if (gb.W1.allocated()) gb.W1.download(&cb.W1[0], cb.W1.size());
+				if (gb.W2.allocated()) gb.W2.download(&cb.W2[0], cb.W2.size());
+				if (gb.bq.allocated()) gb.bq.download(&cb.bq[0], cb.bq.size());
+				if (gb.bk.allocated()) gb.bk.download(&cb.bk[0], cb.bk.size());
+				if (gb.bv.allocated()) gb.bv.download(&cb.bv[0], cb.bv.size());
+				if (gb.bo.allocated()) gb.bo.download(&cb.bo[0], cb.bo.size());
+				if (gb.b1.allocated()) gb.b1.download(&cb.b1[0], cb.b1.size());
+				if (gb.b2.allocated()) gb.b2.download(&cb.b2[0], cb.b2.size());
+				if (gb.ln1Gamma.allocated()) gb.ln1Gamma.download(&cb.ln1Gamma[0], cb.ln1Gamma.size());
+				if (gb.ln1Beta.allocated()) gb.ln1Beta.download(&cb.ln1Beta[0], cb.ln1Beta.size());
+				if (gb.ln2Gamma.allocated()) gb.ln2Gamma.download(&cb.ln2Gamma[0], cb.ln2Gamma.size());
+				if (gb.ln2Beta.allocated()) gb.ln2Beta.download(&cb.ln2Beta[0], cb.ln2Beta.size());
+			}
+
+			return; // GPU path complete; skip CPU fallback.
+		}
+	}
+#endif // GLADES_HAVE_CUDA
+
 	for (unsigned int s = 0; s < seqCount; ++s)
 	{
 		const unsigned int T = isTrain ? di->getTrainSequenceLength(s) : di->getTestSequenceLength(s);
@@ -2224,7 +3295,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (useSoftmax && N > 0)
 					overallTotalError += static_cast<float>(loss / static_cast<double>(N));
 				if ((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL))
-					confusionMatrix.addResult(results);
+				{
+					const int expIdx = GMath::argmax(expRow, expSize);
+					const int predIdx = GMath::argmax(&transformerScratch.probs[off], outSize);
+					confusionMatrix.addResultDirect(static_cast<unsigned int>(expIdx), static_cast<unsigned int>(predIdx));
+				}
 			}
 		}
 

@@ -695,7 +695,11 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 					}
 
 					if ((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL))
-						confusionMatrix.addResult(results);
+					{
+						const int expIdx = GMath::argmax(expData, expSize);
+						const int predIdx = GMath::argmax(&yFlat[tOffOut], outSize);
+						confusionMatrix.addResultDirect(static_cast<unsigned int>(expIdx), static_cast<unsigned int>(predIdx));
+					}
 				}
 			} // forward timesteps
 

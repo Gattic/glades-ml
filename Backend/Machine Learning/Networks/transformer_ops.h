@@ -27,8 +27,7 @@ inline float relu_deriv_from_y(float y) { return (y > 0.0f) ? 1.0f : 0.0f; }
 // SiLU / Swish: x * sigmoid(x)
 inline float sigmoid(float x)
 {
-	// Stable enough for typical float ranges used in this codebase.
-	return 1.0f / (1.0f + static_cast<float>(exp(-static_cast<double>(x))));
+	return 1.0f / (1.0f + expf(-x));
 }
 
 inline float silu(float x)
@@ -882,14 +881,14 @@ inline void scaled_dot_product_attention_forward_flash_strided(const float* Qbas
 			}
 
 			const float newM = (s > m) ? s : m;
-			const double alpha = exp(static_cast<double>(m - newM));
-			const double beta = exp(static_cast<double>(s - newM));
-			l = l * alpha + beta;
+			const float alpha = expf(m - newM);
+			const float beta = expf(s - newM);
+			l = l * static_cast<double>(alpha) + static_cast<double>(beta);
 
 			// Scale old accumulator + add new contribution.
 			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
 			for (unsigned int dv = 0; dv < dV; ++dv)
-				ot[dv] = (ot[dv] * static_cast<float>(alpha)) + (static_cast<float>(beta) * vu[dv]);
+				ot[dv] = (ot[dv] * alpha) + (beta * vu[dv]);
 			m = newM;
 		}
 
@@ -994,9 +993,9 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 				continue;
 			}
 			const float newM = (s > m) ? s : m;
-			const double alpha = exp(static_cast<double>(m - newM));
-			const double beta = exp(static_cast<double>(s - newM));
-			l = l * alpha + beta;
+			const float alpha = expf(m - newM);
+			const float beta = expf(s - newM);
+			l = l * static_cast<double>(alpha) + static_cast<double>(beta);
 			m = newM;
 		}
 		if (!any || !(l > 0.0))
@@ -1017,15 +1016,14 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 				dPCache[u] = 0.0f;
 				continue;
 			}
-			const double p = exp(static_cast<double>(sCache[u] - m)) * invL;
-			const float pf = static_cast<float>(p);
+			const float pf = static_cast<float>(static_cast<double>(expf(sCache[u] - m)) * invL);
 			pCache[u] = pf;
 
 			// dP = dot(dO[t], V[u])
 			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
 			const float dP = glades::transformer_kernels::dot_f32(dOt, vu, dV);
 			dPCache[u] = dP;
-			rowDot += p * static_cast<double>(dP);
+			rowDot += static_cast<double>(pf) * static_cast<double>(dP);
 
 			// dV[u] += p * dO[t]
 			float* dVu = dVbase + static_cast<size_t>(u) * static_cast<size_t>(dVStride);

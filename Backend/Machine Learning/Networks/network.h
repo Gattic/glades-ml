@@ -42,6 +42,15 @@
 #include <sys/time.h>
 #include <stdint.h>
 
+#ifdef GLADES_HAVE_CUDA
+#include "cuda/gpu_device.h"
+#include "cuda/gpu_dispatch.h"
+#include "cuda/gpu_blas.h"
+#include "cuda/gpu_transformer_state.h"
+#include "cuda/gpu_dff_state.h"
+#include "cuda/gpu_rnn_state.h"
+#endif
+
 // Concurrency primitives:
 // Prefer standard C++ atomics when available; fall back to legacy builtins otherwise.
 #if __cplusplus >= 201103L
@@ -777,6 +786,36 @@ private:
 	TensorTransformerState tensorTransformer;
 	TransformerScratch transformerScratch;
 
+	// === GPU-resident state (CUDA offloading) ===
+	//
+	// When GLADES_HAVE_CUDA is defined and the GPU is enabled, these hold device-side
+	// mirrors of the corresponding CPU tensor state. Weights stay GPU-resident; only
+	// inputs/outputs cross PCIe.
+#ifdef GLADES_HAVE_CUDA
+	gpu::GpuTransformerWeights* gpuTransformerWeights;
+	gpu::GpuTransformerScratch* gpuTransformerScratch;
+	gpu::GpuDFFWeights* gpuDffWeights;
+	gpu::GpuDFFScratch* gpuDffScratch;
+	gpu::GpuRNNWeights* gpuRnnWeights;
+	gpu::GpuGatedWeights* gpuGruWeights;
+	gpu::GpuGatedWeights* gpuLstmWeights;
+#else
+	void* gpuTransformerWeights;
+	void* gpuTransformerScratch;
+	void* gpuDffWeights;
+	void* gpuDffScratch;
+	void* gpuRnnWeights;
+	void* gpuGruWeights;
+	void* gpuLstmWeights;
+#endif
+	bool gpuStateReady;
+
+	// Ensure GPU state is allocated and weights are uploaded.
+	// Returns true if GPU is ready for use, false if CPU fallback should be used.
+	bool ensureGpuState();
+	// Free all GPU state.
+	void freeGpuState();
+
 	// === Positional encoding caches (Transformer) ===
 	//
 	// These caches avoid recomputing expensive pow()-derived frequency terms (sinusoidal PE and RoPE).
@@ -1317,6 +1356,10 @@ public:
 		bool metricsEnabled;
 		TransformerKvPerfBreakdown perf;
 
+		// Opaque pointer to GPU inference state (allocated/freed by transformer_infer.cpp).
+		// NULL when GPU inference is not active.
+		void* gpuInferState;
+
 		TransformerLmSession()
 		    : initialized(false),
 		      maxLen(0u),
@@ -1354,9 +1397,14 @@ public:
 		      ropeThetaCached(0.0f),
 		      ropeInvFreq(),
 		      metricsEnabled(false),
-		      perf()
+		      perf(),
+		      gpuInferState(0)
 		{
 		}
+
+		// Destructor frees GPU inference state if allocated.
+		// Implemented in transformer_infer.cpp to keep CUDA out of the header.
+		~TransformerLmSession();
 
 		void reset()
 		{
@@ -1391,6 +1439,8 @@ public:
 			ropeInvFreq.clear();
 			metricsEnabled = false;
 			perf.reset();
+			// Note: gpuInferState is NOT freed here; the caller (transformerLmSessionReset)
+			// manages GPU lifecycle to avoid pulling CUDA into the header.
 		}
 	};
 

@@ -382,6 +382,28 @@ struct TrainingConfig
 	// Mixed precision (used primarily for transformer net types).
 	MixedPrecisionConfig mixedPrecision;
 
+	// GPU offloading configuration (requires GLADES_HAVE_CUDA).
+	struct GpuConfig
+	{
+		// If true, attempt to use GPU when available.
+		bool enable;
+		// CUDA device ID to use (0 = first GPU).
+		int deviceId;
+		// Minimum problem size (total floats) before offloading to GPU.
+		// Small problems may be faster on CPU due to kernel launch overhead.
+		// 0 = always use GPU when enabled.
+		size_t minProblemSize;
+
+		GpuConfig()
+		    : enable(false),
+		      deviceId(0),
+		      minProblemSize(0)
+		{
+		}
+	};
+
+	GpuConfig gpu;
+
 	TrainingConfig()
 	    : minibatchSizeOverride(0),
 	      tbpttWindowOverride(0),
@@ -390,7 +412,8 @@ struct TrainingConfig
 	      optimizer(),
 	      lrSchedule(),
 	      transformer(),
-	      mixedPrecision()
+	      mixedPrecision(),
+	      gpu()
 	{
 	}
 };

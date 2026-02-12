@@ -7,6 +7,17 @@ file(MAKE_DIRECTORY ${CMAKE_INSTALL_PREFIX}/include)
 
 #Init
 cmake_minimum_required(VERSION 3.10)
+
+# CUDA GPU offloading (must match main build when linking CUDA-built libraries)
+option(GLADES_ENABLE_CUDA "Build with CUDA GPU offloading support" OFF)
+if(GLADES_ENABLE_CUDA)
+	cmake_minimum_required(VERSION 3.18)
+	include(${CMAKE_SOURCE_DIR}/../cmake/CudaGlibcCompat.cmake)
+	cuda_glibc_compat_apply()
+	enable_language(CUDA)
+	add_definitions(-DGLADES_HAVE_CUDA=1)
+endif()
+
 set(CMAKE_CXX_STANDARD 98)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -62,6 +73,12 @@ target_link_libraries(${PROJECT_NAME}
 	PCATests glades shmea)#custom libs
 
 target_include_directories(${PROJECT_NAME} PRIVATE "Backend")
+
+# When CUDA is enabled, the final executable must run nvlink to resolve
+# device symbols from separable compilation in GladesCUDA.
+if(GLADES_ENABLE_CUDA)
+	set_target_properties(${PROJECT_NAME} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
 
 #make run
 add_custom_target(run

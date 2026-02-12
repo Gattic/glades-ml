@@ -1,0 +1,1784 @@
+// Custom CUDA kernel implementations for Glades ML.
+//
+// Contains normalization, activation, attention, embedding, optimizer, and
+// utility kernels together with thin host-side wrapper functions that handle
+// grid/block configuration.
+//
+// Requirements: CUDA 11+, SM 6.0+.
+
+#include "gpu_kernels.h"
+
+#ifdef GLADES_HAVE_CUDA
+
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cfloat>
+#include <cmath>
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+namespace glades {
+namespace gpu {
+
+namespace {
+
+// Convenience: check a CUDA call, print on error, return false.
+#define GLADES_CUDA_CHECK(call)                                               \
+	do {                                                                      \
+		cudaError_t err_ = (call);                                            \
+		if (err_ != cudaSuccess) {                                            \
+			fprintf(stderr, "[glades-cuda] %s:%d  %s  -> %s\n",              \
+			        __FILE__, __LINE__, #call, cudaGetErrorString(err_));     \
+			return false;                                                     \
+		}                                                                     \
+	} while (0)
+
+// Block size for simple element-wise kernels.
+static constexpr int kBlockElem = 256;
+
+// Maximum block size for per-row kernels.
+static constexpr int kMaxBlockRow = 1024;
+
+// Choose block size for per-row kernels: min(cols, kMaxBlockRow) rounded up to
+// the nearest warp (32).
+inline int rowBlockSize(int cols)
+{
+	int b = cols < kMaxBlockRow ? cols : kMaxBlockRow;
+	b = ((b + 31) / 32) * 32;
+	if (b < 32) b = 32;
+	if (b > kMaxBlockRow) b = kMaxBlockRow;
+	return b;
+}
+
+} // anonymous namespace
+
+// ===========================================================================
+//  Warp-level primitives
+// ===========================================================================
+
+namespace {
+
+__device__ __forceinline__ float warpReduceSum(float val)
+{
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+	return val;
+}
+
+__device__ __forceinline__ float warpReduceMax(float val)
+{
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+	return val;
+}
+
+// Block-wide sum reduction using shared memory.  Caller must provide
+// smem of size >= (blockDim.x / 32) floats.
+__device__ float blockReduceSum(float val, float* smem)
+{
+	int lane = threadIdx.x & 31;
+	int wid  = threadIdx.x >> 5;
+
+	val = warpReduceSum(val);
+	if (lane == 0) smem[wid] = val;
+	__syncthreads();
+
+	int numWarps = (blockDim.x + 31) / 32;
+	val = (threadIdx.x < (unsigned)numWarps) ? smem[threadIdx.x] : 0.0f;
+	if (wid == 0) val = warpReduceSum(val);
+	return val;
+}
+
+// Block-wide max reduction using shared memory.
+__device__ float blockReduceMax(float val, float* smem)
+{
+	int lane = threadIdx.x & 31;
+	int wid  = threadIdx.x >> 5;
+
+	val = warpReduceMax(val);
+	if (lane == 0) smem[wid] = val;
+	__syncthreads();
+
+	int numWarps = (blockDim.x + 31) / 32;
+	val = (threadIdx.x < (unsigned)numWarps) ? smem[threadIdx.x] : -FLT_MAX;
+	if (wid == 0) val = warpReduceMax(val);
+	return val;
+}
+
+} // anonymous namespace
+
+// ===========================================================================
+//  1. Layer normalization forward
+// ===========================================================================
+
+namespace {
+
+__global__ void layernorm_forward_rows(const float* __restrict__ x,
+                                       const float* __restrict__ gamma,
+                                       const float* __restrict__ beta,
+                                       float eps, int cols,
+                                       float* __restrict__ out,
+                                       float* __restrict__ meanOut,
+                                       float* __restrict__ invStdOut)
+{
+	// One block per row.
+	int row = blockIdx.x;
+	const float* xRow = x + (size_t)row * cols;
+	float* oRow       = out + (size_t)row * cols;
+
+	extern __shared__ float smem[];  // at least (blockDim.x / 32) * 2 floats
+	float* sSum  = smem;
+	float* sSum2 = smem + (blockDim.x / 32 + 1);
+
+	// Pass 1: compute mean.
+	float localSum = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localSum += xRow[i];
+	localSum = blockReduceSum(localSum, sSum);
+
+	__shared__ float sMean;
+	__shared__ float sInvStd;
+	if (threadIdx.x == 0)
+		sMean = localSum / (float)cols;
+	__syncthreads();
+
+	float mu = sMean;
+
+	// Pass 2: variance.
+	float localVar = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		localVar += d * d;
+	}
+	localVar = blockReduceSum(localVar, sSum2);
+
+	if (threadIdx.x == 0) {
+		float var = localVar / (float)cols;
+		sInvStd = rsqrtf(var + eps);
+	}
+	__syncthreads();
+
+	float inv = sInvStd;
+
+	// Write side-outputs.
+	if (threadIdx.x == 0) {
+		meanOut[row]   = mu;
+		invStdOut[row] = inv;
+	}
+
+	// Pass 3: normalize.
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = gamma[i] * (xRow[i] - mu) * inv + beta[i];
+}
+
+} // anonymous namespace
+
+bool layernorm_forward(const float* x, const float* gamma, const float* beta,
+                       float eps, int rows, int cols,
+                       float* out, float* mean, float* invStd)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	layernorm_forward_rows<<<rows, block, smemBytes>>>(
+		x, gamma, beta, eps, cols, out, mean, invStd);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  2. Layer normalization backward
+// ===========================================================================
+
+namespace {
+
+// dx kernel: one block per row, no atomics.
+__global__ void layernorm_backward_dx(const float* __restrict__ dout,
+                                      const float* __restrict__ x,
+                                      const float* __restrict__ gamma,
+                                      const float* __restrict__ mean,
+                                      const float* __restrict__ invStd,
+                                      int cols,
+                                      float* __restrict__ dx)
+{
+	int row = blockIdx.x;
+	const float* dRow = dout + (size_t)row * cols;
+	const float* xRow = x    + (size_t)row * cols;
+	float* dxRow      = dx   + (size_t)row * cols;
+
+	float mu  = mean[row];
+	float inv = invStd[row];
+
+	extern __shared__ float smem[];
+	float* s1 = smem;
+	float* s2 = smem + (blockDim.x / 32 + 1);
+
+	float localDs = 0.0f;
+	float localDb = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float xhat = (xRow[i] - mu) * inv;
+		float dg   = dRow[i] * gamma[i];
+		localDs += dg * xhat;
+		localDb += dg;
+	}
+
+	localDs = blockReduceSum(localDs, s1);
+	__syncthreads();
+	localDb = blockReduceSum(localDb, s2);
+
+	__shared__ float sDs, sDb;
+	if (threadIdx.x == 0) {
+		sDs = localDs;
+		sDb = localDb;
+	}
+	__syncthreads();
+
+	float ds = sDs;
+	float db = sDb;
+	float invN = 1.0f / (float)cols;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float xhat = (xRow[i] - mu) * inv;
+		float dg   = dRow[i] * gamma[i];
+		dxRow[i] = inv * (dg - invN * (db + xhat * ds));
+	}
+}
+
+// dgamma/dbeta kernel: one block per column, threads reduce across rows.
+__global__ void layernorm_backward_dgamma_dbeta(
+    const float* __restrict__ dout,
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ invStd,
+    int rows, int cols,
+    float* __restrict__ dgamma,
+    float* __restrict__ dbeta)
+{
+	int col = blockIdx.x;
+	if (col >= cols) return;
+
+	extern __shared__ float smem[];
+	float* s1 = smem;
+	float* s2 = smem + (blockDim.x / 32 + 1);
+
+	float localDg = 0.0f;
+	float localDb = 0.0f;
+	for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+		float mu  = mean[r];
+		float inv = invStd[r];
+		float xhat = (x[(size_t)r * cols + col] - mu) * inv;
+		float d = dout[(size_t)r * cols + col];
+		localDg += d * xhat;
+		localDb += d;
+	}
+
+	localDg = blockReduceSum(localDg, s1);
+	__syncthreads();
+	localDb = blockReduceSum(localDb, s2);
+
+	if (threadIdx.x == 0) {
+		dgamma[col] += localDg;
+		dbeta[col]  += localDb;
+	}
+}
+
+} // anonymous namespace
+
+bool layernorm_backward(const float* dout, const float* x,
+                        const float* gamma, const float* mean,
+                        const float* invStd, int rows, int cols,
+                        float* dx, float* dgamma, float* dbeta)
+{
+	if (rows <= 0 || cols <= 0) return true;
+
+	// Kernel 1: dx (one block per row).
+	int block1 = rowBlockSize(cols);
+	int smemBytes1 = (block1 / 32 + 2) * 2 * sizeof(float);
+	layernorm_backward_dx<<<rows, block1, smemBytes1>>>(
+		dout, x, gamma, mean, invStd, cols, dx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Kernel 2: dgamma/dbeta (one block per column, reduce across rows).
+	int block2 = rowBlockSize(rows);
+	int smemBytes2 = (block2 / 32 + 2) * 2 * sizeof(float);
+	layernorm_backward_dgamma_dbeta<<<cols, block2, smemBytes2>>>(
+		dout, x, mean, invStd, rows, cols, dgamma, dbeta);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
+// ===========================================================================
+//  3. RMSNorm forward
+// ===========================================================================
+
+namespace {
+
+__global__ void rmsnorm_forward_rows(const float* __restrict__ x,
+                                     const float* __restrict__ gamma,
+                                     float eps, int cols,
+                                     float* __restrict__ out,
+                                     float* __restrict__ invRmsOut)
+{
+	int row = blockIdx.x;
+	const float* xRow = x + (size_t)row * cols;
+	float* oRow       = out + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+
+	float localSS = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localSS += xRow[i] * xRow[i];
+	localSS = blockReduceSum(localSS, smem);
+
+	__shared__ float sInvRms;
+	if (threadIdx.x == 0) {
+		float rms = localSS / (float)cols;
+		sInvRms = rsqrtf(rms + eps);
+		invRmsOut[row] = sInvRms;
+	}
+	__syncthreads();
+
+	float inv = sInvRms;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = gamma[i] * xRow[i] * inv;
+}
+
+} // anonymous namespace
+
+bool rmsnorm_forward(const float* x, const float* gamma, float eps,
+                     int rows, int cols, float* out, float* invRms)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 1) * sizeof(float);
+	rmsnorm_forward_rows<<<rows, block, smemBytes>>>(
+		x, gamma, eps, cols, out, invRms);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  4. RMSNorm backward
+// ===========================================================================
+
+namespace {
+
+// dx kernel: one block per row, no atomics.
+__global__ void rmsnorm_backward_dx(const float* __restrict__ dout,
+                                    const float* __restrict__ x,
+                                    const float* __restrict__ gamma,
+                                    const float* __restrict__ invRms,
+                                    int cols,
+                                    float* __restrict__ dx)
+{
+	int row = blockIdx.x;
+	const float* dRow = dout + (size_t)row * cols;
+	const float* xRow = x    + (size_t)row * cols;
+	float* dxRow      = dx   + (size_t)row * cols;
+	float inv = invRms[row];
+
+	extern __shared__ float smem[];
+
+	float localDot = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localDot += dRow[i] * gamma[i] * xRow[i];
+	localDot = blockReduceSum(localDot, smem);
+
+	__shared__ float sDot;
+	if (threadIdx.x == 0)
+		sDot = localDot;
+	__syncthreads();
+
+	float dot  = sDot;
+	float invN = 1.0f / (float)cols;
+	float inv3 = inv * inv * inv;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		dxRow[i] = inv * gamma[i] * dRow[i] - xRow[i] * inv3 * dot * invN;
+}
+
+// dgamma kernel: one block per column, threads reduce across rows.
+__global__ void rmsnorm_backward_dgamma(
+    const float* __restrict__ dout,
+    const float* __restrict__ x,
+    const float* __restrict__ invRms,
+    int rows, int cols,
+    float* __restrict__ dgamma)
+{
+	int col = blockIdx.x;
+	if (col >= cols) return;
+
+	extern __shared__ float smem[];
+
+	float localDg = 0.0f;
+	for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+		float inv = invRms[r];
+		localDg += dout[(size_t)r * cols + col] * x[(size_t)r * cols + col] * inv;
+	}
+	localDg = blockReduceSum(localDg, smem);
+
+	if (threadIdx.x == 0)
+		dgamma[col] += localDg;
+}
+
+} // anonymous namespace
+
+bool rmsnorm_backward(const float* dout, const float* x,
+                      const float* gamma, const float* invRms,
+                      int rows, int cols,
+                      float* dx, float* dgamma)
+{
+	if (rows <= 0 || cols <= 0) return true;
+
+	// Kernel 1: dx (one block per row).
+	int block1 = rowBlockSize(cols);
+	int smemBytes1 = (block1 / 32 + 1) * sizeof(float);
+	rmsnorm_backward_dx<<<rows, block1, smemBytes1>>>(
+		dout, x, gamma, invRms, cols, dx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Kernel 2: dgamma (one block per column, reduce across rows).
+	int block2 = rowBlockSize(rows);
+	int smemBytes2 = (block2 / 32 + 1) * sizeof(float);
+	rmsnorm_backward_dgamma<<<cols, block2, smemBytes2>>>(
+		dout, x, invRms, rows, cols, dgamma);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
+// ===========================================================================
+//  5. Stable softmax (per-row)
+// ===========================================================================
+
+namespace {
+
+__global__ void softmax_stable_rows(const float* __restrict__ x,
+                                    int cols,
+                                    float* __restrict__ out)
+{
+	int row = blockIdx.x;
+	const float* xRow = x + (size_t)row * cols;
+	float* oRow       = out + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sMax = smem;
+	float* sSum = smem + (blockDim.x / 32 + 1);
+
+	// Pass 1: row max.
+	float localMax = -FLT_MAX;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localMax = fmaxf(localMax, xRow[i]);
+	localMax = blockReduceMax(localMax, sMax);
+
+	__shared__ float sRowMax;
+	if (threadIdx.x == 0) sRowMax = localMax;
+	__syncthreads();
+	float rowMax = sRowMax;
+
+	// Pass 2: sum of exp(x - max).
+	float localSum = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float e = expf(xRow[i] - rowMax);
+		oRow[i] = e;  // store intermediate exp in output
+		localSum += e;
+	}
+	localSum = blockReduceSum(localSum, sSum);
+
+	__shared__ float sRowSum;
+	if (threadIdx.x == 0) sRowSum = localSum;
+	__syncthreads();
+	float invSum = 1.0f / sRowSum;
+
+	// Pass 3: normalize.
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] *= invSum;
+}
+
+} // anonymous namespace
+
+bool softmax_forward(const float* x, int rows, int cols, float* out)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	softmax_stable_rows<<<rows, block, smemBytes>>>(x, cols, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  6. Softmax cross-entropy backward
+// ===========================================================================
+
+namespace {
+
+__global__ void softmax_cross_entropy_backward(const float* __restrict__ probs,
+                                               const int* __restrict__ targets,
+                                               int cols,
+                                               float* __restrict__ dlogits)
+{
+	// Grid: (rows * ceil(cols / blockDim.x)).
+	int row = blockIdx.x;
+	int target = targets[row];
+	const float* pRow = probs   + (size_t)row * cols;
+	float* dRow       = dlogits + (size_t)row * cols;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float p = pRow[i];
+		dRow[i] = (i == target) ? (p - 1.0f) : p;
+	}
+}
+
+} // anonymous namespace
+
+bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
+                               int rows, int cols, float* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward<<<rows, block>>>(probs, targets, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  7. GELU (tanh approximation)
+// ===========================================================================
+
+namespace {
+
+// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+__device__ __forceinline__ float gelu_val(float x)
+{
+	const float kA = 0.7978845608f; // sqrt(2/pi)
+	const float kB = 0.044715f;
+	float x3 = x * x * x;
+	float inner = kA * (x + kB * x3);
+	return 0.5f * x * (1.0f + tanhf(inner));
+}
+
+__device__ __forceinline__ float gelu_grad(float x)
+{
+	const float kA = 0.7978845608f;
+	const float kB = 0.044715f;
+	float x2 = x * x;
+	float inner = kA * (x + kB * x * x2);
+	float th = tanhf(inner);
+	float sech2 = 1.0f - th * th;
+	float dInner = kA * (1.0f + 3.0f * kB * x2);
+	return 0.5f * (1.0f + th) + 0.5f * x * sech2 * dInner;
+}
+
+__global__ void gelu_forward_kernel(const float* __restrict__ x, int n,
+                                    float* __restrict__ out)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		out[idx] = gelu_val(x[idx]);
+}
+
+__global__ void gelu_backward_kernel(const float* __restrict__ dout,
+                                     const float* __restrict__ x, int n,
+                                     float* __restrict__ dx)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		dx[idx] = dout[idx] * gelu_grad(x[idx]);
+}
+
+} // anonymous namespace
+
+bool gelu_forward(const float* x, int n, float* out)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	gelu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool gelu_backward(const float* dout, const float* x, int n, float* dx)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	gelu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  8. SiLU (x * sigmoid(x))
+// ===========================================================================
+
+namespace {
+
+__device__ __forceinline__ float sigmoid_val(float x)
+{
+	return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void silu_forward_kernel(const float* __restrict__ x, int n,
+                                    float* __restrict__ out)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n) {
+		float s = sigmoid_val(x[idx]);
+		out[idx] = x[idx] * s;
+	}
+}
+
+__global__ void silu_backward_kernel(const float* __restrict__ dout,
+                                     const float* __restrict__ x, int n,
+                                     float* __restrict__ dx)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n) {
+		float s = sigmoid_val(x[idx]);
+		// d/dx [x * sigma(x)] = sigma(x) + x * sigma(x) * (1 - sigma(x))
+		//                      = sigma(x) * (1 + x * (1 - sigma(x)))
+		dx[idx] = dout[idx] * s * (1.0f + x[idx] * (1.0f - s));
+	}
+}
+
+} // anonymous namespace
+
+bool silu_forward(const float* x, int n, float* out)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	silu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool silu_backward(const float* dout, const float* x, int n, float* dx)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	silu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  9. ReLU
+// ===========================================================================
+
+namespace {
+
+__global__ void relu_forward_kernel(const float* __restrict__ x, int n,
+                                    float* __restrict__ out)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		out[idx] = fmaxf(0.0f, x[idx]);
+}
+
+__global__ void relu_backward_kernel(const float* __restrict__ dout,
+                                     const float* __restrict__ x, int n,
+                                     float* __restrict__ dx)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		dx[idx] = (x[idx] > 0.0f) ? dout[idx] : 0.0f;
+}
+
+} // anonymous namespace
+
+bool relu_forward(const float* x, int n, float* out)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	relu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool relu_backward(const float* dout, const float* x, int n, float* dx)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	relu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  10. SwiGLU
+// ===========================================================================
+
+namespace {
+
+// gate_up layout: [n, 2*dFF].  First dFF columns = gate, last dFF = up.
+// out[i, j] = silu(gate[i, j]) * up[i, j]
+// 1-D grid over n * dFF elements.
+__global__ void swiglu_fwd(const float* __restrict__ gate_up,
+                           int n, int dFF,
+                           float* __restrict__ out)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n * dFF) return;
+	int row = idx / dFF;
+	int col = idx % dFF;
+
+	int totalCols = 2 * dFF;
+	const float* guRow = gate_up + (size_t)row * totalCols;
+	float g = guRow[col];
+	float u = guRow[col + dFF];
+	float s = sigmoid_val(g);
+	out[idx] = g * s * u;
+}
+
+__global__ void swiglu_bwd(const float* __restrict__ dout,
+                           const float* __restrict__ gate_up,
+                           int n, int dFF,
+                           float* __restrict__ d_gate_up)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n * dFF) return;
+	int row = idx / dFF;
+	int col = idx % dFF;
+
+	int totalCols = 2 * dFF;
+	const float* guRow = gate_up + (size_t)row * totalCols;
+	float g = guRow[col];
+	float u = guRow[col + dFF];
+	float s = sigmoid_val(g);
+	float silu_g = g * s;
+
+	float do_val = dout[idx];
+
+	// d_gate = dout * up * d_silu(gate) = dout * up * sigma(g)*(1 + g*(1-sigma(g)))
+	float dsilu = s * (1.0f + g * (1.0f - s));
+	float dg = do_val * u * dsilu;
+	// d_up = dout * silu(gate)
+	float du = do_val * silu_g;
+
+	float* dguRow = d_gate_up + (size_t)row * totalCols;
+	dguRow[col]        = dg;
+	dguRow[col + dFF]  = du;
+}
+
+} // anonymous namespace
+
+bool swiglu_forward(const float* gate_up, int n, int dFF, float* out)
+{
+	if (n <= 0 || dFF <= 0) return true;
+	int total = n * dFF;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	swiglu_fwd<<<grid, kBlockElem>>>(gate_up, n, dFF, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool swiglu_backward(const float* dout, const float* gate_up,
+                     int n, int dFF, float* d_gate_up)
+{
+	if (n <= 0 || dFF <= 0) return true;
+	int total = n * dFF;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	swiglu_bwd<<<grid, kBlockElem>>>(dout, gate_up, n, dFF, d_gate_up);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  11. Rotary positional encoding (RoPE)
+// ===========================================================================
+
+namespace {
+
+__global__ void rope_apply_inplace(float* __restrict__ x,
+                                   const float* __restrict__ invFreq,
+                                   int T, int nHeads, int dHead,
+                                   int halfDim, bool inverse)
+{
+	// Grid: one thread per (t, h, d) triple where d in [0, halfDim).
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int total = T * nHeads * halfDim;
+	if (idx >= total) return;
+
+	int d   = idx % halfDim;
+	int tmp = idx / halfDim;
+	int h   = tmp % nHeads;
+	int t   = tmp / nHeads;
+
+	float theta = (float)t * invFreq[d];
+	float cosT  = cosf(theta);
+	float sinT  = inverse ? -sinf(theta) : sinf(theta);
+
+	// x layout: [T, nHeads, dHead]
+	size_t base = ((size_t)t * nHeads + h) * dHead;
+	float x0 = x[base + d];
+	float x1 = x[base + d + halfDim];
+
+	x[base + d]            = x0 * cosT - x1 * sinT;
+	x[base + d + halfDim]  = x0 * sinT + x1 * cosT;
+}
+
+} // anonymous namespace
+
+bool rope_apply(float* x, const float* invFreq,
+                int T, int nHeads, int dHead,
+                int halfDim, bool inverse)
+{
+	if (T <= 0 || nHeads <= 0 || dHead < 2) return true;
+	int hd = (halfDim > 0 && halfDim <= dHead / 2) ? halfDim : (dHead / 2);
+	int total = T * nHeads * hd;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	rope_apply_inplace<<<grid, kBlockElem>>>(x, invFreq, T, nHeads, dHead, hd, inverse);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  12. Simple vector ops: add_bias, add_residual, axpy
+// ===========================================================================
+
+namespace {
+
+__global__ void add_bias_kernel(float* __restrict__ out,
+                                const float* __restrict__ bias,
+                                int rows, int cols)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= rows * cols) return;
+	int col = idx % cols;
+	out[idx] += bias[col];
+}
+
+__global__ void add_residual_kernel(float* __restrict__ out,
+                                    const float* __restrict__ residual,
+                                    int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		out[idx] += residual[idx];
+}
+
+__global__ void axpy_kernel(float alpha,
+                            const float* __restrict__ x,
+                            float* __restrict__ y,
+                            int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		y[idx] += alpha * x[idx];
+}
+
+} // anonymous namespace
+
+bool add_bias(float* out, const float* bias, int rows, int cols)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int total = rows * cols;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	add_bias_kernel<<<grid, kBlockElem>>>(out, bias, rows, cols);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool add_residual(float* out, const float* residual, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	add_residual_kernel<<<grid, kBlockElem>>>(out, residual, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool axpy(float alpha, const float* x, float* y, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	axpy_kernel<<<grid, kBlockElem>>>(alpha, x, y, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
+__global__ void scale_array_kernel(float* __restrict__ x, float scale, int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n) x[idx] *= scale;
+}
+} // anonymous namespace
+
+bool scale_array(float* x, float scale, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	scale_array_kernel<<<grid, kBlockElem>>>(x, scale, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  13. Embedding gather / scatter_add
+// ===========================================================================
+
+namespace {
+
+__global__ void embedding_gather_kernel(const float* __restrict__ E,
+                                        const int* __restrict__ tokenIds,
+                                        int T, int vocabSize, int dModel,
+                                        float* __restrict__ out)
+{
+	// 1-D grid over T * dModel elements.
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= T * dModel) return;
+	int t = idx / dModel;
+	int d = idx % dModel;
+	int tok = tokenIds[t];
+	// Bounds check on vocabulary.
+	if (tok >= 0 && tok < vocabSize)
+		out[idx] = E[(size_t)tok * dModel + d];
+	else
+		out[idx] = 0.0f;
+}
+
+__global__ void embedding_scatter_add_kernel(float* __restrict__ dE,
+                                             const int* __restrict__ tokenIds,
+                                             const float* __restrict__ dout,
+                                             int T, int vocabSize, int dModel)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= T * dModel) return;
+	int t = idx / dModel;
+	int d = idx % dModel;
+	int tok = tokenIds[t];
+	if (tok >= 0 && tok < vocabSize)
+		atomicAdd(&dE[(size_t)tok * dModel + d], dout[idx]);
+}
+
+} // anonymous namespace
+
+bool embedding_gather(const float* E, const int* tokenIds,
+                      int T, int vocabSize, int dModel, float* out)
+{
+	if (T <= 0 || dModel <= 0) return true;
+	int total = T * dModel;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	embedding_gather_kernel<<<grid, kBlockElem>>>(E, tokenIds, T, vocabSize, dModel, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool embedding_scatter_add(float* dE, const int* tokenIds,
+                           const float* dout,
+                           int T, int vocabSize, int dModel)
+{
+	if (T <= 0 || dModel <= 0) return true;
+	int total = T * dModel;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	embedding_scatter_add_kernel<<<grid, kBlockElem>>>(dE, tokenIds, dout, T, vocabSize, dModel);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  14. Adam optimizer
+// ===========================================================================
+
+namespace {
+
+__global__ void adam_update_kernel(float* __restrict__ param,
+                                  const float* __restrict__ grad,
+                                  float* __restrict__ m,
+                                  float* __restrict__ v,
+                                  float lr, float beta1, float beta2,
+                                  float eps, float weightDecay,
+                                  int step, int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	float g = grad[idx];
+
+	// Decoupled weight decay (AdamW).
+	if (weightDecay != 0.0f)
+		param[idx] -= lr * weightDecay * param[idx];
+
+	// Update biased first and second moments.
+	float m_new = beta1 * m[idx] + (1.0f - beta1) * g;
+	float v_new = beta2 * v[idx] + (1.0f - beta2) * g * g;
+	m[idx] = m_new;
+	v[idx] = v_new;
+
+	// Bias correction.
+	float bc1 = 1.0f - powf(beta1, (float)step);
+	float bc2 = 1.0f - powf(beta2, (float)step);
+	float m_hat = m_new / bc1;
+	float v_hat = v_new / bc2;
+
+	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
+} // anonymous namespace
+
+bool adam_update(float* param, const float* grad, float* m, float* v,
+                 float lr, float beta1, float beta2, float eps,
+                 float weightDecay, int step, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	adam_update_kernel<<<grid, kBlockElem>>>(
+		param, grad, m, v, lr, beta1, beta2, eps, weightDecay, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  15a. reduce_rows_sum
+// ===========================================================================
+
+namespace {
+
+// One block per column.  Threads cooperatively sum across all rows.
+__global__ void reduce_rows_sum_kernel(const float* __restrict__ input,
+                                       int rows, int cols,
+                                       float beta,
+                                       float* __restrict__ out)
+{
+    int col = blockIdx.x;
+    if (col >= cols) return;
+
+    extern __shared__ float smem[];
+
+    float localSum = 0.0f;
+    for (int r = threadIdx.x; r < rows; r += blockDim.x)
+        localSum += input[(size_t)r * cols + col];
+    localSum = blockReduceSum(localSum, smem);
+
+    if (threadIdx.x == 0)
+    {
+        if (beta == 0.0f)
+            out[col] = localSum;
+        else
+            out[col] = beta * out[col] + localSum;
+    }
+}
+
+} // anonymous namespace
+
+bool reduce_rows_sum(const float* input, int rows, int cols,
+                     float beta, float* out)
+{
+    if (rows <= 0 || cols <= 0) return true;
+    int block = rowBlockSize(rows);
+    int smemBytes = (block / 32 + 1) * sizeof(float);
+    reduce_rows_sum_kernel<<<cols, block, smemBytes>>>(input, rows, cols, beta, out);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
+//  15b. Causal-masked softmax (in-place, for attention scores)
+// ===========================================================================
+
+namespace {
+
+// One block per (batch, row).  S is [batchSize, T, T] row-major.
+__global__ void causal_mask_softmax_kernel(float* __restrict__ S,
+                                           int T)
+{
+    int idx = blockIdx.x;  // linear index into (batch, row)
+    int row = idx % T;
+    float* sRow = S + (size_t)idx * T;
+
+    extern __shared__ float smem[];
+    float* sMax = smem;
+    float* sSum = smem + (blockDim.x / 32 + 1);
+
+    // Apply causal mask: set j > row to -FLT_MAX.
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        if (j > row)
+            sRow[j] = -FLT_MAX;
+    }
+    __syncthreads();
+
+    // Pass 1: row max.
+    float localMax = -FLT_MAX;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+        localMax = fmaxf(localMax, sRow[j]);
+    localMax = blockReduceMax(localMax, sMax);
+
+    __shared__ float sRowMax;
+    if (threadIdx.x == 0) sRowMax = localMax;
+    __syncthreads();
+    float rowMax = sRowMax;
+
+    // Pass 2: sum of exp(x - max).
+    float localSum = 0.0f;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        float e = expf(sRow[j] - rowMax);
+        sRow[j] = e;
+        localSum += e;
+    }
+    localSum = blockReduceSum(localSum, sSum);
+
+    __shared__ float sRowSum;
+    if (threadIdx.x == 0) sRowSum = localSum;
+    __syncthreads();
+    float invSum = 1.0f / sRowSum;
+
+    // Pass 3: normalize.
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+        sRow[j] *= invSum;
+}
+
+} // anonymous namespace
+
+bool causal_mask_softmax_inplace(float* S, int batchSize, int T)
+{
+    if (batchSize <= 0 || T <= 0) return true;
+    int totalRows = batchSize * T;
+    int block = rowBlockSize(T);
+    int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+    causal_mask_softmax_kernel<<<totalRows, block, smemBytes>>>(S, T);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
+//  15c. Softmax backward for attention
+// ===========================================================================
+
+namespace {
+
+// dS = P * (dP - row_sum(dP * P)), zero above diagonal.
+// One block per (batch, row).
+__global__ void softmax_backward_attn_kernel(const float* __restrict__ P,
+                                              const float* __restrict__ dP,
+                                              int T,
+                                              float* __restrict__ dS)
+{
+    int idx = blockIdx.x;
+    int row = idx % T;
+    const float* pRow  = P  + (size_t)idx * T;
+    const float* dpRow = dP + (size_t)idx * T;
+    float* dsRow       = dS + (size_t)idx * T;
+
+    extern __shared__ float smem[];
+
+    // Compute dot = sum_j(dP[j] * P[j]) for valid positions (j <= row).
+    float localDot = 0.0f;
+    for (int j = threadIdx.x; j <= row; j += blockDim.x)
+        localDot += dpRow[j] * pRow[j];
+    localDot = blockReduceSum(localDot, smem);
+
+    __shared__ float sDot;
+    if (threadIdx.x == 0) sDot = localDot;
+    __syncthreads();
+    float dot = sDot;
+
+    // dS[j] = P[j] * (dP[j] - dot) for j <= row, 0 otherwise.
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        if (j <= row)
+            dsRow[j] = pRow[j] * (dpRow[j] - dot);
+        else
+            dsRow[j] = 0.0f;
+    }
+}
+
+} // anonymous namespace
+
+bool softmax_backward_attn(const float* P, const float* dP,
+                           int batchSize, int T, float* dS)
+{
+    if (batchSize <= 0 || T <= 0) return true;
+    int totalRows = batchSize * T;
+    int block = rowBlockSize(T);
+    int smemBytes = (block / 32 + 1) * sizeof(float);
+    softmax_backward_attn_kernel<<<totalRows, block, smemBytes>>>(P, dP, T, dS);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
+//  15d. Cross-entropy NLL loss
+// ===========================================================================
+
+namespace {
+
+// One block total (simple reduction).  Each thread handles a subset of rows.
+__global__ void cross_entropy_nll_kernel(const float* __restrict__ probs,
+                                         const int* __restrict__ targets,
+                                         int T, int vocabSize, int padToken,
+                                         float* __restrict__ loss_sum,
+                                         int* __restrict__ valid_count)
+{
+    extern __shared__ float smem[];
+    float* sLoss = smem;
+
+    float localLoss = 0.0f;
+    int localCount = 0;
+    for (int t = threadIdx.x; t < T; t += blockDim.x)
+    {
+        int tgt = targets[t];
+        if (padToken >= 0 && tgt == padToken) continue;
+        if (tgt < 0 || tgt >= vocabSize) continue;
+        float p = probs[(size_t)t * vocabSize + tgt];
+        if (p < 1e-12f) p = 1e-12f;
+        localLoss += -logf(p);
+        ++localCount;
+    }
+
+    // Reduce loss.
+    localLoss = blockReduceSum(localLoss, sLoss);
+    if (threadIdx.x == 0)
+        atomicAdd(loss_sum, localLoss);
+
+    // Reduce count (reuse warp reduce as floats, cast back).
+    __syncthreads();
+    float countF = (float)localCount;
+    countF = blockReduceSum(countF, sLoss);
+    if (threadIdx.x == 0)
+        atomicAdd(valid_count, (int)countF);
+}
+
+} // anonymous namespace
+
+bool cross_entropy_nll_loss(const float* probs, const int* targets,
+                            int T, int vocabSize, int padToken,
+                            float* loss_sum, int* valid_count)
+{
+    if (T <= 0 || vocabSize <= 0) return true;
+    GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, sizeof(float)));
+    GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+    int block = 256;
+    int grid = 1;
+    if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
+    int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
+    cross_entropy_nll_kernel<<<grid, block, smemBytes>>>(
+        probs, targets, T, vocabSize, padToken, loss_sum, valid_count);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
+//  15e. Argmax accuracy
+// ===========================================================================
+
+namespace {
+
+__global__ void argmax_count_kernel(const float* __restrict__ probs,
+                                    const int* __restrict__ targets,
+                                    int T, int vocabSize, int padToken,
+                                    int* __restrict__ correct_count,
+                                    int* __restrict__ valid_count)
+{
+    extern __shared__ float smem[];
+
+    int localCorrect = 0;
+    int localValid = 0;
+    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < T;
+         t += blockDim.x * gridDim.x)
+    {
+        int tgt = targets[t];
+        if (padToken >= 0 && tgt == padToken) continue;
+        if (tgt < 0 || tgt >= vocabSize) continue;
+        ++localValid;
+
+        const float* row = probs + (size_t)t * vocabSize;
+        int bestIdx = 0;
+        float bestVal = row[0];
+        for (int v = 1; v < vocabSize; ++v)
+        {
+            if (row[v] > bestVal) { bestVal = row[v]; bestIdx = v; }
+        }
+        if (bestIdx == tgt) ++localCorrect;
+    }
+
+    float correctF = (float)localCorrect;
+    correctF = blockReduceSum(correctF, smem);
+    if (threadIdx.x == 0) atomicAdd(correct_count, (int)correctF);
+
+    __syncthreads();
+    float validF = (float)localValid;
+    validF = blockReduceSum(validF, smem);
+    if (threadIdx.x == 0) atomicAdd(valid_count, (int)validF);
+}
+
+} // anonymous namespace
+
+bool argmax_count_matches(const float* probs, const int* targets,
+                          int T, int vocabSize, int padToken,
+                          int* correct_count, int* valid_count)
+{
+    if (T <= 0 || vocabSize <= 0) return true;
+    GLADES_CUDA_CHECK(cudaMemset(correct_count, 0, sizeof(int)));
+    GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+    // One thread per row for argmax (vocabSize may be large).
+    int block = 128;
+    int grid = (T + block - 1) / block;
+    if (grid > 128) grid = 128;
+    int smemBytes = (block / 32 + 1) * sizeof(float);
+    argmax_count_kernel<<<grid, block, smemBytes>>>(
+        probs, targets, T, vocabSize, padToken, correct_count, valid_count);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
+//  16. Flash attention (simplified, single-head)
+// ===========================================================================
+//
+// Forward:
+//   O[T, dV] = softmax(Q K^T / sqrt(dK)) * V,  with optional causal mask.
+//
+// Strategy: one block per query row q.  Iterate over key/value blocks (tiles)
+// in shared memory.  For each tile we load a [Bc, dK] chunk of K and a
+// [Bc, dV] chunk of V into shared memory, compute the local attention scores,
+// and use the online softmax trick to accumulate O without materialising the
+// full T*T attention matrix.
+//
+// Bc (key tile size) = blockDim.x (threads in the block also serve as the
+// tile width -- each thread owns one key row inside the tile).
+
+namespace {
+
+// Tile size for keys/values loaded into shared memory.
+static constexpr int kFlashTile = 64;
+
+// Forward kernel.  One block per query row.
+// Shared memory layout:
+//   float sK[kFlashTile * dK]   -- tile of keys
+//   float sV[kFlashTile * dV]   -- tile of values
+// Passed as dynamic shared memory.
+__global__ void flash_attention_fwd_kernel(const float* __restrict__ Q,
+                                           const float* __restrict__ K,
+                                           const float* __restrict__ V,
+                                           int T, int dK, int dV,
+                                           int causal,
+                                           float* __restrict__ O)
+{
+	int q = blockIdx.x;  // query row index
+	if (q >= T) return;
+
+	extern __shared__ float smem[];
+	float* sK = smem;                          // [kFlashTile, dK]
+	float* sV = smem + kFlashTile * dK;        // [kFlashTile, dV]
+
+	const float* qRow = Q + (size_t)q * dK;
+
+	// Online softmax state.
+	float runMax = -FLT_MAX;
+	float runSum = 0.0f;
+
+	// Accumulator for output row (in registers, length dV).
+	// We store the accumulator in global memory via O at the end.
+	// For moderate dV we keep it in a local array; for large dV we iterate.
+	// Here we use a loop that reads/writes to O directly (initialized to 0).
+	float* oRow = O + (size_t)q * dV;
+	for (int d = threadIdx.x; d < dV; d += blockDim.x)
+		oRow[d] = 0.0f;
+	__syncthreads();
+
+	float scale = rsqrtf((float)dK);
+
+	int numTiles = (T + kFlashTile - 1) / kFlashTile;
+
+	for (int tile = 0; tile < numTiles; ++tile) {
+		int kStart = tile * kFlashTile;
+		int tileLen = kFlashTile;
+		if (kStart + tileLen > T) tileLen = T - kStart;
+
+		// Cooperatively load sK[tileLen, dK] and sV[tileLen, dV].
+		int loadCount = tileLen * dK;
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			int kr = i / dK;
+			int kd = i % dK;
+			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+		}
+		int loadCountV = tileLen * dV;
+		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
+			int vr = i / dV;
+			int vd = i % dV;
+			sV[i] = V[(size_t)(kStart + vr) * dV + vd];
+		}
+		__syncthreads();
+
+		// Compute attention scores for this tile and update online softmax.
+		// Because dK can be large (64-128) we let thread 0 do the serial work
+		// for clarity.  A production kernel would parallelise this differently
+		// (e.g. one warp per query).
+
+		// Each thread handles a subset of keys in the tile.
+		// Accumulate partial max / sum / weighted V over the tile.
+		for (int j = 0; j < tileLen; ++j) {
+			int kIdx = kStart + j;
+
+			// Causal mask: skip keys with index > query index.
+			if (causal && kIdx > q) break;
+
+			// Dot product Q[q,:] . K[kIdx,:].
+			float dot = 0.0f;
+			for (int d = 0; d < dK; ++d)
+				dot += qRow[d] * sK[j * dK + d];
+			dot *= scale;
+
+			// Online softmax update (single-threaded per block on thread 0).
+			// We serialise this loop per key within the tile; the loop body
+			// is O(dV) work, parallelised across threads below.
+			// To keep the code simple and correct, we let all threads
+			// compute the same dot above but only thread 0 decides the max/sum.
+			// Then we broadcast.
+
+			// All threads see dot (same value because they all read qRow and sK).
+			float prevMax = runMax;
+			if (dot > runMax) runMax = dot;
+			float exp_prev = expf(prevMax - runMax);
+			float exp_cur  = expf(dot - runMax);
+
+			// Rescale running sum and accumulator.
+			runSum = runSum * exp_prev + exp_cur;
+
+			// Update oRow: oRow = oRow * exp_prev + exp_cur * V[j,:]
+			for (int d = threadIdx.x; d < dV; d += blockDim.x)
+				oRow[d] = oRow[d] * exp_prev + exp_cur * sV[j * dV + d];
+		}
+
+		__syncthreads();
+	}
+
+	// Final normalisation: oRow /= runSum.
+	float invSum = (runSum > 0.0f) ? (1.0f / runSum) : 0.0f;
+	for (int d = threadIdx.x; d < dV; d += blockDim.x)
+		oRow[d] *= invSum;
+}
+
+// Backward kernel.  One block per query row.
+// Recomputes attention on the fly (flash-style) to avoid storing the T*T matrix.
+__global__ void flash_attention_bwd_kernel(const float* __restrict__ Q,
+                                           const float* __restrict__ K,
+                                           const float* __restrict__ V,
+                                           const float* __restrict__ O,
+                                           const float* __restrict__ dO,
+                                           int T, int dK, int dV,
+                                           int causal,
+                                           float* __restrict__ dQ,
+                                           float* __restrict__ dK_out,
+                                           float* __restrict__ dV_out)
+{
+	int q = blockIdx.x;
+	if (q >= T) return;
+
+	extern __shared__ float smem[];
+	float* sK = smem;                        // [kFlashTile, dK]
+	float* sV = smem + kFlashTile * dK;      // [kFlashTile, dV]
+
+	const float* qRow  = Q  + (size_t)q * dK;
+	const float* oRow  = O  + (size_t)q * dV;
+	const float* doRow = dO + (size_t)q * dV;
+	float* dqRow       = dQ + (size_t)q * dK;
+
+	float scale = rsqrtf((float)dK);
+
+	// First pass: recompute softmax statistics (online max, sum).
+	float runMax = -FLT_MAX;
+	float runSum = 0.0f;
+
+	int numTiles = (T + kFlashTile - 1) / kFlashTile;
+
+	for (int tile = 0; tile < numTiles; ++tile) {
+		int kStart = tile * kFlashTile;
+		int tileLen = kFlashTile;
+		if (kStart + tileLen > T) tileLen = T - kStart;
+
+		// Load K tile into shared memory.
+		int loadCount = tileLen * dK;
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			int kr = i / dK;
+			int kd = i % dK;
+			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+		}
+		__syncthreads();
+
+		for (int j = 0; j < tileLen; ++j) {
+			int kIdx = kStart + j;
+			if (causal && kIdx > q) break;
+			float dot = 0.0f;
+			for (int d = 0; d < dK; ++d)
+				dot += qRow[d] * sK[j * dK + d];
+			dot *= scale;
+			if (dot > runMax) {
+				runSum = runSum * expf(runMax - dot);
+				runMax = dot;
+			}
+			runSum += expf(dot - runMax);
+		}
+		__syncthreads();
+	}
+
+	float logSumExp = runMax + logf(runSum + 1e-20f);
+
+	// Compute D = sum_d  dO[q,d] * O[q,d]  (needed for backward formula).
+	float D = 0.0f;
+	for (int d = 0; d < dV; ++d)
+		D += doRow[d] * oRow[d];
+
+	// Second pass: compute gradients.
+	// Initialise dQ row to zero.
+	for (int d = threadIdx.x; d < dK; d += blockDim.x)
+		dqRow[d] = 0.0f;
+	__syncthreads();
+
+	for (int tile = 0; tile < numTiles; ++tile) {
+		int kStart = tile * kFlashTile;
+		int tileLen = kFlashTile;
+		if (kStart + tileLen > T) tileLen = T - kStart;
+
+		// Load K and V tiles.
+		int loadCount = tileLen * dK;
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			int kr = i / dK;
+			int kd = i % dK;
+			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+		}
+		int loadCountV = tileLen * dV;
+		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
+			int vr = i / dV;
+			int vd = i % dV;
+			sV[i] = V[(size_t)(kStart + vr) * dV + vd];
+		}
+		__syncthreads();
+
+		for (int j = 0; j < tileLen; ++j) {
+			int kIdx = kStart + j;
+			if (causal && kIdx > q) break;
+
+			// Recompute attention weight p = softmax score.
+			float dot = 0.0f;
+			for (int d = 0; d < dK; ++d)
+				dot += qRow[d] * sK[j * dK + d];
+			dot *= scale;
+			float p = expf(dot - logSumExp);
+
+			// ds = p * (dO . V[kIdx] - D)
+			float doV = 0.0f;
+			for (int d = 0; d < dV; ++d)
+				doV += doRow[d] * sV[j * dV + d];
+			float ds = p * (doV - D);
+
+			// dQ[q,:] += ds * scale * K[kIdx,:]
+			for (int d = threadIdx.x; d < dK; d += blockDim.x)
+				dqRow[d] += ds * scale * sK[j * dK + d];
+
+			// dK[kIdx,:] += ds * scale * Q[q,:]  (atomic across query blocks)
+			for (int d = threadIdx.x; d < dK; d += blockDim.x)
+				atomicAdd(&dK_out[(size_t)kIdx * dK + d], ds * scale * qRow[d]);
+
+			// dV[kIdx,:] += p * dO[q,:]  (atomic across query blocks)
+			for (int d = threadIdx.x; d < dV; d += blockDim.x)
+				atomicAdd(&dV_out[(size_t)kIdx * dV + d], p * doRow[d]);
+		}
+		__syncthreads();
+	}
+}
+
+} // anonymous namespace
+
+bool flash_attention_forward(const float* Q, const float* K, const float* V,
+                             int T, int dK, int dV, bool causal,
+                             float* O)
+{
+	if (T <= 0 || dK <= 0 || dV <= 0) return true;
+
+	int block = kFlashTile;  // threads per block
+	if (block > kMaxBlockRow) block = kMaxBlockRow;
+
+	// Shared memory: sK[kFlashTile * dK] + sV[kFlashTile * dV].
+	size_t smemBytes = (size_t)kFlashTile * (dK + dV) * sizeof(float);
+
+	flash_attention_fwd_kernel<<<T, block, smemBytes>>>(
+		Q, K, V, T, dK, dV, causal ? 1 : 0, O);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool flash_attention_backward(const float* Q, const float* K, const float* V,
+                              const float* O, const float* dO,
+                              int T, int dK, int dV, bool causal,
+                              float* dQ, float* dK_out, float* dV_out)
+{
+	if (T <= 0 || dK <= 0 || dV <= 0) return true;
+
+	// Zero dK_out and dV_out because the kernel accumulates with atomicAdd.
+	GLADES_CUDA_CHECK(cudaMemset(dK_out, 0, (size_t)T * dK * sizeof(float)));
+	GLADES_CUDA_CHECK(cudaMemset(dV_out, 0, (size_t)T * dV * sizeof(float)));
+
+	int block = kFlashTile;
+	if (block > kMaxBlockRow) block = kMaxBlockRow;
+
+	size_t smemBytes = (size_t)kFlashTile * (dK + dV) * sizeof(float);
+
+	flash_attention_bwd_kernel<<<T, block, smemBytes>>>(
+		Q, K, V, O, dO, T, dK, dV, causal ? 1 : 0,
+		dQ, dK_out, dV_out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  16. Incremental KV-cache attention (single-query, multi-head)
+// ===========================================================================
+//
+// One block per query head.  Each block:
+//   Phase 1: Compute scores[0..pos] = Q[hq] . K_cache[u, kvHead] * invSqrt
+//   Phase 2: Parallel reduction to find max score
+//   Phase 3: Compute exp(score - max), parallel reduction for sum
+//   Phase 4: Normalize probabilities
+//   Phase 5: Weighted sum of V_cache -> output head
+//
+// scores_scratch[nHeads, maxLen] is a global memory buffer to avoid
+// shared-memory limits for long sequences.
+
+namespace {
+
+__global__ void kv_attn_incremental_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K_cache,
+    const float* __restrict__ V_cache,
+    float* __restrict__ scores,
+    const unsigned char* __restrict__ keyValid,
+    int nHeads, int nKVHeads, int dHead,
+    int dModelKV, int maxLen, int pos,
+    float invSqrt,
+    float* __restrict__ out)
+{
+	const int hq = blockIdx.x;
+	if (hq >= nHeads) return;
+
+	const int groupSize = (nKVHeads > 0 && nKVHeads < nHeads) ? (nHeads / nKVHeads) : 1;
+	const int kvHead = (nKVHeads == nHeads) ? hq : (hq / groupSize);
+	const int seqLen = pos + 1;
+	const int tid = threadIdx.x;
+	const int nThreads = blockDim.x;
+
+	const float* qh = Q + hq * dHead;
+	const int kvOff = kvHead * dHead;
+	float* myScores = scores + (size_t)hq * maxLen;
+
+	// Shared memory for parallel reduction: [nThreads]
+	extern __shared__ float reduce[];
+
+	// Phase 1: Compute dot-product scores
+	for (int u = tid; u < seqLen; u += nThreads) {
+		if (keyValid && keyValid[u] == 0) {
+			myScores[u] = -1e30f;
+		} else {
+			const float* ku = K_cache + (size_t)u * dModelKV + kvOff;
+			float dot = 0.0f;
+			for (int d = 0; d < dHead; ++d)
+				dot += qh[d] * ku[d];
+			myScores[u] = dot * invSqrt;
+		}
+	}
+	__syncthreads();
+
+	// Phase 2: Find max score (parallel reduction)
+	float localMax = -1e30f;
+	for (int u = tid; u < seqLen; u += nThreads)
+		localMax = fmaxf(localMax, myScores[u]);
+	reduce[tid] = localMax;
+	__syncthreads();
+	for (int s = nThreads / 2; s > 0; s >>= 1) {
+		if (tid < s) reduce[tid] = fmaxf(reduce[tid], reduce[tid + s]);
+		__syncthreads();
+	}
+	float maxVal = reduce[0];
+	__syncthreads();
+
+	// Phase 3: Exp and sum
+	float localSum = 0.0f;
+	for (int u = tid; u < seqLen; u += nThreads) {
+		float e = expf(myScores[u] - maxVal);
+		myScores[u] = e;
+		localSum += e;
+	}
+	reduce[tid] = localSum;
+	__syncthreads();
+	for (int s = nThreads / 2; s > 0; s >>= 1) {
+		if (tid < s) reduce[tid] += reduce[tid + s];
+		__syncthreads();
+	}
+	float sumVal = reduce[0];
+	__syncthreads();
+
+	// Phase 4: Normalize to probabilities
+	float invS = (sumVal > 0.0f) ? (1.0f / sumVal) : 0.0f;
+	for (int u = tid; u < seqLen; u += nThreads)
+		myScores[u] *= invS;
+	__syncthreads();
+
+	// Phase 5: Weighted sum of V values -> output
+	float* oh = out + hq * dHead;
+	for (int d = tid; d < dHead; d += nThreads) {
+		float acc = 0.0f;
+		for (int u = 0; u < seqLen; ++u)
+			acc += myScores[u] * V_cache[(size_t)u * dModelKV + kvOff + d];
+		oh[d] = acc;
+	}
+}
+
+} // anonymous namespace
+
+bool kv_attention_incremental(const float* Q,
+                              const float* K_cache, const float* V_cache,
+                              float* scores_scratch,
+                              const unsigned char* keyValid,
+                              int nHeads, int nKVHeads, int dHead,
+                              int dModelKV, int maxLen, int pos,
+                              float invSqrt, float* out)
+{
+	if (nHeads <= 0 || dHead <= 0 || pos < 0) return true;
+
+	int block = 256;
+	if (block > kMaxBlockRow) block = kMaxBlockRow;
+	size_t smemBytes = (size_t)block * sizeof(float);
+
+	kv_attn_incremental_kernel<<<nHeads, block, smemBytes>>>(
+		Q, K_cache, V_cache, scores_scratch, keyValid,
+		nHeads, nKVHeads, dHead, dModelKV, maxLen, pos,
+		invSqrt, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Device memory operations
+// ---------------------------------------------------------------------------
+
+void device_memcpy_d2d(void* dst, const void* src, size_t bytes)
+{
+	cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+}
+
+void device_memcpy_h2d(void* dst, const void* src, size_t bytes)
+{
+	cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+}
+
+void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spitch,
+                           size_t width, size_t height)
+{
+	cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
+}
+
+void device_memset_bytes(void* ptr, int value, size_t bytes)
+{
+	cudaMemset(ptr, value, bytes);
+}
+
+} // namespace gpu
+} // namespace glades
+
+#endif // GLADES_HAVE_CUDA
