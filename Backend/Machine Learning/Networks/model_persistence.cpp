@@ -889,7 +889,7 @@ static bool read_vocab_bin(const std::string& vocabPath, std::vector<std::string
 
 namespace glades {
 
-NNetworkStatus NNetwork::saveModel(const std::string& modelName) const
+NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput* externalDI) const
 {
 	if (modelName.empty())
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveModel: modelName is empty");
@@ -908,7 +908,16 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName) const
 		const bool hasTr = (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && tensorTransformer.initialized;
 		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr)
 		{
-			if (!const_cast<glades::NNetwork*>(this)->ensureTensorParametersInitialized())
+			// If caller provided an external DataInput (e.g. after test() detached the
+			// internal pointer via RunDataAttachmentGuard), temporarily attach it so
+			// ensureTensorParametersInitialized() can read the feature count.
+			glades::NNetwork* mut = const_cast<glades::NNetwork*>(this);
+			const DataInput* prevDI = mut->di;
+			if (externalDI && !mut->di)
+				mut->di = externalDI;
+			const bool ok = mut->ensureTensorParametersInitialized();
+			mut->di = prevDI;
+			if (!ok)
 				return lastStatus;
 		}
 	}

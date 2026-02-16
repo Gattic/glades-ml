@@ -350,6 +350,31 @@ struct MixedPrecisionConfig
 	}
 };
 
+struct WarmupConfig
+{
+	enum Type { WARMUP_NONE = 0, WARMUP_LINEAR = 1 };
+	Type type;
+	int warmupSteps; // optimizer steps (not epochs)
+	WarmupConfig() : type(WARMUP_NONE), warmupSteps(0) {}
+	inline float multiplier(int optimizerStep) const
+	{
+		if (type == WARMUP_NONE || warmupSteps <= 0) return 1.0f;
+		if (optimizerStep >= warmupSteps) return 1.0f;
+		return static_cast<float>(optimizerStep) / static_cast<float>(warmupSteps);
+	}
+};
+
+struct DDPConfig
+{
+	bool enable;            // master switch (default false)
+	bool linearLRScaling;   // scale LR by worldSize (default true)
+	int rank;               // this worker's rank (0 = root)
+	int worldSize;          // total workers
+	int rootPort;           // port root listens on
+	DDPConfig() : enable(false), linearLRScaling(true),
+	              rank(0), worldSize(1), rootPort(9200) {}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -404,6 +429,10 @@ struct TrainingConfig
 
 	GpuConfig gpu;
 
+	WarmupConfig warmup;
+
+	DDPConfig ddp;
+
 	TrainingConfig()
 	    : minibatchSizeOverride(0),
 	      tbpttWindowOverride(0),
@@ -413,7 +442,9 @@ struct TrainingConfig
 	      lrSchedule(),
 	      transformer(),
 	      mixedPrecision(),
-	      gpu()
+	      gpu(),
+	      warmup(),
+	      ddp()
 	{
 	}
 };

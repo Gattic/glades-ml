@@ -45,6 +45,7 @@ class NNInfo;
 class NNetwork;
 class RNN;
 class DataInput;
+class ITrainingCallbacks;
 
 void init();
 RNN* getRNN(const std::string&);
@@ -59,6 +60,13 @@ MetaNetwork* train(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connec
 MetaNetwork* test(NNInfo*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* test(NNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 MetaNetwork* test(MetaNetwork*, DataInput*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+
+// Callback-aware API: pass an ITrainingCallbacks* to receive epoch metrics.
+// When callbacks != NULL, training uses the provided callbacks instead of the built-in
+// default (logger + GUI adapter). The server/connection parameters are still used for
+// setServer() so the network can be saved/loaded remotely if needed.
+MetaNetwork* train(NNetwork*, DataInput*, ITrainingCallbacks*, GNet::GServer* = NULL, GNet::Connection* = NULL);
+MetaNetwork* test(NNetwork*, DataInput*, ITrainingCallbacks*, GNet::GServer* = NULL, GNet::Connection* = NULL);
 
 // Safer ownership API: returns RAII pointer (ref-counted).
 //

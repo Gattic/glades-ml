@@ -29,6 +29,7 @@
 #include "../DataObjects/ImageInput.h"
 #include "trainer.h"
 #include "param_layout.h"
+#include "ddp_comm.h"
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -86,6 +87,7 @@ glades::NNetwork::NNetwork(int newNetType)
 	lrScheduleMultiplier = 1.0f;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
+	lastStepLogTime = 0;
 	// Initialize tensor gate packs (gateCount is fixed by architecture type).
 	tensorGru = TensorGatedState(3u);
 	tensorLstm = TensorGatedState(4u);
@@ -130,6 +132,7 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	lrScheduleMultiplier = 1.0f;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
+	lastStepLogTime = 0;
 	tensorGru = TensorGatedState(3u);
 	tensorLstm = TensorGatedState(4u);
 	gpuTransformerWeights = NULL;
@@ -495,7 +498,7 @@ static void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { 
 class LoggerCallbacks : public glades::ITrainingCallbacks
 {
 public:
-	explicit LoggerCallbacks(shmea::GLogger* l) : logger(l), last() {}
+	explicit LoggerCallbacks(shmea::GLogger* l) : logger(l), last(), lastEpochLogTime(0) {}
 
 	virtual void onRunStart(const glades::NNetwork& net, int runType)
 	{
@@ -526,6 +529,12 @@ public:
 			return false;
 		if (m.runType != glades::NNetwork::RUN_TRAIN)
 			return false;
+
+		// Rate limit: log at most once per second to avoid flooding on fast epochs.
+		const int64_t now = net.getCurrentTimeMilliseconds();
+		if (now - lastEpochLogTime < 1000)
+			return false;
+		lastEpochLogTime = now;
 
 		std::ostringstream oss;
 		oss << "event=nn_epoch_end";
@@ -588,6 +597,7 @@ public:
 private:
 	shmea::GLogger* logger;
 	glades::NNetworkEpochMetrics last;
+	int64_t lastEpochLogTime;
 };
 
 class GuiCallbacks : public glades::ITrainingCallbacks
@@ -598,12 +608,23 @@ public:
 	{
 	}
 
+	virtual void onRunStart(const glades::NNetwork& /*net*/, int /*runType*/)
+	{
+		if (!server || !conn)
+			return;
+
+		shmea::GList argData;
+		argData.addString("RESET");
+
+		ServiceDataSendPtr cData(new shmea::ServiceData(conn, "GUI_Callback"));
+		cData->set(argData);
+		cData->setArgList(argData);
+		server->send(cData);
+		cData.reset();
+	}
+
 	virtual bool onEpochEnd(const glades::NNetwork& net, const glades::NNetworkEpochMetrics& m)
 	{
-		// Only send during training.
-		if (m.runType != glades::NNetwork::RUN_TRAIN)
-			return false;
-
 		if (!server || !conn)
 			return false;
 
@@ -628,7 +649,7 @@ public:
 			cData->set(wData);
 			cData->setArgList(argData);
 			server->send(cData);
-			cData.reset(); // explicit ownership transfer
+			cData.reset();
 
 			// Activations: first message sends layer sizes, subsequent sends activations list
 			argData.clear();
@@ -643,7 +664,6 @@ public:
 				const glades::DataInput* di = net.getAttachedDataInput();
 				if (sk && di)
 				{
-					// Layer sizes: [input] + [hidden...] + [output]
 					layerSizes.addInt(static_cast<int>(di->getFeatureCount()));
 					for (int i = 0; i < sk->numHiddenLayers(); ++i)
 						layerSizes.addInt(sk->getHiddenLayerSize(i));
@@ -657,37 +677,56 @@ public:
 			}
 			cData->setArgList(argData);
 			server->send(cData);
-			cData.reset(); // explicit ownership transfer
+			cData.reset();
 
-			// Weights: layer weights + bias weights
+			// Weights
 			argData.clear();
 			shmea::GList obtainedWeights = net.getWeightsForGui();
-
 			argData.addString("WEIGHTS");
 			cData = ServiceDataSendPtr(new shmea::ServiceData(conn, "GUI_Callback"));
 			cData->set(obtainedWeights);
 			cData->setArgList(argData);
 			server->send(cData);
-			cData.reset(); // explicit ownership transfer
+			cData.reset();
 		}
 
-		// Accuracy label
+		// Rich metrics message: all NNetworkEpochMetrics fields.
+		// Format: [epoch, totalAccuracy, totalError, perplexity, outputType,
+		//          regMAE, regRMSE, classAccuracy, classPrecision, classRecall,
+		//          classSpecificity, classF1, classMCC, learningRate, lrMultiplier,
+		//          gradNorm, gradNormScale, runType]
 		{
 			shmea::GList argData;
 			argData.addString("ACC");
 
 			shmea::GList wData;
-			wData.addInt(m.epoch);
-			wData.addFloat(m.totalAccuracy);
+			wData.addInt(m.epoch);              // [0]
+			wData.addFloat(m.totalAccuracy);    // [1]
+			wData.addFloat(m.totalError);       // [2]
+			wData.addFloat(m.perplexity);       // [3]
+			wData.addInt(m.outputType);         // [4]
+			wData.addFloat(m.regMAE);           // [5]
+			wData.addFloat(m.regRMSE);          // [6]
+			wData.addFloat(m.classAccuracy);    // [7]
+			wData.addFloat(m.classPrecision);   // [8]
+			wData.addFloat(m.classRecall);      // [9]
+			wData.addFloat(m.classSpecificity); // [10]
+			wData.addFloat(m.classF1);          // [11]
+			wData.addFloat(m.classMCC);         // [12]
+			wData.addFloat(m.learningRate);     // [13]
+			wData.addFloat(m.lrMultiplier);     // [14]
+			wData.addFloat(m.gradNorm);         // [15]
+			wData.addFloat(m.gradNormScale);    // [16]
+			wData.addInt(m.runType);            // [17]
 
 			ServiceDataSendPtr cData(new shmea::ServiceData(conn, "GUI_Callback"));
 			cData->set(wData);
 			cData->setArgList(argData);
 			server->send(cData);
-			cData.reset(); // explicit ownership transfer
+			cData.reset();
 		}
 
-		// Confusion matrix
+		// Confusion matrix (classification/KL only)
 		if ((m.outputType == glades::GMath::CLASSIFICATION) || (m.outputType == glades::GMath::KL))
 		{
 			const glades::CMatrix& cm = net.getConfusionMatrix();
@@ -700,11 +739,26 @@ public:
 			cData->set(cm.getMatrix());
 			cData->setArgList(argData);
 			server->send(cData);
-			cData.reset(); // explicit ownership transfer
+			cData.reset();
 		}
 
 		lastUpdateTime = ms;
 		return false;
+	}
+
+	virtual void onRunEnd(const glades::NNetwork& /*net*/, int /*runType*/)
+	{
+		if (!server || !conn)
+			return;
+
+		shmea::GList argData;
+		argData.addString("UPDATE-GRAPHS");
+
+		ServiceDataSendPtr cData(new shmea::ServiceData(conn, "GUI_Callback"));
+		cData->set(argData);
+		cData->setArgList(argData);
+		server->send(cData);
+		cData.reset();
 	}
 
 private:
@@ -928,6 +982,7 @@ void glades::NNetwork::clean()
 	lrScheduleMultiplier = 1.0f;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
+	lastStepLogTime = 0;
 
 	// Reset tensor training state caches (they will be re-initialized on next run).
 	tensorDff.reset();
@@ -1444,6 +1499,42 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			InitGlorot::run(rngEngine, b.Wo, dModel, dModel);
 			InitGlorot::run(rngEngine, b.W1, dModel, ff1Width);
 			InitGlorot::run(rngEngine, b.W2, dFF, dModel);
+		}
+
+		// DDP: broadcast weights from rank 0 so all workers start with identical parameters.
+		if (trainingConfig.ddp.enable && glades::ddp::worldSize() > 1)
+		{
+			// Global tensors
+			if (!tensorTransformer.tokE.empty())
+				glades::ddp::broadcastFromRoot(&tensorTransformer.tokE[0], tensorTransformer.tokE.size());
+			if (!tensorTransformer.lmBias.empty())
+				glades::ddp::broadcastFromRoot(&tensorTransformer.lmBias[0], tensorTransformer.lmBias.size());
+			glades::ddp::broadcastFromRoot(&tensorTransformer.WIn[0], tensorTransformer.WIn.size());
+			glades::ddp::broadcastFromRoot(&tensorTransformer.bIn[0], tensorTransformer.bIn.size());
+			glades::ddp::broadcastFromRoot(&tensorTransformer.WOut[0], tensorTransformer.WOut.size());
+			glades::ddp::broadcastFromRoot(&tensorTransformer.bOut[0], tensorTransformer.bOut.size());
+
+			// Per-block tensors
+			for (int li = 0; li < H; ++li)
+			{
+				TensorTransformerState::Block& b = tensorTransformer.blocks[static_cast<size_t>(li)];
+				glades::ddp::broadcastFromRoot(&b.Wq[0], b.Wq.size());
+				glades::ddp::broadcastFromRoot(&b.Wk[0], b.Wk.size());
+				glades::ddp::broadcastFromRoot(&b.Wv[0], b.Wv.size());
+				glades::ddp::broadcastFromRoot(&b.Wo[0], b.Wo.size());
+				glades::ddp::broadcastFromRoot(&b.bq[0], b.bq.size());
+				glades::ddp::broadcastFromRoot(&b.bk[0], b.bk.size());
+				glades::ddp::broadcastFromRoot(&b.bv[0], b.bv.size());
+				glades::ddp::broadcastFromRoot(&b.bo[0], b.bo.size());
+				glades::ddp::broadcastFromRoot(&b.ln1Gamma[0], b.ln1Gamma.size());
+				glades::ddp::broadcastFromRoot(&b.ln1Beta[0], b.ln1Beta.size());
+				glades::ddp::broadcastFromRoot(&b.ln2Gamma[0], b.ln2Gamma.size());
+				glades::ddp::broadcastFromRoot(&b.ln2Beta[0], b.ln2Beta.size());
+				glades::ddp::broadcastFromRoot(&b.W1[0], b.W1.size());
+				glades::ddp::broadcastFromRoot(&b.W2[0], b.W2.size());
+				glades::ddp::broadcastFromRoot(&b.b1[0], b.b1.size());
+				glades::ddp::broadcastFromRoot(&b.b2[0], b.b2.size());
+			}
 		}
 
 		return true;

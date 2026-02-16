@@ -29,6 +29,7 @@
 #include "Backend/Machine Learning/transformer-serving-layer-test.h"
 #include "Backend/Machine Learning/prop-fuzz-test.h"
 #include "Backend/Machine Learning/parallel-test.h"
+#include "Backend/Machine Learning/ddp-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -49,6 +50,7 @@ int main(int argc, char* argv[])
 	    OHEUnitTest();
 	    MappedDatasetUnitTest();
 	    NNMixedPrecisionUnitTest();
+	    DDPUnitTest();
 	}
 	else if (argc > 1)
 	{
@@ -84,6 +86,8 @@ int main(int argc, char* argv[])
 		PropFuzzUnitTest();
 	    else if (strcmp(argv[1], "parallel") == 0)
 		ParallelUnitTest();
+	    else if (strcmp(argv[1], "ddp") == 0)
+		DDPUnitTest();
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
 	        OHEUnitTest();
@@ -122,6 +126,7 @@ int main(int argc, char* argv[])
 		    NNMixedPrecisionUnitTest();
 		    PropFuzzUnitTest();
 		    ParallelUnitTest();
+		    DDPUnitTest();
         }
 	    else
 		printf("Invalid test: %s\n", argv[1]);

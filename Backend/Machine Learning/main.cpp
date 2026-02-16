@@ -22,6 +22,7 @@
 #include "Structure/nninfo.h"
 #include "Networks/metanetwork.h"
 #include "Networks/network.h"
+#include "Networks/training_callbacks.h"
 #include "DataObjects/ImageInput.h"
 
 using namespace glades;
@@ -267,6 +268,63 @@ glades::MetaNetwork* glades::test(glades::MetaNetwork* cMetaNetwork, DataInput* 
 		if (!st.ok())
 		{
 			printf("[NN] Test failed: %s\n", st.message.c_str());
+			return NULL;
+		}
+	}
+
+	return cMetaNetwork;
+}
+
+// ===== Callback-aware wrappers =====
+//
+// These pass an explicit ITrainingCallbacks* to the network, bypassing the built-in
+// default callbacks. Useful when the caller provides its own GUI/logging adapter.
+
+glades::MetaNetwork* glades::train(glades::NNetwork* cNetwork, DataInput* newDataInput,
+    ITrainingCallbacks* callbacks, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+{
+	if (!cNetwork)
+		return NULL;
+
+	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(cNetwork->getName());
+	cMetaNetwork->addSubnet(cNetwork);
+
+	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
+	for (unsigned int i = 0; i < subnets.size(); ++i)
+	{
+		if (serverInstance && cConnection)
+			subnets[i]->setServer(serverInstance, cConnection);
+		const glades::NNetworkStatus st = subnets[i]->train(newDataInput, callbacks);
+		if (!st.ok())
+		{
+			printf("[NN] Train failed: %s\n", st.message.c_str());
+			delete cMetaNetwork;
+			return NULL;
+		}
+	}
+
+	return cMetaNetwork;
+}
+
+glades::MetaNetwork* glades::test(glades::NNetwork* cNetwork, DataInput* newDataInput,
+    ITrainingCallbacks* callbacks, GNet::GServer* serverInstance, GNet::Connection* cConnection)
+{
+	if (!cNetwork)
+		return NULL;
+
+	glades::MetaNetwork* cMetaNetwork = new glades::MetaNetwork(cNetwork->getName());
+	cMetaNetwork->addSubnet(cNetwork);
+
+	std::vector<glades::NNetwork*> subnets = cMetaNetwork->getSubnets();
+	for (unsigned int i = 0; i < subnets.size(); ++i)
+	{
+		if (serverInstance && cConnection)
+			subnets[i]->setServer(serverInstance, cConnection);
+		const glades::NNetworkStatus st = subnets[i]->test(newDataInput, callbacks);
+		if (!st.ok())
+		{
+			printf("[NN] Test failed: %s\n", st.message.c_str());
+			delete cMetaNetwork;
 			return NULL;
 		}
 	}

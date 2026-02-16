@@ -6,6 +6,7 @@ set(DO_src_files
 	tabular_preprocessing.cpp
 	MappedMatrix.cpp
 	MappedNumberInput.cpp
+	DDPDataInputWrapper.cpp
 )
 add_library(DataObjects ${DO_src_files})
 

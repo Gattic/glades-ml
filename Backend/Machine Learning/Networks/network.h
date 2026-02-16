@@ -927,6 +927,7 @@ private:
 	float lrScheduleMultiplier; // computed each epoch by the scheduler; starts at 1
 	float lastGradNorm;
 	float lastGradNormScale;
+	int64_t lastStepLogTime;
 
 	// === Tokenizer + vocabulary artifacts (deployment metadata) ===
 	//
@@ -1073,7 +1074,7 @@ public:
 	//
 	// Loading requires a DataInput instance to provide the input feature count so the
 	// network tensors can be shaped before applying weights.
-	NNetworkStatus saveModel(const std::string& modelName) const;
+	NNetworkStatus saveModel(const std::string& modelName, const DataInput* externalDI = NULL) const;
 	NNetworkStatus loadModel(const std::string& modelName, const DataInput* forShape, int netTypeOverride = -1);
 
 	// === Tokenizer/vocab artifacts (optional) ===

@@ -3,6 +3,7 @@
 #include "sgd_utils.h"
 #include "transformer_kernels.h"
 #include "glades_thread_pool.h"
+#include "ddp_comm.h"
 
 #ifdef GLADES_HAVE_CUDA
 #include "cuda/gpu_dispatch.h"
@@ -786,6 +787,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = trainingConfig.transformer.tokenLmLossKind;
 	const int tokenLmNegK = trainingConfig.transformer.tokenLmSampledNegatives;
 	const bool tokenLmAllowHuge = trainingConfig.transformer.tokenLmAllowHugeFullSoftmax;
+	const bool ddpEnabled = trainingConfig.ddp.enable && (glades::ddp::worldSize() > 1);
 
 	// Trainability triage:
 	// - For real LLMs, AdamW is the supported optimizer in this backend.
@@ -885,6 +887,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			// Otherwise, the model will "silently" change unused parameters and can skew grad clipping
 			// scale for the parameters that actually affect the forward pass.
 			const bool tokenLMTiedHead = tt.tokenModel;
+
+			// Warmup + DDP LR scaling multipliers.
+			const float warmupMult = net.trainingConfig.warmup.multiplier(static_cast<int>(tt.optimizerStep));
+			const float ddpLRScale = (net.trainingConfig.ddp.enable && net.trainingConfig.ddp.linearLRScaling)
+			                       ? static_cast<float>(glades::ddp::worldSize()) : 1.0f;
+			const float extraLRMult = warmupMult * ddpLRScale;
 
 			// Optional global grad norm clip (same semantics as other tensor paths).
 			float gradNorm = 0.0f;
@@ -1100,7 +1108,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				// Token embedding (index 0 in LM mode)
 				if (tt.tokenModel)
 				{
-					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float mf = net.skeleton->getMomentumFactor(0u);
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
@@ -1130,7 +1138,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 				// Input projection (index 0)
 				{
-					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float mf = net.skeleton->getMomentumFactor(0u);
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
@@ -1161,7 +1169,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				for (unsigned int li = 0; li < nLayers; ++li)
 				{
 					const unsigned int idx = li + 1u;
-					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
 					const float mf = net.skeleton->getMomentumFactor(idx);
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
@@ -1215,7 +1223,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (!tokenLMTiedHead)
 				{
 					const unsigned int idx = nLayers;
-					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
 					const float mf = net.skeleton->getMomentumFactor(idx);
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
@@ -1346,7 +1354,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				// Token embedding (index 0 in LM mode)
 				if (tt.tokenModel)
 				{
-					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
 					Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
@@ -1357,7 +1365,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 				// Input projection (index 0)
 				{
-					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
 					Adam::update_weight(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn,
@@ -1370,7 +1378,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				for (unsigned int li = 0; li < nLayers; ++li)
 				{
 					const unsigned int idx = li + 1u;
-					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
 					TensorTransformerState::Block& b = tt.blocks[li];
@@ -1399,7 +1407,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (!tokenLMTiedHead)
 				{
 					const unsigned int idx = nLayers;
-					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
 					Adam::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
@@ -1421,6 +1429,49 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	TensorTransformerState& tt = tensorTransformer;
 	ClearGrads clearGrads(tt);
 	ApplyBatch applyBatch(*this, tt, nLayers, dModel, outSize);
+
+	// Helper: AllReduce all gradient vectors across DDP workers (SUM).
+	struct DDPReduceGrads
+	{
+		TensorTransformerState& tt;
+		unsigned int nLayers;
+		DDPReduceGrads(TensorTransformerState& t, unsigned int nl) : tt(t), nLayers(nl) {}
+		void operator()(unsigned int& timeStepsInBatch) const
+		{
+			if (glades::ddp::worldSize() <= 1) return;
+			// Global tensors
+			if (!tt.gTokE.empty())   glades::ddp::allReduceSumInPlace(&tt.gTokE[0], tt.gTokE.size());
+			if (!tt.gLmBias.empty()) glades::ddp::allReduceSumInPlace(&tt.gLmBias[0], tt.gLmBias.size());
+			if (!tt.gWIn.empty())    glades::ddp::allReduceSumInPlace(&tt.gWIn[0], tt.gWIn.size());
+			if (!tt.gBIn.empty())    glades::ddp::allReduceSumInPlace(&tt.gBIn[0], tt.gBIn.size());
+			if (!tt.gWOut.empty())   glades::ddp::allReduceSumInPlace(&tt.gWOut[0], tt.gWOut.size());
+			if (!tt.gBOut.empty())   glades::ddp::allReduceSumInPlace(&tt.gBOut[0], tt.gBOut.size());
+			// Per-block tensors
+			for (unsigned int l = 0; l < nLayers; ++l)
+			{
+				TensorTransformerState::Block& b = tt.blocks[l];
+				if (!b.gWq.empty()) glades::ddp::allReduceSumInPlace(&b.gWq[0], b.gWq.size());
+				if (!b.gWk.empty()) glades::ddp::allReduceSumInPlace(&b.gWk[0], b.gWk.size());
+				if (!b.gWv.empty()) glades::ddp::allReduceSumInPlace(&b.gWv[0], b.gWv.size());
+				if (!b.gWo.empty()) glades::ddp::allReduceSumInPlace(&b.gWo[0], b.gWo.size());
+				if (!b.gBq.empty()) glades::ddp::allReduceSumInPlace(&b.gBq[0], b.gBq.size());
+				if (!b.gBk.empty()) glades::ddp::allReduceSumInPlace(&b.gBk[0], b.gBk.size());
+				if (!b.gBv.empty()) glades::ddp::allReduceSumInPlace(&b.gBv[0], b.gBv.size());
+				if (!b.gBo.empty()) glades::ddp::allReduceSumInPlace(&b.gBo[0], b.gBo.size());
+				if (!b.gLn1Gamma.empty()) glades::ddp::allReduceSumInPlace(&b.gLn1Gamma[0], b.gLn1Gamma.size());
+				if (!b.gLn1Beta.empty())  glades::ddp::allReduceSumInPlace(&b.gLn1Beta[0], b.gLn1Beta.size());
+				if (!b.gLn2Gamma.empty()) glades::ddp::allReduceSumInPlace(&b.gLn2Gamma[0], b.gLn2Gamma.size());
+				if (!b.gLn2Beta.empty())  glades::ddp::allReduceSumInPlace(&b.gLn2Beta[0], b.gLn2Beta.size());
+				if (!b.gW1.empty()) glades::ddp::allReduceSumInPlace(&b.gW1[0], b.gW1.size());
+				if (!b.gW2.empty()) glades::ddp::allReduceSumInPlace(&b.gW2[0], b.gW2.size());
+				if (!b.gB1.empty()) glades::ddp::allReduceSumInPlace(&b.gB1[0], b.gB1.size());
+				if (!b.gB2.empty()) glades::ddp::allReduceSumInPlace(&b.gB2[0], b.gB2.size());
+			}
+			// AllReduce SUM timeStepsInBatch so applyBatch divides by global total.
+			glades::ddp::allReduceSumInPlace(&timeStepsInBatch, 1);
+		}
+	};
+	DDPReduceGrads ddpReduceGrads(tt, nLayers);
 
 	// Mixed precision helper (must live inside this member function because TensorTransformerState is private).
 	struct MixedPrecisionHelper
@@ -2615,8 +2666,30 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	}
 #endif // GLADES_HAVE_CUDA
 
-	for (unsigned int s = 0; s < seqCount; ++s)
+	// Build shuffled sequence order. When DDP is active, each rank uses a different
+	// seed so workers process sequences in different orders (reducing correlation).
+	std::vector<unsigned int> seqOrder(seqCount);
+	for (unsigned int si = 0; si < seqCount; ++si)
+		seqOrder[si] = si;
+	if (isTrain && seqCount > 1u)
 	{
+		unsigned int seed = static_cast<unsigned int>(epochIdx * 31 + 7);
+		if (ddpEnabled)
+			seed += static_cast<unsigned int>(glades::ddp::rank()) * 1000003u;
+		// Fisher-Yates shuffle with a simple LCG.
+		for (unsigned int i = seqCount - 1; i > 0; --i)
+		{
+			seed = seed * 1664525u + 1013904223u;
+			const unsigned int j = seed % (i + 1u);
+			const unsigned int tmp = seqOrder[i];
+			seqOrder[i] = seqOrder[j];
+			seqOrder[j] = tmp;
+		}
+	}
+
+	for (unsigned int si = 0; si < seqCount; ++si)
+	{
+		const unsigned int s = seqOrder[si];
 		const unsigned int T = isTrain ? di->getTrainSequenceLength(s) : di->getTestSequenceLength(s);
 		if (T == 0u)
 			continue;
@@ -3801,6 +3874,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						if (mpUseLossScaling && tt.mpLossScale != 1.0f)
 							MixedPrecisionHelper::scale_all_grads(tt, 1.0f / tt.mpLossScale);
 
+						if (ddpEnabled)
+							ddpReduceGrads(timeStepsInBatch);
+
 						if (!applyBatch(timeStepsInBatch))
 							return;
 
@@ -3989,6 +4065,20 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		logger->info("NNetwork", shmea::GString(oss.str().c_str()));
 	}
 
+	// DDP: aggregate metrics across all workers before finalization.
+	if (ddpEnabled)
+	{
+		glades::ddp::allReduceSumInPlace(&tokenLmNllSum, 1);
+		glades::ddp::allReduceSumInPlace(&tokenLmTokenCount, 1);
+		glades::ddp::allReduceSumInPlace(&clsCorrect, 1);
+		glades::ddp::allReduceSumInPlace(&clsTotal, 1);
+		glades::ddp::allReduceSumInPlace(&regSSE, 1);
+		glades::ddp::allReduceSumInPlace(&regSAE, 1);
+		glades::ddp::allReduceSumInPlace(&regSumY, 1);
+		glades::ddp::allReduceSumInPlace(&regSumY2, 1);
+		glades::ddp::allReduceSumInPlace(&regCount, 1);
+	}
+
 	// Normalize token LM loss: mean NLL per non-pad token.
 	// (Trainer expects overallTotalError to be an epoch-level mean-like quantity.)
 	if (tokenLM)
@@ -4018,6 +4108,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		{
 			if (mpUseLossScaling && tt.mpLossScale != 1.0f)
 				MixedPrecisionHelper::scale_all_grads(tt, 1.0f / tt.mpLossScale);
+			if (ddpEnabled)
+				ddpReduceGrads(timeStepsInBatch);
 			if (!applyBatch(timeStepsInBatch))
 				return;
 			if (mpDynamicLossScaling)

@@ -18,6 +18,7 @@
 #include "trainer.h"
 
 #include "network.h"
+#include "ddp_comm.h"
 #include "../GMath/gmath.h"
 #include "../DataObjects/DataInput.h"
 
@@ -504,6 +505,14 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		bool callbackStop = false;
 		if (cb)
 			callbackStop = cb->onEpochEnd(net, metrics);
+
+		// DDP: consensus on early-stop so all workers stop together.
+		if (net.trainingConfig.ddp.enable && glades::ddp::worldSize() > 1)
+		{
+			unsigned int stopFlag = callbackStop ? 1u : 0u;
+			glades::ddp::allReduceSumInPlace(&stopFlag, 1);
+			callbackStop = (stopFlag > 0u);
+		}
 
 		net.cNodeActivations.clear();
 

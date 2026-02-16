@@ -425,8 +425,8 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 		}
 	}
 
-	// Progress logs for long DFF epochs (bounded to ~20 messages per epoch).
-	// Note: this emits "loss_so_far" as the running aggregate; epoch-end callback logs the finalized metrics.
+	// Progress logs for long DFF epochs (bounded to ~20 messages per epoch,
+	// and at most once per second wall-clock to avoid flooding on fast small datasets).
 	{
 		shmea::GLogger* logger = getLogger();
 		if (logger && dataSize > 0u)
@@ -439,28 +439,31 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 			const unsigned int done = inputRowCounter + 1u;
 			if (done == dataSize || (done % every) == 0u)
 			{
-				std::ostringstream oss;
-				oss << "event=nn_step_progress";
-				append_logfmt_kv(oss, "net_type", netType);
-				append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
-				append_logfmt_kv(oss, "epoch", epochs);
-				append_logfmt_kv(oss, "step", done);
-				append_logfmt_kv(oss, "steps_total", dataSize);
-				append_logfmt_kv(oss, "loss_so_far", overallTotalError);
-				append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
-				// Grad-norm is only computed when global grad clipping is enabled (for performance).
-				// Avoid printing misleading zeros when it is disabled.
-				if (trainingConfig.globalGradClipNorm > 0.0f)
+				const int64_t now = getCurrentTimeMilliseconds();
+				if (now - lastStepLogTime >= 1000)
 				{
-					append_logfmt_kv(oss, "grad_norm", lastGradNorm);
-					append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+					lastStepLogTime = now;
+					std::ostringstream oss;
+					oss << "event=nn_step_progress";
+					append_logfmt_kv(oss, "net_type", netType);
+					append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
+					append_logfmt_kv(oss, "epoch", epochs);
+					append_logfmt_kv(oss, "step", done);
+					append_logfmt_kv(oss, "steps_total", dataSize);
+					append_logfmt_kv(oss, "loss_so_far", overallTotalError);
+					append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+					if (trainingConfig.globalGradClipNorm > 0.0f)
+					{
+						append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+						append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+					}
+					else
+					{
+						append_logfmt_kv(oss, "grad_norm", std::string("na"));
+						append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
+					}
+					logger->info("NNetwork", shmea::GString(oss.str().c_str()));
 				}
-				else
-				{
-					append_logfmt_kv(oss, "grad_norm", std::string("na"));
-					append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
-				}
-				logger->info("NNetwork", shmea::GString(oss.str().c_str()));
 			}
 		}
 	}

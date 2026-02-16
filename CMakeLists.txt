@@ -14,15 +14,47 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 option(GLADES_ENABLE_CUDA "Build with CUDA GPU offloading support" OFF)
 if(GLADES_ENABLE_CUDA)
 	cmake_minimum_required(VERSION 3.18) # for CUDA_ARCHITECTURES
+
+	# Find nvcc if not already in PATH (common on Fedora/RHEL where the
+	# CUDA toolkit installs to /usr/local/cuda but doesn't modify PATH).
+	if(NOT CMAKE_CUDA_COMPILER)
+		find_program(_NVCC_BIN nvcc
+			PATHS /usr/local/cuda/bin /usr/local/cuda-12/bin
+			      /opt/cuda/bin ENV CUDA_PATH
+			NO_DEFAULT_PATH)
+		if(_NVCC_BIN)
+			set(CMAKE_CUDA_COMPILER "${_NVCC_BIN}" CACHE FILEPATH "CUDA compiler")
+		endif()
+	endif()
+
+	# CMake >= 3.18 requires CMAKE_CUDA_ARCHITECTURES to be non-empty.
+	# Default to "native" (detect at build time) when not explicitly set.
+	if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
+		set(CMAKE_CUDA_ARCHITECTURES native)
+	endif()
+
 	include(${CMAKE_SOURCE_DIR}/cmake/CudaGlibcCompat.cmake)
 	cuda_glibc_compat_apply()
+
+	# CUDA 12.x supports up to GCC 14.  When the system default (e.g. GCC 15)
+	# is too new, tell nvcc to use gcc-14/g++-14 as the host compiler.
+	# The ccbin flag must be visible during CMake's compiler-identification
+	# step (NVCC_PREPEND_FLAGS, appended AFTER cuda_glibc_compat_apply) and
+	# during the actual build (CMAKE_CUDA_FLAGS).
+	find_program(_GCC14 g++-14 PATHS /usr/bin NO_DEFAULT_PATH)
+	if(_GCC14)
+		set(CMAKE_CUDA_HOST_COMPILER "${_GCC14}" CACHE FILEPATH "CUDA host compiler")
+		set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -ccbin ${_GCC14}")
+		set(ENV{NVCC_PREPEND_FLAGS} "$ENV{NVCC_PREPEND_FLAGS} -ccbin ${_GCC14}")
+	endif()
+
 	enable_language(CUDA)
 	add_definitions(-DGLADES_HAVE_CUDA=1)
 	message(STATUS "CUDA enabled: ${CMAKE_CUDA_COMPILER}")
 endif()
 
 #Compiler Flags
-set(CMAKE_BUILD_TYPE RelWithDebInfo) # -O2 -g
+set(CMAKE_BUILD_TYPE Release) # -O3
 
 if(WIN32)
 	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static")
@@ -31,7 +63,7 @@ else()
 	set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
 #Project
 project(glades)

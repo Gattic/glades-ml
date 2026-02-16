@@ -61,6 +61,7 @@ private:
 	shmea::GList repList;
 	shmea::GTable repTable;
 	shmea::GObject repObj;
+	shmea::GString binaryPayload;
 
 public:
 
@@ -70,6 +71,7 @@ public:
 	static const int TYPE_LIST = 1;
 	static const int TYPE_TABLE = 2;
 	static const int TYPE_NETWORK_POINTER = 3;
+	static const int TYPE_BINARY = 4;
 
 	ServiceData(GNet::Connection*);
 	ServiceData(GNet::Connection*, shmea::GString);
@@ -82,10 +84,15 @@ public:
 	void set(shmea::GString, const shmea::GTable&);
 	void set(shmea::GString, const shmea::GObject&);
 	void set(shmea::GString, const shmea::Serializable&);
+	void set(shmea::GString, const char*, unsigned int);
 	void set(const shmea::GList&);
 	void set(const shmea::GTable&);
 	void set(const shmea::GObject&);
 	void set(const shmea::Serializable&);
+
+	void setBinaryPayload(const char* data, unsigned int size);
+	const shmea::GString& getBinaryPayload() const;
+	unsigned int getBinaryPayloadSize() const;
 
 	GNet::Connection* getConnection() const;
 	void setConnectionOwner(shmea::GPointer<GNet::Connection, shmea::delete_connection>);

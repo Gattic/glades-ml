@@ -16,5 +16,7 @@ ohe-test.cpp
 mapped-dataset-test.cpp
  "../../../Backend/Machine Learning/DataObjects/MappedMatrix.cpp"
  "../../../Backend/Machine Learning/DataObjects/MappedNumberInput.cpp"
+ddp-test.cpp
+ "../../../Backend/Machine Learning/DataObjects/DDPDataInputWrapper.cpp"
 )
 add_library(PCATests ${PCATests_src_files})
