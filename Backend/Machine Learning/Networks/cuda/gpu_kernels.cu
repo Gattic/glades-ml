@@ -835,6 +835,66 @@ bool rope_apply(float* x, const float* invFreq,
 	return true;
 }
 
+// Fused Q+K RoPE: apply RoPE to both Q and K in a single kernel launch.
+// Grid: (ceil(total/blockDim.x), 2) — blockIdx.y==0 for Q, blockIdx.y==1 for K.
+namespace {
+
+__global__ void rope_apply_qk_kernel(float* __restrict__ Q,
+                                      float* __restrict__ K,
+                                      const float* __restrict__ invFreq,
+                                      int T, int nQHeads, int nKVHeads,
+                                      int dHead, int halfDim, bool inverse,
+                                      int totalQ, int totalK)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int region = blockIdx.y; // 0=Q, 1=K
+
+	float* x;
+	int nHeads, total;
+	if (region == 0) {
+		x = Q; nHeads = nQHeads; total = totalQ;
+	} else {
+		x = K; nHeads = nKVHeads; total = totalK;
+	}
+
+	if (idx >= total) return;
+
+	int d   = idx % halfDim;
+	int tmp = idx / halfDim;
+	int h   = tmp % nHeads;
+	int t   = tmp / nHeads;
+
+	float theta = (float)t * invFreq[d];
+	float cosT  = cosf(theta);
+	float sinT  = inverse ? -sinf(theta) : sinf(theta);
+
+	size_t base = ((size_t)t * nHeads + h) * dHead;
+	float x0 = x[base + d];
+	float x1 = x[base + d + halfDim];
+
+	x[base + d]            = x0 * cosT - x1 * sinT;
+	x[base + d + halfDim]  = x0 * sinT + x1 * cosT;
+}
+
+} // anonymous namespace
+
+bool rope_apply_qk(float* Q, float* K, const float* invFreq,
+                    int T, int nQHeads, int nKVHeads, int dHead,
+                    int halfDim, bool inverse)
+{
+	if (T <= 0 || dHead < 2) return true;
+	int hd = (halfDim > 0 && halfDim <= dHead / 2) ? halfDim : (dHead / 2);
+	int totalQ = T * nQHeads * hd;
+	int totalK = T * nKVHeads * hd;
+	int maxTotal = (totalQ > totalK) ? totalQ : totalK;
+	int gridX = (maxTotal + kBlockElem - 1) / kBlockElem;
+	dim3 grid(gridX, 2);
+	rope_apply_qk_kernel<<<grid, kBlockElem>>>(Q, K, invFreq, T, nQHeads, nKVHeads,
+	                                            dHead, hd, inverse, totalQ, totalK);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // ===========================================================================
 //  12. Simple vector ops: add_bias, add_residual, axpy
 // ===========================================================================
@@ -1053,6 +1113,72 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 	int grid = (n + kBlockElem - 1) / kBlockElem;
 	adam_update_kernel<<<grid, kBlockElem>>>(
 		param, grad, m, v, lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Batched Adam: process all parameter groups in a single kernel launch.
+// Each block handles one element range within one parameter group.
+namespace {
+
+__global__ void adam_update_batch_kernel(
+    float** __restrict__ params,
+    float** __restrict__ grads,
+    float** __restrict__ ms,
+    float** __restrict__ vs,
+    const float* __restrict__ lrs,
+    const float* __restrict__ wds,
+    const int* __restrict__ sizes,
+    float beta1, float beta2, float eps,
+    float gradScale, int step, int groupCount)
+{
+	int grp = blockIdx.y;
+	if (grp >= groupCount) return;
+
+	int n = sizes[grp];
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	float* param = params[grp];
+	float* grad = grads[grp];
+	float* m_arr = ms[grp];
+	float* v_arr = vs[grp];
+	float lr = lrs[grp];
+	float weightDecay = wds[grp];
+
+	float g = grad[idx] * gradScale;
+
+	if (weightDecay != 0.0f)
+		param[idx] -= lr * weightDecay * param[idx];
+
+	float m_new = beta1 * m_arr[idx] + (1.0f - beta1) * g;
+	float v_new = beta2 * v_arr[idx] + (1.0f - beta2) * g * g;
+	m_arr[idx] = m_new;
+	v_arr[idx] = v_new;
+
+	float bc1 = 1.0f - powf(beta1, (float)step);
+	float bc2 = 1.0f - powf(beta2, (float)step);
+	float m_hat = m_new / bc1;
+	float v_hat = v_new / bc2;
+
+	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
+} // anonymous namespace
+
+bool adam_update_batch(float** d_params, float** d_grads,
+                       float** d_ms, float** d_vs,
+                       const float* d_lrs, const float* d_wds,
+                       const int* d_sizes, int maxSize,
+                       float beta1, float beta2, float eps,
+                       float gradScale, int step, int groupCount)
+{
+	if (groupCount <= 0) return true;
+	int gridX = (maxSize + kBlockElem - 1) / kBlockElem;
+	dim3 grid(gridX, groupCount);
+	adam_update_batch_kernel<<<grid, kBlockElem>>>(
+		d_params, d_grads, d_ms, d_vs, d_lrs, d_wds, d_sizes,
+		beta1, beta2, eps, gradScale, step, groupCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

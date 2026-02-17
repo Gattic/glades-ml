@@ -18,7 +18,10 @@ GpuTransformerWeights::GpuTransformerWeights()
       dModel(0), dFF(0), nHeads(0), nKVHeads(0), nLayers(0),
       vocabSize(0), inputSize(0), outSize(0), ffnKind(0),
       tokenModel(false), tieEmbeddings(false),
-      blocks(0)
+      blocks(0),
+      d_adamParams(0), d_adamGrads(0), d_adamM(0), d_adamV(0),
+      d_adamLr(0), d_adamWd(0), d_adamSizes(0),
+      adamGroupCount(0), adamMaxSize(0), adamPtrsUploaded(false)
 {
 }
 
@@ -176,6 +179,23 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gB2, dm)) return false;
 	}
 
+	// Allocate batched Adam device arrays.
+	// Max groups: 4 global + 16 per layer.
+	{
+		int maxGroups = 4 + 16 * static_cast<int>(nl);
+		cudaError_t e;
+		e = cudaMalloc(&d_adamParams, maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamGrads,  maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamM,      maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamV,      maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamLr,     maxGroups * sizeof(float));   if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamWd,     maxGroups * sizeof(float));   if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamSizes,  maxGroups * sizeof(int));     if (e != cudaSuccess) return false;
+		adamGroupCount = 0;
+		adamMaxSize = 0;
+		adamPtrsUploaded = false;
+	}
+
 	initialized = true;
 	return true;
 }
@@ -187,6 +207,16 @@ void GpuTransformerWeights::free()
 		delete[] blocks;
 		blocks = 0;
 	}
+	if (d_adamParams) { cudaFree(d_adamParams); d_adamParams = 0; }
+	if (d_adamGrads)  { cudaFree(d_adamGrads);  d_adamGrads  = 0; }
+	if (d_adamM)      { cudaFree(d_adamM);      d_adamM      = 0; }
+	if (d_adamV)      { cudaFree(d_adamV);       d_adamV      = 0; }
+	if (d_adamLr)     { cudaFree(d_adamLr);      d_adamLr     = 0; }
+	if (d_adamWd)     { cudaFree(d_adamWd);      d_adamWd     = 0; }
+	if (d_adamSizes)  { cudaFree(d_adamSizes);   d_adamSizes  = 0; }
+	adamGroupCount = 0;
+	adamMaxSize = 0;
+	adamPtrsUploaded = false;
 	initialized = false;
 	// GpuBuffer destructors handle cudaFree automatically.
 }

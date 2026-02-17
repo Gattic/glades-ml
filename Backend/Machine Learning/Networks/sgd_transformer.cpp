@@ -1826,18 +1826,16 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					                     0.0f, V_l, static_cast<int>(dModelKV));
 					gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
 
-					// RoPE (if enabled)
+					// RoPE (if enabled) — fused Q+K in single kernel launch
 					if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
 					{
 						const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
 						                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
 						// Use persistent gpuInvFreq from scratch (uploaded before layer loop).
-						gpu::rope_apply(Q_l, gpuTransformerScratch->gpuInvFreq.data(),
-						                 static_cast<int>(T), static_cast<int>(nHeads),
-						                 static_cast<int>(dHead), static_cast<int>(rd / 2u));
-						gpu::rope_apply(K_l, gpuTransformerScratch->gpuInvFreq.data(),
-						                 static_cast<int>(T), static_cast<int>(nKVHeads),
-						                 static_cast<int>(dHead), static_cast<int>(rd / 2u));
+						gpu::rope_apply_qk(Q_l, K_l, gpuTransformerScratch->gpuInvFreq.data(),
+						                    static_cast<int>(T), static_cast<int>(nHeads),
+						                    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+						                    static_cast<int>(rd / 2u));
 					}
 
 					// Batched GEMM attention (replaces per-head flash attention).
@@ -2338,17 +2336,15 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						}
 					}
 
-					// --- RoPE backward (inverse rotation) ---
+					// --- RoPE backward (inverse rotation) — fused Q+K ---
 					if (useRope && gpuTransformerScratch->gpuInvFreq.allocated())
 					{
-						gpu::rope_apply(gpuTransformerScratch->dQfull.data(),
+						gpu::rope_apply_qk(gpuTransformerScratch->dQfull.data(),
+						    gpuTransformerScratch->dKfull.data(),
 						    gpuTransformerScratch->gpuInvFreq.data(),
 						    static_cast<int>(T), static_cast<int>(nHeads),
-						    static_cast<int>(dHead), static_cast<int>(ropeHalfDim), true);
-						gpu::rope_apply(gpuTransformerScratch->dKfull.data(),
-						    gpuTransformerScratch->gpuInvFreq.data(),
-						    static_cast<int>(T), static_cast<int>(nKVHeads),
-						    static_cast<int>(dHead), static_cast<int>(ropeHalfDim), true);
+						    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+						    static_cast<int>(ropeHalfDim), true);
 					}
 
 					// --- Q/K/V projection backward ---
@@ -2371,14 +2367,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					    static_cast<int>(T), static_cast<int>(dModel),
 					    1.0f, gb.gBq.data());
 
-					// K: dXtmp = dK * Wk^T, accumulate into dX1
+					// K: accumulate dK * Wk^T directly into dX1 (beta=1.0)
 					gpu::sgemm_rowmajor(
 					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
 					    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
 					    gb.Wk.data(), static_cast<int>(dModel),
-					    0.0f, gpuTransformerScratch->dXtmp.data(), static_cast<int>(dModel));
-					gpu::add_residual(gpuTransformerScratch->dX1.data(),
-					    gpuTransformerScratch->dXtmp.data(), static_cast<int>(T * dModel));
+					    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
 					gpu::sgemm_rowmajor_atb(
 					    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
 					    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
@@ -2389,14 +2383,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					    static_cast<int>(T), static_cast<int>(dModelKV),
 					    1.0f, gb.gBk.data());
 
-					// V: dXtmp = dV * Wv^T, accumulate into dX1
+					// V: accumulate dV * Wv^T directly into dX1 (beta=1.0)
 					gpu::sgemm_rowmajor(
 					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
 					    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
 					    gb.Wv.data(), static_cast<int>(dModel),
-					    0.0f, gpuTransformerScratch->dXtmp.data(), static_cast<int>(dModel));
-					gpu::add_residual(gpuTransformerScratch->dX1.data(),
-					    gpuTransformerScratch->dXtmp.data(), static_cast<int>(T * dModel));
+					    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
 					gpu::sgemm_rowmajor_atb(
 					    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
 					    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
@@ -2472,141 +2464,155 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					tensorTransformer.optimizerStep += 1ULL;
 					const int stepInt = static_cast<int>(tensorTransformer.optimizerStep);
 
-					// Token embedding (layer index 0).
-					if (tokenLM)
+					// === Batched Adam optimizer ===
+					// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
+					if (!gpuTransformerWeights->adamPtrsUploaded)
 					{
-						const float lr = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
-						const float wd = skeleton->getWeightDecay2(0u);
-						const int tokEn = static_cast<int>(static_cast<size_t>(vocabSize) * dModel);
-						gpu::adam_update(gpuTransformerWeights->tokE.data(),
-						    gpuTransformerWeights->gTokE.data(),
-						    gpuTransformerWeights->vTokE.data(),
-						    gpuTransformerWeights->v2TokE.data(),
-						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, tokEn);
+						float* hParams[4 + 16 * 256];
+						float* hGrads[4 + 16 * 256];
+						float* hMs[4 + 16 * 256];
+						float* hVs[4 + 16 * 256];
+						int hSizes[4 + 16 * 256];
+						int gc = 0;
+						int maxSz = 0;
 
-						const int lbN = static_cast<int>(vocabSize);
-						gpu::adam_update(gpuTransformerWeights->lmBias.data(),
-						    gpuTransformerWeights->gLmBias.data(),
-						    gpuTransformerWeights->mLmBias.data(),
-						    gpuTransformerWeights->v2LmBias.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lbN);
-					}
+#define GLADES_ADD_ADAM_GROUP(p, g, m, v, sz) do { \
+	if ((sz) > 0) { \
+		hParams[gc] = (p); hGrads[gc] = (g); \
+		hMs[gc] = (m); hVs[gc] = (v); \
+		hSizes[gc] = (sz); \
+		if ((sz) > maxSz) maxSz = (sz); \
+		++gc; \
+	} \
+} while(0)
 
-					// Input projection (layer index 0).
-					{
-						const float lr = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
-						const float wd = skeleton->getWeightDecay2(0u);
-						const int wn = static_cast<int>(gpuTransformerWeights->WIn.size());
-						if (wn > 0)
+						if (tokenLM)
 						{
-							gpu::adam_update(gpuTransformerWeights->WIn.data(),
+							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->tokE.data(),
+							    gpuTransformerWeights->gTokE.data(),
+							    gpuTransformerWeights->vTokE.data(),
+							    gpuTransformerWeights->v2TokE.data(),
+							    static_cast<int>(static_cast<size_t>(vocabSize) * dModel));
+							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lmBias.data(),
+							    gpuTransformerWeights->gLmBias.data(),
+							    gpuTransformerWeights->mLmBias.data(),
+							    gpuTransformerWeights->v2LmBias.data(),
+							    static_cast<int>(vocabSize));
+						}
+						{
+							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WIn.data(),
 							    gpuTransformerWeights->gWIn.data(),
 							    gpuTransformerWeights->vWIn.data(),
 							    gpuTransformerWeights->v2WIn.data(),
-							    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wn);
-						}
-						const int bn = static_cast<int>(gpuTransformerWeights->bIn.size());
-						if (bn > 0)
-						{
-							gpu::adam_update(gpuTransformerWeights->bIn.data(),
+							    static_cast<int>(gpuTransformerWeights->WIn.size()));
+							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bIn.data(),
 							    gpuTransformerWeights->gBIn.data(),
 							    gpuTransformerWeights->mBIn.data(),
 							    gpuTransformerWeights->v2BIn.data(),
-							    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bn);
+							    static_cast<int>(gpuTransformerWeights->bIn.size()));
 						}
-					}
-
-					// Per-block weights (layer index 1..nLayers).
-					for (unsigned int bli = 0; bli < nLayers; ++bli)
-					{
-						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
-						const unsigned int idx = bli + 1u;
-						const float lr = skeleton->getLearningRate(idx) * lrScheduleMultiplier;
-						const float wd = skeleton->getWeightDecay2(idx);
-
-						// Weight matrices.
-						const int wqN = static_cast<int>(gb.Wq.size());
-						gpu::adam_update(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(),
-						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wqN);
-						const int wkN = static_cast<int>(gb.Wk.size());
-						gpu::adam_update(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(),
-						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wkN);
-						const int wvN = static_cast<int>(gb.Wv.size());
-						gpu::adam_update(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(),
-						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wvN);
-						const int woN = static_cast<int>(gb.Wo.size());
-						gpu::adam_update(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(),
-						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, woN);
-						const int w1N = static_cast<int>(gb.W1.size());
-						gpu::adam_update(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(),
-						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, w1N);
-						const int w2N = static_cast<int>(gb.W2.size());
-						gpu::adam_update(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(),
-						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, w2N);
-
-						// Biases (no weight decay).
-						const int bqN = static_cast<int>(gb.bq.size());
-						gpu::adam_update(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bqN);
-						const int bkN = static_cast<int>(gb.bk.size());
-						gpu::adam_update(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bkN);
-						const int bvN = static_cast<int>(gb.bv.size());
-						gpu::adam_update(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bvN);
-						const int boN = static_cast<int>(gb.bo.size());
-						gpu::adam_update(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, boN);
-						const int b1N = static_cast<int>(gb.b1.size());
-						gpu::adam_update(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, b1N);
-						const int b2N = static_cast<int>(gb.b2.size());
-						gpu::adam_update(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, b2N);
-
-						// LN params (no weight decay).
-						const int lgN = static_cast<int>(gb.ln1Gamma.size());
-						gpu::adam_update(gb.ln1Gamma.data(), gb.gLn1Gamma.data(),
-						    gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lgN);
-						const int lbN = static_cast<int>(gb.ln1Beta.size());
-						gpu::adam_update(gb.ln1Beta.data(), gb.gLn1Beta.data(),
-						    gb.mLn1Beta.data(), gb.v2Ln1Beta.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lbN);
-						const int lg2N = static_cast<int>(gb.ln2Gamma.size());
-						gpu::adam_update(gb.ln2Gamma.data(), gb.gLn2Gamma.data(),
-						    gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lg2N);
-						const int lb2N = static_cast<int>(gb.ln2Beta.size());
-						gpu::adam_update(gb.ln2Beta.data(), gb.gLn2Beta.data(),
-						    gb.mLn2Beta.data(), gb.v2Ln2Beta.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lb2N);
-					}
-
-					// Output projection (non-tokenLM only).
-					if (!tokenLM)
-					{
-						const unsigned int idx = nLayers;
-						const float lr = skeleton->getLearningRate(idx) * lrScheduleMultiplier;
-						const float wd = skeleton->getWeightDecay2(idx);
-						const int woN = static_cast<int>(gpuTransformerWeights->WOut.size());
-						if (woN > 0)
+						for (unsigned int bli = 0; bli < nLayers; ++bli)
 						{
-							gpu::adam_update(gpuTransformerWeights->WOut.data(),
+							gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+							GLADES_ADD_ADAM_GROUP(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()));
+							GLADES_ADD_ADAM_GROUP(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()));
+							GLADES_ADD_ADAM_GROUP(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()));
+							GLADES_ADD_ADAM_GROUP(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()));
+							GLADES_ADD_ADAM_GROUP(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()));
+							GLADES_ADD_ADAM_GROUP(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()));
+							GLADES_ADD_ADAM_GROUP(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(), static_cast<int>(gb.bq.size()));
+							GLADES_ADD_ADAM_GROUP(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(), static_cast<int>(gb.bk.size()));
+							GLADES_ADD_ADAM_GROUP(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(), static_cast<int>(gb.bv.size()));
+							GLADES_ADD_ADAM_GROUP(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(), static_cast<int>(gb.bo.size()));
+							GLADES_ADD_ADAM_GROUP(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(), static_cast<int>(gb.b1.size()));
+							GLADES_ADD_ADAM_GROUP(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(), static_cast<int>(gb.b2.size()));
+							GLADES_ADD_ADAM_GROUP(gb.ln1Gamma.data(), gb.gLn1Gamma.data(), gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(), static_cast<int>(gb.ln1Gamma.size()));
+							GLADES_ADD_ADAM_GROUP(gb.ln1Beta.data(), gb.gLn1Beta.data(), gb.mLn1Beta.data(), gb.v2Ln1Beta.data(), static_cast<int>(gb.ln1Beta.size()));
+							GLADES_ADD_ADAM_GROUP(gb.ln2Gamma.data(), gb.gLn2Gamma.data(), gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(), static_cast<int>(gb.ln2Gamma.size()));
+							GLADES_ADD_ADAM_GROUP(gb.ln2Beta.data(), gb.gLn2Beta.data(), gb.mLn2Beta.data(), gb.v2Ln2Beta.data(), static_cast<int>(gb.ln2Beta.size()));
+						}
+						if (!tokenLM)
+						{
+							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WOut.data(),
 							    gpuTransformerWeights->gWOut.data(),
 							    gpuTransformerWeights->vWOut.data(),
 							    gpuTransformerWeights->v2WOut.data(),
-							    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, woN);
-						}
-						const int boN = static_cast<int>(gpuTransformerWeights->bOut.size());
-						if (boN > 0)
-						{
-							gpu::adam_update(gpuTransformerWeights->bOut.data(),
+							    static_cast<int>(gpuTransformerWeights->WOut.size()));
+							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bOut.data(),
 							    gpuTransformerWeights->gBOut.data(),
 							    gpuTransformerWeights->mBOut.data(),
 							    gpuTransformerWeights->v2BOut.data(),
-							    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, boN);
+							    static_cast<int>(gpuTransformerWeights->bOut.size()));
 						}
+#undef GLADES_ADD_ADAM_GROUP
+
+						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamParams, hParams, gc * sizeof(float*));
+						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamGrads, hGrads, gc * sizeof(float*));
+						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamM, hMs, gc * sizeof(float*));
+						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamV, hVs, gc * sizeof(float*));
+						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamSizes, hSizes, gc * sizeof(int));
+						gpuTransformerWeights->adamGroupCount = gc;
+						gpuTransformerWeights->adamMaxSize = maxSz;
+						gpuTransformerWeights->adamPtrsUploaded = true;
+					}
+
+					// Fill lr/wd arrays each step and launch single batched kernel.
+					{
+						const int gc = gpuTransformerWeights->adamGroupCount;
+						float hLrs[4 + 16 * 256];
+						float hWds[4 + 16 * 256];
+						int gi = 0;
+
+						if (tokenLM)
+						{
+							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
+							const float wd0 = skeleton->getWeightDecay2(0u);
+							hLrs[gi] = lr0; hWds[gi] = wd0; ++gi;
+							hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi;
+						}
+						{
+							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
+							const float wd0 = skeleton->getWeightDecay2(0u);
+							if (gpuTransformerWeights->WIn.size() > 0)
+							{ hLrs[gi] = lr0; hWds[gi] = wd0; ++gi; }
+							if (gpuTransformerWeights->bIn.size() > 0)
+							{ hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi; }
+						}
+						for (unsigned int bli = 0; bli < nLayers; ++bli)
+						{
+							const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier;
+							const float wd_l = skeleton->getWeightDecay2(bli + 1u);
+							// 6 weight groups (with wd)
+							for (int w = 0; w < 6; ++w)
+							{ hLrs[gi] = lr_l; hWds[gi] = wd_l; ++gi; }
+							// 10 bias/LN groups (no wd)
+							for (int b = 0; b < 10; ++b)
+							{ hLrs[gi] = lr_l; hWds[gi] = 0.0f; ++gi; }
+						}
+						if (!tokenLM)
+						{
+							const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier;
+							const float wdO = skeleton->getWeightDecay2(nLayers);
+							if (gpuTransformerWeights->WOut.size() > 0)
+							{ hLrs[gi] = lrO; hWds[gi] = wdO; ++gi; }
+							if (gpuTransformerWeights->bOut.size() > 0)
+							{ hLrs[gi] = lrO; hWds[gi] = 0.0f; ++gi; }
+						}
+
+						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamLr, hLrs, gc * sizeof(float));
+						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamWd, hWds, gc * sizeof(float));
+
+						gpu::adam_update_batch(
+						    gpuTransformerWeights->d_adamParams,
+						    gpuTransformerWeights->d_adamGrads,
+						    gpuTransformerWeights->d_adamM,
+						    gpuTransformerWeights->d_adamV,
+						    gpuTransformerWeights->d_adamLr,
+						    gpuTransformerWeights->d_adamWd,
+						    gpuTransformerWeights->d_adamSizes,
+						    gpuTransformerWeights->adamMaxSize,
+						    beta1, beta2, adamEps,
+						    invBatch, stepInt, gc);
 					}
 
 					gpu::synchronize();

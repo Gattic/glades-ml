@@ -87,6 +87,11 @@ bool rope_apply(float* x, const float* invFreq,
                 int T, int nHeads, int dHead,
                 int halfDim = 0, bool inverse = false);
 
+// Fused Q+K RoPE: apply RoPE to both Q and K arrays in a single kernel launch.
+bool rope_apply_qk(float* Q, float* K, const float* invFreq,
+                    int T, int nQHeads, int nKVHeads, int dHead,
+                    int halfDim = 0, bool inverse = false);
+
 // ---------------------------------------------------------------------------
 // Simple vector ops
 // ---------------------------------------------------------------------------
@@ -128,6 +133,18 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
 bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
                  float weightDecay, float gradScale, int step, int n);
+
+// Batched Adam: process all parameter groups in a single kernel launch.
+// d_params/d_grads/d_ms/d_vs are device arrays of groupCount pointers.
+// d_lrs/d_wds are device arrays of groupCount floats (per-group lr/wd).
+// d_sizes is a device array of groupCount ints (element counts).
+// maxSize is the largest element count across all groups.
+bool adam_update_batch(float** d_params, float** d_grads,
+                       float** d_ms, float** d_vs,
+                       const float* d_lrs, const float* d_wds,
+                       const int* d_sizes, int maxSize,
+                       float beta1, float beta2, float eps,
+                       float gradScale, int step, int groupCount);
 
 // ---------------------------------------------------------------------------
 // Flash attention (simplified single-head)
@@ -268,6 +285,7 @@ inline bool swiglu_forward(const float*, int, int, float*) { return false; }
 inline bool swiglu_backward(const float*, const float*, int, int, float*) { return false; }
 
 inline bool rope_apply(float*, const float*, int, int, int, int = 0, bool = false) { return false; }
+inline bool rope_apply_qk(float*, float*, const float*, int, int, int, int, int = 0, bool = false) { return false; }
 
 inline bool add_bias(float*, const float*, int, int) { return false; }
 inline bool add_residual(float*, const float*, int) { return false; }
@@ -279,6 +297,7 @@ inline bool embedding_gather(const float*, const int*, int, int, int, float*) { 
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
+inline bool adam_update_batch(float**, float**, float**, float**, const float*, const float*, const int*, int, float, float, float, float, int, int) { return false; }
 
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
