@@ -19,5 +19,6 @@ mapped-dataset-test.cpp
 ddp-test.cpp
  "../../../Backend/Machine Learning/DataObjects/DDPDataInputWrapper.cpp"
 transformer-improvements-test.cpp
+gpu-training-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})
