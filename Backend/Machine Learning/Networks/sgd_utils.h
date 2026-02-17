@@ -7,6 +7,8 @@
 #include <limits>
 #include <vector>
 
+#include "transformer_kernels.h"
+
 namespace glades {
 namespace sgd_detail {
 
@@ -31,66 +33,30 @@ inline bool is_finite_double(double v)
 #endif
 }
 
-// Check a vector for non-finite values using a bounded sampling strategy.
-// This is intended for potentially huge input rows (e.g., images).
-inline bool vector_all_finite_bounded(const std::vector<float>& v, unsigned int maxChecks = 16u)
+// Check a vector for non-finite values (full scan with SIMD fast path).
+inline bool vector_all_finite_bounded(const std::vector<float>& v, unsigned int /*maxChecks*/ = 16u)
 {
 	if (v.empty())
 		return true;
-	if (maxChecks == 0u)
-		maxChecks = 1u;
-	const unsigned int n = static_cast<unsigned int>(v.size());
-	const unsigned int checks = (n < maxChecks ? n : maxChecks);
-	const unsigned int denom = (checks > 1u ? (checks - 1u) : 1u);
-	for (unsigned int k = 0; k < checks; ++k)
-	{
-		const unsigned int idx = (n == 1u) ? 0u
-		                                   : static_cast<unsigned int>((static_cast<unsigned long long>(k) * static_cast<unsigned long long>(n - 1u)) / denom);
-		if (!is_finite(v[idx]))
-			return false;
-	}
-	return true;
+	return glades::transformer_kernels::all_finite_full(&v[0], v.size());
 }
 
 // Overload for shmea::GVector<float> (API-compatible container used throughout the engine).
 template <typename GVectorLike>
-inline bool gvector_all_finite_bounded(const GVectorLike& v, unsigned int maxChecks = 16u)
+inline bool gvector_all_finite_bounded(const GVectorLike& v, unsigned int /*maxChecks*/ = 16u)
 {
 	if (v.size() == 0)
 		return true;
-	if (maxChecks == 0u)
-		maxChecks = 1u;
-	const unsigned int n = static_cast<unsigned int>(v.size());
-	const unsigned int checks = (n < maxChecks ? n : maxChecks);
-	const unsigned int denom = (checks > 1u ? (checks - 1u) : 1u);
-	for (unsigned int k = 0; k < checks; ++k)
-	{
-		const unsigned int idx = (n == 1u) ? 0u
-		                                   : static_cast<unsigned int>((static_cast<unsigned long long>(k) * static_cast<unsigned long long>(n - 1u)) / denom);
-		if (!is_finite(v[idx]))
-			return false;
-	}
-	return true;
+	// GVector has contiguous storage, use full scan
+	return glades::transformer_kernels::all_finite_full(&v[0], static_cast<size_t>(v.size()));
 }
 
 // Pointer/span variant (for DataInput::*View APIs).
-inline bool span_all_finite_bounded(const float* data, unsigned int size, unsigned int maxChecks = 16u)
+inline bool span_all_finite_bounded(const float* data, unsigned int size, unsigned int /*maxChecks*/ = 16u)
 {
 	if (!data || size == 0u)
 		return true;
-	if (maxChecks == 0u)
-		maxChecks = 1u;
-	const unsigned int n = size;
-	const unsigned int checks = (n < maxChecks ? n : maxChecks);
-	const unsigned int denom = (checks > 1u ? (checks - 1u) : 1u);
-	for (unsigned int k = 0; k < checks; ++k)
-	{
-		const unsigned int idx = (n == 1u) ? 0u
-		                                   : static_cast<unsigned int>((static_cast<unsigned long long>(k) * static_cast<unsigned long long>(n - 1u)) / denom);
-		if (!is_finite(data[idx]))
-			return false;
-	}
-	return true;
+	return glades::transformer_kernels::all_finite_full(data, static_cast<size_t>(size));
 }
 
 inline float clipf(float v, float limit)

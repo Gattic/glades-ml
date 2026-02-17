@@ -18,5 +18,6 @@ mapped-dataset-test.cpp
  "../../../Backend/Machine Learning/DataObjects/MappedNumberInput.cpp"
 ddp-test.cpp
  "../../../Backend/Machine Learning/DataObjects/DDPDataInputWrapper.cpp"
+transformer-improvements-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})

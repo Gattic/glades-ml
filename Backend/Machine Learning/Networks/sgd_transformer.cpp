@@ -834,6 +834,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			std::fill(tt.gBIn.begin(), tt.gBIn.end(), 0.0f);
 			std::fill(tt.gWOut.begin(), tt.gWOut.end(), 0.0f);
 			std::fill(tt.gBOut.begin(), tt.gBOut.end(), 0.0f);
+			std::fill(tt.gLnFinalGamma.begin(), tt.gLnFinalGamma.end(), 0.0f);
+			std::fill(tt.gLnFinalBeta.begin(), tt.gLnFinalBeta.end(), 0.0f);
 			for (size_t l = 0; l < tt.blocks.size(); ++l)
 			{
 				TensorTransformerState::Block& b = tt.blocks[l];
@@ -948,6 +950,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						for (size_t j = 0; j < b.gLn2Gamma.size(); ++j) { const double gd = static_cast<double>(b.gLn2Gamma[j] * invBatch); sumsq += gd * gd; }
 						for (size_t j = 0; j < b.gLn2Beta.size(); ++j) { const double gd = static_cast<double>(b.gLn2Beta[j] * invBatch); sumsq += gd * gd; }
 					}
+					// Final LayerNorm gradients
+					for (size_t j = 0; j < tt.gLnFinalGamma.size(); ++j) { const double gd = static_cast<double>(tt.gLnFinalGamma[j] * invBatch); sumsq += gd * gd; }
+					for (size_t j = 0; j < tt.gLnFinalBeta.size(); ++j) { const double gd = static_cast<double>(tt.gLnFinalBeta[j] * invBatch); sumsq += gd * gd; }
 					// Output projection gradients exist only for non-tokenLM paths.
 					if (!tokenLMTiedHead)
 					{
@@ -1054,6 +1059,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						for (size_t j = 0; j < b.ln2Gamma.size(); ++j) sumsq += static_cast<double>(b.gLn2Gamma[j] * invBatch) * static_cast<double>(b.gLn2Gamma[j] * invBatch);
 						for (size_t j = 0; j < b.ln2Beta.size(); ++j) sumsq += static_cast<double>(b.gLn2Beta[j] * invBatch) * static_cast<double>(b.gLn2Beta[j] * invBatch);
 					}
+
+					// Final LayerNorm gradients
+					for (size_t j = 0; j < tt.gLnFinalGamma.size(); ++j) sumsq += static_cast<double>(tt.gLnFinalGamma[j] * invBatch) * static_cast<double>(tt.gLnFinalGamma[j] * invBatch);
+					for (size_t j = 0; j < tt.gLnFinalBeta.size(); ++j) sumsq += static_cast<double>(tt.gLnFinalBeta[j] * invBatch) * static_cast<double>(tt.gLnFinalBeta[j] * invBatch);
 
 					// Output projection (index nLayers)
 					if (!tokenLMTiedHead)
@@ -1217,6 +1226,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					for (size_t i = 0; i < b.ln1Beta.size(); ++i) { b.ln1Beta[i] -= lr * (b.gLn1Beta[i] * invBatch) * gradScale; b.gLn1Beta[i] = 0.0f; }
 					for (size_t i = 0; i < b.ln2Gamma.size(); ++i) { b.ln2Gamma[i] -= lr * (b.gLn2Gamma[i] * invBatch) * gradScale; b.gLn2Gamma[i] = 0.0f; }
 					for (size_t i = 0; i < b.ln2Beta.size(); ++i) { b.ln2Beta[i] -= lr * (b.gLn2Beta[i] * invBatch) * gradScale; b.gLn2Beta[i] = 0.0f; }
+				}
+
+				// Final LayerNorm (SGD, use block 0 LR; no weight decay)
+				{
+					const float lr = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
+					for (size_t i = 0; i < tt.lnFinalGamma.size(); ++i) { tt.lnFinalGamma[i] -= lr * (tt.gLnFinalGamma[i] * invBatch) * gradScale; tt.gLnFinalGamma[i] = 0.0f; }
+					for (size_t i = 0; i < tt.lnFinalBeta.size(); ++i) { tt.lnFinalBeta[i] -= lr * (tt.gLnFinalBeta[i] * invBatch) * gradScale; tt.gLnFinalBeta[i] = 0.0f; }
 				}
 
 				// Output projection (index nLayers) is unused in token LM tied-head mode.
@@ -1403,6 +1419,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 				}
 
+				// Final LayerNorm (use block 0 LR; no weight decay)
+				{
+					const float lr = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
+					Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+				}
+
 				// Output projection (index nLayers) is unused in token LM tied-head mode.
 				if (!tokenLMTiedHead)
 				{
@@ -1446,6 +1469,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			if (!tt.gBIn.empty())    glades::ddp::allReduceSumInPlace(&tt.gBIn[0], tt.gBIn.size());
 			if (!tt.gWOut.empty())   glades::ddp::allReduceSumInPlace(&tt.gWOut[0], tt.gWOut.size());
 			if (!tt.gBOut.empty())   glades::ddp::allReduceSumInPlace(&tt.gBOut[0], tt.gBOut.size());
+			if (!tt.gLnFinalGamma.empty()) glades::ddp::allReduceSumInPlace(&tt.gLnFinalGamma[0], tt.gLnFinalGamma.size());
+			if (!tt.gLnFinalBeta.empty())  glades::ddp::allReduceSumInPlace(&tt.gLnFinalBeta[0], tt.gLnFinalBeta.size());
 			// Per-block tensors
 			for (unsigned int l = 0; l < nLayers; ++l)
 			{
@@ -2729,7 +2754,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			}
 		}
 
-		transformerScratch.ensure(T, inputSize, scratchOutSize, dModel, dFF, dModelKV, nHeads, nLayers, ff1Width);
+		transformerScratch.ensure(T, inputSize, scratchOutSize, dModel, dFF, dModelKV, nHeads, nLayers, ff1Width,
+		                         trainingConfig.transformer.embeddingDropoutRate,
+		                         trainingConfig.transformer.residualDropoutRate,
+		                         trainingConfig.gradientCheckpointing);
 
 		// Load x[t] for this sequence into scratch.x (non-tokenLM).
 		// In tokenLM mode, inputs are token ids (ints) and scratch.x is unused.
@@ -2876,6 +2904,22 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			transformerPosEncCache.ensureSinusoidal(dModel);
 			add_positional_encoding(transformerScratch.h.empty() ? NULL : &transformerScratch.h[0], T, dModel,
 			                        transformerPosEncCache.sinInvDenomPair);
+		}
+
+		// Embedding dropout (after positional encoding, before transformer blocks).
+		{
+			const float embDropRate = trainingConfig.transformer.embeddingDropoutRate;
+			if (embDropRate > 0.0f && !transformerScratch.h.empty())
+			{
+				const size_t hLen = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				unsigned char* mask = transformerScratch.dropoutMaskEmb.empty() ? NULL : &transformerScratch.dropoutMaskEmb[0];
+				if (mask)
+				{
+					glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, hLen, embDropRate);
+					const float scale = 1.0f / (1.0f - embDropRate);
+					glades::transformer_kernels::apply_dropout_mask_inplace(&transformerScratch.h[0], mask, scale, hLen);
+				}
+			}
 		}
 
 		// RoPE precompute (used when positionalEncoding==POSENC_ROPE).
@@ -3054,6 +3098,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			float* attnOut = transformerScratch.attnOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 			linear_forward_maybe_lowp(attnConcat, T, dModel, b.Wo, b.WoLowp, useLowpWeights, lowpDType, b.bo, dModel, attnOut);
 
+			// Residual attention dropout
+			{
+				const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+				if (resDropRate > 0.0f)
+				{
+					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+					const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+					unsigned char* mask = transformerScratch.dropoutMaskResAttn.empty() ? NULL : &transformerScratch.dropoutMaskResAttn[layerOff];
+					if (mask)
+					{
+						glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, n, resDropRate);
+						const float scale = 1.0f / (1.0f - resDropRate);
+						glades::transformer_kernels::apply_dropout_mask_inplace(attnOut, mask, scale, n);
+					}
+				}
+			}
+
 			// Residual add
 			float* hAfterAttn = transformerScratch.hAfterAttn.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 			for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
@@ -3116,17 +3177,38 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			}
 			else
 			{
-				for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dFF); ++i)
+				const size_t actLen = static_cast<size_t>(T) * static_cast<size_t>(dFF);
+				if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
 				{
-					const float x = ff1[i];
-					ff1Act[i] = (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
-					                ? glades::transformer_ops::gelu(x)
-					                : glades::transformer_ops::relu(x);
+					glades::transformer_kernels::gelu_forward_buf(ff1, ff1Act, actLen);
+				}
+				else
+				{
+					// ReLU (no vectorized kernel needed — simple branch)
+					for (size_t i = 0; i < actLen; ++i)
+						ff1Act[i] = glades::transformer_ops::relu(ff1[i]);
 				}
 			}
 
 			float* ffOut = transformerScratch.ffOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 			linear_forward_maybe_lowp(ff1Act, T, dFF, b.W2, b.W2Lowp, useLowpWeights, lowpDType, b.b2, dModel, ffOut);
+
+			// Residual FFN dropout
+			{
+				const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+				if (resDropRate > 0.0f)
+				{
+					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+					const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+					unsigned char* mask = transformerScratch.dropoutMaskResFF.empty() ? NULL : &transformerScratch.dropoutMaskResFF[layerOff];
+					if (mask)
+					{
+						glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, n, resDropRate);
+						const float scale = 1.0f / (1.0f - resDropRate);
+						glades::transformer_kernels::apply_dropout_mask_inplace(ffOut, mask, scale, n);
+					}
+				}
+			}
 
 			// Residual add
 			float* hAfterFF = transformerScratch.hAfterFF.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
@@ -3136,6 +3218,21 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 		const float* hFinal = transformerScratch.hAfterFF.data() + (static_cast<size_t>(nLayers - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 
+		// Final LayerNorm: hFinal → hPostFinalLN
+		float* hPostFinalLN = transformerScratch.hPostFinalLN.data();
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+		{
+			glades::transformer_kernels::rmsnorm_forward_rows(hFinal, T, dModel,
+			    tt.lnFinalGamma, tt.lnFinalBeta, lnEps,
+			    hPostFinalLN, transformerScratch.lnFinalInvStd.data());
+		}
+		else
+		{
+			glades::transformer_kernels::layernorm_forward_rows(hFinal, T, dModel,
+			    tt.lnFinalGamma, tt.lnFinalBeta, lnEps,
+			    hPostFinalLN, transformerScratch.lnFinalMean.data(), transformerScratch.lnFinalInvStd.data());
+		}
+
 		// Output head logits
 		if (tokenLM)
 		{
@@ -3144,7 +3241,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				// Region H: Token LM tied embedding head — parallel over timesteps.
 				if (useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty())
 				{
-					glades::transformer_kernels::tied_embedding_logits_forward_rows_lowp(hFinal, T, dModel, &tt.tokELowp[0], lowpDType, tt.lmBias,
+					glades::transformer_kernels::tied_embedding_logits_forward_rows_lowp(hPostFinalLN, T, dModel, &tt.tokELowp[0], lowpDType, tt.lmBias,
 					                                                                    vocabSize, transformerScratch.logits.data());
 				}
 				else
@@ -3154,7 +3251,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					if (embWorthParallel && T > 1u && pool.numThreads() > 1u)
 					{
 						TiedEmbLogitsCtx ectx;
-						ectx.H = hFinal;
+						ectx.H = hPostFinalLN;
 						ectx.dModel = dModel;
 						ectx.tokE = tt.tokE.empty() ? NULL : &tt.tokE[0];
 						ectx.lmBias = tt.lmBias.empty() ? NULL : &tt.lmBias[0];
@@ -3165,7 +3262,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					}
 					else
 					{
-						glades::transformer_kernels::tied_embedding_logits_forward_rows(hFinal, T, dModel, tt.tokE, tt.lmBias, vocabSize,
+						glades::transformer_kernels::tied_embedding_logits_forward_rows(hPostFinalLN, T, dModel, tt.tokE, tt.lmBias, vocabSize,
 						                                                               transformerScratch.logits.data());
 					}
 				}
@@ -3208,7 +3305,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						for (unsigned int i = 0; i < dModel; ++i)
 						{
 							const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
-							acc += static_cast<double>(hFinal[hOff + i]) * static_cast<double>(ev);
+							acc += static_cast<double>(hPostFinalLN[hOff + i]) * static_cast<double>(ev);
 						}
 						transformerScratch.logits[off + j] = static_cast<float>(acc);
 					}
@@ -3220,7 +3317,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		}
 		else
 		{
-			linear_forward_maybe_lowp(hFinal, T, dModel, tt.WOut, tt.WOutLowp, useLowpWeights, lowpDType, tt.bOut, outSize,
+			linear_forward_maybe_lowp(hPostFinalLN, T, dModel, tt.WOut, tt.WOutLowp, useLowpWeights, lowpDType, tt.bOut, outSize,
 			                          transformerScratch.logits.data());
 		}
 
@@ -3434,7 +3531,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							const size_t eOff = static_cast<size_t>(v) * static_cast<size_t>(dModel);
 							for (unsigned int i = 0; i < dModel; ++i)
 							{
-								tt.gTokE[eOff + i] += dz * hFinal[hOff + i];
+								tt.gTokE[eOff + i] += dz * hPostFinalLN[hOff + i];
 								const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
 								dH[hOff + i] += dz * ev;
 							}
@@ -3473,7 +3570,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
 							for (unsigned int i = 0; i < dModel; ++i)
 							{
-								tt.gTokE[eOff + i] += dz * hFinal[hOff + i];
+								tt.gTokE[eOff + i] += dz * hPostFinalLN[hOff + i];
 								const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
 								dH[hOff + i] += dz * ev;
 							}
@@ -3518,11 +3615,31 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				}
 
 				// Backprop output projection: gWOut/gBOut, dHFinal
-				linear_backward_accum_maybe_lowp(hFinal, dLogits.data(), T, dModel, outSize, tt.gWOut, tt.gBOut, tt.WOut, tt.WOutLowp, useLowpWeights,
+				linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, outSize, tt.gWOut, tt.gBOut, tt.WOut, tt.WOutLowp, useLowpWeights,
 				                                 lowpDType, dH.data());
 
 				// Non-tokenLM: average by timesteps (historical behavior).
 				timeStepsInBatch += T;
+			}
+
+			// Backprop Final LayerNorm: dH (w.r.t. hPostFinalLN) -> dH (w.r.t. hFinal)
+			{
+				std::vector<float, glades::AlignedAllocator<float, 64> >& dHPreFinalLN = transformerScratch.dH2;
+				if (dHPreFinalLN.size() != dH.size())
+					dHPreFinalLN.resize(dH.size());
+				std::fill(dHPreFinalLN.begin(), dHPreFinalLN.end(), 0.0f);
+				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+				{
+					glades::transformer_kernels::rmsnorm_backward_rows_accum(hFinal, dH.data(), T, dModel, tt.lnFinalGamma,
+					    transformerScratch.lnFinalInvStd.data(), dHPreFinalLN.data(), tt.gLnFinalGamma, tt.gLnFinalBeta);
+				}
+				else
+				{
+					glades::transformer_kernels::layernorm_backward_rows_accum(hFinal, dH.data(), T, dModel, tt.lnFinalGamma,
+					    transformerScratch.lnFinalMean.data(), transformerScratch.lnFinalInvStd.data(),
+					    dHPreFinalLN.data(), tt.gLnFinalGamma, tt.gLnFinalBeta);
+				}
+				std::copy(dHPreFinalLN.begin(), dHPreFinalLN.end(), dH.begin());
 			}
 
 			// Backprop through blocks (reverse)
@@ -3546,6 +3663,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (dHAfterAttn.size() != dH.size())
 					dHAfterAttn.resize(dH.size());
 				std::copy(dH.begin(), dH.end(), dHAfterAttn.begin());
+
+				// FFN residual dropout backward: mask dH for the FFN path only.
+				{
+					const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+					if (resDropRate > 0.0f)
+					{
+						const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+						const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+						const unsigned char* mask = transformerScratch.dropoutMaskResFF.empty() ? NULL : &transformerScratch.dropoutMaskResFF[layerOff];
+						if (mask)
+						{
+							const float scale = 1.0f / (1.0f - resDropRate);
+							for (size_t i = 0; i < n; ++i)
+								dH[i] *= mask[i] ? scale : 0.0f;
+						}
+					}
+				}
 
 				// FFN backward
 				// ffOut = W2 * ff1Act + b2
@@ -3590,14 +3724,15 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				else
 				{
 					// FFN activation backprop (ReLU or GELU)
-					for (size_t i = 0; i < dFF1Act.size(); ++i)
+					const size_t actLen = dFF1Act.size();
+					if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
 					{
-						const float pre = ff1[i];
-						const float deriv =
-						    (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
-						        ? glades::transformer_ops::gelu_deriv(pre)
-						        : glades::transformer_ops::relu_deriv_from_y(ff1Act[i]);
-						dFF1Act[i] = dFF1Act[i] * deriv;
+						glades::transformer_kernels::gelu_backward_buf(ff1, dFF1Act.data(), actLen);
+					}
+					else
+					{
+						for (size_t i = 0; i < actLen; ++i)
+							dFF1Act[i] *= glades::transformer_ops::relu_deriv_from_y(ff1Act[i]);
 					}
 					linear_backward_accum_maybe_lowp(x2, dFF1Act.data(), T, dModel, dFF, b.gW1, b.gB1, b.W1, b.W1Lowp, useLowpWeights, lowpDType,
 					                                 dX2.data());
@@ -3628,6 +3763,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				// Split residual at attention: hAfterAttn = hIn + attnOut
 				// Use dHAfterAttn as dAttnOut and copy into dH for the residual-to-hIn path.
 				std::copy(dHAfterAttn.begin(), dHAfterAttn.end(), dH.begin());
+
+				// Attention residual dropout backward: mask dHAfterAttn for the Wo path only.
+				{
+					const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+					if (resDropRate > 0.0f)
+					{
+						const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+						const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+						const unsigned char* mask = transformerScratch.dropoutMaskResAttn.empty() ? NULL : &transformerScratch.dropoutMaskResAttn[layerOff];
+						if (mask)
+						{
+							const float scale = 1.0f / (1.0f - resDropRate);
+							for (size_t i = 0; i < n; ++i)
+								dHAfterAttn[i] *= mask[i] ? scale : 0.0f;
+						}
+					}
+				}
 
 			// Need attnConcat to backprop Wo. Use the cached per-layer concatenation from forward
 			// (O(nLayers*T*dModel) memory) instead of storing full attention probability matrices.
@@ -3815,6 +3967,22 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				for (size_t i = 0; i < dH.size(); ++i)
 					dH[i] += dHInFromLN[i];
 			} // layers
+
+			// Embedding dropout backward
+			{
+				const float embDropRate = trainingConfig.transformer.embeddingDropoutRate;
+				if (embDropRate > 0.0f)
+				{
+					const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+					const unsigned char* mask = transformerScratch.dropoutMaskEmb.empty() ? NULL : &transformerScratch.dropoutMaskEmb[0];
+					if (mask)
+					{
+						const float scale = 1.0f / (1.0f - embDropRate);
+						for (size_t i = 0; i < n; ++i)
+							dH[i] *= mask[i] ? scale : 0.0f;
+					}
+				}
+			}
 
 			// Backprop input projection: h = WIn*x + bIn (+ posEnc)
 			// dH is gradient w.r.t h (posEnc has no params)

@@ -142,6 +142,12 @@ struct TransformerRunConfig
 	// NOTE: Ignored when ffnKind==FFN_SWIGLU (SwiGLU uses SiLU).
 	FFNActivationType ffnActivation;
 
+	// Dropout rates (training only; disabled by default).
+	// Embedding dropout: applied after positional encoding, before the first block.
+	float embeddingDropoutRate;
+	// Residual dropout: applied to attention output and FFN output before residual adds.
+	float residualDropoutRate;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -160,7 +166,9 @@ struct TransformerRunConfig
 	      ropeDimOverride(0),
 	      ropeTheta(10000.0f),
 	      ffnKind(FFN_MLP),
-	      ffnActivation(FFN_RELU)
+	      ffnActivation(FFN_RELU),
+	      embeddingDropoutRate(0.0f),
+	      residualDropoutRate(0.0f)
 	{
 	}
 };
@@ -433,6 +441,10 @@ struct TrainingConfig
 
 	DDPConfig ddp;
 
+	// Gradient checkpointing: trade compute for memory by recomputing activations
+	// during backward instead of storing all per-layer intermediates.
+	bool gradientCheckpointing;
+
 	TrainingConfig()
 	    : minibatchSizeOverride(0),
 	      tbpttWindowOverride(0),
@@ -444,7 +456,8 @@ struct TrainingConfig
 	      mixedPrecision(),
 	      gpu(),
 	      warmup(),
-	      ddp()
+	      ddp(),
+	      gradientCheckpointing(false)
 	{
 	}
 };

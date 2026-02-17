@@ -1385,6 +1385,20 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 	if (outLogits)
 	{
 		ScopedTimerMs t(this, breakdown, &session.perf.msLogits);
+
+		// Apply final LayerNorm before logits (in-place on h, single position).
+		if (!tt.lnFinalGamma.empty())
+		{
+			float invStd = 0.0f;
+			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+				glades::transformer_kernels::rmsnorm_forward_rows(&h[0], 1u, dModel, tt.lnFinalGamma, tt.lnFinalBeta, eps, &h[0], &invStd);
+			else
+			{
+				float mean = 0.0f;
+				glades::transformer_kernels::layernorm_forward_rows(&h[0], 1u, dModel, tt.lnFinalGamma, tt.lnFinalBeta, eps, &h[0], &mean, &invStd);
+			}
+		}
+
 		// Avoid per-token reallocations if caller reuses the same vector across steps.
 		if (outLogits->capacity() < static_cast<size_t>(vocab))
 			outLogits->reserve(static_cast<size_t>(vocab));
@@ -1920,6 +1934,20 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 		if (outRow)
 		{
 			ScopedTimerMs t(this, breakdown, &session.perf.msLogits);
+
+			// Apply final LayerNorm before logits (in-place on h, single position).
+			if (!tt.lnFinalGamma.empty())
+			{
+				float invStd = 0.0f;
+				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					glades::transformer_kernels::rmsnorm_forward_rows(&h[0], 1u, session.dModel, tt.lnFinalGamma, tt.lnFinalBeta, eps, &h[0], &invStd);
+				else
+				{
+					float mean = 0.0f;
+					glades::transformer_kernels::layernorm_forward_rows(&h[0], 1u, session.dModel, tt.lnFinalGamma, tt.lnFinalBeta, eps, &h[0], &mean, &invStd);
+				}
+			}
+
 			tied_embedding_logits_into(&h[0], session.dModel, tt.tokE, tt.lmBias, vocab, outRow);
 		}
 
@@ -2166,11 +2194,31 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogits(const st
 		}
 	}
 
+	// Apply final LayerNorm to last position before logits.
+	std::vector<float> hLastLN(dModel, 0.0f);
+	{
+		const float* hLastRaw = &h[(T - 1u) * static_cast<size_t>(dModel)];
+		if (!tt.lnFinalGamma.empty())
+		{
+			float invStd = 0.0f;
+			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+				glades::transformer_kernels::rmsnorm_forward_rows(hLastRaw, 1u, dModel, tt.lnFinalGamma, tt.lnFinalBeta, eps, &hLastLN[0], &invStd);
+			else
+			{
+				float mean = 0.0f;
+				glades::transformer_kernels::layernorm_forward_rows(hLastRaw, 1u, dModel, tt.lnFinalGamma, tt.lnFinalBeta, eps, &hLastLN[0], &mean, &invStd);
+			}
+		}
+		else
+		{
+			std::copy(hLastRaw, hLastRaw + dModel, hLastLN.begin());
+		}
+	}
+
 	// Logits for last position: h_last * E^T + bias
 	outLogits.assign(vocab, 0.0f);
-	const float* hLast = &h[(T - 1u) * static_cast<size_t>(dModel)];
 	if (!outLogits.empty())
-		tied_embedding_logits_into(hLast, dModel, tt.tokE, tt.lmBias, vocab, &outLogits[0]);
+		tied_embedding_logits_into(&hLastLN[0], dModel, tt.tokE, tt.lmBias, vocab, &outLogits[0]);
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }

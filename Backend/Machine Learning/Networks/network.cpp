@@ -1483,12 +1483,25 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			b.gB1.assign(ff1Width, 0.0f); b.gB2.assign(dModel, 0.0f);
 		}
 
+		// Final LayerNorm: gamma=1, beta=0, Adam/grad state=0
+		tensorTransformer.lnFinalGamma.assign(dModel, 1.0f);
+		tensorTransformer.lnFinalBeta.assign(dModel, 0.0f);
+		tensorTransformer.mLnFinalGamma.assign(dModel, 0.0f);
+		tensorTransformer.v2LnFinalGamma.assign(dModel, 0.0f);
+		tensorTransformer.mLnFinalBeta.assign(dModel, 0.0f);
+		tensorTransformer.v2LnFinalBeta.assign(dModel, 0.0f);
+		tensorTransformer.gLnFinalGamma.assign(dModel, 0.0f);
+		tensorTransformer.gLnFinalBeta.assign(dModel, 0.0f);
+		tensorTransformer.adamBeta1Power = 1.0;
+		tensorTransformer.adamBeta2Power = 1.0;
+
 		InitGlorot::run(rngEngine, tensorTransformer.WIn, inputSize, dModel);
 		InitGlorot::run(rngEngine, tensorTransformer.WOut, dModel, outSize);
 		if (tokenModel)
 		{
-			// Initialize embeddings with Glorot fanIn=1, fanOut=dModel (simple default).
-			InitGlorot::run(rngEngine, tensorTransformer.tokE, 1u, dModel);
+			// Initialize embeddings with N(0, 0.02) (standard LLM practice).
+			for (size_t i = 0; i < tensorTransformer.tokE.size(); ++i)
+				tensorTransformer.tokE[i] = glades::rng::normal(rngEngine, 0.0f, 0.02f);
 		}
 		for (int li = 0; li < H; ++li)
 		{
@@ -1513,6 +1526,10 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			glades::ddp::broadcastFromRoot(&tensorTransformer.bIn[0], tensorTransformer.bIn.size());
 			glades::ddp::broadcastFromRoot(&tensorTransformer.WOut[0], tensorTransformer.WOut.size());
 			glades::ddp::broadcastFromRoot(&tensorTransformer.bOut[0], tensorTransformer.bOut.size());
+			if (!tensorTransformer.lnFinalGamma.empty())
+				glades::ddp::broadcastFromRoot(&tensorTransformer.lnFinalGamma[0], tensorTransformer.lnFinalGamma.size());
+			if (!tensorTransformer.lnFinalBeta.empty())
+				glades::ddp::broadcastFromRoot(&tensorTransformer.lnFinalBeta[0], tensorTransformer.lnFinalBeta.size());
 
 			// Per-block tensors
 			for (int li = 0; li < H; ++li)
@@ -1848,6 +1865,9 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 		// Token LM tensors (present only when tokenModel==true, but written in a fixed slot for v3+)
 		if (!write_vec_f32(out, tt.tokE)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer tokE)");
 		if (!write_vec_f32(out, tt.lmBias)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lmBias)");
+		// Final LayerNorm
+		if (!write_vec_f32(out, tt.lnFinalGamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lnFinalGamma)");
+		if (!write_vec_f32(out, tt.lnFinalBeta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lnFinalBeta)");
 
 		for (size_t l = 0; l < tt.blocks.size(); ++l)
 		{
@@ -2228,6 +2248,11 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 			if (!read_vec_f32_exact(in, tensorTransformer.lmBias, want))
 				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lmBias (size mismatch/corrupt)");
 		}
+		// Final LayerNorm
+		if (!read_vec_f32_exact(in, tensorTransformer.lnFinalGamma, static_cast<size_t>(dModel)))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lnFinalGamma (size mismatch/corrupt)");
+		if (!read_vec_f32_exact(in, tensorTransformer.lnFinalBeta, static_cast<size_t>(dModel)))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lnFinalBeta (size mismatch/corrupt)");
 
 		tensorTransformer.vWIn.assign(tensorTransformer.WIn.size(), 0.0f);
 		tensorTransformer.v2WIn.assign(tensorTransformer.WIn.size(), 0.0f);
@@ -2247,6 +2272,12 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		tensorTransformer.mLmBias.assign(tensorTransformer.lmBias.size(), 0.0f);
 		tensorTransformer.v2LmBias.assign(tensorTransformer.lmBias.size(), 0.0f);
 		tensorTransformer.gLmBias.assign(tensorTransformer.lmBias.size(), 0.0f);
+		tensorTransformer.mLnFinalGamma.assign(tensorTransformer.lnFinalGamma.size(), 0.0f);
+		tensorTransformer.v2LnFinalGamma.assign(tensorTransformer.lnFinalGamma.size(), 0.0f);
+		tensorTransformer.gLnFinalGamma.assign(tensorTransformer.lnFinalGamma.size(), 0.0f);
+		tensorTransformer.mLnFinalBeta.assign(tensorTransformer.lnFinalBeta.size(), 0.0f);
+		tensorTransformer.v2LnFinalBeta.assign(tensorTransformer.lnFinalBeta.size(), 0.0f);
+		tensorTransformer.gLnFinalBeta.assign(tensorTransformer.lnFinalBeta.size(), 0.0f);
 
 		tensorTransformer.blocks.resize(nLayers);
 		for (size_t l = 0; l < nLayers; ++l)

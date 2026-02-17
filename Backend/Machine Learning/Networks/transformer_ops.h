@@ -864,6 +864,14 @@ inline void scaled_dot_product_attention_forward_flash_strided(const float* Qbas
 		{
 			if (keyAllowed && keyAllowed[u] == 0u)
 				continue;
+#if defined(__SSE2__)
+			// Software prefetch: bring next key block into L1 cache
+			if ((u & 31u) == 0u && (u + 32u) <= maxU)
+			{
+				const float* kpf = Kbase + static_cast<size_t>(u + 32u) * static_cast<size_t>(kStride);
+				_mm_prefetch(reinterpret_cast<const char*>(kpf), _MM_HINT_T0);
+			}
+#endif
 			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
 
 			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
@@ -981,6 +989,13 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 				sCache[u] = -1e30f;
 				continue;
 			}
+#if defined(__SSE2__)
+			if ((u & 31u) == 0u && (u + 32u) <= maxU)
+			{
+				const float* kpf = Kbase + static_cast<size_t>(u + 32u) * static_cast<size_t>(kStride);
+				_mm_prefetch(reinterpret_cast<const char*>(kpf), _MM_HINT_T0);
+			}
+#endif
 			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
 			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
 			sCache[u] = s;

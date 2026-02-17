@@ -495,6 +495,8 @@ static bool transformer_weights_l2_from_file(const std::string& weightsPath, dou
 	if (!read_and_accum_vec_l2(in, ss)) return false; // bOut
 	if (!read_and_accum_vec_l2(in, ss)) return false; // tokE
 	if (!read_and_accum_vec_l2(in, ss)) return false; // lmBias
+	if (!read_and_accum_vec_l2(in, ss)) return false; // lnFinalGamma
+	if (!read_and_accum_vec_l2(in, ss)) return false; // lnFinalBeta
 	for (unsigned int l = 0; l < nLayers; ++l)
 	{
 		// block vectors (fixed order, 18 vectors)
@@ -614,6 +616,14 @@ static bool write_transformer_decoder_tokenlm_weights(const std::string& weights
 		if (!write_vec_f32(fp, bLm)) return false;
 	}
 
+	// Final LayerNorm (gamma=1, beta=0 => identity)
+	{
+		std::vector<float> lnFinalGamma(dModel, 1.0f);
+		std::vector<float> lnFinalBeta(dModel, 0.0f);
+		if (!write_vec_f32(fp, lnFinalGamma)) return false;
+		if (!write_vec_f32(fp, lnFinalBeta)) return false;
+	}
+
 	for (unsigned int l = 0; l < nLayers; ++l)
 	{
 		// ln1Gamma/beta
@@ -725,7 +735,7 @@ static bool read_first_dff_weight(const std::string& weightsPath, float& outW)
 	unsigned int version = 0u, netType = 0u, r0 = 0u, r1 = 0u;
 	if (!read_u32_le(in, version) || !read_u32_le(in, netType) || !read_u32_le(in, r0) || !read_u32_le(in, r1))
 		return false;
-	if (!(version == 1u && netType == 0u))
+	if (version != 1u || netType != 0u)
 		return false;
 
 	unsigned int transitions = 0u;
@@ -803,7 +813,7 @@ static bool read_rnn_out_bias_1x1x1(const std::string& weightsPath, float& outBy
 	unsigned int version = 0u, netType = 0u, r0 = 0u, r1 = 0u;
 	if (!read_u32_le(in, version) || !read_u32_le(in, netType) || !read_u32_le(in, r0) || !read_u32_le(in, r1))
 		return false;
-	if (!(version == 1u && netType == 1u))
+	if (version != 1u || netType != 1u)
 		return false;
 
 	// rnn header: hiddenLayers, inputSize, outSize
@@ -905,7 +915,7 @@ static bool read_gated_out_bias_1layer_1x1x1(const std::string& weightsPath,
 	unsigned int version = 0u, netType = 0u, r0 = 0u, r1 = 0u;
 	if (!read_u32_le(in, version) || !read_u32_le(in, netType) || !read_u32_le(in, r0) || !read_u32_le(in, r1))
 		return false;
-	if (!(version == 1u && netType == wantNetType))
+	if (version != 1u || netType != wantNetType)
 		return false;
 
 	// gated header: gateCount, hiddenLayers, inputSize, outSize
@@ -3297,10 +3307,13 @@ void NNTransformerUnitTest()
 		toks.push_back(2u);
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity ForwardLastLogits Failed==============", net.transformerLmForwardLastLogits(toks, logits).ok());
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity LogitsSize Failed==============", logits.size() == vocab);
-		// Expect logits == onehot(token=2): [0,0,1]
-		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit0 Failed==============", fabs(logits[0] - 0.0f) < 1e-6f);
-		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit1 Failed==============", fabs(logits[1] - 0.0f) < 1e-6f);
-		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit2 Failed==============", fabs(logits[2] - 1.0f) < 1e-6f);
+		// After final LayerNorm (gamma=1,beta=0) on [0,0,1]: h_norm = [-1/sqrt(2), -1/sqrt(2), sqrt(2)]
+		// Tied identity embedding gives logits = h_norm.
+		const float invSqrt2 = static_cast<float>(1.0 / sqrt(2.0));
+		const float sqrt2    = static_cast<float>(sqrt(2.0));
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit0 Failed==============", fabs(logits[0] - (-invSqrt2)) < 1e-4f);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit1 Failed==============", fabs(logits[1] - (-invSqrt2)) < 1e-4f);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity Logit2 Failed==============", fabs(logits[2] - sqrt2) < 1e-4f);
 
 		// Same via session-based incremental decode.
 		glades::NNetwork::TransformerLmSession session;
@@ -3411,11 +3424,29 @@ void NNTransformerUnitTest()
 			         net.transformerLmSessionAppend(session, tok, &logitsKv).ok());
 			G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal LogitsSize Failed==============", logitsFull.size() == vocab && logitsKv.size() == vocab);
 
+			// Compute expected hidden state, then apply LayerNorm (gamma=1, beta=0)
+			// to get the expected logits (tied identity embedding).
+			double h[3];
+			double hMean = 0.0;
 			for (unsigned int v = 0; v < vocab; ++v)
 			{
-				const float exp = ((v == tok) ? 1.0f : 0.0f) + sinusoidal_pe(/*pos*/ t, /*i*/ v, /*dModel*/ dModel);
-				G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal FullExpectedMismatch Failed==============", fabs(logitsFull[v] - exp) < 1e-5f);
-				G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal KvExpectedMismatch Failed==============", fabs(logitsKv[v] - exp) < 1e-5f);
+				h[v] = ((v == tok) ? 1.0 : 0.0) + static_cast<double>(sinusoidal_pe(/*pos*/ t, /*i*/ v, /*dModel*/ dModel));
+				hMean += h[v];
+			}
+			hMean /= static_cast<double>(vocab);
+			double hVar = 0.0;
+			for (unsigned int v = 0; v < vocab; ++v)
+			{
+				const double d = h[v] - hMean;
+				hVar += d * d;
+			}
+			hVar /= static_cast<double>(vocab);
+			const double hInvStd = 1.0 / sqrt(hVar + 1e-5);
+			for (unsigned int v = 0; v < vocab; ++v)
+			{
+				const float exp = static_cast<float>((h[v] - hMean) * hInvStd);
+				G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal FullExpectedMismatch Failed==============", fabs(logitsFull[v] - exp) < 1e-4f);
+				G_assert(__FILE__, __LINE__, "==============NN::ToySinusoidal KvExpectedMismatch Failed==============", fabs(logitsKv[v] - exp) < 1e-4f);
 			}
 		}
 

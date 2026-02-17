@@ -551,6 +551,19 @@ private:
 
 		std::vector<Block> blocks;
 
+		// Final LayerNorm (applied after the last block, before the output head).
+		std::vector<float> lnFinalGamma; // [dModel]
+		std::vector<float> lnFinalBeta;  // [dModel]
+		std::vector<float> mLnFinalGamma; // Adam 1st moment
+		std::vector<float> v2LnFinalGamma; // Adam 2nd moment
+		std::vector<float> mLnFinalBeta;
+		std::vector<float> v2LnFinalBeta;
+		std::vector<float> gLnFinalGamma; // gradients
+		std::vector<float> gLnFinalBeta;
+		// Running accumulators for Adam bias correction (avoids pow(beta,t) each step).
+		double adamBeta1Power;
+		double adamBeta2Power;
+
 		// === Mixed precision runtime state (Transformer training) ===
 		//
 		// Master weights remain the FP32 vectors above.
@@ -581,6 +594,8 @@ private:
 		      padTokenId(-1),
 		      tieEmbeddings(true),
 		      optimizerStep(0ULL),
+		      adamBeta1Power(1.0),
+		      adamBeta2Power(1.0),
 		      mpLowpReady(false),
 		      mpLowpDType(0),
 		      mpLossScale(1.0f),
@@ -605,10 +620,16 @@ private:
 			padTokenId = -1;
 			tieEmbeddings = true;
 			optimizerStep = 0ULL;
+			adamBeta1Power = 1.0;
+			adamBeta2Power = 1.0;
 			mpLowpReady = false;
 			mpLowpDType = 0;
 			mpLossScale = 1.0f;
 			mpLossScaleGoodSteps = 0;
+			lnFinalGamma.clear(); lnFinalBeta.clear();
+			mLnFinalGamma.clear(); v2LnFinalGamma.clear();
+			mLnFinalBeta.clear(); v2LnFinalBeta.clear();
+			gLnFinalGamma.clear(); gLnFinalBeta.clear();
 			tokE.clear(); tokELowp.clear(); vTokE.clear(); v2TokE.clear(); gTokE.clear();
 			lmBias.clear(); mLmBias.clear(); v2LmBias.clear(); gLmBias.clear();
 			WIn.clear(); WInLowp.clear(); vWIn.clear(); v2WIn.clear(); gWIn.clear();
@@ -663,6 +684,26 @@ private:
 		// Output of each block
 		std::vector<float, glades::AlignedAllocator<float, 64> > hAfterFF; // [nLayers, T, dModel]
 
+		// Final LayerNorm scratch
+		std::vector<float, glades::AlignedAllocator<float, 64> > lnFinalMean;   // [T]
+		std::vector<float, glades::AlignedAllocator<float, 64> > lnFinalInvStd; // [T]
+		std::vector<float, glades::AlignedAllocator<float, 64> > hPostFinalLN;  // [T, dModel]
+
+		// Dropout masks (unsigned char, aligned)
+		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > dropoutMaskEmb;     // [T*dModel]
+		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > dropoutMaskResAttn;  // [nLayers*T*dModel]
+		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > dropoutMaskResFF;    // [nLayers*T*dModel]
+
+		// Gradient checkpointing recompute buffers (only allocated when enabled)
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_x1;        // [T, dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_Q;         // [T, dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_K;         // [T, dModelKV]
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_V;         // [T, dModelKV]
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_attnConcat; // [T, dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_x2;        // [T, dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_ff1;       // [T, ff1Width]
+		std::vector<float, glades::AlignedAllocator<float, 64> > recomp_ff1Act;    // [T, dFF]
+
 		// Output head
 		std::vector<float, glades::AlignedAllocator<float, 64> > logits; // [T, outSize]
 		std::vector<float, glades::AlignedAllocator<float, 64> > probs;  // [T, outSize] (softmax if needed)
@@ -712,6 +753,14 @@ private:
 			std::fill(v.begin(), v.end(), 0.0f);
 		}
 
+		template <typename UCharVec>
+		static void resize_uchar_zero(UCharVec& v, size_t n)
+		{
+			if (v.size() != n)
+				v.resize(n);
+			std::fill(v.begin(), v.end(), static_cast<unsigned char>(0));
+		}
+
 		void ensure(unsigned int newT,
 		            unsigned int newInputSize,
 		            unsigned int newOutSize,
@@ -720,7 +769,10 @@ private:
 		            unsigned int newDModelKV,
 		            unsigned int newNHeads,
 		            unsigned int newNLayers,
-		            unsigned int newFF1Width)
+		            unsigned int newFF1Width,
+		            float embDropRate = 0.0f,
+		            float resDropRate = 0.0f,
+		            bool gradCheckpoint = false)
 		{
 			T = newT;
 			inputSize = newInputSize;
@@ -756,6 +808,47 @@ private:
 			resize_and_zero(ffOut, static_cast<size_t>(nLayers) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 
 			resize_and_zero(hAfterFF, static_cast<size_t>(nLayers) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+
+			// Final LayerNorm scratch (always allocated)
+			resize_and_zero(lnFinalMean, static_cast<size_t>(T));
+			resize_and_zero(lnFinalInvStd, static_cast<size_t>(T));
+			resize_and_zero(hPostFinalLN, static_cast<size_t>(T) * static_cast<size_t>(dModel));
+
+			// Dropout masks (only allocated if rates > 0)
+			const size_t TD = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+			const size_t LTD = static_cast<size_t>(nLayers) * TD;
+			if (embDropRate > 0.0f)
+				resize_uchar_zero(dropoutMaskEmb, TD);
+			else
+				dropoutMaskEmb.clear();
+			if (resDropRate > 0.0f)
+			{
+				resize_uchar_zero(dropoutMaskResAttn, LTD);
+				resize_uchar_zero(dropoutMaskResFF, LTD);
+			}
+			else
+			{
+				dropoutMaskResAttn.clear();
+				dropoutMaskResFF.clear();
+			}
+
+			// Gradient checkpointing recompute buffers
+			if (gradCheckpoint)
+			{
+				resize_and_zero(recomp_x1, static_cast<size_t>(T) * static_cast<size_t>(dModel));
+				resize_and_zero(recomp_Q, static_cast<size_t>(T) * static_cast<size_t>(dModel));
+				resize_and_zero(recomp_K, static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+				resize_and_zero(recomp_V, static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+				resize_and_zero(recomp_attnConcat, static_cast<size_t>(T) * static_cast<size_t>(dModel));
+				resize_and_zero(recomp_x2, static_cast<size_t>(T) * static_cast<size_t>(dModel));
+				resize_and_zero(recomp_ff1, static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
+				resize_and_zero(recomp_ff1Act, static_cast<size_t>(T) * static_cast<size_t>(dFF));
+			}
+			else
+			{
+				recomp_x1.clear(); recomp_Q.clear(); recomp_K.clear(); recomp_V.clear();
+				recomp_attnConcat.clear(); recomp_x2.clear(); recomp_ff1.clear(); recomp_ff1Act.clear();
+			}
 
 			resize_and_zero(logits, static_cast<size_t>(T) * static_cast<size_t>(outSize));
 			resize_and_zero(probs, static_cast<size_t>(T) * static_cast<size_t>(outSize));

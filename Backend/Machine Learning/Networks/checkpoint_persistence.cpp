@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -1358,6 +1359,14 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 				}
 			}
 
+			// Final LayerNorm weights
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(dModel));
+				tensorsToWrite.push_back(TensorWriteRef("tr.lnFinalGamma", &tt.lnFinalGamma, dt, sh));
+				tensorsToWrite.push_back(TensorWriteRef("tr.lnFinalBeta", &tt.lnFinalBeta, dt, sh));
+			}
+
 			if (includeOpt)
 			{
 				{
@@ -1405,6 +1414,15 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 						tensorsToWrite.push_back(TensorWriteRef("tr.mLmBias", &tt.mLmBias, dt, sh));
 						tensorsToWrite.push_back(TensorWriteRef("tr.v2LmBias", &tt.v2LmBias, dt, sh));
 					}
+				}
+				// Final LayerNorm optimizer state
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(dModel));
+					tensorsToWrite.push_back(TensorWriteRef("tr.mLnFinalGamma", &tt.mLnFinalGamma, dt, sh));
+					tensorsToWrite.push_back(TensorWriteRef("tr.v2LnFinalGamma", &tt.v2LnFinalGamma, dt, sh));
+					tensorsToWrite.push_back(TensorWriteRef("tr.mLnFinalBeta", &tt.mLnFinalBeta, dt, sh));
+					tensorsToWrite.push_back(TensorWriteRef("tr.v2LnFinalBeta", &tt.v2LnFinalBeta, dt, sh));
 				}
 			}
 
@@ -2133,6 +2151,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				expected.push_back(TensorReadRef("tr.lmBias", &tt.lmBias, dt, sh));
 			}
 		}
+		// Final LayerNorm (optional for backward compat with old checkpoints)
+		{
+			std::vector<uint64_t> sh;
+			sh.push_back(static_cast<uint64_t>(dModel));
+			expected.push_back(TensorReadRef("tr.lnFinalGamma", &tt.lnFinalGamma, dt, sh));
+			expected.push_back(TensorReadRef("tr.lnFinalBeta", &tt.lnFinalBeta, dt, sh));
+		}
 		if (includeOpt)
 		{
 			{
@@ -2180,6 +2205,15 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					expected.push_back(TensorReadRef("tr.mLmBias", &tt.mLmBias, dt, sh));
 					expected.push_back(TensorReadRef("tr.v2LmBias", &tt.v2LmBias, dt, sh));
 				}
+			}
+			// Final LayerNorm optimizer state (optional for backward compat)
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(dModel));
+				expected.push_back(TensorReadRef("tr.mLnFinalGamma", &tt.mLnFinalGamma, dt, sh));
+				expected.push_back(TensorReadRef("tr.v2LnFinalGamma", &tt.v2LnFinalGamma, dt, sh));
+				expected.push_back(TensorReadRef("tr.mLnFinalBeta", &tt.mLnFinalBeta, dt, sh));
+				expected.push_back(TensorReadRef("tr.v2LnFinalBeta", &tt.v2LnFinalBeta, dt, sh));
 			}
 		}
 		for (size_t l = 0; l < tt.blocks.size(); ++l)
@@ -2513,6 +2547,15 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			nameToShape[expected[i].name] = expected[i].shape;
 		}
 	}
+	// Optional tensor names: these may be absent in old checkpoints (backward compat).
+	// If not found in the checkpoint, they keep their initialized defaults.
+	std::set<std::string> optionalNames;
+	optionalNames.insert("tr.lnFinalGamma");
+	optionalNames.insert("tr.lnFinalBeta");
+	optionalNames.insert("tr.mLnFinalGamma");
+	optionalNames.insert("tr.v2LnFinalGamma");
+	optionalNames.insert("tr.mLnFinalBeta");
+	optionalNames.insert("tr.v2LnFinalBeta");
 
 	// Parse shardCount/tensorCount
 	size_t shardCount = 0u;
@@ -2810,6 +2853,10 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		// Mark consumed to detect missing tensors later.
 		nameToVec.erase(it);
 	}
+
+	// Remove optional tensors that were not in the checkpoint (backward compat).
+	for (std::set<std::string>::const_iterator oit = optionalNames.begin(); oit != optionalNames.end(); ++oit)
+		nameToVec.erase(*oit);
 
 	// Ensure no expected tensors are missing (strict).
 	if (!nameToVec.empty())

@@ -12,6 +12,7 @@
 // - This is intentionally header-only to avoid build-system changes.
 // - Default seed is fixed (5489) until explicitly set by the caller.
 
+#include <cmath>    // sqrt, log, cos for Box-Muller
 #include <stdint.h> // C++98-friendly fixed-width ints
 
 namespace glades {
@@ -130,6 +131,24 @@ inline double uniform_double(Engine& e, double loInclusive, double hiExclusive)
 	if (hiExclusive <= loInclusive)
 		return loInclusive;
 	return loInclusive + (hiExclusive - loInclusive) * unit_double01(e);
+}
+
+// ===== Gaussian (normal) distribution via Box-Muller =====
+
+inline float standard_normal(Engine& e)
+{
+	// Box-Muller transform: generate two independent N(0,1) samples from two U(0,1) draws.
+	// We discard the second sample for simplicity (no caching across calls).
+	float u1 = unit_float01(e);
+	float u2 = unit_float01(e);
+	// Avoid log(0): clamp u1 away from zero.
+	if (u1 < 1e-30f) u1 = 1e-30f;
+	return static_cast<float>(sqrt(-2.0 * log(static_cast<double>(u1))) * cos(6.283185307179586 * static_cast<double>(u2)));
+}
+
+inline float normal(Engine& e, float mean, float stddev)
+{
+	return mean + stddev * standard_normal(e);
 }
 
 // ===== Legacy implicit-engine API (discouraged) =====

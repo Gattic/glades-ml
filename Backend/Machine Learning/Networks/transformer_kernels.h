@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <stdint.h>
 #if defined(__AVX2__) || defined(__SSE2__)
 #include <immintrin.h>
@@ -1208,6 +1209,204 @@ inline void rmsnorm_backward_rows_accum(const float* X,
 			const double v = dxhat * invd - xi * inv3 * invD * sum_dxhat_x;
 			dX[off + i] = static_cast<float>(v);
 		}
+	}
+}
+
+// === Full NaN/Inf scan (AVX2 fast path) ===
+//
+// Returns true if ALL elements are finite (not NaN, not +/-Inf).
+inline bool all_finite_full(const float* data, size_t n)
+{
+	if (!data || n == 0u)
+		return true;
+#if defined(__AVX2__)
+	size_t i = 0;
+	// Check 8 floats at a time.
+	for (; i + 7 < n; i += 8)
+	{
+		const __m256 v = _mm256_loadu_ps(data + i);
+		// _CMP_UNORD_Q: true if either operand is NaN
+		const __m256 nan_mask = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
+		if (_mm256_movemask_ps(nan_mask) != 0)
+			return false;
+		// Check for Inf: |v| > FLT_MAX
+		const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+		const __m256 absv = _mm256_and_ps(v, abs_mask);
+		const __m256 flt_max = _mm256_set1_ps(std::numeric_limits<float>::max());
+		const __m256 inf_mask = _mm256_cmp_ps(absv, flt_max, _CMP_GT_OQ);
+		if (_mm256_movemask_ps(inf_mask) != 0)
+			return false;
+	}
+	// Scalar tail
+	for (; i < n; ++i)
+	{
+		if (!is_finite(data[i]))
+			return false;
+	}
+	return true;
+#else
+	for (size_t i = 0; i < n; ++i)
+	{
+		if (!is_finite(data[i]))
+			return false;
+	}
+	return true;
+#endif
+}
+
+// === Tiled GEMM: Y = X * W^T + bias (row-major) ===
+//
+// X: [T, inSize], W: [outSize, inSize] (row-major), bias: [outSize], Y: [T, outSize]
+// Tiles over output rows and input columns for L1 cache reuse.
+inline void gemm_rowmajor_ABt_bias(const float* GLADES_RESTRICT X,
+                                   unsigned int T,
+                                   unsigned int inSize,
+                                   const float* GLADES_RESTRICT W,
+                                   const float* GLADES_RESTRICT bias,
+                                   unsigned int biasSize,
+                                   unsigned int outSize,
+                                   float* GLADES_RESTRICT Y)
+{
+	if (!X || !W || !Y || T == 0u || inSize == 0u || outSize == 0u)
+		return;
+
+	// Initialize Y with bias
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		float* yt = Y + static_cast<size_t>(t) * outSize;
+		for (unsigned int o = 0; o < outSize; ++o)
+			yt[o] = (bias && o < biasSize) ? bias[o] : 0.0f;
+	}
+
+	// Tiled accumulation: Y[t,o] += X[t,:] * W[o,:]^T
+	const unsigned int TILE_T = 8u;
+	const unsigned int TILE_K = 64u;
+	const unsigned int TILE_O = 8u;
+
+	for (unsigned int ob = 0; ob < outSize; ob += TILE_O)
+	{
+		const unsigned int oe = (ob + TILE_O < outSize) ? (ob + TILE_O) : outSize;
+		for (unsigned int kb = 0; kb < inSize; kb += TILE_K)
+		{
+			const unsigned int ke = (kb + TILE_K < inSize) ? (kb + TILE_K) : inSize;
+			const unsigned int klen = ke - kb;
+			for (unsigned int tb = 0; tb < T; tb += TILE_T)
+			{
+				const unsigned int te = (tb + TILE_T < T) ? (tb + TILE_T) : T;
+				for (unsigned int t = tb; t < te; ++t)
+				{
+					const float* xt = X + static_cast<size_t>(t) * inSize + kb;
+					float* yt = Y + static_cast<size_t>(t) * outSize;
+					for (unsigned int o = ob; o < oe; ++o)
+					{
+						const float* wrow = W + static_cast<size_t>(o) * inSize + kb;
+						yt[o] += dot_f32(xt, wrow, klen);
+					}
+				}
+			}
+		}
+	}
+}
+
+// === Dropout kernels ===
+
+// Generate a dropout mask: each byte is 1 (keep) or 0 (drop).
+// `rate` is the probability of dropping (zeroing) an element.
+template <typename EngineT>
+inline void generate_dropout_mask(EngineT& eng, unsigned char* mask, size_t n, float rate)
+{
+	if (!mask || n == 0 || rate <= 0.0f)
+	{
+		// No dropout: fill with 1s
+		if (mask)
+			for (size_t i = 0; i < n; ++i)
+				mask[i] = 1;
+		return;
+	}
+	if (rate >= 1.0f)
+	{
+		// Drop everything
+		for (size_t i = 0; i < n; ++i)
+			mask[i] = 0;
+		return;
+	}
+	// Generate 64 bits at a time for speed. Each bit decides one element.
+	// Threshold: keep if random < (1-rate), so keep_threshold = floor((1-rate) * 2^24).
+	const uint32_t keep_thresh = static_cast<uint32_t>((1.0f - rate) * 16777216.0f);
+	size_t i = 0;
+	for (; i < n; ++i)
+	{
+		const uint64_t r = glades::rng::next_u64(eng);
+		// Use upper 24 bits
+		const uint32_t bits = static_cast<uint32_t>(r >> 40);
+		mask[i] = (bits < keep_thresh) ? 1 : 0;
+	}
+}
+
+// Apply dropout mask in-place: x[i] *= mask[i] * scale
+inline void apply_dropout_mask_inplace(float* x, const unsigned char* mask, float scale, size_t n)
+{
+	if (!x || !mask || n == 0)
+		return;
+	for (size_t i = 0; i < n; ++i)
+		x[i] = mask[i] ? (x[i] * scale) : 0.0f;
+}
+
+// === Vectorized activation buffer APIs ===
+//
+// These operate on contiguous buffers and provide a single call site for future SIMD optimization.
+
+// SiLU forward: y[i] = silu(x[i])
+inline void silu_forward_buf(const float* x, float* y, size_t n)
+{
+	if (!x || !y) return;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const float s = 1.0f / (1.0f + expf(-x[i]));
+		y[i] = x[i] * s;
+	}
+}
+
+// GELU forward: y[i] = gelu(x[i])
+inline void gelu_forward_buf(const float* x, float* y, size_t n)
+{
+	if (!x || !y) return;
+	const double c = 0.79788456080286535588; // sqrt(2/pi)
+	for (size_t i = 0; i < n; ++i)
+	{
+		const double xd = static_cast<double>(x[i]);
+		const double u = c * (xd + 0.044715 * xd * xd * xd);
+		const double t = tanh(u);
+		y[i] = static_cast<float>(0.5 * xd * (1.0 + t));
+	}
+}
+
+// SiLU backward: dAct[i] *= silu'(x[i])
+inline void silu_backward_buf(const float* x, float* dAct, size_t n)
+{
+	if (!x || !dAct) return;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const float s = 1.0f / (1.0f + expf(-x[i]));
+		dAct[i] *= s * (1.0f + x[i] * (1.0f - s));
+	}
+}
+
+// GELU backward: dAct[i] *= gelu'(x[i])
+inline void gelu_backward_buf(const float* x, float* dAct, size_t n)
+{
+	if (!x || !dAct) return;
+	const double c = 0.79788456080286535588;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const double xd = static_cast<double>(x[i]);
+		const double x2 = xd * xd;
+		const double u = c * (xd + 0.044715 * xd * x2);
+		const double t = tanh(u);
+		const double sech2 = 1.0 - (t * t);
+		const double du = c * (1.0 + 3.0 * 0.044715 * x2);
+		const double g = 0.5 * (1.0 + t) + 0.5 * xd * sech2 * du;
+		dAct[i] *= static_cast<float>(g);
 	}
 }
 
