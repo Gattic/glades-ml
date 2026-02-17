@@ -2686,6 +2686,17 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (gb.ln2Beta.allocated()) gb.ln2Beta.download(&cb.ln2Beta[0], cb.ln2Beta.size());
 			}
 
+			// Finalize epoch-level loss before returning.
+			// tokenLmNllSum / tokenLmTokenCount are locals; copy to the member
+			// that the Trainer reads (overallTotalError).
+			if (tokenLM)
+			{
+				if (tokenLmTokenCount > 0ULL)
+					overallTotalError = static_cast<float>(tokenLmNllSum / static_cast<double>(tokenLmTokenCount));
+				else
+					overallTotalError = 0.0f;
+			}
+
 			return; // GPU path complete; skip CPU fallback.
 		}
 	}
