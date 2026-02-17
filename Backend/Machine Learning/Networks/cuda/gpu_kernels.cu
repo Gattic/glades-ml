@@ -901,6 +901,29 @@ bool axpy(float alpha, const float* x, float* y, int n)
 }
 
 namespace {
+
+__global__ void add_two_kernel(const float* __restrict__ a,
+                               const float* __restrict__ b,
+                               int n,
+                               float* __restrict__ out)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n)
+		out[idx] = a[idx] + b[idx];
+}
+
+} // anonymous namespace
+
+bool add_two(float* out, const float* a, const float* b, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	add_two_kernel<<<grid, kBlockElem>>>(a, b, n, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
 __global__ void scale_array_kernel(float* __restrict__ x, float scale, int n)
 {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1804,6 +1827,40 @@ bool zero_buffers_batch(float** d_ptrs, const int* d_sizes, int count)
 {
 	if (count <= 0) return true;
 	zero_multi_buffers_kernel<<<count, 256>>>(d_ptrs, d_sizes);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  Pack loss scalars: copy 4 scalar device values into a contiguous buffer
+// ===========================================================================
+
+namespace {
+
+__global__ void pack_loss_scalars_kernel(const float* __restrict__ lossSum,
+                                          const int* __restrict__ lossCount,
+                                          const int* __restrict__ correctCount,
+                                          const int* __restrict__ validCount,
+                                          int* __restrict__ out)
+{
+	if (threadIdx.x == 0)
+	{
+		// Reinterpret float as int bits for the first slot.
+		const int* lossBits = reinterpret_cast<const int*>(lossSum);
+		out[0] = lossBits[0];
+		out[1] = lossCount[0];
+		out[2] = correctCount[0];
+		out[3] = validCount[0];
+	}
+}
+
+} // anonymous namespace
+
+bool pack_loss_scalars(const float* lossSum, const int* lossCount,
+                       const int* correctCount, const int* validCount,
+                       int* out)
+{
+	pack_loss_scalars_kernel<<<1, 1>>>(lossSum, lossCount, correctCount, validCount, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

@@ -196,7 +196,8 @@ void GpuTransformerWeights::free()
 GpuTransformerScratch::GpuTransformerScratch()
     : initialized(false),
       T(0), dModel(0), dFF(0), dModelKV(0), nHeads(0), nLayers(0),
-      inputSize(0), outSize(0), ff1Width(0)
+      inputSize(0), outSize(0), ff1Width(0),
+      d_dKdVZeroPtrs(0), d_dKdVZeroSizes(0)
 {
 }
 
@@ -287,6 +288,18 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	if (!lossCount.allocate(1)) return false;
 	if (!correctCount.allocate(1)) return false;
 	if (!validCount.allocate(1)) return false;
+	if (!lossPack.allocate(4)) return false;
+
+	// Persistent device arrays for batch-zeroing dK/dV.
+	{
+		cudaError_t e1 = cudaMalloc(&d_dKdVZeroPtrs, 2 * sizeof(float*));
+		cudaError_t e2 = cudaMalloc(&d_dKdVZeroSizes, 2 * sizeof(int));
+		if (e1 != cudaSuccess || e2 != cudaSuccess) return false;
+		float* hPtrs[2] = { dKfull.data(), dVfull.data() };
+		int hSizes[2] = { static_cast<int>(sT * sdmkv), static_cast<int>(sT * sdmkv) };
+		cudaMemcpy(d_dKdVZeroPtrs, hPtrs, 2 * sizeof(float*), cudaMemcpyHostToDevice);
+		cudaMemcpy(d_dKdVZeroSizes, hSizes, 2 * sizeof(int), cudaMemcpyHostToDevice);
+	}
 
 	initialized = true;
 	return true;
@@ -295,6 +308,8 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 void GpuTransformerScratch::free()
 {
 	initialized = false;
+	if (d_dKdVZeroPtrs)  { cudaFree(d_dKdVZeroPtrs);  d_dKdVZeroPtrs  = 0; }
+	if (d_dKdVZeroSizes) { cudaFree(d_dKdVZeroSizes); d_dKdVZeroSizes = 0; }
 	// All GpuBuffer destructors handle cudaFree.
 }
 

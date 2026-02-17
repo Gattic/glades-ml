@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <vector>
@@ -1854,9 +1855,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						{
 							const unsigned int qStart = kvh * groupSize;
 							// S[groupSize, T, T] = Q_group[groupSize, T, dHead] * K_kvh[T, dHead]^T
-							// Q heads are strided at [T, dModel] with head offset = qStart*dHead.
-							// K head is at [T, dModelKV] with head offset = kvh*dHead.
-							// For each Q head in the group, we compute S_h = Q_h * K_kvh^T.
+							float* P_out = attnP + static_cast<size_t>(qStart) * T * T;
 							gpu::sgemm_batched_strided_abt(
 							    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
 							    invSqrt,
@@ -1865,26 +1864,20 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							    K_l + kvh * dHead, static_cast<int>(dModelKV),
 							    0LL,  // stride 0: all Q heads in group share same K head
 							    0.0f,
-							    scores + static_cast<size_t>(qStart) * T * T, static_cast<int>(T),
+							    P_out, static_cast<int>(T),
 							    static_cast<long long>(T) * T,
 							    static_cast<int>(groupSize));
 
 							// Causal mask + softmax on S[groupSize, T, T].
 							gpu::causal_mask_softmax_inplace(
-							    scores + static_cast<size_t>(qStart) * T * T,
+							    P_out,
 							    static_cast<int>(groupSize), static_cast<int>(T));
-
-							// Save probs for backward pass.
-							gpu::device_memcpy_d2d(
-							    attnP + static_cast<size_t>(qStart) * T * T,
-							    scores + static_cast<size_t>(qStart) * T * T,
-							    static_cast<size_t>(groupSize) * T * T * sizeof(float));
 
 							// O[groupSize, T, dHead] = P[groupSize, T, T] * V_kvh[T, dHead]
 							gpu::sgemm_batched_strided(
 							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
 							    1.0f,
-							    scores + static_cast<size_t>(qStart) * T * T, static_cast<int>(T),
+							    P_out, static_cast<int>(T),
 							    static_cast<long long>(T) * T,
 							    V_l + kvh * dHead, static_cast<int>(dModelKV),
 							    0LL,  // stride 0: all Q heads in group share same V head
@@ -1905,8 +1898,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 					// Residual 1: hAfterAttn = layerIn + attnOut
 					float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
-					gpu::device_memcpy_d2d(hAfterAttn_l, layerIn, T * dModel * sizeof(float));
-					gpu::add_residual(hAfterAttn_l, attnOut_l, static_cast<int>(T * dModel));
+					gpu::add_two(hAfterAttn_l, layerIn, attnOut_l, static_cast<int>(T * dModel));
 
 					// Pre-LN 2
 					float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
@@ -1961,8 +1953,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 					// Residual 2: hAfterFF = hAfterAttn + ffOut
 					float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li) * T * dModel;
-					gpu::device_memcpy_d2d(hAfterFF_l, hAfterAttn_l, T * dModel * sizeof(float));
-					gpu::add_residual(hAfterFF_l, ffOut_l, static_cast<int>(T * dModel));
+					gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l, static_cast<int>(T * dModel));
 				}
 
 				// Output logits
@@ -2017,13 +2008,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					    gpuTransformerScratch->correctCount.data(),
 					    gpuTransformerScratch->validCount.data());
 
-					// Download scalar results (16 bytes instead of T*vocabSize*4 bytes).
-					float lossVal = 0.0f;
-					int lossCountVal = 0, correctVal = 0, validVal = 0;
-					gpuTransformerScratch->lossSum.download(&lossVal, 1);
-					gpuTransformerScratch->lossCount.download(&lossCountVal, 1);
-					gpuTransformerScratch->correctCount.download(&correctVal, 1);
-					gpuTransformerScratch->validCount.download(&validVal, 1);
+					// Pack 4 loss scalars into contiguous buffer, download once.
+					gpu::pack_loss_scalars(
+					    gpuTransformerScratch->lossSum.data(),
+					    gpuTransformerScratch->lossCount.data(),
+					    gpuTransformerScratch->correctCount.data(),
+					    gpuTransformerScratch->validCount.data(),
+					    gpuTransformerScratch->lossPack.data());
+					int lossPacked[4];
+					gpuTransformerScratch->lossPack.download(lossPacked, 4);
+					float lossVal;
+					memcpy(&lossVal, &lossPacked[0], sizeof(float));
+					int lossCountVal = lossPacked[1], correctVal = lossPacked[2], validVal = lossPacked[3];
 
 					gpuValidTargets = static_cast<unsigned int>(lossCountVal);
 					tokenLmNllSum += static_cast<double>(lossVal);
@@ -2146,11 +2142,6 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 					// dH is gradient w.r.t. hAfterFF[li].
 					// Residual: hAfterFF = hAfterAttn + ffOut => dFFOut = dH, dHAfterAttn (residual) = dH.
-					// Copy dH into dH2 for the residual-to-hAfterAttn path.
-					gpu::device_memcpy_d2d(gpuTransformerScratch->dH2.data(),
-					           gpuTransformerScratch->dH.data(),
-					           T * dModel * sizeof(float));
-
 					// --- FFN backward ---
 					// ffOut = W2 * ff1Act + b2  =>  dFF1Act = dH * W2^T, gW2 += dH^T * ff1Act
 					gpu::sgemm_rowmajor(
@@ -2248,8 +2239,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						    gb.gLn2Gamma.data(), gb.gLn2Beta.data());
 					}
 
-					// Combine: dHAfterAttn = dH2 (residual) + dHAfterAttnFromLN
-					gpu::add_residual(gpuTransformerScratch->dH2.data(),
+					// Combine: dHAfterAttn = dH (residual) + dHAfterAttnFromLN
+					gpu::add_two(gpuTransformerScratch->dH2.data(),
+					    gpuTransformerScratch->dH.data(),
 					    gpuTransformerScratch->dHAfterAttnFromLN.data(),
 					    static_cast<int>(T * dModel));
 
@@ -2270,19 +2262,14 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					    static_cast<int>(T), static_cast<int>(dModel),
 					    1.0f, gb.gBo.data());
 
-					// dH = dH2 for the residual-to-hIn path (copy for next iteration).
-					gpu::device_memcpy_d2d(gpuTransformerScratch->dH.data(),
-					           gpuTransformerScratch->dH2.data(),
-					           T * dModel * sizeof(float));
-
 					// --- Attention backward (batched GEMM) ---
 					float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
 					float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
 					float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
 
 					// Zero dK/dV (dQ is overwritten per-head, but dK/dV accumulate for GQA).
-					gpu::device_memset_bytes(gpuTransformerScratch->dKfull.data(), 0, T * dModelKV * sizeof(float));
-					gpu::device_memset_bytes(gpuTransformerScratch->dVfull.data(), 0, T * dModelKV * sizeof(float));
+					gpu::zero_buffers_batch(gpuTransformerScratch->d_dKdVZeroPtrs,
+					    gpuTransformerScratch->d_dKdVZeroSizes, 2);
 
 					{
 						const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
@@ -2442,8 +2429,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						    gb.gLn1Gamma.data(), gb.gLn1Beta.data());
 					}
 
-					// Combine into dH: dH += dHInFromLN
-					gpu::add_residual(gpuTransformerScratch->dH.data(),
+					// Combine into dH: dH = dH2 + dHInFromLN
+					gpu::add_two(gpuTransformerScratch->dH.data(),
+					    gpuTransformerScratch->dH2.data(),
 					    gpuTransformerScratch->dHInFromLN.data(),
 					    static_cast<int>(T * dModel));
 				} // layers backward

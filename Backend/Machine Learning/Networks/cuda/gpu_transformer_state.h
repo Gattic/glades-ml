@@ -193,6 +193,12 @@ struct GpuTransformerScratch
 	GpuBuffer<int> lossCount;    // [1]  (valid token count)
 	GpuBuffer<int> correctCount; // [1]  (argmax matches)
 	GpuBuffer<int> validCount;   // [1]  (valid tokens for accuracy)
+	GpuBuffer<int> lossPack;     // [4]  (packed loss scalars for single D2H download)
+
+	// Persistent device arrays for batch-zeroing dK/dV (2 pointers + 2 sizes).
+	// Raw device pointers (not GpuBuffer) to avoid needing a float* specialization.
+	float** d_dKdVZeroPtrs;  // device array of 2 float*
+	int*    d_dKdVZeroSizes; // device array of 2 ints
 
 	GpuTransformerScratch();
 	~GpuTransformerScratch();
