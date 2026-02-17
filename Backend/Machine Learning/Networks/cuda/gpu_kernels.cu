@@ -993,12 +993,13 @@ __global__ void adam_update_kernel(float* __restrict__ param,
                                   float* __restrict__ v,
                                   float lr, float beta1, float beta2,
                                   float eps, float weightDecay,
+                                  float gradScale,
                                   int step, int n)
 {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= n) return;
 
-	float g = grad[idx];
+	float g = grad[idx] * gradScale;
 
 	// Decoupled weight decay (AdamW).
 	if (weightDecay != 0.0f)
@@ -1023,12 +1024,12 @@ __global__ void adam_update_kernel(float* __restrict__ param,
 
 bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
-                 float weightDecay, int step, int n)
+                 float weightDecay, float gradScale, int step, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
 	adam_update_kernel<<<grid, kBlockElem>>>(
-		param, grad, m, v, lr, beta1, beta2, eps, weightDecay, step, n);
+		param, grad, m, v, lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1158,6 +1159,7 @@ namespace {
 __global__ void softmax_backward_attn_kernel(const float* __restrict__ P,
                                               const float* __restrict__ dP,
                                               int T,
+                                              float outputScale,
                                               float* __restrict__ dS)
 {
     int idx = blockIdx.x;
@@ -1179,11 +1181,11 @@ __global__ void softmax_backward_attn_kernel(const float* __restrict__ P,
     __syncthreads();
     float dot = sDot;
 
-    // dS[j] = P[j] * (dP[j] - dot) for j <= row, 0 otherwise.
+    // dS[j] = outputScale * P[j] * (dP[j] - dot) for j <= row, 0 otherwise.
     for (int j = threadIdx.x; j < T; j += blockDim.x)
     {
         if (j <= row)
-            dsRow[j] = pRow[j] * (dpRow[j] - dot);
+            dsRow[j] = outputScale * pRow[j] * (dpRow[j] - dot);
         else
             dsRow[j] = 0.0f;
     }
@@ -1192,13 +1194,13 @@ __global__ void softmax_backward_attn_kernel(const float* __restrict__ P,
 } // anonymous namespace
 
 bool softmax_backward_attn(const float* P, const float* dP,
-                           int batchSize, int T, float* dS)
+                           int batchSize, int T, float outputScale, float* dS)
 {
     if (batchSize <= 0 || T <= 0) return true;
     int totalRows = batchSize * T;
     int block = rowBlockSize(T);
     int smemBytes = (block / 32 + 1) * sizeof(float);
-    softmax_backward_attn_kernel<<<totalRows, block, smemBytes>>>(P, dP, T, dS);
+    softmax_backward_attn_kernel<<<totalRows, block, smemBytes>>>(P, dP, T, outputScale, dS);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1777,6 +1779,33 @@ void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spit
 void device_memset_bytes(void* ptr, int value, size_t bytes)
 {
 	cudaMemset(ptr, value, bytes);
+}
+
+// ===========================================================================
+//  Batch zero: zero multiple GPU buffers with a single kernel launch
+// ===========================================================================
+
+namespace {
+
+// Each block zeros one buffer. ptrs[blockIdx.x] is the pointer,
+// sizes[blockIdx.x] is the number of floats to zero.
+__global__ void zero_multi_buffers_kernel(float** __restrict__ ptrs,
+                                          const int* __restrict__ sizes)
+{
+	float* buf = ptrs[blockIdx.x];
+	int n = sizes[blockIdx.x];
+	for (int i = threadIdx.x; i < n; i += blockDim.x)
+		buf[i] = 0.0f;
+}
+
+} // anonymous namespace
+
+bool zero_buffers_batch(float** d_ptrs, const int* d_sizes, int count)
+{
+	if (count <= 0) return true;
+	zero_multi_buffers_kernel<<<count, 256>>>(d_ptrs, d_sizes);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
 }
 
 } // namespace gpu

@@ -1,8 +1,10 @@
 // GPU transformer state implementation.
 #include "gpu_transformer_state.h"
+#include "gpu_kernels.h"
 
 #ifdef GLADES_HAVE_CUDA
 
+#include <cuda_runtime.h>
 #include <cstdio>
 #include <cstring>
 
@@ -411,46 +413,82 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
 	return true;
 }
 
+// Helper: append a GpuBuffer to the batch-zero list if allocated.
+static void addBuf(GpuBuffer<float>& buf, float** hPtrs, int* hSizes, int& count)
+{
+	if (buf.allocated())
+	{
+		hPtrs[count] = buf.data();
+		hSizes[count] = static_cast<int>(buf.size());
+		++count;
+	}
+}
+
 bool zeroTransformerGradients(GpuTransformerWeights& gpu)
 {
 	if (!gpu.initialized)
 		return false;
 
+	// Max buffers: 4 global + 16 per layer (256 layers max).
+	float* hPtrs[4 + 16 * 256];
+	int    hSizes[4 + 16 * 256];
+	int count = 0;
+
 	if (gpu.tokenModel)
 	{
-		if (gpu.gTokE.allocated()) gpu.gTokE.zero();
-		if (gpu.gLmBias.allocated()) gpu.gLmBias.zero();
+		addBuf(gpu.gTokE, hPtrs, hSizes, count);
+		addBuf(gpu.gLmBias, hPtrs, hSizes, count);
 	}
 	else
 	{
-		if (gpu.gWIn.allocated()) gpu.gWIn.zero();
-		if (gpu.gBIn.allocated()) gpu.gBIn.zero();
-		if (gpu.gWOut.allocated()) gpu.gWOut.zero();
-		if (gpu.gBOut.allocated()) gpu.gBOut.zero();
+		addBuf(gpu.gWIn, hPtrs, hSizes, count);
+		addBuf(gpu.gBIn, hPtrs, hSizes, count);
+		addBuf(gpu.gWOut, hPtrs, hSizes, count);
+		addBuf(gpu.gBOut, hPtrs, hSizes, count);
 	}
 
 	for (unsigned int l = 0; l < gpu.nLayers; ++l)
 	{
 		GpuTransformerWeights::Block& b = gpu.blocks[l];
-		b.gLn1Gamma.zero();
-		b.gLn1Beta.zero();
-		b.gWq.zero();
-		b.gWk.zero();
-		b.gWv.zero();
-		b.gWo.zero();
-		b.gBq.zero();
-		b.gBk.zero();
-		b.gBv.zero();
-		b.gBo.zero();
-		b.gLn2Gamma.zero();
-		b.gLn2Beta.zero();
-		b.gW1.zero();
-		b.gW2.zero();
-		b.gB1.zero();
-		b.gB2.zero();
+		addBuf(b.gLn1Gamma, hPtrs, hSizes, count);
+		addBuf(b.gLn1Beta, hPtrs, hSizes, count);
+		addBuf(b.gWq, hPtrs, hSizes, count);
+		addBuf(b.gWk, hPtrs, hSizes, count);
+		addBuf(b.gWv, hPtrs, hSizes, count);
+		addBuf(b.gWo, hPtrs, hSizes, count);
+		addBuf(b.gBq, hPtrs, hSizes, count);
+		addBuf(b.gBk, hPtrs, hSizes, count);
+		addBuf(b.gBv, hPtrs, hSizes, count);
+		addBuf(b.gBo, hPtrs, hSizes, count);
+		addBuf(b.gLn2Gamma, hPtrs, hSizes, count);
+		addBuf(b.gLn2Beta, hPtrs, hSizes, count);
+		addBuf(b.gW1, hPtrs, hSizes, count);
+		addBuf(b.gW2, hPtrs, hSizes, count);
+		addBuf(b.gB1, hPtrs, hSizes, count);
+		addBuf(b.gB2, hPtrs, hSizes, count);
 	}
 
-	return true;
+	if (count == 0)
+		return true;
+
+	// Persistent device buffers for the pointer/size arrays (re-allocated if needed).
+	static float** d_ptrs = 0;
+	static int*    d_sizes = 0;
+	static int     d_capacity = 0;
+
+	if (count > d_capacity)
+	{
+		if (d_ptrs)  cudaFree(d_ptrs);
+		if (d_sizes) cudaFree(d_sizes);
+		cudaMalloc(&d_ptrs,  count * sizeof(float*));
+		cudaMalloc(&d_sizes, count * sizeof(int));
+		d_capacity = count;
+	}
+
+	cudaMemcpy(d_ptrs,  hPtrs,  count * sizeof(float*), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_sizes, hSizes, count * sizeof(int),    cudaMemcpyHostToDevice);
+
+	return zero_buffers_batch(d_ptrs, d_sizes, count);
 }
 
 } // namespace gpu

@@ -179,7 +179,7 @@ void GpuTrainingUnitTest()
 		// Correct call: batchSize = number of [T,T] matrices (NOT batchSize * T)
 		bool ok = glades::gpu::softmax_backward_attn(
 		    d_P.data(), d_dP.data(),
-		    batchSize, T,
+		    batchSize, T, 1.0f,
 		    d_dS.data());
 
 		ASSERT("softmax_backward_attn call failed", ok);

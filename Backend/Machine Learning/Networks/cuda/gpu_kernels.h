@@ -121,9 +121,10 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
 // ---------------------------------------------------------------------------
 
 // In-place Adam update for n parameters.
+// gradScale is applied to grad before the update (use 1.0f for no scaling).
 bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
-                 float weightDecay, int step, int n);
+                 float weightDecay, float gradScale, int step, int n);
 
 // ---------------------------------------------------------------------------
 // Flash attention (simplified single-head)
@@ -179,11 +180,11 @@ bool reduce_rows_sum(const float* input, int rows, int cols,
 // Each (batch, row) block: set S[i,j]==-FLT_MAX for j>i, then stable softmax.
 bool causal_mask_softmax_inplace(float* S, int batchSize, int T);
 
-// Softmax backward for attention: dS = P * (dP - row_sum(dP * P)),
+// Softmax backward for attention: dS = outputScale * P * (dP - row_sum(dP * P)),
 // zero above-diagonal for causal mask.
 // P, dP, dS are [batchSize, T, T] row-major.
 bool softmax_backward_attn(const float* P, const float* dP,
-                           int batchSize, int T, float* dS);
+                           int batchSize, int T, float outputScale, float* dS);
 
 // ---------------------------------------------------------------------------
 // Loss computation
@@ -205,6 +206,14 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
 bool argmax_count_matches(const float* probs, const int* targets,
                           int T, int vocabSize, int padToken,
                           int* correct_count, int* valid_count);
+
+// ---------------------------------------------------------------------------
+// Batch zero: zero multiple GPU buffers with a single kernel launch
+// ---------------------------------------------------------------------------
+
+// d_ptrs[count] and d_sizes[count] must be device pointers.
+// Each buffer d_ptrs[i] of d_sizes[i] floats is zeroed.
+bool zero_buffers_batch(float** d_ptrs, const int* d_sizes, int count);
 
 // ---------------------------------------------------------------------------
 // Device memory operations (callable from .cpp files without cuda_runtime.h)
@@ -255,18 +264,20 @@ inline bool scale_array(float*, float, int) { return false; }
 inline bool embedding_gather(const float*, const int*, int, int, int, float*) { return false; }
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 
-inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, int, int) { return false; }
+inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
 
 inline bool reduce_rows_sum(const float*, int, int, float, float*) { return false; }
 inline bool causal_mask_softmax_inplace(float*, int, int) { return false; }
-inline bool softmax_backward_attn(const float*, const float*, int, int, float*) { return false; }
+inline bool softmax_backward_attn(const float*, const float*, int, int, float, float*) { return false; }
 inline bool cross_entropy_nll_loss(const float*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, int*) { return false; }
 
 inline bool kv_attention_incremental(const float*, const float*, const float*, float*, const unsigned char*, int, int, int, int, int, int, float, float*) { return false; }
+
+inline bool zero_buffers_batch(float**, const int*, int) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}

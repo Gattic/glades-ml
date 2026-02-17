@@ -2308,14 +2308,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							    dS, static_cast<int>(T), static_cast<long long>(T) * T,
 							    static_cast<int>(groupSize));
 
-							// 2. softmax backward: dS = P * (dP - row_sum(dP * P))
+							// 2. softmax backward: dS = invSqrt * P * (dP - row_sum(dP * P))
 							gpu::softmax_backward_attn(P_group, dS,
 							    static_cast<int>(groupSize),
-							    static_cast<int>(T), dS);
-
-							// Scale dS by invSqrt for the Q*K^T scaling
-							gpu::scale_array(dS, invSqrt,
-							    static_cast<int>(groupSize) * static_cast<int>(T) * static_cast<int>(T));
+							    static_cast<int>(T), invSqrt, dS);
 
 							// 3. dQ[groupSize, T, dHead] = dS[groupSize, T, T] * K_kvh[T, dHead]
 							gpu::sgemm_batched_strided(
@@ -2494,20 +2490,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						const float lr = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
 						const float wd = skeleton->getWeightDecay2(0u);
 						const int tokEn = static_cast<int>(static_cast<size_t>(vocabSize) * dModel);
-						gpu::scale_array(gpuTransformerWeights->gTokE.data(), invBatch, tokEn);
 						gpu::adam_update(gpuTransformerWeights->tokE.data(),
 						    gpuTransformerWeights->gTokE.data(),
 						    gpuTransformerWeights->vTokE.data(),
 						    gpuTransformerWeights->v2TokE.data(),
-						    lr, beta1, beta2, adamEps, wd, stepInt, tokEn);
+						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, tokEn);
 
 						const int lbN = static_cast<int>(vocabSize);
-						gpu::scale_array(gpuTransformerWeights->gLmBias.data(), invBatch, lbN);
 						gpu::adam_update(gpuTransformerWeights->lmBias.data(),
 						    gpuTransformerWeights->gLmBias.data(),
 						    gpuTransformerWeights->mLmBias.data(),
 						    gpuTransformerWeights->v2LmBias.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lbN);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lbN);
 					}
 
 					// Input projection (layer index 0).
@@ -2517,22 +2511,20 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						const int wn = static_cast<int>(gpuTransformerWeights->WIn.size());
 						if (wn > 0)
 						{
-							gpu::scale_array(gpuTransformerWeights->gWIn.data(), invBatch, wn);
 							gpu::adam_update(gpuTransformerWeights->WIn.data(),
 							    gpuTransformerWeights->gWIn.data(),
 							    gpuTransformerWeights->vWIn.data(),
 							    gpuTransformerWeights->v2WIn.data(),
-							    lr, beta1, beta2, adamEps, wd, stepInt, wn);
+							    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wn);
 						}
 						const int bn = static_cast<int>(gpuTransformerWeights->bIn.size());
 						if (bn > 0)
 						{
-							gpu::scale_array(gpuTransformerWeights->gBIn.data(), invBatch, bn);
 							gpu::adam_update(gpuTransformerWeights->bIn.data(),
 							    gpuTransformerWeights->gBIn.data(),
 							    gpuTransformerWeights->mBIn.data(),
 							    gpuTransformerWeights->v2BIn.data(),
-							    lr, beta1, beta2, adamEps, 0.0f, stepInt, bn);
+							    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bn);
 						}
 					}
 
@@ -2546,77 +2538,61 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 						// Weight matrices.
 						const int wqN = static_cast<int>(gb.Wq.size());
-						gpu::scale_array(gb.gWq.data(), invBatch, wqN);
 						gpu::adam_update(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(),
-						    lr, beta1, beta2, adamEps, wd, stepInt, wqN);
+						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wqN);
 						const int wkN = static_cast<int>(gb.Wk.size());
-						gpu::scale_array(gb.gWk.data(), invBatch, wkN);
 						gpu::adam_update(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(),
-						    lr, beta1, beta2, adamEps, wd, stepInt, wkN);
+						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wkN);
 						const int wvN = static_cast<int>(gb.Wv.size());
-						gpu::scale_array(gb.gWv.data(), invBatch, wvN);
 						gpu::adam_update(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(),
-						    lr, beta1, beta2, adamEps, wd, stepInt, wvN);
+						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, wvN);
 						const int woN = static_cast<int>(gb.Wo.size());
-						gpu::scale_array(gb.gWo.data(), invBatch, woN);
 						gpu::adam_update(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(),
-						    lr, beta1, beta2, adamEps, wd, stepInt, woN);
+						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, woN);
 						const int w1N = static_cast<int>(gb.W1.size());
-						gpu::scale_array(gb.gW1.data(), invBatch, w1N);
 						gpu::adam_update(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(),
-						    lr, beta1, beta2, adamEps, wd, stepInt, w1N);
+						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, w1N);
 						const int w2N = static_cast<int>(gb.W2.size());
-						gpu::scale_array(gb.gW2.data(), invBatch, w2N);
 						gpu::adam_update(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(),
-						    lr, beta1, beta2, adamEps, wd, stepInt, w2N);
+						    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, w2N);
 
 						// Biases (no weight decay).
 						const int bqN = static_cast<int>(gb.bq.size());
-						gpu::scale_array(gb.gBq.data(), invBatch, bqN);
 						gpu::adam_update(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, bqN);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bqN);
 						const int bkN = static_cast<int>(gb.bk.size());
-						gpu::scale_array(gb.gBk.data(), invBatch, bkN);
 						gpu::adam_update(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, bkN);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bkN);
 						const int bvN = static_cast<int>(gb.bv.size());
-						gpu::scale_array(gb.gBv.data(), invBatch, bvN);
 						gpu::adam_update(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, bvN);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, bvN);
 						const int boN = static_cast<int>(gb.bo.size());
-						gpu::scale_array(gb.gBo.data(), invBatch, boN);
 						gpu::adam_update(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, boN);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, boN);
 						const int b1N = static_cast<int>(gb.b1.size());
-						gpu::scale_array(gb.gB1.data(), invBatch, b1N);
 						gpu::adam_update(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, b1N);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, b1N);
 						const int b2N = static_cast<int>(gb.b2.size());
-						gpu::scale_array(gb.gB2.data(), invBatch, b2N);
 						gpu::adam_update(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, b2N);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, b2N);
 
 						// LN params (no weight decay).
 						const int lgN = static_cast<int>(gb.ln1Gamma.size());
-						gpu::scale_array(gb.gLn1Gamma.data(), invBatch, lgN);
 						gpu::adam_update(gb.ln1Gamma.data(), gb.gLn1Gamma.data(),
 						    gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lgN);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lgN);
 						const int lbN = static_cast<int>(gb.ln1Beta.size());
-						gpu::scale_array(gb.gLn1Beta.data(), invBatch, lbN);
 						gpu::adam_update(gb.ln1Beta.data(), gb.gLn1Beta.data(),
 						    gb.mLn1Beta.data(), gb.v2Ln1Beta.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lbN);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lbN);
 						const int lg2N = static_cast<int>(gb.ln2Gamma.size());
-						gpu::scale_array(gb.gLn2Gamma.data(), invBatch, lg2N);
 						gpu::adam_update(gb.ln2Gamma.data(), gb.gLn2Gamma.data(),
 						    gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lg2N);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lg2N);
 						const int lb2N = static_cast<int>(gb.ln2Beta.size());
-						gpu::scale_array(gb.gLn2Beta.data(), invBatch, lb2N);
 						gpu::adam_update(gb.ln2Beta.data(), gb.gLn2Beta.data(),
 						    gb.mLn2Beta.data(), gb.v2Ln2Beta.data(),
-						    lr, beta1, beta2, adamEps, 0.0f, stepInt, lb2N);
+						    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, lb2N);
 					}
 
 					// Output projection (non-tokenLM only).
@@ -2628,22 +2604,20 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						const int woN = static_cast<int>(gpuTransformerWeights->WOut.size());
 						if (woN > 0)
 						{
-							gpu::scale_array(gpuTransformerWeights->gWOut.data(), invBatch, woN);
 							gpu::adam_update(gpuTransformerWeights->WOut.data(),
 							    gpuTransformerWeights->gWOut.data(),
 							    gpuTransformerWeights->vWOut.data(),
 							    gpuTransformerWeights->v2WOut.data(),
-							    lr, beta1, beta2, adamEps, wd, stepInt, woN);
+							    lr, beta1, beta2, adamEps, wd, invBatch, stepInt, woN);
 						}
 						const int boN = static_cast<int>(gpuTransformerWeights->bOut.size());
 						if (boN > 0)
 						{
-							gpu::scale_array(gpuTransformerWeights->gBOut.data(), invBatch, boN);
 							gpu::adam_update(gpuTransformerWeights->bOut.data(),
 							    gpuTransformerWeights->gBOut.data(),
 							    gpuTransformerWeights->mBOut.data(),
 							    gpuTransformerWeights->v2BOut.data(),
-							    lr, beta1, beta2, adamEps, 0.0f, stepInt, boN);
+							    lr, beta1, beta2, adamEps, 0.0f, invBatch, stepInt, boN);
 						}
 					}
 
