@@ -2689,6 +2689,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 	for (unsigned int si = 0; si < seqCount; ++si)
 	{
+		if (!running)
+			break;
+
 		const unsigned int s = seqOrder[si];
 		const unsigned int T = isTrain ? di->getTrainSequenceLength(s) : di->getTestSequenceLength(s);
 		if (T == 0u)

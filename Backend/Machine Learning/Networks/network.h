@@ -372,7 +372,7 @@ private:
 	shmea::GLogger* loggerOverride;
 	glades::NaiveBayes bModel;
 
-	bool running;
+	volatile bool running;
 	int netType;
 	int epochs;
 	bool saveInstance;

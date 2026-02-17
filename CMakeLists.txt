@@ -36,16 +36,39 @@ if(GLADES_ENABLE_CUDA)
 	include(${CMAKE_SOURCE_DIR}/cmake/CudaGlibcCompat.cmake)
 	cuda_glibc_compat_apply()
 
-	# CUDA 12.x supports up to GCC 14.  When the system default (e.g. GCC 15)
-	# is too new, tell nvcc to use gcc-14/g++-14 as the host compiler.
+	# When the system default g++ is too new for nvcc, find an older one.
 	# The ccbin flag must be visible during CMake's compiler-identification
 	# step (NVCC_PREPEND_FLAGS, appended AFTER cuda_glibc_compat_apply) and
 	# during the actual build (CMAKE_CUDA_FLAGS).
-	find_program(_GCC14 g++-14 PATHS /usr/bin NO_DEFAULT_PATH)
-	if(_GCC14)
-		set(CMAKE_CUDA_HOST_COMPILER "${_GCC14}" CACHE FILEPATH "CUDA host compiler")
-		set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -ccbin ${_GCC14}")
-		set(ENV{NVCC_PREPEND_FLAGS} "$ENV{NVCC_PREPEND_FLAGS} -ccbin ${_GCC14}")
+	#
+	# Detect the default g++ major version so we only try *older* ones
+	# (the default is already tried by nvcc automatically).
+	execute_process(COMMAND g++ -dumpversion
+		OUTPUT_VARIABLE _DEFAULT_GXX_VER OUTPUT_STRIP_TRAILING_WHITESPACE
+		ERROR_QUIET RESULT_VARIABLE _GXX_RC)
+	if(_GXX_RC EQUAL 0)
+		string(REGEX MATCH "^[0-9]+" _DEFAULT_GXX_MAJOR "${_DEFAULT_GXX_VER}")
+	else()
+		set(_DEFAULT_GXX_MAJOR "0")
+	endif()
+
+	set(_CUDA_HOST_CXX "")
+	foreach(_ver 14 13 12 11)
+		if("${_ver}" STREQUAL "${_DEFAULT_GXX_MAJOR}")
+			continue()   # same as default — nvcc already tries it
+		endif()
+		find_program(_GCC_CANDIDATE g++-${_ver} PATHS /usr/bin NO_DEFAULT_PATH)
+		if(_GCC_CANDIDATE)
+			set(_CUDA_HOST_CXX "${_GCC_CANDIDATE}")
+			break()
+		endif()
+		unset(_GCC_CANDIDATE CACHE)
+	endforeach()
+	if(_CUDA_HOST_CXX)
+		message(STATUS "Using CUDA host compiler: ${_CUDA_HOST_CXX}")
+		set(CMAKE_CUDA_HOST_COMPILER "${_CUDA_HOST_CXX}" CACHE FILEPATH "CUDA host compiler")
+		set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -ccbin ${_CUDA_HOST_CXX}")
+		set(ENV{NVCC_PREPEND_FLAGS} "$ENV{NVCC_PREPEND_FLAGS} -ccbin ${_CUDA_HOST_CXX}")
 	endif()
 
 	enable_language(CUDA)

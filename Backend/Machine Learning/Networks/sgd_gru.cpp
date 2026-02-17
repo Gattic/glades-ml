@@ -203,7 +203,7 @@ void glades::NNetwork::SGDHelper_GRU(unsigned int inputRowCounter, int runType)
 		float& lastGradNorm;
 		float& lastGradNormScale;
 		NNetworkStatus& lastStatus;
-		bool& running;
+		volatile bool& running;
 		TensorGatedState& tensorGru;
 		int H;
 		unsigned int outSize;

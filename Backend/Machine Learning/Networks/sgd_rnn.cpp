@@ -202,7 +202,7 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		float& lastGradNorm;
 		float& lastGradNormScale;
 		NNetworkStatus& lastStatus;
-		bool& running;
+		volatile bool& running;
 		TensorRNNState& tensorRnn;
 		int H;
 		unsigned int outSize;
