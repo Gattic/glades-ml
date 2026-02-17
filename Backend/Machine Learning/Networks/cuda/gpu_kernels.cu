@@ -961,6 +961,7 @@ bool embedding_gather(const float* E, const int* tokenIds,
                       int T, int vocabSize, int dModel, float* out)
 {
 	if (T <= 0 || dModel <= 0) return true;
+
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
 	embedding_gather_kernel<<<grid, kBlockElem>>>(E, tokenIds, T, vocabSize, dModel, out);

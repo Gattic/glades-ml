@@ -136,6 +136,20 @@ void synchronize()
 		cudaDeviceSynchronize();
 }
 
+bool synchronizeCheck(const char* phase)
+{
+	if (!g_state.available)
+		return true;
+	cudaError_t err = cudaDeviceSynchronize();
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "[glades-cuda] ERROR at '%s': %s\n",
+		        phase ? phase : "?", cudaGetErrorString(err));
+		return false;
+	}
+	return true;
+}
+
 void resetDevice()
 {
 	if (g_state.available)

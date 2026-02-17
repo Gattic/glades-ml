@@ -1750,7 +1750,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					gpuTransformerScratch->x.upload(&xHost[0], xHost.size());
 
 					// Input projection: h = x * WIn^T + bIn
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
 					                     1.0f,
 					                     gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
 					                     gpuTransformerWeights->WIn.data(), static_cast<int>(inputSize),
@@ -1807,19 +1807,19 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
 					float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
 
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
 					                     1.0f, x1_l, static_cast<int>(dModel),
 					                     gb.Wq.data(), static_cast<int>(dModel),
 					                     0.0f, Q_l, static_cast<int>(dModel));
 					gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
 
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
 					                     1.0f, x1_l, static_cast<int>(dModel),
 					                     gb.Wk.data(), static_cast<int>(dModel),
 					                     0.0f, K_l, static_cast<int>(dModelKV));
 					gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
 
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
 					                     1.0f, x1_l, static_cast<int>(dModel),
 					                     gb.Wv.data(), static_cast<int>(dModel),
 					                     0.0f, V_l, static_cast<int>(dModelKV));
@@ -1897,7 +1897,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 					// Wo projection
 					float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
 					                     1.0f, attnConcat_l, static_cast<int>(dModel),
 					                     gb.Wo.data(), static_cast<int>(dModel),
 					                     0.0f, attnOut_l, static_cast<int>(dModel));
@@ -1932,7 +1932,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					float* ffOut_l = gpuTransformerScratch->ffOut.data() + static_cast<size_t>(li) * T * dModel;
 
 					// FF1: x2 * W1^T + b1
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
 					                     1.0f, x2_l, static_cast<int>(dModel),
 					                     gb.W1.data(), static_cast<int>(dModel),
 					                     0.0f, ff1_l, static_cast<int>(ff1Width));
@@ -1953,7 +1953,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					}
 
 					// FF2: ffAct * W2^T + b2
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
 					                     1.0f, ff1Act_l, static_cast<int>(dFF),
 					                     gb.W2.data(), static_cast<int>(dFF),
 					                     0.0f, ffOut_l, static_cast<int>(dModel));
@@ -1970,7 +1970,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (tokenLM && tieEmb)
 				{
 					// logits = finalH * E^T + lmBias
-					gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
+					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
 					                     1.0f, finalH, static_cast<int>(dModel),
 					                     gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
 					                     0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize));
@@ -2310,7 +2310,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 							// 2. softmax backward: dS = P * (dP - row_sum(dP * P))
 							gpu::softmax_backward_attn(P_group, dS,
-							    static_cast<int>(groupSize) * static_cast<int>(T),
+							    static_cast<int>(groupSize),
 							    static_cast<int>(T), dS);
 
 							// Scale dS by invSqrt for the Q*K^T scaling

@@ -2473,6 +2473,7 @@ bool glades::NNetwork::ensureGpuState()
 		const unsigned int dModelKV = ts.nKVHeads * dHead;
 		const unsigned int ff1Width = (ts.ffnKind == 1) ? (2u * ts.dFF) : ts.dFF;
 
+
 		// Allocate weights
 		if (!gpuTransformerWeights)
 			gpuTransformerWeights = new gpu::GpuTransformerWeights();

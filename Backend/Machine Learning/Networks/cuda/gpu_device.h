@@ -32,6 +32,10 @@ int maxThreadsPerBlock();
 // Synchronize the current device (blocks until all kernels complete).
 void synchronize();
 
+// Synchronize and check for errors.  Returns true on success.
+// On failure, prints the phase label and CUDA error string to stderr.
+bool synchronizeCheck(const char* phase);
+
 // Reset/release the current device (called at shutdown).
 void resetDevice();
 
@@ -53,6 +57,7 @@ inline size_t totalGlobalMemBytes() { return 0; }
 inline int multiprocessorCount() { return 0; }
 inline int maxThreadsPerBlock() { return 0; }
 inline void synchronize() {}
+inline bool synchronizeCheck(const char*) { return true; }
 inline void resetDevice() {}
 
 } // namespace gpu
