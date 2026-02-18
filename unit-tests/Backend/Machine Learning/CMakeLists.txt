@@ -21,5 +21,7 @@ ddp-test.cpp
 transformer-improvements-test.cpp
 gpu-training-test.cpp
 cnn-test.cpp
+garch-test.cpp
+egarch-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})

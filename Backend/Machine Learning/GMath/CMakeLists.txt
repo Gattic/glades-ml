@@ -1,6 +1,10 @@
 set(GMath_src_files
 	kmeans.cpp
 	pca.cpp
+	garch.cpp
+	garch.h
+	egarch.cpp
+	egarch.h
 	cmatrix.cpp
 	cmatrix.h
 	OHE.cpp

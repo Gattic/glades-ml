@@ -33,6 +33,8 @@
 #include "Backend/Machine Learning/transformer-improvements-test.h"
 #include "Backend/Machine Learning/gpu-training-test.h"
 #include "Backend/Machine Learning/cnn-test.h"
+#include "Backend/Machine Learning/garch-test.h"
+#include "Backend/Machine Learning/egarch-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -54,6 +56,8 @@ int main(int argc, char* argv[])
 	    MappedDatasetUnitTest();
 	    NNMixedPrecisionUnitTest();
 	    DDPUnitTest();
+	    GARCHUnitTest();
+	    EGARCHUnitTest();
 	}
 	else if (argc > 1)
 	{
@@ -99,6 +103,10 @@ int main(int argc, char* argv[])
 		NNCNNUnitTest();
 	    else if (strcmp(argv[1], "cnn-mnist") == 0)
 		NNCNNMNISTUnitTest();
+	    else if (strcmp(argv[1], "garch") == 0)
+		GARCHUnitTest();
+	    else if (strcmp(argv[1], "egarch") == 0)
+		EGARCHUnitTest();
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
 	        OHEUnitTest();
