@@ -906,7 +906,8 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 		const bool hasGru = (netType == TYPE_GRU) && tensorGru.initialized;
 		const bool hasLstm = (netType == TYPE_LSTM) && tensorLstm.initialized;
 		const bool hasTr = (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && tensorTransformer.initialized;
-		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr)
+		const bool hasCnn = (netType == TYPE_CNN) && tensorCnn.initialized;
+		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr && !hasCnn)
 		{
 			// If caller provided an external DataInput (e.g. after test() detached the
 			// internal pointer via RunDataAttachmentGuard), temporarily attach it so

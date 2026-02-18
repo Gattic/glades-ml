@@ -78,7 +78,7 @@ public:
 	    featureCount = 0;
 	    rowCacheOrder.clear();
 	    rowCache.clear();
-	    rowCacheMaxEntries = 64;
+	    rowCacheMaxEntries = 4096;
 	}
 
 	virtual ~ImageInput()

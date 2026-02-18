@@ -98,6 +98,8 @@ glades::NNetwork::NNetwork(int newNetType)
 	gpuRnnWeights = NULL;
 	gpuGruWeights = NULL;
 	gpuLstmWeights = NULL;
+	gpuCnnWeights = NULL;
+	gpuCnnScratch = NULL;
 	gpuStateReady = false;
 	clean();
 	netType = newNetType;
@@ -142,6 +144,8 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	gpuRnnWeights = NULL;
 	gpuGruWeights = NULL;
 	gpuLstmWeights = NULL;
+	gpuCnnWeights = NULL;
+	gpuCnnScratch = NULL;
 	gpuStateReady = false;
 	clean();
 
@@ -854,6 +858,9 @@ glades::NNetworkStatus glades::NNetwork::SGDHelper(unsigned int inputRowCounter,
 			return lastStatus;
 		SGDHelper_TRANSFORMER(inputRowCounter, runType);
 		return lastStatus;
+	case TYPE_CNN:
+		SGDHelper_CNN(inputRowCounter, runType);
+		return lastStatus;
 	default:
 		return failStatus(NNetworkStatus::INVALID_ARGUMENT, "NNetwork::SGDHelper: unknown netType");
 	}
@@ -990,6 +997,7 @@ void glades::NNetwork::clean()
 	tensorGru.reset();
 	tensorLstm.reset();
 	tensorTransformer.reset();
+	tensorCnn.reset();
 	transformerPosEncCache.reset();
 	freeGpuState();
 
@@ -1557,6 +1565,199 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		return true;
 	}
 
+	// === CNN ===
+	if (netType == TYPE_CNN)
+	{
+		if (tensorCnn.initialized)
+			return true;
+
+		const CNNConfig& cfg = trainingConfig.cnn;
+		if (cfg.inputH == 0u || cfg.inputW == 0u || cfg.inputC == 0u)
+		{
+			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: CNN requires inputH/inputW/inputC > 0 in trainingConfig.cnn");
+			return false;
+		}
+		if (static_cast<size_t>(cfg.inputH) * cfg.inputW * cfg.inputC != static_cast<size_t>(inputSize))
+		{
+			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: CNN inputH*inputW*inputC != featureCount");
+			return false;
+		}
+		if (cfg.convLayers.empty())
+		{
+			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: CNN requires >= 1 conv layer");
+			return false;
+		}
+
+		tensorCnn.reset();
+		tensorCnn.inputH = cfg.inputH;
+		tensorCnn.inputW = cfg.inputW;
+		tensorCnn.inputC = cfg.inputC;
+
+		// Kaiming (He) initialization for conv layers.
+		struct InitKaiming
+		{
+			static void run(glades::rng::Engine& eng, std::vector<float>& W, unsigned int fanIn)
+			{
+				if (fanIn == 0u || W.empty())
+					return;
+				const double stddev = sqrt(2.0 / static_cast<double>(fanIn));
+				for (size_t i = 0; i < W.size(); ++i)
+				{
+					// Box-Muller for normal distribution.
+					const double u1 = glades::rng::uniform_double(eng, 1e-7, 1.0);
+					const double u2 = glades::rng::uniform_double(eng, 0.0, 6.283185307179586);
+					const double z = sqrt(-2.0 * log(u1)) * cos(u2);
+					W[i] = static_cast<float>(z * stddev);
+				}
+			}
+		};
+
+		// Build spatial info and conv layers.
+		unsigned int curH = cfg.inputH;
+		unsigned int curW = cfg.inputW;
+		unsigned int curC = cfg.inputC;
+
+		tensorCnn.spatialInfo.resize(cfg.convLayers.size());
+		tensorCnn.convLayers.resize(cfg.convLayers.size());
+
+		for (size_t l = 0; l < cfg.convLayers.size(); ++l)
+		{
+			const CNNConfig::ConvLayerSpec& spec = cfg.convLayers[l];
+			TensorCNNState::ConvSpatialInfo& sp = tensorCnn.spatialInfo[l];
+			TensorCNNState::ConvLayer& cl = tensorCnn.convLayers[l];
+
+			sp.inH = curH; sp.inW = curW; sp.inC = curC;
+			sp.kH = spec.kernelH; sp.kW = spec.kernelW;
+			sp.strideH = spec.strideH; sp.strideW = spec.strideW;
+			sp.padH = spec.padH; sp.padW = spec.padW;
+			sp.useBatchNorm = spec.useBatchNorm;
+			sp.useMaxPool = spec.useMaxPool;
+			sp.poolH = spec.poolH; sp.poolW = spec.poolW;
+			sp.poolStrideH = spec.poolStrideH; sp.poolStrideW = spec.poolStrideW;
+
+			sp.outH = (curH + 2u * spec.padH - spec.kernelH) / spec.strideH + 1u;
+			sp.outW = (curW + 2u * spec.padW - spec.kernelW) / spec.strideW + 1u;
+			sp.outC = spec.outChannels;
+
+			if (sp.outH == 0u || sp.outW == 0u)
+			{
+				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: CNN conv layer produces 0-dim output");
+				tensorCnn.reset();
+				return false;
+			}
+
+			sp.im2colRows = sp.outH * sp.outW;
+			sp.im2colCols = curC * spec.kernelH * spec.kernelW;
+
+			if (spec.useMaxPool)
+			{
+				sp.poolOutH = (sp.outH - spec.poolH) / spec.poolStrideH + 1u;
+				sp.poolOutW = (sp.outW - spec.poolW) / spec.poolStrideW + 1u;
+				if (sp.poolOutH == 0u || sp.poolOutW == 0u)
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: CNN pool produces 0-dim output");
+					tensorCnn.reset();
+					return false;
+				}
+			}
+			else
+			{
+				sp.poolOutH = sp.outH;
+				sp.poolOutW = sp.outW;
+			}
+
+			// Allocate conv weights.
+			cl.outC = spec.outChannels;
+			cl.inC = curC;
+			cl.kH = spec.kernelH;
+			cl.kW = spec.kernelW;
+
+			const size_t K = static_cast<size_t>(curC) * spec.kernelH * spec.kernelW;
+			const size_t wSize = static_cast<size_t>(spec.outChannels) * K;
+			cl.W.assign(wSize, 0.0f);
+			cl.bias.assign(spec.outChannels, 0.0f);
+			cl.gW.assign(wSize, 0.0f);
+			cl.gBias.assign(spec.outChannels, 0.0f);
+			cl.vW.assign(wSize, 0.0f);
+			cl.v2W.assign(wSize, 0.0f);
+			cl.vBias.assign(spec.outChannels, 0.0f);
+			cl.v2Bias.assign(spec.outChannels, 0.0f);
+
+			// Kaiming init.
+			InitKaiming::run(rngEngine, cl.W, static_cast<unsigned int>(K));
+
+			// BatchNorm parameters.
+			if (spec.useBatchNorm)
+			{
+				cl.bnGamma.assign(spec.outChannels, 1.0f);
+				cl.bnBeta.assign(spec.outChannels, 0.0f);
+				cl.bnRunMean.assign(spec.outChannels, 0.0f);
+				cl.bnRunVar.assign(spec.outChannels, 1.0f);
+				cl.gBnGamma.assign(spec.outChannels, 0.0f);
+				cl.gBnBeta.assign(spec.outChannels, 0.0f);
+				cl.vBnGamma.assign(spec.outChannels, 0.0f);
+				cl.v2BnGamma.assign(spec.outChannels, 0.0f);
+				cl.vBnBeta.assign(spec.outChannels, 0.0f);
+				cl.v2BnBeta.assign(spec.outChannels, 0.0f);
+			}
+
+			// Advance spatial dims for next layer.
+			curH = sp.poolOutH;
+			curW = sp.poolOutW;
+			curC = spec.outChannels;
+		}
+
+		// Flattened size.
+		tensorCnn.flattenedSize = curC * curH * curW;
+		if (tensorCnn.flattenedSize == 0u)
+		{
+			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: CNN flattened size is 0");
+			tensorCnn.reset();
+			return false;
+		}
+
+		// FC layers: NNInfo hidden layers define FC layers; output layer is the final.
+		std::vector<unsigned int> fcSizes;
+		fcSizes.push_back(tensorCnn.flattenedSize);
+		for (int l = 0; l < H; ++l)
+		{
+			const int hs = skeleton->getHiddenLayerSize(static_cast<unsigned int>(l));
+			if (hs <= 0)
+			{
+				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: CNN FC hidden layer size <= 0");
+				tensorCnn.reset();
+				return false;
+			}
+			fcSizes.push_back(static_cast<unsigned int>(hs));
+		}
+		fcSizes.push_back(outSize);
+
+		const unsigned int numFC = static_cast<unsigned int>(fcSizes.size() - 1u);
+		tensorCnn.fcLayers.resize(numFC);
+		for (unsigned int t = 0; t < numFC; ++t)
+		{
+			TensorCNNState::FCTransition& fc = tensorCnn.fcLayers[t];
+			fc.in = fcSizes[t];
+			fc.out = fcSizes[t + 1u];
+			const size_t wSize = static_cast<size_t>(fc.out) * fc.in;
+			fc.W.assign(wSize, 0.0f);
+			fc.bias.assign(fc.out, 0.0f);
+			fc.gW.assign(wSize, 0.0f);
+			fc.gBias.assign(fc.out, 0.0f);
+			fc.vW.assign(wSize, 0.0f);
+			fc.v2W.assign(wSize, 0.0f);
+			fc.vBias.assign(fc.out, 0.0f);
+			fc.v2Bias.assign(fc.out, 0.0f);
+
+			InitGlorot::run(rngEngine, fc.W, fc.in, fc.out);
+		}
+
+		tensorCnn.batchCount = 0u;
+		tensorCnn.optimizerStep = 0ULL;
+		tensorCnn.initialized = true;
+		return true;
+	}
+
 	lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "ensureTensorParametersInitialized: unknown netType");
 	return false;
 }
@@ -1714,7 +1915,8 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 		const bool hasGru = (netType == TYPE_GRU) && tensorGru.initialized;
 		const bool hasLstm = (netType == TYPE_LSTM) && tensorLstm.initialized;
 		const bool hasTr = (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && tensorTransformer.initialized;
-		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr)
+		const bool hasCnn = (netType == TYPE_CNN) && tensorCnn.initialized;
+		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr && !hasCnn)
 		{
 			if (!const_cast<glades::NNetwork*>(this)->ensureTensorParametersInitialized())
 				return lastStatus;
@@ -1890,6 +2092,65 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 			if (!write_vec_f32(out, b.b2)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer b2)");
 		}
 
+		out.flush();
+		out.close();
+		if (!out || ::rename(tmpPath.c_str(), filePath.c_str()) != 0)
+		{
+			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: failed to publish file (rename failed)");
+		}
+		tmpGuard.dismiss();
+		return NNetworkStatus(NNetworkStatus::OK, std::string());
+	}
+
+	if (netType == TYPE_CNN)
+	{
+		const TensorCNNState& cs = tensorCnn;
+		write_u32_le(out, static_cast<unsigned int>(cs.convLayers.size()));
+		write_u32_le(out, static_cast<unsigned int>(cs.fcLayers.size()));
+		write_u32_le(out, cs.inputH);
+		write_u32_le(out, cs.inputW);
+		write_u32_le(out, cs.inputC);
+		write_u32_le(out, cs.flattenedSize);
+		for (size_t l = 0; l < cs.convLayers.size(); ++l)
+		{
+			const TensorCNNState::ConvLayer& cl = cs.convLayers[l];
+			const TensorCNNState::ConvSpatialInfo& sp = cs.spatialInfo[l];
+			write_u32_le(out, cl.inC);
+			write_u32_le(out, cl.outC);
+			write_u32_le(out, cl.kH);
+			write_u32_le(out, cl.kW);
+			// Spatial config needed to reconstruct spatial info on load.
+			write_u32_le(out, sp.strideH);
+			write_u32_le(out, sp.strideW);
+			write_u32_le(out, sp.padH);
+			write_u32_le(out, sp.padW);
+			write_u32_le(out, sp.useBatchNorm ? 1u : 0u);
+			write_u32_le(out, sp.useMaxPool ? 1u : 0u);
+			write_u32_le(out, sp.poolH);
+			write_u32_le(out, sp.poolW);
+			write_u32_le(out, sp.poolStrideH);
+			write_u32_le(out, sp.poolStrideW);
+			write_u32_le(out, sp.outH);
+			write_u32_le(out, sp.outW);
+			write_u32_le(out, sp.poolOutH);
+			write_u32_le(out, sp.poolOutW);
+			write_u32_le(out, sp.im2colRows);
+			write_u32_le(out, sp.im2colCols);
+			if (!write_vec_f32(out, cl.W)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN conv W)");
+			if (!write_vec_f32(out, cl.bias)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN conv bias)");
+			if (!write_vec_f32(out, cl.bnGamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN bnGamma)");
+			if (!write_vec_f32(out, cl.bnBeta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN bnBeta)");
+			if (!write_vec_f32(out, cl.bnRunMean)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN bnRunMean)");
+			if (!write_vec_f32(out, cl.bnRunVar)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN bnRunVar)");
+		}
+		for (size_t t = 0; t < cs.fcLayers.size(); ++t)
+		{
+			const TensorCNNState::FCTransition& fc = cs.fcLayers[t];
+			write_u32_le(out, fc.in);
+			write_u32_le(out, fc.out);
+			if (!write_vec_f32(out, fc.W)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN FC W)");
+			if (!write_vec_f32(out, fc.bias)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (CNN FC bias)");
+		}
 		out.flush();
 		out.close();
 		if (!out || ::rename(tmpPath.c_str(), filePath.c_str()) != 0)
@@ -2375,6 +2636,143 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 	}
 
+	if (netType == TYPE_CNN)
+	{
+		unsigned int numConvLayers = 0u, numFCLayers = 0u;
+		unsigned int loadInputH = 0u, loadInputW = 0u, loadInputC = 0u, loadFlattenedSize = 0u;
+		if (!read_u32_le(in, numConvLayers))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing cnn.numConvLayers");
+		if (!read_u32_le(in, numFCLayers))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing cnn.numFCLayers");
+		if (!read_u32_le(in, loadInputH))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing cnn.inputH");
+		if (!read_u32_le(in, loadInputW))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing cnn.inputW");
+		if (!read_u32_le(in, loadInputC))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing cnn.inputC");
+		if (!read_u32_le(in, loadFlattenedSize))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing cnn.flattenedSize");
+
+		tensorCnn.reset();
+		tensorCnn.inputH = loadInputH;
+		tensorCnn.inputW = loadInputW;
+		tensorCnn.inputC = loadInputC;
+		tensorCnn.flattenedSize = loadFlattenedSize;
+		tensorCnn.convLayers.resize(numConvLayers);
+		tensorCnn.spatialInfo.resize(numConvLayers);
+
+		for (size_t l = 0; l < numConvLayers; ++l)
+		{
+			unsigned int inC = 0u, outC = 0u, kH = 0u, kW = 0u;
+			if (!read_u32_le(in, inC) || !read_u32_le(in, outC) || !read_u32_le(in, kH) || !read_u32_le(in, kW))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn conv header");
+
+			TensorCNNState::ConvLayer& cl = tensorCnn.convLayers[l];
+			cl.inC = inC; cl.outC = outC; cl.kH = kH; cl.kW = kW;
+
+			// Read spatial config.
+			TensorCNNState::ConvSpatialInfo& sp = tensorCnn.spatialInfo[l];
+			sp.inC = inC; sp.outC = outC; sp.kH = kH; sp.kW = kW;
+			// Reconstruct inH/inW from previous layer or from global input.
+			if (l == 0u)
+			{
+				sp.inH = loadInputH;
+				sp.inW = loadInputW;
+			}
+			else
+			{
+				const TensorCNNState::ConvSpatialInfo& prev = tensorCnn.spatialInfo[l - 1u];
+				sp.inH = prev.poolOutH;
+				sp.inW = prev.poolOutW;
+			}
+			unsigned int tmp = 0u;
+			if (!read_u32_le(in, sp.strideH) || !read_u32_le(in, sp.strideW))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial stride");
+			if (!read_u32_le(in, sp.padH) || !read_u32_le(in, sp.padW))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial pad");
+			if (!read_u32_le(in, tmp)) return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial useBN");
+			sp.useBatchNorm = (tmp != 0u);
+			if (!read_u32_le(in, tmp)) return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial usePool");
+			sp.useMaxPool = (tmp != 0u);
+			if (!read_u32_le(in, sp.poolH) || !read_u32_le(in, sp.poolW))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial pool size");
+			if (!read_u32_le(in, sp.poolStrideH) || !read_u32_le(in, sp.poolStrideW))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial pool stride");
+			if (!read_u32_le(in, sp.outH) || !read_u32_le(in, sp.outW))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial outH/W");
+			if (!read_u32_le(in, sp.poolOutH) || !read_u32_le(in, sp.poolOutW))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial poolOutH/W");
+			if (!read_u32_le(in, sp.im2colRows) || !read_u32_le(in, sp.im2colCols))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn spatial im2col");
+
+			{
+				size_t want = 0u;
+				if (!mul_size_checked(static_cast<size_t>(outC), static_cast<size_t>(inC) * kH * kW, want))
+					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: CNN conv W size overflow");
+				if (!read_vec_f32_exact(in, cl.W, want))
+					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN conv W");
+			}
+			if (!read_vec_f32_exact(in, cl.bias, static_cast<size_t>(outC)))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN conv bias");
+
+			// BN params: read_vec_f32 reads the u64 count + data (may be 0-length if no BN).
+			if (!read_vec_f32(in, cl.bnGamma))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN bnGamma");
+			if (!read_vec_f32(in, cl.bnBeta))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN bnBeta");
+			if (!read_vec_f32(in, cl.bnRunMean))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN bnRunMean");
+			if (!read_vec_f32(in, cl.bnRunVar))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN bnRunVar");
+
+			// Reset optimizer/grads.
+			cl.gW.assign(cl.W.size(), 0.0f);
+			cl.gBias.assign(cl.bias.size(), 0.0f);
+			cl.vW.assign(cl.W.size(), 0.0f);
+			cl.v2W.assign(cl.W.size(), 0.0f);
+			cl.vBias.assign(cl.bias.size(), 0.0f);
+			cl.v2Bias.assign(cl.bias.size(), 0.0f);
+			cl.gBnGamma.assign(cl.bnGamma.size(), 0.0f);
+			cl.gBnBeta.assign(cl.bnBeta.size(), 0.0f);
+			cl.vBnGamma.assign(cl.bnGamma.size(), 0.0f);
+			cl.v2BnGamma.assign(cl.bnGamma.size(), 0.0f);
+			cl.vBnBeta.assign(cl.bnBeta.size(), 0.0f);
+			cl.v2BnBeta.assign(cl.bnBeta.size(), 0.0f);
+		}
+
+		tensorCnn.fcLayers.resize(numFCLayers);
+		for (size_t t = 0; t < numFCLayers; ++t)
+		{
+			unsigned int fcIn = 0u, fcOut = 0u;
+			if (!read_u32_le(in, fcIn) || !read_u32_le(in, fcOut))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: malformed cnn FC header");
+
+			TensorCNNState::FCTransition& fc = tensorCnn.fcLayers[t];
+			fc.in = fcIn; fc.out = fcOut;
+			{
+				size_t want = 0u;
+				if (!mul_size_checked(static_cast<size_t>(fcOut), static_cast<size_t>(fcIn), want))
+					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: CNN FC W size overflow");
+				if (!read_vec_f32_exact(in, fc.W, want))
+					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN FC W");
+			}
+			if (!read_vec_f32_exact(in, fc.bias, static_cast<size_t>(fcOut)))
+				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read CNN FC bias");
+
+			fc.gW.assign(fc.W.size(), 0.0f);
+			fc.gBias.assign(fc.bias.size(), 0.0f);
+			fc.vW.assign(fc.W.size(), 0.0f);
+			fc.v2W.assign(fc.W.size(), 0.0f);
+			fc.vBias.assign(fc.bias.size(), 0.0f);
+			fc.v2Bias.assign(fc.bias.size(), 0.0f);
+		}
+
+		tensorCnn.batchCount = 0u;
+		tensorCnn.optimizerStep = 0ULL;
+		tensorCnn.initialized = true;
+		return NNetworkStatus(NNetworkStatus::OK, std::string());
+	}
+
 	return failStatus(NNetworkStatus::INVALID_ARGUMENT, "loadTensorWeightsFromFile: unknown netType");
 }
 
@@ -2633,6 +3031,16 @@ void glades::NNetwork::freeGpuState()
 	{
 		delete gpuLstmWeights;
 		gpuLstmWeights = NULL;
+	}
+	if (gpuCnnWeights)
+	{
+		delete gpuCnnWeights;
+		gpuCnnWeights = NULL;
+	}
+	if (gpuCnnScratch)
+	{
+		delete gpuCnnScratch;
+		gpuCnnScratch = NULL;
 	}
 #endif
 	gpuStateReady = false;

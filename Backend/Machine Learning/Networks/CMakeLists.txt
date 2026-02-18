@@ -12,6 +12,7 @@ set(Networks_src_files
 	sgd_rnn.cpp
 	sgd_gru.cpp
 	sgd_lstm.cpp
+	sgd_cnn.cpp
 	sgd_transformer.cpp
 	glades_thread_pool.cpp
 	transformer_infer.cpp

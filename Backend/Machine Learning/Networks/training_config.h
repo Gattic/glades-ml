@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <stdint.h> // uint64_t (C++98-friendly)
+#include <vector>
 
 namespace glades {
 
@@ -383,6 +384,51 @@ struct DDPConfig
 	              rank(0), worldSize(1), rootPort(9200) {}
 };
 
+// CNN-specific run configuration.
+//
+// Image dimensions (inputH * inputW * inputC) must equal the DataInput feature count.
+// NNInfo hidden layers define FC layers after flatten (same as DFF).
+// NNInfo output layer defines number of classes.
+struct CNNConfig
+{
+	unsigned int inputH, inputW, inputC; // image dimensions (NCHW)
+
+	struct ConvLayerSpec
+	{
+		unsigned int outChannels;   // filter count
+		unsigned int kernelH, kernelW;
+		unsigned int strideH, strideW;
+		unsigned int padH, padW;    // zero-padding
+		bool useBatchNorm;          // BN after conv
+		bool useMaxPool;            // pooling after activation
+		unsigned int poolH, poolW, poolStrideH, poolStrideW;
+
+		ConvLayerSpec()
+		    : outChannels(0u),
+		      kernelH(3u), kernelW(3u),
+		      strideH(1u), strideW(1u),
+		      padH(1u), padW(1u),
+		      useBatchNorm(false),
+		      useMaxPool(false),
+		      poolH(2u), poolW(2u),
+		      poolStrideH(2u), poolStrideW(2u)
+		{
+		}
+	};
+
+	std::vector<ConvLayerSpec> convLayers;
+	float batchNormEps;       // default 1e-5
+	float batchNormMomentum;  // default 0.1 (EMA for running stats)
+
+	CNNConfig()
+	    : inputH(0u), inputW(0u), inputC(0u),
+	      convLayers(),
+	      batchNormEps(1e-5f),
+	      batchNormMomentum(0.1f)
+	{
+	}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -445,6 +491,9 @@ struct TrainingConfig
 	// during backward instead of storing all per-layer intermediates.
 	bool gradientCheckpointing;
 
+	// CNN run config (used only for TYPE_CNN).
+	CNNConfig cnn;
+
 	TrainingConfig()
 	    : minibatchSizeOverride(0),
 	      tbpttWindowOverride(0),
@@ -457,7 +506,8 @@ struct TrainingConfig
 	      gpu(),
 	      warmup(),
 	      ddp(),
-	      gradientCheckpointing(false)
+	      gradientCheckpointing(false),
+	      cnn()
 	{
 	}
 };

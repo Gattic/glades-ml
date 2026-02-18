@@ -49,6 +49,7 @@
 #include "cuda/gpu_transformer_state.h"
 #include "cuda/gpu_dff_state.h"
 #include "cuda/gpu_rnn_state.h"
+#include "cuda/gpu_cnn_state.h"
 #endif
 
 // Concurrency primitives:
@@ -253,6 +254,157 @@ private:
 	// GRU: gateCount=3, LSTM: gateCount=4
 	TensorGatedState tensorGru;
 	TensorGatedState tensorLstm;
+
+	// === CNN packed parameters ===
+	//
+	// Convolutional layers followed by fully-connected (FC) layers.
+	// Data layout: channel-first (NCHW) throughout.
+	struct TensorCNNState
+	{
+		bool initialized;
+
+		// Image input dimensions.
+		unsigned int inputH, inputW, inputC;
+
+		// Precomputed spatial dimensions per conv layer.
+		struct ConvSpatialInfo
+		{
+			unsigned int inH, inW, inC;
+			unsigned int outH, outW, outC;
+			unsigned int kH, kW;
+			unsigned int strideH, strideW;
+			unsigned int padH, padW;
+			bool useBatchNorm;
+			bool useMaxPool;
+			unsigned int poolH, poolW, poolStrideH, poolStrideW;
+			unsigned int poolOutH, poolOutW;
+			// im2col matrix dims: rows = outH*outW, cols = inC*kH*kW
+			unsigned int im2colRows, im2colCols;
+		};
+
+		std::vector<ConvSpatialInfo> spatialInfo;
+
+		// Per-conv-layer weights.
+		struct ConvLayer
+		{
+			unsigned int outC, inC, kH, kW;
+			// W: [outC, inC*kH*kW] row-major
+			std::vector<float> W;
+			std::vector<float> bias; // [outC]
+			std::vector<float> gW;
+			std::vector<float> gBias;
+			// Momentum / Adam state
+			std::vector<float> vW;
+			std::vector<float> v2W;  // Adam second moment
+			std::vector<float> vBias;
+			std::vector<float> v2Bias;
+			// BatchNorm parameters (per channel)
+			std::vector<float> bnGamma;   // [outC]
+			std::vector<float> bnBeta;    // [outC]
+			std::vector<float> bnRunMean; // [outC] running EMA
+			std::vector<float> bnRunVar;  // [outC] running EMA
+			std::vector<float> gBnGamma;
+			std::vector<float> gBnBeta;
+			std::vector<float> vBnGamma;
+			std::vector<float> v2BnGamma;
+			std::vector<float> vBnBeta;
+			std::vector<float> v2BnBeta;
+
+			ConvLayer() : outC(0u), inC(0u), kH(0u), kW(0u) {}
+		};
+
+		std::vector<ConvLayer> convLayers;
+
+		// FC transition layers (identical layout to DFF Transition).
+		struct FCTransition
+		{
+			unsigned int in;
+			unsigned int out;
+			std::vector<float> W;    // [out, in]
+			std::vector<float> bias; // [out]
+			std::vector<float> gW;
+			std::vector<float> gBias;
+			std::vector<float> vW;
+			std::vector<float> v2W;
+			std::vector<float> vBias;
+			std::vector<float> v2Bias;
+
+			FCTransition() : in(0u), out(0u) {}
+		};
+
+		std::vector<FCTransition> fcLayers;
+
+		// Flattened feature size after last conv layer.
+		unsigned int flattenedSize;
+		// Optimizer step counter (for Adam bias correction).
+		unsigned long long optimizerStep;
+		// Minibatch accumulation count.
+		unsigned int batchCount;
+
+		TensorCNNState()
+		    : initialized(false),
+		      inputH(0u), inputW(0u), inputC(0u),
+		      flattenedSize(0u),
+		      optimizerStep(0ULL),
+		      batchCount(0u)
+		{
+		}
+
+		void reset()
+		{
+			initialized = false;
+			inputH = inputW = inputC = 0u;
+			flattenedSize = 0u;
+			optimizerStep = 0ULL;
+			batchCount = 0u;
+			spatialInfo.clear();
+			convLayers.clear();
+			fcLayers.clear();
+		}
+	};
+
+	// Scratch buffers for CNN forward/backward pass (reused per sample).
+	struct CNNScratch
+	{
+		// Per conv layer: post-conv output, im2col matrix, bn/pool intermediates
+		struct ConvLayerScratch
+		{
+			std::vector<float> im2col;    // [outH*outW, inC*kH*kW]
+			std::vector<float> convOut;   // [outC, outH*outW]
+			std::vector<float> bnOut;     // [outC, outH*outW] (after BN)
+			std::vector<float> bnMean;    // [outC] per-channel mean
+			std::vector<float> bnInvStd;  // [outC] per-channel 1/sqrt(var+eps)
+			std::vector<float> bnNorm;    // [outC, outH*outW] normalized (before gamma/beta)
+			std::vector<float> actOut;    // [outC, outH*outW] (after ReLU)
+			std::vector<float> poolOut;   // [outC, poolOutH*poolOutW]
+			std::vector<int> poolArgmax;  // [outC, poolOutH*poolOutW] argmax indices
+
+			// Backward scratch
+			std::vector<float> dPoolOut;  // gradient from upstream
+			std::vector<float> dActOut;   // gradient after pool backward / before ReLU backward
+			std::vector<float> dConvOut;  // gradient at conv output (after BN backward)
+			std::vector<float> dIm2col;   // gradient for col2im
+		};
+
+		std::vector<ConvLayerScratch> convScratch;
+
+		// FC layer scratch (activations and deltas, similar to DFF)
+		std::vector<std::vector<float> > fcA;     // activations per FC layer
+		std::vector<std::vector<float> > fcDelta; // deltas per FC layer
+
+		// Reusable buffer for conv input gradient during backward (avoids static/thread-unsafe alloc).
+		std::vector<float> convInputGrad;
+
+		// Gradient at flatten layer input (propagated from first FC layer).
+		std::vector<float> dFlatten;
+
+		// Output
+		std::vector<float> logits;
+		std::vector<float> probs;
+	};
+
+	TensorCNNState tensorCnn;
+	CNNScratch cnnScratch;
 
 	// Reusable scratch buffers for recurrent (RNN/GRU/LSTM) forward/backward passes.
 	// This avoids per-window nested-vector allocations in the hot path.
@@ -892,6 +1044,8 @@ private:
 	gpu::GpuRNNWeights* gpuRnnWeights;
 	gpu::GpuGatedWeights* gpuGruWeights;
 	gpu::GpuGatedWeights* gpuLstmWeights;
+	gpu::GpuCNNWeights* gpuCnnWeights;
+	gpu::GpuCNNScratch* gpuCnnScratch;
 #else
 	void* gpuTransformerWeights;
 	void* gpuTransformerScratch;
@@ -900,6 +1054,8 @@ private:
 	void* gpuRnnWeights;
 	void* gpuGruWeights;
 	void* gpuLstmWeights;
+	void* gpuCnnWeights;
+	void* gpuCnnScratch;
 #endif
 	bool gpuStateReady;
 
@@ -1085,6 +1241,7 @@ private:
 	void SGDHelper_GRU(unsigned int inputRowCounter, int runType);
 	void SGDHelper_LSTM(unsigned int inputRowCounter, int runType);
 	void SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int runType);
+	void SGDHelper_CNN(unsigned int inputRowCounter, int runType);
 
 	// Owned resources (used only in some construction paths)
 	shmea::GPointer<NNInfo> ownedSkeleton;
@@ -1138,7 +1295,9 @@ public:
 		// Transformer encoder: bidirectional self-attention over sequences.
 		TYPE_TRANSFORMER_ENCODER = 4,
 		// Transformer decoder-only: causal self-attention over sequences.
-		TYPE_TRANSFORMER_DECODER = 5
+		TYPE_TRANSFORMER_DECODER = 5,
+		// Convolutional neural network: im2col+SGEMM convolution, pooling, FC head.
+		TYPE_CNN = 6
 	};
 
 	enum

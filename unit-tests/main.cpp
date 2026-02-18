@@ -32,6 +32,7 @@
 #include "Backend/Machine Learning/ddp-test.h"
 #include "Backend/Machine Learning/transformer-improvements-test.h"
 #include "Backend/Machine Learning/gpu-training-test.h"
+#include "Backend/Machine Learning/cnn-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -94,6 +95,10 @@ int main(int argc, char* argv[])
 		TransformerImprovementsUnitTest();
 	    else if (strcmp(argv[1], "gpu-training") == 0)
 		GpuTrainingUnitTest();
+	    else if (strcmp(argv[1], "cnn") == 0)
+		NNCNNUnitTest();
+	    else if (strcmp(argv[1], "cnn-mnist") == 0)
+		NNCNNMNISTUnitTest();
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
 	        OHEUnitTest();
@@ -134,6 +139,7 @@ int main(int argc, char* argv[])
 		    ParallelUnitTest();
 		    DDPUnitTest();
 		    TransformerImprovementsUnitTest();
+		    NNCNNUnitTest();
         }
 	    else
 		printf("Invalid test: %s\n", argv[1]);

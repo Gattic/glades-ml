@@ -111,7 +111,9 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<shmea::GPointer
 	shmea::GString label = "";
 	const shmea::GType& cCell = cTable.getCell(r, outputCol); // get the first cell of the col
 	shmea::GType::Type cType = cCell.getType();
-	if (cType == shmea::GType::CHAR_TYPE)
+	if (cType == shmea::GType::STRING_TYPE)
+		label = cCell.c_str();
+	else if (cType == shmea::GType::CHAR_TYPE)
 		label = shmea::GString::intTOstring(cCell.getChar());
 	else if (cType == shmea::GType::SHORT_TYPE)
 		label = shmea::GString::intTOstring(cCell.getShort());
@@ -136,7 +138,7 @@ void ImageInput::importHelper(shmea::GTable& cTable, std::vector<shmea::GPointer
 		else
 		    label = "false";
 	}
-	
+
 	if (label.length() == 0)
 	{
 	    printf("Invalid type for image classification\n");
