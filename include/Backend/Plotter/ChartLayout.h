@@ -32,66 +32,70 @@ public:
                unsigned int ssaa_factor = 1);
     ~ChartLayout();
     
-    // Get dimensions and margins
-    unsigned int getWidth() const;
-    unsigned int getHeight() const;
-    unsigned int getMarginTop() const;
-    unsigned int getMarginRight() const;
-    unsigned int getMarginBottom() const;
-    unsigned int getMarginLeft() const;
-    
+    // Get dimensions and margins — inline for performance
+    unsigned int getWidth() const { return width; }
+    unsigned int getHeight() const { return height; }
+    unsigned int getMarginTop() const { return marginTop; }
+    unsigned int getMarginRight() const { return marginRight; }
+    unsigned int getMarginBottom() const { return marginBottom; }
+    unsigned int getMarginLeft() const { return marginLeft; }
+
     // Set margins
-    void setMarginTop(unsigned int margin);
-    void setMarginRight(unsigned int margin);
-    void setMarginBottom(unsigned int margin);
-    void setMarginLeft(unsigned int margin);
-    
-    // Calculate plotting area
-    unsigned int getPlotWidth() const;
-    unsigned int getPlotHeight() const;
-    
+    void setMarginTop(unsigned int margin) { marginTop = margin; }
+    void setMarginRight(unsigned int margin) { marginRight = margin; }
+    void setMarginBottom(unsigned int margin) { marginBottom = margin; }
+    void setMarginLeft(unsigned int margin) { marginLeft = margin; }
+
+    // Calculate plotting area — inline for performance
+    unsigned int getPlotWidth() const { return width - marginLeft - marginRight; }
+    unsigned int getPlotHeight() const { return height - marginTop - marginBottom; }
+
     // Estimate text dimensions
     int estimateTextWidth(const std::string& text, unsigned int fontSize) const;
     int calculateInfoBoxHeight(const std::vector<std::string>& labels, unsigned int fontSize) const;
-    
+
     // Corner radius for styling
-    void setCornerRadius(int radius);
-    int getCornerRadius() const;
-    
-    // Grid and axes visibility
-    void setShowGrid(bool show);
-    bool isGridVisible() const;
-    void setShowAxes(bool show);
-    bool areAxesVisible() const;
-    
+    void setCornerRadius(int radius) { cornerRadius = radius; }
+    int getCornerRadius() const { return cornerRadius; }
+
+    // Grid and axes visibility — inline for performance
+    void setShowGrid(bool show) { showGrid = show; }
+    bool isGridVisible() const { return showGrid; }
+    void setShowAxes(bool show) { showAxes = show; }
+    bool areAxesVisible() const { return showAxes; }
+
     // Origin axes (four quadrants) visibility
-    void setShowOriginAxes(bool show);
-    bool areOriginAxesVisible() const;
-   
+    void setShowOriginAxes(bool show) { showOriginAxes = show; }
+    bool areOriginAxesVisible() const { return showOriginAxes; }
+
     //Decision if we want to display dates
-    void setDateLabel(bool date);
-    bool isDateLabelShown() const;
+    void setDateLabel(bool date) { dateLabel = date; }
+    bool isDateLabelShown() const { return dateLabel; }
 
     //Decision if Legend is displayed
-    void setLegendLabels(bool legend);
-    bool isLegendVisible() const;
+    void setLegendLabels(bool legend) { legendLabel = legend; }
+    bool isLegendVisible() const { return legendLabel; }
 
     // Supersampling factor
-    unsigned int getSsaaFactor() const;
+    unsigned int getSsaaFactor() const { return ssaaFactor; }
     void setSsaaFactor(unsigned int factor);
-    
+
     // Access to supersampled image (needed for certain rendering operations)
-    Image& getSsaaImage();
-    const Image& getSsaaImage() const;
-    
+    Image& getSsaaImage() { return ssaaImage; }
+    const Image& getSsaaImage() const { return ssaaImage; }
+
     // Logo dimensions
-    int getLogoWidth() const;
-    int getLogoHeight() const;
-    void setLogoWidth(int width);
-    void setLogoHeight(int height);
-    
-    // Helper method for maintaining integer bounds
-    static int clamp(int value, int min, int max);
+    int getLogoWidth() const { return logoWidth; }
+    int getLogoHeight() const { return logoHeight; }
+    void setLogoWidth(int w) { logoWidth = w; }
+    void setLogoHeight(int h) { logoHeight = h; }
+
+    // Helper method for maintaining integer bounds — inline for performance
+    static int clamp(int value, int min, int max) {
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
+    }
     
 private:
     unsigned int width;

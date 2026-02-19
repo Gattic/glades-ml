@@ -143,10 +143,15 @@ public:
 		return data[y * width + x];
 	}
 
+	// Raw data access for performance-critical loops where bounds are known safe
+	RGBA* getData() { return data; }
+	const RGBA* getData() const { return data; }
+
 	// sets
 	void SetAllPixels(const RGBA& value)
 	{
-		for (unsigned int i = 0; i < width * height; i++)
+		unsigned int count = width * height;
+		for (unsigned int i = 0; i < count; i++)
 			data[i] = value;
 	}
 
