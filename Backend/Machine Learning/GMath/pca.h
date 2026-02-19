@@ -17,74 +17,44 @@
 #ifndef _GPCA
 #define _GPCA
 
-#include <vector>
 #include <algorithm>
 #include <cmath>
-#include <cmath>
-#include <fstream>
 #include <iostream>
-#include <map>
+#include <vector>
 
 namespace glades
 {
 
 class PCA
 {
-protected:
-    //
-    // Helper function to compute the mean of a vector of numbers
-    double compute_mean(const std::vector<double>& data);
+private:
+	std::vector<double> mean_vec;
+	std::vector<std::vector<double> > eigenvectors; // rows are eigenvectors, sorted desc
+	std::vector<double> eigenvalues; // sorted descending
+	std::vector<double> variance_explained;
+	std::vector<std::vector<double> > transformed_data;
+	std::vector<std::vector<double> > reconstructed_data;
+	std::vector<size_t> component_mapping;
+	size_t active_components;
 
-    // Helper function to compute the dot product of two vectors
-    double dot_product(const std::vector<double>& vec1, const std::vector<double>& vec2);
-
-    // Helper function to perform matrix-vector multiplication
-    std::vector<double> matrix_vector_multiply(const std::vector<std::vector<double> >& matrix, const std::vector<double>& vec);
-
-    // Multiply two matrices: C = A * B
-    std::vector<std::vector<double> > matrixMultiply(const std::vector<std::vector<double> >& A,
-	const std::vector<std::vector<double> >& B);
-
-    // Gram-Schmidt orthogonalization
-    void gramSchmidt(std::vector<std::vector<double> >& matrix);
-
-    // Maps principal component index (0-based) to original feature index
-    // This preserves the order of variance_explained, so component_mapping[i] 
-    // tells which original feature the i-th principal component maps to
-    std::vector<size_t> component_mapping; 
+	double dot_product(const std::vector<double>& vec1, const std::vector<double>& vec2) const;
 
 public:
-    // Custom comparison function for sorting in descending order
-    static bool compare_pairs(const std::pair<double, std::vector<double> >& pair1, const std::pair<double, std::vector<double> >& pair2);
-    
-    // Same function but for pairs of double and size_t
-    static bool compare_value_index_pairs(const std::pair<double, size_t>& pair1, const std::pair<double, size_t>& pair2);
+	void compute(const std::vector<std::vector<double> >& data, size_t num_components = 0);
 
-    std::vector<std::vector<double> > transformed_data;
-    std::vector<std::vector<double> > sorted_eig_vecs;
-    std::vector<double> variance_explained;
-    std::vector<std::vector<double> > reconstructed_data;
+	const std::vector<double>& getMean() const;
+	const std::vector<std::vector<double> >& getEigenvectors() const;
+	const std::vector<double>& getEigenvalues() const;
+	const std::vector<double>& getVarianceExplained() const;
+	const std::vector<std::vector<double> >& getTransformedData() const;
+	const std::vector<std::vector<double> >& getReconstructedData() const;
+	size_t getNumComponents() const;
 
-    // Main function to compute PCA, return reconstructed data
-    void compute(const std::vector<std::vector<double> >& data);
-    
-    // Get the importance of each original feature
-    std::vector<double> getFeatureImportance() const;
-    
-    // Get the original feature index for a given principal component
-    size_t getOriginalFeatureIndex(size_t component_index) const;
-    
-    // Display information about component mappings
-    void printComponentMapping() const;
-
-    static void calculate_arrow_head(double x1, double y1, double x2, double y2);
+	std::vector<double> getFeatureImportance() const;
+	size_t getOriginalFeatureIndex(size_t component_index) const;
+	void printComponentMapping() const;
 };
 
 };
-
-
-// CALL THIS
-// Top level function
-void pca_example(const std::vector<std::vector<double> >& data, std::vector<std::vector<double> >& transformed_data, std::vector<std::vector<double> >& sorted_eig_vecs);
 
 #endif

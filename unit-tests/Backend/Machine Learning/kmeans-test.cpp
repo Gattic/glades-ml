@@ -39,13 +39,14 @@ void createKMeansImage(shmea::GString newImageName, const glades::PCA& pca, cons
     std::string kValueStr = ss.str();
 
     // Combine the features to cluster the classes using the first two principal components
+    const std::vector<std::vector<double> >& tdata = pca.getTransformedData();
     std::vector<std::vector<double> > clusterData;
     std::vector<int> clusterLabels;
-    for(unsigned int i = 0; i < pca.transformed_data.size(); ++i)
+    for(unsigned int i = 0; i < tdata.size(); ++i)
     {
         std::vector<double> point;
-        point.push_back(pca.transformed_data[i][0]);
-        point.push_back(pca.transformed_data[i][1]);
+        point.push_back(tdata[i][0]);
+        point.push_back(tdata[i][1]);
         clusterData.push_back(point);
         clusterLabels.push_back(kmeans.labels[i]);
     }

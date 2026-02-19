@@ -31,9 +31,13 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
     std::string imagePath = "datasets";
     std::string nameStr = newImageName.c_str(); // Convert GString to std::string
 
+    const std::vector<std::vector<double> >& tdata = pca.getTransformedData();
+    const std::vector<std::vector<double> >& eigvecs = pca.getEigenvectors();
+    const std::vector<std::vector<double> >& rdata = pca.getReconstructedData();
+
     // Create a plotter with default dimensions and supersampling factor of 4
-    shmea::Plotter plotter(1800, 1000, 4);
-    
+    shmea::Plotter plotter(1800, 1000, 1);
+
     // Convert 2D data points to Plotter's Point format for original data
     std::vector<shmea::Point> original_points;
     for (size_t i = 0; i < compute_data.size(); ++i) {
@@ -44,7 +48,7 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
             original_points.push_back(p);
         }
     }
-    
+
     // Save the original data plot
     plotter.chart()
         .title(nameStr + ": Original Data", 36)
@@ -57,36 +61,36 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
         .autoMargins(shmea::CHART_SCATTER)
         .addSeries("Original Data", original_points, shmea::RGBA(0xFF, 0x00, 0x00, 0xFF), shmea::SERIES_SCATTER, 2, 8)
         .saveAs(nameStr + "_pca_original.png", imagePath);
-    
+
     printf("[PCA] Original data image saved\n");
-    
+
     // Create a second plotter for transformed data
-    shmea::Plotter plotter2(1800, 1000, 4);
-    
+    shmea::Plotter plotter2(1800, 1000, 1);
+
     // Convert 2D data points to Plotter's Point format for transformed data
     std::vector<shmea::Point> transformed_points;
-    for (size_t i = 0; i < pca.transformed_data.size(); ++i) {
+    for (size_t i = 0; i < tdata.size(); ++i) {
         shmea::Point p;
-        if (pca.transformed_data[i].size() >= 2) {
-            p.x = pca.transformed_data[i][0];
-            p.y = pca.transformed_data[i][1];
+        if (tdata[i].size() >= 2) {
+            p.x = tdata[i][0];
+            p.y = tdata[i][1];
             transformed_points.push_back(p);
         }
     }
 
-    // Use the pca.sorted_eigen_vecs to create arrows for the diagram
+    // Use the eigenvectors to create arrows for the diagram
     std::vector<shmea::Arrow> diagramArrows;
-    for(unsigned int i = 0; i < pca.sorted_eig_vecs.size(); ++i)
+    for(unsigned int i = 0; i < eigvecs.size(); ++i)
     {
 	shmea::Arrow arrow;
 	arrow.start.x = 0.0f;
 	arrow.start.y = 0.0f;
-	arrow.end.x = pca.sorted_eig_vecs[i][0];
-	arrow.end.y = pca.sorted_eig_vecs[i][1];
+	arrow.end.x = eigvecs[i][0];
+	arrow.end.y = eigvecs[i][1];
 	arrow.color = shmea::RGBA(0x00, 0x00, 0xFF, 0xFF); // Blue color for arrows
 	diagramArrows.push_back(arrow);
     }
-    
+
     // Save the transformed data plot
     plotter2.chart()
         .title(nameStr + ": Transformed Data", 36)
@@ -100,23 +104,23 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
         .addSeries("Transformed Data", transformed_points, shmea::RGBA(0x00, 0xFF, 0x00, 0xFF), shmea::SERIES_SCATTER, 2, 8)
         .addArrows(diagramArrows)
         .saveAs(nameStr + "_pca_transformed.png", imagePath);
-    
+
     printf("[PCA] Transformed data image saved\n");
-    
+
     // Create a third plotter for reconstructed data
-    shmea::Plotter plotter3(1800, 1000, 4);
-    
+    shmea::Plotter plotter3(1800, 1000, 1);
+
     // Convert 2D data points to Plotter's Point format for reconstructed data
     std::vector<shmea::Point> reconstructed_points;
-    for (size_t i = 0; i < pca.reconstructed_data.size(); ++i) {
+    for (size_t i = 0; i < rdata.size(); ++i) {
         shmea::Point p;
-        if (pca.reconstructed_data[i].size() >= 2) {
-            p.x = pca.reconstructed_data[i][0];
-            p.y = pca.reconstructed_data[i][1];
+        if (rdata[i].size() >= 2) {
+            p.x = rdata[i][0];
+            p.y = rdata[i][1];
             reconstructed_points.push_back(p);
         }
     }
-    
+
     // Save the reconstructed data plot
     plotter3.chart()
         .title(nameStr + ": Reconstructed Data", 36)
@@ -129,38 +133,8 @@ void createPCAImage(shmea::GString newImageName, const std::vector<std::vector<d
         .autoMargins(shmea::CHART_SCATTER)
         .addSeries("Reconstructed Data", reconstructed_points, shmea::RGBA(0xFF, 0x00, 0xFF, 0xFF), shmea::SERIES_SCATTER, 2, 8)
         .saveAs(nameStr + "_pca_reconstructed.png", imagePath);
-    
+
     printf("[PCA] Reconstructed data image saved\n");
-    
-    // Combine the features to cluster the classes using the first two principal components
-    std::vector<shmea::Point> pca_score_points;
-    for(unsigned int i = 0; i < pca.transformed_data.size(); ++i)
-    {
-        shmea::Point p;
-        if (pca.transformed_data[i].size() >= 2) {
-            p.x = pca.transformed_data[i][0];
-            p.y = pca.transformed_data[i][1];
-            pca_score_points.push_back(p);
-        }
-    }
-    
-    // Create a fourth plotter for score plot (first two principal components)
-    shmea::Plotter plotter4(1800, 1000, 4);
-    
-    // Save the score plot
-    plotter4.chart()
-        .title(nameStr + ": PCA Score Plot (PC1 vs PC2)", 36)
-        .grid(true)
-        .axes(true)
-        .cornerRadius(15)
-        .logo("logo.png")
-        .axisLabels("Principal Component 1", "Principal Component 2", 28)
-        .originAxes(true)  // Enable four quadrant origin axes
-        .autoMargins(shmea::CHART_SCATTER)
-        .addSeries("PC Score", pca_score_points, shmea::RGBA(0xFF, 0x00, 0xFF, 0xFF), shmea::SERIES_SCATTER, 2, 8)
-        .saveAs(nameStr + "_pca_score.png", imagePath);
-    
-    printf("[PCA] Score plot image saved\n");
 }
 
 void PCAUnitTest()
@@ -185,32 +159,6 @@ void PCAUnitTest()
 
     glades::PCA pca1;
     pca1.compute(example_data);
-
-    /* Expected Output:
-     * ----------
-     *  Computing the mean of the data...
-     *  ----------
-     *  Computing the covariance matrix...
-     *  Covariance Matrix Row 0: [33.4167, 33.4167]
-     *  Covariance Matrix Row 1: [33.4167, 33.4167]
-     *  ----------
-     *  Computing the eigenvectors and eigenvalues of the covariance matrix...
-     *  Eigenvalues: [-7.64242e-15, -5.56129e-15]
-     *  ----------
-     *  Sorting eigenvectors based on eigenvalues...
-     *  Running Gram-Schmidt orthogonalization on the eigenvectors...
-     *  ----------
-     *  Eigenvector 0: [-0.707107, 0.707107]
-     *  Eigenvector 1: [0.707107, 0.707107]
-     *  ----------
-     *  Transforming the data using the eigenvectors...
-     *  Computing the percentage of variance explained by each principal component...
-     *  Variance explained by each principal component: 
-     *  Principal Component 0: 57.8809%
-     *  Principal Component 1: 42.1191%
-     *
-     *  Reconstruction error: 4.6284e-28
-     */
 
     createPCAImage("yequalsx", example_data, pca1);
 
@@ -258,32 +206,6 @@ void PCAUnitTest()
     glades::PCA pca3;
     pca3.compute(example_data);
 
-    /* Expected Output:
-     * ----------
-     * Computing the mean of the data...
-     * ----------
-     *  Computing the covariance matrix...
-     *  Covariance Matrix Row 0: [33.4167, 16.568]
-     *  Covariance Matrix Row 1: [16.568, 8.73592]
-     *  ----------
-     *  Computing the eigenvectors and eigenvalues of the covariance matrix...
-     *  Eigenvalues: [-0.687157, -25.3679]
-     *  ----------
-     *  Sorting eigenvectors based on eigenvalues...
-     *  Running Gram-Schmidt orthogonalization on the eigenvectors...
-     *  ----------
-     *  Eigenvector 0: [-0.436971, 0.899476]
-     *  Eigenvector 1: [-0.899476, -0.436971]
-     *  ----------
-     *  Transforming the data using the eigenvectors...
-     *  Computing the percentage of variance explained by each principal component...
-     *  Variance explained by each principal component: 
-     *  Principal Component 0: 2.63732%
-     *  Principal Component 1: 97.3627%
-     *
-     *  Reconstruction error: 54430.9
-     */
-
     createPCAImage("trig", example_data, pca3);
 
     printf("============================================================\n");
@@ -315,10 +237,11 @@ void PCAUnitTest()
     // Save a PNG representation of the PCA
     createPCAImage("iris", compute_data, pca4);
 
+    const std::vector<double>& ve = pca4.getVarianceExplained();
     std::cout << "Variance explained by each principal component: " << std::endl;
-    for(unsigned int i = 0; i < pca4.variance_explained.size(); ++i)
+    for(unsigned int i = 0; i < ve.size(); ++i)
     {
-	std::cout << "Principal Component " << i << ": " << pca4.variance_explained[i]*100.0f << "%" << std::endl;
+	std::cout << "Principal Component " << i << ": " << ve[i]*100.0f << "%" << std::endl;
     }
 
     printf("============================================================\n");
