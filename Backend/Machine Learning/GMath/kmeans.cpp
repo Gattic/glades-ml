@@ -7,85 +7,111 @@ using namespace glades;
 KMeans::KMeans(int clusters, int iterations, float tol)
 {
     k = clusters;
+    dims_ = 0;
     maxIterations = iterations;
     tolerance = tol;
     rngEngine_ = NULL;
 }
 
-// Compute Euclidean distance (optimized loop)
-float KMeans::euclideanDistance(const std::vector<float>& a, const std::vector<float>& b) const
+// Squared distance from a point vector to flat centroid at index j
+float KMeans::squaredDistToCentroid(const std::vector<float>& point, int j) const
 {
+    const float* c = &centroids_[j * dims_];
+    const float* p = &point[0];
     float sum = 0.0f;
-    for (std::size_t i = 0; i < a.size(); ++i)
+    for (int d = 0; d < dims_; ++d)
     {
-        float diff = a[i] - b[i];
+        float diff = p[d] - c[d];
         sum += diff * diff;
     }
-    return std::sqrt(sum);
+    return sum;
 }
 
 // K-Means++ Initialization
 void KMeans::initializeCentroids(const std::vector<std::vector<float> >& points)
 {
-    centroids.clear();
-    int n = points.size();
+    int n = static_cast<int>(points.size());
+    centroids_.resize(k * dims_);
     glades::rng::Engine& eng = (rngEngine_ ? *rngEngine_ : glades::rng::default_engine());
 
     // Select first centroid randomly
     int firstIndex = glades::rng::uniform_int(eng, 0, n - 1);
-    centroids.push_back(points[firstIndex]);
+    const float* src = &points[firstIndex][0];
+    for (int d = 0; d < dims_; ++d)
+        centroids_[d] = src[d];
+
+    // Pre-allocate distances buffer (hoisted out of loop)
+    std::vector<float> distances(n);
 
     // Select remaining centroids using distance-based probability
-    while ((int)centroids.size() < k)
+    for (int c = 1; c < k; ++c)
     {
-        std::vector<float> distances(n, std::numeric_limits<float>::max());
-
-        // Compute distances to the nearest centroid
+        // Compute min squared distance to any already-chosen centroid
         for (int i = 0; i < n; ++i)
         {
-            for (std::size_t j = 0; j < centroids.size(); ++j)
+            const float* p = &points[i][0];
+            float minDist = std::numeric_limits<float>::max();
+            for (int j = 0; j < c; ++j)
             {
-                float dist = euclideanDistance(points[i], centroids[j]);
-                if (dist < distances[i])
+                const float* ctr = &centroids_[j * dims_];
+                float dist = 0.0f;
+                for (int d = 0; d < dims_; ++d)
                 {
-                    distances[i] = dist;
+                    float diff = p[d] - ctr[d];
+                    dist += diff * diff;
                 }
+                if (dist < minDist)
+                    minDist = dist;
             }
+            distances[i] = minDist;
         }
 
-        // Weighted random selection based on squared distances
+        // Weighted random selection (probabilities proportional to squared distance)
         float totalDist = 0.0f;
         for (int i = 0; i < n; ++i)
-        {
-            totalDist += distances[i] * distances[i];
-        }
+            totalDist += distances[i];
 
         float r = glades::rng::uniform_float(eng, 0.0f, totalDist);
         float cumulative = 0.0f;
+        int sel = n - 1; // fallback for float rounding
 
         for (int i = 0; i < n; ++i)
         {
-            cumulative += distances[i] * distances[i];
+            cumulative += distances[i];
             if (cumulative >= r)
             {
-                centroids.push_back(points[i]);
+                sel = i;
                 break;
             }
         }
+
+        // Copy selected point into centroid c
+        const float* selPt = &points[sel][0];
+        float* dest = &centroids_[c * dims_];
+        for (int d = 0; d < dims_; ++d)
+            dest[d] = selPt[d];
     }
 }
 
 // Assign each point to the nearest centroid
 void KMeans::assignClusters(const std::vector<std::vector<float> >& points)
 {
-    for (std::size_t i = 0; i < points.size(); ++i)
+    int n = static_cast<int>(points.size());
+    for (int i = 0; i < n; ++i)
     {
+        const float* p = &points[i][0];
         float minDist = std::numeric_limits<float>::max();
-        int bestCluster = -1;
+        int bestCluster = 0;
 
-        for (std::size_t j = 0; j < centroids.size(); ++j)
+        for (int j = 0; j < k; ++j)
         {
-            float dist = euclideanDistance(points[i], centroids[j]);
+            const float* c = &centroids_[j * dims_];
+            float dist = 0.0f;
+            for (int d = 0; d < dims_; ++d)
+            {
+                float diff = p[d] - c[d];
+                dist += diff * diff;
+            }
             if (dist < minDist)
             {
                 minDist = dist;
@@ -99,85 +125,109 @@ void KMeans::assignClusters(const std::vector<std::vector<float> >& points)
 // Update centroids and return true if centroids moved significantly
 bool KMeans::updateCentroids(const std::vector<std::vector<float> >& points)
 {
-    std::vector<std::vector<float> > newCentroids(k, std::vector<float>(points[0].size(), 0.0f));
+    int flatSize = k * dims_;
+    std::vector<float> newCentroids(flatSize, 0.0f);
     std::vector<int> counts(k, 0);
 
-    for (std::size_t i = 0; i < points.size(); ++i)
+    int n = static_cast<int>(points.size());
+    for (int i = 0; i < n; ++i)
     {
         int cluster = labels[i];
         ++counts[cluster];
-
-        for (std::size_t d = 0; d < points[i].size(); ++d)
-        {
-            newCentroids[cluster][d] += points[i][d];
-        }
+        const float* p = &points[i][0];
+        float* nc = &newCentroids[cluster * dims_];
+        for (int d = 0; d < dims_; ++d)
+            nc[d] += p[d];
     }
 
     bool converged = true;
     for (int j = 0; j < k; ++j)
     {
-        if (counts[j] == 0) continue; // Avoid division by zero
+        float* nc = &newCentroids[j * dims_];
+        const float* oc = &centroids_[j * dims_];
 
-        for (std::size_t d = 0; d < centroids[j].size(); ++d)
+        if (counts[j] == 0)
         {
-            newCentroids[j][d] /= counts[j];
+            // Retain previous centroid for empty clusters
+            for (int d = 0; d < dims_; ++d)
+                nc[d] = oc[d];
+            continue;
+        }
+
+        float invCount = 1.0f / counts[j];
+        for (int d = 0; d < dims_; ++d)
+        {
+            nc[d] *= invCount;
 
             // Check for convergence using tolerance
-            if (std::fabs(centroids[j][d] - newCentroids[j][d]) > tolerance)
-            {
+            if (std::fabs(oc[d] - nc[d]) > tolerance)
                 converged = false;
-            }
         }
     }
 
-    centroids = newCentroids;
+    centroids_.swap(newCentroids);
     return !converged;
 }
 
 // Fit the model to the dataset
 void KMeans::fit(const std::vector<std::vector<float> >& points)
 {
+    centroids_.clear();
     labels.clear();
-    labels.resize(points.size());
 
-    initializeCentroids(points);
+    if (points.empty() || k <= 0 || static_cast<int>(points.size()) < k)
+        return;
+
+    dims_ = static_cast<int>(points[0].size());
     labels.assign(points.size(), -1);
 
-    int iterations = 0;
-    while (iterations < maxIterations)
+    initializeCentroids(points);
+
+    for (int iter = 0; iter < maxIterations; ++iter)
     {
         assignClusters(points);
 
         if (!updateCentroids(points))
-        {
-            std::cout << "Converged after " << iterations << " iterations.\n";
             break;
-        }
-
-        ++iterations;
     }
 }
 
 int KMeans::predict(const std::vector<float>& point) const
 {
-    float minDist = std::numeric_limits<float>::max();
-	int bestCluster = -1;
+    if (centroids_.empty())
+        return -1;
 
-	for (std::size_t j = 0; j < centroids.size(); ++j)
-	{
-		float dist = euclideanDistance(point, centroids[j]);
-		if (dist < minDist)
-		{
-			minDist = dist;
-			bestCluster = j;
-		}
-	}
-	return bestCluster;
+    float minDist = std::numeric_limits<float>::max();
+    int bestCluster = -1;
+
+    for (int j = 0; j < k; ++j)
+    {
+        float dist = squaredDistToCentroid(point, j);
+        if (dist < minDist)
+        {
+            minDist = dist;
+            bestCluster = j;
+        }
+    }
+    return bestCluster;
 }
 
+// Reconstruct vector-of-vectors from flat storage (rare, post-fit call)
 std::vector<std::vector<float> > KMeans::getCentroids() const
 {
-    return centroids;
+    std::vector<std::vector<float> > result;
+    result.reserve(k);
+    for (int j = 0; j < k; ++j)
+    {
+        const float* c = &centroids_[j * dims_];
+        result.push_back(std::vector<float>(c, c + dims_));
+    }
+    return result;
+}
+
+const std::vector<int>& KMeans::getLabels() const
+{
+    return labels;
 }
 
 unsigned int KMeans::getClassCount() const
@@ -185,42 +235,43 @@ unsigned int KMeans::getClassCount() const
     return k;
 }
 
-// Determine the best k using silhouette score
+// Determine the best k using the elbow method on SSE
 int KMeans::determineOptimalK(const std::vector<std::vector<float> >& points, int maxK)
 {
+    if (points.empty() || maxK < 2)
+        return 2;
+
     std::vector<float> sseValues;
-    
+    sseValues.reserve(maxK - 1);
+
     for (int k = 2; k <= maxK; ++k)
     {
         KMeans kmeans(k, 100, 1e-4);
         kmeans.fit(points);
 
-        // Compute SSE (inertia)
+        // Compute SSE (sum of squared distances to assigned centroid)
         float sse = 0.0f;
-        std::vector<std::vector<float> > centroids = kmeans.getCentroids();
-
         for (std::size_t i = 0; i < points.size(); ++i)
         {
-            sse += kmeans.euclideanDistance(points[i], centroids[kmeans.labels[i]]);
+            sse += kmeans.squaredDistToCentroid(points[i], kmeans.labels[i]);
         }
 
         sseValues.push_back(sse);
     }
 
-    // Find "elbow" where SSE drops sharply
+    // Find "elbow" using second derivative (maximum curvature)
     int bestK = 2;
-    float maxDiff = 0.0f;
+    float maxSecondDeriv = 0.0f;
 
-    for (std::size_t i = 1; i < sseValues.size() - 1; ++i)
+    for (std::size_t i = 1; i + 1 < sseValues.size(); ++i)
     {
-        float diff = sseValues[i - 1] - sseValues[i];
-        if (diff > maxDiff)
+        float secondDeriv = sseValues[i - 1] - 2.0f * sseValues[i] + sseValues[i + 1];
+        if (secondDeriv > maxSecondDeriv)
         {
-            maxDiff = diff;
-            bestK = i + 2; // Since k starts at 2
+            maxSecondDeriv = secondDeriv;
+            bestK = static_cast<int>(i) + 2; // Since k starts at 2
         }
     }
 
     return bestK;
 }
-

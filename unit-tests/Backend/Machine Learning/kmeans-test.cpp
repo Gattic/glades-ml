@@ -42,13 +42,16 @@ void createKMeansImage(shmea::GString newImageName, const glades::PCA& pca, cons
     const std::vector<std::vector<double> >& tdata = pca.getTransformedData();
     std::vector<std::vector<double> > clusterData;
     std::vector<int> clusterLabels;
+    clusterData.reserve(tdata.size());
+    clusterLabels.reserve(tdata.size());
+    const std::vector<int>& kLabels = kmeans.getLabels();
     for(unsigned int i = 0; i < tdata.size(); ++i)
     {
         std::vector<double> point;
         point.push_back(tdata[i][0]);
         point.push_back(tdata[i][1]);
         clusterData.push_back(point);
-        clusterLabels.push_back(kmeans.labels[i]);
+        clusterLabels.push_back(kLabels[i]);
     }
 
     // Get centroids as vector<vector<double>>
@@ -95,6 +98,8 @@ void KMeansUnitTest()
     std::vector<std::vector<float> > points;
     std::vector<std::vector<double> > compute_data;
     unsigned int trainSize = di->getTrainSize();
+    points.reserve(trainSize);
+    compute_data.reserve(trainSize);
     for(unsigned int i = 0; i < trainSize; ++i)
     {
         shmea::GVector<float> cRow = di->getTrainRow(i);
@@ -124,10 +129,11 @@ void KMeansUnitTest()
     kmeans.fit(points);
 
     // Display clustering results
+    const std::vector<int>& finalLabels = kmeans.getLabels();
     std::cout << "\nCluster Assignments:\n";
     for (std::size_t i = 0; i < points.size(); ++i)
     {
-        std::cout << "Point (" << i << ") => Cluster " << kmeans.labels[i] << "\n";
+        std::cout << "Point (" << i << ") => Cluster " << finalLabels[i] << "\n";
     }
 
     createKMeansImage("iris", pca, kmeans);
