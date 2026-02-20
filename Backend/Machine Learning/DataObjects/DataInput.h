@@ -135,6 +135,11 @@ public:
 	virtual bool getTestTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
 	virtual bool getTestExpectedTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
 
+	// Returns true when the expected output for each training position is a single token ID
+	// (via getTrainExpectedTokenId / getTestExpectedTokenId) rather than a dense probability vector.
+	// Subclasses that serve token-level language model data should override this.
+	virtual bool hasTokenIdExpectedOutput() const { return false; }
+
 	// === Sparse row access (optional; primarily for high-cardinality one-hot inputs) ===
 	//
 	// This API allows DataInput implementations to provide a sparse representation of
@@ -667,7 +672,7 @@ inline bool DataInput::validateTrainRowShapes(unsigned int expectedFeatureCount,
 			return false;
 		}
 	}
-	if (hasFixedTrainExpectedRowSize())
+	if (!hasTokenIdExpectedOutput() && hasFixedTrainExpectedRowSize())
 	{
 		const unsigned int n = getFixedTrainExpectedRowSize();
 		if (n < expectedOutSize)
@@ -685,7 +690,8 @@ inline bool DataInput::validateTrainRowShapes(unsigned int expectedFeatureCount,
 	}
 
 	// If either fixed-size contract is missing, do a bounded materialization check.
-	if (!(hasFixedTrainRowSize() && hasFixedTrainExpectedRowSize()))
+	// Skip expected-output checks for token-ID datasets (training loop uses token-ID accessors).
+	if (!(hasFixedTrainRowSize() && (hasFixedTrainExpectedRowSize() || hasTokenIdExpectedOutput())))
 	{
 		const unsigned int wantChecks = (maxRowsToCheck == 0u ? 1u : maxRowsToCheck);
 		const unsigned int checks = (trainSize < wantChecks ? trainSize : wantChecks);
@@ -711,20 +717,23 @@ inline bool DataInput::validateTrainRowShapes(unsigned int expectedFeatureCount,
 				return false;
 			}
 
-			const shmea::GVector<float> exp = getTrainExpectedRow(idx);
-			if (exp.size() < expectedOutSize)
+			if (!hasTokenIdExpectedOutput())
 			{
-				if (errMsg)
+				const shmea::GVector<float> exp = getTrainExpectedRow(idx);
+				if (exp.size() < expectedOutSize)
 				{
-					char buf[256];
-					sprintf(buf,
-					        "expected row %u has %u outputs but expected at least %u",
-					        idx,
-					        static_cast<unsigned int>(exp.size()),
-					        expectedOutSize);
-					*errMsg = std::string(buf);
+					if (errMsg)
+					{
+						char buf[256];
+						sprintf(buf,
+						        "expected row %u has %u outputs but expected at least %u",
+						        idx,
+						        static_cast<unsigned int>(exp.size()),
+						        expectedOutSize);
+						*errMsg = std::string(buf);
+					}
+					return false;
 				}
-				return false;
 			}
 		}
 	}
@@ -772,7 +781,7 @@ inline bool DataInput::validateTestRowShapes(unsigned int expectedFeatureCount,
 			return false;
 		}
 	}
-	if (hasFixedTestExpectedRowSize())
+	if (!hasTokenIdExpectedOutput() && hasFixedTestExpectedRowSize())
 	{
 		const unsigned int n = getFixedTestExpectedRowSize();
 		if (n < expectedOutSize)
@@ -790,7 +799,8 @@ inline bool DataInput::validateTestRowShapes(unsigned int expectedFeatureCount,
 	}
 
 	// If either fixed-size contract is missing, do a bounded materialization check.
-	if (!(hasFixedTestRowSize() && hasFixedTestExpectedRowSize()))
+	// Skip expected-output checks for token-ID datasets (training loop uses token-ID accessors).
+	if (!(hasFixedTestRowSize() && (hasFixedTestExpectedRowSize() || hasTokenIdExpectedOutput())))
 	{
 		const unsigned int wantChecks = (maxRowsToCheck == 0u ? 1u : maxRowsToCheck);
 		const unsigned int checks = (testSize < wantChecks ? testSize : wantChecks);
@@ -819,20 +829,23 @@ inline bool DataInput::validateTestRowShapes(unsigned int expectedFeatureCount,
 				return false;
 			}
 
-			const shmea::GVector<float> exp = getTestExpectedRow(idx);
-			if (exp.size() < expectedOutSize)
+			if (!hasTokenIdExpectedOutput())
 			{
-				if (errMsg)
+				const shmea::GVector<float> exp = getTestExpectedRow(idx);
+				if (exp.size() < expectedOutSize)
 				{
-					char buf[256];
-					sprintf(buf,
-					        "test expected row %u has %u outputs but expected at least %u",
-					        idx,
-					        static_cast<unsigned int>(exp.size()),
-					        expectedOutSize);
-					*errMsg = std::string(buf);
+					if (errMsg)
+					{
+						char buf[256];
+						sprintf(buf,
+						        "test expected row %u has %u outputs but expected at least %u",
+						        idx,
+						        static_cast<unsigned int>(exp.size()),
+						        expectedOutSize);
+						*errMsg = std::string(buf);
+					}
+					return false;
 				}
-				return false;
 			}
 		}
 	}
