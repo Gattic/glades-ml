@@ -35,6 +35,8 @@
 #include "Backend/Machine Learning/cnn-test.h"
 #include "Backend/Machine Learning/garch-test.h"
 #include "Backend/Machine Learning/egarch-test.h"
+#include "Backend/Machine Learning/gan-test.h"
+#include "Backend/Machine Learning/hyperparameter-tuner-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -52,6 +54,7 @@ int main(int argc, char* argv[])
 	    KMeansUnitTest();
 	    BayesUnitTest();
 	    BayesOptimizerUnitTest();
+	    BayesOptimizerMultiDimTest();
 	    OHEUnitTest();
 	    MappedDatasetUnitTest();
 	    NNMixedPrecisionUnitTest();
@@ -79,6 +82,8 @@ int main(int argc, char* argv[])
 		BayesUnitTest();
 	    else if (strcmp(argv[1], "bayes-optimizer") == 0)
 		BayesOptimizerUnitTest();
+	    else if (strcmp(argv[1], "bayes-optimizer-nd") == 0)
+		BayesOptimizerMultiDimTest();
 	    else if (strcmp(argv[1], "ohe") == 0)
 		OHEUnitTest();
 	    else if (strcmp(argv[1], "mapped") == 0)
@@ -107,6 +112,16 @@ int main(int argc, char* argv[])
 		GARCHUnitTest();
 	    else if (strcmp(argv[1], "egarch") == 0)
 		EGARCHUnitTest();
+	    else if (strcmp(argv[1], "gan") == 0)
+		GANUnitTest();
+	    else if (strcmp(argv[1], "search-space") == 0)
+		SearchSpaceUnitTest();
+	    else if (strcmp(argv[1], "hp-tuner") == 0)
+		HyperparameterTunerUnitTest();
+	    else if (strcmp(argv[1], "bayes-lr") == 0)
+		BayesianLRScheduleTest();
+	    else if (strcmp(argv[1], "hp-tuner-full") == 0)
+		HyperparameterTunerFullLoopTest();
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
 	        OHEUnitTest();

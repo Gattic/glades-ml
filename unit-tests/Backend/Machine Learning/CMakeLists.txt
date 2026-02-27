@@ -23,5 +23,7 @@ gpu-training-test.cpp
 cnn-test.cpp
 garch-test.cpp
 egarch-test.cpp
+gan-test.cpp
+hyperparameter-tuner-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})

@@ -88,6 +88,8 @@ glades::NNetwork::NNetwork(int newNetType)
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
+	bayesianLRMultiplier_ = 1.0f;
+	bayesianLREpochCounter_ = 0;
 	// Initialize tensor gate packs (gateCount is fixed by architecture type).
 	tensorGru = TensorGatedState(3u);
 	tensorLstm = TensorGatedState(4u);
@@ -135,6 +137,8 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
+	bayesianLRMultiplier_ = 1.0f;
+	bayesianLREpochCounter_ = 0;
 	tensorGru = TensorGatedState(3u);
 	tensorLstm = TensorGatedState(4u);
 	gpuTransformerWeights = NULL;
@@ -2831,8 +2835,19 @@ glades::NNetworkStatus glades::NNetwork::setTerminator(const glades::Terminator&
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
+glades::NNetwork* glades::NNetwork::cloneForTrial() const
+{
+	NNetwork* net = new NNetwork(skeleton, netType);
+	net->trainingConfig = trainingConfig;
+	net->terminator = terminator;
+	net->setSeed(rngSeed + 1);
+	return net;
+}
+
 float glades::NNetwork::computeLearningRateMultiplier(int epochFromStart) const
 {
+	if (trainingConfig.lrSchedule.type == LearningRateScheduleConfig::BAYESIAN)
+		return bayesianLRMultiplier_;
 	return trainingConfig.lrSchedule.multiplier(epochFromStart);
 }
 

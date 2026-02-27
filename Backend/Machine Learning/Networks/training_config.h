@@ -181,7 +181,8 @@ struct LearningRateScheduleConfig
 		NONE = 0,
 		STEP = 1,
 		EXP = 2,
-		COSINE = 3
+		COSINE = 3,
+		BAYESIAN = 4
 	};
 
 	Type type;
@@ -272,6 +273,8 @@ struct LearningRateScheduleConfig
 			const double m = minM + 0.5 * (1.0 - minM) * (1.0 + cosv);
 			return static_cast<float>(m);
 		}
+		case BAYESIAN:
+			return 1.0f;
 		case NONE:
 		default:
 			return 1.0f;
@@ -284,6 +287,20 @@ struct LearningRateScheduleConfig
 // NOTE:
 // - Default preserves historical behavior (SGD with momentum from NNInfo).
 // - For transformers, ADAMW is strongly recommended.
+struct BayesianLRConfig
+{
+	int windowEpochs;   // evaluate every N epochs (default 10)
+	float minLR;        // lower bound for LR multiplier (default 1e-6)
+	float maxLR;        // upper bound for LR multiplier (default 0.1)
+
+	BayesianLRConfig()
+	    : windowEpochs(10),
+	      minLR(1e-6f),
+	      maxLR(0.1f)
+	{
+	}
+};
+
 struct OptimizerConfig
 {
 	enum Type
@@ -429,6 +446,44 @@ struct CNNConfig
 	}
 };
 
+// Transposed-convolution (deconvolution) generator configuration for GANs.
+struct DeconvConfig
+{
+	unsigned int projectChannels; // channels after FC projection
+	unsigned int projectH;       // spatial height after projection
+	unsigned int projectW;       // spatial width after projection
+
+	struct DeconvLayerSpec
+	{
+		unsigned int outChannels;
+		unsigned int kernelH, kernelW;
+		unsigned int strideH, strideW;
+		unsigned int padH, padW;
+		bool useBatchNorm;
+		bool useReLU; // false for last layer (use sigmoid)
+
+		DeconvLayerSpec()
+		    : outChannels(0u),
+		      kernelH(4u), kernelW(4u),
+		      strideH(2u), strideW(2u),
+		      padH(1u), padW(1u),
+		      useBatchNorm(false),
+		      useReLU(true)
+		{
+		}
+	};
+
+	std::vector<DeconvLayerSpec> layers;
+
+	DeconvConfig()
+	    : projectChannels(128u),
+	      projectH(7u),
+	      projectW(7u),
+	      layers()
+	{
+	}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -454,6 +509,9 @@ struct TrainingConfig
 
 	// Learning rate schedule multiplier configuration.
 	LearningRateScheduleConfig lrSchedule;
+
+	// Bayesian adaptive LR configuration (used when lrSchedule.type == BAYESIAN).
+	BayesianLRConfig bayesianLR;
 
 	// Transformer run config (used only for transformer net types).
 	TransformerRunConfig transformer;
@@ -501,6 +559,7 @@ struct TrainingConfig
 	      perElementGradClip(10.0f),
 	      optimizer(),
 	      lrSchedule(),
+	      bayesianLR(),
 	      transformer(),
 	      mixedPrecision(),
 	      gpu(),

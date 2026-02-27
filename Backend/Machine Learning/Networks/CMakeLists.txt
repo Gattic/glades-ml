@@ -26,6 +26,10 @@ set(Networks_src_files
 	transformer_ops.h
 	ddp_comm.cpp
 	ddp_comm.h
+	gan.cpp
+	gan.h
+	hyperparameter_tuner.cpp
+	hyperparameter_tuner.h
 )
 add_library(Networks ${Networks_src_files})
 target_link_libraries(Networks pthread)

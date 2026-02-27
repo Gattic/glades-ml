@@ -28,6 +28,7 @@
 #include "training_config.h"
 #include "../nnetwork_status.h"
 #include "bayes.h"
+#include "bayes-optimizer.h"
 #include "transformer_ops.h"
 #include "aligned_allocator.h"
 #include <algorithm>
@@ -73,6 +74,8 @@ class GServer;
 class Connection;
 };
 
+void GANUnitTest();
+
 namespace glades {
 
 class DataInput;
@@ -80,6 +83,8 @@ class CMatrix;
 class MetaNetwork;
 class TrainingCore;
 class Trainer;
+class GAN;
+struct GradientBuffer;
 
 class NNetwork
 {
@@ -87,6 +92,9 @@ private:
 	friend MetaNetwork;
 	friend TrainingCore;
 	friend Trainer;
+	friend GAN;
+	friend GradientBuffer;
+	friend void ::GANUnitTest();
 
 	// Tensor-based DFF training state.
 	//
@@ -405,6 +413,62 @@ private:
 
 	TensorCNNState tensorCnn;
 	CNNScratch cnnScratch;
+
+	// === Transposed-convolution (deconv) generator state ===
+	struct TensorDeconvState
+	{
+		bool initialized;
+
+		// FC projection: noise -> projectC * projectH * projectW
+		unsigned int fcIn, fcOut;
+		std::vector<float> fcW, fcBias, fcGW, fcGBias;
+		std::vector<float> fcVW, fcV2W, fcVBias, fcV2Bias; // Adam
+
+		unsigned int projectC, projectH, projectW;
+
+		struct DeconvLayer
+		{
+			unsigned int inC, outC, kH, kW;
+			unsigned int strideH, strideW, padH, padW;
+			unsigned int inH, inW, outH, outW;
+			bool useBatchNorm, useReLU;
+
+			std::vector<float> W, bias, gW, gBias;
+			std::vector<float> vW, v2W, vBias, v2Bias; // Adam
+
+			DeconvLayer()
+			    : inC(0u), outC(0u), kH(0u), kW(0u),
+			      strideH(0u), strideW(0u), padH(0u), padW(0u),
+			      inH(0u), inW(0u), outH(0u), outW(0u),
+			      useBatchNorm(false), useReLU(true)
+			{
+			}
+		};
+
+		std::vector<DeconvLayer> layers;
+		unsigned long long optimizerStep;
+
+		TensorDeconvState()
+		    : initialized(false),
+		      fcIn(0u), fcOut(0u),
+		      projectC(0u), projectH(0u), projectW(0u),
+		      optimizerStep(0ULL)
+		{
+		}
+
+		void reset()
+		{
+			initialized = false;
+			fcIn = fcOut = 0u;
+			projectC = projectH = projectW = 0u;
+			fcW.clear(); fcBias.clear(); fcGW.clear(); fcGBias.clear();
+			fcVW.clear(); fcV2W.clear(); fcVBias.clear(); fcV2Bias.clear();
+			layers.clear();
+			optimizerStep = 0ULL;
+		}
+	};
+
+	TensorDeconvState tensorDeconv;
 
 	// Reusable scratch buffers for recurrent (RNN/GRU/LSTM) forward/backward passes.
 	// This avoids per-window nested-vector allocations in the hot path.
@@ -1178,6 +1242,11 @@ private:
 	float lastGradNormScale;
 	int64_t lastStepLogTime;
 
+	// Bayesian adaptive LR state (used when lrSchedule.type == BAYESIAN).
+	float bayesianLRMultiplier_;       // current Bayesian LR multiplier (default 1.0)
+	int bayesianLREpochCounter_;       // epochs since last LR adjustment
+	GaussianProcess bayesianLRGP_;     // 1D GP for inner-loop adaptive LR
+
 	// === Tokenizer + vocabulary artifacts (deployment metadata) ===
 	//
 	// Glades models operate on token IDs. To make model packages self-contained for deployment,
@@ -1313,6 +1382,9 @@ public:
 	virtual ~NNetwork();
 	void setSeed(uint64_t seed);
 	uint64_t getSeed() const { return rngSeed; }
+	// Create a fresh NNetwork from the same skeleton/type/config for hyperparameter tuning.
+	// Caller owns the returned pointer and must delete it.
+	NNetwork* cloneForTrial() const;
 	// Returns the network's architecture type (TYPE_DFF, TYPE_RNN, etc.).
 	int getNetType() const { return netType; }
 	int64_t getCurrentTimeMilliseconds() const;

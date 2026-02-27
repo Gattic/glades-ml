@@ -309,8 +309,8 @@ inline static GVector<float> vectorStandardize(const GVector<float>& vec)
     {
         float cell = vec[r];
 
-        // Scale from [xMin..xMax] to [0..1], then shift => [-0.5..+0.5]
-        cell = ((cell - xMin) / xRange) - 0.5f;
+        // Scale from [xMin..xMax] to [0..1]
+        cell = (cell - xMin) / xRange;
 
         newVec[r] = cell;
     }

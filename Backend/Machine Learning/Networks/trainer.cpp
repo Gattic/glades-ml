@@ -502,6 +502,49 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			return net.lastStatus;
 		}
 
+		// Bayesian adaptive LR update.
+		// Every `windowEpochs` training epochs, record the current (logLR, loss) pair in the
+		// inner-loop GP and pick the log-LR with the highest expected improvement.
+		if (isTrainRun && net.trainingConfig.lrSchedule.type == LearningRateScheduleConfig::BAYESIAN)
+		{
+			++net.bayesianLREpochCounter_;
+			if (net.bayesianLREpochCounter_ >= net.trainingConfig.bayesianLR.windowEpochs)
+			{
+				net.bayesianLREpochCounter_ = 0;
+				float currentLoss = metrics.totalError;
+				float currentLogLR = logf(net.bayesianLRMultiplier_);
+
+				net.bayesianLRGP_.addSample(currentLogLR, currentLoss);
+				net.bayesianLRGP_.fit();
+
+				float logMin = logf(net.trainingConfig.bayesianLR.minLR);
+				float logMax = logf(net.trainingConfig.bayesianLR.maxLR);
+				float bestEI = -1.0f;
+				float bestLogLR = currentLogLR;
+
+				if (net.bayesianLRGP_.numSamples() >= 2)
+				{
+					float bestLoss = currentLoss;
+					for (float logLR = logMin; logLR <= logMax; logLR += (logMax - logMin) / 100.0f)
+					{
+						std::pair<float, float> pred = net.bayesianLRGP_.predict(logLR);
+						float mu = pred.first;
+						float sigma = sqrtf(pred.second);
+						if (sigma < 1e-8f) continue;
+						float z = (bestLoss - mu) / sigma;
+						float ei = (bestLoss - mu) * BayesianOptimizer::cdf(z) + sigma * BayesianOptimizer::pdf(z);
+						if (ei > bestEI) { bestEI = ei; bestLogLR = logLR; }
+					}
+				}
+
+				net.bayesianLRMultiplier_ = expf(bestLogLR);
+				if (net.bayesianLRMultiplier_ < net.trainingConfig.bayesianLR.minLR)
+					net.bayesianLRMultiplier_ = net.trainingConfig.bayesianLR.minLR;
+				if (net.bayesianLRMultiplier_ > net.trainingConfig.bayesianLR.maxLR)
+					net.bayesianLRMultiplier_ = net.trainingConfig.bayesianLR.maxLR;
+			}
+		}
+
 		bool callbackStop = false;
 		if (cb)
 			callbackStop = cb->onEpochEnd(net, metrics);

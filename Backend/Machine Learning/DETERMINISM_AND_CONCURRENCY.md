@@ -47,9 +47,26 @@ The engine is **deterministic by default**.
     - ensure the shared `DataInput` is externally synchronized, or
     - use `*RowView()` APIs that are explicitly documented as thread-safe for a specific implementation.
 
+### GAN training parallelism
+
+- `GAN::train()` parallelizes per-sample processing within each batch using `ThreadPool`.
+- With `GANConfig::deterministicReduce = true` (default), gradient reduction is ordered
+  by thread index, producing bit-identical results regardless of thread count.
+- With `deterministicReduce = false`, threads accumulate directly into shared gradient arrays
+  for slightly faster execution at the cost of non-deterministic float summation order.
+- RNG draws and `DataInput` reads are pre-generated sequentially before each parallel loop,
+  preserving the same draw order as the sequential code path.
+- All GAN variants (Vanilla, WGAN-GP, InfoGAN, StyleGAN, CycleGAN, composites) support
+  parallel training.
+- **Known limitation**: StyleGAN's `dffForwardStyled` injects per-layer noise via a shared
+  RNG that is not yet pre-generated. This causes non-deterministic noise vectors across
+  threads, affecting generator-phase reproducibility when noise scales are non-zero.
+
 ### Practical guidance
 
 - **Reproducible experiment**: set explicit seeds and save them in your run metadata.
 - **Parallel training**: create one `NNetwork` + one `DataInput` per thread.
+- **GAN parallel training**: use `GANConfig::deterministicReduce = true` (default) for
+  reproducible results across any thread count.
 - **Do not** rely on “random by default” behavior; in this engine you must opt in by choosing seeds.
 
