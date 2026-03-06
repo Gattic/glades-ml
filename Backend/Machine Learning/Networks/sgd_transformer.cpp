@@ -1463,38 +1463,51 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		void operator()(unsigned int& timeStepsInBatch) const
 		{
 			if (glades::ddp::worldSize() <= 1) return;
+
+			const int maxBufs = 8 + 16 * static_cast<int>(nLayers);
+			std::vector<float*> bufs;
+			std::vector<size_t> sizes;
+			bufs.reserve(maxBufs);
+			sizes.reserve(maxBufs);
+
 			// Global tensors
-			if (!tt.gTokE.empty())   glades::ddp::allReduceSumInPlace(&tt.gTokE[0], tt.gTokE.size());
-			if (!tt.gLmBias.empty()) glades::ddp::allReduceSumInPlace(&tt.gLmBias[0], tt.gLmBias.size());
-			if (!tt.gWIn.empty())    glades::ddp::allReduceSumInPlace(&tt.gWIn[0], tt.gWIn.size());
-			if (!tt.gBIn.empty())    glades::ddp::allReduceSumInPlace(&tt.gBIn[0], tt.gBIn.size());
-			if (!tt.gWOut.empty())   glades::ddp::allReduceSumInPlace(&tt.gWOut[0], tt.gWOut.size());
-			if (!tt.gBOut.empty())   glades::ddp::allReduceSumInPlace(&tt.gBOut[0], tt.gBOut.size());
-			if (!tt.gLnFinalGamma.empty()) glades::ddp::allReduceSumInPlace(&tt.gLnFinalGamma[0], tt.gLnFinalGamma.size());
-			if (!tt.gLnFinalBeta.empty())  glades::ddp::allReduceSumInPlace(&tt.gLnFinalBeta[0], tt.gLnFinalBeta.size());
+			if (!tt.gTokE.empty())        { bufs.push_back(&tt.gTokE[0]);        sizes.push_back(tt.gTokE.size()); }
+			if (!tt.gLmBias.empty())       { bufs.push_back(&tt.gLmBias[0]);      sizes.push_back(tt.gLmBias.size()); }
+			if (!tt.gWIn.empty())          { bufs.push_back(&tt.gWIn[0]);         sizes.push_back(tt.gWIn.size()); }
+			if (!tt.gBIn.empty())          { bufs.push_back(&tt.gBIn[0]);         sizes.push_back(tt.gBIn.size()); }
+			if (!tt.gWOut.empty())         { bufs.push_back(&tt.gWOut[0]);        sizes.push_back(tt.gWOut.size()); }
+			if (!tt.gBOut.empty())         { bufs.push_back(&tt.gBOut[0]);        sizes.push_back(tt.gBOut.size()); }
+			if (!tt.gLnFinalGamma.empty()) { bufs.push_back(&tt.gLnFinalGamma[0]); sizes.push_back(tt.gLnFinalGamma.size()); }
+			if (!tt.gLnFinalBeta.empty())  { bufs.push_back(&tt.gLnFinalBeta[0]);  sizes.push_back(tt.gLnFinalBeta.size()); }
+
 			// Per-block tensors
 			for (unsigned int l = 0; l < nLayers; ++l)
 			{
 				TensorTransformerState::Block& b = tt.blocks[l];
-				if (!b.gWq.empty()) glades::ddp::allReduceSumInPlace(&b.gWq[0], b.gWq.size());
-				if (!b.gWk.empty()) glades::ddp::allReduceSumInPlace(&b.gWk[0], b.gWk.size());
-				if (!b.gWv.empty()) glades::ddp::allReduceSumInPlace(&b.gWv[0], b.gWv.size());
-				if (!b.gWo.empty()) glades::ddp::allReduceSumInPlace(&b.gWo[0], b.gWo.size());
-				if (!b.gBq.empty()) glades::ddp::allReduceSumInPlace(&b.gBq[0], b.gBq.size());
-				if (!b.gBk.empty()) glades::ddp::allReduceSumInPlace(&b.gBk[0], b.gBk.size());
-				if (!b.gBv.empty()) glades::ddp::allReduceSumInPlace(&b.gBv[0], b.gBv.size());
-				if (!b.gBo.empty()) glades::ddp::allReduceSumInPlace(&b.gBo[0], b.gBo.size());
-				if (!b.gLn1Gamma.empty()) glades::ddp::allReduceSumInPlace(&b.gLn1Gamma[0], b.gLn1Gamma.size());
-				if (!b.gLn1Beta.empty())  glades::ddp::allReduceSumInPlace(&b.gLn1Beta[0], b.gLn1Beta.size());
-				if (!b.gLn2Gamma.empty()) glades::ddp::allReduceSumInPlace(&b.gLn2Gamma[0], b.gLn2Gamma.size());
-				if (!b.gLn2Beta.empty())  glades::ddp::allReduceSumInPlace(&b.gLn2Beta[0], b.gLn2Beta.size());
-				if (!b.gW1.empty()) glades::ddp::allReduceSumInPlace(&b.gW1[0], b.gW1.size());
-				if (!b.gW2.empty()) glades::ddp::allReduceSumInPlace(&b.gW2[0], b.gW2.size());
-				if (!b.gB1.empty()) glades::ddp::allReduceSumInPlace(&b.gB1[0], b.gB1.size());
-				if (!b.gB2.empty()) glades::ddp::allReduceSumInPlace(&b.gB2[0], b.gB2.size());
+				if (!b.gWq.empty())      { bufs.push_back(&b.gWq[0]);      sizes.push_back(b.gWq.size()); }
+				if (!b.gWk.empty())      { bufs.push_back(&b.gWk[0]);      sizes.push_back(b.gWk.size()); }
+				if (!b.gWv.empty())      { bufs.push_back(&b.gWv[0]);      sizes.push_back(b.gWv.size()); }
+				if (!b.gWo.empty())      { bufs.push_back(&b.gWo[0]);      sizes.push_back(b.gWo.size()); }
+				if (!b.gBq.empty())      { bufs.push_back(&b.gBq[0]);      sizes.push_back(b.gBq.size()); }
+				if (!b.gBk.empty())      { bufs.push_back(&b.gBk[0]);      sizes.push_back(b.gBk.size()); }
+				if (!b.gBv.empty())      { bufs.push_back(&b.gBv[0]);      sizes.push_back(b.gBv.size()); }
+				if (!b.gBo.empty())      { bufs.push_back(&b.gBo[0]);      sizes.push_back(b.gBo.size()); }
+				if (!b.gLn1Gamma.empty()){ bufs.push_back(&b.gLn1Gamma[0]);sizes.push_back(b.gLn1Gamma.size()); }
+				if (!b.gLn1Beta.empty()) { bufs.push_back(&b.gLn1Beta[0]); sizes.push_back(b.gLn1Beta.size()); }
+				if (!b.gLn2Gamma.empty()){ bufs.push_back(&b.gLn2Gamma[0]);sizes.push_back(b.gLn2Gamma.size()); }
+				if (!b.gLn2Beta.empty()) { bufs.push_back(&b.gLn2Beta[0]); sizes.push_back(b.gLn2Beta.size()); }
+				if (!b.gW1.empty())      { bufs.push_back(&b.gW1[0]);      sizes.push_back(b.gW1.size()); }
+				if (!b.gW2.empty())      { bufs.push_back(&b.gW2[0]);      sizes.push_back(b.gW2.size()); }
+				if (!b.gB1.empty())      { bufs.push_back(&b.gB1[0]);      sizes.push_back(b.gB1.size()); }
+				if (!b.gB2.empty())      { bufs.push_back(&b.gB2[0]);      sizes.push_back(b.gB2.size()); }
 			}
-			// AllReduce SUM timeStepsInBatch so applyBatch divides by global total.
-			glades::ddp::allReduceSumInPlace(&timeStepsInBatch, 1);
+
+			int numBufs = static_cast<int>(bufs.size());
+			glades::ddp::allReduceSumInPlaceBucketed(
+				numBufs > 0 ? &bufs[0] : NULL,
+				numBufs > 0 ? &sizes[0] : NULL,
+				numBufs,
+				&timeStepsInBatch, 1);
 		}
 	};
 	DDPReduceGrads ddpReduceGrads(tt, nLayers);

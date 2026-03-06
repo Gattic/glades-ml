@@ -397,8 +397,12 @@ struct DDPConfig
 	int rank;               // this worker's rank (0 = root)
 	int worldSize;          // total workers
 	int rootPort;           // port root listens on
+	int compressionMode;    // 0=none, 1=FP16, 2=FP16+TopK
+	float topKRatio;        // fraction of gradients to keep (default 0.01)
+	int topKWarmupSteps;    // use FP16-only for first N steps (default 0)
 	DDPConfig() : enable(false), linearLRScaling(true),
-	              rank(0), worldSize(1), rootPort(9200) {}
+	              rank(0), worldSize(1), rootPort(9200),
+	              compressionMode(0), topKRatio(0.01f), topKWarmupSteps(0) {}
 };
 
 // CNN-specific run configuration.

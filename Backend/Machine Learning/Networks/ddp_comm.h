@@ -48,6 +48,22 @@ void barrier();
 // Root broadcasts data to all workers. Workers receive into same buffer.
 void broadcastFromRoot(float* data, size_t count);
 
+// Compression configuration (call after init, before training).
+// mode: 0=none (raw FP32), 1=FP16, 2=FP16+TopK
+void setCompression(int mode);
+void setTopKRatio(float ratio);
+void setTopKWarmupSteps(int steps);
+
+// Bucketed AllReduce: concatenates numBuffers gradient vectors into one
+// flat buffer, performs a single compressed allReduce, then scatters
+// results back into the original buffers.
+// scalarBuf/scalarCount: small exact-precision values (e.g. timeStepsInBatch)
+// that bypass compression and are always sent as raw float32.
+void allReduceSumInPlaceBucketed(float** buffers, size_t* counts,
+                                 int numBuffers,
+                                 unsigned int* scalarBuf,
+                                 size_t scalarCount);
+
 } // namespace ddp
 } // namespace glades
 
