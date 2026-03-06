@@ -2032,6 +2032,55 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					targetsProcessed += static_cast<unsigned long long>(T);
 				}
 
+				// Periodic progress logging (mirrors CPU path).
+				if (logger && (s + 1u) < seqCount)
+				{
+					const int64_t nowMs = getCurrentTimeMilliseconds();
+					const bool dueBySeq = (((s + 1u) % progressEverySeq) == 0u);
+					const bool dueByTime = ((nowMs - lastProgressMs) >= kProgressIntervalMs);
+					if (dueBySeq || dueByTime)
+					{
+						lastProgressMs = nowMs;
+						const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
+						const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
+						const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
+
+						std::ostringstream oss;
+						oss << "event=nn_epoch_progress";
+						append_logfmt_kv(oss, "net_type", netType);
+						append_logfmt_kv(oss, "run_type", std::string("train"));
+						append_logfmt_kv(oss, "gpu", true);
+						append_logfmt_kv(oss, "epoch", epochIdx);
+						append_logfmt_kv(oss, "seq_done", s + 1u);
+						append_logfmt_kv(oss, "seq_total", seqCount);
+						append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
+						append_logfmt_kv(oss, "targets_seen", targetsProcessed);
+						append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
+						if (tokenLM)
+						{
+							append_logfmt_kv(oss, "token_lm_loss_kind", std::string("full_softmax"));
+							append_logfmt_kv(oss, "nll", meanNll);
+							double ppl = 0.0;
+							if (tokenLmTokenCount > 0ULL)
+							{
+								double arg = meanNll;
+								if (arg > 80.0) arg = 80.0;
+								if (arg < -80.0) arg = -80.0;
+								ppl = exp(arg);
+							}
+							append_logfmt_kv(oss, "perplexity", ppl);
+							append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+						}
+						else
+						{
+							append_logfmt_kv(oss, "loss_so_far", overallTotalError);
+						}
+						append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+						append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tensorTransformer.optimizerStep));
+						logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+					}
+				}
+
 				// === GPU Backward pass ===
 				if (seqInBatch == 0u)
 				{
