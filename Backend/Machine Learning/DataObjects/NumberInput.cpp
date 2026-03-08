@@ -29,6 +29,15 @@
 #include <string>
 #include <cstdio> // snprintf
 #include <sys/stat.h>
+#ifdef _MSC_VER
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#endif
+#include <sys/stat.h>
 
 using namespace glades;
 

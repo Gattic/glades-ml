@@ -360,9 +360,19 @@ shmea::GList glades::NNetwork::getWeightsForGui() const
 
 int64_t NNetwork::getCurrentTimeMilliseconds() const
 {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER uli;
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    // FILETIME is 100-ns intervals since 1601-01-01; convert to ms since epoch
+    return static_cast<int64_t>((uli.QuadPart - 116444736000000000ULL) / 10000ULL);
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return static_cast<unsigned long long>(tv.tv_sec) * 1000ULL + tv.tv_usec / 1000ULL;
+#endif
 }
 
 bool glades::NNetwork::getRunning() const

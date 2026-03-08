@@ -21,10 +21,12 @@
 #include "../Database/GPointer.h"
 #include "../Database/GLogger.h"
 #include "socket.h"
+#include "../Core/GMutex.h"
+#include "../Core/GThread.h"
+#include "../Core/GCondVar.h"
 #include <errno.h>
 #include <iostream>
 #include <map>
-#include <pthread.h>
 #include <queue>
 #include <set>
 #include <stdio.h>
@@ -32,8 +34,9 @@
 #include <string.h>
 #include <string>
 #include <sys/types.h>
-#include <sys/signal.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <vector>
 /*#include <openssl/bio.h>
 #include <openssl/err.h>
@@ -74,7 +77,7 @@ public:
 	class GServer* serverInstance;
 	class Connection* cConnection;
 	shmea::GPointer<shmea::ServiceData> sockData;
-	pthread_t sThread;
+	shmea::GThread sThread;
 	shmea::GString command;
 	shmea::GString serviceKey;
 	int stIndex;
@@ -89,21 +92,21 @@ class GServer
 
 	// Detached outbound connect launcher threads (LaunchInstance) must be accounted for so
 	// GServer can shut down safely without use-after-free.
-	pthread_mutex_t* launchMutex;
-	pthread_cond_t* launchCond;
+	shmea::GMutex launchMutex;
+	shmea::GCondVar launchCond;
 	unsigned int launchInFlight;
 	void waitForLaunchThreads();
 
 	// Bounded worker pool for executing Services (replaces thread-per-request)
-	pthread_mutex_t* serviceMutex;
-	pthread_cond_t* serviceCond;
+	shmea::GMutex serviceMutex;
+	shmea::GCondVar serviceCond;
 	std::queue<newServiceArgs*> serviceQueue;
-	std::vector<pthread_t> serviceWorkers;
+	std::vector<shmea::GThread*> serviceWorkers;
 	unsigned int serviceQueueMax;
 	bool serviceStopRequested;
 
 	// Thread-safe logout requests from worker threads
-	pthread_mutex_t* logoutMutex;
+	shmea::GMutex logoutMutex;
 	std::queue<Connection*> logoutQueue;
 	void drainLogoutQueue();
 
@@ -122,17 +125,17 @@ class GServer
 	std::map<shmea::GString, std::vector<int> >serverCLookUp;
 	std::vector<Connection*> serverC;
 
-	int sockfd;
+	socket_t sockfd;
 	bool cryptEnabled;
-	pthread_t* commandThread;
-	pthread_t* writerThread;
-	// Thread lifecycle bookkeeping (pthread_join is only valid if started).
+	shmea::GThread commandThread;
+	shmea::GThread writerThread;
+	// Thread lifecycle bookkeeping (join is only valid if started).
 	bool commandThreadStarted;
 	bool writerThreadStarted;
-	pthread_mutex_t* clientMutex;
-	pthread_mutex_t* serverMutex;
-	pthread_mutex_t* writersMutex;
-	pthread_cond_t* writersBlock;
+	shmea::GMutex clientMutex;
+	shmea::GMutex serverMutex;
+	shmea::GMutex writersMutex;
+	shmea::GCondVar writersBlock;
 	// Protects `writersBlock` wakeups to avoid missed signals.
 	// Accessed only while holding `writersMutex`.
 	unsigned int writerWakeups;
@@ -145,8 +148,8 @@ class GServer
 	void interruptAllIO();
 
 	// Protects service registry maps and running-service keyed locks.
-	pthread_mutex_t* servicesMutex;
-	std::map<shmea::GString, pthread_mutex_t*> runningServiceLocks;
+	shmea::GMutex servicesMutex;
+	std::map<shmea::GString, shmea::GMutex*> runningServiceLocks;
 
 	std::map<shmea::GString, Service*> service_depot;
 	std::map<shmea::GString, Service*> running_services;
@@ -178,15 +181,15 @@ class GServer
 
 	// Returns a mutex used to serialize access to `running_services[key]`.
 	// Caller should lock/unlock it (may return NULL if key is empty).
-	pthread_mutex_t* getOrCreateRunningServiceMutex(const shmea::GString& key);
+	shmea::GMutex* getOrCreateRunningServiceMutex(const shmea::GString& key);
 
-	int getSockFD();
+	socket_t getSockFD();
 	const std::vector<Connection*> getClientConnections();
 	const std::vector<Connection*> getServerConnections();
-	pthread_mutex_t* getClientMutex();
-	pthread_mutex_t* getServerMutex();
+	shmea::GMutex* getClientMutex();
+	shmea::GMutex* getServerMutex();
 
-	bool isConnection(int, const fd_set&);
+	bool isConnection(socket_t, const fd_set&);
 	Connection* setupNewConnection(int);
 	Connection* findExistingConnection(const std::vector<Connection*>&, const fd_set&);
 

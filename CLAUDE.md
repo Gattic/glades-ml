@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build Commands
+## Build Commands (Linux)
 
 **Build the library** (from project root):
 ```bash
@@ -23,6 +23,65 @@ cd unit-tests && bash test.sh nnall    # run all tests
 **Available single test names**: `nn`, `nn-recurrent`, `nn-transformer`, `transformer-serving` (or `serving`), `nn-bench`, `pca`, `kmeans`, `bayes`, `bayes-optimizer`, `bayes-optimizer-nd`, `ohe`, `mapped`, `cv`, `save-load`, `nn-mixed-precision` (or `nn-mp`), `prop-fuzz`, `parallel`, `ddp`, `transformer-improvements` (or `ti`), `gpu-training`, `cnn`, `cnn-mnist`, `garch`, `egarch`, `gan`, `search-space`, `hp-tuner`, `bayes-lr`, `hp-tuner-full`
 
 **Install**: `cd build && make install` (installs to `~/.local`)
+
+## Windows Installation
+
+### Prerequisites
+
+1. **Visual Studio 2022 Build Tools** with the "Desktop development with C++" workload:
+   - Download from https://visualstudio.microsoft.com/visual-cpp-build-tools/
+   - In the installer, select "Desktop development with C++" workload
+
+2. **vcpkg** (C++ package manager):
+   ```powershell
+   git clone https://github.com/microsoft/vcpkg.git C:\path\to\vcpkg
+   .\vcpkg\bootstrap-vcpkg.bat
+   # Set VCPKG_ROOT environment variable to C:\path\to\vcpkg
+   ```
+
+3. **FreeType** (required by shmea):
+   ```powershell
+   vcpkg install freetype:x64-windows
+   ```
+
+4. **CUDA Toolkit** (optional, for GPU support):
+   - Download from https://developer.nvidia.com/cuda-downloads
+   - Ensure `CUDA_PATH` environment variable is set after install
+
+### Build shmea first
+
+glades-ml depends on shmea. Build and install it before building glades-ml:
+```powershell
+cd C:\path\to\ShmeaDB
+cmake --preset windows-release
+cmake --build --preset windows-release
+cmake --install build
+```
+
+### Build glades-ml
+
+From a Developer PowerShell for VS 2022 (or after running `Enter-VsDevShell`):
+
+```powershell
+# Without CUDA
+cmake --preset windows-release
+cmake --build --preset windows-release
+cmake --install build
+
+# With CUDA
+cmake --preset windows-cuda
+cmake --build --preset windows-cuda
+cmake --install build
+```
+
+### Build and run unit tests (Windows)
+
+```powershell
+cd unit-tests
+cmake --preset windows-release   # or windows-cuda
+cmake --build --preset windows-release
+.\build\glades-unit-tests.exe nnall
+```
 
 ## Project Overview
 

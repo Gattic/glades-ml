@@ -18,17 +18,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/time.h>
+#endif
 #include <cmath>
 #include <string>
 #include <vector>
 
+
+#ifdef _WIN32
+#include "Backend/Core/platform.h"
+#endif
+
 namespace {
 static int64_t now_ms()
 {
+#ifdef _WIN32
+	FILETIME ft;
+	GetSystemTimeAsFileTime(&ft);
+	ULARGE_INTEGER uli;
+	uli.LowPart = ft.dwLowDateTime;
+	uli.HighPart = ft.dwHighDateTime;
+	return static_cast<int64_t>((uli.QuadPart - 116444736000000000ULL) / 10000ULL);
+#else
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return static_cast<int64_t>(tv.tv_sec) * 1000LL + static_cast<int64_t>(tv.tv_usec) / 1000LL;
+#endif
 }
 
 static bool streq(const char* a, const char* b) { return (a && b && strcmp(a, b) == 0); }

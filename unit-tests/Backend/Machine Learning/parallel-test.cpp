@@ -120,20 +120,40 @@ struct ThreadCountGuard
 	{
 		char buf[32];
 		snprintf(buf, sizeof(buf), "%u", n);
+#ifdef _WIN32
+		_putenv_s("GLADES_NUM_THREADS", buf);
+#else
 		::setenv("GLADES_NUM_THREADS", buf, 1);
+#endif
 	}
 
 	void unset()
 	{
+#ifdef _WIN32
+		_putenv_s("GLADES_NUM_THREADS", "");
+#else
 		::unsetenv("GLADES_NUM_THREADS");
+#endif
 	}
 
 	~ThreadCountGuard()
 	{
 		if (hadOld)
+		{
+#ifdef _WIN32
+			_putenv_s("GLADES_NUM_THREADS", oldValue.c_str());
+#else
 			::setenv("GLADES_NUM_THREADS", oldValue.c_str(), 1);
+#endif
+		}
 		else
+		{
+#ifdef _WIN32
+			_putenv_s("GLADES_NUM_THREADS", "");
+#else
 			::unsetenv("GLADES_NUM_THREADS");
+#endif
+		}
 	}
 
 private:

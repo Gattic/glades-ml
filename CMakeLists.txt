@@ -2,11 +2,16 @@ if(NOT (${CMAKE_BINARY_DIR} STREQUAL "${CMAKE_SOURCE_DIR}/build"))
 	message(FATAL_ERROR "Must be in \"build\" directory")
 endif()
 
-set (CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "default install path" FORCE)
+if(WIN32)
+    set(CMAKE_INSTALL_PREFIX "$ENV{USERPROFILE}/glades" CACHE PATH "default install path" FORCE)
+else()
+    set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "default install path" FORCE)
+endif()
 file(MAKE_DIRECTORY ${CMAKE_INSTALL_PREFIX}/include)
 
 #Init
 cmake_minimum_required(VERSION 3.10)
+cmake_policy(SET CMP0091 NEW)
 set(CMAKE_CXX_STANDARD 98)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -21,6 +26,9 @@ if(GLADES_ENABLE_CUDA)
 		find_program(_NVCC_BIN nvcc
 			PATHS /usr/local/cuda/bin /usr/local/cuda-12/bin
 			      /opt/cuda/bin ENV CUDA_PATH
+			      "$ENV{CUDA_PATH}/bin"
+			      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin"
+			      "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/bin"
 			NO_DEFAULT_PATH)
 		if(_NVCC_BIN)
 			set(CMAKE_CUDA_COMPILER "${_NVCC_BIN}" CACHE FILEPATH "CUDA compiler")
@@ -33,42 +41,46 @@ if(GLADES_ENABLE_CUDA)
 		set(CMAKE_CUDA_ARCHITECTURES native)
 	endif()
 
-	include(${CMAKE_SOURCE_DIR}/cmake/CudaGlibcCompat.cmake)
-	cuda_glibc_compat_apply()
-
-	# When the system default g++ is too new for nvcc, find an older one.
-	# The ccbin flag must be visible during CMake's compiler-identification
-	# step (NVCC_PREPEND_FLAGS, appended AFTER cuda_glibc_compat_apply) and
-	# during the actual build (CMAKE_CUDA_FLAGS).
-	#
-	# Detect the default g++ major version so we only try *older* ones
-	# (the default is already tried by nvcc automatically).
-	execute_process(COMMAND g++ -dumpversion
-		OUTPUT_VARIABLE _DEFAULT_GXX_VER OUTPUT_STRIP_TRAILING_WHITESPACE
-		ERROR_QUIET RESULT_VARIABLE _GXX_RC)
-	if(_GXX_RC EQUAL 0)
-		string(REGEX MATCH "^[0-9]+" _DEFAULT_GXX_MAJOR "${_DEFAULT_GXX_VER}")
-	else()
-		set(_DEFAULT_GXX_MAJOR "0")
+	if(NOT WIN32)
+		include(${CMAKE_SOURCE_DIR}/cmake/CudaGlibcCompat.cmake)
+		cuda_glibc_compat_apply()
 	endif()
 
-	set(_CUDA_HOST_CXX "")
-	foreach(_ver 14 13 12 11)
-		if("${_ver}" STREQUAL "${_DEFAULT_GXX_MAJOR}")
-			continue()   # same as default — nvcc already tries it
+	if(NOT WIN32)
+		# When the system default g++ is too new for nvcc, find an older one.
+		# The ccbin flag must be visible during CMake's compiler-identification
+		# step (NVCC_PREPEND_FLAGS, appended AFTER cuda_glibc_compat_apply) and
+		# during the actual build (CMAKE_CUDA_FLAGS).
+		#
+		# Detect the default g++ major version so we only try *older* ones
+		# (the default is already tried by nvcc automatically).
+		execute_process(COMMAND g++ -dumpversion
+			OUTPUT_VARIABLE _DEFAULT_GXX_VER OUTPUT_STRIP_TRAILING_WHITESPACE
+			ERROR_QUIET RESULT_VARIABLE _GXX_RC)
+		if(_GXX_RC EQUAL 0)
+			string(REGEX MATCH "^[0-9]+" _DEFAULT_GXX_MAJOR "${_DEFAULT_GXX_VER}")
+		else()
+			set(_DEFAULT_GXX_MAJOR "0")
 		endif()
-		find_program(_GCC_CANDIDATE g++-${_ver} PATHS /usr/bin NO_DEFAULT_PATH)
-		if(_GCC_CANDIDATE)
-			set(_CUDA_HOST_CXX "${_GCC_CANDIDATE}")
-			break()
+
+		set(_CUDA_HOST_CXX "")
+		foreach(_ver 14 13 12 11)
+			if("${_ver}" STREQUAL "${_DEFAULT_GXX_MAJOR}")
+				continue()   # same as default — nvcc already tries it
+			endif()
+			find_program(_GCC_CANDIDATE g++-${_ver} PATHS /usr/bin NO_DEFAULT_PATH)
+			if(_GCC_CANDIDATE)
+				set(_CUDA_HOST_CXX "${_GCC_CANDIDATE}")
+				break()
+			endif()
+			unset(_GCC_CANDIDATE CACHE)
+		endforeach()
+		if(_CUDA_HOST_CXX)
+			message(STATUS "Using CUDA host compiler: ${_CUDA_HOST_CXX}")
+			set(CMAKE_CUDA_HOST_COMPILER "${_CUDA_HOST_CXX}" CACHE FILEPATH "CUDA host compiler")
+			set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -ccbin ${_CUDA_HOST_CXX}")
+			set(ENV{NVCC_PREPEND_FLAGS} "$ENV{NVCC_PREPEND_FLAGS} -ccbin ${_CUDA_HOST_CXX}")
 		endif()
-		unset(_GCC_CANDIDATE CACHE)
-	endforeach()
-	if(_CUDA_HOST_CXX)
-		message(STATUS "Using CUDA host compiler: ${_CUDA_HOST_CXX}")
-		set(CMAKE_CUDA_HOST_COMPILER "${_CUDA_HOST_CXX}" CACHE FILEPATH "CUDA host compiler")
-		set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -ccbin ${_CUDA_HOST_CXX}")
-		set(ENV{NVCC_PREPEND_FLAGS} "$ENV{NVCC_PREPEND_FLAGS} -ccbin ${_CUDA_HOST_CXX}")
 	endif()
 
 	enable_language(CUDA)
@@ -78,18 +90,22 @@ endif()
 
 #Compiler Flags
 set(CMAKE_BUILD_TYPE Release) # -O3
-
-if(WIN32)
-	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static")
-else()
-	#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC") # its set below
-	set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
-endif()
-
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
+set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 #Project
 project(glades)
+
+if(MSVC)
+    add_compile_options(/W3 /wd4101 /wd4100)
+    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2")
+elseif(WIN32)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
+else()
+    set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
+endif()
 set(G_VERSION_MAJOR 0)
 set(G_VERSION_MINOR 57)
 
@@ -135,8 +151,11 @@ else()
 endif()
 
 #Link libraries
-target_link_libraries(${PROJECT_NAME}
-	ML GNet DB pthread) #custom libs
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} ML GNet DB)
+else()
+    target_link_libraries(${PROJECT_NAME} ML GNet DB pthread)
+endif()
 
 target_include_directories(glades PRIVATE "include")
 target_include_directories(glades PRIVATE "Backend")
@@ -195,6 +214,7 @@ add_custom_target(local
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
+if(NOT WIN32)
 #make debug
 add_custom_target(debug
 	COMMAND gdb ./build/${PROJECT_NAME}
@@ -228,3 +248,4 @@ add_custom_target(ddd
 	COMMAND xargs rm < ./build/install_manifest.txt
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
+endif()

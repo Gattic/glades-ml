@@ -17,14 +17,12 @@
 #ifndef _GSAVEFOLDER
 #define _GSAVEFOLDER
 
+#include "../Core/GDir.h"
 #include "GString.h"
-#include <dirent.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 namespace shmea {

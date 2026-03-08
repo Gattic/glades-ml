@@ -76,6 +76,9 @@ private:
 	void* mapBase;
 	unsigned long long mapBytes;
 	int fd;
+#ifdef _WIN32
+	void* hMapping; // HANDLE for CreateFileMapping
+#endif
 
 	// Parsed header.
 	unsigned long long nRows;

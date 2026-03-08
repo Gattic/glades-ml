@@ -19,7 +19,11 @@
 
 #include "GDeleter.h"
 #include <ctime>
+#ifdef _WIN32
+#include "../Core/platform.h"
+#else
 #include <pthread.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +38,11 @@ protected:
 
 	T* data;
 	unsigned int* refCount;
+#ifdef _WIN32
+	CRITICAL_SECTION* refMutex;
+#else
 	pthread_mutex_t* refMutex;
+#endif
 
 public:
 
@@ -42,15 +50,20 @@ public:
 	template <typename U, void(*UDeleter)(U*)>
 	friend class GPointer;
 
-	explicit GPointer(T* newData = NULL) : 
+	explicit GPointer(T* newData = NULL) :
 		data(newData),
 		refCount(newData ? new unsigned int(1) : NULL),
 		refMutex(NULL)
 	{
 		if (newData)
 		{
+#ifdef _WIN32
+			refMutex = new CRITICAL_SECTION;
+			InitializeCriticalSection(refMutex);
+#else
 			refMutex = new pthread_mutex_t;
 			pthread_mutex_init(refMutex, NULL);
+#endif
 		}
 	}
 
@@ -88,20 +101,24 @@ public:
 		{
 			return;
 		}
-		
+
 		unsigned int count = decrement();
 		if (count == 0)
 		{
 			// Store local copies before nulling members
 			T* dataToDelete = data;
 			unsigned int* countToDelete = refCount;
+#ifdef _WIN32
+			CRITICAL_SECTION* mutexToDelete = refMutex;
+#else
 			pthread_mutex_t* mutexToDelete = refMutex;
-			
+#endif
+
 			// Null members first
 			data = NULL;
 			refCount = NULL;
 			refMutex = NULL;
-			
+
 			// Delete after members are nulled
 			if (dataToDelete)
 			{
@@ -110,7 +127,11 @@ public:
 			delete countToDelete;
 			if (mutexToDelete)
 			{
+#ifdef _WIN32
+				DeleteCriticalSection(mutexToDelete);
+#else
 				pthread_mutex_destroy(mutexToDelete);
+#endif
 				delete mutexToDelete;
 			}
 		} else {
@@ -131,11 +152,23 @@ public:
 		if (refCount)
 		{
 			if (refMutex)
+			{
+#ifdef _WIN32
+				EnterCriticalSection(refMutex);
+#else
 				pthread_mutex_lock(refMutex);
+#endif
+			}
 			++(*refCount);
 			unsigned int v = *refCount;
 			if (refMutex)
+			{
+#ifdef _WIN32
+				LeaveCriticalSection(refMutex);
+#else
 				pthread_mutex_unlock(refMutex);
+#endif
+			}
 			return v;
 		}
 		return 0;
@@ -146,11 +179,23 @@ public:
 		if (refCount)
 		{
 			if (refMutex)
+			{
+#ifdef _WIN32
+				EnterCriticalSection(refMutex);
+#else
 				pthread_mutex_lock(refMutex);
+#endif
+			}
 			--(*refCount);
 			unsigned int v = *refCount;
 			if (refMutex)
+			{
+#ifdef _WIN32
+				LeaveCriticalSection(refMutex);
+#else
 				pthread_mutex_unlock(refMutex);
+#endif
+			}
 			return v;
 		}
 		return 0;
@@ -196,11 +241,11 @@ public:
 		if(this != &g2)
 		{
 			reset();
-			
+
 			data = g2.data;
 			refCount = g2.refCount;
 			refMutex = g2.refMutex;
-			
+
 			increment();
 		}
 

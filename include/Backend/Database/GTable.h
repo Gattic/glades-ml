@@ -24,8 +24,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#ifndef _WIN32
 #include <strings.h>
+#endif
 #include <sys/stat.h>
+
+#ifdef _MSC_VER
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+#endif
 #include <vector>
 
 namespace shmea {

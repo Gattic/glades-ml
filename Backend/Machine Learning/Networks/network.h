@@ -40,7 +40,9 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#ifndef _WIN32
 #include <sys/time.h>
+#endif
 #include <stdint.h>
 
 #ifdef GLADES_HAVE_CUDA
@@ -55,7 +57,7 @@
 
 // Concurrency primitives:
 // Prefer standard C++ atomics when available; fall back to legacy builtins otherwise.
-#if __cplusplus >= 201103L
+#if __cplusplus >= 201103L || (defined(_MSC_VER) && _MSC_VER >= 1700)
 #include <atomic>
 #define GLADES_HAVE_STD_ATOMICS 1
 #else

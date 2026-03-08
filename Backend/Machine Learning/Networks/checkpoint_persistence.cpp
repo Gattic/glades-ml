@@ -21,7 +21,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
 #include <dirent.h>
+#include <unistd.h>
+#else
+#include "Backend/Core/platform.h"
+#include <io.h>
+#include <process.h>
+#define unlink _unlink
+#define rmdir _rmdir
+#define getpid _getpid
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#endif
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -31,7 +47,6 @@
 #include <string>
 #include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -313,6 +328,37 @@ static bool rename_atomic(const std::string& from, const std::string& to)
 
 static bool remove_tree_recursive(const std::string& path)
 {
+#ifdef _WIN32
+	if (!stat_is_dir(path))
+	{
+		if (stat_is_file(path))
+			return ::_unlink(path.c_str()) == 0;
+		return true;
+	}
+	std::string pattern = path + "\\*";
+	WIN32_FIND_DATAA fd;
+	HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+	if (hFind == INVALID_HANDLE_VALUE)
+		return ::_rmdir(path.c_str()) == 0;
+	do
+	{
+		const char* name = fd.cFileName;
+		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+			continue;
+		const std::string child = join_dir(path, std::string(name));
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+		{
+			(void)remove_tree_recursive(child);
+			(void)::_rmdir(child.c_str());
+		}
+		else
+		{
+			(void)::_unlink(child.c_str());
+		}
+	} while (FindNextFileA(hFind, &fd));
+	FindClose(hFind);
+	return ::_rmdir(path.c_str()) == 0;
+#else
 	DIR* d = ::opendir(path.c_str());
 	if (!d)
 	{
@@ -344,6 +390,7 @@ static bool remove_tree_recursive(const std::string& path)
 	}
 	::closedir(d);
 	return ::rmdir(path.c_str()) == 0;
+#endif
 }
 
 static bool write_kv(std::ostream& out, const std::string& k, const std::string& v)
@@ -2609,7 +2656,11 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			struct stat st;
 			const std::string shardPath = dir + shardFile;
 			// Do not follow symlinks for checkpoint shards.
+#ifdef _WIN32
+			if (::stat(shardPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#else
 			if (::lstat(shardPath.c_str(), &st) != 0 || S_ISLNK(st.st_mode) || !S_ISREG(st.st_mode))
+#endif
 			{
 				const NNetworkStatus stt = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: shard file missing or not a regular file");
 				close_and_delete_shards(shardStreams);

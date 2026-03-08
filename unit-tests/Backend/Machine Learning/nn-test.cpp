@@ -968,12 +968,12 @@ static bool read_last_result_pred(const glades::NNetwork& net, float& outPred)
 	return true;
 }
 
-static glades::NNetwork load_with_overridden_weights_DFF(const glades::NNInfo* info,
-                                                        const glades::NumberInput* di,
-                                                        const std::string& modelName,
-                                                        unsigned int seed,
-                                                        float w,
-                                                        float b)
+static glades::NNetwork* load_with_overridden_weights_DFF(const glades::NNInfo* info,
+                                                         const glades::NumberInput* di,
+                                                         const std::string& modelName,
+                                                         unsigned int seed,
+                                                         float w,
+                                                         float b)
 {
 	// These override-style tests intentionally patch weights.bin after saveModel().
 	// Ensure file integrity verification is disabled regardless of caller environment.
@@ -1004,18 +1004,18 @@ static glades::NNetwork load_with_overridden_weights_DFF(const glades::NNInfo* i
 	         write_dff_weights("database/models/" + modelName + "/weights.bin", w, b));
 
 	// 3) Load into a fresh net (ensures runtime uses the overridden packed weights).
-	glades::NNetwork net(glades::NNetwork::TYPE_DFF);
-	const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+	glades::NNetwork* net = new glades::NNetwork(glades::NNetwork::TYPE_DFF);
+	const glades::NNetworkStatus stLoad = net->loadModel(modelName, di);
 	G_assert(__FILE__, __LINE__, "==============NN::DFF_LoadOverrideModel() Failed==============", stLoad.ok());
 	return net;
 }
 
-static glades::NNetwork load_with_overridden_weights_RNN_1x1x1(const glades::NNInfo* info,
-                                                               const glades::NumberInput* di,
-                                                               const std::string& modelName,
-                                                               unsigned int seed,
-                                                               float Wxh, float Whh, float bh,
-                                                               float Why, float by)
+static glades::NNetwork* load_with_overridden_weights_RNN_1x1x1(const glades::NNInfo* info,
+                                                                const glades::NumberInput* di,
+                                                                const std::string& modelName,
+                                                                unsigned int seed,
+                                                                float Wxh, float Whh, float bh,
+                                                                float Why, float by)
 {
 	// These override-style tests intentionally patch weights.bin after saveModel().
 	// Ensure file integrity verification is disabled regardless of caller environment.
@@ -1041,20 +1041,20 @@ static glades::NNetwork load_with_overridden_weights_RNN_1x1x1(const glades::NNI
 	G_assert(__FILE__, __LINE__, "==============NN::RNN_WriteOverrideWeights() Failed==============",
 	         write_rnn_weights_1x1x1("database/models/" + modelName + "/weights.bin", Wxh, Whh, bh, Why, by));
 
-	glades::NNetwork net(glades::NNetwork::TYPE_RNN);
-	const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+	glades::NNetwork* net = new glades::NNetwork(glades::NNetwork::TYPE_RNN);
+	const glades::NNetworkStatus stLoad = net->loadModel(modelName, di);
 	G_assert(__FILE__, __LINE__, "==============NN::RNN_LoadOverrideModel() Failed==============", stLoad.ok());
 	return net;
 }
 
-static glades::NNetwork load_with_overridden_weights_Gated_1layer_1x1x1(const glades::NNInfo* info,
-                                                                        const glades::NumberInput* di,
-                                                                        const std::string& modelName,
-                                                                        int netType,
-                                                                        unsigned int seed,
-                                                                        unsigned int gateCount,
-                                                                        float Why,
-                                                                        float by)
+static glades::NNetwork* load_with_overridden_weights_Gated_1layer_1x1x1(const glades::NNInfo* info,
+                                                                         const glades::NumberInput* di,
+                                                                         const std::string& modelName,
+                                                                         int netType,
+                                                                         unsigned int seed,
+                                                                         unsigned int gateCount,
+                                                                         float Why,
+                                                                         float by)
 {
 	// Ensure file integrity verification is disabled regardless of caller environment.
 	EnvVarGuard verify("GLADES_MODEL_VERIFY_FILES");
@@ -1083,8 +1083,8 @@ static glades::NNetwork load_with_overridden_weights_Gated_1layer_1x1x1(const gl
 	                                          Why,
 	                                          by));
 
-	glades::NNetwork net(netType);
-	const glades::NNetworkStatus stLoad = net.loadModel(modelName, di);
+	glades::NNetwork* net = new glades::NNetwork(netType);
+	const glades::NNetworkStatus stLoad = net->loadModel(modelName, di);
 	G_assert(__FILE__, __LINE__, "==============NN::Gated_LoadOverrideModel() Failed==============", stLoad.ok());
 	return net;
 }
@@ -1210,13 +1210,13 @@ void NNUnitTest()
 		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_minibatch_timing", in, hidden, out);
 
-		glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_minibatch", 123u, /*w*/ 1.0f, /*b*/ 0.0f);
-		net.getTerminatorMutable().setEpoch(1);
-		net.getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_minibatch", 123u, /*w*/ 1.0f, /*b*/ 0.0f);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net.train(di);
+		const glades::NNetworkStatus st = net->train(di);
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_Minibatch TrainStatus() Failed==============", st.ok());
-		const glades::NNetworkStatus stSave = net.saveModel("ut_pkg_dff_minibatch_after");
+		const glades::NNetworkStatus stSave = net->saveModel("ut_pkg_dff_minibatch_after");
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_Minibatch SaveModel() Failed==============", stSave.ok());
 
 		float wFinal = 0.0f;
@@ -1228,6 +1228,7 @@ void NNUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_MinibatchUpdate() Failed==============",
                  (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
 
+		delete net;
 		delete di;
 		delete info;
     }
@@ -1253,13 +1254,13 @@ void NNUnitTest()
 		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l2", in, hidden, out);
 
-		glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l2", 321u, /*w*/ 1.0f, /*b*/ 0.0f);
-		net.getTerminatorMutable().setEpoch(1);
-		net.getTerminatorMutable().setAccuracy(0);
+		glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l2", 321u, /*w*/ 1.0f, /*b*/ 0.0f);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
 
-		const glades::NNetworkStatus st = net.train(di);
+		const glades::NNetworkStatus st = net->train(di);
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2 TrainStatus() Failed==============", st.ok());
-		const glades::NNetworkStatus stSave = net.saveModel("ut_pkg_dff_l2_after");
+		const glades::NNetworkStatus stSave = net->saveModel("ut_pkg_dff_l2_after");
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2 SaveModel() Failed==============", stSave.ok());
 
 		float wFinal = 0.0f;
@@ -1271,6 +1272,7 @@ void NNUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::DFF_L2WeightDecay() Failed==============",
                  (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
 
+		delete net;
 		delete di;
 		delete info;
     }
@@ -1301,11 +1303,11 @@ void NNUnitTest()
             std::vector<glades::HiddenLayerInfo*> hidden;
             glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
             glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l1_pos", in, hidden, out);
-			glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_pos", 777u, /*w*/ 1.0f, /*b*/ 0.0f);
-            net.getTerminatorMutable().setEpoch(1);
-            net.getTerminatorMutable().setAccuracy(0);
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) TrainStatus() Failed==============", net.train(di).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) SaveModel() Failed==============", net.saveModel("ut_pkg_dff_l1_pos_after").ok());
+			glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_pos", 777u, /*w*/ 1.0f, /*b*/ 0.0f);
+            net->getTerminatorMutable().setEpoch(1);
+            net->getTerminatorMutable().setAccuracy(0);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) TrainStatus() Failed==============", net->train(di).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) SaveModel() Failed==============", net->saveModel("ut_pkg_dff_l1_pos_after").ok());
 			float wFinal = 0.0f;
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) ReadWeight() Failed==============",
 			         read_first_dff_weight("database/models/ut_pkg_dff_l1_pos_after/weights.bin", wFinal));
@@ -1313,6 +1315,7 @@ void NNUnitTest()
 			printf("[UT] DFF L1(+1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(+1) WeightDecay() Failed==============",
                      (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
+            delete net;
             delete info;
         }
 
@@ -1330,11 +1333,11 @@ void NNUnitTest()
             std::vector<glades::HiddenLayerInfo*> hidden;
             glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
             glades::NNInfo* info = new glades::NNInfo("ut_weight_decay_l1_neg", in, hidden, out);
-			glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_neg", 778u, /*w*/ -1.0f, /*b*/ 0.0f);
-            net.getTerminatorMutable().setEpoch(1);
-            net.getTerminatorMutable().setAccuracy(0);
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) TrainStatus() Failed==============", net.train(di).ok());
-			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) SaveModel() Failed==============", net.saveModel("ut_pkg_dff_l1_neg_after").ok());
+			glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_l1_neg", 778u, /*w*/ -1.0f, /*b*/ 0.0f);
+            net->getTerminatorMutable().setEpoch(1);
+            net->getTerminatorMutable().setAccuracy(0);
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) TrainStatus() Failed==============", net->train(di).ok());
+			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) SaveModel() Failed==============", net->saveModel("ut_pkg_dff_l1_neg_after").ok());
 			float wFinal = 0.0f;
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) ReadWeight() Failed==============",
 			         read_first_dff_weight("database/models/ut_pkg_dff_l1_neg_after/weights.bin", wFinal));
@@ -1342,6 +1345,7 @@ void NNUnitTest()
 			printf("[UT] DFF L1(-1) final weight = %f (expected ~%f)\n", wFinal, expectedW);
 			G_assert(__FILE__, __LINE__, "==============NN::DFF_L1(-1) WeightDecay() Failed==============",
                      (wFinal > expectedW - tol) && (wFinal < expectedW + tol));
+            delete net;
             delete info;
         }
 
@@ -1393,10 +1397,10 @@ void NNUnitTest()
 		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_reg_metrics", in, hidden, out);
 
-		glades::NNetwork net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_reg_metrics", 999u, /*w*/ 1.0f, /*b*/ 0.0f);
+		glades::NNetwork* net = load_with_overridden_weights_DFF(info, di, "ut_pkg_dff_reg_metrics", 999u, /*w*/ 1.0f, /*b*/ 0.0f);
 
         CaptureMetricsCb cb;
-		const glades::NNetworkStatus st = net.test(di, &cb);
+		const glades::NNetworkStatus st = net->test(di, &cb);
 		G_assert(__FILE__, __LINE__, "==============NN::RegMetrics TestStatus() Failed==============", st.ok());
 		G_assert(__FILE__, __LINE__, "==============NN::RegMetrics SawMetrics() Failed==============", cb.saw);
 
@@ -1412,6 +1416,7 @@ void NNUnitTest()
 			G_assert(__FILE__, __LINE__, "==============NN::RegMetrics RMSE() Failed==============", fabs(cb.last.regRMSE - expRMSE) < tol);
 		}
 
+		delete net;
 		delete di;
 		delete info;
     }
@@ -1829,14 +1834,14 @@ void NNRecurrentUnitTest()
 		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_rnn_forward", in, hidden, out);
 
-		glades::NNetwork net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_forward", 4242u,
-		                                                              /*Wxh*/ 1.0f, /*Whh*/ 1.0f, /*bh*/ 0.0f,
-		                                                              /*Why*/ 1.0f, /*by*/ 0.0f);
-		const glades::NNetworkStatus st = net.test(di);
+		glades::NNetwork* net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_forward", 4242u,
+		                                                               /*Wxh*/ 1.0f, /*Whh*/ 1.0f, /*bh*/ 0.0f,
+		                                                               /*Why*/ 1.0f, /*by*/ 0.0f);
+		const glades::NNetworkStatus st = net->test(di);
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward TestStatus() Failed==============", st.ok());
 
 		float pred = 0.0f;
-		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward GetPred() Failed==============", read_last_result_pred(net, pred));
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward GetPred() Failed==============", read_last_result_pred(*net, pred));
 		// h1=2, h2=3 + 2 = 5, y2=5
 		const float expected = 5.0f;
 		const float tol = 1e-4f;
@@ -1845,7 +1850,7 @@ void NNRecurrentUnitTest()
 
 		// End-to-end persistence: save model, reload, and re-check the same prediction.
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward SaveModel() Failed==============",
-		         net.saveModel("ut_pkg_rnn_forward_after").ok());
+		         net->saveModel("ut_pkg_rnn_forward_after").ok());
 		glades::NNetwork net2(glades::NNetwork::TYPE_RNN);
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward ReloadModel() Failed==============",
 		         net2.loadModel("ut_pkg_rnn_forward_after", di).ok());
@@ -1855,6 +1860,7 @@ void NNRecurrentUnitTest()
 		printf("[UT] RNN reload last pred = %f (expected %f)\n", pred2, expected);
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Forward Reload PredMismatch() Failed==============", fabs(pred2 - expected) < tol);
 
+		delete net;
 		delete di;
 		delete info;
     }
@@ -1915,13 +1921,13 @@ void NNRecurrentUnitTest()
 		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_rnn_minibatch_semantics", in, hidden, out);
 
-		glades::NNetwork net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_minibatch_semantics", 1234u,
-		                                                              /*Wxh*/ 0.0f, /*Whh*/ 0.0f, /*bh*/ 0.0f,
-		                                                              /*Why*/ 0.0f, /*by*/ 0.0f);
-		net.getTerminatorMutable().setEpoch(1);
-		net.getTerminatorMutable().setAccuracy(0);
-		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch TrainStatus() Failed==============", net.train(di).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_rnn_minibatch_semantics_after").ok());
+		glades::NNetwork* net = load_with_overridden_weights_RNN_1x1x1(info, di, "ut_pkg_rnn_minibatch_semantics", 1234u,
+		                                                                /*Wxh*/ 0.0f, /*Whh*/ 0.0f, /*bh*/ 0.0f,
+		                                                                /*Why*/ 0.0f, /*by*/ 0.0f);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch TrainStatus() Failed==============", net->train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch SaveModel() Failed==============", net->saveModel("ut_pkg_rnn_minibatch_semantics_after").ok());
 
 		float byFinal = 0.0f;
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch ReadOutBias() Failed==============",
@@ -1932,6 +1938,7 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::RNN Minibatch OutBiasMismatch() Failed==============",
 		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
 
+		delete net;
 		delete di;
 		delete info;
 	}
@@ -1978,16 +1985,16 @@ void NNRecurrentUnitTest()
 		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_gru_minibatch_semantics", in, hidden, out);
 
-		glades::NNetwork net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_gru_minibatch_semantics",
-		                                                                       glades::NNetwork::TYPE_GRU,
-		                                                                       2233u,
-		                                                                       /*gateCount*/ 3u,
-		                                                                       /*Why*/ 0.0f,
-		                                                                       /*by*/ 0.0f);
-		net.getTerminatorMutable().setEpoch(1);
-		net.getTerminatorMutable().setAccuracy(0);
-		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch TrainStatus() Failed==============", net.train(di).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_gru_minibatch_semantics_after").ok());
+		glades::NNetwork* net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_gru_minibatch_semantics",
+		                                                                        glades::NNetwork::TYPE_GRU,
+		                                                                        2233u,
+		                                                                        /*gateCount*/ 3u,
+		                                                                        /*Why*/ 0.0f,
+		                                                                        /*by*/ 0.0f);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch TrainStatus() Failed==============", net->train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch SaveModel() Failed==============", net->saveModel("ut_pkg_gru_minibatch_semantics_after").ok());
 
 		float byFinal = 0.0f;
 		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch ReadOutBias() Failed==============",
@@ -2000,6 +2007,7 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::GRU Minibatch OutBiasMismatch() Failed==============",
 		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
 
+		delete net;
 		delete di;
 		delete info;
 	}
@@ -2046,16 +2054,16 @@ void NNRecurrentUnitTest()
 		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
 		glades::NNInfo* info = new glades::NNInfo("ut_lstm_minibatch_semantics", in, hidden, out);
 
-		glades::NNetwork net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_lstm_minibatch_semantics",
-		                                                                       glades::NNetwork::TYPE_LSTM,
-		                                                                       3344u,
-		                                                                       /*gateCount*/ 4u,
-		                                                                       /*Why*/ 0.0f,
-		                                                                       /*by*/ 0.0f);
-		net.getTerminatorMutable().setEpoch(1);
-		net.getTerminatorMutable().setAccuracy(0);
-		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch TrainStatus() Failed==============", net.train(di).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SaveModel() Failed==============", net.saveModel("ut_pkg_lstm_minibatch_semantics_after").ok());
+		glades::NNetwork* net = load_with_overridden_weights_Gated_1layer_1x1x1(info, di, "ut_pkg_lstm_minibatch_semantics",
+		                                                                        glades::NNetwork::TYPE_LSTM,
+		                                                                        3344u,
+		                                                                        /*gateCount*/ 4u,
+		                                                                        /*Why*/ 0.0f,
+		                                                                        /*by*/ 0.0f);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch TrainStatus() Failed==============", net->train(di).ok());
+		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch SaveModel() Failed==============", net->saveModel("ut_pkg_lstm_minibatch_semantics_after").ok());
 
 		float byFinal = 0.0f;
 		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch ReadOutBias() Failed==============",
@@ -2068,6 +2076,7 @@ void NNRecurrentUnitTest()
 		G_assert(__FILE__, __LINE__, "==============NN::LSTM Minibatch OutBiasMismatch() Failed==============",
 		         (byFinal > expectedBy - tol) && (byFinal < expectedBy + tol));
 
+		delete net;
 		delete di;
 		delete info;
 	}

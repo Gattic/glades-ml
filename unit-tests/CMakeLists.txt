@@ -2,18 +2,25 @@ if(NOT (${CMAKE_BINARY_DIR} STREQUAL "${CMAKE_SOURCE_DIR}/build"))
 	message(FATAL_ERROR "Must be in \"build\" directory")
 endif()
 
-set (CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "default install path" FORCE)
+if(WIN32)
+    set(CMAKE_INSTALL_PREFIX "$ENV{USERPROFILE}/glades" CACHE PATH "default install path" FORCE)
+else()
+    set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "default install path" FORCE)
+endif()
 file(MAKE_DIRECTORY ${CMAKE_INSTALL_PREFIX}/include)
 
 #Init
 cmake_minimum_required(VERSION 3.10)
+cmake_policy(SET CMP0091 NEW)
 
 # CUDA GPU offloading (must match main build when linking CUDA-built libraries)
 option(GLADES_ENABLE_CUDA "Build with CUDA GPU offloading support" OFF)
 if(GLADES_ENABLE_CUDA)
 	cmake_minimum_required(VERSION 3.18)
-	include(${CMAKE_SOURCE_DIR}/../cmake/CudaGlibcCompat.cmake)
-	cuda_glibc_compat_apply()
+	if(NOT WIN32)
+		include(${CMAKE_SOURCE_DIR}/../cmake/CudaGlibcCompat.cmake)
+		cuda_glibc_compat_apply()
+	endif()
 	enable_language(CUDA)
 	add_definitions(-DGLADES_HAVE_CUDA=1)
 endif()
@@ -21,21 +28,29 @@ endif()
 set(CMAKE_CXX_STANDARD 98)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-#Compiler Flags
-set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-#add_compile_options(-fsanitize=address)
-#add_link_options(-fsanitize=address)
-
 #Project
 project(glades-unit-tests)
+
+#Compiler Flags
+if(MSVC)
+    add_compile_options(/W3 /wd4101 /wd4100)
+    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+else()
+    set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+    set(CMAKE_CXX_FLAGS_DEBUG "-g")
+    #add_compile_options(-fsanitize=address)
+    #add_link_options(-fsanitize=address)
+endif()
 set(G_VERSION_MAJOR 0)
 set(G_VERSION_MINOR 57)
 
 set(DEFAULT_BUILD_TYPE "Release")
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+if(WIN32)
+  # On Windows, must match the Release-built glades library
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+elseif(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "Setting build type to '${DEFAULT_BUILD_TYPE}' as none was specified.")
   set(CMAKE_BUILD_TYPE "${DEFAULT_BUILD_TYPE}" CACHE STRING "Choose the type of build." FORCE)
   # Set the possible values of build type for cmake-gui
@@ -80,6 +95,7 @@ if(GLADES_ENABLE_CUDA)
 	set_target_properties(${PROJECT_NAME} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endif()
 
+if(NOT WIN32)
 #make run
 add_custom_target(run
 	COMMAND ${PROJECT_NAME} $(ARGS)
@@ -114,7 +130,9 @@ add_custom_target(profile
 	DEPENDS ${PROJECT_NAME}
 	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
+endif()
 
+if(NOT WIN32)
 # Generate a GNUmakefile wrapper in the build directory.
 # GNU Make prefers GNUmakefile over Makefile, so this is read first.
 # It captures trailing arguments (e.g. "make run cnn-mnist") and forwards
@@ -136,3 +154,4 @@ endif\n\
 \n\
 include Makefile\n"
 )
+endif()

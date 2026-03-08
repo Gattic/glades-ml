@@ -8,10 +8,17 @@
 #include <cstring>
 #include <limits>
 
+#ifdef _WIN32
+#include "Backend/Core/platform.h"
+#include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -92,6 +99,9 @@ glades::MappedFloatMatrix::MappedFloatMatrix()
     : mapBase(NULL),
       mapBytes(0ull),
       fd(-1),
+#ifdef _WIN32
+      hMapping(NULL),
+#endif
       nRows(0ull),
       nCols(0ull),
       dataOff(0ull),
@@ -106,6 +116,29 @@ glades::MappedFloatMatrix::~MappedFloatMatrix()
 
 void glades::MappedFloatMatrix::close()
 {
+#ifdef _WIN32
+	if (mapBase)
+	{
+		UnmapViewOfFile(mapBase);
+	}
+	mapBase = NULL;
+	mapBytes = 0ull;
+	dataPtr = NULL;
+	nRows = 0ull;
+	nCols = 0ull;
+	dataOff = 0ull;
+
+	if (hMapping)
+	{
+		CloseHandle(hMapping);
+		hMapping = NULL;
+	}
+	if (fd != -1)
+	{
+		CloseHandle(reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd)));
+		fd = -1;
+	}
+#else
 	if (mapBase && mapBytes > 0ull)
 	{
 		::munmap(mapBase, static_cast<size_t>(mapBytes));
@@ -122,6 +155,7 @@ void glades::MappedFloatMatrix::close()
 		::close(fd);
 	}
 	fd = -1;
+#endif
 }
 
 bool glades::MappedFloatMatrix::isOpen() const
@@ -159,6 +193,47 @@ bool glades::MappedFloatMatrix::openReadOnly(const std::string& path, std::strin
 		return false;
 	}
 
+#ifdef _WIN32
+	HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+	                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		set_err(errMsg, "MappedFloatMatrix::openReadOnly: CreateFile failed");
+		return false;
+	}
+	// Store as fd for bookkeeping (cast to int via intptr_t)
+	fd = static_cast<int>(reinterpret_cast<intptr_t>(hFile));
+
+	LARGE_INTEGER fileSize;
+	if (!GetFileSizeEx(hFile, &fileSize))
+	{
+		set_err(errMsg, "MappedFloatMatrix::openReadOnly: GetFileSizeEx failed");
+		close();
+		return false;
+	}
+	if (fileSize.QuadPart < static_cast<LONGLONG>(kHeaderBytes))
+	{
+		set_err(errMsg, "MappedFloatMatrix::openReadOnly: file too small");
+		close();
+		return false;
+	}
+
+	mapBytes = static_cast<unsigned long long>(fileSize.QuadPart);
+	hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+	if (!hMapping)
+	{
+		set_err(errMsg, "MappedFloatMatrix::openReadOnly: CreateFileMapping failed");
+		close();
+		return false;
+	}
+	mapBase = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+	if (!mapBase)
+	{
+		set_err(errMsg, "MappedFloatMatrix::openReadOnly: MapViewOfFile failed");
+		close();
+		return false;
+	}
+#else
 	fd = ::open(path.c_str(), O_RDONLY);
 	if (fd < 0)
 	{
@@ -189,6 +264,7 @@ bool glades::MappedFloatMatrix::openReadOnly(const std::string& path, std::strin
 		close();
 		return false;
 	}
+#endif
 
 	const unsigned char* hdr = reinterpret_cast<const unsigned char*>(mapBase);
 
@@ -305,7 +381,11 @@ bool glades::MappedFloatMatrix::writeFromDense(const std::string& path,
 	const unsigned long long dataBytes = rows * cols * 4ull;
 	const unsigned long long fileBytes = dataOffset + dataBytes;
 
+#ifdef _WIN32
+	int outFd = _open(path.c_str(), _O_CREAT | _O_TRUNC | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
 	const int outFd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+#endif
 	if (outFd < 0)
 	{
 		set_errno_err(errMsg, "MappedFloatMatrix::writeFromDense: open failed");
@@ -325,6 +405,15 @@ bool glades::MappedFloatMatrix::writeFromDense(const std::string& path,
 	write_u64_le(hdr + 48, 0ull);
 	write_u64_le(hdr + 56, 0ull);
 
+#ifdef _WIN32
+	int wr = _write(outFd, hdr, static_cast<unsigned int>(kHeaderBytes));
+	if (wr != static_cast<int>(kHeaderBytes))
+	{
+		set_errno_err(errMsg, "MappedFloatMatrix::writeFromDense: header write failed");
+		_close(outFd);
+		return false;
+	}
+#else
 	ssize_t wr = ::write(outFd, hdr, static_cast<size_t>(kHeaderBytes));
 	if (wr != static_cast<ssize_t>(kHeaderBytes))
 	{
@@ -332,6 +421,7 @@ bool glades::MappedFloatMatrix::writeFromDense(const std::string& path,
 		::close(outFd);
 		return false;
 	}
+#endif
 
 	// Write body in chunks (avoid a single gigantic write on huge datasets).
 	const unsigned char* bytes = reinterpret_cast<const unsigned char*>(rowMajorData);
@@ -339,11 +429,19 @@ bool glades::MappedFloatMatrix::writeFromDense(const std::string& path,
 	while (remaining > 0ull)
 	{
 		const unsigned long long chunk = (remaining > (16ull * 1024ull * 1024ull)) ? (16ull * 1024ull * 1024ull) : remaining;
+#ifdef _WIN32
+		const int w = _write(outFd, bytes, static_cast<unsigned int>(chunk));
+#else
 		const ssize_t w = ::write(outFd, bytes, static_cast<size_t>(chunk));
+#endif
 		if (w <= 0)
 		{
 			set_errno_err(errMsg, "MappedFloatMatrix::writeFromDense: data write failed");
+#ifdef _WIN32
+			_close(outFd);
+#else
 			::close(outFd);
+#endif
 			return false;
 		}
 		bytes += static_cast<unsigned long long>(w);
@@ -352,7 +450,11 @@ bool glades::MappedFloatMatrix::writeFromDense(const std::string& path,
 
 	// Best-effort size sanity (optional).
 	(void)fileBytes;
+#ifdef _WIN32
+	_close(outFd);
+#else
 	::close(outFd);
+#endif
 	return true;
 }
 
@@ -383,7 +485,11 @@ bool glades::MappedFloatMatrix::writeFromGMatrix(const std::string& path, const 
 	const unsigned long long dataOffset = kHeaderBytes;
 	const unsigned long long dataBytes = R * C * 4ull;
 
+#ifdef _WIN32
+	int outFd = _open(path.c_str(), _O_CREAT | _O_TRUNC | _O_WRONLY | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
 	const int outFd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+#endif
 	if (outFd < 0)
 	{
 		set_errno_err(errMsg, "MappedFloatMatrix::writeFromGMatrix: open failed");
@@ -401,6 +507,15 @@ bool glades::MappedFloatMatrix::writeFromGMatrix(const std::string& path, const 
 	write_u64_le(hdr + 48, 0ull);
 	write_u64_le(hdr + 56, 0ull);
 
+#ifdef _WIN32
+	int wr = _write(outFd, hdr, static_cast<unsigned int>(kHeaderBytes));
+	if (wr != static_cast<int>(kHeaderBytes))
+	{
+		set_errno_err(errMsg, "MappedFloatMatrix::writeFromGMatrix: header write failed");
+		_close(outFd);
+		return false;
+	}
+#else
 	ssize_t wr = ::write(outFd, hdr, static_cast<size_t>(kHeaderBytes));
 	if (wr != static_cast<ssize_t>(kHeaderBytes))
 	{
@@ -408,6 +523,7 @@ bool glades::MappedFloatMatrix::writeFromGMatrix(const std::string& path, const 
 		::close(outFd);
 		return false;
 	}
+#endif
 
 	// Write each row's contiguous floats.
 	for (unsigned long long r = 0ull; r < R; ++r)
@@ -418,11 +534,19 @@ bool glades::MappedFloatMatrix::writeFromGMatrix(const std::string& path, const 
 		unsigned long long remaining = rowBytes;
 		while (remaining > 0ull)
 		{
+#ifdef _WIN32
+			const int w = _write(outFd, bytes, static_cast<unsigned int>(remaining));
+#else
 			const ssize_t w = ::write(outFd, bytes, static_cast<size_t>(remaining));
+#endif
 			if (w <= 0)
 			{
 				set_errno_err(errMsg, "MappedFloatMatrix::writeFromGMatrix: data write failed");
+#ifdef _WIN32
+				_close(outFd);
+#else
 				::close(outFd);
+#endif
 				return false;
 			}
 			bytes += static_cast<unsigned long long>(w);
@@ -431,7 +555,10 @@ bool glades::MappedFloatMatrix::writeFromGMatrix(const std::string& path, const 
 	}
 
 	(void)dataBytes;
+#ifdef _WIN32
+	_close(outFd);
+#else
 	::close(outFd);
+#endif
 	return true;
 }
-

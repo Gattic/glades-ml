@@ -20,13 +20,17 @@
 #include "GString.h"
 #include "GTable.h"
 #include <fstream>
+#ifndef _WIN32
 #include <pthread.h>
+#endif
 #include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <vector>
 
 namespace shmea {

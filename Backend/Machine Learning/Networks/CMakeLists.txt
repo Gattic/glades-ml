@@ -32,7 +32,9 @@ set(Networks_src_files
 	hyperparameter_tuner.h
 )
 add_library(Networks ${Networks_src_files})
-target_link_libraries(Networks pthread)
+if(NOT WIN32)
+    target_link_libraries(Networks pthread)
+endif()
 
 # CUDA GPU offloading
 if(GLADES_ENABLE_CUDA)

@@ -28,7 +28,23 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#ifndef _WIN32
 #include <dirent.h>
+#else
+#include "Backend/Core/platform.h"
+#include <io.h>
+#include <process.h>
+#include <direct.h>
+#define unlink _unlink
+#define rmdir _rmdir
+#define getpid _getpid
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#endif
 #include <errno.h>
 #include <fstream>
 #include <limits>
@@ -36,7 +52,9 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <vector>
 
 namespace {
@@ -107,9 +125,36 @@ static std::string join_dir(const std::string& a, const std::string& b)
 	return a + "/" + b;
 }
 
-// Best-effort recursive delete (POSIX). Used only for test cleanup.
+// Best-effort recursive delete. Used only for test cleanup.
 static bool remove_tree_recursive(const std::string& path)
 {
+#ifdef _WIN32
+	if (stat_is_file(path))
+		return ::unlink(path.c_str()) == 0;
+	if (!stat_is_dir(path))
+		return true;
+	std::string pattern = path + "\\*";
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return ::rmdir(path.c_str()) == 0;
+	do {
+		if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+			continue;
+		const std::string child = join_dir(path, std::string(fd.cFileName));
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+		{
+			(void)remove_tree_recursive(child);
+			(void)::rmdir(child.c_str());
+		}
+		else
+		{
+			(void)::unlink(child.c_str());
+		}
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+	return ::rmdir(path.c_str()) == 0;
+#else
 	DIR* d = ::opendir(path.c_str());
 	if (!d)
 	{
@@ -141,6 +186,7 @@ static bool remove_tree_recursive(const std::string& path)
 	}
 	::closedir(d);
 	return ::rmdir(path.c_str()) == 0;
+#endif
 }
 
 static std::string checkpoint_root_dir()

@@ -20,6 +20,15 @@
 #endif
 #include <vector>
 
+// MSVC does not provide sincosf; emulate with sinf/cosf.
+#ifdef _MSC_VER
+static inline void sincosf(float x, float* s, float* c)
+{
+	*s = sinf(x);
+	*c = cosf(x);
+}
+#endif
+
 namespace glades {
 namespace transformer_kernels {
 

@@ -24,6 +24,12 @@
 #include "Networks/network.h"
 #include "Networks/training_callbacks.h"
 #include "DataObjects/ImageInput.h"
+#include <sys/stat.h>
+#ifdef _MSC_VER
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#endif
 
 using namespace glades;
 

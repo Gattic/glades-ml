@@ -5,7 +5,11 @@
 #include "Backend/Database/GLogger.h"
 
 #include <algorithm>
+#ifdef _WIN32
+#include "Backend/Core/platform.h"
+#else
 #include <pthread.h>
+#endif
 #include <sstream>
 
 namespace glades {
@@ -13,7 +17,11 @@ namespace glades {
 // ===== Internal synchronization (recursive mutex) =====
 struct TransformerServingLayer::MutexImpl
 {
+#ifdef _WIN32
+	CRITICAL_SECTION cs;
+#else
 	pthread_mutex_t m;
+#endif
 	bool ok;
 };
 
@@ -21,6 +29,10 @@ TransformerServingLayer::Mutex::Mutex() : impl_(NULL)
 {
 	impl_ = new MutexImpl();
 	impl_->ok = false;
+#ifdef _WIN32
+	InitializeCriticalSection(&impl_->cs);
+	impl_->ok = true;
+#else
 	pthread_mutexattr_t attr;
 	if (pthread_mutexattr_init(&attr) == 0)
 	{
@@ -34,6 +46,7 @@ TransformerServingLayer::Mutex::Mutex() : impl_(NULL)
 		// Fallback: plain mutex (best-effort).
 		impl_->ok = (pthread_mutex_init(&impl_->m, NULL) == 0);
 	}
+#endif
 }
 
 TransformerServingLayer::Mutex::~Mutex()
@@ -41,7 +54,13 @@ TransformerServingLayer::Mutex::~Mutex()
 	if (!impl_)
 		return;
 	if (impl_->ok)
+	{
+#ifdef _WIN32
+		DeleteCriticalSection(&impl_->cs);
+#else
 		(void)pthread_mutex_destroy(&impl_->m);
+#endif
+	}
 	delete impl_;
 	impl_ = NULL;
 }
@@ -52,7 +71,11 @@ void TransformerServingLayer::Mutex::lock() const
 		return;
 	if (!impl_->ok)
 		return;
+#ifdef _WIN32
+	EnterCriticalSection(&impl_->cs);
+#else
 	(void)pthread_mutex_lock(&impl_->m);
+#endif
 }
 
 void TransformerServingLayer::Mutex::unlock() const
@@ -61,7 +84,11 @@ void TransformerServingLayer::Mutex::unlock() const
 		return;
 	if (!impl_->ok)
 		return;
+#ifdef _WIN32
+	LeaveCriticalSection(&impl_->cs);
+#else
 	(void)pthread_mutex_unlock(&impl_->m);
+#endif
 }
 
 namespace {

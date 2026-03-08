@@ -21,8 +21,23 @@
 #include <string>
 #include <sys/stat.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
 #include <dirent.h>
+#else
+#include "Backend/Core/platform.h"
+#include <io.h>
+#include <process.h>
+#define unlink _unlink
+#define rmdir _rmdir
+#define getpid _getpid
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#endif
 
 namespace {
 
@@ -72,22 +87,32 @@ static bool is_safe_path_component(const std::string& s)
 static bool stat_is_dir(const std::string& path)
 {
 	struct stat st;
+#ifdef _WIN32
+	if (::stat(path.c_str(), &st) != 0)
+		return false;
+#else
 	if (::lstat(path.c_str(), &st) != 0)
 		return false;
 	// Do not follow symlinks for persistence roots.
 	if (S_ISLNK(st.st_mode))
 		return false;
+#endif
 	return S_ISDIR(st.st_mode) != 0;
 }
 
 static bool stat_is_file(const std::string& path)
 {
 	struct stat st;
+#ifdef _WIN32
+	if (::stat(path.c_str(), &st) != 0)
+		return false;
+#else
 	if (::lstat(path.c_str(), &st) != 0)
 		return false;
 	// Do not follow symlinks for persistence files.
 	if (S_ISLNK(st.st_mode))
 		return false;
+#endif
 	return S_ISREG(st.st_mode) != 0;
 }
 
@@ -145,6 +170,39 @@ static bool rename_atomic(const std::string& from, const std::string& to)
 
 static bool remove_tree_recursive(const std::string& path)
 {
+#ifdef _WIN32
+	if (!stat_is_dir(path))
+	{
+		if (stat_is_file(path))
+			return ::_unlink(path.c_str()) == 0;
+		return true;
+	}
+
+	std::string pattern = path + "\\*";
+	WIN32_FIND_DATAA fd;
+	HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+	if (hFind == INVALID_HANDLE_VALUE)
+		return ::_rmdir(path.c_str()) == 0;
+
+	do
+	{
+		const char* name = fd.cFileName;
+		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+			continue;
+		const std::string child = path + "\\" + std::string(name);
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+		{
+			(void)remove_tree_recursive(child);
+			(void)::_rmdir(child.c_str());
+		}
+		else
+		{
+			(void)::_unlink(child.c_str());
+		}
+	} while (FindNextFileA(hFind, &fd));
+	FindClose(hFind);
+	return ::_rmdir(path.c_str()) == 0;
+#else
 	DIR* d = ::opendir(path.c_str());
 	if (!d)
 	{
@@ -183,6 +241,7 @@ static bool remove_tree_recursive(const std::string& path)
 	}
 	::closedir(d);
 	return ::rmdir(path.c_str()) == 0;
+#endif
 }
 
 struct ModelManifest
@@ -1037,10 +1096,17 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 	uint64_t weightsHash = 0ULL;
 	{
 		struct stat st;
+#ifdef _WIN32
+		if (::stat(nninfoPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+			nninfoBytes = static_cast<uint64_t>(st.st_size);
+		if (::stat(weightsPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+			weightsBytes = static_cast<uint64_t>(st.st_size);
+#else
 		if (::lstat(nninfoPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
 			nninfoBytes = static_cast<uint64_t>(st.st_size);
 		if (::lstat(weightsPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
 			weightsBytes = static_cast<uint64_t>(st.st_size);
+#endif
 		if (weightsBytes > 0ULL)
 		{
 			if (!fnv1a64_hash_file_prefix(weightsPath, weightsBytes, weightsHash))
@@ -1337,7 +1403,11 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 		if (verify && mf.hasWeightsBytes && mf.hasWeightsFNV)
 		{
 			struct stat st;
+#ifdef _WIN32
+			if (::stat(weightsPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#else
 			if (::lstat(weightsPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#endif
 				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: weights.bin missing or not a regular file");
 			const uint64_t bytes = static_cast<uint64_t>(st.st_size);
 			if (bytes != mf.weightsBytes)
@@ -1350,7 +1420,11 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 		if (verify && mf.hasNninfoBytes)
 		{
 			struct stat st;
+#ifdef _WIN32
+			if (::stat(nninfoPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#else
 			if (::lstat(nninfoPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+#endif
 				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: nninfo.csv missing or not a regular file");
 			const uint64_t bytes = static_cast<uint64_t>(st.st_size);
 			if (bytes != mf.nninfoBytes)

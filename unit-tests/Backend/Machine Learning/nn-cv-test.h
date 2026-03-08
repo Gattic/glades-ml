@@ -22,7 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 void NNCVUnitTestValidation();
 

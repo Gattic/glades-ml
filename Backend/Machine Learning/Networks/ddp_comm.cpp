@@ -14,7 +14,11 @@
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GPointer.h"
 
+#ifdef _WIN32
+#include "Backend/Core/platform.h"
+#else
 #include <pthread.h>
+#endif
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,8 +35,26 @@ static int ddpWorldSize = 1;
 static GNet::GServer* ddpServer = NULL;
 
 // Synchronization for blocking allreduce/barrier/broadcast.
+#ifdef _WIN32
+static CRITICAL_SECTION ddpMutex;
+static CONDITION_VARIABLE ddpCond;
+static bool ddpSyncInit = false;
+static void ensureDdpSync()
+{
+	if (!ddpSyncInit) { InitializeCriticalSection(&ddpMutex); InitializeConditionVariable(&ddpCond); ddpSyncInit = true; }
+}
+#define DDP_LOCK()   do { ensureDdpSync(); EnterCriticalSection(&ddpMutex); } while(0)
+#define DDP_UNLOCK() LeaveCriticalSection(&ddpMutex)
+#define DDP_WAIT()   SleepConditionVariableCS(&ddpCond, &ddpMutex, INFINITE)
+#define DDP_BROADCAST() WakeAllConditionVariable(&ddpCond)
+#else
 static pthread_mutex_t ddpMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ddpCond = PTHREAD_COND_INITIALIZER;
+#define DDP_LOCK()   pthread_mutex_lock(&ddpMutex)
+#define DDP_UNLOCK() pthread_mutex_unlock(&ddpMutex)
+#define DDP_WAIT()   pthread_cond_wait(&ddpCond, &ddpMutex)
+#define DDP_BROADCAST() pthread_cond_broadcast(&ddpCond)
+#endif
 
 // --- AllReduce state ---
 // Root accumulation buffer (float). Root copies own data here first,
@@ -77,7 +99,7 @@ public:
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
 		const unsigned int floatCount = payloadSize / sizeof(float);
 
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 
 		// Sum into accumulation buffer.
 		if (reduceAccumF.size() == static_cast<size_t>(floatCount))
@@ -91,8 +113,8 @@ public:
 		workerConnections.push_back(cData->getConnection());
 
 		++reduceWorkersArrived;
-		pthread_cond_broadcast(&ddpCond);
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_BROADCAST();
+		DDP_UNLOCK();
 
 		return NULL;
 	}
@@ -115,13 +137,13 @@ public:
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
 		const unsigned int floatCount = payloadSize / sizeof(float);
 
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		resultBufF.resize(floatCount);
 		if (floatCount > 0)
 			memcpy(&resultBufF[0], payload.c_str(), payloadSize);
 		reduceResultReady = true;
-		pthread_cond_broadcast(&ddpCond);
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_BROADCAST();
+		DDP_UNLOCK();
 
 		return NULL;
 	}
@@ -140,11 +162,11 @@ public:
 
 	shmea::ServiceData* execute(const shmea::ServiceData* cData)
 	{
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		workerConnections.push_back(cData->getConnection());
 		++barrierWorkersArrived;
-		pthread_cond_broadcast(&ddpCond);
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_BROADCAST();
+		DDP_UNLOCK();
 		return NULL;
 	}
 
@@ -163,10 +185,10 @@ public:
 	shmea::ServiceData* execute(const shmea::ServiceData* cData)
 	{
 		(void)cData;
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		barrierReleased = true;
-		pthread_cond_broadcast(&ddpCond);
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_BROADCAST();
+		DDP_UNLOCK();
 		return NULL;
 	}
 
@@ -188,13 +210,13 @@ public:
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
 		const unsigned int floatCount = payloadSize / sizeof(float);
 
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		broadcastBuf.resize(floatCount);
 		if (floatCount > 0)
 			memcpy(&broadcastBuf[0], payload.c_str(), payloadSize);
 		broadcastReady = true;
-		pthread_cond_broadcast(&ddpCond);
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_BROADCAST();
+		DDP_UNLOCK();
 		return NULL;
 	}
 
@@ -212,11 +234,11 @@ public:
 
 	shmea::ServiceData* execute(const shmea::ServiceData* cData)
 	{
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		workerConnections.push_back(cData->getConnection());
 		++barrierWorkersArrived; // reuse barrier counter for broadcast sync
-		pthread_cond_broadcast(&ddpCond);
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_BROADCAST();
+		DDP_UNLOCK();
 		return NULL;
 	}
 
@@ -231,10 +253,10 @@ public:
 	void onClientLogin(GNet::Connection* c)
 	{
 		(void)c;
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		++loginCount;
-		pthread_cond_broadcast(&ddpCond);
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_BROADCAST();
+		DDP_UNLOCK();
 	}
 	void onServerLogin(GNet::Connection* c) { (void)c; }
 };
@@ -283,10 +305,10 @@ static void initInternal(const char* rootHost, int rootPort,
 		ddpServer->run(shmea::GString(listenBuf), false);
 
 		// Wait for all N-1 workers to connect.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		while (loginCount < static_cast<unsigned int>(worldSize - 1))
-			pthread_cond_wait(&ddpCond, &ddpMutex);
-		pthread_mutex_unlock(&ddpMutex);
+			DDP_WAIT();
+		DDP_UNLOCK();
 	}
 	else
 	{
@@ -303,10 +325,14 @@ static void initInternal(const char* rootHost, int rootPort,
 
 		// Small delay to allow connection to establish.
 		// (LaunchInstance is async; the handshake completes in the background.)
+#ifdef _WIN32
+		Sleep(500);
+#else
 		struct timespec ts;
 		ts.tv_sec = 0;
 		ts.tv_nsec = 500 * 1000 * 1000; // 500ms
 		nanosleep(&ts, NULL);
+#endif
 	}
 
 	ddpInitialized = true;
@@ -381,17 +407,17 @@ void glades::ddp::allReduceSumInPlace(float* data, size_t count)
 	if (ddpRank == 0)
 	{
 		// Root: copy own data into accumulation buffer, wait for all workers.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		reduceAccumF.resize(count);
 		memcpy(&reduceAccumF[0], data, byteSize);
 		reduceWorkersArrived = 0;
 		workerConnections.clear();
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 
 		// Wait for all N-1 workers to send their gradients.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		while (reduceWorkersArrived < static_cast<unsigned int>(ddpWorldSize - 1))
-			pthread_cond_wait(&ddpCond, &ddpMutex);
+			DDP_WAIT();
 
 		// Copy summed result back to caller.
 		memcpy(data, &reduceAccumF[0], byteSize);
@@ -406,14 +432,14 @@ void glades::ddp::allReduceSumInPlace(float* data, size_t count)
 
 		workerConnections.clear();
 		reduceWorkersArrived = 0;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 	}
 	else
 	{
 		// Non-root: send our data to root, then wait for result.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		reduceResultReady = false;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 
 		// Find root connection (server connection established during init).
 		GNet::Connection* rootConn = ddpServer->getConnectionFromName(shmea::GString(""));
@@ -433,15 +459,15 @@ void glades::ddp::allReduceSumInPlace(float* data, size_t count)
 		}
 
 		// Wait for result from root.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		while (!reduceResultReady)
-			pthread_cond_wait(&ddpCond, &ddpMutex);
+			DDP_WAIT();
 
 		if (resultBufF.size() == count)
 			memcpy(data, &resultBufF[0], byteSize);
 
 		reduceResultReady = false;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 	}
 }
 
@@ -512,14 +538,14 @@ void glades::ddp::barrier()
 	if (ddpRank == 0)
 	{
 		// Root: wait for all N-1 workers to arrive.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		barrierWorkersArrived = 0;
 		workerConnections.clear();
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		while (barrierWorkersArrived < static_cast<unsigned int>(ddpWorldSize - 1))
-			pthread_cond_wait(&ddpCond, &ddpMutex);
+			DDP_WAIT();
 
 		// Release all workers.
 		for (size_t i = 0; i < workerConnections.size(); ++i)
@@ -530,13 +556,13 @@ void glades::ddp::barrier()
 		}
 		workerConnections.clear();
 		barrierWorkersArrived = 0;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 	}
 	else
 	{
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		barrierReleased = false;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 
 		// Send barrier arrival to root.
 		GNet::Connection* rootConn = ddpServer->getConnectionFromName(shmea::GString(""));
@@ -555,11 +581,11 @@ void glades::ddp::barrier()
 		}
 
 		// Wait for release.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		while (!barrierReleased)
-			pthread_cond_wait(&ddpCond, &ddpMutex);
+			DDP_WAIT();
 		barrierReleased = false;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 	}
 }
 
@@ -576,14 +602,14 @@ void glades::ddp::broadcastFromRoot(float* data, size_t count)
 	if (ddpRank == 0)
 	{
 		// Root: wait for all workers to signal ready, then send data.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		barrierWorkersArrived = 0;
 		workerConnections.clear();
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		while (barrierWorkersArrived < static_cast<unsigned int>(ddpWorldSize - 1))
-			pthread_cond_wait(&ddpCond, &ddpMutex);
+			DDP_WAIT();
 
 		for (size_t i = 0; i < workerConnections.size(); ++i)
 		{
@@ -593,13 +619,13 @@ void glades::ddp::broadcastFromRoot(float* data, size_t count)
 		}
 		workerConnections.clear();
 		barrierWorkersArrived = 0;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 	}
 	else
 	{
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		broadcastReady = false;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 
 		// Signal root we are ready.
 		GNet::Connection* rootConn = ddpServer->getConnectionFromName(shmea::GString(""));
@@ -618,14 +644,14 @@ void glades::ddp::broadcastFromRoot(float* data, size_t count)
 		}
 
 		// Wait for broadcast data.
-		pthread_mutex_lock(&ddpMutex);
+		DDP_LOCK();
 		while (!broadcastReady)
-			pthread_cond_wait(&ddpCond, &ddpMutex);
+			DDP_WAIT();
 
 		if (broadcastBuf.size() == count)
 			memcpy(data, &broadcastBuf[0], byteSize);
 
 		broadcastReady = false;
-		pthread_mutex_unlock(&ddpMutex);
+		DDP_UNLOCK();
 	}
 }

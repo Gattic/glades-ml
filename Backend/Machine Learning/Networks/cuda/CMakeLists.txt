@@ -32,7 +32,9 @@ target_compile_definitions(GladesCUDA PRIVATE GLADES_HAVE_CUDA=1)
 target_include_directories(GladesCUDA PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Link cuBLAS.
-find_library(CUBLAS_LIB cublas HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+find_library(CUBLAS_LIB cublas
+	HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+	      "$ENV{CUDA_PATH}/lib/x64")
 if(CUBLAS_LIB)
 	target_link_libraries(GladesCUDA ${CUBLAS_LIB})
 else()
@@ -40,7 +42,9 @@ else()
 endif()
 
 # Link CUDA runtime so downstream consumers (unit tests, etc.) get it transitively.
-find_library(CUDART_LIB cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+find_library(CUDART_LIB cudart
+	HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+	      "$ENV{CUDA_PATH}/lib/x64")
 if(CUDART_LIB)
 	target_link_libraries(GladesCUDA ${CUDART_LIB})
 else()

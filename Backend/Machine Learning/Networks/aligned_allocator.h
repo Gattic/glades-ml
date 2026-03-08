@@ -48,17 +48,27 @@ public:
 
 		void* p = NULL;
 		const size_type bytes = n * sizeof(T);
-		// posix_memalign requires alignment to be a power of two and multiple of sizeof(void*).
 		const size_type wantAlign = (Alignment < sizeof(void*)) ? sizeof(void*) : Alignment;
+#ifdef _WIN32
+		p = ::_aligned_malloc(bytes, wantAlign);
+		if (!p)
+			throw std::bad_alloc();
+#else
+		// posix_memalign requires alignment to be a power of two and multiple of sizeof(void*).
 		const int rc = ::posix_memalign(&p, wantAlign, bytes);
 		if (rc != 0 || !p)
 			throw std::bad_alloc();
+#endif
 		return static_cast<pointer>(p);
 	}
 
 	void deallocate(pointer p, size_type /*n*/)
 	{
+#ifdef _WIN32
+		::_aligned_free(static_cast<void*>(p));
+#else
 		::free(static_cast<void*>(p));
+#endif
 	}
 
 	// C++03 construct/destroy (no-op for trivials but required by some libstdc++ modes).

@@ -19,7 +19,7 @@
 
 #include "../Database/GString.h"
 #include <stdint.h>
-#include <pthread.h>
+#include "../Core/platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,7 +71,7 @@ public:
 	static const int PROTO_TCP = 0;
 	static const int PROTO_UDP = 1;
 
-	int sockfd;
+	socket_t sockfd;
 	shmea::GString overflow;
 
 	Connection(int, int, shmea::GString);

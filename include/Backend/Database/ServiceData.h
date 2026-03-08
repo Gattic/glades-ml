@@ -22,7 +22,9 @@
 #include "../Database/GTable.h"
 #include "../Database/GObject.h"
 #include "../Database/GPointer.h"
+#ifndef _WIN32
 #include <pthread.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

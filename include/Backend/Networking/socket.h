@@ -21,21 +21,15 @@
 #include "../Database/GLogger.h"
 #include "../Database/GPointer.h"
 #include "../Database/ServiceData.h"
-#include <arpa/inet.h>
-#include <netinet/tcp.h>
+#include "../Core/platform.h"
+#include "../Core/GMutex.h"
 #include <iostream>
-#include <netdb.h>
-#include <pthread.h>
 #include <map>
 #include <queue>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -50,8 +44,8 @@ private:
 	static const shmea::GString ANYADDR;
 
 	shmea::GString PORT;
-	pthread_mutex_t* inMutex;
-	pthread_mutex_t* outMutex;
+	shmea::GMutex inMutex;
+	shmea::GMutex outMutex;
 	// Queue keys must be scoped to a connection to avoid cross-connection collisions.
 	struct QueueKey
 	{
@@ -74,7 +68,7 @@ private:
 
 	std::map<QueueKey, shmea::GPointer<shmea::ServiceData>, QueueKeyLess> inboundLists;
 	std::map<QueueKey, shmea::GPointer<shmea::ServiceData>, QueueKeyLess> outboundLists;
-	int udpfd;
+	socket_t udpfd;
 	unsigned int inboundQueueMax;
 	unsigned int outboundQueueMax;
 
@@ -97,19 +91,19 @@ public:
 	void closeSockets();
 	const shmea::GString getPort();
 	void setPort(shmea::GString);
-	int openServerConnection();
-	int openClientConnection(const shmea::GString&, const shmea::GString&);
-	int openUDPServerSocket();
-	int getUDPSocketFD() const { return udpfd; }
-	void readConnection(Connection*, const int&, std::vector<shmea::GPointer<shmea::ServiceData> >&);
+	socket_t openServerConnection();
+	socket_t openClientConnection(const shmea::GString&, const shmea::GString&);
+	socket_t openUDPServerSocket();
+	socket_t getUDPSocketFD() const { return udpfd; }
+	void readConnection(Connection*, const socket_t&, std::vector<shmea::GPointer<shmea::ServiceData> >&);
 	// Returns:
 	//  1  => made progress (read bytes and/or parsed at least one complete frame)
 	//  0  => no new bytes available right now (EAGAIN/EWOULDBLOCK) and no frames parsed
 	// -1  => peer closed (EOF) with no remaining complete frames parsed
 	// -2  => fatal I/O or protocol error (caller should logout / close connection)
-	int readConnectionHelper(Connection*, const int&, std::vector<shmea::GPointer<shmea::ServiceData> >&);
-	int writeConnection(const Connection*, const int&, shmea::ServiceData*);
-	void closeConnection(const int&);
+	int readConnectionHelper(Connection*, const socket_t&, std::vector<shmea::GPointer<shmea::ServiceData> >&);
+	int writeConnection(const Connection*, const socket_t&, shmea::ServiceData*);
+	void closeConnection(const socket_t&);
 
 	bool anyInboundLists();
 	bool anyOutboundLists();

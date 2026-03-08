@@ -19,12 +19,14 @@
 
 #include <algorithm>
 #include <map>
+#ifndef _WIN32
 #include <pthread.h>
+#include <sys/signal.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
-#include <sys/signal.h>
 #include <sys/stat.h>
 #include <vector>
 
