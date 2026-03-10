@@ -31,7 +31,9 @@
 #include "Backend/Machine Learning/parallel-test.h"
 #include "Backend/Machine Learning/ddp-test.h"
 #include "Backend/Machine Learning/transformer-improvements-test.h"
+#ifdef GLADES_HAVE_CUDA
 #include "Backend/Machine Learning/gpu-training-test.h"
+#endif
 #include "Backend/Machine Learning/cnn-test.h"
 #include "Backend/Machine Learning/garch-test.h"
 #include "Backend/Machine Learning/egarch-test.h"
@@ -102,8 +104,10 @@ int main(int argc, char* argv[])
 		DDPUnitTest();
 	    else if (strcmp(argv[1], "transformer-improvements") == 0 || strcmp(argv[1], "ti") == 0)
 		TransformerImprovementsUnitTest();
+#ifdef GLADES_HAVE_CUDA
 	    else if (strcmp(argv[1], "gpu-training") == 0)
 		GpuTrainingUnitTest();
+#endif
 	    else if (strcmp(argv[1], "cnn") == 0)
 		NNCNNUnitTest();
 	    else if (strcmp(argv[1], "cnn-mnist") == 0)

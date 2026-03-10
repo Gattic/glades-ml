@@ -26,6 +26,16 @@ set_target_properties(GladesCUDA PROPERTIES
 	POSITION_INDEPENDENT_CODE ON
 )
 
+# On Windows + Ninja the "Machine Learning" space in the source path leaks
+# into the /Fd PDB flag that CMake wraps in nvcc's -Xcompiler, breaking the
+# compile.  Redirect PDBs to a space-free directory under the build root.
+if(MSVC)
+	set_target_properties(GladesCUDA PROPERTIES
+		COMPILE_PDB_NAME "GladesCUDA"
+		COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/pdb"
+	)
+endif()
+
 target_compile_definitions(GladesCUDA PRIVATE GLADES_HAVE_CUDA=1)
 
 # Include path so gpu_*.h headers can find each other.

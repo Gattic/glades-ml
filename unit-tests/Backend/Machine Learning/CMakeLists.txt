@@ -19,11 +19,15 @@ mapped-dataset-test.cpp
 ddp-test.cpp
  "../../../Backend/Machine Learning/DataObjects/DDPDataInputWrapper.cpp"
 transformer-improvements-test.cpp
-gpu-training-test.cpp
 cnn-test.cpp
 garch-test.cpp
 egarch-test.cpp
 gan-test.cpp
 hyperparameter-tuner-test.cpp
 )
+
+if(GLADES_ENABLE_CUDA)
+	list(APPEND PCATests_src_files gpu-training-test.cpp)
+endif()
+
 add_library(PCATests ${PCATests_src_files})

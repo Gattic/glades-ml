@@ -33,7 +33,7 @@ project(glades-unit-tests)
 
 #Compiler Flags
 if(MSVC)
-    add_compile_options(/W3 /wd4101 /wd4100)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W3> $<$<COMPILE_LANGUAGE:CXX>:/wd4101> $<$<COMPILE_LANGUAGE:CXX>:/wd4100>)
     add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 else()
     set(CMAKE_CXX_FLAGS "-Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -march=native")
@@ -71,7 +71,8 @@ find_package(Freetype REQUIRED)
 
 #Subdirectories
 include_directories(${FREETYPE_INCLUDE_DIRS})
-include_directories("../include")
+get_target_property(SHMEA_INCLUDE_DIRS shmea INTERFACE_INCLUDE_DIRECTORIES)
+include_directories(${SHMEA_INCLUDE_DIRS})
 add_subdirectory("Backend/Machine Learning")
 
 #Executable

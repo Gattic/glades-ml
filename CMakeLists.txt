@@ -96,7 +96,8 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 project(glades)
 
 if(MSVC)
-    add_compile_options(/W3 /wd4101 /wd4100)
+    # Guard MSVC flags with COMPILE_LANGUAGE so they don't leak into nvcc
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W3> $<$<COMPILE_LANGUAGE:CXX>:/wd4101> $<$<COMPILE_LANGUAGE:CXX>:/wd4100>)
     add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
     set(CMAKE_CXX_FLAGS_RELEASE "/O2")
 elseif(WIN32)
@@ -128,6 +129,10 @@ if(EMSCRIPTEN)
     endif()
 else()
     find_package(shmea REQUIRED)
+
+    # Make shmea headers available to all sub-libraries
+    get_target_property(SHMEA_INCLUDE_DIRS shmea INTERFACE_INCLUDE_DIRECTORIES)
+    include_directories(${SHMEA_INCLUDE_DIRS})
 endif()
 
 include(GNUInstallDirs)
@@ -135,7 +140,6 @@ include(CMakePackageConfigHelpers)
 
 #Subdirectories
 include_directories(${CMAKE_SOURCE_DIR})
-include_directories("include")
 include_directories("services")
 add_subdirectory("Backend/Machine Learning")
 
@@ -157,7 +161,9 @@ else()
     target_link_libraries(${PROJECT_NAME} ML GNet DB pthread)
 endif()
 
-target_include_directories(glades PRIVATE "include")
+if(SHMEA_INCLUDE_DIRS)
+    target_include_directories(glades PRIVATE ${SHMEA_INCLUDE_DIRS})
+endif()
 target_include_directories(glades PRIVATE "Backend")
 
 #target_include_directories(${PROJECT_NAME} PUBLIC
