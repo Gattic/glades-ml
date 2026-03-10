@@ -17,6 +17,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 # CUDA GPU offloading (optional, default OFF)
 option(GLADES_ENABLE_CUDA "Build with CUDA GPU offloading support" OFF)
+option(DEV_MODE "Copy shmea headers into include/ from source tree for development" OFF)
 if(GLADES_ENABLE_CUDA)
 	cmake_minimum_required(VERSION 3.18) # for CUDA_ARCHITECTURES
 
@@ -129,10 +130,26 @@ if(EMSCRIPTEN)
     endif()
 else()
     find_package(shmea REQUIRED)
-
-    # Make shmea headers available to all sub-libraries
-    get_target_property(SHMEA_INCLUDE_DIRS shmea INTERFACE_INCLUDE_DIRECTORIES)
-    include_directories(${SHMEA_INCLUDE_DIRS})
+    if(DEV_MODE)
+        # Dev mode: copy shmea headers from source tree into include/
+        if(NOT SHMEA_SOURCE_DIR)
+            set(SHMEA_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../ShmeaDB")
+        endif()
+        if(NOT EXISTS "${SHMEA_SOURCE_DIR}/Backend")
+            message(FATAL_ERROR "DEV_MODE requires SHMEA_SOURCE_DIR (default: ../ShmeaDB). Not found at: ${SHMEA_SOURCE_DIR}")
+        endif()
+        message(STATUS "DEV_MODE: copying shmea headers from ${SHMEA_SOURCE_DIR} into include/")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Core/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Core" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Database/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Database" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Networking/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Networking" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/Backend/Plotter/" DESTINATION "${CMAKE_SOURCE_DIR}/include/Backend/Plotter" FILES_MATCHING PATTERN "*.h")
+        file(COPY "${SHMEA_SOURCE_DIR}/main.h" DESTINATION "${CMAKE_SOURCE_DIR}/include")
+        file(COPY "${SHMEA_SOURCE_DIR}/g_export.h" DESTINATION "${CMAKE_SOURCE_DIR}/include")
+        include_directories("include")
+    else()
+        get_target_property(SHMEA_INCLUDE_DIRS shmea INTERFACE_INCLUDE_DIRECTORIES)
+        include_directories(${SHMEA_INCLUDE_DIRS})
+    endif()
 endif()
 
 include(GNUInstallDirs)

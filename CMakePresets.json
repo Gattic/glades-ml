@@ -52,6 +52,22 @@
             "cacheVariables": {
                 "GLADES_ENABLE_CUDA": "ON"
             }
+        },
+        {
+            "name": "windows-dev",
+            "displayName": "Windows Dev (MSVC, local shmea headers)",
+            "inherits": "windows-release",
+            "cacheVariables": {
+                "DEV_MODE": "ON"
+            }
+        },
+        {
+            "name": "windows-dev-cuda",
+            "displayName": "Windows Dev + CUDA (MSVC, local shmea headers)",
+            "inherits": "windows-dev",
+            "cacheVariables": {
+                "GLADES_ENABLE_CUDA": "ON"
+            }
         }
     ],
     "buildPresets": [
@@ -70,6 +86,14 @@
         {
             "name": "windows-cuda",
             "configurePreset": "windows-cuda"
+        },
+        {
+            "name": "windows-dev",
+            "configurePreset": "windows-dev"
+        },
+        {
+            "name": "windows-dev-cuda",
+            "configurePreset": "windows-dev-cuda"
         }
     ]
 }

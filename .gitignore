@@ -8,3 +8,4 @@ database/*
 alpaca.key
 .gdb_history
 .claude/
+include/

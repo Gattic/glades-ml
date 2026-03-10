@@ -71,8 +71,16 @@ find_package(Freetype REQUIRED)
 
 #Subdirectories
 include_directories(${FREETYPE_INCLUDE_DIRS})
-get_target_property(SHMEA_INCLUDE_DIRS shmea INTERFACE_INCLUDE_DIRECTORIES)
-include_directories(${SHMEA_INCLUDE_DIRS})
+if(DEV_MODE)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/../include/Backend")
+        include_directories("${CMAKE_SOURCE_DIR}/../include")
+    else()
+        message(FATAL_ERROR "DEV_MODE: include/Backend/ not found. Run cmake with DEV_MODE on the main project first.")
+    endif()
+else()
+    get_target_property(SHMEA_INCLUDE_DIRS shmea INTERFACE_INCLUDE_DIRECTORIES)
+    include_directories(${SHMEA_INCLUDE_DIRS})
+endif()
 add_subdirectory("Backend/Machine Learning")
 
 #Executable

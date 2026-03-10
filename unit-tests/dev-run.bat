@@ -1,28 +1,30 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: Usage: build-and-install.bat [VS_VERSION] [cuda]
+:: Usage: dev-run.bat [VS_VERSION] [cuda]
 :: Examples:
-::   build-and-install.bat              (VS 2022, no CUDA)
-::   build-and-install.bat 18           (VS 18, no CUDA)
-::   build-and-install.bat 18 cuda      (VS 18, with CUDA)
-::   build-and-install.bat 2022 cuda    (VS 2022, with CUDA)
+::   dev-run.bat              (VS 2022, no CUDA)
+::   dev-run.bat 2022 cuda    (VS 2022, with CUDA)
+::
+:: Dev mode uses shmea headers from ..\include\Backend\
+:: (populated by running dev-build.bat from the project root).
 
 set "VS_VER=2022"
 if not "%~1"=="" set "VS_VER=%~1"
 
 set "CUDA_FLAG="
-set "CMAKE_PRESET=windows-release"
+set "CMAKE_PRESET=windows-dev"
 if /i "%~2"=="cuda" (
     set "CUDA_FLAG=yes"
-    set "CMAKE_PRESET=windows-cuda"
+    set "CMAKE_PRESET=windows-dev-cuda"
 )
 
 echo ============================================
-echo  glades-ml - Build and Install (Windows)
+echo  glades-ml Unit Tests - Dev Build and Run (Windows)
 echo  Visual Studio version: !VS_VER!
 if defined CUDA_FLAG echo  CUDA: ENABLED
 if not defined CUDA_FLAG echo  CUDA: disabled
+echo  DEV_MODE: using shmea headers from ..\include\
 echo ============================================
 echo.
 
@@ -47,7 +49,6 @@ if exist "C:\Program Files\Microsoft Visual Studio\!VS_VER!\Community\Common7\To
 )
 echo [ERROR] Could not find Visual Studio !VS_VER! Build Tools or Community edition.
 echo         Install VS Build Tools with "Desktop development with C++" workload.
-echo         See INSTALL.md for details.
 exit /b 1
 
 :vcpkg_check
@@ -86,23 +87,32 @@ echo         Install it with: vcpkg install freetype:x64-windows
 exit /b 1
 
 :freetype_ok
-:: If VCPKG_ROOT was reset, clear any stale CMake cache that points to the old path
-if exist "build\CMakeCache.txt" (
-    echo [FIX] Clearing stale CMake cache...
-    rmdir /s /q build >nul 2>&1
-)
 
 echo [OK] VCPKG_ROOT = !VCPKG_ROOT!
 
 :: --------------------------------------------------
-:: 3. Verify ShmeaDB is installed
+:: 3. Verify dev include/ and installed libs
 :: --------------------------------------------------
-if not exist "%USERPROFILE%\shmea\bin\shmea.dll" (
-    echo [ERROR] shmea.dll not found at %USERPROFILE%\shmea\bin\shmea.dll
-    echo         Build and install ShmeaDB first.
+if not exist "..\include\Backend" (
+    echo [ERROR] Dev-mode include\Backend\ not found.
+    echo         Run dev-build.bat from the project root first to populate include\.
     exit /b 1
 )
-echo [OK] ShmeaDB installation found at %USERPROFILE%\shmea
+echo [OK] Dev-mode include\Backend\ found.
+
+if not exist "!USERPROFILE!\shmea\bin\shmea.dll" (
+    echo [ERROR] shmea.dll not found at !USERPROFILE!\shmea\bin\shmea.dll
+    echo         Build and install ShmeaDB first, needed for linking.
+    exit /b 1
+)
+echo [OK] ShmeaDB installation found at !USERPROFILE!\shmea
+
+if not exist "!USERPROFILE!\glades\bin\glades.dll" (
+    echo [ERROR] glades.dll not found at !USERPROFILE!\glades\bin\glades.dll
+    echo         Run dev-build.bat from the project root first.
+    exit /b 1
+)
+echo [OK] glades-ml installation found at !USERPROFILE!\glades
 
 :: --------------------------------------------------
 :: 4. Verify CUDA if requested
@@ -111,14 +121,25 @@ if defined CUDA_FLAG (
     where nvcc >nul 2>&1
     if !errorlevel! neq 0 (
         echo [ERROR] CUDA requested but nvcc not found on PATH.
-        echo         Install CUDA Toolkit and ensure it is on PATH.
         exit /b 1
     )
     echo [OK] CUDA compiler found.
 )
 
 :: --------------------------------------------------
-:: 5. Verify prerequisites
+:: 5. Set PATH so DLLs are found at runtime
+:: --------------------------------------------------
+set "PATH=!USERPROFILE!\shmea\bin;!USERPROFILE!\glades\bin;!VCPKG_ROOT!\installed\x64-windows\bin;!PATH!"
+echo [OK] PATH updated with shmea.dll, glades.dll, and freetype.dll locations.
+if defined CUDA_FLAG (
+    if defined CUDA_PATH (
+        set "PATH=!CUDA_PATH!\bin;!PATH!"
+        echo [OK] PATH updated with CUDA libraries.
+    )
+)
+
+:: --------------------------------------------------
+:: 6. Verify prerequisites
 :: --------------------------------------------------
 where cmake >nul 2>&1
 if !errorlevel! neq 0 (
@@ -137,18 +158,17 @@ echo [OK] ninja found.
 echo.
 
 :: --------------------------------------------------
-:: 6. Clean dev-mode include/ to ensure prod headers
+:: 7. Clear stale cache if switching between dev/prod
 :: --------------------------------------------------
-if exist "include\Backend" (
-    echo [CLEAN] Removing dev-mode include/ to use installed shmea headers...
-    rmdir /s /q "include" >nul 2>&1
-    echo [OK] Dev include/ removed.
+if exist "build\CMakeCache.txt" (
+    echo [FIX] Clearing stale CMake cache...
+    rmdir /s /q build >nul 2>&1
 )
 
 :: --------------------------------------------------
-:: 7. Configure
+:: 8. Configure
 :: --------------------------------------------------
-echo [STEP] Configuring with CMake preset '!CMAKE_PRESET!'...
+echo [STEP] Configuring unit tests with CMake preset '!CMAKE_PRESET!'...
 cmake --preset !CMAKE_PRESET!
 if !errorlevel! neq 0 (
     echo [ERROR] CMake configure failed.
@@ -158,9 +178,9 @@ echo [OK] Configure succeeded.
 echo.
 
 :: --------------------------------------------------
-:: 7. Build
+:: 8. Build
 :: --------------------------------------------------
-echo [STEP] Building...
+echo [STEP] Building unit tests...
 cmake --build --preset !CMAKE_PRESET!
 if !errorlevel! neq 0 (
     echo [ERROR] Build failed.
@@ -170,19 +190,19 @@ echo [OK] Build succeeded.
 echo.
 
 :: --------------------------------------------------
-:: 8. Install
+:: 9. Run
 :: --------------------------------------------------
-echo [STEP] Installing to %USERPROFILE%\glades ...
-cmake --install build
-if !errorlevel! neq 0 (
-    echo [ERROR] Install failed.
-    exit /b 1
-)
-echo [OK] Installed to %USERPROFILE%\glades
+echo [STEP] Running unit tests...
 echo.
-
+.\build\glades-unit-tests.exe
+if !errorlevel! neq 0 (
+    echo.
+    echo [FAIL] Unit tests failed with exit code !errorlevel!.
+    exit /b !errorlevel!
+)
+echo.
 echo ============================================
-echo  Done! glades-ml installed to %USERPROFILE%\glades
+echo  All unit tests passed! (dev mode)
 echo ============================================
 
 endlocal

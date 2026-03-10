@@ -151,7 +151,24 @@ echo [OK] ninja found.
 echo.
 
 :: --------------------------------------------------
-:: 7. Configure
+:: 7. Clean dev-mode include/ to ensure prod headers
+:: --------------------------------------------------
+if exist "..\include\Backend" (
+    echo [CLEAN] Removing dev-mode include/ to use installed shmea headers...
+    rmdir /s /q "..\include" >nul 2>&1
+    echo [OK] Dev include/ removed.
+)
+
+:: --------------------------------------------------
+:: 8. Clear stale cache if switching between dev/prod
+:: --------------------------------------------------
+if exist "build\CMakeCache.txt" (
+    echo [FIX] Clearing stale CMake cache...
+    rmdir /s /q build >nul 2>&1
+)
+
+:: --------------------------------------------------
+:: 9. Configure
 :: --------------------------------------------------
 echo [STEP] Configuring unit tests with CMake preset '!CMAKE_PRESET!'...
 cmake --preset !CMAKE_PRESET!
