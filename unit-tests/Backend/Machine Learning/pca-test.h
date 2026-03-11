@@ -24,6 +24,6 @@
 #include <string>
 #include <unistd.h>
 
-void PCAUnitTest();
+void PCAUnitTest(bool saveImages = false);
 
 #endif
