@@ -162,7 +162,8 @@ void ImageInput::import(shmea::GString newName, int standardizeFlag)
     //
     shmea::GString trainFName = fname + "train.csv";
     shmea::GString testFName = fname + "test.csv";
-    int importType = shmea::GTable::TYPE_FILE;
+    // Image legends contain only strings (paths + labels), skip numeric type inference
+    int importType = shmea::GTable::TYPE_FILE_STRINGS_ONLY;
 
     trainingLegend = shmea::GTable(trainFName, ',', importType);
     testingLegend = shmea::GTable(testFName, ',', importType);

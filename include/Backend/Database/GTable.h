@@ -46,12 +46,14 @@ private:
 	shmea::GVector<unsigned int> outputColumns; // sparse boolean array
 
 	void importFromFile(const GString&);
+	void importFromFileStringsOnly(const GString&);
 	void importFromString(const GString&);
 
 public:
 	static const int TYPE_FILE = 0;
 	static const int TYPE_URL = 1;
 	static const int TYPE_STRING = 2;
+	static const int TYPE_FILE_STRINGS_ONLY = 3;
 
 	GTable();
 	GTable(char);

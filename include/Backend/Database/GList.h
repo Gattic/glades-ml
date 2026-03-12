@@ -92,6 +92,7 @@ public:
 	int getType(unsigned int) const;
 	unsigned int size() const;
 	bool empty() const;
+	void reserveItems(unsigned int n) { items.reserve(n); }
 	void standardize();
 	float unstandardize(float) const;
 	void print() const;

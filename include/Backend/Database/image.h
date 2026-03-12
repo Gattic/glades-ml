@@ -175,6 +175,9 @@ public:
 	void LoadPNG(const GString&);
 
 	shmea::GVector<float> flatten() const;
+	// Fused decode+flatten: convert raw RGBA buffer directly to hue-intensity floats.
+	// Avoids intermediate Image allocation when only the flat vector is needed.
+	static shmea::GVector<float> flattenRawRGBA(const unsigned char* rgba, unsigned int w, unsigned int h);
 	float rgbaToHueIntensity(const RGBA&) const;
 
 	shmea::GString hash() const;

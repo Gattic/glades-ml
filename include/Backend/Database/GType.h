@@ -44,9 +44,12 @@ public:
 		FUNCTION_TYPE = 8,
 	};
 protected:
+	static const unsigned int SBO_SIZE = 8;
 	GPointer<char, array_deleter<char> > block;
+	char inlineBlock[SBO_SIZE + 1]; // +1 for null terminator
 	unsigned int blockSize;
 	Type type;
+	bool useInline;
 public:
 
 	const static unsigned int npos = -1;
@@ -86,6 +89,7 @@ public:
 	operator double() const;
 	operator bool() const;
 	unsigned int size() const;
+	const char* rawData() const;
 
 	// sets
 	void set(Type, const void*, int64_t);

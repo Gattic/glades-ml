@@ -23,8 +23,28 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdint.h>
 namespace shmea
 {
+
+// Compile-time POD trait for memcpy optimization (C++98 compatible)
+template<typename T> struct is_pod_type { static const bool value = false; };
+template<> struct is_pod_type<char> { static const bool value = true; };
+template<> struct is_pod_type<unsigned char> { static const bool value = true; };
+template<> struct is_pod_type<short> { static const bool value = true; };
+template<> struct is_pod_type<unsigned short> { static const bool value = true; };
+template<> struct is_pod_type<int> { static const bool value = true; };
+template<> struct is_pod_type<unsigned int> { static const bool value = true; };
+template<> struct is_pod_type<int64_t> { static const bool value = true; };
+template<> struct is_pod_type<uint64_t> { static const bool value = true; };
+template<> struct is_pod_type<float> { static const bool value = true; };
+template<> struct is_pod_type<double> { static const bool value = true; };
+template<> struct is_pod_type<bool> { static const bool value = true; };
+
+// C++98 compile-time conditional type selector (like std::conditional)
+template<bool Cond, typename TrueT, typename FalseT> struct select_type { typedef TrueT type; };
+template<typename TrueT, typename FalseT> struct select_type<false, TrueT, FalseT> { typedef FalseT type; };
+
 template<typename T>
 class GVector
 {
@@ -56,12 +76,14 @@ public:
 			this->push_back(value);
 	}
 	GVector(const GVector& value) :
-		m_size(0),
+		m_size(value.m_size),
 		m_capacity(value.m_capacity),
-		m_data(new T[value.m_capacity])
+		m_data(value.m_capacity > 0 ? new T[value.m_capacity] : NULL)
 	{
-		for (size_type i = 0; i < value.m_size; i++)
-			this->push_back(value[i]);
+		if (value.m_size > 0 && m_data)
+		{
+			copyElements(m_data.get(), value.m_data.get(), value.m_size);
+		}
 	}
 	virtual ~GVector() 
 	{ 
@@ -87,13 +109,14 @@ public:
 	{
 		if (new_cap <= m_capacity) return;
 
-		shmea::GPointer<T, array_deleter<T> > newBuffer(new T[new_cap]);
-
-		for (unsigned int i = 0; i < m_size; i++)
-			newBuffer[i] = m_data[i];
+		T* newArray = new T[new_cap];
+		if (m_data && m_size > 0)
+		{
+			copyElements(newArray, m_data.get(), m_size);
+		}
 
 		m_capacity = new_cap;
-		m_data = newBuffer;
+		m_data = shmea::GPointer<T, array_deleter<T> >(newArray);
 	}
 	void clear() 
 	{ 
@@ -210,11 +233,11 @@ public:
 		{
 			// Create new array and copy data before clearing old one
 			T* newArray = new T[other.m_capacity];
-			for (size_type i = 0; i < other.m_size; ++i)
+			if (other.m_size > 0)
 			{
-				new (&newArray[i]) T(other.m_data[i]);
+				copyElements(newArray, other.m_data.get(), other.m_size);
 			}
-			
+
 			// Only after new data is ready, clear old data
 			clear();
 			m_size = other.m_size;
@@ -241,19 +264,39 @@ private:
 		return (*lhs) == (*rhs);
 	}
 
+	// Bulk copy: tag dispatch to avoid compiler warnings on memcpy with non-POD
+	struct pod_tag {};
+	struct obj_tag {};
+
+	static void doCopy(T* dst, const T* src, size_type count, pod_tag)
+	{
+		memcpy(dst, src, count * sizeof(T));
+	}
+
+	static void doCopy(T* dst, const T* src, size_type count, obj_tag)
+	{
+		for (size_type i = 0; i < count; ++i)
+			new (&dst[i]) T(src[i]);
+	}
+
+	// Selects memcpy for POD types, placement-new loop otherwise
+	static void copyElements(T* dst, const T* src, size_type count)
+	{
+		if (count == 0) return;
+		// C++98 tag dispatch: POD types get memcpy, everything else gets copy-ctor
+		typedef typename select_type<is_pod_type<T>::value, pod_tag, obj_tag>::type tag;
+		doCopy(dst, src, count, tag());
+	}
+
 	void expand()
 	{
 		size_type newCap = (m_capacity == 0) ? 1 : m_capacity * 2;
 		T* newArray = new T[newCap];
-		
+
 		// Copy existing elements before modifying m_data
 		if (m_data && m_size > 0)
 		{
-			for (size_type i = 0; i < m_size; ++i)
-			{
-				// Use copy constructor
-				new (&newArray[i]) T(m_data[i]);
-			}
+			copyElements(newArray, m_data.get(), m_size);
 		}
 
 		// Create new pointer and only then release old one
