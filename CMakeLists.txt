@@ -147,6 +147,13 @@ else()
         file(COPY "${SHMEA_SOURCE_DIR}/g_export.h" DESTINATION "${CMAKE_SOURCE_DIR}/include")
         include_directories("include")
     else()
+        if(NOT TARGET shmea)
+            message(FATAL_ERROR
+                "find_package(shmea) succeeded but the 'shmea' imported target was not created.\n"
+                "This usually means a stale CMake package registry entry exists.\n"
+                "Try: rm -rf ~/.cmake/packages/shmea/ and re-run cmake.\n"
+                "Also ensure ShmeaDB is installed: cd ShmeaDB/build && cmake --preset linux-release && cmake --build --preset linux-release && cmake --install build")
+        endif()
         get_target_property(SHMEA_INCLUDE_DIRS shmea INTERFACE_INCLUDE_DIRECTORIES)
         include_directories(${SHMEA_INCLUDE_DIRS})
     endif()
