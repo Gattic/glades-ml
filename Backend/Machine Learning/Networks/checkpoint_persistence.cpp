@@ -15,6 +15,7 @@
 // and omit optimizer state; checkpoints are for resuming training.
 
 #include "network.h"
+#include "atlas_optimizer.h"
 
 #include <cerrno>
 #include <cmath>
@@ -807,7 +808,8 @@ static bool write_manifest(const std::string& manifestPath,
                            unsigned long long transformerLossScaleGoodSteps,
                            size_t maxShardBytes,
                            const std::vector<ShardEntry>& shards,
-                           const std::vector<TensorEntry>& tensors)
+                           const std::vector<TensorEntry>& tensors,
+                           const std::map<std::string, std::string>& extraKV = std::map<std::string, std::string>())
 {
 	// Atomic write: write to temp file then rename into place.
 	const std::string tmpPath = manifestPath + ".tmp";
@@ -915,6 +917,10 @@ static bool write_manifest(const std::string& manifestPath,
 		std::ostringstream oss; oss << transformerLossScale; write_kv(out, "transformer.lossScale", oss.str());
 	}
 	write_kv(out, "transformer.lossScaleGoodSteps", u64_to_string(static_cast<uint64_t>(transformerLossScaleGoodSteps)));
+
+	// Extra key-value pairs (e.g. ATLAS optimizer scalars).
+	for (std::map<std::string, std::string>::const_iterator eit = extraKV.begin(); eit != extraKV.end(); ++eit)
+		write_kv(out, eit->first, eit->second);
 
 	// Shards
 	for (size_t i = 0; i < shards.size(); ++i)
@@ -1049,6 +1055,108 @@ static void close_and_delete_shards(std::vector< shmea::GPointer<std::ifstream> 
 	}
 }
 
+// --- ATLAS checkpoint helpers ---
+
+static void enqueueAtlasWrite(std::vector<TensorWriteRef>& out,
+                               const std::string& prefix,
+                               const glades::atlas::WeightState& st,
+                               const std::string& dt)
+{
+	if (!st.initialized)
+		return;
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.m));
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.U", &st.U, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.fisher", &st.fisherDiag, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.prevGz", &st.prevGz, dt, sh));
+	}
+}
+
+static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
+                                  const std::string& prefix,
+                                  const glades::atlas::WeightState& st)
+{
+	if (!st.initialized)
+		return;
+	{
+		std::ostringstream oss; oss << st.mu;
+		kv["atlas." + prefix + ".mu"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << static_cast<unsigned long long>(st.step);
+		kv["atlas." + prefix + ".step"] = oss.str();
+	}
+}
+
+static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
+                              const std::string& prefix,
+                              glades::atlas::WeightState& st,
+                              unsigned int m, unsigned int n, unsigned int r,
+                              const std::string& dt)
+{
+	st.m = m;
+	st.n = n;
+	st.r = r;
+	st.U.resize(static_cast<size_t>(m) * r);
+	st.fisherDiag.resize(r);
+	st.prevGz.resize(static_cast<size_t>(r) * n);
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(m));
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.U", &st.U, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.fisher", &st.fisherDiag, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.prevGz", &st.prevGz, dt, sh));
+	}
+}
+
+static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
+                                 const std::string& prefix,
+                                 glades::atlas::WeightState& st)
+{
+	if (st.U.empty())
+		return;
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".mu");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.mu;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".step");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			unsigned long long s = 0;
+			iss >> s;
+			st.step = s;
+		}
+	}
+	st.initialized = true;
+}
+
 } // namespace
 
 namespace glades {
@@ -1146,8 +1254,10 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 	// 2) Collect tensors
 	std::vector<TensorWriteRef> tensorsToWrite;
 	tensorsToWrite.clear();
+	std::map<std::string, std::string> atlasKV;
 	{
 		const bool includeOpt = cfg.includeOptimizerState;
+		const bool isAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 		const std::string dt = "f32";
 		if (netType == TYPE_DFF)
 		{
@@ -1174,6 +1284,12 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 					sh.push_back(static_cast<uint64_t>(tr.out));
 					sh.push_back(static_cast<uint64_t>(tr.in));
 					tensorsToWrite.push_back(TensorWriteRef(oss.str(), &tr.vW, dt, sh));
+				}
+				if (includeOpt && isAtlas && t < tensorDff.atlasState.size())
+				{
+					std::ostringstream oss; oss << "dff.t" << static_cast<unsigned long long>(t);
+					enqueueAtlasWrite(tensorsToWrite, oss.str(), tensorDff.atlasState[t], dt);
+					writeAtlasManifestKV(atlasKV, oss.str(), tensorDff.atlasState[t]);
 				}
 			}
 		}
@@ -1219,6 +1335,19 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 						tensorsToWrite.push_back(TensorWriteRef(oss.str(), &hl.vWhh, dt, sh));
 					}
 				}
+				if (includeOpt && isAtlas)
+				{
+					{
+						std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Wxh";
+						enqueueAtlasWrite(tensorsToWrite, oss.str(), hl.atlasWxh, dt);
+						writeAtlasManifestKV(atlasKV, oss.str(), hl.atlasWxh);
+					}
+					{
+						std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Whh";
+						enqueueAtlasWrite(tensorsToWrite, oss.str(), hl.atlasWhh, dt);
+						writeAtlasManifestKV(atlasKV, oss.str(), hl.atlasWhh);
+					}
+				}
 			}
 			{
 				std::vector<uint64_t> sh;
@@ -1237,6 +1366,11 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 				sh.push_back(static_cast<uint64_t>(tensorRnn.O.out));
 				sh.push_back(static_cast<uint64_t>(tensorRnn.O.in));
 				tensorsToWrite.push_back(TensorWriteRef("rnn.o.vWhy", &tensorRnn.O.vWhy, dt, sh));
+			}
+			if (includeOpt && isAtlas)
+			{
+				enqueueAtlasWrite(tensorsToWrite, "rnn.o", tensorRnn.O.atlasWhy, dt);
+				writeAtlasManifestKV(atlasKV, "rnn.o", tensorRnn.O.atlasWhy);
 			}
 		}
 		else if (netType == TYPE_GRU || netType == TYPE_LSTM)
@@ -1288,6 +1422,19 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 						tensorsToWrite.push_back(TensorWriteRef(oss.str(), &hl.vU, dt, sh));
 					}
 				}
+				if (includeOpt && isAtlas)
+				{
+					{
+						std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".W";
+						enqueueAtlasWrite(tensorsToWrite, oss.str(), hl.atlasW, dt);
+						writeAtlasManifestKV(atlasKV, oss.str(), hl.atlasW);
+					}
+					{
+						std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".U";
+						enqueueAtlasWrite(tensorsToWrite, oss.str(), hl.atlasU, dt);
+						writeAtlasManifestKV(atlasKV, oss.str(), hl.atlasU);
+					}
+				}
 			}
 			{
 				std::vector<uint64_t> sh;
@@ -1306,6 +1453,11 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 				sh.push_back(static_cast<uint64_t>(tg.O.out));
 				sh.push_back(static_cast<uint64_t>(tg.O.in));
 				tensorsToWrite.push_back(TensorWriteRef(std::string(prefix) + ".o.vWhy", &tg.O.vWhy, dt, sh));
+			}
+			if (includeOpt && isAtlas)
+			{
+				enqueueAtlasWrite(tensorsToWrite, std::string(prefix) + ".o", tg.O.atlasWhy, dt);
+				writeAtlasManifestKV(atlasKV, std::string(prefix) + ".o", tg.O.atlasWhy);
 			}
 		}
 		else if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
@@ -1740,6 +1892,35 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 						tensorsToWrite.push_back(TensorWriteRef(oss.str(), &b.v2B2, dt, sh));
 					}
 				}
+				if (includeOpt && isAtlas)
+				{
+					std::ostringstream base; base << "tr.b" << li;
+					const std::string bp = base.str();
+					enqueueAtlasWrite(tensorsToWrite, bp + ".Wq", b.atlasWq, dt);
+					enqueueAtlasWrite(tensorsToWrite, bp + ".Wk", b.atlasWk, dt);
+					enqueueAtlasWrite(tensorsToWrite, bp + ".Wv", b.atlasWv, dt);
+					enqueueAtlasWrite(tensorsToWrite, bp + ".Wo", b.atlasWo, dt);
+					enqueueAtlasWrite(tensorsToWrite, bp + ".W1", b.atlasW1, dt);
+					enqueueAtlasWrite(tensorsToWrite, bp + ".W2", b.atlasW2, dt);
+					writeAtlasManifestKV(atlasKV, bp + ".Wq", b.atlasWq);
+					writeAtlasManifestKV(atlasKV, bp + ".Wk", b.atlasWk);
+					writeAtlasManifestKV(atlasKV, bp + ".Wv", b.atlasWv);
+					writeAtlasManifestKV(atlasKV, bp + ".Wo", b.atlasWo);
+					writeAtlasManifestKV(atlasKV, bp + ".W1", b.atlasW1);
+					writeAtlasManifestKV(atlasKV, bp + ".W2", b.atlasW2);
+				}
+			}
+			if (includeOpt && isAtlas)
+			{
+				enqueueAtlasWrite(tensorsToWrite, "tr.WIn", tt.atlasWIn, dt);
+				enqueueAtlasWrite(tensorsToWrite, "tr.WOut", tt.atlasWOut, dt);
+				writeAtlasManifestKV(atlasKV, "tr.WIn", tt.atlasWIn);
+				writeAtlasManifestKV(atlasKV, "tr.WOut", tt.atlasWOut);
+				if (tt.tokenModel)
+				{
+					enqueueAtlasWrite(tensorsToWrite, "tr.tokE", tt.atlasTokE, dt);
+					writeAtlasManifestKV(atlasKV, "tr.tokE", tt.atlasTokE);
+				}
 			}
 		}
 		else
@@ -1787,7 +1968,8 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 	                    trLossScaleGood,
 	                    maxShardBytes,
 	                    writer.get_shards(),
-	                    writer.get_tensors()))
+	                    writer.get_tensors(),
+	                    atlasKV))
 	{
 		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to write manifest.txt");
 	}
@@ -1942,6 +2124,8 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	std::vector<TensorReadRef> expected;
 	expected.clear();
 	const std::string dt = "f32";
+	const bool isAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
+	const unsigned int atlasRank = trainingConfig.atlas.rank;
 	if (netType == TYPE_DFF)
 	{
 		for (size_t t = 0; t < tensorDff.T.size(); ++t)
@@ -1967,6 +2151,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				sh.push_back(static_cast<uint64_t>(tr.out));
 				sh.push_back(static_cast<uint64_t>(tr.in));
 				expected.push_back(TensorReadRef(oss.str(), &tr.vW, dt, sh));
+			}
+			if (includeOpt && isAtlas && t < tensorDff.atlasState.size())
+			{
+				const unsigned int m = tr.out, n = tr.in;
+				const unsigned int r = std::min(atlasRank, std::min(m, n));
+				std::ostringstream oss; oss << "dff.t" << static_cast<unsigned long long>(t);
+				enqueueAtlasRead(expected, oss.str(), tensorDff.atlasState[t], m, n, r, dt);
 			}
 		}
 	}
@@ -2012,6 +2203,21 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					expected.push_back(TensorReadRef(oss.str(), &hl.vWhh, dt, sh));
 				}
 			}
+			if (includeOpt && isAtlas)
+			{
+				{
+					const unsigned int m = hl.h, n = hl.in;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Wxh";
+					enqueueAtlasRead(expected, oss.str(), hl.atlasWxh, m, n, r, dt);
+				}
+				{
+					const unsigned int m = hl.h, n = hl.h;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Whh";
+					enqueueAtlasRead(expected, oss.str(), hl.atlasWhh, m, n, r, dt);
+				}
+			}
 		}
 		{
 			std::vector<uint64_t> sh;
@@ -2030,6 +2236,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			sh.push_back(static_cast<uint64_t>(tensorRnn.O.out));
 			sh.push_back(static_cast<uint64_t>(tensorRnn.O.in));
 			expected.push_back(TensorReadRef("rnn.o.vWhy", &tensorRnn.O.vWhy, dt, sh));
+		}
+		if (includeOpt && isAtlas)
+		{
+			const unsigned int m = tensorRnn.O.out, n = tensorRnn.O.in;
+			const unsigned int r = std::min(atlasRank, std::min(m, n));
+			enqueueAtlasRead(expected, "rnn.o", tensorRnn.O.atlasWhy, m, n, r, dt);
 		}
 	}
 	else if (netType == TYPE_GRU || netType == TYPE_LSTM)
@@ -2081,6 +2293,21 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					expected.push_back(TensorReadRef(oss.str(), &hl.vU, dt, sh));
 				}
 			}
+			if (includeOpt && isAtlas)
+			{
+				{
+					const unsigned int m = tg.gateCount * hl.h, n = hl.in;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".W";
+					enqueueAtlasRead(expected, oss.str(), hl.atlasW, m, n, r, dt);
+				}
+				{
+					const unsigned int m = tg.gateCount * hl.h, n = hl.h;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".U";
+					enqueueAtlasRead(expected, oss.str(), hl.atlasU, m, n, r, dt);
+				}
+			}
 		}
 		{
 			std::vector<uint64_t> sh;
@@ -2099,6 +2326,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			sh.push_back(static_cast<uint64_t>(tg.O.out));
 			sh.push_back(static_cast<uint64_t>(tg.O.in));
 			expected.push_back(TensorReadRef(std::string(prefix) + ".o.vWhy", &tg.O.vWhy, dt, sh));
+		}
+		if (includeOpt && isAtlas)
+		{
+			const unsigned int m = tg.O.out, n = tg.O.in;
+			const unsigned int r = std::min(atlasRank, std::min(m, n));
+			enqueueAtlasRead(expected, std::string(prefix) + ".o", tg.O.atlasWhy, m, n, r, dt);
 		}
 	}
 	else if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
@@ -2529,6 +2762,64 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					expected.push_back(TensorReadRef(oss.str(), &b.v2B2, dt, sh));
 				}
 			}
+			if (includeOpt && isAtlas)
+			{
+				{
+					const unsigned int m = dModel, n = dModel;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "tr.b" << li << ".Wq";
+					enqueueAtlasRead(expected, oss.str(), b.atlasWq, m, n, r, dt);
+				}
+				{
+					const unsigned int m = dModelKV, n = dModel;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "tr.b" << li << ".Wk";
+					enqueueAtlasRead(expected, oss.str(), b.atlasWk, m, n, r, dt);
+				}
+				{
+					const unsigned int m = dModelKV, n = dModel;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "tr.b" << li << ".Wv";
+					enqueueAtlasRead(expected, oss.str(), b.atlasWv, m, n, r, dt);
+				}
+				{
+					const unsigned int m = dModel, n = dModel;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "tr.b" << li << ".Wo";
+					enqueueAtlasRead(expected, oss.str(), b.atlasWo, m, n, r, dt);
+				}
+				{
+					const unsigned int m = ff1Width, n = dModel;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "tr.b" << li << ".W1";
+					enqueueAtlasRead(expected, oss.str(), b.atlasW1, m, n, r, dt);
+				}
+				{
+					const unsigned int m = dModel, n = tt.dFF;
+					const unsigned int r = std::min(atlasRank, std::min(m, n));
+					std::ostringstream oss; oss << "tr.b" << li << ".W2";
+					enqueueAtlasRead(expected, oss.str(), b.atlasW2, m, n, r, dt);
+				}
+			}
+		}
+		if (includeOpt && isAtlas)
+		{
+			{
+				const unsigned int m = dModel, n = inputSize;
+				const unsigned int r = std::min(atlasRank, std::min(m, n));
+				enqueueAtlasRead(expected, "tr.WIn", tt.atlasWIn, m, n, r, dt);
+			}
+			{
+				const unsigned int m = outSize, n = dModel;
+				const unsigned int r = std::min(atlasRank, std::min(m, n));
+				enqueueAtlasRead(expected, "tr.WOut", tt.atlasWOut, m, n, r, dt);
+			}
+			if (tt.tokenModel)
+			{
+				const unsigned int m = tt.vocabSize, n = dModel;
+				const unsigned int r = std::min(atlasRank, std::min(m, n));
+				enqueueAtlasRead(expected, "tr.tokE", tt.atlasTokE, m, n, r, dt);
+			}
 		}
 	}
 	else
@@ -2556,6 +2847,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	optionalNames.insert("tr.v2LnFinalGamma");
 	optionalNames.insert("tr.mLnFinalBeta");
 	optionalNames.insert("tr.v2LnFinalBeta");
+	// ATLAS tensors are optional (old checkpoints won't have them).
+	for (size_t i = 0; i < expected.size(); ++i)
+	{
+		if (expected[i].name.find(".atlas.") != std::string::npos)
+			optionalNames.insert(expected[i].name);
+	}
 
 	// Parse shardCount/tensorCount
 	size_t shardCount = 0u;
@@ -2739,7 +3036,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				return st;
 			}
 			uint64_t shapeCount = 0u;
-			if (rankU == 0u)
+			if (countU == 0u)
+			{
+				// Empty tensor (e.g. unused optimizer state). Accept regardless of shape.
+				shapeCount = 0u;
+			}
+			else if (rankU == 0u)
 			{
 				shapeCount = 0u;
 			}
@@ -2792,6 +3094,9 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		std::map<std::string, std::vector<float>*>::iterator it = nameToVec.find(tname);
 		if (it == nameToVec.end())
 		{
+			// ATLAS tensors in old checkpoints can be safely skipped if not expected.
+			if (tname.find(".atlas.") != std::string::npos)
+				continue;
 			// Unknown tensor in checkpoint; reject (strict).
 			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, std::string("loadCheckpoint: unexpected tensor in checkpoint: ") + tname);
 			close_and_delete_shards(shardStreams);
@@ -2868,6 +3173,74 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 
 	// Cleanup streams
 	close_and_delete_shards(shardStreams);
+
+	// Restore ATLAS optimizer scalar state (mu, step) from manifest KV entries.
+	if (includeOpt && isAtlas)
+	{
+		if (netType == TYPE_DFF)
+		{
+			for (size_t t = 0; t < tensorDff.atlasState.size(); ++t)
+			{
+				std::ostringstream oss; oss << "dff.t" << static_cast<unsigned long long>(t);
+				readAtlasManifestKV(kv, oss.str(), tensorDff.atlasState[t]);
+			}
+		}
+		else if (netType == TYPE_RNN)
+		{
+			for (size_t l = 0; l < tensorRnn.H.size(); ++l)
+			{
+				TensorRNNState::Hidden& hl = tensorRnn.H[l];
+				{
+					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Wxh";
+					readAtlasManifestKV(kv, oss.str(), hl.atlasWxh);
+				}
+				{
+					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Whh";
+					readAtlasManifestKV(kv, oss.str(), hl.atlasWhh);
+				}
+			}
+			readAtlasManifestKV(kv, "rnn.o", tensorRnn.O.atlasWhy);
+		}
+		else if (netType == TYPE_GRU || netType == TYPE_LSTM)
+		{
+			TensorGatedState& tg = (netType == TYPE_GRU) ? tensorGru : tensorLstm;
+			const char* prefix = (netType == TYPE_GRU) ? "gru" : "lstm";
+			for (size_t l = 0; l < tg.H.size(); ++l)
+			{
+				TensorGatedState::Hidden& hl = tg.H[l];
+				{
+					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".W";
+					readAtlasManifestKV(kv, oss.str(), hl.atlasW);
+				}
+				{
+					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".U";
+					readAtlasManifestKV(kv, oss.str(), hl.atlasU);
+				}
+			}
+			readAtlasManifestKV(kv, std::string(prefix) + ".o", tg.O.atlasWhy);
+		}
+		else if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
+		{
+			TensorTransformerState& tt = tensorTransformer;
+			readAtlasManifestKV(kv, "tr.WIn", tt.atlasWIn);
+			readAtlasManifestKV(kv, "tr.WOut", tt.atlasWOut);
+			if (tt.tokenModel)
+				readAtlasManifestKV(kv, "tr.tokE", tt.atlasTokE);
+			for (size_t l = 0; l < tt.blocks.size(); ++l)
+			{
+				TensorTransformerState::Block& b = tt.blocks[l];
+				const unsigned long long li = static_cast<unsigned long long>(l);
+				std::ostringstream base; base << "tr.b" << li;
+				const std::string bp = base.str();
+				readAtlasManifestKV(kv, bp + ".Wq", b.atlasWq);
+				readAtlasManifestKV(kv, bp + ".Wk", b.atlasWk);
+				readAtlasManifestKV(kv, bp + ".Wv", b.atlasWv);
+				readAtlasManifestKV(kv, bp + ".Wo", b.atlasWo);
+				readAtlasManifestKV(kv, bp + ".W1", b.atlasW1);
+				readAtlasManifestKV(kv, bp + ".W2", b.atlasW2);
+			}
+		}
+	}
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }

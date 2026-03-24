@@ -196,6 +196,38 @@ bool sgemm_rowmajor_abt(int M, int N, int K,
 	return true;
 }
 
+// Row-major right-side upper-triangular solve:
+// X[M,N] * R[N,N] = alpha * B[M,N], R upper triangular, B overwritten with X.
+//
+// cuBLAS col-major view: row-major R[N,N] becomes col-major R^T[N,N] (lower tri).
+// Row-major B[M,N] becomes col-major B^T[N,M].
+// X*R = B  =>  R^T * X^T = B^T  =>  SIDE_LEFT, LOWER, OP_N on the transposed view.
+bool strsm_rowmajor_right_upper(int M, int N,
+                                 float alpha,
+                                 const float* R, int ldr,
+                                 float* B, int ldb)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+
+	cublasStatus_t st = cublasStrsm(g_handle,
+	                                 CUBLAS_SIDE_LEFT,
+	                                 CUBLAS_FILL_MODE_LOWER,
+	                                 CUBLAS_OP_N,
+	                                 CUBLAS_DIAG_NON_UNIT,
+	                                 N, M,
+	                                 &alpha,
+	                                 R, ldr,
+	                                 B, ldb);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasStrsm failed: %d (M=%d N=%d)\n",
+		        static_cast<int>(st), M, N);
+		return false;
+	}
+	return true;
+}
+
 bool sgemm_batched_strided(int M, int N, int K,
                             float alpha,
                             const float* A, int lda, long long int strideA,

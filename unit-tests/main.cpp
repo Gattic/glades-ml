@@ -37,6 +37,8 @@
 #include "Backend/Machine Learning/egarch-test.h"
 #include "Backend/Machine Learning/gan-test.h"
 #include "Backend/Machine Learning/hyperparameter-tuner-test.h"
+#include "Backend/Machine Learning/atlas-test.h"
+#include "Backend/Machine Learning/atlas-bench.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -122,6 +124,10 @@ int main(int argc, char* argv[])
 		BayesianLRScheduleTest();
 	    else if (strcmp(argv[1], "hp-tuner-full") == 0)
 		HyperparameterTunerFullLoopTest();
+	    else if (strcmp(argv[1], "atlas") == 0)
+		ATLASUnitTest();
+	    else if (strcmp(argv[1], "atlas-bench") == 0)
+		ATLASBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
 	        OHEUnitTest();

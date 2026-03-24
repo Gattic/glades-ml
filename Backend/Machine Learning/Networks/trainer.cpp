@@ -288,7 +288,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		float lrMult = 1.0f;
 		if (runType == glades::NNetwork::RUN_TRAIN && net.skeleton)
 		{
-			lrMult = net.computeLearningRateMultiplier(net.epochs - starting_epochs);
+			lrMult = net.computeLearningRateMultiplier(net.epochs - starting_epochs + net.lrScheduleEpochOffset);
 			net.lrScheduleMultiplier = lrMult;
 		}
 

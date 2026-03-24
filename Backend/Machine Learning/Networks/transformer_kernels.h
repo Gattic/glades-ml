@@ -33,7 +33,7 @@ static inline float dot_f32(const float* a, const float* b, unsigned int n)
 {
 	if (!a || !b || n == 0u)
 		return 0.0f;
-#if defined(__AVX2__)
+#if defined(__AVX__)
 	__m256 acc0 = _mm256_setzero_ps();
 	__m256 acc1 = _mm256_setzero_ps();
 	__m256 acc2 = _mm256_setzero_ps();
@@ -88,7 +88,7 @@ static inline void axpy_f32(float* y, const float* x, float a, unsigned int n)
 {
 	if (!y || !x || n == 0u)
 		return;
-#if defined(__AVX2__)
+#if defined(__AVX__)
 	const __m256 va = _mm256_set1_ps(a);
 	unsigned int i = 0u;
 	for (; (i + 7u) < n; i += 8u)

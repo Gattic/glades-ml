@@ -207,6 +207,8 @@ void glades::NNetwork::SGDHelper_GRU(unsigned int inputRowCounter, int runType)
 		TensorGatedState& tensorGru;
 		int H;
 		unsigned int outSize;
+		glades::rng::Engine& rngEngine;
+		shmea::GLogger* logger;
 
 		ApplyBatch(NNetwork& net, TensorGatedState& tg, int h, unsigned int os)
 		    : skeleton(net.skeleton),
@@ -218,7 +220,9 @@ void glades::NNetwork::SGDHelper_GRU(unsigned int inputRowCounter, int runType)
 		      running(net.running),
 		      tensorGru(tg),
 		      H(h),
-		      outSize(os)
+		      outSize(os),
+		      rngEngine(net.rngEngine),
+		      logger(net.getLogger())
 		{
 		}
 
@@ -321,6 +325,82 @@ void glades::NNetwork::SGDHelper_GRU(unsigned int inputRowCounter, int runType)
 				return false;
 			}
 
+			// ATLAS optimizer branch.
+			const bool useAtlas = (trainingConfig.optimizer.type == OptimizerConfig::ATLAS);
+			if (useAtlas)
+			{
+				const ATLASConfig& ac = trainingConfig.atlas;
+
+				// Output: Why
+				if (!tensorGru.O.atlasWhy.initialized && tensorGru.O.out > 0 && tensorGru.O.in > 0)
+					atlas::initWeightState(tensorGru.O.atlasWhy, tensorGru.O.out, tensorGru.O.in, ac.rank, ac.muMin, rngEngine, logger);
+				if (tensorGru.O.atlasWhy.initialized)
+					atlas::applyStep(tensorGru.O.atlasWhy, &tensorGru.O.Why[0], &tensorGru.O.gWhy[0],
+						tensorGru.O.out, tensorGru.O.in, invBatch, lrOut, wd1Out, wd2Out, gradScale,
+						ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
+
+				// Output bias: standard SGD
+				for (unsigned int k = 0; k < outSize; ++k)
+				{
+					float gB = tensorGru.O.gBias[k] * invBatch;
+					gB *= gradScale;
+					tensorGru.O.bias[k] -= (lrOut * gB);
+					tensorGru.O.gBias[k] = 0.0f;
+					if (!is_finite(tensorGru.O.bias[k]))
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_GRU: non-finite output bias after ATLAS update (NaN/Inf)");
+						running = false;
+						return false;
+					}
+				}
+
+				// Hidden layers: whole-matrix ATLAS over packed gates
+				for (int l = 0; l < H; ++l)
+				{
+					const unsigned int li = static_cast<unsigned int>(l);
+					TensorGatedState::Hidden& hl = tensorGru.H[static_cast<size_t>(l)];
+					const float lr = skeleton->getLearningRate(li) * lrScheduleMultiplier;
+					const float wd1 = skeleton->getWeightDecay1(li);
+					const float wd2 = skeleton->getWeightDecay2(li);
+
+					// W: [gateCount*h, in] as single matrix
+					const unsigned int wRows = tensorGru.gateCount * hl.h;
+					if (!hl.atlasW.initialized && wRows > 0 && hl.in > 0)
+						atlas::initWeightState(hl.atlasW, wRows, hl.in, ac.rank, ac.muMin, rngEngine, logger);
+					if (hl.atlasW.initialized)
+						atlas::applyStep(hl.atlasW, &hl.W[0], &hl.gW[0],
+							wRows, hl.in, invBatch, lr, wd1, wd2, gradScale,
+							ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
+
+					// U: [gateCount*h, h] as single matrix
+					const unsigned int uRows = tensorGru.gateCount * hl.h;
+					if (!hl.atlasU.initialized && uRows > 0 && hl.h > 0)
+						atlas::initWeightState(hl.atlasU, uRows, hl.h, ac.rank, ac.muMin, rngEngine, logger);
+					if (hl.atlasU.initialized)
+						atlas::applyStep(hl.atlasU, &hl.U[0], &hl.gU[0],
+							uRows, hl.h, invBatch, lr, wd1, wd2, gradScale,
+							ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
+
+					// Bias: standard SGD
+					for (size_t bi = 0; bi < hl.bias.size(); ++bi)
+					{
+						float gB = hl.gBias[bi] * invBatch;
+						gB *= gradScale;
+						hl.bias[bi] -= (lr * gB);
+						hl.gBias[bi] = 0.0f;
+						if (!is_finite(hl.bias[bi]))
+						{
+							lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_GRU: non-finite hidden bias after ATLAS update (NaN/Inf)");
+							running = false;
+							return false;
+						}
+					}
+				}
+
+				return true;
+			}
+			else
+			{
 			// Output weights
 			for (size_t idx = 0; idx < tensorGru.O.Why.size(); ++idx)
 			{
@@ -426,6 +506,7 @@ void glades::NNetwork::SGDHelper_GRU(unsigned int inputRowCounter, int runType)
 
 			// Defer syncing tensors -> Node/Edge graph until an epoch boundary.
 			return true;
+			} // else (momentum SGD)
 		}
 	};
 	ApplyBatch applyBatch(*this, tensorGru, H, outSize);

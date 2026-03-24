@@ -9,6 +9,7 @@
 #include "cuda/gpu_dispatch.h"
 #include "cuda/gpu_kernels.h"
 #include "cuda/gpu_blas.h"
+#include "cuda/gpu_atlas.h"
 #include "cuda/gpu_transformer_state.h"
 #endif
 
@@ -791,12 +792,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	const bool ddpEnabled = trainingConfig.ddp.enable && (glades::ddp::worldSize() > 1);
 
 	// Trainability triage:
-	// - For real LLMs, AdamW is the supported optimizer in this backend.
+	// - For real LLMs, AdamW or ATLAS are the supported optimizers in this backend.
 	// - Full softmax is guarded to avoid silently allocating/computing O(T*vocab) buffers.
-	if (tokenLM && isTrain && (trainingConfig.optimizer.type != glades::OptimizerConfig::ADAMW))
+	if (tokenLM && isTrain && (trainingConfig.optimizer.type != glades::OptimizerConfig::ADAMW)
+	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::ATLAS))
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-		                            "SGDHelper_TRANSFORMER: token LM training requires optimizer=ADAMW for LLM-scale stability");
+		                            "SGDHelper_TRANSFORMER: token LM training requires optimizer=ADAMW or ATLAS for LLM-scale stability");
 		running = false;
 		return;
 	}
@@ -882,6 +884,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 			const float invBatch = 1.0f / static_cast<float>(batchTimeSteps);
 			const bool useAdamW = (net.trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW);
+			const bool useAtlas = (net.trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 			// Token LM mode uses a tied embedding head: logits = H * E^T + lmBias.
 			// In this mode, the generic output projection (WOut/bOut) is UNUSED and must not:
 			// - contribute to global grad-norm clipping (via weight decay terms), or
@@ -905,9 +908,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			{
 				double sumsq = 0.0;
 
-				if (useAdamW)
+				if (useAdamW || useAtlas)
 				{
-					// For AdamW, clip is applied to raw gradients (weight decay is decoupled).
+					// For AdamW/ATLAS, clip is applied to raw gradients (weight decay is decoupled).
 					if (tt.tokenModel)
 					{
 						for (size_t i = 0; i < tt.gTokE.size(); ++i)
@@ -1112,7 +1115,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			}
 
 			// --- Apply updates ---
-			if (!useAdamW)
+			if (!useAdamW && !useAtlas)
 			{
 				// SGD + momentum (historical behavior).
 				// Token embedding (index 0 in LM mode)
@@ -1259,6 +1262,187 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						tt.WOut[i] -= v;
 						tt.gWOut[i] = 0.0f;
 					}
+					for (size_t i = 0; i < tt.bOut.size(); ++i)
+					{
+						const float gB = (tt.gBOut[i] * invBatch) * gradScale;
+						tt.bOut[i] -= lr * gB;
+						tt.gBOut[i] = 0.0f;
+					}
+				}
+				else
+				{
+					// Defensive: ensure gradients are cleared so stale values never leak into later non-tokenLM runs.
+					std::fill(tt.gWOut.begin(), tt.gWOut.end(), 0.0f);
+					std::fill(tt.gBOut.begin(), tt.gBOut.end(), 0.0f);
+				}
+			}
+			else if (useAtlas)
+			{
+				// ATLAS optimizer: subspace-projected natural gradient with temporal prediction.
+				const glades::ATLASConfig& ac = net.trainingConfig.atlas;
+
+				tt.optimizerStep += 1ULL;
+
+				// Compute weight matrix dimensions.
+				const unsigned int dmTT = tt.dModel;
+				const unsigned int dFFTT = tt.dFF;
+				const unsigned int nHeadsTT = tt.nHeads;
+				const unsigned int nKVHeadsTT = (tt.nKVHeads > 0u ? tt.nKVHeads : nHeadsTT);
+				const unsigned int dHeadTT = dmTT / nHeadsTT;
+				const unsigned int dModelKVTT = nKVHeadsTT * dHeadTT;
+				const unsigned int ffnKindTT = tt.ffnKind;
+				const unsigned int ff1WidthTT = (ffnKindTT == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFFTT) : dFFTT;
+
+				// Token embedding (index 0 in LM mode)
+				if (tt.tokenModel)
+				{
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(0u);
+					const float wd2 = net.skeleton->getWeightDecay2(0u);
+
+					// tokE: [vocabSize, dModel]
+					if (!tt.atlasTokE.initialized)
+						atlas::initWeightState(tt.atlasTokE, tt.vocabSize, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(tt.atlasTokE, &tt.tokE[0], &tt.gTokE[0],
+					                 tt.vocabSize, dmTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// lmBias: simple SGD (no subspace projection for 1D bias)
+					for (size_t i = 0; i < tt.lmBias.size(); ++i)
+					{
+						tt.lmBias[i] -= lr * (tt.gLmBias[i] * invBatch) * gradScale;
+						tt.gLmBias[i] = 0.0f;
+					}
+				}
+
+				// Input projection (index 0)
+				{
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(0u);
+					const float wd2 = net.skeleton->getWeightDecay2(0u);
+
+					// WIn: [dModel, inputSize]
+					const unsigned int winRows = dmTT;
+					const unsigned int winCols = tt.inputSize;
+					if (!tt.atlasWIn.initialized)
+						atlas::initWeightState(tt.atlasWIn, winRows, winCols, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(tt.atlasWIn, &tt.WIn[0], &tt.gWIn[0],
+					                 winRows, winCols,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// bIn: simple SGD
+					for (size_t i = 0; i < tt.bIn.size(); ++i)
+					{
+						tt.bIn[i] -= lr * (tt.gBIn[i] * invBatch) * gradScale;
+						tt.gBIn[i] = 0.0f;
+					}
+				}
+
+				// Blocks (index 1..nLayers)
+				for (unsigned int li = 0; li < nLayers; ++li)
+				{
+					const unsigned int idx = li + 1u;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(idx);
+					const float wd2 = net.skeleton->getWeightDecay2(idx);
+					TensorTransformerState::Block& b = tt.blocks[li];
+
+					// Wq: [dModel, dModel]
+					if (!b.atlasWq.initialized)
+						atlas::initWeightState(b.atlasWq, dmTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(b.atlasWq, &b.Wq[0], &b.gWq[0],
+					                 dmTT, dmTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// Wk: [dModelKV, dModel]
+					if (!b.atlasWk.initialized)
+						atlas::initWeightState(b.atlasWk, dModelKVTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(b.atlasWk, &b.Wk[0], &b.gWk[0],
+					                 dModelKVTT, dmTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// Wv: [dModelKV, dModel]
+					if (!b.atlasWv.initialized)
+						atlas::initWeightState(b.atlasWv, dModelKVTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(b.atlasWv, &b.Wv[0], &b.gWv[0],
+					                 dModelKVTT, dmTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// Wo: [dModel, dModel]
+					if (!b.atlasWo.initialized)
+						atlas::initWeightState(b.atlasWo, dmTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(b.atlasWo, &b.Wo[0], &b.gWo[0],
+					                 dmTT, dmTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// W1: [ff1Width, dModel]
+					if (!b.atlasW1.initialized)
+						atlas::initWeightState(b.atlasW1, ff1WidthTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(b.atlasW1, &b.W1[0], &b.gW1[0],
+					                 ff1WidthTT, dmTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// W2: [dModel, dFF]
+					if (!b.atlasW2.initialized)
+						atlas::initWeightState(b.atlasW2, dmTT, dFFTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(b.atlasW2, &b.W2[0], &b.gW2[0],
+					                 dmTT, dFFTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// Biases and LN params: simple SGD (no subspace projection)
+					for (size_t i = 0; i < b.bq.size(); ++i) { b.bq[i] -= lr * (b.gBq[i] * invBatch) * gradScale; b.gBq[i] = 0.0f; }
+					for (size_t i = 0; i < b.bk.size(); ++i) { b.bk[i] -= lr * (b.gBk[i] * invBatch) * gradScale; b.gBk[i] = 0.0f; }
+					for (size_t i = 0; i < b.bv.size(); ++i) { b.bv[i] -= lr * (b.gBv[i] * invBatch) * gradScale; b.gBv[i] = 0.0f; }
+					for (size_t i = 0; i < b.bo.size(); ++i) { b.bo[i] -= lr * (b.gBo[i] * invBatch) * gradScale; b.gBo[i] = 0.0f; }
+					for (size_t i = 0; i < b.b1.size(); ++i) { b.b1[i] -= lr * (b.gB1[i] * invBatch) * gradScale; b.gB1[i] = 0.0f; }
+					for (size_t i = 0; i < b.b2.size(); ++i) { b.b2[i] -= lr * (b.gB2[i] * invBatch) * gradScale; b.gB2[i] = 0.0f; }
+					for (size_t i = 0; i < b.ln1Gamma.size(); ++i) { b.ln1Gamma[i] -= lr * (b.gLn1Gamma[i] * invBatch) * gradScale; b.gLn1Gamma[i] = 0.0f; }
+					for (size_t i = 0; i < b.ln1Beta.size(); ++i) { b.ln1Beta[i] -= lr * (b.gLn1Beta[i] * invBatch) * gradScale; b.gLn1Beta[i] = 0.0f; }
+					for (size_t i = 0; i < b.ln2Gamma.size(); ++i) { b.ln2Gamma[i] -= lr * (b.gLn2Gamma[i] * invBatch) * gradScale; b.gLn2Gamma[i] = 0.0f; }
+					for (size_t i = 0; i < b.ln2Beta.size(); ++i) { b.ln2Beta[i] -= lr * (b.gLn2Beta[i] * invBatch) * gradScale; b.gLn2Beta[i] = 0.0f; }
+				}
+
+				// Final LayerNorm (SGD, use block 0 LR; no weight decay)
+				{
+					const float lr = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
+					for (size_t i = 0; i < tt.lnFinalGamma.size(); ++i) { tt.lnFinalGamma[i] -= lr * (tt.gLnFinalGamma[i] * invBatch) * gradScale; tt.gLnFinalGamma[i] = 0.0f; }
+					for (size_t i = 0; i < tt.lnFinalBeta.size(); ++i) { tt.lnFinalBeta[i] -= lr * (tt.gLnFinalBeta[i] * invBatch) * gradScale; tt.gLnFinalBeta[i] = 0.0f; }
+				}
+
+				// Output projection (index nLayers) is unused in token LM tied-head mode.
+				if (!tokenLMTiedHead)
+				{
+					const unsigned int idx = nLayers;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(idx);
+					const float wd2 = net.skeleton->getWeightDecay2(idx);
+
+					// WOut: [outSize, dModel]
+					if (!tt.atlasWOut.initialized)
+						atlas::initWeightState(tt.atlasWOut, outSize, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
+					atlas::applyStep(tt.atlasWOut, &tt.WOut[0], &tt.gWOut[0],
+					                 outSize, dmTT,
+					                 invBatch, lr, wd1, wd2, gradScale,
+					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					                 net.rngEngine, net.getLogger());
+
+					// bOut: simple SGD
 					for (size_t i = 0; i < tt.bOut.size(); ++i)
 					{
 						const float gB = (tt.gBOut[i] * invBatch) * gradScale;
@@ -1700,6 +1884,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		const bool gpuReady = ensureGpuState();
 		if (gpuReady && gpuTransformerWeights && gpuTransformerWeights->initialized)
 		{
+
 			const unsigned int dHead = dModel / nHeads;
 			const unsigned int dModelKV = nKVHeads * dHead;
 			const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
@@ -1714,6 +1899,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (T == 0u)
 					continue;
 				tokensProcessed += static_cast<unsigned long long>(T);
+
 
 				// Ensure GPU scratch is big enough for this sequence.
 				if (!gpuTransformerScratch)
@@ -2089,6 +2275,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							append_logfmt_kv(oss, "loss_so_far", overallTotalError);
 						}
 						append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+						if (trainingConfig.globalGradClipNorm > 0.0f)
+						{
+							append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+							append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+						}
 						append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tensorTransformer.optimizerStep));
 						logger->info("NNetwork", shmea::GString(oss.str().c_str()));
 					}
@@ -2520,13 +2711,196 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (seqInBatch >= seqBatchMax && timeStepsInBatch > 0u)
 				{
 					const float invBatch = 1.0f / static_cast<float>(timeStepsInBatch);
+					tensorTransformer.optimizerStep += 1ULL;
+
+					// Warmup + DDP LR scaling (matches CPU path).
+					const float warmupMult = trainingConfig.warmup.multiplier(static_cast<int>(tensorTransformer.optimizerStep));
+					const float ddpLRScale = (trainingConfig.ddp.enable && trainingConfig.ddp.linearLRScaling)
+					                       ? static_cast<float>(glades::ddp::worldSize()) : 1.0f;
+					const float gpuExtraLRMult = warmupMult * ddpLRScale;
+
+					// Step-level LR schedule (cosine decay within epoch).
+					if (trainingConfig.lrSchedule.type != glades::LearningRateScheduleConfig::NONE)
+					{
+						const unsigned int totalSteps = (seqCount + seqBatchMax - 1u) / seqBatchMax;
+						const float progress = (totalSteps > 0u) ? static_cast<float>(tensorTransformer.optimizerStep % totalSteps) / static_cast<float>(totalSteps) : 0.0f;
+						lrScheduleMultiplier = trainingConfig.lrSchedule.multiplierSmooth(progress);
+					}
+
+					// Global gradient norm clipping on GPU.
+					float gradScale = 1.0f;
+					const float clipNorm = trainingConfig.globalGradClipNorm;
+					if (clipNorm > 0.0f)
+					{
+						// Use lossSum buffer as temporary accumulator for gradient norm.
+						gpu::device_memset_bytes(gpuTransformerScratch->lossSum.data(), 0, sizeof(float));
+
+						// Accumulate sum(g^2) across all gradient buffers.
+						if (tokenLM)
+						{
+							gpu::sum_squared_accumulate(gpuTransformerWeights->gTokE.data(),
+							    static_cast<int>(gpuTransformerWeights->gTokE.size()),
+							    gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gpuTransformerWeights->gLmBias.data(),
+							    static_cast<int>(gpuTransformerWeights->gLmBias.size()),
+							    gpuTransformerScratch->lossSum.data());
+						}
+						else
+						{
+							gpu::sum_squared_accumulate(gpuTransformerWeights->gWIn.data(),
+							    static_cast<int>(gpuTransformerWeights->gWIn.size()),
+							    gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gpuTransformerWeights->gBIn.data(),
+							    static_cast<int>(gpuTransformerWeights->gBIn.size()),
+							    gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gpuTransformerWeights->gWOut.data(),
+							    static_cast<int>(gpuTransformerWeights->gWOut.size()),
+							    gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gpuTransformerWeights->gBOut.data(),
+							    static_cast<int>(gpuTransformerWeights->gBOut.size()),
+							    gpuTransformerScratch->lossSum.data());
+						}
+						for (unsigned int gli = 0; gli < nLayers; ++gli)
+						{
+							gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[gli];
+							gpu::sum_squared_accumulate(gb.gWq.data(), static_cast<int>(gb.gWq.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gWk.data(), static_cast<int>(gb.gWk.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gWv.data(), static_cast<int>(gb.gWv.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gWo.data(), static_cast<int>(gb.gWo.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gW1.data(), static_cast<int>(gb.gW1.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gW2.data(), static_cast<int>(gb.gW2.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gBq.data(), static_cast<int>(gb.gBq.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gBk.data(), static_cast<int>(gb.gBk.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gBv.data(), static_cast<int>(gb.gBv.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gBo.data(), static_cast<int>(gb.gBo.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gB1.data(), static_cast<int>(gb.gB1.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gB2.data(), static_cast<int>(gb.gB2.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gLn1Gamma.data(), static_cast<int>(gb.gLn1Gamma.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gLn1Beta.data(), static_cast<int>(gb.gLn1Beta.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gLn2Gamma.data(), static_cast<int>(gb.gLn2Gamma.size()), gpuTransformerScratch->lossSum.data());
+							gpu::sum_squared_accumulate(gb.gLn2Beta.data(), static_cast<int>(gb.gLn2Beta.size()), gpuTransformerScratch->lossSum.data());
+						}
+
+						float h_sumSq = 0.0f;
+						gpuTransformerScratch->lossSum.download(&h_sumSq, 1);
+						const float gradNorm = sqrtf(h_sumSq) * invBatch;
+						if (gradNorm > clipNorm)
+							gradScale = clipNorm / (gradNorm + 1e-12f);
+						lastGradNorm = gradNorm;
+						lastGradNormScale = gradScale;
+					}
+
+					const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
+
+					if (gpuUseAtlas)
+					{
+					// === GPU ATLAS optimizer ===
+					// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
+					// Biases and LN params use vanilla SGD (matching CPU ATLAS path).
+					const glades::ATLASConfig& ac = trainingConfig.atlas;
+
+					// Macro: ATLAS step for a weight matrix on GPU.
+#define GLADES_GPU_ATLAS_STEP(st, W, gW, rows, cols, lr_, wd1_, wd2_) do { \
+	if (!(st).initialized) \
+		gpu::atlas_gpu_init((st), (rows), (cols), ac.rank, ac.muMin); \
+	gpu::atlas_gpu_step((st), (W).data(), (gW).data(), \
+	                    (rows), (cols), \
+	                    invBatch, (lr_), (wd1_), (wd2_), gradScale, \
+	                    ac.beta, ac.muMin, ac.muMax, ac.eps, \
+	                    ac.tSub, ac.powerIters, ac.betaRefresh, \
+	                    ac.kappaMax); \
+} while(0)
+
+					// Macro: vanilla SGD for 1D bias/LN param on GPU.
+					// W -= lr * invBatch * gradScale * g;  then zero g.
+#define GLADES_GPU_SGD_BIAS(param, grad, lr_) do { \
+	const int sgd_sz_ = static_cast<int>((param).size()); \
+	if (sgd_sz_ > 0) { \
+		gpu::atlas_gpu_baseline_update((param).data(), (grad).data(), sgd_sz_, (lr_) * invBatch * gradScale); \
+		(grad).zero(); \
+	} \
+} while(0)
+
+					// Token embedding (layer index 0)
+					if (tokenLM)
+					{
+						const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_0 = skeleton->getWeightDecay1(0u);
+						const float wd2_0 = skeleton->getWeightDecay2(0u);
+
+						GLADES_GPU_ATLAS_STEP(gpuTransformerWeights->atlasTokE,
+						    gpuTransformerWeights->tokE, gpuTransformerWeights->gTokE,
+						    vocabSize, dModel, lr0, wd1_0, wd2_0);
+
+						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lmBias, gpuTransformerWeights->gLmBias, lr0);
+					}
+
+					// Input projection (layer index 0, not used for token-LM models)
+					if (!tokenLM)
+					{
+						const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_0 = skeleton->getWeightDecay1(0u);
+						const float wd2_0 = skeleton->getWeightDecay2(0u);
+
+						GLADES_GPU_ATLAS_STEP(gpuTransformerWeights->atlasWIn,
+						    gpuTransformerWeights->WIn, gpuTransformerWeights->gWIn,
+						    dModel, inputSize, lr0, wd1_0, wd2_0);
+
+						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bIn, gpuTransformerWeights->gBIn, lr0);
+					}
+
+					// Per-layer blocks (layer index 1..nLayers)
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_l = skeleton->getWeightDecay1(bli + 1u);
+						const float wd2_l = skeleton->getWeightDecay2(bli + 1u);
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+
+						GLADES_GPU_ATLAS_STEP(gb.atlasWq, gb.Wq, gb.gWq, dModel, dModel, lr_l, wd1_l, wd2_l);
+						GLADES_GPU_ATLAS_STEP(gb.atlasWk, gb.Wk, gb.gWk, dModelKV, dModel, lr_l, wd1_l, wd2_l);
+						GLADES_GPU_ATLAS_STEP(gb.atlasWv, gb.Wv, gb.gWv, dModelKV, dModel, lr_l, wd1_l, wd2_l);
+						GLADES_GPU_ATLAS_STEP(gb.atlasWo, gb.Wo, gb.gWo, dModel, dModel, lr_l, wd1_l, wd2_l);
+						GLADES_GPU_ATLAS_STEP(gb.atlasW1, gb.W1, gb.gW1, ff1Width, dModel, lr_l, wd1_l, wd2_l);
+						GLADES_GPU_ATLAS_STEP(gb.atlasW2, gb.W2, gb.gW2, dModel, dFF, lr_l, wd1_l, wd2_l);
+
+						// Biases and LN params: vanilla SGD (no subspace projection)
+						GLADES_GPU_SGD_BIAS(gb.bq, gb.gBq, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.bk, gb.gBk, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.bv, gb.gBv, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.bo, gb.gBo, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.b1, gb.gB1, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.b2, gb.gB2, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.ln1Gamma, gb.gLn1Gamma, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.ln1Beta, gb.gLn1Beta, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.ln2Gamma, gb.gLn2Gamma, lr_l);
+						GLADES_GPU_SGD_BIAS(gb.ln2Beta, gb.gLn2Beta, lr_l);
+					}
+
+					// Output projection (layer index nLayers, unused in tied-head mode)
+					if (!tokenLM)
+					{
+						const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_o = skeleton->getWeightDecay1(nLayers);
+						const float wd2_o = skeleton->getWeightDecay2(nLayers);
+
+						GLADES_GPU_ATLAS_STEP(gpuTransformerWeights->atlasWOut,
+						    gpuTransformerWeights->WOut, gpuTransformerWeights->gWOut,
+						    outSize, dModel, lrO, wd1_o, wd2_o);
+
+						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bOut, gpuTransformerWeights->gBOut, lrO);
+					}
+#undef GLADES_GPU_ATLAS_STEP
+#undef GLADES_GPU_SGD_BIAS
+					}
+					else
+					{
+					// === Batched Adam optimizer ===
 					const float beta1 = trainingConfig.optimizer.adamBeta1;
 					const float beta2 = trainingConfig.optimizer.adamBeta2;
 					const float adamEps = trainingConfig.optimizer.adamEps;
-					tensorTransformer.optimizerStep += 1ULL;
 					const int stepInt = static_cast<int>(tensorTransformer.optimizerStep);
 
-					// === Batched Adam optimizer ===
 					// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
 					if (!gpuTransformerWeights->adamPtrsUploaded)
 					{
@@ -2627,13 +3001,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 						if (tokenLM)
 						{
-							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
+							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
 							const float wd0 = skeleton->getWeightDecay2(0u);
 							hLrs[gi] = lr0; hWds[gi] = wd0; ++gi;
 							hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi;
 						}
 						{
-							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier;
+							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
 							const float wd0 = skeleton->getWeightDecay2(0u);
 							if (gpuTransformerWeights->WIn.size() > 0)
 							{ hLrs[gi] = lr0; hWds[gi] = wd0; ++gi; }
@@ -2642,7 +3016,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						}
 						for (unsigned int bli = 0; bli < nLayers; ++bli)
 						{
-							const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier;
+							const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
 							const float wd_l = skeleton->getWeightDecay2(bli + 1u);
 							// 6 weight groups (with wd)
 							for (int w = 0; w < 6; ++w)
@@ -2653,7 +3027,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						}
 						if (!tokenLM)
 						{
-							const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier;
+							const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
 							const float wdO = skeleton->getWeightDecay2(nLayers);
 							if (gpuTransformerWeights->WOut.size() > 0)
 							{ hLrs[gi] = lrO; hWds[gi] = wdO; ++gi; }
@@ -2674,8 +3048,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						    gpuTransformerWeights->d_adamSizes,
 						    gpuTransformerWeights->adamMaxSize,
 						    beta1, beta2, adamEps,
-						    invBatch, stepInt, gc);
+						    invBatch * gradScale, stepInt, gc);
 					}
+					} // end Adam branch
 
 					gpu::synchronize();
 					seqInBatch = 0u;

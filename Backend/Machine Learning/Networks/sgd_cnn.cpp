@@ -748,6 +748,7 @@ void glades::NNetwork::SGDHelper_CNN(unsigned int inputRowCounter, int runType)
 		return;
 
 	const float invBatch = 1.0f / static_cast<float>(tensorCnn.batchCount);
+	const bool useAtlas = (trainingConfig.optimizer.type == OptimizerConfig::ATLAS);
 	const bool useAdam = (trainingConfig.optimizer.type == OptimizerConfig::ADAMW);
 	++tensorCnn.optimizerStep;
 	const float baseLR = skeleton->getLearningRate(0) * lrScheduleMultiplier;
@@ -813,7 +814,94 @@ void glades::NNetwork::SGDHelper_CNN(unsigned int inputRowCounter, int runType)
 	lastGradNorm = gradNorm;
 	lastGradNormScale = gradScale;
 
-	if (useAdam)
+	if (useAtlas)
+	{
+		const ATLASConfig& ac = trainingConfig.atlas;
+		const float wd1 = skeleton->getWeightDecay1(0);
+
+		// Update conv layers
+		for (unsigned int l = 0; l < numConv; ++l)
+		{
+			TensorCNNState::ConvLayer& cl = tensorCnn.convLayers[l];
+			const unsigned int convM = cl.outC;
+			const unsigned int convN = cl.inC * cl.kH * cl.kW;
+
+			// Initialize ATLAS state for this conv layer if needed
+			if (!cl.atlasW.initialized && convM > 0 && convN > 0)
+				atlas::initWeightState(cl.atlasW, convM, convN, ac.rank, ac.muMin, rngEngine, getLogger());
+
+			if (cl.atlasW.initialized)
+			{
+				// ATLAS step for conv weight matrix
+				atlas::applyStep(cl.atlasW,
+					&cl.W[0], &cl.gW[0],
+					convM, convN,
+					invBatch, baseLR,
+					wd1, wd2, gradScale,
+					ac.beta, ac.muMin, ac.muMax,
+					ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					rngEngine, getLogger());
+			}
+
+			// Bias update: standard SGD (no subspace projection for 1D vectors)
+			for (unsigned int c = 0; c < cl.outC; ++c)
+			{
+				float g = cl.gBias[c] * invBatch * gradScale;
+				cl.bias[c] -= baseLR * g;
+				cl.gBias[c] = 0.0f;
+			}
+
+			// BatchNorm params: standard SGD (no subspace projection)
+			if (cs.spatialInfo[l].useBatchNorm)
+			{
+				for (unsigned int c = 0; c < cl.outC; ++c)
+				{
+					{
+						float g = cl.gBnGamma[c] * invBatch * gradScale;
+						cl.bnGamma[c] -= baseLR * g;
+						cl.gBnGamma[c] = 0.0f;
+					}
+					{
+						float g = cl.gBnBeta[c] * invBatch * gradScale;
+						cl.bnBeta[c] -= baseLR * g;
+						cl.gBnBeta[c] = 0.0f;
+					}
+				}
+			}
+		}
+
+		// Update FC layers
+		for (unsigned int t = 0; t < numFC; ++t)
+		{
+			TensorCNNState::FCTransition& fc = tensorCnn.fcLayers[t];
+
+			// Initialize ATLAS state for this FC layer if needed
+			if (!fc.atlasW.initialized && fc.out > 0 && fc.in > 0)
+				atlas::initWeightState(fc.atlasW, fc.out, fc.in, ac.rank, ac.muMin, rngEngine, getLogger());
+
+			if (fc.atlasW.initialized)
+			{
+				// ATLAS step for FC weight matrix
+				atlas::applyStep(fc.atlasW,
+					&fc.W[0], &fc.gW[0],
+					fc.out, fc.in,
+					invBatch, baseLR,
+					wd1, wd2, gradScale,
+					ac.beta, ac.muMin, ac.muMax,
+					ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+					rngEngine, getLogger());
+			}
+
+			// Bias update: standard SGD (no subspace projection for 1D vectors)
+			for (unsigned int j = 0; j < fc.out; ++j)
+			{
+				float g = fc.gBias[j] * invBatch * gradScale;
+				fc.bias[j] -= baseLR * g;
+				fc.gBias[j] = 0.0f;
+			}
+		}
+	}
+	else if (useAdam)
 	{
 		const float beta1 = trainingConfig.optimizer.adamBeta1;
 		const float beta2 = trainingConfig.optimizer.adamBeta2;

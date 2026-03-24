@@ -26,6 +26,7 @@
 #include "../rng.h"
 #include "training_callbacks.h"
 #include "training_config.h"
+#include "atlas_optimizer.h"
 #include "../nnetwork_status.h"
 #include "bayes.h"
 #include "bayes-optimizer.h"
@@ -134,6 +135,9 @@ private:
 		// Minibatch accumulation count.
 		unsigned int batchCount;
 
+		// ATLAS optimizer state (one per Transition; used when optimizer.type==ATLAS).
+		std::vector<atlas::WeightState> atlasState;
+
 		TensorDFFState() : initialized(false), batchCount(0) {}
 
 		void reset()
@@ -173,6 +177,8 @@ private:
 			// Per-unit bias
 			std::vector<float> bias;
 			std::vector<float> gBias;
+			atlas::WeightState atlasWxh;
+			atlas::WeightState atlasWhh;
 			Hidden() : in(0u), h(0u) {}
 		};
 
@@ -186,6 +192,7 @@ private:
 			std::vector<float> gWhy;
 			std::vector<float> bias;
 			std::vector<float> gBias;
+			atlas::WeightState atlasWhy;
 			Out() : in(0u), out(0u) {}
 		};
 
@@ -227,6 +234,8 @@ private:
 			std::vector<float> gU;
 			std::vector<float> bias;
 			std::vector<float> gBias;
+			atlas::WeightState atlasW;
+			atlas::WeightState atlasU;
 			Hidden() : in(0u), h(0u) {}
 		};
 
@@ -239,6 +248,7 @@ private:
 			std::vector<float> gWhy;
 			std::vector<float> bias;
 			std::vector<float> gBias;
+			atlas::WeightState atlasWhy;
 			Out() : in(0u), out(0u) {}
 		};
 
@@ -318,6 +328,9 @@ private:
 			std::vector<float> vBnBeta;
 			std::vector<float> v2BnBeta;
 
+			// ATLAS optimizer state for this conv layer's weight matrix.
+			atlas::WeightState atlasW;
+
 			ConvLayer() : outC(0u), inC(0u), kH(0u), kW(0u) {}
 		};
 
@@ -336,6 +349,9 @@ private:
 			std::vector<float> v2W;
 			std::vector<float> vBias;
 			std::vector<float> v2Bias;
+
+			// ATLAS optimizer state for this FC layer's weight matrix.
+			atlas::WeightState atlasW;
 
 			FCTransition() : in(0u), out(0u) {}
 		};
@@ -763,9 +779,18 @@ private:
 			std::vector<float> mB1, mB2;
 			std::vector<float> v2B1, v2B2;
 			std::vector<float> gB1, gB2;
+
+			// ATLAS optimizer state per weight matrix in this block.
+			atlas::WeightState atlasWq, atlasWk, atlasWv, atlasWo;
+			atlas::WeightState atlasW1, atlasW2;
 		};
 
 		std::vector<Block> blocks;
+
+		// ATLAS optimizer state for non-block weight matrices.
+		atlas::WeightState atlasWIn;
+		atlas::WeightState atlasWOut;
+		atlas::WeightState atlasTokE;
 
 		// Final LayerNorm (applied after the last block, before the output head).
 		std::vector<float> lnFinalGamma; // [dModel]
@@ -1238,6 +1263,8 @@ private:
 	// Defaults preserve historical behavior.
 	TrainingConfig trainingConfig;
 	float lrScheduleMultiplier; // computed each epoch by the scheduler; starts at 1
+	int lrScheduleEpochOffset;  // added to epochFromStart in Trainer::run(); caller sets this
+	                            // when train() is called once per epoch in a loop
 	float lastGradNorm;
 	float lastGradNormScale;
 	int64_t lastStepLogTime;
@@ -1462,6 +1489,7 @@ public:
 	void setLearningRateScheduleExp(float gamma);
 	void setLearningRateScheduleCosine(int tMaxEpochs, float minMultiplier);
 	float getLearningRateMultiplier() const { return lrScheduleMultiplier; }
+	void setLrScheduleEpochOffset(int offset) { lrScheduleEpochOffset = offset; }
 	void setGlobalGradClipNorm(float clipNorm);
 	float getGlobalGradClipNorm() const { return trainingConfig.globalGradClipNorm; }
 	void setPerElementGradClip(float clipLimit);

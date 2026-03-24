@@ -246,6 +246,15 @@ bool pack_loss_scalars(const float* lossSum, const int* lossCount,
                        int* out);
 
 // ---------------------------------------------------------------------------
+// Gradient norm computation
+// ---------------------------------------------------------------------------
+
+// Atomically accumulate sum(data[i]^2) into *d_accumulator.
+// Caller must zero d_accumulator before the first call.
+// Multiple calls accumulate across different buffers.
+bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
+
+// ---------------------------------------------------------------------------
 // Device memory operations (callable from .cpp files without cuda_runtime.h)
 // ---------------------------------------------------------------------------
 
@@ -312,6 +321,8 @@ inline bool kv_attention_incremental(const float*, const float*, const float*, f
 
 inline bool zero_buffers_batch(float**, const int*, int) { return false; }
 inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, int*) { return false; }
+
+inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}

@@ -25,5 +25,7 @@ garch-test.cpp
 egarch-test.cpp
 gan-test.cpp
 hyperparameter-tuner-test.cpp
+atlas-test.cpp
+atlas-bench.cpp
 )
 add_library(PCATests ${PCATests_src_files})
