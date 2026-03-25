@@ -1954,6 +1954,273 @@ void GANUnitTest()
 		delete domB;
 	}
 
+	// ------------------------------------------------------------------
+	// Test 23: Health diagnostics - DFF vanilla
+	// ------------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("GAN Test 23: Health diagnostics - DFF vanilla\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = make_gaussian_mixture(100, 42u);
+
+		std::vector<unsigned int> genHidden;
+		genHidden.push_back(32u);
+		genHidden.push_back(16u);
+
+		std::vector<unsigned int> discHidden;
+		discHidden.push_back(16u);
+		discHidden.push_back(8u);
+
+		glades::NNInfo* genInfo = make_gen_info("ut_diag_gen", genHidden, 0.0002f, glades::GMath::LEAKY);
+		glades::NNInfo* discInfo = make_disc_info("ut_diag_disc", discHidden, 0.0002f, glades::GMath::LEAKY);
+
+		glades::GANConfig cfg;
+		cfg.lossType = glades::GANConfig::GAN_VANILLA;
+		cfg.archType = glades::GANConfig::GAN_DFF;
+		cfg.noiseDim = 8;
+		cfg.epochs = 5;
+		cfg.batchSize = 20;
+		cfg.nCriticPerGenerator = 1;
+
+		glades::GAN gan(cfg, genInfo, discInfo);
+		gan.setSeed(123);
+
+		GANCaptureMetrics metrics;
+		const glades::NNetworkStatus st = gan.train(di, &metrics);
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla No Metrics==============", metrics.saw);
+
+		// D(real) should be between 0 and 1 for vanilla GAN (sigmoid output)
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla dOutReal not finite==============",
+		         is_finite(metrics.last.dOutReal));
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla dOutReal out of range==============",
+		         metrics.last.dOutReal >= 0.0f && metrics.last.dOutReal <= 1.0f);
+
+		// D(fake) should be between 0 and 1 for vanilla GAN
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla dOutFake not finite==============",
+		         is_finite(metrics.last.dOutFake));
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla dOutFake out of range==============",
+		         metrics.last.dOutFake >= 0.0f && metrics.last.dOutFake <= 1.0f);
+
+		// D(real) should be greater than D(fake) — disc can distinguish
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla dOutReal <= dOutFake==============",
+		         metrics.last.dOutReal > metrics.last.dOutFake);
+
+		// Generator gradient norm should be positive and finite
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla genGradNorm not finite==============",
+		         is_finite(metrics.last.genGradNorm));
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla genGradNorm not positive==============",
+		         metrics.last.genGradNorm > 0.0f);
+
+		// Sample diversity should be positive (not mode-collapsed)
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla sampleDiversity not finite==============",
+		         is_finite(metrics.last.sampleDiversity));
+		G_assert(__FILE__, __LINE__, "==============Diag::DFF_Vanilla sampleDiversity not positive==============",
+		         metrics.last.sampleDiversity > 0.0f);
+
+		printf("  dOutReal=%.4f dOutFake=%.4f genGradNorm=%.4f diversity=%.6f\n",
+		       metrics.last.dOutReal, metrics.last.dOutFake,
+		       metrics.last.genGradNorm, metrics.last.sampleDiversity);
+
+		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+		delete genInfo;
+		delete discInfo;
+		delete di;
+	}
+
+	// ------------------------------------------------------------------
+	// Test 24: Health diagnostics - LSGAN (unbounded disc output)
+	// ------------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("GAN Test 24: Health diagnostics - LSGAN\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = make_gaussian_mixture(100, 42u);
+
+		std::vector<unsigned int> genHidden;
+		genHidden.push_back(32u);
+		genHidden.push_back(16u);
+
+		std::vector<unsigned int> discHidden;
+		discHidden.push_back(16u);
+		discHidden.push_back(8u);
+
+		glades::NNInfo* genInfo = make_gen_info("ut_diag_ls_gen", genHidden, 0.0002f, glades::GMath::LEAKY);
+		glades::NNInfo* discInfo = make_disc_info("ut_diag_ls_disc", discHidden, 0.0002f, glades::GMath::LEAKY);
+
+		glades::GANConfig cfg;
+		cfg.lossType = glades::GANConfig::GAN_LSGAN;
+		cfg.archType = glades::GANConfig::GAN_DFF;
+		cfg.noiseDim = 8;
+		cfg.epochs = 5;
+		cfg.batchSize = 20;
+		cfg.nCriticPerGenerator = 1;
+
+		glades::GAN gan(cfg, genInfo, discInfo);
+		gan.setSeed(456);
+
+		GANCaptureMetrics metrics;
+		const glades::NNetworkStatus st = gan.train(di, &metrics);
+		G_assert(__FILE__, __LINE__, "==============Diag::LSGAN TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============Diag::LSGAN No Metrics==============", metrics.saw);
+
+		// LSGAN: no sigmoid, so D outputs are unbounded — just check finite
+		G_assert(__FILE__, __LINE__, "==============Diag::LSGAN dOutReal not finite==============",
+		         is_finite(metrics.last.dOutReal));
+		G_assert(__FILE__, __LINE__, "==============Diag::LSGAN dOutFake not finite==============",
+		         is_finite(metrics.last.dOutFake));
+
+		// D(real) should still tend toward 1, D(fake) toward 0 for LSGAN
+		G_assert(__FILE__, __LINE__, "==============Diag::LSGAN dOutReal <= dOutFake==============",
+		         metrics.last.dOutReal > metrics.last.dOutFake);
+
+		// genGradNorm and diversity still valid
+		G_assert(__FILE__, __LINE__, "==============Diag::LSGAN genGradNorm not positive==============",
+		         is_finite(metrics.last.genGradNorm) && metrics.last.genGradNorm > 0.0f);
+		G_assert(__FILE__, __LINE__, "==============Diag::LSGAN sampleDiversity not positive==============",
+		         is_finite(metrics.last.sampleDiversity) && metrics.last.sampleDiversity > 0.0f);
+
+		printf("  dOutReal=%.4f dOutFake=%.4f genGradNorm=%.4f diversity=%.6f\n",
+		       metrics.last.dOutReal, metrics.last.dOutFake,
+		       metrics.last.genGradNorm, metrics.last.sampleDiversity);
+
+		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+		delete genInfo;
+		delete discInfo;
+		delete di;
+	}
+
+	// ------------------------------------------------------------------
+	// Test 25: Health diagnostics - CNN architecture
+	// ------------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("GAN Test 25: Health diagnostics - CNN\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int C = 1, H = 8, W = 8;
+		glades::NumberInput* di = make_synthetic_image_data(64, C, H, W, 42u);
+
+		std::vector<unsigned int> genHidden;
+		genHidden.push_back(32u);
+
+		std::vector<unsigned int> discHidden;
+		discHidden.push_back(16u);
+
+		glades::NNInfo* genInfo = make_gen_info("ut_diag_cnn_gen", genHidden, 0.0002f, glades::GMath::LEAKY);
+		glades::NNInfo* discInfo = make_disc_info("ut_diag_cnn_disc", discHidden, 0.0002f, glades::GMath::LEAKY);
+
+		glades::GANConfig cfg;
+		cfg.lossType = glades::GANConfig::GAN_LSGAN;
+		cfg.archType = glades::GANConfig::GAN_CNN;
+		cfg.noiseDim = 8;
+		cfg.epochs = 3;
+		cfg.batchSize = 16;
+		cfg.nCriticPerGenerator = 1;
+
+		glades::CNNConfig::ConvLayerSpec convSpec;
+		convSpec.outChannels = 4;
+		convSpec.kernelH = 3; convSpec.kernelW = 3;
+		convSpec.strideH = 1; convSpec.strideW = 1;
+		convSpec.padH = 1; convSpec.padW = 1;
+		convSpec.useBatchNorm = false;
+		convSpec.useMaxPool = false;
+		cfg.discriminatorCNN.inputH = H;
+		cfg.discriminatorCNN.inputW = W;
+		cfg.discriminatorCNN.inputC = C;
+		cfg.discriminatorCNN.convLayers.push_back(convSpec);
+
+		glades::GAN gan(cfg, genInfo, discInfo);
+		gan.setSeed(789);
+
+		GANCaptureMetrics metrics;
+		const glades::NNetworkStatus st = gan.train(di, &metrics);
+		G_assert(__FILE__, __LINE__, "==============Diag::CNN TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============Diag::CNN No Metrics==============", metrics.saw);
+
+		// All health metrics should be finite and positive
+		G_assert(__FILE__, __LINE__, "==============Diag::CNN dOutReal not finite==============",
+		         is_finite(metrics.last.dOutReal));
+		G_assert(__FILE__, __LINE__, "==============Diag::CNN dOutFake not finite==============",
+		         is_finite(metrics.last.dOutFake));
+		G_assert(__FILE__, __LINE__, "==============Diag::CNN genGradNorm not positive==============",
+		         is_finite(metrics.last.genGradNorm) && metrics.last.genGradNorm > 0.0f);
+		G_assert(__FILE__, __LINE__, "==============Diag::CNN sampleDiversity not finite==============",
+		         is_finite(metrics.last.sampleDiversity));
+
+		printf("  dOutReal=%.4f dOutFake=%.4f genGradNorm=%.4f diversity=%.6f\n",
+		       metrics.last.dOutReal, metrics.last.dOutFake,
+		       metrics.last.genGradNorm, metrics.last.sampleDiversity);
+
+		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+		delete genInfo;
+		delete discInfo;
+		delete di;
+	}
+
+	// ------------------------------------------------------------------
+	// Test 26: Health diagnostics - InfoGAN with diagnostics
+	// ------------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("GAN Test 26: Health diagnostics - InfoGAN\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = make_gaussian_mixture(100, 42u);
+
+		std::vector<unsigned int> genHidden;
+		genHidden.push_back(32u);
+		genHidden.push_back(16u);
+
+		std::vector<unsigned int> discHidden;
+		discHidden.push_back(16u);
+		discHidden.push_back(8u);
+
+		glades::NNInfo* genInfo = make_gen_info("ut_diag_info_gen", genHidden, 0.0002f, glades::GMath::LEAKY);
+		glades::NNInfo* discInfo = make_disc_info("ut_diag_info_disc", discHidden, 0.0002f, glades::GMath::LEAKY);
+
+		glades::GANConfig cfg;
+		cfg.lossType = glades::GANConfig::GAN_LSGAN;
+		cfg.archType = glades::GANConfig::GAN_DFF;
+		cfg.noiseDim = 8;
+		cfg.epochs = 5;
+		cfg.batchSize = 20;
+		cfg.nCriticPerGenerator = 1;
+		cfg.infoConfig.numCategorical = 3;
+		cfg.infoConfig.numContinuous = 1;
+		cfg.infoConfig.infoLambda = 1.0f;
+
+		glades::GAN gan(cfg, genInfo, discInfo);
+		gan.setSeed(321);
+
+		GANCaptureMetrics metrics;
+		const glades::NNetworkStatus st = gan.train(di, &metrics);
+		G_assert(__FILE__, __LINE__, "==============Diag::InfoGAN TrainStatus() Failed==============", st.ok());
+		G_assert(__FILE__, __LINE__, "==============Diag::InfoGAN No Metrics==============", metrics.saw);
+
+		// All diagnostics should be populated alongside InfoGAN-specific metrics
+		G_assert(__FILE__, __LINE__, "==============Diag::InfoGAN dOutReal not finite==============",
+		         is_finite(metrics.last.dOutReal));
+		G_assert(__FILE__, __LINE__, "==============Diag::InfoGAN genGradNorm not positive==============",
+		         is_finite(metrics.last.genGradNorm) && metrics.last.genGradNorm > 0.0f);
+		G_assert(__FILE__, __LINE__, "==============Diag::InfoGAN sampleDiversity not finite==============",
+		         is_finite(metrics.last.sampleDiversity));
+		G_assert(__FILE__, __LINE__, "==============Diag::InfoGAN catAccuracy not finite==============",
+		         is_finite(metrics.last.catAccuracy));
+
+		printf("  dOutReal=%.4f dOutFake=%.4f genGradNorm=%.4f diversity=%.6f catAcc=%.2f%%\n",
+		       metrics.last.dOutReal, metrics.last.dOutFake,
+		       metrics.last.genGradNorm, metrics.last.sampleDiversity,
+		       metrics.last.catAccuracy * 100.0f);
+
+		printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+		delete genInfo;
+		delete discInfo;
+		delete di;
+	}
+
 	printf("============================================================\n");
 	printf("GAN Unit Test Suite Complete\n");
 	printf("============================================================\n");
