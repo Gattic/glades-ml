@@ -86,6 +86,7 @@ class TrainingCore;
 class Trainer;
 class GAN;
 struct GradientBuffer;
+struct DeconvScratchArena;
 
 class NNetwork
 {
@@ -95,6 +96,7 @@ private:
 	friend Trainer;
 	friend GAN;
 	friend GradientBuffer;
+	friend DeconvScratchArena;
 	friend void ::GANUnitTest();
 
 	// Tensor-based DFF training state.
@@ -448,15 +450,22 @@ private:
 			unsigned int strideH, strideW, padH, padW;
 			unsigned int inH, inW, outH, outW;
 			bool useBatchNorm, useReLU;
+			bool useUpsampleConv; // nearest-neighbor upsample + standard conv
 
 			std::vector<float> W, bias, gW, gBias;
 			std::vector<float> vW, v2W, vBias, v2Bias; // Adam
+
+			// Batch normalization (per outC channel)
+			std::vector<float> bnGamma, bnBeta, bnRunMean, bnRunVar;
+			std::vector<float> gBnGamma, gBnBeta;                    // gradients
+			std::vector<float> vBnGamma, v2BnGamma, vBnBeta, v2BnBeta; // Adam
 
 			DeconvLayer()
 			    : inC(0u), outC(0u), kH(0u), kW(0u),
 			      strideH(0u), strideW(0u), padH(0u), padW(0u),
 			      inH(0u), inW(0u), outH(0u), outW(0u),
-			      useBatchNorm(false), useReLU(true)
+			      useBatchNorm(false), useReLU(true),
+			      useUpsampleConv(false)
 			{
 			}
 		};

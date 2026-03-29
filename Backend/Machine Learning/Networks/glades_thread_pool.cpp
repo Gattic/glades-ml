@@ -4,6 +4,8 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <xmmintrin.h>
+#include <pmmintrin.h>
 
 namespace glades {
 
@@ -61,6 +63,10 @@ void* ThreadPool::Impl::worker_main(void* arg)
 	Impl& self = *wa.impl;
 	const unsigned int myId = wa.id;
 	unsigned int lastGen = 0u;
+
+	// Flush subnormal floats to zero — prevents 10-100x FP slowdown on x86.
+	_MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+	_MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
 	for (;;)
 	{
