@@ -39,6 +39,7 @@
 #include "Backend/Machine Learning/hyperparameter-tuner-test.h"
 #include "Backend/Machine Learning/atlas-test.h"
 #include "Backend/Machine Learning/atlas-bench.h"
+#include "Backend/Machine Learning/sfcka-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -63,6 +64,10 @@ int main(int argc, char* argv[])
 	    DDPUnitTest();
 	    GARCHUnitTest();
 	    EGARCHUnitTest();
+	    FFTUnitTest();
+	    FisherTransformUnitTest();
+	    KellyUnitTest();
+	    QPSolverUnitTest();
 	}
 	else if (argc > 1)
 	{
@@ -128,6 +133,21 @@ int main(int argc, char* argv[])
 		ATLASUnitTest();
 	    else if (strcmp(argv[1], "atlas-bench") == 0)
 		ATLASBenchmark(argc, argv);
+	    else if (strcmp(argv[1], "fft") == 0)
+		FFTUnitTest();
+	    else if (strcmp(argv[1], "fisher") == 0)
+		FisherTransformUnitTest();
+	    else if (strcmp(argv[1], "kelly") == 0)
+		KellyUnitTest();
+	    else if (strcmp(argv[1], "qp") == 0)
+		QPSolverUnitTest();
+	    else if (strcmp(argv[1], "sfcka") == 0)
+	    {
+		FFTUnitTest();
+		FisherTransformUnitTest();
+		KellyUnitTest();
+		QPSolverUnitTest();
+	    }
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
 	        OHEUnitTest();

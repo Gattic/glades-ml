@@ -27,5 +27,6 @@ gan-test.cpp
 hyperparameter-tuner-test.cpp
 atlas-test.cpp
 atlas-bench.cpp
+sfcka-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})
