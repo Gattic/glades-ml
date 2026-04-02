@@ -2723,7 +2723,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					if (trainingConfig.lrSchedule.type != glades::LearningRateScheduleConfig::NONE)
 					{
 						const unsigned int totalSteps = (seqCount + seqBatchMax - 1u) / seqBatchMax;
-						const float progress = (totalSteps > 0u) ? static_cast<float>(tensorTransformer.optimizerStep % totalSteps) / static_cast<float>(totalSteps) : 0.0f;
+						const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
+						const float progress = (totalSteps > 0u) ? static_cast<float>(stepInEpoch) / static_cast<float>(totalSteps) : 0.0f;
 						lrScheduleMultiplier = trainingConfig.lrSchedule.multiplierSmooth(progress);
 					}
 
