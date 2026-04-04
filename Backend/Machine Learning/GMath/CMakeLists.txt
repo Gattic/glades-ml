@@ -11,6 +11,22 @@ set(GMath_src_files
 	OHE.h
 	gmath.cpp
 	gmath.h
+	fft.cpp
+	fft.h
+	fisher_transform.cpp
+	fisher_transform.h
+	kelly.cpp
+	kelly.h
+	qp_solver.cpp
+	qp_solver.h
+	garch_utils.cpp
+	garch_utils.h
+	dwt.cpp
+	dwt.h
+	permutation_entropy.cpp
+	permutation_entropy.h
+	wasserstein.cpp
+	wasserstein.h
 )
 add_library(GMath ${GMath_src_files})
 

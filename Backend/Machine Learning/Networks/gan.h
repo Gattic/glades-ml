@@ -76,8 +76,10 @@ struct GANConfig
 		unsigned int numCategorical; // one-hot categorical code dims (default 10)
 		unsigned int numContinuous;  // continuous code dims (default 2)
 		float infoLambda;            // MI loss weight (default 1.0)
+		float catScale;              // categorical code input scale (default 1.0)
+		float divLambda;             // mode-seeking diversity loss weight (default 0.0 = off)
 
-		InfoConfig() : numCategorical(10u), numContinuous(2u), infoLambda(1.0f) {}
+		InfoConfig() : numCategorical(10u), numContinuous(2u), infoLambda(1.0f), catScale(1.0f), divLambda(0.0f) {}
 	};
 	InfoConfig infoConfig;
 
@@ -115,6 +117,15 @@ struct GANConfig
 	bool spectralNorm;             // apply spectral norm to discriminator weights
 	int spectralNormIters;         // power iteration count (default: 1)
 
+	// Gradient clipping
+	float gradClipNorm;            // max L2 norm for generator gradients (0 = off, default: 0)
+
+	// Weight decay (L2 regularization)
+	float weightDecay;             // L2 weight decay coefficient (0 = off, default: 0)
+
+	// Generator output temperature
+	float genOutputTemp;           // sigmoid temperature for deconv output (default: 1.0, higher = softer)
+
 	// Parallelism
 	bool deterministicReduce; // ordered gradient reduction for reproducibility (default: true)
 
@@ -149,6 +160,9 @@ struct GANConfig
 		  adaptiveDiscThreshold(0.1f),
 		  spectralNorm(false),
 		  spectralNormIters(1),
+		  gradClipNorm(0.0f),
+		  weightDecay(0.0f),
+		  genOutputTemp(1.0f),
 		  deterministicReduce(true)
 	{
 	}
@@ -165,6 +179,7 @@ struct GANEpochMetrics
 	// InfoGAN-specific
 	float infoLoss;     // mutual information loss
 	float catAccuracy;  // categorical code classification accuracy
+	float divLoss;      // mode-seeking diversity loss
 
 	// CycleGAN-specific
 	float cycleLoss;    // cycle consistency loss
@@ -174,11 +189,18 @@ struct GANEpochMetrics
 	float gLossAB;      // generator A->B loss
 	float gLossBA;      // generator B->A loss
 
+	// Health diagnostics
+	float dOutReal;        // mean discriminator output on real data
+	float dOutFake;        // mean discriminator output on fake data
+	float genGradNorm;     // L2 norm of generator gradient
+	float sampleDiversity; // mean per-pixel variance across generated samples (0 = mode collapse)
+
 	GANEpochMetrics()
 		: epoch(0), dLossReal(0.0f), dLossFake(0.0f), gLoss(0.0f), wasserstein(0.0f),
-		  infoLoss(0.0f), catAccuracy(0.0f),
+		  infoLoss(0.0f), catAccuracy(0.0f), divLoss(0.0f),
 		  cycleLoss(0.0f), identityLoss(0.0f), dLossA(0.0f), dLossB(0.0f),
-		  gLossAB(0.0f), gLossBA(0.0f)
+		  gLossAB(0.0f), gLossBA(0.0f),
+		  dOutReal(0.0f), dOutFake(0.0f), genGradNorm(0.0f), sampleDiversity(0.0f)
 	{
 	}
 };
@@ -210,19 +232,53 @@ struct GradientBuffer
 	// Deconv layer gradient arrays: [layer][weights/biases]
 	std::vector<std::vector<float> > deconvGW;
 	std::vector<std::vector<float> > deconvGBias;
+	// Deconv batch norm gradient arrays: [layer][gamma/beta]
+	std::vector<std::vector<float> > deconvGBnGamma;
+	std::vector<std::vector<float> > deconvGBnBeta;
 
 	// Q-head gradient arrays (InfoGAN)
 	std::vector<float> qGW;
 	std::vector<float> qGBias;
 
+	// Generator-side Q-head gradient arrays (InfoGAN direct path)
+	std::vector<float> genQGW;
+	std::vector<float> genQGBias;
+	std::vector<float> genQGHiddenW;
+	std::vector<float> genQGHiddenBias;
+
 	void initFromDFF(const NNetwork& net);
 	void initFromCNN(const NNetwork& net);
 	void initFromDeconv(const NNetwork& net);
 	void initFromQHead(unsigned int sharedDim, unsigned int qOutDim);
+	void initFromGenQHead(unsigned int sharedDim, unsigned int qOutDim, unsigned int hiddenDim);
 	void zero();
 	void addToDFF(NNetwork& net) const;
 	void addToCNN(NNetwork& net) const;
 	void addToDeconv(NNetwork& net) const;
+};
+
+struct DeconvScratchArena
+{
+	// Per-layer forward buffers
+	std::vector<std::vector<float> > upsampled;   // [layer] inC*upH*upW
+	std::vector<std::vector<float> > cols;         // [layer] N*K (im2col output)
+	std::vector<std::vector<float> > outputCols;   // [layer] outK*N (transposed conv path)
+
+	// Per-layer backward buffers
+	std::vector<std::vector<float> > dCols;        // [layer] N*K
+	std::vector<std::vector<float> > dUp;          // [layer] inC*upH*upW
+	std::vector<std::vector<float> > dInput;       // [layer] inC*inH*inW
+
+	// FC backward
+	std::vector<float> dFC;
+
+	// Backward dCur working buffer
+	std::vector<float> dCur;
+
+	bool initialized;
+	DeconvScratchArena() : initialized(false) {}
+
+	void initFromDeconv(const NNetwork& net);
 };
 
 struct GANThreadCtx
@@ -242,8 +298,15 @@ struct GANThreadCtx
 	// Activation scratch
 	std::vector<std::vector<float> > genAct, discActReal, discActFake;
 	std::vector<float> cnnOutReal, cnnOutFake;
+	std::vector<std::vector<float> > cnnFcActFake; // cached FC activations for Q-head
 	std::vector<float> deconvOut;
 	std::vector<std::vector<float> > deconvScratch;
+	// Pre-allocated deconv scratch arena (eliminates per-sample malloc)
+	DeconvScratchArena deconvArena;
+
+	// Pre-allocated InfoGAN per-sample scratch
+	std::vector<float> penultActBuf;    // [penultDim] reusable
+	std::vector<float> qInfoDFakeBuf;   // [dataDim] reusable
 	std::vector<float> dFake, dWVec, genInput;
 
 	// Style forward scratch
@@ -255,6 +318,7 @@ struct GANThreadCtx
 	// InfoGAN scratch
 	std::vector<float> qOut, qGrad, sharedGrad;
 	std::vector<std::vector<float> > qDelta;
+	std::vector<float> genQHiddenPre, genQHiddenPost, genQDHidden; // genQHead hidden layer scratch
 
 	// dffBackwardStyled scratch (replaces class-member scratchDelta)
 	std::vector<std::vector<float> > scratchDeltaLocal;
@@ -306,15 +370,22 @@ struct GANThreadCtx
 	// CycleGAN loss accumulators
 	float gLossAB, gLossBA, cycleLoss, identityLoss;
 
+	// Diversity loss scratch (mode-seeking: compare consecutive samples)
+	std::vector<float> prevFake;
+
 	// Loss accumulators
-	float dLossReal, dLossFake, gLoss, wasserstein, infoLoss;
+	float dLossReal, dLossFake, gLoss, wasserstein, infoLoss, divLoss;
 	unsigned int catCorrect, catTotal;
+
+	// Discriminator output accumulators (raw predictions before loss)
+	float dOutRealSum, dOutFakeSum;
 
 	GANThreadCtx()
 		: gLossAB(0.0f), gLossBA(0.0f), cycleLoss(0.0f), identityLoss(0.0f),
 		  dLossReal(0.0f), dLossFake(0.0f), gLoss(0.0f),
-		  wasserstein(0.0f), infoLoss(0.0f),
-		  catCorrect(0u), catTotal(0u) {}
+		  wasserstein(0.0f), infoLoss(0.0f), divLoss(0.0f),
+		  catCorrect(0u), catTotal(0u),
+		  dOutRealSum(0.0f), dOutFakeSum(0.0f) {}
 
 	void zeroLosses();
 	void zeroGrads();
@@ -460,10 +531,18 @@ private:
 		unsigned int sharedDim, qOutDim;
 		bool initialized;
 
-		QNetworkHead() : sharedDim(0u), qOutDim(0u), initialized(false) {}
+		// Optional hidden layer (hiddenDim > 0 enables two-layer Q-head)
+		unsigned int hiddenDim;
+		std::vector<float> hiddenW, hiddenBias, gHiddenW, gHiddenBias;
+
+		QNetworkHead() : sharedDim(0u), qOutDim(0u), initialized(false), hiddenDim(0u) {}
 	};
 	QNetworkHead qHead;
 	AdamState qAdamState;
+
+	// Direct generator-side Q-head (InfoGAN: bypasses discriminator for gen gradient)
+	QNetworkHead genQHead;
+	AdamState genQAdamState;
 
 	// ---- StyleGAN members ----
 	NNetwork mappingNet;
@@ -580,14 +659,18 @@ private:
 	bool initDeconvTensors(NNetwork& net, unsigned int inputDim, const DeconvConfig& cfg);
 	void deconvForward(const NNetwork& net, const float* input, unsigned int inputSize,
 	                   std::vector<float>& output,
-	                   std::vector<std::vector<float> >* scratchOut = NULL) const;
+	                   std::vector<std::vector<float> >* scratchOut = NULL,
+	                   unsigned int noiseSeed = 0,
+	                   DeconvScratchArena* arena = NULL) const;
 	void deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& scratch,
 	                    const float* outputGrad, unsigned int outputSize,
-	                    std::vector<float>* inputGrad);
+	                    std::vector<float>* inputGrad,
+	                    DeconvScratchArena* arena = NULL);
 	void deconvBackward(const NNetwork& net, const std::vector<std::vector<float> >& scratch,
 	                    const float* outputGrad, unsigned int outputSize,
 	                    std::vector<float>* inputGrad,
-	                    GradientBuffer& gradBuf);
+	                    GradientBuffer& gradBuf,
+	                    DeconvScratchArena* arena = NULL);
 	void deconvUpdate(NNetwork& net, float lr);
 	void zeroDeconvGrads(NNetwork& net);
 
@@ -617,14 +700,19 @@ private:
 	// InfoGAN helpers (parameterized to work on any Q-head)
 	void sampleLatentCodes(std::vector<float>& catCode, std::vector<float>& contCode) const;
 	void initQHead(unsigned int sharedDim, QNetworkHead& head, AdamState& adamSt);
+	void initGenQHead(unsigned int inputDim, unsigned int hiddenDim,
+	                  QNetworkHead& head, AdamState& adamSt);
 	void qHeadForward(const QNetworkHead& head, const float* shared, unsigned int dim,
-	                  std::vector<float>& qOut) const;
+	                  std::vector<float>& qOut,
+	                  std::vector<float>* hiddenPre = NULL,
+	                  std::vector<float>* hiddenPost = NULL) const;
 	void qHeadBackward(QNetworkHead& head, const float* shared, const float* qGrad,
 	                   std::vector<float>& sharedGrad);
 	void qHeadBackward(const QNetworkHead& head, const float* shared, const float* qGrad,
 	                   std::vector<float>& sharedGrad,
 	                   GradientBuffer& gradBuf);
 	void qHeadUpdate(QNetworkHead& head, AdamState& adamSt, float lr);
+	void genQHeadUpdate(QNetworkHead& head, AdamState& adamSt, float lr);
 	float computeInfoLoss(const std::vector<float>& qOut,
 	                      const std::vector<float>& catCode, const std::vector<float>& contCode,
 	                      std::vector<float>& qGrad) const;
@@ -708,6 +796,7 @@ private:
 		bool hasStyle;
 		bool genIsDeconv;
 		float infoLambda;
+		float catScale;
 		unsigned int penultDim;
 		const unsigned int* beginToTid; // maps chunk begin -> thread context index
 	};
@@ -732,11 +821,23 @@ private:
 		bool genIsDeconv;
 		bool hasLN;
 		float infoLambda;
+		float catScale;
+		float divLambda;
 		unsigned int penultDim;
 		const unsigned int* beginToTid;
 		LayerNormParams* lnScratch; // per-thread LN forward cache, or NULL
 	};
 	static void genTrainBody(void* userData, unsigned int begin, unsigned int end);
+
+	// Parallel layer-wise gradient reduction callback data and body
+	struct LayerReduceData
+	{
+		GANThreadCtx* ctxs;
+		unsigned int nThreads;
+		NNetwork* net;
+		bool isGen;       // true=deconv generator, false=CNN discriminator
+	};
+	static void layerReduceBody(void* userData, unsigned int begin, unsigned int end);
 
 	// CycleGAN parallel discriminator training callback data and body
 	struct CycleDiscData

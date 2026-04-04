@@ -5,6 +5,7 @@
 #pragma once
 
 #include "gpu_buffer.h"
+#include "gpu_atlas.h"
 #include <cstddef>
 
 #ifdef GLADES_HAVE_CUDA
@@ -105,6 +106,10 @@ struct GpuTransformerWeights
 		GpuBuffer<float> mB1, mB2;
 		GpuBuffer<float> v2B1, v2B2;
 		GpuBuffer<float> gB1, gB2;
+
+		// ATLAS optimizer state (one per weight matrix)
+		GpuAtlasWeightState atlasWq, atlasWk, atlasWv, atlasWo;
+		GpuAtlasWeightState atlasW1, atlasW2;
 	};
 
 	Block* blocks;  // array of nLayers blocks
@@ -124,14 +129,23 @@ struct GpuTransformerWeights
 	int adamMaxSize;      // largest element count across groups
 	bool adamPtrsUploaded; // true after pointer arrays uploaded once
 
+	// ATLAS optimizer state (one per weight matrix, biases use Adam).
+	GpuAtlasWeightState atlasTokE;
+	GpuAtlasWeightState atlasWIn;
+	GpuAtlasWeightState atlasWOut;
+
 	GpuTransformerWeights();
 	~GpuTransformerWeights();
 
 	// Allocate all GPU buffers for the given model config.
+	// When skipAdamBufs is true, Adam moment buffers (v*/v2*/m*) are not
+	// allocated on GPU.  Used when the optimizer is ATLAS (which maintains
+	// its own per-matrix state) to avoid wasting ~2x model-size in VRAM.
 	bool allocate(unsigned int dModel, unsigned int dFF, unsigned int nHeads,
 	              unsigned int nKVHeads, unsigned int nLayers,
 	              unsigned int vocabSize, unsigned int inputSize, unsigned int outSize,
-	              unsigned int ffnKind, bool tokenModel, bool tieEmbeddings);
+	              unsigned int ffnKind, bool tokenModel, bool tieEmbeddings,
+	              bool skipAdamBufs = false);
 
 	// Free all GPU memory.
 	void free();

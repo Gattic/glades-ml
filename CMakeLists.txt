@@ -241,6 +241,25 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/gladesConfigVersion.cmake"
     DESTINATION "${glades_INSTALL_CMAKEDIR}")
 
+# Install GMath public headers so downstream projects can #include them
+install(FILES
+    "Backend/Machine Learning/GMath/pca.h"
+    "Backend/Machine Learning/GMath/fft.h"
+    "Backend/Machine Learning/GMath/fisher_transform.h"
+    "Backend/Machine Learning/GMath/kelly.h"
+    "Backend/Machine Learning/GMath/qp_solver.h"
+    "Backend/Machine Learning/GMath/gmath.h"
+    "Backend/Machine Learning/GMath/garch.h"
+    "Backend/Machine Learning/GMath/egarch.h"
+    "Backend/Machine Learning/GMath/kmeans.h"
+    "Backend/Machine Learning/GMath/cmatrix.h"
+    "Backend/Machine Learning/GMath/OHE.h"
+    "Backend/Machine Learning/GMath/garch_utils.h"
+    "Backend/Machine Learning/GMath/dwt.h"
+    "Backend/Machine Learning/GMath/permutation_entropy.h"
+    "Backend/Machine Learning/GMath/wasserstein.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/Backend/Machine Learning/GMath")
+
 #make fmt
 add_custom_target(fmt
 	COMMAND ./clang-format-all

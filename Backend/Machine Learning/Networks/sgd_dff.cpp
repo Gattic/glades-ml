@@ -684,6 +684,59 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 						return;
 					}
 
+				if (trainingConfig.optimizer.type == OptimizerConfig::ATLAS)
+				{
+					// ATLAS update
+					const ATLASConfig& ac = trainingConfig.atlas;
+
+					// Ensure ATLAS state is initialized
+					if (tensorDff.atlasState.size() != tensorDff.T.size())
+						tensorDff.atlasState.resize(tensorDff.T.size());
+
+					for (unsigned int t = 0; t < tensorDff.T.size(); ++t)
+					{
+						TensorDFFState::Transition& tr = tensorDff.T[t];
+						const float lr = skeleton->getLearningRate(t) * lrScheduleMultiplier;
+						const float wd1 = skeleton->getWeightDecay1(t);
+						const float wd2 = skeleton->getWeightDecay2(t);
+
+						// Initialize ATLAS state for this transition if needed
+						if (!tensorDff.atlasState[t].initialized && tr.in > 0 && tr.out > 0)
+						{
+							atlas::initWeightState(tensorDff.atlasState[t],
+								tr.out, tr.in, ac.rank, ac.muMin, rngEngine,
+								getLogger());
+						}
+
+						if (tensorDff.atlasState[t].initialized)
+						{
+							// ATLAS step for weight matrix
+							atlas::applyStep(tensorDff.atlasState[t],
+								&tr.W[0], &tr.gW[0],
+								tr.out, tr.in,
+								invBatch, lr,
+								wd1, wd2, gradScale,
+								ac.beta, ac.muMin, ac.muMax,
+								ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
+								rngEngine, getLogger());
+						}
+
+						// Bias update: standard SGD (no subspace projection for 1D vectors)
+						for (unsigned int j = 0; j < tr.out; ++j)
+						{
+							float gB = (j < tr.gBias.size()) ? (tr.gBias[j] * invBatch) : 0.0f;
+							gB *= gradScale;
+							if (j < tr.bias.size())
+								tr.bias[j] -= (lr * gB);
+							if (j < tr.gBias.size())
+								tr.gBias[j] = 0.0f;
+						}
+					}
+
+					tensorDff.batchCount = 0;
+				}
+				else
+				{
 				for (unsigned int t = 0; t < tensorDff.T.size(); ++t)
 				{
 					TensorDFFState::Transition& tr = tensorDff.T[t];
@@ -750,6 +803,7 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 				}
 
 				tensorDff.batchCount = 0;
+				}
 			}
 
 			// Save the autotuning data (kept for parity with old path)

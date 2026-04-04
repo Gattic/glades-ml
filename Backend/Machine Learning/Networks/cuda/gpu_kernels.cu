@@ -1991,6 +1991,42 @@ bool pack_loss_scalars(const float* lossSum, const int* lossCount,
 	return true;
 }
 
+// ===========================================================================
+//  17. Sum of squared elements (for gradient norm computation)
+// ===========================================================================
+
+namespace {
+
+__global__ void sum_sq_kernel(const float* __restrict__ data, int n,
+                              float* __restrict__ acc)
+{
+	extern __shared__ float smem[];
+	float localSum = 0.0f;
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+	     i += gridDim.x * blockDim.x)
+	{
+		float v = data[i];
+		localSum += v * v;
+	}
+	float sum = blockReduceSum(localSum, smem);
+	if (threadIdx.x == 0)
+		atomicAdd(acc, sum);
+}
+
+} // anonymous namespace
+
+bool sum_squared_accumulate(const float* data, int n, float* d_accumulator)
+{
+	if (n <= 0) return true;
+	int block = 256;
+	int grid = (n + block - 1) / block;
+	if (grid > 256) grid = 256;
+	int smemBytes = ((block / 32) + 1) * sizeof(float);
+	sum_sq_kernel<<<grid, block, smemBytes>>>(data, n, d_accumulator);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

@@ -1,0 +1,184 @@
+// Copyright 2026 Robert Carneiro, Derek Meer, Matthew Tabak, Eric Lujan
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+// associated documentation files (the "Software"), to deal in the Software without restriction,
+// including without limitation the rights to use, copy, modify, merge, publish, distribute,
+// sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or
+// substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+// NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#ifndef _GTYPES
+#define _GTYPES
+
+#include <ctime>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include "GDeleter.h"
+#include "GPointer.h"
+
+namespace shmea {
+
+class GType
+{
+public:
+	enum Type
+	{
+		NULL_TYPE = -1,
+		BOOLEAN_TYPE = 0,
+		CHAR_TYPE = 1,
+		SHORT_TYPE = 2,
+		INT_TYPE = 3,
+		LONG_TYPE = 4,
+		FLOAT_TYPE = 5,
+		DOUBLE_TYPE = 6,
+		STRING_TYPE = 7,
+		FUNCTION_TYPE = 8,
+	};
+protected:
+	static const unsigned int SBO_SIZE = 8;
+	GPointer<char, array_deleter<char> > block;
+	char inlineBlock[SBO_SIZE + 1]; // +1 for null terminator
+	unsigned int blockSize;
+	Type type;
+	bool useInline;
+public:
+
+	const static unsigned int npos = -1;
+
+	GType();
+	GType(const GType&);
+	GType(const bool&);
+	GType(const char&);
+	GType(const short&);
+	GType(const int&);
+	GType(const int64_t&);
+	GType(const float&);
+	GType(const double&);
+	GType(const char*);
+	GType(const char*, unsigned int);
+	/* GType(int, const void*, int64_t); */
+	GType(Type, const void*, int64_t);
+	virtual ~GType();
+
+	// gets
+	Type getType() const;
+	const char* c_str() const;
+	char getChar() const;
+	short getShort() const;
+	int getInt() const;
+	int64_t getLong() const;
+	float getFloat() const;
+	double getDouble() const;
+	bool getBoolean() const;
+
+	operator const char*() const;
+	operator char() const;
+	operator short() const;
+	operator int() const;
+	operator int64_t() const;
+	operator float() const;
+	operator double() const;
+	operator bool() const;
+	unsigned int size() const;
+	const char* rawData() const;
+
+	// sets
+	void set(Type, const void*, int64_t);
+
+	//= operators
+	GType& operator=(const GType&);
+	GType& operator=(const char&);
+	GType& operator=(const short&);
+	GType& operator=(const int&);
+	GType& operator=(const int64_t&);
+	GType& operator=(const float&);
+	GType& operator=(const double&);
+	GType& operator=(const char*);
+	GType& operator=(const bool&);
+
+	//== operators
+	bool operator==(const GType&) const;
+	bool operator==(const char&) const;
+	bool operator==(const short&) const;
+	bool operator==(const int&) const;
+	bool operator==(const int64_t&) const;
+	bool operator==(const float&) const;
+	bool operator==(const double&) const;
+	bool operator==(const char*) const;
+	bool operator==(const bool&) const;
+
+	//!= operators
+	bool operator!=(const GType&) const;
+	bool operator!=(const char&) const;
+	bool operator!=(const short&) const;
+	bool operator!=(const int&) const;
+	bool operator!=(const int64_t&) const;
+	bool operator!=(const float&) const;
+	bool operator!=(const double&) const;
+	bool operator!=(const char*) const;
+	bool operator!=(const bool&) const;
+
+	//< operators
+	bool operator<(const GType&) const;
+	bool operator<(const char&) const;
+	bool operator<(const short&) const;
+	bool operator<(const int&) const;
+	bool operator<(const int64_t&) const;
+	bool operator<(const float&) const;
+	bool operator<(const double&) const;
+	bool operator<(const char*) const;
+	bool operator<(const bool&) const;
+
+	//> operators
+	bool operator>(const GType&) const;
+	bool operator>(const char&) const;
+	bool operator>(const short&) const;
+	bool operator>(const int&) const;
+	bool operator>(const int64_t&) const;
+	bool operator>(const float&) const;
+	bool operator>(const double&) const;
+	bool operator>(const char*) const;
+	bool operator>(const bool&) const;
+
+	//<= operators
+	bool operator<=(const GType&) const;
+	bool operator<=(const char&) const;
+	bool operator<=(const short&) const;
+	bool operator<=(const int&) const;
+	bool operator<=(const int64_t&) const;
+	bool operator<=(const float&) const;
+	bool operator<=(const double&) const;
+	bool operator<=(const char*) const;
+	bool operator<=(const bool&) const;
+
+	//>= operators
+	bool operator>=(const GType&) const;
+	bool operator>=(const char&) const;
+	bool operator>=(const short&) const;
+	bool operator>=(const int&) const;
+	bool operator>=(const int64_t&) const;
+	bool operator>=(const float&) const;
+	bool operator>=(const double&) const;
+	bool operator>=(const char*) const;
+	bool operator>=(const bool&) const;
+
+	// Member helpers
+	unsigned int cfind(char) const;
+	unsigned int find(const char*, unsigned int) const;
+
+	// Static helpers
+	static unsigned int cfind(char, const char*, unsigned int);
+	static unsigned int find(const char*, unsigned int, const char*, unsigned int);
+};
+};
+
+#endif

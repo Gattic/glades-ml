@@ -96,6 +96,49 @@ static void col2im_cpu(const float* cols,
 	}
 }
 
+// Nearest-neighbor upsample: [C, inH, inW] -> [C, inH*scaleH, inW*scaleW]
+static void nn_upsample_cpu(const float* input,
+                            unsigned int C, unsigned int inH, unsigned int inW,
+                            unsigned int scaleH, unsigned int scaleW,
+                            float* output)
+{
+	const unsigned int outH = inH * scaleH;
+	const unsigned int outW = inW * scaleW;
+	for (unsigned int c = 0; c < C; ++c)
+	{
+		const size_t inOff = static_cast<size_t>(c) * inH * inW;
+		const size_t outOff = static_cast<size_t>(c) * outH * outW;
+		for (unsigned int oh = 0; oh < outH; ++oh)
+		{
+			const unsigned int ih = oh / scaleH;
+			for (unsigned int ow = 0; ow < outW; ++ow)
+				output[outOff + oh * outW + ow] = input[inOff + ih * inW + ow / scaleW];
+		}
+	}
+}
+
+// Sum-downsample (gradient of nn upsample): [C, inH, inW] -> [C, inH/scaleH, inW/scaleW]
+static void nn_downsample_sum_cpu(const float* input,
+                                  unsigned int C, unsigned int inH, unsigned int inW,
+                                  unsigned int scaleH, unsigned int scaleW,
+                                  float* output)
+{
+	const unsigned int outH = inH / scaleH;
+	const unsigned int outW = inW / scaleW;
+	std::memset(output, 0, static_cast<size_t>(C) * outH * outW * sizeof(float));
+	for (unsigned int c = 0; c < C; ++c)
+	{
+		const size_t inOff = static_cast<size_t>(c) * inH * inW;
+		const size_t outOff = static_cast<size_t>(c) * outH * outW;
+		for (unsigned int ih = 0; ih < inH; ++ih)
+		{
+			const unsigned int oh = ih / scaleH;
+			for (unsigned int iw = 0; iw < inW; ++iw)
+				output[outOff + oh * outW + iw / scaleW] += input[inOff + ih * inW + iw];
+		}
+	}
+}
+
 // C[M,N] += A[M,K] * B^T[N,K]
 static void sgemm_abt_cpu(const float* A, const float* B, float* C,
                           unsigned int M, unsigned int K, unsigned int N)
@@ -405,10 +448,17 @@ void GradientBuffer::initFromDeconv(const NNetwork& net)
 	const size_t nL = dc.layers.size();
 	deconvGW.resize(nL);
 	deconvGBias.resize(nL);
+	deconvGBnGamma.resize(nL);
+	deconvGBnBeta.resize(nL);
 	for (size_t l = 0; l < nL; ++l)
 	{
 		deconvGW[l].assign(dc.layers[l].gW.size(), 0.0f);
 		deconvGBias[l].assign(dc.layers[l].gBias.size(), 0.0f);
+		if (dc.layers[l].useBatchNorm)
+		{
+			deconvGBnGamma[l].assign(dc.layers[l].bnGamma.size(), 0.0f);
+			deconvGBnBeta[l].assign(dc.layers[l].bnBeta.size(), 0.0f);
+		}
 	}
 }
 
@@ -416,6 +466,21 @@ void GradientBuffer::initFromQHead(unsigned int sharedDim, unsigned int qOutDim)
 {
 	qGW.assign(static_cast<size_t>(sharedDim) * static_cast<size_t>(qOutDim), 0.0f);
 	qGBias.assign(qOutDim, 0.0f);
+}
+
+void GradientBuffer::initFromGenQHead(unsigned int sharedDim, unsigned int qOutDim, unsigned int hiddenDim)
+{
+	if (hiddenDim > 0u)
+	{
+		genQGHiddenW.assign(static_cast<size_t>(hiddenDim) * static_cast<size_t>(sharedDim), 0.0f);
+		genQGHiddenBias.assign(hiddenDim, 0.0f);
+		genQGW.assign(static_cast<size_t>(qOutDim) * static_cast<size_t>(hiddenDim), 0.0f);
+	}
+	else
+	{
+		genQGW.assign(static_cast<size_t>(sharedDim) * static_cast<size_t>(qOutDim), 0.0f);
+	}
+	genQGBias.assign(qOutDim, 0.0f);
 }
 
 void GradientBuffer::zero()
@@ -452,10 +517,25 @@ void GradientBuffer::zero()
 		if (!deconvGBias[l].empty())
 			std::memset(&deconvGBias[l][0], 0, deconvGBias[l].size() * sizeof(float));
 	}
+	for (size_t l = 0; l < deconvGBnGamma.size(); ++l)
+	{
+		if (!deconvGBnGamma[l].empty())
+			std::memset(&deconvGBnGamma[l][0], 0, deconvGBnGamma[l].size() * sizeof(float));
+		if (!deconvGBnBeta[l].empty())
+			std::memset(&deconvGBnBeta[l][0], 0, deconvGBnBeta[l].size() * sizeof(float));
+	}
 	if (!qGW.empty())
 		std::memset(&qGW[0], 0, qGW.size() * sizeof(float));
 	if (!qGBias.empty())
 		std::memset(&qGBias[0], 0, qGBias.size() * sizeof(float));
+	if (!genQGW.empty())
+		std::memset(&genQGW[0], 0, genQGW.size() * sizeof(float));
+	if (!genQGBias.empty())
+		std::memset(&genQGBias[0], 0, genQGBias.size() * sizeof(float));
+	if (!genQGHiddenW.empty())
+		std::memset(&genQGHiddenW[0], 0, genQGHiddenW.size() * sizeof(float));
+	if (!genQGHiddenBias.empty())
+		std::memset(&genQGHiddenBias[0], 0, genQGHiddenBias.size() * sizeof(float));
 }
 
 void GradientBuffer::addToDFF(NNetwork& net) const
@@ -503,6 +583,13 @@ void GradientBuffer::addToDeconv(NNetwork& net) const
 		for (size_t i = 0; i < deconvGBias[l].size(); ++i)
 			dc.layers[l].gBias[i] += deconvGBias[l][i];
 	}
+	for (size_t l = 0; l < deconvGBnGamma.size(); ++l)
+	{
+		for (size_t i = 0; i < deconvGBnGamma[l].size(); ++i)
+			dc.layers[l].gBnGamma[i] += deconvGBnGamma[l][i];
+		for (size_t i = 0; i < deconvGBnBeta[l].size(); ++i)
+			dc.layers[l].gBnBeta[i] += deconvGBnBeta[l][i];
+	}
 }
 
 // ============================================================
@@ -511,9 +598,63 @@ void GradientBuffer::addToDeconv(NNetwork& net) const
 
 void GANThreadCtx::zeroLosses()
 {
-	dLossReal = dLossFake = gLoss = wasserstein = infoLoss = 0.0f;
+	dLossReal = dLossFake = gLoss = wasserstein = infoLoss = divLoss = 0.0f;
 	gLossAB = gLossBA = cycleLoss = identityLoss = 0.0f;
 	catCorrect = catTotal = 0u;
+	dOutRealSum = dOutFakeSum = 0.0f;
+}
+
+void DeconvScratchArena::initFromDeconv(const NNetwork& net)
+{
+	const NNetwork::TensorDeconvState& ds = net.tensorDeconv;
+	const unsigned int numLayers = static_cast<unsigned int>(ds.layers.size());
+
+	upsampled.resize(numLayers);
+	cols.resize(numLayers);
+	outputCols.resize(numLayers);
+	dCols.resize(numLayers);
+	dUp.resize(numLayers);
+	dInput.resize(numLayers);
+
+	for (unsigned int l = 0; l < numLayers; ++l)
+	{
+		const NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
+
+		if (dl.useUpsampleConv)
+		{
+			const unsigned int upH = dl.inH * dl.strideH;
+			const unsigned int upW = dl.inW * dl.strideW;
+			const unsigned int K = dl.inC * dl.kH * dl.kW;
+			const unsigned int N = dl.outH * dl.outW;
+
+			upsampled[l].resize(static_cast<size_t>(dl.inC) * upH * upW);
+			cols[l].resize(static_cast<size_t>(N) * K);
+			dCols[l].resize(static_cast<size_t>(N) * K);
+			dUp[l].resize(static_cast<size_t>(dl.inC) * upH * upW);
+		}
+		else
+		{
+			const unsigned int N = dl.inH * dl.inW;
+			const unsigned int outK = dl.outC * dl.kH * dl.kW;
+
+			outputCols[l].resize(static_cast<size_t>(outK) * N);
+			dCols[l].resize(static_cast<size_t>(outK) * N);
+		}
+		dInput[l].resize(static_cast<size_t>(dl.inC) * dl.inH * dl.inW);
+	}
+
+	dFC.resize(ds.fcOut);
+
+	unsigned int maxOutVol = 0;
+	for (unsigned int l = 0; l < numLayers; ++l)
+	{
+		const NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
+		const unsigned int v = dl.outC * dl.outH * dl.outW;
+		if (v > maxOutVol) maxOutVol = v;
+	}
+	dCur.resize(maxOutVol);
+
+	initialized = true;
 }
 
 void GANThreadCtx::zeroGrads()
@@ -731,15 +872,24 @@ int GAN::saveWeights(const std::string& dir, const std::string& prefix) const
 		fwrite(&numDeconv, sizeof(uint32_t), 1, fp);
 		for (uint32_t l = 0; l < numDeconv; ++l)
 		{
-			uint32_t ddims[8] = {
+			uint32_t ddims[10] = {
 				net.tensorDeconv.layers[l].inC, net.tensorDeconv.layers[l].outC,
 				net.tensorDeconv.layers[l].kH, net.tensorDeconv.layers[l].kW,
 				net.tensorDeconv.layers[l].strideH, net.tensorDeconv.layers[l].strideW,
-				net.tensorDeconv.layers[l].padH, net.tensorDeconv.layers[l].padW
+				net.tensorDeconv.layers[l].padH, net.tensorDeconv.layers[l].padW,
+				net.tensorDeconv.layers[l].useUpsampleConv ? 1u : 0u,
+				net.tensorDeconv.layers[l].useReLU ? 1u : 0u
 			};
-			fwrite(ddims, sizeof(uint32_t), 8, fp);
+			fwrite(ddims, sizeof(uint32_t), 10, fp);
 			fwrite(net.tensorDeconv.layers[l].W.data(), sizeof(float), net.tensorDeconv.layers[l].W.size(), fp);
 			fwrite(net.tensorDeconv.layers[l].bias.data(), sizeof(float), net.tensorDeconv.layers[l].bias.size(), fp);
+			uint8_t hasBN = net.tensorDeconv.layers[l].useBatchNorm ? 1u : 0u;
+			fwrite(&hasBN, sizeof(uint8_t), 1, fp);
+			if (hasBN)
+			{
+				fwrite(net.tensorDeconv.layers[l].bnGamma.data(), sizeof(float), net.tensorDeconv.layers[l].bnGamma.size(), fp);
+				fwrite(net.tensorDeconv.layers[l].bnBeta.data(), sizeof(float), net.tensorDeconv.layers[l].bnBeta.size(), fp);
+			}
 		}
 
 		fclose(fp);
@@ -846,19 +996,36 @@ int GAN::loadWeights(const std::string& dir, const std::string& prefix)
 		net.tensorDeconv.layers.resize(numDeconv);
 		for (uint32_t l = 0; l < numDeconv; ++l)
 		{
-			uint32_t ddims[8];
-			if (fread(ddims, sizeof(uint32_t), 8, fp) != 8) break;
+			uint32_t ddims[10];
+			if (fread(ddims, sizeof(uint32_t), 10, fp) != 10) break;
 			NNetwork::TensorDeconvState::DeconvLayer& dl = net.tensorDeconv.layers[l];
 			dl.inC = ddims[0]; dl.outC = ddims[1];
 			dl.kH = ddims[2]; dl.kW = ddims[3];
 			dl.strideH = ddims[4]; dl.strideW = ddims[5];
 			dl.padH = ddims[6]; dl.padW = ddims[7];
+			dl.useUpsampleConv = (ddims[8] != 0u);
+			dl.useReLU = (ddims[9] != 0u);
 			dl.W.resize(static_cast<size_t>(dl.inC) * dl.outC * dl.kH * dl.kW);
 			dl.bias.resize(dl.outC);
 			dl.gW.resize(dl.W.size(), 0.0f);
 			dl.gBias.resize(dl.outC, 0.0f);
 			fread(dl.W.data(), sizeof(float), dl.W.size(), fp);
 			fread(dl.bias.data(), sizeof(float), dl.bias.size(), fp);
+			uint8_t hasBN = 0;
+			if (fread(&hasBN, sizeof(uint8_t), 1, fp) == 1 && hasBN)
+			{
+				dl.useBatchNorm = true;
+				dl.bnGamma.resize(dl.outC);
+				dl.bnBeta.resize(dl.outC);
+				dl.gBnGamma.resize(dl.outC, 0.0f);
+				dl.gBnBeta.resize(dl.outC, 0.0f);
+				dl.vBnGamma.resize(dl.outC, 0.0f);
+				dl.v2BnGamma.resize(dl.outC, 0.0f);
+				dl.vBnBeta.resize(dl.outC, 0.0f);
+				dl.v2BnBeta.resize(dl.outC, 0.0f);
+				fread(dl.bnGamma.data(), sizeof(float), dl.bnGamma.size(), fp);
+				fread(dl.bnBeta.data(), sizeof(float), dl.bnBeta.size(), fp);
+			}
 		}
 		if (net.tensorDeconv.fcOut > 0 || numDeconv > 0)
 		{
@@ -870,8 +1037,18 @@ int GAN::loadWeights(const std::string& dir, const std::string& prefix)
 				NNetwork::TensorDeconvState::DeconvLayer& dl = net.tensorDeconv.layers[l];
 				dl.inH = curH;
 				dl.inW = curW;
-				dl.outH = (curH - 1u) * dl.strideH - 2u * dl.padH + dl.kH;
-				dl.outW = (curW - 1u) * dl.strideW - 2u * dl.padW + dl.kW;
+				if (dl.useUpsampleConv)
+				{
+					const unsigned int upH = curH * dl.strideH;
+					const unsigned int upW = curW * dl.strideW;
+					dl.outH = upH - dl.kH + 2u * dl.padH + 1u;
+					dl.outW = upW - dl.kW + 2u * dl.padW + 1u;
+				}
+				else
+				{
+					dl.outH = (curH - 1u) * dl.strideH - 2u * dl.padH + dl.kH;
+					dl.outW = (curW - 1u) * dl.strideW - 2u * dl.padW + dl.kW;
+				}
 				curH = dl.outH;
 				curW = dl.outW;
 			}
@@ -2675,10 +2852,24 @@ bool GAN::initDeconvTensors(NNetwork& net, unsigned int inputDim, const DeconvCo
 		dl.padW = spec.padW;
 		dl.inH = curH;
 		dl.inW = curW;
-		dl.outH = (curH - 1u) * spec.strideH - 2u * spec.padH + spec.kernelH;
-		dl.outW = (curW - 1u) * spec.strideW - 2u * spec.padW + spec.kernelW;
 		dl.useBatchNorm = spec.useBatchNorm;
 		dl.useReLU = spec.useReLU;
+		dl.useUpsampleConv = spec.useUpsampleConv;
+
+		if (dl.useUpsampleConv)
+		{
+			// Upsample + standard conv: upH = inH*stride, outH = (upH - kH + 2*pad) + 1
+			const unsigned int upH = curH * spec.strideH;
+			const unsigned int upW = curW * spec.strideW;
+			dl.outH = upH - spec.kernelH + 2u * spec.padH + 1u;
+			dl.outW = upW - spec.kernelW + 2u * spec.padW + 1u;
+		}
+		else
+		{
+			// Transposed conv: outH = (inH - 1)*stride - 2*pad + kH
+			dl.outH = (curH - 1u) * spec.strideH - 2u * spec.padH + spec.kernelH;
+			dl.outW = (curW - 1u) * spec.strideW - 2u * spec.padW + spec.kernelW;
+		}
 
 		// W: [inC, outC*kH*kW]
 		const size_t wSize = static_cast<size_t>(dl.inC) * dl.outC * dl.kH * dl.kW;
@@ -2691,7 +2882,24 @@ bool GAN::initDeconvTensors(NNetwork& net, unsigned int inputDim, const DeconvCo
 		dl.vBias.assign(dl.outC, 0.0f);
 		dl.v2Bias.assign(dl.outC, 0.0f);
 
-		initGlorot(rngEngine, dl.W, dl.inC, dl.outC * dl.kH * dl.kW);
+		if (dl.useUpsampleConv)
+			initGlorot(rngEngine, dl.W, dl.inC * dl.kH * dl.kW, dl.outC);
+		else
+			initGlorot(rngEngine, dl.W, dl.inC, dl.outC * dl.kH * dl.kW);
+
+		if (dl.useBatchNorm)
+		{
+			dl.bnGamma.assign(dl.outC, 1.0f);
+			dl.bnBeta.assign(dl.outC, 0.0f);
+			dl.bnRunMean.assign(dl.outC, 0.0f);
+			dl.bnRunVar.assign(dl.outC, 1.0f);
+			dl.gBnGamma.assign(dl.outC, 0.0f);
+			dl.gBnBeta.assign(dl.outC, 0.0f);
+			dl.vBnGamma.assign(dl.outC, 0.0f);
+			dl.v2BnGamma.assign(dl.outC, 0.0f);
+			dl.vBnBeta.assign(dl.outC, 0.0f);
+			dl.v2BnBeta.assign(dl.outC, 0.0f);
+		}
 
 		curC = dl.outC;
 		curH = dl.outH;
@@ -2705,7 +2913,9 @@ bool GAN::initDeconvTensors(NNetwork& net, unsigned int inputDim, const DeconvCo
 
 void GAN::deconvForward(const NNetwork& net, const float* input, unsigned int inputSize,
                         std::vector<float>& output,
-                        std::vector<std::vector<float> >* scratchOut) const
+                        std::vector<std::vector<float> >* scratchOut,
+                        unsigned int noiseSeed,
+                        DeconvScratchArena* arena) const
 {
 	const NNetwork::TensorDeconvState& ds = net.tensorDeconv;
 	const unsigned int numLayers = static_cast<unsigned int>(ds.layers.size());
@@ -2714,8 +2924,9 @@ void GAN::deconvForward(const NNetwork& net, const float* input, unsigned int in
 	// scratch[0] = original input copy (for FC backward)
 	// scratch[1] = FC output (post-activation)
 	// scratch[2..numLayers+1] = deconv layer outputs (post-activation)
+	// scratch[numLayers+2..2*numLayers+1] = BN scratch (invstd[outC] + x_hat[outVol])
 	const unsigned int numScratch = 2u + numLayers;
-	std::vector<std::vector<float> > scratch(numScratch);
+	std::vector<std::vector<float> > scratch(numScratch + numLayers);
 
 	// Store original input
 	scratch[0].assign(input, input + inputSize);
@@ -2737,20 +2948,61 @@ void GAN::deconvForward(const NNetwork& net, const float* input, unsigned int in
 	for (unsigned int li = 0; li < numLayers; ++li)
 	{
 		const NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[li];
-		const unsigned int N = dl.inH * dl.inW;
-		const unsigned int outK = dl.outC * dl.kH * dl.kW;
 		const unsigned int outVol = dl.outC * dl.outH * dl.outW;
 
-		// Transposed conv: output_cols[outK, N] = W^T * input_flat
-		// W: [inC, outK], input_flat: [inC, N]
-		std::vector<float> outputCols(static_cast<size_t>(outK) * N, 0.0f);
-		sgemm_atb_cpu(curData, &dl.W[0], &outputCols[0], dl.inC, N, outK);
-
-		// col2im: scatter outputCols to spatial output
 		scratch[2u + li].assign(outVol, 0.0f);
-		col2im_cpu(&outputCols[0], dl.outC, dl.outH, dl.outW,
-		           dl.kH, dl.kW, dl.strideH, dl.strideW, dl.padH, dl.padW,
-		           dl.inH, dl.inW, &scratch[2u + li][0]);
+
+		if (dl.useUpsampleConv)
+		{
+			// Upsample + standard conv path (no checkerboard artifacts)
+			const unsigned int upH = dl.inH * dl.strideH;
+			const unsigned int upW = dl.inW * dl.strideW;
+			const unsigned int K = dl.inC * dl.kH * dl.kW;
+			const unsigned int N = dl.outH * dl.outW;
+
+			// Nearest-neighbor upsample
+			float* upBuf;
+			std::vector<float> upLocal;
+			if (arena && arena->initialized) { upBuf = &arena->upsampled[li][0]; }
+			else { upLocal.resize(static_cast<size_t>(dl.inC) * upH * upW); upBuf = &upLocal[0]; }
+			nn_upsample_cpu(curData, dl.inC, dl.inH, dl.inW, dl.strideH, dl.strideW, upBuf);
+
+			// im2col on upsampled input (stride=1)
+			float* colBuf;
+			std::vector<float> colLocal;
+			if (arena && arena->initialized) { colBuf = &arena->cols[li][0]; }
+			else { colLocal.resize(static_cast<size_t>(N) * K); colBuf = &colLocal[0]; }
+			im2col_cpu(upBuf, dl.inC, upH, upW,
+			           dl.kH, dl.kW, 1u, 1u, dl.padH, dl.padW,
+			           dl.outH, dl.outW, colBuf);
+
+			// Standard conv: output[outC, N] = W[outC, K] * cols^T[K, N]
+			sgemm_abt_cpu(&dl.W[0], colBuf, &scratch[2u + li][0], dl.outC, K, N);
+		}
+		else
+		{
+			// Transposed conv path
+			const unsigned int N = dl.inH * dl.inW;
+			const unsigned int outK = dl.outC * dl.kH * dl.kW;
+
+			// output_cols[N, outK] = input^T * W
+			// W: [inC, outK], input_flat: [inC, N]
+			float* ocBuf;
+			std::vector<float> ocLocal;
+			if (arena && arena->initialized) {
+				ocBuf = &arena->outputCols[li][0];
+				std::memset(ocBuf, 0, static_cast<size_t>(outK) * N * sizeof(float));
+			} else {
+				ocLocal.assign(static_cast<size_t>(outK) * N, 0.0f);
+				ocBuf = &ocLocal[0];
+			}
+			sgemm_atb_cpu(curData, &dl.W[0], ocBuf, dl.inC, N, outK);
+
+			// col2im: scatter outputCols to spatial output
+			col2im_cpu(ocBuf, dl.outC, dl.outH, dl.outW,
+			           dl.kH, dl.kW, dl.strideH, dl.strideW, dl.padH, dl.padW,
+			           dl.inH, dl.inW, &scratch[2u + li][0]);
+		}
 
 		// Add bias (broadcast per outC channel)
 		for (unsigned int c = 0; c < dl.outC; ++c)
@@ -2761,16 +3013,84 @@ void GAN::deconvForward(const NNetwork& net, const float* input, unsigned int in
 				scratch[2u + li][chOff + p] += b;
 		}
 
+		// Batch normalization (spatial/instance norm per channel)
+		if (dl.useBatchNorm)
+		{
+			const unsigned int HW = dl.outH * dl.outW;
+			const float bnEps = 1e-5f;
+			// Store invstd[outC] then x_hat[outVol] for backward pass
+			scratch[numScratch + li].resize(static_cast<size_t>(dl.outC) + outVol);
+			float* invstdBuf = &scratch[numScratch + li][0];
+			float* xhatBuf = &scratch[numScratch + li][dl.outC];
+
+			for (unsigned int c = 0; c < dl.outC; ++c)
+			{
+				const size_t chOff = static_cast<size_t>(c) * HW;
+				// Mean over spatial dims
+				float mean = 0.0f;
+				for (unsigned int p = 0; p < HW; ++p)
+					mean += scratch[2u + li][chOff + p];
+				mean /= static_cast<float>(HW);
+				// Variance over spatial dims
+				float var = 0.0f;
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					const float d = scratch[2u + li][chOff + p] - mean;
+					var += d * d;
+				}
+				var /= static_cast<float>(HW);
+				const float invstd = 1.0f / sqrtf(var + bnEps);
+				invstdBuf[c] = invstd;
+				// Normalize, scale, shift
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					const float xh = (scratch[2u + li][chOff + p] - mean) * invstd;
+					xhatBuf[chOff + p] = xh;
+					scratch[2u + li][chOff + p] = dl.bnGamma[c] * xh + dl.bnBeta[c];
+				}
+			}
+		}
+
 		// Activation: ReLU for hidden layers, sigmoid for last layer
 		if (dl.useReLU)
 		{
 			for (size_t i = 0; i < outVol; ++i)
 				scratch[2u + li][i] = (scratch[2u + li][i] > 0.0f) ? scratch[2u + li][i] : 0.0f;
+
+			// Noise injection (training only): add per-pixel Gaussian noise
+			// after hidden-layer activations to prevent mode collapse.
+			// Gradient of addition is identity, so no backward changes needed.
+			// noiseSeed != 0 indicates training mode; seed is unique per thread/sample.
+			if (noiseSeed != 0u)
+			{
+				const float noiseStd = 0.1f;
+				unsigned int rng = noiseSeed ^ (li * 65537u); // per-layer variation
+				for (size_t i = 0; i < outVol; i += 2u)
+				{
+					// Box-Muller with Numerical Recipes LCG (thread-safe, no shared state)
+					float u1, u2;
+					do {
+						rng = rng * 1664525u + 1013904223u;
+						u1 = static_cast<float>(rng & 0x7FFFFFFFu) / 2147483648.0f;
+					} while (u1 < 1e-10f);
+					rng = rng * 1664525u + 1013904223u;
+					u2 = static_cast<float>(rng & 0x7FFFFFFFu) / 2147483648.0f;
+					const float r = sqrtf(-2.0f * logf(u1));
+					const float theta = 6.2831853f * u2;
+					scratch[2u + li][i] += noiseStd * r * cosf(theta);
+					if (i + 1u < outVol)
+						scratch[2u + li][i + 1u] += noiseStd * r * sinf(theta);
+				}
+			}
 		}
 		else
 		{
+			// Temperature-scaled sigmoid: sigmoid(z / T).
+			// Higher T widens the linear region, preventing binary saturation.
+			// With T=3, reaching output 0.98 requires z≈12 — weight decay resists this.
+			const float invTemp = 1.0f / config.genOutputTemp;
 			for (size_t i = 0; i < outVol; ++i)
-				scratch[2u + li][i] = sigmoid(scratch[2u + li][i]);
+				scratch[2u + li][i] = sigmoid(scratch[2u + li][i] * invTemp);
 		}
 
 		curData = &scratch[2u + li][0];
@@ -2785,7 +3105,8 @@ void GAN::deconvForward(const NNetwork& net, const float* input, unsigned int in
 
 void GAN::deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& scratch,
                          const float* outputGrad, unsigned int outputSize,
-                         std::vector<float>* inputGrad)
+                         std::vector<float>* inputGrad,
+                         DeconvScratchArena* arena)
 {
 	NNetwork::TensorDeconvState& ds = net.tensorDeconv;
 	const unsigned int numLayers = static_cast<unsigned int>(ds.layers.size());
@@ -2794,16 +3115,24 @@ void GAN::deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& 
 	// scratch[0] = original input copy
 	// scratch[1] = FC output (post-activation)
 	// scratch[2..numLayers+1] = deconv layer outputs (post-activation)
+	// scratch[numLayers+2..2*numLayers+1] = BN scratch (invstd + x_hat)
+	const unsigned int numScratch = 2u + numLayers;
 
-	std::vector<float> dCur(outputGrad, outputGrad + outputSize);
+	float* dCurPtr;
+	std::vector<float> dCurLocal;
+	if (arena && arena->initialized) {
+		dCurPtr = &arena->dCur[0];
+		std::memcpy(dCurPtr, outputGrad, outputSize * sizeof(float));
+	} else {
+		dCurLocal.assign(outputGrad, outputGrad + outputSize);
+		dCurPtr = &dCurLocal[0];
+	}
 
 	// Backward through deconv layers (reverse order)
 	for (int li = static_cast<int>(numLayers) - 1; li >= 0; --li)
 	{
 		const unsigned int l = static_cast<unsigned int>(li);
 		NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
-		const unsigned int N = dl.inH * dl.inW;
-		const unsigned int outK = dl.outC * dl.kH * dl.kW;
 		const unsigned int outVol = dl.outC * dl.outH * dl.outW;
 
 		// Activation derivative
@@ -2811,12 +3140,55 @@ void GAN::deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& 
 		if (dl.useReLU)
 		{
 			for (size_t i = 0; i < outVol; ++i)
-				dCur[i] = (layerOut[i] > 0.0f) ? dCur[i] : 0.0f;
+				dCurPtr[i] = (layerOut[i] > 0.0f) ? dCurPtr[i] : 0.0f;
 		}
 		else
 		{
+			// Temperature-scaled sigmoid derivative: d/dz sigmoid(z/T) = a*(1-a) / T
+			const float invTemp = 1.0f / config.genOutputTemp;
 			for (size_t i = 0; i < outVol; ++i)
-				dCur[i] *= sigmoidDeriv(layerOut[i]);
+				dCurPtr[i] *= sigmoidDeriv(layerOut[i]) * invTemp;
+		}
+
+		// Batch norm backward
+		if (dl.useBatchNorm)
+		{
+			const unsigned int HW = dl.outH * dl.outW;
+			const float invHW = 1.0f / static_cast<float>(HW);
+			const float* invstdBuf = &scratch[numScratch + l][0];
+			const float* xhatBuf = &scratch[numScratch + l][dl.outC];
+
+			for (unsigned int c = 0; c < dl.outC; ++c)
+			{
+				const size_t chOff = static_cast<size_t>(c) * HW;
+				// Gamma/beta gradients
+				float dGamma = 0.0f, dBeta = 0.0f;
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					dGamma += dCurPtr[chOff + p] * xhatBuf[chOff + p];
+					dBeta += dCurPtr[chOff + p];
+				}
+				dl.gBnGamma[c] += dGamma;
+				dl.gBnBeta[c] += dBeta;
+
+				// Input gradient through BN
+				const float invstd = invstdBuf[c];
+				const float gamma = dl.bnGamma[c];
+				float sumDyG = 0.0f, sumDyGXh = 0.0f;
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					const float dyg = dCurPtr[chOff + p] * gamma;
+					sumDyG += dyg;
+					sumDyGXh += dyg * xhatBuf[chOff + p];
+				}
+				const float meanDyG = sumDyG * invHW;
+				const float meanDyGXh = sumDyGXh * invHW;
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					const float dyg = dCurPtr[chOff + p] * gamma;
+					dCurPtr[chOff + p] = invstd * (dyg - meanDyG - xhatBuf[chOff + p] * meanDyGXh);
+				}
+			}
 		}
 
 		// Bias gradient
@@ -2825,48 +3197,163 @@ void GAN::deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& 
 			float bsum = 0.0f;
 			const size_t chOff = static_cast<size_t>(c) * dl.outH * dl.outW;
 			for (unsigned int p = 0; p < dl.outH * dl.outW; ++p)
-				bsum += dCur[chOff + p];
+				bsum += dCurPtr[chOff + p];
 			dl.gBias[c] += bsum;
 		}
 
-		// im2col on dCur: gradient of col2im is im2col
-		std::vector<float> dOutputCols(static_cast<size_t>(outK) * N, 0.0f);
-		im2col_cpu(&dCur[0], dl.outC, dl.outH, dl.outW,
-		           dl.kH, dl.kW, dl.strideH, dl.strideW, dl.padH, dl.padW,
-		           dl.inH, dl.inW, &dOutputCols[0]);
-
-		// Weight gradient: dW[inC, outK] += input_flat[inC, N] * dOutputCols[outK, N]^T
 		// Layer input is scratch[1+l]: scratch[1] = FC output for l=0, scratch[2..] for l>0
 		const float* layerInput = &scratch[1u + l][0];
-		sgemm_abt_cpu(layerInput, &dOutputCols[0], &dl.gW[0], dl.inC, N, outK);
 
-		// Input gradient: dinput[inC, N] = W[inC, outK] * dOutputCols[outK, N]
+		if (dl.useUpsampleConv)
 		{
-			const size_t inputVol = static_cast<size_t>(dl.inC) * N;
-			std::vector<float> dInput(inputVol, 0.0f);
-			sgemm_cpu(&dl.W[0], &dOutputCols[0], &dInput[0], dl.inC, outK, N);
-			dCur = dInput;
+			// Standard conv backward (upsample+conv path)
+			const unsigned int upH = dl.inH * dl.strideH;
+			const unsigned int upW = dl.inW * dl.strideW;
+			const unsigned int K = dl.inC * dl.kH * dl.kW;
+			const unsigned int N = dl.outH * dl.outW;
+
+			// Recompute forward cols: upsample input, im2col
+			float* upsampledPtr;
+			std::vector<float> upsampledLocal;
+			if (arena && arena->initialized) {
+				upsampledPtr = &arena->upsampled[l][0];
+			} else {
+				upsampledLocal.resize(static_cast<size_t>(dl.inC) * upH * upW);
+				upsampledPtr = &upsampledLocal[0];
+			}
+			nn_upsample_cpu(layerInput, dl.inC, dl.inH, dl.inW, dl.strideH, dl.strideW, upsampledPtr);
+
+			float* colsPtr;
+			std::vector<float> colsLocal;
+			if (arena && arena->initialized) {
+				colsPtr = &arena->cols[l][0];
+			} else {
+				colsLocal.resize(static_cast<size_t>(N) * K);
+				colsPtr = &colsLocal[0];
+			}
+			im2col_cpu(upsampledPtr, dl.inC, upH, upW,
+			           dl.kH, dl.kW, 1u, 1u, dl.padH, dl.padW,
+			           dl.outH, dl.outW, colsPtr);
+
+			// Weight gradient: gW[outC, K] += dCur[outC, N] * cols[N, K]
+			sgemm_cpu(dCurPtr, colsPtr, &dl.gW[0], dl.outC, N, K);
+
+			// Input gradient: dCols[N, K] = dCur^T[N, outC] * W[outC, K]
+			float* dColsPtr;
+			std::vector<float> dColsLocal;
+			if (arena && arena->initialized) {
+				dColsPtr = &arena->dCols[l][0];
+				std::memset(dColsPtr, 0, static_cast<size_t>(N) * K * sizeof(float));
+			} else {
+				dColsLocal.assign(static_cast<size_t>(N) * K, 0.0f);
+				dColsPtr = &dColsLocal[0];
+			}
+			sgemm_atb_cpu(dCurPtr, &dl.W[0], dColsPtr, dl.outC, N, K);
+
+			// col2im to get d_upsampled[inC, upH, upW]
+			float* dUpPtr;
+			std::vector<float> dUpLocal;
+			if (arena && arena->initialized) {
+				dUpPtr = &arena->dUp[l][0];
+				std::memset(dUpPtr, 0, static_cast<size_t>(dl.inC) * upH * upW * sizeof(float));
+			} else {
+				dUpLocal.assign(static_cast<size_t>(dl.inC) * upH * upW, 0.0f);
+				dUpPtr = &dUpLocal[0];
+			}
+			col2im_cpu(dColsPtr, dl.inC, upH, upW,
+			           dl.kH, dl.kW, 1u, 1u, dl.padH, dl.padW,
+			           dl.outH, dl.outW, dUpPtr);
+
+			// Downsample to get dInput[inC, inH, inW]
+			const size_t inputVol = static_cast<size_t>(dl.inC) * dl.inH * dl.inW;
+			float* dInputPtr;
+			std::vector<float> dInputLocal;
+			if (arena && arena->initialized) {
+				dInputPtr = &arena->dInput[l][0];
+			} else {
+				dInputLocal.resize(inputVol);
+				dInputPtr = &dInputLocal[0];
+			}
+			nn_downsample_sum_cpu(dUpPtr, dl.inC, upH, upW, dl.strideH, dl.strideW, dInputPtr);
+			if (arena && arena->initialized) {
+				std::memcpy(dCurPtr, &arena->dInput[l][0], inputVol * sizeof(float));
+			} else {
+				dCurLocal = dInputLocal;
+				dCurPtr = &dCurLocal[0];
+			}
+		}
+		else
+		{
+			// Transposed conv backward
+			const unsigned int N = dl.inH * dl.inW;
+			const unsigned int outK = dl.outC * dl.kH * dl.kW;
+
+			// im2col on dCur: gradient of col2im is im2col
+			float* dOutputColsPtr;
+			std::vector<float> dOutputColsLocal;
+			if (arena && arena->initialized) {
+				dOutputColsPtr = &arena->dCols[l][0];
+				std::memset(dOutputColsPtr, 0, static_cast<size_t>(outK) * N * sizeof(float));
+			} else {
+				dOutputColsLocal.assign(static_cast<size_t>(outK) * N, 0.0f);
+				dOutputColsPtr = &dOutputColsLocal[0];
+			}
+			im2col_cpu(dCurPtr, dl.outC, dl.outH, dl.outW,
+			           dl.kH, dl.kW, dl.strideH, dl.strideW, dl.padH, dl.padW,
+			           dl.inH, dl.inW, dOutputColsPtr);
+
+			// Weight gradient: dW[inC, outK] += input_flat[inC, N] * dOutputCols[N, outK]^T
+			sgemm_abt_cpu(layerInput, dOutputColsPtr, &dl.gW[0], dl.inC, N, outK);
+
+			// Input gradient: dinput[inC, N] = W[inC, outK] * dOutputCols[outK, N]
+			{
+				const size_t inputVol = static_cast<size_t>(dl.inC) * N;
+				float* dInputPtr;
+				std::vector<float> dInputLocal;
+				if (arena && arena->initialized) {
+					dInputPtr = &arena->dInput[l][0];
+					std::memset(dInputPtr, 0, inputVol * sizeof(float));
+				} else {
+					dInputLocal.assign(inputVol, 0.0f);
+					dInputPtr = &dInputLocal[0];
+				}
+				sgemm_cpu(&dl.W[0], dOutputColsPtr, dInputPtr, dl.inC, outK, N);
+				if (arena && arena->initialized) {
+					std::memcpy(dCurPtr, &arena->dInput[l][0], inputVol * sizeof(float));
+				} else {
+					dCurLocal = dInputLocal;
+					dCurPtr = &dCurLocal[0];
+				}
+			}
 		}
 	}
 
 	// FC backward: dCur now holds gradient w.r.t. FC output
 	// scratch[1] = FC output (post-activation)
-	std::vector<float> dFC(ds.fcOut, 0.0f);
+	float* dFCBuf;
+	std::vector<float> dFCLocal;
+	if (arena && arena->initialized) {
+		dFCBuf = &arena->dFC[0];
+		std::memset(dFCBuf, 0, ds.fcOut * sizeof(float));
+	} else {
+		dFCLocal.assign(ds.fcOut, 0.0f);
+		dFCBuf = &dFCLocal[0];
+	}
 	for (unsigned int j = 0; j < ds.fcOut; ++j)
 	{
 		const float a = scratch[1][j];
-		dFC[j] = dCur[j] * ((a > 0.0f) ? 1.0f : 0.2f); // LeakyReLU derivative
+		dFCBuf[j] = dCurPtr[j] * ((a > 0.0f) ? 1.0f : 0.2f); // LeakyReLU derivative
 	}
 
 	// FC bias gradient
 	for (unsigned int j = 0; j < ds.fcOut; ++j)
-		ds.fcGBias[j] += dFC[j];
+		ds.fcGBias[j] += dFCBuf[j];
 
 	// FC weight gradient: gW[j*fcIn + i] += dFC[j] * input[i]
 	const std::vector<float>& inputCopy = scratch[0];
 	for (unsigned int j = 0; j < ds.fcOut; ++j)
 	{
-		const float d = dFC[j];
+		const float d = dFCBuf[j];
 		const size_t rowOff = static_cast<size_t>(j) * ds.fcIn;
 		for (unsigned int i = 0; i < ds.fcIn; ++i)
 			ds.fcGW[rowOff + i] += d * inputCopy[i];
@@ -2880,7 +3367,7 @@ void GAN::deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& 
 		{
 			float sum = 0.0f;
 			for (unsigned int j = 0; j < ds.fcOut; ++j)
-				sum += dFC[j] * ds.fcW[static_cast<size_t>(j) * ds.fcIn + i];
+				sum += dFCBuf[j] * ds.fcW[static_cast<size_t>(j) * ds.fcIn + i];
 			(*inputGrad)[i] = sum;
 		}
 	}
@@ -2893,7 +3380,8 @@ void GAN::deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& 
 void GAN::deconvBackward(const NNetwork& net, const std::vector<std::vector<float> >& scratch,
                          const float* outputGrad, unsigned int outputSize,
                          std::vector<float>* inputGrad,
-                         GradientBuffer& gradBuf)
+                         GradientBuffer& gradBuf,
+                         DeconvScratchArena* arena)
 {
 	const NNetwork::TensorDeconvState& ds = net.tensorDeconv;
 	const unsigned int numLayers = static_cast<unsigned int>(ds.layers.size());
@@ -2902,16 +3390,24 @@ void GAN::deconvBackward(const NNetwork& net, const std::vector<std::vector<floa
 	// scratch[0] = original input copy
 	// scratch[1] = FC output (post-activation)
 	// scratch[2..numLayers+1] = deconv layer outputs (post-activation)
+	// scratch[numLayers+2..2*numLayers+1] = BN scratch (invstd + x_hat)
+	const unsigned int numScratch = 2u + numLayers;
 
-	std::vector<float> dCur(outputGrad, outputGrad + outputSize);
+	float* dCurPtr;
+	std::vector<float> dCurLocal;
+	if (arena && arena->initialized) {
+		dCurPtr = &arena->dCur[0];
+		std::memcpy(dCurPtr, outputGrad, outputSize * sizeof(float));
+	} else {
+		dCurLocal.assign(outputGrad, outputGrad + outputSize);
+		dCurPtr = &dCurLocal[0];
+	}
 
 	// Backward through deconv layers (reverse order)
 	for (int li = static_cast<int>(numLayers) - 1; li >= 0; --li)
 	{
 		const unsigned int l = static_cast<unsigned int>(li);
 		const NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
-		const unsigned int N = dl.inH * dl.inW;
-		const unsigned int outK = dl.outC * dl.kH * dl.kW;
 		const unsigned int outVol = dl.outC * dl.outH * dl.outW;
 
 		// Activation derivative
@@ -2919,12 +3415,53 @@ void GAN::deconvBackward(const NNetwork& net, const std::vector<std::vector<floa
 		if (dl.useReLU)
 		{
 			for (size_t i = 0; i < outVol; ++i)
-				dCur[i] = (layerOut[i] > 0.0f) ? dCur[i] : 0.0f;
+				dCurPtr[i] = (layerOut[i] > 0.0f) ? dCurPtr[i] : 0.0f;
 		}
 		else
 		{
+			// Temperature-scaled sigmoid derivative: d/dz sigmoid(z/T) = a*(1-a) / T
+			const float invTemp = 1.0f / config.genOutputTemp;
 			for (size_t i = 0; i < outVol; ++i)
-				dCur[i] *= sigmoidDeriv(layerOut[i]);
+				dCurPtr[i] *= sigmoidDeriv(layerOut[i]) * invTemp;
+		}
+
+		// Batch norm backward
+		if (dl.useBatchNorm)
+		{
+			const unsigned int HW = dl.outH * dl.outW;
+			const float invHW = 1.0f / static_cast<float>(HW);
+			const float* invstdBuf = &scratch[numScratch + l][0];
+			const float* xhatBuf = &scratch[numScratch + l][dl.outC];
+
+			for (unsigned int c = 0; c < dl.outC; ++c)
+			{
+				const size_t chOff = static_cast<size_t>(c) * HW;
+				float dGamma = 0.0f, dBeta = 0.0f;
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					dGamma += dCurPtr[chOff + p] * xhatBuf[chOff + p];
+					dBeta += dCurPtr[chOff + p];
+				}
+				gradBuf.deconvGBnGamma[l][c] += dGamma;
+				gradBuf.deconvGBnBeta[l][c] += dBeta;
+
+				const float invstd = invstdBuf[c];
+				const float gamma = dl.bnGamma[c];
+				float sumDyG = 0.0f, sumDyGXh = 0.0f;
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					const float dyg = dCurPtr[chOff + p] * gamma;
+					sumDyG += dyg;
+					sumDyGXh += dyg * xhatBuf[chOff + p];
+				}
+				const float meanDyG = sumDyG * invHW;
+				const float meanDyGXh = sumDyGXh * invHW;
+				for (unsigned int p = 0; p < HW; ++p)
+				{
+					const float dyg = dCurPtr[chOff + p] * gamma;
+					dCurPtr[chOff + p] = invstd * (dyg - meanDyG - xhatBuf[chOff + p] * meanDyGXh);
+				}
+			}
 		}
 
 		// Bias gradient into GradientBuffer
@@ -2933,47 +3470,163 @@ void GAN::deconvBackward(const NNetwork& net, const std::vector<std::vector<floa
 			float bsum = 0.0f;
 			const size_t chOff = static_cast<size_t>(c) * dl.outH * dl.outW;
 			for (unsigned int p = 0; p < dl.outH * dl.outW; ++p)
-				bsum += dCur[chOff + p];
+				bsum += dCurPtr[chOff + p];
 			gradBuf.deconvGBias[l][c] += bsum;
 		}
 
-		// im2col on dCur: gradient of col2im is im2col
-		std::vector<float> dOutputCols(static_cast<size_t>(outK) * N, 0.0f);
-		im2col_cpu(&dCur[0], dl.outC, dl.outH, dl.outW,
-		           dl.kH, dl.kW, dl.strideH, dl.strideW, dl.padH, dl.padW,
-		           dl.inH, dl.inW, &dOutputCols[0]);
-
-		// Weight gradient into GradientBuffer
+		// Layer input is scratch[1+l]
 		const float* layerInput = &scratch[1u + l][0];
-		sgemm_abt_cpu(layerInput, &dOutputCols[0], &gradBuf.deconvGW[l][0], dl.inC, N, outK);
 
-		// Input gradient: dinput[inC, N] = W[inC, outK] * dOutputCols[outK, N]
+		if (dl.useUpsampleConv)
 		{
-			const size_t inputVol = static_cast<size_t>(dl.inC) * N;
-			std::vector<float> dInput(inputVol, 0.0f);
-			sgemm_cpu(&dl.W[0], &dOutputCols[0], &dInput[0], dl.inC, outK, N);
-			dCur = dInput;
+			// Standard conv backward (upsample+conv path)
+			const unsigned int upH = dl.inH * dl.strideH;
+			const unsigned int upW = dl.inW * dl.strideW;
+			const unsigned int K = dl.inC * dl.kH * dl.kW;
+			const unsigned int N = dl.outH * dl.outW;
+
+			// Recompute forward cols: upsample input, im2col
+			float* upsampledPtr;
+			std::vector<float> upsampledLocal;
+			if (arena && arena->initialized) {
+				upsampledPtr = &arena->upsampled[l][0];
+			} else {
+				upsampledLocal.resize(static_cast<size_t>(dl.inC) * upH * upW);
+				upsampledPtr = &upsampledLocal[0];
+			}
+			nn_upsample_cpu(layerInput, dl.inC, dl.inH, dl.inW, dl.strideH, dl.strideW, upsampledPtr);
+
+			float* colsPtr;
+			std::vector<float> colsLocal;
+			if (arena && arena->initialized) {
+				colsPtr = &arena->cols[l][0];
+			} else {
+				colsLocal.resize(static_cast<size_t>(N) * K);
+				colsPtr = &colsLocal[0];
+			}
+			im2col_cpu(upsampledPtr, dl.inC, upH, upW,
+			           dl.kH, dl.kW, 1u, 1u, dl.padH, dl.padW,
+			           dl.outH, dl.outW, colsPtr);
+
+			// Weight gradient: gW[outC, K] += dCur[outC, N] * cols[N, K]
+			sgemm_cpu(dCurPtr, colsPtr, &gradBuf.deconvGW[l][0], dl.outC, N, K);
+
+			// Input gradient: dCols[N, K] = dCur^T[N, outC] * W[outC, K]
+			float* dColsPtr;
+			std::vector<float> dColsLocal;
+			if (arena && arena->initialized) {
+				dColsPtr = &arena->dCols[l][0];
+				std::memset(dColsPtr, 0, static_cast<size_t>(N) * K * sizeof(float));
+			} else {
+				dColsLocal.assign(static_cast<size_t>(N) * K, 0.0f);
+				dColsPtr = &dColsLocal[0];
+			}
+			sgemm_atb_cpu(dCurPtr, &dl.W[0], dColsPtr, dl.outC, N, K);
+
+			// col2im to get d_upsampled[inC, upH, upW]
+			float* dUpPtr;
+			std::vector<float> dUpLocal;
+			if (arena && arena->initialized) {
+				dUpPtr = &arena->dUp[l][0];
+				std::memset(dUpPtr, 0, static_cast<size_t>(dl.inC) * upH * upW * sizeof(float));
+			} else {
+				dUpLocal.assign(static_cast<size_t>(dl.inC) * upH * upW, 0.0f);
+				dUpPtr = &dUpLocal[0];
+			}
+			col2im_cpu(dColsPtr, dl.inC, upH, upW,
+			           dl.kH, dl.kW, 1u, 1u, dl.padH, dl.padW,
+			           dl.outH, dl.outW, dUpPtr);
+
+			// Downsample to get dInput[inC, inH, inW]
+			const size_t inputVol = static_cast<size_t>(dl.inC) * dl.inH * dl.inW;
+			float* dInputPtr;
+			std::vector<float> dInputLocal;
+			if (arena && arena->initialized) {
+				dInputPtr = &arena->dInput[l][0];
+			} else {
+				dInputLocal.resize(inputVol);
+				dInputPtr = &dInputLocal[0];
+			}
+			nn_downsample_sum_cpu(dUpPtr, dl.inC, upH, upW, dl.strideH, dl.strideW, dInputPtr);
+			if (arena && arena->initialized) {
+				std::memcpy(dCurPtr, &arena->dInput[l][0], inputVol * sizeof(float));
+			} else {
+				dCurLocal = dInputLocal;
+				dCurPtr = &dCurLocal[0];
+			}
+		}
+		else
+		{
+			// Transposed conv backward
+			const unsigned int N = dl.inH * dl.inW;
+			const unsigned int outK = dl.outC * dl.kH * dl.kW;
+
+			// im2col on dCur: gradient of col2im is im2col
+			float* dOutputColsPtr;
+			std::vector<float> dOutputColsLocal;
+			if (arena && arena->initialized) {
+				dOutputColsPtr = &arena->dCols[l][0];
+				std::memset(dOutputColsPtr, 0, static_cast<size_t>(outK) * N * sizeof(float));
+			} else {
+				dOutputColsLocal.assign(static_cast<size_t>(outK) * N, 0.0f);
+				dOutputColsPtr = &dOutputColsLocal[0];
+			}
+			im2col_cpu(dCurPtr, dl.outC, dl.outH, dl.outW,
+			           dl.kH, dl.kW, dl.strideH, dl.strideW, dl.padH, dl.padW,
+			           dl.inH, dl.inW, dOutputColsPtr);
+
+			// Weight gradient into GradientBuffer
+			sgemm_abt_cpu(layerInput, dOutputColsPtr, &gradBuf.deconvGW[l][0], dl.inC, N, outK);
+
+			// Input gradient: dinput[inC, N] = W[inC, outK] * dOutputCols[outK, N]
+			{
+				const size_t inputVol = static_cast<size_t>(dl.inC) * N;
+				float* dInputPtr;
+				std::vector<float> dInputLocal;
+				if (arena && arena->initialized) {
+					dInputPtr = &arena->dInput[l][0];
+					std::memset(dInputPtr, 0, inputVol * sizeof(float));
+				} else {
+					dInputLocal.assign(inputVol, 0.0f);
+					dInputPtr = &dInputLocal[0];
+				}
+				sgemm_cpu(&dl.W[0], dOutputColsPtr, dInputPtr, dl.inC, outK, N);
+				if (arena && arena->initialized) {
+					std::memcpy(dCurPtr, &arena->dInput[l][0], inputVol * sizeof(float));
+				} else {
+					dCurLocal = dInputLocal;
+					dCurPtr = &dCurLocal[0];
+				}
+			}
 		}
 	}
 
 	// FC backward: dCur now holds gradient w.r.t. FC output
 	// scratch[1] = FC output (post-activation)
-	std::vector<float> dFC(ds.fcOut, 0.0f);
+	float* dFCBuf;
+	std::vector<float> dFCLocal;
+	if (arena && arena->initialized) {
+		dFCBuf = &arena->dFC[0];
+		std::memset(dFCBuf, 0, ds.fcOut * sizeof(float));
+	} else {
+		dFCLocal.assign(ds.fcOut, 0.0f);
+		dFCBuf = &dFCLocal[0];
+	}
 	for (unsigned int j = 0; j < ds.fcOut; ++j)
 	{
 		const float a = scratch[1][j];
-		dFC[j] = dCur[j] * ((a > 0.0f) ? 1.0f : 0.2f); // LeakyReLU derivative
+		dFCBuf[j] = dCurPtr[j] * ((a > 0.0f) ? 1.0f : 0.2f); // LeakyReLU derivative
 	}
 
 	// FC bias gradient into GradientBuffer
 	for (unsigned int j = 0; j < ds.fcOut; ++j)
-		gradBuf.deconvFcGBias[j] += dFC[j];
+		gradBuf.deconvFcGBias[j] += dFCBuf[j];
 
 	// FC weight gradient into GradientBuffer
 	const std::vector<float>& inputCopy = scratch[0];
 	for (unsigned int j = 0; j < ds.fcOut; ++j)
 	{
-		const float d = dFC[j];
+		const float d = dFCBuf[j];
 		const size_t rowOff = static_cast<size_t>(j) * ds.fcIn;
 		for (unsigned int i = 0; i < ds.fcIn; ++i)
 			gradBuf.deconvFcGW[rowOff + i] += d * inputCopy[i];
@@ -2987,7 +3640,7 @@ void GAN::deconvBackward(const NNetwork& net, const std::vector<std::vector<floa
 		{
 			float sum = 0.0f;
 			for (unsigned int j = 0; j < ds.fcOut; ++j)
-				sum += dFC[j] * ds.fcW[static_cast<size_t>(j) * ds.fcIn + i];
+				sum += dFCBuf[j] * ds.fcW[static_cast<size_t>(j) * ds.fcIn + i];
 			(*inputGrad)[i] = sum;
 		}
 	}
@@ -3003,6 +3656,8 @@ void GAN::deconvUpdate(NNetwork& net, float lr)
 	const float bc1 = 1.0f - powf(beta1, static_cast<float>(ds.optimizerStep));
 	const float bc2 = 1.0f - powf(beta2, static_cast<float>(ds.optimizerStep));
 
+	const float wd = config.weightDecay;
+
 	// FC projection
 	for (size_t i = 0; i < ds.fcW.size(); ++i)
 	{
@@ -3011,7 +3666,7 @@ void GAN::deconvUpdate(NNetwork& net, float lr)
 		ds.fcV2W[i] = beta2 * ds.fcV2W[i] + (1.0f - beta2) * g * g;
 		const float mHat = ds.fcVW[i] / bc1;
 		const float vHat = ds.fcV2W[i] / bc2;
-		ds.fcW[i] -= lr * mHat / (sqrtf(vHat) + eps);
+		ds.fcW[i] -= lr * (mHat / (sqrtf(vHat) + eps) + wd * ds.fcW[i]);
 		ds.fcGW[i] = 0.0f;
 	}
 	for (unsigned int j = 0; j < ds.fcOut; ++j)
@@ -3036,7 +3691,7 @@ void GAN::deconvUpdate(NNetwork& net, float lr)
 			dl.v2W[i] = beta2 * dl.v2W[i] + (1.0f - beta2) * g * g;
 			const float mHat = dl.vW[i] / bc1;
 			const float vHat = dl.v2W[i] / bc2;
-			dl.W[i] -= lr * mHat / (sqrtf(vHat) + eps);
+			dl.W[i] -= lr * (mHat / (sqrtf(vHat) + eps) + wd * dl.W[i]);
 			dl.gW[i] = 0.0f;
 		}
 		for (unsigned int c = 0; c < dl.outC; ++c)
@@ -3048,6 +3703,30 @@ void GAN::deconvUpdate(NNetwork& net, float lr)
 			const float vHat = dl.v2Bias[c] / bc2;
 			dl.bias[c] -= lr * mHat / (sqrtf(vHat) + eps);
 			dl.gBias[c] = 0.0f;
+		}
+		if (dl.useBatchNorm)
+		{
+			for (unsigned int c = 0; c < dl.outC; ++c)
+			{
+				{
+					const float g = dl.gBnGamma[c];
+					dl.vBnGamma[c] = beta1 * dl.vBnGamma[c] + (1.0f - beta1) * g;
+					dl.v2BnGamma[c] = beta2 * dl.v2BnGamma[c] + (1.0f - beta2) * g * g;
+					const float mHat = dl.vBnGamma[c] / bc1;
+					const float vHat = dl.v2BnGamma[c] / bc2;
+					dl.bnGamma[c] -= lr * mHat / (sqrtf(vHat) + eps);
+					dl.gBnGamma[c] = 0.0f;
+				}
+				{
+					const float g = dl.gBnBeta[c];
+					dl.vBnBeta[c] = beta1 * dl.vBnBeta[c] + (1.0f - beta1) * g;
+					dl.v2BnBeta[c] = beta2 * dl.v2BnBeta[c] + (1.0f - beta2) * g * g;
+					const float mHat = dl.vBnBeta[c] / bc1;
+					const float vHat = dl.v2BnBeta[c] / bc2;
+					dl.bnBeta[c] -= lr * mHat / (sqrtf(vHat) + eps);
+					dl.gBnBeta[c] = 0.0f;
+				}
+			}
 		}
 	}
 }
@@ -3064,6 +3743,11 @@ void GAN::zeroDeconvGrads(NNetwork& net)
 		NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
 		std::memset(&dl.gW[0], 0, dl.gW.size() * sizeof(float));
 		std::memset(&dl.gBias[0], 0, dl.gBias.size() * sizeof(float));
+		if (dl.useBatchNorm)
+		{
+			std::memset(&dl.gBnGamma[0], 0, dl.gBnGamma.size() * sizeof(float));
+			std::memset(&dl.gBnBeta[0], 0, dl.gBnBeta.size() * sizeof(float));
+		}
 	}
 }
 
@@ -3278,6 +3962,100 @@ NNetworkStatus GAN::train(const DataInput* domainA, const DataInput* domainB, IG
 }
 
 // ============================================================
+// Parallel layer-wise gradient reduction
+// ============================================================
+
+void GAN::layerReduceBody(void* userData, unsigned int begin, unsigned int end)
+{
+	LayerReduceData& d = *static_cast<LayerReduceData*>(userData);
+
+	for (unsigned int layerIdx = begin; layerIdx < end; ++layerIdx)
+	{
+		if (d.isGen)
+		{
+			// Deconv generator reduction
+			NNetwork::TensorDeconvState& dc = d.net->tensorDeconv;
+			if (layerIdx == 0u)
+			{
+				// FC layer
+				std::memset(&dc.fcGW[0], 0, dc.fcGW.size() * sizeof(float));
+				std::memset(&dc.fcGBias[0], 0, dc.fcOut * sizeof(float));
+				for (unsigned int tid = 0; tid < d.nThreads; ++tid)
+				{
+					const GradientBuffer& g = d.ctxs[tid].genGrads;
+					for (size_t i = 0; i < dc.fcGW.size(); ++i)
+						dc.fcGW[i] += g.deconvFcGW[i];
+					for (size_t i = 0; i < dc.fcOut; ++i)
+						dc.fcGBias[i] += g.deconvFcGBias[i];
+				}
+			}
+			else
+			{
+				const unsigned int l = layerIdx - 1u;
+				NNetwork::TensorDeconvState::DeconvLayer& dl = dc.layers[l];
+				std::memset(&dl.gW[0], 0, dl.gW.size() * sizeof(float));
+				std::memset(&dl.gBias[0], 0, dl.outC * sizeof(float));
+				if (dl.useBatchNorm)
+				{
+					std::memset(&dl.gBnGamma[0], 0, dl.outC * sizeof(float));
+					std::memset(&dl.gBnBeta[0], 0, dl.outC * sizeof(float));
+				}
+				for (unsigned int tid = 0; tid < d.nThreads; ++tid)
+				{
+					const GradientBuffer& g = d.ctxs[tid].genGrads;
+					for (size_t i = 0; i < dl.gW.size(); ++i)
+						dl.gW[i] += g.deconvGW[l][i];
+					for (size_t i = 0; i < dl.outC; ++i)
+						dl.gBias[i] += g.deconvGBias[l][i];
+					if (dl.useBatchNorm)
+					{
+						for (size_t i = 0; i < dl.outC; ++i)
+							dl.gBnGamma[i] += g.deconvGBnGamma[l][i];
+						for (size_t i = 0; i < dl.outC; ++i)
+							dl.gBnBeta[i] += g.deconvGBnBeta[l][i];
+					}
+				}
+			}
+		}
+		else
+		{
+			// CNN discriminator reduction
+			NNetwork::TensorCNNState& cnn = d.net->tensorCnn;
+			const unsigned int nConv = static_cast<unsigned int>(cnn.convLayers.size());
+			if (layerIdx < nConv)
+			{
+				NNetwork::TensorCNNState::ConvLayer& cl = cnn.convLayers[layerIdx];
+				std::memset(&cl.gW[0], 0, cl.gW.size() * sizeof(float));
+				std::memset(&cl.gBias[0], 0, cl.outC * sizeof(float));
+				for (unsigned int tid = 0; tid < d.nThreads; ++tid)
+				{
+					const GradientBuffer& g = d.ctxs[tid].discGrads;
+					for (size_t i = 0; i < cl.gW.size(); ++i)
+						cl.gW[i] += g.convGW[layerIdx][i];
+					for (size_t i = 0; i < cl.outC; ++i)
+						cl.gBias[i] += g.convGBias[layerIdx][i];
+				}
+			}
+			else
+			{
+				const unsigned int fcIdx = layerIdx - nConv;
+				NNetwork::TensorCNNState::FCTransition& fc = cnn.fcLayers[fcIdx];
+				std::memset(&fc.gW[0], 0, fc.gW.size() * sizeof(float));
+				std::memset(&fc.gBias[0], 0, fc.out * sizeof(float));
+				for (unsigned int tid = 0; tid < d.nThreads; ++tid)
+				{
+					const GradientBuffer& g = d.ctxs[tid].discGrads;
+					for (size_t i = 0; i < fc.gW.size(); ++i)
+						fc.gW[i] += g.fcGW[fcIdx][i];
+					for (size_t i = 0; i < fc.out; ++i)
+						fc.gBias[i] += g.fcGBias[fcIdx][i];
+				}
+			}
+		}
+	}
+}
+
+// ============================================================
 // Parallel discriminator critic callback
 // ============================================================
 
@@ -3295,14 +4073,18 @@ void GAN::discCritBody(void* userData, unsigned int begin, unsigned int end)
 		// Build genInput from pre-generated noise + codes
 		std::memcpy(&ctx.genInput[0], &d.noise[s][0], self.config.noiseDim * sizeof(float));
 		if (d.numCat > 0u)
-			std::memcpy(&ctx.genInput[self.config.noiseDim], &d.catCodes[s][0], d.numCat * sizeof(float));
+		{
+			for (unsigned int c = 0; c < d.numCat; ++c)
+				ctx.genInput[self.config.noiseDim + c] = d.catCodes[s][c] * d.catScale;
+		}
 		if (d.numCont > 0u)
 			std::memcpy(&ctx.genInput[self.config.noiseDim + d.numCat], &d.contCodes[s][0], d.numCont * sizeof(float));
 
 		// Generator forward
 		if (d.genIsDeconv)
 		{
-			self.deconvForward(self.generator, &ctx.genInput[0], d.genInputDim, ctx.deconvOut, &ctx.deconvScratch);
+			self.deconvForward(self.generator, &ctx.genInput[0], d.genInputDim, ctx.deconvOut, &ctx.deconvScratch, tid * 1000003u + s * 7u + 1u,
+			                   &ctx.deconvArena);
 		}
 		else if (d.hasStyle)
 		{
@@ -3342,9 +4124,16 @@ void GAN::discCritBody(void* userData, unsigned int begin, unsigned int end)
 		}
 		else
 		{
-			self.cnnForward(self.discriminator, &fake[0], ctx.cnnOutFake, discSig);
+			if (d.hasInfo)
+				self.cnnForward(self.discriminator, &fake[0], ctx.cnnOutFake, discSig, &ctx.cnnFcActFake);
+			else
+				self.cnnForward(self.discriminator, &fake[0], ctx.cnnOutFake, discSig);
 			predFake = ctx.cnnOutFake[0];
 		}
+
+		// Track raw discriminator outputs for health monitoring
+		ctx.dOutRealSum += predReal;
+		ctx.dOutFakeSum += predFake;
 
 		// Adversarial loss + backward (using GradientBuffer overloads)
 		if (self.config.lossType == GANConfig::GAN_VANILLA)
@@ -3407,7 +4196,7 @@ void GAN::discCritBody(void* userData, unsigned int begin, unsigned int end)
 				self.cnnBackward(self.discriminator, realRow, &dLdReal, 1u, NULL, ctx.discGrads, NULL, false);
 				self.cnnBackward(self.discriminator, &fake[0], &dLdFake, 1u, NULL, ctx.discGrads, NULL, false);
 			}
-			// Zero the discard buffer before GP
+			// Gradient penalty (monitoring only; Lipschitz enforced via spectral norm)
 			ctx.discardDiscGrads.zero();
 			float gp = self.computeGradientPenalty(self.discriminator, realRow, &fake[0],
 			                                       d.dataDim, d.gpEps[s],
@@ -3418,20 +4207,18 @@ void GAN::discCritBody(void* userData, unsigned int begin, unsigned int end)
 		// InfoGAN: Q-head on disc penultimate layer
 		if (d.hasInfo)
 		{
-			std::vector<float> penultAct;
+			std::vector<float>& penultAct = ctx.penultActBuf;
 			if (self.config.archType == GANConfig::GAN_DFF)
 			{
 				const unsigned int numDiscLayers = static_cast<unsigned int>(self.discriminator.tensorDff.sizes.size());
-				penultAct = ctx.discActFake[numDiscLayers - 2u];
+				std::memcpy(&penultAct[0], &ctx.discActFake[numDiscLayers - 2u][0], d.penultDim * sizeof(float));
 			}
 			else
 			{
-				// CNN: re-forward to get FC activations
-				std::vector<float> discOutTmp;
-				std::vector<std::vector<float> > cnnFcAct;
-				self.cnnForward(self.discriminator, &fake[0], discOutTmp, discSig, &cnnFcAct);
-				const unsigned int numCnnFC = static_cast<unsigned int>(cnnFcAct.size());
-				penultAct = (numCnnFC >= 2u) ? cnnFcAct[numCnnFC - 2u] : cnnFcAct[0];
+				// CNN: use cached FC activations from disc forward
+				const unsigned int numCnnFC = static_cast<unsigned int>(ctx.cnnFcActFake.size());
+				const std::vector<float>& src = (numCnnFC >= 2u) ? ctx.cnnFcActFake[numCnnFC - 2u] : ctx.cnnFcActFake[0];
+				std::memcpy(&penultAct[0], &src[0], d.penultDim * sizeof(float));
 			}
 
 			self.qHeadForward(self.qHead, &penultAct[0], d.penultDim, ctx.qOut);
@@ -3465,7 +4252,7 @@ void GAN::discCritBody(void* userData, unsigned int begin, unsigned int end)
 					const NNInfo* skel = self.discriminator.skeleton;
 					ctx.qDelta.resize(numDiscLayers);
 					for (unsigned int li = 0; li < numDiscLayers; ++li)
-						ctx.qDelta[li].assign(dff.sizes[li], 0.0f);
+						std::memset(&ctx.qDelta[li][0], 0, ctx.qDelta[li].size() * sizeof(float));
 					for (unsigned int i = 0; i < d.penultDim && i < ctx.sharedGrad.size(); ++i)
 					{
 						if (numDiscLayers >= 3u)
@@ -3534,14 +4321,18 @@ void GAN::genTrainBody(void* userData, unsigned int begin, unsigned int end)
 		// Build genInput from pre-generated noise + codes
 		std::memcpy(&ctx.genInput[0], &d.noise[s][0], self.config.noiseDim * sizeof(float));
 		if (d.numCat > 0u)
-			std::memcpy(&ctx.genInput[self.config.noiseDim], &d.catCodes[s][0], d.numCat * sizeof(float));
+		{
+			for (unsigned int c = 0; c < d.numCat; ++c)
+				ctx.genInput[self.config.noiseDim + c] = d.catCodes[s][c] * d.catScale;
+		}
 		if (d.numCont > 0u)
 			std::memcpy(&ctx.genInput[self.config.noiseDim + d.numCat], &d.contCodes[s][0], d.numCont * sizeof(float));
 
 		// Generator forward
 		if (d.genIsDeconv)
 		{
-			self.deconvForward(self.generator, &ctx.genInput[0], d.genInputDim, ctx.deconvOut, &ctx.deconvScratch);
+			self.deconvForward(self.generator, &ctx.genInput[0], d.genInputDim, ctx.deconvOut, &ctx.deconvScratch, tid * 1000003u + s * 7u + 1u,
+			                   &ctx.deconvArena);
 		}
 		else if (d.hasStyle)
 		{
@@ -3569,7 +4360,10 @@ void GAN::genTrainBody(void* userData, unsigned int begin, unsigned int end)
 		}
 		else
 		{
-			self.cnnForward(self.discriminator, &fake[0], ctx.cnnOutFake, discSig);
+			if (d.hasInfo)
+				self.cnnForward(self.discriminator, &fake[0], ctx.cnnOutFake, discSig, &ctx.cnnFcActFake);
+			else
+				self.cnnForward(self.discriminator, &fake[0], ctx.cnnOutFake, discSig);
 			predFake = ctx.cnnOutFake[0];
 		}
 
@@ -3607,33 +4401,45 @@ void GAN::genTrainBody(void* userData, unsigned int begin, unsigned int end)
 			                 ctx.discardDiscGrads, NULL, false);
 		}
 
-		// InfoGAN: Q-head contribution to dFake
+		// InfoGAN: Q-head on discriminator features (proper InfoGAN architecture)
+		// Routes info gradient through disc -> Q -> back through disc -> dFake
 		if (d.hasInfo)
 		{
-			std::vector<float> penultAct;
+			// Get penultimate discriminator activations (already computed from disc forward above)
+			std::vector<float>& penultAct = ctx.penultActBuf;
 			if (self.config.archType == GANConfig::GAN_DFF)
 			{
 				const unsigned int numDiscLayers = static_cast<unsigned int>(self.discriminator.tensorDff.sizes.size());
-				penultAct = ctx.discActFake[numDiscLayers - 2u];
+				std::memcpy(&penultAct[0], &ctx.discActFake[numDiscLayers - 2u][0], d.penultDim * sizeof(float));
 			}
 			else
 			{
-				std::vector<float> discOutTmp;
-				std::vector<std::vector<float> > cnnFcAct;
-				self.cnnForward(self.discriminator, &fake[0], discOutTmp, discSig, &cnnFcAct);
-				const unsigned int numCnnFC = static_cast<unsigned int>(cnnFcAct.size());
-				penultAct = (numCnnFC >= 2u) ? cnnFcAct[numCnnFC - 2u] : cnnFcAct[0];
+				// CNN: use cached FC activations from disc forward
+				const unsigned int numCnnFC = static_cast<unsigned int>(ctx.cnnFcActFake.size());
+				const std::vector<float>& src = (numCnnFC >= 2u) ? ctx.cnnFcActFake[numCnnFC - 2u] : ctx.cnnFcActFake[0];
+				std::memcpy(&penultAct[0], &src[0], d.penultDim * sizeof(float));
 			}
 
+			// Forward through disc-side Q-head
 			self.qHeadForward(self.qHead, &penultAct[0], d.penultDim, ctx.qOut);
 			float miLoss = self.computeInfoLoss(ctx.qOut, d.catCodes[s], d.contCodes[s], ctx.qGrad);
 			ctx.infoLoss += miLoss;
 			for (unsigned int i = 0; i < ctx.qGrad.size(); ++i) ctx.qGrad[i] *= d.infoLambda;
-			self.qHeadBackward(self.qHead, &penultAct[0], &ctx.qGrad[0], ctx.sharedGrad, ctx.qGrads);
 
+			// Q-head backward: compute gradient on penultimate activations only
+			// (no Q-head weight accumulation — Q is updated during disc training)
+			ctx.sharedGrad.assign(self.qHead.sharedDim, 0.0f);
+			for (unsigned int j = 0; j < self.qHead.qOutDim; ++j)
+			{
+				const float dj = ctx.qGrad[j];
+				const size_t rowOff = static_cast<size_t>(j) * self.qHead.sharedDim;
+				for (unsigned int i = 0; i < self.qHead.sharedDim; ++i)
+					ctx.sharedGrad[i] += dj * self.qHead.W[rowOff + i];
+			}
+
+			// Backprop Q gradient through discriminator to get dFake (discard disc grads)
 			if (self.config.archType == GANConfig::GAN_DFF)
 			{
-				// Backprop Q gradient through disc to input
 				const unsigned int numDiscLayers = static_cast<unsigned int>(self.discriminator.tensorDff.sizes.size());
 				const unsigned int lastT = static_cast<unsigned int>(self.discriminator.tensorDff.T.size());
 				if (lastT >= 1u)
@@ -3642,7 +4448,9 @@ void GAN::genTrainBody(void* userData, unsigned int begin, unsigned int end)
 					const NNInfo* skel = self.discriminator.skeleton;
 					ctx.qDelta.resize(numDiscLayers);
 					for (unsigned int li = 0; li < numDiscLayers; ++li)
-						ctx.qDelta[li].assign(dff.sizes[li], 0.0f);
+						std::memset(&ctx.qDelta[li][0], 0, ctx.qDelta[li].size() * sizeof(float));
+
+					// Penultimate layer: apply activation derivative
 					for (unsigned int i = 0; i < d.penultDim && i < ctx.sharedGrad.size(); ++i)
 					{
 						if (numDiscLayers >= 3u)
@@ -3655,7 +4463,9 @@ void GAN::genTrainBody(void* userData, unsigned int begin, unsigned int end)
 						else
 							ctx.qDelta[numDiscLayers - 2u][i] = ctx.sharedGrad[i];
 					}
-					for (int li = static_cast<int>(numDiscLayers) - 3; li >= 0; --li)
+
+					// Backward through hidden layers (no parameter gradient accumulation)
+					for (int li = static_cast<int>(numDiscLayers) - 3; li >= 1; --li)
 					{
 						const unsigned int l = static_cast<unsigned int>(li);
 						const NNetwork::TensorDFFState::Transition& nextTr = dff.T[l];
@@ -3664,37 +4474,67 @@ void GAN::genTrainBody(void* userData, unsigned int begin, unsigned int end)
 							float sum = 0.0f;
 							for (unsigned int j = 0; j < nextTr.out; ++j)
 								sum += ctx.qDelta[l + 1u][j] * nextTr.W[static_cast<size_t>(j) * nextTr.in + i];
-							if (l == 0u) ctx.qDelta[0][i] = sum;
-							else
-							{
-								const int actFx = skel->getActivationType(l - 1u);
-								const float actParam = skel->getActivationParam(l - 1u);
-								ctx.qDelta[l][i] = sum * GMath::activationErrDer(ctx.discActFake[l][i], actFx, actParam);
-							}
+							const int actFx = skel->getActivationType(l - 1u);
+							const float actParam = skel->getActivationParam(l - 1u);
+							ctx.qDelta[l][i] = sum * GMath::activationErrDer(ctx.discActFake[l][i], actFx, actParam);
 						}
 					}
-					for (unsigned int i = 0; i < d.dataDim && i < ctx.qDelta[0].size(); ++i)
-						ctx.dFake[i] += ctx.qDelta[0][i];
+
+					// Input gradient: add Q-path contribution to dFake
+					const NNetwork::TensorDFFState::Transition& tr0 = dff.T[0];
+					for (unsigned int i = 0; i < tr0.in && i < d.dataDim; ++i)
+					{
+						float sum = 0.0f;
+						for (unsigned int j = 0; j < tr0.out; ++j)
+							sum += ctx.qDelta[1][j] * tr0.W[static_cast<size_t>(j) * tr0.in + i];
+						ctx.dFake[i] += sum;
+					}
 				}
 			}
 			else
 			{
-				// CNN: backprop Q gradient through disc to get input gradient
-				std::vector<float> qInputGrad;
+				// CNN: backprop Q gradient through disc, capture input gradient
+				std::vector<float>& qInfoDFake = ctx.qInfoDFakeBuf;
 				float zeroGrad = 0.0f;
-				ctx.discardDiscGrads.zero();
-				self.cnnBackward(self.discriminator, &fake[0], &zeroGrad, 1u, &qInputGrad,
-				                 ctx.discardDiscGrads, &ctx.sharedGrad);
-				for (unsigned int i = 0; i < d.dataDim && i < qInputGrad.size(); ++i)
-					ctx.dFake[i] += qInputGrad[i];
+				self.cnnBackward(self.discriminator, &fake[0], &zeroGrad, 1u, &qInfoDFake,
+				                 ctx.discardDiscGrads, &ctx.sharedGrad, false);
+				for (unsigned int i = 0; i < d.dataDim && i < qInfoDFake.size(); ++i)
+					ctx.dFake[i] += qInfoDFake[i];
 			}
+		}
+
+		// Mode-seeking diversity loss: penalise identical outputs for different noise vectors.
+		// Compare current fake to previous sample from this thread (no extra forward pass).
+		if (d.divLambda > 0.0f && s > begin && !ctx.prevFake.empty())
+		{
+			float dOut = 0.0f, dIn = 0.0f;
+			for (unsigned int i = 0; i < d.dataDim; ++i)
+				dOut += fabsf(fake[i] - ctx.prevFake[i]);
+			for (unsigned int i = 0; i < self.config.noiseDim; ++i)
+				dIn += fabsf(d.noise[s][i] - d.noise[s - 1u][i]);
+			const float invDIn = 1.0f / (dIn + 1e-6f);
+			ctx.divLoss += -dOut * invDIn;
+
+			// Gradient w.r.t. fake: push away from prevFake
+			const float scale = d.divLambda * invDIn;
+			for (unsigned int i = 0; i < d.dataDim; ++i)
+			{
+				const float diff = fake[i] - ctx.prevFake[i];
+				const float sgn = (diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f);
+				ctx.dFake[i] -= sgn * scale;
+			}
+		}
+		if (d.divLambda > 0.0f)
+		{
+			ctx.prevFake.resize(d.dataDim);
+			std::memcpy(&ctx.prevFake[0], &fake[0], d.dataDim * sizeof(float));
 		}
 
 		// Generator backward
 		if (d.genIsDeconv)
 		{
 			self.deconvBackward(self.generator, ctx.deconvScratch, &ctx.dFake[0], d.dataDim, NULL,
-			                    ctx.genGrads);
+			                    ctx.genGrads, &ctx.deconvArena);
 		}
 		else if (d.hasStyle)
 		{
@@ -3776,7 +4616,7 @@ void GAN::cycleDiscBody(void* userData, unsigned int begin, unsigned int end)
 		// Generator forward to produce fake in target domain
 		if (d.genIsDeconv)
 		{
-			self.deconvForward(gen, &genInputBuf[0], d.genInputDim, deconvOutBuf, &deconvScrBuf);
+			self.deconvForward(gen, &genInputBuf[0], d.genInputDim, deconvOutBuf, &deconvScrBuf, tid * 1000003u + s * 7u + 1u);
 		}
 		else if (d.hasStyle)
 		{
@@ -3881,7 +4721,7 @@ void GAN::cycleDiscBody(void* userData, unsigned int begin, unsigned int end)
 				self.cnnBackward(disc, tgtRow, &dLdReal, 1u, NULL, discGradBuf, NULL, false);
 				self.cnnBackward(disc, &fake[0], &dLdFake, 1u, NULL, discGradBuf, NULL, false);
 			}
-			// Gradient penalty
+			// Gradient penalty (monitoring only; Lipschitz enforced via spectral norm)
 			discardBuf.zero();
 			float gp = self.computeGradientPenalty(disc, tgtRow, &fake[0],
 			                                       d.tgtDim, d.gpEps[s],
@@ -4019,8 +4859,8 @@ void GAN::cycleGenBody(void* userData, unsigned int begin, unsigned int end)
 		// Forward passes for fakeB and fakeA
 		if (d.genIsDeconv)
 		{
-			self.deconvForward(self.generator, &ctx.genInput[0], d.genABInputDim, ctx.deconvOut, &ctx.deconvScratch);
-			self.deconvForward(self.generatorBA, &ctx.genBAInput[0], d.genBAInputDim, ctx.deconvOutBA, &ctx.deconvScratchBA);
+			self.deconvForward(self.generator, &ctx.genInput[0], d.genABInputDim, ctx.deconvOut, &ctx.deconvScratch, tid * 1000003u + s * 7u + 1u);
+			self.deconvForward(self.generatorBA, &ctx.genBAInput[0], d.genBAInputDim, ctx.deconvOutBA, &ctx.deconvScratchBA, tid * 1000003u + s * 7u + 2u);
 		}
 		else if (d.hasStyle)
 		{
@@ -4061,8 +4901,8 @@ void GAN::cycleGenBody(void* userData, unsigned int begin, unsigned int end)
 
 		if (d.genIsDeconv)
 		{
-			self.deconvForward(self.generatorBA, &recAInput[0], d.genBAInputDim, ctx.deconvOutRecA, &ctx.deconvScratchRecA);
-			self.deconvForward(self.generator, &recBInput[0], d.genABInputDim, ctx.deconvOutRecB, &ctx.deconvScratchRecB);
+			self.deconvForward(self.generatorBA, &recAInput[0], d.genBAInputDim, ctx.deconvOutRecA, &ctx.deconvScratchRecA, tid * 1000003u + s * 7u + 3u);
+			self.deconvForward(self.generator, &recBInput[0], d.genABInputDim, ctx.deconvOutRecB, &ctx.deconvScratchRecB, tid * 1000003u + s * 7u + 4u);
 		}
 		else if (d.hasStyle)
 		{
@@ -4105,8 +4945,8 @@ void GAN::cycleGenBody(void* userData, unsigned int begin, unsigned int end)
 
 		if (d.genIsDeconv)
 		{
-			self.deconvForward(self.generator, &identBInput[0], d.genABInputDim, ctx.deconvOutIdentB, &ctx.deconvScratchIdentB);
-			self.deconvForward(self.generatorBA, &identAInput[0], d.genBAInputDim, ctx.deconvOutIdentA, &ctx.deconvScratchIdentA);
+			self.deconvForward(self.generator, &identBInput[0], d.genABInputDim, ctx.deconvOutIdentB, &ctx.deconvScratchIdentB, tid * 1000003u + s * 7u + 5u);
+			self.deconvForward(self.generatorBA, &identAInput[0], d.genBAInputDim, ctx.deconvOutIdentA, &ctx.deconvScratchIdentA, tid * 1000003u + s * 7u + 6u);
 		}
 		else if (d.hasStyle)
 		{
@@ -4643,6 +5483,7 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 			penultDim = (numCnnFC >= 2u) ? discriminator.tensorCnn.fcLayers[numCnnFC - 2u].out : discriminator.tensorCnn.flattenedSize;
 		}
 		initQHead(penultDim, qHead, qAdamState);
+		// genQHead no longer used — info gradient flows through disc-side qHead
 	}
 
 	const int batchSize = (config.batchSize > 0) ? config.batchSize : static_cast<int>(trainSize);
@@ -4681,7 +5522,10 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 	{
 		threadCtx[tid].genInput.resize(genInputDim, 0.0f);
 		if (genIsDeconv)
+		{
 			threadCtx[tid].genGrads.initFromDeconv(generator);
+			threadCtx[tid].deconvArena.initFromDeconv(generator);
+		}
 		else
 			threadCtx[tid].genGrads.initFromDFF(generator);
 		if (config.archType == GANConfig::GAN_DFF)
@@ -4689,7 +5533,15 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 		else
 			threadCtx[tid].discGrads.initFromCNN(discriminator);
 		if (hasInfo)
+		{
 			threadCtx[tid].qGrads.initFromQHead(qHead.sharedDim, qHead.qOutDim);
+			threadCtx[tid].genGrads.initFromGenQHead(genQHead.sharedDim, genQHead.qOutDim, genQHead.hiddenDim);
+			threadCtx[tid].genQHiddenPre.assign(genQHead.hiddenDim, 0.0f);
+			threadCtx[tid].genQHiddenPost.assign(genQHead.hiddenDim, 0.0f);
+			threadCtx[tid].genQDHidden.assign(genQHead.hiddenDim, 0.0f);
+			threadCtx[tid].penultActBuf.resize(penultDim, 0.0f);
+			threadCtx[tid].qInfoDFakeBuf.resize(dataDim, 0.0f);
+		}
 		if (hasStyle)
 		{
 			threadCtx[tid].mappingGrads.initFromDFF(mappingNet);
@@ -4760,6 +5612,10 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 		float epochGLoss = 0.0f;
 		float epochWasserstein = 0.0f;
 		float epochInfoLoss = 0.0f;
+		float epochDivLoss = 0.0f;
+		float epochDOutReal = 0.0f;
+		float epochDOutFake = 0.0f;
+		float epochGenGradNorm = 0.0f;
 		unsigned int epochCatCorrect = 0u;
 		unsigned int epochCatTotal = 0u;
 		unsigned int epochSamples = 0u;
@@ -4833,42 +5689,87 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 				dcd.hasStyle = hasStyle;
 				dcd.genIsDeconv = genIsDeconv;
 				dcd.infoLambda = infoLambda;
+				dcd.catScale = config.infoConfig.catScale;
 				dcd.penultDim = penultDim;
 				dcd.beginToTid = &beginToTid[0];
 				ThreadPool::instance().parallel_for(curBatchSize, discCritBody, &dcd);
 
 				// --- Phase 4: Ordered reduction (sum thread-local grads into network) ---
-				// Zero master network grads
-				if (config.archType == GANConfig::GAN_DFF)
-					zeroDFFGrads(discriminator);
-				else
-					zeroCNNGrads(discriminator);
-				if (hasInfo)
+				if (config.deterministicReduce)
 				{
-					std::memset(&qHead.gW[0], 0, qHead.gW.size() * sizeof(float));
-					std::memset(&qHead.gBias[0], 0, qHead.gBias.size() * sizeof(float));
-				}
-
-				// Sum thread-local grads into master (in order for determinism)
-				for (unsigned int tid = 0; tid < nThreads; ++tid)
-				{
+					// Zero master network grads
 					if (config.archType == GANConfig::GAN_DFF)
-						threadCtx[tid].discGrads.addToDFF(discriminator);
+						zeroDFFGrads(discriminator);
 					else
-						threadCtx[tid].discGrads.addToCNN(discriminator);
+						zeroCNNGrads(discriminator);
 					if (hasInfo)
 					{
-						for (size_t i = 0; i < qHead.gW.size(); ++i)
-							qHead.gW[i] += threadCtx[tid].qGrads.qGW[i];
-						for (size_t j = 0; j < qHead.gBias.size(); ++j)
-							qHead.gBias[j] += threadCtx[tid].qGrads.qGBias[j];
+						std::memset(&qHead.gW[0], 0, qHead.gW.size() * sizeof(float));
+						std::memset(&qHead.gBias[0], 0, qHead.gBias.size() * sizeof(float));
 					}
-					batchDLossReal += threadCtx[tid].dLossReal;
-					batchDLossFake += threadCtx[tid].dLossFake;
-					batchInfoLoss += threadCtx[tid].infoLoss;
-					epochWasserstein += threadCtx[tid].wasserstein;
-					epochCatCorrect += threadCtx[tid].catCorrect;
-					epochCatTotal += threadCtx[tid].catTotal;
+
+					// Sum thread-local grads into master (in order for determinism)
+					for (unsigned int tid = 0; tid < nThreads; ++tid)
+					{
+						if (config.archType == GANConfig::GAN_DFF)
+							threadCtx[tid].discGrads.addToDFF(discriminator);
+						else
+							threadCtx[tid].discGrads.addToCNN(discriminator);
+						if (hasInfo)
+						{
+							for (size_t i = 0; i < qHead.gW.size(); ++i)
+								qHead.gW[i] += threadCtx[tid].qGrads.qGW[i];
+							for (size_t j = 0; j < qHead.gBias.size(); ++j)
+								qHead.gBias[j] += threadCtx[tid].qGrads.qGBias[j];
+						}
+						batchDLossReal += threadCtx[tid].dLossReal;
+						batchDLossFake += threadCtx[tid].dLossFake;
+						batchInfoLoss += threadCtx[tid].infoLoss;
+						epochWasserstein += threadCtx[tid].wasserstein;
+						epochCatCorrect += threadCtx[tid].catCorrect;
+						epochCatTotal += threadCtx[tid].catTotal;
+						epochDOutReal += threadCtx[tid].dOutRealSum;
+						epochDOutFake += threadCtx[tid].dOutFakeSum;
+					}
+				}
+				else
+				{
+					// Parallel layer-wise reduction
+					LayerReduceData lrd;
+					lrd.ctxs = &threadCtx[0];
+					lrd.nThreads = nThreads;
+					lrd.net = &discriminator;
+					lrd.isGen = false;
+					const unsigned int nConv = static_cast<unsigned int>(discriminator.tensorCnn.convLayers.size());
+					const unsigned int nFC = static_cast<unsigned int>(discriminator.tensorCnn.fcLayers.size());
+					ThreadPool::instance().parallel_for(nConv + nFC, layerReduceBody, &lrd);
+
+					// Q-head (small, serial)
+					if (hasInfo)
+					{
+						std::memset(&qHead.gW[0], 0, qHead.gW.size() * sizeof(float));
+						std::memset(&qHead.gBias[0], 0, qHead.qOutDim * sizeof(float));
+						for (unsigned int tid = 0; tid < nThreads; ++tid)
+						{
+							for (size_t i = 0; i < qHead.gW.size(); ++i)
+								qHead.gW[i] += threadCtx[tid].qGrads.qGW[i];
+							for (size_t j = 0; j < qHead.qOutDim; ++j)
+								qHead.gBias[j] += threadCtx[tid].qGrads.qGBias[j];
+						}
+					}
+
+					// Loss accumulators (tiny, serial)
+					for (unsigned int tid = 0; tid < nThreads; ++tid)
+					{
+						batchDLossReal += threadCtx[tid].dLossReal;
+						batchDLossFake += threadCtx[tid].dLossFake;
+						batchInfoLoss += threadCtx[tid].infoLoss;
+						epochWasserstein += threadCtx[tid].wasserstein;
+						epochCatCorrect += threadCtx[tid].catCorrect;
+						epochCatTotal += threadCtx[tid].catTotal;
+						epochDOutReal += threadCtx[tid].dOutRealSum;
+						epochDOutFake += threadCtx[tid].dOutFakeSum;
+					}
 				}
 
 				const float invBatch = 1.0f / static_cast<float>(curBatchSize);
@@ -4986,69 +5887,149 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 				gtd.genIsDeconv = genIsDeconv;
 				gtd.hasLN = hasLN;
 				gtd.infoLambda = infoLambda;
+				gtd.catScale = config.infoConfig.catScale;
+				gtd.divLambda = config.infoConfig.divLambda;
 				gtd.penultDim = penultDim;
 				gtd.beginToTid = &beginToTid[0];
 				gtd.lnScratch = hasLN ? &genLNScratch[0] : NULL;
 				ThreadPool::instance().parallel_for(curBatchSize, genTrainBody, &gtd);
 
 				// --- Phase 4: Ordered reduction ---
-				// Zero master network grads
-				if (genIsDeconv)
-					zeroDeconvGrads(generator);
-				else
-					zeroDFFGrads(generator);
-				if (hasStyle && !genIsDeconv)
+				if (config.deterministicReduce)
 				{
-					zeroDFFGrads(mappingNet);
-					for (size_t sa = 0; sa < styleAffines.size(); ++sa)
-					{
-						std::memset(&styleAffines[sa].gW[0], 0, styleAffines[sa].gW.size() * sizeof(float));
-						std::memset(&styleAffines[sa].gBias[0], 0, styleAffines[sa].gBias.size() * sizeof(float));
-						gNoiseScales[sa] = 0.0f;
-					}
-				}
-				if (hasLN)
-				{
-					for (size_t i = 0; i < genLNParams.gGamma.size(); ++i)
-					{
-						std::memset(&genLNParams.gGamma[i][0], 0, genLNParams.gGamma[i].size() * sizeof(float));
-						std::memset(&genLNParams.gBeta[i][0], 0, genLNParams.gBeta[i].size() * sizeof(float));
-					}
-				}
-
-				// Sum thread-local grads into master (in order for determinism)
-				for (unsigned int tid = 0; tid < nThreads; ++tid)
-				{
+					// Zero master network grads
 					if (genIsDeconv)
-						threadCtx[tid].genGrads.addToDeconv(generator);
+						zeroDeconvGrads(generator);
 					else
-						threadCtx[tid].genGrads.addToDFF(generator);
-
+						zeroDFFGrads(generator);
 					if (hasStyle && !genIsDeconv)
 					{
-						threadCtx[tid].mappingGrads.addToDFF(mappingNet);
+						zeroDFFGrads(mappingNet);
 						for (size_t sa = 0; sa < styleAffines.size(); ++sa)
 						{
-							for (size_t i = 0; i < styleAffines[sa].gW.size(); ++i)
-								styleAffines[sa].gW[i] += threadCtx[tid].styleGW[sa][i];
-							for (size_t j = 0; j < styleAffines[sa].gBias.size(); ++j)
-								styleAffines[sa].gBias[j] += threadCtx[tid].styleGBias[sa][j];
-							gNoiseScales[sa] += threadCtx[tid].gNoiseScalesLocal[sa];
+							std::memset(&styleAffines[sa].gW[0], 0, styleAffines[sa].gW.size() * sizeof(float));
+							std::memset(&styleAffines[sa].gBias[0], 0, styleAffines[sa].gBias.size() * sizeof(float));
+							gNoiseScales[sa] = 0.0f;
 						}
 					}
 					if (hasLN)
 					{
 						for (size_t i = 0; i < genLNParams.gGamma.size(); ++i)
 						{
-							for (size_t j = 0; j < genLNParams.gGamma[i].size(); ++j)
-								genLNParams.gGamma[i][j] += threadCtx[tid].lnGGamma[i][j];
-							for (size_t j = 0; j < genLNParams.gBeta[i].size(); ++j)
-								genLNParams.gBeta[i][j] += threadCtx[tid].lnGBeta[i][j];
+							std::memset(&genLNParams.gGamma[i][0], 0, genLNParams.gGamma[i].size() * sizeof(float));
+							std::memset(&genLNParams.gBeta[i][0], 0, genLNParams.gBeta[i].size() * sizeof(float));
+						}
+					}
+					// genQHead no longer used — info gradient flows through disc-side qHead
+
+					// Sum thread-local grads into master (in order for determinism)
+					for (unsigned int tid = 0; tid < nThreads; ++tid)
+					{
+						if (genIsDeconv)
+							threadCtx[tid].genGrads.addToDeconv(generator);
+						else
+							threadCtx[tid].genGrads.addToDFF(generator);
+
+						if (hasStyle && !genIsDeconv)
+						{
+							threadCtx[tid].mappingGrads.addToDFF(mappingNet);
+							for (size_t sa = 0; sa < styleAffines.size(); ++sa)
+							{
+								for (size_t i = 0; i < styleAffines[sa].gW.size(); ++i)
+									styleAffines[sa].gW[i] += threadCtx[tid].styleGW[sa][i];
+								for (size_t j = 0; j < styleAffines[sa].gBias.size(); ++j)
+									styleAffines[sa].gBias[j] += threadCtx[tid].styleGBias[sa][j];
+								gNoiseScales[sa] += threadCtx[tid].gNoiseScalesLocal[sa];
+							}
+						}
+						if (hasLN)
+						{
+							for (size_t i = 0; i < genLNParams.gGamma.size(); ++i)
+							{
+								for (size_t j = 0; j < genLNParams.gGamma[i].size(); ++j)
+									genLNParams.gGamma[i][j] += threadCtx[tid].lnGGamma[i][j];
+								for (size_t j = 0; j < genLNParams.gBeta[i].size(); ++j)
+									genLNParams.gBeta[i][j] += threadCtx[tid].lnGBeta[i][j];
+							}
+						}
+						// genQHead gradient accumulation removed — Q updated during disc training only
+
+						batchGLoss += threadCtx[tid].gLoss;
+						batchInfoLoss += threadCtx[tid].infoLoss;
+						epochDivLoss += threadCtx[tid].divLoss;
+					}
+				}
+				else
+				{
+					// Parallel layer-wise reduction (deconv generator only)
+					if (genIsDeconv)
+					{
+						const unsigned int numDeconvLayers = static_cast<unsigned int>(generator.tensorDeconv.layers.size());
+						LayerReduceData lrd;
+						lrd.ctxs = &threadCtx[0];
+						lrd.nThreads = nThreads;
+						lrd.net = &generator;
+						lrd.isGen = true;
+						ThreadPool::instance().parallel_for(1u + numDeconvLayers, layerReduceBody, &lrd);
+					}
+					else
+					{
+						zeroDFFGrads(generator);
+						for (unsigned int tid = 0; tid < nThreads; ++tid)
+							threadCtx[tid].genGrads.addToDFF(generator);
+					}
+
+					// Style / mapping reduction (serial — small and complex)
+					if (hasStyle && !genIsDeconv)
+					{
+						zeroDFFGrads(mappingNet);
+						for (size_t sa = 0; sa < styleAffines.size(); ++sa)
+						{
+							std::memset(&styleAffines[sa].gW[0], 0, styleAffines[sa].gW.size() * sizeof(float));
+							std::memset(&styleAffines[sa].gBias[0], 0, styleAffines[sa].gBias.size() * sizeof(float));
+							gNoiseScales[sa] = 0.0f;
+						}
+						for (unsigned int tid = 0; tid < nThreads; ++tid)
+						{
+							threadCtx[tid].mappingGrads.addToDFF(mappingNet);
+							for (size_t sa = 0; sa < styleAffines.size(); ++sa)
+							{
+								for (size_t i = 0; i < styleAffines[sa].gW.size(); ++i)
+									styleAffines[sa].gW[i] += threadCtx[tid].styleGW[sa][i];
+								for (size_t j = 0; j < styleAffines[sa].gBias.size(); ++j)
+									styleAffines[sa].gBias[j] += threadCtx[tid].styleGBias[sa][j];
+								gNoiseScales[sa] += threadCtx[tid].gNoiseScalesLocal[sa];
+							}
 						}
 					}
 
-					batchGLoss += threadCtx[tid].gLoss;
-					batchInfoLoss += threadCtx[tid].infoLoss;
+					// LN gradient reduction (serial — small and complex)
+					if (hasLN)
+					{
+						for (size_t i = 0; i < genLNParams.gGamma.size(); ++i)
+						{
+							std::memset(&genLNParams.gGamma[i][0], 0, genLNParams.gGamma[i].size() * sizeof(float));
+							std::memset(&genLNParams.gBeta[i][0], 0, genLNParams.gBeta[i].size() * sizeof(float));
+						}
+						for (unsigned int tid = 0; tid < nThreads; ++tid)
+						{
+							for (size_t i = 0; i < genLNParams.gGamma.size(); ++i)
+							{
+								for (size_t j = 0; j < genLNParams.gGamma[i].size(); ++j)
+									genLNParams.gGamma[i][j] += threadCtx[tid].lnGGamma[i][j];
+								for (size_t j = 0; j < genLNParams.gBeta[i].size(); ++j)
+									genLNParams.gBeta[i][j] += threadCtx[tid].lnGBeta[i][j];
+							}
+						}
+					}
+
+					// Loss accumulators (tiny, serial)
+					for (unsigned int tid = 0; tid < nThreads; ++tid)
+					{
+						batchGLoss += threadCtx[tid].gLoss;
+						batchInfoLoss += threadCtx[tid].infoLoss;
+						epochDivLoss += threadCtx[tid].divLoss;
+					}
 				}
 
 				const float invBatch = 1.0f / static_cast<float>(curBatchSize);
@@ -5066,7 +6047,48 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 						NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
 						for (size_t i = 0; i < dl.gW.size(); ++i) dl.gW[i] *= invBatch;
 						for (unsigned int c = 0; c < dl.outC; ++c) dl.gBias[c] *= invBatch;
+						if (dl.useBatchNorm)
+						{
+							for (unsigned int c = 0; c < dl.outC; ++c) dl.gBnGamma[c] *= invBatch;
+							for (unsigned int c = 0; c < dl.outC; ++c) dl.gBnBeta[c] *= invBatch;
+						}
 					}
+
+					// Generator gradient L2 norm (after batch-averaging)
+					float gnNorm = 0.0f;
+					{
+						float gnSq = 0.0f;
+						for (size_t i = 0; i < ds.fcGW.size(); ++i) gnSq += ds.fcGW[i] * ds.fcGW[i];
+						for (unsigned int j = 0; j < ds.fcOut; ++j) gnSq += ds.fcGBias[j] * ds.fcGBias[j];
+						for (unsigned int l2 = 0; l2 < ds.layers.size(); ++l2)
+						{
+							const NNetwork::TensorDeconvState::DeconvLayer& dl2 = ds.layers[l2];
+							for (size_t i = 0; i < dl2.gW.size(); ++i) gnSq += dl2.gW[i] * dl2.gW[i];
+							for (unsigned int c = 0; c < dl2.outC; ++c) gnSq += dl2.gBias[c] * dl2.gBias[c];
+						}
+						gnNorm = sqrtf(gnSq);
+						epochGenGradNorm += gnNorm;
+					}
+
+					// Gradient clipping (deconv generator)
+					if (config.gradClipNorm > 0.0f && gnNorm > config.gradClipNorm)
+					{
+						const float scale = config.gradClipNorm / (gnNorm + 1e-8f);
+						for (size_t i = 0; i < ds.fcGW.size(); ++i) ds.fcGW[i] *= scale;
+						for (unsigned int j = 0; j < ds.fcOut; ++j) ds.fcGBias[j] *= scale;
+						for (unsigned int l2 = 0; l2 < ds.layers.size(); ++l2)
+						{
+							NNetwork::TensorDeconvState::DeconvLayer& dl2 = ds.layers[l2];
+							for (size_t i = 0; i < dl2.gW.size(); ++i) dl2.gW[i] *= scale;
+							for (unsigned int c = 0; c < dl2.outC; ++c) dl2.gBias[c] *= scale;
+							if (dl2.useBatchNorm)
+							{
+								for (unsigned int c = 0; c < dl2.outC; ++c) dl2.gBnGamma[c] *= scale;
+								for (unsigned int c = 0; c < dl2.outC; ++c) dl2.gBnBeta[c] *= scale;
+							}
+						}
+					}
+
 					deconvUpdate(generator, config.generatorLR);
 				}
 				else
@@ -5077,6 +6099,33 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 						for (size_t i = 0; i < tr.gW.size(); ++i) tr.gW[i] *= invBatch;
 						for (size_t j = 0; j < tr.gBias.size(); ++j) tr.gBias[j] *= invBatch;
 					}
+
+					// Generator gradient L2 norm (after batch-averaging)
+					float gnNormDff = 0.0f;
+					{
+						float gnSq = 0.0f;
+						for (unsigned int t2 = 0; t2 < generator.tensorDff.T.size(); ++t2)
+						{
+							const NNetwork::TensorDFFState::Transition& tr2 = generator.tensorDff.T[t2];
+							for (size_t i = 0; i < tr2.gW.size(); ++i) gnSq += tr2.gW[i] * tr2.gW[i];
+							for (size_t j = 0; j < tr2.gBias.size(); ++j) gnSq += tr2.gBias[j] * tr2.gBias[j];
+						}
+						gnNormDff = sqrtf(gnSq);
+						epochGenGradNorm += gnNormDff;
+					}
+
+					// Gradient clipping (DFF generator)
+					if (config.gradClipNorm > 0.0f && gnNormDff > config.gradClipNorm)
+					{
+						const float scale = config.gradClipNorm / (gnNormDff + 1e-8f);
+						for (unsigned int t2 = 0; t2 < generator.tensorDff.T.size(); ++t2)
+						{
+							NNetwork::TensorDFFState::Transition& tr2 = generator.tensorDff.T[t2];
+							for (size_t i = 0; i < tr2.gW.size(); ++i) tr2.gW[i] *= scale;
+							for (size_t j = 0; j < tr2.gBias.size(); ++j) tr2.gBias[j] *= scale;
+						}
+					}
+
 					dffUpdate(generator, genAdamState, config.generatorLR);
 					if (hasLN)
 					{
@@ -5105,6 +6154,8 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 					}
 					styleAffineUpdate(config.generatorLR, styleAffines, styleAffineAdamState, noiseScales, gNoiseScales);
 				}
+
+				// genQHead update removed — Q updated during disc training only
 			}
 
 			epochSamples += curBatchSize;
@@ -5122,8 +6173,45 @@ NNetworkStatus GAN::trainSingleDomain(const DataInput* realData, IGANCallbacks* 
 		if (hasInfo)
 		{
 			metrics.infoLoss = epochInfoLoss * invBatches;
+			metrics.divLoss = epochDivLoss * invBatches;
 			if (epochCatTotal > 0u)
 				metrics.catAccuracy = static_cast<float>(epochCatCorrect) / static_cast<float>(epochCatTotal);
+		}
+
+		// Health diagnostics
+		if (epochSamples > 0u)
+		{
+			const float invSamples = 1.0f / static_cast<float>(epochSamples);
+			metrics.dOutReal = epochDOutReal * invSamples;
+			metrics.dOutFake = epochDOutFake * invSamples;
+		}
+		const unsigned int genStepsPerEpoch = numBatches * static_cast<unsigned int>(config.nGenPerCritic);
+		if (genStepsPerEpoch > 0u)
+			metrics.genGradNorm = epochGenGradNorm / static_cast<float>(genStepsPerEpoch);
+
+		// Sample diversity: mean per-pixel variance across generated samples
+		{
+			const unsigned int divSamples = 16u;
+			std::vector<std::vector<float> > divBatch;
+			generate(divSamples, divBatch);
+			if (divBatch.size() == divSamples && divBatch[0].size() > 0u)
+			{
+				const unsigned int dim = static_cast<unsigned int>(divBatch[0].size());
+				float totalVar = 0.0f;
+				for (unsigned int d = 0; d < dim; ++d)
+				{
+					float sum = 0.0f, sumSq = 0.0f;
+					for (unsigned int s = 0; s < divSamples; ++s)
+					{
+						const float v = divBatch[s][d];
+						sum += v;
+						sumSq += v * v;
+					}
+					const float mean = sum / static_cast<float>(divSamples);
+					totalVar += sumSq / static_cast<float>(divSamples) - mean * mean;
+				}
+				metrics.sampleDiversity = totalVar / static_cast<float>(dim);
+			}
 		}
 
 		if (cb)
@@ -5265,17 +6353,90 @@ void GAN::initQHead(unsigned int sharedDim, QNetworkHead& head, AdamState& adamS
 	head.initialized = true;
 }
 
-void GAN::qHeadForward(const QNetworkHead& head, const float* shared, unsigned int dim,
-                       std::vector<float>& qOut) const
+void GAN::initGenQHead(unsigned int inputDim, unsigned int hiddenDim,
+                       QNetworkHead& head, AdamState& adamSt)
 {
-	qOut.assign(head.qOutDim, 0.0f);
-	for (unsigned int j = 0; j < head.qOutDim; ++j)
+	const unsigned int numCat = config.infoConfig.numCategorical;
+	const unsigned int numCont = config.infoConfig.numContinuous;
+	const unsigned int qOut = numCat + 2u * numCont;
+
+	head.sharedDim = inputDim;
+	head.qOutDim = qOut;
+	head.hiddenDim = hiddenDim;
+
+	// Hidden layer: inputDim -> hiddenDim
+	head.hiddenW.assign(static_cast<size_t>(hiddenDim) * inputDim, 0.0f);
+	head.hiddenBias.assign(hiddenDim, 0.0f);
+	head.gHiddenW.assign(head.hiddenW.size(), 0.0f);
+	head.gHiddenBias.assign(hiddenDim, 0.0f);
+	initGlorot(rngEngine, head.hiddenW, inputDim, hiddenDim);
+
+	// Output layer: hiddenDim -> qOut
+	head.W.assign(static_cast<size_t>(qOut) * hiddenDim, 0.0f);
+	head.bias.assign(qOut, 0.0f);
+	head.gW.assign(head.W.size(), 0.0f);
+	head.gBias.assign(qOut, 0.0f);
+	initGlorot(rngEngine, head.W, hiddenDim, qOut);
+
+	// Adam state: 2 transitions (hidden + output)
+	adamSt.step = 0ULL;
+	adamSt.mW.resize(2u);
+	adamSt.vW.resize(2u);
+	adamSt.mBias.resize(2u);
+	adamSt.vBias.resize(2u);
+	adamSt.mW[0].assign(head.hiddenW.size(), 0.0f);
+	adamSt.vW[0].assign(head.hiddenW.size(), 0.0f);
+	adamSt.mBias[0].assign(hiddenDim, 0.0f);
+	adamSt.vBias[0].assign(hiddenDim, 0.0f);
+	adamSt.mW[1].assign(head.W.size(), 0.0f);
+	adamSt.vW[1].assign(head.W.size(), 0.0f);
+	adamSt.mBias[1].assign(qOut, 0.0f);
+	adamSt.vBias[1].assign(qOut, 0.0f);
+
+	head.initialized = true;
+}
+
+void GAN::qHeadForward(const QNetworkHead& head, const float* shared, unsigned int dim,
+                       std::vector<float>& qOut,
+                       std::vector<float>* hiddenPre,
+                       std::vector<float>* hiddenPost) const
+{
+	if (head.hiddenDim > 0u && hiddenPre && hiddenPost)
 	{
-		float z = head.bias[j];
-		const size_t rowOff = static_cast<size_t>(j) * head.sharedDim;
-		for (unsigned int i = 0; i < dim && i < head.sharedDim; ++i)
-			z += head.W[rowOff + i] * shared[i];
-		qOut[j] = z;
+		// Two-layer: shared -> hidden (LeakyReLU) -> output
+		const float alpha = 0.01f;
+		for (unsigned int k = 0; k < head.hiddenDim; ++k)
+		{
+			float z = head.hiddenBias[k];
+			const size_t rowOff = static_cast<size_t>(k) * head.sharedDim;
+			for (unsigned int i = 0; i < dim && i < head.sharedDim; ++i)
+				z += head.hiddenW[rowOff + i] * shared[i];
+			(*hiddenPre)[k] = z;
+			(*hiddenPost)[k] = (z > 0.0f) ? z : alpha * z;
+		}
+
+		qOut.assign(head.qOutDim, 0.0f);
+		for (unsigned int j = 0; j < head.qOutDim; ++j)
+		{
+			float z = head.bias[j];
+			const size_t rowOff = static_cast<size_t>(j) * head.hiddenDim;
+			for (unsigned int k = 0; k < head.hiddenDim; ++k)
+				z += head.W[rowOff + k] * (*hiddenPost)[k];
+			qOut[j] = z;
+		}
+	}
+	else
+	{
+		// Single-layer (original path for disc-side qHead)
+		qOut.assign(head.qOutDim, 0.0f);
+		for (unsigned int j = 0; j < head.qOutDim; ++j)
+		{
+			float z = head.bias[j];
+			const size_t rowOff = static_cast<size_t>(j) * head.sharedDim;
+			for (unsigned int i = 0; i < dim && i < head.sharedDim; ++i)
+				z += head.W[rowOff + i] * shared[i];
+			qOut[j] = z;
+		}
 	}
 }
 
@@ -5345,6 +6506,56 @@ void GAN::qHeadUpdate(QNetworkHead& head, AdamState& adamSt, float lr)
 	}
 }
 
+void GAN::genQHeadUpdate(QNetworkHead& head, AdamState& adamSt, float lr)
+{
+	++adamSt.step;
+	const float beta1 = config.adamBeta1;
+	const float beta2 = config.adamBeta2;
+	const float eps = config.adamEps;
+	const float bc1 = 1.0f - powf(beta1, static_cast<float>(adamSt.step));
+	const float bc2 = 1.0f - powf(beta2, static_cast<float>(adamSt.step));
+
+	// Hidden layer (transition 0)
+	if (head.hiddenDim > 0u)
+	{
+		for (size_t i = 0; i < head.hiddenW.size(); ++i)
+		{
+			const float g = head.gHiddenW[i];
+			adamSt.mW[0][i] = beta1 * adamSt.mW[0][i] + (1.0f - beta1) * g;
+			adamSt.vW[0][i] = beta2 * adamSt.vW[0][i] + (1.0f - beta2) * g * g;
+			head.hiddenW[i] -= lr * (adamSt.mW[0][i] / bc1) / (sqrtf(adamSt.vW[0][i] / bc2) + eps);
+			head.gHiddenW[i] = 0.0f;
+		}
+		for (unsigned int k = 0; k < head.hiddenDim; ++k)
+		{
+			const float g = head.gHiddenBias[k];
+			adamSt.mBias[0][k] = beta1 * adamSt.mBias[0][k] + (1.0f - beta1) * g;
+			adamSt.vBias[0][k] = beta2 * adamSt.vBias[0][k] + (1.0f - beta2) * g * g;
+			head.hiddenBias[k] -= lr * (adamSt.mBias[0][k] / bc1) / (sqrtf(adamSt.vBias[0][k] / bc2) + eps);
+			head.gHiddenBias[k] = 0.0f;
+		}
+	}
+
+	// Output layer (transition 1 if hidden, 0 if no hidden)
+	const unsigned int outIdx = (head.hiddenDim > 0u) ? 1u : 0u;
+	for (size_t i = 0; i < head.W.size(); ++i)
+	{
+		const float g = head.gW[i];
+		adamSt.mW[outIdx][i] = beta1 * adamSt.mW[outIdx][i] + (1.0f - beta1) * g;
+		adamSt.vW[outIdx][i] = beta2 * adamSt.vW[outIdx][i] + (1.0f - beta2) * g * g;
+		head.W[i] -= lr * (adamSt.mW[outIdx][i] / bc1) / (sqrtf(adamSt.vW[outIdx][i] / bc2) + eps);
+		head.gW[i] = 0.0f;
+	}
+	for (unsigned int j = 0; j < head.qOutDim; ++j)
+	{
+		const float g = head.gBias[j];
+		adamSt.mBias[outIdx][j] = beta1 * adamSt.mBias[outIdx][j] + (1.0f - beta1) * g;
+		adamSt.vBias[outIdx][j] = beta2 * adamSt.vBias[outIdx][j] + (1.0f - beta2) * g * g;
+		head.bias[j] -= lr * (adamSt.mBias[outIdx][j] / bc1) / (sqrtf(adamSt.vBias[outIdx][j] / bc2) + eps);
+		head.gBias[j] = 0.0f;
+	}
+}
+
 float GAN::computeInfoLoss(const std::vector<float>& qOut,
                            const std::vector<float>& catCode, const std::vector<float>& contCode,
                            std::vector<float>& qGrad) const
@@ -5367,19 +6578,20 @@ float GAN::computeInfoLoss(const std::vector<float>& qOut,
 		categoricalCEGrad(&catLogits[0], &catCode[0], &qGrad[0], numCat);
 	}
 
-	// Continuous: Gaussian NLL
+	// Continuous: Gaussian NLL (clamp logvar to prevent continuous gradient
+	// from dominating categorical gradient through the shared Q-head path)
 	for (unsigned int c = 0; c < numCont; ++c)
 	{
 		const unsigned int muIdx = numCat + 2u * c;
 		const unsigned int lvIdx = numCat + 2u * c + 1u;
 		const float mu = qOut[muIdx];
-		const float logvar = qOut[lvIdx];
+		const float logvar = (qOut[lvIdx] < -2.0f) ? -2.0f : qOut[lvIdx];
 		loss += gaussianNLL(mu, logvar, contCode[c]);
 
 		float dMu, dLogvar;
 		gaussianNLLGrad(mu, logvar, contCode[c], dMu, dLogvar);
 		qGrad[muIdx] = dMu;
-		qGrad[lvIdx] = dLogvar;
+		qGrad[lvIdx] = (qOut[lvIdx] < -2.0f) ? 0.0f : dLogvar;
 	}
 
 	return loss;
@@ -5430,7 +6642,10 @@ NNetworkStatus GAN::generateInfoGAN(unsigned int numSamples,
 		std::vector<float> genInput(totalInputDim);
 		std::memcpy(&genInput[0], &noise[0], config.noiseDim * sizeof(float));
 		if (numCat > 0u)
-			std::memcpy(&genInput[config.noiseDim], &catCode[0], numCat * sizeof(float));
+		{
+			for (unsigned int c = 0; c < numCat; ++c)
+				genInput[config.noiseDim + c] = catCode[c] * config.infoConfig.catScale;
+		}
 		if (numCont > 0u)
 			std::memcpy(&genInput[config.noiseDim + numCat], &contCode[0], numCont * sizeof(float));
 
@@ -6855,6 +8070,11 @@ NNetworkStatus GAN::trainDualDomain(const DataInput* domainA, const DataInput* d
 						NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
 						for (size_t i = 0; i < dl.gW.size(); ++i) dl.gW[i] *= invBatch;
 						for (unsigned int c = 0; c < dl.outC; ++c) dl.gBias[c] *= invBatch;
+						if (dl.useBatchNorm)
+						{
+							for (unsigned int c = 0; c < dl.outC; ++c) dl.gBnGamma[c] *= invBatch;
+							for (unsigned int c = 0; c < dl.outC; ++c) dl.gBnBeta[c] *= invBatch;
+						}
 					}
 					deconvUpdate(generator, config.generatorLR);
 				}
@@ -6885,6 +8105,11 @@ NNetworkStatus GAN::trainDualDomain(const DataInput* domainA, const DataInput* d
 						NNetwork::TensorDeconvState::DeconvLayer& dl = ds.layers[l];
 						for (size_t i = 0; i < dl.gW.size(); ++i) dl.gW[i] *= invBatch;
 						for (unsigned int c = 0; c < dl.outC; ++c) dl.gBias[c] *= invBatch;
+						if (dl.useBatchNorm)
+						{
+							for (unsigned int c = 0; c < dl.outC; ++c) dl.gBnGamma[c] *= invBatch;
+							for (unsigned int c = 0; c < dl.outC; ++c) dl.gBnBeta[c] *= invBatch;
+						}
 					}
 					deconvUpdate(generatorBA, config.generatorLR);
 				}

@@ -40,7 +40,8 @@ static bool allocBuf(GpuBuffer<float>& buf, size_t n)
 bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned int nh,
                                       unsigned int nkvh, unsigned int nl,
                                       unsigned int vs, unsigned int is, unsigned int os,
-                                      unsigned int ffk, bool tm, bool te)
+                                      unsigned int ffk, bool tm, bool te,
+                                      bool skipAdamBufs)
 {
 	free();
 
@@ -64,12 +65,12 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (tokenModel)
 	{
 		if (!allocBuf(tokE, (size_t)vs * dm)) return false;
-		if (!allocBuf(vTokE, (size_t)vs * dm)) return false;
-		if (!allocBuf(v2TokE, (size_t)vs * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(vTokE, (size_t)vs * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
 		if (!allocBuf(gTokE, (size_t)vs * dm)) return false;
 		if (!allocBuf(lmBias, vs)) return false;
-		if (!allocBuf(mLmBias, vs)) return false;
-		if (!allocBuf(v2LmBias, vs)) return false;
+		if (!skipAdamBufs && !allocBuf(mLmBias, vs)) return false;
+		if (!skipAdamBufs && !allocBuf(v2LmBias, vs)) return false;
 		if (!allocBuf(gLmBias, vs)) return false;
 	}
 
@@ -77,12 +78,12 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (!tokenModel)
 	{
 		if (!allocBuf(WIn, (size_t)dm * is)) return false;
-		if (!allocBuf(vWIn, (size_t)dm * is)) return false;
-		if (!allocBuf(v2WIn, (size_t)dm * is)) return false;
+		if (!skipAdamBufs && !allocBuf(vWIn, (size_t)dm * is)) return false;
+		if (!skipAdamBufs && !allocBuf(v2WIn, (size_t)dm * is)) return false;
 		if (!allocBuf(gWIn, (size_t)dm * is)) return false;
 		if (!allocBuf(bIn, dm)) return false;
-		if (!allocBuf(mBIn, dm)) return false;
-		if (!allocBuf(v2BIn, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(mBIn, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(v2BIn, dm)) return false;
 		if (!allocBuf(gBIn, dm)) return false;
 	}
 
@@ -90,12 +91,12 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (!tokenModel)
 	{
 		if (!allocBuf(WOut, (size_t)os * dm)) return false;
-		if (!allocBuf(vWOut, (size_t)os * dm)) return false;
-		if (!allocBuf(v2WOut, (size_t)os * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(vWOut, (size_t)os * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(v2WOut, (size_t)os * dm)) return false;
 		if (!allocBuf(gWOut, (size_t)os * dm)) return false;
 		if (!allocBuf(bOut, os)) return false;
-		if (!allocBuf(mBOut, os)) return false;
-		if (!allocBuf(v2BOut, os)) return false;
+		if (!skipAdamBufs && !allocBuf(mBOut, os)) return false;
+		if (!skipAdamBufs && !allocBuf(v2BOut, os)) return false;
 		if (!allocBuf(gBOut, os)) return false;
 	}
 
@@ -108,10 +109,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		// LN1
 		if (!allocBuf(b.ln1Gamma, dm)) return false;
 		if (!allocBuf(b.ln1Beta, dm)) return false;
-		if (!allocBuf(b.mLn1Gamma, dm)) return false;
-		if (!allocBuf(b.v2Ln1Gamma, dm)) return false;
-		if (!allocBuf(b.mLn1Beta, dm)) return false;
-		if (!allocBuf(b.v2Ln1Beta, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mLn1Gamma, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Ln1Gamma, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mLn1Beta, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Ln1Beta, dm)) return false;
 		if (!allocBuf(b.gLn1Gamma, dm)) return false;
 		if (!allocBuf(b.gLn1Beta, dm)) return false;
 
@@ -120,14 +121,14 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.Wk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.Wv, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.Wo, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.vWq, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.vWk, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.vWv, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.vWo, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.v2Wq, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.v2Wk, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.v2Wv, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.v2Wo, (size_t)dm * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.vWq, (size_t)dm * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.vWk, (size_t)dm * dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.vWv, (size_t)dm * dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.vWo, (size_t)dm * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Wq, (size_t)dm * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Wk, (size_t)dm * dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Wv, (size_t)dm * dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Wo, (size_t)dm * dm)) return false;
 		if (!allocBuf(b.gWq, (size_t)dm * dm)) return false;
 		if (!allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
@@ -137,14 +138,14 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.bk, dModelKV)) return false;
 		if (!allocBuf(b.bv, dModelKV)) return false;
 		if (!allocBuf(b.bo, dm)) return false;
-		if (!allocBuf(b.mBq, dm)) return false;
-		if (!allocBuf(b.mBk, dModelKV)) return false;
-		if (!allocBuf(b.mBv, dModelKV)) return false;
-		if (!allocBuf(b.mBo, dm)) return false;
-		if (!allocBuf(b.v2Bq, dm)) return false;
-		if (!allocBuf(b.v2Bk, dModelKV)) return false;
-		if (!allocBuf(b.v2Bv, dModelKV)) return false;
-		if (!allocBuf(b.v2Bo, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mBq, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mBk, dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mBv, dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mBo, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Bq, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Bk, dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Bv, dModelKV)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Bo, dm)) return false;
 		if (!allocBuf(b.gBq, dm)) return false;
 		if (!allocBuf(b.gBk, dModelKV)) return false;
 		if (!allocBuf(b.gBv, dModelKV)) return false;
@@ -153,34 +154,34 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		// LN2
 		if (!allocBuf(b.ln2Gamma, dm)) return false;
 		if (!allocBuf(b.ln2Beta, dm)) return false;
-		if (!allocBuf(b.mLn2Gamma, dm)) return false;
-		if (!allocBuf(b.v2Ln2Gamma, dm)) return false;
-		if (!allocBuf(b.mLn2Beta, dm)) return false;
-		if (!allocBuf(b.v2Ln2Beta, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mLn2Gamma, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Ln2Gamma, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mLn2Beta, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2Ln2Beta, dm)) return false;
 		if (!allocBuf(b.gLn2Gamma, dm)) return false;
 		if (!allocBuf(b.gLn2Beta, dm)) return false;
 
 		// FFN
 		if (!allocBuf(b.W1, (size_t)ff1Width * dm)) return false;
 		if (!allocBuf(b.W2, (size_t)dm * df)) return false;
-		if (!allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
-		if (!allocBuf(b.vW2, (size_t)dm * df)) return false;
-		if (!allocBuf(b.v2W1, (size_t)ff1Width * dm)) return false;
-		if (!allocBuf(b.v2W2, (size_t)dm * df)) return false;
+		if (!skipAdamBufs && !allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.vW2, (size_t)dm * df)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2W1, (size_t)ff1Width * dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2W2, (size_t)dm * df)) return false;
 		if (!allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
 		if (!allocBuf(b.gW2, (size_t)dm * df)) return false;
 		if (!allocBuf(b.b1, ff1Width)) return false;
 		if (!allocBuf(b.b2, dm)) return false;
-		if (!allocBuf(b.mB1, ff1Width)) return false;
-		if (!allocBuf(b.mB2, dm)) return false;
-		if (!allocBuf(b.v2B1, ff1Width)) return false;
-		if (!allocBuf(b.v2B2, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mB1, ff1Width)) return false;
+		if (!skipAdamBufs && !allocBuf(b.mB2, dm)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2B1, ff1Width)) return false;
+		if (!skipAdamBufs && !allocBuf(b.v2B2, dm)) return false;
 		if (!allocBuf(b.gB1, ff1Width)) return false;
 		if (!allocBuf(b.gB2, dm)) return false;
 	}
 
-	// Allocate batched Adam device arrays.
-	// Max groups: 4 global + 16 per layer.
+	// Allocate batched Adam device arrays (only needed for Adam optimizer).
+	if (!skipAdamBufs)
 	{
 		int maxGroups = 4 + 16 * static_cast<int>(nl);
 		cudaError_t e;

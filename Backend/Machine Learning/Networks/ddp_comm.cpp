@@ -22,6 +22,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <algorithm>
 #include <vector>
 
 // ============================================================
@@ -81,6 +83,67 @@ static unsigned int loginCount = 0;
 // Stored by DDPReduceService as workers arrive.
 static std::vector<GNet::Connection*> workerConnections;
 
+// --- Compression state ---
+static int ddpCompressionMode = 0;   // 0=none, 1=FP16, 2=FP16+TopK
+static float ddpTopKRatio = 0.01f;
+static int ddpTopKWarmupSteps = 0;
+static int ddpBucketedStepCount = 0;
+static std::vector<float> ddpResidual;
+
+static inline uint16_t float_to_fp16(float f)
+{
+	unsigned int x;
+	memcpy(&x, &f, 4);
+	unsigned int sign = (x >> 16) & 0x8000u;
+	int exp = ((x >> 23) & 0xFF) - 127;
+	unsigned int mant = x & 0x007FFFFFu;
+
+	if (exp > 15)
+		return static_cast<uint16_t>(sign | 0x7C00u);
+	if (exp < -14)
+	{
+		if (exp < -24) return static_cast<uint16_t>(sign);
+		mant |= 0x00800000u;
+		int shift = -1 - exp;
+		unsigned int half = 1u << (shift - 1 + 13);
+		unsigned int rounded = (mant + half - 1 + ((mant >> (shift + 13)) & 1u)) >> (shift + 13);
+		return static_cast<uint16_t>(sign | rounded);
+	}
+	unsigned int hexp = static_cast<unsigned int>(exp + 15) << 10;
+	unsigned int rounded = mant + 0x00000FFFu + ((mant >> 13) & 1u);
+	if (rounded & 0x00800000u)
+	{
+		rounded = 0;
+		hexp += 0x0400u;
+		if (hexp >= 0x7C00u) hexp = 0x7C00u;
+	}
+	return static_cast<uint16_t>(sign | hexp | (rounded >> 13));
+}
+
+static inline float fp16_to_float(uint16_t h)
+{
+	unsigned int sign = (static_cast<unsigned int>(h) & 0x8000u) << 16;
+	unsigned int hexp = (h >> 10) & 0x1Fu;
+	unsigned int mant = h & 0x03FFu;
+	unsigned int result;
+	if (hexp == 0)
+	{
+		if (mant == 0) { result = sign; }
+		else
+		{
+			hexp = 1;
+			while (!(mant & 0x0400u)) { mant <<= 1; hexp--; }
+			mant &= 0x03FFu;
+			result = sign | (static_cast<unsigned int>(127 - 15 + hexp) << 23) | (mant << 13);
+		}
+	}
+	else if (hexp == 31) { result = sign | 0x7F800000u | (mant << 13); }
+	else { result = sign | (static_cast<unsigned int>(hexp + 127 - 15) << 23) | (mant << 13); }
+	float f;
+	memcpy(&f, &result, 4);
+	return f;
+}
+
 // ============================================================
 // DDP Services (run inside GServer's service pool)
 // ============================================================
@@ -97,21 +160,68 @@ public:
 	{
 		const shmea::GString& payload = cData->getBinaryPayload();
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
-		const unsigned int floatCount = payloadSize / sizeof(float);
 
 		DDP_LOCK();
 
-		// Sum into accumulation buffer.
-		if (reduceAccumF.size() == static_cast<size_t>(floatCount))
+		if (payloadSize >= 4)
 		{
+			const unsigned char* raw = reinterpret_cast<const unsigned char*>(payload.c_str());
+			const unsigned char mode = raw[0];
+
+			if (mode == 1)
+			{
+				const unsigned int fp16Count = (payloadSize - 4) / sizeof(uint16_t);
+				const uint16_t* src = reinterpret_cast<const uint16_t*>(raw + 4);
+				if (reduceAccumF.size() == static_cast<size_t>(fp16Count))
+				{
+					for (size_t i = 0; i < fp16Count; ++i)
+						reduceAccumF[i] += fp16_to_float(src[i]);
+				}
+			}
+			else if (mode == 2)
+			{
+				if (payloadSize >= 8)
+				{
+					unsigned int nnz;
+					memcpy(&nnz, raw + 4, 4);
+					const unsigned int expectedSize = 8 + nnz * 4 + nnz * 2;
+					if (payloadSize >= expectedSize)
+					{
+						const uint32_t* indices = reinterpret_cast<const uint32_t*>(raw + 8);
+						const uint16_t* values = reinterpret_cast<const uint16_t*>(raw + 8 + nnz * 4);
+						for (unsigned int j = 0; j < nnz; ++j)
+						{
+							if (indices[j] < reduceAccumF.size())
+								reduceAccumF[indices[j]] += fp16_to_float(values[j]);
+						}
+					}
+				}
+			}
+			else
+			{
+				// Mode 0 or unknown: header(4) + float[count]
+				const unsigned int floatCount = (payloadSize - 4) / sizeof(float);
+				const float* src = reinterpret_cast<const float*>(raw + 4);
+				if (reduceAccumF.size() == static_cast<size_t>(floatCount))
+				{
+					for (size_t i = 0; i < floatCount; ++i)
+						reduceAccumF[i] += src[i];
+				}
+			}
+		}
+		else
+		{
+			// Legacy: no header, raw floats
+			const unsigned int floatCount = payloadSize / sizeof(float);
 			const float* src = reinterpret_cast<const float*>(payload.c_str());
-			for (size_t i = 0; i < floatCount; ++i)
-				reduceAccumF[i] += src[i];
+			if (reduceAccumF.size() == static_cast<size_t>(floatCount))
+			{
+				for (size_t i = 0; i < floatCount; ++i)
+					reduceAccumF[i] += src[i];
+			}
 		}
 
-		// Track which worker sent this so we can send back results.
 		workerConnections.push_back(cData->getConnection());
-
 		++reduceWorkersArrived;
 		DDP_BROADCAST();
 		DDP_UNLOCK();
@@ -135,12 +245,41 @@ public:
 	{
 		const shmea::GString& payload = cData->getBinaryPayload();
 		const unsigned int payloadSize = cData->getBinaryPayloadSize();
-		const unsigned int floatCount = payloadSize / sizeof(float);
 
 		DDP_LOCK();
-		resultBufF.resize(floatCount);
-		if (floatCount > 0)
-			memcpy(&resultBufF[0], payload.c_str(), payloadSize);
+
+		if (payloadSize >= 4)
+		{
+			const unsigned char* raw = reinterpret_cast<const unsigned char*>(payload.c_str());
+			const unsigned char mode = raw[0];
+
+			if (mode == 1 || mode == 2)
+			{
+				// FP16 dense result (result broadcast is always dense FP16 for modes 1 and 2)
+				const unsigned int fp16Count = (payloadSize - 4) / sizeof(uint16_t);
+				resultBufF.resize(fp16Count);
+				const uint16_t* src = reinterpret_cast<const uint16_t*>(raw + 4);
+				for (size_t i = 0; i < fp16Count; ++i)
+					resultBufF[i] = fp16_to_float(src[i]);
+			}
+			else
+			{
+				// Mode 0: raw FP32 with header
+				const unsigned int floatCount = (payloadSize - 4) / sizeof(float);
+				resultBufF.resize(floatCount);
+				if (floatCount > 0)
+					memcpy(&resultBufF[0], raw + 4, floatCount * sizeof(float));
+			}
+		}
+		else
+		{
+			// Legacy: no header
+			const unsigned int floatCount = payloadSize / sizeof(float);
+			resultBufF.resize(floatCount);
+			if (floatCount > 0)
+				memcpy(&resultBufF[0], payload.c_str(), payloadSize);
+		}
+
 		reduceResultReady = true;
 		DDP_BROADCAST();
 		DDP_UNLOCK();
@@ -376,6 +515,11 @@ void glades::ddp::finalize()
 	ddpRank = 0;
 	ddpWorldSize = 1;
 	loginCount = 0;
+	ddpCompressionMode = 0;
+	ddpTopKRatio = 0.01f;
+	ddpTopKWarmupSteps = 0;
+	ddpBucketedStepCount = 0;
+	ddpResidual.clear();
 	ddpInitialized = false;
 }
 
@@ -426,7 +570,11 @@ void glades::ddp::allReduceSumInPlace(float* data, size_t count)
 		for (size_t i = 0; i < workerConnections.size(); ++i)
 		{
 			shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPResult");
-			sd->setBinaryPayload(reinterpret_cast<const char*>(&reduceAccumF[0]), byteSize);
+			unsigned int resultSize = 4 + byteSize;
+			std::vector<unsigned char> resultBuf(resultSize);
+			resultBuf[0] = 0; resultBuf[1] = 0; resultBuf[2] = 0; resultBuf[3] = 0;
+			memcpy(&resultBuf[4], &reduceAccumF[0], byteSize);
+			sd->setBinaryPayload(reinterpret_cast<const char*>(&resultBuf[0]), resultSize);
 			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
 		}
 
@@ -454,7 +602,11 @@ void glades::ddp::allReduceSumInPlace(float* data, size_t count)
 		if (rootConn)
 		{
 			shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
-			sd->setBinaryPayload(reinterpret_cast<const char*>(data), byteSize);
+			unsigned int sendSize = 4 + byteSize;
+			std::vector<unsigned char> sendBuf(sendSize);
+			sendBuf[0] = 0; sendBuf[1] = 0; sendBuf[2] = 0; sendBuf[3] = 0;
+			memcpy(&sendBuf[4], data, byteSize);
+			sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
 			ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
 		}
 
@@ -654,4 +806,318 @@ void glades::ddp::broadcastFromRoot(float* data, size_t count)
 		broadcastReady = false;
 		DDP_UNLOCK();
 	}
+}
+
+// ============================================================
+// Compression configuration
+// ============================================================
+void glades::ddp::setCompression(int mode)
+{
+	ddpCompressionMode = mode;
+}
+
+void glades::ddp::setTopKRatio(float ratio)
+{
+	if (ratio > 0.0f && ratio <= 1.0f)
+		ddpTopKRatio = ratio;
+}
+
+void glades::ddp::setTopKWarmupSteps(int steps)
+{
+	ddpTopKWarmupSteps = steps;
+}
+
+// ============================================================
+// Compressed AllReduce (modes 0, 1, 2)
+// ============================================================
+static void allReduceCompressed(float* data, size_t count, int effectiveMode)
+{
+	if (!ddpInitialized || ddpWorldSize <= 1 || count == 0)
+		return;
+
+	if (ddpRank == 0)
+	{
+		// === ROOT ===
+		DDP_LOCK();
+		reduceAccumF.resize(count);
+
+		if (effectiveMode == 2)
+		{
+			// Top-K: root sparsifies its own contribution.
+			if (ddpResidual.size() != count)
+				ddpResidual.assign(count, 0.0f);
+			for (size_t i = 0; i < count; ++i)
+				data[i] += ddpResidual[i];
+
+			size_t k = static_cast<size_t>(static_cast<float>(count) * ddpTopKRatio);
+			if (k == 0) k = 1;
+			if (k > count) k = count;
+
+			std::vector<float> absVals(count);
+			for (size_t i = 0; i < count; ++i)
+				absVals[i] = (data[i] >= 0.0f) ? data[i] : -data[i];
+
+			std::vector<float> absSort(absVals);
+			std::nth_element(absSort.begin(), absSort.begin() + static_cast<long>(count - k), absSort.end());
+			float threshold = absSort[count - k];
+
+			memset(&reduceAccumF[0], 0, count * sizeof(float));
+			for (size_t i = 0; i < count; ++i)
+			{
+				if (absVals[i] >= threshold)
+				{
+					reduceAccumF[i] = data[i];
+					ddpResidual[i] = 0.0f;
+				}
+				else
+				{
+					ddpResidual[i] = data[i];
+				}
+			}
+		}
+		else
+		{
+			memcpy(&reduceAccumF[0], data, count * sizeof(float));
+		}
+
+		reduceWorkersArrived = 0;
+		workerConnections.clear();
+		DDP_UNLOCK();
+
+		// Wait for all workers.
+		DDP_LOCK();
+		while (reduceWorkersArrived < static_cast<unsigned int>(ddpWorldSize - 1))
+			DDP_WAIT();
+
+		// Copy result locally.
+		memcpy(data, &reduceAccumF[0], count * sizeof(float));
+
+		// Send result to workers.
+		if (effectiveMode >= 1)
+		{
+			// Dense FP16 result.
+			const unsigned int resultSize = 4 + static_cast<unsigned int>(count) * 2;
+			std::vector<unsigned char> resultBuf(resultSize);
+			resultBuf[0] = static_cast<unsigned char>(effectiveMode);
+			resultBuf[1] = 0; resultBuf[2] = 0; resultBuf[3] = 0;
+			uint16_t* dst = reinterpret_cast<uint16_t*>(&resultBuf[4]);
+			for (size_t i = 0; i < count; ++i)
+				dst[i] = float_to_fp16(reduceAccumF[i]);
+
+			for (size_t i = 0; i < workerConnections.size(); ++i)
+			{
+				shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPResult");
+				sd->setBinaryPayload(reinterpret_cast<const char*>(&resultBuf[0]), resultSize);
+				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			}
+		}
+		else
+		{
+			// Mode 0: raw FP32 with header.
+			const unsigned int resultSize = 4 + static_cast<unsigned int>(count) * 4;
+			std::vector<unsigned char> resultBuf(resultSize);
+			resultBuf[0] = 0; resultBuf[1] = 0; resultBuf[2] = 0; resultBuf[3] = 0;
+			memcpy(&resultBuf[4], &reduceAccumF[0], count * sizeof(float));
+
+			for (size_t i = 0; i < workerConnections.size(); ++i)
+			{
+				shmea::ServiceData* sd = new shmea::ServiceData(workerConnections[i], "DDPResult");
+				sd->setBinaryPayload(reinterpret_cast<const char*>(&resultBuf[0]), resultSize);
+				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			}
+		}
+
+		workerConnections.clear();
+		reduceWorkersArrived = 0;
+		DDP_UNLOCK();
+	}
+	else
+	{
+		// === NON-ROOT WORKER ===
+		DDP_LOCK();
+		reduceResultReady = false;
+		DDP_UNLOCK();
+
+		GNet::Connection* rootConn = ddpServer->getConnectionFromName(shmea::GString(""));
+		if (!rootConn)
+		{
+			char workerName[64];
+			sprintf(workerName, "ddp_worker_%d", ddpRank);
+			rootConn = ddpServer->getConnectionFromName(shmea::GString(workerName));
+		}
+
+		if (rootConn)
+		{
+			if (effectiveMode == 2)
+			{
+				// Top-K sparse send.
+				if (ddpResidual.size() != count)
+					ddpResidual.assign(count, 0.0f);
+				for (size_t i = 0; i < count; ++i)
+					data[i] += ddpResidual[i];
+
+				size_t k = static_cast<size_t>(static_cast<float>(count) * ddpTopKRatio);
+				if (k == 0) k = 1;
+				if (k > count) k = count;
+
+				std::vector<float> absVals(count);
+				for (size_t i = 0; i < count; ++i)
+					absVals[i] = (data[i] >= 0.0f) ? data[i] : -data[i];
+
+				std::vector<float> absSort(absVals);
+				std::nth_element(absSort.begin(), absSort.begin() + static_cast<long>(count - k), absSort.end());
+				float threshold = absSort[count - k];
+
+				std::vector<uint32_t> indices;
+				std::vector<uint16_t> values;
+				indices.reserve(k);
+				values.reserve(k);
+
+				for (size_t i = 0; i < count; ++i)
+				{
+					if (absVals[i] >= threshold)
+					{
+						indices.push_back(static_cast<uint32_t>(i));
+						values.push_back(float_to_fp16(data[i]));
+						ddpResidual[i] = 0.0f;
+					}
+					else
+					{
+						ddpResidual[i] = data[i];
+					}
+				}
+
+				uint32_t nnz = static_cast<uint32_t>(indices.size());
+				unsigned int sendSize = 4 + 4 + nnz * 4 + nnz * 2;
+				std::vector<unsigned char> sendBuf(sendSize);
+				sendBuf[0] = 2; sendBuf[1] = 0; sendBuf[2] = 0; sendBuf[3] = 0;
+				memcpy(&sendBuf[4], &nnz, 4);
+				if (nnz > 0)
+				{
+					memcpy(&sendBuf[8], &indices[0], nnz * 4);
+					memcpy(&sendBuf[8 + nnz * 4], &values[0], nnz * 2);
+				}
+
+				shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
+				sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
+				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			}
+			else if (effectiveMode == 1)
+			{
+				// FP16 dense send.
+				unsigned int sendSize = 4 + static_cast<unsigned int>(count) * 2;
+				std::vector<unsigned char> sendBuf(sendSize);
+				sendBuf[0] = 1; sendBuf[1] = 0; sendBuf[2] = 0; sendBuf[3] = 0;
+				uint16_t* dst = reinterpret_cast<uint16_t*>(&sendBuf[4]);
+				for (size_t i = 0; i < count; ++i)
+					dst[i] = float_to_fp16(data[i]);
+
+				shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
+				sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
+				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			}
+			else
+			{
+				// Mode 0: raw FP32 with header.
+				unsigned int sendSize = 4 + static_cast<unsigned int>(count) * 4;
+				std::vector<unsigned char> sendBuf(sendSize);
+				sendBuf[0] = 0; sendBuf[1] = 0; sendBuf[2] = 0; sendBuf[3] = 0;
+				memcpy(&sendBuf[4], data, count * sizeof(float));
+
+				shmea::ServiceData* sd = new shmea::ServiceData(rootConn, "DDPReduce");
+				sd->setBinaryPayload(reinterpret_cast<const char*>(&sendBuf[0]), sendSize);
+				ddpServer->send(shmea::GPointer<shmea::ServiceData>(sd));
+			}
+		}
+
+		// Wait for result.
+		DDP_LOCK();
+		while (!reduceResultReady)
+			DDP_WAIT();
+
+		if (resultBufF.size() == count)
+			memcpy(data, &resultBufF[0], count * sizeof(float));
+
+		reduceResultReady = false;
+		DDP_UNLOCK();
+	}
+}
+
+// ============================================================
+// Bucketed AllReduce (compressed)
+// ============================================================
+void glades::ddp::allReduceSumInPlaceBucketed(float** buffers, size_t* counts,
+                                              int numBuffers,
+                                              unsigned int* scalarBuf,
+                                              size_t scalarCount)
+{
+	if (!ddpInitialized || ddpWorldSize <= 1)
+		return;
+	if (numBuffers <= 0 && scalarCount == 0)
+		return;
+
+	size_t totalCount = 0;
+	for (int i = 0; i < numBuffers; ++i)
+		totalCount += counts[i];
+
+	if (totalCount == 0 && scalarCount == 0)
+		return;
+
+	int effectiveMode = ddpCompressionMode;
+	if (effectiveMode == 2 && ddpBucketedStepCount < ddpTopKWarmupSteps)
+		effectiveMode = 1;
+
+	// Flatten.
+	std::vector<float> flat(totalCount);
+	{
+		size_t offset = 0;
+		for (int i = 0; i < numBuffers; ++i)
+		{
+			if (counts[i] > 0)
+				memcpy(&flat[offset], buffers[i], counts[i] * sizeof(float));
+			offset += counts[i];
+		}
+	}
+
+	// Dispatch.
+	if (effectiveMode == 0)
+		allReduceSumInPlace(&flat[0], totalCount);
+	else
+		allReduceCompressed(&flat[0], totalCount, effectiveMode);
+
+	// Scatter back.
+	{
+		size_t offset = 0;
+		for (int i = 0; i < numBuffers; ++i)
+		{
+			if (counts[i] > 0)
+				memcpy(buffers[i], &flat[offset], counts[i] * sizeof(float));
+			offset += counts[i];
+		}
+	}
+
+	// Scalars always raw FP32.
+	if (scalarCount > 0 && scalarBuf)
+		allReduceSumInPlace(scalarBuf, scalarCount);
+
+	++ddpBucketedStepCount;
+}
+
+// ============================================================
+// Compression configuration
+// ============================================================
+void glades::ddp::setCompression(int mode)
+{
+	ddpCompressionMode = mode;
+}
+
+void glades::ddp::setTopKRatio(float ratio)
+{
+	if (ratio > 0.0f && ratio <= 1.0f)
+		ddpTopKRatio = ratio;
+}
+
+void glades::ddp::setTopKWarmupSteps(int steps)
+{
+	ddpTopKWarmupSteps = steps;
 }

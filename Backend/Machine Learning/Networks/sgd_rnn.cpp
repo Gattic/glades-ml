@@ -206,6 +206,8 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		TensorRNNState& tensorRnn;
 		int H;
 		unsigned int outSize;
+		glades::rng::Engine& rngEngine;
+		shmea::GLogger* logger;
 
 		ApplyBatch(NNetwork& net, TensorRNNState& tr, int h, unsigned int os)
 		    : skeleton(net.skeleton),
@@ -217,7 +219,9 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		      running(net.running),
 		      tensorRnn(tr),
 		      H(h),
-		      outSize(os)
+		      outSize(os),
+		      rngEngine(net.rngEngine),
+		      logger(net.getLogger())
 		{
 		}
 
@@ -321,6 +325,80 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 				return false;
 			}
 
+			// ATLAS optimizer branch.
+			const bool useAtlas = (trainingConfig.optimizer.type == OptimizerConfig::ATLAS);
+			if (useAtlas)
+			{
+				const ATLASConfig& ac = trainingConfig.atlas;
+
+				// Output weights (Why)
+				if (!tensorRnn.O.atlasWhy.initialized && tensorRnn.O.out > 0 && tensorRnn.O.in > 0)
+					atlas::initWeightState(tensorRnn.O.atlasWhy, tensorRnn.O.out, tensorRnn.O.in, ac.rank, ac.muMin, rngEngine, logger);
+				if (tensorRnn.O.atlasWhy.initialized)
+					atlas::applyStep(tensorRnn.O.atlasWhy, &tensorRnn.O.Why[0], &tensorRnn.O.gWhy[0],
+						tensorRnn.O.out, tensorRnn.O.in, invBatch, lrOut, wd1Out, wd2Out, gradScale,
+						ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
+
+				// Output bias: standard SGD
+				for (unsigned int k = 0; k < outSize; ++k)
+				{
+					float gB = tensorRnn.O.gBias[k] * invBatch;
+					gB *= gradScale;
+					tensorRnn.O.bias[k] -= (lrOut * gB);
+					tensorRnn.O.gBias[k] = 0.0f;
+					if (!is_finite(tensorRnn.O.bias[k]))
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_RNN: non-finite output bias after ATLAS update (NaN/Inf)");
+						running = false;
+						return false;
+					}
+				}
+
+				// Hidden layers
+				for (int l = 0; l < H; ++l)
+				{
+					const unsigned int li = static_cast<unsigned int>(l);
+					TensorRNNState::Hidden& hl = tensorRnn.H[static_cast<size_t>(l)];
+					const float lr = skeleton->getLearningRate(li) * lrScheduleMultiplier;
+					const float wd1 = skeleton->getWeightDecay1(li);
+					const float wd2 = skeleton->getWeightDecay2(li);
+
+					// Wxh
+					if (!hl.atlasWxh.initialized && hl.h > 0 && hl.in > 0)
+						atlas::initWeightState(hl.atlasWxh, hl.h, hl.in, ac.rank, ac.muMin, rngEngine, logger);
+					if (hl.atlasWxh.initialized)
+						atlas::applyStep(hl.atlasWxh, &hl.Wxh[0], &hl.gWxh[0],
+							hl.h, hl.in, invBatch, lr, wd1, wd2, gradScale,
+							ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
+
+					// Whh
+					if (!hl.atlasWhh.initialized && hl.h > 0)
+						atlas::initWeightState(hl.atlasWhh, hl.h, hl.h, ac.rank, ac.muMin, rngEngine, logger);
+					if (hl.atlasWhh.initialized)
+						atlas::applyStep(hl.atlasWhh, &hl.Whh[0], &hl.gWhh[0],
+							hl.h, hl.h, invBatch, lr, wd1, wd2, gradScale,
+							ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
+
+					// Bias: standard SGD
+					for (unsigned int i = 0; i < hl.h; ++i)
+					{
+						float gB = hl.gBias[i] * invBatch;
+						gB *= gradScale;
+						hl.bias[i] -= (lr * gB);
+						hl.gBias[i] = 0.0f;
+						if (!is_finite(hl.bias[i]))
+						{
+							lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_RNN: non-finite hidden bias after ATLAS update (NaN/Inf)");
+							running = false;
+							return false;
+						}
+					}
+				}
+
+				return true;
+			}
+			else
+			{
 			// Update output weights.
 			for (size_t idx = 0; idx < tensorRnn.O.Why.size(); ++idx)
 			{
@@ -425,6 +503,7 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 			}
 
 			return true;
+			} // else (momentum SGD)
 		}
 	};
 	ApplyBatch applyBatch(*this, tensorRnn, H, outSize);

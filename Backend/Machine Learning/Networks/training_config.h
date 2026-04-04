@@ -234,6 +234,27 @@ struct LearningRateScheduleConfig
 		minMultiplier = minMult;
 	}
 
+	// Step-level multiplier: progress is a float in [0, 1] representing
+	// fractional progress through total training (e.g. step/totalSteps).
+	inline float multiplierSmooth(float progress) const
+	{
+		if (progress < 0.0f) progress = 0.0f;
+		if (progress > 1.0f) progress = 1.0f;
+
+		switch (type)
+		{
+		case COSINE:
+		{
+			const double minM = static_cast<double>(minMultiplier);
+			const double cosv = cos(3.14159265358979323846 * static_cast<double>(progress));
+			return static_cast<float>(minM + 0.5 * (1.0 - minM) * (1.0 + cosv));
+		}
+		case NONE:
+		default:
+			return 1.0f;
+		}
+	}
+
 	inline float multiplier(int epochFromStart) const
 	{
 		if (epochFromStart < 0)
@@ -306,7 +327,8 @@ struct OptimizerConfig
 	enum Type
 	{
 		SGD_MOMENTUM = 0,
-		ADAMW = 1
+		ADAMW = 1,
+		ATLAS = 2
 	};
 
 	Type type;
@@ -323,6 +345,68 @@ struct OptimizerConfig
 	      adamBeta2(0.999f),
 	      adamEps(1e-8f),
 	      adamBiasCorrection(true)
+	{
+	}
+};
+
+// ATLAS optimizer configuration (BRSP variant).
+//
+// ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces) with
+// Baseline-Regularized Subspace Preconditioning (BRSP):
+// - Fisher-diagonal preconditioning in a low-rank subspace
+// - Data-driven baseline preconditioning (sigma2) in the complement space
+// - EMA-blended subspace refresh with Fisher transform (no catastrophic resets)
+// - Optional Predictive Natural Gradient (PNG) temporal extrapolation
+struct ATLASConfig
+{
+	// Subspace rank per weight matrix.
+	// The actual rank is clamped to min(rank, min(m, n)) for each weight matrix.
+	// Larger rank captures more curvature information at higher compute/memory cost.
+	unsigned int rank;
+
+	// Fisher EMA decay rate. Controls how quickly the Fisher diagonal and sigma2
+	// adapt. Higher values (closer to 1) give more stable estimates.
+	float beta;
+
+	// Prediction coefficient bounds. The adaptive mu is clamped to [muMin, muMax].
+	// mu=0 disables temporal prediction (falls back to plain natural gradient).
+	float muMin;
+	float muMax;
+
+	// Subspace refresh interval (optimizer steps). Every tSub steps, the subspace
+	// basis U is refreshed via randomized power iteration with EMA blending.
+	// Set to 0 to disable periodic refresh (use initial subspace only).
+	unsigned int tSub;
+
+	// Number of power iteration steps for subspace SVD computation.
+	// More iterations give better subspace approximation at higher cost.
+	unsigned int powerIters;
+
+	// Regularization epsilon added to Fisher diagonal and sigma2 before inversion.
+	float eps;
+
+	// Maximum ratio of effective baseline learning rate to nominal lr.
+	// Caps baselineRate = lr/(sigma2+eps) at kappaMax*lr to prevent divergence
+	// as sigma2 converges to small gradient variance during training.
+	// Higher values allow more aggressive preconditioning; 10 is a safe default.
+	float kappaMax;
+
+	// EMA blending coefficient for subspace refresh. Controls how much the new
+	// power-iteration basis replaces the old basis at each refresh.
+	// 0 = keep old basis (no refresh), 1 = full replacement (old ATLAS behavior).
+	// Recommended: 0.5 (balanced blending preserves Fisher/prevGz continuity).
+	float betaRefresh;
+
+	ATLASConfig()
+	    : rank(128u),
+	      beta(0.999f),
+	      muMin(0.01f),
+	      muMax(0.3f),
+	      tSub(200u),
+	      powerIters(2u),
+	      eps(1e-8f),
+	      kappaMax(10.0f),
+	      betaRefresh(0.5f)
 	{
 	}
 };
@@ -397,8 +481,12 @@ struct DDPConfig
 	int rank;               // this worker's rank (0 = root)
 	int worldSize;          // total workers
 	int rootPort;           // port root listens on
+	int compressionMode;    // 0=none, 1=FP16, 2=FP16+TopK
+	float topKRatio;        // fraction of gradients to keep (default 0.01)
+	int topKWarmupSteps;    // use FP16-only for first N steps (default 0)
 	DDPConfig() : enable(false), linearLRScaling(true),
-	              rank(0), worldSize(1), rootPort(9200) {}
+	              rank(0), worldSize(1), rootPort(9200),
+	              compressionMode(0), topKRatio(0.01f), topKWarmupSteps(0) {}
 };
 
 // CNN-specific run configuration.
@@ -461,6 +549,7 @@ struct DeconvConfig
 		unsigned int padH, padW;
 		bool useBatchNorm;
 		bool useReLU; // false for last layer (use sigmoid)
+		bool useUpsampleConv; // nearest-neighbor upsample + standard conv (no checkerboard)
 
 		DeconvLayerSpec()
 		    : outChannels(0u),
@@ -468,7 +557,8 @@ struct DeconvConfig
 		      strideH(2u), strideW(2u),
 		      padH(1u), padW(1u),
 		      useBatchNorm(false),
-		      useReLU(true)
+		      useReLU(true),
+		      useUpsampleConv(false)
 		{
 		}
 	};
@@ -506,6 +596,9 @@ struct TrainingConfig
 
 	// Optimizer configuration.
 	OptimizerConfig optimizer;
+
+	// ATLAS optimizer configuration (used when optimizer.type==ATLAS).
+	ATLASConfig atlas;
 
 	// Learning rate schedule multiplier configuration.
 	LearningRateScheduleConfig lrSchedule;
@@ -558,6 +651,7 @@ struct TrainingConfig
 	      globalGradClipNorm(0.0f),
 	      perElementGradClip(10.0f),
 	      optimizer(),
+	      atlas(),
 	      lrSchedule(),
 	      bayesianLR(),
 	      transformer(),

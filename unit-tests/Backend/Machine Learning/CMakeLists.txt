@@ -24,6 +24,9 @@ garch-test.cpp
 egarch-test.cpp
 gan-test.cpp
 hyperparameter-tuner-test.cpp
+atlas-test.cpp
+atlas-bench.cpp
+sfcka-test.cpp
 )
 
 if(GLADES_ENABLE_CUDA)

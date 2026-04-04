@@ -57,6 +57,14 @@ bool sgemm_rowmajor_abt(int M, int N, int K,
                           float beta,
                           float* C, int ldc);
 
+// Row-major right-side upper-triangular solve (in-place):
+// Solves X[M,N] * R[N,N] = alpha * B[M,N]  where R is upper triangular.
+// B is overwritten with the solution X.
+bool strsm_rowmajor_right_upper(int M, int N,
+                                 float alpha,
+                                 const float* R, int ldr,
+                                 float* B, int ldb);
+
 // Row-major batched strided SGEMM:
 // C_i[M,N] = alpha * A_i[M,K] * B_i[K,N] + beta * C_i[M,N]
 // for i in [0, batchCount).
@@ -102,6 +110,7 @@ namespace gpu {
 inline bool blasInit() { return false; }
 inline void blasDestroy() {}
 
+inline bool strsm_rowmajor_right_upper(int, int, float, const float*, int, float*, int) { return false; }
 inline bool sgemm_rowmajor(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
