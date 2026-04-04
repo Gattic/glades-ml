@@ -25,5 +25,6 @@
 #include <unistd.h>
 
 void ATLASUnitTest();
+void ATLASGpuNaNTest();
 
 #endif

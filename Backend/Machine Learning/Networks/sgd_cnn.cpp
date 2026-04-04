@@ -826,46 +826,36 @@ void glades::NNetwork::SGDHelper_CNN(unsigned int inputRowCounter, int runType)
 			const unsigned int convM = cl.outC;
 			const unsigned int convN = cl.inC * cl.kH * cl.kW;
 
-			// Initialize ATLAS state for this conv layer if needed
-			if (!cl.atlasW.initialized && convM > 0 && convN > 0)
-				atlas::initWeightState(cl.atlasW, convM, convN, ac.rank, ac.muMin, rngEngine, getLogger());
-
-			if (cl.atlasW.initialized)
+			if (!atlas::update(cl.atlasW, &cl.W[0], &cl.gW[0],
+				convM, convN, invBatch, baseLR, wd1, wd2, gradScale,
+				ac, rngEngine, getLogger(), "cnn.conv"))
 			{
-				// ATLAS step for conv weight matrix
-				atlas::applyStep(cl.atlasW,
-					&cl.W[0], &cl.gW[0],
-					convM, convN,
-					invBatch, baseLR,
-					wd1, wd2, gradScale,
-					ac.beta, ac.muMin, ac.muMax,
-					ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					rngEngine, getLogger());
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+				    "SGDHelper_CNN: ATLAS conv weight update entered NaN recovery");
+				running = false;
+				return;
 			}
 
-			// Bias update: standard SGD (no subspace projection for 1D vectors)
-			for (unsigned int c = 0; c < cl.outC; ++c)
+			if (!atlas::updateBias(&cl.bias[0], &cl.gBias[0],
+			                       cl.outC, invBatch, baseLR, gradScale))
 			{
-				float g = cl.gBias[c] * invBatch * gradScale;
-				cl.bias[c] -= baseLR * g;
-				cl.gBias[c] = 0.0f;
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+				    "SGDHelper_CNN: ATLAS conv bias update produced NaN/Inf");
+				running = false;
+				return;
 			}
 
-			// BatchNorm params: standard SGD (no subspace projection)
 			if (cs.spatialInfo[l].useBatchNorm)
 			{
-				for (unsigned int c = 0; c < cl.outC; ++c)
+				if (!atlas::updateBias(&cl.bnGamma[0], &cl.gBnGamma[0],
+				                       cl.outC, invBatch, baseLR, gradScale) ||
+				    !atlas::updateBias(&cl.bnBeta[0], &cl.gBnBeta[0],
+				                       cl.outC, invBatch, baseLR, gradScale))
 				{
-					{
-						float g = cl.gBnGamma[c] * invBatch * gradScale;
-						cl.bnGamma[c] -= baseLR * g;
-						cl.gBnGamma[c] = 0.0f;
-					}
-					{
-						float g = cl.gBnBeta[c] * invBatch * gradScale;
-						cl.bnBeta[c] -= baseLR * g;
-						cl.gBnBeta[c] = 0.0f;
-					}
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "SGDHelper_CNN: ATLAS batchnorm param update produced NaN/Inf");
+					running = false;
+					return;
 				}
 			}
 		}
@@ -875,29 +865,23 @@ void glades::NNetwork::SGDHelper_CNN(unsigned int inputRowCounter, int runType)
 		{
 			TensorCNNState::FCTransition& fc = tensorCnn.fcLayers[t];
 
-			// Initialize ATLAS state for this FC layer if needed
-			if (!fc.atlasW.initialized && fc.out > 0 && fc.in > 0)
-				atlas::initWeightState(fc.atlasW, fc.out, fc.in, ac.rank, ac.muMin, rngEngine, getLogger());
-
-			if (fc.atlasW.initialized)
+			if (!atlas::update(fc.atlasW, &fc.W[0], &fc.gW[0],
+				fc.out, fc.in, invBatch, baseLR, wd1, wd2, gradScale,
+				ac, rngEngine, getLogger(), "cnn.fc"))
 			{
-				// ATLAS step for FC weight matrix
-				atlas::applyStep(fc.atlasW,
-					&fc.W[0], &fc.gW[0],
-					fc.out, fc.in,
-					invBatch, baseLR,
-					wd1, wd2, gradScale,
-					ac.beta, ac.muMin, ac.muMax,
-					ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					rngEngine, getLogger());
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+				    "SGDHelper_CNN: ATLAS FC weight update entered NaN recovery");
+				running = false;
+				return;
 			}
 
-			// Bias update: standard SGD (no subspace projection for 1D vectors)
-			for (unsigned int j = 0; j < fc.out; ++j)
+			if (!atlas::updateBias(&fc.bias[0], &fc.gBias[0],
+			                       fc.out, invBatch, baseLR, gradScale))
 			{
-				float g = fc.gBias[j] * invBatch * gradScale;
-				fc.bias[j] -= baseLR * g;
-				fc.gBias[j] = 0.0f;
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+				    "SGDHelper_CNN: ATLAS FC bias update produced NaN/Inf");
+				running = false;
+				return;
 			}
 		}
 	}

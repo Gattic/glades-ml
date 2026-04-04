@@ -1,11 +1,17 @@
 // ATLAS optimizer implementation (BRSP variant).
 // See atlas_optimizer.h for API documentation.
 #include "atlas_optimizer.h"
+#include "gemm_helpers.h"
+#include "training_config.h"
+#include "transformer_kernels.h"
 #include "Backend/Database/GLogger.h"
+#include <cmath>
 #include <sstream>
 
 namespace glades {
 namespace atlas {
+
+using glades::transformer_kernels::axpy_f32;
 
 // logfmt helpers (local to this TU)
 static void append_kv(std::ostringstream& oss, const char* k, unsigned int v)
@@ -19,6 +25,15 @@ static void append_kv(std::ostringstream& oss, const char* k, unsigned long long
 static void append_kv(std::ostringstream& oss, const char* k, float v)
 {
 	oss << ' ' << k << '=' << v;
+}
+
+// NaN/Inf check for internal state protection.
+// Uses std::isfinite which is safe under all compiler optimization levels,
+// unlike the manual (x == x) && (x - x == 0.0f) pattern which can be
+// optimized away under -ffast-math.
+static inline bool atlas_isfinite(float x)
+{
+	return std::isfinite(x);
 }
 
 void gramSchmidt(float* Q, unsigned int m, unsigned int r,
@@ -80,6 +95,17 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 	if (state.r > n) state.r = n;
 	if (state.r == 0u) state.r = 1u;
 
+	if (state.r > 256u && logger)
+	{
+		std::ostringstream oss;
+		oss << "event=atlas_rank_warning";
+		append_kv(oss, "m", m);
+		append_kv(oss, "n", n);
+		append_kv(oss, "rank", state.r);
+		oss << " msg=rank>256_may_use_significant_memory";
+		logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
 	const unsigned int r = state.r;
 
 	// Initialize U with random Gaussian values, then orthogonalize
@@ -95,6 +121,18 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 
 	// Initialize previous compressed gradient to zero
 	state.prevGz.assign(static_cast<size_t>(r) * static_cast<size_t>(n), 0.0f);
+
+	// Allocate persistent scratch buffers (reused every step, avoids per-step heap churn).
+	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
+	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
+	state.scratch_gz.resize(rn);
+	state.scratch_corrected.resize(rn);
+	state.scratch_U_old.resize(mr);
+	state.scratch_f_old.resize(static_cast<size_t>(r));
+	state.scratch_B.resize(rn);
+	state.scratch_Z.resize(mr);
+	state.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
+	state.scratch_prevGzOld.resize(rn);
 
 	state.sigma2 = 1.0f;
 	state.mu = muInit;
@@ -112,56 +150,51 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 		append_kv(oss, "mu_init", muInit);
 		append_kv(oss, "U_size", static_cast<unsigned long long>(state.U.size()));
 		append_kv(oss, "prevGz_size", static_cast<unsigned long long>(state.prevGz.size()));
+		const unsigned long long totalBytes =
+		    static_cast<unsigned long long>(state.U.size() + state.fisherDiag.size()
+		        + state.prevGz.size()
+		        + state.scratch_gz.size() + state.scratch_corrected.size()
+		        + state.scratch_U_old.size() + state.scratch_f_old.size()
+		        + state.scratch_B.size() + state.scratch_Z.size()
+		        + state.scratch_overlap.size() + state.scratch_prevGzOld.size())
+		    * static_cast<unsigned long long>(sizeof(float));
+		append_kv(oss, "total_bytes", totalBytes);
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
 }
 
-void refreshSubspace(WeightState& state, const float* grad,
+bool refreshSubspace(WeightState& state, const float* grad,
                      unsigned int m, unsigned int n,
                      unsigned int powerIters, float betaRefresh,
                      glades::rng::Engine& rng,
                      shmea::GLogger* logger)
 {
 	const unsigned int r = state.r;
-	if (r == 0u || m == 0u || n == 0u) return;
+	if (r == 0u || m == 0u || n == 0u) return true;
 
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
-	const size_t nr = static_cast<size_t>(n) * static_cast<size_t>(r);
+	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
 
 	// Save old basis and Fisher for EMA blending and Fisher transform.
-	std::vector<float> U_old(state.U.begin(), state.U.end());
-	std::vector<float> f_old(state.fisherDiag.begin(), state.fisherDiag.end());
+	std::copy(state.U.begin(), state.U.end(), state.scratch_U_old.begin());
+	std::copy(state.fisherDiag.begin(), state.fisherDiag.end(), state.scratch_f_old.begin());
+	std::vector<float>& U_old = state.scratch_U_old;
+	std::vector<float>& f_old = state.scratch_f_old;
 
 	// --- Randomized power iteration (warm-started from current U) ---
 	std::vector<float>& Q = state.U;
-	std::vector<float> B(nr, 0.0f);
-	std::vector<float> Z(mr, 0.0f);
+	// B stored as [r, n] (transposed from original [n, r]) for SIMD-friendly access.
+	std::vector<float>& B = state.scratch_B;
+	std::vector<float>& Z = state.scratch_Z;
 
 	for (unsigned int p = 0; p < powerIters; ++p)
 	{
-		// B = grad^T * Q
-		std::fill(B.begin(), B.end(), 0.0f);
-		for (unsigned int i = 0; i < m; ++i)
-		{
-			for (unsigned int c = 0; c < r; ++c)
-			{
-				const float q_ic = Q[i * r + c];
-				for (unsigned int j = 0; j < n; ++j)
-					B[j * r + c] += grad[i * n + j] * q_ic;
-			}
-		}
+		// B[r,n] = Q^T[r,m] * grad[m,n]  (Q is [m,r], so Q^T is [r,m])
+		glades::gemm::atb(&B[0], &Q[0], grad, r, m, n, 1.0f);
 
-		// Z = grad * B
-		std::fill(Z.begin(), Z.end(), 0.0f);
-		for (unsigned int i = 0; i < m; ++i)
-		{
-			for (unsigned int j = 0; j < n; ++j)
-			{
-				const float g_ij = grad[i * n + j];
-				for (unsigned int c = 0; c < r; ++c)
-					Z[i * r + c] += g_ij * B[j * r + c];
-			}
-		}
+		// Z[m,r] = grad[m,n] * B[r,n]^T
+		// B is [r,n] row-major; B^T is [n,r]; Z[i,c] = dot(grad[i,:], B[c,:])
+		glades::gemm::abt(&Z[0], grad, &B[0], m, n, r, 1.0f);
 
 		std::copy(Z.begin(), Z.end(), Q.begin());
 		gramSchmidt(&Q[0], m, r, logger);
@@ -176,16 +209,9 @@ void refreshSubspace(WeightState& state, const float* grad,
 
 	// --- Compute overlap matrix O = U_final^T * U_old [r x r] ---
 	// O[c*r+j] = sum_i U_final[i*r+c] * U_old[i*r+j]
-	std::vector<float> overlap(static_cast<size_t>(r) * static_cast<size_t>(r), 0.0f);
-	for (unsigned int i = 0; i < m; ++i)
-	{
-		for (unsigned int c = 0; c < r; ++c)
-		{
-			const float u_ic = Q[i * r + c];
-			for (unsigned int j = 0; j < r; ++j)
-				overlap[c * r + j] += u_ic * U_old[i * r + j];
-		}
-	}
+	// This is O[r,r] = Q^T[r,m] * U_old[m,r]
+	std::vector<float>& overlap = state.scratch_overlap;
+	glades::gemm::atb(&overlap[0], &Q[0], &U_old[0], r, m, r, 1.0f);
 
 	// --- Transform Fisher diagonal into new basis ---
 	// f_new[c] = sum_j O[c,j]^2 * f_old[j]
@@ -205,7 +231,8 @@ void refreshSubspace(WeightState& state, const float* grad,
 
 	// --- Transform prevGz into new basis ---
 	// prevGz_new[c*n+j] = sum_k O[c,k] * prevGz_old[k*n+j]
-	std::vector<float> prevGzOld(state.prevGz.begin(), state.prevGz.end());
+	std::vector<float>& prevGzOld = state.scratch_prevGzOld;
+	std::copy(state.prevGz.begin(), state.prevGz.end(), prevGzOld.begin());
 	std::fill(state.prevGz.begin(), state.prevGz.end(), 0.0f);
 	for (unsigned int c = 0; c < r; ++c)
 	{
@@ -213,12 +240,44 @@ void refreshSubspace(WeightState& state, const float* grad,
 		{
 			const float o_ck = overlap[c * r + k];
 			if (o_ck == 0.0f) continue;
-			for (unsigned int j = 0; j < n; ++j)
-				state.prevGz[c * n + j] += o_ck * prevGzOld[k * n + j];
+			axpy_f32(&state.prevGz[c * n], &prevGzOld[k * n], o_ck, n);
 		}
 	}
 
-	if (logger)
+	// Verify U and Fisher are finite after refresh.
+	bool refreshOk = true;
+	for (size_t idx = 0; idx < mr; ++idx)
+	{
+		if (!atlas_isfinite(Q[idx]))
+		{
+			refreshOk = false;
+			break;
+		}
+	}
+	if (refreshOk)
+	{
+		for (unsigned int c = 0; c < r; ++c)
+		{
+			if (!atlas_isfinite(state.fisherDiag[c]))
+			{
+				refreshOk = false;
+				break;
+			}
+		}
+	}
+
+	if (!refreshOk && logger)
+	{
+		std::ostringstream oss;
+		oss << "event=atlas_refresh_nonfinite";
+		append_kv(oss, "step", state.step);
+		append_kv(oss, "m", m);
+		append_kv(oss, "n", n);
+		append_kv(oss, "rank", r);
+		logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
+	if (logger && refreshOk)
 	{
 		float fMin = state.fisherDiag[0];
 		float fMax = state.fisherDiag[0];
@@ -252,20 +311,30 @@ void refreshSubspace(WeightState& state, const float* grad,
 		append_kv(oss, "fisher_mean", static_cast<float>(fSum / static_cast<double>(r)));
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
+
+	return refreshOk;
 }
 
-void applyStep(WeightState& state,
+bool applyStep(WeightState& state,
                float* W, float* gW,
                unsigned int m, unsigned int n,
                float invBatch, float lr,
                float wd1, float wd2, float gradScale,
-               float beta, float muMin, float muMax,
-               float eps, unsigned int tSub,
-               unsigned int powerIters, float betaRefresh,
+               const ATLASConfig& ac,
                glades::rng::Engine& rng,
-               shmea::GLogger* logger)
+               shmea::GLogger* logger,
+               const char* tag)
 {
-	if (!state.initialized) return;
+	if (!state.initialized) return false;
+	bool recovered = false;
+
+	const float beta = ac.beta;
+	const float muMin = ac.muMin;
+	const float muMax = ac.muMax;
+	const float eps = ac.eps;
+	const float kappaMax = ac.kappaMax;
+	const unsigned int tSub = ac.tSub;
+	const float muGrowthRate = ac.muGrowthRate;
 
 	const unsigned int r = state.r;
 	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
@@ -276,6 +345,20 @@ void applyStep(WeightState& state,
 		&& (state.step % static_cast<unsigned long long>(tSub)) == 0ULL;
 
 	const float gScale = invBatch * gradScale;
+
+	// === Bias correction factor ===
+	// Compensates for zero-initialization bias in EMA quantities.
+	// Applied to effective sigma2 and fisherDiag when computing learning rates,
+	// NOT to the stored raw EMA values (which remain uncorrected for stability).
+	float bcFactor = 1.0f;
+	if (ac.biasCorrection)
+	{
+		const double betaPow = pow(static_cast<double>(beta),
+		                           static_cast<double>(state.step));
+		const double denom = 1.0 - betaPow;
+		if (denom > 1e-15)
+			bcFactor = static_cast<float>(1.0 / denom);
+	}
 
 	// === Step 1: Update global second moment sigma2 ===
 	// sigma2 is the EMA of mean(G^2), providing a data-driven baseline
@@ -289,15 +372,19 @@ void applyStep(WeightState& state,
 		}
 		gMeanSq /= static_cast<double>(mn);
 		state.sigma2 = beta * state.sigma2 + (1.0f - beta) * static_cast<float>(gMeanSq);
+		if (!atlas_isfinite(state.sigma2))
+		{
+			state.sigma2 = 1.0f;
+			recovered = true;
+		}
 	}
 
 	// === Step 2: Periodic subspace refresh (EMA-blended) ===
+	// Pass raw gW directly — eigenvectors of G*G^T are scale-invariant.
 	if (tSub > 0u && (state.step % static_cast<unsigned long long>(tSub)) == 0ULL)
 	{
-		std::vector<float> avgGrad(mn);
-		for (size_t idx = 0; idx < mn; ++idx)
-			avgGrad[idx] = gW[idx] * gScale;
-		refreshSubspace(state, &avgGrad[0], m, n, powerIters, betaRefresh, rng, logger);
+		if (!refreshSubspace(state, gW, m, n, ac.powerIters, ac.betaRefresh, rng, logger))
+			recovered = true;
 	}
 
 	// === Step 3: Decoupled weight decay (applied in full parameter space) ===
@@ -317,17 +404,9 @@ void applyStep(WeightState& state,
 	}
 
 	// === Step 4: Project gradient to subspace ===
-	// gz[c*n+j] = sum_i U[i*r+c] * G[i*n+j]
-	std::vector<float> gz(rn, 0.0f);
-	for (unsigned int i = 0; i < m; ++i)
-	{
-		for (unsigned int c = 0; c < r; ++c)
-		{
-			const float u_ic = state.U[i * r + c];
-			for (unsigned int j = 0; j < n; ++j)
-				gz[c * n + j] += u_ic * (gW[i * n + j] * gScale);
-		}
-	}
+	// gz[r,n] = gScale * U^T[r,m] * gW[m,n]
+	std::vector<float>& gz = state.scratch_gz;
+	glades::gemm::atb(&gz[0], &state.U[0], gW, r, m, n, gScale);
 
 	// === Step 5: Update Fisher diagonal (EMA of mean squared projected gradient) ===
 	const float oneMinusBeta = 1.0f - beta;
@@ -341,56 +420,91 @@ void applyStep(WeightState& state,
 		}
 		const float meansq = static_cast<float>(sumsq / static_cast<double>(n));
 		state.fisherDiag[c] = beta * state.fisherDiag[c] + oneMinusBeta * meansq;
+		if (!atlas_isfinite(state.fisherDiag[c]))
+		{
+			state.fisherDiag[c] = 1.0f;
+			recovered = true;
+		}
 	}
 
 	// === Step 6: Full-space baseline update ===
-	// W -= (lr / (sigma2 + eps)) * G
-	// This provides RMSprop-like preconditioning to ALL directions,
-	// ensuring no gradient information is ever discarded.
-	const float baselineRate = lr / (state.sigma2 + eps);
+	// W -= min(lr / (effSigma2 + eps), kappaMax * lr) * G
+	// Baseline rate is capped at kappaMax*lr to prevent divergence
+	// when sigma2 converges to small gradient variance.
+	// effSigma2 includes bias correction so early steps get meaningful preconditioning.
+	const float kappaLr = kappaMax * lr;
+	const float effSigma2 = state.sigma2 * bcFactor;
+	float rawBaselineRate = lr / (effSigma2 + eps);
+	if (rawBaselineRate > kappaLr) rawBaselineRate = kappaLr;
+	const float baselineRate = rawBaselineRate;
 	{
-		const float baseScaled = baselineRate * gScale;
+		const float baseScaled = -baselineRate * gScale;
 		for (size_t idx = 0; idx < mn; ++idx)
-			W[idx] -= baseScaled * gW[idx];
+			W[idx] += baseScaled * gW[idx];
 	}
 
 	// === Step 7: Subspace correction with optional PNG ===
 	//
-	// corrScale_c = lr/(sigma2+eps) - lr/(f_c+eps)
+	// corrScale_c = baselineRate - min(lr/(effFisher_c+eps), kappaLr)
 	//
 	// This ADDS BACK the baseline step in subspace directions and REPLACES
 	// it with Fisher-preconditioned step. The net update per direction:
-	//   subspace c: -lr/(f_c+eps) * gPred_c  (Fisher-preconditioned)
-	//   complement: -lr/(sigma2+eps) * G_perp (baseline-preconditioned)
+	//   subspace c: -min(lr/(effFisher_c+eps), kappaLr) * gPred_c  (Fisher-preconditioned)
+	//   complement: -baselineRate * G_perp (baseline-preconditioned)
 	//
 	// gPred = (1+mu)*gz - mu*prevGz  (PNG temporal extrapolation)
-	std::vector<float> corrScale(static_cast<size_t>(r));
-	for (unsigned int c = 0; c < r; ++c)
-		corrScale[c] = baselineRate - lr / (state.fisherDiag[c] + eps);
-
 	const float onePlusMu = 1.0f + state.mu;
 	const float negMu = -state.mu;
 
-	double updateNormSq = 0.0;
-
-	for (unsigned int i = 0; i < m; ++i)
+	// Precompute corrected[r,n] = corrScale[c] * gPred[c,n]
+	std::vector<float>& corrected = state.scratch_corrected;
+	for (unsigned int c = 0; c < r; ++c)
 	{
-		for (unsigned int c = 0; c < r; ++c)
+		const float effFisher = state.fisherDiag[c] * bcFactor;
+		float fisherLR = lr / (effFisher + eps);
+		if (fisherLR > kappaLr) fisherLR = kappaLr;
+		const float corrScale = baselineRate - fisherLR;
+		for (unsigned int j = 0; j < n; ++j)
 		{
-			const float u_cs = state.U[i * r + c] * corrScale[c];
-			for (unsigned int j = 0; j < n; ++j)
+			const size_t cj = static_cast<size_t>(c) * n + j;
+			corrected[cj] = corrScale * (onePlusMu * gz[cj] + negMu * state.prevGz[cj]);
+		}
+	}
+
+	// W[m,n] += U[m,r] * corrected[r,n]
+	glades::gemm::ab_accum(W, &state.U[0], &corrected[0], m, r, n, 1.0f);
+
+	// Guard against NaN/Inf propagation from corrupted U or corrected buffers.
+	for (size_t idx = 0; idx < mn; ++idx)
+	{
+		if (!atlas_isfinite(W[idx]))
+		{
+			W[idx] = 0.0f;
+			recovered = true;
+			if (logger)
 			{
-				const size_t cj = static_cast<size_t>(c) * static_cast<size_t>(n) + static_cast<size_t>(j);
-				const float gPred = onePlusMu * gz[cj] + negMu * state.prevGz[cj];
-				const float delta = u_cs * gPred;
-				W[i * n + j] += delta;
-				if (diagStep)
-					updateNormSq += static_cast<double>(delta) * static_cast<double>(delta);
+				std::ostringstream oss;
+				oss << "event=atlas_nonfinite_weight";
+				append_kv(oss, "step", state.step);
+				append_kv(oss, "idx", static_cast<unsigned long long>(idx));
+				if (tag) oss << " tag=" << tag;
+				logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
 			}
 		}
 	}
 
+	// Compute update norm for diagnostics (only on diag steps)
+	double updateNormSq = 0.0;
+	if (diagStep)
+	{
+		for (size_t idx = 0; idx < rn; ++idx)
+			updateNormSq += static_cast<double>(corrected[idx]) * static_cast<double>(corrected[idx]);
+	}
+
 	// === Step 8: Adapt prediction coefficient ===
+	// Bidirectional adaptation: mu decreases when gradients oscillate (ratio > 0)
+	// and slowly recovers via muGrowthRate when gradients are smooth.
+	// newMu = mu * (1 - ratio) + muGrowthRate * (muMax - mu)
 	double errNormSq = 0.0;
 	double gzNormSq = 0.0;
 	if (state.step > 1ULL)
@@ -406,10 +520,16 @@ void applyStep(WeightState& state,
 		if (gzNorm > 1e-12)
 		{
 			const float ratio = static_cast<float>(sqrt(errNormSq) / (gzNorm + 1e-12));
-			float newMu = state.mu * (1.0f - ratio);
+			float newMu = state.mu * (1.0f - ratio)
+			            + muGrowthRate * (muMax - state.mu);
 			if (newMu < muMin) newMu = muMin;
 			if (newMu > muMax) newMu = muMax;
 			state.mu = newMu;
+			if (!atlas_isfinite(state.mu))
+			{
+				state.mu = muMin;
+				recovered = true;
+			}
 		}
 	}
 
@@ -438,6 +558,7 @@ void applyStep(WeightState& state,
 
 		std::ostringstream oss;
 		oss << "event=atlas_step";
+		if (tag) oss << " tag=" << tag;
 		append_kv(oss, "step", state.step);
 		append_kv(oss, "m", m);
 		append_kv(oss, "n", n);
@@ -459,6 +580,39 @@ void applyStep(WeightState& state,
 
 	// === Step 10: Clear accumulated gradients ===
 	std::memset(gW, 0, mn * sizeof(float));
+
+	return !recovered;
+}
+
+bool update(WeightState& state, float* W, float* gW,
+            unsigned int m, unsigned int n,
+            float invBatch, float lr,
+            float wd1, float wd2, float gradScale,
+            const ATLASConfig& ac,
+            glades::rng::Engine& rng,
+            shmea::GLogger* logger,
+            const char* tag)
+{
+	if (!state.initialized && m > 0u && n > 0u)
+		initWeightState(state, m, n, ac.rank, ac.muMin, rng, logger);
+
+	return applyStep(state, W, gW, m, n, invBatch, lr, wd1, wd2, gradScale,
+	                 ac, rng, logger, tag);
+}
+
+bool updateBias(float* bias, float* gBias, unsigned int size,
+                float invBatch, float lr, float gradScale)
+{
+	for (unsigned int i = 0; i < size; ++i)
+	{
+		float gB = gBias[i] * invBatch;
+		gB *= gradScale;
+		bias[i] -= lr * gB;
+		gBias[i] = 0.0f;
+		if (!atlas_isfinite(bias[i]))
+			return false;
+	}
+	return true;
 }
 
 } // namespace atlas

@@ -100,6 +100,16 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(gBOut, os)) return false;
 	}
 
+	// Final LayerNorm
+	if (!allocBuf(lnFinalGamma, dm)) return false;
+	if (!allocBuf(lnFinalBeta, dm)) return false;
+	if (!skipAdamBufs && !allocBuf(mLnFinalGamma, dm)) return false;
+	if (!skipAdamBufs && !allocBuf(v2LnFinalGamma, dm)) return false;
+	if (!skipAdamBufs && !allocBuf(mLnFinalBeta, dm)) return false;
+	if (!skipAdamBufs && !allocBuf(v2LnFinalBeta, dm)) return false;
+	if (!allocBuf(gLnFinalGamma, dm)) return false;
+	if (!allocBuf(gLnFinalBeta, dm)) return false;
+
 	// Blocks
 	blocks = new Block[nl];
 	for (unsigned int l = 0; l < nl; ++l)
@@ -183,7 +193,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	// Allocate batched Adam device arrays (only needed for Adam optimizer).
 	if (!skipAdamBufs)
 	{
-		int maxGroups = 4 + 16 * static_cast<int>(nl);
+		int maxGroups = 6 + 16 * static_cast<int>(nl);
 		cudaError_t e;
 		e = cudaMalloc(&d_adamParams, maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamGrads,  maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
@@ -281,6 +291,9 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	if (!ff1Act.allocate(snl * sT * sdf)) return false;
 	if (!ffOut.allocate(snl * sT * sdm)) return false;
 	if (!hAfterFF.allocate(snl * sT * sdm)) return false;
+	if (!hPostFinalLN.allocate(sT * sdm)) return false;
+	if (!lnFinalMean.allocate(sT)) return false;
+	if (!lnFinalInvStd.allocate(sT)) return false;
 	if (!logits.allocate(sT * sos)) return false;
 	if (!probs.allocate(sT * sos)) return false;
 
@@ -352,7 +365,9 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
                                const float* bIn, size_t bInSize,
                                const float* WOut, size_t WOutSize,
                                const float* bOut, size_t bOutSize,
-                               const float* lmBias, size_t lmBiasSize)
+                               const float* lmBias, size_t lmBiasSize,
+                               const float* lnFinalGamma, size_t lnFinalGammaSize,
+                               const float* lnFinalBeta, size_t lnFinalBetaSize)
 {
 	if (!gpu.initialized)
 		return false;
@@ -381,6 +396,14 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
 	{
 		if (!gpu.lmBias.upload(lmBias, lmBiasSize)) return false;
 	}
+	if (lnFinalGamma && lnFinalGammaSize > 0)
+	{
+		if (!gpu.lnFinalGamma.upload(lnFinalGamma, lnFinalGammaSize)) return false;
+	}
+	if (lnFinalBeta && lnFinalBetaSize > 0)
+	{
+		if (!gpu.lnFinalBeta.upload(lnFinalBeta, lnFinalBetaSize)) return false;
+	}
 
 	return true;
 }
@@ -391,7 +414,9 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
                                  float* bIn, size_t bInSize,
                                  float* WOut, size_t WOutSize,
                                  float* bOut, size_t bOutSize,
-                                 float* lmBias, size_t lmBiasSize)
+                                 float* lmBias, size_t lmBiasSize,
+                                 float* lnFinalGamma, size_t lnFinalGammaSize,
+                                 float* lnFinalBeta, size_t lnFinalBetaSize)
 {
 	if (!gpu.initialized)
 		return false;
@@ -419,6 +444,14 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
 	if (gpu.tokenModel && lmBias && lmBiasSize > 0)
 	{
 		if (!gpu.lmBias.download(lmBias, lmBiasSize)) return false;
+	}
+	if (lnFinalGamma && lnFinalGammaSize > 0)
+	{
+		if (!gpu.lnFinalGamma.download(lnFinalGamma, lnFinalGammaSize)) return false;
+	}
+	if (lnFinalBeta && lnFinalBetaSize > 0)
+	{
+		if (!gpu.lnFinalBeta.download(lnFinalBeta, lnFinalBetaSize)) return false;
 	}
 
 	return true;
@@ -475,9 +508,9 @@ bool zeroTransformerGradients(GpuTransformerWeights& gpu)
 	if (!gpu.initialized)
 		return false;
 
-	// Max buffers: 4 global + 16 per layer (256 layers max).
-	float* hPtrs[4 + 16 * 256];
-	int    hSizes[4 + 16 * 256];
+	// Max buffers: 6 global + 16 per layer (256 layers max).
+	float* hPtrs[6 + 16 * 256];
+	int    hSizes[6 + 16 * 256];
 	int count = 0;
 
 	if (gpu.tokenModel)
@@ -513,6 +546,9 @@ bool zeroTransformerGradients(GpuTransformerWeights& gpu)
 		addBuf(b.gB1, hPtrs, hSizes, count);
 		addBuf(b.gB2, hPtrs, hSizes, count);
 	}
+
+	addBuf(gpu.gLnFinalGamma, hPtrs, hSizes, count);
+	addBuf(gpu.gLnFinalBeta, hPtrs, hSizes, count);
 
 	if (count == 0)
 		return true;

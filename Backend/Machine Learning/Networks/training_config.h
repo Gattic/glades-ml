@@ -397,6 +397,19 @@ struct ATLASConfig
 	// Recommended: 0.5 (balanced blending preserves Fisher/prevGz continuity).
 	float betaRefresh;
 
+	// Growth rate for mu recovery. After transient instability drives mu to muMin,
+	// this additive term allows mu to slowly recover toward muMax.
+	// newMu = mu * (1 - ratio) + muGrowthRate * (muMax - mu)
+	// Set to 0 to disable recovery (old behavior: mu can only shrink).
+	float muGrowthRate;
+
+	// Enable bias correction for EMA quantities (sigma2, fisherDiag).
+	// When true, applies the standard correction factor 1/(1 - beta^step)
+	// to compensate for zero-initialization bias in early steps. This
+	// allows the optimizer to deliver meaningful preconditioning from step 1
+	// instead of waiting ~1/(1-beta) steps for the EMA to converge.
+	bool biasCorrection;
+
 	ATLASConfig()
 	    : rank(128u),
 	      beta(0.999f),
@@ -406,7 +419,9 @@ struct ATLASConfig
 	      powerIters(2u),
 	      eps(1e-8f),
 	      kappaMax(10.0f),
-	      betaRefresh(0.5f)
+	      betaRefresh(0.5f),
+	      muGrowthRate(0.001f),
+	      biasCorrection(true)
 	{
 	}
 };
