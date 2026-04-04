@@ -565,6 +565,7 @@ struct DeconvConfig
 		bool useBatchNorm;
 		bool useReLU; // false for last layer (use sigmoid)
 		bool useUpsampleConv; // nearest-neighbor upsample + standard conv (no checkerboard)
+		bool useTanh;
 
 		DeconvLayerSpec()
 		    : outChannels(0u),
@@ -573,7 +574,8 @@ struct DeconvConfig
 		      padH(1u), padW(1u),
 		      useBatchNorm(false),
 		      useReLU(true),
-		      useUpsampleConv(false)
+		      useUpsampleConv(false),
+		      useTanh(false)
 		{
 		}
 	};

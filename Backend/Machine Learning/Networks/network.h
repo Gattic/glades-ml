@@ -451,6 +451,7 @@ private:
 			unsigned int inH, inW, outH, outW;
 			bool useBatchNorm, useReLU;
 			bool useUpsampleConv; // nearest-neighbor upsample + standard conv
+			bool useTanh;
 
 			std::vector<float> W, bias, gW, gBias;
 			std::vector<float> vW, v2W, vBias, v2Bias; // Adam
@@ -465,7 +466,8 @@ private:
 			      strideH(0u), strideW(0u), padH(0u), padW(0u),
 			      inH(0u), inW(0u), outH(0u), outW(0u),
 			      useBatchNorm(false), useReLU(true),
-			      useUpsampleConv(false)
+			      useUpsampleConv(false),
+			      useTanh(false)
 			{
 			}
 		};
