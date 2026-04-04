@@ -1141,6 +1141,10 @@ static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
 		kv["atlas." + prefix + ".mu"] = oss.str();
 	}
 	{
+		std::ostringstream oss; oss << st.sigma2;
+		kv["atlas." + prefix + ".sigma2"] = oss.str();
+	}
+	{
 		std::ostringstream oss; oss << static_cast<unsigned long long>(st.step);
 		kv["atlas." + prefix + ".step"] = oss.str();
 	}
@@ -1155,9 +1159,21 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.m = m;
 	st.n = n;
 	st.r = r;
-	st.U.resize(static_cast<size_t>(m) * r);
+	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
+	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
+	st.U.resize(mr);
 	st.fisherDiag.resize(r);
-	st.prevGz.resize(static_cast<size_t>(r) * n);
+	st.prevGz.resize(rn);
+
+	// Allocate persistent scratch buffers (must match initWeightState).
+	st.scratch_gz.resize(rn);
+	st.scratch_corrected.resize(rn);
+	st.scratch_U_old.resize(mr);
+	st.scratch_f_old.resize(static_cast<size_t>(r));
+	st.scratch_B.resize(rn);
+	st.scratch_Z.resize(mr);
+	st.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
+	st.scratch_prevGzOld.resize(rn);
 	{
 		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(m));
@@ -1189,6 +1205,14 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 		{
 			std::istringstream iss(it->second);
 			iss >> st.mu;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".sigma2");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.sigma2;
 		}
 	}
 	{
@@ -2175,6 +2199,10 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	const unsigned int atlasRank = trainingConfig.atlas.rank;
 	if (netType == TYPE_DFF)
 	{
+		// Pre-allocate ATLAS state vector so checkpoint tensors can be read into it.
+		if (includeOpt && isAtlas && tensorDff.atlasState.size() < tensorDff.T.size())
+			tensorDff.atlasState.resize(tensorDff.T.size());
+
 		for (size_t t = 0; t < tensorDff.T.size(); ++t)
 		{
 			TensorDFFState::Transition& tr = tensorDff.T[t];

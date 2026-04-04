@@ -6,17 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Build the library** (from project root):
 ```bash
-cd build && cmake .. && make -j$(nproc)
+sh .configure.sh
 ```
 
 **Build with CUDA**:
 ```bash
-cd build && cmake .. -DGLADES_ENABLE_CUDA=ON && make -j$(nproc)
+sh .configure.sh cuda
 ```
 
 **Build and run unit tests**:
 ```bash
-cd unit-tests/build && cmake .. && make -j$(nproc)
+cd unit-tests/build && sh .configure.sh
+cd unit-tests/build && sh .configure.sh cuda # compile with cuda
 cd unit-tests && bash test.sh nnall    # run all tests
 ```
 

@@ -135,6 +135,8 @@ int main(int argc, char* argv[])
 		HyperparameterTunerFullLoopTest();
 	    else if (strcmp(argv[1], "atlas") == 0)
 		ATLASUnitTest();
+	    else if (strcmp(argv[1], "atlas-gpu-nan") == 0)
+		ATLASGpuNaNTest();
 	    else if (strcmp(argv[1], "atlas-bench") == 0)
 		ATLASBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "fft") == 0)

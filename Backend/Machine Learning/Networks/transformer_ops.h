@@ -1091,6 +1091,110 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 	                                                              NULL);
 }
 
+// Chunk variant: processes query rows [tBegin, tEnd) only.
+// dQ writes go to dQbase (strided, only rows tBegin..tEnd-1 are touched).
+// dK/dV writes go to contiguous local buffers (stride = dK/dV, not dKStride/dVStride).
+// Caller must zero dKlocal/dVlocal before calling.
+inline void scaled_dot_product_attention_backward_recompute_flash_chunk(
+    const float* Qbase, unsigned int qStride,
+    const float* Kbase, unsigned int kStride,
+    const float* Vbase, unsigned int vStride,
+    const float* dObase, unsigned int dOStride,
+    unsigned int tBegin, unsigned int tEnd,
+    unsigned int T, unsigned int dK, unsigned int dV,
+    bool causal,
+    float* dQbase, unsigned int dQStride,
+    float* dKlocal, float* dVlocal,
+    const unsigned char* keyAllowed)
+{
+	if (!Qbase || !Kbase || !Vbase || !dObase || !dQbase || !dKlocal || !dVlocal)
+		return;
+	if (T == 0u || dK == 0u || dV == 0u || tBegin >= tEnd)
+		return;
+
+	const float invSqrt = 1.0f / static_cast<float>(sqrt(static_cast<double>(dK)));
+
+	std::vector<float> sCache(T);
+	std::vector<float> pCache(T);
+	std::vector<float> dPCache(T);
+
+	for (unsigned int t = tBegin; t < tEnd; ++t)
+	{
+		const float* qt = Qbase + static_cast<size_t>(t) * static_cast<size_t>(qStride);
+		const float* dOt = dObase + static_cast<size_t>(t) * static_cast<size_t>(dOStride);
+		float* dQt = dQbase + static_cast<size_t>(t) * static_cast<size_t>(dQStride);
+
+		const unsigned int maxU = causal ? t : (T - 1u);
+
+		float m = -1e30f;
+		double l = 0.0;
+		bool any = false;
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (keyAllowed && keyAllowed[u] == 0u)
+			{
+				sCache[u] = -1e30f;
+				continue;
+			}
+#if defined(__SSE2__)
+			if ((u & 31u) == 0u && (u + 32u) <= maxU)
+			{
+				const float* kpf = Kbase + static_cast<size_t>(u + 32u) * static_cast<size_t>(kStride);
+				_mm_prefetch(reinterpret_cast<const char*>(kpf), _MM_HINT_T0);
+			}
+#endif
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
+			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
+			sCache[u] = s;
+
+			if (!any) { any = true; m = s; l = 1.0; continue; }
+			const float newM = (s > m) ? s : m;
+			const float alpha = expf(m - newM);
+			const float beta = expf(s - newM);
+			l = l * static_cast<double>(alpha) + static_cast<double>(beta);
+			m = newM;
+		}
+		if (!any || !(l > 0.0))
+			continue;
+		const double invL = 1.0 / l;
+
+		double rowDot = 0.0;
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (keyAllowed && keyAllowed[u] == 0u)
+			{
+				pCache[u] = 0.0f;
+				dPCache[u] = 0.0f;
+				continue;
+			}
+			const float pf = static_cast<float>(static_cast<double>(expf(sCache[u] - m)) * invL);
+			pCache[u] = pf;
+			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
+			const float dP = glades::transformer_kernels::dot_f32(dOt, vu, dV);
+			dPCache[u] = dP;
+			rowDot += static_cast<double>(pf) * static_cast<double>(dP);
+			// dV into contiguous local buffer (stride = dV)
+			float* dVu = dVlocal + static_cast<size_t>(u) * static_cast<size_t>(dV);
+			glades::transformer_kernels::axpy_f32(dVu, dOt, pf, dV);
+		}
+
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (keyAllowed && keyAllowed[u] == 0u)
+				continue;
+			const float pf = pCache[u];
+			if (pf == 0.0f) continue;
+			const float ds = (pf * static_cast<float>(static_cast<double>(dPCache[u]) - rowDot)) * invSqrt;
+			if (ds == 0.0f) continue;
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
+			// dK into contiguous local buffer (stride = dK)
+			float* dKu = dKlocal + static_cast<size_t>(u) * static_cast<size_t>(dK);
+			glades::transformer_kernels::axpy_f32(dQt, ku, ds, dK);
+			glades::transformer_kernels::axpy_f32(dKu, qt, ds, dK);
+		}
+	}
+}
+
 inline void scaled_dot_product_attention_backward_recompute_strided(const float* Qbase,
                                                                     unsigned int qStride,
                                                                     const float* Kbase,
