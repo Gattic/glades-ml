@@ -29,5 +29,8 @@ hyperparameter-tuner-test.cpp
 atlas-test.cpp
 atlas-bench.cpp
 sfcka-test.cpp
+simd-parity-test.cpp
+sampling-test.cpp
+attention-backward-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})

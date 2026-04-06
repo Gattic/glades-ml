@@ -41,6 +41,9 @@
 #include "Backend/Machine Learning/atlas-bench.h"
 #include "Backend/Machine Learning/sfcka-test.h"
 #include "Backend/Machine Learning/transformer-gradient-test.h"
+#include "Backend/Machine Learning/simd-parity-test.h"
+#include "Backend/Machine Learning/sampling-test.h"
+#include "Backend/Machine Learning/attention-backward-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -146,6 +149,12 @@ int main(int argc, char* argv[])
 		QPSolverUnitTest();
 	    else if (strcmp(argv[1], "transformer-grad") == 0)
 		TransformerGradientUnitTest();
+	    else if (strcmp(argv[1], "simd-parity") == 0)
+		SIMDParityUnitTest();
+	    else if (strcmp(argv[1], "sampling") == 0)
+		SamplingUnitTest();
+	    else if (strcmp(argv[1], "attention-bwd") == 0)
+		AttentionBackwardUnitTest();
 	    else if (strcmp(argv[1], "sfcka") == 0)
 	    {
 		FFTUnitTest();
