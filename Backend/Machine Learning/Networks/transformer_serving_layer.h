@@ -244,6 +244,11 @@ private:
 	bool running_;
 	bool stopRequested_;
 
+	// Re-entrancy guard: true while step() is executing batcher callbacks.
+	// Prevents user callbacks from re-entering step() (which would corrupt batcher state).
+	// Also used to detect blocking callbacks (via diagnostic logging).
+	bool inStep_;
+
 	// Synchronizes all public APIs and internal state.
 	mutable Mutex mu_;
 

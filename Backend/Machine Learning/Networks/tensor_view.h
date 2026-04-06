@@ -78,15 +78,38 @@ struct Tensor2DView
 	size_t rows;
 	size_t cols;
 	size_t rowStride; // in elements
+	size_t capacity;  // total elements in backing buffer (0 = unknown/unchecked)
 	TensorDType dtype;
 
-	Tensor2DView() : data(NULL), rows(0u), cols(0u), rowStride(0u), dtype(tensor_dtype<T>()) {}
+	Tensor2DView() : data(NULL), rows(0u), cols(0u), rowStride(0u), capacity(0u), dtype(tensor_dtype<T>()) {}
 	Tensor2DView(T* p, size_t r, size_t c, size_t rs)
-	    : data(p), rows(r), cols(c), rowStride(rs), dtype(tensor_dtype<T>())
+	    : data(p), rows(r), cols(c), rowStride(rs), capacity(0u), dtype(tensor_dtype<T>())
+	{
+	}
+	Tensor2DView(T* p, size_t r, size_t c, size_t rs, size_t cap)
+	    : data(p), rows(r), cols(c), rowStride(rs), capacity(cap), dtype(tensor_dtype<T>())
 	{
 	}
 
-	inline bool ok() const { return (data != NULL && rows > 0u && cols > 0u && rowStride >= cols); }
+	inline bool ok() const
+	{
+		if (data == NULL || rows == 0u || cols == 0u || rowStride < cols)
+			return false;
+		// When capacity is known, validate that the view fits within the buffer.
+		if (capacity > 0u && rows > 0u && rowStride > 0u)
+		{
+			// Last valid element: (rows-1)*rowStride + (cols-1)
+			// Required capacity: (rows-1)*rowStride + cols
+			const size_t lastRowStart = (rows - 1u) * rowStride;
+			if (lastRowStart / rowStride != (rows - 1u)) // overflow check
+				return false;
+			if (lastRowStart + cols < lastRowStart) // overflow check
+				return false;
+			if (lastRowStart + cols > capacity)
+				return false;
+		}
+		return true;
+	}
 
 	inline T* row(size_t r) const { return data + r * rowStride; }
 	inline T& at(size_t r, size_t c) const { return row(r)[c]; }

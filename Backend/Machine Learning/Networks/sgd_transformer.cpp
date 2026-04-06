@@ -64,6 +64,20 @@ static inline float clip_maybe(float v, float limit)
 	return glades::sgd_detail::clipf_maybe(v, limit);
 }
 
+// Overflow-checked size_t multiplication (matches transformer_infer.cpp pattern).
+static inline bool checked_mul_size(size_t a, size_t b, size_t& out)
+{
+	if (a == 0u || b == 0u)
+	{
+		out = 0u;
+		return true;
+	}
+	if (a > (std::numeric_limits<size_t>::max() / b))
+		return false;
+	out = a * b;
+	return true;
+}
+
 static void add_positional_encoding(float* h,
                                     unsigned int T,
                                     unsigned int dModel,
@@ -223,18 +237,24 @@ static void attn_fwd_body(void* ud, unsigned int begin, unsigned int end)
 	for (unsigned int h = begin; h < end; ++h)
 	{
 		const unsigned int kvHead = (c.nKVHeads == c.nHeads) ? h : (c.groupSize > 0u ? (h / c.groupSize) : 0u);
+		size_t qOff = 0u, kOff = 0u, vOff = 0u, oOff = 0u;
+		if (!checked_mul_size(static_cast<size_t>(h), static_cast<size_t>(c.dHead), qOff) ||
+		    !checked_mul_size(static_cast<size_t>(kvHead), static_cast<size_t>(c.dHead), kOff) ||
+		    !checked_mul_size(static_cast<size_t>(kvHead), static_cast<size_t>(c.dHead), vOff) ||
+		    !checked_mul_size(static_cast<size_t>(h), static_cast<size_t>(c.dHead), oOff))
+			return;
 		glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
-		    c.Q + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.Q + qOff,
 		    c.dModel,
-		    c.K + static_cast<size_t>(kvHead) * static_cast<size_t>(c.dHead),
+		    c.K + kOff,
 		    c.dModelKV,
-		    c.V + static_cast<size_t>(kvHead) * static_cast<size_t>(c.dHead),
+		    c.V + vOff,
 		    c.dModelKV,
 		    c.T,
 		    c.dHead,
 		    c.dHead,
 		    c.causal,
-		    c.O + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.O + oOff,
 		    c.dModel,
 		    c.keyAllowed);
 	}
@@ -298,23 +318,29 @@ static void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
 			const unsigned int kvh = item;
 			const unsigned int hStart = kvh * c.groupSize;
 			const unsigned int hEnd = hStart + c.groupSize;
+			size_t kvhOff = 0u;
+			if (!checked_mul_size(static_cast<size_t>(kvh), static_cast<size_t>(c.dHead), kvhOff))
+				continue;
 			for (unsigned int hh = hStart; hh < hEnd && hh < c.nHeads; ++hh)
 			{
+				size_t hhOff = 0u;
+				if (!checked_mul_size(static_cast<size_t>(hh), static_cast<size_t>(c.dHead), hhOff))
+					continue;
 				glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
-				    c.Q + static_cast<size_t>(hh) * static_cast<size_t>(c.dHead),
+				    c.Q + hhOff,
 				    c.dModel,
-				    c.K + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.K + kvhOff,
 				    c.dModelKV,
-				    c.V + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.V + kvhOff,
 				    c.dModelKV,
-				    c.dO + static_cast<size_t>(hh) * static_cast<size_t>(c.dHead),
+				    c.dO + hhOff,
 				    c.dModel,
 				    c.T, c.dHead, c.dHead, c.causal,
-				    c.dQ + static_cast<size_t>(hh) * static_cast<size_t>(c.dHead),
+				    c.dQ + hhOff,
 				    c.dModel,
-				    c.dK + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.dK + kvhOff,
 				    c.dModelKV,
-				    c.dV + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.dV + kvhOff,
 				    c.dModelKV,
 				    c.keyAllowed);
 			}
@@ -323,22 +349,32 @@ static void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
 
 		// Chunked path: process query rows [tBegin, tEnd) for head h.
 		const unsigned int kvh = (c.nKVHeads == c.nHeads) ? h : (c.groupSize > 0u ? (h / c.groupSize) : 0u);
-		const size_t scratchSize = static_cast<size_t>(c.T) * static_cast<size_t>(c.dHead);
-		float* dKlocal = c.dKVscratch + static_cast<size_t>(item) * scratchSize * 2u;
+		size_t scratchSize = 0u;
+		if (!checked_mul_size(static_cast<size_t>(c.T), static_cast<size_t>(c.dHead), scratchSize))
+			continue;
+		size_t scratchItemOff = 0u;
+		if (!checked_mul_size(static_cast<size_t>(item), scratchSize * 2u, scratchItemOff))
+			continue;
+		float* dKlocal = c.dKVscratch + scratchItemOff;
 		float* dVlocal = dKlocal + scratchSize;
 
+		size_t hOff = 0u, kvhOff = 0u;
+		if (!checked_mul_size(static_cast<size_t>(h), static_cast<size_t>(c.dHead), hOff) ||
+		    !checked_mul_size(static_cast<size_t>(kvh), static_cast<size_t>(c.dHead), kvhOff))
+			continue;
+
 		glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_chunk(
-		    c.Q + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.Q + hOff,
 		    c.dModel,
-		    c.K + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+		    c.K + kvhOff,
 		    c.dModelKV,
-		    c.V + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+		    c.V + kvhOff,
 		    c.dModelKV,
-		    c.dO + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.dO + hOff,
 		    c.dModel,
 		    tBegin, tEnd,
 		    c.T, c.dHead, c.dHead, c.causal,
-		    c.dQ + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.dQ + hOff,
 		    c.dModel,
 		    dKlocal, dVlocal,
 		    c.keyAllowed);
@@ -1919,6 +1955,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 	// Attention scratch buffers (reused) to avoid per-head allocations.
 	const unsigned int nKVHeads = (ttConst.nKVHeads > 0u ? ttConst.nKVHeads : nHeads);
+	if (nHeads == 0u || (dModel % nHeads) != 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_TRANSFORMER: dModel is not divisible by nHeads");
+		running = false;
+		return;
+	}
+	if ((nHeads % nKVHeads) != 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_TRANSFORMER: nHeads is not divisible by nKVHeads");
+		running = false;
+		return;
+	}
 	const unsigned int dHead = dModel / nHeads;
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFF) : dFF;
@@ -2960,6 +3008,19 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		float* hAfterFF = transformerScratch.hAfterFF.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
 		for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
 			hAfterFF[i] = hAfterAttn[i] + ffOut[i];
+
+		// Per-layer NaN detection: check hidden state after each layer and abort early.
+		{
+			const size_t layerElems = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+			if (!glades::transformer_kernels::all_finite_full(hAfterFF, layerElems))
+			{
+				std::ostringstream oss;
+				oss << "transformerCpuForwardPass: non-finite hidden state detected at layer " << li;
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, oss.str());
+				running = false;
+				return;
+			}
+		}
 	}
 
 	const float* hFinal = transformerScratch.hAfterFF.data() + (static_cast<size_t>(nLayers - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
@@ -3690,6 +3751,18 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	int64_t lastProgressMs = epochStartMs;
 	static const int64_t kProgressIntervalMs = 5000;
 
+	if (nHeads == 0u || (dModel % nHeads) != 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerGpuTrainEpoch: dModel is not divisible by nHeads");
+		running = false;
+		return;
+	}
+	if ((nHeads % nKVHeads) != 0u)
+	{
+		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerGpuTrainEpoch: nHeads is not divisible by nKVHeads");
+		running = false;
+		return;
+	}
 	const unsigned int dHead = dModel / nHeads;
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;

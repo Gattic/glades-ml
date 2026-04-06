@@ -75,6 +75,7 @@ TransformerServingLayer::TransformerServingLayer()
       batcherCallbacks_(*this),
       running_(false),
       stopRequested_(false),
+      inStep_(false),
       mu_(),
       slotCancel_(),
       live_(),
@@ -285,7 +286,16 @@ bool TransformerServingLayer::BatcherCallbacks::onToken(const NNetwork& net, uns
 	ITransformerServingCallbacks* cb = layer_.live_[requestIndex].cb;
 	if (!cb || id == 0ULL)
 		return false;
-	return cb->onToken(id, net, tokenId, generatedIndex);
+	try
+	{
+		return cb->onToken(id, net, tokenId, generatedIndex);
+	}
+	catch (...)
+	{
+		// User callback threw — treat as cancellation to prevent state corruption.
+		layer_.logEvent("transformer_serving_callback_exception", id, "onToken threw; treating as cancel");
+		return true;
+	}
 }
 
 bool TransformerServingLayer::BatcherCallbacks::shouldStopAll(const NNetwork& /*net*/)
@@ -303,7 +313,18 @@ bool TransformerServingLayer::BatcherCallbacks::shouldStopRequest(const NNetwork
 	const uint64_t id = (requestIndex < layer_.live_.size()) ? layer_.live_[requestIndex].id : 0ULL;
 	ITransformerServingCallbacks* cb = (requestIndex < layer_.live_.size()) ? layer_.live_[requestIndex].cb : NULL;
 	if (cb && id != 0ULL)
-		return cb->shouldCancel(id, net);
+	{
+		try
+		{
+			return cb->shouldCancel(id, net);
+		}
+		catch (...)
+		{
+			// User callback threw — treat as cancellation to prevent state corruption.
+			layer_.logEvent("transformer_serving_callback_exception", id, "shouldCancel threw; treating as cancel");
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -489,6 +510,16 @@ NNetworkStatus TransformerServingLayer::step()
 	if (stopRequested_)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::step: stop requested");
 
+	// Re-entrancy guard: prevent step() from being called from within a batcher callback.
+	// The recursive mutex would allow the lock, but batcher state is not re-entrant-safe.
+	if (inStep_)
+	{
+		logEvent("transformer_serving_reentrant_step", 0ULL, "step() called from callback; rejected");
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		    "TransformerServingLayer::step: re-entrant call detected (likely from a callback). "
+		    "Callbacks must not call step().");
+	}
+
 	// 1) Admit as many pending requests as possible.
 	admitPending_();
 
@@ -497,7 +528,11 @@ NNetworkStatus TransformerServingLayer::step()
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 
 	// 3) Advance one global step.
+	// Set inStep_ around the batcher call so callbacks can detect re-entrancy.
+	inStep_ = true;
 	const NNetworkStatus stStep = net_->transformerLmServeBatcherStep(batcher_, &batcherCallbacks_);
+	inStep_ = false;
+
 	if (!stStep.ok())
 	{
 		// Mark all live requests failed.

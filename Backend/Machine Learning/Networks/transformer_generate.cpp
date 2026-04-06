@@ -426,9 +426,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 		return st;
 	}
 
-	// Sampling scratch buffers (reuse across steps to avoid heap churn).
-	std::vector<unsigned int> idxScratch;
-	std::vector<float> weightScratch;
+	// Sampling scratch buffers (pre-sized to vocab to avoid per-step allocations).
+	std::vector<unsigned int> idxScratch(vocab);
+	for (unsigned int i = 0u; i < vocab; ++i)
+		idxScratch[i] = i;
+	std::vector<float> weightScratch(vocab, 0.0f);
 
 	const int eos = cfg.eosTokenId;
 	const bool stopOnEos = cfg.stopOnEos && (eos >= 0);
@@ -862,9 +864,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 		}
 	}
 
-	// Sampling scratch buffers (reused across all requests/steps).
-	std::vector<unsigned int> idxScratch;
-	std::vector<float> weightScratch;
+	// Sampling scratch buffers (pre-sized to vocab to avoid per-step allocations).
+	std::vector<unsigned int> idxScratch(vocab);
+	for (unsigned int i = 0u; i < vocab; ++i)
+		idxScratch[i] = i;
+	std::vector<float> weightScratch(vocab, 0.0f);
 
 	// Decode: continuous batching with per-request early stopping.
 	for (unsigned int genIdx = 0u; genIdx < globalMaxNew; ++genIdx)

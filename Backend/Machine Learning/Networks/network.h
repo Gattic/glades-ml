@@ -1759,11 +1759,8 @@ public:
 		std::vector<float, glades::AlignedAllocator<float, 64> > scores;     // [maxLen]
 
 		// Positional encoding caches (owned by the session to avoid mutating NNetwork).
-		unsigned int sinDModelCached;
-		std::vector<double> sinInvDenomPair;
-		unsigned int ropeDimCached;
-		float ropeThetaCached;
-		std::vector<double> ropeInvFreq;
+		// Reuses the same struct as the training-side cache to avoid divergent implementations.
+		TransformerPosEncCache posEncCache;
 
 		// Optional performance counters/timers (populated only when enabled).
 		bool metricsEnabled;
@@ -1804,11 +1801,7 @@ public:
 		      ffAct(),
 		      ffOut(),
 		      scores(),
-		      sinDModelCached(0u),
-		      sinInvDenomPair(),
-		      ropeDimCached(0u),
-		      ropeThetaCached(0.0f),
-		      ropeInvFreq(),
+		      posEncCache(),
 		      metricsEnabled(false),
 		      perf(),
 		      gpuInferState(0)
@@ -1845,11 +1838,7 @@ public:
 			ffAct.clear();
 			ffOut.clear();
 			scores.clear();
-			sinDModelCached = 0u;
-			sinInvDenomPair.clear();
-			ropeDimCached = 0u;
-			ropeThetaCached = 0.0f;
-			ropeInvFreq.clear();
+			posEncCache.reset();
 			metricsEnabled = false;
 			perf.reset();
 			// Note: gpuInferState is NOT freed here; the caller (transformerLmSessionReset)
@@ -1912,11 +1901,8 @@ public:
 		std::vector<float, glades::AlignedAllocator<float, 64> > scores;     // [maxLen]
 
 		// Positional encoding caches (session-owned).
-		unsigned int sinDModelCached;
-		std::vector<double> sinInvDenomPair;
-		unsigned int ropeDimCached;
-		float ropeThetaCached;
-		std::vector<double> ropeInvFreq;
+		// Reuses the same struct as the training-side cache to avoid divergent implementations.
+		TransformerPosEncCache posEncCache;
 
 		// Optional performance counters/timers (populated only when enabled).
 		bool metricsEnabled;
@@ -1954,11 +1940,7 @@ public:
 		      ffAct(),
 		      ffOut(),
 		      scores(),
-		      sinDModelCached(0u),
-		      sinInvDenomPair(),
-		      ropeDimCached(0u),
-		      ropeThetaCached(0.0f),
-		      ropeInvFreq(),
+		      posEncCache(),
 		      metricsEnabled(false),
 		      perf()
 		{
@@ -1991,11 +1973,7 @@ public:
 			ffAct.clear();
 			ffOut.clear();
 			scores.clear();
-			sinDModelCached = 0u;
-			sinInvDenomPair.clear();
-			ropeDimCached = 0u;
-			ropeThetaCached = 0.0f;
-			ropeInvFreq.clear();
+			posEncCache.reset();
 			metricsEnabled = false;
 			perf.reset();
 		}
