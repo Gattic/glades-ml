@@ -32,5 +32,7 @@ sfcka-test.cpp
 simd-parity-test.cpp
 sampling-test.cpp
 attention-backward-test.cpp
+transformer-ops-test.cpp
+transformer-kernels-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})
