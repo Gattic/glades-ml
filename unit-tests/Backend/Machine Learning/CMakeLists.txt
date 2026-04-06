@@ -34,5 +34,6 @@ sampling-test.cpp
 attention-backward-test.cpp
 transformer-ops-test.cpp
 transformer-kernels-test.cpp
+numerical-edge-test.cpp
 )
 add_library(PCATests ${PCATests_src_files})

@@ -46,6 +46,7 @@
 #include "Backend/Machine Learning/attention-backward-test.h"
 #include "Backend/Machine Learning/transformer-ops-test.h"
 #include "Backend/Machine Learning/transformer-kernels-test.h"
+#include "Backend/Machine Learning/numerical-edge-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -161,6 +162,8 @@ int main(int argc, char* argv[])
 		TransformerOpsUnitTest();
 	    else if (strcmp(argv[1], "transformer-kernels") == 0)
 		TransformerKernelsUnitTest();
+	    else if (strcmp(argv[1], "numerical-edge") == 0)
+		NumericalEdgeUnitTest();
 	    else if (strcmp(argv[1], "sfcka") == 0)
 	    {
 		FFTUnitTest();
