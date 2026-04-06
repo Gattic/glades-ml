@@ -19,6 +19,7 @@ mapped-dataset-test.cpp
 ddp-test.cpp
  "../../../Backend/Machine Learning/DataObjects/DDPDataInputWrapper.cpp"
 transformer-improvements-test.cpp
+transformer-gradient-test.cpp
 gpu-training-test.cpp
 cnn-test.cpp
 garch-test.cpp

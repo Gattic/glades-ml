@@ -26,7 +26,10 @@
 #include <sstream>
 #include <vector>
 
+#include "logfmt_utils.h"
+
 using namespace glades;
+using namespace glades::logfmt;
 
 namespace {
 
@@ -60,49 +63,6 @@ static inline float clip_maybe(float v, float limit)
 {
 	return glades::sgd_detail::clipf_maybe(v, limit);
 }
-
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
-{
-	oss << ' ' << k << '=';
-	bool needQuote = false;
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
-		{
-			needQuote = true;
-			break;
-		}
-	}
-	if (!needQuote)
-	{
-		oss << v;
-		return;
-	}
-	oss << '"';
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == '\\' || c == '"')
-			oss << '\\' << c;
-		else if (c == '\n')
-			oss << "\\n";
-		else if (c == '\r')
-			oss << "\\r";
-		else if (c == '\t')
-			oss << "\\t";
-		else
-			oss << c;
-	}
-	oss << '"';
-}
-
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, int v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned int v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned long long v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, double v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, bool v) { oss << ' ' << k << '=' << (v ? 1 : 0); }
 
 static void add_positional_encoding(float* h,
                                     unsigned int T,
@@ -1963,6 +1923,45 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFF) : dFF;
 
+	// Bundle config for extracted sub-functions.
+	TransformerEpochCfg epochCfg;
+	epochCfg.inputSize = inputSize;
+	epochCfg.outSize = outSize;
+	epochCfg.dModel = dModel;
+	epochCfg.dFF = dFF;
+	epochCfg.nHeads = nHeads;
+	epochCfg.nKVHeads = nKVHeads;
+	epochCfg.nLayers = nLayers;
+	epochCfg.vocabSize = vocabSize;
+	epochCfg.dHead = dHead;
+	epochCfg.dModelKV = dModelKV;
+	epochCfg.ff1Width = ff1Width;
+	epochCfg.padTokenId = padTokenId;
+	epochCfg.causal = causal;
+	epochCfg.tokenLM = tokenLM;
+	epochCfg.tieEmb = tieEmb;
+	epochCfg.isTrain = isTrain;
+	epochCfg.gradClip = gradClip;
+	epochCfg.lnEps = lnEps;
+	epochCfg.ropeTheta = ropeTheta;
+	epochCfg.costFx = costFx;
+	epochCfg.posEnc = posEnc;
+	epochCfg.normType = normType;
+	epochCfg.ffnKind = ffnKind;
+	epochCfg.ffnAct = ffnAct;
+	epochCfg.ropeDimOverride = ropeDimOverride;
+	epochCfg.tokenLmNegK = tokenLmNegK;
+	epochCfg.ddpEnabled = ddpEnabled;
+	epochCfg.useLowpWeights = useLowpWeights;
+	epochCfg.lowpDType = lowpDType;
+	epochCfg.mpEnable = mpEnable;
+	epochCfg.mpUseLossScaling = mpUseLossScaling;
+	epochCfg.mpDynamicLossScaling = mpDynamicLossScaling;
+	epochCfg.seqBatchMax = seqBatchMax;
+	epochCfg.tokenLmLossKind = tokenLmLossKind;
+	epochCfg.tokenLmAllowHuge = tokenLmAllowHuge;
+	epochCfg.lrScheduleMultiplier = lrScheduleMultiplier;
+
 	// Token LM metrics:
 	// Accumulate mean NLL over non-pad tokens (natural log).
 	double tokenLmNllSum = 0.0;
@@ -1993,1360 +1992,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		const bool gpuReady = ensureGpuState();
 		if (gpuReady && gpuTransformerWeights && gpuTransformerWeights->initialized)
 		{
-
-			const unsigned int dHead = dModel / nHeads;
-			const unsigned int dModelKV = nKVHeads * dHead;
-			const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
-			const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
-
-			for (unsigned int s = 0; s < seqCount; ++s)
-			{
-				if (!running)
-					break;
-
-				const unsigned int T = di->getTrainSequenceLength(s);
-				if (T == 0u)
-					continue;
-				tokensProcessed += static_cast<unsigned long long>(T);
-
-
-				// Ensure GPU scratch is big enough for this sequence.
-				if (!gpuTransformerScratch)
-					gpuTransformerScratch = new gpu::GpuTransformerScratch();
-
-				if (!gpuTransformerScratch->initialized || gpuTransformerScratch->T < T)
-				{
-					if (!gpuTransformerScratch->allocate(T, inputSize, outSize, dModel, dFF, dModelKV, nHeads, nLayers, ff1Width))
-					{
-						// GPU scratch allocation failed, fall through to CPU.
-						break;
-					}
-				}
-
-				// Upload token IDs for this sequence.
-				if (tokenLM)
-				{
-					std::vector<int> tokenIdsInt(T);
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						int tid = 0;
-						di->getTrainSequenceTokenId(s, t, tid);
-						tokenIdsInt[t] = tid;
-					}
-					gpuTransformerScratch->tokenIds.upload(&tokenIdsInt[0], T);
-
-					// Forward: embedding gather
-					gpu::embedding_gather(
-					    gpuTransformerWeights->tokE.data(),
-					    gpuTransformerScratch->tokenIds.data(),
-					    static_cast<int>(T), static_cast<int>(vocabSize),
-					    static_cast<int>(dModel),
-					    gpuTransformerScratch->h.data());
-				}
-				else
-				{
-					// Upload input features and run linear projection.
-					std::vector<float> xHost(static_cast<size_t>(T) * inputSize);
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						const float* row = NULL;
-						unsigned int rowSize = 0u;
-						di->getTrainSequenceRowView(s, t, row, rowSize);
-						const size_t off = static_cast<size_t>(t) * inputSize;
-						for (unsigned int f = 0; f < inputSize; ++f)
-							xHost[off + f] = (row && f < rowSize) ? row[f] : 0.0f;
-					}
-					gpuTransformerScratch->x.upload(&xHost[0], xHost.size());
-
-					// Input projection: h = x * WIn^T + bIn
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
-					                     1.0f,
-					                     gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
-					                     gpuTransformerWeights->WIn.data(), static_cast<int>(inputSize),
-					                     0.0f,
-					                     gpuTransformerScratch->h.data(), static_cast<int>(dModel));
-					gpu::add_bias(gpuTransformerScratch->h.data(),
-					              gpuTransformerWeights->bIn.data(),
-					              static_cast<int>(T), static_cast<int>(dModel));
-				}
-
-				// Upload RoPE invFreq to scratch (shared across all layers).
-				unsigned int fwdRopeHalfDim = 0u;
-				if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
-				{
-					const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
-					                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
-					fwdRopeHalfDim = rd / 2u;
-					std::vector<float> invFreqF(fwdRopeHalfDim);
-					for (unsigned int i = 0; i < fwdRopeHalfDim && i < transformerPosEncCache.ropeInvFreq.size(); ++i)
-						invFreqF[i] = static_cast<float>(transformerPosEncCache.ropeInvFreq[i]);
-					gpuTransformerScratch->gpuInvFreq.upload(&invFreqF[0], invFreqF.size());
-				}
-
-				// Per-layer transformer blocks.
-				for (unsigned int li = 0; li < nLayers; ++li)
-				{
-					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
-					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
-
-					// Input to this layer is h (or hAfterFF from previous layer).
-					const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
-					                                 : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
-
-					float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
-					float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
-					float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
-
-					// Pre-LN 1
-					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-					{
-						gpu::rmsnorm_forward(layerIn, gb.ln1Gamma.data(), lnEps,
-						                      static_cast<int>(T), static_cast<int>(dModel),
-						                      x1_l, ln1InvStd_l);
-					}
-					else
-					{
-						gpu::layernorm_forward(layerIn, gb.ln1Gamma.data(), gb.ln1Beta.data(),
-						                        lnEps, static_cast<int>(T), static_cast<int>(dModel),
-						                        x1_l, ln1Mean_l, ln1InvStd_l);
-					}
-
-					// QKV projections
-					float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
-					float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
-					float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
-
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
-					                     1.0f, x1_l, static_cast<int>(dModel),
-					                     gb.Wq.data(), static_cast<int>(dModel),
-					                     0.0f, Q_l, static_cast<int>(dModel));
-					gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
-
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
-					                     1.0f, x1_l, static_cast<int>(dModel),
-					                     gb.Wk.data(), static_cast<int>(dModel),
-					                     0.0f, K_l, static_cast<int>(dModelKV));
-					gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
-
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
-					                     1.0f, x1_l, static_cast<int>(dModel),
-					                     gb.Wv.data(), static_cast<int>(dModel),
-					                     0.0f, V_l, static_cast<int>(dModelKV));
-					gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
-
-					// RoPE (if enabled) — fused Q+K in single kernel launch
-					if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
-					{
-						const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
-						                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
-						// Use persistent gpuInvFreq from scratch (uploaded before layer loop).
-						gpu::rope_apply_qk(Q_l, K_l, gpuTransformerScratch->gpuInvFreq.data(),
-						                    static_cast<int>(T), static_cast<int>(nHeads),
-						                    static_cast<int>(nKVHeads), static_cast<int>(dHead),
-						                    static_cast<int>(rd / 2u));
-					}
-
-					// Batched GEMM attention (replaces per-head flash attention).
-					// Q[T, dModel], K[T, dModelKV], V[T, dModelKV], attnConcat[T, dModel].
-					// Treat as batched over heads with stride = dHead between heads.
-					float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
-					float* scores = gpuTransformerScratch->attnScores.data();
-					float* attnP  = gpuTransformerScratch->attnProbs.data();
-					{
-						const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
-						const unsigned int groupSize = nHeads / nKVHeads;
-
-						// Loop over KV-head groups for GQA support.
-						for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
-						{
-							const unsigned int qStart = kvh * groupSize;
-							// S[groupSize, T, T] = Q_group[groupSize, T, dHead] * K_kvh[T, dHead]^T
-							float* P_out = attnP + static_cast<size_t>(qStart) * T * T;
-							gpu::sgemm_batched_strided_abt(
-							    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
-							    invSqrt,
-							    Q_l + qStart * dHead, static_cast<int>(dModel),
-							    static_cast<long long>(T) * dModel,
-							    K_l + kvh * dHead, static_cast<int>(dModelKV),
-							    0LL,  // stride 0: all Q heads in group share same K head
-							    0.0f,
-							    P_out, static_cast<int>(T),
-							    static_cast<long long>(T) * T,
-							    static_cast<int>(groupSize));
-
-							// Causal mask + softmax on S[groupSize, T, T].
-							gpu::causal_mask_softmax_inplace(
-							    P_out,
-							    static_cast<int>(groupSize), static_cast<int>(T));
-
-							// O[groupSize, T, dHead] = P[groupSize, T, T] * V_kvh[T, dHead]
-							gpu::sgemm_batched_strided(
-							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-							    1.0f,
-							    P_out, static_cast<int>(T),
-							    static_cast<long long>(T) * T,
-							    V_l + kvh * dHead, static_cast<int>(dModelKV),
-							    0LL,  // stride 0: all Q heads in group share same V head
-							    0.0f,
-							    attnConcat_l + qStart * dHead, static_cast<int>(dModel),
-							    static_cast<long long>(T) * dModel,
-							    static_cast<int>(groupSize));
-						}
-					}
-
-					// Wo projection
-					float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
-					                     1.0f, attnConcat_l, static_cast<int>(dModel),
-					                     gb.Wo.data(), static_cast<int>(dModel),
-					                     0.0f, attnOut_l, static_cast<int>(dModel));
-					gpu::add_bias(attnOut_l, gb.bo.data(), static_cast<int>(T), static_cast<int>(dModel));
-
-					// Residual 1: hAfterAttn = layerIn + attnOut
-					float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
-					gpu::add_two(hAfterAttn_l, layerIn, attnOut_l, static_cast<int>(T * dModel));
-
-					// Pre-LN 2
-					float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
-					float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
-					float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
-
-					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-					{
-						gpu::rmsnorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), lnEps,
-						                      static_cast<int>(T), static_cast<int>(dModel),
-						                      x2_l, ln2InvStd_l);
-					}
-					else
-					{
-						gpu::layernorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), gb.ln2Beta.data(),
-						                        lnEps, static_cast<int>(T), static_cast<int>(dModel),
-						                        x2_l, ln2Mean_l, ln2InvStd_l);
-					}
-
-					// FFN
-					float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
-					float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
-					float* ffOut_l = gpuTransformerScratch->ffOut.data() + static_cast<size_t>(li) * T * dModel;
-
-					// FF1: x2 * W1^T + b1
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
-					                     1.0f, x2_l, static_cast<int>(dModel),
-					                     gb.W1.data(), static_cast<int>(dModel),
-					                     0.0f, ff1_l, static_cast<int>(ff1Width));
-					gpu::add_bias(ff1_l, gb.b1.data(), static_cast<int>(T), static_cast<int>(ff1Width));
-
-					// Activation
-					if (ffnKind == 1) // SwiGLU
-					{
-						gpu::swiglu_forward(ff1_l, static_cast<int>(T), static_cast<int>(dFF), ff1Act_l);
-					}
-					else if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
-					{
-						gpu::gelu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
-					}
-					else
-					{
-						gpu::relu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
-					}
-
-					// FF2: ffAct * W2^T + b2
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
-					                     1.0f, ff1Act_l, static_cast<int>(dFF),
-					                     gb.W2.data(), static_cast<int>(dFF),
-					                     0.0f, ffOut_l, static_cast<int>(dModel));
-					gpu::add_bias(ffOut_l, gb.b2.data(), static_cast<int>(T), static_cast<int>(dModel));
-
-					// Residual 2: hAfterFF = hAfterAttn + ffOut
-					float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li) * T * dModel;
-					gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l, static_cast<int>(T * dModel));
-				}
-
-				// Final LayerNorm
-				const float* finalH = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(nLayers - 1) * T * dModel;
-				float* hPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
-				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-				{
-					gpu::rmsnorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(), lnEps,
-					                     static_cast<int>(T), static_cast<int>(dModel),
-					                     hPostFinalLN, gpuTransformerScratch->lnFinalInvStd.data());
-				}
-				else
-				{
-					gpu::layernorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(),
-					                       gpuTransformerWeights->lnFinalBeta.data(), lnEps,
-					                       static_cast<int>(T), static_cast<int>(dModel),
-					                       hPostFinalLN, gpuTransformerScratch->lnFinalMean.data(),
-					                       gpuTransformerScratch->lnFinalInvStd.data());
-				}
-
-				// Output logits
-				if (tokenLM && tieEmb)
-				{
-					// logits = hPostFinalLN * E^T + lmBias
-					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
-					                     1.0f, hPostFinalLN, static_cast<int>(dModel),
-					                     gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
-					                     0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize));
-					gpu::add_bias(gpuTransformerScratch->logits.data(),
-					              gpuTransformerWeights->lmBias.data(),
-					              static_cast<int>(T), static_cast<int>(vocabSize));
-				}
-
-				// Softmax
-				gpu::softmax_forward(gpuTransformerScratch->logits.data(),
-				                      static_cast<int>(T), static_cast<int>(outSize),
-				                      gpuTransformerScratch->probs.data());
-
-				// === Loss / metrics ===
-				std::vector<int> gpuTargetIds;
-				unsigned int gpuValidTargets = 0u;
-				if (tokenLM)
-				{
-					gpuTargetIds.resize(T);
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						int yid = padTokenId;
-						di->getTrainSequenceExpectedTokenId(s, t, yid);
-						gpuTargetIds[t] = yid;
-					}
-					// Upload targets to persistent scratch buffer.
-					gpuTransformerScratch->gpuTargetsT.upload(&gpuTargetIds[0], T);
-
-					// GPU loss: cross-entropy NLL.
-					gpu::cross_entropy_nll_loss(
-					    gpuTransformerScratch->probs.data(),
-					    gpuTransformerScratch->gpuTargetsT.data(),
-					    static_cast<int>(T), static_cast<int>(vocabSize),
-					    padTokenId,
-					    gpuTransformerScratch->lossSum.data(),
-					    gpuTransformerScratch->lossCount.data());
-
-					// GPU accuracy: argmax match count.
-					gpu::argmax_count_matches(
-					    gpuTransformerScratch->probs.data(),
-					    gpuTransformerScratch->gpuTargetsT.data(),
-					    static_cast<int>(T), static_cast<int>(vocabSize),
-					    padTokenId,
-					    gpuTransformerScratch->correctCount.data(),
-					    gpuTransformerScratch->validCount.data());
-
-					// Pack 4 loss scalars into contiguous buffer, download once.
-					gpu::pack_loss_scalars(
-					    gpuTransformerScratch->lossSum.data(),
-					    gpuTransformerScratch->lossCount.data(),
-					    gpuTransformerScratch->correctCount.data(),
-					    gpuTransformerScratch->validCount.data(),
-					    gpuTransformerScratch->lossPack.data());
-					int lossPacked[4];
-					gpuTransformerScratch->lossPack.download(lossPacked, 4);
-					float lossVal;
-					memcpy(&lossVal, &lossPacked[0], sizeof(float));
-					int lossCountVal = lossPacked[1], correctVal = lossPacked[2], validVal = lossPacked[3];
-
-					gpuValidTargets = static_cast<unsigned int>(lossCountVal);
-					tokenLmNllSum += static_cast<double>(lossVal);
-					tokenLmTokenCount += static_cast<unsigned long long>(lossCountVal);
-					clsCorrect += static_cast<unsigned long long>(correctVal);
-					clsTotal += static_cast<unsigned long long>(validVal);
-
-					targetsProcessed += static_cast<unsigned long long>(gpuValidTargets);
-				}
-				else
-				{
-					targetsProcessed += static_cast<unsigned long long>(T);
-				}
-
-				// Periodic progress logging (mirrors CPU path).
-				if (logger && (s + 1u) < seqCount)
-				{
-					const int64_t nowMs = getCurrentTimeMilliseconds();
-					const bool dueBySeq = (((s + 1u) % progressEverySeq) == 0u);
-					const bool dueByTime = ((nowMs - lastProgressMs) >= kProgressIntervalMs);
-					if (dueBySeq || dueByTime)
-					{
-						lastProgressMs = nowMs;
-						const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
-						const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
-						const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
-
-						std::ostringstream oss;
-						oss << "event=nn_epoch_progress";
-						append_logfmt_kv(oss, "net_type", netType);
-						append_logfmt_kv(oss, "run_type", std::string("train"));
-						append_logfmt_kv(oss, "gpu", true);
-						append_logfmt_kv(oss, "epoch", epochIdx);
-						append_logfmt_kv(oss, "seq_done", s + 1u);
-						append_logfmt_kv(oss, "seq_total", seqCount);
-						append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
-						append_logfmt_kv(oss, "targets_seen", targetsProcessed);
-						append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
-						if (tokenLM)
-						{
-							append_logfmt_kv(oss, "token_lm_loss_kind", std::string("full_softmax"));
-							append_logfmt_kv(oss, "nll", meanNll);
-							double ppl = 0.0;
-							if (tokenLmTokenCount > 0ULL)
-							{
-								double arg = meanNll;
-								if (arg > 80.0) arg = 80.0;
-								if (arg < -80.0) arg = -80.0;
-								ppl = exp(arg);
-							}
-							append_logfmt_kv(oss, "perplexity", ppl);
-							append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
-						}
-						else
-						{
-							append_logfmt_kv(oss, "loss_so_far", overallTotalError);
-						}
-						append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
-						if (trainingConfig.globalGradClipNorm > 0.0f)
-						{
-							append_logfmt_kv(oss, "grad_norm", lastGradNorm);
-							append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
-						}
-						append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tensorTransformer.optimizerStep));
-						logger->info("NNetwork", shmea::GString(oss.str().c_str()));
-					}
-				}
-
-				// === GPU Backward pass ===
-				if (seqInBatch == 0u)
-				{
-					gpu::zeroTransformerGradients(*gpuTransformerWeights);
-					timeStepsInBatch = 0u;
-				}
-
-				// Compute dLogits on GPU.
-				const float* bwdFinalH = gpuTransformerScratch->hAfterFF.data() +
-				    static_cast<size_t>(nLayers - 1) * T * dModel;
-				const float* bwdPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
-
-				if (tokenLM)
-				{
-					// dLogits = probs - one_hot(targets)
-					gpu::softmax_cross_entropy_bwd(
-					    gpuTransformerScratch->probs.data(),
-					    gpuTransformerScratch->gpuTargetsT.data(),
-					    static_cast<int>(T), static_cast<int>(vocabSize),
-					    gpuTransformerScratch->dLogits.data());
-
-					// Backprop tied LM head: logits = hPostFinalLN * E^T + lmBias
-					// dH (w.r.t. hPostFinalLN) = dLogits * E
-					gpu::sgemm_rowmajor(
-					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(vocabSize),
-					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
-					    gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
-					    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
-
-					// gTokE += dLogits^T * hPostFinalLN  [vocabSize, dModel]
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(vocabSize), static_cast<int>(dModel), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
-					    bwdPostFinalLN, static_cast<int>(dModel),
-					    1.0f, gpuTransformerWeights->gTokE.data(), static_cast<int>(dModel));
-
-					// gLmBias += sum_rows(dLogits)
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dLogits.data(),
-					    static_cast<int>(T), static_cast<int>(vocabSize),
-					    1.0f, gpuTransformerWeights->gLmBias.data());
-
-					timeStepsInBatch += gpuValidTargets;
-				}
-				else
-				{
-					// Non-tokenLM: dLogits computed from probs - expected on CPU, upload.
-					std::vector<float> probsHost(static_cast<size_t>(T) * outSize);
-					gpuTransformerScratch->probs.download(&probsHost[0], probsHost.size());
-					std::vector<float> dLogitsHost(static_cast<size_t>(T) * outSize, 0.0f);
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						const float* expRow = NULL;
-						unsigned int expSize = 0u;
-						di->getTrainSequenceExpectedRowView(s, t, expRow, expSize);
-						const size_t off = static_cast<size_t>(t) * outSize;
-						for (unsigned int k = 0; k < outSize; ++k)
-						{
-							const float expv = (expRow && k < expSize) ? expRow[k] : 0.0f;
-							dLogitsHost[off + k] = probsHost[off + k] - expv;
-						}
-					}
-					gpuTransformerScratch->dLogits.upload(&dLogitsHost[0], dLogitsHost.size());
-
-					// dH (w.r.t. hPostFinalLN) = dLogits * WOut  [T, dModel]
-					gpu::sgemm_rowmajor(
-					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(outSize),
-					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
-					    gpuTransformerWeights->WOut.data(), static_cast<int>(dModel),
-					    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
-
-					// gWOut += dLogits^T * hPostFinalLN  [outSize, dModel]
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(outSize), static_cast<int>(dModel), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
-					    bwdPostFinalLN, static_cast<int>(dModel),
-					    1.0f, gpuTransformerWeights->gWOut.data(), static_cast<int>(dModel));
-
-					// gBOut += sum_rows(dLogits)
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dLogits.data(),
-					    static_cast<int>(T), static_cast<int>(outSize),
-					    1.0f, gpuTransformerWeights->gBOut.data());
-
-					timeStepsInBatch += T;
-				}
-
-				// Backprop Final LayerNorm: dH (w.r.t. hPostFinalLN) -> dH (w.r.t. hFinal)
-				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-				{
-					gpu::rmsnorm_backward(
-					    gpuTransformerScratch->dH.data(), bwdFinalH,
-					    gpuTransformerWeights->lnFinalGamma.data(),
-					    gpuTransformerScratch->lnFinalInvStd.data(),
-					    static_cast<int>(T), static_cast<int>(dModel),
-					    gpuTransformerScratch->dH2.data(),
-					    gpuTransformerWeights->gLnFinalGamma.data());
-				}
-				else
-				{
-					gpu::layernorm_backward(
-					    gpuTransformerScratch->dH.data(), bwdFinalH,
-					    gpuTransformerWeights->lnFinalGamma.data(),
-					    gpuTransformerScratch->lnFinalMean.data(),
-					    gpuTransformerScratch->lnFinalInvStd.data(),
-					    static_cast<int>(T), static_cast<int>(dModel),
-					    gpuTransformerScratch->dH2.data(),
-					    gpuTransformerWeights->gLnFinalGamma.data(),
-					    gpuTransformerWeights->gLnFinalBeta.data());
-				}
-				// dH2 now has gradient w.r.t. hFinal; swap into dH for block backprop.
-				gpu::device_memcpy_d2d(gpuTransformerScratch->dH.data(),
-				                       gpuTransformerScratch->dH2.data(),
-				                       static_cast<size_t>(T) * dModel * sizeof(float));
-
-				// RoPE invFreq already uploaded to scratch before forward layer loop.
-				const unsigned int ropeHalfDim = fwdRopeHalfDim;
-
-				// Backprop through blocks (reverse order).
-				for (int li = static_cast<int>(nLayers) - 1; li >= 0; --li)
-				{
-					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
-					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
-
-					const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
-					    : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
-					const float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
-					const float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
-					const float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
-					const float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
-					const float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
-					const float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
-
-					// dH is gradient w.r.t. hAfterFF[li].
-					// Residual: hAfterFF = hAfterAttn + ffOut => dFFOut = dH, dHAfterAttn (residual) = dH.
-					// --- FFN backward ---
-					// ffOut = W2 * ff1Act + b2  =>  dFF1Act = dH * W2^T, gW2 += dH^T * ff1Act
-					gpu::sgemm_rowmajor(
-					    static_cast<int>(T), static_cast<int>(dFF), static_cast<int>(dModel),
-					    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
-					    gb.W2.data(), static_cast<int>(dFF),
-					    0.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF));
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(dModel), static_cast<int>(dFF), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
-					    ff1Act_l, static_cast<int>(dFF),
-					    1.0f, gb.gW2.data(), static_cast<int>(dFF));
-					// gB2 += sum_rows(dH)
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dH.data(),
-					    static_cast<int>(T), static_cast<int>(dModel),
-					    1.0f, gb.gB2.data());
-
-					// Activation backward.
-					if (ffnKind == 1) // SwiGLU
-					{
-						gpu::swiglu_backward(
-						    gpuTransformerScratch->dFF1Act.data(), ff1_l,
-						    static_cast<int>(T), static_cast<int>(dFF),
-						    gpuTransformerScratch->dFF1Cat.data());
-						// ff1 = W1 * x2 + b1 => dX2 = dFF1Cat * W1^T, gW1 += dFF1Cat^T * x2
-						gpu::sgemm_rowmajor(
-						    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(ff1Width),
-						    1.0f, gpuTransformerScratch->dFF1Cat.data(), static_cast<int>(ff1Width),
-						    gb.W1.data(), static_cast<int>(dModel),
-						    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
-						gpu::sgemm_rowmajor_atb(
-						    static_cast<int>(ff1Width), static_cast<int>(dModel), static_cast<int>(T),
-						    1.0f, gpuTransformerScratch->dFF1Cat.data(), static_cast<int>(ff1Width),
-						    x2_l, static_cast<int>(dModel),
-						    1.0f, gb.gW1.data(), static_cast<int>(dModel));
-						gpu::reduce_rows_sum(
-						    gpuTransformerScratch->dFF1Cat.data(),
-						    static_cast<int>(T), static_cast<int>(ff1Width),
-						    1.0f, gb.gB1.data());
-					}
-					else
-					{
-						// GELU/ReLU backward
-						if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
-						{
-							gpu::gelu_backward(
-							    gpuTransformerScratch->dFF1Act.data(), ff1_l,
-							    static_cast<int>(T * dFF),
-							    gpuTransformerScratch->dFF1Act.data());
-						}
-						else
-						{
-							gpu::relu_backward(
-							    gpuTransformerScratch->dFF1Act.data(), ff1_l,
-							    static_cast<int>(T * dFF),
-							    gpuTransformerScratch->dFF1Act.data());
-						}
-						// ff1 = W1 * x2 + b1 => dX2, gW1
-						gpu::sgemm_rowmajor(
-						    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
-						    1.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF),
-						    gb.W1.data(), static_cast<int>(dModel),
-						    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
-						gpu::sgemm_rowmajor_atb(
-						    static_cast<int>(dFF), static_cast<int>(dModel), static_cast<int>(T),
-						    1.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF),
-						    x2_l, static_cast<int>(dModel),
-						    1.0f, gb.gW1.data(), static_cast<int>(dModel));
-						gpu::reduce_rows_sum(
-						    gpuTransformerScratch->dFF1Act.data(),
-						    static_cast<int>(T), static_cast<int>(dFF),
-						    1.0f, gb.gB1.data());
-					}
-
-					// --- LN2 backward ---
-					const float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
-					const float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
-					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-					{
-						gpu::rmsnorm_backward(
-						    gpuTransformerScratch->dX2.data(), hAfterAttn_l,
-						    gb.ln2Gamma.data(), ln2InvStd_l,
-						    static_cast<int>(T), static_cast<int>(dModel),
-						    gpuTransformerScratch->dHAfterAttnFromLN.data(),
-						    gb.gLn2Gamma.data());
-					}
-					else
-					{
-						gpu::layernorm_backward(
-						    gpuTransformerScratch->dX2.data(), hAfterAttn_l,
-						    gb.ln2Gamma.data(), ln2Mean_l, ln2InvStd_l,
-						    static_cast<int>(T), static_cast<int>(dModel),
-						    gpuTransformerScratch->dHAfterAttnFromLN.data(),
-						    gb.gLn2Gamma.data(), gb.gLn2Beta.data());
-					}
-
-					// Combine: dHAfterAttn = dH (residual) + dHAfterAttnFromLN
-					gpu::add_two(gpuTransformerScratch->dH2.data(),
-					    gpuTransformerScratch->dH.data(),
-					    gpuTransformerScratch->dHAfterAttnFromLN.data(),
-					    static_cast<int>(T * dModel));
-
-					// --- Wo backward ---
-					// attnOut = Wo * attnConcat + bo  =>  dAttnConcat, gWo
-					gpu::sgemm_rowmajor(
-					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
-					    1.0f, gpuTransformerScratch->dH2.data(), static_cast<int>(dModel),
-					    gb.Wo.data(), static_cast<int>(dModel),
-					    0.0f, gpuTransformerScratch->dAttnConcat.data(), static_cast<int>(dModel));
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dH2.data(), static_cast<int>(dModel),
-					    attnConcat_l, static_cast<int>(dModel),
-					    1.0f, gb.gWo.data(), static_cast<int>(dModel));
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dH2.data(),
-					    static_cast<int>(T), static_cast<int>(dModel),
-					    1.0f, gb.gBo.data());
-
-					// --- Attention backward (batched GEMM) ---
-					float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
-					float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
-					float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
-
-					// Zero dK/dV (dQ is overwritten per-head, but dK/dV accumulate for GQA).
-					gpu::zero_buffers_batch(gpuTransformerScratch->d_dKdVZeroPtrs,
-					    gpuTransformerScratch->d_dKdVZeroSizes, 2);
-
-					{
-						const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
-						const unsigned int groupSize = nHeads / nKVHeads;
-						float* scores = gpuTransformerScratch->attnScores.data();
-						const float* attnP = gpuTransformerScratch->attnProbs.data();
-
-						for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
-						{
-							const unsigned int qStart = kvh * groupSize;
-							const float* P_group = attnP + static_cast<size_t>(qStart) * T * T;
-							float* dS = scores; // reuse attnScores as scratch for dS
-
-							// 1. dP[groupSize, T, T] = dO[groupSize, T, dHead] * V_kvh[T, dHead]^T
-							gpu::sgemm_batched_strided_abt(
-							    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
-							    1.0f,
-							    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
-							    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
-							    V_l + kvh * dHead,
-							    static_cast<int>(dModelKV), 0LL,
-							    0.0f,
-							    dS, static_cast<int>(T), static_cast<long long>(T) * T,
-							    static_cast<int>(groupSize));
-
-							// 2. softmax backward: dS = invSqrt * P * (dP - row_sum(dP * P))
-							gpu::softmax_backward_attn(P_group, dS,
-							    static_cast<int>(groupSize),
-							    static_cast<int>(T), invSqrt, dS);
-
-							// 3. dQ[groupSize, T, dHead] = dS[groupSize, T, T] * K_kvh[T, dHead]
-							gpu::sgemm_batched_strided(
-							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-							    1.0f,
-							    dS, static_cast<int>(T), static_cast<long long>(T) * T,
-							    K_l + kvh * dHead, static_cast<int>(dModelKV), 0LL,
-							    0.0f,
-							    gpuTransformerScratch->dQfull.data() + qStart * dHead,
-							    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
-							    static_cast<int>(groupSize));
-
-							// 4. dK_kvh[T, dHead] += sum over group of dS_h^T[T, T] * Q_h[T, dHead]
-							// Use batched ATB: dK += dS^T * Q, beta=1.0 to accumulate.
-							gpu::sgemm_batched_strided_atb(
-							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-							    1.0f,
-							    dS, static_cast<int>(T), static_cast<long long>(T) * T,
-							    Q_l + qStart * dHead, static_cast<int>(dModel),
-							    static_cast<long long>(T) * dModel,
-							    1.0f,
-							    gpuTransformerScratch->dKfull.data() + kvh * dHead,
-							    static_cast<int>(dModelKV), 0LL,
-							    static_cast<int>(groupSize));
-
-							// 5. dV_kvh[T, dHead] += sum over group of P_h^T[T, T] * dO_h[T, dHead]
-							gpu::sgemm_batched_strided_atb(
-							    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-							    1.0f,
-							    P_group, static_cast<int>(T), static_cast<long long>(T) * T,
-							    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
-							    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
-							    1.0f,
-							    gpuTransformerScratch->dVfull.data() + kvh * dHead,
-							    static_cast<int>(dModelKV), 0LL,
-							    static_cast<int>(groupSize));
-						}
-					}
-
-					// --- RoPE backward (inverse rotation) — fused Q+K ---
-					if (useRope && gpuTransformerScratch->gpuInvFreq.allocated())
-					{
-						gpu::rope_apply_qk(gpuTransformerScratch->dQfull.data(),
-						    gpuTransformerScratch->dKfull.data(),
-						    gpuTransformerScratch->gpuInvFreq.data(),
-						    static_cast<int>(T), static_cast<int>(nHeads),
-						    static_cast<int>(nKVHeads), static_cast<int>(dHead),
-						    static_cast<int>(ropeHalfDim), true);
-					}
-
-					// --- Q/K/V projection backward ---
-					// dX1 = dQ*Wq^T + dK*Wk^T + dV*Wv^T
-					// Also accumulate gWq, gBq, gWk, gBk, gWv, gBv.
-
-					// Q: dXtmp = dQ * Wq^T
-					gpu::sgemm_rowmajor(
-					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
-					    1.0f, gpuTransformerScratch->dQfull.data(), static_cast<int>(dModel),
-					    gb.Wq.data(), static_cast<int>(dModel),
-					    0.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dQfull.data(), static_cast<int>(dModel),
-					    x1_l, static_cast<int>(dModel),
-					    1.0f, gb.gWq.data(), static_cast<int>(dModel));
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dQfull.data(),
-					    static_cast<int>(T), static_cast<int>(dModel),
-					    1.0f, gb.gBq.data());
-
-					// K: accumulate dK * Wk^T directly into dX1 (beta=1.0)
-					gpu::sgemm_rowmajor(
-					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
-					    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
-					    gb.Wk.data(), static_cast<int>(dModel),
-					    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
-					    x1_l, static_cast<int>(dModel),
-					    1.0f, gb.gWk.data(), static_cast<int>(dModel));
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dKfull.data(),
-					    static_cast<int>(T), static_cast<int>(dModelKV),
-					    1.0f, gb.gBk.data());
-
-					// V: accumulate dV * Wv^T directly into dX1 (beta=1.0)
-					gpu::sgemm_rowmajor(
-					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
-					    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
-					    gb.Wv.data(), static_cast<int>(dModel),
-					    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
-					    x1_l, static_cast<int>(dModel),
-					    1.0f, gb.gWv.data(), static_cast<int>(dModel));
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dVfull.data(),
-					    static_cast<int>(T), static_cast<int>(dModelKV),
-					    1.0f, gb.gBv.data());
-
-					// --- LN1 backward ---
-					const float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
-					const float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
-					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-					{
-						gpu::rmsnorm_backward(
-						    gpuTransformerScratch->dX1.data(), layerIn,
-						    gb.ln1Gamma.data(), ln1InvStd_l,
-						    static_cast<int>(T), static_cast<int>(dModel),
-						    gpuTransformerScratch->dHInFromLN.data(),
-						    gb.gLn1Gamma.data());
-					}
-					else
-					{
-						gpu::layernorm_backward(
-						    gpuTransformerScratch->dX1.data(), layerIn,
-						    gb.ln1Gamma.data(), ln1Mean_l, ln1InvStd_l,
-						    static_cast<int>(T), static_cast<int>(dModel),
-						    gpuTransformerScratch->dHInFromLN.data(),
-						    gb.gLn1Gamma.data(), gb.gLn1Beta.data());
-					}
-
-					// Combine into dH: dH = dH2 + dHInFromLN
-					gpu::add_two(gpuTransformerScratch->dH.data(),
-					    gpuTransformerScratch->dH2.data(),
-					    gpuTransformerScratch->dHInFromLN.data(),
-					    static_cast<int>(T * dModel));
-				} // layers backward
-
-				// Backprop through input embedding/projection.
-				if (tokenLM)
-				{
-					// gTokE[tokenId[t]] += dH[t] for each timestep.
-					gpu::embedding_scatter_add(
-					    gpuTransformerWeights->gTokE.data(),
-					    gpuTransformerScratch->tokenIds.data(),
-					    gpuTransformerScratch->dH.data(),
-					    static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel));
-				}
-				else
-				{
-					// gWIn += dH^T * x, gBIn += sum_rows(dH)
-					gpu::sgemm_rowmajor_atb(
-					    static_cast<int>(dModel), static_cast<int>(inputSize), static_cast<int>(T),
-					    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
-					    gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
-					    1.0f, gpuTransformerWeights->gWIn.data(), static_cast<int>(inputSize));
-					gpu::reduce_rows_sum(
-					    gpuTransformerScratch->dH.data(),
-					    static_cast<int>(T), static_cast<int>(dModel),
-					    1.0f, gpuTransformerWeights->gBIn.data());
-				}
-
-				++seqInBatch;
-
-				// === Optimizer step (when batch is complete) ===
-				if (seqInBatch >= seqBatchMax && timeStepsInBatch > 0u)
-				{
-					const float invBatch = 1.0f / static_cast<float>(timeStepsInBatch);
-					tensorTransformer.optimizerStep += 1ULL;
-
-					// Warmup + DDP LR scaling (matches CPU path).
-					const float warmupMult = trainingConfig.warmup.multiplier(static_cast<int>(tensorTransformer.optimizerStep));
-					const float ddpLRScale = (trainingConfig.ddp.enable && trainingConfig.ddp.linearLRScaling)
-					                       ? static_cast<float>(glades::ddp::worldSize()) : 1.0f;
-					const float gpuExtraLRMult = warmupMult * ddpLRScale;
-
-					// Step-level LR schedule (cosine decay within epoch).
-					if (trainingConfig.lrSchedule.type != glades::LearningRateScheduleConfig::NONE)
-					{
-						const unsigned int totalSteps = (seqCount + seqBatchMax - 1u) / seqBatchMax;
-						const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
-						const float progress = (totalSteps > 0u) ? static_cast<float>(stepInEpoch) / static_cast<float>(totalSteps) : 0.0f;
-						lrScheduleMultiplier = trainingConfig.lrSchedule.multiplierSmooth(progress);
-					}
-
-					// Global gradient norm clipping on GPU.
-					float gradScale = 1.0f;
-					const float clipNorm = trainingConfig.globalGradClipNorm;
-					if (clipNorm > 0.0f)
-					{
-						// Use lossSum buffer as temporary accumulator for gradient norm.
-						gpu::device_memset_bytes(gpuTransformerScratch->lossSum.data(), 0, sizeof(float));
-
-						// Accumulate sum(g^2) across all gradient buffers.
-						if (tokenLM)
-						{
-							gpu::sum_squared_accumulate(gpuTransformerWeights->gTokE.data(),
-							    static_cast<int>(gpuTransformerWeights->gTokE.size()),
-							    gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gpuTransformerWeights->gLmBias.data(),
-							    static_cast<int>(gpuTransformerWeights->gLmBias.size()),
-							    gpuTransformerScratch->lossSum.data());
-						}
-						else
-						{
-							gpu::sum_squared_accumulate(gpuTransformerWeights->gWIn.data(),
-							    static_cast<int>(gpuTransformerWeights->gWIn.size()),
-							    gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gpuTransformerWeights->gBIn.data(),
-							    static_cast<int>(gpuTransformerWeights->gBIn.size()),
-							    gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gpuTransformerWeights->gWOut.data(),
-							    static_cast<int>(gpuTransformerWeights->gWOut.size()),
-							    gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gpuTransformerWeights->gBOut.data(),
-							    static_cast<int>(gpuTransformerWeights->gBOut.size()),
-							    gpuTransformerScratch->lossSum.data());
-						}
-						for (unsigned int gli = 0; gli < nLayers; ++gli)
-						{
-							gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[gli];
-							gpu::sum_squared_accumulate(gb.gWq.data(), static_cast<int>(gb.gWq.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gWk.data(), static_cast<int>(gb.gWk.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gWv.data(), static_cast<int>(gb.gWv.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gWo.data(), static_cast<int>(gb.gWo.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gW1.data(), static_cast<int>(gb.gW1.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gW2.data(), static_cast<int>(gb.gW2.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gBq.data(), static_cast<int>(gb.gBq.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gBk.data(), static_cast<int>(gb.gBk.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gBv.data(), static_cast<int>(gb.gBv.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gBo.data(), static_cast<int>(gb.gBo.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gB1.data(), static_cast<int>(gb.gB1.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gB2.data(), static_cast<int>(gb.gB2.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gLn1Gamma.data(), static_cast<int>(gb.gLn1Gamma.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gLn1Beta.data(), static_cast<int>(gb.gLn1Beta.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gLn2Gamma.data(), static_cast<int>(gb.gLn2Gamma.size()), gpuTransformerScratch->lossSum.data());
-							gpu::sum_squared_accumulate(gb.gLn2Beta.data(), static_cast<int>(gb.gLn2Beta.size()), gpuTransformerScratch->lossSum.data());
-						}
-						// Final LayerNorm gradients
-						gpu::sum_squared_accumulate(gpuTransformerWeights->gLnFinalGamma.data(),
-						    static_cast<int>(gpuTransformerWeights->gLnFinalGamma.size()),
-						    gpuTransformerScratch->lossSum.data());
-						gpu::sum_squared_accumulate(gpuTransformerWeights->gLnFinalBeta.data(),
-						    static_cast<int>(gpuTransformerWeights->gLnFinalBeta.size()),
-						    gpuTransformerScratch->lossSum.data());
-
-						float h_sumSq = 0.0f;
-						gpuTransformerScratch->lossSum.download(&h_sumSq, 1);
-						const float gradNorm = sqrtf(h_sumSq) * invBatch;
-						if (gradNorm > clipNorm)
-							gradScale = clipNorm / (gradNorm + 1e-12f);
-						lastGradNorm = gradNorm;
-						lastGradNormScale = gradScale;
-					}
-
-					const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
-
-					if (gpuUseAtlas)
-					{
-					// === GPU ATLAS optimizer ===
-					// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
-					// Biases and LN params use vanilla SGD (matching CPU ATLAS path).
-					const glades::ATLASConfig& ac = trainingConfig.atlas;
-
-					bool gpuAtlasError = false;
-
-					// Macro: vanilla SGD for 1D bias/LN param on GPU.
-					// W -= lr * invBatch * gradScale * g;  then zero g.
-#define GLADES_GPU_SGD_BIAS(param, grad, lr_) do { \
-	const int sgd_sz_ = static_cast<int>((param).size()); \
-	if (sgd_sz_ > 0) { \
-		gpu::atlas_gpu_baseline_update((param).data(), (grad).data(), sgd_sz_, (lr_) * invBatch * gradScale); \
-		gpu::atlas_gpu_guard((param).data(), sgd_sz_); \
-		(grad).zero(); \
-	} \
-} while(0)
-
-					// Token embedding (layer index 0)
-					if (tokenLM)
-					{
-						const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
-						const float wd1_0 = skeleton->getWeightDecay1(0u);
-						const float wd2_0 = skeleton->getWeightDecay2(0u);
-
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasTokE,
-						    gpuTransformerWeights->tokE.data(), gpuTransformerWeights->gTokE.data(),
-						    vocabSize, dModel, invBatch, lr0, wd1_0, wd2_0, gradScale,
-						    ac, rngEngine, getLogger(), "tr.tokE"))
-						    gpuAtlasError = true;
-
-						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lmBias, gpuTransformerWeights->gLmBias, lr0);
-					}
-
-					// Input projection (layer index 0, not used for token-LM models)
-					if (!tokenLM)
-					{
-						const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
-						const float wd1_0 = skeleton->getWeightDecay1(0u);
-						const float wd2_0 = skeleton->getWeightDecay2(0u);
-
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasWIn,
-						    gpuTransformerWeights->WIn.data(), gpuTransformerWeights->gWIn.data(),
-						    dModel, inputSize, invBatch, lr0, wd1_0, wd2_0, gradScale,
-						    ac, rngEngine, getLogger(), "tr.WIn"))
-						    gpuAtlasError = true;
-
-						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bIn, gpuTransformerWeights->gBIn, lr0);
-					}
-
-					// Per-layer blocks (layer index 1..nLayers)
-					for (unsigned int bli = 0; bli < nLayers; ++bli)
-					{
-						const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
-						const float wd1_l = skeleton->getWeightDecay1(bli + 1u);
-						const float wd2_l = skeleton->getWeightDecay2(bli + 1u);
-						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
-
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWq, gb.Wq.data(), gb.gWq.data(), dModel, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wq"))
-						    gpuAtlasError = true;
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWk, gb.Wk.data(), gb.gWk.data(), dModelKV, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wk"))
-						    gpuAtlasError = true;
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWv, gb.Wv.data(), gb.gWv.data(), dModelKV, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wv"))
-						    gpuAtlasError = true;
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWo, gb.Wo.data(), gb.gWo.data(), dModel, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wo"))
-						    gpuAtlasError = true;
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasW1, gb.W1.data(), gb.gW1.data(), ff1Width, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.W1"))
-						    gpuAtlasError = true;
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasW2, gb.W2.data(), gb.gW2.data(), dModel, dFF, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.W2"))
-						    gpuAtlasError = true;
-
-						// Biases and LN params: vanilla SGD (no subspace projection)
-						GLADES_GPU_SGD_BIAS(gb.bq, gb.gBq, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.bk, gb.gBk, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.bv, gb.gBv, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.bo, gb.gBo, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.b1, gb.gB1, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.b2, gb.gB2, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.ln1Gamma, gb.gLn1Gamma, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.ln1Beta, gb.gLn1Beta, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.ln2Gamma, gb.gLn2Gamma, lr_l);
-						GLADES_GPU_SGD_BIAS(gb.ln2Beta, gb.gLn2Beta, lr_l);
-					}
-
-					// Final LayerNorm (use block 0 LR; no weight decay)
-					{
-						const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
-						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lnFinalGamma, gpuTransformerWeights->gLnFinalGamma, lrLN);
-						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lnFinalBeta, gpuTransformerWeights->gLnFinalBeta, lrLN);
-					}
-
-					// Output projection (layer index nLayers, unused in tied-head mode)
-					if (!tokenLM)
-					{
-						const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
-						const float wd1_o = skeleton->getWeightDecay1(nLayers);
-						const float wd2_o = skeleton->getWeightDecay2(nLayers);
-
-						if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasWOut,
-						    gpuTransformerWeights->WOut.data(), gpuTransformerWeights->gWOut.data(),
-						    outSize, dModel, invBatch, lrO, wd1_o, wd2_o, gradScale,
-						    ac, rngEngine, getLogger(), "tr.WOut"))
-						    gpuAtlasError = true;
-
-						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bOut, gpuTransformerWeights->gBOut, lrO);
-					}
-
-					// --- GPU ATLAS periodic diagnostics ---
-					if (!gpuAtlasError && logger && ac.tSub > 0u)
-					{
-						const unsigned long long tSubULL = static_cast<unsigned long long>(ac.tSub);
-
-						// Helper lambda-like macro to log a single weight state
-#define GLADES_GPU_ATLAS_DIAG(st, tag_str) do { \
-	if ((st).initialized && ((st).step % tSubULL) == 0ULL) { \
-		gpu::AtlasGpuDiag ad_ = gpu::atlas_gpu_get_diag((st)); \
-		if (ad_.valid) { \
-			std::ostringstream oss_; \
-			oss_ << "event=gpu_atlas_step tag=" << (tag_str); \
-			oss_ << " step=" << ad_.step; \
-			oss_ << " m=" << (st).m << " n=" << (st).n << " rank=" << (st).r; \
-			oss_ << " mu=" << ad_.mu; \
-			oss_ << " sigma2=" << ad_.sigma2; \
-			oss_ << " baseline_rate=" << ad_.baselineRate; \
-			oss_ << " gz_norm=" << ad_.gzNorm; \
-			oss_ << " update_norm=" << ad_.updateNorm; \
-			oss_ << " fisher_min=" << ad_.fisherMin; \
-			oss_ << " fisher_max=" << ad_.fisherMax; \
-			oss_ << " fisher_mean=" << ad_.fisherMean; \
-			logger->info("ATLAS", shmea::GString(oss_.str().c_str())); \
-		} \
-	} \
-} while(0)
-
-						if (tokenLM)
-							GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasTokE, "tr.tokE");
-						if (!tokenLM)
-							GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasWIn, "tr.WIn");
-
-						for (unsigned int bli = 0; bli < nLayers; ++bli)
-						{
-							gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
-							GLADES_GPU_ATLAS_DIAG(gb.atlasWq, "tr.Wq");
-							GLADES_GPU_ATLAS_DIAG(gb.atlasWk, "tr.Wk");
-							GLADES_GPU_ATLAS_DIAG(gb.atlasWv, "tr.Wv");
-							GLADES_GPU_ATLAS_DIAG(gb.atlasWo, "tr.Wo");
-							GLADES_GPU_ATLAS_DIAG(gb.atlasW1, "tr.W1");
-							GLADES_GPU_ATLAS_DIAG(gb.atlasW2, "tr.W2");
-						}
-
-						if (!tokenLM)
-							GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasWOut, "tr.WOut");
-
-#undef GLADES_GPU_ATLAS_DIAG
-					}
-
-					if (gpuAtlasError)
-					{
-						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-						    "SGDHelper_TRANSFORMER: GPU ATLAS update failed");
-						running = false;
-					}
-#undef GLADES_GPU_SGD_BIAS
-					}
-					else
-					{
-					// === Batched Adam optimizer ===
-					const float beta1 = trainingConfig.optimizer.adamBeta1;
-					const float beta2 = trainingConfig.optimizer.adamBeta2;
-					const float adamEps = trainingConfig.optimizer.adamEps;
-					const int stepInt = static_cast<int>(tensorTransformer.optimizerStep);
-
-					// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
-					if (!gpuTransformerWeights->adamPtrsUploaded)
-					{
-						float* hParams[6 + 16 * 256];
-						float* hGrads[6 + 16 * 256];
-						float* hMs[6 + 16 * 256];
-						float* hVs[6 + 16 * 256];
-						int hSizes[6 + 16 * 256];
-						int gc = 0;
-						int maxSz = 0;
-
-#define GLADES_ADD_ADAM_GROUP(p, g, m, v, sz) do { \
-	if ((sz) > 0) { \
-		hParams[gc] = (p); hGrads[gc] = (g); \
-		hMs[gc] = (m); hVs[gc] = (v); \
-		hSizes[gc] = (sz); \
-		if ((sz) > maxSz) maxSz = (sz); \
-		++gc; \
-	} \
-} while(0)
-
-						if (tokenLM)
-						{
-							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->tokE.data(),
-							    gpuTransformerWeights->gTokE.data(),
-							    gpuTransformerWeights->vTokE.data(),
-							    gpuTransformerWeights->v2TokE.data(),
-							    static_cast<int>(static_cast<size_t>(vocabSize) * dModel));
-							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lmBias.data(),
-							    gpuTransformerWeights->gLmBias.data(),
-							    gpuTransformerWeights->mLmBias.data(),
-							    gpuTransformerWeights->v2LmBias.data(),
-							    static_cast<int>(vocabSize));
-						}
-						{
-							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WIn.data(),
-							    gpuTransformerWeights->gWIn.data(),
-							    gpuTransformerWeights->vWIn.data(),
-							    gpuTransformerWeights->v2WIn.data(),
-							    static_cast<int>(gpuTransformerWeights->WIn.size()));
-							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bIn.data(),
-							    gpuTransformerWeights->gBIn.data(),
-							    gpuTransformerWeights->mBIn.data(),
-							    gpuTransformerWeights->v2BIn.data(),
-							    static_cast<int>(gpuTransformerWeights->bIn.size()));
-						}
-						for (unsigned int bli = 0; bli < nLayers; ++bli)
-						{
-							gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
-							GLADES_ADD_ADAM_GROUP(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()));
-							GLADES_ADD_ADAM_GROUP(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()));
-							GLADES_ADD_ADAM_GROUP(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()));
-							GLADES_ADD_ADAM_GROUP(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()));
-							GLADES_ADD_ADAM_GROUP(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()));
-							GLADES_ADD_ADAM_GROUP(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()));
-							GLADES_ADD_ADAM_GROUP(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(), static_cast<int>(gb.bq.size()));
-							GLADES_ADD_ADAM_GROUP(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(), static_cast<int>(gb.bk.size()));
-							GLADES_ADD_ADAM_GROUP(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(), static_cast<int>(gb.bv.size()));
-							GLADES_ADD_ADAM_GROUP(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(), static_cast<int>(gb.bo.size()));
-							GLADES_ADD_ADAM_GROUP(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(), static_cast<int>(gb.b1.size()));
-							GLADES_ADD_ADAM_GROUP(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(), static_cast<int>(gb.b2.size()));
-							GLADES_ADD_ADAM_GROUP(gb.ln1Gamma.data(), gb.gLn1Gamma.data(), gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(), static_cast<int>(gb.ln1Gamma.size()));
-							GLADES_ADD_ADAM_GROUP(gb.ln1Beta.data(), gb.gLn1Beta.data(), gb.mLn1Beta.data(), gb.v2Ln1Beta.data(), static_cast<int>(gb.ln1Beta.size()));
-							GLADES_ADD_ADAM_GROUP(gb.ln2Gamma.data(), gb.gLn2Gamma.data(), gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(), static_cast<int>(gb.ln2Gamma.size()));
-							GLADES_ADD_ADAM_GROUP(gb.ln2Beta.data(), gb.gLn2Beta.data(), gb.mLn2Beta.data(), gb.v2Ln2Beta.data(), static_cast<int>(gb.ln2Beta.size()));
-						}
-						// Final LayerNorm
-						GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalGamma.data(),
-						    gpuTransformerWeights->gLnFinalGamma.data(),
-						    gpuTransformerWeights->mLnFinalGamma.data(),
-						    gpuTransformerWeights->v2LnFinalGamma.data(),
-						    static_cast<int>(gpuTransformerWeights->lnFinalGamma.size()));
-						GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalBeta.data(),
-						    gpuTransformerWeights->gLnFinalBeta.data(),
-						    gpuTransformerWeights->mLnFinalBeta.data(),
-						    gpuTransformerWeights->v2LnFinalBeta.data(),
-						    static_cast<int>(gpuTransformerWeights->lnFinalBeta.size()));
-						if (!tokenLM)
-						{
-							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WOut.data(),
-							    gpuTransformerWeights->gWOut.data(),
-							    gpuTransformerWeights->vWOut.data(),
-							    gpuTransformerWeights->v2WOut.data(),
-							    static_cast<int>(gpuTransformerWeights->WOut.size()));
-							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bOut.data(),
-							    gpuTransformerWeights->gBOut.data(),
-							    gpuTransformerWeights->mBOut.data(),
-							    gpuTransformerWeights->v2BOut.data(),
-							    static_cast<int>(gpuTransformerWeights->bOut.size()));
-						}
-#undef GLADES_ADD_ADAM_GROUP
-
-						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamParams, hParams, gc * sizeof(float*));
-						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamGrads, hGrads, gc * sizeof(float*));
-						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamM, hMs, gc * sizeof(float*));
-						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamV, hVs, gc * sizeof(float*));
-						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamSizes, hSizes, gc * sizeof(int));
-						gpuTransformerWeights->adamGroupCount = gc;
-						gpuTransformerWeights->adamMaxSize = maxSz;
-						gpuTransformerWeights->adamPtrsUploaded = true;
-					}
-
-					// Fill lr/wd arrays each step and launch single batched kernel.
-					{
-						const int gc = gpuTransformerWeights->adamGroupCount;
-						float hLrs[6 + 16 * 256];
-						float hWds[6 + 16 * 256];
-						int gi = 0;
-
-						if (tokenLM)
-						{
-							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
-							const float wd0 = skeleton->getWeightDecay2(0u);
-							hLrs[gi] = lr0; hWds[gi] = wd0; ++gi;
-							hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi;
-						}
-						{
-							const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
-							const float wd0 = skeleton->getWeightDecay2(0u);
-							if (gpuTransformerWeights->WIn.size() > 0)
-							{ hLrs[gi] = lr0; hWds[gi] = wd0; ++gi; }
-							if (gpuTransformerWeights->bIn.size() > 0)
-							{ hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi; }
-						}
-						for (unsigned int bli = 0; bli < nLayers; ++bli)
-						{
-							const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
-							const float wd_l = skeleton->getWeightDecay2(bli + 1u);
-							// 6 weight groups (with wd)
-							for (int w = 0; w < 6; ++w)
-							{ hLrs[gi] = lr_l; hWds[gi] = wd_l; ++gi; }
-							// 10 bias/LN groups (no wd)
-							for (int b = 0; b < 10; ++b)
-							{ hLrs[gi] = lr_l; hWds[gi] = 0.0f; ++gi; }
-						}
-						// Final LayerNorm (use block 0 LR; no weight decay)
-						{
-							const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
-							hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalGamma
-							hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalBeta
-						}
-						if (!tokenLM)
-						{
-							const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
-							const float wdO = skeleton->getWeightDecay2(nLayers);
-							if (gpuTransformerWeights->WOut.size() > 0)
-							{ hLrs[gi] = lrO; hWds[gi] = wdO; ++gi; }
-							if (gpuTransformerWeights->bOut.size() > 0)
-							{ hLrs[gi] = lrO; hWds[gi] = 0.0f; ++gi; }
-						}
-
-						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamLr, hLrs, gc * sizeof(float));
-						gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamWd, hWds, gc * sizeof(float));
-
-						gpu::adam_update_batch(
-						    gpuTransformerWeights->d_adamParams,
-						    gpuTransformerWeights->d_adamGrads,
-						    gpuTransformerWeights->d_adamM,
-						    gpuTransformerWeights->d_adamV,
-						    gpuTransformerWeights->d_adamLr,
-						    gpuTransformerWeights->d_adamWd,
-						    gpuTransformerWeights->d_adamSizes,
-						    gpuTransformerWeights->adamMaxSize,
-						    beta1, beta2, adamEps,
-						    invBatch * gradScale, stepInt, gc);
-					}
-					} // end Adam branch
-
-					gpu::synchronize();
-					seqInBatch = 0u;
-					timeStepsInBatch = 0u;
-				}
-			}
-
-			// After GPU training loop: download updated weights back to CPU.
-			TensorTransformerState& ttMut = tensorTransformer;
-			gpu::downloadTransformerWeights(*gpuTransformerWeights,
-			                                ttMut.tokE.empty() ? NULL : &ttMut.tokE[0], ttMut.tokE.size(),
-			                                ttMut.WIn.empty() ? NULL : &ttMut.WIn[0], ttMut.WIn.size(),
-			                                ttMut.bIn.empty() ? NULL : &ttMut.bIn[0], ttMut.bIn.size(),
-			                                ttMut.WOut.empty() ? NULL : &ttMut.WOut[0], ttMut.WOut.size(),
-			                                ttMut.bOut.empty() ? NULL : &ttMut.bOut[0], ttMut.bOut.size(),
-			                                ttMut.lmBias.empty() ? NULL : &ttMut.lmBias[0], ttMut.lmBias.size(),
-			                                ttMut.lnFinalGamma.empty() ? NULL : &ttMut.lnFinalGamma[0], ttMut.lnFinalGamma.size(),
-			                                ttMut.lnFinalBeta.empty() ? NULL : &ttMut.lnFinalBeta[0], ttMut.lnFinalBeta.size());
-
-			// Download per-block weights.
-			for (unsigned int l = 0; l < nLayers; ++l)
-			{
-				TensorTransformerState::Block& cb = ttMut.blocks[l];
-				const gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[l];
-				if (gb.Wq.allocated()) gb.Wq.download(&cb.Wq[0], cb.Wq.size());
-				if (gb.Wk.allocated()) gb.Wk.download(&cb.Wk[0], cb.Wk.size());
-				if (gb.Wv.allocated()) gb.Wv.download(&cb.Wv[0], cb.Wv.size());
-				if (gb.Wo.allocated()) gb.Wo.download(&cb.Wo[0], cb.Wo.size());
-				if (gb.W1.allocated()) gb.W1.download(&cb.W1[0], cb.W1.size());
-				if (gb.W2.allocated()) gb.W2.download(&cb.W2[0], cb.W2.size());
-				if (gb.bq.allocated()) gb.bq.download(&cb.bq[0], cb.bq.size());
-				if (gb.bk.allocated()) gb.bk.download(&cb.bk[0], cb.bk.size());
-				if (gb.bv.allocated()) gb.bv.download(&cb.bv[0], cb.bv.size());
-				if (gb.bo.allocated()) gb.bo.download(&cb.bo[0], cb.bo.size());
-				if (gb.b1.allocated()) gb.b1.download(&cb.b1[0], cb.b1.size());
-				if (gb.b2.allocated()) gb.b2.download(&cb.b2[0], cb.b2.size());
-				if (gb.ln1Gamma.allocated()) gb.ln1Gamma.download(&cb.ln1Gamma[0], cb.ln1Gamma.size());
-				if (gb.ln1Beta.allocated()) gb.ln1Beta.download(&cb.ln1Beta[0], cb.ln1Beta.size());
-				if (gb.ln2Gamma.allocated()) gb.ln2Gamma.download(&cb.ln2Gamma[0], cb.ln2Gamma.size());
-				if (gb.ln2Beta.allocated()) gb.ln2Beta.download(&cb.ln2Beta[0], cb.ln2Beta.size());
-			}
-
-			// Finalize epoch-level loss before returning.
-			// tokenLmNllSum / tokenLmTokenCount are locals; copy to the member
-			// that the Trainer reads (overallTotalError).
-			if (tokenLM)
-			{
-				if (tokenLmTokenCount > 0ULL)
-					overallTotalError = static_cast<float>(tokenLmNllSum / static_cast<double>(tokenLmTokenCount));
-				else
-					overallTotalError = 0.0f;
-			}
-
+			transformerGpuTrainEpoch(epochCfg, seqCount, epochIdx, epochStartMs,
+			                        tokensProcessed, targetsProcessed,
+			                        tokenLmNllSum, tokenLmTokenCount,
+			                        clsCorrect, clsTotal, logger);
 			return; // GPU path complete; skip CPU fallback.
 		}
 	}
@@ -3534,483 +2183,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			targetsProcessed += static_cast<unsigned long long>(T);
 		}
 
-		// === Forward ===
-		// Input to h
-		if (tokenLM)
-		{
-			// Embedding lookup.
-			const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
-			for (unsigned int t = 0; t < T; ++t)
-			{
-				const int tid = tokenIds[t];
-				// tid already validated when loaded.
-				const size_t eOff = static_cast<size_t>(tid) * static_cast<size_t>(dModel);
-				const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
-				for (unsigned int i = 0; i < dModel; ++i)
-				{
-					transformerScratch.h[hOff + i] = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType)
-					                                          : tt.tokE[eOff + i];
-				}
-			}
-		}
-		else
-		{
-			// Input projection to h
-			linear_forward_maybe_lowp(transformerScratch.x.data(), T, inputSize, tt.WIn, tt.WInLowp, useLowpWeights, lowpDType, tt.bIn, dModel,
-			                          transformerScratch.h.data());
-		}
-		if (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL))
-		{
-			// Avoid recomputing pow()-derived denominators per sequence.
-			transformerPosEncCache.ensureSinusoidal(dModel);
-			add_positional_encoding(transformerScratch.h.empty() ? NULL : &transformerScratch.h[0], T, dModel,
-			                        transformerPosEncCache.sinInvDenomPair);
-		}
+		// === Forward + output head (delegated to extracted method) ===
+		transformerCpuForwardPass(epochCfg, T, s, tokenIds, targetIds, keyAllowed, scratchOutSize, sampleCount);
 
-		// Embedding dropout (after positional encoding, before transformer blocks).
-		{
-			const float embDropRate = trainingConfig.transformer.embeddingDropoutRate;
-			if (embDropRate > 0.0f && !transformerScratch.h.empty())
-			{
-				const size_t hLen = static_cast<size_t>(T) * static_cast<size_t>(dModel);
-				unsigned char* mask = transformerScratch.dropoutMaskEmb.empty() ? NULL : &transformerScratch.dropoutMaskEmb[0];
-				if (mask)
-				{
-					glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, hLen, embDropRate);
-					const float scale = 1.0f / (1.0f - embDropRate);
-					glades::transformer_kernels::apply_dropout_mask_inplace(&transformerScratch.h[0], mask, scale, hLen);
-				}
-			}
-		}
-
-		// RoPE precompute (used when positionalEncoding==POSENC_ROPE).
-		const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
-		unsigned int ropeDim = dHead;
-		if (ropeDimOverride > 0)
-		{
-			const unsigned int rd = static_cast<unsigned int>(ropeDimOverride);
-			ropeDim = (rd < ropeDim) ? rd : ropeDim;
-		}
-		// Must be even.
-		if ((ropeDim % 2u) != 0u)
-			ropeDim -= 1u;
-		const std::vector<double>* ropeInvFreq = NULL;
-		if (useRope && ropeDim >= 2u)
-		{
-			// Avoid recomputing pow()-derived invFreq per sequence.
-			transformerPosEncCache.ensureRope(ropeDim, ropeTheta);
-			ropeInvFreq = &transformerPosEncCache.ropeInvFreq;
-		}
-		const unsigned int groupSize = (nKVHeads > 0u) ? (nHeads / nKVHeads) : 0u;
-
-		// Per-layer forward
-		for (unsigned int li = 0; li < nLayers; ++li)
-		{
-			const TensorTransformerState::Block& b = tt.blocks[li];
-			const float* hIn = (li == 0u) ? transformerScratch.h.data()
-			                              : (transformerScratch.hAfterFF.data() + (static_cast<size_t>(li - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel)));
-
-			float* x1 = transformerScratch.x1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			float* ln1Mean = transformerScratch.ln1Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-			float* ln1InvStd = transformerScratch.ln1InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-			// Region G: LayerNorm/RMSNorm forward (parallel over timesteps)
-			{
-				const bool normWorthParallel = (static_cast<unsigned long long>(T) * dModel >= 65536ULL);
-				glades::ThreadPool& pool = glades::ThreadPool::instance();
-				if (normWorthParallel && T > 1u && pool.numThreads() > 1u)
-				{
-					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-						std::fill(ln1Mean, ln1Mean + T, 0.0f);
-					NormFwdCtx nctx;
-					nctx.X = hIn;
-					nctx.D = dModel;
-					nctx.gamma = b.ln1Gamma.empty() ? NULL : &b.ln1Gamma[0];
-					nctx.beta = b.ln1Beta.empty() ? NULL : &b.ln1Beta[0];
-					nctx.gammaSize = static_cast<unsigned int>(b.ln1Gamma.size());
-					nctx.betaSize = static_cast<unsigned int>(b.ln1Beta.size());
-					nctx.eps = lnEps;
-					nctx.Y = x1;
-					nctx.meanOut = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM)) ? NULL : ln1Mean;
-					nctx.invStdOut = ln1InvStd;
-					nctx.isRmsNorm = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM));
-					pool.parallel_for(T, norm_fwd_body, &nctx);
-				}
-				else if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-				{
-					std::fill(ln1Mean, ln1Mean + T, 0.0f);
-					glades::transformer_kernels::rmsnorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1InvStd);
-				}
-				else
-				{
-					glades::transformer_kernels::layernorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1Mean, ln1InvStd);
-				}
-			}
-
-			float* Q = transformerScratch.Q.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			float* K = transformerScratch.K.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
-			float* V = transformerScratch.V.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
-
-			linear_forward_maybe_lowp(x1, T, dModel, b.Wq, b.WqLowp, useLowpWeights, lowpDType, b.bq, dModel, Q);
-			linear_forward_maybe_lowp(x1, T, dModel, b.Wk, b.WkLowp, useLowpWeights, lowpDType, b.bk, dModelKV, K);
-			linear_forward_maybe_lowp(x1, T, dModel, b.Wv, b.WvLowp, useLowpWeights, lowpDType, b.bv, dModelKV, V);
-
-			// Region F: RoPE on Q/K (in-place) if enabled — parallel over heads.
-			if (useRope && ropeInvFreq)
-			{
-				const bool ropeWorthParallel = (static_cast<unsigned long long>(T) * ropeDim >= 4096ULL);
-				glades::ThreadPool& pool = glades::ThreadPool::instance();
-				if (ropeWorthParallel && pool.numThreads() > 1u)
-				{
-					if (nHeads > 1u)
-					{
-						RopeFwdCtx rctx;
-						rctx.buf = Q;
-						rctx.T = T;
-						rctx.rowStride = dModel;
-						rctx.dHead = dHead;
-						rctx.ropeDim = ropeDim;
-						rctx.invFreq = ropeInvFreq;
-						rctx.inverse = false;
-						pool.parallel_for(nHeads, rope_body, &rctx);
-					}
-					else
-					{
-						glades::transformer_kernels::rope_apply_inplace_strided(Q, T, dModel, dHead, ropeDim, *ropeInvFreq, false);
-					}
-					if (nKVHeads > 1u)
-					{
-						RopeFwdCtx rctx;
-						rctx.buf = K;
-						rctx.T = T;
-						rctx.rowStride = dModelKV;
-						rctx.dHead = dHead;
-						rctx.ropeDim = ropeDim;
-						rctx.invFreq = ropeInvFreq;
-						rctx.inverse = false;
-						pool.parallel_for(nKVHeads, rope_body, &rctx);
-					}
-					else
-					{
-						for (unsigned int hk = 0; hk < nKVHeads; ++hk)
-							glades::transformer_kernels::rope_apply_inplace_strided(
-							    K + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, false);
-					}
-				}
-				else
-				{
-					for (unsigned int h = 0; h < nHeads; ++h)
-						glades::transformer_kernels::rope_apply_inplace_strided(
-						    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, false);
-					for (unsigned int hk = 0; hk < nKVHeads; ++hk)
-						glades::transformer_kernels::rope_apply_inplace_strided(
-						    K + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, false);
-				}
-			}
-
-			// Region A: Multi-head attention forward — parallel over heads.
-			float* attnConcat = transformerScratch.attnConcat.data() +
-			                    (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			std::fill(attnConcat, attnConcat + (static_cast<size_t>(T) * static_cast<size_t>(dModel)), 0.0f);
-			{
-				const bool attnWorthParallel = (static_cast<unsigned long long>(T) * T * dHead >= 32768ULL);
-				glades::ThreadPool& pool = glades::ThreadPool::instance();
-				if (attnWorthParallel && nHeads > 1u && pool.numThreads() > 1u)
-				{
-					AttnFwdCtx actx;
-					actx.Q = Q;
-					actx.K = K;
-					actx.V = V;
-					actx.O = attnConcat;
-					actx.dModel = dModel;
-					actx.dModelKV = dModelKV;
-					actx.dHead = dHead;
-					actx.nHeads = nHeads;
-					actx.nKVHeads = nKVHeads;
-					actx.T = T;
-					actx.groupSize = groupSize;
-					actx.causal = causal;
-					actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
-					pool.parallel_for(nHeads, attn_fwd_body, &actx);
-				}
-				else
-				{
-					for (unsigned int h = 0; h < nHeads; ++h)
-					{
-						const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
-						glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
-						    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-						    dModel,
-						    K + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-						    dModelKV,
-						    V + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-						    dModelKV,
-						    T,
-						    dHead,
-						    dHead,
-						    causal,
-						    attnConcat + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-						    dModel,
-						    keyAllowed.empty() ? NULL : &keyAllowed[0]);
-					}
-				}
-			}
-
-			// Apply Wo
-			float* attnOut = transformerScratch.attnOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			linear_forward_maybe_lowp(attnConcat, T, dModel, b.Wo, b.WoLowp, useLowpWeights, lowpDType, b.bo, dModel, attnOut);
-
-			// Residual attention dropout
-			{
-				const float resDropRate = trainingConfig.transformer.residualDropoutRate;
-				if (resDropRate > 0.0f)
-				{
-					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
-					const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
-					unsigned char* mask = transformerScratch.dropoutMaskResAttn.empty() ? NULL : &transformerScratch.dropoutMaskResAttn[layerOff];
-					if (mask)
-					{
-						glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, n, resDropRate);
-						const float scale = 1.0f / (1.0f - resDropRate);
-						glades::transformer_kernels::apply_dropout_mask_inplace(attnOut, mask, scale, n);
-					}
-				}
-			}
-
-			// Residual add
-			float* hAfterAttn = transformerScratch.hAfterAttn.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
-				hAfterAttn[i] = hIn[i] + attnOut[i];
-
-			// Region G: LN2 forward (parallel over timesteps)
-			float* x2 = transformerScratch.x2.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			float* ln2Mean = transformerScratch.ln2Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-			float* ln2InvStd = transformerScratch.ln2InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-			{
-				const bool normWorthParallel = (static_cast<unsigned long long>(T) * dModel >= 65536ULL);
-				glades::ThreadPool& pool = glades::ThreadPool::instance();
-				if (normWorthParallel && T > 1u && pool.numThreads() > 1u)
-				{
-					if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-						std::fill(ln2Mean, ln2Mean + T, 0.0f);
-					NormFwdCtx nctx;
-					nctx.X = hAfterAttn;
-					nctx.D = dModel;
-					nctx.gamma = b.ln2Gamma.empty() ? NULL : &b.ln2Gamma[0];
-					nctx.beta = b.ln2Beta.empty() ? NULL : &b.ln2Beta[0];
-					nctx.gammaSize = static_cast<unsigned int>(b.ln2Gamma.size());
-					nctx.betaSize = static_cast<unsigned int>(b.ln2Beta.size());
-					nctx.eps = lnEps;
-					nctx.Y = x2;
-					nctx.meanOut = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM)) ? NULL : ln2Mean;
-					nctx.invStdOut = ln2InvStd;
-					nctx.isRmsNorm = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM));
-					pool.parallel_for(T, norm_fwd_body, &nctx);
-				}
-				else if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-				{
-					std::fill(ln2Mean, ln2Mean + T, 0.0f);
-					glades::transformer_kernels::rmsnorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2InvStd);
-				}
-				else
-				{
-					glades::transformer_kernels::layernorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2Mean, ln2InvStd);
-				}
-			}
-
-			// FFN
-			float* ff1 = transformerScratch.ff1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
-			float* ff1Act = transformerScratch.ff1Act.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dFF));
-			linear_forward_maybe_lowp(x2, T, dModel, b.W1, b.W1Lowp, useLowpWeights, lowpDType, b.b1, ff1Width, ff1);
-			if (ffnKind == static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU))
-			{
-				// Packed [gate, up] -> SiLU(gate) * up
-				for (unsigned int t = 0; t < T; ++t)
-				{
-					const size_t preOff = static_cast<size_t>(t) * static_cast<size_t>(ff1Width);
-					const size_t outOff = static_cast<size_t>(t) * static_cast<size_t>(dFF);
-					for (unsigned int i = 0; i < dFF; ++i)
-					{
-						const float gatePre = ff1[preOff + i];
-						const float upPre = ff1[preOff + static_cast<size_t>(dFF) + i];
-						ff1Act[outOff + i] = glades::transformer_ops::silu(gatePre) * upPre;
-					}
-				}
-			}
-			else
-			{
-				const size_t actLen = static_cast<size_t>(T) * static_cast<size_t>(dFF);
-				if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
-				{
-					glades::transformer_kernels::gelu_forward_buf(ff1, ff1Act, actLen);
-				}
-				else
-				{
-					// ReLU (no vectorized kernel needed — simple branch)
-					for (size_t i = 0; i < actLen; ++i)
-						ff1Act[i] = glades::transformer_ops::relu(ff1[i]);
-				}
-			}
-
-			float* ffOut = transformerScratch.ffOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			linear_forward_maybe_lowp(ff1Act, T, dFF, b.W2, b.W2Lowp, useLowpWeights, lowpDType, b.b2, dModel, ffOut);
-
-			// Residual FFN dropout
-			{
-				const float resDropRate = trainingConfig.transformer.residualDropoutRate;
-				if (resDropRate > 0.0f)
-				{
-					const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
-					const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
-					unsigned char* mask = transformerScratch.dropoutMaskResFF.empty() ? NULL : &transformerScratch.dropoutMaskResFF[layerOff];
-					if (mask)
-					{
-						glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, n, resDropRate);
-						const float scale = 1.0f / (1.0f - resDropRate);
-						glades::transformer_kernels::apply_dropout_mask_inplace(ffOut, mask, scale, n);
-					}
-				}
-			}
-
-			// Residual add
-			float* hAfterFF = transformerScratch.hAfterFF.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
-				hAfterFF[i] = hAfterAttn[i] + ffOut[i];
-		}
-
-		const float* hFinal = transformerScratch.hAfterFF.data() + (static_cast<size_t>(nLayers - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-
-		// Final LayerNorm: hFinal → hPostFinalLN
-		float* hPostFinalLN = transformerScratch.hPostFinalLN.data();
-		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-		{
-			glades::transformer_kernels::rmsnorm_forward_rows(hFinal, T, dModel,
-			    tt.lnFinalGamma, tt.lnFinalBeta, lnEps,
-			    hPostFinalLN, transformerScratch.lnFinalInvStd.data());
-		}
-		else
-		{
-			glades::transformer_kernels::layernorm_forward_rows(hFinal, T, dModel,
-			    tt.lnFinalGamma, tt.lnFinalBeta, lnEps,
-			    hPostFinalLN, transformerScratch.lnFinalMean.data(), transformerScratch.lnFinalInvStd.data());
-		}
-
-		// Output head logits
-		if (tokenLM)
-		{
-			if (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX)
-			{
-				// Region H: Token LM tied embedding head — parallel over timesteps.
-				if (useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty())
-				{
-					glades::transformer_kernels::tied_embedding_logits_forward_rows_lowp(hPostFinalLN, T, dModel, &tt.tokELowp[0], lowpDType, tt.lmBias,
-					                                                                    vocabSize, transformerScratch.logits.data());
-				}
-				else
-				{
-					const bool embWorthParallel = (static_cast<unsigned long long>(T) * vocabSize * dModel >= 500000ULL);
-					glades::ThreadPool& pool = glades::ThreadPool::instance();
-					if (embWorthParallel && T > 1u && pool.numThreads() > 1u)
-					{
-						TiedEmbLogitsCtx ectx;
-						ectx.H = hPostFinalLN;
-						ectx.dModel = dModel;
-						ectx.tokE = tt.tokE.empty() ? NULL : &tt.tokE[0];
-						ectx.lmBias = tt.lmBias.empty() ? NULL : &tt.lmBias[0];
-						ectx.lmBiasSize = static_cast<unsigned int>(tt.lmBias.size());
-						ectx.vocab = vocabSize;
-						ectx.logitsOut = transformerScratch.logits.data();
-						pool.parallel_for(T, tied_emb_logits_body, &ectx);
-					}
-					else
-					{
-						glades::transformer_kernels::tied_embedding_logits_forward_rows(hPostFinalLN, T, dModel, tt.tokE, tt.lmBias, vocabSize,
-						                                                               transformerScratch.logits.data());
-					}
-				}
-			}
-			else
-			{
-				// Sampled-softmax: compute logits only for {target + negatives}.
-				// Column 0 is always the target id; remaining columns are uniform negatives.
-				const unsigned int S = scratchOutSize;
-				for (unsigned int t = 0; t < T; ++t)
-				{
-					const int yid = targetIds[t];
-					if (padTokenId >= 0 && yid == padTokenId)
-						continue;
-					if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize)
-						continue;
-
-					const size_t off = static_cast<size_t>(t) * static_cast<size_t>(S);
-					transformerScratch.tokenLmSampleIds[off + 0u] = yid;
-					// Negatives (allow duplicates; bias is acceptable for this reference objective).
-					for (unsigned int j = 1u; j < S; ++j)
-					{
-						int nid = yid;
-						// Avoid trivial collision with target.
-						for (int tries = 0; tries < 4 && nid == yid; ++tries)
-							nid = glades::rng::uniform_int(rngEngine, 0, static_cast<int>(vocabSize) - 1);
-						if (nid == yid)
-							nid = (yid + 1) % static_cast<int>(vocabSize);
-						transformerScratch.tokenLmSampleIds[off + j] = nid;
-					}
-
-					// Logits for sampled ids
-					const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
-					const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
-					for (unsigned int j = 0u; j < S; ++j)
-					{
-						const int vid = transformerScratch.tokenLmSampleIds[off + j];
-						const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
-						double acc = static_cast<double>(tt.lmBias[static_cast<size_t>(vid)]);
-						for (unsigned int i = 0; i < dModel; ++i)
-						{
-							const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
-							acc += static_cast<double>(hPostFinalLN[hOff + i]) * static_cast<double>(ev);
-						}
-						transformerScratch.logits[off + j] = static_cast<float>(acc);
-					}
-					// Softmax over the sampled set into probs (for loss/grad).
-					glades::transformer_kernels::softmax_stable_into(&transformerScratch.logits[off], static_cast<size_t>(S),
-					                                                &transformerScratch.probs[off]);
-				}
-			}
-		}
-		else
-		{
-			linear_forward_maybe_lowp(hPostFinalLN, T, dModel, tt.WOut, tt.WOutLowp, useLowpWeights, lowpDType, tt.bOut, outSize,
-			                          transformerScratch.logits.data());
-		}
-
-		// Output activation
-		if (tokenLM && (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX))
-		{
-			// Sampled-softmax already computed probs in the tokenLM branch above.
-		}
-		else if (((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL)) && (outSize > 1u))
-		{
-			// Per-timestep softmax (no per-timestep allocations, no extra buffers).
-			for (unsigned int t = 0; t < T; ++t)
-			{
-				const size_t off = static_cast<size_t>(t) * static_cast<size_t>(outSize);
-				glades::transformer_kernels::softmax_stable_into(&transformerScratch.logits[off], static_cast<size_t>(outSize),
-				                                                &transformerScratch.probs[off]);
-			}
-		}
-		else if ((costFx == GMath::CLASSIFICATION) && (outSize == 1u))
-		{
-			// Sigmoid
-			for (unsigned int t = 0; t < T; ++t)
-			{
-				const float z = transformerScratch.logits[static_cast<size_t>(t) * static_cast<size_t>(outSize)];
-				transformerScratch.probs[static_cast<size_t>(t) * static_cast<size_t>(outSize)] = GMath::squash(z, GMath::SIGMOID, 0.0f);
-			}
-		}
-		else
-		{
-			// Linear regression
-			std::copy(transformerScratch.logits.begin(), transformerScratch.logits.end(), transformerScratch.probs.begin());
-		}
 
 		// === Metrics ===
 		if (tokenLM)
@@ -4137,580 +2312,17 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			}
 		}
 
-		// === Backward + grad accumulation ===
+		// === Backward + grad accumulation (delegated to extracted method) ===
 		if (isTrain)
 		{
-			const float lossScale = (mpUseLossScaling ? tt.mpLossScale : 1.0f);
 			if (seqInBatch == 0u)
 			{
 				clearGrads();
 				timeStepsInBatch = 0u;
 			}
 
-			// dLogits (delta) per timestep (reused scratch to avoid allocations)
-			std::vector<float, glades::AlignedAllocator<float, 64> >& dLogits = transformerScratch.dLogits;
-			if (dLogits.size() != (static_cast<size_t>(T) * static_cast<size_t>(scratchOutSize)))
-				dLogits.resize(static_cast<size_t>(T) * static_cast<size_t>(scratchOutSize));
-			std::fill(dLogits.begin(), dLogits.end(), 0.0f);
+			transformerCpuBackwardPass(epochCfg, T, s, tokenIds, targetIds, scratchOutSize, seqInBatch, timeStepsInBatch);
 
-			// Upstream gradient dH for current layer output (reused scratch to avoid allocations)
-			std::vector<float, glades::AlignedAllocator<float, 64> >& dH = transformerScratch.dH;
-			if (dH.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
-				dH.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			if (tokenLM)
-			{
-				unsigned int validTargetsThisSeq = 0u;
-				std::fill(dH.begin(), dH.end(), 0.0f);
-				if (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX)
-				{
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						const int yid = targetIds[t];
-						if (padTokenId >= 0 && yid == padTokenId)
-							continue;
-						if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize)
-							continue;
-						++validTargetsThisSeq;
-						const size_t off = static_cast<size_t>(t) * static_cast<size_t>(vocabSize);
-						for (unsigned int v = 0; v < vocabSize; ++v)
-							dLogits[off + v] = transformerScratch.probs[off + v];
-						dLogits[off + static_cast<unsigned int>(yid)] -= 1.0f;
-					}
-
-					// Backprop tied LM head (dense).
-					const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						const size_t off = static_cast<size_t>(t) * static_cast<size_t>(vocabSize);
-						const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
-						for (unsigned int v = 0; v < vocabSize; ++v)
-						{
-							const float dz = clip_maybe(dLogits[off + v], gradClip) * lossScale;
-							if (dz == 0.0f)
-								continue;
-							tt.gLmBias[v] += dz;
-							const size_t eOff = static_cast<size_t>(v) * static_cast<size_t>(dModel);
-							for (unsigned int i = 0; i < dModel; ++i)
-							{
-								tt.gTokE[eOff + i] += dz * hPostFinalLN[hOff + i];
-								const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
-								dH[hOff + i] += dz * ev;
-							}
-						}
-					}
-				}
-				else
-				{
-					// Sampled-softmax backprop (sparse): only update sampled vocab rows.
-					const unsigned int S = scratchOutSize;
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						const int yid = targetIds[t];
-						if (padTokenId >= 0 && yid == padTokenId)
-							continue;
-						if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize)
-							continue;
-						++validTargetsThisSeq;
-
-						const size_t off = static_cast<size_t>(t) * static_cast<size_t>(S);
-						for (unsigned int j = 0u; j < S; ++j)
-							dLogits[off + j] = transformerScratch.probs[off + j];
-						dLogits[off + 0u] -= 1.0f; // col 0 is target
-
-						const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
-						const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
-						for (unsigned int j = 0u; j < S; ++j)
-						{
-							const float dz = clip_maybe(dLogits[off + j], gradClip) * lossScale;
-							if (dz == 0.0f)
-								continue;
-							const int vid = transformerScratch.tokenLmSampleIds[off + j];
-							if (vid < 0 || static_cast<unsigned int>(vid) >= vocabSize)
-								continue;
-							tt.gLmBias[static_cast<size_t>(vid)] += dz;
-							const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
-							for (unsigned int i = 0; i < dModel; ++i)
-							{
-								tt.gTokE[eOff + i] += dz * hPostFinalLN[hOff + i];
-								const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
-								dH[hOff + i] += dz * ev;
-							}
-						}
-					}
-				}
-
-				// Batch divisor must match token LM loss normalization:
-				// average by the number of non-pad target tokens, not raw sequence length.
-				timeStepsInBatch += validTargetsThisSeq;
-			}
-			else
-			{
-				for (unsigned int t = 0; t < T; ++t)
-				{
-					const float* expRow = NULL;
-					unsigned int expSize = 0u;
-					di->getTrainSequenceExpectedRowView(s, t, expRow, expSize);
-					const size_t off = static_cast<size_t>(t) * static_cast<size_t>(outSize);
-					for (unsigned int k = 0; k < outSize; ++k)
-					{
-						const float expv = (expRow && k < expSize) ? expRow[k] : 0.0f;
-						const float pred = transformerScratch.probs[off + k];
-						float d = 0.0f;
-						const bool useSoftmax = ((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL)) && (outSize > 1u);
-						if (useSoftmax)
-						{
-							d = pred - expv;
-						}
-						else if ((costFx == GMath::CLASSIFICATION) && (outSize == 1u))
-						{
-							// sigmoid + BCE => dL/dz = p - y
-							d = pred - expv;
-						}
-						else
-						{
-							// linear regression
-							d = GMath::costErrDer(expv, pred, costFx);
-						}
-						dLogits[off + k] = clip_maybe(d, gradClip) * lossScale;
-					}
-				}
-
-				// Backprop output projection: gWOut/gBOut, dHFinal
-				linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, outSize, tt.gWOut, tt.gBOut, tt.WOut, tt.WOutLowp, useLowpWeights,
-				                                 lowpDType, dH.data());
-
-				// Non-tokenLM: average by timesteps (historical behavior).
-				timeStepsInBatch += T;
-			}
-
-			// Backprop Final LayerNorm: dH (w.r.t. hPostFinalLN) -> dH (w.r.t. hFinal)
-			{
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dHPreFinalLN = transformerScratch.dH2;
-				if (dHPreFinalLN.size() != dH.size())
-					dHPreFinalLN.resize(dH.size());
-				std::fill(dHPreFinalLN.begin(), dHPreFinalLN.end(), 0.0f);
-				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-				{
-					glades::transformer_kernels::rmsnorm_backward_rows_accum(hFinal, dH.data(), T, dModel, tt.lnFinalGamma,
-					    transformerScratch.lnFinalInvStd.data(), dHPreFinalLN.data(), tt.gLnFinalGamma, tt.gLnFinalBeta);
-				}
-				else
-				{
-					glades::transformer_kernels::layernorm_backward_rows_accum(hFinal, dH.data(), T, dModel, tt.lnFinalGamma,
-					    transformerScratch.lnFinalMean.data(), transformerScratch.lnFinalInvStd.data(),
-					    dHPreFinalLN.data(), tt.gLnFinalGamma, tt.gLnFinalBeta);
-				}
-				std::copy(dHPreFinalLN.begin(), dHPreFinalLN.end(), dH.begin());
-			}
-
-			// Backprop through blocks (reverse)
-			for (int li = static_cast<int>(nLayers) - 1; li >= 0; --li)
-			{
-				TensorTransformerState::Block& b = tt.blocks[static_cast<size_t>(li)];
-				const float* hIn = (li == 0) ? transformerScratch.h.data()
-				                             : (transformerScratch.hAfterFF.data() + (static_cast<size_t>(li - 1) * static_cast<size_t>(T) * static_cast<size_t>(dModel)));
-
-				const float* hAfterAttn = transformerScratch.hAfterAttn.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				const float* x1 = transformerScratch.x1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				const float* x2 = transformerScratch.x2.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				const float* ff1 = transformerScratch.ff1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
-				const float* ff1Act = transformerScratch.ff1Act.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dFF));
-
-				// dH is gradient w.r.t hAfterFF
-				// Split residual: hAfterFF = hAfterAttn + ffOut
-				// dFFOut and the residual path into hAfterAttn both start as dH.
-				// Use scratch buffers to avoid per-layer allocations.
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dHAfterAttn = transformerScratch.dH2;
-				if (dHAfterAttn.size() != dH.size())
-					dHAfterAttn.resize(dH.size());
-				std::copy(dH.begin(), dH.end(), dHAfterAttn.begin());
-
-				// FFN residual dropout backward: mask dH for the FFN path only.
-				{
-					const float resDropRate = trainingConfig.transformer.residualDropoutRate;
-					if (resDropRate > 0.0f)
-					{
-						const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
-						const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
-						const unsigned char* mask = transformerScratch.dropoutMaskResFF.empty() ? NULL : &transformerScratch.dropoutMaskResFF[layerOff];
-						if (mask)
-						{
-							const float scale = 1.0f / (1.0f - resDropRate);
-							for (size_t i = 0; i < n; ++i)
-								dH[i] *= mask[i] ? scale : 0.0f;
-						}
-					}
-				}
-
-				// FFN backward
-				// ffOut = W2 * ff1Act + b2
-				// ff1Act = activation(ff1)  (MLP) or SwiGLU product (SwiGLU)
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dFF1Act = transformerScratch.dFF1Act;
-				if (dFF1Act.size() != (static_cast<size_t>(T) * static_cast<size_t>(dFF)))
-					dFF1Act.resize(static_cast<size_t>(T) * static_cast<size_t>(dFF));
-				linear_backward_accum_maybe_lowp(ff1Act, dH.data(), T, dFF, dModel, b.gW2, b.gB2, b.W2, b.W2Lowp, useLowpWeights, lowpDType,
-				                                 dFF1Act.data());
-
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dX2 = transformerScratch.dX2;
-				if (dX2.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
-					dX2.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				if (ffnKind == static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU))
-				{
-					// Backprop through SwiGLU:
-					// out = SiLU(gatePre) * upPre
-					// ff1 packed as [gatePre (dFF), upPre (dFF)]
-					std::vector<float, glades::AlignedAllocator<float, 64> >& dFF1Cat = transformerScratch.dFF1Cat;
-					if (dFF1Cat.size() != (static_cast<size_t>(T) * static_cast<size_t>(ff1Width)))
-						dFF1Cat.resize(static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
-					std::fill(dFF1Cat.begin(), dFF1Cat.end(), 0.0f);
-					for (unsigned int t = 0; t < T; ++t)
-					{
-						const size_t preOff = static_cast<size_t>(t) * static_cast<size_t>(ff1Width);
-						const size_t outOff = static_cast<size_t>(t) * static_cast<size_t>(dFF);
-						for (unsigned int i = 0; i < dFF; ++i)
-						{
-							const float gatePre = ff1[preOff + i];
-							const float upPre = ff1[preOff + static_cast<size_t>(dFF) + i];
-							const float siluVal = glades::transformer_ops::silu(gatePre);
-							const float dOut = dFF1Act[outOff + i];
-							// dGatePre = dOut * upPre * silu'(gatePre)
-							dFF1Cat[preOff + i] = dOut * upPre * glades::transformer_ops::silu_deriv(gatePre);
-							// dUpPre = dOut * SiLU(gatePre)
-							dFF1Cat[preOff + static_cast<size_t>(dFF) + i] = dOut * siluVal;
-						}
-					}
-					linear_backward_accum_maybe_lowp(x2, dFF1Cat.data(), T, dModel, ff1Width, b.gW1, b.gB1, b.W1, b.W1Lowp, useLowpWeights, lowpDType,
-					                                 dX2.data());
-				}
-				else
-				{
-					// FFN activation backprop (ReLU or GELU)
-					const size_t actLen = dFF1Act.size();
-					if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
-					{
-						glades::transformer_kernels::gelu_backward_buf(ff1, dFF1Act.data(), actLen);
-					}
-					else
-					{
-						for (size_t i = 0; i < actLen; ++i)
-							dFF1Act[i] *= glades::transformer_ops::relu_deriv_from_y(ff1Act[i]);
-					}
-					linear_backward_accum_maybe_lowp(x2, dFF1Act.data(), T, dModel, dFF, b.gW1, b.gB1, b.W1, b.W1Lowp, useLowpWeights, lowpDType,
-					                                 dX2.data());
-				}
-
-				// LN2 backward: x2 = LN(hAfterAttn)
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dHAfterAttnFromLN = transformerScratch.dHAfterAttnFromLN;
-				if (dHAfterAttnFromLN.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
-					dHAfterAttnFromLN.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				std::fill(dHAfterAttnFromLN.begin(), dHAfterAttnFromLN.end(), 0.0f);
-				const float* ln2Mean = transformerScratch.ln2Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-				const float* ln2InvStd = transformerScratch.ln2InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-				{
-					glades::transformer_kernels::rmsnorm_backward_rows_accum(hAfterAttn, dX2.data(), T, dModel, b.ln2Gamma, ln2InvStd,
-					                                                        dHAfterAttnFromLN.data(), b.gLn2Gamma, b.gLn2Beta);
-				}
-				else
-				{
-					glades::transformer_kernels::layernorm_backward_rows_accum(hAfterAttn, dX2.data(), T, dModel, b.ln2Gamma, ln2Mean, ln2InvStd,
-					                                                          dHAfterAttnFromLN.data(), b.gLn2Gamma, b.gLn2Beta);
-				}
-
-				// Combine gradients to hAfterAttn
-				for (size_t i = 0; i < dHAfterAttn.size(); ++i)
-					dHAfterAttn[i] += dHAfterAttnFromLN[i];
-
-				// Split residual at attention: hAfterAttn = hIn + attnOut
-				// Use dHAfterAttn as dAttnOut and copy into dH for the residual-to-hIn path.
-				std::copy(dHAfterAttn.begin(), dHAfterAttn.end(), dH.begin());
-
-				// Attention residual dropout backward: mask dHAfterAttn for the Wo path only.
-				{
-					const float resDropRate = trainingConfig.transformer.residualDropoutRate;
-					if (resDropRate > 0.0f)
-					{
-						const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
-						const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
-						const unsigned char* mask = transformerScratch.dropoutMaskResAttn.empty() ? NULL : &transformerScratch.dropoutMaskResAttn[layerOff];
-						if (mask)
-						{
-							const float scale = 1.0f / (1.0f - resDropRate);
-							for (size_t i = 0; i < n; ++i)
-								dHAfterAttn[i] *= mask[i] ? scale : 0.0f;
-						}
-					}
-				}
-
-			// Need attnConcat to backprop Wo. Use the cached per-layer concatenation from forward
-			// (O(nLayers*T*dModel) memory) instead of storing full attention probability matrices.
-			const float* attnConcat = transformerScratch.attnConcat.data() +
-			                          (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-
-				// Backprop Wo: attnOut = Wo*attnConcat + bo
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dAttnConcat = transformerScratch.dAttnConcat;
-				if (dAttnConcat.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
-					dAttnConcat.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				linear_backward_accum_maybe_lowp(attnConcat, dHAfterAttn.data(), T, dModel, dModel, b.gWo, b.gBo, b.Wo, b.WoLowp, useLowpWeights,
-				                                 lowpDType, dAttnConcat.data());
-
-				// Backprop attention per head directly on packed Q/K/V buffers:
-				// - no gather/scatter temporaries
-				// - no per-head allocations
-				// - KV grads accumulate correctly when using GQA (nKVHeads < nHeads)
-			const float* Vfull = transformerScratch.V.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
-			const float* Qfull = transformerScratch.Q.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-			const float* Kfull = transformerScratch.K.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dQfull = transformerScratch.dQfull;
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dKfull = transformerScratch.dKfull;
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dVfull = transformerScratch.dVfull;
-				if (dQfull.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
-					dQfull.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				if (dKfull.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModelKV)))
-					dKfull.resize(static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
-				if (dVfull.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModelKV)))
-					dVfull.resize(static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
-				std::fill(dQfull.begin(), dQfull.end(), 0.0f);
-				std::fill(dKfull.begin(), dKfull.end(), 0.0f);
-				std::fill(dVfull.begin(), dVfull.end(), 0.0f);
-				// Region B: Attention backward — parallel over (head, query-chunk) pairs.
-				{
-					const bool attnWorthParallel = (static_cast<unsigned long long>(T) * T * dHead >= 32768ULL);
-					glades::ThreadPool& pool = glades::ThreadPool::instance();
-					if (attnWorthParallel && nHeads > 1u && pool.numThreads() > 1u)
-					{
-						// Determine chunk count: enough items to keep all cores busy.
-						const unsigned int nThreads = pool.numThreads();
-						unsigned int nChunksPerHead = 1u;
-						if (nHeads < nThreads && T >= 512u)
-						{
-							nChunksPerHead = (nThreads + nHeads - 1u) / nHeads;
-							// Cap to avoid excessive scratch memory.
-							if (nChunksPerHead > 4u) nChunksPerHead = 4u;
-						}
-
-						if (nChunksPerHead <= 1u)
-						{
-							// No benefit from chunking; dispatch one item per KV head (legacy path).
-							AttnBwdCtx actx;
-							actx.Q = Qfull; actx.K = Kfull; actx.V = Vfull;
-							actx.dO = dAttnConcat.data();
-							actx.dQ = dQfull.data(); actx.dK = dKfull.data(); actx.dV = dVfull.data();
-							actx.dModel = dModel; actx.dModelKV = dModelKV;
-							actx.dHead = dHead; actx.nHeads = nHeads; actx.nKVHeads = nKVHeads;
-							actx.T = T; actx.groupSize = groupSize;
-							actx.causal = causal;
-							actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
-							actx.nChunksPerHead = 1u;
-							actx.totalItems = nKVHeads;
-							actx.dKVscratch = NULL;
-							pool.parallel_for(nKVHeads, attn_bwd_body, &actx);
-						}
-						else
-						{
-							// Chunked: dispatch nHeads * nChunksPerHead items.
-							const unsigned int totalItems = nHeads * nChunksPerHead;
-							const size_t scratchPerItem = static_cast<size_t>(T) * dHead * 2u; // dK + dV
-							const size_t totalScratch = static_cast<size_t>(totalItems) * scratchPerItem;
-							std::vector<float> dKVscratch(totalScratch, 0.0f);
-
-							AttnBwdCtx actx;
-							actx.Q = Qfull; actx.K = Kfull; actx.V = Vfull;
-							actx.dO = dAttnConcat.data();
-							actx.dQ = dQfull.data(); actx.dK = dKfull.data(); actx.dV = dVfull.data();
-							actx.dModel = dModel; actx.dModelKV = dModelKV;
-							actx.dHead = dHead; actx.nHeads = nHeads; actx.nKVHeads = nKVHeads;
-							actx.T = T; actx.groupSize = groupSize;
-							actx.causal = causal;
-							actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
-							actx.nChunksPerHead = nChunksPerHead;
-							actx.totalItems = totalItems;
-							actx.dKVscratch = &dKVscratch[0];
-
-							pool.parallel_for(totalItems, attn_bwd_body, &actx);
-
-							// Reduce per-chunk dK/dV into the real strided dK/dV.
-							AttnBwdReduceCtx rctx;
-							rctx.dKVscratch = &dKVscratch[0];
-							rctx.dK = dKfull.data();
-							rctx.dV = dVfull.data();
-							rctx.dHead = dHead;
-							rctx.dModelKV = dModelKV;
-							rctx.T = T;
-							rctx.nHeads = nHeads;
-							rctx.nKVHeads = nKVHeads;
-							rctx.groupSize = groupSize;
-							rctx.nChunksPerHead = nChunksPerHead;
-							pool.parallel_for(nKVHeads, attn_bwd_reduce_body, &rctx);
-						}
-					}
-					else
-					{
-						for (unsigned int h = 0; h < nHeads; ++h)
-						{
-							const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
-							glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
-							    Qfull + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-							    dModel,
-							    Kfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-							    dModelKV,
-							    Vfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-							    dModelKV,
-							    dAttnConcat.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-							    dModel,
-							    T, dHead, dHead, causal,
-							    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
-							    dModel,
-							    dKfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-							    dModelKV,
-							    dVfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),
-							    dModelKV,
-							    keyAllowed.empty() ? NULL : &keyAllowed[0]);
-						}
-					}
-				}
-
-				// Region F: Backprop through RoPE rotation — parallel over heads.
-				if (useRope && ropeInvFreq)
-				{
-					const bool ropeWorthParallel = (static_cast<unsigned long long>(T) * ropeDim >= 4096ULL);
-					glades::ThreadPool& pool = glades::ThreadPool::instance();
-					if (ropeWorthParallel && pool.numThreads() > 1u)
-					{
-						if (nHeads > 1u)
-						{
-							RopeFwdCtx rctx;
-							rctx.buf = dQfull.data();
-							rctx.T = T;
-							rctx.rowStride = dModel;
-							rctx.dHead = dHead;
-							rctx.ropeDim = ropeDim;
-							rctx.invFreq = ropeInvFreq;
-							rctx.inverse = true;
-							pool.parallel_for(nHeads, rope_body, &rctx);
-						}
-						else
-						{
-							glades::transformer_kernels::rope_apply_inplace_strided(
-							    dQfull.data(), T, dModel, dHead, ropeDim, *ropeInvFreq, true);
-						}
-						if (nKVHeads > 1u)
-						{
-							RopeFwdCtx rctx;
-							rctx.buf = dKfull.data();
-							rctx.T = T;
-							rctx.rowStride = dModelKV;
-							rctx.dHead = dHead;
-							rctx.ropeDim = ropeDim;
-							rctx.invFreq = ropeInvFreq;
-							rctx.inverse = true;
-							pool.parallel_for(nKVHeads, rope_body, &rctx);
-						}
-						else
-						{
-							for (unsigned int hk = 0; hk < nKVHeads; ++hk)
-								glades::transformer_kernels::rope_apply_inplace_strided(
-								    dKfull.data() + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, true);
-						}
-					}
-					else
-					{
-						for (unsigned int h = 0; h < nHeads; ++h)
-							glades::transformer_kernels::rope_apply_inplace_strided(
-							    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, true);
-						for (unsigned int hk = 0; hk < nKVHeads; ++hk)
-							glades::transformer_kernels::rope_apply_inplace_strided(
-							    dKfull.data() + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, true);
-					}
-				}
-
-				// Backprop Q/K/V linear projections into x1
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dX1 = transformerScratch.dX1;
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dXtmp = transformerScratch.dXtmp;
-				if (dX1.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
-					dX1.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				if (dXtmp.size() != dX1.size())
-					dXtmp.resize(dX1.size());
-				std::fill(dX1.begin(), dX1.end(), 0.0f);
-				// q = Wq*x1 + bq
-				{
-					linear_backward_accum_maybe_lowp(x1, dQfull.data(), T, dModel, dModel, b.gWq, b.gBq, b.Wq, b.WqLowp, useLowpWeights, lowpDType,
-					                                 dXtmp.data());
-					for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
-				}
-				{
-					linear_backward_accum_maybe_lowp(x1, dKfull.data(), T, dModel, dModelKV, b.gWk, b.gBk, b.Wk, b.WkLowp, useLowpWeights, lowpDType,
-					                                 dXtmp.data());
-					for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
-				}
-				{
-					linear_backward_accum_maybe_lowp(x1, dVfull.data(), T, dModel, dModelKV, b.gWv, b.gBv, b.Wv, b.WvLowp, useLowpWeights, lowpDType,
-					                                 dXtmp.data());
-					for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
-				}
-
-				// LN1 backward: x1 = LN(hIn)
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dHInFromLN = transformerScratch.dHInFromLN;
-				if (dHInFromLN.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
-					dHInFromLN.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-				std::fill(dHInFromLN.begin(), dHInFromLN.end(), 0.0f);
-				const float* ln1Mean = transformerScratch.ln1Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-				const float* ln1InvStd = transformerScratch.ln1InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
-				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-				{
-					glades::transformer_kernels::rmsnorm_backward_rows_accum(hIn, dX1.data(), T, dModel, b.ln1Gamma, ln1InvStd,
-					                                                        dHInFromLN.data(), b.gLn1Gamma, b.gLn1Beta);
-				}
-				else
-				{
-					glades::transformer_kernels::layernorm_backward_rows_accum(hIn, dX1.data(), T, dModel, b.ln1Gamma, ln1Mean, ln1InvStd,
-					                                                          dHInFromLN.data(), b.gLn1Gamma, b.gLn1Beta);
-				}
-
-				// Combine into dH (currently the residual-to-hIn path from attention).
-				for (size_t i = 0; i < dH.size(); ++i)
-					dH[i] += dHInFromLN[i];
-			} // layers
-
-			// Embedding dropout backward
-			{
-				const float embDropRate = trainingConfig.transformer.embeddingDropoutRate;
-				if (embDropRate > 0.0f)
-				{
-					const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
-					const unsigned char* mask = transformerScratch.dropoutMaskEmb.empty() ? NULL : &transformerScratch.dropoutMaskEmb[0];
-					if (mask)
-					{
-						const float scale = 1.0f / (1.0f - embDropRate);
-						for (size_t i = 0; i < n; ++i)
-							dH[i] *= mask[i] ? scale : 0.0f;
-					}
-				}
-			}
-
-			// Backprop input projection: h = WIn*x + bIn (+ posEnc)
-			// dH is gradient w.r.t h (posEnc has no params)
-			if (tokenLM)
-			{
-				// Accumulate embedding grads for input embedding lookup: gE[token] += dH[t]
-				for (unsigned int t = 0; t < T; ++t)
-				{
-					const int tid = tokenIds[t];
-					const size_t eOff = static_cast<size_t>(tid) * static_cast<size_t>(dModel);
-					const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
-					for (unsigned int i = 0; i < dModel; ++i)
-						tt.gTokE[eOff + i] += dH[hOff + i];
-				}
-			}
-			else
-			{
-				std::vector<float, glades::AlignedAllocator<float, 64> >& dX = transformerScratch.dInput;
-				if (dX.size() != (static_cast<size_t>(T) * static_cast<size_t>(inputSize)))
-					dX.resize(static_cast<size_t>(T) * static_cast<size_t>(inputSize));
-				linear_backward_accum_maybe_lowp(transformerScratch.x.data(), dH.data(), T, inputSize, dModel, tt.gWIn, tt.gBIn, tt.WIn, tt.WInLowp,
-				                                 useLowpWeights, lowpDType, dX.data());
-				(void)dX; // gradient w.r.t. raw inputs unused
-			}
 
 			++seqInBatch;
 			if (seqInBatch >= seqBatchMax)
@@ -5006,3 +2618,2430 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Extracted CPU forward pass (previously inlined in SGDHelper_TRANSFORMER).
+// Computes forward activations through all transformer blocks and produces
+// logits/probs in transformerScratch.  Called once per sequence.
+// ---------------------------------------------------------------------------
+void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg, unsigned int T, unsigned int s,
+                                                 const std::vector<int>& tokenIds,
+                                                 const std::vector<int>& targetIds,
+                                                 const std::vector<unsigned char>& keyAllowed,
+                                                 unsigned int scratchOutSize, unsigned int sampleCount)
+{
+	TensorTransformerState& tt = tensorTransformer;
+
+	const unsigned int dModel = cfg.dModel;
+	const unsigned int dFF = cfg.dFF;
+	const unsigned int nHeads = cfg.nHeads;
+	const unsigned int nKVHeads = cfg.nKVHeads;
+	const unsigned int nLayers = cfg.nLayers;
+	const unsigned int vocabSize = cfg.vocabSize;
+	const unsigned int inputSize = cfg.inputSize;
+	const unsigned int outSize = cfg.outSize;
+	const unsigned int dHead = cfg.dHead;
+	const unsigned int dModelKV = cfg.dModelKV;
+	const unsigned int ff1Width = cfg.ff1Width;
+	const bool tokenLM = cfg.tokenLM;
+	const bool causal = cfg.causal;
+	const int posEnc = cfg.posEnc;
+	const int normType = cfg.normType;
+	const int ffnKind = cfg.ffnKind;
+	const int ffnAct = cfg.ffnAct;
+	const float lnEps = cfg.lnEps;
+	const float ropeTheta = cfg.ropeTheta;
+	const int ropeDimOverride = cfg.ropeDimOverride;
+	const bool useLowpWeights = cfg.useLowpWeights;
+	const int lowpDType = cfg.lowpDType;
+	const int costFx = cfg.costFx;
+	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = cfg.tokenLmLossKind;
+	const int tokenLmNegK = cfg.tokenLmNegK;
+	const int padTokenId = cfg.padTokenId;
+
+	// === Forward ===
+	// Input to h
+	if (tokenLM)
+	{
+		// Embedding lookup.
+		const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const int tid = tokenIds[t];
+			const size_t eOff = static_cast<size_t>(tid) * static_cast<size_t>(dModel);
+			const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+			for (unsigned int i = 0; i < dModel; ++i)
+			{
+				transformerScratch.h[hOff + i] = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType)
+				                                          : tt.tokE[eOff + i];
+			}
+		}
+	}
+	else
+	{
+		linear_forward_maybe_lowp(transformerScratch.x.data(), T, inputSize, tt.WIn, tt.WInLowp, useLowpWeights, lowpDType, tt.bIn, dModel,
+		                          transformerScratch.h.data());
+	}
+	if (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL))
+	{
+		transformerPosEncCache.ensureSinusoidal(dModel);
+		add_positional_encoding(transformerScratch.h.empty() ? NULL : &transformerScratch.h[0], T, dModel,
+		                        transformerPosEncCache.sinInvDenomPair);
+	}
+
+	// Embedding dropout
+	{
+		const float embDropRate = trainingConfig.transformer.embeddingDropoutRate;
+		if (embDropRate > 0.0f && !transformerScratch.h.empty())
+		{
+			const size_t hLen = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+			unsigned char* mask = transformerScratch.dropoutMaskEmb.empty() ? NULL : &transformerScratch.dropoutMaskEmb[0];
+			if (mask)
+			{
+				glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, hLen, embDropRate);
+				const float scale = 1.0f / (1.0f - embDropRate);
+				glades::transformer_kernels::apply_dropout_mask_inplace(&transformerScratch.h[0], mask, scale, hLen);
+			}
+		}
+	}
+
+	// RoPE precompute
+	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+	unsigned int ropeDim = dHead;
+	if (ropeDimOverride > 0)
+	{
+		const unsigned int rd = static_cast<unsigned int>(ropeDimOverride);
+		ropeDim = (rd < ropeDim) ? rd : ropeDim;
+	}
+	if ((ropeDim % 2u) != 0u)
+		ropeDim -= 1u;
+	const std::vector<double>* ropeInvFreq = NULL;
+	if (useRope && ropeDim >= 2u)
+	{
+		transformerPosEncCache.ensureRope(ropeDim, ropeTheta);
+		ropeInvFreq = &transformerPosEncCache.ropeInvFreq;
+	}
+	const unsigned int groupSize = (nKVHeads > 0u) ? (nHeads / nKVHeads) : 0u;
+
+	// Per-layer forward
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		const TensorTransformerState::Block& b = tt.blocks[li];
+		const float* hIn = (li == 0u) ? transformerScratch.h.data()
+		                              : (transformerScratch.hAfterFF.data() + (static_cast<size_t>(li - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel)));
+
+		float* x1 = transformerScratch.x1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		float* ln1Mean = transformerScratch.ln1Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		float* ln1InvStd = transformerScratch.ln1InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		{
+			const bool normWorthParallel = (static_cast<unsigned long long>(T) * dModel >= 65536ULL);
+			glades::ThreadPool& pool = glades::ThreadPool::instance();
+			if (normWorthParallel && T > 1u && pool.numThreads() > 1u)
+			{
+				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					std::fill(ln1Mean, ln1Mean + T, 0.0f);
+				NormFwdCtx nctx;
+				nctx.X = hIn;
+				nctx.D = dModel;
+				nctx.gamma = b.ln1Gamma.empty() ? NULL : &b.ln1Gamma[0];
+				nctx.beta = b.ln1Beta.empty() ? NULL : &b.ln1Beta[0];
+				nctx.gammaSize = static_cast<unsigned int>(b.ln1Gamma.size());
+				nctx.betaSize = static_cast<unsigned int>(b.ln1Beta.size());
+				nctx.eps = lnEps;
+				nctx.Y = x1;
+				nctx.meanOut = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM)) ? NULL : ln1Mean;
+				nctx.invStdOut = ln1InvStd;
+				nctx.isRmsNorm = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM));
+				pool.parallel_for(T, norm_fwd_body, &nctx);
+			}
+			else if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			{
+				std::fill(ln1Mean, ln1Mean + T, 0.0f);
+				glades::transformer_kernels::rmsnorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1InvStd);
+			}
+			else
+			{
+				glades::transformer_kernels::layernorm_forward_rows(hIn, T, dModel, b.ln1Gamma, b.ln1Beta, lnEps, x1, ln1Mean, ln1InvStd);
+			}
+		}
+
+		float* Q = transformerScratch.Q.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		float* K = transformerScratch.K.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+		float* V = transformerScratch.V.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+
+		linear_forward_maybe_lowp(x1, T, dModel, b.Wq, b.WqLowp, useLowpWeights, lowpDType, b.bq, dModel, Q);
+		linear_forward_maybe_lowp(x1, T, dModel, b.Wk, b.WkLowp, useLowpWeights, lowpDType, b.bk, dModelKV, K);
+		linear_forward_maybe_lowp(x1, T, dModel, b.Wv, b.WvLowp, useLowpWeights, lowpDType, b.bv, dModelKV, V);
+
+		// RoPE
+		if (useRope && ropeInvFreq)
+		{
+			const bool ropeWorthParallel = (static_cast<unsigned long long>(T) * ropeDim >= 4096ULL);
+			glades::ThreadPool& pool = glades::ThreadPool::instance();
+			if (ropeWorthParallel && pool.numThreads() > 1u)
+			{
+				if (nHeads > 1u)
+				{
+					RopeFwdCtx rctx;
+					rctx.buf = Q; rctx.T = T; rctx.rowStride = dModel; rctx.dHead = dHead;
+					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = false;
+					pool.parallel_for(nHeads, rope_body, &rctx);
+				}
+				else
+				{
+					glades::transformer_kernels::rope_apply_inplace_strided(Q, T, dModel, dHead, ropeDim, *ropeInvFreq, false);
+				}
+				if (nKVHeads > 1u)
+				{
+					RopeFwdCtx rctx;
+					rctx.buf = K; rctx.T = T; rctx.rowStride = dModelKV; rctx.dHead = dHead;
+					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = false;
+					pool.parallel_for(nKVHeads, rope_body, &rctx);
+				}
+				else
+				{
+					for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+						glades::transformer_kernels::rope_apply_inplace_strided(
+						    K + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, false);
+				}
+			}
+			else
+			{
+				for (unsigned int h = 0; h < nHeads; ++h)
+					glades::transformer_kernels::rope_apply_inplace_strided(
+					    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, false);
+				for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+					glades::transformer_kernels::rope_apply_inplace_strided(
+					    K + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, false);
+			}
+		}
+
+		// Multi-head attention forward
+		float* attnConcat = transformerScratch.attnConcat.data() +
+		                    (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		std::fill(attnConcat, attnConcat + (static_cast<size_t>(T) * static_cast<size_t>(dModel)), 0.0f);
+		{
+			const bool attnWorthParallel = (static_cast<unsigned long long>(T) * T * dHead >= 32768ULL);
+			glades::ThreadPool& pool = glades::ThreadPool::instance();
+			if (attnWorthParallel && nHeads > 1u && pool.numThreads() > 1u)
+			{
+				AttnFwdCtx actx;
+				actx.Q = Q; actx.K = K; actx.V = V; actx.O = attnConcat;
+				actx.dModel = dModel; actx.dModelKV = dModelKV; actx.dHead = dHead;
+				actx.nHeads = nHeads; actx.nKVHeads = nKVHeads; actx.T = T;
+				actx.groupSize = groupSize; actx.causal = causal;
+				actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
+				pool.parallel_for(nHeads, attn_fwd_body, &actx);
+			}
+			else
+			{
+				for (unsigned int h = 0; h < nHeads; ++h)
+				{
+					const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
+					glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
+					    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
+					    K + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
+					    V + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
+					    T, dHead, dHead, causal,
+					    attnConcat + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
+					    keyAllowed.empty() ? NULL : &keyAllowed[0]);
+				}
+			}
+		}
+
+		// Wo projection
+		float* attnOut = transformerScratch.attnOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		linear_forward_maybe_lowp(attnConcat, T, dModel, b.Wo, b.WoLowp, useLowpWeights, lowpDType, b.bo, dModel, attnOut);
+
+		// Residual attention dropout
+		{
+			const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+			if (resDropRate > 0.0f)
+			{
+				const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				unsigned char* mask = transformerScratch.dropoutMaskResAttn.empty() ? NULL : &transformerScratch.dropoutMaskResAttn[layerOff];
+				if (mask)
+				{
+					glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, n, resDropRate);
+					const float scale = 1.0f / (1.0f - resDropRate);
+					glades::transformer_kernels::apply_dropout_mask_inplace(attnOut, mask, scale, n);
+				}
+			}
+		}
+
+		// Residual add
+		float* hAfterAttn = transformerScratch.hAfterAttn.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
+			hAfterAttn[i] = hIn[i] + attnOut[i];
+
+		// LN2 forward
+		float* x2 = transformerScratch.x2.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		float* ln2Mean = transformerScratch.ln2Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		float* ln2InvStd = transformerScratch.ln2InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		{
+			const bool normWorthParallel = (static_cast<unsigned long long>(T) * dModel >= 65536ULL);
+			glades::ThreadPool& pool = glades::ThreadPool::instance();
+			if (normWorthParallel && T > 1u && pool.numThreads() > 1u)
+			{
+				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+					std::fill(ln2Mean, ln2Mean + T, 0.0f);
+				NormFwdCtx nctx;
+				nctx.X = hAfterAttn; nctx.D = dModel;
+				nctx.gamma = b.ln2Gamma.empty() ? NULL : &b.ln2Gamma[0];
+				nctx.beta = b.ln2Beta.empty() ? NULL : &b.ln2Beta[0];
+				nctx.gammaSize = static_cast<unsigned int>(b.ln2Gamma.size());
+				nctx.betaSize = static_cast<unsigned int>(b.ln2Beta.size());
+				nctx.eps = lnEps; nctx.Y = x2;
+				nctx.meanOut = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM)) ? NULL : ln2Mean;
+				nctx.invStdOut = ln2InvStd;
+				nctx.isRmsNorm = (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM));
+				pool.parallel_for(T, norm_fwd_body, &nctx);
+			}
+			else if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			{
+				std::fill(ln2Mean, ln2Mean + T, 0.0f);
+				glades::transformer_kernels::rmsnorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2InvStd);
+			}
+			else
+			{
+				glades::transformer_kernels::layernorm_forward_rows(hAfterAttn, T, dModel, b.ln2Gamma, b.ln2Beta, lnEps, x2, ln2Mean, ln2InvStd);
+			}
+		}
+
+		// FFN
+		float* ff1 = transformerScratch.ff1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
+		float* ff1Act = transformerScratch.ff1Act.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dFF));
+		linear_forward_maybe_lowp(x2, T, dModel, b.W1, b.W1Lowp, useLowpWeights, lowpDType, b.b1, ff1Width, ff1);
+		if (ffnKind == static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU))
+		{
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const size_t preOff = static_cast<size_t>(t) * static_cast<size_t>(ff1Width);
+				const size_t outOff = static_cast<size_t>(t) * static_cast<size_t>(dFF);
+				for (unsigned int i = 0; i < dFF; ++i)
+				{
+					const float gatePre = ff1[preOff + i];
+					const float upPre = ff1[preOff + static_cast<size_t>(dFF) + i];
+					ff1Act[outOff + i] = glades::transformer_ops::silu(gatePre) * upPre;
+				}
+			}
+		}
+		else
+		{
+			const size_t actLen = static_cast<size_t>(T) * static_cast<size_t>(dFF);
+			if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+				glades::transformer_kernels::gelu_forward_buf(ff1, ff1Act, actLen);
+			else
+				for (size_t i = 0; i < actLen; ++i)
+					ff1Act[i] = glades::transformer_ops::relu(ff1[i]);
+		}
+
+		float* ffOut = transformerScratch.ffOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		linear_forward_maybe_lowp(ff1Act, T, dFF, b.W2, b.W2Lowp, useLowpWeights, lowpDType, b.b2, dModel, ffOut);
+
+		// Residual FFN dropout
+		{
+			const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+			if (resDropRate > 0.0f)
+			{
+				const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				unsigned char* mask = transformerScratch.dropoutMaskResFF.empty() ? NULL : &transformerScratch.dropoutMaskResFF[layerOff];
+				if (mask)
+				{
+					glades::transformer_kernels::generate_dropout_mask(rngEngine, mask, n, resDropRate);
+					const float scale = 1.0f / (1.0f - resDropRate);
+					glades::transformer_kernels::apply_dropout_mask_inplace(ffOut, mask, scale, n);
+				}
+			}
+		}
+
+		// Residual add
+		float* hAfterFF = transformerScratch.hAfterFF.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		for (size_t i = 0; i < static_cast<size_t>(T) * static_cast<size_t>(dModel); ++i)
+			hAfterFF[i] = hAfterAttn[i] + ffOut[i];
+	}
+
+	const float* hFinal = transformerScratch.hAfterFF.data() + (static_cast<size_t>(nLayers - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+
+	// Final LayerNorm
+	float* hPostFinalLN = transformerScratch.hPostFinalLN.data();
+	if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+	{
+		glades::transformer_kernels::rmsnorm_forward_rows(hFinal, T, dModel,
+		    tt.lnFinalGamma, tt.lnFinalBeta, lnEps,
+		    hPostFinalLN, transformerScratch.lnFinalInvStd.data());
+	}
+	else
+	{
+		glades::transformer_kernels::layernorm_forward_rows(hFinal, T, dModel,
+		    tt.lnFinalGamma, tt.lnFinalBeta, lnEps,
+		    hPostFinalLN, transformerScratch.lnFinalMean.data(), transformerScratch.lnFinalInvStd.data());
+	}
+
+	// Output head logits
+	if (tokenLM)
+	{
+		if (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX)
+		{
+			if (useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty())
+			{
+				glades::transformer_kernels::tied_embedding_logits_forward_rows_lowp(hPostFinalLN, T, dModel, &tt.tokELowp[0], lowpDType, tt.lmBias,
+				                                                                    vocabSize, transformerScratch.logits.data());
+			}
+			else
+			{
+				const bool embWorthParallel = (static_cast<unsigned long long>(T) * vocabSize * dModel >= 500000ULL);
+				glades::ThreadPool& pool = glades::ThreadPool::instance();
+				if (embWorthParallel && T > 1u && pool.numThreads() > 1u)
+				{
+					TiedEmbLogitsCtx ectx;
+					ectx.H = hPostFinalLN; ectx.dModel = dModel;
+					ectx.tokE = tt.tokE.empty() ? NULL : &tt.tokE[0];
+					ectx.lmBias = tt.lmBias.empty() ? NULL : &tt.lmBias[0];
+					ectx.lmBiasSize = static_cast<unsigned int>(tt.lmBias.size());
+					ectx.vocab = vocabSize;
+					ectx.logitsOut = transformerScratch.logits.data();
+					pool.parallel_for(T, tied_emb_logits_body, &ectx);
+				}
+				else
+				{
+					glades::transformer_kernels::tied_embedding_logits_forward_rows(hPostFinalLN, T, dModel, tt.tokE, tt.lmBias, vocabSize,
+					                                                               transformerScratch.logits.data());
+				}
+			}
+		}
+		else
+		{
+			// Sampled-softmax logits
+			const unsigned int K = static_cast<unsigned int>(tokenLmNegK);
+			const unsigned int S = sampleCount;
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const int yid = targetIds[t];
+				if ((padTokenId >= 0 && yid == padTokenId) || yid < 0 || static_cast<unsigned int>(yid) >= vocabSize)
+				{
+					const size_t off = static_cast<size_t>(t) * static_cast<size_t>(S);
+					for (unsigned int j = 0u; j < S; ++j)
+					{
+						transformerScratch.logits[off + j] = 0.0f;
+						transformerScratch.tokenLmSampleIds[off + j] = -1;
+					}
+					continue;
+				}
+
+				const size_t off = static_cast<size_t>(t) * static_cast<size_t>(S);
+				transformerScratch.tokenLmSampleIds[off + 0u] = yid;
+				for (unsigned int k = 0; k < K; ++k)
+				{
+					int neg = glades::rng::uniform_int(rngEngine, 0, static_cast<int>(vocabSize) - 2);
+					if (neg >= yid) ++neg;
+					transformerScratch.tokenLmSampleIds[off + 1u + k] = neg;
+				}
+
+				const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+				const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
+				for (unsigned int j = 0u; j < S; ++j)
+				{
+					const int vid = transformerScratch.tokenLmSampleIds[off + j];
+					if (vid < 0 || static_cast<unsigned int>(vid) >= vocabSize)
+					{
+						transformerScratch.logits[off + j] = 0.0f;
+						continue;
+					}
+					float dot = 0.0f;
+					const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
+					if (haveLowpE)
+					{
+						for (unsigned int d = 0; d < dModel; ++d)
+							dot += hPostFinalLN[hOff + d] * glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + d], lowpDType);
+					}
+					else
+					{
+						dot = glades::transformer_kernels::dot_f32(&hPostFinalLN[hOff], &tt.tokE[eOff], dModel);
+					}
+					const float bias = (static_cast<size_t>(vid) < tt.lmBias.size()) ? tt.lmBias[static_cast<size_t>(vid)] : 0.0f;
+					transformerScratch.logits[off + j] = dot + bias;
+				}
+			}
+		}
+	}
+	else
+	{
+		linear_forward_maybe_lowp(hPostFinalLN, T, dModel, tt.WOut, tt.WOutLowp, useLowpWeights, lowpDType, tt.bOut, outSize,
+		                          transformerScratch.logits.data());
+	}
+
+	// Softmax / sigmoid / identity
+	if (tokenLM)
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const size_t off = static_cast<size_t>(t) * static_cast<size_t>(scratchOutSize);
+			glades::transformer_kernels::softmax_stable_into(&transformerScratch.logits[off], static_cast<size_t>(scratchOutSize),
+			                                                &transformerScratch.probs[off]);
+		}
+	}
+	else if (((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL)) && (outSize > 1u))
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const size_t off = static_cast<size_t>(t) * static_cast<size_t>(outSize);
+			glades::transformer_kernels::softmax_stable_into(&transformerScratch.logits[off], static_cast<size_t>(outSize),
+			                                                &transformerScratch.probs[off]);
+		}
+	}
+	else if ((costFx == GMath::CLASSIFICATION) && (outSize == 1u))
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const float z = transformerScratch.logits[static_cast<size_t>(t) * static_cast<size_t>(outSize)];
+			transformerScratch.probs[static_cast<size_t>(t) * static_cast<size_t>(outSize)] = GMath::squash(z, GMath::SIGMOID, 0.0f);
+		}
+	}
+	else
+	{
+		std::copy(transformerScratch.logits.begin(), transformerScratch.logits.end(), transformerScratch.probs.begin());
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Extracted CPU backward pass + gradient accumulation.
+// Assumes the forward pass has already been run.
+// ---------------------------------------------------------------------------
+void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg, unsigned int T, unsigned int s,
+                                                  const std::vector<int>& tokenIds,
+                                                  const std::vector<int>& targetIds,
+                                                  unsigned int scratchOutSize,
+                                                  unsigned int& seqInBatch,
+                                                  unsigned int& timeStepsInBatch)
+{
+	using namespace glades::sgd_detail;
+
+	TensorTransformerState& tt = tensorTransformer;
+
+	const unsigned int dModel = cfg.dModel;
+	const unsigned int dFF = cfg.dFF;
+	const unsigned int nHeads = cfg.nHeads;
+	const unsigned int nKVHeads = cfg.nKVHeads;
+	const unsigned int nLayers = cfg.nLayers;
+	const unsigned int vocabSize = cfg.vocabSize;
+	const unsigned int inputSize = cfg.inputSize;
+	const unsigned int outSize = cfg.outSize;
+	const unsigned int dHead = cfg.dHead;
+	const unsigned int dModelKV = cfg.dModelKV;
+	const unsigned int ff1Width = cfg.ff1Width;
+	const bool tokenLM = cfg.tokenLM;
+	const bool causal = cfg.causal;
+	const int posEnc = cfg.posEnc;
+	const int normType = cfg.normType;
+	const int ffnKind = cfg.ffnKind;
+	const int ffnAct = cfg.ffnAct;
+	const float lnEps = cfg.lnEps;
+	const float ropeTheta = cfg.ropeTheta;
+	const int ropeDimOverride = cfg.ropeDimOverride;
+	const bool useLowpWeights = cfg.useLowpWeights;
+	const int lowpDType = cfg.lowpDType;
+	const int costFx = cfg.costFx;
+	const float gradClip = cfg.gradClip;
+	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = cfg.tokenLmLossKind;
+	const int padTokenId = cfg.padTokenId;
+	const bool mpUseLossScaling = cfg.mpUseLossScaling;
+
+	const float lossScale = (mpUseLossScaling ? tt.mpLossScale : 1.0f);
+
+	std::vector<float, glades::AlignedAllocator<float, 64> >& dLogits = transformerScratch.dLogits;
+	if (dLogits.size() != (static_cast<size_t>(T) * static_cast<size_t>(scratchOutSize)))
+		dLogits.resize(static_cast<size_t>(T) * static_cast<size_t>(scratchOutSize));
+	std::fill(dLogits.begin(), dLogits.end(), 0.0f);
+
+	std::vector<float, glades::AlignedAllocator<float, 64> >& dH = transformerScratch.dH;
+	if (dH.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
+		dH.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
+
+	const float* hFinal = transformerScratch.hAfterFF.data() + (static_cast<size_t>(nLayers - 1u) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+	float* hPostFinalLN = transformerScratch.hPostFinalLN.data();
+
+	if (tokenLM)
+	{
+		unsigned int validTargetsThisSeq = 0u;
+		std::fill(dH.begin(), dH.end(), 0.0f);
+		if (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX)
+		{
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const int yid = targetIds[t];
+				if (padTokenId >= 0 && yid == padTokenId) continue;
+				if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize) continue;
+				++validTargetsThisSeq;
+				const size_t off = static_cast<size_t>(t) * static_cast<size_t>(vocabSize);
+				for (unsigned int v = 0; v < vocabSize; ++v)
+					dLogits[off + v] = transformerScratch.probs[off + v];
+				dLogits[off + static_cast<unsigned int>(yid)] -= 1.0f;
+			}
+
+			// Apply gradient clipping and loss scaling to dLogits in-place
+			{
+				const size_t dLogitsLen = static_cast<size_t>(T) * static_cast<size_t>(vocabSize);
+				for (size_t idx = 0; idx < dLogitsLen; ++idx)
+					dLogits[idx] = clip_maybe(dLogits[idx], gradClip) * lossScale;
+			}
+
+			// Parallelized tied-embedding backward:
+			//   gTokE  += dLogits^T * hPostFinalLN   (weight gradient)
+			//   gLmBias += sum_t dLogits[t,:]         (bias gradient)
+			//   dH      += dLogits * tokE             (input gradient)
+			linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, vocabSize,
+			    tt.gTokE, tt.gLmBias, tt.tokE, tt.tokELowp, useLowpWeights, lowpDType, dH.data());
+		}
+		else
+		{
+			const unsigned int S = scratchOutSize;
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const int yid = targetIds[t];
+				if (padTokenId >= 0 && yid == padTokenId) continue;
+				if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize) continue;
+				++validTargetsThisSeq;
+
+				const size_t off = static_cast<size_t>(t) * static_cast<size_t>(S);
+				for (unsigned int j = 0u; j < S; ++j)
+					dLogits[off + j] = transformerScratch.probs[off + j];
+				dLogits[off + 0u] -= 1.0f;
+
+				const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+				const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
+				for (unsigned int j = 0u; j < S; ++j)
+				{
+					const float dz = clip_maybe(dLogits[off + j], gradClip) * lossScale;
+					if (dz == 0.0f) continue;
+					const int vid = transformerScratch.tokenLmSampleIds[off + j];
+					if (vid < 0 || static_cast<unsigned int>(vid) >= vocabSize) continue;
+					tt.gLmBias[static_cast<size_t>(vid)] += dz;
+					const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
+					for (unsigned int i = 0; i < dModel; ++i)
+					{
+						tt.gTokE[eOff + i] += dz * hPostFinalLN[hOff + i];
+						const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
+						dH[hOff + i] += dz * ev;
+					}
+				}
+			}
+		}
+		timeStepsInBatch += validTargetsThisSeq;
+	}
+	else
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const float* expRow = NULL;
+			unsigned int expSize = 0u;
+			di->getTrainSequenceExpectedRowView(s, t, expRow, expSize);
+			const size_t off = static_cast<size_t>(t) * static_cast<size_t>(outSize);
+			for (unsigned int k = 0; k < outSize; ++k)
+			{
+				const float expv = (expRow && k < expSize) ? expRow[k] : 0.0f;
+				const float pred = transformerScratch.probs[off + k];
+				float d = 0.0f;
+				const bool useSoftmax = ((costFx == GMath::CLASSIFICATION) || (costFx == GMath::KL)) && (outSize > 1u);
+				if (useSoftmax)
+					d = pred - expv;
+				else if ((costFx == GMath::CLASSIFICATION) && (outSize == 1u))
+					d = pred - expv;
+				else
+					d = GMath::costErrDer(expv, pred, costFx);
+				dLogits[off + k] = clip_maybe(d, gradClip) * lossScale;
+			}
+		}
+
+		linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, outSize, tt.gWOut, tt.gBOut, tt.WOut, tt.WOutLowp, useLowpWeights,
+		                                 lowpDType, dH.data());
+		timeStepsInBatch += T;
+	}
+
+	// Backprop Final LayerNorm
+	{
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dHPreFinalLN = transformerScratch.dH2;
+		if (dHPreFinalLN.size() != dH.size()) dHPreFinalLN.resize(dH.size());
+		std::fill(dHPreFinalLN.begin(), dHPreFinalLN.end(), 0.0f);
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+		{
+			glades::transformer_kernels::rmsnorm_backward_rows_accum(hFinal, dH.data(), T, dModel, tt.lnFinalGamma,
+			    transformerScratch.lnFinalInvStd.data(), dHPreFinalLN.data(), tt.gLnFinalGamma, tt.gLnFinalBeta);
+		}
+		else
+		{
+			glades::transformer_kernels::layernorm_backward_rows_accum(hFinal, dH.data(), T, dModel, tt.lnFinalGamma,
+			    transformerScratch.lnFinalMean.data(), transformerScratch.lnFinalInvStd.data(),
+			    dHPreFinalLN.data(), tt.gLnFinalGamma, tt.gLnFinalBeta);
+		}
+		std::copy(dHPreFinalLN.begin(), dHPreFinalLN.end(), dH.begin());
+	}
+
+	// RoPE precompute for backward
+	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+	unsigned int ropeDim = dHead;
+	if (ropeDimOverride > 0)
+	{
+		const unsigned int rd = static_cast<unsigned int>(ropeDimOverride);
+		ropeDim = (rd < ropeDim) ? rd : ropeDim;
+	}
+	if ((ropeDim % 2u) != 0u) ropeDim -= 1u;
+	const std::vector<double>* ropeInvFreq = NULL;
+	if (useRope && ropeDim >= 2u)
+	{
+		transformerPosEncCache.ensureRope(ropeDim, ropeTheta);
+		ropeInvFreq = &transformerPosEncCache.ropeInvFreq;
+	}
+	const unsigned int groupSize = (nKVHeads > 0u) ? (nHeads / nKVHeads) : 0u;
+
+	// Backprop through blocks (reverse)
+	for (int li = static_cast<int>(nLayers) - 1; li >= 0; --li)
+	{
+		TensorTransformerState::Block& b = tt.blocks[static_cast<size_t>(li)];
+		const float* hIn = (li == 0) ? transformerScratch.h.data()
+		                             : (transformerScratch.hAfterFF.data() + (static_cast<size_t>(li - 1) * static_cast<size_t>(T) * static_cast<size_t>(dModel)));
+
+		const float* hAfterAttn = transformerScratch.hAfterAttn.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		const float* x1 = transformerScratch.x1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		const float* x2 = transformerScratch.x2.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		const float* ff1 = transformerScratch.ff1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
+		const float* ff1Act = transformerScratch.ff1Act.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dFF));
+
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dHAfterAttn = transformerScratch.dH2;
+		if (dHAfterAttn.size() != dH.size()) dHAfterAttn.resize(dH.size());
+		std::copy(dH.begin(), dH.end(), dHAfterAttn.begin());
+
+		// FFN residual dropout backward
+		{
+			const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+			if (resDropRate > 0.0f)
+			{
+				const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				const unsigned char* mask = transformerScratch.dropoutMaskResFF.empty() ? NULL : &transformerScratch.dropoutMaskResFF[layerOff];
+				if (mask)
+				{
+					const float scale = 1.0f / (1.0f - resDropRate);
+					for (size_t i = 0; i < n; ++i)
+						dH[i] *= mask[i] ? scale : 0.0f;
+				}
+			}
+		}
+
+		// FFN backward
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dFF1Act = transformerScratch.dFF1Act;
+		if (dFF1Act.size() != (static_cast<size_t>(T) * static_cast<size_t>(dFF)))
+			dFF1Act.resize(static_cast<size_t>(T) * static_cast<size_t>(dFF));
+		linear_backward_accum_maybe_lowp(ff1Act, dH.data(), T, dFF, dModel, b.gW2, b.gB2, b.W2, b.W2Lowp, useLowpWeights, lowpDType, dFF1Act.data());
+
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dX2 = transformerScratch.dX2;
+		if (dX2.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
+			dX2.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		if (ffnKind == static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU))
+		{
+			std::vector<float, glades::AlignedAllocator<float, 64> >& dFF1Cat = transformerScratch.dFF1Cat;
+			if (dFF1Cat.size() != (static_cast<size_t>(T) * static_cast<size_t>(ff1Width)))
+				dFF1Cat.resize(static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
+			std::fill(dFF1Cat.begin(), dFF1Cat.end(), 0.0f);
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const size_t preOff = static_cast<size_t>(t) * static_cast<size_t>(ff1Width);
+				const size_t outOff = static_cast<size_t>(t) * static_cast<size_t>(dFF);
+				for (unsigned int i = 0; i < dFF; ++i)
+				{
+					const float gatePre = ff1[preOff + i];
+					const float upPre = ff1[preOff + static_cast<size_t>(dFF) + i];
+					const float siluVal = glades::transformer_ops::silu(gatePre);
+					const float dOut = dFF1Act[outOff + i];
+					dFF1Cat[preOff + i] = dOut * upPre * glades::transformer_ops::silu_deriv(gatePre);
+					dFF1Cat[preOff + static_cast<size_t>(dFF) + i] = dOut * siluVal;
+				}
+			}
+			linear_backward_accum_maybe_lowp(x2, dFF1Cat.data(), T, dModel, ff1Width, b.gW1, b.gB1, b.W1, b.W1Lowp, useLowpWeights, lowpDType, dX2.data());
+		}
+		else
+		{
+			const size_t actLen = dFF1Act.size();
+			if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+				glades::transformer_kernels::gelu_backward_buf(ff1, dFF1Act.data(), actLen);
+			else
+				for (size_t i = 0; i < actLen; ++i)
+					dFF1Act[i] *= glades::transformer_ops::relu_deriv_from_y(ff1Act[i]);
+			linear_backward_accum_maybe_lowp(x2, dFF1Act.data(), T, dModel, dFF, b.gW1, b.gB1, b.W1, b.W1Lowp, useLowpWeights, lowpDType, dX2.data());
+		}
+
+		// LN2 backward
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dHAfterAttnFromLN = transformerScratch.dHAfterAttnFromLN;
+		if (dHAfterAttnFromLN.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
+			dHAfterAttnFromLN.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		std::fill(dHAfterAttnFromLN.begin(), dHAfterAttnFromLN.end(), 0.0f);
+		const float* ln2Mean = transformerScratch.ln2Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		const float* ln2InvStd = transformerScratch.ln2InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+		{
+			glades::transformer_kernels::rmsnorm_backward_rows_accum(hAfterAttn, dX2.data(), T, dModel, b.ln2Gamma, ln2InvStd,
+			                                                        dHAfterAttnFromLN.data(), b.gLn2Gamma, b.gLn2Beta);
+		}
+		else
+		{
+			glades::transformer_kernels::layernorm_backward_rows_accum(hAfterAttn, dX2.data(), T, dModel, b.ln2Gamma, ln2Mean, ln2InvStd,
+			                                                          dHAfterAttnFromLN.data(), b.gLn2Gamma, b.gLn2Beta);
+		}
+		for (size_t i = 0; i < dHAfterAttn.size(); ++i)
+			dHAfterAttn[i] += dHAfterAttnFromLN[i];
+
+		std::copy(dHAfterAttn.begin(), dHAfterAttn.end(), dH.begin());
+
+		// Attention residual dropout backward
+		{
+			const float resDropRate = trainingConfig.transformer.residualDropoutRate;
+			if (resDropRate > 0.0f)
+			{
+				const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+				const unsigned char* mask = transformerScratch.dropoutMaskResAttn.empty() ? NULL : &transformerScratch.dropoutMaskResAttn[layerOff];
+				if (mask)
+				{
+					const float scale = 1.0f / (1.0f - resDropRate);
+					for (size_t i = 0; i < n; ++i)
+						dHAfterAttn[i] *= mask[i] ? scale : 0.0f;
+				}
+			}
+		}
+
+		const float* attnConcat = transformerScratch.attnConcat.data() +
+		                          (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+
+		// Backprop Wo
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dAttnConcat = transformerScratch.dAttnConcat;
+		if (dAttnConcat.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
+			dAttnConcat.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		linear_backward_accum_maybe_lowp(attnConcat, dHAfterAttn.data(), T, dModel, dModel, b.gWo, b.gBo, b.Wo, b.WoLowp, useLowpWeights,
+		                                 lowpDType, dAttnConcat.data());
+
+		const float* Vfull = transformerScratch.V.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+		const float* Qfull = transformerScratch.Q.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		const float* Kfull = transformerScratch.K.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dQfull = transformerScratch.dQfull;
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dKfull = transformerScratch.dKfull;
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dVfull = transformerScratch.dVfull;
+		if (dQfull.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
+			dQfull.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		if (dKfull.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModelKV)))
+			dKfull.resize(static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+		if (dVfull.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModelKV)))
+			dVfull.resize(static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
+		std::fill(dQfull.begin(), dQfull.end(), 0.0f);
+		std::fill(dKfull.begin(), dKfull.end(), 0.0f);
+		std::fill(dVfull.begin(), dVfull.end(), 0.0f);
+
+		// Attention backward
+		{
+			const bool attnWorthParallel = (static_cast<unsigned long long>(T) * T * dHead >= 32768ULL);
+			glades::ThreadPool& pool = glades::ThreadPool::instance();
+			if (attnWorthParallel && nHeads > 1u && pool.numThreads() > 1u)
+			{
+				const unsigned int nThreads = pool.numThreads();
+				unsigned int nChunksPerHead = 1u;
+				if (nHeads < nThreads && T >= 512u)
+				{
+					nChunksPerHead = (nThreads + nHeads - 1u) / nHeads;
+					if (nChunksPerHead > 4u) nChunksPerHead = 4u;
+				}
+
+				if (nChunksPerHead <= 1u)
+				{
+					AttnBwdCtx actx;
+					actx.Q = Qfull; actx.K = Kfull; actx.V = Vfull;
+					actx.dO = dAttnConcat.data();
+					actx.dQ = dQfull.data(); actx.dK = dKfull.data(); actx.dV = dVfull.data();
+					actx.dModel = dModel; actx.dModelKV = dModelKV;
+					actx.dHead = dHead; actx.nHeads = nHeads; actx.nKVHeads = nKVHeads;
+					actx.T = T; actx.groupSize = groupSize;
+					actx.causal = causal; actx.keyAllowed = NULL;
+					actx.nChunksPerHead = 1u; actx.totalItems = nKVHeads;
+					actx.dKVscratch = NULL;
+					pool.parallel_for(nKVHeads, attn_bwd_body, &actx);
+				}
+				else
+				{
+					const unsigned int totalItems = nHeads * nChunksPerHead;
+					const size_t scratchPerItem = static_cast<size_t>(T) * dHead * 2u;
+					const size_t totalScratch = static_cast<size_t>(totalItems) * scratchPerItem;
+					if (transformerScratch.dKVscratch.size() < totalScratch)
+						transformerScratch.dKVscratch.resize(totalScratch);
+					std::fill(transformerScratch.dKVscratch.begin(), transformerScratch.dKVscratch.begin() + totalScratch, 0.0f);
+
+					AttnBwdCtx actx;
+					actx.Q = Qfull; actx.K = Kfull; actx.V = Vfull;
+					actx.dO = dAttnConcat.data();
+					actx.dQ = dQfull.data(); actx.dK = dKfull.data(); actx.dV = dVfull.data();
+					actx.dModel = dModel; actx.dModelKV = dModelKV;
+					actx.dHead = dHead; actx.nHeads = nHeads; actx.nKVHeads = nKVHeads;
+					actx.T = T; actx.groupSize = groupSize;
+					actx.causal = causal; actx.keyAllowed = NULL;
+					actx.nChunksPerHead = nChunksPerHead; actx.totalItems = totalItems;
+					actx.dKVscratch = &transformerScratch.dKVscratch[0];
+					pool.parallel_for(totalItems, attn_bwd_body, &actx);
+
+					AttnBwdReduceCtx rctx;
+					rctx.dKVscratch = &transformerScratch.dKVscratch[0];
+					rctx.dK = dKfull.data(); rctx.dV = dVfull.data();
+					rctx.dHead = dHead; rctx.dModelKV = dModelKV; rctx.T = T;
+					rctx.nHeads = nHeads; rctx.nKVHeads = nKVHeads;
+					rctx.groupSize = groupSize; rctx.nChunksPerHead = nChunksPerHead;
+					pool.parallel_for(nKVHeads, attn_bwd_reduce_body, &rctx);
+				}
+			}
+			else
+			{
+				for (unsigned int h = 0; h < nHeads; ++h)
+				{
+					const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
+					glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
+					    Qfull + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
+					    Kfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
+					    Vfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
+					    dAttnConcat.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
+					    T, dHead, dHead, causal,
+					    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
+					    dKfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
+					    dVfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
+					    NULL);
+				}
+			}
+		}
+
+		// RoPE backward
+		if (useRope && ropeInvFreq)
+		{
+			const bool ropeWorthParallel = (static_cast<unsigned long long>(T) * ropeDim >= 4096ULL);
+			glades::ThreadPool& pool = glades::ThreadPool::instance();
+			if (ropeWorthParallel && pool.numThreads() > 1u)
+			{
+				if (nHeads > 1u)
+				{
+					RopeFwdCtx rctx;
+					rctx.buf = dQfull.data(); rctx.T = T; rctx.rowStride = dModel; rctx.dHead = dHead;
+					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = true;
+					pool.parallel_for(nHeads, rope_body, &rctx);
+				}
+				else
+				{
+					glades::transformer_kernels::rope_apply_inplace_strided(dQfull.data(), T, dModel, dHead, ropeDim, *ropeInvFreq, true);
+				}
+				if (nKVHeads > 1u)
+				{
+					RopeFwdCtx rctx;
+					rctx.buf = dKfull.data(); rctx.T = T; rctx.rowStride = dModelKV; rctx.dHead = dHead;
+					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = true;
+					pool.parallel_for(nKVHeads, rope_body, &rctx);
+				}
+				else
+				{
+					for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+						glades::transformer_kernels::rope_apply_inplace_strided(
+						    dKfull.data() + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, true);
+				}
+			}
+			else
+			{
+				for (unsigned int h = 0; h < nHeads; ++h)
+					glades::transformer_kernels::rope_apply_inplace_strided(
+					    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), T, dModel, dHead, ropeDim, *ropeInvFreq, true);
+				for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+					glades::transformer_kernels::rope_apply_inplace_strided(
+					    dKfull.data() + static_cast<size_t>(hk) * static_cast<size_t>(dHead), T, dModelKV, dHead, ropeDim, *ropeInvFreq, true);
+			}
+		}
+
+		// QKV projection backward
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dX1 = transformerScratch.dX1;
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dXtmp = transformerScratch.dXtmp;
+		if (dX1.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
+			dX1.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		if (dXtmp.size() != dX1.size()) dXtmp.resize(dX1.size());
+		std::fill(dX1.begin(), dX1.end(), 0.0f);
+		{
+			linear_backward_accum_maybe_lowp(x1, dQfull.data(), T, dModel, dModel, b.gWq, b.gBq, b.Wq, b.WqLowp, useLowpWeights, lowpDType, dXtmp.data());
+			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
+		}
+		{
+			linear_backward_accum_maybe_lowp(x1, dKfull.data(), T, dModel, dModelKV, b.gWk, b.gBk, b.Wk, b.WkLowp, useLowpWeights, lowpDType, dXtmp.data());
+			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
+		}
+		{
+			linear_backward_accum_maybe_lowp(x1, dVfull.data(), T, dModel, dModelKV, b.gWv, b.gBv, b.Wv, b.WvLowp, useLowpWeights, lowpDType, dXtmp.data());
+			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
+		}
+
+		// LN1 backward
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dHInFromLN = transformerScratch.dHInFromLN;
+		if (dHInFromLN.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
+			dHInFromLN.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
+		std::fill(dHInFromLN.begin(), dHInFromLN.end(), 0.0f);
+		const float* ln1Mean = transformerScratch.ln1Mean.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		const float* ln1InvStd = transformerScratch.ln1InvStd.data() + (static_cast<size_t>(li) * static_cast<size_t>(T));
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+		{
+			glades::transformer_kernels::rmsnorm_backward_rows_accum(hIn, dX1.data(), T, dModel, b.ln1Gamma, ln1InvStd,
+			                                                        dHInFromLN.data(), b.gLn1Gamma, b.gLn1Beta);
+		}
+		else
+		{
+			glades::transformer_kernels::layernorm_backward_rows_accum(hIn, dX1.data(), T, dModel, b.ln1Gamma, ln1Mean, ln1InvStd,
+			                                                          dHInFromLN.data(), b.gLn1Gamma, b.gLn1Beta);
+		}
+
+		for (size_t i = 0; i < dH.size(); ++i)
+			dH[i] += dHInFromLN[i];
+	} // layers
+
+	// Embedding dropout backward
+	{
+		const float embDropRate = trainingConfig.transformer.embeddingDropoutRate;
+		if (embDropRate > 0.0f)
+		{
+			const size_t n = static_cast<size_t>(T) * static_cast<size_t>(dModel);
+			const unsigned char* mask = transformerScratch.dropoutMaskEmb.empty() ? NULL : &transformerScratch.dropoutMaskEmb[0];
+			if (mask)
+			{
+				const float scale = 1.0f / (1.0f - embDropRate);
+				for (size_t i = 0; i < n; ++i)
+					dH[i] *= mask[i] ? scale : 0.0f;
+			}
+		}
+	}
+
+	// Backprop input projection
+	if (tokenLM)
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const int tid = tokenIds[t];
+			const size_t eOff = static_cast<size_t>(tid) * static_cast<size_t>(dModel);
+			const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+			for (unsigned int i = 0; i < dModel; ++i)
+				tt.gTokE[eOff + i] += dH[hOff + i];
+		}
+	}
+	else
+	{
+		std::vector<float, glades::AlignedAllocator<float, 64> >& dX = transformerScratch.dInput;
+		if (dX.size() != (static_cast<size_t>(T) * static_cast<size_t>(inputSize)))
+			dX.resize(static_cast<size_t>(T) * static_cast<size_t>(inputSize));
+		linear_backward_accum_maybe_lowp(transformerScratch.x.data(), dH.data(), T, inputSize, dModel, tt.gWIn, tt.gBIn, tt.WIn, tt.WInLowp,
+		                                 useLowpWeights, lowpDType, dX.data());
+		(void)dX;
+	}
+}
+
+
+// ---------------------------------------------------------------------------
+// Extracted GPU training epoch (previously inlined in SGDHelper_TRANSFORMER).
+// Runs the complete forward/backward/optimizer loop on GPU for all sequences
+// in the epoch.
+// ---------------------------------------------------------------------------
+#ifdef GLADES_HAVE_CUDA
+void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
+                                                int epochIdx, int64_t epochStartMs,
+                                                unsigned long long& tokensProcessed,
+                                                unsigned long long& targetsProcessed,
+                                                double& tokenLmNllSum,
+                                                unsigned long long& tokenLmTokenCount,
+                                                unsigned long long& clsCorrect,
+                                                unsigned long long& clsTotal,
+                                                shmea::GLogger* logger)
+{
+	using namespace glades::logfmt;
+
+	TensorTransformerState& tt = tensorTransformer;
+
+	const unsigned int dModel = cfg.dModel;
+	const unsigned int dFF = cfg.dFF;
+	const unsigned int nHeads = cfg.nHeads;
+	const unsigned int nKVHeads = cfg.nKVHeads;
+	const unsigned int nLayers = cfg.nLayers;
+	const unsigned int vocabSize = cfg.vocabSize;
+	const unsigned int inputSize = cfg.inputSize;
+	const unsigned int outSize = cfg.outSize;
+	const bool tokenLM = cfg.tokenLM;
+	const bool tieEmb = cfg.tieEmb;
+	const bool causal = cfg.causal;
+	const int padTokenId = cfg.padTokenId;
+	const int posEnc = cfg.posEnc;
+	const int normType = cfg.normType;
+	const int ffnKind = cfg.ffnKind;
+	const int ffnAct = cfg.ffnAct;
+	const float lnEps = cfg.lnEps;
+	const int ropeDimOverride = cfg.ropeDimOverride;
+	const unsigned int seqBatchMax = cfg.seqBatchMax;
+
+	unsigned int seqInBatch = 0u;
+	unsigned int timeStepsInBatch = 0u;
+
+	// Progress logging setup
+	unsigned int progressEverySeq = 1u;
+	if (seqCount > 20u)
+		progressEverySeq = seqCount / 20u;
+	if (progressEverySeq == 0u)
+		progressEverySeq = 1u;
+	int64_t lastProgressMs = epochStartMs;
+	static const int64_t kProgressIntervalMs = 5000;
+
+	const unsigned int dHead = dModel / nHeads;
+	const unsigned int dModelKV = nKVHeads * dHead;
+	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
+	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+
+	for (unsigned int s = 0; s < seqCount; ++s)
+	{
+		if (!running)
+			break;
+
+		const unsigned int T = di->getTrainSequenceLength(s);
+		if (T == 0u)
+			continue;
+		tokensProcessed += static_cast<unsigned long long>(T);
+
+
+		// Ensure GPU scratch is big enough for this sequence.
+		if (!gpuTransformerScratch)
+			gpuTransformerScratch = new gpu::GpuTransformerScratch();
+
+		if (!gpuTransformerScratch->initialized || gpuTransformerScratch->T < T)
+		{
+			if (!gpuTransformerScratch->allocate(T, inputSize, outSize, dModel, dFF, dModelKV, nHeads, nLayers, ff1Width))
+			{
+				// GPU scratch allocation failed, fall through to CPU.
+				break;
+			}
+		}
+
+		// Upload token IDs for this sequence.
+		if (tokenLM)
+		{
+			std::vector<int> tokenIdsInt(T);
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				int tid = 0;
+				di->getTrainSequenceTokenId(s, t, tid);
+				tokenIdsInt[t] = tid;
+			}
+			gpuTransformerScratch->tokenIds.upload(&tokenIdsInt[0], T);
+
+			// Forward: embedding gather
+			gpu::embedding_gather(
+			    gpuTransformerWeights->tokE.data(),
+			    gpuTransformerScratch->tokenIds.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize),
+			    static_cast<int>(dModel),
+			    gpuTransformerScratch->h.data());
+		}
+		else
+		{
+			// Upload input features and run linear projection.
+			std::vector<float> xHost(static_cast<size_t>(T) * inputSize);
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const float* row = NULL;
+				unsigned int rowSize = 0u;
+				di->getTrainSequenceRowView(s, t, row, rowSize);
+				const size_t off = static_cast<size_t>(t) * inputSize;
+				for (unsigned int f = 0; f < inputSize; ++f)
+					xHost[off + f] = (row && f < rowSize) ? row[f] : 0.0f;
+			}
+			gpuTransformerScratch->x.upload(&xHost[0], xHost.size());
+
+			// Input projection: h = x * WIn^T + bIn
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
+			                     1.0f,
+			                     gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
+			                     gpuTransformerWeights->WIn.data(), static_cast<int>(inputSize),
+			                     0.0f,
+			                     gpuTransformerScratch->h.data(), static_cast<int>(dModel));
+			gpu::add_bias(gpuTransformerScratch->h.data(),
+			              gpuTransformerWeights->bIn.data(),
+			              static_cast<int>(T), static_cast<int>(dModel));
+		}
+
+		// Upload RoPE invFreq to scratch (shared across all layers).
+		unsigned int fwdRopeHalfDim = 0u;
+		if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
+		{
+			const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
+			                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
+			fwdRopeHalfDim = rd / 2u;
+			std::vector<float> invFreqF(fwdRopeHalfDim);
+			for (unsigned int i = 0; i < fwdRopeHalfDim && i < transformerPosEncCache.ropeInvFreq.size(); ++i)
+				invFreqF[i] = static_cast<float>(transformerPosEncCache.ropeInvFreq[i]);
+			gpuTransformerScratch->gpuInvFreq.upload(&invFreqF[0], invFreqF.size());
+		}
+
+		// Per-layer transformer blocks.
+		for (unsigned int li = 0; li < nLayers; ++li)
+		{
+			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
+			const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+
+			// Input to this layer is h (or hAfterFF from previous layer).
+			const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
+			                                 : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
+
+			float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
+			float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
+			float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
+
+			// Pre-LN 1
+			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			{
+				gpu::rmsnorm_forward(layerIn, gb.ln1Gamma.data(), lnEps,
+				                      static_cast<int>(T), static_cast<int>(dModel),
+				                      x1_l, ln1InvStd_l);
+			}
+			else
+			{
+				gpu::layernorm_forward(layerIn, gb.ln1Gamma.data(), gb.ln1Beta.data(),
+				                        lnEps, static_cast<int>(T), static_cast<int>(dModel),
+				                        x1_l, ln1Mean_l, ln1InvStd_l);
+			}
+
+			// QKV projections
+			float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
+			float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
+			float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
+
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+			                     1.0f, x1_l, static_cast<int>(dModel),
+			                     gb.Wq.data(), static_cast<int>(dModel),
+			                     0.0f, Q_l, static_cast<int>(dModel));
+			gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
+			                     1.0f, x1_l, static_cast<int>(dModel),
+			                     gb.Wk.data(), static_cast<int>(dModel),
+			                     0.0f, K_l, static_cast<int>(dModelKV));
+			gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
+			                     1.0f, x1_l, static_cast<int>(dModel),
+			                     gb.Wv.data(), static_cast<int>(dModel),
+			                     0.0f, V_l, static_cast<int>(dModelKV));
+			gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+
+			// RoPE (if enabled) — fused Q+K in single kernel launch
+			if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
+			{
+				const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
+				                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
+				// Use persistent gpuInvFreq from scratch (uploaded before layer loop).
+				gpu::rope_apply_qk(Q_l, K_l, gpuTransformerScratch->gpuInvFreq.data(),
+				                    static_cast<int>(T), static_cast<int>(nHeads),
+				                    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+				                    static_cast<int>(rd / 2u));
+			}
+
+			// Batched GEMM attention (replaces per-head flash attention).
+			// Q[T, dModel], K[T, dModelKV], V[T, dModelKV], attnConcat[T, dModel].
+			// Treat as batched over heads with stride = dHead between heads.
+			float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
+			float* scores = gpuTransformerScratch->attnScores.data();
+			float* attnP  = gpuTransformerScratch->attnProbs.data();
+			{
+				const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
+				const unsigned int groupSize = nHeads / nKVHeads;
+
+				// Loop over KV-head groups for GQA support.
+				for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
+				{
+					const unsigned int qStart = kvh * groupSize;
+					// S[groupSize, T, T] = Q_group[groupSize, T, dHead] * K_kvh[T, dHead]^T
+					float* P_out = attnP + static_cast<size_t>(qStart) * T * T;
+					gpu::sgemm_batched_strided_abt(
+					    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
+					    invSqrt,
+					    Q_l + qStart * dHead, static_cast<int>(dModel),
+					    static_cast<long long>(T) * dModel,
+					    K_l + kvh * dHead, static_cast<int>(dModelKV),
+					    0LL,  // stride 0: all Q heads in group share same K head
+					    0.0f,
+					    P_out, static_cast<int>(T),
+					    static_cast<long long>(T) * T,
+					    static_cast<int>(groupSize));
+
+					// Causal mask + softmax on S[groupSize, T, T].
+					gpu::causal_mask_softmax_inplace(
+					    P_out,
+					    static_cast<int>(groupSize), static_cast<int>(T));
+
+					// O[groupSize, T, dHead] = P[groupSize, T, T] * V_kvh[T, dHead]
+					gpu::sgemm_batched_strided(
+					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+					    1.0f,
+					    P_out, static_cast<int>(T),
+					    static_cast<long long>(T) * T,
+					    V_l + kvh * dHead, static_cast<int>(dModelKV),
+					    0LL,  // stride 0: all Q heads in group share same V head
+					    0.0f,
+					    attnConcat_l + qStart * dHead, static_cast<int>(dModel),
+					    static_cast<long long>(T) * dModel,
+					    static_cast<int>(groupSize));
+				}
+			}
+
+			// Wo projection
+			float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+			                     1.0f, attnConcat_l, static_cast<int>(dModel),
+			                     gb.Wo.data(), static_cast<int>(dModel),
+			                     0.0f, attnOut_l, static_cast<int>(dModel));
+			gpu::add_bias(attnOut_l, gb.bo.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+			// Residual 1: hAfterAttn = layerIn + attnOut
+			float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
+			gpu::add_two(hAfterAttn_l, layerIn, attnOut_l, static_cast<int>(T * dModel));
+
+			// Pre-LN 2
+			float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
+			float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
+			float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
+
+			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			{
+				gpu::rmsnorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), lnEps,
+				                      static_cast<int>(T), static_cast<int>(dModel),
+				                      x2_l, ln2InvStd_l);
+			}
+			else
+			{
+				gpu::layernorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), gb.ln2Beta.data(),
+				                        lnEps, static_cast<int>(T), static_cast<int>(dModel),
+				                        x2_l, ln2Mean_l, ln2InvStd_l);
+			}
+
+			// FFN
+			float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
+			float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
+			float* ffOut_l = gpuTransformerScratch->ffOut.data() + static_cast<size_t>(li) * T * dModel;
+
+			// FF1: x2 * W1^T + b1
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
+			                     1.0f, x2_l, static_cast<int>(dModel),
+			                     gb.W1.data(), static_cast<int>(dModel),
+			                     0.0f, ff1_l, static_cast<int>(ff1Width));
+			gpu::add_bias(ff1_l, gb.b1.data(), static_cast<int>(T), static_cast<int>(ff1Width));
+
+			// Activation
+			if (ffnKind == 1) // SwiGLU
+			{
+				gpu::swiglu_forward(ff1_l, static_cast<int>(T), static_cast<int>(dFF), ff1Act_l);
+			}
+			else if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+			{
+				gpu::gelu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+			}
+			else
+			{
+				gpu::relu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+			}
+
+			// FF2: ffAct * W2^T + b2
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+			                     1.0f, ff1Act_l, static_cast<int>(dFF),
+			                     gb.W2.data(), static_cast<int>(dFF),
+			                     0.0f, ffOut_l, static_cast<int>(dModel));
+			gpu::add_bias(ffOut_l, gb.b2.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+			// Residual 2: hAfterFF = hAfterAttn + ffOut
+			float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li) * T * dModel;
+			gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l, static_cast<int>(T * dModel));
+		}
+
+		// Final LayerNorm
+		const float* finalH = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(nLayers - 1) * T * dModel;
+		float* hPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+		{
+			gpu::rmsnorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(), lnEps,
+			                     static_cast<int>(T), static_cast<int>(dModel),
+			                     hPostFinalLN, gpuTransformerScratch->lnFinalInvStd.data());
+		}
+		else
+		{
+			gpu::layernorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(),
+			                       gpuTransformerWeights->lnFinalBeta.data(), lnEps,
+			                       static_cast<int>(T), static_cast<int>(dModel),
+			                       hPostFinalLN, gpuTransformerScratch->lnFinalMean.data(),
+			                       gpuTransformerScratch->lnFinalInvStd.data());
+		}
+
+		// Output logits
+		if (tokenLM && tieEmb)
+		{
+			// logits = hPostFinalLN * E^T + lmBias
+			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
+			                     1.0f, hPostFinalLN, static_cast<int>(dModel),
+			                     gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
+			                     0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize));
+			gpu::add_bias(gpuTransformerScratch->logits.data(),
+			              gpuTransformerWeights->lmBias.data(),
+			              static_cast<int>(T), static_cast<int>(vocabSize));
+		}
+
+		// Softmax
+		gpu::softmax_forward(gpuTransformerScratch->logits.data(),
+		                      static_cast<int>(T), static_cast<int>(outSize),
+		                      gpuTransformerScratch->probs.data());
+
+		// === Loss / metrics ===
+		std::vector<int> gpuTargetIds;
+		unsigned int gpuValidTargets = 0u;
+		if (tokenLM)
+		{
+			gpuTargetIds.resize(T);
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				int yid = padTokenId;
+				di->getTrainSequenceExpectedTokenId(s, t, yid);
+				gpuTargetIds[t] = yid;
+			}
+			// Upload targets to persistent scratch buffer.
+			gpuTransformerScratch->gpuTargetsT.upload(&gpuTargetIds[0], T);
+
+			// GPU loss: cross-entropy NLL.
+			gpu::cross_entropy_nll_loss(
+			    gpuTransformerScratch->probs.data(),
+			    gpuTransformerScratch->gpuTargetsT.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize),
+			    padTokenId,
+			    gpuTransformerScratch->lossSum.data(),
+			    gpuTransformerScratch->lossCount.data());
+
+			// GPU accuracy: argmax match count.
+			gpu::argmax_count_matches(
+			    gpuTransformerScratch->probs.data(),
+			    gpuTransformerScratch->gpuTargetsT.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize),
+			    padTokenId,
+			    gpuTransformerScratch->correctCount.data(),
+			    gpuTransformerScratch->validCount.data());
+
+			// Pack 4 loss scalars into contiguous buffer, download once.
+			gpu::pack_loss_scalars(
+			    gpuTransformerScratch->lossSum.data(),
+			    gpuTransformerScratch->lossCount.data(),
+			    gpuTransformerScratch->correctCount.data(),
+			    gpuTransformerScratch->validCount.data(),
+			    gpuTransformerScratch->lossPack.data());
+			int lossPacked[4];
+			gpuTransformerScratch->lossPack.download(lossPacked, 4);
+			float lossVal;
+			memcpy(&lossVal, &lossPacked[0], sizeof(float));
+			int lossCountVal = lossPacked[1], correctVal = lossPacked[2], validVal = lossPacked[3];
+
+			gpuValidTargets = static_cast<unsigned int>(lossCountVal);
+			tokenLmNllSum += static_cast<double>(lossVal);
+			tokenLmTokenCount += static_cast<unsigned long long>(lossCountVal);
+			clsCorrect += static_cast<unsigned long long>(correctVal);
+			clsTotal += static_cast<unsigned long long>(validVal);
+
+			targetsProcessed += static_cast<unsigned long long>(gpuValidTargets);
+		}
+		else
+		{
+			targetsProcessed += static_cast<unsigned long long>(T);
+		}
+
+		// Periodic progress logging (mirrors CPU path).
+		if (logger && (s + 1u) < seqCount)
+		{
+			const int64_t nowMs = getCurrentTimeMilliseconds();
+			const bool dueBySeq = (((s + 1u) % progressEverySeq) == 0u);
+			const bool dueByTime = ((nowMs - lastProgressMs) >= kProgressIntervalMs);
+			if (dueBySeq || dueByTime)
+			{
+				lastProgressMs = nowMs;
+				const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
+				const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
+				const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
+
+				std::ostringstream oss;
+				oss << "event=nn_epoch_progress";
+				append_logfmt_kv(oss, "net_type", netType);
+				append_logfmt_kv(oss, "run_type", std::string("train"));
+				append_logfmt_kv(oss, "gpu", true);
+				append_logfmt_kv(oss, "epoch", epochIdx);
+				append_logfmt_kv(oss, "seq_done", s + 1u);
+				append_logfmt_kv(oss, "seq_total", seqCount);
+				append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
+				append_logfmt_kv(oss, "targets_seen", targetsProcessed);
+				append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
+				if (tokenLM)
+				{
+					append_logfmt_kv(oss, "token_lm_loss_kind", std::string("full_softmax"));
+					append_logfmt_kv(oss, "nll", meanNll);
+					double ppl = 0.0;
+					if (tokenLmTokenCount > 0ULL)
+					{
+						double arg = meanNll;
+						if (arg > 80.0) arg = 80.0;
+						if (arg < -80.0) arg = -80.0;
+						ppl = exp(arg);
+					}
+					append_logfmt_kv(oss, "perplexity", ppl);
+					append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+				}
+				else
+				{
+					append_logfmt_kv(oss, "loss_so_far", overallTotalError);
+				}
+				append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+				if (trainingConfig.globalGradClipNorm > 0.0f)
+				{
+					append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+					append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+				}
+				append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tensorTransformer.optimizerStep));
+				logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+			}
+		}
+
+		// === GPU Backward pass ===
+		if (seqInBatch == 0u)
+		{
+			gpu::zeroTransformerGradients(*gpuTransformerWeights);
+			timeStepsInBatch = 0u;
+		}
+
+		// Compute dLogits on GPU.
+		const float* bwdFinalH = gpuTransformerScratch->hAfterFF.data() +
+		    static_cast<size_t>(nLayers - 1) * T * dModel;
+		const float* bwdPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
+
+		if (tokenLM)
+		{
+			// dLogits = probs - one_hot(targets)
+			gpu::softmax_cross_entropy_bwd(
+			    gpuTransformerScratch->probs.data(),
+			    gpuTransformerScratch->gpuTargetsT.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize),
+			    gpuTransformerScratch->dLogits.data());
+
+			// Backprop tied LM head: logits = hPostFinalLN * E^T + lmBias
+			// dH (w.r.t. hPostFinalLN) = dLogits * E
+			gpu::sgemm_rowmajor(
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(vocabSize),
+			    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
+			    gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
+			    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
+
+			// gTokE += dLogits^T * hPostFinalLN  [vocabSize, dModel]
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(vocabSize), static_cast<int>(dModel), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
+			    bwdPostFinalLN, static_cast<int>(dModel),
+			    1.0f, gpuTransformerWeights->gTokE.data(), static_cast<int>(dModel));
+
+			// gLmBias += sum_rows(dLogits)
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dLogits.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize),
+			    1.0f, gpuTransformerWeights->gLmBias.data());
+
+			timeStepsInBatch += gpuValidTargets;
+		}
+		else
+		{
+			// Non-tokenLM: dLogits computed from probs - expected on CPU, upload.
+			std::vector<float> probsHost(static_cast<size_t>(T) * outSize);
+			gpuTransformerScratch->probs.download(&probsHost[0], probsHost.size());
+			std::vector<float> dLogitsHost(static_cast<size_t>(T) * outSize, 0.0f);
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const float* expRow = NULL;
+				unsigned int expSize = 0u;
+				di->getTrainSequenceExpectedRowView(s, t, expRow, expSize);
+				const size_t off = static_cast<size_t>(t) * outSize;
+				for (unsigned int k = 0; k < outSize; ++k)
+				{
+					const float expv = (expRow && k < expSize) ? expRow[k] : 0.0f;
+					dLogitsHost[off + k] = probsHost[off + k] - expv;
+				}
+			}
+			gpuTransformerScratch->dLogits.upload(&dLogitsHost[0], dLogitsHost.size());
+
+			// dH (w.r.t. hPostFinalLN) = dLogits * WOut  [T, dModel]
+			gpu::sgemm_rowmajor(
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(outSize),
+			    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
+			    gpuTransformerWeights->WOut.data(), static_cast<int>(dModel),
+			    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
+
+			// gWOut += dLogits^T * hPostFinalLN  [outSize, dModel]
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(outSize), static_cast<int>(dModel), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
+			    bwdPostFinalLN, static_cast<int>(dModel),
+			    1.0f, gpuTransformerWeights->gWOut.data(), static_cast<int>(dModel));
+
+			// gBOut += sum_rows(dLogits)
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dLogits.data(),
+			    static_cast<int>(T), static_cast<int>(outSize),
+			    1.0f, gpuTransformerWeights->gBOut.data());
+
+			timeStepsInBatch += T;
+		}
+
+		// Backprop Final LayerNorm: dH (w.r.t. hPostFinalLN) -> dH (w.r.t. hFinal)
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+		{
+			gpu::rmsnorm_backward(
+			    gpuTransformerScratch->dH.data(), bwdFinalH,
+			    gpuTransformerWeights->lnFinalGamma.data(),
+			    gpuTransformerScratch->lnFinalInvStd.data(),
+			    static_cast<int>(T), static_cast<int>(dModel),
+			    gpuTransformerScratch->dH2.data(),
+			    gpuTransformerWeights->gLnFinalGamma.data());
+		}
+		else
+		{
+			gpu::layernorm_backward(
+			    gpuTransformerScratch->dH.data(), bwdFinalH,
+			    gpuTransformerWeights->lnFinalGamma.data(),
+			    gpuTransformerScratch->lnFinalMean.data(),
+			    gpuTransformerScratch->lnFinalInvStd.data(),
+			    static_cast<int>(T), static_cast<int>(dModel),
+			    gpuTransformerScratch->dH2.data(),
+			    gpuTransformerWeights->gLnFinalGamma.data(),
+			    gpuTransformerWeights->gLnFinalBeta.data());
+		}
+		// dH2 now has gradient w.r.t. hFinal; swap into dH for block backprop.
+		gpu::device_memcpy_d2d(gpuTransformerScratch->dH.data(),
+		                       gpuTransformerScratch->dH2.data(),
+		                       static_cast<size_t>(T) * dModel * sizeof(float));
+
+		// RoPE invFreq already uploaded to scratch before forward layer loop.
+		const unsigned int ropeHalfDim = fwdRopeHalfDim;
+
+		// Backprop through blocks (reverse order).
+		for (int li = static_cast<int>(nLayers) - 1; li >= 0; --li)
+		{
+			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
+			const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+
+			const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
+			    : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
+			const float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
+			const float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
+			const float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
+			const float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
+			const float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
+			const float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
+
+			// dH is gradient w.r.t. hAfterFF[li].
+			// Residual: hAfterFF = hAfterAttn + ffOut => dFFOut = dH, dHAfterAttn (residual) = dH.
+			// --- FFN backward ---
+			// ffOut = W2 * ff1Act + b2  =>  dFF1Act = dH * W2^T, gW2 += dH^T * ff1Act
+			gpu::sgemm_rowmajor(
+			    static_cast<int>(T), static_cast<int>(dFF), static_cast<int>(dModel),
+			    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
+			    gb.W2.data(), static_cast<int>(dFF),
+			    0.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF));
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(dModel), static_cast<int>(dFF), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
+			    ff1Act_l, static_cast<int>(dFF),
+			    1.0f, gb.gW2.data(), static_cast<int>(dFF));
+			// gB2 += sum_rows(dH)
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dH.data(),
+			    static_cast<int>(T), static_cast<int>(dModel),
+			    1.0f, gb.gB2.data());
+
+			// Activation backward.
+			if (ffnKind == 1) // SwiGLU
+			{
+				gpu::swiglu_backward(
+				    gpuTransformerScratch->dFF1Act.data(), ff1_l,
+				    static_cast<int>(T), static_cast<int>(dFF),
+				    gpuTransformerScratch->dFF1Cat.data());
+				// ff1 = W1 * x2 + b1 => dX2 = dFF1Cat * W1^T, gW1 += dFF1Cat^T * x2
+				gpu::sgemm_rowmajor(
+				    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(ff1Width),
+				    1.0f, gpuTransformerScratch->dFF1Cat.data(), static_cast<int>(ff1Width),
+				    gb.W1.data(), static_cast<int>(dModel),
+				    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
+				gpu::sgemm_rowmajor_atb(
+				    static_cast<int>(ff1Width), static_cast<int>(dModel), static_cast<int>(T),
+				    1.0f, gpuTransformerScratch->dFF1Cat.data(), static_cast<int>(ff1Width),
+				    x2_l, static_cast<int>(dModel),
+				    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+				gpu::reduce_rows_sum(
+				    gpuTransformerScratch->dFF1Cat.data(),
+				    static_cast<int>(T), static_cast<int>(ff1Width),
+				    1.0f, gb.gB1.data());
+			}
+			else
+			{
+				// GELU/ReLU backward
+				if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+				{
+					gpu::gelu_backward(
+					    gpuTransformerScratch->dFF1Act.data(), ff1_l,
+					    static_cast<int>(T * dFF),
+					    gpuTransformerScratch->dFF1Act.data());
+				}
+				else
+				{
+					gpu::relu_backward(
+					    gpuTransformerScratch->dFF1Act.data(), ff1_l,
+					    static_cast<int>(T * dFF),
+					    gpuTransformerScratch->dFF1Act.data());
+				}
+				// ff1 = W1 * x2 + b1 => dX2, gW1
+				gpu::sgemm_rowmajor(
+				    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+				    1.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF),
+				    gb.W1.data(), static_cast<int>(dModel),
+				    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
+				gpu::sgemm_rowmajor_atb(
+				    static_cast<int>(dFF), static_cast<int>(dModel), static_cast<int>(T),
+				    1.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF),
+				    x2_l, static_cast<int>(dModel),
+				    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+				gpu::reduce_rows_sum(
+				    gpuTransformerScratch->dFF1Act.data(),
+				    static_cast<int>(T), static_cast<int>(dFF),
+				    1.0f, gb.gB1.data());
+			}
+
+			// --- LN2 backward ---
+			const float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
+			const float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
+			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			{
+				gpu::rmsnorm_backward(
+				    gpuTransformerScratch->dX2.data(), hAfterAttn_l,
+				    gb.ln2Gamma.data(), ln2InvStd_l,
+				    static_cast<int>(T), static_cast<int>(dModel),
+				    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+				    gb.gLn2Gamma.data());
+			}
+			else
+			{
+				gpu::layernorm_backward(
+				    gpuTransformerScratch->dX2.data(), hAfterAttn_l,
+				    gb.ln2Gamma.data(), ln2Mean_l, ln2InvStd_l,
+				    static_cast<int>(T), static_cast<int>(dModel),
+				    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+				    gb.gLn2Gamma.data(), gb.gLn2Beta.data());
+			}
+
+			// Combine: dHAfterAttn = dH (residual) + dHAfterAttnFromLN
+			gpu::add_two(gpuTransformerScratch->dH2.data(),
+			    gpuTransformerScratch->dH.data(),
+			    gpuTransformerScratch->dHAfterAttnFromLN.data(),
+			    static_cast<int>(T * dModel));
+
+			// --- Wo backward ---
+			// attnOut = Wo * attnConcat + bo  =>  dAttnConcat, gWo
+			gpu::sgemm_rowmajor(
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+			    1.0f, gpuTransformerScratch->dH2.data(), static_cast<int>(dModel),
+			    gb.Wo.data(), static_cast<int>(dModel),
+			    0.0f, gpuTransformerScratch->dAttnConcat.data(), static_cast<int>(dModel));
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dH2.data(), static_cast<int>(dModel),
+			    attnConcat_l, static_cast<int>(dModel),
+			    1.0f, gb.gWo.data(), static_cast<int>(dModel));
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dH2.data(),
+			    static_cast<int>(T), static_cast<int>(dModel),
+			    1.0f, gb.gBo.data());
+
+			// --- Attention backward (batched GEMM) ---
+			float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
+			float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
+			float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
+
+			// Zero dK/dV (dQ is overwritten per-head, but dK/dV accumulate for GQA).
+			gpu::zero_buffers_batch(gpuTransformerScratch->d_dKdVZeroPtrs,
+			    gpuTransformerScratch->d_dKdVZeroSizes, 2);
+
+			{
+				const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
+				const unsigned int groupSize = nHeads / nKVHeads;
+				float* scores = gpuTransformerScratch->attnScores.data();
+				const float* attnP = gpuTransformerScratch->attnProbs.data();
+
+				for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
+				{
+					const unsigned int qStart = kvh * groupSize;
+					const float* P_group = attnP + static_cast<size_t>(qStart) * T * T;
+					float* dS = scores; // reuse attnScores as scratch for dS
+
+					// 1. dP[groupSize, T, T] = dO[groupSize, T, dHead] * V_kvh[T, dHead]^T
+					gpu::sgemm_batched_strided_abt(
+					    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
+					    1.0f,
+					    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
+					    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
+					    V_l + kvh * dHead,
+					    static_cast<int>(dModelKV), 0LL,
+					    0.0f,
+					    dS, static_cast<int>(T), static_cast<long long>(T) * T,
+					    static_cast<int>(groupSize));
+
+					// 2. softmax backward: dS = invSqrt * P * (dP - row_sum(dP * P))
+					gpu::softmax_backward_attn(P_group, dS,
+					    static_cast<int>(groupSize),
+					    static_cast<int>(T), invSqrt, dS);
+
+					// 3. dQ[groupSize, T, dHead] = dS[groupSize, T, T] * K_kvh[T, dHead]
+					gpu::sgemm_batched_strided(
+					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+					    1.0f,
+					    dS, static_cast<int>(T), static_cast<long long>(T) * T,
+					    K_l + kvh * dHead, static_cast<int>(dModelKV), 0LL,
+					    0.0f,
+					    gpuTransformerScratch->dQfull.data() + qStart * dHead,
+					    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
+					    static_cast<int>(groupSize));
+
+					// 4. dK_kvh[T, dHead] += sum over group of dS_h^T[T, T] * Q_h[T, dHead]
+					// Use batched ATB: dK += dS^T * Q, beta=1.0 to accumulate.
+					gpu::sgemm_batched_strided_atb(
+					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+					    1.0f,
+					    dS, static_cast<int>(T), static_cast<long long>(T) * T,
+					    Q_l + qStart * dHead, static_cast<int>(dModel),
+					    static_cast<long long>(T) * dModel,
+					    1.0f,
+					    gpuTransformerScratch->dKfull.data() + kvh * dHead,
+					    static_cast<int>(dModelKV), 0LL,
+					    static_cast<int>(groupSize));
+
+					// 5. dV_kvh[T, dHead] += sum over group of P_h^T[T, T] * dO_h[T, dHead]
+					gpu::sgemm_batched_strided_atb(
+					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
+					    1.0f,
+					    P_group, static_cast<int>(T), static_cast<long long>(T) * T,
+					    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
+					    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
+					    1.0f,
+					    gpuTransformerScratch->dVfull.data() + kvh * dHead,
+					    static_cast<int>(dModelKV), 0LL,
+					    static_cast<int>(groupSize));
+				}
+			}
+
+			// --- RoPE backward (inverse rotation) — fused Q+K ---
+			if (useRope && gpuTransformerScratch->gpuInvFreq.allocated())
+			{
+				gpu::rope_apply_qk(gpuTransformerScratch->dQfull.data(),
+				    gpuTransformerScratch->dKfull.data(),
+				    gpuTransformerScratch->gpuInvFreq.data(),
+				    static_cast<int>(T), static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+				    static_cast<int>(ropeHalfDim), true);
+			}
+
+			// --- Q/K/V projection backward ---
+			// dX1 = dQ*Wq^T + dK*Wk^T + dV*Wv^T
+			// Also accumulate gWq, gBq, gWk, gBk, gWv, gBv.
+
+			// Q: dXtmp = dQ * Wq^T
+			gpu::sgemm_rowmajor(
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
+			    1.0f, gpuTransformerScratch->dQfull.data(), static_cast<int>(dModel),
+			    gb.Wq.data(), static_cast<int>(dModel),
+			    0.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dQfull.data(), static_cast<int>(dModel),
+			    x1_l, static_cast<int>(dModel),
+			    1.0f, gb.gWq.data(), static_cast<int>(dModel));
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dQfull.data(),
+			    static_cast<int>(T), static_cast<int>(dModel),
+			    1.0f, gb.gBq.data());
+
+			// K: accumulate dK * Wk^T directly into dX1 (beta=1.0)
+			gpu::sgemm_rowmajor(
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
+			    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
+			    gb.Wk.data(), static_cast<int>(dModel),
+			    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
+			    x1_l, static_cast<int>(dModel),
+			    1.0f, gb.gWk.data(), static_cast<int>(dModel));
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dKfull.data(),
+			    static_cast<int>(T), static_cast<int>(dModelKV),
+			    1.0f, gb.gBk.data());
+
+			// V: accumulate dV * Wv^T directly into dX1 (beta=1.0)
+			gpu::sgemm_rowmajor(
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV),
+			    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
+			    gb.Wv.data(), static_cast<int>(dModel),
+			    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
+			    x1_l, static_cast<int>(dModel),
+			    1.0f, gb.gWv.data(), static_cast<int>(dModel));
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dVfull.data(),
+			    static_cast<int>(T), static_cast<int>(dModelKV),
+			    1.0f, gb.gBv.data());
+
+			// --- LN1 backward ---
+			const float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
+			const float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
+			if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			{
+				gpu::rmsnorm_backward(
+				    gpuTransformerScratch->dX1.data(), layerIn,
+				    gb.ln1Gamma.data(), ln1InvStd_l,
+				    static_cast<int>(T), static_cast<int>(dModel),
+				    gpuTransformerScratch->dHInFromLN.data(),
+				    gb.gLn1Gamma.data());
+			}
+			else
+			{
+				gpu::layernorm_backward(
+				    gpuTransformerScratch->dX1.data(), layerIn,
+				    gb.ln1Gamma.data(), ln1Mean_l, ln1InvStd_l,
+				    static_cast<int>(T), static_cast<int>(dModel),
+				    gpuTransformerScratch->dHInFromLN.data(),
+				    gb.gLn1Gamma.data(), gb.gLn1Beta.data());
+			}
+
+			// Combine into dH: dH = dH2 + dHInFromLN
+			gpu::add_two(gpuTransformerScratch->dH.data(),
+			    gpuTransformerScratch->dH2.data(),
+			    gpuTransformerScratch->dHInFromLN.data(),
+			    static_cast<int>(T * dModel));
+		} // layers backward
+
+		// Backprop through input embedding/projection.
+		if (tokenLM)
+		{
+			// gTokE[tokenId[t]] += dH[t] for each timestep.
+			gpu::embedding_scatter_add(
+			    gpuTransformerWeights->gTokE.data(),
+			    gpuTransformerScratch->tokenIds.data(),
+			    gpuTransformerScratch->dH.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel));
+		}
+		else
+		{
+			// gWIn += dH^T * x, gBIn += sum_rows(dH)
+			gpu::sgemm_rowmajor_atb(
+			    static_cast<int>(dModel), static_cast<int>(inputSize), static_cast<int>(T),
+			    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
+			    gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
+			    1.0f, gpuTransformerWeights->gWIn.data(), static_cast<int>(inputSize));
+			gpu::reduce_rows_sum(
+			    gpuTransformerScratch->dH.data(),
+			    static_cast<int>(T), static_cast<int>(dModel),
+			    1.0f, gpuTransformerWeights->gBIn.data());
+		}
+
+		++seqInBatch;
+
+		// === Optimizer step (when batch is complete) ===
+		if (seqInBatch >= seqBatchMax && timeStepsInBatch > 0u)
+		{
+			const float invBatch = 1.0f / static_cast<float>(timeStepsInBatch);
+			tensorTransformer.optimizerStep += 1ULL;
+
+			// Warmup + DDP LR scaling (matches CPU path).
+			const float warmupMult = trainingConfig.warmup.multiplier(static_cast<int>(tensorTransformer.optimizerStep));
+			const float ddpLRScale = (trainingConfig.ddp.enable && trainingConfig.ddp.linearLRScaling)
+			                       ? static_cast<float>(glades::ddp::worldSize()) : 1.0f;
+			const float gpuExtraLRMult = warmupMult * ddpLRScale;
+
+			// Step-level LR schedule (cosine decay within epoch).
+			if (trainingConfig.lrSchedule.type != glades::LearningRateScheduleConfig::NONE)
+			{
+				const unsigned int totalSteps = (seqCount + seqBatchMax - 1u) / seqBatchMax;
+				const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
+				const float progress = (totalSteps > 0u) ? static_cast<float>(stepInEpoch) / static_cast<float>(totalSteps) : 0.0f;
+				lrScheduleMultiplier = trainingConfig.lrSchedule.multiplierSmooth(progress);
+			}
+
+			// Global gradient norm clipping on GPU.
+			float gradScale = 1.0f;
+			const float clipNorm = trainingConfig.globalGradClipNorm;
+			if (clipNorm > 0.0f)
+			{
+				// Use lossSum buffer as temporary accumulator for gradient norm.
+				gpu::device_memset_bytes(gpuTransformerScratch->lossSum.data(), 0, sizeof(float));
+
+				// Accumulate sum(g^2) across all gradient buffers.
+				if (tokenLM)
+				{
+					gpu::sum_squared_accumulate(gpuTransformerWeights->gTokE.data(),
+					    static_cast<int>(gpuTransformerWeights->gTokE.size()),
+					    gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gpuTransformerWeights->gLmBias.data(),
+					    static_cast<int>(gpuTransformerWeights->gLmBias.size()),
+					    gpuTransformerScratch->lossSum.data());
+				}
+				else
+				{
+					gpu::sum_squared_accumulate(gpuTransformerWeights->gWIn.data(),
+					    static_cast<int>(gpuTransformerWeights->gWIn.size()),
+					    gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gpuTransformerWeights->gBIn.data(),
+					    static_cast<int>(gpuTransformerWeights->gBIn.size()),
+					    gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gpuTransformerWeights->gWOut.data(),
+					    static_cast<int>(gpuTransformerWeights->gWOut.size()),
+					    gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gpuTransformerWeights->gBOut.data(),
+					    static_cast<int>(gpuTransformerWeights->gBOut.size()),
+					    gpuTransformerScratch->lossSum.data());
+				}
+				for (unsigned int gli = 0; gli < nLayers; ++gli)
+				{
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[gli];
+					gpu::sum_squared_accumulate(gb.gWq.data(), static_cast<int>(gb.gWq.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gWk.data(), static_cast<int>(gb.gWk.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gWv.data(), static_cast<int>(gb.gWv.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gWo.data(), static_cast<int>(gb.gWo.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gW1.data(), static_cast<int>(gb.gW1.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gW2.data(), static_cast<int>(gb.gW2.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gBq.data(), static_cast<int>(gb.gBq.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gBk.data(), static_cast<int>(gb.gBk.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gBv.data(), static_cast<int>(gb.gBv.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gBo.data(), static_cast<int>(gb.gBo.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gB1.data(), static_cast<int>(gb.gB1.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gB2.data(), static_cast<int>(gb.gB2.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gLn1Gamma.data(), static_cast<int>(gb.gLn1Gamma.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gLn1Beta.data(), static_cast<int>(gb.gLn1Beta.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gLn2Gamma.data(), static_cast<int>(gb.gLn2Gamma.size()), gpuTransformerScratch->lossSum.data());
+					gpu::sum_squared_accumulate(gb.gLn2Beta.data(), static_cast<int>(gb.gLn2Beta.size()), gpuTransformerScratch->lossSum.data());
+				}
+				// Final LayerNorm gradients
+				gpu::sum_squared_accumulate(gpuTransformerWeights->gLnFinalGamma.data(),
+				    static_cast<int>(gpuTransformerWeights->gLnFinalGamma.size()),
+				    gpuTransformerScratch->lossSum.data());
+				gpu::sum_squared_accumulate(gpuTransformerWeights->gLnFinalBeta.data(),
+				    static_cast<int>(gpuTransformerWeights->gLnFinalBeta.size()),
+				    gpuTransformerScratch->lossSum.data());
+
+				float h_sumSq = 0.0f;
+				gpuTransformerScratch->lossSum.download(&h_sumSq, 1);
+				const float gradNorm = sqrtf(h_sumSq) * invBatch;
+				if (gradNorm > clipNorm)
+					gradScale = clipNorm / (gradNorm + 1e-12f);
+				lastGradNorm = gradNorm;
+				lastGradNormScale = gradScale;
+			}
+
+			const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
+
+			if (gpuUseAtlas)
+			{
+			// === GPU ATLAS optimizer ===
+			// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
+			// Biases and LN params use vanilla SGD (matching CPU ATLAS path).
+			const glades::ATLASConfig& ac = trainingConfig.atlas;
+
+			bool gpuAtlasError = false;
+
+			// Macro: vanilla SGD for 1D bias/LN param on GPU.
+			// W -= lr * invBatch * gradScale * g;  then zero g.
+#define GLADES_GPU_SGD_BIAS(param, grad, lr_) do { \
+	const int sgd_sz_ = static_cast<int>((param).size()); \
+	if (sgd_sz_ > 0) { \
+gpu::atlas_gpu_baseline_update((param).data(), (grad).data(), sgd_sz_, (lr_) * invBatch * gradScale); \
+gpu::atlas_gpu_guard((param).data(), sgd_sz_); \
+(grad).zero(); \
+	} \
+} while(0)
+
+			// Token embedding (layer index 0)
+			if (tokenLM)
+			{
+				const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_0 = skeleton->getWeightDecay1(0u);
+				const float wd2_0 = skeleton->getWeightDecay2(0u);
+
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasTokE,
+				    gpuTransformerWeights->tokE.data(), gpuTransformerWeights->gTokE.data(),
+				    vocabSize, dModel, invBatch, lr0, wd1_0, wd2_0, gradScale,
+				    ac, rngEngine, getLogger(), "tr.tokE"))
+				    gpuAtlasError = true;
+
+				GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lmBias, gpuTransformerWeights->gLmBias, lr0);
+			}
+
+			// Input projection (layer index 0, not used for token-LM models)
+			if (!tokenLM)
+			{
+				const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_0 = skeleton->getWeightDecay1(0u);
+				const float wd2_0 = skeleton->getWeightDecay2(0u);
+
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasWIn,
+				    gpuTransformerWeights->WIn.data(), gpuTransformerWeights->gWIn.data(),
+				    dModel, inputSize, invBatch, lr0, wd1_0, wd2_0, gradScale,
+				    ac, rngEngine, getLogger(), "tr.WIn"))
+				    gpuAtlasError = true;
+
+				GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bIn, gpuTransformerWeights->gBIn, lr0);
+			}
+
+			// Per-layer blocks (layer index 1..nLayers)
+			for (unsigned int bli = 0; bli < nLayers; ++bli)
+			{
+				const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_l = skeleton->getWeightDecay1(bli + 1u);
+				const float wd2_l = skeleton->getWeightDecay2(bli + 1u);
+				gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWq, gb.Wq.data(), gb.gWq.data(), dModel, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wq"))
+				    gpuAtlasError = true;
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWk, gb.Wk.data(), gb.gWk.data(), dModelKV, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wk"))
+				    gpuAtlasError = true;
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWv, gb.Wv.data(), gb.gWv.data(), dModelKV, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wv"))
+				    gpuAtlasError = true;
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWo, gb.Wo.data(), gb.gWo.data(), dModel, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wo"))
+				    gpuAtlasError = true;
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasW1, gb.W1.data(), gb.gW1.data(), ff1Width, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.W1"))
+				    gpuAtlasError = true;
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasW2, gb.W2.data(), gb.gW2.data(), dModel, dFF, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.W2"))
+				    gpuAtlasError = true;
+
+				// Biases and LN params: vanilla SGD (no subspace projection)
+				GLADES_GPU_SGD_BIAS(gb.bq, gb.gBq, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.bk, gb.gBk, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.bv, gb.gBv, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.bo, gb.gBo, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.b1, gb.gB1, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.b2, gb.gB2, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.ln1Gamma, gb.gLn1Gamma, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.ln1Beta, gb.gLn1Beta, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.ln2Gamma, gb.gLn2Gamma, lr_l);
+				GLADES_GPU_SGD_BIAS(gb.ln2Beta, gb.gLn2Beta, lr_l);
+			}
+
+			// Final LayerNorm (use block 0 LR; no weight decay)
+			{
+				const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
+				GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lnFinalGamma, gpuTransformerWeights->gLnFinalGamma, lrLN);
+				GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lnFinalBeta, gpuTransformerWeights->gLnFinalBeta, lrLN);
+			}
+
+			// Output projection (layer index nLayers, unused in tied-head mode)
+			if (!tokenLM)
+			{
+				const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_o = skeleton->getWeightDecay1(nLayers);
+				const float wd2_o = skeleton->getWeightDecay2(nLayers);
+
+				if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasWOut,
+				    gpuTransformerWeights->WOut.data(), gpuTransformerWeights->gWOut.data(),
+				    outSize, dModel, invBatch, lrO, wd1_o, wd2_o, gradScale,
+				    ac, rngEngine, getLogger(), "tr.WOut"))
+				    gpuAtlasError = true;
+
+				GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bOut, gpuTransformerWeights->gBOut, lrO);
+			}
+
+			// --- GPU ATLAS periodic diagnostics ---
+			if (!gpuAtlasError && logger && ac.tSub > 0u)
+			{
+				const unsigned long long tSubULL = static_cast<unsigned long long>(ac.tSub);
+
+				// Helper lambda-like macro to log a single weight state
+#define GLADES_GPU_ATLAS_DIAG(st, tag_str) do { \
+	if ((st).initialized && ((st).step % tSubULL) == 0ULL) { \
+gpu::AtlasGpuDiag ad_ = gpu::atlas_gpu_get_diag((st)); \
+if (ad_.valid) { \
+	std::ostringstream oss_; \
+	oss_ << "event=gpu_atlas_step tag=" << (tag_str); \
+	oss_ << " step=" << ad_.step; \
+	oss_ << " m=" << (st).m << " n=" << (st).n << " rank=" << (st).r; \
+	oss_ << " mu=" << ad_.mu; \
+	oss_ << " sigma2=" << ad_.sigma2; \
+	oss_ << " baseline_rate=" << ad_.baselineRate; \
+	oss_ << " gz_norm=" << ad_.gzNorm; \
+	oss_ << " update_norm=" << ad_.updateNorm; \
+	oss_ << " fisher_min=" << ad_.fisherMin; \
+	oss_ << " fisher_max=" << ad_.fisherMax; \
+	oss_ << " fisher_mean=" << ad_.fisherMean; \
+	logger->info("ATLAS", shmea::GString(oss_.str().c_str())); \
+} \
+	} \
+} while(0)
+
+				if (tokenLM)
+					GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasTokE, "tr.tokE");
+				if (!tokenLM)
+					GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasWIn, "tr.WIn");
+
+				for (unsigned int bli = 0; bli < nLayers; ++bli)
+				{
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+					GLADES_GPU_ATLAS_DIAG(gb.atlasWq, "tr.Wq");
+					GLADES_GPU_ATLAS_DIAG(gb.atlasWk, "tr.Wk");
+					GLADES_GPU_ATLAS_DIAG(gb.atlasWv, "tr.Wv");
+					GLADES_GPU_ATLAS_DIAG(gb.atlasWo, "tr.Wo");
+					GLADES_GPU_ATLAS_DIAG(gb.atlasW1, "tr.W1");
+					GLADES_GPU_ATLAS_DIAG(gb.atlasW2, "tr.W2");
+				}
+
+				if (!tokenLM)
+					GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasWOut, "tr.WOut");
+
+#undef GLADES_GPU_ATLAS_DIAG
+			}
+
+			if (gpuAtlasError)
+			{
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+				    "SGDHelper_TRANSFORMER: GPU ATLAS update failed");
+				running = false;
+			}
+#undef GLADES_GPU_SGD_BIAS
+			}
+			else
+			{
+			// === Batched Adam optimizer ===
+			const float beta1 = trainingConfig.optimizer.adamBeta1;
+			const float beta2 = trainingConfig.optimizer.adamBeta2;
+			const float adamEps = trainingConfig.optimizer.adamEps;
+			const int stepInt = static_cast<int>(tensorTransformer.optimizerStep);
+
+			// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
+			if (!gpuTransformerWeights->adamPtrsUploaded)
+			{
+				float* hParams[6 + 16 * 256];
+				float* hGrads[6 + 16 * 256];
+				float* hMs[6 + 16 * 256];
+				float* hVs[6 + 16 * 256];
+				int hSizes[6 + 16 * 256];
+				int gc = 0;
+				int maxSz = 0;
+
+#define GLADES_ADD_ADAM_GROUP(p, g, m, v, sz) do { \
+	if ((sz) > 0) { \
+hParams[gc] = (p); hGrads[gc] = (g); \
+hMs[gc] = (m); hVs[gc] = (v); \
+hSizes[gc] = (sz); \
+if ((sz) > maxSz) maxSz = (sz); \
+++gc; \
+	} \
+} while(0)
+
+				if (tokenLM)
+				{
+					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->tokE.data(),
+					    gpuTransformerWeights->gTokE.data(),
+					    gpuTransformerWeights->vTokE.data(),
+					    gpuTransformerWeights->v2TokE.data(),
+					    static_cast<int>(static_cast<size_t>(vocabSize) * dModel));
+					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lmBias.data(),
+					    gpuTransformerWeights->gLmBias.data(),
+					    gpuTransformerWeights->mLmBias.data(),
+					    gpuTransformerWeights->v2LmBias.data(),
+					    static_cast<int>(vocabSize));
+				}
+				{
+					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WIn.data(),
+					    gpuTransformerWeights->gWIn.data(),
+					    gpuTransformerWeights->vWIn.data(),
+					    gpuTransformerWeights->v2WIn.data(),
+					    static_cast<int>(gpuTransformerWeights->WIn.size()));
+					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bIn.data(),
+					    gpuTransformerWeights->gBIn.data(),
+					    gpuTransformerWeights->mBIn.data(),
+					    gpuTransformerWeights->v2BIn.data(),
+					    static_cast<int>(gpuTransformerWeights->bIn.size()));
+				}
+				for (unsigned int bli = 0; bli < nLayers; ++bli)
+				{
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+					GLADES_ADD_ADAM_GROUP(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()));
+					GLADES_ADD_ADAM_GROUP(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()));
+					GLADES_ADD_ADAM_GROUP(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()));
+					GLADES_ADD_ADAM_GROUP(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()));
+					GLADES_ADD_ADAM_GROUP(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()));
+					GLADES_ADD_ADAM_GROUP(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()));
+					GLADES_ADD_ADAM_GROUP(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(), static_cast<int>(gb.bq.size()));
+					GLADES_ADD_ADAM_GROUP(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(), static_cast<int>(gb.bk.size()));
+					GLADES_ADD_ADAM_GROUP(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(), static_cast<int>(gb.bv.size()));
+					GLADES_ADD_ADAM_GROUP(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(), static_cast<int>(gb.bo.size()));
+					GLADES_ADD_ADAM_GROUP(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(), static_cast<int>(gb.b1.size()));
+					GLADES_ADD_ADAM_GROUP(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(), static_cast<int>(gb.b2.size()));
+					GLADES_ADD_ADAM_GROUP(gb.ln1Gamma.data(), gb.gLn1Gamma.data(), gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(), static_cast<int>(gb.ln1Gamma.size()));
+					GLADES_ADD_ADAM_GROUP(gb.ln1Beta.data(), gb.gLn1Beta.data(), gb.mLn1Beta.data(), gb.v2Ln1Beta.data(), static_cast<int>(gb.ln1Beta.size()));
+					GLADES_ADD_ADAM_GROUP(gb.ln2Gamma.data(), gb.gLn2Gamma.data(), gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(), static_cast<int>(gb.ln2Gamma.size()));
+					GLADES_ADD_ADAM_GROUP(gb.ln2Beta.data(), gb.gLn2Beta.data(), gb.mLn2Beta.data(), gb.v2Ln2Beta.data(), static_cast<int>(gb.ln2Beta.size()));
+				}
+				// Final LayerNorm
+				GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalGamma.data(),
+				    gpuTransformerWeights->gLnFinalGamma.data(),
+				    gpuTransformerWeights->mLnFinalGamma.data(),
+				    gpuTransformerWeights->v2LnFinalGamma.data(),
+				    static_cast<int>(gpuTransformerWeights->lnFinalGamma.size()));
+				GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalBeta.data(),
+				    gpuTransformerWeights->gLnFinalBeta.data(),
+				    gpuTransformerWeights->mLnFinalBeta.data(),
+				    gpuTransformerWeights->v2LnFinalBeta.data(),
+				    static_cast<int>(gpuTransformerWeights->lnFinalBeta.size()));
+				if (!tokenLM)
+				{
+					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WOut.data(),
+					    gpuTransformerWeights->gWOut.data(),
+					    gpuTransformerWeights->vWOut.data(),
+					    gpuTransformerWeights->v2WOut.data(),
+					    static_cast<int>(gpuTransformerWeights->WOut.size()));
+					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bOut.data(),
+					    gpuTransformerWeights->gBOut.data(),
+					    gpuTransformerWeights->mBOut.data(),
+					    gpuTransformerWeights->v2BOut.data(),
+					    static_cast<int>(gpuTransformerWeights->bOut.size()));
+				}
+#undef GLADES_ADD_ADAM_GROUP
+
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamParams, hParams, gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamGrads, hGrads, gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamM, hMs, gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamV, hVs, gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamSizes, hSizes, gc * sizeof(int));
+				gpuTransformerWeights->adamGroupCount = gc;
+				gpuTransformerWeights->adamMaxSize = maxSz;
+				gpuTransformerWeights->adamPtrsUploaded = true;
+			}
+
+			// Fill lr/wd arrays each step and launch single batched kernel.
+			{
+				const int gc = gpuTransformerWeights->adamGroupCount;
+				float hLrs[6 + 16 * 256];
+				float hWds[6 + 16 * 256];
+				int gi = 0;
+
+				if (tokenLM)
+				{
+					const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+					const float wd0 = skeleton->getWeightDecay2(0u);
+					hLrs[gi] = lr0; hWds[gi] = wd0; ++gi;
+					hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi;
+				}
+				{
+					const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+					const float wd0 = skeleton->getWeightDecay2(0u);
+					if (gpuTransformerWeights->WIn.size() > 0)
+					{ hLrs[gi] = lr0; hWds[gi] = wd0; ++gi; }
+					if (gpuTransformerWeights->bIn.size() > 0)
+					{ hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi; }
+				}
+				for (unsigned int bli = 0; bli < nLayers; ++bli)
+				{
+					const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+					const float wd_l = skeleton->getWeightDecay2(bli + 1u);
+					// 6 weight groups (with wd)
+					for (int w = 0; w < 6; ++w)
+					{ hLrs[gi] = lr_l; hWds[gi] = wd_l; ++gi; }
+					// 10 bias/LN groups (no wd)
+					for (int b = 0; b < 10; ++b)
+					{ hLrs[gi] = lr_l; hWds[gi] = 0.0f; ++gi; }
+				}
+				// Final LayerNorm (use block 0 LR; no weight decay)
+				{
+					const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
+					hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalGamma
+					hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalBeta
+				}
+				if (!tokenLM)
+				{
+					const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+					const float wdO = skeleton->getWeightDecay2(nLayers);
+					if (gpuTransformerWeights->WOut.size() > 0)
+					{ hLrs[gi] = lrO; hWds[gi] = wdO; ++gi; }
+					if (gpuTransformerWeights->bOut.size() > 0)
+					{ hLrs[gi] = lrO; hWds[gi] = 0.0f; ++gi; }
+				}
+
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamLr, hLrs, gc * sizeof(float));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamWd, hWds, gc * sizeof(float));
+
+				gpu::adam_update_batch(
+				    gpuTransformerWeights->d_adamParams,
+				    gpuTransformerWeights->d_adamGrads,
+				    gpuTransformerWeights->d_adamM,
+				    gpuTransformerWeights->d_adamV,
+				    gpuTransformerWeights->d_adamLr,
+				    gpuTransformerWeights->d_adamWd,
+				    gpuTransformerWeights->d_adamSizes,
+				    gpuTransformerWeights->adamMaxSize,
+				    beta1, beta2, adamEps,
+				    invBatch * gradScale, stepInt, gc);
+			}
+			} // end Adam branch
+
+			gpu::synchronize();
+			seqInBatch = 0u;
+			timeStepsInBatch = 0u;
+		}
+	}
+
+	// After GPU training loop: download updated weights back to CPU.
+	TensorTransformerState& ttMut = tensorTransformer;
+	gpu::downloadTransformerWeights(*gpuTransformerWeights,
+	                                ttMut.tokE.empty() ? NULL : &ttMut.tokE[0], ttMut.tokE.size(),
+	                                ttMut.WIn.empty() ? NULL : &ttMut.WIn[0], ttMut.WIn.size(),
+	                                ttMut.bIn.empty() ? NULL : &ttMut.bIn[0], ttMut.bIn.size(),
+	                                ttMut.WOut.empty() ? NULL : &ttMut.WOut[0], ttMut.WOut.size(),
+	                                ttMut.bOut.empty() ? NULL : &ttMut.bOut[0], ttMut.bOut.size(),
+	                                ttMut.lmBias.empty() ? NULL : &ttMut.lmBias[0], ttMut.lmBias.size(),
+	                                ttMut.lnFinalGamma.empty() ? NULL : &ttMut.lnFinalGamma[0], ttMut.lnFinalGamma.size(),
+	                                ttMut.lnFinalBeta.empty() ? NULL : &ttMut.lnFinalBeta[0], ttMut.lnFinalBeta.size());
+
+	// Download per-block weights.
+	for (unsigned int l = 0; l < nLayers; ++l)
+	{
+		TensorTransformerState::Block& cb = ttMut.blocks[l];
+		const gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[l];
+		if (gb.Wq.allocated()) gb.Wq.download(&cb.Wq[0], cb.Wq.size());
+		if (gb.Wk.allocated()) gb.Wk.download(&cb.Wk[0], cb.Wk.size());
+		if (gb.Wv.allocated()) gb.Wv.download(&cb.Wv[0], cb.Wv.size());
+		if (gb.Wo.allocated()) gb.Wo.download(&cb.Wo[0], cb.Wo.size());
+		if (gb.W1.allocated()) gb.W1.download(&cb.W1[0], cb.W1.size());
+		if (gb.W2.allocated()) gb.W2.download(&cb.W2[0], cb.W2.size());
+		if (gb.bq.allocated()) gb.bq.download(&cb.bq[0], cb.bq.size());
+		if (gb.bk.allocated()) gb.bk.download(&cb.bk[0], cb.bk.size());
+		if (gb.bv.allocated()) gb.bv.download(&cb.bv[0], cb.bv.size());
+		if (gb.bo.allocated()) gb.bo.download(&cb.bo[0], cb.bo.size());
+		if (gb.b1.allocated()) gb.b1.download(&cb.b1[0], cb.b1.size());
+		if (gb.b2.allocated()) gb.b2.download(&cb.b2[0], cb.b2.size());
+		if (gb.ln1Gamma.allocated()) gb.ln1Gamma.download(&cb.ln1Gamma[0], cb.ln1Gamma.size());
+		if (gb.ln1Beta.allocated()) gb.ln1Beta.download(&cb.ln1Beta[0], cb.ln1Beta.size());
+		if (gb.ln2Gamma.allocated()) gb.ln2Gamma.download(&cb.ln2Gamma[0], cb.ln2Gamma.size());
+		if (gb.ln2Beta.allocated()) gb.ln2Beta.download(&cb.ln2Beta[0], cb.ln2Beta.size());
+	}
+
+	// Finalize epoch-level loss before returning.
+	// tokenLmNllSum / tokenLmTokenCount are locals; copy to the member
+	// that the Trainer reads (overallTotalError).
+	if (tokenLM)
+	{
+		if (tokenLmTokenCount > 0ULL)
+			overallTotalError = static_cast<float>(tokenLmNllSum / static_cast<double>(tokenLmTokenCount));
+		else
+			overallTotalError = 0.0f;
+	}
+
+}
+#endif // GLADES_HAVE_CUDA

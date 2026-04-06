@@ -31,6 +31,7 @@
 #include "bayes.h"
 #include "bayes-optimizer.h"
 #include "transformer_ops.h"
+#include "transformer_types.h"
 #include "aligned_allocator.h"
 #include <algorithm>
 #include <cmath>
@@ -984,6 +985,10 @@ private:
 		std::vector<float, glades::AlignedAllocator<float, 64> > dHInFromLN;  // [T, dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > dInput;      // [T, inputSize]
 
+		// Attention backward chunked dK/dV scratch (reused across layers).
+		// Sized lazily on first use based on nChunksPerHead; persists across layers/sequences.
+		std::vector<float, glades::AlignedAllocator<float, 64> > dKVscratch;
+
 		TransformerScratch()
 		    : T(0u),
 		      inputSize(0u),
@@ -1349,6 +1354,50 @@ private:
 	void SGDHelper_LSTM(unsigned int inputRowCounter, int runType);
 	void SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int runType);
 	void SGDHelper_CNN(unsigned int inputRowCounter, int runType);
+
+	// Transformer SGD sub-functions (split from SGDHelper_TRANSFORMER for readability).
+	// The config struct bundles per-epoch derived values so the extracted methods
+	// share state without passing dozens of individual parameters.
+	struct TransformerEpochCfg
+	{
+		unsigned int inputSize, outSize, dModel, dFF, nHeads, nKVHeads, nLayers;
+		unsigned int vocabSize, dHead, dModelKV, ff1Width;
+		int padTokenId;
+		bool causal, tokenLM, tieEmb, isTrain;
+		float gradClip, lnEps, ropeTheta;
+		int costFx, posEnc, normType, ffnKind, ffnAct, ropeDimOverride;
+		int tokenLmNegK;
+		bool ddpEnabled;
+		bool useLowpWeights;
+		int lowpDType;
+		bool mpEnable, mpUseLossScaling, mpDynamicLossScaling;
+		unsigned int seqBatchMax;
+		glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind;
+		bool tokenLmAllowHuge;
+		float lrScheduleMultiplier;
+	};
+#ifdef GLADES_HAVE_CUDA
+	void transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
+	                              int epochIdx, int64_t epochStartMs,
+	                              unsigned long long& tokensProcessed,
+	                              unsigned long long& targetsProcessed,
+	                              double& tokenLmNllSum,
+	                              unsigned long long& tokenLmTokenCount,
+	                              unsigned long long& clsCorrect,
+	                              unsigned long long& clsTotal,
+	                              shmea::GLogger* logger);
+#endif
+	void transformerCpuForwardPass(const TransformerEpochCfg& cfg, unsigned int T, unsigned int s,
+	                               const std::vector<int>& tokenIds,
+	                               const std::vector<int>& targetIds,
+	                               const std::vector<unsigned char>& keyAllowed,
+	                               unsigned int scratchOutSize, unsigned int sampleCount);
+	void transformerCpuBackwardPass(const TransformerEpochCfg& cfg, unsigned int T, unsigned int s,
+	                                const std::vector<int>& tokenIds,
+	                                const std::vector<int>& targetIds,
+	                                unsigned int scratchOutSize,
+	                                unsigned int& seqInBatch,
+	                                unsigned int& timeStepsInBatch);
 
 	// Owned resources (used only in some construction paths)
 	shmea::GPointer<NNInfo> ownedSkeleton;
@@ -1985,95 +2034,10 @@ public:
 	// - This API allocates and uses a per-call KV session (no internal KV state is retained).
 	// - It is still not safe to call concurrently with training/mutation on the same NNetwork instance.
 	// - This API requires token LM mode (enableTokenEmbedding==true) and decoder net type.
-	struct TransformerGenerateConfig
-	{
-		// Maximum number of new tokens to generate (excluding the prompt).
-		unsigned int maxNewTokens;
-		// Total KV cache length cap. If 0, defaults to promptLen + maxNewTokens.
-		// If provided, it must be >= promptLen + maxNewTokens.
-		unsigned int maxSeqLen;
-
-		// Sampling controls:
-		// - temperature <= 0 => greedy (argmax)
-		// - topK == 0 => disabled
-		// - topP <= 0 or > 1 => disabled
-		float temperature;
-		unsigned int topK;
-		float topP;
-		// Nucleus (top-p) implementation policy:
-		//
-		// When topP < 1 and topK == 0, a "pure" nucleus implementation would need to:
-		// - sort the full vocabulary by logit each step (O(V log V)), then
-		// - take the smallest prefix whose cumulative probability >= topP.
-		//
-		// That can be prohibitively expensive for large vocabularies on CPU.
-		//
-		// Glades defaults to an explicit approximation:
-		// - if topP < 1 and topK == 0, we first cap candidates to the top-K tokens where
-		//   K = min(vocabSize, topPTopKCap), then apply top-p within those candidates.
-		//
-		// Set topPTopKCap to 0 to disable this approximation (full-vocab nucleus).
-		unsigned int topPTopKCap;
-
-		// Stop controls:
-		// - eosTokenId < 0 => disabled
-		// - if stopOnEos==true and eosTokenId is produced, generation stops after emitting it
-		int eosTokenId;
-		bool stopOnEos;
-
-		// Output formatting:
-		// - includePromptInOutput==true => out.tokens includes prompt first, then generated tokens
-		// - otherwise out.tokens contains only generated tokens
-		bool includePromptInOutput;
-
-		// RNG control:
-		// - rngSeedOverride!=0 => seed the per-call RNG with this value
-		// - rngSeedOverride==0 => derive a deterministic seed from the network seed + prompt tokens
-		//
-		// IMPORTANT:
-		// - Generation does not mutate or depend on the shared `NNetwork::rngEngine`.
-		// - If you want stochastic variation across calls, you must supply different rngSeedOverride values.
-		uint64_t rngSeedOverride;
-
-		TransformerGenerateConfig()
-		    : maxNewTokens(0u),
-		      maxSeqLen(0u),
-		      temperature(1.0f),
-		      topK(0u),
-		      topP(1.0f),
-		      topPTopKCap(256u),
-		      eosTokenId(-1),
-		      stopOnEos(true),
-		      includePromptInOutput(false),
-		      rngSeedOverride(0ULL)
-		{
-		}
-	};
-
-	struct TransformerGenerateResult
-	{
-		// Tokens returned (see includePromptInOutput).
-		std::vector<unsigned int> tokens;
-		// Why generation ended.
-		bool stoppedOnEos;
-		// Stopped because a non-EOS stop token was encountered (TransformerServeRequest::stopTokenIds).
-		// This is distinct from stoppedOnEos so serving telemetry can distinguish these cases.
-		bool stoppedByStopToken;
-		bool stoppedByCallback;
-		bool stoppedByLimit;
-		// Last token emitted (undefined if no tokens were emitted).
-		unsigned int lastToken;
-
-		TransformerGenerateResult()
-		    : tokens(),
-		      stoppedOnEos(false),
-		      stoppedByStopToken(false),
-		      stoppedByCallback(false),
-		      stoppedByLimit(false),
-		      lastToken(0u)
-		{
-		}
-	};
+	// Backward-compatible aliases (these types have moved to glades:: namespace scope;
+	// see transformer_types.h for definitions).
+	typedef glades::TransformerGenerateConfig TransformerGenerateConfig;
+	typedef glades::TransformerGenerateResult TransformerGenerateResult;
 
 	class ITransformerGenerateCallbacks
 	{
@@ -2105,20 +2069,8 @@ public:
 	// Implementation notes:
 	// - Uses the internal batched KV cache with selective appends (no fake padding positions).
 	// - Still scalar (loops requests), but allocation-free per decode step.
-	struct TransformerServeRequest
-	{
-		std::vector<unsigned int> promptTokens;
-		TransformerGenerateConfig cfg;
-		// Optional additional stop tokens (besides eosTokenId).
-		// If any token in stopTokenIds is generated, generation stops after emitting it.
-		std::vector<unsigned int> stopTokenIds;
-	};
-
-	struct TransformerServeBatchResult
-	{
-		// One result per request (aligned to input order).
-		std::vector<TransformerGenerateResult> results;
-	};
+	typedef glades::TransformerServeRequest TransformerServeRequest;
+	typedef glades::TransformerServeBatchResult TransformerServeBatchResult;
 
 	class ITransformerServeCallbacks
 	{

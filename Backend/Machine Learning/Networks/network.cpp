@@ -40,7 +40,10 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "logfmt_utils.h"
+
 using namespace glades;
+using namespace glades::logfmt;
 
 // Force-link optional DataObjects translation units that otherwise may be discarded when building
 // libglades.so from static sub-libraries. These are public APIs used by production/CLI consumers.
@@ -464,46 +467,6 @@ static const char* output_type_name(int outType)
 	default: return "unknown";
 	}
 }
-
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
-{
-	oss << ' ' << k << '=';
-	bool needQuote = false;
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
-		{
-			needQuote = true;
-			break;
-		}
-	}
-	if (!needQuote)
-	{
-		oss << v;
-		return;
-	}
-	oss << '"';
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == '\\' || c == '"')
-			oss << '\\' << c;
-		else if (c == '\n')
-			oss << "\\n";
-		else if (c == '\r')
-			oss << "\\r";
-		else if (c == '\t')
-			oss << "\\t";
-		else
-			oss << c;
-	}
-	oss << '"';
-}
-
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, int v) { oss << ' ' << k << '=' << v; }
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned long long v) { oss << ' ' << k << '=' << v; }
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { oss << ' ' << k << '=' << v; }
 
 class LoggerCallbacks : public glades::ITrainingCallbacks
 {

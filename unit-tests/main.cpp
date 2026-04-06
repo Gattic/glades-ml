@@ -40,6 +40,7 @@
 #include "Backend/Machine Learning/atlas-test.h"
 #include "Backend/Machine Learning/atlas-bench.h"
 #include "Backend/Machine Learning/sfcka-test.h"
+#include "Backend/Machine Learning/transformer-gradient-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -143,6 +144,8 @@ int main(int argc, char* argv[])
 		KellyUnitTest();
 	    else if (strcmp(argv[1], "qp") == 0)
 		QPSolverUnitTest();
+	    else if (strcmp(argv[1], "transformer-grad") == 0)
+		TransformerGradientUnitTest();
 	    else if (strcmp(argv[1], "sfcka") == 0)
 	    {
 		FFTUnitTest();
@@ -190,6 +193,7 @@ int main(int argc, char* argv[])
 		    ParallelUnitTest();
 		    DDPUnitTest();
 		    TransformerImprovementsUnitTest();
+		    TransformerGradientUnitTest();
 		    NNCNNUnitTest();
         }
 	    else

@@ -8,6 +8,8 @@
 #include <pthread.h>
 #include <sstream>
 
+#include "logfmt_utils.h"
+
 namespace glades {
 
 // ===== Internal synchronization (recursive mutex) =====
@@ -64,53 +66,7 @@ void TransformerServingLayer::Mutex::unlock() const
 	(void)pthread_mutex_unlock(&impl_->m);
 }
 
-namespace {
-
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
-{
-	oss << ' ' << k << '=';
-	bool needQuote = false;
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
-		{
-			needQuote = true;
-			break;
-		}
-	}
-	if (!needQuote)
-	{
-		oss << v;
-		return;
-	}
-	oss << '"';
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == '\\' || c == '"')
-			oss << '\\' << c;
-		else if (c == '\n')
-			oss << "\\n";
-		else if (c == '\r')
-			oss << "\\r";
-		else if (c == '\t')
-			oss << "\\t";
-		else
-			oss << c;
-	}
-	oss << '"';
-}
-
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, uint64_t v)
-{
-	oss << ' ' << k << '=' << static_cast<unsigned long long>(v);
-}
-
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned int v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, bool v) { oss << ' ' << k << '=' << (v ? 1 : 0); }
-
-} // namespace
+using namespace glades::logfmt;
 
 TransformerServingLayer::TransformerServingLayer()
     : net_(NULL),
