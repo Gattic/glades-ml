@@ -26,6 +26,7 @@ bool blasInit()
 		fprintf(stderr, "[glades-cuda] cublasCreate failed: %d\n", static_cast<int>(st));
 		return false;
 	}
+	cublasSetStream(g_handle, computeStream());
 	// Enable TF32 tensor core math on Ampere+ (SM 8.0+) for ~2x SGEMM speedup.
 	if (computeCapabilityMajor() >= 8)
 	{

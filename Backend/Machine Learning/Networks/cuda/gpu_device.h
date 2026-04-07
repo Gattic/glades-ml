@@ -7,6 +7,11 @@
 
 #ifdef GLADES_HAVE_CUDA
 
+struct CUstream_st;
+struct CUevent_st;
+typedef CUstream_st* cudaStream_t;
+typedef CUevent_st* cudaEvent_t;
+
 namespace glades {
 namespace gpu {
 
@@ -28,6 +33,22 @@ int computeCapabilityMinor();
 size_t totalGlobalMemBytes();
 int multiprocessorCount();
 int maxThreadsPerBlock();
+
+// Persistent non-blocking streams used by the training path.
+cudaStream_t computeStream();
+cudaStream_t transferStream();
+
+// Synchronization helpers for specific streams.
+bool synchronizeStream(cudaStream_t stream);
+bool synchronizeComputeStream();
+bool synchronizeTransferStream();
+
+// Event helpers for explicit cross-stream dependencies.
+cudaEvent_t createEvent(bool enableTiming = false);
+void destroyEvent(cudaEvent_t eventHandle);
+bool recordEvent(cudaEvent_t eventHandle, cudaStream_t stream);
+bool streamWaitEvent(cudaStream_t stream, cudaEvent_t eventHandle);
+bool synchronizeEvent(cudaEvent_t eventHandle);
 
 // Synchronize the current device (blocks until all kernels complete).
 void synchronize();
@@ -56,6 +77,16 @@ inline int computeCapabilityMinor() { return 0; }
 inline size_t totalGlobalMemBytes() { return 0; }
 inline int multiprocessorCount() { return 0; }
 inline int maxThreadsPerBlock() { return 0; }
+inline cudaStream_t computeStream() { return 0; }
+inline cudaStream_t transferStream() { return 0; }
+inline bool synchronizeStream(cudaStream_t) { return true; }
+inline bool synchronizeComputeStream() { return true; }
+inline bool synchronizeTransferStream() { return true; }
+inline cudaEvent_t createEvent(bool = false) { return 0; }
+inline void destroyEvent(cudaEvent_t) {}
+inline bool recordEvent(cudaEvent_t, cudaStream_t) { return true; }
+inline bool streamWaitEvent(cudaStream_t, cudaEvent_t) { return true; }
+inline bool synchronizeEvent(cudaEvent_t) { return true; }
 inline void synchronize() {}
 inline bool synchronizeCheck(const char*) { return true; }
 inline void resetDevice() {}

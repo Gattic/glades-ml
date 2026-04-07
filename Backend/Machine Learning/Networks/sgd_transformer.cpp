@@ -3019,6 +3019,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
 	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+	cudaEvent_t gpuTransferReadyEvent = gpu::createEvent(false);
+	cudaEvent_t gpuComputeReadyEvent = gpu::createEvent(false);
 
 	for (unsigned int s = 0; s < seqCount; ++s)
 	{
@@ -3054,7 +3056,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				di->getTrainSequenceTokenId(s, t, tid);
 				tokenIdsInt[t] = tid;
 			}
-			gpuTransformerScratch->tokenIds.upload(&tokenIdsInt[0], T);
+			gpuTransformerScratch->tokenIds.uploadAsync(&tokenIdsInt[0], T);
+			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
 			// Forward: embedding gather
 			gpu::embedding_gather(
@@ -3077,7 +3081,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				for (unsigned int f = 0; f < inputSize; ++f)
 					xHost[off + f] = (row && f < rowSize) ? row[f] : 0.0f;
 			}
-			gpuTransformerScratch->x.upload(&xHost[0], xHost.size());
+			gpuTransformerScratch->x.uploadAsync(&xHost[0], xHost.size());
+			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
 			// Input projection: h = x * WIn^T + bIn
 			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
@@ -3101,7 +3107,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			std::vector<float> invFreqF(fwdRopeHalfDim);
 			for (unsigned int i = 0; i < fwdRopeHalfDim && i < transformerPosEncCache.ropeInvFreq.size(); ++i)
 				invFreqF[i] = static_cast<float>(transformerPosEncCache.ropeInvFreq[i]);
-			gpuTransformerScratch->gpuInvFreq.upload(&invFreqF[0], invFreqF.size());
+			gpuTransformerScratch->gpuInvFreq.uploadAsync(&invFreqF[0], invFreqF.size());
+			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 		}
 
 		// Per-layer transformer blocks.
@@ -3158,6 +3165,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			// RoPE (if enabled) — fused Q+K in single kernel launch
 			if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
 			{
+				if (li == 0u)
+					gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 				const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
 				                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
 				// Use persistent gpuInvFreq from scratch (uploaded before layer loop).
@@ -3297,7 +3306,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				gpuTargetIds[t] = yid;
 			}
 			// Upload targets to persistent scratch buffer.
-			gpuTransformerScratch->gpuTargetsT.upload(&gpuTargetIds[0], T);
+			gpuTransformerScratch->gpuTargetsT.uploadAsync(&gpuTargetIds[0], T);
+			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
 			// GPU loss: cross-entropy NLL.
 			gpu::cross_entropy_nll_loss(
@@ -3325,7 +3336,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->validCount.data(),
 			    gpuTransformerScratch->lossPack.data());
 			int lossPacked[4];
-			gpuTransformerScratch->lossPack.download(lossPacked, 4);
+			gpu::recordEvent(gpuComputeReadyEvent, gpu::computeStream());
+			gpu::streamWaitEvent(gpu::transferStream(), gpuComputeReadyEvent);
+			gpuTransformerScratch->lossPack.downloadAsync(lossPacked, 4);
+			gpu::synchronizeTransferStream();
 			float lossVal;
 			memcpy(&lossVal, &lossPacked[0], sizeof(float));
 			int lossCountVal = lossPacked[1], correctVal = lossPacked[2], validVal = lossPacked[3];
@@ -3875,7 +3889,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    gpuTransformerScratch->lossSum.data());
 
 				float h_sumSq = 0.0f;
-				gpuTransformerScratch->lossSum.download(&h_sumSq, 1);
+				gpu::recordEvent(gpuComputeReadyEvent, gpu::computeStream());
+				gpu::streamWaitEvent(gpu::transferStream(), gpuComputeReadyEvent);
+				gpuTransformerScratch->lossSum.downloadAsync(&h_sumSq, 1);
+				gpu::synchronizeTransferStream();
 				const float gradNorm = sqrtf(h_sumSq) * invBatch;
 				if (gradNorm > clipNorm)
 					gradScale = clipNorm / (gradNorm + 1e-12f);
@@ -4156,6 +4173,8 @@ if ((sz) > maxSz) maxSz = (sz); \
 				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamM, hMs, gc * sizeof(float*));
 				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamV, hVs, gc * sizeof(float*));
 				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamSizes, hSizes, gc * sizeof(int));
+				gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+				gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 				gpuTransformerWeights->adamGroupCount = gc;
 				gpuTransformerWeights->adamMaxSize = maxSz;
 				gpuTransformerWeights->adamPtrsUploaded = true;
@@ -4212,6 +4231,8 @@ if ((sz) > maxSz) maxSz = (sz); \
 
 				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamLr, hLrs, gc * sizeof(float));
 				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamWd, hWds, gc * sizeof(float));
+				gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
+				gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
 				gpu::adam_update_batch(
 				    gpuTransformerWeights->d_adamParams,
@@ -4227,11 +4248,14 @@ if ((sz) > maxSz) maxSz = (sz); \
 			}
 			} // end Adam branch
 
-			gpu::synchronize();
+			gpu::synchronizeComputeStream();
 			seqInBatch = 0u;
 			timeStepsInBatch = 0u;
 		}
 	}
+
+	gpu::destroyEvent(gpuTransferReadyEvent);
+	gpu::destroyEvent(gpuComputeReadyEvent);
 
 	// After GPU training loop: download updated weights back to CPU.
 	TensorTransformerState& ttMut = tensorTransformer;

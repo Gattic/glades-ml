@@ -277,6 +277,7 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
 
 void device_memcpy_d2d(void* dst, const void* src, size_t bytes);
 void device_memcpy_h2d(void* dst, const void* src, size_t bytes);
+void device_memcpy_d2h(void* dst, const void* src, size_t bytes);
 void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spitch,
                            size_t width, size_t height);
 void device_memset_bytes(void* ptr, int value, size_t bytes);
@@ -345,6 +346,7 @@ inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}
+inline void device_memcpy_d2h(void*, const void*, size_t) {}
 inline void device_memcpy_2d_d2d(void*, size_t, const void*, size_t, size_t, size_t) {}
 inline void device_memset_bytes(void*, int, size_t) {}
 

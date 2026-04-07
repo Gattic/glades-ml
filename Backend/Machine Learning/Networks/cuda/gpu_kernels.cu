@@ -7,6 +7,7 @@
 // Requirements: CUDA 11+, SM 6.0+.
 
 #include "gpu_kernels.h"
+#include "gpu_device.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -182,7 +183,7 @@ bool layernorm_forward(const float* x, const float* gamma, const float* beta,
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
-	layernorm_forward_rows<<<rows, block, smemBytes>>>(
+	layernorm_forward_rows<<<rows, block, smemBytes, computeStream()>>>(
 		x, gamma, beta, eps, cols, out, mean, invStd);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -296,14 +297,14 @@ bool layernorm_backward(const float* dout, const float* x,
 	// Kernel 1: dx (one block per row).
 	int block1 = rowBlockSize(cols);
 	int smemBytes1 = (block1 / 32 + 2) * 2 * sizeof(float);
-	layernorm_backward_dx<<<rows, block1, smemBytes1>>>(
+	layernorm_backward_dx<<<rows, block1, smemBytes1, computeStream()>>>(
 		dout, x, gamma, mean, invStd, cols, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
 	// Kernel 2: dgamma/dbeta (one block per column, reduce across rows).
 	int block2 = rowBlockSize(rows);
 	int smemBytes2 = (block2 / 32 + 2) * 2 * sizeof(float);
-	layernorm_backward_dgamma_dbeta<<<cols, block2, smemBytes2>>>(
+	layernorm_backward_dgamma_dbeta<<<cols, block2, smemBytes2, computeStream()>>>(
 		dout, x, mean, invStd, rows, cols, dgamma, dbeta);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
@@ -354,7 +355,7 @@ bool rmsnorm_forward(const float* x, const float* gamma, float eps,
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 1) * sizeof(float);
-	rmsnorm_forward_rows<<<rows, block, smemBytes>>>(
+	rmsnorm_forward_rows<<<rows, block, smemBytes, computeStream()>>>(
 		x, gamma, eps, cols, out, invRms);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -436,14 +437,14 @@ bool rmsnorm_backward(const float* dout, const float* x,
 	// Kernel 1: dx (one block per row).
 	int block1 = rowBlockSize(cols);
 	int smemBytes1 = (block1 / 32 + 1) * sizeof(float);
-	rmsnorm_backward_dx<<<rows, block1, smemBytes1>>>(
+	rmsnorm_backward_dx<<<rows, block1, smemBytes1, computeStream()>>>(
 		dout, x, gamma, invRms, cols, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
 	// Kernel 2: dgamma (one block per column, reduce across rows).
 	int block2 = rowBlockSize(rows);
 	int smemBytes2 = (block2 / 32 + 1) * sizeof(float);
-	rmsnorm_backward_dgamma<<<cols, block2, smemBytes2>>>(
+	rmsnorm_backward_dgamma<<<cols, block2, smemBytes2, computeStream()>>>(
 		dout, x, invRms, rows, cols, dgamma);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
@@ -505,7 +506,7 @@ bool softmax_forward(const float* x, int rows, int cols, float* out)
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
-	softmax_stable_rows<<<rows, block, smemBytes>>>(x, cols, out);
+	softmax_stable_rows<<<rows, block, smemBytes, computeStream()>>>(x, cols, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -540,7 +541,7 @@ bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
 {
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
-	softmax_cross_entropy_backward<<<rows, block>>>(probs, targets, cols, dlogits);
+	softmax_cross_entropy_backward<<<rows, block, 0, computeStream()>>>(probs, targets, cols, dlogits);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -596,7 +597,7 @@ bool gelu_forward(const float* x, int n, float* out)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	gelu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	gelu_forward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -605,7 +606,7 @@ bool gelu_backward(const float* dout, const float* x, int n, float* dx)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	gelu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	gelu_backward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dout, x, n, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -650,7 +651,7 @@ bool silu_forward(const float* x, int n, float* out)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	silu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	silu_forward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -659,7 +660,7 @@ bool silu_backward(const float* dout, const float* x, int n, float* dx)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	silu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	silu_backward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dout, x, n, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -693,7 +694,7 @@ bool relu_forward(const float* x, int n, float* out)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	relu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	relu_forward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -702,7 +703,7 @@ bool relu_backward(const float* dout, const float* x, int n, float* dx)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	relu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	relu_backward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dout, x, n, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -770,7 +771,7 @@ bool swiglu_forward(const float* gate_up, int n, int dFF, float* out)
 	if (n <= 0 || dFF <= 0) return true;
 	int total = n * dFF;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	swiglu_fwd<<<grid, kBlockElem>>>(gate_up, n, dFF, out);
+	swiglu_fwd<<<grid, kBlockElem, 0, computeStream()>>>(gate_up, n, dFF, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -781,7 +782,7 @@ bool swiglu_backward(const float* dout, const float* gate_up,
 	if (n <= 0 || dFF <= 0) return true;
 	int total = n * dFF;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	swiglu_bwd<<<grid, kBlockElem>>>(dout, gate_up, n, dFF, d_gate_up);
+	swiglu_bwd<<<grid, kBlockElem, 0, computeStream()>>>(dout, gate_up, n, dFF, d_gate_up);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -830,7 +831,7 @@ bool rope_apply(float* x, const float* invFreq,
 	int hd = (halfDim > 0 && halfDim <= dHead / 2) ? halfDim : (dHead / 2);
 	int total = T * nHeads * hd;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	rope_apply_inplace<<<grid, kBlockElem>>>(x, invFreq, T, nHeads, dHead, hd, inverse);
+	rope_apply_inplace<<<grid, kBlockElem, 0, computeStream()>>>(x, invFreq, T, nHeads, dHead, hd, inverse);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -889,7 +890,7 @@ bool rope_apply_qk(float* Q, float* K, const float* invFreq,
 	int maxTotal = (totalQ > totalK) ? totalQ : totalK;
 	int gridX = (maxTotal + kBlockElem - 1) / kBlockElem;
 	dim3 grid(gridX, 2);
-	rope_apply_qk_kernel<<<grid, kBlockElem>>>(Q, K, invFreq, T, nQHeads, nKVHeads,
+	rope_apply_qk_kernel<<<grid, kBlockElem, 0, computeStream()>>>(Q, K, invFreq, T, nQHeads, nKVHeads,
 	                                            dHead, hd, inverse, totalQ, totalK);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -937,7 +938,7 @@ bool add_bias(float* out, const float* bias, int rows, int cols)
 	if (rows <= 0 || cols <= 0) return true;
 	int total = rows * cols;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	add_bias_kernel<<<grid, kBlockElem>>>(out, bias, rows, cols);
+	add_bias_kernel<<<grid, kBlockElem, 0, computeStream()>>>(out, bias, rows, cols);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -946,7 +947,7 @@ bool add_residual(float* out, const float* residual, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	add_residual_kernel<<<grid, kBlockElem>>>(out, residual, n);
+	add_residual_kernel<<<grid, kBlockElem, 0, computeStream()>>>(out, residual, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -955,7 +956,7 @@ bool axpy(float alpha, const float* x, float* y, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	axpy_kernel<<<grid, kBlockElem>>>(alpha, x, y, n);
+	axpy_kernel<<<grid, kBlockElem, 0, computeStream()>>>(alpha, x, y, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -978,7 +979,7 @@ bool add_two(float* out, const float* a, const float* b, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	add_two_kernel<<<grid, kBlockElem>>>(a, b, n, out);
+	add_two_kernel<<<grid, kBlockElem, 0, computeStream()>>>(a, b, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -995,7 +996,7 @@ bool scale_array(float* x, float scale, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	scale_array_kernel<<<grid, kBlockElem>>>(x, scale, n);
+	scale_array_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, scale, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1047,7 +1048,7 @@ bool embedding_gather(const float* E, const int* tokenIds,
 
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	embedding_gather_kernel<<<grid, kBlockElem>>>(E, tokenIds, T, vocabSize, dModel, out);
+	embedding_gather_kernel<<<grid, kBlockElem, 0, computeStream()>>>(E, tokenIds, T, vocabSize, dModel, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1059,7 +1060,7 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
 	if (T <= 0 || dModel <= 0) return true;
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	embedding_scatter_add_kernel<<<grid, kBlockElem>>>(dE, tokenIds, dout, T, vocabSize, dModel);
+	embedding_scatter_add_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dE, tokenIds, dout, T, vocabSize, dModel);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1111,7 +1112,7 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	adam_update_kernel<<<grid, kBlockElem>>>(
+	adam_update_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
 		param, grad, m, v, lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -1176,7 +1177,7 @@ bool adam_update_batch(float** d_params, float** d_grads,
 	if (groupCount <= 0) return true;
 	int gridX = (maxSize + kBlockElem - 1) / kBlockElem;
 	dim3 grid(gridX, groupCount);
-	adam_update_batch_kernel<<<grid, kBlockElem>>>(
+	adam_update_batch_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
 		d_params, d_grads, d_ms, d_vs, d_lrs, d_wds, d_sizes,
 		beta1, beta2, eps, gradScale, step, groupCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
@@ -1222,7 +1223,7 @@ bool reduce_rows_sum(const float* input, int rows, int cols,
     if (rows <= 0 || cols <= 0) return true;
     int block = rowBlockSize(rows);
     int smemBytes = (block / 32 + 1) * sizeof(float);
-    reduce_rows_sum_kernel<<<cols, block, smemBytes>>>(input, rows, cols, beta, out);
+    reduce_rows_sum_kernel<<<cols, block, smemBytes, computeStream()>>>(input, rows, cols, beta, out);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1292,7 +1293,7 @@ bool causal_mask_softmax_inplace(float* S, int batchSize, int T)
     int totalRows = batchSize * T;
     int block = rowBlockSize(T);
     int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
-    causal_mask_softmax_kernel<<<totalRows, block, smemBytes>>>(S, T);
+    causal_mask_softmax_kernel<<<totalRows, block, smemBytes, computeStream()>>>(S, T);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1349,7 +1350,7 @@ bool softmax_backward_attn(const float* P, const float* dP,
     int totalRows = batchSize * T;
     int block = rowBlockSize(T);
     int smemBytes = (block / 32 + 1) * sizeof(float);
-    softmax_backward_attn_kernel<<<totalRows, block, smemBytes>>>(P, dP, T, outputScale, dS);
+    softmax_backward_attn_kernel<<<totalRows, block, smemBytes, computeStream()>>>(P, dP, T, outputScale, dS);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1409,7 +1410,7 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
     int grid = 1;
     if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
     int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
-    cross_entropy_nll_kernel<<<grid, block, smemBytes>>>(
+    cross_entropy_nll_kernel<<<grid, block, smemBytes, computeStream()>>>(
         probs, targets, T, vocabSize, padToken, loss_sum, valid_count);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
@@ -1473,7 +1474,7 @@ bool argmax_count_matches(const float* probs, const int* targets,
     int grid = (T + block - 1) / block;
     if (grid > 128) grid = 128;
     int smemBytes = (block / 32 + 1) * sizeof(float);
-    argmax_count_kernel<<<grid, block, smemBytes>>>(
+    argmax_count_kernel<<<grid, block, smemBytes, computeStream()>>>(
         probs, targets, T, vocabSize, padToken, correct_count, valid_count);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
@@ -1748,7 +1749,7 @@ bool flash_attention_multihead_forward(const float* Q, const float* K, const flo
 	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
 	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
 
-	flash_attention_fwd_multihead_kernel<<<grid, block, smemBytes>>>(
+	flash_attention_fwd_multihead_kernel<<<grid, block, smemBytes, computeStream()>>>(
 		Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0, O);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -1773,7 +1774,7 @@ bool flash_attention_multihead_backward(const float* Q, const float* K, const fl
 	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
 	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
 
-	flash_attention_bwd_multihead_kernel<<<grid, block, smemBytes>>>(
+	flash_attention_bwd_multihead_kernel<<<grid, block, smemBytes, computeStream()>>>(
 		Q, K, V, O, dO, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0,
 		dQ, dK_out, dV_out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
@@ -1898,7 +1899,7 @@ bool kv_attention_incremental(const float* Q,
 	if (block > kMaxBlockRow) block = kMaxBlockRow;
 	size_t smemBytes = (size_t)block * sizeof(float);
 
-	kv_attn_incremental_kernel<<<nHeads, block, smemBytes>>>(
+	kv_attn_incremental_kernel<<<nHeads, block, smemBytes, computeStream()>>>(
 		Q, K_cache, V_cache, scores_scratch, keyValid,
 		nHeads, nKVHeads, dHead, dModelKV, maxLen, pos,
 		invSqrt, out);
@@ -1912,23 +1913,28 @@ bool kv_attention_incremental(const float* Q,
 
 void device_memcpy_d2d(void* dst, const void* src, size_t bytes)
 {
-	cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+	cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, computeStream());
 }
 
 void device_memcpy_h2d(void* dst, const void* src, size_t bytes)
 {
-	cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+	cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, transferStream());
+}
+
+void device_memcpy_d2h(void* dst, const void* src, size_t bytes)
+{
+	cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, transferStream());
 }
 
 void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spitch,
                            size_t width, size_t height)
 {
-	cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
+	cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, computeStream());
 }
 
 void device_memset_bytes(void* ptr, int value, size_t bytes)
 {
-	cudaMemset(ptr, value, bytes);
+	cudaMemsetAsync(ptr, value, bytes, computeStream());
 }
 
 // ===========================================================================
@@ -1953,7 +1959,7 @@ __global__ void zero_multi_buffers_kernel(float** __restrict__ ptrs,
 bool zero_buffers_batch(float** d_ptrs, const int* d_sizes, int count)
 {
 	if (count <= 0) return true;
-	zero_multi_buffers_kernel<<<count, 256>>>(d_ptrs, d_sizes);
+	zero_multi_buffers_kernel<<<count, 256, 0, computeStream()>>>(d_ptrs, d_sizes);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1987,7 +1993,7 @@ bool pack_loss_scalars(const float* lossSum, const int* lossCount,
                        const int* correctCount, const int* validCount,
                        int* out)
 {
-	pack_loss_scalars_kernel<<<1, 1>>>(lossSum, lossCount, correctCount, validCount, out);
+	pack_loss_scalars_kernel<<<1, 1, 0, computeStream()>>>(lossSum, lossCount, correctCount, validCount, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -2023,7 +2029,7 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator)
 	int grid = (n + block - 1) / block;
 	if (grid > 256) grid = 256;
 	int smemBytes = ((block / 32) + 1) * sizeof(float);
-	sum_sq_kernel<<<grid, block, smemBytes>>>(data, n, d_accumulator);
+	sum_sq_kernel<<<grid, block, smemBytes, computeStream()>>>(data, n, d_accumulator);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

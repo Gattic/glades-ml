@@ -11,6 +11,7 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include "gpu_blas.h"
+#include "gpu_device.h"
 #include "Backend/Database/GLogger.h"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -559,7 +560,7 @@ bool atlas_gpu_gram_schmidt(float* d_Q, int m, int r)
 	if (blockSize > m) blockSize = ((m + 31) / 32) * 32;
 	if (blockSize < 32) blockSize = 32;
 	int smemBytes = ((blockSize / 32) + 1) * sizeof(double);
-	atlas_gs_kernel<<<1, blockSize, smemBytes>>>(d_Q, m, r);
+	atlas_gs_kernel<<<1, blockSize, smemBytes, computeStream()>>>(d_Q, m, r);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -591,7 +592,7 @@ static bool cholesky_qr_pass(float* d_Q, int m, int r,
 	// 2. Cholesky factorization + inversion entirely on GPU.
 	// The kernel reads G from d_scratch_rr, writes R^{-1} back to d_scratch_rr.
 	// It uses d_scratch_rr[r*r .. 2*r*r-1] as scratch for colScale and R copy.
-	atlas_cholesky_inv_kernel<<<1, 1>>>(d_scratch_rr, r, regularize);
+	atlas_cholesky_inv_kernel<<<1, 1, 0, computeStream()>>>(d_scratch_rr, r, regularize);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 
 	// 3. Q_new = Q * R_inv via cuBLAS SGEMM
@@ -600,9 +601,10 @@ static bool cholesky_qr_pass(float* d_Q, int m, int r,
 		return false;
 
 	// 4. Copy result back to Q
-	ATLAS_CUDA_CHECK(cudaMemcpy(d_Q, d_qrTemp,
-	                            (size_t)m * r * sizeof(float),
-	                            cudaMemcpyDeviceToDevice));
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(d_Q, d_qrTemp,
+	                                 (size_t)m * r * sizeof(float),
+	                                 cudaMemcpyDeviceToDevice,
+	                                 computeStream()));
 
 	return true;
 }
@@ -636,7 +638,7 @@ bool atlas_gpu_weight_decay(float* d_W, size_t mn, float lr, float wd1, float wd
 	if (mn == 0) return true;
 	if (wd1 == 0.0f && wd2 == 0.0f) return true;
 	int grid = (int)((mn + kBlock - 1) / kBlock);
-	atlas_wd_kernel<<<grid, kBlock>>>(d_W, mn, lr, wd1, wd2);
+	atlas_wd_kernel<<<grid, kBlock, 0, computeStream()>>>(d_W, mn, lr, wd1, wd2);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -645,7 +647,7 @@ bool atlas_gpu_baseline_update(float* d_W, const float* d_gW, size_t mn, float b
 {
 	if (mn == 0) return true;
 	int grid = (int)((mn + kBlock - 1) / kBlock);
-	atlas_baseline_kernel<<<grid, kBlock>>>(d_W, d_gW, mn, baseScaled);
+	atlas_baseline_kernel<<<grid, kBlock, 0, computeStream()>>>(d_W, d_gW, mn, baseScaled);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -659,10 +661,10 @@ bool atlas_gpu_fisher_update(const float* d_gz, float* d_fisherDiag,
 	if (blockSize < 32) blockSize = 32;
 	int smemBytes = ((blockSize / 32) + 1) * sizeof(double);
 	if (rightSubspace)
-		atlas_fisher_col_kernel<<<r, blockSize, smemBytes>>>(
+		atlas_fisher_col_kernel<<<r, blockSize, smemBytes, computeStream()>>>(
 			d_gz, d_fisherDiag, r, outerDim, beta, 1.0f - beta);
 	else
-		atlas_fisher_kernel<<<r, blockSize, smemBytes>>>(
+		atlas_fisher_kernel<<<r, blockSize, smemBytes, computeStream()>>>(
 			d_gz, d_fisherDiag, r, outerDim, beta, 1.0f - beta);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -682,7 +684,7 @@ bool atlas_gpu_prepare_correction(const float* d_gz, const float* d_prevGz,
 	{
 		// Col kernel: x=direction (r), y=row (outerDim) — coalesced reads
 		dim3 grid((r + kBlock - 1) / kBlock, outerDim);
-		atlas_correction_col_kernel<<<grid, block>>>(
+		atlas_correction_col_kernel<<<grid, block, 0, computeStream()>>>(
 			d_gz, d_prevGz, d_fisherDiag, d_out, r, outerDim,
 			onePlusMu, negMu, baselineRate, lr, eps, kappaLr, bcFactor);
 	}
@@ -690,7 +692,7 @@ bool atlas_gpu_prepare_correction(const float* d_gz, const float* d_prevGz,
 	{
 		// Row kernel: x=element (outerDim), y=direction (r)
 		dim3 grid((outerDim + kBlock - 1) / kBlock, r);
-		atlas_correction_kernel<<<grid, block>>>(
+		atlas_correction_kernel<<<grid, block, 0, computeStream()>>>(
 			d_gz, d_prevGz, d_fisherDiag, d_out, r, outerDim,
 			onePlusMu, negMu, baselineRate, lr, eps, kappaLr, bcFactor);
 	}
@@ -706,11 +708,11 @@ bool atlas_gpu_mu_norms(const float* d_gz, const float* d_prevGz,
 	if (grid > 256) grid = 256;
 	// Phase 1: per-block partial sums (layout: [errPartials(grid), gzPartials(grid)])
 	int smemBytes = 2 * ((kBlock / 32) + 1) * sizeof(float);
-	atlas_mu_norms_kernel<<<grid, kBlock, smemBytes>>>(d_gz, d_prevGz, rn, grid, d_partials);
+	atlas_mu_norms_kernel<<<grid, kBlock, smemBytes, computeStream()>>>(d_gz, d_prevGz, rn, grid, d_partials);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	// Phase 2: single-block deterministic reduction
 	int smemBytes2 = 2 * ((kBlock / 32) + 1) * sizeof(float);
-	atlas_reduce_partials2_kernel<<<1, kBlock, smemBytes2>>>(d_partials, grid, d_out);
+	atlas_reduce_partials2_kernel<<<1, kBlock, smemBytes2, computeStream()>>>(d_partials, grid, d_out);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -720,7 +722,7 @@ bool atlas_gpu_ema_blend(float* d_dst, const float* d_a, const float* d_b,
 {
 	if (count == 0) return true;
 	int grid = (int)((count + kBlock - 1) / kBlock);
-	atlas_ema_kernel<<<grid, kBlock>>>(d_dst, d_a, d_b, count, 1.0f - beta, beta);
+	atlas_ema_kernel<<<grid, kBlock, 0, computeStream()>>>(d_dst, d_a, d_b, count, 1.0f - beta, beta);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -732,7 +734,7 @@ bool atlas_gpu_transform_fisher(const float* d_overlap, const float* d_f_old,
 	int blockSize = ((r + 31) / 32) * 32;
 	if (blockSize < 32) blockSize = 32;
 	if (blockSize > 1024) blockSize = 1024;
-	atlas_transform_fisher_kernel<<<1, blockSize>>>(d_overlap, d_f_old, d_f_new, r);
+	atlas_transform_fisher_kernel<<<1, blockSize, 0, computeStream()>>>(d_overlap, d_f_old, d_f_new, r);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -741,7 +743,7 @@ bool atlas_gpu_scale_grad(const float* d_gW, float* d_out, size_t mn, float gSca
 {
 	if (mn == 0) return true;
 	int grid = (int)((mn + kBlock - 1) / kBlock);
-	atlas_scale_kernel<<<grid, kBlock>>>(d_gW, d_out, mn, gScale);
+	atlas_scale_kernel<<<grid, kBlock, 0, computeStream()>>>(d_gW, d_out, mn, gScale);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -751,7 +753,7 @@ bool atlas_gpu_guard(float* d_W, size_t mn)
 	if (mn == 0) return true;
 	const int block = 256;
 	int grid = (int)((mn + block - 1) / block);
-	atlas_guard_kernel<<<grid, block>>>(d_W, mn);
+	atlas_guard_kernel<<<grid, block, 0, computeStream()>>>(d_W, mn);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -871,7 +873,7 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 		        m, n, r, isRight ? "RIGHT" : "LEFT", totalElems * sizeof(float));
 	}
 
-	ATLAS_CUDA_CHECK(cudaDeviceSynchronize());
+	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 	return true;
 }
 
@@ -909,10 +911,12 @@ static bool refreshSubspace(GpuAtlasWeightState& state,
 	const size_t or_ = (size_t)outerDim * r;
 
 	// Save old basis and Fisher
-	ATLAS_CUDA_CHECK(cudaMemcpy(state.U_old.data(), state.U.data(),
-	                            sr * sizeof(float), cudaMemcpyDeviceToDevice));
-	ATLAS_CUDA_CHECK(cudaMemcpy(state.f_old.data(), state.fisherDiag.data(),
-	                            r * sizeof(float), cudaMemcpyDeviceToDevice));
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.U_old.data(), state.U.data(),
+	                                 sr * sizeof(float), cudaMemcpyDeviceToDevice,
+	                                 computeStream()));
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.f_old.data(), state.fisherDiag.data(),
+	                                 r * sizeof(float), cudaMemcpyDeviceToDevice,
+	                                 computeStream()));
 
 	float* d_Q = state.U.data();
 
@@ -1024,8 +1028,9 @@ static bool refreshSubspace(GpuAtlasWeightState& state,
 		return false;
 
 	// --- Transform prevGz into new basis ---
-	ATLAS_CUDA_CHECK(cudaMemcpy(state.prevGzOld.data(), state.prevGz.data(),
-	                            or_ * sizeof(float), cudaMemcpyDeviceToDevice));
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.prevGzOld.data(), state.prevGz.data(),
+	                                 or_ * sizeof(float), cudaMemcpyDeviceToDevice,
+	                                 computeStream()));
 
 	if (isRight)
 	{
@@ -1417,11 +1422,12 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	}
 
 	// === Step 9: Store compressed gradient for next step ===
-	ATLAS_CUDA_CHECK(cudaMemcpy(state.prevGz.data(), state.gz.data(),
-	                            or_ * sizeof(float), cudaMemcpyDeviceToDevice));
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.prevGz.data(), state.gz.data(),
+	                                 or_ * sizeof(float), cudaMemcpyDeviceToDevice,
+	                                 computeStream()));
 
 	// === Step 10: Clear accumulated gradients ===
-	ATLAS_CUDA_CHECK(cudaMemsetAsync(d_gW, 0, (size_t)mn * sizeof(float)));
+	ATLAS_CUDA_CHECK(cudaMemsetAsync(d_gW, 0, (size_t)mn * sizeof(float), computeStream()));
 
 	return true;
 }
