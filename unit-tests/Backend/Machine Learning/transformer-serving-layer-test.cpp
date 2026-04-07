@@ -31,10 +31,80 @@
 #include <cmath>
 #include <pthread.h>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 namespace {
+
+class CallbackBarrier
+{
+public:
+	CallbackBarrier()
+	    : entered_(false),
+	      released_(false),
+	      completed_(false)
+	{
+		(void)pthread_mutex_init(&mu_, NULL);
+		(void)pthread_cond_init(&cv_, NULL);
+	}
+
+	~CallbackBarrier()
+	{
+		(void)pthread_cond_destroy(&cv_);
+		(void)pthread_mutex_destroy(&mu_);
+	}
+
+	void signalEnteredAndWait()
+	{
+		(void)pthread_mutex_lock(&mu_);
+		entered_ = true;
+		(void)pthread_cond_broadcast(&cv_);
+		while (!released_)
+			(void)pthread_cond_wait(&cv_, &mu_);
+		(void)pthread_mutex_unlock(&mu_);
+	}
+
+	void waitUntilEntered()
+	{
+		(void)pthread_mutex_lock(&mu_);
+		while (!entered_)
+			(void)pthread_cond_wait(&cv_, &mu_);
+		(void)pthread_mutex_unlock(&mu_);
+	}
+
+	void release()
+	{
+		(void)pthread_mutex_lock(&mu_);
+		released_ = true;
+		(void)pthread_cond_broadcast(&cv_);
+		(void)pthread_mutex_unlock(&mu_);
+	}
+
+	void markCompleted()
+	{
+		(void)pthread_mutex_lock(&mu_);
+		completed_ = true;
+		(void)pthread_cond_broadcast(&cv_);
+		(void)pthread_mutex_unlock(&mu_);
+	}
+
+	bool completed() const
+	{
+		(void)pthread_mutex_lock(&mu_);
+		const bool v = completed_;
+		(void)pthread_mutex_unlock(&mu_);
+		return v;
+	}
+
+private:
+	mutable pthread_mutex_t mu_;
+	pthread_cond_t cv_;
+	bool entered_;
+	bool released_;
+	bool completed_;
+
+	CallbackBarrier(const CallbackBarrier&);
+	CallbackBarrier& operator=(const CallbackBarrier&);
+};
 
 struct SmallDecoderLm
 {
@@ -182,9 +252,6 @@ public:
 	    : layer_(layer),
 	      started_(false),
 	      joined_(false),
-	      threadDone_(0u),
-	      completedDuringCallback_(false),
-	      blockedDuringCallback_(false),
 	      threadOk_(false)
 	{
 	}
@@ -204,20 +271,9 @@ public:
 		started_ = true;
 		args_.cb = this;
 		args_.requestId = requestId;
-		threadDone_ = 0u;
 		if (pthread_create(&thread_, NULL, &ProbeSnapshotFromCallback::thread_main, &args_) != 0)
-		{
-			blockedDuringCallback_ = true;
 			return true;
-		}
-		for (unsigned int spin = 0u; spin < 100u; ++spin)
-		{
-			if (threadDone_ != 0u)
-				break;
-			usleep(1000);
-		}
-		completedDuringCallback_ = (threadDone_ != 0u);
-		blockedDuringCallback_ = !completedDuringCallback_;
+		threadDone_.waitUntilEntered();
 		return true;
 	}
 
@@ -229,8 +285,8 @@ public:
 		joined_ = true;
 	}
 
-	bool completedDuringCallback() const { return completedDuringCallback_; }
-	bool blockedDuringCallback() const { return blockedDuringCallback_; }
+	void releaseThread() { threadDone_.release(); }
+	bool completedDuringCallback() const { return threadDone_.completed(); }
 	bool threadOk() const { return threadOk_; }
 
 private:
@@ -248,7 +304,8 @@ private:
 			return NULL;
 		glades::TransformerServingLayer::RequestSnapshot snap;
 		args->cb->threadOk_ = args->cb->layer_.getSnapshot(args->requestId, snap);
-		args->cb->threadDone_ = 1u;
+		args->cb->threadDone_.signalEnteredAndWait();
+		args->cb->threadDone_.markCompleted();
 		return NULL;
 	}
 
@@ -256,11 +313,76 @@ private:
 	bool started_;
 	bool joined_;
 	pthread_t thread_;
-	volatile unsigned int threadDone_;
-	bool completedDuringCallback_;
-	bool blockedDuringCallback_;
+	CallbackBarrier threadDone_;
 	bool threadOk_;
 	ThreadArgs args_;
+};
+
+class ShouldCancelCallback : public glades::ITransformerServingCallbacks
+{
+public:
+	ShouldCancelCallback(bool shouldStop, bool shouldThrow)
+	    : shouldStop_(shouldStop),
+	      shouldThrow_(shouldThrow),
+	      shouldCancelCalls_(0u),
+	      onTokenCalls_(0u)
+	{
+	}
+
+	virtual bool onToken(uint64_t /*requestId*/,
+	                     const glades::NNetwork& /*net*/,
+	                     unsigned int /*tokenId*/,
+	                     unsigned int /*generatedIndex*/)
+	{
+		++onTokenCalls_;
+		return false;
+	}
+
+	virtual bool shouldCancel(uint64_t /*requestId*/, const glades::NNetwork& /*net*/)
+	{
+		++shouldCancelCalls_;
+		if (shouldThrow_)
+			throw "shouldCancel throw";
+		return shouldStop_;
+	}
+
+	unsigned int shouldCancelCalls() const { return shouldCancelCalls_; }
+	unsigned int onTokenCalls() const { return onTokenCalls_; }
+
+private:
+	bool shouldStop_;
+	bool shouldThrow_;
+	unsigned int shouldCancelCalls_;
+	unsigned int onTokenCalls_;
+};
+
+class ReentrantStepCallback : public glades::ITransformerServingCallbacks
+{
+public:
+	explicit ReentrantStepCallback(glades::TransformerServingLayer& layer)
+	    : layer_(layer),
+	      reentrantStatus(glades::NNetworkStatus::OK, std::string()),
+	      calls_(0u)
+	{
+	}
+
+	virtual bool onToken(uint64_t /*requestId*/,
+	                     const glades::NNetwork& /*net*/,
+	                     unsigned int /*tokenId*/,
+	                     unsigned int /*generatedIndex*/)
+	{
+		++calls_;
+		reentrantStatus = layer_.step();
+		return true;
+	}
+
+	unsigned int calls() const { return calls_; }
+
+	glades::NNetworkStatus reentrantStatus;
+
+private:
+	glades::TransformerServingLayer& layer_;
+	unsigned int calls_;
 };
 
 } // namespace
@@ -632,8 +754,8 @@ void TransformerServingLayerUnitTest()
 				ASSERT("==============ServingLayer: StepProbePrefill Failed==============", layer.step().ok());
 
 			ASSERT("==============ServingLayer: StepProbeDecode Failed==============", layer.step().ok());
+			cb.releaseThread();
 			cb.join();
-			ASSERT("==============ServingLayer: CallbackNotBlocked Failed==============", !cb.blockedDuringCallback());
 			ASSERT("==============ServingLayer: CallbackProbeCompleted Failed==============", cb.completedDuringCallback());
 			ASSERT("==============ServingLayer: CallbackProbeSnapshotOK Failed==============", cb.threadOk());
 			layer.stop();
@@ -705,6 +827,168 @@ void TransformerServingLayerUnitTest()
 			glades::TransformerServingLayer::RequestSnapshot liveSnap;
 			ASSERT("==============ServingLayer: LiveSnapshotStillExists Failed==============", layer.getSnapshot(pendingId, liveSnap));
 			ASSERT("==============ServingLayer: LiveSnapshotNotDone Failed==============", !liveSnap.done);
+			layer.stop();
+		}
+
+		// --------
+		// Case 12: shouldCancel() may stop a request at the decode boundary
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK10 Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+			ShouldCancelCallback cb(true, false);
+
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitShouldCancel Failed==============",
+			       layer.submit(make_req(prompt, 3u, false, 101u, 1u), id, &cb).ok());
+
+			for (unsigned int t = 0u; t < prompt.size(); ++t)
+				ASSERT("==============ServingLayer: StepShouldCancelPrefill Failed==============", layer.step().ok());
+
+			ASSERT("==============ServingLayer: StepShouldCancelDecode Failed==============", layer.step().ok());
+
+			glades::TransformerServingLayer::RequestSnapshot snap;
+			ASSERT("==============ServingLayer: SnapshotShouldCancel Failed==============", layer.getSnapshot(id, snap));
+			ASSERT("==============ServingLayer: ShouldCancelDone Failed==============", snap.done);
+			ASSERT("==============ServingLayer: ShouldCancelFlag Failed==============", snap.result.stoppedByCallback);
+			ASSERT("==============ServingLayer: ShouldCancelNoDecodeToken Failed==============", snap.result.tokens.empty());
+			ASSERT("==============ServingLayer: ShouldCancelCalled Failed==============", cb.shouldCancelCalls() == 1u);
+			ASSERT("==============ServingLayer: ShouldCancelOnTokenNotCalled Failed==============", cb.onTokenCalls() == 0u);
+			layer.stop();
+		}
+
+		// --------
+		// Case 13: shouldCancel() exceptions are treated as cancel
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK11 Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(4u);
+			prompt.push_back(5u);
+			prompt.push_back(6u);
+			ShouldCancelCallback cb(false, true);
+
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitShouldCancelThrow Failed==============",
+			       layer.submit(make_req(prompt, 2u, false, 202u, 1u), id, &cb).ok());
+
+			for (unsigned int t = 0u; t < prompt.size(); ++t)
+				ASSERT("==============ServingLayer: StepShouldCancelThrowPrefill Failed==============", layer.step().ok());
+
+			ASSERT("==============ServingLayer: StepShouldCancelThrowDecode Failed==============", layer.step().ok());
+
+			glades::TransformerServingLayer::RequestSnapshot snap;
+			ASSERT("==============ServingLayer: SnapshotShouldCancelThrow Failed==============", layer.getSnapshot(id, snap));
+			ASSERT("==============ServingLayer: ShouldCancelThrowDone Failed==============", snap.done);
+			ASSERT("==============ServingLayer: ShouldCancelThrowFlag Failed==============", snap.result.stoppedByCallback);
+			ASSERT("==============ServingLayer: ShouldCancelThrowNoDecodeToken Failed==============", snap.result.tokens.empty());
+			ASSERT("==============ServingLayer: ShouldCancelThrowCalled Failed==============", cb.shouldCancelCalls() == 1u);
+			layer.stop();
+		}
+
+		// --------
+		// Case 14: re-entrant step() from callback is rejected
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK12 Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+			ReentrantStepCallback cb(layer);
+
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitReentrant Failed==============",
+			       layer.submit(make_req(prompt, 2u, false, 303u, 1u), id, &cb).ok());
+
+			for (unsigned int t = 0u; t < prompt.size(); ++t)
+				ASSERT("==============ServingLayer: StepReentrantPrefill Failed==============", layer.step().ok());
+
+			ASSERT("==============ServingLayer: StepReentrantDecode Failed==============", layer.step().ok());
+			ASSERT("==============ServingLayer: ReentrantCallbackInvoked Failed==============", cb.calls() == 1u);
+			ASSERT("==============ServingLayer: ReentrantStepRejected Failed==============", !cb.reentrantStatus.ok());
+			layer.stop();
+		}
+
+		// --------
+		// Case 15: direct stop() rejects future work and retains snapshots
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK13 Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitDirectStop Failed==============", layer.submit(make_req(prompt, 2u, false, 404u, 1u), id).ok());
+
+			ASSERT("==============ServingLayer: StepDirectStopPrefill Failed==============", layer.step().ok());
+			layer.stop();
+			ASSERT("==============ServingLayer: DirectStopNotRunning Failed==============", !layer.isRunning());
+
+			glades::TransformerServingLayer::RequestSnapshot snap;
+			ASSERT("==============ServingLayer: DirectStopSnapshotRetained Failed==============", layer.getSnapshot(id, snap));
+
+			uint64_t id2 = 0;
+			ASSERT("==============ServingLayer: DirectStopSubmitRejected Failed==============",
+			       !layer.submit(make_req(prompt, 1u, false, 405u, 1u), id2).ok());
+			ASSERT("==============ServingLayer: DirectStopStepRejected Failed==============", !layer.step().ok());
+		}
+
+		// --------
+		// Case 16: cancel() return values for done and missing requests
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK14 Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(7u);
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitDoneCancel Failed==============", layer.submit(make_req(prompt, 0u, false, 505u, 1u), id).ok());
+
+			for (unsigned int spins = 0u; spins < 8u; ++spins)
+			{
+				ASSERT("==============ServingLayer: StepDoneCancel Failed==============", layer.step().ok());
+				glades::TransformerServingLayer::RequestSnapshot snap;
+				ASSERT("==============ServingLayer: SnapshotDoneCancel Failed==============", layer.getSnapshot(id, snap));
+				if (snap.done)
+					break;
+			}
+
+			ASSERT("==============ServingLayer: CancelDoneReturnsTrue Failed==============", layer.cancel(id));
+			ASSERT("==============ServingLayer: CancelMissingReturnsFalse Failed==============", !layer.cancel(999999ULL));
 			layer.stop();
 		}
 
