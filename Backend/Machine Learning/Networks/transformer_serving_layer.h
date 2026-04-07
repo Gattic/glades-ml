@@ -167,6 +167,7 @@ private:
 		~Mutex();
 		void lock() const;
 		void unlock() const;
+		bool ok() const;
 
 	private:
 		// PIMPL so we don't expose pthread headers here.
@@ -198,6 +199,10 @@ private:
 		NNetwork::TransformerServeRequest req;
 		ITransformerServingCallbacks* cb;
 		Pending() : id(0ULL), req(), cb(NULL) {}
+		Pending(uint64_t newId, const NNetwork::TransformerServeRequest& newReq, ITransformerServingCallbacks* newCb)
+		    : id(newId), req(newReq), cb(newCb)
+		{
+		}
 	};
 
 	struct LiveSlot
@@ -208,7 +213,7 @@ private:
 	};
 
 	// Adapter used by NNetwork::transformerLmServeBatcherStep.
-	class BatcherCallbacks : public NNetwork::ITransformerServeCallbacks
+	class BatcherCallbacks : public ITransformerServeCallbacks
 	{
 	public:
 		BatcherCallbacks(const TransformerServingLayer& layer) : layer_(layer) {}
@@ -229,6 +234,8 @@ private:
 	void admitPending_();
 	void updateSnapshotsFromBatcher_();
 	void finalizeDoneSlots_();
+	void shutdownLocked_(bool clearSnapshots, const char* logMsg);
+	bool mutexOk_() const;
 
 private:
 	// Owned by user; must outlive this layer.
@@ -269,4 +276,3 @@ private:
 };
 
 } // namespace glades
-

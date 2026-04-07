@@ -319,6 +319,32 @@ static void assert_all_tokens_in_range(const std::vector<unsigned int>& toks, un
 		ASSERT("==============ServingLayer: token out of range Failed==============", toks[i] < vocab);
 }
 
+class StopLayerOnTokenCallback : public glades::ITransformerServingCallbacks
+{
+public:
+	explicit StopLayerOnTokenCallback(glades::TransformerServingLayer& layer)
+	    : layer_(layer),
+	      calls_(0u)
+	{
+	}
+
+	virtual bool onToken(uint64_t /*requestId*/,
+	                     const glades::NNetwork& /*net*/,
+	                     unsigned int /*tokenId*/,
+	                     unsigned int /*generatedIndex*/)
+	{
+		++calls_;
+		layer_.stop();
+		return true;
+	}
+
+	unsigned int calls() const { return calls_; }
+
+private:
+	glades::TransformerServingLayer& layer_;
+	unsigned int calls_;
+};
+
 } // namespace
 
 void TransformerServingLayerUnitTest()
@@ -575,7 +601,7 @@ void TransformerServingLayerUnitTest()
 	}
 
 	// --------
-	// Case 7: invalid prompt token id propagates as a per-request failure (submit ok, admit fails)
+	// Case 7: callback may stop the layer during decode without crashing step()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
@@ -584,6 +610,42 @@ void TransformerServingLayerUnitTest()
 		cfg.maxSeqLen = 16u;
 		cfg.enableLogs = false;
 		ASSERT("==============ServingLayer: StartOK6 Failed==============", layer.start(*m.net, cfg).ok());
+
+		std::vector<unsigned int> prompt;
+		prompt.push_back(1u);
+		prompt.push_back(2u);
+		prompt.push_back(3u);
+		StopLayerOnTokenCallback cb(layer);
+
+		uint64_t id = 0;
+		ASSERT("==============ServingLayer: SubmitStopFromCallback Failed==============",
+		       layer.submit(make_req(prompt, 2u, false, 11u, 1u), id, &cb).ok());
+
+		for (unsigned int t = 0u; t < prompt.size(); ++t)
+			ASSERT("==============ServingLayer: StepPrefillCallbackStop Failed==============", layer.step().ok());
+
+		ASSERT("==============ServingLayer: StepDecodeCallbackStop Failed==============", layer.step().ok());
+		ASSERT("==============ServingLayer: CallbackInvoked Failed==============", cb.calls() == 1u);
+		ASSERT("==============ServingLayer: LayerStoppedByCallback Failed==============", !layer.isRunning());
+
+		glades::TransformerServingLayer::RequestSnapshot snap;
+		ASSERT("==============ServingLayer: SnapshotCallbackStop Failed==============", layer.getSnapshot(id, snap));
+		ASSERT("==============ServingLayer: CallbackStopDone Failed==============", snap.done);
+		ASSERT("==============ServingLayer: CallbackStopFlag Failed==============", snap.result.stoppedByCallback);
+		ASSERT("==============ServingLayer: CallbackStopEmittedToken Failed==============", snap.result.tokens.size() == 1u);
+		assert_all_tokens_in_range(snap.result.tokens, m.vocab);
+	}
+
+	// --------
+	// Case 8: invalid prompt token id propagates as a per-request failure (submit ok, admit fails)
+	// --------
+	{
+		glades::TransformerServingLayer layer;
+		glades::TransformerServingLayer::Config cfg;
+		cfg.maxBatchSize = 1u;
+		cfg.maxSeqLen = 16u;
+		cfg.enableLogs = false;
+		ASSERT("==============ServingLayer: StartOK7 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> badPrompt;
 		badPrompt.push_back(m.vocab); // out of range
@@ -601,7 +663,7 @@ void TransformerServingLayerUnitTest()
 	}
 
 	// --------
-	// Case 8: clearSnapshot() removes completed snapshot
+	// Case 9: clearSnapshot() removes completed snapshot
 	// --------
 	{
 		glades::TransformerServingLayer layer;
@@ -609,7 +671,7 @@ void TransformerServingLayerUnitTest()
 		cfg.maxBatchSize = 1u;
 		cfg.maxSeqLen = 16u;
 		cfg.enableLogs = false;
-		ASSERT("==============ServingLayer: StartOK7 Failed==============", layer.start(*m.net, cfg).ok());
+		ASSERT("==============ServingLayer: StartOK8 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> prompt;
 		prompt.push_back(1u);
@@ -638,4 +700,3 @@ void TransformerServingLayerUnitTest()
 
 	printf("\n============================================================\n");
 }
-

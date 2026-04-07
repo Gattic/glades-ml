@@ -6,9 +6,14 @@
 //
 #pragma once
 
-#include "network.h"
+#include "../nnetwork_status.h"
+#include "transformer_types.h"
+
+#include <vector>
 
 namespace glades {
+
+class NNetwork;
 
 // Token identifiers are first-class integers throughout transformer APIs.
 // (They must be < vocabSize; negative IDs are reserved for internal sentinel use.)
@@ -18,30 +23,20 @@ typedef int TokenLabelId; // may be negative for padding/ignore depending on con
 struct TransformerPublicAPI
 {
 	// Single-request generation (KV-cache incremental decode).
-	static inline NNetworkStatus generate(const NNetwork& net,
-	                                     const std::vector<TokenId>& promptTokens,
-	                                     const NNetwork::TransformerGenerateConfig& cfg,
-	                                     NNetwork::TransformerGenerateResult& out,
-	                                     NNetwork::ITransformerGenerateCallbacks* cb /* optional */)
-	{
-		return net.transformerLmGenerate(promptTokens, cfg, out, cb);
-	}
+	static NNetworkStatus generate(const NNetwork& net,
+	                               const std::vector<TokenId>& promptTokens,
+	                               const TransformerGenerateConfig& cfg,
+	                               TransformerGenerateResult& out,
+	                               ITransformerGenerateCallbacks* cb /* optional */);
 
 	// Batched generation (one-shot, ragged prompts).
-	static inline NNetworkStatus generateBatch(const NNetwork& net,
-	                                          const std::vector<NNetwork::TransformerServeRequest>& requests,
-	                                          NNetwork::TransformerServeBatchResult& out,
-	                                          NNetwork::ITransformerServeCallbacks* cb /* optional */)
-	{
-		return net.transformerLmServeGenerateBatch(requests, out, cb);
-	}
+	static NNetworkStatus generateBatch(const NNetwork& net,
+	                                    const std::vector<TransformerServeRequest>& requests,
+	                                    TransformerServeBatchResult& out,
+	                                    ITransformerServeCallbacks* cb /* optional */);
 
 	// Full forward last-logits (debug/test parity helper).
-	static inline NNetworkStatus forwardLastLogits(const NNetwork& net, const std::vector<TokenId>& tokenIds, std::vector<float>& outLogits)
-	{
-		return net.transformerLmForwardLastLogits(tokenIds, outLogits);
-	}
+	static NNetworkStatus forwardLastLogits(const NNetwork& net, const std::vector<TokenId>& tokenIds, std::vector<float>& outLogits);
 };
 
 } // namespace glades
-

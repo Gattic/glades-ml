@@ -7,6 +7,7 @@
 #include "Backend/Database/GTable.h"
 
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -43,6 +44,28 @@ static inline bool path_ends_with(const std::string& s, const std::string& suf)
 	return s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
+static inline bool parse_strict_int_token(const std::string& s, int& outTok)
+{
+	if (s.empty())
+		return false;
+
+	char* end = NULL;
+	errno = 0;
+	const long long v = strtoll(s.c_str(), &end, 10);
+	if (end == s.c_str() || errno != 0)
+		return false;
+	while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end)))
+		++end;
+	if (*end != '\0')
+		return false;
+	if (v < static_cast<long long>(std::numeric_limits<int>::min()) ||
+	    v > static_cast<long long>(std::numeric_limits<int>::max()))
+		return false;
+
+	outTok = static_cast<int>(v);
+	return true;
+}
+
 static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 {
 	outTok = 0;
@@ -53,18 +76,32 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 	case shmea::GType::INT_TYPE: outTok = cell.getInt(); return true;
 	case shmea::GType::LONG_TYPE:
 	{
-		const long long v = static_cast<long long>(cell.getLong());
+		const long long v = cell.getLong();
 		if (v < static_cast<long long>(std::numeric_limits<int>::min()) || v > static_cast<long long>(std::numeric_limits<int>::max()))
 			return false;
 		outTok = static_cast<int>(v);
 		return true;
 	}
-	case shmea::GType::BOOLEAN_TYPE: outTok = cell.getBoolean() ? 1 : 0; return true;
+	case shmea::GType::BOOLEAN_TYPE:
+		return false;
 	case shmea::GType::FLOAT_TYPE:
-	case shmea::GType::DOUBLE_TYPE:
 	{
 		const double v = static_cast<double>(cell.getFloat());
 		if (!std::isfinite(v))
+			return false;
+		if (std::floor(v) != v)
+			return false;
+		if (v < static_cast<double>(std::numeric_limits<int>::min()) || v > static_cast<double>(std::numeric_limits<int>::max()))
+			return false;
+		outTok = static_cast<int>(v);
+		return true;
+	}
+	case shmea::GType::DOUBLE_TYPE:
+	{
+		const double v = cell.getDouble();
+		if (!std::isfinite(v))
+			return false;
+		if (std::floor(v) != v)
 			return false;
 		if (v < static_cast<double>(std::numeric_limits<int>::min()) || v > static_cast<double>(std::numeric_limits<int>::max()))
 			return false;
@@ -74,18 +111,7 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 	case shmea::GType::STRING_TYPE:
 	default:
 	{
-		// Best-effort parse from string.
-		const std::string s = std::string(cell.c_str());
-		if (s.empty())
-			return false;
-		std::istringstream iss(s);
-		long long v = 0;
-		if (!(iss >> v))
-			return false;
-		if (v < static_cast<long long>(std::numeric_limits<int>::min()) || v > static_cast<long long>(std::numeric_limits<int>::max()))
-			return false;
-		outTok = static_cast<int>(v);
-		return true;
+		return parse_strict_int_token(std::string(cell.c_str()), outTok);
 	}
 	}
 }
@@ -104,11 +130,18 @@ glades::TokenInput::TokenInput()
 
 glades::TokenInput::~TokenInput()
 {
+	clearLoadedData();
+}
+
+void glades::TokenInput::clearLoadedData()
+{
 	loaded = false;
 	trainTok.clear();
 	trainNextTok.clear();
 	testTok.clear();
 	testNextTok.clear();
+	clearTrainSequences();
+	clearTestSequences();
 }
 
 glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path,
@@ -208,20 +241,18 @@ glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path
 
 void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 {
-	if (loaded)
-	{
-		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
-		return;
-	}
-
 	const std::string p = to_std_string(fname);
 	if (p.empty())
 	{
+		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import: empty path");
-		loaded = false;
 		return;
 	}
 
+	std::vector<int> newTrainTok;
+	std::vector<int> newTrainNextTok;
+	std::vector<int> newTestTok;
+	std::vector<int> newTestNextTok;
 	// Directory semantics: if path ends with '/', accept "train.tok" + "test.tok".
 	// File semantics: treat as train only (mirror to test).
 	std::vector<SequenceSpan> trSeq;
@@ -230,39 +261,42 @@ void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 	glades::NNetworkStatus stTrain(glades::NNetworkStatus::OK, std::string());
 	if (path_ends_with(p, "/"))
 	{
-		stTrain = loadTokenFile(p + "train.tok", trainTok, trainNextTok, trSeq);
+		stTrain = loadTokenFile(p + "train.tok", newTrainTok, newTrainNextTok, trSeq);
 		// Test split is optional; ignore failures and mirror train->test below.
-		(void)loadTokenFile(p + "test.tok", testTok, testNextTok, teSeq);
+		(void)loadTokenFile(p + "test.tok", newTestTok, newTestNextTok, teSeq);
 	}
 	else
 	{
-		stTrain = loadTokenFile(p, trainTok, trainNextTok, trSeq);
+		stTrain = loadTokenFile(p, newTrainTok, newTrainNextTok, trSeq);
 	}
 
 	if (!stTrain.ok())
 	{
-		trainTok.clear();
-		trainNextTok.clear();
-		testTok.clear();
-		testNextTok.clear();
-		clearTrainSequences();
-		clearTestSequences();
-		loaded = false;
+		clearLoadedData();
 		lastImportStatus = stTrain;
 		return;
 	}
 
 	// Default: if no explicit test split loaded, mirror train->test.
-	if (testTok.empty() && !trainTok.empty())
+	if (newTestTok.empty() && !newTrainTok.empty())
 	{
-		testTok = trainTok;
-		testNextTok = trainNextTok;
+		newTestTok = newTrainTok;
+		newTestNextTok = newTrainNextTok;
 		teSeq = trSeq;
 	}
 
+	trainTok.swap(newTrainTok);
+	trainNextTok.swap(newTrainNextTok);
+	testTok.swap(newTestTok);
+	testNextTok.swap(newTestNextTok);
 	// Install sequence spans.
-	setTrainSequences(trSeq);
-	setTestSequences(teSeq);
+	if (!setTrainSequences(trSeq) || !setTestSequences(teSeq))
+	{
+		clearLoadedData();
+		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                                         "TokenInput::import: invalid sequence spans after load");
+		return;
+	}
 
 	loaded = true;
 	lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
@@ -270,12 +304,6 @@ void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 
 void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 {
-	if (loaded)
-	{
-		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
-		return;
-	}
-
 	// Interpret a table as token IDs:
 	// - If cols==1: each row is one timestep; the whole table is a single sequence.
 	// - If cols>1: each table row is treated as one independent sequence spanning all columns.
@@ -285,14 +313,14 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 	const unsigned int C = t.numberOfCols();
 	if (R == 0u || C == 0u)
 	{
+		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::EMPTY_DATA, "TokenInput::import(table): empty table");
-		loaded = false;
 		return;
 	}
 
+	std::vector<int> newTrainTok;
+	std::vector<int> newTrainNextTok;
 	std::vector<SequenceSpan> trSeq;
-	trainTok.clear();
-	trainNextTok.clear();
 
 	if (C == 1u)
 	{
@@ -302,8 +330,8 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 		const unsigned int emitLen = (usePad ? R : (R > 0u ? (R - 1u) : 0u));
 		if (emitLen == 0u)
 		{
+			clearLoadedData();
 			lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::EMPTY_DATA, "TokenInput::import(table): empty after LM pair emission");
-			loaded = false;
 			return;
 		}
 
@@ -314,28 +342,28 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 			int tok = 0;
 			if (!cell_to_int_token(t.getCell(r, 0u), tok))
 			{
+				clearLoadedData();
 				lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): invalid token cell");
-				loaded = false;
 				return;
 			}
 			if (tok < 0)
 			{
+				clearLoadedData();
 				lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): negative token id not allowed");
-				loaded = false;
 				return;
 			}
 			toks.push_back(tok);
 		}
 
-		trainTok.reserve(emitLen);
-		trainNextTok.reserve(emitLen);
+		newTrainTok.reserve(emitLen);
+		newTrainNextTok.reserve(emitLen);
 		for (unsigned int r = 0; r < emitLen; ++r)
 		{
-			trainTok.push_back(toks[r]);
+			newTrainTok.push_back(toks[r]);
 			if (r + 1u < R)
-				trainNextTok.push_back(toks[r + 1u]);
+				newTrainNextTok.push_back(toks[r + 1u]);
 			else
-				trainNextTok.push_back(padTokenId); // only when usePad==true
+				newTrainNextTok.push_back(padTokenId); // only when usePad==true
 		}
 		trSeq.push_back(SequenceSpan(0u, emitLen));
 	}
@@ -358,46 +386,53 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 				int tok = 0;
 				if (!cell_to_int_token(t.getCell(r, c), tok))
 				{
+					clearLoadedData();
 					lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): invalid token cell");
-					loaded = false;
 					return;
 				}
 				if (tok < 0)
 				{
+					clearLoadedData();
 					lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): negative token id not allowed");
-					loaded = false;
 					return;
 				}
 				toks.push_back(tok);
 			}
 
 			trSeq.push_back(SequenceSpan(cursor, emitLen));
-			trainTok.reserve(trainTok.size() + emitLen);
-			trainNextTok.reserve(trainNextTok.size() + emitLen);
+			newTrainTok.reserve(newTrainTok.size() + emitLen);
+			newTrainNextTok.reserve(newTrainNextTok.size() + emitLen);
 			for (unsigned int c = 0; c < emitLen; ++c)
 			{
-				trainTok.push_back(toks[c]);
+				newTrainTok.push_back(toks[c]);
 				if (c + 1u < len)
-					trainNextTok.push_back(toks[c + 1u]);
+					newTrainNextTok.push_back(toks[c + 1u]);
 				else
-					trainNextTok.push_back(padTokenId); // only when usePad==true
+					newTrainNextTok.push_back(padTokenId); // only when usePad==true
 			}
 			cursor += emitLen;
 		}
 	}
 
-	if (trainTok.empty() || trainNextTok.empty() || trainTok.size() != trainNextTok.size())
+	if (newTrainTok.empty() || newTrainNextTok.empty() || newTrainTok.size() != newTrainNextTok.size())
 	{
+		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::EMPTY_DATA, "TokenInput::import(table): no LM pairs produced");
-		loaded = false;
 		return;
 	}
 
 	// Mirror train->test by default (same semantics as file import when no explicit test split exists).
+	trainTok.swap(newTrainTok);
+	trainNextTok.swap(newTrainNextTok);
 	testTok = trainTok;
 	testNextTok = trainNextTok;
-	setTrainSequences(trSeq);
-	setTestSequences(trSeq);
+	if (!setTrainSequences(trSeq) || !setTestSequences(trSeq))
+	{
+		clearLoadedData();
+		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                                         "TokenInput::import(table): invalid sequence spans after load");
+		return;
+	}
 	loaded = true;
 	lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
@@ -540,4 +575,3 @@ unsigned int glades::TokenInput::getFeatureCount() const
 {
 	return 1u;
 }
-

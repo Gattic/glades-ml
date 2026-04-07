@@ -15,6 +15,7 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "network.h"
+#include "transformer_public_api.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
@@ -194,6 +195,30 @@ bool glades::NNetwork::tryAcquireRunLock()
 	// Atomic compare-and-swap from 0 -> 1.
 	return __sync_bool_compare_and_swap(&runLock, 0, 1);
 #endif
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::generate(const glades::NNetwork& net,
+                                                              const std::vector<glades::TokenId>& promptTokens,
+                                                              const glades::TransformerGenerateConfig& cfg,
+                                                              glades::TransformerGenerateResult& out,
+                                                              glades::ITransformerGenerateCallbacks* cb)
+{
+	return net.transformerLmGenerate(promptTokens, cfg, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::generateBatch(const glades::NNetwork& net,
+                                                                   const std::vector<glades::TransformerServeRequest>& requests,
+                                                                   glades::TransformerServeBatchResult& out,
+                                                                   glades::ITransformerServeCallbacks* cb)
+{
+	return net.transformerLmServeGenerateBatch(requests, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogits(const glades::NNetwork& net,
+                                                                       const std::vector<glades::TokenId>& tokenIds,
+                                                                       std::vector<float>& outLogits)
+{
+	return net.transformerLmForwardLastLogits(tokenIds, outLogits);
 }
 
 void glades::NNetwork::releaseRunLock()
@@ -3031,4 +3056,3 @@ void glades::NNetwork::freeGpuState()
 #endif
 	gpuStateReady = false;
 }
-

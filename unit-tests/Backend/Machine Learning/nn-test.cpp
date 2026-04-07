@@ -3319,11 +3319,11 @@ void NNTransformerUnitTest()
 		glades::NNetwork::TransformerLmSession session;
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionReset Failed==============",
 		         net.transformerLmSessionReset(session, /*maxSeqLen*/ 4u).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen0 Failed==============", session.curLen == 0u);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen0 Failed==============", session.getCurrentLength() == 0u);
 		std::vector<float> logitsKv;
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionAppend Failed==============",
 		         net.transformerLmSessionAppend(session, /*tokenId*/ 2u, &logitsKv).ok());
-		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen1 Failed==============", session.curLen == 1u);
+		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity SessionLen1 Failed==============", session.getCurrentLength() == 1u);
 		G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity KvLogitsSize Failed==============", logitsKv.size() == vocab);
 		for (unsigned int i = 0; i < vocab; ++i)
 			G_assert(__FILE__, __LINE__, "==============NN::ToyIdentity KvLogitsMismatch Failed==============", fabs(logitsKv[i] - logits[i]) < 1e-6f);
@@ -4001,7 +4001,7 @@ void NNTransformerUnitTest()
 
 		// Case C: per-request callback early stop.
 		{
-			struct StopAfterOneCb : public glades::NNetwork::ITransformerServeCallbacks
+			struct StopAfterOneCb : public glades::ITransformerServeCallbacks
 			{
 				virtual bool onToken(const glades::NNetwork& /*net*/, unsigned int requestIndex, unsigned int /*tokenId*/, unsigned int generatedIndex)
 				{

@@ -84,7 +84,9 @@ int main(int argc, char* argv[])
 		NNRecurrentUnitTest();
 	    else if (strcmp(argv[1], "nn-transformer") == 0)
 		NNTransformerUnitTest();
-	    else if (strcmp(argv[1], "transformer-serving") == 0 || strcmp(argv[1], "serving") == 0)
+	    else if (strcmp(argv[1], "transformer-serving") == 0 ||
+	             strcmp(argv[1], "transformer-serving-layer") == 0 ||
+	             strcmp(argv[1], "serving") == 0)
 		TransformerServingLayerUnitTest();
 	    else if (strcmp(argv[1], "nn-bench") == 0)
 		NNBenchmarks(argc, argv);

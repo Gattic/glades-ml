@@ -301,7 +301,7 @@ static bool sample_token_from_logits(const std::vector<float>& logits,
 glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector<unsigned int>& promptTokens,
                                                               const TransformerGenerateConfig& cfg,
                                                               TransformerGenerateResult& out,
-                                                              ITransformerGenerateCallbacks* cb) const
+                                                              glades::ITransformerGenerateCallbacks* cb) const
 {
 	out = TransformerGenerateResult();
 
@@ -563,7 +563,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 
 glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const std::vector<TransformerServeRequest>& requests,
                                                                          TransformerServeBatchResult& out,
-                                                                         ITransformerServeCallbacks* cb) const
+                                                                         glades::ITransformerServeCallbacks* cb) const
 {
 	out = TransformerServeBatchResult();
 	out.results.clear();
@@ -1190,7 +1190,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherRemove(glades:
 	if (batcher.inUse[slot] == 0u)
 		return NNetworkStatus(NNetworkStatus::OK, std::string()); // idempotent
 
-	// Optionally wipe KV + mask prefix used by this slot.
+	// Optionally wipe the used KV prefix for this slot in whichever cache
+	// storage is active (FP32 or low-precision), plus the key-valid mask.
 	if (batcher.wipeKvOnRemove)
 	{
 		const unsigned int usedLen = (slot < batcher.session.curLen.size()) ? batcher.session.curLen[slot] : 0u;
@@ -1204,6 +1205,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherRemove(glades:
 			const size_t perSeq = static_cast<size_t>(nLayers) * perLayer;
 			float* kSeq = batcher.session.k.empty() ? NULL : &batcher.session.k[static_cast<size_t>(slot) * perSeq];
 			float* vSeq = batcher.session.v.empty() ? NULL : &batcher.session.v[static_cast<size_t>(slot) * perSeq];
+			uint16_t* kSeq16 = batcher.session.k16.empty() ? NULL : &batcher.session.k16[static_cast<size_t>(slot) * perSeq];
+			uint16_t* vSeq16 = batcher.session.v16.empty() ? NULL : &batcher.session.v16[static_cast<size_t>(slot) * perSeq];
 			unsigned char* keyValidSeq =
 			    batcher.session.keyValid.empty() ? NULL : &batcher.session.keyValid[static_cast<size_t>(slot) * static_cast<size_t>(maxLen)];
 
@@ -1215,6 +1218,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherRemove(glades:
 					std::fill(kSeq + off, kSeq + off + prefix, 0.0f);
 				if (vSeq)
 					std::fill(vSeq + off, vSeq + off + prefix, 0.0f);
+				if (kSeq16)
+					std::fill(kSeq16 + off, kSeq16 + off + prefix, static_cast<uint16_t>(0u));
+				if (vSeq16)
+					std::fill(vSeq16 + off, vSeq16 + off + prefix, static_cast<uint16_t>(0u));
 			}
 			if (keyValidSeq)
 				std::fill(keyValidSeq, keyValidSeq + usedLen, 0u);
@@ -1246,7 +1253,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherRemove(glades:
 }
 
 glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::NNetwork::TransformerServeBatcher& batcher,
-                                                                       glades::NNetwork::ITransformerServeCallbacks* cb) const
+                                                                       glades::ITransformerServeCallbacks* cb) const
 {
 	if (!batcher.initialized)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmServeBatcherStep: batcher not initialized");
@@ -1423,4 +1430,3 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
-

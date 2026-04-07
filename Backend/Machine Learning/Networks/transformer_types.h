@@ -10,8 +10,31 @@
 
 namespace glades {
 
-// Forward declaration -- callbacks and session types still live inside NNetwork.
 class NNetwork;
+
+class ITransformerGenerateCallbacks
+{
+public:
+	virtual ~ITransformerGenerateCallbacks() {}
+	// Called after a token is emitted (and appended to the KV cache).
+	// Return true to stop generation early.
+	virtual bool onToken(const NNetwork& /*net*/, unsigned int /*tokenId*/, unsigned int /*generatedIndex*/) { return false; }
+	// Polled once per step; return true to cancel generation.
+	virtual bool shouldStop(const NNetwork& /*net*/) { return false; }
+};
+
+class ITransformerServeCallbacks
+{
+public:
+	virtual ~ITransformerServeCallbacks() {}
+	// Called after a token is emitted for a request.
+	// Return true to stop that request early.
+	virtual bool onToken(const NNetwork& /*net*/, unsigned int /*requestIndex*/, unsigned int /*tokenId*/, unsigned int /*generatedIndex*/) { return false; }
+	// Polled once per global decode step; return true to cancel all requests.
+	virtual bool shouldStopAll(const NNetwork& /*net*/) { return false; }
+	// Polled before sampling for a request each step; return true to cancel that request.
+	virtual bool shouldStopRequest(const NNetwork& /*net*/, unsigned int /*requestIndex*/) { return false; }
+};
 
 struct TransformerGenerateConfig
 {

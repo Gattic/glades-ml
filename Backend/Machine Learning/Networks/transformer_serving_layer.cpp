@@ -12,6 +12,19 @@
 
 namespace glades {
 
+namespace {
+
+static void append_token_delta(std::vector<unsigned int>& dst, const std::vector<unsigned int>& src)
+{
+	if (src.size() <= dst.size())
+		return;
+	const size_t from = dst.size();
+	dst.reserve(src.size());
+	dst.insert(dst.end(), src.begin() + static_cast<std::ptrdiff_t>(from), src.end());
+}
+
+} // namespace
+
 // ===== Internal synchronization (recursive mutex) =====
 struct TransformerServingLayer::MutexImpl
 {
@@ -24,18 +37,15 @@ TransformerServingLayer::Mutex::Mutex() : impl_(NULL)
 	impl_ = new MutexImpl();
 	impl_->ok = false;
 	pthread_mutexattr_t attr;
-	if (pthread_mutexattr_init(&attr) == 0)
+	if (pthread_mutexattr_init(&attr) != 0)
+		return;
+	if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0)
 	{
-		// True recursive mutex (POSIX).
-		(void)pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-		impl_->ok = (pthread_mutex_init(&impl_->m, &attr) == 0);
 		(void)pthread_mutexattr_destroy(&attr);
+		return;
 	}
-	else
-	{
-		// Fallback: plain mutex (best-effort).
-		impl_->ok = (pthread_mutex_init(&impl_->m, NULL) == 0);
-	}
+	impl_->ok = (pthread_mutex_init(&impl_->m, &attr) == 0);
+	(void)pthread_mutexattr_destroy(&attr);
 }
 
 TransformerServingLayer::Mutex::~Mutex()
@@ -64,6 +74,11 @@ void TransformerServingLayer::Mutex::unlock() const
 	if (!impl_->ok)
 		return;
 	(void)pthread_mutex_unlock(&impl_->m);
+}
+
+bool TransformerServingLayer::Mutex::ok() const
+{
+	return impl_ && impl_->ok;
 }
 
 using namespace glades::logfmt;
@@ -99,7 +114,10 @@ bool TransformerServingLayer::isRunning() const
 NNetworkStatus TransformerServingLayer::start(const NNetwork& net, const Config& cfg)
 {
 	LockGuard lock(mu_);
-	stop(); // idempotent reset
+	shutdownLocked_(false, NULL);
+
+	if (!mutexOk_())
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "TransformerServingLayer::start: recursive mutex initialization failed");
 
 	if (cfg.maxBatchSize == 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "TransformerServingLayer::start: maxBatchSize is 0");
@@ -139,15 +157,16 @@ void TransformerServingLayer::stop()
 	LockGuard lock(mu_);
 	if (!running_)
 		return;
-
-	running_ = false;
-	stopRequested_ = true;
-
-	// Clear state.
-	pending_.clear();
-	// Keep snapshots for post-mortem inspection? In production you'd probably clear; here we keep by default.
-	net_ = NULL;
-	logEvent("transformer_serving_stop", 0ULL, "ok");
+	if (inStep_)
+	{
+		// Callbacks are allowed to request shutdown, but destructive teardown must wait
+		// until step() has finished using the current batcher/net state.
+		running_ = false;
+		stopRequested_ = true;
+		logEvent("transformer_serving_stop_deferred", 0ULL, "deferred_until_step_exit");
+		return;
+	}
+	shutdownLocked_(false, "ok");
 }
 
 NNetworkStatus TransformerServingLayer::submit(const NNetwork::TransformerServeRequest& req,
@@ -169,11 +188,7 @@ NNetworkStatus TransformerServingLayer::submit(const NNetwork::TransformerServeR
 	if (cfg_.maxPendingRequests > 0u && pending_.size() >= static_cast<size_t>(cfg_.maxPendingRequests))
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::submit: pending queue full (backpressure)");
 
-	Pending p;
-	p.id = id;
-	p.req = req;
-	p.cb = callbacks;
-	pending_.push_back(p);
+	pending_.push_back(Pending(id, req, callbacks));
 
 	RequestSnapshot snap;
 	snap.requestId = id;
@@ -383,20 +398,22 @@ void TransformerServingLayer::admitPending_()
 		if (!findFreeSlot_(slot))
 			return;
 
-		Pending p = pending_.front();
+		Pending& p = pending_.front();
+		const uint64_t requestId = p.id;
+		ITransformerServingCallbacks* cb = p.cb;
 
 		unsigned int outSlot = 0u;
 		const NNetworkStatus st = net_->transformerLmServeBatcherSubmit(batcher_, p.req, outSlot);
 		if (!st.ok())
 		{
 			// Mark request failed and drop it.
-			std::map<uint64_t, RequestSnapshot>::iterator sit = snapshots_.find(p.id);
+			std::map<uint64_t, RequestSnapshot>::iterator sit = snapshots_.find(requestId);
 			if (sit != snapshots_.end())
 			{
 				sit->second.done = true;
 				sit->second.status = st;
 			}
-			logEvent("transformer_serving_submit_fail", p.id, st.message.c_str());
+			logEvent("transformer_serving_submit_fail", requestId, st.message.c_str());
 			pending_.pop_front();
 			continue;
 		}
@@ -405,13 +422,13 @@ void TransformerServingLayer::admitPending_()
 		pending_.pop_front();
 		if (outSlot < live_.size())
 		{
-			live_[outSlot].id = p.id;
-			live_[outSlot].cb = p.cb;
+			live_[outSlot].id = requestId;
+			live_[outSlot].cb = cb;
 		}
 		if (outSlot < slotCancel_.size())
 			slotCancel_[outSlot] = 0u;
 
-		logEvent("transformer_serving_admit", p.id, "admitted");
+		logEvent("transformer_serving_admit", requestId, "admitted");
 	}
 }
 
@@ -427,13 +444,7 @@ void TransformerServingLayer::updateSnapshotsFromBatcher_()
 			continue;
 		RequestSnapshot& snap = it->second;
 		const NNetwork::TransformerGenerateResult& rr = (s < batcher_.results.size()) ? batcher_.results[s] : snap.result;
-		// Append new tokens since last snapshot.
-		if (rr.tokens.size() > snap.result.tokens.size())
-		{
-			snap.result.tokens.insert(snap.result.tokens.end(),
-			                         rr.tokens.begin() + snap.result.tokens.size(),
-			                         rr.tokens.end());
-		}
+		append_token_delta(snap.result.tokens, rr.tokens);
 		snap.result.lastToken = rr.lastToken;
 		snap.result.stoppedByCallback = rr.stoppedByCallback;
 		snap.result.stoppedOnEos = rr.stoppedOnEos;
@@ -445,7 +456,7 @@ void TransformerServingLayer::updateSnapshotsFromBatcher_()
 void TransformerServingLayer::finalizeDoneSlots_()
 {
 	// Called after a successful Step().
-	if (batcher_.inUse.empty() || batcher_.done.empty())
+	if (!net_ || batcher_.inUse.empty() || batcher_.done.empty())
 		return;
 
 	for (unsigned int s = 0u; s < batcher_.maxBatchSize; ++s)
@@ -468,14 +479,8 @@ void TransformerServingLayer::finalizeDoneSlots_()
 		if (it != snapshots_.end())
 		{
 			RequestSnapshot& snap = it->second;
-			// Merge tokens incrementally (avoid full copies each tick).
 			const NNetwork::TransformerGenerateResult& rr = batcher_.results[s];
-			if (rr.tokens.size() > snap.result.tokens.size())
-			{
-				snap.result.tokens.insert(snap.result.tokens.end(),
-				                         rr.tokens.begin() + snap.result.tokens.size(),
-				                         rr.tokens.end());
-			}
+			append_token_delta(snap.result.tokens, rr.tokens);
 			snap.result.lastToken = rr.lastToken;
 			snap.result.stoppedByCallback = rr.stoppedByCallback;
 			snap.result.stoppedOnEos = rr.stoppedOnEos;
@@ -505,6 +510,8 @@ void TransformerServingLayer::finalizeDoneSlots_()
 NNetworkStatus TransformerServingLayer::step()
 {
 	LockGuard lock(mu_);
+	if (!mutexOk_())
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "TransformerServingLayer::step: recursive mutex initialization failed");
 	if (!running_ || !net_)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::step: layer not running");
 	if (stopRequested_)
@@ -530,7 +537,8 @@ NNetworkStatus TransformerServingLayer::step()
 	// 3) Advance one global step.
 	// Set inStep_ around the batcher call so callbacks can detect re-entrancy.
 	inStep_ = true;
-	const NNetworkStatus stStep = net_->transformerLmServeBatcherStep(batcher_, &batcherCallbacks_);
+	const NNetwork* stepNet = net_;
+	const NNetworkStatus stStep = stepNet->transformerLmServeBatcherStep(batcher_, &batcherCallbacks_);
 	inStep_ = false;
 
 	if (!stStep.ok())
@@ -550,15 +558,46 @@ NNetworkStatus TransformerServingLayer::step()
 		}
 		logEvent("transformer_serving_step_fail", 0ULL, stStep.message.c_str());
 		stopRequested_ = true;
+		shutdownLocked_(false, "step_failed");
 		return stStep;
 	}
 
 	// 4) Update snapshots and finalize done slots.
 	updateSnapshotsFromBatcher_();
 	finalizeDoneSlots_();
+	if (stopRequested_)
+	{
+		shutdownLocked_(false, "ok");
+		return NNetworkStatus(NNetworkStatus::OK, std::string());
+	}
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
-} // namespace glades
+void TransformerServingLayer::shutdownLocked_(bool clearSnapshots, const char* logMsg)
+{
+	const bool hadNet = (net_ != NULL);
+	if (hadNet && logMsg)
+		logEvent("transformer_serving_stop", 0ULL, logMsg);
+	running_ = false;
+	stopRequested_ = false;
+	inStep_ = false;
+	pending_.clear();
+	batcher_.reset();
+	std::fill(slotCancel_.begin(), slotCancel_.end(), static_cast<unsigned char>(0u));
+	for (size_t i = 0u; i < live_.size(); ++i)
+	{
+		live_[i].id = 0ULL;
+		live_[i].cb = NULL;
+	}
+	if (clearSnapshots)
+		snapshots_.clear();
+	net_ = NULL;
+}
 
+bool TransformerServingLayer::mutexOk_() const
+{
+	return mu_.ok();
+}
+
+} // namespace glades

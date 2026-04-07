@@ -80,6 +80,8 @@ void GANUnitTest();
 
 namespace glades {
 
+class TransformerServingLayer;
+
 class DataInput;
 class CMatrix;
 class MetaNetwork;
@@ -1715,60 +1717,9 @@ public:
 			KV_CACHE_BF16 = 2
 		};
 
-		bool initialized;
-		unsigned int maxLen;
-		unsigned int curLen;
-		// Cached model dims (for indexing and sanity).
-		unsigned int dModel;
-		unsigned int dFF;
-		unsigned int nHeads;
-		unsigned int nKVHeads;
-		unsigned int nLayers;
-		unsigned int dHead;
-		unsigned int dModelKV;
-		unsigned int ffnKind;
-		unsigned int ff1Width;
-
-		// KV-cache storage dtype (owned by the session).
-		KVCacheDType kvCacheDType;
-
-		// Cached K/V per layer: [nLayers, maxLen, dModelKV]
-		// Exactly one storage is used based on kvCacheDType.
-		std::vector<float, glades::AlignedAllocator<float, 64> > k;
-		std::vector<float, glades::AlignedAllocator<float, 64> > v;
-		// Low-precision KV cache storage:
-		// - When kvCacheDType==KV_CACHE_F16: values are IEEE754 binary16 (FP16)
-		// - When kvCacheDType==KV_CACHE_BF16: values are bfloat16 (BF16)
-		std::vector<uint16_t, glades::AlignedAllocator<uint16_t, 64> > k16;
-		std::vector<uint16_t, glades::AlignedAllocator<uint16_t, 64> > v16;
-		// keyValid[pos] == 1 => real token, 0 => padding (masked out of attention)
-		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > keyValid; // [maxLen]
-
-		// Scratch buffers sized in Reset and reused across appends.
-		std::vector<float, glades::AlignedAllocator<float, 64> > h;          // [dModel]
-		std::vector<float, glades::AlignedAllocator<float, 64> > x1;         // [dModel]
-		std::vector<float, glades::AlignedAllocator<float, 64> > x2;         // [dModel]
-		std::vector<float, glades::AlignedAllocator<float, 64> > q;          // [dModel]
-		std::vector<float, glades::AlignedAllocator<float, 64> > kvec;       // [dModelKV]
-		std::vector<float, glades::AlignedAllocator<float, 64> > vvec;       // [dModelKV]
-		std::vector<float, glades::AlignedAllocator<float, 64> > attnConcat; // [dModel]
-		std::vector<float, glades::AlignedAllocator<float, 64> > attnOut;    // [dModel]
-		std::vector<float, glades::AlignedAllocator<float, 64> > ffPre;      // [ff1Width]
-		std::vector<float, glades::AlignedAllocator<float, 64> > ffAct;      // [dFF]
-		std::vector<float, glades::AlignedAllocator<float, 64> > ffOut;      // [dModel]
-		std::vector<float, glades::AlignedAllocator<float, 64> > scores;     // [maxLen]
-
-		// Positional encoding caches (owned by the session to avoid mutating NNetwork).
-		// Reuses the same struct as the training-side cache to avoid divergent implementations.
-		TransformerPosEncCache posEncCache;
-
-		// Optional performance counters/timers (populated only when enabled).
-		bool metricsEnabled;
-		TransformerKvPerfBreakdown perf;
-
-		// Opaque pointer to GPU inference state (allocated/freed by transformer_infer.cpp).
-		// NULL when GPU inference is not active.
-		void* gpuInferState;
+		bool isInitialized() const { return initialized; }
+		unsigned int getMaxLen() const { return maxLen; }
+		unsigned int getCurrentLength() const { return curLen; }
 
 		TransformerLmSession()
 		    : initialized(false),
@@ -1844,24 +1795,14 @@ public:
 			// Note: gpuInferState is NOT freed here; the caller (transformerLmSessionReset)
 			// manages GPU lifecycle to avoid pulling CUDA into the header.
 		}
-	};
 
-	struct TransformerLmBatchSession
-	{
-		enum KVCacheDType
-		{
-			KV_CACHE_F32 = 0,
-			KV_CACHE_F16 = 1,
-			KV_CACHE_BF16 = 2
-		};
+	private:
+		friend class NNetwork;
 
 		bool initialized;
-		unsigned int batchSize;
 		unsigned int maxLen;
-		// Per-sequence current lengths.
-		std::vector<unsigned int> curLen; // [batchSize]
-
-		// Cached model dims.
+		unsigned int curLen;
+		// Cached model dims (for indexing and sanity).
 		unsigned int dModel;
 		unsigned int dFF;
 		unsigned int nHeads;
@@ -1875,18 +1816,19 @@ public:
 		// KV-cache storage dtype (owned by the session).
 		KVCacheDType kvCacheDType;
 
-		// Cached K/V per sequence:
-		// - k/v are laid out as [batchSize, nLayers, maxLen, dModelKV] in a contiguous buffer.
+		// Cached K/V per layer: [nLayers, maxLen, dModelKV]
 		// Exactly one storage is used based on kvCacheDType.
 		std::vector<float, glades::AlignedAllocator<float, 64> > k;
 		std::vector<float, glades::AlignedAllocator<float, 64> > v;
-		// Low-precision KV cache storage (same encoding as TransformerLmSession::k16/v16).
+		// Low-precision KV cache storage:
+		// - When kvCacheDType==KV_CACHE_F16: values are IEEE754 binary16 (FP16)
+		// - When kvCacheDType==KV_CACHE_BF16: values are bfloat16 (BF16)
 		std::vector<uint16_t, glades::AlignedAllocator<uint16_t, 64> > k16;
 		std::vector<uint16_t, glades::AlignedAllocator<uint16_t, 64> > v16;
-		// keyValid per sequence: [batchSize, maxLen]
-		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > keyValid;
+		// keyValid[pos] == 1 => real token, 0 => padding (masked out of attention)
+		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > keyValid; // [maxLen]
 
-		// Shared scratch buffers (reused while looping over batch elements).
+		// Scratch buffers sized in Reset and reused across appends.
 		std::vector<float, glades::AlignedAllocator<float, 64> > h;          // [dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > x1;         // [dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > x2;         // [dModel]
@@ -1900,13 +1842,36 @@ public:
 		std::vector<float, glades::AlignedAllocator<float, 64> > ffOut;      // [dModel]
 		std::vector<float, glades::AlignedAllocator<float, 64> > scores;     // [maxLen]
 
-		// Positional encoding caches (session-owned).
+		// Positional encoding caches (owned by the session to avoid mutating NNetwork).
 		// Reuses the same struct as the training-side cache to avoid divergent implementations.
 		TransformerPosEncCache posEncCache;
 
 		// Optional performance counters/timers (populated only when enabled).
 		bool metricsEnabled;
 		TransformerKvPerfBreakdown perf;
+
+		// Opaque pointer to GPU inference state (allocated/freed by transformer_infer.cpp).
+		// NULL when GPU inference is not active.
+		void* gpuInferState;
+
+	};
+
+	struct TransformerLmBatchSession
+	{
+		enum KVCacheDType
+		{
+			KV_CACHE_F32 = 0,
+			KV_CACHE_F16 = 1,
+			KV_CACHE_BF16 = 2
+		};
+
+		bool isInitialized() const { return initialized; }
+		unsigned int getBatchSize() const { return batchSize; }
+		unsigned int getMaxLen() const { return maxLen; }
+		unsigned int getCurrentLength(unsigned int index) const
+		{
+			return (index < curLen.size()) ? curLen[index] : 0u;
+		}
 
 		TransformerLmBatchSession()
 		    : initialized(false),
@@ -1977,6 +1942,63 @@ public:
 			metricsEnabled = false;
 			perf.reset();
 		}
+
+	private:
+		friend class NNetwork;
+
+		bool initialized;
+		unsigned int batchSize;
+		unsigned int maxLen;
+		// Per-sequence current lengths.
+		std::vector<unsigned int> curLen; // [batchSize]
+
+		// Cached model dims.
+		unsigned int dModel;
+		unsigned int dFF;
+		unsigned int nHeads;
+		unsigned int nKVHeads;
+		unsigned int nLayers;
+		unsigned int dHead;
+		unsigned int dModelKV;
+		unsigned int ffnKind;
+		unsigned int ff1Width;
+
+		// KV-cache storage dtype (owned by the session).
+		KVCacheDType kvCacheDType;
+
+		// Cached K/V per sequence:
+		// - k/v are laid out as [batchSize, nLayers, maxLen, dModelKV] in a contiguous buffer.
+		// Exactly one storage is used based on kvCacheDType.
+		std::vector<float, glades::AlignedAllocator<float, 64> > k;
+		std::vector<float, glades::AlignedAllocator<float, 64> > v;
+		// Low-precision KV cache storage (same encoding as TransformerLmSession::k16/v16).
+		std::vector<uint16_t, glades::AlignedAllocator<uint16_t, 64> > k16;
+		std::vector<uint16_t, glades::AlignedAllocator<uint16_t, 64> > v16;
+		// keyValid per sequence: [batchSize, maxLen]
+		std::vector<unsigned char, glades::AlignedAllocator<unsigned char, 64> > keyValid;
+
+		// Shared scratch buffers (reused while looping over batch elements).
+		std::vector<float, glades::AlignedAllocator<float, 64> > h;          // [dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > x1;         // [dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > x2;         // [dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > q;          // [dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > kvec;       // [dModelKV]
+		std::vector<float, glades::AlignedAllocator<float, 64> > vvec;       // [dModelKV]
+		std::vector<float, glades::AlignedAllocator<float, 64> > attnConcat; // [dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > attnOut;    // [dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > ffPre;      // [ff1Width]
+		std::vector<float, glades::AlignedAllocator<float, 64> > ffAct;      // [dFF]
+		std::vector<float, glades::AlignedAllocator<float, 64> > ffOut;      // [dModel]
+		std::vector<float, glades::AlignedAllocator<float, 64> > scores;     // [maxLen]
+
+		// Positional encoding caches (session-owned).
+		// Reuses the same struct as the training-side cache to avoid divergent implementations.
+		TransformerPosEncCache posEncCache;
+
+		// Optional performance counters/timers (populated only when enabled).
+		bool metricsEnabled;
+		TransformerKvPerfBreakdown perf;
+
 	};
 
 	// Session APIs (const: do not mutate NNetwork inference state).
@@ -1985,7 +2007,7 @@ public:
 
 	NNetworkStatus transformerLmBatchSessionReset(TransformerLmBatchSession& session, unsigned int batchSize, unsigned int maxSeqLen) const;
 	// Append one token for each active batch element (ragged-safe):
-	// - Only active[b]!=0 advances session.curLen[b]
+		// - Only active[b]!=0 advances the current length tracked for that batch element
 	// - If tokenValid is provided and tokenValid[b]==0, the position is treated as padding and masked out of attention
 	// - If outLogitsFlat is provided, it is resized to [batchSize * vocabSize] and filled row-major; inactive rows are zeros
 	NNetworkStatus transformerLmBatchSessionAppendSelective(TransformerLmBatchSession& session,
@@ -2016,17 +2038,7 @@ public:
 	// see transformer_types.h for definitions).
 	typedef glades::TransformerGenerateConfig TransformerGenerateConfig;
 	typedef glades::TransformerGenerateResult TransformerGenerateResult;
-
-	class ITransformerGenerateCallbacks
-	{
-	public:
-		virtual ~ITransformerGenerateCallbacks() {}
-		// Called after a token is emitted (and appended to the KV cache).
-		// Return true to stop generation early.
-		virtual bool onToken(const NNetwork& /*net*/, unsigned int /*tokenId*/, unsigned int /*generatedIndex*/) { return false; }
-		// Polled once per step; return true to cancel generation.
-		virtual bool shouldStop(const NNetwork& /*net*/) { return false; }
-	};
+	typedef glades::ITransformerGenerateCallbacks ITransformerGenerateCallbacks;
 
 	// Generate tokens given a prompt (token IDs).
 	// - `promptTokens` must be non-empty (callers should include a BOS token if needed).
@@ -2049,19 +2061,7 @@ public:
 	// - Still scalar (loops requests), but allocation-free per decode step.
 	typedef glades::TransformerServeRequest TransformerServeRequest;
 	typedef glades::TransformerServeBatchResult TransformerServeBatchResult;
-
-	class ITransformerServeCallbacks
-	{
-	public:
-		virtual ~ITransformerServeCallbacks() {}
-		// Called after a token is emitted for a request.
-		// Return true to stop that request early.
-		virtual bool onToken(const NNetwork& /*net*/, unsigned int /*requestIndex*/, unsigned int /*tokenId*/, unsigned int /*generatedIndex*/) { return false; }
-		// Polled once per global decode step; return true to cancel all requests.
-		virtual bool shouldStopAll(const NNetwork& /*net*/) { return false; }
-		// Polled before sampling for a request each step; return true to cancel that request.
-		virtual bool shouldStopRequest(const NNetwork& /*net*/, unsigned int /*requestIndex*/) { return false; }
-	};
+	typedef glades::ITransformerServeCallbacks ITransformerServeCallbacks;
 
 	// === Continuous batching scheduler (persistent) ===
 	//
@@ -2087,7 +2087,8 @@ public:
 		unsigned int maxBatchSize;
 		// Maximum KV cache length per request. Requests with larger maxSeqLen are rejected.
 		unsigned int maxSeqLen;
-		// If true, zero-out the used KV prefix when removing a slot.
+		// If true, zero-out the used KV prefix when removing a slot, including
+		// both FP32 and low-precision KV cache storage.
 		// This is more secure but can be expensive for large models/long sequences.
 		bool wipeKvOnRemove;
 		// Seed for the batcher's shared RNG stream (used when a request does not provide rngSeedOverride).
@@ -2105,44 +2106,8 @@ public:
 
 	struct TransformerServeBatcher
 	{
-		bool initialized;
-		unsigned int vocab;
-		unsigned int maxBatchSize;
-		unsigned int maxSeqLen;
-		bool wipeKvOnRemove;
-
-		// One KV-cache session sized for [maxBatchSize, maxSeqLen].
-		TransformerLmBatchSession session;
-
-		// Per-slot state (size maxBatchSize).
-		std::vector<unsigned char> inUse;
-		std::vector<unsigned char> done;
-		std::vector<unsigned int> promptPos;
-		std::vector<unsigned int> promptLen;
-		std::vector<unsigned int> generated;
-		std::vector<unsigned int> reqMaxNew;
-		std::vector<unsigned int> reqMaxLen;
-
-		// Request payload per slot (owned).
-		std::vector<TransformerServeRequest> req;
-		// Results per slot (owned).
-		std::vector<TransformerGenerateResult> results;
-
-		// RNG: one shared stream for non-overridden requests, and optional per-slot overrides.
-		glades::rng::Engine batchEngine;
-		std::vector<glades::rng::Engine> overrideEngines;
-		std::vector<unsigned char> hasOverride;
-
-		// Hot-loop buffers (no per-step allocations after Reset).
-		std::vector<unsigned int> tokenIds;
-		std::vector<unsigned char> active;
-		std::vector<unsigned int> sampledTok;     // only meaningful for decode slots in the current step
-		std::vector<unsigned char> sampledIsValid;
-		std::vector<float> prevLogitsFlat; // [B, vocab]
-		std::vector<float> logitsFlat;     // [B, vocab]
-		// Sampling scratch (reused across slots; Step processes slots sequentially for sampling).
-		std::vector<unsigned int> idxScratch;
-		std::vector<float> weightScratch;
+	public:
+		bool isInitialized() const { return initialized; }
 
 		TransformerServeBatcher()
 		    : initialized(false),
@@ -2205,6 +2170,50 @@ public:
 			idxScratch.clear();
 			weightScratch.clear();
 		}
+
+	private:
+		friend class NNetwork;
+		friend class TransformerServingLayer;
+
+		bool initialized;
+		unsigned int vocab;
+		unsigned int maxBatchSize;
+		unsigned int maxSeqLen;
+		bool wipeKvOnRemove;
+
+		// One KV-cache session sized for [maxBatchSize, maxSeqLen].
+		TransformerLmBatchSession session;
+
+		// Per-slot state (size maxBatchSize).
+		std::vector<unsigned char> inUse;
+		std::vector<unsigned char> done;
+		std::vector<unsigned int> promptPos;
+		std::vector<unsigned int> promptLen;
+		std::vector<unsigned int> generated;
+		std::vector<unsigned int> reqMaxNew;
+		std::vector<unsigned int> reqMaxLen;
+
+		// Request payload per slot (owned).
+		std::vector<TransformerServeRequest> req;
+		// Results per slot (owned).
+		std::vector<TransformerGenerateResult> results;
+
+		// RNG: one shared stream for non-overridden requests, and optional per-slot overrides.
+		glades::rng::Engine batchEngine;
+		std::vector<glades::rng::Engine> overrideEngines;
+		std::vector<unsigned char> hasOverride;
+
+		// Hot-loop buffers (no per-step allocations after Reset).
+		std::vector<unsigned int> tokenIds;
+		std::vector<unsigned char> active;
+		std::vector<unsigned int> sampledTok;     // only meaningful for decode slots in the current step
+		std::vector<unsigned char> sampledIsValid;
+		std::vector<float> prevLogitsFlat; // [B, vocab]
+		std::vector<float> logitsFlat;     // [B, vocab]
+		// Sampling scratch (reused across slots; Step processes slots sequentially for sampling).
+		std::vector<unsigned int> idxScratch;
+		std::vector<float> weightScratch;
+
 	};
 
 	// Initialize/reset a persistent continuous batcher.

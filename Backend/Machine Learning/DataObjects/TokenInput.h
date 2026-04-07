@@ -33,6 +33,7 @@ public:
 	int getPadTokenId() const { return padTokenId; }
 
 	// DataInput API
+	// Import replaces any previously loaded token data.
 	virtual void import(shmea::GString, int = 0);
 	virtual void import(const shmea::GTable&, int = 0);
 
@@ -92,7 +93,7 @@ private:
 	                             std::vector<int>& outNext,
 	                             std::vector<SequenceSpan>& outSeq,
 	                             unsigned int* outLineCount = NULL);
+	void clearLoadedData();
 };
 
 } // namespace glades
-
