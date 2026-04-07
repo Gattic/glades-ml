@@ -14,6 +14,7 @@ set(Networks_src_files
 	sgd_lstm.cpp
 	sgd_cnn.cpp
 	sgd_transformer.cpp
+	transformer_train_detail.cpp
 	atlas_optimizer.cpp
 	glades_thread_pool.cpp
 	transformer_infer.cpp

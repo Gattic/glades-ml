@@ -7,6 +7,7 @@
 //
 #include "network.h"
 #include "sampling_utils.h"
+#include "transformer_common_utils.h"
 #include "../rng.h"
 #include "Backend/Database/GLogger.h"
 
@@ -26,38 +27,12 @@ using namespace glades::logfmt;
 namespace {
 
 using namespace glades::sampling;
+using glades::transformer_common::bytes_to_human;
+using glades::transformer_common::checked_mul_size;
+using glades::transformer_common::parse_u64_env;
+using glades::transformer_common::ScopedTimerMs;
 
 static inline bool is_finite(float x) { return std::isfinite(x); }
-
-static inline bool checked_mul_size(size_t a, size_t b, size_t& out)
-{
-	if (a == 0u || b == 0u)
-	{
-		out = 0u;
-		return true;
-	}
-	if (a > (std::numeric_limits<size_t>::max() / b))
-		return false;
-	out = a * b;
-	return true;
-}
-
-static inline bool parse_u64_env(const char* name, unsigned long long& out)
-{
-	out = 0ULL;
-	if (!name || !name[0])
-		return false;
-	const char* v = ::getenv(name);
-	if (!v || !v[0])
-		return false;
-	errno = 0;
-	char* end = NULL;
-	const unsigned long long x = ::strtoull(v, &end, 10);
-	if (errno != 0 || end == v || (end && *end != '\0'))
-		return false;
-	out = x;
-	return true;
-}
 
 static inline unsigned long long transformer_serve_max_bytes()
 {
@@ -66,21 +41,6 @@ static inline unsigned long long transformer_serve_max_bytes()
 	if (parse_u64_env("GLADES_TRANSFORMER_SERVE_MAX_BYTES", v) && v > 0ULL)
 		return v;
 	return kDefault;
-}
-
-static std::string bytes_to_human(unsigned long long bytes)
-{
-	std::ostringstream oss;
-	const double b = static_cast<double>(bytes);
-	const double mib = b / (1024.0 * 1024.0);
-	const double gib = mib / 1024.0;
-	oss.setf(std::ios::fixed);
-	oss.precision(2);
-	if (gib >= 1.0)
-		oss << gib << " GiB";
-	else
-		oss << mib << " MiB";
-	return oss.str();
 }
 
 static NNetworkStatus validate_transformer_serve_logits_storage(const char* where,
@@ -142,25 +102,6 @@ static inline uint64_t hash_u32_vec_fnv1a64(const std::vector<unsigned int>& v)
 	}
 	return h;
 }
-
-struct ScopedTimerMs
-{
-	const glades::NNetwork* net;
-	double* acc;
-	int64_t t0ms;
-	explicit ScopedTimerMs(const glades::NNetwork* n, double* outAcc) : net(n), acc((n && outAcc) ? outAcc : NULL), t0ms(0)
-	{
-		if (acc)
-			t0ms = net->getCurrentTimeMilliseconds();
-	}
-	~ScopedTimerMs()
-	{
-		if (!acc)
-			return;
-		const int64_t t1ms = net->getCurrentTimeMilliseconds();
-		*acc += static_cast<double>(t1ms - t0ms);
-	}
-};
 
 static const char* stop_reason_string(const glades::NNetwork::TransformerGenerateResult& r)
 {
@@ -481,7 +422,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 	for (unsigned int i = 0; i < promptLen; ++i)
 	{
 		const bool last = (i + 1u == promptLen);
-		ScopedTimerMs t(this, metricsOn ? &msPrefill : NULL);
+		ScopedTimerMs t(this, metricsOn, &msPrefill);
 		const NNetworkStatus st = transformerLmSessionAppend(session, promptTokens[i], last ? &logits : NULL);
 		if (!st.ok())
 		{
@@ -545,7 +486,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 
 		unsigned int nextTok = 0u;
 		{
-			ScopedTimerMs t(this, metricsOn ? &msSample : NULL);
+			ScopedTimerMs t(this, metricsOn, &msSample);
 			if (!sample_token_from_logits(logits, callEngine, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap, nextTok, idxScratch, weightScratch))
 			{
 				const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "transformerLmGenerate: failed to sample token from logits");
@@ -578,7 +519,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 
 		// Append token to KV cache and fetch logits for next step.
 		{
-			ScopedTimerMs t(this, metricsOn ? &msDecodeAppend : NULL);
+			ScopedTimerMs t(this, metricsOn, &msDecodeAppend);
 			const NNetworkStatus st = transformerLmSessionAppend(session, nextTok, &logits);
 			if (!st.ok())
 			{
@@ -940,7 +881,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 			}
 		}
 
-		ScopedTimerMs tms(this, metricsOn ? &msPrefillAppend : NULL);
+		ScopedTimerMs tms(this, metricsOn, &msPrefillAppend);
 		const NNetworkStatus st = transformerLmBatchSessionAppendSelective(session, tokenIds, active, &logitsFlat);
 		if (!st.ok())
 		{
@@ -1027,7 +968,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 
 			unsigned int nextTok = 0u;
 			{
-				ScopedTimerMs tms(this, metricsOn ? &msSample : NULL);
+				ScopedTimerMs tms(this, metricsOn, &msSample);
 				if (!sample_token_from_logits_ptr(row, reqEngines[r], vocab, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap, nextTok, idxScratch,
 				                                  weightScratch))
 				{
@@ -1053,7 +994,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 
 		// Append sampled tokens only for active requests and compute logits for the next step.
 		{
-			ScopedTimerMs tms(this, metricsOn ? &msDecodeAppend : NULL);
+			ScopedTimerMs tms(this, metricsOn, &msDecodeAppend);
 			const NNetworkStatus st = transformerLmBatchSessionAppendSelective(session, tokenIds, active, &logitsFlat);
 			if (!st.ok())
 			{
