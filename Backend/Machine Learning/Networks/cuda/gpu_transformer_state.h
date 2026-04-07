@@ -222,10 +222,6 @@ struct GpuTransformerScratch
 	// Token IDs (for embedding gather/scatter)
 	GpuBuffer<int> tokenIds;     // [T]
 
-	// Attention scores/probs (materialized for batched GEMM attention path)
-	GpuBuffer<float> attnScores; // [nHeads * T * T]
-	GpuBuffer<float> attnProbs;  // [nHeads * T * T]
-
 	// Persistent buffers to avoid per-step allocations
 	GpuBuffer<float> gpuInvFreq; // [dHead/2]  (RoPE inverse frequencies)
 	GpuBuffer<int> gpuTargetsT;  // [T]        (target token IDs for loss/backward)

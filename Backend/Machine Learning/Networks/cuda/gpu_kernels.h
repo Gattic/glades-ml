@@ -161,6 +161,23 @@ bool flash_attention_backward(const float* Q, const float* K, const float* V,
                               int T, int dK, int dV, bool causal,
                               float* dQ, float* dK_out, float* dV_out);
 
+// Packed multi-head/GQA flash-style attention for training.
+// Q[T, dModel], K/V[T, dModelKV], O[T, dModel] are row-major with heads packed
+// contiguously inside the model dimension.
+bool flash_attention_multihead_forward(const float* Q, const float* K, const float* V,
+                                       int T, int nHeads, int nKVHeads,
+                                       int dHead, int dModel, int dModelKV,
+                                       bool causal, float* O);
+
+// Backward for packed multi-head/GQA flash-style attention.
+// dQ is written per query head; dK/dV are accumulated per KV head.
+bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
+                                        const float* O, const float* dO,
+                                        int T, int nHeads, int nKVHeads,
+                                        int dHead, int dModel, int dModelKV,
+                                        bool causal,
+                                        float* dQ, float* dK_out, float* dV_out);
+
 // ---------------------------------------------------------------------------
 // Incremental KV-cache attention (single-query, multi-head)
 // ---------------------------------------------------------------------------
@@ -310,6 +327,8 @@ inline bool adam_update_batch(float**, float**, float**, float**, const float*, 
 
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
+inline bool flash_attention_multihead_forward(const float*, const float*, const float*, int, int, int, int, int, int, bool, float*) { return false; }
+inline bool flash_attention_multihead_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 
 inline bool reduce_rows_sum(const float*, int, int, float, float*) { return false; }
 inline bool causal_mask_softmax_inplace(float*, int, int) { return false; }

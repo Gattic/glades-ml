@@ -1480,186 +1480,171 @@ bool argmax_count_matches(const float* probs, const int* targets,
 }
 
 // ===========================================================================
-//  16. Flash attention (simplified, single-head)
+//  16. Flash attention (packed multi-head / GQA)
 // ===========================================================================
 //
-// Forward:
-//   O[T, dV] = softmax(Q K^T / sqrt(dK)) * V,  with optional causal mask.
+// Training path:
+// - Q[T, dModel]
+// - K[T, dModelKV]
+// - V[T, dModelKV]
+// - O[T, dModel]
 //
-// Strategy: one block per query row q.  Iterate over key/value blocks (tiles)
-// in shared memory.  For each tile we load a [Bc, dK] chunk of K and a
-// [Bc, dV] chunk of V into shared memory, compute the local attention scores,
-// and use the online softmax trick to accumulate O without materialising the
-// full T*T attention matrix.
+// Heads are packed contiguously inside the feature dimension. For GQA,
+// multiple query heads map to the same KV head.
 //
-// Bc (key tile size) = blockDim.x (threads in the block also serve as the
-// tile width -- each thread owns one key row inside the tile).
+// Strategy: one block per (query row, query head). Iterate over K/V tiles
+// held in shared memory, update the output row with online softmax, and never
+// materialize a [T,T] score/probability matrix.
 
 namespace {
 
 // Tile size for keys/values loaded into shared memory.
 static constexpr int kFlashTile = 64;
 
-// Forward kernel.  One block per query row.
+// Forward kernel. One block per (query row, query head).
 // Shared memory layout:
 //   float sK[kFlashTile * dK]   -- tile of keys
 //   float sV[kFlashTile * dV]   -- tile of values
 // Passed as dynamic shared memory.
-__global__ void flash_attention_fwd_kernel(const float* __restrict__ Q,
-                                           const float* __restrict__ K,
-                                           const float* __restrict__ V,
-                                           int T, int dK, int dV,
-                                           int causal,
-                                           float* __restrict__ O)
+__global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q,
+                                                     const float* __restrict__ K,
+                                                     const float* __restrict__ V,
+                                                     int T, int nHeads, int nKVHeads,
+                                                     int dHead, int dModel, int dModelKV,
+                                                     int causal,
+                                                     float* __restrict__ O)
 {
-	int q = blockIdx.x;  // query row index
-	if (q >= T) return;
+	const int q = static_cast<int>(blockIdx.x);
+	const int h = static_cast<int>(blockIdx.y);
+	if (q >= T || h >= nHeads) return;
 
 	extern __shared__ float smem[];
-	float* sK = smem;                          // [kFlashTile, dK]
-	float* sV = smem + kFlashTile * dK;        // [kFlashTile, dV]
+	float* sK = smem;                             // [kFlashTile, dHead]
+	float* sV = smem + kFlashTile * dHead;        // [kFlashTile, dHead]
 
-	const float* qRow = Q + (size_t)q * dK;
+	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
+	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
+
+	const float* qRow = Q + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	float* oRow = O + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 
 	// Online softmax state.
 	float runMax = -FLT_MAX;
 	float runSum = 0.0f;
 
-	// Accumulator for output row (in registers, length dV).
-	// We store the accumulator in global memory via O at the end.
-	// For moderate dV we keep it in a local array; for large dV we iterate.
-	// Here we use a loop that reads/writes to O directly (initialized to 0).
-	float* oRow = O + (size_t)q * dV;
-	for (int d = threadIdx.x; d < dV; d += blockDim.x)
+	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
 		oRow[d] = 0.0f;
 	__syncthreads();
 
-	float scale = rsqrtf((float)dK);
+	const float scale = rsqrtf(static_cast<float>(dHead));
 
-	int numTiles = (T + kFlashTile - 1) / kFlashTile;
+	const int numTiles = (T + kFlashTile - 1) / kFlashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		int kStart = tile * kFlashTile;
+		const int kStart = tile * kFlashTile;
 		int tileLen = kFlashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
-		// Cooperatively load sK[tileLen, dK] and sV[tileLen, dV].
-		int loadCount = tileLen * dK;
+		// Cooperatively load sK[tileLen, dHead] and sV[tileLen, dHead].
+		const int loadCount = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
-			int kr = i / dK;
-			int kd = i % dK;
-			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
-		int loadCountV = tileLen * dV;
+		const int loadCountV = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
-			int vr = i / dV;
-			int vd = i % dV;
-			sV[i] = V[(size_t)(kStart + vr) * dV + vd];
+			const int vr = i / dHead;
+			const int vd = i % dHead;
+			sV[i] = V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd];
 		}
 		__syncthreads();
 
-		// Compute attention scores for this tile and update online softmax.
-		// Because dK can be large (64-128) we let thread 0 do the serial work
-		// for clarity.  A production kernel would parallelise this differently
-		// (e.g. one warp per query).
-
-		// Each thread handles a subset of keys in the tile.
-		// Accumulate partial max / sum / weighted V over the tile.
 		for (int j = 0; j < tileLen; ++j) {
-			int kIdx = kStart + j;
+			const int kIdx = kStart + j;
 
-			// Causal mask: skip keys with index > query index.
 			if (causal && kIdx > q) break;
 
-			// Dot product Q[q,:] . K[kIdx,:].
 			float dot = 0.0f;
-			for (int d = 0; d < dK; ++d)
-				dot += qRow[d] * sK[j * dK + d];
+			for (int d = 0; d < dHead; ++d)
+				dot += qRow[d] * sK[j * dHead + d];
 			dot *= scale;
 
-			// Online softmax update (single-threaded per block on thread 0).
-			// We serialise this loop per key within the tile; the loop body
-			// is O(dV) work, parallelised across threads below.
-			// To keep the code simple and correct, we let all threads
-			// compute the same dot above but only thread 0 decides the max/sum.
-			// Then we broadcast.
-
-			// All threads see dot (same value because they all read qRow and sK).
-			float prevMax = runMax;
+			const float prevMax = runMax;
 			if (dot > runMax) runMax = dot;
-			float exp_prev = expf(prevMax - runMax);
-			float exp_cur  = expf(dot - runMax);
+			const float exp_prev = expf(prevMax - runMax);
+			const float exp_cur  = expf(dot - runMax);
 
-			// Rescale running sum and accumulator.
 			runSum = runSum * exp_prev + exp_cur;
 
-			// Update oRow: oRow = oRow * exp_prev + exp_cur * V[j,:]
-			for (int d = threadIdx.x; d < dV; d += blockDim.x)
-				oRow[d] = oRow[d] * exp_prev + exp_cur * sV[j * dV + d];
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				oRow[d] = oRow[d] * exp_prev + exp_cur * sV[j * dHead + d];
 		}
 
 		__syncthreads();
 	}
 
-	// Final normalisation: oRow /= runSum.
-	float invSum = (runSum > 0.0f) ? (1.0f / runSum) : 0.0f;
-	for (int d = threadIdx.x; d < dV; d += blockDim.x)
+	const float invSum = (runSum > 0.0f) ? (1.0f / runSum) : 0.0f;
+	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
 		oRow[d] *= invSum;
 }
 
-// Backward kernel.  One block per query row.
+// Backward kernel. One block per (query row, query head).
 // Recomputes attention on the fly (flash-style) to avoid storing the T*T matrix.
-__global__ void flash_attention_bwd_kernel(const float* __restrict__ Q,
-                                           const float* __restrict__ K,
-                                           const float* __restrict__ V,
-                                           const float* __restrict__ O,
-                                           const float* __restrict__ dO,
-                                           int T, int dK, int dV,
-                                           int causal,
-                                           float* __restrict__ dQ,
-                                           float* __restrict__ dK_out,
-                                           float* __restrict__ dV_out)
+__global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q,
+                                                     const float* __restrict__ K,
+                                                     const float* __restrict__ V,
+                                                     const float* __restrict__ O,
+                                                     const float* __restrict__ dO,
+                                                     int T, int nHeads, int nKVHeads,
+                                                     int dHead, int dModel, int dModelKV,
+                                                     int causal,
+                                                     float* __restrict__ dQ,
+                                                     float* __restrict__ dK_out,
+                                                     float* __restrict__ dV_out)
 {
-	int q = blockIdx.x;
-	if (q >= T) return;
+	const int q = static_cast<int>(blockIdx.x);
+	const int h = static_cast<int>(blockIdx.y);
+	if (q >= T || h >= nHeads) return;
 
 	extern __shared__ float smem[];
-	float* sK = smem;                        // [kFlashTile, dK]
-	float* sV = smem + kFlashTile * dK;      // [kFlashTile, dV]
+	float* sK = smem;                           // [kFlashTile, dHead]
+	float* sV = smem + kFlashTile * dHead;      // [kFlashTile, dHead]
 
-	const float* qRow  = Q  + (size_t)q * dK;
-	const float* oRow  = O  + (size_t)q * dV;
-	const float* doRow = dO + (size_t)q * dV;
-	float* dqRow       = dQ + (size_t)q * dK;
+	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
+	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
 
-	float scale = rsqrtf((float)dK);
+	const float* qRow  = Q  + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	const float* oRow  = O  + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	const float* doRow = dO + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	float* dqRow       = dQ + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 
-	// First pass: recompute softmax statistics (online max, sum).
+	const float scale = rsqrtf(static_cast<float>(dHead));
+
 	float runMax = -FLT_MAX;
 	float runSum = 0.0f;
 
-	int numTiles = (T + kFlashTile - 1) / kFlashTile;
+	const int numTiles = (T + kFlashTile - 1) / kFlashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		int kStart = tile * kFlashTile;
+		const int kStart = tile * kFlashTile;
 		int tileLen = kFlashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
-		// Load K tile into shared memory.
-		int loadCount = tileLen * dK;
+		const int loadCount = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
-			int kr = i / dK;
-			int kd = i % dK;
-			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
 		__syncthreads();
 
 		for (int j = 0; j < tileLen; ++j) {
-			int kIdx = kStart + j;
+			const int kIdx = kStart + j;
 			if (causal && kIdx > q) break;
 			float dot = 0.0f;
-			for (int d = 0; d < dK; ++d)
-				dot += qRow[d] * sK[j * dK + d];
+			for (int d = 0; d < dHead; ++d)
+				dot += qRow[d] * sK[j * dHead + d];
 			dot *= scale;
 			if (dot > runMax) {
 				runSum = runSum * expf(runMax - dot);
@@ -1670,67 +1655,60 @@ __global__ void flash_attention_bwd_kernel(const float* __restrict__ Q,
 		__syncthreads();
 	}
 
-	float logSumExp = runMax + logf(runSum + 1e-20f);
+	const float logSumExp = runMax + logf(runSum + 1e-20f);
 
-	// Compute D = sum_d  dO[q,d] * O[q,d]  (needed for backward formula).
 	float D = 0.0f;
-	for (int d = 0; d < dV; ++d)
+	for (int d = 0; d < dHead; ++d)
 		D += doRow[d] * oRow[d];
 
-	// Second pass: compute gradients.
-	// Initialise dQ row to zero.
-	for (int d = threadIdx.x; d < dK; d += blockDim.x)
+	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
 		dqRow[d] = 0.0f;
 	__syncthreads();
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		int kStart = tile * kFlashTile;
+		const int kStart = tile * kFlashTile;
 		int tileLen = kFlashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
-		// Load K and V tiles.
-		int loadCount = tileLen * dK;
+		const int loadCount = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
-			int kr = i / dK;
-			int kd = i % dK;
-			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
-		int loadCountV = tileLen * dV;
+		const int loadCountV = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
-			int vr = i / dV;
-			int vd = i % dV;
-			sV[i] = V[(size_t)(kStart + vr) * dV + vd];
+			const int vr = i / dHead;
+			const int vd = i % dHead;
+			sV[i] = V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd];
 		}
 		__syncthreads();
 
 		for (int j = 0; j < tileLen; ++j) {
-			int kIdx = kStart + j;
+			const int kIdx = kStart + j;
 			if (causal && kIdx > q) break;
 
-			// Recompute attention weight p = softmax score.
 			float dot = 0.0f;
-			for (int d = 0; d < dK; ++d)
-				dot += qRow[d] * sK[j * dK + d];
+			for (int d = 0; d < dHead; ++d)
+				dot += qRow[d] * sK[j * dHead + d];
 			dot *= scale;
-			float p = expf(dot - logSumExp);
+			const float p = expf(dot - logSumExp);
 
-			// ds = p * (dO . V[kIdx] - D)
 			float doV = 0.0f;
-			for (int d = 0; d < dV; ++d)
-				doV += doRow[d] * sV[j * dV + d];
-			float ds = p * (doV - D);
+			for (int d = 0; d < dHead; ++d)
+				doV += doRow[d] * sV[j * dHead + d];
+			const float ds = p * (doV - D);
 
-			// dQ[q,:] += ds * scale * K[kIdx,:]
-			for (int d = threadIdx.x; d < dK; d += blockDim.x)
-				dqRow[d] += ds * scale * sK[j * dK + d];
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				dqRow[d] += ds * scale * sK[j * dHead + d];
 
-			// dK[kIdx,:] += ds * scale * Q[q,:]  (atomic across query blocks)
-			for (int d = threadIdx.x; d < dK; d += blockDim.x)
-				atomicAdd(&dK_out[(size_t)kIdx * dK + d], ds * scale * qRow[d]);
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				atomicAdd(&dK_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
+				          ds * scale * qRow[d]);
 
-			// dV[kIdx,:] += p * dO[q,:]  (atomic across query blocks)
-			for (int d = threadIdx.x; d < dV; d += blockDim.x)
-				atomicAdd(&dV_out[(size_t)kIdx * dV + d], p * doRow[d]);
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				atomicAdd(&dV_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
+				          p * doRow[d]);
 		}
 		__syncthreads();
 	}
@@ -1742,18 +1720,8 @@ bool flash_attention_forward(const float* Q, const float* K, const float* V,
                              int T, int dK, int dV, bool causal,
                              float* O)
 {
-	if (T <= 0 || dK <= 0 || dV <= 0) return true;
-
-	int block = kFlashTile;  // threads per block
-	if (block > kMaxBlockRow) block = kMaxBlockRow;
-
-	// Shared memory: sK[kFlashTile * dK] + sV[kFlashTile * dV].
-	size_t smemBytes = (size_t)kFlashTile * (dK + dV) * sizeof(float);
-
-	flash_attention_fwd_kernel<<<T, block, smemBytes>>>(
-		Q, K, V, T, dK, dV, causal ? 1 : 0, O);
-	GLADES_CUDA_CHECK(cudaGetLastError());
-	return true;
+	if (dK != dV) return false;
+	return flash_attention_multihead_forward(Q, K, V, T, 1, 1, dK, dK, dK, causal, O);
 }
 
 bool flash_attention_backward(const float* Q, const float* K, const float* V,
@@ -1761,19 +1729,52 @@ bool flash_attention_backward(const float* Q, const float* K, const float* V,
                               int T, int dK, int dV, bool causal,
                               float* dQ, float* dK_out, float* dV_out)
 {
-	if (T <= 0 || dK <= 0 || dV <= 0) return true;
+	if (dK != dV) return false;
+	return flash_attention_multihead_backward(Q, K, V, O, dO, T, 1, 1, dK, dK, dK, causal,
+	                                          dQ, dK_out, dV_out);
+}
 
-	// Zero dK_out and dV_out because the kernel accumulates with atomicAdd.
-	GLADES_CUDA_CHECK(cudaMemset(dK_out, 0, (size_t)T * dK * sizeof(float)));
-	GLADES_CUDA_CHECK(cudaMemset(dV_out, 0, (size_t)T * dV * sizeof(float)));
+bool flash_attention_multihead_forward(const float* Q, const float* K, const float* V,
+                                       int T, int nHeads, int nKVHeads,
+                                       int dHead, int dModel, int dModelKV,
+                                       bool causal, float* O)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
+		return true;
 
 	int block = kFlashTile;
 	if (block > kMaxBlockRow) block = kMaxBlockRow;
 
-	size_t smemBytes = (size_t)kFlashTile * (dK + dV) * sizeof(float);
+	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
+	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
 
-	flash_attention_bwd_kernel<<<T, block, smemBytes>>>(
-		Q, K, V, O, dO, T, dK, dV, causal ? 1 : 0,
+	flash_attention_fwd_multihead_kernel<<<grid, block, smemBytes>>>(
+		Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0, O);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
+                                        const float* O, const float* dO,
+                                        int T, int nHeads, int nKVHeads,
+                                        int dHead, int dModel, int dModelKV,
+                                        bool causal,
+                                        float* dQ, float* dK_out, float* dV_out)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
+		return true;
+
+	GLADES_CUDA_CHECK(cudaMemset(dK_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
+	GLADES_CUDA_CHECK(cudaMemset(dV_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
+
+	int block = kFlashTile;
+	if (block > kMaxBlockRow) block = kMaxBlockRow;
+
+	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
+	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
+
+	flash_attention_bwd_multihead_kernel<<<grid, block, smemBytes>>>(
+		Q, K, V, O, dO, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0,
 		dQ, dK_out, dV_out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;

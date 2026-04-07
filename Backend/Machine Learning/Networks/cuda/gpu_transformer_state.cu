@@ -317,12 +317,8 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	// Token IDs
 	if (!tokenIds.allocate(sT)) return false;
 
-	// Attention score/prob buffers for batched GEMM attention
-	const size_t snh = static_cast<size_t>(nh);
-	if (!attnScores.allocate(snh * sT * sT)) return false;
-	if (!attnProbs.allocate(snh * sT * sT)) return false;
-
 	// Persistent per-step buffers
+	const size_t snh = static_cast<size_t>(nh);
 	const size_t dHead = sdm / snh;
 	if (!gpuInvFreq.allocate(dHead / 2)) return false;
 	if (!gpuTargetsT.allocate(sT)) return false;

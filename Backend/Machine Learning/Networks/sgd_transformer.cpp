@@ -3167,53 +3167,18 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				                    static_cast<int>(rd / 2u));
 			}
 
-			// Batched GEMM attention (replaces per-head flash attention).
-			// Q[T, dModel], K[T, dModelKV], V[T, dModelKV], attnConcat[T, dModel].
-			// Treat as batched over heads with stride = dHead between heads.
+			// Flash-style packed multi-head attention without materializing T*T scores/probs.
 			float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
-			float* scores = gpuTransformerScratch->attnScores.data();
-			float* attnP  = gpuTransformerScratch->attnProbs.data();
-			{
-				const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
-				const unsigned int groupSize = nHeads / nKVHeads;
-
-				// Loop over KV-head groups for GQA support.
-				for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
-				{
-					const unsigned int qStart = kvh * groupSize;
-					// S[groupSize, T, T] = Q_group[groupSize, T, dHead] * K_kvh[T, dHead]^T
-					float* P_out = attnP + static_cast<size_t>(qStart) * T * T;
-					gpu::sgemm_batched_strided_abt(
-					    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
-					    invSqrt,
-					    Q_l + qStart * dHead, static_cast<int>(dModel),
-					    static_cast<long long>(T) * dModel,
-					    K_l + kvh * dHead, static_cast<int>(dModelKV),
-					    0LL,  // stride 0: all Q heads in group share same K head
-					    0.0f,
-					    P_out, static_cast<int>(T),
-					    static_cast<long long>(T) * T,
-					    static_cast<int>(groupSize));
-
-					// Causal mask + softmax on S[groupSize, T, T].
-					gpu::causal_mask_softmax_inplace(
-					    P_out,
-					    static_cast<int>(groupSize), static_cast<int>(T));
-
-					// O[groupSize, T, dHead] = P[groupSize, T, T] * V_kvh[T, dHead]
-					gpu::sgemm_batched_strided(
-					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-					    1.0f,
-					    P_out, static_cast<int>(T),
-					    static_cast<long long>(T) * T,
-					    V_l + kvh * dHead, static_cast<int>(dModelKV),
-					    0LL,  // stride 0: all Q heads in group share same V head
-					    0.0f,
-					    attnConcat_l + qStart * dHead, static_cast<int>(dModel),
-					    static_cast<long long>(T) * dModel,
-					    static_cast<int>(groupSize));
-				}
-			}
+			gpu::flash_attention_multihead_forward(
+			    Q_l, K_l, V_l,
+			    static_cast<int>(T),
+			    static_cast<int>(nHeads),
+			    static_cast<int>(nKVHeads),
+			    static_cast<int>(dHead),
+			    static_cast<int>(dModel),
+			    static_cast<int>(dModelKV),
+			    causal,
+			    attnConcat_l);
 
 			// Wo projection
 			float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;
@@ -3687,7 +3652,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    static_cast<int>(T), static_cast<int>(dModel),
 			    1.0f, gb.gBo.data());
 
-			// --- Attention backward (batched GEMM) ---
+			// --- Attention backward (flash-style recompute) ---
 			float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
 			float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
 			float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
@@ -3696,72 +3661,20 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			gpu::zero_buffers_batch(gpuTransformerScratch->d_dKdVZeroPtrs,
 			    gpuTransformerScratch->d_dKdVZeroSizes, 2);
 
-			{
-				const float invSqrt = 1.0f / sqrtf(static_cast<float>(dHead));
-				const unsigned int groupSize = nHeads / nKVHeads;
-				float* scores = gpuTransformerScratch->attnScores.data();
-				const float* attnP = gpuTransformerScratch->attnProbs.data();
-
-				for (unsigned int kvh = 0; kvh < nKVHeads; ++kvh)
-				{
-					const unsigned int qStart = kvh * groupSize;
-					const float* P_group = attnP + static_cast<size_t>(qStart) * T * T;
-					float* dS = scores; // reuse attnScores as scratch for dS
-
-					// 1. dP[groupSize, T, T] = dO[groupSize, T, dHead] * V_kvh[T, dHead]^T
-					gpu::sgemm_batched_strided_abt(
-					    static_cast<int>(T), static_cast<int>(T), static_cast<int>(dHead),
-					    1.0f,
-					    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
-					    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
-					    V_l + kvh * dHead,
-					    static_cast<int>(dModelKV), 0LL,
-					    0.0f,
-					    dS, static_cast<int>(T), static_cast<long long>(T) * T,
-					    static_cast<int>(groupSize));
-
-					// 2. softmax backward: dS = invSqrt * P * (dP - row_sum(dP * P))
-					gpu::softmax_backward_attn(P_group, dS,
-					    static_cast<int>(groupSize),
-					    static_cast<int>(T), invSqrt, dS);
-
-					// 3. dQ[groupSize, T, dHead] = dS[groupSize, T, T] * K_kvh[T, dHead]
-					gpu::sgemm_batched_strided(
-					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-					    1.0f,
-					    dS, static_cast<int>(T), static_cast<long long>(T) * T,
-					    K_l + kvh * dHead, static_cast<int>(dModelKV), 0LL,
-					    0.0f,
-					    gpuTransformerScratch->dQfull.data() + qStart * dHead,
-					    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
-					    static_cast<int>(groupSize));
-
-					// 4. dK_kvh[T, dHead] += sum over group of dS_h^T[T, T] * Q_h[T, dHead]
-					// Use batched ATB: dK += dS^T * Q, beta=1.0 to accumulate.
-					gpu::sgemm_batched_strided_atb(
-					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-					    1.0f,
-					    dS, static_cast<int>(T), static_cast<long long>(T) * T,
-					    Q_l + qStart * dHead, static_cast<int>(dModel),
-					    static_cast<long long>(T) * dModel,
-					    1.0f,
-					    gpuTransformerScratch->dKfull.data() + kvh * dHead,
-					    static_cast<int>(dModelKV), 0LL,
-					    static_cast<int>(groupSize));
-
-					// 5. dV_kvh[T, dHead] += sum over group of P_h^T[T, T] * dO_h[T, dHead]
-					gpu::sgemm_batched_strided_atb(
-					    static_cast<int>(T), static_cast<int>(dHead), static_cast<int>(T),
-					    1.0f,
-					    P_group, static_cast<int>(T), static_cast<long long>(T) * T,
-					    gpuTransformerScratch->dAttnConcat.data() + qStart * dHead,
-					    static_cast<int>(dModel), static_cast<long long>(T) * dModel,
-					    1.0f,
-					    gpuTransformerScratch->dVfull.data() + kvh * dHead,
-					    static_cast<int>(dModelKV), 0LL,
-					    static_cast<int>(groupSize));
-				}
-			}
+			gpu::flash_attention_multihead_backward(
+			    Q_l, K_l, V_l,
+			    attnConcat_l,
+			    gpuTransformerScratch->dAttnConcat.data(),
+			    static_cast<int>(T),
+			    static_cast<int>(nHeads),
+			    static_cast<int>(nKVHeads),
+			    static_cast<int>(dHead),
+			    static_cast<int>(dModel),
+			    static_cast<int>(dModelKV),
+			    causal,
+			    gpuTransformerScratch->dQfull.data(),
+			    gpuTransformerScratch->dKfull.data(),
+			    gpuTransformerScratch->dVfull.data());
 
 			// --- RoPE backward (inverse rotation) — fused Q+K ---
 			if (useRope && gpuTransformerScratch->gpuInvFreq.allocated())
