@@ -9,3 +9,4 @@ alpaca.key
 .gdb_history
 .claude/
 .worktrees/
+.codex

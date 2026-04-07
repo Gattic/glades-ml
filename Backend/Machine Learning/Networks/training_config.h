@@ -255,6 +255,37 @@ struct LearningRateScheduleConfig
 		}
 	}
 
+	// Fractional-epoch multiplier: epochProgressFromStart is measured in epochs
+	// from the start of training and may include intra-epoch progress.
+	inline float multiplierFractionalEpoch(double epochProgressFromStart) const
+	{
+		if (epochProgressFromStart < 0.0)
+			epochProgressFromStart = 0.0;
+
+		switch (type)
+		{
+		case COSINE:
+		{
+			if (cosineTMaxEpochs <= 0)
+				return 1.0f;
+			const double T = static_cast<double>(cosineTMaxEpochs);
+			double t = epochProgressFromStart;
+			if (t > T)
+				t = T;
+			const double minM = static_cast<double>(minMultiplier);
+			const double cosv = cos(3.14159265358979323846 * (t / T));
+			const double m = minM + 0.5 * (1.0 - minM) * (1.0 + cosv);
+			return static_cast<float>(m);
+		}
+		case STEP:
+		case EXP:
+		case BAYESIAN:
+		case NONE:
+		default:
+			return multiplier(static_cast<int>(epochProgressFromStart));
+		}
+	}
+
 	inline float multiplier(int epochFromStart) const
 	{
 		if (epochFromStart < 0)
@@ -683,4 +714,3 @@ struct TrainingConfig
 };
 
 } // namespace glades
-

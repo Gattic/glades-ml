@@ -64,6 +64,26 @@ static inline float clip_maybe(float v, float limit)
 	return glades::sgd_detail::clipf_maybe(v, limit);
 }
 
+static float transformer_schedule_multiplier(const glades::LearningRateScheduleConfig& schedule,
+                                             int epochIdx,
+                                             unsigned int stepInEpoch,
+                                             unsigned int totalStepsInEpoch)
+{
+	if (schedule.type == glades::LearningRateScheduleConfig::NONE)
+		return 1.0f;
+
+	if (totalStepsInEpoch == 0u)
+		return schedule.multiplier(epochIdx);
+
+	if (stepInEpoch > totalStepsInEpoch)
+		stepInEpoch = totalStepsInEpoch;
+
+	const double epochProgress =
+	    static_cast<double>(epochIdx) +
+	    (static_cast<double>(stepInEpoch) / static_cast<double>(totalStepsInEpoch));
+	return schedule.multiplierFractionalEpoch(epochProgress);
+}
+
 // Overflow-checked size_t multiplication (matches transformer_infer.cpp pattern).
 static inline bool checked_mul_size(size_t a, size_t b, size_t& out)
 {
@@ -920,6 +940,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 	// Minibatch: number of sequences to accumulate before applying an update.
 	const unsigned int seqBatchMax = (minibatchSize > 0 ? static_cast<unsigned int>(minibatchSize) : 1u);
+	const unsigned int optimizerStepsPerEpoch = (seqCount + seqBatchMax - 1u) / seqBatchMax;
 	unsigned int seqInBatch = 0u;
 	// Gradient averaging divisor for the minibatch:
 	// - Non-tokenLM: total timesteps across sequences in the batch (as before).
@@ -2412,6 +2433,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						if (ddpEnabled)
 							ddpReduceGrads(timeStepsInBatch);
 
+						const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
+						lrScheduleMultiplier = transformer_schedule_multiplier(
+						    trainingConfig.lrSchedule,
+						    epochIdx + lrScheduleEpochOffset,
+						    stepInEpoch,
+						    optimizerStepsPerEpoch);
 						if (!applyBatch(timeStepsInBatch))
 							return;
 
@@ -2645,6 +2672,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				MixedPrecisionHelper::scale_all_grads(tt, 1.0f / tt.mpLossScale);
 			if (ddpEnabled)
 				ddpReduceGrads(timeStepsInBatch);
+			lrScheduleMultiplier = transformer_schedule_multiplier(
+			    trainingConfig.lrSchedule,
+			    epochIdx + lrScheduleEpochOffset,
+			    optimizerStepsPerEpoch,
+			    optimizerStepsPerEpoch);
 			if (!applyBatch(timeStepsInBatch))
 				return;
 			if (mpDynamicLossScaling)
@@ -3738,6 +3770,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	const float lnEps = cfg.lnEps;
 	const int ropeDimOverride = cfg.ropeDimOverride;
 	const unsigned int seqBatchMax = cfg.seqBatchMax;
+	const unsigned int optimizerStepsPerEpoch = (seqCount + seqBatchMax - 1u) / seqBatchMax;
 
 	unsigned int seqInBatch = 0u;
 	unsigned int timeStepsInBatch = 0u;
@@ -4641,14 +4674,12 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			                       ? static_cast<float>(glades::ddp::worldSize()) : 1.0f;
 			const float gpuExtraLRMult = warmupMult * ddpLRScale;
 
-			// Step-level LR schedule (cosine decay within epoch).
-			if (trainingConfig.lrSchedule.type != glades::LearningRateScheduleConfig::NONE)
-			{
-				const unsigned int totalSteps = (seqCount + seqBatchMax - 1u) / seqBatchMax;
-				const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
-				const float progress = (totalSteps > 0u) ? static_cast<float>(stepInEpoch) / static_cast<float>(totalSteps) : 0.0f;
-				lrScheduleMultiplier = trainingConfig.lrSchedule.multiplierSmooth(progress);
-			}
+			const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
+			lrScheduleMultiplier = transformer_schedule_multiplier(
+			    trainingConfig.lrSchedule,
+			    epochIdx + lrScheduleEpochOffset,
+			    stepInEpoch,
+			    optimizerStepsPerEpoch);
 
 			// Global gradient norm clipping on GPU.
 			float gradScale = 1.0f;
