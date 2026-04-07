@@ -1917,6 +1917,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogits(const std::vector<unsigned int>& tokenIds,
                                                                         std::vector<float>& outLogits) const
 {
+	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
+	if (!runGuard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		                     "transformerLmForwardLastLogits: NNetwork is already running (training/eval/inference are not re-entrant)");
+
 	if (netType != TYPE_TRANSFORMER_DECODER)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmForwardLastLogits: requires TYPE_TRANSFORMER_DECODER");
 	if (!trainingConfig.transformer.enableTokenEmbedding)
@@ -2190,4 +2195,3 @@ glades::NNetworkStatus glades::NNetwork::transformerLmForwardLastLogits(const st
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
-

@@ -143,6 +143,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 	glades::NNetwork::TransformerGenerateResult out;
 	(void)fx.net->transformerLmGenerate(prompt, cfg, out, NULL);
 
+	std::vector<glades::NNetwork::TransformerServeRequest> requests(1);
+	requests[0].promptTokens = prompt;
+	requests[0].cfg = cfg;
+	glades::NNetwork::TransformerServeBatchResult serveOut;
+	(void)fx.net->transformerLmServeGenerateBatch(requests, serveOut, NULL);
+
 	// KV session append.
 	glades::NNetwork::TransformerLmSession sess;
 	(void)fx.net->transformerLmSessionReset(sess, cfg.maxSeqLen);
@@ -152,6 +158,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 		(void)fx.net->transformerLmSessionAppend(sess, prompt[i], &step);
 	}
 
+	glades::NNetwork::TransformerServeBatcher batcher;
+	glades::NNetwork::TransformerServeBatcherConfig batcherCfg;
+	batcherCfg.maxBatchSize = 2u;
+	batcherCfg.maxSeqLen = cfg.maxSeqLen;
+	if (fx.net->transformerLmServeBatcherReset(batcher, batcherCfg).ok())
+	{
+		unsigned int slot = 0u;
+		if (fx.net->transformerLmServeBatcherSubmit(batcher, requests[0], slot).ok())
+		{
+			const unsigned int maxSteps = static_cast<unsigned int>(prompt.size()) + cfg.maxNewTokens + 2u;
+			for (unsigned int stepIdx = 0u; stepIdx < maxSteps; ++stepIdx)
+			{
+				const glades::NNetworkStatus st = fx.net->transformerLmServeBatcherStep(batcher, NULL);
+				if (!st.ok())
+					break;
+				if (slot < batcher.done.size() && batcher.done[slot] != 0u)
+					break;
+			}
+		}
+	}
+
 	return 0;
 }
-

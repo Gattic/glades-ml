@@ -17,11 +17,11 @@
 
 #include "transformer-serving-layer-test.h"
 #include "../../unit-test.h"
+#include "test_token_id_input_fixture.h"
 
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_serving_layer.h"
 
-#include "../../../Backend/Machine Learning/DataObjects/DataInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
@@ -29,182 +29,12 @@
 #include "../../../Backend/Machine Learning/Structure/outputlayerinfo.h"
 
 #include <cmath>
+#include <pthread.h>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
-
-// Minimal in-memory token-id dataset for token language model inference tests.
-// (Copied from nn-test.cpp to keep this test file self-contained.)
-class InMemoryTokenIdInput : public glades::DataInput
-{
-public:
-	InMemoryTokenIdInput()
-	    : padTokenId(-1),
-	      scratchTok(0.0f),
-	      scratchNext(0.0f),
-	      one(1, 0.0f),
-	      empty()
-	{
-	}
-
-	void setTrainTokens(const std::vector<unsigned int>& toks, int pad)
-	{
-		padTokenId = pad;
-		trainTok.clear();
-		trainNextTok.clear();
-		trainTok.reserve(toks.size());
-		for (size_t i = 0; i < toks.size(); ++i)
-			trainTok.push_back(static_cast<int>(toks[i]));
-		build_next(trainTok, padTokenId, trainNextTok);
-	}
-
-	void mirrorTrainToTest()
-	{
-		testTok = trainTok;
-		testNextTok = trainNextTok;
-	}
-
-	virtual void import(shmea::GString, int = 0) {}
-	virtual void import(const shmea::GTable&, int = 0) {}
-
-	virtual shmea::GVector<float> getTrainRow(unsigned int i) const
-	{
-		if (i >= trainTok.size())
-			return empty;
-		one[0] = static_cast<float>(trainTok[i]);
-		return one;
-	}
-	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int i) const
-	{
-		if (i >= trainNextTok.size())
-			return empty;
-		one[0] = static_cast<float>(trainNextTok[i]);
-		return one;
-	}
-	virtual shmea::GVector<float> getTestRow(unsigned int i) const
-	{
-		if (i >= testTok.size())
-			return empty;
-		one[0] = static_cast<float>(testTok[i]);
-		return one;
-	}
-	virtual shmea::GVector<float> getTestExpectedRow(unsigned int i) const
-	{
-		if (i >= testNextTok.size())
-			return empty;
-		one[0] = static_cast<float>(testNextTok[i]);
-		return one;
-	}
-
-	virtual bool getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= trainTok.size())
-			return false;
-		scratchTok = static_cast<float>(trainTok[index]);
-		outData = &scratchTok;
-		outSize = 1u;
-		return true;
-	}
-	virtual bool getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= trainNextTok.size())
-			return false;
-		scratchNext = static_cast<float>(trainNextTok[index]);
-		outData = &scratchNext;
-		outSize = 1u;
-		return true;
-	}
-	virtual bool getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= testTok.size())
-			return false;
-		scratchTok = static_cast<float>(testTok[index]);
-		outData = &scratchTok;
-		outSize = 1u;
-		return true;
-	}
-	virtual bool getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
-	{
-		outData = NULL;
-		outSize = 0u;
-		if (index >= testNextTok.size())
-			return false;
-		scratchNext = static_cast<float>(testNextTok[index]);
-		outData = &scratchNext;
-		outSize = 1u;
-		return true;
-	}
-
-	virtual bool getTrainTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= trainTok.size())
-			return false;
-		outTokenId = trainTok[index];
-		return true;
-	}
-	virtual bool getTrainExpectedTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= trainNextTok.size())
-			return false;
-		outTokenId = trainNextTok[index];
-		return true;
-	}
-	virtual bool getTestTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= testTok.size())
-			return false;
-		outTokenId = testTok[index];
-		return true;
-	}
-	virtual bool getTestExpectedTokenId(unsigned int index, int& outTokenId) const
-	{
-		outTokenId = 0;
-		if (index >= testNextTok.size())
-			return false;
-		outTokenId = testNextTok[index];
-		return true;
-	}
-
-	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok.size()); }
-	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok.size()); }
-	virtual unsigned int getFeatureCount() const { return 1u; }
-	virtual int getType() const { return TEXT; }
-
-private:
-	static void build_next(const std::vector<int>& toks, int pad, std::vector<int>& outNext)
-	{
-		outNext.clear();
-		outNext.reserve(toks.size());
-		for (size_t i = 0; i < toks.size(); ++i)
-		{
-			if (i + 1u < toks.size())
-				outNext.push_back(toks[i + 1u]);
-			else
-				outNext.push_back(pad);
-		}
-	}
-
-	int padTokenId;
-	std::vector<int> trainTok;
-	std::vector<int> trainNextTok;
-	std::vector<int> testTok;
-	std::vector<int> testNextTok;
-
-	mutable float scratchTok;
-	mutable float scratchNext;
-	mutable shmea::GVector<float> one;
-	shmea::GVector<float> empty;
-};
 
 struct SmallDecoderLm
 {
@@ -343,6 +173,94 @@ public:
 private:
 	glades::TransformerServingLayer& layer_;
 	unsigned int calls_;
+};
+
+class ProbeSnapshotFromCallback : public glades::ITransformerServingCallbacks
+{
+public:
+	explicit ProbeSnapshotFromCallback(glades::TransformerServingLayer& layer)
+	    : layer_(layer),
+	      started_(false),
+	      joined_(false),
+	      threadDone_(0u),
+	      completedDuringCallback_(false),
+	      blockedDuringCallback_(false),
+	      threadOk_(false)
+	{
+	}
+
+	~ProbeSnapshotFromCallback()
+	{
+		join();
+	}
+
+	virtual bool onToken(uint64_t requestId,
+	                     const glades::NNetwork& /*net*/,
+	                     unsigned int /*tokenId*/,
+	                     unsigned int /*generatedIndex*/)
+	{
+		if (started_)
+			return false;
+		started_ = true;
+		args_.cb = this;
+		args_.requestId = requestId;
+		threadDone_ = 0u;
+		if (pthread_create(&thread_, NULL, &ProbeSnapshotFromCallback::thread_main, &args_) != 0)
+		{
+			blockedDuringCallback_ = true;
+			return true;
+		}
+		for (unsigned int spin = 0u; spin < 100u; ++spin)
+		{
+			if (threadDone_ != 0u)
+				break;
+			usleep(1000);
+		}
+		completedDuringCallback_ = (threadDone_ != 0u);
+		blockedDuringCallback_ = !completedDuringCallback_;
+		return true;
+	}
+
+	void join()
+	{
+		if (!started_ || joined_)
+			return;
+		(void)pthread_join(thread_, NULL);
+		joined_ = true;
+	}
+
+	bool completedDuringCallback() const { return completedDuringCallback_; }
+	bool blockedDuringCallback() const { return blockedDuringCallback_; }
+	bool threadOk() const { return threadOk_; }
+
+private:
+	struct ThreadArgs
+	{
+		ProbeSnapshotFromCallback* cb;
+		uint64_t requestId;
+		ThreadArgs() : cb(NULL), requestId(0ULL) {}
+	};
+
+	static void* thread_main(void* ud)
+	{
+		ThreadArgs* args = static_cast<ThreadArgs*>(ud);
+		if (!args || !args->cb)
+			return NULL;
+		glades::TransformerServingLayer::RequestSnapshot snap;
+		args->cb->threadOk_ = args->cb->layer_.getSnapshot(args->requestId, snap);
+		args->cb->threadDone_ = 1u;
+		return NULL;
+	}
+
+	glades::TransformerServingLayer& layer_;
+	bool started_;
+	bool joined_;
+	pthread_t thread_;
+	volatile unsigned int threadDone_;
+	bool completedDuringCallback_;
+	bool blockedDuringCallback_;
+	bool threadOk_;
+	ThreadArgs args_;
 };
 
 } // namespace
@@ -662,21 +580,80 @@ void TransformerServingLayerUnitTest()
 		layer.stop();
 	}
 
-	// --------
-	// Case 9: clearSnapshot() removes completed snapshot
-	// --------
-	{
-		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 1u;
-		cfg.maxSeqLen = 16u;
-		cfg.enableLogs = false;
-		ASSERT("==============ServingLayer: StartOK8 Failed==============", layer.start(*m.net, cfg).ok());
+		// --------
+		// Case 9: clearSnapshot() removes completed snapshot
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK8a Failed==============", layer.start(*m.net, cfg).ok());
 
-		std::vector<unsigned int> prompt;
-		prompt.push_back(1u);
-		uint64_t id = 0;
-		ASSERT("==============ServingLayer: SubmitShort Failed==============", layer.submit(make_req(prompt, 0u, false, 0u, 1u), id).ok());
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitPendingClear Failed==============", layer.submit(make_req(prompt, 1u, false, 0u, 1u), id).ok());
+			ASSERT("==============ServingLayer: ClearPendingRejected Failed==============", !layer.clearSnapshot(id));
+
+			ASSERT("==============ServingLayer: StepLiveClear Failed==============", layer.step().ok());
+			ASSERT("==============ServingLayer: ClearLiveRejected Failed==============", !layer.clearSnapshot(id));
+
+			glades::TransformerServingLayer::RequestSnapshot snap;
+			ASSERT("==============ServingLayer: SnapshotStillPresent Failed==============", layer.getSnapshot(id, snap));
+			ASSERT("==============ServingLayer: SnapshotStillInFlight Failed==============", !snap.done);
+			layer.stop();
+		}
+
+		// --------
+		// Case 10: callback executes without the serving mutex held
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK8b Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+			ProbeSnapshotFromCallback cb(layer);
+
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitProbeCallback Failed==============",
+			       layer.submit(make_req(prompt, 2u, false, 22u, 1u), id, &cb).ok());
+
+			for (unsigned int t = 0u; t < prompt.size(); ++t)
+				ASSERT("==============ServingLayer: StepProbePrefill Failed==============", layer.step().ok());
+
+			ASSERT("==============ServingLayer: StepProbeDecode Failed==============", layer.step().ok());
+			cb.join();
+			ASSERT("==============ServingLayer: CallbackNotBlocked Failed==============", !cb.blockedDuringCallback());
+			ASSERT("==============ServingLayer: CallbackProbeCompleted Failed==============", cb.completedDuringCallback());
+			ASSERT("==============ServingLayer: CallbackProbeSnapshotOK Failed==============", cb.threadOk());
+			layer.stop();
+		}
+
+		// --------
+		// Case 11: clearSnapshot() removes completed snapshot
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK9 Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitShort Failed==============", layer.submit(make_req(prompt, 0u, false, 0u, 1u), id).ok());
 
 		// With maxNewTokens=0, it should stop by limit right after prompt completes (no decode).
 		for (unsigned int spins = 0u; spins < 8u; ++spins)
@@ -694,9 +671,42 @@ void TransformerServingLayerUnitTest()
 		ASSERT("==============ServingLayer: ClearSnapshotOK Failed==============", layer.clearSnapshot(id));
 
 		glades::TransformerServingLayer::RequestSnapshot snap2;
-		ASSERT("==============ServingLayer: SnapshotCleared Missing Failed==============", !layer.getSnapshot(id, snap2));
-		layer.stop();
-	}
+			ASSERT("==============ServingLayer: SnapshotCleared Missing Failed==============", !layer.getSnapshot(id, snap2));
+			layer.stop();
+		}
 
-	printf("\n============================================================\n");
-}
+		// --------
+		// Case 10: clearSnapshot() rejects pending and live requests
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK9 Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+
+			uint64_t pendingId = 0;
+			ASSERT("==============ServingLayer: SubmitPendingClear Failed==============", layer.submit(make_req(prompt, 1u, false, 42u, 1u), pendingId).ok());
+			ASSERT("==============ServingLayer: ClearPendingSnapshotRejected Failed==============", !layer.clearSnapshot(pendingId));
+
+			glades::TransformerServingLayer::RequestSnapshot pendingSnap;
+			ASSERT("==============ServingLayer: PendingSnapshotStillExists Failed==============", layer.getSnapshot(pendingId, pendingSnap));
+			ASSERT("==============ServingLayer: PendingSnapshotNotDone Failed==============", !pendingSnap.done);
+
+			ASSERT("==============ServingLayer: StepLiveClear Failed==============", layer.step().ok());
+			ASSERT("==============ServingLayer: ClearLiveSnapshotRejected Failed==============", !layer.clearSnapshot(pendingId));
+
+			glades::TransformerServingLayer::RequestSnapshot liveSnap;
+			ASSERT("==============ServingLayer: LiveSnapshotStillExists Failed==============", layer.getSnapshot(pendingId, liveSnap));
+			ASSERT("==============ServingLayer: LiveSnapshotNotDone Failed==============", !liveSnap.done);
+			layer.stop();
+		}
+
+		printf("\n============================================================\n");
+	}

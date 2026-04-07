@@ -11,7 +11,10 @@
 #include "Backend/Database/GLogger.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -25,6 +28,89 @@ namespace {
 using namespace glades::sampling;
 
 static inline bool is_finite(float x) { return std::isfinite(x); }
+
+static inline bool checked_mul_size(size_t a, size_t b, size_t& out)
+{
+	if (a == 0u || b == 0u)
+	{
+		out = 0u;
+		return true;
+	}
+	if (a > (std::numeric_limits<size_t>::max() / b))
+		return false;
+	out = a * b;
+	return true;
+}
+
+static inline bool parse_u64_env(const char* name, unsigned long long& out)
+{
+	out = 0ULL;
+	if (!name || !name[0])
+		return false;
+	const char* v = ::getenv(name);
+	if (!v || !v[0])
+		return false;
+	errno = 0;
+	char* end = NULL;
+	const unsigned long long x = ::strtoull(v, &end, 10);
+	if (errno != 0 || end == v || (end && *end != '\0'))
+		return false;
+	out = x;
+	return true;
+}
+
+static inline unsigned long long transformer_serve_max_bytes()
+{
+	static const unsigned long long kDefault = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+	unsigned long long v = 0ULL;
+	if (parse_u64_env("GLADES_TRANSFORMER_SERVE_MAX_BYTES", v) && v > 0ULL)
+		return v;
+	return kDefault;
+}
+
+static std::string bytes_to_human(unsigned long long bytes)
+{
+	std::ostringstream oss;
+	const double b = static_cast<double>(bytes);
+	const double mib = b / (1024.0 * 1024.0);
+	const double gib = mib / 1024.0;
+	oss.setf(std::ios::fixed);
+	oss.precision(2);
+	if (gib >= 1.0)
+		oss << gib << " GiB";
+	else
+		oss << mib << " MiB";
+	return oss.str();
+}
+
+static NNetworkStatus validate_transformer_serve_logits_storage(const char* where,
+                                                               size_t rows,
+                                                               size_t vocab,
+                                                               unsigned int numFloatBuffers)
+{
+	size_t elemsPer = 0u;
+	if (!checked_mul_size(rows, vocab, elemsPer))
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, std::string(where) + ": logits buffer size overflow");
+
+	size_t bytesPer = 0u;
+	if (!checked_mul_size(elemsPer, sizeof(float), bytesPer))
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, std::string(where) + ": logits buffer byte size overflow");
+
+	size_t totalBytes = 0u;
+	if (!checked_mul_size(bytesPer, static_cast<size_t>(numFloatBuffers), totalBytes))
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, std::string(where) + ": total logits buffer byte size overflow");
+
+	const unsigned long long cap = transformer_serve_max_bytes();
+	if (static_cast<unsigned long long>(totalBytes) > cap)
+	{
+		std::ostringstream oss;
+		oss << where << ": serving logits buffers require " << bytes_to_human(static_cast<unsigned long long>(totalBytes))
+		    << " > cap " << bytes_to_human(cap);
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, oss.str());
+	}
+
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
 
 // Lightweight 64-bit mixing utilities for deterministic per-call/per-request RNG seeding.
 // We intentionally DO NOT use (or mutate) NNetwork::rngEngine in inference APIs.
@@ -304,6 +390,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
                                                               glades::ITransformerGenerateCallbacks* cb) const
 {
 	out = TransformerGenerateResult();
+	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
+	if (!runGuard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		                     "transformerLmGenerate: NNetwork is already running (training/eval/inference are not re-entrant)");
 
 	if (netType != TYPE_TRANSFORMER_DECODER)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmGenerate: requires TYPE_TRANSFORMER_DECODER");
@@ -567,6 +657,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 {
 	out = TransformerServeBatchResult();
 	out.results.clear();
+	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
+	if (!runGuard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		                     "transformerLmServeGenerateBatch: NNetwork is already running (training/eval/inference are not re-entrant)");
 
 	if (netType != TYPE_TRANSFORMER_DECODER)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeGenerateBatch: requires TYPE_TRANSFORMER_DECODER");
@@ -581,6 +675,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 	const unsigned int vocab = tensorTransformer.vocabSize;
 	if (vocab == 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmServeGenerateBatch: vocabSize is 0");
+	{
+		const NNetworkStatus st = validate_transformer_serve_logits_storage("transformerLmServeGenerateBatch",
+		                                                                   static_cast<size_t>(B),
+		                                                                   static_cast<size_t>(vocab),
+		                                                                   2u);
+		if (!st.ok())
+			return st;
+	}
 
 	const TransformerMetricsConfig& mcfg = getTransformerMetricsConfig();
 	const bool metricsOn = mcfg.enable;
@@ -806,11 +908,19 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 	}
 
 	// Buffers reused across the entire call (no per-step heap churn).
-	std::vector<unsigned int> tokenIds(B, 0u);
-	std::vector<unsigned char> active(B, 0u);
-	std::vector<float> logitsFlat;      // output of append: [B, vocab]
-	std::vector<float> prevLogitsFlat;  // "current" logits used for sampling next token: [B, vocab]
-	prevLogitsFlat.assign(static_cast<size_t>(B) * static_cast<size_t>(vocab), 0.0f);
+		std::vector<unsigned int> tokenIds(B, 0u);
+		std::vector<unsigned char> active(B, 0u);
+		std::vector<float> logitsFlat;      // output of append: [B, vocab]
+		std::vector<float> prevLogitsFlat;  // "current" logits used for sampling next token: [B, vocab]
+		{
+			size_t logitsElems = 0u;
+			if (!checked_mul_size(static_cast<size_t>(B), static_cast<size_t>(vocab), logitsElems))
+			{
+				retSt = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeGenerateBatch: logits element count overflow");
+				return retSt;
+			}
+			prevLogitsFlat.assign(logitsElems, 0.0f);
+		}
 
 	// Prefill prompts without positional distortion (ragged):
 	// We append only those requests that have a real token at this timestep.
@@ -1024,6 +1134,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherReset(glades::NNetwork::TransformerServeBatcher& batcher,
                                                                         const glades::NNetwork::TransformerServeBatcherConfig& cfg) const
 {
+	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
+	if (!runGuard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		                     "transformerLmServeBatcherReset: NNetwork is already running (training/eval/inference are not re-entrant)");
+
 	batcher.reset();
 
 	if (netType != TYPE_TRANSFORMER_DECODER)
@@ -1040,6 +1155,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherReset(glades::
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherReset: maxBatchSize is 0");
 	if (cfg.maxSeqLen == 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherReset: maxSeqLen is 0");
+	{
+		const NNetworkStatus st = validate_transformer_serve_logits_storage("transformerLmServeBatcherReset",
+		                                                                   static_cast<size_t>(cfg.maxBatchSize),
+		                                                                   static_cast<size_t>(vocab),
+		                                                                   2u);
+		if (!st.ok())
+			return st;
+	}
 
 	batcher.initialized = true;
 	batcher.vocab = vocab;
@@ -1079,8 +1202,13 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherReset(glades::
 	batcher.sampledTok.assign(B, 0u);
 	batcher.sampledIsValid.assign(B, 0u);
 
-	batcher.prevLogitsFlat.assign(static_cast<size_t>(B) * static_cast<size_t>(vocab), 0.0f);
-	batcher.logitsFlat.assign(static_cast<size_t>(B) * static_cast<size_t>(vocab), 0.0f);
+		{
+			size_t logitsElems = 0u;
+			if (!checked_mul_size(static_cast<size_t>(B), static_cast<size_t>(vocab), logitsElems))
+				return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherReset: logits element count overflow");
+			batcher.prevLogitsFlat.assign(logitsElems, 0.0f);
+			batcher.logitsFlat.assign(logitsElems, 0.0f);
+		}
 
 	// Sampling scratch: pre-size to avoid hot-path resize.
 	batcher.idxScratch.resize(vocab);
@@ -1255,6 +1383,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherRemove(glades:
 glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::NNetwork::TransformerServeBatcher& batcher,
                                                                        glades::ITransformerServeCallbacks* cb) const
 {
+	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
+	if (!runGuard.ok())
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		                     "transformerLmServeBatcherStep: NNetwork is already running (training/eval/inference are not re-entrant)");
+
 	if (!batcher.initialized)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmServeBatcherStep: batcher not initialized");
 	if (batcher.maxBatchSize == 0u || batcher.vocab == 0u)

@@ -32,6 +32,11 @@ public:
 	void setPadTokenId(int id) { padTokenId = id; }
 	int getPadTokenId() const { return padTokenId; }
 
+	// Optional compatibility knob for callers that explicitly want a single imported split
+	// to be mirrored into the test split. Disabled by default so train/test semantics stay honest.
+	void setMirrorTrainToTestOnImplicitSplit(bool enabled) { mirrorTrainToTestOnImplicitSplit = enabled; }
+	bool getMirrorTrainToTestOnImplicitSplit() const { return mirrorTrainToTestOnImplicitSplit; }
+
 	// DataInput API
 	// Import replaces any previously loaded token data.
 	virtual void import(shmea::GString, int = 0);
@@ -77,6 +82,7 @@ public:
 private:
 	bool loaded;
 	int padTokenId;
+	bool mirrorTrainToTestOnImplicitSplit;
 
 	// Most recent import/load status. When loaded==false, this SHOULD describe why.
 	NNetworkStatus lastImportStatus;

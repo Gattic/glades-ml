@@ -10,3 +10,4 @@ alpaca.key
 .claude/
 .worktrees/
 .codex
+logs/

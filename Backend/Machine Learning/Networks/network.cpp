@@ -221,6 +221,32 @@ glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogits(const gla
 	return net.transformerLmForwardLastLogits(tokenIds, outLogits);
 }
 
+glades::TransformerPublicAPI::Runtime glades::TransformerPublicAPI::runtime(const glades::NNetwork& net)
+{
+	return Runtime(net);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::generate(const std::vector<glades::TokenId>& promptTokens,
+                                                                       const glades::TransformerGenerateConfig& cfg,
+                                                                       glades::TransformerGenerateResult& out,
+                                                                       glades::ITransformerGenerateCallbacks* cb) const
+{
+	return TransformerPublicAPI::generate(net, promptTokens, cfg, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::generateBatch(const std::vector<glades::TransformerServeRequest>& requests,
+                                                                            glades::TransformerServeBatchResult& out,
+                                                                            glades::ITransformerServeCallbacks* cb) const
+{
+	return TransformerPublicAPI::generateBatch(net, requests, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogits(const std::vector<glades::TokenId>& tokenIds,
+                                                                                std::vector<float>& outLogits) const
+{
+	return TransformerPublicAPI::forwardLastLogits(net, tokenIds, outLogits);
+}
+
 void glades::NNetwork::releaseRunLock()
 {
 #if GLADES_HAVE_STD_ATOMICS

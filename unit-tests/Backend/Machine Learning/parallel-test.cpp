@@ -12,6 +12,7 @@
 
 #include "parallel-test.h"
 #include "../../unit-test.h"
+#include "test_token_id_input_fixture.h"
 
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/glades_thread_pool.h"
@@ -32,6 +33,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <pthread.h>
+#include <string>
 #include <vector>
 
 namespace {
@@ -139,94 +142,6 @@ struct ThreadCountGuard
 private:
 	ThreadCountGuard(const ThreadCountGuard&);
 	ThreadCountGuard& operator=(const ThreadCountGuard&);
-};
-
-// ---------------------------------------------------------------------------
-// Minimal in-memory token-id DataInput (same pattern as nn-test.cpp).
-// ---------------------------------------------------------------------------
-
-class InMemoryTokenIdInput : public glades::DataInput
-{
-public:
-	InMemoryTokenIdInput()
-	    : padTokenId_(-1), scratchTok_(0.0f), scratchNext_(0.0f), one_(1, 0.0f), empty_() {}
-
-	void setTrainTokens(const std::vector<unsigned int>& toks, int pad)
-	{
-		padTokenId_ = pad;
-		trainTok_.clear();
-		trainNextTok_.clear();
-		trainTok_.reserve(toks.size());
-		for (size_t i = 0; i < toks.size(); ++i)
-			trainTok_.push_back(static_cast<int>(toks[i]));
-		buildNext(trainTok_, padTokenId_, trainNextTok_);
-	}
-
-	void mirrorTrainToTest()
-	{
-		testTok_ = trainTok_;
-		testNextTok_ = trainNextTok_;
-	}
-
-	virtual void import(shmea::GString, int = 0) {}
-	virtual void import(const shmea::GTable&, int = 0) {}
-
-	virtual shmea::GVector<float> getTrainRow(unsigned int i) const
-	{
-		if (i >= trainTok_.size()) return empty_;
-		one_[0] = static_cast<float>(trainTok_[i]); return one_;
-	}
-	virtual shmea::GVector<float> getTrainExpectedRow(unsigned int i) const
-	{
-		if (i >= trainNextTok_.size()) return empty_;
-		one_[0] = static_cast<float>(trainNextTok_[i]); return one_;
-	}
-	virtual shmea::GVector<float> getTestRow(unsigned int i) const
-	{
-		if (i >= testTok_.size()) return empty_;
-		one_[0] = static_cast<float>(testTok_[i]); return one_;
-	}
-	virtual shmea::GVector<float> getTestExpectedRow(unsigned int i) const
-	{
-		if (i >= testNextTok_.size()) return empty_;
-		one_[0] = static_cast<float>(testNextTok_[i]); return one_;
-	}
-
-	virtual bool getTrainRowView(unsigned int i, const float*& d, unsigned int& sz) const
-	{ d=NULL; sz=0; if(i>=trainTok_.size()) return false; scratchTok_=static_cast<float>(trainTok_[i]); d=&scratchTok_; sz=1; return true; }
-	virtual bool getTrainExpectedRowView(unsigned int i, const float*& d, unsigned int& sz) const
-	{ d=NULL; sz=0; if(i>=trainNextTok_.size()) return false; scratchNext_=static_cast<float>(trainNextTok_[i]); d=&scratchNext_; sz=1; return true; }
-	virtual bool getTestRowView(unsigned int i, const float*& d, unsigned int& sz) const
-	{ d=NULL; sz=0; if(i>=testTok_.size()) return false; scratchTok_=static_cast<float>(testTok_[i]); d=&scratchTok_; sz=1; return true; }
-	virtual bool getTestExpectedRowView(unsigned int i, const float*& d, unsigned int& sz) const
-	{ d=NULL; sz=0; if(i>=testNextTok_.size()) return false; scratchNext_=static_cast<float>(testNextTok_[i]); d=&scratchNext_; sz=1; return true; }
-
-	virtual bool getTrainTokenId(unsigned int i, int& out) const
-	{ out=0; if(i>=trainTok_.size()) return false; out=trainTok_[i]; return true; }
-	virtual bool getTrainExpectedTokenId(unsigned int i, int& out) const
-	{ out=0; if(i>=trainNextTok_.size()) return false; out=trainNextTok_[i]; return true; }
-	virtual bool getTestTokenId(unsigned int i, int& out) const
-	{ out=0; if(i>=testTok_.size()) return false; out=testTok_[i]; return true; }
-	virtual bool getTestExpectedTokenId(unsigned int i, int& out) const
-	{ out=0; if(i>=testNextTok_.size()) return false; out=testNextTok_[i]; return true; }
-
-	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok_.size()); }
-	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok_.size()); }
-	virtual unsigned int getFeatureCount() const { return 1u; }
-	virtual int getType() const { return TEXT; }
-
-private:
-	static void buildNext(const std::vector<int>& t, int pad, std::vector<int>& o)
-	{
-		o.clear(); o.reserve(t.size());
-		for (size_t i=0; i<t.size(); ++i)
-			o.push_back((i+1<t.size()) ? t[i+1] : pad);
-	}
-	int padTokenId_;
-	std::vector<int> trainTok_, trainNextTok_, testTok_, testNextTok_;
-	mutable float scratchTok_, scratchNext_;
-	mutable shmea::GVector<float> one_;
-	shmea::GVector<float> empty_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1120,6 +1035,133 @@ static void test_parallel_for_fewer_items_than_threads()
 	}
 }
 
+struct RowViewTlsSync
+{
+	pthread_mutex_t mu;
+	pthread_cond_t cv;
+	unsigned int phase;
+
+	RowViewTlsSync() : phase(0u)
+	{
+		(void)pthread_mutex_init(&mu, NULL);
+		(void)pthread_cond_init(&cv, NULL);
+	}
+
+	~RowViewTlsSync()
+	{
+		(void)pthread_cond_destroy(&cv);
+		(void)pthread_mutex_destroy(&mu);
+	}
+};
+
+struct RowViewTlsThreadArgs
+{
+	InMemoryTokenIdInput* di;
+	RowViewTlsSync* sync;
+	unsigned int rowIndex;
+	float firstValue;
+	float secondValue;
+	bool ok;
+
+	RowViewTlsThreadArgs()
+	    : di(NULL),
+	      sync(NULL),
+	      rowIndex(0u),
+	      firstValue(0.0f),
+	      secondValue(0.0f),
+	      ok(false)
+	{
+	}
+};
+
+static void* row_view_tls_reader_a(void* ud)
+{
+	RowViewTlsThreadArgs* args = static_cast<RowViewTlsThreadArgs*>(ud);
+	if (!args || !args->di || !args->sync)
+		return NULL;
+
+	const float* data = NULL;
+	unsigned int size = 0u;
+	args->ok = args->di->getTrainRowView(args->rowIndex, data, size);
+	if (!args->ok || !data || size != 1u)
+		return NULL;
+	args->firstValue = data[0];
+
+	pthread_mutex_lock(&args->sync->mu);
+	args->sync->phase = 1u;
+	pthread_cond_broadcast(&args->sync->cv);
+	while (args->sync->phase < 2u)
+		pthread_cond_wait(&args->sync->cv, &args->sync->mu);
+	pthread_mutex_unlock(&args->sync->mu);
+
+	args->secondValue = data[0];
+	return NULL;
+}
+
+static void* row_view_tls_reader_b(void* ud)
+{
+	RowViewTlsThreadArgs* args = static_cast<RowViewTlsThreadArgs*>(ud);
+	if (!args || !args->di || !args->sync)
+		return NULL;
+
+	pthread_mutex_lock(&args->sync->mu);
+	while (args->sync->phase < 1u)
+		pthread_cond_wait(&args->sync->cv, &args->sync->mu);
+	pthread_mutex_unlock(&args->sync->mu);
+
+	const float* data = NULL;
+	unsigned int size = 0u;
+	args->ok = args->di->getTrainRowView(args->rowIndex, data, size);
+	if (args->ok && data && size == 1u)
+		args->firstValue = data[0];
+	else
+		args->ok = false;
+
+	pthread_mutex_lock(&args->sync->mu);
+	args->sync->phase = 2u;
+	pthread_cond_broadcast(&args->sync->cv);
+	pthread_mutex_unlock(&args->sync->mu);
+
+	return NULL;
+}
+
+static void test_token_row_view_is_thread_local()
+{
+	printf("-----------------------------------\n");
+	printf("Token row-view TLS semantics\n");
+	printf("-----------------------------------\n");
+
+	InMemoryTokenIdInput di;
+	std::vector<unsigned int> toks;
+	toks.push_back(11u);
+	toks.push_back(29u);
+	toks.push_back(7u);
+	di.setTrainTokens(toks, -1);
+
+	RowViewTlsSync sync;
+	RowViewTlsThreadArgs a;
+	a.di = &di;
+	a.sync = &sync;
+	a.rowIndex = 0u;
+	RowViewTlsThreadArgs b;
+	b.di = &di;
+	b.sync = &sync;
+	b.rowIndex = 1u;
+
+	pthread_t ta;
+	pthread_t tb;
+	ASSERT("row-view tls create thread A", pthread_create(&ta, NULL, &row_view_tls_reader_a, &a) == 0);
+	ASSERT("row-view tls create thread B", pthread_create(&tb, NULL, &row_view_tls_reader_b, &b) == 0);
+	(void)pthread_join(ta, NULL);
+	(void)pthread_join(tb, NULL);
+
+	ASSERT("row-view tls thread A ok", a.ok);
+	ASSERT("row-view tls thread B ok", b.ok);
+	ASSERT("row-view tls thread A initial value", std::fabs(a.firstValue - 11.0f) < 1e-6f);
+	ASSERT("row-view tls thread B value", std::fabs(b.firstValue - 29.0f) < 1e-6f);
+	ASSERT("row-view tls thread A stable after concurrent read", std::fabs(a.secondValue - 11.0f) < 1e-6f);
+}
+
 // ---------------------------------------------------------------------------
 // 13. Training with different transformer configs (exercises all parallel regions)
 // ---------------------------------------------------------------------------
@@ -1483,6 +1525,154 @@ static void test_training_t1()
 	delete info;
 }
 
+// ---------------------------------------------------------------------------
+// 17. Public transformer infer/generate APIs reject re-entry during training
+// ---------------------------------------------------------------------------
+
+static void test_transformer_run_lock_reentry_rejection()
+{
+	printf("-----------------------------------\n");
+	printf("Transformer run lock re-entry rejection\n");
+	printf("-----------------------------------\n");
+
+	const unsigned int vocab = 8u;
+	const unsigned int padTokenId = vocab - 1u;
+
+	std::vector<unsigned int> toks;
+	toks.push_back(1u);
+	toks.push_back(2u);
+	toks.push_back(3u);
+	toks.push_back(4u);
+
+	InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+	di->setTrainTokens(toks, static_cast<int>(padTokenId));
+	di->mirrorTrainToTest();
+
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	hidden.push_back(new glades::HiddenLayerInfo(
+	    8, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	hidden.push_back(new glades::HiddenLayerInfo(
+	    8, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	glades::NNInfo* info = new glades::NNInfo("ut_par_transformer_runlock", in, hidden, out);
+
+	glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+	net.setSeed(7u);
+	{
+		glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+		cfg.transformer.enableTokenEmbedding = true;
+		cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+		cfg.transformer.tieEmbeddings = true;
+		cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+		cfg.transformer.nHeadsOverride = 2;
+		cfg.transformer.nKVHeadsOverride = 1;
+		cfg.transformer.dFFOverride = 16;
+		cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+		cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+		cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+	}
+
+	net.getTerminatorMutable().setEpoch(1);
+	net.getTerminatorMutable().setAccuracy(0);
+
+	ASSERT("run-lock init ok", net.test(di).ok());
+
+	std::vector<unsigned int> prompt;
+	prompt.push_back(1u);
+	prompt.push_back(2u);
+
+	glades::NNetwork::TransformerGenerateConfig genCfg;
+	genCfg.maxNewTokens = 1u;
+	genCfg.maxSeqLen = 3u;
+
+	glades::NNetwork::TransformerServeBatcher batcher;
+	glades::NNetwork::TransformerServeBatcherConfig batcherCfg;
+	batcherCfg.maxBatchSize = 1u;
+	batcherCfg.maxSeqLen = 4u;
+	ASSERT("run-lock batcher reset ok", net.transformerLmServeBatcherReset(batcher, batcherCfg).ok());
+
+	glades::NNetwork::TransformerServeRequest request;
+	request.promptTokens = prompt;
+	request.cfg = genCfg;
+	unsigned int slot = 0u;
+	ASSERT("run-lock batcher submit ok", net.transformerLmServeBatcherSubmit(batcher, request, slot).ok());
+	ASSERT("run-lock batcher slot 0", slot == 0u);
+
+	struct RunLockProbeCb : public glades::ITrainingCallbacks
+	{
+		std::vector<unsigned int> promptTokens;
+		glades::NNetwork::TransformerGenerateConfig cfg;
+		glades::NNetwork::TransformerServeBatcher& batcherRef;
+		bool sawRunStart;
+		glades::NNetworkStatus genStatus;
+		glades::NNetworkStatus batchStatus;
+		glades::NNetworkStatus forwardStatus;
+		glades::NNetworkStatus batcherResetStatus;
+		glades::NNetworkStatus batcherStepStatus;
+
+		RunLockProbeCb(const std::vector<unsigned int>& prompt,
+		               const glades::NNetwork::TransformerGenerateConfig& c,
+		               glades::NNetwork::TransformerServeBatcher& batcher)
+		    : promptTokens(prompt),
+		      cfg(c),
+		      batcherRef(batcher),
+		      sawRunStart(false),
+		      genStatus(glades::NNetworkStatus::OK, std::string()),
+		      batchStatus(glades::NNetworkStatus::OK, std::string()),
+		      forwardStatus(glades::NNetworkStatus::OK, std::string()),
+		      batcherResetStatus(glades::NNetworkStatus::OK, std::string()),
+		      batcherStepStatus(glades::NNetworkStatus::OK, std::string())
+		{
+		}
+
+		virtual void onRunStart(const glades::NNetwork& net, int)
+		{
+			sawRunStart = true;
+
+			glades::NNetwork::TransformerGenerateResult out;
+			genStatus = net.transformerLmGenerate(promptTokens, cfg, out, NULL);
+
+			std::vector<glades::NNetwork::TransformerServeRequest> reqs(1);
+			reqs[0].promptTokens = promptTokens;
+			reqs[0].cfg = cfg;
+			glades::NNetwork::TransformerServeBatchResult outBatch;
+			batchStatus = net.transformerLmServeGenerateBatch(reqs, outBatch, NULL);
+
+			std::vector<float> logits;
+			forwardStatus = net.transformerLmForwardLastLogits(promptTokens, logits);
+
+			glades::NNetwork::TransformerServeBatcherConfig localCfg;
+			localCfg.maxBatchSize = 1u;
+			localCfg.maxSeqLen = 4u;
+			batcherResetStatus = net.transformerLmServeBatcherReset(batcherRef, localCfg);
+			batcherStepStatus = net.transformerLmServeBatcherStep(batcherRef, NULL);
+		}
+
+		virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics&)
+		{
+			return true;
+		}
+
+		virtual void onRunEnd(const glades::NNetwork&, int) {}
+	};
+
+	RunLockProbeCb cb(prompt, genCfg, batcher);
+	ASSERT("run-lock train ok", net.train(di, &cb).ok());
+	ASSERT("run-lock callback invoked", cb.sawRunStart);
+	ASSERT("run-lock generate rejected", cb.genStatus.code == glades::NNetworkStatus::INVALID_STATE);
+	ASSERT("run-lock serve-generate rejected", cb.batchStatus.code == glades::NNetworkStatus::INVALID_STATE);
+	ASSERT("run-lock forward rejected", cb.forwardStatus.code == glades::NNetworkStatus::INVALID_STATE);
+	ASSERT("run-lock batcher reset rejected", cb.batcherResetStatus.code == glades::NNetworkStatus::INVALID_STATE);
+	ASSERT("run-lock batcher step rejected", cb.batcherStepStatus.code == glades::NNetworkStatus::INVALID_STATE);
+
+	delete di;
+	delete info;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1500,6 +1690,7 @@ void ParallelUnitTest()
 	test_thread_pool_partitioning();
 	test_parallel_for_stress();
 	test_parallel_for_fewer_items_than_threads();
+	test_token_row_view_is_thread_local();
 
 	// Kernel-level parity.
 	test_linear_forward_parity();
@@ -1516,6 +1707,7 @@ void ParallelUnitTest()
 	test_triple_determinism();
 	test_training_various_configs();
 	test_training_t1();
+	test_transformer_run_lock_reentry_rejection();
 
 	printf("\n============================================================\n");
 }

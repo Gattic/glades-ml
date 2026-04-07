@@ -120,6 +120,7 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 glades::TokenInput::TokenInput()
     : loaded(false),
       padTokenId(-1),
+      mirrorTrainToTestOnImplicitSplit(false),
       lastImportStatus(glades::NNetworkStatus::OK, std::string())
 {
 	trainTok.clear();
@@ -242,6 +243,7 @@ glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path
 void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 {
 	const std::string p = to_std_string(fname);
+	const bool isDirectoryImport = path_ends_with(p, "/");
 	if (p.empty())
 	{
 		clearLoadedData();
@@ -253,17 +255,17 @@ void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 	std::vector<int> newTrainNextTok;
 	std::vector<int> newTestTok;
 	std::vector<int> newTestNextTok;
-	// Directory semantics: if path ends with '/', accept "train.tok" + "test.tok".
-	// File semantics: treat as train only (mirror to test).
+	// Directory semantics: require both "train.tok" and "test.tok".
+	// File semantics: treat the file as train-only unless mirroring was explicitly requested.
 	std::vector<SequenceSpan> trSeq;
 	std::vector<SequenceSpan> teSeq;
 
 	glades::NNetworkStatus stTrain(glades::NNetworkStatus::OK, std::string());
-	if (path_ends_with(p, "/"))
+	glades::NNetworkStatus stTest(glades::NNetworkStatus::OK, std::string());
+	if (isDirectoryImport)
 	{
 		stTrain = loadTokenFile(p + "train.tok", newTrainTok, newTrainNextTok, trSeq);
-		// Test split is optional; ignore failures and mirror train->test below.
-		(void)loadTokenFile(p + "test.tok", newTestTok, newTestNextTok, teSeq);
+		stTest = loadTokenFile(p + "test.tok", newTestTok, newTestNextTok, teSeq);
 	}
 	else
 	{
@@ -276,9 +278,15 @@ void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 		lastImportStatus = stTrain;
 		return;
 	}
+	if (isDirectoryImport && !stTest.ok())
+	{
+		clearLoadedData();
+		lastImportStatus = stTest;
+		return;
+	}
 
-	// Default: if no explicit test split loaded, mirror train->test.
-	if (newTestTok.empty() && !newTrainTok.empty())
+	// Optional compatibility mode for single-input imports.
+	if (!isDirectoryImport && mirrorTrainToTestOnImplicitSplit && newTestTok.empty() && !newTrainTok.empty())
 	{
 		newTestTok = newTrainTok;
 		newTestNextTok = newTrainNextTok;
@@ -321,6 +329,7 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 	std::vector<int> newTrainTok;
 	std::vector<int> newTrainNextTok;
 	std::vector<SequenceSpan> trSeq;
+	std::vector<SequenceSpan> teSeq;
 
 	if (C == 1u)
 	{
@@ -421,12 +430,21 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 		return;
 	}
 
-	// Mirror train->test by default (same semantics as file import when no explicit test split exists).
 	trainTok.swap(newTrainTok);
 	trainNextTok.swap(newTrainNextTok);
-	testTok = trainTok;
-	testNextTok = trainNextTok;
-	if (!setTrainSequences(trSeq) || !setTestSequences(trSeq))
+	if (mirrorTrainToTestOnImplicitSplit)
+	{
+		testTok = trainTok;
+		testNextTok = trainNextTok;
+		teSeq = trSeq;
+	}
+	else
+	{
+		testTok.clear();
+		testNextTok.clear();
+		teSeq.clear();
+	}
+	if (!setTrainSequences(trSeq) || !setTestSequences(teSeq))
 	{
 		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,

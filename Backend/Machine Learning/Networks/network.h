@@ -2032,8 +2032,9 @@ public:
 	//
 	// IMPORTANT:
 	// - This API allocates and uses a per-call KV session (no internal KV state is retained).
-	// - It is still not safe to call concurrently with training/mutation on the same NNetwork instance.
+	// - It fails fast if the same NNetwork instance is already running training/eval/inference.
 	// - This API requires token LM mode (enableTokenEmbedding==true) and decoder net type.
+	// - For supported transformer-facing callers, prefer TransformerPublicAPI / TransformerPublicAPI::runtime(net).
 	// Backward-compatible aliases (these types have moved to glades:: namespace scope;
 	// see transformer_types.h for definitions).
 	typedef glades::TransformerGenerateConfig TransformerGenerateConfig;
@@ -2079,8 +2080,11 @@ public:
 	// Thread-safety:
 	// - A batcher is not internally synchronized; do not call Step/Submit/Remove concurrently
 	//   on the same batcher from multiple threads.
-	// - Multiple batchers may be used concurrently with the same NNetwork as long as the network
-	//   is not being mutated (trained) concurrently.
+	// - Multiple batchers may be used concurrently with the same NNetwork only while the network
+	//   is otherwise idle; public Reset/Step/generate/forward entry points fail fast if the
+	//   network is already running training/eval/inference.
+	// - Prefer TransformerPublicAPI for the supported one-shot runtime surface; these low-level
+	//   batcher/session entry points remain on NNetwork for compatibility and advanced callers.
 	struct TransformerServeBatcherConfig
 	{
 		// Maximum number of concurrent requests (slots) in this batcher.

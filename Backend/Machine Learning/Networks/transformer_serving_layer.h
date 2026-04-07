@@ -16,8 +16,9 @@
 // - This layer is internally synchronized: all public APIs are safe to call concurrently from
 //   multiple threads.
 // - `step()` drives the batcher forward and invokes user callbacks on the caller's thread.
-// - For simplicity and determinism, callbacks may execute while the serving layer holds its
-//   internal lock. Callbacks should be fast and must not call `step()` re-entrantly.
+// - Internal state mutation is serialized under the layer mutex, but user callbacks execute
+//   after the serving layer releases that mutex. Callbacks may call other public APIs, but
+//   must not call `step()` re-entrantly.
 //
 // Copyright 2026
 //
@@ -149,7 +150,7 @@ public:
 	bool popNewTokens(uint64_t requestId, std::vector<unsigned int>& outNewTokens, bool& outDone, NNetworkStatus& outStatus);
 
 	// Forget a completed request snapshot (does not affect the model/batcher).
-	// Returns false if requestId not found.
+	// Returns false if requestId not found or the request is still pending/live.
 	bool clearSnapshot(uint64_t requestId);
 
 private:
@@ -185,6 +186,20 @@ private:
 			if (locked_)
 				m_.unlock();
 		}
+		void unlock()
+		{
+			if (!locked_)
+				return;
+			m_.unlock();
+			locked_ = false;
+		}
+		void lock()
+		{
+			if (locked_)
+				return;
+			m_.lock();
+			locked_ = true;
+		}
 
 	private:
 		const Mutex& m_;
@@ -210,6 +225,25 @@ private:
 		uint64_t id;
 		ITransformerServingCallbacks* cb;
 		LiveSlot() : id(0ULL), cb(NULL) {}
+	};
+
+	struct DeferredTokenCallback
+	{
+		uint64_t requestId;
+		ITransformerServingCallbacks* cb;
+		unsigned int tokenId;
+		unsigned int generatedIndex;
+		DeferredTokenCallback()
+		    : requestId(0ULL), cb(NULL), tokenId(0u), generatedIndex(0u)
+		{
+		}
+		DeferredTokenCallback(uint64_t newId,
+		                      ITransformerServingCallbacks* newCb,
+		                      unsigned int newTokenId,
+		                      unsigned int newGeneratedIndex)
+		    : requestId(newId), cb(newCb), tokenId(newTokenId), generatedIndex(newGeneratedIndex)
+		{
+		}
 	};
 
 	// Adapter used by NNetwork::transformerLmServeBatcherStep.
@@ -270,9 +304,10 @@ private:
 	// Pending queue and snapshots (single-threaded; external server should synchronize if needed).
 	std::deque<Pending> pending_;
 	std::map<uint64_t, RequestSnapshot> snapshots_;
+	mutable std::vector<DeferredTokenCallback> deferredTokenCallbacks_;
 
 	// Request id generator.
 	uint64_t nextId_;
-};
+	};
 
 } // namespace glades
