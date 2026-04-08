@@ -140,6 +140,138 @@ static inline uint64_t make_transformer_serve_batch_call_id(uint64_t seedBase,
 	return mix64(x);
 }
 
+static NNetworkStatus validate_token_id_range(const char* where,
+                                             const std::vector<unsigned int>& tokenIds,
+                                             unsigned int vocab,
+                                             const char* tokenLabel)
+{
+	if (tokenIds.empty())
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, std::string(where) + ": tokenIds is empty");
+	for (size_t i = 0u; i < tokenIds.size(); ++i)
+	{
+		if (tokenIds[i] >= vocab)
+		{
+			std::ostringstream oss;
+			oss << where << ": " << tokenLabel << " tokenId out of range";
+			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, oss.str());
+		}
+	}
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
+static uint64_t derive_single_generate_seed(uint64_t configuredSeed,
+                                           uint64_t seedOverride,
+                                           const std::vector<unsigned int>& promptTokens)
+{
+	if (seedOverride != 0ULL)
+		return seedOverride;
+	return mix64(configuredSeed ^ hash_u32_vec_fnv1a64(promptTokens));
+}
+
+static SamplingPlan build_generate_sampling_plan(unsigned int vocab,
+                                                const glades::NNetwork::TransformerGenerateConfig& cfg)
+{
+	return make_sampling_plan(vocab, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap);
+}
+
+static void init_sampling_scratch(unsigned int vocab,
+                                  std::vector<unsigned int>& idxScratch,
+                                  std::vector<float>& weightScratch);
+
+static NNetworkStatus sample_next_token_common(const char* where,
+                                               const float* logits,
+                                               const SamplingPlan& plan,
+                                               glades::rng::Engine& rng,
+                                               std::vector<unsigned int>& idxScratch,
+                                               std::vector<float>& weightScratch,
+                                               unsigned int& outToken);
+
+static bool apply_stop_token_rules(glades::NNetwork::TransformerGenerateResult& rr,
+                                   unsigned int tok,
+                                   const glades::NNetwork::TransformerGenerateConfig& cfg,
+                                   const std::vector<unsigned int>* stopTok);
+
+static NNetworkStatus prefill_single_generate_prompt(const glades::NNetwork& net,
+                                                    glades::NNetwork::TransformerLmSession& session,
+                                                    const std::vector<unsigned int>& promptTokens,
+                                                    bool metricsOn,
+                                                    double* msPrefill,
+                                                    std::vector<float>& logits)
+{
+	const unsigned int promptLen = static_cast<unsigned int>(promptTokens.size());
+	for (unsigned int i = 0u; i < promptLen; ++i)
+	{
+		const bool last = (i + 1u == promptLen);
+		ScopedTimerMs t(&net, metricsOn, msPrefill);
+		const NNetworkStatus st = net.transformerLmSessionAppend(session, promptTokens[i], last ? &logits : NULL);
+		if (!st.ok())
+			return st;
+	}
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
+static NNetworkStatus decode_single_generate_tokens(const glades::NNetwork& net,
+                                                   glades::NNetwork::TransformerLmSession& session,
+                                                   const SamplingPlan& samplingPlan,
+                                                   const glades::NNetwork::TransformerGenerateConfig& cfg,
+                                                   glades::NNetwork::TransformerGenerateResult& out,
+                                                   glades::ITransformerGenerateCallbacks* cb,
+                                                   glades::rng::Engine& callEngine,
+                                                   bool metricsOn,
+                                                   double* msSample,
+                                                   double* msDecodeAppend,
+                                                   std::vector<float>& logits)
+{
+	std::vector<unsigned int> idxScratch;
+	std::vector<float> weightScratch;
+	init_sampling_scratch(samplingPlan.vocab, idxScratch, weightScratch);
+
+	for (unsigned int genIdx = 0u; genIdx < cfg.maxNewTokens; ++genIdx)
+	{
+		if (cb && cb->shouldStop(net))
+		{
+			out.stoppedByCallback = true;
+			return NNetworkStatus(NNetworkStatus::OK, std::string());
+		}
+
+		unsigned int nextTok = 0u;
+		{
+			ScopedTimerMs t(&net, metricsOn, msSample);
+			const NNetworkStatus st = sample_next_token_common("transformerLmGenerate",
+			                                                  logits.empty() ? NULL : &logits[0],
+			                                                  samplingPlan,
+			                                                  callEngine,
+			                                                  idxScratch,
+			                                                  weightScratch,
+			                                                  nextTok);
+			if (!st.ok())
+				return st;
+		}
+
+		{
+			ScopedTimerMs t(&net, metricsOn, msDecodeAppend);
+			const NNetworkStatus st = net.transformerLmSessionAppend(session, nextTok, &logits);
+			if (!st.ok())
+				return st;
+		}
+
+		out.tokens.push_back(nextTok);
+		out.lastToken = nextTok;
+
+		if (cb && cb->onToken(net, nextTok, genIdx))
+		{
+			out.stoppedByCallback = true;
+			return NNetworkStatus(NNetworkStatus::OK, std::string());
+		}
+
+		if (apply_stop_token_rules(out, nextTok, cfg, NULL))
+			return NNetworkStatus(NNetworkStatus::OK, std::string());
+	}
+
+	out.stoppedByLimit = true;
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
 static const char* stop_reason_string(const glades::NNetwork::TransformerGenerateResult& r)
 {
 	if (r.stoppedByCallback) return "callback";
@@ -367,6 +499,21 @@ static void init_sampling_scratch(unsigned int vocab,
 
 static NNetworkStatus sample_next_token_common(const char* where,
                                                const float* logits,
+                                               const SamplingPlan& plan,
+                                               glades::rng::Engine& rng,
+                                               std::vector<unsigned int>& idxScratch,
+                                               std::vector<float>& weightScratch,
+                                               unsigned int& outToken)
+{
+	if (!sample_token_from_logits_ptr_plan(logits, rng, plan, outToken, idxScratch, weightScratch))
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, std::string(where) + ": failed to sample token from logits");
+	if (outToken >= plan.vocab)
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, std::string(where) + ": sampled tokenId out of range");
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
+static NNetworkStatus sample_next_token_common(const char* where,
+                                               const float* logits,
                                                unsigned int vocab,
                                                glades::rng::Engine& rng,
                                                const glades::NNetwork::TransformerGenerateConfig& cfg,
@@ -374,11 +521,8 @@ static NNetworkStatus sample_next_token_common(const char* where,
                                                std::vector<float>& weightScratch,
                                                unsigned int& outToken)
 {
-	if (!sample_token_from_logits_ptr(logits, rng, vocab, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap, outToken, idxScratch, weightScratch))
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, std::string(where) + ": failed to sample token from logits");
-	if (outToken >= vocab)
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, std::string(where) + ": sampled tokenId out of range");
-	return NNetworkStatus(NNetworkStatus::OK, std::string());
+	const SamplingPlan plan = build_generate_sampling_plan(vocab, cfg);
+	return sample_next_token_common(where, logits, plan, rng, idxScratch, weightScratch, outToken);
 }
 
 static bool apply_stop_token_rules(glades::NNetwork::TransformerGenerateResult& rr,
@@ -495,11 +639,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 	const unsigned int vocab = tensorTransformer.vocabSize;
 	if (vocab == 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmGenerate: vocabSize is 0");
-
-	for (size_t i = 0; i < promptTokens.size(); ++i)
 	{
-		if (promptTokens[i] >= vocab)
-			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmGenerate: prompt tokenId out of range");
+		const NNetworkStatus st = validate_token_id_range("transformerLmGenerate", promptTokens, vocab, "prompt");
+		if (!st.ok())
+			return st;
 	}
 
 	// Install a per-call RNG engine (never mutate the network RNG engine).
@@ -509,13 +652,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 	// - Else: derive a deterministic seed from this network's configured rngSeed and the prompt tokens.
 	//   This makes repeated calls with the same prompt/config deterministic and avoids shared-state races.
 	glades::rng::Engine callEngine;
-	uint64_t seed = cfg.rngSeedOverride;
-	if (seed == 0ULL)
-	{
-		// Base: network seed + prompt hash.
-		const uint64_t h = hash_u32_vec_fnv1a64(promptTokens);
-		seed = mix64(loadConfiguredSeed() ^ h);
-	}
+	const uint64_t seed = derive_single_generate_seed(loadConfiguredSeed(), cfg.rngSeedOverride, promptTokens);
 	glades::rng::seed_engine(callEngine, seed);
 
 	// KV cache sizing.
@@ -569,12 +706,9 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 
 	std::vector<float> logits; // reused
 
-	// Prefill: append all prompt tokens, computing logits only for the final prompt token.
-	for (unsigned int i = 0; i < promptLen; ++i)
 	{
-		const bool last = (i + 1u == promptLen);
-		ScopedTimerMs t(this, metricsOn, &msPrefill);
-		const NNetworkStatus st = transformerLmSessionAppend(session, promptTokens[i], last ? &logits : NULL);
+		const NNetworkStatus st =
+		    prefill_single_generate_prompt(*this, session, promptTokens, metricsOn, &msPrefill, logits);
 		if (!st.ok())
 		{
 			retSt = st;
@@ -590,63 +724,18 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 		return retSt;
 	}
 
-	// Sampling scratch buffers (pre-sized to vocab to avoid per-step allocations).
-	std::vector<unsigned int> idxScratch;
-	std::vector<float> weightScratch;
-	init_sampling_scratch(vocab, idxScratch, weightScratch);
-
-	for (unsigned int genIdx = 0u; genIdx < cfg.maxNewTokens; ++genIdx)
-	{
-		if (cb && cb->shouldStop(*this))
-		{
-			out.stoppedByCallback = true;
-			return retSt;
-		}
-
-		unsigned int nextTok = 0u;
-		{
-			ScopedTimerMs t(this, metricsOn, &msSample);
-			retSt = sample_next_token_common("transformerLmGenerate",
-			                                 logits.empty() ? NULL : &logits[0],
-			                                 vocab,
-			                                 callEngine,
-			                                 cfg,
-			                                 idxScratch,
-			                                 weightScratch,
-			                                 nextTok);
-		}
-		if (!retSt.ok())
-			return retSt;
-
-		// Append token to KV cache and fetch logits for next step.
-		{
-			ScopedTimerMs t(this, metricsOn, &msDecodeAppend);
-			const NNetworkStatus st = transformerLmSessionAppend(session, nextTok, &logits);
-			if (!st.ok())
-			{
-				retSt = st;
-				return retSt;
-			}
-		}
-
-		out.tokens.push_back(nextTok);
-		out.lastToken = nextTok;
-
-		if (cb)
-		{
-			const bool stop = cb->onToken(*this, nextTok, genIdx);
-			if (stop)
-			{
-				out.stoppedByCallback = true;
-				return retSt;
-			}
-		}
-
-		if (apply_stop_token_rules(out, nextTok, cfg, NULL))
-			return retSt;
-	}
-
-	out.stoppedByLimit = true;
+	const SamplingPlan samplingPlan = build_generate_sampling_plan(vocab, cfg);
+	retSt = decode_single_generate_tokens(*this,
+	                                     session,
+	                                     samplingPlan,
+	                                     cfg,
+	                                     out,
+	                                     cb,
+	                                     callEngine,
+	                                     metricsOn,
+	                                     &msSample,
+	                                     &msDecodeAppend,
+	                                     logits);
 	return retSt;
 }
 

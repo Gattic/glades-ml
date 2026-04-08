@@ -66,6 +66,27 @@ inline std::string bytes_to_human(unsigned long long bytes)
 	return oss.str();
 }
 
+inline unsigned int resolve_rope_dim(unsigned int dHead, int ropeDimOverride)
+{
+	unsigned int ropeDim = dHead;
+	if (ropeDimOverride > 0)
+	{
+		const unsigned int rd = static_cast<unsigned int>(ropeDimOverride);
+		ropeDim = (rd < ropeDim) ? rd : ropeDim;
+	}
+	if ((ropeDim % 2u) != 0u)
+		ropeDim -= 1u;
+	return ropeDim;
+}
+
+inline unsigned int resolve_kv_head(unsigned int queryHead, unsigned int nHeads, unsigned int nKVHeads)
+{
+	if (nKVHeads == nHeads)
+		return queryHead;
+	const unsigned int groupSize = (nKVHeads > 0u ? (nHeads / nKVHeads) : 0u);
+	return (groupSize > 0u ? (queryHead / groupSize) : 0u);
+}
+
 struct ScopedTimerMs
 {
 	const glades::NNetwork* net;
