@@ -6,6 +6,7 @@
 // - compute logits for the appended token position
 //
 #include "network.h"
+#include "transformer_config.h"
 #include "transformer_common_utils.h"
 #include "../GMath/gmath.h"
 #include "transformer_kernels.h"
@@ -158,13 +159,10 @@ static NNetworkStatus build_transformer_session_common_config(const char* where,
                                                              shmea::GLogger* logger,
                                                              TransformerSessionCommonConfig& out)
 {
-	const int posEnc = static_cast<int>(runtimeCfg.positionalEncoding);
-	if (posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_NONE) &&
-	    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL) &&
-	    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE))
-	{
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, std::string(where) + ": unknown positionalEncoding");
-	}
+	TransformerRuntimeConfigSnapshot runtime;
+	NNetworkStatus st = buildTransformerRuntimeConfigSnapshot(where, runtimeCfg, runtime);
+	if (!st.ok())
+		return st;
 
 	out.dModel = dModel;
 	out.dFF = dFF;
@@ -186,12 +184,12 @@ static NNetworkStatus build_transformer_session_common_config(const char* where,
 	out.metricsEnabled = metricsCfg.enable;
 	out.metricsBreakdownEnabled = metricsCfg.enableKvKernelBreakdown;
 	out.metricsLogPerKvAppend = metricsCfg.logPerKvAppend;
-	out.layerNormEps = (runtimeCfg.layerNormEps > 0.0f ? runtimeCfg.layerNormEps : 1e-5f);
-	out.normType = static_cast<unsigned int>(runtimeCfg.normType);
-	out.positionalEncoding = static_cast<unsigned int>(runtimeCfg.positionalEncoding);
-	out.ropeDimOverride = runtimeCfg.ropeDimOverride;
-	out.ropeTheta = (runtimeCfg.ropeTheta > 0.0f ? runtimeCfg.ropeTheta : 10000.0f);
-	out.ffnActivation = static_cast<unsigned int>(runtimeCfg.ffnActivation);
+	out.layerNormEps = runtime.layerNormEps;
+	out.normType = runtime.normType;
+	out.positionalEncoding = runtime.positionalEncoding;
+	out.ropeDimOverride = runtime.ropeDimOverride;
+	out.ropeTheta = runtime.ropeTheta;
+	out.ffnActivation = runtime.ffnActivation;
 	out.padTokenId = padTokenId;
 	out.logger = metricsCfg.enable ? logger : NULL;
 	return NNetworkStatus(NNetworkStatus::OK, std::string());

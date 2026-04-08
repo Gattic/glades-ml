@@ -1,5 +1,6 @@
 // Net-type-specific SGD: Transformer encoder/decoder-only path
 #include "network.h"
+#include "transformer_config.h"
 #include "sgd_utils.h"
 #include "transformer_common_utils.h"
 #include "transformer_train_detail.h"
@@ -119,15 +120,31 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		}
 	}
 
+	NNetworkStatus cfgStatus = validateTransformerTrainingConfig("SGDHelper_TRANSFORMER", trainingConfig);
+	if (!cfgStatus.ok())
+	{
+		lastStatus = cfgStatus;
+		storeRunningFlag(false);
+		return;
+	}
+	TransformerRuntimeConfigSnapshot runtimeCfg;
+	cfgStatus = buildTransformerRuntimeConfigSnapshot("SGDHelper_TRANSFORMER", trainingConfig.transformer, runtimeCfg);
+	if (!cfgStatus.ok())
+	{
+		lastStatus = cfgStatus;
+		storeRunningFlag(false);
+		return;
+	}
+
 	const float gradClip = trainingConfig.perElementGradClip;
 	const int costFx = skeleton->getOutputType();
-	const float lnEps = (trainingConfig.transformer.layerNormEps > 0.0f ? trainingConfig.transformer.layerNormEps : 1e-5f);
-	const int posEnc = static_cast<int>(trainingConfig.transformer.positionalEncoding);
-	const int normType = static_cast<int>(trainingConfig.transformer.normType);
-	const int ffnKind = static_cast<int>(trainingConfig.transformer.ffnKind);
-	const int ffnAct = static_cast<int>(trainingConfig.transformer.ffnActivation);
-	const float ropeTheta = (trainingConfig.transformer.ropeTheta > 0.0f ? trainingConfig.transformer.ropeTheta : 10000.0f);
-	const int ropeDimOverride = trainingConfig.transformer.ropeDimOverride;
+	const float lnEps = runtimeCfg.layerNormEps;
+	const int posEnc = static_cast<int>(runtimeCfg.positionalEncoding);
+	const int normType = static_cast<int>(runtimeCfg.normType);
+	const int ffnKind = static_cast<int>(runtimeCfg.ffnKind);
+	const int ffnAct = static_cast<int>(runtimeCfg.ffnActivation);
+	const float ropeTheta = runtimeCfg.ropeTheta;
+	const int ropeDimOverride = runtimeCfg.ropeDimOverride;
 	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = trainingConfig.transformer.tokenLmLossKind;
 	const int tokenLmNegK = trainingConfig.transformer.tokenLmSampledNegatives;
 	const bool tokenLmAllowHuge = trainingConfig.transformer.tokenLmAllowHugeFullSoftmax;
@@ -144,14 +161,6 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		storeRunningFlag(false);
 		return;
 	}
-	if (tokenLM && (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX) && (tokenLmNegK < 1))
-	{
-		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-		                            "SGDHelper_TRANSFORMER: token LM sampled-softmax requires tokenLmSampledNegatives >= 1");
-		storeRunningFlag(false);
-		return;
-	}
-
 	// Reset per-epoch bookkeeping
 	results.clear();
 	if (isTrain)

@@ -3,6 +3,8 @@ set(Networks_src_files
 	metanetwork.h
 	network.cpp
 	network.h
+	transformer_config.cpp
+	transformer_config.h
 	cross_validation.cpp
 	cross_validation.h
 	model_persistence.cpp

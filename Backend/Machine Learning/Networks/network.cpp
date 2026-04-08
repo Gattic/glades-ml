@@ -15,6 +15,7 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "network.h"
+#include "transformer_config.h"
 #include "transformer_public_api.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
@@ -1351,109 +1352,43 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 	// === Transformer (encoder/decoder) ===
 	if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
 	{
-		if (H <= 0)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: transformer requires >= 1 hidden layer (blocks)");
-			return false;
-		}
-
-		const int dModelCfg = skeleton->getHiddenLayerSize(0u);
-		const unsigned int dModel = (dModelCfg > 0) ? static_cast<unsigned int>(dModelCfg) : 0u;
-		// Proper transformer config:
-		// Use TrainingConfig.transformer overrides (persisted in the model manifest).
-		// NOTE: We intentionally do NOT read heads/dFF from NNInfo hidden-layer activation metadata.
-		int headsCfg = trainingConfig.transformer.nHeadsOverride;
-		if (headsCfg <= 0)
-			headsCfg = 4;
-		const unsigned int nHeads = static_cast<unsigned int>(headsCfg);
-
-		// Grouped-query attention: KV head count.
-		int kvHeadsCfg = trainingConfig.transformer.nKVHeadsOverride;
-		if (kvHeadsCfg <= 0)
-			kvHeadsCfg = static_cast<int>(nHeads);
-		const unsigned int nKVHeads = (kvHeadsCfg > 0) ? static_cast<unsigned int>(kvHeadsCfg) : 0u;
-
-		int dffCfg = trainingConfig.transformer.dFFOverride;
-		if (dffCfg <= 0)
-			dffCfg = static_cast<int>(4u * dModel);
-		const unsigned int dFF = (dffCfg > 0) ? static_cast<unsigned int>(dffCfg) : 0u;
-
-		// Token LM mode: derive vocab size and expect input features == 1 token id.
-		unsigned int vocabSize = outSize;
-		if (trainingConfig.transformer.vocabSizeOverride > 0)
-			vocabSize = static_cast<unsigned int>(trainingConfig.transformer.vocabSizeOverride);
-		if (tokenModel)
-		{
-			if (!trainingConfig.transformer.tieEmbeddings)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM mode currently requires tieEmbeddings=true");
-				return false;
-			}
-			if (!tokenIdInput)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM mode requires DataInput token-id accessors");
-				return false;
-			}
-			if (vocabSize == 0u)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM mode requires vocabSize > 0");
-				return false;
-			}
-			// In LM mode, require the network output layer size to match vocab unless overridden.
-			if (trainingConfig.transformer.vocabSizeOverride > 0 && outSize != vocabSize)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM vocabSizeOverride must match NNInfo output layer size");
-				return false;
-			}
-		}
-
-		const unsigned int ffnKind = static_cast<unsigned int>(trainingConfig.transformer.ffnKind);
-		const unsigned int ff1Width = (ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU))
-		                                  ? (2u * dFF)
-		                                  : dFF;
-
-		if (dModel == 0u || nHeads == 0u || nKVHeads == 0u || dFF == 0u || ff1Width == 0u)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: invalid transformer config (dModel/heads/dFF)");
-			return false;
-		}
-		if ((dModel % nHeads) != 0u)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-			                            "ensureTensorParametersInitialized: transformer dModel must be divisible by nHeads");
-			return false;
-		}
-		if ((nHeads % nKVHeads) != 0u)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-			                            "ensureTensorParametersInitialized: transformer nKVHeads must divide nHeads");
-			return false;
-		}
-
+		std::vector<unsigned int> hiddenSizes;
+		hiddenSizes.reserve(static_cast<size_t>(H > 0 ? H : 0));
 		for (int l = 0; l < H; ++l)
 		{
 			const int hs = skeleton->getHiddenLayerSize(static_cast<unsigned int>(l));
-			if (hs <= 0 || static_cast<unsigned int>(hs) != dModel)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: transformer requires constant hidden size (dModel) across all blocks");
-				return false;
-			}
+			hiddenSizes.push_back(hs > 0 ? static_cast<unsigned int>(hs) : 0u);
 		}
+
+		TransformerModelConfigSnapshot modelCfg;
+		lastStatus = buildTransformerModelConfigSnapshot("ensureTensorParametersInitialized",
+		                                                 trainingConfig,
+		                                                 hiddenSizes,
+		                                                 outSize,
+		                                                 tokenIdInput,
+		                                                 netType == TYPE_TRANSFORMER_DECODER,
+		                                                 modelCfg);
+		if (!lastStatus.ok())
+			return false;
+
+		const unsigned int dModel = modelCfg.dModel;
+		const unsigned int nHeads = modelCfg.nHeads;
+		const unsigned int nKVHeads = modelCfg.nKVHeads;
+		const unsigned int dFF = modelCfg.dFF;
+		const unsigned int vocabSize = modelCfg.vocabSize;
+		const unsigned int ffnKind = modelCfg.ffnKind;
+		const bool tokenModel = modelCfg.tokenModel;
+		const unsigned int ff1Width = modelCfg.ff1Width;
 
 		const bool mismatch = (!tensorTransformer.initialized) || (tensorTransformer.inputSize != inputSize) || (tensorTransformer.outSize != outSize) ||
 		                      (tensorTransformer.dModel != dModel) || (tensorTransformer.dFF != dFF) || (tensorTransformer.nHeads != nHeads) ||
 		                      (tensorTransformer.nKVHeads != nKVHeads) || (tensorTransformer.ffnKind != ffnKind) ||
 		                      (tensorTransformer.tokenModel != tokenModel) ||
 		                      (tensorTransformer.vocabSize != vocabSize) ||
-		                      (tensorTransformer.padTokenId != trainingConfig.transformer.padTokenId) ||
-		                      (tensorTransformer.tieEmbeddings != trainingConfig.transformer.tieEmbeddings) ||
-		                      (tensorTransformer.nLayers != static_cast<unsigned int>(H)) ||
-		                      (tensorTransformer.causal != (netType == TYPE_TRANSFORMER_DECODER));
+		                      (tensorTransformer.padTokenId != modelCfg.padTokenId) ||
+		                      (tensorTransformer.tieEmbeddings != modelCfg.tieEmbeddings) ||
+		                      (tensorTransformer.nLayers != modelCfg.nLayers) ||
+		                      (tensorTransformer.causal != modelCfg.causal);
 		if (!mismatch)
 			return true;
 
@@ -1465,13 +1400,13 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		tensorTransformer.dFF = dFF;
 		tensorTransformer.nHeads = nHeads;
 		tensorTransformer.nKVHeads = nKVHeads;
-		tensorTransformer.nLayers = static_cast<unsigned int>(H);
-		tensorTransformer.causal = (netType == TYPE_TRANSFORMER_DECODER);
+		tensorTransformer.nLayers = modelCfg.nLayers;
+		tensorTransformer.causal = modelCfg.causal;
 		tensorTransformer.ffnKind = ffnKind;
 		tensorTransformer.tokenModel = tokenModel;
 		tensorTransformer.vocabSize = vocabSize;
-		tensorTransformer.padTokenId = trainingConfig.transformer.padTokenId;
-		tensorTransformer.tieEmbeddings = trainingConfig.transformer.tieEmbeddings;
+		tensorTransformer.padTokenId = modelCfg.padTokenId;
+		tensorTransformer.tieEmbeddings = modelCfg.tieEmbeddings;
 		tensorTransformer.optimizerStep = 0ULL;
 
 		// ATLAS uses its own per-matrix state; skip AdamW moment buffers (v*/v2*) to save memory.
@@ -2898,6 +2833,30 @@ glades::NNetworkStatus glades::NNetwork::setTrainingConfig(const glades::Trainin
 	RunLockGuard runGuard(*this);
 	if (!runGuard.ok())
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "setTrainingConfig: network is running (not thread-safe/re-entrant)");
+	NNetworkStatus st = validateTransformerTrainingConfig("setTrainingConfig", cfg);
+	if (!st.ok())
+		return st;
+	if ((netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && skeleton && di)
+	{
+		std::vector<unsigned int> hiddenSizes;
+		const int hiddenCount = skeleton->numHiddenLayers();
+		hiddenSizes.reserve(static_cast<size_t>(hiddenCount > 0 ? hiddenCount : 0));
+		for (int i = 0; i < hiddenCount; ++i)
+		{
+			const int hs = skeleton->getHiddenLayerSize(static_cast<unsigned int>(i));
+			hiddenSizes.push_back(hs > 0 ? static_cast<unsigned int>(hs) : 0u);
+		}
+		TransformerModelConfigSnapshot modelCfg;
+		st = buildTransformerModelConfigSnapshot("setTrainingConfig",
+		                                         cfg,
+		                                         hiddenSizes,
+		                                         skeleton->getOutputLayerSize(),
+		                                         cfg.transformer.enableTokenEmbedding && di->hasTokenIdInput(),
+		                                         netType == TYPE_TRANSFORMER_DECODER,
+		                                         modelCfg);
+		if (!st.ok())
+			return st;
+	}
 	trainingConfig = cfg;
 	// Reset schedule bookkeeping to avoid leaking stale multipliers into the next run.
 	lrScheduleMultiplier = 1.0f;

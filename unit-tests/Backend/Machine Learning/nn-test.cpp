@@ -3327,25 +3327,16 @@ void NNTransformerUnitTest()
 
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			{
-				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				glades::TrainingConfig cfg = net.getTrainingConfig();
 				cfg.transformer.enableTokenEmbedding = true;
 				cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
 				cfg.transformer.tieEmbeddings = true;
 				cfg.transformer.nHeadsOverride = 2;
 				cfg.transformer.dFFOverride = 16;
 				cfg.transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+				const glades::NNetworkStatus stCfg = net.setTrainingConfig(cfg);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc SetTrainingConfigShouldFail Failed==============", !stCfg.ok());
 			}
-			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc InitTestStatus() Failed==============", net.test(di).ok());
-			glades::NNetwork::TransformerLmSession session;
-			const glades::NNetworkStatus stReset = net.transformerLmSessionReset(session, 4u);
-			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc KvResetShouldFail Failed==============", !stReset.ok());
-
-			// Also validate the full forward API rejects the unknown encoding.
-			std::vector<unsigned int> toks;
-			toks.push_back(1u);
-			std::vector<float> logits;
-			const glades::NNetworkStatus stF = net.transformerLmForwardLastLogits(toks, logits);
-			G_assert(__FILE__, __LINE__, "==============NN::InferApi BadPosEnc ForwardShouldFail Failed==============", !stF.ok());
 
 			delete di;
 			delete info;
@@ -4396,6 +4387,42 @@ void NNTransformerUnitTest()
 			net.getTrainingConfigMutable().transformer.tieEmbeddings = false;
 			const glades::NNetworkStatus st = net.test(di);
 			G_assert(__FILE__, __LINE__, "==============NN::BadTieEmbeddings ShouldFail Failed==============", !st.ok());
+			delete info;
+		}
+
+		// setTrainingConfig should reject invalid runtime config before execution starts.
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_invalid_config_boundary", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::TrainingConfig cfg = net.getTrainingConfig();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = 8;
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+			const glades::NNetworkStatus st = net.setTrainingConfig(cfg);
+			G_assert(__FILE__, __LINE__, "==============NN::SetTrainingConfig InvalidPosEnc Failed==============", !st.ok());
+			delete info;
+		}
+
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_invalid_sampled_softmax", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::TrainingConfig cfg = net.getTrainingConfig();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = 8;
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX;
+			cfg.transformer.tokenLmSampledNegatives = 0;
+			const glades::NNetworkStatus st = net.setTrainingConfig(cfg);
+			G_assert(__FILE__, __LINE__, "==============NN::SetTrainingConfig InvalidSampledSoftmax Failed==============", !st.ok());
 			delete info;
 		}
 
