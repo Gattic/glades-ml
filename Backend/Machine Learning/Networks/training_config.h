@@ -442,6 +442,27 @@ struct ATLASConfig
 	// Set to 0 to disable recovery (old behavior: mu can only shrink).
 	float muGrowthRate;
 
+	// When true, weight the refresh seed by the current Fisher diagonal so the
+	// tracked subspace follows the same curvature signal used for preconditioning.
+	bool fisherWeightedRefresh;
+
+	// When true, ATLAS can shrink the active subspace rank when the observed
+	// Fisher mass is concentrated in fewer directions than the configured rank.
+	bool adaptiveRank;
+
+	// Lower bound for the dynamically active rank. The allocated rank is still
+	// `rank`; this only controls how many leading directions are used each step.
+	unsigned int minActiveRank;
+
+	// Fisher mass fraction retained by the active rank. Example: 0.95 means use
+	// the smallest prefix of Fisher directions whose cumulative mass is >= 95%.
+	float rankCapture;
+
+	// If fisher_max / fisher_min stays below this threshold, treat the active
+	// spectrum as effectively flat and shrink the sketch budget conservatively
+	// at refresh boundaries. Set <= 1 to disable the flat-spectrum heuristic.
+	float flatSpectrumThreshold;
+
 	// Enable bias correction for EMA quantities (sigma2, fisherDiag).
 	// When true, applies the standard correction factor 1/(1 - beta^step)
 	// to compensate for zero-initialization bias in early steps. This
@@ -460,6 +481,11 @@ struct ATLASConfig
 	      kappaMax(10.0f),
 	      betaRefresh(0.5f),
 	      muGrowthRate(0.001f),
+	      fisherWeightedRefresh(true),
+	      adaptiveRank(false),
+	      minActiveRank(1u),
+	      rankCapture(0.95f),
+	      flatSpectrumThreshold(1.05f),
 	      biasCorrection(true)
 	{
 	}

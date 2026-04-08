@@ -16,6 +16,32 @@ The framework yields:
 - A **PAC-Bayes generalization bound** tightened by a factor of k/d relative to unconstrained training.
 - A **minimal prototype** implementable as a drop-in PyTorch optimizer.
 
+### 1.1 Empirical Redesign Update (April 8, 2026)
+
+ATLAS was revised using the diagnostic logs in `unit-tests/logs/`, especially:
+- `unit-tests/logs/2026-04-08-H16.log`
+- `unit-tests/logs/2026-04-08-H17.log`
+- `unit-tests/logs/2026-03-11-H08.log`
+
+The main empirical findings were:
+- Repeated `atlas_gram_schmidt_degenerate` events clustered in small or nearly rank-deficient matrices, indicating that refresh-time basis maintenance was too brittle.
+- Many output-like layers exhibited nearly flat Fisher spectra, so aggressive rank collapse created representational loss without reliable evidence of a true rank-1 optimum.
+- Large hidden layers often had materially non-flat Fisher structure and needed the full tracked subspace to preserve out-of-sample accuracy.
+
+The implemented redesign therefore makes three concrete changes:
+- **Fisher-weighted refresh seeds.** Refresh now follows the same curvature signal used for preconditioning instead of treating all tracked directions equally.
+- **Packed active-basis execution.** The optimizer can operate on a reduced active prefix without reallocating or reprojecting the entire stored basis every step.
+- **Conservative adaptive-rank policy.** Adaptive rank remains available, but it now shrinks only at refresh boundaries, repairs the inactive basis to keep `U` orthonormal, and is disabled by default until broader benchmarks justify turning it on globally.
+
+Observed outcomes on April 8, 2026:
+- `./glades-unit-tests atlas` passes with the redesign enabled.
+- The aggressive adaptive-rank setting improved throughput slightly but hurt MNIST test accuracy; it is therefore no longer the default.
+- The default ATLAS path with Fisher-weighted refresh and the new diagnostics reached `train=7.96s`, `testAcc=98.64%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1`.
+
+Interpretation:
+- The data supports **stability-first subspace tracking** and **opt-in adaptive compression**, not unconditional online rank collapse.
+- The next likely source of additional out-of-sample gains is a scale-consistency review of the baseline `sigma2` preconditioner versus the subspace Fisher statistics; this remains an open item rather than a completed claim.
+
 ---
 
 ## 2. Candidate Formulations

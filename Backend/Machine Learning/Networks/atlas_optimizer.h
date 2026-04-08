@@ -38,6 +38,7 @@ struct WeightState
 	unsigned int m;     // rows of weight matrix
 	unsigned int n;     // cols of weight matrix
 	unsigned int r;     // subspace rank (r <= min(m, n))
+	unsigned int activeRank; // currently active leading rank (activeRank <= r)
 
 	std::vector<float> U;           // [m * r] orthonormal subspace basis (row-major)
 	std::vector<float> fisherDiag;  // [r] EMA of Fisher eigenvalues
@@ -54,21 +55,24 @@ struct WeightState
 	std::vector<float> scratch_Z;         // [m * r]
 	std::vector<float> scratch_overlap;   // [r * r]
 	std::vector<float> scratch_prevGzOld; // [r * n]
+	std::vector<float> scratch_basisPacked; // [m * r] packed leading basis for GEMM fast path
 
 	float sigma2;                   // global second moment EMA (BRSP baseline)
 	float mu;                       // adaptive prediction coefficient
+	float lastBaselineRate;         // diagnostics for the most recent baseline step
 	unsigned long long step;        // optimizer step counter
 	bool initialized;
 
 	WeightState()
-	    : m(0u), n(0u), r(0u),
-	      sigma2(1.0f), mu(0.01f), step(0ULL), initialized(false)
+	    : m(0u), n(0u), r(0u), activeRank(0u),
+	      sigma2(1.0f), mu(0.01f), lastBaselineRate(0.0f),
+	      step(0ULL), initialized(false)
 	{
 	}
 
 	void reset()
 	{
-		m = n = r = 0u;
+		m = n = r = activeRank = 0u;
 		U.clear();
 		fisherDiag.clear();
 		prevGz.clear();
@@ -80,8 +84,10 @@ struct WeightState
 		scratch_Z.clear();
 		scratch_overlap.clear();
 		scratch_prevGzOld.clear();
+		scratch_basisPacked.clear();
 		sigma2 = 1.0f;
 		mu = 0.01f;
+		lastBaselineRate = 0.0f;
 		step = 0ULL;
 		initialized = false;
 	}
@@ -112,6 +118,7 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 bool refreshSubspace(WeightState& state, const float* grad,
                      unsigned int m, unsigned int n,
                      unsigned int powerIters, float betaRefresh,
+                     bool fisherWeightedRefresh,
                      glades::rng::Engine& rng,
                      shmea::GLogger* logger = 0);
 

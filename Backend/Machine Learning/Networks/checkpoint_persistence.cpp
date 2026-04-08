@@ -1481,6 +1481,10 @@ static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
 		std::ostringstream oss; oss << static_cast<unsigned long long>(st.step);
 		kv["atlas." + prefix + ".step"] = oss.str();
 	}
+	{
+		std::ostringstream oss; oss << static_cast<unsigned long long>(st.activeRank);
+		kv["atlas." + prefix + ".activeRank"] = oss.str();
+	}
 }
 
 static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
@@ -1492,6 +1496,7 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.m = m;
 	st.n = n;
 	st.r = r;
+	st.activeRank = r;
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
 	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
 	st.U.resize(mr);
@@ -1507,6 +1512,7 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.scratch_Z.resize(mr);
 	st.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
 	st.scratch_prevGzOld.resize(rn);
+	st.scratch_basisPacked.resize(mr);
 	{
 		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(m));
@@ -1558,6 +1564,18 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 			st.step = s;
 		}
 	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".activeRank");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			unsigned long long s = 0;
+			iss >> s;
+			if (s > 0u && s <= static_cast<unsigned long long>(st.r))
+				st.activeRank = static_cast<unsigned int>(s);
+		}
+	}
+	st.lastBaselineRate = 0.0f;
 	st.initialized = true;
 }
 

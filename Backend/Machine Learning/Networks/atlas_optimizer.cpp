@@ -36,6 +36,375 @@ static inline bool atlas_isfinite(float x)
 	return std::isfinite(x);
 }
 
+static unsigned int atlas_clamp_active_rank(unsigned int activeRank,
+                                            unsigned int maxRank,
+                                            unsigned int minActiveRank)
+{
+	if (maxRank == 0u)
+		return 0u;
+	if (minActiveRank == 0u)
+		minActiveRank = 1u;
+	if (minActiveRank > maxRank)
+		minActiveRank = maxRank;
+	if (activeRank < minActiveRank)
+		activeRank = minActiveRank;
+	if (activeRank > maxRank)
+		activeRank = maxRank;
+	return activeRank;
+}
+
+static void pack_active_basis(const std::vector<float>& U,
+                              unsigned int fullRank,
+                              unsigned int m,
+                              unsigned int activeRank,
+                              std::vector<float>& packed)
+{
+	if (activeRank == 0u)
+		return;
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		const float* src = &U[static_cast<size_t>(i) * fullRank];
+		float* dst = &packed[static_cast<size_t>(i) * activeRank];
+		for (unsigned int c = 0; c < activeRank; ++c)
+			dst[c] = src[c];
+	}
+}
+
+static unsigned int orthonormalize_active(float* Q,
+                                          const float* fallbackFull,
+                                          unsigned int fallbackStride,
+                                          unsigned int m,
+                                          unsigned int r,
+                                          shmea::GLogger* logger)
+{
+	unsigned int informativeRank = 0u;
+	const double tol = 1e-12;
+
+	for (unsigned int j = 0; j < r; ++j)
+	{
+		for (unsigned int p = 0; p < j; ++p)
+		{
+			double dot = 0.0;
+			for (unsigned int k = 0; k < m; ++k)
+				dot += static_cast<double>(Q[k * r + j]) * static_cast<double>(Q[k * r + p]);
+			const float dotf = static_cast<float>(dot);
+			for (unsigned int k = 0; k < m; ++k)
+				Q[k * r + j] -= dotf * Q[k * r + p];
+		}
+
+		double norm = 0.0;
+		for (unsigned int k = 0; k < m; ++k)
+		{
+			const double v = static_cast<double>(Q[k * r + j]);
+			norm += v * v;
+		}
+
+		const bool informative = (norm > tol);
+		if (!informative && fallbackFull)
+		{
+			for (unsigned int k = 0; k < m; ++k)
+				Q[k * r + j] = fallbackFull[k * fallbackStride + j];
+			for (unsigned int p = 0; p < j; ++p)
+			{
+				double dot = 0.0;
+				for (unsigned int k = 0; k < m; ++k)
+					dot += static_cast<double>(Q[k * r + j]) * static_cast<double>(Q[k * r + p]);
+				const float dotf = static_cast<float>(dot);
+				for (unsigned int k = 0; k < m; ++k)
+					Q[k * r + j] -= dotf * Q[k * r + p];
+			}
+			norm = 0.0;
+			for (unsigned int k = 0; k < m; ++k)
+			{
+				const double v = static_cast<double>(Q[k * r + j]);
+				norm += v * v;
+			}
+		}
+
+		if (norm <= tol)
+		{
+			if (logger)
+			{
+				std::ostringstream oss;
+				oss << "event=atlas_gram_schmidt_degenerate";
+				append_kv(oss, "col", j);
+				append_kv(oss, "m", m);
+				append_kv(oss, "r", r);
+				logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
+			}
+			for (unsigned int k = 0; k < m; ++k)
+				Q[k * r + j] = 0.0f;
+			if (m > 0u)
+			{
+				const unsigned int basisRow = (j < m) ? j : (m - 1u);
+				Q[basisRow * r + j] = 1.0f;
+			}
+			for (unsigned int p = 0; p < j; ++p)
+			{
+				double dot = 0.0;
+				for (unsigned int k = 0; k < m; ++k)
+					dot += static_cast<double>(Q[k * r + j]) * static_cast<double>(Q[k * r + p]);
+				const float dotf = static_cast<float>(dot);
+				for (unsigned int k = 0; k < m; ++k)
+					Q[k * r + j] -= dotf * Q[k * r + p];
+			}
+			norm = 0.0;
+			for (unsigned int k = 0; k < m; ++k)
+			{
+				const double v = static_cast<double>(Q[k * r + j]);
+				norm += v * v;
+			}
+		}
+
+		if (norm > tol)
+		{
+			const float inv = static_cast<float>(1.0 / sqrt(norm));
+			for (unsigned int k = 0; k < m; ++k)
+				Q[k * r + j] *= inv;
+		}
+		else
+		{
+			for (unsigned int k = 0; k < m; ++k)
+				Q[k * r + j] = 0.0f;
+		}
+
+		if (informative)
+			informativeRank = j + 1u;
+	}
+
+	return (informativeRank > 0u) ? informativeRank : 1u;
+}
+
+static void repair_inactive_basis(std::vector<float>& U,
+                                  const float* fallbackFull,
+                                  unsigned int stride,
+                                  unsigned int m,
+                                  unsigned int activeRank,
+                                  unsigned int fullRank,
+                                  shmea::GLogger* logger)
+{
+	if (activeRank >= fullRank)
+		return;
+
+	const double tol = 1e-12;
+	for (unsigned int j = activeRank; j < fullRank; ++j)
+	{
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			const float seed = fallbackFull
+			    ? fallbackFull[static_cast<size_t>(i) * stride + j]
+			    : 0.0f;
+			U[static_cast<size_t>(i) * fullRank + j] = seed;
+		}
+
+		for (unsigned int p = 0; p < j; ++p)
+		{
+			double dot = 0.0;
+			for (unsigned int k = 0; k < m; ++k)
+			{
+				dot += static_cast<double>(U[static_cast<size_t>(k) * fullRank + j])
+				    * static_cast<double>(U[static_cast<size_t>(k) * fullRank + p]);
+			}
+			const float dotf = static_cast<float>(dot);
+			for (unsigned int k = 0; k < m; ++k)
+			{
+				U[static_cast<size_t>(k) * fullRank + j] -=
+				    dotf * U[static_cast<size_t>(k) * fullRank + p];
+			}
+		}
+
+		double norm = 0.0;
+		for (unsigned int k = 0; k < m; ++k)
+		{
+			const double v = static_cast<double>(U[static_cast<size_t>(k) * fullRank + j]);
+			norm += v * v;
+		}
+
+		if (norm <= tol)
+		{
+			for (unsigned int k = 0; k < m; ++k)
+				U[static_cast<size_t>(k) * fullRank + j] = 0.0f;
+			if (m > 0u)
+			{
+				const unsigned int basisRow = (j < m) ? j : (m - 1u);
+				U[static_cast<size_t>(basisRow) * fullRank + j] = 1.0f;
+			}
+			for (unsigned int p = 0; p < j; ++p)
+			{
+				double dot = 0.0;
+				for (unsigned int k = 0; k < m; ++k)
+				{
+					dot += static_cast<double>(U[static_cast<size_t>(k) * fullRank + j])
+					    * static_cast<double>(U[static_cast<size_t>(k) * fullRank + p]);
+				}
+				const float dotf = static_cast<float>(dot);
+				for (unsigned int k = 0; k < m; ++k)
+				{
+					U[static_cast<size_t>(k) * fullRank + j] -=
+					    dotf * U[static_cast<size_t>(k) * fullRank + p];
+				}
+			}
+			norm = 0.0;
+			for (unsigned int k = 0; k < m; ++k)
+			{
+				const double v = static_cast<double>(U[static_cast<size_t>(k) * fullRank + j]);
+				norm += v * v;
+			}
+		}
+
+		if (norm > tol)
+		{
+			const float inv = static_cast<float>(1.0 / sqrt(norm));
+			for (unsigned int k = 0; k < m; ++k)
+				U[static_cast<size_t>(k) * fullRank + j] *= inv;
+		}
+		else
+		{
+			if (logger)
+			{
+				std::ostringstream oss;
+				oss << "event=atlas_inactive_basis_degenerate";
+				append_kv(oss, "col", j);
+				append_kv(oss, "m", m);
+				append_kv(oss, "r", fullRank);
+				logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
+			}
+			for (unsigned int k = 0; k < m; ++k)
+				U[static_cast<size_t>(k) * fullRank + j] = 0.0f;
+		}
+	}
+}
+
+static void sort_directions_by_fisher(WeightState& state,
+                                      unsigned int limit,
+                                      std::vector<float>* gzBuffer,
+                                      unsigned int nCols)
+{
+	if (limit <= 1u || limit > state.r)
+		return;
+
+	for (unsigned int i = 0; i + 1u < limit; ++i)
+	{
+		unsigned int best = i;
+		float bestVal = state.fisherDiag[i];
+		for (unsigned int j = i + 1u; j < limit; ++j)
+		{
+			if (state.fisherDiag[j] > bestVal)
+			{
+				bestVal = state.fisherDiag[j];
+				best = j;
+			}
+		}
+		if (best == i)
+			continue;
+
+		std::swap(state.fisherDiag[i], state.fisherDiag[best]);
+		for (unsigned int row = 0; row < state.m; ++row)
+			std::swap(state.U[static_cast<size_t>(row) * state.r + i],
+			          state.U[static_cast<size_t>(row) * state.r + best]);
+		for (unsigned int col = 0; col < state.n; ++col)
+			std::swap(state.prevGz[static_cast<size_t>(i) * state.n + col],
+			          state.prevGz[static_cast<size_t>(best) * state.n + col]);
+		if (gzBuffer)
+		{
+			for (unsigned int col = 0; col < nCols; ++col)
+				std::swap((*gzBuffer)[static_cast<size_t>(i) * nCols + col],
+				          (*gzBuffer)[static_cast<size_t>(best) * nCols + col]);
+		}
+	}
+}
+
+static unsigned int choose_active_rank(const WeightState& state,
+                                       unsigned int limit,
+                                       float capture,
+                                       unsigned int minActiveRank)
+{
+	if (limit == 0u)
+		return 0u;
+
+	limit = atlas_clamp_active_rank(limit, limit, minActiveRank);
+	if (capture <= 0.0f)
+		return atlas_clamp_active_rank(1u, limit, minActiveRank);
+	if (capture >= 1.0f)
+		capture = 1.0f;
+
+	double total = 0.0;
+	for (unsigned int i = 0; i < limit; ++i)
+		total += static_cast<double>(state.fisherDiag[i]);
+	if (total <= 1e-30)
+		return atlas_clamp_active_rank(1u, limit, minActiveRank);
+
+	double accum = 0.0;
+	const double target = static_cast<double>(capture) * total;
+	for (unsigned int i = 0; i < limit; ++i)
+	{
+		accum += static_cast<double>(state.fisherDiag[i]);
+		if (accum >= target)
+			return atlas_clamp_active_rank(i + 1u, limit, minActiveRank);
+	}
+
+	return atlas_clamp_active_rank(limit, limit, minActiveRank);
+}
+
+static unsigned int choose_flat_spectrum_rank(unsigned int activeRank,
+                                              unsigned int minActiveRank)
+{
+	if (activeRank == 0u)
+		return 0u;
+	if (activeRank <= minActiveRank)
+		return activeRank;
+
+	// A flat Fisher spectrum means the tracked directions have similar curvature,
+	// not that the layer is intrinsically rank-1. Shrink the sketch budget
+	// conservatively instead of collapsing to the minimum rank in one step.
+	const unsigned int halfRank = (activeRank + 1u) / 2u;
+	return atlas_clamp_active_rank(halfRank, activeRank, minActiveRank);
+}
+
+static float compute_effective_rank(const WeightState& state, unsigned int limit)
+{
+	if (limit == 0u)
+		return 0.0f;
+
+	double total = 0.0;
+	for (unsigned int i = 0; i < limit; ++i)
+		total += static_cast<double>(state.fisherDiag[i]);
+	if (total <= 1e-30)
+		return 0.0f;
+
+	double entropy = 0.0;
+	for (unsigned int i = 0; i < limit; ++i)
+	{
+		const double p = static_cast<double>(state.fisherDiag[i]) / total;
+		if (p > 1e-30)
+			entropy -= p * log(p);
+	}
+	return static_cast<float>(exp(entropy));
+}
+
+static float compute_topk_concentration(const WeightState& state,
+                                        unsigned int limit,
+                                        unsigned int k)
+{
+	if (limit == 0u || k == 0u)
+		return 0.0f;
+	if (k > limit)
+		k = limit;
+
+	double total = 0.0;
+	double top = 0.0;
+	for (unsigned int i = 0; i < limit; ++i)
+	{
+		const double v = static_cast<double>(state.fisherDiag[i]);
+		total += v;
+		if (i < k)
+			top += v;
+	}
+	if (total <= 1e-30)
+		return 0.0f;
+	return static_cast<float>(top / total);
+}
+
 void gramSchmidt(float* Q, unsigned int m, unsigned int r,
                  shmea::GLogger* logger)
 {
@@ -94,6 +463,7 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 	if (state.r > m) state.r = m;
 	if (state.r > n) state.r = n;
 	if (state.r == 0u) state.r = 1u;
+	state.activeRank = state.r;
 
 	if (state.r > 256u && logger)
 	{
@@ -133,9 +503,11 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 	state.scratch_Z.resize(mr);
 	state.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
 	state.scratch_prevGzOld.resize(rn);
+	state.scratch_basisPacked.resize(mr);
 
 	state.sigma2 = 1.0f;
 	state.mu = muInit;
+	state.lastBaselineRate = 0.0f;
 	state.step = 0ULL;
 	state.initialized = true;
 
@@ -147,6 +519,7 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 		append_kv(oss, "n", n);
 		append_kv(oss, "rank_requested", rank);
 		append_kv(oss, "rank_actual", r);
+		append_kv(oss, "active_rank", state.activeRank);
 		append_kv(oss, "mu_init", muInit);
 		append_kv(oss, "U_size", static_cast<unsigned long long>(state.U.size()));
 		append_kv(oss, "prevGz_size", static_cast<unsigned long long>(state.prevGz.size()));
@@ -156,7 +529,8 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 		        + state.scratch_gz.size() + state.scratch_corrected.size()
 		        + state.scratch_U_old.size() + state.scratch_f_old.size()
 		        + state.scratch_B.size() + state.scratch_Z.size()
-		        + state.scratch_overlap.size() + state.scratch_prevGzOld.size())
+		        + state.scratch_overlap.size() + state.scratch_prevGzOld.size()
+		        + state.scratch_basisPacked.size())
 		    * static_cast<unsigned long long>(sizeof(float));
 		append_kv(oss, "total_bytes", totalBytes);
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
@@ -166,14 +540,15 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 bool refreshSubspace(WeightState& state, const float* grad,
                      unsigned int m, unsigned int n,
                      unsigned int powerIters, float betaRefresh,
+                     bool fisherWeightedRefresh,
                      glades::rng::Engine& rng,
                      shmea::GLogger* logger)
 {
 	const unsigned int r = state.r;
 	if (r == 0u || m == 0u || n == 0u) return true;
 
+	const unsigned int activeRank = atlas_clamp_active_rank(state.activeRank, r, 1u);
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
-	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
 
 	// Save old basis and Fisher for EMA blending and Fisher transform.
 	std::copy(state.U.begin(), state.U.end(), state.scratch_U_old.begin());
@@ -181,82 +556,103 @@ bool refreshSubspace(WeightState& state, const float* grad,
 	std::vector<float>& U_old = state.scratch_U_old;
 	std::vector<float>& f_old = state.scratch_f_old;
 
-	// --- Randomized power iteration (warm-started from current U) ---
-	std::vector<float>& Q = state.U;
-	// B stored as [r, n] (transposed from original [n, r]) for SIMD-friendly access.
+	// Q_active is stored packed as [m, activeRank] so GEMM uses the reduced rank.
+	std::vector<float>& Q_active = state.scratch_basisPacked;
+	pack_active_basis(state.U, state.r, m, activeRank, Q_active);
+
+	if (fisherWeightedRefresh && activeRank > 0u && !f_old.empty())
+	{
+		double fisherMean = 0.0;
+		for (unsigned int c = 0; c < activeRank; ++c)
+			fisherMean += static_cast<double>(f_old[c]);
+		fisherMean /= static_cast<double>(activeRank);
+		if (fisherMean < 1e-12)
+			fisherMean = 1.0;
+		for (unsigned int c = 0; c < activeRank; ++c)
+		{
+			const double ratio = static_cast<double>(f_old[c]) / fisherMean;
+			const float scale = static_cast<float>(sqrt(ratio > 1e-12 ? ratio : 1e-12));
+			for (unsigned int i = 0; i < m; ++i)
+				Q_active[static_cast<size_t>(i) * activeRank + c] *= scale;
+		}
+	}
+	orthonormalize_active(&Q_active[0], &U_old[0], state.r, m, activeRank, logger);
+
 	std::vector<float>& B = state.scratch_B;
 	std::vector<float>& Z = state.scratch_Z;
-
 	for (unsigned int p = 0; p < powerIters; ++p)
 	{
-		// B[r,n] = Q^T[r,m] * grad[m,n]  (Q is [m,r], so Q^T is [r,m])
-		glades::gemm::atb(&B[0], &Q[0], grad, r, m, n, 1.0f);
-
-		// Z[m,r] = grad[m,n] * B[r,n]^T
-		// B is [r,n] row-major; B^T is [n,r]; Z[i,c] = dot(grad[i,:], B[c,:])
-		glades::gemm::abt(&Z[0], grad, &B[0], m, n, r, 1.0f);
-
-		std::copy(Z.begin(), Z.end(), Q.begin());
-		gramSchmidt(&Q[0], m, r, logger);
+		glades::gemm::atb(&B[0], &Q_active[0], grad, activeRank, m, n, 1.0f);
+		glades::gemm::abt(&Z[0], grad, &B[0], m, n, activeRank, 1.0f);
+		std::copy(Z.begin(), Z.begin() + static_cast<size_t>(m) * activeRank, Q_active.begin());
+		orthonormalize_active(&Q_active[0], &U_old[0], state.r, m, activeRank, logger);
 	}
 
-	// Q now contains U_new (raw power iteration result).
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		for (unsigned int c = 0; c < activeRank; ++c)
+		{
+			Q_active[static_cast<size_t>(i) * activeRank + c] =
+			    (1.0f - betaRefresh) * U_old[static_cast<size_t>(i) * state.r + c]
+			  + betaRefresh * Q_active[static_cast<size_t>(i) * activeRank + c];
+		}
+	}
+	const unsigned int informativeRank =
+	    orthonormalize_active(&Q_active[0], &U_old[0], state.r, m, activeRank, logger);
 
-	// --- EMA blend: U = (1-betaRefresh)*U_old + betaRefresh*U_new ---
-	for (size_t idx = 0; idx < mr; ++idx)
-		Q[idx] = (1.0f - betaRefresh) * U_old[idx] + betaRefresh * Q[idx];
-	gramSchmidt(&Q[0], m, r, logger);
+	// Copy packed basis back into the leading active columns.
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		for (unsigned int c = 0; c < activeRank; ++c)
+			state.U[static_cast<size_t>(i) * state.r + c] = Q_active[static_cast<size_t>(i) * activeRank + c];
+	}
+	repair_inactive_basis(state.U, &U_old[0], state.r, m, activeRank, state.r, logger);
 
-	// --- Compute overlap matrix O = U_final^T * U_old [r x r] ---
-	// O[c*r+j] = sum_i U_final[i*r+c] * U_old[i*r+j]
-	// This is O[r,r] = Q^T[r,m] * U_old[m,r]
+	// overlap = U_new_active^T * U_old_active
+	pack_active_basis(U_old, state.r, m, activeRank, Z);
 	std::vector<float>& overlap = state.scratch_overlap;
-	glades::gemm::atb(&overlap[0], &Q[0], &U_old[0], r, m, r, 1.0f);
+	glades::gemm::atb(&overlap[0], &Q_active[0], &Z[0], activeRank, m, activeRank, 1.0f);
 
-	// --- Transform Fisher diagonal into new basis ---
-	// f_new[c] = sum_j O[c,j]^2 * f_old[j]
-	// This transfers curvature information from old directions to new directions
-	// based on their overlap, preserving accumulated preconditioning knowledge.
-	for (unsigned int c = 0; c < r; ++c)
+	for (unsigned int c = 0; c < activeRank; ++c)
 	{
 		double fNew = 0.0;
-		for (unsigned int j = 0; j < r; ++j)
+		for (unsigned int j = 0; j < activeRank; ++j)
 		{
-			const double o = static_cast<double>(overlap[c * r + j]);
+			const double o = static_cast<double>(overlap[c * activeRank + j]);
 			fNew += o * o * static_cast<double>(f_old[j]);
 		}
 		if (fNew < 1e-12) fNew = 1e-12;
 		state.fisherDiag[c] = static_cast<float>(fNew);
 	}
 
-	// --- Transform prevGz into new basis ---
-	// prevGz_new[c*n+j] = sum_k O[c,k] * prevGz_old[k*n+j]
 	std::vector<float>& prevGzOld = state.scratch_prevGzOld;
 	std::copy(state.prevGz.begin(), state.prevGz.end(), prevGzOld.begin());
 	std::fill(state.prevGz.begin(), state.prevGz.end(), 0.0f);
-	for (unsigned int c = 0; c < r; ++c)
+	for (unsigned int c = 0; c < activeRank; ++c)
 	{
-		for (unsigned int k = 0; k < r; ++k)
+		for (unsigned int k = 0; k < activeRank; ++k)
 		{
-			const float o_ck = overlap[c * r + k];
+			const float o_ck = overlap[c * activeRank + k];
 			if (o_ck == 0.0f) continue;
 			axpy_f32(&state.prevGz[c * n], &prevGzOld[k * n], o_ck, n);
 		}
 	}
 
-	// Verify U and Fisher are finite after refresh.
 	bool refreshOk = true;
-	for (size_t idx = 0; idx < mr; ++idx)
+	for (unsigned int i = 0; i < m && refreshOk; ++i)
 	{
-		if (!atlas_isfinite(Q[idx]))
+		for (unsigned int c = 0; c < activeRank; ++c)
 		{
-			refreshOk = false;
-			break;
+			if (!atlas_isfinite(state.U[static_cast<size_t>(i) * state.r + c]))
+			{
+				refreshOk = false;
+				break;
+			}
 		}
 	}
 	if (refreshOk)
 	{
-		for (unsigned int c = 0; c < r; ++c)
+		for (unsigned int c = 0; c < activeRank; ++c)
 		{
 			if (!atlas_isfinite(state.fisherDiag[c]))
 			{
@@ -274,6 +670,7 @@ bool refreshSubspace(WeightState& state, const float* grad,
 		append_kv(oss, "m", m);
 		append_kv(oss, "n", n);
 		append_kv(oss, "rank", r);
+		append_kv(oss, "active_rank", activeRank);
 		logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
 	}
 
@@ -282,18 +679,17 @@ bool refreshSubspace(WeightState& state, const float* grad,
 		float fMin = state.fisherDiag[0];
 		float fMax = state.fisherDiag[0];
 		double fSum = 0.0;
-		for (unsigned int c = 0; c < r; ++c)
+		for (unsigned int c = 0; c < activeRank; ++c)
 		{
 			const float f = state.fisherDiag[c];
 			if (f < fMin) fMin = f;
 			if (f > fMax) fMax = f;
 			fSum += static_cast<double>(f);
 		}
-		// Mean diagonal overlap measures basis stability (1.0 = no change)
 		double overlapDiagSum = 0.0;
-		for (unsigned int c = 0; c < r; ++c)
+		for (unsigned int c = 0; c < activeRank; ++c)
 		{
-			const double od = static_cast<double>(overlap[c * r + c]);
+			const double od = static_cast<double>(overlap[c * activeRank + c]);
 			overlapDiagSum += (od > 0.0 ? od : -od);
 		}
 
@@ -303,12 +699,15 @@ bool refreshSubspace(WeightState& state, const float* grad,
 		append_kv(oss, "m", m);
 		append_kv(oss, "n", n);
 		append_kv(oss, "rank", r);
+		append_kv(oss, "active_rank", state.activeRank);
+		append_kv(oss, "informative_rank", informativeRank);
 		append_kv(oss, "power_iters", powerIters);
 		append_kv(oss, "beta_refresh", betaRefresh);
-		append_kv(oss, "mean_overlap", static_cast<float>(overlapDiagSum / static_cast<double>(r)));
+		append_kv(oss, "mean_overlap",
+		          static_cast<float>(overlapDiagSum / static_cast<double>(activeRank)));
 		append_kv(oss, "fisher_min", fMin);
 		append_kv(oss, "fisher_max", fMax);
-		append_kv(oss, "fisher_mean", static_cast<float>(fSum / static_cast<double>(r)));
+		append_kv(oss, "fisher_mean", static_cast<float>(fSum / static_cast<double>(activeRank)));
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
 
@@ -338,8 +737,10 @@ bool applyStep(WeightState& state,
 
 	const unsigned int r = state.r;
 	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
-	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
 	state.step += 1ULL;
+	state.activeRank = atlas_clamp_active_rank(state.activeRank, r, ac.minActiveRank);
+	unsigned int activeRank = state.activeRank;
+	size_t rn = static_cast<size_t>(activeRank) * static_cast<size_t>(n);
 
 	const bool diagStep = logger && tSub > 0u
 		&& (state.step % static_cast<unsigned long long>(tSub)) == 0ULL;
@@ -399,7 +800,8 @@ bool applyStep(WeightState& state,
 	// Pass raw gW directly — eigenvectors of G*G^T are scale-invariant.
 	if (tSub > 0u && (state.step % static_cast<unsigned long long>(tSub)) == 0ULL)
 	{
-		if (!refreshSubspace(state, gW, m, n, ac.powerIters, ac.betaRefresh, rng, logger))
+		if (!refreshSubspace(state, gW, m, n, ac.powerIters, ac.betaRefresh,
+		                     ac.fisherWeightedRefresh, rng, logger))
 			recovered = true;
 	}
 
@@ -422,11 +824,13 @@ bool applyStep(WeightState& state,
 	// === Step 4: Project gradient to subspace ===
 	// gz[r,n] = gScale * U^T[r,m] * gW[m,n]
 	std::vector<float>& gz = state.scratch_gz;
-	glades::gemm::atb(&gz[0], &state.U[0], gW, r, m, n, gScale);
+	std::vector<float>& basisPacked = state.scratch_basisPacked;
+	pack_active_basis(state.U, state.r, m, activeRank, basisPacked);
+	glades::gemm::atb(&gz[0], &basisPacked[0], gW, activeRank, m, n, gScale);
 
 	// === Step 5: Update Fisher diagonal (EMA of mean squared projected gradient) ===
 	const float oneMinusBeta = 1.0f - beta;
-	for (unsigned int c = 0; c < r; ++c)
+	for (unsigned int c = 0; c < activeRank; ++c)
 	{
 		double sumsq = 0.0;
 		for (unsigned int j = 0; j < n; ++j)
@@ -453,6 +857,7 @@ bool applyStep(WeightState& state,
 	float rawBaselineRate = lr / (effSigma2 + eps);
 	if (rawBaselineRate > kappaLr) rawBaselineRate = kappaLr;
 	const float baselineRate = rawBaselineRate;
+	state.lastBaselineRate = baselineRate;
 	{
 		const float baseScaled = -baselineRate * gScale;
 		for (size_t idx = 0; idx < mn; ++idx)
@@ -474,7 +879,7 @@ bool applyStep(WeightState& state,
 
 	// Precompute corrected[r,n] = corrScale[c] * gPred[c,n]
 	std::vector<float>& corrected = state.scratch_corrected;
-	for (unsigned int c = 0; c < r; ++c)
+	for (unsigned int c = 0; c < activeRank; ++c)
 	{
 		const float effFisher = state.fisherDiag[c] * bcFactor;
 		float fisherLR = lr / (effFisher + eps);
@@ -488,7 +893,7 @@ bool applyStep(WeightState& state,
 	}
 
 	// W[m,n] += U[m,r] * corrected[r,n]
-	glades::gemm::ab_accum(W, &state.U[0], &corrected[0], m, r, n, 1.0f);
+	glades::gemm::ab_accum(W, &basisPacked[0], &corrected[0], m, activeRank, n, 1.0f);
 
 	// Guard against NaN/Inf propagation from corrupted U or corrected buffers.
 	for (size_t idx = 0; idx < mn; ++idx)
@@ -549,6 +954,38 @@ bool applyStep(WeightState& state,
 		}
 	}
 
+	// Keep the leading directions ordered by Fisher mass so active-rank truncation
+	// uses the most informative prefix.
+	sort_directions_by_fisher(state, activeRank, &gz, n);
+	float shrinkFisherMin = state.fisherDiag[0];
+	float shrinkFisherMax = state.fisherDiag[0];
+	for (unsigned int c = 1u; c < activeRank; ++c)
+	{
+		const float f = state.fisherDiag[c];
+		if (f < shrinkFisherMin) shrinkFisherMin = f;
+		if (f > shrinkFisherMax) shrinkFisherMax = f;
+	}
+	if (ac.adaptiveRank && tSub > 0u
+	    && (state.step % static_cast<unsigned long long>(tSub)) == 0ULL)
+	{
+		unsigned int targetRank =
+		    choose_active_rank(state, activeRank, ac.rankCapture, ac.minActiveRank);
+		if (activeRank > ac.minActiveRank
+		    && ac.flatSpectrumThreshold > 1.0f
+		    && shrinkFisherMin > 1e-12f
+		    && (shrinkFisherMax / shrinkFisherMin) <= ac.flatSpectrumThreshold)
+		{
+			const unsigned int flatRank =
+			    choose_flat_spectrum_rank(activeRank, ac.minActiveRank);
+			if (flatRank < targetRank)
+				targetRank = flatRank;
+		}
+		if (targetRank < state.activeRank)
+			state.activeRank = targetRank;
+		activeRank = state.activeRank;
+		rn = static_cast<size_t>(activeRank) * static_cast<size_t>(n);
+	}
+
 	// === Periodic diagnostics ===
 	if (diagStep)
 	{
@@ -564,13 +1001,23 @@ bool applyStep(WeightState& state,
 		float fMin = state.fisherDiag[0];
 		float fMax = state.fisherDiag[0];
 		double fSum = 0.0;
-		for (unsigned int c = 0; c < r; ++c)
+		for (unsigned int c = 0; c < activeRank; ++c)
 		{
 			const float f = state.fisherDiag[c];
 			if (f < fMin) fMin = f;
 			if (f > fMax) fMax = f;
 			fSum += static_cast<double>(f);
 		}
+		const float effectiveRank = compute_effective_rank(state, activeRank);
+		const float spectralEfficiency = (activeRank > 0u)
+		    ? (effectiveRank / static_cast<float>(activeRank))
+		    : 0.0f;
+		const float top1Concentration = compute_topk_concentration(state, activeRank, 1u);
+		const float top10Concentration = compute_topk_concentration(state, activeRank, 10u);
+		const float fisherRatio = (fMin > 1e-12f) ? (fMax / fMin) : 0.0f;
+		const float sigma2FisherRatio = (fSum > 1e-30)
+		    ? static_cast<float>(state.sigma2 / (fSum / static_cast<double>(activeRank)))
+		    : 0.0f;
 
 		std::ostringstream oss;
 		oss << "event=atlas_step";
@@ -579,6 +1026,7 @@ bool applyStep(WeightState& state,
 		append_kv(oss, "m", m);
 		append_kv(oss, "n", n);
 		append_kv(oss, "rank", r);
+		append_kv(oss, "active_rank", activeRank);
 		append_kv(oss, "lr", lr);
 		append_kv(oss, "mu", state.mu);
 		append_kv(oss, "sigma2", state.sigma2);
@@ -587,12 +1035,21 @@ bool applyStep(WeightState& state,
 		append_kv(oss, "update_norm", static_cast<float>(sqrt(updateNormSq)));
 		append_kv(oss, "fisher_min", fMin);
 		append_kv(oss, "fisher_max", fMax);
-		append_kv(oss, "fisher_mean", static_cast<float>(fSum / static_cast<double>(r)));
+		append_kv(oss, "fisher_mean", static_cast<float>(fSum / static_cast<double>(activeRank)));
+		append_kv(oss, "fisher_ratio", fisherRatio);
+		append_kv(oss, "sigma2_fisher_ratio", sigma2FisherRatio);
+		append_kv(oss, "effective_rank", effectiveRank);
+		append_kv(oss, "spectral_efficiency", spectralEfficiency);
+		append_kv(oss, "top1_concentration", top1Concentration);
+		append_kv(oss, "top10_concentration", top10Concentration);
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
 
 	// === Step 9: Store compressed gradient for next step ===
-	std::copy(gz.begin(), gz.end(), state.prevGz.begin());
+	if (rn > 0u)
+		std::copy(gz.begin(), gz.begin() + rn, state.prevGz.begin());
+	if (state.prevGz.size() > rn)
+		std::fill(state.prevGz.begin() + rn, state.prevGz.end(), 0.0f);
 
 	// === Step 10: Clear accumulated gradients ===
 	std::memset(gW, 0, mn * sizeof(float));

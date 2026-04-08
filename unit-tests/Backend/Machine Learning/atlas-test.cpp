@@ -755,7 +755,9 @@ void ATLASUnitTest()
 			grad[i] = static_cast<float>(i % 7) * 0.1f - 0.3f;
 
 		// Run refresh
-		glades::atlas::refreshSubspace(state, &grad[0], m, n, /*powerIters=*/3, /*betaRefresh=*/0.5f, rng);
+		glades::atlas::refreshSubspace(state, &grad[0], m, n, /*powerIters=*/3,
+		                              /*betaRefresh=*/0.5f,
+		                              /*fisherWeightedRefresh=*/true, rng);
 
 		// Verify U is still orthonormal after refresh
 		const float tol = 1e-4f;
@@ -2858,6 +2860,61 @@ void ATLASUnitTest()
 
 		printf("[UT] ATLAS scale test (512x512 r=64): %d steps completed, all invariants held\n",
 		       nSteps);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 30: adaptive active rank shrinks on low-rank gradient streams
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 30: Adaptive active rank shrink\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 16;
+		const unsigned int n = 8;
+		const unsigned int r = 6;
+		const unsigned int nSteps = 24;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 30303030ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
+
+		ASSERT("==============ATLAS::AdaptiveRank init activeRank wrong==============",
+		       state.activeRank == r);
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		glades::ATLASConfig acAdaptive;
+		acAdaptive.rank = r;
+		acAdaptive.tSub = 4u;
+		acAdaptive.rankCapture = 0.90f;
+		acAdaptive.minActiveRank = 1u;
+		acAdaptive.adaptiveRank = true;
+		acAdaptive.fisherWeightedRefresh = true;
+
+		for (unsigned int step = 0; step < nSteps; ++step)
+		{
+			std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				const float a = (i < (m / 2u)) ? 1.0f : -1.0f;
+				for (unsigned int j = 0; j < n; ++j)
+				{
+					const float b = 0.2f + 0.03f * static_cast<float>(j);
+					gW[static_cast<size_t>(i) * n + j] = a * b;
+				}
+			}
+
+			const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+			                                         1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+			                                         acAdaptive, rng);
+			ASSERT("==============ATLAS::AdaptiveRank applyStep failed==============", ok);
+		}
+
+		printf("[UT] ATLAS adaptive rank: configured=%u active=%u after %u steps\n",
+		       r, state.activeRank, nSteps);
+		ASSERT("==============ATLAS::AdaptiveRank did not shrink==============",
+		       state.activeRank < r);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
