@@ -14,14 +14,49 @@
 		bool logPerRequest;
 		// Emit one log line per KV append (very noisy; intended for debugging only).
 		bool logPerKvAppend;
+		// Collect GPU launch/transfer/sync counters in train/infer hot paths.
+		bool enableGpuPerf;
+		// Emit one structured summary line after GPU-backed train/test runs.
+		bool logGpuTrainSummary;
+		// Emit one structured summary line after GPU-backed KV append operations.
+		bool logGpuInferSummary;
 
 		TransformerMetricsConfig()
 		    : enable(false),
 		      enableKvKernelBreakdown(true),
 		      logPerRequest(true),
-		      logPerKvAppend(false)
+		      logPerKvAppend(false),
+		      enableGpuPerf(false),
+		      logGpuTrainSummary(false),
+		      logGpuInferSummary(false)
 		{
 		}
+	};
+
+	struct TransformerGpuPerfBreakdown
+	{
+		glades::gpu::DispatchPerfCounters counters;
+		double msTotal;
+		double msEmbed;
+		double msPosEnc;
+		double msAttention;
+		double msLoss;
+		double msBackward;
+		double msOptimizer;
+
+		TransformerGpuPerfBreakdown()
+		    : counters(),
+		      msTotal(0.0),
+		      msEmbed(0.0),
+		      msPosEnc(0.0),
+		      msAttention(0.0),
+		      msLoss(0.0),
+		      msBackward(0.0),
+		      msOptimizer(0.0)
+		{
+		}
+
+		void reset() { *this = TransformerGpuPerfBreakdown(); }
 	};
 
 	struct TransformerKvPerfBreakdown
@@ -49,6 +84,7 @@
 		double msWo;
 		double msFFN;
 		double msLogits;
+		TransformerGpuPerfBreakdown gpu;
 
 		TransformerKvPerfBreakdown()
 		    : kvAppends(0ULL),
@@ -69,7 +105,8 @@
 		      msAttention(0.0),
 		      msWo(0.0),
 		      msFFN(0.0),
-		      msLogits(0.0)
+		      msLogits(0.0),
+		      gpu()
 		{
 		}
 

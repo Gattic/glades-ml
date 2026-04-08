@@ -283,6 +283,13 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,
                                     const float* W1, const float* W2,
                                     const float* b1, const float* b2);
 
+bool uploadTransformerTokenIds(GpuTransformerScratch& scratch,
+                               const int* tokenIds, size_t count);
+bool uploadTransformerDenseInputs(GpuTransformerScratch& scratch,
+                                  const float* hostInputs, size_t count);
+bool uploadTransformerRopeInvFreq(GpuTransformerScratch& scratch,
+                                  const float* invFreq, size_t count);
+
 // Zero all gradient buffers on GPU.
 bool zeroTransformerGradients(GpuTransformerWeights& gpu);
 

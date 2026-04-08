@@ -1413,6 +1413,8 @@ public:
 private:
 	// Transformer serving/inference metrics configuration (default: disabled).
 	TransformerMetricsConfig transformerMetricsCfg;
+	mutable TransformerGpuPerfBreakdown lastTransformerTrainGpuPerf;
+	mutable TransformerGpuPerfBreakdown lastTransformerInferGpuPerf;
 
 public:
 	// Configure structured transformer metrics/logging.
@@ -1420,6 +1422,8 @@ public:
 	//   APIs will emit structured log lines through getLogger().
 	void setTransformerMetricsConfig(const TransformerMetricsConfig& cfg) { transformerMetricsCfg = cfg; }
 	const TransformerMetricsConfig& getTransformerMetricsConfig() const { return transformerMetricsCfg; }
+	const TransformerGpuPerfBreakdown& getLastTransformerTrainGpuPerf() const { return lastTransformerTrainGpuPerf; }
+	const TransformerGpuPerfBreakdown& getLastTransformerInferGpuPerf() const { return lastTransformerInferGpuPerf; }
 
 	struct TransformerLmSession
 	{
@@ -1469,6 +1473,7 @@ public:
 		      metricsEnabled(false),
 		      metricsBreakdownEnabled(false),
 		      metricsLogPerKvAppend(false),
+		      metricsGpuPerfEnabled(false),
 		      perf(),
 		      layerNormEps(0.0f),
 		      normType(0u),
@@ -1516,6 +1521,7 @@ public:
 			metricsEnabled = false;
 			metricsBreakdownEnabled = false;
 			metricsLogPerKvAppend = false;
+			metricsGpuPerfEnabled = false;
 			perf.reset();
 			layerNormEps = 0.0f;
 			normType = 0u;
@@ -1583,6 +1589,7 @@ public:
 		bool metricsEnabled;
 		bool metricsBreakdownEnabled;
 		bool metricsLogPerKvAppend;
+		bool metricsGpuPerfEnabled;
 		TransformerKvPerfBreakdown perf;
 		float layerNormEps;
 		unsigned int normType;
@@ -1652,6 +1659,7 @@ public:
 		      metricsEnabled(false),
 		      metricsBreakdownEnabled(false),
 		      metricsLogPerKvAppend(false),
+		      metricsGpuPerfEnabled(false),
 		      perf(),
 		      layerNormEps(0.0f),
 		      normType(0u),
@@ -1695,6 +1703,7 @@ public:
 			metricsEnabled = false;
 			metricsBreakdownEnabled = false;
 			metricsLogPerKvAppend = false;
+			metricsGpuPerfEnabled = false;
 			perf.reset();
 			layerNormEps = 0.0f;
 			normType = 0u;
@@ -1762,6 +1771,7 @@ public:
 		bool metricsEnabled;
 		bool metricsBreakdownEnabled;
 		bool metricsLogPerKvAppend;
+		bool metricsGpuPerfEnabled;
 		TransformerKvPerfBreakdown perf;
 		float layerNormEps;
 		unsigned int normType;

@@ -1998,6 +1998,98 @@ bool pack_loss_scalars(const float* lossSum, const int* lossCount,
 	return true;
 }
 
+namespace {
+
+__global__ void collect_token_lm_metrics_kernel(const float* __restrict__ probs,
+                                                const int* __restrict__ targets,
+                                                int T, int vocabSize, int padToken,
+                                                int* __restrict__ out)
+{
+	extern __shared__ float smem[];
+	float* sLoss = smem;
+	float* sValid = sLoss + blockDim.x;
+	float* sCorrect = sValid + blockDim.x;
+
+	float localLoss = 0.0f;
+	float localValid = 0.0f;
+	float localCorrect = 0.0f;
+
+	for (int t = threadIdx.x; t < T; t += blockDim.x)
+	{
+		const int tgt = targets[t];
+		if (padToken >= 0 && tgt == padToken)
+			continue;
+		if (tgt < 0 || tgt >= vocabSize)
+			continue;
+
+		const float* row = probs + static_cast<size_t>(t) * vocabSize;
+		float p = row[tgt];
+		if (p < 1e-12f)
+			p = 1e-12f;
+		localLoss += -logf(p);
+		localValid += 1.0f;
+
+		int bestIdx = 0;
+		float bestVal = row[0];
+		for (int v = 1; v < vocabSize; ++v)
+		{
+			if (row[v] > bestVal)
+			{
+				bestVal = row[v];
+				bestIdx = v;
+			}
+		}
+		if (bestIdx == tgt)
+			localCorrect += 1.0f;
+	}
+
+	sLoss[threadIdx.x] = localLoss;
+	sValid[threadIdx.x] = localValid;
+	sCorrect[threadIdx.x] = localCorrect;
+	__syncthreads();
+
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < stride)
+		{
+			sLoss[threadIdx.x] += sLoss[threadIdx.x + stride];
+			sValid[threadIdx.x] += sValid[threadIdx.x + stride];
+			sCorrect[threadIdx.x] += sCorrect[threadIdx.x + stride];
+		}
+		__syncthreads();
+	}
+
+	if (threadIdx.x == 0)
+	{
+		union
+		{
+			float f;
+			int i;
+		} lossBits;
+		lossBits.f = sLoss[0];
+		out[0] = lossBits.i;
+		out[1] = static_cast<int>(sValid[0]);
+		out[2] = static_cast<int>(sCorrect[0]);
+		out[3] = static_cast<int>(sValid[0]);
+	}
+}
+
+} // anonymous namespace
+
+bool collect_token_lm_metrics(const float* probs, const int* targets,
+                              int T, int vocabSize, int padToken,
+                              int* out)
+{
+	if (T <= 0 || vocabSize <= 0)
+		return true;
+	const int block = 256;
+	const int smemBytes = 3 * block * static_cast<int>(sizeof(float));
+	collect_token_lm_metrics_kernel<<<1, block, smemBytes, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // ===========================================================================
 //  17. Sum of squared elements (for gradient norm computation)
 // ===========================================================================

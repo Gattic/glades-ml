@@ -488,6 +488,30 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
 	return true;
 }
 
+bool uploadTransformerTokenIds(GpuTransformerScratch& scratch,
+                               const int* tokenIds, size_t count)
+{
+	if (!scratch.initialized || !tokenIds)
+		return false;
+	return scratch.tokenIds.uploadAsync(tokenIds, count);
+}
+
+bool uploadTransformerDenseInputs(GpuTransformerScratch& scratch,
+                                  const float* hostInputs, size_t count)
+{
+	if (!scratch.initialized || !hostInputs)
+		return false;
+	return scratch.x.uploadAsync(hostInputs, count);
+}
+
+bool uploadTransformerRopeInvFreq(GpuTransformerScratch& scratch,
+                                  const float* invFreq, size_t count)
+{
+	if (!scratch.initialized || !invFreq)
+		return false;
+	return scratch.gpuInvFreq.uploadAsync(invFreq, count);
+}
+
 // Helper: append a GpuBuffer to the batch-zero list if allocated.
 static void addBuf(GpuBuffer<float>& buf, float** hPtrs, int* hSizes, int& count)
 {

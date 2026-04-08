@@ -94,6 +94,12 @@ static void log_kv_append_event(shmea::GLogger* logger,
 		append_logfmt_kv(oss, "kv_appends", static_cast<unsigned long long>(perf->kvAppends));
 		append_logfmt_kv(oss, "kv_ms_total", perf->msTotal);
 		append_logfmt_kv(oss, "non_finite_hidden", static_cast<unsigned long long>(perf->nonFiniteHiddenState));
+		append_logfmt_kv(oss, "gpu_kernel_launches", perf->gpu.counters.kernelLaunches);
+		append_logfmt_kv(oss, "gpu_sync_points", perf->gpu.counters.syncPoints);
+		append_logfmt_kv(oss, "gpu_bytes_h2d", perf->gpu.counters.bytesH2D);
+		append_logfmt_kv(oss, "gpu_bytes_d2h", perf->gpu.counters.bytesD2H);
+		append_logfmt_kv(oss, "gpu_bytes_d2d", perf->gpu.counters.bytesD2D);
+		append_logfmt_kv(oss, "gpu_ms_total", perf->gpu.msTotal);
 	}
 	logger->info("Transformer", shmea::GString(oss.str().c_str()));
 }
@@ -112,6 +118,7 @@ struct TransformerSessionCommonConfig
 	bool metricsEnabled;
 	bool metricsBreakdownEnabled;
 	bool metricsLogPerKvAppend;
+	bool metricsGpuPerfEnabled;
 	float layerNormEps;
 	unsigned int normType;
 	unsigned int positionalEncoding;
@@ -134,6 +141,7 @@ struct TransformerSessionCommonConfig
 	      metricsEnabled(false),
 	      metricsBreakdownEnabled(false),
 	      metricsLogPerKvAppend(false),
+	      metricsGpuPerfEnabled(false),
 	      layerNormEps(0.0f),
 	      normType(0u),
 	      positionalEncoding(0u),
@@ -184,6 +192,7 @@ static NNetworkStatus build_transformer_session_common_config(const char* where,
 	out.metricsEnabled = metricsCfg.enable;
 	out.metricsBreakdownEnabled = metricsCfg.enableKvKernelBreakdown;
 	out.metricsLogPerKvAppend = metricsCfg.logPerKvAppend;
+	out.metricsGpuPerfEnabled = (metricsCfg.enable && metricsCfg.enableGpuPerf);
 	out.layerNormEps = runtime.layerNormEps;
 	out.normType = runtime.normType;
 	out.positionalEncoding = runtime.positionalEncoding;
@@ -667,6 +676,196 @@ static void freeGpuInferState(void*& ptr)
 	}
 }
 
+static bool gpu_infer_run_layer_step(const std::vector<double>& ropeInvFreq,
+                                     const glades::gpu::GpuTransformerWeights::Block& blk,
+                                     GpuInferState& gs,
+                                     unsigned int li,
+                                     unsigned int pos,
+                                     unsigned int dModel,
+                                     unsigned int dFF,
+                                     unsigned int nHeads,
+                                     unsigned int nKVHeads,
+                                     unsigned int dHead,
+                                     unsigned int dModelKV,
+                                     unsigned int ff1Width,
+                                     unsigned int ffnKind,
+                                     unsigned int ffnActivation,
+                                     int normType,
+                                     float eps,
+                                     bool useRope,
+                                     unsigned int ropeDim,
+                                     float ropeTheta,
+                                     glades::NNetwork::TransformerGpuPerfBreakdown* gpuPerf)
+{
+	namespace gg = glades::gpu;
+	const int dM = static_cast<int>(dModel);
+	const int dMKV = static_cast<int>(dModelKV);
+	const int dFFi = static_cast<int>(dFF);
+	const int ff1W = static_cast<int>(ff1Width);
+
+	if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::rmsnorm_forward(gs.h.data(), blk.ln1Gamma.data(), eps,
+		                    1, dM, gs.x1.data(), gs.lnInvStd.data());
+	}
+	else
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::layernorm_forward(gs.h.data(), blk.ln1Gamma.data(), blk.ln1Beta.data(),
+		                      eps, 1, dM, gs.x1.data(), gs.lnMean.data(), gs.lnInvStd.data());
+	}
+
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::sgemv_rowmajor(dM, dM, 1.0f, blk.Wq.data(), dM, gs.x1.data(), 0.0f, gs.q.data());
+	if (blk.bq.allocated())
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::add_bias(gs.q.data(), blk.bq.data(), 1, dM);
+	}
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::sgemv_rowmajor(dMKV, dM, 1.0f, blk.Wk.data(), dM, gs.x1.data(), 0.0f, gs.kvec.data());
+	if (blk.bk.allocated())
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::add_bias(gs.kvec.data(), blk.bk.data(), 1, dMKV);
+	}
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::sgemv_rowmajor(dMKV, dM, 1.0f, blk.Wv.data(), dM, gs.x1.data(), 0.0f, gs.vvec.data());
+	if (blk.bv.allocated())
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::add_bias(gs.vvec.data(), blk.bv.data(), 1, dMKV);
+	}
+
+	if (useRope && ropeDim >= 2u)
+	{
+		std::vector<float> qCpu(dModel);
+		std::vector<float> kvCpu(dModelKV);
+		if (gpuPerf)
+		{
+			gg::perfRecordBytesD2H(&gpuPerf->counters, static_cast<size_t>(dModel + dModelKV) * sizeof(float));
+			gg::perfRecordBytesH2D(&gpuPerf->counters, static_cast<size_t>(dModel + dModelKV) * sizeof(float));
+		}
+		gs.q.download(&qCpu[0], dModel);
+		gs.kvec.download(&kvCpu[0], dModelKV);
+		for (unsigned int hq = 0; hq < nHeads; ++hq)
+			rope_apply_vec(&qCpu[static_cast<size_t>(hq) * dHead], dHead, ropeDim,
+			               ropeInvFreq, pos);
+		for (unsigned int hk = 0; hk < nKVHeads; ++hk)
+			rope_apply_vec(&kvCpu[static_cast<size_t>(hk) * dHead], dHead, ropeDim,
+			               ropeInvFreq, pos);
+		gs.q.upload(&qCpu[0], dModel);
+		gs.kvec.upload(&kvCpu[0], dModelKV);
+	}
+
+	{
+		const size_t perLayer = static_cast<size_t>(gs.maxLen) * dModelKV;
+		const size_t base = static_cast<size_t>(li) * perLayer + static_cast<size_t>(pos) * dModelKV;
+		if (gpuPerf)
+			gg::perfRecordBytesD2D(&gpuPerf->counters, 2u * static_cast<size_t>(dModelKV) * sizeof(float));
+		gpu::device_memcpy_d2d(gs.k.data() + base, gs.kvec.data(), dModelKV * sizeof(float));
+		gpu::device_memcpy_d2d(gs.v.data() + base, gs.vvec.data(), dModelKV * sizeof(float));
+	}
+
+	{
+		glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msAttention : NULL);
+		const size_t perLayer = static_cast<size_t>(gs.maxLen) * dModelKV;
+		const float* kLayer = gs.k.data() + static_cast<size_t>(li) * perLayer;
+		const float* vLayer = gs.v.data() + static_cast<size_t>(li) * perLayer;
+		const float invSqrt = 1.0f / static_cast<float>(sqrt(static_cast<double>(dHead)));
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::kv_attention_incremental(
+		    gs.q.data(), kLayer, vLayer,
+		    gs.attnScores.data(), gs.keyValid.data(),
+		    static_cast<int>(nHeads), static_cast<int>(nKVHeads),
+		    static_cast<int>(dHead), dMKV, static_cast<int>(gs.maxLen),
+		    static_cast<int>(pos), invSqrt, gs.attnConcat.data());
+	}
+
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::sgemv_rowmajor(dM, dM, 1.0f, blk.Wo.data(), dM,
+	                   gs.attnConcat.data(), 0.0f, gs.attnOut.data());
+	if (blk.bo.allocated())
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::add_bias(gs.attnOut.data(), blk.bo.data(), 1, dM);
+	}
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::add_residual(gs.h.data(), gs.attnOut.data(), dM);
+
+	if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::rmsnorm_forward(gs.h.data(), blk.ln2Gamma.data(), eps,
+		                    1, dM, gs.x1.data(), gs.lnInvStd.data());
+	}
+	else
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::layernorm_forward(gs.h.data(), blk.ln2Gamma.data(), blk.ln2Beta.data(),
+		                      eps, 1, dM, gs.x1.data(), gs.lnMean.data(), gs.lnInvStd.data());
+	}
+
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::sgemv_rowmajor(ff1W, dM, 1.0f, blk.W1.data(), dM,
+	                   gs.x1.data(), 0.0f, gs.ffPre.data());
+	if (blk.b1.allocated())
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::add_bias(gs.ffPre.data(), blk.b1.data(), 1, ff1W);
+	}
+	if (ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU))
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::swiglu_forward(gs.ffPre.data(), 1, dFFi, gs.ffAct.data());
+	}
+	else if (static_cast<int>(ffnActivation) == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::gelu_forward(gs.ffPre.data(), dFFi, gs.ffAct.data());
+	}
+	else
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::relu_forward(gs.ffPre.data(), dFFi, gs.ffAct.data());
+	}
+
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::sgemv_rowmajor(dM, dFFi, 1.0f, blk.W2.data(), dFFi,
+	                   gs.ffAct.data(), 0.0f, gs.ffOut.data());
+	if (blk.b2.allocated())
+	{
+		if (gpuPerf)
+			gg::perfRecordKernel(&gpuPerf->counters, 1u);
+		gg::add_bias(gs.ffOut.data(), blk.b2.data(), 1, dM);
+	}
+	if (gpuPerf)
+		gg::perfRecordKernel(&gpuPerf->counters, 1u);
+	gg::add_residual(gs.h.data(), gs.ffOut.data(), dM);
+	return true;
+}
+
 #endif // GLADES_HAVE_CUDA
 
 } // namespace
@@ -777,6 +976,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionReset(glades::NNetw
 	session.metricsEnabled = commonCfg.metricsEnabled;
 	session.metricsBreakdownEnabled = commonCfg.metricsBreakdownEnabled;
 	session.metricsLogPerKvAppend = commonCfg.metricsLogPerKvAppend;
+	session.metricsGpuPerfEnabled = commonCfg.metricsGpuPerfEnabled;
 	session.perf.reset();
 	session.dModel = commonCfg.dModel;
 	session.dFF = commonCfg.dFF;
@@ -952,6 +1152,9 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 		{
 			namespace gg = glades::gpu;
 			const gg::GpuTransformerWeights& gw = *gs->weights;
+			glades::NNetwork::TransformerGpuPerfBreakdown* gpuPerf =
+			    (session.metricsGpuPerfEnabled ? &session.perf.gpu : NULL);
+			glades::gpu::ScopedPerfTimerMs gpuTotal(gpuPerf ? &gpuPerf->msTotal : NULL);
 			const int dM = static_cast<int>(dModel);
 			const int dMKV = static_cast<int>(dModelKV);
 			const int dH = static_cast<int>(dHead);
@@ -961,6 +1164,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 
 			// Update key validity mask on GPU for this position.
 			{
+				if (gpuPerf)
+					gg::perfRecordBytesH2D(&gpuPerf->counters, 1u);
 				unsigned char kv = (padTokenId >= 0 && static_cast<int>(tokenId) == padTokenId) ? 0u : 1u;
 				gpu::device_memcpy_h2d(gs->keyValid.data() + pos, &kv, 1);
 			}
@@ -968,7 +1173,13 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 			// --- Embedding ---
 			// h[dModel] = tokE[tokenId, :]
 			{
+				glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msEmbed : NULL);
 				int tid = static_cast<int>(tokenId);
+				if (gpuPerf)
+				{
+					gg::perfRecordBytesH2D(&gpuPerf->counters, sizeof(int));
+					gg::perfRecordKernel(&gpuPerf->counters, 1u);
+				}
 				gs->tokenIdBuf.upload(&tid, 1);
 				gg::embedding_gather(gw.tokE.data(), gs->tokenIdBuf.data(),
 				                     1, static_cast<int>(vocab), dM, gs->h.data());
@@ -977,6 +1188,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 			// --- Positional encoding ---
 			if (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL))
 			{
+				glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msPosEnc : NULL);
 				// Compute sinusoidal PE on CPU, upload, add to h on GPU.
 				session.posEncCache.ensureSinusoidal(dModel);
 				std::vector<float> peVec(dModel, 0.0f);
@@ -989,153 +1201,59 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 						peVec[i] = (i % 2u == 0u) ? static_cast<float>(sin(angle)) : static_cast<float>(cos(angle));
 					}
 				}
+				if (gpuPerf)
+				{
+					gg::perfRecordBytesH2D(&gpuPerf->counters, static_cast<size_t>(dModel) * sizeof(float));
+					gg::perfRecordKernel(&gpuPerf->counters, 1u);
+				}
 				gs->peScratch.upload(&peVec[0], dModel);
 				gg::add_residual(gs->h.data(), gs->peScratch.data(), dM);
 			}
 			// RoPE is applied after QKV projection, not here.
 			// POSENC_NONE: nothing to do.
+			if (useRope && ropeDim >= 2u)
+				session.posEncCache.ensureRope(ropeDim, ropeTheta);
 
 			// --- Per-layer forward ---
 			for (unsigned int li = 0; li < tt.nLayers; ++li)
 			{
 				const gg::GpuTransformerWeights::Block& gb = gw.blocks[li];
-
-				// Norm1: h[dModel] -> x1[dModel]
-				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-					gg::rmsnorm_forward(gs->h.data(), gb.ln1Gamma.data(), eps,
-					                    1, dM, gs->x1.data(), gs->lnInvStd.data());
-				else
-					gg::layernorm_forward(gs->h.data(), gb.ln1Gamma.data(), gb.ln1Beta.data(),
-					                      eps, 1, dM, gs->x1.data(), gs->lnMean.data(), gs->lnInvStd.data());
-
-				// Q/K/V projections: sgemv y = W * x + b
-				// q[dModel] = Wq[dModel, dModel] * x1[dModel]
-				gg::sgemv_rowmajor(dM, dM, 1.0f, gb.Wq.data(), dM, gs->x1.data(), 0.0f, gs->q.data());
-				if (gb.bq.allocated())
-					gg::add_bias(gs->q.data(), gb.bq.data(), 1, dM);
-
-				// kvec[dModelKV] = Wk[dModelKV, dModel] * x1[dModel]
-				gg::sgemv_rowmajor(dMKV, dM, 1.0f, gb.Wk.data(), dM, gs->x1.data(), 0.0f, gs->kvec.data());
-				if (gb.bk.allocated())
-					gg::add_bias(gs->kvec.data(), gb.bk.data(), 1, dMKV);
-
-				// vvec[dModelKV] = Wv[dModelKV, dModel] * x1[dModel]
-				gg::sgemv_rowmajor(dMKV, dM, 1.0f, gb.Wv.data(), dM, gs->x1.data(), 0.0f, gs->vvec.data());
-				if (gb.bv.allocated())
-					gg::add_bias(gs->vvec.data(), gb.bv.data(), 1, dMKV);
-
-				// RoPE on Q and K for this single token.
-				// The GPU rope_apply kernel uses theta = t * invFreq[d] with t as the row
-				// index. For T=1, t=0 always, giving no rotation. For incremental inference
-				// we need theta = pos * invFreq[d]. We handle this by applying RoPE on CPU
-				// (download, rotate, re-upload). The overhead is small since Q and K are
-				// single vectors, and RoPE is not the bottleneck in inference.
-				if (useRope && ropeDim >= 2u)
-				{
-					session.posEncCache.ensureRope(ropeDim, ropeTheta);
-					std::vector<float> qCpu(dModel);
-					std::vector<float> kvCpu(dModelKV);
-					gs->q.download(&qCpu[0], dModel);
-					gs->kvec.download(&kvCpu[0], dModelKV);
-					for (unsigned int hq = 0; hq < nHeads; ++hq)
-						rope_apply_vec(&qCpu[static_cast<size_t>(hq) * dHead], dHead, ropeDim,
-						               session.posEncCache.ropeInvFreq, pos);
-					for (unsigned int hk = 0; hk < nKVHeads; ++hk)
-						rope_apply_vec(&kvCpu[static_cast<size_t>(hk) * dHead], dHead, ropeDim,
-						               session.posEncCache.ropeInvFreq, pos);
-					gs->q.upload(&qCpu[0], dModel);
-					gs->kvec.upload(&kvCpu[0], dModelKV);
-				}
-
-				// Store K/V into GPU cache at [li, pos]
-				{
-					const size_t perLayer = static_cast<size_t>(gs->maxLen) * dModelKV;
-					const size_t base = static_cast<size_t>(li) * perLayer + static_cast<size_t>(pos) * dModelKV;
-					gpu::device_memcpy_d2d(gs->k.data() + base, gs->kvec.data(),
-					                       dModelKV * sizeof(float));
-					gpu::device_memcpy_d2d(gs->v.data() + base, gs->vvec.data(),
-					                       dModelKV * sizeof(float));
-				}
-
-				// Attention: Q[nHeads*dHead] against KV cache -> attnConcat[nHeads*dHead]
-				{
-					const size_t perLayer = static_cast<size_t>(gs->maxLen) * dModelKV;
-					const float* kLayer = gs->k.data() + static_cast<size_t>(li) * perLayer;
-					const float* vLayer = gs->v.data() + static_cast<size_t>(li) * perLayer;
-					const float invSqrt = 1.0f / static_cast<float>(sqrt(static_cast<double>(dHead)));
-
-					gg::kv_attention_incremental(
-						gs->q.data(), kLayer, vLayer,
-						gs->attnScores.data(), gs->keyValid.data(),
-						static_cast<int>(nHeads), static_cast<int>(nKVHeads),
-						dH, dMKV, static_cast<int>(gs->maxLen),
-						static_cast<int>(pos), invSqrt, gs->attnConcat.data());
-				}
-
-				// Wo projection + residual: attnOut = Wo * attnConcat + bo; h += attnOut
-				gg::sgemv_rowmajor(dM, dM, 1.0f, gb.Wo.data(), dM,
-				                   gs->attnConcat.data(), 0.0f, gs->attnOut.data());
-				if (gb.bo.allocated())
-					gg::add_bias(gs->attnOut.data(), gb.bo.data(), 1, dM);
-				gg::add_residual(gs->h.data(), gs->attnOut.data(), dM);
-
-				// Norm2: h -> x1 (reuse x1 as scratch for post-LN2 output)
-				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
-					gg::rmsnorm_forward(gs->h.data(), gb.ln2Gamma.data(), eps,
-					                    1, dM, gs->x1.data(), gs->lnInvStd.data());
-				else
-					gg::layernorm_forward(gs->h.data(), gb.ln2Gamma.data(), gb.ln2Beta.data(),
-					                      eps, 1, dM, gs->x1.data(), gs->lnMean.data(), gs->lnInvStd.data());
-
-				// FFN: x1 -> ffPre -> ffAct -> ffOut
-				// ffPre = W1 * x1 + b1
-				gg::sgemv_rowmajor(ff1W, dM, 1.0f, gb.W1.data(), dM,
-				                   gs->x1.data(), 0.0f, gs->ffPre.data());
-				if (gb.b1.allocated())
-					gg::add_bias(gs->ffPre.data(), gb.b1.data(), 1, ff1W);
-
-				// Activation
-				if (session.ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU))
-				{
-					// SwiGLU: ffPre[2*dFF] -> ffAct[dFF]
-					gg::swiglu_forward(gs->ffPre.data(), 1, dFFi, gs->ffAct.data());
-				}
-				else
-				{
-					const int act = static_cast<int>(session.ffnActivation);
-					if (act == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
-						gg::gelu_forward(gs->ffPre.data(), dFFi, gs->ffAct.data());
-					else
-						gg::relu_forward(gs->ffPre.data(), dFFi, gs->ffAct.data());
-				}
-
-				// ffOut = W2 * ffAct + b2
-				gg::sgemv_rowmajor(dM, dFFi, 1.0f, gb.W2.data(), dFFi,
-				                   gs->ffAct.data(), 0.0f, gs->ffOut.data());
-				if (gb.b2.allocated())
-					gg::add_bias(gs->ffOut.data(), gb.b2.data(), 1, dM);
-
-				// h += ffOut
-				gg::add_residual(gs->h.data(), gs->ffOut.data(), dM);
+				gpu_infer_run_layer_step(session.posEncCache.ropeInvFreq, gb, *gs, li, pos, dModel, dFF,
+				                        nHeads, nKVHeads, dHead, dModelKV,
+				                        session.ff1Width, session.ffnKind, session.ffnActivation,
+				                        normType, eps, useRope, ropeDim, ropeTheta, gpuPerf);
 			}
 
 			// --- Logits: tied embedding ---
 			if (outLogits)
 			{
+				glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msAttention : NULL);
 				// logits[vocab] = tokE[vocab, dModel] * h[dModel] + lmBias[vocab]
+				if (gpuPerf)
+					gg::perfRecordKernel(&gpuPerf->counters, 1u);
 				gg::sgemv_rowmajor(static_cast<int>(vocab), dM, 1.0f,
 				                   gw.tokE.data(), dM, gs->h.data(),
 				                   0.0f, gs->logits.data());
 				if (gw.lmBias.allocated())
+				{
+					if (gpuPerf)
+						gg::perfRecordKernel(&gpuPerf->counters, 1u);
 					gg::add_bias(gs->logits.data(), gw.lmBias.data(), 1, static_cast<int>(vocab));
+				}
 
 				// Download logits to CPU.
 				if (outLogits->size() != vocab)
 					outLogits->resize(vocab);
+				if (gpuPerf)
+					gg::perfRecordBytesD2H(&gpuPerf->counters, static_cast<size_t>(vocab) * sizeof(float));
 				gs->logits.download(&(*outLogits)[0], vocab);
 			}
 
 			session.curLen += 1u;
+			if (gpuPerf)
+				lastTransformerInferGpuPerf = *gpuPerf;
+			if (gpuPerf && metricsOn && session.logger && transformerMetricsCfg.logGpuInferSummary)
+				log_kv_append_event(session.logger, "transformer_gpu_kv_append", session.curLen, session.maxLen, 1u, outLogits != NULL, &session.perf);
 			return NNetworkStatus(NNetworkStatus::OK, std::string());
 		}
 	}
@@ -1521,6 +1639,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionReset(glades::
 	session.metricsEnabled = commonCfg.metricsEnabled;
 	session.metricsBreakdownEnabled = commonCfg.metricsBreakdownEnabled;
 	session.metricsLogPerKvAppend = commonCfg.metricsLogPerKvAppend;
+	session.metricsGpuPerfEnabled = commonCfg.metricsGpuPerfEnabled;
 	session.perf.reset();
 	session.dModel = commonCfg.dModel;
 	session.dFF = commonCfg.dFF;

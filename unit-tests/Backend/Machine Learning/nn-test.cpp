@@ -4413,6 +4413,29 @@ void NNTransformerUnitTest()
 			std::vector<glades::HiddenLayerInfo*> hidden;
 			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
 			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
+			glades::NNInfo* info = new glades::NNInfo("ut_transformer_gpu_metrics_cfg", in, hidden, out);
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			glades::NNetwork::TransformerMetricsConfig metricsCfg = net.getTransformerMetricsConfig();
+			metricsCfg.enable = true;
+			metricsCfg.enableGpuPerf = true;
+			metricsCfg.logGpuTrainSummary = true;
+			metricsCfg.logGpuInferSummary = true;
+			net.setTransformerMetricsConfig(metricsCfg);
+			const glades::NNetwork::TransformerMetricsConfig appliedCfg = net.getTransformerMetricsConfig();
+			G_assert(__FILE__, __LINE__, "==============NN::TransformerMetricsCfg EnableGpuPerf Failed==============",
+			         appliedCfg.enableGpuPerf && appliedCfg.logGpuTrainSummary && appliedCfg.logGpuInferSummary);
+			G_assert(__FILE__, __LINE__, "==============NN::TransformerMetricsCfg TrainSnapshotZero Failed==============",
+			         net.getLastTransformerTrainGpuPerf().counters.kernelLaunches == 0ULL);
+			G_assert(__FILE__, __LINE__, "==============NN::TransformerMetricsCfg InferSnapshotZero Failed==============",
+			         net.getLastTransformerInferGpuPerf().counters.bytesH2D == 0ULL);
+			delete info;
+		}
+
+		{
+			glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+			std::vector<glades::HiddenLayerInfo*> hidden;
+			hidden.push_back(new glades::HiddenLayerInfo(8, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+			glades::OutputLayerInfo* out = new glades::OutputLayerInfo(8, glades::OutputLayerInfo::CLASSIFICATION);
 			glades::NNInfo* info = new glades::NNInfo("ut_transformer_invalid_sampled_softmax", in, hidden, out);
 			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 			glades::TrainingConfig cfg = net.getTrainingConfig();

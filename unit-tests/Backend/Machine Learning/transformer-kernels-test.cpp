@@ -1,6 +1,7 @@
 #include "transformer-kernels-test.h"
 #include "../../unit-test.h"
 #include "../../../Backend/Machine Learning/rng.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_dispatch.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
 #include <cmath>
 #include <cstdio>
@@ -37,6 +38,33 @@ void TransformerKernelsUnitTest()
 	printf("============================================================\n");
 
 	unsigned int seed = 42u;
+
+	// ----------------------------------------------------------
+	// Group D: GPU perf helper smoke tests
+	// ----------------------------------------------------------
+	printf("\n--- Group D: GPU Perf Helper Smoke ---\n");
+	{
+		glades::gpu::DispatchPerfCounters perf;
+		glades::gpu::perfRecordKernel(&perf, 3u);
+		glades::gpu::perfRecordSync(&perf, 2u);
+		glades::gpu::perfRecordBytesH2D(&perf, 64u);
+		glades::gpu::perfRecordBytesD2H(&perf, 32u);
+		glades::gpu::perfRecordBytesD2D(&perf, 16u);
+		{
+			glades::gpu::ScopedPerfTimerMs t(&perf.msCompute);
+			volatile int sink = 0;
+			for (int i = 0; i < 1000; ++i)
+				sink += i;
+			(void)sink;
+		}
+		ASSERT("GPU perf helper kernel count", perf.kernelLaunches == 3u);
+		ASSERT("GPU perf helper sync count", perf.syncPoints == 2u);
+		ASSERT("GPU perf helper H2D bytes", perf.bytesH2D == 64u);
+		ASSERT("GPU perf helper D2H bytes", perf.bytesD2H == 32u);
+		ASSERT("GPU perf helper D2D bytes", perf.bytesD2D == 16u);
+		ASSERT("GPU perf helper timer non-negative", perf.msCompute >= 0.0);
+		printf("[PASS] D1: GpuPerfHelpersSmoke\n");
+	}
 
 	// ----------------------------------------------------------
 	// Group E: Normalization Forward/Backward

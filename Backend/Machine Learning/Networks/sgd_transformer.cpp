@@ -3028,6 +3028,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
 	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+	TransformerGpuPerfBreakdown* gpuPerf =
+	    ((transformerMetricsCfg.enable && transformerMetricsCfg.enableGpuPerf) ? &lastTransformerTrainGpuPerf : NULL);
+	if (gpuPerf)
+		gpuPerf->reset();
+	glades::gpu::ScopedPerfTimerMs gpuTotal(gpuPerf ? &gpuPerf->msTotal : NULL);
 	cudaEvent_t gpuTransferReadyEvent = gpu::createEvent(false);
 	cudaEvent_t gpuComputeReadyEvent = gpu::createEvent(false);
 
@@ -3058,6 +3063,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		// Upload token IDs for this sequence.
 		if (tokenLM)
 		{
+			glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msEmbed : NULL);
 			std::vector<int> tokenIdsInt(T);
 			for (unsigned int t = 0; t < T; ++t)
 			{
@@ -3065,7 +3071,13 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				di->getTrainSequenceTokenId(s, t, tid);
 				tokenIdsInt[t] = tid;
 			}
-			gpuTransformerScratch->tokenIds.uploadAsync(&tokenIdsInt[0], T);
+			if (gpuPerf)
+			{
+				gpu::perfRecordBytesH2D(&gpuPerf->counters, static_cast<size_t>(T) * sizeof(int));
+				gpu::perfRecordSync(&gpuPerf->counters, 1u);
+				gpu::perfRecordKernel(&gpuPerf->counters, 1u);
+			}
+			gpu::uploadTransformerTokenIds(*gpuTransformerScratch, &tokenIdsInt[0], T);
 			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
@@ -3079,6 +3091,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		}
 		else
 		{
+			glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msEmbed : NULL);
 			// Upload input features and run linear projection.
 			std::vector<float> xHost(static_cast<size_t>(T) * inputSize);
 			for (unsigned int t = 0; t < T; ++t)
@@ -3090,7 +3103,14 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				for (unsigned int f = 0; f < inputSize; ++f)
 					xHost[off + f] = (row && f < rowSize) ? row[f] : 0.0f;
 			}
-			gpuTransformerScratch->x.uploadAsync(&xHost[0], xHost.size());
+			if (gpuPerf)
+			{
+				gpu::perfRecordBytesH2D(&gpuPerf->counters,
+				                        static_cast<size_t>(T) * static_cast<size_t>(inputSize) * sizeof(float));
+				gpu::perfRecordSync(&gpuPerf->counters, 1u);
+				gpu::perfRecordKernel(&gpuPerf->counters, 2u);
+			}
+			gpu::uploadTransformerDenseInputs(*gpuTransformerScratch, &xHost[0], xHost.size());
 			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
@@ -3110,13 +3130,19 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		unsigned int fwdRopeHalfDim = 0u;
 		if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
 		{
+			glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msPosEnc : NULL);
 			const unsigned int rd = (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
 			                        ? static_cast<unsigned int>(ropeDimOverride) : dHead;
 			fwdRopeHalfDim = rd / 2u;
 			std::vector<float> invFreqF(fwdRopeHalfDim);
 			for (unsigned int i = 0; i < fwdRopeHalfDim && i < transformerPosEncCache.ropeInvFreq.size(); ++i)
 				invFreqF[i] = static_cast<float>(transformerPosEncCache.ropeInvFreq[i]);
-			gpuTransformerScratch->gpuInvFreq.uploadAsync(&invFreqF[0], invFreqF.size());
+			if (gpuPerf)
+			{
+				gpu::perfRecordBytesH2D(&gpuPerf->counters, invFreqF.size() * sizeof(float));
+				gpu::perfRecordSync(&gpuPerf->counters, 1u);
+			}
+			gpu::uploadTransformerRopeInvFreq(*gpuTransformerScratch, &invFreqF[0], invFreqF.size());
 			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 		}
 
@@ -3307,6 +3333,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		unsigned int gpuValidTargets = 0u;
 		if (tokenLM)
 		{
+			glades::gpu::ScopedPerfTimerMs gpuStage(gpuPerf ? &gpuPerf->msLoss : NULL);
 			gpuTargetIds.resize(T);
 			for (unsigned int t = 0; t < T; ++t)
 			{
@@ -3315,36 +3342,25 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				gpuTargetIds[t] = yid;
 			}
 			// Upload targets to persistent scratch buffer.
+			if (gpuPerf)
+			{
+				gpu::perfRecordBytesH2D(&gpuPerf->counters, static_cast<size_t>(T) * sizeof(int));
+				gpu::perfRecordSync(&gpuPerf->counters, 2u);
+				gpu::perfRecordKernel(&gpuPerf->counters, 1u);
+			}
 			gpuTransformerScratch->gpuTargetsT.uploadAsync(&gpuTargetIds[0], T);
 			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
-			// GPU loss: cross-entropy NLL.
-			gpu::cross_entropy_nll_loss(
+			gpu::collect_token_lm_metrics(
 			    gpuTransformerScratch->probs.data(),
 			    gpuTransformerScratch->gpuTargetsT.data(),
 			    static_cast<int>(T), static_cast<int>(vocabSize),
 			    padTokenId,
-			    gpuTransformerScratch->lossSum.data(),
-			    gpuTransformerScratch->lossCount.data());
-
-			// GPU accuracy: argmax match count.
-			gpu::argmax_count_matches(
-			    gpuTransformerScratch->probs.data(),
-			    gpuTransformerScratch->gpuTargetsT.data(),
-			    static_cast<int>(T), static_cast<int>(vocabSize),
-			    padTokenId,
-			    gpuTransformerScratch->correctCount.data(),
-			    gpuTransformerScratch->validCount.data());
-
-			// Pack 4 loss scalars into contiguous buffer, download once.
-			gpu::pack_loss_scalars(
-			    gpuTransformerScratch->lossSum.data(),
-			    gpuTransformerScratch->lossCount.data(),
-			    gpuTransformerScratch->correctCount.data(),
-			    gpuTransformerScratch->validCount.data(),
 			    gpuTransformerScratch->lossPack.data());
 			int lossPacked[4];
+			if (gpuPerf)
+				gpu::perfRecordBytesD2H(&gpuPerf->counters, 4u * sizeof(int));
 			gpu::recordEvent(gpuComputeReadyEvent, gpu::computeStream());
 			gpu::streamWaitEvent(gpu::transferStream(), gpuComputeReadyEvent);
 			gpuTransformerScratch->lossPack.downloadAsync(lossPacked, 4);
@@ -3426,6 +3442,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			gpu::zeroTransformerGradients(*gpuTransformerWeights);
 			timeStepsInBatch = 0u;
 		}
+		glades::gpu::ScopedPerfTimerMs gpuBackwardStage(gpuPerf ? &gpuPerf->msBackward : NULL);
 
 		// Compute dLogits on GPU.
 		const float* bwdFinalH = gpuTransformerScratch->hAfterFF.data() +
@@ -3683,6 +3700,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			// Zero dK/dV (dQ is overwritten per-head, but dK/dV accumulate for GQA).
 			gpu::zero_buffers_batch(gpuTransformerScratch->d_dKdVZeroPtrs,
 			    gpuTransformerScratch->d_dKdVZeroSizes, 2);
+			if (gpuPerf)
+				gpu::perfRecordKernel(&gpuPerf->counters, 2u);
 
 			gpu::flash_attention_multihead_backward(
 			    Q_l, K_l, V_l,
@@ -3820,6 +3839,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		// === Optimizer step (when batch is complete) ===
 		if (seqInBatch >= seqBatchMax && timeStepsInBatch > 0u)
 		{
+			glades::gpu::ScopedPerfTimerMs gpuOptStage(gpuPerf ? &gpuPerf->msOptimizer : NULL);
 			const float invBatch = 1.0f / static_cast<float>(timeStepsInBatch);
 			tensorTransformer.optimizerStep += 1ULL;
 
@@ -4240,6 +4260,12 @@ if ((sz) > maxSz) maxSz = (sz); \
 
 				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamLr, hLrs, gc * sizeof(float));
 				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamWd, hWds, gc * sizeof(float));
+				if (gpuPerf)
+				{
+					gpu::perfRecordBytesH2D(&gpuPerf->counters, static_cast<size_t>(2 * gc) * sizeof(float));
+					gpu::perfRecordSync(&gpuPerf->counters, 1u);
+					gpu::perfRecordKernel(&gpuPerf->counters, 1u);
+				}
 				gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 				gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
@@ -4257,6 +4283,8 @@ if ((sz) > maxSz) maxSz = (sz); \
 			}
 			} // end Adam branch
 
+			if (gpuPerf)
+				gpu::perfRecordSync(&gpuPerf->counters, 1u);
 			gpu::synchronizeComputeStream();
 			seqInBatch = 0u;
 			timeStepsInBatch = 0u;
@@ -4277,6 +4305,8 @@ if ((sz) > maxSz) maxSz = (sz); \
 	                                ttMut.lmBias.empty() ? NULL : &ttMut.lmBias[0], ttMut.lmBias.size(),
 	                                ttMut.lnFinalGamma.empty() ? NULL : &ttMut.lnFinalGamma[0], ttMut.lnFinalGamma.size(),
 	                                ttMut.lnFinalBeta.empty() ? NULL : &ttMut.lnFinalBeta[0], ttMut.lnFinalBeta.size());
+	if (gpuPerf)
+		gpu::perfRecordSync(&gpuPerf->counters, 1u);
 
 	// Download per-block weights.
 	for (unsigned int l = 0; l < nLayers; ++l)
@@ -4310,6 +4340,22 @@ if ((sz) > maxSz) maxSz = (sz); \
 			overallTotalError = static_cast<float>(tokenLmNllSum / static_cast<double>(tokenLmTokenCount));
 		else
 			overallTotalError = 0.0f;
+	}
+	if (gpuPerf && logger && transformerMetricsCfg.logGpuTrainSummary)
+	{
+		std::ostringstream oss;
+		oss << "event=transformer_gpu_train_perf";
+		append_logfmt_kv(oss, "epoch", epochIdx);
+		append_logfmt_kv(oss, "kernel_launches", gpuPerf->counters.kernelLaunches);
+		append_logfmt_kv(oss, "sync_points", gpuPerf->counters.syncPoints);
+		append_logfmt_kv(oss, "bytes_h2d", gpuPerf->counters.bytesH2D);
+		append_logfmt_kv(oss, "bytes_d2h", gpuPerf->counters.bytesD2H);
+		append_logfmt_kv(oss, "bytes_d2d", gpuPerf->counters.bytesD2D);
+		append_logfmt_kv(oss, "ms_total", gpuPerf->msTotal);
+		append_logfmt_kv(oss, "ms_loss", gpuPerf->msLoss);
+		append_logfmt_kv(oss, "ms_backward", gpuPerf->msBackward);
+		append_logfmt_kv(oss, "ms_optimizer", gpuPerf->msOptimizer);
+		logger->info("NNetwork", shmea::GString(oss.str().c_str()));
 	}
 
 }

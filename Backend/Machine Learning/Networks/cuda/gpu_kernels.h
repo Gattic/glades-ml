@@ -262,6 +262,13 @@ bool pack_loss_scalars(const float* lossSum, const int* lossCount,
                        const int* correctCount, const int* validCount,
                        int* out);
 
+// Fused token-LM metrics reducer.
+// Computes cross-entropy NLL sum, valid-token count, argmax-correct count,
+// and writes the packed 4-scalar payload directly to out[4].
+bool collect_token_lm_metrics(const float* probs, const int* targets,
+                              int T, int vocabSize, int padToken,
+                              int* out);
+
 // ---------------------------------------------------------------------------
 // Gradient norm computation
 // ---------------------------------------------------------------------------
