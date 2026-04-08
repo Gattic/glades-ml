@@ -91,6 +91,70 @@ static bool parse_kv_manifest(const std::string& path, std::map<std::string, std
 	return sawMagic;
 }
 
+static glades::NumberInput* make_atlas_transformer_resume_dataset()
+{
+	const int numSamples = 8;
+	const int numFeatures = 4;
+	const int numOutputs = 4;
+
+	glades::NumberInput* di = new glades::NumberInput();
+	di->trainMatrix = shmea::GMatrix(numSamples, shmea::GVector<float>(numFeatures, 0.0f));
+	di->trainExpectedMatrix = shmea::GMatrix(numSamples, shmea::GVector<float>(numOutputs, 0.0f));
+
+	for (int i = 0; i < numSamples; ++i)
+	{
+		for (int j = 0; j < numFeatures; ++j)
+			di->trainMatrix[i][j] = static_cast<float>(i * numFeatures + j) / static_cast<float>(numSamples * numFeatures);
+		for (int j = 0; j < numOutputs; ++j)
+			di->trainExpectedMatrix[i][j] = static_cast<float>((i + j) % numOutputs) / static_cast<float>(numOutputs);
+	}
+
+	di->testMatrix = di->trainMatrix;
+	di->testExpectedMatrix = di->trainExpectedMatrix;
+	return di;
+}
+
+static glades::NNInfo* make_atlas_transformer_resume_info(const char* name)
+{
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	    /*batchSize*/ 1,
+	    /*learningRate*/ 0.01f,
+	    /*momentumFactor*/ 0.0f,
+	    /*weightDecay1*/ 0.0f,
+	    /*weightDecay2*/ 0.0f,
+	    /*pDropout*/ 0.0f,
+	    /*activationType*/ glades::GMath::LINEAR,
+	    /*activationParam*/ 1.0f);
+
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	hidden.push_back(new glades::HiddenLayerInfo(
+	    /*size*/ 16,
+	    /*learningRate*/ 0.01f,
+	    /*momentumFactor*/ 0.0f,
+	    /*weightDecay1*/ 0.0f,
+	    /*weightDecay2*/ 0.0f,
+	    /*pDropout*/ 0.0f,
+	    /*activationType*/ glades::GMath::LINEAR,
+	    /*activationParam*/ 1.0f));
+
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(4, glades::OutputLayerInfo::REGRESSION);
+	return new glades::NNInfo(name, in, hidden, out);
+}
+
+static void configure_atlas_transformer_resume_net(glades::NNetwork& net, unsigned int seed, int epochs)
+{
+	net.setSeed(seed);
+	net.getTerminatorMutable().setEpoch(epochs);
+	net.getTerminatorMutable().setAccuracy(0);
+
+	glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+	cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+	cfg.atlas.rank = 8u;
+	cfg.atlas.tSub = 50u;
+	cfg.transformer.nHeadsOverride = 4;
+	cfg.transformer.dFFOverride = 32;
+}
+
 } // anonymous namespace
 
 void ATLASUnitTest()
@@ -2335,6 +2399,92 @@ void ATLASUnitTest()
 		       relDiff < 1e-5f);
 
 		// Cleanup
+		{
+			const std::string base = "database/checkpoints/" + ckptName;
+			remove((base + "/manifest.txt").c_str());
+			remove((base + "/nninfo.csv").c_str());
+			for (int i = 0; i < 10; ++i)
+			{
+				char buf[64];
+				snprintf(buf, sizeof(buf), "/shard_%03d.bin", i);
+				remove((base + buf).c_str());
+			}
+			rmdir(base.c_str());
+		}
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ----------------------------------------------------------------
+	// Test 24B: Transformer checkpoint preserves ATLAS optimizer state
+	// ----------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 24B: Transformer checkpoint state preservation\n");
+	printf("-----------------------------------\n");
+	{
+		const std::string ckptName = "ut_atlas_tr_st24b";
+		float lossA = -1.0f;
+		float lossB = -1.0f;
+
+		// Path A: train 50 epochs, checkpoint, then continue 25 more epochs.
+		{
+			glades::NumberInput* diA = make_atlas_transformer_resume_dataset();
+			glades::NNInfo* info = make_atlas_transformer_resume_info("ut_atlas_tr_st24b_a");
+
+			glades::NNetwork netA(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+			configure_atlas_transformer_resume_net(netA, 2027u, 50);
+
+			glades::NNetworkStatus st = netA.train(diA);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint Phase1 Train Failed==============", st.ok());
+
+			st = netA.saveCheckpoint(ckptName);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint Save Failed==============", st.ok());
+
+			netA.getTerminatorMutable().setEpoch(25);
+			CaptureMetricsCallbacks cbA;
+			st = netA.train(diA, &cbA);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint Phase2 Train Failed==============", st.ok());
+			ASSERT("==============ATLAS::TransformerStateCheckpoint Phase2 no metrics==============", cbA.saw);
+			lossA = cbA.last.totalError;
+
+			delete diA;
+			delete info;
+		}
+
+		// Path B: load checkpoint, verify config restore, then train the same 25 epochs.
+		{
+			glades::NumberInput* diB = make_atlas_transformer_resume_dataset();
+			glades::NNetwork netB;
+			glades::NNetworkStatus st = netB.loadCheckpoint(ckptName, diB);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint Load Failed==============", st.ok());
+			ASSERT("==============ATLAS::TransformerStateCheckpoint OptimizerRestored Failed==============",
+			       netB.getTrainingConfig().optimizer.type == glades::OptimizerConfig::ATLAS);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint RankRestored Failed==============",
+			       netB.getTrainingConfig().atlas.rank == 8u);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint TSubRestored Failed==============",
+			       netB.getTrainingConfig().atlas.tSub == 50u);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint HeadsRestored Failed==============",
+			       netB.getTrainingConfig().transformer.nHeadsOverride == 4);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint DFFRestored Failed==============",
+			       netB.getTrainingConfig().transformer.dFFOverride == 32);
+
+			netB.getTerminatorMutable().setEpoch(25);
+			CaptureMetricsCallbacks cbB;
+			st = netB.train(diB, &cbB);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint Phase3 Train Failed==============", st.ok());
+			ASSERT("==============ATLAS::TransformerStateCheckpoint Phase3 no metrics==============", cbB.saw);
+			lossB = cbB.last.totalError;
+
+			delete diB;
+		}
+
+		printf("[UT] ATLAS transformer state checkpoint: lossA=%f, lossB=%f\n", lossA, lossB);
+		const float relDiff = (lossA > 0.0f && lossB > 0.0f)
+		    ? fabsf(lossA - lossB) / (0.5f * (lossA + lossB))
+		    : fabsf(lossA - lossB);
+		printf("[UT] Transformer relative difference: %e\n", relDiff);
+		ASSERT("==============ATLAS::TransformerStateCheckpoint losses diverged==============",
+		       relDiff < 1e-4f);
+
 		{
 			const std::string base = "database/checkpoints/" + ckptName;
 			remove((base + "/manifest.txt").c_str());

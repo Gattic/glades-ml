@@ -189,9 +189,10 @@ Monitor `lr_mult` in logs to confirm no more restarts.
 Already in place:
 - ATLAS checkpoint persistence writes and reads `U`, `fisherDiag`, `prevGz`, `mu`, `sigma2`, and `step`
 - `ATLAS Test 24` verifies resume equivalence for a checkpointed ATLAS training run
+- `ATLAS Test 24B` verifies ATLAS resume equivalence for a checkpointed transformer encoder run and checks restored transformer overrides
 
 Remaining work:
 - [x] Persist ATLAS config in the checkpoint manifest so callers do not have to manually restore fields like `rank` and `tSub` after `loadCheckpoint()`
 - [x] Fail fast on rank/config mismatches instead of reconstructing ATLAS state from the current runtime config
-- Add a transformer-focused resume test so checkpoint coverage is not limited to the DFF path
+- [x] Add a transformer-focused resume test so checkpoint coverage is not limited to the DFF path
 - Decide whether GPU-resident resume needs dedicated coverage beyond the current checkpoint load path
