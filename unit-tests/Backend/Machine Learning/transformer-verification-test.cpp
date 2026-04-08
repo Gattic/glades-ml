@@ -20,6 +20,7 @@
 #include "test_token_id_input_fixture.h"
 
 #include "../../../Backend/Machine Learning/Networks/network.h"
+#include "../../../Backend/Machine Learning/Networks/training_callbacks.h"
 #include "../../../Backend/Machine Learning/Networks/training_config.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_config.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
@@ -94,6 +95,71 @@ struct SmallDecoderLm
 	}
 
 	~SmallDecoderLm()
+	{
+		delete net;
+		delete di;
+		delete info;
+	}
+};
+
+static glades::TrainingConfig make_valid_training_cfg(unsigned int vocab);
+
+struct TrainableDecoderLm
+{
+	InMemoryTokenIdInput* di;
+	glades::NNInfo* info;
+	glades::NNetwork* net;
+	unsigned int vocab;
+	unsigned int padTokenId;
+
+	TrainableDecoderLm(unsigned int newVocab,
+	                   unsigned int seqLen,
+	                   unsigned int seed,
+	                   bool bootstrapNow = true)
+	    : di(NULL),
+	      info(NULL),
+	      net(NULL),
+	      vocab(newVocab),
+	      padTokenId(newVocab - 1u)
+	{
+		const unsigned int tokenSpan = (newVocab > 2u) ? (newVocab - 2u) : 1u;
+		std::vector<unsigned int> toks;
+		toks.reserve(seqLen);
+		for (unsigned int i = 0u; i < seqLen; ++i)
+			toks.push_back(1u + (i % tokenSpan));
+
+		di = new InMemoryTokenIdInput();
+		di->setTrainTokens(toks, static_cast<int>(padTokenId));
+		di->mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		info = new glades::NNInfo("ut_transformer_verification_train_decoder_lm", in, hidden, out);
+
+		net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net->setSeed(seed);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
+
+		glades::TrainingConfig cfg = make_valid_training_cfg(vocab);
+		cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+		const glades::NNetworkStatus cfgSt = net->setTrainingConfig(cfg);
+		ASSERT("==============TransformerVerification: TrainableDecoderLm SetTrainingConfig Failed==============", cfgSt.ok());
+
+		if (bootstrapNow)
+		{
+			const glades::NNetworkStatus st = net->test(di);
+			ASSERT("==============TransformerVerification: TrainableDecoderLm InitTestStatus Failed==============", st.ok());
+		}
+	}
+
+	~TrainableDecoderLm()
 	{
 		delete net;
 		delete di;
@@ -199,6 +265,69 @@ public:
 
 private:
 	unsigned int shouldStopAllCalls_;
+};
+
+class CaptureEpochMetricsCallback : public glades::ITrainingCallbacks
+{
+public:
+	CaptureEpochMetricsCallback()
+	    : last(),
+	      sawRunStart(false),
+	      sawEpoch(false),
+	      sawRunEnd(false)
+	{
+	}
+
+	virtual void onRunStart(const glades::NNetwork& /*net*/, int /*runType*/)
+	{
+		sawRunStart = true;
+	}
+
+	virtual bool onEpochEnd(const glades::NNetwork& /*net*/, const glades::NNetworkEpochMetrics& m)
+	{
+		last = m;
+		sawEpoch = true;
+		return false;
+	}
+
+	virtual void onRunEnd(const glades::NNetwork& /*net*/, int /*runType*/)
+	{
+		sawRunEnd = true;
+	}
+
+	glades::NNetworkEpochMetrics last;
+	bool sawRunStart;
+	bool sawEpoch;
+	bool sawRunEnd;
+};
+
+class SetTrainingConfigWhileRunningCallback : public glades::ITrainingCallbacks
+{
+public:
+	explicit SetTrainingConfigWhileRunningCallback(const glades::TrainingConfig& cfg)
+	    : sawRunStart(false),
+	      setConfigStatus(glades::NNetworkStatus::OK, std::string()),
+	      cfg_(cfg)
+	{
+	}
+
+	virtual void onRunStart(const glades::NNetwork& net, int /*runType*/)
+	{
+		sawRunStart = true;
+		glades::NNetwork& mutNet = const_cast<glades::NNetwork&>(net);
+		setConfigStatus = mutNet.setTrainingConfig(cfg_);
+	}
+
+	virtual bool onEpochEnd(const glades::NNetwork& /*net*/, const glades::NNetworkEpochMetrics& /*m*/)
+	{
+		return false;
+	}
+
+	bool sawRunStart;
+	glades::NNetworkStatus setConfigStatus;
+
+private:
+	glades::TrainingConfig cfg_;
 };
 
 static void test_runtime_config_snapshot_validation()
@@ -748,6 +877,170 @@ static void test_batcher_callback_stop_and_manual_cancel()
 	printf("    PASSED\n");
 }
 
+static void test_training_set_training_config_runlock_contract()
+{
+	printf("  [C1] TrainingSetTrainingConfigRunLockContract ...\n");
+
+	TrainableDecoderLm m(17u, 6u, 401u);
+
+	glades::TrainingConfig cfg = m.net->getTrainingConfig();
+	cfg.transformer.residualDropoutRate = 0.05f;
+
+	SetTrainingConfigWhileRunningCallback cb(cfg);
+	const glades::NNetworkStatus st = m.net->train(m.di, &cb);
+	ASSERT("training run should succeed", st.ok());
+	ASSERT("run-start callback should fire", cb.sawRunStart);
+	assert_status_error(cb.setConfigStatus,
+	                    glades::NNetworkStatus::INVALID_STATE,
+	                    "setTrainingConfig: ",
+	                    "network is running");
+
+	printf("    PASSED\n");
+}
+
+static void test_training_optimizer_gate_and_eval_contract()
+{
+	printf("  [C2] TrainingOptimizerGateAndEvalContract ...\n");
+
+	TrainableDecoderLm m(19u, 6u, 402u);
+
+	glades::TrainingConfig cfg = m.net->getTrainingConfig();
+	cfg.optimizer.type = glades::OptimizerConfig::SGD_MOMENTUM;
+	cfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	ASSERT("set training config for optimizer gate", m.net->setTrainingConfig(cfg).ok());
+
+	CaptureEpochMetricsCallback evalCb;
+	const glades::NNetworkStatus evalSt = m.net->test(m.di, &evalCb);
+	ASSERT("eval path should allow unsupported optimizer", evalSt.ok());
+	ASSERT("eval callback should see run start", evalCb.sawRunStart);
+	ASSERT("eval callback should capture metrics", evalCb.sawEpoch);
+	ASSERT("eval callback should see run end", evalCb.sawRunEnd);
+
+	CaptureEpochMetricsCallback trainCb;
+	const glades::NNetworkStatus trainSt = m.net->train(m.di, &trainCb);
+	assert_status_error(trainSt,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "SGDHelper_TRANSFORMER: ",
+	                    "requires optimizer=ADAMW or ATLAS");
+	ASSERT("optimizer-gated train should not emit epoch metrics", !trainCb.sawEpoch);
+
+	printf("    PASSED\n");
+}
+
+static void test_training_full_softmax_metrics_contract()
+{
+	printf("  [C3] TrainingFullSoftmaxMetricsContract ...\n");
+
+	TrainableDecoderLm m(17u, 6u, 403u);
+
+	glades::TrainingConfig cfg = m.net->getTrainingConfig();
+	cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+	cfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	ASSERT("set training config for full softmax", m.net->setTrainingConfig(cfg).ok());
+
+	CaptureEpochMetricsCallback cb;
+	const glades::NNetworkStatus st = m.net->train(m.di, &cb);
+	ASSERT("full softmax train should succeed", st.ok());
+	ASSERT("full softmax callback should see run start", cb.sawRunStart);
+	ASSERT("full softmax callback should capture metrics", cb.sawEpoch);
+	ASSERT("full softmax callback should see run end", cb.sawRunEnd);
+	ASSERT("full softmax totalError finite and non-negative", cb.last.totalError >= 0.0f && cb.last.totalError < 1.0e6f);
+	ASSERT("full softmax perplexity reported", cb.last.perplexity > 0.0f && cb.last.perplexity < 1.0e6f);
+
+	printf("    PASSED\n");
+}
+
+static void test_training_sampled_softmax_metrics_contract()
+{
+	printf("  [C4] TrainingSampledSoftmaxMetricsContract ...\n");
+
+	TrainableDecoderLm m(17u, 6u, 404u);
+
+	glades::TrainingConfig cfg = m.net->getTrainingConfig();
+	cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+	cfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX;
+	cfg.transformer.tokenLmSampledNegatives = 4;
+	ASSERT("set training config for sampled softmax", m.net->setTrainingConfig(cfg).ok());
+
+	CaptureEpochMetricsCallback cb;
+	const glades::NNetworkStatus st = m.net->train(m.di, &cb);
+	ASSERT("sampled softmax train should succeed", st.ok());
+	ASSERT("sampled softmax callback should capture metrics", cb.sawEpoch);
+	ASSERT("sampled softmax totalError finite and non-negative", cb.last.totalError >= 0.0f && cb.last.totalError < 1.0e6f);
+	ASSERT("sampled softmax does not report perplexity", std::fabs(cb.last.perplexity) < 1e-7f);
+
+	printf("    PASSED\n");
+}
+
+static void test_training_gradient_checkpointing_parity()
+{
+	printf("  [C5] TrainingGradientCheckpointingParity ...\n");
+
+	TrainableDecoderLm noCheckpoint(17u, 6u, 405u);
+	TrainableDecoderLm withCheckpoint(17u, 6u, 405u);
+
+	glades::TrainingConfig noCheckpointCfg = noCheckpoint.net->getTrainingConfig();
+	noCheckpointCfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+	noCheckpointCfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	noCheckpointCfg.gradientCheckpointing = false;
+	ASSERT("set training config without checkpointing", noCheckpoint.net->setTrainingConfig(noCheckpointCfg).ok());
+
+	glades::TrainingConfig checkpointCfg = withCheckpoint.net->getTrainingConfig();
+	checkpointCfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+	checkpointCfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	checkpointCfg.gradientCheckpointing = true;
+	ASSERT("set training config with checkpointing", withCheckpoint.net->setTrainingConfig(checkpointCfg).ok());
+
+	CaptureEpochMetricsCallback noCheckpointCb;
+	CaptureEpochMetricsCallback checkpointCb;
+	ASSERT("train without checkpointing", noCheckpoint.net->train(noCheckpoint.di, &noCheckpointCb).ok());
+	ASSERT("train with checkpointing", withCheckpoint.net->train(withCheckpoint.di, &checkpointCb).ok());
+	ASSERT("checkpointing parity emits metrics", noCheckpointCb.sawEpoch && checkpointCb.sawEpoch);
+	ASSERT("checkpointing totalError parity", std::fabs(noCheckpointCb.last.totalError - checkpointCb.last.totalError) < 1e-4f);
+
+	std::vector<unsigned int> probe;
+	probe.push_back(1u);
+	probe.push_back(2u);
+	probe.push_back(3u);
+
+	std::vector<float> logitsNoCheckpoint;
+	std::vector<float> logitsCheckpoint;
+	ASSERT("forward after no-checkpoint train", noCheckpoint.net->transformerLmForwardLastLogits(probe, logitsNoCheckpoint).ok());
+	ASSERT("forward after checkpoint train", withCheckpoint.net->transformerLmForwardLastLogits(probe, logitsCheckpoint).ok());
+	ASSERT("checkpointing logits size parity", logitsNoCheckpoint.size() == logitsCheckpoint.size());
+
+	double maxAbs = 0.0;
+	for (size_t i = 0u; i < logitsNoCheckpoint.size(); ++i)
+	{
+		const double d = std::fabs(static_cast<double>(logitsNoCheckpoint[i]) - static_cast<double>(logitsCheckpoint[i]));
+		if (d > maxAbs) maxAbs = d;
+	}
+	ASSERT("checkpointing logits parity", maxAbs < 1e-4);
+
+	printf("    PASSED\n");
+}
+
+static void test_training_full_softmax_huge_scratch_guard()
+{
+	printf("  [C6] TrainingFullSoftmaxHugeScratchGuard ...\n");
+
+	TrainableDecoderLm m(16384u, 1400u, 406u, false);
+
+	glades::TrainingConfig cfg = m.net->getTrainingConfig();
+	cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+	cfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	cfg.transformer.tokenLmAllowHugeFullSoftmax = false;
+	ASSERT("set training config for huge softmax guard", m.net->setTrainingConfig(cfg).ok());
+
+	const glades::NNetworkStatus st = m.net->train(m.di);
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "SGDHelper_TRANSFORMER: ",
+	                    "token LM full softmax would allocate");
+
+	printf("    PASSED\n");
+}
+
 } // namespace
 
 void TransformerVerificationUnitTest()
@@ -767,6 +1060,14 @@ void TransformerVerificationUnitTest()
 	test_batcher_submit_validation_matrix();
 	test_batcher_slot_lifecycle_and_reuse();
 	test_batcher_callback_stop_and_manual_cancel();
+
+	printf("\n--- Group C: Training Config ---\n");
+	test_training_set_training_config_runlock_contract();
+	test_training_optimizer_gate_and_eval_contract();
+	test_training_full_softmax_metrics_contract();
+	test_training_sampled_softmax_metrics_contract();
+	test_training_gradient_checkpointing_parity();
+	test_training_full_softmax_huge_scratch_guard();
 
 	printf("\n============================================================\n");
 }
