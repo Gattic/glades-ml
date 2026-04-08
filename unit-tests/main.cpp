@@ -21,6 +21,7 @@
 #include "Backend/Machine Learning/nn-mixed-precision-test.h"
 #include "Backend/Machine Learning/nn-benchmarks.h"
 #include "Backend/Machine Learning/transformer-gpu-bench.h"
+#include "Backend/Machine Learning/transformer-verification-test.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
@@ -60,6 +61,7 @@ int main(int argc, char* argv[])
 	    NNUnitTest();
 	    NNRecurrentUnitTest();
 	    NNTransformerUnitTest();
+	    TransformerVerificationUnitTest();
 	    TransformerServingLayerUnitTest();
 	    PCAUnitTest();
 	    KMeansUnitTest();
@@ -85,6 +87,10 @@ int main(int argc, char* argv[])
 		NNRecurrentUnitTest();
 	    else if (strcmp(argv[1], "nn-transformer") == 0)
 		NNTransformerUnitTest();
+	    else if (strcmp(argv[1], "transformer-verification") == 0 ||
+	             strcmp(argv[1], "transformer-verify") == 0 ||
+	             strcmp(argv[1], "tverify") == 0)
+		TransformerVerificationUnitTest();
 	    else if (strcmp(argv[1], "transformer-serving") == 0 ||
 	             strcmp(argv[1], "transformer-serving-layer") == 0 ||
 	             strcmp(argv[1], "serving") == 0)
@@ -178,11 +184,12 @@ int main(int argc, char* argv[])
 	    }
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
-	        OHEUnitTest();
+		    OHEUnitTest();
 		    MappedDatasetUnitTest();
 		    NNUnitTest();
 		    NNRecurrentUnitTest();
 		    NNTransformerUnitTest();
+		    TransformerVerificationUnitTest();
 		    TransformerServingLayerUnitTest();
 
 		    // Run a fixed benchmark configuration when invoked via `nnall`.

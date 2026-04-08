@@ -6,6 +6,7 @@ nn-save-load-test.cpp
 nn-mixed-precision-test.cpp
 nn-benchmarks.cpp
 transformer-gpu-bench.cpp
+transformer-verification-test.cpp
 transformer-serving-layer-test.cpp
 prop-fuzz-test.cpp
 parallel-test.cpp
