@@ -192,8 +192,8 @@ struct BenchConfig
 	      clipNorm(5.0f),
 	      sgdLR(0.01f),
 	      sgdMomentum(0.9f),
-	      adamLR(0.001f),
-	      atlasLR(0.1f)
+	      adamLR(0.0015f),
+	      atlasLR(0.08f)
 	{
 	}
 };
@@ -312,8 +312,8 @@ static void print_usage()
 	printf("  --clip-norm X                           Global grad clip norm (default: 5.0)\n");
 	printf("  --sgd-lr X                              SGD learning rate (default: 0.01)\n");
 	printf("  --sgd-momentum X                        SGD momentum factor (default: 0.9)\n");
-	printf("  --adam-lr X                             AdamW learning rate (default: 0.001)\n");
-	printf("  --atlas-lr X                            ATLAS-BSRP learning rate (default: 0.1)\n");
+	printf("  --adam-lr X                             AdamW learning rate (default: 0.0015)\n");
+	printf("  --atlas-lr X                            ATLAS-BSRP learning rate (default: 0.08)\n");
 	printf("  --rank N                                ATLAS subspace rank (default: 16)\n");
 	printf("  --tsub N                                ATLAS subspace refresh interval in steps (default: 200)\n");
 	printf("  --seed N                                Base seed for repeats (default: 1337)\n");

@@ -2719,10 +2719,52 @@ void ATLASUnitTest()
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
 	// ---------------------------------------------------------------
-	// Test 28: Scale stress test (m=512, n=512, r=64)
+	// Test 28: sigma2 initialization uses accumulated-gradient scale
 	// ---------------------------------------------------------------
 	printf("-----------------------------------\n");
-	printf("ATLAS Test 28: Scale stress test (512x512 r=64)\n");
+	printf("ATLAS Test 28: sigma2 initialization uses accumulated-gradient scale\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+		const float invBatch = 1.0f / 1024.0f;
+		const float lr = 0.01f;
+		const float gradScale = 1.0f;
+		const float gradValue = 0.25f;
+		const float expectedSigma2 = gradValue * gradValue;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 28282828ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, gradValue);
+
+		glades::ATLASConfig acSigma;
+		acSigma.rank = r;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         invBatch, lr, 0.0f, 0.0f, gradScale,
+		                                         acSigma, rng);
+		ASSERT("==============ATLAS::Sigma2Scale applyStep failed==============", ok);
+
+		printf("[UT] ATLAS sigma2 scale: sigma2=%f expected=%f invBatch=%f\n",
+		       state.sigma2, expectedSigma2, invBatch);
+
+		const float sigmaErr = state.sigma2 - expectedSigma2;
+		const float sigmaErrAbs = (sigmaErr < 0.0f) ? -sigmaErr : sigmaErr;
+		ASSERT("==============ATLAS::Sigma2Scale sigma2 not initialized from accumulated gradient scale==============",
+		       sigmaErrAbs < 1e-6f);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 29: Scale stress test (m=512, n=512, r=64)
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 29: Scale stress test (512x512 r=64)\n");
 	printf("-----------------------------------\n");
 	{
 		const unsigned int m = 512;

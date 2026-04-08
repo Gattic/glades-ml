@@ -361,20 +361,36 @@ bool applyStep(WeightState& state,
 	}
 
 	// === Step 1: Update global second moment sigma2 ===
-	// sigma2 is the EMA of mean(G^2), providing a data-driven baseline
-	// preconditioner for the complement space.
+	// sigma2 tracks mean(G_accum^2) on the accumulated-gradient scale.
+	// Using gScale here would inject an invBatch^2 factor, driving sigma2
+	// toward zero for large batches and collapsing baseline-rate adaptation.
+	// The invBatch normalization is applied later in the actual update via
+	// baseScaled = baselineRate * gScale.
 	{
 		double gMeanSq = 0.0;
 		for (size_t idx = 0; idx < mn; ++idx)
 		{
-			const double v = static_cast<double>(gW[idx]) * static_cast<double>(gScale);
+			const double v = static_cast<double>(gW[idx]) * static_cast<double>(gradScale);
 			gMeanSq += v * v;
 		}
 		gMeanSq /= static_cast<double>(mn);
-		state.sigma2 = beta * state.sigma2 + (1.0f - beta) * static_cast<float>(gMeanSq);
+		if (state.step == 1ULL)
+		{
+			// Initialize from the actual first-step gradient statistics rather than
+			// decaying from the arbitrary reset value.
+			state.sigma2 = (gMeanSq > static_cast<double>(eps))
+			             ? static_cast<float>(gMeanSq)
+			             : eps;
+		}
+		else
+		{
+			state.sigma2 = beta * state.sigma2 + (1.0f - beta) * static_cast<float>(gMeanSq);
+		}
+		if (state.sigma2 < eps)
+			state.sigma2 = eps;
 		if (!atlas_isfinite(state.sigma2))
 		{
-			state.sigma2 = 1.0f;
+			state.sigma2 = eps;
 			recovered = true;
 		}
 	}
