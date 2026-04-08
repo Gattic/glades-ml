@@ -134,6 +134,11 @@ static double max_abs_diff(const float* a, const float* b, unsigned int n)
 	return maxDiff;
 }
 
+// Float32 attention finite differences become cancellation-noisy around 1e-4.
+// Keep the probe step aligned with the masked-gradient checks below.
+static const float kAttentionFiniteDiffEps = 1e-3f;
+static const double kAttentionFiniteDiffTol = 5e-2;
+
 // ============================================================
 // Test functions
 // ============================================================
@@ -162,8 +167,8 @@ static void test_finite_diff_recompute_causal()
 	glades::transformer_ops::scaled_dot_product_attention_backward_recompute(
 		&Q[0], &K[0], &V[0], &dO[0], T, dK, dV, true, dQ, dK_out, dV_out);
 
-	const float eps = 1e-4f;
-	const double tol = 5e-2;
+	const float eps = kAttentionFiniteDiffEps;
+	const double tol = kAttentionFiniteDiffTol;
 
 	// Check Q gradients
 	double errQ = finite_diff_check(&Q[0], qSize, &Q[0], &K[0], &V[0], T, dK, dV, true, &dQ[0], eps);
@@ -205,8 +210,8 @@ static void test_finite_diff_recompute_noncausal()
 	glades::transformer_ops::scaled_dot_product_attention_backward_recompute(
 		&Q[0], &K[0], &V[0], &dO[0], T, dK, dV, false, dQ, dK_out, dV_out);
 
-	const float eps = 1e-4f;
-	const double tol = 5e-2;
+	const float eps = kAttentionFiniteDiffEps;
+	const double tol = kAttentionFiniteDiffTol;
 
 	double errQ = finite_diff_check(&Q[0], qSize, &Q[0], &K[0], &V[0], T, dK, dV, false, &dQ[0], eps);
 	printf("    dQ maxRelErr = %.6e\n", errQ);
@@ -248,8 +253,8 @@ static void test_finite_diff_flash_strided_causal()
 		T, dK, dV, true,
 		&dQ[0], dK, &dK_out[0], dK, &dV_out[0], dV);
 
-	const float eps = 1e-4f;
-	const double tol = 5e-2;
+	const float eps = kAttentionFiniteDiffEps;
+	const double tol = kAttentionFiniteDiffTol;
 
 	double errQ = finite_diff_check(&Q[0], qSize, &Q[0], &K[0], &V[0], T, dK, dV, true, &dQ[0], eps);
 	printf("    dQ maxRelErr = %.6e\n", errQ);
@@ -526,8 +531,8 @@ static void test_key_mask_partial()
 	ASSERT("dV for masked keys should be ~0", masked_v_zero);
 
 	// Finite-diff check for Q and K with mask
-	const float eps = 1e-3f;
-	const double tol_grad = 5e-2;
+	const float eps = kAttentionFiniteDiffEps;
+	const double tol_grad = kAttentionFiniteDiffTol;
 
 	double errQ = finite_diff_check_masked(&Q[0], qSize, &Q[0], &K[0], &V[0],
 	                                       T, dK, dV, false, keyAllowed, &dQ_a[0], eps);
