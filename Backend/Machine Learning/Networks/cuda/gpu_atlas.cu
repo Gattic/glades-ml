@@ -107,6 +107,8 @@ __global__ void atlas_gs_kernel(float* __restrict__ Q, int m, int r)
 {
 	extern __shared__ char smem_gs_bytes[];
 	double* smem = reinterpret_cast<double*>(smem_gs_bytes);
+	__shared__ double sDot;
+	__shared__ float sInvNorm;
 
 	for (int j = 0; j < r; ++j)
 	{
@@ -114,13 +116,15 @@ __global__ void atlas_gs_kernel(float* __restrict__ Q, int m, int r)
 		for (int p = 0; p < j; ++p)
 		{
 			double localDot = 0.0;
-			for (int k = threadIdx.x; k < m; k += blockDim.x)
-				localDot += (double)Q[k * r + j] * (double)Q[k * r + p];
+				for (int k = threadIdx.x; k < m; k += blockDim.x)
+					localDot += (double)Q[k * r + j] * (double)Q[k * r + p];
 			double dot = blockReduceSumD(localDot, smem);
+			if (threadIdx.x == 0)
+				sDot = dot;
 			__syncthreads();
 
 			for (int k = threadIdx.x; k < m; k += blockDim.x)
-				Q[k * r + j] -= (float)(dot * (double)Q[k * r + p]);
+				Q[k * r + j] -= (float)(sDot * (double)Q[k * r + p]);
 			__syncthreads();
 		}
 
@@ -134,7 +138,6 @@ __global__ void atlas_gs_kernel(float* __restrict__ Q, int m, int r)
 		double norm = blockReduceSumD(localNorm, smem);
 		__syncthreads();
 
-		__shared__ float sInvNorm;
 		if (threadIdx.x == 0)
 		{
 			norm = sqrt(norm);
@@ -983,6 +986,7 @@ static bool refreshSubspace(GpuAtlasWeightState& state,
 	// overlap = I, Fisher and prevGz are unchanged. The weight simply keeps
 	// its current subspace until the next refresh with better-conditioned gradients.
 	{
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 		float qCheck[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 		ATLAS_CUDA_CHECK(cudaMemcpy(&qCheck[0], d_Q, sizeof(float), cudaMemcpyDeviceToHost));
 		ATLAS_CUDA_CHECK(cudaMemcpy(&qCheck[1], d_Q + sr / 4, sizeof(float), cudaMemcpyDeviceToHost));
@@ -1099,6 +1103,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	// NaN diagnostic: verify guard worked (only at diagnostic steps)
 	if (logger && tag && tSub > 0u && ((state.step % (unsigned long long)tSub) == 0ULL))
 	{
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 		float gwSamples[3] = {0.0f, 0.0f, 0.0f};
 		cudaMemcpy(&gwSamples[0], d_gW, sizeof(float), cudaMemcpyDeviceToHost);
 		cudaMemcpy(&gwSamples[1], d_gW + mn / 2, sizeof(float), cudaMemcpyDeviceToHost);
@@ -1148,6 +1153,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		ATLAS_CUDA_CHECK(cudaGetLastError());
 		// Synchronous D2H — consume in the same step (matches CPU path).
 		float h_sigma2Sum = 0.0f;
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 		ATLAS_CUDA_CHECK(cudaMemcpy(&h_sigma2Sum, state.d_reduce.data(),
 		                              sizeof(float), cudaMemcpyDeviceToHost));
 		float gMeanSq = h_sigma2Sum / (float)mn;
@@ -1185,6 +1191,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		{
 			const unsigned int subDim = isRight ? n : m;
 			const size_t sr = (size_t)subDim * r;
+			ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 			float uPre[2] = {0.0f, 0.0f};
 			cudaMemcpy(&uPre[0], state.U.data(), sizeof(float), cudaMemcpyDeviceToHost);
 			cudaMemcpy(&uPre[1], state.U.data() + sr - 1, sizeof(float), cudaMemcpyDeviceToHost);
@@ -1214,6 +1221,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		// NaN diagnostic: check U after refresh
 		if (logger && tag)
 		{
+			ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 			float uSample[2] = {0.0f, 0.0f};
 			const unsigned int subDim = isRight ? n : m;
 			const size_t sr = (size_t)subDim * r;
@@ -1262,6 +1270,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	// NaN diagnostic: check gz, prevGz, and U after projection
 	if (logger && tag && (state.step % (unsigned long long)tSub) == 0ULL)
 	{
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 		float gzSample[2] = {0.0f, 0.0f};
 		float prevGzSample[2] = {0.0f, 0.0f};
 		float uSample = 0.0f;
@@ -1354,6 +1363,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			return false;
 		// Synchronous D2H — consume in the same step (matches CPU path).
 		float h_muNorms[2] = {0.0f, 0.0f};
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 		ATLAS_CUDA_CHECK(cudaMemcpy(h_muNorms, state.d_reduce.data(),
 		                              2 * sizeof(float), cudaMemcpyDeviceToHost));
 		float errNormSq = h_muNorms[0];
@@ -1458,6 +1468,9 @@ AtlasGpuDiag atlas_gpu_get_diag(const GpuAtlasWeightState& state)
 	d.step = state.step;
 	d.baselineRate = state.lastBaselineRate;
 	d.rightSubspace = state.rightSubspace;
+
+	if (cudaStreamSynchronize(computeStream()) != cudaSuccess)
+		return d;
 
 	// Download Fisher diagonal to compute min/max/mean/median
 	if (r > 0u)

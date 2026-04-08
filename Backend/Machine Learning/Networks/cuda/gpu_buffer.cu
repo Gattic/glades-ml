@@ -12,6 +12,18 @@
 namespace glades {
 namespace gpu {
 
+namespace {
+
+// Blocking buffer operations are expected to observe all prior queued work.
+// After the stream split to non-blocking compute/transfer streams, plain
+// cudaMemcpy/cudaMemset no longer implied that ordering, so synchronize here.
+static bool syncBlockingBufferOp()
+{
+	return synchronizeComputeStream() && synchronizeTransferStream();
+}
+
+} // namespace
+
 // ---- float specialization ----
 
 template <>
@@ -60,6 +72,8 @@ bool GpuBuffer<float>::upload(const float* src, size_t count)
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(d_ptr, src, count * sizeof(float), cudaMemcpyHostToDevice);
 	return err == cudaSuccess;
 }
@@ -86,6 +100,8 @@ bool GpuBuffer<float>::download(float* dst, size_t count) const
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(dst, d_ptr, count * sizeof(float), cudaMemcpyDeviceToHost);
 	return err == cudaSuccess;
 }
@@ -107,6 +123,8 @@ template <>
 bool GpuBuffer<float>::zero()
 {
 	if (!d_ptr)
+		return false;
+	if (!syncBlockingBufferOp())
 		return false;
 	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(float));
 	return err == cudaSuccess;
@@ -166,6 +184,8 @@ bool GpuBuffer<int>::upload(const int* src, size_t count)
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(d_ptr, src, count * sizeof(int), cudaMemcpyHostToDevice);
 	return err == cudaSuccess;
 }
@@ -192,6 +212,8 @@ bool GpuBuffer<int>::download(int* dst, size_t count) const
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(dst, d_ptr, count * sizeof(int), cudaMemcpyDeviceToHost);
 	return err == cudaSuccess;
 }
@@ -213,6 +235,8 @@ template <>
 bool GpuBuffer<int>::zero()
 {
 	if (!d_ptr)
+		return false;
+	if (!syncBlockingBufferOp())
 		return false;
 	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(int));
 	return err == cudaSuccess;
@@ -272,6 +296,8 @@ bool GpuBuffer<uint16_t>::upload(const uint16_t* src, size_t count)
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(d_ptr, src, count * sizeof(uint16_t), cudaMemcpyHostToDevice);
 	return err == cudaSuccess;
 }
@@ -298,6 +324,8 @@ bool GpuBuffer<uint16_t>::download(uint16_t* dst, size_t count) const
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(dst, d_ptr, count * sizeof(uint16_t), cudaMemcpyDeviceToHost);
 	return err == cudaSuccess;
 }
@@ -319,6 +347,8 @@ template <>
 bool GpuBuffer<uint16_t>::zero()
 {
 	if (!d_ptr)
+		return false;
+	if (!syncBlockingBufferOp())
 		return false;
 	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(uint16_t));
 	return err == cudaSuccess;
@@ -378,6 +408,8 @@ bool GpuBuffer<unsigned int>::upload(const unsigned int* src, size_t count)
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(d_ptr, src, count * sizeof(unsigned int), cudaMemcpyHostToDevice);
 	return err == cudaSuccess;
 }
@@ -404,6 +436,8 @@ bool GpuBuffer<unsigned int>::download(unsigned int* dst, size_t count) const
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(dst, d_ptr, count * sizeof(unsigned int), cudaMemcpyDeviceToHost);
 	return err == cudaSuccess;
 }
@@ -425,6 +459,8 @@ template <>
 bool GpuBuffer<unsigned int>::zero()
 {
 	if (!d_ptr)
+		return false;
+	if (!syncBlockingBufferOp())
 		return false;
 	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(unsigned int));
 	return err == cudaSuccess;
@@ -484,6 +520,8 @@ bool GpuBuffer<unsigned char>::upload(const unsigned char* src, size_t count)
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(d_ptr, src, count * sizeof(unsigned char), cudaMemcpyHostToDevice);
 	return err == cudaSuccess;
 }
@@ -510,6 +548,8 @@ bool GpuBuffer<unsigned char>::download(unsigned char* dst, size_t count) const
 		count = n;
 	if (count > n)
 		return false;
+	if (!syncBlockingBufferOp())
+		return false;
 	cudaError_t err = cudaMemcpy(dst, d_ptr, count * sizeof(unsigned char), cudaMemcpyDeviceToHost);
 	return err == cudaSuccess;
 }
@@ -531,6 +571,8 @@ template <>
 bool GpuBuffer<unsigned char>::zero()
 {
 	if (!d_ptr)
+		return false;
+	if (!syncBlockingBufferOp())
 		return false;
 	cudaError_t err = cudaMemset(d_ptr, 0, n * sizeof(unsigned char));
 	return err == cudaSuccess;
