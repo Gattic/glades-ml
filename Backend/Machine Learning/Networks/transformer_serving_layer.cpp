@@ -29,6 +29,37 @@ static const char* status_code_name(glades::NNetworkStatus::Code code)
 	}
 }
 
+static void emit_logger_line(shmea::GLogger* logger,
+                             int level,
+                             const char* component,
+                             const std::string& line)
+{
+	if (!logger)
+		return;
+	switch (level)
+	{
+	case shmea::GLogger::LOG_DEBUG:
+		logger->debug(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_WARNING:
+		logger->warning(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_ERROR:
+		logger->error(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_FATAL:
+		logger->fatal(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_VERBOSE:
+		logger->verbose(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_INFO:
+	default:
+		logger->info(component, shmea::GString(line.c_str()));
+		break;
+	}
+}
+
 static void append_token_delta(std::vector<unsigned int>& dst, const std::vector<unsigned int>& src)
 {
 	if (src.size() <= dst.size())
@@ -111,6 +142,7 @@ TransformerServingLayer::TransformerServingLayer()
       live_(),
       pending_(),
       snapshots_(),
+      diagnostics_(),
       nextId_(1ULL)
 {
 }
@@ -157,14 +189,22 @@ NNetworkStatus TransformerServingLayer::start(const NNetwork& net, const Config&
 	const NNetworkStatus st = TransformerPublicAPI::serving(*net_).resetBatcher(batcher_, bcfg);
 	if (!st.ok())
 	{
+		noteFailure_(0ULL, static_cast<unsigned int>(-1), st);
+		logEvent("transformer_serving_start_fail", shmea::GLogger::LOG_ERROR, 0ULL, "reset_batcher_failed", &st);
 		net_ = NULL;
 		return st;
 	}
 
+	diagnostics_ = Diagnostics();
+	diagnostics_.running = true;
+	diagnostics_.maxBatchSize = cfg_.maxBatchSize;
+	diagnostics_.maxSeqLen = cfg_.maxSeqLen;
+	diagnostics_.maxPendingRequests = cfg_.maxPendingRequests;
+	diagnostics_.nextRequestId = nextId_;
 	stopRequested_ = false;
 	running_ = true;
 
-	logEvent("transformer_serving_start", 0ULL, "ok");
+	logEvent("transformer_serving_start", shmea::GLogger::LOG_INFO, 0ULL, "ok");
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
@@ -179,7 +219,9 @@ void TransformerServingLayer::stop()
 		// until step() has finished using the current batcher/net state.
 		running_ = false;
 		stopRequested_ = true;
-		logEvent("transformer_serving_stop_deferred", 0ULL, "deferred_until_step_exit");
+		diagnostics_.running = false;
+		diagnostics_.stopRequested = true;
+		logEvent("transformer_serving_stop_deferred", shmea::GLogger::LOG_INFO, 0ULL, "deferred_until_step_exit");
 		return;
 	}
 	shutdownLocked_(false, NULL, "ok");
@@ -192,17 +234,36 @@ NNetworkStatus TransformerServingLayer::submit(const NNetwork::TransformerServeR
 	LockGuard lock(mu_);
 	outRequestId = 0ULL;
 	if (!running_ || !net_)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::submit: serving layer not running");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::submit: serving layer not running");
+		noteFailure_(0ULL, static_cast<unsigned int>(-1), st);
+		return st;
+	}
 
 	// Lightweight validation here; deeper validation happens inside the model submit/reset paths.
 	if (req.promptTokens.empty())
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "TransformerServingLayer::submit: promptTokens is empty");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT, "TransformerServingLayer::submit: promptTokens is empty");
+		noteFailure_(0ULL, static_cast<unsigned int>(-1), st);
+		logEvent("transformer_serving_submit_rejected", shmea::GLogger::LOG_WARNING, 0ULL, "prompt_empty", &st);
+		return st;
+	}
 	if (req.cfg.maxSeqLen > 0u && req.cfg.maxSeqLen > cfg_.maxSeqLen)
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "TransformerServingLayer::submit: request maxSeqLen exceeds serving maxSeqLen");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT, "TransformerServingLayer::submit: request maxSeqLen exceeds serving maxSeqLen");
+		noteFailure_(0ULL, static_cast<unsigned int>(-1), st);
+		logEvent("transformer_serving_submit_rejected", shmea::GLogger::LOG_WARNING, 0ULL, "max_seq_len_exceeded", &st);
+		return st;
+	}
 
 	const uint64_t id = nextId_++;
 	if (cfg_.maxPendingRequests > 0u && pending_.size() >= static_cast<size_t>(cfg_.maxPendingRequests))
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::submit: pending queue full (backpressure)");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::submit: pending queue full (backpressure)");
+		noteFailure_(id, static_cast<unsigned int>(-1), st);
+		logEvent("transformer_serving_submit_rejected", shmea::GLogger::LOG_WARNING, id, "pending_queue_full", &st);
+		return st;
+	}
 
 	pending_.push_back(Pending(id, req, callbacks));
 
@@ -215,7 +276,9 @@ NNetworkStatus TransformerServingLayer::submit(const NNetwork::TransformerServeR
 	snapshots_[id] = snap;
 
 	outRequestId = id;
-	logEvent("transformer_serving_submit", id, "queued");
+	diagnostics_.totalSubmitted += 1ULL;
+	diagnostics_.nextRequestId = nextId_;
+	logEvent("transformer_serving_submit", shmea::GLogger::LOG_DEBUG, id, "queued");
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
@@ -239,7 +302,8 @@ bool TransformerServingLayer::cancel(uint64_t requestId)
 			markSnapshotStoppedByCallback_(it->second, NULL);
 			completedCallbacks_[requestId] = q->cb;
 			pending_.erase(q);
-			logEvent("transformer_serving_cancel", requestId, "cancelled_pending");
+			diagnostics_.totalPendingCancels += 1ULL;
+			logEvent("transformer_serving_cancel", shmea::GLogger::LOG_DEBUG, requestId, "cancelled_pending");
 			return true;
 		}
 	}
@@ -250,7 +314,8 @@ bool TransformerServingLayer::cancel(uint64_t requestId)
 		if (live_[s].id == requestId)
 		{
 			slotCancel_[s] = 1u;
-			logEvent("transformer_serving_cancel", requestId, "cancel_requested");
+			diagnostics_.totalLiveCancelRequests += 1ULL;
+			logEvent("transformer_serving_cancel", shmea::GLogger::LOG_DEBUG, requestId, "cancel_requested");
 			return true;
 		}
 	}
@@ -307,6 +372,26 @@ bool TransformerServingLayer::clearSnapshot(uint64_t requestId)
 		return false;
 	snapshots_.erase(it);
 	completedCallbacks_.erase(requestId);
+	diagnostics_.totalSnapshotClears += 1ULL;
+	return true;
+}
+
+bool TransformerServingLayer::getDiagnostics(Diagnostics& out) const
+{
+	LockGuard lock(mu_);
+	out = diagnostics_;
+	out.running = running_;
+	out.stopRequested = stopRequested_;
+	out.inStep = inStep_;
+	out.maxBatchSize = cfg_.maxBatchSize;
+	out.maxSeqLen = cfg_.maxSeqLen;
+	out.maxPendingRequests = cfg_.maxPendingRequests;
+	out.pendingRequests = static_cast<unsigned int>(pending_.size());
+	out.activeRequests = countActiveSlots_();
+	out.doneSnapshots = countDoneSnapshots_();
+	out.snapshotCount = static_cast<unsigned int>(snapshots_.size());
+	out.completedCallbackCount = static_cast<unsigned int>(completedCallbacks_.size());
+	out.nextRequestId = nextId_;
 	return true;
 }
 
@@ -340,6 +425,7 @@ bool TransformerServingLayer::BatcherCallbacks::shouldStopRequest(const NNetwork
 }
 
 void TransformerServingLayer::logEvent(const char* event,
+                                      int level,
                                       uint64_t requestId,
                                       const char* msg,
                                       const NNetworkStatus* st,
@@ -360,7 +446,11 @@ void TransformerServingLayer::logEvent(const char* event,
 	append_logfmt_kv(oss, "auto_remove", cfg_.autoRemoveFinished);
 	append_logfmt_kv(oss, "pending_requests", static_cast<unsigned int>(pending_.size()));
 	append_logfmt_kv(oss, "active_requests", countActiveSlots_());
+	append_logfmt_kv(oss, "done_snapshots", countDoneSnapshots_());
 	append_logfmt_kv(oss, "snapshot_count", static_cast<unsigned int>(snapshots_.size()));
+	append_logfmt_kv(oss, "step_calls", static_cast<unsigned long long>(diagnostics_.totalStepCalls));
+	append_logfmt_kv(oss, "step_failures", static_cast<unsigned long long>(diagnostics_.totalStepFailures));
+	append_logfmt_kv(oss, "callback_exceptions", static_cast<unsigned long long>(diagnostics_.totalCallbackExceptions));
 	if (slot != static_cast<unsigned int>(-1))
 		append_logfmt_kv(oss, "slot", slot);
 	if (st)
@@ -373,7 +463,7 @@ void TransformerServingLayer::logEvent(const char* event,
 	if (msg)
 		append_logfmt_kv(oss, "msg", std::string(msg));
 
-	logger->info("TransformerServe", shmea::GString(oss.str().c_str()));
+	emit_logger_line(logger, level, "TransformerServe", oss.str());
 }
 
 void TransformerServingLayer::finalizeSnapshotForShutdown_(uint64_t requestId, const NNetworkStatus* terminalStatus)
@@ -393,6 +483,24 @@ unsigned int TransformerServingLayer::countActiveSlots_() const
 		if (batcher_.slotInUse(s))
 			++n;
 	return n;
+}
+
+unsigned int TransformerServingLayer::countDoneSnapshots_() const
+{
+	unsigned int n = 0u;
+	for (std::map<uint64_t, RequestSnapshot>::const_iterator it = snapshots_.begin(); it != snapshots_.end(); ++it)
+	{
+		if (it->second.done)
+			++n;
+	}
+	return n;
+}
+
+void TransformerServingLayer::noteFailure_(uint64_t requestId, unsigned int slot, const NNetworkStatus& st)
+{
+	diagnostics_.lastFailureRequestId = requestId;
+	diagnostics_.lastFailureSlot = slot;
+	diagnostics_.lastFailureStatus = st;
 }
 
 bool TransformerServingLayer::findFreeSlot_(unsigned int& outSlot) const
@@ -463,7 +571,10 @@ void TransformerServingLayer::applyDeferredCancelDecisions_(const std::vector<un
                                                             const std::vector<uint64_t>& exceptionIds)
 {
 	for (size_t i = 0u; i < exceptionIds.size(); ++i)
-		logEvent("transformer_serving_callback_exception", exceptionIds[i], "shouldCancel threw; treating as cancel");
+	{
+		diagnostics_.totalCallbackExceptions += 1ULL;
+		logEvent("transformer_serving_callback_exception", shmea::GLogger::LOG_WARNING, exceptionIds[i], "shouldCancel threw; treating as cancel");
+	}
 	for (size_t i = 0u; i < cancelSlots.size(); ++i)
 	{
 		const unsigned int slot = cancelSlots[i];
@@ -492,7 +603,10 @@ void TransformerServingLayer::applyTokenCallbackStops_(const std::vector<uint64_
                                                        const std::vector<uint64_t>& exceptionIds)
 {
 	for (size_t i = 0u; i < exceptionIds.size(); ++i)
-		logEvent("transformer_serving_callback_exception", exceptionIds[i], "onToken threw; treating as cancel");
+	{
+		diagnostics_.totalCallbackExceptions += 1ULL;
+		logEvent("transformer_serving_callback_exception", shmea::GLogger::LOG_WARNING, exceptionIds[i], "onToken threw; treating as cancel");
+	}
 	for (size_t i = 0u; i < stopIds.size(); ++i)
 	{
 		const uint64_t id = stopIds[i];
@@ -512,7 +626,7 @@ void TransformerServingLayer::applyTokenCallbackStops_(const std::vector<uint64_
 			clearLiveSlot_(s);
 			if (cfg_.autoRemoveFinished)
 				(void)TransformerPublicAPI::serving(*net_).remove(batcher_, s);
-			logEvent("transformer_serving_request_done", id, "done", &finalStatus, s);
+			logEvent("transformer_serving_request_done", shmea::GLogger::LOG_DEBUG, id, "done", &finalStatus, s);
 			break;
 		}
 	}
@@ -542,7 +656,9 @@ void TransformerServingLayer::admitPending_()
 				sit->second.done = true;
 				sit->second.status = st;
 			}
-			logEvent("transformer_serving_submit_fail", requestId, st.message.c_str(), &st, outSlot);
+			diagnostics_.totalAdmitFailures += 1ULL;
+			noteFailure_(requestId, outSlot, st);
+			logEvent("transformer_serving_submit_fail", shmea::GLogger::LOG_WARNING, requestId, st.message.c_str(), &st, outSlot);
 			pending_.pop_front();
 			continue;
 		}
@@ -557,7 +673,8 @@ void TransformerServingLayer::admitPending_()
 		if (outSlot < slotCancel_.size())
 			slotCancel_[outSlot] = 0u;
 
-		logEvent("transformer_serving_admit", requestId, "admitted", NULL, outSlot);
+		diagnostics_.totalAdmitted += 1ULL;
+		logEvent("transformer_serving_admit", shmea::GLogger::LOG_DEBUG, requestId, "admitted", NULL, outSlot);
 	}
 }
 
@@ -614,7 +731,7 @@ void TransformerServingLayer::finalizeDoneSlots_()
 			finalStatus = snap.status;
 		}
 
-		logEvent("transformer_serving_request_done", id, "done", &finalStatus, s);
+		logEvent("transformer_serving_request_done", shmea::GLogger::LOG_DEBUG, id, "done", &finalStatus, s);
 		completedCallbacks_[id] = live_[s].cb;
 
 		clearLiveSlot_(s);
@@ -629,20 +746,34 @@ NNetworkStatus TransformerServingLayer::step()
 {
 	LockGuard lock(mu_);
 	if (!mutexOk_())
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "TransformerServingLayer::step: recursive mutex initialization failed");
+	{
+		diagnostics_.lastStepStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "TransformerServingLayer::step: recursive mutex initialization failed");
+		return diagnostics_.lastStepStatus;
+	}
 	if (!running_ || !net_)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::step: layer not running");
+	{
+		diagnostics_.lastStepStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::step: layer not running");
+		return diagnostics_.lastStepStatus;
+	}
 	if (stopRequested_)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::step: stop requested");
+	{
+		diagnostics_.lastStepStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::step: stop requested");
+		return diagnostics_.lastStepStatus;
+	}
+	diagnostics_.totalStepCalls += 1ULL;
 
 	// Re-entrancy guard: prevent step() from being called from within a batcher callback.
 	// The recursive mutex would allow the lock, but batcher state is not re-entrant-safe.
 	if (inStep_)
 	{
-		logEvent("transformer_serving_reentrant_step", 0ULL, "step() called from callback; rejected");
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
+		const NNetworkStatus st(NNetworkStatus::INVALID_STATE,
 		    "TransformerServingLayer::step: re-entrant call detected (likely from a callback). "
 		    "Callbacks must not call step().");
+		diagnostics_.totalReentrantStepRejected += 1ULL;
+		diagnostics_.lastStepStatus = st;
+		noteFailure_(0ULL, static_cast<unsigned int>(-1), st);
+		logEvent("transformer_serving_reentrant_step", shmea::GLogger::LOG_WARNING, 0ULL, "step() called from callback; rejected", &st);
+		return st;
 	}
 
 	// 1) Admit as many pending requests as possible.
@@ -650,7 +781,11 @@ NNetworkStatus TransformerServingLayer::step()
 
 	// 2) If nothing active, nothing to do.
 	if (countActiveSlots_() == 0u)
-		return NNetworkStatus(NNetworkStatus::OK, std::string());
+	{
+		diagnostics_.totalIdleSteps += 1ULL;
+		diagnostics_.lastStepStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
+		return diagnostics_.lastStepStatus;
+	}
 
 	// 3) Advance one global step.
 	// Keep inStep_ true for the entire operation so callbacks can reject step() re-entry,
@@ -683,8 +818,9 @@ NNetworkStatus TransformerServingLayer::step()
 	if (stopRequested_)
 	{
 		inStep_ = false;
+		diagnostics_.lastStepStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
 		shutdownLocked_(false, NULL, "ok");
-		return NNetworkStatus(NNetworkStatus::OK, std::string());
+		return diagnostics_.lastStepStatus;
 	}
 	applyDeferredCancelDecisions_(cancelSlots, cancelLogIds);
 
@@ -694,8 +830,11 @@ NNetworkStatus TransformerServingLayer::step()
 	if (!stStep.ok())
 	{
 		inStep_ = false;
+		diagnostics_.totalStepFailures += 1ULL;
+		diagnostics_.lastStepStatus = stStep;
+		noteFailure_(0ULL, static_cast<unsigned int>(-1), stStep);
 		markLiveRequestsFailed_(stStep);
-		logEvent("transformer_serving_step_fail", 0ULL, stStep.message.c_str(), &stStep);
+		logEvent("transformer_serving_step_fail", shmea::GLogger::LOG_ERROR, 0ULL, stStep.message.c_str(), &stStep);
 		stopRequested_ = true;
 		shutdownLocked_(false, &stStep, "step_failed");
 		return stStep;
@@ -735,18 +874,20 @@ NNetworkStatus TransformerServingLayer::step()
 
 	if (stopRequested_)
 	{
+		diagnostics_.lastStepStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
 		shutdownLocked_(false, NULL, "ok");
-		return NNetworkStatus(NNetworkStatus::OK, std::string());
+		return diagnostics_.lastStepStatus;
 	}
 
-	return NNetworkStatus(NNetworkStatus::OK, std::string());
+	diagnostics_.lastStepStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
+	return diagnostics_.lastStepStatus;
 }
 
 void TransformerServingLayer::shutdownLocked_(bool clearSnapshots, const NNetworkStatus* terminalStatus, const char* logMsg)
 {
 	const bool hadNet = (net_ != NULL);
 	if (hadNet && logMsg)
-		logEvent("transformer_serving_stop", 0ULL, logMsg);
+		logEvent("transformer_serving_stop", shmea::GLogger::LOG_INFO, 0ULL, logMsg, terminalStatus);
 	for (std::deque<Pending>::iterator it = pending_.begin(); it != pending_.end(); ++it)
 	{
 		finalizeSnapshotForShutdown_(it->id, terminalStatus);
@@ -777,6 +918,9 @@ void TransformerServingLayer::shutdownLocked_(bool clearSnapshots, const NNetwor
 	if (clearSnapshots)
 		snapshots_.clear();
 	net_ = NULL;
+	diagnostics_.running = false;
+	diagnostics_.stopRequested = false;
+	diagnostics_.inStep = false;
 }
 
 bool TransformerServingLayer::mutexOk_() const

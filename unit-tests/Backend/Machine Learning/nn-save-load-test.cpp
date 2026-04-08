@@ -19,6 +19,8 @@
 #include "Backend/Database/GList.h"
 #include "../../../Backend/Machine Learning/main.h"
 #include "../../../Backend/Machine Learning/Networks/network.h"
+#include "../../../include/Backend/Database/GLogger.h"
+
 #include "../../../Backend/Machine Learning/DataObjects/ImageInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
@@ -1631,6 +1633,56 @@ void NNSaveLoadUnitTest()
 		G_assert(__FILE__, __LINE__,
 		         "==============NNSaveLoad::TokArtifacts_TokenContentRoundTrip() Failed==============",
 		         tb.vocab.size() >= 5u && tb.vocab[4] == "hello world");
+	}
+
+	// ============================
+	// Case M: saveModel emits structured publish logs for success and rejected input
+	// ============================
+	{
+		printf("[UT-NN] Model package publish structured logging\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_publish_logs",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_Init() Failed==============",
+		         net.test(di).ok());
+
+		glades::NNetwork::TokenizerArtifacts ta;
+		ta.type = "custom";
+		ta.vocab.push_back("<pad>");
+		ta.vocab.push_back("hello");
+		ta.padTokenId = 0;
+		ta.bosTokenId = -1;
+		ta.eosTokenId = -1;
+		ta.unkTokenId = -1;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_SetTokenizer() Failed==============",
+		         net.setTokenizerArtifacts(ta).ok());
+
+		shmea::GLogger logger;
+		logger.setPrintLevel(shmea::GLogger::LOG_DEBUG);
+		logger.unsurpress(shmea::GLogger::LOG_INFO);
+		logger.unsurpress(shmea::GLogger::LOG_WARNING);
+		logger.unsurpress(shmea::GLogger::LOG_ERROR);
+		logger.setPrintToConsole(false);
+		net.setLogger(&logger);
+
+		const std::string modelName = "ut_model_pkg_obs_logging";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_Save() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		logger.clear();
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ModelPublishLogs_RejectedStatus() Failed==============",
+		         !net.saveModel("bad/name").ok());
+
+		net.setLogger(NULL);
 	}
 
 	// ============================

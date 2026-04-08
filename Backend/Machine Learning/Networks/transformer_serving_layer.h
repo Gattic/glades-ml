@@ -116,6 +116,68 @@ public:
 		}
 	};
 
+	struct Diagnostics
+	{
+		bool running;
+		bool stopRequested;
+		bool inStep;
+		unsigned int maxBatchSize;
+		unsigned int maxSeqLen;
+		unsigned int maxPendingRequests;
+		unsigned int pendingRequests;
+		unsigned int activeRequests;
+		unsigned int doneSnapshots;
+		unsigned int snapshotCount;
+		unsigned int completedCallbackCount;
+		uint64_t nextRequestId;
+		uint64_t totalSubmitted;
+		uint64_t totalAdmitted;
+		uint64_t totalPendingCancels;
+		uint64_t totalLiveCancelRequests;
+		uint64_t totalStepCalls;
+		uint64_t totalIdleSteps;
+		uint64_t totalAdmitFailures;
+		uint64_t totalStepFailures;
+		uint64_t totalCallbackExceptions;
+		uint64_t totalReentrantStepRejected;
+		uint64_t totalSnapshotClears;
+		uint64_t lastFailureRequestId;
+		unsigned int lastFailureSlot;
+		NNetworkStatus lastFailureStatus;
+		NNetworkStatus lastStepStatus;
+
+		Diagnostics()
+		    : running(false),
+		      stopRequested(false),
+		      inStep(false),
+		      maxBatchSize(0u),
+		      maxSeqLen(0u),
+		      maxPendingRequests(0u),
+		      pendingRequests(0u),
+		      activeRequests(0u),
+		      doneSnapshots(0u),
+		      snapshotCount(0u),
+		      completedCallbackCount(0u),
+		      nextRequestId(0ULL),
+		      totalSubmitted(0ULL),
+		      totalAdmitted(0ULL),
+		      totalPendingCancels(0ULL),
+		      totalLiveCancelRequests(0ULL),
+		      totalStepCalls(0ULL),
+		      totalIdleSteps(0ULL),
+		      totalAdmitFailures(0ULL),
+		      totalStepFailures(0ULL),
+		      totalCallbackExceptions(0ULL),
+		      totalReentrantStepRejected(0ULL),
+		      totalSnapshotClears(0ULL),
+		      lastFailureRequestId(0ULL),
+		      lastFailureSlot(static_cast<unsigned int>(-1)),
+		      lastFailureStatus(NNetworkStatus::OK, std::string()),
+		      lastStepStatus(NNetworkStatus::OK, std::string())
+		{
+		}
+	};
+
 	TransformerServingLayer();
 	~TransformerServingLayer();
 
@@ -158,6 +220,9 @@ public:
 	// Forget a completed request snapshot (does not affect the model/batcher).
 	// Returns false if requestId not found or the request is still pending/live.
 	bool clearSnapshot(uint64_t requestId);
+
+	// Query current serving state and cumulative counters for the current layer run.
+	bool getDiagnostics(Diagnostics& out) const;
 
 private:
 	// Non-copyable (C++98 style).
@@ -278,10 +343,13 @@ private:
 	};
 
 	void logEvent(const char* event,
+	             int level,
 	             uint64_t requestId,
 	             const char* msg,
 	             const NNetworkStatus* st = NULL,
 	             unsigned int slot = static_cast<unsigned int>(-1)) const;
+	unsigned int countDoneSnapshots_() const;
+	void noteFailure_(uint64_t requestId, unsigned int slot, const NNetworkStatus& st);
 
 private:
 	// Helpers: step() only (single-threaded).
@@ -338,6 +406,8 @@ private:
 	std::map<uint64_t, RequestSnapshot> snapshots_;
 	mutable std::vector<DeferredTokenCallback> deferredTokenCallbacks_;
 	std::map<uint64_t, CallbackHandle> completedCallbacks_;
+
+	Diagnostics diagnostics_;
 
 	// Request id generator.
 	uint64_t nextId_;

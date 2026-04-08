@@ -22,9 +22,7 @@
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_serving_layer.h"
 
-#define private public
 #include "../../../include/Backend/Database/GLogger.h"
-#undef private
 
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
@@ -39,36 +37,6 @@
 #include <vector>
 
 namespace {
-
-static bool glog_list_contains_message(const shmea::GList& list, const char* needle)
-{
-	if (!needle)
-		return false;
-	for (unsigned int i = 0u; i < list.size(); ++i)
-	{
-		const std::string msg = list.getString(i).c_str();
-		if (msg.find(needle) != std::string::npos)
-			return true;
-	}
-	return false;
-}
-
-static bool logger_contains_message(const shmea::GLogger& logger, const char* needle)
-{
-	return glog_list_contains_message(logger.verboseLog, needle) ||
-	       glog_list_contains_message(logger.debugLog, needle) ||
-	       glog_list_contains_message(logger.infoLog, needle) ||
-	       glog_list_contains_message(logger.warningLog, needle) ||
-	       glog_list_contains_message(logger.errorLog, needle) ||
-	       glog_list_contains_message(logger.fatalLog, needle) ||
-	       glog_list_contains_message(logger.verboseKeys, needle) ||
-	       glog_list_contains_message(logger.debugKeys, needle) ||
-	       glog_list_contains_message(logger.infoKeys, needle) ||
-	       glog_list_contains_message(logger.warningKeys, needle) ||
-	       glog_list_contains_message(logger.errorKeys, needle) ||
-	       glog_list_contains_message(logger.fatalKeys, needle);
-}
-
 class CallbackBarrier
 {
 public:
@@ -1043,8 +1011,11 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			shmea::GLogger logger;
-			logger.setPrintLevel(shmea::GLogger::LOG_INFO);
+			logger.setPrintLevel(shmea::GLogger::LOG_DEBUG);
+			logger.unsurpress(shmea::GLogger::LOG_DEBUG);
 			logger.unsurpress(shmea::GLogger::LOG_INFO);
+			logger.unsurpress(shmea::GLogger::LOG_WARNING);
+			logger.unsurpress(shmea::GLogger::LOG_ERROR);
 			logger.setPrintToConsole(false);
 			m.net->setLogger(&logger);
 
@@ -1074,6 +1045,56 @@ void TransformerServingLayerUnitTest()
 
 			ASSERT("==============ServingLayer: LoggingEnabledFailurePath Completed Failed==============", true);
 
+			m.net->setLogger(NULL);
+		}
+
+		// --------
+		// Case 18: diagnostics snapshot and warning/error log levels expose failure state
+		// --------
+		{
+			shmea::GLogger logger;
+			logger.setPrintLevel(shmea::GLogger::LOG_DEBUG);
+			logger.unsurpress(shmea::GLogger::LOG_DEBUG);
+			logger.unsurpress(shmea::GLogger::LOG_INFO);
+			logger.unsurpress(shmea::GLogger::LOG_WARNING);
+			logger.unsurpress(shmea::GLogger::LOG_ERROR);
+			logger.setPrintToConsole(false);
+			m.net->setLogger(&logger);
+
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, true);
+			ASSERT("==============ServingLayer: StartOK16 Failed==============", layer.start(*m.net, cfg).ok());
+
+			glades::TransformerServingLayer::Diagnostics diag;
+			ASSERT("==============ServingLayer: DiagnosticsStart Failed==============", layer.getDiagnostics(diag));
+			ASSERT("==============ServingLayer: DiagnosticsRunning Failed==============", diag.running);
+			ASSERT("==============ServingLayer: DiagnosticsStartCounts Failed==============",
+			       diag.totalSubmitted == 0ULL &&
+			       diag.totalAdmitFailures == 0ULL &&
+			       diag.totalStepCalls == 0ULL &&
+			       diag.pendingRequests == 0u);
+
+			std::vector<unsigned int> badPrompt;
+			badPrompt.push_back(m.vocab);
+			uint64_t badId = 0ULL;
+			ASSERT("==============ServingLayer: SubmitBadPromptObs Failed==============",
+			       layer.submit(make_req(badPrompt, 1u, false, 808u, 1u), badId).ok());
+			ASSERT("==============ServingLayer: StepBadPromptObs Failed==============", layer.step().ok());
+
+			ASSERT("==============ServingLayer: DiagnosticsAfterFailure Failed==============", layer.getDiagnostics(diag));
+			ASSERT("==============ServingLayer: DiagnosticsFailureCounts Failed==============",
+			       diag.totalSubmitted == 1ULL &&
+			       diag.totalAdmitFailures == 1ULL &&
+			       diag.totalStepCalls == 1ULL &&
+			       diag.pendingRequests == 0u &&
+			       diag.doneSnapshots == 1u);
+			ASSERT("==============ServingLayer: DiagnosticsFailureStatus Failed==============",
+			       diag.lastFailureRequestId == badId &&
+			       !diag.lastFailureStatus.ok() &&
+			       diag.lastFailureStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT);
+			ASSERT("==============ServingLayer: DiagnosticsLastStepStatus Failed==============", diag.lastStepStatus.ok());
+
+			layer.stop();
 			m.net->setLogger(NULL);
 		}
 

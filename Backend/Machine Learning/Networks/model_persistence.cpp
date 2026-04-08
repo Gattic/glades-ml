@@ -9,6 +9,8 @@
 // behind a single API. Legacy graph-based formats are not supported.
 
 #include "network.h"
+#include "logfmt_utils.h"
+#include "Backend/Database/GLogger.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -26,6 +28,8 @@
 
 namespace {
 
+using namespace glades::logfmt;
+
 // v1: legacy graph weights (no longer supported).
 // v2: packed tensor weights (authoritative parameters).
 // v3: atomic package publish + file integrity metadata + stricter transformer config requirements.
@@ -34,6 +38,49 @@ static const int kModelFormatVersionLatest = 3;
 
 // Tokenizer artifact format version (stored under modelDir/tokenizer/).
 static const int kTokenizerFormatVersion = 1;
+
+static const char* status_code_name(glades::NNetworkStatus::Code code)
+{
+	switch (code)
+	{
+	case glades::NNetworkStatus::OK: return "OK";
+	case glades::NNetworkStatus::INVALID_ARGUMENT: return "INVALID_ARGUMENT";
+	case glades::NNetworkStatus::INVALID_STATE: return "INVALID_STATE";
+	case glades::NNetworkStatus::INTERNAL_ERROR: return "INTERNAL_ERROR";
+	default: return "UNKNOWN";
+	}
+}
+
+static void emit_logger_line(shmea::GLogger* logger,
+                             int level,
+                             const char* component,
+                             const std::string& line)
+{
+	if (!logger)
+		return;
+	switch (level)
+	{
+	case shmea::GLogger::LOG_DEBUG:
+		logger->debug(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_WARNING:
+		logger->warning(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_ERROR:
+		logger->error(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_FATAL:
+		logger->fatal(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_VERBOSE:
+		logger->verbose(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_INFO:
+	default:
+		logger->info(component, shmea::GString(line.c_str()));
+		break;
+	}
+}
 
 static inline bool is_path_separator(char c)
 {
@@ -896,6 +943,49 @@ struct TokenizerPackageWriteResult
 	TokenizerPackageWriteResult() : present(false), vocabHash(0ULL) {}
 };
 
+static void log_model_publish_event(const glades::NNetwork* net,
+                                    int level,
+                                    const char* event,
+                                    const char* stage,
+                                    const std::string& modelName,
+                                    int netType,
+                                    bool tokenizerPresent,
+                                    bool rotatedPrevious,
+                                    const glades::NNetworkStatus* st,
+                                    const ModelPackageIntegrity* integrity)
+{
+	if (!net)
+		return;
+	shmea::GLogger* logger = net->getLogger();
+	if (!logger)
+		return;
+
+	std::ostringstream oss;
+	oss << "event=" << (event ? event : "model_package_publish_event");
+	append_logfmt_kv(oss, "operation", std::string("save_model"));
+	append_logfmt_kv(oss, "model_name", modelName);
+	append_logfmt_kv(oss, "net_type", netType);
+	append_logfmt_kv(oss, "stage", std::string(stage ? stage : "unknown"));
+	append_logfmt_kv(oss, "tokenizer_present", tokenizerPresent);
+	append_logfmt_kv(oss, "rotated_previous", rotatedPrevious);
+	if (integrity)
+	{
+		append_logfmt_kv(oss, "nninfo_bytes", static_cast<unsigned long long>(integrity->nninfoBytes));
+		append_logfmt_kv(oss, "weights_bytes", static_cast<unsigned long long>(integrity->weightsBytes));
+		if (integrity->weightsBytes > 0ULL)
+			append_logfmt_kv(oss, "weights_fnv1a64", static_cast<unsigned long long>(integrity->weightsHash));
+	}
+	if (st)
+	{
+		append_logfmt_kv(oss, "status_code", std::string(status_code_name(st->code)));
+		append_logfmt_kv(oss, "status_ok", st->ok());
+		if (!st->message.empty())
+			append_logfmt_kv(oss, "error", st->message);
+	}
+
+	emit_logger_line(logger, level, "ModelPersist", oss.str());
+}
+
 static ModelPackagePaths build_model_package_paths(const std::string& dirNoSlash)
 {
 	ModelPackagePaths paths;
@@ -1228,12 +1318,33 @@ namespace glades {
 
 NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput* externalDI) const
 {
+	const bool tokenizerPresent = tokenizerArtifactsPresent;
+	const NNetworkStatus okStatus(NNetworkStatus::OK, std::string());
+
 	if (modelName.empty())
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveModel: modelName is empty");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT, "saveModel: modelName is empty");
+		log_model_publish_event(this, shmea::GLogger::LOG_WARNING, "model_package_publish_rejected",
+		                        "validate", modelName, netType, tokenizerPresent, false, &st, NULL);
+		return st;
+	}
 	if (!is_safe_path_component(modelName))
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveModel: modelName contains unsafe characters");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT, "saveModel: modelName contains unsafe characters");
+		log_model_publish_event(this, shmea::GLogger::LOG_WARNING, "model_package_publish_rejected",
+		                        "validate", modelName, netType, tokenizerPresent, false, &st, NULL);
+		return st;
+	}
 	if (!skeleton)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "saveModel: skeleton is null");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_STATE, "saveModel: skeleton is null");
+		log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+		                        "validate", modelName, netType, tokenizerPresent, false, &st, NULL);
+		return st;
+	}
+
+	log_model_publish_event(this, shmea::GLogger::LOG_INFO, "model_package_publish_start",
+	                        "begin", modelName, netType, tokenizerPresent, false, &okStatus, NULL);
 
 	// Tensor-first: weights are persisted from packed tensors (the single source of truth).
 	// If tensors are not initialized yet, try to initialize them from the attached DataInput.
@@ -1256,12 +1367,21 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 			const bool ok = mut->ensureTensorParametersInitialized();
 			mut->di = prevDI;
 			if (!ok)
+			{
+				log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+				                        "init_tensors", modelName, netType, tokenizerPresent, false, &lastStatus, NULL);
 				return lastStatus;
+			}
 		}
 	}
 
 	if (!ensure_models_root())
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to create database/models directory");
+	{
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to create database/models directory");
+		log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+		                        "ensure_models_root", modelName, netType, tokenizerPresent, false, &st, NULL);
+		return st;
+	}
 
 	const std::string finalDirNoSlash = model_dir_no_slash(modelName);
 
@@ -1286,7 +1406,12 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 		break;
 	}
 	if (tmpDirNoSlash.empty())
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to create temporary model directory");
+	{
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to create temporary model directory");
+		log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+		                        "create_tmp_dir", modelName, netType, tokenizerPresent, false, &st, NULL);
+		return st;
+	}
 
 	struct TmpDirGuard
 	{
@@ -1313,27 +1438,43 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 		const shmea::GTable tinfo = skeleton->toGTable();
 		const NNetworkStatus stInfo = write_model_package_nninfo(tinfo, paths.nninfoPath);
 		if (!stInfo.ok())
+		{
+			log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+			                        "write_nninfo", modelName, netType, tokenizerPresent, false, &stInfo, NULL);
 			return stInfo;
+		}
 	}
 
 	// 2) weights
 	{
 		const NNetworkStatus stW = saveTensorWeightsToFile(paths.weightsPath);
 		if (!stW.ok())
+		{
+			log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+			                        "write_weights", modelName, netType, tokenizerPresent, false, &stW, NULL);
 			return stW;
+		}
 	}
 
 	// 3) tokenizer artifacts (optional)
 	TokenizerPackageWriteResult tokenizerWrite;
 	const NNetworkStatus stTokenizer = write_tokenizer_package(paths, tokenizerArtifactsPtr, tokenizerWrite);
 	if (!stTokenizer.ok())
+	{
+		log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+		                        "write_tokenizer", modelName, netType, tokenizerPresent, false, &stTokenizer, NULL);
 		return stTokenizer;
+	}
 
 	// Compute file integrity metadata (v3+).
 	ModelPackageIntegrity integrity;
 	const NNetworkStatus stIntegrity = compute_model_package_integrity(paths, integrity);
 	if (!stIntegrity.ok())
+	{
+		log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+		                        "compute_integrity", modelName, netType, tokenizerPresent, false, &stIntegrity, &integrity);
 		return stIntegrity;
+	}
 
 	// 4) manifest (written last)
 	{
@@ -1341,30 +1482,46 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 		    write_model_package_manifest(paths, modelName, netType, epochs, rngSeed, trainingConfig,
 		                                 tokenizerArtifactsPtr, tokenizerWrite, integrity);
 		if (!stManifest.ok())
+		{
+			log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+			                        "write_manifest", modelName, netType, tokenizerPresent, false, &stManifest, &integrity);
 			return stManifest;
+		}
 	}
 
 	// 5) Atomically publish temp dir -> final dir (rotate existing).
 	std::string backupDirNoSlash;
+	bool rotatedPrevious = false;
 	if (stat_is_dir(finalDirNoSlash))
 	{
 		std::ostringstream bak;
 		bak << modelName << ".bak_" << pid << "_" << t;
 		backupDirNoSlash = std::string("database/models/") + bak.str();
 		if (!rename_atomic(finalDirNoSlash, backupDirNoSlash))
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to rotate existing model directory");
+		{
+			const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to rotate existing model directory");
+			log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+			                        "rotate_existing", modelName, netType, tokenizerPresent, false, &st, &integrity);
+			return st;
+		}
+		rotatedPrevious = true;
 	}
 	if (!rename_atomic(tmpDirNoSlash, finalDirNoSlash))
 	{
 		if (!backupDirNoSlash.empty())
 			(void)rename_atomic(backupDirNoSlash, finalDirNoSlash);
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to publish model directory (rename failed)");
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to publish model directory (rename failed)");
+		log_model_publish_event(this, shmea::GLogger::LOG_ERROR, "model_package_publish_fail",
+		                        "publish", modelName, netType, tokenizerPresent, rotatedPrevious, &st, &integrity);
+		return st;
 	}
 	tmpGuard.dismiss();
 	if (!backupDirNoSlash.empty())
 		(void)remove_tree_recursive(backupDirNoSlash);
 
-	return NNetworkStatus(NNetworkStatus::OK, std::string());
+	log_model_publish_event(this, shmea::GLogger::LOG_INFO, "model_package_publish_end",
+	                        "publish_complete", modelName, netType, tokenizerPresent, rotatedPrevious, &okStatus, &integrity);
+	return okStatus;
 }
 
 NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput* forShape, int netTypeOverride)
