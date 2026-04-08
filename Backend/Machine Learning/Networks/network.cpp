@@ -205,7 +205,7 @@ glades::NNetworkStatus glades::TransformerPublicAPI::generate(const glades::NNet
                                                               glades::TransformerGenerateResult& out,
                                                               glades::ITransformerGenerateCallbacks* cb)
 {
-	return net.transformerLmGenerate(promptTokens, cfg, out, cb);
+	return TransformerPublicAPI::runtime(net).generate(promptTokens, cfg, out, cb);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::generateBatch(const glades::NNetwork& net,
@@ -213,14 +213,14 @@ glades::NNetworkStatus glades::TransformerPublicAPI::generateBatch(const glades:
                                                                    glades::TransformerServeBatchResult& out,
                                                                    glades::ITransformerServeCallbacks* cb)
 {
-	return net.transformerLmServeGenerateBatch(requests, out, cb);
+	return TransformerPublicAPI::runtime(net).generateBatch(requests, out, cb);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogits(const glades::NNetwork& net,
                                                                        const std::vector<glades::TokenId>& tokenIds,
                                                                        std::vector<float>& outLogits)
 {
-	return net.transformerLmForwardLastLogits(tokenIds, outLogits);
+	return TransformerPublicAPI::runtime(net).forwardLastLogits(tokenIds, outLogits);
 }
 
 glades::TransformerPublicAPI::Runtime glades::TransformerPublicAPI::runtime(const glades::NNetwork& net)
@@ -238,20 +238,20 @@ glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::generate(const std
                                                                        glades::TransformerGenerateResult& out,
                                                                        glades::ITransformerGenerateCallbacks* cb) const
 {
-	return TransformerPublicAPI::generate(net, promptTokens, cfg, out, cb);
+	return net.transformerLmGenerate(promptTokens, cfg, out, cb);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::generateBatch(const std::vector<glades::TransformerServeRequest>& requests,
                                                                             glades::TransformerServeBatchResult& out,
                                                                             glades::ITransformerServeCallbacks* cb) const
 {
-	return TransformerPublicAPI::generateBatch(net, requests, out, cb);
+	return net.transformerLmServeGenerateBatch(requests, out, cb);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogits(const std::vector<glades::TokenId>& tokenIds,
                                                                                 std::vector<float>& outLogits) const
 {
-	return TransformerPublicAPI::forwardLastLogits(net, tokenIds, outLogits);
+	return net.transformerLmForwardLastLogits(tokenIds, outLogits);
 }
 
 glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::resetBatcher(Batcher& batcher, const BatcherConfig& cfg) const

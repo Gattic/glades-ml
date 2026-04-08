@@ -855,6 +855,7 @@ void TransformerImprovementsUnitTest()
 		di.setMirrorTrainToTestOnImplicitSplit(true);
 		di.import(shmea::GString(path));
 		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: import failed==============", di.loadedOk());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: expected output contract failed==============", di.hasTokenIdExpectedOutput());
 		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: train split empty==============", di.getTrainSize() > 0u);
 		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: test split empty==============", di.getTestSize() > 0u);
 

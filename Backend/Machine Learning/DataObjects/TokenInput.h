@@ -1,13 +1,14 @@
 // TokenInput: minimal token-id sequence DataInput for language modeling.
 //
 // Format:
-// - import(path) reads a text file where each line is a sequence of integer token ids.
-// - Tokens are whitespace-separated.
-// - Each line becomes one sequence span in DataInput.
+// - import(path) accepts either a token file or a directory containing train.tok/test.tok.
+// - Tokens are whitespace-separated integer token ids.
+// - Each imported line or table row becomes one sequence span in DataInput.
 //
 // Semantics:
 // - Token IDs are stored as first-class signed integers (int).
 // - Legacy float-row APIs are unsupported; token callers must use the token-id accessors below.
+// - Expected outputs are token ids, not dense probability vectors.
 // - For each sequence, targets are the next token in-sequence.
 //   - If padTokenId >= 0: the final timestep's expected token is padTokenId (so LM loss can ignore it).
 //   - If padTokenId < 0: the final timestep is not emitted (avoids negative expected token ids).
@@ -55,6 +56,7 @@ public:
 
 	// Token-id accessors (first-class integers for token LMs).
 	virtual bool hasTokenIdInput() const { return true; }
+	virtual bool hasTokenIdExpectedOutput() const { return true; }
 	virtual bool getTrainTokenId(unsigned int index, int& outTokenId) const;
 	virtual bool getTrainExpectedTokenId(unsigned int index, int& outTokenId) const;
 	virtual bool getTestTokenId(unsigned int index, int& outTokenId) const;

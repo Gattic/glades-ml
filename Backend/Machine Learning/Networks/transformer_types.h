@@ -4,7 +4,6 @@
 // so consumers can include this lightweight header without pulling in all of network.h.
 #pragma once
 
-#include <string>
 #include <vector>
 #include <stdint.h>
 

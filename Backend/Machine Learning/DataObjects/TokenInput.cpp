@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <limits>
+#include <sys/stat.h>
 
 using namespace glades;
 
@@ -24,14 +25,24 @@ static inline std::string to_std_string(const shmea::GString& s)
 	return std::string(s.c_str());
 }
 
-static inline bool path_ends_with(const std::string& s, const std::string& suf)
+static inline bool path_is_directory(const std::string& p)
 {
-	if (s.size() < suf.size())
+	struct stat st;
+	if (::stat(p.c_str(), &st) != 0)
 		return false;
-	return s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+	return S_ISDIR(st.st_mode);
 }
 
-static inline bool parse_strict_int_token(const std::string& s, int& outTok)
+static inline std::string join_path(const std::string& base, const char* leaf)
+{
+	if (base.empty())
+		return std::string(leaf);
+	if (base[base.size() - 1] == '/')
+		return base + leaf;
+	return base + "/" + leaf;
+}
+
+static inline bool parse_non_negative_int_token(const std::string& s, int& outTok)
 {
 	if (s.empty())
 		return false;
@@ -48,6 +59,8 @@ static inline bool parse_strict_int_token(const std::string& s, int& outTok)
 	if (v < static_cast<long long>(std::numeric_limits<int>::min()) ||
 	    v > static_cast<long long>(std::numeric_limits<int>::max()))
 		return false;
+	if (v < 0ll)
+		return false;
 
 	outTok = static_cast<int>(v);
 	return true;
@@ -58,13 +71,21 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 	outTok = 0;
 	switch (cell.getType())
 	{
-	case shmea::GType::CHAR_TYPE: outTok = static_cast<int>(cell.getChar()); return true;
-	case shmea::GType::SHORT_TYPE: outTok = static_cast<int>(cell.getShort()); return true;
-	case shmea::GType::INT_TYPE: outTok = cell.getInt(); return true;
+	case shmea::GType::CHAR_TYPE:
+		outTok = static_cast<int>(cell.getChar());
+		return outTok >= 0;
+	case shmea::GType::SHORT_TYPE:
+		outTok = static_cast<int>(cell.getShort());
+		return outTok >= 0;
+	case shmea::GType::INT_TYPE:
+		outTok = cell.getInt();
+		return outTok >= 0;
 	case shmea::GType::LONG_TYPE:
 	{
 		const long long v = cell.getLong();
 		if (v < static_cast<long long>(std::numeric_limits<int>::min()) || v > static_cast<long long>(std::numeric_limits<int>::max()))
+			return false;
+		if (v < 0ll)
 			return false;
 		outTok = static_cast<int>(v);
 		return true;
@@ -80,6 +101,8 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 			return false;
 		if (v < static_cast<double>(std::numeric_limits<int>::min()) || v > static_cast<double>(std::numeric_limits<int>::max()))
 			return false;
+		if (v < 0.0)
+			return false;
 		outTok = static_cast<int>(v);
 		return true;
 	}
@@ -92,15 +115,50 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 			return false;
 		if (v < static_cast<double>(std::numeric_limits<int>::min()) || v > static_cast<double>(std::numeric_limits<int>::max()))
 			return false;
+		if (v < 0.0)
+			return false;
 		outTok = static_cast<int>(v);
 		return true;
 	}
 	case shmea::GType::STRING_TYPE:
 	default:
 	{
-		return parse_strict_int_token(std::string(cell.c_str()), outTok);
+		return parse_non_negative_int_token(std::string(cell.c_str()), outTok);
 	}
 	}
+}
+
+static bool append_token_id_sequence(const std::vector<int>& toks,
+                                     int padTokenId,
+                                     std::vector<int>& outTok,
+                                     std::vector<int>& outNext,
+                                     std::vector<DataInput::SequenceSpan>& outSeq,
+                                     unsigned int& cursor)
+{
+	if (toks.empty())
+		return true;
+
+	const unsigned int len = static_cast<unsigned int>(toks.size());
+	const bool usePad = (padTokenId >= 0);
+	const unsigned int emitLen = usePad ? len : (len > 0u ? (len - 1u) : 0u);
+	if (emitLen == 0u)
+		return true;
+
+	const unsigned int start = cursor;
+	outTok.reserve(outTok.size() + emitLen);
+	outNext.reserve(outNext.size() + emitLen);
+	for (unsigned int i = 0; i < emitLen; ++i)
+	{
+		outTok.push_back(toks[i]);
+		if (i + 1u < len)
+			outNext.push_back(toks[i + 1u]);
+		else
+			outNext.push_back(padTokenId);
+	}
+
+	outSeq.push_back(DataInput::SequenceSpan(start, emitLen));
+	cursor += emitLen;
+	return true;
 }
 } // namespace
 
@@ -190,34 +248,8 @@ glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path
 		if (toks.empty())
 			continue;
 
-		// Emit language-model rows:
-		// - For each token, the target is the next token in the same sequence.
-		// - For the final token, there is no "next token". If padTokenId >= 0, we emit an
-		//   explicit pad/ignore target; otherwise we DO NOT emit the final timestep.
-		//
-		// Rationale:
-		// - Token IDs are first-class ints, but many downstream call sites historically cast
-		//   expected rows to unsigned token IDs; emitting a negative pad/ignore id is not safe.
-		const unsigned int len = static_cast<unsigned int>(toks.size());
-		const bool usePad = (padTokenId >= 0);
-		const unsigned int emitLen = (usePad ? len : (len > 0u ? (len - 1u) : 0u));
-		if (emitLen == 0u)
-			continue;
-
-		const unsigned int start = cursor;
-		outTok.reserve(outTok.size() + emitLen);
-		outNext.reserve(outNext.size() + emitLen);
-		for (unsigned int i = 0; i < emitLen; ++i)
-		{
-			outTok.push_back(toks[i]);
-			if (i + 1u < len)
-				outNext.push_back(toks[i + 1u]);
-			else
-				outNext.push_back(padTokenId); // only reachable when usePad==true
-		}
-
-		outSeq.push_back(SequenceSpan(start, emitLen));
-		cursor += emitLen;
+		// Emit one language-model sequence span per non-empty line.
+		append_token_id_sequence(toks, padTokenId, outTok, outNext, outSeq, cursor);
 	}
 
 	if (outTok.empty())
@@ -230,13 +262,13 @@ glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path
 void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 {
 	const std::string p = to_std_string(fname);
-	const bool isDirectoryImport = path_ends_with(p, "/");
 	if (p.empty())
 	{
 		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import: empty path");
 		return;
 	}
+	const bool isDirectoryImport = path_is_directory(p);
 
 	std::vector<int> newTrainTok;
 	std::vector<int> newTrainNextTok;
@@ -251,8 +283,8 @@ void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 	glades::NNetworkStatus stTest(glades::NNetworkStatus::OK, std::string());
 	if (isDirectoryImport)
 	{
-		stTrain = loadTokenFile(p + "train.tok", newTrainTok, newTrainNextTok, trSeq);
-		stTest = loadTokenFile(p + "test.tok", newTestTok, newTestNextTok, teSeq);
+		stTrain = loadTokenFile(join_path(p, "train.tok"), newTrainTok, newTrainNextTok, trSeq);
+		stTest = loadTokenFile(join_path(p, "test.tok"), newTestTok, newTestNextTok, teSeq);
 	}
 	else
 	{
@@ -320,17 +352,6 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 
 	if (C == 1u)
 	{
-		// One sequence spanning all rows.
-		// When padTokenId < 0, we omit the final timestep to avoid negative expected token ids.
-		const bool usePad = (padTokenId >= 0);
-		const unsigned int emitLen = (usePad ? R : (R > 0u ? (R - 1u) : 0u));
-		if (emitLen == 0u)
-		{
-			clearLoadedData();
-			lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::EMPTY_DATA, "TokenInput::import(table): empty after LM pair emission");
-			return;
-		}
-
 		std::vector<int> toks;
 		toks.reserve(R);
 		for (unsigned int r = 0; r < R; ++r)
@@ -342,41 +363,21 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 				lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): invalid token cell");
 				return;
 			}
-			if (tok < 0)
-			{
-				clearLoadedData();
-				lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): negative token id not allowed");
-				return;
-			}
 			toks.push_back(tok);
 		}
 
-		newTrainTok.reserve(emitLen);
-		newTrainNextTok.reserve(emitLen);
-		for (unsigned int r = 0; r < emitLen; ++r)
-		{
-			newTrainTok.push_back(toks[r]);
-			if (r + 1u < R)
-				newTrainNextTok.push_back(toks[r + 1u]);
-			else
-				newTrainNextTok.push_back(padTokenId); // only when usePad==true
-		}
-		trSeq.push_back(SequenceSpan(0u, emitLen));
+		// One table column becomes one sequence whose timesteps are the rows.
+		unsigned int cursor = 0u;
+		append_token_id_sequence(toks, padTokenId, newTrainTok, newTrainNextTok, trSeq, cursor);
 	}
 	else
 	{
-		// Row-per-sequence.
+		// Each table row becomes one independent sequence.
 		unsigned int cursor = 0u;
 		for (unsigned int r = 0; r < R; ++r)
 		{
-			const unsigned int len = C;
-			const bool usePad = (padTokenId >= 0);
-			const unsigned int emitLen = (usePad ? len : (len > 0u ? (len - 1u) : 0u));
-			if (emitLen == 0u)
-				continue;
-
 			std::vector<int> toks;
-			toks.reserve(len);
+			toks.reserve(C);
 			for (unsigned int c = 0; c < C; ++c)
 			{
 				int tok = 0;
@@ -386,27 +387,10 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 					lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): invalid token cell");
 					return;
 				}
-				if (tok < 0)
-				{
-					clearLoadedData();
-					lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): negative token id not allowed");
-					return;
-				}
 				toks.push_back(tok);
 			}
 
-			trSeq.push_back(SequenceSpan(cursor, emitLen));
-			newTrainTok.reserve(newTrainTok.size() + emitLen);
-			newTrainNextTok.reserve(newTrainNextTok.size() + emitLen);
-			for (unsigned int c = 0; c < emitLen; ++c)
-			{
-				newTrainTok.push_back(toks[c]);
-				if (c + 1u < len)
-					newTrainNextTok.push_back(toks[c + 1u]);
-				else
-					newTrainNextTok.push_back(padTokenId); // only when usePad==true
-			}
-			cursor += emitLen;
+			append_token_id_sequence(toks, padTokenId, newTrainTok, newTrainNextTok, trSeq, cursor);
 		}
 	}
 

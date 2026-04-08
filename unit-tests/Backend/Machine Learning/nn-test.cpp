@@ -3660,11 +3660,18 @@ void NNTransformerUnitTest()
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSize Failed==============", di.getTrainSize() == 5u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSize Failed==============", di.getTestSize() == 4u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TokenInputCapability Failed==============", di.hasTokenIdInput());
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TokenExpectedOutput Failed==============", di.hasTokenIdExpectedOutput());
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir FeatureCount Failed==============", di.getFeatureCount() == 1u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeqCount Failed==============", di.getTrainSequenceCount() == 2u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSeqCount Failed==============", di.getTestSequenceCount() == 1u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeq0Len Failed==============", di.getTrainSequenceLength(0u) == 3u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeq1Len Failed==============", di.getTrainSequenceLength(1u) == 2u);
+
+			glades::TokenInput diNoSlash;
+			diNoSlash.setPadTokenId(99);
+			diNoSlash.import(shmea::GString("database/tokeninput_ut"), 0);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir NoSlash TrainSize Failed==============", diNoSlash.getTrainSize() == 5u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir NoSlash TestSize Failed==============", diNoSlash.getTestSize() == 4u);
 
 			// Verify next-token shift and pad at sequence end.
 			int tok = 0, nxt = 0;

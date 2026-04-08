@@ -1818,8 +1818,8 @@ public:
 	// - It fails fast if the same NNetwork instance is already running training/eval/inference.
 	// - This API requires token LM mode (enableTokenEmbedding==true) and decoder net type.
 	// - For supported transformer-facing callers, prefer TransformerPublicAPI / TransformerPublicAPI::runtime(net).
-	// Backward-compatible aliases (these types have moved to glades:: namespace scope;
-	// see transformer_types.h for definitions).
+	// Legacy compatibility aliases only.
+	// New code should include transformer_types.h and use the freestanding names directly.
 	typedef glades::TransformerGenerateConfig TransformerGenerateConfig;
 	typedef glades::TransformerGenerateResult TransformerGenerateResult;
 	typedef glades::ITransformerGenerateCallbacks ITransformerGenerateCallbacks;

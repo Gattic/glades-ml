@@ -14,43 +14,67 @@ static glades::NNetworkStatus invalid_state(const char* where, const char* msg)
 	                              std::string(where ? where : "transformer_config") + ": " + msg);
 }
 
-} // namespace
-
-glades::NNetworkStatus glades::buildTransformerRuntimeConfigSnapshot(const char* where,
-                                                                     const TransformerRunConfig& runtimeCfg,
-                                                                     TransformerRuntimeConfigSnapshot& out)
+static glades::NNetworkStatus validateTransformerRuntimeConfig(const char* where,
+                                                               const glades::TransformerRunConfig& runtimeCfg)
 {
 	const int posEnc = static_cast<int>(runtimeCfg.positionalEncoding);
-	if (posEnc != static_cast<int>(TransformerRunConfig::POSENC_NONE) &&
-	    posEnc != static_cast<int>(TransformerRunConfig::POSENC_SINUSOIDAL) &&
-	    posEnc != static_cast<int>(TransformerRunConfig::POSENC_ROPE))
+	if (posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_NONE) &&
+	    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL) &&
+	    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE))
 		return invalid_argument(where, "unknown positionalEncoding");
 
 	const int normType = static_cast<int>(runtimeCfg.normType);
-	if (normType != static_cast<int>(TransformerRunConfig::NORM_LAYERNORM) &&
-	    normType != static_cast<int>(TransformerRunConfig::NORM_RMSNORM))
+	if (normType != static_cast<int>(glades::TransformerRunConfig::NORM_LAYERNORM) &&
+	    normType != static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
 		return invalid_argument(where, "unknown normType");
 
 	const int ffnKind = static_cast<int>(runtimeCfg.ffnKind);
-	if (ffnKind != static_cast<int>(TransformerRunConfig::FFN_MLP) &&
-	    ffnKind != static_cast<int>(TransformerRunConfig::FFN_SWIGLU))
+	if (ffnKind != static_cast<int>(glades::TransformerRunConfig::FFN_MLP) &&
+	    ffnKind != static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU))
 		return invalid_argument(where, "unknown ffnKind");
 
 	const int ffnActivation = static_cast<int>(runtimeCfg.ffnActivation);
-	if (ffnActivation != static_cast<int>(TransformerRunConfig::FFN_RELU) &&
-	    ffnActivation != static_cast<int>(TransformerRunConfig::FFN_GELU))
+	if (ffnActivation != static_cast<int>(glades::TransformerRunConfig::FFN_RELU) &&
+	    ffnActivation != static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
 		return invalid_argument(where, "unknown ffnActivation");
 
 	const int kvCacheDType = static_cast<int>(runtimeCfg.kvCacheDType);
-	if (kvCacheDType != static_cast<int>(TransformerRunConfig::KV_CACHE_F32) &&
-	    kvCacheDType != static_cast<int>(TransformerRunConfig::KV_CACHE_F16) &&
-	    kvCacheDType != static_cast<int>(TransformerRunConfig::KV_CACHE_BF16))
+	if (kvCacheDType != static_cast<int>(glades::TransformerRunConfig::KV_CACHE_F32) &&
+	    kvCacheDType != static_cast<int>(glades::TransformerRunConfig::KV_CACHE_F16) &&
+	    kvCacheDType != static_cast<int>(glades::TransformerRunConfig::KV_CACHE_BF16))
 		return invalid_argument(where, "unknown kvCacheDType");
 
 	if (runtimeCfg.embeddingDropoutRate < 0.0f || runtimeCfg.embeddingDropoutRate >= 1.0f)
 		return invalid_argument(where, "embeddingDropoutRate must be in [0,1)");
 	if (runtimeCfg.residualDropoutRate < 0.0f || runtimeCfg.residualDropoutRate >= 1.0f)
 		return invalid_argument(where, "residualDropoutRate must be in [0,1)");
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus validateTransformerTokenLmConfig(const char* where,
+                                                               const glades::TrainingConfig& cfg)
+{
+	if (cfg.transformer.tokenLmLossKind != glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX &&
+	    cfg.transformer.tokenLmLossKind != glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX)
+		return invalid_argument(where, "unknown tokenLmLossKind");
+
+	if (cfg.transformer.tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX &&
+	    cfg.transformer.tokenLmSampledNegatives < 1)
+		return invalid_argument(where, "tokenLmSampledNegatives must be >= 1 for sampled softmax");
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+} // namespace
+
+glades::NNetworkStatus glades::buildTransformerRuntimeConfigSnapshot(const char* where,
+                                                                     const TransformerRunConfig& runtimeCfg,
+                                                                     TransformerRuntimeConfigSnapshot& out)
+{
+	NNetworkStatus st = validateTransformerRuntimeConfig(where, runtimeCfg);
+	if (!st.ok())
+		return st;
 
 	out.tokenModel = runtimeCfg.enableTokenEmbedding;
 	out.layerNormEps = (runtimeCfg.layerNormEps > 0.0f ? runtimeCfg.layerNormEps : 1e-5f);
@@ -68,18 +92,12 @@ glades::NNetworkStatus glades::buildTransformerRuntimeConfigSnapshot(const char*
 glades::NNetworkStatus glades::validateTransformerTrainingConfig(const char* where,
                                                                  const TrainingConfig& cfg)
 {
-	TransformerRuntimeConfigSnapshot ignored;
-	NNetworkStatus st = buildTransformerRuntimeConfigSnapshot(where, cfg.transformer, ignored);
+	NNetworkStatus st = validateTransformerRuntimeConfig(where, cfg.transformer);
 	if (!st.ok())
 		return st;
-
-	if (cfg.transformer.tokenLmLossKind != TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX &&
-	    cfg.transformer.tokenLmLossKind != TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX)
-		return invalid_argument(where, "unknown tokenLmLossKind");
-
-	if (cfg.transformer.tokenLmLossKind == TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX &&
-	    cfg.transformer.tokenLmSampledNegatives < 1)
-		return invalid_argument(where, "tokenLmSampledNegatives must be >= 1 for sampled softmax");
+	st = validateTransformerTokenLmConfig(where, cfg);
+	if (!st.ok())
+		return st;
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
