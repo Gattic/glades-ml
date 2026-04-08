@@ -116,23 +116,6 @@ static bool ensure_models_root()
 	return true;
 }
 
-static bool ensure_models_dir(const std::string& modelName)
-{
-	if (!ensure_models_root())
-		return false;
-
-	if (modelName.empty())
-		return false;
-	if (!is_safe_path_component(modelName))
-		return false;
-	return mkdir_if_missing(std::string("database/models/") + modelName);
-}
-
-static std::string model_dir(const std::string& modelName)
-{
-	return std::string("database/models/") + modelName + "/";
-}
-
 static std::string model_dir_no_slash(const std::string& modelName)
 {
 	return std::string("database/models/") + modelName;
@@ -885,6 +868,360 @@ static bool read_vocab_bin(const std::string& vocabPath, std::vector<std::string
 	return true;
 }
 
+struct ModelPackagePaths
+{
+	std::string dirNoSlash;
+	std::string dir;
+	std::string manifestPath;
+	std::string nninfoPath;
+	std::string weightsPath;
+	std::string tokenizerDirNoSlash;
+	std::string tokenizerDir;
+	std::string tokenizerManifestPath;
+	std::string tokenizerVocabPath;
+};
+
+struct ModelPackageIntegrity
+{
+	uint64_t nninfoBytes;
+	uint64_t weightsBytes;
+	uint64_t weightsHash;
+	ModelPackageIntegrity() : nninfoBytes(0ULL), weightsBytes(0ULL), weightsHash(0ULL) {}
+};
+
+struct TokenizerPackageWriteResult
+{
+	bool present;
+	uint64_t vocabHash;
+	TokenizerPackageWriteResult() : present(false), vocabHash(0ULL) {}
+};
+
+static ModelPackagePaths build_model_package_paths(const std::string& dirNoSlash)
+{
+	ModelPackagePaths paths;
+	paths.dirNoSlash = dirNoSlash;
+	paths.dir = dirNoSlash + "/";
+	paths.manifestPath = paths.dir + "manifest.txt";
+	paths.nninfoPath = paths.dir + "nninfo.csv";
+	paths.weightsPath = paths.dir + "weights.bin";
+	paths.tokenizerDirNoSlash = paths.dirNoSlash + "/tokenizer";
+	paths.tokenizerDir = paths.tokenizerDirNoSlash + "/";
+	paths.tokenizerManifestPath = paths.tokenizerDir + "manifest.txt";
+	paths.tokenizerVocabPath = paths.tokenizerDir + "vocab.bin";
+	return paths;
+}
+
+static glades::NNetworkStatus write_model_package_nninfo(const shmea::GTable& tinfo, const std::string& nninfoPath)
+{
+	const std::string tmp = nninfoPath + ".tmp";
+	tinfo.save(shmea::GString(tmp.c_str()));
+	if (!rename_atomic(tmp, nninfoPath))
+	{
+		(void)::remove(tmp.c_str());
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                              "saveModel: failed to publish nninfo.csv (rename failed)");
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus write_tokenizer_manifest_atomic(const std::string& manifestPath,
+                                                              const glades::NNetwork::TokenizerArtifacts& artifacts,
+                                                              uint64_t vocabHash)
+{
+	const std::string tmp = manifestPath + ".tmp";
+	std::ofstream out(tmp.c_str(), std::ios::out | std::ios::trunc);
+	if (!out)
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                              "saveModel: unable to write tokenizer manifest.txt");
+
+	out << "GLADES_TOKENIZER" << "\n";
+	out << "version=" << kTokenizerFormatVersion << "\n";
+	out << "type=" << artifacts.type << "\n";
+	out << "vocabFile=vocab.bin" << "\n";
+	out << "vocabCount=" << static_cast<unsigned long long>(artifacts.vocab.size()) << "\n";
+	out << "fnv1a64=" << static_cast<unsigned long long>(vocabHash) << "\n";
+	out << "special.padTokenId=" << artifacts.padTokenId << "\n";
+	out << "special.bosTokenId=" << artifacts.bosTokenId << "\n";
+	out << "special.eosTokenId=" << artifacts.eosTokenId << "\n";
+	out << "special.unkTokenId=" << artifacts.unkTokenId << "\n";
+	out.flush();
+	out.close();
+	if (!out || !rename_atomic(tmp, manifestPath))
+	{
+		(void)::remove(tmp.c_str());
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                              "saveModel: failed to publish tokenizer manifest.txt (rename failed)");
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus write_tokenizer_package(const ModelPackagePaths& paths,
+                                                      const glades::NNetwork::TokenizerArtifacts* artifacts,
+                                                      TokenizerPackageWriteResult& outResult)
+{
+	outResult = TokenizerPackageWriteResult();
+	if (!artifacts)
+		return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+
+	const glades::NNetworkStatus stValid = glades::NNetwork::validateTokenizerArtifacts(*artifacts);
+	if (!stValid.ok())
+		return stValid;
+
+	if (!mkdir_if_missing(paths.tokenizerDirNoSlash))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                              "saveModel: unable to create tokenizer directory");
+	}
+	if (!write_vocab_bin_atomic(paths.tokenizerVocabPath, artifacts->vocab, outResult.vocabHash))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                              "saveModel: failed to write tokenizer vocab.bin");
+	}
+
+	const glades::NNetworkStatus stManifest =
+	    write_tokenizer_manifest_atomic(paths.tokenizerManifestPath, *artifacts, outResult.vocabHash);
+	if (!stManifest.ok())
+		return stManifest;
+
+	outResult.present = true;
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus compute_model_package_integrity(const ModelPackagePaths& paths,
+                                                              ModelPackageIntegrity& outIntegrity)
+{
+	outIntegrity = ModelPackageIntegrity();
+	struct stat st;
+	if (::lstat(paths.nninfoPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+		outIntegrity.nninfoBytes = static_cast<uint64_t>(st.st_size);
+	if (::lstat(paths.weightsPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+		outIntegrity.weightsBytes = static_cast<uint64_t>(st.st_size);
+	if (outIntegrity.weightsBytes > 0ULL)
+	{
+		if (!fnv1a64_hash_file_prefix(paths.weightsPath, outIntegrity.weightsBytes, outIntegrity.weightsHash))
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+			                              "saveModel: failed to compute weights.bin checksum");
+		}
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus write_model_package_manifest(const ModelPackagePaths& paths,
+                                                           const std::string& modelName,
+                                                           int netType,
+                                                           int epochs,
+                                                           uint64_t rngSeed,
+                                                           const glades::TrainingConfig& trainingConfig,
+                                                           const glades::NNetwork::TokenizerArtifacts* tokenizerArtifacts,
+                                                           const TokenizerPackageWriteResult& tokenizerWrite,
+                                                           const ModelPackageIntegrity& integrity)
+{
+	const std::string tmp = paths.manifestPath + ".tmp";
+	std::ofstream out(tmp.c_str(), std::ios::out | std::ios::trunc);
+	if (!out)
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to write manifest.txt");
+
+	out << "GLADES_MODEL" << "\n";
+	out << "version=" << kModelFormatVersionLatest << "\n";
+	out << "name=" << modelName << "\n";
+	out << "netType=" << netType << "\n";
+	out << "epochs=" << epochs << "\n";
+	out << "rngSeed=" << static_cast<unsigned long long>(rngSeed) << "\n";
+	out << "nninfo.file=nninfo.csv\n";
+	out << "nninfo.bytes=" << static_cast<unsigned long long>(integrity.nninfoBytes) << "\n";
+	out << "weights.file=weights.bin\n";
+	out << "weights.bytes=" << static_cast<unsigned long long>(integrity.weightsBytes) << "\n";
+	out << "weights.fnv1a64=" << static_cast<unsigned long long>(integrity.weightsHash) << "\n";
+
+	out << "training.minibatchSizeOverride=" << trainingConfig.minibatchSizeOverride << "\n";
+	out << "training.tbpttWindowOverride=" << trainingConfig.tbpttWindowOverride << "\n";
+	out << "training.globalGradClipNorm=" << trainingConfig.globalGradClipNorm << "\n";
+	out << "training.perElementGradClip=" << trainingConfig.perElementGradClip << "\n";
+	out << "training.optimizer.type=" << static_cast<int>(trainingConfig.optimizer.type) << "\n";
+	out << "training.optimizer.adamBeta1=" << trainingConfig.optimizer.adamBeta1 << "\n";
+	out << "training.optimizer.adamBeta2=" << trainingConfig.optimizer.adamBeta2 << "\n";
+	out << "training.optimizer.adamEps=" << trainingConfig.optimizer.adamEps << "\n";
+	out << "training.optimizer.adamBiasCorrection=" << (trainingConfig.optimizer.adamBiasCorrection ? 1 : 0) << "\n";
+	out << "training.lrSchedule.type=" << static_cast<int>(trainingConfig.lrSchedule.type) << "\n";
+	out << "training.lrSchedule.stepSizeEpochs=" << trainingConfig.lrSchedule.stepSizeEpochs << "\n";
+	out << "training.lrSchedule.gamma=" << trainingConfig.lrSchedule.gamma << "\n";
+	out << "training.lrSchedule.cosineTMaxEpochs=" << trainingConfig.lrSchedule.cosineTMaxEpochs << "\n";
+	out << "training.lrSchedule.minMultiplier=" << trainingConfig.lrSchedule.minMultiplier << "\n";
+	out << "training.mixedPrecision.enable=" << (trainingConfig.mixedPrecision.enable ? 1 : 0) << "\n";
+	out << "training.mixedPrecision.weightDType=" << static_cast<int>(trainingConfig.mixedPrecision.weightDType) << "\n";
+	out << "training.mixedPrecision.useLossScaling=" << (trainingConfig.mixedPrecision.useLossScaling ? 1 : 0) << "\n";
+	out << "training.mixedPrecision.dynamicLossScaling=" << (trainingConfig.mixedPrecision.dynamicLossScaling ? 1 : 0) << "\n";
+	out << "training.mixedPrecision.lossScaleInit=" << trainingConfig.mixedPrecision.lossScaleInit << "\n";
+	out << "training.mixedPrecision.lossScaleMin=" << trainingConfig.mixedPrecision.lossScaleMin << "\n";
+	out << "training.mixedPrecision.lossScaleMax=" << trainingConfig.mixedPrecision.lossScaleMax << "\n";
+	out << "training.mixedPrecision.growthInterval=" << trainingConfig.mixedPrecision.growthInterval << "\n";
+	out << "training.mixedPrecision.growthFactor=" << trainingConfig.mixedPrecision.growthFactor << "\n";
+	out << "training.mixedPrecision.backoffFactor=" << trainingConfig.mixedPrecision.backoffFactor << "\n";
+	out << "training.transformer.nHeadsOverride=" << trainingConfig.transformer.nHeadsOverride << "\n";
+	out << "training.transformer.nKVHeadsOverride=" << trainingConfig.transformer.nKVHeadsOverride << "\n";
+	out << "training.transformer.dFFOverride=" << trainingConfig.transformer.dFFOverride << "\n";
+	out << "training.transformer.enableTokenEmbedding=" << (trainingConfig.transformer.enableTokenEmbedding ? 1 : 0) << "\n";
+	out << "training.transformer.vocabSizeOverride=" << trainingConfig.transformer.vocabSizeOverride << "\n";
+	out << "training.transformer.tieEmbeddings=" << (trainingConfig.transformer.tieEmbeddings ? 1 : 0) << "\n";
+	out << "training.transformer.padTokenId=" << trainingConfig.transformer.padTokenId << "\n";
+	out << "training.transformer.tokenLmLossKind=" << static_cast<int>(trainingConfig.transformer.tokenLmLossKind) << "\n";
+	out << "training.transformer.tokenLmSampledNegatives=" << trainingConfig.transformer.tokenLmSampledNegatives << "\n";
+	out << "training.transformer.tokenLmAllowHugeFullSoftmax=" << (trainingConfig.transformer.tokenLmAllowHugeFullSoftmax ? 1 : 0) << "\n";
+	out << "training.transformer.layerNormEps=" << trainingConfig.transformer.layerNormEps << "\n";
+	out << "training.transformer.normType=" << static_cast<int>(trainingConfig.transformer.normType) << "\n";
+	out << "training.transformer.positionalEncoding=" << static_cast<int>(trainingConfig.transformer.positionalEncoding) << "\n";
+	out << "training.transformer.kvCacheDType=" << static_cast<int>(trainingConfig.transformer.kvCacheDType) << "\n";
+	out << "training.transformer.ropeDimOverride=" << trainingConfig.transformer.ropeDimOverride << "\n";
+	out << "training.transformer.ropeTheta=" << trainingConfig.transformer.ropeTheta << "\n";
+	out << "training.transformer.ffnKind=" << static_cast<int>(trainingConfig.transformer.ffnKind) << "\n";
+	out << "training.transformer.ffnActivation=" << static_cast<int>(trainingConfig.transformer.ffnActivation) << "\n";
+
+	out << "tokenizer.present=" << (tokenizerWrite.present ? 1 : 0) << "\n";
+	if (tokenizerWrite.present && tokenizerArtifacts)
+	{
+		out << "tokenizer.formatVersion=" << kTokenizerFormatVersion << "\n";
+		out << "tokenizer.type=" << tokenizerArtifacts->type << "\n";
+		out << "tokenizer.vocabCount=" << static_cast<unsigned long long>(tokenizerArtifacts->vocab.size()) << "\n";
+		out << "tokenizer.fnv1a64=" << static_cast<unsigned long long>(tokenizerWrite.vocabHash) << "\n";
+		out << "tokenizer.special.padTokenId=" << tokenizerArtifacts->padTokenId << "\n";
+		out << "tokenizer.special.bosTokenId=" << tokenizerArtifacts->bosTokenId << "\n";
+		out << "tokenizer.special.eosTokenId=" << tokenizerArtifacts->eosTokenId << "\n";
+		out << "tokenizer.special.unkTokenId=" << tokenizerArtifacts->unkTokenId << "\n";
+	}
+	out.flush();
+	out.close();
+	if (!out || !rename_atomic(tmp, paths.manifestPath))
+	{
+		(void)::remove(tmp.c_str());
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                              "saveModel: failed to publish manifest.txt (rename failed)");
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus validate_tokenizer_manifest_presence(const ModelManifest& mf,
+                                                                   const ModelPackagePaths& paths)
+{
+	if (!mf.hasTokenizerPresent)
+		return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+
+	const bool tokOnDisk = stat_is_file(paths.tokenizerManifestPath);
+	if (mf.tokenizerPresent && !tokOnDisk)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadModel: manifest claims tokenizer.present=1 but tokenizer/manifest.txt is missing");
+	}
+	if (!mf.tokenizerPresent && tokOnDisk)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadModel: manifest claims tokenizer.present=0 but tokenizer/manifest.txt exists");
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus load_tokenizer_package(const ModelPackagePaths& paths,
+                                                     glades::NNetwork::TokenizerArtifacts& outArtifacts,
+                                                     uint64_t& outVocabHash)
+{
+	outArtifacts.reset();
+	outVocabHash = 0ULL;
+	if (!stat_is_file(paths.tokenizerManifestPath))
+		return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+	if (!stat_is_file(paths.tokenizerVocabPath))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadModel: tokenizer vocab.bin missing or not a regular file");
+	}
+
+	TokenizerManifest tm;
+	if (!read_tokenizer_manifest(paths.tokenizerManifestPath, tm))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR, "loadModel: unable to read tokenizer manifest.txt");
+	if (tm.magic != "GLADES_TOKENIZER")
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: tokenizer manifest magic mismatch");
+	if (tm.version != kTokenizerFormatVersion)
+	{
+		std::ostringstream oss;
+		oss << "loadModel: unsupported tokenizer format version " << tm.version << " (expected " << kTokenizerFormatVersion << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+	if (!is_safe_relative_file(tm.vocabFile) || tm.vocabFile != "vocab.bin")
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocabFile must be 'vocab.bin'");
+
+	if (!read_vocab_bin(paths.tokenizerVocabPath, outArtifacts.vocab, outVocabHash))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: failed to read tokenizer vocab.bin");
+	if (tm.hasVocabCount && tm.vocabCount != static_cast<uint64_t>(outArtifacts.vocab.size()))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocabCount mismatch vs vocab.bin");
+	if (tm.hasFNV && tm.fnv1a64 != outVocabHash)
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocab.bin checksum mismatch (fnv1a64)");
+
+	outArtifacts.type = tm.type;
+	outArtifacts.padTokenId = tm.padTokenId;
+	outArtifacts.bosTokenId = tm.bosTokenId;
+	outArtifacts.eosTokenId = tm.eosTokenId;
+	outArtifacts.unkTokenId = tm.unkTokenId;
+	return glades::NNetwork::validateTokenizerArtifacts(outArtifacts);
+}
+
+static glades::NNetworkStatus verify_loaded_model_package_files(const ModelPackagePaths& paths,
+                                                                const ModelManifest& mf,
+                                                                const glades::NNetwork::TokenizerArtifacts* tokenizerArtifacts)
+{
+	if (mf.hasWeightsBytes && mf.hasWeightsFNV)
+	{
+		struct stat st;
+		if (::lstat(paths.weightsPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: weights.bin missing or not a regular file");
+		const uint64_t bytes = static_cast<uint64_t>(st.st_size);
+		if (bytes != mf.weightsBytes)
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: weights.bin size mismatch vs manifest");
+		uint64_t h = 0ULL;
+		if (!fnv1a64_hash_file_prefix(paths.weightsPath, bytes, h) || h != mf.weightsFNV1a64)
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: weights.bin checksum mismatch (fnv1a64)");
+	}
+
+	if (mf.hasNninfoBytes)
+	{
+		struct stat st;
+		if (::lstat(paths.nninfoPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: nninfo.csv missing or not a regular file");
+		const uint64_t bytes = static_cast<uint64_t>(st.st_size);
+		if (bytes != mf.nninfoBytes)
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadModel: nninfo.csv size mismatch vs manifest");
+	}
+
+	if (mf.hasTokenizerPresent && mf.tokenizerPresent)
+	{
+		if (!tokenizerArtifacts)
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+			                              "loadModel: manifest claims tokenizer.present=1 but tokenizer artifacts were not loaded");
+		}
+		if (mf.hasTokenizerVocabCount && mf.tokenizerVocabCount != static_cast<uint64_t>(tokenizerArtifacts->vocab.size()))
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+			                              "loadModel: tokenizer vocabCount mismatch vs loaded artifacts");
+		}
+		if (mf.hasTokenizerFNV)
+		{
+			std::vector<std::string> tmpVocab;
+			uint64_t h = 0ULL;
+			if (!read_vocab_bin(paths.tokenizerVocabPath, tmpVocab, h))
+			{
+				return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+				                              "loadModel: failed to re-read tokenizer vocab.bin for verification");
+			}
+			if (h != mf.tokenizerFNV1a64)
+			{
+				return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+				                              "loadModel: tokenizer vocab.bin checksum mismatch vs top-level manifest");
+			}
+		}
+	}
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
 } // namespace
 
 namespace glades {
@@ -967,172 +1304,44 @@ NNetworkStatus NNetwork::saveModel(const std::string& modelName, const DataInput
 		TmpDirGuard& operator=(const TmpDirGuard&);
 	};
 	TmpDirGuard tmpGuard(tmpDirNoSlash);
-
-	const std::string dir = tmpDirNoSlash + "/";
-	const std::string manifestPath = dir + "manifest.txt";
-	const std::string nninfoPath = dir + "nninfo.csv";
-	const std::string weightsPath = dir + "weights.bin";
-	const std::string tokDir = dir + "tokenizer/";
-	const std::string tokManifestPath = tokDir + "manifest.txt";
-	const std::string tokVocabPath = tokDir + "vocab.bin";
+	const ModelPackagePaths paths = build_model_package_paths(tmpDirNoSlash);
+	const NNetwork::TokenizerArtifacts* tokenizerArtifactsPtr =
+	    tokenizerArtifactsPresent ? &tokenizerArtifacts : NULL;
 
 	// 1) architecture
 	{
 		const shmea::GTable tinfo = skeleton->toGTable();
-		const std::string tmp = nninfoPath + ".tmp";
-		tinfo.save(shmea::GString(tmp.c_str()));
-		if (!rename_atomic(tmp, nninfoPath))
-		{
-			(void)::remove(tmp.c_str());
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: failed to publish nninfo.csv (rename failed)");
-		}
+		const NNetworkStatus stInfo = write_model_package_nninfo(tinfo, paths.nninfoPath);
+		if (!stInfo.ok())
+			return stInfo;
 	}
 
 	// 2) weights
 	{
-		const NNetworkStatus stW = saveTensorWeightsToFile(weightsPath);
+		const NNetworkStatus stW = saveTensorWeightsToFile(paths.weightsPath);
 		if (!stW.ok())
 			return stW;
 	}
 
 	// 3) tokenizer artifacts (optional)
-	uint64_t vocabHash = 0ULL;
-	if (tokenizerArtifactsPresent)
-	{
-		if (!mkdir_if_missing(tokDir.substr(0, tokDir.size() - 1)))
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to create tokenizer directory");
-
-		if (!write_vocab_bin_atomic(tokVocabPath, tokenizerArtifacts.vocab, vocabHash))
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: failed to write tokenizer vocab.bin");
-
-		{
-			const std::string tmp = tokManifestPath + ".tmp";
-			std::ofstream out(tmp.c_str(), std::ios::out | std::ios::trunc);
-			if (!out)
-				return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to write tokenizer manifest.txt");
-
-			out << "GLADES_TOKENIZER" << "\n";
-			out << "version=" << kTokenizerFormatVersion << "\n";
-			out << "type=" << tokenizerArtifacts.type << "\n";
-			out << "vocabFile=vocab.bin" << "\n";
-			out << "vocabCount=" << static_cast<unsigned long long>(tokenizerArtifacts.vocab.size()) << "\n";
-			out << "fnv1a64=" << static_cast<unsigned long long>(vocabHash) << "\n";
-			out << "special.padTokenId=" << tokenizerArtifacts.padTokenId << "\n";
-			out << "special.bosTokenId=" << tokenizerArtifacts.bosTokenId << "\n";
-			out << "special.eosTokenId=" << tokenizerArtifacts.eosTokenId << "\n";
-			out << "special.unkTokenId=" << tokenizerArtifacts.unkTokenId << "\n";
-			out.flush();
-			out.close();
-			if (!out || !rename_atomic(tmp, tokManifestPath))
-			{
-				(void)::remove(tmp.c_str());
-				return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: failed to publish tokenizer manifest.txt (rename failed)");
-			}
-		}
-	}
+	TokenizerPackageWriteResult tokenizerWrite;
+	const NNetworkStatus stTokenizer = write_tokenizer_package(paths, tokenizerArtifactsPtr, tokenizerWrite);
+	if (!stTokenizer.ok())
+		return stTokenizer;
 
 	// Compute file integrity metadata (v3+).
-	uint64_t nninfoBytes = 0ULL;
-	uint64_t weightsBytes = 0ULL;
-	uint64_t weightsHash = 0ULL;
-	{
-		struct stat st;
-		if (::lstat(nninfoPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
-			nninfoBytes = static_cast<uint64_t>(st.st_size);
-		if (::lstat(weightsPath.c_str(), &st) == 0 && S_ISREG(st.st_mode))
-			weightsBytes = static_cast<uint64_t>(st.st_size);
-		if (weightsBytes > 0ULL)
-		{
-			if (!fnv1a64_hash_file_prefix(weightsPath, weightsBytes, weightsHash))
-				return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: failed to compute weights.bin checksum");
-		}
-	}
+	ModelPackageIntegrity integrity;
+	const NNetworkStatus stIntegrity = compute_model_package_integrity(paths, integrity);
+	if (!stIntegrity.ok())
+		return stIntegrity;
 
 	// 4) manifest (written last)
 	{
-		const std::string tmp = manifestPath + ".tmp";
-		std::ofstream out(tmp.c_str(), std::ios::out | std::ios::trunc);
-		if (!out)
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: unable to write manifest.txt");
-
-		out << "GLADES_MODEL" << "\n";
-		out << "version=" << kModelFormatVersionLatest << "\n";
-		out << "name=" << modelName << "\n";
-		out << "netType=" << netType << "\n";
-		out << "epochs=" << epochs << "\n";
-		out << "rngSeed=" << static_cast<unsigned long long>(rngSeed) << "\n";
-		out << "nninfo.file=nninfo.csv\n";
-		out << "nninfo.bytes=" << static_cast<unsigned long long>(nninfoBytes) << "\n";
-		out << "weights.file=weights.bin\n";
-		out << "weights.bytes=" << static_cast<unsigned long long>(weightsBytes) << "\n";
-		out << "weights.fnv1a64=" << static_cast<unsigned long long>(weightsHash) << "\n";
-
-		// Persist TrainingConfig so inference matches training-time conventions.
-		out << "training.minibatchSizeOverride=" << trainingConfig.minibatchSizeOverride << "\n";
-		out << "training.tbpttWindowOverride=" << trainingConfig.tbpttWindowOverride << "\n";
-		out << "training.globalGradClipNorm=" << trainingConfig.globalGradClipNorm << "\n";
-		out << "training.perElementGradClip=" << trainingConfig.perElementGradClip << "\n";
-		out << "training.optimizer.type=" << static_cast<int>(trainingConfig.optimizer.type) << "\n";
-		out << "training.optimizer.adamBeta1=" << trainingConfig.optimizer.adamBeta1 << "\n";
-		out << "training.optimizer.adamBeta2=" << trainingConfig.optimizer.adamBeta2 << "\n";
-		out << "training.optimizer.adamEps=" << trainingConfig.optimizer.adamEps << "\n";
-		out << "training.optimizer.adamBiasCorrection=" << (trainingConfig.optimizer.adamBiasCorrection ? 1 : 0) << "\n";
-		out << "training.lrSchedule.type=" << static_cast<int>(trainingConfig.lrSchedule.type) << "\n";
-		out << "training.lrSchedule.stepSizeEpochs=" << trainingConfig.lrSchedule.stepSizeEpochs << "\n";
-		out << "training.lrSchedule.gamma=" << trainingConfig.lrSchedule.gamma << "\n";
-		out << "training.lrSchedule.cosineTMaxEpochs=" << trainingConfig.lrSchedule.cosineTMaxEpochs << "\n";
-		out << "training.lrSchedule.minMultiplier=" << trainingConfig.lrSchedule.minMultiplier << "\n";
-		// Mixed precision
-		out << "training.mixedPrecision.enable=" << (trainingConfig.mixedPrecision.enable ? 1 : 0) << "\n";
-		out << "training.mixedPrecision.weightDType=" << static_cast<int>(trainingConfig.mixedPrecision.weightDType) << "\n";
-		out << "training.mixedPrecision.useLossScaling=" << (trainingConfig.mixedPrecision.useLossScaling ? 1 : 0) << "\n";
-		out << "training.mixedPrecision.dynamicLossScaling=" << (trainingConfig.mixedPrecision.dynamicLossScaling ? 1 : 0) << "\n";
-		out << "training.mixedPrecision.lossScaleInit=" << trainingConfig.mixedPrecision.lossScaleInit << "\n";
-		out << "training.mixedPrecision.lossScaleMin=" << trainingConfig.mixedPrecision.lossScaleMin << "\n";
-		out << "training.mixedPrecision.lossScaleMax=" << trainingConfig.mixedPrecision.lossScaleMax << "\n";
-		out << "training.mixedPrecision.growthInterval=" << trainingConfig.mixedPrecision.growthInterval << "\n";
-		out << "training.mixedPrecision.growthFactor=" << trainingConfig.mixedPrecision.growthFactor << "\n";
-		out << "training.mixedPrecision.backoffFactor=" << trainingConfig.mixedPrecision.backoffFactor << "\n";
-		// TransformerRunConfig (these affect inference too).
-		out << "training.transformer.nHeadsOverride=" << trainingConfig.transformer.nHeadsOverride << "\n";
-		out << "training.transformer.nKVHeadsOverride=" << trainingConfig.transformer.nKVHeadsOverride << "\n";
-		out << "training.transformer.dFFOverride=" << trainingConfig.transformer.dFFOverride << "\n";
-		out << "training.transformer.enableTokenEmbedding=" << (trainingConfig.transformer.enableTokenEmbedding ? 1 : 0) << "\n";
-		out << "training.transformer.vocabSizeOverride=" << trainingConfig.transformer.vocabSizeOverride << "\n";
-		out << "training.transformer.tieEmbeddings=" << (trainingConfig.transformer.tieEmbeddings ? 1 : 0) << "\n";
-		out << "training.transformer.padTokenId=" << trainingConfig.transformer.padTokenId << "\n";
-		out << "training.transformer.tokenLmLossKind=" << static_cast<int>(trainingConfig.transformer.tokenLmLossKind) << "\n";
-		out << "training.transformer.tokenLmSampledNegatives=" << trainingConfig.transformer.tokenLmSampledNegatives << "\n";
-		out << "training.transformer.tokenLmAllowHugeFullSoftmax=" << (trainingConfig.transformer.tokenLmAllowHugeFullSoftmax ? 1 : 0) << "\n";
-		out << "training.transformer.layerNormEps=" << trainingConfig.transformer.layerNormEps << "\n";
-		out << "training.transformer.normType=" << static_cast<int>(trainingConfig.transformer.normType) << "\n";
-		out << "training.transformer.positionalEncoding=" << static_cast<int>(trainingConfig.transformer.positionalEncoding) << "\n";
-		out << "training.transformer.kvCacheDType=" << static_cast<int>(trainingConfig.transformer.kvCacheDType) << "\n";
-		out << "training.transformer.ropeDimOverride=" << trainingConfig.transformer.ropeDimOverride << "\n";
-		out << "training.transformer.ropeTheta=" << trainingConfig.transformer.ropeTheta << "\n";
-		out << "training.transformer.ffnKind=" << static_cast<int>(trainingConfig.transformer.ffnKind) << "\n";
-		out << "training.transformer.ffnActivation=" << static_cast<int>(trainingConfig.transformer.ffnActivation) << "\n";
-
-		// Tokenizer artifacts (optional)
-		out << "tokenizer.present=" << (tokenizerArtifactsPresent ? 1 : 0) << "\n";
-		if (tokenizerArtifactsPresent)
-		{
-			out << "tokenizer.formatVersion=" << kTokenizerFormatVersion << "\n";
-			out << "tokenizer.type=" << tokenizerArtifacts.type << "\n";
-			out << "tokenizer.vocabCount=" << static_cast<unsigned long long>(tokenizerArtifacts.vocab.size()) << "\n";
-			out << "tokenizer.fnv1a64=" << static_cast<unsigned long long>(vocabHash) << "\n";
-			out << "tokenizer.special.padTokenId=" << tokenizerArtifacts.padTokenId << "\n";
-			out << "tokenizer.special.bosTokenId=" << tokenizerArtifacts.bosTokenId << "\n";
-			out << "tokenizer.special.eosTokenId=" << tokenizerArtifacts.eosTokenId << "\n";
-			out << "tokenizer.special.unkTokenId=" << tokenizerArtifacts.unkTokenId << "\n";
-		}
-		out.flush();
-		out.close();
-		if (!out || !rename_atomic(tmp, manifestPath))
-		{
-			(void)::remove(tmp.c_str());
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveModel: failed to publish manifest.txt (rename failed)");
-		}
+		const NNetworkStatus stManifest =
+		    write_model_package_manifest(paths, modelName, netType, epochs, rngSeed, trainingConfig,
+		                                 tokenizerArtifactsPtr, tokenizerWrite, integrity);
+		if (!stManifest.ok())
+			return stManifest;
 	}
 
 	// 5) Atomically publish temp dir -> final dir (rotate existing).
@@ -1167,26 +1376,20 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 	if (!forShape)
 		return failStatus(NNetworkStatus::INVALID_ARGUMENT, "loadModel: forShape is null (required to rebuild input layer)");
 
-	const std::string dir = model_dir(modelName);
-	const std::string manifestPath = dir + "manifest.txt";
-	const std::string nninfoPath = dir + "nninfo.csv";
-	const std::string weightsPath = dir + "weights.bin";
-	const std::string tokDir = dir + "tokenizer/";
-	const std::string tokManifestPath = tokDir + "manifest.txt";
-	const std::string tokVocabPath = tokDir + "vocab.bin";
+	const ModelPackagePaths paths = build_model_package_paths(model_dir_no_slash(modelName));
 
 	// Modern-only: unified model package must exist.
 	{
-		std::ifstream probe(manifestPath.c_str());
+		std::ifstream probe(paths.manifestPath.c_str());
 		if (!probe)
 			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: manifest.txt not found (legacy formats are not supported)");
 	}
-	if (!stat_is_file(manifestPath) || !stat_is_file(nninfoPath) || !stat_is_file(weightsPath))
+	if (!stat_is_file(paths.manifestPath) || !stat_is_file(paths.nninfoPath) || !stat_is_file(paths.weightsPath))
 		return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: model package files missing or not regular files");
 
 	// Unified package load.
 	ModelManifest mf;
-	if (!read_kv_manifest(manifestPath, mf))
+	if (!read_kv_manifest(paths.manifestPath, mf))
 		return failStatus(NNetworkStatus::INTERNAL_ERROR, "loadModel: unable to read manifest.txt");
 
 	if (mf.magic != "GLADES_MODEL")
@@ -1214,7 +1417,7 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 
 	// Load architecture from nninfo.csv (self-contained, file-based).
 	{
-		const shmea::GTable t(shmea::GString(nninfoPath.c_str()), ',', shmea::GTable::TYPE_FILE);
+		const shmea::GTable t(shmea::GString(paths.nninfoPath.c_str()), ',', shmea::GTable::TYPE_FILE);
 		ownedSkeleton = shmea::GPointer<NNInfo>(new NNInfo(shmea::GString(modelName.c_str()), t));
 		skeleton = ownedSkeleton.get();
 	}
@@ -1223,7 +1426,7 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 		return failStatus(NNetworkStatus::INTERNAL_ERROR, "loadModel: failed to construct NNInfo from nninfo.csv");
 
 	// Load packed tensor weights (format v2+).
-	const NNetworkStatus stW = loadTensorWeightsFromFile(weightsPath);
+	const NNetworkStatus stW = loadTensorWeightsFromFile(paths.weightsPath);
 	if (!stW.ok())
 		return stW;
 
@@ -1243,49 +1446,18 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 	// Load tokenizer artifacts if present (optional).
 	// This is strict: if tokenizer/manifest.txt exists, it must be valid and consistent.
 	clearTokenizerArtifacts();
-	if (mf.hasTokenizerPresent)
 	{
-		const bool tokOnDisk = stat_is_file(tokManifestPath);
-		if (mf.tokenizerPresent && !tokOnDisk)
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: manifest claims tokenizer.present=1 but tokenizer/manifest.txt is missing");
-		if (!mf.tokenizerPresent && tokOnDisk)
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: manifest claims tokenizer.present=0 but tokenizer/manifest.txt exists");
+		const NNetworkStatus stTokPresence = validate_tokenizer_manifest_presence(mf, paths);
+		if (!stTokPresence.ok())
+			return failStatus(stTokPresence.code, stTokPresence.message);
 	}
-	if (stat_is_file(tokManifestPath))
+	if (stat_is_file(paths.tokenizerManifestPath))
 	{
-		if (!stat_is_file(tokVocabPath))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocab.bin missing or not a regular file");
-
-		TokenizerManifest tm;
-		if (!read_tokenizer_manifest(tokManifestPath, tm))
-			return failStatus(NNetworkStatus::INTERNAL_ERROR, "loadModel: unable to read tokenizer manifest.txt");
-		if (tm.magic != "GLADES_TOKENIZER")
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: tokenizer manifest magic mismatch");
-		if (tm.version != kTokenizerFormatVersion)
-		{
-			std::ostringstream oss;
-			oss << "loadModel: unsupported tokenizer format version " << tm.version << " (expected " << kTokenizerFormatVersion << ")";
-			return failStatus(NNetworkStatus::INVALID_STATE, oss.str());
-		}
-		if (!is_safe_relative_file(tm.vocabFile) || tm.vocabFile != "vocab.bin")
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocabFile must be 'vocab.bin'");
-
-		std::vector<std::string> vocab;
-		uint64_t vocabHash = 0ULL;
-		if (!read_vocab_bin(tokVocabPath, vocab, vocabHash))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: failed to read tokenizer vocab.bin");
-		if (tm.hasVocabCount && tm.vocabCount != static_cast<uint64_t>(vocab.size()))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocabCount mismatch vs vocab.bin");
-		if (tm.hasFNV && tm.fnv1a64 != vocabHash)
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocab.bin checksum mismatch (fnv1a64)");
-
 		TokenizerArtifacts a;
-		a.type = tm.type;
-		a.vocab = vocab;
-		a.padTokenId = tm.padTokenId;
-		a.bosTokenId = tm.bosTokenId;
-		a.eosTokenId = tm.eosTokenId;
-		a.unkTokenId = tm.unkTokenId;
+		uint64_t vocabHash = 0ULL;
+		const NNetworkStatus stTokRead = load_tokenizer_package(paths, a, vocabHash);
+		if (!stTokRead.ok())
+			return failStatus(stTokRead.code, stTokRead.message);
 		const NNetworkStatus stTok = setTokenizerArtifacts(a);
 		if (!stTok.ok())
 			return stTok;
@@ -1333,46 +1505,12 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 	{
 		const char* v = ::getenv("GLADES_MODEL_VERIFY_FILES");
 		const bool verify = (v && std::strcmp(v, "1") == 0);
-
-		if (verify && mf.hasWeightsBytes && mf.hasWeightsFNV)
+		if (verify)
 		{
-			struct stat st;
-			if (::lstat(weightsPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: weights.bin missing or not a regular file");
-			const uint64_t bytes = static_cast<uint64_t>(st.st_size);
-			if (bytes != mf.weightsBytes)
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: weights.bin size mismatch vs manifest");
-			uint64_t h = 0ULL;
-			if (!fnv1a64_hash_file_prefix(weightsPath, bytes, h) || h != mf.weightsFNV1a64)
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: weights.bin checksum mismatch (fnv1a64)");
-		}
-
-		if (verify && mf.hasNninfoBytes)
-		{
-			struct stat st;
-			if (::lstat(nninfoPath.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: nninfo.csv missing or not a regular file");
-			const uint64_t bytes = static_cast<uint64_t>(st.st_size);
-			if (bytes != mf.nninfoBytes)
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: nninfo.csv size mismatch vs manifest");
-		}
-
-		// Tokenizer integrity duplicated in top-level manifest: verify agreement if present.
-		if (verify && mf.hasTokenizerPresent && mf.tokenizerPresent)
-		{
-			if (!hasTokenizerArtifacts())
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: manifest claims tokenizer.present=1 but tokenizer artifacts were not loaded");
-			if (mf.hasTokenizerVocabCount && mf.tokenizerVocabCount != static_cast<uint64_t>(tokenizerArtifacts.vocab.size()))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocabCount mismatch vs loaded artifacts");
-			if (mf.hasTokenizerFNV)
-			{
-				std::vector<std::string> tmpVocab;
-				uint64_t h = 0ULL;
-				if (!read_vocab_bin(tokVocabPath, tmpVocab, h))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: failed to re-read tokenizer vocab.bin for verification");
-				if (h != mf.tokenizerFNV1a64)
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadModel: tokenizer vocab.bin checksum mismatch vs top-level manifest");
-			}
+			const NNetworkStatus stVerifyFiles =
+			    verify_loaded_model_package_files(paths, mf, hasTokenizerArtifacts() ? &tokenizerArtifacts : NULL);
+			if (!stVerifyFiles.ok())
+				return failStatus(stVerifyFiles.code, stVerifyFiles.message);
 		}
 	}
 
@@ -1380,4 +1518,3 @@ NNetworkStatus NNetwork::loadModel(const std::string& modelName, const DataInput
 }
 
 } // namespace glades
-

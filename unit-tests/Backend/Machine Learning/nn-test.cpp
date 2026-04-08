@@ -257,6 +257,103 @@ static bool write_weights_header_bin(std::ostream& out, unsigned int netType)
 	return static_cast<bool>(out);
 }
 
+struct TransformerWeightVecWriteRef
+{
+	const std::vector<float>* values;
+
+	explicit TransformerWeightVecWriteRef(const std::vector<float>& fieldValues)
+	    : values(&fieldValues)
+	{
+	}
+};
+
+static void append_transformer_weight_write_ref(std::vector<TransformerWeightVecWriteRef>& fields,
+                                                const std::vector<float>& values)
+{
+	fields.push_back(TransformerWeightVecWriteRef(values));
+}
+
+static bool write_transformer_weight_vecs(std::ostream& out,
+                                          const std::vector<TransformerWeightVecWriteRef>& fields)
+{
+	for (size_t i = 0; i < fields.size(); ++i)
+	{
+		if (!write_vec_f32(out, *fields[i].values))
+			return false;
+	}
+	return true;
+}
+
+static void append_transformer_global_weight_write_refs(std::vector<TransformerWeightVecWriteRef>& fields,
+                                                        const std::vector<float>& WIn,
+                                                        const std::vector<float>& bIn,
+                                                        const std::vector<float>& WOut,
+                                                        const std::vector<float>& bOut,
+                                                        const std::vector<float>& tokE,
+                                                        const std::vector<float>& lmBias,
+                                                        const std::vector<float>& lnFinalGamma,
+                                                        const std::vector<float>& lnFinalBeta)
+{
+	fields.clear();
+	fields.reserve(8u);
+	append_transformer_weight_write_ref(fields, WIn);
+	append_transformer_weight_write_ref(fields, bIn);
+	append_transformer_weight_write_ref(fields, WOut);
+	append_transformer_weight_write_ref(fields, bOut);
+	append_transformer_weight_write_ref(fields, tokE);
+	append_transformer_weight_write_ref(fields, lmBias);
+	append_transformer_weight_write_ref(fields, lnFinalGamma);
+	append_transformer_weight_write_ref(fields, lnFinalBeta);
+}
+
+static void append_transformer_block_weight_write_refs(std::vector<TransformerWeightVecWriteRef>& fields,
+                                                       const std::vector<float>& ln1Gamma,
+                                                       const std::vector<float>& ln1Beta,
+                                                       const std::vector<float>& Wq,
+                                                       const std::vector<float>& Wk,
+                                                       const std::vector<float>& Wv,
+                                                       const std::vector<float>& Wo,
+                                                       const std::vector<float>& bq,
+                                                       const std::vector<float>& bk,
+                                                       const std::vector<float>& bv,
+                                                       const std::vector<float>& bo,
+                                                       const std::vector<float>& ln2Gamma,
+                                                       const std::vector<float>& ln2Beta,
+                                                       const std::vector<float>& W1,
+                                                       const std::vector<float>& b1,
+                                                       const std::vector<float>& W2,
+                                                       const std::vector<float>& b2)
+{
+	fields.clear();
+	fields.reserve(16u);
+	append_transformer_weight_write_ref(fields, ln1Gamma);
+	append_transformer_weight_write_ref(fields, ln1Beta);
+	append_transformer_weight_write_ref(fields, Wq);
+	append_transformer_weight_write_ref(fields, Wk);
+	append_transformer_weight_write_ref(fields, Wv);
+	append_transformer_weight_write_ref(fields, Wo);
+	append_transformer_weight_write_ref(fields, bq);
+	append_transformer_weight_write_ref(fields, bk);
+	append_transformer_weight_write_ref(fields, bv);
+	append_transformer_weight_write_ref(fields, bo);
+	append_transformer_weight_write_ref(fields, ln2Gamma);
+	append_transformer_weight_write_ref(fields, ln2Beta);
+	append_transformer_weight_write_ref(fields, W1);
+	append_transformer_weight_write_ref(fields, b1);
+	append_transformer_weight_write_ref(fields, W2);
+	append_transformer_weight_write_ref(fields, b2);
+}
+
+static bool read_transformer_weight_group_l2(std::istream& in, size_t fieldCount, double& sumsq)
+{
+	for (size_t i = 0; i < fieldCount; ++i)
+	{
+		if (!read_and_accum_vec_l2(in, sumsq))
+			return false;
+	}
+	return true;
+}
+
 static bool transformer_weights_l2_from_file(const std::string& weightsPath, double& outL2)
 {
 	outL2 = 0.0;
@@ -302,34 +399,15 @@ static bool transformer_weights_l2_from_file(const std::string& weightsPath, dou
 	(void)causal; (void)inputSize; (void)dModel; (void)dFF; (void)nHeads; (void)outSize;
 
 	double ss = 0.0;
-	// global vectors
-	if (!read_and_accum_vec_l2(in, ss)) return false; // WIn
-	if (!read_and_accum_vec_l2(in, ss)) return false; // bIn
-	if (!read_and_accum_vec_l2(in, ss)) return false; // WOut
-	if (!read_and_accum_vec_l2(in, ss)) return false; // bOut
-	if (!read_and_accum_vec_l2(in, ss)) return false; // tokE
-	if (!read_and_accum_vec_l2(in, ss)) return false; // lmBias
-	if (!read_and_accum_vec_l2(in, ss)) return false; // lnFinalGamma
-	if (!read_and_accum_vec_l2(in, ss)) return false; // lnFinalBeta
+	// Canonical transformer section order in weights.bin:
+	// globals = WIn, bIn, WOut, bOut, tokE, lmBias, lnFinalGamma, lnFinalBeta
+	if (!read_transformer_weight_group_l2(in, 8u, ss))
+		return false;
 	for (unsigned int l = 0; l < nLayers; ++l)
 	{
-		// block vectors (fixed order, 18 vectors)
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln1Gamma
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln1Beta
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wq
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wk
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wv
-		if (!read_and_accum_vec_l2(in, ss)) return false; // Wo
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bq
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bk
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bv
-		if (!read_and_accum_vec_l2(in, ss)) return false; // bo
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln2Gamma
-		if (!read_and_accum_vec_l2(in, ss)) return false; // ln2Beta
-		if (!read_and_accum_vec_l2(in, ss)) return false; // W1
-		if (!read_and_accum_vec_l2(in, ss)) return false; // b1
-		if (!read_and_accum_vec_l2(in, ss)) return false; // W2
-		if (!read_and_accum_vec_l2(in, ss)) return false; // b2
+		// block = ln1Gamma, ln1Beta, Wq, Wk, Wv, Wo, bq, bk, bv, bo, ln2Gamma, ln2Beta, W1, b1, W2, b2
+		if (!read_transformer_weight_group_l2(in, 16u, ss))
+			return false;
 	}
 	outL2 = sqrt(ss);
 	return true;
@@ -421,21 +499,16 @@ static bool write_transformer_decoder_tokenlm_weights(const std::string& weights
 		std::vector<float> bLm = lmBias;
 		if (bLm.empty())
 			bLm.assign(vocabSize, 0.0f);
-
-		if (!write_vec_f32(fp, WIn)) return false;
-		if (!write_vec_f32(fp, bIn)) return false;
-		if (!write_vec_f32(fp, WOut)) return false;
-		if (!write_vec_f32(fp, bOut)) return false;
-		if (!write_vec_f32(fp, tokE)) return false;
-		if (!write_vec_f32(fp, bLm)) return false;
-	}
-
-	// Final LayerNorm (gamma=1, beta=0 => identity)
-	{
 		std::vector<float> lnFinalGamma(dModel, 1.0f);
 		std::vector<float> lnFinalBeta(dModel, 0.0f);
-		if (!write_vec_f32(fp, lnFinalGamma)) return false;
-		if (!write_vec_f32(fp, lnFinalBeta)) return false;
+
+		std::vector<TransformerWeightVecWriteRef> fields;
+		append_transformer_global_weight_write_refs(fields,
+		                                           WIn, bIn,
+		                                           WOut, bOut,
+		                                           tokE, bLm,
+		                                           lnFinalGamma, lnFinalBeta);
+		if (!write_transformer_weight_vecs(fp, fields)) return false;
 	}
 
 	for (unsigned int l = 0; l < nLayers; ++l)
@@ -471,22 +544,14 @@ static bool write_transformer_decoder_tokenlm_weights(const std::string& weights
 			if (b2.size() >= 1u) b2[0] = 0.01f;
 		}
 
-		if (!write_vec_f32(fp, ln1Gamma)) return false;
-		if (!write_vec_f32(fp, ln1Beta)) return false;
-		if (!write_vec_f32(fp, Wq)) return false;
-		if (!write_vec_f32(fp, Wk)) return false;
-		if (!write_vec_f32(fp, Wv)) return false;
-		if (!write_vec_f32(fp, Wo)) return false;
-		if (!write_vec_f32(fp, bq)) return false;
-		if (!write_vec_f32(fp, bk)) return false;
-		if (!write_vec_f32(fp, bv)) return false;
-		if (!write_vec_f32(fp, bo)) return false;
-		if (!write_vec_f32(fp, ln2Gamma)) return false;
-		if (!write_vec_f32(fp, ln2Beta)) return false;
-		if (!write_vec_f32(fp, W1)) return false;
-		if (!write_vec_f32(fp, b1)) return false;
-		if (!write_vec_f32(fp, W2)) return false;
-		if (!write_vec_f32(fp, b2)) return false;
+		std::vector<TransformerWeightVecWriteRef> fields;
+		append_transformer_block_weight_write_refs(fields,
+		                                          ln1Gamma, ln1Beta,
+		                                          Wq, Wk, Wv, Wo,
+		                                          bq, bk, bv, bo,
+		                                          ln2Gamma, ln2Beta,
+		                                          W1, b1, W2, b2);
+		if (!write_transformer_weight_vecs(fp, fields)) return false;
 	}
 
 	return static_cast<bool>(fp);

@@ -239,6 +239,42 @@ struct SmallTransformerSetup
 	}
 };
 
+static void assert_transformer_model_save_load_logits_roundtrip(SmallTransformerSetup& saved,
+                                                                SmallTransformerSetup& loaded,
+                                                                const std::string& modelName,
+                                                                const std::vector<unsigned int>& prefix,
+                                                                double tolerance)
+{
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: save failed==============",
+	         saved.net->saveModel(modelName).ok());
+
+	std::vector<float> logitsSaved;
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: forward1 failed==============",
+	         saved.net->transformerLmForwardLastLogits(prefix, logitsSaved).ok());
+
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: load init failed==============",
+	         loaded.net->test(loaded.di).ok());
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: load failed==============",
+	         loaded.net->loadModel(modelName, loaded.di).ok());
+
+	std::vector<float> logitsLoaded;
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: forward2 failed==============",
+	         loaded.net->transformerLmForwardLastLogits(prefix, logitsLoaded).ok());
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: logits size mismatch==============",
+	         logitsSaved.size() == logitsLoaded.size());
+	double maxErr = 0.0;
+	for (size_t i = 0; i < logitsSaved.size(); ++i)
+	{
+		G_assert(__FILE__, __LINE__, "==============Checkpoint: non-finite logit==============",
+		         std::isfinite(logitsSaved[i]) && std::isfinite(logitsLoaded[i]));
+		const double e = fabs(static_cast<double>(logitsSaved[i]) - static_cast<double>(logitsLoaded[i]));
+		if (e > maxErr)
+			maxErr = e;
+	}
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: logits differ after save/load==============",
+	         maxErr < tolerance);
+}
+
 } // anonymous namespace
 
 void TransformerImprovementsUnitTest()
@@ -753,43 +789,13 @@ void TransformerImprovementsUnitTest()
 		G_assert(__FILE__, __LINE__, "==============Checkpoint: init failed==============", s.net->test(s.di).ok());
 		G_assert(__FILE__, __LINE__, "==============Checkpoint: train failed==============", s.net->train(s.di).ok());
 
-		// Save model
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: save failed==============",
-		         s.net->saveModel("ut_transformer_improvements_ckpt").ok());
-
-		// Record logits from trained network
 		std::vector<unsigned int> prefix;
 		prefix.push_back(1u);
 		prefix.push_back(2u);
 		prefix.push_back(3u);
-		std::vector<float> logits1;
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: forward1 failed==============",
-		         s.net->transformerLmForwardLastLogits(prefix, logits1).ok());
 
-		// Create a new network and load the checkpoint
 		SmallTransformerSetup s2(vocab, dModel, 4u, 32u, 9999u); // different seed
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: load init failed==============", s2.net->test(s2.di).ok());
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: load failed==============",
-		         s2.net->loadModel("ut_transformer_improvements_ckpt", s2.di).ok());
-
-		// Verify logits match between saved and loaded networks
-		// (this implicitly verifies all weights including final LN gamma/beta were restored)
-		std::vector<float> logits2;
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: forward2 failed==============",
-		         s2.net->transformerLmForwardLastLogits(prefix, logits2).ok());
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: logits size mismatch==============",
-		         logits1.size() == logits2.size());
-		{
-			double maxErr = 0.0;
-			for (size_t i = 0; i < logits1.size(); ++i)
-			{
-				G_assert(__FILE__, __LINE__, "==============Checkpoint: non-finite logit==============",
-				         std::isfinite(logits1[i]) && std::isfinite(logits2[i]));
-				const double e = fabs(static_cast<double>(logits1[i]) - static_cast<double>(logits2[i]));
-				if (e > maxErr) maxErr = e;
-			}
-			G_assert(__FILE__, __LINE__, "==============Checkpoint: logits differ after save/load==============", maxErr < 1e-4);
-		}
+		assert_transformer_model_save_load_logits_roundtrip(s, s2, "ut_transformer_improvements_ckpt", prefix, 1e-4);
 	}
 
 	// ===== 11. Multi-layer transformer with GELU + LayerNorm + dropout =====

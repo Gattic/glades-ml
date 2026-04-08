@@ -1055,6 +1055,255 @@ static void close_and_delete_shards(std::vector< shmea::GPointer<std::ifstream> 
 	}
 }
 
+struct ParsedCheckpointTensorEntry
+{
+	std::string name;
+	uint64_t count;
+	size_t shardIndex;
+	uint64_t offsetBytes;
+	uint64_t bytes;
+	uint64_t fnv1a64;
+	std::string dtype;
+	uint64_t elemBytes;
+	std::vector<uint64_t> shape;
+	ParsedCheckpointTensorEntry()
+	    : name(), count(0u), shardIndex(0u), offsetBytes(0u), bytes(0u),
+	      fnv1a64(0u), dtype(), elemBytes(0u), shape()
+	{
+	}
+};
+
+static glades::NNetworkStatus parse_checkpoint_manifest_header(const std::string& manifestPath,
+                                                               std::map<std::string, std::string>& kvOut,
+                                                               int& savedNetTypeOut)
+{
+	kvOut.clear();
+	savedNetTypeOut = glades::NNetwork::TYPE_DFF;
+	if (!read_kv_file(manifestPath, kvOut))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: manifest.txt not found or unreadable");
+	}
+	if (kvOut.find("__magic__") == kvOut.end() || kvOut["__magic__"] != "GLADES_CHECKPOINT")
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: manifest magic mismatch");
+
+	int version = -1;
+	if (!parse_int(kvOut, "version", version) || version != kCheckpointFormatVersion)
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsupported checkpoint format version");
+
+	std::map<std::string, std::string>::const_iterator itEndian = kvOut.find("file.endian");
+	if (itEndian == kvOut.end())
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing file.endian");
+	if (itEndian->second != "little")
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsupported file.endian (expected little)");
+
+	std::map<std::string, std::string>::const_iterator itEncoding = kvOut.find("file.tensorEncoding");
+	if (itEncoding == kvOut.end())
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing file.tensorEncoding");
+	if (itEncoding->second != "raw_le")
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsupported file.tensorEncoding");
+
+	if (!parse_int(kvOut, "netType", savedNetTypeOut) || savedNetTypeOut < 0)
+		savedNetTypeOut = glades::NNetwork::TYPE_DFF;
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static void restore_checkpoint_runtime_metadata(const std::map<std::string, std::string>& kv,
+                                                int& epochsOut,
+                                                bool& includeOptimizerStateOut,
+                                                uint64_t& seedOut,
+                                                bool& hasSeedOut,
+                                                glades::TrainingConfig& cfg)
+{
+	int savedEpochs = 0;
+	if (parse_int(kv, "epochs", savedEpochs))
+		epochsOut = savedEpochs;
+
+	hasSeedOut = parse_u64(kv, "rngSeed", seedOut);
+	includeOptimizerStateOut = true;
+	(void)parse_bool01(kv, "includeOptimizerState", includeOptimizerStateOut);
+
+	glades::TrainingConfig cfgTmp = cfg;
+	bool any = false;
+	apply_training_config_from_kv(kv, cfgTmp, any);
+	if (any)
+		cfg = cfgTmp;
+}
+
+static glades::NNetworkStatus open_checkpoint_shards(const std::string& dir,
+                                                     const std::map<std::string, std::string>& kv,
+                                                     size_t shardCount,
+                                                     std::vector< shmea::GPointer<std::ifstream> >& shardStreams,
+                                                     std::vector<uint64_t>& shardBytes,
+                                                     std::vector<uint64_t>& shardHashExpected)
+{
+	shardStreams.clear();
+	shardStreams.resize(shardCount);
+	shardBytes.assign(shardCount, 0u);
+	shardHashExpected.assign(shardCount, 0u);
+
+	for (size_t s = 0; s < shardCount; ++s)
+	{
+		std::ostringstream kf; kf << "shard." << static_cast<unsigned long long>(s) << ".file";
+		std::ostringstream kb; kb << "shard." << static_cast<unsigned long long>(s) << ".bytes";
+		std::ostringstream kh; kh << "shard." << static_cast<unsigned long long>(s) << ".fnv1a64";
+		if (kv.find(kf.str()) == kv.end())
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing shard file entry in manifest");
+
+		uint64_t bytesU = 0u;
+		if (!parse_u64(kv, kb.str(), bytesU))
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing shard bytes entry in manifest");
+
+		uint64_t hashU = 0u;
+		if (!parse_u64(kv, kh.str(), hashU))
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing shard checksum entry in manifest");
+
+		const std::string shardFile = kv.find(kf.str())->second;
+		if (!is_safe_shard_filename(shardFile))
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsafe shard filename in manifest");
+
+		const std::string shardPath = dir + shardFile;
+		struct stat st;
+		if (::lstat(shardPath.c_str(), &st) != 0 || S_ISLNK(st.st_mode) || !S_ISREG(st.st_mode))
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+			                              "loadCheckpoint: shard file missing or not a regular file");
+		}
+		if (static_cast<uint64_t>(st.st_size) < bytesU)
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+			                              "loadCheckpoint: shard file is smaller than manifest bytes");
+		}
+
+		shmea::GPointer<std::ifstream> in(new std::ifstream(shardPath.c_str(), std::ios::in | std::ios::binary));
+		if (!in || !(*in.get()))
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: unable to open shard file");
+
+		shardStreams[s] = in;
+		shardBytes[s] = bytesU;
+		shardHashExpected[s] = hashU;
+
+		if (should_verify_shards())
+		{
+			uint64_t computed = 0u;
+			if (!fnv1a64_hash_file_prefix(shardPath, bytesU, computed) || computed != hashU)
+				return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: shard checksum mismatch");
+		}
+	}
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus parse_checkpoint_tensor_manifest_entry(const std::map<std::string, std::string>& kv,
+                                                                     size_t tensorIndex,
+                                                                     size_t shardCount,
+                                                                     const std::vector<uint64_t>& shardBytes,
+                                                                     ParsedCheckpointTensorEntry& out)
+{
+	out = ParsedCheckpointTensorEntry();
+
+	std::ostringstream kn; kn << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".name";
+	std::ostringstream kc; kc << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".count";
+	std::ostringstream ks; ks << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".shard";
+	std::ostringstream ko; ko << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".offsetBytes";
+	std::ostringstream kb; kb << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".bytes";
+	std::ostringstream kh; kh << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".fnv1a64";
+	std::ostringstream kd; kd << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".dtype";
+	std::ostringstream ke; ke << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".elemBytes";
+	std::ostringstream kr; kr << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".rank";
+	std::ostringstream ksh; ksh << "tensor." << static_cast<unsigned long long>(tensorIndex) << ".shape";
+
+	std::map<std::string, std::string>::const_iterator itName = kv.find(kn.str());
+	if (itName == kv.end())
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing tensor name in manifest");
+	out.name = itName->second;
+
+	uint64_t shardU = 0u;
+	if (!parse_u64(kv, kc.str(), out.count) ||
+	    !parse_u64(kv, ks.str(), shardU) ||
+	    !parse_u64(kv, ko.str(), out.offsetBytes) ||
+	    !parse_u64(kv, kb.str(), out.bytes) ||
+	    !parse_u64(kv, kh.str(), out.fnv1a64))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: malformed tensor entry in manifest");
+	}
+
+	if (kv.find(kd.str()) == kv.end())
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing tensor dtype");
+	out.dtype = kv.find(kd.str())->second;
+	if (!parse_u64(kv, ke.str(), out.elemBytes))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing tensor elemBytes");
+
+	uint64_t rankU = 0u;
+	if (!parse_u64(kv, kr.str(), rankU) || rankU > 8u)
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: invalid tensor rank");
+	if (rankU == 0u && out.count != 0u)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: invalid tensor rank (0 with non-zero count)");
+	}
+	if (rankU > 0u)
+	{
+		std::map<std::string, std::string>::const_iterator itShape = kv.find(ksh.str());
+		if (itShape == kv.end() || !parse_u64_list_value(itShape->second, out.shape) || out.shape.size() != static_cast<size_t>(rankU))
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadCheckpoint: invalid tensor shape");
+	}
+	else
+	{
+		out.shape.clear();
+	}
+
+	if (out.dtype != "f32" || out.elemBytes != 4ull)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: unsupported tensor dtype/elemBytes (expected f32/4)");
+	}
+
+	uint64_t shapeCount = 0u;
+	if (out.count == 0u)
+		shapeCount = 0u;
+	else if (rankU == 0u)
+		shapeCount = 0u;
+	else if (!checked_shape_elem_count(out.shape, shapeCount))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: invalid tensor shape (overflow)");
+	}
+	if (shapeCount != out.count)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: tensor shape product != count (manifest corrupted)");
+	}
+	if ((out.offsetBytes % 4ull) != 0ull)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: tensor offsetBytes is not 4-byte aligned");
+	}
+	const uint64_t wantBytes = out.count * out.elemBytes;
+	if (out.bytes != wantBytes)
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: tensor bytes != count*elemBytes (manifest corrupted)");
+	}
+	if (shardU >= static_cast<uint64_t>(shardCount))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+		                              "loadCheckpoint: tensor references out-of-range shard");
+	}
+	out.shardIndex = static_cast<size_t>(shardU);
+	if (out.shardIndex < shardBytes.size())
+	{
+		const uint64_t shardByteCount = shardBytes[out.shardIndex];
+		if (out.offsetBytes > shardByteCount || out.bytes > shardByteCount || out.offsetBytes + out.bytes > shardByteCount)
+		{
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE,
+			                              "loadCheckpoint: tensor range exceeds shard bytes (manifest corrupted)");
+		}
+	}
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
 // --- ATLAS checkpoint helpers ---
 
 static void enqueueAtlasWrite(std::vector<TensorWriteRef>& out,
@@ -2042,56 +2291,25 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	const std::string manifestPath = dir + "manifest.txt";
 	const std::string nninfoPath = dir + "nninfo.csv";
 
-	// Read manifest
 	std::map<std::string, std::string> kv;
-	if (!read_kv_file(manifestPath, kv))
-		return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: manifest.txt not found or unreadable");
-	if (kv.find("__magic__") == kv.end() || kv["__magic__"] != "GLADES_CHECKPOINT")
-		return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: manifest magic mismatch");
-	int version = -1;
-	if (!parse_int(kv, "version", version) || version != kCheckpointFormatVersion)
-		return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsupported checkpoint format version");
-
-	// Validate explicit file encoding metadata early.
+	int savedNetType = TYPE_DFF;
 	{
-		std::map<std::string, std::string>::const_iterator itE = kv.find("file.endian");
-		if (itE == kv.end())
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing file.endian");
-		if (itE->second != "little")
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsupported file.endian (expected little)");
-
-		std::map<std::string, std::string>::const_iterator itEnc = kv.find("file.tensorEncoding");
-		if (itEnc == kv.end())
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing file.tensorEncoding");
-		if (itEnc->second != "raw_le")
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsupported file.tensorEncoding");
+		const NNetworkStatus stManifest = parse_checkpoint_manifest_header(manifestPath, kv, savedNetType);
+		if (!stManifest.ok())
+			return failStatus(stManifest.code, stManifest.message);
 	}
-
-	int savedNetType = -1;
-	parse_int(kv, "netType", savedNetType);
-	if (savedNetType < 0)
-		savedNetType = TYPE_DFF;
 	if (netTypeOverride >= 0)
 		netType = netTypeOverride;
 	else
 		netType = savedNetType;
 
 	// Restore metadata/config before allocating tensors.
-	int savedEpochs = 0;
-	if (parse_int(kv, "epochs", savedEpochs))
-		epochs = savedEpochs;
 	uint64_t savedSeed = 0u;
-	if (parse_u64(kv, "rngSeed", savedSeed))
-		setSeed(savedSeed);
+	bool hasSavedSeed = false;
 	bool includeOpt = true;
-	parse_bool01(kv, "includeOptimizerState", includeOpt);
-	{
-		glades::TrainingConfig cfgTmp = trainingConfig;
-		bool any = false;
-		apply_training_config_from_kv(kv, cfgTmp, any);
-		if (any)
-			trainingConfig = cfgTmp;
-	}
+	restore_checkpoint_runtime_metadata(kv, epochs, includeOpt, savedSeed, hasSavedSeed, trainingConfig);
+	if (hasSavedSeed)
+		setSeed(savedSeed);
 
 	// Optimizer-state completeness guard:
 	// If the run is configured for AdamW, the checkpoint must include optimizer state.
@@ -2890,243 +3108,40 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	if (shardCount == 0u && tensorCount != 0u)
 		return failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: shardCount is 0 but tensorCount is non-zero");
 
-	// Open shards
 	std::vector< shmea::GPointer<std::ifstream> > shardStreams;
-	shardStreams.resize(shardCount);
 	std::vector<uint64_t> shardBytes;
-	shardBytes.assign(shardCount, 0u);
 	std::vector<uint64_t> shardHashExpected;
-	shardHashExpected.assign(shardCount, 0u);
-	for (size_t s = 0; s < shardCount; ++s)
 	{
-		std::ostringstream kf; kf << "shard." << static_cast<unsigned long long>(s) << ".file";
-		std::ostringstream kb; kb << "shard." << static_cast<unsigned long long>(s) << ".bytes";
-		std::ostringstream kh; kh << "shard." << static_cast<unsigned long long>(s) << ".fnv1a64";
-		if (kv.find(kf.str()) == kv.end())
+		const NNetworkStatus stShards =
+		    open_checkpoint_shards(dir, kv, shardCount, shardStreams, shardBytes, shardHashExpected);
+		if (!stShards.ok())
 		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing shard file entry in manifest");
 			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		uint64_t bytesU = 0u;
-		if (!parse_u64(kv, kb.str(), bytesU))
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing shard bytes entry in manifest");
-			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		uint64_t hashU = 0u;
-		if (!parse_u64(kv, kh.str(), hashU))
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing shard checksum entry in manifest");
-			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		const std::string shardFile = kv[kf.str()];
-		if (!is_safe_shard_filename(shardFile))
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsafe shard filename in manifest");
-			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		// Validate file exists and is large enough.
-		{
-			struct stat st;
-			const std::string shardPath = dir + shardFile;
-			// Do not follow symlinks for checkpoint shards.
-			if (::lstat(shardPath.c_str(), &st) != 0 || S_ISLNK(st.st_mode) || !S_ISREG(st.st_mode))
-			{
-				const NNetworkStatus stt = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: shard file missing or not a regular file");
-				close_and_delete_shards(shardStreams);
-				return stt;
-			}
-			const uint64_t fileBytes = static_cast<uint64_t>(st.st_size);
-			if (fileBytes < bytesU)
-			{
-				const NNetworkStatus stt = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: shard file is smaller than manifest bytes");
-				close_and_delete_shards(shardStreams);
-				return stt;
-			}
-		}
-		shmea::GPointer<std::ifstream> in(new std::ifstream((dir + shardFile).c_str(), std::ios::in | std::ios::binary));
-		if (!in || !(*in.get()))
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: unable to open shard file");
-			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		shardStreams[s] = in;
-		shardBytes[s] = bytesU;
-		shardHashExpected[s] = hashU;
-
-		// Optional hostile-environment verification: validate whole-shard checksum.
-		// This is stronger than per-tensor checks, but can be expensive for huge checkpoints.
-		// Enable by setting `GLADES_CHECKPOINT_VERIFY_SHARDS=1`.
-		if (should_verify_shards())
-		{
-			uint64_t computed = 0u;
-			const std::string shardPath = dir + shardFile;
-			if (!fnv1a64_hash_file_prefix(shardPath, bytesU, computed) || computed != hashU)
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: shard checksum mismatch");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
+			return failStatus(stShards.code, stShards.message);
 		}
 	}
 
 	// Load each tensor entry into its destination vector.
 	for (size_t i = 0; i < tensorCount; ++i)
 	{
-		std::ostringstream kn; kn << "tensor." << static_cast<unsigned long long>(i) << ".name";
-		std::ostringstream kc; kc << "tensor." << static_cast<unsigned long long>(i) << ".count";
-		std::ostringstream ks; ks << "tensor." << static_cast<unsigned long long>(i) << ".shard";
-		std::ostringstream ko; ko << "tensor." << static_cast<unsigned long long>(i) << ".offsetBytes";
-		std::ostringstream kb; kb << "tensor." << static_cast<unsigned long long>(i) << ".bytes";
-		std::ostringstream kh; kh << "tensor." << static_cast<unsigned long long>(i) << ".fnv1a64";
-		// v2 tensor metadata keys:
-		std::ostringstream kd; kd << "tensor." << static_cast<unsigned long long>(i) << ".dtype";
-		std::ostringstream ke; ke << "tensor." << static_cast<unsigned long long>(i) << ".elemBytes";
-		std::ostringstream kr; kr << "tensor." << static_cast<unsigned long long>(i) << ".rank";
-		std::ostringstream ksh; ksh << "tensor." << static_cast<unsigned long long>(i) << ".shape";
-
-		if (kv.find(kn.str()) == kv.end())
+		ParsedCheckpointTensorEntry tensorEntry;
+		const NNetworkStatus stTensor =
+		    parse_checkpoint_tensor_manifest_entry(kv, i, shardCount, shardBytes, tensorEntry);
+		if (!stTensor.ok())
 		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing tensor name in manifest");
 			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		const std::string tname = kv[kn.str()];
-
-		uint64_t countU = 0u;
-		uint64_t shardU = 0u;
-		uint64_t offU = 0u;
-		uint64_t bytesU = 0u;
-		uint64_t hashU = 0u;
-		if (!parse_u64(kv, kc.str(), countU) || !parse_u64(kv, ks.str(), shardU) || !parse_u64(kv, ko.str(), offU) ||
-		    !parse_u64(kv, kb.str(), bytesU) || !parse_u64(kv, kh.str(), hashU))
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: malformed tensor entry in manifest");
-			close_and_delete_shards(shardStreams);
-			return st;
+			return failStatus(stTensor.code, stTensor.message);
 		}
 
-		// v2: parse and validate per-tensor metadata.
-		std::string dtypeU = "f32";
-		uint64_t elemBytesU = 4ull;
-		std::vector<uint64_t> shapeU64;
-		{
-			if (kv.find(kd.str()) == kv.end())
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing tensor dtype");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-			dtypeU = kv[kd.str()];
-			if (!parse_u64(kv, ke.str(), elemBytesU))
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: missing tensor elemBytes");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-			uint64_t rankU = 0u;
-			if (!parse_u64(kv, kr.str(), rankU) || rankU > 8u)
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: invalid tensor rank");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-			// Rank==0 is allowed only if count==0 (scalar empty). Otherwise reject.
-			if (rankU == 0u && countU != 0u)
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: invalid tensor rank (0 with non-zero count)");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-			if (rankU > 0u)
-			{
-				if (kv.find(ksh.str()) == kv.end() || !parse_u64_list_value(kv[ksh.str()], shapeU64) || shapeU64.size() != static_cast<size_t>(rankU))
-				{
-					const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: invalid tensor shape");
-					close_and_delete_shards(shardStreams);
-					return st;
-				}
-			}
-			else
-			{
-				shapeU64.clear();
-			}
-
-			if (dtypeU != "f32" || elemBytesU != 4ull)
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: unsupported tensor dtype/elemBytes (expected f32/4)");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-			uint64_t shapeCount = 0u;
-			if (countU == 0u)
-			{
-				// Empty tensor (e.g. unused optimizer state). Accept regardless of shape.
-				shapeCount = 0u;
-			}
-			else if (rankU == 0u)
-			{
-				shapeCount = 0u;
-			}
-			else if (!checked_shape_elem_count(shapeU64, shapeCount))
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: invalid tensor shape (overflow)");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-			if (shapeCount != countU)
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: tensor shape product != count (manifest corrupted)");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-		}
-		// Manifest sanity checks.
-		// Note: for now, only f32 is supported, so 4-byte alignment is required.
-		if ((offU % 4ull) != 0ull)
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: tensor offsetBytes is not 4-byte aligned");
-			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		const uint64_t wantBytes = (countU * elemBytesU);
-		if (bytesU != wantBytes)
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: tensor bytes != count*elemBytes (manifest corrupted)");
-			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		if (shardU >= static_cast<uint64_t>(shardCount))
-		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: tensor references out-of-range shard");
-			close_and_delete_shards(shardStreams);
-			return st;
-		}
-		// Ensure tensor window fits within shard bytes.
-		if (!shardBytes.empty() && static_cast<size_t>(shardU) < shardBytes.size())
-		{
-			const uint64_t sb = shardBytes[static_cast<size_t>(shardU)];
-			if (offU > sb || bytesU > sb || offU + bytesU > sb)
-			{
-				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: tensor range exceeds shard bytes (manifest corrupted)");
-				close_and_delete_shards(shardStreams);
-				return st;
-			}
-		}
-
-		std::map<std::string, std::vector<float>*>::iterator it = nameToVec.find(tname);
+		std::map<std::string, std::vector<float>*>::iterator it = nameToVec.find(tensorEntry.name);
 		if (it == nameToVec.end())
 		{
 			// ATLAS tensors in old checkpoints can be safely skipped if not expected.
-			if (tname.find(".atlas.") != std::string::npos)
+			if (tensorEntry.name.find(".atlas.") != std::string::npos)
 				continue;
 			// Unknown tensor in checkpoint; reject (strict).
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, std::string("loadCheckpoint: unexpected tensor in checkpoint: ") + tname);
+			const NNetworkStatus st =
+			    failStatus(NNetworkStatus::INVALID_STATE, std::string("loadCheckpoint: unexpected tensor in checkpoint: ") + tensorEntry.name);
 			close_and_delete_shards(shardStreams);
 			return st;
 		}
@@ -3138,12 +3153,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			return st;
 		}
 
-		const size_t wantCount = static_cast<size_t>(countU);
+		const size_t wantCount = static_cast<size_t>(tensorEntry.count);
 		// Strict shape compatibility: element count must match what we allocated.
 		if (dst->size() != wantCount)
 		{
 			std::ostringstream oss;
-			oss << "loadCheckpoint: tensor size mismatch for " << tname << " (checkpoint " << static_cast<unsigned long long>(wantCount)
+			oss << "loadCheckpoint: tensor size mismatch for " << tensorEntry.name << " (checkpoint " << static_cast<unsigned long long>(wantCount)
 			    << " vs model " << static_cast<unsigned long long>(dst->size()) << ")";
 			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, oss.str());
 			close_and_delete_shards(shardStreams);
@@ -3152,21 +3167,21 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 
 		// Shape/dtype must match the expected tensor spec (stronger than count-only).
 		{
-			std::map<std::string, std::string>::const_iterator itd = nameToDType.find(tname);
-			std::map<std::string, std::vector<uint64_t> >::const_iterator its = nameToShape.find(tname);
+			std::map<std::string, std::string>::const_iterator itd = nameToDType.find(tensorEntry.name);
+			std::map<std::string, std::vector<uint64_t> >::const_iterator its = nameToShape.find(tensorEntry.name);
 			if (itd == nameToDType.end() || its == nameToShape.end())
 			{
 				const NNetworkStatus st = failStatus(NNetworkStatus::INTERNAL_ERROR, "loadCheckpoint: internal error (missing expected tensor metadata)");
 				close_and_delete_shards(shardStreams);
 				return st;
 			}
-			if (dtypeU != itd->second)
+			if (tensorEntry.dtype != itd->second)
 			{
 				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: tensor dtype mismatch (checkpoint vs model)");
 				close_and_delete_shards(shardStreams);
 				return st;
 			}
-			if (shapeU64 != its->second)
+			if (tensorEntry.shape != its->second)
 			{
 				const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, "loadCheckpoint: tensor shape mismatch (checkpoint vs model)");
 				close_and_delete_shards(shardStreams);
@@ -3175,10 +3190,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		}
 
 		uint64_t computed = 0u;
-		if (!shardStreams[static_cast<size_t>(shardU)] ||
-		    !read_f32_blob_from_shard(*shardStreams[static_cast<size_t>(shardU)], offU, *dst, wantCount, hashU, computed))
+		if (!shardStreams[tensorEntry.shardIndex] ||
+		    !read_f32_blob_from_shard(*shardStreams[tensorEntry.shardIndex], tensorEntry.offsetBytes,
+		                              *dst, wantCount, tensorEntry.fnv1a64, computed))
 		{
-			const NNetworkStatus st = failStatus(NNetworkStatus::INVALID_STATE, std::string("loadCheckpoint: checksum/read failed for tensor ") + tname);
+			const NNetworkStatus st =
+			    failStatus(NNetworkStatus::INVALID_STATE, std::string("loadCheckpoint: checksum/read failed for tensor ") + tensorEntry.name);
 			close_and_delete_shards(shardStreams);
 			return st;
 		}

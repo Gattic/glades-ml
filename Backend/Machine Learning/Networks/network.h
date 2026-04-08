@@ -1212,6 +1212,15 @@ public:
 		{
 		}
 
+		bool hasType() const { return !type.empty(); }
+		bool hasVocab() const { return !vocab.empty(); }
+		size_t vocabSize() const { return vocab.size(); }
+		bool hasAnySpecialTokenId() const
+		{
+			return padTokenId >= 0 || bosTokenId >= 0 || eosTokenId >= 0 || unkTokenId >= 0;
+		}
+		static bool isSpecialTokenIdSet(int id) { return id >= 0; }
+
 		void reset() { *this = TokenizerArtifacts(); }
 	};
 
@@ -1395,6 +1404,7 @@ public:
 	// - Not safe to mutate while the network is running (same as trainingConfig/terminator).
 	bool hasTokenizerArtifacts() const { return tokenizerArtifactsPresent; }
 	const TokenizerArtifacts& getTokenizerArtifacts() const { return tokenizerArtifacts; }
+	static NNetworkStatus validateTokenizerArtifacts(const TokenizerArtifacts& a);
 	NNetworkStatus setTokenizerArtifacts(const TokenizerArtifacts& a);
 	void clearTokenizerArtifacts();
 

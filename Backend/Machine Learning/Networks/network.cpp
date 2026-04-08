@@ -1912,6 +1912,307 @@ static bool read_vec_f32_exact(std::istream& in, std::vector<float>& v, size_t e
 	}
 	return true;
 }
+
+struct TransformerTensorWeightsHeader
+{
+	unsigned int causal;
+	unsigned int nLayers;
+	unsigned int inputSize;
+	unsigned int dModel;
+	unsigned int dFF;
+	unsigned int nHeads;
+	unsigned int outSize;
+	unsigned int nKVHeads;
+	unsigned int ffnKind;
+	unsigned int tokenModel;
+	unsigned int vocabSize;
+	unsigned int padTokenId;
+	unsigned int tieEmbeddings;
+
+	TransformerTensorWeightsHeader()
+	    : causal(0u),
+	      nLayers(0u),
+	      inputSize(0u),
+	      dModel(0u),
+	      dFF(0u),
+	      nHeads(0u),
+	      outSize(0u),
+	      nKVHeads(0u),
+	      ffnKind(0u),
+	      tokenModel(0u),
+	      vocabSize(0u),
+	      padTokenId(0u),
+	      tieEmbeddings(0u)
+	{
+	}
+};
+
+struct TransformerWeightWriteField
+{
+	const char* name;
+	const std::vector<float>* values;
+
+	TransformerWeightWriteField(const char* fieldName, const std::vector<float>& fieldValues)
+	    : name(fieldName), values(&fieldValues)
+	{
+	}
+};
+
+struct TransformerWeightReadField
+{
+	const char* name;
+	std::vector<float>* values;
+	size_t expectedCount;
+
+	TransformerWeightReadField(const char* fieldName, std::vector<float>& fieldValues, size_t fieldExpectedCount)
+	    : name(fieldName), values(&fieldValues), expectedCount(fieldExpectedCount)
+	{
+	}
+};
+
+static void append_transformer_write_field(std::vector<TransformerWeightWriteField>& fields,
+                                           const char* name,
+                                           const std::vector<float>& values)
+{
+	fields.push_back(TransformerWeightWriteField(name, values));
+}
+
+static void append_transformer_read_field(std::vector<TransformerWeightReadField>& fields,
+                                          const char* name,
+                                          std::vector<float>& values,
+                                          size_t expectedCount)
+{
+	fields.push_back(TransformerWeightReadField(name, values, expectedCount));
+}
+
+static glades::NNetworkStatus write_transformer_weights_header(std::ostream& out,
+                                                               const TransformerTensorWeightsHeader& header)
+{
+	write_u32_le(out, header.causal);
+	write_u32_le(out, header.nLayers);
+	write_u32_le(out, header.inputSize);
+	write_u32_le(out, header.dModel);
+	write_u32_le(out, header.dFF);
+	write_u32_le(out, header.nHeads);
+	write_u32_le(out, header.outSize);
+	write_u32_le(out, header.nKVHeads);
+	write_u32_le(out, header.ffnKind);
+	write_u32_le(out, header.tokenModel);
+	write_u32_le(out, header.vocabSize);
+	write_u32_le(out, header.padTokenId);
+	write_u32_le(out, header.tieEmbeddings);
+	if (!out)
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: failed to write transformer header");
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus read_transformer_weights_header(std::istream& in,
+                                                              TransformerTensorWeightsHeader& header)
+{
+	if (!read_u32_le(in, header.causal))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.causal");
+	if (!read_u32_le(in, header.nLayers))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nLayers");
+	if (!read_u32_le(in, header.inputSize))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.inputSize");
+	if (!read_u32_le(in, header.dModel))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dModel");
+	if (!read_u32_le(in, header.dFF))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dFF");
+	if (!read_u32_le(in, header.nHeads))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nHeads");
+	if (!read_u32_le(in, header.outSize))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.outSize");
+	if (!read_u32_le(in, header.nKVHeads))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nKVHeads");
+	if (!read_u32_le(in, header.ffnKind))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.ffnKind");
+	if (!read_u32_le(in, header.tokenModel))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tokenModel");
+	if (!read_u32_le(in, header.vocabSize))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.vocabSize");
+	if (!read_u32_le(in, header.padTokenId))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.padTokenId");
+	if (!read_u32_le(in, header.tieEmbeddings))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tieEmbeddings");
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus write_transformer_weight_fields(std::ostream& out,
+                                                              const std::vector<TransformerWeightWriteField>& fields)
+{
+	for (size_t i = 0; i < fields.size(); ++i)
+	{
+		if (!write_vec_f32(out, *fields[i].values))
+		{
+			std::string msg("saveTensorWeightsToFile: write failed (Transformer ");
+			msg += fields[i].name;
+			msg += ")";
+			return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR, msg);
+		}
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus read_transformer_weight_fields(std::istream& in,
+                                                             const std::vector<TransformerWeightReadField>& fields)
+{
+	for (size_t i = 0; i < fields.size(); ++i)
+	{
+		if (!read_vec_f32_exact(in, *fields[i].values, fields[i].expectedCount))
+		{
+			std::string msg("loadTensorWeightsFromFile: failed to read Transformer ");
+			msg += fields[i].name;
+			msg += " (size mismatch/corrupt)";
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, msg);
+		}
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static void append_transformer_global_write_fields(std::vector<TransformerWeightWriteField>& fields,
+                                                   const std::vector<float>& WIn,
+                                                   const std::vector<float>& bIn,
+                                                   const std::vector<float>& WOut,
+                                                   const std::vector<float>& bOut,
+                                                   const std::vector<float>& tokE,
+                                                   const std::vector<float>& lmBias,
+                                                   const std::vector<float>& lnFinalGamma,
+                                                   const std::vector<float>& lnFinalBeta)
+{
+	fields.clear();
+	fields.reserve(8u);
+	append_transformer_write_field(fields, "WIn", WIn);
+	append_transformer_write_field(fields, "bIn", bIn);
+	append_transformer_write_field(fields, "WOut", WOut);
+	append_transformer_write_field(fields, "bOut", bOut);
+	append_transformer_write_field(fields, "tokE", tokE);
+	append_transformer_write_field(fields, "lmBias", lmBias);
+	append_transformer_write_field(fields, "lnFinalGamma", lnFinalGamma);
+	append_transformer_write_field(fields, "lnFinalBeta", lnFinalBeta);
+}
+
+static void append_transformer_global_read_fields(std::vector<TransformerWeightReadField>& fields,
+                                                  std::vector<float>& WIn,
+                                                  size_t WInCount,
+                                                  std::vector<float>& bIn,
+                                                  size_t bInCount,
+                                                  std::vector<float>& WOut,
+                                                  size_t WOutCount,
+                                                  std::vector<float>& bOut,
+                                                  size_t bOutCount,
+                                                  std::vector<float>& tokE,
+                                                  size_t tokECount,
+                                                  std::vector<float>& lmBias,
+                                                  size_t lmBiasCount,
+                                                  std::vector<float>& lnFinalGamma,
+                                                  size_t lnFinalGammaCount,
+                                                  std::vector<float>& lnFinalBeta,
+                                                  size_t lnFinalBetaCount)
+{
+	fields.clear();
+	fields.reserve(8u);
+	append_transformer_read_field(fields, "WIn", WIn, WInCount);
+	append_transformer_read_field(fields, "bIn", bIn, bInCount);
+	append_transformer_read_field(fields, "WOut", WOut, WOutCount);
+	append_transformer_read_field(fields, "bOut", bOut, bOutCount);
+	append_transformer_read_field(fields, "tokE", tokE, tokECount);
+	append_transformer_read_field(fields, "lmBias", lmBias, lmBiasCount);
+	append_transformer_read_field(fields, "lnFinalGamma", lnFinalGamma, lnFinalGammaCount);
+	append_transformer_read_field(fields, "lnFinalBeta", lnFinalBeta, lnFinalBetaCount);
+}
+
+static void append_transformer_block_write_fields(std::vector<TransformerWeightWriteField>& fields,
+                                                  const std::vector<float>& ln1Gamma,
+                                                  const std::vector<float>& ln1Beta,
+                                                  const std::vector<float>& Wq,
+                                                  const std::vector<float>& Wk,
+                                                  const std::vector<float>& Wv,
+                                                  const std::vector<float>& Wo,
+                                                  const std::vector<float>& bq,
+                                                  const std::vector<float>& bk,
+                                                  const std::vector<float>& bv,
+                                                  const std::vector<float>& bo,
+                                                  const std::vector<float>& ln2Gamma,
+                                                  const std::vector<float>& ln2Beta,
+                                                  const std::vector<float>& W1,
+                                                  const std::vector<float>& b1,
+                                                  const std::vector<float>& W2,
+                                                  const std::vector<float>& b2)
+{
+	fields.clear();
+	fields.reserve(16u);
+	append_transformer_write_field(fields, "ln1Gamma", ln1Gamma);
+	append_transformer_write_field(fields, "ln1Beta", ln1Beta);
+	append_transformer_write_field(fields, "Wq", Wq);
+	append_transformer_write_field(fields, "Wk", Wk);
+	append_transformer_write_field(fields, "Wv", Wv);
+	append_transformer_write_field(fields, "Wo", Wo);
+	append_transformer_write_field(fields, "bq", bq);
+	append_transformer_write_field(fields, "bk", bk);
+	append_transformer_write_field(fields, "bv", bv);
+	append_transformer_write_field(fields, "bo", bo);
+	append_transformer_write_field(fields, "ln2Gamma", ln2Gamma);
+	append_transformer_write_field(fields, "ln2Beta", ln2Beta);
+	append_transformer_write_field(fields, "W1", W1);
+	append_transformer_write_field(fields, "b1", b1);
+	append_transformer_write_field(fields, "W2", W2);
+	append_transformer_write_field(fields, "b2", b2);
+}
+
+static void append_transformer_block_read_fields(std::vector<TransformerWeightReadField>& fields,
+                                                 std::vector<float>& ln1Gamma,
+                                                 size_t ln1GammaCount,
+                                                 std::vector<float>& ln1Beta,
+                                                 size_t ln1BetaCount,
+                                                 std::vector<float>& Wq,
+                                                 size_t WqCount,
+                                                 std::vector<float>& Wk,
+                                                 size_t WkCount,
+                                                 std::vector<float>& Wv,
+                                                 size_t WvCount,
+                                                 std::vector<float>& Wo,
+                                                 size_t WoCount,
+                                                 std::vector<float>& bq,
+                                                 size_t bqCount,
+                                                 std::vector<float>& bk,
+                                                 size_t bkCount,
+                                                 std::vector<float>& bv,
+                                                 size_t bvCount,
+                                                 std::vector<float>& bo,
+                                                 size_t boCount,
+                                                 std::vector<float>& ln2Gamma,
+                                                 size_t ln2GammaCount,
+                                                 std::vector<float>& ln2Beta,
+                                                 size_t ln2BetaCount,
+                                                 std::vector<float>& W1,
+                                                 size_t W1Count,
+                                                 std::vector<float>& b1,
+                                                 size_t b1Count,
+                                                 std::vector<float>& W2,
+                                                 size_t W2Count,
+                                                 std::vector<float>& b2,
+                                                 size_t b2Count)
+{
+	fields.clear();
+	fields.reserve(16u);
+	append_transformer_read_field(fields, "ln1Gamma", ln1Gamma, ln1GammaCount);
+	append_transformer_read_field(fields, "ln1Beta", ln1Beta, ln1BetaCount);
+	append_transformer_read_field(fields, "Wq", Wq, WqCount);
+	append_transformer_read_field(fields, "Wk", Wk, WkCount);
+	append_transformer_read_field(fields, "Wv", Wv, WvCount);
+	append_transformer_read_field(fields, "Wo", Wo, WoCount);
+	append_transformer_read_field(fields, "bq", bq, bqCount);
+	append_transformer_read_field(fields, "bk", bk, bkCount);
+	append_transformer_read_field(fields, "bv", bv, bvCount);
+	append_transformer_read_field(fields, "bo", bo, boCount);
+	append_transformer_read_field(fields, "ln2Gamma", ln2Gamma, ln2GammaCount);
+	append_transformer_read_field(fields, "ln2Beta", ln2Beta, ln2BetaCount);
+	append_transformer_read_field(fields, "W1", W1, W1Count);
+	append_transformer_read_field(fields, "b1", b1, b1Count);
+	append_transformer_read_field(fields, "W2", W2, W2Count);
+	append_transformer_read_field(fields, "b2", b2, b2Count);
+}
 } // namespace
 
 glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::string& filePath) const
@@ -2057,52 +2358,50 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 	if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
 	{
 		const TensorTransformerState& tt = tensorTransformer;
-		write_u32_le(out, tt.causal ? 1u : 0u);
-		write_u32_le(out, static_cast<unsigned int>(tt.blocks.size()));
-		write_u32_le(out, tt.inputSize);
-		write_u32_le(out, tt.dModel);
-		write_u32_le(out, tt.dFF);
-		write_u32_le(out, tt.nHeads);
-		write_u32_le(out, tt.outSize);
-		// v2+ transformer extras
-		write_u32_le(out, tt.nKVHeads);
-		write_u32_le(out, tt.ffnKind);
-		// v3+ token LM extras
-		write_u32_le(out, tt.tokenModel ? 1u : 0u);
-		write_u32_le(out, tt.vocabSize);
-		write_u32_le(out, static_cast<unsigned int>(tt.padTokenId));
-		write_u32_le(out, tt.tieEmbeddings ? 1u : 0u);
+		TransformerTensorWeightsHeader header;
+		header.causal = tt.causal ? 1u : 0u;
+		header.nLayers = static_cast<unsigned int>(tt.blocks.size());
+		header.inputSize = tt.inputSize;
+		header.dModel = tt.dModel;
+		header.dFF = tt.dFF;
+		header.nHeads = tt.nHeads;
+		header.outSize = tt.outSize;
+		header.nKVHeads = tt.nKVHeads;
+		header.ffnKind = tt.ffnKind;
+		header.tokenModel = tt.tokenModel ? 1u : 0u;
+		header.vocabSize = tt.vocabSize;
+		header.padTokenId = static_cast<unsigned int>(tt.padTokenId);
+		header.tieEmbeddings = tt.tieEmbeddings ? 1u : 0u;
+		{
+			const NNetworkStatus stHeader = write_transformer_weights_header(out, header);
+			if (!stHeader.ok())
+				return stHeader;
+		}
 
-		if (!write_vec_f32(out, tt.WIn)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer WIn)");
-		if (!write_vec_f32(out, tt.bIn)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bIn)");
-		if (!write_vec_f32(out, tt.WOut)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer WOut)");
-		if (!write_vec_f32(out, tt.bOut)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bOut)");
-		// Token LM tensors (present only when tokenModel==true, but written in a fixed slot for v3+)
-		if (!write_vec_f32(out, tt.tokE)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer tokE)");
-		if (!write_vec_f32(out, tt.lmBias)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lmBias)");
-		// Final LayerNorm
-		if (!write_vec_f32(out, tt.lnFinalGamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lnFinalGamma)");
-		if (!write_vec_f32(out, tt.lnFinalBeta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lnFinalBeta)");
+		std::vector<TransformerWeightWriteField> fields;
+		append_transformer_global_write_fields(fields,
+		                                     tt.WIn, tt.bIn,
+		                                     tt.WOut, tt.bOut,
+		                                     tt.tokE, tt.lmBias,
+		                                     tt.lnFinalGamma, tt.lnFinalBeta);
+		{
+			const NNetworkStatus stGlobals = write_transformer_weight_fields(out, fields);
+			if (!stGlobals.ok())
+				return stGlobals;
+		}
 
 		for (size_t l = 0; l < tt.blocks.size(); ++l)
 		{
 			const TensorTransformerState::Block& b = tt.blocks[l];
-			if (!write_vec_f32(out, b.ln1Gamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln1Gamma)");
-			if (!write_vec_f32(out, b.ln1Beta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln1Beta)");
-			if (!write_vec_f32(out, b.Wq)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wq)");
-			if (!write_vec_f32(out, b.Wk)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wk)");
-			if (!write_vec_f32(out, b.Wv)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wv)");
-			if (!write_vec_f32(out, b.Wo)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wo)");
-			if (!write_vec_f32(out, b.bq)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bq)");
-			if (!write_vec_f32(out, b.bk)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bk)");
-			if (!write_vec_f32(out, b.bv)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bv)");
-			if (!write_vec_f32(out, b.bo)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bo)");
-			if (!write_vec_f32(out, b.ln2Gamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln2Gamma)");
-			if (!write_vec_f32(out, b.ln2Beta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln2Beta)");
-			if (!write_vec_f32(out, b.W1)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer W1)");
-			if (!write_vec_f32(out, b.b1)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer b1)");
-			if (!write_vec_f32(out, b.W2)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer W2)");
-			if (!write_vec_f32(out, b.b2)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer b2)");
+			append_transformer_block_write_fields(fields,
+			                                      b.ln1Gamma, b.ln1Beta,
+			                                      b.Wq, b.Wk, b.Wv, b.Wo,
+			                                      b.bq, b.bk, b.bv, b.bo,
+			                                      b.ln2Gamma, b.ln2Beta,
+			                                      b.W1, b.b1, b.W2, b.b2);
+			const NNetworkStatus stBlock = write_transformer_weight_fields(out, fields);
+			if (!stBlock.ok())
+				return stBlock;
 		}
 
 		out.flush();
@@ -2423,42 +2722,26 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 
 	if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
 	{
-		unsigned int causalIntU = 0u;
-		unsigned int nLayersU = 0u;
-		unsigned int inputSize = 0, dModel = 0, dFF = 0, nHeads = 0, outSize = 0;
-		unsigned int nKVHeads = 0u;
-		unsigned int ffnKind = 0u;
-		unsigned int tokenModelU = 0u;
-		unsigned int vocabSizeU = 0u;
-		unsigned int padTokenU = 0u;
-		unsigned int tieEmbU = 0u;
-		if (!read_u32_le(in, causalIntU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.causal");
-		if (!read_u32_le(in, nLayersU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nLayers");
-		if (!read_u32_le(in, inputSize))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.inputSize");
-		if (!read_u32_le(in, dModel))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dModel");
-		if (!read_u32_le(in, dFF))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dFF");
-		if (!read_u32_le(in, nHeads))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nHeads");
-		if (!read_u32_le(in, outSize))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.outSize");
-		// v3-only
-		if (!read_u32_le(in, nKVHeads))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nKVHeads");
-		if (!read_u32_le(in, ffnKind))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.ffnKind");
-		if (!read_u32_le(in, tokenModelU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tokenModel");
-		if (!read_u32_le(in, vocabSizeU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.vocabSize");
-		if (!read_u32_le(in, padTokenU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.padTokenId");
-		if (!read_u32_le(in, tieEmbU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tieEmbeddings");
+		TransformerTensorWeightsHeader header;
+		{
+			const NNetworkStatus stHeader = read_transformer_weights_header(in, header);
+			if (!stHeader.ok())
+				return failStatus(stHeader.code, stHeader.message);
+		}
+
+		const unsigned int causalIntU = header.causal;
+		const unsigned int nLayersU = header.nLayers;
+		const unsigned int inputSize = header.inputSize;
+		const unsigned int dModel = header.dModel;
+		const unsigned int dFF = header.dFF;
+		const unsigned int nHeads = header.nHeads;
+		const unsigned int outSize = header.outSize;
+		const unsigned int nKVHeads = header.nKVHeads;
+		const unsigned int ffnKind = header.ffnKind;
+		const unsigned int tokenModelU = header.tokenModel;
+		const unsigned int vocabSizeU = header.vocabSize;
+		const unsigned int padTokenU = header.padTokenId;
+		const unsigned int tieEmbU = header.tieEmbeddings;
 		const size_t nLayers = static_cast<size_t>(nLayersU);
 
 		tensorTransformer.reset();
@@ -2494,39 +2777,36 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		if (tensorTransformer.tokenModel && !tensorTransformer.tieEmbeddings)
 			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: tokenModel requires tieEmbeddings");
 
+		size_t WInCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(inputSize), WInCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WIn size overflow");
+		size_t WOutCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(outSize), static_cast<size_t>(dModel), WOutCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WOut size overflow");
+		size_t tokECount = 0u;
+		if (tensorTransformer.tokenModel &&
+		    !mul_size_checked(static_cast<size_t>(tensorTransformer.vocabSize), static_cast<size_t>(dModel), tokECount))
 		{
-			size_t want = 0u;
-			if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(inputSize), want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WIn size overflow");
-			if (!read_vec_f32_exact(in, tensorTransformer.WIn, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer WIn (size mismatch/corrupt)");
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer tokE size overflow");
 		}
-		if (!read_vec_f32_exact(in, tensorTransformer.bIn, static_cast<size_t>(dModel)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bIn (size mismatch/corrupt)");
+		const size_t dModelCount = static_cast<size_t>(dModel);
+		const size_t outSizeCount = static_cast<size_t>(outSize);
+		const size_t vocabCount = tensorTransformer.tokenModel ? static_cast<size_t>(tensorTransformer.vocabSize) : 0u;
+		std::vector<TransformerWeightReadField> fields;
+		append_transformer_global_read_fields(fields,
+		                                     tensorTransformer.WIn, WInCount,
+		                                     tensorTransformer.bIn, dModelCount,
+		                                     tensorTransformer.WOut, WOutCount,
+		                                     tensorTransformer.bOut, outSizeCount,
+		                                     tensorTransformer.tokE, tokECount,
+		                                     tensorTransformer.lmBias, vocabCount,
+		                                     tensorTransformer.lnFinalGamma, dModelCount,
+		                                     tensorTransformer.lnFinalBeta, dModelCount);
 		{
-			size_t want = 0u;
-			if (!mul_size_checked(static_cast<size_t>(outSize), static_cast<size_t>(dModel), want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WOut size overflow");
-			if (!read_vec_f32_exact(in, tensorTransformer.WOut, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer WOut (size mismatch/corrupt)");
+			const NNetworkStatus stGlobals = read_transformer_weight_fields(in, fields);
+			if (!stGlobals.ok())
+				return failStatus(stGlobals.code, stGlobals.message);
 		}
-		if (!read_vec_f32_exact(in, tensorTransformer.bOut, static_cast<size_t>(outSize)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bOut (size mismatch/corrupt)");
-		{
-			const size_t want = tensorTransformer.tokenModel ? (static_cast<size_t>(tensorTransformer.vocabSize) * static_cast<size_t>(dModel)) : 0u;
-			if (!read_vec_f32_exact(in, tensorTransformer.tokE, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer tokE (size mismatch/corrupt)");
-		}
-		{
-			const size_t want = tensorTransformer.tokenModel ? static_cast<size_t>(tensorTransformer.vocabSize) : 0u;
-			if (!read_vec_f32_exact(in, tensorTransformer.lmBias, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lmBias (size mismatch/corrupt)");
-		}
-		// Final LayerNorm
-		if (!read_vec_f32_exact(in, tensorTransformer.lnFinalGamma, static_cast<size_t>(dModel)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lnFinalGamma (size mismatch/corrupt)");
-		if (!read_vec_f32_exact(in, tensorTransformer.lnFinalBeta, static_cast<size_t>(dModel)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lnFinalBeta (size mismatch/corrupt)");
 
 		tensorTransformer.vWIn.assign(tensorTransformer.WIn.size(), 0.0f);
 		tensorTransformer.v2WIn.assign(tensorTransformer.WIn.size(), 0.0f);
@@ -2553,72 +2833,51 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		tensorTransformer.v2LnFinalBeta.assign(tensorTransformer.lnFinalBeta.size(), 0.0f);
 		tensorTransformer.gLnFinalBeta.assign(tensorTransformer.lnFinalBeta.size(), 0.0f);
 
+		size_t WqCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), WqCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wq size overflow");
+		size_t WkCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), WkCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wk size overflow");
+		size_t WvCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), WvCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wv size overflow");
+		size_t WoCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), WoCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wo size overflow");
+		size_t W1Count = 0u;
+		if (!mul_size_checked(static_cast<size_t>(ff1Width), static_cast<size_t>(dModel), W1Count))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W1 size overflow");
+		size_t W2Count = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dFF), W2Count))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W2 size overflow");
+		const size_t dModelKVCount = static_cast<size_t>(dModelKV);
+		const size_t ff1WidthCount = static_cast<size_t>(ff1Width);
+
 		tensorTransformer.blocks.resize(nLayers);
 		for (size_t l = 0; l < nLayers; ++l)
 		{
 			TensorTransformerState::Block& b = tensorTransformer.blocks[l];
-			if (!read_vec_f32_exact(in, b.ln1Gamma, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln1Gamma (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.ln1Beta, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln1Beta (size mismatch/corrupt)");
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wq size overflow");
-				if (!read_vec_f32_exact(in, b.Wq, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wq (size mismatch/corrupt)");
-			}
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wk size overflow");
-				if (!read_vec_f32_exact(in, b.Wk, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wk (size mismatch/corrupt)");
-			}
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wv size overflow");
-				if (!read_vec_f32_exact(in, b.Wv, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wv (size mismatch/corrupt)");
-			}
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wo size overflow");
-				if (!read_vec_f32_exact(in, b.Wo, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wo (size mismatch/corrupt)");
-			}
-			if (!read_vec_f32_exact(in, b.bq, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bq (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.bk, static_cast<size_t>(dModelKV)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bk (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.bv, static_cast<size_t>(dModelKV)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bv (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.bo, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bo (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.ln2Gamma, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln2Gamma (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.ln2Beta, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln2Beta (size mismatch/corrupt)");
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(ff1Width), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W1 size overflow");
-				if (!read_vec_f32_exact(in, b.W1, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer W1 (size mismatch/corrupt)");
-			}
-			if (!read_vec_f32_exact(in, b.b1, static_cast<size_t>(ff1Width)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer b1 (size mismatch/corrupt)");
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dFF), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W2 size overflow");
-				if (!read_vec_f32_exact(in, b.W2, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer W2 (size mismatch/corrupt)");
-			}
-			if (!read_vec_f32_exact(in, b.b2, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer b2 (size mismatch/corrupt)");
+			append_transformer_block_read_fields(fields,
+			                                     b.ln1Gamma, dModelCount,
+			                                     b.ln1Beta, dModelCount,
+			                                     b.Wq, WqCount,
+			                                     b.Wk, WkCount,
+			                                     b.Wv, WvCount,
+			                                     b.Wo, WoCount,
+			                                     b.bq, dModelCount,
+			                                     b.bk, dModelKVCount,
+			                                     b.bv, dModelKVCount,
+			                                     b.bo, dModelCount,
+			                                     b.ln2Gamma, dModelCount,
+			                                     b.ln2Beta, dModelCount,
+			                                     b.W1, W1Count,
+			                                     b.b1, ff1WidthCount,
+			                                     b.W2, W2Count,
+			                                     b.b2, dModelCount);
+			const NNetworkStatus stBlock = read_transformer_weight_fields(in, fields);
+			if (!stBlock.ok())
+				return failStatus(stBlock.code, stBlock.message);
 
 			b.mLn1Gamma.assign(b.ln1Gamma.size(), 0.0f);
 			b.v2Ln1Gamma.assign(b.ln1Gamma.size(), 0.0f);
