@@ -54,26 +54,133 @@ static double compute_active_trace(const WeightState& state, unsigned int active
 	return activeTrace;
 }
 
+static unsigned int atlas_complement_sector_rank(unsigned int enabledRank,
+                                                 unsigned int subDim,
+                                                 unsigned int activeRank)
+{
+	if (enabledRank == 0u)
+		return 0u;
+	if (subDim <= activeRank + 1u)
+		return 0u;
+	return 1u;
+}
+
+static void project_out_active_basis(float* v,
+                                     const std::vector<float>& U,
+                                     unsigned int fullRank,
+                                     unsigned int activeRank,
+                                     unsigned int m)
+{
+	for (unsigned int c = 0; c < activeRank; ++c)
+	{
+		double dot = 0.0;
+		for (unsigned int i = 0; i < m; ++i)
+			dot += static_cast<double>(v[i]) * static_cast<double>(U[static_cast<size_t>(i) * fullRank + c]);
+		const float dotf = static_cast<float>(dot);
+		for (unsigned int i = 0; i < m; ++i)
+			v[i] -= dotf * U[static_cast<size_t>(i) * fullRank + c];
+	}
+}
+
+static double vector_norm_sq(const float* v, unsigned int m)
+{
+	double normSq = 0.0;
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		const double x = static_cast<double>(v[i]);
+		normSq += x * x;
+	}
+	return normSq;
+}
+
+static bool normalize_vector(float* v, unsigned int m)
+{
+	const double normSq = vector_norm_sq(v, m);
+	if (normSq <= 1e-12)
+		return false;
+	const float invNorm = static_cast<float>(1.0 / sqrt(normSq));
+	for (unsigned int i = 0; i < m; ++i)
+		v[i] *= invNorm;
+	return true;
+}
+
+static bool build_coordinate_complement_seed(float* v,
+                                             const std::vector<float>& U,
+                                             unsigned int fullRank,
+                                             unsigned int activeRank,
+                                             unsigned int m)
+{
+	if (m == 0u)
+		return false;
+	for (unsigned int basisRow = 0; basisRow < m; ++basisRow)
+	{
+		for (unsigned int i = 0; i < m; ++i)
+			v[i] = 0.0f;
+		v[basisRow] = 1.0f;
+		project_out_active_basis(v, U, fullRank, activeRank, m);
+		if (normalize_vector(v, m))
+			return true;
+	}
+	return false;
+}
+
+static void ensure_complement_basis(WeightState& state,
+                                    unsigned int activeRank,
+                                    glades::rng::Engine& rng,
+                                    shmea::GLogger* logger)
+{
+	if (state.V.size() != state.m)
+		state.V.assign(static_cast<size_t>(state.m), 0.0f);
+
+	for (unsigned int i = 0; i < state.m; ++i)
+		state.V[i] = glades::rng::standard_normal(rng);
+	project_out_active_basis(&state.V[0], state.U, state.r, activeRank, state.m);
+	if (!normalize_vector(&state.V[0], state.m))
+	{
+		if (!build_coordinate_complement_seed(&state.V[0], state.U, state.r, activeRank, state.m))
+		{
+			std::fill(state.V.begin(), state.V.end(), 0.0f);
+			if (logger)
+			{
+				std::ostringstream oss;
+				oss << "event=atlas_complement_seed_failure";
+				append_kv(oss, "m", state.m);
+				append_kv(oss, "rank", state.r);
+				append_kv(oss, "active_rank", activeRank);
+				logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
+			}
+		}
+	}
+}
+
 static float compute_complement_sigma2(const WeightState& state,
                                        unsigned int activeRank,
+                                       unsigned int sectorRank,
                                        unsigned int subDim,
                                        float eps,
                                        double* activeTraceOut = 0,
+                                       double* sectorTraceOut = 0,
                                        double* closureGapOut = 0)
 {
 	const double activeTrace = compute_active_trace(state, activeRank);
-	const double closureGap = static_cast<double>(state.totalTrace) - activeTrace;
+	const double sectorTrace = (sectorRank > 0u)
+	    ? static_cast<double>(state.complementFisher)
+	    : 0.0;
+	const double modeledTrace = activeTrace + sectorTrace;
+	const double closureGap = static_cast<double>(state.totalTrace) - modeledTrace;
 	const double closedTrace = (closureGap >= 0.0)
 	    ? static_cast<double>(state.totalTrace)
-	    : activeTrace;
-	const unsigned int complementDim = (subDim > activeRank) ? (subDim - activeRank) : 0u;
+	    : modeledTrace;
+	const unsigned int complementDim =
+	    (subDim > activeRank + sectorRank) ? (subDim - activeRank - sectorRank) : 0u;
 	double sigma2 = 0.0;
 	if (complementDim > 0u)
-		sigma2 = (closedTrace - activeTrace) / static_cast<double>(complementDim);
-	else if (activeRank > 0u)
-		sigma2 = closedTrace / static_cast<double>(activeRank);
+		sigma2 = (closedTrace - modeledTrace) / static_cast<double>(complementDim);
+	else if (activeRank + sectorRank > 0u)
+		sigma2 = closedTrace / static_cast<double>(activeRank + sectorRank);
 
 	if (activeTraceOut) *activeTraceOut = activeTrace;
+	if (sectorTraceOut) *sectorTraceOut = sectorTrace;
 	if (closureGapOut) *closureGapOut = closureGap;
 	if (!std::isfinite(sigma2) || sigma2 < static_cast<double>(eps))
 		sigma2 = static_cast<double>(eps);
@@ -533,15 +640,22 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 	// Initialize Fisher statistics to zero; the first real gradient bootstraps
 	// them to data-dependent values before they are used for preconditioning.
 	state.fisherDiag.assign(static_cast<size_t>(r), 0.0f);
+	state.complementFisher = 0.0f;
 
-	// Initialize previous compressed gradient to zero
+	// Initialize previous compressed gradients to zero
 	state.prevGz.assign(static_cast<size_t>(r) * static_cast<size_t>(n), 0.0f);
+	state.prevGv.assign(static_cast<size_t>(n), 0.0f);
+	state.V.assign(static_cast<size_t>(m), 0.0f);
+	if (atlas_complement_sector_rank(1u, m, state.activeRank) > 0u)
+		ensure_complement_basis(state, state.activeRank, rng, logger);
 
 	// Allocate persistent scratch buffers (reused every step, avoids per-step heap churn).
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
 	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
 	state.scratch_gz.resize(rn);
 	state.scratch_corrected.resize(rn);
+	state.scratch_gv.resize(static_cast<size_t>(n));
+	state.scratch_correctedV.resize(static_cast<size_t>(n));
 	state.scratch_U_old.resize(mr);
 	state.scratch_f_old.resize(static_cast<size_t>(r));
 	state.scratch_B.resize(rn);
@@ -549,6 +663,9 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 	state.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
 	state.scratch_prevGzOld.resize(rn);
 	state.scratch_basisPacked.resize(mr);
+	state.scratch_V_old.resize(static_cast<size_t>(m));
+	state.scratch_Bv.resize(static_cast<size_t>(n));
+	state.scratch_Zv.resize(static_cast<size_t>(m));
 
 	state.totalTrace = 0.0f;
 	state.sigma2 = 0.0f;
@@ -568,14 +685,19 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 		append_kv(oss, "active_rank", state.activeRank);
 		append_kv(oss, "mu_init", muInit);
 		append_kv(oss, "U_size", static_cast<unsigned long long>(state.U.size()));
+		append_kv(oss, "V_size", static_cast<unsigned long long>(state.V.size()));
 		append_kv(oss, "prevGz_size", static_cast<unsigned long long>(state.prevGz.size()));
+		append_kv(oss, "prevGv_size", static_cast<unsigned long long>(state.prevGv.size()));
 		const unsigned long long totalBytes =
 		    static_cast<unsigned long long>(state.U.size() + state.fisherDiag.size()
-		        + state.prevGz.size()
+		        + state.V.size() + state.prevGz.size() + state.prevGv.size()
 		        + state.scratch_gz.size() + state.scratch_corrected.size()
+		        + state.scratch_gv.size() + state.scratch_correctedV.size()
 		        + state.scratch_U_old.size() + state.scratch_f_old.size()
 		        + state.scratch_B.size() + state.scratch_Z.size()
 		        + state.scratch_overlap.size() + state.scratch_prevGzOld.size()
+		        + state.scratch_V_old.size() + state.scratch_Bv.size()
+		        + state.scratch_Zv.size()
 		        + state.scratch_basisPacked.size())
 		    * static_cast<unsigned long long>(sizeof(float));
 		append_kv(oss, "total_bytes", totalBytes);
@@ -760,6 +882,89 @@ bool refreshSubspace(WeightState& state, const float* grad,
 	return refreshOk;
 }
 
+static bool refreshComplementSector(WeightState& state,
+                                    const float* grad,
+                                    unsigned int m,
+                                    unsigned int n,
+                                    unsigned int activeRank,
+                                    unsigned int powerIters,
+                                    float betaRefresh,
+                                    glades::rng::Engine& rng,
+                                    shmea::GLogger* logger)
+{
+	if (atlas_complement_sector_rank(1u, m, activeRank) == 0u)
+	{
+		state.complementFisher = 0.0f;
+		std::fill(state.prevGv.begin(), state.prevGv.end(), 0.0f);
+		return true;
+	}
+
+	if (state.V.size() != m || vector_norm_sq(&state.V[0], m) <= 1e-12)
+		ensure_complement_basis(state, activeRank, rng, logger);
+
+	std::copy(state.V.begin(), state.V.end(), state.scratch_V_old.begin());
+	std::vector<float>& V_old = state.scratch_V_old;
+	std::vector<float>& q = state.V;
+	project_out_active_basis(&q[0], state.U, state.r, activeRank, m);
+	if (!normalize_vector(&q[0], m))
+	{
+		std::copy(V_old.begin(), V_old.end(), q.begin());
+		project_out_active_basis(&q[0], state.U, state.r, activeRank, m);
+		if (!normalize_vector(&q[0], m)
+		    && !build_coordinate_complement_seed(&q[0], state.U, state.r, activeRank, m))
+			return false;
+	}
+
+	std::vector<float>& Bv = state.scratch_Bv;
+	std::vector<float>& Zv = state.scratch_Zv;
+	for (unsigned int p = 0; p < powerIters; ++p)
+	{
+		glades::gemm::atb(&Bv[0], &q[0], grad, 1u, m, n, 1.0f);
+		glades::gemm::abt(&Zv[0], grad, &Bv[0], m, n, 1u, 1.0f);
+		project_out_active_basis(&Zv[0], state.U, state.r, activeRank, m);
+		if (!normalize_vector(&Zv[0], m))
+			break;
+		std::copy(Zv.begin(), Zv.end(), q.begin());
+	}
+
+	for (unsigned int i = 0; i < m; ++i)
+		q[i] = (1.0f - betaRefresh) * V_old[i] + betaRefresh * q[i];
+	project_out_active_basis(&q[0], state.U, state.r, activeRank, m);
+	if (!normalize_vector(&q[0], m))
+	{
+		std::copy(V_old.begin(), V_old.end(), q.begin());
+		project_out_active_basis(&q[0], state.U, state.r, activeRank, m);
+		if (!normalize_vector(&q[0], m)
+		    && !build_coordinate_complement_seed(&q[0], state.U, state.r, activeRank, m))
+			return false;
+	}
+
+	double overlap = 0.0;
+	for (unsigned int i = 0; i < m; ++i)
+		overlap += static_cast<double>(q[i]) * static_cast<double>(V_old[i]);
+	const float overlapf = static_cast<float>(overlap);
+	state.complementFisher *= overlapf * overlapf;
+	for (unsigned int j = 0; j < n; ++j)
+		state.prevGv[j] *= overlapf;
+
+	if (logger)
+	{
+		std::ostringstream oss;
+		oss << "event=atlas_complement_refresh";
+		append_kv(oss, "step", state.step);
+		append_kv(oss, "m", m);
+		append_kv(oss, "n", n);
+		append_kv(oss, "active_rank", activeRank);
+		append_kv(oss, "power_iters", powerIters);
+		append_kv(oss, "beta_refresh", betaRefresh);
+		append_kv(oss, "overlap", overlapf);
+		append_kv(oss, "sector_fisher", state.complementFisher);
+		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
+	return true;
+}
+
 bool applyStep(WeightState& state,
                float* W, float* gW,
                unsigned int m, unsigned int n,
@@ -786,6 +991,8 @@ bool applyStep(WeightState& state,
 	state.step += 1ULL;
 	state.activeRank = atlas_clamp_active_rank(state.activeRank, r, ac.minActiveRank);
 	unsigned int activeRank = state.activeRank;
+	const unsigned int sectorRank =
+	    atlas_complement_sector_rank(ac.complementRank, m, activeRank);
 	size_t rn = static_cast<size_t>(activeRank) * static_cast<size_t>(n);
 
 	const bool diagStep = logger && tSub > 0u
@@ -840,6 +1047,10 @@ bool applyStep(WeightState& state,
 		if (!refreshSubspace(state, gW, m, n, ac.powerIters, ac.betaRefresh,
 		                     ac.fisherWeightedRefresh, rng, logger))
 			recovered = true;
+		if (sectorRank > 0u
+		    && !refreshComplementSector(state, gW, m, n, activeRank,
+		                                ac.powerIters, ac.betaRefresh, rng, logger))
+			recovered = true;
 	}
 
 	// === Step 3: Decoupled weight decay (applied in full parameter space) ===
@@ -865,6 +1076,12 @@ bool applyStep(WeightState& state,
 	pack_active_basis(state.U, state.r, m, activeRank, basisPacked);
 	glades::gemm::atb(&gz[0], &basisPacked[0], gW, activeRank, m, n, gScale);
 
+	std::vector<float>& gv = state.scratch_gv;
+	if (sectorRank > 0u)
+		glades::gemm::atb(&gv[0], &state.V[0], gW, 1u, m, n, gScale);
+	else if (!gv.empty())
+		std::fill(gv.begin(), gv.end(), 0.0f);
+
 	// === Step 5: Update Fisher diagonal (EMA of mean squared projected gradient) ===
 	for (unsigned int c = 0; c < activeRank; ++c)
 	{
@@ -885,9 +1102,32 @@ bool applyStep(WeightState& state,
 			recovered = true;
 		}
 	}
+	if (sectorRank > 0u)
+	{
+		double sumsq = 0.0;
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			const double v = static_cast<double>(gv[j]);
+			sumsq += v * v;
+		}
+		const float meansq = static_cast<float>(sumsq / static_cast<double>(n)) * statScaleSq;
+		state.complementFisher = atlas_bootstrap_or_ema(state.complementFisher,
+		                                                meansq,
+		                                                beta,
+		                                                state.step);
+		if (!atlas_isfinite(state.complementFisher))
+		{
+			state.complementFisher = eps;
+			recovered = true;
+		}
+	}
+	else
+	{
+		state.complementFisher = 0.0f;
+	}
 
 	// === Step 6: Recompute sigma2 from the shared covariance model ===
-	state.sigma2 = compute_complement_sigma2(state, activeRank, m, eps);
+	state.sigma2 = compute_complement_sigma2(state, activeRank, sectorRank, m, eps);
 	if (!atlas_isfinite(state.sigma2))
 	{
 		state.sigma2 = eps;
@@ -942,6 +1182,18 @@ bool applyStep(WeightState& state,
 	// W[m,n] += U[m,r] * corrected[r,n]
 	glades::gemm::ab_accum(W, &basisPacked[0], &corrected[0], m, activeRank, n, 1.0f);
 
+	if (sectorRank > 0u)
+	{
+		std::vector<float>& correctedV = state.scratch_correctedV;
+		const float effComplementFisher = state.complementFisher * bcFactor;
+		float sectorLR = lr / (effComplementFisher + eps);
+		if (sectorLR > kappaLr) sectorLR = kappaLr;
+		const float sectorCorrScale = baselineRate - sectorLR;
+		for (unsigned int j = 0; j < n; ++j)
+			correctedV[j] = sectorCorrScale * gv[j];
+		glades::gemm::ab_accum(W, &state.V[0], &correctedV[0], m, 1u, n, 1.0f);
+	}
+
 	// Guard against NaN/Inf propagation from corrupted U or corrected buffers.
 	for (size_t idx = 0; idx < mn; ++idx)
 	{
@@ -967,6 +1219,12 @@ bool applyStep(WeightState& state,
 	{
 		for (size_t idx = 0; idx < rn; ++idx)
 			updateNormSq += static_cast<double>(corrected[idx]) * static_cast<double>(corrected[idx]);
+		if (sectorRank > 0u)
+		{
+			const std::vector<float>& correctedV = state.scratch_correctedV;
+			for (unsigned int j = 0; j < n; ++j)
+				updateNormSq += static_cast<double>(correctedV[j]) * static_cast<double>(correctedV[j]);
+		}
 	}
 
 	// === Step 9: Adapt prediction coefficient ===
@@ -1031,7 +1289,7 @@ bool applyStep(WeightState& state,
 			state.activeRank = targetRank;
 		activeRank = state.activeRank;
 		rn = static_cast<size_t>(activeRank) * static_cast<size_t>(n);
-		state.sigma2 = compute_complement_sigma2(state, activeRank, m, eps);
+		state.sigma2 = compute_complement_sigma2(state, activeRank, sectorRank, m, eps);
 	}
 
 	// === Periodic diagnostics ===
@@ -1064,14 +1322,22 @@ bool applyStep(WeightState& state,
 		const float top10Concentration = compute_topk_concentration(state, activeRank, 10u);
 		const float fisherRatio = (fMin > 1e-12f) ? (fMax / fMin) : 0.0f;
 		double activeTrace = 0.0;
+		double sectorTrace = 0.0;
 		double closureGap = 0.0;
 		const float sigma2Closed =
-		    compute_complement_sigma2(state, activeRank, m, eps, &activeTrace, &closureGap);
+		    compute_complement_sigma2(state, activeRank, sectorRank, m, eps,
+		                              &activeTrace, &sectorTrace, &closureGap);
 		const float sigma2FisherRatio = (fSum > 1e-30)
 		    ? static_cast<float>(sigma2Closed / (fSum / static_cast<double>(activeRank)))
 		    : 0.0f;
-		const float traceCapture = (state.totalTrace > 1e-30f)
+		const float activeTraceCapture = (state.totalTrace > 1e-30f)
 		    ? static_cast<float>(activeTrace / static_cast<double>(state.totalTrace))
+		    : 0.0f;
+		const float traceCapture = (state.totalTrace > 1e-30f)
+		    ? static_cast<float>((activeTrace + sectorTrace) / static_cast<double>(state.totalTrace))
+		    : 0.0f;
+		const float sectorTraceCapture = (state.totalTrace > 1e-30f)
+		    ? static_cast<float>(sectorTrace / static_cast<double>(state.totalTrace))
 		    : 0.0f;
 
 		std::ostringstream oss;
@@ -1094,7 +1360,10 @@ bool applyStep(WeightState& state,
 		append_kv(oss, "fisher_mean", static_cast<float>(fSum / static_cast<double>(activeRank)));
 		append_kv(oss, "fisher_ratio", fisherRatio);
 		append_kv(oss, "sigma2_fisher_ratio", sigma2FisherRatio);
+		append_kv(oss, "active_trace_capture", activeTraceCapture);
 		append_kv(oss, "trace_capture", traceCapture);
+		append_kv(oss, "sector_trace_capture", sectorTraceCapture);
+		append_kv(oss, "sector_fisher", state.complementFisher);
 		append_kv(oss, "closure_gap", static_cast<float>(closureGap));
 		append_kv(oss, "effective_rank", effectiveRank);
 		append_kv(oss, "spectral_efficiency", spectralEfficiency);
@@ -1108,6 +1377,10 @@ bool applyStep(WeightState& state,
 		std::copy(gz.begin(), gz.begin() + rn, state.prevGz.begin());
 	if (state.prevGz.size() > rn)
 		std::fill(state.prevGz.begin() + rn, state.prevGz.end(), 0.0f);
+	if (sectorRank > 0u)
+		std::copy(gv.begin(), gv.begin() + n, state.prevGv.begin());
+	else if (!state.prevGv.empty())
+		std::fill(state.prevGv.begin(), state.prevGv.end(), 0.0f);
 
 	// === Step 11: Clear accumulated gradients ===
 	std::memset(gW, 0, mn * sizeof(float));

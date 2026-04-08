@@ -404,6 +404,11 @@ struct ATLASConfig
 	// Larger rank captures more curvature information at higher compute/memory cost.
 	unsigned int rank;
 
+	// Residual complement-sector rank. The current prototype supports 0 (disable)
+	// or 1 (track one anisotropic complement direction plus an isotropic tail).
+	// This only applies when the complement has at least two remaining directions.
+	unsigned int complementRank;
+
 	// Fisher EMA decay rate. Controls how quickly the Fisher diagonal and
 	// normalized covariance trace adapt. Higher values (closer to 1) give more
 	// stable estimates.
@@ -474,6 +479,7 @@ struct ATLASConfig
 
 	ATLASConfig()
 	    : rank(128u),
+	      complementRank(0u),
 	      beta(0.999f),
 	      muMin(0.01f),
 	      muMax(0.3f),

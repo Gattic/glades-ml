@@ -33,16 +33,19 @@ The implemented redesign therefore makes three concrete changes:
 - **Packed active-basis execution.** The optimizer can operate on a reduced active prefix without reallocating or reprojecting the entire stored basis every step.
 - **Conservative adaptive-rank policy.** Adaptive rank remains available, but it now shrinks only at refresh boundaries, repairs the inactive basis to keep `U` orthonormal, and is disabled by default until broader benchmarks justify turning it on globally.
 - **Projection-consistent covariance closure.** `sigma2` is no longer estimated on a separate accumulated-gradient scale; the optimizer now tracks the normalized covariance trace `tr((1/n) H H^T)` on the same update scale as the subspace Fisher statistics and derives the complement scalar by trace closure.
+- **Residual complement-sector prototype.** ATLAS can now track one anisotropic complement direction through `complementRank=1`, with its own Fisher EMA and an isotropic tail on the remaining complement.
 
 Observed outcomes on April 8, 2026:
 - `./glades-unit-tests atlas` passes with the redesign enabled.
 - The aggressive adaptive-rank setting improved throughput slightly but hurt MNIST test accuracy; it is therefore no longer the default.
-- The default ATLAS path with Fisher-weighted refresh and the new diagnostics reached `train=7.96s`, `testAcc=98.64%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1`.
+- The trace-closed baseline path with `complementRank=0` reached `train=8.06s`, `testAcc=98.14%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 0`.
+- The one-sector residual closure with `complementRank=1` reached `train=8.00s`, `testAcc=97.72%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 1`.
 
 Interpretation:
 - The data supports **stability-first subspace tracking** and **opt-in adaptive compression**, not unconditional online rank collapse.
-- The next likely source of additional out-of-sample gains is improving the complement closure beyond isotropy; the scale-consistency issue between `sigma2` and the subspace Fisher statistics is now addressed in the implementation by sharing one normalized covariance model.
-- The current trace-closed implementation fixed the diagnostic mismatch but did **not** improve the standard MNIST benchmark yet; on April 8, 2026 it ran at `98.20%` test accuracy, indicating the optimizer still needs post-fix retuning or a richer complement model.
+- The scale-consistency issue between `sigma2` and the subspace Fisher statistics is addressed in the implementation by sharing one normalized covariance model.
+- A single residual complement sector improves the geometric model but does **not** improve standard MNIST generalization yet; on April 8, 2026 the one-sector run was slightly faster but materially less accurate than the `complementRank=0` baseline.
+- The next likely source of gains is not merely "any richer closure", but a better residual policy: sector birth/death, denser residual blocks, or retuned `lr`/`kappaMax` for complement-sector updates.
 
 ---
 

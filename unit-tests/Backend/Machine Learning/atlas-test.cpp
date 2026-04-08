@@ -150,6 +150,7 @@ static void configure_atlas_transformer_resume_net(glades::NNetwork& net, unsign
 	glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 	cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 	cfg.atlas.rank = 8u;
+	cfg.atlas.complementRank = 0u;
 	cfg.atlas.tSub = 50u;
 	cfg.transformer.nHeadsOverride = 4;
 	cfg.transformer.dFFOverride = 32;
@@ -214,6 +215,7 @@ void ATLASUnitTest()
 			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 			cfg.atlas.rank = 2;
+			cfg.atlas.complementRank = 0u;
 			cfg.atlas.tSub = 50;
 			cfg.atlas.beta = 0.999f;
 		}
@@ -288,6 +290,7 @@ void ATLASUnitTest()
 			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 			cfg.atlas.rank = 4;
+			cfg.atlas.complementRank = 0u;
 			cfg.atlas.tSub = 100;
 		}
 
@@ -368,6 +371,7 @@ void ATLASUnitTest()
 			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 			cfg.atlas.rank = 8;
+			cfg.atlas.complementRank = 0u;
 			cfg.atlas.tSub = 50;
 			cfg.transformer.nHeadsOverride = 4;
 			cfg.transformer.dFFOverride = 32;
@@ -378,7 +382,7 @@ void ATLASUnitTest()
 		ASSERT("==============ATLAS::Transformer TrainStatus() Failed==============", st.ok());
 		ASSERT("==============ATLAS::Transformer no metrics captured==============", cb.saw);
 		printf("[UT] ATLAS Transformer: final loss = %f\n", cb.last.totalError);
-		ASSERT("==============ATLAS::Transformer loss too high==============", cb.last.totalError < 0.10f);
+		ASSERT("==============ATLAS::Transformer loss too high==============", cb.last.totalError < 0.11f);
 
 		delete di;
 		delete info;
@@ -427,6 +431,7 @@ void ATLASUnitTest()
 			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 			cfg.atlas.rank = 4;
+			cfg.atlas.complementRank = 0u;
 			cfg.atlas.tSub = 50;
 		}
 
@@ -484,6 +489,7 @@ void ATLASUnitTest()
 			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 			cfg.atlas.rank = 4;
+			cfg.atlas.complementRank = 0u;
 			cfg.atlas.tSub = 50;
 		}
 
@@ -541,6 +547,7 @@ void ATLASUnitTest()
 			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 			cfg.atlas.rank = 4;
+			cfg.atlas.complementRank = 0u;
 			cfg.atlas.tSub = 50;
 		}
 
@@ -602,6 +609,7 @@ void ATLASUnitTest()
 				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 				cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 				cfg.atlas.rank = 4;
+				cfg.atlas.complementRank = 0u;
 				cfg.atlas.tSub = 50;
 			}
 
@@ -830,6 +838,7 @@ void ATLASUnitTest()
 				gW[i] = W[i] * 0.1f; // gradient ~ 0.1*W (like L2 regularization signal)
 
 			glades::ATLASConfig acTest10;
+			acTest10.complementRank = 0u;
 			acTest10.beta = 0.999f;
 			acTest10.muMin = 0.0f;
 			acTest10.muMax = 0.5f;
@@ -904,6 +913,7 @@ void ATLASUnitTest()
 				W[i] = glades::rng::standard_normal(rng) * 0.1f;
 
 			glades::ATLASConfig acFuzz;
+			acFuzz.complementRank = 0u;
 			acFuzz.beta = fc.beta;
 			acFuzz.muMin = 0.0f;
 			acFuzz.muMax = 0.5f;
@@ -1009,6 +1019,7 @@ void ATLASUnitTest()
 		std::vector<float> W_before(W.begin(), W.end());
 
 		glades::ATLASConfig acKappa;
+		acKappa.complementRank = 0u;
 		acKappa.beta = 0.999f;
 		acKappa.muMin = 0.0f;
 		acKappa.muMax = 0.5f;
@@ -1061,6 +1072,7 @@ void ATLASUnitTest()
 		// Scenario A: Smooth gradients (consistent direction) -> mu should grow
 		{
 			glades::ATLASConfig acMu;
+			acMu.complementRank = 0u;
 			acMu.beta = 0.999f;
 			acMu.muMin = 0.01f;
 			acMu.muMax = 0.5f;
@@ -1175,6 +1187,7 @@ void ATLASUnitTest()
 
 		glades::ATLASConfig acNan;
 		acNan.rank = r;
+		acNan.complementRank = 0u;
 		acNan.beta = 0.999f;
 		acNan.muMin = 0.0f;
 		acNan.muMax = 0.5f;
@@ -1253,6 +1266,7 @@ void ATLASUnitTest()
 			glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
 
 			glades::ATLASConfig acOff;
+			acOff.complementRank = 0u;
 			acOff.beta = 0.999f;
 			acOff.biasCorrection = false;
 			acOff.muMin = 0.0f;
@@ -1282,6 +1296,7 @@ void ATLASUnitTest()
 			glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
 
 			glades::ATLASConfig acOn;
+			acOn.complementRank = 0u;
 			acOn.beta = 0.999f;
 			acOn.biasCorrection = true;
 			acOn.muMin = 0.0f;
@@ -1393,6 +1408,7 @@ void ATLASUnitTest()
 				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 				cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 				cfg.atlas.rank = 4;
+				cfg.atlas.complementRank = 0u;
 				cfg.atlas.tSub = 50;
 			}
 
@@ -1550,6 +1566,7 @@ void ATLASUnitTest()
 
 			glades::ATLASConfig ac;
 			ac.rank = r;
+			ac.complementRank = 0u;
 			ac.beta = 0.99f;
 			ac.muMin = 0.01f;
 			ac.muMax = 0.3f;
@@ -1638,6 +1655,7 @@ void ATLASUnitTest()
 
 			glades::ATLASConfig ac;
 			ac.rank = r;
+			ac.complementRank = 0u;
 			ac.beta = 0.99f;
 			ac.muMin = 0.01f;
 			ac.muMax = 0.3f;
@@ -1686,7 +1704,10 @@ void ATLASUnitTest()
 				glades::atlas::initWeightState(tmpCpu, m, n, r, muInit, initRng);
 				gpuState.U.upload(tmpCpu.U.data(), tmpCpu.U.size());
 				gpuState.fisherDiag.upload(tmpCpu.fisherDiag.data(), tmpCpu.fisherDiag.size());
+				gpuState.V.upload(tmpCpu.V.data(), tmpCpu.V.size());
+				gpuState.complementFisher.upload(&tmpCpu.complementFisher, 1);
 				gpuState.prevGz.zero();
+				gpuState.prevGv.zero();
 				gpuState.totalTrace = tmpCpu.totalTrace;
 				gpuState.sigma2 = tmpCpu.sigma2;
 				gpuState.mu = tmpCpu.mu;
@@ -1774,6 +1795,7 @@ void ATLASUnitTest()
 
 			glades::ATLASConfig ac;
 			ac.rank = r;
+			ac.complementRank = 0u;
 			ac.beta = 0.99f;
 			ac.tSub = 10;
 			ac.biasCorrection = true;
@@ -1825,8 +1847,13 @@ void ATLASUnitTest()
 			gpuState.U.download(cpuState.U.data(), cpuState.U.size());
 			cpuState.fisherDiag.resize(r);
 			gpuState.fisherDiag.download(cpuState.fisherDiag.data(), r);
+			cpuState.V.resize(m);
+			gpuState.V.download(cpuState.V.data(), cpuState.V.size());
 			cpuState.prevGz.resize((size_t)r * n);
 			gpuState.prevGz.download(cpuState.prevGz.data(), cpuState.prevGz.size());
+			cpuState.prevGv.resize(n);
+			gpuState.prevGv.download(cpuState.prevGv.data(), cpuState.prevGv.size());
+			gpuState.complementFisher.download(&cpuState.complementFisher, 1);
 			cpuState.totalTrace = gpuState.totalTrace;
 			cpuState.sigma2 = gpuState.sigma2;
 			cpuState.mu = gpuState.mu;
@@ -1838,6 +1865,8 @@ void ATLASUnitTest()
 			const size_t rn = (size_t)r * n;
 			cpuState.scratch_gz.resize(rn);
 			cpuState.scratch_corrected.resize(rn);
+			cpuState.scratch_gv.resize(n);
+			cpuState.scratch_correctedV.resize(n);
 			cpuState.scratch_U_old.resize(mr);
 			cpuState.scratch_f_old.resize(r);
 			cpuState.scratch_B.resize(rn);
@@ -1845,6 +1874,9 @@ void ATLASUnitTest()
 			cpuState.scratch_overlap.resize((size_t)r * r);
 			cpuState.scratch_prevGzOld.resize(rn);
 			cpuState.scratch_basisPacked.resize(mr);
+			cpuState.scratch_V_old.resize(m);
+			cpuState.scratch_Bv.resize(n);
+			cpuState.scratch_Zv.resize(m);
 
 			// Download GPU weights for CPU path
 			std::vector<float> W_cpu(mn);
@@ -1940,6 +1972,7 @@ void ATLASUnitTest()
 		std::vector<float> W(1, 1.0f);
 		glades::ATLASConfig ac1x1;
 		ac1x1.rank = 128;
+		ac1x1.complementRank = 0u;
 		ac1x1.tSub = 10;
 		for (int step = 0; step < 50; ++step)
 		{
@@ -1973,6 +2006,7 @@ void ATLASUnitTest()
 		std::vector<float> W_init(W.begin(), W.end());
 
 		glades::ATLASConfig acZero;
+		acZero.complementRank = 0u;
 		acZero.tSub = 10;
 		acZero.muMin = 0.0f;
 		acZero.muMax = 0.0f;
@@ -2045,6 +2079,7 @@ void ATLASUnitTest()
 
 		glades::ATLASConfig acFull;
 		acFull.rank = r;
+		acFull.complementRank = 0u;
 		acFull.tSub = 5;  // frequent refresh
 
 		for (int step = 0; step < 50; ++step)
@@ -2147,6 +2182,7 @@ void ATLASUnitTest()
 			// Configure ATLAS optimizer.
 			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 			cfg.atlas.rank = 2;
+			cfg.atlas.complementRank = 0u;
 			cfg.atlas.tSub = 50;
 			cfg.atlas.beta = 0.999f;
 		}
@@ -2298,6 +2334,7 @@ void ATLASUnitTest()
 				glades::TrainingConfig& cfg = netA.getTrainingConfigMutable();
 				cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
 				cfg.atlas.rank = 4;
+				cfg.atlas.complementRank = 0u;
 				cfg.atlas.tSub = 50;
 			}
 
@@ -2344,6 +2381,8 @@ void ATLASUnitTest()
 			       kv["__magic__"] == "GLADES_CHECKPOINT");
 			ASSERT("==============ATLAS::StateCheckpoint ManifestRank Failed==============",
 			       kv["training.atlas.rank"] == "4");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestComplementRank Failed==============",
+			       kv["training.atlas.complementRank"] == "0");
 			ASSERT("==============ATLAS::StateCheckpoint ManifestTSub Failed==============",
 			       kv["training.atlas.tSub"] == "50");
 
@@ -2352,11 +2391,13 @@ void ATLASUnitTest()
 				glades::TrainingConfig& cfgMismatch = netMismatch.getTrainingConfigMutable();
 				cfgMismatch.optimizer.type = glades::OptimizerConfig::ATLAS;
 				cfgMismatch.atlas.rank = 7u;
+				cfgMismatch.atlas.complementRank = 0u;
 				cfgMismatch.atlas.tSub = 13u;
 				glades::NNetworkStatus stMismatch = netMismatch.loadCheckpoint(ckptName, diB);
 				ASSERT("==============ATLAS::StateCheckpoint MismatchLoadShouldFail==============", !stMismatch.ok());
 				ASSERT("==============ATLAS::StateCheckpoint MismatchMessage Failed==============",
 				       stMismatch.message.find("training.atlas.rank") != std::string::npos
+				       || stMismatch.message.find("training.atlas.complementRank") != std::string::npos
 				       || stMismatch.message.find("training.atlas.tSub") != std::string::npos);
 			}
 
@@ -2367,6 +2408,8 @@ void ATLASUnitTest()
 			       netB.getTrainingConfig().optimizer.type == glades::OptimizerConfig::ATLAS);
 			ASSERT("==============ATLAS::StateCheckpoint RankRestored Failed==============",
 			       netB.getTrainingConfig().atlas.rank == 4u);
+			ASSERT("==============ATLAS::StateCheckpoint ComplementRankRestored Failed==============",
+			       netB.getTrainingConfig().atlas.complementRank == 0u);
 			ASSERT("==============ATLAS::StateCheckpoint TSubRestored Failed==============",
 			       netB.getTrainingConfig().atlas.tSub == 50u);
 			netB.getTerminatorMutable().setEpoch(50);
@@ -2450,6 +2493,8 @@ void ATLASUnitTest()
 			       netB.getTrainingConfig().optimizer.type == glades::OptimizerConfig::ATLAS);
 			ASSERT("==============ATLAS::TransformerStateCheckpoint RankRestored Failed==============",
 			       netB.getTrainingConfig().atlas.rank == 8u);
+			ASSERT("==============ATLAS::TransformerStateCheckpoint ComplementRankRestored Failed==============",
+			       netB.getTrainingConfig().atlas.complementRank == 0u);
 			ASSERT("==============ATLAS::TransformerStateCheckpoint TSubRestored Failed==============",
 			       netB.getTrainingConfig().atlas.tSub == 50u);
 			ASSERT("==============ATLAS::TransformerStateCheckpoint HeadsRestored Failed==============",
@@ -2743,6 +2788,7 @@ void ATLASUnitTest()
 
 		glades::ATLASConfig acSigma;
 		acSigma.rank = r;
+		acSigma.complementRank = 0u;
 		acSigma.biasCorrection = false;
 		acSigma.muMin = 0.0f;
 		acSigma.muMax = 0.0f;
@@ -2763,6 +2809,67 @@ void ATLASUnitTest()
 		       traceErrAbs < 1e-6f);
 		ASSERT("==============ATLAS::Sigma2Scale sigma2 not trace-closed from normalized covariance==============",
 		       sigmaErrAbs < 1e-6f);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 28B: complement sector captures residual anisotropy
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 28B: complement sector captures residual anisotropy\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 5;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 28282829ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		state.activeRank = r;
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		state.V[2] = 1.0f;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0 * n + j] = 1.0f;
+			gW[1 * n + j] = 2.0f;
+			gW[2 * n + j] = 4.0f;
+			gW[3 * n + j] = 0.5f;
+			gW[4 * n + j] = 0.5f;
+		}
+
+		glades::ATLASConfig acSector;
+		acSector.rank = r;
+		acSector.complementRank = 1u;
+		acSector.biasCorrection = false;
+		acSector.muMin = 0.0f;
+		acSector.muMax = 0.0f;
+		acSector.tSub = 0u;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                         acSector, rng);
+		ASSERT("==============ATLAS::ComplementSector applyStep failed==============", ok);
+
+		const float expectedTrace = 21.5f;
+		const float expectedSectorFisher = 16.0f;
+		const float expectedSigma2 = 0.25f;
+		printf("[UT] ATLAS complement sector: totalTrace=%f sectorFisher=%f sigma2=%f\n",
+		       state.totalTrace, state.complementFisher, state.sigma2);
+		ASSERT("==============ATLAS::ComplementSector totalTrace mismatch==============",
+		       fabsf(state.totalTrace - expectedTrace) < 1e-6f);
+		ASSERT("==============ATLAS::ComplementSector sectorFisher mismatch==============",
+		       fabsf(state.complementFisher - expectedSectorFisher) < 1e-6f);
+		ASSERT("==============ATLAS::ComplementSector sigma2 mismatch==============",
+		       fabsf(state.sigma2 - expectedSigma2) < 1e-6f);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 

@@ -596,6 +596,7 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.optimizer.adamEps", f)) { cfg.optimizer.adamEps = f; any = true; }
 	if (parse_bool01(kv, "training.optimizer.adamBiasCorrection", b)) { cfg.optimizer.adamBiasCorrection = b; any = true; }
 	if (parse_int(kv, "training.atlas.rank", i) && i >= 0) { cfg.atlas.rank = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.complementRank", i) && i >= 0) { cfg.atlas.complementRank = static_cast<unsigned int>(i); any = true; }
 	if (parse_int(kv, "training.atlas.tSub", i) && i >= 0) { cfg.atlas.tSub = static_cast<unsigned int>(i); any = true; }
 
 	if (parse_int(kv, "training.lrSchedule.type", i)) { cfg.lrSchedule.type = static_cast<glades::LearningRateScheduleConfig::Type>(i); any = true; }
@@ -945,6 +946,7 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	write_kv(out, "training.optimizer.adamBiasCorrection", trainingConfig.optimizer.adamBiasCorrection ? "1" : "0");
 	write_kv(out, "training.atlas.rank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.rank)));
+	write_kv(out, "training.atlas.complementRank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.complementRank)));
 	write_kv(out, "training.atlas.tSub", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.tSub)));
 	write_kv(out, "training.lrSchedule.type", u64_to_string(static_cast<uint64_t>(static_cast<int>(trainingConfig.lrSchedule.type))));
 	write_kv(out, "training.lrSchedule.stepSizeEpochs", u64_to_string(static_cast<uint64_t>(trainingConfig.lrSchedule.stepSizeEpochs)));
@@ -1247,6 +1249,17 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 
+	int savedComplementRank = -1;
+	if (parse_int(kv, "training.atlas.complementRank", savedComplementRank) &&
+	    savedComplementRank >= 0 &&
+	    currentCfg.atlas.complementRank != static_cast<unsigned int>(savedComplementRank))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.complementRank mismatch vs requested resume config (checkpoint "
+		    << savedComplementRank << ", current " << currentCfg.atlas.complementRank << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
 	int savedTSub = -1;
 	if (parse_int(kv, "training.atlas.tSub", savedTSub) &&
 	    savedTSub >= 0 &&
@@ -1461,6 +1474,65 @@ static void enqueueAtlasWrite(std::vector<TensorWriteRef>& out,
 		sh.push_back(static_cast<uint64_t>(st.n));
 		out.push_back(TensorWriteRef(prefix + ".atlas.prevGz", &st.prevGz, dt, sh));
 	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.m));
+		out.push_back(TensorWriteRef(prefix + ".atlas.V", &st.V, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.prevGv", &st.prevGv, dt, sh));
+	}
+}
+
+static bool restoreAtlasComplementBasis(glades::atlas::WeightState& st)
+{
+	if (st.V.size() != static_cast<size_t>(st.m))
+		st.V.assign(static_cast<size_t>(st.m), 0.0f);
+
+	double normSq = 0.0;
+	for (unsigned int i = 0; i < st.m; ++i)
+	{
+		const double v = static_cast<double>(st.V[i]);
+		normSq += v * v;
+	}
+	if (normSq > 1e-12)
+		return true;
+
+	const unsigned int activeRank = (st.activeRank <= st.r) ? st.activeRank : st.r;
+	for (unsigned int basisRow = 0; basisRow < st.m; ++basisRow)
+	{
+		std::fill(st.V.begin(), st.V.end(), 0.0f);
+		st.V[basisRow] = 1.0f;
+		for (unsigned int c = 0; c < activeRank; ++c)
+		{
+			double dot = 0.0;
+			for (unsigned int i = 0; i < st.m; ++i)
+				dot += static_cast<double>(st.V[i])
+				    * static_cast<double>(st.U[static_cast<size_t>(i) * st.r + c]);
+			const float dotf = static_cast<float>(dot);
+			for (unsigned int i = 0; i < st.m; ++i)
+				st.V[i] -= dotf * st.U[static_cast<size_t>(i) * st.r + c];
+		}
+
+		normSq = 0.0;
+		for (unsigned int i = 0; i < st.m; ++i)
+		{
+			const double v = static_cast<double>(st.V[i]);
+			normSq += v * v;
+		}
+		if (normSq > 1e-12)
+		{
+			const float invNorm = static_cast<float>(1.0 / std::sqrt(normSq));
+			for (unsigned int i = 0; i < st.m; ++i)
+				st.V[i] *= invNorm;
+			return true;
+		}
+	}
+
+	std::fill(st.V.begin(), st.V.end(), 0.0f);
+	return false;
 }
 
 static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
@@ -1482,6 +1554,10 @@ static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
 		kv["atlas." + prefix + ".sigma2"] = oss.str();
 	}
 	{
+		std::ostringstream oss; oss << st.complementFisher;
+		kv["atlas." + prefix + ".complementFisher"] = oss.str();
+	}
+	{
 		std::ostringstream oss; oss << static_cast<unsigned long long>(st.step);
 		kv["atlas." + prefix + ".step"] = oss.str();
 	}
@@ -1501,15 +1577,20 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.n = n;
 	st.r = r;
 	st.activeRank = r;
+	st.complementFisher = 0.0f;
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
 	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
 	st.U.resize(mr);
 	st.fisherDiag.resize(r);
+	st.V.resize(m);
 	st.prevGz.resize(rn);
+	st.prevGv.resize(n);
 
 	// Allocate persistent scratch buffers (must match initWeightState).
 	st.scratch_gz.resize(rn);
 	st.scratch_corrected.resize(rn);
+	st.scratch_gv.resize(n);
+	st.scratch_correctedV.resize(n);
 	st.scratch_U_old.resize(mr);
 	st.scratch_f_old.resize(static_cast<size_t>(r));
 	st.scratch_B.resize(rn);
@@ -1517,6 +1598,9 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
 	st.scratch_prevGzOld.resize(rn);
 	st.scratch_basisPacked.resize(mr);
+	st.scratch_V_old.resize(m);
+	st.scratch_Bv.resize(n);
+	st.scratch_Zv.resize(m);
 	{
 		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(m));
@@ -1533,6 +1617,16 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 		sh.push_back(static_cast<uint64_t>(r));
 		sh.push_back(static_cast<uint64_t>(n));
 		out.push_back(TensorReadRef(prefix + ".atlas.prevGz", &st.prevGz, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(m));
+		out.push_back(TensorReadRef(prefix + ".atlas.V", &st.V, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.prevGv", &st.prevGv, dt, sh));
 	}
 }
 
@@ -1567,6 +1661,14 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 		}
 	}
 	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".complementFisher");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.complementFisher;
+		}
+	}
+	{
 		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".step");
 		if (it != kv.end())
 		{
@@ -1587,12 +1689,19 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 				st.activeRank = static_cast<unsigned int>(s);
 		}
 	}
+	if (st.prevGv.empty())
+		st.prevGv.assign(static_cast<size_t>(st.n), 0.0f);
+	restoreAtlasComplementBasis(st);
 	if (st.totalTrace <= 0.0f)
 	{
 		double activeTrace = 0.0;
 		for (unsigned int c = 0; c < st.activeRank; ++c)
 			activeTrace += static_cast<double>(st.fisherDiag[c]);
-		const unsigned int complementDim = (st.m > st.activeRank) ? (st.m - st.activeRank) : 0u;
+		activeTrace += static_cast<double>(st.complementFisher);
+		const unsigned int sectorRank = (st.m > st.activeRank + 1u) ? 1u : 0u;
+		const unsigned int complementDim = (st.m > st.activeRank + sectorRank)
+		    ? (st.m - st.activeRank - sectorRank)
+		    : 0u;
 		double closedTrace = activeTrace;
 		if (complementDim > 0u)
 			closedTrace += static_cast<double>(st.sigma2) * static_cast<double>(complementDim);

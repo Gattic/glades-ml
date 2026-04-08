@@ -170,6 +170,7 @@ struct BenchConfig
 	unsigned int repeats;
 	unsigned int batchSize;
 	unsigned int atlasRank;
+	unsigned int atlasComplementRank;
 	unsigned int atlasTSub;
 	unsigned int seed;
 	float clipNorm;
@@ -187,6 +188,7 @@ struct BenchConfig
 	      repeats(1u),
 	      batchSize(64u),
 	      atlasRank(16u),
+	      atlasComplementRank(0u),
 	      atlasTSub(200u),
 	      seed(1337u),
 	      clipNorm(5.0f),
@@ -315,6 +317,7 @@ static void print_usage()
 	printf("  --adam-lr X                             AdamW learning rate (default: 0.0015)\n");
 	printf("  --atlas-lr X                            ATLAS-BSRP learning rate (default: 0.08)\n");
 	printf("  --rank N                                ATLAS subspace rank (default: 16)\n");
+	printf("  --atlas-complement-rank N               ATLAS complement sector rank (default: 0)\n");
 	printf("  --tsub N                                ATLAS subspace refresh interval in steps (default: 200)\n");
 	printf("  --seed N                                Base seed for repeats (default: 1337)\n");
 	printf("  --help                                  Show this message\n");
@@ -733,6 +736,7 @@ static void configure_optimizer(glades::NNetwork& net,
 	{
 		tc.optimizer.type = glades::OptimizerConfig::ATLAS;
 		tc.atlas.rank = cfg.atlasRank;
+		tc.atlas.complementRank = cfg.atlasComplementRank;
 		tc.atlas.tSub = cfg.atlasTSub;
 		tc.atlas.beta = 0.999f;
 		tc.atlas.betaRefresh = 0.5f;
@@ -917,9 +921,10 @@ static bool run_benchmark_case(const BenchmarkCase& benchCase,
 	printf("Model: LeNet-style CNN (8x5x5 -> pool -> 16x5x5 -> pool -> FC128 -> 10)\n");
 	printf("Config: epochs=%u repeats=%u batch=%u clip=%.2f\n",
 	       benchCase.cfg.epochs, benchCase.cfg.repeats, benchCase.cfg.batchSize, benchCase.cfg.clipNorm);
-	printf("LRs: SGD=%.4f (momentum=%.2f) AdamW=%.4f ATLAS-BSRP=%.4f rank=%u tSub=%u\n",
+	printf("LRs: SGD=%.4f (momentum=%.2f) AdamW=%.4f ATLAS-BSRP=%.4f rank=%u cRank=%u tSub=%u\n",
 	       benchCase.cfg.sgdLR, benchCase.cfg.sgdMomentum, benchCase.cfg.adamLR,
-	       benchCase.cfg.atlasLR, benchCase.cfg.atlasRank, benchCase.cfg.atlasTSub);
+	       benchCase.cfg.atlasLR, benchCase.cfg.atlasRank,
+	       benchCase.cfg.atlasComplementRank, benchCase.cfg.atlasTSub);
 	printf("Cache warmup: %lld ms for %u images (excluded from benchmark timing)\n",
 	       warmMs, data.getTrainSize() + data.getTestSize());
 	printf("Planned train image passes across all optimizers: %llu\n",
@@ -1130,6 +1135,14 @@ void ATLASBenchmark(int argc, char* argv[])
 			if (!parse_uint_arg(argv[++i], cfg.atlasRank))
 			{
 				printf("Invalid value for --rank\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-complement-rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasComplementRank))
+			{
+				printf("Invalid value for --atlas-complement-rank\n");
 				return;
 			}
 		}

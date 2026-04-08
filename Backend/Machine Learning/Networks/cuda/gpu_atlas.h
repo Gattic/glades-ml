@@ -45,11 +45,16 @@ struct GpuAtlasWeightState
 
 	GpuBuffer<float> U;          // [subDim * r] orthonormal subspace basis
 	GpuBuffer<float> fisherDiag; // [r] EMA of Fisher eigenvalues
+	GpuBuffer<float> V;          // [subDim] residual complement sector basis
+	GpuBuffer<float> complementFisher; // [1] EMA Fisher mass for V
 	GpuBuffer<float> prevGz;     // [outerDim * r] previous compressed gradient
+	GpuBuffer<float> prevGv;     // [outerDim] previous complement-sector gradient
 
 	// Scratch buffers (persistent to avoid per-step allocation)
 	GpuBuffer<float> gz;         // [outerDim * r] current projected gradient
 	GpuBuffer<float> gPred;      // [outerDim * r] scaled prediction for correction SGEMM
+	GpuBuffer<float> gv;         // [outerDim] current complement-sector gradient
+	GpuBuffer<float> gPredV;     // [outerDim] scaled complement correction
 	GpuBuffer<float> d_reduce;   // [2] reduction output (errNormSq, gzNormSq)
 	GpuBuffer<float> d_partials; // [512] per-block partial sums for deterministic reductions
 
@@ -60,6 +65,9 @@ struct GpuAtlasWeightState
 	GpuBuffer<float> overlap;    // [r * r * 2]
 	GpuBuffer<float> prevGzOld;  // [outerDim * r]
 	GpuBuffer<float> qrTemp;     // [subDim * r] scratch for Cholesky QR SGEMM output
+	GpuBuffer<float> V_old;      // [subDim]
+	GpuBuffer<float> Bv;         // [outerDim]
+	GpuBuffer<float> Zv;         // [subDim]
 	bool refreshAllocated;       // true after refresh scratch buffers allocated
 
 	// Host-side scalars (passed to kernels as parameters, updated on host)

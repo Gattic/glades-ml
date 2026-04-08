@@ -30,9 +30,12 @@ namespace atlas {
 // For a weight matrix W in R^{m x n}, ATLAS maintains:
 // - U in R^{m x r}: orthonormal subspace basis (top-r Fisher eigenvectors)
 // - fisherDiag in R^r: EMA of Fisher eigenvalues per subspace dimension
+// - V in R^m: one residual complement sector basis vector
+// - complementFisher: EMA of Fisher mass captured by V
 // - totalTrace: EMA of the normalized covariance trace on the ATLAS update scale
-// - sigma2: complement closure scalar derived from totalTrace and fisherDiag
+// - sigma2: isotropic tail closure derived from totalTrace, fisherDiag, and V
 // - prevGz in R^{r x n}: previous step's compressed gradient
+// - prevGv in R^n: previous step's complement-sector gradient
 // - mu: adaptive temporal prediction coefficient
 struct WeightState
 {
@@ -43,12 +46,16 @@ struct WeightState
 
 	std::vector<float> U;           // [m * r] orthonormal subspace basis (row-major)
 	std::vector<float> fisherDiag;  // [r] EMA of Fisher eigenvalues
+	std::vector<float> V;           // [m] residual complement sector basis
 	std::vector<float> prevGz;      // [r * n] previous compressed gradient
+	std::vector<float> prevGv;      // [n] previous complement-sector gradient
 
 	// Persistent scratch buffers (allocated once in initWeightState, reused every step).
 	// applyStep scratch:
 	std::vector<float> scratch_gz;        // [r * n]
 	std::vector<float> scratch_corrected; // [r * n]
+	std::vector<float> scratch_gv;        // [n]
+	std::vector<float> scratch_correctedV; // [n]
 	// refreshSubspace scratch:
 	std::vector<float> scratch_U_old;     // [m * r]
 	std::vector<float> scratch_f_old;     // [r]
@@ -57,9 +64,13 @@ struct WeightState
 	std::vector<float> scratch_overlap;   // [r * r]
 	std::vector<float> scratch_prevGzOld; // [r * n]
 	std::vector<float> scratch_basisPacked; // [m * r] packed leading basis for GEMM fast path
+	std::vector<float> scratch_V_old;     // [m]
+	std::vector<float> scratch_Bv;        // [n]
+	std::vector<float> scratch_Zv;        // [m]
 
+	float complementFisher;         // EMA Fisher mass of the residual complement sector
 	float totalTrace;               // EMA trace of the normalized covariance operator
-	float sigma2;                   // complement closure scalar (BRSP baseline)
+	float sigma2;                   // isotropic complement-tail closure scalar
 	float mu;                       // adaptive prediction coefficient
 	float lastBaselineRate;         // diagnostics for the most recent baseline step
 	unsigned long long step;        // optimizer step counter
@@ -67,7 +78,8 @@ struct WeightState
 
 	WeightState()
 	    : m(0u), n(0u), r(0u), activeRank(0u),
-	      totalTrace(0.0f), sigma2(0.0f), mu(0.01f), lastBaselineRate(0.0f),
+	      complementFisher(0.0f), totalTrace(0.0f), sigma2(0.0f),
+	      mu(0.01f), lastBaselineRate(0.0f),
 	      step(0ULL), initialized(false)
 	{
 	}
@@ -77,9 +89,13 @@ struct WeightState
 		m = n = r = activeRank = 0u;
 		U.clear();
 		fisherDiag.clear();
+		V.clear();
 		prevGz.clear();
+		prevGv.clear();
 		scratch_gz.clear();
 		scratch_corrected.clear();
+		scratch_gv.clear();
+		scratch_correctedV.clear();
 		scratch_U_old.clear();
 		scratch_f_old.clear();
 		scratch_B.clear();
@@ -87,6 +103,10 @@ struct WeightState
 		scratch_overlap.clear();
 		scratch_prevGzOld.clear();
 		scratch_basisPacked.clear();
+		scratch_V_old.clear();
+		scratch_Bv.clear();
+		scratch_Zv.clear();
+		complementFisher = 0.0f;
 		totalTrace = 0.0f;
 		sigma2 = 0.0f;
 		mu = 0.01f;
