@@ -85,6 +85,13 @@ static bool has_image_manifests(const std::string& dir)
 	       path_exists(join_path(dir, "test.csv"));
 }
 
+enum BenchMode
+{
+	BENCH_MODE_ALL = 0,
+	BENCH_MODE_STANDARD = 1,
+	BENCH_MODE_ENDURANCE = 2
+};
+
 static bool parse_uint_arg(const char* text, unsigned int& outValue)
 {
 	if (!text || !*text)
@@ -109,6 +116,33 @@ static bool parse_float_arg(const char* text, float& outValue)
 	return true;
 }
 
+static unsigned int max_u32(unsigned int a, unsigned int b)
+{
+	return (a > b) ? a : b;
+}
+
+static bool parse_mode_arg(const char* text, BenchMode& outMode)
+{
+	if (!text || !*text)
+		return false;
+	if (streq(text, "all"))
+	{
+		outMode = BENCH_MODE_ALL;
+		return true;
+	}
+	if (streq(text, "standard") || streq(text, "short"))
+	{
+		outMode = BENCH_MODE_STANDARD;
+		return true;
+	}
+	if (streq(text, "endurance") || streq(text, "big") || streq(text, "long"))
+	{
+		outMode = BENCH_MODE_ENDURANCE;
+		return true;
+	}
+	return false;
+}
+
 class CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 {
 public:
@@ -128,6 +162,7 @@ public:
 
 struct BenchConfig
 {
+	BenchMode mode;
 	std::string datasetRequest;
 	unsigned int trainLimit;
 	unsigned int testLimit;
@@ -144,11 +179,12 @@ struct BenchConfig
 	float atlasLR;
 
 	BenchConfig()
-	    : datasetRequest("auto"),
+	    : mode(BENCH_MODE_ALL),
+	      datasetRequest("auto"),
 	      trainLimit(5000u),
 	      testLimit(1000u),
 	      epochs(5u),
-	      repeats(2u),
+	      repeats(1u),
 	      batchSize(64u),
 	      atlasRank(16u),
 	      atlasTSub(200u),
@@ -248,15 +284,30 @@ enum OptimizerVariant
 	OPT_ATLAS_BRSP = 2
 };
 
+struct BenchmarkCase
+{
+	std::string label;
+	std::string description;
+	BenchConfig cfg;
+
+	BenchmarkCase()
+	    : label(),
+	      description(),
+	      cfg()
+	{
+	}
+};
+
 static void print_usage()
 {
 	printf("Usage: glades-unit-tests atlas-bench [options]\n");
 	printf("Options:\n");
+	printf("  --mode all|standard|endurance          Run the short case, the minutes-scale case, or both (default: all)\n");
 	printf("  --dataset auto|mnist|mnist-small|PATH   Dataset directory with train.csv/test.csv (default: auto)\n");
 	printf("  --train-limit N                         Class-balanced train subset size; 0 = full split (default: 5000)\n");
 	printf("  --test-limit N                          Class-balanced test subset size; 0 = full split (default: 1000)\n");
 	printf("  --epochs N                              Training epochs per run (default: 5)\n");
-	printf("  --repeats N                             Repeats per optimizer (default: 2)\n");
+	printf("  --repeats N                             Repeats per optimizer in each case (default: 1)\n");
 	printf("  --batch-size N                          Mini-batch size (default: 64)\n");
 	printf("  --clip-norm X                           Global grad clip norm (default: 5.0)\n");
 	printf("  --sgd-lr X                              SGD learning rate (default: 0.01)\n");
@@ -267,6 +318,67 @@ static void print_usage()
 	printf("  --tsub N                                ATLAS subspace refresh interval in steps (default: 200)\n");
 	printf("  --seed N                                Base seed for repeats (default: 1337)\n");
 	printf("  --help                                  Show this message\n");
+}
+
+static BenchConfig make_endurance_config(const BenchConfig& base)
+{
+	BenchConfig endurance = base;
+	endurance.mode = BENCH_MODE_ENDURANCE;
+	if (base.trainLimit != 0u)
+	{
+		const unsigned long scaledTrain = static_cast<unsigned long>(base.trainLimit) * 4ul;
+		endurance.trainLimit = static_cast<unsigned int>((scaledTrain > 20000ul) ? scaledTrain : 20000ul);
+	}
+	else
+	{
+		endurance.trainLimit = 0u;
+	}
+	if (base.testLimit != 0u)
+	{
+		const unsigned long scaledTest = static_cast<unsigned long>(base.testLimit) * 4ul;
+		endurance.testLimit = static_cast<unsigned int>((scaledTest > 4000ul) ? scaledTest : 4000ul);
+	}
+	else
+	{
+		endurance.testLimit = 0u;
+	}
+	endurance.epochs = max_u32(base.epochs * 2u, 10u);
+	endurance.atlasTSub = max_u32(base.atlasTSub, 500u);
+	return endurance;
+}
+
+static void build_benchmark_cases(const BenchConfig& base, std::vector<BenchmarkCase>& outCases)
+{
+	outCases.clear();
+
+	if (base.mode == BENCH_MODE_ALL || base.mode == BENCH_MODE_STANDARD)
+	{
+		BenchmarkCase standard;
+		standard.label = "standard";
+		standard.description = "Reference MNIST run sized to finish quickly while still showing real optimizer behavior.";
+		standard.cfg = base;
+		standard.cfg.mode = BENCH_MODE_STANDARD;
+		outCases.push_back(standard);
+	}
+
+	if (base.mode == BENCH_MODE_ALL || base.mode == BENCH_MODE_ENDURANCE)
+	{
+		BenchmarkCase endurance;
+		endurance.label = "endurance";
+		endurance.description = "Scaled-up MNIST run sized to take minutes instead of seconds on CPU builds.";
+		endurance.cfg = make_endurance_config(base);
+		outCases.push_back(endurance);
+	}
+}
+
+static unsigned long long planned_train_images(const BenchConfig& cfg,
+                                               unsigned int trainSize,
+                                               size_t optimizerCount)
+{
+	return static_cast<unsigned long long>(cfg.epochs) *
+	       static_cast<unsigned long long>(cfg.repeats) *
+	       static_cast<unsigned long long>(trainSize) *
+	       static_cast<unsigned long long>(optimizerCount);
 }
 
 static bool find_named_dataset(const char* leafName, std::string& outDir)
@@ -770,6 +882,147 @@ static void print_summary_row(const char* label,
 	       status);
 }
 
+static bool run_benchmark_case(const BenchmarkCase& benchCase,
+                               const DatasetInfo& resolvedDatasetInfo)
+{
+	DatasetInfo datasetInfo = resolvedDatasetInfo;
+	std::string err;
+	glades::ImageInput data;
+	if (!load_image_dataset(data, datasetInfo, benchCase.cfg.trainLimit, benchCase.cfg.testLimit, err))
+	{
+		printf("Case '%s' dataset load failed: %s\n", benchCase.label.c_str(), err.c_str());
+		return false;
+	}
+
+	long long warmMs = 0LL;
+	if (!warm_image_cache(data, warmMs, err))
+	{
+		printf("Case '%s' cache warmup failed: %s\n", benchCase.label.c_str(), err.c_str());
+		return false;
+	}
+
+	const OptimizerVariant optimizers[] = { OPT_SGD, OPT_ADAMW, OPT_ATLAS_BRSP };
+	const size_t optimizerCount = sizeof(optimizers) / sizeof(optimizers[0]);
+	const int64_t caseStartMs = now_ms();
+
+	printf("------------------------------------------------------------\n");
+	printf("Case: %s\n", benchCase.label.c_str());
+	printf("Description: %s\n", benchCase.description.c_str());
+	printf("Dataset: %s\n", datasetInfo.datasetName.c_str());
+	printf("Path: %s\n", datasetInfo.resolvedDir.c_str());
+	printf("Train split: %u / %u\n", data.getTrainSize(), datasetInfo.originalTrainSize);
+	printf("Test split:  %u / %u\n", data.getTestSize(), datasetInfo.originalTestSize);
+	if (!datasetInfo.note.empty())
+		printf("Note: %s\n", datasetInfo.note.c_str());
+	printf("Model: LeNet-style CNN (8x5x5 -> pool -> 16x5x5 -> pool -> FC128 -> 10)\n");
+	printf("Config: epochs=%u repeats=%u batch=%u clip=%.2f\n",
+	       benchCase.cfg.epochs, benchCase.cfg.repeats, benchCase.cfg.batchSize, benchCase.cfg.clipNorm);
+	printf("LRs: SGD=%.4f (momentum=%.2f) AdamW=%.4f ATLAS-BSRP=%.4f rank=%u tSub=%u\n",
+	       benchCase.cfg.sgdLR, benchCase.cfg.sgdMomentum, benchCase.cfg.adamLR,
+	       benchCase.cfg.atlasLR, benchCase.cfg.atlasRank, benchCase.cfg.atlasTSub);
+	printf("Cache warmup: %lld ms for %u images (excluded from benchmark timing)\n",
+	       warmMs, data.getTrainSize() + data.getTestSize());
+	printf("Planned train image passes across all optimizers: %llu\n",
+	       planned_train_images(benchCase.cfg, data.getTrainSize(), optimizerCount));
+	printf("\n");
+
+	std::vector<BenchmarkSummary> summaries;
+	summaries.reserve(optimizerCount);
+
+	for (size_t opt = 0; opt < optimizerCount; ++opt)
+	{
+		printf("Running %s\n", optimizer_label(optimizers[opt]));
+
+		std::vector<double> trainSecVals;
+		std::vector<double> imgPerSecVals;
+		std::vector<double> trainLossVals;
+		std::vector<double> trainAccVals;
+		std::vector<double> testLossVals;
+		std::vector<double> testAccVals;
+		bool allOk = true;
+		std::string firstErr;
+
+		for (unsigned int rep = 0u; rep < benchCase.cfg.repeats; ++rep)
+		{
+			const unsigned int seed = benchCase.cfg.seed + rep;
+			const SingleRunResult r = run_single_benchmark(data, optimizers[opt], benchCase.cfg, seed);
+			if (!r.ok)
+			{
+				allOk = false;
+				if (firstErr.empty())
+					firstErr = r.err;
+				printf("  [%u/%u] seed=%u failed: %s\n",
+				       rep + 1u, benchCase.cfg.repeats, seed, r.err.c_str());
+				continue;
+			}
+
+			printf("  [%u/%u] seed=%u train=%.2fs test=%.2fs trainLoss=%.4f trainAcc=%.2f%% testLoss=%.4f testAcc=%.2f%% img/s=%.1f\n",
+			       rep + 1u, benchCase.cfg.repeats, seed,
+			       static_cast<double>(r.trainMs) / 1000.0,
+			       static_cast<double>(r.testMs) / 1000.0,
+			       r.trainLoss, r.trainAcc,
+			       r.testLoss, r.testAcc,
+			       r.trainImagesPerSec);
+
+			trainSecVals.push_back(static_cast<double>(r.trainMs) / 1000.0);
+			imgPerSecVals.push_back(r.trainImagesPerSec);
+			trainLossVals.push_back(r.trainLoss);
+			trainAccVals.push_back(r.trainAcc);
+			testLossVals.push_back(r.testLoss);
+			testAccVals.push_back(r.testAcc);
+		}
+
+		BenchmarkSummary summary;
+		summary.label = optimizer_label(optimizers[opt]);
+		summary.ok = allOk && !trainSecVals.empty();
+		if (!summary.ok)
+		{
+			summary.status = firstErr.empty() ? "FAILED" : firstErr;
+		}
+		else
+		{
+			summary.trainSec = compute_stats(trainSecVals);
+			summary.imgPerSec = compute_stats(imgPerSecVals);
+			summary.trainLoss = compute_stats(trainLossVals);
+			summary.trainAcc = compute_stats(trainAccVals);
+			summary.testLoss = compute_stats(testLossVals);
+			summary.testAcc = compute_stats(testAccVals);
+			summary.status = "OK";
+		}
+		summaries.push_back(summary);
+
+		printf("\n");
+	}
+
+	printf("%s summary\n", benchCase.label.c_str());
+	printf("Optimizer     Train(s)              Img/s                 TrainLoss             TrainAcc(%%)          TestLoss              TestAcc(%%)           Status\n");
+	printf("------------  --------------------  --------------------  --------------------  --------------------  --------------------  --------------------  --------\n");
+	for (size_t i = 0; i < summaries.size(); ++i)
+	{
+		if (!summaries[i].ok)
+		{
+			printf("%-11s  %-20s  %-20s  %-20s  %-20s  %-20s  %-20s  %s\n",
+			       summaries[i].label,
+			       "-", "-", "-", "-", "-", "-", summaries[i].status.c_str());
+			continue;
+		}
+		print_summary_row(
+		    summaries[i].label,
+		    summaries[i].trainSec,
+		    summaries[i].imgPerSec,
+		    summaries[i].trainLoss,
+		    summaries[i].trainAcc,
+		    summaries[i].testLoss,
+		    summaries[i].testAcc,
+		    summaries[i].status.c_str());
+	}
+	const int64_t caseEndMs = now_ms();
+	printf("Case wall time: %.2f minutes\n",
+	       static_cast<double>(caseEndMs - caseStartMs) / 60000.0);
+	printf("\n");
+	return true;
+}
+
 } // anonymous namespace
 
 void ATLASBenchmark(int argc, char* argv[])
@@ -781,6 +1034,14 @@ void ATLASBenchmark(int argc, char* argv[])
 		{
 			print_usage();
 			return;
+		}
+		else if (streq(argv[i], "--mode") && i + 1 < argc)
+		{
+			if (!parse_mode_arg(argv[++i], cfg.mode))
+			{
+				printf("Invalid value for --mode\n");
+				return;
+			}
 		}
 		else if (streq(argv[i], "--dataset") && i + 1 < argc)
 			cfg.datasetRequest = argv[++i];
@@ -908,127 +1169,12 @@ void ATLASBenchmark(int argc, char* argv[])
 		return;
 	}
 
-	glades::ImageInput data;
-	if (!load_image_dataset(data, datasetInfo, cfg.trainLimit, cfg.testLimit, err))
+	std::vector<BenchmarkCase> cases;
+	build_benchmark_cases(cfg, cases);
+	for (size_t i = 0; i < cases.size(); ++i)
 	{
-		printf("Dataset load failed: %s\n", err.c_str());
-		return;
+		if (!run_benchmark_case(cases[i], datasetInfo))
+			return;
 	}
-
-	long long warmMs = 0LL;
-	if (!warm_image_cache(data, warmMs, err))
-	{
-		printf("Cache warmup failed: %s\n", err.c_str());
-		return;
-	}
-
-	printf("Dataset: %s\n", datasetInfo.datasetName.c_str());
-	printf("Path: %s\n", datasetInfo.resolvedDir.c_str());
-	printf("Train split: %u / %u\n", data.getTrainSize(), datasetInfo.originalTrainSize);
-	printf("Test split:  %u / %u\n", data.getTestSize(), datasetInfo.originalTestSize);
-	if (!datasetInfo.note.empty())
-		printf("Note: %s\n", datasetInfo.note.c_str());
-	printf("Model: LeNet-style CNN (8x5x5 -> pool -> 16x5x5 -> pool -> FC128 -> 10)\n");
-	printf("Config: epochs=%u repeats=%u batch=%u clip=%.2f\n",
-	       cfg.epochs, cfg.repeats, cfg.batchSize, cfg.clipNorm);
-	printf("LRs: SGD=%.4f (momentum=%.2f) AdamW=%.4f ATLAS-BSRP=%.4f rank=%u tSub=%u\n",
-	       cfg.sgdLR, cfg.sgdMomentum, cfg.adamLR, cfg.atlasLR, cfg.atlasRank, cfg.atlasTSub);
-	printf("Cache warmup: %lld ms for %u images (excluded from benchmark timing)\n",
-	       warmMs, data.getTrainSize() + data.getTestSize());
-	printf("\n");
-
-	const OptimizerVariant optimizers[] = { OPT_SGD, OPT_ADAMW, OPT_ATLAS_BRSP };
-	const size_t optimizerCount = sizeof(optimizers) / sizeof(optimizers[0]);
-	std::vector<BenchmarkSummary> summaries;
-	summaries.reserve(optimizerCount);
-
-	for (size_t opt = 0; opt < optimizerCount; ++opt)
-	{
-		printf("Running %s\n", optimizer_label(optimizers[opt]));
-
-		std::vector<double> trainSecVals;
-		std::vector<double> imgPerSecVals;
-		std::vector<double> trainLossVals;
-		std::vector<double> trainAccVals;
-		std::vector<double> testLossVals;
-		std::vector<double> testAccVals;
-		bool allOk = true;
-		std::string firstErr;
-
-		for (unsigned int rep = 0u; rep < cfg.repeats; ++rep)
-		{
-			const unsigned int seed = cfg.seed + rep;
-			const SingleRunResult r = run_single_benchmark(data, optimizers[opt], cfg, seed);
-			if (!r.ok)
-			{
-				allOk = false;
-				if (firstErr.empty())
-					firstErr = r.err;
-				printf("  [%u/%u] seed=%u failed: %s\n",
-				       rep + 1u, cfg.repeats, seed, r.err.c_str());
-				continue;
-			}
-
-			printf("  [%u/%u] seed=%u train=%.2fs test=%.2fs trainLoss=%.4f trainAcc=%.2f%% testLoss=%.4f testAcc=%.2f%% img/s=%.1f\n",
-			       rep + 1u, cfg.repeats, seed,
-			       static_cast<double>(r.trainMs) / 1000.0,
-			       static_cast<double>(r.testMs) / 1000.0,
-			       r.trainLoss, r.trainAcc,
-			       r.testLoss, r.testAcc,
-			       r.trainImagesPerSec);
-
-			trainSecVals.push_back(static_cast<double>(r.trainMs) / 1000.0);
-			imgPerSecVals.push_back(r.trainImagesPerSec);
-			trainLossVals.push_back(r.trainLoss);
-			trainAccVals.push_back(r.trainAcc);
-			testLossVals.push_back(r.testLoss);
-			testAccVals.push_back(r.testAcc);
-		}
-
-		BenchmarkSummary summary;
-		summary.label = optimizer_label(optimizers[opt]);
-		summary.ok = allOk && !trainSecVals.empty();
-		if (!summary.ok)
-		{
-			summary.status = firstErr.empty() ? "FAILED" : firstErr;
-		}
-		else
-		{
-			summary.trainSec = compute_stats(trainSecVals);
-			summary.imgPerSec = compute_stats(imgPerSecVals);
-			summary.trainLoss = compute_stats(trainLossVals);
-			summary.trainAcc = compute_stats(trainAccVals);
-			summary.testLoss = compute_stats(testLossVals);
-			summary.testAcc = compute_stats(testAccVals);
-			summary.status = "OK";
-		}
-		summaries.push_back(summary);
-
-		printf("\n");
-	}
-
-	printf("Final summary\n");
-	printf("Optimizer     Train(s)              Img/s                 TrainLoss             TrainAcc(%%)          TestLoss              TestAcc(%%)           Status\n");
-	printf("------------  --------------------  --------------------  --------------------  --------------------  --------------------  --------------------  --------\n");
-	for (size_t i = 0; i < summaries.size(); ++i)
-	{
-		if (!summaries[i].ok)
-		{
-			printf("%-11s  %-20s  %-20s  %-20s  %-20s  %-20s  %-20s  %s\n",
-			       summaries[i].label,
-			       "-", "-", "-", "-", "-", "-", summaries[i].status.c_str());
-			continue;
-		}
-		print_summary_row(
-		    summaries[i].label,
-		    summaries[i].trainSec,
-		    summaries[i].imgPerSec,
-		    summaries[i].trainLoss,
-		    summaries[i].trainAcc,
-		    summaries[i].testLoss,
-		    summaries[i].testAcc,
-		    summaries[i].status.c_str());
-	}
-	printf("\n");
 	printf("============================================================\n");
 }
