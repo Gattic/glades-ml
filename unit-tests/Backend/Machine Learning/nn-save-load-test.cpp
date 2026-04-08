@@ -111,6 +111,41 @@ static bool replace_line_prefix_in_file(const std::string& path, const std::stri
 	return replaced && write_text_file(path, out);
 }
 
+static bool remove_lines_with_prefixes_in_file(const std::string& path, const std::vector<std::string>& prefixes)
+{
+	std::string s;
+	if (!read_file_to_string(path, s))
+		return false;
+	std::string out;
+	out.reserve(s.size());
+	size_t pos = 0;
+	bool removedAny = false;
+	while (pos < s.size())
+	{
+		const size_t nl = s.find('\n', pos);
+		const size_t end = (nl == std::string::npos) ? s.size() : nl;
+		const std::string line = s.substr(pos, end - pos);
+		bool removeLine = false;
+		for (size_t i = 0; i < prefixes.size(); ++i)
+		{
+			if (line.find(prefixes[i]) == 0)
+			{
+				removeLine = true;
+				removedAny = true;
+				break;
+			}
+		}
+		if (!removeLine)
+		{
+			out += line;
+			if (nl != std::string::npos)
+				out += "\n";
+		}
+		pos = (nl == std::string::npos) ? s.size() : (nl + 1);
+	}
+	return removedAny && write_text_file(path, out);
+}
+
 static bool parse_kv_manifest(const std::string& path, std::map<std::string, std::string>& outKv)
 {
 	outKv.clear();
@@ -193,6 +228,65 @@ static bool flip_one_byte_in_file(const std::string& path, unsigned long long of
 	io.write(&c, 1);
 	return static_cast<bool>(io);
 }
+
+struct EnvVarGuard
+{
+	std::string name;
+	bool hadOld;
+	std::string oldValue;
+
+	explicit EnvVarGuard(const char* n)
+	    : name(n ? n : ""),
+	      hadOld(false),
+	      oldValue()
+	{
+		if (!name.empty())
+		{
+			const char* v = ::getenv(name.c_str());
+			if (v)
+			{
+				hadOld = true;
+				oldValue = v;
+			}
+		}
+	}
+
+	void set(const char* v)
+	{
+		if (name.empty())
+			return;
+#if defined(_WIN32)
+		(void)::_putenv_s(name.c_str(), v ? v : "");
+#else
+		(void)::setenv(name.c_str(), v ? v : "", 1);
+#endif
+	}
+
+	void unset()
+	{
+		if (name.empty())
+			return;
+#if defined(_WIN32)
+		(void)::_putenv_s(name.c_str(), "");
+#else
+		(void)::unsetenv(name.c_str());
+#endif
+	}
+
+	~EnvVarGuard()
+	{
+		if (name.empty())
+			return;
+		if (hadOld)
+			set(oldValue.c_str());
+		else
+			unset();
+	}
+
+private:
+	EnvVarGuard(const EnvVarGuard&);
+	EnvVarGuard& operator=(const EnvVarGuard&);
+};
 
 struct CheckpointTensorLoc
 {
@@ -2197,6 +2291,236 @@ void NNSaveLoadUnitTest()
 			         "==============NNSaveLoad::TokValidate_SpecialIdRangeShouldFail() Failed==============",
 			         !st.ok());
 		}
+	}
+
+	// ============================
+	// Case P: saveModel can bootstrap uninitialized tensors via externalDI
+	// ============================
+	{
+		printf("[UT-NN] saveModel bootstraps uninitialized tensors via externalDI\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_external_di_bootstrap",
+		                                     2u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     3,
+		                                     glades::GMath::TANH);
+		fixture.setTrainPair(0u, 1.0f, 0.0f);
+		fixture.setTrainPair(1u, 2.0f, 1.0f);
+
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		net.setSeed(2468u);
+
+		const std::string modelName = "ut_model_pkg_external_di_bootstrap";
+		const glades::NNetworkStatus stSave = net.saveModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ExternalDI_SaveModel() Failed==============",
+		         stSave.ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ExternalDI_WeightsHeader() Failed==============",
+		         weights_bin_header_ok("database/models/" + modelName + "/weights.bin", /*netType*/ 0u));
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_DFF);
+		const glades::NNetworkStatus stLoad = net2.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::ExternalDI_LoadModel() Failed==============",
+		         stLoad.ok());
+	}
+
+	// ============================
+	// Case Q: tokenizer presence mismatch between manifest and package should fail load
+	// ============================
+	{
+		printf("[UT-NN] loadModel rejects tokenizer presence mismatch\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_tok_presence_mismatch",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_Init() Failed==============",
+		         net.test(di).ok());
+
+		glades::NNetwork::TokenizerArtifacts ta;
+		ta.type = "custom";
+		ta.vocab.push_back("<pad>");
+		ta.vocab.push_back("hello");
+		ta.padTokenId = 0;
+		ta.bosTokenId = -1;
+		ta.eosTokenId = -1;
+		ta.unkTokenId = -1;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_SetTokenizer() Failed==============",
+		         net.setTokenizerArtifacts(ta).ok());
+
+		const std::string modelName = "ut_model_pkg_tok_presence_mismatch";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_CorruptManifest() Failed==============",
+		         replace_line_prefix_in_file("database/models/" + modelName + "/manifest.txt",
+		                                     "tokenizer.present=",
+		                                     "tokenizer.present=0"));
+
+		glades::NNetwork netBad(glades::NNetwork::TYPE_DFF);
+		const glades::NNetworkStatus st = netBad.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_LoadShouldFail() Failed==============",
+		         !st.ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TokPresence_Message() Failed==============",
+		         st.message.find("tokenizer.present=0") != std::string::npos);
+	}
+
+	// ============================
+	// Case R: transformer model packages require TrainingConfig on load
+	// ============================
+	{
+		printf("[UT-NN] Transformer model load requires persisted TrainingConfig\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_tr_missing_training_cfg",
+		                                     2u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     16,
+		                                     glades::GMath::LINEAR);
+		fixture.setTrainPair(0u, 1.0f, 0.0f);
+		fixture.setTrainPair(1u, 2.0f, 1.0f);
+
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_Init() Failed==============",
+		         net.test(di).ok());
+
+		const std::string modelName = "ut_model_pkg_tr_missing_training_cfg";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		std::vector<std::string> prefixes;
+		prefixes.push_back("training.");
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_RemoveTrainingLines() Failed==============",
+		         remove_lines_with_prefixes_in_file("database/models/" + modelName + "/manifest.txt", prefixes));
+
+		glades::NNetwork netBad(glades::NNetwork::TYPE_TRANSFORMER_ENCODER);
+		const glades::NNetworkStatus st = netBad.loadModel(modelName, di);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_LoadShouldFail() Failed==============",
+		         !st.ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::TrMissingCfg_Message() Failed==============",
+		         st.message.find("missing TrainingConfig") != std::string::npos);
+	}
+
+	// ============================
+	// Case S: checkpoint root override and default maxShardBytes contract
+	// ============================
+	{
+		printf("[UT-NN] Checkpoint root override + default maxShardBytes\n");
+		OwnedNumberPersistenceFixture fixture("ut_ckpt_env_root_default_max",
+		                                     2u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION,
+		                                     4,
+		                                     glades::GMath::TANH);
+		fixture.setTrainPair(0u, 0.0f, 0.0f);
+		fixture.setTrainPair(1u, 1.0f, 1.0f);
+
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_Init() Failed==============",
+		         net.test(di).ok());
+
+		std::ostringstream root;
+		root << "/tmp/glades_ut_checkpoint_root_" << static_cast<unsigned long long>(::getpid());
+		EnvVarGuard rootGuard("GLADES_CHECKPOINT_ROOT");
+		rootGuard.set(root.str().c_str());
+
+		glades::NNetwork::CheckpointConfig ccfg;
+		ccfg.includeOptimizerState = false;
+		ccfg.maxShardBytes = 0u;
+		const std::string ckptName = "ut_checkpoint_env_root_default_max";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_SaveCheckpoint() Failed==============",
+		         net.saveCheckpoint(ckptName, ccfg).ok());
+
+		const std::string manifestPath = root.str() + "/" + ckptName + "/manifest.txt";
+		std::map<std::string, std::string> kv;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_ReadManifest() Failed==============",
+		         parse_kv_manifest(manifestPath, kv));
+		unsigned long long maxShardBytes = 0ull;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_MaxShardBytesPresent() Failed==============",
+		         kv_get_u64(kv, "maxShardBytes", maxShardBytes));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_MaxShardBytesDefaulted() Failed==============",
+		         maxShardBytes == (1024ull * 1024ull * 1024ull));
+
+		glades::NNetwork::PersistenceDiagnostics diag;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_GetDiag() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_DiagMaxShardBytes() Failed==============",
+		         diag.lastMaxShardBytes == (1024ull * 1024ull * 1024ull));
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::CkptEnvRoot_LoadCheckpoint() Failed==============",
+		         net2.loadCheckpoint(ckptName, di).ok());
+	}
+
+	// ============================
+	// Case T: load operations do not mutate persistence diagnostics
+	// ============================
+	{
+		printf("[UT-NN] loadModel leaves persistence diagnostics unchanged\n");
+		OwnedNumberPersistenceFixture fixture("ut_model_load_diag_stability",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_Init() Failed==============",
+		         net.test(di).ok());
+
+		const std::string modelName = "ut_model_pkg_load_diag_stability";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+
+		glades::NNetwork net2(glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_LoadModel() Failed==============",
+		         net2.loadModel(modelName, di).ok());
+
+		glades::NNetwork::PersistenceDiagnostics diag;
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_GetDiagnostics() Failed==============",
+		         net2.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::LoadDiag_CountersUnchanged() Failed==============",
+		         diag.totalPersistenceOps == 0ULL &&
+		         diag.totalPersistenceSuccesses == 0ULL &&
+		         diag.totalPersistenceFailures == 0ULL &&
+		         diag.lastOperation.empty());
 	}
 
     printf("\n============================================================\n");
