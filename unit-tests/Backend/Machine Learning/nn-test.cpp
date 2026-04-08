@@ -3444,6 +3444,7 @@ void NNTransformerUnitTest()
 					cfg.transformer.enableTokenEmbedding = true;
 					cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
 					cfg.transformer.tieEmbeddings = true;
+					cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
 					cfg.transformer.nHeadsOverride = 2;
 					cfg.transformer.dFFOverride = 16;
 					cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
@@ -3565,6 +3566,7 @@ void NNTransformerUnitTest()
 					cfg.transformer.enableTokenEmbedding = true;
 					cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
 					cfg.transformer.tieEmbeddings = true;
+					cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
 					cfg.transformer.nHeadsOverride = 2;
 					cfg.transformer.dFFOverride = 16;
 					cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;

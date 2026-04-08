@@ -21,7 +21,9 @@ void G_assert(const char* fileName, int lineNo, const char* failureMsg, bool exp
 	if(!expr)
 	{
 		printf("Unit Test Error %s[%d]: %s\n", fileName, lineNo, failureMsg);
-		assert (expr);
+		fflush(stdout);
+		fflush(stderr);
+		abort();
 	}
 	else
 	{

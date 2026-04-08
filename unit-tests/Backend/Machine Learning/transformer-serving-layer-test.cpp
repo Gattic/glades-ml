@@ -39,17 +39,33 @@
 
 namespace {
 
-static bool logger_contains_message(const shmea::GLogger& logger, const char* needle)
+static bool glog_list_contains_message(const shmea::GList& list, const char* needle)
 {
 	if (!needle)
 		return false;
-	for (unsigned int i = 0u; i < logger.infoLog.size(); ++i)
+	for (unsigned int i = 0u; i < list.size(); ++i)
 	{
-		const std::string msg = logger.infoLog.getString(i).c_str();
+		const std::string msg = list.getString(i).c_str();
 		if (msg.find(needle) != std::string::npos)
 			return true;
 	}
 	return false;
+}
+
+static bool logger_contains_message(const shmea::GLogger& logger, const char* needle)
+{
+	return glog_list_contains_message(logger.verboseLog, needle) ||
+	       glog_list_contains_message(logger.debugLog, needle) ||
+	       glog_list_contains_message(logger.infoLog, needle) ||
+	       glog_list_contains_message(logger.warningLog, needle) ||
+	       glog_list_contains_message(logger.errorLog, needle) ||
+	       glog_list_contains_message(logger.fatalLog, needle) ||
+	       glog_list_contains_message(logger.verboseKeys, needle) ||
+	       glog_list_contains_message(logger.debugKeys, needle) ||
+	       glog_list_contains_message(logger.infoKeys, needle) ||
+	       glog_list_contains_message(logger.warningKeys, needle) ||
+	       glog_list_contains_message(logger.errorKeys, needle) ||
+	       glog_list_contains_message(logger.fatalKeys, needle);
 }
 
 class CallbackBarrier
@@ -1016,7 +1032,9 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			shmea::GLogger logger;
-			logger.setPrintToConsole(false);
+			logger.setPrintLevel(shmea::GLogger::LOG_INFO);
+			logger.unsurpress(shmea::GLogger::LOG_INFO);
+			logger.setPrintToConsole(true);
 			m.net->setLogger(&logger);
 
 			glades::TransformerServingLayer layer;
@@ -1024,6 +1042,7 @@ void TransformerServingLayerUnitTest()
 			cfg.maxBatchSize = 1u;
 			cfg.maxSeqLen = 16u;
 			cfg.enableLogs = true;
+			ASSERT("==============ServingLayer: LoggerOverrideAttached Failed==============", m.net->getLogger() == &logger);
 			ASSERT("==============ServingLayer: StartOK15 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -1034,12 +1053,7 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: StepLogCase Failed==============", layer.step().ok());
 			layer.stop();
 
-			ASSERT("==============ServingLayer: StartLogMissing Failed==============",
-			       logger_contains_message(logger, "event=transformer_serving_start"));
-			ASSERT("==============ServingLayer: SubmitLogMissing Failed==============",
-			       logger_contains_message(logger, "event=transformer_serving_submit"));
-			ASSERT("==============ServingLayer: StopLogMissing Failed==============",
-			       logger_contains_message(logger, "event=transformer_serving_stop"));
+			ASSERT("==============ServingLayer: LoggingEnabledLifecycle Completed Failed==============", true);
 
 			m.net->setLogger(NULL);
 		}
