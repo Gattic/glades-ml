@@ -13,6 +13,83 @@
 namespace glades {
 namespace gpu {
 
+struct HostFloatBufferView
+{
+	float* data;
+	size_t size;
+
+	HostFloatBufferView()
+	    : data(0), size(0)
+	{
+	}
+};
+
+struct TransformerHostBlockWeightsView
+{
+	HostFloatBufferView ln1Gamma;
+	HostFloatBufferView ln1Beta;
+	HostFloatBufferView Wq;
+	HostFloatBufferView Wk;
+	HostFloatBufferView Wv;
+	HostFloatBufferView Wo;
+	HostFloatBufferView bq;
+	HostFloatBufferView bk;
+	HostFloatBufferView bv;
+	HostFloatBufferView bo;
+	HostFloatBufferView ln2Gamma;
+	HostFloatBufferView ln2Beta;
+	HostFloatBufferView W1;
+	HostFloatBufferView W2;
+	HostFloatBufferView b1;
+	HostFloatBufferView b2;
+};
+
+struct TransformerHostWeightsView
+{
+	HostFloatBufferView tokE;
+	HostFloatBufferView WIn;
+	HostFloatBufferView bIn;
+	HostFloatBufferView WOut;
+	HostFloatBufferView bOut;
+	HostFloatBufferView lmBias;
+	HostFloatBufferView lnFinalGamma;
+	HostFloatBufferView lnFinalBeta;
+	TransformerHostBlockWeightsView* blocks;
+	unsigned int blockCount;
+
+	TransformerHostWeightsView()
+	    : blocks(0),
+	      blockCount(0u)
+	{
+	}
+};
+
+struct TransformerGpuScratchConfig
+{
+	unsigned int T;
+	unsigned int inputSize;
+	unsigned int outSize;
+	unsigned int dModel;
+	unsigned int dFF;
+	unsigned int dModelKV;
+	unsigned int nHeads;
+	unsigned int nLayers;
+	unsigned int ff1Width;
+
+	TransformerGpuScratchConfig()
+	    : T(0u),
+	      inputSize(0u),
+	      outSize(0u),
+	      dModel(0u),
+	      dFF(0u),
+	      dModelKV(0u),
+	      nHeads(0u),
+	      nLayers(0u),
+	      ff1Width(0u)
+	{
+	}
+};
+
 // GPU-resident copy of all transformer weights + optimizer state.
 // Layout mirrors NNetwork::TensorTransformerState.
 struct GpuTransformerWeights
@@ -247,6 +324,9 @@ struct GpuTransformerScratch
 	void free();
 };
 
+bool ensureTransformerScratch(GpuTransformerScratch*& scratch,
+                              const TransformerGpuScratchConfig& cfg);
+
 // Upload CPU TensorTransformerState weights -> GPU.
 // Assumes gpu weights are already allocated with matching dimensions.
 // The cpu_* parameters are pointers to the CPU-side weight arrays.
@@ -289,6 +369,8 @@ bool uploadTransformerDenseInputs(GpuTransformerScratch& scratch,
                                   const float* hostInputs, size_t count);
 bool uploadTransformerRopeInvFreq(GpuTransformerScratch& scratch,
                                   const float* invFreq, size_t count);
+bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
+                                      const TransformerHostWeightsView& host);
 
 // Zero all gradient buffers on GPU.
 bool zeroTransformerGradients(GpuTransformerWeights& gpu);

@@ -219,6 +219,70 @@ static glades::NNetworkStatus build_run_preflight(const glades::DataInput& di,
 	return validate_row_shape_contracts(di, isTrainRun, out.expectedFeatureCount, out.expectedOutputSize);
 }
 
+struct TrainerCallbackLifecycle
+{
+	TrainerCallbackLifecycle(glades::NNetwork& n,
+	                         int run,
+	                         glades::ITrainingCallbacks* callbacks)
+	    : net(n),
+	      runType(run),
+	      cb(callbacks),
+	      runStarted(false),
+	      runEnded(false)
+	{
+	}
+
+	void beginRun()
+	{
+		if (runStarted)
+			return;
+		runStarted = true;
+		if (cb)
+			cb->onRunStart(net, runType);
+	}
+
+	bool finishEpoch(const glades::TrainingConfig& trainingConfig,
+	                 const glades::NNetworkEpochMetrics& metrics)
+	{
+		bool callbackStop = false;
+		if (cb)
+			callbackStop = cb->onEpochEnd(net, metrics);
+
+		// DDP: consensus on early-stop so all workers stop together.
+		if (trainingConfig.ddp.enable && glades::ddp::worldSize() > 1)
+		{
+			unsigned int stopFlag = callbackStop ? 1u : 0u;
+			glades::ddp::allReduceSumInPlace(&stopFlag, 1);
+			callbackStop = (stopFlag > 0u);
+		}
+		return callbackStop;
+	}
+
+	void finishRun()
+	{
+		if (!runStarted || runEnded)
+			return;
+		runEnded = true;
+		if (cb)
+			cb->onRunEnd(net, runType);
+	}
+
+	~TrainerCallbackLifecycle()
+	{
+		finishRun();
+	}
+
+private:
+	glades::NNetwork& net;
+	int runType;
+	glades::ITrainingCallbacks* cb;
+	bool runStarted;
+	bool runEnded;
+
+	TrainerCallbackLifecycle(const TrainerCallbackLifecycle&);
+	TrainerCallbackLifecycle& operator=(const TrainerCallbackLifecycle&);
+};
+
 } // namespace
 
 glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
@@ -344,8 +408,8 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	net.running = true;
 	net.firstRunActivation = false;
 
-	if (cb)
-		cb->onRunStart(net, runType);
+	TrainerCallbackLifecycle callbackLifecycle(net, runType, cb);
+	callbackLifecycle.beginRun();
 
 	while (net.running)
 	{
@@ -392,8 +456,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			{
 				// Stop immediately on internal failures: continuing would produce silent corruption.
 				net.running = false;
-				if (cb)
-					cb->onRunEnd(net, runType);
+				callbackLifecycle.finishRun();
 				return stStep;
 			}
 		}
@@ -409,8 +472,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			net.running = false;
 			net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 			                                "Trainer::run: non-finite training aggregates detected (NaN/Inf). Aborting run.");
-			if (cb)
-				cb->onRunEnd(net, runType);
+			callbackLifecycle.finishRun();
 			return net.lastStatus;
 		}
 
@@ -489,8 +551,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			net.running = false;
 			net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 			                                "Trainer::run: non-finite metrics detected (NaN/Inf). Aborting run.");
-			if (cb)
-				cb->onRunEnd(net, runType);
+			callbackLifecycle.finishRun();
 			return net.lastStatus;
 		}
 
@@ -556,8 +617,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			net.running = false;
 			net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 			                                "Trainer::run: non-finite schedule/gradient metadata detected (NaN/Inf). Aborting run.");
-			if (cb)
-				cb->onRunEnd(net, runType);
+			callbackLifecycle.finishRun();
 			return net.lastStatus;
 		}
 
@@ -604,17 +664,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			}
 		}
 
-		bool callbackStop = false;
-		if (cb)
-			callbackStop = cb->onEpochEnd(net, metrics);
-
-		// DDP: consensus on early-stop so all workers stop together.
-		if (net.trainingConfig.ddp.enable && glades::ddp::worldSize() > 1)
-		{
-			unsigned int stopFlag = callbackStop ? 1u : 0u;
-			glades::ddp::allReduceSumInPlace(&stopFlag, 1);
-			callbackStop = (stopFlag > 0u);
-		}
+		const bool callbackStop = callbackLifecycle.finishEpoch(net.trainingConfig, metrics);
 
 		net.cNodeActivations.clear();
 
@@ -630,8 +680,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 			break;
 	}
 
-	if (cb)
-		cb->onRunEnd(net, runType);
+	callbackLifecycle.finishRun();
 
 	// So the network doesnt immediately quit next time and we can prematurely start our net
 	net.running = false;

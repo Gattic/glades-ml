@@ -247,6 +247,33 @@ GpuTransformerScratch::~GpuTransformerScratch()
 	free();
 }
 
+bool ensureTransformerScratch(GpuTransformerScratch*& scratch,
+                              const TransformerGpuScratchConfig& cfg)
+{
+	if (!scratch)
+		scratch = new GpuTransformerScratch();
+	if (!scratch)
+		return false;
+
+	const bool shapeMatches =
+	    scratch->initialized &&
+	    scratch->T >= cfg.T &&
+	    scratch->inputSize == cfg.inputSize &&
+	    scratch->outSize == cfg.outSize &&
+	    scratch->dModel == cfg.dModel &&
+	    scratch->dFF == cfg.dFF &&
+	    scratch->dModelKV == cfg.dModelKV &&
+	    scratch->nHeads == cfg.nHeads &&
+	    scratch->nLayers == cfg.nLayers &&
+	    scratch->ff1Width == cfg.ff1Width;
+	if (shapeMatches)
+		return true;
+
+	return scratch->allocate(cfg.T, cfg.inputSize, cfg.outSize,
+	                         cfg.dModel, cfg.dFF, cfg.dModelKV,
+	                         cfg.nHeads, cfg.nLayers, cfg.ff1Width);
+}
+
 bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigned int os,
                                       unsigned int dm, unsigned int df, unsigned int dmkv,
                                       unsigned int nh, unsigned int nl, unsigned int f1w)
@@ -510,6 +537,62 @@ bool uploadTransformerRopeInvFreq(GpuTransformerScratch& scratch,
 	if (!scratch.initialized || !invFreq)
 		return false;
 	return scratch.gpuInvFreq.uploadAsync(invFreq, count);
+}
+
+static bool download_host_buffer(const GpuBuffer<float>& src,
+                                 const HostFloatBufferView& dst)
+{
+	if (dst.size == 0u)
+		return true;
+	if (!dst.data || !src.allocated() || src.size() < dst.size)
+		return false;
+	return src.download(dst.data, dst.size);
+}
+
+bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
+                                      const TransformerHostWeightsView& host)
+{
+	if (!downloadTransformerWeights(gpu,
+	                                host.tokE.data, host.tokE.size,
+	                                host.WIn.data, host.WIn.size,
+	                                host.bIn.data, host.bIn.size,
+	                                host.WOut.data, host.WOut.size,
+	                                host.bOut.data, host.bOut.size,
+	                                host.lmBias.data, host.lmBias.size,
+	                                host.lnFinalGamma.data, host.lnFinalGamma.size,
+	                                host.lnFinalBeta.data, host.lnFinalBeta.size))
+	{
+		return false;
+	}
+
+	if (host.blockCount != gpu.nLayers)
+		return false;
+	if (gpu.nLayers > 0u && !host.blocks)
+		return false;
+
+	for (unsigned int l = 0; l < gpu.nLayers; ++l)
+	{
+		const GpuTransformerWeights::Block& gb = gpu.blocks[l];
+		const TransformerHostBlockWeightsView& hb = host.blocks[l];
+		if (!download_host_buffer(gb.Wq, hb.Wq)) return false;
+		if (!download_host_buffer(gb.Wk, hb.Wk)) return false;
+		if (!download_host_buffer(gb.Wv, hb.Wv)) return false;
+		if (!download_host_buffer(gb.Wo, hb.Wo)) return false;
+		if (!download_host_buffer(gb.W1, hb.W1)) return false;
+		if (!download_host_buffer(gb.W2, hb.W2)) return false;
+		if (!download_host_buffer(gb.bq, hb.bq)) return false;
+		if (!download_host_buffer(gb.bk, hb.bk)) return false;
+		if (!download_host_buffer(gb.bv, hb.bv)) return false;
+		if (!download_host_buffer(gb.bo, hb.bo)) return false;
+		if (!download_host_buffer(gb.b1, hb.b1)) return false;
+		if (!download_host_buffer(gb.b2, hb.b2)) return false;
+		if (!download_host_buffer(gb.ln1Gamma, hb.ln1Gamma)) return false;
+		if (!download_host_buffer(gb.ln1Beta, hb.ln1Beta)) return false;
+		if (!download_host_buffer(gb.ln2Gamma, hb.ln2Gamma)) return false;
+		if (!download_host_buffer(gb.ln2Beta, hb.ln2Beta)) return false;
+	}
+
+	return true;
 }
 
 // Helper: append a GpuBuffer to the batch-zero list if allocated.

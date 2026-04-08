@@ -35,6 +35,171 @@ using namespace glades;
 using namespace glades::logfmt;
 using namespace glades::transformer_train_detail;
 
+namespace {
+
+static glades::transformer_train_detail::LinearWeightView make_linear_weight_view(const std::vector<float>& weights,
+                                                                                  const std::vector<uint16_t>& lowpWeights,
+                                                                                  const std::vector<float>& bias,
+                                                                                  bool useLowpWeights,
+                                                                                  int lowpDType)
+{
+	glades::transformer_train_detail::LinearWeightView view;
+	view.weights = weights.empty() ? NULL : &weights[0];
+	view.weightCount = static_cast<unsigned int>(weights.size());
+	view.lowpWeights = lowpWeights.empty() ? NULL : &lowpWeights[0];
+	view.lowpWeightCount = static_cast<unsigned int>(lowpWeights.size());
+	view.bias = bias.empty() ? NULL : &bias[0];
+	view.biasCount = static_cast<unsigned int>(bias.size());
+	view.useLowpWeights = useLowpWeights;
+	view.lowpDType = lowpDType;
+	return view;
+}
+
+static glades::transformer_train_detail::DoubleBufferView make_double_buffer_view(const std::vector<double>& values)
+{
+	glades::transformer_train_detail::DoubleBufferView view;
+	view.data = values.empty() ? NULL : &values[0];
+	view.size = static_cast<unsigned int>(values.size());
+	return view;
+}
+
+#ifdef GLADES_HAVE_CUDA
+static glades::gpu::HostFloatBufferView make_host_float_buffer_view(std::vector<float>& values)
+{
+	glades::gpu::HostFloatBufferView view;
+	view.data = values.empty() ? NULL : &values[0];
+	view.size = values.size();
+	return view;
+}
+
+static glades::gpu::TransformerHostBlockWeightsView make_transformer_host_block_view(std::vector<float>& ln1Gamma,
+                                                                                     std::vector<float>& ln1Beta,
+                                                                                     std::vector<float>& Wq,
+                                                                                     std::vector<float>& Wk,
+                                                                                     std::vector<float>& Wv,
+                                                                                     std::vector<float>& Wo,
+                                                                                     std::vector<float>& bq,
+                                                                                     std::vector<float>& bk,
+                                                                                     std::vector<float>& bv,
+                                                                                     std::vector<float>& bo,
+                                                                                     std::vector<float>& ln2Gamma,
+                                                                                     std::vector<float>& ln2Beta,
+                                                                                     std::vector<float>& W1,
+                                                                                     std::vector<float>& W2,
+                                                                                     std::vector<float>& b1,
+                                                                                     std::vector<float>& b2)
+{
+	glades::gpu::TransformerHostBlockWeightsView view;
+	view.ln1Gamma = make_host_float_buffer_view(ln1Gamma);
+	view.ln1Beta = make_host_float_buffer_view(ln1Beta);
+	view.Wq = make_host_float_buffer_view(Wq);
+	view.Wk = make_host_float_buffer_view(Wk);
+	view.Wv = make_host_float_buffer_view(Wv);
+	view.Wo = make_host_float_buffer_view(Wo);
+	view.bq = make_host_float_buffer_view(bq);
+	view.bk = make_host_float_buffer_view(bk);
+	view.bv = make_host_float_buffer_view(bv);
+	view.bo = make_host_float_buffer_view(bo);
+	view.ln2Gamma = make_host_float_buffer_view(ln2Gamma);
+	view.ln2Beta = make_host_float_buffer_view(ln2Beta);
+	view.W1 = make_host_float_buffer_view(W1);
+	view.W2 = make_host_float_buffer_view(W2);
+	view.b1 = make_host_float_buffer_view(b1);
+	view.b2 = make_host_float_buffer_view(b2);
+	return view;
+}
+#endif
+
+static void log_transformer_epoch_progress(shmea::GLogger* logger,
+                                           int netType,
+                                           bool isTrain,
+                                           int epochIdx,
+                                           unsigned int seqDone,
+                                           unsigned int seqCount,
+                                           int64_t nowMs,
+                                           int64_t epochStartMs,
+                                           unsigned long long tokensProcessed,
+                                           unsigned long long targetsProcessed,
+                                           bool tokenLM,
+                                           glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind,
+                                           double tokenLmNllSum,
+                                           unsigned long long tokenLmTokenCount,
+                                           unsigned long long clsCorrect,
+                                           unsigned long long clsTotal,
+                                           float lossSoFar,
+                                           float lrScheduleMultiplier,
+                                           float globalGradClipNorm,
+                                           float lastGradNorm,
+                                           float lastGradNormScale,
+                                           bool mpUseLossScaling,
+                                           float mpLossScale,
+                                           unsigned long long optimizerStep)
+{
+	if (!logger)
+		return;
+
+	const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
+	const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
+
+	std::ostringstream oss;
+	oss << "event=nn_epoch_progress";
+	append_logfmt_kv(oss, "net_type", netType);
+	append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
+	append_logfmt_kv(oss, "epoch", epochIdx);
+	append_logfmt_kv(oss, "seq_done", seqDone);
+	append_logfmt_kv(oss, "seq_total", seqCount);
+	append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
+	append_logfmt_kv(oss, "targets_seen", targetsProcessed);
+	append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
+	if (tokenLM)
+	{
+		const bool tokenLmFullSoftmax = (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
+		append_logfmt_kv(oss, "token_lm_loss_kind", std::string(tokenLmFullSoftmax ? "full_softmax" : "sampled_softmax"));
+		const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
+		append_logfmt_kv(oss, "nll", meanNll);
+		if (tokenLmFullSoftmax)
+		{
+			double ppl = 0.0;
+			if (tokenLmTokenCount > 0ULL)
+			{
+				double arg = meanNll;
+				if (arg > 80.0) arg = 80.0;
+				if (arg < -80.0) arg = -80.0;
+				ppl = exp(arg);
+			}
+			append_logfmt_kv(oss, "perplexity", ppl);
+			append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+		}
+		else
+		{
+			append_logfmt_kv(oss, "perplexity", std::string("na"));
+			append_logfmt_kv(oss, "acc_top1", std::string("na"));
+		}
+	}
+	else
+	{
+		append_logfmt_kv(oss, "loss_so_far", lossSoFar);
+	}
+	append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
+	if (globalGradClipNorm > 0.0f)
+	{
+		append_logfmt_kv(oss, "grad_norm", lastGradNorm);
+		append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
+	}
+	else
+	{
+		append_logfmt_kv(oss, "grad_norm", std::string("na"));
+		append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
+	}
+	append_logfmt_kv(oss, "optimizer_step", optimizerStep);
+	if (mpUseLossScaling)
+		append_logfmt_kv(oss, "loss_scale", mpLossScale);
+
+	logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+}
+
+} // namespace
+
 void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int runType)
 {
 	using namespace glades::sgd_detail;
@@ -1276,6 +1441,142 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	int64_t lastProgressMs = epochStartMs;
 	static const int64_t kProgressIntervalMs = 5000; // 5s heartbeat
 
+	struct MinibatchDriver
+	{
+		glades::TrainingConfig& trainingConfig;
+		TensorTransformerState& tt;
+		ClearGrads& clearGrads;
+		ApplyBatch& applyBatch;
+		DDPReduceGrads& ddpReduceGrads;
+		shmea::GLogger* logger;
+		bool ddpEnabled;
+		bool mpEnable;
+		bool mpUseLossScaling;
+		bool mpDynamicLossScaling;
+		unsigned int optimizerStepsPerEpoch;
+		int epochIdx;
+		int lrScheduleEpochOffset;
+		float& lrScheduleMultiplier;
+		int netType;
+
+		MinibatchDriver(glades::TrainingConfig& cfg,
+		                TensorTransformerState& state,
+		                ClearGrads& clearFn,
+		                ApplyBatch& applyFn,
+		                DDPReduceGrads& ddpReduceFn,
+		                shmea::GLogger* log,
+		                bool ddpOn,
+		                bool mpOn,
+		                bool mpLossScaleOn,
+		                bool mpDynamicOn,
+		                unsigned int stepsPerEpoch,
+		                int epoch,
+		                int epochOffset,
+		                float& lrMult,
+		                int type)
+		    : trainingConfig(cfg),
+		      tt(state),
+		      clearGrads(clearFn),
+		      applyBatch(applyFn),
+		      ddpReduceGrads(ddpReduceFn),
+		      logger(log),
+		      ddpEnabled(ddpOn),
+		      mpEnable(mpOn),
+		      mpUseLossScaling(mpLossScaleOn),
+		      mpDynamicLossScaling(mpDynamicOn),
+		      optimizerStepsPerEpoch(stepsPerEpoch),
+		      epochIdx(epoch),
+		      lrScheduleEpochOffset(epochOffset),
+		      lrScheduleMultiplier(lrMult),
+		      netType(type)
+		{
+		}
+
+		void log_loss_scale_change(const char* eventName, float prevScale) const
+		{
+			if (!logger)
+				return;
+			std::ostringstream oss;
+			oss << "event=" << eventName;
+			append_logfmt_kv(oss, "net_type", netType);
+			append_logfmt_kv(oss, "epoch", epochIdx);
+			append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
+			append_logfmt_kv(oss, "loss_scale_prev", prevScale);
+			append_logfmt_kv(oss, "loss_scale_new", tt.mpLossScale);
+			logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+		}
+
+		void maybe_backoff_loss_scale()
+		{
+			if (!mpDynamicLossScaling)
+				return;
+			const float prev = tt.mpLossScale;
+			tt.mpLossScale *= trainingConfig.mixedPrecision.backoffFactor;
+			if (tt.mpLossScale < trainingConfig.mixedPrecision.lossScaleMin)
+				tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMin;
+			tt.mpLossScaleGoodSteps = 0;
+			log_loss_scale_change("nn_loss_scale_backoff", prev);
+		}
+
+		void maybe_grow_loss_scale()
+		{
+			if (!mpDynamicLossScaling)
+				return;
+			tt.mpLossScaleGoodSteps += 1;
+			if (tt.mpLossScaleGoodSteps < trainingConfig.mixedPrecision.growthInterval)
+				return;
+			const float prev = tt.mpLossScale;
+			tt.mpLossScale *= trainingConfig.mixedPrecision.growthFactor;
+			if (tt.mpLossScale > trainingConfig.mixedPrecision.lossScaleMax)
+				tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMax;
+			tt.mpLossScaleGoodSteps = 0;
+			if (tt.mpLossScale != prev)
+				log_loss_scale_change("nn_loss_scale_grow", prev);
+		}
+
+		bool apply_ready_batch(unsigned int& batchTimeSteps,
+		                       unsigned int stepInEpoch)
+		{
+			if (batchTimeSteps == 0u)
+				return true;
+
+			if (mpUseLossScaling && !MixedPrecisionHelper::grads_all_finite(tt))
+			{
+				maybe_backoff_loss_scale();
+				clearGrads();
+				return true;
+			}
+
+			if (mpUseLossScaling && tt.mpLossScale != 1.0f)
+				MixedPrecisionHelper::scale_all_grads(tt, 1.0f / tt.mpLossScale);
+
+			if (ddpEnabled)
+				ddpReduceGrads(batchTimeSteps);
+
+			lrScheduleMultiplier = transformer_schedule_multiplier(
+			    trainingConfig.lrSchedule,
+			    epochIdx + lrScheduleEpochOffset,
+			    stepInEpoch,
+			    optimizerStepsPerEpoch);
+			if (!applyBatch(batchTimeSteps))
+				return false;
+
+			maybe_grow_loss_scale();
+
+			if (mpEnable)
+				MixedPrecisionHelper::ensure_transformer_lowp_weights(tt, trainingConfig);
+			return true;
+		}
+	};
+
+	MinibatchDriver minibatchDriver(trainingConfig, tt,
+	                                clearGrads, applyBatch, ddpReduceGrads,
+	                                logger, ddpEnabled, mpEnable,
+	                                mpUseLossScaling, mpDynamicLossScaling,
+	                                optimizerStepsPerEpoch, epochIdx,
+	                                lrScheduleEpochOffset, lrScheduleMultiplier,
+	                                netType);
+
 #ifdef GLADES_HAVE_CUDA
 	// === GPU accelerated training path ===
 	//
@@ -1283,19 +1584,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	// loop to the GPU. Weights stay GPU-resident; only token inputs and loss/metrics
 	// cross PCIe per sequence.
 	//
-	// If ensureGpuState() fails, fall through to the CPU path silently.
-	if (trainingConfig.gpu.enable && isTrain)
-	{
-		const bool gpuReady = ensureGpuState();
-		if (gpuReady && gpuTransformerWeights && gpuTransformerWeights->initialized)
-		{
-			transformerGpuTrainEpoch(epochCfg, seqCount, epochIdx, epochStartMs,
-			                        tokensProcessed, targetsProcessed,
-			                        tokenLmNllSum, tokenLmTokenCount,
-			                        clsCorrect, clsTotal, logger);
-			return; // GPU path complete; skip CPU fallback.
-		}
-	}
+	// Keep the launch path narrow: allocation/upload ownership live behind dedicated helpers.
+	if (tryRunTransformerGpuEpoch(epochCfg, seqCount, epochIdx, epochStartMs,
+	                              tokensProcessed, targetsProcessed,
+	                              tokenLmNllSum, tokenLmTokenCount,
+	                              clsCorrect, clsTotal, logger))
+		return; // GPU path complete; skip CPU fallback.
 #endif // GLADES_HAVE_CUDA
 
 	// Build shuffled sequence order. When DDP is active, each rank uses a different
@@ -1628,77 +1922,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				// (e.g. all-pad targets). In that case applyBatch() is a no-op.
 				if (timeStepsInBatch > 0u)
 				{
-					// Dynamic loss scaling: detect NaN/Inf in scaled grads, back off, and skip the step.
-					if (mpUseLossScaling && !MixedPrecisionHelper::grads_all_finite(tt))
-					{
-						if (mpDynamicLossScaling)
-						{
-								const float prev = tt.mpLossScale;
-							tt.mpLossScale *= trainingConfig.mixedPrecision.backoffFactor;
-							if (tt.mpLossScale < trainingConfig.mixedPrecision.lossScaleMin)
-								tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMin;
-							tt.mpLossScaleGoodSteps = 0;
-								if (logger)
-								{
-									std::ostringstream oss;
-									oss << "event=nn_loss_scale_backoff";
-									append_logfmt_kv(oss, "net_type", netType);
-									append_logfmt_kv(oss, "epoch", epochIdx);
-									append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
-									append_logfmt_kv(oss, "loss_scale_prev", prev);
-									append_logfmt_kv(oss, "loss_scale_new", tt.mpLossScale);
-									logger->info("NNetwork", shmea::GString(oss.str().c_str()));
-								}
-						}
-						clearGrads();
-					}
-					else
-					{
-						// Unscale gradients back to FP32 magnitude before optimizer/clipping.
-						if (mpUseLossScaling && tt.mpLossScale != 1.0f)
-							MixedPrecisionHelper::scale_all_grads(tt, 1.0f / tt.mpLossScale);
-
-						if (ddpEnabled)
-							ddpReduceGrads(timeStepsInBatch);
-
-						const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
-						lrScheduleMultiplier = transformer_schedule_multiplier(
-						    trainingConfig.lrSchedule,
-						    epochIdx + lrScheduleEpochOffset,
-						    stepInEpoch,
-						    optimizerStepsPerEpoch);
-						if (!applyBatch(timeStepsInBatch))
-							return;
-
-						// Grow loss scale after a run of good steps.
-						if (mpDynamicLossScaling)
-						{
-							tt.mpLossScaleGoodSteps += 1;
-							if (tt.mpLossScaleGoodSteps >= trainingConfig.mixedPrecision.growthInterval)
-							{
-									const float prev = tt.mpLossScale;
-								tt.mpLossScale *= trainingConfig.mixedPrecision.growthFactor;
-								if (tt.mpLossScale > trainingConfig.mixedPrecision.lossScaleMax)
-									tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMax;
-								tt.mpLossScaleGoodSteps = 0;
-									if (logger && tt.mpLossScale != prev)
-									{
-										std::ostringstream oss;
-										oss << "event=nn_loss_scale_grow";
-										append_logfmt_kv(oss, "net_type", netType);
-										append_logfmt_kv(oss, "epoch", epochIdx);
-										append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
-										append_logfmt_kv(oss, "loss_scale_prev", prev);
-										append_logfmt_kv(oss, "loss_scale_new", tt.mpLossScale);
-										logger->info("NNetwork", shmea::GString(oss.str().c_str()));
-									}
-							}
-						}
-
-						// Sync low-precision weight copies from updated master weights.
-						if (mpEnable)
-							MixedPrecisionHelper::ensure_transformer_lowp_weights(tt, trainingConfig);
-					}
+					const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
+					if (!minibatchDriver.apply_ready_batch(timeStepsInBatch, stepInEpoch))
+						return;
 				}
 				seqInBatch = 0u;
 				timeStepsInBatch = 0u;
@@ -1723,67 +1949,17 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			if (!(dueBySeq || dueByTime))
 				continue;
 			lastProgressMs = nowMs;
-			const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
-			const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
-
-			std::ostringstream oss;
-			oss << "event=nn_epoch_progress";
-			append_logfmt_kv(oss, "net_type", netType);
-			append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
-			append_logfmt_kv(oss, "epoch", epochIdx);
-			append_logfmt_kv(oss, "seq_done", s + 1u);
-			append_logfmt_kv(oss, "seq_total", seqCount);
-			append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
-			append_logfmt_kv(oss, "targets_seen", targetsProcessed);
-			append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
-			if (tokenLM)
-			{
-				const bool tokenLmFullSoftmax = (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
-				append_logfmt_kv(oss, "token_lm_loss_kind", std::string(tokenLmFullSoftmax ? "full_softmax" : "sampled_softmax"));
-				const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
-				append_logfmt_kv(oss, "nll", meanNll);
-				if (tokenLmFullSoftmax)
-				{
-					double ppl = 0.0;
-					if (tokenLmTokenCount > 0ULL)
-					{
-						double arg = meanNll;
-						if (arg > 80.0) arg = 80.0;
-						if (arg < -80.0) arg = -80.0;
-						ppl = exp(arg);
-					}
-					append_logfmt_kv(oss, "perplexity", ppl);
-					append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
-				}
-				else
-				{
-					// Sampled-softmax does not produce an exact perplexity, and we do not have a full-vocab argmax.
-					append_logfmt_kv(oss, "perplexity", std::string("na"));
-					append_logfmt_kv(oss, "acc_top1", std::string("na"));
-				}
-			}
-			else
-			{
-				append_logfmt_kv(oss, "loss_so_far", overallTotalError);
-			}
-			append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
-			// Grad-norm is only computed when global grad clipping is enabled (for performance).
-			// Avoid printing misleading zeros when it is disabled.
-			if (trainingConfig.globalGradClipNorm > 0.0f)
-			{
-				append_logfmt_kv(oss, "grad_norm", lastGradNorm);
-				append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
-			}
-			else
-			{
-				append_logfmt_kv(oss, "grad_norm", std::string("na"));
-				append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
-			}
-			append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
-			if (mpUseLossScaling)
-				append_logfmt_kv(oss, "loss_scale", tt.mpLossScale);
-
-			logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+			log_transformer_epoch_progress(logger, netType, isTrain, epochIdx,
+			                               s + 1u, seqCount, nowMs, epochStartMs,
+			                               tokensProcessed, targetsProcessed,
+			                               tokenLM, tokenLmLossKind,
+			                               tokenLmNllSum, tokenLmTokenCount,
+			                               clsCorrect, clsTotal,
+			                               overallTotalError, lrScheduleMultiplier,
+			                               trainingConfig.globalGradClipNorm,
+			                               lastGradNorm, lastGradNormScale,
+			                               mpUseLossScaling, tt.mpLossScale,
+			                               static_cast<unsigned long long>(tt.optimizerStep));
 		}
 	} // sequences
 
@@ -1792,67 +1968,17 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	if (logger)
 	{
 		const int64_t nowMs = getCurrentTimeMilliseconds();
-		const double elapsedMs = static_cast<double>(nowMs - epochStartMs);
-		const double meanNll = (tokenLmTokenCount > 0ULL) ? (tokenLmNllSum / static_cast<double>(tokenLmTokenCount)) : 0.0;
-		double ppl = 0.0;
-		if (tokenLM && tokenLmTokenCount > 0ULL)
-		{
-			double arg = meanNll;
-			if (arg > 80.0) arg = 80.0;
-			if (arg < -80.0) arg = -80.0;
-			ppl = exp(arg);
-		}
-		const double tokPerSec = (elapsedMs > 0.0) ? (static_cast<double>(targetsProcessed) / (elapsedMs / 1000.0)) : 0.0;
-
-		std::ostringstream oss;
-		oss << "event=nn_epoch_progress";
-		append_logfmt_kv(oss, "net_type", netType);
-		append_logfmt_kv(oss, "run_type", std::string(isTrain ? "train" : "eval"));
-		append_logfmt_kv(oss, "epoch", epochIdx);
-		append_logfmt_kv(oss, "seq_done", seqCount);
-		append_logfmt_kv(oss, "seq_total", seqCount);
-		append_logfmt_kv(oss, "tokens_seen", tokensProcessed);
-		append_logfmt_kv(oss, "targets_seen", targetsProcessed);
-		append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
-		// Token LM running loss (mean NLL); for non-tokenLM use overallTotalError accumulator.
-		if (tokenLM)
-		{
-			const bool tokenLmFullSoftmax = (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
-			append_logfmt_kv(oss, "token_lm_loss_kind", std::string(tokenLmFullSoftmax ? "full_softmax" : "sampled_softmax"));
-			append_logfmt_kv(oss, "nll", meanNll);
-			if (tokenLmFullSoftmax)
-			{
-				append_logfmt_kv(oss, "perplexity", ppl);
-				append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
-			}
-			else
-			{
-				append_logfmt_kv(oss, "perplexity", std::string("na"));
-				append_logfmt_kv(oss, "acc_top1", std::string("na"));
-			}
-		}
-		else
-		{
-			append_logfmt_kv(oss, "loss_so_far", overallTotalError);
-		}
-		append_logfmt_kv(oss, "lr_mult", lrScheduleMultiplier);
-		// Grad-norm is only computed when global grad clipping is enabled (for performance).
-		// Avoid printing misleading zeros when it is disabled.
-		if (trainingConfig.globalGradClipNorm > 0.0f)
-		{
-			append_logfmt_kv(oss, "grad_norm", lastGradNorm);
-			append_logfmt_kv(oss, "grad_norm_scale", lastGradNormScale);
-		}
-		else
-		{
-			append_logfmt_kv(oss, "grad_norm", std::string("na"));
-			append_logfmt_kv(oss, "grad_norm_scale", std::string("na"));
-		}
-		append_logfmt_kv(oss, "optimizer_step", static_cast<unsigned long long>(tt.optimizerStep));
-		if (mpUseLossScaling)
-			append_logfmt_kv(oss, "loss_scale", tt.mpLossScale);
-
-		logger->info("NNetwork", shmea::GString(oss.str().c_str()));
+		log_transformer_epoch_progress(logger, netType, isTrain, epochIdx,
+		                               seqCount, seqCount, nowMs, epochStartMs,
+		                               tokensProcessed, targetsProcessed,
+		                               tokenLM, tokenLmLossKind,
+		                               tokenLmNllSum, tokenLmTokenCount,
+		                               clsCorrect, clsTotal,
+		                               overallTotalError, lrScheduleMultiplier,
+		                               trainingConfig.globalGradClipNorm,
+		                               lastGradNorm, lastGradNormScale,
+		                               mpUseLossScaling, tt.mpLossScale,
+		                               static_cast<unsigned long long>(tt.optimizerStep));
 	}
 
 	// DDP: aggregate metrics across all workers before finalization.
@@ -1882,45 +2008,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	// Flush partial minibatch
 	if (isTrain && seqInBatch > 0u && timeStepsInBatch > 0u)
 	{
-		// Dynamic loss scaling: detect NaN/Inf in scaled grads, back off, and skip the step.
-		if (mpUseLossScaling && !MixedPrecisionHelper::grads_all_finite(tt))
-		{
-			if (mpDynamicLossScaling)
-			{
-				tt.mpLossScale *= trainingConfig.mixedPrecision.backoffFactor;
-				if (tt.mpLossScale < trainingConfig.mixedPrecision.lossScaleMin)
-					tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMin;
-				tt.mpLossScaleGoodSteps = 0;
-			}
-			clearGrads();
-		}
-		else
-		{
-			if (mpUseLossScaling && tt.mpLossScale != 1.0f)
-				MixedPrecisionHelper::scale_all_grads(tt, 1.0f / tt.mpLossScale);
-			if (ddpEnabled)
-				ddpReduceGrads(timeStepsInBatch);
-			lrScheduleMultiplier = transformer_schedule_multiplier(
-			    trainingConfig.lrSchedule,
-			    epochIdx + lrScheduleEpochOffset,
-			    optimizerStepsPerEpoch,
-			    optimizerStepsPerEpoch);
-			if (!applyBatch(timeStepsInBatch))
-				return;
-			if (mpDynamicLossScaling)
-			{
-				tt.mpLossScaleGoodSteps += 1;
-				if (tt.mpLossScaleGoodSteps >= trainingConfig.mixedPrecision.growthInterval)
-				{
-					tt.mpLossScale *= trainingConfig.mixedPrecision.growthFactor;
-					if (tt.mpLossScale > trainingConfig.mixedPrecision.lossScaleMax)
-						tt.mpLossScale = trainingConfig.mixedPrecision.lossScaleMax;
-					tt.mpLossScaleGoodSteps = 0;
-				}
-			}
-			if (mpEnable)
-				MixedPrecisionHelper::ensure_transformer_lowp_weights(tt, trainingConfig);
-		}
+		if (!minibatchDriver.apply_ready_batch(timeStepsInBatch, optimizerStepsPerEpoch))
+			return;
 		seqInBatch = 0u;
 		timeStepsInBatch = 0u;
 	}
@@ -1986,14 +2075,14 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 	}
 	else
 	{
-		linear_forward_maybe_lowp(transformerScratch.x.data(), T, inputSize, tt.WIn, tt.WInLowp, useLowpWeights, lowpDType, tt.bIn, dModel,
-		                          transformerScratch.h.data());
+		const LinearWeightView inputProj = make_linear_weight_view(tt.WIn, tt.WInLowp, tt.bIn, useLowpWeights, lowpDType);
+		linear_forward_maybe_lowp(transformerScratch.x.data(), T, inputSize, inputProj, dModel, transformerScratch.h.data());
 	}
 	if (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL))
 	{
 		transformerPosEncCache.ensureSinusoidal(dModel);
 		add_positional_encoding(transformerScratch.h.empty() ? NULL : &transformerScratch.h[0], T, dModel,
-		                        transformerPosEncCache.sinInvDenomPair);
+		                        make_double_buffer_view(transformerPosEncCache.sinInvDenomPair));
 	}
 
 	// Embedding dropout
@@ -2076,9 +2165,12 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		float* K = transformerScratch.K.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
 		float* V = transformerScratch.V.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
 
-		linear_forward_maybe_lowp(x1, T, dModel, b.Wq, b.WqLowp, useLowpWeights, lowpDType, b.bq, dModel, Q);
-		linear_forward_maybe_lowp(x1, T, dModel, b.Wk, b.WkLowp, useLowpWeights, lowpDType, b.bk, dModelKV, K);
-		linear_forward_maybe_lowp(x1, T, dModel, b.Wv, b.WvLowp, useLowpWeights, lowpDType, b.bv, dModelKV, V);
+		const LinearWeightView qProj = make_linear_weight_view(b.Wq, b.WqLowp, b.bq, useLowpWeights, lowpDType);
+		const LinearWeightView kProj = make_linear_weight_view(b.Wk, b.WkLowp, b.bk, useLowpWeights, lowpDType);
+		const LinearWeightView vProj = make_linear_weight_view(b.Wv, b.WvLowp, b.bv, useLowpWeights, lowpDType);
+		linear_forward_maybe_lowp(x1, T, dModel, qProj, dModel, Q);
+		linear_forward_maybe_lowp(x1, T, dModel, kProj, dModelKV, K);
+		linear_forward_maybe_lowp(x1, T, dModel, vProj, dModelKV, V);
 
 		// RoPE
 		if (useRope && ropeInvFreq)
@@ -2091,7 +2183,7 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 				{
 					RopeFwdCtx rctx;
 					rctx.buf = Q; rctx.T = T; rctx.rowStride = dModel; rctx.dHead = dHead;
-					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = false;
+					rctx.ropeDim = ropeDim; rctx.invFreq = make_double_buffer_view(*ropeInvFreq); rctx.inverse = false;
 					pool.parallel_for(nHeads, rope_body, &rctx);
 				}
 				else
@@ -2102,7 +2194,7 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 				{
 					RopeFwdCtx rctx;
 					rctx.buf = K; rctx.T = T; rctx.rowStride = dModelKV; rctx.dHead = dHead;
-					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = false;
+					rctx.ropeDim = ropeDim; rctx.invFreq = make_double_buffer_view(*ropeInvFreq); rctx.inverse = false;
 					pool.parallel_for(nKVHeads, rope_body, &rctx);
 				}
 				else
@@ -2158,7 +2250,8 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 
 		// Wo projection
 		float* attnOut = transformerScratch.attnOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-		linear_forward_maybe_lowp(attnConcat, T, dModel, b.Wo, b.WoLowp, useLowpWeights, lowpDType, b.bo, dModel, attnOut);
+		const LinearWeightView oProj = make_linear_weight_view(b.Wo, b.WoLowp, b.bo, useLowpWeights, lowpDType);
+		linear_forward_maybe_lowp(attnConcat, T, dModel, oProj, dModel, attnOut);
 
 		// Residual attention dropout
 		{
@@ -2219,7 +2312,8 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		// FFN
 		float* ff1 = transformerScratch.ff1.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(ff1Width));
 		float* ff1Act = transformerScratch.ff1Act.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dFF));
-		linear_forward_maybe_lowp(x2, T, dModel, b.W1, b.W1Lowp, useLowpWeights, lowpDType, b.b1, ff1Width, ff1);
+		const LinearWeightView ff1Proj = make_linear_weight_view(b.W1, b.W1Lowp, b.b1, useLowpWeights, lowpDType);
+		linear_forward_maybe_lowp(x2, T, dModel, ff1Proj, ff1Width, ff1);
 		if (ffnKind == static_cast<int>(glades::TransformerRunConfig::FFN_SWIGLU))
 		{
 			for (unsigned int t = 0; t < T; ++t)
@@ -2245,7 +2339,8 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		}
 
 		float* ffOut = transformerScratch.ffOut.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
-		linear_forward_maybe_lowp(ff1Act, T, dFF, b.W2, b.W2Lowp, useLowpWeights, lowpDType, b.b2, dModel, ffOut);
+		const LinearWeightView ff2Proj = make_linear_weight_view(b.W2, b.W2Lowp, b.b2, useLowpWeights, lowpDType);
+		linear_forward_maybe_lowp(ff1Act, T, dFF, ff2Proj, dModel, ffOut);
 
 		// Residual FFN dropout
 		{
@@ -2389,8 +2484,8 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 	}
 	else
 	{
-		linear_forward_maybe_lowp(hPostFinalLN, T, dModel, tt.WOut, tt.WOutLowp, useLowpWeights, lowpDType, tt.bOut, outSize,
-		                          transformerScratch.logits.data());
+		const LinearWeightView outProj = make_linear_weight_view(tt.WOut, tt.WOutLowp, tt.bOut, useLowpWeights, lowpDType);
+		linear_forward_maybe_lowp(hPostFinalLN, T, dModel, outProj, outSize, transformerScratch.logits.data());
 	}
 
 	// Softmax / sigmoid / identity
@@ -2512,8 +2607,9 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 			//   gTokE  += dLogits^T * hPostFinalLN   (weight gradient)
 			//   gLmBias += sum_t dLogits[t,:]         (bias gradient)
 			//   dH      += dLogits * tokE             (input gradient)
+			const LinearWeightView tiedEmbHead = make_linear_weight_view(tt.tokE, tt.tokELowp, tt.lmBias, useLowpWeights, lowpDType);
 			linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, vocabSize,
-			    tt.gTokE, tt.gLmBias, tt.tokE, tt.tokELowp, useLowpWeights, lowpDType, dH.data());
+			    tt.gTokE, tt.gLmBias, tiedEmbHead, dH.data());
 		}
 		else
 		{
@@ -2575,8 +2671,9 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 			}
 		}
 
-		linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, outSize, tt.gWOut, tt.gBOut, tt.WOut, tt.WOutLowp, useLowpWeights,
-		                                 lowpDType, dH.data());
+		const LinearWeightView outProj = make_linear_weight_view(tt.WOut, tt.WOutLowp, tt.bOut, useLowpWeights, lowpDType);
+		linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, outSize,
+		                                 tt.gWOut, tt.gBOut, outProj, dH.data());
 		timeStepsInBatch += T;
 	}
 
@@ -2654,7 +2751,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		std::vector<float, glades::AlignedAllocator<float, 64> >& dFF1Act = transformerScratch.dFF1Act;
 		if (dFF1Act.size() != (static_cast<size_t>(T) * static_cast<size_t>(dFF)))
 			dFF1Act.resize(static_cast<size_t>(T) * static_cast<size_t>(dFF));
-		linear_backward_accum_maybe_lowp(ff1Act, dH.data(), T, dFF, dModel, b.gW2, b.gB2, b.W2, b.W2Lowp, useLowpWeights, lowpDType, dFF1Act.data());
+		const LinearWeightView ff2Proj = make_linear_weight_view(b.W2, b.W2Lowp, b.b2, useLowpWeights, lowpDType);
+		linear_backward_accum_maybe_lowp(ff1Act, dH.data(), T, dFF, dModel, b.gW2, b.gB2, ff2Proj, dFF1Act.data());
 
 		std::vector<float, glades::AlignedAllocator<float, 64> >& dX2 = transformerScratch.dX2;
 		if (dX2.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
@@ -2679,7 +2777,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 					dFF1Cat[preOff + static_cast<size_t>(dFF) + i] = dOut * siluVal;
 				}
 			}
-			linear_backward_accum_maybe_lowp(x2, dFF1Cat.data(), T, dModel, ff1Width, b.gW1, b.gB1, b.W1, b.W1Lowp, useLowpWeights, lowpDType, dX2.data());
+			const LinearWeightView ff1Proj = make_linear_weight_view(b.W1, b.W1Lowp, b.b1, useLowpWeights, lowpDType);
+			linear_backward_accum_maybe_lowp(x2, dFF1Cat.data(), T, dModel, ff1Width, b.gW1, b.gB1, ff1Proj, dX2.data());
 		}
 		else
 		{
@@ -2689,7 +2788,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 			else
 				for (size_t i = 0; i < actLen; ++i)
 					dFF1Act[i] *= glades::transformer_ops::relu_deriv_from_y(ff1Act[i]);
-			linear_backward_accum_maybe_lowp(x2, dFF1Act.data(), T, dModel, dFF, b.gW1, b.gB1, b.W1, b.W1Lowp, useLowpWeights, lowpDType, dX2.data());
+			const LinearWeightView ff1Proj = make_linear_weight_view(b.W1, b.W1Lowp, b.b1, useLowpWeights, lowpDType);
+			linear_backward_accum_maybe_lowp(x2, dFF1Act.data(), T, dModel, dFF, b.gW1, b.gB1, ff1Proj, dX2.data());
 		}
 
 		// LN2 backward
@@ -2738,8 +2838,9 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		std::vector<float, glades::AlignedAllocator<float, 64> >& dAttnConcat = transformerScratch.dAttnConcat;
 		if (dAttnConcat.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
 			dAttnConcat.resize(static_cast<size_t>(T) * static_cast<size_t>(dModel));
-		linear_backward_accum_maybe_lowp(attnConcat, dHAfterAttn.data(), T, dModel, dModel, b.gWo, b.gBo, b.Wo, b.WoLowp, useLowpWeights,
-		                                 lowpDType, dAttnConcat.data());
+		const LinearWeightView oProj = make_linear_weight_view(b.Wo, b.WoLowp, b.bo, useLowpWeights, lowpDType);
+		linear_backward_accum_maybe_lowp(attnConcat, dHAfterAttn.data(), T, dModel, dModel,
+		                                 b.gWo, b.gBo, oProj, dAttnConcat.data());
 
 		const float* Vfull = transformerScratch.V.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
 		const float* Qfull = transformerScratch.Q.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
@@ -2845,7 +2946,7 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 				{
 					RopeFwdCtx rctx;
 					rctx.buf = dQfull.data(); rctx.T = T; rctx.rowStride = dModel; rctx.dHead = dHead;
-					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = true;
+					rctx.ropeDim = ropeDim; rctx.invFreq = make_double_buffer_view(*ropeInvFreq); rctx.inverse = true;
 					pool.parallel_for(nHeads, rope_body, &rctx);
 				}
 				else
@@ -2856,7 +2957,7 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 				{
 					RopeFwdCtx rctx;
 					rctx.buf = dKfull.data(); rctx.T = T; rctx.rowStride = dModelKV; rctx.dHead = dHead;
-					rctx.ropeDim = ropeDim; rctx.invFreq = ropeInvFreq; rctx.inverse = true;
+					rctx.ropeDim = ropeDim; rctx.invFreq = make_double_buffer_view(*ropeInvFreq); rctx.inverse = true;
 					pool.parallel_for(nKVHeads, rope_body, &rctx);
 				}
 				else
@@ -2885,15 +2986,18 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		if (dXtmp.size() != dX1.size()) dXtmp.resize(dX1.size());
 		std::fill(dX1.begin(), dX1.end(), 0.0f);
 		{
-			linear_backward_accum_maybe_lowp(x1, dQfull.data(), T, dModel, dModel, b.gWq, b.gBq, b.Wq, b.WqLowp, useLowpWeights, lowpDType, dXtmp.data());
+			const LinearWeightView qProj = make_linear_weight_view(b.Wq, b.WqLowp, b.bq, useLowpWeights, lowpDType);
+			linear_backward_accum_maybe_lowp(x1, dQfull.data(), T, dModel, dModel, b.gWq, b.gBq, qProj, dXtmp.data());
 			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
 		}
 		{
-			linear_backward_accum_maybe_lowp(x1, dKfull.data(), T, dModel, dModelKV, b.gWk, b.gBk, b.Wk, b.WkLowp, useLowpWeights, lowpDType, dXtmp.data());
+			const LinearWeightView kProj = make_linear_weight_view(b.Wk, b.WkLowp, b.bk, useLowpWeights, lowpDType);
+			linear_backward_accum_maybe_lowp(x1, dKfull.data(), T, dModel, dModelKV, b.gWk, b.gBk, kProj, dXtmp.data());
 			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
 		}
 		{
-			linear_backward_accum_maybe_lowp(x1, dVfull.data(), T, dModel, dModelKV, b.gWv, b.gBv, b.Wv, b.WvLowp, useLowpWeights, lowpDType, dXtmp.data());
+			const LinearWeightView vProj = make_linear_weight_view(b.Wv, b.WvLowp, b.bv, useLowpWeights, lowpDType);
+			linear_backward_accum_maybe_lowp(x1, dVfull.data(), T, dModel, dModelKV, b.gWv, b.gBv, vProj, dXtmp.data());
 			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
 		}
 
@@ -2952,8 +3056,9 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		std::vector<float, glades::AlignedAllocator<float, 64> >& dX = transformerScratch.dInput;
 		if (dX.size() != (static_cast<size_t>(T) * static_cast<size_t>(inputSize)))
 			dX.resize(static_cast<size_t>(T) * static_cast<size_t>(inputSize));
-		linear_backward_accum_maybe_lowp(transformerScratch.x.data(), dH.data(), T, inputSize, dModel, tt.gWIn, tt.gBIn, tt.WIn, tt.WInLowp,
-		                                 useLowpWeights, lowpDType, dX.data());
+		const LinearWeightView inputProj = make_linear_weight_view(tt.WIn, tt.WInLowp, tt.bIn, useLowpWeights, lowpDType);
+		linear_backward_accum_maybe_lowp(transformerScratch.x.data(), dH.data(), T, inputSize, dModel,
+		                                 tt.gWIn, tt.gBIn, inputProj, dX.data());
 		(void)dX;
 	}
 }
@@ -2965,6 +3070,76 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 // in the epoch.
 // ---------------------------------------------------------------------------
 #ifdef GLADES_HAVE_CUDA
+bool glades::NNetwork::tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
+                                                 int epochIdx, int64_t epochStartMs,
+                                                 unsigned long long& tokensProcessed,
+                                                 unsigned long long& targetsProcessed,
+                                                 double& tokenLmNllSum,
+                                                 unsigned long long& tokenLmTokenCount,
+                                                 unsigned long long& clsCorrect,
+                                                 unsigned long long& clsTotal,
+                                                 shmea::GLogger* logger)
+{
+	if (!trainingConfig.gpu.enable || !cfg.isTrain)
+		return false;
+
+	const bool gpuReady = ensureGpuState();
+	if (!gpuReady || !gpuTransformerWeights || !gpuTransformerWeights->initialized)
+		return false;
+
+	transformerGpuTrainEpoch(cfg, seqCount, epochIdx, epochStartMs,
+	                        tokensProcessed, targetsProcessed,
+	                        tokenLmNllSum, tokenLmTokenCount,
+	                        clsCorrect, clsTotal, logger);
+	return true;
+}
+
+bool glades::NNetwork::ensureTransformerGpuTrainingScratch(const TransformerEpochCfg& cfg, unsigned int T)
+{
+	glades::gpu::TransformerGpuScratchConfig scratchCfg;
+	scratchCfg.T = T;
+	scratchCfg.inputSize = cfg.inputSize;
+	scratchCfg.outSize = cfg.outSize;
+	scratchCfg.dModel = cfg.dModel;
+	scratchCfg.dFF = cfg.dFF;
+	scratchCfg.dModelKV = cfg.dModelKV;
+	scratchCfg.nHeads = cfg.nHeads;
+	scratchCfg.nLayers = cfg.nLayers;
+	scratchCfg.ff1Width = cfg.ff1Width;
+	return glades::gpu::ensureTransformerScratch(gpuTransformerScratch, scratchCfg);
+}
+
+bool glades::NNetwork::syncTransformerGpuTrainingWeightsToCpu()
+{
+	if (!gpuTransformerWeights || !gpuTransformerWeights->initialized)
+		return false;
+
+	std::vector<glades::gpu::TransformerHostBlockWeightsView> blockViews(tensorTransformer.blocks.size());
+	for (size_t l = 0; l < tensorTransformer.blocks.size(); ++l)
+	{
+		TensorTransformerState::Block& block = tensorTransformer.blocks[l];
+		blockViews[l] = make_transformer_host_block_view(block.ln1Gamma, block.ln1Beta,
+		                                                 block.Wq, block.Wk, block.Wv, block.Wo,
+		                                                 block.bq, block.bk, block.bv, block.bo,
+		                                                 block.ln2Gamma, block.ln2Beta,
+		                                                 block.W1, block.W2, block.b1, block.b2);
+	}
+
+	glades::gpu::TransformerHostWeightsView hostView;
+	hostView.tokE = make_host_float_buffer_view(tensorTransformer.tokE);
+	hostView.WIn = make_host_float_buffer_view(tensorTransformer.WIn);
+	hostView.bIn = make_host_float_buffer_view(tensorTransformer.bIn);
+	hostView.WOut = make_host_float_buffer_view(tensorTransformer.WOut);
+	hostView.bOut = make_host_float_buffer_view(tensorTransformer.bOut);
+	hostView.lmBias = make_host_float_buffer_view(tensorTransformer.lmBias);
+	hostView.lnFinalGamma = make_host_float_buffer_view(tensorTransformer.lnFinalGamma);
+	hostView.lnFinalBeta = make_host_float_buffer_view(tensorTransformer.lnFinalBeta);
+	hostView.blocks = blockViews.empty() ? NULL : &blockViews[0];
+	hostView.blockCount = static_cast<unsigned int>(blockViews.size());
+
+	return glades::gpu::downloadTransformerWeightsToHost(*gpuTransformerWeights, hostView);
+}
+
 void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
                                                 int epochIdx, int64_t epochStartMs,
                                                 unsigned long long& tokensProcessed,
@@ -3046,19 +3221,12 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			continue;
 		tokensProcessed += static_cast<unsigned long long>(T);
 
-
-		// Ensure GPU scratch is big enough for this sequence.
-		if (!gpuTransformerScratch)
-			gpuTransformerScratch = new gpu::GpuTransformerScratch();
-
-		if (!gpuTransformerScratch->initialized || gpuTransformerScratch->T < T)
-		{
-			if (!gpuTransformerScratch->allocate(T, inputSize, outSize, dModel, dFF, dModelKV, nHeads, nLayers, ff1Width))
+			// Ensure GPU scratch ownership/capacity before any per-sequence uploads.
+			if (!ensureTransformerGpuTrainingScratch(cfg, T))
 			{
-				// GPU scratch allocation failed, fall through to CPU.
+				// GPU scratch allocation failed, stop the GPU epoch cleanly.
 				break;
 			}
-		}
 
 		// Upload token IDs for this sequence.
 		if (tokenLM)
@@ -4294,42 +4462,16 @@ if ((sz) > maxSz) maxSz = (sz); \
 	gpu::destroyEvent(gpuTransferReadyEvent);
 	gpu::destroyEvent(gpuComputeReadyEvent);
 
-	// After GPU training loop: download updated weights back to CPU.
-	TensorTransformerState& ttMut = tensorTransformer;
-	gpu::downloadTransformerWeights(*gpuTransformerWeights,
-	                                ttMut.tokE.empty() ? NULL : &ttMut.tokE[0], ttMut.tokE.size(),
-	                                ttMut.WIn.empty() ? NULL : &ttMut.WIn[0], ttMut.WIn.size(),
-	                                ttMut.bIn.empty() ? NULL : &ttMut.bIn[0], ttMut.bIn.size(),
-	                                ttMut.WOut.empty() ? NULL : &ttMut.WOut[0], ttMut.WOut.size(),
-	                                ttMut.bOut.empty() ? NULL : &ttMut.bOut[0], ttMut.bOut.size(),
-	                                ttMut.lmBias.empty() ? NULL : &ttMut.lmBias[0], ttMut.lmBias.size(),
-	                                ttMut.lnFinalGamma.empty() ? NULL : &ttMut.lnFinalGamma[0], ttMut.lnFinalGamma.size(),
-	                                ttMut.lnFinalBeta.empty() ? NULL : &ttMut.lnFinalBeta[0], ttMut.lnFinalBeta.size());
-	if (gpuPerf)
-		gpu::perfRecordSync(&gpuPerf->counters, 1u);
-
-	// Download per-block weights.
-	for (unsigned int l = 0; l < nLayers; ++l)
-	{
-		TensorTransformerState::Block& cb = ttMut.blocks[l];
-		const gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[l];
-		if (gb.Wq.allocated()) gb.Wq.download(&cb.Wq[0], cb.Wq.size());
-		if (gb.Wk.allocated()) gb.Wk.download(&cb.Wk[0], cb.Wk.size());
-		if (gb.Wv.allocated()) gb.Wv.download(&cb.Wv[0], cb.Wv.size());
-		if (gb.Wo.allocated()) gb.Wo.download(&cb.Wo[0], cb.Wo.size());
-		if (gb.W1.allocated()) gb.W1.download(&cb.W1[0], cb.W1.size());
-		if (gb.W2.allocated()) gb.W2.download(&cb.W2[0], cb.W2.size());
-		if (gb.bq.allocated()) gb.bq.download(&cb.bq[0], cb.bq.size());
-		if (gb.bk.allocated()) gb.bk.download(&cb.bk[0], cb.bk.size());
-		if (gb.bv.allocated()) gb.bv.download(&cb.bv[0], cb.bv.size());
-		if (gb.bo.allocated()) gb.bo.download(&cb.bo[0], cb.bo.size());
-		if (gb.b1.allocated()) gb.b1.download(&cb.b1[0], cb.b1.size());
-		if (gb.b2.allocated()) gb.b2.download(&cb.b2[0], cb.b2.size());
-		if (gb.ln1Gamma.allocated()) gb.ln1Gamma.download(&cb.ln1Gamma[0], cb.ln1Gamma.size());
-		if (gb.ln1Beta.allocated()) gb.ln1Beta.download(&cb.ln1Beta[0], cb.ln1Beta.size());
-		if (gb.ln2Gamma.allocated()) gb.ln2Gamma.download(&cb.ln2Gamma[0], cb.ln2Gamma.size());
-		if (gb.ln2Beta.allocated()) gb.ln2Beta.download(&cb.ln2Beta[0], cb.ln2Beta.size());
-	}
+		// After GPU training loop: sync updated weights back to CPU-owned tensor state.
+		if (!syncTransformerGpuTrainingWeightsToCpu())
+		{
+			lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+			                            "SGDHelper_TRANSFORMER: failed to download transformer GPU weights");
+			storeRunningFlag(false);
+			return;
+		}
+		if (gpuPerf)
+			gpu::perfRecordSync(&gpuPerf->counters, 1u);
 
 	// Finalize epoch-level loss before returning.
 	// tokenLmNllSum / tokenLmTokenCount are locals; copy to the member

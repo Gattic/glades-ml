@@ -1529,6 +1529,49 @@ static void test_training_t1()
 // 17. Public transformer infer/generate APIs reject re-entry during training
 // ---------------------------------------------------------------------------
 
+struct RunLockApiSnapshot
+{
+	RunLockApiSnapshot()
+	    : genStatus(glades::NNetworkStatus::OK, std::string()),
+	      batchStatus(glades::NNetworkStatus::OK, std::string()),
+	      forwardStatus(glades::NNetworkStatus::OK, std::string()),
+	      batcherResetStatus(glades::NNetworkStatus::OK, std::string()),
+	      batcherStepStatus(glades::NNetworkStatus::OK, std::string())
+	{
+	}
+
+	glades::NNetworkStatus genStatus;
+	glades::NNetworkStatus batchStatus;
+	glades::NNetworkStatus forwardStatus;
+	glades::NNetworkStatus batcherResetStatus;
+	glades::NNetworkStatus batcherStepStatus;
+};
+
+static void probe_transformer_run_lock_apis(const glades::NNetwork& net,
+                                            const std::vector<unsigned int>& promptTokens,
+                                            const glades::NNetwork::TransformerGenerateConfig& cfg,
+                                            glades::NNetwork::TransformerServeBatcher& batcherRef,
+                                            RunLockApiSnapshot& out)
+{
+	glades::NNetwork::TransformerGenerateResult outGen;
+	out.genStatus = net.transformerLmGenerate(promptTokens, cfg, outGen, NULL);
+
+	std::vector<glades::NNetwork::TransformerServeRequest> reqs(1);
+	reqs[0].promptTokens = promptTokens;
+	reqs[0].cfg = cfg;
+	glades::NNetwork::TransformerServeBatchResult outBatch;
+	out.batchStatus = net.transformerLmServeGenerateBatch(reqs, outBatch, NULL);
+
+	std::vector<float> logits;
+	out.forwardStatus = net.transformerLmForwardLastLogits(promptTokens, logits);
+
+	glades::NNetwork::TransformerServeBatcherConfig localCfg;
+	localCfg.maxBatchSize = 1u;
+	localCfg.maxSeqLen = 4u;
+	out.batcherResetStatus = net.transformerLmServeBatcherReset(batcherRef, localCfg);
+	out.batcherStepStatus = net.transformerLmServeBatcherStep(batcherRef, NULL);
+}
+
 static void test_transformer_run_lock_reentry_rejection()
 {
 	printf("-----------------------------------\n");
@@ -1603,71 +1646,84 @@ static void test_transformer_run_lock_reentry_rejection()
 	ASSERT("run-lock batcher slot 0", slot == 0u);
 
 	struct RunLockProbeCb : public glades::ITrainingCallbacks
-	{
-		std::vector<unsigned int> promptTokens;
-		glades::NNetwork::TransformerGenerateConfig cfg;
-		glades::NNetwork::TransformerServeBatcher& batcherRef;
-		bool sawRunStart;
-		glades::NNetworkStatus genStatus;
-		glades::NNetworkStatus batchStatus;
-		glades::NNetworkStatus forwardStatus;
-		glades::NNetworkStatus batcherResetStatus;
-		glades::NNetworkStatus batcherStepStatus;
-
-		RunLockProbeCb(const std::vector<unsigned int>& prompt,
-		               const glades::NNetwork::TransformerGenerateConfig& c,
-		               glades::NNetwork::TransformerServeBatcher& batcher)
-		    : promptTokens(prompt),
-		      cfg(c),
-		      batcherRef(batcher),
-		      sawRunStart(false),
-		      genStatus(glades::NNetworkStatus::OK, std::string()),
-		      batchStatus(glades::NNetworkStatus::OK, std::string()),
-		      forwardStatus(glades::NNetworkStatus::OK, std::string()),
-		      batcherResetStatus(glades::NNetworkStatus::OK, std::string()),
-		      batcherStepStatus(glades::NNetworkStatus::OK, std::string())
 		{
-		}
+			std::vector<unsigned int> promptTokens;
+			glades::NNetwork::TransformerGenerateConfig cfg;
+			glades::NNetwork::TransformerServeBatcher& batcherRef;
+			bool sawRunStart;
+			bool sawEpochEnd;
+			bool sawRunEnd;
+			bool runningOnRunStart;
+			bool runningOnEpochEnd;
+			bool runningOnRunEnd;
+			RunLockApiSnapshot runStartApis;
+			RunLockApiSnapshot epochEndApis;
+			RunLockApiSnapshot runEndApis;
 
-		virtual void onRunStart(const glades::NNetwork& net, int)
-		{
-			sawRunStart = true;
+			RunLockProbeCb(const std::vector<unsigned int>& prompt,
+			               const glades::NNetwork::TransformerGenerateConfig& c,
+			               glades::NNetwork::TransformerServeBatcher& batcher)
+			    : promptTokens(prompt),
+			      cfg(c),
+			      batcherRef(batcher),
+			      sawRunStart(false),
+			      sawEpochEnd(false),
+			      sawRunEnd(false),
+			      runningOnRunStart(false),
+			      runningOnEpochEnd(false),
+			      runningOnRunEnd(false),
+			      runStartApis(),
+			      epochEndApis(),
+			      runEndApis()
+			{
+			}
 
-			glades::NNetwork::TransformerGenerateResult out;
-			genStatus = net.transformerLmGenerate(promptTokens, cfg, out, NULL);
+			virtual void onRunStart(const glades::NNetwork& net, int)
+			{
+				sawRunStart = true;
+				runningOnRunStart = net.getRunning();
+				probe_transformer_run_lock_apis(net, promptTokens, cfg, batcherRef, runStartApis);
+			}
 
-			std::vector<glades::NNetwork::TransformerServeRequest> reqs(1);
-			reqs[0].promptTokens = promptTokens;
-			reqs[0].cfg = cfg;
-			glades::NNetwork::TransformerServeBatchResult outBatch;
-			batchStatus = net.transformerLmServeGenerateBatch(reqs, outBatch, NULL);
+			virtual bool onEpochEnd(const glades::NNetwork& net, const glades::NNetworkEpochMetrics&)
+			{
+				sawEpochEnd = true;
+				runningOnEpochEnd = net.getRunning();
+				probe_transformer_run_lock_apis(net, promptTokens, cfg, batcherRef, epochEndApis);
+				return true;
+			}
 
-			std::vector<float> logits;
-			forwardStatus = net.transformerLmForwardLastLogits(promptTokens, logits);
+			virtual void onRunEnd(const glades::NNetwork& net, int)
+			{
+				sawRunEnd = true;
+				runningOnRunEnd = net.getRunning();
+				probe_transformer_run_lock_apis(net, promptTokens, cfg, batcherRef, runEndApis);
+			}
+		};
 
-			glades::NNetwork::TransformerServeBatcherConfig localCfg;
-			localCfg.maxBatchSize = 1u;
-			localCfg.maxSeqLen = 4u;
-			batcherResetStatus = net.transformerLmServeBatcherReset(batcherRef, localCfg);
-			batcherStepStatus = net.transformerLmServeBatcherStep(batcherRef, NULL);
-		}
-
-		virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics&)
-		{
-			return true;
-		}
-
-		virtual void onRunEnd(const glades::NNetwork&, int) {}
-	};
-
-	RunLockProbeCb cb(prompt, genCfg, batcher);
-	ASSERT("run-lock train ok", net.train(di, &cb).ok());
-	ASSERT("run-lock callback invoked", cb.sawRunStart);
-	ASSERT("run-lock generate rejected", cb.genStatus.code == glades::NNetworkStatus::INVALID_STATE);
-	ASSERT("run-lock serve-generate rejected", cb.batchStatus.code == glades::NNetworkStatus::INVALID_STATE);
-	ASSERT("run-lock forward rejected", cb.forwardStatus.code == glades::NNetworkStatus::INVALID_STATE);
-	ASSERT("run-lock batcher reset rejected", cb.batcherResetStatus.code == glades::NNetworkStatus::INVALID_STATE);
-	ASSERT("run-lock batcher step rejected", cb.batcherStepStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		RunLockProbeCb cb(prompt, genCfg, batcher);
+		ASSERT("run-lock train ok", net.train(di, &cb).ok());
+		ASSERT("run-lock callback invoked", cb.sawRunStart);
+		ASSERT("run-lock epoch callback invoked", cb.sawEpochEnd);
+		ASSERT("run-lock run end invoked", cb.sawRunEnd);
+		ASSERT("run-lock running on run start", cb.runningOnRunStart);
+		ASSERT("run-lock running on epoch end", cb.runningOnEpochEnd);
+		ASSERT("run-lock running on run end", cb.runningOnRunEnd);
+		ASSERT("run-lock start generate rejected", cb.runStartApis.genStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock start serve-generate rejected", cb.runStartApis.batchStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock start forward rejected", cb.runStartApis.forwardStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock start batcher reset rejected", cb.runStartApis.batcherResetStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock start batcher step rejected", cb.runStartApis.batcherStepStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock epoch generate rejected", cb.epochEndApis.genStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock epoch serve-generate rejected", cb.epochEndApis.batchStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock epoch forward rejected", cb.epochEndApis.forwardStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock epoch batcher reset rejected", cb.epochEndApis.batcherResetStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock epoch batcher step rejected", cb.epochEndApis.batcherStepStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock end generate rejected", cb.runEndApis.genStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock end serve-generate rejected", cb.runEndApis.batchStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock end forward rejected", cb.runEndApis.forwardStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock end batcher reset rejected", cb.runEndApis.batcherResetStatus.code == glades::NNetworkStatus::INVALID_STATE);
+		ASSERT("run-lock end batcher step rejected", cb.runEndApis.batcherStepStatus.code == glades::NNetworkStatus::INVALID_STATE);
 
 	delete di;
 	delete info;

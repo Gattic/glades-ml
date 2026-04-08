@@ -2,12 +2,49 @@
 #ifndef _GLADES_TRANSFORMER_TRAIN_DETAIL_H
 #define _GLADES_TRANSFORMER_TRAIN_DETAIL_H
 
-#include "network.h"
-
+#include <stdint.h>
 #include <vector>
 
 namespace glades {
+
+struct LearningRateScheduleConfig;
+
 namespace transformer_train_detail {
+
+struct DoubleBufferView
+{
+	const double* data;
+	unsigned int size;
+
+	DoubleBufferView()
+	    : data(NULL), size(0u)
+	{
+	}
+};
+
+struct LinearWeightView
+{
+	const float* weights;
+	unsigned int weightCount;
+	const uint16_t* lowpWeights;
+	unsigned int lowpWeightCount;
+	const float* bias;
+	unsigned int biasCount;
+	bool useLowpWeights;
+	int lowpDType;
+
+	LinearWeightView()
+	    : weights(NULL),
+	      weightCount(0u),
+	      lowpWeights(NULL),
+	      lowpWeightCount(0u),
+	      bias(NULL),
+	      biasCount(0u),
+	      useLowpWeights(false),
+	      lowpDType(0)
+	{
+	}
+};
 
 float clip_maybe(float v, float limit);
 float transformer_schedule_multiplier(const glades::LearningRateScheduleConfig& schedule,
@@ -18,16 +55,12 @@ float transformer_schedule_multiplier(const glades::LearningRateScheduleConfig& 
 void add_positional_encoding(float* h,
                              unsigned int T,
                              unsigned int dModel,
-                             const std::vector<double>& invDenomPair);
+                             const DoubleBufferView& invDenomPair);
 
 void linear_forward_maybe_lowp(const float* X,
                                unsigned int T,
                                unsigned int inSize,
-                               const std::vector<float>& W,
-                               const std::vector<uint16_t>& WLowp,
-                               bool useLowp,
-                               int lowpDType,
-                               const std::vector<float>& b,
+                               const LinearWeightView& weights,
                                unsigned int outSize,
                                float* Y);
 
@@ -38,10 +71,7 @@ void linear_backward_accum_maybe_lowp(const float* X,
                                       unsigned int outSize,
                                       std::vector<float>& gW,
                                       std::vector<float>& gB,
-                                      const std::vector<float>& WMaster,
-                                      const std::vector<uint16_t>& WLowp,
-                                      bool useLowp,
-                                      int lowpDType,
+                                      const LinearWeightView& weights,
                                       float* dXOut);
 
 struct AttnFwdCtx
@@ -111,7 +141,7 @@ struct RopeFwdCtx
 	unsigned int rowStride;
 	unsigned int dHead;
 	unsigned int ropeDim;
-	const std::vector<double>* invFreq;
+	DoubleBufferView invFreq;
 	bool inverse;
 };
 

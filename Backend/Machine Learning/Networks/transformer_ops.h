@@ -218,6 +218,29 @@ inline void softmax_masked_row_stable_keymask(const float* scoresRow,
 		probsRowOut[u] *= inv;
 }
 
+inline unsigned int attention_row_max_u(unsigned int T, unsigned int rowT, bool causal)
+{
+	return causal ? rowT : (T - 1u);
+}
+
+inline double attention_softmax_row_dot(const std::vector<float>& probsRow,
+                                        const std::vector<float>& dProbsRow,
+                                        unsigned int maxU)
+{
+	double rowDot = 0.0;
+	for (unsigned int u = 0; u <= maxU; ++u)
+		rowDot += static_cast<double>(probsRow[u]) * static_cast<double>(dProbsRow[u]);
+	return rowDot;
+}
+
+inline float attention_score_grad(float prob,
+                                  float dProb,
+                                  double rowDot,
+                                  float invSqrt)
+{
+	return (prob * (dProb - static_cast<float>(rowDot))) * invSqrt;
+}
+
 // Scaled dot-product attention for a single head.
 //
 // Inputs:
@@ -410,8 +433,8 @@ inline void scaled_dot_product_attention_backward(const float* Q,
 	for (unsigned int t = 0; t < T; ++t)
 	{
 		const size_t pOff = static_cast<size_t>(t) * static_cast<size_t>(T);
+		const unsigned int maxU = attention_row_max_u(T, t, causal);
 		double rowDot = 0.0;
-		const unsigned int maxU = causal ? t : (T - 1u);
 		for (unsigned int u = 0; u <= maxU; ++u)
 			rowDot += static_cast<double>(probs[pOff + u]) * static_cast<double>(dProbs[pOff + u]);
 		for (unsigned int u = 0; u < T; ++u)
@@ -514,7 +537,7 @@ inline void scaled_dot_product_attention_backward_recompute(const float* Q,
 		}
 
 		// dProbsRow[u] = dot(dO[t], V[u])
-		const unsigned int maxU = causal ? t : (T - 1u);
+			const unsigned int maxU = attention_row_max_u(T, t, causal);
 		for (unsigned int u = 0; u < T; ++u)
 		{
 			if (causal && u > maxU)
@@ -529,21 +552,19 @@ inline void scaled_dot_product_attention_backward_recompute(const float* Q,
 			dProbsRow[u] = static_cast<float>(dot);
 		}
 
-		// rowDot = sum_u p_u * dP_u
-		double rowDot = 0.0;
-		for (unsigned int u = 0; u <= maxU; ++u)
-			rowDot += static_cast<double>(probsRow[u]) * static_cast<double>(dProbsRow[u]);
+			// rowDot = sum_u p_u * dP_u
+			const double rowDot = attention_softmax_row_dot(probsRow, dProbsRow, maxU);
 
 		// dScores_u = p_u * (dP_u - rowDot)
 		// dQ[t] and dK[u] from scores = Q K^T / sqrt(dK)
 		for (unsigned int u = 0; u <= maxU; ++u)
-		{
-			const float p = probsRow[u];
-			if (p == 0.0f)
-				continue;
-			const float ds = (p * (dProbsRow[u] - static_cast<float>(rowDot))) * invSqrt;
-			if (ds == 0.0f)
-				continue;
+			{
+				const float p = probsRow[u];
+				if (p == 0.0f)
+					continue;
+				const float ds = attention_score_grad(p, dProbsRow[u], rowDot, invSqrt);
+				if (ds == 0.0f)
+					continue;
 
 			const size_t kOff = static_cast<size_t>(u) * static_cast<size_t>(dK);
 			for (unsigned int k = 0; k < dK; ++k)
@@ -616,7 +637,7 @@ inline void scaled_dot_product_attention_backward_recompute(const float* Q,
 		}
 
 		// dProbsRow[u] = dot(dO[t], V[u])
-		const unsigned int maxU = causal ? t : (T - 1u);
+		const unsigned int maxU = attention_row_max_u(T, t, causal);
 		for (unsigned int u = 0; u < T; ++u)
 		{
 			if (causal && u > maxU)
@@ -1054,7 +1075,7 @@ inline void scaled_dot_product_attention_backward_recompute_flash_strided(const 
 			if (pf == 0.0f)
 				continue;
 
-			const float ds = (pf * static_cast<float>(static_cast<double>(dPCache[u]) - rowDot)) * invSqrt;
+			const float ds = attention_score_grad(pf, dPCache[u], rowDot, invSqrt);
 			if (ds == 0.0f)
 				continue;
 
@@ -1124,7 +1145,7 @@ inline void scaled_dot_product_attention_backward_recompute_flash_chunk(
 		const float* dOt = dObase + static_cast<size_t>(t) * static_cast<size_t>(dOStride);
 		float* dQt = dQbase + static_cast<size_t>(t) * static_cast<size_t>(dQStride);
 
-		const unsigned int maxU = causal ? t : (T - 1u);
+		const unsigned int maxU = attention_row_max_u(T, t, causal);
 
 		float m = -1e30f;
 		double l = 0.0;
@@ -1184,7 +1205,7 @@ inline void scaled_dot_product_attention_backward_recompute_flash_chunk(
 				continue;
 			const float pf = pCache[u];
 			if (pf == 0.0f) continue;
-			const float ds = (pf * static_cast<float>(static_cast<double>(dPCache[u]) - rowDot)) * invSqrt;
+			const float ds = attention_score_grad(pf, dPCache[u], rowDot, invSqrt);
 			if (ds == 0.0f) continue;
 			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
 			// dK into contiguous local buffer (stride = dK)
@@ -1433,4 +1454,3 @@ inline void scaled_dot_product_attention_backward_recompute_strided(const float*
 
 } // namespace transformer_ops
 } // namespace glades
-

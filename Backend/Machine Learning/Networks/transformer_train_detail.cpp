@@ -1,4 +1,5 @@
 // Internal transformer training helpers extracted from sgd_transformer.cpp.
+#include "network.h"
 #include "transformer_train_detail.h"
 
 #include "glades_thread_pool.h"
@@ -18,9 +19,15 @@ using glades::transformer_common::checked_mul_size;
 namespace {
 
 struct LinearFwdCtx;
-void linear_forward_opt_parallel(const float* X, unsigned int T, unsigned int inSize,
-                                 const std::vector<float>& W, const std::vector<float>& b,
-                                 unsigned int outSize, float* Y);
+void linear_forward_opt_parallel(const float* X,
+                                 unsigned int T,
+                                 unsigned int inSize,
+                                 const float* W,
+                                 size_t WSize,
+                                 const float* b,
+                                 unsigned int bSize,
+                                 unsigned int outSize,
+                                 float* Y);
 
 struct LinearBwdGWCtx;
 void linear_bwd_gw_body(void* ud, unsigned int begin, unsigned int end);
@@ -38,7 +45,7 @@ void linear_bwd_dx_body(void* ud, unsigned int begin, unsigned int end);
 void linear_backward_accum_parallel(const float* X, const float* dY, unsigned int T,
                                     unsigned int inSize, unsigned int outSize,
                                     std::vector<float>& gW, std::vector<float>& gB,
-                                    const std::vector<float>& W, float* dXOut);
+                                    const float* W, float* dXOut);
 
 struct LinearFwdCtx
 {
@@ -106,34 +113,43 @@ float transformer_schedule_multiplier(const glades::LearningRateScheduleConfig& 
 void add_positional_encoding(float* h,
                              unsigned int T,
                              unsigned int dModel,
-                             const std::vector<double>& invDenomPair)
+                             const DoubleBufferView& invDenomPair)
 {
 	if (T == 0u || dModel == 0u || !h)
 		return;
-	glades::transformer_kernels::add_sinusoidal_positional_encoding_seq_inplace(h, T, dModel, invDenomPair);
+	glades::transformer_kernels::add_sinusoidal_positional_encoding_seq_inplace(
+	    h, T, dModel, invDenomPair.data, invDenomPair.size);
 }
 
 void linear_forward_maybe_lowp(const float* X,
                                unsigned int T,
                                unsigned int inSize,
-                               const std::vector<float>& W,
-                               const std::vector<uint16_t>& WLowp,
-                               bool useLowp,
-                               int lowpDType,
-                               const std::vector<float>& b,
+                               const LinearWeightView& weights,
                                unsigned int outSize,
                                float* Y)
 {
-	if (useLowp)
+	if (weights.useLowpWeights)
 	{
-		if (WLowp.size() == static_cast<size_t>(outSize) * static_cast<size_t>(inSize))
-			glades::transformer_kernels::linear_forward_lowp(X, T, inSize, &WLowp[0], lowpDType, b, outSize, Y);
+		if (weights.lowpWeights &&
+		    weights.lowpWeightCount == static_cast<size_t>(outSize) * static_cast<size_t>(inSize))
+			glades::transformer_kernels::linear_forward_lowp(X, T, inSize,
+			                                                weights.lowpWeights,
+			                                                weights.lowpDType,
+			                                                weights.bias,
+			                                                weights.biasCount,
+			                                                outSize, Y);
 		else
-			linear_forward_opt_parallel(X, T, inSize, W, b, outSize, Y);
+			linear_forward_opt_parallel(X, T, inSize,
+			                            weights.weights, weights.weightCount,
+			                            weights.bias, weights.biasCount,
+			                            outSize, Y);
 	}
 	else
 	{
-		linear_forward_opt_parallel(X, T, inSize, W, b, outSize, Y);
+		linear_forward_opt_parallel(X, T, inSize,
+		                            weights.weights, weights.weightCount,
+		                            weights.bias, weights.biasCount,
+		                            outSize, Y);
 	}
 }
 
@@ -144,7 +160,7 @@ static void linear_backward_accum(const float* X,
                                   unsigned int outSize,
                                   std::vector<float>& gW,
                                   std::vector<float>& gB,
-                                  const std::vector<float>& W,
+                                  const float* W,
                                   float* dXOut)
 {
 	linear_backward_accum_parallel(X, dY, T, inSize, outSize, gW, gB, W, dXOut);
@@ -157,19 +173,18 @@ void linear_backward_accum_maybe_lowp(const float* X,
                                       unsigned int outSize,
                                       std::vector<float>& gW,
                                       std::vector<float>& gB,
-                                      const std::vector<float>& WMaster,
-                                      const std::vector<uint16_t>& WLowp,
-                                      bool useLowp,
-                                      int lowpDType,
+                                      const LinearWeightView& weights,
                                       float* dXOut)
 {
-	linear_backward_accum(X, dY, T, inSize, outSize, gW, gB, WMaster, NULL);
+	linear_backward_accum(X, dY, T, inSize, outSize, gW, gB, weights.weights, NULL);
 
 	if (!dXOut)
 		return;
 	std::fill(dXOut, dXOut + (static_cast<size_t>(T) * static_cast<size_t>(inSize)), 0.0f);
 
-	const bool haveLowp = useLowp && (WLowp.size() == static_cast<size_t>(outSize) * static_cast<size_t>(inSize));
+	const bool haveLowp = weights.useLowpWeights &&
+	                      weights.lowpWeights &&
+	                      (weights.lowpWeightCount == static_cast<size_t>(outSize) * static_cast<size_t>(inSize));
 	if (!haveLowp)
 	{
 		const bool worthParallel = (static_cast<unsigned long long>(T) * outSize * inSize >= 500000ULL);
@@ -178,7 +193,7 @@ void linear_backward_accum_maybe_lowp(const float* X,
 		{
 			LinearBwdDXCtx ctx;
 			ctx.dY = dY;
-			ctx.W = WMaster.empty() ? NULL : &WMaster[0];
+			ctx.W = weights.weights;
 			ctx.inSize = inSize;
 			ctx.outSize = outSize;
 			ctx.dX = dXOut;
@@ -195,7 +210,7 @@ void linear_backward_accum_maybe_lowp(const float* X,
 					const float dy = dY[dyOff + o];
 					glades::transformer_kernels::axpy_f32(
 					    dXOut + dxOff,
-					    &WMaster[static_cast<size_t>(o) * static_cast<size_t>(inSize)],
+					    weights.weights + (static_cast<size_t>(o) * static_cast<size_t>(inSize)),
 					    dy, inSize);
 				}
 			}
@@ -213,7 +228,7 @@ void linear_backward_accum_maybe_lowp(const float* X,
 				const float dy = dY[dyOff + o];
 				const size_t wRowOff = static_cast<size_t>(o) * static_cast<size_t>(inSize);
 				for (unsigned int i = 0; i < inSize; ++i)
-					wRowBuf[i] = glades::transformer_kernels::lowp_to_float(WLowp[wRowOff + i], lowpDType);
+					wRowBuf[i] = glades::transformer_kernels::lowp_to_float(weights.lowpWeights[wRowOff + i], weights.lowpDType);
 				glades::transformer_kernels::axpy_f32(dXOut + dxOff, &wRowBuf[0], dy, inSize);
 			}
 		}
@@ -381,7 +396,8 @@ void rope_body(void* ud, unsigned int begin, unsigned int end)
 	{
 		glades::transformer_kernels::rope_apply_inplace_strided(
 		    c.buf + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
-		    c.T, c.rowStride, c.dHead, c.ropeDim, *c.invFreq, c.inverse);
+		    c.T, c.rowStride, c.dHead, c.ropeDim,
+		    c.invFreq.data, c.invFreq.size, c.inverse);
 	}
 }
 
@@ -471,12 +487,14 @@ void linear_fwd_tiled_body(void* ud, unsigned int begin, unsigned int end)
 void linear_forward_opt_parallel(const float* X,
                                  unsigned int T,
                                  unsigned int inSize,
-                                 const std::vector<float>& W,
-                                 const std::vector<float>& b,
+                                 const float* W,
+                                 size_t WSize,
+                                 const float* b,
+                                 unsigned int bSize,
                                  unsigned int outSize,
                                  float* Y)
 {
-	if (!X || !Y || T == 0u || inSize == 0u || outSize == 0u)
+	if (!X || !W || !Y || T == 0u || inSize == 0u || outSize == 0u)
 		return;
 
 	const bool worthParallel = (static_cast<unsigned long long>(T) * outSize * inSize >= 500000ULL);
@@ -487,16 +505,16 @@ void linear_forward_opt_parallel(const float* X,
 		ctx.X = X;
 		ctx.T = T;
 		ctx.inSize = inSize;
-		ctx.W = W.empty() ? NULL : &W[0];
-		ctx.b = b.empty() ? NULL : &b[0];
-		ctx.bSize = static_cast<unsigned int>(b.size());
+		ctx.W = W;
+		ctx.b = b;
+		ctx.bSize = bSize;
 		ctx.outSize = outSize;
 		ctx.Y = Y;
 		pool.parallel_for(outSize, linear_fwd_tiled_body, &ctx);
 	}
 	else
 	{
-		glades::transformer_kernels::linear_forward_opt(X, T, inSize, W, b, outSize, Y);
+		glades::transformer_kernels::linear_forward_opt(X, T, inSize, W, WSize, b, bSize, outSize, Y);
 	}
 }
 
@@ -548,7 +566,7 @@ void linear_backward_accum_parallel(const float* X,
                                     unsigned int outSize,
                                     std::vector<float>& gW,
                                     std::vector<float>& gB,
-                                    const std::vector<float>& W,
+                                    const float* W,
                                     float* dXOut)
 {
 	if (gW.size() != static_cast<size_t>(outSize) * static_cast<size_t>(inSize))
@@ -596,7 +614,7 @@ void linear_backward_accum_parallel(const float* X,
 	{
 		LinearBwdDXCtx ctx;
 		ctx.dY = dY;
-		ctx.W = W.empty() ? NULL : &W[0];
+		ctx.W = W;
 		ctx.inSize = inSize;
 		ctx.outSize = outSize;
 		ctx.dX = dXOut;
@@ -613,7 +631,7 @@ void linear_backward_accum_parallel(const float* X,
 				const float dy = dY[dyOff + o];
 				glades::transformer_kernels::axpy_f32(
 				    dXOut + dxOff,
-				    &W[static_cast<size_t>(o) * static_cast<size_t>(inSize)],
+				    W + (static_cast<size_t>(o) * static_cast<size_t>(inSize)),
 				    dy, inSize);
 			}
 		}

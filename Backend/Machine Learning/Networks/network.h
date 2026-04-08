@@ -1264,6 +1264,17 @@ private:
 		float lrScheduleMultiplier;
 	};
 #ifdef GLADES_HAVE_CUDA
+	bool tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
+	                               int epochIdx, int64_t epochStartMs,
+	                               unsigned long long& tokensProcessed,
+	                               unsigned long long& targetsProcessed,
+	                               double& tokenLmNllSum,
+	                               unsigned long long& tokenLmTokenCount,
+	                               unsigned long long& clsCorrect,
+	                               unsigned long long& clsTotal,
+	                               shmea::GLogger* logger);
+	bool ensureTransformerGpuTrainingScratch(const TransformerEpochCfg& cfg, unsigned int T);
+	bool syncTransformerGpuTrainingWeightsToCpu();
 	void transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
 	                              int epochIdx, int64_t epochStartMs,
 	                              unsigned long long& tokensProcessed,
