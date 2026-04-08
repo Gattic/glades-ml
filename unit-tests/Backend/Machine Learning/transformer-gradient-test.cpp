@@ -15,6 +15,7 @@
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/training_config.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
+#include "../../../Backend/Machine Learning/DataObjects/TokenInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
@@ -26,6 +27,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <vector>
 
@@ -829,6 +831,66 @@ void TransformerGradientUnitTest()
 		delete net;
 		delete info;
 		delete di;
+	}
+
+	// -----------------------------------------------------------------------
+	// 6. Real TokenInput import path also improves eval loss after training.
+	// -----------------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("TokenInput integration: file import participates in gradient descent\n");
+	printf("-----------------------------------\n");
+	{
+		const char* path = "/tmp/ut_transformer_gradient_tokeninput.txt";
+		std::ofstream out(path);
+		out << "2 5 11 3 7 1 9 4\n";
+		out << "3 6 10 2 8 1 7 5\n";
+		out.close();
+
+		glades::TokenInput di;
+		di.setPadTokenId(12);
+		di.setMirrorTrainToTestOnImplicitSplit(true);
+		di.import(shmea::GString(path));
+		G_assert(__FILE__, __LINE__, "==============Grad TokenInput: import failed==============", di.loadedOk());
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.02f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(12, 0.02f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* outInfo = new glades::OutputLayerInfo(13, glades::OutputLayerInfo::CLASSIFICATION);
+
+		glades::NNInfo* info = new glades::NNInfo("ut_grad_tokeninput", in, hidden, outInfo);
+		glades::NNetwork* net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net->setSeed(9090u);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
+
+		glades::TrainingConfig& tc = net->getTrainingConfigMutable();
+		tc.transformer.enableTokenEmbedding = true;
+		tc.transformer.vocabSizeOverride = 13;
+		tc.transformer.tieEmbeddings = true;
+		tc.transformer.padTokenId = 12;
+		tc.transformer.nHeadsOverride = 3;
+		tc.transformer.nKVHeadsOverride = 3;
+		tc.transformer.dFFOverride = 24;
+		tc.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		tc.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+		tc.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+		tc.transformer.ffnActivation = glades::TransformerRunConfig::FFN_GELU;
+		tc.transformer.ropeTheta = 10000.0f;
+		tc.optimizer.type = glades::OptimizerConfig::ADAMW;
+
+		LossCaptureCb cbBefore;
+		glades::NNetworkStatus st = net->test(&di, &cbBefore);
+		G_assert(__FILE__, __LINE__, "==============Grad TokenInput: eval before failed==============", st.ok() && cbBefore.saw);
+		st = net->train(&di);
+		G_assert(__FILE__, __LINE__, "==============Grad TokenInput: train failed==============", st.ok());
+		LossCaptureCb cbAfter;
+		st = net->test(&di, &cbAfter);
+		G_assert(__FILE__, __LINE__, "==============Grad TokenInput: eval after failed==============", st.ok() && cbAfter.saw);
+		G_assert(__FILE__, __LINE__, "==============Grad TokenInput: loss did not decrease==============",
+		         cbAfter.lastLoss < cbBefore.lastLoss + 0.01f);
+
+		delete net;
+		delete info;
 	}
 
 	printf("============================================================\n");

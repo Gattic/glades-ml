@@ -61,14 +61,14 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE,
 		                            isTrain ? "SGDHelper_TRANSFORMER: no train sequences"
 		                                    : "SGDHelper_TRANSFORMER: no test sequences");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 
 	// Ensure transformer parameters exist.
 	if (!ensureTensorParametersInitialized())
 	{
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 
@@ -88,7 +88,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	if (inputSize == 0u || outSize == 0u || dModel == 0u || dFF == 0u || nHeads == 0u || nLayers == 0u)
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_TRANSFORMER: invalid transformer state sizes");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 	if (tokenLM)
@@ -96,25 +96,25 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		if (!tieEmb)
 		{
 			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_TRANSFORMER: token LM mode requires tieEmbeddings=true");
-			running = false;
+			storeRunningFlag(false);
 			return;
 		}
 		if (inputSize != 1u)
 		{
 			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_TRANSFORMER: token LM mode requires inputSize==1 (token id)");
-			running = false;
+			storeRunningFlag(false);
 			return;
 		}
 		if (outSize != vocabSize || vocabSize == 0u)
 		{
 			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_TRANSFORMER: token LM mode requires outSize==vocabSize>0");
-			running = false;
+			storeRunningFlag(false);
 			return;
 		}
 		if (tieEmb && (ttConst.tokE.size() != static_cast<size_t>(vocabSize) * static_cast<size_t>(dModel)))
 		{
 			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_TRANSFORMER: token LM embedding table is not initialized");
-			running = false;
+			storeRunningFlag(false);
 			return;
 		}
 	}
@@ -141,14 +141,14 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
 		                            "SGDHelper_TRANSFORMER: token LM training requires optimizer=ADAMW or ATLAS for LLM-scale stability");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 	if (tokenLM && (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX) && (tokenLmNegK < 1))
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
 		                            "SGDHelper_TRANSFORMER: token LM sampled-softmax requires tokenLmSampledNegatives >= 1");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 
@@ -440,7 +440,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				if (!is_finite_double(sumsq))
 				{
 					net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_TRANSFORMER: non-finite grad-norm accumulation detected (NaN/Inf)");
-					net.running = false;
+					net.storeRunningFlag(false);
 					return false;
 				}
 				gradNorm = static_cast<float>(sqrt(sumsq));
@@ -453,7 +453,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			if (!is_finite(net.lastGradNorm) || !is_finite(net.lastGradNormScale) || net.lastGradNormScale <= 0.0f)
 			{
 				net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_TRANSFORMER: non-finite grad clipping metadata detected (NaN/Inf)");
-				net.running = false;
+				net.storeRunningFlag(false);
 				return false;
 			}
 
@@ -650,7 +650,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS tokE update entered NaN recovery");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 
@@ -661,7 +661,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS lmBias update produced NaN/Inf");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 				}
@@ -679,7 +679,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS WIn update entered NaN recovery");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 
@@ -690,7 +690,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS bIn update produced NaN/Inf");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 				}
@@ -725,7 +725,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS block weight update entered NaN recovery");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 
@@ -743,7 +743,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS block bias/LN update produced NaN/Inf");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 				}
@@ -760,7 +760,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS final LN update produced NaN/Inf");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 				}
@@ -780,7 +780,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS WOut update entered NaN recovery");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 
@@ -791,7 +791,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS bOut update produced NaN/Inf");
-						net.running = false;
+						net.storeRunningFlag(false);
 						return false;
 					}
 				}
@@ -1198,13 +1198,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	if (nHeads == 0u || (dModel % nHeads) != 0u)
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_TRANSFORMER: dModel is not divisible by nHeads");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 	if ((nHeads % nKVHeads) != 0u)
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "SGDHelper_TRANSFORMER: nHeads is not divisible by nKVHeads");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 	const unsigned int dHead = dModel / nHeads;
@@ -1312,7 +1312,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 	for (unsigned int si = 0; si < seqCount; ++si)
 	{
-		if (!running)
+		if (!loadRunningFlag())
 			break;
 
 		const unsigned int s = seqOrder[si];
@@ -1347,7 +1347,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				    << " MiB just for logits/probs/dLogits (T=" << T << ", vocab=" << vocabSize << "). "
 				    << "Use sampled-softmax (tokenLmLossKind=SAMPLED) or set tokenLmAllowHugeFullSoftmax=1 to override.";
 				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, oss.str());
-				running = false;
+				storeRunningFlag(false);
 				return;
 			}
 		}
@@ -1389,13 +1389,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				{
 					lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
 					                            "SGDHelper_TRANSFORMER: token LM requires integer token-id accessors on DataInput (get*SequenceTokenId)");
-					running = false;
+					storeRunningFlag(false);
 					return;
 				}
 				if (tid < 0 || static_cast<unsigned int>(tid) >= vocabSize)
 				{
 					lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_TRANSFORMER: token id out of range");
-					running = false;
+					storeRunningFlag(false);
 					return;
 				}
 				tokenIds[t] = tid;
@@ -1411,7 +1411,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				{
 					lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
 					                            "SGDHelper_TRANSFORMER: token LM requires integer expected-token-id accessors on DataInput (get*SequenceExpectedTokenId)");
-					running = false;
+					storeRunningFlag(false);
 					return;
 				}
 				targetIds[t] = yid;
@@ -1431,7 +1431,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					if (!is_finite(v))
 					{
 						lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "SGDHelper_TRANSFORMER: non-finite input sequence value detected (NaN/Inf)");
-						running = false;
+						storeRunningFlag(false);
 						return;
 					}
 					transformerScratch.x[off + i] = v;
@@ -2268,7 +2268,7 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 				std::ostringstream oss;
 				oss << "transformerCpuForwardPass: non-finite hidden state detected at layer " << li;
 				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, oss.str());
-				running = false;
+				storeRunningFlag(false);
 				return;
 			}
 		}
@@ -3006,13 +3006,13 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	if (nHeads == 0u || (dModel % nHeads) != 0u)
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerGpuTrainEpoch: dModel is not divisible by nHeads");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 	if ((nHeads % nKVHeads) != 0u)
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerGpuTrainEpoch: nHeads is not divisible by nKVHeads");
-		running = false;
+		storeRunningFlag(false);
 		return;
 	}
 	const unsigned int dHead = dModel / nHeads;
@@ -3024,7 +3024,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 	for (unsigned int s = 0; s < seqCount; ++s)
 	{
-		if (!running)
+		if (!loadRunningFlag())
 			break;
 
 		const unsigned int T = di->getTrainSequenceLength(s);
@@ -4064,7 +4064,7 @@ if (ad_.valid) { \
 			{
 				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 				    "SGDHelper_TRANSFORMER: GPU ATLAS update failed");
-				running = false;
+				storeRunningFlag(false);
 			}
 #undef GLADES_GPU_SGD_BIAS
 			}

@@ -16,6 +16,7 @@
 #include "../../../Backend/Machine Learning/Networks/transformer_ops.h"
 #include "../../../Backend/Machine Learning/Networks/training_config.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
+#include "../../../Backend/Machine Learning/DataObjects/TokenInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
@@ -27,6 +28,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <vector>
 
@@ -832,6 +834,66 @@ void TransformerImprovementsUnitTest()
 		for (size_t i = 0; i < logitsA.size(); ++i)
 			G_assert(__FILE__, __LINE__, "==============Determinism: logits differ==============",
 			         fabs(static_cast<double>(logitsA[i]) - static_cast<double>(logitsB[i])) < 1e-7);
+	}
+
+	// ===== 13. TokenInput file import works on the real token LM path =====
+	printf("-----------------------------------\n");
+	printf("TokenInput: file import feeds transformer training/inference\n");
+	printf("-----------------------------------\n");
+	{
+		const char* path = "/tmp/ut_transformer_improvements_tokeninput.txt";
+		std::ofstream out(path);
+		out << "1 2 3 4 5\n";
+		out << "2 3 4 5 6\n";
+		out.close();
+
+		glades::TokenInput di;
+		di.setPadTokenId(16);
+		di.setMirrorTrainToTestOnImplicitSplit(true);
+		di.import(shmea::GString(path));
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: import failed==============", di.loadedOk());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: train split empty==============", di.getTrainSize() > 0u);
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: test split empty==============", di.getTestSize() > 0u);
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* outInfo = new glades::OutputLayerInfo(17, glades::OutputLayerInfo::CLASSIFICATION);
+
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_improvements_tokeninput", in, hidden, outInfo);
+		glades::NNetwork* net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net->setSeed(31337u);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
+
+		glades::TrainingConfig& cfg = net->getTrainingConfigMutable();
+		cfg.transformer.enableTokenEmbedding = true;
+		cfg.transformer.vocabSizeOverride = 17;
+		cfg.transformer.tieEmbeddings = true;
+		cfg.transformer.padTokenId = 16;
+		cfg.transformer.nHeadsOverride = 4;
+		cfg.transformer.nKVHeadsOverride = 4;
+		cfg.transformer.dFFOverride = 32;
+		cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+		cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+		cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		cfg.transformer.ropeTheta = 10000.0f;
+		cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: init failed==============", net->test(&di).ok());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: train failed==============", net->train(&di).ok());
+
+		std::vector<unsigned int> probe;
+		probe.push_back(1u);
+		probe.push_back(2u);
+		probe.push_back(3u);
+		std::vector<float> logits;
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: forward failed==============",
+		         net->transformerLmForwardLastLogits(probe, logits).ok());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: logits size mismatch==============", logits.size() == 17u);
+
+		delete net;
+		delete info;
 	}
 
 	printf("\n============================================================\n");

@@ -74,7 +74,7 @@ static GladesLinkAnchorsOnce g_glades_link_anchors_once;
  */
 glades::NNetwork::NNetwork(int newNetType)
 {
-	running = false;
+	storeRunningFlag(false);
 #if GLADES_HAVE_STD_ATOMICS
 	runLock.clear(std::memory_order_release);
 #else
@@ -124,7 +124,7 @@ glades::NNetwork::NNetwork(int newNetType)
 glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 {
 	// Constructors must always fully initialize the object. Never early-return.
-	running = false;
+	storeRunningFlag(false);
 #if GLADES_HAVE_STD_ATOMICS
 	runLock.clear(std::memory_order_release);
 #else
@@ -226,6 +226,11 @@ glades::TransformerPublicAPI::Runtime glades::TransformerPublicAPI::runtime(cons
 	return Runtime(net);
 }
 
+glades::TransformerPublicAPI::ServingRuntime glades::TransformerPublicAPI::serving(const glades::NNetwork& net)
+{
+	return ServingRuntime(net);
+}
+
 glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::generate(const std::vector<glades::TokenId>& promptTokens,
                                                                        const glades::TransformerGenerateConfig& cfg,
                                                                        glades::TransformerGenerateResult& out,
@@ -245,6 +250,33 @@ glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogits(
                                                                                 std::vector<float>& outLogits) const
 {
 	return TransformerPublicAPI::forwardLastLogits(net, tokenIds, outLogits);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::resetBatcher(Batcher& batcher, const BatcherConfig& cfg) const
+{
+	return net.transformerLmServeBatcherReset(batcher, cfg);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::submit(Batcher& batcher,
+                                                                            const glades::TransformerServeRequest& request,
+                                                                            unsigned int& outSlot) const
+{
+	return net.transformerLmServeBatcherSubmit(batcher, request, outSlot);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::remove(Batcher& batcher, unsigned int slot) const
+{
+	return net.transformerLmServeBatcherRemove(batcher, slot);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::step(Batcher& batcher, glades::ITransformerServeCallbacks* cb) const
+{
+	return net.transformerLmServeBatcherStep(batcher, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::cancelSlot(Batcher& batcher, unsigned int slot) const
+{
+	return net.transformerLmServeBatcherCancelSlot(batcher, slot);
 }
 
 void glades::NNetwork::releaseRunLock()
@@ -423,7 +455,7 @@ int64_t NNetwork::getCurrentTimeMilliseconds() const
 
 bool glades::NNetwork::getRunning() const
 {
-	return running;
+	return loadRunningFlag();
 }
 
 int glades::NNetwork::getEpochs() const
@@ -433,7 +465,17 @@ int glades::NNetwork::getEpochs() const
 
 void glades::NNetwork::stop()
 {
-	running = false;
+	storeRunningFlag(false);
+}
+
+bool glades::NNetwork::loadRunningFlag() const
+{
+	return (__atomic_load_n(&running, __ATOMIC_SEQ_CST) != 0);
+}
+
+void glades::NNetwork::storeRunningFlag(bool value)
+{
+	__atomic_store_n(&running, value ? 1 : 0, __ATOMIC_SEQ_CST);
 }
 
 void glades::NNetwork::setSeed(uint64_t seed)
@@ -838,7 +880,7 @@ glades::NNetworkStatus glades::NNetwork::run(const DataInput* newDataInput, int 
 glades::NNetworkStatus glades::NNetwork::failStatus(glades::NNetworkStatus::Code code, const std::string& message)
 {
 	lastStatus = glades::NNetworkStatus(code, message);
-	running = false;
+	storeRunningFlag(false);
 	return lastStatus;
 }
 
@@ -996,7 +1038,7 @@ void glades::NNetwork::clean()
 	overallClassSpecificity = 0.0f;
 	overallClassF1 = 0.0f;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
-	running = false;
+	storeRunningFlag(false);
 	lastStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
 	// Reset training configuration to defaults.
 	trainingConfig = TrainingConfig();
@@ -1054,7 +1096,9 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 
 	// Determinism: parameter initialization must always use this network's RNG engine.
 
-	const unsigned int inputSize = di->getFeatureCount();
+	const bool tokenModel = trainingConfig.transformer.enableTokenEmbedding;
+	const bool tokenIdInput = tokenModel && di->hasTokenIdInput();
+	const unsigned int inputSize = tokenIdInput ? 1u : di->getFeatureCount();
 	const unsigned int outSize = skeleton->getOutputLayerSize();
 	const int H = skeleton->numHiddenLayers();
 	if (inputSize == 0u || outSize == 0u)
@@ -1312,7 +1356,6 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		const unsigned int dFF = (dffCfg > 0) ? static_cast<unsigned int>(dffCfg) : 0u;
 
 		// Token LM mode: derive vocab size and expect input features == 1 token id.
-		const bool tokenModel = trainingConfig.transformer.enableTokenEmbedding;
 		unsigned int vocabSize = outSize;
 		if (trainingConfig.transformer.vocabSizeOverride > 0)
 			vocabSize = static_cast<unsigned int>(trainingConfig.transformer.vocabSizeOverride);
@@ -1324,10 +1367,10 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 				                            "ensureTensorParametersInitialized: token LM mode currently requires tieEmbeddings=true");
 				return false;
 			}
-			if (inputSize != 1u)
+			if (!tokenIdInput)
 			{
 				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM mode requires DataInput featureCount == 1 (token id)");
+				                            "ensureTensorParametersInitialized: token LM mode requires DataInput token-id accessors");
 				return false;
 			}
 			if (vocabSize == 0u)

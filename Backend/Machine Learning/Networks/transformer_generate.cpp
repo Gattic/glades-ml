@@ -301,27 +301,119 @@ static void log_transformer_serve_batch_end(shmea::GLogger* logger,
 	logger->info("Transformer", shmea::GString(oss.str().c_str()));
 }
 
-static bool sample_token_from_logits(const std::vector<float>& logits,
-                                     glades::rng::Engine& rng,
-                                     float temperature,
-                                     unsigned int topK,
-                                     float topP,
-                                     unsigned int topPTopKCap,
-                                     unsigned int& outToken,
-                                     std::vector<unsigned int>& idxScratch,
-                                     std::vector<float>& weightScratch)
+static void init_sampling_scratch(unsigned int vocab,
+                                  std::vector<unsigned int>& idxScratch,
+                                  std::vector<float>& weightScratch)
 {
-	return sample_token_from_logits_ptr(logits.empty() ? NULL : &logits[0],
-	                                    rng,
-	                                    static_cast<unsigned int>(logits.size()),
-	                                    temperature,
-	                                    topK,
-	                                    topP,
-	                                    topPTopKCap,
-	                                    outToken,
-	                                    idxScratch,
-	                                    weightScratch);
+	idxScratch.resize(vocab);
+	for (unsigned int i = 0u; i < vocab; ++i)
+		idxScratch[i] = i;
+	weightScratch.assign(vocab, 0.0f);
 }
+
+static NNetworkStatus sample_next_token_common(const char* where,
+                                               const float* logits,
+                                               unsigned int vocab,
+                                               glades::rng::Engine& rng,
+                                               const glades::NNetwork::TransformerGenerateConfig& cfg,
+                                               std::vector<unsigned int>& idxScratch,
+                                               std::vector<float>& weightScratch,
+                                               unsigned int& outToken)
+{
+	if (!sample_token_from_logits_ptr(logits, rng, vocab, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap, outToken, idxScratch, weightScratch))
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, std::string(where) + ": failed to sample token from logits");
+	if (outToken >= vocab)
+		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, std::string(where) + ": sampled tokenId out of range");
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
+static bool apply_stop_token_rules(glades::NNetwork::TransformerGenerateResult& rr,
+                                   unsigned int tok,
+                                   const glades::NNetwork::TransformerGenerateConfig& cfg,
+                                   const std::vector<unsigned int>* stopTok)
+{
+	const int eos = cfg.eosTokenId;
+	if (cfg.stopOnEos && eos >= 0 && tok == static_cast<unsigned int>(eos))
+	{
+		rr.stoppedOnEos = true;
+		return true;
+	}
+	if (!stopTok)
+		return false;
+	for (size_t i = 0u; i < stopTok->size(); ++i)
+	{
+		if (tok == (*stopTok)[i])
+		{
+			rr.stoppedByStopToken = true;
+			return true;
+		}
+	}
+	return false;
+}
+
+struct SingleGenerateMetricsGuard
+{
+	shmea::GLogger* logger;
+	const glades::NNetworkStatus* status;
+	unsigned int promptLen;
+	const glades::NNetwork::TransformerGenerateConfig* cfg;
+	unsigned int wantMaxLen;
+	const glades::NNetwork::TransformerGenerateResult* out;
+	int64_t wall0ms;
+	const glades::NNetwork* net;
+	const double* msPrefill;
+	const double* msSample;
+	const double* msDecodeAppend;
+	const glades::NNetwork::TransformerKvPerfBreakdown* perf;
+
+	SingleGenerateMetricsGuard(shmea::GLogger* newLogger,
+	                          const glades::NNetworkStatus* newStatus,
+	                          unsigned int newPromptLen,
+	                          const glades::NNetwork::TransformerGenerateConfig* newCfg,
+	                          unsigned int newWantMaxLen,
+	                          const glades::NNetwork::TransformerGenerateResult* newOut,
+	                          int64_t newWall0ms,
+	                          const glades::NNetwork* newNet,
+	                          const double* newMsPrefill,
+	                          const double* newMsSample,
+	                          const double* newMsDecodeAppend,
+	                          const glades::NNetwork::TransformerKvPerfBreakdown* newPerf)
+	    : logger(newLogger),
+	      status(newStatus),
+	      promptLen(newPromptLen),
+	      cfg(newCfg),
+	      wantMaxLen(newWantMaxLen),
+	      out(newOut),
+	      wall0ms(newWall0ms),
+	      net(newNet),
+	      msPrefill(newMsPrefill),
+	      msSample(newMsSample),
+	      msDecodeAppend(newMsDecodeAppend),
+	      perf(newPerf)
+	{
+	}
+
+	~SingleGenerateMetricsGuard()
+	{
+		if (!logger || !status || !cfg || !out || !net)
+			return;
+		const double wallMs = static_cast<double>(net->getCurrentTimeMilliseconds() - wall0ms);
+		const unsigned int totalOut = static_cast<unsigned int>(out->tokens.size());
+		const unsigned int genTokens = cfg->includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
+		log_transformer_generate_end(logger,
+		                             *status,
+		                             promptLen,
+		                             *cfg,
+		                             wantMaxLen,
+		                             *out,
+		                             genTokens,
+		                             wallMs,
+		                             (msPrefill ? *msPrefill : 0.0),
+		                             (msSample ? *msSample : 0.0),
+		                             (msDecodeAppend ? *msDecodeAppend : 0.0),
+		                             perf);
+	}
+};
 
 } // namespace
 
@@ -331,6 +423,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
                                                               glades::ITransformerGenerateCallbacks* cb) const
 {
 	out = TransformerGenerateResult();
+	NNetworkStatus retSt(NNetworkStatus::OK, std::string());
 	glades::NNetwork::RunLockGuard runGuard(*const_cast<glades::NNetwork*>(this));
 	if (!runGuard.ok())
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE,
@@ -399,20 +492,24 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 
 	// Initialize per-call KV session and prefill prompt.
 	TransformerLmSession session;
+	SingleGenerateMetricsGuard metricsGuard(metricsOn ? logger : NULL,
+	                                       &retSt,
+	                                       promptLen,
+	                                       &cfg,
+	                                       wantMaxLen,
+	                                       &out,
+	                                       wall0ms,
+	                                       this,
+	                                       &msPrefill,
+	                                       &msSample,
+	                                       &msDecodeAppend,
+	                                       &session.perf);
 	{
 		const NNetworkStatus st = transformerLmSessionReset(session, wantMaxLen);
 		if (!st.ok())
 		{
-			if (metricsOn && logger)
-			{
-				const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-				const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-				const unsigned int genTokens =
-				    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-				log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample,
-				                             msDecodeAppend, NULL);
-			}
-			return st;
+			retSt = st;
+			return retSt;
 		}
 	}
 
@@ -426,16 +523,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 		const NNetworkStatus st = transformerLmSessionAppend(session, promptTokens[i], last ? &logits : NULL);
 		if (!st.ok())
 		{
-			if (metricsOn && logger)
-			{
-				const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-				const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-				const unsigned int genTokens =
-				    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-				log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample,
-				                             msDecodeAppend, &session.perf);
-			}
-			return st;
+			retSt = st;
+			return retSt;
 		}
 	}
 
@@ -444,78 +533,36 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 	{
 		out.stoppedByLimit = true;
 		out.lastToken = cfg.includePromptInOutput ? promptTokens[promptTokens.size() - 1u] : 0u;
-		const NNetworkStatus st(NNetworkStatus::OK, std::string());
-		if (metricsOn && logger)
-		{
-			const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-			const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-			const unsigned int genTokens =
-			    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-			log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-			                             &session.perf);
-		}
-		return st;
+		return retSt;
 	}
 
 	// Sampling scratch buffers (pre-sized to vocab to avoid per-step allocations).
-	std::vector<unsigned int> idxScratch(vocab);
-	for (unsigned int i = 0u; i < vocab; ++i)
-		idxScratch[i] = i;
-	std::vector<float> weightScratch(vocab, 0.0f);
-
-	const int eos = cfg.eosTokenId;
-	const bool stopOnEos = cfg.stopOnEos && (eos >= 0);
+	std::vector<unsigned int> idxScratch;
+	std::vector<float> weightScratch;
+	init_sampling_scratch(vocab, idxScratch, weightScratch);
 
 	for (unsigned int genIdx = 0u; genIdx < cfg.maxNewTokens; ++genIdx)
 	{
 		if (cb && cb->shouldStop(*this))
 		{
 			out.stoppedByCallback = true;
-			const NNetworkStatus st(NNetworkStatus::OK, std::string());
-			if (metricsOn && logger)
-			{
-				const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-				const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-				const unsigned int genTokens =
-				    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-				log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-				                             &session.perf);
-			}
-			return st;
+			return retSt;
 		}
 
 		unsigned int nextTok = 0u;
 		{
 			ScopedTimerMs t(this, metricsOn, &msSample);
-			if (!sample_token_from_logits(logits, callEngine, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap, nextTok, idxScratch, weightScratch))
-			{
-				const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "transformerLmGenerate: failed to sample token from logits");
-				if (metricsOn && logger)
-				{
-					const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-					const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-					const unsigned int genTokens =
-					    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-					log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-					                             &session.perf);
-				}
-				return st;
-			}
+			retSt = sample_next_token_common("transformerLmGenerate",
+			                                 logits.empty() ? NULL : &logits[0],
+			                                 vocab,
+			                                 callEngine,
+			                                 cfg,
+			                                 idxScratch,
+			                                 weightScratch,
+			                                 nextTok);
 		}
-		if (nextTok >= vocab)
-		{
-			const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "transformerLmGenerate: sampled tokenId out of range");
-			if (metricsOn && logger)
-			{
-				const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-				const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-				const unsigned int genTokens =
-				    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-				log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-				                             &session.perf);
-			}
-			return st;
-		}
+		if (!retSt.ok())
+			return retSt;
 
 		// Append token to KV cache and fetch logits for next step.
 		{
@@ -523,16 +570,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 			const NNetworkStatus st = transformerLmSessionAppend(session, nextTok, &logits);
 			if (!st.ok())
 			{
-				if (metricsOn && logger)
-				{
-					const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-					const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-					const unsigned int genTokens =
-					    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-					log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-					                             &session.perf);
-				}
-				return st;
+				retSt = st;
+				return retSt;
 			}
 		}
 
@@ -545,51 +584,16 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 			if (stop)
 			{
 				out.stoppedByCallback = true;
-				const NNetworkStatus st(NNetworkStatus::OK, std::string());
-				if (metricsOn && logger)
-				{
-					const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-					const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-					const unsigned int genTokens =
-					    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-					log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-					                             &session.perf);
-				}
-				return st;
+				return retSt;
 			}
 		}
 
-		if (stopOnEos && nextTok == static_cast<unsigned int>(eos))
-		{
-			out.stoppedOnEos = true;
-			const NNetworkStatus st(NNetworkStatus::OK, std::string());
-			if (metricsOn && logger)
-			{
-				const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-				const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-				const unsigned int genTokens =
-				    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-				log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-				                             &session.perf);
-			}
-			return st;
-		}
+		if (apply_stop_token_rules(out, nextTok, cfg, NULL))
+			return retSt;
 	}
 
 	out.stoppedByLimit = true;
-	{
-		const NNetworkStatus st(NNetworkStatus::OK, std::string());
-		if (metricsOn && logger)
-		{
-			const double wallMs = static_cast<double>(getCurrentTimeMilliseconds() - wall0ms);
-			const unsigned int totalOut = static_cast<unsigned int>(out.tokens.size());
-			const unsigned int genTokens =
-			    cfg.includePromptInOutput ? ((totalOut >= promptLen) ? (totalOut - promptLen) : 0u) : totalOut;
-			log_transformer_generate_end(logger, st, promptLen, cfg, wantMaxLen, out, genTokens, wallMs, msPrefill, msSample, msDecodeAppend,
-			                             &session.perf);
-		}
-		return st;
-	}
+	return retSt;
 }
 
 glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const std::vector<TransformerServeRequest>& requests,
@@ -916,10 +920,9 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 	}
 
 	// Sampling scratch buffers (pre-sized to vocab to avoid per-step allocations).
-	std::vector<unsigned int> idxScratch(vocab);
-	for (unsigned int i = 0u; i < vocab; ++i)
-		idxScratch[i] = i;
-	std::vector<float> weightScratch(vocab, 0.0f);
+	std::vector<unsigned int> idxScratch;
+	std::vector<float> weightScratch;
+	init_sampling_scratch(vocab, idxScratch, weightScratch);
 
 	// Decode: continuous batching with per-request early stopping.
 	for (unsigned int genIdx = 0u; genIdx < globalMaxNew; ++genIdx)
@@ -969,20 +972,17 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 			unsigned int nextTok = 0u;
 			{
 				ScopedTimerMs tms(this, metricsOn, &msSample);
-				if (!sample_token_from_logits_ptr(row, reqEngines[r], vocab, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap, nextTok, idxScratch,
-				                                  weightScratch))
-				{
-					const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "transformerLmServeGenerateBatch: failed to sample token from logits");
-					retSt = st;
-					return retSt;
-				}
+				retSt = sample_next_token_common("transformerLmServeGenerateBatch",
+				                                 row,
+				                                 vocab,
+				                                 reqEngines[r],
+				                                 cfg,
+				                                 idxScratch,
+				                                 weightScratch,
+				                                 nextTok);
 			}
-			if (nextTok >= vocab)
-			{
-				const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "transformerLmServeGenerateBatch: sampled tokenId out of range");
-				retSt = st;
+			if (!retSt.ok())
 				return retSt;
-			}
 
 			tokenIds[r] = nextTok;
 			active[r] = 1u;
@@ -1029,24 +1029,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 			}
 
 			const TransformerGenerateConfig& cfg = requests[r].cfg;
-			const int eos = cfg.eosTokenId;
-			if (cfg.stopOnEos && eos >= 0 && tok == static_cast<unsigned int>(eos))
+			const std::vector<unsigned int>& stopTok = requests[r].stopTokenIds;
+			if (apply_stop_token_rules(rr, tok, cfg, &stopTok))
 			{
-				rr.stoppedOnEos = true;
 				done[r] = 1u;
 				continue;
-			}
-
-			// Additional stop tokens.
-			const std::vector<unsigned int>& stopTok = requests[r].stopTokenIds;
-			for (size_t i = 0; i < stopTok.size(); ++i)
-			{
-				if (tok == stopTok[i])
-				{
-					rr.stoppedByStopToken = true;
-					done[r] = 1u;
-					break;
-				}
 			}
 
 			// Per-request max token limit.
@@ -1152,10 +1139,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherReset(glades::
 		}
 
 	// Sampling scratch: pre-size to avoid hot-path resize.
-	batcher.idxScratch.resize(vocab);
-	for (unsigned int i = 0u; i < vocab; ++i)
-		batcher.idxScratch[i] = i;
-	batcher.weightScratch.assign(vocab, 0.0f);
+	init_sampling_scratch(vocab, batcher.idxScratch, batcher.weightScratch);
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
@@ -1321,6 +1305,25 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherRemove(glades:
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
+glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherCancelSlot(glades::NNetwork::TransformerServeBatcher& batcher,
+                                                                             unsigned int slot) const
+{
+	if (!batcher.initialized)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmServeBatcherCancelSlot: batcher not initialized");
+	if (slot >= batcher.maxBatchSize)
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherCancelSlot: slot out of range");
+	if (batcher.inUse[slot] == 0u)
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherCancelSlot: slot not in use");
+
+	TransformerGenerateResult& rr = batcher.results[slot];
+	rr.stoppedByCallback = true;
+	rr.stoppedOnEos = false;
+	rr.stoppedByStopToken = false;
+	rr.stoppedByLimit = false;
+	batcher.done[slot] = 1u;
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
 glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::NNetwork::TransformerServeBatcher& batcher,
                                                                        glades::ITransformerServeCallbacks* cb) const
 {
@@ -1406,11 +1409,16 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 
 		const float* row = batcher.prevLogitsFlat.empty() ? NULL : &batcher.prevLogitsFlat[static_cast<size_t>(s) * static_cast<size_t>(vocab)];
 		unsigned int nextTok = 0u;
-		if (!sample_token_from_logits_ptr(row, *useEngine, vocab, cfg.temperature, cfg.topK, cfg.topP, cfg.topPTopKCap, nextTok, batcher.idxScratch,
-		                                  batcher.weightScratch))
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "transformerLmServeBatcherStep: failed to sample token from logits");
-		if (nextTok >= vocab)
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "transformerLmServeBatcherStep: sampled tokenId out of range");
+		const NNetworkStatus stSample = sample_next_token_common("transformerLmServeBatcherStep",
+		                                                        row,
+		                                                        vocab,
+		                                                        *useEngine,
+		                                                        cfg,
+		                                                        batcher.idxScratch,
+		                                                        batcher.weightScratch,
+		                                                        nextTok);
+		if (!stSample.ok())
+			return stSample;
 
 		batcher.tokenIds[s] = nextTok;
 		batcher.sampledTok[s] = nextTok;
@@ -1471,24 +1479,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 		}
 
 		const TransformerGenerateConfig& cfg = batcher.req[s].cfg;
-		const int eos = cfg.eosTokenId;
-		if (cfg.stopOnEos && eos >= 0 && tok == static_cast<unsigned int>(eos))
+		const std::vector<unsigned int>& stopTok = batcher.req[s].stopTokenIds;
+		if (apply_stop_token_rules(rr, tok, cfg, &stopTok))
 		{
-			rr.stoppedOnEos = true;
 			batcher.done[s] = 1u;
 			continue;
-		}
-
-		// Additional stop tokens.
-		const std::vector<unsigned int>& stopTok = batcher.req[s].stopTokenIds;
-		for (size_t i = 0; i < stopTok.size(); ++i)
-		{
-			if (tok == stopTok[i])
-			{
-				rr.stoppedByStopToken = true;
-				batcher.done[s] = 1u;
-				break;
-			}
 		}
 		if (batcher.done[s] != 0u)
 			continue;

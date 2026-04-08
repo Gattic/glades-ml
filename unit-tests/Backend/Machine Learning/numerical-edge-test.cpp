@@ -588,6 +588,49 @@ static void test_session_logits_match_forward(const glades::NNetwork& net)
 	printf("    PASSED\n");
 }
 
+static void test_batch_append_invalid_token_without_pad(const glades::NNetwork& net)
+{
+	printf("  [F1] BatchAppendInvalidTokenWithoutPad ...\n");
+	glades::TrainingConfig cfg = net.getTrainingConfig();
+	cfg.transformer.padTokenId = -1;
+	ASSERT("setTrainingConfig should accept no-pad transformer config", const_cast<glades::NNetwork&>(net).setTrainingConfig(cfg).ok());
+
+	glades::NNetwork::TransformerLmBatchSession batch;
+	glades::NNetworkStatus st = net.transformerLmBatchSessionReset(batch, 1u, 4u);
+	ASSERT("batch reset should succeed", st.ok());
+
+	std::vector<unsigned int> tokenIds(1u, 3u);
+	std::vector<unsigned char> tokenValid(1u, 0u);
+	std::vector<unsigned char> active(1u, 1u);
+	std::vector<float> logitsFlat;
+	st = net.transformerLmBatchSessionAppendSelective(batch, tokenIds, &tokenValid, active, &logitsFlat);
+	ASSERT("invalid masked append should succeed", st.ok());
+	ASSERT("invalid masked append logits sized to vocab", logitsFlat.size() == VOCAB);
+
+	tokenIds[0] = 2u;
+	tokenValid[0] = 1u;
+	st = net.transformerLmBatchSessionAppendSelective(batch, tokenIds, &tokenValid, active, &logitsFlat);
+	ASSERT("valid append after masked gap should succeed", st.ok());
+
+	glades::NNetwork::TransformerLmSession session;
+	st = net.transformerLmSessionReset(session, 4u);
+	ASSERT("single session reset should succeed", st.ok());
+	std::vector<float> refLogits;
+	st = net.transformerLmSessionAppend(session, 2u, &refLogits);
+	ASSERT("single session append should succeed", st.ok());
+
+	ASSERT("masked-gap logits should match fresh valid append size", logitsFlat.size() == refLogits.size());
+	float maxDiff = 0.0f;
+	for (size_t i = 0; i < refLogits.size(); ++i)
+	{
+		const float d = std::fabs(logitsFlat[i] - refLogits[i]);
+		if (d > maxDiff)
+			maxDiff = d;
+	}
+	ASSERT("masked invalid append should not perturb later logits", maxDiff < 1e-3f);
+	printf("    PASSED\n");
+}
+
 } // anonymous namespace
 
 // ============================================================
@@ -641,6 +684,10 @@ void NumericalEdgeUnitTest()
 	// --- Group E: KV-cache parity ---
 	printf("--- Group E: Session/Forward Parity ---\n");
 	test_session_logits_match_forward(*m.net);
+
+	// --- Group F: Batch masking semantics ---
+	printf("--- Group F: Batch Masking Semantics ---\n");
+	test_batch_append_invalid_token_without_pad(*m.net);
 
 	printf("============================================================\n");
 	printf("All Numerical Edge Case Tests Passed\n");

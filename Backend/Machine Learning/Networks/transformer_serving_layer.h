@@ -135,7 +135,9 @@ public:
 	NNetworkStatus step();
 
 	// Submit a request. Returns a requestId that can be used for polling/streaming/cancel.
-	// If callbacks is non-null, they may be invoked from step() on the caller's thread.
+	// If callbacks is non-null, ownership transfers to the serving layer; the callback is
+	// retained until the request snapshot is cleared or the layer stops.
+	// Callbacks may be invoked from step() on the caller's thread.
 	NNetworkStatus submit(const NNetwork::TransformerServeRequest& req, uint64_t& outRequestId, ITransformerServingCallbacks* callbacks = NULL);
 
 	// Request cancellation. Best-effort: takes effect on the next decode step.
@@ -268,7 +270,12 @@ private:
 	void admitPending_();
 	void updateSnapshotsFromBatcher_();
 	void finalizeDoneSlots_();
-	void shutdownLocked_(bool clearSnapshots, const char* logMsg);
+	void retainCallback_(ITransformerServingCallbacks* cb);
+	void releaseCallback_(ITransformerServingCallbacks* cb);
+	void retireCompletedCallback_(uint64_t requestId, ITransformerServingCallbacks* cb);
+	void releaseCompletedCallback_(uint64_t requestId);
+	void finalizeSnapshotForShutdown_(uint64_t requestId, const NNetworkStatus* terminalStatus);
+	void shutdownLocked_(bool clearSnapshots, const NNetworkStatus* terminalStatus, const char* logMsg);
 	bool mutexOk_() const;
 
 private:
@@ -305,6 +312,8 @@ private:
 	std::deque<Pending> pending_;
 	std::map<uint64_t, RequestSnapshot> snapshots_;
 	mutable std::vector<DeferredTokenCallback> deferredTokenCallbacks_;
+	std::map<uint64_t, ITransformerServingCallbacks*> completedCallbacks_;
+	std::map<ITransformerServingCallbacks*, unsigned int> callbackRefCounts_;
 
 	// Request id generator.
 	uint64_t nextId_;

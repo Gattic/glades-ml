@@ -18,19 +18,6 @@
 using namespace glades;
 
 namespace {
-// Thread-local storage for row-view scratch scalars.
-//
-// This codebase may be compiled in a pre-C++11 mode, so we cannot rely on `thread_local`.
-// Prefer standard TLS when available; otherwise fall back to compiler TLS.
-#if defined(__cplusplus) && (__cplusplus >= 201103L)
-#define GLADES_THREAD_LOCAL thread_local
-#elif defined(_MSC_VER)
-#define GLADES_THREAD_LOCAL __declspec(thread)
-#elif defined(__GNUC__) || defined(__clang__)
-#define GLADES_THREAD_LOCAL __thread
-#else
-#error "TokenInput row-view APIs require thread-local storage support"
-#endif
 
 static inline std::string to_std_string(const shmea::GString& s)
 {
@@ -457,90 +444,58 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 
 shmea::GVector<float> glades::TokenInput::getTrainRow(unsigned int index) const
 {
-	if (index >= trainTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(trainTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 shmea::GVector<float> glades::TokenInput::getTrainExpectedRow(unsigned int index) const
 {
-	if (index >= trainNextTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(trainNextTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 shmea::GVector<float> glades::TokenInput::getTestRow(unsigned int index) const
 {
-	if (index >= testTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(testTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 shmea::GVector<float> glades::TokenInput::getTestExpectedRow(unsigned int index) const
 {
-	if (index >= testNextTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(testNextTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 bool glades::TokenInput::getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= trainTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsTok;
-	tlsTok = static_cast<float>(trainTok[index]);
-	outData = &tlsTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= trainNextTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsNextTok;
-	tlsNextTok = static_cast<float>(trainNextTok[index]);
-	outData = &tlsNextTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= testTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsTok;
-	tlsTok = static_cast<float>(testTok[index]);
-	outData = &tlsTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= testNextTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsNextTok;
-	tlsNextTok = static_cast<float>(testNextTok[index]);
-	outData = &tlsNextTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTrainTokenId(unsigned int index, int& outTokenId) const

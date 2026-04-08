@@ -1,6 +1,7 @@
 // Serving layer implementation for Transformer token-LM generation.
 
 #include "transformer_serving_layer.h"
+#include "transformer_public_api.h"
 
 #include "Backend/Database/GLogger.h"
 
@@ -114,7 +115,8 @@ TransformerServingLayer::TransformerServingLayer()
 
 TransformerServingLayer::~TransformerServingLayer()
 {
-	stop();
+	LockGuard lock(mu_);
+	shutdownLocked_(true, NULL, running_ ? "destroy" : NULL);
 }
 
 bool TransformerServingLayer::isRunning() const
@@ -126,7 +128,7 @@ bool TransformerServingLayer::isRunning() const
 NNetworkStatus TransformerServingLayer::start(const NNetwork& net, const Config& cfg)
 {
 	LockGuard lock(mu_);
-	shutdownLocked_(false, NULL);
+	shutdownLocked_(false, NULL, NULL);
 
 	if (!mutexOk_())
 		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "TransformerServingLayer::start: recursive mutex initialization failed");
@@ -150,7 +152,7 @@ NNetworkStatus TransformerServingLayer::start(const NNetwork& net, const Config&
 	bcfg.wipeKvOnRemove = cfg_.wipeKvOnRemove;
 	bcfg.rngSeed = cfg_.rngSeed;
 
-	const NNetworkStatus st = net_->transformerLmServeBatcherReset(batcher_, bcfg);
+	const NNetworkStatus st = TransformerPublicAPI::serving(*net_).resetBatcher(batcher_, bcfg);
 	if (!st.ok())
 	{
 		net_ = NULL;
@@ -178,7 +180,7 @@ void TransformerServingLayer::stop()
 		logEvent("transformer_serving_stop_deferred", 0ULL, "deferred_until_step_exit");
 		return;
 	}
-	shutdownLocked_(false, "ok");
+	shutdownLocked_(false, NULL, "ok");
 }
 
 NNetworkStatus TransformerServingLayer::submit(const NNetwork::TransformerServeRequest& req,
@@ -201,6 +203,7 @@ NNetworkStatus TransformerServingLayer::submit(const NNetwork::TransformerServeR
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "TransformerServingLayer::submit: pending queue full (backpressure)");
 
 	pending_.push_back(Pending(id, req, callbacks));
+	retainCallback_(callbacks);
 
 	RequestSnapshot snap;
 	snap.requestId = id;
@@ -235,6 +238,7 @@ bool TransformerServingLayer::cancel(uint64_t requestId)
 			it->second.done = true;
 			it->second.result.stoppedByCallback = true;
 			it->second.status = NNetworkStatus(NNetworkStatus::OK, std::string());
+			retireCompletedCallback_(requestId, q->cb);
 			pending_.erase(q);
 			logEvent("transformer_serving_cancel", requestId, "cancelled_pending");
 			return true;
@@ -303,6 +307,7 @@ bool TransformerServingLayer::clearSnapshot(uint64_t requestId)
 	if (!it->second.done)
 		return false;
 	snapshots_.erase(it);
+	releaseCompletedCallback_(requestId);
 	return true;
 }
 
@@ -356,23 +361,88 @@ void TransformerServingLayer::logEvent(const char* event, uint64_t requestId, co
 	logger->info("TransformerServe", shmea::GString(oss.str().c_str()));
 }
 
+void TransformerServingLayer::retainCallback_(ITransformerServingCallbacks* cb)
+{
+	if (!cb)
+		return;
+	unsigned int& refs = callbackRefCounts_[cb];
+	++refs;
+}
+
+void TransformerServingLayer::releaseCallback_(ITransformerServingCallbacks* cb)
+{
+	if (!cb)
+		return;
+	std::map<ITransformerServingCallbacks*, unsigned int>::iterator it = callbackRefCounts_.find(cb);
+	if (it == callbackRefCounts_.end())
+		return;
+	if (it->second > 1u)
+	{
+		--(it->second);
+		return;
+	}
+	callbackRefCounts_.erase(it);
+	delete cb;
+}
+
+void TransformerServingLayer::retireCompletedCallback_(uint64_t requestId, ITransformerServingCallbacks* cb)
+{
+	if (!cb)
+		return;
+	std::map<uint64_t, ITransformerServingCallbacks*>::iterator it = completedCallbacks_.find(requestId);
+	if (it != completedCallbacks_.end())
+	{
+		if (it->second != cb)
+			releaseCallback_(it->second);
+		it->second = cb;
+		return;
+	}
+	completedCallbacks_[requestId] = cb;
+}
+
+void TransformerServingLayer::releaseCompletedCallback_(uint64_t requestId)
+{
+	std::map<uint64_t, ITransformerServingCallbacks*>::iterator it = completedCallbacks_.find(requestId);
+	if (it == completedCallbacks_.end())
+		return;
+	ITransformerServingCallbacks* cb = it->second;
+	completedCallbacks_.erase(it);
+	releaseCallback_(cb);
+}
+
+void TransformerServingLayer::finalizeSnapshotForShutdown_(uint64_t requestId, const NNetworkStatus* terminalStatus)
+{
+	std::map<uint64_t, RequestSnapshot>::iterator it = snapshots_.find(requestId);
+	if (it == snapshots_.end() || it->second.done)
+		return;
+	it->second.done = true;
+	it->second.result.stoppedByCallback = true;
+	it->second.result.stoppedOnEos = false;
+	it->second.result.stoppedByStopToken = false;
+	it->second.result.stoppedByLimit = false;
+	if (terminalStatus)
+		it->second.status = *terminalStatus;
+	else
+		it->second.status = NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
 unsigned int TransformerServingLayer::countActiveSlots_() const
 {
 	unsigned int n = 0u;
-	if (batcher_.inUse.empty())
+	if (!batcher_.isInitialized())
 		return 0u;
-	for (unsigned int s = 0u; s < batcher_.maxBatchSize; ++s)
-		if (batcher_.inUse[s] != 0u)
+	for (unsigned int s = 0u; s < batcher_.capacity(); ++s)
+		if (batcher_.slotInUse(s))
 			++n;
 	return n;
 }
 
 bool TransformerServingLayer::findFreeSlot_(unsigned int& outSlot) const
 {
-	outSlot = batcher_.maxBatchSize;
-	for (unsigned int s = 0u; s < batcher_.maxBatchSize; ++s)
+	outSlot = batcher_.capacity();
+	for (unsigned int s = 0u; s < batcher_.capacity(); ++s)
 	{
-		if (s < batcher_.inUse.size() && batcher_.inUse[s] == 0u)
+		if (!batcher_.slotInUse(s))
 		{
 			outSlot = s;
 			return true;
@@ -395,7 +465,7 @@ void TransformerServingLayer::admitPending_()
 		ITransformerServingCallbacks* cb = p.cb;
 
 		unsigned int outSlot = 0u;
-		const NNetworkStatus st = net_->transformerLmServeBatcherSubmit(batcher_, p.req, outSlot);
+		const NNetworkStatus st = TransformerPublicAPI::serving(*net_).submit(batcher_, p.req, outSlot);
 		if (!st.ok())
 		{
 			// Mark request failed and drop it.
@@ -405,6 +475,7 @@ void TransformerServingLayer::admitPending_()
 				sit->second.done = true;
 				sit->second.status = st;
 			}
+			releaseCallback_(p.cb);
 			logEvent("transformer_serving_submit_fail", requestId, st.message.c_str());
 			pending_.pop_front();
 			continue;
@@ -435,34 +506,34 @@ void TransformerServingLayer::updateSnapshotsFromBatcher_()
 		if (it == snapshots_.end())
 			continue;
 		RequestSnapshot& snap = it->second;
-		const NNetwork::TransformerGenerateResult& rr = (s < batcher_.results.size()) ? batcher_.results[s] : snap.result;
-		append_token_delta(snap.result.tokens, rr.tokens);
-		snap.result.lastToken = rr.lastToken;
-		snap.result.stoppedByCallback = rr.stoppedByCallback;
-		snap.result.stoppedOnEos = rr.stoppedOnEos;
-		snap.result.stoppedByStopToken = rr.stoppedByStopToken;
-		snap.result.stoppedByLimit = rr.stoppedByLimit;
+		const NNetwork::TransformerGenerateResult* rr = batcher_.slotResult(s);
+		if (!rr)
+			rr = &snap.result;
+		append_token_delta(snap.result.tokens, rr->tokens);
+		snap.result.lastToken = rr->lastToken;
+		snap.result.stoppedByCallback = rr->stoppedByCallback;
+		snap.result.stoppedOnEos = rr->stoppedOnEos;
+		snap.result.stoppedByStopToken = rr->stoppedByStopToken;
+		snap.result.stoppedByLimit = rr->stoppedByLimit;
 	}
 }
 
 void TransformerServingLayer::finalizeDoneSlots_()
 {
 	// Called after a successful Step().
-	if (!net_ || batcher_.inUse.empty() || batcher_.done.empty())
+	if (!net_ || !batcher_.isInitialized())
 		return;
 
-	for (unsigned int s = 0u; s < batcher_.maxBatchSize; ++s)
+	for (unsigned int s = 0u; s < batcher_.capacity(); ++s)
 	{
-		if (s >= batcher_.inUse.size() || s >= batcher_.done.size())
-			continue;
-		if (batcher_.inUse[s] == 0u || batcher_.done[s] == 0u)
+		if (!batcher_.slotInUse(s) || !batcher_.slotDone(s))
 			continue;
 
 		const uint64_t id = (s < live_.size()) ? live_[s].id : 0ULL;
 		if (id == 0ULL)
 		{
 			// Defensive: unknown slot state; remove it.
-			(void)net_->transformerLmServeBatcherRemove(batcher_, s);
+			(void)TransformerPublicAPI::serving(*net_).remove(batcher_, s);
 			continue;
 		}
 
@@ -471,18 +542,21 @@ void TransformerServingLayer::finalizeDoneSlots_()
 		if (it != snapshots_.end())
 		{
 			RequestSnapshot& snap = it->second;
-			const NNetwork::TransformerGenerateResult& rr = batcher_.results[s];
-			append_token_delta(snap.result.tokens, rr.tokens);
-			snap.result.lastToken = rr.lastToken;
-			snap.result.stoppedByCallback = rr.stoppedByCallback;
-			snap.result.stoppedOnEos = rr.stoppedOnEos;
-			snap.result.stoppedByStopToken = rr.stoppedByStopToken;
-			snap.result.stoppedByLimit = rr.stoppedByLimit;
+			const NNetwork::TransformerGenerateResult* rr = batcher_.slotResult(s);
+			if (!rr)
+				continue;
+			append_token_delta(snap.result.tokens, rr->tokens);
+			snap.result.lastToken = rr->lastToken;
+			snap.result.stoppedByCallback = rr->stoppedByCallback;
+			snap.result.stoppedOnEos = rr->stoppedOnEos;
+			snap.result.stoppedByStopToken = rr->stoppedByStopToken;
+			snap.result.stoppedByLimit = rr->stoppedByLimit;
 			snap.done = true;
 			snap.status = NNetworkStatus(NNetworkStatus::OK, std::string());
 		}
 
 		logEvent("transformer_serving_request_done", id, "done");
+		retireCompletedCallback_(id, live_[s].cb);
 
 		// Clear live slot metadata.
 		if (s < live_.size())
@@ -495,7 +569,7 @@ void TransformerServingLayer::finalizeDoneSlots_()
 
 		// Remove from batcher (optional; but default enabled for serving).
 		if (cfg_.autoRemoveFinished)
-			(void)net_->transformerLmServeBatcherRemove(batcher_, s);
+			(void)TransformerPublicAPI::serving(*net_).remove(batcher_, s);
 	}
 }
 
@@ -535,15 +609,7 @@ NNetworkStatus TransformerServingLayer::step()
 	cancelChecks.reserve(live_.size());
 	for (unsigned int s = 0u; s < live_.size(); ++s)
 	{
-		if (s >= batcher_.inUse.size() || s >= batcher_.done.size() ||
-		    s >= batcher_.promptPos.size() || s >= batcher_.promptLen.size() ||
-		    s >= batcher_.generated.size() || s >= batcher_.reqMaxNew.size())
-			continue;
-		if (batcher_.inUse[s] == 0u || batcher_.done[s] != 0u)
-			continue;
-		if (batcher_.promptPos[s] < batcher_.promptLen[s])
-			continue;
-		if (batcher_.generated[s] >= batcher_.reqMaxNew[s])
+		if (!batcher_.slotCanDecode(s))
 			continue;
 		if (live_[s].id == 0ULL || live_[s].cb == NULL)
 			continue;
@@ -573,7 +639,7 @@ NNetworkStatus TransformerServingLayer::step()
 	if (stopRequested_)
 	{
 		inStep_ = false;
-		shutdownLocked_(false, "ok");
+		shutdownLocked_(false, NULL, "ok");
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 	}
 	for (size_t i = 0u; i < cancelLogIds.size(); ++i)
@@ -586,7 +652,7 @@ NNetworkStatus TransformerServingLayer::step()
 	}
 
 	deferredTokenCallbacks_.clear();
-	const NNetworkStatus stStep = stepNet->transformerLmServeBatcherStep(batcher_, &batcherCallbacks_);
+	const NNetworkStatus stStep = TransformerPublicAPI::serving(*stepNet).step(batcher_, &batcherCallbacks_);
 
 	if (!stStep.ok())
 	{
@@ -606,7 +672,7 @@ NNetworkStatus TransformerServingLayer::step()
 		}
 		logEvent("transformer_serving_step_fail", 0ULL, stStep.message.c_str());
 		stopRequested_ = true;
-		shutdownLocked_(false, "step_failed");
+		shutdownLocked_(false, &stStep, "step_failed");
 		return stStep;
 	}
 
@@ -658,24 +724,17 @@ NNetworkStatus TransformerServingLayer::step()
 		{
 			if (live_[s].id != id)
 				continue;
-			if (s < batcher_.results.size())
-			{
-				batcher_.results[s].stoppedByCallback = true;
-				batcher_.results[s].stoppedOnEos = false;
-				batcher_.results[s].stoppedByStopToken = false;
-				batcher_.results[s].stoppedByLimit = false;
-			}
-			if (s < batcher_.done.size())
-				batcher_.done[s] = 1u;
+			(void)TransformerPublicAPI::serving(*net_).cancelSlot(batcher_, s);
 			if (s < live_.size())
 			{
+				retireCompletedCallback_(id, live_[s].cb);
 				live_[s].id = 0ULL;
 				live_[s].cb = NULL;
 			}
 			if (s < slotCancel_.size())
 				slotCancel_[s] = 0u;
 			if (cfg_.autoRemoveFinished)
-				(void)net_->transformerLmServeBatcherRemove(batcher_, s);
+				(void)TransformerPublicAPI::serving(*net_).remove(batcher_, s);
 			logEvent("transformer_serving_request_done", id, "done");
 			break;
 		}
@@ -684,18 +743,30 @@ NNetworkStatus TransformerServingLayer::step()
 
 	if (stopRequested_)
 	{
-		shutdownLocked_(false, "ok");
+		shutdownLocked_(false, NULL, "ok");
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 	}
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
-void TransformerServingLayer::shutdownLocked_(bool clearSnapshots, const char* logMsg)
+void TransformerServingLayer::shutdownLocked_(bool clearSnapshots, const NNetworkStatus* terminalStatus, const char* logMsg)
 {
 	const bool hadNet = (net_ != NULL);
 	if (hadNet && logMsg)
 		logEvent("transformer_serving_stop", 0ULL, logMsg);
+	for (std::deque<Pending>::iterator it = pending_.begin(); it != pending_.end(); ++it)
+	{
+		finalizeSnapshotForShutdown_(it->id, terminalStatus);
+		retireCompletedCallback_(it->id, it->cb);
+	}
+	for (size_t i = 0u; i < live_.size(); ++i)
+	{
+		if (live_[i].id == 0ULL)
+			continue;
+		finalizeSnapshotForShutdown_(live_[i].id, terminalStatus);
+		retireCompletedCallback_(live_[i].id, live_[i].cb);
+	}
 	running_ = false;
 	stopRequested_ = false;
 	inStep_ = false;
@@ -706,6 +777,13 @@ void TransformerServingLayer::shutdownLocked_(bool clearSnapshots, const char* l
 	{
 		live_[i].id = 0ULL;
 		live_[i].cb = NULL;
+	}
+	if (clearSnapshots)
+	{
+		for (std::map<uint64_t, ITransformerServingCallbacks*>::iterator it = completedCallbacks_.begin();
+		     it != completedCallbacks_.end(); ++it)
+			releaseCallback_(it->second);
+		completedCallbacks_.clear();
 	}
 	if (clearSnapshots)
 		snapshots_.clear();

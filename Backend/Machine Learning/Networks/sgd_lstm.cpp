@@ -174,7 +174,7 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 		float& lastGradNorm;
 		float& lastGradNormScale;
 		NNetworkStatus& lastStatus;
-		volatile bool& running;
+		volatile int& running;
 		TensorGatedState& tensorLstm;
 		int H;
 		unsigned int outSize;
@@ -1090,4 +1090,3 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 		timeStepsInBatch = 0u;
 	}
 }
-

@@ -44,8 +44,26 @@ struct TransformerPublicAPI
 		const NNetwork& net;
 	};
 
+	struct ServingRuntime
+	{
+		typedef NNetwork::TransformerServeBatcherConfig BatcherConfig;
+		typedef NNetwork::TransformerServeBatcher Batcher;
+
+		explicit ServingRuntime(const NNetwork& network) : net(network) {}
+
+		NNetworkStatus resetBatcher(Batcher& batcher, const BatcherConfig& cfg) const;
+		NNetworkStatus submit(Batcher& batcher, const TransformerServeRequest& request, unsigned int& outSlot) const;
+		NNetworkStatus remove(Batcher& batcher, unsigned int slot) const;
+		NNetworkStatus step(Batcher& batcher, ITransformerServeCallbacks* cb /* optional */) const;
+		NNetworkStatus cancelSlot(Batcher& batcher, unsigned int slot) const;
+
+	private:
+		const NNetwork& net;
+	};
+
 	// Preferred entrypoint: bind a transformer-specific runtime facade to a network.
 	static Runtime runtime(const NNetwork& net);
+	static ServingRuntime serving(const NNetwork& net);
 
 	// Single-request generation (KV-cache incremental decode).
 	static NNetworkStatus generate(const NNetwork& net,

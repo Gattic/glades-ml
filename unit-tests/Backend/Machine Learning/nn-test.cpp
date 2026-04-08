@@ -3610,6 +3610,7 @@ void NNTransformerUnitTest()
 
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSize Failed==============", di.getTrainSize() == 5u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSize Failed==============", di.getTestSize() == 4u);
+			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TokenInputCapability Failed==============", di.hasTokenIdInput());
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir FeatureCount Failed==============", di.getFeatureCount() == 1u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TrainSeqCount Failed==============", di.getTrainSequenceCount() == 2u);
 			G_assert(__FILE__, __LINE__, "==============TokenInput Dir TestSeqCount Failed==============", di.getTestSequenceCount() == 1u);

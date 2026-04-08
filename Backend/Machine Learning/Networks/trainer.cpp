@@ -98,7 +98,11 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	}
 
 	const unsigned int dataSize = isTrainRun ? net.di->getTrainSize() : net.di->getTestSize();
-	if ((dataSize <= 0u) || (net.di->getFeatureCount() <= 0))
+	const bool tokenLMInput =
+	    (((net.netType == glades::NNetwork::TYPE_TRANSFORMER_DECODER) || (net.netType == glades::NNetwork::TYPE_TRANSFORMER_ENCODER)) &&
+	     net.trainingConfig.transformer.enableTokenEmbedding &&
+	     net.di->hasTokenIdInput());
+	if ((dataSize <= 0u) || (!tokenLMInput && (net.di->getFeatureCount() <= 0)))
 	{
 		// If the DataInput tracks a concrete import/load error, surface it here so callers
 		// don't have to debug a generic EMPTY_DATA later.
@@ -192,7 +196,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 		// Instead, use DataInput's shape contract. Implementations with fixed shapes validate
 		// in O(1); others do a bounded spot-check.
 		std::string shapeErr;
-		const unsigned int expectedFeatureCount = tokenLM ? 1u : featureCount;
+		const unsigned int expectedFeatureCount = (tokenLM && net.di->hasTokenIdInput()) ? 0u : (tokenLM ? 1u : featureCount);
 		// Token LM expected rows are a single token id, not a dense one-hot of size outSize.
 		const unsigned int expectedOutSize = tokenLM ? 1u : outSize;
 		if (isTrainRun)
@@ -247,7 +251,7 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	}
 
 	// Re-check the active split is non-empty post-build (build can succeed for featureCount-only cases).
-	if ((dataSize <= 0u) || (net.di->getFeatureCount() <= 0))
+	if ((dataSize <= 0u) || (!tokenLMInput && (net.di->getFeatureCount() <= 0)))
 	{
 		std::string extra;
 		{
@@ -580,4 +584,3 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	net.lastStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
 	return net.lastStatus;
 }
-

@@ -618,7 +618,7 @@ private:
 	shmea::GLogger* loggerOverride;
 	glades::NaiveBayes bModel;
 
-	volatile bool running;
+	volatile int running;
 	int netType;
 	int epochs;
 	bool saveInstance;
@@ -656,6 +656,8 @@ private:
 	// Low-level lock primitives (implemented in network.cpp; GCC/Clang use atomic builtins).
 	bool tryAcquireRunLock();
 	void releaseRunLock();
+	bool loadRunningFlag() const;
+	void storeRunningFlag(bool value);
 
 	// Epoch-scoped metric accumulators (reset at the start of each epoch).
 	// Regression:
@@ -2112,6 +2114,31 @@ public:
 	{
 	public:
 		bool isInitialized() const { return initialized; }
+		unsigned int capacity() const { return maxBatchSize; }
+		bool slotInUse(unsigned int slot) const
+		{
+			return slot < inUse.size() && inUse[slot] != 0u;
+		}
+		bool slotDone(unsigned int slot) const
+		{
+			return slot < done.size() && done[slot] != 0u;
+		}
+		bool slotInPrefill(unsigned int slot) const
+		{
+			return slot < promptPos.size() && slot < promptLen.size() && promptPos[slot] < promptLen[slot];
+		}
+		bool slotCanDecode(unsigned int slot) const
+		{
+			return slotInUse(slot) && !slotDone(slot) &&
+			       !slotInPrefill(slot) &&
+			       slot < generated.size() &&
+			       slot < reqMaxNew.size() &&
+			       generated[slot] < reqMaxNew[slot];
+		}
+		const TransformerGenerateResult* slotResult(unsigned int slot) const
+		{
+			return slot < results.size() ? &results[slot] : NULL;
+		}
 
 		TransformerServeBatcher()
 		    : initialized(false),
@@ -2177,7 +2204,6 @@ public:
 
 	private:
 		friend class NNetwork;
-		friend class TransformerServingLayer;
 
 		bool initialized;
 		unsigned int vocab;
@@ -2235,6 +2261,9 @@ public:
 	// - Does not allocate on the hot path after Reset (subject to request submission copying).
 	NNetworkStatus transformerLmServeBatcherStep(TransformerServeBatcher& batcher,
 	                                            ITransformerServeCallbacks* cb /* optional */) const;
+	// Mark an in-use slot as callback-stopped without removing it from the batcher.
+	// Intended for serving runtimes that need to defer terminalization until after user callbacks return.
+	NNetworkStatus transformerLmServeBatcherCancelSlot(TransformerServeBatcher& batcher, unsigned int slot) const;
 
 	// Batched generation entrypoint.
 	// - Requests must be non-empty; each request must have a non-empty promptTokens.

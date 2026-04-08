@@ -10,6 +10,7 @@
 #include "../GMath/gmath.h"
 #include "transformer_kernels.h"
 #include "tensor_view.h"
+#include "Backend/Database/GLogger.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -18,6 +19,8 @@
 #include <limits>
 #include <sstream>
 #include <vector>
+
+#include "logfmt_utils.h"
 
 #ifdef GLADES_HAVE_CUDA
 #include "cuda/gpu_device.h"
@@ -33,6 +36,7 @@ using namespace glades;
 
 namespace {
 static inline bool is_finite(float x) { return glades::transformer_kernels::is_finite(x); }
+using namespace glades::logfmt;
 using glades::transformer_common::bytes_to_human;
 using glades::transformer_common::checked_add_size;
 using glades::transformer_common::checked_mul_size;
@@ -64,6 +68,31 @@ static inline unsigned long long kv_session_max_bytes()
 	if (parse_u64_env("GLADES_TRANSFORMER_KV_SESSION_MAX_BYTES", v) && v > 0ULL)
 		return v;
 	return kDefault;
+}
+
+static void log_kv_append_event(shmea::GLogger* logger,
+                                const char* event,
+                                unsigned int seqLen,
+                                unsigned int maxSeqLen,
+                                unsigned int activeCount,
+                                bool emittedLogits,
+                                const glades::NNetwork::TransformerKvPerfBreakdown* perf)
+{
+	if (!logger || !event)
+		return;
+	std::ostringstream oss;
+	oss << "event=" << event;
+	append_logfmt_kv(oss, "seq_len", seqLen);
+	append_logfmt_kv(oss, "max_seq_len", maxSeqLen);
+	append_logfmt_kv(oss, "active", activeCount);
+	append_logfmt_kv(oss, "emit_logits", emittedLogits);
+	if (perf)
+	{
+		append_logfmt_kv(oss, "kv_appends", static_cast<unsigned long long>(perf->kvAppends));
+		append_logfmt_kv(oss, "kv_ms_total", perf->msTotal);
+		append_logfmt_kv(oss, "non_finite_hidden", static_cast<unsigned long long>(perf->nonFiniteHiddenState));
+	}
+	logger->info("Transformer", shmea::GString(oss.str().c_str()));
 }
 
 // Use the shared scalar kernels directly (no wrapper shims).
@@ -1264,7 +1293,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 					session.perf.lastNonFiniteLayer = li;
 					session.perf.lastNonFinitePos = pos;
 				}
-				return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "transformerLmSessionAppend: non-finite hidden state");
+				std::ostringstream oss;
+				oss << "transformerLmSessionAppend: non-finite hidden state at layer " << li
+				    << " position " << pos << " dim " << i;
+				return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, oss.str());
 			}
 	}
 
@@ -1295,6 +1327,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 	}
 
 	session.curLen += 1u;
+	if (metricsOn && transformerMetricsCfg.logPerKvAppend)
+		log_kv_append_event(getLogger(),
+		                   "transformer_kv_append",
+		                   session.curLen,
+		                   session.maxLen,
+		                   1u,
+		                   outLogits != NULL,
+		                   &session.perf);
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
@@ -1610,6 +1650,33 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 		// keyValid for this position
 		if (keyValidSeq)
 			keyValidSeq[pos] = (keyIsValid ? 1u : 0u);
+		if (valid == 0u && padTokenId < 0)
+		{
+			const size_t perLayer = static_cast<size_t>(maxLen) * static_cast<size_t>(session.dModelKV);
+			const size_t basePos = static_cast<size_t>(pos) * static_cast<size_t>(session.dModelKV);
+			for (unsigned int li = 0; li < session.nLayers; ++li)
+			{
+				const size_t base = static_cast<size_t>(li) * perLayer + basePos;
+				if (session.kvCacheDType != glades::NNetwork::TransformerLmBatchSession::KV_CACHE_F32)
+				{
+					if (!kSeq16 || !vSeq16)
+						return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmBatchSessionAppendSelective: invalid K/V cache pointers (lowp)");
+					std::fill(kSeq16 + base, kSeq16 + base + session.dModelKV, static_cast<uint16_t>(0u));
+					std::fill(vSeq16 + base, vSeq16 + base + session.dModelKV, static_cast<uint16_t>(0u));
+				}
+				else
+				{
+					if (!kSeq || !vSeq)
+						return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmBatchSessionAppendSelective: invalid K/V cache pointers");
+					std::fill(kSeq + base, kSeq + base + session.dModelKV, 0.0f);
+					std::fill(vSeq + base, vSeq + base + session.dModelKV, 0.0f);
+				}
+			}
+			if (outRow)
+				std::fill(outRow, outRow + vocab, 0.0f);
+			cur += 1u;
+			continue;
+		}
 
 		// Embed
 		{
@@ -1816,7 +1883,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 						session.perf.lastNonFiniteLayer = li;
 						session.perf.lastNonFinitePos = pos;
 					}
-					return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "transformerLmBatchSessionAppendSelective: non-finite hidden state");
+					std::ostringstream oss;
+					oss << "transformerLmBatchSessionAppendSelective: non-finite hidden state at batch " << b
+					    << " layer " << li << " position " << pos << " dim " << i;
+					return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, oss.str());
 				}
 		}
 
@@ -1844,6 +1914,24 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 		cur += 1u;
 	}
 
+	if (metricsOn && transformerMetricsCfg.logPerKvAppend)
+	{
+		unsigned int activeCount = 0u;
+		unsigned int maxCurLen = 0u;
+		for (size_t i = 0u; i < active.size(); ++i)
+			if (active[i] != 0u)
+				++activeCount;
+		for (size_t i = 0u; i < session.curLen.size(); ++i)
+			if (session.curLen[i] > maxCurLen)
+				maxCurLen = session.curLen[i];
+		log_kv_append_event(getLogger(),
+		                   "transformer_kv_batch_append",
+		                   maxCurLen,
+		                   session.maxLen,
+		                   activeCount,
+		                   outLogitsFlat != NULL,
+		                   &session.perf);
+	}
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
