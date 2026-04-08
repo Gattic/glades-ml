@@ -35,6 +35,7 @@ struct GpuAtlasWeightState
 	unsigned int n;     // cols of weight matrix
 	unsigned int r;     // subspace rank
 	unsigned int complementRank; // allocated complement-block rank (>= 1 for storage)
+	unsigned int activeComplementRank; // runtime active residual rank (<= complementRank)
 	bool rightSubspace; // true when m > n (use right singular vectors)
 
 	// subDim = min(m,n): dimension the subspace basis lives in
@@ -43,6 +44,7 @@ struct GpuAtlasWeightState
 	// gz/gPred/prevGz: [outerDim * r] projected gradient
 	//   Left subspace (rightSubspace=false): gz[r, n] — direction c is row c
 	//   Right subspace (rightSubspace=true):  gz[m, r] — direction c is col c
+	// activeComplementRank: online active prefix inside the retained residual block
 
 	GpuBuffer<float> U;          // [subDim * r] orthonormal subspace basis
 	GpuBuffer<float> fisherDiag; // [r] EMA of Fisher eigenvalues
@@ -82,7 +84,7 @@ struct GpuAtlasWeightState
 	float lastBaselineRate;
 
 	GpuAtlasWeightState()
-	    : m(0u), n(0u), r(0u), complementRank(0u), rightSubspace(false),
+	    : m(0u), n(0u), r(0u), complementRank(0u), activeComplementRank(0u), rightSubspace(false),
 	      refreshAllocated(false),
 	      totalTrace(0.0f), sigma2(0.0f), mu(0.01f), step(0ULL), initialized(false),
 	      lastBaselineRate(0.0f)

@@ -32,6 +32,7 @@ namespace atlas {
 // - fisherDiag in R^r: EMA of Fisher eigenvalues per subspace dimension
 // - V in R^{m x b}: residual complement block basis (row-major, packed by row)
 // - complementBlock in R^{b x b}: EMA covariance block captured by V
+// - activeComplementRank: online active prefix inside the retained residual block
 // - complementFisher: trace(complementBlock) for diagnostics / compatibility
 // - totalTrace: EMA of the normalized covariance trace on the ATLAS update scale
 // - sigma2: isotropic tail closure derived from totalTrace, fisherDiag, and V
@@ -45,6 +46,7 @@ struct WeightState
 	unsigned int r;     // subspace rank (r <= min(m, n))
 	unsigned int activeRank; // currently active leading rank (activeRank <= r)
 	unsigned int complementRank; // allocated complement-block rank (>= 1 for storage)
+	unsigned int activeComplementRank; // runtime active residual rank (<= complementRank)
 
 	std::vector<float> U;           // [m * r] orthonormal subspace basis (row-major)
 	std::vector<float> fisherDiag;  // [r] EMA of Fisher eigenvalues
@@ -84,6 +86,7 @@ struct WeightState
 
 	WeightState()
 	    : m(0u), n(0u), r(0u), activeRank(0u), complementRank(0u),
+	      activeComplementRank(0u),
 	      complementFisher(0.0f), totalTrace(0.0f), sigma2(0.0f),
 	      mu(0.01f), lastBaselineRate(0.0f),
 	      step(0ULL), initialized(false)
@@ -92,7 +95,7 @@ struct WeightState
 
 	void reset()
 	{
-		m = n = r = activeRank = complementRank = 0u;
+		m = n = r = activeRank = complementRank = activeComplementRank = 0u;
 		U.clear();
 		fisherDiag.clear();
 		V.clear();

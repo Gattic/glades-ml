@@ -57,6 +57,171 @@ static inline float atlas_bootstrap_or_ema(float prev,
 	return beta * prev + (1.0f - beta) * sample;
 }
 
+static unsigned int atlas_requested_complement_rank(unsigned int enabledRank,
+                                                    unsigned int subDim,
+                                                    unsigned int activeRank);
+
+static bool atlas_tag_contains(const char* tag, const char* needle)
+{
+	return tag && needle && std::strstr(tag, needle) != 0;
+}
+
+static bool atlas_hidden_fc_eligible(const char* tag,
+                                     unsigned int m,
+                                     unsigned int n)
+{
+	if (!tag || !tag[0])
+		return true;
+	if (m <= 16u || n <= 16u)
+		return false;
+	return atlas_tag_contains(tag, "cnn.fc")
+	    || atlas_tag_contains(tag, "dff.W");
+}
+
+static unsigned int atlas_enabled_complement_rank(unsigned int configuredRank,
+                                                  const char* tag,
+                                                  unsigned int m,
+                                                  unsigned int n,
+                                                  unsigned int activeRank)
+{
+	if (configuredRank == 0u)
+		return 0u;
+	if (!atlas_hidden_fc_eligible(tag, m, n))
+		return 0u;
+	return atlas_requested_complement_rank(configuredRank, m, activeRank);
+}
+
+static double sum_leading_spectrum(const std::vector<float>& eigVal,
+                                   unsigned int count)
+{
+	double sum = 0.0;
+	const unsigned int limit =
+	    (count < static_cast<unsigned int>(eigVal.size()))
+	        ? count
+	        : static_cast<unsigned int>(eigVal.size());
+	for (unsigned int i = 0; i < limit; ++i)
+	{
+		double v = static_cast<double>(eigVal[i]);
+		if (!std::isfinite(v) || v < 0.0)
+			v = 0.0;
+		sum += v;
+	}
+	return sum;
+}
+
+static double complement_tail_mean(double closedTrace,
+                                   double activeTrace,
+                                   double selectedTrace,
+                                   unsigned int subDim,
+                                   unsigned int activeRank,
+                                   unsigned int selectedRank,
+                                   float eps)
+{
+	const unsigned int tailDim =
+	    (subDim > activeRank + selectedRank)
+	        ? (subDim - activeRank - selectedRank)
+	        : 0u;
+	if (tailDim == 0u)
+		return std::max<double>(static_cast<double>(eps), 0.0);
+
+	double tailMean = (closedTrace - activeTrace - selectedTrace)
+	                / static_cast<double>(tailDim);
+	if (!std::isfinite(tailMean) || tailMean < static_cast<double>(eps))
+		tailMean = static_cast<double>(eps);
+	return tailMean;
+}
+
+static double complement_kelly_fraction(double scoutEig,
+                                        double tailMean)
+{
+	if (!std::isfinite(scoutEig) || scoutEig <= 0.0)
+		return 0.0;
+	if (!std::isfinite(tailMean) || tailMean <= 0.0)
+		tailMean = 0.0;
+	const double edge = scoutEig - tailMean;
+	if (!(edge > 0.0))
+		return 0.0;
+	double fraction = edge / scoutEig;
+	if (!std::isfinite(fraction) || fraction < 0.0)
+		return 0.0;
+	if (fraction > 1.0)
+		fraction = 1.0;
+	return fraction;
+}
+
+static unsigned int choose_active_complement_rank(const std::vector<float>& eigVal,
+                                                  const std::vector<float>* scoutEigVal,
+                                                  unsigned int informativeRank,
+                                                  unsigned int prevRank,
+                                                  double activeTrace,
+                                                  float totalTrace,
+                                                  unsigned int subDim,
+                                                  unsigned int activeRank,
+                                                  float eps,
+                                                  double* birthKellyOut = 0,
+                                                  double* birthScoutOut = 0)
+{
+	if (informativeRank == 0u)
+		return 0u;
+	if (prevRank > informativeRank)
+		prevRank = informativeRank;
+
+	const double fullTrace = sum_leading_spectrum(eigVal, informativeRank);
+	const double closedTrace = std::max<double>(static_cast<double>(totalTrace),
+	                                            activeTrace + fullTrace);
+	const double deathRatio = 1.10;
+	const double birthKellyThreshold = 0.10;
+	const double birthMinShare = 0.005;
+	const double deathMinShare = 0.03;
+	if (birthKellyOut)
+		*birthKellyOut = 0.0;
+	if (birthScoutOut)
+		*birthScoutOut = 0.0;
+
+	if (prevRank < informativeRank)
+	{
+		const double selectedTrace = sum_leading_spectrum(eigVal, prevRank);
+		const double tailMean =
+		    complement_tail_mean(closedTrace, activeTrace, selectedTrace,
+		                         subDim, activeRank, prevRank, eps);
+		double emaNextEig = static_cast<double>(eigVal[prevRank]);
+		if (!std::isfinite(emaNextEig) || emaNextEig < 0.0)
+			emaNextEig = 0.0;
+		double scoutNextEig = emaNextEig;
+		if (scoutEigVal && prevRank < scoutEigVal->size())
+		{
+			scoutNextEig = static_cast<double>((*scoutEigVal)[prevRank]);
+			if (!std::isfinite(scoutNextEig) || scoutNextEig < 0.0)
+				scoutNextEig = 0.0;
+		}
+		const double birthScout = (scoutNextEig > emaNextEig) ? scoutNextEig : emaNextEig;
+		const double birthKelly = complement_kelly_fraction(birthScout, tailMean);
+		if (birthKellyOut)
+			*birthKellyOut = birthKelly;
+		if (birthScoutOut)
+			*birthScoutOut = birthScout;
+		if (birthKelly >= birthKellyThreshold
+		    && birthScout > birthMinShare * closedTrace)
+			return prevRank + 1u;
+	}
+
+	if (prevRank > 0u)
+	{
+		const double selectedTrace = sum_leading_spectrum(eigVal, prevRank - 1u);
+		const double tailMean =
+		    complement_tail_mean(closedTrace, activeTrace, selectedTrace,
+		                         subDim, activeRank, prevRank - 1u, eps);
+		double weakestEig = static_cast<double>(eigVal[prevRank - 1u]);
+		if (!std::isfinite(weakestEig) || weakestEig < 0.0)
+			weakestEig = 0.0;
+		if (weakestEig <= deathRatio * tailMean
+		    || weakestEig <= deathMinShare * closedTrace)
+			return prevRank - 1u;
+	}
+
+	return prevRank;
+}
+
 static unsigned int atlas_storage_complement_rank(unsigned int enabledRank)
 {
 	return (enabledRank > 0u) ? enabledRank : 1u;
@@ -77,7 +242,7 @@ static unsigned int atlas_requested_complement_rank(unsigned int enabledRank,
 static float compute_complement_sigma2(float totalTrace,
                                        const std::vector<float>& fisherDiag,
                                        unsigned int activeRank,
-                                       float sectorFisher,
+                                       double activeSectorTrace,
                                        unsigned int effectiveComplementRank,
                                        unsigned int subDim,
                                        float eps,
@@ -88,7 +253,8 @@ static float compute_complement_sigma2(float totalTrace,
 	double activeTrace = 0.0;
 	for (unsigned int c = 0; c < activeRank; ++c)
 		activeTrace += static_cast<double>(fisherDiag[c]);
-	const double sectorTrace = (effectiveComplementRank > 0u) ? static_cast<double>(sectorFisher) : 0.0;
+	const double sectorTrace =
+	    (effectiveComplementRank > 0u) ? activeSectorTrace : 0.0;
 	const double modeledTrace = activeTrace + sectorTrace;
 	const double closureGap = static_cast<double>(totalTrace) - modeledTrace;
 	const double closedTrace = (closureGap >= 0.0)
@@ -1107,6 +1273,7 @@ static void compute_complement_block_sample(const std::vector<float>& gv,
 
 static float build_complement_correction_matrix(const std::vector<float>& block,
                                                 unsigned int rank,
+                                                unsigned int activeRank,
                                                 float baselineRate,
                                                 float nominalLr,
                                                 float eps,
@@ -1126,6 +1293,8 @@ static float build_complement_correction_matrix(const std::vector<float>& block,
 	float maxRate = 0.0f;
 	for (unsigned int mode = 0; mode < rank; ++mode)
 	{
+		if (mode >= activeRank)
+			continue;
 		float fisher = eigVal[mode];
 		if (!std::isfinite(fisher) || fisher < 0.0f)
 			fisher = 0.0f;
@@ -1274,6 +1443,8 @@ static bool ensureComplementStorage(GpuAtlasWeightState& state,
 	orthonormalize_complement_block(h_V, storageRank, h_U, activeRank, activeRank, subDim, targetRank);
 
 	state.complementRank = storageRank;
+	if (state.activeComplementRank > storageRank)
+		state.activeComplementRank = storageRank;
 	if (!state.V.allocate(static_cast<size_t>(subDim) * storageRank)) return false;
 	if (!state.complementBlock.allocate(static_cast<size_t>(storageRank) * storageRank)) return false;
 	if (!state.prevGv.allocate(static_cast<size_t>(outerDim) * storageRank)) return false;
@@ -1442,6 +1613,7 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 
 	// Dual-space selection: use whichever dimension is smaller for the subspace.
 	state.rightSubspace = (m > n);
+	state.activeComplementRank = 0u;
 
 	// Dimension-proportional rank cap: subspace rank should not exceed 25% of
 	// the subspace dimension. This prevents over-provisioning rank relative to
@@ -1771,15 +1943,23 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	const bool isRight = state.rightSubspace;
 	const unsigned int subDim = isRight ? n : m;
 	const unsigned int outerDim = isRight ? m : n;
-	if (!ensureComplementStorage(state, ac.complementRank))
+	const unsigned int enabledComplementRank =
+	    atlas_enabled_complement_rank(ac.complementRank, tag, m, n, r);
+	const bool adaptiveComplementController = (tag && tag[0]);
+	if (!ensureComplementStorage(state, enabledComplementRank))
 		return false;
 	const unsigned int complementRank = state.complementRank;
-	unsigned int effectiveComplementRank =
-	    atlas_requested_complement_rank(ac.complementRank, subDim, r);
+	unsigned int effectiveComplementRank = 0u;
 	const size_t mn = (size_t)m * n;
 	const size_t or_ = (size_t)outerDim * r;  // gz/gPred/prevGz size
 	const size_t compOuter = (size_t)outerDim * complementRank;
 	state.step += 1ULL;
+	if (state.activeComplementRank > enabledComplementRank)
+		state.activeComplementRank = enabledComplementRank;
+	const bool complementControlStep =
+	    adaptiveComplementController
+	    && (enabledComplementRank > 0u)
+	    && ((tSub == 0u) || (state.step % (unsigned long long)tSub) == 0ULL);
 
 	// Guard incoming gradient against NaN/Inf before any computation.
 	// A single NaN in d_gW would corrupt sigma2 (via reduction), the subspace
@@ -1901,7 +2081,8 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			}
 			return false;
 		}
-		if (ac.complementRank > 0u && !refreshComplementSector(state, d_gW, powerIters, betaRefresh))
+		if (enabledComplementRank > 0u
+		    && !refreshComplementSector(state, d_gW, powerIters, betaRefresh))
 			return false;
 
 		// NaN diagnostic: check U after refresh
@@ -1953,7 +2134,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			return false;
 	}
 
-	if (ac.complementRank > 0u)
+	if (enabledComplementRank > 0u)
 	{
 		if (isRight)
 		{
@@ -1975,6 +2156,10 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			                         state.gv.data(), (int)outerDim))
 				return false;
 		}
+	}
+	else if (state.gv.size() > 0u)
+	{
+		ATLAS_CUDA_CHECK(cudaMemset(state.gv.data(), 0, state.gv.size() * sizeof(float)));
 	}
 
 	// NaN diagnostic: check gz, prevGz, and U after projection
@@ -2014,46 +2199,155 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	// === Step 6: Recompute sigma2 from the shared covariance model ===
 	std::vector<float> h_fisher(r);
 	std::vector<float> h_block((size_t)complementRank * complementRank, 0.0f);
+	std::vector<float> h_sample((size_t)complementRank * complementRank, 0.0f);
 	std::vector<float> h_gv(compOuter, 0.0f);
-	float h_sectorFisher = 0.0f;
+	float h_blockTrace = 0.0f;
+	double activeSectorTrace = 0.0;
+	float complementTailMean = eps;
+	float complementScoutTop = 0.0f;
+	float complementBirthKelly = 0.0f;
+	unsigned int informativeComplementRank = 0u;
 	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 	ATLAS_CUDA_CHECK(cudaMemcpy(h_fisher.data(), state.fisherDiag.data(),
 	                              r * sizeof(float), cudaMemcpyDeviceToHost));
-	if (ac.complementRank > 0u)
+	if (enabledComplementRank > 0u)
 	{
 		ATLAS_CUDA_CHECK(cudaMemcpy(h_gv.data(), state.gv.data(),
 		                              h_gv.size() * sizeof(float), cudaMemcpyDeviceToHost));
 		ATLAS_CUDA_CHECK(cudaMemcpy(h_block.data(), state.complementBlock.data(),
 		                              h_block.size() * sizeof(float), cudaMemcpyDeviceToHost));
-		std::vector<float> sample;
-		compute_complement_block_sample(h_gv, complementRank, outerDim, isRight, statScaleSq, sample);
+		compute_complement_block_sample(h_gv, complementRank, outerDim, isRight, statScaleSq, h_sample);
 		for (size_t i = 0; i < h_block.size(); ++i)
-			h_block[i] = atlas_bootstrap_or_ema(h_block[i], sample[i], beta, state.step);
+			h_block[i] = atlas_bootstrap_or_ema(h_block[i], h_sample[i], beta, state.step);
 		symmetrize_block(h_block, complementRank);
-		h_sectorFisher = trace_complement_block(h_block, complementRank);
-		sectorFisherDiag = h_sectorFisher;
+		h_blockTrace = trace_complement_block(h_block, complementRank);
 		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementBlock.data(), h_block.data(),
 		                              h_block.size() * sizeof(float), cudaMemcpyHostToDevice));
-		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_sectorFisher,
+		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_blockTrace,
 		                              sizeof(float), cudaMemcpyHostToDevice));
 	}
 	else
 	{
-		h_sectorFisher = 0.0f;
+		h_blockTrace = 0.0f;
+		state.activeComplementRank = 0u;
 		ATLAS_CUDA_CHECK(cudaMemset(state.complementBlock.data(), 0, state.complementBlock.size() * sizeof(float)));
-		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_sectorFisher,
+		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_blockTrace,
 		                              sizeof(float), cudaMemcpyHostToDevice));
 	}
 	std::vector<float> h_V((size_t)subDim * complementRank, 0.0f);
 	ATLAS_CUDA_CHECK(cudaMemcpy(h_V.data(), state.V.data(),
 	                              h_V.size() * sizeof(float), cudaMemcpyDeviceToHost));
-	effectiveComplementRank = effective_complement_rank(h_V, complementRank, ac.complementRank, subDim, r);
+	informativeComplementRank =
+	    effective_complement_rank(h_V, complementRank, enabledComplementRank, subDim, r);
+	std::vector<float> h_blockEigVec;
+	std::vector<float> h_blockEigVal;
+	if (enabledComplementRank > 0u && informativeComplementRank > 0u)
+	{
+		jacobi_eigendecompose(h_block, complementRank, h_blockEigVec, h_blockEigVal);
+		for (unsigned int i = 0; i < complementRank; ++i)
+		{
+			if (!std::isfinite(h_blockEigVal[i]) || h_blockEigVal[i] < 0.0f)
+				h_blockEigVal[i] = 0.0f;
+		}
+		std::vector<float> h_scoutEigVec;
+		std::vector<float> h_scoutEigVal;
+		if (adaptiveComplementController)
+		{
+			symmetrize_block(h_sample, complementRank);
+			jacobi_eigendecompose(h_sample, complementRank, h_scoutEigVec, h_scoutEigVal);
+			for (unsigned int i = 0; i < complementRank; ++i)
+			{
+				if (!std::isfinite(h_scoutEigVal[i]) || h_scoutEigVal[i] < 0.0f)
+					h_scoutEigVal[i] = 0.0f;
+			}
+			if (!h_scoutEigVal.empty())
+				complementScoutTop = h_scoutEigVal[0];
+		}
+		if (!adaptiveComplementController)
+		{
+			state.activeComplementRank = informativeComplementRank;
+		}
+		else if (complementControlStep)
+		{
+			const unsigned int prevActiveComplementRank = state.activeComplementRank;
+			double activeTraceNow = 0.0;
+			for (unsigned int c = 0; c < r; ++c)
+				activeTraceNow += static_cast<double>(h_fisher[c]);
+			double birthKelly = 0.0;
+			double birthScout = 0.0;
+			state.activeComplementRank =
+			    choose_active_complement_rank(h_blockEigVal,
+			                                  h_scoutEigVal.empty() ? 0 : &h_scoutEigVal,
+			                                  informativeComplementRank,
+			                                  state.activeComplementRank,
+			                                  activeTraceNow,
+			                                  state.totalTrace,
+			                                  subDim,
+			                                  r,
+			                                  eps,
+			                                  &birthKelly,
+			                                  &birthScout);
+			complementBirthKelly = static_cast<float>(birthKelly);
+			complementScoutTop = static_cast<float>(birthScout);
+			if (state.activeComplementRank > informativeComplementRank)
+				state.activeComplementRank = informativeComplementRank;
+			if (logger && state.activeComplementRank != prevActiveComplementRank)
+			{
+				const double closedTrace = std::max<double>(
+				    static_cast<double>(state.totalTrace),
+				    activeTraceNow + sum_leading_spectrum(h_blockEigVal, informativeComplementRank));
+				const double prevTrace =
+				    sum_leading_spectrum(h_blockEigVal, prevActiveComplementRank);
+				const double tailMean =
+				    complement_tail_mean(closedTrace, activeTraceNow, prevTrace,
+				                         subDim, r, prevActiveComplementRank, eps);
+				std::ostringstream oss;
+				oss << "event=atlas_gpu_complement_rank_change";
+				if (tag) oss << " tag=" << tag;
+				oss << " step=" << state.step
+				    << " m=" << m
+				    << " n=" << n
+				    << " complement_rank_cap=" << enabledComplementRank
+				    << " complement_rank_prev=" << prevActiveComplementRank
+				    << " complement_rank_new=" << state.activeComplementRank
+				    << " tail_mean=" << static_cast<float>(tailMean)
+				    << " birth_kelly=" << complementBirthKelly
+				    << " birth_scout=" << complementScoutTop
+				    << " next_mode="
+				    << ((prevActiveComplementRank < informativeComplementRank)
+				            ? h_blockEigVal[prevActiveComplementRank]
+				            : 0.0f)
+				    << " weakest_active="
+				    << ((prevActiveComplementRank > 0u)
+				            ? h_blockEigVal[prevActiveComplementRank - 1u]
+				            : 0.0f);
+				logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+			}
+		}
+	}
+	else
+	{
+		state.activeComplementRank = 0u;
+	}
+	if (state.activeComplementRank > informativeComplementRank)
+		state.activeComplementRank = informativeComplementRank;
+	effectiveComplementRank = state.activeComplementRank;
+	activeSectorTrace = sum_leading_spectrum(h_blockEigVal, effectiveComplementRank);
 	{
 		double activeTrace = 0.0;
 		double sectorTrace = 0.0;
 		double gap = 0.0;
+		for (unsigned int c = 0; c < r; ++c)
+			activeTrace += static_cast<double>(h_fisher[c]);
+		const double fullBlockTrace =
+		    sum_leading_spectrum(h_blockEigVal, informativeComplementRank);
+		const double closedTrace = std::max<double>(static_cast<double>(state.totalTrace),
+		                                            activeTrace + fullBlockTrace);
+		complementTailMean = static_cast<float>(
+		    complement_tail_mean(closedTrace, activeTrace, activeSectorTrace,
+		                         subDim, r, effectiveComplementRank, eps));
 		state.sigma2 = compute_complement_sigma2(state.totalTrace, h_fisher, r,
-		                                         h_sectorFisher, effectiveComplementRank, subDim, eps,
+		                                         activeSectorTrace, effectiveComplementRank, subDim, eps,
 		                                         &activeTrace, &sectorTrace, &gap);
 		activeTraceCapture = (state.totalTrace > 1e-30f)
 		    ? (float)(activeTrace / (double)state.totalTrace)
@@ -2068,6 +2362,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	}
 	if (!std::isfinite(state.sigma2))
 		state.sigma2 = eps;
+	sectorFisherDiag = static_cast<float>(activeSectorTrace);
 
 	// === Step 7: Full-space baseline update ===
 	{
@@ -2115,11 +2410,12 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 				return false;
 		}
 
-		if (ac.complementRank > 0u)
+		if (enabledComplementRank > 0u && effectiveComplementRank > 0u)
 		{
 			const float sectorNominalLr = lr * atlas_nonnegative_finite(ac.complementLrScale, 0.0f);
 			std::vector<float> h_corrMat;
 			sectorRate = build_complement_correction_matrix(h_block, complementRank,
+			                                                effectiveComplementRank,
 			                                                baselineRate,
 			                                                sectorNominalLr,
 			                                                eps,
@@ -2165,9 +2461,14 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 				                     state.V.data(), (int)complementRank,
 				                     state.gPredV.data(), (int)outerDim,
 				                     1.0f,
-				                     d_W, (int)outerDim))
+			                     d_W, (int)outerDim))
 					return false;
 			}
+		}
+		else if (state.gPredV.size() > 0u)
+		{
+			ATLAS_CUDA_CHECK(cudaMemset(state.gPredV.data(), 0,
+			                            state.gPredV.size() * sizeof(float)));
 		}
 
 		// Guard against NaN/Inf propagation (matches CPU path)
@@ -2222,7 +2523,8 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		if (tag) oss << " tag=" << tag;
 		oss << " step=" << state.step
 		    << " m=" << m << " n=" << n << " rank=" << r
-		    << " complement_rank=" << complementRank
+		    << " complement_rank=" << enabledComplementRank
+		    << " complement_active_rank=" << state.activeComplementRank
 		    << " complement_effective_rank=" << effectiveComplementRank
 		    << " subspace=" << (isRight ? "right" : "left")
 		    << " lr=" << lr
@@ -2243,6 +2545,10 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			    << " trace_capture=" << traceCapture
 			    << " sector_trace_capture=" << sectorTraceCapture
 			    << " sector_fisher=" << sectorFisherDiag
+			    << " complement_block_trace=" << h_blockTrace
+			    << " complement_tail_mean=" << complementTailMean
+			    << " complement_scout_top=" << complementScoutTop
+			    << " complement_birth_kelly=" << complementBirthKelly
 			    << " sector_rate=" << sectorRate
 			    << " closure_gap=" << closureGap
 			    << " effective_rank=" << diag.effectiveRank
@@ -2259,7 +2565,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.prevGz.data(), state.gz.data(),
 	                                 or_ * sizeof(float), cudaMemcpyDeviceToDevice,
 	                                 computeStream()));
-	if (ac.complementRank > 0u)
+	if (enabledComplementRank > 0u)
 	{
 		ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.prevGv.data(), state.gv.data(),
 		                                 compOuter * sizeof(float), cudaMemcpyDeviceToDevice,

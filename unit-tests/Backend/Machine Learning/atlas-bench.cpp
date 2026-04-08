@@ -324,7 +324,7 @@ static void print_usage()
 	printf("  --atlas-lr X                            ATLAS-BSRP learning rate (default: 0.08)\n");
 	printf("  --atlas-kappa-max X                     ATLAS baseline/active kappaMax (default: 10.0)\n");
 	printf("  --rank N                                ATLAS subspace rank (default: 16)\n");
-	printf("  --atlas-complement-rank N               ATLAS complement sector rank (default: 0)\n");
+	printf("  --atlas-complement-rank N               ATLAS complement rank cap (default: 0)\n");
 	printf("  --atlas-sector-lr-scale X               ATLAS complement-sector lr scale (default: 0.25)\n");
 	printf("  --atlas-sector-kappa-max X              ATLAS complement-sector kappaMax (default: 0.5)\n");
 	printf("  --tsub N                                ATLAS subspace refresh interval in steps (default: 200)\n");

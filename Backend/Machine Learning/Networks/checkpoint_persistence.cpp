@@ -1665,6 +1665,10 @@ static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
 		std::ostringstream oss; oss << static_cast<unsigned long long>(st.activeRank);
 		kv["atlas." + prefix + ".activeRank"] = oss.str();
 	}
+	{
+		std::ostringstream oss; oss << static_cast<unsigned long long>(st.activeComplementRank);
+		kv["atlas." + prefix + ".activeComplementRank"] = oss.str();
+	}
 }
 
 static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
@@ -1679,6 +1683,7 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.r = r;
 	st.activeRank = r;
 	st.complementRank = (complementRankCfg > 0u) ? complementRankCfg : 1u;
+	st.activeComplementRank = 0u;
 	st.complementFisher = 0.0f;
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
 	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
@@ -1815,6 +1820,17 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 			iss >> s;
 			if (s > 0u && s <= static_cast<unsigned long long>(st.r))
 				st.activeRank = static_cast<unsigned int>(s);
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".activeComplementRank");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			unsigned long long s = 0;
+			iss >> s;
+			if (s <= static_cast<unsigned long long>(st.complementRank))
+				st.activeComplementRank = static_cast<unsigned int>(s);
 		}
 	}
 	if (st.prevGv.empty())

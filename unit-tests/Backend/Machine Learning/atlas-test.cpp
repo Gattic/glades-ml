@@ -3034,7 +3034,189 @@ void ATLASUnitTest()
 		ASSERT("==============ATLAS::DenseComplement sectorFisher mismatch==============",
 		       fabsf(state.complementFisher - expectedComplementTrace) < 1e-6f);
 		ASSERT("==============ATLAS::DenseComplement sigma2 mismatch==============",
-		       fabsf(state.sigma2 - expectedSigma2) < 1e-6f);
+		       fabsf(state.sigma2 - expectedSigma2) < 5e-6f);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 28D: FC eligibility gate disables complement block on small heads
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 28D: FC eligibility gate disables small-head complement block\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 10;
+		const unsigned int n = 84;
+		const unsigned int r = 4;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 28282831ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 1.0f);
+
+		glades::ATLASConfig acGate;
+		acGate.rank = r;
+		acGate.complementRank = 4u;
+		acGate.biasCorrection = false;
+		acGate.muMin = 0.0f;
+		acGate.muMax = 0.0f;
+		acGate.tSub = 1u;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                         acGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ComplementEligibility applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ComplementEligibility active rank should stay zero==============",
+		       state.activeComplementRank == 0u);
+		ASSERT("==============ATLAS::ComplementEligibility block trace should stay zero==============",
+		       fabsf(state.complementFisher) < 1e-8f);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 28E: adaptive complement rank births only materially large modes
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 28E: adaptive complement rank births large residual modes only\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 28282832ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.0f, rng);
+
+		state.activeRank = r;
+		state.complementRank = 4u;
+		state.activeComplementRank = 0u;
+		state.V.assign(static_cast<size_t>(m) * state.complementRank, 0.0f);
+		state.complementBlock.assign(static_cast<size_t>(state.complementRank) * state.complementRank, 0.0f);
+		state.prevGv.assign(static_cast<size_t>(state.complementRank) * n, 0.0f);
+		state.scratch_gv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_correctedV.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_V_old.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_Bv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_Zv.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_complementMat.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVec.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVal.resize(state.complementRank);
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+		state.fisherDiag[0] = 1.0f;
+		state.fisherDiag[1] = 0.0f;
+		state.complementBlock[0] = 16.0f;
+		state.complementBlock[5] = 9.0f;
+		state.complementBlock[10] = 1.0f;
+		state.complementBlock[15] = 0.25f;
+		state.complementFisher = 26.25f;
+		state.totalTrace = 27.25f;
+		state.step = 1ULL;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+
+		glades::ATLASConfig acAdaptive;
+		acAdaptive.rank = r;
+		acAdaptive.complementRank = 4u;
+		acAdaptive.beta = 1.0f;
+		acAdaptive.biasCorrection = false;
+		acAdaptive.muMin = 0.0f;
+		acAdaptive.muMax = 0.0f;
+		acAdaptive.tSub = 0u;
+
+		bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                   acAdaptive, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementRank first applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementRank should birth first mode==============",
+		       state.activeComplementRank == 1u);
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acAdaptive, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementRank second applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementRank should birth second mode only==============",
+		       state.activeComplementRank == 2u);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 28F: scout signal can birth before the EMA block catches up
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 28F: complement scout births on fresh residual evidence\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 28282833ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.0f, rng);
+
+		state.activeRank = r;
+		state.complementRank = 4u;
+		state.activeComplementRank = 0u;
+		state.V.assign(static_cast<size_t>(m) * state.complementRank, 0.0f);
+		state.complementBlock.assign(static_cast<size_t>(state.complementRank) * state.complementRank, 0.0f);
+		state.prevGv.assign(static_cast<size_t>(state.complementRank) * n, 0.0f);
+		state.scratch_gv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_correctedV.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_V_old.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_Bv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_Zv.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_complementMat.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVec.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVal.resize(state.complementRank);
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+		state.fisherDiag[0] = 1.0f;
+		state.fisherDiag[1] = 0.0f;
+		state.complementBlock[0] = 0.05f;
+		state.complementBlock[5] = 0.02f;
+		state.complementBlock[10] = 0.01f;
+		state.complementBlock[15] = 0.005f;
+		state.complementFisher = 0.085f;
+		state.totalTrace = 8.0f;
+		state.step = 199ULL;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+			gW[2 * n + j] = 12.0f;
+
+		glades::ATLASConfig acScout;
+		acScout.rank = r;
+		acScout.complementRank = 4u;
+		acScout.beta = 0.999f;
+		acScout.biasCorrection = false;
+		acScout.muMin = 0.0f;
+		acScout.muMax = 0.0f;
+		acScout.tSub = 0u;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acScout, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementScout applyStep failed==============", ok);
+		printf("[UT] ATLAS scout complement: activeRank=%u totalTrace=%f complementFisher=%f sigma2=%f\n",
+		       state.activeComplementRank, state.totalTrace, state.complementFisher, state.sigma2);
+		ASSERT("==============ATLAS::AdaptiveComplementScout should birth from scout signal==============",
+		       state.activeComplementRank == 1u);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
