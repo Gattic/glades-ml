@@ -34,8 +34,10 @@ using glades::transformer_common::ScopedTimerMs;
 
 static inline bool is_finite(float x) { return std::isfinite(x); }
 
-static inline unsigned long long transformer_serve_max_bytes()
+static inline unsigned long long transformer_serve_max_bytes(const glades::TransformerRunConfig& cfg)
 {
+	if (cfg.serveLogitsMaxBytes > 0ULL)
+		return cfg.serveLogitsMaxBytes;
 	static const unsigned long long kDefault = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 	unsigned long long v = 0ULL;
 	if (parse_u64_env("GLADES_TRANSFORMER_SERVE_MAX_BYTES", v) && v > 0ULL)
@@ -46,7 +48,8 @@ static inline unsigned long long transformer_serve_max_bytes()
 static NNetworkStatus validate_transformer_serve_logits_storage(const char* where,
                                                                size_t rows,
                                                                size_t vocab,
-                                                               unsigned int numFloatBuffers)
+                                                               unsigned int numFloatBuffers,
+                                                               const glades::TransformerRunConfig& cfg)
 {
 	size_t elemsPer = 0u;
 	if (!checked_mul_size(rows, vocab, elemsPer))
@@ -60,12 +63,13 @@ static NNetworkStatus validate_transformer_serve_logits_storage(const char* wher
 	if (!checked_mul_size(bytesPer, static_cast<size_t>(numFloatBuffers), totalBytes))
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, std::string(where) + ": total logits buffer byte size overflow");
 
-	const unsigned long long cap = transformer_serve_max_bytes();
+	const unsigned long long cap = transformer_serve_max_bytes(cfg);
 	if (static_cast<unsigned long long>(totalBytes) > cap)
 	{
 		std::ostringstream oss;
 		oss << where << ": serving logits buffers require " << bytes_to_human(static_cast<unsigned long long>(totalBytes))
-		    << " > cap " << bytes_to_human(cap);
+		    << " > cap " << bytes_to_human(cap)
+		    << " (set transformer.serveLogitsMaxBytes or GLADES_TRANSFORMER_SERVE_MAX_BYTES)";
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, oss.str());
 	}
 
@@ -101,6 +105,39 @@ static inline uint64_t hash_u32_vec_fnv1a64(const std::vector<unsigned int>& v)
 		h ^= static_cast<uint64_t>(b3); h *= prime;
 	}
 	return h;
+}
+
+static const char* status_code_name(glades::NNetworkStatus::Code code)
+{
+	switch (code)
+	{
+	case glades::NNetworkStatus::OK: return "ok";
+	case glades::NNetworkStatus::INVALID_ARGUMENT: return "invalid_argument";
+	case glades::NNetworkStatus::INVALID_STATE: return "invalid_state";
+	case glades::NNetworkStatus::EMPTY_DATA: return "empty_data";
+	case glades::NNetworkStatus::BUILD_FAILED: return "build_failed";
+	case glades::NNetworkStatus::INTERNAL_ERROR: return "internal_error";
+	default: return "unknown";
+	}
+}
+
+static inline uint64_t make_transformer_serve_request_log_id(uint64_t seedBase,
+                                                            unsigned int requestIndex,
+                                                            const std::vector<unsigned int>& promptTokens)
+{
+	return mix64(seedBase ^ mix64(static_cast<uint64_t>(requestIndex) + 1ULL) ^ hash_u32_vec_fnv1a64(promptTokens));
+}
+
+static inline uint64_t make_transformer_serve_batch_call_id(uint64_t seedBase,
+                                                           const std::vector<glades::NNetwork::TransformerServeRequest>& requests)
+{
+	uint64_t x = mix64(seedBase ^ mix64(static_cast<uint64_t>(requests.size())));
+	for (size_t i = 0u; i < requests.size(); ++i)
+	{
+		x ^= mix64(make_transformer_serve_request_log_id(seedBase, static_cast<unsigned int>(i), requests[i].promptTokens) +
+		           static_cast<uint64_t>(i));
+	}
+	return mix64(x);
 }
 
 static const char* stop_reason_string(const glades::NNetwork::TransformerGenerateResult& r)
@@ -200,6 +237,7 @@ static void log_transformer_generate_end(shmea::GLogger* logger,
 }
 
 static void log_transformer_serve_batch_start(shmea::GLogger* logger,
+                                             uint64_t batchCallId,
                                              unsigned int batchSize,
                                              unsigned int maxPromptLen,
                                              unsigned int globalMaxLen,
@@ -209,6 +247,7 @@ static void log_transformer_serve_batch_start(shmea::GLogger* logger,
 		return;
 	std::ostringstream oss;
 	oss << "event=transformer_serve_batch_start";
+	append_logfmt_kv(oss, "batch_call_id", static_cast<unsigned long long>(batchCallId));
 	append_logfmt_kv(oss, "batch_size", batchSize);
 	append_logfmt_kv(oss, "max_prompt_len", maxPromptLen);
 	append_logfmt_kv(oss, "global_max_len", globalMaxLen);
@@ -217,7 +256,10 @@ static void log_transformer_serve_batch_start(shmea::GLogger* logger,
 }
 
 static void log_transformer_serve_request_end(shmea::GLogger* logger,
+                                             uint64_t batchCallId,
+                                             uint64_t requestId,
                                              unsigned int requestIndex,
+                                             const glades::NNetworkStatus& st,
                                              unsigned int promptLen,
                                              const glades::NNetwork::TransformerGenerateConfig& cfg,
                                              unsigned int maxSeqLen,
@@ -229,7 +271,13 @@ static void log_transformer_serve_request_end(shmea::GLogger* logger,
 		return;
 	std::ostringstream oss;
 	oss << "event=transformer_serve_request_end";
-	append_logfmt_kv(oss, "request", requestIndex);
+	append_logfmt_kv(oss, "batch_call_id", static_cast<unsigned long long>(batchCallId));
+	append_logfmt_kv(oss, "request_id", static_cast<unsigned long long>(requestId));
+	append_logfmt_kv(oss, "request_index", requestIndex);
+	append_logfmt_kv(oss, "status_code", std::string(status_code_name(st.code)));
+	append_logfmt_kv(oss, "status_ok", st.ok());
+	if (!st.ok())
+		append_logfmt_kv(oss, "error", st.message);
 	append_logfmt_kv(oss, "prompt_len", promptLen);
 	append_logfmt_kv(oss, "max_new", cfg.maxNewTokens);
 	append_logfmt_kv(oss, "max_seq_len", maxSeqLen);
@@ -247,7 +295,9 @@ static void log_transformer_serve_request_end(shmea::GLogger* logger,
 }
 
 static void log_transformer_serve_batch_end(shmea::GLogger* logger,
+                                           uint64_t batchCallId,
                                            const glades::NNetworkStatus& st,
+                                           const char* failureStage,
                                            unsigned int batchSize,
                                            unsigned int globalMaxLen,
                                            unsigned int globalMaxNew,
@@ -263,9 +313,13 @@ static void log_transformer_serve_batch_end(shmea::GLogger* logger,
 	const double tps = (wallMs > 0.0) ? (static_cast<double>(totalTokensGenerated) / (wallMs / 1000.0)) : 0.0;
 	std::ostringstream oss;
 	oss << "event=transformer_serve_batch_end";
+	append_logfmt_kv(oss, "batch_call_id", static_cast<unsigned long long>(batchCallId));
 	append_logfmt_kv(oss, "ok", st.ok());
+	append_logfmt_kv(oss, "status_code", std::string(status_code_name(st.code)));
 	if (!st.ok())
 		append_logfmt_kv(oss, "error", st.message);
+	if (failureStage)
+		append_logfmt_kv(oss, "failure_stage", std::string(failureStage));
 	append_logfmt_kv(oss, "batch_size", batchSize);
 	append_logfmt_kv(oss, "global_max_len", globalMaxLen);
 	append_logfmt_kv(oss, "global_max_new", globalMaxNew);
@@ -460,7 +514,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmGenerate(const std::vector
 	{
 		// Base: network seed + prompt hash.
 		const uint64_t h = hash_u32_vec_fnv1a64(promptTokens);
-		seed = mix64(rngSeed ^ h);
+		seed = mix64(loadConfiguredSeed() ^ h);
 	}
 	glades::rng::seed_engine(callEngine, seed);
 
@@ -624,7 +678,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 		const NNetworkStatus st = validate_transformer_serve_logits_storage("transformerLmServeGenerateBatch",
 		                                                                   static_cast<size_t>(B),
 		                                                                   static_cast<size_t>(vocab),
-		                                                                   2u);
+		                                                                   2u,
+		                                                                   trainingConfig.transformer);
 		if (!st.ok())
 			return st;
 	}
@@ -632,6 +687,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 	const TransformerMetricsConfig& mcfg = getTransformerMetricsConfig();
 	const bool metricsOn = mcfg.enable;
 	shmea::GLogger* logger = metricsOn ? getLogger() : NULL;
+	const uint64_t serveSeedBase = loadConfiguredSeed();
+	const uint64_t batchCallId = make_transformer_serve_batch_call_id(serveSeedBase, requests);
 	const int64_t wall0ms = getCurrentTimeMilliseconds();
 	double msPrefillAppend = 0.0;
 	double msDecodeAppend = 0.0;
@@ -681,9 +738,12 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 				return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeGenerateBatch: stopTokenId out of range");
 		}
 	}
+	std::vector<uint64_t> requestLogIds(B, 0ULL);
+	for (unsigned int r = 0; r < B; ++r)
+		requestLogIds[r] = make_transformer_serve_request_log_id(serveSeedBase, r, requests[r].promptTokens);
 
 	if (metricsOn && logger)
-		log_transformer_serve_batch_start(logger, B, maxPromptLen, globalMaxLen, globalMaxNew);
+		log_transformer_serve_batch_start(logger, batchCallId, B, maxPromptLen, globalMaxLen, globalMaxNew);
 
 	// Initialize per-call batched KV session for the maximum required length.
 	TransformerLmBatchSession session;
@@ -695,8 +755,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 			{
 				std::ostringstream oss;
 				oss << "event=transformer_serve_batch_end";
+				append_logfmt_kv(oss, "batch_call_id", static_cast<unsigned long long>(batchCallId));
 				append_logfmt_kv(oss, "ok", false);
+				append_logfmt_kv(oss, "status_code", std::string(status_code_name(st.code)));
 				append_logfmt_kv(oss, "error", st.message);
+				append_logfmt_kv(oss, "failure_stage", std::string("session_reset"));
 				append_logfmt_kv(oss, "batch_size", B);
 				logger->info("Transformer", shmea::GString(oss.str().c_str()));
 			}
@@ -706,6 +769,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 
 	// Single-exit return status (so we can always emit end-of-call metrics).
 	NNetworkStatus retSt(NNetworkStatus::OK, std::string());
+	const char* failureStage = NULL;
 
 	// Initialize outputs (optionally include prompt).
 	out.results.resize(B);
@@ -725,11 +789,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 		const glades::NNetwork::TransformerMetricsConfig* cfg;
 		const int64_t* wall0ms;
 		const glades::NNetworkStatus* status;
+		const char** failureStage;
 		const std::vector<glades::NNetwork::TransformerServeRequest>* requests;
+		const std::vector<uint64_t>* requestLogIds;
 		const std::vector<unsigned int>* promptLen;
 		const std::vector<unsigned int>* reqMaxLen;
 		const glades::NNetwork::TransformerLmBatchSession* session;
 		const glades::NNetwork::TransformerServeBatchResult* out;
+		uint64_t batchCallId;
 		unsigned int B;
 		unsigned int globalMaxLen;
 		unsigned int globalMaxNew;
@@ -742,11 +809,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 		                      const glades::NNetwork::TransformerMetricsConfig* c,
 		                      const int64_t* w0,
 		                      const glades::NNetworkStatus* st,
+		                      const char** fs,
 		                      const std::vector<glades::NNetwork::TransformerServeRequest>* rq,
+		                      const std::vector<uint64_t>* rids,
 		                      const std::vector<unsigned int>* pl,
 		                      const std::vector<unsigned int>* rml,
 		                      const glades::NNetwork::TransformerLmBatchSession* sess,
 		                      const glades::NNetwork::TransformerServeBatchResult* o,
+		                      uint64_t bcId,
 		                      unsigned int bsz,
 		                      unsigned int gml,
 		                      unsigned int gmn,
@@ -758,11 +828,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 		      cfg(c),
 		      wall0ms(w0),
 		      status(st),
+		      failureStage(fs),
 		      requests(rq),
+		      requestLogIds(rids),
 		      promptLen(pl),
 		      reqMaxLen(rml),
 		      session(sess),
 		      out(o),
+		      batchCallId(bcId),
 		      B(bsz),
 		      globalMaxLen(gml),
 		      globalMaxNew(gmn),
@@ -774,7 +847,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 
 		~ServeBatchMetricsGuard()
 		{
-			if (!net || !logger || !cfg || !cfg->enable || !wall0ms || !status || !requests || !promptLen || !reqMaxLen || !session || !out)
+			if (!net || !logger || !cfg || !cfg->enable || !wall0ms || !status || !failureStage ||
+			    !requests || !requestLogIds || !promptLen || !reqMaxLen || !session || !out)
 				return;
 
 			const double wallMs = static_cast<double>(net->getCurrentTimeMilliseconds() - *wall0ms);
@@ -788,7 +862,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 				totalGen += static_cast<unsigned long long>(gen);
 			}
 
-			log_transformer_serve_batch_end(logger, *status, B, globalMaxLen, globalMaxNew, wallMs, totalGen,
+			log_transformer_serve_batch_end(logger, batchCallId, *status, *failureStage, B, globalMaxLen, globalMaxNew, wallMs, totalGen,
 			                                (msPrefillAppend ? *msPrefillAppend : 0.0),
 			                                (msSample ? *msSample : 0.0),
 			                                (msDecodeAppend ? *msDecodeAppend : 0.0),
@@ -803,7 +877,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 					const unsigned int gen =
 					    (*requests)[r].cfg.includePromptInOutput ? ((totalOut >= (*promptLen)[r]) ? (totalOut - (*promptLen)[r]) : 0u) : totalOut;
 					log_transformer_serve_request_end(logger,
+					                                 batchCallId,
+					                                 (*requestLogIds)[r],
 					                                 r,
+					                                 *status,
 					                                 (*promptLen)[r],
 					                                 (*requests)[r].cfg,
 					                                 (*reqMaxLen)[r],
@@ -820,11 +897,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 	                                   &mcfg,
 	                                   &wall0ms,
 	                                   &retSt,
+	                                   &failureStage,
 	                                   &requests,
+	                                   &requestLogIds,
 	                                   &promptLen,
 	                                   &reqMaxLen,
 	                                   &session,
 	                                   &out,
+	                                   batchCallId,
 	                                   B,
 	                                   globalMaxLen,
 	                                   globalMaxNew,
@@ -847,7 +927,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 		{
 			const uint64_t h = hash_u32_vec_fnv1a64(requests[r].promptTokens);
 			const uint64_t tag = mix64(static_cast<uint64_t>(r) + 1ULL);
-			s = mix64(rngSeed ^ h ^ tag);
+			s = mix64(serveSeedBase ^ h ^ tag);
 		}
 		glades::rng::seed_engine(reqEngines[r], s);
 	}
@@ -862,6 +942,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 			if (!checked_mul_size(static_cast<size_t>(B), static_cast<size_t>(vocab), logitsElems))
 			{
 				retSt = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeGenerateBatch: logits element count overflow");
+				failureStage = "allocate_logits";
 				return retSt;
 			}
 			prevLogitsFlat.assign(logitsElems, 0.0f);
@@ -890,6 +971,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 		if (!st.ok())
 		{
 			retSt = st;
+			failureStage = "prefill_append";
 			return retSt;
 		}
 
@@ -982,7 +1064,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 				                                 nextTok);
 			}
 			if (!retSt.ok())
+			{
+				failureStage = "sample";
 				return retSt;
+			}
 
 			tokenIds[r] = nextTok;
 			active[r] = 1u;
@@ -999,6 +1084,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 			if (!st.ok())
 			{
 				retSt = st;
+				failureStage = "decode_append";
 				return retSt;
 			}
 		}
@@ -1056,6 +1142,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeGenerateBatch(const s
 	}
 
 	retSt = NNetworkStatus(NNetworkStatus::OK, std::string());
+	failureStage = "completed";
 	return retSt;
 }
 
@@ -1087,59 +1174,66 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherReset(glades::
 		const NNetworkStatus st = validate_transformer_serve_logits_storage("transformerLmServeBatcherReset",
 		                                                                   static_cast<size_t>(cfg.maxBatchSize),
 		                                                                   static_cast<size_t>(vocab),
-		                                                                   2u);
+		                                                                   2u,
+		                                                                   trainingConfig.transformer);
 		if (!st.ok())
 			return st;
 	}
 
-	batcher.initialized = true;
-	batcher.vocab = vocab;
-	batcher.maxBatchSize = cfg.maxBatchSize;
-	batcher.maxSeqLen = cfg.maxSeqLen;
-	batcher.wipeKvOnRemove = cfg.wipeKvOnRemove;
+	// Build the batcher state off to the side and commit only once the full
+	// initialization succeeds. This keeps a failed reset uninitialized and safe.
+	glades::NNetwork::TransformerServeBatcher nextBatcher;
+	nextBatcher.vocab = vocab;
+	nextBatcher.maxBatchSize = cfg.maxBatchSize;
+	nextBatcher.maxSeqLen = cfg.maxSeqLen;
+	nextBatcher.wipeKvOnRemove = cfg.wipeKvOnRemove;
 
 	// Own a dedicated RNG stream for this batcher (does not mutate the network RNG).
 	{
-		const uint64_t seed = (cfg.rngSeed != 0ULL) ? cfg.rngSeed : (rngSeed != 0ULL ? rngSeed : 5489ULL);
-		glades::rng::seed_engine(batcher.batchEngine, seed);
+		const uint64_t configuredSeed = loadConfiguredSeed();
+		const uint64_t seed = (cfg.rngSeed != 0ULL) ? cfg.rngSeed : (configuredSeed != 0ULL ? configuredSeed : 5489ULL);
+		glades::rng::seed_engine(nextBatcher.batchEngine, seed);
 	}
 
 	{
-		const NNetworkStatus st = transformerLmBatchSessionReset(batcher.session, batcher.maxBatchSize, batcher.maxSeqLen);
+		const NNetworkStatus st = transformerLmBatchSessionReset(nextBatcher.session, nextBatcher.maxBatchSize, nextBatcher.maxSeqLen);
 		if (!st.ok())
 			return st;
 	}
 
-	const unsigned int B = batcher.maxBatchSize;
-	batcher.inUse.assign(B, 0u);
-	batcher.done.assign(B, 0u);
-	batcher.promptPos.assign(B, 0u);
-	batcher.promptLen.assign(B, 0u);
-	batcher.generated.assign(B, 0u);
-	batcher.reqMaxNew.assign(B, 0u);
-	batcher.reqMaxLen.assign(B, 0u);
+	const unsigned int B = nextBatcher.maxBatchSize;
+	nextBatcher.inUse.assign(B, 0u);
+	nextBatcher.done.assign(B, 0u);
+	nextBatcher.promptPos.assign(B, 0u);
+	nextBatcher.promptLen.assign(B, 0u);
+	nextBatcher.generated.assign(B, 0u);
+	nextBatcher.reqMaxNew.assign(B, 0u);
+	nextBatcher.reqMaxLen.assign(B, 0u);
 
-	batcher.req.resize(B);
-	batcher.results.resize(B);
+	nextBatcher.req.resize(B);
+	nextBatcher.results.resize(B);
 
-	batcher.overrideEngines.resize(B);
-	batcher.hasOverride.assign(B, 0u);
+	nextBatcher.overrideEngines.resize(B);
+	nextBatcher.hasOverride.assign(B, 0u);
 
-	batcher.tokenIds.assign(B, 0u);
-	batcher.active.assign(B, 0u);
-	batcher.sampledTok.assign(B, 0u);
-	batcher.sampledIsValid.assign(B, 0u);
+	nextBatcher.tokenIds.assign(B, 0u);
+	nextBatcher.active.assign(B, 0u);
+	nextBatcher.sampledTok.assign(B, 0u);
+	nextBatcher.sampledIsValid.assign(B, 0u);
 
-		{
-			size_t logitsElems = 0u;
-			if (!checked_mul_size(static_cast<size_t>(B), static_cast<size_t>(vocab), logitsElems))
-				return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherReset: logits element count overflow");
-			batcher.prevLogitsFlat.assign(logitsElems, 0.0f);
-			batcher.logitsFlat.assign(logitsElems, 0.0f);
-		}
+	{
+		size_t logitsElems = 0u;
+		if (!checked_mul_size(static_cast<size_t>(B), static_cast<size_t>(vocab), logitsElems))
+			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherReset: logits element count overflow");
+		nextBatcher.prevLogitsFlat.assign(logitsElems, 0.0f);
+		nextBatcher.logitsFlat.assign(logitsElems, 0.0f);
+	}
 
 	// Sampling scratch: pre-size to avoid hot-path resize.
-	init_sampling_scratch(vocab, batcher.idxScratch, batcher.weightScratch);
+	init_sampling_scratch(vocab, nextBatcher.idxScratch, nextBatcher.weightScratch);
+
+	batcher = nextBatcher;
+	batcher.initialized = true;
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }

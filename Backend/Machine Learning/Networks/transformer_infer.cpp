@@ -58,8 +58,10 @@ using glades::transformer_common::ScopedTimerMs;
 // - Override via environment variable:
 //     GLADES_TRANSFORMER_KV_SESSION_MAX_BYTES
 //   where value is an integer byte count (e.g. 4294967296 for 4GiB).
-static inline unsigned long long kv_session_max_bytes()
+static inline unsigned long long kv_session_max_bytes(const glades::TransformerRunConfig& cfg)
 {
+	if (cfg.kvSessionMaxBytes > 0ULL)
+		return cfg.kvSessionMaxBytes;
 	// Default: 2 GiB.
 	// Rationale: large enough for typical CPU demo/serving, small enough to prevent
 	// accidental multi-tens-of-GB allocations from a bad maxSeqLen.
@@ -93,6 +95,106 @@ static void log_kv_append_event(shmea::GLogger* logger,
 		append_logfmt_kv(oss, "non_finite_hidden", static_cast<unsigned long long>(perf->nonFiniteHiddenState));
 	}
 	logger->info("Transformer", shmea::GString(oss.str().c_str()));
+}
+
+struct TransformerSessionCommonConfig
+{
+	unsigned int dModel;
+	unsigned int dFF;
+	unsigned int nHeads;
+	unsigned int nKVHeads;
+	unsigned int nLayers;
+	unsigned int dHead;
+	unsigned int dModelKV;
+	unsigned int ffnKind;
+	unsigned int ff1Width;
+	bool metricsEnabled;
+	bool metricsBreakdownEnabled;
+	bool metricsLogPerKvAppend;
+	float layerNormEps;
+	unsigned int normType;
+	unsigned int positionalEncoding;
+	int ropeDimOverride;
+	float ropeTheta;
+	unsigned int ffnActivation;
+	int padTokenId;
+	shmea::GLogger* logger;
+
+	TransformerSessionCommonConfig()
+	    : dModel(0u),
+	      dFF(0u),
+	      nHeads(0u),
+	      nKVHeads(0u),
+	      nLayers(0u),
+	      dHead(0u),
+	      dModelKV(0u),
+	      ffnKind(0u),
+	      ff1Width(0u),
+	      metricsEnabled(false),
+	      metricsBreakdownEnabled(false),
+	      metricsLogPerKvAppend(false),
+	      layerNormEps(0.0f),
+	      normType(0u),
+	      positionalEncoding(0u),
+	      ropeDimOverride(0),
+	      ropeTheta(0.0f),
+	      ffnActivation(0u),
+	      padTokenId(-1),
+	      logger(NULL)
+	{
+	}
+};
+
+static NNetworkStatus build_transformer_session_common_config(const char* where,
+                                                             unsigned int dModel,
+                                                             unsigned int dFF,
+                                                             unsigned int nHeads,
+                                                             unsigned int nKVHeadsRaw,
+                                                             unsigned int nLayers,
+                                                             unsigned int ffnKind,
+                                                             int padTokenId,
+                                                             const glades::TransformerRunConfig& runtimeCfg,
+                                                             const glades::NNetwork::TransformerMetricsConfig& metricsCfg,
+                                                             shmea::GLogger* logger,
+                                                             TransformerSessionCommonConfig& out)
+{
+	const int posEnc = static_cast<int>(runtimeCfg.positionalEncoding);
+	if (posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_NONE) &&
+	    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL) &&
+	    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE))
+	{
+		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, std::string(where) + ": unknown positionalEncoding");
+	}
+
+	out.dModel = dModel;
+	out.dFF = dFF;
+	out.nHeads = nHeads;
+	out.nKVHeads = (nKVHeadsRaw > 0u ? nKVHeadsRaw : nHeads);
+	out.dHead = (out.nHeads > 0u ? (out.dModel / out.nHeads) : 0u);
+	out.dModelKV = out.nKVHeads * out.dHead;
+	if (out.dHead == 0u || out.dModelKV == 0u)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE, std::string(where) + ": invalid head dimensions");
+	if (out.nHeads > 0u && (out.dModel % out.nHeads) != 0u)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE, std::string(where) + ": dModel is not divisible by nHeads");
+	if (out.nKVHeads > 0u && (out.nHeads % out.nKVHeads) != 0u)
+		return NNetworkStatus(NNetworkStatus::INVALID_STATE, std::string(where) + ": nHeads is not divisible by nKVHeads");
+
+	out.nLayers = nLayers;
+	out.ffnKind = ffnKind;
+	out.ff1Width =
+	    (ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFF) : dFF;
+	out.metricsEnabled = metricsCfg.enable;
+	out.metricsBreakdownEnabled = metricsCfg.enableKvKernelBreakdown;
+	out.metricsLogPerKvAppend = metricsCfg.logPerKvAppend;
+	out.layerNormEps = (runtimeCfg.layerNormEps > 0.0f ? runtimeCfg.layerNormEps : 1e-5f);
+	out.normType = static_cast<unsigned int>(runtimeCfg.normType);
+	out.positionalEncoding = static_cast<unsigned int>(runtimeCfg.positionalEncoding);
+	out.ropeDimOverride = runtimeCfg.ropeDimOverride;
+	out.ropeTheta = (runtimeCfg.ropeTheta > 0.0f ? runtimeCfg.ropeTheta : 10000.0f);
+	out.ffnActivation = static_cast<unsigned int>(runtimeCfg.ffnActivation);
+	out.padTokenId = padTokenId;
+	out.logger = metricsCfg.enable ? logger : NULL;
+	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
 // Use the shared scalar kernels directly (no wrapper shims).
@@ -587,51 +689,46 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionReset(glades::NNetw
 {
 	if (netType != TYPE_TRANSFORMER_DECODER)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: requires TYPE_TRANSFORMER_DECODER");
-	if (!trainingConfig.transformer.enableTokenEmbedding)
+	const glades::TransformerRunConfig& runtimeCfg = trainingConfig.transformer;
+	const TransformerMetricsConfig metricsCfg = getTransformerMetricsConfig();
+	if (!runtimeCfg.enableTokenEmbedding)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: requires transformer.enableTokenEmbedding");
 	if (!tensorTransformer.initialized || !tensorTransformer.tokenModel)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmSessionReset: transformer tensors not initialized for token LM (loadModel or run once)");
 	if (maxSeqLen == 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: maxSeqLen is 0");
 
-	// Fail fast on unsupported positional encodings. KV-cache inference must match training.
-	{
-		const int posEnc = static_cast<int>(trainingConfig.transformer.positionalEncoding);
-		if (posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_NONE) &&
-		    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL) &&
-		    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE))
-		{
-			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: unknown positionalEncoding");
-		}
-	}
-
 	const TensorTransformerState& tt = tensorTransformer;
-	const unsigned int dModel = tt.dModel;
-	const unsigned int nHeads = tt.nHeads;
-	const unsigned int nKVHeads = (tt.nKVHeads > 0u ? tt.nKVHeads : nHeads);
-	const unsigned int dHead = (nHeads > 0u ? (dModel / nHeads) : 0u);
-	const unsigned int dModelKV = nKVHeads * dHead;
-	if (dHead == 0u || dModelKV == 0u)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmSessionReset: invalid head dimensions");
-	if (nHeads > 0u && (dModel % nHeads) != 0u)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmSessionReset: dModel is not divisible by nHeads");
-	if (nKVHeads > 0u && (nHeads % nKVHeads) != 0u)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmSessionReset: nHeads is not divisible by nKVHeads");
-	const unsigned int ff1WidthLocal =
-	    (tt.ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * tt.dFF) : tt.dFF;
+	TransformerSessionCommonConfig commonCfg;
+	{
+		const NNetworkStatus st = build_transformer_session_common_config("transformerLmSessionReset",
+		                                                                 tt.dModel,
+		                                                                 tt.dFF,
+		                                                                 tt.nHeads,
+		                                                                 tt.nKVHeads,
+		                                                                 tt.nLayers,
+		                                                                 tt.ffnKind,
+		                                                                 tt.padTokenId,
+		                                                                 runtimeCfg,
+		                                                                 metricsCfg,
+		                                                                 getLogger(),
+		                                                                 commonCfg);
+		if (!st.ok())
+			return st;
+	}
 
 	// Allocation sizing safety: overflow checks + hard cap.
 	{
 		const size_t L = static_cast<size_t>(tt.nLayers);
 		const size_t S = static_cast<size_t>(maxSeqLen);
-		const size_t K = static_cast<size_t>(dModelKV);
+		const size_t K = static_cast<size_t>(commonCfg.dModelKV);
 		size_t perLayerElems = 0u;
 		size_t totalElems = 0u;
 		if (!checked_mul_size(S, K, perLayerElems) || !checked_mul_size(L, perLayerElems, totalElems))
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: KV-cache size overflow (maxSeqLen too large)");
 
-		const bool kvLowp = (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16) ||
-		                    (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16);
+		const bool kvLowp = (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16) ||
+		                    (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16);
 		const unsigned long long elemBytes = kvLowp ? static_cast<unsigned long long>(sizeof(uint16_t))
 		                                            : static_cast<unsigned long long>(sizeof(float));
 		// K and V both stored: *2.
@@ -646,14 +743,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionReset(glades::NNetw
 		// ffPre: ff1Width
 		// ffAct: dFF
 		// scores: maxSeqLen
-		if (!checked_mul_size(static_cast<size_t>(dModel), 7u, scratchFloats))
+		if (!checked_mul_size(static_cast<size_t>(commonCfg.dModel), 7u, scratchFloats))
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: scratch size overflow");
 		size_t tmp = 0u;
-		if (!checked_add_size(scratchFloats, static_cast<size_t>(dModelKV) * 2u, scratchFloats))
+		if (!checked_add_size(scratchFloats, static_cast<size_t>(commonCfg.dModelKV) * 2u, scratchFloats))
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: scratch size overflow");
-		if (!checked_add_size(scratchFloats, static_cast<size_t>(ff1WidthLocal), scratchFloats))
+		if (!checked_add_size(scratchFloats, static_cast<size_t>(commonCfg.ff1Width), scratchFloats))
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: scratch size overflow");
-		if (!checked_add_size(scratchFloats, static_cast<size_t>(tt.dFF), scratchFloats))
+		if (!checked_add_size(scratchFloats, static_cast<size_t>(commonCfg.dFF), scratchFloats))
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: scratch size overflow");
 		if (!checked_add_size(scratchFloats, static_cast<size_t>(maxSeqLen), scratchFloats))
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmSessionReset: scratch size overflow");
@@ -664,44 +761,51 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionReset(glades::NNetw
 		    static_cast<unsigned long long>(maxSeqLen);
 
 		const unsigned long long wantBytes = kvBytes + scratchBytes;
-		const unsigned long long cap = kv_session_max_bytes();
+		const unsigned long long cap = kv_session_max_bytes(runtimeCfg);
 		if (cap > 0ULL && wantBytes > cap)
 		{
 			std::ostringstream oss;
 			oss << "transformerLmSessionReset: session allocation exceeds cap (want "
 			    << bytes_to_human(wantBytes) << ", cap " << bytes_to_human(cap)
-			    << "). Reduce maxSeqLen or set GLADES_TRANSFORMER_KV_SESSION_MAX_BYTES.";
+			    << "). Reduce maxSeqLen or set transformer.kvSessionMaxBytes / GLADES_TRANSFORMER_KV_SESSION_MAX_BYTES.";
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, oss.str());
 		}
 	}
 
 	session.reset();
 	session.initialized = true;
-	session.metricsEnabled = transformerMetricsCfg.enable;
-	session.perf.reset();
 	session.maxLen = maxSeqLen;
 	session.curLen = 0u;
-	session.dModel = dModel;
-	session.dFF = tt.dFF;
-	session.nHeads = nHeads;
-	session.nKVHeads = nKVHeads;
-	session.nLayers = tt.nLayers;
-	session.dHead = dHead;
-	session.dModelKV = dModelKV;
-	session.ffnKind = tt.ffnKind;
-	session.ff1Width =
-	    (tt.ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * tt.dFF) : tt.dFF;
+	session.metricsEnabled = commonCfg.metricsEnabled;
+	session.metricsBreakdownEnabled = commonCfg.metricsBreakdownEnabled;
+	session.metricsLogPerKvAppend = commonCfg.metricsLogPerKvAppend;
+	session.perf.reset();
+	session.dModel = commonCfg.dModel;
+	session.dFF = commonCfg.dFF;
+	session.nHeads = commonCfg.nHeads;
+	session.nKVHeads = commonCfg.nKVHeads;
+	session.nLayers = commonCfg.nLayers;
+	session.dHead = commonCfg.dHead;
+	session.dModelKV = commonCfg.dModelKV;
+	session.ffnKind = commonCfg.ffnKind;
+	session.ff1Width = commonCfg.ff1Width;
+	session.layerNormEps = commonCfg.layerNormEps;
+	session.normType = commonCfg.normType;
+	session.positionalEncoding = commonCfg.positionalEncoding;
+	session.ropeDimOverride = commonCfg.ropeDimOverride;
+	session.ropeTheta = commonCfg.ropeTheta;
+	session.ffnActivation = commonCfg.ffnActivation;
+	session.padTokenId = commonCfg.padTokenId;
+	session.logger = commonCfg.logger;
 
 	size_t perLayer = 0u;
-	(void)checked_mul_size(static_cast<size_t>(maxSeqLen), static_cast<size_t>(dModelKV), perLayer);
-	// KV-cache dtype for this session.
-	if (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16)
+	(void)checked_mul_size(static_cast<size_t>(maxSeqLen), static_cast<size_t>(commonCfg.dModelKV), perLayer);
+	if (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16)
 		session.kvCacheDType = glades::NNetwork::TransformerLmSession::KV_CACHE_F16;
-	else if (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16)
+	else if (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16)
 		session.kvCacheDType = glades::NNetwork::TransformerLmSession::KV_CACHE_BF16;
 	else
 		session.kvCacheDType = glades::NNetwork::TransformerLmSession::KV_CACHE_F32;
-
 	if (session.kvCacheDType != glades::NNetwork::TransformerLmSession::KV_CACHE_F32)
 	{
 		session.k.clear();
@@ -717,33 +821,29 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionReset(glades::NNetw
 		session.v.assign(static_cast<size_t>(tt.nLayers) * perLayer, 0.0f);
 	}
 	session.keyValid.assign(static_cast<size_t>(maxSeqLen), 1u);
-
-	// Pre-size scratch buffers to guarantee allocation-free Append().
-	session.h.assign(static_cast<size_t>(dModel), 0.0f);
-	session.x1.assign(static_cast<size_t>(dModel), 0.0f);
-	session.x2.assign(static_cast<size_t>(dModel), 0.0f);
-	session.q.assign(static_cast<size_t>(dModel), 0.0f);
-	session.kvec.assign(static_cast<size_t>(dModelKV), 0.0f);
-	session.vvec.assign(static_cast<size_t>(dModelKV), 0.0f);
-	session.attnConcat.assign(static_cast<size_t>(dModel), 0.0f);
-	session.attnOut.assign(static_cast<size_t>(dModel), 0.0f);
-	session.ffPre.assign(static_cast<size_t>(session.ff1Width), 0.0f);
-	session.ffAct.assign(static_cast<size_t>(tt.dFF), 0.0f);
-	session.ffOut.assign(static_cast<size_t>(dModel), 0.0f);
+	session.h.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.x1.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.x2.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.q.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.kvec.assign(static_cast<size_t>(commonCfg.dModelKV), 0.0f);
+	session.vvec.assign(static_cast<size_t>(commonCfg.dModelKV), 0.0f);
+	session.attnConcat.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.attnOut.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.ffPre.assign(static_cast<size_t>(commonCfg.ff1Width), 0.0f);
+	session.ffAct.assign(static_cast<size_t>(commonCfg.dFF), 0.0f);
+	session.ffOut.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
 	session.scores.assign(static_cast<size_t>(maxSeqLen), 0.0f);
-
-	// Cache sinusoidal PE frequency terms (pow-free) for this dModel when needed.
-	if (trainingConfig.transformer.positionalEncoding == glades::TransformerRunConfig::POSENC_SINUSOIDAL)
+	if (commonCfg.positionalEncoding == static_cast<unsigned int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL))
 	{
 		if (session.metricsEnabled)
 		{
-			const bool hit = (session.posEncCache.sinDModelCached == dModel && !session.posEncCache.sinInvDenomPair.empty());
+			const bool hit = (session.posEncCache.sinDModelCached == commonCfg.dModel && !session.posEncCache.sinInvDenomPair.empty());
 			if (hit)
 				++session.perf.sinCacheHits;
 			else
 				++session.perf.sinCacheMisses;
 		}
-		session.posEncCache.ensureSinusoidal(dModel);
+		session.posEncCache.ensureSinusoidal(commonCfg.dModel);
 	}
 
 	// === GPU inference state allocation ===
@@ -756,8 +856,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionReset(glades::NNetw
 	if (gpuStateReady && gpuTransformerWeights && gpuTransformerWeights->initialized)
 	{
 		GpuInferState* gs = new GpuInferState();
-		if (gs->allocate(gpuTransformerWeights, maxSeqLen, dModel, tt.dFF,
-		                 dModelKV, nHeads, nKVHeads, tt.nLayers,
+		if (gs->allocate(gpuTransformerWeights, maxSeqLen, commonCfg.dModel, commonCfg.dFF,
+		                 commonCfg.dModelKV, commonCfg.nHeads, commonCfg.nKVHeads, commonCfg.nLayers,
 		                 session.ff1Width, tt.vocabSize))
 		{
 			session.gpuInferState = static_cast<void*>(gs);
@@ -799,10 +899,10 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 	const unsigned int dHead = session.dHead;
 	const unsigned int dModelKV = session.dModelKV;
 	const unsigned int groupSize = (nKVHeads > 0u ? (nHeads / nKVHeads) : 0u);
-	const int padTokenId = tt.padTokenId;
+	const int padTokenId = session.padTokenId;
 
 	const bool metricsOn = session.metricsEnabled;
-	const bool breakdown = metricsOn && transformerMetricsCfg.enableKvKernelBreakdown;
+	const bool breakdown = metricsOn && session.metricsBreakdownEnabled;
 	if (metricsOn)
 		++session.perf.kvAppends;
 	ScopedTimerMs tTotal(this, metricsOn, &session.perf.msTotal);
@@ -829,11 +929,11 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 		session.keyValid[pos] = (padTokenId >= 0 && static_cast<int>(tokenId) == padTokenId) ? 0u : 1u;
 
 	// Config knobs
-	const float eps = (trainingConfig.transformer.layerNormEps > 0.0f ? trainingConfig.transformer.layerNormEps : 1e-5f);
-	const int normType = static_cast<int>(trainingConfig.transformer.normType);
-	const int posEnc = static_cast<int>(trainingConfig.transformer.positionalEncoding);
-	const int ropeDimOverride = trainingConfig.transformer.ropeDimOverride;
-	const float ropeTheta = (trainingConfig.transformer.ropeTheta > 0.0f ? trainingConfig.transformer.ropeTheta : 10000.0f);
+	const float eps = session.layerNormEps;
+	const int normType = static_cast<int>(session.normType);
+	const int posEnc = static_cast<int>(session.positionalEncoding);
+	const int ropeDimOverride = session.ropeDimOverride;
+	const float ropeTheta = session.ropeTheta;
 	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
 
 	unsigned int ropeDim = dHead;
@@ -1004,7 +1104,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 				}
 				else
 				{
-					const int act = static_cast<int>(trainingConfig.transformer.ffnActivation);
+					const int act = static_cast<int>(session.ffnActivation);
 					if (act == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
 						gg::gelu_forward(gs->ffPre.data(), dFFi, gs->ffAct.data());
 					else
@@ -1270,7 +1370,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 			}
 			else
 			{
-				const int act = static_cast<int>(trainingConfig.transformer.ffnActivation);
+				const int act = static_cast<int>(session.ffnActivation);
 				for (unsigned int i = 0; i < dFF; ++i)
 				{
 					const float x = ffPre[i];
@@ -1327,8 +1427,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmSessionAppend(glades::NNet
 	}
 
 	session.curLen += 1u;
-	if (metricsOn && transformerMetricsCfg.logPerKvAppend)
-		log_kv_append_event(getLogger(),
+	if (metricsOn && session.metricsLogPerKvAppend && session.logger)
+		log_kv_append_event(session.logger,
 		                   "transformer_kv_append",
 		                   session.curLen,
 		                   session.maxLen,
@@ -1344,7 +1444,9 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionReset(glades::
 {
 	if (netType != TYPE_TRANSFORMER_DECODER)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmBatchSessionReset: requires TYPE_TRANSFORMER_DECODER");
-	if (!trainingConfig.transformer.enableTokenEmbedding)
+	const glades::TransformerRunConfig& runtimeCfg = trainingConfig.transformer;
+	const TransformerMetricsConfig metricsCfg = getTransformerMetricsConfig();
+	if (!runtimeCfg.enableTokenEmbedding)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmBatchSessionReset: requires transformer.enableTokenEmbedding");
 	if (!tensorTransformer.initialized || !tensorTransformer.tokenModel)
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmBatchSessionReset: transformer tensors not initialized for token LM (loadModel or run once)");
@@ -1353,35 +1455,31 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionReset(glades::
 	if (maxSeqLen == 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmBatchSessionReset: maxSeqLen is 0");
 
-	{
-		const int posEnc = static_cast<int>(trainingConfig.transformer.positionalEncoding);
-		if (posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_NONE) &&
-		    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL) &&
-		    posEnc != static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE))
-		{
-			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmBatchSessionReset: unknown positionalEncoding");
-		}
-	}
-
 	const TensorTransformerState& tt = tensorTransformer;
-	const unsigned int dModel = tt.dModel;
-	const unsigned int nHeads = tt.nHeads;
-	const unsigned int nKVHeads = (tt.nKVHeads > 0u ? tt.nKVHeads : nHeads);
-	const unsigned int dHead = (nHeads > 0u ? (dModel / nHeads) : 0u);
-	const unsigned int dModelKV = nKVHeads * dHead;
-	if (dHead == 0u || dModelKV == 0u)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmBatchSessionReset: invalid head dimensions");
-	if (nHeads > 0u && (dModel % nHeads) != 0u)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmBatchSessionReset: dModel is not divisible by nHeads");
-	if (nKVHeads > 0u && (nHeads % nKVHeads) != 0u)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "transformerLmBatchSessionReset: nHeads is not divisible by nKVHeads");
+	TransformerSessionCommonConfig commonCfg;
+	{
+		const NNetworkStatus st = build_transformer_session_common_config("transformerLmBatchSessionReset",
+		                                                                 tt.dModel,
+		                                                                 tt.dFF,
+		                                                                 tt.nHeads,
+		                                                                 tt.nKVHeads,
+		                                                                 tt.nLayers,
+		                                                                 tt.ffnKind,
+		                                                                 tt.padTokenId,
+		                                                                 runtimeCfg,
+		                                                                 metricsCfg,
+		                                                                 getLogger(),
+		                                                                 commonCfg);
+		if (!st.ok())
+			return st;
+	}
 
 	// Allocation sizing safety: overflow checks + hard cap.
 	{
 		const size_t B = static_cast<size_t>(batchSize);
 		const size_t L = static_cast<size_t>(tt.nLayers);
 		const size_t S = static_cast<size_t>(maxSeqLen);
-		const size_t K = static_cast<size_t>(dModelKV);
+		const size_t K = static_cast<size_t>(commonCfg.dModelKV);
 		size_t perSeqElems = 0u;
 		size_t tmp = 0u;
 		if (!checked_mul_size(L, S, tmp) || !checked_mul_size(tmp, K, perSeqElems))
@@ -1390,8 +1488,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionReset(glades::
 		if (!checked_mul_size(B, perSeqElems, totalElems))
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmBatchSessionReset: KV-cache size overflow (batchSize too large)");
 
-		const bool kvLowp = (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16) ||
-		                    (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16);
+		const bool kvLowp = (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16) ||
+		                    (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16);
 		const unsigned long long elemBytes = kvLowp ? static_cast<unsigned long long>(sizeof(uint16_t))
 		                                            : static_cast<unsigned long long>(sizeof(float));
 		const unsigned long long kvBytes =
@@ -1405,50 +1503,57 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionReset(glades::
 				return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmBatchSessionReset: keyValid size overflow");
 			keyMaskBytes = static_cast<unsigned long long>(keyMask);
 		}
-		const unsigned long long cap = kv_session_max_bytes();
+		const unsigned long long cap = kv_session_max_bytes(runtimeCfg);
 		const unsigned long long wantBytes = kvBytes + keyMaskBytes;
 		if (cap > 0ULL && wantBytes > cap)
 		{
 			std::ostringstream oss;
 			oss << "transformerLmBatchSessionReset: session allocation exceeds cap (want "
 			    << bytes_to_human(wantBytes) << ", cap " << bytes_to_human(cap)
-			    << "). Reduce batchSize/maxSeqLen or set GLADES_TRANSFORMER_KV_SESSION_MAX_BYTES.";
+			    << "). Reduce batchSize/maxSeqLen or set transformer.kvSessionMaxBytes / GLADES_TRANSFORMER_KV_SESSION_MAX_BYTES.";
 			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, oss.str());
 		}
 	}
 
 	session.reset();
 	session.initialized = true;
-	session.metricsEnabled = transformerMetricsCfg.enable;
-	session.perf.reset();
 	session.batchSize = batchSize;
 	session.maxLen = maxSeqLen;
 	session.curLen.assign(static_cast<size_t>(batchSize), 0u);
-	session.dModel = dModel;
-	session.dFF = tt.dFF;
-	session.nHeads = nHeads;
-	session.nKVHeads = nKVHeads;
-	session.nLayers = tt.nLayers;
-	session.dHead = dHead;
-	session.dModelKV = dModelKV;
-	session.ffnKind = tt.ffnKind;
-	session.ff1Width =
-	    (tt.ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * tt.dFF) : tt.dFF;
+	session.metricsEnabled = commonCfg.metricsEnabled;
+	session.metricsBreakdownEnabled = commonCfg.metricsBreakdownEnabled;
+	session.metricsLogPerKvAppend = commonCfg.metricsLogPerKvAppend;
+	session.perf.reset();
+	session.dModel = commonCfg.dModel;
+	session.dFF = commonCfg.dFF;
+	session.nHeads = commonCfg.nHeads;
+	session.nKVHeads = commonCfg.nKVHeads;
+	session.nLayers = commonCfg.nLayers;
+	session.dHead = commonCfg.dHead;
+	session.dModelKV = commonCfg.dModelKV;
+	session.ffnKind = commonCfg.ffnKind;
+	session.ff1Width = commonCfg.ff1Width;
+	session.layerNormEps = commonCfg.layerNormEps;
+	session.normType = commonCfg.normType;
+	session.positionalEncoding = commonCfg.positionalEncoding;
+	session.ropeDimOverride = commonCfg.ropeDimOverride;
+	session.ropeTheta = commonCfg.ropeTheta;
+	session.ffnActivation = commonCfg.ffnActivation;
+	session.padTokenId = commonCfg.padTokenId;
+	session.logger = commonCfg.logger;
 
 	size_t perSeq = 0u;
 	{
 		size_t tmp = 0u;
 		(void)checked_mul_size(static_cast<size_t>(tt.nLayers), static_cast<size_t>(maxSeqLen), tmp);
-		(void)checked_mul_size(tmp, static_cast<size_t>(dModelKV), perSeq);
+		(void)checked_mul_size(tmp, static_cast<size_t>(commonCfg.dModelKV), perSeq);
 	}
-	// KV-cache dtype for this session.
-	if (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16)
+	if (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_F16)
 		session.kvCacheDType = glades::NNetwork::TransformerLmBatchSession::KV_CACHE_F16;
-	else if (trainingConfig.transformer.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16)
+	else if (runtimeCfg.kvCacheDType == glades::TransformerRunConfig::KV_CACHE_BF16)
 		session.kvCacheDType = glades::NNetwork::TransformerLmBatchSession::KV_CACHE_BF16;
 	else
 		session.kvCacheDType = glades::NNetwork::TransformerLmBatchSession::KV_CACHE_F32;
-
 	if (session.kvCacheDType != glades::NNetwork::TransformerLmBatchSession::KV_CACHE_F32)
 	{
 		session.k.clear();
@@ -1464,32 +1569,29 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionReset(glades::
 		session.v.assign(static_cast<size_t>(batchSize) * perSeq, 0.0f);
 	}
 	session.keyValid.assign(static_cast<size_t>(batchSize) * static_cast<size_t>(maxSeqLen), 1u);
-
-	// Shared scratch sized once (reused while looping).
-	session.h.assign(static_cast<size_t>(dModel), 0.0f);
-	session.x1.assign(static_cast<size_t>(dModel), 0.0f);
-	session.x2.assign(static_cast<size_t>(dModel), 0.0f);
-	session.q.assign(static_cast<size_t>(dModel), 0.0f);
-	session.kvec.assign(static_cast<size_t>(dModelKV), 0.0f);
-	session.vvec.assign(static_cast<size_t>(dModelKV), 0.0f);
-	session.attnConcat.assign(static_cast<size_t>(dModel), 0.0f);
-	session.attnOut.assign(static_cast<size_t>(dModel), 0.0f);
-	session.ffPre.assign(static_cast<size_t>(session.ff1Width), 0.0f);
-	session.ffAct.assign(static_cast<size_t>(tt.dFF), 0.0f);
-	session.ffOut.assign(static_cast<size_t>(dModel), 0.0f);
+	session.h.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.x1.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.x2.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.q.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.kvec.assign(static_cast<size_t>(commonCfg.dModelKV), 0.0f);
+	session.vvec.assign(static_cast<size_t>(commonCfg.dModelKV), 0.0f);
+	session.attnConcat.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.attnOut.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
+	session.ffPre.assign(static_cast<size_t>(commonCfg.ff1Width), 0.0f);
+	session.ffAct.assign(static_cast<size_t>(commonCfg.dFF), 0.0f);
+	session.ffOut.assign(static_cast<size_t>(commonCfg.dModel), 0.0f);
 	session.scores.assign(static_cast<size_t>(maxSeqLen), 0.0f);
-
-	if (trainingConfig.transformer.positionalEncoding == glades::TransformerRunConfig::POSENC_SINUSOIDAL)
+	if (commonCfg.positionalEncoding == static_cast<unsigned int>(glades::TransformerRunConfig::POSENC_SINUSOIDAL))
 	{
 		if (session.metricsEnabled)
 		{
-			const bool hit = (session.posEncCache.sinDModelCached == dModel && !session.posEncCache.sinInvDenomPair.empty());
+			const bool hit = (session.posEncCache.sinDModelCached == commonCfg.dModel && !session.posEncCache.sinInvDenomPair.empty());
 			if (hit)
 				++session.perf.sinCacheHits;
 			else
 				++session.perf.sinCacheMisses;
 		}
-		session.posEncCache.ensureSinusoidal(dModel);
+		session.posEncCache.ensureSinusoidal(commonCfg.dModel);
 	}
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
@@ -1533,18 +1635,18 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 	const unsigned int nLayers = session.nLayers;
 	const unsigned int dModelKV = session.dModelKV;
 	const size_t perSeq = static_cast<size_t>(nLayers) * static_cast<size_t>(maxLen) * static_cast<size_t>(dModelKV);
-	const int padTokenId = tt.padTokenId;
+	const int padTokenId = session.padTokenId;
 
 	const bool metricsOn = session.metricsEnabled;
-	const bool breakdown = metricsOn && transformerMetricsCfg.enableKvKernelBreakdown;
+	const bool breakdown = metricsOn && session.metricsBreakdownEnabled;
 	ScopedTimerMs tTotal(this, metricsOn, &session.perf.msTotal);
 
 	// Config knobs
-	const float eps = (trainingConfig.transformer.layerNormEps > 0.0f ? trainingConfig.transformer.layerNormEps : 1e-5f);
-	const int normType = static_cast<int>(trainingConfig.transformer.normType);
-	const int posEnc = static_cast<int>(trainingConfig.transformer.positionalEncoding);
-	const int ropeDimOverride = trainingConfig.transformer.ropeDimOverride;
-	const float ropeTheta = (trainingConfig.transformer.ropeTheta > 0.0f ? trainingConfig.transformer.ropeTheta : 10000.0f);
+	const float eps = session.layerNormEps;
+	const int normType = static_cast<int>(session.normType);
+	const int posEnc = static_cast<int>(session.positionalEncoding);
+	const int ropeDimOverride = session.ropeDimOverride;
+	const float ropeTheta = session.ropeTheta;
 	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
 
 	// RoPE cache for the session (shared across batch elements).
@@ -1860,7 +1962,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 				}
 				else
 				{
-					const int act = static_cast<int>(trainingConfig.transformer.ffnActivation);
+					const int act = static_cast<int>(session.ffnActivation);
 					for (unsigned int i = 0; i < session.dFF; ++i)
 					{
 						const float x = ffPre[i];
@@ -1914,7 +2016,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 		cur += 1u;
 	}
 
-	if (metricsOn && transformerMetricsCfg.logPerKvAppend)
+	if (metricsOn && session.metricsLogPerKvAppend && session.logger)
 	{
 		unsigned int activeCount = 0u;
 		unsigned int maxCurLen = 0u;
@@ -1924,7 +2026,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmBatchSessionAppendSelectiv
 		for (size_t i = 0u; i < session.curLen.size(); ++i)
 			if (session.curLen[i] > maxCurLen)
 				maxCurLen = session.curLen[i];
-		log_kv_append_event(getLogger(),
+		log_kv_append_event(session.logger,
 		                   "transformer_kv_batch_append",
 		                   maxCurLen,
 		                   session.maxLen,

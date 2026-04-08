@@ -129,6 +129,12 @@ struct TransformerRunConfig
 
 	// KV-cache dtype for inference sessions (see KVCacheDType).
 	KVCacheDType kvCacheDType;
+	// Optional hard cap for KV-session allocations in bytes.
+	// 0 => use the environment/default policy.
+	uint64_t kvSessionMaxBytes;
+	// Optional hard cap for serving logits scratch/storage in bytes.
+	// 0 => use the environment/default policy.
+	uint64_t serveLogitsMaxBytes;
 
 	// RoPE parameters (used only when positionalEncoding==POSENC_ROPE).
 	// If ropeDimOverride <= 0, use dHead (full head dim). Will be rounded down to even.
@@ -164,6 +170,8 @@ struct TransformerRunConfig
 	      normType(NORM_LAYERNORM),
 	      positionalEncoding(POSENC_SINUSOIDAL),
 	      kvCacheDType(KV_CACHE_F32),
+	      kvSessionMaxBytes(0ULL),
+	      serveLogitsMaxBytes(0ULL),
 	      ropeDimOverride(0),
 	      ropeTheta(10000.0f),
 	      ffnKind(FFN_MLP),

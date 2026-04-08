@@ -57,6 +57,8 @@ public:
 class TransformerServingLayer
 {
 public:
+	typedef shmea::GPointer<ITransformerServingCallbacks> CallbackHandle;
+
 	struct Config
 	{
 		// Batcher capacity.
@@ -118,7 +120,7 @@ public:
 	~TransformerServingLayer();
 
 	// Initialize/reset the serving layer.
-	// The referenced `net` must outlive this serving layer.
+	// The referenced `net` must outlive this serving layer and any in-flight callbacks.
 	NNetworkStatus start(const NNetwork& net, const Config& cfg);
 
 	// Stop serving (clears pending/live state; keeps snapshots for inspection unless cleared explicitly).
@@ -135,10 +137,12 @@ public:
 	NNetworkStatus step();
 
 	// Submit a request. Returns a requestId that can be used for polling/streaming/cancel.
-	// If callbacks is non-null, ownership transfers to the serving layer; the callback is
-	// retained until the request snapshot is cleared or the layer stops.
+	// If callbacks is non-null, the serving layer takes shared ownership of a heap-allocated
+	// callback object and retains it until the request snapshot is cleared or the layer stops.
 	// Callbacks may be invoked from step() on the caller's thread.
-	NNetworkStatus submit(const NNetwork::TransformerServeRequest& req, uint64_t& outRequestId, ITransformerServingCallbacks* callbacks = NULL);
+	NNetworkStatus submit(const NNetwork::TransformerServeRequest& req,
+	                      uint64_t& outRequestId,
+	                      CallbackHandle callbacks = CallbackHandle());
 
 	// Request cancellation. Best-effort: takes effect on the next decode step.
 	// Returns false if requestId not found (already done/removed or never existed).
@@ -214,9 +218,9 @@ private:
 	{
 		uint64_t id;
 		NNetwork::TransformerServeRequest req;
-		ITransformerServingCallbacks* cb;
-		Pending() : id(0ULL), req(), cb(NULL) {}
-		Pending(uint64_t newId, const NNetwork::TransformerServeRequest& newReq, ITransformerServingCallbacks* newCb)
+		CallbackHandle cb;
+		Pending() : id(0ULL), req(), cb() {}
+		Pending(uint64_t newId, const NNetwork::TransformerServeRequest& newReq, const CallbackHandle& newCb)
 		    : id(newId), req(newReq), cb(newCb)
 		{
 		}
@@ -225,22 +229,22 @@ private:
 	struct LiveSlot
 	{
 		uint64_t id;
-		ITransformerServingCallbacks* cb;
-		LiveSlot() : id(0ULL), cb(NULL) {}
+		CallbackHandle cb;
+		LiveSlot() : id(0ULL), cb() {}
 	};
 
 	struct DeferredTokenCallback
 	{
 		uint64_t requestId;
-		ITransformerServingCallbacks* cb;
+		CallbackHandle cb;
 		unsigned int tokenId;
 		unsigned int generatedIndex;
 		DeferredTokenCallback()
-		    : requestId(0ULL), cb(NULL), tokenId(0u), generatedIndex(0u)
+		    : requestId(0ULL), cb(), tokenId(0u), generatedIndex(0u)
 		{
 		}
 		DeferredTokenCallback(uint64_t newId,
-		                      ITransformerServingCallbacks* newCb,
+		                      const CallbackHandle& newCb,
 		                      unsigned int newTokenId,
 		                      unsigned int newGeneratedIndex)
 		    : requestId(newId), cb(newCb), tokenId(newTokenId), generatedIndex(newGeneratedIndex)
@@ -261,7 +265,11 @@ private:
 		const TransformerServingLayer& layer_;
 	};
 
-	void logEvent(const char* event, uint64_t requestId, const char* msg) const;
+	void logEvent(const char* event,
+	             uint64_t requestId,
+	             const char* msg,
+	             const NNetworkStatus* st = NULL,
+	             unsigned int slot = static_cast<unsigned int>(-1)) const;
 
 private:
 	// Helpers: step() only (single-threaded).
@@ -270,10 +278,6 @@ private:
 	void admitPending_();
 	void updateSnapshotsFromBatcher_();
 	void finalizeDoneSlots_();
-	void retainCallback_(ITransformerServingCallbacks* cb);
-	void releaseCallback_(ITransformerServingCallbacks* cb);
-	void retireCompletedCallback_(uint64_t requestId, ITransformerServingCallbacks* cb);
-	void releaseCompletedCallback_(uint64_t requestId);
 	void finalizeSnapshotForShutdown_(uint64_t requestId, const NNetworkStatus* terminalStatus);
 	void shutdownLocked_(bool clearSnapshots, const NNetworkStatus* terminalStatus, const char* logMsg);
 	bool mutexOk_() const;
@@ -312,8 +316,7 @@ private:
 	std::deque<Pending> pending_;
 	std::map<uint64_t, RequestSnapshot> snapshots_;
 	mutable std::vector<DeferredTokenCallback> deferredTokenCallbacks_;
-	std::map<uint64_t, ITransformerServingCallbacks*> completedCallbacks_;
-	std::map<ITransformerServingCallbacks*, unsigned int> callbackRefCounts_;
+	std::map<uint64_t, CallbackHandle> completedCallbacks_;
 
 	// Request id generator.
 	uint64_t nextId_;

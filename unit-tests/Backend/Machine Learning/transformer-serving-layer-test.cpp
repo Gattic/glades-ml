@@ -34,6 +34,7 @@
 
 #include <cmath>
 #include <pthread.h>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -688,7 +689,8 @@ void TransformerServingLayerUnitTest()
 		prompt.push_back(1u);
 		prompt.push_back(2u);
 		prompt.push_back(3u);
-		StopLayerOnTokenCallback* cb = new StopLayerOnTokenCallback(layer);
+			glades::TransformerServingLayer::CallbackHandle cb(new StopLayerOnTokenCallback(layer));
+			StopLayerOnTokenCallback* raw = static_cast<StopLayerOnTokenCallback*>(cb.get());
 
 		uint64_t id = 0;
 		ASSERT("==============ServingLayer: SubmitStopFromCallback Failed==============",
@@ -698,7 +700,7 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: StepPrefillCallbackStop Failed==============", layer.step().ok());
 
 		ASSERT("==============ServingLayer: StepDecodeCallbackStop Failed==============", layer.step().ok());
-		ASSERT("==============ServingLayer: CallbackInvoked Failed==============", cb->calls() == 1u);
+			ASSERT("==============ServingLayer: CallbackInvoked Failed==============", raw->calls() == 1u);
 		ASSERT("==============ServingLayer: LayerStoppedByCallback Failed==============", !layer.isRunning());
 
 		glades::TransformerServingLayer::RequestSnapshot snap;
@@ -777,25 +779,57 @@ void TransformerServingLayerUnitTest()
 			prompt.push_back(1u);
 			prompt.push_back(2u);
 			prompt.push_back(3u);
-		ProbeSnapshotFromCallback* cb = new ProbeSnapshotFromCallback(layer);
+			glades::TransformerServingLayer::CallbackHandle cb(new ProbeSnapshotFromCallback(layer));
+			ProbeSnapshotFromCallback* raw = static_cast<ProbeSnapshotFromCallback*>(cb.get());
 
-		uint64_t id = 0;
-		ASSERT("==============ServingLayer: SubmitProbeCallback Failed==============",
-		       layer.submit(make_req(prompt, 2u, false, 22u, 1u), id, cb).ok());
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitProbeCallback Failed==============",
+			       layer.submit(make_req(prompt, 2u, false, 22u, 1u), id, cb).ok());
 
-		for (unsigned int t = 0u; t < prompt.size(); ++t)
-			ASSERT("==============ServingLayer: StepProbePrefill Failed==============", layer.step().ok());
+			for (unsigned int t = 0u; t < prompt.size(); ++t)
+				ASSERT("==============ServingLayer: StepProbePrefill Failed==============", layer.step().ok());
 
-		ASSERT("==============ServingLayer: StepProbeDecode Failed==============", layer.step().ok());
-		cb->releaseThread();
-		cb->join();
-		ASSERT("==============ServingLayer: CallbackProbeCompleted Failed==============", cb->completedDuringCallback());
-		ASSERT("==============ServingLayer: CallbackProbeSnapshotOK Failed==============", cb->threadOk());
-		layer.stop();
-	}
+			ASSERT("==============ServingLayer: StepProbeDecode Failed==============", layer.step().ok());
+			raw->releaseThread();
+			raw->join();
+			ASSERT("==============ServingLayer: CallbackProbeCompleted Failed==============", raw->completedDuringCallback());
+			ASSERT("==============ServingLayer: CallbackProbeSnapshotOK Failed==============", raw->threadOk());
+			layer.stop();
+		}
 
 		// --------
-		// Case 11: clearSnapshot() removes completed snapshot
+		// Case 11: callback ownership survives dropping the caller's handle
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg;
+			cfg.maxBatchSize = 1u;
+			cfg.maxSeqLen = 16u;
+			cfg.enableLogs = false;
+			ASSERT("==============ServingLayer: StartOK8c Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(4u);
+			prompt.push_back(5u);
+			prompt.push_back(6u);
+
+			glades::TransformerServingLayer::CallbackHandle cb(new ShouldCancelCallback(false, false));
+			ShouldCancelCallback* raw = static_cast<ShouldCancelCallback*>(cb.get());
+			uint64_t id = 0;
+			ASSERT("==============ServingLayer: SubmitOwnershipRetention Failed==============",
+			       layer.submit(make_req(prompt, 3u, false, 23u, 1u), id, cb).ok());
+			cb = glades::TransformerServingLayer::CallbackHandle();
+
+			for (unsigned int t = 0u; t < prompt.size(); ++t)
+				ASSERT("==============ServingLayer: StepOwnershipRetentionPrefill Failed==============", layer.step().ok());
+
+			ASSERT("==============ServingLayer: StepOwnershipRetentionDecode Failed==============", layer.step().ok());
+			ASSERT("==============ServingLayer: OwnershipRetentionCallbackCalls Failed==============", raw->shouldCancelCalls() == 1u);
+			layer.stop();
+		}
+
+		// --------
+		// Case 12: clearSnapshot() removes completed snapshot
 		// --------
 		{
 			glades::TransformerServingLayer layer;
@@ -831,7 +865,7 @@ void TransformerServingLayerUnitTest()
 		}
 
 		// --------
-		// Case 10: clearSnapshot() rejects pending and live requests
+		// Case 13: clearSnapshot() rejects pending and live requests
 		// --------
 		{
 			glades::TransformerServingLayer layer;
@@ -878,7 +912,8 @@ void TransformerServingLayerUnitTest()
 			prompt.push_back(1u);
 			prompt.push_back(2u);
 			prompt.push_back(3u);
-			ShouldCancelCallback* cb = new ShouldCancelCallback(true, false);
+			glades::TransformerServingLayer::CallbackHandle cb(new ShouldCancelCallback(true, false));
+			ShouldCancelCallback* raw = static_cast<ShouldCancelCallback*>(cb.get());
 
 			uint64_t id = 0;
 			ASSERT("==============ServingLayer: SubmitShouldCancel Failed==============",
@@ -894,8 +929,8 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: ShouldCancelDone Failed==============", snap.done);
 			ASSERT("==============ServingLayer: ShouldCancelFlag Failed==============", snap.result.stoppedByCallback);
 			ASSERT("==============ServingLayer: ShouldCancelNoDecodeToken Failed==============", snap.result.tokens.empty());
-			ASSERT("==============ServingLayer: ShouldCancelCalled Failed==============", cb->shouldCancelCalls() == 1u);
-			ASSERT("==============ServingLayer: ShouldCancelOnTokenNotCalled Failed==============", cb->onTokenCalls() == 0u);
+			ASSERT("==============ServingLayer: ShouldCancelCalled Failed==============", raw->shouldCancelCalls() == 1u);
+			ASSERT("==============ServingLayer: ShouldCancelOnTokenNotCalled Failed==============", raw->onTokenCalls() == 0u);
 			layer.stop();
 		}
 
@@ -914,7 +949,8 @@ void TransformerServingLayerUnitTest()
 			prompt.push_back(4u);
 			prompt.push_back(5u);
 			prompt.push_back(6u);
-			ShouldCancelCallback* cb = new ShouldCancelCallback(false, true);
+			glades::TransformerServingLayer::CallbackHandle cb(new ShouldCancelCallback(false, true));
+			ShouldCancelCallback* raw = static_cast<ShouldCancelCallback*>(cb.get());
 
 			uint64_t id = 0;
 			ASSERT("==============ServingLayer: SubmitShouldCancelThrow Failed==============",
@@ -930,7 +966,7 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: ShouldCancelThrowDone Failed==============", snap.done);
 			ASSERT("==============ServingLayer: ShouldCancelThrowFlag Failed==============", snap.result.stoppedByCallback);
 			ASSERT("==============ServingLayer: ShouldCancelThrowNoDecodeToken Failed==============", snap.result.tokens.empty());
-			ASSERT("==============ServingLayer: ShouldCancelThrowCalled Failed==============", cb->shouldCancelCalls() == 1u);
+			ASSERT("==============ServingLayer: ShouldCancelThrowCalled Failed==============", raw->shouldCancelCalls() == 1u);
 			layer.stop();
 		}
 
@@ -949,7 +985,8 @@ void TransformerServingLayerUnitTest()
 			prompt.push_back(1u);
 			prompt.push_back(2u);
 			prompt.push_back(3u);
-			ReentrantStepCallback* cb = new ReentrantStepCallback(layer);
+			glades::TransformerServingLayer::CallbackHandle cb(new ReentrantStepCallback(layer));
+			ReentrantStepCallback* raw = static_cast<ReentrantStepCallback*>(cb.get());
 
 			uint64_t id = 0;
 			ASSERT("==============ServingLayer: SubmitReentrant Failed==============",
@@ -959,8 +996,8 @@ void TransformerServingLayerUnitTest()
 				ASSERT("==============ServingLayer: StepReentrantPrefill Failed==============", layer.step().ok());
 
 			ASSERT("==============ServingLayer: StepReentrantDecode Failed==============", layer.step().ok());
-			ASSERT("==============ServingLayer: ReentrantCallbackInvoked Failed==============", cb->calls() == 1u);
-			ASSERT("==============ServingLayer: ReentrantStepRejected Failed==============", !cb->reentrantStatus.ok());
+			ASSERT("==============ServingLayer: ReentrantCallbackInvoked Failed==============", raw->calls() == 1u);
+			ASSERT("==============ServingLayer: ReentrantStepRejected Failed==============", !raw->reentrantStatus.ok());
 			layer.stop();
 		}
 
@@ -1034,7 +1071,7 @@ void TransformerServingLayerUnitTest()
 			shmea::GLogger logger;
 			logger.setPrintLevel(shmea::GLogger::LOG_INFO);
 			logger.unsurpress(shmea::GLogger::LOG_INFO);
-			logger.setPrintToConsole(true);
+			logger.setPrintToConsole(false);
 			m.net->setLogger(&logger);
 
 			glades::TransformerServingLayer layer;
@@ -1054,6 +1091,17 @@ void TransformerServingLayerUnitTest()
 			layer.stop();
 
 			ASSERT("==============ServingLayer: LoggingEnabledLifecycle Completed Failed==============", true);
+
+			glades::TransformerServingLayer failLayer;
+			ASSERT("==============ServingLayer: StartOK15b Failed==============", failLayer.start(*m.net, cfg).ok());
+			std::vector<unsigned int> badPrompt;
+			badPrompt.push_back(999999u);
+			uint64_t badId = 0;
+			ASSERT("==============ServingLayer: SubmitBadLogCase Failed==============", failLayer.submit(make_req(badPrompt, 1u, false, 607u, 1u), badId).ok());
+			ASSERT("==============ServingLayer: StepBadLogCase Failed==============", failLayer.step().ok());
+			failLayer.stop();
+
+			ASSERT("==============ServingLayer: LoggingEnabledFailurePath Completed Failed==============", true);
 
 			m.net->setLogger(NULL);
 		}

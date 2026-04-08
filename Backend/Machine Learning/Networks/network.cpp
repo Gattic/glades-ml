@@ -64,6 +64,7 @@ struct GladesLinkAnchorsOnce
 	}
 };
 static GladesLinkAnchorsOnce g_glades_link_anchors_once;
+static shmea::GLogger g_default_network_logger(shmea::GLogger::LOG_INFO);
 } // namespace
 
 // for stopping ml  training instances
@@ -478,10 +479,32 @@ void glades::NNetwork::storeRunningFlag(bool value)
 	__atomic_store_n(&running, value ? 1 : 0, __ATOMIC_SEQ_CST);
 }
 
+uint64_t glades::NNetwork::loadConfiguredSeed() const
+{
+	return __atomic_load_n(&rngSeed, __ATOMIC_SEQ_CST);
+}
+
+void glades::NNetwork::storeConfiguredSeed(uint64_t seed)
+{
+	__atomic_store_n(&rngSeed, seed, __ATOMIC_SEQ_CST);
+}
+
+shmea::GLogger* glades::NNetwork::loadLoggerOverride() const
+{
+	return __atomic_load_n(&loggerOverride, __ATOMIC_SEQ_CST);
+}
+
+void glades::NNetwork::storeLoggerOverride(shmea::GLogger* logger)
+{
+	__atomic_store_n(&loggerOverride, logger, __ATOMIC_SEQ_CST);
+}
+
 void glades::NNetwork::setSeed(uint64_t seed)
 {
-	rngSeed = seed;
-	glades::rng::seed_engine(rngEngine, seed);
+	storeConfiguredSeed(seed);
+	RunLockGuard runGuard(*this);
+	if (runGuard.ok())
+		glades::rng::seed_engine(rngEngine, seed);
 }
 
 glades::NNetworkStatus glades::NNetwork::train(const DataInput* newDataInput)
@@ -999,17 +1022,17 @@ void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* new
 
 void glades::NNetwork::setLogger(shmea::GLogger* logger)
 {
-	loggerOverride = logger;
+	storeLoggerOverride(logger);
 }
 
 shmea::GLogger* glades::NNetwork::getLogger() const
 {
-	if (loggerOverride)
-		return loggerOverride;
+	shmea::GLogger* logger = loadLoggerOverride();
+	if (logger)
+		return logger;
 	if (serverInstance && serverInstance->logger)
 		return serverInstance->logger.get();
-	static shmea::GLogger defaultLogger(shmea::GLogger::LOG_INFO);
-	return &defaultLogger;
+	return &g_default_network_logger;
 }
 
 shmea::GList glades::NNetwork::getResults() const

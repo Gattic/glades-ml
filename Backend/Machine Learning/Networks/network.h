@@ -658,6 +658,10 @@ private:
 	void releaseRunLock();
 	bool loadRunningFlag() const;
 	void storeRunningFlag(bool value);
+	uint64_t loadConfiguredSeed() const;
+	void storeConfiguredSeed(uint64_t seed);
+	shmea::GLogger* loadLoggerOverride() const;
+	void storeLoggerOverride(shmea::GLogger* logger);
 
 	// Epoch-scoped metric accumulators (reset at the start of each epoch).
 	// Regression:
@@ -1472,7 +1476,7 @@ public:
 	explicit NNetwork(const NNInfo* newNNInfo, int newNetType=TYPE_DFF);
 	virtual ~NNetwork();
 	void setSeed(uint64_t seed);
-	uint64_t getSeed() const { return rngSeed; }
+	uint64_t getSeed() const { return loadConfiguredSeed(); }
 	// Create a fresh NNetwork from the same skeleton/type/config for hyperparameter tuning.
 	// Caller owns the returned pointer and must delete it.
 	NNetwork* cloneForTrial() const;
@@ -1756,7 +1760,17 @@ public:
 		      scores(),
 		      posEncCache(),
 		      metricsEnabled(false),
+		      metricsBreakdownEnabled(false),
+		      metricsLogPerKvAppend(false),
 		      perf(),
+		      layerNormEps(0.0f),
+		      normType(0u),
+		      positionalEncoding(0u),
+		      ropeDimOverride(0),
+		      ropeTheta(0.0f),
+		      ffnActivation(0u),
+		      padTokenId(-1),
+		      logger(NULL),
 		      gpuInferState(0)
 		{
 		}
@@ -1793,7 +1807,17 @@ public:
 			scores.clear();
 			posEncCache.reset();
 			metricsEnabled = false;
+			metricsBreakdownEnabled = false;
+			metricsLogPerKvAppend = false;
 			perf.reset();
+			layerNormEps = 0.0f;
+			normType = 0u;
+			positionalEncoding = 0u;
+			ropeDimOverride = 0;
+			ropeTheta = 0.0f;
+			ffnActivation = 0u;
+			padTokenId = -1;
+			logger = NULL;
 			// Note: gpuInferState is NOT freed here; the caller (transformerLmSessionReset)
 			// manages GPU lifecycle to avoid pulling CUDA into the header.
 		}
@@ -1850,7 +1874,17 @@ public:
 
 		// Optional performance counters/timers (populated only when enabled).
 		bool metricsEnabled;
+		bool metricsBreakdownEnabled;
+		bool metricsLogPerKvAppend;
 		TransformerKvPerfBreakdown perf;
+		float layerNormEps;
+		unsigned int normType;
+		unsigned int positionalEncoding;
+		int ropeDimOverride;
+		float ropeTheta;
+		unsigned int ffnActivation;
+		int padTokenId;
+		shmea::GLogger* logger;
 
 		// Opaque pointer to GPU inference state (allocated/freed by transformer_infer.cpp).
 		// NULL when GPU inference is not active.
@@ -1909,7 +1943,17 @@ public:
 		      scores(),
 		      posEncCache(),
 		      metricsEnabled(false),
-		      perf()
+		      metricsBreakdownEnabled(false),
+		      metricsLogPerKvAppend(false),
+		      perf(),
+		      layerNormEps(0.0f),
+		      normType(0u),
+		      positionalEncoding(0u),
+		      ropeDimOverride(0),
+		      ropeTheta(0.0f),
+		      ffnActivation(0u),
+		      padTokenId(-1),
+		      logger(NULL)
 		{
 		}
 
@@ -1942,7 +1986,17 @@ public:
 			scores.clear();
 			posEncCache.reset();
 			metricsEnabled = false;
+			metricsBreakdownEnabled = false;
+			metricsLogPerKvAppend = false;
 			perf.reset();
+			layerNormEps = 0.0f;
+			normType = 0u;
+			positionalEncoding = 0u;
+			ropeDimOverride = 0;
+			ropeTheta = 0.0f;
+			ffnActivation = 0u;
+			padTokenId = -1;
+			logger = NULL;
 		}
 
 	private:
@@ -1999,7 +2053,17 @@ public:
 
 		// Optional performance counters/timers (populated only when enabled).
 		bool metricsEnabled;
+		bool metricsBreakdownEnabled;
+		bool metricsLogPerKvAppend;
 		TransformerKvPerfBreakdown perf;
+		float layerNormEps;
+		unsigned int normType;
+		unsigned int positionalEncoding;
+		int ropeDimOverride;
+		float ropeTheta;
+		unsigned int ffnActivation;
+		int padTokenId;
+		shmea::GLogger* logger;
 
 	};
 

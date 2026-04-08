@@ -3416,6 +3416,54 @@ void NNTransformerUnitTest()
 				G_assert(__FILE__, __LINE__, "==============NN::InferApi TokenOutOfRange ShouldFail Failed==============", !st.ok());
 			}
 
+			// Session reset snapshots transformer runtime knobs used by append.
+			{
+				glades::TrainingConfig savedCfg = net.getTrainingConfig();
+
+				glades::NNetwork::TransformerLmSession session;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionSnapshotReset Failed==============", net.transformerLmSessionReset(session, 3u).ok());
+				net.getTrainingConfigMutable().transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+				net.getTrainingConfigMutable().transformer.ffnActivation = glades::TransformerRunConfig::FFN_RELU;
+				net.getTrainingConfigMutable().transformer.layerNormEps = 0.0f;
+
+				std::vector<float> logits;
+				const glades::NNetworkStatus st = net.transformerLmSessionAppend(session, 1u, &logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionSnapshotAppend Failed==============", st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi SessionSnapshotRestore Failed==============", net.setTrainingConfig(savedCfg).ok());
+			}
+
+			// Batch session reset snapshots the same runtime knobs.
+			{
+				glades::TrainingConfig savedCfg = net.getTrainingConfig();
+
+				glades::NNetwork::TransformerLmBatchSession session;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotReset Failed==============", net.transformerLmBatchSessionReset(session, 1u, 3u).ok());
+				net.getTrainingConfigMutable().transformer.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(999);
+				net.getTrainingConfigMutable().transformer.ffnActivation = glades::TransformerRunConfig::FFN_RELU;
+				net.getTrainingConfigMutable().transformer.layerNormEps = 0.0f;
+
+				std::vector<unsigned int> tokenIds(1, 1u);
+				std::vector<unsigned char> active(1, 1u);
+				std::vector<float> logits;
+				const glades::NNetworkStatus st = net.transformerLmBatchSessionAppendSelective(session, tokenIds, active, &logits);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotAppend Failed==============", st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotLogits Failed==============", logits.size() == vocab);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi BatchSessionSnapshotRestore Failed==============", net.setTrainingConfig(savedCfg).ok());
+			}
+
+			// Typed KV-session allocation cap should fail fast without relying on env state.
+			{
+				glades::TrainingConfig savedCfg = net.getTrainingConfig();
+				glades::TrainingConfig cappedCfg = savedCfg;
+				cappedCfg.transformer.kvSessionMaxBytes = 64ULL;
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi TypedKvCapConfig Failed==============", net.setTrainingConfig(cappedCfg).ok());
+
+				glades::NNetwork::TransformerLmSession session;
+				const glades::NNetworkStatus st = net.transformerLmSessionReset(session, 64u);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi TypedKvCapResetShouldFail Failed==============", !st.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi TypedKvCapRestore Failed==============", net.setTrainingConfig(savedCfg).ok());
+			}
+
 				delete di;
 				delete info;
 			}
@@ -3451,8 +3499,7 @@ void NNTransformerUnitTest()
 				}
 				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap InitTestStatus() Failed==============", net.test(di).ok());
 
-				EnvVarGuard capGuard("GLADES_TRANSFORMER_SERVE_MAX_BYTES");
-				capGuard.set("64");
+				net.getTrainingConfigMutable().transformer.serveLogitsMaxBytes = 64ULL;
 
 				std::vector<glades::NNetwork::TransformerServeRequest> reqs;
 				reqs.resize(2);
@@ -3471,6 +3518,15 @@ void NNTransformerUnitTest()
 				bcfg.maxSeqLen = 4u;
 				const glades::NNetworkStatus stBatcher = net.transformerLmServeBatcherReset(batcher, bcfg);
 				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherResetShouldFail Failed==============", !stBatcher.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherResetShouldLeaveUninitialized Failed==============", !batcher.isInitialized());
+
+				glades::NNetwork::TransformerServeRequest serveReq;
+				serveReq.promptTokens.push_back(1u);
+				serveReq.cfg.maxNewTokens = 1u;
+				unsigned int submitSlot = 123u;
+				const glades::NNetworkStatus stSubmit = net.transformerLmServeBatcherSubmit(batcher, serveReq, submitSlot);
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherSubmitAfterResetFailureShouldFail Failed==============", !stSubmit.ok());
+				G_assert(__FILE__, __LINE__, "==============NN::InferApi ServeCap BatcherSubmitAfterResetFailureSlotReset Failed==============", submitSlot == 0u);
 
 				delete di;
 				delete info;
