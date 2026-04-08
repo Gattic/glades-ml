@@ -102,6 +102,75 @@ private:
 	friend DeconvScratchArena;
 	friend void ::GANUnitTest();
 
+public:
+	struct TrainerRunDiagnostics
+	{
+		uint64_t totalRunAttempts;
+		uint64_t totalRunSuccesses;
+		uint64_t totalRunFailures;
+		uint64_t totalPreflightFailures;
+		uint64_t totalNullSkeletonFailures;
+		uint64_t totalNullDataFailures;
+		uint64_t totalUnknownRunTypeFailures;
+		uint64_t totalEmptyDataFailures;
+		uint64_t totalPostBuildEmptyDataFailures;
+		uint64_t totalContractFailures;
+		uint64_t totalTensorInitFailures;
+		int lastRunType;
+		int lastNetType;
+		bool lastTrainRun;
+		bool lastEvalRun;
+		bool lastTokenLM;
+		bool lastTokenLMInput;
+		bool lastSequenceModel;
+		bool lastFailureDuringPreflight;
+		bool lastFailurePostBuildCheck;
+		unsigned int lastDataSize;
+		unsigned int lastFeatureCount;
+		unsigned int lastOutputSize;
+		unsigned int lastExpectedFeatureCount;
+		unsigned int lastExpectedOutputSize;
+		std::string lastFailureStage;
+		NNetworkStatus lastRunStatus;
+		NNetworkStatus lastFailureStatus;
+		NNetworkStatus lastDataInputStatus;
+
+		TrainerRunDiagnostics()
+		    : totalRunAttempts(0ULL),
+		      totalRunSuccesses(0ULL),
+		      totalRunFailures(0ULL),
+		      totalPreflightFailures(0ULL),
+		      totalNullSkeletonFailures(0ULL),
+		      totalNullDataFailures(0ULL),
+		      totalUnknownRunTypeFailures(0ULL),
+		      totalEmptyDataFailures(0ULL),
+		      totalPostBuildEmptyDataFailures(0ULL),
+		      totalContractFailures(0ULL),
+		      totalTensorInitFailures(0ULL),
+		      lastRunType(-1),
+		      lastNetType(-1),
+		      lastTrainRun(false),
+		      lastEvalRun(false),
+		      lastTokenLM(false),
+		      lastTokenLMInput(false),
+		      lastSequenceModel(false),
+		      lastFailureDuringPreflight(false),
+		      lastFailurePostBuildCheck(false),
+		      lastDataSize(0u),
+		      lastFeatureCount(0u),
+		      lastOutputSize(0u),
+		      lastExpectedFeatureCount(0u),
+		      lastExpectedOutputSize(0u),
+		      lastFailureStage(),
+		      lastRunStatus(NNetworkStatus::OK, std::string()),
+		      lastFailureStatus(NNetworkStatus::OK, std::string()),
+		      lastDataInputStatus(NNetworkStatus::OK, std::string())
+		{
+		}
+	};
+
+private:
+
 	// Tensor-based DFF training state.
 	//
 	// This is a contiguous-buffer rewrite of the historical (graph-based) training core,
@@ -679,6 +748,7 @@ private:
 
 	bool firstRunActivation;
 	NNetworkStatus lastStatus;
+	TrainerRunDiagnostics trainerRunDiagnostics;
 	TensorDFFState tensorDff;
 	RecurrentScratch recScratch;
 
@@ -1449,6 +1519,7 @@ public:
 	NNetworkStatus train(const DataInput*, ITrainingCallbacks*);
 	NNetworkStatus test(const DataInput*, ITrainingCallbacks*);
 	const NNetworkStatus& getLastStatus() const { return lastStatus; }
+	bool getTrainerRunDiagnostics(TrainerRunDiagnostics& out) const;
 
 	// Training loop controls (optional).
 	// These are intentionally simple knobs that do not require modifying NNInfo persistence.

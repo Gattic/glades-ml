@@ -574,6 +574,20 @@ static const char* run_type_name(int runType)
 	}
 }
 
+static const char* status_code_name(glades::NNetworkStatus::Code code)
+{
+	switch (code)
+	{
+	case glades::NNetworkStatus::OK: return "OK";
+	case glades::NNetworkStatus::INVALID_ARGUMENT: return "INVALID_ARGUMENT";
+	case glades::NNetworkStatus::INVALID_STATE: return "INVALID_STATE";
+	case glades::NNetworkStatus::EMPTY_DATA: return "EMPTY_DATA";
+	case glades::NNetworkStatus::BUILD_FAILED: return "BUILD_FAILED";
+	case glades::NNetworkStatus::INTERNAL_ERROR: return "INTERNAL_ERROR";
+	default: return "UNKNOWN";
+	}
+}
+
 static const char* output_type_name(int outType)
 {
 	switch (outType)
@@ -689,6 +703,70 @@ private:
 	glades::NNetworkEpochMetrics last;
 	int64_t lastEpochLogTime;
 };
+
+static bool emit_trainer_preflight_failure_log(const glades::NNetwork& net,
+                                               int runType,
+                                               const glades::NNetworkStatus& st)
+{
+	glades::NNetwork::TrainerRunDiagnostics diag;
+	if (!net.getTrainerRunDiagnostics(diag))
+		return false;
+	if (!diag.lastFailureDuringPreflight)
+		return false;
+	if (diag.lastRunType != runType)
+		return false;
+	if (diag.lastFailureStatus.code != st.code || diag.lastFailureStatus.message != st.message)
+		return false;
+
+	shmea::GLogger* logger = net.getLogger();
+	if (!logger)
+		return false;
+
+	std::ostringstream oss;
+	oss << "event=nn_run_preflight_fail";
+	append_logfmt_kv(oss, "run_type", std::string(run_type_name(runType)));
+	append_logfmt_kv(oss, "net_type", net.getNetType());
+	append_logfmt_kv(oss, "stage", diag.lastFailureStage);
+	append_logfmt_kv(oss, "run_attempts", static_cast<unsigned long long>(diag.totalRunAttempts));
+	append_logfmt_kv(oss, "run_failures", static_cast<unsigned long long>(diag.totalRunFailures));
+	append_logfmt_kv(oss, "preflight_failures", static_cast<unsigned long long>(diag.totalPreflightFailures));
+	append_logfmt_kv(oss, "post_build_check", diag.lastFailurePostBuildCheck);
+	append_logfmt_kv(oss, "data_size", diag.lastDataSize);
+	append_logfmt_kv(oss, "feature_count", diag.lastFeatureCount);
+	append_logfmt_kv(oss, "output_size", diag.lastOutputSize);
+	append_logfmt_kv(oss, "expected_feature_count", diag.lastExpectedFeatureCount);
+	append_logfmt_kv(oss, "expected_output_size", diag.lastExpectedOutputSize);
+	append_logfmt_kv(oss, "token_lm", diag.lastTokenLM);
+	append_logfmt_kv(oss, "token_lm_input", diag.lastTokenLMInput);
+	append_logfmt_kv(oss, "sequence_model", diag.lastSequenceModel);
+	append_logfmt_kv(oss, "status_code", std::string(status_code_name(st.code)));
+	append_logfmt_kv(oss, "status_ok", st.ok());
+	if (!st.message.empty())
+		append_logfmt_kv(oss, "error", st.message);
+	if (!diag.lastDataInputStatus.ok())
+	{
+		append_logfmt_kv(oss, "data_status_code", std::string(status_code_name(diag.lastDataInputStatus.code)));
+		if (!diag.lastDataInputStatus.message.empty())
+			append_logfmt_kv(oss, "data_error", diag.lastDataInputStatus.message);
+	}
+
+	const glades::NNInfo* sk = net.getNNInfo();
+	if (sk)
+	{
+		append_logfmt_kv(oss, "name", std::string(sk->getName().c_str()));
+		append_logfmt_kv(oss, "output_type", std::string(output_type_name(sk->getOutputType())));
+		append_logfmt_kv(oss, "hidden_layers", sk->numHiddenLayers());
+	}
+
+	const bool hardFailure =
+	    (st.code == glades::NNetworkStatus::INTERNAL_ERROR) ||
+	    (diag.lastFailureStage == "initialize_tensors");
+	if (hardFailure)
+		logger->error("NNetwork", shmea::GString(oss.str().c_str()));
+	else
+		logger->warning("NNetwork", shmea::GString(oss.str().c_str()));
+	return true;
+}
 
 class GuiCallbacks : public glades::ITrainingCallbacks
 {
@@ -879,9 +957,12 @@ glades::NNetworkStatus glades::NNetwork::run(const DataInput* newDataInput, int 
 		const glades::NNetworkStatus st = glades::Trainer::run(*this, newDataInput, runType, callbacks);
 		if (!st.ok())
 		{
-			shmea::GLogger* logger = getLogger();
-			if (logger)
-				logger->error("NNetwork", st.message.c_str());
+			if (!emit_trainer_preflight_failure_log(*this, runType, st))
+			{
+				shmea::GLogger* logger = getLogger();
+				if (logger)
+					logger->error("NNetwork", st.message.c_str());
+			}
 		}
 		return st;
 	}
@@ -893,9 +974,12 @@ glades::NNetworkStatus glades::NNetwork::run(const DataInput* newDataInput, int 
 		const glades::NNetworkStatus st = glades::Trainer::run(*this, newDataInput, runType, static_cast<glades::ITrainingCallbacks*>(&defaultCb));
 		if (!st.ok())
 		{
-			shmea::GLogger* logger = getLogger();
-			if (logger)
-				logger->error("NNetwork", st.message.c_str());
+			if (!emit_trainer_preflight_failure_log(*this, runType, st))
+			{
+				shmea::GLogger* logger = getLogger();
+				if (logger)
+					logger->error("NNetwork", st.message.c_str());
+			}
 		}
 		return st;
 	}
@@ -1015,6 +1099,12 @@ const shmea::GList& glades::NNetwork::getNodeActivations() const
 	return cNodeActivations;
 }
 
+bool glades::NNetwork::getTrainerRunDiagnostics(TrainerRunDiagnostics& out) const
+{
+	out = trainerRunDiagnostics;
+	return true;
+}
+
 void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
 {
 	serverInstance = newServer;
@@ -1096,6 +1186,7 @@ void glades::NNetwork::clean()
 	regCount = 0ULL;
 	clsCorrect = 0ULL;
 	clsTotal = 0ULL;
+	trainerRunDiagnostics = TrainerRunDiagnostics();
 
 	// Ensure the run lock is released when resetting the instance state.
 #if GLADES_HAVE_STD_ATOMICS

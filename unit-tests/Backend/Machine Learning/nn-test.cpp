@@ -3697,6 +3697,54 @@ void NNTransformerUnitTest()
 			}
 		}
 
+	// Trainer preflight observability: capture failure context and counters.
+	printf("-----------------------------------\n");
+	printf("Trainer preflight diagnostics\n");
+	printf("-----------------------------------\n");
+	{
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_trainer_preflight_diag", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		const glades::DataInput* noData = NULL;
+		const glades::NNetworkStatus stNull = net.train(noData);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataStatus Failed==============", !stNull.ok());
+
+		glades::NNetwork::TrainerRunDiagnostics diag;
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataGet Failed==============", net.getTrainerRunDiagnostics(diag));
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataCounts Failed==============",
+		         diag.totalRunAttempts == 1ULL &&
+		         diag.totalRunFailures == 1ULL &&
+		         diag.totalPreflightFailures == 1ULL &&
+		         diag.totalNullDataFailures == 1ULL);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag NullDataStage Failed==============",
+		         diag.lastFailureStage == "validate_data_input" &&
+		         diag.lastFailureStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT &&
+		         diag.lastRunType == glades::NNetwork::RUN_TRAIN);
+
+		glades::NumberInput emptyDi;
+		const glades::NNetworkStatus stEmpty = net.train(&emptyDi);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataStatus Failed==============", !stEmpty.ok());
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataGet Failed==============", net.getTrainerRunDiagnostics(diag));
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataCounts Failed==============",
+		         diag.totalRunAttempts == 2ULL &&
+		         diag.totalRunFailures == 2ULL &&
+		         diag.totalPreflightFailures == 2ULL &&
+		         diag.totalEmptyDataFailures == 1ULL);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataStage Failed==============",
+		         diag.lastFailureStage == "validate_active_split_data" &&
+		         diag.lastFailureStatus.code == glades::NNetworkStatus::EMPTY_DATA &&
+		         !diag.lastFailurePostBuildCheck);
+		G_assert(__FILE__, __LINE__, "==============NN::TrainerDiag EmptyDataContext Failed==============",
+		         diag.lastDataSize == 0u &&
+		         diag.lastOutputSize == 1u &&
+		         diag.lastNetType == glades::NNetwork::TYPE_DFF);
+
+		delete info;
+	}
+
 	// TokenInput dataset parsing + sequence semantics (LLM data pipeline).
 	printf("-----------------------------------\n");
 	printf("TokenInput parsing + explicit split semantics\n");
