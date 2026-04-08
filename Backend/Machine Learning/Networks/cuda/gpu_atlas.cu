@@ -75,14 +75,9 @@ __device__ float blockReduceSum(float val, float* smem)
 
 __device__ __forceinline__ double warpReduceSumD(double val)
 {
-	int lo = __double2loint(val);
-	int hi = __double2hiint(val);
 	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-	{
-		lo = __shfl_down_sync(0xFFFFFFFF, lo, offset);
-		hi = __shfl_down_sync(0xFFFFFFFF, hi, offset);
-	}
-	return __hiloint2double(hi, lo);
+		val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+	return val;
 }
 
 __device__ double blockReduceSumD(double val, double* smem)

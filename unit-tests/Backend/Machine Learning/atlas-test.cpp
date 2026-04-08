@@ -2581,6 +2581,65 @@ void ATLASGpuNaNTest()
 
 #ifdef GLADES_HAVE_CUDA
 	// ---------------------------------------------------------------
+	// Test GPU 0: Fisher kernel mean-squared reduction
+	//
+	// Isolates atlas_gpu_fisher_update. With beta=0 and gz filled with 1.0,
+	// each Fisher entry must become exactly 1.0 because mean(gz^2)=1.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS GPU Test 0: Fisher kernel mean-squared reduction\n");
+	printf("-----------------------------------\n");
+	if (glades::gpu::initDevice())
+	{
+		const int r = 4;
+		const int outerDim = 1024;
+
+		glades::gpu::GpuBuffer<float> d_gz_left, d_gz_right, d_fisher;
+		ASSERT("==============GPU Fisher left alloc==============",
+		       d_gz_left.allocate((size_t)r * outerDim));
+		ASSERT("==============GPU Fisher right alloc==============",
+		       d_gz_right.allocate((size_t)outerDim * r));
+		ASSERT("==============GPU Fisher diag alloc==============",
+		       d_fisher.allocate((size_t)r));
+
+		std::vector<float> ones((size_t)r * outerDim, 1.0f);
+		std::vector<float> fisher(r, 0.0f);
+
+		ASSERT("==============GPU Fisher left upload==============",
+		       d_gz_left.upload(ones.data(), ones.size()));
+		ASSERT("==============GPU Fisher diag zero upload==============",
+		       d_fisher.upload(fisher.data(), fisher.size()));
+		ASSERT("==============GPU Fisher left update==============",
+		       glades::gpu::atlas_gpu_fisher_update(
+		           d_gz_left.data(), d_fisher.data(), r, outerDim, 0.0f, false));
+		ASSERT("==============GPU Fisher left download==============",
+		       d_fisher.download(fisher.data(), fisher.size()));
+		for (int c = 0; c < r; ++c)
+		{
+			printf("    left fisher[%d]=%.8f\n", c, fisher[c]);
+			ASSERT("==============GPU Fisher left mean-squared mismatch==============",
+			       fabsf(fisher[c] - 1.0f) < 1e-5f);
+		}
+
+		ASSERT("==============GPU Fisher right upload==============",
+		       d_gz_right.upload(ones.data(), ones.size()));
+		std::fill(fisher.begin(), fisher.end(), 0.0f);
+		ASSERT("==============GPU Fisher diag reset upload==============",
+		       d_fisher.upload(fisher.data(), fisher.size()));
+		ASSERT("==============GPU Fisher right update==============",
+		       glades::gpu::atlas_gpu_fisher_update(
+		           d_gz_right.data(), d_fisher.data(), r, outerDim, 0.0f, true));
+		ASSERT("==============GPU Fisher right download==============",
+		       d_fisher.download(fisher.data(), fisher.size()));
+		for (int c = 0; c < r; ++c)
+		{
+			printf("    right fisher[%d]=%.8f\n", c, fisher[c]);
+			ASSERT("==============GPU Fisher right mean-squared mismatch==============",
+			       fabsf(fisher[c] - 1.0f) < 1e-5f);
+		}
+	}
+
+	// ---------------------------------------------------------------
 	// Test GPU: ATLAS GPU NaN reproduction — zero/tiny gradient refresh
 	//
 	// Reproduces the production bug where layer 0 Wq gets NaN in
