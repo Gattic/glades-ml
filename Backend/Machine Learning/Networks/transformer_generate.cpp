@@ -1343,7 +1343,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherSubmit(glades:
 	unsigned int slot = batcher.maxBatchSize;
 	for (unsigned int i = 0u; i < batcher.maxBatchSize; ++i)
 	{
-		if (batcher.inUse[i] == 0u)
+		if (batcher.slotFree(i))
 		{
 			slot = i;
 			break;
@@ -1379,37 +1379,14 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherSubmit(glades:
 	if (wantMaxLen > batcher.maxSeqLen)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherSubmit: request maxSeqLen exceeds batcher maxSeqLen");
 
-	// Install request payload (owned copy).
-	batcher.req[slot] = request;
-	batcher.results[slot] = TransformerGenerateResult();
-	if (request.cfg.includePromptInOutput)
-		batcher.results[slot].tokens = request.promptTokens;
-
-	batcher.inUse[slot] = 1u;
-	batcher.done[slot] = 0u;
-	batcher.promptPos[slot] = 0u;
-	batcher.promptLen[slot] = promptLen;
-	batcher.generated[slot] = 0u;
-	batcher.reqMaxNew[slot] = maxNew;
-	batcher.reqMaxLen[slot] = wantMaxLen;
-
-	// Reset KV position for this slot (old KV contents are unreachable past curLen).
-	if (slot < batcher.session.curLen.size())
-		batcher.session.curLen[slot] = 0u;
+	// Install request payload and transition the slot into PREFILL state.
+	batcher.installSlotRequest(slot, request, promptLen, maxNew, wantMaxLen);
 
 	// Reset per-slot RNG override.
-	batcher.hasOverride[slot] = 0u;
 	if (request.cfg.rngSeedOverride != 0ULL)
 	{
 		glades::rng::seed_engine(batcher.overrideEngines[slot], request.cfg.rngSeedOverride);
 		batcher.hasOverride[slot] = 1u;
-	}
-
-	// Reset logits row.
-	{
-		float* row = batcher.prevLogitsFlat.empty() ? NULL : &batcher.prevLogitsFlat[static_cast<size_t>(slot) * static_cast<size_t>(vocab)];
-		if (row)
-			std::fill(row, row + vocab, 0.0f);
 	}
 
 	outSlot = slot;
@@ -1464,26 +1441,8 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherRemove(glades:
 		}
 	}
 
-	// Release slot state.
-	batcher.inUse[slot] = 0u;
-	batcher.done[slot] = 0u;
-	batcher.promptPos[slot] = 0u;
-	batcher.promptLen[slot] = 0u;
-	batcher.generated[slot] = 0u;
-	batcher.reqMaxNew[slot] = 0u;
-	batcher.reqMaxLen[slot] = 0u;
-	if (slot < batcher.session.curLen.size())
-		batcher.session.curLen[slot] = 0u;
-	batcher.hasOverride[slot] = 0u;
-	batcher.req[slot] = TransformerServeRequest();
-	batcher.results[slot] = TransformerGenerateResult();
-
-	// Clear logits row for hygiene.
-	if (!batcher.prevLogitsFlat.empty() && batcher.vocab > 0u)
-	{
-		float* row = &batcher.prevLogitsFlat[static_cast<size_t>(slot) * static_cast<size_t>(batcher.vocab)];
-		std::fill(row, row + batcher.vocab, 0.0f);
-	}
+	// Release the slot back to FREE state.
+	batcher.clearSlotState(slot);
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
@@ -1498,12 +1457,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherCancelSlot(gla
 	if (batcher.inUse[slot] == 0u)
 		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "transformerLmServeBatcherCancelSlot: slot not in use");
 
-	TransformerGenerateResult& rr = batcher.results[slot];
-	rr.stoppedByCallback = true;
-	rr.stoppedOnEos = false;
-	rr.stoppedByStopToken = false;
-	rr.stoppedByLimit = false;
-	batcher.done[slot] = 1u;
+	batcher.markSlotStoppedByCallback(slot);
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
@@ -1527,43 +1481,39 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 	{
 		for (unsigned int s = 0u; s < B; ++s)
 		{
-			if (batcher.inUse[s] != 0u && batcher.done[s] == 0u)
-			{
-				batcher.results[s].stoppedByCallback = true;
-				batcher.done[s] = 1u;
-			}
+			if (batcher.slotInUse(s) && !batcher.slotDone(s))
+				batcher.markSlotStoppedByCallback(s);
 		}
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 	}
 
-	// Build one append step across the whole batch.
+	// Persistent slot lifecycle is FREE -> PREFILL -> DECODE -> DONE -> FREE.
+	// This loop only plans the transient work for the current append step.
 	unsigned int activeCount = 0u;
 	for (unsigned int s = 0u; s < B; ++s)
 	{
 		batcher.active[s] = 0u;
 		batcher.sampledIsValid[s] = 0u;
 
-		if (batcher.inUse[s] == 0u || batcher.done[s] != 0u)
+		const TransformerServeBatcher::SlotLifecycle lifecycle = batcher.slotLifecycle(s);
+		if (lifecycle == TransformerServeBatcher::SLOT_FREE ||
+		    lifecycle == TransformerServeBatcher::SLOT_DONE)
 			continue;
 
-		const unsigned int curLen = (s < batcher.session.curLen.size()) ? batcher.session.curLen[s] : 0u;
-		if (curLen >= batcher.reqMaxLen[s])
+		if (batcher.slotReachedMaxLen(s))
 		{
-			batcher.results[s].stoppedByLimit = true;
-			batcher.done[s] = 1u;
+			batcher.markSlotStoppedByLimit(s);
 			continue;
 		}
 
-		// Prefill: append prompt tokens until promptPos == promptLen.
-		if (batcher.promptPos[s] < batcher.promptLen[s])
+		if (lifecycle == TransformerServeBatcher::SLOT_PREFILL)
 		{
 			const unsigned int p = batcher.promptPos[s];
 			const std::vector<unsigned int>& pt = batcher.req[s].promptTokens;
 			if (p >= pt.size())
 			{
 				// Defensive: promptLen/promptPos mismatch.
-				batcher.results[s].stoppedByCallback = true;
-				batcher.done[s] = 1u;
+				batcher.markSlotStoppedByCallback(s);
 				continue;
 			}
 			batcher.tokenIds[s] = pt[p];
@@ -1572,17 +1522,15 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 			continue;
 		}
 
-		// Decode: stop checks and sampling.
+		// Decode-ready slot: apply stop checks and then sample the next token.
 		if (batcher.generated[s] >= batcher.reqMaxNew[s])
 		{
-			batcher.results[s].stoppedByLimit = true;
-			batcher.done[s] = 1u;
+			batcher.markSlotStoppedByLimit(s);
 			continue;
 		}
 		if (cb && cb->shouldStopRequest(*this, s))
 		{
-			batcher.results[s].stoppedByCallback = true;
-			batcher.done[s] = 1u;
+			batcher.markSlotStoppedByCallback(s);
 			continue;
 		}
 
@@ -1625,23 +1573,19 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 	// Emit decode tokens and advance prompt cursors.
 	for (unsigned int s = 0u; s < B; ++s)
 	{
-		if (batcher.active[s] == 0u || batcher.inUse[s] == 0u || batcher.done[s] != 0u)
+		if (batcher.active[s] == 0u || batcher.slotFree(s) || batcher.slotDone(s))
 			continue;
 
-		// Prefill path.
+		// Prefill path: advance toward DECODE, or stop immediately if maxNewTokens==0.
 		if (batcher.sampledIsValid[s] == 0u)
 		{
 			++batcher.promptPos[s];
-			// If prompt just completed and no decode requested, stop now.
 			if (batcher.promptPos[s] >= batcher.promptLen[s] && batcher.reqMaxNew[s] == 0u)
-			{
-				batcher.results[s].stoppedByLimit = true;
-				batcher.done[s] = 1u;
-			}
+				batcher.markSlotStoppedByLimit(s);
 			continue;
 		}
 
-		// Decode path (token already appended to KV in this step).
+		// Decode path: the token was already appended to KV in this step.
 		const unsigned int tok = batcher.sampledTok[s];
 		TransformerGenerateResult& rr = batcher.results[s];
 		rr.tokens.push_back(tok);
@@ -1655,8 +1599,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 			const bool stopReq = cb->onToken(*this, s, tok, genIdx);
 			if (stopReq)
 			{
-				rr.stoppedByCallback = true;
-				batcher.done[s] = 1u;
+				batcher.markSlotStoppedByCallback(s);
 				continue;
 			}
 		}
@@ -1673,11 +1616,7 @@ glades::NNetworkStatus glades::NNetwork::transformerLmServeBatcherStep(glades::N
 
 		// Per-request max token limit.
 		if (batcher.generated[s] >= batcher.reqMaxNew[s])
-		{
-			rr.stoppedByLimit = true;
-			batcher.done[s] = 1u;
-			continue;
-		}
+			batcher.markSlotStoppedByLimit(s);
 	}
 
 	return NNetworkStatus(NNetworkStatus::OK, std::string());

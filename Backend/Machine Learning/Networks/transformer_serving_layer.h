@@ -252,6 +252,18 @@ private:
 		}
 	};
 
+	struct DeferredCancelCheck
+	{
+		unsigned int slot;
+		uint64_t requestId;
+		CallbackHandle cb;
+		DeferredCancelCheck() : slot(0u), requestId(0ULL), cb() {}
+		DeferredCancelCheck(unsigned int newSlot, uint64_t newRequestId, const CallbackHandle& newCb)
+		    : slot(newSlot), requestId(newRequestId), cb(newCb)
+		{
+		}
+	};
+
 	// Adapter used by NNetwork::transformerLmServeBatcherStep.
 	class BatcherCallbacks : public ITransformerServeCallbacks
 	{
@@ -276,6 +288,15 @@ private:
 	unsigned int countActiveSlots_() const;
 	bool findFreeSlot_(unsigned int& outSlot) const;
 	void admitPending_();
+	void applyBatcherResult_(RequestSnapshot& snap, const NNetwork::TransformerGenerateResult& rr) const;
+	void markSnapshotStoppedByCallback_(RequestSnapshot& snap, const NNetworkStatus* terminalStatus) const;
+	void clearLiveSlot_(unsigned int slot);
+	void collectDeferredCancelChecks_(std::vector<DeferredCancelCheck>& out) const;
+	void applyDeferredCancelDecisions_(const std::vector<unsigned int>& cancelSlots,
+	                                  const std::vector<uint64_t>& exceptionIds);
+	void markLiveRequestsFailed_(const NNetworkStatus& st);
+	void applyTokenCallbackStops_(const std::vector<uint64_t>& stopIds,
+	                             const std::vector<uint64_t>& exceptionIds);
 	void updateSnapshotsFromBatcher_();
 	void finalizeDoneSlots_();
 	void finalizeSnapshotForShutdown_(uint64_t requestId, const NNetworkStatus* terminalStatus);

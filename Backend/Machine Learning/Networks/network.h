@@ -2107,11 +2107,23 @@ public:
 	struct TransformerServeBatcher
 	{
 	public:
+		enum SlotLifecycle
+		{
+			SLOT_FREE = 0,
+			SLOT_PREFILL,
+			SLOT_DECODE,
+			SLOT_DONE
+		};
+
 		bool isInitialized() const { return initialized; }
 		unsigned int capacity() const { return maxBatchSize; }
+		bool slotFree(unsigned int slot) const
+		{
+			return slot < inUse.size() && inUse[slot] == 0u;
+		}
 		bool slotInUse(unsigned int slot) const
 		{
-			return slot < inUse.size() && inUse[slot] != 0u;
+			return !slotFree(slot);
 		}
 		bool slotDone(unsigned int slot) const
 		{
@@ -2128,6 +2140,22 @@ public:
 			       slot < generated.size() &&
 			       slot < reqMaxNew.size() &&
 			       generated[slot] < reqMaxNew[slot];
+		}
+		unsigned int slotCurrentLen(unsigned int slot) const
+		{
+			return slot < session.curLen.size() ? session.curLen[slot] : 0u;
+		}
+		bool slotReachedMaxLen(unsigned int slot) const
+		{
+			return slot < reqMaxLen.size() && slotCurrentLen(slot) >= reqMaxLen[slot];
+		}
+		SlotLifecycle slotLifecycle(unsigned int slot) const
+		{
+			if (slotFree(slot))
+				return SLOT_FREE;
+			if (slotDone(slot))
+				return SLOT_DONE;
+			return slotInPrefill(slot) ? SLOT_PREFILL : SLOT_DECODE;
 		}
 		const TransformerGenerateResult* slotResult(unsigned int slot) const
 		{
@@ -2198,6 +2226,105 @@ public:
 
 	private:
 		friend class NNetwork;
+
+		void zeroLogitsRow(unsigned int slot)
+		{
+			if (slot >= maxBatchSize || vocab == 0u)
+				return;
+			const size_t offset = static_cast<size_t>(slot) * static_cast<size_t>(vocab);
+			if (!prevLogitsFlat.empty())
+			{
+				float* row = &prevLogitsFlat[offset];
+				std::fill(row, row + vocab, 0.0f);
+			}
+			if (!logitsFlat.empty())
+			{
+				float* row = &logitsFlat[offset];
+				std::fill(row, row + vocab, 0.0f);
+			}
+		}
+
+		void installSlotRequest(unsigned int slot,
+		                       const TransformerServeRequest& newReq,
+		                       unsigned int newPromptLen,
+		                       unsigned int newMaxNew,
+		                       unsigned int newMaxLen)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			req[slot] = newReq;
+			results[slot] = TransformerGenerateResult();
+			if (newReq.cfg.includePromptInOutput)
+				results[slot].tokens = newReq.promptTokens;
+			inUse[slot] = 1u;
+			done[slot] = 0u;
+			promptPos[slot] = 0u;
+			promptLen[slot] = newPromptLen;
+			generated[slot] = 0u;
+			reqMaxNew[slot] = newMaxNew;
+			reqMaxLen[slot] = newMaxLen;
+			if (slot < session.curLen.size())
+				session.curLen[slot] = 0u;
+			hasOverride[slot] = 0u;
+			if (slot < tokenIds.size())
+				tokenIds[slot] = 0u;
+			if (slot < active.size())
+				active[slot] = 0u;
+			if (slot < sampledTok.size())
+				sampledTok[slot] = 0u;
+			if (slot < sampledIsValid.size())
+				sampledIsValid[slot] = 0u;
+			zeroLogitsRow(slot);
+		}
+
+		void clearSlotState(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			inUse[slot] = 0u;
+			done[slot] = 0u;
+			promptPos[slot] = 0u;
+			promptLen[slot] = 0u;
+			generated[slot] = 0u;
+			reqMaxNew[slot] = 0u;
+			reqMaxLen[slot] = 0u;
+			if (slot < session.curLen.size())
+				session.curLen[slot] = 0u;
+			hasOverride[slot] = 0u;
+			req[slot] = TransformerServeRequest();
+			results[slot] = TransformerGenerateResult();
+			if (slot < tokenIds.size())
+				tokenIds[slot] = 0u;
+			if (slot < active.size())
+				active[slot] = 0u;
+			if (slot < sampledTok.size())
+				sampledTok[slot] = 0u;
+			if (slot < sampledIsValid.size())
+				sampledIsValid[slot] = 0u;
+			zeroLogitsRow(slot);
+		}
+
+		void markSlotStoppedByLimit(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			results[slot].stoppedByCallback = false;
+			results[slot].stoppedOnEos = false;
+			results[slot].stoppedByStopToken = false;
+			results[slot].stoppedByLimit = true;
+			done[slot] = 1u;
+		}
+
+		void markSlotStoppedByCallback(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			results[slot].stoppedByCallback = true;
+			results[slot].stoppedOnEos = false;
+			results[slot].stoppedByStopToken = false;
+			results[slot].stoppedByLimit = false;
+			done[slot] = 1u;
+		}
 
 		bool initialized;
 		unsigned int vocab;
