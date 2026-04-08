@@ -47,25 +47,71 @@ struct IdxMinHeapByLogit
 	}
 };
 
-// Sample a token id from logits under (temperature, topK, topP).
-// Scratch buffers are provided to avoid per-step allocations.
-inline bool sample_token_from_logits_ptr(const float* logits,
-                                         glades::rng::Engine& rng,
-                                         unsigned int vocab,
-                                         float temperature,
-                                         unsigned int topK,
-                                         float topP,
-                                         unsigned int topPTopKCap,
-                                         unsigned int& outToken,
-                                         std::vector<unsigned int>& idxScratch,
-                                         std::vector<float>& weightScratch)
+struct SamplingPlan
 {
+	unsigned int vocab;
+	float invTemp;
+	unsigned int topK;
+	float topP;
+	bool greedy;
+	bool useFullVocabFastPath;
+
+	SamplingPlan()
+	    : vocab(0u),
+	      invTemp(1.0f),
+	      topK(0u),
+	      topP(1.0f),
+	      greedy(false),
+	      useFullVocabFastPath(false)
+	{
+	}
+};
+
+inline SamplingPlan make_sampling_plan(unsigned int vocab,
+                                      float temperature,
+                                      unsigned int topK,
+                                      float topP,
+                                      unsigned int topPTopKCap)
+{
+	SamplingPlan plan;
+	plan.vocab = vocab;
+	plan.greedy = (temperature <= 0.0f);
+	if (plan.greedy)
+		return plan;
+
+	if (!std::isfinite(temperature) || temperature <= 0.0f)
+		temperature = 1.0f;
+	if (!std::isfinite(topP) || topP <= 0.0f || topP > 1.0f)
+		topP = 1.0f;
+	if (topK > vocab)
+		topK = vocab;
+	if (topP < 1.0f && topK == 0u && topPTopKCap > 0u)
+		topK = std::min(vocab, topPTopKCap);
+
+	plan.invTemp = 1.0f / temperature;
+	plan.topK = topK;
+	plan.topP = topP;
+	plan.useFullVocabFastPath = (topK == 0u && topP >= 1.0f);
+	return plan;
+}
+
+inline bool sample_token_from_logits_ptr_plan(const float* logits,
+                                              glades::rng::Engine& rng,
+                                              const SamplingPlan& plan,
+                                              unsigned int& outToken,
+                                              std::vector<unsigned int>& idxScratch,
+                                              std::vector<float>& weightScratch)
+{
+	const unsigned int vocab = plan.vocab;
+	const float invTemp = plan.invTemp;
+	const unsigned int topK = plan.topK;
+	const float topP = plan.topP;
+
 	outToken = 0u;
 	if (!logits || vocab == 0u)
 		return false;
 
-	// Greedy path.
-	if (temperature <= 0.0f)
+	if (plan.greedy)
 	{
 		unsigned int bestIdx = 0u;
 		float best = logits[0];
@@ -82,27 +128,7 @@ inline bool sample_token_from_logits_ptr(const float* logits,
 		return true;
 	}
 
-	// Validate / sanitize sampling knobs.
-	if (!std::isfinite(temperature) || temperature <= 0.0f)
-		temperature = 1.0f;
-	if (!std::isfinite(topP) || topP <= 0.0f || topP > 1.0f)
-		topP = 1.0f;
-	if (topK > vocab)
-		topK = vocab;
-
-	const float invTemp = 1.0f / temperature;
-
-	// Fast-by-design policy (explicit and configurable):
-	// If nucleus sampling is enabled (topP < 1) and the caller didn't provide an explicit topK,
-	// we can cap candidate selection to the top-K logits before applying top-p.
-	//
-	// This makes sampling much faster for large vocabularies, but it is an approximation.
-	// Set topPTopKCap==0 to disable and run "pure" top-p over the full vocabulary.
-	if (topP < 1.0f && topK == 0u && topPTopKCap > 0u)
-		topK = std::min(vocab, topPTopKCap);
-
-	// Fast path: full-vocab temperature sampling (no topK, no topP) in two passes, no sorting.
-	if (topK == 0u && topP >= 1.0f)
+	if (plan.useFullVocabFastPath)
 	{
 		float maxScaled = logits[0] * invTemp;
 		for (unsigned int i = 1u; i < vocab; ++i)
@@ -135,15 +161,10 @@ inline bool sample_token_from_logits_ptr(const float* logits,
 				return true;
 			}
 		}
-		// Numerical edge case:
-		// `sum` is accumulated in double from `w` but `acc` is accumulated from float-truncated weights.
-		// In rare cases, `acc` may end slightly below `sum` and the sample falls through.
-		// Production policy: always return a valid token.
 		outToken = vocab - 1u;
 		return true;
 	}
 
-	// Candidate selection:
 	unsigned int candN = vocab;
 	if (topK > 0u && topK < vocab)
 	{
@@ -185,7 +206,6 @@ inline bool sample_token_from_logits_ptr(const float* logits,
 			std::sort(idxScratch.begin(), idxScratch.end(), IdxGreaterByLogit(logits));
 	}
 
-	// Softmax over candidates (stable) and sample.
 	if (weightScratch.size() < candN)
 		weightScratch.resize(candN);
 
@@ -249,9 +269,25 @@ inline bool sample_token_from_logits_ptr(const float* logits,
 			return true;
 		}
 	}
-	// Same fall-through defense as the full-vocab fast path.
 	outToken = idxScratch[keepN - 1u];
 	return true;
+}
+
+// Sample a token id from logits under (temperature, topK, topP).
+// Scratch buffers are provided to avoid per-step allocations.
+inline bool sample_token_from_logits_ptr(const float* logits,
+                                         glades::rng::Engine& rng,
+                                         unsigned int vocab,
+                                         float temperature,
+                                         unsigned int topK,
+                                         float topP,
+                                         unsigned int topPTopKCap,
+                                         unsigned int& outToken,
+                                         std::vector<unsigned int>& idxScratch,
+                                         std::vector<float>& weightScratch)
+{
+	const SamplingPlan plan = make_sampling_plan(vocab, temperature, topK, topP, topPTopKCap);
+	return sample_token_from_logits_ptr_plan(logits, rng, plan, outToken, idxScratch, weightScratch);
 }
 
 } // namespace sampling

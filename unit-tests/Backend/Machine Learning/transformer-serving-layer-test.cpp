@@ -253,6 +253,41 @@ static void assert_all_tokens_in_range(const std::vector<unsigned int>& toks, un
 		ASSERT("==============ServingLayer: token out of range Failed==============", toks[i] < vocab);
 }
 
+static glades::TransformerServingLayer::Config make_layer_cfg(unsigned int maxBatchSize,
+                                                              unsigned int maxSeqLen,
+                                                              bool enableLogs)
+{
+	glades::TransformerServingLayer::Config cfg;
+	cfg.maxBatchSize = maxBatchSize;
+	cfg.maxSeqLen = maxSeqLen;
+	cfg.enableLogs = enableLogs;
+	return cfg;
+}
+
+static void step_prefill(glades::TransformerServingLayer& layer,
+                         unsigned int promptLen,
+                         const char* stepMsg)
+{
+	for (unsigned int t = 0u; t < promptLen; ++t)
+		ASSERT(stepMsg, layer.step().ok());
+}
+
+static void step_until_done(glades::TransformerServingLayer& layer,
+                            uint64_t requestId,
+                            unsigned int maxSpins,
+                            const char* stepMsg,
+                            const char* snapshotMsg,
+                            glades::TransformerServingLayer::RequestSnapshot& outSnap)
+{
+	for (unsigned int spins = 0u; spins < maxSpins; ++spins)
+	{
+		ASSERT(stepMsg, layer.step().ok());
+		ASSERT(snapshotMsg, layer.getSnapshot(requestId, outSnap));
+		if (outSnap.done)
+			break;
+	}
+}
+
 class StopLayerOnTokenCallback : public glades::ITransformerServingCallbacks
 {
 public:
@@ -390,12 +425,12 @@ private:
 	unsigned int onTokenCalls_;
 };
 
-class ReentrantStepCallback : public glades::ITransformerServingCallbacks
-{
+	class ReentrantStepCallback : public glades::ITransformerServingCallbacks
+	{
 public:
 	explicit ReentrantStepCallback(glades::TransformerServingLayer& layer)
-	    : layer_(layer),
-	      reentrantStatus(glades::NNetworkStatus::OK, std::string()),
+	    : reentrantStatus(glades::NNetworkStatus::OK, std::string()),
+	      layer_(layer),
 	      calls_(0u)
 	{
 	}
@@ -444,9 +479,7 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 0u;
-		cfg.maxSeqLen = 16u;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(0u, 16u, false);
 		const glades::NNetworkStatus st = layer.start(*m.net, cfg);
 		ASSERT("==============ServingLayer: StartRejectsZeroBatch Failed==============", !st.ok());
 		ASSERT("==============ServingLayer: NotRunningAfterFailedStart Failed==============", !layer.isRunning());
@@ -457,14 +490,11 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 2u;
-		cfg.maxSeqLen = 16u;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(2u, 16u, false);
 		cfg.maxPendingRequests = 2u;
 		cfg.wipeKvOnRemove = false;
 		cfg.rngSeed = 123u;
 		cfg.autoRemoveFinished = true;
-		cfg.enableLogs = false;
 		ASSERT("==============ServingLayer: StartOK Failed==============", layer.start(*m.net, cfg).ok());
 
 		uint64_t id0 = 0, id1 = 0, id2 = 0;
@@ -488,11 +518,8 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 1u;
-		cfg.maxSeqLen = 16u;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 		cfg.maxPendingRequests = 8u;
-		cfg.enableLogs = false;
 		ASSERT("==============ServingLayer: StartOK2 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> prompt;
@@ -516,10 +543,7 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 1u;
-		cfg.maxSeqLen = 16u;
-		cfg.enableLogs = false;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 		ASSERT("==============ServingLayer: StartOK3 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> prompt;
@@ -583,10 +607,7 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 1u;
-		cfg.maxSeqLen = 16u;
-		cfg.enableLogs = false;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 		ASSERT("==============ServingLayer: StartOK4 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> prompt;
@@ -631,10 +652,7 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 1u;
-		cfg.maxSeqLen = 16u;
-		cfg.enableLogs = false;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 		ASSERT("==============ServingLayer: StartOK5 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> prompt;
@@ -679,10 +697,7 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 1u;
-		cfg.maxSeqLen = 16u;
-		cfg.enableLogs = false;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 		ASSERT("==============ServingLayer: StartOK6 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> prompt;
@@ -696,8 +711,8 @@ void TransformerServingLayerUnitTest()
 		ASSERT("==============ServingLayer: SubmitStopFromCallback Failed==============",
 		       layer.submit(make_req(prompt, 2u, false, 11u, 1u), id, cb).ok());
 
-		for (unsigned int t = 0u; t < prompt.size(); ++t)
-			ASSERT("==============ServingLayer: StepPrefillCallbackStop Failed==============", layer.step().ok());
+			step_prefill(layer, static_cast<unsigned int>(prompt.size()),
+			            "==============ServingLayer: StepPrefillCallbackStop Failed==============");
 
 		ASSERT("==============ServingLayer: StepDecodeCallbackStop Failed==============", layer.step().ok());
 			ASSERT("==============ServingLayer: CallbackInvoked Failed==============", raw->calls() == 1u);
@@ -716,10 +731,7 @@ void TransformerServingLayerUnitTest()
 	// --------
 	{
 		glades::TransformerServingLayer layer;
-		glades::TransformerServingLayer::Config cfg;
-		cfg.maxBatchSize = 1u;
-		cfg.maxSeqLen = 16u;
-		cfg.enableLogs = false;
+		glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 		ASSERT("==============ServingLayer: StartOK7 Failed==============", layer.start(*m.net, cfg).ok());
 
 		std::vector<unsigned int> badPrompt;
@@ -742,10 +754,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK8a Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -769,10 +778,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK8b Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -786,8 +792,8 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: SubmitProbeCallback Failed==============",
 			       layer.submit(make_req(prompt, 2u, false, 22u, 1u), id, cb).ok());
 
-			for (unsigned int t = 0u; t < prompt.size(); ++t)
-				ASSERT("==============ServingLayer: StepProbePrefill Failed==============", layer.step().ok());
+			step_prefill(layer, static_cast<unsigned int>(prompt.size()),
+			            "==============ServingLayer: StepProbePrefill Failed==============");
 
 			ASSERT("==============ServingLayer: StepProbeDecode Failed==============", layer.step().ok());
 			raw->releaseThread();
@@ -802,10 +808,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK8c Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -820,8 +823,8 @@ void TransformerServingLayerUnitTest()
 			       layer.submit(make_req(prompt, 3u, false, 23u, 1u), id, cb).ok());
 			cb = glades::TransformerServingLayer::CallbackHandle();
 
-			for (unsigned int t = 0u; t < prompt.size(); ++t)
-				ASSERT("==============ServingLayer: StepOwnershipRetentionPrefill Failed==============", layer.step().ok());
+			step_prefill(layer, static_cast<unsigned int>(prompt.size()),
+			            "==============ServingLayer: StepOwnershipRetentionPrefill Failed==============");
 
 			ASSERT("==============ServingLayer: StepOwnershipRetentionDecode Failed==============", layer.step().ok());
 			ASSERT("==============ServingLayer: OwnershipRetentionCallbackCalls Failed==============", raw->shouldCancelCalls() == 1u);
@@ -833,10 +836,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK9 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -845,16 +845,11 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: SubmitShort Failed==============", layer.submit(make_req(prompt, 0u, false, 0u, 1u), id).ok());
 
 		// With maxNewTokens=0, it should stop by limit right after prompt completes (no decode).
-		for (unsigned int spins = 0u; spins < 8u; ++spins)
-		{
-			ASSERT("==============ServingLayer: StepShort Failed==============", layer.step().ok());
-			glades::TransformerServingLayer::RequestSnapshot snap;
-			ASSERT("==============ServingLayer: SnapshotShort Failed==============", layer.getSnapshot(id, snap));
-			if (snap.done)
-				break;
-		}
-
 		glades::TransformerServingLayer::RequestSnapshot snap;
+		step_until_done(layer, id, 8u,
+		                "==============ServingLayer: StepShort Failed==============",
+		                "==============ServingLayer: SnapshotShort Failed==============",
+		                snap);
 		ASSERT("==============ServingLayer: SnapshotShortFinal Failed==============", layer.getSnapshot(id, snap));
 		ASSERT("==============ServingLayer: ShortDone Failed==============", snap.done);
 		ASSERT("==============ServingLayer: ClearSnapshotOK Failed==============", layer.clearSnapshot(id));
@@ -869,10 +864,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK9 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -902,10 +894,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK10 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -919,8 +908,8 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: SubmitShouldCancel Failed==============",
 			       layer.submit(make_req(prompt, 3u, false, 101u, 1u), id, cb).ok());
 
-			for (unsigned int t = 0u; t < prompt.size(); ++t)
-				ASSERT("==============ServingLayer: StepShouldCancelPrefill Failed==============", layer.step().ok());
+			step_prefill(layer, static_cast<unsigned int>(prompt.size()),
+			            "==============ServingLayer: StepShouldCancelPrefill Failed==============");
 
 			ASSERT("==============ServingLayer: StepShouldCancelDecode Failed==============", layer.step().ok());
 
@@ -939,10 +928,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK11 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -956,8 +942,8 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: SubmitShouldCancelThrow Failed==============",
 			       layer.submit(make_req(prompt, 2u, false, 202u, 1u), id, cb).ok());
 
-			for (unsigned int t = 0u; t < prompt.size(); ++t)
-				ASSERT("==============ServingLayer: StepShouldCancelThrowPrefill Failed==============", layer.step().ok());
+			step_prefill(layer, static_cast<unsigned int>(prompt.size()),
+			            "==============ServingLayer: StepShouldCancelThrowPrefill Failed==============");
 
 			ASSERT("==============ServingLayer: StepShouldCancelThrowDecode Failed==============", layer.step().ok());
 
@@ -975,10 +961,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK12 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -992,8 +975,8 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: SubmitReentrant Failed==============",
 			       layer.submit(make_req(prompt, 2u, false, 303u, 1u), id, cb).ok());
 
-			for (unsigned int t = 0u; t < prompt.size(); ++t)
-				ASSERT("==============ServingLayer: StepReentrantPrefill Failed==============", layer.step().ok());
+			step_prefill(layer, static_cast<unsigned int>(prompt.size()),
+			            "==============ServingLayer: StepReentrantPrefill Failed==============");
 
 			ASSERT("==============ServingLayer: StepReentrantDecode Failed==============", layer.step().ok());
 			ASSERT("==============ServingLayer: ReentrantCallbackInvoked Failed==============", raw->calls() == 1u);
@@ -1006,10 +989,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK13 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -1039,10 +1019,7 @@ void TransformerServingLayerUnitTest()
 		// --------
 		{
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = false;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
 			ASSERT("==============ServingLayer: StartOK14 Failed==============", layer.start(*m.net, cfg).ok());
 
 			std::vector<unsigned int> prompt;
@@ -1050,14 +1027,11 @@ void TransformerServingLayerUnitTest()
 			uint64_t id = 0;
 			ASSERT("==============ServingLayer: SubmitDoneCancel Failed==============", layer.submit(make_req(prompt, 0u, false, 505u, 1u), id).ok());
 
-			for (unsigned int spins = 0u; spins < 8u; ++spins)
-			{
-				ASSERT("==============ServingLayer: StepDoneCancel Failed==============", layer.step().ok());
-				glades::TransformerServingLayer::RequestSnapshot snap;
-				ASSERT("==============ServingLayer: SnapshotDoneCancel Failed==============", layer.getSnapshot(id, snap));
-				if (snap.done)
-					break;
-			}
+			glades::TransformerServingLayer::RequestSnapshot snap;
+			step_until_done(layer, id, 8u,
+			                "==============ServingLayer: StepDoneCancel Failed==============",
+			                "==============ServingLayer: SnapshotDoneCancel Failed==============",
+			                snap);
 
 			ASSERT("==============ServingLayer: CancelDoneReturnsTrue Failed==============", layer.cancel(id));
 			ASSERT("==============ServingLayer: CancelMissingReturnsFalse Failed==============", !layer.cancel(999999ULL));
@@ -1075,10 +1049,7 @@ void TransformerServingLayerUnitTest()
 			m.net->setLogger(&logger);
 
 			glades::TransformerServingLayer layer;
-			glades::TransformerServingLayer::Config cfg;
-			cfg.maxBatchSize = 1u;
-			cfg.maxSeqLen = 16u;
-			cfg.enableLogs = true;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, true);
 			ASSERT("==============ServingLayer: LoggerOverrideAttached Failed==============", m.net->getLogger() == &logger);
 			ASSERT("==============ServingLayer: StartOK15 Failed==============", layer.start(*m.net, cfg).ok());
 

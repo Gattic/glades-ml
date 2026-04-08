@@ -3950,32 +3950,57 @@ void NNTransformerUnitTest()
 			}
 		};
 
+		struct ServeBatchCaseBuilder
+		{
+			static glades::NNetwork::TransformerGenerateConfig makeCfg(bool includePromptInOutput,
+			                                                          unsigned int maxNewTokens,
+			                                                          float temperature,
+			                                                          unsigned int topK,
+			                                                          float topP,
+			                                                          uint64_t rngSeedOverride)
+			{
+				glades::NNetwork::TransformerGenerateConfig cfg;
+				cfg.includePromptInOutput = includePromptInOutput;
+				cfg.maxNewTokens = maxNewTokens;
+				cfg.maxSeqLen = 0u;
+				cfg.temperature = temperature;
+				cfg.topK = topK;
+				cfg.topP = topP;
+				cfg.eosTokenId = -1;
+				cfg.stopOnEos = false;
+				cfg.rngSeedOverride = rngSeedOverride;
+				return cfg;
+			}
+
+			static glades::NNetwork::TransformerServeRequest makeRequest(const std::vector<unsigned int>& prompt,
+			                                                           const glades::NNetwork::TransformerGenerateConfig& cfg)
+			{
+				glades::NNetwork::TransformerServeRequest req;
+				req.promptTokens = prompt;
+				req.cfg = cfg;
+				return req;
+			}
+		};
+
 			// Case A: ragged prompts + per-request RNG overrides => batch == per-request generate exactly.
 			{
 				const glades::TransformerPublicAPI::Runtime api = glades::TransformerPublicAPI::runtime(net);
-				glades::NNetwork::TransformerGenerateConfig cfgA;
-				cfgA.includePromptInOutput = true;
-			cfgA.maxNewTokens = 6u;
-			cfgA.maxSeqLen = 0u; // promptLen + maxNewTokens
-			cfgA.temperature = 1.0f;
-			cfgA.topK = 0u;
-			cfgA.topP = 1.0f;
-			cfgA.eosTokenId = -1;
-			cfgA.stopOnEos = false;
+				glades::NNetwork::TransformerGenerateConfig cfgA =
+				    ServeBatchCaseBuilder::makeCfg(true, 6u, 1.0f, 0u, 1.0f, 111ULL);
+				glades::NNetwork::TransformerGenerateConfig cfgA2 = cfgA;
+				cfgA2.rngSeedOverride = 222ULL;
 
-			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
-			reqs.resize(2);
-			reqs[0].promptTokens.clear(); // len 2
-			reqs[0].promptTokens.push_back(0u);
-			reqs[0].promptTokens.push_back(1u);
-			reqs[1].promptTokens.clear(); // len 3
-			reqs[1].promptTokens.push_back(2u);
-			reqs[1].promptTokens.push_back(3u);
-			reqs[1].promptTokens.push_back(4u);
-			reqs[0].cfg = cfgA;
-			reqs[1].cfg = cfgA;
-			reqs[0].cfg.rngSeedOverride = 111ULL;
-			reqs[1].cfg.rngSeedOverride = 222ULL;
+				std::vector<unsigned int> prompt0;
+				prompt0.push_back(0u);
+				prompt0.push_back(1u);
+				std::vector<unsigned int> prompt1;
+				prompt1.push_back(2u);
+				prompt1.push_back(3u);
+				prompt1.push_back(4u);
+
+				std::vector<glades::NNetwork::TransformerServeRequest> reqs;
+				reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt0, cfgA));
+				reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt1, cfgA2));
 
 			glades::NNetwork::TransformerServeBatchResult outBatch;
 				G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseA BatchStatus Failed==============",
@@ -4023,33 +4048,25 @@ void NNTransformerUnitTest()
 
 		// Case B: stop tokens work per-request and do not affect other requests.
 		{
-			glades::NNetwork::TransformerGenerateConfig cfgB;
-			cfgB.includePromptInOutput = true;
-			cfgB.maxNewTokens = 10u;
-			cfgB.temperature = 0.0f; // greedy => always emits stopTok
-			cfgB.topK = 0u;
-			cfgB.topP = 1.0f;
-			cfgB.eosTokenId = -1;
-			cfgB.stopOnEos = false;
-			cfgB.rngSeedOverride = 999ULL; // irrelevant for greedy, but keep explicit
+			glades::NNetwork::TransformerGenerateConfig cfgB =
+			    ServeBatchCaseBuilder::makeCfg(true, 10u, 0.0f, 0u, 1.0f, 999ULL);
 
 			glades::NNetwork::TransformerGenerateConfig cfgC = cfgB;
 			cfgC.maxNewTokens = 3u;   // short request to ensure it runs past genIdx=0
 			cfgC.temperature = 1.0f; // stochastic (still deterministic via override)
 			cfgC.rngSeedOverride = 1234ULL;
 
+			std::vector<unsigned int> prompt0;
+			prompt0.push_back(1u);
+			std::vector<unsigned int> prompt1;
+			prompt1.push_back(2u);
+			prompt1.push_back(3u);
+
 			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
-			reqs.resize(2);
-			reqs[0].promptTokens.clear();
-			reqs[0].promptTokens.push_back(1u);
-			reqs[0].cfg = cfgB;
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt0, cfgB));
 			reqs[0].stopTokenIds.clear();
 			reqs[0].stopTokenIds.push_back(stopTok);
-
-			reqs[1].promptTokens.clear();
-			reqs[1].promptTokens.push_back(2u);
-			reqs[1].promptTokens.push_back(3u);
-			reqs[1].cfg = cfgC;
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt1, cfgC));
 
 			glades::NNetwork::TransformerServeBatchResult outBatch;
 			G_assert(__FILE__, __LINE__, "==============NN::ServeBatch CaseB BatchStatus Failed==============",
@@ -4084,25 +4101,19 @@ void NNTransformerUnitTest()
 				}
 			};
 
-			glades::NNetwork::TransformerGenerateConfig cfg;
-			cfg.includePromptInOutput = true;
-			cfg.maxNewTokens = 5u;
-			cfg.temperature = 1.0f;
-			cfg.topK = 0u;
-			cfg.topP = 1.0f;
-			cfg.eosTokenId = -1;
-			cfg.stopOnEos = false;
-			cfg.rngSeedOverride = 2026ULL;
+			glades::NNetwork::TransformerGenerateConfig cfg =
+			    ServeBatchCaseBuilder::makeCfg(true, 5u, 1.0f, 0u, 1.0f, 2026ULL);
+			glades::NNetwork::TransformerGenerateConfig cfg2 = cfg;
+			cfg2.rngSeedOverride = 2027ULL;
+
+			std::vector<unsigned int> prompt0;
+			prompt0.push_back(0u);
+			std::vector<unsigned int> prompt1;
+			prompt1.push_back(1u);
 
 			std::vector<glades::NNetwork::TransformerServeRequest> reqs;
-			reqs.resize(2);
-			reqs[0].promptTokens.clear();
-			reqs[0].promptTokens.push_back(0u);
-			reqs[1].promptTokens.clear();
-			reqs[1].promptTokens.push_back(1u);
-			reqs[0].cfg = cfg;
-			reqs[1].cfg = cfg;
-			reqs[1].cfg.rngSeedOverride = 2027ULL;
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt0, cfg));
+			reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt1, cfg2));
 
 			glades::NNetwork::TransformerServeBatchResult outBatch;
 			StopAfterOneCb cb;
@@ -4126,22 +4137,13 @@ void NNTransformerUnitTest()
 				EnvVarGuard cap("GLADES_TRANSFORMER_SERVE_MAX_BYTES");
 				cap.set("1");
 
-				glades::NNetwork::TransformerGenerateConfig cfg;
-				cfg.includePromptInOutput = false;
-				cfg.maxNewTokens = 1u;
-				cfg.maxSeqLen = 0u;
-				cfg.temperature = 1.0f;
-				cfg.topK = 1u;
-				cfg.topP = 1.0f;
-				cfg.eosTokenId = -1;
-				cfg.stopOnEos = false;
-				cfg.rngSeedOverride = 7ULL;
+				glades::NNetwork::TransformerGenerateConfig cfg =
+				    ServeBatchCaseBuilder::makeCfg(false, 1u, 1.0f, 1u, 1.0f, 7ULL);
 
+				std::vector<unsigned int> prompt;
+				prompt.push_back(1u);
 				std::vector<glades::NNetwork::TransformerServeRequest> reqs;
-				reqs.resize(1);
-				reqs[0].promptTokens.clear();
-				reqs[0].promptTokens.push_back(1u);
-				reqs[0].cfg = cfg;
+				reqs.push_back(ServeBatchCaseBuilder::makeRequest(prompt, cfg));
 
 				glades::NNetwork::TransformerServeBatchResult outBatch;
 				const glades::NNetworkStatus stBatch = net.transformerLmServeGenerateBatch(reqs, outBatch, NULL);

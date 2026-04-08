@@ -38,18 +38,6 @@ static void append_token_delta(std::vector<unsigned int>& dst, const std::vector
 	dst.insert(dst.end(), src.begin() + static_cast<std::ptrdiff_t>(from), src.end());
 }
 
-struct DeferredCancelCheck
-{
-	unsigned int slot;
-	uint64_t requestId;
-	glades::TransformerServingLayer::CallbackHandle cb;
-	DeferredCancelCheck() : slot(0u), requestId(0ULL), cb() {}
-	DeferredCancelCheck(unsigned int newSlot, uint64_t newRequestId, const glades::TransformerServingLayer::CallbackHandle& newCb)
-	    : slot(newSlot), requestId(newRequestId), cb(newCb)
-	{
-	}
-};
-
 } // namespace
 
 // ===== Internal synchronization (recursive mutex) =====
@@ -248,9 +236,7 @@ bool TransformerServingLayer::cancel(uint64_t requestId)
 	{
 		if (q->id == requestId)
 		{
-			it->second.done = true;
-			it->second.result.stoppedByCallback = true;
-			it->second.status = NNetworkStatus(NNetworkStatus::OK, std::string());
+			markSnapshotStoppedByCallback_(it->second, NULL);
 			completedCallbacks_[requestId] = q->cb;
 			pending_.erase(q);
 			logEvent("transformer_serving_cancel", requestId, "cancelled_pending");
@@ -395,15 +381,7 @@ void TransformerServingLayer::finalizeSnapshotForShutdown_(uint64_t requestId, c
 	std::map<uint64_t, RequestSnapshot>::iterator it = snapshots_.find(requestId);
 	if (it == snapshots_.end() || it->second.done)
 		return;
-	it->second.done = true;
-	it->second.result.stoppedByCallback = true;
-	it->second.result.stoppedOnEos = false;
-	it->second.result.stoppedByStopToken = false;
-	it->second.result.stoppedByLimit = false;
-	if (terminalStatus)
-		it->second.status = *terminalStatus;
-	else
-		it->second.status = NNetworkStatus(NNetworkStatus::OK, std::string());
+	markSnapshotStoppedByCallback_(it->second, terminalStatus);
 }
 
 unsigned int TransformerServingLayer::countActiveSlots_() const
@@ -429,6 +407,115 @@ bool TransformerServingLayer::findFreeSlot_(unsigned int& outSlot) const
 		}
 	}
 	return false;
+}
+
+void TransformerServingLayer::applyBatcherResult_(RequestSnapshot& snap,
+                                                  const NNetwork::TransformerGenerateResult& rr) const
+{
+	append_token_delta(snap.result.tokens, rr.tokens);
+	snap.result.lastToken = rr.lastToken;
+	snap.result.stoppedByCallback = rr.stoppedByCallback;
+	snap.result.stoppedOnEos = rr.stoppedOnEos;
+	snap.result.stoppedByStopToken = rr.stoppedByStopToken;
+	snap.result.stoppedByLimit = rr.stoppedByLimit;
+}
+
+void TransformerServingLayer::markSnapshotStoppedByCallback_(RequestSnapshot& snap,
+                                                             const NNetworkStatus* terminalStatus) const
+{
+	snap.done = true;
+	snap.result.stoppedByCallback = true;
+	snap.result.stoppedOnEos = false;
+	snap.result.stoppedByStopToken = false;
+	snap.result.stoppedByLimit = false;
+	if (terminalStatus)
+		snap.status = *terminalStatus;
+	else
+		snap.status = NNetworkStatus(NNetworkStatus::OK, std::string());
+}
+
+void TransformerServingLayer::clearLiveSlot_(unsigned int slot)
+{
+	if (slot < live_.size())
+	{
+		live_[slot].id = 0ULL;
+		live_[slot].cb = CallbackHandle();
+	}
+	if (slot < slotCancel_.size())
+		slotCancel_[slot] = 0u;
+}
+
+void TransformerServingLayer::collectDeferredCancelChecks_(std::vector<DeferredCancelCheck>& out) const
+{
+	out.clear();
+	out.reserve(live_.size());
+	for (unsigned int s = 0u; s < live_.size(); ++s)
+	{
+		if (!batcher_.slotCanDecode(s))
+			continue;
+		if (live_[s].id == 0ULL || !live_[s].cb)
+			continue;
+		out.push_back(DeferredCancelCheck(s, live_[s].id, live_[s].cb));
+	}
+}
+
+void TransformerServingLayer::applyDeferredCancelDecisions_(const std::vector<unsigned int>& cancelSlots,
+                                                            const std::vector<uint64_t>& exceptionIds)
+{
+	for (size_t i = 0u; i < exceptionIds.size(); ++i)
+		logEvent("transformer_serving_callback_exception", exceptionIds[i], "shouldCancel threw; treating as cancel");
+	for (size_t i = 0u; i < cancelSlots.size(); ++i)
+	{
+		const unsigned int slot = cancelSlots[i];
+		if (slot < live_.size() && slot < slotCancel_.size() && live_[slot].id != 0ULL)
+			slotCancel_[slot] = 1u;
+	}
+}
+
+void TransformerServingLayer::markLiveRequestsFailed_(const NNetworkStatus& st)
+{
+	for (unsigned int s = 0u; s < live_.size(); ++s)
+	{
+		const uint64_t id = live_[s].id;
+		if (id == 0ULL)
+			continue;
+		std::map<uint64_t, RequestSnapshot>::iterator it = snapshots_.find(id);
+		if (it != snapshots_.end() && !it->second.done)
+		{
+			it->second.done = true;
+			it->second.status = st;
+		}
+	}
+}
+
+void TransformerServingLayer::applyTokenCallbackStops_(const std::vector<uint64_t>& stopIds,
+                                                       const std::vector<uint64_t>& exceptionIds)
+{
+	for (size_t i = 0u; i < exceptionIds.size(); ++i)
+		logEvent("transformer_serving_callback_exception", exceptionIds[i], "onToken threw; treating as cancel");
+	for (size_t i = 0u; i < stopIds.size(); ++i)
+	{
+		const uint64_t id = stopIds[i];
+		std::map<uint64_t, RequestSnapshot>::iterator it = snapshots_.find(id);
+		NNetworkStatus finalStatus(NNetworkStatus::OK, std::string());
+		if (it != snapshots_.end())
+		{
+			markSnapshotStoppedByCallback_(it->second, NULL);
+			finalStatus = it->second.status;
+		}
+		for (unsigned int s = 0u; s < live_.size(); ++s)
+		{
+			if (live_[s].id != id)
+				continue;
+			(void)TransformerPublicAPI::serving(*net_).cancelSlot(batcher_, s);
+			completedCallbacks_[id] = live_[s].cb;
+			clearLiveSlot_(s);
+			if (cfg_.autoRemoveFinished)
+				(void)TransformerPublicAPI::serving(*net_).remove(batcher_, s);
+			logEvent("transformer_serving_request_done", id, "done", &finalStatus, s);
+			break;
+		}
+	}
 }
 
 void TransformerServingLayer::admitPending_()
@@ -488,12 +575,7 @@ void TransformerServingLayer::updateSnapshotsFromBatcher_()
 		const NNetwork::TransformerGenerateResult* rr = batcher_.slotResult(s);
 		if (!rr)
 			rr = &snap.result;
-		append_token_delta(snap.result.tokens, rr->tokens);
-		snap.result.lastToken = rr->lastToken;
-		snap.result.stoppedByCallback = rr->stoppedByCallback;
-		snap.result.stoppedOnEos = rr->stoppedOnEos;
-		snap.result.stoppedByStopToken = rr->stoppedByStopToken;
-		snap.result.stoppedByLimit = rr->stoppedByLimit;
+		applyBatcherResult_(snap, *rr);
 	}
 }
 
@@ -513,6 +595,7 @@ void TransformerServingLayer::finalizeDoneSlots_()
 		{
 			// Defensive: unknown slot state; remove it.
 			(void)TransformerPublicAPI::serving(*net_).remove(batcher_, s);
+			clearLiveSlot_(s);
 			continue;
 		}
 
@@ -525,12 +608,7 @@ void TransformerServingLayer::finalizeDoneSlots_()
 			const NNetwork::TransformerGenerateResult* rr = batcher_.slotResult(s);
 			if (!rr)
 				continue;
-			append_token_delta(snap.result.tokens, rr->tokens);
-			snap.result.lastToken = rr->lastToken;
-			snap.result.stoppedByCallback = rr->stoppedByCallback;
-			snap.result.stoppedOnEos = rr->stoppedOnEos;
-			snap.result.stoppedByStopToken = rr->stoppedByStopToken;
-			snap.result.stoppedByLimit = rr->stoppedByLimit;
+			applyBatcherResult_(snap, *rr);
 			snap.done = true;
 			snap.status = NNetworkStatus(NNetworkStatus::OK, std::string());
 			finalStatus = snap.status;
@@ -539,14 +617,7 @@ void TransformerServingLayer::finalizeDoneSlots_()
 		logEvent("transformer_serving_request_done", id, "done", &finalStatus, s);
 		completedCallbacks_[id] = live_[s].cb;
 
-		// Clear live slot metadata.
-		if (s < live_.size())
-		{
-			live_[s].id = 0ULL;
-			live_[s].cb = CallbackHandle();
-		}
-		if (s < slotCancel_.size())
-			slotCancel_[s] = 0u;
+		clearLiveSlot_(s);
 
 		// Remove from batcher (optional; but default enabled for serving).
 		if (cfg_.autoRemoveFinished)
@@ -587,15 +658,7 @@ NNetworkStatus TransformerServingLayer::step()
 	inStep_ = true;
 	const NNetwork* stepNet = net_;
 	std::vector<DeferredCancelCheck> cancelChecks;
-	cancelChecks.reserve(live_.size());
-	for (unsigned int s = 0u; s < live_.size(); ++s)
-	{
-		if (!batcher_.slotCanDecode(s))
-			continue;
-		if (live_[s].id == 0ULL || !live_[s].cb)
-			continue;
-		cancelChecks.push_back(DeferredCancelCheck(s, live_[s].id, live_[s].cb));
-	}
+	collectDeferredCancelChecks_(cancelChecks);
 
 	lock.unlock();
 	std::vector<unsigned int> cancelSlots;
@@ -623,14 +686,7 @@ NNetworkStatus TransformerServingLayer::step()
 		shutdownLocked_(false, NULL, "ok");
 		return NNetworkStatus(NNetworkStatus::OK, std::string());
 	}
-	for (size_t i = 0u; i < cancelLogIds.size(); ++i)
-		logEvent("transformer_serving_callback_exception", cancelLogIds[i], "shouldCancel threw; treating as cancel");
-	for (size_t i = 0u; i < cancelSlots.size(); ++i)
-	{
-		const unsigned int slot = cancelSlots[i];
-		if (slot < live_.size() && slot < slotCancel_.size() && live_[slot].id != 0ULL)
-			slotCancel_[slot] = 1u;
-	}
+	applyDeferredCancelDecisions_(cancelSlots, cancelLogIds);
 
 	deferredTokenCallbacks_.clear();
 	const NNetworkStatus stStep = TransformerPublicAPI::serving(*stepNet).step(batcher_, &batcherCallbacks_);
@@ -638,19 +694,7 @@ NNetworkStatus TransformerServingLayer::step()
 	if (!stStep.ok())
 	{
 		inStep_ = false;
-		// Mark all live requests failed.
-		for (unsigned int s = 0u; s < live_.size(); ++s)
-		{
-			const uint64_t id = live_[s].id;
-			if (id == 0ULL)
-				continue;
-			std::map<uint64_t, RequestSnapshot>::iterator it = snapshots_.find(id);
-			if (it != snapshots_.end() && !it->second.done)
-			{
-				it->second.done = true;
-				it->second.status = stStep;
-			}
-		}
+		markLiveRequestsFailed_(stStep);
 		logEvent("transformer_serving_step_fail", 0ULL, stStep.message.c_str(), &stStep);
 		stopRequested_ = true;
 		shutdownLocked_(false, &stStep, "step_failed");
@@ -686,42 +730,7 @@ NNetworkStatus TransformerServingLayer::step()
 	}
 	lock.lock();
 
-	for (size_t i = 0u; i < tokenExceptionIds.size(); ++i)
-		logEvent("transformer_serving_callback_exception", tokenExceptionIds[i], "onToken threw; treating as cancel");
-	for (size_t i = 0u; i < stopIds.size(); ++i)
-	{
-		const uint64_t id = stopIds[i];
-		std::map<uint64_t, RequestSnapshot>::iterator it = snapshots_.find(id);
-		NNetworkStatus finalStatus(NNetworkStatus::OK, std::string());
-		if (it != snapshots_.end())
-		{
-			it->second.done = true;
-			it->second.status = NNetworkStatus(NNetworkStatus::OK, std::string());
-			it->second.result.stoppedByCallback = true;
-			it->second.result.stoppedOnEos = false;
-			it->second.result.stoppedByStopToken = false;
-			it->second.result.stoppedByLimit = false;
-			finalStatus = it->second.status;
-		}
-		for (unsigned int s = 0u; s < live_.size(); ++s)
-		{
-			if (live_[s].id != id)
-				continue;
-			(void)TransformerPublicAPI::serving(*net_).cancelSlot(batcher_, s);
-			if (s < live_.size())
-			{
-				completedCallbacks_[id] = live_[s].cb;
-				live_[s].id = 0ULL;
-				live_[s].cb = CallbackHandle();
-			}
-			if (s < slotCancel_.size())
-				slotCancel_[s] = 0u;
-			if (cfg_.autoRemoveFinished)
-				(void)TransformerPublicAPI::serving(*net_).remove(batcher_, s);
-			logEvent("transformer_serving_request_done", id, "done", &finalStatus, s);
-			break;
-		}
-	}
+	applyTokenCallbackStops_(stopIds, tokenExceptionIds);
 	inStep_ = false;
 
 	if (stopRequested_)

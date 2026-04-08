@@ -1048,6 +1048,102 @@ private:
 	};
 	mutable TransformerPosEncCache transformerPosEncCache;
 
+	struct TransformerTokenStepCore
+	{
+		TransformerTokenStepCore()
+		    : where(NULL),
+		      tokenId(0u),
+		      pos(0u),
+		      maxLen(0u),
+		      keyValid(NULL),
+		      kSeq(NULL),
+		      vSeq(NULL),
+		      kSeq16(NULL),
+		      vSeq16(NULL),
+		      outLogits(NULL),
+		      dModel(0u),
+		      dFF(0u),
+		      nHeads(0u),
+		      nKVHeads(0u),
+		      nLayers(0u),
+		      dHead(0u),
+		      dModelKV(0u),
+		      ffnKind(0u),
+		      ff1Width(0u),
+		      layerNormEps(0.0f),
+		      normType(0u),
+		      positionalEncoding(0u),
+		      ropeDim(0u),
+		      ffnActivation(0u),
+		      lowpDType(0),
+		      metricsEnabled(false),
+		      metricsBreakdownEnabled(false),
+		      posEncCache(NULL),
+		      perf(NULL),
+		      h(NULL),
+		      x1(NULL),
+		      x2(NULL),
+		      q(NULL),
+		      kvec(NULL),
+		      vvec(NULL),
+		      attnConcat(NULL),
+		      attnOut(NULL),
+		      ffPre(NULL),
+		      ffAct(NULL),
+		      ffOut(NULL),
+		      scores(NULL)
+		{
+		}
+
+		bool usesLowPrecisionKvCache() const { return kSeq16 != NULL && vSeq16 != NULL; }
+
+		const char* where;
+		unsigned int tokenId;
+		unsigned int pos;
+		unsigned int maxLen;
+		unsigned char* keyValid;
+		float* kSeq;
+		float* vSeq;
+		uint16_t* kSeq16;
+		uint16_t* vSeq16;
+		float* outLogits;
+
+		unsigned int dModel;
+		unsigned int dFF;
+		unsigned int nHeads;
+		unsigned int nKVHeads;
+		unsigned int nLayers;
+		unsigned int dHead;
+		unsigned int dModelKV;
+		unsigned int ffnKind;
+		unsigned int ff1Width;
+		float layerNormEps;
+		unsigned int normType;
+		unsigned int positionalEncoding;
+		unsigned int ropeDim;
+		unsigned int ffnActivation;
+		int lowpDType;
+		bool metricsEnabled;
+		bool metricsBreakdownEnabled;
+
+		TransformerPosEncCache* posEncCache;
+		void* perf;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* h;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* x1;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* x2;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* q;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* kvec;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* vvec;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* attnConcat;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* attnOut;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* ffPre;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* ffAct;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* ffOut;
+		std::vector<float, glades::AlignedAllocator<float, 64> >* scores;
+	};
+
+	NNetworkStatus transformerLmAppendCpuTokenCore(TransformerTokenStepCore& core) const;
+
 	// Ensure packed tensor parameters are initialized from the attached DataInput shape.
 	// Returns false and sets lastStatus on failure.
 	bool ensureTensorParametersInitialized();
@@ -1538,6 +1634,60 @@ public:
 	private:
 		friend class NNetwork;
 
+		// Initialized-session contract:
+		// - cached dimensions mirror the active transformer tensor layout
+		// - exactly one KV storage pair is active (`k/v` for F32 or `k16/v16` for low-precision)
+		// - scratch buffers are pre-sized so Append stays allocation-free
+		// - `keyValid.size() == maxLen`
+		bool usesLowPrecisionKvCache() const { return kvCacheDType != KV_CACHE_F32; }
+		size_t kvElementsPerSequence() const
+		{
+			return static_cast<size_t>(nLayers) * static_cast<size_t>(maxLen) * static_cast<size_t>(dModelKV);
+		}
+		bool shapeMatches(unsigned int expectedDModel,
+		                 unsigned int expectedDFF,
+		                 unsigned int expectedNHeads,
+		                 unsigned int expectedNKVHeads,
+		                 unsigned int expectedNLayers,
+		                 unsigned int expectedDHead,
+		                 unsigned int expectedDModelKV,
+		                 unsigned int expectedFfnKind,
+		                 unsigned int expectedFf1Width) const
+		{
+			return dModel == expectedDModel &&
+			       dFF == expectedDFF &&
+			       nHeads == expectedNHeads &&
+			       nKVHeads == expectedNKVHeads &&
+			       nLayers == expectedNLayers &&
+			       dHead == expectedDHead &&
+			       dModelKV == expectedDModelKV &&
+			       ffnKind == expectedFfnKind &&
+			       ff1Width == expectedFf1Width;
+		}
+		bool storageInvariantsHold() const
+		{
+			if (curLen > maxLen ||
+			    keyValid.size() != static_cast<size_t>(maxLen) ||
+			    h.size() != static_cast<size_t>(dModel) ||
+			    x1.size() != static_cast<size_t>(dModel) ||
+			    x2.size() != static_cast<size_t>(dModel) ||
+			    q.size() != static_cast<size_t>(dModel) ||
+			    kvec.size() != static_cast<size_t>(dModelKV) ||
+			    vvec.size() != static_cast<size_t>(dModelKV) ||
+			    attnConcat.size() != static_cast<size_t>(dModel) ||
+			    attnOut.size() != static_cast<size_t>(dModel) ||
+			    ffPre.size() != static_cast<size_t>(ff1Width) ||
+			    ffAct.size() != static_cast<size_t>(dFF) ||
+			    ffOut.size() != static_cast<size_t>(dModel) ||
+			    scores.size() != static_cast<size_t>(maxLen))
+				return false;
+
+			const size_t kvElems = kvElementsPerSequence();
+			if (usesLowPrecisionKvCache())
+				return k.empty() && v.empty() && k16.size() == kvElems && v16.size() == kvElems;
+			return k.size() == kvElems && v.size() == kvElems && k16.empty() && v16.empty();
+		}
+
 		bool initialized;
 		unsigned int maxLen;
 		unsigned int curLen;
@@ -1718,6 +1868,69 @@ public:
 	private:
 		friend class NNetwork;
 
+		// Initialized-session contract:
+		// - cached dimensions mirror the active transformer tensor layout
+		// - `curLen.size() == batchSize` and every entry stays <= maxLen
+		// - exactly one KV storage pair is active (`k/v` for F32 or `k16/v16` for low-precision)
+		// - scratch buffers are shared across batch elements and pre-sized so Append stays allocation-free
+		// - `keyValid.size() == batchSize * maxLen`
+		bool usesLowPrecisionKvCache() const { return kvCacheDType != KV_CACHE_F32; }
+		size_t kvElementsPerSequence() const
+		{
+			return static_cast<size_t>(nLayers) * static_cast<size_t>(maxLen) * static_cast<size_t>(dModelKV);
+		}
+		size_t kvElementsTotal() const
+		{
+			return static_cast<size_t>(batchSize) * kvElementsPerSequence();
+		}
+		bool shapeMatches(unsigned int expectedDModel,
+		                 unsigned int expectedDFF,
+		                 unsigned int expectedNHeads,
+		                 unsigned int expectedNKVHeads,
+		                 unsigned int expectedNLayers,
+		                 unsigned int expectedDHead,
+		                 unsigned int expectedDModelKV,
+		                 unsigned int expectedFfnKind,
+		                 unsigned int expectedFf1Width) const
+		{
+			return dModel == expectedDModel &&
+			       dFF == expectedDFF &&
+			       nHeads == expectedNHeads &&
+			       nKVHeads == expectedNKVHeads &&
+			       nLayers == expectedNLayers &&
+			       dHead == expectedDHead &&
+			       dModelKV == expectedDModelKV &&
+			       ffnKind == expectedFfnKind &&
+			       ff1Width == expectedFf1Width;
+		}
+		bool storageInvariantsHold() const
+		{
+			if (curLen.size() != static_cast<size_t>(batchSize) ||
+			    keyValid.size() != (static_cast<size_t>(batchSize) * static_cast<size_t>(maxLen)) ||
+			    h.size() != static_cast<size_t>(dModel) ||
+			    x1.size() != static_cast<size_t>(dModel) ||
+			    x2.size() != static_cast<size_t>(dModel) ||
+			    q.size() != static_cast<size_t>(dModel) ||
+			    kvec.size() != static_cast<size_t>(dModelKV) ||
+			    vvec.size() != static_cast<size_t>(dModelKV) ||
+			    attnConcat.size() != static_cast<size_t>(dModel) ||
+			    attnOut.size() != static_cast<size_t>(dModel) ||
+			    ffPre.size() != static_cast<size_t>(ff1Width) ||
+			    ffAct.size() != static_cast<size_t>(dFF) ||
+			    ffOut.size() != static_cast<size_t>(dModel) ||
+			    scores.size() != static_cast<size_t>(maxLen))
+				return false;
+
+			for (size_t i = 0u; i < curLen.size(); ++i)
+				if (curLen[i] > maxLen)
+					return false;
+
+			const size_t kvElems = kvElementsTotal();
+			if (usesLowPrecisionKvCache())
+				return k.empty() && v.empty() && k16.size() == kvElems && v16.size() == kvElems;
+			return k.size() == kvElems && v.size() == kvElems && k16.empty() && v16.empty();
+		}
+
 		bool initialized;
 		unsigned int batchSize;
 		unsigned int maxLen;
@@ -1894,11 +2107,23 @@ public:
 	struct TransformerServeBatcher
 	{
 	public:
+		enum SlotLifecycle
+		{
+			SLOT_FREE = 0,
+			SLOT_PREFILL,
+			SLOT_DECODE,
+			SLOT_DONE
+		};
+
 		bool isInitialized() const { return initialized; }
 		unsigned int capacity() const { return maxBatchSize; }
+		bool slotFree(unsigned int slot) const
+		{
+			return slot < inUse.size() && inUse[slot] == 0u;
+		}
 		bool slotInUse(unsigned int slot) const
 		{
-			return slot < inUse.size() && inUse[slot] != 0u;
+			return !slotFree(slot);
 		}
 		bool slotDone(unsigned int slot) const
 		{
@@ -1915,6 +2140,22 @@ public:
 			       slot < generated.size() &&
 			       slot < reqMaxNew.size() &&
 			       generated[slot] < reqMaxNew[slot];
+		}
+		unsigned int slotCurrentLen(unsigned int slot) const
+		{
+			return slot < session.curLen.size() ? session.curLen[slot] : 0u;
+		}
+		bool slotReachedMaxLen(unsigned int slot) const
+		{
+			return slot < reqMaxLen.size() && slotCurrentLen(slot) >= reqMaxLen[slot];
+		}
+		SlotLifecycle slotLifecycle(unsigned int slot) const
+		{
+			if (slotFree(slot))
+				return SLOT_FREE;
+			if (slotDone(slot))
+				return SLOT_DONE;
+			return slotInPrefill(slot) ? SLOT_PREFILL : SLOT_DECODE;
 		}
 		const TransformerGenerateResult* slotResult(unsigned int slot) const
 		{
@@ -1985,6 +2226,105 @@ public:
 
 	private:
 		friend class NNetwork;
+
+		void zeroLogitsRow(unsigned int slot)
+		{
+			if (slot >= maxBatchSize || vocab == 0u)
+				return;
+			const size_t offset = static_cast<size_t>(slot) * static_cast<size_t>(vocab);
+			if (!prevLogitsFlat.empty())
+			{
+				float* row = &prevLogitsFlat[offset];
+				std::fill(row, row + vocab, 0.0f);
+			}
+			if (!logitsFlat.empty())
+			{
+				float* row = &logitsFlat[offset];
+				std::fill(row, row + vocab, 0.0f);
+			}
+		}
+
+		void installSlotRequest(unsigned int slot,
+		                       const TransformerServeRequest& newReq,
+		                       unsigned int newPromptLen,
+		                       unsigned int newMaxNew,
+		                       unsigned int newMaxLen)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			req[slot] = newReq;
+			results[slot] = TransformerGenerateResult();
+			if (newReq.cfg.includePromptInOutput)
+				results[slot].tokens = newReq.promptTokens;
+			inUse[slot] = 1u;
+			done[slot] = 0u;
+			promptPos[slot] = 0u;
+			promptLen[slot] = newPromptLen;
+			generated[slot] = 0u;
+			reqMaxNew[slot] = newMaxNew;
+			reqMaxLen[slot] = newMaxLen;
+			if (slot < session.curLen.size())
+				session.curLen[slot] = 0u;
+			hasOverride[slot] = 0u;
+			if (slot < tokenIds.size())
+				tokenIds[slot] = 0u;
+			if (slot < active.size())
+				active[slot] = 0u;
+			if (slot < sampledTok.size())
+				sampledTok[slot] = 0u;
+			if (slot < sampledIsValid.size())
+				sampledIsValid[slot] = 0u;
+			zeroLogitsRow(slot);
+		}
+
+		void clearSlotState(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			inUse[slot] = 0u;
+			done[slot] = 0u;
+			promptPos[slot] = 0u;
+			promptLen[slot] = 0u;
+			generated[slot] = 0u;
+			reqMaxNew[slot] = 0u;
+			reqMaxLen[slot] = 0u;
+			if (slot < session.curLen.size())
+				session.curLen[slot] = 0u;
+			hasOverride[slot] = 0u;
+			req[slot] = TransformerServeRequest();
+			results[slot] = TransformerGenerateResult();
+			if (slot < tokenIds.size())
+				tokenIds[slot] = 0u;
+			if (slot < active.size())
+				active[slot] = 0u;
+			if (slot < sampledTok.size())
+				sampledTok[slot] = 0u;
+			if (slot < sampledIsValid.size())
+				sampledIsValid[slot] = 0u;
+			zeroLogitsRow(slot);
+		}
+
+		void markSlotStoppedByLimit(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			results[slot].stoppedByCallback = false;
+			results[slot].stoppedOnEos = false;
+			results[slot].stoppedByStopToken = false;
+			results[slot].stoppedByLimit = true;
+			done[slot] = 1u;
+		}
+
+		void markSlotStoppedByCallback(unsigned int slot)
+		{
+			if (slot >= maxBatchSize)
+				return;
+			results[slot].stoppedByCallback = true;
+			results[slot].stoppedOnEos = false;
+			results[slot].stoppedByStopToken = false;
+			results[slot].stoppedByLimit = false;
+			done[slot] = 1u;
+		}
 
 		bool initialized;
 		unsigned int vocab;
