@@ -30,6 +30,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 namespace {
@@ -145,6 +146,24 @@ static void assert_tokens_in_range(const std::vector<unsigned int>& toks, unsign
 		ASSERT("==============TransformerVerification: token out of range Failed==============", toks[i] < vocab);
 }
 
+static void assert_status_error(const glades::NNetworkStatus& st,
+                                glades::NNetworkStatus::Code expectedCode,
+                                const char* expectedPrefix,
+                                const char* expectedFragment)
+{
+	ASSERT("==============TransformerVerification: expected error status Failed==============", !st.ok());
+	ASSERT("==============TransformerVerification: unexpected status code Failed==============", st.code == expectedCode);
+	ASSERT("==============TransformerVerification: status prefix mismatch Failed==============",
+	       st.message.find(expectedPrefix) == 0u);
+	ASSERT("==============TransformerVerification: status fragment missing Failed==============",
+	       st.message.find(expectedFragment) != std::string::npos);
+}
+
+static std::vector<unsigned int> make_hidden_sizes(unsigned int dModel, unsigned int nLayers)
+{
+	return std::vector<unsigned int>(nLayers, dModel);
+}
+
 class StopAfterFirstTokenCallback : public glades::ITransformerServeCallbacks
 {
 public:
@@ -213,44 +232,149 @@ static void test_runtime_config_snapshot_validation()
 	runtime = glades::TransformerRunConfig();
 	runtime.positionalEncoding = static_cast<glades::TransformerRunConfig::PositionalEncodingType>(99);
 	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime", runtime, snap);
-	ASSERT("runtime snapshot rejects bad positional encoding", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime: ",
+	                    "unknown positionalEncoding");
 
 	runtime = glades::TransformerRunConfig();
 	runtime.normType = static_cast<glades::TransformerRunConfig::NormType>(99);
 	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime", runtime, snap);
-	ASSERT("runtime snapshot rejects bad norm type", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime: ",
+	                    "unknown normType");
 
 	runtime = glades::TransformerRunConfig();
 	runtime.ffnKind = static_cast<glades::TransformerRunConfig::FFNKind>(99);
 	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime", runtime, snap);
-	ASSERT("runtime snapshot rejects bad ffn kind", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime: ",
+	                    "unknown ffnKind");
 
 	runtime = glades::TransformerRunConfig();
 	runtime.ffnActivation = static_cast<glades::TransformerRunConfig::FFNActivationType>(99);
 	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime", runtime, snap);
-	ASSERT("runtime snapshot rejects bad ffn activation", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime: ",
+	                    "unknown ffnActivation");
 
 	runtime = glades::TransformerRunConfig();
 	runtime.kvCacheDType = static_cast<glades::TransformerRunConfig::KVCacheDType>(99);
 	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime", runtime, snap);
-	ASSERT("runtime snapshot rejects bad kv dtype", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime: ",
+	                    "unknown kvCacheDType");
 
 	runtime = glades::TransformerRunConfig();
 	runtime.embeddingDropoutRate = -0.01f;
 	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime", runtime, snap);
-	ASSERT("runtime snapshot rejects negative embedding dropout", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime: ",
+	                    "embeddingDropoutRate must be in [0,1)");
 
 	runtime = glades::TransformerRunConfig();
 	runtime.residualDropoutRate = 1.0f;
 	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime", runtime, snap);
-	ASSERT("runtime snapshot rejects residual dropout >= 1", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime: ",
+	                    "residualDropoutRate must be in [0,1)");
+
+	printf("    PASSED\n");
+}
+
+static void test_runtime_config_snapshot_boundary_contract()
+{
+	printf("  [A2] RuntimeConfigSnapshotBoundaryContract ...\n");
+
+	glades::TransformerRunConfig runtime;
+	runtime.enableTokenEmbedding = false;
+	runtime.layerNormEps = 2.5e-4f;
+	runtime.normType = glades::TransformerRunConfig::NORM_LAYERNORM;
+	runtime.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+	runtime.kvCacheDType = glades::TransformerRunConfig::KV_CACHE_F16;
+	runtime.ropeDimOverride = 14;
+	runtime.ropeTheta = 321.0f;
+	runtime.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+	runtime.ffnActivation = glades::TransformerRunConfig::FFN_RELU;
+	runtime.padTokenId = -1;
+	runtime.embeddingDropoutRate = 0.0f;
+	runtime.residualDropoutRate = 0.999f;
+
+	glades::TransformerRuntimeConfigSnapshot snap;
+	glades::NNetworkStatus st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime_boundaries", runtime, snap);
+	ASSERT("runtime boundary snapshot should succeed", st.ok());
+	ASSERT("runtime boundary snapshot token model disabled", !snap.tokenModel);
+	ASSERT("runtime boundary snapshot layerNormEps preserved", std::fabs(snap.layerNormEps - runtime.layerNormEps) < 1e-8f);
+	ASSERT("runtime boundary snapshot ropeDimOverride preserved", snap.ropeDimOverride == runtime.ropeDimOverride);
+	ASSERT("runtime boundary snapshot ropeTheta preserved", std::fabs(snap.ropeTheta - runtime.ropeTheta) < 1e-6f);
+	ASSERT("runtime boundary snapshot kv dtype preserved",
+	       snap.kvCacheDType == static_cast<unsigned int>(glades::TransformerRunConfig::KV_CACHE_F16));
+	ASSERT("runtime boundary snapshot ffn kind preserved",
+	       snap.ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_MLP));
+	ASSERT("runtime boundary snapshot ffn activation preserved",
+	       snap.ffnActivation == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_RELU));
+
+	runtime = glades::TransformerRunConfig();
+	runtime.embeddingDropoutRate = 1.0f;
+	st = glades::buildTransformerRuntimeConfigSnapshot("ut_transformer_runtime_boundaries", runtime, snap);
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_runtime_boundaries: ",
+	                    "embeddingDropoutRate must be in [0,1)");
+
+	runtime = glades::TransformerRunConfig();
+	runtime.residualDropoutRate = -0.01f;
+	st = glades::buildTransformerRuntimeConfigSnapshot(NULL, runtime, snap);
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "transformer_config: ",
+	                    "residualDropoutRate must be in [0,1)");
+
+	printf("    PASSED\n");
+}
+
+static void test_training_config_validation_contract()
+{
+	printf("  [A3] TrainingConfigValidationContract ...\n");
+
+	const unsigned int vocab = 33u;
+	glades::TrainingConfig cfg = make_valid_training_cfg(vocab);
+	glades::NNetworkStatus st = glades::validateTransformerTrainingConfig("ut_transformer_training", cfg);
+	ASSERT("training config valid baseline", st.ok());
+
+	cfg.transformer.tokenLmLossKind = static_cast<glades::TransformerRunConfig::TokenLMLossKind>(99);
+	st = glades::validateTransformerTrainingConfig("ut_transformer_training", cfg);
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_training: ",
+	                    "unknown tokenLmLossKind");
+
+	cfg = make_valid_training_cfg(vocab);
+	cfg.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	cfg.transformer.tokenLmSampledNegatives = 0;
+	st = glades::validateTransformerTrainingConfig("ut_transformer_training", cfg);
+	ASSERT("training config full softmax ignores sampled negative count", st.ok());
+
+	cfg = make_valid_training_cfg(vocab);
+	cfg.transformer.embeddingDropoutRate = 1.0f;
+	st = glades::validateTransformerTrainingConfig("ut_transformer_training", cfg);
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_training: ",
+	                    "embeddingDropoutRate must be in [0,1)");
 
 	printf("    PASSED\n");
 }
 
 static void test_training_config_validation_and_model_snapshot()
 {
-	printf("  [A2] TrainingConfigValidationAndModelSnapshot ...\n");
+	printf("  [A4] TrainingConfigValidationAndModelSnapshot ...\n");
 
 	const unsigned int vocab = 33u;
 	glades::TrainingConfig cfg = make_valid_training_cfg(vocab);
@@ -258,7 +382,10 @@ static void test_training_config_validation_and_model_snapshot()
 	cfg.transformer.tokenLmSampledNegatives = 0;
 
 	glades::NNetworkStatus st = glades::validateTransformerTrainingConfig("ut_transformer_training", cfg);
-	ASSERT("training config rejects sampled softmax without negatives", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_training: ",
+	                    "tokenLmSampledNegatives must be >= 1 for sampled softmax");
 
 	cfg = make_valid_training_cfg(vocab);
 	cfg.transformer.layerNormEps = 0.0f;
@@ -286,42 +413,137 @@ static void test_training_config_validation_and_model_snapshot()
 
 	std::vector<unsigned int> badHiddenSizes;
 	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model", cfg, badHiddenSizes, vocab, true, true, snap);
-	ASSERT("model snapshot rejects empty hidden sizes", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_STATE,
+	                    "ut_transformer_model: ",
+	                    "transformer requires >= 1 hidden layer (blocks)");
 
 	cfg = make_valid_training_cfg(vocab);
 	hiddenSizes.clear();
 	hiddenSizes.push_back(10u);
 	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model", cfg, hiddenSizes, vocab, true, true, snap);
-	ASSERT("model snapshot rejects dModel not divisible by nHeads", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_model: ",
+	                    "transformer dModel must be divisible by nHeads");
 
 	cfg = make_valid_training_cfg(vocab);
 	cfg.transformer.nKVHeadsOverride = 3;
 	hiddenSizes.clear();
 	hiddenSizes.push_back(12u);
 	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model", cfg, hiddenSizes, vocab, true, true, snap);
-	ASSERT("model snapshot rejects nKVHeads that do not divide nHeads", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_model: ",
+	                    "transformer nKVHeads must divide nHeads");
 
 	cfg = make_valid_training_cfg(vocab);
 	hiddenSizes.clear();
 	hiddenSizes.push_back(16u);
 	hiddenSizes.push_back(12u);
 	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model", cfg, hiddenSizes, vocab, true, true, snap);
-	ASSERT("model snapshot rejects mismatched hidden sizes", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_model: ",
+	                    "transformer requires constant hidden size (dModel) across all blocks");
 
 	cfg = make_valid_training_cfg(vocab);
 	cfg.transformer.tieEmbeddings = false;
 	hiddenSizes.clear();
 	hiddenSizes.push_back(16u);
 	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model", cfg, hiddenSizes, vocab, true, true, snap);
-	ASSERT("model snapshot rejects untied token embeddings", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_model: ",
+	                    "token LM mode currently requires tieEmbeddings=true");
 
 	cfg = make_valid_training_cfg(vocab);
 	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model", cfg, hiddenSizes, vocab, false, true, snap);
-	ASSERT("model snapshot rejects missing token-id input", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_model: ",
+	                    "token LM mode requires DataInput token-id accessors");
 
 	cfg = make_valid_training_cfg(vocab);
 	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model", cfg, hiddenSizes, vocab + 1u, true, true, snap);
-	ASSERT("model snapshot rejects vocab/output mismatch", !st.ok());
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_model: ",
+	                    "token LM vocabSizeOverride must match NNInfo output layer size");
+
+	printf("    PASSED\n");
+}
+
+static void test_model_snapshot_default_and_non_token_contract()
+{
+	printf("  [A5] ModelSnapshotDefaultAndNonTokenContract ...\n");
+
+	const std::vector<unsigned int> hiddenSizes = make_hidden_sizes(16u, 2u);
+	glades::TransformerModelConfigSnapshot snap;
+
+	glades::TrainingConfig nonTokenCfg;
+	nonTokenCfg.transformer.tieEmbeddings = false;
+	nonTokenCfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+	nonTokenCfg.transformer.ffnActivation = glades::TransformerRunConfig::FFN_RELU;
+	nonTokenCfg.transformer.kvCacheDType = glades::TransformerRunConfig::KV_CACHE_F16;
+	nonTokenCfg.transformer.layerNormEps = 2.0e-5f;
+	nonTokenCfg.transformer.ropeDimOverride = 6;
+	nonTokenCfg.transformer.ropeTheta = 5000.0f;
+
+	glades::NNetworkStatus st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model_defaults",
+	                                                                        nonTokenCfg,
+	                                                                        hiddenSizes,
+	                                                                        0u,
+	                                                                        false,
+	                                                                        false,
+	                                                                        snap);
+	ASSERT("non-token model snapshot should succeed", st.ok());
+	ASSERT("non-token model flag disabled", !snap.tokenModel);
+	ASSERT("non-token default heads", snap.nHeads == 4u);
+	ASSERT("non-token default kv heads", snap.nKVHeads == 4u);
+	ASSERT("non-token default dFF", snap.dFF == 64u);
+	ASSERT("non-token mlp ff1 width", snap.ff1Width == 64u);
+	ASSERT("non-token allows zero vocab", snap.vocabSize == 0u);
+	ASSERT("non-token tieEmbeddings passthrough", !snap.tieEmbeddings);
+	ASSERT("non-token causal flag", !snap.causal);
+	ASSERT("non-token runtime fields copied", snap.kvCacheDType == static_cast<unsigned int>(glades::TransformerRunConfig::KV_CACHE_F16));
+	ASSERT("non-token ropeDimOverride copied", snap.ropeDimOverride == 6);
+	ASSERT("non-token positive ropeTheta preserved", std::fabs(snap.ropeTheta - 5000.0f) < 1e-4f);
+
+	glades::TrainingConfig tokenDefaultCfg = make_valid_training_cfg(7u);
+	tokenDefaultCfg.transformer.nHeadsOverride = 0;
+	tokenDefaultCfg.transformer.nKVHeadsOverride = 0;
+	tokenDefaultCfg.transformer.dFFOverride = 0;
+	tokenDefaultCfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+	tokenDefaultCfg.transformer.vocabSizeOverride = 0;
+	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model_defaults",
+	                                                 tokenDefaultCfg,
+	                                                 hiddenSizes,
+	                                                 11u,
+	                                                 true,
+	                                                 false,
+	                                                 snap);
+	ASSERT("token model default derivation should succeed", st.ok());
+	ASSERT("token model default heads", snap.nHeads == 4u);
+	ASSERT("token model default kv heads", snap.nKVHeads == 4u);
+	ASSERT("token model default dFF", snap.dFF == 64u);
+	ASSERT("token model default mlp ff1 width", snap.ff1Width == 64u);
+	ASSERT("token model vocab falls back to output size", snap.vocabSize == 11u);
+	ASSERT("token model causal flag copied", !snap.causal);
+
+	glades::TrainingConfig zeroVocabCfg = make_valid_training_cfg(7u);
+	zeroVocabCfg.transformer.vocabSizeOverride = 0;
+	st = glades::buildTransformerModelConfigSnapshot("ut_transformer_model_defaults",
+	                                                 zeroVocabCfg,
+	                                                 hiddenSizes,
+	                                                 0u,
+	                                                 true,
+	                                                 true,
+	                                                 snap);
+	assert_status_error(st,
+	                    glades::NNetworkStatus::INVALID_ARGUMENT,
+	                    "ut_transformer_model_defaults: ",
+	                    "token LM mode requires vocabSize > 0");
 
 	printf("    PASSED\n");
 }
@@ -536,7 +758,10 @@ void TransformerVerificationUnitTest()
 
 	printf("\n--- Group A: Config Snapshots ---\n");
 	test_runtime_config_snapshot_validation();
+	test_runtime_config_snapshot_boundary_contract();
+	test_training_config_validation_contract();
 	test_training_config_validation_and_model_snapshot();
+	test_model_snapshot_default_and_non_token_contract();
 
 	printf("\n--- Group B: Persistent Batcher ---\n");
 	test_batcher_submit_validation_matrix();
