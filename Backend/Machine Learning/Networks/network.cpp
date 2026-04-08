@@ -1105,6 +1105,124 @@ bool glades::NNetwork::getTrainerRunDiagnostics(TrainerRunDiagnostics& out) cons
 	return true;
 }
 
+bool glades::NNetwork::getPersistenceDiagnostics(PersistenceDiagnostics& out) const
+{
+	out = persistenceDiagnostics;
+	return true;
+}
+
+void glades::NNetwork::resetPersistenceDiagnosticsAttempt(PersistenceDiagnostics& d,
+                                                          const char* operation,
+                                                          const std::string& name,
+                                                          int netType,
+                                                          bool isCheckpoint,
+                                                          bool tokenizerPresent,
+                                                          bool includeOptimizerState,
+                                                          uint64_t maxShardBytes)
+{
+	d.totalPersistenceOps += 1ULL;
+	if (isCheckpoint)
+		d.totalCheckpointSaveAttempts += 1ULL;
+	else
+		d.totalModelSaveAttempts += 1ULL;
+
+	d.lastNetType = netType;
+	d.lastOperationWasCheckpoint = isCheckpoint;
+	d.lastOperationSucceeded = false;
+	d.lastOperationRejected = false;
+	d.lastRotatedPrevious = false;
+	d.lastTokenizerPresent = tokenizerPresent;
+	d.lastIncludeOptimizerState = includeOptimizerState;
+	d.lastShardCount = 0ULL;
+	d.lastTensorCount = 0ULL;
+	d.lastWeightsBytes = 0ULL;
+	d.lastMaxShardBytes = maxShardBytes;
+	d.lastOperation = operation ? std::string(operation) : std::string();
+	d.lastName = name;
+	d.lastStage = "begin";
+	d.lastStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+void glades::NNetwork::notePersistenceDiagnosticsFailure(PersistenceDiagnostics& d,
+                                                         const char* stage,
+                                                         bool rejectedInput,
+                                                         bool rotatedPrevious,
+                                                         const NNetworkStatus& st,
+                                                         uint64_t shardCount,
+                                                         uint64_t tensorCount,
+                                                         uint64_t weightsBytes)
+{
+	d.totalPersistenceFailures += 1ULL;
+	if (d.lastOperationWasCheckpoint)
+		d.totalCheckpointSaveFailures += 1ULL;
+	else
+		d.totalModelSaveFailures += 1ULL;
+
+	d.lastOperationSucceeded = false;
+	d.lastOperationRejected = rejectedInput;
+	d.lastRotatedPrevious = rotatedPrevious;
+	d.lastStage = stage ? std::string(stage) : std::string();
+	d.lastStatus = st;
+	d.lastShardCount = shardCount;
+	d.lastTensorCount = tensorCount;
+	d.lastWeightsBytes = weightsBytes;
+
+	if (rejectedInput)
+	{
+		d.totalRejectedInputs += 1ULL;
+		return;
+	}
+
+	d.totalPublishFailures += 1ULL;
+	if (d.lastOperationWasCheckpoint)
+		d.totalCheckpointPublishFailures += 1ULL;
+	else
+		d.totalModelPublishFailures += 1ULL;
+
+	if (d.lastStage == "rotate_existing")
+		d.totalRotateFailures += 1ULL;
+	else if (d.lastStage == "publish")
+		d.totalPublishRenameFailures += 1ULL;
+	else if (d.lastStage == "write_manifest")
+		d.totalManifestWriteFailures += 1ULL;
+	else if (d.lastStage == "write_nninfo")
+		d.totalNninfoWriteFailures += 1ULL;
+	else if (d.lastStage == "write_weights")
+		d.totalWeightsWriteFailures += 1ULL;
+	else if (d.lastStage == "compute_integrity")
+		d.totalIntegrityFailures += 1ULL;
+	else if (d.lastStage == "collect_tensors")
+		d.totalCheckpointTensorCollectionFailures += 1ULL;
+	else if (d.lastStage == "open_first_shard" ||
+	         d.lastStage == "write_shards" ||
+	         d.lastStage == "finalize_shards")
+		d.totalCheckpointShardWriteFailures += 1ULL;
+}
+
+void glades::NNetwork::notePersistenceDiagnosticsSuccess(PersistenceDiagnostics& d,
+                                                         const char* stage,
+                                                         bool rotatedPrevious,
+                                                         const NNetworkStatus& st,
+                                                         uint64_t shardCount,
+                                                         uint64_t tensorCount,
+                                                         uint64_t weightsBytes)
+{
+	d.totalPersistenceSuccesses += 1ULL;
+	if (d.lastOperationWasCheckpoint)
+		d.totalCheckpointSaveSuccesses += 1ULL;
+	else
+		d.totalModelSaveSuccesses += 1ULL;
+
+	d.lastOperationSucceeded = true;
+	d.lastOperationRejected = false;
+	d.lastRotatedPrevious = rotatedPrevious;
+	d.lastStage = stage ? std::string(stage) : std::string();
+	d.lastStatus = st;
+	d.lastShardCount = shardCount;
+	d.lastTensorCount = tensorCount;
+	d.lastWeightsBytes = weightsBytes;
+}
+
 void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
 {
 	serverInstance = newServer;
@@ -1187,6 +1305,7 @@ void glades::NNetwork::clean()
 	clsCorrect = 0ULL;
 	clsTotal = 0ULL;
 	trainerRunDiagnostics = TrainerRunDiagnostics();
+	persistenceDiagnostics = PersistenceDiagnostics();
 
 	// Ensure the run lock is released when resetting the instance state.
 #if GLADES_HAVE_STD_ATOMICS

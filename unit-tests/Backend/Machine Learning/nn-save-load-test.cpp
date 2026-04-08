@@ -1686,6 +1686,166 @@ void NNSaveLoadUnitTest()
 	}
 
 	// ============================
+	// Case N: persistence diagnostics expose model/checkpoint publish state and failure buckets
+	// ============================
+	{
+		printf("[UT-NN] Persistence diagnostics for model/checkpoint publish\n");
+		OwnedNumberPersistenceFixture fixture("ut_persistence_diag",
+		                                     1u,
+		                                     1,
+		                                     glades::OutputLayerInfo::REGRESSION);
+		glades::NumberInput* di = fixture.di;
+		glades::NNInfo* info = fixture.info;
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_Init() Failed==============",
+		         net.test(di).ok());
+
+		shmea::GLogger logger;
+		logger.setPrintLevel(shmea::GLogger::LOG_DEBUG);
+		logger.unsurpress(shmea::GLogger::LOG_INFO);
+		logger.unsurpress(shmea::GLogger::LOG_WARNING);
+		logger.unsurpress(shmea::GLogger::LOG_ERROR);
+		logger.setPrintToConsole(false);
+		net.setLogger(&logger);
+
+		glades::NNetwork::PersistenceDiagnostics diag;
+		const std::string modelName = "ut_model_pkg_persist_diag";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_SaveModel() Failed==============",
+		         net.saveModel(modelName).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterModelSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelSuccessCounts() Failed==============",
+		         diag.totalPersistenceOps == 1ULL &&
+		         diag.totalPersistenceSuccesses == 1ULL &&
+		         diag.totalPersistenceFailures == 0ULL &&
+		         diag.totalModelSaveAttempts == 1ULL &&
+		         diag.totalModelSaveSuccesses == 1ULL &&
+		         diag.totalCheckpointSaveAttempts == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelSuccessState() Failed==============",
+		         !diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_model" &&
+		         diag.lastName == modelName &&
+		         diag.lastStage == "publish_complete" &&
+		         diag.lastOperationSucceeded &&
+		         !diag.lastOperationRejected &&
+		         diag.lastStatus.ok() &&
+		         diag.lastWeightsBytes > 0ULL);
+
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_RejectedModelSave() Failed==============",
+		         !net.saveModel("bad/name").ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterRejectedModelSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelRejectCounts() Failed==============",
+		         diag.totalPersistenceOps == 2ULL &&
+		         diag.totalPersistenceSuccesses == 1ULL &&
+		         diag.totalPersistenceFailures == 1ULL &&
+		         diag.totalRejectedInputs == 1ULL &&
+		         diag.totalPublishFailures == 0ULL &&
+		         diag.totalModelSaveFailures == 1ULL &&
+		         diag.totalModelPublishFailures == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_ModelRejectState() Failed==============",
+		         !diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_model" &&
+		         diag.lastStage == "validate" &&
+		         !diag.lastOperationSucceeded &&
+		         diag.lastOperationRejected &&
+		         diag.lastStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT);
+
+		glades::NNetwork::CheckpointConfig ckptCfg;
+		ckptCfg.includeOptimizerState = true;
+		ckptCfg.maxShardBytes = 4096u;
+		const std::string ckptName = "ut_checkpoint_publish_diag";
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_SaveCheckpoint() Failed==============",
+		         net.saveCheckpoint(ckptName, ckptCfg).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterCheckpointSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointSuccessCounts() Failed==============",
+		         diag.totalPersistenceOps == 3ULL &&
+		         diag.totalPersistenceSuccesses == 2ULL &&
+		         diag.totalCheckpointSaveAttempts == 1ULL &&
+		         diag.totalCheckpointSaveSuccesses == 1ULL &&
+		         diag.totalCheckpointSaveFailures == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointSuccessState() Failed==============",
+		         diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_checkpoint" &&
+		         diag.lastName == ckptName &&
+		         diag.lastStage == "publish_complete" &&
+		         diag.lastOperationSucceeded &&
+		         !diag.lastOperationRejected &&
+		         diag.lastIncludeOptimizerState &&
+		         diag.lastMaxShardBytes == static_cast<uint64_t>(ckptCfg.maxShardBytes) &&
+		         diag.lastShardCount >= 1ULL &&
+		         diag.lastTensorCount >= 1ULL &&
+		         diag.lastStatus.ok());
+
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_RejectedCheckpointSave() Failed==============",
+		         !net.saveCheckpoint("bad/name", ckptCfg).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterRejectedCheckpointSave() Failed==============",
+		         net.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointRejectCounts() Failed==============",
+		         diag.totalPersistenceOps == 4ULL &&
+		         diag.totalPersistenceFailures == 2ULL &&
+		         diag.totalRejectedInputs == 2ULL &&
+		         diag.totalCheckpointSaveFailures == 1ULL &&
+		         diag.totalCheckpointPublishFailures == 0ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_CheckpointRejectState() Failed==============",
+		         diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_checkpoint" &&
+		         diag.lastStage == "validate" &&
+		         !diag.lastOperationSucceeded &&
+		         diag.lastOperationRejected &&
+		         diag.lastStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT);
+
+		glades::NNetwork invalidNet(glades::NNetwork::TYPE_DFF);
+		invalidNet.setLogger(&logger);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_InvalidCheckpointSave() Failed==============",
+		         !invalidNet.saveCheckpoint("ut_checkpoint_publish_invalid_state", ckptCfg).ok());
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_GetAfterInvalidCheckpointSave() Failed==============",
+		         invalidNet.getPersistenceDiagnostics(diag));
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_InvalidCheckpointCounts() Failed==============",
+		         diag.totalPersistenceOps == 1ULL &&
+		         diag.totalPersistenceFailures == 1ULL &&
+		         diag.totalRejectedInputs == 0ULL &&
+		         diag.totalPublishFailures == 1ULL &&
+		         diag.totalCheckpointSaveAttempts == 1ULL &&
+		         diag.totalCheckpointSaveFailures == 1ULL &&
+		         diag.totalCheckpointPublishFailures == 1ULL);
+		G_assert(__FILE__, __LINE__,
+		         "==============NNSaveLoad::PersistenceDiag_InvalidCheckpointState() Failed==============",
+		         diag.lastOperationWasCheckpoint &&
+		         diag.lastOperation == "save_checkpoint" &&
+		         diag.lastName == "ut_checkpoint_publish_invalid_state" &&
+		         diag.lastStage == "validate" &&
+		         !diag.lastOperationSucceeded &&
+		         !diag.lastOperationRejected &&
+		         diag.lastStatus.code == glades::NNetworkStatus::INVALID_STATE);
+
+		invalidNet.setLogger(NULL);
+		net.setLogger(NULL);
+	}
+
+	// ============================
 	// Case L: Tokenizer vocab corruption should be detected (checksum)
 	// ============================
 	{

@@ -169,6 +169,86 @@ public:
 		}
 	};
 
+	struct PersistenceDiagnostics
+	{
+		uint64_t totalPersistenceOps;
+		uint64_t totalPersistenceSuccesses;
+		uint64_t totalPersistenceFailures;
+		uint64_t totalRejectedInputs;
+		uint64_t totalPublishFailures;
+		uint64_t totalModelSaveAttempts;
+		uint64_t totalModelSaveSuccesses;
+		uint64_t totalModelSaveFailures;
+		uint64_t totalModelPublishFailures;
+		uint64_t totalCheckpointSaveAttempts;
+		uint64_t totalCheckpointSaveSuccesses;
+		uint64_t totalCheckpointSaveFailures;
+		uint64_t totalCheckpointPublishFailures;
+		uint64_t totalRotateFailures;
+		uint64_t totalPublishRenameFailures;
+		uint64_t totalManifestWriteFailures;
+		uint64_t totalNninfoWriteFailures;
+		uint64_t totalWeightsWriteFailures;
+		uint64_t totalCheckpointTensorCollectionFailures;
+		uint64_t totalCheckpointShardWriteFailures;
+		uint64_t totalIntegrityFailures;
+		int lastNetType;
+		bool lastOperationWasCheckpoint;
+		bool lastOperationSucceeded;
+		bool lastOperationRejected;
+		bool lastRotatedPrevious;
+		bool lastTokenizerPresent;
+		bool lastIncludeOptimizerState;
+		uint64_t lastShardCount;
+		uint64_t lastTensorCount;
+		uint64_t lastWeightsBytes;
+		uint64_t lastMaxShardBytes;
+		std::string lastOperation;
+		std::string lastName;
+		std::string lastStage;
+		NNetworkStatus lastStatus;
+
+		PersistenceDiagnostics()
+		    : totalPersistenceOps(0ULL),
+		      totalPersistenceSuccesses(0ULL),
+		      totalPersistenceFailures(0ULL),
+		      totalRejectedInputs(0ULL),
+		      totalPublishFailures(0ULL),
+		      totalModelSaveAttempts(0ULL),
+		      totalModelSaveSuccesses(0ULL),
+		      totalModelSaveFailures(0ULL),
+		      totalModelPublishFailures(0ULL),
+		      totalCheckpointSaveAttempts(0ULL),
+		      totalCheckpointSaveSuccesses(0ULL),
+		      totalCheckpointSaveFailures(0ULL),
+		      totalCheckpointPublishFailures(0ULL),
+		      totalRotateFailures(0ULL),
+		      totalPublishRenameFailures(0ULL),
+		      totalManifestWriteFailures(0ULL),
+		      totalNninfoWriteFailures(0ULL),
+		      totalWeightsWriteFailures(0ULL),
+		      totalCheckpointTensorCollectionFailures(0ULL),
+		      totalCheckpointShardWriteFailures(0ULL),
+		      totalIntegrityFailures(0ULL),
+		      lastNetType(-1),
+		      lastOperationWasCheckpoint(false),
+		      lastOperationSucceeded(false),
+		      lastOperationRejected(false),
+		      lastRotatedPrevious(false),
+		      lastTokenizerPresent(false),
+		      lastIncludeOptimizerState(false),
+		      lastShardCount(0ULL),
+		      lastTensorCount(0ULL),
+		      lastWeightsBytes(0ULL),
+		      lastMaxShardBytes(0ULL),
+		      lastOperation(),
+		      lastName(),
+		      lastStage(),
+		      lastStatus(NNetworkStatus::OK, std::string())
+		{
+		}
+	};
+
 private:
 
 	// Tensor-based DFF training state.
@@ -727,6 +807,29 @@ private:
 	void releaseRunLock();
 	bool loadRunningFlag() const;
 	void storeRunningFlag(bool value);
+	static void resetPersistenceDiagnosticsAttempt(PersistenceDiagnostics& d,
+	                                               const char* operation,
+	                                               const std::string& name,
+	                                               int netType,
+	                                               bool isCheckpoint,
+	                                               bool tokenizerPresent,
+	                                               bool includeOptimizerState,
+	                                               uint64_t maxShardBytes);
+	static void notePersistenceDiagnosticsFailure(PersistenceDiagnostics& d,
+	                                              const char* stage,
+	                                              bool rejectedInput,
+	                                              bool rotatedPrevious,
+	                                              const NNetworkStatus& st,
+	                                              uint64_t shardCount,
+	                                              uint64_t tensorCount,
+	                                              uint64_t weightsBytes);
+	static void notePersistenceDiagnosticsSuccess(PersistenceDiagnostics& d,
+	                                              const char* stage,
+	                                              bool rotatedPrevious,
+	                                              const NNetworkStatus& st,
+	                                              uint64_t shardCount,
+	                                              uint64_t tensorCount,
+	                                              uint64_t weightsBytes);
 	uint64_t loadConfiguredSeed() const;
 	void storeConfiguredSeed(uint64_t seed);
 	shmea::GLogger* loadLoggerOverride() const;
@@ -749,6 +852,7 @@ private:
 	bool firstRunActivation;
 	NNetworkStatus lastStatus;
 	TrainerRunDiagnostics trainerRunDiagnostics;
+	mutable PersistenceDiagnostics persistenceDiagnostics;
 	TensorDFFState tensorDff;
 	RecurrentScratch recScratch;
 
@@ -1520,6 +1624,7 @@ public:
 	NNetworkStatus test(const DataInput*, ITrainingCallbacks*);
 	const NNetworkStatus& getLastStatus() const { return lastStatus; }
 	bool getTrainerRunDiagnostics(TrainerRunDiagnostics& out) const;
+	bool getPersistenceDiagnostics(PersistenceDiagnostics& out) const;
 
 	// Training loop controls (optional).
 	// These are intentionally simple knobs that do not require modifying NNInfo persistence.

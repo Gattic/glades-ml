@@ -16,6 +16,8 @@
 
 #include "network.h"
 #include "atlas_optimizer.h"
+#include "logfmt_utils.h"
+#include "Backend/Database/GLogger.h"
 
 #include <cerrno>
 #include <cmath>
@@ -37,11 +39,97 @@
 
 namespace {
 
+using namespace glades::logfmt;
+
 // Checkpoint manifest format (current and only):
 // - version=1
 // - explicit file byte order + per-tensor dtype + per-tensor shape metadata
 // - strict validation on load
 static const int kCheckpointFormatVersion = 1;
+
+static const char* status_code_name(glades::NNetworkStatus::Code code)
+{
+	switch (code)
+	{
+	case glades::NNetworkStatus::OK: return "OK";
+	case glades::NNetworkStatus::INVALID_ARGUMENT: return "INVALID_ARGUMENT";
+	case glades::NNetworkStatus::INVALID_STATE: return "INVALID_STATE";
+	case glades::NNetworkStatus::INTERNAL_ERROR: return "INTERNAL_ERROR";
+	default: return "UNKNOWN";
+	}
+}
+
+static void emit_logger_line(shmea::GLogger* logger,
+                             int level,
+                             const char* component,
+                             const std::string& line)
+{
+	if (!logger)
+		return;
+	switch (level)
+	{
+	case shmea::GLogger::LOG_DEBUG:
+		logger->debug(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_WARNING:
+		logger->warning(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_ERROR:
+		logger->error(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_FATAL:
+		logger->fatal(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_VERBOSE:
+		logger->verbose(component, shmea::GString(line.c_str()));
+		break;
+	case shmea::GLogger::LOG_INFO:
+	default:
+		logger->info(component, shmea::GString(line.c_str()));
+		break;
+	}
+}
+
+static void log_checkpoint_publish_event(const glades::NNetwork* net,
+                                         int level,
+                                         const char* event,
+                                         const char* stage,
+                                         const std::string& checkpointName,
+                                         int netType,
+                                         bool includeOptimizerState,
+                                         bool rotatedPrevious,
+                                         uint64_t shardCount,
+                                         uint64_t tensorCount,
+                                         uint64_t maxShardBytes,
+                                         const glades::NNetworkStatus* st)
+{
+	if (!net)
+		return;
+	shmea::GLogger* logger = net->getLogger();
+	if (!logger)
+		return;
+
+	std::ostringstream oss;
+	oss << "event=" << (event ? event : "checkpoint_publish_event");
+	append_logfmt_kv(oss, "operation", std::string("save_checkpoint"));
+	append_logfmt_kv(oss, "checkpoint_name", checkpointName);
+	append_logfmt_kv(oss, "net_type", netType);
+	append_logfmt_kv(oss, "stage", std::string(stage ? stage : "unknown"));
+	append_logfmt_kv(oss, "include_optimizer_state", includeOptimizerState);
+	append_logfmt_kv(oss, "rotated_previous", rotatedPrevious);
+	append_logfmt_kv(oss, "max_shard_bytes", static_cast<unsigned long long>(maxShardBytes));
+	append_logfmt_kv(oss, "shard_count", static_cast<unsigned long long>(shardCount));
+	append_logfmt_kv(oss, "tensor_count", static_cast<unsigned long long>(tensorCount));
+	if (st)
+	{
+		append_logfmt_kv(oss, "status_code", std::string(status_code_name(st->code)));
+		append_logfmt_kv(oss, "status_ok", st->ok());
+		if (!st->message.empty())
+			append_logfmt_kv(oss, "error", st->message);
+	}
+
+	emit_logger_line(logger, level, "CheckpointPersist", oss.str());
+}
 
 static inline bool is_path_separator(char c)
 {
@@ -1436,12 +1524,44 @@ namespace glades {
 
 NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const CheckpointConfig& cfg) const
 {
+	const uint64_t effectiveMaxShardBytes =
+	    static_cast<uint64_t>(cfg.maxShardBytes ? cfg.maxShardBytes : static_cast<size_t>(1024ull * 1024ull * 1024ull));
+	const NNetworkStatus okStatus(NNetworkStatus::OK, std::string());
+	PersistenceDiagnostics& diag = persistenceDiagnostics;
+	resetPersistenceDiagnosticsAttempt(diag, "save_checkpoint", checkpointName, netType, true, false,
+	                                   cfg.includeOptimizerState, effectiveMaxShardBytes);
+
 	if (checkpointName.empty())
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: checkpointName is empty");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: checkpointName is empty");
+		notePersistenceDiagnosticsFailure(diag, "validate", true, false, st, 0ULL, 0ULL, 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_WARNING, "checkpoint_publish_rejected",
+		                             "validate", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+		return st;
+	}
 	if (!is_safe_path_component(checkpointName))
-		return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: checkpointName contains unsafe characters");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: checkpointName contains unsafe characters");
+		notePersistenceDiagnosticsFailure(diag, "validate", true, false, st, 0ULL, 0ULL, 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_WARNING, "checkpoint_publish_rejected",
+		                             "validate", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+		return st;
+	}
 	if (!skeleton)
-		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "saveCheckpoint: skeleton is null");
+	{
+		const NNetworkStatus st(NNetworkStatus::INVALID_STATE, "saveCheckpoint: skeleton is null");
+		notePersistenceDiagnosticsFailure(diag, "validate", false, false, st, 0ULL, 0ULL, 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+		                             "validate", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+		return st;
+	}
+
+	log_checkpoint_publish_event(this, shmea::GLogger::LOG_INFO, "checkpoint_publish_start",
+	                             "begin", checkpointName, netType, cfg.includeOptimizerState,
+	                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &okStatus);
 
 	// Require tensors already initialized (checkpointing is for resumable training).
 	{
@@ -1451,7 +1571,15 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 		const bool hasLstm = (netType == TYPE_LSTM) && tensorLstm.initialized;
 		const bool hasTr = (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && tensorTransformer.initialized;
 		if (!hasDff && !hasRnn && !hasGru && !hasLstm && !hasTr)
-			return NNetworkStatus(NNetworkStatus::INVALID_STATE, "saveCheckpoint: tensors are not initialized (run train/test or loadModel first)");
+		{
+			const NNetworkStatus st(NNetworkStatus::INVALID_STATE,
+			                        "saveCheckpoint: tensors are not initialized (run train/test or loadModel first)");
+			notePersistenceDiagnosticsFailure(diag, "validate_tensors", false, false, st, 0ULL, 0ULL, 0ULL);
+			log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+			                             "validate_tensors", checkpointName, netType, cfg.includeOptimizerState,
+			                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+			return st;
+		}
 	}
 
 	// Optimizer-state completeness guard:
@@ -1463,9 +1591,25 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 		if (wantAdamW)
 		{
 			if (!isTransformer)
-				return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: ADAMW optimizer is only supported for transformer net types");
+			{
+				const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT,
+				                        "saveCheckpoint: ADAMW optimizer is only supported for transformer net types");
+				notePersistenceDiagnosticsFailure(diag, "validate_optimizer", true, false, st, 0ULL, 0ULL, 0ULL);
+				log_checkpoint_publish_event(this, shmea::GLogger::LOG_WARNING, "checkpoint_publish_rejected",
+				                             "validate_optimizer", checkpointName, netType, cfg.includeOptimizerState,
+				                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+				return st;
+			}
 			if (!cfg.includeOptimizerState)
-				return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: ADAMW requires includeOptimizerState=true for resumable checkpoints");
+			{
+				const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT,
+				                        "saveCheckpoint: ADAMW requires includeOptimizerState=true for resumable checkpoints");
+				notePersistenceDiagnosticsFailure(diag, "validate_optimizer", true, false, st, 0ULL, 0ULL, 0ULL);
+				log_checkpoint_publish_event(this, shmea::GLogger::LOG_WARNING, "checkpoint_publish_rejected",
+				                             "validate_optimizer", checkpointName, netType, cfg.includeOptimizerState,
+				                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+				return st;
+			}
 		}
 	}
 
@@ -1474,7 +1618,14 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 	// - atomically publish by renaming temp dir -> final dir
 	// This avoids partially-written checkpoints if the process crashes mid-write.
 	if (!ensure_checkpoint_root())
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to create checkpoint root directory");
+	{
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to create checkpoint root directory");
+		notePersistenceDiagnosticsFailure(diag, "ensure_checkpoint_root", false, false, st, 0ULL, 0ULL, 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+		                             "ensure_checkpoint_root", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+		return st;
+	}
 
 	const std::string root = checkpoint_root_dir();
 	const std::string finalDirNoSlash = join_dir(root, checkpointName);
@@ -1488,7 +1639,14 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 
 	// Create tmp dir.
 	if (!mkdir_if_missing_dir_strict(tmpDirNoSlash))
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to create temporary checkpoint directory");
+	{
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to create temporary checkpoint directory");
+		notePersistenceDiagnosticsFailure(diag, "create_tmp_dir", false, false, st, 0ULL, 0ULL, 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+		                             "create_tmp_dir", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+		return st;
+	}
 
 	struct TmpDirGuard
 	{
@@ -1520,7 +1678,12 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 		if (!rename_atomic(nnTmp, nninfoPath))
 		{
 			(void)remove_tree_recursive(tmpDirNoSlash);
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to write nninfo.csv");
+			const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to write nninfo.csv");
+			notePersistenceDiagnosticsFailure(diag, "write_nninfo", false, false, st, 0ULL, 0ULL, 0ULL);
+			log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+			                             "write_nninfo", checkpointName, netType, cfg.includeOptimizerState,
+			                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+			return st;
 		}
 	}
 
@@ -2198,25 +2361,65 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 		}
 		else
 		{
-			return NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: unknown netType");
+			const NNetworkStatus st(NNetworkStatus::INVALID_ARGUMENT, "saveCheckpoint: unknown netType");
+			notePersistenceDiagnosticsFailure(diag, "collect_tensors", true, false, st, 0ULL, 0ULL, 0ULL);
+			log_checkpoint_publish_event(this, shmea::GLogger::LOG_WARNING, "checkpoint_publish_rejected",
+			                             "collect_tensors", checkpointName, netType, cfg.includeOptimizerState,
+			                             false, 0ULL, 0ULL, effectiveMaxShardBytes, &st);
+			return st;
 		}
 	}
 
 	// 3) Write sharded blobs
-	const size_t maxShardBytes = (cfg.maxShardBytes ? cfg.maxShardBytes : static_cast<size_t>(1024ull * 1024ull * 1024ull));
+	const size_t maxShardBytes = static_cast<size_t>(effectiveMaxShardBytes);
 	CheckpointShardWriter writer(dir, maxShardBytes);
 	if (!writer.open_first())
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to open shard_000.bin for writing");
+	{
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to open shard_000.bin for writing");
+		notePersistenceDiagnosticsFailure(diag, "open_first_shard", false, false, st, 0ULL, 0ULL, 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+		                             "open_first_shard", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, 0ULL, static_cast<uint64_t>(tensorsToWrite.size()), effectiveMaxShardBytes, &st);
+		return st;
+	}
 
 	for (size_t i = 0; i < tensorsToWrite.size(); ++i)
 	{
 		if (!tensorsToWrite[i].vec)
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: internal error (null tensor vec)");
+		{
+			const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: internal error (null tensor vec)");
+			notePersistenceDiagnosticsFailure(diag, "write_shards", false, false, st, 0ULL,
+			                                  static_cast<uint64_t>(tensorsToWrite.size()), 0ULL);
+			log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+			                             "write_shards", checkpointName, netType, cfg.includeOptimizerState,
+			                             false, 0ULL, static_cast<uint64_t>(tensorsToWrite.size()), effectiveMaxShardBytes, &st);
+			return st;
+		}
 		if (!writer.add_tensor(tensorsToWrite[i].name, *tensorsToWrite[i].vec, tensorsToWrite[i].dtype, tensorsToWrite[i].shape))
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: failed while writing shard data");
+		{
+			const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: failed while writing shard data");
+			notePersistenceDiagnosticsFailure(diag, "write_shards", false, false, st,
+			                                  static_cast<uint64_t>(writer.get_shards().size()),
+			                                  static_cast<uint64_t>(tensorsToWrite.size()), 0ULL);
+			log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+			                             "write_shards", checkpointName, netType, cfg.includeOptimizerState,
+			                             false, static_cast<uint64_t>(writer.get_shards().size()),
+			                             static_cast<uint64_t>(tensorsToWrite.size()), effectiveMaxShardBytes, &st);
+			return st;
+		}
 	}
 	if (!writer.finalize_all())
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: failed to finalize shard data");
+	{
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: failed to finalize shard data");
+		notePersistenceDiagnosticsFailure(diag, "finalize_shards", false, false, st,
+		                                  static_cast<uint64_t>(writer.get_shards().size()),
+		                                  static_cast<uint64_t>(tensorsToWrite.size()), 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+		                             "finalize_shards", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, static_cast<uint64_t>(writer.get_shards().size()),
+		                             static_cast<uint64_t>(tensorsToWrite.size()), effectiveMaxShardBytes, &st);
+		return st;
+	}
 
 	// 4) Manifest
 	unsigned long long trStep = 0ULL;
@@ -2244,7 +2447,15 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 	                    writer.get_tensors(),
 	                    atlasKV))
 	{
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to write manifest.txt");
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to write manifest.txt");
+		notePersistenceDiagnosticsFailure(diag, "write_manifest", false, false, st,
+		                                  static_cast<uint64_t>(writer.get_shards().size()),
+		                                  static_cast<uint64_t>(writer.get_tensors().size()), 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+		                             "write_manifest", checkpointName, netType, cfg.includeOptimizerState,
+		                             false, static_cast<uint64_t>(writer.get_shards().size()),
+		                             static_cast<uint64_t>(writer.get_tensors().size()), effectiveMaxShardBytes, &st);
+		return st;
 	}
 
 	// 5) Atomically publish:
@@ -2252,26 +2463,53 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 	// - rename temp dir -> final dir
 	// - best-effort delete the backup
 	std::string backupDirNoSlash;
+	bool rotatedPrevious = false;
 	if (stat_is_dir(finalDirNoSlash))
 	{
 		std::ostringstream bak;
 		bak << checkpointName << ".bak_" << static_cast<unsigned long long>(::getpid()) << "_" << static_cast<unsigned long long>(time(NULL));
 		backupDirNoSlash = join_dir(root, bak.str());
 		if (!rename_atomic(finalDirNoSlash, backupDirNoSlash))
-			return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to rotate existing checkpoint directory");
+		{
+			const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to rotate existing checkpoint directory");
+			notePersistenceDiagnosticsFailure(diag, "rotate_existing", false, false, st,
+			                                  static_cast<uint64_t>(writer.get_shards().size()),
+			                                  static_cast<uint64_t>(writer.get_tensors().size()), 0ULL);
+			log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+			                             "rotate_existing", checkpointName, netType, cfg.includeOptimizerState,
+			                             false, static_cast<uint64_t>(writer.get_shards().size()),
+			                             static_cast<uint64_t>(writer.get_tensors().size()), effectiveMaxShardBytes, &st);
+			return st;
+		}
+		rotatedPrevious = true;
 	}
 	if (!rename_atomic(tmpDirNoSlash, finalDirNoSlash))
 	{
 		// Best-effort rollback.
 		if (!backupDirNoSlash.empty())
 			(void)rename_atomic(backupDirNoSlash, finalDirNoSlash);
-		return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to publish checkpoint directory (rename failed)");
+		const NNetworkStatus st(NNetworkStatus::INTERNAL_ERROR, "saveCheckpoint: unable to publish checkpoint directory (rename failed)");
+		notePersistenceDiagnosticsFailure(diag, "publish", false, rotatedPrevious, st,
+		                                  static_cast<uint64_t>(writer.get_shards().size()),
+		                                  static_cast<uint64_t>(writer.get_tensors().size()), 0ULL);
+		log_checkpoint_publish_event(this, shmea::GLogger::LOG_ERROR, "checkpoint_publish_fail",
+		                             "publish", checkpointName, netType, cfg.includeOptimizerState,
+		                             rotatedPrevious, static_cast<uint64_t>(writer.get_shards().size()),
+		                             static_cast<uint64_t>(writer.get_tensors().size()), effectiveMaxShardBytes, &st);
+		return st;
 	}
 	tmpGuard.dismiss();
 	if (!backupDirNoSlash.empty())
 		(void)remove_tree_recursive(backupDirNoSlash);
 
-	return NNetworkStatus(NNetworkStatus::OK, std::string());
+	notePersistenceDiagnosticsSuccess(diag, "publish_complete", rotatedPrevious, okStatus,
+	                                  static_cast<uint64_t>(writer.get_shards().size()),
+	                                  static_cast<uint64_t>(writer.get_tensors().size()), 0ULL);
+	log_checkpoint_publish_event(this, shmea::GLogger::LOG_INFO, "checkpoint_publish_end",
+	                             "publish_complete", checkpointName, netType, cfg.includeOptimizerState,
+	                             rotatedPrevious, static_cast<uint64_t>(writer.get_shards().size()),
+	                             static_cast<uint64_t>(writer.get_tensors().size()), effectiveMaxShardBytes, &okStatus);
+	return okStatus;
 }
 
 NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const DataInput* forShape, int netTypeOverride)
