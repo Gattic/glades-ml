@@ -20,6 +20,7 @@
 #include "Backend/Machine Learning/nn-save-load-test.h"
 #include "Backend/Machine Learning/nn-mixed-precision-test.h"
 #include "Backend/Machine Learning/nn-benchmarks.h"
+#include "Backend/Machine Learning/transformer-gpu-bench.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
@@ -90,6 +91,8 @@ int main(int argc, char* argv[])
 		TransformerServingLayerUnitTest();
 	    else if (strcmp(argv[1], "nn-bench") == 0)
 		NNBenchmarks(argc, argv);
+	    else if (strcmp(argv[1], "transformer-gpu-bench") == 0 || strcmp(argv[1], "tgpu-bench") == 0)
+		TransformerGpuBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "pca") == 0)
 		PCAUnitTest();
 	    else if (strcmp(argv[1], "kmeans") == 0)
@@ -206,6 +209,32 @@ int main(int argc, char* argv[])
 
 		    for (int i = 0; i < bench_argc; ++i)
 			    free(bench_argv[i]);
+
+		    const char* transformer_bench_args[] = {
+			"transformer-gpu-bench",
+			"--repeats", "1",
+			"--epochs", "1",
+			"--train-seqs", "2",
+			"--seq-len", "8",
+			"--infer-prompt", "8",
+			"--infer-steps", "8",
+			"--dmodel", "16",
+			"--dff", "32",
+			"--layers", "1",
+			"--heads", "4",
+			"--kv-heads", "2",
+			"--vocab", "33",
+		    };
+		    const int transformer_bench_argc = (int)(sizeof(transformer_bench_args) / sizeof(transformer_bench_args[0]));
+
+		    std::vector<char*> transformer_bench_argv(transformer_bench_argc, (char*)0);
+		    for (int i = 0; i < transformer_bench_argc; ++i)
+			    transformer_bench_argv[i] = strdup(transformer_bench_args[i]);
+
+		    TransformerGpuBenchmark(transformer_bench_argc, &transformer_bench_argv[0]);
+
+		    for (int i = 0; i < transformer_bench_argc; ++i)
+			    free(transformer_bench_argv[i]);
 
 		    NNSaveLoadUnitTest();
 		    NNMixedPrecisionUnitTest();
