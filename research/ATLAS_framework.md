@@ -32,6 +32,7 @@ The implemented redesign therefore makes three concrete changes:
 - **Fisher-weighted refresh seeds.** Refresh now follows the same curvature signal used for preconditioning instead of treating all tracked directions equally.
 - **Packed active-basis execution.** The optimizer can operate on a reduced active prefix without reallocating or reprojecting the entire stored basis every step.
 - **Conservative adaptive-rank policy.** Adaptive rank remains available, but it now shrinks only at refresh boundaries, repairs the inactive basis to keep `U` orthonormal, and is disabled by default until broader benchmarks justify turning it on globally.
+- **Projection-consistent covariance closure.** `sigma2` is no longer estimated on a separate accumulated-gradient scale; the optimizer now tracks the normalized covariance trace `tr((1/n) H H^T)` on the same update scale as the subspace Fisher statistics and derives the complement scalar by trace closure.
 
 Observed outcomes on April 8, 2026:
 - `./glades-unit-tests atlas` passes with the redesign enabled.
@@ -40,7 +41,8 @@ Observed outcomes on April 8, 2026:
 
 Interpretation:
 - The data supports **stability-first subspace tracking** and **opt-in adaptive compression**, not unconditional online rank collapse.
-- The next likely source of additional out-of-sample gains is a scale-consistency review of the baseline `sigma2` preconditioner versus the subspace Fisher statistics; this remains an open item rather than a completed claim.
+- The next likely source of additional out-of-sample gains is improving the complement closure beyond isotropy; the scale-consistency issue between `sigma2` and the subspace Fisher statistics is now addressed in the implementation by sharing one normalized covariance model.
+- The current trace-closed implementation fixed the diagnostic mismatch but did **not** improve the standard MNIST benchmark yet; on April 8, 2026 it ran at `98.20%` test accuracy, indicating the optimizer still needs post-fix retuning or a richer complement model.
 
 ---
 

@@ -393,7 +393,8 @@ struct OptimizerConfig
 // ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces) with
 // Baseline-Regularized Subspace Preconditioning (BRSP):
 // - Fisher-diagonal preconditioning in a low-rank subspace
-// - Data-driven baseline preconditioning (sigma2) in the complement space
+// - Data-driven complement closure (sigma2) derived from the same normalized
+//   covariance operator as the active Fisher statistics
 // - EMA-blended subspace refresh with Fisher transform (no catastrophic resets)
 // - Optional Predictive Natural Gradient (PNG) temporal extrapolation
 struct ATLASConfig
@@ -403,8 +404,9 @@ struct ATLASConfig
 	// Larger rank captures more curvature information at higher compute/memory cost.
 	unsigned int rank;
 
-	// Fisher EMA decay rate. Controls how quickly the Fisher diagonal and sigma2
-	// adapt. Higher values (closer to 1) give more stable estimates.
+	// Fisher EMA decay rate. Controls how quickly the Fisher diagonal and
+	// normalized covariance trace adapt. Higher values (closer to 1) give more
+	// stable estimates.
 	float beta;
 
 	// Prediction coefficient bounds. The adaptive mu is clamped to [muMin, muMax].
@@ -463,7 +465,7 @@ struct ATLASConfig
 	// at refresh boundaries. Set <= 1 to disable the flat-spectrum heuristic.
 	float flatSpectrumThreshold;
 
-	// Enable bias correction for EMA quantities (sigma2, fisherDiag).
+	// Enable bias correction for EMA quantities (sigma2, fisherDiag, totalTrace).
 	// When true, applies the standard correction factor 1/(1 - beta^step)
 	// to compensate for zero-initialization bias in early steps. This
 	// allows the optimizer to deliver meaningful preconditioning from step 1

@@ -1474,6 +1474,10 @@ static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
 		kv["atlas." + prefix + ".mu"] = oss.str();
 	}
 	{
+		std::ostringstream oss; oss << st.totalTrace;
+		kv["atlas." + prefix + ".totalTrace"] = oss.str();
+	}
+	{
 		std::ostringstream oss; oss << st.sigma2;
 		kv["atlas." + prefix + ".sigma2"] = oss.str();
 	}
@@ -1547,6 +1551,14 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 		}
 	}
 	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".totalTrace");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.totalTrace;
+		}
+	}
+	{
 		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".sigma2");
 		if (it != kv.end())
 		{
@@ -1574,6 +1586,17 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 			if (s > 0u && s <= static_cast<unsigned long long>(st.r))
 				st.activeRank = static_cast<unsigned int>(s);
 		}
+	}
+	if (st.totalTrace <= 0.0f)
+	{
+		double activeTrace = 0.0;
+		for (unsigned int c = 0; c < st.activeRank; ++c)
+			activeTrace += static_cast<double>(st.fisherDiag[c]);
+		const unsigned int complementDim = (st.m > st.activeRank) ? (st.m - st.activeRank) : 0u;
+		double closedTrace = activeTrace;
+		if (complementDim > 0u)
+			closedTrace += static_cast<double>(st.sigma2) * static_cast<double>(complementDim);
+		st.totalTrace = static_cast<float>(closedTrace > 0.0 ? closedTrace : st.sigma2);
 	}
 	st.lastBaselineRate = 0.0f;
 	st.initialized = true;

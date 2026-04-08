@@ -1659,21 +1659,6 @@ void ATLASUnitTest()
 						allGrads[s][i] = glades::rng::standard_normal(gradRng) * 0.1f;
 			}
 
-			// GPU ATLAS bootstraps sigma2 from the first real gradient instead of
-			// decaying from the CPU path's default 1.0 initialization. Seed the
-			// CPU reference with the same first-step variance so the trajectories
-			// differ only by implementation details, not different initial state.
-			{
-				double gMeanSq = 0.0;
-				for (unsigned int i = 0; i < m * n; ++i)
-				{
-					const double v = static_cast<double>(allGrads[0][i]);
-					gMeanSq += v * v;
-				}
-				gMeanSq /= static_cast<double>(m * n);
-				cpuState.sigma2 = static_cast<float>(gMeanSq > ac.eps ? gMeanSq : ac.eps);
-			}
-
 			for (unsigned int s = 0; s < nSteps; ++s)
 			{
 				std::vector<float> gW(allGrads[s]);
@@ -1699,10 +1684,10 @@ void ATLASUnitTest()
 				glades::rng::seed_engine(initRng, cpuSeed);
 				glades::atlas::WeightState tmpCpu;
 				glades::atlas::initWeightState(tmpCpu, m, n, r, muInit, initRng);
-				tmpCpu.sigma2 = cpuState.sigma2;
 				gpuState.U.upload(tmpCpu.U.data(), tmpCpu.U.size());
 				gpuState.fisherDiag.upload(tmpCpu.fisherDiag.data(), tmpCpu.fisherDiag.size());
 				gpuState.prevGz.zero();
+				gpuState.totalTrace = tmpCpu.totalTrace;
 				gpuState.sigma2 = tmpCpu.sigma2;
 				gpuState.mu = tmpCpu.mu;
 				gpuState.step = 0ULL;
@@ -1835,12 +1820,14 @@ void ATLASUnitTest()
 			cpuState.m = m;
 			cpuState.n = n;
 			cpuState.r = r;
+			cpuState.activeRank = r;
 			cpuState.U.resize((size_t)m * r);
 			gpuState.U.download(cpuState.U.data(), cpuState.U.size());
 			cpuState.fisherDiag.resize(r);
 			gpuState.fisherDiag.download(cpuState.fisherDiag.data(), r);
 			cpuState.prevGz.resize((size_t)r * n);
 			gpuState.prevGz.download(cpuState.prevGz.data(), cpuState.prevGz.size());
+			cpuState.totalTrace = gpuState.totalTrace;
 			cpuState.sigma2 = gpuState.sigma2;
 			cpuState.mu = gpuState.mu;
 			cpuState.step = gpuState.step;
@@ -1857,6 +1844,7 @@ void ATLASUnitTest()
 			cpuState.scratch_Z.resize(mr);
 			cpuState.scratch_overlap.resize((size_t)r * r);
 			cpuState.scratch_prevGzOld.resize(rn);
+			cpuState.scratch_basisPacked.resize(mr);
 
 			// Download GPU weights for CPU path
 			std::vector<float> W_cpu(mn);
@@ -2721,43 +2709,59 @@ void ATLASUnitTest()
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
 	// ---------------------------------------------------------------
-	// Test 28: sigma2 initialization uses accumulated-gradient scale
+	// Test 28: sigma2 uses normalized covariance trace closure
 	// ---------------------------------------------------------------
 	printf("-----------------------------------\n");
-	printf("ATLAS Test 28: sigma2 initialization uses accumulated-gradient scale\n");
+	printf("ATLAS Test 28: sigma2 uses normalized covariance trace closure\n");
 	printf("-----------------------------------\n");
 	{
 		const unsigned int m = 4;
 		const unsigned int n = 4;
 		const unsigned int r = 2;
-		const float invBatch = 1.0f / 1024.0f;
+		const float invBatch = 1.0f;
 		const float lr = 0.01f;
 		const float gradScale = 1.0f;
-		const float gradValue = 0.25f;
-		const float expectedSigma2 = gradValue * gradValue;
+		const float expectedTrace = 30.0f;
+		const float expectedSigma2 = 12.5f;
 
 		glades::rng::Engine rng;
 		glades::rng::seed_engine(rng, 28282828ULL);
 		glades::atlas::WeightState state;
 		glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
 
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[3] = 1.0f;
+		state.activeRank = r;
+
 		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
-		std::vector<float> gW(static_cast<size_t>(m) * n, gradValue);
+		std::vector<float> gW;
+		gW.push_back(1.0f); gW.push_back(1.0f); gW.push_back(1.0f); gW.push_back(1.0f);
+		gW.push_back(2.0f); gW.push_back(2.0f); gW.push_back(2.0f); gW.push_back(2.0f);
+		gW.push_back(3.0f); gW.push_back(3.0f); gW.push_back(3.0f); gW.push_back(3.0f);
+		gW.push_back(4.0f); gW.push_back(4.0f); gW.push_back(4.0f); gW.push_back(4.0f);
 
 		glades::ATLASConfig acSigma;
 		acSigma.rank = r;
+		acSigma.biasCorrection = false;
+		acSigma.muMin = 0.0f;
+		acSigma.muMax = 0.0f;
 
 		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
 		                                         invBatch, lr, 0.0f, 0.0f, gradScale,
 		                                         acSigma, rng);
 		ASSERT("==============ATLAS::Sigma2Scale applyStep failed==============", ok);
 
-		printf("[UT] ATLAS sigma2 scale: sigma2=%f expected=%f invBatch=%f\n",
-		       state.sigma2, expectedSigma2, invBatch);
+		printf("[UT] ATLAS closure scale: totalTrace=%f expectedTrace=%f sigma2=%f expectedSigma2=%f\n",
+		       state.totalTrace, expectedTrace, state.sigma2, expectedSigma2);
 
+		const float traceErr = state.totalTrace - expectedTrace;
+		const float traceErrAbs = (traceErr < 0.0f) ? -traceErr : traceErr;
 		const float sigmaErr = state.sigma2 - expectedSigma2;
 		const float sigmaErrAbs = (sigmaErr < 0.0f) ? -sigmaErr : sigmaErr;
-		ASSERT("==============ATLAS::Sigma2Scale sigma2 not initialized from accumulated gradient scale==============",
+		ASSERT("==============ATLAS::Sigma2Scale totalTrace not on normalized covariance scale==============",
+		       traceErrAbs < 1e-6f);
+		ASSERT("==============ATLAS::Sigma2Scale sigma2 not trace-closed from normalized covariance==============",
 		       sigmaErrAbs < 1e-6f);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
@@ -2959,7 +2963,7 @@ void ATLASGpuNaNTest()
 		       d_fisher.upload(fisher.data(), fisher.size()));
 		ASSERT("==============GPU Fisher left update==============",
 		       glades::gpu::atlas_gpu_fisher_update(
-		           d_gz_left.data(), d_fisher.data(), r, outerDim, 0.0f, false));
+		           d_gz_left.data(), d_fisher.data(), r, outerDim, 0.0f, 1.0f, false, false));
 		ASSERT("==============GPU Fisher left download==============",
 		       d_fisher.download(fisher.data(), fisher.size()));
 		for (int c = 0; c < r; ++c)
@@ -2976,7 +2980,7 @@ void ATLASGpuNaNTest()
 		       d_fisher.upload(fisher.data(), fisher.size()));
 		ASSERT("==============GPU Fisher right update==============",
 		       glades::gpu::atlas_gpu_fisher_update(
-		           d_gz_right.data(), d_fisher.data(), r, outerDim, 0.0f, true));
+		           d_gz_right.data(), d_fisher.data(), r, outerDim, 0.0f, 1.0f, true, false));
 		ASSERT("==============GPU Fisher right download==============",
 		       d_fisher.download(fisher.data(), fisher.size()));
 		for (int c = 0; c < r; ++c)

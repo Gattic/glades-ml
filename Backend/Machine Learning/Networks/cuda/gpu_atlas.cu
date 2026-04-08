@@ -47,6 +47,44 @@ static constexpr int kBlock = 256;
 // Note: GPU memory tracking is done per-init via stderr logging.
 // No global state is maintained — callers can aggregate if needed.
 
+static inline float atlas_bootstrap_or_ema(float prev,
+                                           float sample,
+                                           float beta,
+                                           unsigned long long step)
+{
+	if (step <= 1ULL)
+		return sample;
+	return beta * prev + (1.0f - beta) * sample;
+}
+
+static float compute_complement_sigma2(float totalTrace,
+                                       const std::vector<float>& fisherDiag,
+                                       unsigned int activeRank,
+                                       unsigned int subDim,
+                                       float eps,
+                                       double* activeTraceOut = 0,
+                                       double* closureGapOut = 0)
+{
+	double activeTrace = 0.0;
+	for (unsigned int c = 0; c < activeRank; ++c)
+		activeTrace += static_cast<double>(fisherDiag[c]);
+	const double closureGap = static_cast<double>(totalTrace) - activeTrace;
+	const double closedTrace = (closureGap >= 0.0)
+	    ? static_cast<double>(totalTrace)
+	    : activeTrace;
+	const unsigned int complementDim = (subDim > activeRank) ? (subDim - activeRank) : 0u;
+	double sigma2 = 0.0;
+	if (complementDim > 0u)
+		sigma2 = (closedTrace - activeTrace) / static_cast<double>(complementDim);
+	else if (activeRank > 0u)
+		sigma2 = closedTrace / static_cast<double>(activeRank);
+	if (activeTraceOut) *activeTraceOut = activeTrace;
+	if (closureGapOut) *closureGapOut = closureGap;
+	if (!std::isfinite(sigma2) || sigma2 < static_cast<double>(eps))
+		sigma2 = static_cast<double>(eps);
+	return static_cast<float>(sigma2);
+}
+
 // ---------------------------------------------------------------------------
 // Warp / block reduction primitives
 // ---------------------------------------------------------------------------
@@ -194,7 +232,9 @@ __global__ void atlas_baseline_kernel(float* __restrict__ W,
 __global__ void atlas_fisher_kernel(const float* __restrict__ gz,
                                     float* __restrict__ fisherDiag,
                                     int r, int outerDim,
-                                    float beta, float oneMinusBeta)
+                                    float beta, float oneMinusBeta,
+                                    float sampleScale,
+                                    int bootstrap)
 {
 	int c = blockIdx.x;
 	if (c >= r) return;
@@ -213,8 +253,8 @@ __global__ void atlas_fisher_kernel(const float* __restrict__ gz,
 
 	if (threadIdx.x == 0)
 	{
-		float meansq = (float)(sumsq / (double)outerDim);
-		fisherDiag[c] = beta * fisherDiag[c] + oneMinusBeta * meansq;
+		float meansq = (float)(sumsq / (double)outerDim) * sampleScale;
+		fisherDiag[c] = bootstrap ? meansq : (beta * fisherDiag[c] + oneMinusBeta * meansq);
 	}
 }
 
@@ -226,7 +266,9 @@ __global__ void atlas_fisher_kernel(const float* __restrict__ gz,
 __global__ void atlas_fisher_col_kernel(const float* __restrict__ gz,
                                          float* __restrict__ fisherDiag,
                                          int r, int outerDim,
-                                         float beta, float oneMinusBeta)
+                                         float beta, float oneMinusBeta,
+                                         float sampleScale,
+                                         int bootstrap)
 {
 	int c = blockIdx.x;
 	if (c >= r) return;
@@ -248,8 +290,8 @@ __global__ void atlas_fisher_col_kernel(const float* __restrict__ gz,
 
 	if (threadIdx.x == 0)
 	{
-		float meansq = (float)(sumsq / (double)outerDim);
-		fisherDiag[c] = beta * fisherDiag[c] + oneMinusBeta * meansq;
+		float meansq = (float)(sumsq / (double)outerDim) * sampleScale;
+		fisherDiag[c] = bootstrap ? meansq : (beta * fisherDiag[c] + oneMinusBeta * meansq);
 	}
 }
 
@@ -651,7 +693,8 @@ bool atlas_gpu_baseline_update(float* d_W, const float* d_gW, size_t mn, float b
 }
 
 bool atlas_gpu_fisher_update(const float* d_gz, float* d_fisherDiag,
-                             int r, int outerDim, float beta, bool rightSubspace)
+                             int r, int outerDim, float beta, float sampleScale,
+                             bool rightSubspace, bool bootstrap)
 {
 	if (r <= 0 || outerDim <= 0) return true;
 	int blockSize = 256;
@@ -660,10 +703,12 @@ bool atlas_gpu_fisher_update(const float* d_gz, float* d_fisherDiag,
 	int smemBytes = ((blockSize / 32) + 1) * sizeof(double);
 	if (rightSubspace)
 		atlas_fisher_col_kernel<<<r, blockSize, smemBytes, computeStream()>>>(
-			d_gz, d_fisherDiag, r, outerDim, beta, 1.0f - beta);
+			d_gz, d_fisherDiag, r, outerDim, beta, 1.0f - beta, sampleScale,
+			bootstrap ? 1 : 0);
 	else
 		atlas_fisher_kernel<<<r, blockSize, smemBytes, computeStream()>>>(
-			d_gz, d_fisherDiag, r, outerDim, beta, 1.0f - beta);
+			d_gz, d_fisherDiag, r, outerDim, beta, 1.0f - beta, sampleScale,
+			bootstrap ? 1 : 0);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -844,20 +889,18 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 	                 state.qrTemp.data()))
 		return false;
 
-	// Initialize Fisher diagonal to eps (will be set from actual gradient
-	// statistics on first step via bias correction or direct EMA).
-	// Previous init of 1.0 caused ~7000 steps of wrong preconditioning
-	// as Fisher decayed from 1.0 to the true value (~1e-6).
+	// Initialize Fisher diagonal to zero; the first real gradient bootstraps
+	// the curvature statistics before they are used for preconditioning.
 	{
-		const float epsInit = 1e-8f;
-		std::vector<float> initFisher(r, epsInit);
+		std::vector<float> initFisher(r, 0.0f);
 		if (!state.fisherDiag.upload(initFisher.data(), r)) return false;
 	}
 
 	// Zero prevGz
 	if (!state.prevGz.zero()) return false;
 
-	state.sigma2 = 1e-8f; // will be set from first step's actual gMeanSq
+	state.totalTrace = 0.0f;
+	state.sigma2 = 0.0f;
 	state.mu = muInit;
 	state.step = 0ULL;
 	state.initialized = true;
@@ -1085,6 +1128,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 
 	const unsigned int r = state.r;
 	const bool isRight = state.rightSubspace;
+	const unsigned int subDim = isRight ? n : m;
 	const unsigned int outerDim = isRight ? m : n;
 	const size_t mn = (size_t)m * n;
 	const size_t or_ = (size_t)outerDim * r;  // gz/gPred/prevGz size
@@ -1099,6 +1143,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		return false;
 
 	const float gScale = invBatch * gradScale;
+	const float statScaleSq = (invBatch > 0.0f) ? (1.0f / (invBatch * invBatch)) : 1.0f;
 
 	// NaN diagnostic: verify guard worked (only at diagnostic steps)
 	if (logger && tag && tSub > 0u && ((state.step % (unsigned long long)tSub) == 0ULL))
@@ -1130,15 +1175,13 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			bcFactor = (float)(1.0 / denom);
 	}
 
-	// === Step 1: Compute sigma2 (synchronous, matches CPU path) ===
+	float traceCapture = 0.0f;
+	float closureGap = 0.0f;
+
+	// === Step 1: Compute the normalized covariance trace ===
 	// Two-pass deterministic reduction: block partials → single-block sum.
-	// NOTE: sigma2 uses gradScale (not gScale = invBatch*gradScale) to track
-	// gradient variance on the accumulated-gradient scale. With gScale, the
-	// invBatch² factor (~6e-10 for batch=40K) pushes sigma2 below the eps
-	// floor for all weights, killing per-weight baseline rate adaptation.
-	// Using gradScale keeps sigma2 ≈ mean(gW_accum²) which is O(0.01–0.1),
-	// well above eps, allowing meaningful per-weight differentiation.
-	// The invBatch normalization is applied later via baseScaled = rate*gScale.
+	// totalTrace tracks tr(C) where C is the minibatch-normalized covariance on
+	// the accumulated-gradient gauge used historically by ATLAS.
 	{
 		int grid = (int)((mn + kBlock - 1) / kBlock);
 		if (grid > 256) grid = 256;
@@ -1152,30 +1195,20 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		    state.d_partials.data(), grid, state.d_reduce.data());
 		ATLAS_CUDA_CHECK(cudaGetLastError());
 		// Synchronous D2H — consume in the same step (matches CPU path).
-		float h_sigma2Sum = 0.0f;
+		float h_traceSum = 0.0f;
 		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
-		ATLAS_CUDA_CHECK(cudaMemcpy(&h_sigma2Sum, state.d_reduce.data(),
+		ATLAS_CUDA_CHECK(cudaMemcpy(&h_traceSum, state.d_reduce.data(),
 		                              sizeof(float), cudaMemcpyDeviceToHost));
-		float gMeanSq = h_sigma2Sum / (float)mn;
-		if (state.step == 1ULL)
+		const float traceSample = h_traceSum / (float)outerDim;
+		state.totalTrace = atlas_bootstrap_or_ema(state.totalTrace, traceSample, beta, state.step);
+		if (state.totalTrace < eps) state.totalTrace = eps;
+		if (!std::isfinite(state.totalTrace))
 		{
-			// First step: initialize sigma2 from actual gradient statistics
-			// instead of decaying from arbitrary 1.0 initialization.
-			state.sigma2 = (gMeanSq > eps) ? gMeanSq : eps;
-		}
-		else
-		{
-			state.sigma2 = beta * state.sigma2 + (1.0f - beta) * gMeanSq;
-		}
-		// Floor at eps to prevent sigma2 → 0 collapse that kills preconditioning.
-		if (state.sigma2 < eps) state.sigma2 = eps;
-		if (!std::isfinite(state.sigma2))
-		{
-			state.sigma2 = eps;
+			state.totalTrace = eps;
 			if (logger)
 			{
 				std::ostringstream oss;
-				oss << "event=atlas_gpu_sigma2_recovery step=" << state.step;
+				oss << "event=atlas_gpu_total_trace_recovery step=" << state.step;
 				if (tag) oss << " tag=" << tag;
 				logger->warning("ATLAS", shmea::GString(oss.str().c_str()));
 			}
@@ -1298,10 +1331,29 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 
 	// === Step 5: Update Fisher diagonal ===
 	if (!atlas_gpu_fisher_update(state.gz.data(), state.fisherDiag.data(),
-	                             (int)r, (int)outerDim, beta, isRight))
+	                             (int)r, (int)outerDim, beta, statScaleSq, isRight,
+	                             state.step == 1ULL))
 		return false;
 
-	// === Step 6: Full-space baseline update ===
+	// === Step 6: Recompute sigma2 from the shared covariance model ===
+	std::vector<float> h_fisher(r);
+	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+	ATLAS_CUDA_CHECK(cudaMemcpy(h_fisher.data(), state.fisherDiag.data(),
+	                              r * sizeof(float), cudaMemcpyDeviceToHost));
+	{
+		double activeTrace = 0.0;
+		double gap = 0.0;
+		state.sigma2 = compute_complement_sigma2(state.totalTrace, h_fisher, r, subDim, eps,
+		                                         &activeTrace, &gap);
+		traceCapture = (state.totalTrace > 1e-30f)
+		    ? (float)(activeTrace / (double)state.totalTrace)
+		    : 0.0f;
+		closureGap = (float)gap;
+	}
+	if (!std::isfinite(state.sigma2))
+		state.sigma2 = eps;
+
+	// === Step 7: Full-space baseline update ===
 	{
 		// Apply bias correction to sigma2 (matches CPU path).
 		const float effSigma2 = state.sigma2 * bcFactor;
@@ -1314,7 +1366,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		if (!atlas_gpu_baseline_update(d_W, d_gW, mn, baseScaled))
 			return false;
 
-		// === Step 7: Subspace correction with PNG ===
+		// === Step 8: Subspace correction with PNG ===
 		const float onePlusMu = 1.0f + state.mu;
 		const float negMu = -state.mu;
 
@@ -1355,7 +1407,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			return false;
 	}
 
-	// === Step 8: Compute mu adaptation (synchronous, matches CPU path) ===
+	// === Step 9: Compute mu adaptation (synchronous, matches CPU path) ===
 	if (state.step > 1ULL && muMax > 0.0f)
 	{
 		if (!atlas_gpu_mu_norms(state.gz.data(), state.prevGz.data(),
@@ -1405,6 +1457,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		    << " subspace=" << (isRight ? "right" : "left")
 		    << " lr=" << lr
 		    << " mu=" << state.mu
+		    << " total_trace=" << state.totalTrace
 		    << " sigma2=" << state.sigma2
 		    << " bc_factor=" << bcFactor;
 		if (diag.valid)
@@ -1416,6 +1469,8 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			    << " fisher_median=" << diag.fisherMedian
 			    << " fisher_ratio=" << (diag.fisherMin > 1e-15f ? diag.fisherMax / diag.fisherMin : 0.0f)
 			    << " sigma2_fisher_ratio=" << (diag.fisherMean > 1e-15f ? diag.sigma2 / diag.fisherMean : 0.0f)
+			    << " trace_capture=" << traceCapture
+			    << " closure_gap=" << closureGap
 			    << " effective_rank=" << diag.effectiveRank
 			    << " spectral_efficiency=" << diag.spectralEfficiency
 			    << " top1_concentration=" << diag.top1Concentration

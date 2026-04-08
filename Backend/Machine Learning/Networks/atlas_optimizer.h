@@ -30,7 +30,8 @@ namespace atlas {
 // For a weight matrix W in R^{m x n}, ATLAS maintains:
 // - U in R^{m x r}: orthonormal subspace basis (top-r Fisher eigenvectors)
 // - fisherDiag in R^r: EMA of Fisher eigenvalues per subspace dimension
-// - sigma2: global second moment EMA (scalar baseline preconditioner)
+// - totalTrace: EMA of the normalized covariance trace on the ATLAS update scale
+// - sigma2: complement closure scalar derived from totalTrace and fisherDiag
 // - prevGz in R^{r x n}: previous step's compressed gradient
 // - mu: adaptive temporal prediction coefficient
 struct WeightState
@@ -57,7 +58,8 @@ struct WeightState
 	std::vector<float> scratch_prevGzOld; // [r * n]
 	std::vector<float> scratch_basisPacked; // [m * r] packed leading basis for GEMM fast path
 
-	float sigma2;                   // global second moment EMA (BRSP baseline)
+	float totalTrace;               // EMA trace of the normalized covariance operator
+	float sigma2;                   // complement closure scalar (BRSP baseline)
 	float mu;                       // adaptive prediction coefficient
 	float lastBaselineRate;         // diagnostics for the most recent baseline step
 	unsigned long long step;        // optimizer step counter
@@ -65,7 +67,7 @@ struct WeightState
 
 	WeightState()
 	    : m(0u), n(0u), r(0u), activeRank(0u),
-	      sigma2(1.0f), mu(0.01f), lastBaselineRate(0.0f),
+	      totalTrace(0.0f), sigma2(0.0f), mu(0.01f), lastBaselineRate(0.0f),
 	      step(0ULL), initialized(false)
 	{
 	}
@@ -85,7 +87,8 @@ struct WeightState
 		scratch_overlap.clear();
 		scratch_prevGzOld.clear();
 		scratch_basisPacked.clear();
-		sigma2 = 1.0f;
+		totalTrace = 0.0f;
+		sigma2 = 0.0f;
 		mu = 0.01f;
 		lastBaselineRate = 0.0f;
 		step = 0ULL;
@@ -125,14 +128,15 @@ bool refreshSubspace(WeightState& state, const float* grad,
 // Apply one ATLAS optimizer step (BRSP variant).
 //
 // Baseline-Regularized Subspace Preconditioning (BRSP):
-// 1. Update global second moment sigma2 (scalar EMA of mean(G^2))
+// 1. Update the normalized covariance trace on the ATLAS update scale
 // 2. Periodic subspace refresh with EMA blending (every tSub steps)
 // 3. Apply decoupled weight decay to W (full-space)
 // 4. Project gradient to subspace: gz = U^T * G
 // 5. Update Fisher diagonal (EMA)
-// 6. Full-space baseline update: W -= (lr/(sigma2+eps)) * G
-// 7. Subspace correction: W += U * diag(lr/(sigma2+eps) - lr/(f+eps)) * gPred
-// 8. Adapt prediction coefficient mu
+// 6. Recompute sigma2 by trace-closing the complement covariance
+// 7. Full-space baseline update: W -= (lr/(sigma2+eps)) * G
+// 8. Subspace correction: W += U * diag(lr/(sigma2+eps) - lr/(f+eps)) * gPred
+// 9. Adapt prediction coefficient mu
 //
 // The net effect is:
 //   subspace direction c:  step = -lr/(f_c+eps) * gPred_c  (Fisher-preconditioned)

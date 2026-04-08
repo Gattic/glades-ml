@@ -36,6 +36,50 @@ static inline bool atlas_isfinite(float x)
 	return std::isfinite(x);
 }
 
+static inline float atlas_bootstrap_or_ema(float prev,
+                                           float sample,
+                                           float beta,
+                                           unsigned long long step)
+{
+	if (step <= 1ULL)
+		return sample;
+	return beta * prev + (1.0f - beta) * sample;
+}
+
+static double compute_active_trace(const WeightState& state, unsigned int activeRank)
+{
+	double activeTrace = 0.0;
+	for (unsigned int c = 0; c < activeRank; ++c)
+		activeTrace += static_cast<double>(state.fisherDiag[c]);
+	return activeTrace;
+}
+
+static float compute_complement_sigma2(const WeightState& state,
+                                       unsigned int activeRank,
+                                       unsigned int subDim,
+                                       float eps,
+                                       double* activeTraceOut = 0,
+                                       double* closureGapOut = 0)
+{
+	const double activeTrace = compute_active_trace(state, activeRank);
+	const double closureGap = static_cast<double>(state.totalTrace) - activeTrace;
+	const double closedTrace = (closureGap >= 0.0)
+	    ? static_cast<double>(state.totalTrace)
+	    : activeTrace;
+	const unsigned int complementDim = (subDim > activeRank) ? (subDim - activeRank) : 0u;
+	double sigma2 = 0.0;
+	if (complementDim > 0u)
+		sigma2 = (closedTrace - activeTrace) / static_cast<double>(complementDim);
+	else if (activeRank > 0u)
+		sigma2 = closedTrace / static_cast<double>(activeRank);
+
+	if (activeTraceOut) *activeTraceOut = activeTrace;
+	if (closureGapOut) *closureGapOut = closureGap;
+	if (!std::isfinite(sigma2) || sigma2 < static_cast<double>(eps))
+		sigma2 = static_cast<double>(eps);
+	return static_cast<float>(sigma2);
+}
+
 static unsigned int atlas_clamp_active_rank(unsigned int activeRank,
                                             unsigned int maxRank,
                                             unsigned int minActiveRank)
@@ -486,8 +530,9 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 
 	gramSchmidt(&state.U[0], m, r, logger);
 
-	// Initialize Fisher diagonal to 1.0 (neutral preconditioning)
-	state.fisherDiag.assign(static_cast<size_t>(r), 1.0f);
+	// Initialize Fisher statistics to zero; the first real gradient bootstraps
+	// them to data-dependent values before they are used for preconditioning.
+	state.fisherDiag.assign(static_cast<size_t>(r), 0.0f);
 
 	// Initialize previous compressed gradient to zero
 	state.prevGz.assign(static_cast<size_t>(r) * static_cast<size_t>(n), 0.0f);
@@ -505,7 +550,8 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 	state.scratch_prevGzOld.resize(rn);
 	state.scratch_basisPacked.resize(mr);
 
-	state.sigma2 = 1.0f;
+	state.totalTrace = 0.0f;
+	state.sigma2 = 0.0f;
 	state.mu = muInit;
 	state.lastBaselineRate = 0.0f;
 	state.step = 0ULL;
@@ -746,6 +792,7 @@ bool applyStep(WeightState& state,
 		&& (state.step % static_cast<unsigned long long>(tSub)) == 0ULL;
 
 	const float gScale = invBatch * gradScale;
+	const float statScaleSq = (invBatch > 0.0f) ? (1.0f / (invBatch * invBatch)) : 1.0f;
 
 	// === Bias correction factor ===
 	// Compensates for zero-initialization bias in EMA quantities.
@@ -761,37 +808,27 @@ bool applyStep(WeightState& state,
 			bcFactor = static_cast<float>(1.0 / denom);
 	}
 
-	// === Step 1: Update global second moment sigma2 ===
-	// sigma2 tracks mean(G_accum^2) on the accumulated-gradient scale.
-	// Using gScale here would inject an invBatch^2 factor, driving sigma2
-	// toward zero for large batches and collapsing baseline-rate adaptation.
-	// The invBatch normalization is applied later in the actual update via
-	// baseScaled = baselineRate * gScale.
+	// === Step 1: Update the normalized covariance trace ===
+	// totalTrace tracks tr(C) where C = (1/n) * H * H^T and H = gradScale * G.
+	// The active Fisher statistics are reduced from the same operator, so sigma2
+	// can be recovered by trace closure without changing the historical gauge.
 	{
-		double gMeanSq = 0.0;
+		double traceSample = 0.0;
 		for (size_t idx = 0; idx < mn; ++idx)
 		{
 			const double v = static_cast<double>(gW[idx]) * static_cast<double>(gradScale);
-			gMeanSq += v * v;
+			traceSample += v * v;
 		}
-		gMeanSq /= static_cast<double>(mn);
-		if (state.step == 1ULL)
+		traceSample /= static_cast<double>(n);
+		state.totalTrace = atlas_bootstrap_or_ema(state.totalTrace,
+		                                          static_cast<float>(traceSample),
+		                                          beta,
+		                                          state.step);
+		if (state.totalTrace < eps)
+			state.totalTrace = eps;
+		if (!atlas_isfinite(state.totalTrace))
 		{
-			// Initialize from the actual first-step gradient statistics rather than
-			// decaying from the arbitrary reset value.
-			state.sigma2 = (gMeanSq > static_cast<double>(eps))
-			             ? static_cast<float>(gMeanSq)
-			             : eps;
-		}
-		else
-		{
-			state.sigma2 = beta * state.sigma2 + (1.0f - beta) * static_cast<float>(gMeanSq);
-		}
-		if (state.sigma2 < eps)
-			state.sigma2 = eps;
-		if (!atlas_isfinite(state.sigma2))
-		{
-			state.sigma2 = eps;
+			state.totalTrace = eps;
 			recovered = true;
 		}
 	}
@@ -829,7 +866,6 @@ bool applyStep(WeightState& state,
 	glades::gemm::atb(&gz[0], &basisPacked[0], gW, activeRank, m, n, gScale);
 
 	// === Step 5: Update Fisher diagonal (EMA of mean squared projected gradient) ===
-	const float oneMinusBeta = 1.0f - beta;
 	for (unsigned int c = 0; c < activeRank; ++c)
 	{
 		double sumsq = 0.0;
@@ -838,19 +874,30 @@ bool applyStep(WeightState& state,
 			const double v = static_cast<double>(gz[c * n + j]);
 			sumsq += v * v;
 		}
-		const float meansq = static_cast<float>(sumsq / static_cast<double>(n));
-		state.fisherDiag[c] = beta * state.fisherDiag[c] + oneMinusBeta * meansq;
+		const float meansq = static_cast<float>(sumsq / static_cast<double>(n)) * statScaleSq;
+		state.fisherDiag[c] = atlas_bootstrap_or_ema(state.fisherDiag[c],
+		                                             meansq,
+		                                             beta,
+		                                             state.step);
 		if (!atlas_isfinite(state.fisherDiag[c]))
 		{
-			state.fisherDiag[c] = 1.0f;
+			state.fisherDiag[c] = eps;
 			recovered = true;
 		}
 	}
 
-	// === Step 6: Full-space baseline update ===
+	// === Step 6: Recompute sigma2 from the shared covariance model ===
+	state.sigma2 = compute_complement_sigma2(state, activeRank, m, eps);
+	if (!atlas_isfinite(state.sigma2))
+	{
+		state.sigma2 = eps;
+		recovered = true;
+	}
+
+	// === Step 7: Full-space baseline update ===
 	// W -= min(lr / (effSigma2 + eps), kappaMax * lr) * G
 	// Baseline rate is capped at kappaMax*lr to prevent divergence
-	// when sigma2 converges to small gradient variance.
+	// when sigma2 converges to small complement variance.
 	// effSigma2 includes bias correction so early steps get meaningful preconditioning.
 	const float kappaLr = kappaMax * lr;
 	const float effSigma2 = state.sigma2 * bcFactor;
@@ -864,7 +911,7 @@ bool applyStep(WeightState& state,
 			W[idx] += baseScaled * gW[idx];
 	}
 
-	// === Step 7: Subspace correction with optional PNG ===
+	// === Step 8: Subspace correction with optional PNG ===
 	//
 	// corrScale_c = baselineRate - min(lr/(effFisher_c+eps), kappaLr)
 	//
@@ -922,7 +969,7 @@ bool applyStep(WeightState& state,
 			updateNormSq += static_cast<double>(corrected[idx]) * static_cast<double>(corrected[idx]);
 	}
 
-	// === Step 8: Adapt prediction coefficient ===
+	// === Step 9: Adapt prediction coefficient ===
 	// Bidirectional adaptation: mu decreases when gradients oscillate (ratio > 0)
 	// and slowly recovers via muGrowthRate when gradients are smooth.
 	// newMu = mu * (1 - ratio) + muGrowthRate * (muMax - mu)
@@ -984,6 +1031,7 @@ bool applyStep(WeightState& state,
 			state.activeRank = targetRank;
 		activeRank = state.activeRank;
 		rn = static_cast<size_t>(activeRank) * static_cast<size_t>(n);
+		state.sigma2 = compute_complement_sigma2(state, activeRank, m, eps);
 	}
 
 	// === Periodic diagnostics ===
@@ -1015,8 +1063,15 @@ bool applyStep(WeightState& state,
 		const float top1Concentration = compute_topk_concentration(state, activeRank, 1u);
 		const float top10Concentration = compute_topk_concentration(state, activeRank, 10u);
 		const float fisherRatio = (fMin > 1e-12f) ? (fMax / fMin) : 0.0f;
+		double activeTrace = 0.0;
+		double closureGap = 0.0;
+		const float sigma2Closed =
+		    compute_complement_sigma2(state, activeRank, m, eps, &activeTrace, &closureGap);
 		const float sigma2FisherRatio = (fSum > 1e-30)
-		    ? static_cast<float>(state.sigma2 / (fSum / static_cast<double>(activeRank)))
+		    ? static_cast<float>(sigma2Closed / (fSum / static_cast<double>(activeRank)))
+		    : 0.0f;
+		const float traceCapture = (state.totalTrace > 1e-30f)
+		    ? static_cast<float>(activeTrace / static_cast<double>(state.totalTrace))
 		    : 0.0f;
 
 		std::ostringstream oss;
@@ -1029,6 +1084,7 @@ bool applyStep(WeightState& state,
 		append_kv(oss, "active_rank", activeRank);
 		append_kv(oss, "lr", lr);
 		append_kv(oss, "mu", state.mu);
+		append_kv(oss, "total_trace", state.totalTrace);
 		append_kv(oss, "sigma2", state.sigma2);
 		append_kv(oss, "baseline_rate", baselineRate);
 		append_kv(oss, "gz_norm", static_cast<float>(sqrt(gzNormSq)));
@@ -1038,6 +1094,8 @@ bool applyStep(WeightState& state,
 		append_kv(oss, "fisher_mean", static_cast<float>(fSum / static_cast<double>(activeRank)));
 		append_kv(oss, "fisher_ratio", fisherRatio);
 		append_kv(oss, "sigma2_fisher_ratio", sigma2FisherRatio);
+		append_kv(oss, "trace_capture", traceCapture);
+		append_kv(oss, "closure_gap", static_cast<float>(closureGap));
 		append_kv(oss, "effective_rank", effectiveRank);
 		append_kv(oss, "spectral_efficiency", spectralEfficiency);
 		append_kv(oss, "top1_concentration", top1Concentration);
@@ -1045,13 +1103,13 @@ bool applyStep(WeightState& state,
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
 
-	// === Step 9: Store compressed gradient for next step ===
+	// === Step 10: Store compressed gradient for next step ===
 	if (rn > 0u)
 		std::copy(gz.begin(), gz.begin() + rn, state.prevGz.begin());
 	if (state.prevGz.size() > rn)
 		std::fill(state.prevGz.begin() + rn, state.prevGz.end(), 0.0f);
 
-	// === Step 10: Clear accumulated gradients ===
+	// === Step 11: Clear accumulated gradients ===
 	std::memset(gW, 0, mn * sizeof(float));
 
 	return !recovered;

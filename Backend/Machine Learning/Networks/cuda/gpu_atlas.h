@@ -63,6 +63,7 @@ struct GpuAtlasWeightState
 	bool refreshAllocated;       // true after refresh scratch buffers allocated
 
 	// Host-side scalars (passed to kernels as parameters, updated on host)
+	float totalTrace;
 	float sigma2;
 	float mu;
 	unsigned long long step;
@@ -72,7 +73,7 @@ struct GpuAtlasWeightState
 	GpuAtlasWeightState()
 	    : m(0u), n(0u), r(0u), rightSubspace(false),
 	      refreshAllocated(false),
-	      sigma2(1.0f), mu(0.01f), step(0ULL), initialized(false),
+	      totalTrace(0.0f), sigma2(0.0f), mu(0.01f), step(0ULL), initialized(false),
 	      lastBaselineRate(0.0f)
 	{
 	}
@@ -166,7 +167,8 @@ bool atlas_gpu_baseline_update(float* d_W, const float* d_gW, size_t mn, float b
 // Right subspace: gz[m, r], direction c = col c (strided, stride=r)
 // outerDim: n (left) or m (right) — number of elements per direction
 bool atlas_gpu_fisher_update(const float* d_gz, float* d_fisherDiag,
-                              int r, int outerDim, float beta, bool rightSubspace);
+                              int r, int outerDim, float beta, float sampleScale,
+                              bool rightSubspace, bool bootstrap);
 
 // Prepare scaled prediction for subspace correction.
 // Left subspace:  gz/out are [r, outerDim], direction c = row c
@@ -215,8 +217,12 @@ namespace gpu {
 
 struct GpuAtlasWeightState
 {
+	float totalTrace;
+	float sigma2;
+	float mu;
+	unsigned long long step;
 	bool initialized;
-	GpuAtlasWeightState() : initialized(false) {}
+	GpuAtlasWeightState() : totalTrace(0.0f), sigma2(0.0f), mu(0.0f), step(0ULL), initialized(false) {}
 };
 
 struct AtlasGpuDiag
