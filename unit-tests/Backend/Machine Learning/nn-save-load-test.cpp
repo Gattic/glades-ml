@@ -367,6 +367,9 @@ public:
 		return true;
 	}
 
+	virtual bool hasTokenIdInput() const { return true; }
+	virtual bool hasTokenIdExpectedOutput() const { return true; }
+
 	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok.size()); }
 	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok.size()); }
 	virtual unsigned int getFeatureCount() const { return 1u; }
