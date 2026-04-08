@@ -2951,6 +2951,94 @@ void ATLASUnitTest()
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
 	// ---------------------------------------------------------------
+	// Test 28C: dense complement block captures correlated residuals
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 28C: dense complement block captures correlated residuals\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 6;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 28282830ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.01f, rng);
+
+		state.complementRank = 2u;
+		state.V.assign(static_cast<size_t>(m) * state.complementRank, 0.0f);
+		state.complementBlock.assign(static_cast<size_t>(state.complementRank) * state.complementRank, 0.0f);
+		state.prevGv.assign(static_cast<size_t>(state.complementRank) * n, 0.0f);
+		state.scratch_gv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_correctedV.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_V_old.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_Bv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_Zv.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_complementMat.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVec.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVal.resize(state.complementRank);
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		state.activeRank = r;
+		state.V[2 * state.complementRank + 0] = 1.0f;
+		state.V[3 * state.complementRank + 1] = 1.0f;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0 * n + j] = 1.0f;
+			gW[1 * n + j] = 2.0f;
+			gW[2 * n + j] = 4.0f;
+			gW[3 * n + j] = 3.0f;
+			gW[4 * n + j] = 1.0f;
+			gW[5 * n + j] = 1.0f;
+		}
+
+		glades::ATLASConfig acDense;
+		acDense.rank = r;
+		acDense.complementRank = 2u;
+		acDense.biasCorrection = false;
+		acDense.muMin = 0.0f;
+		acDense.muMax = 0.0f;
+		acDense.tSub = 0u;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                         acDense, rng);
+		ASSERT("==============ATLAS::DenseComplement applyStep failed==============", ok);
+
+		const float expectedTrace = 32.0f;
+		const float expectedBlock00 = 16.0f;
+		const float expectedBlock01 = 12.0f;
+		const float expectedBlock11 = 9.0f;
+		const float expectedComplementTrace = 25.0f;
+		const float expectedSigma2 = 1.0f;
+		printf("[UT] ATLAS dense complement: totalTrace=%f block=[%f %f; %f %f] sectorFisher=%f sigma2=%f\n",
+		       state.totalTrace,
+		       state.complementBlock[0], state.complementBlock[1],
+		       state.complementBlock[2], state.complementBlock[3],
+		       state.complementFisher, state.sigma2);
+		ASSERT("==============ATLAS::DenseComplement totalTrace mismatch==============",
+		       fabsf(state.totalTrace - expectedTrace) < 1e-6f);
+		ASSERT("==============ATLAS::DenseComplement block00 mismatch==============",
+		       fabsf(state.complementBlock[0] - expectedBlock00) < 1e-6f);
+		ASSERT("==============ATLAS::DenseComplement block01 mismatch==============",
+		       fabsf(state.complementBlock[1] - expectedBlock01) < 1e-6f
+		       && fabsf(state.complementBlock[2] - expectedBlock01) < 1e-6f);
+		ASSERT("==============ATLAS::DenseComplement block11 mismatch==============",
+		       fabsf(state.complementBlock[3] - expectedBlock11) < 1e-6f);
+		ASSERT("==============ATLAS::DenseComplement sectorFisher mismatch==============",
+		       fabsf(state.complementFisher - expectedComplementTrace) < 1e-6f);
+		ASSERT("==============ATLAS::DenseComplement sigma2 mismatch==============",
+		       fabsf(state.sigma2 - expectedSigma2) < 1e-6f);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
 	// Test 29: Scale stress test (m=512, n=512, r=64)
 	// ---------------------------------------------------------------
 	printf("-----------------------------------\n");

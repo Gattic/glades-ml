@@ -1519,10 +1519,12 @@ static void enqueueAtlasWrite(std::vector<TensorWriteRef>& out,
 	{
 		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(st.m));
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
 		out.push_back(TensorWriteRef(prefix + ".atlas.V", &st.V, dt, sh));
 	}
 	{
 		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
 		sh.push_back(static_cast<uint64_t>(st.n));
 		out.push_back(TensorWriteRef(prefix + ".atlas.prevGv", &st.prevGv, dt, sh));
 	}
@@ -1530,51 +1532,98 @@ static void enqueueAtlasWrite(std::vector<TensorWriteRef>& out,
 
 static bool restoreAtlasComplementBasis(glades::atlas::WeightState& st)
 {
-	if (st.V.size() != static_cast<size_t>(st.m))
-		st.V.assign(static_cast<size_t>(st.m), 0.0f);
-
-	double normSq = 0.0;
-	for (unsigned int i = 0; i < st.m; ++i)
-	{
-		const double v = static_cast<double>(st.V[i]);
-		normSq += v * v;
-	}
-	if (normSq > 1e-12)
-		return true;
+	const unsigned int compRank = (st.complementRank > 0u) ? st.complementRank : 1u;
+	if (st.V.size() != static_cast<size_t>(st.m) * compRank)
+		st.V.assign(static_cast<size_t>(st.m) * compRank, 0.0f);
 
 	const unsigned int activeRank = (st.activeRank <= st.r) ? st.activeRank : st.r;
-	for (unsigned int basisRow = 0; basisRow < st.m; ++basisRow)
+	unsigned int informative = 0u;
+	for (unsigned int c = 0; c < compRank; ++c)
 	{
-		std::fill(st.V.begin(), st.V.end(), 0.0f);
-		st.V[basisRow] = 1.0f;
-		for (unsigned int c = 0; c < activeRank; ++c)
+		std::vector<float> col(static_cast<size_t>(st.m), 0.0f);
+		for (unsigned int i = 0; i < st.m; ++i)
+			col[i] = st.V[static_cast<size_t>(i) * compRank + c];
+
+		for (unsigned int a = 0; a < activeRank; ++a)
 		{
 			double dot = 0.0;
 			for (unsigned int i = 0; i < st.m; ++i)
-				dot += static_cast<double>(st.V[i])
-				    * static_cast<double>(st.U[static_cast<size_t>(i) * st.r + c]);
+				dot += static_cast<double>(col[i])
+				    * static_cast<double>(st.U[static_cast<size_t>(i) * st.r + a]);
 			const float dotf = static_cast<float>(dot);
 			for (unsigned int i = 0; i < st.m; ++i)
-				st.V[i] -= dotf * st.U[static_cast<size_t>(i) * st.r + c];
+				col[i] -= dotf * st.U[static_cast<size_t>(i) * st.r + a];
+		}
+		for (unsigned int prev = 0; prev < c; ++prev)
+		{
+			double dot = 0.0;
+			for (unsigned int i = 0; i < st.m; ++i)
+				dot += static_cast<double>(col[i])
+				    * static_cast<double>(st.V[static_cast<size_t>(i) * compRank + prev]);
+			const float dotf = static_cast<float>(dot);
+			for (unsigned int i = 0; i < st.m; ++i)
+				col[i] -= dotf * st.V[static_cast<size_t>(i) * compRank + prev];
 		}
 
-		normSq = 0.0;
+		double normSq = 0.0;
 		for (unsigned int i = 0; i < st.m; ++i)
 		{
-			const double v = static_cast<double>(st.V[i]);
+			const double v = static_cast<double>(col[i]);
 			normSq += v * v;
 		}
-		if (normSq > 1e-12)
+		if (normSq <= 1e-12)
 		{
-			const float invNorm = static_cast<float>(1.0 / std::sqrt(normSq));
-			for (unsigned int i = 0; i < st.m; ++i)
-				st.V[i] *= invNorm;
-			return true;
+			bool seeded = false;
+			for (unsigned int basisRow = 0; basisRow < st.m && !seeded; ++basisRow)
+			{
+				std::fill(col.begin(), col.end(), 0.0f);
+				col[basisRow] = 1.0f;
+				for (unsigned int a = 0; a < activeRank; ++a)
+				{
+					double dot = 0.0;
+					for (unsigned int i = 0; i < st.m; ++i)
+						dot += static_cast<double>(col[i])
+						    * static_cast<double>(st.U[static_cast<size_t>(i) * st.r + a]);
+					const float dotf = static_cast<float>(dot);
+					for (unsigned int i = 0; i < st.m; ++i)
+						col[i] -= dotf * st.U[static_cast<size_t>(i) * st.r + a];
+				}
+				for (unsigned int prev = 0; prev < c; ++prev)
+				{
+					double dot = 0.0;
+					for (unsigned int i = 0; i < st.m; ++i)
+						dot += static_cast<double>(col[i])
+						    * static_cast<double>(st.V[static_cast<size_t>(i) * compRank + prev]);
+					const float dotf = static_cast<float>(dot);
+					for (unsigned int i = 0; i < st.m; ++i)
+						col[i] -= dotf * st.V[static_cast<size_t>(i) * compRank + prev];
+				}
+				normSq = 0.0;
+				for (unsigned int i = 0; i < st.m; ++i)
+				{
+					const double v = static_cast<double>(col[i]);
+					normSq += v * v;
+				}
+				seeded = (normSq > 1e-12);
+			}
+			if (normSq <= 1e-12)
+			{
+				for (unsigned int i = 0; i < st.m; ++i)
+					st.V[static_cast<size_t>(i) * compRank + c] = 0.0f;
+				continue;
+			}
 		}
+
+		const float invNorm = static_cast<float>(1.0 / std::sqrt(normSq));
+		for (unsigned int i = 0; i < st.m; ++i)
+			st.V[static_cast<size_t>(i) * compRank + c] = col[i] * invNorm;
+		informative = c + 1u;
 	}
 
-	std::fill(st.V.begin(), st.V.end(), 0.0f);
-	return false;
+	for (unsigned int c = informative; c < compRank; ++c)
+		for (unsigned int i = 0; i < st.m; ++i)
+			st.V[static_cast<size_t>(i) * compRank + c] = 0.0f;
+	return informative > 0u || compRank == 0u;
 }
 
 static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
@@ -1600,6 +1649,15 @@ static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
 		kv["atlas." + prefix + ".complementFisher"] = oss.str();
 	}
 	{
+		std::ostringstream oss;
+		for (size_t i = 0; i < st.complementBlock.size(); ++i)
+		{
+			if (i > 0u) oss << ' ';
+			oss << st.complementBlock[i];
+		}
+		kv["atlas." + prefix + ".complementBlock"] = oss.str();
+	}
+	{
 		std::ostringstream oss; oss << static_cast<unsigned long long>(st.step);
 		kv["atlas." + prefix + ".step"] = oss.str();
 	}
@@ -1613,26 +1671,32 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
                               const std::string& prefix,
                               glades::atlas::WeightState& st,
                               unsigned int m, unsigned int n, unsigned int r,
+                              unsigned int complementRankCfg,
                               const std::string& dt)
 {
 	st.m = m;
 	st.n = n;
 	st.r = r;
 	st.activeRank = r;
+	st.complementRank = (complementRankCfg > 0u) ? complementRankCfg : 1u;
 	st.complementFisher = 0.0f;
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
 	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
+	const size_t cr = static_cast<size_t>(st.complementRank);
+	const size_t cn = cr * static_cast<size_t>(n);
+	const size_t mc = static_cast<size_t>(m) * cr;
 	st.U.resize(mr);
 	st.fisherDiag.resize(r);
-	st.V.resize(m);
+	st.V.resize(mc);
+	st.complementBlock.assign(cr * cr, 0.0f);
 	st.prevGz.resize(rn);
-	st.prevGv.resize(n);
+	st.prevGv.resize(cn);
 
 	// Allocate persistent scratch buffers (must match initWeightState).
 	st.scratch_gz.resize(rn);
 	st.scratch_corrected.resize(rn);
-	st.scratch_gv.resize(n);
-	st.scratch_correctedV.resize(n);
+	st.scratch_gv.resize(cn);
+	st.scratch_correctedV.resize(cn);
 	st.scratch_U_old.resize(mr);
 	st.scratch_f_old.resize(static_cast<size_t>(r));
 	st.scratch_B.resize(rn);
@@ -1640,9 +1704,12 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
 	st.scratch_prevGzOld.resize(rn);
 	st.scratch_basisPacked.resize(mr);
-	st.scratch_V_old.resize(m);
-	st.scratch_Bv.resize(n);
-	st.scratch_Zv.resize(m);
+	st.scratch_V_old.resize(mc);
+	st.scratch_Bv.resize(cn);
+	st.scratch_Zv.resize(mc);
+	st.scratch_complementMat.resize(cr * cr);
+	st.scratch_complementEigVec.resize(cr * cr);
+	st.scratch_complementEigVal.resize(cr);
 	{
 		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(m));
@@ -1663,10 +1730,12 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	{
 		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(m));
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
 		out.push_back(TensorReadRef(prefix + ".atlas.V", &st.V, dt, sh));
 	}
 	{
 		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
 		sh.push_back(static_cast<uint64_t>(n));
 		out.push_back(TensorReadRef(prefix + ".atlas.prevGv", &st.prevGv, dt, sh));
 	}
@@ -1711,6 +1780,23 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 		}
 	}
 	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".complementBlock");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			for (size_t i = 0; i < st.complementBlock.size(); ++i)
+			{
+				if (!(iss >> st.complementBlock[i]))
+					break;
+			}
+		}
+		else if (!st.complementBlock.empty())
+		{
+			std::fill(st.complementBlock.begin(), st.complementBlock.end(), 0.0f);
+			st.complementBlock[0] = st.complementFisher;
+		}
+	}
+	{
 		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".step");
 		if (it != kv.end())
 		{
@@ -1732,17 +1818,38 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 		}
 	}
 	if (st.prevGv.empty())
-		st.prevGv.assign(static_cast<size_t>(st.n), 0.0f);
+		st.prevGv.assign(static_cast<size_t>(st.complementRank ? st.complementRank : 1u) * static_cast<size_t>(st.n), 0.0f);
 	restoreAtlasComplementBasis(st);
+	{
+		double compTrace = 0.0;
+		for (unsigned int c = 0; c < st.complementRank; ++c)
+			compTrace += static_cast<double>(st.complementBlock[static_cast<size_t>(c) * st.complementRank + c]);
+		st.complementFisher = static_cast<float>(compTrace);
+	}
 	if (st.totalTrace <= 0.0f)
 	{
 		double activeTrace = 0.0;
 		for (unsigned int c = 0; c < st.activeRank; ++c)
 			activeTrace += static_cast<double>(st.fisherDiag[c]);
 		activeTrace += static_cast<double>(st.complementFisher);
-		const unsigned int sectorRank = (st.m > st.activeRank + 1u) ? 1u : 0u;
-		const unsigned int complementDim = (st.m > st.activeRank + sectorRank)
-		    ? (st.m - st.activeRank - sectorRank)
+		unsigned int effectiveComplementRank = 0u;
+		if (st.complementFisher > 1e-12f)
+		{
+			for (unsigned int c = 0; c < st.complementRank; ++c)
+			{
+				double normSq = 0.0;
+				for (unsigned int i = 0; i < st.m; ++i)
+				{
+					const double v = static_cast<double>(st.V[static_cast<size_t>(i) * st.complementRank + c]);
+					normSq += v * v;
+				}
+				if (normSq <= 1e-12)
+					break;
+				effectiveComplementRank = c + 1u;
+			}
+		}
+		const unsigned int complementDim = (st.m > st.activeRank + effectiveComplementRank)
+		    ? (st.m - st.activeRank - effectiveComplementRank)
 		    : 0u;
 		double closedTrace = activeTrace;
 		if (complementDim > 0u)
@@ -2847,6 +2954,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	const std::string dt = "f32";
 	const bool isAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 	const unsigned int atlasRank = trainingConfig.atlas.rank;
+	const unsigned int atlasComplementRank = trainingConfig.atlas.complementRank;
 	if (netType == TYPE_DFF)
 	{
 		// Pre-allocate ATLAS state vector so checkpoint tensors can be read into it.
@@ -2882,7 +2990,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				const unsigned int m = tr.out, n = tr.in;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
 				std::ostringstream oss; oss << "dff.t" << static_cast<unsigned long long>(t);
-				enqueueAtlasRead(expected, oss.str(), tensorDff.atlasState[t], m, n, r, dt);
+				enqueueAtlasRead(expected, oss.str(), tensorDff.atlasState[t], m, n, r, atlasComplementRank, dt);
 			}
 		}
 	}
@@ -2934,13 +3042,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					const unsigned int m = hl.h, n = hl.in;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Wxh";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasWxh, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasWxh, m, n, r, atlasComplementRank, dt);
 				}
 				{
 					const unsigned int m = hl.h, n = hl.h;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Whh";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasWhh, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasWhh, m, n, r, atlasComplementRank, dt);
 				}
 			}
 		}
@@ -2966,7 +3074,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		{
 			const unsigned int m = tensorRnn.O.out, n = tensorRnn.O.in;
 			const unsigned int r = std::min(atlasRank, std::min(m, n));
-			enqueueAtlasRead(expected, "rnn.o", tensorRnn.O.atlasWhy, m, n, r, dt);
+			enqueueAtlasRead(expected, "rnn.o", tensorRnn.O.atlasWhy, m, n, r, atlasComplementRank, dt);
 		}
 	}
 	else if (netType == TYPE_GRU || netType == TYPE_LSTM)
@@ -3024,13 +3132,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					const unsigned int m = tg.gateCount * hl.h, n = hl.in;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".W";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasW, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasW, m, n, r, atlasComplementRank, dt);
 				}
 				{
 					const unsigned int m = tg.gateCount * hl.h, n = hl.h;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".U";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasU, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasU, m, n, r, atlasComplementRank, dt);
 				}
 			}
 		}
@@ -3056,7 +3164,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		{
 			const unsigned int m = tg.O.out, n = tg.O.in;
 			const unsigned int r = std::min(atlasRank, std::min(m, n));
-			enqueueAtlasRead(expected, std::string(prefix) + ".o", tg.O.atlasWhy, m, n, r, dt);
+			enqueueAtlasRead(expected, std::string(prefix) + ".o", tg.O.atlasWhy, m, n, r, atlasComplementRank, dt);
 		}
 	}
 	else if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
@@ -3493,37 +3601,37 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					const unsigned int m = dModel, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wq";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWq, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWq, m, n, r, atlasComplementRank, dt);
 				}
 				{
 					const unsigned int m = dModelKV, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wk";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWk, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWk, m, n, r, atlasComplementRank, dt);
 				}
 				{
 					const unsigned int m = dModelKV, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wv";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWv, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWv, m, n, r, atlasComplementRank, dt);
 				}
 				{
 					const unsigned int m = dModel, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wo";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWo, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWo, m, n, r, atlasComplementRank, dt);
 				}
 				{
 					const unsigned int m = ff1Width, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".W1";
-					enqueueAtlasRead(expected, oss.str(), b.atlasW1, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasW1, m, n, r, atlasComplementRank, dt);
 				}
 				{
 					const unsigned int m = dModel, n = tt.dFF;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".W2";
-					enqueueAtlasRead(expected, oss.str(), b.atlasW2, m, n, r, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasW2, m, n, r, atlasComplementRank, dt);
 				}
 			}
 		}
@@ -3532,18 +3640,18 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			{
 				const unsigned int m = dModel, n = inputSize;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
-				enqueueAtlasRead(expected, "tr.WIn", tt.atlasWIn, m, n, r, dt);
+				enqueueAtlasRead(expected, "tr.WIn", tt.atlasWIn, m, n, r, atlasComplementRank, dt);
 			}
 			{
 				const unsigned int m = outSize, n = dModel;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
-				enqueueAtlasRead(expected, "tr.WOut", tt.atlasWOut, m, n, r, dt);
+				enqueueAtlasRead(expected, "tr.WOut", tt.atlasWOut, m, n, r, atlasComplementRank, dt);
 			}
 			if (tt.tokenModel)
 			{
 				const unsigned int m = tt.vocabSize, n = dModel;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
-				enqueueAtlasRead(expected, "tr.tokE", tt.atlasTokE, m, n, r, dt);
+				enqueueAtlasRead(expected, "tr.tokE", tt.atlasTokE, m, n, r, atlasComplementRank, dt);
 			}
 		}
 	}

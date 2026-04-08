@@ -33,8 +33,8 @@ The implemented redesign therefore makes three concrete changes:
 - **Packed active-basis execution.** The optimizer can operate on a reduced active prefix without reallocating or reprojecting the entire stored basis every step.
 - **Conservative adaptive-rank policy.** Adaptive rank remains available, but it now shrinks only at refresh boundaries, repairs the inactive basis to keep `U` orthonormal, and is disabled by default until broader benchmarks justify turning it on globally.
 - **Projection-consistent covariance closure.** `sigma2` is no longer estimated on a separate accumulated-gradient scale; the optimizer now tracks the normalized covariance trace `tr((1/n) H H^T)` on the same update scale as the subspace Fisher statistics and derives the complement scalar by trace closure.
-- **Residual complement-sector prototype.** ATLAS can now track one anisotropic complement direction through `complementRank=1`, with its own Fisher EMA and an isotropic tail on the remaining complement.
-- **Sector-specific damping controls.** The complement sector now uses its own nominal lr scale and `kappaMax` cap instead of inheriting the more aggressive active-space settings. The current default is a conservative sector path intended to prevent residual-block over-correction.
+- **Residual complement block prototype.** `complementRank` now controls a dense low-rank residual block `V R V^T` instead of a single scalar direction. `complementRank=1` reproduces the earlier sector path; `complementRank>1` enables a denser FC-style residual closure.
+- **Complement-specific damping controls.** The residual block uses its own nominal lr scale and `kappaMax` cap instead of inheriting the more aggressive active-space settings. The current default keeps the complement path conservative while the richer closure is still benchmarked.
 
 Observed outcomes on April 8, 2026:
 - `./glades-unit-tests atlas` passes with the redesign enabled.
@@ -42,13 +42,15 @@ Observed outcomes on April 8, 2026:
 - The trace-closed baseline path with `complementRank=0` reached `train=8.06s`, `testAcc=98.14%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 0`.
 - The one-sector residual closure with `complementRank=1` reached `train=8.00s`, `testAcc=97.72%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 1`.
 - After retuning the one-sector path to `complementLrScale=0.25` and `complementKappaMax=0.5`, the same benchmark reached `train=8.17s`, `testAcc=97.86%`. This is better than the undamped one-sector path but still below the `complementRank=0` baseline.
+- The new dense residual block with `complementRank=4` reached `train=7.98s`, `testAcc=98.10%`. It captures more FC complement trace than the scalar path and is slightly faster than the isotropic baseline, but it still loses a small amount of out-of-sample accuracy.
 - On the hidden FC layer at step 200 of the standard benchmark, the sector-specific damping reduced the logged `sector_rate` from about `0.1609` in the undamped path to `0.0100`, confirming that the retune directly addressed the residual-block over-correction mechanism.
+- On the hidden FC layer at step 200 with `complementRank=4`, the dense block captured about `0.7%` of total trace beyond the active subspace (`sector_trace_capture≈0.007`), but the active-plus-block model still left a very large closure gap (`closure_gap≈161.9`), so the isotropic tail remains the dominant modeled mass.
 
 Interpretation:
 - The data supports **stability-first subspace tracking** and **opt-in adaptive compression**, not unconditional online rank collapse.
 - The scale-consistency issue between `sigma2` and the subspace Fisher statistics is addressed in the implementation by sharing one normalized covariance model.
-- A single residual complement sector still does **not** improve standard MNIST generalization yet. The main gain from retuning was stability: the sector update is no longer grossly oversized relative to the complement baseline, but even the damped setting remains worse than `complementRank=0`.
-- The next likely source of gains is not merely "any richer closure", but a better residual policy: sector birth/death, denser residual blocks, or retuned `lr`/`kappaMax` for complement-sector updates.
+- A richer residual closure alone still does **not** beat the `complementRank=0` MNIST baseline. The dense block is a cleaner structural test than the one-sector path, but the current `complementRank=4` result remains accuracy-negative.
+- The main remaining issue is now clearer: ATLAS can model some FC residual anisotropy, but the captured residual block is still tiny relative to the total closure gap. The next likely gains are either stronger residual rank allocation/birth-death logic or a more selective FC-only activation policy, not further scalar damping alone.
 
 ---
 

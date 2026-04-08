@@ -57,22 +57,28 @@ static inline float atlas_bootstrap_or_ema(float prev,
 	return beta * prev + (1.0f - beta) * sample;
 }
 
-static unsigned int atlas_complement_sector_rank(unsigned int enabledRank,
-                                                 unsigned int subDim,
-                                                 unsigned int activeRank)
+static unsigned int atlas_storage_complement_rank(unsigned int enabledRank)
+{
+	return (enabledRank > 0u) ? enabledRank : 1u;
+}
+
+static unsigned int atlas_requested_complement_rank(unsigned int enabledRank,
+                                                    unsigned int subDim,
+                                                    unsigned int activeRank)
 {
 	if (enabledRank == 0u)
 		return 0u;
-	if (subDim <= activeRank + 1u)
+	if (subDim <= activeRank)
 		return 0u;
-	return 1u;
+	const unsigned int available = subDim - activeRank;
+	return (enabledRank < available) ? enabledRank : available;
 }
 
 static float compute_complement_sigma2(float totalTrace,
                                        const std::vector<float>& fisherDiag,
                                        unsigned int activeRank,
                                        float sectorFisher,
-                                       unsigned int sectorRank,
+                                       unsigned int effectiveComplementRank,
                                        unsigned int subDim,
                                        float eps,
                                        double* activeTraceOut = 0,
@@ -82,19 +88,21 @@ static float compute_complement_sigma2(float totalTrace,
 	double activeTrace = 0.0;
 	for (unsigned int c = 0; c < activeRank; ++c)
 		activeTrace += static_cast<double>(fisherDiag[c]);
-	const double sectorTrace = (sectorRank > 0u) ? static_cast<double>(sectorFisher) : 0.0;
+	const double sectorTrace = (effectiveComplementRank > 0u) ? static_cast<double>(sectorFisher) : 0.0;
 	const double modeledTrace = activeTrace + sectorTrace;
 	const double closureGap = static_cast<double>(totalTrace) - modeledTrace;
 	const double closedTrace = (closureGap >= 0.0)
 	    ? static_cast<double>(totalTrace)
 	    : modeledTrace;
 	const unsigned int complementDim =
-	    (subDim > activeRank + sectorRank) ? (subDim - activeRank - sectorRank) : 0u;
+	    (subDim > activeRank + effectiveComplementRank)
+	        ? (subDim - activeRank - effectiveComplementRank)
+	        : 0u;
 	double sigma2 = 0.0;
 	if (complementDim > 0u)
 		sigma2 = (closedTrace - modeledTrace) / static_cast<double>(complementDim);
-	else if (activeRank + sectorRank > 0u)
-		sigma2 = closedTrace / static_cast<double>(activeRank + sectorRank);
+	else if (activeRank + effectiveComplementRank > 0u)
+		sigma2 = closedTrace / static_cast<double>(activeRank + effectiveComplementRank);
 	if (activeTraceOut) *activeTraceOut = activeTrace;
 	if (sectorTraceOut) *sectorTraceOut = sectorTrace;
 	if (closureGapOut) *closureGapOut = closureGap;
@@ -120,6 +128,23 @@ static void project_out_active_basis(std::vector<float>& v,
 	}
 }
 
+static void project_out_basis_block(std::vector<float>& v,
+                                    const std::vector<float>& basis,
+                                    unsigned int stride,
+                                    unsigned int rank,
+                                    unsigned int subDim)
+{
+	for (unsigned int c = 0; c < rank; ++c)
+	{
+		double dot = 0.0;
+		for (unsigned int i = 0; i < subDim; ++i)
+			dot += static_cast<double>(v[i]) * static_cast<double>(basis[static_cast<size_t>(i) * stride + c]);
+		const float dotf = static_cast<float>(dot);
+		for (unsigned int i = 0; i < subDim; ++i)
+			v[i] -= dotf * basis[static_cast<size_t>(i) * stride + c];
+	}
+}
+
 static bool normalize_vector(std::vector<float>& v)
 {
 	double normSq = 0.0;
@@ -140,6 +165,9 @@ static bool build_coordinate_complement_seed(std::vector<float>& v,
                                              const std::vector<float>& U,
                                              unsigned int fullRank,
                                              unsigned int activeRank,
+                                             const std::vector<float>& extraBasis,
+                                             unsigned int extraStride,
+                                             unsigned int extraRank,
                                              unsigned int subDim)
 {
 	for (unsigned int basisRow = 0; basisRow < subDim; ++basisRow)
@@ -147,11 +175,216 @@ static bool build_coordinate_complement_seed(std::vector<float>& v,
 		std::fill(v.begin(), v.end(), 0.0f);
 		v[basisRow] = 1.0f;
 		project_out_active_basis(v, U, fullRank, activeRank, subDim);
+		if (!extraBasis.empty() && extraRank > 0u)
+			project_out_basis_block(v, extraBasis, extraStride, extraRank, subDim);
 		if (normalize_vector(v))
 			return true;
 	}
 	std::fill(v.begin(), v.end(), 0.0f);
 	return false;
+}
+
+static unsigned int orthonormalize_complement_block(std::vector<float>& V,
+                                                    unsigned int stride,
+                                                    const std::vector<float>& U,
+                                                    unsigned int fullRank,
+                                                    unsigned int activeRank,
+                                                    unsigned int subDim,
+                                                    unsigned int targetRank)
+{
+	if (targetRank == 0u)
+	{
+		std::fill(V.begin(), V.end(), 0.0f);
+		return 0u;
+	}
+
+	unsigned int informative = 0u;
+	for (unsigned int c = 0; c < targetRank; ++c)
+	{
+		std::vector<float> col(subDim, 0.0f);
+		for (unsigned int i = 0; i < subDim; ++i)
+			col[i] = V[static_cast<size_t>(i) * stride + c];
+		project_out_active_basis(col, U, fullRank, activeRank, subDim);
+		if (c > 0u)
+			project_out_basis_block(col, V, stride, c, subDim);
+		if (!normalize_vector(col)
+		    && !build_coordinate_complement_seed(col, U, fullRank, activeRank, V, stride, c, subDim))
+		{
+			for (unsigned int i = 0; i < subDim; ++i)
+				V[static_cast<size_t>(i) * stride + c] = 0.0f;
+			continue;
+		}
+		for (unsigned int i = 0; i < subDim; ++i)
+			V[static_cast<size_t>(i) * stride + c] = col[i];
+		informative = c + 1u;
+	}
+	for (unsigned int c = targetRank; c < stride; ++c)
+		for (unsigned int i = 0; i < subDim; ++i)
+			V[static_cast<size_t>(i) * stride + c] = 0.0f;
+	return informative;
+}
+
+static unsigned int effective_complement_rank(const std::vector<float>& V,
+                                              unsigned int stride,
+                                              unsigned int enabledRank,
+                                              unsigned int subDim,
+                                              unsigned int activeRank)
+{
+	const unsigned int requested =
+	    atlas_requested_complement_rank(enabledRank, subDim, activeRank);
+	const unsigned int inspect = (requested < stride) ? requested : stride;
+	unsigned int informative = 0u;
+	for (unsigned int c = 0; c < inspect; ++c)
+	{
+		double normSq = 0.0;
+		for (unsigned int i = 0; i < subDim; ++i)
+		{
+			const double v = static_cast<double>(V[static_cast<size_t>(i) * stride + c]);
+			normSq += v * v;
+		}
+		if (normSq <= 1e-12)
+			break;
+		informative = c + 1u;
+	}
+	return informative;
+}
+
+static float trace_complement_block(const std::vector<float>& block,
+                                    unsigned int dim)
+{
+	double trace = 0.0;
+	for (unsigned int i = 0; i < dim; ++i)
+		trace += static_cast<double>(block[static_cast<size_t>(i) * dim + i]);
+	return static_cast<float>(trace);
+}
+
+static void symmetrize_block(std::vector<float>& block, unsigned int dim)
+{
+	for (unsigned int i = 0; i < dim; ++i)
+	{
+		for (unsigned int j = i + 1u; j < dim; ++j)
+		{
+			const float v = 0.5f * (block[static_cast<size_t>(i) * dim + j]
+			                      + block[static_cast<size_t>(j) * dim + i]);
+			block[static_cast<size_t>(i) * dim + j] = v;
+			block[static_cast<size_t>(j) * dim + i] = v;
+		}
+	}
+}
+
+static void jacobi_eigendecompose(const std::vector<float>& symBlock,
+                                  unsigned int dim,
+                                  std::vector<float>& eigVec,
+                                  std::vector<float>& eigVal)
+{
+	eigVec.assign(static_cast<size_t>(dim) * dim, 0.0f);
+	eigVal.assign(static_cast<size_t>(dim), 0.0f);
+	if (dim == 0u)
+		return;
+	std::vector<float> a(symBlock);
+	for (unsigned int i = 0; i < dim; ++i)
+		eigVec[static_cast<size_t>(i) * dim + i] = 1.0f;
+	const unsigned int maxSweeps = 32u + dim * 8u;
+	for (unsigned int sweep = 0; sweep < maxSweeps; ++sweep)
+	{
+		unsigned int p = 0u, q = 0u;
+		float maxOff = 0.0f;
+		for (unsigned int i = 0; i < dim; ++i)
+		{
+			for (unsigned int j = i + 1u; j < dim; ++j)
+			{
+				const float off = std::fabs(a[static_cast<size_t>(i) * dim + j]);
+				if (off > maxOff)
+				{
+					maxOff = off;
+					p = i;
+					q = j;
+				}
+			}
+		}
+		if (maxOff < 1e-6f)
+			break;
+		const float app = a[static_cast<size_t>(p) * dim + p];
+		const float aqq = a[static_cast<size_t>(q) * dim + q];
+		const float apq = a[static_cast<size_t>(p) * dim + q];
+		const float tau = (aqq - app) / (2.0f * apq);
+		const float t = (tau >= 0.0f)
+		    ? (1.0f / (tau + std::sqrt(1.0f + tau * tau)))
+		    : (-1.0f / (-tau + std::sqrt(1.0f + tau * tau)));
+		const float c = 1.0f / std::sqrt(1.0f + t * t);
+		const float s = t * c;
+		for (unsigned int k = 0; k < dim; ++k)
+		{
+			if (k == p || k == q)
+				continue;
+			const float aik = a[static_cast<size_t>(p) * dim + k];
+			const float aqk = a[static_cast<size_t>(q) * dim + k];
+			const float newAik = c * aik - s * aqk;
+			const float newAqk = s * aik + c * aqk;
+			a[static_cast<size_t>(p) * dim + k] = newAik;
+			a[static_cast<size_t>(k) * dim + p] = newAik;
+			a[static_cast<size_t>(q) * dim + k] = newAqk;
+			a[static_cast<size_t>(k) * dim + q] = newAqk;
+		}
+		const float newApp = c * c * app - 2.0f * s * c * apq + s * s * aqq;
+		const float newAqq = s * s * app + 2.0f * s * c * apq + c * c * aqq;
+		a[static_cast<size_t>(p) * dim + p] = newApp;
+		a[static_cast<size_t>(q) * dim + q] = newAqq;
+		a[static_cast<size_t>(p) * dim + q] = 0.0f;
+		a[static_cast<size_t>(q) * dim + p] = 0.0f;
+		for (unsigned int k = 0; k < dim; ++k)
+		{
+			const float vip = eigVec[static_cast<size_t>(k) * dim + p];
+			const float viq = eigVec[static_cast<size_t>(k) * dim + q];
+			eigVec[static_cast<size_t>(k) * dim + p] = c * vip - s * viq;
+			eigVec[static_cast<size_t>(k) * dim + q] = s * vip + c * viq;
+		}
+	}
+	for (unsigned int i = 0; i < dim; ++i)
+		eigVal[i] = a[static_cast<size_t>(i) * dim + i];
+	for (unsigned int i = 0; i + 1u < dim; ++i)
+	{
+		unsigned int best = i;
+		for (unsigned int j = i + 1u; j < dim; ++j)
+			if (eigVal[j] > eigVal[best]) best = j;
+		if (best == i)
+			continue;
+		std::swap(eigVal[i], eigVal[best]);
+		for (unsigned int k = 0; k < dim; ++k)
+			std::swap(eigVec[static_cast<size_t>(k) * dim + i],
+			          eigVec[static_cast<size_t>(k) * dim + best]);
+	}
+}
+
+static void transform_symmetric_block(std::vector<float>& dst,
+                                      const std::vector<float>& overlap,
+                                      const std::vector<float>& src,
+                                      unsigned int dim)
+{
+	std::vector<float> tmp(static_cast<size_t>(dim) * dim, 0.0f);
+	for (unsigned int i = 0; i < dim; ++i)
+	{
+		for (unsigned int j = 0; j < dim; ++j)
+		{
+			double sum = 0.0;
+			for (unsigned int k = 0; k < dim; ++k)
+				sum += static_cast<double>(overlap[static_cast<size_t>(i) * dim + k])
+				     * static_cast<double>(src[static_cast<size_t>(k) * dim + j]);
+			tmp[static_cast<size_t>(i) * dim + j] = static_cast<float>(sum);
+		}
+	}
+	dst.assign(static_cast<size_t>(dim) * dim, 0.0f);
+	for (unsigned int i = 0; i < dim; ++i)
+	{
+		for (unsigned int j = 0; j < dim; ++j)
+		{
+			double sum = 0.0;
+			for (unsigned int k = 0; k < dim; ++k)
+				sum += static_cast<double>(tmp[static_cast<size_t>(i) * dim + k])
+				     * static_cast<double>(overlap[static_cast<size_t>(j) * dim + k]);
+			dst[static_cast<size_t>(i) * dim + j] = static_cast<float>(sum);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +1067,84 @@ static float atlas_clamped_rate(float nominalLr,
 	return rate;
 }
 
+static void compute_complement_block_sample(const std::vector<float>& gv,
+                                            unsigned int rank,
+                                            unsigned int outerDim,
+                                            bool isRight,
+                                            float statScaleSq,
+                                            std::vector<float>& block)
+{
+	block.assign(static_cast<size_t>(rank) * rank, 0.0f);
+	if (outerDim == 0u)
+		return;
+	for (unsigned int i = 0; i < rank; ++i)
+	{
+		for (unsigned int j = i; j < rank; ++j)
+		{
+			double dot = 0.0;
+			if (isRight)
+			{
+				for (unsigned int row = 0; row < outerDim; ++row)
+				{
+					dot += static_cast<double>(gv[static_cast<size_t>(row) * rank + i])
+					     * static_cast<double>(gv[static_cast<size_t>(row) * rank + j]);
+				}
+			}
+			else
+			{
+				for (unsigned int col = 0; col < outerDim; ++col)
+				{
+					dot += static_cast<double>(gv[static_cast<size_t>(i) * outerDim + col])
+					     * static_cast<double>(gv[static_cast<size_t>(j) * outerDim + col]);
+				}
+			}
+			const float meansq = static_cast<float>(dot / static_cast<double>(outerDim)) * statScaleSq;
+			block[static_cast<size_t>(i) * rank + j] = meansq;
+			block[static_cast<size_t>(j) * rank + i] = meansq;
+		}
+	}
+}
+
+static float build_complement_correction_matrix(const std::vector<float>& block,
+                                                unsigned int rank,
+                                                float baselineRate,
+                                                float nominalLr,
+                                                float eps,
+                                                float kappaMax,
+                                                float bcFactor,
+                                                std::vector<float>& corrMat)
+{
+	std::vector<float> scaledBlock(block);
+	for (size_t i = 0; i < scaledBlock.size(); ++i)
+		scaledBlock[i] *= bcFactor;
+	symmetrize_block(scaledBlock, rank);
+
+	std::vector<float> eigVec;
+	std::vector<float> eigVal;
+	jacobi_eigendecompose(scaledBlock, rank, eigVec, eigVal);
+	corrMat.assign(static_cast<size_t>(rank) * rank, 0.0f);
+	float maxRate = 0.0f;
+	for (unsigned int mode = 0; mode < rank; ++mode)
+	{
+		float fisher = eigVal[mode];
+		if (!std::isfinite(fisher) || fisher < 0.0f)
+			fisher = 0.0f;
+		const float rate = atlas_clamped_rate(nominalLr, fisher, eps, kappaMax);
+		if (rate > maxRate)
+			maxRate = rate;
+		const float scale = baselineRate - rate;
+		for (unsigned int i = 0; i < rank; ++i)
+		{
+			const float qi = eigVec[static_cast<size_t>(i) * rank + mode];
+			for (unsigned int j = 0; j < rank; ++j)
+				corrMat[static_cast<size_t>(i) * rank + j] +=
+				    scale * qi * eigVec[static_cast<size_t>(j) * rank + mode];
+		}
+	}
+	symmetrize_block(corrMat, rank);
+	return maxRate;
+}
+
 bool atlas_gpu_mu_norms(const float* d_gz, const float* d_prevGz,
                          size_t rn, float* d_out, float* d_partials)
 {
@@ -892,33 +1203,100 @@ bool atlas_gpu_guard(float* d_W, size_t mn)
 	return true;
 }
 
-static bool initComplementSector(GpuAtlasWeightState& state,
-                                 glades::rng::Engine& rng)
+static bool ensureComplementStorage(GpuAtlasWeightState& state,
+                                    unsigned int requestedRank)
 {
-	const unsigned int subDim = state.rightSubspace ? state.n : state.m;
+	const unsigned int storageRank = atlas_storage_complement_rank(requestedRank);
 	const unsigned int activeRank = state.r;
-	std::vector<float> h_U((size_t)subDim * activeRank);
+	const unsigned int subDim = state.rightSubspace ? state.n : state.m;
+	const unsigned int outerDim = state.rightSubspace ? state.m : state.n;
+	if (state.complementRank == storageRank
+	    && state.V.size() == static_cast<size_t>(subDim) * storageRank
+	    && state.complementBlock.size() == static_cast<size_t>(storageRank) * storageRank
+	    && state.prevGv.size() == static_cast<size_t>(outerDim) * storageRank)
+		return true;
+
+	std::vector<float> h_U((size_t)subDim * activeRank, 0.0f);
 	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 	ATLAS_CUDA_CHECK(cudaMemcpy(h_U.data(), state.U.data(),
 	                              h_U.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
-	std::vector<float> h_V(subDim, 0.0f);
-	if (atlas_complement_sector_rank(1u, subDim, activeRank) > 0u)
+	const unsigned int oldRank = state.complementRank;
+	std::vector<float> h_V_old((size_t)subDim * oldRank, 0.0f);
+	std::vector<float> h_prev_old((size_t)outerDim * oldRank, 0.0f);
+	std::vector<float> h_block_old((size_t)oldRank * oldRank, 0.0f);
+	if (oldRank > 0u)
 	{
-		for (unsigned int i = 0; i < subDim; ++i)
-			h_V[i] = glades::rng::standard_normal(rng);
-		project_out_active_basis(h_V, h_U, activeRank, activeRank, subDim);
-		if (!normalize_vector(h_V))
-			build_coordinate_complement_seed(h_V, h_U, activeRank, activeRank, subDim);
+		if (state.V.size() > 0u)
+			ATLAS_CUDA_CHECK(cudaMemcpy(h_V_old.data(), state.V.data(),
+			                              h_V_old.size() * sizeof(float), cudaMemcpyDeviceToHost));
+		if (state.prevGv.size() > 0u)
+			ATLAS_CUDA_CHECK(cudaMemcpy(h_prev_old.data(), state.prevGv.data(),
+			                              h_prev_old.size() * sizeof(float), cudaMemcpyDeviceToHost));
+		if (state.complementBlock.size() > 0u)
+			ATLAS_CUDA_CHECK(cudaMemcpy(h_block_old.data(), state.complementBlock.data(),
+			                              h_block_old.size() * sizeof(float), cudaMemcpyDeviceToHost));
 	}
 
-	ATLAS_CUDA_CHECK(cudaMemcpy(state.V.data(), h_V.data(),
-	                              h_V.size() * sizeof(float), cudaMemcpyHostToDevice));
-	ATLAS_CUDA_CHECK(cudaMemset(state.prevGv.data(), 0, state.prevGv.size() * sizeof(float)));
-	const float zero = 0.0f;
-	ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &zero,
-	                              sizeof(float), cudaMemcpyHostToDevice));
+	std::vector<float> h_V((size_t)subDim * storageRank, 0.0f);
+	std::vector<float> h_prev((size_t)outerDim * storageRank, 0.0f);
+	std::vector<float> h_block((size_t)storageRank * storageRank, 0.0f);
+	const unsigned int copyRank = (oldRank < storageRank) ? oldRank : storageRank;
+	for (unsigned int i = 0; i < subDim; ++i)
+		for (unsigned int c = 0; c < copyRank; ++c)
+			h_V[static_cast<size_t>(i) * storageRank + c] =
+			    h_V_old[static_cast<size_t>(i) * oldRank + c];
+	if (state.rightSubspace)
+	{
+		for (unsigned int row = 0; row < outerDim; ++row)
+			for (unsigned int c = 0; c < copyRank; ++c)
+				h_prev[static_cast<size_t>(row) * storageRank + c] =
+				    h_prev_old[static_cast<size_t>(row) * oldRank + c];
+	}
+	else
+	{
+		for (unsigned int c = 0; c < copyRank; ++c)
+			for (unsigned int col = 0; col < outerDim; ++col)
+				h_prev[static_cast<size_t>(c) * outerDim + col] =
+				    h_prev_old[static_cast<size_t>(c) * outerDim + col];
+	}
+	for (unsigned int i = 0; i < copyRank; ++i)
+		for (unsigned int j = 0; j < copyRank; ++j)
+			h_block[static_cast<size_t>(i) * storageRank + j] =
+			    h_block_old[static_cast<size_t>(i) * oldRank + j];
+
+	for (unsigned int c = copyRank; c < storageRank; ++c)
+		for (unsigned int i = 0; i < subDim; ++i)
+			h_V[static_cast<size_t>(i) * storageRank + c] =
+			    0.1f * static_cast<float>(((i + 1u) * (c + 3u)) % 17u + 1u);
+	const unsigned int targetRank =
+	    atlas_requested_complement_rank(storageRank, subDim, activeRank);
+	orthonormalize_complement_block(h_V, storageRank, h_U, activeRank, activeRank, subDim, targetRank);
+
+	state.complementRank = storageRank;
+	if (!state.V.allocate(static_cast<size_t>(subDim) * storageRank)) return false;
+	if (!state.complementBlock.allocate(static_cast<size_t>(storageRank) * storageRank)) return false;
+	if (!state.prevGv.allocate(static_cast<size_t>(outerDim) * storageRank)) return false;
+	if (!state.gv.allocate(static_cast<size_t>(outerDim) * storageRank)) return false;
+	if (!state.gPredV.allocate(static_cast<size_t>(outerDim) * storageRank)) return false;
+	if (!state.complementMat.allocate(static_cast<size_t>(storageRank) * storageRank)) return false;
+	if (!state.V_old.allocate(static_cast<size_t>(subDim) * storageRank)) return false;
+	if (!state.Bv.allocate(static_cast<size_t>(outerDim) * storageRank)) return false;
+	if (!state.Zv.allocate(static_cast<size_t>(subDim) * storageRank)) return false;
+
+	if (!state.V.upload(h_V.data(), h_V.size())) return false;
+	if (!state.complementBlock.upload(h_block.data(), h_block.size())) return false;
+	if (!state.prevGv.upload(h_prev.data(), h_prev.size())) return false;
+	const float blockTrace = trace_complement_block(h_block, storageRank);
+	if (!state.complementFisher.upload(&blockTrace, 1)) return false;
 	return true;
+}
+
+static bool initComplementSector(GpuAtlasWeightState& state,
+                                 glades::rng::Engine& rng)
+{
+	(void)rng;
+	return ensureComplementStorage(state, 0u);
 }
 
 static bool refreshComplementSector(GpuAtlasWeightState& state,
@@ -930,9 +1308,14 @@ static bool refreshComplementSector(GpuAtlasWeightState& state,
 	const unsigned int subDim = isRight ? state.n : state.m;
 	const unsigned int outerDim = isRight ? state.m : state.n;
 	const unsigned int activeRank = state.r;
-	if (atlas_complement_sector_rank(1u, subDim, activeRank) == 0u)
+	const unsigned int storageRank = state.complementRank;
+	const unsigned int targetRank =
+	    atlas_requested_complement_rank(storageRank, subDim, activeRank);
+	if (targetRank == 0u)
 	{
+		ATLAS_CUDA_CHECK(cudaMemset(state.V.data(), 0, state.V.size() * sizeof(float)));
 		ATLAS_CUDA_CHECK(cudaMemset(state.prevGv.data(), 0, state.prevGv.size() * sizeof(float)));
+		ATLAS_CUDA_CHECK(cudaMemset(state.complementBlock.data(), 0, state.complementBlock.size() * sizeof(float)));
 		const float zero = 0.0f;
 		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &zero,
 		                              sizeof(float), cudaMemcpyHostToDevice));
@@ -940,104 +1323,104 @@ static bool refreshComplementSector(GpuAtlasWeightState& state,
 	}
 
 	std::vector<float> h_U((size_t)subDim * activeRank);
-	std::vector<float> h_V_old(subDim);
+	std::vector<float> h_V_old((size_t)subDim * storageRank, 0.0f);
+	std::vector<float> h_block_old((size_t)storageRank * storageRank, 0.0f);
 	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 	ATLAS_CUDA_CHECK(cudaMemcpy(h_U.data(), state.U.data(),
 	                              h_U.size() * sizeof(float), cudaMemcpyDeviceToHost));
 	ATLAS_CUDA_CHECK(cudaMemcpy(h_V_old.data(), state.V.data(),
 	                              h_V_old.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	ATLAS_CUDA_CHECK(cudaMemcpy(h_block_old.data(), state.complementBlock.data(),
+	                              h_block_old.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
 	std::vector<float> q(h_V_old);
-	project_out_active_basis(q, h_U, activeRank, activeRank, subDim);
-	if (!normalize_vector(q))
-	{
-		q = h_V_old;
-		if (!build_coordinate_complement_seed(q, h_U, activeRank, activeRank, subDim))
-			return false;
-	}
+	orthonormalize_complement_block(q, storageRank, h_U, activeRank, activeRank, subDim, targetRank);
 
-	std::vector<float> h_Z(subDim);
+	std::vector<float> h_Z((size_t)subDim * storageRank, 0.0f);
 	for (unsigned int p = 0; p < powerIters; ++p)
 	{
 		ATLAS_CUDA_CHECK(cudaMemcpy(state.V.data(), q.data(),
 		                              q.size() * sizeof(float), cudaMemcpyHostToDevice));
 		if (isRight)
 		{
-			if (!sgemv_rowmajor((int)outerDim, (int)subDim,
+			if (!sgemm_rowmajor((int)outerDim, (int)storageRank, (int)subDim,
 			                     1.0f,
 			                     d_grad, (int)subDim,
-			                     state.V.data(),
+			                     state.V.data(), (int)storageRank,
 			                     0.0f,
-			                     state.Bv.data()))
+			                     state.Bv.data(), (int)storageRank))
 				return false;
-			if (!sgemm_rowmajor_atb((int)subDim, 1, (int)outerDim,
+			if (!sgemm_rowmajor_atb((int)subDim, (int)storageRank, (int)outerDim,
 			                         1.0f,
 			                         d_grad, (int)subDim,
-			                         state.Bv.data(), 1,
+			                         state.Bv.data(), (int)storageRank,
 			                         0.0f,
-			                         state.Zv.data(), 1))
+			                         state.Zv.data(), (int)storageRank))
 				return false;
 		}
 		else
 		{
-			if (!sgemm_rowmajor_atb(1, (int)outerDim, (int)subDim,
+			if (!sgemm_rowmajor_atb((int)storageRank, (int)outerDim, (int)subDim,
 			                         1.0f,
-			                         state.V.data(), 1,
+			                         state.V.data(), (int)storageRank,
 			                         d_grad, (int)outerDim,
 			                         0.0f,
 			                         state.Bv.data(), (int)outerDim))
 				return false;
-			if (!sgemv_rowmajor((int)subDim, (int)outerDim,
-			                     1.0f,
-			                     d_grad, (int)outerDim,
-			                     state.Bv.data(),
-			                     0.0f,
-			                     state.Zv.data()))
+			if (!sgemm_rowmajor_abt((int)subDim, (int)storageRank, (int)outerDim,
+			                         1.0f,
+			                         d_grad, (int)outerDim,
+			                         state.Bv.data(), (int)outerDim,
+			                         0.0f,
+			                         state.Zv.data(), (int)storageRank))
 				return false;
 		}
 
 		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 		ATLAS_CUDA_CHECK(cudaMemcpy(h_Z.data(), state.Zv.data(),
 		                              h_Z.size() * sizeof(float), cudaMemcpyDeviceToHost));
-		project_out_active_basis(h_Z, h_U, activeRank, activeRank, subDim);
-		if (!normalize_vector(h_Z))
-			break;
 		q.swap(h_Z);
+		orthonormalize_complement_block(q, storageRank, h_U, activeRank, activeRank, subDim, targetRank);
 	}
 
 	for (unsigned int i = 0; i < subDim; ++i)
-		q[i] = (1.0f - betaRefresh) * h_V_old[i] + betaRefresh * q[i];
-	project_out_active_basis(q, h_U, activeRank, activeRank, subDim);
-	if (!normalize_vector(q))
 	{
-		q = h_V_old;
-		project_out_active_basis(q, h_U, activeRank, activeRank, subDim);
-		if (!normalize_vector(q)
-		    && !build_coordinate_complement_seed(q, h_U, activeRank, activeRank, subDim))
-			return false;
+		for (unsigned int c = 0; c < storageRank; ++c)
+		{
+			q[static_cast<size_t>(i) * storageRank + c] =
+			    (1.0f - betaRefresh) * h_V_old[static_cast<size_t>(i) * storageRank + c]
+			  + betaRefresh * q[static_cast<size_t>(i) * storageRank + c];
+		}
 	}
+	const unsigned int informativeRank =
+	    orthonormalize_complement_block(q, storageRank, h_U, activeRank, activeRank, subDim, targetRank);
 
-	double overlap = 0.0;
-	for (unsigned int i = 0; i < subDim; ++i)
-		overlap += static_cast<double>(q[i]) * static_cast<double>(h_V_old[i]);
-	const float overlapf = static_cast<float>(overlap);
-
-	std::vector<float> h_prevGv(outerDim, 0.0f);
-	float h_compFisher = 0.0f;
-	ATLAS_CUDA_CHECK(cudaMemcpy(h_prevGv.data(), state.prevGv.data(),
-	                              h_prevGv.size() * sizeof(float), cudaMemcpyDeviceToHost));
-	ATLAS_CUDA_CHECK(cudaMemcpy(&h_compFisher, state.complementFisher.data(),
-	                              sizeof(float), cudaMemcpyDeviceToHost));
-	for (unsigned int i = 0; i < outerDim; ++i)
-		h_prevGv[i] *= overlapf;
-	h_compFisher *= overlapf * overlapf;
+	std::vector<float> overlap((size_t)storageRank * storageRank, 0.0f);
+	for (unsigned int c = 0; c < storageRank; ++c)
+	{
+		for (unsigned int k = 0; k < storageRank; ++k)
+		{
+			double dot = 0.0;
+			for (unsigned int i = 0; i < subDim; ++i)
+				dot += static_cast<double>(q[static_cast<size_t>(i) * storageRank + c])
+				     * static_cast<double>(h_V_old[static_cast<size_t>(i) * storageRank + k]);
+			overlap[static_cast<size_t>(c) * storageRank + k] = static_cast<float>(dot);
+		}
+	}
+	std::vector<float> h_block_new;
+	transform_symmetric_block(h_block_new, overlap, h_block_old, storageRank);
+	symmetrize_block(h_block_new, storageRank);
+	const float h_compFisher = trace_complement_block(h_block_new, storageRank);
 
 	ATLAS_CUDA_CHECK(cudaMemcpy(state.V.data(), q.data(),
 	                              q.size() * sizeof(float), cudaMemcpyHostToDevice));
-	ATLAS_CUDA_CHECK(cudaMemcpy(state.prevGv.data(), h_prevGv.data(),
-	                              h_prevGv.size() * sizeof(float), cudaMemcpyHostToDevice));
+	ATLAS_CUDA_CHECK(cudaMemset(state.prevGv.data(), 0, state.prevGv.size() * sizeof(float)));
+	ATLAS_CUDA_CHECK(cudaMemcpy(state.complementBlock.data(), h_block_new.data(),
+	                              h_block_new.size() * sizeof(float), cudaMemcpyHostToDevice));
 	ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_compFisher,
 	                              sizeof(float), cudaMemcpyHostToDevice));
+	(void)outerDim;
+	(void)informativeRank;
 	return true;
 }
 
@@ -1080,8 +1463,13 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 	const bool isRight = state.rightSubspace;
 	const unsigned int subDim = isRight ? n : m;    // dimension the basis lives in
 	const unsigned int outerDim = isRight ? m : n;  // the other dimension
+	state.complementRank = atlas_storage_complement_rank(0u);
+	const unsigned int cr = state.complementRank;
 	const size_t sr = (size_t)subDim * r;    // basis size: U/V [subDim, r]
 	const size_t or_ = (size_t)outerDim * r; // projected gradient size: gz [outerDim, r] or [r, outerDim]
+	const size_t compBasis = (size_t)subDim * cr;
+	const size_t compOuter = (size_t)outerDim * cr;
+	const size_t compBlock = (size_t)cr * cr;
 
 	// For left subspace: gz is [r, n] so or_ = r*n (but laid out as r*outerDim)
 	// For right subspace: gz is [m, r] so or_ = m*r
@@ -1090,16 +1478,18 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 	// Allocate persistent buffers
 	if (!state.U.allocate(sr)) return false;
 	if (!state.fisherDiag.allocate(r)) return false;
-	if (!state.V.allocate(subDim)) return false;
+	if (!state.V.allocate(compBasis)) return false;
+	if (!state.complementBlock.allocate(compBlock)) return false;
 	if (!state.complementFisher.allocate(1)) return false;
 	if (!state.prevGz.allocate(or_)) return false;
-	if (!state.prevGv.allocate(outerDim)) return false;
+	if (!state.prevGv.allocate(compOuter)) return false;
 
 	// Allocate per-step scratch buffers
 	if (!state.gz.allocate(or_)) return false;
 	if (!state.gPred.allocate(or_)) return false;
-	if (!state.gv.allocate(outerDim)) return false;
-	if (!state.gPredV.allocate(outerDim)) return false;
+	if (!state.gv.allocate(compOuter)) return false;
+	if (!state.gPredV.allocate(compOuter)) return false;
+	if (!state.complementMat.allocate(compBlock)) return false;
 	if (!state.d_reduce.allocate(2)) return false;
 	if (!state.d_partials.allocate(512)) return false;
 
@@ -1109,9 +1499,9 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 	if (!state.B.allocate(or_)) return false;
 	if (!state.overlap.allocate((size_t)r * r * 2)) return false;
 	if (!state.prevGzOld.allocate(or_)) return false;
-	if (!state.V_old.allocate(subDim)) return false;
-	if (!state.Bv.allocate(outerDim)) return false;
-	if (!state.Zv.allocate(subDim)) return false;
+	if (!state.V_old.allocate(compBasis)) return false;
+	if (!state.Bv.allocate(compOuter)) return false;
+	if (!state.Zv.allocate(compBasis)) return false;
 	state.refreshAllocated = true;
 
 	// Pre-allocate Cholesky QR temp buffer
@@ -1157,9 +1547,9 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 
 	{
 		const size_t totalElems = sr + r + or_
-		    + subDim + 1 + outerDim
-		    + or_ + or_ + outerDim + outerDim + 2 + 512
-		    + sr + r + or_ + (size_t)r*r*2 + or_ + subDim + outerDim + subDim
+		    + compBasis + compBlock + 1 + compOuter
+		    + or_ + or_ + compOuter + compOuter + compBlock + 2 + 512
+		    + sr + r + or_ + (size_t)r*r*2 + or_ + compBasis + compOuter + compBasis
 		    + sr;
 		fprintf(stderr, "[atlas-gpu] init m=%u n=%u r=%u %s total_gpu_bytes=%zu\n",
 		        m, n, r, isRight ? "RIGHT" : "LEFT", totalElems * sizeof(float));
@@ -1381,9 +1771,14 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	const bool isRight = state.rightSubspace;
 	const unsigned int subDim = isRight ? n : m;
 	const unsigned int outerDim = isRight ? m : n;
-	const unsigned int sectorRank = atlas_complement_sector_rank(ac.complementRank, subDim, r);
+	if (!ensureComplementStorage(state, ac.complementRank))
+		return false;
+	const unsigned int complementRank = state.complementRank;
+	unsigned int effectiveComplementRank =
+	    atlas_requested_complement_rank(ac.complementRank, subDim, r);
 	const size_t mn = (size_t)m * n;
 	const size_t or_ = (size_t)outerDim * r;  // gz/gPred/prevGz size
+	const size_t compOuter = (size_t)outerDim * complementRank;
 	state.step += 1ULL;
 
 	// Guard incoming gradient against NaN/Inf before any computation.
@@ -1506,7 +1901,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			}
 			return false;
 		}
-		if (sectorRank > 0u && !refreshComplementSector(state, d_gW, powerIters, betaRefresh))
+		if (ac.complementRank > 0u && !refreshComplementSector(state, d_gW, powerIters, betaRefresh))
 			return false;
 
 		// NaN diagnostic: check U after refresh
@@ -1558,23 +1953,23 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			return false;
 	}
 
-	if (sectorRank > 0u)
+	if (ac.complementRank > 0u)
 	{
 		if (isRight)
 		{
-			if (!sgemm_rowmajor((int)outerDim, 1, (int)subDim,
+			if (!sgemm_rowmajor((int)outerDim, (int)complementRank, (int)subDim,
 			                     gScale,
 			                     d_gW, (int)subDim,
-			                     state.V.data(), 1,
+			                     state.V.data(), (int)complementRank,
 			                     0.0f,
-			                     state.gv.data(), 1))
+			                     state.gv.data(), (int)complementRank))
 				return false;
 		}
 		else
 		{
-			if (!sgemm_rowmajor_atb(1, (int)outerDim, (int)subDim,
+			if (!sgemm_rowmajor_atb((int)complementRank, (int)outerDim, (int)subDim,
 			                         gScale,
-			                         state.V.data(), 1,
+			                         state.V.data(), (int)complementRank,
 			                         d_gW, (int)outerDim,
 			                         0.0f,
 			                         state.gv.data(), (int)outerDim))
@@ -1616,30 +2011,49 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	                             (int)r, (int)outerDim, beta, statScaleSq, isRight,
 	                             state.step == 1ULL))
 		return false;
-	if (sectorRank > 0u
-	    && !atlas_gpu_fisher_update(state.gv.data(), state.complementFisher.data(),
-	                                1, (int)outerDim, beta, statScaleSq, isRight,
-	                                state.step == 1ULL))
-		return false;
-
 	// === Step 6: Recompute sigma2 from the shared covariance model ===
 	std::vector<float> h_fisher(r);
+	std::vector<float> h_block((size_t)complementRank * complementRank, 0.0f);
+	std::vector<float> h_gv(compOuter, 0.0f);
 	float h_sectorFisher = 0.0f;
 	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 	ATLAS_CUDA_CHECK(cudaMemcpy(h_fisher.data(), state.fisherDiag.data(),
 	                              r * sizeof(float), cudaMemcpyDeviceToHost));
-	if (sectorRank > 0u)
+	if (ac.complementRank > 0u)
 	{
-		ATLAS_CUDA_CHECK(cudaMemcpy(&h_sectorFisher, state.complementFisher.data(),
-		                              sizeof(float), cudaMemcpyDeviceToHost));
+		ATLAS_CUDA_CHECK(cudaMemcpy(h_gv.data(), state.gv.data(),
+		                              h_gv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+		ATLAS_CUDA_CHECK(cudaMemcpy(h_block.data(), state.complementBlock.data(),
+		                              h_block.size() * sizeof(float), cudaMemcpyDeviceToHost));
+		std::vector<float> sample;
+		compute_complement_block_sample(h_gv, complementRank, outerDim, isRight, statScaleSq, sample);
+		for (size_t i = 0; i < h_block.size(); ++i)
+			h_block[i] = atlas_bootstrap_or_ema(h_block[i], sample[i], beta, state.step);
+		symmetrize_block(h_block, complementRank);
+		h_sectorFisher = trace_complement_block(h_block, complementRank);
 		sectorFisherDiag = h_sectorFisher;
+		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementBlock.data(), h_block.data(),
+		                              h_block.size() * sizeof(float), cudaMemcpyHostToDevice));
+		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_sectorFisher,
+		                              sizeof(float), cudaMemcpyHostToDevice));
 	}
+	else
+	{
+		h_sectorFisher = 0.0f;
+		ATLAS_CUDA_CHECK(cudaMemset(state.complementBlock.data(), 0, state.complementBlock.size() * sizeof(float)));
+		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_sectorFisher,
+		                              sizeof(float), cudaMemcpyHostToDevice));
+	}
+	std::vector<float> h_V((size_t)subDim * complementRank, 0.0f);
+	ATLAS_CUDA_CHECK(cudaMemcpy(h_V.data(), state.V.data(),
+	                              h_V.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	effectiveComplementRank = effective_complement_rank(h_V, complementRank, ac.complementRank, subDim, r);
 	{
 		double activeTrace = 0.0;
 		double sectorTrace = 0.0;
 		double gap = 0.0;
 		state.sigma2 = compute_complement_sigma2(state.totalTrace, h_fisher, r,
-		                                         h_sectorFisher, sectorRank, subDim, eps,
+		                                         h_sectorFisher, effectiveComplementRank, subDim, eps,
 		                                         &activeTrace, &sectorTrace, &gap);
 		activeTraceCapture = (state.totalTrace > 1e-30f)
 		    ? (float)(activeTrace / (double)state.totalTrace)
@@ -1701,37 +2115,54 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 				return false;
 		}
 
-		if (sectorRank > 0u)
+		if (ac.complementRank > 0u)
 		{
 			const float sectorNominalLr = lr * atlas_nonnegative_finite(ac.complementLrScale, 0.0f);
-			const float sectorKappaLr =
-			    atlas_nonnegative_finite(ac.complementKappaMax, 0.0f) * sectorNominalLr;
-			sectorRate = atlas_clamped_rate(sectorNominalLr,
-			                                h_sectorFisher * bcFactor,
-			                                eps,
-			                                ac.complementKappaMax);
-			if (!atlas_gpu_prepare_correction(state.gv.data(), state.prevGv.data(),
-			                                   state.complementFisher.data(),
-			                                   state.gPredV.data(), 1, (int)outerDim,
-			                                   1.0f, 0.0f,
-			                                   baselineRate, sectorNominalLr, eps, sectorKappaLr,
-			                                   bcFactor, isRight))
-				return false;
+			std::vector<float> h_corrMat;
+			sectorRate = build_complement_correction_matrix(h_block, complementRank,
+			                                                baselineRate,
+			                                                sectorNominalLr,
+			                                                eps,
+			                                                ac.complementKappaMax,
+			                                                bcFactor,
+			                                                h_corrMat);
+			ATLAS_CUDA_CHECK(cudaMemcpy(state.complementMat.data(), h_corrMat.data(),
+			                              h_corrMat.size() * sizeof(float), cudaMemcpyHostToDevice));
 			if (isRight)
 			{
-				if (!sgemm_rowmajor_abt((int)outerDim, (int)subDim, 1,
+				if (!sgemm_rowmajor((int)outerDim, (int)complementRank, (int)complementRank,
+				                     1.0f,
+				                     state.gv.data(), (int)complementRank,
+				                     state.complementMat.data(), (int)complementRank,
+				                     0.0f,
+				                     state.gPredV.data(), (int)complementRank))
+					return false;
+			}
+			else
+			{
+				if (!sgemm_rowmajor((int)complementRank, (int)outerDim, (int)complementRank,
+				                     1.0f,
+				                     state.complementMat.data(), (int)complementRank,
+				                     state.gv.data(), (int)outerDim,
+				                     0.0f,
+				                     state.gPredV.data(), (int)outerDim))
+					return false;
+			}
+			if (isRight)
+			{
+				if (!sgemm_rowmajor_abt((int)outerDim, (int)subDim, (int)complementRank,
 				                         1.0f,
-				                         state.gPredV.data(), 1,
-				                         state.V.data(), 1,
+				                         state.gPredV.data(), (int)complementRank,
+				                         state.V.data(), (int)complementRank,
 				                         1.0f,
 				                         d_W, (int)subDim))
 					return false;
 			}
 			else
 			{
-				if (!sgemm_rowmajor((int)subDim, (int)outerDim, 1,
+				if (!sgemm_rowmajor((int)subDim, (int)outerDim, (int)complementRank,
 				                     1.0f,
-				                     state.V.data(), 1,
+				                     state.V.data(), (int)complementRank,
 				                     state.gPredV.data(), (int)outerDim,
 				                     1.0f,
 				                     d_W, (int)outerDim))
@@ -1791,6 +2222,8 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		if (tag) oss << " tag=" << tag;
 		oss << " step=" << state.step
 		    << " m=" << m << " n=" << n << " rank=" << r
+		    << " complement_rank=" << complementRank
+		    << " complement_effective_rank=" << effectiveComplementRank
 		    << " subspace=" << (isRight ? "right" : "left")
 		    << " lr=" << lr
 		    << " mu=" << state.mu
@@ -1826,16 +2259,16 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.prevGz.data(), state.gz.data(),
 	                                 or_ * sizeof(float), cudaMemcpyDeviceToDevice,
 	                                 computeStream()));
-	if (sectorRank > 0u)
+	if (ac.complementRank > 0u)
 	{
 		ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.prevGv.data(), state.gv.data(),
-		                                 outerDim * sizeof(float), cudaMemcpyDeviceToDevice,
+		                                 compOuter * sizeof(float), cudaMemcpyDeviceToDevice,
 		                                 computeStream()));
 	}
 	else
 	{
 		ATLAS_CUDA_CHECK(cudaMemsetAsync(state.prevGv.data(), 0,
-		                                 outerDim * sizeof(float), computeStream()));
+		                                 compOuter * sizeof(float), computeStream()));
 	}
 
 	// === Step 10: Clear accumulated gradients ===

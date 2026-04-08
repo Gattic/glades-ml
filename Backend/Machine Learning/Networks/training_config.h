@@ -404,9 +404,9 @@ struct ATLASConfig
 	// Larger rank captures more curvature information at higher compute/memory cost.
 	unsigned int rank;
 
-	// Residual complement-sector rank. The current prototype supports 0 (disable)
-	// or 1 (track one anisotropic complement direction plus an isotropic tail).
-	// This only applies when the complement has at least two remaining directions.
+	// Residual complement-block rank. 0 disables the anisotropic complement path;
+	// positive values allocate a dense low-rank residual block of this size,
+	// followed by an isotropic tail closure on the remaining complement space.
 	unsigned int complementRank;
 
 	// Relative learning-rate scale applied only to the anisotropic complement

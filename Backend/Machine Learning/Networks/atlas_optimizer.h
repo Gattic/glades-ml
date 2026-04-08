@@ -30,12 +30,13 @@ namespace atlas {
 // For a weight matrix W in R^{m x n}, ATLAS maintains:
 // - U in R^{m x r}: orthonormal subspace basis (top-r Fisher eigenvectors)
 // - fisherDiag in R^r: EMA of Fisher eigenvalues per subspace dimension
-// - V in R^m: one residual complement sector basis vector
-// - complementFisher: EMA of Fisher mass captured by V
+// - V in R^{m x b}: residual complement block basis (row-major, packed by row)
+// - complementBlock in R^{b x b}: EMA covariance block captured by V
+// - complementFisher: trace(complementBlock) for diagnostics / compatibility
 // - totalTrace: EMA of the normalized covariance trace on the ATLAS update scale
 // - sigma2: isotropic tail closure derived from totalTrace, fisherDiag, and V
 // - prevGz in R^{r x n}: previous step's compressed gradient
-// - prevGv in R^n: previous step's complement-sector gradient
+// - prevGv in R^{b x n}: previous step's complement-block gradient
 // - mu: adaptive temporal prediction coefficient
 struct WeightState
 {
@@ -43,19 +44,21 @@ struct WeightState
 	unsigned int n;     // cols of weight matrix
 	unsigned int r;     // subspace rank (r <= min(m, n))
 	unsigned int activeRank; // currently active leading rank (activeRank <= r)
+	unsigned int complementRank; // allocated complement-block rank (>= 1 for storage)
 
 	std::vector<float> U;           // [m * r] orthonormal subspace basis (row-major)
 	std::vector<float> fisherDiag;  // [r] EMA of Fisher eigenvalues
-	std::vector<float> V;           // [m] residual complement sector basis
+	std::vector<float> V;           // [m * complementRank] residual complement basis
+	std::vector<float> complementBlock; // [complementRank * complementRank] dense residual covariance EMA
 	std::vector<float> prevGz;      // [r * n] previous compressed gradient
-	std::vector<float> prevGv;      // [n] previous complement-sector gradient
+	std::vector<float> prevGv;      // [complementRank * n] previous complement-block gradient
 
 	// Persistent scratch buffers (allocated once in initWeightState, reused every step).
 	// applyStep scratch:
 	std::vector<float> scratch_gz;        // [r * n]
 	std::vector<float> scratch_corrected; // [r * n]
-	std::vector<float> scratch_gv;        // [n]
-	std::vector<float> scratch_correctedV; // [n]
+	std::vector<float> scratch_gv;        // [complementRank * n]
+	std::vector<float> scratch_correctedV; // [complementRank * n]
 	// refreshSubspace scratch:
 	std::vector<float> scratch_U_old;     // [m * r]
 	std::vector<float> scratch_f_old;     // [r]
@@ -64,11 +67,14 @@ struct WeightState
 	std::vector<float> scratch_overlap;   // [r * r]
 	std::vector<float> scratch_prevGzOld; // [r * n]
 	std::vector<float> scratch_basisPacked; // [m * r] packed leading basis for GEMM fast path
-	std::vector<float> scratch_V_old;     // [m]
-	std::vector<float> scratch_Bv;        // [n]
-	std::vector<float> scratch_Zv;        // [m]
+	std::vector<float> scratch_V_old;     // [m * complementRank]
+	std::vector<float> scratch_Bv;        // [complementRank * n]
+	std::vector<float> scratch_Zv;        // [m * complementRank]
+	std::vector<float> scratch_complementMat; // [complementRank * complementRank]
+	std::vector<float> scratch_complementEigVec; // [complementRank * complementRank]
+	std::vector<float> scratch_complementEigVal; // [complementRank]
 
-	float complementFisher;         // EMA Fisher mass of the residual complement sector
+	float complementFisher;         // trace(complementBlock)
 	float totalTrace;               // EMA trace of the normalized covariance operator
 	float sigma2;                   // isotropic complement-tail closure scalar
 	float mu;                       // adaptive prediction coefficient
@@ -77,7 +83,7 @@ struct WeightState
 	bool initialized;
 
 	WeightState()
-	    : m(0u), n(0u), r(0u), activeRank(0u),
+	    : m(0u), n(0u), r(0u), activeRank(0u), complementRank(0u),
 	      complementFisher(0.0f), totalTrace(0.0f), sigma2(0.0f),
 	      mu(0.01f), lastBaselineRate(0.0f),
 	      step(0ULL), initialized(false)
@@ -86,10 +92,11 @@ struct WeightState
 
 	void reset()
 	{
-		m = n = r = activeRank = 0u;
+		m = n = r = activeRank = complementRank = 0u;
 		U.clear();
 		fisherDiag.clear();
 		V.clear();
+		complementBlock.clear();
 		prevGz.clear();
 		prevGv.clear();
 		scratch_gz.clear();
@@ -106,6 +113,9 @@ struct WeightState
 		scratch_V_old.clear();
 		scratch_Bv.clear();
 		scratch_Zv.clear();
+		scratch_complementMat.clear();
+		scratch_complementEigVec.clear();
+		scratch_complementEigVal.clear();
 		complementFisher = 0.0f;
 		totalTrace = 0.0f;
 		sigma2 = 0.0f;

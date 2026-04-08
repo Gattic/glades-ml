@@ -34,6 +34,7 @@ struct GpuAtlasWeightState
 	unsigned int m;     // rows of weight matrix
 	unsigned int n;     // cols of weight matrix
 	unsigned int r;     // subspace rank
+	unsigned int complementRank; // allocated complement-block rank (>= 1 for storage)
 	bool rightSubspace; // true when m > n (use right singular vectors)
 
 	// subDim = min(m,n): dimension the subspace basis lives in
@@ -45,16 +46,18 @@ struct GpuAtlasWeightState
 
 	GpuBuffer<float> U;          // [subDim * r] orthonormal subspace basis
 	GpuBuffer<float> fisherDiag; // [r] EMA of Fisher eigenvalues
-	GpuBuffer<float> V;          // [subDim] residual complement sector basis
-	GpuBuffer<float> complementFisher; // [1] EMA Fisher mass for V
+	GpuBuffer<float> V;          // [subDim * complementRank] residual complement basis
+	GpuBuffer<float> complementBlock; // [complementRank * complementRank] dense residual covariance EMA
+	GpuBuffer<float> complementFisher; // [1] trace(complementBlock)
 	GpuBuffer<float> prevGz;     // [outerDim * r] previous compressed gradient
-	GpuBuffer<float> prevGv;     // [outerDim] previous complement-sector gradient
+	GpuBuffer<float> prevGv;     // [outerDim * complementRank] previous complement-block gradient
 
 	// Scratch buffers (persistent to avoid per-step allocation)
 	GpuBuffer<float> gz;         // [outerDim * r] current projected gradient
 	GpuBuffer<float> gPred;      // [outerDim * r] scaled prediction for correction SGEMM
-	GpuBuffer<float> gv;         // [outerDim] current complement-sector gradient
-	GpuBuffer<float> gPredV;     // [outerDim] scaled complement correction
+	GpuBuffer<float> gv;         // [outerDim * complementRank] current complement-block gradient
+	GpuBuffer<float> gPredV;     // [outerDim * complementRank] scaled complement correction
+	GpuBuffer<float> complementMat; // [complementRank * complementRank] dense complement correction matrix
 	GpuBuffer<float> d_reduce;   // [2] reduction output (errNormSq, gzNormSq)
 	GpuBuffer<float> d_partials; // [512] per-block partial sums for deterministic reductions
 
@@ -65,9 +68,9 @@ struct GpuAtlasWeightState
 	GpuBuffer<float> overlap;    // [r * r * 2]
 	GpuBuffer<float> prevGzOld;  // [outerDim * r]
 	GpuBuffer<float> qrTemp;     // [subDim * r] scratch for Cholesky QR SGEMM output
-	GpuBuffer<float> V_old;      // [subDim]
-	GpuBuffer<float> Bv;         // [outerDim]
-	GpuBuffer<float> Zv;         // [subDim]
+	GpuBuffer<float> V_old;      // [subDim * complementRank]
+	GpuBuffer<float> Bv;         // [outerDim * complementRank]
+	GpuBuffer<float> Zv;         // [subDim * complementRank]
 	bool refreshAllocated;       // true after refresh scratch buffers allocated
 
 	// Host-side scalars (passed to kernels as parameters, updated on host)
@@ -79,7 +82,7 @@ struct GpuAtlasWeightState
 	float lastBaselineRate;
 
 	GpuAtlasWeightState()
-	    : m(0u), n(0u), r(0u), rightSubspace(false),
+	    : m(0u), n(0u), r(0u), complementRank(0u), rightSubspace(false),
 	      refreshAllocated(false),
 	      totalTrace(0.0f), sigma2(0.0f), mu(0.01f), step(0ULL), initialized(false),
 	      lastBaselineRate(0.0f)
