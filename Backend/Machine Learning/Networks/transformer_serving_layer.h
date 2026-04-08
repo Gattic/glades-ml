@@ -102,6 +102,14 @@ public:
 		bool done;
 		NNetworkStatus status; // OK if successful or cancelled-by-callback; INTERNAL/INVALID_* on failure.
 		NNetwork::TransformerGenerateResult result; // includes stop flags + tokens (as accumulated by this layer)
+		uint64_t submittedAtUs;
+		uint64_t admittedAtUs;
+		uint64_t completedAtUs;
+		uint64_t queueWaitUs;
+		uint64_t serviceTimeUs;
+		uint64_t endToEndTimeUs;
+		unsigned int promptTokenCount;
+		unsigned int generatedTokenCount;
 
 		// Number of tokens already delivered through popNewTokens().
 		unsigned int streamedTokenCount;
@@ -111,6 +119,14 @@ public:
 		      done(false),
 		      status(NNetworkStatus::OK, std::string()),
 		      result(),
+		      submittedAtUs(0ULL),
+		      admittedAtUs(0ULL),
+		      completedAtUs(0ULL),
+		      queueWaitUs(0ULL),
+		      serviceTimeUs(0ULL),
+		      endToEndTimeUs(0ULL),
+		      promptTokenCount(0u),
+		      generatedTokenCount(0u),
 		      streamedTokenCount(0u)
 		{
 		}
@@ -129,11 +145,29 @@ public:
 		unsigned int doneSnapshots;
 		unsigned int snapshotCount;
 		unsigned int completedCallbackCount;
+		unsigned int peakPendingRequests;
+		unsigned int peakActiveRequests;
+		unsigned int peakDoneSnapshots;
 		uint64_t nextRequestId;
+		uint64_t startTimeUs;
+		uint64_t uptimeUs;
 		uint64_t totalSubmitted;
+		uint64_t totalSubmitRejected;
+		uint64_t totalBackpressureRejected;
 		uint64_t totalAdmitted;
+		uint64_t totalCompleted;
+		uint64_t totalCompletedSuccess;
+		uint64_t totalCompletedCancelled;
+		uint64_t totalCompletedFailed;
 		uint64_t totalPendingCancels;
 		uint64_t totalLiveCancelRequests;
+		uint64_t totalCallbackStops;
+		uint64_t totalLimitStops;
+		uint64_t totalStopTokenStops;
+		uint64_t totalEosStops;
+		uint64_t totalPromptTokensSubmitted;
+		uint64_t totalPromptTokensAdmitted;
+		uint64_t totalGeneratedTokens;
 		uint64_t totalStepCalls;
 		uint64_t totalIdleSteps;
 		uint64_t totalAdmitFailures;
@@ -141,6 +175,28 @@ public:
 		uint64_t totalCallbackExceptions;
 		uint64_t totalReentrantStepRejected;
 		uint64_t totalSnapshotClears;
+		uint64_t totalQueueWaitUs;
+		uint64_t totalServiceTimeUs;
+		uint64_t totalEndToEndTimeUs;
+		uint64_t totalStepDurationUs;
+		uint64_t lastQueueWaitUs;
+		uint64_t lastServiceTimeUs;
+		uint64_t lastEndToEndTimeUs;
+		uint64_t lastStepDurationUs;
+		uint64_t maxQueueWaitUs;
+		uint64_t maxServiceTimeUs;
+		uint64_t maxEndToEndTimeUs;
+		uint64_t maxStepDurationUs;
+		uint64_t recentRequestLatencyP50Us;
+		uint64_t recentRequestLatencyP99Us;
+		uint64_t recentRequestLatencyP999Us;
+		uint64_t recentStepDurationP50Us;
+		uint64_t recentStepDurationP99Us;
+		uint64_t recentStepDurationP999Us;
+		float submittedPerSec;
+		float admittedPerSec;
+		float completedPerSec;
+		float generatedTokensPerSec;
 		uint64_t lastFailureRequestId;
 		unsigned int lastFailureSlot;
 		NNetworkStatus lastFailureStatus;
@@ -158,11 +214,29 @@ public:
 		      doneSnapshots(0u),
 		      snapshotCount(0u),
 		      completedCallbackCount(0u),
+		      peakPendingRequests(0u),
+		      peakActiveRequests(0u),
+		      peakDoneSnapshots(0u),
 		      nextRequestId(0ULL),
+		      startTimeUs(0ULL),
+		      uptimeUs(0ULL),
 		      totalSubmitted(0ULL),
+		      totalSubmitRejected(0ULL),
+		      totalBackpressureRejected(0ULL),
 		      totalAdmitted(0ULL),
+		      totalCompleted(0ULL),
+		      totalCompletedSuccess(0ULL),
+		      totalCompletedCancelled(0ULL),
+		      totalCompletedFailed(0ULL),
 		      totalPendingCancels(0ULL),
 		      totalLiveCancelRequests(0ULL),
+		      totalCallbackStops(0ULL),
+		      totalLimitStops(0ULL),
+		      totalStopTokenStops(0ULL),
+		      totalEosStops(0ULL),
+		      totalPromptTokensSubmitted(0ULL),
+		      totalPromptTokensAdmitted(0ULL),
+		      totalGeneratedTokens(0ULL),
 		      totalStepCalls(0ULL),
 		      totalIdleSteps(0ULL),
 		      totalAdmitFailures(0ULL),
@@ -170,6 +244,28 @@ public:
 		      totalCallbackExceptions(0ULL),
 		      totalReentrantStepRejected(0ULL),
 		      totalSnapshotClears(0ULL),
+		      totalQueueWaitUs(0ULL),
+		      totalServiceTimeUs(0ULL),
+		      totalEndToEndTimeUs(0ULL),
+		      totalStepDurationUs(0ULL),
+		      lastQueueWaitUs(0ULL),
+		      lastServiceTimeUs(0ULL),
+		      lastEndToEndTimeUs(0ULL),
+		      lastStepDurationUs(0ULL),
+		      maxQueueWaitUs(0ULL),
+		      maxServiceTimeUs(0ULL),
+		      maxEndToEndTimeUs(0ULL),
+		      maxStepDurationUs(0ULL),
+		      recentRequestLatencyP50Us(0ULL),
+		      recentRequestLatencyP99Us(0ULL),
+		      recentRequestLatencyP999Us(0ULL),
+		      recentStepDurationP50Us(0ULL),
+		      recentStepDurationP99Us(0ULL),
+		      recentStepDurationP999Us(0ULL),
+		      submittedPerSec(0.0f),
+		      admittedPerSec(0.0f),
+		      completedPerSec(0.0f),
+		      generatedTokensPerSec(0.0f),
 		      lastFailureRequestId(0ULL),
 		      lastFailureSlot(static_cast<unsigned int>(-1)),
 		      lastFailureStatus(NNetworkStatus::OK, std::string()),
@@ -284,9 +380,10 @@ private:
 		uint64_t id;
 		NNetwork::TransformerServeRequest req;
 		CallbackHandle cb;
-		Pending() : id(0ULL), req(), cb() {}
-		Pending(uint64_t newId, const NNetwork::TransformerServeRequest& newReq, const CallbackHandle& newCb)
-		    : id(newId), req(newReq), cb(newCb)
+		uint64_t submittedAtUs;
+		Pending() : id(0ULL), req(), cb(), submittedAtUs(0ULL) {}
+		Pending(uint64_t newId, const NNetwork::TransformerServeRequest& newReq, const CallbackHandle& newCb, uint64_t newSubmittedAtUs)
+		    : id(newId), req(newReq), cb(newCb), submittedAtUs(newSubmittedAtUs)
 		{
 		}
 	};
@@ -295,7 +392,47 @@ private:
 	{
 		uint64_t id;
 		CallbackHandle cb;
-		LiveSlot() : id(0ULL), cb() {}
+		uint64_t admittedAtUs;
+		LiveSlot() : id(0ULL), cb(), admittedAtUs(0ULL) {}
+	};
+
+	struct DurationWindow
+	{
+		std::vector<uint64_t> samples;
+		unsigned int nextIndex;
+		bool filled;
+
+		DurationWindow()
+		    : samples(128u, 0ULL),
+		      nextIndex(0u),
+		      filled(false)
+		{
+		}
+
+		void clear()
+		{
+			std::fill(samples.begin(), samples.end(), 0ULL);
+			nextIndex = 0u;
+			filled = false;
+		}
+
+		void add(uint64_t sample)
+		{
+			if (samples.empty())
+				return;
+			samples[nextIndex] = sample;
+			nextIndex += 1u;
+			if (nextIndex >= samples.size())
+			{
+				nextIndex = 0u;
+				filled = true;
+			}
+		}
+
+		unsigned int size() const
+		{
+			return filled ? static_cast<unsigned int>(samples.size()) : nextIndex;
+		}
 	};
 
 	struct DeferredTokenCallback
@@ -348,8 +485,20 @@ private:
 	             const char* msg,
 	             const NNetworkStatus* st = NULL,
 	             unsigned int slot = static_cast<unsigned int>(-1)) const;
+	void logRequestDone_(uint64_t requestId,
+	                    const RequestSnapshot& snap,
+	                    const NNetworkStatus& finalStatus,
+	                    unsigned int slot) const;
 	unsigned int countDoneSnapshots_() const;
 	void noteFailure_(uint64_t requestId, unsigned int slot, const NNetworkStatus& st);
+	void noteSubmitRejected_(bool backpressure);
+	void updatePeakDepths_();
+	void noteStepDuration_(uint64_t stepStartUs);
+	void finalizeRequestMetrics_(uint64_t requestId, RequestSnapshot& snap);
+	void fillDurationPercentiles_(const DurationWindow& window,
+	                             uint64_t& outP50,
+	                             uint64_t& outP99,
+	                             uint64_t& outP999) const;
 
 private:
 	// Helpers: step() only (single-threaded).
@@ -406,6 +555,8 @@ private:
 	std::map<uint64_t, RequestSnapshot> snapshots_;
 	mutable std::vector<DeferredTokenCallback> deferredTokenCallbacks_;
 	std::map<uint64_t, CallbackHandle> completedCallbacks_;
+	DurationWindow requestLatencySamples_;
+	DurationWindow stepDurationSamples_;
 
 	Diagnostics diagnostics_;
 

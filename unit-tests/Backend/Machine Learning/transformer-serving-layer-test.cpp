@@ -1085,6 +1085,8 @@ void TransformerServingLayerUnitTest()
 			ASSERT("==============ServingLayer: DiagnosticsFailureCounts Failed==============",
 			       diag.totalSubmitted == 1ULL &&
 			       diag.totalAdmitFailures == 1ULL &&
+			       diag.totalCompleted == 1ULL &&
+			       diag.totalCompletedFailed == 1ULL &&
 			       diag.totalStepCalls == 1ULL &&
 			       diag.pendingRequests == 0u &&
 			       diag.doneSnapshots == 1u);
@@ -1093,9 +1095,119 @@ void TransformerServingLayerUnitTest()
 			       !diag.lastFailureStatus.ok() &&
 			       diag.lastFailureStatus.code == glades::NNetworkStatus::INVALID_ARGUMENT);
 			ASSERT("==============ServingLayer: DiagnosticsLastStepStatus Failed==============", diag.lastStepStatus.ok());
+			ASSERT("==============ServingLayer: DiagnosticsFailureLatency Failed==============",
+			       diag.recentRequestLatencyP50Us == diag.lastEndToEndTimeUs &&
+			       diag.recentRequestLatencyP99Us == diag.lastEndToEndTimeUs &&
+			       diag.recentRequestLatencyP999Us == diag.lastEndToEndTimeUs);
 
 			layer.stop();
 			m.net->setLogger(NULL);
+		}
+
+		// --------
+		// Case 19: serving metrics expose throughput, latency snapshots, and per-request timings
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(1u, 16u, false);
+			ASSERT("==============ServingLayer: StartMetrics Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(2u);
+			prompt.push_back(3u);
+			uint64_t id = 0ULL;
+			ASSERT("==============ServingLayer: SubmitMetrics Failed==============", layer.submit(make_req(prompt, 2u, false, 909u, 1u), id).ok());
+
+			glades::TransformerServingLayer::Diagnostics diag;
+			ASSERT("==============ServingLayer: MetricsDiagQueued Failed==============", layer.getDiagnostics(diag));
+			ASSERT("==============ServingLayer: MetricsQueuedCounts Failed==============",
+			       diag.totalSubmitted == 1ULL &&
+			       diag.totalSubmitRejected == 0ULL &&
+			       diag.pendingRequests == 1u &&
+			       diag.peakPendingRequests >= 1u &&
+			       diag.totalPromptTokensSubmitted == prompt.size());
+
+			glades::TransformerServingLayer::RequestSnapshot snap;
+			step_until_done(layer, id, 8u,
+			                "==============ServingLayer: MetricsStep Failed==============",
+			                "==============ServingLayer: MetricsSnapshot Failed==============",
+			                snap);
+			ASSERT("==============ServingLayer: MetricsDone Failed==============", snap.done);
+			ASSERT("==============ServingLayer: MetricsDiagDone Failed==============", layer.getDiagnostics(diag));
+			ASSERT("==============ServingLayer: MetricsThroughputCounts Failed==============",
+			       diag.totalSubmitted == 1ULL &&
+			       diag.totalAdmitted == 1ULL &&
+			       diag.totalCompleted == 1ULL &&
+			       diag.totalCompletedSuccess == 1ULL &&
+			       diag.totalCompletedCancelled == 0ULL &&
+			       diag.totalCompletedFailed == 0ULL &&
+			       diag.totalPromptTokensSubmitted == prompt.size() &&
+			       diag.totalPromptTokensAdmitted == prompt.size() &&
+			       diag.totalGeneratedTokens == snap.generatedTokenCount);
+			ASSERT("==============ServingLayer: MetricsPeaks Failed==============",
+			       diag.peakPendingRequests >= 1u &&
+			       diag.peakActiveRequests >= 1u);
+			ASSERT("==============ServingLayer: MetricsLatencyTotals Failed==============",
+			       diag.totalQueueWaitUs <= diag.totalEndToEndTimeUs &&
+			       diag.totalServiceTimeUs <= diag.totalEndToEndTimeUs &&
+			       diag.lastQueueWaitUs <= diag.lastEndToEndTimeUs &&
+			       diag.lastServiceTimeUs <= diag.lastEndToEndTimeUs &&
+			       diag.recentRequestLatencyP50Us == diag.lastEndToEndTimeUs &&
+			       diag.recentRequestLatencyP99Us == diag.lastEndToEndTimeUs &&
+			       diag.recentRequestLatencyP999Us == diag.lastEndToEndTimeUs);
+			ASSERT("==============ServingLayer: MetricsStepLatency Failed==============",
+			       diag.totalStepDurationUs >= diag.lastStepDurationUs &&
+			       diag.maxStepDurationUs >= diag.recentStepDurationP50Us &&
+			       diag.maxStepDurationUs >= diag.recentStepDurationP99Us &&
+			       diag.maxStepDurationUs >= diag.recentStepDurationP999Us);
+			ASSERT("==============ServingLayer: MetricsRates Failed==============",
+			       diag.submittedPerSec >= 0.0f &&
+			       diag.admittedPerSec >= 0.0f &&
+			       diag.completedPerSec >= 0.0f &&
+			       diag.generatedTokensPerSec >= 0.0f);
+			ASSERT("==============ServingLayer: MetricsSnapshotFields Failed==============",
+			       snap.submittedAtUs > 0ULL &&
+			       snap.admittedAtUs >= snap.submittedAtUs &&
+			       snap.completedAtUs >= snap.admittedAtUs &&
+			       snap.queueWaitUs <= snap.endToEndTimeUs &&
+			       snap.serviceTimeUs <= snap.endToEndTimeUs &&
+			       snap.promptTokenCount == prompt.size() &&
+			       snap.generatedTokenCount == snap.result.tokens.size());
+
+			layer.stop();
+		}
+
+		// --------
+		// Case 20: backpressure rejection increments serving saturation counters
+		// --------
+		{
+			glades::TransformerServingLayer layer;
+			glades::TransformerServingLayer::Config cfg = make_layer_cfg(2u, 16u, false);
+			cfg.maxPendingRequests = 2u;
+			ASSERT("==============ServingLayer: StartBackpressureMetrics Failed==============", layer.start(*m.net, cfg).ok());
+
+			std::vector<unsigned int> prompt;
+			prompt.push_back(1u);
+			prompt.push_back(2u);
+
+			uint64_t id0 = 0ULL;
+			uint64_t id1 = 0ULL;
+			uint64_t id2 = 0ULL;
+			ASSERT("==============ServingLayer: BackpressureSubmit0 Failed==============", layer.submit(make_req(prompt, 1u, false, 1001u, 1u), id0).ok());
+			ASSERT("==============ServingLayer: BackpressureSubmit1 Failed==============", layer.submit(make_req(prompt, 1u, false, 1002u, 1u), id1).ok());
+			ASSERT("==============ServingLayer: BackpressureReject Failed==============",
+			       !layer.submit(make_req(prompt, 1u, false, 1003u, 1u), id2).ok());
+
+			glades::TransformerServingLayer::Diagnostics diag;
+			ASSERT("==============ServingLayer: BackpressureDiag Failed==============", layer.getDiagnostics(diag));
+			ASSERT("==============ServingLayer: BackpressureDiagCounts Failed==============",
+			       diag.totalSubmitted == 2ULL &&
+			       diag.totalSubmitRejected == 1ULL &&
+			       diag.totalBackpressureRejected == 1ULL &&
+			       diag.pendingRequests == 2u &&
+			       diag.peakPendingRequests == 2u);
+
+			layer.stop();
 		}
 
 		printf("\n============================================================\n");
