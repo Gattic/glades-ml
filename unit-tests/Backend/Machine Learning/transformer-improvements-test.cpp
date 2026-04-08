@@ -14,6 +14,7 @@
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_ops.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_train_detail.h"
 #include "../../../Backend/Machine Learning/Networks/training_config.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
 #include "../../../Backend/Machine Learning/DataObjects/TokenInput.h"
@@ -904,6 +905,59 @@ void TransformerImprovementsUnitTest()
 
 		delete net;
 		delete info;
+	}
+
+	// ===== 14. Cosine LR schedule uses fractional intra-epoch progress =====
+	printf("-----------------------------------\n");
+	printf("Cosine LR schedule: fractional intra-epoch progress\n");
+	printf("-----------------------------------\n");
+	{
+		glades::LearningRateScheduleConfig schedule;
+		schedule.setCosine(2, 0.1f);
+
+		const unsigned int totalStepsInEpoch = 8u;
+		double previous = 0.0;
+		for (unsigned int stepInEpoch = 0u; stepInEpoch <= totalStepsInEpoch; ++stepInEpoch)
+		{
+			const double epochProgress =
+			    static_cast<double>(stepInEpoch) / static_cast<double>(totalStepsInEpoch);
+			const double expected = static_cast<double>(schedule.multiplierFractionalEpoch(epochProgress));
+			const double actual = static_cast<double>(glades::transformer_train_detail::transformer_schedule_multiplier(
+			    schedule, 0, stepInEpoch, totalStepsInEpoch));
+			G_assert(__FILE__, __LINE__, "==============Cosine schedule: finite multiplier expected==============",
+			         std::isfinite(actual));
+			G_assert(__FILE__, __LINE__, "==============Cosine schedule: fractional multiplier mismatch==============",
+			         fabs(actual - expected) < 1e-7);
+			if (stepInEpoch > 0u)
+				G_assert(__FILE__, __LINE__, "==============Cosine schedule: intra-epoch multiplier must not increase==============",
+				         actual <= previous + 1e-7);
+			previous = actual;
+		}
+
+		const double start = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(schedule, 0, 0u, totalStepsInEpoch));
+		const double firstStep = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(schedule, 0, 1u, totalStepsInEpoch));
+		const double endOfEpoch = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(
+		        schedule, 0, totalStepsInEpoch, totalStepsInEpoch));
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: epoch should start at multiplier 1==============",
+		         fabs(start - 1.0) < 1e-7);
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: first step must decay below epoch start==============",
+		         firstStep < start - 1e-4);
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: epoch end mismatch==============",
+		         fabs(endOfEpoch - static_cast<double>(schedule.multiplier(1))) < 1e-7);
+
+		const double clamped = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(
+		        schedule, 0, totalStepsInEpoch + 5u, totalStepsInEpoch));
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: step clamp mismatch==============",
+		         fabs(clamped - endOfEpoch) < 1e-7);
+
+		const double zeroStepsFallback = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(schedule, 1, 0u, 0u));
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: zero-step fallback mismatch==============",
+		         fabs(zeroStepsFallback - static_cast<double>(schedule.multiplier(1))) < 1e-7);
 	}
 
 	printf("\n============================================================\n");
