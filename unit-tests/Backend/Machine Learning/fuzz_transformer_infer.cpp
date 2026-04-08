@@ -2,20 +2,21 @@
 //
 // This file is NOT compiled by default in the normal unit-tests build.
 //
-// Build example (clang):
-//   clang++ -std=c++98 -O1 -g -fsanitize=fuzzer,address,undefined \
-//     -I. -I./include -I./Backend -I./services \
-//     unit-tests/Backend/Machine\ Learning/fuzz_transformer_infer.cpp \
-//     -lglades -lshmea -o fuzz_transformer_infer
+// Preferred build:
+//   cmake -S unit-tests -B unit-tests/build \
+//     -DGLADES_BUILD_TRANSFORMER_INFER_FUZZER=ON \
+//     -DCMAKE_CXX_COMPILER=clang++
+//   cmake --build unit-tests/build --target fuzz_transformer_infer
 //
-// Then run:
-//   ./fuzz_transformer_infer -runs=100000 corpus_dir/
+// Quick smoke run:
+//   cmake --build unit-tests/build --target fuzz_transformer_infer_smoke
 //
 // Notes:
 // - This harness avoids filesystem IO.
 // - It keeps maxSeqLen small to avoid large allocations.
 
 #include "../../../Backend/Machine Learning/Networks/network.h"
+#include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/hiddenlayerinfo.h"
@@ -173,7 +174,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 				const glades::NNetworkStatus st = fx.net->transformerLmServeBatcherStep(batcher, NULL);
 				if (!st.ok())
 					break;
-				if (slot < batcher.done.size() && batcher.done[slot] != 0u)
+				if (batcher.slotDone(slot))
 					break;
 			}
 		}
