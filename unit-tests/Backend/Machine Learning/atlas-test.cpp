@@ -36,6 +36,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -58,6 +61,35 @@ public:
 	glades::NNetworkEpochMetrics last;
 	bool saw;
 };
+
+static bool parse_kv_manifest(const std::string& path, std::map<std::string, std::string>& outKv)
+{
+	outKv.clear();
+	std::ifstream in(path.c_str());
+	if (!in)
+		return false;
+
+	std::string line;
+	bool sawMagic = false;
+	while (std::getline(in, line))
+	{
+		if (!line.empty() && line[line.size() - 1u] == '\r')
+			line.erase(line.size() - 1u);
+		if (line.empty())
+			continue;
+		if (!sawMagic)
+		{
+			outKv["__magic__"] = line;
+			sawMagic = true;
+			continue;
+		}
+		const std::string::size_type eq = line.find('=');
+		if (eq == std::string::npos)
+			continue;
+		outKv[line.substr(0u, eq)] = line.substr(eq + 1u);
+	}
+	return sawMagic;
+}
 
 } // anonymous namespace
 
@@ -2251,16 +2283,38 @@ void ATLASUnitTest()
 			diB->testMatrix = diB->trainMatrix;
 			diB->testExpectedMatrix = diB->trainExpectedMatrix;
 
+			std::map<std::string, std::string> kv;
+			ASSERT("==============ATLAS::StateCheckpoint ParseManifest Failed==============",
+			       parse_kv_manifest("database/checkpoints/" + ckptName + "/manifest.txt", kv));
+			ASSERT("==============ATLAS::StateCheckpoint ManifestMagic Failed==============",
+			       kv["__magic__"] == "GLADES_CHECKPOINT");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestRank Failed==============",
+			       kv["training.atlas.rank"] == "4");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestTSub Failed==============",
+			       kv["training.atlas.tSub"] == "50");
+
+			{
+				glades::NNetwork netMismatch(glades::NNetwork::TYPE_DFF);
+				glades::TrainingConfig& cfgMismatch = netMismatch.getTrainingConfigMutable();
+				cfgMismatch.optimizer.type = glades::OptimizerConfig::ATLAS;
+				cfgMismatch.atlas.rank = 7u;
+				cfgMismatch.atlas.tSub = 13u;
+				glades::NNetworkStatus stMismatch = netMismatch.loadCheckpoint(ckptName, diB);
+				ASSERT("==============ATLAS::StateCheckpoint MismatchLoadShouldFail==============", !stMismatch.ok());
+				ASSERT("==============ATLAS::StateCheckpoint MismatchMessage Failed==============",
+				       stMismatch.message.find("training.atlas.rank") != std::string::npos
+				       || stMismatch.message.find("training.atlas.tSub") != std::string::npos);
+			}
+
 			glades::NNetwork netB;
 			glades::NNetworkStatus st = netB.loadCheckpoint(ckptName, diB);
 			ASSERT("==============ATLAS::StateCheckpoint Load Failed==============", st.ok());
-
-			// Restore ATLAS config (not yet persisted in checkpoint manifest).
-			{
-				glades::TrainingConfig& cfg = netB.getTrainingConfigMutable();
-				cfg.atlas.rank = 4;
-				cfg.atlas.tSub = 50;
-			}
+			ASSERT("==============ATLAS::StateCheckpoint OptimizerRestored Failed==============",
+			       netB.getTrainingConfig().optimizer.type == glades::OptimizerConfig::ATLAS);
+			ASSERT("==============ATLAS::StateCheckpoint RankRestored Failed==============",
+			       netB.getTrainingConfig().atlas.rank == 4u);
+			ASSERT("==============ATLAS::StateCheckpoint TSubRestored Failed==============",
+			       netB.getTrainingConfig().atlas.tSub == 50u);
 			netB.getTerminatorMutable().setEpoch(50);
 			CaptureMetricsCallbacks cbB;
 			st = netB.train(diB, &cbB);

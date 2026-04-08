@@ -191,7 +191,7 @@ Already in place:
 - `ATLAS Test 24` verifies resume equivalence for a checkpointed ATLAS training run
 
 Remaining work:
-- Persist ATLAS config in the checkpoint manifest so callers do not have to manually restore fields like `rank` and `tSub` after `loadCheckpoint()`
-- Fail fast on rank/config mismatches instead of reconstructing ATLAS state from the current runtime config
+- [x] Persist ATLAS config in the checkpoint manifest so callers do not have to manually restore fields like `rank` and `tSub` after `loadCheckpoint()`
+- [x] Fail fast on rank/config mismatches instead of reconstructing ATLAS state from the current runtime config
 - Add a transformer-focused resume test so checkpoint coverage is not limited to the DFF path
 - Decide whether GPU-resident resume needs dedicated coverage beyond the current checkpoint load path

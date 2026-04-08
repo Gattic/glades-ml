@@ -595,6 +595,8 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.optimizer.adamBeta2", f)) { cfg.optimizer.adamBeta2 = f; any = true; }
 	if (parse_float(kv, "training.optimizer.adamEps", f)) { cfg.optimizer.adamEps = f; any = true; }
 	if (parse_bool01(kv, "training.optimizer.adamBiasCorrection", b)) { cfg.optimizer.adamBiasCorrection = b; any = true; }
+	if (parse_int(kv, "training.atlas.rank", i) && i >= 0) { cfg.atlas.rank = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.tSub", i) && i >= 0) { cfg.atlas.tSub = static_cast<unsigned int>(i); any = true; }
 
 	if (parse_int(kv, "training.lrSchedule.type", i)) { cfg.lrSchedule.type = static_cast<glades::LearningRateScheduleConfig::Type>(i); any = true; }
 	if (parse_int(kv, "training.lrSchedule.stepSizeEpochs", i)) { cfg.lrSchedule.stepSizeEpochs = i; any = true; }
@@ -942,6 +944,8 @@ static bool write_manifest(const std::string& manifestPath,
 		std::ostringstream oss; oss << trainingConfig.optimizer.adamEps; write_kv(out, "training.optimizer.adamEps", oss.str());
 	}
 	write_kv(out, "training.optimizer.adamBiasCorrection", trainingConfig.optimizer.adamBiasCorrection ? "1" : "0");
+	write_kv(out, "training.atlas.rank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.rank)));
+	write_kv(out, "training.atlas.tSub", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.tSub)));
 	write_kv(out, "training.lrSchedule.type", u64_to_string(static_cast<uint64_t>(static_cast<int>(trainingConfig.lrSchedule.type))));
 	write_kv(out, "training.lrSchedule.stepSizeEpochs", u64_to_string(static_cast<uint64_t>(trainingConfig.lrSchedule.stepSizeEpochs)));
 	{
@@ -1216,6 +1220,45 @@ static void restore_checkpoint_runtime_metadata(const std::map<std::string, std:
 	apply_training_config_from_kv(kv, cfgTmp, any);
 	if (any)
 		cfg = cfgTmp;
+}
+
+static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
+    const std::map<std::string, std::string>& kv,
+    const glades::TrainingConfig& currentCfg)
+{
+	int savedOptimizerType = -1;
+	if (!parse_int(kv, "training.optimizer.type", savedOptimizerType))
+		return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+
+	if (currentCfg.optimizer.type != glades::OptimizerConfig::ATLAS ||
+	    savedOptimizerType != static_cast<int>(glades::OptimizerConfig::ATLAS))
+	{
+		return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+	}
+
+	int savedRank = -1;
+	if (parse_int(kv, "training.atlas.rank", savedRank) &&
+	    savedRank >= 0 &&
+	    currentCfg.atlas.rank != static_cast<unsigned int>(savedRank))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.rank mismatch vs requested resume config (checkpoint "
+		    << savedRank << ", current " << currentCfg.atlas.rank << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedTSub = -1;
+	if (parse_int(kv, "training.atlas.tSub", savedTSub) &&
+	    savedTSub >= 0 &&
+	    currentCfg.atlas.tSub != static_cast<unsigned int>(savedTSub))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.tSub mismatch vs requested resume config (checkpoint "
+		    << savedTSub << ", current " << currentCfg.atlas.tSub << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
 
 static glades::NNetworkStatus open_checkpoint_shards(const std::string& dir,
@@ -2540,6 +2583,12 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		netType = netTypeOverride;
 	else
 		netType = savedNetType;
+
+	{
+		const NNetworkStatus stCfg = validate_checkpoint_training_config_compatibility(kv, trainingConfig);
+		if (!stCfg.ok())
+			return failStatus(stCfg.code, stCfg.message);
+	}
 
 	// Restore metadata/config before allocating tensors.
 	uint64_t savedSeed = 0u;
