@@ -34,17 +34,20 @@ The implemented redesign therefore makes three concrete changes:
 - **Conservative adaptive-rank policy.** Adaptive rank remains available, but it now shrinks only at refresh boundaries, repairs the inactive basis to keep `U` orthonormal, and is disabled by default until broader benchmarks justify turning it on globally.
 - **Projection-consistent covariance closure.** `sigma2` is no longer estimated on a separate accumulated-gradient scale; the optimizer now tracks the normalized covariance trace `tr((1/n) H H^T)` on the same update scale as the subspace Fisher statistics and derives the complement scalar by trace closure.
 - **Residual complement-sector prototype.** ATLAS can now track one anisotropic complement direction through `complementRank=1`, with its own Fisher EMA and an isotropic tail on the remaining complement.
+- **Sector-specific damping controls.** The complement sector now uses its own nominal lr scale and `kappaMax` cap instead of inheriting the more aggressive active-space settings. The current default is a conservative sector path intended to prevent residual-block over-correction.
 
 Observed outcomes on April 8, 2026:
 - `./glades-unit-tests atlas` passes with the redesign enabled.
 - The aggressive adaptive-rank setting improved throughput slightly but hurt MNIST test accuracy; it is therefore no longer the default.
 - The trace-closed baseline path with `complementRank=0` reached `train=8.06s`, `testAcc=98.14%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 0`.
 - The one-sector residual closure with `complementRank=1` reached `train=8.00s`, `testAcc=97.72%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 1`.
+- After retuning the one-sector path to `complementLrScale=0.25` and `complementKappaMax=0.5`, the same benchmark reached `train=8.17s`, `testAcc=97.86%`. This is better than the undamped one-sector path but still below the `complementRank=0` baseline.
+- On the hidden FC layer at step 200 of the standard benchmark, the sector-specific damping reduced the logged `sector_rate` from about `0.1609` in the undamped path to `0.0100`, confirming that the retune directly addressed the residual-block over-correction mechanism.
 
 Interpretation:
 - The data supports **stability-first subspace tracking** and **opt-in adaptive compression**, not unconditional online rank collapse.
 - The scale-consistency issue between `sigma2` and the subspace Fisher statistics is addressed in the implementation by sharing one normalized covariance model.
-- A single residual complement sector improves the geometric model but does **not** improve standard MNIST generalization yet; on April 8, 2026 the one-sector run was slightly faster but materially less accurate than the `complementRank=0` baseline.
+- A single residual complement sector still does **not** improve standard MNIST generalization yet. The main gain from retuning was stability: the sector update is no longer grossly oversized relative to the complement baseline, but even the damped setting remains worse than `complementRank=0`.
 - The next likely source of gains is not merely "any richer closure", but a better residual policy: sector birth/death, denser residual blocks, or retuned `lr`/`kappaMax` for complement-sector updates.
 
 ---

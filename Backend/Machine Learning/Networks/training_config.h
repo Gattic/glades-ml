@@ -409,6 +409,17 @@ struct ATLASConfig
 	// This only applies when the complement has at least two remaining directions.
 	unsigned int complementRank;
 
+	// Relative learning-rate scale applied only to the anisotropic complement
+	// sector update. Values below 1 damp the residual-sector correction so it
+	// does not inherit the more aggressive nominal lr used for the active space.
+	float complementLrScale;
+
+	// Maximum ratio of the effective complement-sector rate to the sector's own
+	// nominal lr. This caps complementRate =
+	// (complementLrScale * lr) / (sectorFisher + eps) at
+	// complementKappaMax * complementLrScale * lr.
+	float complementKappaMax;
+
 	// Fisher EMA decay rate. Controls how quickly the Fisher diagonal and
 	// normalized covariance trace adapt. Higher values (closer to 1) give more
 	// stable estimates.
@@ -480,6 +491,8 @@ struct ATLASConfig
 	ATLASConfig()
 	    : rank(128u),
 	      complementRank(0u),
+	      complementLrScale(0.25f),
+	      complementKappaMax(0.5f),
 	      beta(0.999f),
 	      muMin(0.01f),
 	      muMax(0.3f),

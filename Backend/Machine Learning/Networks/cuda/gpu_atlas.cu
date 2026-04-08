@@ -812,6 +812,28 @@ bool atlas_gpu_prepare_correction(const float* d_gz, const float* d_prevGz,
 	return true;
 }
 
+static float atlas_nonnegative_finite(float v, float fallback)
+{
+	return (std::isfinite(v) && v >= 0.0f) ? v : fallback;
+}
+
+static float atlas_clamped_rate(float nominalLr,
+                                float fisher,
+                                float eps,
+                                float kappaMax)
+{
+	if (!(nominalLr > 0.0f))
+		return 0.0f;
+	const float cappedKappa = atlas_nonnegative_finite(kappaMax, 0.0f);
+	const float cap = cappedKappa * nominalLr;
+	float rate = nominalLr / (fisher + eps);
+	if (!std::isfinite(rate) || rate < 0.0f)
+		rate = 0.0f;
+	if (rate > cap)
+		rate = cap;
+	return rate;
+}
+
 bool atlas_gpu_mu_norms(const float* d_gz, const float* d_prevGz,
                          size_t rn, float* d_out, float* d_partials)
 {
@@ -1410,6 +1432,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	float sectorTraceCapture = 0.0f;
 	float closureGap = 0.0f;
 	float sectorFisherDiag = 0.0f;
+	float sectorRate = 0.0f;
 
 	// === Step 1: Compute the normalized covariance trace ===
 	// Two-pass deterministic reduction: block partials → single-block sum.
@@ -1636,10 +1659,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	{
 		// Apply bias correction to sigma2 (matches CPU path).
 		const float effSigma2 = state.sigma2 * bcFactor;
-		const float kappaLr = kappaMax * lr;
-		float rawBaselineRate = lr / (effSigma2 + eps);
-		if (rawBaselineRate > kappaLr) rawBaselineRate = kappaLr;
-		const float baselineRate = rawBaselineRate;
+		const float baselineRate = atlas_clamped_rate(lr, effSigma2, eps, kappaMax);
 		state.lastBaselineRate = baselineRate;
 		const float baseScaled = baselineRate * gScale;
 		if (!atlas_gpu_baseline_update(d_W, d_gW, mn, baseScaled))
@@ -1653,7 +1673,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		                                   state.fisherDiag.data(),
 		                                   state.gPred.data(), (int)r, (int)outerDim,
 		                                   onePlusMu, negMu,
-		                                   baselineRate, lr, eps, kappaLr,
+		                                   baselineRate, lr, eps, kappaMax * lr,
 		                                   bcFactor, isRight))
 			return false;
 
@@ -1683,11 +1703,18 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 
 		if (sectorRank > 0u)
 		{
+			const float sectorNominalLr = lr * atlas_nonnegative_finite(ac.complementLrScale, 0.0f);
+			const float sectorKappaLr =
+			    atlas_nonnegative_finite(ac.complementKappaMax, 0.0f) * sectorNominalLr;
+			sectorRate = atlas_clamped_rate(sectorNominalLr,
+			                                h_sectorFisher * bcFactor,
+			                                eps,
+			                                ac.complementKappaMax);
 			if (!atlas_gpu_prepare_correction(state.gv.data(), state.prevGv.data(),
 			                                   state.complementFisher.data(),
 			                                   state.gPredV.data(), 1, (int)outerDim,
 			                                   1.0f, 0.0f,
-			                                   baselineRate, lr, eps, kappaLr,
+			                                   baselineRate, sectorNominalLr, eps, sectorKappaLr,
 			                                   bcFactor, isRight))
 				return false;
 			if (isRight)
@@ -1783,6 +1810,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			    << " trace_capture=" << traceCapture
 			    << " sector_trace_capture=" << sectorTraceCapture
 			    << " sector_fisher=" << sectorFisherDiag
+			    << " sector_rate=" << sectorRate
 			    << " closure_gap=" << closureGap
 			    << " effective_rank=" << diag.effectiveRank
 			    << " spectral_efficiency=" << diag.spectralEfficiency

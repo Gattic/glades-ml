@@ -187,6 +187,28 @@ static float compute_complement_sigma2(const WeightState& state,
 	return static_cast<float>(sigma2);
 }
 
+static float atlas_nonnegative_finite(float v, float fallback)
+{
+	return (std::isfinite(v) && v >= 0.0f) ? v : fallback;
+}
+
+static float atlas_clamped_rate(float nominalLr,
+                                float fisher,
+                                float eps,
+                                float kappaMax)
+{
+	if (!(nominalLr > 0.0f))
+		return 0.0f;
+	const float cappedKappa = atlas_nonnegative_finite(kappaMax, 0.0f);
+	const float cap = cappedKappa * nominalLr;
+	float rate = nominalLr / (fisher + eps);
+	if (!atlas_isfinite(rate) || rate < 0.0f)
+		rate = 0.0f;
+	if (rate > cap)
+		rate = cap;
+	return rate;
+}
+
 static unsigned int atlas_clamp_active_rank(unsigned int activeRank,
                                             unsigned int maxRank,
                                             unsigned int minActiveRank)
@@ -1139,11 +1161,8 @@ bool applyStep(WeightState& state,
 	// Baseline rate is capped at kappaMax*lr to prevent divergence
 	// when sigma2 converges to small complement variance.
 	// effSigma2 includes bias correction so early steps get meaningful preconditioning.
-	const float kappaLr = kappaMax * lr;
 	const float effSigma2 = state.sigma2 * bcFactor;
-	float rawBaselineRate = lr / (effSigma2 + eps);
-	if (rawBaselineRate > kappaLr) rawBaselineRate = kappaLr;
-	const float baselineRate = rawBaselineRate;
+	const float baselineRate = atlas_clamped_rate(lr, effSigma2, eps, kappaMax);
 	state.lastBaselineRate = baselineRate;
 	{
 		const float baseScaled = -baselineRate * gScale;
@@ -1169,8 +1188,7 @@ bool applyStep(WeightState& state,
 	for (unsigned int c = 0; c < activeRank; ++c)
 	{
 		const float effFisher = state.fisherDiag[c] * bcFactor;
-		float fisherLR = lr / (effFisher + eps);
-		if (fisherLR > kappaLr) fisherLR = kappaLr;
+		const float fisherLR = atlas_clamped_rate(lr, effFisher, eps, kappaMax);
 		const float corrScale = baselineRate - fisherLR;
 		for (unsigned int j = 0; j < n; ++j)
 		{
@@ -1186,8 +1204,11 @@ bool applyStep(WeightState& state,
 	{
 		std::vector<float>& correctedV = state.scratch_correctedV;
 		const float effComplementFisher = state.complementFisher * bcFactor;
-		float sectorLR = lr / (effComplementFisher + eps);
-		if (sectorLR > kappaLr) sectorLR = kappaLr;
+		const float sectorNominalLr = lr * atlas_nonnegative_finite(ac.complementLrScale, 0.0f);
+		const float sectorLR = atlas_clamped_rate(sectorNominalLr,
+		                                          effComplementFisher,
+		                                          eps,
+		                                          ac.complementKappaMax);
 		const float sectorCorrScale = baselineRate - sectorLR;
 		for (unsigned int j = 0; j < n; ++j)
 			correctedV[j] = sectorCorrScale * gv[j];
@@ -1324,6 +1345,7 @@ bool applyStep(WeightState& state,
 		double activeTrace = 0.0;
 		double sectorTrace = 0.0;
 		double closureGap = 0.0;
+		float sectorRate = 0.0f;
 		const float sigma2Closed =
 		    compute_complement_sigma2(state, activeRank, sectorRank, m, eps,
 		                              &activeTrace, &sectorTrace, &closureGap);
@@ -1339,6 +1361,15 @@ bool applyStep(WeightState& state,
 		const float sectorTraceCapture = (state.totalTrace > 1e-30f)
 		    ? static_cast<float>(sectorTrace / static_cast<double>(state.totalTrace))
 		    : 0.0f;
+		if (sectorRank > 0u)
+		{
+			const float effComplementFisher = state.complementFisher * bcFactor;
+			const float sectorNominalLr = lr * atlas_nonnegative_finite(ac.complementLrScale, 0.0f);
+			sectorRate = atlas_clamped_rate(sectorNominalLr,
+			                                effComplementFisher,
+			                                eps,
+			                                ac.complementKappaMax);
+		}
 
 		std::ostringstream oss;
 		oss << "event=atlas_step";
@@ -1364,6 +1395,7 @@ bool applyStep(WeightState& state,
 		append_kv(oss, "trace_capture", traceCapture);
 		append_kv(oss, "sector_trace_capture", sectorTraceCapture);
 		append_kv(oss, "sector_fisher", state.complementFisher);
+		append_kv(oss, "sector_rate", sectorRate);
 		append_kv(oss, "closure_gap", static_cast<float>(closureGap));
 		append_kv(oss, "effective_rank", effectiveRank);
 		append_kv(oss, "spectral_efficiency", spectralEfficiency);

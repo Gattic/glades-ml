@@ -597,6 +597,9 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_bool01(kv, "training.optimizer.adamBiasCorrection", b)) { cfg.optimizer.adamBiasCorrection = b; any = true; }
 	if (parse_int(kv, "training.atlas.rank", i) && i >= 0) { cfg.atlas.rank = static_cast<unsigned int>(i); any = true; }
 	if (parse_int(kv, "training.atlas.complementRank", i) && i >= 0) { cfg.atlas.complementRank = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.kappaMax", f)) { cfg.atlas.kappaMax = f; any = true; }
+	if (parse_float(kv, "training.atlas.complementLrScale", f)) { cfg.atlas.complementLrScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.complementKappaMax", f)) { cfg.atlas.complementKappaMax = f; any = true; }
 	if (parse_int(kv, "training.atlas.tSub", i) && i >= 0) { cfg.atlas.tSub = static_cast<unsigned int>(i); any = true; }
 
 	if (parse_int(kv, "training.lrSchedule.type", i)) { cfg.lrSchedule.type = static_cast<glades::LearningRateScheduleConfig::Type>(i); any = true; }
@@ -947,6 +950,15 @@ static bool write_manifest(const std::string& manifestPath,
 	write_kv(out, "training.optimizer.adamBiasCorrection", trainingConfig.optimizer.adamBiasCorrection ? "1" : "0");
 	write_kv(out, "training.atlas.rank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.rank)));
 	write_kv(out, "training.atlas.complementRank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.complementRank)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.kappaMax; write_kv(out, "training.atlas.kappaMax", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.complementLrScale; write_kv(out, "training.atlas.complementLrScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.complementKappaMax; write_kv(out, "training.atlas.complementKappaMax", oss.str());
+	}
 	write_kv(out, "training.atlas.tSub", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.tSub)));
 	write_kv(out, "training.lrSchedule.type", u64_to_string(static_cast<uint64_t>(static_cast<int>(trainingConfig.lrSchedule.type))));
 	write_kv(out, "training.lrSchedule.stepSizeEpochs", u64_to_string(static_cast<uint64_t>(trainingConfig.lrSchedule.stepSizeEpochs)));
@@ -1257,6 +1269,36 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.complementRank mismatch vs requested resume config (checkpoint "
 		    << savedComplementRank << ", current " << currentCfg.atlas.complementRank << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedKappaMax = 0.0f;
+	if (parse_float(kv, "training.atlas.kappaMax", savedKappaMax) &&
+	    fabsf(currentCfg.atlas.kappaMax - savedKappaMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.kappaMax mismatch vs requested resume config (checkpoint "
+		    << savedKappaMax << ", current " << currentCfg.atlas.kappaMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedComplementLrScale = 0.0f;
+	if (parse_float(kv, "training.atlas.complementLrScale", savedComplementLrScale) &&
+	    fabsf(currentCfg.atlas.complementLrScale - savedComplementLrScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.complementLrScale mismatch vs requested resume config (checkpoint "
+		    << savedComplementLrScale << ", current " << currentCfg.atlas.complementLrScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedComplementKappaMax = 0.0f;
+	if (parse_float(kv, "training.atlas.complementKappaMax", savedComplementKappaMax) &&
+	    fabsf(currentCfg.atlas.complementKappaMax - savedComplementKappaMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.complementKappaMax mismatch vs requested resume config (checkpoint "
+		    << savedComplementKappaMax << ", current " << currentCfg.atlas.complementKappaMax << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

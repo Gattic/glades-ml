@@ -178,6 +178,9 @@ struct BenchConfig
 	float sgdMomentum;
 	float adamLR;
 	float atlasLR;
+	float atlasKappaMax;
+	float atlasSectorLrScale;
+	float atlasSectorKappaMax;
 
 	BenchConfig()
 	    : mode(BENCH_MODE_ALL),
@@ -195,7 +198,10 @@ struct BenchConfig
 	      sgdLR(0.01f),
 	      sgdMomentum(0.9f),
 	      adamLR(0.0015f),
-	      atlasLR(0.08f)
+	      atlasLR(0.08f),
+	      atlasKappaMax(10.0f),
+	      atlasSectorLrScale(0.25f),
+	      atlasSectorKappaMax(0.5f)
 	{
 	}
 };
@@ -316,8 +322,11 @@ static void print_usage()
 	printf("  --sgd-momentum X                        SGD momentum factor (default: 0.9)\n");
 	printf("  --adam-lr X                             AdamW learning rate (default: 0.0015)\n");
 	printf("  --atlas-lr X                            ATLAS-BSRP learning rate (default: 0.08)\n");
+	printf("  --atlas-kappa-max X                     ATLAS baseline/active kappaMax (default: 10.0)\n");
 	printf("  --rank N                                ATLAS subspace rank (default: 16)\n");
 	printf("  --atlas-complement-rank N               ATLAS complement sector rank (default: 0)\n");
+	printf("  --atlas-sector-lr-scale X               ATLAS complement-sector lr scale (default: 0.25)\n");
+	printf("  --atlas-sector-kappa-max X              ATLAS complement-sector kappaMax (default: 0.5)\n");
 	printf("  --tsub N                                ATLAS subspace refresh interval in steps (default: 200)\n");
 	printf("  --seed N                                Base seed for repeats (default: 1337)\n");
 	printf("  --help                                  Show this message\n");
@@ -737,10 +746,12 @@ static void configure_optimizer(glades::NNetwork& net,
 		tc.optimizer.type = glades::OptimizerConfig::ATLAS;
 		tc.atlas.rank = cfg.atlasRank;
 		tc.atlas.complementRank = cfg.atlasComplementRank;
+		tc.atlas.complementLrScale = cfg.atlasSectorLrScale;
+		tc.atlas.complementKappaMax = cfg.atlasSectorKappaMax;
 		tc.atlas.tSub = cfg.atlasTSub;
 		tc.atlas.beta = 0.999f;
 		tc.atlas.betaRefresh = 0.5f;
-		tc.atlas.kappaMax = 10.0f;
+		tc.atlas.kappaMax = cfg.atlasKappaMax;
 	}
 }
 
@@ -925,6 +936,10 @@ static bool run_benchmark_case(const BenchmarkCase& benchCase,
 	       benchCase.cfg.sgdLR, benchCase.cfg.sgdMomentum, benchCase.cfg.adamLR,
 	       benchCase.cfg.atlasLR, benchCase.cfg.atlasRank,
 	       benchCase.cfg.atlasComplementRank, benchCase.cfg.atlasTSub);
+	printf("ATLAS caps: kappaMax=%.3f sectorLrScale=%.3f sectorKappaMax=%.3f\n",
+	       benchCase.cfg.atlasKappaMax,
+	       benchCase.cfg.atlasSectorLrScale,
+	       benchCase.cfg.atlasSectorKappaMax);
 	printf("Cache warmup: %lld ms for %u images (excluded from benchmark timing)\n",
 	       warmMs, data.getTrainSize() + data.getTestSize());
 	printf("Planned train image passes across all optimizers: %llu\n",
@@ -1130,6 +1145,14 @@ void ATLASBenchmark(int argc, char* argv[])
 				return;
 			}
 		}
+		else if (streq(argv[i], "--atlas-kappa-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasKappaMax))
+			{
+				printf("Invalid value for --atlas-kappa-max\n");
+				return;
+			}
+		}
 		else if (streq(argv[i], "--rank") && i + 1 < argc)
 		{
 			if (!parse_uint_arg(argv[++i], cfg.atlasRank))
@@ -1143,6 +1166,22 @@ void ATLASBenchmark(int argc, char* argv[])
 			if (!parse_uint_arg(argv[++i], cfg.atlasComplementRank))
 			{
 				printf("Invalid value for --atlas-complement-rank\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sector-lr-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSectorLrScale))
+			{
+				printf("Invalid value for --atlas-sector-lr-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sector-kappa-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSectorKappaMax))
+			{
+				printf("Invalid value for --atlas-sector-kappa-max\n");
 				return;
 			}
 		}
