@@ -249,6 +249,78 @@ public:
 		}
 	};
 
+	struct AtlasRuntimeDiagnostics
+	{
+		unsigned int atlasMatrices;
+		unsigned int sparrowMatrices;
+		unsigned int sparrowMode2Matrices;
+		double sparrowMeanActiveModes;
+		double sparrowMode2Fraction;
+		double sparrowMeanEdge;
+		double sparrowMeanSecondEdge;
+		double sparrowMeanSecondEdgeRatio;
+		double sparrowMeanMemoryGain;
+		double sparrowMeanHorizontalRatio;
+		unsigned int helmMatrices;
+		unsigned int helmMode2Matrices;
+		double helmMeanActiveModes;
+		double helmMode2Fraction;
+		double helmMeanEdge;
+		double helmMeanSecondEdge;
+		double helmMeanSecondEdgeRatio;
+		double helmMeanSigma;
+		double helmMeanPredR2;
+		double helmMeanMemoryGain;
+		double helmMeanPole;
+		unsigned int asterMatrices;
+		unsigned int asterMode2Matrices;
+		double asterMeanActiveModes;
+		double asterMode2Fraction;
+		double asterMeanEdge;
+		double asterMeanSecondEdge;
+		double asterMeanSecondEdgeRatio;
+		double asterMeanSigma;
+		double asterMeanPredR2;
+		double asterMeanMemoryGain;
+		double asterMeanPole;
+
+		AtlasRuntimeDiagnostics()
+		    : atlasMatrices(0u),
+		      sparrowMatrices(0u),
+		      sparrowMode2Matrices(0u),
+		      sparrowMeanActiveModes(0.0),
+		      sparrowMode2Fraction(0.0),
+		      sparrowMeanEdge(0.0),
+		      sparrowMeanSecondEdge(0.0),
+		      sparrowMeanSecondEdgeRatio(0.0),
+		      sparrowMeanMemoryGain(0.0),
+		      sparrowMeanHorizontalRatio(0.0),
+		      helmMatrices(0u),
+		      helmMode2Matrices(0u),
+		      helmMeanActiveModes(0.0),
+		      helmMode2Fraction(0.0),
+		      helmMeanEdge(0.0),
+		      helmMeanSecondEdge(0.0),
+		      helmMeanSecondEdgeRatio(0.0),
+		      helmMeanSigma(0.0),
+		      helmMeanPredR2(0.0),
+		      helmMeanMemoryGain(0.0),
+		      helmMeanPole(0.0),
+		      asterMatrices(0u),
+		      asterMode2Matrices(0u),
+		      asterMeanActiveModes(0.0),
+		      asterMode2Fraction(0.0),
+		      asterMeanEdge(0.0),
+		      asterMeanSecondEdge(0.0),
+		      asterMeanSecondEdgeRatio(0.0),
+		      asterMeanSigma(0.0),
+		      asterMeanPredR2(0.0),
+		      asterMeanMemoryGain(0.0),
+		      asterMeanPole(0.0)
+		{
+		}
+	};
+
 private:
 
 	// Tensor-based DFF training state.
@@ -257,6 +329,188 @@ private:
 	// but implemented purely in packed vectors/matrices for cache-friendly execution.
 	struct TensorDFFState
 	{
+		struct HelmState
+		{
+			bool initialized;
+			unsigned int rawHiddenDim;
+			unsigned int hiddenDim;
+			unsigned int outputDim;
+			unsigned int hiddenStackDepth;
+			unsigned int modeRank;
+			std::vector<unsigned int> hiddenLayerActivationIndices;
+			std::vector<unsigned int> hiddenLayerOffsets;
+			std::vector<unsigned int> hiddenLayerSizes;
+			std::vector<float> prevHiddenMean;
+			std::vector<float> prevResidualMean;
+			std::vector<float> hiddenVar;
+			std::vector<float> residualVar;
+			std::vector<float> crossCov;
+			std::vector<float> sigma;
+			std::vector<float> leftMode;
+			std::vector<float> rightMode;
+			std::vector<float> batchHiddenSum;
+			std::vector<float> batchHiddenSqSum;
+			std::vector<float> batchResidualSum;
+			std::vector<float> batchResidualSqSum;
+			std::vector<float> latent;
+			std::vector<float> poleNumer;
+			std::vector<float> poleDenom;
+			std::vector<float> pole;
+			unsigned int lastActiveModes;
+			float lastEdge;
+			float lastSecondEdge;
+			float lastSecondEdgeRatio;
+			float lastSigma;
+			float lastPredR2;
+			float lastMemoryGain;
+
+			HelmState()
+			    : initialized(false),
+			      rawHiddenDim(0u),
+			      hiddenDim(0u),
+			      outputDim(0u),
+			      hiddenStackDepth(0u),
+			      modeRank(0u),
+			      lastActiveModes(0u),
+			      lastEdge(0.0f),
+			      lastSecondEdge(0.0f),
+			      lastSecondEdgeRatio(0.0f),
+			      lastSigma(0.0f),
+			      lastPredR2(0.0f),
+			      lastMemoryGain(0.0f)
+			{
+			}
+
+			void reset()
+			{
+				initialized = false;
+				rawHiddenDim = 0u;
+				hiddenDim = 0u;
+				outputDim = 0u;
+				hiddenStackDepth = 0u;
+				modeRank = 0u;
+				hiddenLayerActivationIndices.clear();
+				hiddenLayerOffsets.clear();
+				hiddenLayerSizes.clear();
+				prevHiddenMean.clear();
+				prevResidualMean.clear();
+				hiddenVar.clear();
+				residualVar.clear();
+				crossCov.clear();
+				sigma.clear();
+				leftMode.clear();
+				rightMode.clear();
+				batchHiddenSum.clear();
+				batchHiddenSqSum.clear();
+				batchResidualSum.clear();
+				batchResidualSqSum.clear();
+				latent.clear();
+				poleNumer.clear();
+				poleDenom.clear();
+				pole.clear();
+				lastActiveModes = 0u;
+				lastEdge = 0.0f;
+				lastSecondEdge = 0.0f;
+				lastSecondEdgeRatio = 0.0f;
+				lastSigma = 0.0f;
+				lastPredR2 = 0.0f;
+				lastMemoryGain = 0.0f;
+			}
+		};
+
+		struct AsterState
+		{
+			bool initialized;
+			unsigned int rawHiddenDim;
+			unsigned int controlDim;
+			unsigned int outputDim;
+			unsigned int hiddenStackDepth;
+			unsigned int stateRank;
+			std::vector<unsigned int> hiddenLayerActivationIndices;
+			std::vector<unsigned int> hiddenLayerOffsets;
+			std::vector<unsigned int> hiddenLayerSizes;
+			std::vector<float> prevControlMean;
+			std::vector<float> prevResidualMean;
+			std::vector<float> controlVar;
+			std::vector<float> residualVar;
+			std::vector<float> pastCov;
+			std::vector<float> crossCov;
+			std::vector<float> theta;
+			std::vector<float> sigma;
+			std::vector<float> leftMode;
+			std::vector<float> rightMode;
+			std::vector<float> batchHiddenSum;
+			std::vector<float> batchHiddenSqSum;
+			std::vector<float> batchResidualSum;
+			std::vector<float> batchResidualSqSum;
+			std::vector<float> latent;
+			std::vector<float> poleNumer;
+			std::vector<float> poleDenom;
+			std::vector<float> pole;
+			unsigned int lastActiveModes;
+			float lastEdge;
+			float lastSecondEdge;
+			float lastSecondEdgeRatio;
+			float lastSigma;
+			float lastPredR2;
+			float lastMemoryGain;
+
+			AsterState()
+			    : initialized(false),
+			      rawHiddenDim(0u),
+			      controlDim(0u),
+			      outputDim(0u),
+			      hiddenStackDepth(0u),
+			      stateRank(0u),
+			      lastActiveModes(0u),
+			      lastEdge(0.0f),
+			      lastSecondEdge(0.0f),
+			      lastSecondEdgeRatio(0.0f),
+			      lastSigma(0.0f),
+			      lastPredR2(0.0f),
+			      lastMemoryGain(0.0f)
+			{
+			}
+
+			void reset()
+			{
+				initialized = false;
+				rawHiddenDim = 0u;
+				controlDim = 0u;
+				outputDim = 0u;
+				hiddenStackDepth = 0u;
+				stateRank = 0u;
+				hiddenLayerActivationIndices.clear();
+				hiddenLayerOffsets.clear();
+				hiddenLayerSizes.clear();
+				prevControlMean.clear();
+				prevResidualMean.clear();
+				controlVar.clear();
+				residualVar.clear();
+				pastCov.clear();
+				crossCov.clear();
+				theta.clear();
+				sigma.clear();
+				leftMode.clear();
+				rightMode.clear();
+				batchHiddenSum.clear();
+				batchHiddenSqSum.clear();
+				batchResidualSum.clear();
+				batchResidualSqSum.clear();
+				latent.clear();
+				poleNumer.clear();
+				poleDenom.clear();
+				pole.clear();
+				lastActiveModes = 0u;
+				lastEdge = 0.0f;
+				lastSecondEdge = 0.0f;
+				lastSecondEdgeRatio = 0.0f;
+				lastSigma = 0.0f;
+				lastPredR2 = 0.0f;
+				lastMemoryGain = 0.0f;
+			}
+		};
+
 		bool initialized;
 		// Layer sizes including input and output: [in, h1, ..., hH, out]
 		std::vector<unsigned int> sizes;
@@ -291,6 +545,8 @@ private:
 
 		// ATLAS optimizer state (one per Transition; used when optimizer.type==ATLAS).
 		std::vector<atlas::WeightState> atlasState;
+		HelmState helm;
+		AsterState aster;
 
 		TensorDFFState() : initialized(false), batchCount(0) {}
 
@@ -302,6 +558,8 @@ private:
 			a.clear();
 			delta.clear();
 			batchCount = 0;
+			helm.reset();
+			aster.reset();
 		}
 	};
 
@@ -1680,6 +1938,7 @@ public:
 	float getMCC() const;
 	const CMatrix& getConfusionMatrix() const;
 	const shmea::GList& getNodeActivations() const;
+	bool getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) const;
 
 	// graphing
 	shmea::GList getResults() const;

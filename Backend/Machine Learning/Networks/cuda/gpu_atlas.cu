@@ -149,8 +149,257 @@ static double complement_kelly_fraction(double scoutEig,
 	return fraction;
 }
 
-static unsigned int choose_active_complement_rank(const std::vector<float>& eigVal,
+static double atlas_clamp_unit(double x)
+{
+	if (!std::isfinite(x) || x <= 0.0)
+		return 0.0;
+	if (x >= 1.0)
+		return 1.0;
+	return x;
+}
+
+struct ResidualScoutQuality
+{
+	double rawTopEig;
+	double projectedEig;
+	double birthScout;
+	double birthKelly;
+	double alignment;
+	double contamination;
+	double uncertainty;
+	double quality;
+
+	ResidualScoutQuality()
+	    : rawTopEig(0.0), projectedEig(0.0), birthScout(0.0),
+	      birthKelly(0.0), alignment(1.0), contamination(0.0),
+	      uncertainty(0.0), quality(1.0)
+	{
+	}
+};
+
+static void reset_complement_trial(GpuAtlasWeightState& state)
+{
+	state.trialComplementRank = 0u;
+	state.trialComplementWins = 0u;
+	state.trialComplementMean = 0.0f;
+	state.trialComplementVar = 0.0f;
+}
+
+static double complement_direction_overlap_sq(const std::vector<float>& eigVec,
+                                              const std::vector<float>* scoutEigVec,
+                                              unsigned int dim,
+                                              unsigned int refMode,
+                                              unsigned int scoutMode)
+{
+	if (!scoutEigVec || refMode >= dim || scoutMode >= dim
+	    || eigVec.size() < static_cast<size_t>(dim) * dim
+	    || scoutEigVec->size() < static_cast<size_t>(dim) * dim)
+		return 0.0;
+
+	double dot = 0.0;
+	double refNorm = 0.0;
+	double scoutNorm = 0.0;
+	for (unsigned int k = 0; k < dim; ++k)
+	{
+		const double a =
+		    static_cast<double>(eigVec[static_cast<size_t>(k) * dim + refMode]);
+		const double b =
+		    static_cast<double>((*scoutEigVec)[static_cast<size_t>(k) * dim + scoutMode]);
+		dot += a * b;
+		refNorm += a * a;
+		scoutNorm += b * b;
+	}
+	if (!(refNorm > 1e-18) || !(scoutNorm > 1e-18))
+		return 0.0;
+	return atlas_clamp_unit((dot * dot) / (refNorm * scoutNorm));
+}
+
+static unsigned int complement_informative_scout_count(const std::vector<float>* scoutEigVal,
+                                                       unsigned int dim,
+                                                       unsigned int scoutCount,
+                                                       float eps)
+{
+	const unsigned int limit = (scoutCount < dim) ? scoutCount : dim;
+	if (!scoutEigVal || scoutEigVal->empty())
+		return limit;
+
+	double topEig = 0.0;
+	for (unsigned int scoutMode = 0; scoutMode < limit && scoutMode < scoutEigVal->size(); ++scoutMode)
+	{
+		double eig = static_cast<double>((*scoutEigVal)[scoutMode]);
+		if (std::isfinite(eig) && eig > topEig)
+			topEig = eig;
+	}
+	if (!(topEig > static_cast<double>(eps)))
+		return 0u;
+
+	const double minEig = std::max<double>(static_cast<double>(eps), topEig * 1e-3);
+	unsigned int informative = 0u;
+	for (unsigned int scoutMode = 0; scoutMode < limit && scoutMode < scoutEigVal->size(); ++scoutMode)
+	{
+		const double eig = static_cast<double>((*scoutEigVal)[scoutMode]);
+		if (std::isfinite(eig) && eig >= minEig)
+			++informative;
+	}
+	return informative;
+}
+
+static double complement_direction_subspace_alignment(const std::vector<float>& eigVec,
+                                                      const std::vector<float>* scoutEigVal,
+                                                      const std::vector<float>* scoutEigVec,
+                                                      unsigned int dim,
+                                                      unsigned int refMode,
+                                                      unsigned int scoutCount,
+                                                      float eps)
+{
+	if (refMode >= dim)
+		return 0.0;
+	if (!scoutEigVec)
+		return 1.0;
+	const unsigned int limit =
+	    complement_informative_scout_count(scoutEigVal, dim, scoutCount, eps);
+	if (limit == 0u)
+		return 0.0;
+	double overlap = 0.0;
+	double totalWeight = 0.0;
+	for (unsigned int scoutMode = 0; scoutMode < limit; ++scoutMode)
+	{
+		double weight = 1.0;
+		if (scoutEigVal && scoutMode < scoutEigVal->size())
+		{
+			weight = static_cast<double>((*scoutEigVal)[scoutMode]);
+			if (!std::isfinite(weight) || weight <= static_cast<double>(eps))
+				continue;
+		}
+		overlap += weight * complement_direction_overlap_sq(eigVec, scoutEigVec, dim,
+		                                                    refMode, scoutMode);
+		totalWeight += weight;
+	}
+	if (!(totalWeight > 1e-18))
+		return 0.0;
+	return atlas_clamp_unit(overlap / totalWeight);
+}
+
+static double complement_projected_scout_eigenvalue(const std::vector<float>* scoutEigVal,
+                                                    const std::vector<float>& eigVec,
+                                                    const std::vector<float>* scoutEigVec,
+                                                    unsigned int dim,
+                                                    unsigned int refMode,
+                                                    unsigned int scoutCount)
+{
+	if (!scoutEigVal || !scoutEigVec || refMode >= dim)
+		return 0.0;
+	const unsigned int limit =
+	    std::min<unsigned int>(scoutCount,
+	                           static_cast<unsigned int>(scoutEigVal->size()));
+	double projectedEig = 0.0;
+	for (unsigned int scoutMode = 0; scoutMode < limit; ++scoutMode)
+	{
+		double eig = static_cast<double>((*scoutEigVal)[scoutMode]);
+		if (!std::isfinite(eig) || eig < 0.0)
+			eig = 0.0;
+		projectedEig += complement_direction_overlap_sq(eigVec, scoutEigVec, dim,
+		                                                refMode, scoutMode) * eig;
+	}
+	return projectedEig;
+}
+
+static double complement_scout_contamination(const std::vector<float>* scoutEigVal,
+                                             const std::vector<float>& eigVec,
+                                             const std::vector<float>* scoutEigVec,
+                                             unsigned int dim,
+                                             unsigned int retainedCount,
+                                             unsigned int scoutCount)
+{
+	if (!scoutEigVec || retainedCount == 0u)
+		return 0.0;
+	const unsigned int scoutLimit =
+	    std::min<unsigned int>(scoutCount, dim);
+	const unsigned int retainedLimit =
+	    std::min<unsigned int>(retainedCount, dim);
+	double contam = 0.0;
+	double totalWeight = 0.0;
+	for (unsigned int scoutMode = 0; scoutMode < scoutLimit; ++scoutMode)
+	{
+		double weight = 1.0;
+		if (scoutEigVal && scoutMode < scoutEigVal->size())
+		{
+			weight = static_cast<double>((*scoutEigVal)[scoutMode]);
+			if (!std::isfinite(weight) || weight <= 0.0)
+				weight = 0.0;
+		}
+		double overlap = 0.0;
+		for (unsigned int refMode = 0; refMode < retainedLimit; ++refMode)
+			overlap += complement_direction_overlap_sq(eigVec, scoutEigVec, dim,
+			                                           refMode, scoutMode);
+		contam += weight * atlas_clamp_unit(overlap);
+		totalWeight += weight;
+	}
+	if (!(totalWeight > 1e-18))
+		return 0.0;
+	return atlas_clamp_unit(contam / totalWeight);
+}
+
+static ResidualScoutQuality evaluate_residual_scout(const std::vector<float>& eigVal,
+                                                    const std::vector<float>& eigVec,
+                                                    const std::vector<float>* scoutEigVal,
+                                                    const std::vector<float>* scoutEigVec,
+                                                    unsigned int nextMode,
+                                                    unsigned int retainedCount,
+                                                    double tailMean,
+                                                    float eps)
+{
+	ResidualScoutQuality quality;
+	if (nextMode >= eigVal.size())
+		return quality;
+
+	double nextEmaEig = static_cast<double>(eigVal[nextMode]);
+	if (!std::isfinite(nextEmaEig) || nextEmaEig < 0.0)
+		nextEmaEig = 0.0;
+	quality.rawTopEig = nextEmaEig;
+	quality.projectedEig = nextEmaEig;
+	quality.birthScout = nextEmaEig;
+
+	if (scoutEigVal && !scoutEigVal->empty() && scoutEigVec)
+	{
+		const unsigned int dim = static_cast<unsigned int>(eigVal.size());
+		const unsigned int scoutCount =
+		    complement_informative_scout_count(scoutEigVal, dim, 2u, eps);
+		double rawTopEig = static_cast<double>((*scoutEigVal)[0u]);
+		if (!std::isfinite(rawTopEig) || rawTopEig < 0.0)
+			rawTopEig = 0.0;
+		quality.rawTopEig = rawTopEig;
+		quality.alignment =
+		    complement_direction_subspace_alignment(eigVec, scoutEigVal, scoutEigVec,
+		                                            dim, nextMode, scoutCount, eps);
+		quality.projectedEig =
+		    complement_projected_scout_eigenvalue(scoutEigVal, eigVec, scoutEigVec,
+		                                          dim, nextMode, scoutCount);
+		quality.contamination =
+		    complement_scout_contamination(scoutEigVal, eigVec, scoutEigVec,
+		                                   dim, retainedCount, scoutCount);
+		const double emaSupport = quality.alignment * nextEmaEig;
+		quality.birthScout = std::max(quality.projectedEig, emaSupport);
+		const double uncertaintyScale =
+		    std::max<double>(std::max<double>(quality.birthScout, tailMean),
+		                     static_cast<double>(eps));
+		quality.uncertainty =
+		    atlas_clamp_unit(std::fabs(quality.projectedEig - emaSupport)
+		                     / uncertaintyScale);
+	}
+
+	quality.birthKelly = complement_kelly_fraction(quality.birthScout, tailMean);
+	quality.quality = quality.alignment * (1.0 - quality.contamination);
+	if (!std::isfinite(quality.quality) || quality.quality < 0.0)
+		quality.quality = 0.0;
+	return quality;
+}
+
+static unsigned int choose_active_complement_rank(GpuAtlasWeightState& state,
+                                                  const std::vector<float>& eigVal,
+                                                  const std::vector<float>& eigVec,
                                                   const std::vector<float>* scoutEigVal,
+                                                  const std::vector<float>* scoutEigVec,
                                                   unsigned int informativeRank,
                                                   unsigned int prevRank,
                                                   double activeTrace,
@@ -159,12 +408,24 @@ static unsigned int choose_active_complement_rank(const std::vector<float>& eigV
                                                   unsigned int activeRank,
                                                   float eps,
                                                   double* birthKellyOut = 0,
-                                                  double* birthScoutOut = 0)
+                                                  double* birthScoutOut = 0,
+                                                  double* scoutProjectedOut = 0,
+                                                  double* trialKellyOut = 0,
+                                                  double* trialAlignmentOut = 0,
+                                                  double* trialContaminationOut = 0,
+                                                  double* trialReturnOut = 0,
+                                                  double* trialScoreOut = 0)
 {
 	if (informativeRank == 0u)
+	{
+		reset_complement_trial(state);
 		return 0u;
+	}
 	if (prevRank > informativeRank)
 		prevRank = informativeRank;
+	if (state.trialComplementRank > informativeRank
+	    || state.trialComplementRank <= prevRank)
+		reset_complement_trial(state);
 
 	const double fullTrace = sum_leading_spectrum(eigVal, informativeRank);
 	const double closedTrace = std::max<double>(static_cast<double>(totalTrace),
@@ -173,36 +434,127 @@ static unsigned int choose_active_complement_rank(const std::vector<float>& eigV
 	const double birthKellyThreshold = 0.10;
 	const double birthMinShare = 0.005;
 	const double deathMinShare = 0.03;
+	const double trialBeta = 0.8;
+	const double trialUncertaintyWeight = 0.25;
+	const double trialContaminationWeight = 0.10;
+	const double trialKellyThreshold = 0.10;
+	const double trialScoreThreshold = 0.15;
+	const double trialDropScore = 0.02;
+	const double trialAlignmentFloor = 0.25;
+	const double trialRiskFloor = 0.05;
+	const unsigned int trialWinsRequired = 2u;
 	if (birthKellyOut)
 		*birthKellyOut = 0.0;
 	if (birthScoutOut)
 		*birthScoutOut = 0.0;
+	if (scoutProjectedOut)
+		*scoutProjectedOut = 0.0;
+	if (trialKellyOut)
+		*trialKellyOut = 0.0;
+	if (trialAlignmentOut)
+		*trialAlignmentOut = 0.0;
+	if (trialContaminationOut)
+		*trialContaminationOut = 0.0;
+	if (trialReturnOut)
+		*trialReturnOut = 0.0;
+	if (trialScoreOut)
+		*trialScoreOut = 0.0;
 
 	if (prevRank < informativeRank)
 	{
+		const unsigned int candidateRank = prevRank + 1u;
 		const double selectedTrace = sum_leading_spectrum(eigVal, prevRank);
 		const double tailMean =
 		    complement_tail_mean(closedTrace, activeTrace, selectedTrace,
 		                         subDim, activeRank, prevRank, eps);
-		double emaNextEig = static_cast<double>(eigVal[prevRank]);
-		if (!std::isfinite(emaNextEig) || emaNextEig < 0.0)
-			emaNextEig = 0.0;
-		double scoutNextEig = emaNextEig;
-		if (scoutEigVal && prevRank < scoutEigVal->size())
-		{
-			scoutNextEig = static_cast<double>((*scoutEigVal)[prevRank]);
-			if (!std::isfinite(scoutNextEig) || scoutNextEig < 0.0)
-				scoutNextEig = 0.0;
-		}
-		const double birthScout = (scoutNextEig > emaNextEig) ? scoutNextEig : emaNextEig;
-		const double birthKelly = complement_kelly_fraction(birthScout, tailMean);
+		const ResidualScoutQuality scoutQuality =
+		    evaluate_residual_scout(eigVal, eigVec, scoutEigVal, scoutEigVec,
+		                            prevRank, prevRank, tailMean, eps);
+		const double birthScout = scoutQuality.birthScout;
+		const double birthKelly = scoutQuality.birthKelly;
+		const double alignment = scoutQuality.alignment;
+		const double contamination = scoutQuality.contamination;
+		const double uncertainty = scoutQuality.uncertainty;
+		const double edgeShare = (closedTrace > static_cast<double>(eps))
+		    ? std::max<double>(0.0, birthScout - tailMean) / closedTrace
+		    : 0.0;
+		const double sampleReturn =
+		    edgeShare
+		    - trialUncertaintyWeight * uncertainty
+		    - trialContaminationWeight * contamination;
 		if (birthKellyOut)
 			*birthKellyOut = birthKelly;
 		if (birthScoutOut)
-			*birthScoutOut = birthScout;
+			*birthScoutOut = scoutQuality.rawTopEig;
+		if (scoutProjectedOut)
+			*scoutProjectedOut = scoutQuality.projectedEig;
+		if (trialAlignmentOut)
+			*trialAlignmentOut = alignment;
+		if (trialContaminationOut)
+			*trialContaminationOut = contamination;
+		if (trialReturnOut)
+			*trialReturnOut = sampleReturn;
 		if (birthKelly >= birthKellyThreshold
 		    && birthScout > birthMinShare * closedTrace)
-			return prevRank + 1u;
+		{
+			if (state.trialComplementRank != candidateRank)
+				reset_complement_trial(state);
+			state.trialComplementRank = candidateRank;
+			const double prevMean = static_cast<double>(state.trialComplementMean);
+			const double prevVar = static_cast<double>(state.trialComplementVar);
+			const double nextMean =
+			    (state.trialComplementWins == 0u && prevMean == 0.0 && prevVar == 0.0)
+			        ? sampleReturn
+			        : (trialBeta * prevMean + (1.0 - trialBeta) * sampleReturn);
+			const double innovation = sampleReturn - prevMean;
+			const double nextVar =
+			    (state.trialComplementWins == 0u && prevMean == 0.0 && prevVar == 0.0)
+			        ? (innovation * innovation)
+			        : (trialBeta * prevVar + (1.0 - trialBeta) * innovation * innovation);
+			state.trialComplementMean = static_cast<float>(nextMean);
+			state.trialComplementVar = static_cast<float>(nextVar);
+			const double riskPenalty =
+			    std::max<double>(trialRiskFloor,
+			                     nextVar + uncertainty + (1.0 - alignment));
+			const double trialKelly =
+			    atlas_clamp_unit((nextMean > 0.0) ? (nextMean / riskPenalty) : 0.0);
+			const double trialScore =
+			    trialKelly * scoutQuality.quality * birthKelly;
+			if (trialKellyOut)
+				*trialKellyOut = trialKelly;
+			if (trialScoreOut)
+				*trialScoreOut = trialScore;
+			if (nextMean > 0.0
+			    && trialKelly >= trialKellyThreshold
+			    && trialScore >= trialScoreThreshold
+			    && alignment >= trialAlignmentFloor)
+			{
+				++state.trialComplementWins;
+				if (state.trialComplementWins >= trialWinsRequired)
+				{
+					reset_complement_trial(state);
+					return candidateRank;
+				}
+			}
+			else if (nextMean <= 0.0
+			         || trialScore <= trialDropScore
+			         || alignment < 0.05)
+			{
+				reset_complement_trial(state);
+			}
+			else
+			{
+				state.trialComplementWins = 0u;
+			}
+		}
+		else if (state.trialComplementRank == candidateRank)
+		{
+			reset_complement_trial(state);
+		}
+	}
+	else
+	{
+		reset_complement_trial(state);
 	}
 
 	if (prevRank > 0u)
@@ -216,7 +568,10 @@ static unsigned int choose_active_complement_rank(const std::vector<float>& eigV
 			weakestEig = 0.0;
 		if (weakestEig <= deathRatio * tailMean
 		    || weakestEig <= deathMinShare * closedTrace)
+		{
+			reset_complement_trial(state);
 			return prevRank - 1u;
+		}
 	}
 
 	return prevRank;
@@ -1445,6 +1800,9 @@ static bool ensureComplementStorage(GpuAtlasWeightState& state,
 	state.complementRank = storageRank;
 	if (state.activeComplementRank > storageRank)
 		state.activeComplementRank = storageRank;
+	if (state.trialComplementRank > storageRank
+	    || state.trialComplementRank <= state.activeComplementRank)
+		reset_complement_trial(state);
 	if (!state.V.allocate(static_cast<size_t>(subDim) * storageRank)) return false;
 	if (!state.complementBlock.allocate(static_cast<size_t>(storageRank) * storageRank)) return false;
 	if (!state.prevGv.allocate(static_cast<size_t>(outerDim) * storageRank)) return false;
@@ -1614,6 +1972,7 @@ bool atlas_gpu_init(GpuAtlasWeightState& state,
 	// Dual-space selection: use whichever dimension is smaller for the subspace.
 	state.rightSubspace = (m > n);
 	state.activeComplementRank = 0u;
+	reset_complement_trial(state);
 
 	// Dimension-proportional rank cap: subspace rank should not exceed 25% of
 	// the subspace dimension. This prevents over-provisioning rank relative to
@@ -1956,6 +2315,9 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	state.step += 1ULL;
 	if (state.activeComplementRank > enabledComplementRank)
 		state.activeComplementRank = enabledComplementRank;
+	if (state.trialComplementRank > enabledComplementRank
+	    || state.trialComplementRank <= state.activeComplementRank)
+		reset_complement_trial(state);
 	const bool complementControlStep =
 	    adaptiveComplementController
 	    && (enabledComplementRank > 0u)
@@ -2205,7 +2567,13 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	double activeSectorTrace = 0.0;
 	float complementTailMean = eps;
 	float complementScoutTop = 0.0f;
+	double complementScoutProjected = 0.0;
 	float complementBirthKelly = 0.0f;
+	double complementTrialKelly = 0.0;
+	double complementTrialAlignment = 0.0;
+	double complementTrialContamination = 0.0;
+	double complementTrialReturn = 0.0;
+	double complementTrialScore = 0.0;
 	unsigned int informativeComplementRank = 0u;
 	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
 	ATLAS_CUDA_CHECK(cudaMemcpy(h_fisher.data(), state.fisherDiag.data(),
@@ -2230,6 +2598,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	{
 		h_blockTrace = 0.0f;
 		state.activeComplementRank = 0u;
+		reset_complement_trial(state);
 		ATLAS_CUDA_CHECK(cudaMemset(state.complementBlock.data(), 0, state.complementBlock.size() * sizeof(float)));
 		ATLAS_CUDA_CHECK(cudaMemcpy(state.complementFisher.data(), &h_blockTrace,
 		                              sizeof(float), cudaMemcpyHostToDevice));
@@ -2266,6 +2635,7 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		if (!adaptiveComplementController)
 		{
 			state.activeComplementRank = informativeComplementRank;
+			reset_complement_trial(state);
 		}
 		else if (complementControlStep)
 		{
@@ -2276,8 +2646,11 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			double birthKelly = 0.0;
 			double birthScout = 0.0;
 			state.activeComplementRank =
-			    choose_active_complement_rank(h_blockEigVal,
+			    choose_active_complement_rank(state,
+			                                  h_blockEigVal,
+			                                  h_blockEigVec,
 			                                  h_scoutEigVal.empty() ? 0 : &h_scoutEigVal,
+			                                  h_scoutEigVec.empty() ? 0 : &h_scoutEigVec,
 			                                  informativeComplementRank,
 			                                  state.activeComplementRank,
 			                                  activeTraceNow,
@@ -2286,7 +2659,13 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			                                  r,
 			                                  eps,
 			                                  &birthKelly,
-			                                  &birthScout);
+			                                  &birthScout,
+			                                  &complementScoutProjected,
+			                                  &complementTrialKelly,
+			                                  &complementTrialAlignment,
+			                                  &complementTrialContamination,
+			                                  &complementTrialReturn,
+			                                  &complementTrialScore);
 			complementBirthKelly = static_cast<float>(birthKelly);
 			complementScoutTop = static_cast<float>(birthScout);
 			if (state.activeComplementRank > informativeComplementRank)
@@ -2313,6 +2692,12 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 				    << " tail_mean=" << static_cast<float>(tailMean)
 				    << " birth_kelly=" << complementBirthKelly
 				    << " birth_scout=" << complementScoutTop
+				    << " birth_projected=" << complementScoutProjected
+				    << " trial_kelly=" << complementTrialKelly
+				    << " trial_alignment=" << complementTrialAlignment
+				    << " trial_contam=" << complementTrialContamination
+				    << " trial_return=" << complementTrialReturn
+				    << " trial_score=" << complementTrialScore
 				    << " next_mode="
 				    << ((prevActiveComplementRank < informativeComplementRank)
 				            ? h_blockEigVal[prevActiveComplementRank]
@@ -2328,9 +2713,13 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	else
 	{
 		state.activeComplementRank = 0u;
+		reset_complement_trial(state);
 	}
 	if (state.activeComplementRank > informativeComplementRank)
 		state.activeComplementRank = informativeComplementRank;
+	if (state.trialComplementRank > informativeComplementRank
+	    || state.trialComplementRank <= state.activeComplementRank)
+		reset_complement_trial(state);
 	effectiveComplementRank = state.activeComplementRank;
 	activeSectorTrace = sum_leading_spectrum(h_blockEigVal, effectiveComplementRank);
 	{
@@ -2526,6 +2915,8 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 		    << " complement_rank=" << enabledComplementRank
 		    << " complement_active_rank=" << state.activeComplementRank
 		    << " complement_effective_rank=" << effectiveComplementRank
+		    << " complement_trial_rank=" << state.trialComplementRank
+		    << " complement_trial_wins=" << state.trialComplementWins
 		    << " subspace=" << (isRight ? "right" : "left")
 		    << " lr=" << lr
 		    << " mu=" << state.mu
@@ -2548,7 +2939,13 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 			    << " complement_block_trace=" << h_blockTrace
 			    << " complement_tail_mean=" << complementTailMean
 			    << " complement_scout_top=" << complementScoutTop
+			    << " complement_scout_projected=" << complementScoutProjected
 			    << " complement_birth_kelly=" << complementBirthKelly
+			    << " complement_trial_kelly=" << complementTrialKelly
+			    << " complement_trial_alignment=" << complementTrialAlignment
+			    << " complement_trial_contam=" << complementTrialContamination
+			    << " complement_trial_return=" << complementTrialReturn
+			    << " complement_trial_score=" << complementTrialScore
 			    << " sector_rate=" << sectorRate
 			    << " closure_gap=" << closureGap
 			    << " effective_rank=" << diag.effectiveRank

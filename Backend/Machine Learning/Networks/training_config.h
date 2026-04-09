@@ -421,6 +421,275 @@ struct ATLASConfig
 	// complementKappaMax * complementLrScale * lr.
 	float complementKappaMax;
 
+	// Enable the PRISM-style active-memory / predictive-edge prototype.
+	// When false, ATLAS uses the historical active/complement logic unchanged.
+	bool prismEnabled;
+
+	// Number of lagged compressed gradients used by the PRISM active-memory
+	// correction. The current prototype supports up to 2 lags.
+	unsigned int prismLagHorizon;
+
+	// Strength of the active-space memory correction. Larger values apply more
+	// unresolved-bulk friction to the PNG-style extrapolated active update.
+	float prismMemoryScale;
+
+		// Minimum normalized predictive-edge score required before the complement
+		// controller is allowed to activate residual complement modes.
+		float prismPredictiveEdgeThreshold;
+
+		// Enable the RESOLVE prototype: a lagged transfer-edge gate plus a stable
+		// active-space memory kernel fit from compressed-gradient history.
+		bool resolveEnabled;
+
+		// Number of lagged compressed-gradient slices used by the RESOLVE
+		// prototype. The current implementation supports up to 4 lags.
+		unsigned int resolveLagHorizon;
+
+		// Strength of the RESOLVE active-space memory kernel.
+		float resolveMemoryScale;
+
+	// Minimum normalized transfer-edge score required before the adaptive
+	// complement controller is allowed to retain explicit residual modes.
+	float resolvePredictiveEdgeThreshold;
+
+	// Enable the HERO prototype: a Hankel-edge gate on residual complement
+	// activation plus a memory-only fallback on the active coordinates.
+	bool heroEnabled;
+
+	// Number of lagged active/scout history slices used by the HERO Hankel
+	// sketch. The current implementation supports up to 4 lags.
+	unsigned int heroLagHorizon;
+
+	// Strength of the HERO active-space memory kernel.
+	float heroMemoryScale;
+
+	// Minimum normalized Hankel-edge score required before the adaptive
+	// complement controller is allowed to retain explicit residual modes.
+	float heroEdgeThreshold;
+
+	// Enable the COBALT prototype: a stacked active/scout transfer-edge gate
+	// plus a transfer-weighted active-memory kernel. This is a CPU-side minimal
+	// prototype of the broader cross-layer transfer idea; the current
+	// implementation stays layer-local and reuses the existing compressed
+	// active/scout histories.
+	bool cobaltEnabled;
+
+	// Number of lagged active/scout history slices used by the COBALT transfer
+	// sketch. The current implementation supports up to 4 lags.
+	unsigned int cobaltLagHorizon;
+
+	// Strength of the COBALT active-space memory kernel. The effective memory
+	// gain is further scaled by the observed transfer singular value so weak
+	// transfer regimes fall back toward plain ATLAS.
+	float cobaltMemoryScale;
+
+	// Minimum normalized transfer-edge score required before the adaptive
+	// complement controller is allowed to retain explicit residual modes.
+	float cobaltEdgeThreshold;
+
+	// Enable the BIRCH prototype: a local Hankel-style transfer gate on stacked
+	// active/scout histories plus a memory-only fallback on the active
+	// coordinates. This is the minimal ATLAS-side approximation of the broader
+	// balanced transfer idea; explicit complement reactivation stays disabled.
+	bool birchEnabled;
+
+	// Number of lagged past slices used in the BIRCH past-state sketch. The
+	// current implementation supports up to 3 past slices in addition to the
+	// current and one previous future slice.
+	unsigned int birchPastHorizon;
+
+	// Number of active future slices used in the BIRCH Hankel sketch. The
+	// current implementation supports up to 2 future slices (current + lag1).
+	unsigned int birchFutureHorizon;
+
+	// Strength of the BIRCH active-space memory kernel. The effective gain is
+	// further gated by the supercritical part of the Hankel transfer score so
+	// weak transfer regimes fall back toward plain ATLAS.
+	float birchMemoryScale;
+
+	// Minimum normalized Hankel transfer-edge score required before the BIRCH
+	// memory fallback activates. Explicit complement modes remain disabled in
+	// this minimal prototype even when the edge is supercritical.
+	float birchEdgeThreshold;
+
+	// Enable the GHOST prototype: approximate gauge-horizontal projection in the
+	// compressed ATLAS state plus a rank-1 biorthogonal transfer mode extracted
+	// from lagged active/scout history. The minimal prototype is memory-only and
+	// keeps explicit complement activation disabled.
+	bool ghostEnabled;
+
+	// Number of lagged active/scout history slices used by the GHOST transfer
+	// sketch. The current implementation supports up to 4 lagged slices.
+	unsigned int ghostLagHorizon;
+
+	// Strength of the GHOST active-space memory correction after quotient-style
+	// horizontalization and balanced transfer weighting.
+	float ghostMemoryScale;
+
+	// Minimum normalized GHOST transfer-edge score required before the
+	// memory-only correction activates.
+	float ghostEdgeThreshold;
+
+	// Enable SPARROW: a cheaper streaming quotient-transfer observer that keeps
+	// the GHOST lesson (horizontalization + biorthogonal transfer) but replaces
+	// lag-stack operator extraction with a rank-1 streaming latent memory model.
+	bool sparrowEnabled;
+
+	// Number of retained SPARROW streaming transfer modes. The current
+	// implementation supports rank-1 and rank-2 observers.
+	unsigned int sparrowModeRank;
+
+	// When enabled, sparrowModeRank is treated as a cap rather than an exact
+	// retained rank. Higher modes are only activated if their edge is strong
+	// enough relative to the leading mode.
+	bool sparrowAutoModeGate;
+
+	// Strength of the SPARROW active-space memory correction.
+	float sparrowMemoryScale;
+
+	// Minimum SPARROW canonical-edge score required before the memory-only
+	// correction activates.
+	float sparrowEdgeThreshold;
+
+	// Minimum raw mode-2 SPARROW edge required before the second streaming mode
+	// is allowed to contribute when auto-gating is enabled.
+	float sparrowSecondEdgeThreshold;
+
+	// Minimum mode-2 / mode-1 SPARROW edge ratio required before the second
+	// streaming mode is allowed to contribute when auto-gating is enabled.
+	float sparrowSecondEdgeFraction;
+
+	// Stability clamp for the SPARROW latent memory pole. The pole is projected
+	// to [-sparrowPoleMax, sparrowPoleMax] each update.
+	float sparrowPoleMax;
+
+	// Enable QBRT: a quotient-balanced transfer controller that reuses the
+	// existing active/scout lag histories, extracts a balanced rank-1 mode, and
+	// applies only a memory correction in active coordinates.
+	bool qbrtEnabled;
+
+	// Number of lagged active/scout history slices used by the QBRT balanced
+	// transfer sketch. The current implementation supports up to 4 lagged
+	// slices, matching the existing GHOST/HERO history budget.
+	unsigned int qbrtLagHorizon;
+
+	// Strength of the QBRT active-space memory correction.
+	float qbrtMemoryScale;
+
+	// Minimum normalized QBRT transfer-edge score required before the
+	// memory-only correction activates.
+	float qbrtEdgeThreshold;
+
+	// Stability clamp for the QBRT latent memory pole. The pole is projected to
+	// [-qbrtPoleMax, qbrtPoleMax] each update.
+	float qbrtPoleMax;
+
+	// Enable QRC: a quotient resolvent controller that fits a tiny reduced
+	// active/scout plant on compressed history and applies only a memory/control
+	// correction in active coordinates.
+	bool qrcEnabled;
+
+	// Number of lagged active/scout history slices used by the QRC reduced-plant
+	// fit. The current implementation supports up to 4 lagged slices.
+	unsigned int qrcLagHorizon;
+
+	// Strength of the QRC active-space control correction.
+	float qrcMemoryScale;
+
+	// Minimum normalized QRC closed-loop edge score required before the
+	// controller activates.
+	float qrcEdgeThreshold;
+
+	// Stability clamp for the QRC latent plant pole. The pole is projected to
+	// [-qrcPoleMax, qrcPoleMax] each update.
+	float qrcPoleMax;
+
+	// Enable RIFT: a quotient-horizontal path-signature memory correction that
+	// uses low-order active/scout path features instead of explicit complement
+	// geometry. The minimal prototype is CPU-side, memory-only, and keeps
+	// explicit complement activation disabled.
+	bool riftEnabled;
+
+	// Number of lagged active/scout history slices used to build the RIFT path
+	// segment. The current implementation supports up to 4 lagged slices.
+	unsigned int riftLagHorizon;
+
+	// Strength of the RIFT active-space memory correction.
+	float riftMemoryScale;
+
+	// Minimum RIFT path-edge score required before the memory-only correction
+	// activates.
+	float riftEdgeThreshold;
+
+	// Stability clamp for the RIFT latent memory pole. The pole is projected to
+	// [-riftPoleMax, riftPoleMax] each update.
+	float riftPoleMax;
+
+	// Enable ORBIT-Lite: an output-head-only function-space memory correction
+	// that approximates quotient output modes directly in classifier row-space
+	// instead of modeling parameter-space complement geometry.
+	bool orbitEnabled;
+
+	// Strength of the ORBIT-Lite active-space memory correction.
+	float orbitMemoryScale;
+
+	// Minimum normalized ORBIT functional-edge score required before the
+	// memory-only correction activates.
+	float orbitEdgeThreshold;
+
+	// Stability clamp for the ORBIT-Lite latent memory pole. The pole is
+	// projected to [-orbitPoleMax, orbitPoleMax] each update.
+	float orbitPoleMax;
+
+	// Enable HELM: a hidden/output transfer observer applied only on the DFF
+	// output head. The current prototype is CPU-side, memory-style, and leaves
+	// explicit complement modeling disabled.
+	bool helmEnabled;
+
+	// Strength of the HELM output-head memory correction.
+	float helmMemoryScale;
+
+	// Minimum HELM transfer-edge score required before the output-head
+	// correction activates.
+	float helmEdgeThreshold;
+
+	// Maximum retained HELM transfer modes. Values above 1 enable a small
+	// multi-mode hidden-to-output observer instead of the original rank-1 probe.
+	unsigned int helmModeRank;
+
+	// Number of trailing hidden layers to stack into the HELM observable.
+	// 1 reproduces the original last-hidden-only probe; 2 enables HELM-v2.
+	unsigned int helmHiddenStackDepth;
+
+	// Stability clamp for the HELM latent memory pole. The pole is
+	// projected to [-helmPoleMax, helmPoleMax] each update.
+	float helmPoleMax;
+
+	// Enable ASTER: a reduced output-space innovation state-space observer that
+	// uses transported hidden controls and output innovations instead of
+	// parameter-space observables. The minimal prototype is DFF-only,
+	// output-head-only, and keeps explicit complement modeling disabled.
+	bool asterEnabled;
+
+	// Strength of the ASTER output-head memory / innovation correction.
+	float asterMemoryScale;
+
+	// Minimum ASTER transfer-edge score required before the output-head
+	// correction activates.
+	float asterEdgeThreshold;
+
+	// Maximum retained ASTER transfer modes. The current prototype supports a
+	// small rank-1 or rank-2 output-space realization.
+	unsigned int asterStateRank;
+
+	// Number of trailing hidden layers to transport into ASTER output-space
+	// controls.
+	unsigned int asterHiddenStackDepth;
+
+	// Stability clamp for the ASTER latent pole surrogate. The pole is
+	// projected to [-asterPoleMax, asterPoleMax] each update.
+	float asterPoleMax;
+
 	// Fisher EMA decay rate. Controls how quickly the Fisher diagonal and
 	// normalized covariance trace adapt. Higher values (closer to 1) give more
 	// stable estimates.
@@ -494,6 +763,70 @@ struct ATLASConfig
 	      complementRank(0u),
 	      complementLrScale(0.25f),
 	      complementKappaMax(0.5f),
+	      prismEnabled(false),
+	      prismLagHorizon(2u),
+	      prismMemoryScale(0.15f),
+	      prismPredictiveEdgeThreshold(0.05f),
+	      resolveEnabled(false),
+	      resolveLagHorizon(4u),
+	      resolveMemoryScale(0.10f),
+	      resolvePredictiveEdgeThreshold(0.05f),
+	      heroEnabled(false),
+	      heroLagHorizon(4u),
+	      heroMemoryScale(0.10f),
+	      heroEdgeThreshold(0.10f),
+	      cobaltEnabled(false),
+	      cobaltLagHorizon(4u),
+	      cobaltMemoryScale(0.08f),
+	      cobaltEdgeThreshold(0.10f),
+	      birchEnabled(false),
+	      birchPastHorizon(3u),
+	      birchFutureHorizon(2u),
+	      birchMemoryScale(0.08f),
+	      birchEdgeThreshold(0.10f),
+	      ghostEnabled(false),
+	      ghostLagHorizon(4u),
+	      ghostMemoryScale(0.05f),
+	      ghostEdgeThreshold(0.10f),
+	      sparrowEnabled(false),
+	      sparrowModeRank(1u),
+	      sparrowAutoModeGate(false),
+	      sparrowMemoryScale(0.05f),
+	      sparrowEdgeThreshold(0.10f),
+	      sparrowSecondEdgeThreshold(0.10f),
+	      sparrowSecondEdgeFraction(0.50f),
+	      sparrowPoleMax(0.95f),
+	      qbrtEnabled(false),
+	      qbrtLagHorizon(4u),
+	      qbrtMemoryScale(0.05f),
+	      qbrtEdgeThreshold(0.10f),
+	      qbrtPoleMax(0.95f),
+	      qrcEnabled(false),
+	      qrcLagHorizon(4u),
+	      qrcMemoryScale(0.05f),
+	      qrcEdgeThreshold(0.10f),
+	      qrcPoleMax(0.95f),
+	      riftEnabled(false),
+	      riftLagHorizon(4u),
+	      riftMemoryScale(0.05f),
+	      riftEdgeThreshold(0.05f),
+	      riftPoleMax(0.95f),
+	      orbitEnabled(false),
+	      orbitMemoryScale(0.04f),
+	      orbitEdgeThreshold(0.05f),
+	      orbitPoleMax(0.95f),
+	      helmEnabled(false),
+	      helmMemoryScale(0.05f),
+	      helmEdgeThreshold(0.10f),
+	      helmModeRank(2u),
+	      helmHiddenStackDepth(2u),
+	      helmPoleMax(0.95f),
+	      asterEnabled(false),
+	      asterMemoryScale(0.05f),
+	      asterEdgeThreshold(0.10f),
+	      asterStateRank(2u),
+	      asterHiddenStackDepth(2u),
+	      asterPoleMax(0.95f),
 	      beta(0.999f),
 	      muMin(0.01f),
 	      muMax(0.3f),

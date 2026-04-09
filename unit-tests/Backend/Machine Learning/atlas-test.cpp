@@ -156,6 +156,70 @@ static void configure_atlas_transformer_resume_net(glades::NNetwork& net, unsign
 	cfg.transformer.dFFOverride = 32;
 }
 
+static void prepare_atlas_complement_test_state(glades::atlas::WeightState& state,
+                                                glades::rng::Engine& rng,
+                                                unsigned int m,
+                                                unsigned int n,
+                                                unsigned int r,
+                                                unsigned int complementRank,
+                                                const char* tag)
+{
+	glades::atlas::initWeightState(state, m, n, r, 0.0f, rng);
+
+	glades::ATLASConfig acSetup;
+	acSetup.rank = r;
+	acSetup.complementRank = complementRank;
+	acSetup.beta = 1.0f;
+	acSetup.biasCorrection = false;
+	acSetup.muMin = 0.0f;
+	acSetup.muMax = 0.0f;
+	acSetup.tSub = 0u;
+
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+	const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+	                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+	                                         acSetup, rng, 0, tag);
+	ASSERT("==============ATLAS::ComplementTest setup applyStep failed==============", ok);
+
+	state.step = 0ULL;
+	state.activeRank = r;
+	state.activeComplementRank = 0u;
+	state.trialComplementRank = 0u;
+	state.trialComplementWins = 0u;
+	state.trialComplementMean = 0.0f;
+	state.trialComplementVar = 0.0f;
+}
+
+static bool atlas_storage_shapes_ok(const glades::atlas::WeightState& state,
+                                    unsigned int m,
+                                    unsigned int n,
+                                    unsigned int r,
+                                    unsigned int complementRank)
+{
+	const unsigned int sparrowModeRank = (state.sparrowModeRank > 0u) ? state.sparrowModeRank : 1u;
+	return state.U.size() == static_cast<size_t>(m) * r
+	    && state.fisherDiag.size() == static_cast<size_t>(r)
+	    && state.prevGz.size() == static_cast<size_t>(r) * n
+	    && state.complementRank == complementRank
+	    && state.V.size() == static_cast<size_t>(m) * complementRank
+	    && state.complementBlock.size() == static_cast<size_t>(complementRank) * complementRank
+	    && state.scoutBasis.size() == static_cast<size_t>(m) * complementRank
+	    && state.scoutCov.size() == static_cast<size_t>(complementRank) * complementRank
+	    && state.scoutNoise.size() == static_cast<size_t>(complementRank) * complementRank
+	    && state.prevGv.size() == static_cast<size_t>(complementRank) * n
+	    && state.resolveGzHistory.size() >= static_cast<size_t>(4u) * r * n
+	    && state.heroGwHistory.size() == static_cast<size_t>(4u) * complementRank * n
+	    && state.sparrowPrevActive.size() == static_cast<size_t>(r) * n
+	    && state.sparrowPrevScout.size() == static_cast<size_t>(complementRank) * n
+	    && state.sparrowFutureCov.size() == static_cast<size_t>(r) * r
+	    && state.sparrowPastCov.size() == static_cast<size_t>(r + complementRank) * (r + complementRank)
+	    && state.sparrowCrossCov.size() == static_cast<size_t>(r) * (r + complementRank)
+	    && state.sparrowLeftMode.size() == static_cast<size_t>(sparrowModeRank) * r
+	    && state.sparrowRightMode.size() == static_cast<size_t>(sparrowModeRank) * (r + complementRank)
+	    && state.sparrowLatent.size() == static_cast<size_t>(sparrowModeRank) * n;
+}
+
 } // anonymous namespace
 
 void ATLASUnitTest()
@@ -229,6 +293,1395 @@ void ATLASUnitTest()
 
 		delete di;
 		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1B: HELM-Lite produces bounded runtime diagnostics on DFF output-head
+	// training and leaves the network trainable.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1B: HELM-Lite runtime diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(4, shmea::GVector<float>(2, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainMatrix[0][0] = 0.0f; di->trainMatrix[0][1] = 0.0f;
+		di->trainExpectedMatrix[0][0] = 0.0f;
+		di->trainMatrix[1][0] = 0.0f; di->trainMatrix[1][1] = 1.0f;
+		di->trainExpectedMatrix[1][0] = 1.0f;
+		di->trainMatrix[2][0] = 1.0f; di->trainMatrix[2][1] = 0.0f;
+		di->trainExpectedMatrix[2][0] = 1.0f;
+		di->trainMatrix[3][0] = 1.0f; di->trainMatrix[3][1] = 1.0f;
+		di->trainExpectedMatrix[3][0] = 0.0f;
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_atlas_dff_helm", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		net.setSeed(4242u);
+		net.getTerminatorMutable().setEpoch(100);
+		net.getTerminatorMutable().setAccuracy(0);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 4u;
+			cfg.atlas.complementRank = 0u;
+			cfg.atlas.tSub = 32u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.helmEnabled = true;
+			cfg.atlas.helmMemoryScale = 0.05f;
+			cfg.atlas.helmEdgeThreshold = 0.0f;
+			cfg.atlas.helmPoleMax = 0.95f;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::HELM_DFF TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::HELM_DFF no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::HELM_DFF diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::HELM_DFF should expose one output-head HELM observer==============",
+		       diag.helmMatrices == 1u);
+		ASSERT("==============ATLAS::HELM_DFF diagnostics should remain finite==============",
+		       diag.helmMeanEdge == diag.helmMeanEdge
+		       && diag.helmMeanSigma == diag.helmMeanSigma
+		       && diag.helmMeanPredR2 == diag.helmMeanPredR2
+		       && diag.helmMeanMemoryGain == diag.helmMeanMemoryGain
+		       && diag.helmMeanPole == diag.helmMeanPole);
+		ASSERT("==============ATLAS::HELM_DFF loss too high==============", cb.last.totalError < 0.35f);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1C: ASTER-Lite produces bounded runtime diagnostics on DFF output-head
+	// training and leaves the network trainable.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1C: ASTER-Lite runtime diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		glades::NumberInput* di = new glades::NumberInput();
+		di->trainMatrix = shmea::GMatrix(4, shmea::GVector<float>(2, 0.0f));
+		di->trainExpectedMatrix = shmea::GMatrix(4, shmea::GVector<float>(1, 0.0f));
+		di->trainMatrix[0][0] = 0.0f; di->trainMatrix[0][1] = 0.0f;
+		di->trainExpectedMatrix[0][0] = 0.0f;
+		di->trainMatrix[1][0] = 0.0f; di->trainMatrix[1][1] = 1.0f;
+		di->trainExpectedMatrix[1][0] = 1.0f;
+		di->trainMatrix[2][0] = 1.0f; di->trainMatrix[2][1] = 0.0f;
+		di->trainExpectedMatrix[2][0] = 1.0f;
+		di->trainMatrix[3][0] = 1.0f; di->trainMatrix[3][1] = 1.0f;
+		di->trainExpectedMatrix[3][0] = 0.0f;
+		di->testMatrix = di->trainMatrix;
+		di->testExpectedMatrix = di->trainExpectedMatrix;
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    4, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    8, 0.05f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::SIGMOID, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(1, glades::OutputLayerInfo::REGRESSION);
+		glades::NNInfo* info = new glades::NNInfo("ut_atlas_dff_aster", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+		net.setSeed(4243u);
+		net.getTerminatorMutable().setEpoch(100);
+		net.getTerminatorMutable().setAccuracy(0);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 4u;
+			cfg.atlas.complementRank = 0u;
+			cfg.atlas.tSub = 32u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.asterEnabled = true;
+			cfg.atlas.asterMemoryScale = 0.05f;
+			cfg.atlas.asterEdgeThreshold = 0.0f;
+			cfg.atlas.asterPoleMax = 0.95f;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::ASTER_DFF TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::ASTER_DFF no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::ASTER_DFF diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::ASTER_DFF should expose one output-head ASTER observer==============",
+		       diag.asterMatrices == 1u);
+		ASSERT("==============ATLAS::ASTER_DFF diagnostics should remain finite==============",
+		       diag.asterMeanEdge == diag.asterMeanEdge
+		       && diag.asterMeanSigma == diag.asterMeanSigma
+		       && diag.asterMeanPredR2 == diag.asterMeanPredR2
+		       && diag.asterMeanMemoryGain == diag.asterMeanMemoryGain
+		       && diag.asterMeanPole == diag.asterMeanPole);
+		ASSERT("==============ATLAS::ASTER_DFF loss too high==============", cb.last.totalError < 0.35f);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C11: COBALT transfer-edge gate suppresses stale complement births
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C11: COBALT transfer-edge gate blocks stale complement modes\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282842ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.heroGwHistory.begin(), state.heroGwHistory.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+			gW[3u * n + j] = 3.0f;
+		}
+
+		glades::ATLASConfig acCobaltGate;
+		acCobaltGate.rank = r;
+		acCobaltGate.complementRank = 4u;
+		acCobaltGate.beta = 1.0f;
+		acCobaltGate.biasCorrection = false;
+		acCobaltGate.muMin = 0.0f;
+		acCobaltGate.muMax = 0.0f;
+		acCobaltGate.tSub = 0u;
+		acCobaltGate.cobaltEnabled = true;
+		acCobaltGate.cobaltLagHorizon = 4u;
+		acCobaltGate.cobaltEdgeThreshold = 0.10f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acCobaltGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerCobaltGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerCobaltGate should suppress stale complement probation==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerCobaltGate transfer edge should stay subcritical==============",
+		       state.lastCobaltEdge < acCobaltGate.cobaltEdgeThreshold);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C12: COBALT active memory shrinks the subspace correction on aligned histories
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C12: COBALT active memory damps aligned active corrections\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282843ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState cobaltState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		cobaltState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			cobaltState.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			cobaltState.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			cobaltState.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			cobaltState.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			cobaltState.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			cobaltState.resolveGzHistory[2u * r * n + 1u * n + j] = 1.5f;
+			cobaltState.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			cobaltState.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+		}
+
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> gWBase = gW;
+		std::vector<float> gWGhost = gW;
+		std::vector<float> WBase(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> WCobalt(static_cast<size_t>(m) * n, 0.0f);
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acCobalt = acBase;
+		acCobalt.cobaltEnabled = true;
+		acCobalt.cobaltLagHorizon = 4u;
+		acCobalt.cobaltMemoryScale = 0.20f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gW[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerCobaltMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(cobaltState, &WCobalt[0], &gW[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acCobalt, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerCobaltMemory cobalt applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double cobaltCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			const double cobaltCorrection =
+			    static_cast<double>(WCobalt[idx])
+			    + static_cast<double>(cobaltState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			cobaltCorrectionNormSq += cobaltCorrection * cobaltCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerCobaltMemory should reduce active correction energy==============",
+		       cobaltCorrectionNormSq < baseCorrectionNormSq);
+		ASSERT("==============ATLAS::ControllerCobaltMemory memory diagnostic should remain finite==============",
+		       cobaltState.lastCobaltMemoryGain == cobaltState.lastCobaltMemoryGain);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C13: BIRCH stays memory-only and clears explicit complement activity
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C13: BIRCH stays memory-only and clears complement activity\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282844ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+		state.activeComplementRank = 1u;
+		state.trialComplementRank = 2u;
+		state.trialComplementWins = 1u;
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			state.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			state.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			state.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			state.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			state.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			state.resolveGzHistory[2u * r * n + 1u * n + j] = 1.5f;
+			state.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			state.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+		}
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+
+		glades::ATLASConfig acBirchGate;
+		acBirchGate.rank = r;
+		acBirchGate.complementRank = 4u;
+		acBirchGate.beta = 1.0f;
+		acBirchGate.biasCorrection = false;
+		acBirchGate.muMin = 0.0f;
+		acBirchGate.muMax = 0.0f;
+		acBirchGate.tSub = 0u;
+		acBirchGate.birchEnabled = true;
+		acBirchGate.birchPastHorizon = 3u;
+		acBirchGate.birchFutureHorizon = 2u;
+		acBirchGate.birchEdgeThreshold = 0.10f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acBirchGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerBirchGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerBirchGate should clear explicit complement activity==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerBirchGate edge diagnostic should remain finite==============",
+		       state.lastBirchEdge == state.lastBirchEdge
+		       && state.lastBirchSigma == state.lastBirchSigma);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C14: BIRCH active memory shrinks the subspace correction on aligned histories
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C14: BIRCH active memory damps aligned active corrections\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282845ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState birchState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		birchState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			birchState.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			birchState.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			birchState.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			birchState.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			birchState.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			birchState.resolveGzHistory[2u * r * n + 1u * n + j] = 1.5f;
+			birchState.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			birchState.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+		}
+
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> WBirch(static_cast<size_t>(m) * n, 0.0f);
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acBirch = acBase;
+		acBirch.birchEnabled = true;
+		acBirch.birchPastHorizon = 3u;
+		acBirch.birchFutureHorizon = 2u;
+		acBirch.birchMemoryScale = 0.20f;
+		acBirch.birchEdgeThreshold = 0.0f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gW[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerBirchMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(birchState, &WBirch[0], &gW[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acBirch, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerBirchMemory birch applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double birchCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			const double birchCorrection =
+			    static_cast<double>(WBirch[idx])
+			    + static_cast<double>(birchState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			birchCorrectionNormSq += birchCorrection * birchCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerBirchMemory should reduce active correction energy==============",
+		       birchCorrectionNormSq < baseCorrectionNormSq);
+		ASSERT("==============ATLAS::ControllerBirchMemory memory diagnostic should remain finite==============",
+		       birchState.lastBirchMemoryGain == birchState.lastBirchMemoryGain);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C15: GHOST stays memory-only and clears explicit complement activity
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C15: GHOST stays memory-only and clears complement activity\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282846ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+		state.activeComplementRank = 1u;
+		state.trialComplementRank = 2u;
+		state.trialComplementWins = 1u;
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			state.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			state.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			state.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			state.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			state.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			state.resolveGzHistory[2u * r * n + 1u * n + j] = 1.50f;
+			state.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			state.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+		}
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			W[0u * n + j] = 2.0f;
+			W[1u * n + j] = 1.0f;
+		}
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+
+		glades::ATLASConfig acGhostGate;
+		acGhostGate.rank = r;
+		acGhostGate.complementRank = 4u;
+		acGhostGate.beta = 1.0f;
+		acGhostGate.biasCorrection = false;
+		acGhostGate.muMin = 0.0f;
+		acGhostGate.muMax = 0.0f;
+		acGhostGate.tSub = 0u;
+		acGhostGate.ghostEnabled = true;
+		acGhostGate.ghostLagHorizon = 4u;
+		acGhostGate.ghostEdgeThreshold = 0.10f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acGhostGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerGhostGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerGhostGate should clear explicit complement activity==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerGhostGate diagnostics should remain finite==============",
+		       state.lastGhostEdge == state.lastGhostEdge
+		       && state.lastGhostSigma == state.lastGhostSigma
+		       && state.lastGhostHorizontalRatio == state.lastGhostHorizontalRatio);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C16: GHOST horizontal projection strips gauge energy and keeps
+	// memory diagnostics coherent on gauge-aligned histories.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C16: GHOST horizontal projection strips gauge energy\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282847ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState ghostState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		ghostState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			ghostState.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			ghostState.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			ghostState.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			ghostState.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			ghostState.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			ghostState.resolveGzHistory[2u * r * n + 1u * n + j] = 1.50f;
+			ghostState.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			ghostState.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+		}
+
+		std::vector<float> WInit(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			WInit[0u * n + j] = 2.0f;
+			WInit[1u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase = WInit;
+		std::vector<float> WGhost = WInit;
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> gWBase = gW;
+		std::vector<float> gWGhost = gW;
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acGhost = acBase;
+		acGhost.ghostEnabled = true;
+		acGhost.ghostLagHorizon = 4u;
+		acGhost.ghostMemoryScale = 0.20f;
+		acGhost.ghostEdgeThreshold = 0.0f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gWBase[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerGhostMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(ghostState, &WGhost[0], &gWGhost[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acGhost, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerGhostMemory ghost applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double ghostCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx] - WInit[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gWBase[idx]);
+			const double ghostCorrection =
+			    static_cast<double>(WGhost[idx] - WInit[idx])
+			    + static_cast<double>(ghostState.lastBaselineRate) * static_cast<double>(gWGhost[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			ghostCorrectionNormSq += ghostCorrection * ghostCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerGhostMemory should remove some gauge energy==============",
+		       ghostState.lastGhostHorizontalRatio < 0.999f);
+		if (ghostState.lastGhostMemoryGain > 1e-6f)
+		{
+			ASSERT("==============ATLAS::ControllerGhostMemory should reduce active correction energy when memory activates==============",
+			       ghostCorrectionNormSq < baseCorrectionNormSq);
+		}
+		ASSERT("==============ATLAS::ControllerGhostMemory memory diagnostics should remain finite==============",
+		       ghostState.lastGhostMemoryGain == ghostState.lastGhostMemoryGain
+		       && ghostState.lastGhostEdge == ghostState.lastGhostEdge
+		       && ghostState.lastGhostSigma == ghostState.lastGhostSigma);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C17: SPARROW stays memory-only and clears explicit complement activity
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C17: SPARROW stays memory-only and clears complement activity\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282848ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+		state.activeComplementRank = 1u;
+		state.trialComplementRank = 2u;
+		state.trialComplementWins = 1u;
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			W[0u * n + j] = 2.0f;
+			W[1u * n + j] = 1.0f;
+		}
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+
+		glades::ATLASConfig acSparrowGate;
+		acSparrowGate.rank = r;
+		acSparrowGate.complementRank = 4u;
+		acSparrowGate.beta = 1.0f;
+		acSparrowGate.biasCorrection = false;
+		acSparrowGate.muMin = 0.0f;
+		acSparrowGate.muMax = 0.0f;
+		acSparrowGate.tSub = 0u;
+		acSparrowGate.sparrowEnabled = true;
+		acSparrowGate.sparrowModeRank = 2u;
+		acSparrowGate.sparrowMemoryScale = 0.10f;
+		acSparrowGate.sparrowEdgeThreshold = 0.10f;
+		acSparrowGate.sparrowPoleMax = 0.95f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acSparrowGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerSparrowGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerSparrowGate should clear explicit complement activity==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerSparrowGate diagnostics should remain finite==============",
+		       state.lastSparrowEdge == state.lastSparrowEdge
+		       && state.lastSparrowSigma == state.lastSparrowSigma
+		       && state.lastSparrowHorizontalRatio == state.lastSparrowHorizontalRatio
+		       && state.lastSparrowMemoryGain == state.lastSparrowMemoryGain);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C18: SPARROW horizontal streaming mode produces coherent
+	// diagnostics and can reduce active correction energy on aligned history.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C18: SPARROW streaming quotient mode is coherent\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282849ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState sparrowState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		sparrowState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			sparrowState.sparrowPrevActive[0u * n + j] = 4.0f;
+			sparrowState.sparrowPrevActive[1u * n + j] = 2.0f;
+		}
+
+		std::vector<float> WInit(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			WInit[0u * n + j] = 2.0f;
+			WInit[1u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase = WInit;
+		std::vector<float> WSparrow = WInit;
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> gWBase = gW;
+		std::vector<float> gWSparrow = gW;
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acSparrow = acBase;
+		acSparrow.sparrowEnabled = true;
+		acSparrow.sparrowModeRank = 2u;
+		acSparrow.sparrowMemoryScale = 0.20f;
+		acSparrow.sparrowEdgeThreshold = 0.0f;
+		acSparrow.sparrowPoleMax = 0.95f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gWBase[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerSparrowMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(sparrowState, &WSparrow[0], &gWSparrow[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acSparrow, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerSparrowMemory sparrow applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double sparrowCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx] - WInit[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gWBase[idx]);
+			const double sparrowCorrection =
+			    static_cast<double>(WSparrow[idx] - WInit[idx])
+			    + static_cast<double>(sparrowState.lastBaselineRate) * static_cast<double>(gWSparrow[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			sparrowCorrectionNormSq += sparrowCorrection * sparrowCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerSparrowMemory should remove some gauge energy==============",
+		       sparrowState.lastSparrowHorizontalRatio < 0.999f);
+		if (sparrowState.lastSparrowMemoryGain > 1e-6f)
+		{
+			ASSERT("==============ATLAS::ControllerSparrowMemory should reduce active correction energy when memory activates==============",
+			       sparrowCorrectionNormSq < baseCorrectionNormSq);
+		}
+		ASSERT("==============ATLAS::ControllerSparrowMemory diagnostics should remain finite==============",
+		       sparrowState.lastSparrowMemoryGain == sparrowState.lastSparrowMemoryGain
+		       && sparrowState.lastSparrowEdge == sparrowState.lastSparrowEdge
+		       && sparrowState.lastSparrowSigma == sparrowState.lastSparrowSigma
+		       && sparrowState.lastSparrowSecondEdge == sparrowState.lastSparrowSecondEdge
+		       && sparrowState.lastSparrowSecondSigma == sparrowState.lastSparrowSecondSigma
+		       && sparrowState.sparrowPole == sparrowState.sparrowPole);
+		ASSERT("==============ATLAS::ControllerSparrowMemory rank-2 storage should persist two channels==============",
+		       sparrowState.sparrowLeftMode.size() >= static_cast<size_t>(2u * r)
+		       && sparrowState.sparrowLatent.size() >= static_cast<size_t>(2u * n));
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C18b: SPARROW auto-gates the second streaming mode based on
+	// raw mode-2 edge strength and its ratio to mode 1.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C18b: SPARROW auto-gates the second mode coherently\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 382828491ULL);
+
+		glades::ATLASConfig acAuto;
+		acAuto.rank = r;
+		acAuto.complementRank = 0u;
+		acAuto.beta = 0.0f;
+		acAuto.biasCorrection = false;
+		acAuto.muMin = 0.0f;
+		acAuto.muMax = 0.0f;
+		acAuto.tSub = 0u;
+		acAuto.sparrowEnabled = true;
+		acAuto.sparrowModeRank = 2u;
+		acAuto.sparrowAutoModeGate = true;
+		acAuto.sparrowMemoryScale = 0.20f;
+		acAuto.sparrowEdgeThreshold = 0.0f;
+		acAuto.sparrowSecondEdgeThreshold = 0.10f;
+		acAuto.sparrowSecondEdgeFraction = 0.50f;
+		acAuto.sparrowPoleMax = 0.95f;
+
+		glades::atlas::WeightState strongState;
+		glades::atlas::initWeightState(strongState, m, n, r, 0.0f, rng);
+		std::fill(strongState.U.begin(), strongState.U.end(), 0.0f);
+		strongState.U[0] = 1.0f;
+		strongState.U[strongState.r + 1] = 1.0f;
+		strongState.sparrowPrevActive[0u * n + 0u] = 4.0f;
+		strongState.sparrowPrevActive[1u * n + 1u] = 4.0f;
+		std::vector<float> WStrong(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gWStrong(static_cast<size_t>(m) * n, 0.0f);
+		gWStrong[0u * n + 0u] = 4.0f;
+		gWStrong[1u * n + 1u] = 4.0f;
+		bool ok = glades::atlas::applyStep(strongState, &WStrong[0], &gWStrong[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acAuto, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerSparrowAutoGate strong applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerSparrowAutoGate should retain both strong modes==============",
+		       strongState.lastSparrowActiveModes == 2u);
+		ASSERT("==============ATLAS::ControllerSparrowAutoGate should measure a nontrivial second edge in the strong case==============",
+		       strongState.lastSparrowSecondEdge > acAuto.sparrowSecondEdgeThreshold);
+
+		glades::atlas::WeightState weakState;
+		glades::atlas::initWeightState(weakState, m, n, r, 0.0f, rng);
+		std::fill(weakState.U.begin(), weakState.U.end(), 0.0f);
+		weakState.U[0] = 1.0f;
+		weakState.U[weakState.r + 1] = 1.0f;
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			weakState.sparrowPrevActive[0u * n + j] = 4.0f;
+			weakState.sparrowPrevActive[1u * n + j] = 1.0f;
+		}
+		std::vector<float> WWeak(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gWWeak(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gWWeak[0u * n + j] = 4.0f;
+			gWWeak[1u * n + j] = 1.0f;
+		}
+		ok = glades::atlas::applyStep(weakState, &WWeak[0], &gWWeak[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acAuto, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerSparrowAutoGate weak applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerSparrowAutoGate should reject the redundant second mode==============",
+		       weakState.lastSparrowActiveModes == 1u);
+		ASSERT("==============ATLAS::ControllerSparrowAutoGate weak case diagnostics should stay finite==============",
+		       weakState.lastSparrowSecondEdge == weakState.lastSparrowSecondEdge
+		       && weakState.lastSparrowSecondSigma == weakState.lastSparrowSecondSigma);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C19: QBRT produces coherent quotient-balanced diagnostics and
+	// perturbs the active correction on aligned lagged history.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C19: QBRT balanced transfer mode is coherent\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282850ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState qbrtState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		qbrtState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			qbrtState.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			qbrtState.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			qbrtState.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			qbrtState.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			qbrtState.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			qbrtState.resolveGzHistory[2u * r * n + 1u * n + j] = 1.50f;
+			qbrtState.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			qbrtState.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+			qbrtState.qbrtLatent[j] = 0.25f;
+		}
+		qbrtState.qbrtPole = 0.50f;
+		qbrtState.qbrtPoleNumer = 0.25f;
+		qbrtState.qbrtPoleDenom = 0.50f;
+
+		std::vector<float> WInit(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			WInit[0u * n + j] = 2.0f;
+			WInit[1u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase = WInit;
+		std::vector<float> WQbrt = WInit;
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> gWBase = gW;
+		std::vector<float> gWQbrt = gW;
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acQbrt = acBase;
+		acQbrt.qbrtEnabled = true;
+		acQbrt.qbrtLagHorizon = 4u;
+		acQbrt.qbrtMemoryScale = 0.20f;
+		acQbrt.qbrtEdgeThreshold = 0.0f;
+		acQbrt.qbrtPoleMax = 0.95f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gWBase[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerQBRTMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(qbrtState, &WQbrt[0], &gWQbrt[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acQbrt, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerQBRTMemory qbrt applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double qbrtCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx] - WInit[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gWBase[idx]);
+			const double qbrtCorrection =
+			    static_cast<double>(WQbrt[idx] - WInit[idx])
+			    + static_cast<double>(qbrtState.lastBaselineRate) * static_cast<double>(gWQbrt[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			qbrtCorrectionNormSq += qbrtCorrection * qbrtCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerQBRTMemory should remove some quotient gauge energy==============",
+		       qbrtState.lastQbrtHorizontalRatio < 0.999f);
+		if (qbrtState.lastQbrtMemoryGain > 1e-6f)
+		{
+			ASSERT("==============ATLAS::ControllerQBRTMemory should materially perturb the active correction when memory activates==============",
+			       fabs(qbrtCorrectionNormSq - baseCorrectionNormSq) > 1e-8);
+		}
+		ASSERT("==============ATLAS::ControllerQBRTMemory diagnostics should remain finite==============",
+		       qbrtState.lastQbrtMemoryGain == qbrtState.lastQbrtMemoryGain
+		       && qbrtState.lastQbrtEdge == qbrtState.lastQbrtEdge
+		       && qbrtState.lastQbrtSigma == qbrtState.lastQbrtSigma
+		       && qbrtState.qbrtPole == qbrtState.qbrtPole);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C20: RIFT produces coherent path-signature diagnostics and
+	// perturbs the active correction on curved lagged history.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C20: RIFT signature path mode is coherent\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282851ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState riftState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		riftState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			// resolveGzHistory stores newest slice at lag 0, so seed a four-point
+			// loop in reverse chronological order that still has nontrivial area
+			// after quotient-horizontal projection.
+			riftState.resolveGzHistory[0u * r * n + 0u * n + j] = ((j & 1u) == 0u) ? 1.0f : 0.0f;
+			riftState.resolveGzHistory[0u * r * n + 1u * n + j] = (j == 1u || j == 2u) ? 1.0f : 0.0f;
+			riftState.resolveGzHistory[1u * r * n + 0u * n + j] = (j < 2u) ? 1.0f : 0.0f;
+			riftState.resolveGzHistory[1u * r * n + 1u * n + j] = (j == 0u || j == 3u) ? 1.0f : 0.0f;
+			riftState.resolveGzHistory[2u * r * n + 0u * n + j] = ((j & 1u) == 1u) ? 1.0f : 0.0f;
+			riftState.resolveGzHistory[2u * r * n + 1u * n + j] = ((j & 1u) == 0u) ? 1.0f : 0.0f;
+			riftState.resolveGzHistory[3u * r * n + 0u * n + j] = 0.0f;
+			riftState.resolveGzHistory[3u * r * n + 1u * n + j] = 0.0f;
+			riftState.riftLatent[j] = 0.20f;
+		}
+		riftState.riftPole = 0.40f;
+		riftState.riftPoleNumer = 0.16f;
+		riftState.riftPoleDenom = 0.40f;
+
+		std::vector<float> WInit(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			WInit[0u * n + j] = 2.0f;
+			WInit[1u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase = WInit;
+		std::vector<float> WRift = WInit;
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 2.0f;
+			gW[1u * n + j] = -2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> gWBase = gW;
+		std::vector<float> gWRift = gW;
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acRift = acBase;
+		acRift.riftEnabled = true;
+		acRift.riftLagHorizon = 4u;
+		acRift.riftMemoryScale = 0.20f;
+		acRift.riftEdgeThreshold = 0.0f;
+		acRift.riftPoleMax = 0.95f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gWBase[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerRIFTMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(riftState, &WRift[0], &gWRift[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acRift, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerRIFTMemory rift applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double riftCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx] - WInit[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gWBase[idx]);
+			const double riftCorrection =
+			    static_cast<double>(WRift[idx] - WInit[idx])
+			    + static_cast<double>(riftState.lastBaselineRate) * static_cast<double>(gWRift[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			riftCorrectionNormSq += riftCorrection * riftCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerRIFTMemory should remove some quotient gauge energy==============",
+		       riftState.lastRiftHorizontalRatio < 0.999f);
+		ASSERT("==============ATLAS::ControllerRIFTMemory should retain nontrivial path area==============",
+		       riftState.lastRiftAreaEnergy > 1e-6f);
+		if (riftState.lastRiftMemoryGain > 1e-6f)
+		{
+			ASSERT("==============ATLAS::ControllerRIFTMemory should materially perturb the active correction when memory activates==============",
+			       fabs(riftCorrectionNormSq - baseCorrectionNormSq) > 1e-8);
+		}
+		ASSERT("==============ATLAS::ControllerRIFTMemory diagnostics should remain finite==============",
+		       riftState.lastRiftMemoryGain == riftState.lastRiftMemoryGain
+		       && riftState.lastRiftEdge == riftState.lastRiftEdge
+		       && riftState.lastRiftSigma == riftState.lastRiftSigma
+		       && riftState.lastRiftPredR2 == riftState.lastRiftPredR2
+		       && riftState.riftPole == riftState.riftPole);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C21: ORBIT-Lite stays memory-only on small output heads and
+	// produces finite diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C21: ORBIT-Lite stays memory-only on output heads\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 10;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282850ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.0f, rng);
+		state.activeComplementRank = 1u;
+		state.trialComplementRank = 2u;
+		state.trialComplementWins = 1u;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			W[0u * n + j] = 3.0f;
+			W[1u * n + j] = -1.0f;
+			W[2u * n + j] = 2.0f;
+			W[3u * n + j] = 0.0f;
+			gW[0u * n + j] = 5.0f;
+			gW[1u * n + j] = -3.0f;
+			gW[2u * n + j] = 3.0f;
+			gW[3u * n + j] = -1.0f;
+		}
+
+		glades::ATLASConfig acOrbitGate;
+		acOrbitGate.rank = r;
+		acOrbitGate.complementRank = 4u;
+		acOrbitGate.beta = 0.0f;
+		acOrbitGate.biasCorrection = false;
+		acOrbitGate.muMin = 0.0f;
+		acOrbitGate.muMax = 0.0f;
+		acOrbitGate.tSub = 0u;
+		acOrbitGate.orbitEnabled = true;
+		acOrbitGate.orbitMemoryScale = 0.10f;
+		acOrbitGate.orbitEdgeThreshold = 0.0f;
+		acOrbitGate.orbitPoleMax = 0.95f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acOrbitGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerOrbitGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerOrbitGate should clear explicit complement activity on output head==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerOrbitGate diagnostics should remain finite==============",
+		       state.lastOrbitEdge == state.lastOrbitEdge
+		       && state.lastOrbitSigma == state.lastOrbitSigma
+		       && state.lastOrbitHorizontalRatio == state.lastOrbitHorizontalRatio
+		       && state.lastOrbitMemoryGain == state.lastOrbitMemoryGain
+		       && state.orbitPole == state.orbitPole);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C22: ORBIT-Lite produces a coherent output-space memory correction
+	// on aligned classifier-head structure.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C22: ORBIT-Lite output-space mode is coherent\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+		const float invSqrt2 = 0.70710678f;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282851ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState orbitState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0u * r + 0u] = invSqrt2;
+		baseState.U[1u * r + 0u] = -invSqrt2;
+		baseState.U[2u * r + 1u] = invSqrt2;
+		baseState.U[3u * r + 1u] = -invSqrt2;
+		orbitState.U = baseState.U;
+		for (unsigned int j = 0; j < n; ++j)
+			orbitState.orbitPrevSignal[j] = 2.0f;
+
+		std::vector<float> WInit(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			WInit[0u * n + j] = 4.0f;
+			WInit[1u * n + j] = -2.0f;
+			WInit[2u * n + j] = 2.0f;
+			WInit[3u * n + j] = 0.0f;
+		}
+		std::vector<float> WBase = WInit;
+		std::vector<float> WOrbit = WInit;
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 5.0f;
+			gW[1u * n + j] = -3.0f;
+			gW[2u * n + j] = 3.0f;
+			gW[3u * n + j] = -1.0f;
+		}
+		std::vector<float> gWBase = gW;
+		std::vector<float> gWOrbit = gW;
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acOrbit = acBase;
+		acOrbit.orbitEnabled = true;
+		acOrbit.orbitMemoryScale = 0.20f;
+		acOrbit.orbitEdgeThreshold = 0.0f;
+		acOrbit.orbitPoleMax = 0.95f;
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			orbitState.orbitPrevSignal[j] = 0.75f;
+			orbitState.orbitLatent[j] = 0.50f;
+		}
+		orbitState.orbitPole = 0.50f;
+		orbitState.orbitPoleNumer = 0.25f;
+		orbitState.orbitPoleDenom = 0.50f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gWBase[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerOrbitMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(orbitState, &WOrbit[0], &gWOrbit[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acOrbit, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerOrbitMemory orbit applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double orbitCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx] - WInit[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gWBase[idx]);
+			const double orbitCorrection =
+			    static_cast<double>(WOrbit[idx] - WInit[idx])
+			    + static_cast<double>(orbitState.lastBaselineRate) * static_cast<double>(gWOrbit[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			orbitCorrectionNormSq += orbitCorrection * orbitCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerOrbitMemory should detect nontrivial output quotient signal==============",
+		       orbitState.lastOrbitSigma > 0.0f && orbitState.lastOrbitEdge >= 0.0f);
+		ASSERT("==============ATLAS::ControllerOrbitMemory should remove some common-logit energy==============",
+		       orbitState.lastOrbitHorizontalRatio < 0.999f);
+		if (orbitState.lastOrbitMemoryGain > 1e-6f)
+		{
+			ASSERT("==============ATLAS::ControllerOrbitMemory should materially perturb the active correction when memory activates==============",
+			       fabs(orbitCorrectionNormSq - baseCorrectionNormSq) > 1e-8);
+		}
+		ASSERT("==============ATLAS::ControllerOrbitMemory diagnostics should remain finite==============",
+		       orbitState.lastOrbitMemoryGain == orbitState.lastOrbitMemoryGain
+		       && orbitState.lastOrbitEdge == orbitState.lastOrbitEdge
+		       && orbitState.lastOrbitSigma == orbitState.lastOrbitSigma
+		       && orbitState.orbitPole == orbitState.orbitPole);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C23: QRC produces coherent closed-loop diagnostics and
+	// perturbs the active correction on aligned quotient lagged history.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C23: QRC reduced control mode is coherent\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282852ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState qrcState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		qrcState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			qrcState.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			qrcState.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			qrcState.resolveGzHistory[1u * r * n + 0u * n + j] = 3.0f;
+			qrcState.resolveGzHistory[1u * r * n + 1u * n + j] = 1.5f;
+			qrcState.resolveGzHistory[2u * r * n + 0u * n + j] = 2.0f;
+			qrcState.resolveGzHistory[2u * r * n + 1u * n + j] = 1.0f;
+			qrcState.resolveGzHistory[3u * r * n + 0u * n + j] = 1.0f;
+			qrcState.resolveGzHistory[3u * r * n + 1u * n + j] = 0.5f;
+			qrcState.qrcLatent[j] = 0.25f;
+		}
+		qrcState.qrcPole = 0.50f;
+		qrcState.qrcPoleNumer = 0.25f;
+		qrcState.qrcPoleDenom = 0.50f;
+
+		std::vector<float> WInit(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			WInit[0u * n + j] = 2.0f;
+			WInit[1u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase = WInit;
+		std::vector<float> WQrc = WInit;
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> gWBase = gW;
+		std::vector<float> gWQrc = gW;
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acQrc = acBase;
+		acQrc.qrcEnabled = true;
+		acQrc.qrcLagHorizon = 4u;
+		acQrc.qrcMemoryScale = 0.20f;
+		acQrc.qrcEdgeThreshold = 0.0f;
+		acQrc.qrcPoleMax = 0.95f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gWBase[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerQRCMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(qrcState, &WQrc[0], &gWQrc[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acQrc, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerQRCMemory qrc applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double qrcCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx] - WInit[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gWBase[idx]);
+			const double qrcCorrection =
+			    static_cast<double>(WQrc[idx] - WInit[idx])
+			    + static_cast<double>(qrcState.lastBaselineRate) * static_cast<double>(gWQrc[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			qrcCorrectionNormSq += qrcCorrection * qrcCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerQRCMemory should remove some quotient gauge energy==============",
+		       qrcState.lastQrcHorizontalRatio < 0.999f);
+		ASSERT("==============ATLAS::ControllerQRCMemory should produce nonnegative control gain==============",
+		       qrcState.lastQrcControlGain >= 0.0f);
+		if (qrcState.lastQrcMemoryGain > 1e-6f)
+		{
+			ASSERT("==============ATLAS::ControllerQRCMemory should materially perturb the active correction when control activates==============",
+			       fabs(qrcCorrectionNormSq - baseCorrectionNormSq) > 1e-8);
+		}
+		ASSERT("==============ATLAS::ControllerQRCMemory diagnostics should remain finite==============",
+		       qrcState.lastQrcMemoryGain == qrcState.lastQrcMemoryGain
+		       && qrcState.lastQrcEdge == qrcState.lastQrcEdge
+		       && qrcState.lastQrcSigma == qrcState.lastQrcSigma
+		       && qrcState.lastQrcControlGain == qrcState.lastQrcControlGain
+		       && qrcState.qrcPole == qrcState.qrcPole);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
@@ -2394,6 +3847,49 @@ void ATLASUnitTest()
 			cfg.atlas.kappaMax = 7.0f;
 			cfg.atlas.complementLrScale = 0.125f;
 			cfg.atlas.complementKappaMax = 0.75f;
+			cfg.atlas.prismEnabled = true;
+			cfg.atlas.prismLagHorizon = 2u;
+			cfg.atlas.prismMemoryScale = 0.20f;
+			cfg.atlas.prismPredictiveEdgeThreshold = 0.03f;
+			cfg.atlas.resolveEnabled = true;
+			cfg.atlas.resolveLagHorizon = 4u;
+			cfg.atlas.resolveMemoryScale = 0.10f;
+			cfg.atlas.resolvePredictiveEdgeThreshold = 0.04f;
+			cfg.atlas.heroEnabled = true;
+			cfg.atlas.heroLagHorizon = 4u;
+			cfg.atlas.heroMemoryScale = 0.10f;
+			cfg.atlas.heroEdgeThreshold = 0.10f;
+			cfg.atlas.cobaltEnabled = true;
+			cfg.atlas.cobaltLagHorizon = 4u;
+			cfg.atlas.cobaltMemoryScale = 0.08f;
+			cfg.atlas.cobaltEdgeThreshold = 0.10f;
+			cfg.atlas.birchEnabled = true;
+			cfg.atlas.birchPastHorizon = 3u;
+			cfg.atlas.birchFutureHorizon = 2u;
+			cfg.atlas.birchMemoryScale = 0.08f;
+			cfg.atlas.birchEdgeThreshold = 0.10f;
+			cfg.atlas.ghostEnabled = true;
+			cfg.atlas.ghostLagHorizon = 4u;
+			cfg.atlas.ghostMemoryScale = 0.05f;
+			cfg.atlas.ghostEdgeThreshold = 0.10f;
+			cfg.atlas.sparrowEnabled = true;
+			cfg.atlas.sparrowModeRank = 2u;
+			cfg.atlas.sparrowAutoModeGate = true;
+			cfg.atlas.sparrowMemoryScale = 0.05f;
+			cfg.atlas.sparrowEdgeThreshold = 0.10f;
+			cfg.atlas.sparrowSecondEdgeThreshold = 0.08f;
+			cfg.atlas.sparrowSecondEdgeFraction = 0.60f;
+			cfg.atlas.sparrowPoleMax = 0.95f;
+			cfg.atlas.orbitEnabled = true;
+			cfg.atlas.orbitMemoryScale = 0.04f;
+			cfg.atlas.orbitEdgeThreshold = 0.05f;
+			cfg.atlas.orbitPoleMax = 0.95f;
+			cfg.atlas.helmEnabled = true;
+			cfg.atlas.helmMemoryScale = 0.03f;
+			cfg.atlas.helmEdgeThreshold = 0.04f;
+			cfg.atlas.helmModeRank = 2u;
+			cfg.atlas.helmHiddenStackDepth = 2u;
+			cfg.atlas.helmPoleMax = 0.90f;
 			cfg.atlas.tSub = 50;
 		}
 
@@ -2448,6 +3944,92 @@ void ATLASUnitTest()
 			       kv["training.atlas.complementLrScale"] == "0.125");
 			ASSERT("==============ATLAS::StateCheckpoint ManifestComplementKappaMax Failed==============",
 			       kv["training.atlas.complementKappaMax"] == "0.75");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestPrismEnabled Failed==============",
+			       kv["training.atlas.prismEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestPrismLagHorizon Failed==============",
+			       kv["training.atlas.prismLagHorizon"] == "2");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestPrismMemoryScale Failed==============",
+			       kv["training.atlas.prismMemoryScale"] == "0.2");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestPrismEdgeThreshold Failed==============",
+			       kv["training.atlas.prismPredictiveEdgeThreshold"] == "0.03");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestResolveEnabled Failed==============",
+			       kv["training.atlas.resolveEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestResolveLagHorizon Failed==============",
+			       kv["training.atlas.resolveLagHorizon"] == "4");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestResolveMemoryScale Failed==============",
+			       kv["training.atlas.resolveMemoryScale"] == "0.1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestResolveEdgeThreshold Failed==============",
+			       kv["training.atlas.resolvePredictiveEdgeThreshold"] == "0.04");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHeroEnabled Failed==============",
+			       kv["training.atlas.heroEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHeroLagHorizon Failed==============",
+			       kv["training.atlas.heroLagHorizon"] == "4");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHeroMemoryScale Failed==============",
+			       kv["training.atlas.heroMemoryScale"] == "0.1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHeroEdgeThreshold Failed==============",
+			       kv["training.atlas.heroEdgeThreshold"] == "0.1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestCobaltEnabled Failed==============",
+			       kv["training.atlas.cobaltEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestCobaltLagHorizon Failed==============",
+			       kv["training.atlas.cobaltLagHorizon"] == "4");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestCobaltMemoryScale Failed==============",
+			       kv["training.atlas.cobaltMemoryScale"] == "0.08");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestCobaltEdgeThreshold Failed==============",
+			       kv["training.atlas.cobaltEdgeThreshold"] == "0.1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestBirchEnabled Failed==============",
+			       kv["training.atlas.birchEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestBirchPastHorizon Failed==============",
+			       kv["training.atlas.birchPastHorizon"] == "3");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestBirchFutureHorizon Failed==============",
+			       kv["training.atlas.birchFutureHorizon"] == "2");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestBirchMemoryScale Failed==============",
+			       kv["training.atlas.birchMemoryScale"] == "0.08");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestBirchEdgeThreshold Failed==============",
+			       kv["training.atlas.birchEdgeThreshold"] == "0.1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestGhostEnabled Failed==============",
+			       kv["training.atlas.ghostEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestGhostLagHorizon Failed==============",
+			       kv["training.atlas.ghostLagHorizon"] == "4");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestGhostMemoryScale Failed==============",
+			       kv["training.atlas.ghostMemoryScale"] == "0.05");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestGhostEdgeThreshold Failed==============",
+			       kv["training.atlas.ghostEdgeThreshold"] == "0.1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowEnabled Failed==============",
+			       kv["training.atlas.sparrowEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowModeRank Failed==============",
+			       kv["training.atlas.sparrowModeRank"] == "2");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowAutoModeGate Failed==============",
+			       kv["training.atlas.sparrowAutoModeGate"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowMemoryScale Failed==============",
+			       kv["training.atlas.sparrowMemoryScale"] == "0.05");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowEdgeThreshold Failed==============",
+			       kv["training.atlas.sparrowEdgeThreshold"] == "0.1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowSecondEdgeThreshold Failed==============",
+			       kv["training.atlas.sparrowSecondEdgeThreshold"] == "0.08");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowSecondEdgeFraction Failed==============",
+			       kv["training.atlas.sparrowSecondEdgeFraction"] == "0.6");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestSparrowPoleMax Failed==============",
+			       kv["training.atlas.sparrowPoleMax"] == "0.95");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestOrbitEnabled Failed==============",
+			       kv["training.atlas.orbitEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestOrbitMemoryScale Failed==============",
+			       kv["training.atlas.orbitMemoryScale"] == "0.04");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestOrbitEdgeThreshold Failed==============",
+			       kv["training.atlas.orbitEdgeThreshold"] == "0.05");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestOrbitPoleMax Failed==============",
+			       kv["training.atlas.orbitPoleMax"] == "0.95");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHelmEnabled Failed==============",
+			       kv["training.atlas.helmEnabled"] == "1");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHelmMemoryScale Failed==============",
+			       kv["training.atlas.helmMemoryScale"] == "0.03");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHelmEdgeThreshold Failed==============",
+			       kv["training.atlas.helmEdgeThreshold"] == "0.04");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHelmModeRank Failed==============",
+			       kv["training.atlas.helmModeRank"] == "2");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHelmHiddenStackDepth Failed==============",
+			       kv["training.atlas.helmHiddenStackDepth"] == "2");
+			ASSERT("==============ATLAS::StateCheckpoint ManifestHelmPoleMax Failed==============",
+			       kv["training.atlas.helmPoleMax"] == "0.9");
 			ASSERT("==============ATLAS::StateCheckpoint ManifestTSub Failed==============",
 			       kv["training.atlas.tSub"] == "50");
 
@@ -2460,6 +4042,49 @@ void ATLASUnitTest()
 				cfgMismatch.atlas.kappaMax = 9.0f;
 				cfgMismatch.atlas.complementLrScale = 0.2f;
 				cfgMismatch.atlas.complementKappaMax = 0.9f;
+				cfgMismatch.atlas.prismEnabled = false;
+				cfgMismatch.atlas.prismLagHorizon = 1u;
+				cfgMismatch.atlas.prismMemoryScale = 0.15f;
+				cfgMismatch.atlas.prismPredictiveEdgeThreshold = 0.07f;
+				cfgMismatch.atlas.resolveEnabled = false;
+				cfgMismatch.atlas.resolveLagHorizon = 2u;
+				cfgMismatch.atlas.resolveMemoryScale = 0.05f;
+				cfgMismatch.atlas.resolvePredictiveEdgeThreshold = 0.02f;
+				cfgMismatch.atlas.heroEnabled = false;
+				cfgMismatch.atlas.heroLagHorizon = 2u;
+				cfgMismatch.atlas.heroMemoryScale = 0.05f;
+				cfgMismatch.atlas.heroEdgeThreshold = 0.03f;
+				cfgMismatch.atlas.cobaltEnabled = false;
+				cfgMismatch.atlas.cobaltLagHorizon = 2u;
+				cfgMismatch.atlas.cobaltMemoryScale = 0.04f;
+				cfgMismatch.atlas.cobaltEdgeThreshold = 0.02f;
+				cfgMismatch.atlas.birchEnabled = false;
+				cfgMismatch.atlas.birchPastHorizon = 1u;
+				cfgMismatch.atlas.birchFutureHorizon = 1u;
+				cfgMismatch.atlas.birchMemoryScale = 0.03f;
+				cfgMismatch.atlas.birchEdgeThreshold = 0.02f;
+				cfgMismatch.atlas.ghostEnabled = false;
+				cfgMismatch.atlas.ghostLagHorizon = 2u;
+				cfgMismatch.atlas.ghostMemoryScale = 0.02f;
+				cfgMismatch.atlas.ghostEdgeThreshold = 0.03f;
+				cfgMismatch.atlas.sparrowEnabled = false;
+				cfgMismatch.atlas.sparrowModeRank = 1u;
+				cfgMismatch.atlas.sparrowAutoModeGate = false;
+				cfgMismatch.atlas.sparrowMemoryScale = 0.02f;
+				cfgMismatch.atlas.sparrowEdgeThreshold = 0.03f;
+				cfgMismatch.atlas.sparrowSecondEdgeThreshold = 0.02f;
+				cfgMismatch.atlas.sparrowSecondEdgeFraction = 0.40f;
+				cfgMismatch.atlas.sparrowPoleMax = 0.80f;
+				cfgMismatch.atlas.orbitEnabled = false;
+				cfgMismatch.atlas.orbitMemoryScale = 0.02f;
+				cfgMismatch.atlas.orbitEdgeThreshold = 0.02f;
+				cfgMismatch.atlas.orbitPoleMax = 0.80f;
+				cfgMismatch.atlas.helmEnabled = false;
+				cfgMismatch.atlas.helmMemoryScale = 0.02f;
+				cfgMismatch.atlas.helmEdgeThreshold = 0.02f;
+				cfgMismatch.atlas.helmModeRank = 1u;
+				cfgMismatch.atlas.helmHiddenStackDepth = 1u;
+				cfgMismatch.atlas.helmPoleMax = 0.80f;
 				cfgMismatch.atlas.tSub = 13u;
 				glades::NNetworkStatus stMismatch = netMismatch.loadCheckpoint(ckptName, diB);
 				ASSERT("==============ATLAS::StateCheckpoint MismatchLoadShouldFail==============", !stMismatch.ok());
@@ -2469,6 +4094,49 @@ void ATLASUnitTest()
 				       || stMismatch.message.find("training.atlas.kappaMax") != std::string::npos
 				       || stMismatch.message.find("training.atlas.complementLrScale") != std::string::npos
 				       || stMismatch.message.find("training.atlas.complementKappaMax") != std::string::npos
+				       || stMismatch.message.find("training.atlas.prismEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.prismLagHorizon") != std::string::npos
+				       || stMismatch.message.find("training.atlas.prismMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.prismPredictiveEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.resolveEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.resolveLagHorizon") != std::string::npos
+				       || stMismatch.message.find("training.atlas.resolveMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.resolvePredictiveEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.heroEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.heroLagHorizon") != std::string::npos
+				       || stMismatch.message.find("training.atlas.heroMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.heroEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.cobaltEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.cobaltLagHorizon") != std::string::npos
+				       || stMismatch.message.find("training.atlas.cobaltMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.cobaltEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.birchEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.birchPastHorizon") != std::string::npos
+				       || stMismatch.message.find("training.atlas.birchFutureHorizon") != std::string::npos
+				       || stMismatch.message.find("training.atlas.birchMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.birchEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.ghostEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.ghostLagHorizon") != std::string::npos
+				       || stMismatch.message.find("training.atlas.ghostMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.ghostEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowModeRank") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowAutoModeGate") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowSecondEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowSecondEdgeFraction") != std::string::npos
+				       || stMismatch.message.find("training.atlas.sparrowPoleMax") != std::string::npos
+				       || stMismatch.message.find("training.atlas.orbitEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.orbitMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.orbitEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.orbitPoleMax") != std::string::npos
+				       || stMismatch.message.find("training.atlas.helmEnabled") != std::string::npos
+				       || stMismatch.message.find("training.atlas.helmMemoryScale") != std::string::npos
+				       || stMismatch.message.find("training.atlas.helmEdgeThreshold") != std::string::npos
+				       || stMismatch.message.find("training.atlas.helmModeRank") != std::string::npos
+				       || stMismatch.message.find("training.atlas.helmHiddenStackDepth") != std::string::npos
+				       || stMismatch.message.find("training.atlas.helmPoleMax") != std::string::npos
 				       || stMismatch.message.find("training.atlas.tSub") != std::string::npos);
 			}
 
@@ -2487,6 +4155,92 @@ void ATLASUnitTest()
 			       fabsf(netB.getTrainingConfig().atlas.complementLrScale - 0.125f) < 1e-6f);
 			ASSERT("==============ATLAS::StateCheckpoint ComplementKappaMaxRestored Failed==============",
 			       fabsf(netB.getTrainingConfig().atlas.complementKappaMax - 0.75f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint PrismEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.prismEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint PrismLagHorizonRestored Failed==============",
+			       netB.getTrainingConfig().atlas.prismLagHorizon == 2u);
+			ASSERT("==============ATLAS::StateCheckpoint PrismMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.prismMemoryScale - 0.20f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint PrismEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.prismPredictiveEdgeThreshold - 0.03f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint ResolveEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.resolveEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint ResolveLagHorizonRestored Failed==============",
+			       netB.getTrainingConfig().atlas.resolveLagHorizon == 4u);
+			ASSERT("==============ATLAS::StateCheckpoint ResolveMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.resolveMemoryScale - 0.10f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint ResolveEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.resolvePredictiveEdgeThreshold - 0.04f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint HeroEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.heroEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint HeroLagHorizonRestored Failed==============",
+			       netB.getTrainingConfig().atlas.heroLagHorizon == 4u);
+			ASSERT("==============ATLAS::StateCheckpoint HeroMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.heroMemoryScale - 0.10f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint HeroEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.heroEdgeThreshold - 0.10f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint CobaltEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.cobaltEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint CobaltLagHorizonRestored Failed==============",
+			       netB.getTrainingConfig().atlas.cobaltLagHorizon == 4u);
+			ASSERT("==============ATLAS::StateCheckpoint CobaltMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.cobaltMemoryScale - 0.08f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint CobaltEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.cobaltEdgeThreshold - 0.10f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint BirchEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.birchEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint BirchPastHorizonRestored Failed==============",
+			       netB.getTrainingConfig().atlas.birchPastHorizon == 3u);
+			ASSERT("==============ATLAS::StateCheckpoint BirchFutureHorizonRestored Failed==============",
+			       netB.getTrainingConfig().atlas.birchFutureHorizon == 2u);
+			ASSERT("==============ATLAS::StateCheckpoint BirchMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.birchMemoryScale - 0.08f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint BirchEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.birchEdgeThreshold - 0.10f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint GhostEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.ghostEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint GhostLagHorizonRestored Failed==============",
+			       netB.getTrainingConfig().atlas.ghostLagHorizon == 4u);
+			ASSERT("==============ATLAS::StateCheckpoint GhostMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.ghostMemoryScale - 0.05f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint GhostEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.ghostEdgeThreshold - 0.10f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.sparrowEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowModeRankRestored Failed==============",
+			       netB.getTrainingConfig().atlas.sparrowModeRank == 2u);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowAutoModeGateRestored Failed==============",
+			       netB.getTrainingConfig().atlas.sparrowAutoModeGate);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.sparrowMemoryScale - 0.05f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.sparrowEdgeThreshold - 0.10f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowSecondEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.sparrowSecondEdgeThreshold - 0.08f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowSecondEdgeFractionRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.sparrowSecondEdgeFraction - 0.60f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint SparrowPoleMaxRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.sparrowPoleMax - 0.95f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint OrbitEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.orbitEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint OrbitMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.orbitMemoryScale - 0.04f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint OrbitEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.orbitEdgeThreshold - 0.05f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint OrbitPoleMaxRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.orbitPoleMax - 0.95f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint HelmEnabledRestored Failed==============",
+			       netB.getTrainingConfig().atlas.helmEnabled);
+			ASSERT("==============ATLAS::StateCheckpoint HelmMemoryScaleRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.helmMemoryScale - 0.03f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint HelmEdgeThresholdRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.helmEdgeThreshold - 0.04f) < 1e-6f);
+			ASSERT("==============ATLAS::StateCheckpoint HelmModeRankRestored Failed==============",
+			       netB.getTrainingConfig().atlas.helmModeRank == 2u);
+			ASSERT("==============ATLAS::StateCheckpoint HelmHiddenStackDepthRestored Failed==============",
+			       netB.getTrainingConfig().atlas.helmHiddenStackDepth == 2u);
+			ASSERT("==============ATLAS::StateCheckpoint HelmPoleMaxRestored Failed==============",
+			       fabsf(netB.getTrainingConfig().atlas.helmPoleMax - 0.90f) < 1e-6f);
 			ASSERT("==============ATLAS::StateCheckpoint TSubRestored Failed==============",
 			       netB.getTrainingConfig().atlas.tSub == 50u);
 			netB.getTerminatorMutable().setEpoch(50);
@@ -3077,10 +4831,10 @@ void ATLASUnitTest()
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
 	// ---------------------------------------------------------------
-	// Test 28E: adaptive complement rank births only materially large modes
+	// Test 28E: adaptive complement rank promotes only after Kelly probation
 	// ---------------------------------------------------------------
 	printf("-----------------------------------\n");
-	printf("ATLAS Test 28E: adaptive complement rank births large residual modes only\n");
+	printf("ATLAS Test 28E: adaptive complement rank promotes stable modes after probation\n");
 	printf("-----------------------------------\n");
 	{
 		const unsigned int m = 24;
@@ -3120,7 +4874,7 @@ void ATLASUnitTest()
 		state.complementBlock[15] = 0.25f;
 		state.complementFisher = 26.25f;
 		state.totalTrace = 27.25f;
-		state.step = 1ULL;
+		state.step = 2ULL;
 
 		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
 		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
@@ -3134,26 +4888,64 @@ void ATLASUnitTest()
 		acAdaptive.muMax = 0.0f;
 		acAdaptive.tSub = 0u;
 
+		std::fill(gW.begin(), gW.end(), 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+		}
 		bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
 		                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
 		                                   acAdaptive, rng, 0, "cnn.fc");
 		ASSERT("==============ATLAS::AdaptiveComplementRank first applyStep failed==============", ok);
-		ASSERT("==============ATLAS::AdaptiveComplementRank should birth first mode==============",
-		       state.activeComplementRank == 1u);
+		ASSERT("==============ATLAS::AdaptiveComplementRank should keep first mode on probation==============",
+		       state.activeComplementRank == 0u);
+		ASSERT("==============ATLAS::AdaptiveComplementRank should start first probation==============",
+		       state.trialComplementRank == 1u && state.trialComplementWins == 1u);
+		std::fill(gW.begin(), gW.end(), 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+		}
 		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
 		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
 		                              acAdaptive, rng, 0, "cnn.fc");
 		ASSERT("==============ATLAS::AdaptiveComplementRank second applyStep failed==============", ok);
-		ASSERT("==============ATLAS::AdaptiveComplementRank should birth second mode only==============",
+		ASSERT("==============ATLAS::AdaptiveComplementRank should promote first stable mode==============",
+		       state.activeComplementRank == 1u);
+		ASSERT("==============ATLAS::AdaptiveComplementRank should clear first probation after promotion==============",
+		       state.trialComplementRank == 0u);
+		std::fill(gW.begin(), gW.end(), 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[3u * n + j] = 3.0f;
+		}
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acAdaptive, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementRank third applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementRank should start second probation==============",
+		       state.activeComplementRank == 1u
+		       && state.trialComplementRank == 2u
+		       && state.trialComplementWins == 1u);
+		std::fill(gW.begin(), gW.end(), 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[3u * n + j] = 3.0f;
+		}
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acAdaptive, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementRank fourth applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementRank should promote second stable mode==============",
 		       state.activeComplementRank == 2u);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
 	// ---------------------------------------------------------------
-	// Test 28F: scout signal can birth before the EMA block catches up
+	// Test 28F: scout signal stays on probation while uncertainty is high
 	// ---------------------------------------------------------------
 	printf("-----------------------------------\n");
-	printf("ATLAS Test 28F: complement scout births on fresh residual evidence\n");
+	printf("ATLAS Test 28F: complement scout stays on probation under high uncertainty\n");
 	printf("-----------------------------------\n");
 	{
 		const unsigned int m = 24;
@@ -3209,14 +5001,99 @@ void ATLASUnitTest()
 		acScout.muMax = 0.0f;
 		acScout.tSub = 0u;
 
-		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
-		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
-		                                         acScout, rng, 0, "cnn.fc");
-		ASSERT("==============ATLAS::AdaptiveComplementScout applyStep failed==============", ok);
-		printf("[UT] ATLAS scout complement: activeRank=%u totalTrace=%f complementFisher=%f sigma2=%f\n",
-		       state.activeComplementRank, state.totalTrace, state.complementFisher, state.sigma2);
-		ASSERT("==============ATLAS::AdaptiveComplementScout should birth from scout signal==============",
-		       state.activeComplementRank == 1u);
+		bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                   acScout, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementScout first applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementScout should open probation from scout signal==============",
+		       state.activeComplementRank == 0u
+		       && state.trialComplementRank == 1u);
+		for (unsigned int j = 0; j < n; ++j)
+			gW[2 * n + j] = 12.0f;
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acScout, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementScout second applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementScout should stay on probation while uncertainty remains high==============",
+		       state.activeComplementRank == 0u
+		       && state.trialComplementRank == 1u);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 28G: misaligned scout directions are rejected by the Kelly gate
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 28G: misaligned scout directions are rejected\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 28282834ULL);
+		glades::atlas::WeightState state;
+		glades::atlas::initWeightState(state, m, n, r, 0.0f, rng);
+
+		state.activeRank = r;
+		state.complementRank = 4u;
+		state.activeComplementRank = 0u;
+		state.V.assign(static_cast<size_t>(m) * state.complementRank, 0.0f);
+		state.complementBlock.assign(static_cast<size_t>(state.complementRank) * state.complementRank, 0.0f);
+		state.prevGv.assign(static_cast<size_t>(state.complementRank) * n, 0.0f);
+		state.scratch_gv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_correctedV.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_V_old.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_Bv.resize(static_cast<size_t>(state.complementRank) * n);
+		state.scratch_Zv.resize(static_cast<size_t>(m) * state.complementRank);
+		state.scratch_complementMat.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVec.resize(static_cast<size_t>(state.complementRank) * state.complementRank);
+		state.scratch_complementEigVal.resize(state.complementRank);
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+		state.fisherDiag[0] = 1.0f;
+		state.fisherDiag[1] = 0.0f;
+		state.complementBlock[0] = 16.0f;
+		state.complementBlock[5] = 4.0f;
+		state.complementBlock[10] = 1.0f;
+		state.complementBlock[15] = 0.25f;
+		state.complementFisher = 21.25f;
+		state.totalTrace = 22.25f;
+		state.step = 2ULL;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+			gW[3u * n + j] = 12.0f;
+
+		glades::ATLASConfig acReject;
+		acReject.rank = r;
+		acReject.complementRank = 4u;
+		acReject.beta = 1.0f;
+		acReject.biasCorrection = false;
+		acReject.muMin = 0.0f;
+		acReject.muMax = 0.0f;
+		acReject.tSub = 0u;
+
+		bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                   acReject, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementReject first applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementReject should reject misaligned scout mode==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		for (unsigned int j = 0; j < n; ++j)
+			gW[3u * n + j] = 12.0f;
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acReject, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::AdaptiveComplementReject second applyStep failed==============", ok);
+		ASSERT("==============ATLAS::AdaptiveComplementReject should still reject misaligned scout mode==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
@@ -3373,6 +5250,724 @@ void ATLASUnitTest()
 		       r, state.activeRank, nSteps);
 		ASSERT("==============ATLAS::AdaptiveRank did not shrink==============",
 		       state.activeRank < r);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	printf("\n============================================================\n");
+}
+
+void ATLASControllerUnitTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS Complement Controller Unit Test Suite\n");
+	printf("============================================================\n");
+
+	// ---------------------------------------------------------------
+	// Test C1: adaptive complement rank promotes only after Kelly probation
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C1: probation before promotion\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+			glades::rng::Engine rng;
+			glades::rng::seed_engine(rng, 38282832ULL);
+			glades::atlas::WeightState state;
+			prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+			std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.complementBlock.begin(), state.complementBlock.end(), 0.0f);
+		std::fill(state.prevGv.begin(), state.prevGv.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+		state.fisherDiag[0] = 1.0f;
+		state.fisherDiag[1] = 0.0f;
+		state.complementBlock[0] = 16.0f;
+		state.complementBlock[5] = 9.0f;
+		state.complementBlock[10] = 1.0f;
+		state.complementBlock[15] = 0.25f;
+		state.complementFisher = 26.25f;
+		state.totalTrace = 27.25f;
+		state.step = 2ULL;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+
+		glades::ATLASConfig acAdaptive;
+		acAdaptive.rank = r;
+		acAdaptive.complementRank = 4u;
+		acAdaptive.beta = 1.0f;
+		acAdaptive.biasCorrection = false;
+		acAdaptive.muMin = 0.0f;
+		acAdaptive.muMax = 0.0f;
+		acAdaptive.tSub = 0u;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+		}
+			bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+			                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+			                                   acAdaptive, rng, 0, "cnn.fc");
+				ASSERT("==============ATLAS::ControllerProbation first applyStep failed==============", ok);
+				ASSERT("==============ATLAS::ControllerProbation first applyStep should preserve storage==============",
+				       atlas_storage_shapes_ok(state, m, n, r, 4u));
+				ASSERT("==============ATLAS::ControllerProbation should keep first mode on probation==============",
+				       state.activeComplementRank == 0u
+				       && state.trialComplementRank == 1u);
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+		}
+			ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+			                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+			                              acAdaptive, rng, 0, "cnn.fc");
+			ASSERT("==============ATLAS::ControllerProbation second applyStep failed==============", ok);
+			ASSERT("==============ATLAS::ControllerProbation second applyStep should preserve storage==============",
+			       atlas_storage_shapes_ok(state, m, n, r, 4u));
+			ASSERT("==============ATLAS::ControllerProbation should promote first stable mode==============",
+			       state.activeComplementRank == 1u && state.trialComplementRank == 0u);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C2: scout signal stays on probation until EMA confirmation catches up
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C2: scout evidence stays on probation\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282833ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.complementBlock.begin(), state.complementBlock.end(), 0.0f);
+		std::fill(state.prevGv.begin(), state.prevGv.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+		state.fisherDiag[0] = 1.0f;
+		state.fisherDiag[1] = 0.0f;
+		state.complementBlock[0] = 0.05f;
+		state.complementBlock[5] = 0.02f;
+		state.complementBlock[10] = 0.01f;
+		state.complementBlock[15] = 0.005f;
+		state.complementFisher = 0.085f;
+		state.totalTrace = 8.0f;
+		state.step = 199ULL;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+			gW[2u * n + j] = 12.0f;
+
+		glades::ATLASConfig acScout;
+		acScout.rank = r;
+		acScout.complementRank = 4u;
+		acScout.beta = 0.999f;
+		acScout.biasCorrection = false;
+		acScout.muMin = 0.0f;
+		acScout.muMax = 0.0f;
+		acScout.tSub = 0u;
+
+		bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                   acScout, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerScout first applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerScout should open probation from scout signal==============",
+		       state.activeComplementRank == 0u
+		       && state.trialComplementRank == 1u);
+
+		for (unsigned int j = 0; j < n; ++j)
+			gW[2u * n + j] = 12.0f;
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acScout, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerScout second applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerScout should stay on probation while uncertainty remains high==============",
+		       state.activeComplementRank == 0u
+		       && state.trialComplementRank == 1u);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C4: transported q=2 scout should keep rotated residual evidence
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C4: rotated scout subspace remains promotable\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282835ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.complementBlock.begin(), state.complementBlock.end(), 0.0f);
+		std::fill(state.prevGv.begin(), state.prevGv.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+		state.fisherDiag[0] = 1.0f;
+		state.fisherDiag[1] = 0.0f;
+		state.complementBlock[0] = 16.0f;
+		state.complementBlock[5] = 1.0f;
+		state.complementBlock[10] = 0.25f;
+		state.complementBlock[15] = 0.0625f;
+		state.complementFisher = 17.3125f;
+		state.totalTrace = 18.3125f;
+		state.step = 2ULL;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+			gW[3u * n + j] = 4.0f;
+		}
+
+		glades::ATLASConfig acRotated;
+		acRotated.rank = r;
+		acRotated.complementRank = 4u;
+		acRotated.beta = 1.0f;
+		acRotated.biasCorrection = false;
+		acRotated.muMin = 0.0f;
+		acRotated.muMax = 0.0f;
+		acRotated.tSub = 0u;
+
+		bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                   acRotated, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerRotated first applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerRotated should open probation from rotated q2 scout==============",
+		       state.activeComplementRank == 0u
+		       && state.trialComplementRank == 1u
+		       && state.trialComplementMean > 0.0f);
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+			gW[3u * n + j] = 4.0f;
+		}
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acRotated, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerRotated second applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerRotated should promote rotated residual mode==============",
+		       state.activeComplementRank == 1u && state.trialComplementRank == 0u);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C5: PRISM predictive-edge gate suppresses low-persistence complement births
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C5: PRISM predictive-edge gate blocks stale complement modes\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282836ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.prevGv.begin(), state.prevGv.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+			gW[3u * n + j] = 3.0f;
+		}
+
+		glades::ATLASConfig acPrismGate;
+		acPrismGate.rank = r;
+		acPrismGate.complementRank = 4u;
+		acPrismGate.beta = 1.0f;
+		acPrismGate.biasCorrection = false;
+		acPrismGate.muMin = 0.0f;
+		acPrismGate.muMax = 0.0f;
+		acPrismGate.tSub = 0u;
+		acPrismGate.prismEnabled = true;
+		acPrismGate.prismPredictiveEdgeThreshold = 0.05f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acPrismGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerPrismGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerPrismGate should suppress stale complement probation==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerPrismGate predictive edge should stay subcritical==============",
+		       state.lastPredictiveEdge < acPrismGate.prismPredictiveEdgeThreshold);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C6: PRISM active memory shrinks the subspace correction on aligned histories
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C6: PRISM active memory damps aligned active corrections\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282837ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState prismState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		prismState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			baseState.prevGz[0u * n + j] = 4.0f;
+			baseState.prevGz[1u * n + j] = 2.0f;
+			baseState.prevPrevGz[0u * n + j] = 3.5f;
+			baseState.prevPrevGz[1u * n + j] = 1.75f;
+		}
+		prismState.prevGz = baseState.prevGz;
+		prismState.prevPrevGz = baseState.prevPrevGz;
+
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> WPrism(static_cast<size_t>(m) * n, 0.0f);
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acPrism = acBase;
+		acPrism.prismEnabled = true;
+		acPrism.prismLagHorizon = 2u;
+		acPrism.prismMemoryScale = 0.5f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gW[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerPrismMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(prismState, &WPrism[0], &gW[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acPrism, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerPrismMemory prism applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double prismCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			const double prismCorrection =
+			    static_cast<double>(WPrism[idx])
+			    + static_cast<double>(prismState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			prismCorrectionNormSq += prismCorrection * prismCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerPrismMemory should reduce active correction energy==============",
+		       prismCorrectionNormSq < baseCorrectionNormSq);
+		ASSERT("==============ATLAS::ControllerPrismMemory memory diagnostic should remain finite==============",
+		       prismState.lastMemoryGain == prismState.lastMemoryGain);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C7: RESOLVE transfer-edge gate suppresses stale complement births
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C7: RESOLVE transfer-edge gate blocks stale complement modes\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282838ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.resolveGzHistory.begin(), state.resolveGzHistory.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+			gW[3u * n + j] = 3.0f;
+		}
+
+		glades::ATLASConfig acResolveGate;
+		acResolveGate.rank = r;
+		acResolveGate.complementRank = 4u;
+		acResolveGate.beta = 1.0f;
+		acResolveGate.biasCorrection = false;
+		acResolveGate.muMin = 0.0f;
+		acResolveGate.muMax = 0.0f;
+		acResolveGate.tSub = 0u;
+		acResolveGate.resolveEnabled = true;
+		acResolveGate.resolveLagHorizon = 4u;
+		acResolveGate.resolvePredictiveEdgeThreshold = 0.05f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acResolveGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerResolveGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerResolveGate should suppress stale complement probation==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerResolveGate transfer edge should stay subcritical==============",
+		       state.lastResolveEdge < acResolveGate.resolvePredictiveEdgeThreshold);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C8: RESOLVE active memory shrinks the subspace correction on aligned histories
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C8: RESOLVE active memory damps aligned active corrections\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282839ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState resolveState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		resolveState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			resolveState.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			resolveState.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			resolveState.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			resolveState.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			resolveState.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			resolveState.resolveGzHistory[2u * r * n + 1u * n + j] = 1.5f;
+			resolveState.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			resolveState.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+		}
+
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> WResolve(static_cast<size_t>(m) * n, 0.0f);
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acResolve = acBase;
+		acResolve.resolveEnabled = true;
+		acResolve.resolveLagHorizon = 4u;
+		acResolve.resolveMemoryScale = 0.20f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gW[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerResolveMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(resolveState, &WResolve[0], &gW[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acResolve, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerResolveMemory resolve applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double resolveCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			const double resolveCorrection =
+			    static_cast<double>(WResolve[idx])
+			    + static_cast<double>(resolveState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			resolveCorrectionNormSq += resolveCorrection * resolveCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerResolveMemory should reduce active correction energy==============",
+		       resolveCorrectionNormSq < baseCorrectionNormSq);
+	ASSERT("==============ATLAS::ControllerResolveMemory memory diagnostic should remain finite==============",
+	       resolveState.lastResolveMemoryGain == resolveState.lastResolveMemoryGain);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C9: HERO Hankel-edge gate suppresses stale complement births
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C9: HERO Hankel-edge gate blocks stale complement modes\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282840ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.heroGwHistory.begin(), state.heroGwHistory.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[2u * n + j] = 4.0f;
+			gW[3u * n + j] = 3.0f;
+		}
+
+		glades::ATLASConfig acHeroGate;
+		acHeroGate.rank = r;
+		acHeroGate.complementRank = 4u;
+		acHeroGate.beta = 1.0f;
+		acHeroGate.biasCorrection = false;
+		acHeroGate.muMin = 0.0f;
+		acHeroGate.muMax = 0.0f;
+		acHeroGate.tSub = 0u;
+		acHeroGate.heroEnabled = true;
+		acHeroGate.heroLagHorizon = 4u;
+		acHeroGate.heroEdgeThreshold = 0.10f;
+
+		const bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                         1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                         acHeroGate, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerHeroGate applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerHeroGate should suppress stale complement probation==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+		ASSERT("==============ATLAS::ControllerHeroGate Hankel edge should stay subcritical==============",
+		       state.lastHeroEdge < acHeroGate.heroEdgeThreshold);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C10: HERO active memory shrinks the subspace correction on aligned histories
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C10: HERO active memory damps aligned active corrections\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 4;
+		const unsigned int n = 4;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282841ULL);
+		glades::atlas::WeightState baseState;
+		glades::atlas::initWeightState(baseState, m, n, r, 0.0f, rng);
+		glades::atlas::WeightState heroState = baseState;
+
+		std::fill(baseState.U.begin(), baseState.U.end(), 0.0f);
+		baseState.U[0] = 1.0f;
+		baseState.U[baseState.r + 1] = 1.0f;
+		heroState.U = baseState.U;
+
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			heroState.resolveGzHistory[0u * r * n + 0u * n + j] = 4.0f;
+			heroState.resolveGzHistory[0u * r * n + 1u * n + j] = 2.0f;
+			heroState.resolveGzHistory[1u * r * n + 0u * n + j] = 3.5f;
+			heroState.resolveGzHistory[1u * r * n + 1u * n + j] = 1.75f;
+			heroState.resolveGzHistory[2u * r * n + 0u * n + j] = 3.0f;
+			heroState.resolveGzHistory[2u * r * n + 1u * n + j] = 1.5f;
+			heroState.resolveGzHistory[3u * r * n + 0u * n + j] = 2.5f;
+			heroState.resolveGzHistory[3u * r * n + 1u * n + j] = 1.25f;
+		}
+
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			gW[0u * n + j] = 4.0f;
+			gW[1u * n + j] = 2.0f;
+			gW[2u * n + j] = 1.0f;
+			gW[3u * n + j] = 1.0f;
+		}
+		std::vector<float> WBase(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> WHero(static_cast<size_t>(m) * n, 0.0f);
+
+		glades::ATLASConfig acBase;
+		acBase.rank = r;
+		acBase.complementRank = 0u;
+		acBase.beta = 0.0f;
+		acBase.biasCorrection = false;
+		acBase.muMin = 0.0f;
+		acBase.muMax = 0.0f;
+		acBase.tSub = 0u;
+
+		glades::ATLASConfig acHero = acBase;
+		acHero.heroEnabled = true;
+		acHero.heroLagHorizon = 4u;
+		acHero.heroMemoryScale = 0.20f;
+
+		bool ok = glades::atlas::applyStep(baseState, &WBase[0], &gW[0], m, n,
+		                                   1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                   acBase, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerHeroMemory base applyStep failed==============", ok);
+		ok = glades::atlas::applyStep(heroState, &WHero[0], &gW[0], m, n,
+		                              1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                              acHero, rng, 0, 0);
+		ASSERT("==============ATLAS::ControllerHeroMemory hero applyStep failed==============", ok);
+
+		double baseCorrectionNormSq = 0.0;
+		double heroCorrectionNormSq = 0.0;
+		for (size_t idx = 0; idx < WBase.size(); ++idx)
+		{
+			const double baseCorrection =
+			    static_cast<double>(WBase[idx])
+			    + static_cast<double>(baseState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			const double heroCorrection =
+			    static_cast<double>(WHero[idx])
+			    + static_cast<double>(heroState.lastBaselineRate) * static_cast<double>(gW[idx]);
+			baseCorrectionNormSq += baseCorrection * baseCorrection;
+			heroCorrectionNormSq += heroCorrection * heroCorrection;
+		}
+		ASSERT("==============ATLAS::ControllerHeroMemory should reduce active correction energy==============",
+		       heroCorrectionNormSq < baseCorrectionNormSq);
+		ASSERT("==============ATLAS::ControllerHeroMemory memory diagnostic should remain finite==============",
+		       heroState.lastHeroMemoryGain == heroState.lastHeroMemoryGain);
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test C3: misaligned scout directions are rejected
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Controller Test C3: misaligned scout rejection\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int m = 24;
+		const unsigned int n = 24;
+		const unsigned int r = 2;
+
+		glades::rng::Engine rng;
+		glades::rng::seed_engine(rng, 38282834ULL);
+		glades::atlas::WeightState state;
+		prepare_atlas_complement_test_state(state, rng, m, n, r, 4u, "cnn.fc");
+
+		std::fill(state.U.begin(), state.U.end(), 0.0f);
+		std::fill(state.V.begin(), state.V.end(), 0.0f);
+		std::fill(state.complementBlock.begin(), state.complementBlock.end(), 0.0f);
+		std::fill(state.prevGv.begin(), state.prevGv.end(), 0.0f);
+		state.U[0] = 1.0f;
+		state.U[state.r + 1] = 1.0f;
+		for (unsigned int c = 0; c < state.complementRank; ++c)
+			state.V[(c + 2u) * state.complementRank + c] = 1.0f;
+		state.fisherDiag[0] = 1.0f;
+		state.fisherDiag[1] = 0.0f;
+		state.complementBlock[0] = 16.0f;
+		state.complementBlock[5] = 4.0f;
+		state.complementBlock[10] = 1.0f;
+		state.complementBlock[15] = 0.25f;
+		state.complementFisher = 21.25f;
+		state.totalTrace = 22.25f;
+		state.step = 2ULL;
+
+		std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+		std::vector<float> gW(static_cast<size_t>(m) * n, 0.0f);
+		for (unsigned int j = 0; j < n; ++j)
+			gW[3u * n + j] = 12.0f;
+
+		glades::ATLASConfig acReject;
+		acReject.rank = r;
+		acReject.complementRank = 4u;
+		acReject.beta = 1.0f;
+		acReject.biasCorrection = false;
+		acReject.muMin = 0.0f;
+		acReject.muMax = 0.0f;
+		acReject.tSub = 0u;
+
+		bool ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                                   1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                                   acReject, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerReject first applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerReject should reject misaligned scout mode==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
+
+		for (unsigned int j = 0; j < n; ++j)
+			gW[3u * n + j] = 12.0f;
+		ok = glades::atlas::applyStep(state, &W[0], &gW[0], m, n,
+		                              1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+		                              acReject, rng, 0, "cnn.fc");
+		ASSERT("==============ATLAS::ControllerReject second applyStep failed==============", ok);
+		ASSERT("==============ATLAS::ControllerReject should still reject misaligned scout mode==============",
+		       state.activeComplementRank == 0u && state.trialComplementRank == 0u);
 	}
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 

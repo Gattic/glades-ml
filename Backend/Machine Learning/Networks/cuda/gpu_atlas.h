@@ -36,6 +36,8 @@ struct GpuAtlasWeightState
 	unsigned int r;     // subspace rank
 	unsigned int complementRank; // allocated complement-block rank (>= 1 for storage)
 	unsigned int activeComplementRank; // runtime active residual rank (<= complementRank)
+	unsigned int trialComplementRank; // probationary target rank awaiting promotion
+	unsigned int trialComplementWins; // consecutive accepted control boundaries
 	bool rightSubspace; // true when m > n (use right singular vectors)
 
 	// subDim = min(m,n): dimension the subspace basis lives in
@@ -78,15 +80,19 @@ struct GpuAtlasWeightState
 	// Host-side scalars (passed to kernels as parameters, updated on host)
 	float totalTrace;
 	float sigma2;
+	float trialComplementMean;
+	float trialComplementVar;
 	float mu;
 	unsigned long long step;
 	bool initialized;
 	float lastBaselineRate;
 
 	GpuAtlasWeightState()
-	    : m(0u), n(0u), r(0u), complementRank(0u), activeComplementRank(0u), rightSubspace(false),
+	    : m(0u), n(0u), r(0u), complementRank(0u), activeComplementRank(0u),
+	      trialComplementRank(0u), trialComplementWins(0u), rightSubspace(false),
 	      refreshAllocated(false),
-	      totalTrace(0.0f), sigma2(0.0f), mu(0.01f), step(0ULL), initialized(false),
+	      totalTrace(0.0f), sigma2(0.0f), trialComplementMean(0.0f), trialComplementVar(0.0f),
+	      mu(0.01f), step(0ULL), initialized(false),
 	      lastBaselineRate(0.0f)
 	{
 	}

@@ -600,6 +600,70 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.atlas.kappaMax", f)) { cfg.atlas.kappaMax = f; any = true; }
 	if (parse_float(kv, "training.atlas.complementLrScale", f)) { cfg.atlas.complementLrScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.complementKappaMax", f)) { cfg.atlas.complementKappaMax = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.prismEnabled", b)) { cfg.atlas.prismEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.prismLagHorizon", i) && i >= 0) { cfg.atlas.prismLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.prismMemoryScale", f)) { cfg.atlas.prismMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.prismPredictiveEdgeThreshold", f)) { cfg.atlas.prismPredictiveEdgeThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.resolveEnabled", b)) { cfg.atlas.resolveEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.resolveLagHorizon", i) && i >= 0) { cfg.atlas.resolveLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.resolveMemoryScale", f)) { cfg.atlas.resolveMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.resolvePredictiveEdgeThreshold", f)) { cfg.atlas.resolvePredictiveEdgeThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.heroEnabled", b)) { cfg.atlas.heroEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.heroLagHorizon", i) && i >= 0) { cfg.atlas.heroLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.heroMemoryScale", f)) { cfg.atlas.heroMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.heroEdgeThreshold", f)) { cfg.atlas.heroEdgeThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.cobaltEnabled", b)) { cfg.atlas.cobaltEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.cobaltLagHorizon", i) && i >= 0) { cfg.atlas.cobaltLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.cobaltMemoryScale", f)) { cfg.atlas.cobaltMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.cobaltEdgeThreshold", f)) { cfg.atlas.cobaltEdgeThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.birchEnabled", b)) { cfg.atlas.birchEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.birchPastHorizon", i) && i >= 0) { cfg.atlas.birchPastHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.birchFutureHorizon", i) && i >= 0) { cfg.atlas.birchFutureHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.birchMemoryScale", f)) { cfg.atlas.birchMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.birchEdgeThreshold", f)) { cfg.atlas.birchEdgeThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.ghostEnabled", b)) { cfg.atlas.ghostEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.ghostLagHorizon", i) && i >= 0) { cfg.atlas.ghostLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.ghostMemoryScale", f)) { cfg.atlas.ghostMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.ghostEdgeThreshold", f)) { cfg.atlas.ghostEdgeThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.sparrowEnabled", b)) { cfg.atlas.sparrowEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.sparrowModeRank", i) && i >= 0) { cfg.atlas.sparrowModeRank = static_cast<unsigned int>(i); any = true; }
+	if (parse_bool01(kv, "training.atlas.sparrowAutoModeGate", b)) { cfg.atlas.sparrowAutoModeGate = b; any = true; }
+	if (parse_float(kv, "training.atlas.sparrowMemoryScale", f)) { cfg.atlas.sparrowMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.sparrowEdgeThreshold", f)) { cfg.atlas.sparrowEdgeThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.sparrowSecondEdgeThreshold", f)) { cfg.atlas.sparrowSecondEdgeThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.sparrowSecondEdgeFraction", f)) { cfg.atlas.sparrowSecondEdgeFraction = f; any = true; }
+	if (parse_float(kv, "training.atlas.sparrowPoleMax", f)) { cfg.atlas.sparrowPoleMax = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.qbrtEnabled", b)) { cfg.atlas.qbrtEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.qbrtLagHorizon", i) && i >= 0) { cfg.atlas.qbrtLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.qbrtMemoryScale", f)) { cfg.atlas.qbrtMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.qbrtEdgeThreshold", f)) { cfg.atlas.qbrtEdgeThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.qbrtPoleMax", f)) { cfg.atlas.qbrtPoleMax = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.qrcEnabled", b)) { cfg.atlas.qrcEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.qrcLagHorizon", i) && i >= 0) { cfg.atlas.qrcLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.qrcMemoryScale", f)) { cfg.atlas.qrcMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.qrcEdgeThreshold", f)) { cfg.atlas.qrcEdgeThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.qrcPoleMax", f)) { cfg.atlas.qrcPoleMax = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.riftEnabled", b)) { cfg.atlas.riftEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.riftLagHorizon", i) && i >= 0) { cfg.atlas.riftLagHorizon = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.riftMemoryScale", f)) { cfg.atlas.riftMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.riftEdgeThreshold", f)) { cfg.atlas.riftEdgeThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.riftPoleMax", f)) { cfg.atlas.riftPoleMax = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.orbitEnabled", b)) { cfg.atlas.orbitEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.orbitMemoryScale", f)) { cfg.atlas.orbitMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.orbitEdgeThreshold", f)) { cfg.atlas.orbitEdgeThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.orbitPoleMax", f)) { cfg.atlas.orbitPoleMax = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.helmEnabled", b)) { cfg.atlas.helmEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.helmMemoryScale", f)) { cfg.atlas.helmMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.helmEdgeThreshold", f)) { cfg.atlas.helmEdgeThreshold = f; any = true; }
+	if (parse_int(kv, "training.atlas.helmModeRank", i) && i >= 0) { cfg.atlas.helmModeRank = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.helmHiddenStackDepth", i) && i >= 0) { cfg.atlas.helmHiddenStackDepth = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.helmPoleMax", f)) { cfg.atlas.helmPoleMax = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.asterEnabled", b)) { cfg.atlas.asterEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.asterMemoryScale", f)) { cfg.atlas.asterMemoryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.asterEdgeThreshold", f)) { cfg.atlas.asterEdgeThreshold = f; any = true; }
+	if (parse_int(kv, "training.atlas.asterStateRank", i) && i >= 0) { cfg.atlas.asterStateRank = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.asterHiddenStackDepth", i) && i >= 0) { cfg.atlas.asterHiddenStackDepth = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.asterPoleMax", f)) { cfg.atlas.asterPoleMax = f; any = true; }
 	if (parse_int(kv, "training.atlas.tSub", i) && i >= 0) { cfg.atlas.tSub = static_cast<unsigned int>(i); any = true; }
 
 	if (parse_int(kv, "training.lrSchedule.type", i)) { cfg.lrSchedule.type = static_cast<glades::LearningRateScheduleConfig::Type>(i); any = true; }
@@ -959,6 +1023,140 @@ static bool write_manifest(const std::string& manifestPath,
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.complementKappaMax; write_kv(out, "training.atlas.complementKappaMax", oss.str());
 	}
+	write_kv(out, "training.atlas.prismEnabled", trainingConfig.atlas.prismEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.prismLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.prismLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.prismMemoryScale; write_kv(out, "training.atlas.prismMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.prismPredictiveEdgeThreshold; write_kv(out, "training.atlas.prismPredictiveEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.resolveEnabled", trainingConfig.atlas.resolveEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.resolveLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.resolveLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.resolveMemoryScale; write_kv(out, "training.atlas.resolveMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.resolvePredictiveEdgeThreshold; write_kv(out, "training.atlas.resolvePredictiveEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.heroEnabled", trainingConfig.atlas.heroEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.heroLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.heroLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.heroMemoryScale; write_kv(out, "training.atlas.heroMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.heroEdgeThreshold; write_kv(out, "training.atlas.heroEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.cobaltEnabled", trainingConfig.atlas.cobaltEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.cobaltLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.cobaltLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.cobaltMemoryScale; write_kv(out, "training.atlas.cobaltMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.cobaltEdgeThreshold; write_kv(out, "training.atlas.cobaltEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.birchEnabled", trainingConfig.atlas.birchEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.birchPastHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.birchPastHorizon)));
+	write_kv(out, "training.atlas.birchFutureHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.birchFutureHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.birchMemoryScale; write_kv(out, "training.atlas.birchMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.birchEdgeThreshold; write_kv(out, "training.atlas.birchEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.ghostEnabled", trainingConfig.atlas.ghostEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.ghostLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.ghostLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.ghostMemoryScale; write_kv(out, "training.atlas.ghostMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.ghostEdgeThreshold; write_kv(out, "training.atlas.ghostEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.sparrowEnabled", trainingConfig.atlas.sparrowEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.sparrowModeRank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.sparrowModeRank)));
+	write_kv(out, "training.atlas.sparrowAutoModeGate", trainingConfig.atlas.sparrowAutoModeGate ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.sparrowMemoryScale; write_kv(out, "training.atlas.sparrowMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.sparrowEdgeThreshold; write_kv(out, "training.atlas.sparrowEdgeThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.sparrowSecondEdgeThreshold; write_kv(out, "training.atlas.sparrowSecondEdgeThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.sparrowSecondEdgeFraction; write_kv(out, "training.atlas.sparrowSecondEdgeFraction", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.sparrowPoleMax; write_kv(out, "training.atlas.sparrowPoleMax", oss.str());
+	}
+	write_kv(out, "training.atlas.qbrtEnabled", trainingConfig.atlas.qbrtEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.qbrtLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.qbrtLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.qbrtMemoryScale; write_kv(out, "training.atlas.qbrtMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.qbrtEdgeThreshold; write_kv(out, "training.atlas.qbrtEdgeThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.qbrtPoleMax; write_kv(out, "training.atlas.qbrtPoleMax", oss.str());
+	}
+	write_kv(out, "training.atlas.qrcEnabled", trainingConfig.atlas.qrcEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.qrcLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.qrcLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.qrcMemoryScale; write_kv(out, "training.atlas.qrcMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.qrcEdgeThreshold; write_kv(out, "training.atlas.qrcEdgeThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.qrcPoleMax; write_kv(out, "training.atlas.qrcPoleMax", oss.str());
+	}
+	write_kv(out, "training.atlas.riftEnabled", trainingConfig.atlas.riftEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.riftLagHorizon", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.riftLagHorizon)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.riftMemoryScale; write_kv(out, "training.atlas.riftMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.riftEdgeThreshold; write_kv(out, "training.atlas.riftEdgeThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.riftPoleMax; write_kv(out, "training.atlas.riftPoleMax", oss.str());
+	}
+	write_kv(out, "training.atlas.orbitEnabled", trainingConfig.atlas.orbitEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.orbitMemoryScale; write_kv(out, "training.atlas.orbitMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.orbitEdgeThreshold; write_kv(out, "training.atlas.orbitEdgeThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.orbitPoleMax; write_kv(out, "training.atlas.orbitPoleMax", oss.str());
+	}
+	write_kv(out, "training.atlas.helmEnabled", trainingConfig.atlas.helmEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.helmMemoryScale; write_kv(out, "training.atlas.helmMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.helmEdgeThreshold; write_kv(out, "training.atlas.helmEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.helmModeRank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.helmModeRank)));
+	write_kv(out, "training.atlas.helmHiddenStackDepth", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.helmHiddenStackDepth)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.helmPoleMax; write_kv(out, "training.atlas.helmPoleMax", oss.str());
+	}
+	write_kv(out, "training.atlas.asterEnabled", trainingConfig.atlas.asterEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.asterMemoryScale; write_kv(out, "training.atlas.asterMemoryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.asterEdgeThreshold; write_kv(out, "training.atlas.asterEdgeThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.asterStateRank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.asterStateRank)));
+	write_kv(out, "training.atlas.asterHiddenStackDepth", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.asterHiddenStackDepth)));
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.asterPoleMax; write_kv(out, "training.atlas.asterPoleMax", oss.str());
+	}
 	write_kv(out, "training.atlas.tSub", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.tSub)));
 	write_kv(out, "training.lrSchedule.type", u64_to_string(static_cast<uint64_t>(static_cast<int>(trainingConfig.lrSchedule.type))));
 	write_kv(out, "training.lrSchedule.stepSizeEpochs", u64_to_string(static_cast<uint64_t>(trainingConfig.lrSchedule.stepSizeEpochs)));
@@ -1302,6 +1500,657 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 
+	bool savedPrismEnabled = false;
+	if (parse_bool01(kv, "training.atlas.prismEnabled", savedPrismEnabled) &&
+	    currentCfg.atlas.prismEnabled != savedPrismEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.prismEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedPrismEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.prismEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedPrismLagHorizon = -1;
+	if (parse_int(kv, "training.atlas.prismLagHorizon", savedPrismLagHorizon) &&
+	    savedPrismLagHorizon >= 0 &&
+	    currentCfg.atlas.prismLagHorizon != static_cast<unsigned int>(savedPrismLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.prismLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedPrismLagHorizon << ", current " << currentCfg.atlas.prismLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedPrismMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.prismMemoryScale", savedPrismMemoryScale) &&
+	    fabsf(currentCfg.atlas.prismMemoryScale - savedPrismMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.prismMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedPrismMemoryScale << ", current " << currentCfg.atlas.prismMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedPrismEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.prismPredictiveEdgeThreshold", savedPrismEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.prismPredictiveEdgeThreshold - savedPrismEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.prismPredictiveEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedPrismEdgeThreshold << ", current " << currentCfg.atlas.prismPredictiveEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedResolveEnabled = false;
+	if (parse_bool01(kv, "training.atlas.resolveEnabled", savedResolveEnabled) &&
+	    currentCfg.atlas.resolveEnabled != savedResolveEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.resolveEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedResolveEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.resolveEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedResolveLagHorizon = -1;
+	if (parse_int(kv, "training.atlas.resolveLagHorizon", savedResolveLagHorizon) &&
+	    savedResolveLagHorizon >= 0 &&
+	    currentCfg.atlas.resolveLagHorizon != static_cast<unsigned int>(savedResolveLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.resolveLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedResolveLagHorizon << ", current " << currentCfg.atlas.resolveLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedResolveMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.resolveMemoryScale", savedResolveMemoryScale) &&
+	    fabsf(currentCfg.atlas.resolveMemoryScale - savedResolveMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.resolveMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedResolveMemoryScale << ", current " << currentCfg.atlas.resolveMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedResolveEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.resolvePredictiveEdgeThreshold", savedResolveEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.resolvePredictiveEdgeThreshold - savedResolveEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.resolvePredictiveEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedResolveEdgeThreshold << ", current " << currentCfg.atlas.resolvePredictiveEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedHeroEnabled = false;
+	if (parse_bool01(kv, "training.atlas.heroEnabled", savedHeroEnabled) &&
+	    currentCfg.atlas.heroEnabled != savedHeroEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.heroEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedHeroEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.heroEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedHeroLagHorizon = -1;
+	if (parse_int(kv, "training.atlas.heroLagHorizon", savedHeroLagHorizon) &&
+	    savedHeroLagHorizon >= 0 &&
+	    currentCfg.atlas.heroLagHorizon != static_cast<unsigned int>(savedHeroLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.heroLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedHeroLagHorizon << ", current " << currentCfg.atlas.heroLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedHeroMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.heroMemoryScale", savedHeroMemoryScale) &&
+	    fabsf(currentCfg.atlas.heroMemoryScale - savedHeroMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.heroMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedHeroMemoryScale << ", current " << currentCfg.atlas.heroMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedHeroEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.heroEdgeThreshold", savedHeroEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.heroEdgeThreshold - savedHeroEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.heroEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedHeroEdgeThreshold << ", current " << currentCfg.atlas.heroEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedCobaltEnabled = false;
+	if (parse_bool01(kv, "training.atlas.cobaltEnabled", savedCobaltEnabled) &&
+	    currentCfg.atlas.cobaltEnabled != savedCobaltEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.cobaltEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedCobaltEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.cobaltEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedCobaltLagHorizon = -1;
+	if (parse_int(kv, "training.atlas.cobaltLagHorizon", savedCobaltLagHorizon) &&
+	    savedCobaltLagHorizon >= 0 &&
+	    currentCfg.atlas.cobaltLagHorizon != static_cast<unsigned int>(savedCobaltLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.cobaltLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedCobaltLagHorizon << ", current " << currentCfg.atlas.cobaltLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedCobaltMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.cobaltMemoryScale", savedCobaltMemoryScale) &&
+	    fabsf(currentCfg.atlas.cobaltMemoryScale - savedCobaltMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.cobaltMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedCobaltMemoryScale << ", current " << currentCfg.atlas.cobaltMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedCobaltEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.cobaltEdgeThreshold", savedCobaltEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.cobaltEdgeThreshold - savedCobaltEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.cobaltEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedCobaltEdgeThreshold << ", current " << currentCfg.atlas.cobaltEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedBirchEnabled = false;
+	if (parse_bool01(kv, "training.atlas.birchEnabled", savedBirchEnabled) &&
+	    currentCfg.atlas.birchEnabled != savedBirchEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.birchEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedBirchEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.birchEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedBirchPastHorizon = -1;
+	if (parse_int(kv, "training.atlas.birchPastHorizon", savedBirchPastHorizon) &&
+	    savedBirchPastHorizon >= 0 &&
+	    currentCfg.atlas.birchPastHorizon != static_cast<unsigned int>(savedBirchPastHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.birchPastHorizon mismatch vs requested resume config (checkpoint "
+		    << savedBirchPastHorizon << ", current " << currentCfg.atlas.birchPastHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedBirchFutureHorizon = -1;
+	if (parse_int(kv, "training.atlas.birchFutureHorizon", savedBirchFutureHorizon) &&
+	    savedBirchFutureHorizon >= 0 &&
+	    currentCfg.atlas.birchFutureHorizon != static_cast<unsigned int>(savedBirchFutureHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.birchFutureHorizon mismatch vs requested resume config (checkpoint "
+		    << savedBirchFutureHorizon << ", current " << currentCfg.atlas.birchFutureHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedBirchMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.birchMemoryScale", savedBirchMemoryScale) &&
+	    fabsf(currentCfg.atlas.birchMemoryScale - savedBirchMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.birchMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedBirchMemoryScale << ", current " << currentCfg.atlas.birchMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedBirchEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.birchEdgeThreshold", savedBirchEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.birchEdgeThreshold - savedBirchEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.birchEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedBirchEdgeThreshold << ", current " << currentCfg.atlas.birchEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedGhostEnabled = false;
+	if (parse_bool01(kv, "training.atlas.ghostEnabled", savedGhostEnabled) &&
+	    currentCfg.atlas.ghostEnabled != savedGhostEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.ghostEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedGhostEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.ghostEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedGhostLagHorizon = -1;
+	if (parse_int(kv, "training.atlas.ghostLagHorizon", savedGhostLagHorizon) &&
+	    savedGhostLagHorizon >= 0 &&
+	    currentCfg.atlas.ghostLagHorizon != static_cast<unsigned int>(savedGhostLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.ghostLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedGhostLagHorizon << ", current " << currentCfg.atlas.ghostLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedGhostMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.ghostMemoryScale", savedGhostMemoryScale) &&
+	    fabsf(currentCfg.atlas.ghostMemoryScale - savedGhostMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.ghostMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedGhostMemoryScale << ", current " << currentCfg.atlas.ghostMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedGhostEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.ghostEdgeThreshold", savedGhostEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.ghostEdgeThreshold - savedGhostEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.ghostEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedGhostEdgeThreshold << ", current " << currentCfg.atlas.ghostEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedSparrowEnabled = false;
+	if (parse_bool01(kv, "training.atlas.sparrowEnabled", savedSparrowEnabled) &&
+	    currentCfg.atlas.sparrowEnabled != savedSparrowEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedSparrowEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.sparrowEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+	int savedSparrowModeRank = 0;
+	if (parse_int(kv, "training.atlas.sparrowModeRank", savedSparrowModeRank) &&
+	    savedSparrowModeRank >= 0
+	    && currentCfg.atlas.sparrowModeRank != static_cast<unsigned int>(savedSparrowModeRank))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowModeRank mismatch vs requested resume config (checkpoint "
+		    << savedSparrowModeRank << ", current " << currentCfg.atlas.sparrowModeRank << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+	bool savedSparrowAutoModeGate = false;
+	if (parse_bool01(kv, "training.atlas.sparrowAutoModeGate", savedSparrowAutoModeGate) &&
+	    currentCfg.atlas.sparrowAutoModeGate != savedSparrowAutoModeGate)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowAutoModeGate mismatch vs requested resume config (checkpoint "
+		    << (savedSparrowAutoModeGate ? 1 : 0) << ", current " << (currentCfg.atlas.sparrowAutoModeGate ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedSparrowMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.sparrowMemoryScale", savedSparrowMemoryScale) &&
+	    fabsf(currentCfg.atlas.sparrowMemoryScale - savedSparrowMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedSparrowMemoryScale << ", current " << currentCfg.atlas.sparrowMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedSparrowEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.sparrowEdgeThreshold", savedSparrowEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.sparrowEdgeThreshold - savedSparrowEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedSparrowEdgeThreshold << ", current " << currentCfg.atlas.sparrowEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+	float savedSparrowSecondEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.sparrowSecondEdgeThreshold", savedSparrowSecondEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.sparrowSecondEdgeThreshold - savedSparrowSecondEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowSecondEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedSparrowSecondEdgeThreshold << ", current " << currentCfg.atlas.sparrowSecondEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+	float savedSparrowSecondEdgeFraction = 0.0f;
+	if (parse_float(kv, "training.atlas.sparrowSecondEdgeFraction", savedSparrowSecondEdgeFraction) &&
+	    fabsf(currentCfg.atlas.sparrowSecondEdgeFraction - savedSparrowSecondEdgeFraction) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowSecondEdgeFraction mismatch vs requested resume config (checkpoint "
+		    << savedSparrowSecondEdgeFraction << ", current " << currentCfg.atlas.sparrowSecondEdgeFraction << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedSparrowPoleMax = 0.0f;
+	if (parse_float(kv, "training.atlas.sparrowPoleMax", savedSparrowPoleMax) &&
+	    fabsf(currentCfg.atlas.sparrowPoleMax - savedSparrowPoleMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.sparrowPoleMax mismatch vs requested resume config (checkpoint "
+		    << savedSparrowPoleMax << ", current " << currentCfg.atlas.sparrowPoleMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedQbrtEnabled = false;
+	if (parse_bool01(kv, "training.atlas.qbrtEnabled", savedQbrtEnabled) &&
+	    currentCfg.atlas.qbrtEnabled != savedQbrtEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qbrtEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedQbrtEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.qbrtEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedQbrtLagHorizon = 0;
+	if (parse_int(kv, "training.atlas.qbrtLagHorizon", savedQbrtLagHorizon) &&
+	    savedQbrtLagHorizon >= 0 &&
+	    currentCfg.atlas.qbrtLagHorizon != static_cast<unsigned int>(savedQbrtLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qbrtLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedQbrtLagHorizon << ", current " << currentCfg.atlas.qbrtLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedQbrtMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.qbrtMemoryScale", savedQbrtMemoryScale) &&
+	    fabsf(currentCfg.atlas.qbrtMemoryScale - savedQbrtMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qbrtMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedQbrtMemoryScale << ", current " << currentCfg.atlas.qbrtMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedQbrtEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.qbrtEdgeThreshold", savedQbrtEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.qbrtEdgeThreshold - savedQbrtEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qbrtEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedQbrtEdgeThreshold << ", current " << currentCfg.atlas.qbrtEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedQbrtPoleMax = 0.0f;
+	if (parse_float(kv, "training.atlas.qbrtPoleMax", savedQbrtPoleMax) &&
+	    fabsf(currentCfg.atlas.qbrtPoleMax - savedQbrtPoleMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qbrtPoleMax mismatch vs requested resume config (checkpoint "
+		    << savedQbrtPoleMax << ", current " << currentCfg.atlas.qbrtPoleMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedQrcEnabled = false;
+	if (parse_bool01(kv, "training.atlas.qrcEnabled", savedQrcEnabled) &&
+	    currentCfg.atlas.qrcEnabled != savedQrcEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qrcEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedQrcEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.qrcEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedQrcLagHorizon = 0;
+	if (parse_int(kv, "training.atlas.qrcLagHorizon", savedQrcLagHorizon) &&
+	    savedQrcLagHorizon >= 0 &&
+	    currentCfg.atlas.qrcLagHorizon != static_cast<unsigned int>(savedQrcLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qrcLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedQrcLagHorizon << ", current " << currentCfg.atlas.qrcLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedQrcMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.qrcMemoryScale", savedQrcMemoryScale) &&
+	    fabsf(currentCfg.atlas.qrcMemoryScale - savedQrcMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qrcMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedQrcMemoryScale << ", current " << currentCfg.atlas.qrcMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedQrcEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.qrcEdgeThreshold", savedQrcEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.qrcEdgeThreshold - savedQrcEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qrcEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedQrcEdgeThreshold << ", current " << currentCfg.atlas.qrcEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedQrcPoleMax = 0.0f;
+	if (parse_float(kv, "training.atlas.qrcPoleMax", savedQrcPoleMax) &&
+	    fabsf(currentCfg.atlas.qrcPoleMax - savedQrcPoleMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.qrcPoleMax mismatch vs requested resume config (checkpoint "
+		    << savedQrcPoleMax << ", current " << currentCfg.atlas.qrcPoleMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedRiftEnabled = false;
+	if (parse_bool01(kv, "training.atlas.riftEnabled", savedRiftEnabled) &&
+	    currentCfg.atlas.riftEnabled != savedRiftEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.riftEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedRiftEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.riftEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedRiftLagHorizon = 0;
+	if (parse_int(kv, "training.atlas.riftLagHorizon", savedRiftLagHorizon) &&
+	    savedRiftLagHorizon >= 0 &&
+	    currentCfg.atlas.riftLagHorizon != static_cast<unsigned int>(savedRiftLagHorizon))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.riftLagHorizon mismatch vs requested resume config (checkpoint "
+		    << savedRiftLagHorizon << ", current " << currentCfg.atlas.riftLagHorizon << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRiftMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.riftMemoryScale", savedRiftMemoryScale) &&
+	    fabsf(currentCfg.atlas.riftMemoryScale - savedRiftMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.riftMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedRiftMemoryScale << ", current " << currentCfg.atlas.riftMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRiftEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.riftEdgeThreshold", savedRiftEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.riftEdgeThreshold - savedRiftEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.riftEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedRiftEdgeThreshold << ", current " << currentCfg.atlas.riftEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRiftPoleMax = 0.0f;
+	if (parse_float(kv, "training.atlas.riftPoleMax", savedRiftPoleMax) &&
+	    fabsf(currentCfg.atlas.riftPoleMax - savedRiftPoleMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.riftPoleMax mismatch vs requested resume config (checkpoint "
+		    << savedRiftPoleMax << ", current " << currentCfg.atlas.riftPoleMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedOrbitEnabled = false;
+	if (parse_bool01(kv, "training.atlas.orbitEnabled", savedOrbitEnabled) &&
+	    currentCfg.atlas.orbitEnabled != savedOrbitEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.orbitEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedOrbitEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.orbitEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedOrbitMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.orbitMemoryScale", savedOrbitMemoryScale) &&
+	    fabsf(currentCfg.atlas.orbitMemoryScale - savedOrbitMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.orbitMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedOrbitMemoryScale << ", current " << currentCfg.atlas.orbitMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedOrbitEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.orbitEdgeThreshold", savedOrbitEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.orbitEdgeThreshold - savedOrbitEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.orbitEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedOrbitEdgeThreshold << ", current " << currentCfg.atlas.orbitEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedOrbitPoleMax = 0.0f;
+	if (parse_float(kv, "training.atlas.orbitPoleMax", savedOrbitPoleMax) &&
+	    fabsf(currentCfg.atlas.orbitPoleMax - savedOrbitPoleMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.orbitPoleMax mismatch vs requested resume config (checkpoint "
+		    << savedOrbitPoleMax << ", current " << currentCfg.atlas.orbitPoleMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedHelmEnabled = false;
+	if (parse_bool01(kv, "training.atlas.helmEnabled", savedHelmEnabled) &&
+	    currentCfg.atlas.helmEnabled != savedHelmEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.helmEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedHelmEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.helmEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedHelmMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.helmMemoryScale", savedHelmMemoryScale) &&
+	    fabsf(currentCfg.atlas.helmMemoryScale - savedHelmMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.helmMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedHelmMemoryScale << ", current " << currentCfg.atlas.helmMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedHelmEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.helmEdgeThreshold", savedHelmEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.helmEdgeThreshold - savedHelmEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.helmEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedHelmEdgeThreshold << ", current " << currentCfg.atlas.helmEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedHelmModeRank = -1;
+	if (parse_int(kv, "training.atlas.helmModeRank", savedHelmModeRank) &&
+	    savedHelmModeRank >= 0 &&
+	    currentCfg.atlas.helmModeRank != static_cast<unsigned int>(savedHelmModeRank))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.helmModeRank mismatch vs requested resume config (checkpoint "
+		    << savedHelmModeRank << ", current " << currentCfg.atlas.helmModeRank << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedHelmHiddenStackDepth = -1;
+	if (parse_int(kv, "training.atlas.helmHiddenStackDepth", savedHelmHiddenStackDepth) &&
+	    savedHelmHiddenStackDepth >= 0 &&
+	    currentCfg.atlas.helmHiddenStackDepth != static_cast<unsigned int>(savedHelmHiddenStackDepth))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.helmHiddenStackDepth mismatch vs requested resume config (checkpoint "
+		    << savedHelmHiddenStackDepth << ", current " << currentCfg.atlas.helmHiddenStackDepth << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedHelmPoleMax = 0.0f;
+	if (parse_float(kv, "training.atlas.helmPoleMax", savedHelmPoleMax) &&
+	    fabsf(currentCfg.atlas.helmPoleMax - savedHelmPoleMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.helmPoleMax mismatch vs requested resume config (checkpoint "
+		    << savedHelmPoleMax << ", current " << currentCfg.atlas.helmPoleMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedAsterEnabled = false;
+	if (parse_bool01(kv, "training.atlas.asterEnabled", savedAsterEnabled) &&
+	    currentCfg.atlas.asterEnabled != savedAsterEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.asterEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedAsterEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.asterEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedAsterMemoryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.asterMemoryScale", savedAsterMemoryScale) &&
+	    fabsf(currentCfg.atlas.asterMemoryScale - savedAsterMemoryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.asterMemoryScale mismatch vs requested resume config (checkpoint "
+		    << savedAsterMemoryScale << ", current " << currentCfg.atlas.asterMemoryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedAsterEdgeThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.asterEdgeThreshold", savedAsterEdgeThreshold) &&
+	    fabsf(currentCfg.atlas.asterEdgeThreshold - savedAsterEdgeThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.asterEdgeThreshold mismatch vs requested resume config (checkpoint "
+		    << savedAsterEdgeThreshold << ", current " << currentCfg.atlas.asterEdgeThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedAsterStateRank = -1;
+	if (parse_int(kv, "training.atlas.asterStateRank", savedAsterStateRank) &&
+	    savedAsterStateRank >= 0 &&
+	    currentCfg.atlas.asterStateRank != static_cast<unsigned int>(savedAsterStateRank))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.asterStateRank mismatch vs requested resume config (checkpoint "
+		    << savedAsterStateRank << ", current " << currentCfg.atlas.asterStateRank << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedAsterHiddenStackDepth = -1;
+	if (parse_int(kv, "training.atlas.asterHiddenStackDepth", savedAsterHiddenStackDepth) &&
+	    savedAsterHiddenStackDepth >= 0 &&
+	    currentCfg.atlas.asterHiddenStackDepth != static_cast<unsigned int>(savedAsterHiddenStackDepth))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.asterHiddenStackDepth mismatch vs requested resume config (checkpoint "
+		    << savedAsterHiddenStackDepth << ", current " << currentCfg.atlas.asterHiddenStackDepth << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedAsterPoleMax = 0.0f;
+	if (parse_float(kv, "training.atlas.asterPoleMax", savedAsterPoleMax) &&
+	    fabsf(currentCfg.atlas.asterPoleMax - savedAsterPoleMax) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.asterPoleMax mismatch vs requested resume config (checkpoint "
+		    << savedAsterPoleMax << ", current " << currentCfg.atlas.asterPoleMax << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
 	int savedTSub = -1;
 	if (parse_int(kv, "training.atlas.tSub", savedTSub) &&
 	    savedTSub >= 0 &&
@@ -1518,15 +2367,146 @@ static void enqueueAtlasWrite(std::vector<TensorWriteRef>& out,
 	}
 	{
 		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.prevPrevGz", &st.prevPrevGz, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(4ull);
+		sh.push_back(static_cast<uint64_t>(st.r));
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.resolveGzHistory", &st.resolveGzHistory, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(4ull);
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.heroGwHistory", &st.heroGwHistory, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(st.m));
 		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
 		out.push_back(TensorWriteRef(prefix + ".atlas.V", &st.V, dt, sh));
 	}
 	{
 		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.m));
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
+		out.push_back(TensorWriteRef(prefix + ".atlas.scoutBasis", &st.scoutBasis, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
 		sh.push_back(static_cast<uint64_t>(st.n));
 		out.push_back(TensorWriteRef(prefix + ".atlas.prevGv", &st.prevGv, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
+		out.push_back(TensorWriteRef(prefix + ".atlas.scoutCov", &st.scoutCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
+		out.push_back(TensorWriteRef(prefix + ".atlas.scoutNoise", &st.scoutNoise, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowPrevActive", &st.sparrowPrevActive, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank ? st.complementRank : 1u));
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowPrevScout", &st.sparrowPrevScout, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowFutureCov", &st.sparrowFutureCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r + (st.complementRank ? st.complementRank : 1u)));
+		sh.push_back(static_cast<uint64_t>(st.r + (st.complementRank ? st.complementRank : 1u)));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowPastCov", &st.sparrowPastCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		sh.push_back(static_cast<uint64_t>(st.r + (st.complementRank ? st.complementRank : 1u)));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowCrossCov", &st.sparrowCrossCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.sparrowModeRank));
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowLeftMode", &st.sparrowLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.sparrowModeRank));
+		sh.push_back(static_cast<uint64_t>(st.r + (st.complementRank ? st.complementRank : 1u)));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowRightMode", &st.sparrowRightMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.sparrowModeRank));
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.sparrowLatent", &st.sparrowLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.qbrtLeftMode", &st.qbrtLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.qbrtLatent", &st.qbrtLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.qrcLeftMode", &st.qrcLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.qrcLatent", &st.qrcLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.riftLeftMode", &st.riftLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.riftLatent", &st.riftLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.orbitPrevSignal", &st.orbitPrevSignal, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.r));
+		out.push_back(TensorWriteRef(prefix + ".atlas.orbitLeftMode", &st.orbitLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.n));
+		out.push_back(TensorWriteRef(prefix + ".atlas.orbitLatent", &st.orbitLatent, dt, sh));
 	}
 }
 
@@ -1626,6 +2606,122 @@ static bool restoreAtlasComplementBasis(glades::atlas::WeightState& st)
 	return informative > 0u || compRank == 0u;
 }
 
+static bool restoreAtlasScoutBasis(glades::atlas::WeightState& st)
+{
+	const unsigned int compRank = (st.complementRank > 0u) ? st.complementRank : 1u;
+	if (st.scoutBasis.size() != static_cast<size_t>(st.m) * compRank)
+		st.scoutBasis.assign(static_cast<size_t>(st.m) * compRank, 0.0f);
+
+	const unsigned int activeRank = (st.activeRank <= st.r) ? st.activeRank : st.r;
+	unsigned int informative = 0u;
+	for (unsigned int c = 0; c < compRank; ++c)
+	{
+		std::vector<float> col(static_cast<size_t>(st.m), 0.0f);
+		for (unsigned int i = 0; i < st.m; ++i)
+			col[i] = st.scoutBasis[static_cast<size_t>(i) * compRank + c];
+
+		for (unsigned int a = 0; a < activeRank; ++a)
+		{
+			double dot = 0.0;
+			for (unsigned int i = 0; i < st.m; ++i)
+				dot += static_cast<double>(col[i])
+				    * static_cast<double>(st.U[static_cast<size_t>(i) * st.r + a]);
+			const float dotf = static_cast<float>(dot);
+			for (unsigned int i = 0; i < st.m; ++i)
+				col[i] -= dotf * st.U[static_cast<size_t>(i) * st.r + a];
+		}
+		for (unsigned int prev = 0; prev < compRank; ++prev)
+		{
+			double dot = 0.0;
+			for (unsigned int i = 0; i < st.m; ++i)
+				dot += static_cast<double>(col[i])
+				    * static_cast<double>(st.V[static_cast<size_t>(i) * compRank + prev]);
+			const float dotf = static_cast<float>(dot);
+			for (unsigned int i = 0; i < st.m; ++i)
+				col[i] -= dotf * st.V[static_cast<size_t>(i) * compRank + prev];
+		}
+		for (unsigned int prev = 0; prev < c; ++prev)
+		{
+			double dot = 0.0;
+			for (unsigned int i = 0; i < st.m; ++i)
+				dot += static_cast<double>(col[i])
+				    * static_cast<double>(st.scoutBasis[static_cast<size_t>(i) * compRank + prev]);
+			const float dotf = static_cast<float>(dot);
+			for (unsigned int i = 0; i < st.m; ++i)
+				col[i] -= dotf * st.scoutBasis[static_cast<size_t>(i) * compRank + prev];
+		}
+
+		double normSq = 0.0;
+		for (unsigned int i = 0; i < st.m; ++i)
+		{
+			const double v = static_cast<double>(col[i]);
+			normSq += v * v;
+		}
+		if (normSq <= 1e-12)
+		{
+			bool seeded = false;
+			for (unsigned int basisRow = 0; basisRow < st.m && !seeded; ++basisRow)
+			{
+				std::fill(col.begin(), col.end(), 0.0f);
+				col[basisRow] = 1.0f;
+				for (unsigned int a = 0; a < activeRank; ++a)
+				{
+					double dot = 0.0;
+					for (unsigned int i = 0; i < st.m; ++i)
+						dot += static_cast<double>(col[i])
+						    * static_cast<double>(st.U[static_cast<size_t>(i) * st.r + a]);
+					const float dotf = static_cast<float>(dot);
+					for (unsigned int i = 0; i < st.m; ++i)
+						col[i] -= dotf * st.U[static_cast<size_t>(i) * st.r + a];
+				}
+				for (unsigned int prev = 0; prev < compRank; ++prev)
+				{
+					double dot = 0.0;
+					for (unsigned int i = 0; i < st.m; ++i)
+						dot += static_cast<double>(col[i])
+						    * static_cast<double>(st.V[static_cast<size_t>(i) * compRank + prev]);
+					const float dotf = static_cast<float>(dot);
+					for (unsigned int i = 0; i < st.m; ++i)
+						col[i] -= dotf * st.V[static_cast<size_t>(i) * compRank + prev];
+				}
+				for (unsigned int prev = 0; prev < c; ++prev)
+				{
+					double dot = 0.0;
+					for (unsigned int i = 0; i < st.m; ++i)
+						dot += static_cast<double>(col[i])
+						    * static_cast<double>(st.scoutBasis[static_cast<size_t>(i) * compRank + prev]);
+					const float dotf = static_cast<float>(dot);
+					for (unsigned int i = 0; i < st.m; ++i)
+						col[i] -= dotf * st.scoutBasis[static_cast<size_t>(i) * compRank + prev];
+				}
+				normSq = 0.0;
+				for (unsigned int i = 0; i < st.m; ++i)
+				{
+					const double v = static_cast<double>(col[i]);
+					normSq += v * v;
+				}
+				seeded = (normSq > 1e-12);
+			}
+			if (normSq <= 1e-12)
+			{
+				for (unsigned int i = 0; i < st.m; ++i)
+					st.scoutBasis[static_cast<size_t>(i) * compRank + c] = 0.0f;
+				continue;
+			}
+		}
+
+		const float invNorm = static_cast<float>(1.0 / std::sqrt(normSq));
+		for (unsigned int i = 0; i < st.m; ++i)
+			st.scoutBasis[static_cast<size_t>(i) * compRank + c] = col[i] * invNorm;
+		informative = c + 1u;
+	}
+
+	for (unsigned int c = informative; c < compRank; ++c)
+		for (unsigned int i = 0; i < st.m; ++i)
+			st.scoutBasis[static_cast<size_t>(i) * compRank + c] = 0.0f;
+	return informative > 0u || compRank == 0u;
+}
+
 static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
                                   const std::string& prefix,
                                   const glades::atlas::WeightState& st)
@@ -1669,6 +2765,82 @@ static void writeAtlasManifestKV(std::map<std::string, std::string>& kv,
 		std::ostringstream oss; oss << static_cast<unsigned long long>(st.activeComplementRank);
 		kv["atlas." + prefix + ".activeComplementRank"] = oss.str();
 	}
+	{
+		std::ostringstream oss; oss << static_cast<unsigned long long>(st.trialComplementRank);
+		kv["atlas." + prefix + ".trialComplementRank"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << static_cast<unsigned long long>(st.trialComplementWins);
+		kv["atlas." + prefix + ".trialComplementWins"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.trialComplementMean;
+		kv["atlas." + prefix + ".trialComplementMean"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.trialComplementVar;
+		kv["atlas." + prefix + ".trialComplementVar"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.sparrowPoleNumer;
+		kv["atlas." + prefix + ".sparrowPoleNumer"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.sparrowPoleDenom;
+		kv["atlas." + prefix + ".sparrowPoleDenom"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.sparrowPole;
+		kv["atlas." + prefix + ".sparrowPole"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.qbrtPoleNumer;
+		kv["atlas." + prefix + ".qbrtPoleNumer"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.qbrtPoleDenom;
+		kv["atlas." + prefix + ".qbrtPoleDenom"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.qbrtPole;
+		kv["atlas." + prefix + ".qbrtPole"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.qrcPoleNumer;
+		kv["atlas." + prefix + ".qrcPoleNumer"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.qrcPoleDenom;
+		kv["atlas." + prefix + ".qrcPoleDenom"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.qrcPole;
+		kv["atlas." + prefix + ".qrcPole"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.riftPoleNumer;
+		kv["atlas." + prefix + ".riftPoleNumer"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.riftPoleDenom;
+		kv["atlas." + prefix + ".riftPoleDenom"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.riftPole;
+		kv["atlas." + prefix + ".riftPole"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.orbitPoleNumer;
+		kv["atlas." + prefix + ".orbitPoleNumer"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.orbitPoleDenom;
+		kv["atlas." + prefix + ".orbitPoleDenom"] = oss.str();
+	}
+	{
+		std::ostringstream oss; oss << st.orbitPole;
+		kv["atlas." + prefix + ".orbitPole"] = oss.str();
+	}
 }
 
 static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
@@ -1676,6 +2848,7 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
                               glades::atlas::WeightState& st,
                               unsigned int m, unsigned int n, unsigned int r,
                               unsigned int complementRankCfg,
+                              unsigned int sparrowModeRankCfg,
                               const std::string& dt)
 {
 	st.m = m;
@@ -1683,7 +2856,12 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.r = r;
 	st.activeRank = r;
 	st.complementRank = (complementRankCfg > 0u) ? complementRankCfg : 1u;
+	st.sparrowModeRank = (sparrowModeRankCfg > 0u) ? sparrowModeRankCfg : 1u;
 	st.activeComplementRank = 0u;
+	st.trialComplementRank = 0u;
+	st.trialComplementWins = 0u;
+	st.trialComplementMean = 0.0f;
+	st.trialComplementVar = 0.0f;
 	st.complementFisher = 0.0f;
 	const size_t mr = static_cast<size_t>(m) * static_cast<size_t>(r);
 	const size_t rn = static_cast<size_t>(r) * static_cast<size_t>(n);
@@ -1693,28 +2871,64 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	st.U.resize(mr);
 	st.fisherDiag.resize(r);
 	st.V.resize(mc);
+	st.scoutBasis.resize(mc);
 	st.complementBlock.assign(cr * cr, 0.0f);
+	st.scoutCov.assign(cr * cr, 0.0f);
+	st.scoutNoise.assign(cr * cr, 0.0f);
 	st.prevGz.resize(rn);
+	st.prevPrevGz.resize(rn);
 	st.prevGv.resize(cn);
+	st.resolveGzHistory.assign(static_cast<size_t>(4u) * rn, 0.0f);
+	st.heroGwHistory.assign(static_cast<size_t>(4u) * cn, 0.0f);
+	st.sparrowPrevActive.assign(rn, 0.0f);
+	st.sparrowPrevScout.assign(cn, 0.0f);
+	st.sparrowFutureCov.assign(static_cast<size_t>(r) * static_cast<size_t>(r), 0.0f);
+	st.sparrowPastCov.assign(static_cast<size_t>(r + st.complementRank) * static_cast<size_t>(r + st.complementRank), 0.0f);
+	st.sparrowCrossCov.assign(static_cast<size_t>(r) * static_cast<size_t>(r + st.complementRank), 0.0f);
+	st.sparrowLeftMode.assign(static_cast<size_t>(st.sparrowModeRank) * static_cast<size_t>(r), 0.0f);
+	st.sparrowRightMode.assign(static_cast<size_t>(st.sparrowModeRank) * static_cast<size_t>(r + st.complementRank), 0.0f);
+	st.sparrowLatent.assign(static_cast<size_t>(st.sparrowModeRank) * static_cast<size_t>(n), 0.0f);
+	st.qbrtLeftMode.assign(static_cast<size_t>(r), 0.0f);
+	st.qbrtLatent.assign(static_cast<size_t>(n), 0.0f);
+	st.qrcLeftMode.assign(static_cast<size_t>(r), 0.0f);
+	st.qrcLatent.assign(static_cast<size_t>(n), 0.0f);
+	st.riftLeftMode.assign(static_cast<size_t>(r), 0.0f);
+	st.riftLatent.assign(static_cast<size_t>(n), 0.0f);
+	st.orbitPrevSignal.assign(static_cast<size_t>(n), 0.0f);
+	st.orbitLeftMode.assign(static_cast<size_t>(r), 0.0f);
+	st.orbitLatent.assign(static_cast<size_t>(n), 0.0f);
 
 	// Allocate persistent scratch buffers (must match initWeightState).
 	st.scratch_gz.resize(rn);
 	st.scratch_corrected.resize(rn);
 	st.scratch_gv.resize(cn);
 	st.scratch_correctedV.resize(cn);
+	st.scratch_gwScout.resize(cn);
 	st.scratch_U_old.resize(mr);
 	st.scratch_f_old.resize(static_cast<size_t>(r));
 	st.scratch_B.resize(rn);
 	st.scratch_Z.resize(mr);
 	st.scratch_overlap.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
 	st.scratch_prevGzOld.resize(rn);
+	st.scratch_prevPrevGzOld.resize(rn);
+	st.scratch_resolveGzHistoryOld.resize(static_cast<size_t>(4u) * rn);
+	st.scratch_heroGwHistoryOld.resize(static_cast<size_t>(4u) * cn);
 	st.scratch_basisPacked.resize(mr);
 	st.scratch_V_old.resize(mc);
 	st.scratch_Bv.resize(cn);
 	st.scratch_Zv.resize(mc);
+	st.scratch_W_old.resize(mc);
+	st.scratch_Bw.resize(cn);
+	st.scratch_Zw.resize(mc);
 	st.scratch_complementMat.resize(cr * cr);
 	st.scratch_complementEigVec.resize(cr * cr);
 	st.scratch_complementEigVal.resize(cr);
+	st.scratch_scoutMat.resize(cr * cr);
+	st.scratch_scoutEigVec.resize(cr * cr);
+	st.scratch_scoutEigVal.resize(cr);
+	st.scratch_sparrowActive.resize(rn);
+	st.scratch_sparrowScout.resize(cn);
+	st.scratch_sparrowPastSignal.resize(static_cast<size_t>(n));
 	{
 		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(m));
@@ -1734,15 +2948,146 @@ static void enqueueAtlasRead(std::vector<TensorReadRef>& out,
 	}
 	{
 		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.prevPrevGz", &st.prevPrevGz, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(4ull);
+		sh.push_back(static_cast<uint64_t>(r));
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.resolveGzHistory", &st.resolveGzHistory, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(4ull);
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.heroGwHistory", &st.heroGwHistory, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(m));
 		sh.push_back(static_cast<uint64_t>(st.complementRank));
 		out.push_back(TensorReadRef(prefix + ".atlas.V", &st.V, dt, sh));
 	}
 	{
 		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(m));
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
+		out.push_back(TensorReadRef(prefix + ".atlas.scoutBasis", &st.scoutBasis, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
 		sh.push_back(static_cast<uint64_t>(st.complementRank));
 		sh.push_back(static_cast<uint64_t>(n));
 		out.push_back(TensorReadRef(prefix + ".atlas.prevGv", &st.prevGv, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
+		out.push_back(TensorReadRef(prefix + ".atlas.scoutCov", &st.scoutCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
+		out.push_back(TensorReadRef(prefix + ".atlas.scoutNoise", &st.scoutNoise, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowPrevActive", &st.sparrowPrevActive, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.complementRank));
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowPrevScout", &st.sparrowPrevScout, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowFutureCov", &st.sparrowFutureCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r + st.complementRank));
+		sh.push_back(static_cast<uint64_t>(r + st.complementRank));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowPastCov", &st.sparrowPastCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		sh.push_back(static_cast<uint64_t>(r + st.complementRank));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowCrossCov", &st.sparrowCrossCov, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.sparrowModeRank));
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowLeftMode", &st.sparrowLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.sparrowModeRank));
+		sh.push_back(static_cast<uint64_t>(r + st.complementRank));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowRightMode", &st.sparrowRightMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(st.sparrowModeRank));
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.sparrowLatent", &st.sparrowLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.qbrtLeftMode", &st.qbrtLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.qbrtLatent", &st.qbrtLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.qrcLeftMode", &st.qrcLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.qrcLatent", &st.qrcLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.riftLeftMode", &st.riftLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.riftLatent", &st.riftLatent, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.orbitPrevSignal", &st.orbitPrevSignal, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(r));
+		out.push_back(TensorReadRef(prefix + ".atlas.orbitLeftMode", &st.orbitLeftMode, dt, sh));
+	}
+	{
+		std::vector<uint64_t> sh;
+		sh.push_back(static_cast<uint64_t>(n));
+		out.push_back(TensorReadRef(prefix + ".atlas.orbitLatent", &st.orbitLatent, dt, sh));
 	}
 }
 
@@ -1833,9 +3178,233 @@ static void readAtlasManifestKV(const std::map<std::string, std::string>& kv,
 				st.activeComplementRank = static_cast<unsigned int>(s);
 		}
 	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".trialComplementRank");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			unsigned long long s = 0;
+			iss >> s;
+			if (s <= static_cast<unsigned long long>(st.complementRank))
+				st.trialComplementRank = static_cast<unsigned int>(s);
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".trialComplementWins");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			unsigned long long s = 0;
+			iss >> s;
+			st.trialComplementWins = static_cast<unsigned int>(s);
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".trialComplementMean");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.trialComplementMean;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".trialComplementVar");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.trialComplementVar;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".sparrowPoleNumer");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.sparrowPoleNumer;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".sparrowPoleDenom");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.sparrowPoleDenom;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".sparrowPole");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.sparrowPole;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".qbrtPoleNumer");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.qbrtPoleNumer;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".qbrtPoleDenom");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.qbrtPoleDenom;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".qbrtPole");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.qbrtPole;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".qrcPoleNumer");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.qrcPoleNumer;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".qrcPoleDenom");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.qrcPoleDenom;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".qrcPole");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.qrcPole;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".riftPoleNumer");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.riftPoleNumer;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".riftPoleDenom");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.riftPoleDenom;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".riftPole");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.riftPole;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".orbitPoleNumer");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.orbitPoleNumer;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".orbitPoleDenom");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.orbitPoleDenom;
+		}
+	}
+	{
+		std::map<std::string, std::string>::const_iterator it = kv.find("atlas." + prefix + ".orbitPole");
+		if (it != kv.end())
+		{
+			std::istringstream iss(it->second);
+			iss >> st.orbitPole;
+		}
+	}
+	if (st.trialComplementRank <= st.activeComplementRank
+	    || st.trialComplementRank > st.complementRank)
+	{
+		st.trialComplementRank = 0u;
+		st.trialComplementWins = 0u;
+		st.trialComplementMean = 0.0f;
+		st.trialComplementVar = 0.0f;
+	}
 	if (st.prevGv.empty())
 		st.prevGv.assign(static_cast<size_t>(st.complementRank ? st.complementRank : 1u) * static_cast<size_t>(st.n), 0.0f);
+	if (st.prevPrevGz.empty())
+		st.prevPrevGz.assign(static_cast<size_t>(st.r) * static_cast<size_t>(st.n), 0.0f);
+	if (st.resolveGzHistory.empty())
+		st.resolveGzHistory.assign(static_cast<size_t>(4u) * static_cast<size_t>(st.r) * static_cast<size_t>(st.n), 0.0f);
+	if (st.scratch_resolveGzHistoryOld.empty())
+		st.scratch_resolveGzHistoryOld.assign(static_cast<size_t>(4u) * static_cast<size_t>(st.r) * static_cast<size_t>(st.n), 0.0f);
+	if (st.heroGwHistory.empty())
+		st.heroGwHistory.assign(static_cast<size_t>(4u) * static_cast<size_t>(st.complementRank ? st.complementRank : 1u) * static_cast<size_t>(st.n), 0.0f);
+	if (st.scratch_heroGwHistoryOld.empty())
+		st.scratch_heroGwHistoryOld.assign(static_cast<size_t>(4u) * static_cast<size_t>(st.complementRank ? st.complementRank : 1u) * static_cast<size_t>(st.n), 0.0f);
+	if (st.sparrowPrevActive.empty())
+		st.sparrowPrevActive.assign(static_cast<size_t>(st.r) * static_cast<size_t>(st.n), 0.0f);
+	if (st.sparrowPrevScout.empty())
+		st.sparrowPrevScout.assign(static_cast<size_t>(st.complementRank ? st.complementRank : 1u) * static_cast<size_t>(st.n), 0.0f);
+	if (st.sparrowFutureCov.empty())
+		st.sparrowFutureCov.assign(static_cast<size_t>(st.r) * static_cast<size_t>(st.r), 0.0f);
+	if (st.sparrowPastCov.empty())
+		st.sparrowPastCov.assign(static_cast<size_t>(st.r + (st.complementRank ? st.complementRank : 1u))
+		                         * static_cast<size_t>(st.r + (st.complementRank ? st.complementRank : 1u)),
+		                         0.0f);
+	if (st.sparrowCrossCov.empty())
+		st.sparrowCrossCov.assign(static_cast<size_t>(st.r)
+		                          * static_cast<size_t>(st.r + (st.complementRank ? st.complementRank : 1u)),
+		                          0.0f);
+	if (st.sparrowModeRank == 0u)
+		st.sparrowModeRank = 1u;
+	if (st.sparrowLeftMode.empty())
+		st.sparrowLeftMode.assign(static_cast<size_t>(st.sparrowModeRank) * static_cast<size_t>(st.r), 0.0f);
+	if (st.sparrowRightMode.empty())
+		st.sparrowRightMode.assign(static_cast<size_t>(st.sparrowModeRank)
+		                           * static_cast<size_t>(st.r + (st.complementRank ? st.complementRank : 1u)),
+		                           0.0f);
+	if (st.sparrowLatent.empty())
+		st.sparrowLatent.assign(static_cast<size_t>(st.sparrowModeRank) * static_cast<size_t>(st.n), 0.0f);
+	if (st.qbrtLeftMode.empty())
+		st.qbrtLeftMode.assign(static_cast<size_t>(st.r), 0.0f);
+	if (st.qbrtLatent.empty())
+		st.qbrtLatent.assign(static_cast<size_t>(st.n), 0.0f);
+	if (st.qrcLeftMode.empty())
+		st.qrcLeftMode.assign(static_cast<size_t>(st.r), 0.0f);
+	if (st.qrcLatent.empty())
+		st.qrcLatent.assign(static_cast<size_t>(st.n), 0.0f);
+	if (st.riftLeftMode.empty())
+		st.riftLeftMode.assign(static_cast<size_t>(st.r), 0.0f);
+	if (st.riftLatent.empty())
+		st.riftLatent.assign(static_cast<size_t>(st.n), 0.0f);
+	if (st.orbitPrevSignal.empty())
+		st.orbitPrevSignal.assign(static_cast<size_t>(st.n), 0.0f);
+	if (st.orbitLeftMode.empty())
+		st.orbitLeftMode.assign(static_cast<size_t>(st.r), 0.0f);
+	if (st.orbitLatent.empty())
+		st.orbitLatent.assign(static_cast<size_t>(st.n), 0.0f);
+	if (st.scratch_sparrowActive.empty())
+		st.scratch_sparrowActive.assign(static_cast<size_t>(st.r) * static_cast<size_t>(st.n), 0.0f);
+	if (st.scratch_sparrowScout.empty())
+		st.scratch_sparrowScout.assign(static_cast<size_t>(st.complementRank ? st.complementRank : 1u) * static_cast<size_t>(st.n), 0.0f);
+	if (st.scratch_sparrowPastSignal.empty())
+		st.scratch_sparrowPastSignal.assign(static_cast<size_t>(st.n), 0.0f);
 	restoreAtlasComplementBasis(st);
+	restoreAtlasScoutBasis(st);
 	{
 		double compTrace = 0.0;
 		for (unsigned int c = 0; c < st.complementRank; ++c)
@@ -2084,6 +3653,156 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 					std::ostringstream oss; oss << "dff.t" << static_cast<unsigned long long>(t);
 					enqueueAtlasWrite(tensorsToWrite, oss.str(), tensorDff.atlasState[t], dt);
 					writeAtlasManifestKV(atlasKV, oss.str(), tensorDff.atlasState[t]);
+				}
+			}
+			if (includeOpt && isAtlas && trainingConfig.atlas.helmEnabled && tensorDff.helm.initialized)
+			{
+				const TensorDFFState::HelmState& hs = tensorDff.helm;
+				const unsigned int pastDim = hs.hiddenDim + hs.outputDim;
+				const unsigned int modeRank = hs.modeRank;
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(hs.hiddenDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.prevHiddenMean", &hs.prevHiddenMean, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(hs.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.prevResidualMean", &hs.prevResidualMean, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(hs.hiddenDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.hiddenVar", &hs.hiddenVar, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(hs.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.residualVar", &hs.residualVar, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(hs.outputDim));
+					sh.push_back(static_cast<uint64_t>(pastDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.crossCov", &hs.crossCov, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(modeRank));
+					sh.push_back(static_cast<uint64_t>(hs.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.leftMode", &hs.leftMode, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(modeRank));
+					sh.push_back(static_cast<uint64_t>(pastDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.rightMode", &hs.rightMode, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(modeRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.sigma", &hs.sigma, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(modeRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.latent", &hs.latent, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(modeRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.poleNumer", &hs.poleNumer, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(modeRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.poleDenom", &hs.poleDenom, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(modeRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.helm.pole", &hs.pole, dt, sh));
+				}
+			}
+			if (includeOpt && isAtlas && trainingConfig.atlas.asterEnabled && tensorDff.aster.initialized)
+			{
+				const TensorDFFState::AsterState& as = tensorDff.aster;
+				const unsigned int featureDim = as.outputDim + (2u * as.controlDim);
+				const unsigned int stateRank = as.stateRank;
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(as.controlDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.prevControlMean", &as.prevControlMean, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.prevResidualMean", &as.prevResidualMean, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(as.controlDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.controlVar", &as.controlVar, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.residualVar", &as.residualVar, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(featureDim));
+					sh.push_back(static_cast<uint64_t>(featureDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.pastCov", &as.pastCov, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					sh.push_back(static_cast<uint64_t>(featureDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.crossCov", &as.crossCov, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					sh.push_back(static_cast<uint64_t>(featureDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.theta", &as.theta, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.leftMode", &as.leftMode, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					sh.push_back(static_cast<uint64_t>(featureDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.rightMode", &as.rightMode, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.sigma", &as.sigma, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.latent", &as.latent, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.poleNumer", &as.poleNumer, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.poleDenom", &as.poleDenom, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.pole", &as.pole, dt, sh));
 				}
 			}
 		}
@@ -2971,6 +4690,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 	const bool isAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 	const unsigned int atlasRank = trainingConfig.atlas.rank;
 	const unsigned int atlasComplementRank = trainingConfig.atlas.complementRank;
+	const unsigned int atlasSparrowModeRank = trainingConfig.atlas.sparrowModeRank;
 	if (netType == TYPE_DFF)
 	{
 		// Pre-allocate ATLAS state vector so checkpoint tensors can be read into it.
@@ -3006,7 +4726,157 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				const unsigned int m = tr.out, n = tr.in;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
 				std::ostringstream oss; oss << "dff.t" << static_cast<unsigned long long>(t);
-				enqueueAtlasRead(expected, oss.str(), tensorDff.atlasState[t], m, n, r, atlasComplementRank, dt);
+				enqueueAtlasRead(expected, oss.str(), tensorDff.atlasState[t], m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
+			}
+		}
+		if (includeOpt && isAtlas && trainingConfig.atlas.helmEnabled && tensorDff.helm.initialized)
+		{
+			const TensorDFFState::HelmState& hs = tensorDff.helm;
+			const unsigned int pastDim = hs.hiddenDim + hs.outputDim;
+			const unsigned int modeRank = hs.modeRank;
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(hs.hiddenDim));
+				expected.push_back(TensorReadRef("dff.helm.prevHiddenMean", &tensorDff.helm.prevHiddenMean, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(hs.outputDim));
+				expected.push_back(TensorReadRef("dff.helm.prevResidualMean", &tensorDff.helm.prevResidualMean, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(hs.hiddenDim));
+				expected.push_back(TensorReadRef("dff.helm.hiddenVar", &tensorDff.helm.hiddenVar, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(hs.outputDim));
+				expected.push_back(TensorReadRef("dff.helm.residualVar", &tensorDff.helm.residualVar, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(hs.outputDim));
+				sh.push_back(static_cast<uint64_t>(pastDim));
+				expected.push_back(TensorReadRef("dff.helm.crossCov", &tensorDff.helm.crossCov, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(modeRank));
+				sh.push_back(static_cast<uint64_t>(hs.outputDim));
+				expected.push_back(TensorReadRef("dff.helm.leftMode", &tensorDff.helm.leftMode, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(modeRank));
+				sh.push_back(static_cast<uint64_t>(pastDim));
+				expected.push_back(TensorReadRef("dff.helm.rightMode", &tensorDff.helm.rightMode, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(modeRank));
+				expected.push_back(TensorReadRef("dff.helm.sigma", &tensorDff.helm.sigma, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(modeRank));
+				expected.push_back(TensorReadRef("dff.helm.latent", &tensorDff.helm.latent, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(modeRank));
+				expected.push_back(TensorReadRef("dff.helm.poleNumer", &tensorDff.helm.poleNumer, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(modeRank));
+				expected.push_back(TensorReadRef("dff.helm.poleDenom", &tensorDff.helm.poleDenom, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(modeRank));
+				expected.push_back(TensorReadRef("dff.helm.pole", &tensorDff.helm.pole, dt, sh));
+			}
+		}
+		if (includeOpt && isAtlas && trainingConfig.atlas.asterEnabled && tensorDff.aster.initialized)
+		{
+			const TensorDFFState::AsterState& as = tensorDff.aster;
+			const unsigned int featureDim = as.outputDim + (2u * as.controlDim);
+			const unsigned int stateRank = as.stateRank;
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(as.controlDim));
+				expected.push_back(TensorReadRef("dff.aster.prevControlMean", &tensorDff.aster.prevControlMean, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				expected.push_back(TensorReadRef("dff.aster.prevResidualMean", &tensorDff.aster.prevResidualMean, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(as.controlDim));
+				expected.push_back(TensorReadRef("dff.aster.controlVar", &tensorDff.aster.controlVar, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				expected.push_back(TensorReadRef("dff.aster.residualVar", &tensorDff.aster.residualVar, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(featureDim));
+				sh.push_back(static_cast<uint64_t>(featureDim));
+				expected.push_back(TensorReadRef("dff.aster.pastCov", &tensorDff.aster.pastCov, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				sh.push_back(static_cast<uint64_t>(featureDim));
+				expected.push_back(TensorReadRef("dff.aster.crossCov", &tensorDff.aster.crossCov, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				sh.push_back(static_cast<uint64_t>(featureDim));
+				expected.push_back(TensorReadRef("dff.aster.theta", &tensorDff.aster.theta, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				expected.push_back(TensorReadRef("dff.aster.leftMode", &tensorDff.aster.leftMode, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				sh.push_back(static_cast<uint64_t>(featureDim));
+				expected.push_back(TensorReadRef("dff.aster.rightMode", &tensorDff.aster.rightMode, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				expected.push_back(TensorReadRef("dff.aster.sigma", &tensorDff.aster.sigma, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				expected.push_back(TensorReadRef("dff.aster.latent", &tensorDff.aster.latent, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				expected.push_back(TensorReadRef("dff.aster.poleNumer", &tensorDff.aster.poleNumer, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				expected.push_back(TensorReadRef("dff.aster.poleDenom", &tensorDff.aster.poleDenom, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				expected.push_back(TensorReadRef("dff.aster.pole", &tensorDff.aster.pole, dt, sh));
 			}
 		}
 	}
@@ -3058,13 +4928,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					const unsigned int m = hl.h, n = hl.in;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Wxh";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasWxh, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasWxh, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 				{
 					const unsigned int m = hl.h, n = hl.h;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "rnn.h" << static_cast<unsigned long long>(l) << ".Whh";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasWhh, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasWhh, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 			}
 		}
@@ -3090,7 +4960,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		{
 			const unsigned int m = tensorRnn.O.out, n = tensorRnn.O.in;
 			const unsigned int r = std::min(atlasRank, std::min(m, n));
-			enqueueAtlasRead(expected, "rnn.o", tensorRnn.O.atlasWhy, m, n, r, atlasComplementRank, dt);
+			enqueueAtlasRead(expected, "rnn.o", tensorRnn.O.atlasWhy, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 		}
 	}
 	else if (netType == TYPE_GRU || netType == TYPE_LSTM)
@@ -3148,13 +5018,13 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					const unsigned int m = tg.gateCount * hl.h, n = hl.in;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".W";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasW, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasW, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 				{
 					const unsigned int m = tg.gateCount * hl.h, n = hl.h;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << prefix << ".h" << static_cast<unsigned long long>(l) << ".U";
-					enqueueAtlasRead(expected, oss.str(), hl.atlasU, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), hl.atlasU, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 			}
 		}
@@ -3180,7 +5050,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 		{
 			const unsigned int m = tg.O.out, n = tg.O.in;
 			const unsigned int r = std::min(atlasRank, std::min(m, n));
-			enqueueAtlasRead(expected, std::string(prefix) + ".o", tg.O.atlasWhy, m, n, r, atlasComplementRank, dt);
+			enqueueAtlasRead(expected, std::string(prefix) + ".o", tg.O.atlasWhy, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 		}
 	}
 	else if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
@@ -3617,37 +5487,37 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 					const unsigned int m = dModel, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wq";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWq, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWq, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 				{
 					const unsigned int m = dModelKV, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wk";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWk, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWk, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 				{
 					const unsigned int m = dModelKV, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wv";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWv, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWv, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 				{
 					const unsigned int m = dModel, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".Wo";
-					enqueueAtlasRead(expected, oss.str(), b.atlasWo, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasWo, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 				{
 					const unsigned int m = ff1Width, n = dModel;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".W1";
-					enqueueAtlasRead(expected, oss.str(), b.atlasW1, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasW1, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 				{
 					const unsigned int m = dModel, n = tt.dFF;
 					const unsigned int r = std::min(atlasRank, std::min(m, n));
 					std::ostringstream oss; oss << "tr.b" << li << ".W2";
-					enqueueAtlasRead(expected, oss.str(), b.atlasW2, m, n, r, atlasComplementRank, dt);
+					enqueueAtlasRead(expected, oss.str(), b.atlasW2, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 				}
 			}
 		}
@@ -3656,18 +5526,18 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			{
 				const unsigned int m = dModel, n = inputSize;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
-				enqueueAtlasRead(expected, "tr.WIn", tt.atlasWIn, m, n, r, atlasComplementRank, dt);
+				enqueueAtlasRead(expected, "tr.WIn", tt.atlasWIn, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 			}
 			{
 				const unsigned int m = outSize, n = dModel;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
-				enqueueAtlasRead(expected, "tr.WOut", tt.atlasWOut, m, n, r, atlasComplementRank, dt);
+				enqueueAtlasRead(expected, "tr.WOut", tt.atlasWOut, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 			}
 			if (tt.tokenModel)
 			{
 				const unsigned int m = tt.vocabSize, n = dModel;
 				const unsigned int r = std::min(atlasRank, std::min(m, n));
-				enqueueAtlasRead(expected, "tr.tokE", tt.atlasTokE, m, n, r, atlasComplementRank, dt);
+				enqueueAtlasRead(expected, "tr.tokE", tt.atlasTokE, m, n, r, atlasComplementRank, atlasSparrowModeRank, dt);
 			}
 		}
 	}
@@ -3831,6 +5701,58 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			{
 				std::ostringstream oss; oss << "dff.t" << static_cast<unsigned long long>(t);
 				readAtlasManifestKV(kv, oss.str(), tensorDff.atlasState[t]);
+			}
+			if (trainingConfig.atlas.helmEnabled && tensorDff.helm.initialized)
+			{
+				// Legacy scalar HELM checkpoints stored the latent/pole state in the
+				// manifest rather than as tensors. Preserve that fallback for the
+				// rank-1 case so older checkpoints still resume cleanly.
+				if (tensorDff.helm.latent.size() == 1u)
+				{
+					{
+						std::map<std::string, std::string>::const_iterator it = kv.find("dff.helm.latent");
+						if (it != kv.end())
+						{
+							std::istringstream iss(it->second);
+							iss >> tensorDff.helm.latent[0];
+						}
+					}
+					{
+						std::map<std::string, std::string>::const_iterator it = kv.find("dff.helm.poleNumer");
+						if (it != kv.end())
+						{
+							std::istringstream iss(it->second);
+							iss >> tensorDff.helm.poleNumer[0];
+						}
+					}
+					{
+						std::map<std::string, std::string>::const_iterator it = kv.find("dff.helm.poleDenom");
+						if (it != kv.end())
+						{
+							std::istringstream iss(it->second);
+							iss >> tensorDff.helm.poleDenom[0];
+						}
+					}
+					{
+						std::map<std::string, std::string>::const_iterator it = kv.find("dff.helm.pole");
+						if (it != kv.end())
+						{
+							std::istringstream iss(it->second);
+							iss >> tensorDff.helm.pole[0];
+						}
+					}
+				}
+				std::fill(tensorDff.helm.batchHiddenSum.begin(), tensorDff.helm.batchHiddenSum.end(), 0.0f);
+				std::fill(tensorDff.helm.batchHiddenSqSum.begin(), tensorDff.helm.batchHiddenSqSum.end(), 0.0f);
+				std::fill(tensorDff.helm.batchResidualSum.begin(), tensorDff.helm.batchResidualSum.end(), 0.0f);
+				std::fill(tensorDff.helm.batchResidualSqSum.begin(), tensorDff.helm.batchResidualSqSum.end(), 0.0f);
+			}
+			if (trainingConfig.atlas.asterEnabled && tensorDff.aster.initialized)
+			{
+				std::fill(tensorDff.aster.batchHiddenSum.begin(), tensorDff.aster.batchHiddenSum.end(), 0.0f);
+				std::fill(tensorDff.aster.batchHiddenSqSum.begin(), tensorDff.aster.batchHiddenSqSum.end(), 0.0f);
+				std::fill(tensorDff.aster.batchResidualSum.begin(), tensorDff.aster.batchResidualSum.end(), 0.0f);
+				std::fill(tensorDff.aster.batchResidualSqSum.begin(), tensorDff.aster.batchResidualSqSum.end(), 0.0f);
 			}
 		}
 		else if (netType == TYPE_RNN)

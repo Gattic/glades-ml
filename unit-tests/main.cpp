@@ -41,6 +41,7 @@
 #include "Backend/Machine Learning/hyperparameter-tuner-test.h"
 #include "Backend/Machine Learning/atlas-test.h"
 #include "Backend/Machine Learning/atlas-bench.h"
+#include "Backend/Machine Learning/atlas-alt-bench.h"
 #include "Backend/Machine Learning/sfcka-test.h"
 #include "Backend/Machine Learning/transformer-gradient-test.h"
 #include "Backend/Machine Learning/simd-parity-test.h"
@@ -149,10 +150,14 @@ int main(int argc, char* argv[])
 		HyperparameterTunerFullLoopTest();
 	    else if (strcmp(argv[1], "atlas") == 0)
 		ATLASUnitTest();
+	    else if (strcmp(argv[1], "atlas-controller") == 0)
+		ATLASControllerUnitTest();
 	    else if (strcmp(argv[1], "atlas-gpu-nan") == 0)
 		ATLASGpuNaNTest();
 	    else if (strcmp(argv[1], "atlas-bench") == 0)
 		ATLASBenchmark(argc, argv);
+	    else if (strcmp(argv[1], "atlas-alt-bench") == 0)
+		ATLASAltBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)

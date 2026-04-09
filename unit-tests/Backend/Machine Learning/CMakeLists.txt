@@ -30,6 +30,7 @@ gan-test.cpp
 hyperparameter-tuner-test.cpp
 atlas-test.cpp
 atlas-bench.cpp
+atlas-alt-bench.cpp
 sfcka-test.cpp
 simd-parity-test.cpp
 sampling-test.cpp

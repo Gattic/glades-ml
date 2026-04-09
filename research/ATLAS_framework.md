@@ -36,10 +36,14 @@ The implemented redesign therefore makes three concrete changes:
 - **Residual complement block prototype.** `complementRank` now controls a dense low-rank residual block `V R V^T` instead of a single scalar direction. `complementRank=1` reproduces the earlier sector path; `complementRank>1` enables a denser FC-style residual closure.
 - **FC-gated adaptive residual rank.** Tagged hidden FC-style layers now treat `complementRank` as a cap, keep a runtime `activeComplementRank`, and promote/demote residual modes only at ATLAS control boundaries. Untagged/unit-test calls keep the fixed-block semantics so the core math stays directly testable.
 - **Scout-driven birth criterion.** Residual-rank birth no longer waits for the dense-block EMA alone. It now uses the current residual-block sample as a scout and scores birth with a Kelly-style edge fraction relative to the isotropic tail, while deaths remain EMA-based.
+- **Kelly-style probationary acceptance.** A born residual mode is no longer promoted immediately. Stable low-uncertainty modes can still graduate into the active complement block, but fresh scout-only modes now remain on probation until their excess-return estimate clears a Kelly-style risk charge based on sample/EMA disagreement and directional alignment.
+- **Transported `q=2` scout quality filter.** Birth proposals now come from a two-mode scout subspace rather than a single raw sample eigenvector. The controller projects that scout subspace onto the next transported EMA residual mode, penalizes overlap with already-retained complement directions, and only hands the resulting projected support to the Kelly probation gate.
+- **Generalized quotient scout geometry.** On the CPU ATLAS control-boundary path (`tSub>0`), residual proposals now use a separate scout basis on the quotient complement and score directions with a generalized eigenvalue against tail, innovation, and retained-block contamination penalties. The older `tSub=0` controller path remains as a focused fallback for the math tests.
 - **Complement-specific damping controls.** The residual block uses its own nominal lr scale and `kappaMax` cap instead of inheriting the more aggressive active-space settings. The current default keeps the complement path conservative while the richer closure is still benchmarked.
 
 Observed outcomes on April 8, 2026:
 - `./glades-unit-tests atlas` passes with the redesign enabled.
+- `./glades-unit-tests atlas-controller` now passes, covering four focused controller cases: stable modes promote after one probation window, fresh scout spikes stay on probation, rotated two-mode scout subspaces remain promotable, and misaligned scout directions are rejected outright.
 - The aggressive adaptive-rank setting improved throughput slightly but hurt MNIST test accuracy; it is therefore no longer the default.
 - The trace-closed baseline path with `complementRank=0` reached `train=8.06s`, `testAcc=98.14%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 0`.
 - The one-sector residual closure with `complementRank=1` reached `train=8.00s`, `testAcc=97.72%` on `./glades-unit-tests atlas-bench --mode standard --repeats 1 --atlas-complement-rank 1`.
@@ -47,6 +51,10 @@ Observed outcomes on April 8, 2026:
 - The new dense residual block with `complementRank=4` reached `train=7.98s`, `testAcc=98.10%`. It captures more FC complement trace than the scalar path and is slightly faster than the isotropic baseline, but it still loses a small amount of out-of-sample accuracy.
 - The first FC-gated adaptive residual-rank path with `complementRank=4` reached `train=8.21s`, `testAcc=97.82%` on the same benchmark. By step 200 the hidden FC block was still parked at `complement_active_rank=0`, so that controller was conservative enough to avoid over-correction but not strong enough to recover the dense block’s lost accuracy.
 - After switching births to the scout-driven Kelly-style criterion, the same benchmark still reached only `train=8.28s`, `testAcc=97.82%`. The hidden FC layer now promoted to `complement_active_rank=1` at step 200 with `birth_scout≈5.62` and `birth_kelly≈0.73`, but the extra modeled residual trace (`sector_trace_capture≈0.0099`) still did not improve out-of-sample accuracy.
+- After adding the Kelly-style probationary gate, the standard benchmark with `complementRank=4` still reached only `train=8.40s`, `testAcc=97.82%`, versus the `complementRank=0` baseline at `train=8.39s`, `testAcc=98.14%`. At the hidden FC layer’s step-200 control boundary the candidate residual mode stayed inactive (`complement_active_rank=0`) because the new quality metrics were explicitly negative (`complement_trial_alignment≈0.021`, `complement_trial_return≈-0.172`).
+- After replacing the single scout vector with the transported `q=2` scout filter, the standard benchmark still reached only `train=8.21s`, `testAcc=97.82%`, versus the refreshed `complementRank=0` baseline at `train=8.27s`, `testAcc=98.14%`. The hidden FC layer’s step-200 controller state was materially cleaner because the scout now measured projected support and retained-block contamination separately, but the candidate residual mode still stayed inactive and did not recover the baseline accuracy.
+- After upgrading the real control-boundary path to the generalized quotient scout, the focused `atlas-controller` suite still passed: stable modes promoted after probation, rotated scout subspaces remained promotable, and misaligned scout directions stayed rejected. This confirmed the scout geometry change did not regress the controller invariants, even though the benchmark still needed to decide whether the stronger scout was enough to justify residual activation on MNIST.
+- On April 9, 2026, the CPU generalized-quotient scout path with `complementRank=4` reached `train=8.30s`, `testAcc=97.94%` on the standard MNIST benchmark, versus the same-day `complementRank=0` baseline at `train=8.25s`, `testAcc=98.10%`. The hidden FC controller signal was materially cleaner: `complement_scout_lambda≈1.79e-4`, `complement_trial_alignment≈0.132`, `complement_trial_return≈-0.017`, and the residual mode stayed inactive instead of being over-promoted.
 - On the hidden FC layer at step 200 of the standard benchmark, the sector-specific damping reduced the logged `sector_rate` from about `0.1609` in the undamped path to `0.0100`, confirming that the retune directly addressed the residual-block over-correction mechanism.
 - On the hidden FC layer at step 200 with `complementRank=4`, the dense block captured about `0.7%` of total trace beyond the active subspace (`sector_trace_capture≈0.007`), but the active-plus-block model still left a very large closure gap (`closure_gap≈161.9`), so the isotropic tail remains the dominant modeled mass.
 
@@ -55,7 +63,11 @@ Interpretation:
 - The scale-consistency issue between `sigma2` and the subspace Fisher statistics is addressed in the implementation by sharing one normalized covariance model.
 - A richer residual closure alone still does **not** beat the `complementRank=0` MNIST baseline. The dense block is a cleaner structural test than the one-sector path, but both the fixed and adaptive `complementRank=4` results remain accuracy-negative.
 - The scout-driven controller fixes the original “no birth” defect, but MNIST still does not reward the added residual freedom. The problem is no longer lack of activation; it is that a rank-1 residual birth still leaves the closure gap overwhelmingly dominated by the isotropic tail.
-- The next likely gains are from better residual direction quality or a stronger validation-free acceptance criterion, not from further scalar damping alone.
+- The Kelly-style probationary gate fixes the opposite defect: ATLAS now correctly refuses the low-alignment FC scout direction that previously activated at step 200. That rejection improves controller discipline, but it still does not recover the isotropic-baseline accuracy, so the remaining issue is not acceptance logic alone.
+- The transported `q=2` scout improves direction-quality measurement, but not enough to change the MNIST decision boundary: the hidden FC scout is now described more faithfully, yet the benchmark still prefers `complementRank=0`.
+- The generalized quotient scout is a better geometric probe than the old raw scout, but the benchmark must still decide whether the hidden FC complement contains a persistent super-tail mode worth activating. If the generalized eigenvalue path still clusters near the tail, complement modeling is not the right lever for this MNIST setting.
+- The April 9, 2026 benchmark now points the same way: the generalized scout reduced false activation pressure, but it still left the hidden FC residual mode below the acceptance bar and did not beat the isotropic baseline. That makes the next research step a retained-mode keep/drop rule or a different benchmark, not another looser birth threshold.
+- The next likely gains are from stronger scout geometry or a validation-free keep/drop rule on retained residual modes, not from further scalar damping alone.
 
 ---
 
@@ -1167,6 +1179,60 @@ averaged over training steps (excluding the first 1000).
 
 ---
 
+## Implementation Note: PRISM Prototype (April 9, 2026)
+
+An opt-in PRISM prototype was implemented in the CPU ATLAS path with two concrete mechanisms:
+
+- an active-space memory correction using up to two lags of compressed-gradient history,
+- a predictive-edge gate that suppresses adaptive complement activation when the residual complement has subcritical lagged edge.
+
+Focused controller coverage now includes:
+
+- a PRISM predictive-edge gate regression that confirms stale complement modes stay rejected,
+- a PRISM active-memory regression that confirms the active correction energy shrinks on aligned histories,
+- checkpoint manifest/state coverage for the new PRISM config and history state.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- `cRank=0`, `prism=0`: `train=8.27s`, `testAcc=97.84%`
+- `cRank=0`, `prism=1`: `train=8.34s`, `testAcc=97.58%`
+- `cRank=4`, `prism=1`: `train=8.30s`, `testAcc=97.74%`
+
+Interpretation:
+
+- The PRISM gate behaves as intended: on the FC hidden layer, the residual predictive edge remains subcritical rather than producing a useful retained complement mode.
+- The active-memory correction is measurable in diagnostics, but on this benchmark it degrades out-of-sample accuracy instead of improving it.
+- So the PRISM hypothesis is informative but not yet beneficial on MNIST: the benchmark still does not justify explicit complement modeling, and the current memory-only correction is not a default-worthy improvement.
+
+The most defensible conclusion from this prototype is that the residual bulk on this benchmark is not just poorly modeled geometry; it is also not yielding enough short-horizon predictive utility to pay for the extra correction.
+
+### RESOLVE Prototype Update
+
+Minimal RESOLVE was implemented on **April 9, 2026** as:
+
+- a transfer-edge gate on the complement controller using lagged active-history cross structure,
+- a stable scalar lag-kernel fit on the active compressed gradients,
+- checkpoint-persisted lag history and benchmark/config plumbing.
+
+Focused validation:
+
+- `atlas-controller` passes, including RESOLVE gate and active-memory tests.
+- `atlas` passes after the RESOLVE config/state persistence updates.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- `cRank=0`, `resolve=0`: `train=8.42s`, `testAcc=97.84%`
+- `cRank=0`, `resolve=1`: `train=8.65s`, `testAcc=97.68%`
+- `cRank=4`, `resolve=1`: `train=8.68s`, `testAcc=97.70%`
+
+Interpretation:
+
+- RESOLVE is measurable in both diagnostics and runtime, but it does not improve the benchmark.
+- On the hidden FC block, the transfer-edge gate can report large edge scores while the retained residual mode still fails to deliver better out-of-sample behavior.
+- That is further evidence that the benchmark problem is not a missing threshold or missing lag term. The compressed statistics are still not isolating a complement mode with robust predictive utility.
+
+---
+
 ## Appendix A: Notation Summary
 
 All notation is defined at first use and collected here for reference.
@@ -1205,8 +1271,993 @@ The PNG extension replaces g^z with g^z_{pred}, which does not fit the standard 
 
 This connection suggests that convergence results for mirror descent with time-varying potentials (e.g., Rakhlin & Sridharan 2013) may be applicable to ATLAS, potentially yielding tighter bounds than the direct analysis in Theorem 9.1.
 
+## Appendix C: HERO Prototype Note
+
+On April 9, 2026, a minimal CPU-only HERO prototype was added on top of the existing RESOLVE path:
+
+- explicit complement activation is now gated by a whitened Hankel-style edge score built from the current active compressed gradient and lagged scout-history slices,
+- the HERO memory fallback reuses the stable active-space pole fit already used by RESOLVE, but applies the separate `heroMemoryScale`,
+- lagged scout history is transported through scout-basis refresh overlap so the gate remains basis-consistent across control boundaries.
+
+The first benchmark result did not justify a default change on standard MNIST:
+
+- baseline `--atlas-complement-rank 0` remained stronger than the HERO-enabled paths,
+- the hidden FC residual stayed subcritical under the HERO gate,
+- the memory-only fallback also failed to recover the isotropic baseline.
+
+Interpretation: the benchmark still supports the broader research conclusion that the unresolved FC complement behaves more like weak predictive bulk than a stable explicit geometric mode family.
+
+## Appendix D: COBALT Prototype Note
+
+On April 9, 2026, a minimal CPU-only COBALT prototype was added as a transfer-weighted variant of the existing active-memory fallback:
+
+- explicit complement activation is now gated by a stacked active-plus-scout transfer-edge score computed from the lagged `resolveGzHistory` and transported scout history,
+- the active-space memory fallback is scaled by the same transfer strength estimate (`cobaltSigma`) rather than a fixed residual-edge heuristic,
+- the implementation reuses the existing ATLAS compressed history buffers, config plumbing, benchmark flags, and checkpoint config persistence.
+
+Focused validation:
+
+- `atlas-controller` passes, including COBALT transfer-gate and active-memory tests.
+- `atlas` passes after the COBALT config and controller changes.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- `cRank=0`, `cobalt=0`: `train=8.21s`, `testAcc=97.84%`
+- `cRank=0`, `cobalt=1`: `train=10.04s`, `testAcc=97.62%`
+- `cRank=4`, `cobalt=1`: `train=10.44s`, `testAcc=97.64%`
+
+Interpretation:
+
+- COBALT is measurable and the controller diagnostics are coherent, but it is materially slower than the isotropic baseline on this benchmark.
+- The hidden FC block can show positive transfer-edge scores while still failing to deliver a useful optimizer intervention.
+- That reinforces the same research conclusion reached by PRISM, RESOLVE, and HERO: on this benchmark, the unresolved FC complement still behaves more like broad weak bulk than a stable, optimizer-useful explicit mode family.
+
+## Appendix E: BIRCH Prototype Note
+
+On April 9, 2026, a minimal CPU-only BIRCH prototype was added as a memory-only Hankel-transfer fallback:
+
+- it computes a local whitened Hankel-style transfer score from stacked active-history slices plus optional transported scout-history slices,
+- it exposes that score through `birch_edge` and `birch_sigma`,
+- it keeps explicit complement activation disabled in the minimal prototype and only uses the supercritical part of the Hankel score to scale an active-space memory kernel.
+
+Focused validation:
+
+- `atlas-controller` passes after the BIRCH integration.
+- `atlas` passes, including the new BIRCH controller regressions and the expanded checkpoint-config coverage.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- `cRank=0`, `birch=0`: `train=8.36s`, `testAcc=97.84%`
+- `cRank=0`, `birch=1`: `train=9.69s`, `testAcc=97.68%`
+- `cRank=4`, `birch=1`: `train=10.00s`, `testAcc=97.66%`
+
+Interpretation:
+
+- BIRCH produces coherent transfer diagnostics and a measurable memory fallback, but it is slower than the isotropic baseline on this benchmark.
+- The hidden FC block can show supercritical local Hankel scores while still failing to improve out-of-sample behavior.
+- That strengthens the overall ATLAS conclusion: on this benchmark, even a more structured transfer-oriented summary still does not isolate a residual component worth paying to model.
+
+## Appendix F: GHOST Prototype Note
+
+On April 9, 2026, a minimal CPU-only GHOST prototype was added as a quotient-horizontal, memory-only transfer fallback:
+
+- it computes an approximate gauge-horizontal projection in the compressed active/scout state by removing the component aligned with the current compressed weight image,
+- it extracts a rank-1 left/right transfer mode from the whitened cross-covariance between the current horizontal active state and lagged horizontal active/scout history,
+- it exposes that mode through `ghost_edge`, `ghost_sigma`, and `ghost_horizontal_ratio`,
+- it keeps explicit complement activation disabled in the minimal prototype and uses the retained transfer mode only to shape an active-space memory correction.
+
+Focused validation:
+
+- `atlas-controller` passes after the GHOST integration.
+- `atlas` passes, including the new GHOST controller regressions and the expanded checkpoint-config coverage.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- `cRank=0`, `ghost=0`: `train=8.26s`, `testAcc=97.84%`
+- `cRank=0`, `ghost=1`: `train=9.89s`, `testAcc=97.94%`
+- `cRank=4`, `ghost=1`: `train=10.53s`, `testAcc=97.72%`
+
+Interpretation:
+
+- GHOST is the first ATLAS-side prototype that explicitly mixes approximate quotienting with a biorthogonal transfer mode rather than another PSD complement block.
+- The prototype is intentionally local and conservative: it uses a single approximate gauge direction and a rank-1 memory correction, not a full quotient-balanced semigroup model.
+- On this benchmark, the memory-only `cRank=0` path is the first recent ATLAS-side transfer prototype to beat the same-day isotropic baseline in a single run, but the gain is small (`97.94%` vs `97.84%`) and comes with a large throughput penalty (`9.89s` vs `8.26s`).
+- Re-enabling complement capacity under GHOST still makes the result worse (`cRank=4`, `testAcc=97.72%`), so the old conclusion remains intact: richer explicit complement modeling is still not paying for itself on standard MNIST.
+- As with HERO, COBALT, and BIRCH, the standard MNIST benchmark remains the falsifier: if the hidden FC residual still fails to clear a useful post-quotient transfer edge, then the remaining ATLAS improvement path on this workload is unlikely to come from richer complement modeling.
+
+## Appendix G: Late-Prototype Benchmark Ledger (April 9, 2026)
+
+For the late April 9 prototypes, the relevant comparison is each prototype against its same-day isotropic `complementRank=0` anchor on the branch snapshot where it was run. The exact baseline timing shifts slightly between snapshots, but the qualitative ranking is stable.
+
+Recorded standard-MNIST outcomes:
+
+- **PRISM**: `cRank=0`, `prism=1` -> `train=8.34s`, `testAcc=97.58%`; `cRank=4`, `prism=1` -> `train=8.30s`, `testAcc=97.74%`.
+- **RESOLVE**: `cRank=0`, `resolve=1` -> `train=8.65s`, `testAcc=97.68%`; `cRank=4`, `resolve=1` -> `train=8.68s`, `testAcc=97.70%`.
+- **HERO**: `cRank=0`, `hero=1` -> `train=8.51s`, `testAcc=97.68%`; `cRank=4`, `hero=1` -> `train=8.53s`, `testAcc=97.70%`.
+- **COBALT**: `cRank=0`, `cobalt=1` -> `train=10.04s`, `testAcc=97.62%`; `cRank=4`, `cobalt=1` -> `train=10.44s`, `testAcc=97.64%`.
+- **BIRCH**: `cRank=0`, `birch=1` -> `train=9.69s`, `testAcc=97.68%`; `cRank=4`, `birch=1` -> `train=10.00s`, `testAcc=97.66%`.
+- **GHOST**: `cRank=0`, `ghost=1` -> `train=9.89s`, `testAcc=97.94%`; `cRank=4`, `ghost=1` -> `train=10.53s`, `testAcc=97.72%`.
+- **SPARROW**: `cRank=0`, `sparrow=1` -> `train=8.75s`, `testAcc=97.76%`; `cRank=2`, `sparrow=1` -> `train=8.76s`, `testAcc=97.88%`; `cRank=4`, `sparrow=1` -> `train=8.86s`, `testAcc=98.00%`.
+- **ORBIT-Lite**: stabilized CPU last-layer prototype, `cRank=0`, `orbit=1` -> `train=8.25s`, `testAcc=97.36%`; `cRank=4`, `orbit=1` -> `train=8.36s`, `testAcc=97.40%`.
+- **QBRT**: `cRank=0`, `qbrt=1` -> `train=10.00s`, `testAcc=97.78%`; `cRank=4`, `qbrt=1` -> `train=9.97s`, `testAcc=97.78%`.
+- **QRC**: `cRank=0`, `qrc=1` -> `train=9.90s`, `testAcc=97.84%`; `cRank=4`, `qrc=1` -> `train=10.05s`, `testAcc=97.80%`.
+- **RIFT**: `cRank=0`, `rift=1` -> `train=17.80s`, `testAcc=97.80%`; `cRank=4`, `rift=1` -> `train=17.93s`, `testAcc=97.84%`.
+
+Cross-run synthesis:
+
+- These late prototypes consistently improved controller discipline and made the diagnostics more interpretable, but they almost never justified explicit complement activation on standard MNIST.
+- With the lone exception of SPARROW, `cRank>0` remained accuracy-negative across the late transfer/memory prototypes listed above.
+- GHOST was the first late prototype to produce a small same-day single-run accuracy lift over its isotropic anchor, but it paid a large runtime cost and did not overturn the broader conclusion.
+- SPARROW kept the GHOST lesson while removing most of that transfer-model tax. Its memory-only `cRank=0` path was still accuracy-negative, but with larger scout capacity it recovered part of the lost accuracy: `cRank=2` reached `97.88%` and `cRank=4` reached `98.00%` while staying materially faster than GHOST (`8.76-8.86s` vs `9.89-10.53s`).
+- ORBIT-Lite kept the quotient-focused lesson but moved the memory path to the output head. After stabilizing the edge score and making the correction truly memory-only, it avoided the earlier output-head blow-up, but both `cRank=0` and `cRank=4` remained below the same-day isotropic baseline (`97.36-97.40%` vs `97.84%`).
+- QBRT pushed the same transfer-first lesson toward a small quotient-balanced ARX-style controller. It produced clear bounded transfer diagnostics, but on standard MNIST both the memory-only and `cRank=4` paths landed at `97.78%` while costing about `9.97-10.00s`, so the extra balanced-transfer machinery did not pay for itself on this workload either.
+- QRC distilled the same transfer-memory lesson into a tiny reduced robust controller on quotient-active coordinates. That made the controller logic cleaner, but it did not improve the tradeoff: the memory-only `cRank=0` path only matched the same-day isotropic accuracy (`97.84%`) while slowing to `9.90s`, and `cRank=4` slipped back to `97.80%` at `10.05s`.
+- RIFT tested whether the remaining signal was pathwise rather than purely transfer-linear by adding a second-level signature-style observer on quotient-horizontal active/scout histories. On standard MNIST that richer path statistic did not preserve the SPARROW gain: `cRank=0` fell to `97.80%` and `cRank=4` only recovered to `97.84%`, while both runs roughly doubled training time (`17.80-17.93s`).
+- Even so, SPARROW did not beat the same-day isotropic baseline of `97.84%` decisively enough, or cheaply enough, to justify a default change. The best SPARROW point (`cRank=4`) is still slower than the plain isotropic path (`8.86s` vs `8.47s`) and still trails the stronger April 8 reference snapshot.
+- A follow-up FC-heavy MLP benchmark was then added to test the obvious escape hatch: move the same SPARROW idea to a workload with much more fully connected structure. That benchmark did not rescue the result. Across three repeats on April 9, 2026, the FC-heavy ATLAS baseline landed at `12.32 +/- 0.24s`, `96.56 +/- 0.22%`, while SPARROW remained flat or slightly worse: `cRank=0` -> `13.74 +/- 0.51s`, `96.52 +/- 0.22%`; `cRank=2` -> `13.61 +/- 0.10s`, `96.51 +/- 0.22%`; `cRank=4` -> `13.03 +/- 0.35s`, `96.55 +/- 0.29%`.
+- Two materially different task classes were then added through `atlas-alt-bench`. The small autoregressive token-LM benchmark was a clean negative result: across three repeats on April 9, 2026, AdamW remained strongest at `train=1.33 +/- 0.00s`, `testNLL=4.32010 +/- 0.02348`, `testPPL=75.217 +/- 1.751`, while isotropic ATLAS reached `train=2.10 +/- 0.01s`, `testNLL=4.19541 +/- 0.00789`, and SPARROW only matched or slightly worsened that ATLAS result at much lower throughput (`train=3.77 +/- 0.09s`, `testNLL=4.20153 +/- 0.01115`, `testPPL=66.793 +/- 0.743`).
+- The planted teacher-student benchmark was the first materially different task where the transfer-memory branch clearly paid off. Across three repeats on April 9, 2026, AdamW landed at `testMSE=0.07863 +/- 0.00278`, `testR2%=3.737 +/- 3.398`, isotropic ATLAS improved that to `testMSE=0.05933 +/- 0.01585`, `testR2%=27.366 +/- 19.406`, and ATLAS-SPARROW improved again to `testMSE=0.04640 +/- 0.00142`, `testR2%=43.200 +/- 1.733`, with a moderate throughput penalty (`1.67s` vs `1.28s` for isotropic ATLAS).
+- A later rank-2 SPARROW follow-up showed that the transfer-memory branch is real, but not uniformly improved by adding a second streaming mode. On the canonical planted teacher cases, rank-2 won the strongest signal case (`signal-win`: base `0.13618`, rank-1 `0.10486`, rank-2 `0.10431`), lost the neutral anchor (`default-anchor`: base `0.05800`, rank-1 `0.05847`, rank-2 `0.06964`), and gave back the earlier rank-1 advantage in the failure band (`failure-band`: base `0.17332`, rank-1 `0.12703`, rank-2 `0.17300`). On latent-state forecasting, rank-1 and rank-2 were effectively tied on held-out accuracy while rank-2 was slightly slower: rank-1 `train=2.53 +/- 0.01s`, `testMSE=0.00266 +/- 0.00017`, `testR2%=34.980 +/- 4.159`; rank-2 `train=2.60 +/- 0.03s`, `testMSE=0.00266 +/- 0.00017`, `testR2%=34.979 +/- 4.158`.
+- An automatic second-mode gate then narrowed that conclusion. With `modeRankCap=2`, `autoGate=1`, `secondEdgeThreshold=0.10`, and `secondEdgeFraction=0.50`, the canonical planted cases shifted to: `signal-win` base `0.13618`, rank-1 `0.10486`, auto `0.10432`; `default-anchor` base `0.05800`, rank-1 `0.05847`, auto `0.06964`; `failure-band` base `0.17332`, rank-1 `0.12703`, auto `0.17311`. On latent-state forecasting, rank-1 and auto-gated cap-2 were effectively identical on both speed and held-out accuracy: rank-1 `train=2.53 +/- 0.01s`, `testMSE=0.00266 +/- 0.00017`, `testR2%=34.980 +/- 4.159`; auto-gated cap-2 `train=2.53 +/- 0.01s`, `testMSE=0.00266 +/- 0.00017`, `testR2%=34.981 +/- 4.159`. The practical reading is that a gated second mode is a safer experimental cap than unconditional rank-2, but it still does not replace rank-1 as the default SPARROW setting.
+- A final nonlinear latent-dynamics follow-up tested whether the positive branch survives once the latent process stops being purely linear. It did not. On a switching/tanh partially observed forecasting task, isotropic ATLAS still beat SPARROW: ATLAS-BSRP reached `testMSE=0.00143 +/- 0.00009`, `testR2%=21.498 +/- 4.802`, while SPARROW rank-1 fell to `0.00159 +/- 0.00014`, `12.295 +/- 7.634`. Auto-gated cap-2 materially activated the second streaming mode (`activeModes=1.69 +/- 0.35`, `mode2Frac=0.685 +/- 0.346`, `edge2/1=0.662 +/- 0.166`) but did not improve the held-out result over rank-1. That is the strongest current evidence that the remaining bottleneck is the observable family, not just mode count or controller gating.
+- The stronger historical reference remains the earlier April 8 isotropic branch snapshot: `cRank=0` reached `train=8.06s`, `testAcc=98.14%`. None of the later transfer-oriented memory prototypes surpassed that earlier benchmark.
+
+## Appendix H: SPARROW Prototype Note
+
+On April 9, 2026, a minimal CPU-only SPARROW prototype was added as a higher-throughput descendant of GHOST:
+
+- it keeps the approximate quotient-horizontal projection used by GHOST,
+- it replaces lag-stack balanced-mode extraction with a streaming rank-1 left/right transfer observer,
+- it fits a single stable latent pole online and uses that latent state only for a memory-style active correction,
+- it keeps explicit complement activation disabled in the minimal prototype, but still allows a larger scout-capacity budget to improve the observer.
+
+Focused validation:
+
+- `atlas-controller` passes after the SPARROW integration, including new memory-only controller tests.
+- `atlas` passes, including the expanded checkpoint-config coverage and SPARROW controller regressions.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- baseline `cRank=0`, `sparrow=0`: `train=8.47s`, `testAcc=97.84%`
+- memory-only `cRank=0`, `sparrow=1`: `train=8.75s`, `testAcc=97.76%`
+- scout budget `cRank=2`, `sparrow=1`: `train=8.76s`, `testAcc=97.88%`
+- larger scout budget `cRank=4`, `sparrow=1`: `train=8.86s`, `testAcc=98.00%`
+
+Interpretation:
+
+- SPARROW is materially faster than GHOST while preserving the same core idea: quotient-horizontalization plus directional transfer memory instead of explicit complement geometry.
+- The cheap `cRank=0` SPARROW path did not help on standard MNIST, so the useful part of the signal is not captured by the smallest possible observer.
+- Increasing the scout budget to `cRank=2` and `cRank=4` improved out-of-sample accuracy again without reverting to the full GHOST runtime tax, which suggests the useful information is still transfer-directional but not well represented by the smallest scout sketch.
+- The best SPARROW point in this pass (`cRank=4`, `98.00%`) remains slower than the same-day isotropic baseline and still does not surpass the stronger April 8 isotropic reference (`98.14%`), so the prototype should stay opt-in.
+
+Later follow-up on **April 9, 2026**:
+
+- A rank-2 SPARROW extension was added as a direct test of whether the positive task-class results were still rank-1 limited.
+- The result was regime-dependent rather than uniformly better. Rank-2 slightly improved the strongest planted teacher case, regressed the neutral anchor, and erased the earlier rank-1 advantage in a known failure band.
+- On latent-state forecasting, rank-1 and rank-2 were effectively tied on held-out accuracy, with rank-2 slightly slower (`2.60s` vs `2.53s`).
+- So the practical follow-up conclusion is narrower than “increase mode rank”: rank-2 should remain task-conditioned or opt-in, not treated as a new default SPARROW setting.
+
+## Appendix I: ORBIT-Lite Prototype Note
+
+On April 9, 2026, a minimal CPU-only ORBIT-Lite prototype was added as a final-layer, quotient-function-space descendant of the GHOST/SPARROW line:
+
+- it is restricted to small output heads rather than hidden FC blocks,
+- it removes common-logit row-mean motion before scoring a mode,
+- it uses a bounded trace-normalized class-space spike rather than an unregularized generalized eigenvalue,
+- it applies a true memory-only correction by shifting the current signal into the next-step latent state instead of feeding it back immediately,
+- it keeps explicit complement activation off in the minimal path and only perturbs the active correction.
+
+Focused validation:
+
+- `atlas-controller` passes after the ORBIT-Lite integration, including the new output-head memory-only controller coverage.
+- `atlas` passes, including the expanded checkpoint-config coverage and ORBIT controller regressions.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- baseline `cRank=0`, `orbit=0`: `train=8.23s`, `testAcc=97.84%`
+- memory-only `cRank=0`, `orbit=1`: `train=8.25s`, `testAcc=97.36%`
+- mixed path `cRank=4`, `orbit=1`: `train=8.36s`, `testAcc=97.40%`
+
+Representative output-head diagnostics at the logged step-200 control boundary after stabilization:
+
+- memory-only `cRank=0`: `orbit_edge=0.315021`, `orbit_sigma=0.315021`, `orbit_pole=0.95`, `orbit_memory_gain=0.0111588`
+- mixed `cRank=4`: `orbit_edge=0.231249`, `orbit_sigma=0.231249`, `orbit_pole=0.95`, `orbit_memory_gain=0.00763152`
+
+Interpretation:
+
+- The stabilized ORBIT-Lite path did what it was supposed to mechanically: the output-head observer stopped saturating, the edge score became bounded and interpretable, and the memory gain stayed small.
+- Even after that correction, ORBIT-Lite remained accuracy-negative on standard MNIST. So the failure is no longer numerical instability; it is that this benchmark still does not reward the output-head quotient-memory path enough to beat the isotropic ATLAS baseline.
+- Unlike the earlier naive ORBIT attempt, the final recorded result is a meaningful negative result rather than a broken prototype. That is useful: it narrows the remaining headroom and suggests that moving further toward explicit function-space quotienting will need either a stronger benchmark or richer output-space observables than this minimal last-layer sketch.
+
+## Appendix J: QBRT Prototype Note
+
+On April 9, 2026, a minimal CPU-only QBRT prototype was added as a quotient-balanced, transfer-first descendant of the GHOST/SPARROW line:
+
+- it reuses the existing compressed active/scout histories rather than adding another explicit complement basis family,
+- it forms a small quotient-style horizontal past/future transfer problem on the compressed state,
+- it extracts a bounded rank-1 balanced transfer score and left/right memory mode,
+- it fits a stable latent pole online and uses that latent state only for an active-space memory correction,
+- it leaves explicit complement activation effectively suppressed in the minimal path, even when `cRank=4` is allowed.
+
+Focused validation:
+
+- `atlas-controller` passes after the QBRT integration, including the new balanced-transfer controller coverage.
+- `atlas` passes, including the expanded checkpoint-config coverage and QBRT controller regressions.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- baseline `cRank=0`, `qbrt=0`: `train=8.28s`, `testAcc=97.84%`
+- memory-only `cRank=0`, `qbrt=1`: `train=10.00s`, `testAcc=97.78%`
+- mixed path `cRank=4`, `qbrt=1`: `train=9.97s`, `testAcc=97.78%`
+
+Representative hidden-FC diagnostics at the logged step-200 control boundary:
+
+- memory-only `cRank=0`: `qbrt_edge=0.761053`, `qbrt_sigma=1.76251`, `qbrt_pole=0.0719671`, `qbrt_horizontal_ratio=0.998086`, `qbrt_memory_gain=0.0379798`
+- mixed `cRank=4`: `qbrt_edge=0.884316`, `qbrt_sigma=1.88637`, `qbrt_pole=0.00783868`, `qbrt_horizontal_ratio=0.997686`, `qbrt_memory_gain=0.0441135`
+
+Interpretation:
+
+- QBRT confirmed the main late-prototype lesson rather than overturning it: a more structured balanced-transfer score can be measured cleanly, but on standard MNIST that signal still does not convert into a better ATLAS update.
+- Unlike the older complement experiments, QBRT did not fail because its controller was obviously misfiring. The recorded transfer edge and memory gain are both finite and nontrivial, yet the benchmark still lands slightly below the isotropic baseline.
+- That makes QBRT a useful negative result. It narrows the likely cause further: on this workload, the residual transfer signal is either too weak, too noisy, or too misaligned with generalization to justify the extra memory machinery.
+- In practical terms, QBRT should remain opt-in. It adds overhead comparable to the heavier transfer prototypes while failing to beat the simpler isotropic path or the cheaper SPARROW variant.
+
+## Appendix K: RIFT Prototype Note
+
+On April 9, 2026, a minimal CPU-only RIFT prototype was added as a path-signature descendant of the GHOST/SPARROW line:
+
+- it keeps quotient-horizontal projection in the compressed active/scout state,
+- it replaces the rank-1 transfer observer with an order-2 signature-style feature map over recent control-boundary history,
+- it fits a stable memory-only latent state from that path feature block,
+- it keeps explicit complement activation suppressed even when `cRank=4` is allowed.
+
+Focused validation:
+
+- `atlas-controller` passes after the RIFT integration, including the new signature-path controller coverage.
+- `atlas` passes, including the expanded checkpoint-config coverage and the RIFT controller regressions.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- baseline `cRank=0`, `rift=0`: `train=8.34s`, `testAcc=97.84%`
+- memory-only `cRank=0`, `rift=1`: `train=17.80s`, `testAcc=97.80%`
+- mixed path `cRank=4`, `rift=1`: `train=17.93s`, `testAcc=97.84%`
+
+Representative step-200 diagnostics from the final benchmark runs:
+
+- hidden FC, `cRank=0`: `rift_edge=0.0196265`, `rift_sigma=1`, `rift_pole=0.000334218`, `rift_horizontal_ratio=0.997851`, `rift_area_energy=0.000386859`, `rift_memory_gain=0`
+- output head, `cRank=0`: `rift_edge=0.0656473`, `rift_sigma=1`, `rift_pole=0.0593547`, `rift_horizontal_ratio=0.991745`, `rift_area_energy=0.00438161`, `rift_memory_gain=0.000823541`
+- hidden FC, `cRank=4`: `rift_edge=0.0216972`, `rift_sigma=1`, `rift_pole=0.00100023`, `rift_horizontal_ratio=0.997683`, `rift_area_energy=0.000472958`, `rift_memory_gain=0`
+
+Interpretation:
+
+- RIFT is a clean negative result, not a broken prototype. The signature-path observer is bounded, restorable, and test-covered.
+- On this workload, the extra path-statistic machinery is expensive and almost entirely inactive at the hidden FC layer. The measured level-2 area share stays tiny, and the resulting memory gain is usually zero at the layer that originally motivated the complement work.
+- Allowing `cRank=4` does not recover the lost runtime or produce a better result than the same-day isotropic baseline; it only climbs back to a statistical tie (`97.84%`) while staying much slower.
+- Relative to SPARROW, the lesson is narrow but useful: richer pathwise features did not help because the remaining signal on standard MNIST is too weak to justify second-level signature machinery. The surviving positive clue is still the cheaper transfer-directional observer, not a heavier path-geometry model.
+
+## Appendix L: QRC Prototype Note
+
+On April 9, 2026, a minimal CPU-only QRC prototype was added as a reduced robust-control descendant of the SPARROW/QBRT line:
+
+- it reuses the existing compressed active/scout histories rather than introducing another complement-basis family,
+- it forms a small quotient-active transfer state and extracts a bounded scalar edge, pole, and control gain at ATLAS control boundaries,
+- it keeps the path memory-only by applying a reduced active-space correction through a left transfer mode and latent state,
+- it suppresses explicit complement activation when `qrc=1`, even if `cRank=4` is allowed.
+
+Focused validation:
+
+- `atlas-controller` passes after the QRC integration, including the new reduced-control controller coverage.
+- `atlas` passes, including the expanded checkpoint-config coverage and the QRC controller regressions.
+
+Standard MNIST benchmark results on **April 9, 2026**:
+
+- baseline `cRank=0`, `qrc=0`: `train=8.21s`, `testAcc=97.84%`
+- memory-only `cRank=0`, `qrc=1`: `train=9.90s`, `testAcc=97.84%`
+- mixed path `cRank=4`, `qrc=1`: `train=10.05s`, `testAcc=97.80%`
+
+Representative hidden-FC diagnostics at the logged step-200 control boundary:
+
+- memory-only `cRank=0`: `qrc_edge=0.840688`, `qrc_sigma=1.84868`, `qrc_pole=0.0907657`, `qrc_horizontal_ratio=0.998124`, `qrc_control_gain=0.0832129`, `qrc_memory_gain=0.0034978`
+- mixed `cRank=4`: `qrc_edge=0.760746`, `qrc_sigma=1.76548`, `qrc_pole=0.0664062`, `qrc_horizontal_ratio=0.997948`, `qrc_control_gain=0.062271`, `qrc_memory_gain=0.00236862`
+
+Interpretation:
+
+- QRC is a clean negative result rather than a broken controller. The reduced transfer edge, pole, and gain all stay bounded and interpretable.
+- The prototype confirms the narrow late-stage lesson: if there is any proceed path left on standard MNIST, it is a small active-space transfer correction, not richer complement geometry.
+- Even so, the QRC controller does not buy new headroom on this workload. The memory-only path only matches the same-day isotropic baseline on accuracy while paying roughly a 20% runtime penalty, and allowing `cRank=4` makes the result slightly worse.
+- Relative to SPARROW, the practical conclusion is unfavorable. The extra reduced-control machinery did not improve the accuracy/runtime tradeoff, so QRC should remain opt-in rather than replacing the cheaper streaming observer.
+
+## Appendix M: FC-Heavy MLP Follow-Up
+
+On April 9, 2026, the `atlas-bench` harness was extended with a dedicated `fc-heavy` mode to test the narrowest remaining proceed hypothesis:
+
+- keep the dataset fixed to MNIST,
+- replace the LeNet-style CNN with a DFF MLP `784 -> 512 -> 256 -> 128 -> 10`,
+- keep the SPARROW controller as the cheapest surviving transfer-memory branch,
+- ask whether the ATLAS signal strengthens when the workload is dominated by fully connected layers rather than conv blocks.
+
+The FC-heavy mode uses a smaller default run budget than the CNN benchmark so repeated CPU runs stay practical:
+
+- train split cap `2000`,
+- test split cap `1000`,
+- epochs `3`,
+- batch size `128`.
+
+Three-repeat standard results on **April 9, 2026**:
+
+- baseline `cRank=0`, `sparrow=0`: `train=12.32 +/- 0.24s`, `testAcc=96.56 +/- 0.22%`
+- memory-only `cRank=0`, `sparrow=1`: `train=13.74 +/- 0.51s`, `testAcc=96.52 +/- 0.22%`
+- scout budget `cRank=2`, `sparrow=1`: `train=13.61 +/- 0.10s`, `testAcc=96.51 +/- 0.22%`
+- larger scout budget `cRank=4`, `sparrow=1`: `train=13.03 +/- 0.35s`, `testAcc=96.55 +/- 0.29%`
+
+Interpretation:
+
+- This benchmark was the most obvious “maybe ATLAS still has room” follow-up after the standard-MNIST CNN falsifier. It gives the method more fully connected structure without changing the data domain.
+- The result is still negative. SPARROW does not produce a statistically meaningful accuracy lift over the FC-heavy isotropic ATLAS baseline, and every tested SPARROW setting is slower.
+- The `cRank=4` point is the least bad variant in this pass, but it only recovers to a statistical tie with baseline (`96.55 +/- 0.29%` vs `96.56 +/- 0.22%`) while remaining slower (`13.03s` vs `12.32s`).
+- That materially weakens the “just move to a more FC-heavy workload” argument. On this repo’s current MNIST-family workloads, the remaining ATLAS headroom looks narrow enough that further complement/transfer variants are hard to justify without changing the observable family or the task class much more aggressively.
+
+## Appendix N: Alternate Task-Class Follow-Up
+
+On April 9, 2026, a new `atlas-alt-bench` harness was added to test materially different proceed paths:
+
+- an autoregressive next-token benchmark with a small CPU transformer decoder and synthetic order-2 recurrence data,
+- a planted teacher-student regression benchmark with a low-rank teacher signal plus nuisance bulk.
+- a partially observed latent-state forecasting benchmark with windowed DFF prediction on top of a stable latent linear system.
+
+The goal was to stop guessing from MNIST-family image tasks and ask two sharper questions:
+
+- does ATLAS/SPARROW help on a task where sequential transfer is intrinsic?
+- does it help on a task where the low-rank transfer signal is explicitly planted?
+
+### N.1 Autoregressive token-LM benchmark
+
+Setup:
+
+- decoder-only transformer, `vocab=65`, `dModel=48`, `dFF=192`, `layers=2`, `heads=4`,
+- `seqLen=32`, `trainSeqs=128`, `testSeqs=32`, `epochs=6`,
+- compared variants: AdamW, isotropic ATLAS-BSRP (`cRank=0`), and ATLAS-SPARROW (`cRank=4`).
+
+Three-repeat results on **April 9, 2026**:
+
+- AdamW: `train=1.33 +/- 0.00s`, `tok/s=18409.1 +/- 33.8`, `trainNLL=3.45656 +/- 0.00956`, `trainPPL=31.709 +/- 0.303`, `testNLL=4.32010 +/- 0.02348`, `testPPL=75.217 +/- 1.751`
+- ATLAS-BSRP: `train=2.10 +/- 0.01s`, `tok/s=11688.1 +/- 30.2`, `trainNLL=4.01758 +/- 0.00167`, `trainPPL=55.567 +/- 0.093`, `testNLL=4.19541 +/- 0.00789`, `testPPL=66.383 +/- 0.522`
+- ATLAS-SPARROW: `train=3.77 +/- 0.09s`, `tok/s=6520.0 +/- 160.1`, `trainNLL=4.01383 +/- 0.00655`, `trainPPL=55.360 +/- 0.362`, `testNLL=4.20153 +/- 0.01115`, `testPPL=66.793 +/- 0.743`
+
+Interpretation:
+
+- This is not a rescue for the ATLAS proceed path. SPARROW does not improve over isotropic ATLAS here and is substantially slower.
+- The task is still useful as a falsifier: it shows that “sequence memory exists” is not enough by itself. The ATLAS transfer-memory branch still needs the right observable signal, not just any sequential workload.
+- AdamW remains best on raw likelihood/perplexity in this small-token-LM regime.
+
+### N.2 Planted teacher-student benchmark
+
+Setup:
+
+- student DFF regressor with input dimension `32`, hidden widths `64 -> 32 -> 1`,
+- synthetic teacher with planted low-rank signal `rank=4` plus nuisance bulk `rank=12`,
+- `train=4096`, `test=1024`, `batch=64`, `epochs=20`, `bulkScale=0.20`,
+- compared variants: AdamW, isotropic ATLAS-BSRP (`cRank=0`), and ATLAS-SPARROW (`cRank=4`).
+
+Three-repeat results on **April 9, 2026**:
+
+- AdamW: `train=1.20 +/- 0.00s`, `samples/s=68323.7 +/- 80.5`, `trainMSE=0.07765 +/- 0.00382`, `trainR2%=4.202 +/- 4.708`, `testMSE=0.07863 +/- 0.00278`, `testR2%=3.737 +/- 3.398`
+- ATLAS-BSRP: `train=1.28 +/- 0.00s`, `samples/s=63966.7 +/- 62.3`, `trainMSE=0.05721 +/- 0.01654`, `trainR2%=29.426 +/- 20.405`, `testMSE=0.05933 +/- 0.01585`, `testR2%=27.366 +/- 19.406`
+- ATLAS-SPARROW: `train=1.67 +/- 0.00s`, `samples/s=49122.5 +/- 13.9`, `trainMSE=0.04376 +/- 0.00109`, `trainR2%=46.009 +/- 1.341`, `testMSE=0.04640 +/- 0.00142`, `testR2%=43.200 +/- 1.733`
+
+Interpretation:
+
+- This is the first materially different workload in the entire ATLAS exploration where the transfer-memory branch shows a clear positive result rather than a tie or a clean negative.
+- The ranking is coherent with the planted construction: when the task really does contain a recoverable low-rank transfer structure, isotropic ATLAS helps, and SPARROW helps more.
+- The cost is throughput, not correctness. SPARROW is slower than isotropic ATLAS, but the gain is large enough here to justify calling it a real signal.
+
+### N.3 Latent-state forecasting benchmark
+
+Setup:
+
+- partially observed latent linear dynamical system with `latentDim=6`, `obsDim=4`, `window=8`, `seqLen=40`,
+- `trainSeqs=96`, `testSeqs=24`, `epochs=18`,
+- student DFF forecaster with hidden widths `96 -> 64 -> 4`,
+- compared variants: AdamW, isotropic ATLAS-BSRP (`cRank=0`), and ATLAS-SPARROW (`cRank=4`).
+
+Three-repeat results on **April 9, 2026**:
+
+- AdamW: `train=2.06 +/- 0.00s`, `windows/s=26799.5 +/- 52.2`, `trainMSE=0.00400 +/- 0.00013`, `trainR2%=15.352 +/- 2.791`, `testMSE=0.00351 +/- 0.00013`, `testR2%=14.154 +/- 3.233`
+- ATLAS-BSRP: `train=2.19 +/- 0.00s`, `windows/s=25284.0 +/- 49.9`, `trainMSE=0.00313 +/- 0.00025`, `trainR2%=33.767 +/- 5.382`, `testMSE=0.00284 +/- 0.00022`, `testR2%=30.541 +/- 5.448`
+- ATLAS-SPARROW: `train=2.52 +/- 0.01s`, `windows/s=21977.9 +/- 53.8`, `trainMSE=0.00297 +/- 0.00024`, `trainR2%=37.133 +/- 5.165`, `testMSE=0.00266 +/- 0.00017`, `testR2%=34.980 +/- 4.159`
+
+Interpretation:
+
+- This is the second positive result for the transfer-memory branch and the first one that sits between the fully planted teacher-student task and the negative token-LM result.
+- The ranking again matches the proceed hypothesis: isotropic ATLAS helps relative to AdamW, and SPARROW helps more, but with a modest throughput tax.
+- That makes the line more credible than the teacher-student result alone. SPARROW is no longer winning only on an explicitly planted static regression problem; it is also helping on a modest dynamical forecasting problem with partial observability.
+
+### N.4 Teacher-sweep regime map
+
+To avoid overfitting the proceed story to one planted point, the alternate harness was also extended with a `teacher-sweep` mode. The first smoke run intentionally used a bounded quick slice:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode teacher-sweep --repeats 1 --teacher-sweep-limit 4`
+- axes exercised in that bounded slice: `teacherRank=2`, `bulkRank in {0, 12}`, `bulkScale in {0.0, 0.2, 0.8}`, `cRank in {0, 4}`
+
+Observed quick-slice results on **April 9, 2026**:
+
+- 4 base teacher/bulk configurations were evaluated,
+- across the resulting 8 SPARROW-vs-baseline rows, SPARROW improved test MSE in 6 cases,
+- the best observed delta was `-0.01631` test MSE at `teacherRank=2`, `bulkRank=0`, `bulkScale=0.20`, `cRank=4`,
+- the worst observed delta in the bounded slice was `+0.01551` at `teacherRank=2`, `bulkRank=0`, `bulkScale=0.80`, `cRank=4`.
+
+Interpretation:
+
+- The positive teacher-student result is not a single isolated point; there is already a visible regime map.
+- SPARROW benefits are strongest when the planted signal is present but not completely dominant. When the nuisance/bulk structure is absent or the scale regime shifts, the right `cRank` changes and the branch can still regress.
+- That is exactly the behavior needed to justify the next stage: a real phase diagram on teacher-student first, then a transition benchmark such as latent-state forecasting.
+
+A larger repeated quick-profile sweep was then run on **April 9, 2026**:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode teacher-sweep --repeats 3 --teacher-sweep-profile quick`
+- axes: `teacherRank in {2, 4, 8}`, `bulkRank in {0, 12, 24}`, `bulkScale in {0.0, 0.2, 0.8}`, `cRank in {0, 4}`
+
+Observed repeated quick-profile summary:
+
+- `baseConfigs=27`, producing `54` SPARROW-vs-baseline rows,
+- SPARROW improved test MSE in `30 / 54` rows,
+- the best observed delta was `-0.03162` test MSE at `teacherRank=8`, `bulkRank=24`, `bulkScale=0.00`, `cRank=4`,
+- clear failure bands remained, including `+0.09112` at `teacherRank=8`, `bulkRank=12`, `bulkScale=0.20`, `cRank=4`.
+
+Interpretation:
+
+- The proceed path is now supported by an actual regime map, not just a single planted win.
+- SPARROW is not uniformly beneficial. Its gains depend materially on the teacher/bulk structure, and `cRank=4` is not universally better than `cRank=0`.
+- That is a healthy result: it implies the transfer-memory branch is responding to task structure rather than just adding generic regularization or noise.
+
+### N.5 Latent-state tuning note
+
+Because the latent-state forecasting task is the first non-planted dynamic task where SPARROW helped, a small knob sweep was run around the default SPARROW settings on **April 9, 2026**:
+
+- baseline rerun: `cRank=0`, `memoryScale=0.05`, `edge=0.10`, `tSub=64`
+- variants tested:
+  - `memoryScale=0.03`
+  - `memoryScale=0.08`
+  - `edge=0.05`
+  - `edge=0.15`
+  - `tSub=32`
+
+Observed result:
+
+- all tested variants stayed effectively tied within noise on held-out accuracy,
+- the repeated baseline rerun with `cRank=0` already matched the earlier latent SPARROW result: `testMSE=0.00266 +/- 0.00017`, `testR2%=34.977 +/- 4.162`,
+- none of the tested one-knob perturbations produced a meaningful improvement over that point.
+
+Interpretation:
+
+- The latent positive result appears structural, not a fragile threshold accident.
+- On this benchmark, the default SPARROW controller is already close to the local optimum within the easy one-knob tuning surface.
+- That shifts the next research step away from threshold fiddling and toward broader benchmark transfer or richer reduced-state models only if a new task justifies them.
+
+### N.6 Rank-2 SPARROW follow-up
+
+Because the teacher-student and latent-state tasks were the first genuinely positive settings for the transfer-memory branch, a direct rank-2 SPARROW follow-up was run on **April 9, 2026**.
+
+Canonical planted teacher cases:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode teacher-canonical --repeats 3`
+- compared variants: isotropic ATLAS-BSRP, SPARROW rank-1, and SPARROW rank-2
+
+Observed results:
+
+- `signal-win` (`teacherRank=8`, `bulkRank=24`, `bulkScale=0.00`, `cRank=4`):
+  - base `testMSE=0.13618`
+  - SPARROW rank-1 `testMSE=0.10486`
+  - SPARROW rank-2 `testMSE=0.10431`
+  - winner: `sparrow-r2`
+- `default-anchor` (`teacherRank=4`, `bulkRank=12`, `bulkScale=0.20`, `cRank=4`):
+  - base `testMSE=0.05800`
+  - SPARROW rank-1 `testMSE=0.05847`
+  - SPARROW rank-2 `testMSE=0.06964`
+  - winner: `base`
+- `failure-band` (`teacherRank=8`, `bulkRank=12`, `bulkScale=0.20`, `cRank=4`):
+  - base `testMSE=0.17332`
+  - SPARROW rank-1 `testMSE=0.12703`
+  - SPARROW rank-2 `testMSE=0.17300`
+  - winner: `sparrow-r1`
+
+Direct latent-state comparison:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --atlas-complement-rank 4 --atlas-sparrow-mode-rank {1,2}`
+- rank-1:
+  - `train=2.53 +/- 0.01s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.980 +/- 4.159`
+- rank-2:
+  - `train=2.60 +/- 0.03s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.979 +/- 4.158`
+
+Interpretation:
+
+- The added streaming mode is not a general improvement. It helps in the strongest planted signal regime, but it can regress neutral or mixed regimes.
+- On the first non-planted dynamic task where SPARROW worked, rank-2 appears effectively redundant relative to rank-1.
+- So the correct reading is not “SPARROW wants higher mode rank.” It is “SPARROW is now credible enough that mode rank becomes a regime variable rather than a monotone upgrade.”
+
+Bottom line:
+
+- On MNIST-family tasks, ATLAS complement/transfer work remains mostly a dead end.
+- On token-LM, the same branch still does not help.
+- On planted teacher-student and latent-state forecasting tasks, the SPARROW transfer-memory branch works.
+- Rank-2 SPARROW is regime-dependent, not a new default.
+- Auto-gated cap-2 SPARROW is a safer experimental variant than unconditional rank-2, but rank-1 remains the default-worthy setting.
+- On a harder nonlinear latent forecasting task, the second mode activates but does not help, which points to an observable-family limit rather than a simple rank-selection problem.
+- So the global conclusion is now narrower and more actionable than “ATLAS is dead”: the current ATLAS observable family appears to need tasks with genuinely strong low-rank transfer structure or partially observed dynamical transfer before its transfer-memory branch pays off.
+
+### N.7 Auto-gated second-mode follow-up
+
+Because unconditional rank-2 SPARROW was clearly regime-dependent, an automatic second-mode gate was added and evaluated on **April 9, 2026**.
+
+Gate settings:
+
+- `modeRankCap=2`
+- `autoGate=1`
+- `secondEdgeThreshold=0.10`
+- `secondEdgeFraction=0.50`
+
+Canonical planted teacher cases:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode teacher-canonical --repeats 3`
+- compared variants: isotropic ATLAS-BSRP, SPARROW rank-1, and SPARROW auto-gated cap-2
+
+Observed results:
+
+- `signal-win` (`teacherRank=8`, `bulkRank=24`, `bulkScale=0.00`, `cRank=4`):
+  - base `testMSE=0.13618`
+  - SPARROW rank-1 `testMSE=0.10486`
+  - SPARROW auto-gated cap-2 `testMSE=0.10432`
+  - winner: `sparrow-auto`
+- `default-anchor` (`teacherRank=4`, `bulkRank=12`, `bulkScale=0.20`, `cRank=4`):
+  - base `testMSE=0.05800`
+  - SPARROW rank-1 `testMSE=0.05847`
+  - SPARROW auto-gated cap-2 `testMSE=0.06964`
+  - winner: `base`
+- `failure-band` (`teacherRank=8`, `bulkRank=12`, `bulkScale=0.20`, `cRank=4`):
+  - base `testMSE=0.17332`
+  - SPARROW rank-1 `testMSE=0.12703`
+  - SPARROW auto-gated cap-2 `testMSE=0.17311`
+  - winner: `sparrow-r1`
+
+Direct latent-state comparison:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --atlas-complement-rank 4 --atlas-sparrow-mode-rank 2 --atlas-sparrow-auto-mode-gate 1`
+- rank-1:
+  - `train=2.53 +/- 0.01s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.980 +/- 4.159`
+- auto-gated cap-2:
+  - `train=2.53 +/- 0.01s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.981 +/- 4.159`
+
+Interpretation:
+
+- The gate does what it was designed to do. It preserves the strong planted-case improvement without forcing a universally active second mode.
+- On the first non-planted dynamic task where SPARROW works, the gate collapses cleanly to rank-1 behavior rather than adding extra cost.
+- It does not rescue the neutral anchor or known planted failure band, so it is not a global default upgrade.
+- The correct policy is therefore asymmetric:
+  - rank-1 remains the default SPARROW setting,
+  - auto-gated cap-2 is the safer experimental option when a task is believed to contain a second strong transfer mode,
+  - unconditional rank-2 should remain opt-in only.
+
+### N.8 Mode-usage instrumentation and nonlinear latent follow-up
+
+Because the next question after the auto-gated pass was not “does mode 2 exist?” but “does it actually activate on harder dynamic tasks?”, a small read-only ATLAS runtime summary was added on **April 9, 2026** and threaded into `atlas-alt-bench`.
+
+Tracked SPARROW diagnostics:
+
+- mean retained mode count per epoch,
+- fraction of epochs with retained mode count at least `2`,
+- mean raw `mode-2 / mode-1` singular proxy ratio,
+- mean retained SPARROW edge,
+- mean memory gain,
+- mean horizontal ratio.
+
+Linear latent-state forecasting, rank-1 baseline:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --atlas-complement-rank 4 --atlas-sparrow-mode-rank 1`
+- ATLAS-SPARROW:
+  - `train=2.53 +/- 0.01s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.980 +/- 4.159`
+  - `activeModes=1.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.000 +/- 0.000`
+  - `edge=0.524 +/- 0.017`
+  - `mem=0.024 +/- 0.001`
+  - `horiz=0.999 +/- 0.000`
+
+Interpretation:
+
+- On the first non-planted dynamic task where SPARROW clearly helped, the controller is genuinely rank-1. The second mode is not merely “inactive by policy”; it is absent in the retained dynamics.
+
+Nonlinear latent-state forecasting, rank-1:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --atlas-complement-rank 4 --atlas-sparrow-mode-rank 1`
+- AdamW:
+  - `testMSE=0.00182 +/- 0.00005`
+  - `testR2%=0.178 +/- 2.807`
+- ATLAS-BSRP:
+  - `train=4.00 +/- 0.00s`
+  - `testMSE=0.00143 +/- 0.00009`
+  - `testR2%=21.498 +/- 4.802`
+- ATLAS-SPARROW rank-1:
+  - `train=4.39 +/- 0.00s`
+  - `testMSE=0.00159 +/- 0.00014`
+  - `testR2%=12.295 +/- 7.634`
+  - `activeModes=1.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.000 +/- 0.000`
+  - `edge=0.676 +/- 0.008`
+  - `mem=0.032 +/- 0.000`
+  - `horiz=0.999 +/- 0.000`
+
+Nonlinear latent-state forecasting, auto-gated cap-2:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --atlas-complement-rank 4 --atlas-sparrow-mode-rank 2 --atlas-sparrow-auto-mode-gate 1`
+- ATLAS-SPARROW auto-gated cap-2:
+  - `train=4.38 +/- 0.00s`
+  - `testMSE=0.00159 +/- 0.00014`
+  - `testR2%=12.295 +/- 7.633`
+  - `activeModes=1.69 +/- 0.35`
+  - `mode2Frac=0.685 +/- 0.346`
+  - `edge2/1=0.662 +/- 0.166`
+  - `edge=0.768 +/- 0.069`
+  - `mem=0.037 +/- 0.004`
+  - `horiz=0.999 +/- 0.000`
+
+Interpretation:
+
+- The instrumentation is informative rather than decorative: on the nonlinear task, the second SPARROW mode really does activate often and with nontrivial strength.
+- But the held-out result stays unchanged relative to rank-1 and still trails isotropic ATLAS.
+- So the next bottleneck is not “mode 2 is unavailable” or “the gate is too strict.” It is that the current compressed observable family does not translate that extra transfer complexity into better prediction.
+- That sharply narrows the next step. If the line continues, it should move to a different observable family such as hidden-state or output-space transfer, not another parameter-space SPARROW variant.
+
+### N.9 HELM-Lite hidden/output observable follow-up
+
+Because the nonlinear latent result suggested that parameter-space transfer modes were no longer the right observable family, a first hidden/output probe was added on **April 9, 2026**:
+
+- `HELM-Lite` tracks the last hidden layer and the output residual,
+- builds a rank-1 hidden-to-output predictive observer,
+- and applies only a bounded output-head memory correction,
+- with no explicit complement activation.
+
+Linear latent-state forecasting:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3`
+- AdamW:
+  - `train=2.20 +/- 0.01s`
+  - `testMSE=0.00351 +/- 0.00013`
+  - `testR2%=14.154 +/- 3.233`
+- ATLAS-BSRP:
+  - `train=2.31 +/- 0.17s`
+  - `testMSE=0.00284 +/- 0.00022`
+  - `testR2%=30.541 +/- 5.448`
+- ATLAS-SPARROW:
+  - `train=2.52 +/- 0.01s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.980 +/- 4.159`
+  - `activeModes=1.00 +/- 0.00`
+  - `edge=0.524 +/- 0.017`
+  - `mem=0.024 +/- 0.001`
+- ATLAS-HELM:
+  - `train=2.19 +/- 0.00s`
+  - `testMSE=0.00290 +/- 0.00027`
+  - `testR2%=29.105 +/- 6.579`
+  - `edge=0.000 +/- 0.000`
+  - `sigma=0.000 +/- 0.000`
+  - `predR2=0.014 +/- 0.009`
+  - `mem=0.000 +/- 0.000`
+  - `pole=0.950 +/- 0.000`
+
+Nonlinear latent-state forecasting:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3`
+- AdamW:
+  - `train=4.05 +/- 0.38s`
+  - `testMSE=0.00182 +/- 0.00005`
+  - `testR2%=0.178 +/- 2.807`
+- ATLAS-BSRP:
+  - `train=4.26 +/- 0.39s`
+  - `testMSE=0.00143 +/- 0.00009`
+  - `testR2%=21.498 +/- 4.802`
+- ATLAS-SPARROW:
+  - `train=4.37 +/- 0.00s`
+  - `testMSE=0.00159 +/- 0.00014`
+  - `testR2%=12.295 +/- 7.634`
+  - `activeModes=1.00 +/- 0.00`
+  - `edge=0.676 +/- 0.008`
+  - `mem=0.032 +/- 0.000`
+- ATLAS-HELM:
+  - `train=3.99 +/- 0.00s`
+  - `testMSE=0.00144 +/- 0.00012`
+  - `testR2%=20.596 +/- 6.720`
+  - `edge=0.000 +/- 0.000`
+  - `sigma=0.000 +/- 0.000`
+  - `predR2=0.020 +/- 0.007`
+  - `mem=0.000 +/- 0.000`
+  - `pole=0.950 +/- 0.000`
+
+Interpretation:
+
+- HELM-Lite is a meaningful observable-family probe rather than a broken prototype. It stays bounded, adds almost no runtime overhead, and cleanly falls back toward the isotropic ATLAS path when the hidden-to-output edge is subcritical.
+- On the linear latent task, that fallback is not good enough to beat SPARROW. HELM underperforms both ATLAS-BSRP and SPARROW on held-out error, which means the minimal last-hidden/output-head observer is too weak to recover the planted predictive mode that SPARROW still captures indirectly.
+- On the nonlinear latent task, HELM is materially better than SPARROW and nearly matches isotropic ATLAS while running slightly faster than both ATLAS baselines. That is the first evidence that the observable-family move itself is directionally correct even though the minimal rank-1 HELM instantiation is still too weak.
+- The diagnostic pattern is the important part: `edge≈0`, `sigma≈0`, `mem≈0`, and a pole pinned at its stability cap mean HELM is effectively voting “no usable hidden/output transfer spike found.” In other words, the prototype is not discovering a bad mode and overfitting it; it is mostly declining to act.
+
+### N.10 HELM-v2 stacked-hidden rank-2 follow-up
+
+Because HELM-Lite mostly behaved like a clean no-op, a stronger hidden/output probe was added and rerun on **April 9, 2026** after a full backend rebuild:
+
+- `HELM-v2` stacks the last two hidden layers instead of only the final hidden layer,
+- raises the hidden/output observer cap to `modeRank=2`,
+- keeps the correction output-head-only and memory-style,
+- and logs HELM mode usage in the same style as the SPARROW instrumentation.
+
+The full `atlas-controller` and `atlas` suites both passed after the rebuild, which also resolved a stale-build ABI mismatch caused by the expanded HELM state layout.
+
+Linear latent-state forecasting, rebuilt HELM-v2:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3`
+- AdamW:
+  - `train=2.03 +/- 0.00s`
+  - `testMSE=0.00351 +/- 0.00013`
+  - `testR2%=14.154 +/- 3.233`
+- ATLAS-BSRP:
+  - `train=2.16 +/- 0.00s`
+  - `testMSE=0.00284 +/- 0.00022`
+  - `testR2%=30.541 +/- 5.448`
+- ATLAS-SPARROW:
+  - `train=2.50 +/- 0.01s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.980 +/- 4.159`
+  - `activeModes=1.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.000 +/- 0.000`
+  - `edge=0.524 +/- 0.017`
+  - `mem=0.024 +/- 0.001`
+  - `horiz=0.999 +/- 0.000`
+- ATLAS-HELM-v2:
+  - `train=2.18 +/- 0.00s`
+  - `testMSE=0.00290 +/- 0.00027`
+  - `testR2%=29.105 +/- 6.579`
+  - `activeModes=0.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.526 +/- 0.121`
+  - `edge=0.000 +/- 0.000`
+  - `sigma=0.000 +/- 0.000`
+  - `predR2=0.015 +/- 0.010`
+  - `mem=0.000 +/- 0.000`
+  - `pole=0.950 +/- 0.000`
+
+Nonlinear latent-state forecasting, rebuilt HELM-v2:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3`
+- AdamW:
+  - `train=4.76 +/- 0.01s`
+  - `testMSE=0.00182 +/- 0.00005`
+  - `testR2%=0.178 +/- 2.807`
+- ATLAS-BSRP:
+  - `train=4.92 +/- 0.10s`
+  - `testMSE=0.00143 +/- 0.00009`
+  - `testR2%=21.498 +/- 4.802`
+- ATLAS-SPARROW:
+  - `train=4.69 +/- 0.47s`
+  - `testMSE=0.00159 +/- 0.00014`
+  - `testR2%=12.295 +/- 7.634`
+  - `activeModes=1.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.000 +/- 0.000`
+  - `edge=0.676 +/- 0.008`
+  - `mem=0.032 +/- 0.000`
+  - `horiz=0.999 +/- 0.000`
+- ATLAS-HELM-v2:
+  - `train=4.27 +/- 0.39s`
+  - `testMSE=0.00144 +/- 0.00012`
+  - `testR2%=20.596 +/- 6.720`
+  - `activeModes=0.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.078 +/- 0.054`
+  - `edge=0.000 +/- 0.000`
+  - `sigma=0.000 +/- 0.000`
+  - `predR2=0.023 +/- 0.009`
+  - `mem=0.000 +/- 0.000`
+  - `pole=0.915 +/- 0.025`
+
+Interpretation:
+
+- The stronger hidden/output observer does **not** solve the main HELM bottleneck. Even with a two-layer hidden stack and a rank-2 cap, the gate still stays shut: `activeModes=0`, `mode2Frac=0`, `edge≈0`, `sigma≈0`, and `mem≈0` on both dynamic tasks.
+- That means the failure is no longer “rank-1 was too small” or “the last hidden layer was too narrow.” The current HELM observable family still does not expose a supercritical hidden-to-output transfer spike under this lightweight linear observer.
+- The nonlinear latent result remains the useful clue. HELM-v2 stays much closer to ATLAS-BSRP than SPARROW while also running faster than both of those baselines on this task. So the observable-family move still looks directionally correct even though the present HELM gate never truly opens.
+- The practical next step is therefore not more threshold tuning inside HELM-v2. It is a stronger hidden/output observable family, likely a reduced state-space or output-space transfer model, if this branch continues at all.
+
+### N.11 HELM-v3 output-space transport observable follow-up
+
+Because HELM-v2 still used a large raw stacked hidden observable, the next step on **April 9, 2026** was to replace that state with a compact output-space transport observable:
+
+- the tracked hidden layers are still the last `helmHiddenStackDepth` hidden activations,
+- but each layer is now transported into output space through the current downstream weights before entering the HELM predictor,
+- so the past signal dimension shrinks from raw hidden width plus residual width to `outputDim * hiddenStackDepth + outputDim`,
+- while the rest of the HELM controller, gating, and output-head-only correction stays the same.
+
+This was intended to answer a narrower question than HELM-v2: was the real bottleneck the raw hidden observable itself, rather than the controller wrapped around it?
+
+Verification:
+
+- command: `cmake --build /home/robert/dev/glades-ml/build -j4`
+- command: `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- command: `./glades-unit-tests atlas-controller`
+- command: `timeout 120s ./glades-unit-tests atlas`
+
+Linear latent-state forecasting, HELM-v3 transport observable:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3`
+- ATLAS-BSRP:
+  - `train=2.17 +/- 0.01s`
+  - `testMSE=0.00284 +/- 0.00022`
+  - `testR2%=30.541 +/- 5.448`
+- ATLAS-SPARROW:
+  - `train=2.54 +/- 0.03s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.980 +/- 4.159`
+- ATLAS-HELM-v3:
+  - `train=2.34 +/- 0.22s`
+  - `testMSE=0.00290 +/- 0.00027`
+  - `testR2%=29.105 +/- 6.579`
+  - `activeModes=0.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.526 +/- 0.121`
+  - `edge=0.000 +/- 0.000`
+  - `sigma=0.000 +/- 0.000`
+  - `predR2=0.015 +/- 0.010`
+  - `mem=0.000 +/- 0.000`
+  - `pole=0.950 +/- 0.000`
+
+Nonlinear latent-state forecasting, HELM-v3 transport observable:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3`
+- ATLAS-BSRP:
+  - `train=3.94 +/- 0.00s`
+  - `testMSE=0.00143 +/- 0.00009`
+  - `testR2%=21.498 +/- 4.802`
+- ATLAS-SPARROW:
+  - `train=4.42 +/- 0.06s`
+  - `testMSE=0.00159 +/- 0.00014`
+  - `testR2%=12.295 +/- 7.634`
+- ATLAS-HELM-v3:
+  - `train=3.98 +/- 0.00s`
+  - `testMSE=0.00144 +/- 0.00012`
+  - `testR2%=20.596 +/- 6.720`
+  - `activeModes=0.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge2/1=0.078 +/- 0.054`
+  - `edge=0.000 +/- 0.000`
+  - `sigma=0.000 +/- 0.000`
+  - `predR2=0.023 +/- 0.009`
+  - `mem=0.000 +/- 0.000`
+  - `pole=0.915 +/- 0.025`
+
+Interpretation:
+
+- This is a clean negative result. The output-space transport observable is more principled and much smaller than the raw HELM-v2 stacked hidden state, but it does **not** create a usable HELM mode on either dynamic task.
+- In practice the numbers are almost unchanged from HELM-v2, including the most important diagnosis: `activeModes=0`, `edge≈0`, `sigma≈0`, and `mem≈0`.
+- So the bottleneck is not merely “the hidden observable was too wide.” The present HELM line still fails earlier than that: the lightweight linear hidden-to-output predictor is not exposing a supercritical transfer spike, even after the hidden state is explicitly transported into output space.
+- The nonlinear latent task still shows the same directional clue as before. HELM remains much closer to ATLAS-BSRP than SPARROW there, but the improvement comes from a branch that is still effectively declining to act.
+- That narrows the next step further. If this branch continues, it should move to a **true reduced state-space or output-space transfer model**, not another hidden-observable repackaging inside the current HELM gate.
+- That narrows the next step further. If this line continues, it should not go back to parameter-space complement geometry or more SPARROW mode tuning. It should strengthen the hidden/output observable family itself, for example with multi-layer hidden stacks, richer hidden-state targets, or a reduced hidden-to-output state-space realization.
+
+### N.12 ASTER-Lite output-space state-space follow-up
+
+The next step on **April 9, 2026** was to stop treating the hidden/output branch as another covariance gate and replace it with a true reduced output-space transfer model:
+
+- `ASTER-Lite` transports the last two hidden layers into output space and treats them as controls,
+- tracks the whitened batch-mean output innovation as the observed signal,
+- fits a tiny reduced ARX / innovation map on `[prevResidual, prevControl, currentControl]`,
+- extracts up to 2 output-space transfer modes,
+- and applies only a bounded output-head correction from the predicted innovation.
+
+This is the first prototype in this line that is genuinely different in kind from HELM. It is not another hidden observable reshaping inside the same gate; it is a reduced state-space predictor with explicit retained modes and latent poles.
+
+Verification:
+
+- command: `cmake --build /home/robert/dev/glades-ml/build -j4`
+- command: `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- command: `./glades-unit-tests atlas-controller`
+- command: `timeout 120s ./glades-unit-tests atlas`
+
+Linear latent-state forecasting, ASTER-Lite:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3`
+- AdamW:
+  - `train=2.11 +/- 0.01s`
+  - `testMSE=0.00351 +/- 0.00013`
+  - `testR2%=14.154 +/- 3.233`
+- ATLAS-BSRP:
+  - `train=2.23 +/- 0.00s`
+  - `testMSE=0.00284 +/- 0.00022`
+  - `testR2%=30.541 +/- 5.448`
+- ATLAS-SPARROW:
+  - `train=2.69 +/- 0.16s`
+  - `testMSE=0.00266 +/- 0.00017`
+  - `testR2%=34.980 +/- 4.159`
+  - `activeModes=1.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge=0.524 +/- 0.017`
+  - `mem=0.024 +/- 0.001`
+- ATLAS-HELM-v3:
+  - `train=2.41 +/- 0.20s`
+  - `testMSE=0.00290 +/- 0.00027`
+  - `testR2%=29.105 +/- 6.579`
+  - `activeModes=0.00 +/- 0.00`
+  - `edge=0.000 +/- 0.000`
+  - `mem=0.000 +/- 0.000`
+- ATLAS-ASTER:
+  - `train=2.27 +/- 0.00s`
+  - `testMSE=0.00267 +/- 0.00016`
+  - `testR2%=34.845 +/- 3.902`
+  - `activeModes=1.94 +/- 0.00`
+  - `mode2Frac=0.944 +/- 0.000`
+  - `edge2/1=0.601 +/- 0.058`
+  - `edge=0.277 +/- 0.027`
+  - `sigma=0.323 +/- 0.024`
+  - `predR2=0.036 +/- 0.043`
+  - `mem=0.001 +/- 0.001`
+  - `pole=0.871 +/- 0.112`
+
+Nonlinear latent-state forecasting, ASTER-Lite:
+
+- command: `./glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3`
+- AdamW:
+  - `train=3.86 +/- 0.01s`
+  - `testMSE=0.00182 +/- 0.00005`
+  - `testR2%=0.178 +/- 2.807`
+- ATLAS-BSRP:
+  - `train=4.07 +/- 0.01s`
+  - `testMSE=0.00143 +/- 0.00009`
+  - `testR2%=21.498 +/- 4.802`
+- ATLAS-SPARROW:
+  - `train=4.46 +/- 0.00s`
+  - `testMSE=0.00159 +/- 0.00014`
+  - `testR2%=12.295 +/- 7.634`
+  - `activeModes=1.00 +/- 0.00`
+  - `mode2Frac=0.000 +/- 0.000`
+  - `edge=0.676 +/- 0.008`
+  - `mem=0.032 +/- 0.000`
+- ATLAS-HELM-v3:
+  - `train=4.11 +/- 0.00s`
+  - `testMSE=0.00144 +/- 0.00012`
+  - `testR2%=20.596 +/- 6.720`
+  - `activeModes=0.00 +/- 0.00`
+  - `edge=0.000 +/- 0.000`
+  - `mem=0.000 +/- 0.000`
+- ATLAS-ASTER:
+  - `train=4.11 +/- 0.00s`
+  - `testMSE=0.00140 +/- 0.00014`
+  - `testR2%=23.220 +/- 7.514`
+  - `activeModes=1.43 +/- 0.34`
+  - `mode2Frac=0.537 +/- 0.189`
+  - `edge2/1=0.691 +/- 0.049`
+  - `edge=0.147 +/- 0.019`
+  - `sigma=0.180 +/- 0.021`
+  - `predR2=0.114 +/- 0.081`
+  - `mem=0.002 +/- 0.002`
+  - `pole=0.950 +/- 0.000`
+
+Interpretation:
+
+- This is the first hidden/output branch that both stays bounded **and** activates nonzero retained modes on the positive dynamic tasks. Unlike HELM, ASTER is no longer voting “no observable state found.”
+- On the linear latent task, ASTER is effectively tied with SPARROW on held-out error while running materially faster. It does not clearly beat SPARROW there, but it narrows the old observable-family gap to essentially zero.
+- On the nonlinear latent task, ASTER is the strongest ATLAS-family result so far. It beats SPARROW clearly and edges past isotropic ATLAS-BSRP on held-out MSE while running at essentially the same speed as BSRP.
+- The most important result is diagnostic, not just metric: `activeModes > 0`, nontrivial `mode2Frac`, positive `predR2`, and small but nonzero `mem` mean the output-space state-space observable is finally exposing a real predictive mode family instead of collapsing to a no-op.
+- That changes the proceed path. The branch is now no longer “find a better parameter-space summary” or “tune HELM harder.” It is “strengthen ASTER,” for example with better reduced realization, better innovation filtering, or slightly richer output-space state models.
+
 ---
 
-*Document version: 1.0*
+*Document version: 1.3*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
-*Date: 2026-03-10*
+*Date: 2026-04-09*

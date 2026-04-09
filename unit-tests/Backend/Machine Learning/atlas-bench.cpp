@@ -89,7 +89,14 @@ enum BenchMode
 {
 	BENCH_MODE_ALL = 0,
 	BENCH_MODE_STANDARD = 1,
-	BENCH_MODE_ENDURANCE = 2
+	BENCH_MODE_ENDURANCE = 2,
+	BENCH_MODE_FC_HEAVY = 3
+};
+
+enum BenchModelKind
+{
+	BENCH_MODEL_LENET = 0,
+	BENCH_MODEL_DFF_MLP = 1
 };
 
 static bool parse_uint_arg(const char* text, unsigned int& outValue)
@@ -140,6 +147,11 @@ static bool parse_mode_arg(const char* text, BenchMode& outMode)
 		outMode = BENCH_MODE_ENDURANCE;
 		return true;
 	}
+	if (streq(text, "fc-heavy") || streq(text, "fc") || streq(text, "mlp"))
+	{
+		outMode = BENCH_MODE_FC_HEAVY;
+		return true;
+	}
 	return false;
 }
 
@@ -172,6 +184,29 @@ struct BenchConfig
 	unsigned int atlasRank;
 	unsigned int atlasComplementRank;
 	unsigned int atlasTSub;
+	unsigned int atlasPrismEnabled;
+	unsigned int atlasResolveEnabled;
+	unsigned int atlasResolveLagHorizon;
+	unsigned int atlasHeroEnabled;
+	unsigned int atlasHeroLagHorizon;
+	unsigned int atlasCobaltEnabled;
+	unsigned int atlasCobaltLagHorizon;
+	unsigned int atlasBirchEnabled;
+	unsigned int atlasBirchPastHorizon;
+	unsigned int atlasBirchFutureHorizon;
+	unsigned int atlasGhostEnabled;
+	unsigned int atlasGhostLagHorizon;
+	unsigned int atlasSparrowEnabled;
+	unsigned int atlasSparrowModeRank;
+	unsigned int atlasSparrowAutoModeGate;
+	unsigned int atlasQbrtEnabled;
+	unsigned int atlasQbrtLagHorizon;
+	unsigned int atlasQrcEnabled;
+	unsigned int atlasQrcLagHorizon;
+	unsigned int atlasRiftEnabled;
+	unsigned int atlasRiftLagHorizon;
+	unsigned int atlasOrbitEnabled;
+	BenchModelKind modelKind;
 	unsigned int seed;
 	float clipNorm;
 	float sgdLR;
@@ -181,6 +216,35 @@ struct BenchConfig
 	float atlasKappaMax;
 	float atlasSectorLrScale;
 	float atlasSectorKappaMax;
+	float atlasPrismMemoryScale;
+	float atlasPrismEdgeThreshold;
+	float atlasResolveMemoryScale;
+	float atlasResolveEdgeThreshold;
+	float atlasHeroMemoryScale;
+	float atlasHeroEdgeThreshold;
+	float atlasCobaltMemoryScale;
+	float atlasCobaltEdgeThreshold;
+	float atlasBirchMemoryScale;
+	float atlasBirchEdgeThreshold;
+	float atlasGhostMemoryScale;
+	float atlasGhostEdgeThreshold;
+	float atlasSparrowMemoryScale;
+	float atlasSparrowEdgeThreshold;
+	float atlasSparrowSecondEdgeThreshold;
+	float atlasSparrowSecondEdgeFraction;
+	float atlasSparrowPoleMax;
+	float atlasQbrtMemoryScale;
+	float atlasQbrtEdgeThreshold;
+	float atlasQbrtPoleMax;
+	float atlasQrcMemoryScale;
+	float atlasQrcEdgeThreshold;
+	float atlasQrcPoleMax;
+	float atlasRiftMemoryScale;
+	float atlasRiftEdgeThreshold;
+	float atlasRiftPoleMax;
+	float atlasOrbitMemoryScale;
+	float atlasOrbitEdgeThreshold;
+	float atlasOrbitPoleMax;
 
 	BenchConfig()
 	    : mode(BENCH_MODE_ALL),
@@ -193,7 +257,30 @@ struct BenchConfig
 	      atlasRank(16u),
 	      atlasComplementRank(0u),
 	      atlasTSub(200u),
-	      seed(1337u),
+	      atlasPrismEnabled(0u),
+	      atlasResolveEnabled(0u),
+	      atlasResolveLagHorizon(4u),
+	      atlasHeroEnabled(0u),
+	      atlasHeroLagHorizon(4u),
+	      atlasCobaltEnabled(0u),
+	      atlasCobaltLagHorizon(4u),
+	      atlasBirchEnabled(0u),
+	      atlasBirchPastHorizon(3u),
+	      atlasBirchFutureHorizon(2u),
+	      atlasGhostEnabled(0u),
+	      atlasGhostLagHorizon(4u),
+	      atlasSparrowEnabled(0u),
+	      atlasSparrowModeRank(1u),
+	      atlasSparrowAutoModeGate(0u),
+	      atlasQbrtEnabled(0u),
+	      atlasQbrtLagHorizon(4u),
+	      atlasQrcEnabled(0u),
+		      atlasQrcLagHorizon(4u),
+		      atlasRiftEnabled(0u),
+		      atlasRiftLagHorizon(4u),
+		      atlasOrbitEnabled(0u),
+		      modelKind(BENCH_MODEL_LENET),
+		      seed(1337u),
 	      clipNorm(5.0f),
 	      sgdLR(0.01f),
 	      sgdMomentum(0.9f),
@@ -201,7 +288,36 @@ struct BenchConfig
 	      atlasLR(0.08f),
 	      atlasKappaMax(10.0f),
 	      atlasSectorLrScale(0.25f),
-	      atlasSectorKappaMax(0.5f)
+	      atlasSectorKappaMax(0.5f),
+	      atlasPrismMemoryScale(0.15f),
+	      atlasPrismEdgeThreshold(0.05f),
+	      atlasResolveMemoryScale(0.10f),
+	      atlasResolveEdgeThreshold(0.05f),
+	      atlasHeroMemoryScale(0.10f),
+	      atlasHeroEdgeThreshold(0.10f),
+	      atlasCobaltMemoryScale(0.08f),
+	      atlasCobaltEdgeThreshold(0.10f),
+	      atlasBirchMemoryScale(0.08f),
+	      atlasBirchEdgeThreshold(0.10f),
+	      atlasGhostMemoryScale(0.05f),
+	      atlasGhostEdgeThreshold(0.10f),
+	      atlasSparrowMemoryScale(0.05f),
+	      atlasSparrowEdgeThreshold(0.10f),
+	      atlasSparrowSecondEdgeThreshold(0.10f),
+	      atlasSparrowSecondEdgeFraction(0.50f),
+	      atlasSparrowPoleMax(0.95f),
+	      atlasQbrtMemoryScale(0.05f),
+	      atlasQbrtEdgeThreshold(0.10f),
+	      atlasQbrtPoleMax(0.95f),
+	      atlasQrcMemoryScale(0.05f),
+	      atlasQrcEdgeThreshold(0.10f),
+	      atlasQrcPoleMax(0.95f),
+	      atlasRiftMemoryScale(0.05f),
+	      atlasRiftEdgeThreshold(0.05f),
+	      atlasRiftPoleMax(0.95f),
+	      atlasOrbitMemoryScale(0.04f),
+	      atlasOrbitEdgeThreshold(0.05f),
+	      atlasOrbitPoleMax(0.95f)
 	{
 	}
 };
@@ -310,7 +426,7 @@ static void print_usage()
 {
 	printf("Usage: glades-unit-tests atlas-bench [options]\n");
 	printf("Options:\n");
-	printf("  --mode all|standard|endurance          Run the short case, the minutes-scale case, or both (default: all)\n");
+	printf("  --mode all|standard|endurance|fc-heavy Run the short CNN case, the minutes-scale CNN case, or the FC-heavy MLP case (default: all)\n");
 	printf("  --dataset auto|mnist|mnist-small|PATH   Dataset directory with train.csv/test.csv (default: auto)\n");
 	printf("  --train-limit N                         Class-balanced train subset size; 0 = full split (default: 5000)\n");
 	printf("  --test-limit N                          Class-balanced test subset size; 0 = full split (default: 1000)\n");
@@ -327,6 +443,57 @@ static void print_usage()
 	printf("  --atlas-complement-rank N               ATLAS complement rank cap (default: 0)\n");
 	printf("  --atlas-sector-lr-scale X               ATLAS complement-sector lr scale (default: 0.25)\n");
 	printf("  --atlas-sector-kappa-max X              ATLAS complement-sector kappaMax (default: 0.5)\n");
+	printf("  --atlas-prism 0|1                       Enable PRISM memory / predictive-edge gate (default: 0)\n");
+	printf("  --atlas-prism-memory-scale X            PRISM active-memory scale (default: 0.15)\n");
+	printf("  --atlas-prism-edge-threshold X          PRISM complement predictive-edge threshold (default: 0.05)\n");
+	printf("  --atlas-resolve 0|1                     Enable RESOLVE transfer-edge gate / memory kernel (default: 0)\n");
+	printf("  --atlas-resolve-lag-horizon N           RESOLVE lag horizon (default: 4)\n");
+	printf("  --atlas-resolve-memory-scale X          RESOLVE active-memory scale (default: 0.10)\n");
+	printf("  --atlas-resolve-edge-threshold X        RESOLVE complement transfer-edge threshold (default: 0.05)\n");
+	printf("  --atlas-hero 0|1                        Enable HERO Hankel-edge gate / memory fallback (default: 0)\n");
+	printf("  --atlas-hero-lag-horizon N              HERO lag horizon (default: 4)\n");
+	printf("  --atlas-hero-memory-scale X             HERO active-memory scale (default: 0.10)\n");
+	printf("  --atlas-hero-edge-threshold X           HERO complement Hankel-edge threshold (default: 0.10)\n");
+	printf("  --atlas-cobalt 0|1                      Enable COBALT transfer-edge gate / memory fallback (default: 0)\n");
+	printf("  --atlas-cobalt-lag-horizon N            COBALT lag horizon (default: 4)\n");
+	printf("  --atlas-cobalt-memory-scale X           COBALT active-memory scale (default: 0.08)\n");
+	printf("  --atlas-cobalt-edge-threshold X         COBALT complement transfer-edge threshold (default: 0.10)\n");
+	printf("  --atlas-birch 0|1                       Enable BIRCH Hankel-transfer memory fallback (default: 0)\n");
+	printf("  --atlas-birch-past-horizon N            BIRCH past-state horizon (default: 3)\n");
+	printf("  --atlas-birch-future-horizon N          BIRCH future-state horizon (default: 2)\n");
+	printf("  --atlas-birch-memory-scale X            BIRCH active-memory scale (default: 0.08)\n");
+	printf("  --atlas-birch-edge-threshold X          BIRCH Hankel transfer-edge threshold (default: 0.10)\n");
+	printf("  --atlas-ghost 0|1                       Enable GHOST quotient-transfer memory fallback (default: 0)\n");
+	printf("  --atlas-ghost-lag-horizon N             GHOST lag horizon (default: 4)\n");
+	printf("  --atlas-ghost-memory-scale X            GHOST active-memory scale (default: 0.05)\n");
+	printf("  --atlas-ghost-edge-threshold X          GHOST quotient-transfer edge threshold (default: 0.10)\n");
+	printf("  --atlas-sparrow 0|1                     Enable SPARROW streaming quotient-transfer memory fallback (default: 0)\n");
+	printf("  --atlas-sparrow-memory-scale X          SPARROW active-memory scale (default: 0.05)\n");
+	printf("  --atlas-sparrow-edge-threshold X        SPARROW canonical edge threshold (default: 0.10)\n");
+	printf("  --atlas-sparrow-auto-mode-gate 0|1      Treat SPARROW mode rank as a cap with auto mode-2 admission (default: 0)\n");
+	printf("  --atlas-sparrow-second-edge-threshold X Minimum raw mode-2 SPARROW edge for auto admission (default: 0.10)\n");
+	printf("  --atlas-sparrow-second-edge-fraction X  Minimum mode-2/mode-1 edge ratio for auto admission (default: 0.50)\n");
+	printf("  --atlas-sparrow-pole-max X              SPARROW latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-sparrow-mode-rank N             SPARROW retained transfer mode rank (default: 1)\n");
+	printf("  --atlas-qbrt 0|1                        Enable QBRT quotient-balanced transfer memory fallback (default: 0)\n");
+	printf("  --atlas-qbrt-lag-horizon N              QBRT lag horizon (default: 4)\n");
+	printf("  --atlas-qbrt-memory-scale X             QBRT active-memory scale (default: 0.05)\n");
+	printf("  --atlas-qbrt-edge-threshold X           QBRT transfer edge threshold (default: 0.10)\n");
+	printf("  --atlas-qbrt-pole-max X                 QBRT latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-qrc 0|1                         Enable QRC quotient resolvent-control memory fallback (default: 0)\n");
+	printf("  --atlas-qrc-lag-horizon N               QRC lag horizon (default: 4)\n");
+	printf("  --atlas-qrc-memory-scale X              QRC active-memory scale (default: 0.05)\n");
+	printf("  --atlas-qrc-edge-threshold X            QRC closed-loop edge threshold (default: 0.10)\n");
+	printf("  --atlas-qrc-pole-max X                  QRC latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-rift 0|1                        Enable RIFT signature-memory fallback (default: 0)\n");
+	printf("  --atlas-rift-lag-horizon N              RIFT path lag horizon (default: 4)\n");
+	printf("  --atlas-rift-memory-scale X             RIFT active-memory scale (default: 0.05)\n");
+	printf("  --atlas-rift-edge-threshold X           RIFT path-edge threshold (default: 0.05)\n");
+	printf("  --atlas-rift-pole-max X                 RIFT latent pole clamp (default: 0.95)\n");
+	printf("  --atlas-orbit 0|1                       Enable ORBIT-Lite output-head memory fallback (default: 0)\n");
+	printf("  --atlas-orbit-memory-scale X            ORBIT-Lite active-memory scale (default: 0.04)\n");
+	printf("  --atlas-orbit-edge-threshold X          ORBIT-Lite functional edge threshold (default: 0.05)\n");
+	printf("  --atlas-orbit-pole-max X                ORBIT-Lite latent pole clamp (default: 0.95)\n");
 	printf("  --tsub N                                ATLAS subspace refresh interval in steps (default: 200)\n");
 	printf("  --seed N                                Base seed for repeats (default: 1337)\n");
 	printf("  --help                                  Show this message\n");
@@ -359,6 +526,22 @@ static BenchConfig make_endurance_config(const BenchConfig& base)
 	return endurance;
 }
 
+static BenchConfig make_fc_heavy_config(const BenchConfig& base)
+{
+	BenchConfig fcHeavy = base;
+	fcHeavy.mode = BENCH_MODE_FC_HEAVY;
+	fcHeavy.modelKind = BENCH_MODEL_DFF_MLP;
+	fcHeavy.batchSize = max_u32(base.batchSize, 128u);
+	if (base.trainLimit == 0u || base.trainLimit > 2000u)
+		fcHeavy.trainLimit = 2000u;
+	if (base.testLimit == 0u || base.testLimit > 1000u)
+		fcHeavy.testLimit = 1000u;
+	if (base.epochs > 3u)
+		fcHeavy.epochs = 3u;
+	fcHeavy.atlasTSub = max_u32(base.atlasTSub, 200u);
+	return fcHeavy;
+}
+
 static void build_benchmark_cases(const BenchConfig& base, std::vector<BenchmarkCase>& outCases)
 {
 	outCases.clear();
@@ -380,6 +563,15 @@ static void build_benchmark_cases(const BenchConfig& base, std::vector<Benchmark
 		endurance.description = "Scaled-up MNIST run sized to take minutes instead of seconds on CPU builds.";
 		endurance.cfg = make_endurance_config(base);
 		outCases.push_back(endurance);
+	}
+
+	if (base.mode == BENCH_MODE_FC_HEAVY)
+	{
+		BenchmarkCase fcHeavy;
+		fcHeavy.label = "fc-heavy";
+		fcHeavy.description = "FC-heavy MNIST DFF/MLP run for testing whether ATLAS transfer memory helps when residual structure is concentrated in fully connected layers.";
+		fcHeavy.cfg = make_fc_heavy_config(base);
+		outCases.push_back(fcHeavy);
 	}
 }
 
@@ -722,6 +914,75 @@ static glades::NNetwork make_lenet_mnist(const std::string& name,
 	return net;
 }
 
+static glades::NNetwork make_mlp_mnist(const std::string& name,
+                                       float learningRate,
+                                       float momentum,
+                                       int batchSize,
+                                       unsigned int seed)
+{
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	    batchSize,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::LINEAR,
+	    1.0f);
+
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	hidden.push_back(new glades::HiddenLayerInfo(
+	    512,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f));
+	hidden.push_back(new glades::HiddenLayerInfo(
+	    256,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f));
+	hidden.push_back(new glades::HiddenLayerInfo(
+	    128,
+	    learningRate,
+	    momentum,
+	    0.0f,
+	    0.0f,
+	    0.0f,
+	    glades::GMath::RELU,
+	    1.0f));
+
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	    10,
+	    glades::OutputLayerInfo::CLASSIFICATION);
+
+	glades::NNInfo* info = new glades::NNInfo(name.c_str(), in, hidden, out);
+	glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
+	net.setSeed(seed);
+
+	delete info;
+	return net;
+}
+
+static const char* benchmark_model_description(const BenchConfig& cfg)
+{
+	switch (cfg.modelKind)
+	{
+	case BENCH_MODEL_DFF_MLP:
+		return "DFF MLP (784 -> 512 -> 256 -> 128 -> 10)";
+	case BENCH_MODEL_LENET:
+	default:
+		return "LeNet-style CNN (8x5x5 -> pool -> 16x5x5 -> pool -> FC128 -> 10)";
+	}
+}
+
 static void configure_optimizer(glades::NNetwork& net,
                                 OptimizerVariant optimizer,
                                 const BenchConfig& cfg)
@@ -748,6 +1009,57 @@ static void configure_optimizer(glades::NNetwork& net,
 		tc.atlas.complementRank = cfg.atlasComplementRank;
 		tc.atlas.complementLrScale = cfg.atlasSectorLrScale;
 		tc.atlas.complementKappaMax = cfg.atlasSectorKappaMax;
+		tc.atlas.prismEnabled = (cfg.atlasPrismEnabled != 0u);
+		tc.atlas.prismMemoryScale = cfg.atlasPrismMemoryScale;
+		tc.atlas.prismPredictiveEdgeThreshold = cfg.atlasPrismEdgeThreshold;
+		tc.atlas.resolveEnabled = (cfg.atlasResolveEnabled != 0u);
+		tc.atlas.resolveLagHorizon = cfg.atlasResolveLagHorizon;
+		tc.atlas.resolveMemoryScale = cfg.atlasResolveMemoryScale;
+		tc.atlas.resolvePredictiveEdgeThreshold = cfg.atlasResolveEdgeThreshold;
+		tc.atlas.heroEnabled = (cfg.atlasHeroEnabled != 0u);
+		tc.atlas.heroLagHorizon = cfg.atlasHeroLagHorizon;
+		tc.atlas.heroMemoryScale = cfg.atlasHeroMemoryScale;
+		tc.atlas.heroEdgeThreshold = cfg.atlasHeroEdgeThreshold;
+		tc.atlas.cobaltEnabled = (cfg.atlasCobaltEnabled != 0u);
+		tc.atlas.cobaltLagHorizon = cfg.atlasCobaltLagHorizon;
+		tc.atlas.cobaltMemoryScale = cfg.atlasCobaltMemoryScale;
+		tc.atlas.cobaltEdgeThreshold = cfg.atlasCobaltEdgeThreshold;
+		tc.atlas.birchEnabled = (cfg.atlasBirchEnabled != 0u);
+		tc.atlas.birchPastHorizon = cfg.atlasBirchPastHorizon;
+		tc.atlas.birchFutureHorizon = cfg.atlasBirchFutureHorizon;
+		tc.atlas.birchMemoryScale = cfg.atlasBirchMemoryScale;
+		tc.atlas.birchEdgeThreshold = cfg.atlasBirchEdgeThreshold;
+		tc.atlas.ghostEnabled = (cfg.atlasGhostEnabled != 0u);
+		tc.atlas.ghostLagHorizon = cfg.atlasGhostLagHorizon;
+		tc.atlas.ghostMemoryScale = cfg.atlasGhostMemoryScale;
+		tc.atlas.ghostEdgeThreshold = cfg.atlasGhostEdgeThreshold;
+		tc.atlas.sparrowEnabled = (cfg.atlasSparrowEnabled != 0u);
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.qbrtEnabled = (cfg.atlasQbrtEnabled != 0u);
+		tc.atlas.qbrtLagHorizon = cfg.atlasQbrtLagHorizon;
+		tc.atlas.qbrtMemoryScale = cfg.atlasQbrtMemoryScale;
+		tc.atlas.qbrtEdgeThreshold = cfg.atlasQbrtEdgeThreshold;
+		tc.atlas.qbrtPoleMax = cfg.atlasQbrtPoleMax;
+		tc.atlas.qrcEnabled = (cfg.atlasQrcEnabled != 0u);
+		tc.atlas.qrcLagHorizon = cfg.atlasQrcLagHorizon;
+		tc.atlas.qrcMemoryScale = cfg.atlasQrcMemoryScale;
+		tc.atlas.qrcEdgeThreshold = cfg.atlasQrcEdgeThreshold;
+		tc.atlas.qrcPoleMax = cfg.atlasQrcPoleMax;
+		tc.atlas.riftEnabled = (cfg.atlasRiftEnabled != 0u);
+		tc.atlas.riftLagHorizon = cfg.atlasRiftLagHorizon;
+		tc.atlas.riftMemoryScale = cfg.atlasRiftMemoryScale;
+		tc.atlas.riftEdgeThreshold = cfg.atlasRiftEdgeThreshold;
+		tc.atlas.riftPoleMax = cfg.atlasRiftPoleMax;
+		tc.atlas.orbitEnabled = (cfg.atlasOrbitEnabled != 0u);
+		tc.atlas.orbitMemoryScale = cfg.atlasOrbitMemoryScale;
+		tc.atlas.orbitEdgeThreshold = cfg.atlasOrbitEdgeThreshold;
+		tc.atlas.orbitPoleMax = cfg.atlasOrbitPoleMax;
 		tc.atlas.tSub = cfg.atlasTSub;
 		tc.atlas.beta = 0.999f;
 		tc.atlas.betaRefresh = 0.5f;
@@ -794,7 +1106,9 @@ static SingleRunResult run_single_benchmark(glades::ImageInput& data,
 	const float momentum = optimizer_momentum(optimizer, cfg);
 	const std::string netName = std::string("atlas_bench_") + out.optimizerLabel;
 
-	glades::NNetwork net = make_lenet_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed);
+	glades::NNetwork net = (cfg.modelKind == BENCH_MODEL_DFF_MLP)
+	                       ? make_mlp_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed)
+	                       : make_lenet_mnist(netName, lr, momentum, static_cast<int>(cfg.batchSize), seed);
 	configure_optimizer(net, optimizer, cfg);
 	net.getTerminatorMutable().setEpoch(static_cast<int>(cfg.epochs));
 	net.getTerminatorMutable().setAccuracy(0.0f);
@@ -929,7 +1243,7 @@ static bool run_benchmark_case(const BenchmarkCase& benchCase,
 	printf("Test split:  %u / %u\n", data.getTestSize(), datasetInfo.originalTestSize);
 	if (!datasetInfo.note.empty())
 		printf("Note: %s\n", datasetInfo.note.c_str());
-	printf("Model: LeNet-style CNN (8x5x5 -> pool -> 16x5x5 -> pool -> FC128 -> 10)\n");
+	printf("Model: %s\n", benchmark_model_description(benchCase.cfg));
 	printf("Config: epochs=%u repeats=%u batch=%u clip=%.2f\n",
 	       benchCase.cfg.epochs, benchCase.cfg.repeats, benchCase.cfg.batchSize, benchCase.cfg.clipNorm);
 	printf("LRs: SGD=%.4f (momentum=%.2f) AdamW=%.4f ATLAS-BSRP=%.4f rank=%u cRank=%u tSub=%u\n",
@@ -940,6 +1254,56 @@ static bool run_benchmark_case(const BenchmarkCase& benchCase,
 	       benchCase.cfg.atlasKappaMax,
 	       benchCase.cfg.atlasSectorLrScale,
 	       benchCase.cfg.atlasSectorKappaMax);
+	printf("ATLAS PRISM: enabled=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasPrismEnabled,
+	       benchCase.cfg.atlasPrismMemoryScale,
+	       benchCase.cfg.atlasPrismEdgeThreshold);
+	printf("ATLAS RESOLVE: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasResolveEnabled,
+	       benchCase.cfg.atlasResolveLagHorizon,
+	       benchCase.cfg.atlasResolveMemoryScale,
+	       benchCase.cfg.atlasResolveEdgeThreshold);
+	printf("ATLAS HERO: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasHeroEnabled,
+	       benchCase.cfg.atlasHeroLagHorizon,
+	       benchCase.cfg.atlasHeroMemoryScale,
+	       benchCase.cfg.atlasHeroEdgeThreshold);
+	printf("ATLAS COBALT: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasCobaltEnabled,
+	       benchCase.cfg.atlasCobaltLagHorizon,
+	       benchCase.cfg.atlasCobaltMemoryScale,
+	       benchCase.cfg.atlasCobaltEdgeThreshold);
+	printf("ATLAS BIRCH: enabled=%u pastHorizon=%u futureHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasBirchEnabled,
+	       benchCase.cfg.atlasBirchPastHorizon,
+	       benchCase.cfg.atlasBirchFutureHorizon,
+	       benchCase.cfg.atlasBirchMemoryScale,
+	       benchCase.cfg.atlasBirchEdgeThreshold);
+	printf("ATLAS GHOST: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f\n",
+	       benchCase.cfg.atlasGhostEnabled,
+	       benchCase.cfg.atlasGhostLagHorizon,
+	       benchCase.cfg.atlasGhostMemoryScale,
+	       benchCase.cfg.atlasGhostEdgeThreshold);
+	printf("ATLAS SPARROW: enabled=%u modeRankCap=%u autoGate=%u memoryScale=%.3f edgeThreshold=%.3f secondEdgeThreshold=%.3f secondEdgeFraction=%.3f poleMax=%.3f\n",
+	       benchCase.cfg.atlasSparrowEnabled,
+	       benchCase.cfg.atlasSparrowModeRank,
+	       benchCase.cfg.atlasSparrowAutoModeGate,
+	       benchCase.cfg.atlasSparrowMemoryScale,
+	       benchCase.cfg.atlasSparrowEdgeThreshold,
+	       benchCase.cfg.atlasSparrowSecondEdgeThreshold,
+	       benchCase.cfg.atlasSparrowSecondEdgeFraction,
+	       benchCase.cfg.atlasSparrowPoleMax);
+	printf("ATLAS RIFT: enabled=%u lagHorizon=%u memoryScale=%.3f edgeThreshold=%.3f poleMax=%.3f\n",
+	       benchCase.cfg.atlasRiftEnabled,
+	       benchCase.cfg.atlasRiftLagHorizon,
+	       benchCase.cfg.atlasRiftMemoryScale,
+	       benchCase.cfg.atlasRiftEdgeThreshold,
+	       benchCase.cfg.atlasRiftPoleMax);
+	printf("ATLAS ORBIT: enabled=%u memoryScale=%.3f edgeThreshold=%.3f poleMax=%.3f\n",
+	       benchCase.cfg.atlasOrbitEnabled,
+	       benchCase.cfg.atlasOrbitMemoryScale,
+	       benchCase.cfg.atlasOrbitEdgeThreshold,
+	       benchCase.cfg.atlasOrbitPoleMax);
 	printf("Cache warmup: %lld ms for %u images (excluded from benchmark timing)\n",
 	       warmMs, data.getTrainSize() + data.getTestSize());
 	printf("Planned train image passes across all optimizers: %llu\n",
@@ -1185,6 +1549,414 @@ void ATLASBenchmark(int argc, char* argv[])
 				return;
 			}
 		}
+		else if (streq(argv[i], "--atlas-prism") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasPrismEnabled) || cfg.atlasPrismEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-prism\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-prism-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPrismMemoryScale))
+			{
+				printf("Invalid value for --atlas-prism-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-prism-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPrismEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-prism-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasResolveEnabled) || cfg.atlasResolveEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-resolve\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasResolveLagHorizon))
+			{
+				printf("Invalid value for --atlas-resolve-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasResolveMemoryScale))
+			{
+				printf("Invalid value for --atlas-resolve-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-resolve-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasResolveEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-resolve-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasHeroEnabled) || cfg.atlasHeroEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-hero\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasHeroLagHorizon))
+			{
+				printf("Invalid value for --atlas-hero-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasHeroMemoryScale))
+			{
+				printf("Invalid value for --atlas-hero-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-hero-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasHeroEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-hero-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasCobaltEnabled) || cfg.atlasCobaltEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-cobalt\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasCobaltLagHorizon))
+			{
+				printf("Invalid value for --atlas-cobalt-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasCobaltMemoryScale))
+			{
+				printf("Invalid value for --atlas-cobalt-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-cobalt-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasCobaltEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-cobalt-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBirchEnabled) || cfg.atlasBirchEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-birch\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-past-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBirchPastHorizon))
+			{
+				printf("Invalid value for --atlas-birch-past-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-future-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBirchFutureHorizon))
+			{
+				printf("Invalid value for --atlas-birch-future-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasBirchMemoryScale))
+			{
+				printf("Invalid value for --atlas-birch-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-birch-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasBirchEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-birch-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasGhostEnabled) || cfg.atlasGhostEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-ghost\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasGhostLagHorizon))
+			{
+				printf("Invalid value for --atlas-ghost-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasGhostMemoryScale))
+			{
+				printf("Invalid value for --atlas-ghost-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-ghost-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasGhostEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-ghost-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasSparrowEnabled) || cfg.atlasSparrowEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-sparrow\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowMemoryScale))
+			{
+				printf("Invalid value for --atlas-sparrow-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-sparrow-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-auto-mode-gate") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasSparrowAutoModeGate) || cfg.atlasSparrowAutoModeGate > 1u)
+			{
+				printf("Invalid value for --atlas-sparrow-auto-mode-gate\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-second-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowSecondEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-sparrow-second-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-second-edge-fraction") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowSecondEdgeFraction))
+			{
+				printf("Invalid value for --atlas-sparrow-second-edge-fraction\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasSparrowPoleMax))
+			{
+				printf("Invalid value for --atlas-sparrow-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-sparrow-mode-rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasSparrowModeRank) || cfg.atlasSparrowModeRank == 0u)
+			{
+				printf("Invalid value for --atlas-sparrow-mode-rank\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQbrtEnabled) || cfg.atlasQbrtEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-qbrt\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQbrtLagHorizon))
+			{
+				printf("Invalid value for --atlas-qbrt-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQbrtMemoryScale))
+			{
+				printf("Invalid value for --atlas-qbrt-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQbrtEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-qbrt-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qbrt-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQbrtPoleMax))
+			{
+				printf("Invalid value for --atlas-qbrt-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQrcEnabled) || cfg.atlasQrcEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-qrc\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasQrcLagHorizon))
+			{
+				printf("Invalid value for --atlas-qrc-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQrcMemoryScale))
+			{
+				printf("Invalid value for --atlas-qrc-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQrcEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-qrc-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-qrc-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasQrcPoleMax))
+			{
+				printf("Invalid value for --atlas-qrc-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasRiftEnabled) || cfg.atlasRiftEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-rift\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-lag-horizon") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasRiftLagHorizon))
+			{
+				printf("Invalid value for --atlas-rift-lag-horizon\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRiftMemoryScale))
+			{
+				printf("Invalid value for --atlas-rift-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRiftEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-rift-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-rift-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRiftPoleMax))
+			{
+				printf("Invalid value for --atlas-rift-pole-max\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasOrbitEnabled) || cfg.atlasOrbitEnabled > 1u)
+			{
+				printf("Invalid value for --atlas-orbit\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit-memory-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasOrbitMemoryScale))
+			{
+				printf("Invalid value for --atlas-orbit-memory-scale\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit-edge-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasOrbitEdgeThreshold))
+			{
+				printf("Invalid value for --atlas-orbit-edge-threshold\n");
+				return;
+			}
+		}
+		else if (streq(argv[i], "--atlas-orbit-pole-max") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasOrbitPoleMax))
+			{
+				printf("Invalid value for --atlas-orbit-pole-max\n");
+				return;
+			}
+		}
 		else if (streq(argv[i], "--tsub") && i + 1 < argc)
 		{
 			if (!parse_uint_arg(argv[++i], cfg.atlasTSub))
@@ -1210,7 +1982,7 @@ void ATLASBenchmark(int argc, char* argv[])
 	}
 
 	printf("============================================================\n");
-	printf("ATLAS-BSRP vs SGD vs AdamW CNN Benchmark\n");
+	printf("ATLAS-BSRP vs SGD vs AdamW Benchmark\n");
 	printf("============================================================\n");
 
 	DatasetInfo datasetInfo;
