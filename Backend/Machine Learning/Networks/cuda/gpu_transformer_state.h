@@ -64,6 +64,16 @@ struct GpuTransformerWeights
 	GpuBuffer<float> v2BOut;
 	GpuBuffer<float> gBOut;
 
+	// Final LayerNorm: [dModel]
+	GpuBuffer<float> lnFinalGamma;
+	GpuBuffer<float> lnFinalBeta;
+	GpuBuffer<float> mLnFinalGamma;
+	GpuBuffer<float> v2LnFinalGamma;
+	GpuBuffer<float> mLnFinalBeta;
+	GpuBuffer<float> v2LnFinalBeta;
+	GpuBuffer<float> gLnFinalGamma;
+	GpuBuffer<float> gLnFinalBeta;
+
 	// Per-layer block weights.
 	struct Block
 	{
@@ -186,6 +196,9 @@ struct GpuTransformerScratch
 	GpuBuffer<float> ff1Act;     // [nLayers, T, dFF]
 	GpuBuffer<float> ffOut;      // [nLayers, T, dModel]
 	GpuBuffer<float> hAfterFF;   // [nLayers, T, dModel]
+	GpuBuffer<float> hPostFinalLN; // [T, dModel]
+	GpuBuffer<float> lnFinalMean;  // [T]
+	GpuBuffer<float> lnFinalInvStd; // [T]
 	GpuBuffer<float> logits;     // [T, outSize]
 	GpuBuffer<float> probs;      // [T, outSize]
 
@@ -248,7 +261,9 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
                                const float* bIn, size_t bInSize,
                                const float* WOut, size_t WOutSize,
                                const float* bOut, size_t bOutSize,
-                               const float* lmBias, size_t lmBiasSize);
+                               const float* lmBias, size_t lmBiasSize,
+                               const float* lnFinalGamma, size_t lnFinalGammaSize,
+                               const float* lnFinalBeta, size_t lnFinalBetaSize);
 
 // Download GPU weights -> CPU arrays.
 bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
@@ -257,7 +272,9 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
                                  float* bIn, size_t bInSize,
                                  float* WOut, size_t WOutSize,
                                  float* bOut, size_t bOutSize,
-                                 float* lmBias, size_t lmBiasSize);
+                                 float* lmBias, size_t lmBiasSize,
+                                 float* lnFinalGamma, size_t lnFinalGammaSize,
+                                 float* lnFinalBeta, size_t lnFinalBetaSize);
 
 // Upload/download a single block's weights.
 bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,

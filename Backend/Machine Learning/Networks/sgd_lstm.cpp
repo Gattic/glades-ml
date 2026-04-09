@@ -339,26 +339,21 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 				const ATLASConfig& ac = trainingConfig.atlas;
 
 				// Output: Why
-				if (!tensorLstm.O.atlasWhy.initialized && tensorLstm.O.out > 0 && tensorLstm.O.in > 0)
-					atlas::initWeightState(tensorLstm.O.atlasWhy, tensorLstm.O.out, tensorLstm.O.in, ac.rank, ac.muMin, rngEngine, logger);
-				if (tensorLstm.O.atlasWhy.initialized)
-					atlas::applyStep(tensorLstm.O.atlasWhy, &tensorLstm.O.Why[0], &tensorLstm.O.gWhy[0],
-						tensorLstm.O.out, tensorLstm.O.in, invBatch, lrOut, wd1Out, wd2Out, gradScale,
-						ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
+				if (!atlas::update(tensorLstm.O.atlasWhy, &tensorLstm.O.Why[0], &tensorLstm.O.gWhy[0],
+					tensorLstm.O.out, tensorLstm.O.in, invBatch, lrOut, wd1Out, wd2Out, gradScale,
+					ac, rngEngine, logger, "lstm.Why"))
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_LSTM: ATLAS Why update entered NaN recovery");
+					running = false;
+					return false;
+				}
 
 				// Output bias: standard SGD
-				for (unsigned int k = 0; k < outSize; ++k)
+				if (!atlas::updateBias(&tensorLstm.O.bias[0], &tensorLstm.O.gBias[0], outSize, invBatch, lrOut, gradScale))
 				{
-					float gB = tensorLstm.O.gBias[k] * invBatch;
-					gB *= gradScale;
-					tensorLstm.O.bias[k] -= (lrOut * gB);
-					tensorLstm.O.gBias[k] = 0.0f;
-					if (!is_finite(tensorLstm.O.bias[k]))
-					{
-						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_LSTM: non-finite output bias after ATLAS update (NaN/Inf)");
-						running = false;
-						return false;
-					}
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_LSTM: non-finite output bias after ATLAS update (NaN/Inf)");
+					running = false;
+					return false;
 				}
 
 				// Hidden layers: whole-matrix ATLAS over packed gates
@@ -370,37 +365,31 @@ void glades::NNetwork::SGDHelper_LSTM(unsigned int inputRowCounter, int runType)
 					const float wd1 = skeleton->getWeightDecay1(li);
 					const float wd2 = skeleton->getWeightDecay2(li);
 
-					// W: [gateCount*h, in] as single matrix
 					const unsigned int wRows = tensorLstm.gateCount * hl.h;
-					if (!hl.atlasW.initialized && wRows > 0 && hl.in > 0)
-						atlas::initWeightState(hl.atlasW, wRows, hl.in, ac.rank, ac.muMin, rngEngine, logger);
-					if (hl.atlasW.initialized)
-						atlas::applyStep(hl.atlasW, &hl.W[0], &hl.gW[0],
-							wRows, hl.in, invBatch, lr, wd1, wd2, gradScale,
-							ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
-
-					// U: [gateCount*h, h] as single matrix
-					const unsigned int uRows = tensorLstm.gateCount * hl.h;
-					if (!hl.atlasU.initialized && uRows > 0 && hl.h > 0)
-						atlas::initWeightState(hl.atlasU, uRows, hl.h, ac.rank, ac.muMin, rngEngine, logger);
-					if (hl.atlasU.initialized)
-						atlas::applyStep(hl.atlasU, &hl.U[0], &hl.gU[0],
-							uRows, hl.h, invBatch, lr, wd1, wd2, gradScale,
-							ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh, rngEngine, logger);
-
-					// Bias: standard SGD
-					for (size_t bi = 0; bi < hl.bias.size(); ++bi)
+					if (!atlas::update(hl.atlasW, &hl.W[0], &hl.gW[0],
+						wRows, hl.in, invBatch, lr, wd1, wd2, gradScale,
+						ac, rngEngine, logger, "lstm.W"))
 					{
-						float gB = hl.gBias[bi] * invBatch;
-						gB *= gradScale;
-						hl.bias[bi] -= (lr * gB);
-						hl.gBias[bi] = 0.0f;
-						if (!is_finite(hl.bias[bi]))
-						{
-							lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_LSTM: non-finite hidden bias after ATLAS update (NaN/Inf)");
-							running = false;
-							return false;
-						}
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_LSTM: ATLAS W update entered NaN recovery");
+						running = false;
+						return false;
+					}
+
+					const unsigned int uRows = tensorLstm.gateCount * hl.h;
+					if (!atlas::update(hl.atlasU, &hl.U[0], &hl.gU[0],
+						uRows, hl.h, invBatch, lr, wd1, wd2, gradScale,
+						ac, rngEngine, logger, "lstm.U"))
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_LSTM: ATLAS U update entered NaN recovery");
+						running = false;
+						return false;
+					}
+
+					if (!atlas::updateBias(&hl.bias[0], &hl.gBias[0], static_cast<unsigned int>(hl.bias.size()), invBatch, lr, gradScale))
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "SGDHelper_LSTM: non-finite hidden bias after ATLAS update (NaN/Inf)");
+						running = false;
+						return false;
 					}
 				}
 

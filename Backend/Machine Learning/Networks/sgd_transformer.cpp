@@ -280,7 +280,12 @@ static void attn_fwd_body(void* ud, unsigned int begin, unsigned int end)
 	}
 }
 
-// Region B: Multi-head attention backward (parallelized over KV head groups)
+// Region B: Multi-head attention backward (parallelized over (head, query-chunk) pairs).
+//
+// Each work item processes a subset of query rows for one head, writing dQ directly
+// (no contention — each chunk owns different rows) and accumulating dK/dV into
+// thread-local contiguous buffers. After the parallel_for, the per-chunk dK/dV are
+// reduced into the real strided dK/dV.
 struct AttnBwdCtx
 {
 	const float* Q;
@@ -299,37 +304,139 @@ struct AttnBwdCtx
 	unsigned int groupSize;
 	bool causal;
 	const unsigned char* keyAllowed;
+
+	// Chunked dispatch fields.
+	unsigned int nChunksPerHead; // number of query-row chunks per Q-head
+	unsigned int totalItems;     // nHeads * nChunksPerHead
+	float* dKVscratch;           // [totalItems * T * dHead * 2]  (dK then dV per item)
 };
 
 static void attn_bwd_body(void* ud, unsigned int begin, unsigned int end)
 {
 	const AttnBwdCtx& c = *static_cast<const AttnBwdCtx*>(ud);
+
+	const bool chunked = (c.nChunksPerHead > 1u && c.dKVscratch != NULL);
+
+	for (unsigned int item = begin; item < end; ++item)
+	{
+		unsigned int h, tBegin, tEnd;
+
+		if (chunked)
+		{
+			// Decode (head, chunk) from flat item index.
+			h = item / c.nChunksPerHead;
+			const unsigned int chunkIdx = item % c.nChunksPerHead;
+			const unsigned int rowsPerChunk = (c.T + c.nChunksPerHead - 1u) / c.nChunksPerHead;
+			tBegin = chunkIdx * rowsPerChunk;
+			tEnd = tBegin + rowsPerChunk;
+			if (tEnd > c.T) tEnd = c.T;
+			if (tBegin >= tEnd) continue;
+		}
+		else
+		{
+			// Legacy path: item == kvHead, process all Q heads in the group.
+			const unsigned int kvh = item;
+			const unsigned int hStart = kvh * c.groupSize;
+			const unsigned int hEnd = hStart + c.groupSize;
+			for (unsigned int hh = hStart; hh < hEnd && hh < c.nHeads; ++hh)
+			{
+				glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
+				    c.Q + static_cast<size_t>(hh) * static_cast<size_t>(c.dHead),
+				    c.dModel,
+				    c.K + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.dModelKV,
+				    c.V + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.dModelKV,
+				    c.dO + static_cast<size_t>(hh) * static_cast<size_t>(c.dHead),
+				    c.dModel,
+				    c.T, c.dHead, c.dHead, c.causal,
+				    c.dQ + static_cast<size_t>(hh) * static_cast<size_t>(c.dHead),
+				    c.dModel,
+				    c.dK + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.dModelKV,
+				    c.dV + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+				    c.dModelKV,
+				    c.keyAllowed);
+			}
+			continue;
+		}
+
+		// Chunked path: process query rows [tBegin, tEnd) for head h.
+		const unsigned int kvh = (c.nKVHeads == c.nHeads) ? h : (c.groupSize > 0u ? (h / c.groupSize) : 0u);
+		const size_t scratchSize = static_cast<size_t>(c.T) * static_cast<size_t>(c.dHead);
+		float* dKlocal = c.dKVscratch + static_cast<size_t>(item) * scratchSize * 2u;
+		float* dVlocal = dKlocal + scratchSize;
+
+		glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_chunk(
+		    c.Q + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.dModel,
+		    c.K + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+		    c.dModelKV,
+		    c.V + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
+		    c.dModelKV,
+		    c.dO + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.dModel,
+		    tBegin, tEnd,
+		    c.T, c.dHead, c.dHead, c.causal,
+		    c.dQ + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
+		    c.dModel,
+		    dKlocal, dVlocal,
+		    c.keyAllowed);
+	}
+}
+
+// Reduce per-chunk dK/dV scratch into the real strided dK/dV buffers.
+struct AttnBwdReduceCtx
+{
+	const float* dKVscratch;
+	float* dK;
+	float* dV;
+	unsigned int dHead;
+	unsigned int dModelKV;
+	unsigned int T;
+	unsigned int nHeads;
+	unsigned int nKVHeads;
+	unsigned int groupSize;
+	unsigned int nChunksPerHead;
+};
+
+static void attn_bwd_reduce_body(void* ud, unsigned int begin, unsigned int end)
+{
+	const AttnBwdReduceCtx& c = *static_cast<const AttnBwdReduceCtx*>(ud);
+	const size_t scratchSize = static_cast<size_t>(c.T) * static_cast<size_t>(c.dHead);
+
 	for (unsigned int kvh = begin; kvh < end; ++kvh)
 	{
+		// Collect all Q-head chunks that map to this KV head.
 		const unsigned int hStart = kvh * c.groupSize;
-		const unsigned int hEnd = hStart + c.groupSize;
-		for (unsigned int h = hStart; h < hEnd && h < c.nHeads; ++h)
+		const unsigned int hEnd = (hStart + c.groupSize < c.nHeads) ? (hStart + c.groupSize) : c.nHeads;
+
+		float* dKout = c.dK + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead);
+		float* dVout = c.dV + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead);
+
+		for (unsigned int h = hStart; h < hEnd; ++h)
 		{
-			glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
-			    c.Q + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
-			    c.dModel,
-			    c.K + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
-			    c.dModelKV,
-			    c.V + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
-			    c.dModelKV,
-			    c.dO + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
-			    c.dModel,
-			    c.T,
-			    c.dHead,
-			    c.dHead,
-			    c.causal,
-			    c.dQ + static_cast<size_t>(h) * static_cast<size_t>(c.dHead),
-			    c.dModel,
-			    c.dK + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
-			    c.dModelKV,
-			    c.dV + static_cast<size_t>(kvh) * static_cast<size_t>(c.dHead),
-			    c.dModelKV,
-			    c.keyAllowed);
+			for (unsigned int ch = 0; ch < c.nChunksPerHead; ++ch)
+			{
+				const unsigned int item = h * c.nChunksPerHead + ch;
+				const float* dKlocal = c.dKVscratch + static_cast<size_t>(item) * scratchSize * 2u;
+				const float* dVlocal = dKlocal + scratchSize;
+
+				// Accumulate contiguous local dK/dV into strided output.
+				for (unsigned int u = 0; u < c.T; ++u)
+				{
+					const size_t localOff = static_cast<size_t>(u) * c.dHead;
+					const size_t stridedOff = static_cast<size_t>(u) * c.dModelKV;
+					glades::transformer_kernels::axpy_f32(
+					    dKout + stridedOff,
+					    dKlocal + localOff,
+					    1.0f, c.dHead);
+					glades::transformer_kernels::axpy_f32(
+					    dVout + stridedOff,
+					    dVlocal + localOff,
+					    1.0f, c.dHead);
+				}
+			}
 		}
 	}
 }
@@ -1301,19 +1408,25 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
 
 					// tokE: [vocabSize, dModel]
-					if (!tt.atlasTokE.initialized)
-						atlas::initWeightState(tt.atlasTokE, tt.vocabSize, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(tt.atlasTokE, &tt.tokE[0], &tt.gTokE[0],
-					                 tt.vocabSize, dmTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
+					if (!atlas::update(tt.atlasTokE, &tt.tokE[0], &tt.gTokE[0],
+					              tt.vocabSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
+					              ac, net.rngEngine, net.getLogger(), "tr.tokE"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS tokE update entered NaN recovery");
+						net.running = false;
+						return false;
+					}
 
 					// lmBias: simple SGD (no subspace projection for 1D bias)
-					for (size_t i = 0; i < tt.lmBias.size(); ++i)
+					if (!atlas::updateBias(&tt.lmBias[0], &tt.gLmBias[0],
+					                       static_cast<unsigned int>(tt.lmBias.size()),
+					                       invBatch, lr, gradScale))
 					{
-						tt.lmBias[i] -= lr * (tt.gLmBias[i] * invBatch) * gradScale;
-						tt.gLmBias[i] = 0.0f;
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS lmBias update produced NaN/Inf");
+						net.running = false;
+						return false;
 					}
 				}
 
@@ -1324,21 +1437,25 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
 
 					// WIn: [dModel, inputSize]
-					const unsigned int winRows = dmTT;
-					const unsigned int winCols = tt.inputSize;
-					if (!tt.atlasWIn.initialized)
-						atlas::initWeightState(tt.atlasWIn, winRows, winCols, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(tt.atlasWIn, &tt.WIn[0], &tt.gWIn[0],
-					                 winRows, winCols,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
+					if (!atlas::update(tt.atlasWIn, &tt.WIn[0], &tt.gWIn[0],
+					              dmTT, tt.inputSize, invBatch, lr, wd1, wd2, gradScale,
+					              ac, net.rngEngine, net.getLogger(), "tr.WIn"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS WIn update entered NaN recovery");
+						net.running = false;
+						return false;
+					}
 
 					// bIn: simple SGD
-					for (size_t i = 0; i < tt.bIn.size(); ++i)
+					if (!atlas::updateBias(&tt.bIn[0], &tt.gBIn[0],
+					                       static_cast<unsigned int>(tt.bIn.size()),
+					                       invBatch, lr, gradScale))
 					{
-						tt.bIn[i] -= lr * (tt.gBIn[i] * invBatch) * gradScale;
-						tt.gBIn[i] = 0.0f;
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS bIn update produced NaN/Inf");
+						net.running = false;
+						return false;
 					}
 				}
 
@@ -1352,77 +1469,64 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					TensorTransformerState::Block& b = tt.blocks[li];
 
 					// Wq: [dModel, dModel]
-					if (!b.atlasWq.initialized)
-						atlas::initWeightState(b.atlasWq, dmTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(b.atlasWq, &b.Wq[0], &b.gWq[0],
-					                 dmTT, dmTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
-
+					if (!atlas::update(b.atlasWq, &b.Wq[0], &b.gWq[0], dmTT, dmTT,
+					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wq")
 					// Wk: [dModelKV, dModel]
-					if (!b.atlasWk.initialized)
-						atlas::initWeightState(b.atlasWk, dModelKVTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(b.atlasWk, &b.Wk[0], &b.gWk[0],
-					                 dModelKVTT, dmTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
-
+					    || !atlas::update(b.atlasWk, &b.Wk[0], &b.gWk[0], dModelKVTT, dmTT,
+					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wk")
 					// Wv: [dModelKV, dModel]
-					if (!b.atlasWv.initialized)
-						atlas::initWeightState(b.atlasWv, dModelKVTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(b.atlasWv, &b.Wv[0], &b.gWv[0],
-					                 dModelKVTT, dmTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
-
+					    || !atlas::update(b.atlasWv, &b.Wv[0], &b.gWv[0], dModelKVTT, dmTT,
+					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wv")
 					// Wo: [dModel, dModel]
-					if (!b.atlasWo.initialized)
-						atlas::initWeightState(b.atlasWo, dmTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(b.atlasWo, &b.Wo[0], &b.gWo[0],
-					                 dmTT, dmTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
-
+					    || !atlas::update(b.atlasWo, &b.Wo[0], &b.gWo[0], dmTT, dmTT,
+					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wo")
 					// W1: [ff1Width, dModel]
-					if (!b.atlasW1.initialized)
-						atlas::initWeightState(b.atlasW1, ff1WidthTT, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(b.atlasW1, &b.W1[0], &b.gW1[0],
-					                 ff1WidthTT, dmTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
-
+					    || !atlas::update(b.atlasW1, &b.W1[0], &b.gW1[0], ff1WidthTT, dmTT,
+					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.W1")
 					// W2: [dModel, dFF]
-					if (!b.atlasW2.initialized)
-						atlas::initWeightState(b.atlasW2, dmTT, dFFTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(b.atlasW2, &b.W2[0], &b.gW2[0],
-					                 dmTT, dFFTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
+					    || !atlas::update(b.atlasW2, &b.W2[0], &b.gW2[0], dmTT, dFFTT,
+					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.W2"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS block weight update entered NaN recovery");
+						net.running = false;
+						return false;
+					}
 
 					// Biases and LN params: simple SGD (no subspace projection)
-					for (size_t i = 0; i < b.bq.size(); ++i) { b.bq[i] -= lr * (b.gBq[i] * invBatch) * gradScale; b.gBq[i] = 0.0f; }
-					for (size_t i = 0; i < b.bk.size(); ++i) { b.bk[i] -= lr * (b.gBk[i] * invBatch) * gradScale; b.gBk[i] = 0.0f; }
-					for (size_t i = 0; i < b.bv.size(); ++i) { b.bv[i] -= lr * (b.gBv[i] * invBatch) * gradScale; b.gBv[i] = 0.0f; }
-					for (size_t i = 0; i < b.bo.size(); ++i) { b.bo[i] -= lr * (b.gBo[i] * invBatch) * gradScale; b.gBo[i] = 0.0f; }
-					for (size_t i = 0; i < b.b1.size(); ++i) { b.b1[i] -= lr * (b.gB1[i] * invBatch) * gradScale; b.gB1[i] = 0.0f; }
-					for (size_t i = 0; i < b.b2.size(); ++i) { b.b2[i] -= lr * (b.gB2[i] * invBatch) * gradScale; b.gB2[i] = 0.0f; }
-					for (size_t i = 0; i < b.ln1Gamma.size(); ++i) { b.ln1Gamma[i] -= lr * (b.gLn1Gamma[i] * invBatch) * gradScale; b.gLn1Gamma[i] = 0.0f; }
-					for (size_t i = 0; i < b.ln1Beta.size(); ++i) { b.ln1Beta[i] -= lr * (b.gLn1Beta[i] * invBatch) * gradScale; b.gLn1Beta[i] = 0.0f; }
-					for (size_t i = 0; i < b.ln2Gamma.size(); ++i) { b.ln2Gamma[i] -= lr * (b.gLn2Gamma[i] * invBatch) * gradScale; b.gLn2Gamma[i] = 0.0f; }
-					for (size_t i = 0; i < b.ln2Beta.size(); ++i) { b.ln2Beta[i] -= lr * (b.gLn2Beta[i] * invBatch) * gradScale; b.gLn2Beta[i] = 0.0f; }
+					if (!atlas::updateBias(&b.bq[0], &b.gBq[0], static_cast<unsigned int>(b.bq.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.bk[0], &b.gBk[0], static_cast<unsigned int>(b.bk.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.bv[0], &b.gBv[0], static_cast<unsigned int>(b.bv.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.bo[0], &b.gBo[0], static_cast<unsigned int>(b.bo.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.b1[0], &b.gB1[0], static_cast<unsigned int>(b.b1.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.b2[0], &b.gB2[0], static_cast<unsigned int>(b.b2.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln1Gamma[0], &b.gLn1Gamma[0], static_cast<unsigned int>(b.ln1Gamma.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln1Beta[0], &b.gLn1Beta[0], static_cast<unsigned int>(b.ln1Beta.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln2Gamma[0], &b.gLn2Gamma[0], static_cast<unsigned int>(b.ln2Gamma.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln2Beta[0], &b.gLn2Beta[0], static_cast<unsigned int>(b.ln2Beta.size()), invBatch, lr, gradScale))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS block bias/LN update produced NaN/Inf");
+						net.running = false;
+						return false;
+					}
 				}
 
 				// Final LayerNorm (SGD, use block 0 LR; no weight decay)
 				{
 					const float lr = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
-					for (size_t i = 0; i < tt.lnFinalGamma.size(); ++i) { tt.lnFinalGamma[i] -= lr * (tt.gLnFinalGamma[i] * invBatch) * gradScale; tt.gLnFinalGamma[i] = 0.0f; }
-					for (size_t i = 0; i < tt.lnFinalBeta.size(); ++i) { tt.lnFinalBeta[i] -= lr * (tt.gLnFinalBeta[i] * invBatch) * gradScale; tt.gLnFinalBeta[i] = 0.0f; }
+					if (!atlas::updateBias(&tt.lnFinalGamma[0], &tt.gLnFinalGamma[0],
+					                       static_cast<unsigned int>(tt.lnFinalGamma.size()),
+					                       invBatch, lr, gradScale)
+					    || !atlas::updateBias(&tt.lnFinalBeta[0], &tt.gLnFinalBeta[0],
+					                          static_cast<unsigned int>(tt.lnFinalBeta.size()),
+					                          invBatch, lr, gradScale))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS final LN update produced NaN/Inf");
+						net.running = false;
+						return false;
+					}
 				}
 
 				// Output projection (index nLayers) is unused in token LM tied-head mode.
@@ -1434,20 +1538,25 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
 
 					// WOut: [outSize, dModel]
-					if (!tt.atlasWOut.initialized)
-						atlas::initWeightState(tt.atlasWOut, outSize, dmTT, ac.rank, ac.muMin, net.rngEngine, net.getLogger());
-					atlas::applyStep(tt.atlasWOut, &tt.WOut[0], &tt.gWOut[0],
-					                 outSize, dmTT,
-					                 invBatch, lr, wd1, wd2, gradScale,
-					                 ac.beta, ac.muMin, ac.muMax, ac.eps, ac.tSub, ac.powerIters, ac.betaRefresh,
-					                 net.rngEngine, net.getLogger());
+					if (!atlas::update(tt.atlasWOut, &tt.WOut[0], &tt.gWOut[0],
+					              outSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
+					              ac, net.rngEngine, net.getLogger(), "tr.WOut"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS WOut update entered NaN recovery");
+						net.running = false;
+						return false;
+					}
 
 					// bOut: simple SGD
-					for (size_t i = 0; i < tt.bOut.size(); ++i)
+					if (!atlas::updateBias(&tt.bOut[0], &tt.gBOut[0],
+					                       static_cast<unsigned int>(tt.bOut.size()),
+					                       invBatch, lr, gradScale))
 					{
-						const float gB = (tt.gBOut[i] * invBatch) * gradScale;
-						tt.bOut[i] -= lr * gB;
-						tt.gBOut[i] = 0.0f;
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: ATLAS bOut update produced NaN/Inf");
+						net.running = false;
+						return false;
 					}
 				}
 				else
@@ -2153,13 +2262,30 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l, static_cast<int>(T * dModel));
 				}
 
-				// Output logits
+				// Final LayerNorm
 				const float* finalH = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(nLayers - 1) * T * dModel;
+				float* hPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
+				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+				{
+					gpu::rmsnorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(), lnEps,
+					                     static_cast<int>(T), static_cast<int>(dModel),
+					                     hPostFinalLN, gpuTransformerScratch->lnFinalInvStd.data());
+				}
+				else
+				{
+					gpu::layernorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(),
+					                       gpuTransformerWeights->lnFinalBeta.data(), lnEps,
+					                       static_cast<int>(T), static_cast<int>(dModel),
+					                       hPostFinalLN, gpuTransformerScratch->lnFinalMean.data(),
+					                       gpuTransformerScratch->lnFinalInvStd.data());
+				}
+
+				// Output logits
 				if (tokenLM && tieEmb)
 				{
-					// logits = finalH * E^T + lmBias
+					// logits = hPostFinalLN * E^T + lmBias
 					gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
-					                     1.0f, finalH, static_cast<int>(dModel),
+					                     1.0f, hPostFinalLN, static_cast<int>(dModel),
 					                     gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
 					                     0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize));
 					gpu::add_bias(gpuTransformerScratch->logits.data(),
@@ -2293,6 +2419,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				}
 
 				// Compute dLogits on GPU.
+				const float* bwdFinalH = gpuTransformerScratch->hAfterFF.data() +
+				    static_cast<size_t>(nLayers - 1) * T * dModel;
+				const float* bwdPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
+
 				if (tokenLM)
 				{
 					// dLogits = probs - one_hot(targets)
@@ -2302,22 +2432,19 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					    static_cast<int>(T), static_cast<int>(vocabSize),
 					    gpuTransformerScratch->dLogits.data());
 
-					// Backprop tied LM head: logits = hFinal * E^T + lmBias
-					// dH = dLogits * E
-					const float* finalH = gpuTransformerScratch->hAfterFF.data() +
-					    static_cast<size_t>(nLayers - 1) * T * dModel;
-
+					// Backprop tied LM head: logits = hPostFinalLN * E^T + lmBias
+					// dH (w.r.t. hPostFinalLN) = dLogits * E
 					gpu::sgemm_rowmajor(
 					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(vocabSize),
 					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
 					    gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
 					    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
 
-					// gTokE += dLogits^T * hFinal  [vocabSize, dModel]
+					// gTokE += dLogits^T * hPostFinalLN  [vocabSize, dModel]
 					gpu::sgemm_rowmajor_atb(
 					    static_cast<int>(vocabSize), static_cast<int>(dModel), static_cast<int>(T),
 					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
-					    finalH, static_cast<int>(dModel),
+					    bwdPostFinalLN, static_cast<int>(dModel),
 					    1.0f, gpuTransformerWeights->gTokE.data(), static_cast<int>(dModel));
 
 					// gLmBias += sum_rows(dLogits)
@@ -2348,20 +2475,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					}
 					gpuTransformerScratch->dLogits.upload(&dLogitsHost[0], dLogitsHost.size());
 
-					// dH = dLogits * WOut  [T, dModel]
+					// dH (w.r.t. hPostFinalLN) = dLogits * WOut  [T, dModel]
 					gpu::sgemm_rowmajor(
 					    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(outSize),
 					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
 					    gpuTransformerWeights->WOut.data(), static_cast<int>(dModel),
 					    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
 
-					// gWOut += dLogits^T * hFinal  [outSize, dModel]
-					const float* finalH = gpuTransformerScratch->hAfterFF.data() +
-					    static_cast<size_t>(nLayers - 1) * T * dModel;
+					// gWOut += dLogits^T * hPostFinalLN  [outSize, dModel]
 					gpu::sgemm_rowmajor_atb(
 					    static_cast<int>(outSize), static_cast<int>(dModel), static_cast<int>(T),
 					    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
-					    finalH, static_cast<int>(dModel),
+					    bwdPostFinalLN, static_cast<int>(dModel),
 					    1.0f, gpuTransformerWeights->gWOut.data(), static_cast<int>(dModel));
 
 					// gBOut += sum_rows(dLogits)
@@ -2372,6 +2497,34 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 
 					timeStepsInBatch += T;
 				}
+
+				// Backprop Final LayerNorm: dH (w.r.t. hPostFinalLN) -> dH (w.r.t. hFinal)
+				if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+				{
+					gpu::rmsnorm_backward(
+					    gpuTransformerScratch->dH.data(), bwdFinalH,
+					    gpuTransformerWeights->lnFinalGamma.data(),
+					    gpuTransformerScratch->lnFinalInvStd.data(),
+					    static_cast<int>(T), static_cast<int>(dModel),
+					    gpuTransformerScratch->dH2.data(),
+					    gpuTransformerWeights->gLnFinalGamma.data());
+				}
+				else
+				{
+					gpu::layernorm_backward(
+					    gpuTransformerScratch->dH.data(), bwdFinalH,
+					    gpuTransformerWeights->lnFinalGamma.data(),
+					    gpuTransformerScratch->lnFinalMean.data(),
+					    gpuTransformerScratch->lnFinalInvStd.data(),
+					    static_cast<int>(T), static_cast<int>(dModel),
+					    gpuTransformerScratch->dH2.data(),
+					    gpuTransformerWeights->gLnFinalGamma.data(),
+					    gpuTransformerWeights->gLnFinalBeta.data());
+				}
+				// dH2 now has gradient w.r.t. hFinal; swap into dH for block backprop.
+				gpu::device_memcpy_d2d(gpuTransformerScratch->dH.data(),
+				                       gpuTransformerScratch->dH2.data(),
+				                       static_cast<size_t>(T) * dModel * sizeof(float));
 
 				// RoPE invFreq already uploaded to scratch before forward layer loop.
 				const unsigned int ropeHalfDim = fwdRopeHalfDim;
@@ -2781,6 +2934,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							gpu::sum_squared_accumulate(gb.gLn2Gamma.data(), static_cast<int>(gb.gLn2Gamma.size()), gpuTransformerScratch->lossSum.data());
 							gpu::sum_squared_accumulate(gb.gLn2Beta.data(), static_cast<int>(gb.gLn2Beta.size()), gpuTransformerScratch->lossSum.data());
 						}
+						// Final LayerNorm gradients
+						gpu::sum_squared_accumulate(gpuTransformerWeights->gLnFinalGamma.data(),
+						    static_cast<int>(gpuTransformerWeights->gLnFinalGamma.size()),
+						    gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate(gpuTransformerWeights->gLnFinalBeta.data(),
+						    static_cast<int>(gpuTransformerWeights->gLnFinalBeta.size()),
+						    gpuTransformerScratch->lossSum.data());
 
 						float h_sumSq = 0.0f;
 						gpuTransformerScratch->lossSum.download(&h_sumSq, 1);
@@ -2800,17 +2960,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					// Biases and LN params use vanilla SGD (matching CPU ATLAS path).
 					const glades::ATLASConfig& ac = trainingConfig.atlas;
 
-					// Macro: ATLAS step for a weight matrix on GPU.
-#define GLADES_GPU_ATLAS_STEP(st, W, gW, rows, cols, lr_, wd1_, wd2_) do { \
-	if (!(st).initialized) \
-		gpu::atlas_gpu_init((st), (rows), (cols), ac.rank, ac.muMin); \
-	gpu::atlas_gpu_step((st), (W).data(), (gW).data(), \
-	                    (rows), (cols), \
-	                    invBatch, (lr_), (wd1_), (wd2_), gradScale, \
-	                    ac.beta, ac.muMin, ac.muMax, ac.eps, \
-	                    ac.tSub, ac.powerIters, ac.betaRefresh, \
-	                    ac.kappaMax); \
-} while(0)
+					bool gpuAtlasError = false;
 
 					// Macro: vanilla SGD for 1D bias/LN param on GPU.
 					// W -= lr * invBatch * gradScale * g;  then zero g.
@@ -2818,6 +2968,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	const int sgd_sz_ = static_cast<int>((param).size()); \
 	if (sgd_sz_ > 0) { \
 		gpu::atlas_gpu_baseline_update((param).data(), (grad).data(), sgd_sz_, (lr_) * invBatch * gradScale); \
+		gpu::atlas_gpu_guard((param).data(), sgd_sz_); \
 		(grad).zero(); \
 	} \
 } while(0)
@@ -2829,9 +2980,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						const float wd1_0 = skeleton->getWeightDecay1(0u);
 						const float wd2_0 = skeleton->getWeightDecay2(0u);
 
-						GLADES_GPU_ATLAS_STEP(gpuTransformerWeights->atlasTokE,
-						    gpuTransformerWeights->tokE, gpuTransformerWeights->gTokE,
-						    vocabSize, dModel, lr0, wd1_0, wd2_0);
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasTokE,
+						    gpuTransformerWeights->tokE.data(), gpuTransformerWeights->gTokE.data(),
+						    vocabSize, dModel, invBatch, lr0, wd1_0, wd2_0, gradScale,
+						    ac, rngEngine, getLogger(), "tr.tokE"))
+						    gpuAtlasError = true;
 
 						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lmBias, gpuTransformerWeights->gLmBias, lr0);
 					}
@@ -2843,9 +2996,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						const float wd1_0 = skeleton->getWeightDecay1(0u);
 						const float wd2_0 = skeleton->getWeightDecay2(0u);
 
-						GLADES_GPU_ATLAS_STEP(gpuTransformerWeights->atlasWIn,
-						    gpuTransformerWeights->WIn, gpuTransformerWeights->gWIn,
-						    dModel, inputSize, lr0, wd1_0, wd2_0);
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasWIn,
+						    gpuTransformerWeights->WIn.data(), gpuTransformerWeights->gWIn.data(),
+						    dModel, inputSize, invBatch, lr0, wd1_0, wd2_0, gradScale,
+						    ac, rngEngine, getLogger(), "tr.WIn"))
+						    gpuAtlasError = true;
 
 						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bIn, gpuTransformerWeights->gBIn, lr0);
 					}
@@ -2858,12 +3013,18 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						const float wd2_l = skeleton->getWeightDecay2(bli + 1u);
 						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
 
-						GLADES_GPU_ATLAS_STEP(gb.atlasWq, gb.Wq, gb.gWq, dModel, dModel, lr_l, wd1_l, wd2_l);
-						GLADES_GPU_ATLAS_STEP(gb.atlasWk, gb.Wk, gb.gWk, dModelKV, dModel, lr_l, wd1_l, wd2_l);
-						GLADES_GPU_ATLAS_STEP(gb.atlasWv, gb.Wv, gb.gWv, dModelKV, dModel, lr_l, wd1_l, wd2_l);
-						GLADES_GPU_ATLAS_STEP(gb.atlasWo, gb.Wo, gb.gWo, dModel, dModel, lr_l, wd1_l, wd2_l);
-						GLADES_GPU_ATLAS_STEP(gb.atlasW1, gb.W1, gb.gW1, ff1Width, dModel, lr_l, wd1_l, wd2_l);
-						GLADES_GPU_ATLAS_STEP(gb.atlasW2, gb.W2, gb.gW2, dModel, dFF, lr_l, wd1_l, wd2_l);
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWq, gb.Wq.data(), gb.gWq.data(), dModel, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wq"))
+						    gpuAtlasError = true;
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWk, gb.Wk.data(), gb.gWk.data(), dModelKV, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wk"))
+						    gpuAtlasError = true;
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWv, gb.Wv.data(), gb.gWv.data(), dModelKV, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wv"))
+						    gpuAtlasError = true;
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasWo, gb.Wo.data(), gb.gWo.data(), dModel, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.Wo"))
+						    gpuAtlasError = true;
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasW1, gb.W1.data(), gb.gW1.data(), ff1Width, dModel, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.W1"))
+						    gpuAtlasError = true;
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gb.atlasW2, gb.W2.data(), gb.gW2.data(), dModel, dFF, invBatch, lr_l, wd1_l, wd2_l, gradScale, ac, rngEngine, getLogger(), "tr.W2"))
+						    gpuAtlasError = true;
 
 						// Biases and LN params: vanilla SGD (no subspace projection)
 						GLADES_GPU_SGD_BIAS(gb.bq, gb.gBq, lr_l);
@@ -2878,6 +3039,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						GLADES_GPU_SGD_BIAS(gb.ln2Beta, gb.gLn2Beta, lr_l);
 					}
 
+					// Final LayerNorm (use block 0 LR; no weight decay)
+					{
+						const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lnFinalGamma, gpuTransformerWeights->gLnFinalGamma, lrLN);
+						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->lnFinalBeta, gpuTransformerWeights->gLnFinalBeta, lrLN);
+					}
+
 					// Output projection (layer index nLayers, unused in tied-head mode)
 					if (!tokenLM)
 					{
@@ -2885,13 +3053,70 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						const float wd1_o = skeleton->getWeightDecay1(nLayers);
 						const float wd2_o = skeleton->getWeightDecay2(nLayers);
 
-						GLADES_GPU_ATLAS_STEP(gpuTransformerWeights->atlasWOut,
-						    gpuTransformerWeights->WOut, gpuTransformerWeights->gWOut,
-						    outSize, dModel, lrO, wd1_o, wd2_o);
+						if (!gpuAtlasError && !gpu::atlas_gpu_update(gpuTransformerWeights->atlasWOut,
+						    gpuTransformerWeights->WOut.data(), gpuTransformerWeights->gWOut.data(),
+						    outSize, dModel, invBatch, lrO, wd1_o, wd2_o, gradScale,
+						    ac, rngEngine, getLogger(), "tr.WOut"))
+						    gpuAtlasError = true;
 
 						GLADES_GPU_SGD_BIAS(gpuTransformerWeights->bOut, gpuTransformerWeights->gBOut, lrO);
 					}
-#undef GLADES_GPU_ATLAS_STEP
+
+					// --- GPU ATLAS periodic diagnostics ---
+					if (!gpuAtlasError && logger && ac.tSub > 0u)
+					{
+						const unsigned long long tSubULL = static_cast<unsigned long long>(ac.tSub);
+
+						// Helper lambda-like macro to log a single weight state
+#define GLADES_GPU_ATLAS_DIAG(st, tag_str) do { \
+	if ((st).initialized && ((st).step % tSubULL) == 0ULL) { \
+		gpu::AtlasGpuDiag ad_ = gpu::atlas_gpu_get_diag((st)); \
+		if (ad_.valid) { \
+			std::ostringstream oss_; \
+			oss_ << "event=gpu_atlas_step tag=" << (tag_str); \
+			oss_ << " step=" << ad_.step; \
+			oss_ << " m=" << (st).m << " n=" << (st).n << " rank=" << (st).r; \
+			oss_ << " mu=" << ad_.mu; \
+			oss_ << " sigma2=" << ad_.sigma2; \
+			oss_ << " baseline_rate=" << ad_.baselineRate; \
+			oss_ << " gz_norm=" << ad_.gzNorm; \
+			oss_ << " update_norm=" << ad_.updateNorm; \
+			oss_ << " fisher_min=" << ad_.fisherMin; \
+			oss_ << " fisher_max=" << ad_.fisherMax; \
+			oss_ << " fisher_mean=" << ad_.fisherMean; \
+			logger->info("ATLAS", shmea::GString(oss_.str().c_str())); \
+		} \
+	} \
+} while(0)
+
+						if (tokenLM)
+							GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasTokE, "tr.tokE");
+						if (!tokenLM)
+							GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasWIn, "tr.WIn");
+
+						for (unsigned int bli = 0; bli < nLayers; ++bli)
+						{
+							gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+							GLADES_GPU_ATLAS_DIAG(gb.atlasWq, "tr.Wq");
+							GLADES_GPU_ATLAS_DIAG(gb.atlasWk, "tr.Wk");
+							GLADES_GPU_ATLAS_DIAG(gb.atlasWv, "tr.Wv");
+							GLADES_GPU_ATLAS_DIAG(gb.atlasWo, "tr.Wo");
+							GLADES_GPU_ATLAS_DIAG(gb.atlasW1, "tr.W1");
+							GLADES_GPU_ATLAS_DIAG(gb.atlasW2, "tr.W2");
+						}
+
+						if (!tokenLM)
+							GLADES_GPU_ATLAS_DIAG(gpuTransformerWeights->atlasWOut, "tr.WOut");
+
+#undef GLADES_GPU_ATLAS_DIAG
+					}
+
+					if (gpuAtlasError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU ATLAS update failed");
+						running = false;
+					}
 #undef GLADES_GPU_SGD_BIAS
 					}
 					else
@@ -2905,11 +3130,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
 					if (!gpuTransformerWeights->adamPtrsUploaded)
 					{
-						float* hParams[4 + 16 * 256];
-						float* hGrads[4 + 16 * 256];
-						float* hMs[4 + 16 * 256];
-						float* hVs[4 + 16 * 256];
-						int hSizes[4 + 16 * 256];
+						float* hParams[6 + 16 * 256];
+						float* hGrads[6 + 16 * 256];
+						float* hMs[6 + 16 * 256];
+						float* hVs[6 + 16 * 256];
+						int hSizes[6 + 16 * 256];
 						int gc = 0;
 						int maxSz = 0;
 
@@ -2968,6 +3193,17 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							GLADES_ADD_ADAM_GROUP(gb.ln2Gamma.data(), gb.gLn2Gamma.data(), gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(), static_cast<int>(gb.ln2Gamma.size()));
 							GLADES_ADD_ADAM_GROUP(gb.ln2Beta.data(), gb.gLn2Beta.data(), gb.mLn2Beta.data(), gb.v2Ln2Beta.data(), static_cast<int>(gb.ln2Beta.size()));
 						}
+						// Final LayerNorm
+						GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalGamma.data(),
+						    gpuTransformerWeights->gLnFinalGamma.data(),
+						    gpuTransformerWeights->mLnFinalGamma.data(),
+						    gpuTransformerWeights->v2LnFinalGamma.data(),
+						    static_cast<int>(gpuTransformerWeights->lnFinalGamma.size()));
+						GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalBeta.data(),
+						    gpuTransformerWeights->gLnFinalBeta.data(),
+						    gpuTransformerWeights->mLnFinalBeta.data(),
+						    gpuTransformerWeights->v2LnFinalBeta.data(),
+						    static_cast<int>(gpuTransformerWeights->lnFinalBeta.size()));
 						if (!tokenLM)
 						{
 							GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WOut.data(),
@@ -2996,8 +3232,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					// Fill lr/wd arrays each step and launch single batched kernel.
 					{
 						const int gc = gpuTransformerWeights->adamGroupCount;
-						float hLrs[4 + 16 * 256];
-						float hWds[4 + 16 * 256];
+						float hLrs[6 + 16 * 256];
+						float hWds[6 + 16 * 256];
 						int gi = 0;
 
 						if (tokenLM)
@@ -3025,6 +3261,12 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							// 10 bias/LN groups (no wd)
 							for (int b = 0; b < 10; ++b)
 							{ hLrs[gi] = lr_l; hWds[gi] = 0.0f; ++gi; }
+						}
+						// Final LayerNorm (use block 0 LR; no weight decay)
+						{
+							const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
+							hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalGamma
+							hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalBeta
 						}
 						if (!tokenLM)
 						{
@@ -3067,7 +3309,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			                                ttMut.bIn.empty() ? NULL : &ttMut.bIn[0], ttMut.bIn.size(),
 			                                ttMut.WOut.empty() ? NULL : &ttMut.WOut[0], ttMut.WOut.size(),
 			                                ttMut.bOut.empty() ? NULL : &ttMut.bOut[0], ttMut.bOut.size(),
-			                                ttMut.lmBias.empty() ? NULL : &ttMut.lmBias[0], ttMut.lmBias.size());
+			                                ttMut.lmBias.empty() ? NULL : &ttMut.lmBias[0], ttMut.lmBias.size(),
+			                                ttMut.lnFinalGamma.empty() ? NULL : &ttMut.lnFinalGamma[0], ttMut.lnFinalGamma.size(),
+			                                ttMut.lnFinalBeta.empty() ? NULL : &ttMut.lnFinalBeta[0], ttMut.lnFinalBeta.size());
 
 			// Download per-block weights.
 			for (unsigned int l = 0; l < nLayers; ++l)
@@ -4229,30 +4473,76 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				std::fill(dQfull.begin(), dQfull.end(), 0.0f);
 				std::fill(dKfull.begin(), dKfull.end(), 0.0f);
 				std::fill(dVfull.begin(), dVfull.end(), 0.0f);
-				// Region B: Attention backward — parallel over KV head groups.
+				// Region B: Attention backward — parallel over (head, query-chunk) pairs.
 				{
 					const bool attnWorthParallel = (static_cast<unsigned long long>(T) * T * dHead >= 32768ULL);
 					glades::ThreadPool& pool = glades::ThreadPool::instance();
-					if (attnWorthParallel && nKVHeads > 1u && pool.numThreads() > 1u)
+					if (attnWorthParallel && nHeads > 1u && pool.numThreads() > 1u)
 					{
-						AttnBwdCtx actx;
-						actx.Q = Qfull;
-						actx.K = Kfull;
-						actx.V = Vfull;
-						actx.dO = dAttnConcat.data();
-						actx.dQ = dQfull.data();
-						actx.dK = dKfull.data();
-						actx.dV = dVfull.data();
-						actx.dModel = dModel;
-						actx.dModelKV = dModelKV;
-						actx.dHead = dHead;
-						actx.nHeads = nHeads;
-						actx.nKVHeads = nKVHeads;
-						actx.T = T;
-						actx.groupSize = groupSize;
-						actx.causal = causal;
-						actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
-						pool.parallel_for(nKVHeads, attn_bwd_body, &actx);
+						// Determine chunk count: enough items to keep all cores busy.
+						const unsigned int nThreads = pool.numThreads();
+						unsigned int nChunksPerHead = 1u;
+						if (nHeads < nThreads && T >= 512u)
+						{
+							nChunksPerHead = (nThreads + nHeads - 1u) / nHeads;
+							// Cap to avoid excessive scratch memory.
+							if (nChunksPerHead > 4u) nChunksPerHead = 4u;
+						}
+
+						if (nChunksPerHead <= 1u)
+						{
+							// No benefit from chunking; dispatch one item per KV head (legacy path).
+							AttnBwdCtx actx;
+							actx.Q = Qfull; actx.K = Kfull; actx.V = Vfull;
+							actx.dO = dAttnConcat.data();
+							actx.dQ = dQfull.data(); actx.dK = dKfull.data(); actx.dV = dVfull.data();
+							actx.dModel = dModel; actx.dModelKV = dModelKV;
+							actx.dHead = dHead; actx.nHeads = nHeads; actx.nKVHeads = nKVHeads;
+							actx.T = T; actx.groupSize = groupSize;
+							actx.causal = causal;
+							actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
+							actx.nChunksPerHead = 1u;
+							actx.totalItems = nKVHeads;
+							actx.dKVscratch = NULL;
+							pool.parallel_for(nKVHeads, attn_bwd_body, &actx);
+						}
+						else
+						{
+							// Chunked: dispatch nHeads * nChunksPerHead items.
+							const unsigned int totalItems = nHeads * nChunksPerHead;
+							const size_t scratchPerItem = static_cast<size_t>(T) * dHead * 2u; // dK + dV
+							const size_t totalScratch = static_cast<size_t>(totalItems) * scratchPerItem;
+							std::vector<float> dKVscratch(totalScratch, 0.0f);
+
+							AttnBwdCtx actx;
+							actx.Q = Qfull; actx.K = Kfull; actx.V = Vfull;
+							actx.dO = dAttnConcat.data();
+							actx.dQ = dQfull.data(); actx.dK = dKfull.data(); actx.dV = dVfull.data();
+							actx.dModel = dModel; actx.dModelKV = dModelKV;
+							actx.dHead = dHead; actx.nHeads = nHeads; actx.nKVHeads = nKVHeads;
+							actx.T = T; actx.groupSize = groupSize;
+							actx.causal = causal;
+							actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
+							actx.nChunksPerHead = nChunksPerHead;
+							actx.totalItems = totalItems;
+							actx.dKVscratch = &dKVscratch[0];
+
+							pool.parallel_for(totalItems, attn_bwd_body, &actx);
+
+							// Reduce per-chunk dK/dV into the real strided dK/dV.
+							AttnBwdReduceCtx rctx;
+							rctx.dKVscratch = &dKVscratch[0];
+							rctx.dK = dKfull.data();
+							rctx.dV = dVfull.data();
+							rctx.dHead = dHead;
+							rctx.dModelKV = dModelKV;
+							rctx.T = T;
+							rctx.nHeads = nHeads;
+							rctx.nKVHeads = nKVHeads;
+							rctx.groupSize = groupSize;
+							rctx.nChunksPerHead = nChunksPerHead;
+							pool.parallel_for(nKVHeads, attn_bwd_reduce_body, &rctx);
+						}
 					}
 					else
 					{
@@ -4268,10 +4558,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							    dModelKV,
 							    dAttnConcat.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
 							    dModel,
-							    T,
-							    dHead,
-							    dHead,
-							    causal,
+							    T, dHead, dHead, causal,
 							    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead),
 							    dModel,
 							    dKfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead),

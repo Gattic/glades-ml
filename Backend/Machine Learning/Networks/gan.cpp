@@ -872,15 +872,16 @@ int GAN::saveWeights(const std::string& dir, const std::string& prefix) const
 		fwrite(&numDeconv, sizeof(uint32_t), 1, fp);
 		for (uint32_t l = 0; l < numDeconv; ++l)
 		{
-			uint32_t ddims[10] = {
+			uint32_t ddims[11] = {
 				net.tensorDeconv.layers[l].inC, net.tensorDeconv.layers[l].outC,
 				net.tensorDeconv.layers[l].kH, net.tensorDeconv.layers[l].kW,
 				net.tensorDeconv.layers[l].strideH, net.tensorDeconv.layers[l].strideW,
 				net.tensorDeconv.layers[l].padH, net.tensorDeconv.layers[l].padW,
 				net.tensorDeconv.layers[l].useUpsampleConv ? 1u : 0u,
-				net.tensorDeconv.layers[l].useReLU ? 1u : 0u
+				net.tensorDeconv.layers[l].useReLU ? 1u : 0u,
+				net.tensorDeconv.layers[l].useTanh ? 1u : 0u
 			};
-			fwrite(ddims, sizeof(uint32_t), 10, fp);
+			fwrite(ddims, sizeof(uint32_t), 11, fp);
 			fwrite(net.tensorDeconv.layers[l].W.data(), sizeof(float), net.tensorDeconv.layers[l].W.size(), fp);
 			fwrite(net.tensorDeconv.layers[l].bias.data(), sizeof(float), net.tensorDeconv.layers[l].bias.size(), fp);
 			uint8_t hasBN = net.tensorDeconv.layers[l].useBatchNorm ? 1u : 0u;
@@ -996,8 +997,8 @@ int GAN::loadWeights(const std::string& dir, const std::string& prefix)
 		net.tensorDeconv.layers.resize(numDeconv);
 		for (uint32_t l = 0; l < numDeconv; ++l)
 		{
-			uint32_t ddims[10];
-			if (fread(ddims, sizeof(uint32_t), 10, fp) != 10) break;
+			uint32_t ddims[11];
+			if (fread(ddims, sizeof(uint32_t), 11, fp) != 11) break;
 			NNetwork::TensorDeconvState::DeconvLayer& dl = net.tensorDeconv.layers[l];
 			dl.inC = ddims[0]; dl.outC = ddims[1];
 			dl.kH = ddims[2]; dl.kW = ddims[3];
@@ -1005,6 +1006,7 @@ int GAN::loadWeights(const std::string& dir, const std::string& prefix)
 			dl.padH = ddims[6]; dl.padW = ddims[7];
 			dl.useUpsampleConv = (ddims[8] != 0u);
 			dl.useReLU = (ddims[9] != 0u);
+			dl.useTanh = (ddims[10] != 0u);
 			dl.W.resize(static_cast<size_t>(dl.inC) * dl.outC * dl.kH * dl.kW);
 			dl.bias.resize(dl.outC);
 			dl.gW.resize(dl.W.size(), 0.0f);
@@ -2854,6 +2856,7 @@ bool GAN::initDeconvTensors(NNetwork& net, unsigned int inputDim, const DeconvCo
 		dl.inW = curW;
 		dl.useBatchNorm = spec.useBatchNorm;
 		dl.useReLU = spec.useReLU;
+		dl.useTanh = spec.useTanh;
 		dl.useUpsampleConv = spec.useUpsampleConv;
 
 		if (dl.useUpsampleConv)
@@ -3063,7 +3066,7 @@ void GAN::deconvForward(const NNetwork& net, const float* input, unsigned int in
 			// noiseSeed != 0 indicates training mode; seed is unique per thread/sample.
 			if (noiseSeed != 0u)
 			{
-				const float noiseStd = 0.1f;
+				const float noiseStd = 0.05f;
 				unsigned int rng = noiseSeed ^ (li * 65537u); // per-layer variation
 				for (size_t i = 0; i < outVol; i += 2u)
 				{
@@ -3082,6 +3085,11 @@ void GAN::deconvForward(const NNetwork& net, const float* input, unsigned int in
 						scratch[2u + li][i + 1u] += noiseStd * r * sinf(theta);
 				}
 			}
+		}
+		else if (dl.useTanh)
+		{
+			for (size_t i = 0; i < outVol; ++i)
+				scratch[2u + li][i] = tanhf(scratch[2u + li][i]);
 		}
 		else
 		{
@@ -3141,6 +3149,15 @@ void GAN::deconvBackward(NNetwork& net, const std::vector<std::vector<float> >& 
 		{
 			for (size_t i = 0; i < outVol; ++i)
 				dCurPtr[i] = (layerOut[i] > 0.0f) ? dCurPtr[i] : 0.0f;
+		}
+		else if (dl.useTanh)
+		{
+			// tanh derivative: d/dz tanh(z) = 1 - tanh(z)^2
+			for (size_t i = 0; i < outVol; ++i)
+			{
+				const float t = layerOut[i];
+				dCurPtr[i] *= (1.0f - t * t);
+			}
 		}
 		else
 		{
@@ -3416,6 +3433,15 @@ void GAN::deconvBackward(const NNetwork& net, const std::vector<std::vector<floa
 		{
 			for (size_t i = 0; i < outVol; ++i)
 				dCurPtr[i] = (layerOut[i] > 0.0f) ? dCurPtr[i] : 0.0f;
+		}
+		else if (dl.useTanh)
+		{
+			// tanh derivative: d/dz tanh(z) = 1 - tanh(z)^2
+			for (size_t i = 0; i < outVol; ++i)
+			{
+				const float t = layerOut[i];
+				dCurPtr[i] *= (1.0f - t * t);
+			}
 		}
 		else
 		{

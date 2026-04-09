@@ -2909,7 +2909,9 @@ bool glades::NNetwork::ensureGpuState()
 		                              ts.bIn.empty() ? NULL : &ts.bIn[0], ts.bIn.size(),
 		                              ts.WOut.empty() ? NULL : &ts.WOut[0], ts.WOut.size(),
 		                              ts.bOut.empty() ? NULL : &ts.bOut[0], ts.bOut.size(),
-		                              ts.lmBias.empty() ? NULL : &ts.lmBias[0], ts.lmBias.size());
+		                              ts.lmBias.empty() ? NULL : &ts.lmBias[0], ts.lmBias.size(),
+		                              ts.lnFinalGamma.empty() ? NULL : &ts.lnFinalGamma[0], ts.lnFinalGamma.size(),
+		                              ts.lnFinalBeta.empty() ? NULL : &ts.lnFinalBeta[0], ts.lnFinalBeta.size());
 
 		// Upload per-block weights
 		for (unsigned int l = 0; l < ts.nLayers; ++l)
@@ -2999,6 +3001,12 @@ bool glades::NNetwork::ensureGpuState()
 			if (!ts.mBOut.empty()) gpuTransformerWeights->mBOut.upload(&ts.mBOut[0], ts.mBOut.size());
 			if (!ts.v2BOut.empty()) gpuTransformerWeights->v2BOut.upload(&ts.v2BOut[0], ts.v2BOut.size());
 		}
+
+		// Final LayerNorm optimizer state (always present)
+		if (!ts.mLnFinalGamma.empty()) gpuTransformerWeights->mLnFinalGamma.upload(&ts.mLnFinalGamma[0], ts.mLnFinalGamma.size());
+		if (!ts.v2LnFinalGamma.empty()) gpuTransformerWeights->v2LnFinalGamma.upload(&ts.v2LnFinalGamma[0], ts.v2LnFinalGamma.size());
+		if (!ts.mLnFinalBeta.empty()) gpuTransformerWeights->mLnFinalBeta.upload(&ts.mLnFinalBeta[0], ts.mLnFinalBeta.size());
+		if (!ts.v2LnFinalBeta.empty()) gpuTransformerWeights->v2LnFinalBeta.upload(&ts.v2LnFinalBeta[0], ts.v2LnFinalBeta.size());
 	}
 
 	gpuStateReady = true;

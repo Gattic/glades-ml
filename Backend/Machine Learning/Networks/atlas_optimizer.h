@@ -19,6 +19,10 @@
 namespace shmea { class GLogger; }
 
 namespace glades {
+
+// Forward declaration (defined in training_config.h).
+struct ATLASConfig;
+
 namespace atlas {
 
 // Per-weight-matrix ATLAS optimizer state.
@@ -39,6 +43,18 @@ struct WeightState
 	std::vector<float> fisherDiag;  // [r] EMA of Fisher eigenvalues
 	std::vector<float> prevGz;      // [r * n] previous compressed gradient
 
+	// Persistent scratch buffers (allocated once in initWeightState, reused every step).
+	// applyStep scratch:
+	std::vector<float> scratch_gz;        // [r * n]
+	std::vector<float> scratch_corrected; // [r * n]
+	// refreshSubspace scratch:
+	std::vector<float> scratch_U_old;     // [m * r]
+	std::vector<float> scratch_f_old;     // [r]
+	std::vector<float> scratch_B;         // [r * n]
+	std::vector<float> scratch_Z;         // [m * r]
+	std::vector<float> scratch_overlap;   // [r * r]
+	std::vector<float> scratch_prevGzOld; // [r * n]
+
 	float sigma2;                   // global second moment EMA (BRSP baseline)
 	float mu;                       // adaptive prediction coefficient
 	unsigned long long step;        // optimizer step counter
@@ -56,6 +72,14 @@ struct WeightState
 		U.clear();
 		fisherDiag.clear();
 		prevGz.clear();
+		scratch_gz.clear();
+		scratch_corrected.clear();
+		scratch_U_old.clear();
+		scratch_f_old.clear();
+		scratch_B.clear();
+		scratch_Z.clear();
+		scratch_overlap.clear();
+		scratch_prevGzOld.clear();
 		sigma2 = 1.0f;
 		mu = 0.01f;
 		step = 0ULL;
@@ -84,7 +108,8 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 // Uses warm-start from current U. Transforms Fisher diagonal and prevGz
 // into the new basis instead of resetting them.
 // logger: optional GLogger for refresh diagnostics.
-void refreshSubspace(WeightState& state, const float* grad,
+// Returns true on success, false if non-finite values detected during refresh.
+bool refreshSubspace(WeightState& state, const float* grad,
                      unsigned int m, unsigned int n,
                      unsigned int powerIters, float betaRefresh,
                      glades::rng::Engine& rng,
@@ -109,16 +134,36 @@ void refreshSubspace(WeightState& state, const float* grad,
 // W: [m * n] weight matrix (modified in place)
 // gW: [m * n] accumulated gradient (cleared to zero after use)
 // logger: optional GLogger for step diagnostics (logged every tSub steps).
-void applyStep(WeightState& state,
+// tag: optional per-matrix identifier included in log messages (e.g. "block3.Wq").
+// Returns false if the optimizer entered a NaN/Inf recovery path during this step.
+bool applyStep(WeightState& state,
                float* W, float* gW,
                unsigned int m, unsigned int n,
                float invBatch, float lr,
                float wd1, float wd2, float gradScale,
-               float beta, float muMin, float muMax,
-               float eps, unsigned int tSub,
-               unsigned int powerIters, float betaRefresh,
+               const ATLASConfig& ac,
                glades::rng::Engine& rng,
-               shmea::GLogger* logger = 0);
+               shmea::GLogger* logger = 0,
+               const char* tag = 0);
+
+// Convenience wrapper: initializes state if needed, then calls applyStep.
+// Replaces the repeated init-if-needed + applyStep boilerplate in SGD files.
+// Returns false if applyStep entered a recovery path.
+bool update(WeightState& state, float* W, float* gW,
+            unsigned int m, unsigned int n,
+            float invBatch, float lr,
+            float wd1, float wd2, float gradScale,
+            const ATLASConfig& ac,
+            glades::rng::Engine& rng,
+            shmea::GLogger* logger = 0,
+            const char* tag = 0);
+
+// Apply vanilla SGD to a 1D bias vector and zero the gradient.
+// Returns false if any bias element becomes non-finite (NaN/Inf).
+// This centralizes the repeated bias-update-with-NaN-check pattern
+// used in all SGD files alongside ATLAS weight updates.
+bool updateBias(float* bias, float* gBias, unsigned int size,
+                float invBatch, float lr, float gradScale);
 
 } // namespace atlas
 } // namespace glades
