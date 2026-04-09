@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <time.h>
 #include <vector>
 
 #include "logfmt_utils.h"
@@ -19,6 +20,22 @@ using namespace glades;
 using namespace glades::logfmt;
 
 namespace {
+static timespec monotonic_now()
+{
+	timespec ts;
+	ts.tv_sec = 0;
+	ts.tv_nsec = 0;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts;
+}
+
+static double monotonic_elapsed_ns(const timespec& start, const timespec& end)
+{
+	const double sec = static_cast<double>(end.tv_sec - start.tv_sec) * 1.0e9;
+	const double nsec = static_cast<double>(end.tv_nsec - start.tv_nsec);
+	return sec + nsec;
+}
+
 static bool invert_small_dense_row_major(const std::vector<float>& matrix,
                                          unsigned int dim,
                                          float ridge,
@@ -1256,12 +1273,15 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 
 				if (asterEnabled && lastTransition < tensorDff.T.size())
 				{
+					const timespec asterBoundaryStart = monotonic_now();
 					TensorDFFState::Transition& outTr = tensorDff.T[lastTransition];
 					const ATLASConfig& acAster = trainingConfig.atlas;
 					const unsigned int rawHiddenDim = aster.rawHiddenDim;
 					const unsigned int controlDim = aster.controlDim;
 					const unsigned int outputDim = std::min<unsigned int>(aster.outputDim, outTr.out);
 					const unsigned int featureDim = outputDim + (2u * controlDim);
+					const unsigned int stateFeatureDim =
+					    std::max(1u, std::min<unsigned int>(aster.stateRank, std::max(1u, outputDim))) + (2u * controlDim);
 					const unsigned int stateRank = std::min<unsigned int>(std::max(1u, aster.stateRank),
 					                                                    std::max(1u, outputDim));
 					const unsigned int trackedLayers = std::min<unsigned int>(
@@ -1278,11 +1298,25 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					std::vector<float> controlStd(controlDim, 1.0f);
 					std::vector<float> residualStd(outputDim, 1.0f);
 					std::vector<float> feature(featureDim, 0.0f);
+					std::vector<float> prevControlW(controlDim, 0.0f);
+					std::vector<float> currentControlW(controlDim, 0.0f);
 					std::vector<float> currentResidualW(outputDim, 0.0f);
-					std::vector<float> predictedResidualW(outputDim, 0.0f);
-					std::vector<float> predictedLatent(stateRank, 0.0f);
+					std::vector<float> predictedResidualCurrentW(outputDim, 0.0f);
+					std::vector<float> predictedResidualNextW(outputDim, 0.0f);
+					std::vector<float> observedLatent(stateRank, 0.0f);
+					std::vector<float> prevLatentAligned(stateRank, 0.0f);
+					std::vector<float> predictedState(stateRank, 0.0f);
+					std::vector<float> filteredState(stateRank, 0.0f);
+					std::vector<float> nextState(stateRank, 0.0f);
+					std::vector<float> innovation(outputDim, 0.0f);
+					std::vector<float> stateCorrection(stateRank, 0.0f);
+					std::vector<float> stateFeature(stateFeatureDim, 0.0f);
 					std::vector<float> invPastCov;
+					std::vector<float> invStatePastCov;
+					std::vector<float> invInnovationCov;
 					std::vector<float> theta(static_cast<size_t>(outputDim) * static_cast<size_t>(featureDim), 0.0f);
+					std::vector<float> stateModel(static_cast<size_t>(stateRank) * static_cast<size_t>(stateFeatureDim), 0.0f);
+					std::vector<float> innovationGain(static_cast<size_t>(stateRank) * static_cast<size_t>(outputDim), 0.0f);
 					std::vector<float> nextSigma;
 					std::vector<float> nextLeft;
 					std::vector<float> nextRight;
@@ -1294,10 +1328,13 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					        : std::min<unsigned int>(
 					              std::min<unsigned int>(aster.hiddenLayerSizes.back(), outTr.in),
 					              rawHiddenDim - outputHiddenOffset);
+					const double asterSetupNs =
+					    monotonic_elapsed_ns(asterBoundaryStart, monotonic_now());
 
 					for (unsigned int i = 0; i < rawHiddenDim; ++i)
 						rawHiddenMean[i] = aster.batchHiddenSum[i] * invBatch;
 
+					const timespec asterTransportStart = monotonic_now();
 					for (unsigned int l = 0; l < trackedLayers && ((l + 1u) * outputDim) <= controlDim; ++l)
 					{
 						const unsigned int layerOffset = aster.hiddenLayerOffsets[l];
@@ -1363,7 +1400,10 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 							controlMean[projectedOff + j] = static_cast<float>(accum);
 						}
 					}
+					const double asterTransportNs =
+					    monotonic_elapsed_ns(asterTransportStart, monotonic_now());
 
+					const timespec asterTransferFitStart = monotonic_now();
 					for (unsigned int j = 0; j < outputDim; ++j)
 					{
 						residualMean[j] = aster.batchResidualSum[j] * invBatch;
@@ -1382,10 +1422,12 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 						    (betaAster * aster.controlVar[i]) + ((1.0f - betaAster) * std::max(secondMoment, varEps));
 						aster.controlVar[i] = std::max(updatedVar, varEps);
 						controlStd[i] = sqrtf(aster.controlVar[i]);
-						feature[outputDim + i] =
+						prevControlW[i] =
 						    (controlStd[i] > sigmaEps) ? (aster.prevControlMean[i] / controlStd[i]) : 0.0f;
-						feature[outputDim + controlDim + i] =
+						currentControlW[i] =
 						    (controlStd[i] > sigmaEps) ? (controlMean[i] / controlStd[i]) : 0.0f;
+						feature[outputDim + i] = prevControlW[i];
+						feature[outputDim + controlDim + i] = currentControlW[i];
 					}
 
 					for (unsigned int r = 0; r < featureDim; ++r)
@@ -1431,22 +1473,131 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					extract_top_singular_modes_row_major(theta, outputDim, featureDim, stateRank,
 					                                     nextSigma, nextLeft, nextRight);
 
-					double effectiveSigmaSq = 0.0;
 					for (unsigned int m = 0; m < stateRank; ++m)
 					{
-						const float modeSigma = (m < nextSigma.size()) ? std::max(0.0f, nextSigma[m]) : 0.0f;
-						const float modePole = (m < aster.pole.size()) ? aster.pole[m] : 0.0f;
-						const float modeLatent = (m < aster.latent.size()) ? aster.latent[m] : 0.0f;
-						double latentInput = 0.0;
-						const size_t rightOff = static_cast<size_t>(m) * static_cast<size_t>(featureDim);
-						for (unsigned int c = 0; c < featureDim && (rightOff + c) < nextRight.size(); ++c)
-							latentInput += static_cast<double>(nextRight[rightOff + c]) * static_cast<double>(feature[c]);
-						predictedLatent[m] = static_cast<float>(
-						    static_cast<double>(modePole) * static_cast<double>(modeLatent) + latentInput);
-						effectiveSigmaSq += static_cast<double>(modeSigma) * static_cast<double>(modeSigma);
+						bool aligned = false;
+						if ((m < aster.latent.size())
+						    && (aster.leftMode.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(outputDim))
+						    && (nextLeft.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(outputDim)))
+						{
+							double accum = 0.0;
+							const size_t nextLeftOff = static_cast<size_t>(m) * static_cast<size_t>(outputDim);
+							for (unsigned int pm = 0; pm < stateRank && pm < aster.latent.size(); ++pm)
+							{
+								const size_t prevLeftOff = static_cast<size_t>(pm) * static_cast<size_t>(outputDim);
+								double corr = 0.0;
+								for (unsigned int j = 0; j < outputDim; ++j)
+								{
+									corr += static_cast<double>(nextLeft[nextLeftOff + j])
+									      * static_cast<double>(aster.leftMode[prevLeftOff + j]);
+								}
+								accum += corr * static_cast<double>(aster.latent[pm]);
+							}
+							prevLatentAligned[m] = static_cast<float>(accum);
+							aligned = true;
+						}
+						if (!aligned && m < aster.latent.size())
+							prevLatentAligned[m] = aster.latent[m];
+					}
+
+					for (unsigned int m = 0; m < stateRank; ++m)
+						stateFeature[m] = prevLatentAligned[m];
+					for (unsigned int i = 0; i < controlDim; ++i)
+					{
+						stateFeature[stateRank + i] = prevControlW[i];
+						stateFeature[stateRank + controlDim + i] = currentControlW[i];
+					}
+
+					for (unsigned int m = 0; m < stateRank; ++m)
+					{
 						const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(outputDim);
 						for (unsigned int j = 0; j < outputDim && (leftOff + j) < nextLeft.size(); ++j)
-							predictedResidualW[j] += modeSigma * nextLeft[leftOff + j] * predictedLatent[m];
+							observedLatent[m] += nextLeft[leftOff + j] * currentResidualW[j];
+					}
+					const double asterTransferFitNs =
+					    monotonic_elapsed_ns(asterTransferFitStart, monotonic_now());
+
+					const timespec asterStateFitStart = monotonic_now();
+					if (aster.statePastCov.size() >= static_cast<size_t>(stateFeatureDim) * static_cast<size_t>(stateFeatureDim)
+					    && aster.stateCrossCov.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(stateFeatureDim))
+					{
+						for (unsigned int r = 0; r < stateFeatureDim; ++r)
+						{
+							const size_t rowOff = static_cast<size_t>(r) * static_cast<size_t>(stateFeatureDim);
+							for (unsigned int c = 0; c < stateFeatureDim; ++c)
+							{
+								const float sample = stateFeature[r] * stateFeature[c];
+								aster.statePastCov[rowOff + c] =
+								    (betaAster * aster.statePastCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+							}
+						}
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+							for (unsigned int c = 0; c < stateFeatureDim; ++c)
+							{
+								const float sample = observedLatent[m] * stateFeature[c];
+								aster.stateCrossCov[rowOff + c] =
+								    (betaAster * aster.stateCrossCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+							}
+						}
+						if (invert_small_dense_row_major(aster.statePastCov, stateFeatureDim, ridge, invStatePastCov))
+						{
+							for (unsigned int m = 0; m < stateRank; ++m)
+							{
+								const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+								for (unsigned int c = 0; c < stateFeatureDim; ++c)
+								{
+									double accum = 0.0;
+									for (unsigned int k = 0; k < stateFeatureDim; ++k)
+									{
+										accum += static_cast<double>(aster.stateCrossCov[rowOff + k])
+										      * static_cast<double>(invStatePastCov[static_cast<size_t>(k) * static_cast<size_t>(stateFeatureDim) + c]);
+									}
+									stateModel[rowOff + c] = static_cast<float>(accum);
+								}
+							}
+						}
+					}
+
+					float maxRowAbs = 0.0f;
+					for (unsigned int m = 0; m < stateRank; ++m)
+					{
+						const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+						float rowAbs = 0.0f;
+						for (unsigned int s = 0; s < stateRank; ++s)
+							rowAbs += std::fabs(stateModel[rowOff + s]);
+						maxRowAbs = std::max(maxRowAbs, rowAbs);
+					}
+					if (maxRowAbs > acAster.asterPoleMax && maxRowAbs > sigmaEps)
+					{
+						const float scale = acAster.asterPoleMax / maxRowAbs;
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+							for (unsigned int s = 0; s < stateRank; ++s)
+								stateModel[rowOff + s] *= scale;
+						}
+					}
+
+					for (unsigned int m = 0; m < stateRank; ++m)
+					{
+						const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+						double accum = 0.0;
+						for (unsigned int s = 0; s < stateRank; ++s)
+							accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(prevLatentAligned[s]);
+						for (unsigned int i = 0; i < controlDim; ++i)
+						{
+							accum += static_cast<double>(stateModel[rowOff + stateRank + i]) * static_cast<double>(prevControlW[i]);
+							accum += static_cast<double>(stateModel[rowOff + stateRank + controlDim + i]) * static_cast<double>(currentControlW[i]);
+						}
+						predictedState[m] = static_cast<float>(accum);
+					}
+					for (unsigned int m = 0; m < stateRank; ++m)
+					{
+						const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(outputDim);
+						for (unsigned int j = 0; j < outputDim && (leftOff + j) < nextLeft.size(); ++j)
+							predictedResidualCurrentW[j] += nextLeft[leftOff + j] * predictedState[m];
 					}
 
 					double targetNormSq = 0.0;
@@ -1454,13 +1605,93 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					for (unsigned int j = 0; j < outputDim; ++j)
 					{
 						const double target = static_cast<double>(currentResidualW[j]);
-						const double err = target - static_cast<double>(predictedResidualW[j]);
+						const double err = target - static_cast<double>(predictedResidualCurrentW[j]);
+						innovation[j] = static_cast<float>(err);
 						targetNormSq += target * target;
 						errNormSq += err * err;
 					}
 					float asterPredR2 = 0.0f;
 					if (targetNormSq > 1e-12)
 						asterPredR2 = static_cast<float>(std::max<double>(0.0, 1.0 - (errNormSq / targetNormSq)));
+					const double asterStateFitNs =
+					    monotonic_elapsed_ns(asterStateFitStart, monotonic_now());
+
+					for (unsigned int m = 0; m < stateRank; ++m)
+						stateCorrection[m] = observedLatent[m] - predictedState[m];
+					const timespec asterInnovationFitStart = monotonic_now();
+					if (aster.innovationCov.size() >= static_cast<size_t>(outputDim) * static_cast<size_t>(outputDim)
+					    && aster.innovationCross.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(outputDim))
+					{
+						for (unsigned int r = 0; r < outputDim; ++r)
+						{
+							const size_t rowOff = static_cast<size_t>(r) * static_cast<size_t>(outputDim);
+							for (unsigned int c = 0; c < outputDim; ++c)
+							{
+								const float sample = innovation[r] * innovation[c];
+								aster.innovationCov[rowOff + c] =
+								    (betaAster * aster.innovationCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+							}
+						}
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(outputDim);
+							for (unsigned int j = 0; j < outputDim; ++j)
+							{
+								const float sample = stateCorrection[m] * innovation[j];
+								aster.innovationCross[rowOff + j] =
+								    (betaAster * aster.innovationCross[rowOff + j]) + ((1.0f - betaAster) * sample);
+							}
+						}
+						if (invert_small_dense_row_major(aster.innovationCov, outputDim, ridge, invInnovationCov))
+						{
+							for (unsigned int m = 0; m < stateRank; ++m)
+							{
+								const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(outputDim);
+								for (unsigned int j = 0; j < outputDim; ++j)
+								{
+									double accum = 0.0;
+									for (unsigned int k = 0; k < outputDim; ++k)
+									{
+										accum += static_cast<double>(aster.innovationCross[rowOff + k])
+										      * static_cast<double>(invInnovationCov[static_cast<size_t>(k) * static_cast<size_t>(outputDim) + j]);
+									}
+									innovationGain[rowOff + j] = static_cast<float>(accum);
+								}
+							}
+						}
+					}
+
+					for (unsigned int m = 0; m < stateRank; ++m)
+					{
+						double accum = static_cast<double>(predictedState[m]);
+						const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(outputDim);
+						for (unsigned int j = 0; j < outputDim; ++j)
+							accum += static_cast<double>(innovationGain[rowOff + j]) * static_cast<double>(innovation[j]);
+						filteredState[m] = static_cast<float>(accum);
+					}
+					for (unsigned int m = 0; m < stateRank; ++m)
+					{
+						const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+						double accum = 0.0;
+						for (unsigned int s = 0; s < stateRank; ++s)
+							accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(filteredState[s]);
+						for (unsigned int i = 0; i < controlDim; ++i)
+						{
+							accum += static_cast<double>(stateModel[rowOff + stateRank + i]) * static_cast<double>(currentControlW[i]);
+							accum += static_cast<double>(stateModel[rowOff + stateRank + controlDim + i]) * static_cast<double>(currentControlW[i]);
+						}
+						nextState[m] = static_cast<float>(accum);
+					}
+					for (unsigned int m = 0; m < stateRank; ++m)
+					{
+						const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(outputDim);
+						for (unsigned int j = 0; j < outputDim && (leftOff + j) < nextLeft.size(); ++j)
+							predictedResidualNextW[j] += nextLeft[leftOff + j] * nextState[m];
+					}
+					const double asterInnovationFitNs =
+					    monotonic_elapsed_ns(asterInnovationFitStart, monotonic_now());
+
+					const timespec asterApplyStart = monotonic_now();
 					const float asterEdge = (!nextSigma.empty()) ? std::max(0.0f, nextSigma[0]) : 0.0f;
 					float asterTransferScale = 0.0f;
 					if (asterEdge > acAster.asterEdgeThreshold)
@@ -1477,7 +1708,7 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 						for (unsigned int j = 0; j < outputDim; ++j)
 						{
 							const float predictedResidual =
-							    clipf_maybe(predictedResidualW[j] * residualStd[j], gradClip);
+							    clipf_maybe(predictedResidualNextW[j] * residualStd[j], gradClip);
 							if (!is_finite(predictedResidual))
 								continue;
 							if (j < outTr.gBias.size())
@@ -1493,17 +1724,13 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 						if (m >= aster.poleNumer.size() || m >= aster.poleDenom.size()
 						    || m >= aster.pole.size() || m >= aster.latent.size())
 							continue;
-						const float oldLatent = aster.latent[m];
-						const float poleNumer = (betaAster * aster.poleNumer[m])
-						                      + ((1.0f - betaAster) * predictedLatent[m] * oldLatent);
-						const float poleDenom = (betaAster * aster.poleDenom[m])
-						                      + ((1.0f - betaAster) * oldLatent * oldLatent);
-						aster.poleNumer[m] = poleNumer;
-						aster.poleDenom[m] = poleDenom;
-						if (poleDenom > sigmaEps)
-							aster.pole[m] = std::max(-acAster.asterPoleMax,
-							                         std::min(acAster.asterPoleMax, poleNumer / (poleDenom + sigmaEps)));
-						aster.latent[m] = predictedLatent[m];
+						const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+						const float diagPole = (m < stateRank) ? stateModel[rowOff + m] : 0.0f;
+						aster.poleNumer[m] = diagPole;
+						aster.poleDenom[m] = 1.0f;
+						aster.pole[m] = std::max(-acAster.asterPoleMax,
+						                         std::min(acAster.asterPoleMax, diagPole));
+						aster.latent[m] = filteredState[m];
 					}
 
 					unsigned int asterActiveModes = 0u;
@@ -1532,6 +1759,15 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 						aster.prevControlMean[i] = controlMean[i];
 					for (unsigned int j = 0; j < outputDim; ++j)
 						aster.prevResidualMean[j] = residualMean[j];
+					const timespec asterBoundaryEnd = monotonic_now();
+					aster.timingBoundaryCount += 1ULL;
+					aster.totalBoundaryNs += monotonic_elapsed_ns(asterBoundaryStart, asterBoundaryEnd);
+					aster.totalSetupNs += asterSetupNs;
+					aster.totalTransportNs += asterTransportNs;
+					aster.totalTransferFitNs += asterTransferFitNs;
+					aster.totalStateFitNs += asterStateFitNs;
+					aster.totalInnovationFitNs += asterInnovationFitNs;
+					aster.totalApplyNs += monotonic_elapsed_ns(asterApplyStart, asterBoundaryEnd);
 				}
 
 					// Optional global grad-norm clipping (modern feature).

@@ -2256,6 +2256,189 @@ Interpretation:
 - The most important result is diagnostic, not just metric: `activeModes > 0`, nontrivial `mode2Frac`, positive `predR2`, and small but nonzero `mem` mean the output-space state-space observable is finally exposing a real predictive mode family instead of collapsing to a no-op.
 - That changes the proceed path. The branch is now no longer “find a better parameter-space summary” or “tune HELM harder.” It is “strengthen ASTER,” for example with better reduced realization, better innovation filtering, or slightly richer output-space state models.
 
+### N.13 ASTER-v2 explicit innovation-state update
+
+The next step on **April 9, 2026** was to turn `ASTER-Lite` into a more explicit innovation state-space update:
+
+- keep the existing output-space transfer-mode extraction,
+- replace the old one-step latent recurrence with a true predict / innovate / filter / predict cycle,
+- fit a small latent transition on `[x_{k-1}, u_{k-1}, u_k]`,
+- fit a separate innovation gain from output residual surprise,
+- and keep the actuation path output-head-only.
+
+Implementation status after the profiling / root-cause follow-up:
+
+- focused correctness checks still pass:
+  - command: `./unit-tests/build/glades-unit-tests atlas-controller`
+  - command result: `pass`
+- the broader ATLAS suite also completes again:
+  - command: `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+  - command result: `pass`
+
+Performance investigation result:
+
+- the apparent ASTER-v2 “timeout regression” turned out **not** to be in the innovation-state update itself.
+- isolated ASTER timing was added inside the DFF loop and the hot path was split into:
+  - setup,
+  - hidden-to-output transport,
+  - transfer fit,
+  - state fit,
+  - innovation fit,
+  - apply.
+- isolated runs showed ASTER-local overhead is tiny:
+  - `nonlinear-forecast`: `boundaryMs≈0.043`, `transportMs≈0.032`, `transferMs≈0.006`, `stateMs≈0.003`
+  - `latent-forecast`: `boundaryMs≈0.026`, `transportMs≈0.016`, `transferMs≈0.006`, `stateMs≈0.003`
+- `perf stat -d` on isolated `nonlinear-forecast` base vs ASTER agreed: ASTER adds only about `1-2%` task-clock with essentially unchanged IPC, branch-miss, and cache-miss behavior.
+- the real regression was in the alternate benchmark harness: the regression-network factory was still returning `NNetwork` **by value**, and after the recent object/layout churn that path started throwing `std::bad_array_new_length` on the regression tasks.
+- fixing the harness to use the same explicit owner pattern as the token benchmark restored the measured ASTER runs.
+
+Repeated dynamic benchmark status after the harness fix:
+
+- command: `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+- command result:
+  - `ATLAS-BSRP`: `train=2.38 +/- 0.20s`, `testMSE=0.00284 +/- 0.00022`
+  - `ATLAS-SPARROW`: `train=2.58 +/- 0.01s`, `testMSE=0.00266 +/- 0.00017`
+  - `ATLAS-ASTER`: `train=2.28 +/- 0.00s`, `testMSE=0.00267 +/- 0.00016`
+- command: `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+- command result:
+  - `ATLAS-BSRP`: `train=4.33 +/- 0.35s`, `testMSE=0.00143 +/- 0.00009`
+  - `ATLAS-SPARROW`: `train=4.48 +/- 0.00s`, `testMSE=0.00159 +/- 0.00014`
+  - `ATLAS-ASTER`: `train=4.14 +/- 0.00s`, `testMSE=0.00140 +/- 0.00014`
+  - ASTER usage remained nontrivial: `activeModes=1.43 +/- 0.34`, `mode2Frac=0.537 +/- 0.189`, `predR2=0.056 +/- 0.057`
+- command: `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-canonical --repeats 3`
+- command result:
+  - `signal-win`: `base=0.13618`, `sparrow-r1=0.10486`, `sparrow-auto=0.10432`
+  - `default-anchor`: `base=0.05800`, `sparrow-r1=0.05847`, `sparrow-auto=0.06964`
+  - `failure-band`: `base=0.17332`, `sparrow-r1=0.12703`, `sparrow-auto=0.17311`
+
+Interpretation:
+
+- ASTER-v2 is now a **validated** dynamic-task branch, not an unvalidated throughput-regression branch.
+- On `latent-forecast`, ASTER remains effectively tied with SPARROW on held-out error while running materially faster.
+- On `nonlinear-forecast`, ASTER remains the strongest branch so far: it beats both isotropic `ATLAS-BSRP` and SPARROW on held-out MSE while running at essentially the same speed as BSRP.
+- The ASTER innovation/state update is not the practical runtime bottleneck; if an ASTER-side perf pass is ever needed, the only local hotspot worth touching is hidden-to-output transport.
+
+Current recommendation:
+
+- make `ASTER` the primary dynamic-task research branch,
+- keep `SPARROW` as the control branch on `latent-forecast` and planted teacher cases,
+- stop treating ASTER as a perf problem,
+- and spend the next iteration on ASTER accuracy / robustness rather than new framework churn.
+
+### N.14 ASTER-T transformer token-LM port
+
+On **April 9, 2026**, the first transformer-side `ASTER` port was added to the decoder token-LM path:
+
+- observable family:
+  - fixed logit-space sketch over LM-head residual rows,
+  - hidden-state transport from the final hidden state and the last decoder blocks,
+  - small retained ASTER state on that sketched output process.
+- actuation path:
+  - tied LM head only (`tokE` / `lmBias`),
+  - no parameter-space complement modeling,
+  - no extra forward / backward pass in the minimal prototype.
+- implementation status:
+  - transformer-side ASTER state and diagnostics were added to `TensorTransformerState`,
+  - token-LM backward now accumulates hidden/output ASTER statistics,
+  - `atlas-alt-bench` token-LM runs now include `ATLAS-ASTER`,
+  - a transformer token-LM ASTER smoke test was added to `atlas-test.cpp`.
+
+Validation status:
+
+- command: `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - command result: `pass`
+- command: `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - command result: `pass`
+- command: `./unit-tests/build/glades-unit-tests atlas-controller`
+  - command result: `pass`
+- command: `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+  - command result: `timeout`, but this reproduces a broader long-running ATLAS-suite issue unrelated to the transformer ASTER path.
+
+Because the default token-LM benchmark configuration is too heavy for short interactive runs, a reduced token-LM smoke benchmark was also added via new harness knobs for `seqLen`, `dModel`, `dFF`, `layers`, and `heads`.
+
+Reduced token-LM smoke comparison on **April 9, 2026**:
+
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --repeats 1 --token-train-seqs 4 --token-test-seqs 2 --token-epochs 1 --token-seq-len 16 --token-dmodel 16 --token-dff 32 --token-layers 1 --token-heads 1 --variant all`
+- command result:
+  - `AdamW`: `trainNLL=4.16915`, `testNLL=4.17474`
+  - `ATLAS-BSRP`: `trainNLL=4.18018`, `testNLL=4.18314`
+  - `ATLAS-SPARROW`: `trainNLL=4.17168`, `testNLL=4.16570`
+  - `ATLAS-ASTER`: `trainNLL=4.17808`, `testNLL=4.16877`
+  - ASTER usage:
+    - `activeModes=2.00`
+    - `mode2Frac=1.000`
+    - `edge2/1=0.673`
+    - `edge=0.168`
+    - `sigma=0.203`
+    - `predR2=0.331`
+    - `mem=0.007`
+    - `pole=-0.015`
+
+Interpretation:
+
+- This is the first transformer-side result showing that the ASTER-T port is not a no-op: it activates nonzero retained modes and produces bounded output-space state usage on token LM.
+- On this tiny transformer smoke configuration, `SPARROW` still has the best held-out NLL, but `ASTER` is close and clearly better than isotropic `ATLAS-BSRP`.
+- The important result is observability, not the exact ranking on this small smoke case: unlike the earlier parameter-space token-LM branch, ASTER-T exposes a real retained output-state process instead of collapsing to zero modes.
+- The default token-LM harness remains too expensive for interactive repeated sweeps, so any serious transformer follow-up should either:
+  - use the new reduced token-model knobs for iterative work, or
+  - move to offline repeated runs on the default decoder benchmark.
+
+### N.15 Larger token-LM transformer preset
+
+To bridge the gap between the tiny smoke case and the still-expensive default token-LM benchmark, a dedicated larger transformer preset was added on **April 9, 2026**:
+
+- mode:
+  - `token-lm-large`
+- preset:
+  - `vocab=97`
+  - `dModel=24`
+  - `dFF=96`
+  - `layers=2`
+  - `heads=4`
+  - `seqLen=24`
+  - `trainSeqs=8`
+  - `testSeqs=4`
+  - `epochs=1`
+
+This is intentionally larger than the ASTER-T smoke configuration but still small enough to complete quickly in the unit-test harness.
+
+Observed one-repeat comparison on **April 9, 2026**:
+
+- command:
+  - `timeout 90s ./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 1 --variant all`
+- command result:
+  - `AdamW`: `testNLL=4.56885`, `testPPL=96.433`
+  - `ATLAS-BSRP`: `testNLL=4.59081`, `testPPL=98.574`
+  - `ATLAS-SPARROW`: `testNLL=4.57604`, `testPPL=97.129`
+  - `ATLAS-ASTER`: `testNLL=4.56730`, `testPPL=96.284`
+  - ASTER usage:
+    - `activeModes=0.00`
+    - `edge=0.090`
+    - `sigma=0.107`
+    - `predR2=0.793`
+    - `mem=0.000`
+
+Interpretation:
+
+- On this first larger token-LM preset, `ASTER` is the strongest ATLAS-family variant on held-out NLL and slightly edges AdamW in this single run.
+- Unlike the smaller ASTER-T smoke case, the larger preset lands in a near-threshold regime: `predR2` remains strong, but `edge` sits just below the current activation threshold, so the ASTER correction mostly stays gated off.
+- That makes this preset useful as the next transformer-side tuning target: it is large enough to separate `ASTER` from `ATLAS-BSRP`, but still fast enough for iterative work.
+
+Recommended next steps:
+
+- Treat `token-lm-large` as the primary interactive transformer benchmark.
+- Keep `ATLAS-BSRP` and `SPARROW` as controls, but make `ASTER` the main transformer research branch.
+- Run repeated `token-lm-large` comparisons next, not more one-off single runs:
+  - `repeats=3`
+  - `variant all`
+  - fixed seed ladder
+- Center the next ASTER-T tuning pass on the near-threshold regime exposed here:
+  - `asterEdgeThreshold` slightly below `0.10`
+  - `asterMemoryScale` around the current default
+  - no architecture churn until the repeated result is stable.
+- Do not spend more time on the old default token-LM benchmark interactively; it is too expensive for the current harness budget and adds less information per iteration than `token-lm-large`.
+
 ---
 
 *Document version: 1.3*

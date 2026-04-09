@@ -98,6 +98,13 @@ struct AtlasRuntimeAccumulator
 	double asterPredR2Sum;
 	double asterMemoryGainSum;
 	double asterPoleSum;
+	double asterBoundaryMsSum;
+	double asterSetupMsSum;
+	double asterTransportMsSum;
+	double asterTransferFitMsSum;
+	double asterStateFitMsSum;
+	double asterInnovationFitMsSum;
+	double asterApplyMsSum;
 
 	AtlasRuntimeAccumulator()
 	    : atlasMatrices(0u),
@@ -128,7 +135,14 @@ struct AtlasRuntimeAccumulator
 	      asterSigmaSum(0.0),
 	      asterPredR2Sum(0.0),
 	      asterMemoryGainSum(0.0),
-	      asterPoleSum(0.0)
+	      asterPoleSum(0.0),
+	      asterBoundaryMsSum(0.0),
+	      asterSetupMsSum(0.0),
+	      asterTransportMsSum(0.0),
+	      asterTransferFitMsSum(0.0),
+	      asterStateFitMsSum(0.0),
+	      asterInnovationFitMsSum(0.0),
+	      asterApplyMsSum(0.0)
 	{
 	}
 };
@@ -1271,6 +1285,19 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 			acc.asterPoleSum += tensorDff.aster.pole.empty()
 			                    ? 0.0
 			                    : atlas_runtime_value(tensorDff.aster.pole[0], 0.0);
+			if (tensorDff.aster.timingBoundaryCount > 0ULL)
+			{
+				const double invCount =
+				    1.0 / static_cast<double>(tensorDff.aster.timingBoundaryCount);
+				const double nsToMs = 1.0e-6;
+				acc.asterBoundaryMsSum += tensorDff.aster.totalBoundaryNs * invCount * nsToMs;
+				acc.asterSetupMsSum += tensorDff.aster.totalSetupNs * invCount * nsToMs;
+				acc.asterTransportMsSum += tensorDff.aster.totalTransportNs * invCount * nsToMs;
+				acc.asterTransferFitMsSum += tensorDff.aster.totalTransferFitNs * invCount * nsToMs;
+				acc.asterStateFitMsSum += tensorDff.aster.totalStateFitNs * invCount * nsToMs;
+				acc.asterInnovationFitMsSum += tensorDff.aster.totalInnovationFitNs * invCount * nsToMs;
+				acc.asterApplyMsSum += tensorDff.aster.totalApplyNs * invCount * nsToMs;
+			}
 		}
 	}
 	if (tensorRnn.initialized)
@@ -1322,6 +1349,35 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 			accumulate_atlas_runtime(acc, b.atlasW2, sparrowEnabled);
 		}
 		accumulate_atlas_runtime(acc, tensorTransformer.atlasWOut, sparrowEnabled);
+		if (asterEnabled && tensorTransformer.aster.initialized)
+		{
+			acc.asterMatrices += 1u;
+			acc.asterActiveModesSum += static_cast<double>(tensorTransformer.aster.lastActiveModes);
+			if (tensorTransformer.aster.lastActiveModes >= 2u)
+				acc.asterMode2Matrices += 1u;
+			acc.asterEdgeSum += atlas_runtime_nonneg(tensorTransformer.aster.lastEdge);
+			acc.asterSecondEdgeSum += atlas_runtime_nonneg(tensorTransformer.aster.lastSecondEdge);
+			acc.asterSecondEdgeRatioSum += atlas_runtime_nonneg(tensorTransformer.aster.lastSecondEdgeRatio);
+			acc.asterSigmaSum += atlas_runtime_nonneg(tensorTransformer.aster.lastSigma);
+			acc.asterPredR2Sum += atlas_runtime_value(tensorTransformer.aster.lastPredR2, 0.0);
+			acc.asterMemoryGainSum += atlas_runtime_nonneg(tensorTransformer.aster.lastMemoryGain);
+			acc.asterPoleSum += tensorTransformer.aster.pole.empty()
+			                    ? 0.0
+			                    : atlas_runtime_value(tensorTransformer.aster.pole[0], 0.0);
+			if (tensorTransformer.aster.timingBoundaryCount > 0ULL)
+			{
+				const double nsToMs = 1.0 / 1000000.0;
+				const double invCount =
+				    1.0 / static_cast<double>(tensorTransformer.aster.timingBoundaryCount);
+				acc.asterBoundaryMsSum += tensorTransformer.aster.totalBoundaryNs * invCount * nsToMs;
+				acc.asterSetupMsSum += tensorTransformer.aster.totalSetupNs * invCount * nsToMs;
+				acc.asterTransportMsSum += tensorTransformer.aster.totalTransportNs * invCount * nsToMs;
+				acc.asterTransferFitMsSum += tensorTransformer.aster.totalTransferFitNs * invCount * nsToMs;
+				acc.asterStateFitMsSum += tensorTransformer.aster.totalStateFitNs * invCount * nsToMs;
+				acc.asterInnovationFitMsSum += tensorTransformer.aster.totalInnovationFitNs * invCount * nsToMs;
+				acc.asterApplyMsSum += tensorTransformer.aster.totalApplyNs * invCount * nsToMs;
+			}
+		}
 	}
 
 	out = AtlasRuntimeDiagnostics();
@@ -1368,6 +1424,13 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 		out.asterMeanPredR2 = acc.asterPredR2Sum / denom;
 		out.asterMeanMemoryGain = acc.asterMemoryGainSum / denom;
 		out.asterMeanPole = acc.asterPoleSum / denom;
+		out.asterMeanBoundaryMs = acc.asterBoundaryMsSum / denom;
+		out.asterMeanSetupMs = acc.asterSetupMsSum / denom;
+		out.asterMeanTransportMs = acc.asterTransportMsSum / denom;
+		out.asterMeanTransferFitMs = acc.asterTransferFitMsSum / denom;
+		out.asterMeanStateFitMs = acc.asterStateFitMsSum / denom;
+		out.asterMeanInnovationFitMs = acc.asterInnovationFitMsSum / denom;
+		out.asterMeanApplyMs = acc.asterApplyMsSum / denom;
 	}
 	return true;
 }
@@ -1756,6 +1819,7 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			const unsigned int asterFeatureDim = outputDim + (2u * asterControlDim);
 			const unsigned int asterStateRank =
 			    std::max(1u, std::min(trainingConfig.atlas.asterStateRank, std::max(1u, outputDim)));
+			const unsigned int asterStateFeatureDim = asterStateRank + (2u * asterControlDim);
 			tensorDff.aster.initialized = (asterRawHiddenDim > 0u) && (asterControlDim > 0u) && (outputDim > 0u);
 			tensorDff.aster.rawHiddenDim = asterRawHiddenDim;
 			tensorDff.aster.controlDim = asterControlDim;
@@ -1769,6 +1833,10 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			tensorDff.aster.pastCov.assign(static_cast<size_t>(asterFeatureDim) * static_cast<size_t>(asterFeatureDim), 0.0f);
 			tensorDff.aster.crossCov.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(asterFeatureDim), 0.0f);
 			tensorDff.aster.theta.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(asterFeatureDim), 0.0f);
+			tensorDff.aster.statePastCov.assign(static_cast<size_t>(asterStateFeatureDim) * static_cast<size_t>(asterStateFeatureDim), 0.0f);
+			tensorDff.aster.stateCrossCov.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(asterStateFeatureDim), 0.0f);
+			tensorDff.aster.innovationCov.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(outputDim), 0.0f);
+			tensorDff.aster.innovationCross.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(outputDim), 0.0f);
 			tensorDff.aster.sigma.assign(asterStateRank, 0.0f);
 			tensorDff.aster.leftMode.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(outputDim), 0.0f);
 			tensorDff.aster.rightMode.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(asterFeatureDim), 0.0f);
@@ -2160,6 +2228,68 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 				glades::ddp::broadcastFromRoot(&b.b1[0], b.b1.size());
 				glades::ddp::broadcastFromRoot(&b.b2[0], b.b2.size());
 			}
+		}
+
+		if ((trainingConfig.optimizer.type == OptimizerConfig::ATLAS)
+		    && trainingConfig.atlas.asterEnabled
+		    && tokenModel
+		    && modelCfg.nLayers > 0u
+		    && dModel > 0u)
+		{
+			TensorTransformerState::AsterState& aster = tensorTransformer.aster;
+			const unsigned int requestedDepth = std::max(1u, trainingConfig.atlas.asterHiddenStackDepth);
+			const unsigned int stackDepth = std::min(requestedDepth, modelCfg.nLayers);
+			const unsigned int sketchDim = std::max(4u, std::min(16u, vocabSize));
+			const unsigned int stateRank =
+			    std::max(1u, std::min(trainingConfig.atlas.asterStateRank, sketchDim));
+			const unsigned int controlDim = stackDepth * sketchDim;
+			const unsigned int featureDim = sketchDim + (2u * controlDim);
+			const unsigned int stateFeatureDim = stateRank + (2u * controlDim);
+
+			aster.reset();
+			aster.initialized = (stackDepth > 0u) && (controlDim > 0u) && (sketchDim > 0u);
+			aster.sketchDim = sketchDim;
+			aster.controlDim = controlDim;
+			aster.hiddenStackDepth = stackDepth;
+			aster.stateRank = stateRank;
+			aster.trackedBlockIndices.reserve(stackDepth);
+			for (unsigned int d = 0u; d < stackDepth; ++d)
+				aster.trackedBlockIndices.push_back(modelCfg.nLayers - stackDepth + d);
+			aster.prevControlMean.assign(controlDim, 0.0f);
+			aster.prevResidualMean.assign(sketchDim, 0.0f);
+			aster.controlVar.assign(controlDim, 1.0f);
+			aster.residualVar.assign(sketchDim, 1.0f);
+			aster.transportPastCov.assign(static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
+			aster.transportCrossCov.assign(static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
+			aster.pastCov.assign(static_cast<size_t>(featureDim) * featureDim, 0.0f);
+			aster.crossCov.assign(static_cast<size_t>(sketchDim) * featureDim, 0.0f);
+			aster.theta.assign(static_cast<size_t>(sketchDim) * featureDim, 0.0f);
+			aster.statePastCov.assign(static_cast<size_t>(stateFeatureDim) * stateFeatureDim, 0.0f);
+			aster.stateCrossCov.assign(static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
+			aster.innovationCov.assign(static_cast<size_t>(sketchDim) * sketchDim, 0.0f);
+			aster.innovationCross.assign(static_cast<size_t>(stateRank) * sketchDim, 0.0f);
+			aster.sigma.assign(stateRank, 0.0f);
+			aster.leftMode.assign(static_cast<size_t>(stateRank) * sketchDim, 0.0f);
+			aster.rightMode.assign(static_cast<size_t>(stateRank) * featureDim, 0.0f);
+			for (unsigned int m = 0u; m < stateRank; ++m)
+			{
+				if (m < sketchDim)
+					aster.leftMode[static_cast<size_t>(m) * sketchDim + m] = 1.0f;
+				if (m < featureDim)
+					aster.rightMode[static_cast<size_t>(m) * featureDim + m] = 1.0f;
+			}
+			aster.batchFinalHiddenRawSum.assign(dModel, 0.0f);
+			aster.batchFinalHiddenSketchSum.assign(sketchDim, 0.0f);
+			aster.batchLayerHiddenSketchSum.assign(static_cast<size_t>(stackDepth) * sketchDim, 0.0f);
+			aster.batchResidualSum.assign(sketchDim, 0.0f);
+			aster.latent.assign(stateRank, 0.0f);
+			aster.poleNumer.assign(stateRank, 0.0f);
+			aster.poleDenom.assign(stateRank, 0.0f);
+			aster.pole.assign(stateRank, 0.0f);
+		}
+		else
+		{
+			tensorTransformer.aster.reset();
 		}
 
 		return true;

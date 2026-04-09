@@ -128,6 +128,133 @@
 		atlas::WeightState atlasWOut;
 		atlas::WeightState atlasTokE;
 
+		struct AsterState
+		{
+			bool initialized;
+			unsigned int sketchDim;
+			unsigned int controlDim;
+			unsigned int hiddenStackDepth;
+			unsigned int stateRank;
+			std::vector<unsigned int> trackedBlockIndices;
+			std::vector<float> prevControlMean;
+			std::vector<float> prevResidualMean;
+			std::vector<float> controlVar;
+			std::vector<float> residualVar;
+			std::vector<float> transportPastCov;
+			std::vector<float> transportCrossCov;
+			std::vector<float> pastCov;
+			std::vector<float> crossCov;
+			std::vector<float> theta;
+			std::vector<float> statePastCov;
+			std::vector<float> stateCrossCov;
+			std::vector<float> innovationCov;
+			std::vector<float> innovationCross;
+			std::vector<float> sigma;
+			std::vector<float> leftMode;
+			std::vector<float> rightMode;
+			std::vector<float> batchFinalHiddenRawSum;
+			std::vector<float> batchFinalHiddenSketchSum;
+			std::vector<float> batchLayerHiddenSketchSum;
+			std::vector<float> batchResidualSum;
+			std::vector<unsigned int> batchTouchedIds;
+			unsigned int batchTokenCount;
+			std::vector<float> latent;
+			std::vector<float> poleNumer;
+			std::vector<float> poleDenom;
+			std::vector<float> pole;
+			unsigned int lastActiveModes;
+			float lastEdge;
+			float lastSecondEdge;
+			float lastSecondEdgeRatio;
+			float lastSigma;
+			float lastPredR2;
+			float lastMemoryGain;
+			unsigned long long timingBoundaryCount;
+			double totalBoundaryNs;
+			double totalSetupNs;
+			double totalTransportNs;
+			double totalTransferFitNs;
+			double totalStateFitNs;
+			double totalInnovationFitNs;
+			double totalApplyNs;
+
+			AsterState()
+			    : initialized(false),
+			      sketchDim(0u),
+			      controlDim(0u),
+			      hiddenStackDepth(0u),
+			      stateRank(0u),
+			      batchTokenCount(0u),
+			      lastActiveModes(0u),
+			      lastEdge(0.0f),
+			      lastSecondEdge(0.0f),
+			      lastSecondEdgeRatio(0.0f),
+			      lastSigma(0.0f),
+			      lastPredR2(0.0f),
+			      lastMemoryGain(0.0f),
+			      timingBoundaryCount(0ULL),
+			      totalBoundaryNs(0.0),
+			      totalSetupNs(0.0),
+			      totalTransportNs(0.0),
+			      totalTransferFitNs(0.0),
+			      totalStateFitNs(0.0),
+			      totalInnovationFitNs(0.0),
+			      totalApplyNs(0.0)
+			{
+			}
+
+			void reset()
+			{
+				initialized = false;
+				sketchDim = 0u;
+				controlDim = 0u;
+				hiddenStackDepth = 0u;
+				stateRank = 0u;
+				trackedBlockIndices.clear();
+				prevControlMean.clear();
+				prevResidualMean.clear();
+				controlVar.clear();
+				residualVar.clear();
+				transportPastCov.clear();
+				transportCrossCov.clear();
+				pastCov.clear();
+				crossCov.clear();
+				theta.clear();
+				statePastCov.clear();
+				stateCrossCov.clear();
+				innovationCov.clear();
+				innovationCross.clear();
+				sigma.clear();
+				leftMode.clear();
+				rightMode.clear();
+				batchFinalHiddenRawSum.clear();
+				batchFinalHiddenSketchSum.clear();
+				batchLayerHiddenSketchSum.clear();
+				batchResidualSum.clear();
+				batchTouchedIds.clear();
+				batchTokenCount = 0u;
+				latent.clear();
+				poleNumer.clear();
+				poleDenom.clear();
+				pole.clear();
+				lastActiveModes = 0u;
+				lastEdge = 0.0f;
+				lastSecondEdge = 0.0f;
+				lastSecondEdgeRatio = 0.0f;
+				lastSigma = 0.0f;
+				lastPredR2 = 0.0f;
+				lastMemoryGain = 0.0f;
+				timingBoundaryCount = 0ULL;
+				totalBoundaryNs = 0.0;
+				totalSetupNs = 0.0;
+				totalTransportNs = 0.0;
+				totalTransferFitNs = 0.0;
+				totalStateFitNs = 0.0;
+				totalInnovationFitNs = 0.0;
+				totalApplyNs = 0.0;
+			}
+		};
+
 		// Final LayerNorm (applied after the last block, before the output head).
 		std::vector<float> lnFinalGamma; // [dModel]
 		std::vector<float> lnFinalBeta;  // [dModel]
@@ -152,6 +279,7 @@
 		// Dynamic loss scaling state.
 		float mpLossScale;
 		int mpLossScaleGoodSteps;
+		AsterState aster;
 
 		TensorTransformerState()
 		    : initialized(false),
@@ -214,5 +342,6 @@
 			WOut.clear(); WOutLowp.clear(); vWOut.clear(); v2WOut.clear(); gWOut.clear();
 			bOut.clear(); mBOut.clear(); v2BOut.clear(); gBOut.clear();
 			blocks.clear();
+			aster.reset();
 		}
 	};

@@ -283,6 +283,13 @@ public:
 		double asterMeanPredR2;
 		double asterMeanMemoryGain;
 		double asterMeanPole;
+		double asterMeanBoundaryMs;
+		double asterMeanSetupMs;
+		double asterMeanTransportMs;
+		double asterMeanTransferFitMs;
+		double asterMeanStateFitMs;
+		double asterMeanInnovationFitMs;
+		double asterMeanApplyMs;
 
 		AtlasRuntimeDiagnostics()
 		    : atlasMatrices(0u),
@@ -316,7 +323,14 @@ public:
 		      asterMeanSigma(0.0),
 		      asterMeanPredR2(0.0),
 		      asterMeanMemoryGain(0.0),
-		      asterMeanPole(0.0)
+		      asterMeanPole(0.0),
+		      asterMeanBoundaryMs(0.0),
+		      asterMeanSetupMs(0.0),
+		      asterMeanTransportMs(0.0),
+		      asterMeanTransferFitMs(0.0),
+		      asterMeanStateFitMs(0.0),
+		      asterMeanInnovationFitMs(0.0),
+		      asterMeanApplyMs(0.0)
 		{
 		}
 	};
@@ -436,6 +450,10 @@ private:
 			std::vector<float> pastCov;
 			std::vector<float> crossCov;
 			std::vector<float> theta;
+			std::vector<float> statePastCov;
+			std::vector<float> stateCrossCov;
+			std::vector<float> innovationCov;
+			std::vector<float> innovationCross;
 			std::vector<float> sigma;
 			std::vector<float> leftMode;
 			std::vector<float> rightMode;
@@ -454,6 +472,14 @@ private:
 			float lastSigma;
 			float lastPredR2;
 			float lastMemoryGain;
+			unsigned long long timingBoundaryCount;
+			double totalBoundaryNs;
+			double totalSetupNs;
+			double totalTransportNs;
+			double totalTransferFitNs;
+			double totalStateFitNs;
+			double totalInnovationFitNs;
+			double totalApplyNs;
 
 			AsterState()
 			    : initialized(false),
@@ -468,7 +494,15 @@ private:
 			      lastSecondEdgeRatio(0.0f),
 			      lastSigma(0.0f),
 			      lastPredR2(0.0f),
-			      lastMemoryGain(0.0f)
+			      lastMemoryGain(0.0f),
+			      timingBoundaryCount(0ULL),
+			      totalBoundaryNs(0.0),
+			      totalSetupNs(0.0),
+			      totalTransportNs(0.0),
+			      totalTransferFitNs(0.0),
+			      totalStateFitNs(0.0),
+			      totalInnovationFitNs(0.0),
+			      totalApplyNs(0.0)
 			{
 			}
 
@@ -490,6 +524,10 @@ private:
 				pastCov.clear();
 				crossCov.clear();
 				theta.clear();
+				statePastCov.clear();
+				stateCrossCov.clear();
+				innovationCov.clear();
+				innovationCross.clear();
 				sigma.clear();
 				leftMode.clear();
 				rightMode.clear();
@@ -508,6 +546,14 @@ private:
 				lastSigma = 0.0f;
 				lastPredR2 = 0.0f;
 				lastMemoryGain = 0.0f;
+				timingBoundaryCount = 0ULL;
+				totalBoundaryNs = 0.0;
+				totalSetupNs = 0.0;
+				totalTransportNs = 0.0;
+				totalTransferFitNs = 0.0;
+				totalStateFitNs = 0.0;
+				totalInnovationFitNs = 0.0;
+				totalApplyNs = 0.0;
 			}
 		};
 

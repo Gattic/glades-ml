@@ -123,6 +123,13 @@ struct CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 	double atlasAsterPredR2Sum;
 	double atlasAsterMemoryGainSum;
 	double atlasAsterPoleSum;
+	double atlasAsterBoundaryMsSum;
+	double atlasAsterSetupMsSum;
+	double atlasAsterTransportMsSum;
+	double atlasAsterTransferFitMsSum;
+	double atlasAsterStateFitMsSum;
+	double atlasAsterInnovationFitMsSum;
+	double atlasAsterApplyMsSum;
 	unsigned int atlasHelmMode2Epochs;
 	unsigned int atlasSparrowEpochs;
 	unsigned int atlasHelmEpochs;
@@ -155,6 +162,13 @@ struct CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 	      atlasAsterPredR2Sum(0.0),
 	      atlasAsterMemoryGainSum(0.0),
 	      atlasAsterPoleSum(0.0),
+	      atlasAsterBoundaryMsSum(0.0),
+	      atlasAsterSetupMsSum(0.0),
+	      atlasAsterTransportMsSum(0.0),
+	      atlasAsterTransferFitMsSum(0.0),
+	      atlasAsterStateFitMsSum(0.0),
+	      atlasAsterInnovationFitMsSum(0.0),
+	      atlasAsterApplyMsSum(0.0),
 	      atlasHelmMode2Epochs(0u),
 	      atlasSparrowEpochs(0u),
 	      atlasHelmEpochs(0u),
@@ -207,6 +221,13 @@ struct CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 				atlasAsterPredR2Sum += diag.asterMeanPredR2;
 				atlasAsterMemoryGainSum += diag.asterMeanMemoryGain;
 				atlasAsterPoleSum += diag.asterMeanPole;
+				atlasAsterBoundaryMsSum += diag.asterMeanBoundaryMs;
+				atlasAsterSetupMsSum += diag.asterMeanSetupMs;
+				atlasAsterTransportMsSum += diag.asterMeanTransportMs;
+				atlasAsterTransferFitMsSum += diag.asterMeanTransferFitMs;
+				atlasAsterStateFitMsSum += diag.asterMeanStateFitMs;
+				atlasAsterInnovationFitMsSum += diag.asterMeanInnovationFitMs;
+				atlasAsterApplyMsSum += diag.asterMeanApplyMs;
 				if (diag.asterMode2Fraction > 0.0)
 					atlasAsterMode2Epochs += 1u;
 				atlasAsterEpochs += 1u;
@@ -354,7 +375,8 @@ enum BenchMode
 	MODE_LATENT_FORECAST = 3,
 	MODE_TEACHER_SWEEP = 4,
 	MODE_TEACHER_CANONICAL = 5,
-	MODE_NONLINEAR_FORECAST = 6
+	MODE_NONLINEAR_FORECAST = 6,
+	MODE_TOKEN_LM_LARGE = 7
 };
 
 enum VariantKind
@@ -364,6 +386,16 @@ enum VariantKind
 	VARIANT_ATLAS_SPARROW = 2,
 	VARIANT_ATLAS_HELM = 3,
 	VARIANT_ATLAS_ASTER = 4
+};
+
+enum VariantSelection
+{
+	VARIANT_SELECTION_ALL = 0,
+	VARIANT_SELECTION_ADAMW = 1,
+	VARIANT_SELECTION_ATLAS_BASE = 2,
+	VARIANT_SELECTION_ATLAS_SPARROW = 3,
+	VARIANT_SELECTION_ATLAS_HELM = 4,
+	VARIANT_SELECTION_ATLAS_ASTER = 5
 };
 
 struct TokenConfig
@@ -473,6 +505,7 @@ enum SweepProfile
 struct BenchConfig
 {
 	BenchMode mode;
+	VariantSelection variantSelection;
 	unsigned int repeats;
 	unsigned int seed;
 	unsigned int atlasRank;
@@ -504,6 +537,7 @@ struct BenchConfig
 
 	BenchConfig()
 	    : mode(MODE_ALL),
+	      variantSelection(VARIANT_SELECTION_ALL),
 	      repeats(3u),
 	      seed(1337u),
 	      atlasRank(16u),
@@ -618,6 +652,13 @@ struct RunResult
 	double asterPredR2;
 	double asterMemoryGain;
 	double asterPole;
+	double asterBoundaryMs;
+	double asterSetupMs;
+	double asterTransportMs;
+	double asterTransferFitMs;
+	double asterStateFitMs;
+	double asterInnovationFitMs;
+	double asterApplyMs;
 	bool ok;
 	std::string err;
 
@@ -655,6 +696,13 @@ struct RunResult
 	      asterPredR2(0.0),
 	      asterMemoryGain(0.0),
 	      asterPole(0.0),
+	      asterBoundaryMs(0.0),
+	      asterSetupMs(0.0),
+	      asterTransportMs(0.0),
+	      asterTransferFitMs(0.0),
+	      asterStateFitMs(0.0),
+	      asterInnovationFitMs(0.0),
+	      asterApplyMs(0.0),
 	      ok(true),
 	      err()
 	{
@@ -702,6 +750,13 @@ struct Summary
 	AggregateStats asterPredR2;
 	AggregateStats asterMemoryGain;
 	AggregateStats asterPole;
+	AggregateStats asterBoundaryMs;
+	AggregateStats asterSetupMs;
+	AggregateStats asterTransportMs;
+	AggregateStats asterTransferFitMs;
+	AggregateStats asterStateFitMs;
+	AggregateStats asterInnovationFitMs;
+	AggregateStats asterApplyMs;
 	bool ok;
 	std::string status;
 
@@ -738,6 +793,13 @@ struct Summary
 	      asterPredR2(),
 	      asterMemoryGain(),
 	      asterPole(),
+	      asterBoundaryMs(),
+	      asterSetupMs(),
+	      asterTransportMs(),
+	      asterTransferFitMs(),
+	      asterStateFitMs(),
+	      asterInnovationFitMs(),
+	      asterApplyMs(),
 	      ok(false),
 	      status()
 	{
@@ -779,6 +841,27 @@ static const char* variant_label(VariantKind variant)
 	}
 }
 
+static bool variant_matches_selection(VariantSelection selection, VariantKind variant)
+{
+	switch (selection)
+	{
+	case VARIANT_SELECTION_ALL:
+		return true;
+	case VARIANT_SELECTION_ADAMW:
+		return variant == VARIANT_ADAMW;
+	case VARIANT_SELECTION_ATLAS_BASE:
+		return variant == VARIANT_ATLAS_BASE;
+	case VARIANT_SELECTION_ATLAS_SPARROW:
+		return variant == VARIANT_ATLAS_SPARROW;
+	case VARIANT_SELECTION_ATLAS_HELM:
+		return variant == VARIANT_ATLAS_HELM;
+	case VARIANT_SELECTION_ATLAS_ASTER:
+		return variant == VARIANT_ATLAS_ASTER;
+	default:
+		return false;
+	}
+}
+
 static AggregateStats compute_stats(const std::vector<double>& values)
 {
 	AggregateStats stats;
@@ -807,8 +890,10 @@ static void print_usage()
 {
 	printf("Usage: glades-unit-tests atlas-alt-bench [options]\n");
 	printf("Options:\n");
-	printf("  --mode all|token-lm|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
+	printf("  --mode all|token-lm|token-lm-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
 	printf("                                         Run the alternate-task benches or the teacher-student sweep (default: all)\n");
+	printf("  --variant all|adamw|base|sparrow|helm|aster\n");
+	printf("                                         Restrict runs to one optimizer variant when the case supports it (default: all)\n");
 	printf("  --repeats N                           Repeats per optimizer variant (default: 3)\n");
 	printf("  --seed N                              Base RNG seed (default: 1337)\n");
 	printf("  --rank N                              ATLAS active rank (default: 16)\n");
@@ -835,6 +920,11 @@ static void print_usage()
 	printf("  --token-epochs N                      Token-LM epochs (default: 6)\n");
 	printf("  --token-train-seqs N                  Token-LM train sequence count (default: 128)\n");
 	printf("  --token-test-seqs N                   Token-LM test sequence count (default: 32)\n");
+	printf("  --token-seq-len N                     Token-LM sequence length (default: 32)\n");
+	printf("  --token-dmodel N                      Token-LM decoder width (default: 48)\n");
+	printf("  --token-dff N                         Token-LM FFN width (default: 192)\n");
+	printf("  --token-layers N                      Token-LM decoder layers (default: 2)\n");
+	printf("  --token-heads N                       Token-LM attention heads (default: 4)\n");
 	printf("  --teacher-epochs N                    Teacher-student epochs (default: 20)\n");
 	printf("  --teacher-train-size N                Teacher-student train size (default: 4096)\n");
 	printf("  --teacher-test-size N                 Teacher-student test size (default: 1024)\n");
@@ -849,6 +939,22 @@ static void print_usage()
 	printf("  --help                                Show this message\n");
 }
 
+static void apply_large_token_preset(BenchConfig& cfg)
+{
+	cfg.token.vocab = 97u;
+	cfg.token.dModel = 24u;
+	cfg.token.dFF = 96u;
+	cfg.token.layers = 2u;
+	cfg.token.heads = 4u;
+	cfg.token.kvHeads = 4u;
+	cfg.token.seqLen = 24u;
+	cfg.token.trainSeqs = 8u;
+	cfg.token.testSeqs = 4u;
+	cfg.token.epochs = 1u;
+	cfg.token.adamLR = 0.0010f;
+	cfg.token.atlasLR = 0.020f;
+}
+
 static bool parse_mode_arg(const char* text, BenchMode& outMode)
 {
 	if (!text || !*text)
@@ -861,6 +967,11 @@ static bool parse_mode_arg(const char* text, BenchMode& outMode)
 	if (streq(text, "token-lm") || streq(text, "token") || streq(text, "lm"))
 	{
 		outMode = MODE_TOKEN_LM;
+		return true;
+	}
+	if (streq(text, "token-lm-large") || streq(text, "llm-large") || streq(text, "token-large"))
+	{
+		outMode = MODE_TOKEN_LM_LARGE;
 		return true;
 	}
 	if (streq(text, "teacher-student") || streq(text, "teacher") || streq(text, "ts"))
@@ -908,6 +1019,43 @@ static bool parse_sweep_profile_arg(const char* text, SweepProfile& outProfile)
 	return false;
 }
 
+static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
+{
+	if (!text || !*text)
+		return false;
+	if (streq(text, "all"))
+	{
+		outSelection = VARIANT_SELECTION_ALL;
+		return true;
+	}
+	if (streq(text, "adamw") || streq(text, "adam"))
+	{
+		outSelection = VARIANT_SELECTION_ADAMW;
+		return true;
+	}
+	if (streq(text, "base") || streq(text, "atlas-base") || streq(text, "bsrp"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_BASE;
+		return true;
+	}
+	if (streq(text, "sparrow") || streq(text, "atlas-sparrow"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_SPARROW;
+		return true;
+	}
+	if (streq(text, "helm") || streq(text, "atlas-helm"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_HELM;
+		return true;
+	}
+	if (streq(text, "aster") || streq(text, "atlas-aster"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_ASTER;
+		return true;
+	}
+	return false;
+}
+
 static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& err)
 {
 	err.clear();
@@ -920,6 +1068,16 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			if (!parse_mode_arg(argv[++i], cfg.mode))
 			{
 				err = "invalid --mode value";
+				return false;
+			}
+			if (cfg.mode == MODE_TOKEN_LM_LARGE)
+				apply_large_token_preset(cfg);
+		}
+		else if (streq(argv[i], "--variant") && i + 1 < argc)
+		{
+			if (!parse_variant_arg(argv[++i], cfg.variantSelection))
+			{
+				err = "invalid --variant value";
 				return false;
 			}
 		}
@@ -1130,6 +1288,47 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 				err = "invalid --token-test-seqs";
 				return false;
 			}
+		}
+		else if (streq(argv[i], "--token-seq-len") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.token.seqLen) || cfg.token.seqLen < 2u)
+			{
+				err = "invalid --token-seq-len";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--token-dmodel") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.token.dModel) || cfg.token.dModel == 0u)
+			{
+				err = "invalid --token-dmodel";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--token-dff") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.token.dFF) || cfg.token.dFF == 0u)
+			{
+				err = "invalid --token-dff";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--token-layers") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.token.layers) || cfg.token.layers == 0u)
+			{
+				err = "invalid --token-layers";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--token-heads") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.token.heads) || cfg.token.heads == 0u)
+			{
+				err = "invalid --token-heads";
+				return false;
+			}
+			cfg.token.kvHeads = cfg.token.heads;
 		}
 		else if (streq(argv[i], "--teacher-epochs") && i + 1 < argc)
 		{
@@ -1814,11 +2013,13 @@ static bool make_token_network(const BenchConfig& cfg,
 	return true;
 }
 
-static glades::NNetwork make_regression_network(const BenchConfig& cfg,
-                                                const RegressionNetworkSpec& spec,
-                                                unsigned int epochs,
-                                                VariantKind variant,
-                                                unsigned int seed)
+static bool make_regression_network(const BenchConfig& cfg,
+                                    const RegressionNetworkSpec& spec,
+                                    unsigned int epochs,
+                                    VariantKind variant,
+                                    unsigned int seed,
+                                    NetworkOwner& out,
+                                    std::string& err)
 {
 	const float lr = (variant == VARIANT_ADAMW) ? spec.adamLR : spec.atlasLR;
 	glades::InputLayerInfo* in = new glades::InputLayerInfo(
@@ -1845,26 +2046,31 @@ static glades::NNetwork make_regression_network(const BenchConfig& cfg,
 		    1.0f));
 	}
 
-	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(spec.outputDim),
-	                                                           glades::OutputLayerInfo::REGRESSION);
-	glades::NNInfo* info = new glades::NNInfo(spec.name, in, hidden, out);
-	glades::NNetwork net(info, glades::NNetwork::TYPE_DFF);
-	net.setSeed(seed);
-	net.setLogger(quiet_logger());
-	net.getTerminatorMutable().setEpoch(static_cast<int>(epochs));
-	net.getTerminatorMutable().setAccuracy(0.0f);
+	glades::OutputLayerInfo* outLayer = new glades::OutputLayerInfo(static_cast<int>(spec.outputDim),
+	                                                                glades::OutputLayerInfo::REGRESSION);
+	out.info = new glades::NNInfo(spec.name, in, hidden, outLayer);
+	out.net = new glades::NNetwork(out.info, glades::NNetwork::TYPE_DFF);
+	out.net->setSeed(seed);
+	out.net->setLogger(quiet_logger());
+	out.net->getTerminatorMutable().setEpoch(static_cast<int>(epochs));
+	out.net->getTerminatorMutable().setAccuracy(0.0f);
 
-	glades::TrainingConfig tc = net.getTrainingConfig();
+	glades::TrainingConfig tc = out.net->getTrainingConfig();
 	configure_optimizer(tc, cfg, variant, spec.adamLR, spec.atlasLR, spec.clipNorm);
-	net.setTrainingConfig(tc);
-
-	delete info;
-	return net;
+	const glades::NNetworkStatus stCfg = out.net->setTrainingConfig(tc);
+	if (!stCfg.ok())
+	{
+		err = stCfg.message;
+		return false;
+	}
+	return true;
 }
 
-static glades::NNetwork make_teacher_network(const BenchConfig& cfg,
-                                             VariantKind variant,
-                                             unsigned int seed)
+static bool make_teacher_network(const BenchConfig& cfg,
+                                 VariantKind variant,
+                                 unsigned int seed,
+                                 NetworkOwner& out,
+                                 std::string& err)
 {
 	RegressionNetworkSpec spec;
 	spec.name = "atlas_alt_teacher_student";
@@ -1875,12 +2081,14 @@ static glades::NNetwork make_teacher_network(const BenchConfig& cfg,
 	spec.adamLR = cfg.teacher.adamLR;
 	spec.atlasLR = cfg.teacher.atlasLR;
 	spec.clipNorm = 5.0f;
-	return make_regression_network(cfg, spec, cfg.teacher.epochs, variant, seed);
+	return make_regression_network(cfg, spec, cfg.teacher.epochs, variant, seed, out, err);
 }
 
-static glades::NNetwork make_latent_network(const BenchConfig& cfg,
-                                            VariantKind variant,
-                                            unsigned int seed)
+static bool make_latent_network(const BenchConfig& cfg,
+                                VariantKind variant,
+                                unsigned int seed,
+                                NetworkOwner& out,
+                                std::string& err)
 {
 	RegressionNetworkSpec spec;
 	spec.name = "atlas_alt_latent_forecast";
@@ -1891,12 +2099,14 @@ static glades::NNetwork make_latent_network(const BenchConfig& cfg,
 	spec.adamLR = cfg.latent.adamLR;
 	spec.atlasLR = cfg.latent.atlasLR;
 	spec.clipNorm = 5.0f;
-	return make_regression_network(cfg, spec, cfg.latent.epochs, variant, seed);
+	return make_regression_network(cfg, spec, cfg.latent.epochs, variant, seed, out, err);
 }
 
-static glades::NNetwork make_nonlinear_latent_network(const BenchConfig& cfg,
-                                                      VariantKind variant,
-                                                      unsigned int seed)
+static bool make_nonlinear_latent_network(const BenchConfig& cfg,
+                                          VariantKind variant,
+                                          unsigned int seed,
+                                          NetworkOwner& out,
+                                          std::string& err)
 {
 	RegressionNetworkSpec spec;
 	spec.name = "atlas_alt_nonlinear_forecast";
@@ -1907,7 +2117,7 @@ static glades::NNetwork make_nonlinear_latent_network(const BenchConfig& cfg,
 	spec.adamLR = cfg.latent.adamLR;
 	spec.atlasLR = cfg.latent.atlasLR;
 	spec.clipNorm = 5.0f;
-	return make_regression_network(cfg, spec, cfg.latent.epochs, variant, seed);
+	return make_regression_network(cfg, spec, cfg.latent.epochs, variant, seed, out, err);
 }
 
 static RunResult run_token_variant(const BenchConfig& cfg,
@@ -1989,9 +2199,14 @@ static RunResult run_teacher_variant(const BenchConfig& cfg,
 {
 	RunResult out;
 	out.label = variant_label(variant);
-	glades::NNetwork net = make_teacher_network(cfg, variant, seed);
+	NetworkOwner owner;
+	if (!make_teacher_network(cfg, variant, seed, owner, out.err))
+	{
+		out.ok = false;
+		return out;
+	}
 
-	const glades::NNetworkStatus warm = net.test(&data);
+	const glades::NNetworkStatus warm = owner.net->test(&data);
 	if (!warm.ok())
 	{
 		out.ok = false;
@@ -2001,7 +2216,7 @@ static RunResult run_teacher_variant(const BenchConfig& cfg,
 
 	CaptureMetricsCallbacks trainCb;
 	const int64_t t0 = now_ms();
-	const glades::NNetworkStatus trainStatus = net.train(&data, &trainCb);
+	const glades::NNetworkStatus trainStatus = owner.net->train(&data, &trainCb);
 	const int64_t t1 = now_ms();
 	out.trainMs = static_cast<long long>(t1 - t0);
 	if (!trainStatus.ok())
@@ -2022,7 +2237,7 @@ static RunResult run_teacher_variant(const BenchConfig& cfg,
 
 	CaptureMetricsCallbacks testCb;
 	const int64_t t2 = now_ms();
-	const glades::NNetworkStatus testStatus = net.test(&data, &testCb);
+	const glades::NNetworkStatus testStatus = owner.net->test(&data, &testCb);
 	const int64_t t3 = now_ms();
 	out.evalMs = static_cast<long long>(t3 - t2);
 	if (!testStatus.ok())
@@ -2056,9 +2271,14 @@ static RunResult run_latent_variant(const BenchConfig& cfg,
 {
 	RunResult out;
 	out.label = variant_label(variant);
-	glades::NNetwork net = make_latent_network(cfg, variant, seed);
+	NetworkOwner owner;
+	if (!make_latent_network(cfg, variant, seed, owner, out.err))
+	{
+		out.ok = false;
+		return out;
+	}
 
-	const glades::NNetworkStatus warm = net.test(&data);
+	const glades::NNetworkStatus warm = owner.net->test(&data);
 	if (!warm.ok())
 	{
 		out.ok = false;
@@ -2068,7 +2288,7 @@ static RunResult run_latent_variant(const BenchConfig& cfg,
 
 	CaptureMetricsCallbacks trainCb;
 	const int64_t t0 = now_ms();
-	const glades::NNetworkStatus trainStatus = net.train(&data, &trainCb);
+	const glades::NNetworkStatus trainStatus = owner.net->train(&data, &trainCb);
 	const int64_t t1 = now_ms();
 	out.trainMs = static_cast<long long>(t1 - t0);
 	if (!trainStatus.ok())
@@ -2089,7 +2309,7 @@ static RunResult run_latent_variant(const BenchConfig& cfg,
 
 	CaptureMetricsCallbacks testCb;
 	const int64_t t2 = now_ms();
-	const glades::NNetworkStatus testStatus = net.test(&data, &testCb);
+	const glades::NNetworkStatus testStatus = owner.net->test(&data, &testCb);
 	const int64_t t3 = now_ms();
 	out.evalMs = static_cast<long long>(t3 - t2);
 	if (!testStatus.ok())
@@ -2125,9 +2345,14 @@ static RunResult run_nonlinear_latent_variant(const BenchConfig& cfg,
 {
 	RunResult out;
 	out.label = variant_label(variant);
-	glades::NNetwork net = make_nonlinear_latent_network(cfg, variant, seed);
+	NetworkOwner owner;
+	if (!make_nonlinear_latent_network(cfg, variant, seed, owner, out.err))
+	{
+		out.ok = false;
+		return out;
+	}
 
-	const glades::NNetworkStatus warm = net.test(&data);
+	const glades::NNetworkStatus warm = owner.net->test(&data);
 	if (!warm.ok())
 	{
 		out.ok = false;
@@ -2137,7 +2362,7 @@ static RunResult run_nonlinear_latent_variant(const BenchConfig& cfg,
 
 	CaptureMetricsCallbacks trainCb;
 	const int64_t t0 = now_ms();
-	const glades::NNetworkStatus trainStatus = net.train(&data, &trainCb);
+	const glades::NNetworkStatus trainStatus = owner.net->train(&data, &trainCb);
 	const int64_t t1 = now_ms();
 	out.trainMs = static_cast<long long>(t1 - t0);
 	if (!trainStatus.ok())
@@ -2158,7 +2383,7 @@ static RunResult run_nonlinear_latent_variant(const BenchConfig& cfg,
 
 	CaptureMetricsCallbacks testCb;
 	const int64_t t2 = now_ms();
-	const glades::NNetworkStatus testStatus = net.test(&data, &testCb);
+	const glades::NNetworkStatus testStatus = owner.net->test(&data, &testCb);
 	const int64_t t3 = now_ms();
 	out.evalMs = static_cast<long long>(t3 - t2);
 	if (!testStatus.ok())
@@ -2241,6 +2466,14 @@ static void print_aster_usage_row(const Summary& s)
 	       s.asterPredR2.mean, s.asterPredR2.stddev,
 	       s.asterMemoryGain.mean, s.asterMemoryGain.stddev,
 	       s.asterPole.mean, s.asterPole.stddev);
+	printf("  ASTER time:    boundaryMs=%6.3f +/- %-6.3f  setupMs=%6.3f +/- %-6.3f  transportMs=%6.3f +/- %-6.3f  transferMs=%6.3f +/- %-6.3f  stateMs=%6.3f +/- %-6.3f  innovMs=%6.3f +/- %-6.3f  applyMs=%6.3f +/- %-6.3f\n",
+	       s.asterBoundaryMs.mean, s.asterBoundaryMs.stddev,
+	       s.asterSetupMs.mean, s.asterSetupMs.stddev,
+	       s.asterTransportMs.mean, s.asterTransportMs.stddev,
+	       s.asterTransferFitMs.mean, s.asterTransferFitMs.stddev,
+	       s.asterStateFitMs.mean, s.asterStateFitMs.stddev,
+	       s.asterInnovationFitMs.mean, s.asterInnovationFitMs.stddev,
+	       s.asterApplyMs.mean, s.asterApplyMs.stddev);
 }
 
 static void fill_sparrow_run_result(const CaptureMetricsCallbacks& cb, RunResult& out)
@@ -2287,6 +2520,13 @@ static void fill_aster_run_result(const CaptureMetricsCallbacks& cb, RunResult& 
 	out.asterPredR2 = cb.atlasAsterPredR2Sum / denom;
 	out.asterMemoryGain = cb.atlasAsterMemoryGainSum / denom;
 	out.asterPole = cb.atlasAsterPoleSum / denom;
+	out.asterBoundaryMs = cb.atlasAsterBoundaryMsSum / denom;
+	out.asterSetupMs = cb.atlasAsterSetupMsSum / denom;
+	out.asterTransportMs = cb.atlasAsterTransportMsSum / denom;
+	out.asterTransferFitMs = cb.atlasAsterTransferFitMsSum / denom;
+	out.asterStateFitMs = cb.atlasAsterStateFitMsSum / denom;
+	out.asterInnovationFitMs = cb.atlasAsterInnovationFitMsSum / denom;
+	out.asterApplyMs = cb.atlasAsterApplyMsSum / denom;
 }
 
 static Summary summarize_runs(const char* label, const std::vector<RunResult>& runs)
@@ -2327,6 +2567,13 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 	std::vector<double> asterPredR2Vals;
 	std::vector<double> asterMemoryGainVals;
 	std::vector<double> asterPoleVals;
+	std::vector<double> asterBoundaryMsVals;
+	std::vector<double> asterSetupMsVals;
+	std::vector<double> asterTransportMsVals;
+	std::vector<double> asterTransferFitMsVals;
+	std::vector<double> asterStateFitMsVals;
+	std::vector<double> asterInnovationFitMsVals;
+	std::vector<double> asterApplyMsVals;
 	bool allOk = true;
 	std::string firstErr;
 	for (size_t i = 0; i < runs.size(); ++i)
@@ -2374,6 +2621,13 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 			asterPredR2Vals.push_back(runs[i].asterPredR2);
 			asterMemoryGainVals.push_back(runs[i].asterMemoryGain);
 			asterPoleVals.push_back(runs[i].asterPole);
+			asterBoundaryMsVals.push_back(runs[i].asterBoundaryMs);
+			asterSetupMsVals.push_back(runs[i].asterSetupMs);
+			asterTransportMsVals.push_back(runs[i].asterTransportMs);
+			asterTransferFitMsVals.push_back(runs[i].asterTransferFitMs);
+			asterStateFitMsVals.push_back(runs[i].asterStateFitMs);
+			asterInnovationFitMsVals.push_back(runs[i].asterInnovationFitMs);
+			asterApplyMsVals.push_back(runs[i].asterApplyMs);
 		}
 	}
 
@@ -2410,6 +2664,13 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 	s.asterPredR2 = compute_stats(asterPredR2Vals);
 	s.asterMemoryGain = compute_stats(asterMemoryGainVals);
 	s.asterPole = compute_stats(asterPoleVals);
+	s.asterBoundaryMs = compute_stats(asterBoundaryMsVals);
+	s.asterSetupMs = compute_stats(asterSetupMsVals);
+	s.asterTransportMs = compute_stats(asterTransportMsVals);
+	s.asterTransferFitMs = compute_stats(asterTransferFitMsVals);
+	s.asterStateFitMs = compute_stats(asterStateFitMsVals);
+	s.asterInnovationFitMs = compute_stats(asterInnovationFitMsVals);
+	s.asterApplyMs = compute_stats(asterApplyMsVals);
 	return s;
 }
 
@@ -2464,31 +2725,42 @@ static bool run_token_case(const BenchConfig& cfg)
 {
 	TokenDataset data;
 	build_token_dataset(cfg, data);
+	const bool largeCase = (cfg.mode == MODE_TOKEN_LM_LARGE);
 
 	printf("------------------------------------------------------------\n");
-	printf("Case: token-lm\n");
-	printf("Description: autoregressive next-token prediction with a small decoder-only transformer on a synthetic order-2 recurrence.\n");
+	printf("Case: %s\n", largeCase ? "token-lm-large" : "token-lm");
+	printf("Description: %s\n",
+	       largeCase
+	           ? "larger autoregressive next-token prediction benchmark on the same synthetic order-2 recurrence, using a wider/deeper decoder preset."
+	           : "autoregressive next-token prediction with a small decoder-only transformer on a synthetic order-2 recurrence.");
 	printf("Config: vocab=%u dModel=%u dFF=%u layers=%u heads=%u seqLen=%u trainSeqs=%u testSeqs=%u epochs=%u repeats=%u\n",
 	       cfg.token.vocab, cfg.token.dModel, cfg.token.dFF, cfg.token.layers, cfg.token.heads,
 	       cfg.token.seqLen, cfg.token.trainSeqs, cfg.token.testSeqs, cfg.token.epochs, cfg.repeats);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u)\n",
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u)\n",
 	       cfg.token.adamLR, cfg.token.atlasLR, cfg.token.atlasLR, cfg.atlasComplementRank,
-	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f)\n",
+	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate, cfg.token.atlasLR,
+	       cfg.atlasAsterStateRank, cfg.atlasAsterHiddenStackDepth);
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
 	       cfg.atlasSparrowMemoryScale, cfg.atlasSparrowEdgeThreshold,
 	       cfg.atlasSparrowSecondEdgeThreshold, cfg.atlasSparrowSecondEdgeFraction,
-	       cfg.atlasSparrowPoleMax);
+	       cfg.atlasSparrowPoleMax,
+	       cfg.atlasAsterStateRank, cfg.atlasAsterHiddenStackDepth,
+	       cfg.atlasAsterMemoryScale, cfg.atlasAsterEdgeThreshold, cfg.atlasAsterPoleMax);
 	printf("\n");
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_ASTER };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
+	bool ranAny = false;
 	for (size_t v = 0; v < variantCount; ++v)
 	{
+		if (!variant_matches_selection(cfg.variantSelection, variants[v]))
+			continue;
+		ranAny = true;
 		std::vector<RunResult> runs;
 		runs.reserve(cfg.repeats);
 		for (unsigned int rep = 0u; rep < cfg.repeats; ++rep)
@@ -2496,6 +2768,12 @@ static bool run_token_case(const BenchConfig& cfg)
 		const Summary s = summarize_runs(variant_label(variants[v]), runs);
 		print_summary_row(s);
 		print_sparrow_usage_row(s);
+		print_aster_usage_row(s);
+	}
+	if (!ranAny)
+	{
+		printf("No selected optimizer variants are supported for this case.\n\n");
+		return false;
 	}
 	printf("\n");
 	return true;
@@ -2533,8 +2811,12 @@ static bool run_latent_case(const BenchConfig& cfg)
 
 	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
+	bool ranAny = false;
 	for (size_t v = 0; v < variantCount; ++v)
 	{
+		if (!variant_matches_selection(cfg.variantSelection, variants[v]))
+			continue;
+		ranAny = true;
 		std::vector<RunResult> runs;
 		runs.reserve(cfg.repeats);
 		for (unsigned int rep = 0u; rep < cfg.repeats; ++rep)
@@ -2544,6 +2826,11 @@ static bool run_latent_case(const BenchConfig& cfg)
 		print_sparrow_usage_row(s);
 		print_helm_usage_row(s);
 		print_aster_usage_row(s);
+	}
+	if (!ranAny)
+	{
+		printf("No selected optimizer variants are supported for this case.\n\n");
+		return false;
 	}
 	printf("\n");
 	return true;
@@ -2583,8 +2870,12 @@ static bool run_nonlinear_case(const BenchConfig& cfg)
 
 	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
+	bool ranAny = false;
 	for (size_t v = 0; v < variantCount; ++v)
 	{
+		if (!variant_matches_selection(cfg.variantSelection, variants[v]))
+			continue;
+		ranAny = true;
 		std::vector<RunResult> runs;
 		runs.reserve(cfg.repeats);
 		for (unsigned int rep = 0u; rep < cfg.repeats; ++rep)
@@ -2595,6 +2886,11 @@ static bool run_nonlinear_case(const BenchConfig& cfg)
 		print_sparrow_usage_row(s);
 		print_helm_usage_row(s);
 		print_aster_usage_row(s);
+	}
+	if (!ranAny)
+	{
+		printf("No selected optimizer variants are supported for this case.\n\n");
+		return false;
 	}
 	printf("\n");
 	return true;
@@ -2628,8 +2924,12 @@ static bool run_teacher_case(const BenchConfig& cfg)
 
 	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
+	bool ranAny = false;
 	for (size_t v = 0; v < variantCount; ++v)
 	{
+		if (!variant_matches_selection(cfg.variantSelection, variants[v]))
+			continue;
+		ranAny = true;
 		std::vector<RunResult> runs;
 		runs.reserve(cfg.repeats);
 		for (unsigned int rep = 0u; rep < cfg.repeats; ++rep)
@@ -2637,6 +2937,11 @@ static bool run_teacher_case(const BenchConfig& cfg)
 		const Summary s = summarize_runs(variant_label(variants[v]), runs);
 		print_summary_row(s);
 		print_sparrow_usage_row(s);
+	}
+	if (!ranAny)
+	{
+		printf("No selected optimizer variants are supported for this case.\n\n");
+		return false;
 	}
 	printf("\n");
 	return true;
@@ -2885,7 +3190,7 @@ void ATLASAltBenchmark(int argc, char* argv[])
 		return;
 	}
 
-	if (cfg.mode == MODE_ALL || cfg.mode == MODE_TOKEN_LM)
+	if (cfg.mode == MODE_ALL || cfg.mode == MODE_TOKEN_LM || cfg.mode == MODE_TOKEN_LM_LARGE)
 		run_token_case(cfg);
 	if (cfg.mode == MODE_ALL || cfg.mode == MODE_TEACHER_STUDENT)
 		run_teacher_case(cfg);

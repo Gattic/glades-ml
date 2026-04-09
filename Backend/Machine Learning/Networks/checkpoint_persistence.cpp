@@ -3729,6 +3729,7 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 				const TensorDFFState::AsterState& as = tensorDff.aster;
 				const unsigned int featureDim = as.outputDim + (2u * as.controlDim);
 				const unsigned int stateRank = as.stateRank;
+				const unsigned int stateFeatureDim = stateRank + (2u * as.controlDim);
 				{
 					std::vector<uint64_t> sh;
 					sh.push_back(static_cast<uint64_t>(as.controlDim));
@@ -3766,6 +3767,30 @@ NNetworkStatus NNetwork::saveCheckpoint(const std::string& checkpointName, const
 					sh.push_back(static_cast<uint64_t>(as.outputDim));
 					sh.push_back(static_cast<uint64_t>(featureDim));
 					tensorsToWrite.push_back(TensorWriteRef("dff.aster.theta", &as.theta, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateFeatureDim));
+					sh.push_back(static_cast<uint64_t>(stateFeatureDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.statePastCov", &as.statePastCov, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					sh.push_back(static_cast<uint64_t>(stateFeatureDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.stateCrossCov", &as.stateCrossCov, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.innovationCov", &as.innovationCov, dt, sh));
+				}
+				{
+					std::vector<uint64_t> sh;
+					sh.push_back(static_cast<uint64_t>(stateRank));
+					sh.push_back(static_cast<uint64_t>(as.outputDim));
+					tensorsToWrite.push_back(TensorWriteRef("dff.aster.innovationCross", &as.innovationCross, dt, sh));
 				}
 				{
 					std::vector<uint64_t> sh;
@@ -4803,6 +4828,7 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 			const TensorDFFState::AsterState& as = tensorDff.aster;
 			const unsigned int featureDim = as.outputDim + (2u * as.controlDim);
 			const unsigned int stateRank = as.stateRank;
+			const unsigned int stateFeatureDim = stateRank + (2u * as.controlDim);
 			{
 				std::vector<uint64_t> sh;
 				sh.push_back(static_cast<uint64_t>(as.controlDim));
@@ -4840,6 +4866,30 @@ NNetworkStatus NNetwork::loadCheckpoint(const std::string& checkpointName, const
 				sh.push_back(static_cast<uint64_t>(as.outputDim));
 				sh.push_back(static_cast<uint64_t>(featureDim));
 				expected.push_back(TensorReadRef("dff.aster.theta", &tensorDff.aster.theta, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateFeatureDim));
+				sh.push_back(static_cast<uint64_t>(stateFeatureDim));
+				expected.push_back(TensorReadRef("dff.aster.statePastCov", &tensorDff.aster.statePastCov, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				sh.push_back(static_cast<uint64_t>(stateFeatureDim));
+				expected.push_back(TensorReadRef("dff.aster.stateCrossCov", &tensorDff.aster.stateCrossCov, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				expected.push_back(TensorReadRef("dff.aster.innovationCov", &tensorDff.aster.innovationCov, dt, sh));
+			}
+			{
+				std::vector<uint64_t> sh;
+				sh.push_back(static_cast<uint64_t>(stateRank));
+				sh.push_back(static_cast<uint64_t>(as.outputDim));
+				expected.push_back(TensorReadRef("dff.aster.innovationCross", &tensorDff.aster.innovationCross, dt, sh));
 			}
 			{
 				std::vector<uint64_t> sh;

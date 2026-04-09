@@ -32,6 +32,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_atlas.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
+#include "test_token_id_input_fixture.h"
 
 #include <cmath>
 #include <cstdio>
@@ -138,6 +139,86 @@ static glades::NNInfo* make_atlas_transformer_resume_info(const char* name)
 	    /*activationParam*/ 1.0f));
 
 	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(4, glades::OutputLayerInfo::REGRESSION);
+	return new glades::NNInfo(name, in, hidden, out);
+}
+
+static void build_atlas_token_split(unsigned int vocab,
+                                    unsigned int seqCount,
+                                    unsigned int seqLen,
+                                    unsigned int seed,
+                                    unsigned int padTokenId,
+                                    std::vector<unsigned int>& outTokens,
+                                    std::vector<glades::DataInput::SequenceSpan>& outSpans)
+{
+	outTokens.clear();
+	outSpans.clear();
+	outTokens.reserve(static_cast<size_t>(seqCount) * static_cast<size_t>(seqLen + 1u));
+	outSpans.reserve(seqCount);
+
+	for (unsigned int seq = 0u; seq < seqCount; ++seq)
+	{
+		const unsigned int start = static_cast<unsigned int>(outTokens.size());
+		unsigned int a = (seed + 17u * (seq + 1u)) % (vocab - 1u);
+		unsigned int b = (seed + 31u * (seq + 3u)) % (vocab - 1u);
+		const unsigned int phase = 1u + ((seed + 97u * (seq + 5u)) % 7u);
+		for (unsigned int t = 0u; t < seqLen; ++t)
+		{
+			unsigned int tok = 0u;
+			if (t == 0u)
+				tok = a;
+			else if (t == 1u)
+				tok = b;
+			else
+			{
+				tok = (a + b + phase + ((t / 4u) % 3u)) % (vocab - 1u);
+				a = b;
+				b = tok;
+			}
+			outTokens.push_back(tok);
+		}
+		outSpans.push_back(glades::DataInput::SequenceSpan(start, seqLen));
+		outTokens.push_back(padTokenId);
+	}
+}
+
+static InMemoryTokenIdInput* make_atlas_token_dataset(unsigned int vocab,
+                                                      unsigned int seqCount,
+                                                      unsigned int seqLen,
+                                                      unsigned int seed,
+                                                      unsigned int padTokenId)
+{
+	std::vector<unsigned int> trainTokens;
+	std::vector<unsigned int> testTokens;
+	std::vector<glades::DataInput::SequenceSpan> trainSpans;
+	std::vector<glades::DataInput::SequenceSpan> testSpans;
+	build_atlas_token_split(vocab, seqCount, seqLen, seed + 11u, padTokenId, trainTokens, trainSpans);
+	build_atlas_token_split(vocab, std::max(1u, seqCount / 2u), seqLen, seed + 1011u, padTokenId, testTokens, testSpans);
+
+	InMemoryTokenIdInput* di = new InMemoryTokenIdInput();
+	di->setTrainTokens(trainTokens, static_cast<int>(padTokenId));
+	di->setTestTokens(testTokens, static_cast<int>(padTokenId));
+	(void)di->setTrainSequences(trainSpans);
+	(void)di->setTestSequences(testSpans);
+	return di;
+}
+
+static glades::NNInfo* make_atlas_transformer_token_info(const char* name,
+                                                         unsigned int vocab,
+                                                         unsigned int dModel,
+                                                         unsigned int layers,
+                                                         float learningRate)
+{
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(
+	    1, learningRate, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	for (unsigned int i = 0u; i < layers; ++i)
+	{
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    static_cast<int>(dModel), learningRate, 0.0f, 0.0f, 0.0f, 0.0f,
+		    glades::GMath::LINEAR, 1.0f));
+	}
+	glades::OutputLayerInfo* out =
+	    new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	return new glades::NNInfo(name, in, hidden, out);
 }
 
@@ -426,6 +507,70 @@ void ATLASUnitTest()
 		       && diag.asterMeanMemoryGain == diag.asterMeanMemoryGain
 		       && diag.asterMeanPole == diag.asterMeanPole);
 		ASSERT("==============ATLAS::ASTER_DFF loss too high==============", cb.last.totalError < 0.35f);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1D: Transformer token-LM ASTER exposes bounded runtime diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1D: Transformer token-LM ASTER diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 17u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(vocab, 24u, 12u, 55123u, padTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_transformer_token_aster", vocab, 16u, 2u, 0.02f);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(55124u);
+		net.getTerminatorMutable().setEpoch(4);
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 8u;
+			cfg.atlas.complementRank = 0u;
+			cfg.atlas.tSub = 16u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.asterEnabled = true;
+			cfg.atlas.asterMemoryScale = 0.05f;
+			cfg.atlas.asterEdgeThreshold = 0.0f;
+			cfg.atlas.asterStateRank = 2u;
+			cfg.atlas.asterHiddenStackDepth = 2u;
+			cfg.atlas.asterPoleMax = 0.95f;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::ASTER_TRANSFORMER_TOKEN TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::ASTER_TRANSFORMER_TOKEN no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::ASTER_TRANSFORMER_TOKEN diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::ASTER_TRANSFORMER_TOKEN should expose one transformer ASTER observer==============",
+		       diag.asterMatrices == 1u);
+		ASSERT("==============ATLAS::ASTER_TRANSFORMER_TOKEN diagnostics should remain finite==============",
+		       diag.asterMeanEdge == diag.asterMeanEdge
+		       && diag.asterMeanSigma == diag.asterMeanSigma
+		       && diag.asterMeanPredR2 == diag.asterMeanPredR2
+		       && diag.asterMeanMemoryGain == diag.asterMeanMemoryGain
+		       && diag.asterMeanPole == diag.asterMeanPole
+		       && diag.asterMeanBoundaryMs == diag.asterMeanBoundaryMs);
+		ASSERT("==============ATLAS::ASTER_TRANSFORMER_TOKEN train loss should be finite==============",
+		       cb.last.totalError == cb.last.totalError);
 
 		delete di;
 		delete info;

@@ -27,6 +27,7 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <time.h>
 #include <vector>
 
 #include "logfmt_utils.h"
@@ -36,6 +37,264 @@ using namespace glades::logfmt;
 using namespace glades::transformer_train_detail;
 
 namespace {
+
+static timespec monotonic_now()
+{
+	timespec ts;
+	ts.tv_sec = 0;
+	ts.tv_nsec = 0;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts;
+}
+
+static double monotonic_elapsed_ns(const timespec& start, const timespec& end)
+{
+	const double sec = static_cast<double>(end.tv_sec - start.tv_sec) * 1.0e9;
+	const double nsec = static_cast<double>(end.tv_nsec - start.tv_nsec);
+	return sec + nsec;
+}
+
+static bool invert_small_dense_row_major(const std::vector<float>& matrix,
+                                         unsigned int dim,
+                                         float ridge,
+                                         std::vector<float>& inverseOut)
+{
+	if (dim == 0u || matrix.size() < static_cast<size_t>(dim) * static_cast<size_t>(dim))
+		return false;
+
+	const unsigned int augCols = dim * 2u;
+	std::vector<double> aug(static_cast<size_t>(dim) * static_cast<size_t>(augCols), 0.0);
+	for (unsigned int r = 0; r < dim; ++r)
+	{
+		for (unsigned int c = 0; c < dim; ++c)
+		{
+			double v = static_cast<double>(matrix[static_cast<size_t>(r) * static_cast<size_t>(dim) + c]);
+			if (r == c)
+				v += static_cast<double>(ridge);
+			aug[static_cast<size_t>(r) * static_cast<size_t>(augCols) + c] = v;
+		}
+		aug[static_cast<size_t>(r) * static_cast<size_t>(augCols) + (dim + r)] = 1.0;
+	}
+
+	for (unsigned int col = 0; col < dim; ++col)
+	{
+		unsigned int pivot = col;
+		double pivotAbs = std::fabs(aug[static_cast<size_t>(pivot) * static_cast<size_t>(augCols) + col]);
+		for (unsigned int row = col + 1u; row < dim; ++row)
+		{
+			const double candAbs = std::fabs(aug[static_cast<size_t>(row) * static_cast<size_t>(augCols) + col]);
+			if (candAbs > pivotAbs)
+			{
+				pivot = row;
+				pivotAbs = candAbs;
+			}
+		}
+		if (!(pivotAbs > 1e-12))
+			return false;
+		if (pivot != col)
+		{
+			for (unsigned int c = 0; c < augCols; ++c)
+				std::swap(aug[static_cast<size_t>(pivot) * static_cast<size_t>(augCols) + c],
+				          aug[static_cast<size_t>(col) * static_cast<size_t>(augCols) + c]);
+		}
+		const double invPivot = 1.0 / aug[static_cast<size_t>(col) * static_cast<size_t>(augCols) + col];
+		for (unsigned int c = 0; c < augCols; ++c)
+			aug[static_cast<size_t>(col) * static_cast<size_t>(augCols) + c] *= invPivot;
+		for (unsigned int row = 0; row < dim; ++row)
+		{
+			if (row == col)
+				continue;
+			const double scale = aug[static_cast<size_t>(row) * static_cast<size_t>(augCols) + col];
+			if (std::fabs(scale) <= 1e-18)
+				continue;
+			for (unsigned int c = 0; c < augCols; ++c)
+			{
+				aug[static_cast<size_t>(row) * static_cast<size_t>(augCols) + c] -=
+				    scale * aug[static_cast<size_t>(col) * static_cast<size_t>(augCols) + c];
+			}
+		}
+	}
+
+	inverseOut.assign(static_cast<size_t>(dim) * static_cast<size_t>(dim), 0.0f);
+	for (unsigned int r = 0; r < dim; ++r)
+	{
+		for (unsigned int c = 0; c < dim; ++c)
+		{
+			inverseOut[static_cast<size_t>(r) * static_cast<size_t>(dim) + c] =
+			    static_cast<float>(aug[static_cast<size_t>(r) * static_cast<size_t>(augCols) + (dim + c)]);
+		}
+	}
+	return true;
+}
+
+static void extract_top_singular_modes_row_major(const std::vector<float>& matrix,
+                                                 unsigned int rows,
+                                                 unsigned int cols,
+                                                 unsigned int rank,
+                                                 std::vector<float>& sigmaOut,
+                                                 std::vector<float>& leftOut,
+                                                 std::vector<float>& rightOut)
+{
+	sigmaOut.assign(rank, 0.0f);
+	leftOut.assign(static_cast<size_t>(rank) * static_cast<size_t>(rows), 0.0f);
+	rightOut.assign(static_cast<size_t>(rank) * static_cast<size_t>(cols), 0.0f);
+	if (rows == 0u || cols == 0u || rank == 0u
+	    || matrix.size() < static_cast<size_t>(rows) * static_cast<size_t>(cols))
+		return;
+
+	std::vector<float> gram(static_cast<size_t>(rows) * static_cast<size_t>(rows), 0.0f);
+	for (unsigned int r1 = 0; r1 < rows; ++r1)
+	{
+		for (unsigned int r2 = 0; r2 < rows; ++r2)
+		{
+			double accum = 0.0;
+			const size_t off1 = static_cast<size_t>(r1) * static_cast<size_t>(cols);
+			const size_t off2 = static_cast<size_t>(r2) * static_cast<size_t>(cols);
+			for (unsigned int c = 0; c < cols; ++c)
+				accum += static_cast<double>(matrix[off1 + c]) * static_cast<double>(matrix[off2 + c]);
+			gram[static_cast<size_t>(r1) * static_cast<size_t>(rows) + r2] = static_cast<float>(accum);
+		}
+	}
+
+	for (unsigned int m = 0; m < rank; ++m)
+	{
+		std::vector<float> leftVec(rows, 0.0f);
+		leftVec[(m < rows) ? m : 0u] = 1.0f;
+		bool valid = true;
+		for (unsigned int iter = 0; iter < 6u && valid; ++iter)
+		{
+			std::vector<float> nextVec(rows, 0.0f);
+			for (unsigned int r = 0; r < rows; ++r)
+			{
+				double accum = 0.0;
+				for (unsigned int c = 0; c < rows; ++c)
+					accum += static_cast<double>(gram[static_cast<size_t>(r) * static_cast<size_t>(rows) + c])
+					      * static_cast<double>(leftVec[c]);
+				nextVec[r] = static_cast<float>(accum);
+			}
+			for (unsigned int pm = 0; pm < m; ++pm)
+			{
+				const size_t prevOff = static_cast<size_t>(pm) * static_cast<size_t>(rows);
+				double proj = 0.0;
+				for (unsigned int r = 0; r < rows; ++r)
+					proj += static_cast<double>(nextVec[r]) * static_cast<double>(leftOut[prevOff + r]);
+				for (unsigned int r = 0; r < rows; ++r)
+					nextVec[r] -= static_cast<float>(proj * static_cast<double>(leftOut[prevOff + r]));
+			}
+			double normSq = 0.0;
+			for (unsigned int r = 0; r < rows; ++r)
+				normSq += static_cast<double>(nextVec[r]) * static_cast<double>(nextVec[r]);
+			if (!(normSq > 1e-18))
+			{
+				valid = false;
+				break;
+			}
+			const float invNorm = 1.0f / static_cast<float>(sqrt(normSq));
+			for (unsigned int r = 0; r < rows; ++r)
+				leftVec[r] = nextVec[r] * invNorm;
+		}
+		if (!valid)
+			continue;
+
+		std::vector<float> gramLeft(rows, 0.0f);
+		for (unsigned int r = 0; r < rows; ++r)
+		{
+			double accum = 0.0;
+			for (unsigned int c = 0; c < rows; ++c)
+				accum += static_cast<double>(gram[static_cast<size_t>(r) * static_cast<size_t>(rows) + c])
+				      * static_cast<double>(leftVec[c]);
+			gramLeft[r] = static_cast<float>(accum);
+		}
+		double lambda = 0.0;
+		for (unsigned int r = 0; r < rows; ++r)
+			lambda += static_cast<double>(leftVec[r]) * static_cast<double>(gramLeft[r]);
+		const float sigma = static_cast<float>(sqrt(std::max(0.0, lambda)));
+		if (!(sigma > 1e-12f))
+			continue;
+
+		const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(rows);
+		for (unsigned int r = 0; r < rows; ++r)
+			leftOut[leftOff + r] = leftVec[r];
+		sigmaOut[m] = sigma;
+
+		std::vector<float> rightVec(cols, 0.0f);
+		for (unsigned int c = 0; c < cols; ++c)
+		{
+			double accum = 0.0;
+			for (unsigned int r = 0; r < rows; ++r)
+				accum += static_cast<double>(matrix[static_cast<size_t>(r) * static_cast<size_t>(cols) + c])
+				      * static_cast<double>(leftVec[r]);
+			rightVec[c] = static_cast<float>(accum / sigma);
+		}
+		for (unsigned int pm = 0; pm < m; ++pm)
+		{
+			const size_t prevOff = static_cast<size_t>(pm) * static_cast<size_t>(cols);
+			double proj = 0.0;
+			for (unsigned int c = 0; c < cols; ++c)
+				proj += static_cast<double>(rightVec[c]) * static_cast<double>(rightOut[prevOff + c]);
+			for (unsigned int c = 0; c < cols; ++c)
+				rightVec[c] -= static_cast<float>(proj * static_cast<double>(rightOut[prevOff + c]));
+		}
+		double rightNormSq = 0.0;
+		for (unsigned int c = 0; c < cols; ++c)
+			rightNormSq += static_cast<double>(rightVec[c]) * static_cast<double>(rightVec[c]);
+		if (!(rightNormSq > 1e-18))
+		{
+			sigmaOut[m] = 0.0f;
+			for (unsigned int r = 0; r < rows; ++r)
+				leftOut[leftOff + r] = 0.0f;
+			continue;
+		}
+		const float invNorm = 1.0f / static_cast<float>(sqrt(rightNormSq));
+		const size_t rightOff = static_cast<size_t>(m) * static_cast<size_t>(cols);
+		for (unsigned int c = 0; c < cols; ++c)
+			rightOut[rightOff + c] = rightVec[c] * invNorm;
+	}
+}
+
+static unsigned int aster_mix_u32(unsigned int x)
+{
+	x ^= x >> 16;
+	x *= 0x7feb352dU;
+	x ^= x >> 15;
+	x *= 0x846ca68bU;
+	x ^= x >> 16;
+	return x;
+}
+
+static void aster_sketch_dense_row(const float* row,
+                                   unsigned int rowDim,
+                                   unsigned int sketchDim,
+                                   unsigned int seed,
+                                   std::vector<float>& accum)
+{
+	if (!row || sketchDim == 0u)
+		return;
+	for (unsigned int i = 0; i < rowDim; ++i)
+	{
+		const float v = row[i];
+		if (v == 0.0f)
+			continue;
+		const unsigned int h = aster_mix_u32(seed + i * 0x9e3779b9U);
+		const unsigned int bucket = h % sketchDim;
+		const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
+		accum[bucket] += sign * v;
+	}
+}
+
+static inline void aster_sketch_sparse_value(unsigned int index,
+                                             float value,
+                                             unsigned int sketchDim,
+                                             unsigned int seed,
+                                             std::vector<float>& accum)
+{
+	if (sketchDim == 0u || value == 0.0f)
+		return;
+	const unsigned int h = aster_mix_u32(seed + index * 0x9e3779b9U);
+	const unsigned int bucket = h % sketchDim;
+	const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
+	accum[bucket] += sign * value;
+}
 
 static glades::transformer_train_detail::LinearWeightView make_linear_weight_view(const std::vector<float>& weights,
                                                                                   const std::vector<uint16_t>& lowpWeights,
@@ -375,6 +634,15 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				std::fill(b.gW2.begin(), b.gW2.end(), 0.0f);
 				std::fill(b.gB1.begin(), b.gB1.end(), 0.0f);
 				std::fill(b.gB2.begin(), b.gB2.end(), 0.0f);
+			}
+			if (tt.aster.initialized)
+			{
+				std::fill(tt.aster.batchFinalHiddenRawSum.begin(), tt.aster.batchFinalHiddenRawSum.end(), 0.0f);
+				std::fill(tt.aster.batchFinalHiddenSketchSum.begin(), tt.aster.batchFinalHiddenSketchSum.end(), 0.0f);
+				std::fill(tt.aster.batchLayerHiddenSketchSum.begin(), tt.aster.batchLayerHiddenSketchSum.end(), 0.0f);
+				std::fill(tt.aster.batchResidualSum.begin(), tt.aster.batchResidualSum.end(), 0.0f);
+				tt.aster.batchTouchedIds.clear();
+				tt.aster.batchTokenCount = 0u;
 			}
 		}
 	};
@@ -816,6 +1084,509 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
+					TensorTransformerState::AsterState& aster = tt.aster;
+					if (ac.asterEnabled && aster.initialized
+					    && aster.batchTokenCount > 0u
+					    && !aster.batchFinalHiddenRawSum.empty()
+					    && !tt.gTokE.empty()
+					    && !tt.gLmBias.empty())
+					{
+						const timespec asterBoundaryStart = monotonic_now();
+						const unsigned int sketchDim = aster.sketchDim;
+						const unsigned int controlDim = aster.controlDim;
+						const unsigned int featureDim = sketchDim + (2u * controlDim);
+						const unsigned int stateRank =
+						    std::min<unsigned int>(std::max(1u, aster.stateRank), std::max(1u, sketchDim));
+						const unsigned int stateFeatureDim = stateRank + (2u * controlDim);
+						const unsigned int trackedLayers =
+						    std::min<unsigned int>(aster.hiddenStackDepth,
+						                           static_cast<unsigned int>(aster.trackedBlockIndices.size()));
+						const unsigned int tokenCount = std::max(1u, aster.batchTokenCount);
+						const float invTokenCount = 1.0f / static_cast<float>(tokenCount);
+						const float betaAster =
+						    std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
+						const float ridge = 1e-4f;
+						const float varEps = 1e-6f;
+						const float sigmaEps = 1e-12f;
+						std::vector<float> finalHiddenMeanRaw(dModel, 0.0f);
+						std::vector<float> finalHiddenMeanSketch(sketchDim, 0.0f);
+						std::vector<float> layerHiddenMeanSketch(static_cast<size_t>(trackedLayers) * sketchDim, 0.0f);
+						std::vector<float> controlMean(controlDim, 0.0f);
+						std::vector<float> residualMean(sketchDim, 0.0f);
+						std::vector<float> controlStd(controlDim, 1.0f);
+						std::vector<float> residualStd(sketchDim, 1.0f);
+						std::vector<float> feature(featureDim, 0.0f);
+						std::vector<float> prevControlW(controlDim, 0.0f);
+						std::vector<float> currentControlW(controlDim, 0.0f);
+						std::vector<float> currentResidualW(sketchDim, 0.0f);
+						std::vector<float> predictedResidualCurrentW(sketchDim, 0.0f);
+						std::vector<float> predictedResidualNextW(sketchDim, 0.0f);
+						std::vector<float> observedLatent(stateRank, 0.0f);
+						std::vector<float> prevLatentAligned(stateRank, 0.0f);
+						std::vector<float> predictedState(stateRank, 0.0f);
+						std::vector<float> filteredState(stateRank, 0.0f);
+						std::vector<float> nextState(stateRank, 0.0f);
+						std::vector<float> innovation(sketchDim, 0.0f);
+						std::vector<float> stateCorrection(stateRank, 0.0f);
+						std::vector<float> stateFeature(stateFeatureDim, 0.0f);
+						std::vector<float> invTransportCov;
+						std::vector<float> invPastCov;
+						std::vector<float> invStatePastCov;
+						std::vector<float> invInnovationCov;
+						std::vector<float> theta(static_cast<size_t>(sketchDim) * featureDim, 0.0f);
+						std::vector<float> stateModel(static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
+						std::vector<float> innovationGain(static_cast<size_t>(stateRank) * sketchDim, 0.0f);
+						std::vector<float> nextSigma;
+						std::vector<float> nextLeft;
+						std::vector<float> nextRight;
+
+						for (unsigned int i = 0; i < dModel && i < aster.batchFinalHiddenRawSum.size(); ++i)
+							finalHiddenMeanRaw[i] = aster.batchFinalHiddenRawSum[i] * invTokenCount;
+						for (unsigned int i = 0; i < sketchDim && i < aster.batchFinalHiddenSketchSum.size(); ++i)
+							finalHiddenMeanSketch[i] = aster.batchFinalHiddenSketchSum[i] * invTokenCount;
+						for (unsigned int i = 0; i < sketchDim && i < aster.batchResidualSum.size(); ++i)
+							residualMean[i] = aster.batchResidualSum[i] * invTokenCount;
+						for (unsigned int l = 0; l < trackedLayers; ++l)
+						{
+							const size_t srcOff = static_cast<size_t>(l) * static_cast<size_t>(sketchDim);
+							for (unsigned int i = 0; i < sketchDim; ++i)
+								layerHiddenMeanSketch[srcOff + i] =
+								    aster.batchLayerHiddenSketchSum[srcOff + i] * invTokenCount;
+						}
+						const double asterSetupNs =
+						    monotonic_elapsed_ns(asterBoundaryStart, monotonic_now());
+
+						const timespec asterTransportStart = monotonic_now();
+						for (unsigned int l = 0; l < trackedLayers && ((l + 1u) * sketchDim) <= controlDim; ++l)
+						{
+							const size_t covOff = static_cast<size_t>(l) * static_cast<size_t>(sketchDim) * static_cast<size_t>(sketchDim);
+							const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(sketchDim);
+							for (unsigned int r = 0; r < sketchDim; ++r)
+							{
+								const size_t rowOff = covOff + static_cast<size_t>(r) * static_cast<size_t>(sketchDim);
+								for (unsigned int c = 0; c < sketchDim; ++c)
+								{
+									const float layerSample = layerHiddenMeanSketch[layerOff + r] * layerHiddenMeanSketch[layerOff + c];
+									aster.transportPastCov[rowOff + c] =
+									    (betaAster * aster.transportPastCov[rowOff + c]) + ((1.0f - betaAster) * layerSample);
+									const float crossSample = finalHiddenMeanSketch[r] * layerHiddenMeanSketch[layerOff + c];
+									aster.transportCrossCov[rowOff + c] =
+									    (betaAster * aster.transportCrossCov[rowOff + c]) + ((1.0f - betaAster) * crossSample);
+								}
+							}
+							const std::vector<float> pastBlock(
+							    aster.transportPastCov.begin() + static_cast<std::ptrdiff_t>(covOff),
+							    aster.transportPastCov.begin() + static_cast<std::ptrdiff_t>(covOff + static_cast<size_t>(sketchDim) * sketchDim));
+							if (invert_small_dense_row_major(pastBlock, sketchDim, ridge, invTransportCov))
+							{
+								const unsigned int controlOff = l * sketchDim;
+								for (unsigned int r = 0; r < sketchDim; ++r)
+								{
+									double accum = 0.0;
+									for (unsigned int c = 0; c < sketchDim; ++c)
+									{
+										double transportCoeff = 0.0;
+										for (unsigned int k = 0; k < sketchDim; ++k)
+										{
+											const size_t rowOff = covOff + static_cast<size_t>(r) * static_cast<size_t>(sketchDim);
+											transportCoeff += static_cast<double>(aster.transportCrossCov[rowOff + k])
+											               * static_cast<double>(invTransportCov[static_cast<size_t>(k) * static_cast<size_t>(sketchDim) + c]);
+										}
+										accum += transportCoeff * static_cast<double>(layerHiddenMeanSketch[layerOff + c]);
+									}
+									controlMean[controlOff + r] = static_cast<float>(accum);
+								}
+							}
+							else
+							{
+								const unsigned int controlOff = l * sketchDim;
+								for (unsigned int i = 0; i < sketchDim; ++i)
+									controlMean[controlOff + i] = layerHiddenMeanSketch[layerOff + i];
+							}
+						}
+						const double asterTransportNs =
+						    monotonic_elapsed_ns(asterTransportStart, monotonic_now());
+
+						const timespec asterTransferFitStart = monotonic_now();
+						for (unsigned int j = 0; j < sketchDim; ++j)
+						{
+							const float secondMoment = residualMean[j] * residualMean[j];
+							const float updatedVar =
+							    (betaAster * aster.residualVar[j]) + ((1.0f - betaAster) * std::max(secondMoment, varEps));
+							aster.residualVar[j] = std::max(updatedVar, varEps);
+							residualStd[j] = sqrtf(aster.residualVar[j]);
+							currentResidualW[j] = (residualStd[j] > sigmaEps) ? (residualMean[j] / residualStd[j]) : 0.0f;
+							feature[j] = (residualStd[j] > sigmaEps) ? (aster.prevResidualMean[j] / residualStd[j]) : 0.0f;
+						}
+						for (unsigned int i = 0; i < controlDim; ++i)
+						{
+							const float secondMoment = controlMean[i] * controlMean[i];
+							const float updatedVar =
+							    (betaAster * aster.controlVar[i]) + ((1.0f - betaAster) * std::max(secondMoment, varEps));
+							aster.controlVar[i] = std::max(updatedVar, varEps);
+							controlStd[i] = sqrtf(aster.controlVar[i]);
+							prevControlW[i] =
+							    (controlStd[i] > sigmaEps) ? (aster.prevControlMean[i] / controlStd[i]) : 0.0f;
+							currentControlW[i] =
+							    (controlStd[i] > sigmaEps) ? (controlMean[i] / controlStd[i]) : 0.0f;
+							feature[sketchDim + i] = prevControlW[i];
+							feature[sketchDim + controlDim + i] = currentControlW[i];
+						}
+
+						for (unsigned int r = 0; r < featureDim; ++r)
+						{
+							const size_t rowOff = static_cast<size_t>(r) * static_cast<size_t>(featureDim);
+							for (unsigned int c = 0; c < featureDim; ++c)
+							{
+								const float sample = feature[r] * feature[c];
+								aster.pastCov[rowOff + c] =
+								    (betaAster * aster.pastCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+							}
+						}
+						for (unsigned int j = 0; j < sketchDim; ++j)
+						{
+							const size_t rowOff = static_cast<size_t>(j) * static_cast<size_t>(featureDim);
+							for (unsigned int c = 0; c < featureDim; ++c)
+							{
+								const float sample = currentResidualW[j] * feature[c];
+								aster.crossCov[rowOff + c] =
+								    (betaAster * aster.crossCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+							}
+						}
+						if (invert_small_dense_row_major(aster.pastCov, featureDim, ridge, invPastCov))
+						{
+							for (unsigned int j = 0; j < sketchDim; ++j)
+							{
+								const size_t rowOff = static_cast<size_t>(j) * static_cast<size_t>(featureDim);
+								for (unsigned int c = 0; c < featureDim; ++c)
+								{
+									double accum = 0.0;
+									for (unsigned int k = 0; k < featureDim; ++k)
+									{
+										accum += static_cast<double>(aster.crossCov[rowOff + k])
+										      * static_cast<double>(invPastCov[static_cast<size_t>(k) * static_cast<size_t>(featureDim) + c]);
+									}
+									theta[rowOff + c] = static_cast<float>(accum);
+								}
+							}
+						}
+
+						aster.theta = theta;
+						extract_top_singular_modes_row_major(theta, sketchDim, featureDim, stateRank,
+						                                     nextSigma, nextLeft, nextRight);
+
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							bool aligned = false;
+							if ((m < aster.latent.size())
+							    && (aster.leftMode.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(sketchDim))
+							    && (nextLeft.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(sketchDim)))
+							{
+								double accum = 0.0;
+								const size_t nextLeftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
+								for (unsigned int pm = 0; pm < stateRank && pm < aster.latent.size(); ++pm)
+								{
+									const size_t prevLeftOff = static_cast<size_t>(pm) * static_cast<size_t>(sketchDim);
+									double corr = 0.0;
+									for (unsigned int j = 0; j < sketchDim; ++j)
+									{
+										corr += static_cast<double>(nextLeft[nextLeftOff + j])
+										      * static_cast<double>(aster.leftMode[prevLeftOff + j]);
+									}
+									accum += corr * static_cast<double>(aster.latent[pm]);
+								}
+								prevLatentAligned[m] = static_cast<float>(accum);
+								aligned = true;
+							}
+							if (!aligned && m < aster.latent.size())
+								prevLatentAligned[m] = aster.latent[m];
+						}
+
+						for (unsigned int m = 0; m < stateRank; ++m)
+							stateFeature[m] = prevLatentAligned[m];
+						for (unsigned int i = 0; i < controlDim; ++i)
+						{
+							stateFeature[stateRank + i] = prevControlW[i];
+							stateFeature[stateRank + controlDim + i] = currentControlW[i];
+						}
+
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
+							for (unsigned int j = 0; j < sketchDim && (leftOff + j) < nextLeft.size(); ++j)
+								observedLatent[m] += nextLeft[leftOff + j] * currentResidualW[j];
+						}
+						const double asterTransferFitNs =
+						    monotonic_elapsed_ns(asterTransferFitStart, monotonic_now());
+
+						const timespec asterStateFitStart = monotonic_now();
+						if (aster.statePastCov.size() >= static_cast<size_t>(stateFeatureDim) * static_cast<size_t>(stateFeatureDim)
+						    && aster.stateCrossCov.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(stateFeatureDim))
+						{
+							for (unsigned int r = 0; r < stateFeatureDim; ++r)
+							{
+								const size_t rowOff = static_cast<size_t>(r) * static_cast<size_t>(stateFeatureDim);
+								for (unsigned int c = 0; c < stateFeatureDim; ++c)
+								{
+									const float sample = stateFeature[r] * stateFeature[c];
+									aster.statePastCov[rowOff + c] =
+									    (betaAster * aster.statePastCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+								}
+							}
+							for (unsigned int m = 0; m < stateRank; ++m)
+							{
+								const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+								for (unsigned int c = 0; c < stateFeatureDim; ++c)
+								{
+									const float sample = observedLatent[m] * stateFeature[c];
+									aster.stateCrossCov[rowOff + c] =
+									    (betaAster * aster.stateCrossCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+								}
+							}
+							if (invert_small_dense_row_major(aster.statePastCov, stateFeatureDim, ridge, invStatePastCov))
+							{
+								for (unsigned int m = 0; m < stateRank; ++m)
+								{
+									const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+									for (unsigned int c = 0; c < stateFeatureDim; ++c)
+									{
+										double accum = 0.0;
+										for (unsigned int k = 0; k < stateFeatureDim; ++k)
+										{
+											accum += static_cast<double>(aster.stateCrossCov[rowOff + k])
+											      * static_cast<double>(invStatePastCov[static_cast<size_t>(k) * static_cast<size_t>(stateFeatureDim) + c]);
+										}
+										stateModel[rowOff + c] = static_cast<float>(accum);
+									}
+								}
+							}
+						}
+
+						float maxRowAbs = 0.0f;
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+							float rowAbs = 0.0f;
+							for (unsigned int s = 0; s < stateRank; ++s)
+								rowAbs += std::fabs(stateModel[rowOff + s]);
+							maxRowAbs = std::max(maxRowAbs, rowAbs);
+						}
+						if (maxRowAbs > ac.asterPoleMax && maxRowAbs > sigmaEps)
+						{
+							const float scale = ac.asterPoleMax / maxRowAbs;
+							for (unsigned int m = 0; m < stateRank; ++m)
+							{
+								const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+								for (unsigned int s = 0; s < stateRank; ++s)
+									stateModel[rowOff + s] *= scale;
+							}
+						}
+
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+							double accum = 0.0;
+							for (unsigned int s = 0; s < stateRank; ++s)
+								accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(prevLatentAligned[s]);
+							for (unsigned int i = 0; i < controlDim; ++i)
+							{
+								accum += static_cast<double>(stateModel[rowOff + stateRank + i]) * static_cast<double>(prevControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + stateRank + controlDim + i]) * static_cast<double>(currentControlW[i]);
+							}
+							predictedState[m] = static_cast<float>(accum);
+						}
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
+							for (unsigned int j = 0; j < sketchDim && (leftOff + j) < nextLeft.size(); ++j)
+								predictedResidualCurrentW[j] += nextLeft[leftOff + j] * predictedState[m];
+						}
+
+						double targetNormSq = 0.0;
+						double errNormSq = 0.0;
+						for (unsigned int j = 0; j < sketchDim; ++j)
+						{
+							const double target = static_cast<double>(currentResidualW[j]);
+							const double err = target - static_cast<double>(predictedResidualCurrentW[j]);
+							innovation[j] = static_cast<float>(err);
+							targetNormSq += target * target;
+							errNormSq += err * err;
+						}
+						float asterPredR2 = 0.0f;
+						if (targetNormSq > 1e-12)
+							asterPredR2 = static_cast<float>(std::max<double>(0.0, 1.0 - (errNormSq / targetNormSq)));
+						const double asterStateFitNs =
+						    monotonic_elapsed_ns(asterStateFitStart, monotonic_now());
+
+						for (unsigned int m = 0; m < stateRank; ++m)
+							stateCorrection[m] = observedLatent[m] - predictedState[m];
+						const timespec asterInnovationFitStart = monotonic_now();
+						if (aster.innovationCov.size() >= static_cast<size_t>(sketchDim) * static_cast<size_t>(sketchDim)
+						    && aster.innovationCross.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(sketchDim))
+						{
+							for (unsigned int r = 0; r < sketchDim; ++r)
+							{
+								const size_t rowOff = static_cast<size_t>(r) * static_cast<size_t>(sketchDim);
+								for (unsigned int c = 0; c < sketchDim; ++c)
+								{
+									const float sample = innovation[r] * innovation[c];
+									aster.innovationCov[rowOff + c] =
+									    (betaAster * aster.innovationCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+								}
+							}
+							for (unsigned int m = 0; m < stateRank; ++m)
+							{
+								const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
+								for (unsigned int j = 0; j < sketchDim; ++j)
+								{
+									const float sample = stateCorrection[m] * innovation[j];
+									aster.innovationCross[rowOff + j] =
+									    (betaAster * aster.innovationCross[rowOff + j]) + ((1.0f - betaAster) * sample);
+								}
+							}
+							if (invert_small_dense_row_major(aster.innovationCov, sketchDim, ridge, invInnovationCov))
+							{
+								for (unsigned int m = 0; m < stateRank; ++m)
+								{
+									const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
+									for (unsigned int j = 0; j < sketchDim; ++j)
+									{
+										double accum = 0.0;
+										for (unsigned int k = 0; k < sketchDim; ++k)
+										{
+											accum += static_cast<double>(aster.innovationCross[rowOff + k])
+											      * static_cast<double>(invInnovationCov[static_cast<size_t>(k) * static_cast<size_t>(sketchDim) + j]);
+										}
+										innovationGain[rowOff + j] = static_cast<float>(accum);
+									}
+								}
+							}
+						}
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							double accum = static_cast<double>(predictedState[m]);
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
+							for (unsigned int j = 0; j < sketchDim; ++j)
+								accum += static_cast<double>(innovationGain[rowOff + j]) * static_cast<double>(innovation[j]);
+							filteredState[m] = static_cast<float>(accum);
+						}
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+							double accum = 0.0;
+							for (unsigned int s = 0; s < stateRank; ++s)
+								accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(filteredState[s]);
+							for (unsigned int i = 0; i < controlDim; ++i)
+							{
+								accum += static_cast<double>(stateModel[rowOff + stateRank + i]) * static_cast<double>(currentControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + stateRank + controlDim + i]) * static_cast<double>(currentControlW[i]);
+							}
+							nextState[m] = static_cast<float>(accum);
+						}
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
+							for (unsigned int j = 0; j < sketchDim && (leftOff + j) < nextLeft.size(); ++j)
+								predictedResidualNextW[j] += nextLeft[leftOff + j] * nextState[m];
+						}
+						const double asterInnovationFitNs =
+						    monotonic_elapsed_ns(asterInnovationFitStart, monotonic_now());
+
+						const timespec asterApplyStart = monotonic_now();
+						const float asterEdge = (!nextSigma.empty()) ? std::max(0.0f, nextSigma[0]) : 0.0f;
+						float asterTransferScale = 0.0f;
+						if (asterEdge > ac.asterEdgeThreshold)
+							asterTransferScale = (asterEdge - ac.asterEdgeThreshold) / (asterEdge + 1e-6f);
+						float asterMemoryGain = ac.asterMemoryScale
+						                      * std::max(0.0f, asterTransferScale)
+						                      * std::max(0.0f, asterPredR2);
+						if (!is_finite(asterMemoryGain))
+							asterMemoryGain = 0.0f;
+
+						if (asterMemoryGain > 0.0f)
+						{
+							const float batchScale = static_cast<float>(tokenCount) * asterMemoryGain;
+							const bool sampledSoftmax =
+							    (net.trainingConfig.transformer.tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX);
+							if (sampledSoftmax)
+							{
+								std::sort(aster.batchTouchedIds.begin(), aster.batchTouchedIds.end());
+								aster.batchTouchedIds.erase(
+								    std::unique(aster.batchTouchedIds.begin(), aster.batchTouchedIds.end()),
+								    aster.batchTouchedIds.end());
+							}
+							const unsigned int applyCount =
+							    sampledSoftmax ? static_cast<unsigned int>(aster.batchTouchedIds.size()) : tt.vocabSize;
+							for (unsigned int idx = 0; idx < applyCount; ++idx)
+							{
+								const unsigned int vid = sampledSoftmax ? aster.batchTouchedIds[idx] : idx;
+								if (vid >= tt.vocabSize)
+									continue;
+								const unsigned int h = aster_mix_u32(0xA57E0001u + vid * 0x9e3779b9U);
+								const unsigned int bucket = h % sketchDim;
+								const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
+								const float predictedResidual =
+								    clip_maybe(sign * predictedResidualNextW[bucket] * residualStd[bucket],
+								               net.trainingConfig.perElementGradClip);
+								if (!is_finite(predictedResidual))
+									continue;
+								tt.gLmBias[static_cast<size_t>(vid)] += batchScale * predictedResidual;
+								const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
+								for (unsigned int i = 0; i < dModel; ++i)
+									tt.gTokE[eOff + i] += batchScale * predictedResidual * finalHiddenMeanRaw[i];
+							}
+						}
+
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							if (m >= aster.poleNumer.size() || m >= aster.poleDenom.size()
+							    || m >= aster.pole.size() || m >= aster.latent.size())
+								continue;
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
+							const float diagPole = (m < stateRank) ? stateModel[rowOff + m] : 0.0f;
+							aster.poleNumer[m] = diagPole;
+							aster.poleDenom[m] = 1.0f;
+							aster.pole[m] = std::max(-ac.asterPoleMax,
+							                         std::min(ac.asterPoleMax, diagPole));
+							aster.latent[m] = filteredState[m];
+						}
+
+						unsigned int asterActiveModes = 0u;
+						double nextEffectiveSigmaSq = 0.0;
+						for (unsigned int m = 0; m < stateRank; ++m)
+						{
+							const float sigma = (m < nextSigma.size()) ? nextSigma[m] : 0.0f;
+							if (m < aster.sigma.size())
+								aster.sigma[m] = sigma;
+							nextEffectiveSigmaSq += static_cast<double>(sigma) * static_cast<double>(sigma);
+							if (sigma > ac.asterEdgeThreshold)
+								asterActiveModes += 1u;
+						}
+						aster.leftMode.swap(nextLeft);
+						aster.rightMode.swap(nextRight);
+						aster.lastActiveModes = asterActiveModes;
+						aster.lastEdge = (stateRank > 0u) ? std::max(0.0f, aster.sigma[0]) : 0.0f;
+						aster.lastSecondEdge = (stateRank > 1u) ? std::max(0.0f, aster.sigma[1]) : 0.0f;
+						aster.lastSecondEdgeRatio = (aster.lastEdge > sigmaEps)
+						                          ? std::max(0.0f, aster.lastSecondEdge / (aster.lastEdge + sigmaEps))
+						                          : 0.0f;
+						aster.lastSigma = static_cast<float>(sqrt(nextEffectiveSigmaSq));
+						aster.lastPredR2 = asterPredR2;
+						aster.lastMemoryGain = asterMemoryGain;
+						for (unsigned int i = 0; i < controlDim; ++i)
+							aster.prevControlMean[i] = controlMean[i];
+						for (unsigned int j = 0; j < sketchDim; ++j)
+							aster.prevResidualMean[j] = residualMean[j];
+						const timespec asterBoundaryEnd = monotonic_now();
+						aster.timingBoundaryCount += 1ULL;
+						aster.totalBoundaryNs += monotonic_elapsed_ns(asterBoundaryStart, asterBoundaryEnd);
+						aster.totalSetupNs += asterSetupNs;
+						aster.totalTransportNs += asterTransportNs;
+						aster.totalTransferFitNs += asterTransferFitNs;
+						aster.totalStateFitNs += asterStateFitNs;
+						aster.totalInnovationFitNs += asterInnovationFitNs;
+						aster.totalApplyNs += monotonic_elapsed_ns(asterApplyStart, asterBoundaryEnd);
+					}
 
 					// tokE: [vocabSize, dModel]
 					if (!atlas::update(tt.atlasTokE, &tt.tokE[0], &tt.gTokE[0],
@@ -2563,6 +3334,11 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = cfg.tokenLmLossKind;
 	const int padTokenId = cfg.padTokenId;
 	const bool mpUseLossScaling = cfg.mpUseLossScaling;
+	const bool asterEnabled =
+	    tokenLM
+	    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS)
+	    && trainingConfig.atlas.asterEnabled
+	    && tt.aster.initialized;
 
 	const float lossScale = (mpUseLossScaling ? tt.mpLossScale : 1.0f);
 
@@ -2580,6 +3356,9 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 
 	if (tokenLM)
 	{
+		TensorTransformerState::AsterState* aster = asterEnabled ? &tt.aster : NULL;
+		const unsigned int asterSketchSeed = 0xA57E0001u;
+		const unsigned int hiddenSketchSeed = 0xA57E1001u;
 		unsigned int validTargetsThisSeq = 0u;
 		std::fill(dH.begin(), dH.end(), 0.0f);
 		if (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX)
@@ -2592,8 +3371,49 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 				++validTargetsThisSeq;
 				const size_t off = static_cast<size_t>(t) * static_cast<size_t>(vocabSize);
 				for (unsigned int v = 0; v < vocabSize; ++v)
-					dLogits[off + v] = transformerScratch.probs[off + v];
-				dLogits[off + static_cast<unsigned int>(yid)] -= 1.0f;
+				{
+					const float rawResidual = transformerScratch.probs[off + v]
+					                        - ((v == static_cast<unsigned int>(yid)) ? 1.0f : 0.0f);
+					dLogits[off + v] = rawResidual;
+					if (aster)
+						aster_sketch_sparse_value(v, rawResidual, aster->sketchDim,
+						                          asterSketchSeed, aster->batchResidualSum);
+				}
+				if (aster)
+				{
+					const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+					for (unsigned int i = 0; i < dModel && i < aster->batchFinalHiddenRawSum.size(); ++i)
+						aster->batchFinalHiddenRawSum[i] += hPostFinalLN[hOff + i];
+					aster_sketch_dense_row(&hPostFinalLN[hOff], dModel, aster->sketchDim,
+					                       hiddenSketchSeed, aster->batchFinalHiddenSketchSum);
+					const unsigned int trackedLayers =
+					    std::min<unsigned int>(aster->hiddenStackDepth,
+					                           static_cast<unsigned int>(aster->trackedBlockIndices.size()));
+					for (unsigned int l = 0; l < trackedLayers; ++l)
+					{
+						const unsigned int blockIdx = aster->trackedBlockIndices[l];
+						if (blockIdx >= nLayers)
+							continue;
+						const float* layerHidden =
+						    transformerScratch.hAfterFF.data()
+						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
+						    + hOff;
+						const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(aster->sketchDim);
+						for (unsigned int i = 0; i < dModel; ++i)
+						{
+							const float v = layerHidden[i];
+							if (v == 0.0f)
+								continue;
+							const unsigned int h = aster_mix_u32(hiddenSketchSeed
+							                                     + (blockIdx + 1u) * 0x7f4a7c15U
+							                                     + i * 0x9e3779b9U);
+							const unsigned int bucket = h % aster->sketchDim;
+							const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
+							aster->batchLayerHiddenSketchSum[layerOff + bucket] += sign * v;
+						}
+					}
+					aster->batchTokenCount += 1u;
+				}
 			}
 
 			// Apply gradient clipping and loss scaling to dLogits in-place
@@ -2630,9 +3450,16 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 				const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
 				for (unsigned int j = 0u; j < S; ++j)
 				{
+					const int vid = transformerScratch.tokenLmSampleIds[off + j];
+					if (vid >= 0 && static_cast<unsigned int>(vid) < vocabSize && aster)
+					{
+						const float rawResidual = dLogits[off + j];
+						aster_sketch_sparse_value(static_cast<unsigned int>(vid), rawResidual, aster->sketchDim,
+						                          asterSketchSeed, aster->batchResidualSum);
+						aster->batchTouchedIds.push_back(static_cast<unsigned int>(vid));
+					}
 					const float dz = clip_maybe(dLogits[off + j], gradClip) * lossScale;
 					if (dz == 0.0f) continue;
-					const int vid = transformerScratch.tokenLmSampleIds[off + j];
 					if (vid < 0 || static_cast<unsigned int>(vid) >= vocabSize) continue;
 					tt.gLmBias[static_cast<size_t>(vid)] += dz;
 					const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
@@ -2642,6 +3469,40 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 						const float ev = haveLowpE ? glades::transformer_kernels::lowp_to_float(tt.tokELowp[eOff + i], lowpDType) : tt.tokE[eOff + i];
 						dH[hOff + i] += dz * ev;
 					}
+				}
+				if (aster)
+				{
+					for (unsigned int i = 0; i < dModel && i < aster->batchFinalHiddenRawSum.size(); ++i)
+						aster->batchFinalHiddenRawSum[i] += hPostFinalLN[hOff + i];
+					aster_sketch_dense_row(&hPostFinalLN[hOff], dModel, aster->sketchDim,
+					                       hiddenSketchSeed, aster->batchFinalHiddenSketchSum);
+					const unsigned int trackedLayers =
+					    std::min<unsigned int>(aster->hiddenStackDepth,
+					                           static_cast<unsigned int>(aster->trackedBlockIndices.size()));
+					for (unsigned int l = 0; l < trackedLayers; ++l)
+					{
+						const unsigned int blockIdx = aster->trackedBlockIndices[l];
+						if (blockIdx >= nLayers)
+							continue;
+						const float* layerHidden =
+						    transformerScratch.hAfterFF.data()
+						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
+						    + hOff;
+						const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(aster->sketchDim);
+						for (unsigned int i = 0; i < dModel; ++i)
+						{
+							const float v = layerHidden[i];
+							if (v == 0.0f)
+								continue;
+							const unsigned int h = aster_mix_u32(hiddenSketchSeed
+							                                     + (blockIdx + 1u) * 0x7f4a7c15U
+							                                     + i * 0x9e3779b9U);
+							const unsigned int bucket = h % aster->sketchDim;
+							const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
+							aster->batchLayerHiddenSketchSum[layerOff + bucket] += sign * v;
+						}
+					}
+					aster->batchTokenCount += 1u;
 				}
 			}
 		}
