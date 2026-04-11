@@ -795,6 +795,28 @@ struct ATLASConfig
 	// the low-rank preconditioned step.
 	float geodePredictiveScale;
 
+	// Enable BiMAP: a transformer-only blockwise matrix preconditioner that
+	// keeps Adam-style moments but scales matrix updates through row/column
+	// second-moment factors instead of a low-rank residual solve.
+	bool bimapEnabled;
+
+	// Enable BiMAP-v2 low-rank row/column factors on top of the BiMAP-lite
+	// diagonal row/column scaling backbone. When false, BiMAP reduces to the
+	// original scale-only prototype.
+	bool bimapLowRankEnabled;
+
+	// Strength of the row/column matrix anisotropy term inside the BiMAP
+	// two-sided preconditioner. 0 reduces BiMAP to its Adam-style diagonal
+	// backbone.
+	float bimapGeometryScale;
+
+	// Strength of the bounded one-step predictive extrapolation blended into the
+	// BiMAP first-moment signal.
+	float bimapPredictiveScale;
+
+	// Number of optimizer steps between BiMAP row/column factor refreshes.
+	unsigned int bimapFactorCadence;
+
 	// Mirror-descent step size used by SEAM when updating its
 	// {spatial, predictive, output} coordinate simplex.
 	float seamMirrorStep;
@@ -1047,6 +1069,11 @@ struct ATLASConfig
 	      geodeEnabled(false),
 	      geodeGeometryScale(1.0f),
 	      geodePredictiveScale(0.25f),
+	      bimapEnabled(false),
+	      bimapLowRankEnabled(true),
+	      bimapGeometryScale(1.0f),
+	      bimapPredictiveScale(0.15f),
+	      bimapFactorCadence(8u),
 	      seamMirrorStep(0.35f),
 	      seamBudgetMax(0.65f),
 	      quasarTemperature(0.60f),

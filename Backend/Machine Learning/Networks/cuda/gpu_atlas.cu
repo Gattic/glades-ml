@@ -2278,14 +2278,16 @@ static bool refreshSubspace(GpuAtlasWeightState& state,
 //  atlas_gpu_step — one full BRSP optimizer step on GPU
 // ===========================================================================
 
-bool atlas_gpu_step(GpuAtlasWeightState& state,
-                    float* d_W, float* d_gW,
-                    unsigned int m, unsigned int n,
-                    float invBatch, float lr,
-                    float wd1, float wd2, float gradScale,
-                    const glades::ATLASConfig& ac,
-                    shmea::GLogger* logger,
-                    const char* tag)
+static bool atlas_gpu_step_impl(GpuAtlasWeightState& state,
+                                float* d_W, float* d_gW,
+                                unsigned int m, unsigned int n,
+                                float invBatch, float lr,
+                                float wd1, float wd2, float gradScale,
+                                const glades::ATLASConfig& ac,
+                                bool applyWeightDecay,
+                                bool applyBaseline,
+                                shmea::GLogger* logger,
+                                const char* tag)
 {
 	const float beta = ac.beta;
 	const float muMin = ac.muMin;
@@ -2469,8 +2471,11 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	}
 
 	// === Step 3: Decoupled weight decay ===
-	if (!atlas_gpu_weight_decay(d_W, mn, lr, wd1, wd2))
-		return false;
+	if (applyWeightDecay)
+	{
+		if (!atlas_gpu_weight_decay(d_W, mn, lr, wd1, wd2))
+			return false;
+	}
 
 	// === Step 4: Project gradient to subspace ===
 	if (isRight)
@@ -2757,11 +2762,15 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	{
 		// Apply bias correction to sigma2 (matches CPU path).
 		const float effSigma2 = state.sigma2 * bcFactor;
-		const float baselineRate = atlas_clamped_rate(lr, effSigma2, eps, kappaMax);
+		const float baselineRate =
+		    applyBaseline ? atlas_clamped_rate(lr, effSigma2, eps, kappaMax) : 0.0f;
 		state.lastBaselineRate = baselineRate;
-		const float baseScaled = baselineRate * gScale;
-		if (!atlas_gpu_baseline_update(d_W, d_gW, mn, baseScaled))
-			return false;
+		if (applyBaseline)
+		{
+			const float baseScaled = baselineRate * gScale;
+			if (!atlas_gpu_baseline_update(d_W, d_gW, mn, baseScaled))
+				return false;
+		}
 
 		// === Step 8: Subspace correction with PNG ===
 		const float onePlusMu = 1.0f + state.mu;
@@ -2980,6 +2989,19 @@ bool atlas_gpu_step(GpuAtlasWeightState& state,
 	return true;
 }
 
+bool atlas_gpu_step(GpuAtlasWeightState& state,
+                    float* d_W, float* d_gW,
+                    unsigned int m, unsigned int n,
+                    float invBatch, float lr,
+                    float wd1, float wd2, float gradScale,
+                    const glades::ATLASConfig& ac,
+                    shmea::GLogger* logger,
+                    const char* tag)
+{
+	return atlas_gpu_step_impl(state, d_W, d_gW, m, n, invBatch, lr, wd1, wd2,
+	                           gradScale, ac, true, true, logger, tag);
+}
+
 bool atlas_gpu_update(GpuAtlasWeightState& state,
                       float* d_W, float* d_gW,
                       unsigned int m, unsigned int n,
@@ -2997,6 +3019,25 @@ bool atlas_gpu_update(GpuAtlasWeightState& state,
 	}
 	return atlas_gpu_step(state, d_W, d_gW, m, n, invBatch, lr, wd1, wd2, gradScale,
 	                      ac, logger, tag);
+}
+
+bool atlas_gpu_residual_update(GpuAtlasWeightState& state,
+                               float* d_W, float* d_gW,
+                               unsigned int m, unsigned int n,
+                               float invBatch, float lr,
+                               float gradScale,
+                               const glades::ATLASConfig& ac,
+                               glades::rng::Engine& rng,
+                               shmea::GLogger* logger,
+                               const char* tag)
+{
+	if (!state.initialized && m > 0u && n > 0u)
+	{
+		if (!atlas_gpu_init(state, m, n, ac.rank, ac.muMin, rng))
+			return false;
+	}
+	return atlas_gpu_step_impl(state, d_W, d_gW, m, n, invBatch, lr, 0.0f, 0.0f,
+	                           gradScale, ac, false, false, logger, tag);
 }
 
 AtlasGpuDiag atlas_gpu_get_diag(const GpuAtlasWeightState& state)

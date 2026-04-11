@@ -379,6 +379,73 @@ struct WeightState
 	}
 };
 
+// Blockwise matrix-preconditioner state.
+//
+// BiMAP-lite keeps only row/column second-moment scaling. BiMAP-v2 extends that
+// with low-rank row/column factors extracted by subspace iteration on the
+// current gradient matrix, then applies a two-sided Woodbury inverse around the
+// Adam-style per-element backbone.
+struct BiMAPWeightState
+{
+	unsigned int m;
+	unsigned int n;
+	std::vector<float> rowSecond;   // [m] EMA row second moments
+	std::vector<float> colSecond;   // [n] EMA column second moments
+	std::vector<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	std::vector<float> scratchRow;  // [m]
+	std::vector<float> scratchCol;  // [n]
+	std::vector<float> rowBasis;    // [m * rowRank] low-rank row factors
+	std::vector<float> colBasis;    // [n * colRank] low-rank column factors
+	std::vector<float> rowEigVal;   // [rowRank] retained normalized row energies
+	std::vector<float> colEigVal;   // [colRank] retained normalized column energies
+	unsigned int rowRank;
+	unsigned int colRank;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastRowCapture;
+	float lastColCapture;
+	unsigned long long step;
+	bool initialized;
+
+	BiMAPWeightState()
+	    : m(0u), n(0u),
+	      rowRank(0u), colRank(0u),
+	      lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f),
+	      lastColAnisotropy(1.0f),
+	      lastRowCapture(0.0f),
+	      lastColCapture(0.0f),
+	      step(0ULL),
+	      initialized(false)
+	{
+	}
+
+	void reset()
+	{
+		m = 0u;
+		n = 0u;
+		rowSecond.clear();
+		colSecond.clear();
+		prevMhat.clear();
+		scratchRow.clear();
+		scratchCol.clear();
+		rowBasis.clear();
+		colBasis.clear();
+		rowEigVal.clear();
+		colEigVal.clear();
+		rowRank = 0u;
+		colRank = 0u;
+		lastPredictiveTrust = 0.0f;
+		lastRowAnisotropy = 1.0f;
+		lastColAnisotropy = 1.0f;
+		lastRowCapture = 0.0f;
+		lastColCapture = 0.0f;
+		step = 0ULL;
+		initialized = false;
+	}
+};
+
 // Modified Gram-Schmidt orthonormalization of Q[m x r] stored row-major.
 // Q[i * r + j] is element (row i, col j).
 // logger: optional GLogger for degenerate-column warnings.
@@ -392,6 +459,9 @@ void gramSchmidt(float* Q, unsigned int m, unsigned int r,
 void initWeightState(WeightState& state, unsigned int m, unsigned int n,
                      unsigned int rank, float muInit, glades::rng::Engine& rng,
                      shmea::GLogger* logger = 0);
+
+// Initialize BiMAP-lite state for a weight matrix of dimensions [m x n].
+void initBiMAPWeightState(BiMAPWeightState& state, unsigned int m, unsigned int n);
 
 // Refresh subspace basis U via randomized power iteration with EMA blending.
 // grad: [m * n] gradient (row-major), used as the signal for SVD.
@@ -451,6 +521,23 @@ bool update(WeightState& state, float* W, float* gW,
             glades::rng::Engine& rng,
             shmea::GLogger* logger = 0,
             const char* tag = 0);
+
+// Apply one BiMAP-lite step to a matrix block.
+//
+// W/m/v2/gW are [m * n] row-major buffers. The first/second moments are
+// Adam-style; BiMAP augments them with row/column block factors.
+bool bimapUpdate(BiMAPWeightState& state,
+                 float* W, float* m1, float* v2, float* gW,
+                 unsigned int m, unsigned int n,
+                 float lr,
+                 float beta1, float beta2,
+                 float inv1mB1t, float inv1mB2t,
+                 float eps,
+                 float invBatch, float gradScale,
+                 float wd1, float wd2,
+                 const ATLASConfig& ac,
+                 shmea::GLogger* logger = 0,
+                 const char* tag = 0);
 
 // Apply vanilla SGD to a 1D bias vector and zero the gradient.
 // Returns false if any bias element becomes non-finite (NaN/Inf).

@@ -1,0 +1,9 @@
+$ cmake --build /home/robert/dev/glades-ml/build -j4
+[  2%] Built target MLState
+[ 10%] Built target MLStructure
+[ 23%] Built target DataObjects
+[ 45%] Built target GMath
+[ 58%] Built target GladesCUDA
+[ 94%] Built target Networks
+[ 97%] Built target ML
+[100%] Built target glades

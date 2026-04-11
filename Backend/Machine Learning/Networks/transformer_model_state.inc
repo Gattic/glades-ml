@@ -119,6 +119,8 @@
 			// ATLAS optimizer state per weight matrix in this block.
 			atlas::WeightState atlasWq, atlasWk, atlasWv, atlasWo;
 			atlas::WeightState atlasW1, atlasW2;
+			atlas::BiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
+			atlas::BiMAPWeightState bimapW1, bimapW2;
 		};
 
 		std::vector<Block> blocks;
@@ -127,6 +129,9 @@
 		atlas::WeightState atlasWIn;
 		atlas::WeightState atlasWOut;
 		atlas::WeightState atlasTokE;
+		atlas::BiMAPWeightState bimapWIn;
+		atlas::BiMAPWeightState bimapWOut;
+		atlas::BiMAPWeightState bimapTokE;
 
 		// Benchmark-only grouped optimizer-gap diagnostics. These stay at the
 		// top level so AdamW and plain ATLAS-BSRP runs can report the same

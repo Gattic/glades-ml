@@ -2454,7 +2454,8 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		    || (trainingConfig.optimizer.type == OptimizerConfig::ATLAS
 		        && ((trainingConfig.atlas.auroraEnabled
 		             && trainingConfig.atlas.auroraAdamwBackbone)
-		            || trainingConfig.atlas.geodeEnabled));
+		            || trainingConfig.atlas.geodeEnabled
+		            || trainingConfig.atlas.bimapEnabled));
 
 		// Token LM tensors (embedding + bias)
 		if (tokenModel)
@@ -4397,7 +4398,14 @@ bool glades::NNetwork::ensureGpuState()
 
 		if (!gpuTransformerWeights->initialized)
 		{
-			const bool skipAdam = (trainingConfig.optimizer.type == OptimizerConfig::ATLAS);
+			const bool needAdamMoments =
+			    (trainingConfig.optimizer.type != OptimizerConfig::ATLAS)
+			    || (trainingConfig.optimizer.type == OptimizerConfig::ATLAS
+			        && ((trainingConfig.atlas.auroraEnabled
+			             && trainingConfig.atlas.auroraAdamwBackbone)
+			            || trainingConfig.atlas.geodeEnabled
+			            || trainingConfig.atlas.bimapEnabled));
+			const bool skipAdam = !needAdamMoments;
 			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
 			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
 			                                      ts.outSize, ts.ffnKind, ts.tokenModel,

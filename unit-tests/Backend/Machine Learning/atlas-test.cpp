@@ -448,6 +448,121 @@ void ATLASHelmMicroBenchmark()
 	printf("\n");
 }
 
+void ATLASBiMAPMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		glades::OptimizerConfig::Type optimizerType;
+		float learningRate;
+		bool bimapEnabled;
+		bool bimapLowRankEnabled;
+		float bimapPredictiveScale;
+		unsigned int bimapRank;
+		unsigned int bimapCadence;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", glades::OptimizerConfig::ADAMW, 0.001f, false, false, 0.0f, 0u, 1u },
+		{ "BiMAP-lite", glades::OptimizerConfig::ATLAS, 0.001f, true, false, 0.0f, 4u, 1u },
+		{ "BiMAP-v2-0", glades::OptimizerConfig::ATLAS, 0.001f, true, true, 0.0f, 4u, 8u },
+		{ "BiMAP-v2", glades::OptimizerConfig::ATLAS, 0.001f, true, true, 0.15f, 4u, 8u },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("ATLAS BiMAP Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "ApplyMs", "HeadShr", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    73000u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_bimap_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         spec.learningRate);
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(74000u + static_cast<unsigned int>(100u * i));
+		net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+		net.getTerminatorMutable().setAccuracy(0.0f);
+
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.gpu.enable = false;
+			cfg.optimizer.type = spec.optimizerType;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+			cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+			cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+			cfg.transformer.dFFOverride = static_cast<int>(kDff);
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+			if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+			{
+				cfg.atlas.rank = spec.bimapRank;
+				cfg.atlas.complementRank = 0u;
+				cfg.atlas.tSub = 8u;
+				cfg.atlas.beta = 0.999f;
+				cfg.atlas.bimapEnabled = spec.bimapEnabled;
+				cfg.atlas.bimapLowRankEnabled = spec.bimapLowRankEnabled;
+				cfg.atlas.bimapGeometryScale = 1.0f;
+				cfg.atlas.bimapPredictiveScale = spec.bimapPredictiveScale;
+				cfg.atlas.bimapFactorCadence = spec.bimapCadence;
+			}
+		}
+
+		CaptureMetricsCallbacks cb;
+		const int64_t startMs = now_ms();
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		const int64_t endMs = now_ms();
+
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+		const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+		const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+		const double applyMs =
+		    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+		const double headShare =
+		    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
+		const std::string status =
+		    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+		printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
+		       spec.label,
+		       static_cast<double>(endMs - startMs) / 1000.0,
+		       trainNll,
+		       trainPpl,
+		       applyMs,
+		       headShare,
+		       status.c_str());
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
 void ATLASUnitTest()
 {
 	printf("============================================================\n");

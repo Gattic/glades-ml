@@ -5503,6 +5503,390 @@ Updated recommendation:
 - if GEODE cannot win on wall-clock efficiency after the runtime path is cleaned up, stop the replacement line
 - if it can, then it becomes the first branch worth promoting beyond research-control status
 
+## N.40 Explicit Wall-Clock Time-to-Target: GEODE Rank-8 vs AdamW
+
+I ran the next gate directly instead of using more proxy metrics: explicit time-to-target sweeps for `AdamW` and `ATLAS-GEODE` (`rank=8`) on the two hard transformer benchmarks.
+
+Method:
+
+- single-core pinned runs with `taskset -c 2`
+- `repeats=5`
+- sweep `--token-epochs 1 2 3 4`
+- compare measured `Train(s)` against matched held-out `TestNLL`
+
+Commands:
+
+- `taskset -c 2 ./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs {1,2,3,4} --repeats 5 --variant adamw`
+- `taskset -c 2 ./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs {1,2,3,4} --repeats 5 --variant geode --rank 8`
+- `taskset -c 2 ./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs {1,2,3,4} --repeats 5 --variant adamw`
+- `taskset -c 2 ./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs {1,2,3,4} --repeats 5 --variant geode --rank 8`
+
+### `token-lm-document`
+
+`AdamW`:
+
+- 1 epoch:
+  - `Train(s)=0.53 +/- 0.00`
+  - `TestNLL=5.08055 +/- 0.00853`
+- 2 epochs:
+  - `Train(s)=1.05 +/- 0.00`
+  - `TestNLL=4.73422 +/- 0.03952`
+- 3 epochs:
+  - `Train(s)=1.58 +/- 0.01`
+  - `TestNLL=4.22666 +/- 0.06805`
+- 4 epochs:
+  - `Train(s)=2.10 +/- 0.00`
+  - `TestNLL=3.58111 +/- 0.08071`
+
+`ATLAS-GEODE` (`rank=8`):
+
+- 1 epoch:
+  - `Train(s)=0.70 +/- 0.00`
+  - `TestNLL=5.08007 +/- 0.01350`
+- 2 epochs:
+  - `Train(s)=1.39 +/- 0.00`
+  - `TestNLL=4.73145 +/- 0.03785`
+- 3 epochs:
+  - `Train(s)=2.08 +/- 0.01`
+  - `TestNLL=4.22376 +/- 0.11238`
+- 4 epochs:
+  - `Train(s)=2.78 +/- 0.01`
+  - `TestNLL=3.61555 +/- 0.16011`
+
+Time-to-target interpretation:
+
+- At the loose target `TestNLL≈5.08`, `AdamW` gets there in `0.53s`; `GEODE` takes `0.70s`.
+- At the matched target `TestNLL≈4.73`, `AdamW` reaches it in `1.05s`; `GEODE` takes `1.39s`.
+- At the matched target `TestNLL≈4.22`, `AdamW` reaches it in `1.58s`; `GEODE` takes `2.08s`.
+
+So on `token-lm-document`, GEODE does not win time-to-target anywhere on the measured curve. It tracks AdamW’s quality closely, but it is consistently about `1.3x` slower in wall-clock to hit the same NLL.
+
+### `token-lm-corpus-large`
+
+`AdamW`:
+
+- 1 epoch:
+  - `Train(s)=1.60 +/- 0.01`
+  - `TestNLL=6.40277 +/- 0.02125`
+- 2 epochs:
+  - `Train(s)=3.21 +/- 0.00`
+  - `TestNLL=6.25672 +/- 0.09305`
+- 3 epochs:
+  - `Train(s)=4.81 +/- 0.01`
+  - `TestNLL=6.40044 +/- 0.08325`
+- 4 epochs:
+  - `Train(s)=6.44 +/- 0.01`
+  - `TestNLL=6.61852 +/- 0.08902`
+
+`ATLAS-GEODE` (`rank=8`):
+
+- 1 epoch:
+  - `Train(s)=2.04 +/- 0.01`
+  - `TestNLL=6.36924 +/- 0.01752`
+- 2 epochs:
+  - `Train(s)=4.08 +/- 0.01`
+  - `TestNLL=6.32884 +/- 0.07451`
+- 3 epochs:
+  - `Train(s)=6.11 +/- 0.01`
+  - `TestNLL=6.35228 +/- 0.13351`
+- 4 epochs:
+  - `Train(s)=8.16 +/- 0.01`
+  - `TestNLL=6.64143 +/- 0.15692`
+
+Time-to-target interpretation:
+
+- At the loose target `TestNLL≈6.40`, `AdamW` gets there in `1.60s`; `GEODE` takes `2.04s`.
+- At the tighter target `TestNLL≈6.35`, `AdamW` reaches it between epochs 1 and 2 and is still faster than GEODE’s 2-epoch point.
+- `GEODE` never reaches AdamW’s best measured point `TestNLL=6.25672` within 4 epochs.
+
+So on `token-lm-corpus-large`, GEODE also fails the explicit time-to-target gate. It can be directionally competitive at loose early targets, but AdamW reaches every meaningful target faster, and GEODE does not catch up at stricter targets.
+
+### Conclusion
+
+- The explicit wall-clock measurement is decisive.
+- `ATLAS-GEODE rank=8` remains the only transformer-side replacement candidate that is close in quality.
+- But it still does **not** beat `AdamW` on time-to-target on either `token-lm-document` or `token-lm-corpus-large`.
+
+Updated recommendation:
+
+- do not promote GEODE as an AdamW replacement
+- stop local GEODE tuning as a transformer replacement line unless the next step is:
+  - a genuine GPU implementation change, or
+  - a materially different benchmark regime
+- for the current CPU transformer path and current benchmark set, `AdamW` remains the correct default
+- GEODE is now a documented near-match control, not a successor
+
+## N.41 GPU-Native GEODE-v2 Wiring
+
+I followed the next recommendation and implemented the minimal GPU-native GEODE-v2 path instead of continuing CPU-only tuning.
+
+Goal:
+
+- keep `GEODE` as the only active AdamW-replacement line
+- move the replacement question to the only remaining viable axis: GPU execution
+- avoid another controller or observability branch
+
+Implementation:
+
+- the transformer harness now accepts:
+  - `--gpu-enable 0|1`
+  - `--gpu-device N`
+- transformer GPU weight allocation now keeps Adam-style moment buffers when the optimizer is `ATLAS-GEODE`
+- GPU ATLAS gained a residual-only entrypoint that:
+  - reuses ATLAS subspace/Fisher tracking
+  - skips decoupled weight decay
+  - skips the full-space baseline step
+  - applies only the low-rank ATLAS correction
+- transformer GPU `GEODE` now runs as:
+  - Adam-style batched GPU backbone update on all parameters
+  - plus residual-only ATLAS geometry correction on matrix weights
+
+This is the practical GPU analogue of the GEODE research direction:
+
+\[
+\delta_t \approx \delta_t^{\text{Adam}} + \delta_t^{\text{low-rank residual}}
+\]
+
+with the residual applied only to matrix weights and the Adam-style backbone retained everywhere.
+
+Files changed:
+
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.h`
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.cu`
+- `Backend/Machine Learning/Networks/network.cpp`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- CPU GEODE smoke:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant geode --rank 8`
+- GPU-requested smoke:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant geode --rank 8 --gpu-enable 1`
+
+Result:
+
+- the new GPU GEODE-v2 path builds cleanly
+- the benchmark harness now requests CUDA correctly
+- on this machine, the CUDA request reports:
+  - `No CUDA devices found (err=100, count=0)`
+- the run then falls back to CPU and preserves the prior GEODE result
+
+Interpretation:
+
+- the implementation work is complete enough to evaluate on a real CUDA host
+- but this environment cannot answer the actual GPU viability question
+- so the only honest conclusion here is:
+  - GPU GEODE-v2 is wired and benchmarkable
+  - real GPU time-to-target measurement is still outstanding
+
+Updated recommendation:
+
+- keep `GEODE rank=8` as the only active AdamW-replacement line
+- do not make more CPU-side optimizer-shape changes
+- run the new `--gpu-enable 1` GEODE benchmark ladder on a machine with a working NVIDIA driver
+- use the same explicit gate as before:
+  - `token-lm-document`
+  - `token-lm-corpus-large`
+  - matched-NLL wall-clock time-to-target against `AdamW`
+
+### April 11, 2026: `BiMAP-lite` true blockwise matrix-preconditioner prototype
+
+I followed the next replacement recommendation and implemented the minimal practical `BiMAP-lite` branch instead of adding another controller family.
+
+Goal:
+
+- test a true matrix-native preconditioner rather than another low-rank residual shell
+- keep Adam-style robustness on vectors/biases
+- replace transformer matrix-weight updates with a two-sided row/column preconditioner
+
+Implementation:
+
+- added `ATLAS-BIMAP` config/plumbing in:
+  - `Backend/Machine Learning/Networks/training_config.h`
+  - `Backend/Machine Learning/Networks/checkpoint_persistence.cpp`
+  - `Backend/Machine Learning/Networks/transformer_model_state.inc`
+  - `Backend/Machine Learning/Networks/network.cpp`
+  - `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+- added persistent `BiMAPWeightState` and `bimapUpdate(...)` in:
+  - `Backend/Machine Learning/Networks/atlas_optimizer.h`
+  - `Backend/Machine Learning/Networks/atlas_optimizer.cpp`
+- wired transformer matrix weights through `BiMAP` in:
+  - `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+
+Current `BiMAP-lite` update:
+
+\[
+\Delta W_t \approx -\eta_t \frac{\widetilde M_t}{(\sqrt{\hat V_t}+\epsilon)\odot S_r \odot S_c}
+\]
+
+where:
+
+- `\widetilde M_t` is Adam first moment plus a bounded secant-style predictive blend
+- `S_r` is a row anisotropy scale from an EMA of mean row gradient squares
+- `S_c` is a column anisotropy scale from an EMA of mean column gradient squares
+
+This is a real two-sided blockwise preconditioner, but still the minimal diagonal-row/column-factor version, not the full low-rank SPD factor design.
+
+Harness note:
+
+- token alt-bench was initially blocked by a harness regression:
+  - `setTrainingConfig: unknown positionalEncoding`
+- root cause was the benchmark constructing token/regression configs from `net->getTrainingConfig()` instead of a fresh `TrainingConfig`
+- switching the harness to explicit fresh config construction restored valid transformer enum defaults
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- focused transformer ladder:
+  - `token-lm-large --repeats 3 --variant adamw|geode|bimap`
+  - `token-lm-document --repeats 3 --variant adamw|geode|bimap`
+  - `token-lm-corpus-large --repeats 3 --variant adamw|geode|bimap`
+
+Results:
+
+- `token-lm-large`
+  - `AdamW`: `4.57676 +/- 0.00637`, `applyMs=0.056`
+  - `GEODE`: `4.56488 +/- 0.00594`, `applyMs=5.211`
+  - `BiMAP`: `4.57120 +/- 0.00552`, `applyMs=0.172`
+- `token-lm-document`
+  - `AdamW`: `4.71194 +/- 0.03683`, `applyMs=0.892`
+  - `GEODE`: `4.74741 +/- 0.01612`, `applyMs=11.216`
+  - `BiMAP`: `4.72577 +/- 0.05053`, `applyMs=1.610`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.19167 +/- 0.05172`, `applyMs=1.748`
+  - `GEODE`: `6.30822 +/- 0.10461`, `applyMs=39.520`
+  - `BiMAP`: `6.27305 +/- 0.09779`, `applyMs=2.883`
+
+Interpretation:
+
+- `BiMAP-lite` is the first true matrix-preconditioner branch in this line that is both:
+  - materially cheaper than `GEODE`
+  - still reasonably close to `AdamW` on the hard transformer benchmarks
+- but it still does not beat `AdamW` on either `token-lm-document` or `token-lm-corpus-large`
+- so it is a valid next-generation branch, not a replacement winner yet
+
+Updated recommendation:
+
+- keep `BiMAP-lite` as the active true matrix-preconditioner branch
+- treat `GEODE` as the older low-rank-residual control
+- if optimizer replacement work continues, the next serious step should be:
+  - full low-rank row/column SPD factors
+  - GPU-first implementation
+  - explicit time-to-target gate against `AdamW`
+
+### April 11, 2026: `BiMAP-v2` low-rank factor prototype and bounded micro-benchmark
+
+Implementation:
+
+- extended `BiMAPWeightState` with low-rank row/column factor buffers and capture diagnostics in:
+  - `Backend/Machine Learning/Networks/atlas_optimizer.h`
+- added a low-rank `BiMAP-v2` path in:
+  - `Backend/Machine Learning/Networks/atlas_optimizer.cpp`
+  - using alternating row/column subspace iteration plus Woodbury-style left/right inverse application
+- added `bimapLowRankEnabled` plumbing in:
+  - `Backend/Machine Learning/Networks/training_config.h`
+  - `Backend/Machine Learning/Networks/checkpoint_persistence.cpp`
+  - `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+- added a bounded transformer micro-benchmark entrypoint in:
+  - `unit-tests/Backend/Machine Learning/atlas-test.cpp`
+  - `unit-tests/Backend/Machine Learning/atlas-test.h`
+  - `unit-tests/main.cpp`
+
+Runtime note:
+
+- the hard transformer alt-bench loop is no longer a practical local CPU iteration path after this change
+- even `AdamW` timed out locally on:
+  - `token-lm-large --token-epochs 1 --repeats 1 --variant adamw` at `60s`
+  - `token-lm-document --token-epochs 1 --repeats 1 --variant adamw` at `180s`
+- so the local verification gate for this pass was reduced to:
+  - build
+  - `atlas-controller`
+  - `atlas-bimap-micro`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-bimap-micro | rg '^(AdamW|BiMAP)'`
+
+Micro-benchmark result:
+
+- `AdamW`: `TrainNLL=2.82223`, `TrainPPL=16.81433`, `0.002s`
+- `BiMAP-lite`: `TrainNLL=2.82151`, `TrainPPL=16.80225`, `0.002s`
+- `BiMAP-v2-0`: `TrainNLL=2.81736`, `TrainPPL=16.73262`, `0.002s`
+- `BiMAP-v2`: `TrainNLL=2.80104`, `TrainPPL=16.46183`, `0.001s`
+
+Interpretation:
+
+- the low-rank factor path is functionally live and directionally better than `BiMAP-lite` on the tiny transformer sanity check
+- but the hard benchmark gate remains unresolved on this CPU path
+- the next real decision still has to come from GPU-side `token-lm-document` / `token-lm-corpus-large`, not from more local CPU tuning
+
+### April 11, 2026: `BiMAP` GPU gate and acceptance verdict
+
+Ran the GPU-side `BiMAP` gate with:
+
+- `scripts/run_bimap_gpu_gate.sh`
+- `scripts/run_bimap_gpu_gate.sh --skip-build --acceptance`
+
+Artifacts:
+
+- `artifacts/bimap_gpu_gate_20260411-083847/epoch_sweep_summary.tsv`
+- `artifacts/bimap_gpu_gate_20260411-084520/epoch_sweep_summary.tsv`
+- `artifacts/bimap_gpu_gate_20260411-084520/acceptance_summary.tsv`
+
+Acceptance summary (`repeats=10`, default epoch count):
+
+- `token-lm-document`
+  - `AdamW`: `Train(s)=0.10 +/- 0.06`, `TestNLL=4.87531 +/- 0.05549`
+  - `BiMAP-lite`: `0.69 +/- 0.01`, `4.73995 +/- 0.03700`
+  - `BiMAP-v2-0`: `0.72 +/- 0.00`, `4.74647 +/- 0.03648`
+  - `BiMAP-v2`: `0.76 +/- 0.00`, `4.73995 +/- 0.03700`
+- `token-lm-corpus-large`
+  - `AdamW`: `0.19 +/- 0.07`, `6.29585 +/- 0.07842`
+  - `BiMAP-lite`: `2.05 +/- 0.02`, `6.27656 +/- 0.08591`
+  - `BiMAP-v2-0`: `2.06 +/- 0.01`, `6.28066 +/- 0.08327`
+  - `BiMAP-v2`: `2.21 +/- 0.01`, `6.27656 +/- 0.08591`
+
+Epoch-sweep readout:
+
+- `token-lm-document`
+  - `AdamW` remains much faster at every point
+  - `BiMAP-lite` / `BiMAP-v2` produce lower `TestNLL` by epoch count, but not by wall-clock
+  - for example:
+    - `AdamW`: `4.84283` at `0.13s`
+    - `BiMAP-lite`: `4.73404` at `0.69s`
+    - `BiMAP-v2`: `4.73404` at `0.77s`
+  - and `AdamW` already reaches `4.72663` by `0.21s`
+- `token-lm-corpus-large`
+  - `AdamW` dominates the time-to-target frontier
+  - best measured `AdamW`: `6.24807` at `0.21s`
+  - `BiMAP-lite`: `6.26362` at `2.01s`
+  - `BiMAP-v2-0`: `6.26652` at `2.04s`
+  - `BiMAP-v2`: `6.26362` at `2.20s`
+
+Conclusion:
+
+- `BiMAP` is a real matrix-preconditioner line, not a dead branch
+- but it does **not** replace `AdamW` on the actual promotion metric:
+  - GPU wall-clock time-to-target
+- `BiMAP-v2` also failed to justify itself over `BiMAP-lite`
+  - it is slightly slower
+  - it does not produce a consistent accuracy gain on the hard transformer benchmarks
+
+Updated recommendation:
+
+- freeze `AdamW` as the transformer default
+- keep `BiMAP-lite` as the only matrix-preconditioner control worth retaining
+- stop `BiMAP-v2` low-rank-factor refinement on this line
+- if optimizer replacement work continues, change matrix-preconditioner family rather than tuning `BiMAP`
+
 ---
 
 *Document version: 1.19*

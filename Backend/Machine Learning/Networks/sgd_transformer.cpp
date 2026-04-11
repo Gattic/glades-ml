@@ -1652,6 +1652,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const unsigned int ffnKindTT = tt.ffnKind;
 				const unsigned int ff1WidthTT = (ffnKindTT == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFFTT) : dFFTT;
 				const bool geodeEnabled = ac.geodeEnabled;
+				const bool bimapEnabled = ac.bimapEnabled;
 				const bool auroraAdamwBackbone = ac.auroraEnabled && ac.auroraAdamwBackbone;
 				const float beta1 = net.trainingConfig.optimizer.adamBeta1;
 				const float beta2 = net.trainingConfig.optimizer.adamBeta2;
@@ -4157,6 +4158,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (bimapEnabled)
+					{
+						if (!atlas::bimapUpdate(tt.bimapTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+						                        tt.vocabSize, dmTT, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: BiMAP tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (auroraAdamwBackbone)
 					{
 						Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
@@ -4238,6 +4256,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						{
 							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 								"SGDHelper_Transformer: GEODE WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (bimapEnabled)
+					{
+						if (!atlas::bimapUpdate(tt.bimapWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+						                        dmTT, tt.inputSize, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: BiMAP WIn update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
 						}
@@ -4337,6 +4372,43 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
+					else if (bimapEnabled)
+					{
+						if (!atlas::bimapUpdate(b.bimapWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                        dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
+						    || !atlas::bimapUpdate(b.bimapWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
+						    || !atlas::bimapUpdate(b.bimapWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
+						    || !atlas::bimapUpdate(b.bimapWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                           dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
+						    || !atlas::bimapUpdate(b.bimapW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                           ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
+						    || !atlas::bimapUpdate(b.bimapW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                           dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: BiMAP block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					else if (auroraAdamwBackbone)
 					{
 						Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
@@ -4413,6 +4485,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
+					else if (bimapEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					else if (auroraAdamwBackbone)
 					{
 						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
@@ -4451,6 +4530,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						{
 							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 								"SGDHelper_Transformer: GEODE WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (bimapEnabled)
+					{
+						if (!atlas::bimapUpdate(tt.bimapWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+						                        outSize, dmTT, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: BiMAP WOut update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
 						}
@@ -7087,7 +7183,7 @@ bool glades::NNetwork::tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg,
 	if (!trainingConfig.gpu.enable || !cfg.isTrain)
 		return false;
 	if (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS
-	    && trainingConfig.atlas.helmEnabled)
+	    && (trainingConfig.atlas.helmEnabled || trainingConfig.atlas.bimapEnabled))
 		return false;
 
 	const bool gpuReady = ensureGpuState();
@@ -8105,8 +8201,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
+			const bool gpuUseGeode = gpuUseAtlas && trainingConfig.atlas.geodeEnabled;
 
-			if (gpuUseAtlas)
+			if (gpuUseAtlas && !gpuUseGeode)
 			{
 			// === GPU ATLAS optimizer ===
 			// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
@@ -8456,7 +8553,90 @@ if ((sz) > maxSz) maxSz = (sz); \
 				    beta1, beta2, adamEps,
 				    invBatch * gradScale, stepInt, gc);
 			}
-			} // end Adam branch
+				if (gpuUseGeode)
+				{
+					const glades::ATLASConfig& ac = trainingConfig.atlas;
+					glades::ATLASConfig geodeAc = ac;
+					geodeAc.complementRank = 0u;
+					geodeAc.complementLrScale = 0.0f;
+					const float predictiveScale =
+					    std::max(0.0f, std::min(1.0f, ac.geodePredictiveScale));
+					if (predictiveScale <= 0.0f)
+					{
+						geodeAc.muMin = 0.0f;
+						geodeAc.muMax = 0.0f;
+						geodeAc.muGrowthRate = 0.0f;
+					}
+					else
+					{
+						geodeAc.muMin *= predictiveScale;
+						geodeAc.muMax *= predictiveScale;
+						if (geodeAc.muMax < geodeAc.muMin)
+							geodeAc.muMax = geodeAc.muMin;
+						geodeAc.muGrowthRate *= predictiveScale;
+					}
+					const float geodeResidualScale = std::max(0.0f, ac.geodeGeometryScale);
+					bool gpuGeodeError = false;
+
+#define GLADES_GPU_GEODE_WEIGHT(state_, param_, grad_, rows_, cols_, lr_, tag_) do { \
+	if (!gpuGeodeError && geodeResidualScale > 0.0f && (param_).size() > 0u) { \
+		if (!gpu::atlas_gpu_residual_update((state_), (param_).data(), (grad_).data(), \
+		                                    (rows_), (cols_), invBatch, \
+		                                    (lr_) * geodeResidualScale, gradScale, \
+		                                    geodeAc, rngEngine, getLogger(), (tag_))) \
+			gpuGeodeError = true; \
+	} \
+} while (0)
+
+					if (tokenLM)
+					{
+						const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_GEODE_WEIGHT(gpuTransformerWeights->atlasTokE,
+						                        gpuTransformerWeights->tokE,
+						                        gpuTransformerWeights->gTokE,
+						                        vocabSize, dModel, lr0, "tr.tokE");
+					}
+					else
+					{
+						const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_GEODE_WEIGHT(gpuTransformerWeights->atlasWIn,
+						                        gpuTransformerWeights->WIn,
+						                        gpuTransformerWeights->gWIn,
+						                        dModel, inputSize, lr0, "tr.WIn");
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						GLADES_GPU_GEODE_WEIGHT(gb.atlasWq, gb.Wq, gb.gWq, dModel, dModel, lr_l, "tr.Wq");
+						GLADES_GPU_GEODE_WEIGHT(gb.atlasWk, gb.Wk, gb.gWk, dModelKV, dModel, lr_l, "tr.Wk");
+						GLADES_GPU_GEODE_WEIGHT(gb.atlasWv, gb.Wv, gb.gWv, dModelKV, dModel, lr_l, "tr.Wv");
+						GLADES_GPU_GEODE_WEIGHT(gb.atlasWo, gb.Wo, gb.gWo, dModel, dModel, lr_l, "tr.Wo");
+						GLADES_GPU_GEODE_WEIGHT(gb.atlasW1, gb.W1, gb.gW1, ff1Width, dModel, lr_l, "tr.W1");
+						GLADES_GPU_GEODE_WEIGHT(gb.atlasW2, gb.W2, gb.gW2, dModel, dFF, lr_l, "tr.W2");
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_GEODE_WEIGHT(gpuTransformerWeights->atlasWOut,
+						                        gpuTransformerWeights->WOut,
+						                        gpuTransformerWeights->gWOut,
+						                        outSize, dModel, lrO, "tr.WOut");
+					}
+
+#undef GLADES_GPU_GEODE_WEIGHT
+
+					if (gpuGeodeError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU GEODE residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+			} // end Adam/GEODE branch
 
 			if (gpuPerf)
 				gpu::perfRecordSync(&gpuPerf->counters, 1u);

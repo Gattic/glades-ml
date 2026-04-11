@@ -28,5 +28,6 @@ void ATLASUnitTest();
 void ATLASControllerUnitTest();
 void ATLASGpuNaNTest();
 void ATLASHelmMicroBenchmark();
+void ATLASBiMAPMicroBenchmark();
 
 #endif

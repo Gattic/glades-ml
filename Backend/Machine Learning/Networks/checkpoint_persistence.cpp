@@ -681,6 +681,11 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_bool01(kv, "training.atlas.geodeEnabled", b)) { cfg.atlas.geodeEnabled = b; any = true; }
 	if (parse_float(kv, "training.atlas.geodeGeometryScale", f)) { cfg.atlas.geodeGeometryScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.geodePredictiveScale", f)) { cfg.atlas.geodePredictiveScale = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.bimapEnabled", b)) { cfg.atlas.bimapEnabled = b; any = true; }
+	if (parse_bool01(kv, "training.atlas.bimapLowRankEnabled", b)) { cfg.atlas.bimapLowRankEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.bimapGeometryScale", f)) { cfg.atlas.bimapGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.bimapPredictiveScale", f)) { cfg.atlas.bimapPredictiveScale = f; any = true; }
+	if (parse_int(kv, "training.atlas.bimapFactorCadence", i) && i >= 0) { cfg.atlas.bimapFactorCadence = static_cast<unsigned int>(i); any = true; }
 	if (parse_float(kv, "training.atlas.seamMirrorStep", f)) { cfg.atlas.seamMirrorStep = f; any = true; }
 	if (parse_float(kv, "training.atlas.seamBudgetMax", f)) { cfg.atlas.seamBudgetMax = f; any = true; }
 	if (parse_float(kv, "training.atlas.quasarTemperature", f)) { cfg.atlas.quasarTemperature = f; any = true; }
@@ -1227,6 +1232,17 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.geodePredictiveScale; write_kv(out, "training.atlas.geodePredictiveScale", oss.str());
+	}
+	write_kv(out, "training.atlas.bimapEnabled", trainingConfig.atlas.bimapEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.bimapLowRankEnabled", trainingConfig.atlas.bimapLowRankEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.bimapGeometryScale; write_kv(out, "training.atlas.bimapGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.bimapPredictiveScale; write_kv(out, "training.atlas.bimapPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.bimapFactorCadence; write_kv(out, "training.atlas.bimapFactorCadence", oss.str());
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.seamMirrorStep; write_kv(out, "training.atlas.seamMirrorStep", oss.str());
@@ -2505,6 +2521,56 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.geodePredictiveScale mismatch vs requested resume config (checkpoint "
 		    << savedGeodePredictiveScale << ", current " << currentCfg.atlas.geodePredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedBiMAPEnabled = false;
+	if (parse_bool01(kv, "training.atlas.bimapEnabled", savedBiMAPEnabled) &&
+	    currentCfg.atlas.bimapEnabled != savedBiMAPEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.bimapEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedBiMAPEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.bimapEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedBiMAPLowRankEnabled = false;
+	if (parse_bool01(kv, "training.atlas.bimapLowRankEnabled", savedBiMAPLowRankEnabled) &&
+	    currentCfg.atlas.bimapLowRankEnabled != savedBiMAPLowRankEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.bimapLowRankEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedBiMAPLowRankEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.bimapLowRankEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedBiMAPGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.bimapGeometryScale", savedBiMAPGeometryScale) &&
+	    fabsf(currentCfg.atlas.bimapGeometryScale - savedBiMAPGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.bimapGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedBiMAPGeometryScale << ", current " << currentCfg.atlas.bimapGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedBiMAPPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.bimapPredictiveScale", savedBiMAPPredictiveScale) &&
+	    fabsf(currentCfg.atlas.bimapPredictiveScale - savedBiMAPPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.bimapPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedBiMAPPredictiveScale << ", current " << currentCfg.atlas.bimapPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedBiMAPFactorCadence = 0;
+	if (parse_int(kv, "training.atlas.bimapFactorCadence", savedBiMAPFactorCadence) &&
+	    currentCfg.atlas.bimapFactorCadence != static_cast<unsigned int>(savedBiMAPFactorCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.bimapFactorCadence mismatch vs requested resume config (checkpoint "
+		    << savedBiMAPFactorCadence << ", current " << currentCfg.atlas.bimapFactorCadence << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

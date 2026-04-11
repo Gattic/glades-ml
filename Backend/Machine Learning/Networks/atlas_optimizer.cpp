@@ -5,6 +5,8 @@
 #include "training_config.h"
 #include "transformer_kernels.h"
 #include "Backend/Database/GLogger.h"
+#include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <sstream>
 
@@ -26,6 +28,10 @@ static void append_kv(std::ostringstream& oss, const char* k, float v)
 {
 	oss << ' ' << k << '=' << v;
 }
+static void append_kv(std::ostringstream& oss, const char* k, const char* v)
+{
+	oss << ' ' << k << '=' << (v ? v : "");
+}
 
 // NaN/Inf check for internal state protection.
 // Uses std::isfinite which is safe under all compiler optimization levels,
@@ -34,6 +40,11 @@ static void append_kv(std::ostringstream& oss, const char* k, float v)
 static inline bool atlas_isfinite(float x)
 {
 	return std::isfinite(x);
+}
+
+static inline float atlas_sign(float x)
+{
+	return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f);
 }
 
 static inline float atlas_bootstrap_or_ema(float prev,
@@ -2445,6 +2456,31 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 		append_kv(oss, "total_bytes", totalBytes);
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
+}
+
+void initBiMAPWeightState(BiMAPWeightState& state, unsigned int m, unsigned int n)
+{
+	state.reset();
+	state.m = m;
+	state.n = n;
+	state.rowSecond.assign(static_cast<size_t>(m), 1.0f);
+	state.colSecond.assign(static_cast<size_t>(n), 1.0f);
+	state.prevMhat.assign(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
+	state.scratchRow.assign(static_cast<size_t>(m), 0.0f);
+	state.scratchCol.assign(static_cast<size_t>(n), 0.0f);
+	state.rowBasis.clear();
+	state.colBasis.clear();
+	state.rowEigVal.clear();
+	state.colEigVal.clear();
+	state.rowRank = 0u;
+	state.colRank = 0u;
+	state.lastPredictiveTrust = 0.0f;
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.lastRowCapture = 0.0f;
+	state.lastColCapture = 0.0f;
+	state.step = 0ULL;
+	state.initialized = true;
 }
 
 bool refreshSubspace(WeightState& state, const float* grad,
@@ -7934,6 +7970,631 @@ bool update(WeightState& state, float* W, float* gW,
 
 	return applyStep(state, W, gW, m, n, invBatch, lr, wd1, wd2, gradScale,
 	                 ac, rng, logger, tag);
+}
+
+static void bimap_init_identity_basis(std::vector<float>& basis,
+                                      unsigned int dim,
+                                      unsigned int rank)
+{
+	basis.assign(static_cast<size_t>(dim) * rank, 0.0f);
+	for (unsigned int c = 0u; c < rank; ++c)
+	{
+		const unsigned int row = (dim > 0u) ? (c % dim) : 0u;
+		basis[static_cast<size_t>(row) * rank + c] = 1.0f;
+	}
+	if (dim > 0u && rank > 0u)
+		orthonormalize_active(&basis[0], 0, rank, dim, rank, 0);
+}
+
+static void bimap_invert_spd(const std::vector<float>& block,
+                             unsigned int dim,
+                             float eps,
+                             std::vector<float>& invOut)
+{
+	invOut.assign(static_cast<size_t>(dim) * dim, 0.0f);
+	if (dim == 0u)
+		return;
+
+	std::vector<float> sym(block);
+	symmetrize_block(&sym[0], dim);
+	std::vector<float> eigVec;
+	std::vector<float> eigVal;
+	jacobi_eigendecompose(&sym[0], dim, eigVec, eigVal);
+	for (unsigned int k = 0u; k < dim; ++k)
+	{
+		const double lambda = std::max<double>(static_cast<double>(eigVal[k]),
+		                                       static_cast<double>(eps));
+		const double scale = 1.0 / lambda;
+		for (unsigned int r = 0u; r < dim; ++r)
+		{
+			for (unsigned int c = 0u; c < dim; ++c)
+			{
+				invOut[static_cast<size_t>(r) * dim + c] +=
+				    static_cast<float>(scale)
+				    * eigVec[static_cast<size_t>(r) * dim + k]
+				    * eigVec[static_cast<size_t>(c) * dim + k];
+			}
+		}
+	}
+}
+
+static void bimap_refresh_low_rank_factors(BiMAPWeightState& state,
+                                           const std::vector<float>& grad,
+                                           unsigned int m,
+                                           unsigned int n,
+                                           unsigned int rankCap,
+                                           unsigned int powerIters,
+                                           float betaGeom,
+                                           float rowMeanF,
+                                           float colMeanF)
+{
+	const unsigned int rank = std::min(rankCap, std::min(m, n));
+	if (rank == 0u || grad.size() != static_cast<size_t>(m) * n)
+	{
+		state.rowRank = 0u;
+		state.colRank = 0u;
+		state.lastRowCapture = 0.0f;
+		state.lastColCapture = 0.0f;
+		return;
+	}
+
+	if (state.rowBasis.size() != static_cast<size_t>(m) * rank)
+		bimap_init_identity_basis(state.rowBasis, m, rank);
+	if (state.colBasis.size() != static_cast<size_t>(n) * rank)
+		bimap_init_identity_basis(state.colBasis, n, rank);
+	if (state.rowEigVal.size() != rank)
+		state.rowEigVal.assign(rank, 0.0f);
+	if (state.colEigVal.size() != rank)
+		state.colEigVal.assign(rank, 0.0f);
+
+	std::vector<float> rowNext(static_cast<size_t>(m) * rank, 0.0f);
+	std::vector<float> colNext(static_cast<size_t>(n) * rank, 0.0f);
+	for (unsigned int iter = 0u; iter < std::max(1u, powerIters); ++iter)
+	{
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			for (unsigned int c = 0u; c < rank; ++c)
+			{
+				double sum = 0.0;
+				for (unsigned int j = 0u; j < n; ++j)
+					sum += static_cast<double>(grad[static_cast<size_t>(i) * n + j])
+					     * static_cast<double>(state.colBasis[static_cast<size_t>(j) * rank + c]);
+				rowNext[static_cast<size_t>(i) * rank + c] = static_cast<float>(sum);
+			}
+		}
+		orthonormalize_active(&rowNext[0], &state.rowBasis[0], rank, m, rank, 0);
+		state.rowBasis.swap(rowNext);
+
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			for (unsigned int c = 0u; c < rank; ++c)
+			{
+				double sum = 0.0;
+				for (unsigned int i = 0u; i < m; ++i)
+					sum += static_cast<double>(grad[static_cast<size_t>(i) * n + j])
+					     * static_cast<double>(state.rowBasis[static_cast<size_t>(i) * rank + c]);
+				colNext[static_cast<size_t>(j) * rank + c] = static_cast<float>(sum);
+			}
+		}
+		orthonormalize_active(&colNext[0], &state.colBasis[0], rank, n, rank, 0);
+		state.colBasis.swap(colNext);
+	}
+
+	std::vector<float> rowProj(static_cast<size_t>(rank) * n, 0.0f);
+	std::vector<float> colProj(static_cast<size_t>(m) * rank, 0.0f);
+	for (unsigned int c = 0u; c < rank; ++c)
+	{
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			double sum = 0.0;
+			for (unsigned int i = 0u; i < m; ++i)
+				sum += static_cast<double>(state.rowBasis[static_cast<size_t>(i) * rank + c])
+				     * static_cast<double>(grad[static_cast<size_t>(i) * n + j]);
+			rowProj[static_cast<size_t>(c) * n + j] = static_cast<float>(sum);
+		}
+	}
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		for (unsigned int c = 0u; c < rank; ++c)
+		{
+			double sum = 0.0;
+			for (unsigned int j = 0u; j < n; ++j)
+				sum += static_cast<double>(grad[static_cast<size_t>(i) * n + j])
+				     * static_cast<double>(state.colBasis[static_cast<size_t>(j) * rank + c]);
+			colProj[static_cast<size_t>(i) * rank + c] = static_cast<float>(sum);
+		}
+	}
+
+	unsigned int rowActive = 0u;
+	unsigned int colActive = 0u;
+	for (unsigned int c = 0u; c < rank; ++c)
+	{
+		double rowEnergy = 0.0;
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const double v = static_cast<double>(rowProj[static_cast<size_t>(c) * n + j]);
+			rowEnergy += v * v;
+		}
+		rowEnergy /= static_cast<double>(std::max(1u, n));
+		const float rowSample =
+		    static_cast<float>(rowEnergy / static_cast<double>(std::max(rowMeanF, 1.0e-6f)));
+		const float rowExcess = std::max(0.0f, rowSample - 1.0f);
+		state.rowEigVal[c] =
+		    betaGeom * state.rowEigVal[c] + (1.0f - betaGeom) * rowExcess;
+		if (state.rowEigVal[c] > 1.0e-3f)
+			rowActive = c + 1u;
+
+		double colEnergy = 0.0;
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			const double v = static_cast<double>(colProj[static_cast<size_t>(i) * rank + c]);
+			colEnergy += v * v;
+		}
+		colEnergy /= static_cast<double>(std::max(1u, m));
+		const float colSample =
+		    static_cast<float>(colEnergy / static_cast<double>(std::max(colMeanF, 1.0e-6f)));
+		const float colExcess = std::max(0.0f, colSample - 1.0f);
+		state.colEigVal[c] =
+		    betaGeom * state.colEigVal[c] + (1.0f - betaGeom) * colExcess;
+		if (state.colEigVal[c] > 1.0e-3f)
+			colActive = c + 1u;
+	}
+
+	state.rowRank = rowActive;
+	state.colRank = colActive;
+	state.lastRowCapture = (rank > 0u)
+	    ? (static_cast<float>(rowActive) / static_cast<float>(rank))
+	    : 0.0f;
+	state.lastColCapture = (rank > 0u)
+	    ? (static_cast<float>(colActive) / static_cast<float>(rank))
+	    : 0.0f;
+}
+
+static void bimap_apply_left_inverse(std::vector<float>& matrix,
+                                     unsigned int m,
+                                     unsigned int n,
+                                     const std::vector<float>& diagMetric,
+                                     const std::vector<float>& basis,
+                                     const std::vector<float>& eigVal,
+                                     unsigned int rank,
+                                     float geomScale,
+                                     float eps)
+{
+	if (matrix.size() != static_cast<size_t>(m) * n || diagMetric.size() != m)
+		return;
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		const float invDiag = 1.0f / std::max(diagMetric[i], eps);
+		for (unsigned int j = 0u; j < n; ++j)
+			matrix[static_cast<size_t>(i) * n + j] *= invDiag;
+	}
+	if (rank == 0u || geomScale <= 0.0f || basis.size() < static_cast<size_t>(m) * rank)
+		return;
+
+	std::vector<float> core(static_cast<size_t>(rank) * rank, 0.0f);
+	for (unsigned int a = 0u; a < rank; ++a)
+	{
+		for (unsigned int b = 0u; b < rank; ++b)
+		{
+			double sum = 0.0;
+			for (unsigned int i = 0u; i < m; ++i)
+			{
+				const double invDiag = 1.0 / std::max(static_cast<double>(diagMetric[i]),
+				                                      static_cast<double>(eps));
+				sum += invDiag
+				     * static_cast<double>(basis[static_cast<size_t>(i) * rank + a])
+				     * static_cast<double>(basis[static_cast<size_t>(i) * rank + b]);
+			}
+			core[static_cast<size_t>(a) * rank + b] = static_cast<float>(sum);
+		}
+		const float lambdaInv =
+		    1.0f / std::max(geomScale * std::max(eigVal[a], 0.0f), eps);
+		core[static_cast<size_t>(a) * rank + a] += lambdaInv;
+	}
+
+	std::vector<float> coreInv;
+	bimap_invert_spd(core, rank, eps, coreInv);
+	std::vector<float> proj(static_cast<size_t>(rank) * n, 0.0f);
+	for (unsigned int a = 0u; a < rank; ++a)
+	{
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			double sum = 0.0;
+			for (unsigned int i = 0u; i < m; ++i)
+				sum += static_cast<double>(basis[static_cast<size_t>(i) * rank + a])
+				     * static_cast<double>(matrix[static_cast<size_t>(i) * n + j]);
+			proj[static_cast<size_t>(a) * n + j] = static_cast<float>(sum);
+		}
+	}
+	std::vector<float> solved(static_cast<size_t>(rank) * n, 0.0f);
+	for (unsigned int a = 0u; a < rank; ++a)
+	{
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			double sum = 0.0;
+			for (unsigned int b = 0u; b < rank; ++b)
+				sum += static_cast<double>(coreInv[static_cast<size_t>(a) * rank + b])
+				     * static_cast<double>(proj[static_cast<size_t>(b) * n + j]);
+			solved[static_cast<size_t>(a) * n + j] = static_cast<float>(sum);
+		}
+	}
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		const float invDiag = 1.0f / std::max(diagMetric[i], eps);
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			double correction = 0.0;
+			for (unsigned int a = 0u; a < rank; ++a)
+				correction += static_cast<double>(basis[static_cast<size_t>(i) * rank + a])
+				            * static_cast<double>(solved[static_cast<size_t>(a) * n + j]);
+			matrix[static_cast<size_t>(i) * n + j] -=
+			    invDiag * static_cast<float>(correction);
+		}
+	}
+}
+
+static void bimap_apply_right_inverse(std::vector<float>& matrix,
+                                      unsigned int m,
+                                      unsigned int n,
+                                      const std::vector<float>& diagMetric,
+                                      const std::vector<float>& basis,
+                                      const std::vector<float>& eigVal,
+                                      unsigned int rank,
+                                      float geomScale,
+                                      float eps)
+{
+	if (matrix.size() != static_cast<size_t>(m) * n || diagMetric.size() != n)
+		return;
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		for (unsigned int j = 0u; j < n; ++j)
+			matrix[static_cast<size_t>(i) * n + j] *=
+			    1.0f / std::max(diagMetric[j], eps);
+	}
+	if (rank == 0u || geomScale <= 0.0f || basis.size() < static_cast<size_t>(n) * rank)
+		return;
+
+	std::vector<float> core(static_cast<size_t>(rank) * rank, 0.0f);
+	for (unsigned int a = 0u; a < rank; ++a)
+	{
+		for (unsigned int b = 0u; b < rank; ++b)
+		{
+			double sum = 0.0;
+			for (unsigned int j = 0u; j < n; ++j)
+			{
+				const double invDiag = 1.0 / std::max(static_cast<double>(diagMetric[j]),
+				                                      static_cast<double>(eps));
+				sum += invDiag
+				     * static_cast<double>(basis[static_cast<size_t>(j) * rank + a])
+				     * static_cast<double>(basis[static_cast<size_t>(j) * rank + b]);
+			}
+			core[static_cast<size_t>(a) * rank + b] = static_cast<float>(sum);
+		}
+		const float lambdaInv =
+		    1.0f / std::max(geomScale * std::max(eigVal[a], 0.0f), eps);
+		core[static_cast<size_t>(a) * rank + a] += lambdaInv;
+	}
+
+	std::vector<float> coreInv;
+	bimap_invert_spd(core, rank, eps, coreInv);
+	std::vector<float> proj(static_cast<size_t>(m) * rank, 0.0f);
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		for (unsigned int a = 0u; a < rank; ++a)
+		{
+			double sum = 0.0;
+			for (unsigned int j = 0u; j < n; ++j)
+				sum += static_cast<double>(matrix[static_cast<size_t>(i) * n + j])
+				     * static_cast<double>(basis[static_cast<size_t>(j) * rank + a]);
+			proj[static_cast<size_t>(i) * rank + a] = static_cast<float>(sum);
+		}
+	}
+	std::vector<float> solved(static_cast<size_t>(m) * rank, 0.0f);
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		for (unsigned int a = 0u; a < rank; ++a)
+		{
+			double sum = 0.0;
+			for (unsigned int b = 0u; b < rank; ++b)
+				sum += static_cast<double>(proj[static_cast<size_t>(i) * rank + b])
+				     * static_cast<double>(coreInv[static_cast<size_t>(b) * rank + a]);
+			solved[static_cast<size_t>(i) * rank + a] = static_cast<float>(sum);
+		}
+	}
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			double correction = 0.0;
+			for (unsigned int a = 0u; a < rank; ++a)
+				correction += static_cast<double>(solved[static_cast<size_t>(i) * rank + a])
+				            * static_cast<double>(basis[static_cast<size_t>(j) * rank + a]);
+			matrix[static_cast<size_t>(i) * n + j] -=
+			    static_cast<float>(correction)
+			    * (1.0f / std::max(diagMetric[j], eps));
+		}
+	}
+}
+
+bool bimapUpdate(BiMAPWeightState& state,
+                 float* W, float* m1, float* v2, float* gW,
+                 unsigned int m, unsigned int n,
+                 float lr,
+                 float beta1, float beta2,
+                 float inv1mB1t, float inv1mB2t,
+                 float eps,
+                 float invBatch, float gradScale,
+                 float wd1, float wd2,
+                 const ATLASConfig& ac,
+                 shmea::GLogger* logger,
+                 const char* tag)
+{
+	if (!W || !m1 || !v2 || !gW || m == 0u || n == 0u)
+		return true;
+	if (!state.initialized || state.m != m || state.n != n)
+		initBiMAPWeightState(state, m, n);
+	if (!state.initialized || state.m != m || state.n != n)
+		return false;
+
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float oneMinusB1 = 1.0f - beta1;
+	const float oneMinusB2 = 1.0f - beta2;
+	const float betaGeom = std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
+	const float geomScale = std::max(0.0f, ac.bimapGeometryScale);
+	const bool useLowRank = ac.bimapLowRankEnabled && geomScale > 0.0f;
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.bimapPredictiveScale));
+	const unsigned int cadence = std::max(1u, ac.bimapFactorCadence);
+	const unsigned int rankCap =
+	    useLowRank ? std::min(ac.rank, std::min(m, n)) : 0u;
+	const unsigned int powerIters = std::max(1u, std::min(ac.powerIters, 2u));
+	const bool refreshLowRank = useLowRank && ((state.step % cadence) == 0ULL);
+	std::vector<float> gradSnapshot;
+	if (refreshLowRank)
+		gradSnapshot.assign(mn, 0.0f);
+
+	std::fill(state.scratchRow.begin(), state.scratchRow.end(), 0.0f);
+	std::fill(state.scratchCol.begin(), state.scratchCol.end(), 0.0f);
+
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		double rowSq = 0.0;
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const size_t idx = static_cast<size_t>(i) * n + j;
+			const float gScaledRaw = gW[idx] * invBatch * gradScale;
+			if (refreshLowRank)
+				gradSnapshot[idx] = gScaledRaw;
+			float g = gScaledRaw;
+			if (wd1 != 0.0f)
+				g += wd1 * atlas_sign(W[idx]) * gradScale;
+			m1[idx] = beta1 * m1[idx] + oneMinusB1 * g;
+			v2[idx] = beta2 * v2[idx] + oneMinusB2 * (g * g);
+			const double g2 = static_cast<double>(gScaledRaw) * static_cast<double>(gScaledRaw);
+			rowSq += g2;
+			state.scratchCol[j] += static_cast<float>(g2);
+		}
+		state.scratchRow[i] = static_cast<float>(rowSq / static_cast<double>(std::max(1u, n)));
+	}
+	for (unsigned int j = 0u; j < n; ++j)
+		state.scratchCol[j] /= static_cast<float>(std::max(1u, m));
+
+	if ((state.step % cadence) == 0ULL)
+	{
+		for (unsigned int i = 0u; i < m; ++i)
+			state.rowSecond[i] =
+			    betaGeom * state.rowSecond[i]
+			    + (1.0f - betaGeom) * std::max(state.scratchRow[i], 1.0e-12f);
+		for (unsigned int j = 0u; j < n; ++j)
+			state.colSecond[j] =
+			    betaGeom * state.colSecond[j]
+			    + (1.0f - betaGeom) * std::max(state.scratchCol[j], 1.0e-12f);
+	}
+
+	double rowMean = 0.0;
+	double colMean = 0.0;
+	float rowMin = FLT_MAX;
+	float rowMax = 0.0f;
+	float colMin = FLT_MAX;
+	float colMax = 0.0f;
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		const float v = std::max(state.rowSecond[i], 1.0e-12f);
+		rowMean += static_cast<double>(v);
+		rowMin = std::min(rowMin, v);
+		rowMax = std::max(rowMax, v);
+	}
+	for (unsigned int j = 0u; j < n; ++j)
+	{
+		const float v = std::max(state.colSecond[j], 1.0e-12f);
+		colMean += static_cast<double>(v);
+		colMin = std::min(colMin, v);
+		colMax = std::max(colMax, v);
+	}
+	rowMean /= static_cast<double>(std::max(1u, m));
+	colMean /= static_cast<double>(std::max(1u, n));
+	const float rowMeanF = static_cast<float>(std::max(rowMean, 1.0e-12));
+	const float colMeanF = static_cast<float>(std::max(colMean, 1.0e-12));
+	if (refreshLowRank)
+	{
+		bimap_refresh_low_rank_factors(state,
+		                               gradSnapshot,
+		                               m,
+		                               n,
+		                               rankCap,
+		                               powerIters,
+		                               betaGeom,
+		                               rowMeanF,
+		                               colMeanF);
+	}
+	else if (!useLowRank)
+	{
+		state.rowRank = 0u;
+		state.colRank = 0u;
+		state.lastRowCapture = 0.0f;
+		state.lastColCapture = 0.0f;
+	}
+
+	double dot = 0.0;
+	double curNorm = 0.0;
+	double prevNorm = 0.0;
+	if (predictiveScale > 0.0f && state.step > 0ULL && state.prevMhat.size() == mn)
+	{
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const double cur = static_cast<double>(m1[idx] * inv1mB1t);
+			const double prev = static_cast<double>(state.prevMhat[idx]);
+			dot += cur * prev;
+			curNorm += cur * cur;
+			prevNorm += prev * prev;
+		}
+	}
+	float predictiveTrust = 0.0f;
+	if (curNorm > 1.0e-18 && prevNorm > 1.0e-18)
+	{
+		const double cosine = dot / (std::sqrt(curNorm * prevNorm) + 1.0e-18);
+		predictiveTrust =
+		    predictiveScale * std::max(0.0f, std::min(1.0f, static_cast<float>(cosine)));
+	}
+
+	if (!useLowRank)
+	{
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			const float rowScaleRaw =
+			    std::sqrt((std::max(state.rowSecond[i], 1.0e-12f) + eps) / (rowMeanF + eps));
+			for (unsigned int j = 0u; j < n; ++j)
+			{
+				const size_t idx = static_cast<size_t>(i) * n + j;
+				const float colScaleRaw =
+				    std::sqrt((std::max(state.colSecond[j], 1.0e-12f) + eps) / (colMeanF + eps));
+				float matrixScale = rowScaleRaw * colScaleRaw;
+				if (matrixScale < 0.25f)
+					matrixScale = 0.25f;
+				else if (matrixScale > 4.0f)
+					matrixScale = 4.0f;
+				const float mixedScale = std::max(0.25f, 1.0f + geomScale * (matrixScale - 1.0f));
+
+				const float vhat = v2[idx] * inv1mB2t;
+				const float diagDen =
+				    static_cast<float>(std::sqrt(static_cast<double>(std::max(vhat, 0.0f)))) + eps;
+				const float currentMhat = m1[idx] * inv1mB1t;
+				float effectiveMhat = currentMhat;
+				if (predictiveTrust > 0.0f && state.prevMhat.size() == mn)
+				{
+					float delta = currentMhat - state.prevMhat[idx];
+					const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+					if (delta > deltaCap)
+						delta = deltaCap;
+					else if (delta < -deltaCap)
+						delta = -deltaCap;
+					effectiveMhat += predictiveTrust * delta;
+				}
+
+				if (wd2 != 0.0f)
+					W[idx] -= lr * wd2 * W[idx];
+				W[idx] -= lr * (effectiveMhat / (diagDen * mixedScale));
+				gW[idx] = 0.0f;
+				state.prevMhat[idx] = currentMhat;
+				if (!atlas_isfinite(W[idx]))
+					return false;
+			}
+		}
+	}
+	else
+	{
+		std::vector<float> rowMetric(static_cast<size_t>(m), 1.0f);
+		std::vector<float> colMetric(static_cast<size_t>(n), 1.0f);
+		std::vector<float> stepMatrix(mn, 0.0f);
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			const float rowScaleRaw =
+			    std::sqrt((std::max(state.rowSecond[i], 1.0e-12f) + eps) / (rowMeanF + eps));
+			rowMetric[i] = std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (rowScaleRaw - 1.0f)));
+		}
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const float colScaleRaw =
+			    std::sqrt((std::max(state.colSecond[j], 1.0e-12f) + eps) / (colMeanF + eps));
+			colMetric[j] = std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (colScaleRaw - 1.0f)));
+		}
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			for (unsigned int j = 0u; j < n; ++j)
+			{
+				const size_t idx = static_cast<size_t>(i) * n + j;
+				const float vhat = v2[idx] * inv1mB2t;
+				const float diagDen =
+				    static_cast<float>(std::sqrt(static_cast<double>(std::max(vhat, 0.0f)))) + eps;
+				const float currentMhat = m1[idx] * inv1mB1t;
+				float effectiveMhat = currentMhat;
+				if (predictiveTrust > 0.0f && state.prevMhat.size() == mn)
+				{
+					float delta = currentMhat - state.prevMhat[idx];
+					const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+					if (delta > deltaCap)
+						delta = deltaCap;
+					else if (delta < -deltaCap)
+						delta = -deltaCap;
+					effectiveMhat += predictiveTrust * delta;
+				}
+				stepMatrix[idx] = effectiveMhat / diagDen;
+				state.prevMhat[idx] = currentMhat;
+			}
+		}
+		bimap_apply_left_inverse(stepMatrix,
+		                         m,
+		                         n,
+		                         rowMetric,
+		                         state.rowBasis,
+		                         state.rowEigVal,
+		                         state.rowRank,
+		                         geomScale,
+		                         eps);
+		bimap_apply_right_inverse(stepMatrix,
+		                          m,
+		                          n,
+		                          colMetric,
+		                          state.colBasis,
+		                          state.colEigVal,
+		                          state.colRank,
+		                          geomScale,
+		                          eps);
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			if (wd2 != 0.0f)
+				W[idx] -= lr * wd2 * W[idx];
+			W[idx] -= lr * stepMatrix[idx];
+			gW[idx] = 0.0f;
+			if (!atlas_isfinite(W[idx]))
+				return false;
+		}
+	}
+
+	state.lastPredictiveTrust = predictiveTrust;
+	state.lastRowAnisotropy = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
+	state.lastColAnisotropy = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
+	state.step += 1ULL;
+
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		std::ostringstream oss;
+		oss << "event=bimap_step";
+		if (tag && tag[0])
+			append_kv(oss, "tag", tag);
+		append_kv(oss, "step", state.step);
+		append_kv(oss, "predTrust", state.lastPredictiveTrust);
+		append_kv(oss, "rowAniso", state.lastRowAnisotropy);
+		append_kv(oss, "colAniso", state.lastColAnisotropy);
+		append_kv(oss, "rowRank", state.rowRank);
+		append_kv(oss, "colRank", state.colRank);
+		append_kv(oss, "rowCapture", state.lastRowCapture);
+		append_kv(oss, "colCapture", state.lastColCapture);
+		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
+	return true;
 }
 
 bool updateBias(float* bias, float* gBias, unsigned int size,

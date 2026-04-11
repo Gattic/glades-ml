@@ -532,7 +532,8 @@ enum VariantKind
 	VARIANT_ATLAS_AURORA = 10,
 	VARIANT_ATLAS_SEAM = 11,
 	VARIANT_ATLAS_QUASAR = 12,
-	VARIANT_ATLAS_GEODE = 13
+	VARIANT_ATLAS_GEODE = 13,
+	VARIANT_ATLAS_BIMAP = 14
 };
 
 enum VariantSelection
@@ -551,7 +552,8 @@ enum VariantSelection
 	VARIANT_SELECTION_ATLAS_AURORA = 11,
 	VARIANT_SELECTION_ATLAS_SEAM = 12,
 	VARIANT_SELECTION_ATLAS_QUASAR = 13,
-	VARIANT_SELECTION_ATLAS_GEODE = 14
+	VARIANT_SELECTION_ATLAS_GEODE = 14,
+	VARIANT_SELECTION_ATLAS_BIMAP = 15
 };
 
 struct TokenConfig
@@ -694,6 +696,12 @@ struct BenchConfig
 	float atlasAuroraBodyTrustScale;
 	float atlasGeodeGeometryScale;
 	float atlasGeodePredictiveScale;
+	unsigned int atlasBiMAPLowRank;
+	float atlasBiMAPGeometryScale;
+	float atlasBiMAPPredictiveScale;
+	unsigned int atlasBiMAPFactorCadence;
+	unsigned int gpuEnable;
+	int gpuDeviceId;
 	TokenConfig token;
 	TeacherConfig teacher;
 	LatentConfig latent;
@@ -735,6 +743,12 @@ struct BenchConfig
 	      atlasAuroraBodyTrustScale(0.60f),
 	      atlasGeodeGeometryScale(1.0f),
 	      atlasGeodePredictiveScale(0.25f),
+	      atlasBiMAPLowRank(1u),
+	      atlasBiMAPGeometryScale(1.0f),
+	      atlasBiMAPPredictiveScale(0.15f),
+	      atlasBiMAPFactorCadence(8u),
+	      gpuEnable(0u),
+	      gpuDeviceId(0),
 	      token(),
 	      teacher(),
 	      latent(),
@@ -1233,6 +1247,7 @@ static const char* variant_label(VariantKind variant)
 	case VARIANT_ATLAS_SEAM: return "ATLAS-SEAM";
 	case VARIANT_ATLAS_QUASAR: return "ATLAS-QUASAR";
 	case VARIANT_ATLAS_GEODE: return "ATLAS-GEODE";
+	case VARIANT_ATLAS_BIMAP: return "ATLAS-BIMAP";
 	default: return "Unknown";
 	}
 }
@@ -1271,6 +1286,8 @@ static bool variant_matches_selection(VariantSelection selection, VariantKind va
 		return variant == VARIANT_ATLAS_QUASAR;
 	case VARIANT_SELECTION_ATLAS_GEODE:
 		return variant == VARIANT_ATLAS_GEODE;
+	case VARIANT_SELECTION_ATLAS_BIMAP:
+		return variant == VARIANT_ATLAS_BIMAP;
 	default:
 		return false;
 	}
@@ -1408,7 +1425,7 @@ static void print_usage()
 	printf("Options:\n");
 	printf("  --mode all|token-lm|token-lm-large|token-lm-context|token-lm-context-large|token-lm-document|token-lm-corpus|token-lm-corpus-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
 	printf("                                         Run the alternate-task benches or the teacher-student sweep (default: all)\n");
-	printf("  --variant all|adamw|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode\n");
+	printf("  --variant all|adamw|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|bimap\n");
 	printf("                                         Restrict runs to one optimizer variant when the case supports it (default: all)\n");
 	printf("  --repeats N                           Repeats per optimizer variant (default: 3)\n");
 	printf("  --seed N                              Base RNG seed (default: 1337)\n");
@@ -1442,6 +1459,12 @@ static void print_usage()
 	printf("  --atlas-aurora-body-trust-scale X     Retained non-head SPARROW trust inside AURORA (default: 0.60)\n");
 	printf("  --atlas-geode-geometry-scale X        Low-rank geometry strength for GEODE (default: 1.0)\n");
 	printf("  --atlas-geode-predictive-scale X      SPARROW-style active prediction blend for GEODE (default: 0.25)\n");
+	printf("  --atlas-bimap-low-rank 0|1            Enable BiMAP-v2 low-rank row/column factors (default: 1)\n");
+	printf("  --atlas-bimap-geometry-scale X        Row/column geometry strength for BiMAP (default: 1.0)\n");
+	printf("  --atlas-bimap-predictive-scale X      Momentum secant blend for BiMAP (default: 0.15)\n");
+	printf("  --atlas-bimap-factor-cadence N        Steps between BiMAP factor EMA refreshes (default: 8)\n");
+	printf("  --gpu-enable 0|1                      Attempt GPU offload when available (default: 0)\n");
+	printf("  --gpu-device N                        CUDA device id when GPU offload is enabled (default: 0)\n");
 	printf("  --token-epochs N                      Token-LM epochs (default: 6)\n");
 	printf("  --token-train-seqs N                  Token-LM train sequence count (default: 128)\n");
 	printf("  --token-test-seqs N                   Token-LM test sequence count (default: 32)\n");
@@ -1728,6 +1751,11 @@ static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
 	if (streq(text, "geode") || streq(text, "atlas-geode"))
 	{
 		outSelection = VARIANT_SELECTION_ATLAS_GEODE;
+		return true;
+	}
+	if (streq(text, "bimap") || streq(text, "atlas-bimap"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_BIMAP;
 		return true;
 	}
 	return false;
@@ -2023,6 +2051,56 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 				err = "invalid --atlas-geode-predictive-scale";
 				return false;
 			}
+		}
+		else if (streq(argv[i], "--atlas-bimap-low-rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBiMAPLowRank) || cfg.atlasBiMAPLowRank > 1u)
+			{
+				err = "invalid --atlas-bimap-low-rank";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-bimap-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasBiMAPGeometryScale) || cfg.atlasBiMAPGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-bimap-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-bimap-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasBiMAPPredictiveScale) || cfg.atlasBiMAPPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-bimap-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-bimap-factor-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasBiMAPFactorCadence) || cfg.atlasBiMAPFactorCadence == 0u)
+			{
+				err = "invalid --atlas-bimap-factor-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--gpu-enable") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.gpuEnable) || cfg.gpuEnable > 1u)
+			{
+				err = "invalid --gpu-enable";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--gpu-device") && i + 1 < argc)
+		{
+			unsigned int gpuDevice = 0u;
+			if (!parse_uint_arg(argv[++i], gpuDevice))
+			{
+				err = "invalid --gpu-device";
+				return false;
+			}
+			cfg.gpuDeviceId = static_cast<int>(gpuDevice);
 		}
 		else if (streq(argv[i], "--token-epochs") && i + 1 < argc)
 		{
@@ -3273,6 +3351,7 @@ static void reset_atlas_family(glades::TrainingConfig& tc)
 	tc.atlas.seamEnabled = false;
 	tc.atlas.quasarEnabled = false;
 	tc.atlas.geodeEnabled = false;
+	tc.atlas.bimapEnabled = false;
 	tc.atlas.kappaEnabled = false;
 }
 
@@ -3527,6 +3606,14 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.geodeGeometryScale = cfg.atlasGeodeGeometryScale;
 		tc.atlas.geodePredictiveScale = cfg.atlasGeodePredictiveScale;
 	}
+	else if (variant == VARIANT_ATLAS_BIMAP)
+	{
+		tc.atlas.bimapEnabled = true;
+		tc.atlas.bimapLowRankEnabled = (cfg.atlasBiMAPLowRank != 0u);
+		tc.atlas.bimapGeometryScale = cfg.atlasBiMAPGeometryScale;
+		tc.atlas.bimapPredictiveScale = cfg.atlasBiMAPPredictiveScale;
+		tc.atlas.bimapFactorCadence = cfg.atlasBiMAPFactorCadence;
+	}
 }
 
 static bool configure_optimizer(glades::TrainingConfig& tc,
@@ -3557,7 +3644,8 @@ static bool token_variant_uses_adamw_backbone(const BenchConfig& cfg, VariantKin
 {
 	return (variant == VARIANT_ADAMW)
 	    || (variant == VARIANT_ATLAS_AURORA && cfg.atlasAuroraAdamwBackbone != 0u)
-	    || (variant == VARIANT_ATLAS_GEODE);
+	    || (variant == VARIANT_ATLAS_GEODE)
+	    || (variant == VARIANT_ATLAS_BIMAP);
 }
 
 static float token_variant_learning_rate(const BenchConfig& cfg, VariantKind variant)
@@ -3611,7 +3699,7 @@ static bool make_token_network(const BenchConfig& cfg,
 	out.net->getTerminatorMutable().setEpoch(static_cast<int>(cfg.token.epochs));
 	out.net->getTerminatorMutable().setAccuracy(0.0f);
 
-	glades::TrainingConfig tc = out.net->getTrainingConfig();
+	glades::TrainingConfig tc;
 	tc.transformer.enableTokenEmbedding = true;
 	tc.transformer.vocabSizeOverride = static_cast<int>(cfg.token.vocab);
 	tc.transformer.tieEmbeddings = true;
@@ -3632,6 +3720,9 @@ static bool make_token_network(const BenchConfig& cfg,
 	tc.transformer.ropeTheta = 10000.0f;
 	tc.transformer.embeddingDropoutRate = 0.0f;
 	tc.transformer.residualDropoutRate = 0.0f;
+	tc.gpu.enable = (cfg.gpuEnable != 0u);
+	tc.gpu.deviceId = cfg.gpuDeviceId;
+	tc.gpu.minProblemSize = 0u;
 	configure_optimizer(tc, cfg, variant, cfg.token.adamLR, cfg.token.atlasLR, 1.0f);
 
 	const glades::NNetworkStatus stCfg = out.net->setTrainingConfig(tc);
@@ -3685,7 +3776,7 @@ static bool make_regression_network(const BenchConfig& cfg,
 	out.net->getTerminatorMutable().setEpoch(static_cast<int>(epochs));
 	out.net->getTerminatorMutable().setAccuracy(0.0f);
 
-	glades::TrainingConfig tc = out.net->getTrainingConfig();
+	glades::TrainingConfig tc;
 	tc.transformer.enableTokenEmbedding = false;
 	tc.transformer.vocabSizeOverride = 0;
 	tc.transformer.tieEmbeddings = true;
@@ -4841,7 +4932,8 @@ static bool run_token_case(const BenchConfig& cfg)
 	const float seamTokenLR = cfg.token.atlasLR;
 	const float quasarTokenLR = cfg.token.atlasLR;
 	const float geodeTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_GEODE);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u)\n",
+	const float bimapTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_BIMAP);
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-BIMAP(lr=%.4f lowRank=%u cadence=%u)\n",
 	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
 	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
 	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
@@ -4850,8 +4942,8 @@ static bool run_token_case(const BenchConfig& cfg)
 	       rampartTokenLR, cfg.atlasComplementRank, meritTokenLR, cfg.atlasComplementRank,
 	       strataTokenLR, cfg.atlasComplementRank, auroraTokenLR, cfg.atlasComplementRank,
 	       seamTokenLR, cfg.atlasComplementRank, quasarTokenLR, cfg.atlasComplementRank,
-	       geodeTokenLR, cfg.atlasComplementRank);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f)\n",
+	       geodeTokenLR, cfg.atlasComplementRank, bimapTokenLR, cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence);
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) bimap(lowRank=%u geom=%.3f pred=%.3f cadence=%u)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
@@ -4865,12 +4957,13 @@ static bool run_token_case(const BenchConfig& cfg)
 	       cfg.atlasKappaEnabled, cfg.atlasKappaHeads, cfg.atlasKappaLagBuckets, cfg.atlasKappaRank,
 	       cfg.atlasAuroraAdamwBackbone,
 	       cfg.atlasAuroraHeadGain, cfg.atlasAuroraBodyTrustScale,
-	       cfg.atlasGeodeGeometryScale, cfg.atlasGeodePredictiveScale);
+	       cfg.atlasGeodeGeometryScale, cfg.atlasGeodePredictiveScale,
+	       cfg.atlasBiMAPLowRank, cfg.atlasBiMAPGeometryScale, cfg.atlasBiMAPPredictiveScale, cfg.atlasBiMAPFactorCadence);
 	printf("\n");
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_BIMAP };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	std::vector<VariantKind> summaryVariants;
@@ -4909,6 +5002,7 @@ static bool run_token_case(const BenchConfig& cfg)
 		int baseIndex = -1;
 		int auroraIndex = -1;
 		int geodeIndex = -1;
+		int bimapIndex = -1;
 		for (size_t i = 0; i < summaryVariants.size(); ++i)
 		{
 			if (summaryVariants[i] == VARIANT_ADAMW)
@@ -4919,8 +5013,10 @@ static bool run_token_case(const BenchConfig& cfg)
 				auroraIndex = static_cast<int>(i);
 			else if (summaryVariants[i] == VARIANT_ATLAS_GEODE)
 				geodeIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_BIMAP)
+				bimapIndex = static_cast<int>(i);
 		}
-		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0))
+		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || bimapIndex >= 0))
 		{
 			printf("  AdamW gap comparison:\n");
 			if (baseIndex >= 0)
@@ -4932,6 +5028,9 @@ static bool run_token_case(const BenchConfig& cfg)
 			if (geodeIndex >= 0)
 				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
 				                                 summaries[static_cast<size_t>(geodeIndex)]);
+			if (bimapIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(bimapIndex)]);
 		}
 	}
 	printf("\n");

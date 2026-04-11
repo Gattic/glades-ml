@@ -166,6 +166,20 @@ bool atlas_gpu_update(GpuAtlasWeightState& state,
                       shmea::GLogger* logger = 0,
                       const char* tag = 0);
 
+// Residual-only ATLAS update.
+// Uses the same subspace tracking and Fisher adaptation as atlas_gpu_update,
+// but skips decoupled weight decay and the full-space baseline step so callers
+// can layer ATLAS geometry on top of another backbone optimizer.
+bool atlas_gpu_residual_update(GpuAtlasWeightState& state,
+                               float* d_W, float* d_gW,
+                               unsigned int m, unsigned int n,
+                               float invBatch, float lr,
+                               float gradScale,
+                               const glades::ATLASConfig& ac,
+                               glades::rng::Engine& rng,
+                               shmea::GLogger* logger = 0,
+                               const char* tag = 0);
+
 // Retrieve diagnostic info from the current state.
 // Downloads Fisher diagonal from GPU — call sparingly (e.g. every tSub steps).
 AtlasGpuDiag atlas_gpu_get_diag(const GpuAtlasWeightState& state);
@@ -261,12 +275,19 @@ inline bool atlas_gpu_step(GpuAtlasWeightState&, float*, float*,
 inline AtlasGpuDiag atlas_gpu_get_diag(const GpuAtlasWeightState&)
 { return AtlasGpuDiag(); }
 inline bool atlas_gpu_update(GpuAtlasWeightState&, float*, float*,
-                              unsigned int, unsigned int,
-                              float, float, float, float, float,
-                              const glades::ATLASConfig&,
-                              glades::rng::Engine&,
-                              shmea::GLogger* = 0,
-                              const char* = 0) { return false; }
+                             unsigned int, unsigned int,
+                             float, float, float, float, float,
+                             const glades::ATLASConfig&,
+                             glades::rng::Engine&,
+                             shmea::GLogger* = 0,
+                             const char* = 0) { return false; }
+inline bool atlas_gpu_residual_update(GpuAtlasWeightState&, float*, float*,
+                                      unsigned int, unsigned int,
+                                      float, float, float,
+                                      const glades::ATLASConfig&,
+                                      glades::rng::Engine&,
+                                      shmea::GLogger* = 0,
+                                      const char* = 0) { return false; }
 inline bool atlas_gpu_guard(float*, size_t) { return false; }
 
 } // namespace gpu

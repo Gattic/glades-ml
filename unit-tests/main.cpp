@@ -156,6 +156,8 @@ int main(int argc, char* argv[])
 		ATLASGpuNaNTest();
 	    else if (strcmp(argv[1], "atlas-helm-micro") == 0)
 		ATLASHelmMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-bimap-micro") == 0)
+		ATLASBiMAPMicroBenchmark();
 	    else if (strcmp(argv[1], "atlas-bench") == 0)
 		ATLASBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "atlas-alt-bench") == 0)
