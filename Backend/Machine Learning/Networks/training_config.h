@@ -117,6 +117,10 @@ struct TransformerRunConfig
 	// unreasonably large allocations/compute. This is a deliberate "trainability triage"
 	// guardrail to avoid pretending CPU full-softmax is an LLM training solution.
 	bool tokenLmAllowHugeFullSoftmax;
+	// Benchmark-only hook: capture extra optimizer-gap diagnostics such as grouped
+	// update norms, head share, and token-margin summaries. This is intentionally
+	// off by default because it may snapshot pre/post weights around apply steps.
+	bool captureOptimizerGapDiagnostics;
 
 	// LayerNorm epsilon.
 	float layerNormEps;
@@ -166,6 +170,7 @@ struct TransformerRunConfig
 	      tokenLmLossKind(TOKEN_LM_FULL_SOFTMAX),
 	      tokenLmSampledNegatives(64),
 	      tokenLmAllowHugeFullSoftmax(false),
+	      captureOptimizerGapDiagnostics(false),
 	      layerNormEps(1e-5f),
 	      normType(NORM_LAYERNORM),
 	      positionalEncoding(POSENC_SINUSOIDAL),
@@ -671,6 +676,53 @@ struct ATLASConfig
 	// output-head-only, and keeps explicit complement modeling disabled.
 	bool asterEnabled;
 
+	// Enable AEGIS: an evidence-gated fusion branch that keeps the ATLAS-BSRP
+	// spatial base, enables SPARROW and ASTER together, and attenuates the
+	// output-space correction when predictive parameter-space evidence is
+	// already stronger on the current model state.
+	bool aegisEnabled;
+
+	// Enable CITADEL: a contextual trust-region refinement of AEGIS that
+	// downweights residual channels in disagreement-heavy or context-hard
+	// regimes and pushes the update back toward the spatial ATLAS base.
+	bool citadelEnabled;
+
+	// Enable RAMPART: a posterior-style residual fusion pass on top of the
+	// existing AEGIS signals. The minimal prototype keeps the current ATLAS
+	// backbone, infers a small three-channel posterior over
+	// {spatial, predictive, output}, and projects the non-spatial correction
+	// into an explicit residual budget.
+	bool rampartEnabled;
+
+	// Enable MERIT: a geometry-aware residual fusion branch that keeps the
+	// current ATLAS/BSRP backbone, treats spatial structure as geometry instead
+	// of a competing residual sensor, and solves only over predictive/output
+	// residual evidence inside an explicit trust budget.
+	bool meritEnabled;
+
+	// Enable STRATA: a sparse mode-selection controller around the existing
+	// AdamW/ATLAS backbone that chooses among {null, predictive, output,
+	// coupled} residual modes instead of densely blending all channels every
+	// step. The minimal prototype reuses SPARROW and ASTER as the actuators and
+	// only treats ATLAS/BSRP as mode-conditional geometry.
+	bool strataEnabled;
+
+	// Enable AURORA: a receding-horizon residual controller that forecasts
+	// predictive/output evidence one small step forward before solving a bounded
+	// two-sensor posterior around the existing ATLAS base.
+	bool auroraEnabled;
+
+	// Enable SEAM: a mirror-descent simplex controller over
+	// {spatial, predictive, output} coordinates. The current prototype updates a
+	// small coordinate system from delayed evidence instead of solving a dense
+	// posterior every boundary.
+	bool seamEnabled;
+
+	// Enable QUASAR: an entropy-regularized residual controller that maintains a
+	// soft distribution over {null, predictive, output, coupled} residual modes
+	// rather than selecting one mode hard.
+	bool quasarEnabled;
+
 	// Strength of the ASTER output-head memory / innovation correction.
 	float asterMemoryScale;
 
@@ -689,6 +741,154 @@ struct ATLASConfig
 	// Stability clamp for the ASTER latent pole surrogate. The pole is
 	// projected to [-asterPoleMax, asterPoleMax] each update.
 	float asterPoleMax;
+
+	// Enable KAPPA: a transformer-only retrieval-state observable that augments
+	// ASTER/AEGIS with compressed lagged KV summaries from the last decoder
+	// blocks. The minimal prototype is head-only and only affects token-LM runs.
+	bool kappaEnabled;
+
+	// Number of query heads per tracked decoder block that contribute to the
+	// compressed KAPPA retrieval observable.
+	unsigned int kappaHeads;
+
+	// Number of lag buckets used when compressing retrieval summaries. The
+	// current implementation supports up to 4 buckets.
+	unsigned int kappaLagBuckets;
+
+	// Number of projected value channels kept per head/lag KAPPA observable.
+	unsigned int kappaRank;
+
+	// Forecast blending coefficient used by AURORA when combining filtered and
+	// current predictive/output evidence into a short-horizon residual proposal.
+	float auroraHorizonBlend;
+
+	// Maximum D-metric residual budget for the AURORA predictive/output solve.
+	float auroraBudgetMax;
+
+	// When true, AURORA keeps its predictive/output controller but applies the
+	// resulting gradients through an AdamW backbone instead of the ATLAS/BSRP
+	// weight update. This is transformer-only in the current prototype.
+	bool auroraAdamwBackbone;
+
+	// Multiplicative gain applied to AURORA's head-local output correction when
+	// retrieval and margin signals indicate the current residual should act more
+	// like a head-dominant transformer adjustment.
+	float auroraHeadGain;
+
+	// Retention factor applied to non-head SPARROW trust inside AURORA once the
+	// controller decides to bias the step toward the token head. Values in
+	// [0, 1] keep the body closer to the ATLAS base while the head absorbs more
+	// of the residual budget.
+	float auroraBodyTrustScale;
+
+	// Enable GEODE: a transformer-only Adam-style optimizer that reuses ATLAS
+	// active subspace tracking as a low-rank geometry field and optionally
+	// blends a small SPARROW-style predictive correction inside that geometry.
+	bool geodeEnabled;
+
+	// Multiplicative strength of the ATLAS low-rank geometry term inside the
+	// GEODE Woodbury solve. 0 reduces GEODE to its diagonal Adam-style limit.
+	float geodeGeometryScale;
+
+	// Strength of the retained SPARROW active-mode correction when GEODE blends
+	// a small predictive adjustment into the active coordinates before solving
+	// the low-rank preconditioned step.
+	float geodePredictiveScale;
+
+	// Mirror-descent step size used by SEAM when updating its
+	// {spatial, predictive, output} coordinate simplex.
+	float seamMirrorStep;
+
+	// Maximum D-metric residual budget for SEAM's predictive/output correction.
+	float seamBudgetMax;
+
+	// Temperature used by QUASAR when turning delayed mode evidence into a soft
+	// residual-mode distribution. Lower values make the controller more peaked.
+	float quasarTemperature;
+
+	// Maximum D-metric residual budget for QUASAR's probabilistic residual.
+	float quasarBudgetMax;
+
+	// Relative scaling for AEGIS predictive evidence when comparing SPARROW and
+	// ASTER channel confidence.
+	float aegisPredictiveScale;
+
+	// Relative scaling for AEGIS output-space evidence when comparing SPARROW
+	// and ASTER channel confidence.
+	float aegisOutputScale;
+
+	// Baseline CITADEL anchor applied before contextual trust adjustments.
+	float citadelAnchorBase;
+
+	// Additional CITADEL anchor strength for hard transformer regimes.
+	float citadelHardRegimeScale;
+
+	// Additional CITADEL anchor strength from predictive/output disagreement.
+	float citadelDisagreementScale;
+
+	// Spatial-prior boost applied by CITADEL once the contextual anchor is
+	// computed.
+	float citadelSpatialScale;
+
+	// Minimum backbone precision used by the RAMPART posterior. Larger values
+	// keep the solution closer to the ATLAS/BSRP base even when the residual
+	// channels are confident.
+	float rampartTauMin;
+
+	// Maximum backbone precision used by the RAMPART posterior in uncertain or
+	// disagreement-heavy regimes.
+	float rampartTauMax;
+
+	// Maximum D-metric residual budget for the combined predictive/output
+	// correction after the posterior solve. Values in [0, 1] keep the residual
+	// bounded relative to the base step.
+	float rampartBudgetMax;
+
+	// Mixing coefficient for predictive/output covariance inside the RAMPART
+	// posterior. Higher values reduce double-counting when both residual sensors
+	// are strong and agree.
+	float rampartCovarianceMix;
+
+	// Multiplicative strength applied to MERIT's spatial geometry proxy when
+	// converting ATLAS active capture into a residual-budget modifier.
+	float meritGeometryScale;
+
+	// Minimum backbone precision used by the MERIT posterior. Larger values keep
+	// the residual correction closer to the ATLAS/BSRP geometry even when the
+	// predictive/output sensors are confident.
+	float meritTauMin;
+
+	// Maximum backbone precision used by the MERIT posterior in uncertain or
+	// disagreement-heavy regimes.
+	float meritTauMax;
+
+	// Maximum D-metric residual budget for MERIT's predictive/output correction.
+	float meritBudgetMax;
+
+	// Mixing coefficient for predictive/output covariance inside MERIT's
+	// two-sensor posterior.
+	float meritCovarianceMix;
+
+	// Baseline score offset for STRATA's null mode. Larger values make the
+	// controller stay closer to the AdamW/ATLAS backbone in uncertain regimes.
+	float strataNullBias;
+
+	// Penalty applied when STRATA switches away from the previous dominant mode.
+	// Larger values increase dwell time and reduce mode oscillation.
+	float strataDwellPenalty;
+
+	// Maximum D-metric residual budget for STRATA's selected predictive/output
+	// mode. Values in [0, 1] keep the residual bounded relative to the base
+	// step.
+	float strataBudgetMax;
+
+	// Multiplicative strength applied to ATLAS active-capture geometry when
+	// STRATA evaluates predictive-only mode candidates.
+	float strataPredictiveGeometryScale;
+
+	// Multiplicative strength applied to ATLAS active-capture geometry when
+	// STRATA evaluates coupled predictive/output mode candidates.
+	float strataCoupledGeometryScale;
 
 	// Fisher EMA decay rate. Controls how quickly the Fisher diagonal and
 	// normalized covariance trace adapt. Higher values (closer to 1) give more
@@ -822,11 +1022,55 @@ struct ATLASConfig
 	      helmHiddenStackDepth(2u),
 	      helmPoleMax(0.95f),
 	      asterEnabled(false),
+	      aegisEnabled(false),
+	      citadelEnabled(false),
+	      rampartEnabled(false),
+	      meritEnabled(false),
+	      strataEnabled(false),
+	      auroraEnabled(false),
+	      seamEnabled(false),
+	      quasarEnabled(false),
 	      asterMemoryScale(0.05f),
 	      asterEdgeThreshold(0.10f),
 	      asterStateRank(2u),
 	      asterHiddenStackDepth(2u),
 	      asterPoleMax(0.95f),
+	      kappaEnabled(false),
+	      kappaHeads(1u),
+	      kappaLagBuckets(4u),
+	      kappaRank(2u),
+	      auroraHorizonBlend(0.65f),
+	      auroraBudgetMax(0.70f),
+	      auroraAdamwBackbone(false),
+	      auroraHeadGain(1.0f),
+	      auroraBodyTrustScale(1.0f),
+	      geodeEnabled(false),
+	      geodeGeometryScale(1.0f),
+	      geodePredictiveScale(0.25f),
+	      seamMirrorStep(0.35f),
+	      seamBudgetMax(0.65f),
+	      quasarTemperature(0.60f),
+	      quasarBudgetMax(0.70f),
+	      aegisPredictiveScale(1.0f),
+	      aegisOutputScale(1.0f),
+	      citadelAnchorBase(0.0f),
+	      citadelHardRegimeScale(0.85f),
+	      citadelDisagreementScale(0.75f),
+	      citadelSpatialScale(4.0f),
+	      rampartTauMin(0.50f),
+	      rampartTauMax(4.00f),
+	      rampartBudgetMax(0.60f),
+	      rampartCovarianceMix(0.35f),
+	      meritGeometryScale(1.25f),
+	      meritTauMin(0.35f),
+	      meritTauMax(3.00f),
+	      meritBudgetMax(0.70f),
+	      meritCovarianceMix(0.30f),
+	      strataNullBias(0.20f),
+	      strataDwellPenalty(0.15f),
+	      strataBudgetMax(0.65f),
+	      strataPredictiveGeometryScale(0.75f),
+	      strataCoupledGeometryScale(0.45f),
 	      beta(0.999f),
 	      muMin(0.01f),
 	      muMax(0.3f),

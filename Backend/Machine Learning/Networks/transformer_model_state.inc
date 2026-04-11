@@ -128,15 +128,126 @@
 		atlas::WeightState atlasWOut;
 		atlas::WeightState atlasTokE;
 
+		// Benchmark-only grouped optimizer-gap diagnostics. These stay at the
+		// top level so AdamW and plain ATLAS-BSRP runs can report the same
+		// transformer profile without depending on ASTER state.
+		unsigned long long gapApplyCount;
+		double gapInputUpdateNormSum;
+		std::vector<double> gapBlockUpdateNormSums;
+		double gapFinalNormUpdateNormSum;
+		double gapHeadUpdateNormSum;
+		double gapHeadShareSum;
+		double gapNonHeadShareSum;
+		double gapApplyNsSum;
+		unsigned long long gapMarginSnapshotCount;
+		double gapTargetMarginSum;
+		double gapHardNegativeLogitSum;
+
+		struct HelmState
+		{
+			bool initialized;
+			unsigned int hiddenDim;
+			unsigned int outputDim;
+			unsigned int hiddenStackDepth;
+			unsigned int modeRank;
+			std::vector<unsigned int> trackedBlockIndices;
+			std::vector<float> prevHiddenMean;
+			std::vector<float> prevResidualMean;
+			std::vector<float> hiddenVar;
+			std::vector<float> residualVar;
+			std::vector<float> crossCov;
+			std::vector<float> sigma;
+			std::vector<float> leftMode;
+			std::vector<float> rightMode;
+			std::vector<float> batchHiddenSum;
+			std::vector<float> batchHiddenSqSum;
+			std::vector<float> batchResidualSum;
+			std::vector<float> batchResidualSqSum;
+			std::vector<float> latent;
+			std::vector<float> poleNumer;
+			std::vector<float> poleDenom;
+			std::vector<float> pole;
+			std::vector<float> forwardCorrection;
+			unsigned int batchTokenCount;
+			unsigned int lastActiveModes;
+			float lastEdge;
+			float lastSecondEdge;
+			float lastSecondEdgeRatio;
+			float lastSigma;
+			float lastPredR2;
+			float lastMemoryGain;
+
+			HelmState()
+			    : initialized(false),
+			      hiddenDim(0u),
+			      outputDim(0u),
+			      hiddenStackDepth(0u),
+			      modeRank(0u),
+			      batchTokenCount(0u),
+			      lastActiveModes(0u),
+			      lastEdge(0.0f),
+			      lastSecondEdge(0.0f),
+			      lastSecondEdgeRatio(0.0f),
+			      lastSigma(0.0f),
+			      lastPredR2(0.0f),
+			      lastMemoryGain(0.0f)
+			{
+			}
+
+			void reset()
+			{
+				initialized = false;
+				hiddenDim = 0u;
+				outputDim = 0u;
+				hiddenStackDepth = 0u;
+				modeRank = 0u;
+				trackedBlockIndices.clear();
+				prevHiddenMean.clear();
+				prevResidualMean.clear();
+				hiddenVar.clear();
+				residualVar.clear();
+				crossCov.clear();
+				sigma.clear();
+				leftMode.clear();
+				rightMode.clear();
+				batchHiddenSum.clear();
+				batchHiddenSqSum.clear();
+				batchResidualSum.clear();
+				batchResidualSqSum.clear();
+				latent.clear();
+				poleNumer.clear();
+				poleDenom.clear();
+				pole.clear();
+				forwardCorrection.clear();
+				batchTokenCount = 0u;
+				lastActiveModes = 0u;
+				lastEdge = 0.0f;
+				lastSecondEdge = 0.0f;
+				lastSecondEdgeRatio = 0.0f;
+				lastSigma = 0.0f;
+				lastPredR2 = 0.0f;
+				lastMemoryGain = 0.0f;
+			}
+		};
+
 		struct AsterState
 		{
 			bool initialized;
+			unsigned int regimeCount;
 			unsigned int sketchDim;
+			unsigned int supportDim;
+			unsigned int tokenCondDim;
+			unsigned int kappaObsDim;
+			unsigned int kappaHeads;
+			unsigned int kappaLagBuckets;
+			unsigned int kappaRank;
 			unsigned int controlDim;
 			unsigned int hiddenStackDepth;
 			unsigned int stateRank;
 			std::vector<unsigned int> trackedBlockIndices;
+			std::vector<float> prevPrevControlMean;
 			std::vector<float> prevControlMean;
+			std::vector<float> prevPrevResidualMean;
 			std::vector<float> prevResidualMean;
 			std::vector<float> controlVar;
 			std::vector<float> residualVar;
@@ -154,10 +265,29 @@
 			std::vector<float> rightMode;
 			std::vector<float> batchFinalHiddenRawSum;
 			std::vector<float> batchFinalHiddenSketchSum;
+			std::vector<float> batchLayerHiddenRawSum;
 			std::vector<float> batchLayerHiddenSketchSum;
+			std::vector<float> batchLayerAttnRawSum;
+			std::vector<float> batchLayerAttnSketchSum;
+			std::vector<float> batchLayerPatternSum;
+			std::vector<float> batchLayerKappaSum;
 			std::vector<float> batchResidualSum;
+			std::vector<float> batchSupportLogitSum;
+			std::vector<float> batchSupportResidualSum;
+			std::vector<float> batchSupportCount;
+			std::vector<float> batchSupportHiddenRawSum;
+			std::vector<float> batchTargetMarginSum;
+			std::vector<float> batchHardNegativeLogitSum;
+			std::vector<float> batchBaselineWorseSum;
 			std::vector<unsigned int> batchTouchedIds;
+			std::vector<unsigned int> batchSupportIds;
+			std::vector<float> batchSupportRoleCounts;
+			std::vector<float> batchRegimeTokenCount;
 			unsigned int batchTokenCount;
+			std::vector<float> targetMarginEma;
+			std::vector<float> hardNegativeLogitEma;
+			std::vector<float> hardMarginShortfallEma;
+			std::vector<float> prevPrevLatent;
 			std::vector<float> latent;
 			std::vector<float> poleNumer;
 			std::vector<float> poleDenom;
@@ -169,6 +299,48 @@
 			float lastSigma;
 			float lastPredR2;
 			float lastMemoryGain;
+			float lastPoleSummary;
+			float aegisPredictiveErrorEma;
+			float aegisOutputErrorEma;
+			float aegisPrevPredictiveScore;
+			float aegisPrevOutputScore;
+			float aegisLastLambdaSpatial;
+			float aegisLastLambdaPredictive;
+			float aegisLastLambdaOutput;
+			float aegisLastPredictivePredicted;
+			float aegisLastPredictiveRealized;
+			float aegisLastOutputPredicted;
+			float aegisLastOutputRealized;
+			float aegisLastChannelDisagreement;
+			float citadelPredictiveTrustEma;
+			float citadelOutputTrustEma;
+			float citadelLastAnchor;
+			float citadelLastHardRegimeMass;
+			float citadelLastSparrowTrust;
+			float rampartLastTau;
+			float rampartLastBudget;
+			float rampartLastCovariance;
+			float rampartLastSparrowTrust;
+			float meritLastTau;
+			float meritLastBudget;
+			float meritLastCovariance;
+			float meritLastSparrowTrust;
+			float meritLastGeometryTrust;
+			float strataLastNullMode;
+			float strataLastPredictiveMode;
+			float strataLastOutputMode;
+			float strataLastCoupledMode;
+			float strataLastBudget;
+			float strataNullBenefitEma;
+			float strataPredictiveBenefitEma;
+			float strataOutputBenefitEma;
+			float strataCoupledBenefitEma;
+			float strataLastNullBenefit;
+			float strataLastPredictiveBenefit;
+			float strataLastOutputBenefit;
+			float strataLastCoupledBenefit;
+			float strataLastSelectedExcess;
+			float strataLastSwitchRate;
 			unsigned long long timingBoundaryCount;
 			double totalBoundaryNs;
 			double totalSetupNs;
@@ -180,7 +352,14 @@
 
 			AsterState()
 			    : initialized(false),
+			      regimeCount(0u),
 			      sketchDim(0u),
+			      supportDim(0u),
+			      tokenCondDim(0u),
+			      kappaObsDim(0u),
+			      kappaHeads(0u),
+			      kappaLagBuckets(0u),
+			      kappaRank(0u),
 			      controlDim(0u),
 			      hiddenStackDepth(0u),
 			      stateRank(0u),
@@ -192,6 +371,48 @@
 			      lastSigma(0.0f),
 			      lastPredR2(0.0f),
 			      lastMemoryGain(0.0f),
+			      lastPoleSummary(0.0f),
+			      aegisPredictiveErrorEma(0.0f),
+			      aegisOutputErrorEma(0.0f),
+			      aegisPrevPredictiveScore(0.0f),
+			      aegisPrevOutputScore(0.0f),
+			      aegisLastLambdaSpatial(0.0f),
+			      aegisLastLambdaPredictive(0.0f),
+			      aegisLastLambdaOutput(0.0f),
+			      aegisLastPredictivePredicted(0.0f),
+			      aegisLastPredictiveRealized(0.0f),
+			      aegisLastOutputPredicted(0.0f),
+			      aegisLastOutputRealized(0.0f),
+			      aegisLastChannelDisagreement(0.0f),
+			      citadelPredictiveTrustEma(0.0f),
+			      citadelOutputTrustEma(0.0f),
+			      citadelLastAnchor(0.0f),
+			      citadelLastHardRegimeMass(0.0f),
+			      citadelLastSparrowTrust(1.0f),
+			      rampartLastTau(0.0f),
+			      rampartLastBudget(0.0f),
+			      rampartLastCovariance(0.0f),
+			      rampartLastSparrowTrust(1.0f),
+			      meritLastTau(0.0f),
+			      meritLastBudget(0.0f),
+			      meritLastCovariance(0.0f),
+			      meritLastSparrowTrust(1.0f),
+			      meritLastGeometryTrust(0.0f),
+			      strataLastNullMode(1.0f),
+			      strataLastPredictiveMode(0.0f),
+			      strataLastOutputMode(0.0f),
+			      strataLastCoupledMode(0.0f),
+			      strataLastBudget(0.0f),
+			      strataNullBenefitEma(0.0f),
+			      strataPredictiveBenefitEma(0.0f),
+			      strataOutputBenefitEma(0.0f),
+			      strataCoupledBenefitEma(0.0f),
+			      strataLastNullBenefit(0.0f),
+			      strataLastPredictiveBenefit(0.0f),
+			      strataLastOutputBenefit(0.0f),
+			      strataLastCoupledBenefit(0.0f),
+			      strataLastSelectedExcess(0.0f),
+			      strataLastSwitchRate(0.0f),
 			      timingBoundaryCount(0ULL),
 			      totalBoundaryNs(0.0),
 			      totalSetupNs(0.0),
@@ -206,12 +427,21 @@
 			void reset()
 			{
 				initialized = false;
+				regimeCount = 0u;
 				sketchDim = 0u;
+				supportDim = 0u;
+				tokenCondDim = 0u;
+				kappaObsDim = 0u;
+				kappaHeads = 0u;
+				kappaLagBuckets = 0u;
+				kappaRank = 0u;
 				controlDim = 0u;
 				hiddenStackDepth = 0u;
 				stateRank = 0u;
 				trackedBlockIndices.clear();
+				prevPrevControlMean.clear();
 				prevControlMean.clear();
+				prevPrevResidualMean.clear();
 				prevResidualMean.clear();
 				controlVar.clear();
 				residualVar.clear();
@@ -229,10 +459,29 @@
 				rightMode.clear();
 				batchFinalHiddenRawSum.clear();
 				batchFinalHiddenSketchSum.clear();
+				batchLayerHiddenRawSum.clear();
 				batchLayerHiddenSketchSum.clear();
+				batchLayerAttnRawSum.clear();
+				batchLayerAttnSketchSum.clear();
+				batchLayerPatternSum.clear();
+				batchLayerKappaSum.clear();
 				batchResidualSum.clear();
+				batchSupportLogitSum.clear();
+				batchSupportResidualSum.clear();
+				batchSupportCount.clear();
+				batchSupportHiddenRawSum.clear();
+				batchTargetMarginSum.clear();
+				batchHardNegativeLogitSum.clear();
+				batchBaselineWorseSum.clear();
 				batchTouchedIds.clear();
+				batchSupportIds.clear();
+				batchSupportRoleCounts.clear();
+				batchRegimeTokenCount.clear();
 				batchTokenCount = 0u;
+				targetMarginEma.clear();
+				hardNegativeLogitEma.clear();
+				hardMarginShortfallEma.clear();
+				prevPrevLatent.clear();
 				latent.clear();
 				poleNumer.clear();
 				poleDenom.clear();
@@ -244,6 +493,48 @@
 				lastSigma = 0.0f;
 				lastPredR2 = 0.0f;
 				lastMemoryGain = 0.0f;
+				lastPoleSummary = 0.0f;
+				aegisPredictiveErrorEma = 0.0f;
+				aegisOutputErrorEma = 0.0f;
+				aegisPrevPredictiveScore = 0.0f;
+				aegisPrevOutputScore = 0.0f;
+				aegisLastLambdaSpatial = 0.0f;
+				aegisLastLambdaPredictive = 0.0f;
+				aegisLastLambdaOutput = 0.0f;
+				aegisLastPredictivePredicted = 0.0f;
+				aegisLastPredictiveRealized = 0.0f;
+				aegisLastOutputPredicted = 0.0f;
+				aegisLastOutputRealized = 0.0f;
+				aegisLastChannelDisagreement = 0.0f;
+				citadelPredictiveTrustEma = 0.0f;
+				citadelOutputTrustEma = 0.0f;
+				citadelLastAnchor = 0.0f;
+				citadelLastHardRegimeMass = 0.0f;
+				citadelLastSparrowTrust = 1.0f;
+				rampartLastTau = 0.0f;
+				rampartLastBudget = 0.0f;
+				rampartLastCovariance = 0.0f;
+				rampartLastSparrowTrust = 1.0f;
+				meritLastTau = 0.0f;
+				meritLastBudget = 0.0f;
+				meritLastCovariance = 0.0f;
+				meritLastSparrowTrust = 1.0f;
+				meritLastGeometryTrust = 0.0f;
+				strataLastNullMode = 1.0f;
+				strataLastPredictiveMode = 0.0f;
+				strataLastOutputMode = 0.0f;
+				strataLastCoupledMode = 0.0f;
+				strataLastBudget = 0.0f;
+				strataNullBenefitEma = 0.0f;
+				strataPredictiveBenefitEma = 0.0f;
+				strataOutputBenefitEma = 0.0f;
+				strataCoupledBenefitEma = 0.0f;
+				strataLastNullBenefit = 0.0f;
+				strataLastPredictiveBenefit = 0.0f;
+				strataLastOutputBenefit = 0.0f;
+				strataLastCoupledBenefit = 0.0f;
+				strataLastSelectedExcess = 0.0f;
+				strataLastSwitchRate = 0.0f;
 				timingBoundaryCount = 0ULL;
 				totalBoundaryNs = 0.0;
 				totalSetupNs = 0.0;
@@ -279,6 +570,7 @@
 		// Dynamic loss scaling state.
 		float mpLossScale;
 		int mpLossScaleGoodSteps;
+		HelmState helm;
 		AsterState aster;
 
 		TensorTransformerState()
@@ -299,6 +591,17 @@
 		      padTokenId(-1),
 		      tieEmbeddings(true),
 		      optimizerStep(0ULL),
+		      gapApplyCount(0ULL),
+		      gapInputUpdateNormSum(0.0),
+		      gapBlockUpdateNormSums(),
+		      gapFinalNormUpdateNormSum(0.0),
+		      gapHeadUpdateNormSum(0.0),
+		      gapHeadShareSum(0.0),
+		      gapNonHeadShareSum(0.0),
+		      gapApplyNsSum(0.0),
+		      gapMarginSnapshotCount(0ULL),
+		      gapTargetMarginSum(0.0),
+		      gapHardNegativeLogitSum(0.0),
 		      adamBeta1Power(1.0),
 		      adamBeta2Power(1.0),
 		      mpLowpReady(false),
@@ -325,6 +628,17 @@
 			padTokenId = -1;
 			tieEmbeddings = true;
 			optimizerStep = 0ULL;
+			gapApplyCount = 0ULL;
+			gapInputUpdateNormSum = 0.0;
+			gapBlockUpdateNormSums.clear();
+			gapFinalNormUpdateNormSum = 0.0;
+			gapHeadUpdateNormSum = 0.0;
+			gapHeadShareSum = 0.0;
+			gapNonHeadShareSum = 0.0;
+			gapApplyNsSum = 0.0;
+			gapMarginSnapshotCount = 0ULL;
+			gapTargetMarginSum = 0.0;
+			gapHardNegativeLogitSum = 0.0;
 			adamBeta1Power = 1.0;
 			adamBeta2Power = 1.0;
 			mpLowpReady = false;
@@ -342,6 +656,7 @@
 			WOut.clear(); WOutLowp.clear(); vWOut.clear(); v2WOut.clear(); gWOut.clear();
 			bOut.clear(); mBOut.clear(); v2BOut.clear(); gBOut.clear();
 			blocks.clear();
+			helm.reset();
 			aster.reset();
 		}
 	};

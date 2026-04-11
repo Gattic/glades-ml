@@ -17,6 +17,9 @@
 #include <sys/time.h>
 
 #include <cmath>
+#include <iomanip>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -130,11 +133,49 @@ struct CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 	double atlasAsterStateFitMsSum;
 	double atlasAsterInnovationFitMsSum;
 	double atlasAsterApplyMsSum;
+	double atlasAegisLambdaSpatialSum;
+	double atlasAegisLambdaPredictiveSum;
+	double atlasAegisLambdaOutputSum;
+	double atlasAegisPredictivePredictedSum;
+	double atlasAegisPredictiveRealizedSum;
+	double atlasAegisOutputPredictedSum;
+	double atlasAegisOutputRealizedSum;
+	double atlasAegisPredictiveErrorSum;
+	double atlasAegisOutputErrorSum;
+	double atlasAegisChannelDisagreementSum;
+	double atlasCitadelAnchorSum;
+	double atlasCitadelHardRegimeMassSum;
+	double atlasCitadelSparrowTrustSum;
+	double atlasRampartTauSum;
+	double atlasRampartBudgetSum;
+	double atlasRampartCovarianceSum;
+	double atlasRampartSparrowTrustSum;
+	double atlasMeritTauSum;
+	double atlasMeritBudgetSum;
+	double atlasMeritCovarianceSum;
+	double atlasMeritSparrowTrustSum;
+	double atlasMeritGeometryTrustSum;
+	double atlasStrataNullModeSum;
+	double atlasStrataPredictiveModeSum;
+	double atlasStrataOutputModeSum;
+	double atlasStrataCoupledModeSum;
+	double atlasStrataBudgetSum;
+	double atlasStrataNullBenefitSum;
+	double atlasStrataPredictiveBenefitSum;
+	double atlasStrataOutputBenefitSum;
+	double atlasStrataCoupledBenefitSum;
+	double atlasStrataSelectedExcessSum;
+	double atlasStrataSwitchRateSum;
 	unsigned int atlasHelmMode2Epochs;
 	unsigned int atlasSparrowEpochs;
 	unsigned int atlasHelmEpochs;
 	unsigned int atlasAsterMode2Epochs;
 	unsigned int atlasAsterEpochs;
+	unsigned int atlasAegisEpochs;
+	unsigned int atlasCitadelEpochs;
+	unsigned int atlasRampartEpochs;
+	unsigned int atlasMeritEpochs;
+	unsigned int atlasStrataEpochs;
 
 	CaptureMetricsCallbacks()
 	    : last(),
@@ -169,11 +210,49 @@ struct CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 	      atlasAsterStateFitMsSum(0.0),
 	      atlasAsterInnovationFitMsSum(0.0),
 	      atlasAsterApplyMsSum(0.0),
+	      atlasAegisLambdaSpatialSum(0.0),
+	      atlasAegisLambdaPredictiveSum(0.0),
+	      atlasAegisLambdaOutputSum(0.0),
+	      atlasAegisPredictivePredictedSum(0.0),
+	      atlasAegisPredictiveRealizedSum(0.0),
+	      atlasAegisOutputPredictedSum(0.0),
+	      atlasAegisOutputRealizedSum(0.0),
+	      atlasAegisPredictiveErrorSum(0.0),
+	      atlasAegisOutputErrorSum(0.0),
+	      atlasAegisChannelDisagreementSum(0.0),
+	      atlasCitadelAnchorSum(0.0),
+	      atlasCitadelHardRegimeMassSum(0.0),
+	      atlasCitadelSparrowTrustSum(0.0),
+	      atlasRampartTauSum(0.0),
+	      atlasRampartBudgetSum(0.0),
+	      atlasRampartCovarianceSum(0.0),
+	      atlasRampartSparrowTrustSum(0.0),
+	      atlasMeritTauSum(0.0),
+	      atlasMeritBudgetSum(0.0),
+	      atlasMeritCovarianceSum(0.0),
+	      atlasMeritSparrowTrustSum(0.0),
+	      atlasMeritGeometryTrustSum(0.0),
+	      atlasStrataNullModeSum(0.0),
+	      atlasStrataPredictiveModeSum(0.0),
+	      atlasStrataOutputModeSum(0.0),
+	      atlasStrataCoupledModeSum(0.0),
+	      atlasStrataBudgetSum(0.0),
+	      atlasStrataNullBenefitSum(0.0),
+	      atlasStrataPredictiveBenefitSum(0.0),
+	      atlasStrataOutputBenefitSum(0.0),
+	      atlasStrataCoupledBenefitSum(0.0),
+	      atlasStrataSelectedExcessSum(0.0),
+	      atlasStrataSwitchRateSum(0.0),
 	      atlasHelmMode2Epochs(0u),
 	      atlasSparrowEpochs(0u),
 	      atlasHelmEpochs(0u),
 	      atlasAsterMode2Epochs(0u),
-	      atlasAsterEpochs(0u)
+	      atlasAsterEpochs(0u),
+	      atlasAegisEpochs(0u),
+	      atlasCitadelEpochs(0u),
+	      atlasRampartEpochs(0u),
+	      atlasMeritEpochs(0u),
+	      atlasStrataEpochs(0u)
 	{
 	}
 
@@ -185,7 +264,8 @@ struct CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 		glades::NNetwork::AtlasRuntimeDiagnostics diag;
 		if (net.getAtlasRuntimeDiagnostics(diag))
 		{
-			if (diag.sparrowMatrices > 0u || diag.helmMatrices > 0u || diag.asterMatrices > 0u)
+			if (diag.sparrowMatrices > 0u || diag.helmMatrices > 0u || diag.asterMatrices > 0u
+			    || diag.aegisMatrices > 0u || diag.meritMatrices > 0u || diag.strataMatrices > 0u)
 				sawAtlas = true;
 			if (diag.sparrowMatrices > 0u)
 			{
@@ -231,6 +311,59 @@ struct CaptureMetricsCallbacks : public glades::ITrainingCallbacks
 				if (diag.asterMode2Fraction > 0.0)
 					atlasAsterMode2Epochs += 1u;
 				atlasAsterEpochs += 1u;
+			}
+			if (diag.aegisMatrices > 0u)
+			{
+				atlasAegisLambdaSpatialSum += diag.aegisMeanLambdaSpatial;
+				atlasAegisLambdaPredictiveSum += diag.aegisMeanLambdaPredictive;
+				atlasAegisLambdaOutputSum += diag.aegisMeanLambdaOutput;
+				atlasAegisPredictivePredictedSum += diag.aegisMeanPredictivePredicted;
+				atlasAegisPredictiveRealizedSum += diag.aegisMeanPredictiveRealized;
+				atlasAegisOutputPredictedSum += diag.aegisMeanOutputPredicted;
+				atlasAegisOutputRealizedSum += diag.aegisMeanOutputRealized;
+				atlasAegisPredictiveErrorSum += diag.aegisMeanPredictiveError;
+				atlasAegisOutputErrorSum += diag.aegisMeanOutputError;
+				atlasAegisChannelDisagreementSum += diag.aegisMeanChannelDisagreement;
+				atlasAegisEpochs += 1u;
+			}
+			if (diag.citadelMatrices > 0u)
+			{
+				atlasCitadelAnchorSum += diag.citadelMeanAnchor;
+				atlasCitadelHardRegimeMassSum += diag.citadelMeanHardRegimeMass;
+				atlasCitadelSparrowTrustSum += diag.citadelMeanSparrowTrust;
+				atlasCitadelEpochs += 1u;
+			}
+			if (diag.rampartMatrices > 0u)
+			{
+				atlasRampartTauSum += diag.rampartMeanTau;
+				atlasRampartBudgetSum += diag.rampartMeanBudget;
+				atlasRampartCovarianceSum += diag.rampartMeanCovariance;
+				atlasRampartSparrowTrustSum += diag.rampartMeanSparrowTrust;
+				atlasRampartEpochs += 1u;
+			}
+			if (diag.meritMatrices > 0u)
+			{
+				atlasMeritTauSum += diag.meritMeanTau;
+				atlasMeritBudgetSum += diag.meritMeanBudget;
+				atlasMeritCovarianceSum += diag.meritMeanCovariance;
+				atlasMeritSparrowTrustSum += diag.meritMeanSparrowTrust;
+				atlasMeritGeometryTrustSum += diag.meritMeanGeometryTrust;
+				atlasMeritEpochs += 1u;
+			}
+			if (diag.strataMatrices > 0u)
+			{
+				atlasStrataNullModeSum += diag.strataMeanNullMode;
+				atlasStrataPredictiveModeSum += diag.strataMeanPredictiveMode;
+				atlasStrataOutputModeSum += diag.strataMeanOutputMode;
+				atlasStrataCoupledModeSum += diag.strataMeanCoupledMode;
+				atlasStrataBudgetSum += diag.strataMeanBudget;
+				atlasStrataNullBenefitSum += diag.strataMeanNullBenefit;
+				atlasStrataPredictiveBenefitSum += diag.strataMeanPredictiveBenefit;
+				atlasStrataOutputBenefitSum += diag.strataMeanOutputBenefit;
+				atlasStrataCoupledBenefitSum += diag.strataMeanCoupledBenefit;
+				atlasStrataSelectedExcessSum += diag.strataMeanSelectedExcess;
+				atlasStrataSwitchRateSum += diag.strataMeanSwitchRate;
+				atlasStrataEpochs += 1u;
 			}
 		}
 		return false;
@@ -376,7 +509,12 @@ enum BenchMode
 	MODE_TEACHER_SWEEP = 4,
 	MODE_TEACHER_CANONICAL = 5,
 	MODE_NONLINEAR_FORECAST = 6,
-	MODE_TOKEN_LM_LARGE = 7
+	MODE_TOKEN_LM_LARGE = 7,
+	MODE_TOKEN_LM_CONTEXT = 8,
+	MODE_TOKEN_LM_CONTEXT_LARGE = 9,
+	MODE_TOKEN_LM_DOCUMENT = 10,
+	MODE_TOKEN_LM_CORPUS = 11,
+	MODE_TOKEN_LM_CORPUS_LARGE = 12
 };
 
 enum VariantKind
@@ -385,7 +523,16 @@ enum VariantKind
 	VARIANT_ATLAS_BASE = 1,
 	VARIANT_ATLAS_SPARROW = 2,
 	VARIANT_ATLAS_HELM = 3,
-	VARIANT_ATLAS_ASTER = 4
+	VARIANT_ATLAS_ASTER = 4,
+	VARIANT_ATLAS_AEGIS = 5,
+	VARIANT_ATLAS_CITADEL = 6,
+	VARIANT_ATLAS_RAMPART = 7,
+	VARIANT_ATLAS_MERIT = 8,
+	VARIANT_ATLAS_STRATA = 9,
+	VARIANT_ATLAS_AURORA = 10,
+	VARIANT_ATLAS_SEAM = 11,
+	VARIANT_ATLAS_QUASAR = 12,
+	VARIANT_ATLAS_GEODE = 13
 };
 
 enum VariantSelection
@@ -395,7 +542,16 @@ enum VariantSelection
 	VARIANT_SELECTION_ATLAS_BASE = 2,
 	VARIANT_SELECTION_ATLAS_SPARROW = 3,
 	VARIANT_SELECTION_ATLAS_HELM = 4,
-	VARIANT_SELECTION_ATLAS_ASTER = 5
+	VARIANT_SELECTION_ATLAS_ASTER = 5,
+	VARIANT_SELECTION_ATLAS_AEGIS = 6,
+	VARIANT_SELECTION_ATLAS_CITADEL = 7,
+	VARIANT_SELECTION_ATLAS_RAMPART = 8,
+	VARIANT_SELECTION_ATLAS_MERIT = 9,
+	VARIANT_SELECTION_ATLAS_STRATA = 10,
+	VARIANT_SELECTION_ATLAS_AURORA = 11,
+	VARIANT_SELECTION_ATLAS_SEAM = 12,
+	VARIANT_SELECTION_ATLAS_QUASAR = 13,
+	VARIANT_SELECTION_ATLAS_GEODE = 14
 };
 
 struct TokenConfig
@@ -529,6 +685,15 @@ struct BenchConfig
 	unsigned int atlasAsterStateRank;
 	unsigned int atlasAsterHiddenStackDepth;
 	float atlasAsterPoleMax;
+	unsigned int atlasKappaEnabled;
+	unsigned int atlasKappaHeads;
+	unsigned int atlasKappaLagBuckets;
+	unsigned int atlasKappaRank;
+	unsigned int atlasAuroraAdamwBackbone;
+	float atlasAuroraHeadGain;
+	float atlasAuroraBodyTrustScale;
+	float atlasGeodeGeometryScale;
+	float atlasGeodePredictiveScale;
 	TokenConfig token;
 	TeacherConfig teacher;
 	LatentConfig latent;
@@ -561,6 +726,15 @@ struct BenchConfig
 	      atlasAsterStateRank(2u),
 	      atlasAsterHiddenStackDepth(2u),
 	      atlasAsterPoleMax(0.95f),
+	      atlasKappaEnabled(0u),
+	      atlasKappaHeads(1u),
+	      atlasKappaLagBuckets(4u),
+	      atlasKappaRank(2u),
+	      atlasAuroraAdamwBackbone(1u),
+	      atlasAuroraHeadGain(3.0f),
+	      atlasAuroraBodyTrustScale(0.60f),
+	      atlasGeodeGeometryScale(1.0f),
+	      atlasGeodePredictiveScale(0.25f),
 	      token(),
 	      teacher(),
 	      latent(),
@@ -659,6 +833,58 @@ struct RunResult
 	double asterStateFitMs;
 	double asterInnovationFitMs;
 	double asterApplyMs;
+	bool aegisDiagValid;
+	double aegisLambdaSpatial;
+	double aegisLambdaPredictive;
+	double aegisLambdaOutput;
+	double aegisPredictivePredicted;
+	double aegisPredictiveRealized;
+	double aegisOutputPredicted;
+	double aegisOutputRealized;
+	double aegisPredictiveError;
+	double aegisOutputError;
+	double aegisChannelDisagreement;
+	bool citadelDiagValid;
+	double citadelAnchor;
+	double citadelHardRegimeMass;
+	double citadelSparrowTrust;
+	bool rampartDiagValid;
+	double rampartTau;
+	double rampartBudget;
+	double rampartCovariance;
+	double rampartSparrowTrust;
+	bool meritDiagValid;
+	double meritTau;
+	double meritBudget;
+	double meritCovariance;
+	double meritSparrowTrust;
+	double meritGeometryTrust;
+	bool strataDiagValid;
+	double strataNullMode;
+	double strataPredictiveMode;
+	double strataOutputMode;
+	double strataCoupledMode;
+	double strataBudget;
+	double strataNullBenefit;
+	double strataPredictiveBenefit;
+	double strataOutputBenefit;
+	double strataCoupledBenefit;
+	double strataSelectedExcess;
+	double strataSwitchRate;
+	bool transformerGapDiagValid;
+	double transformerInputUpdateNorm;
+	std::vector<double> transformerBlockUpdateNorms;
+	double transformerFinalNormUpdateNorm;
+	double transformerHeadUpdateNorm;
+	double transformerHeadShare;
+	double transformerNonHeadShare;
+	double transformerApplyMs;
+	bool transformerTrainMarginValid;
+	double transformerTrainTargetMargin;
+	double transformerTrainHardNegativeLogit;
+	bool transformerTestMarginValid;
+	double transformerTestTargetMargin;
+	double transformerTestHardNegativeLogit;
 	bool ok;
 	std::string err;
 
@@ -703,6 +929,58 @@ struct RunResult
 	      asterStateFitMs(0.0),
 	      asterInnovationFitMs(0.0),
 	      asterApplyMs(0.0),
+	      aegisDiagValid(false),
+	      aegisLambdaSpatial(0.0),
+	      aegisLambdaPredictive(0.0),
+	      aegisLambdaOutput(0.0),
+	      aegisPredictivePredicted(0.0),
+	      aegisPredictiveRealized(0.0),
+	      aegisOutputPredicted(0.0),
+	      aegisOutputRealized(0.0),
+	      aegisPredictiveError(0.0),
+	      aegisOutputError(0.0),
+	      aegisChannelDisagreement(0.0),
+	      citadelDiagValid(false),
+	      citadelAnchor(0.0),
+	      citadelHardRegimeMass(0.0),
+	      citadelSparrowTrust(0.0),
+	      rampartDiagValid(false),
+	      rampartTau(0.0),
+	      rampartBudget(0.0),
+	      rampartCovariance(0.0),
+	      rampartSparrowTrust(0.0),
+	      meritDiagValid(false),
+	      meritTau(0.0),
+	      meritBudget(0.0),
+	      meritCovariance(0.0),
+	      meritSparrowTrust(0.0),
+	      meritGeometryTrust(0.0),
+	      strataDiagValid(false),
+	      strataNullMode(0.0),
+	      strataPredictiveMode(0.0),
+	      strataOutputMode(0.0),
+	      strataCoupledMode(0.0),
+	      strataBudget(0.0),
+	      strataNullBenefit(0.0),
+	      strataPredictiveBenefit(0.0),
+	      strataOutputBenefit(0.0),
+	      strataCoupledBenefit(0.0),
+	      strataSelectedExcess(0.0),
+	      strataSwitchRate(0.0),
+	      transformerGapDiagValid(false),
+	      transformerInputUpdateNorm(0.0),
+	      transformerBlockUpdateNorms(),
+	      transformerFinalNormUpdateNorm(0.0),
+	      transformerHeadUpdateNorm(0.0),
+	      transformerHeadShare(0.0),
+	      transformerNonHeadShare(0.0),
+	      transformerApplyMs(0.0),
+	      transformerTrainMarginValid(false),
+	      transformerTrainTargetMargin(0.0),
+	      transformerTrainHardNegativeLogit(0.0),
+	      transformerTestMarginValid(false),
+	      transformerTestTargetMargin(0.0),
+	      transformerTestHardNegativeLogit(0.0),
 	      ok(true),
 	      err()
 	{
@@ -757,6 +1035,58 @@ struct Summary
 	AggregateStats asterStateFitMs;
 	AggregateStats asterInnovationFitMs;
 	AggregateStats asterApplyMs;
+	bool aegisDiagValid;
+	AggregateStats aegisLambdaSpatial;
+	AggregateStats aegisLambdaPredictive;
+	AggregateStats aegisLambdaOutput;
+	AggregateStats aegisPredictivePredicted;
+	AggregateStats aegisPredictiveRealized;
+	AggregateStats aegisOutputPredicted;
+	AggregateStats aegisOutputRealized;
+	AggregateStats aegisPredictiveError;
+	AggregateStats aegisOutputError;
+	AggregateStats aegisChannelDisagreement;
+	bool citadelDiagValid;
+	AggregateStats citadelAnchor;
+	AggregateStats citadelHardRegimeMass;
+	AggregateStats citadelSparrowTrust;
+	bool rampartDiagValid;
+	AggregateStats rampartTau;
+	AggregateStats rampartBudget;
+	AggregateStats rampartCovariance;
+	AggregateStats rampartSparrowTrust;
+	bool meritDiagValid;
+	AggregateStats meritTau;
+	AggregateStats meritBudget;
+	AggregateStats meritCovariance;
+	AggregateStats meritSparrowTrust;
+	AggregateStats meritGeometryTrust;
+	bool strataDiagValid;
+	AggregateStats strataNullMode;
+	AggregateStats strataPredictiveMode;
+	AggregateStats strataOutputMode;
+	AggregateStats strataCoupledMode;
+	AggregateStats strataBudget;
+	AggregateStats strataNullBenefit;
+	AggregateStats strataPredictiveBenefit;
+	AggregateStats strataOutputBenefit;
+	AggregateStats strataCoupledBenefit;
+	AggregateStats strataSelectedExcess;
+	AggregateStats strataSwitchRate;
+	bool transformerGapDiagValid;
+	AggregateStats transformerInputUpdateNorm;
+	std::vector<AggregateStats> transformerBlockUpdateNorms;
+	AggregateStats transformerFinalNormUpdateNorm;
+	AggregateStats transformerHeadUpdateNorm;
+	AggregateStats transformerHeadShare;
+	AggregateStats transformerNonHeadShare;
+	AggregateStats transformerApplyMs;
+	bool transformerTrainMarginValid;
+	AggregateStats transformerTrainTargetMargin;
+	AggregateStats transformerTrainHardNegativeLogit;
+	bool transformerTestMarginValid;
+	AggregateStats transformerTestTargetMargin;
+	AggregateStats transformerTestHardNegativeLogit;
 	bool ok;
 	std::string status;
 
@@ -800,6 +1130,58 @@ struct Summary
 	      asterStateFitMs(),
 	      asterInnovationFitMs(),
 	      asterApplyMs(),
+	      aegisDiagValid(false),
+	      aegisLambdaSpatial(),
+	      aegisLambdaPredictive(),
+	      aegisLambdaOutput(),
+	      aegisPredictivePredicted(),
+	      aegisPredictiveRealized(),
+	      aegisOutputPredicted(),
+	      aegisOutputRealized(),
+	      aegisPredictiveError(),
+	      aegisOutputError(),
+	      aegisChannelDisagreement(),
+	      citadelDiagValid(false),
+	      citadelAnchor(),
+	      citadelHardRegimeMass(),
+	      citadelSparrowTrust(),
+	      rampartDiagValid(false),
+	      rampartTau(),
+	      rampartBudget(),
+	      rampartCovariance(),
+	      rampartSparrowTrust(),
+	      meritDiagValid(false),
+	      meritTau(),
+	      meritBudget(),
+	      meritCovariance(),
+	      meritSparrowTrust(),
+	      meritGeometryTrust(),
+	      strataDiagValid(false),
+	      strataNullMode(),
+	      strataPredictiveMode(),
+	      strataOutputMode(),
+	      strataCoupledMode(),
+	      strataBudget(),
+	      strataNullBenefit(),
+	      strataPredictiveBenefit(),
+	      strataOutputBenefit(),
+	      strataCoupledBenefit(),
+	      strataSelectedExcess(),
+	      strataSwitchRate(),
+	      transformerGapDiagValid(false),
+	      transformerInputUpdateNorm(),
+	      transformerBlockUpdateNorms(),
+	      transformerFinalNormUpdateNorm(),
+	      transformerHeadUpdateNorm(),
+	      transformerHeadShare(),
+	      transformerNonHeadShare(),
+	      transformerApplyMs(),
+	      transformerTrainMarginValid(false),
+	      transformerTrainTargetMargin(),
+	      transformerTrainHardNegativeLogit(),
+	      transformerTestMarginValid(false),
+	      transformerTestTargetMargin(),
+	      transformerTestHardNegativeLogit(),
 	      ok(false),
 	      status()
 	{
@@ -809,6 +1191,11 @@ struct Summary
 static void fill_sparrow_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
 static void fill_helm_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
 static void fill_aster_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
+static void fill_aegis_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
+static void fill_citadel_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
+static void fill_rampart_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
+static void fill_merit_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
+static void fill_strata_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
 
 class NetworkOwner
 {
@@ -837,6 +1224,15 @@ static const char* variant_label(VariantKind variant)
 	case VARIANT_ATLAS_SPARROW: return "ATLAS-SPARROW";
 	case VARIANT_ATLAS_HELM: return "ATLAS-HELM";
 	case VARIANT_ATLAS_ASTER: return "ATLAS-ASTER";
+	case VARIANT_ATLAS_AEGIS: return "ATLAS-AEGIS";
+	case VARIANT_ATLAS_CITADEL: return "ATLAS-CITADEL";
+	case VARIANT_ATLAS_RAMPART: return "ATLAS-RAMPART";
+	case VARIANT_ATLAS_MERIT: return "ATLAS-MERIT";
+	case VARIANT_ATLAS_STRATA: return "ATLAS-STRATA";
+	case VARIANT_ATLAS_AURORA: return "ATLAS-AURORA";
+	case VARIANT_ATLAS_SEAM: return "ATLAS-SEAM";
+	case VARIANT_ATLAS_QUASAR: return "ATLAS-QUASAR";
+	case VARIANT_ATLAS_GEODE: return "ATLAS-GEODE";
 	default: return "Unknown";
 	}
 }
@@ -857,6 +1253,24 @@ static bool variant_matches_selection(VariantSelection selection, VariantKind va
 		return variant == VARIANT_ATLAS_HELM;
 	case VARIANT_SELECTION_ATLAS_ASTER:
 		return variant == VARIANT_ATLAS_ASTER;
+	case VARIANT_SELECTION_ATLAS_AEGIS:
+		return variant == VARIANT_ATLAS_AEGIS;
+	case VARIANT_SELECTION_ATLAS_CITADEL:
+		return variant == VARIANT_ATLAS_CITADEL;
+	case VARIANT_SELECTION_ATLAS_RAMPART:
+		return variant == VARIANT_ATLAS_RAMPART;
+	case VARIANT_SELECTION_ATLAS_MERIT:
+		return variant == VARIANT_ATLAS_MERIT;
+	case VARIANT_SELECTION_ATLAS_STRATA:
+		return variant == VARIANT_ATLAS_STRATA;
+	case VARIANT_SELECTION_ATLAS_AURORA:
+		return variant == VARIANT_ATLAS_AURORA;
+	case VARIANT_SELECTION_ATLAS_SEAM:
+		return variant == VARIANT_ATLAS_SEAM;
+	case VARIANT_SELECTION_ATLAS_QUASAR:
+		return variant == VARIANT_ATLAS_QUASAR;
+	case VARIANT_SELECTION_ATLAS_GEODE:
+		return variant == VARIANT_ATLAS_GEODE;
 	default:
 		return false;
 	}
@@ -886,13 +1300,115 @@ static AggregateStats compute_stats(const std::vector<double>& values)
 	return stats;
 }
 
+static std::vector<AggregateStats> compute_stats_by_index(const std::vector< std::vector<double> >& values)
+{
+	std::vector<AggregateStats> out;
+	size_t maxSize = 0u;
+	for (size_t i = 0; i < values.size(); ++i)
+	{
+		if (values[i].size() > maxSize)
+			maxSize = values[i].size();
+	}
+	out.resize(maxSize);
+	for (size_t idx = 0; idx < maxSize; ++idx)
+	{
+		std::vector<double> bucket;
+		for (size_t row = 0; row < values.size(); ++row)
+		{
+			if (idx < values[row].size())
+				bucket.push_back(values[row][idx]);
+		}
+		out[idx] = compute_stats(bucket);
+	}
+	return out;
+}
+
+static double squared_snapshot_delta(const std::vector<float>& before,
+                                     const std::vector<float>& after)
+{
+	if (before.size() != after.size())
+		return 0.0;
+	double sumsq = 0.0;
+	for (size_t i = 0; i < before.size(); ++i)
+	{
+		const double delta = static_cast<double>(after[i]) - static_cast<double>(before[i]);
+		sumsq += delta * delta;
+	}
+	return sumsq;
+}
+
+static void fill_transformer_gap_from_snapshots(
+    const glades::NNetwork::TransformerGroupedParameterSnapshot& before,
+    const glades::NNetwork::TransformerGroupedParameterSnapshot& after,
+    RunResult& out)
+{
+	if (!before.valid || !after.valid)
+		return;
+	if (before.blockGroups.size() != after.blockGroups.size())
+		return;
+
+	const double inputSq = squared_snapshot_delta(before.inputGroup, after.inputGroup);
+	const double finalNormSq = squared_snapshot_delta(before.finalNormGroup, after.finalNormGroup);
+	const double headSq = squared_snapshot_delta(before.headGroup, after.headGroup);
+	double totalSq = inputSq + finalNormSq + headSq;
+
+	out.transformerBlockUpdateNorms.assign(before.blockGroups.size(), 0.0);
+	for (size_t i = 0; i < before.blockGroups.size(); ++i)
+	{
+		const double blockSq = squared_snapshot_delta(before.blockGroups[i], after.blockGroups[i]);
+		out.transformerBlockUpdateNorms[i] = std::sqrt(std::max(0.0, blockSq));
+		totalSq += blockSq;
+	}
+
+	out.transformerGapDiagValid = true;
+	out.transformerInputUpdateNorm = std::sqrt(std::max(0.0, inputSq));
+	out.transformerFinalNormUpdateNorm = std::sqrt(std::max(0.0, finalNormSq));
+	out.transformerHeadUpdateNorm = std::sqrt(std::max(0.0, headSq));
+	if (totalSq > 0.0)
+	{
+		out.transformerHeadShare = headSq / totalSq;
+		out.transformerNonHeadShare = (totalSq - headSq) / totalSq;
+	}
+}
+
+static std::vector<double> make_transformer_profile(const Summary& s)
+{
+	std::vector<double> profile;
+	if (!s.transformerGapDiagValid)
+		return profile;
+	profile.push_back(s.transformerInputUpdateNorm.mean);
+	for (size_t i = 0; i < s.transformerBlockUpdateNorms.size(); ++i)
+		profile.push_back(s.transformerBlockUpdateNorms[i].mean);
+	profile.push_back(s.transformerFinalNormUpdateNorm.mean);
+	profile.push_back(s.transformerHeadUpdateNorm.mean);
+	return profile;
+}
+
+static double profile_cosine(const std::vector<double>& a, const std::vector<double>& b)
+{
+	if (a.empty() || a.size() != b.size())
+		return 0.0;
+	double dot = 0.0;
+	double aa = 0.0;
+	double bb = 0.0;
+	for (size_t i = 0; i < a.size(); ++i)
+	{
+		dot += a[i] * b[i];
+		aa += a[i] * a[i];
+		bb += b[i] * b[i];
+	}
+	if (!(aa > 0.0) || !(bb > 0.0))
+		return 0.0;
+	return dot / (sqrt(aa) * sqrt(bb));
+}
+
 static void print_usage()
 {
 	printf("Usage: glades-unit-tests atlas-alt-bench [options]\n");
 	printf("Options:\n");
-	printf("  --mode all|token-lm|token-lm-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
+	printf("  --mode all|token-lm|token-lm-large|token-lm-context|token-lm-context-large|token-lm-document|token-lm-corpus|token-lm-corpus-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
 	printf("                                         Run the alternate-task benches or the teacher-student sweep (default: all)\n");
-	printf("  --variant all|adamw|base|sparrow|helm|aster\n");
+	printf("  --variant all|adamw|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode\n");
 	printf("                                         Restrict runs to one optimizer variant when the case supports it (default: all)\n");
 	printf("  --repeats N                           Repeats per optimizer variant (default: 3)\n");
 	printf("  --seed N                              Base RNG seed (default: 1337)\n");
@@ -917,6 +1433,15 @@ static void print_usage()
 	printf("  --atlas-aster-state-rank N            ASTER retained state rank (default: 2)\n");
 	printf("  --atlas-aster-hidden-stack-depth N    ASTER trailing hidden layers to transport (default: 2)\n");
 	printf("  --atlas-aster-pole-max X              ASTER pole clamp (default: 0.95)\n");
+	printf("  --atlas-kappa-enabled 0|1             Enable KAPPA retrieval observables inside transformer ASTER/AEGIS (default: 0)\n");
+	printf("  --atlas-kappa-heads N                 Number of tracked attention heads per block for KAPPA (default: 1)\n");
+	printf("  --atlas-kappa-lag-buckets N           Number of lag buckets for KAPPA retrieval summaries (default: 4)\n");
+	printf("  --atlas-kappa-rank N                  Projected value channels per head/lag KAPPA observable (default: 2)\n");
+	printf("  --atlas-aurora-adamw-backbone 0|1     Use AdamW as the AURORA backbone update instead of ATLAS/BSRP (default: 1)\n");
+	printf("  --atlas-aurora-head-gain X            Extra AURORA head-actuation gain on transformer token heads (default: 3.0)\n");
+	printf("  --atlas-aurora-body-trust-scale X     Retained non-head SPARROW trust inside AURORA (default: 0.60)\n");
+	printf("  --atlas-geode-geometry-scale X        Low-rank geometry strength for GEODE (default: 1.0)\n");
+	printf("  --atlas-geode-predictive-scale X      SPARROW-style active prediction blend for GEODE (default: 0.25)\n");
 	printf("  --token-epochs N                      Token-LM epochs (default: 6)\n");
 	printf("  --token-train-seqs N                  Token-LM train sequence count (default: 128)\n");
 	printf("  --token-test-seqs N                   Token-LM test sequence count (default: 32)\n");
@@ -955,6 +1480,86 @@ static void apply_large_token_preset(BenchConfig& cfg)
 	cfg.token.atlasLR = 0.020f;
 }
 
+static void apply_context_token_preset(BenchConfig& cfg)
+{
+	cfg.token.vocab = 129u;
+	cfg.token.dModel = 32u;
+	cfg.token.dFF = 128u;
+	cfg.token.layers = 2u;
+	cfg.token.heads = 4u;
+	cfg.token.kvHeads = 4u;
+	cfg.token.seqLen = 56u;
+	cfg.token.trainSeqs = 24u;
+	cfg.token.testSeqs = 8u;
+	cfg.token.epochs = 2u;
+	cfg.token.adamLR = 0.0010f;
+	cfg.token.atlasLR = 0.020f;
+}
+
+static void apply_context_large_token_preset(BenchConfig& cfg)
+{
+	cfg.token.vocab = 193u;
+	cfg.token.dModel = 40u;
+	cfg.token.dFF = 160u;
+	cfg.token.layers = 3u;
+	cfg.token.heads = 5u;
+	cfg.token.kvHeads = 5u;
+	cfg.token.seqLen = 80u;
+	cfg.token.trainSeqs = 32u;
+	cfg.token.testSeqs = 8u;
+	cfg.token.epochs = 2u;
+	cfg.token.adamLR = 0.0010f;
+	cfg.token.atlasLR = 0.020f;
+}
+
+static void apply_document_token_preset(BenchConfig& cfg)
+{
+	cfg.token.vocab = 257u;
+	cfg.token.dModel = 48u;
+	cfg.token.dFF = 192u;
+	cfg.token.layers = 3u;
+	cfg.token.heads = 6u;
+	cfg.token.kvHeads = 6u;
+	cfg.token.seqLen = 96u;
+	cfg.token.trainSeqs = 48u;
+	cfg.token.testSeqs = 12u;
+	cfg.token.epochs = 2u;
+	cfg.token.adamLR = 0.0010f;
+	cfg.token.atlasLR = 0.020f;
+}
+
+static void apply_corpus_token_preset(BenchConfig& cfg)
+{
+	cfg.token.vocab = 513u;
+	cfg.token.dModel = 48u;
+	cfg.token.dFF = 192u;
+	cfg.token.layers = 3u;
+	cfg.token.heads = 6u;
+	cfg.token.kvHeads = 6u;
+	cfg.token.seqLen = 96u;
+	cfg.token.trainSeqs = 48u;
+	cfg.token.testSeqs = 12u;
+	cfg.token.epochs = 2u;
+	cfg.token.adamLR = 0.0010f;
+	cfg.token.atlasLR = 0.020f;
+}
+
+static void apply_corpus_large_token_preset(BenchConfig& cfg)
+{
+	cfg.token.vocab = 769u;
+	cfg.token.dModel = 56u;
+	cfg.token.dFF = 224u;
+	cfg.token.layers = 4u;
+	cfg.token.heads = 8u;
+	cfg.token.kvHeads = 8u;
+	cfg.token.seqLen = 112u;
+	cfg.token.trainSeqs = 64u;
+	cfg.token.testSeqs = 16u;
+	cfg.token.epochs = 2u;
+	cfg.token.adamLR = 0.0010f;
+	cfg.token.atlasLR = 0.020f;
+}
+
 static bool parse_mode_arg(const char* text, BenchMode& outMode)
 {
 	if (!text || !*text)
@@ -972,6 +1577,33 @@ static bool parse_mode_arg(const char* text, BenchMode& outMode)
 	if (streq(text, "token-lm-large") || streq(text, "llm-large") || streq(text, "token-large"))
 	{
 		outMode = MODE_TOKEN_LM_LARGE;
+		return true;
+	}
+	if (streq(text, "token-lm-context") || streq(text, "llm-context") || streq(text, "token-context") || streq(text, "context-lm"))
+	{
+		outMode = MODE_TOKEN_LM_CONTEXT;
+		return true;
+	}
+	if (streq(text, "token-lm-context-large") || streq(text, "llm-context-large") || streq(text, "token-context-large") || streq(text, "context-lm-large"))
+	{
+		outMode = MODE_TOKEN_LM_CONTEXT_LARGE;
+		return true;
+	}
+	if (streq(text, "token-lm-document") || streq(text, "llm-document") || streq(text, "token-document") || streq(text, "document-lm") || streq(text, "doc-lm"))
+	{
+		outMode = MODE_TOKEN_LM_DOCUMENT;
+		return true;
+	}
+	if (streq(text, "token-lm-corpus") || streq(text, "llm-corpus") || streq(text, "token-corpus")
+	    || streq(text, "corpus-lm") || streq(text, "doc-corpus"))
+	{
+		outMode = MODE_TOKEN_LM_CORPUS;
+		return true;
+	}
+	if (streq(text, "token-lm-corpus-large") || streq(text, "llm-corpus-large") || streq(text, "token-corpus-large")
+	    || streq(text, "corpus-lm-large") || streq(text, "doc-corpus-large"))
+	{
+		outMode = MODE_TOKEN_LM_CORPUS_LARGE;
 		return true;
 	}
 	if (streq(text, "teacher-student") || streq(text, "teacher") || streq(text, "ts"))
@@ -1053,6 +1685,51 @@ static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
 		outSelection = VARIANT_SELECTION_ATLAS_ASTER;
 		return true;
 	}
+	if (streq(text, "aegis") || streq(text, "atlas-aegis"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_AEGIS;
+		return true;
+	}
+	if (streq(text, "citadel") || streq(text, "atlas-citadel"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_CITADEL;
+		return true;
+	}
+	if (streq(text, "rampart") || streq(text, "atlas-rampart"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_RAMPART;
+		return true;
+	}
+	if (streq(text, "merit") || streq(text, "atlas-merit"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_MERIT;
+		return true;
+	}
+	if (streq(text, "strata") || streq(text, "atlas-strata"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_STRATA;
+		return true;
+	}
+	if (streq(text, "aurora") || streq(text, "atlas-aurora"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_AURORA;
+		return true;
+	}
+	if (streq(text, "seam") || streq(text, "atlas-seam"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_SEAM;
+		return true;
+	}
+	if (streq(text, "quasar") || streq(text, "atlas-quasar"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_QUASAR;
+		return true;
+	}
+	if (streq(text, "geode") || streq(text, "atlas-geode"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_GEODE;
+		return true;
+	}
 	return false;
 }
 
@@ -1072,6 +1749,16 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			}
 			if (cfg.mode == MODE_TOKEN_LM_LARGE)
 				apply_large_token_preset(cfg);
+			else if (cfg.mode == MODE_TOKEN_LM_CONTEXT)
+				apply_context_token_preset(cfg);
+			else if (cfg.mode == MODE_TOKEN_LM_CONTEXT_LARGE)
+				apply_context_large_token_preset(cfg);
+			else if (cfg.mode == MODE_TOKEN_LM_DOCUMENT)
+				apply_document_token_preset(cfg);
+			else if (cfg.mode == MODE_TOKEN_LM_CORPUS)
+				apply_corpus_token_preset(cfg);
+			else if (cfg.mode == MODE_TOKEN_LM_CORPUS_LARGE)
+				apply_corpus_large_token_preset(cfg);
 		}
 		else if (streq(argv[i], "--variant") && i + 1 < argc)
 		{
@@ -1262,6 +1949,78 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			if (!parse_float_arg(argv[++i], cfg.atlasAsterPoleMax))
 			{
 				err = "invalid --atlas-aster-pole-max";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kappa-enabled") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasKappaEnabled) || cfg.atlasKappaEnabled > 1u)
+			{
+				err = "invalid --atlas-kappa-enabled";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kappa-heads") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasKappaHeads) || cfg.atlasKappaHeads == 0u)
+			{
+				err = "invalid --atlas-kappa-heads";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kappa-lag-buckets") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasKappaLagBuckets) || cfg.atlasKappaLagBuckets == 0u)
+			{
+				err = "invalid --atlas-kappa-lag-buckets";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kappa-rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasKappaRank) || cfg.atlasKappaRank == 0u)
+			{
+				err = "invalid --atlas-kappa-rank";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-aurora-adamw-backbone") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasAuroraAdamwBackbone) || cfg.atlasAuroraAdamwBackbone > 1u)
+			{
+				err = "invalid --atlas-aurora-adamw-backbone";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-aurora-head-gain") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasAuroraHeadGain) || cfg.atlasAuroraHeadGain < 0.0f)
+			{
+				err = "invalid --atlas-aurora-head-gain";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-aurora-body-trust-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasAuroraBodyTrustScale) || cfg.atlasAuroraBodyTrustScale < 0.0f)
+			{
+				err = "invalid --atlas-aurora-body-trust-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-geode-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasGeodeGeometryScale) || cfg.atlasGeodeGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-geode-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-geode-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasGeodePredictiveScale) || cfg.atlasGeodePredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-geode-predictive-scale";
 				return false;
 			}
 		}
@@ -1832,6 +2591,610 @@ static void build_token_split(unsigned int vocab,
 	}
 }
 
+static unsigned int token_context_global_content(unsigned int contentBase,
+                                                 unsigned int contentCount,
+                                                 unsigned int value)
+{
+	return contentBase + (value % contentCount);
+}
+
+static unsigned int token_context_topic_content(unsigned int contentBase,
+                                                unsigned int contentCount,
+                                                unsigned int topic,
+                                                unsigned int topicCount,
+                                                unsigned int value)
+{
+	const unsigned int start = contentBase + ((topic * contentCount) / topicCount);
+	const unsigned int end = contentBase + (((topic + 1u) * contentCount) / topicCount);
+	const unsigned int width = (end > start) ? (end - start) : 1u;
+	return start + (value % width);
+}
+
+static unsigned int token_pick_from_range(unsigned int base,
+                                          unsigned int count,
+                                          unsigned int value)
+{
+	if (count == 0u)
+		return base;
+	return base + (value % count);
+}
+
+static void build_token_context_split(unsigned int vocab,
+                                      unsigned int seqCount,
+                                      unsigned int seqLen,
+                                      unsigned int seed,
+                                      unsigned int padTokenId,
+                                      std::vector<unsigned int>& outTokens,
+                                      std::vector<glades::DataInput::SequenceSpan>& outSpans)
+{
+	outTokens.clear();
+	outSpans.clear();
+	outTokens.reserve(static_cast<size_t>(seqCount) * static_cast<size_t>(seqLen + 1u));
+	outSpans.reserve(seqCount);
+
+	static const unsigned int kTopicCount = 4u;
+	static const unsigned int kTopicBase = 0u;
+	static const unsigned int kQuerySummary = 4u;
+	static const unsigned int kQueryAnchor = 5u;
+	static const unsigned int kMix = 6u;
+	static const unsigned int kLocal = 7u;
+	static const unsigned int kStore = 8u;
+	static const unsigned int kSep = 9u;
+	static const unsigned int kReservedCount = 10u;
+	static const unsigned int kSegmentLen = 14u;
+
+	if (vocab <= (kReservedCount + 1u))
+	{
+		build_token_split(vocab, seqCount, seqLen, seed, padTokenId, outTokens, outSpans);
+		return;
+	}
+
+	const unsigned int contentBase = kReservedCount;
+	const unsigned int contentCount = vocab - kReservedCount - 1u;
+
+	for (unsigned int seq = 0u; seq < seqCount; ++seq)
+	{
+		const unsigned int start = static_cast<unsigned int>(outTokens.size());
+		const unsigned int topic = mix_u32(seed + 41u * (seq + 1u)) % kTopicCount;
+		unsigned int prevSummary = token_context_topic_content(contentBase, contentCount, topic, kTopicCount,
+		                                                      mix_u32(seed + 73u * (seq + 3u)));
+		unsigned int olderSummary = token_context_topic_content(contentBase, contentCount, topic, kTopicCount,
+		                                                       mix_u32(seed + 109u * (seq + 5u)));
+		unsigned int prevAnchor = token_context_topic_content(contentBase, contentCount, topic, kTopicCount,
+		                                                     mix_u32(seed + 149u * (seq + 7u)));
+		unsigned int olderAnchor = token_context_topic_content(contentBase, contentCount, topic, kTopicCount,
+		                                                      mix_u32(seed + 197u * (seq + 11u)));
+
+		for (unsigned int t = 0u; t < seqLen; ++t)
+		{
+			const unsigned int segment = t / kSegmentLen;
+			const unsigned int slot = t % kSegmentLen;
+			const unsigned int noiseA = mix_u32(seed + 911u * (seq + 1u) + 37u * (segment + 1u));
+			const unsigned int noiseB = mix_u32(seed + 1237u * (seq + 3u) + 53u * (segment + 5u));
+			const unsigned int summaryQuery = ((segment % 3u) == 2u) ? olderSummary : prevSummary;
+			const unsigned int anchorQuery = ((segment % 2u) == 1u) ? olderAnchor : prevAnchor;
+			const unsigned int a = token_context_topic_content(contentBase, contentCount, topic, kTopicCount,
+			                                                  noiseA + prevAnchor + 7u * segment);
+			const unsigned int b = token_context_topic_content(contentBase, contentCount, topic, kTopicCount,
+			                                                  noiseB + prevSummary + 11u * segment);
+			const unsigned int newSummary =
+			    token_context_global_content(contentBase, contentCount,
+			                                (a * 3u) + (b * 5u) + (topic * 17u) + (segment * 19u) + prevSummary);
+			const unsigned int newLocal =
+			    token_context_global_content(contentBase, contentCount,
+			                                (newSummary * 7u) + (b * 3u) + (anchorQuery * 5u) + (segment * 23u));
+			const unsigned int newAnchor =
+			    token_context_topic_content(contentBase, contentCount, topic, kTopicCount,
+			                               (a * 11u) + (prevAnchor * 3u) + (segment * 5u) + noiseB);
+
+			unsigned int tok = 0u;
+			switch (slot)
+			{
+				case 0u: tok = kTopicBase + topic; break;
+				case 1u: tok = kQuerySummary; break;
+				case 2u: tok = summaryQuery; break;
+				case 3u: tok = kQueryAnchor; break;
+				case 4u: tok = anchorQuery; break;
+				case 5u: tok = a; break;
+				case 6u: tok = b; break;
+				case 7u: tok = kMix; break;
+				case 8u: tok = newSummary; break;
+				case 9u: tok = kLocal; break;
+				case 10u: tok = newLocal; break;
+				case 11u: tok = kStore; break;
+				case 12u: tok = newAnchor; break;
+				default: tok = kSep; break;
+			}
+			outTokens.push_back(tok);
+
+			if (slot == (kSegmentLen - 1u))
+			{
+				olderSummary = prevSummary;
+				prevSummary = newSummary;
+				olderAnchor = prevAnchor;
+				prevAnchor = newAnchor;
+			}
+		}
+
+		outSpans.push_back(glades::DataInput::SequenceSpan(start, seqLen));
+		outTokens.push_back(padTokenId);
+	}
+}
+
+static void build_token_document_split(unsigned int vocab,
+                                       unsigned int seqCount,
+                                       unsigned int seqLen,
+                                       unsigned int seed,
+                                       unsigned int padTokenId,
+                                       std::vector<unsigned int>& outTokens,
+                                       std::vector<glades::DataInput::SequenceSpan>& outSpans)
+{
+	outTokens.clear();
+	outSpans.clear();
+	outTokens.reserve(static_cast<size_t>(seqCount) * static_cast<size_t>(seqLen + 1u));
+	outSpans.reserve(seqCount);
+
+	static const unsigned int kDoc = 0u;
+	static const unsigned int kHead = 1u;
+	static const unsigned int kBy = 2u;
+	static const unsigned int kIn = 3u;
+	static const unsigned int kOn = 4u;
+	static const unsigned int kLead = 5u;
+	static const unsigned int kQuote = 6u;
+	static const unsigned int kSays = 7u;
+	static const unsigned int kAbout = 8u;
+	static const unsigned int kWith = 9u;
+	static const unsigned int kAfter = 10u;
+	static const unsigned int kBefore = 11u;
+	static const unsigned int kRecall = 12u;
+	static const unsigned int kSummary = 13u;
+	static const unsigned int kContinue = 14u;
+	static const unsigned int kSep = 15u;
+	static const unsigned int kStructureCount = 16u;
+	static const unsigned int kTopicCount = 8u;
+	static const unsigned int kTopicBase = kStructureCount;
+	static const unsigned int kReservedCount = kStructureCount + kTopicCount;
+	static const unsigned int kParagraphLen = 24u;
+	static const unsigned int kMinPoolWidth = 8u;
+
+	if (vocab <= (kReservedCount + 6u * kMinPoolWidth + 1u))
+	{
+		build_token_context_split(vocab, seqCount, seqLen, seed, padTokenId, outTokens, outSpans);
+		return;
+	}
+
+	const unsigned int contentBase = kReservedCount;
+	const unsigned int contentCount = vocab - kReservedCount - 1u;
+	unsigned int remaining = contentCount;
+	const unsigned int entityCount =
+	    std::min(remaining - 5u * kMinPoolWidth, std::max(kMinPoolWidth, contentCount / 5u));
+	remaining -= entityCount;
+	const unsigned int placeCount =
+	    std::min(remaining - 4u * kMinPoolWidth, std::max(kMinPoolWidth, contentCount / 7u));
+	remaining -= placeCount;
+	const unsigned int yearCount =
+	    std::min(remaining - 3u * kMinPoolWidth, std::max(kMinPoolWidth, contentCount / 10u));
+	remaining -= yearCount;
+	const unsigned int verbCount =
+	    std::min(remaining - 2u * kMinPoolWidth, std::max(kMinPoolWidth, contentCount / 7u));
+	remaining -= verbCount;
+	const unsigned int objectCount =
+	    std::min(remaining - 1u * kMinPoolWidth, std::max(kMinPoolWidth, contentCount / 5u));
+	remaining -= objectCount;
+	const unsigned int detailCount = remaining;
+
+	const unsigned int entityBase = contentBase;
+	const unsigned int placeBase = entityBase + entityCount;
+	const unsigned int yearBase = placeBase + placeCount;
+	const unsigned int verbBase = yearBase + yearCount;
+	const unsigned int objectBase = verbBase + verbCount;
+	const unsigned int detailBase = objectBase + objectCount;
+
+	for (unsigned int seq = 0u; seq < seqCount; ++seq)
+	{
+		const unsigned int start = static_cast<unsigned int>(outTokens.size());
+		const unsigned int topic = mix_u32(seed + 41u * (seq + 1u)) % kTopicCount;
+		const unsigned int topicTok = kTopicBase + topic;
+		const unsigned int leadEntity =
+		    token_pick_from_range(entityBase, entityCount, mix_u32(seed + 73u * (seq + 3u)));
+		const unsigned int authorEntity =
+		    token_pick_from_range(entityBase, entityCount, mix_u32(seed + 109u * (seq + 5u)));
+		const unsigned int openingPlace =
+		    token_pick_from_range(placeBase, placeCount, mix_u32(seed + 149u * (seq + 7u)));
+		const unsigned int openingYear =
+		    token_pick_from_range(yearBase, yearCount, mix_u32(seed + 197u * (seq + 11u)));
+
+		unsigned int prevSummary =
+		    token_context_topic_content(detailBase, detailCount, topic, kTopicCount,
+		                               mix_u32(seed + 223u * (seq + 13u)));
+		unsigned int olderSummary =
+		    token_context_topic_content(detailBase, detailCount, topic, kTopicCount,
+		                               mix_u32(seed + 257u * (seq + 17u)));
+		unsigned int prevObject =
+		    token_pick_from_range(objectBase, objectCount, mix_u32(seed + 307u * (seq + 19u)));
+		unsigned int olderObject =
+		    token_pick_from_range(objectBase, objectCount, mix_u32(seed + 353u * (seq + 23u)));
+		unsigned int prevPlace = openingPlace;
+		unsigned int olderPlace =
+		    token_pick_from_range(placeBase, placeCount, mix_u32(seed + 401u * (seq + 29u)));
+		unsigned int prevYear = openingYear;
+		unsigned int olderYear =
+		    token_pick_from_range(yearBase, yearCount, mix_u32(seed + 443u * (seq + 31u)));
+		unsigned int prevSpeaker = authorEntity;
+		unsigned int olderSpeaker = leadEntity;
+
+		const unsigned int paragraphCount = (seqLen + kParagraphLen - 1u) / kParagraphLen;
+		for (unsigned int paragraph = 0u; paragraph < paragraphCount; ++paragraph)
+		{
+			unsigned int paragraphTokens[kParagraphLen];
+			for (unsigned int i = 0; i < kParagraphLen; ++i)
+				paragraphTokens[i] = kSep;
+
+			const unsigned int recallSummary = ((paragraph % 3u) == 2u) ? olderSummary : prevSummary;
+			const unsigned int recallObject = ((paragraph % 2u) == 1u) ? olderObject : prevObject;
+			const unsigned int recallPlace = ((paragraph % 2u) == 1u) ? olderPlace : prevPlace;
+			const unsigned int recallYear = ((paragraph % 3u) == 1u) ? olderYear : prevYear;
+			const unsigned int recallSpeaker = ((paragraph % 2u) == 1u) ? olderSpeaker : prevSpeaker;
+			const unsigned int entityA =
+			    token_pick_from_range(entityBase, entityCount,
+			                          mix_u32(seed + 601u * (seq + 1u) + 31u * (paragraph + 1u)));
+			const unsigned int entityB =
+			    token_pick_from_range(entityBase, entityCount,
+			                          mix_u32(seed + 647u * (seq + 3u) + 37u * (paragraph + 5u)));
+			const unsigned int verbA =
+			    token_pick_from_range(verbBase, verbCount,
+			                          mix_u32(seed + 691u * (seq + 7u) + 41u * (paragraph + 9u)));
+			const unsigned int verbB =
+			    token_pick_from_range(verbBase, verbCount,
+			                          mix_u32(seed + 743u * (seq + 11u) + 43u * (paragraph + 13u)));
+			const unsigned int objectA =
+			    token_pick_from_range(objectBase, objectCount,
+			                          mix_u32(seed + 797u * (seq + 13u) + 47u * (paragraph + 17u)));
+			const unsigned int objectB =
+			    token_pick_from_range(objectBase, objectCount,
+			                          mix_u32(seed + 853u * (seq + 17u) + 53u * (paragraph + 19u)));
+			const unsigned int placeA =
+			    token_pick_from_range(placeBase, placeCount,
+			                          mix_u32(seed + 911u * (seq + 19u) + 59u * (paragraph + 23u)));
+			const unsigned int yearA =
+			    token_pick_from_range(yearBase, yearCount,
+			                          mix_u32(seed + 977u * (seq + 23u) + 61u * (paragraph + 29u)));
+			const unsigned int detailA =
+			    token_context_topic_content(detailBase, detailCount, topic, kTopicCount,
+			                               mix_u32(seed + 1031u * (seq + 29u) + 67u * (paragraph + 31u)));
+			const unsigned int detailB =
+			    token_context_global_content(detailBase, detailCount,
+			                                 mix_u32(seed + 1087u * (seq + 31u) + 71u * (paragraph + 37u))
+			                                     + recallSummary + recallObject);
+			const unsigned int detailC =
+			    token_context_topic_content(detailBase, detailCount, topic, kTopicCount,
+			                               mix_u32(seed + 1151u * (seq + 37u) + 73u * (paragraph + 41u)));
+			const unsigned int detailD =
+			    token_context_global_content(detailBase, detailCount,
+			                                 mix_u32(seed + 1229u * (seq + 41u) + 79u * (paragraph + 43u))
+			                                     + recallPlace + recallYear);
+			const unsigned int newSummary =
+			    token_context_global_content(detailBase, detailCount,
+			                                 (entityA * 3u) + (objectA * 5u) + (recallSummary * 7u)
+			                                     + (paragraph * 19u) + detailA + detailC);
+			const unsigned int newObject =
+			    token_pick_from_range(objectBase, objectCount,
+			                          (objectB * 11u) + (detailB * 3u) + (paragraph * 17u) + recallObject);
+			const unsigned int newPlace =
+			    token_pick_from_range(placeBase, placeCount,
+			                          (placeA * 7u) + (detailC * 5u) + (paragraph * 13u) + recallPlace);
+			const unsigned int newYear =
+			    token_pick_from_range(yearBase, yearCount,
+			                          (yearA * 5u) + (objectA * 7u) + (paragraph * 11u) + recallYear);
+			const unsigned int newSpeaker = ((paragraph % 2u) == 0u) ? entityB : entityA;
+
+			switch (paragraph % 4u)
+			{
+				case 0u:
+					paragraphTokens[0] = kDoc;
+					paragraphTokens[1] = topicTok;
+					paragraphTokens[2] = kHead;
+					paragraphTokens[3] = leadEntity;
+					paragraphTokens[4] = kBy;
+					paragraphTokens[5] = authorEntity;
+					paragraphTokens[6] = kIn;
+					paragraphTokens[7] = recallPlace;
+					paragraphTokens[8] = kOn;
+					paragraphTokens[9] = recallYear;
+					paragraphTokens[10] = kLead;
+					paragraphTokens[11] = leadEntity;
+					paragraphTokens[12] = verbA;
+					paragraphTokens[13] = objectA;
+					paragraphTokens[14] = kWith;
+					paragraphTokens[15] = detailA;
+					paragraphTokens[16] = detailB;
+					paragraphTokens[17] = kSummary;
+					paragraphTokens[18] = recallSummary;
+					paragraphTokens[19] = kContinue;
+					paragraphTokens[20] = newSummary;
+					paragraphTokens[21] = newObject;
+					paragraphTokens[22] = newPlace;
+					paragraphTokens[23] = kSep;
+					break;
+				case 1u:
+					paragraphTokens[0] = topicTok;
+					paragraphTokens[1] = entityA;
+					paragraphTokens[2] = verbA;
+					paragraphTokens[3] = objectA;
+					paragraphTokens[4] = kIn;
+					paragraphTokens[5] = placeA;
+					paragraphTokens[6] = kAfter;
+					paragraphTokens[7] = yearA;
+					paragraphTokens[8] = detailA;
+					paragraphTokens[9] = entityB;
+					paragraphTokens[10] = verbB;
+					paragraphTokens[11] = objectB;
+					paragraphTokens[12] = kWith;
+					paragraphTokens[13] = recallObject;
+					paragraphTokens[14] = kAbout;
+					paragraphTokens[15] = recallSummary;
+					paragraphTokens[16] = kSummary;
+					paragraphTokens[17] = newSummary;
+					paragraphTokens[18] = kContinue;
+					paragraphTokens[19] = detailC;
+					paragraphTokens[20] = newObject;
+					paragraphTokens[21] = newPlace;
+					paragraphTokens[22] = newYear;
+					paragraphTokens[23] = kSep;
+					break;
+				case 2u:
+					paragraphTokens[0] = kQuote;
+					paragraphTokens[1] = recallSpeaker;
+					paragraphTokens[2] = kSays;
+					paragraphTokens[3] = leadEntity;
+					paragraphTokens[4] = verbB;
+					paragraphTokens[5] = objectB;
+					paragraphTokens[6] = kAbout;
+					paragraphTokens[7] = topicTok;
+					paragraphTokens[8] = kWith;
+					paragraphTokens[9] = detailA;
+					paragraphTokens[10] = detailD;
+					paragraphTokens[11] = kIn;
+					paragraphTokens[12] = recallPlace;
+					paragraphTokens[13] = kOn;
+					paragraphTokens[14] = recallYear;
+					paragraphTokens[15] = kSummary;
+					paragraphTokens[16] = recallSummary;
+					paragraphTokens[17] = kContinue;
+					paragraphTokens[18] = newSummary;
+					paragraphTokens[19] = newSpeaker;
+					paragraphTokens[20] = newObject;
+					paragraphTokens[21] = newPlace;
+					paragraphTokens[22] = newYear;
+					paragraphTokens[23] = kSep;
+					break;
+				default:
+					paragraphTokens[0] = kRecall;
+					paragraphTokens[1] = recallSpeaker;
+					paragraphTokens[2] = recallSummary;
+					paragraphTokens[3] = kIn;
+					paragraphTokens[4] = recallPlace;
+					paragraphTokens[5] = kOn;
+					paragraphTokens[6] = recallYear;
+					paragraphTokens[7] = leadEntity;
+					paragraphTokens[8] = verbA;
+					paragraphTokens[9] = recallObject;
+					paragraphTokens[10] = kBefore;
+					paragraphTokens[11] = olderYear;
+					paragraphTokens[12] = kWith;
+					paragraphTokens[13] = detailB;
+					paragraphTokens[14] = detailC;
+					paragraphTokens[15] = kSummary;
+					paragraphTokens[16] = newSummary;
+					paragraphTokens[17] = kContinue;
+					paragraphTokens[18] = newObject;
+					paragraphTokens[19] = newPlace;
+					paragraphTokens[20] = newYear;
+					paragraphTokens[21] = entityB;
+					paragraphTokens[22] = detailD;
+					paragraphTokens[23] = kSep;
+					break;
+			}
+
+			const unsigned int startToken = paragraph * kParagraphLen;
+			const unsigned int limit = std::min(kParagraphLen, seqLen - startToken);
+			for (unsigned int i = 0u; i < limit; ++i)
+				outTokens.push_back(paragraphTokens[i]);
+
+			olderSummary = prevSummary;
+			prevSummary = newSummary;
+			olderObject = prevObject;
+			prevObject = newObject;
+			olderPlace = prevPlace;
+			prevPlace = newPlace;
+			olderYear = prevYear;
+			prevYear = newYear;
+			olderSpeaker = prevSpeaker;
+			prevSpeaker = newSpeaker;
+		}
+
+		outSpans.push_back(glades::DataInput::SequenceSpan(start, seqLen));
+		outTokens.push_back(padTokenId);
+	}
+}
+
+static unsigned int corpus_hash_word(const std::string& word)
+{
+	unsigned int h = 2166136261u;
+	for (size_t i = 0; i < word.size(); ++i)
+	{
+		h ^= static_cast<unsigned char>(word[i]);
+		h *= 16777619u;
+	}
+	return mix_u32(h);
+}
+
+static unsigned int corpus_intern_word(const std::string& word,
+                                       unsigned int padTokenId,
+                                       std::map<std::string, unsigned int>& lexicon,
+                                       unsigned int& nextId)
+{
+	const std::map<std::string, unsigned int>::const_iterator it = lexicon.find(word);
+	if (it != lexicon.end())
+		return it->second;
+
+	unsigned int tokenId = 0u;
+	if (nextId < padTokenId)
+		tokenId = nextId++;
+	else
+	{
+		const unsigned int base = 3u;
+		const unsigned int width = (padTokenId > base) ? (padTokenId - base) : 1u;
+		tokenId = base + (corpus_hash_word(word) % width);
+	}
+	lexicon.insert(std::make_pair(word, tokenId));
+	return tokenId;
+}
+
+static void corpus_push_boundary(unsigned int tokenId, std::vector<unsigned int>& stream)
+{
+	if (stream.empty() || stream.back() != tokenId)
+		stream.push_back(tokenId);
+}
+
+static void append_corpus_docs(const char* const* docs,
+                               size_t docCount,
+                               unsigned int padTokenId,
+                               std::map<std::string, unsigned int>& lexicon,
+                               unsigned int& nextId,
+                               std::vector<unsigned int>& outStream)
+{
+	static const unsigned int kDocToken = 0u;
+	static const unsigned int kParaToken = 1u;
+	static const unsigned int kEosToken = 2u;
+
+	for (size_t doc = 0; doc < docCount; ++doc)
+	{
+		corpus_push_boundary(kDocToken, outStream);
+		const char* text = docs[doc];
+		std::string word;
+		word.reserve(24u);
+		for (size_t i = 0; text[i] != '\0'; ++i)
+		{
+			const unsigned char uc = static_cast<unsigned char>(text[i]);
+			const char c = static_cast<char>(uc);
+			const bool alphaNum = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			                    || (c >= '0' && c <= '9') || c == '\'');
+			if (alphaNum)
+			{
+				word.push_back((c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c);
+				continue;
+			}
+			if (!word.empty())
+			{
+				outStream.push_back(corpus_intern_word(word, padTokenId, lexicon, nextId));
+				word.clear();
+			}
+			if (c == '.' || c == '!' || c == '?' || c == ';' || c == ':')
+				corpus_push_boundary(kEosToken, outStream);
+			else if (c == '\n')
+				corpus_push_boundary(kParaToken, outStream);
+		}
+		if (!word.empty())
+			outStream.push_back(corpus_intern_word(word, padTokenId, lexicon, nextId));
+		corpus_push_boundary(kParaToken, outStream);
+	}
+}
+
+static void build_token_windows_from_stream(const std::vector<unsigned int>& stream,
+                                            unsigned int seqCount,
+                                            unsigned int seqLen,
+                                            unsigned int seed,
+                                            unsigned int padTokenId,
+                                            std::vector<unsigned int>& outTokens,
+                                            std::vector<glades::DataInput::SequenceSpan>& outSpans)
+{
+	outTokens.clear();
+	outSpans.clear();
+	if (seqCount == 0u || seqLen == 0u)
+		return;
+
+	std::vector<unsigned int> expanded = stream;
+	if (expanded.empty())
+		expanded.push_back(0u);
+	while (expanded.size() < static_cast<size_t>(seqLen))
+		expanded.insert(expanded.end(), stream.begin(), stream.end());
+
+	const unsigned int maxStart =
+	    (expanded.size() > static_cast<size_t>(seqLen))
+	        ? static_cast<unsigned int>(expanded.size() - static_cast<size_t>(seqLen))
+	        : 0u;
+	const unsigned int stride = std::max(1u, (seqLen / 3u) + 7u);
+	const unsigned int jitterSpan = std::max(1u, (seqLen / 4u) + 1u);
+	const unsigned int baseStart =
+	    (maxStart > 0u) ? (mix_u32(seed + 0x6a09e667U) % (maxStart + 1u)) : 0u;
+
+	outTokens.reserve(static_cast<size_t>(seqCount) * static_cast<size_t>(seqLen + 1u));
+	outSpans.reserve(seqCount);
+	for (unsigned int seq = 0u; seq < seqCount; ++seq)
+	{
+		const unsigned int jitter = mix_u32(seed + 0x9e3779b9U * (seq + 1u)) % jitterSpan;
+		const unsigned int start =
+		    (maxStart > 0u) ? ((baseStart + seq * stride + jitter) % (maxStart + 1u)) : 0u;
+		const unsigned int spanStart = static_cast<unsigned int>(outTokens.size());
+		for (unsigned int i = 0; i < seqLen; ++i)
+			outTokens.push_back(expanded[static_cast<size_t>(start + i)]);
+		outSpans.push_back(glades::DataInput::SequenceSpan(spanStart, seqLen));
+		outTokens.push_back(padTokenId);
+	}
+}
+
+static void build_token_corpus_streams(bool largeCorpus,
+                                       unsigned int padTokenId,
+                                       std::vector<unsigned int>& trainStream,
+                                       std::vector<unsigned int>& testStream)
+{
+	static const char* kTrainDocs[] = {
+	    "Alice was beginning to get very tired of sitting by her sister on the bank, and of having nothing to do. Once or twice she had peeped into the book her sister was reading, but it had no pictures or conversations in it. What is the use of a book, thought Alice, without pictures or conversation? So she was considering in her own mind whether the pleasure of making a daisy chain would be worth the trouble of getting up and picking the daisies, when suddenly a White Rabbit with pink eyes ran close by her.",
+	    "It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife. However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered the rightful property of some one or other of their daughters.",
+	    "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation.",
+	    "The story of the house is printed in a little book. It tells of an old red brick farmhouse, standing in a rich pasture country, and of a road that ran before the door and passed away among ancient trees. The house looked across wide meadows, and behind it there were orchards, hedges, and a brook that moved slowly under the willows.",
+	    "The Time Traveller had finally finished the tale of his machine, and we sat in the yellow lamplight looking from him to the fire. His model stood on the table near the lamp, a little thing of ivory and shining metal, while the larger apparatus waited in the laboratory beyond the smoking room. We asked questions, and he answered them absently, as if he were still watching some remote horizon.",
+	    "To Sherlock Holmes she is always the woman. I have seldom heard him mention her under any other name. In his eyes she eclipses and predominates the whole of her sex. It was not that he felt any emotion akin to love for Irene Adler. All emotions, and that one particularly, were abhorrent to his cold, precise but admirably balanced mind." };
+
+	static const char* kTestDocs[] = {
+	    "When I was a child my mother used to tell me stories of voyages by sea, and of harbours where the masts of ships stood thick as leafless trees in winter. I remembered the smell of tar and salt, the clatter of boots upon the quay, and the ringing cry of the tide among the stones. Those memories returned to me many years later when I first set foot upon a windswept pier at dusk.",
+	    "No one would have believed in the last years of the nineteenth century that this world was being watched keenly and closely by intelligences greater than man's. Yet across the gulf of space minds that are to our minds as ours are to the beasts that perish regarded this earth with envious eyes, and slowly and surely drew their plans against us.",
+	    "3 May. Bistritz. Left Munich at eight thirty five in the evening on first May, arriving at Vienna early next morning. Budapest seems a wonderful place, from the glimpse which I got of it from the train and the little I could walk through the streets. I feared to go very far from the station, as we had arrived late and would start as near the correct time as possible." };
+
+	static const char* kTrainDocsExtra[] = {
+	    "There was no possibility of taking a walk that day. We had been wandering, indeed, in the leafless shrubbery an hour in the morning, but since dinner the cold winter wind had brought with it clouds so sombre and a rain so penetrating that further out-door exercise was now out of the question.",
+	    "I remember him well, standing in the doorway with the lamp behind him and the wind lifting the edges of his cloak. He had the air of a man who had seen many roads and trusted none of them, yet his voice when he spoke of the valley and the mills was quiet and exact, as if he carried an entire map of the district in his mind.",
+	    "My father's family name being Pirrip, and my Christian name Philip, my infant tongue could make of both names nothing longer or more explicit than Pip. So I called myself Pip, and came to be called Pip. I give Pirrip as my father's family name, on the authority of his tombstone and my sister Mrs Joe Gargery, who married the blacksmith.",
+	    "The blackness of darkness fell from the air and the rain beat in gusts against the panes. Far down the lane there was a lantern moving, dipping and rising as the bearer made his slow way between hedges that shone with wet. In the kitchen the clock ticked loudly, and every sound in the house seemed to wait upon the knock that had not yet come." };
+
+	static const char* kTestDocsExtra[] = {
+	    "In the centre of the room there was a table spread with papers, charts, and a small globe stained by years of handling. The windows looked over a narrow court where rainwater gathered in the ruts, and beyond the court rose a wall of warehouses whose blank brick fronts caught the last grey of evening.",
+	    "The garden lay still under the first light of morning, and only the birds had begun their business. Paths of damp gravel wound between the beds, and every leaf carried a bead of water that flashed briefly and was gone. She paused at the gate because the place seemed older than memory and yet freshly made before her eyes." };
+
+	trainStream.clear();
+	testStream.clear();
+	std::map<std::string, unsigned int> lexicon;
+	lexicon.insert(std::make_pair(std::string("<doc>"), 0u));
+	lexicon.insert(std::make_pair(std::string("<para>"), 1u));
+	lexicon.insert(std::make_pair(std::string("<eos>"), 2u));
+	unsigned int nextId = 3u;
+	append_corpus_docs(kTrainDocs, sizeof(kTrainDocs) / sizeof(kTrainDocs[0]),
+	                   padTokenId, lexicon, nextId, trainStream);
+	if (largeCorpus)
+	{
+		append_corpus_docs(kTrainDocsExtra, sizeof(kTrainDocsExtra) / sizeof(kTrainDocsExtra[0]),
+		                   padTokenId, lexicon, nextId, trainStream);
+	}
+	append_corpus_docs(kTestDocs, sizeof(kTestDocs) / sizeof(kTestDocs[0]),
+	                   padTokenId, lexicon, nextId, testStream);
+	if (largeCorpus)
+	{
+		append_corpus_docs(kTestDocsExtra, sizeof(kTestDocsExtra) / sizeof(kTestDocsExtra[0]),
+		                   padTokenId, lexicon, nextId, testStream);
+	}
+}
+
 static void build_token_dataset(const BenchConfig& cfg, TokenDataset& out)
 {
 	out = TokenDataset();
@@ -1842,10 +3205,38 @@ static void build_token_dataset(const BenchConfig& cfg, TokenDataset& out)
 	std::vector<glades::DataInput::SequenceSpan> trainSpans;
 	std::vector<glades::DataInput::SequenceSpan> testSpans;
 
-	build_token_split(cfg.token.vocab, cfg.token.trainSeqs, cfg.token.seqLen, cfg.seed + 11u,
-	                  out.padTokenId, trainTokens, trainSpans);
-	build_token_split(cfg.token.vocab, cfg.token.testSeqs, cfg.token.seqLen, cfg.seed + 1011u,
-	                  out.padTokenId, testTokens, testSpans);
+	if (cfg.mode == MODE_TOKEN_LM_CONTEXT || cfg.mode == MODE_TOKEN_LM_CONTEXT_LARGE)
+	{
+		build_token_context_split(cfg.token.vocab, cfg.token.trainSeqs, cfg.token.seqLen, cfg.seed + 11u,
+		                          out.padTokenId, trainTokens, trainSpans);
+		build_token_context_split(cfg.token.vocab, cfg.token.testSeqs, cfg.token.seqLen, cfg.seed + 1011u,
+		                          out.padTokenId, testTokens, testSpans);
+	}
+	else if (cfg.mode == MODE_TOKEN_LM_DOCUMENT)
+	{
+		build_token_document_split(cfg.token.vocab, cfg.token.trainSeqs, cfg.token.seqLen, cfg.seed + 211u,
+		                           out.padTokenId, trainTokens, trainSpans);
+		build_token_document_split(cfg.token.vocab, cfg.token.testSeqs, cfg.token.seqLen, cfg.seed + 1211u,
+		                           out.padTokenId, testTokens, testSpans);
+	}
+	else if (cfg.mode == MODE_TOKEN_LM_CORPUS || cfg.mode == MODE_TOKEN_LM_CORPUS_LARGE)
+	{
+		std::vector<unsigned int> trainStream;
+		std::vector<unsigned int> testStream;
+		const bool largeCorpus = (cfg.mode == MODE_TOKEN_LM_CORPUS_LARGE);
+		build_token_corpus_streams(largeCorpus, out.padTokenId, trainStream, testStream);
+		build_token_windows_from_stream(trainStream, cfg.token.trainSeqs, cfg.token.seqLen,
+		                                cfg.seed + 311u, out.padTokenId, trainTokens, trainSpans);
+		build_token_windows_from_stream(testStream, cfg.token.testSeqs, cfg.token.seqLen,
+		                                cfg.seed + 1311u, out.padTokenId, testTokens, testSpans);
+	}
+	else
+	{
+		build_token_split(cfg.token.vocab, cfg.token.trainSeqs, cfg.token.seqLen, cfg.seed + 11u,
+		                  out.padTokenId, trainTokens, trainSpans);
+		build_token_split(cfg.token.vocab, cfg.token.testSeqs, cfg.token.seqLen, cfg.seed + 1011u,
+		                  out.padTokenId, testTokens, testSpans);
+	}
 
 	out.di.setTrainTokens(trainTokens, static_cast<int>(out.padTokenId));
 	out.di.setTestTokens(testTokens, static_cast<int>(out.padTokenId));
@@ -1873,6 +3264,16 @@ static void reset_atlas_family(glades::TrainingConfig& tc)
 	tc.atlas.orbitEnabled = false;
 	tc.atlas.helmEnabled = false;
 	tc.atlas.asterEnabled = false;
+	tc.atlas.aegisEnabled = false;
+	tc.atlas.citadelEnabled = false;
+	tc.atlas.rampartEnabled = false;
+	tc.atlas.meritEnabled = false;
+	tc.atlas.strataEnabled = false;
+	tc.atlas.auroraEnabled = false;
+	tc.atlas.seamEnabled = false;
+	tc.atlas.quasarEnabled = false;
+	tc.atlas.geodeEnabled = false;
+	tc.atlas.kappaEnabled = false;
 }
 
 static void configure_atlas(glades::TrainingConfig& tc,
@@ -1881,7 +3282,14 @@ static void configure_atlas(glades::TrainingConfig& tc,
 {
 	tc.optimizer.type = glades::OptimizerConfig::ATLAS;
 	tc.atlas.rank = cfg.atlasRank;
-	tc.atlas.complementRank = (variant == VARIANT_ATLAS_SPARROW) ? cfg.atlasComplementRank : 0u;
+	tc.atlas.complementRank =
+	    ((variant == VARIANT_ATLAS_SPARROW) || (variant == VARIANT_ATLAS_AEGIS)
+	     || (variant == VARIANT_ATLAS_CITADEL) || (variant == VARIANT_ATLAS_RAMPART)
+	     || (variant == VARIANT_ATLAS_MERIT) || (variant == VARIANT_ATLAS_STRATA)
+	     || (variant == VARIANT_ATLAS_AURORA) || (variant == VARIANT_ATLAS_SEAM)
+	     || (variant == VARIANT_ATLAS_QUASAR) || (variant == VARIANT_ATLAS_GEODE))
+	        ? cfg.atlasComplementRank
+	        : 0u;
 	tc.atlas.tSub = cfg.atlasTSub;
 	tc.atlas.beta = 0.999f;
 	tc.atlas.betaRefresh = 0.5f;
@@ -1917,6 +3325,207 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
 		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
 		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+		tc.atlas.auroraAdamwBackbone = (cfg.atlasAuroraAdamwBackbone != 0u);
+		tc.atlas.auroraHeadGain = cfg.atlasAuroraHeadGain;
+		tc.atlas.auroraBodyTrustScale = cfg.atlasAuroraBodyTrustScale;
+	}
+	else if (variant == VARIANT_ATLAS_AEGIS)
+	{
+		tc.atlas.aegisEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_CITADEL)
+	{
+		tc.atlas.aegisEnabled = true;
+		tc.atlas.citadelEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_RAMPART)
+	{
+		tc.atlas.aegisEnabled = true;
+		tc.atlas.rampartEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_MERIT)
+	{
+		tc.atlas.aegisEnabled = true;
+		tc.atlas.meritEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_STRATA)
+	{
+		tc.atlas.aegisEnabled = true;
+		tc.atlas.strataEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_AURORA)
+	{
+		tc.atlas.auroraEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_SEAM)
+	{
+		tc.atlas.seamEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_QUASAR)
+	{
+		tc.atlas.quasarEnabled = true;
+		tc.atlas.sparrowEnabled = true;
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.asterEnabled = true;
+		tc.atlas.asterMemoryScale = cfg.atlasAsterMemoryScale;
+		tc.atlas.asterEdgeThreshold = cfg.atlasAsterEdgeThreshold;
+		tc.atlas.asterStateRank = cfg.atlasAsterStateRank;
+		tc.atlas.asterHiddenStackDepth = cfg.atlasAsterHiddenStackDepth;
+		tc.atlas.asterPoleMax = cfg.atlasAsterPoleMax;
+		tc.atlas.kappaEnabled = (cfg.atlasKappaEnabled != 0u);
+		tc.atlas.kappaHeads = cfg.atlasKappaHeads;
+		tc.atlas.kappaLagBuckets = cfg.atlasKappaLagBuckets;
+		tc.atlas.kappaRank = cfg.atlasKappaRank;
+	}
+	else if (variant == VARIANT_ATLAS_GEODE)
+	{
+		tc.atlas.geodeEnabled = true;
+		tc.atlas.sparrowEnabled = (cfg.atlasGeodePredictiveScale > 0.0f);
+		tc.atlas.sparrowModeRank = cfg.atlasSparrowModeRank;
+		tc.atlas.sparrowAutoModeGate = (cfg.atlasSparrowAutoModeGate != 0u);
+		tc.atlas.sparrowMemoryScale = cfg.atlasSparrowMemoryScale;
+		tc.atlas.sparrowEdgeThreshold = cfg.atlasSparrowEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeThreshold = cfg.atlasSparrowSecondEdgeThreshold;
+		tc.atlas.sparrowSecondEdgeFraction = cfg.atlasSparrowSecondEdgeFraction;
+		tc.atlas.sparrowPoleMax = cfg.atlasSparrowPoleMax;
+		tc.atlas.geodeGeometryScale = cfg.atlasGeodeGeometryScale;
+		tc.atlas.geodePredictiveScale = cfg.atlasGeodePredictiveScale;
 	}
 }
 
@@ -1942,6 +3551,18 @@ static bool configure_optimizer(glades::TrainingConfig& tc,
 	(void)atlasLR;
 	(void)adamLR;
 	return true;
+}
+
+static bool token_variant_uses_adamw_backbone(const BenchConfig& cfg, VariantKind variant)
+{
+	return (variant == VARIANT_ADAMW)
+	    || (variant == VARIANT_ATLAS_AURORA && cfg.atlasAuroraAdamwBackbone != 0u)
+	    || (variant == VARIANT_ATLAS_GEODE);
+}
+
+static float token_variant_learning_rate(const BenchConfig& cfg, VariantKind variant)
+{
+	return token_variant_uses_adamw_backbone(cfg, variant) ? cfg.token.adamLR : cfg.token.atlasLR;
 }
 
 static glades::NNInfo* build_token_info(const BenchConfig& cfg, float learningRate, const char* name)
@@ -1982,7 +3603,7 @@ static bool make_token_network(const BenchConfig& cfg,
                                NetworkOwner& out,
                                std::string& err)
 {
-	const float lr = (variant == VARIANT_ADAMW) ? cfg.token.adamLR : cfg.token.atlasLR;
+	const float lr = token_variant_learning_rate(cfg, variant);
 	out.info = build_token_info(cfg, lr, "atlas_alt_token_lm");
 	out.net = new glades::NNetwork(out.info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 	out.net->setSeed(seed);
@@ -1999,9 +3620,18 @@ static bool make_token_network(const BenchConfig& cfg,
 	tc.transformer.nKVHeadsOverride = static_cast<int>(cfg.token.kvHeads);
 	tc.transformer.dFFOverride = static_cast<int>(cfg.token.dFF);
 	tc.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+	tc.transformer.ffnActivation = glades::TransformerRunConfig::FFN_GELU;
 	tc.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
 	tc.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+	tc.transformer.kvCacheDType = glades::TransformerRunConfig::KV_CACHE_F32;
+	tc.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	tc.transformer.tokenLmSampledNegatives = 64;
+	tc.transformer.tokenLmAllowHugeFullSoftmax = false;
+	tc.transformer.captureOptimizerGapDiagnostics = true;
+	tc.transformer.layerNormEps = 1e-5f;
 	tc.transformer.ropeTheta = 10000.0f;
+	tc.transformer.embeddingDropoutRate = 0.0f;
+	tc.transformer.residualDropoutRate = 0.0f;
 	configure_optimizer(tc, cfg, variant, cfg.token.adamLR, cfg.token.atlasLR, 1.0f);
 
 	const glades::NNetworkStatus stCfg = out.net->setTrainingConfig(tc);
@@ -2056,6 +3686,25 @@ static bool make_regression_network(const BenchConfig& cfg,
 	out.net->getTerminatorMutable().setAccuracy(0.0f);
 
 	glades::TrainingConfig tc = out.net->getTrainingConfig();
+	tc.transformer.enableTokenEmbedding = false;
+	tc.transformer.vocabSizeOverride = 0;
+	tc.transformer.tieEmbeddings = true;
+	tc.transformer.padTokenId = -1;
+	tc.transformer.nHeadsOverride = 0;
+	tc.transformer.nKVHeadsOverride = 0;
+	tc.transformer.dFFOverride = 0;
+	tc.transformer.ffnKind = glades::TransformerRunConfig::FFN_MLP;
+	tc.transformer.ffnActivation = glades::TransformerRunConfig::FFN_RELU;
+	tc.transformer.normType = glades::TransformerRunConfig::NORM_LAYERNORM;
+	tc.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_SINUSOIDAL;
+	tc.transformer.kvCacheDType = glades::TransformerRunConfig::KV_CACHE_F32;
+	tc.transformer.tokenLmLossKind = glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX;
+	tc.transformer.tokenLmSampledNegatives = 64;
+	tc.transformer.tokenLmAllowHugeFullSoftmax = false;
+	tc.transformer.layerNormEps = 1e-5f;
+	tc.transformer.ropeTheta = 10000.0f;
+	tc.transformer.embeddingDropoutRate = 0.0f;
+	tc.transformer.residualDropoutRate = 0.0f;
 	configure_optimizer(tc, cfg, variant, spec.adamLR, spec.atlasLR, spec.clipNorm);
 	const glades::NNetworkStatus stCfg = out.net->setTrainingConfig(tc);
 	if (!stCfg.ok())
@@ -2142,6 +3791,9 @@ static RunResult run_token_variant(const BenchConfig& cfg,
 		return out;
 	}
 
+	glades::NNetwork::TransformerGroupedParameterSnapshot beforeTrainSnapshot;
+	owner.net->getTransformerGroupedParameterSnapshot(beforeTrainSnapshot);
+
 	CaptureMetricsCallbacks trainCb;
 	const int64_t t0 = now_ms();
 	const glades::NNetworkStatus trainStatus = owner.net->train(const_cast<InMemoryTokenIdInput*>(&data.di), &trainCb);
@@ -2162,6 +3814,26 @@ static RunResult run_token_variant(const BenchConfig& cfg,
 	fill_sparrow_run_result(trainCb, out);
 	fill_helm_run_result(trainCb, out);
 	fill_aster_run_result(trainCb, out);
+	fill_aegis_run_result(trainCb, out);
+	fill_citadel_run_result(trainCb, out);
+	fill_rampart_run_result(trainCb, out);
+	fill_merit_run_result(trainCb, out);
+	fill_strata_run_result(trainCb, out);
+	glades::NNetwork::TransformerGroupedParameterSnapshot afterTrainSnapshot;
+	owner.net->getTransformerGroupedParameterSnapshot(afterTrainSnapshot);
+	fill_transformer_gap_from_snapshots(beforeTrainSnapshot, afterTrainSnapshot, out);
+	glades::NNetwork::AtlasRuntimeDiagnostics trainDiag;
+	if (owner.net->getAtlasRuntimeDiagnostics(trainDiag))
+	{
+		if (trainDiag.transformerGapBatches > 0u)
+			out.transformerApplyMs = trainDiag.transformerMeanApplyMs;
+		if (trainDiag.transformerMarginSnapshots > 0u)
+		{
+			out.transformerTrainMarginValid = true;
+			out.transformerTrainTargetMargin = trainDiag.transformerMeanTargetMargin;
+			out.transformerTrainHardNegativeLogit = trainDiag.transformerMeanHardNegativeLogit;
+		}
+	}
 
 	CaptureMetricsCallbacks testCb;
 	const int64_t t2 = now_ms();
@@ -2185,6 +3857,13 @@ static RunResult run_token_variant(const BenchConfig& cfg,
 	out.trainMetric = (trainCb.last.perplexity > 0.0f) ? trainCb.last.perplexity : safe_exp(trainCb.last.totalError);
 	out.testLoss = testCb.last.totalError;
 	out.testMetric = (testCb.last.perplexity > 0.0f) ? testCb.last.perplexity : safe_exp(testCb.last.totalError);
+	glades::NNetwork::AtlasRuntimeDiagnostics testDiag;
+	if (owner.net->getAtlasRuntimeDiagnostics(testDiag) && testDiag.transformerMarginSnapshots > 0u)
+	{
+		out.transformerTestMarginValid = true;
+		out.transformerTestTargetMargin = testDiag.transformerMeanTargetMargin;
+		out.transformerTestHardNegativeLogit = testDiag.transformerMeanHardNegativeLogit;
+	}
 
 	const double seconds = static_cast<double>(out.trainMs) / 1000.0;
 	const double tokens = static_cast<double>(data.trainTokensPerEpoch) * static_cast<double>(cfg.token.epochs);
@@ -2234,6 +3913,11 @@ static RunResult run_teacher_variant(const BenchConfig& cfg,
 	fill_sparrow_run_result(trainCb, out);
 	fill_helm_run_result(trainCb, out);
 	fill_aster_run_result(trainCb, out);
+	fill_aegis_run_result(trainCb, out);
+	fill_citadel_run_result(trainCb, out);
+	fill_rampart_run_result(trainCb, out);
+	fill_merit_run_result(trainCb, out);
+	fill_strata_run_result(trainCb, out);
 
 	CaptureMetricsCallbacks testCb;
 	const int64_t t2 = now_ms();
@@ -2306,6 +3990,11 @@ static RunResult run_latent_variant(const BenchConfig& cfg,
 	fill_sparrow_run_result(trainCb, out);
 	fill_helm_run_result(trainCb, out);
 	fill_aster_run_result(trainCb, out);
+	fill_aegis_run_result(trainCb, out);
+	fill_citadel_run_result(trainCb, out);
+	fill_rampart_run_result(trainCb, out);
+	fill_merit_run_result(trainCb, out);
+	fill_strata_run_result(trainCb, out);
 
 	CaptureMetricsCallbacks testCb;
 	const int64_t t2 = now_ms();
@@ -2380,6 +4069,11 @@ static RunResult run_nonlinear_latent_variant(const BenchConfig& cfg,
 	fill_sparrow_run_result(trainCb, out);
 	fill_helm_run_result(trainCb, out);
 	fill_aster_run_result(trainCb, out);
+	fill_aegis_run_result(trainCb, out);
+	fill_citadel_run_result(trainCb, out);
+	fill_rampart_run_result(trainCb, out);
+	fill_merit_run_result(trainCb, out);
+	fill_strata_run_result(trainCb, out);
 
 	CaptureMetricsCallbacks testCb;
 	const int64_t t2 = now_ms();
@@ -2476,6 +4170,125 @@ static void print_aster_usage_row(const Summary& s)
 	       s.asterApplyMs.mean, s.asterApplyMs.stddev);
 }
 
+static void print_aegis_usage_row(const Summary& s)
+{
+	if (!s.aegisDiagValid)
+		return;
+	printf("  AEGIS usage:   lS=%5.3f +/- %-5.3f  lP=%5.3f +/- %-5.3f  lO=%5.3f +/- %-5.3f  pPred=%5.3f +/- %-5.3f  pReal=%5.3f +/- %-5.3f\n",
+	       s.aegisLambdaSpatial.mean, s.aegisLambdaSpatial.stddev,
+	       s.aegisLambdaPredictive.mean, s.aegisLambdaPredictive.stddev,
+	       s.aegisLambdaOutput.mean, s.aegisLambdaOutput.stddev,
+	       s.aegisPredictivePredicted.mean, s.aegisPredictivePredicted.stddev,
+	       s.aegisPredictiveRealized.mean, s.aegisPredictiveRealized.stddev);
+	printf("                oPred=%5.3f +/- %-5.3f  oReal=%5.3f +/- %-5.3f  pErr=%5.3f +/- %-5.3f  oErr=%5.3f +/- %-5.3f  disagree=%5.3f +/- %-5.3f\n",
+	       s.aegisOutputPredicted.mean, s.aegisOutputPredicted.stddev,
+	       s.aegisOutputRealized.mean, s.aegisOutputRealized.stddev,
+	       s.aegisPredictiveError.mean, s.aegisPredictiveError.stddev,
+	       s.aegisOutputError.mean, s.aegisOutputError.stddev,
+	       s.aegisChannelDisagreement.mean, s.aegisChannelDisagreement.stddev);
+}
+
+static void print_citadel_usage_row(const Summary& s)
+{
+	if (!s.citadelDiagValid)
+		return;
+	printf("  CITADEL:      anchor=%5.3f +/- %-5.3f  hard=%5.3f +/- %-5.3f  sparrowTrust=%5.3f +/- %-5.3f\n",
+	       s.citadelAnchor.mean, s.citadelAnchor.stddev,
+	       s.citadelHardRegimeMass.mean, s.citadelHardRegimeMass.stddev,
+	       s.citadelSparrowTrust.mean, s.citadelSparrowTrust.stddev);
+}
+
+static void print_rampart_usage_row(const Summary& s)
+{
+	if (!s.rampartDiagValid)
+		return;
+	printf("  RAMPART:      tau=%5.3f +/- %-5.3f  budget=%5.3f +/- %-5.3f  cov=%5.3f +/- %-5.3f  sparrowTrust=%5.3f +/- %-5.3f\n",
+	       s.rampartTau.mean, s.rampartTau.stddev,
+	       s.rampartBudget.mean, s.rampartBudget.stddev,
+	       s.rampartCovariance.mean, s.rampartCovariance.stddev,
+	       s.rampartSparrowTrust.mean, s.rampartSparrowTrust.stddev);
+}
+
+static void print_merit_usage_row(const Summary& s)
+{
+	if (!s.meritDiagValid)
+		return;
+	printf("  MERIT:        tau=%5.3f +/- %-5.3f  budget=%5.3f +/- %-5.3f  cov=%5.3f +/- %-5.3f  sparrowTrust=%5.3f +/- %-5.3f  geom=%5.3f +/- %-5.3f\n",
+	       s.meritTau.mean, s.meritTau.stddev,
+	       s.meritBudget.mean, s.meritBudget.stddev,
+	       s.meritCovariance.mean, s.meritCovariance.stddev,
+	       s.meritSparrowTrust.mean, s.meritSparrowTrust.stddev,
+	       s.meritGeometryTrust.mean, s.meritGeometryTrust.stddev);
+}
+
+static void print_strata_usage_row(const Summary& s)
+{
+	if (!s.strataDiagValid)
+		return;
+	printf("  STRATA:       null=%5.3f +/- %-5.3f  pred=%5.3f +/- %-5.3f  out=%5.3f +/- %-5.3f  coupled=%5.3f +/- %-5.3f  budget=%5.3f +/- %-5.3f\n",
+	       s.strataNullMode.mean, s.strataNullMode.stddev,
+	       s.strataPredictiveMode.mean, s.strataPredictiveMode.stddev,
+	       s.strataOutputMode.mean, s.strataOutputMode.stddev,
+	       s.strataCoupledMode.mean, s.strataCoupledMode.stddev,
+	       s.strataBudget.mean, s.strataBudget.stddev);
+	printf("                bNull=%5.3f +/- %-5.3f  bPred=%5.3f +/- %-5.3f  bOut=%5.3f +/- %-5.3f  bCoupled=%5.3f +/- %-5.3f  excess=%5.3f +/- %-5.3f  switch=%5.3f +/- %-5.3f\n",
+	       s.strataNullBenefit.mean, s.strataNullBenefit.stddev,
+	       s.strataPredictiveBenefit.mean, s.strataPredictiveBenefit.stddev,
+	       s.strataOutputBenefit.mean, s.strataOutputBenefit.stddev,
+	       s.strataCoupledBenefit.mean, s.strataCoupledBenefit.stddev,
+	       s.strataSelectedExcess.mean, s.strataSelectedExcess.stddev,
+	       s.strataSwitchRate.mean, s.strataSwitchRate.stddev);
+}
+
+static void print_transformer_gap_row(const Summary& s)
+{
+	if (!s.transformerGapDiagValid)
+		return;
+	std::ostringstream oss;
+	oss << "  XFORM proxy:  in=" << std::fixed << std::setprecision(3)
+	    << s.transformerInputUpdateNorm.mean << " +/- " << s.transformerInputUpdateNorm.stddev
+	    << "  blk=[";
+	for (size_t i = 0; i < s.transformerBlockUpdateNorms.size(); ++i)
+	{
+		if (i > 0u)
+			oss << ' ';
+		oss << s.transformerBlockUpdateNorms[i].mean;
+	}
+	oss << "]  final=" << s.transformerFinalNormUpdateNorm.mean
+	    << " +/- " << s.transformerFinalNormUpdateNorm.stddev
+	    << "  head=" << s.transformerHeadUpdateNorm.mean
+	    << " +/- " << s.transformerHeadUpdateNorm.stddev
+	    << "  hShare=" << s.transformerHeadShare.mean
+	    << " +/- " << s.transformerHeadShare.stddev
+	    << "  applyMs=" << s.transformerApplyMs.mean
+	    << " +/- " << s.transformerApplyMs.stddev;
+	printf("%s\n", oss.str().c_str());
+	if (s.transformerTrainMarginValid || s.transformerTestMarginValid)
+	{
+		printf("                trainMargin=%5.3f +/- %-5.3f  trainHardNeg=%5.3f +/- %-5.3f  testMargin=%5.3f +/- %-5.3f  testHardNeg=%5.3f +/- %-5.3f\n",
+		       s.transformerTrainTargetMargin.mean, s.transformerTrainTargetMargin.stddev,
+		       s.transformerTrainHardNegativeLogit.mean, s.transformerTrainHardNegativeLogit.stddev,
+		       s.transformerTestTargetMargin.mean, s.transformerTestTargetMargin.stddev,
+		       s.transformerTestHardNegativeLogit.mean, s.transformerTestHardNegativeLogit.stddev);
+	}
+}
+
+static void print_transformer_gap_compare_row(const Summary& adamw, const Summary& other)
+{
+	if (!adamw.transformerGapDiagValid || !other.transformerGapDiagValid)
+		return;
+	const std::vector<double> adamwProfile = make_transformer_profile(adamw);
+	const std::vector<double> otherProfile = make_transformer_profile(other);
+	const double cosine = profile_cosine(adamwProfile, otherProfile);
+	printf("  vs AdamW %-12s  profileCos=%+6.3f  dHeadShare=%+7.4f  dTrainMargin=%+7.4f  dTestMargin=%+7.4f  dApplyMs=%+7.4f\n",
+	       other.label,
+	       cosine,
+	       other.transformerHeadShare.mean - adamw.transformerHeadShare.mean,
+	       other.transformerTrainTargetMargin.mean - adamw.transformerTrainTargetMargin.mean,
+	       other.transformerTestTargetMargin.mean - adamw.transformerTestTargetMargin.mean,
+	       other.transformerApplyMs.mean - adamw.transformerApplyMs.mean);
+}
+
 static void fill_sparrow_run_result(const CaptureMetricsCallbacks& cb, RunResult& out)
 {
 	if (!cb.sawAtlas || cb.atlasSparrowEpochs == 0u)
@@ -2529,6 +4342,79 @@ static void fill_aster_run_result(const CaptureMetricsCallbacks& cb, RunResult& 
 	out.asterApplyMs = cb.atlasAsterApplyMsSum / denom;
 }
 
+static void fill_aegis_run_result(const CaptureMetricsCallbacks& cb, RunResult& out)
+{
+	if (!cb.sawAtlas || cb.atlasAegisEpochs == 0u)
+		return;
+	const double denom = static_cast<double>(cb.atlasAegisEpochs);
+	out.aegisDiagValid = true;
+	out.aegisLambdaSpatial = cb.atlasAegisLambdaSpatialSum / denom;
+	out.aegisLambdaPredictive = cb.atlasAegisLambdaPredictiveSum / denom;
+	out.aegisLambdaOutput = cb.atlasAegisLambdaOutputSum / denom;
+	out.aegisPredictivePredicted = cb.atlasAegisPredictivePredictedSum / denom;
+	out.aegisPredictiveRealized = cb.atlasAegisPredictiveRealizedSum / denom;
+	out.aegisOutputPredicted = cb.atlasAegisOutputPredictedSum / denom;
+	out.aegisOutputRealized = cb.atlasAegisOutputRealizedSum / denom;
+	out.aegisPredictiveError = cb.atlasAegisPredictiveErrorSum / denom;
+	out.aegisOutputError = cb.atlasAegisOutputErrorSum / denom;
+	out.aegisChannelDisagreement = cb.atlasAegisChannelDisagreementSum / denom;
+}
+
+static void fill_citadel_run_result(const CaptureMetricsCallbacks& cb, RunResult& out)
+{
+	if (!cb.sawAtlas || cb.atlasCitadelEpochs == 0u)
+		return;
+	const double denom = static_cast<double>(cb.atlasCitadelEpochs);
+	out.citadelDiagValid = true;
+	out.citadelAnchor = cb.atlasCitadelAnchorSum / denom;
+	out.citadelHardRegimeMass = cb.atlasCitadelHardRegimeMassSum / denom;
+	out.citadelSparrowTrust = cb.atlasCitadelSparrowTrustSum / denom;
+}
+
+static void fill_rampart_run_result(const CaptureMetricsCallbacks& cb, RunResult& out)
+{
+	if (!cb.sawAtlas || cb.atlasRampartEpochs == 0u)
+		return;
+	const double denom = static_cast<double>(cb.atlasRampartEpochs);
+	out.rampartDiagValid = true;
+	out.rampartTau = cb.atlasRampartTauSum / denom;
+	out.rampartBudget = cb.atlasRampartBudgetSum / denom;
+	out.rampartCovariance = cb.atlasRampartCovarianceSum / denom;
+	out.rampartSparrowTrust = cb.atlasRampartSparrowTrustSum / denom;
+}
+
+static void fill_merit_run_result(const CaptureMetricsCallbacks& cb, RunResult& out)
+{
+	if (!cb.sawAtlas || cb.atlasMeritEpochs == 0u)
+		return;
+	const double denom = static_cast<double>(cb.atlasMeritEpochs);
+	out.meritDiagValid = true;
+	out.meritTau = cb.atlasMeritTauSum / denom;
+	out.meritBudget = cb.atlasMeritBudgetSum / denom;
+	out.meritCovariance = cb.atlasMeritCovarianceSum / denom;
+	out.meritSparrowTrust = cb.atlasMeritSparrowTrustSum / denom;
+	out.meritGeometryTrust = cb.atlasMeritGeometryTrustSum / denom;
+}
+
+static void fill_strata_run_result(const CaptureMetricsCallbacks& cb, RunResult& out)
+{
+	if (!cb.sawAtlas || cb.atlasStrataEpochs == 0u)
+		return;
+	const double denom = static_cast<double>(cb.atlasStrataEpochs);
+	out.strataDiagValid = true;
+	out.strataNullMode = cb.atlasStrataNullModeSum / denom;
+	out.strataPredictiveMode = cb.atlasStrataPredictiveModeSum / denom;
+	out.strataOutputMode = cb.atlasStrataOutputModeSum / denom;
+	out.strataCoupledMode = cb.atlasStrataCoupledModeSum / denom;
+	out.strataBudget = cb.atlasStrataBudgetSum / denom;
+	out.strataNullBenefit = cb.atlasStrataNullBenefitSum / denom;
+	out.strataPredictiveBenefit = cb.atlasStrataPredictiveBenefitSum / denom;
+	out.strataOutputBenefit = cb.atlasStrataOutputBenefitSum / denom;
+	out.strataCoupledBenefit = cb.atlasStrataCoupledBenefitSum / denom;
+	out.strataSelectedExcess = cb.atlasStrataSelectedExcessSum / denom;
+	out.strataSwitchRate = cb.atlasStrataSwitchRateSum / denom;
+}
+
 static Summary summarize_runs(const char* label, const std::vector<RunResult>& runs)
 {
 	Summary s;
@@ -2574,6 +4460,50 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 	std::vector<double> asterStateFitMsVals;
 	std::vector<double> asterInnovationFitMsVals;
 	std::vector<double> asterApplyMsVals;
+	std::vector<double> aegisLambdaSpatialVals;
+	std::vector<double> aegisLambdaPredictiveVals;
+	std::vector<double> aegisLambdaOutputVals;
+	std::vector<double> aegisPredictivePredictedVals;
+	std::vector<double> aegisPredictiveRealizedVals;
+	std::vector<double> aegisOutputPredictedVals;
+	std::vector<double> aegisOutputRealizedVals;
+	std::vector<double> aegisPredictiveErrorVals;
+	std::vector<double> aegisOutputErrorVals;
+	std::vector<double> aegisChannelDisagreementVals;
+	std::vector<double> citadelAnchorVals;
+	std::vector<double> citadelHardRegimeMassVals;
+	std::vector<double> citadelSparrowTrustVals;
+	std::vector<double> rampartTauVals;
+	std::vector<double> rampartBudgetVals;
+	std::vector<double> rampartCovarianceVals;
+	std::vector<double> rampartSparrowTrustVals;
+	std::vector<double> meritTauVals;
+	std::vector<double> meritBudgetVals;
+	std::vector<double> meritCovarianceVals;
+	std::vector<double> meritSparrowTrustVals;
+	std::vector<double> meritGeometryTrustVals;
+	std::vector<double> strataNullModeVals;
+	std::vector<double> strataPredictiveModeVals;
+	std::vector<double> strataOutputModeVals;
+	std::vector<double> strataCoupledModeVals;
+	std::vector<double> strataBudgetVals;
+	std::vector<double> strataNullBenefitVals;
+	std::vector<double> strataPredictiveBenefitVals;
+	std::vector<double> strataOutputBenefitVals;
+	std::vector<double> strataCoupledBenefitVals;
+	std::vector<double> strataSelectedExcessVals;
+	std::vector<double> strataSwitchRateVals;
+	std::vector<double> transformerInputUpdateNormVals;
+	std::vector< std::vector<double> > transformerBlockUpdateNormRows;
+	std::vector<double> transformerFinalNormUpdateNormVals;
+	std::vector<double> transformerHeadUpdateNormVals;
+	std::vector<double> transformerHeadShareVals;
+	std::vector<double> transformerNonHeadShareVals;
+	std::vector<double> transformerApplyMsVals;
+	std::vector<double> transformerTrainTargetMarginVals;
+	std::vector<double> transformerTrainHardNegativeLogitVals;
+	std::vector<double> transformerTestTargetMarginVals;
+	std::vector<double> transformerTestHardNegativeLogitVals;
 	bool allOk = true;
 	std::string firstErr;
 	for (size_t i = 0; i < runs.size(); ++i)
@@ -2629,6 +4559,74 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 			asterInnovationFitMsVals.push_back(runs[i].asterInnovationFitMs);
 			asterApplyMsVals.push_back(runs[i].asterApplyMs);
 		}
+		if (runs[i].aegisDiagValid)
+		{
+			aegisLambdaSpatialVals.push_back(runs[i].aegisLambdaSpatial);
+			aegisLambdaPredictiveVals.push_back(runs[i].aegisLambdaPredictive);
+			aegisLambdaOutputVals.push_back(runs[i].aegisLambdaOutput);
+			aegisPredictivePredictedVals.push_back(runs[i].aegisPredictivePredicted);
+			aegisPredictiveRealizedVals.push_back(runs[i].aegisPredictiveRealized);
+			aegisOutputPredictedVals.push_back(runs[i].aegisOutputPredicted);
+			aegisOutputRealizedVals.push_back(runs[i].aegisOutputRealized);
+			aegisPredictiveErrorVals.push_back(runs[i].aegisPredictiveError);
+			aegisOutputErrorVals.push_back(runs[i].aegisOutputError);
+			aegisChannelDisagreementVals.push_back(runs[i].aegisChannelDisagreement);
+		}
+		if (runs[i].citadelDiagValid)
+		{
+			citadelAnchorVals.push_back(runs[i].citadelAnchor);
+			citadelHardRegimeMassVals.push_back(runs[i].citadelHardRegimeMass);
+			citadelSparrowTrustVals.push_back(runs[i].citadelSparrowTrust);
+		}
+		if (runs[i].rampartDiagValid)
+		{
+			rampartTauVals.push_back(runs[i].rampartTau);
+			rampartBudgetVals.push_back(runs[i].rampartBudget);
+			rampartCovarianceVals.push_back(runs[i].rampartCovariance);
+			rampartSparrowTrustVals.push_back(runs[i].rampartSparrowTrust);
+		}
+		if (runs[i].meritDiagValid)
+		{
+			meritTauVals.push_back(runs[i].meritTau);
+			meritBudgetVals.push_back(runs[i].meritBudget);
+			meritCovarianceVals.push_back(runs[i].meritCovariance);
+			meritSparrowTrustVals.push_back(runs[i].meritSparrowTrust);
+			meritGeometryTrustVals.push_back(runs[i].meritGeometryTrust);
+		}
+		if (runs[i].strataDiagValid)
+		{
+			strataNullModeVals.push_back(runs[i].strataNullMode);
+			strataPredictiveModeVals.push_back(runs[i].strataPredictiveMode);
+			strataOutputModeVals.push_back(runs[i].strataOutputMode);
+			strataCoupledModeVals.push_back(runs[i].strataCoupledMode);
+			strataBudgetVals.push_back(runs[i].strataBudget);
+			strataNullBenefitVals.push_back(runs[i].strataNullBenefit);
+			strataPredictiveBenefitVals.push_back(runs[i].strataPredictiveBenefit);
+			strataOutputBenefitVals.push_back(runs[i].strataOutputBenefit);
+			strataCoupledBenefitVals.push_back(runs[i].strataCoupledBenefit);
+			strataSelectedExcessVals.push_back(runs[i].strataSelectedExcess);
+			strataSwitchRateVals.push_back(runs[i].strataSwitchRate);
+		}
+		if (runs[i].transformerGapDiagValid)
+		{
+			transformerInputUpdateNormVals.push_back(runs[i].transformerInputUpdateNorm);
+			transformerBlockUpdateNormRows.push_back(runs[i].transformerBlockUpdateNorms);
+			transformerFinalNormUpdateNormVals.push_back(runs[i].transformerFinalNormUpdateNorm);
+			transformerHeadUpdateNormVals.push_back(runs[i].transformerHeadUpdateNorm);
+			transformerHeadShareVals.push_back(runs[i].transformerHeadShare);
+			transformerNonHeadShareVals.push_back(runs[i].transformerNonHeadShare);
+			transformerApplyMsVals.push_back(runs[i].transformerApplyMs);
+		}
+		if (runs[i].transformerTrainMarginValid)
+		{
+			transformerTrainTargetMarginVals.push_back(runs[i].transformerTrainTargetMargin);
+			transformerTrainHardNegativeLogitVals.push_back(runs[i].transformerTrainHardNegativeLogit);
+		}
+		if (runs[i].transformerTestMarginValid)
+		{
+			transformerTestTargetMarginVals.push_back(runs[i].transformerTestTargetMargin);
+			transformerTestHardNegativeLogitVals.push_back(runs[i].transformerTestHardNegativeLogit);
+		}
 	}
 
 	s.ok = allOk && !trainSecVals.empty();
@@ -2671,6 +4669,58 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 	s.asterStateFitMs = compute_stats(asterStateFitMsVals);
 	s.asterInnovationFitMs = compute_stats(asterInnovationFitMsVals);
 	s.asterApplyMs = compute_stats(asterApplyMsVals);
+	s.aegisDiagValid = !aegisLambdaSpatialVals.empty();
+	s.aegisLambdaSpatial = compute_stats(aegisLambdaSpatialVals);
+	s.aegisLambdaPredictive = compute_stats(aegisLambdaPredictiveVals);
+	s.aegisLambdaOutput = compute_stats(aegisLambdaOutputVals);
+	s.aegisPredictivePredicted = compute_stats(aegisPredictivePredictedVals);
+	s.aegisPredictiveRealized = compute_stats(aegisPredictiveRealizedVals);
+	s.aegisOutputPredicted = compute_stats(aegisOutputPredictedVals);
+	s.aegisOutputRealized = compute_stats(aegisOutputRealizedVals);
+	s.aegisPredictiveError = compute_stats(aegisPredictiveErrorVals);
+	s.aegisOutputError = compute_stats(aegisOutputErrorVals);
+	s.aegisChannelDisagreement = compute_stats(aegisChannelDisagreementVals);
+	s.citadelDiagValid = !citadelAnchorVals.empty();
+	s.citadelAnchor = compute_stats(citadelAnchorVals);
+	s.citadelHardRegimeMass = compute_stats(citadelHardRegimeMassVals);
+	s.citadelSparrowTrust = compute_stats(citadelSparrowTrustVals);
+	s.rampartDiagValid = !rampartTauVals.empty();
+	s.rampartTau = compute_stats(rampartTauVals);
+	s.rampartBudget = compute_stats(rampartBudgetVals);
+	s.rampartCovariance = compute_stats(rampartCovarianceVals);
+	s.rampartSparrowTrust = compute_stats(rampartSparrowTrustVals);
+	s.meritDiagValid = !meritTauVals.empty();
+	s.meritTau = compute_stats(meritTauVals);
+	s.meritBudget = compute_stats(meritBudgetVals);
+	s.meritCovariance = compute_stats(meritCovarianceVals);
+	s.meritSparrowTrust = compute_stats(meritSparrowTrustVals);
+	s.meritGeometryTrust = compute_stats(meritGeometryTrustVals);
+	s.strataDiagValid = !strataNullModeVals.empty();
+	s.strataNullMode = compute_stats(strataNullModeVals);
+	s.strataPredictiveMode = compute_stats(strataPredictiveModeVals);
+	s.strataOutputMode = compute_stats(strataOutputModeVals);
+	s.strataCoupledMode = compute_stats(strataCoupledModeVals);
+	s.strataBudget = compute_stats(strataBudgetVals);
+	s.strataNullBenefit = compute_stats(strataNullBenefitVals);
+	s.strataPredictiveBenefit = compute_stats(strataPredictiveBenefitVals);
+	s.strataOutputBenefit = compute_stats(strataOutputBenefitVals);
+	s.strataCoupledBenefit = compute_stats(strataCoupledBenefitVals);
+	s.strataSelectedExcess = compute_stats(strataSelectedExcessVals);
+	s.strataSwitchRate = compute_stats(strataSwitchRateVals);
+	s.transformerGapDiagValid = !transformerInputUpdateNormVals.empty();
+	s.transformerInputUpdateNorm = compute_stats(transformerInputUpdateNormVals);
+	s.transformerBlockUpdateNorms = compute_stats_by_index(transformerBlockUpdateNormRows);
+	s.transformerFinalNormUpdateNorm = compute_stats(transformerFinalNormUpdateNormVals);
+	s.transformerHeadUpdateNorm = compute_stats(transformerHeadUpdateNormVals);
+	s.transformerHeadShare = compute_stats(transformerHeadShareVals);
+	s.transformerNonHeadShare = compute_stats(transformerNonHeadShareVals);
+	s.transformerApplyMs = compute_stats(transformerApplyMsVals);
+	s.transformerTrainMarginValid = !transformerTrainTargetMarginVals.empty();
+	s.transformerTrainTargetMargin = compute_stats(transformerTrainTargetMarginVals);
+	s.transformerTrainHardNegativeLogit = compute_stats(transformerTrainHardNegativeLogitVals);
+	s.transformerTestMarginValid = !transformerTestTargetMarginVals.empty();
+	s.transformerTestTargetMargin = compute_stats(transformerTestTargetMarginVals);
+	s.transformerTestHardNegativeLogit = compute_stats(transformerTestHardNegativeLogitVals);
 	return s;
 }
 
@@ -2726,36 +4776,105 @@ static bool run_token_case(const BenchConfig& cfg)
 	TokenDataset data;
 	build_token_dataset(cfg, data);
 	const bool largeCase = (cfg.mode == MODE_TOKEN_LM_LARGE);
+	const bool contextCase = (cfg.mode == MODE_TOKEN_LM_CONTEXT);
+	const bool contextLargeCase = (cfg.mode == MODE_TOKEN_LM_CONTEXT_LARGE);
+	const bool documentCase = (cfg.mode == MODE_TOKEN_LM_DOCUMENT);
+	const bool corpusCase = (cfg.mode == MODE_TOKEN_LM_CORPUS);
+	const bool corpusLargeCase = (cfg.mode == MODE_TOKEN_LM_CORPUS_LARGE);
+	const char* caseName = "token-lm";
+	const char* caseDescription =
+	    "autoregressive next-token prediction with a small decoder-only transformer on a synthetic order-2 recurrence.";
+
+	if (largeCase)
+	{
+		caseName = "token-lm-large";
+		caseDescription =
+		    "larger autoregressive next-token prediction benchmark on the same synthetic order-2 recurrence, using a wider/deeper decoder preset.";
+	}
+	if (contextCase)
+	{
+		caseName = "token-lm-context";
+		caseDescription =
+		    "structured-context autoregressive next-token prediction with topic markers, delayed summary recall, anchor recall, and local continuation inside each sequence.";
+	}
+	if (contextLargeCase)
+	{
+		caseName = "token-lm-context-large";
+		caseDescription =
+		    "larger structured-context autoregressive next-token prediction with longer sequences, deeper decoder, and heavier delayed recall pressure.";
+	}
+	if (documentCase)
+	{
+		caseName = "token-lm-document";
+		caseDescription =
+		    "larger pseudo-document autoregressive next-token prediction with article-style sections, cross-paragraph entity recall, and mixed topical/detail token populations.";
+	}
+	if (corpusCase)
+	{
+		caseName = "token-lm-corpus";
+		caseDescription =
+		    "checked-in small-corpus autoregressive next-token prediction on public-domain prose excerpts with a shared train/test vocabulary and contiguous sequence windows.";
+	}
+	if (corpusLargeCase)
+	{
+		caseName = "token-lm-corpus-large";
+		caseDescription =
+		    "larger checked-in corpus autoregressive next-token prediction with more public-domain prose documents, longer windows, and a shared train/test vocabulary.";
+	}
 
 	printf("------------------------------------------------------------\n");
-	printf("Case: %s\n", largeCase ? "token-lm-large" : "token-lm");
-	printf("Description: %s\n",
-	       largeCase
-	           ? "larger autoregressive next-token prediction benchmark on the same synthetic order-2 recurrence, using a wider/deeper decoder preset."
-	           : "autoregressive next-token prediction with a small decoder-only transformer on a synthetic order-2 recurrence.");
+	printf("Case: %s\n", caseName);
+	printf("Description: %s\n", caseDescription);
 	printf("Config: vocab=%u dModel=%u dFF=%u layers=%u heads=%u seqLen=%u trainSeqs=%u testSeqs=%u epochs=%u repeats=%u\n",
 	       cfg.token.vocab, cfg.token.dModel, cfg.token.dFF, cfg.token.layers, cfg.token.heads,
 	       cfg.token.seqLen, cfg.token.trainSeqs, cfg.token.testSeqs, cfg.token.epochs, cfg.repeats);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u)\n",
-	       cfg.token.adamLR, cfg.token.atlasLR, cfg.token.atlasLR, cfg.atlasComplementRank,
-	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate, cfg.token.atlasLR,
-	       cfg.atlasAsterStateRank, cfg.atlasAsterHiddenStackDepth);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f)\n",
+	const float baseTokenLR = cfg.token.atlasLR;
+	const float sparrowTokenLR = cfg.token.atlasLR;
+	const float helmTokenLR = cfg.token.atlasLR;
+	const float asterTokenLR = cfg.token.atlasLR;
+	const float aegisTokenLR = cfg.token.atlasLR;
+	const float citadelTokenLR = cfg.token.atlasLR;
+	const float rampartTokenLR = cfg.token.atlasLR;
+	const float meritTokenLR = cfg.token.atlasLR;
+	const float strataTokenLR = cfg.token.atlasLR;
+	const float auroraTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_AURORA);
+	const float seamTokenLR = cfg.token.atlasLR;
+	const float quasarTokenLR = cfg.token.atlasLR;
+	const float geodeTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_GEODE);
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u)\n",
+	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
+	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
+	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
+	       cfg.atlasAsterStateRank, cfg.atlasAsterHiddenStackDepth, aegisTokenLR,
+	       cfg.atlasComplementRank, citadelTokenLR, cfg.atlasComplementRank,
+	       rampartTokenLR, cfg.atlasComplementRank, meritTokenLR, cfg.atlasComplementRank,
+	       strataTokenLR, cfg.atlasComplementRank, auroraTokenLR, cfg.atlasComplementRank,
+	       seamTokenLR, cfg.atlasComplementRank, quasarTokenLR, cfg.atlasComplementRank,
+	       geodeTokenLR, cfg.atlasComplementRank);
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
 	       cfg.atlasSparrowMemoryScale, cfg.atlasSparrowEdgeThreshold,
 	       cfg.atlasSparrowSecondEdgeThreshold, cfg.atlasSparrowSecondEdgeFraction,
 	       cfg.atlasSparrowPoleMax,
+	       cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth,
+	       cfg.atlasHelmMemoryScale, cfg.atlasHelmEdgeThreshold, cfg.atlasHelmPoleMax,
 	       cfg.atlasAsterStateRank, cfg.atlasAsterHiddenStackDepth,
-	       cfg.atlasAsterMemoryScale, cfg.atlasAsterEdgeThreshold, cfg.atlasAsterPoleMax);
+	       cfg.atlasAsterMemoryScale, cfg.atlasAsterEdgeThreshold, cfg.atlasAsterPoleMax,
+	       cfg.atlasKappaEnabled, cfg.atlasKappaHeads, cfg.atlasKappaLagBuckets, cfg.atlasKappaRank,
+	       cfg.atlasAuroraAdamwBackbone,
+	       cfg.atlasAuroraHeadGain, cfg.atlasAuroraBodyTrustScale,
+	       cfg.atlasGeodeGeometryScale, cfg.atlasGeodePredictiveScale);
 	printf("\n");
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_ASTER };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
+	std::vector<VariantKind> summaryVariants;
+	std::vector<Summary> summaries;
 	for (size_t v = 0; v < variantCount; ++v)
 	{
 		if (!variant_matches_selection(cfg.variantSelection, variants[v]))
@@ -2768,12 +4887,52 @@ static bool run_token_case(const BenchConfig& cfg)
 		const Summary s = summarize_runs(variant_label(variants[v]), runs);
 		print_summary_row(s);
 		print_sparrow_usage_row(s);
+		print_helm_usage_row(s);
 		print_aster_usage_row(s);
+		print_aegis_usage_row(s);
+		print_citadel_usage_row(s);
+		print_rampart_usage_row(s);
+		print_merit_usage_row(s);
+		print_strata_usage_row(s);
+		print_transformer_gap_row(s);
+		summaryVariants.push_back(variants[v]);
+		summaries.push_back(s);
 	}
 	if (!ranAny)
 	{
 		printf("No selected optimizer variants are supported for this case.\n\n");
 		return false;
+	}
+	if ((documentCase || corpusLargeCase) && !summaries.empty())
+	{
+		int adamwIndex = -1;
+		int baseIndex = -1;
+		int auroraIndex = -1;
+		int geodeIndex = -1;
+		for (size_t i = 0; i < summaryVariants.size(); ++i)
+		{
+			if (summaryVariants[i] == VARIANT_ADAMW)
+				adamwIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_BASE)
+				baseIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_AURORA)
+				auroraIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_GEODE)
+				geodeIndex = static_cast<int>(i);
+		}
+		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0))
+		{
+			printf("  AdamW gap comparison:\n");
+			if (baseIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(baseIndex)]);
+			if (auroraIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(auroraIndex)]);
+			if (geodeIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(geodeIndex)]);
+		}
 	}
 	printf("\n");
 	return true;
@@ -2791,9 +4950,13 @@ static bool run_latent_case(const BenchConfig& cfg)
 	       cfg.latent.latentDim, cfg.latent.obsDim, cfg.latent.window, cfg.latent.seqLen,
 	       cfg.latent.trainSeqs, cfg.latent.testSeqs, cfg.latent.batchSize, cfg.latent.epochs, cfg.repeats);
 	printf("Noise: process=%.3f observation=%.3f\n", cfg.latent.processNoise, cfg.latent.obsNoise);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f) ATLAS-ASTER(lr=%.4f)\n",
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f) ATLAS-ASTER(lr=%.4f) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u)\n",
 	       cfg.latent.adamLR, cfg.latent.atlasLR, cfg.latent.atlasLR, cfg.atlasComplementRank,
-	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate, cfg.latent.atlasLR, cfg.latent.atlasLR);
+	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate, cfg.latent.atlasLR, cfg.latent.atlasLR,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank);
 	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
@@ -2809,7 +4972,7 @@ static bool run_latent_case(const BenchConfig& cfg)
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Windows/s", "TrainMSE", "TrainR2%", "TestMSE", "TestR2%", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	for (size_t v = 0; v < variantCount; ++v)
@@ -2826,6 +4989,11 @@ static bool run_latent_case(const BenchConfig& cfg)
 		print_sparrow_usage_row(s);
 		print_helm_usage_row(s);
 		print_aster_usage_row(s);
+		print_aegis_usage_row(s);
+		print_citadel_usage_row(s);
+		print_rampart_usage_row(s);
+		print_merit_usage_row(s);
+		print_strata_usage_row(s);
 	}
 	if (!ranAny)
 	{
@@ -2850,9 +5018,13 @@ static bool run_nonlinear_case(const BenchConfig& cfg)
 	printf("Noise: process=%.3f observation=%.3f nonlinearMix=%.3f switching=%.3f obsMix=%.3f\n",
 	       cfg.latent.processNoise, cfg.latent.obsNoise,
 	       cfg.latent.nonlinearMix, cfg.latent.switchingScale, cfg.latent.observationMix);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f) ATLAS-ASTER(lr=%.4f)\n",
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f) ATLAS-ASTER(lr=%.4f) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u)\n",
 	       cfg.latent.adamLR, cfg.latent.atlasLR, cfg.latent.atlasLR, cfg.atlasComplementRank,
-	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate, cfg.latent.atlasLR, cfg.latent.atlasLR);
+	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate, cfg.latent.atlasLR, cfg.latent.atlasLR,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank,
+	       cfg.latent.atlasLR, cfg.atlasComplementRank, cfg.latent.atlasLR, cfg.atlasComplementRank);
 	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
@@ -2868,7 +5040,7 @@ static bool run_nonlinear_case(const BenchConfig& cfg)
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Windows/s", "TrainMSE", "TrainR2%", "TestMSE", "TestR2%", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	for (size_t v = 0; v < variantCount; ++v)
@@ -2886,6 +5058,11 @@ static bool run_nonlinear_case(const BenchConfig& cfg)
 		print_sparrow_usage_row(s);
 		print_helm_usage_row(s);
 		print_aster_usage_row(s);
+		print_aegis_usage_row(s);
+		print_citadel_usage_row(s);
+		print_rampart_usage_row(s);
+		print_merit_usage_row(s);
+		print_strata_usage_row(s);
 	}
 	if (!ranAny)
 	{
@@ -2908,9 +5085,13 @@ static bool run_teacher_case(const BenchConfig& cfg)
 	       cfg.teacher.inputDim, cfg.teacher.teacherRank, cfg.teacher.bulkRank,
 	       cfg.teacher.trainSamples, cfg.teacher.testSamples, cfg.teacher.batchSize,
 	       cfg.teacher.epochs, cfg.repeats, cfg.teacher.bulkScale);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u)\n",
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u)\n",
 	       cfg.teacher.adamLR, cfg.teacher.atlasLR, cfg.teacher.atlasLR, cfg.atlasComplementRank,
-	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate);
+	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate, cfg.teacher.atlasLR,
+	       cfg.atlasComplementRank, cfg.teacher.atlasLR, cfg.atlasComplementRank,
+	       cfg.teacher.atlasLR, cfg.atlasComplementRank, cfg.teacher.atlasLR, cfg.atlasComplementRank,
+	       cfg.teacher.atlasLR, cfg.atlasComplementRank, cfg.teacher.atlasLR, cfg.atlasComplementRank,
+	       cfg.teacher.atlasLR, cfg.atlasComplementRank, cfg.teacher.atlasLR, cfg.atlasComplementRank);
 	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
@@ -2922,7 +5103,7 @@ static bool run_teacher_case(const BenchConfig& cfg)
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Samples/s", "TrainMSE", "TrainR2%", "TestMSE", "TestR2%", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	for (size_t v = 0; v < variantCount; ++v)
@@ -2937,6 +5118,12 @@ static bool run_teacher_case(const BenchConfig& cfg)
 		const Summary s = summarize_runs(variant_label(variants[v]), runs);
 		print_summary_row(s);
 		print_sparrow_usage_row(s);
+		print_aster_usage_row(s);
+		print_aegis_usage_row(s);
+		print_citadel_usage_row(s);
+		print_rampart_usage_row(s);
+		print_merit_usage_row(s);
+		print_strata_usage_row(s);
 	}
 	if (!ranAny)
 	{
@@ -3190,7 +5377,10 @@ void ATLASAltBenchmark(int argc, char* argv[])
 		return;
 	}
 
-	if (cfg.mode == MODE_ALL || cfg.mode == MODE_TOKEN_LM || cfg.mode == MODE_TOKEN_LM_LARGE)
+	if (cfg.mode == MODE_ALL || cfg.mode == MODE_TOKEN_LM || cfg.mode == MODE_TOKEN_LM_LARGE
+	    || cfg.mode == MODE_TOKEN_LM_CONTEXT || cfg.mode == MODE_TOKEN_LM_CONTEXT_LARGE
+	    || cfg.mode == MODE_TOKEN_LM_DOCUMENT || cfg.mode == MODE_TOKEN_LM_CORPUS
+	    || cfg.mode == MODE_TOKEN_LM_CORPUS_LARGE)
 		run_token_case(cfg);
 	if (cfg.mode == MODE_ALL || cfg.mode == MODE_TEACHER_STUDENT)
 		run_teacher_case(cfg);

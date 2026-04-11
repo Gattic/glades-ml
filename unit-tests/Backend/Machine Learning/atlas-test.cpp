@@ -41,6 +41,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <sys/time.h>
 #include <unistd.h>
 #include <vector>
 
@@ -222,6 +223,13 @@ static glades::NNInfo* make_atlas_transformer_token_info(const char* name,
 	return new glades::NNInfo(name, in, hidden, out);
 }
 
+static int64_t now_ms()
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return static_cast<int64_t>(tv.tv_sec) * 1000LL + static_cast<int64_t>(tv.tv_usec) / 1000LL;
+}
+
 static void configure_atlas_transformer_resume_net(glades::NNetwork& net, unsigned int seed, int epochs)
 {
 	net.setSeed(seed);
@@ -303,6 +311,143 @@ static bool atlas_storage_shapes_ok(const glades::atlas::WeightState& state,
 
 } // anonymous namespace
 
+void ATLASHelmMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		glades::OptimizerConfig::Type optimizerType;
+		float learningRate;
+		bool helmEnabled;
+	};
+
+	struct MicroVariantResult
+	{
+		MicroVariantResult()
+		    : ok(false),
+		      trainSeconds(0.0),
+		      trainNll(0.0f),
+		      trainPpl(0.0f),
+		      helmMatrices(0u),
+		      helmEdge(0.0),
+		      helmPredR2(0.0),
+		      helmMemoryGain(0.0),
+		      status()
+		{
+		}
+
+		bool ok;
+		double trainSeconds;
+		float trainNll;
+		float trainPpl;
+		unsigned int helmMatrices;
+		double helmEdge;
+		double helmPredR2;
+		double helmMemoryGain;
+		std::string status;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", glades::OptimizerConfig::ADAMW, 0.001f, false },
+		{ "ATLAS-BSRP", glades::OptimizerConfig::ATLAS, 0.020f, false },
+		{ "ATLAS-HELM", glades::OptimizerConfig::ATLAS, 0.020f, true },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("ATLAS HELM Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %10s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "HELMObs", "HELMEdge", "HELMGain", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    71000u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_helm_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         spec.learningRate);
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(72000u + static_cast<unsigned int>(100u * i));
+		net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+		net.getTerminatorMutable().setAccuracy(0.0f);
+
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.gpu.enable = false;
+			cfg.optimizer.type = spec.optimizerType;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+			cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+			cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+			cfg.transformer.dFFOverride = static_cast<int>(kDff);
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+			if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+			{
+				cfg.atlas.rank = 4u;
+				cfg.atlas.complementRank = 0u;
+				cfg.atlas.tSub = 8u;
+				cfg.atlas.beta = 0.999f;
+				cfg.atlas.helmEnabled = spec.helmEnabled;
+				cfg.atlas.helmMemoryScale = 0.05f;
+				cfg.atlas.helmEdgeThreshold = 0.0f;
+				cfg.atlas.helmModeRank = 2u;
+				cfg.atlas.helmHiddenStackDepth = 2u;
+				cfg.atlas.helmPoleMax = 0.95f;
+			}
+		}
+
+		CaptureMetricsCallbacks cb;
+		const int64_t startMs = now_ms();
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		const int64_t endMs = now_ms();
+
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+		const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+		const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+		const unsigned int helmMatrices = haveDiag ? diag.helmMatrices : 0u;
+		const double helmEdge = haveDiag ? diag.helmMeanEdge : 0.0;
+		const double helmMemoryGain = haveDiag ? diag.helmMeanMemoryGain : 0.0;
+		const std::string status =
+		    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+		printf("%-12s %10.3f %12.5f %12.5f %10u %10.4f %10.4f %s\n",
+		       spec.label,
+		       static_cast<double>(endMs - startMs) / 1000.0,
+		       trainNll,
+		       trainPpl,
+		       helmMatrices,
+		       helmEdge,
+		       helmMemoryGain,
+		       status.c_str());
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
 void ATLASUnitTest()
 {
 	printf("============================================================\n");
@@ -371,6 +516,78 @@ void ATLASUnitTest()
 		ASSERT("==============ATLAS::DFF_Regression no metrics captured==============", cb.saw);
 		printf("[UT] ATLAS DFF regression: final loss = %f\n", cb.last.totalError);
 		ASSERT("==============ATLAS::DFF_Regression loss too high==============", cb.last.totalError < 0.27f);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1G: Transformer token-LM RAMPART exposes bounded posterior diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1G: Transformer token-LM RAMPART diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 17u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(vocab, 24u, 12u, 66323u, padTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_transformer_token_rampart", vocab, 16u, 2u, 0.02f);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(66324u);
+		net.getTerminatorMutable().setEpoch(4);
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 8u;
+			cfg.atlas.complementRank = 4u;
+			cfg.atlas.tSub = 16u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.sparrowEnabled = true;
+			cfg.atlas.sparrowModeRank = 1u;
+			cfg.atlas.sparrowMemoryScale = 0.05f;
+			cfg.atlas.sparrowEdgeThreshold = 0.0f;
+			cfg.atlas.sparrowPoleMax = 0.95f;
+			cfg.atlas.asterEnabled = true;
+			cfg.atlas.aegisEnabled = true;
+			cfg.atlas.rampartEnabled = true;
+			cfg.atlas.asterMemoryScale = 0.05f;
+			cfg.atlas.asterEdgeThreshold = 0.0f;
+			cfg.atlas.asterStateRank = 2u;
+			cfg.atlas.asterHiddenStackDepth = 2u;
+			cfg.atlas.asterPoleMax = 0.95f;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::RAMPART_TRANSFORMER_TOKEN TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::RAMPART_TRANSFORMER_TOKEN no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::RAMPART_TRANSFORMER_TOKEN diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::RAMPART_TRANSFORMER_TOKEN should expose one transformer RAMPART observer==============",
+		       diag.rampartMatrices == 1u);
+		ASSERT("==============ATLAS::RAMPART_TRANSFORMER_TOKEN diagnostics should remain finite==============",
+		       diag.rampartMeanTau == diag.rampartMeanTau
+		       && diag.rampartMeanBudget == diag.rampartMeanBudget
+		       && diag.rampartMeanCovariance == diag.rampartMeanCovariance
+		       && diag.rampartMeanSparrowTrust == diag.rampartMeanSparrowTrust);
+		ASSERT("==============ATLAS::RAMPART_TRANSFORMER_TOKEN diagnostics should be bounded==============",
+		       diag.rampartMeanTau >= 0.0
+		       && diag.rampartMeanBudget >= 0.0 && diag.rampartMeanBudget <= 1.0001
+		       && diag.rampartMeanCovariance >= 0.0 && diag.rampartMeanCovariance <= 1.0001
+		       && diag.rampartMeanSparrowTrust >= 0.0 && diag.rampartMeanSparrowTrust <= 1.0001);
 
 		delete di;
 		delete info;
@@ -514,10 +731,75 @@ void ATLASUnitTest()
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 
 	// ---------------------------------------------------------------
-	// Test 1D: Transformer token-LM ASTER exposes bounded runtime diagnostics.
+	// Test 1D: Transformer token-LM HELM exposes bounded runtime diagnostics.
 	// ---------------------------------------------------------------
 	printf("-----------------------------------\n");
-	printf("ATLAS Test 1D: Transformer token-LM ASTER diagnostics remain bounded\n");
+	printf("ATLAS Test 1D: Transformer token-LM HELM diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 17u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(vocab, 24u, 12u, 55023u, padTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_transformer_token_helm", vocab, 16u, 2u, 0.02f);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(55024u);
+		net.getTerminatorMutable().setEpoch(4);
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 8u;
+			cfg.atlas.complementRank = 0u;
+			cfg.atlas.tSub = 16u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.helmEnabled = true;
+			cfg.atlas.helmMemoryScale = 0.05f;
+			cfg.atlas.helmEdgeThreshold = 0.0f;
+			cfg.atlas.helmModeRank = 2u;
+			cfg.atlas.helmHiddenStackDepth = 2u;
+			cfg.atlas.helmPoleMax = 0.95f;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::HELM_TRANSFORMER_TOKEN TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::HELM_TRANSFORMER_TOKEN no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::HELM_TRANSFORMER_TOKEN diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::HELM_TRANSFORMER_TOKEN should expose one transformer HELM observer==============",
+		       diag.helmMatrices == 1u);
+		ASSERT("==============ATLAS::HELM_TRANSFORMER_TOKEN diagnostics should remain finite==============",
+		       diag.helmMeanEdge == diag.helmMeanEdge
+		       && diag.helmMeanSecondEdge == diag.helmMeanSecondEdge
+		       && diag.helmMeanSecondEdgeRatio == diag.helmMeanSecondEdgeRatio
+		       && diag.helmMeanSigma == diag.helmMeanSigma
+		       && diag.helmMeanPredR2 == diag.helmMeanPredR2
+		       && diag.helmMeanMemoryGain == diag.helmMeanMemoryGain
+		       && diag.helmMeanPole == diag.helmMeanPole);
+		ASSERT("==============ATLAS::HELM_TRANSFORMER_TOKEN train loss should be finite==============",
+		       cb.last.totalError == cb.last.totalError);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1E: Transformer token-LM ASTER exposes bounded runtime diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1E: Transformer token-LM ASTER diagnostics remain bounded\n");
 	printf("-----------------------------------\n");
 	{
 		const unsigned int vocab = 17u;
@@ -542,6 +824,10 @@ void ATLASUnitTest()
 			cfg.atlas.asterStateRank = 2u;
 			cfg.atlas.asterHiddenStackDepth = 2u;
 			cfg.atlas.asterPoleMax = 0.95f;
+			cfg.atlas.kappaEnabled = true;
+			cfg.atlas.kappaHeads = 1u;
+			cfg.atlas.kappaLagBuckets = 4u;
+			cfg.atlas.kappaRank = 2u;
 			cfg.transformer.enableTokenEmbedding = true;
 			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
 			cfg.transformer.tieEmbeddings = true;
@@ -571,6 +857,306 @@ void ATLASUnitTest()
 		       && diag.asterMeanBoundaryMs == diag.asterMeanBoundaryMs);
 		ASSERT("==============ATLAS::ASTER_TRANSFORMER_TOKEN train loss should be finite==============",
 		       cb.last.totalError == cb.last.totalError);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1E: Transformer token-LM AEGIS exposes bounded calibration diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1E: Transformer token-LM AEGIS diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 17u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(vocab, 24u, 12u, 66123u, padTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_transformer_token_aegis", vocab, 16u, 2u, 0.02f);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(66124u);
+		net.getTerminatorMutable().setEpoch(4);
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 8u;
+			cfg.atlas.complementRank = 4u;
+			cfg.atlas.tSub = 16u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.sparrowEnabled = true;
+			cfg.atlas.sparrowModeRank = 1u;
+			cfg.atlas.sparrowMemoryScale = 0.05f;
+			cfg.atlas.sparrowEdgeThreshold = 0.0f;
+			cfg.atlas.sparrowPoleMax = 0.95f;
+			cfg.atlas.asterEnabled = true;
+			cfg.atlas.aegisEnabled = true;
+			cfg.atlas.asterMemoryScale = 0.05f;
+			cfg.atlas.asterEdgeThreshold = 0.0f;
+			cfg.atlas.asterStateRank = 2u;
+			cfg.atlas.asterHiddenStackDepth = 2u;
+			cfg.atlas.asterPoleMax = 0.95f;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::AEGIS_TRANSFORMER_TOKEN TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::AEGIS_TRANSFORMER_TOKEN no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::AEGIS_TRANSFORMER_TOKEN diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::AEGIS_TRANSFORMER_TOKEN should expose one transformer AEGIS observer==============",
+		       diag.aegisMatrices == 1u);
+		ASSERT("==============ATLAS::AEGIS_TRANSFORMER_TOKEN calibration diagnostics should remain finite==============",
+		       diag.aegisMeanLambdaSpatial == diag.aegisMeanLambdaSpatial
+		       && diag.aegisMeanLambdaPredictive == diag.aegisMeanLambdaPredictive
+		       && diag.aegisMeanLambdaOutput == diag.aegisMeanLambdaOutput
+		       && diag.aegisMeanPredictiveError == diag.aegisMeanPredictiveError
+		       && diag.aegisMeanOutputError == diag.aegisMeanOutputError
+		       && diag.aegisMeanChannelDisagreement == diag.aegisMeanChannelDisagreement);
+		ASSERT("==============ATLAS::AEGIS_TRANSFORMER_TOKEN lambdas should be bounded==============",
+		       diag.aegisMeanLambdaSpatial >= 0.0
+		       && diag.aegisMeanLambdaPredictive >= 0.0
+		       && diag.aegisMeanLambdaOutput >= 0.0
+		       && (diag.aegisMeanLambdaSpatial + diag.aegisMeanLambdaPredictive + diag.aegisMeanLambdaOutput) <= 1.0001);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1F: Transformer token-LM CITADEL exposes bounded anchor diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1F: Transformer token-LM CITADEL diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 17u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(vocab, 24u, 12u, 66223u, padTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_transformer_token_citadel", vocab, 16u, 2u, 0.02f);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(66224u);
+		net.getTerminatorMutable().setEpoch(4);
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 8u;
+			cfg.atlas.complementRank = 4u;
+			cfg.atlas.tSub = 16u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.sparrowEnabled = true;
+			cfg.atlas.sparrowModeRank = 1u;
+			cfg.atlas.sparrowMemoryScale = 0.05f;
+			cfg.atlas.sparrowEdgeThreshold = 0.0f;
+			cfg.atlas.sparrowPoleMax = 0.95f;
+			cfg.atlas.asterEnabled = true;
+			cfg.atlas.aegisEnabled = true;
+			cfg.atlas.citadelEnabled = true;
+			cfg.atlas.asterMemoryScale = 0.05f;
+			cfg.atlas.asterEdgeThreshold = 0.0f;
+			cfg.atlas.asterStateRank = 2u;
+			cfg.atlas.asterHiddenStackDepth = 2u;
+			cfg.atlas.asterPoleMax = 0.95f;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::CITADEL_TRANSFORMER_TOKEN TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::CITADEL_TRANSFORMER_TOKEN no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::CITADEL_TRANSFORMER_TOKEN diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::CITADEL_TRANSFORMER_TOKEN should expose one transformer CITADEL observer==============",
+		       diag.citadelMatrices == 1u);
+		ASSERT("==============ATLAS::CITADEL_TRANSFORMER_TOKEN anchor diagnostics should remain finite==============",
+		       diag.citadelMeanAnchor == diag.citadelMeanAnchor
+		       && diag.citadelMeanHardRegimeMass == diag.citadelMeanHardRegimeMass
+		       && diag.citadelMeanSparrowTrust == diag.citadelMeanSparrowTrust);
+		ASSERT("==============ATLAS::CITADEL_TRANSFORMER_TOKEN diagnostics should be bounded==============",
+		       diag.citadelMeanAnchor >= 0.0 && diag.citadelMeanAnchor <= 1.0001
+		       && diag.citadelMeanHardRegimeMass >= 0.0 && diag.citadelMeanHardRegimeMass <= 1.0001
+		       && diag.citadelMeanSparrowTrust >= 0.0 && diag.citadelMeanSparrowTrust <= 1.0001);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1H: Transformer token-LM MERIT exposes bounded trust diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1H: Transformer token-LM MERIT diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 17u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(vocab, 24u, 12u, 66423u, padTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_transformer_token_merit", vocab, 16u, 2u, 0.02f);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(66424u);
+		net.getTerminatorMutable().setEpoch(4);
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 8u;
+			cfg.atlas.complementRank = 4u;
+			cfg.atlas.tSub = 16u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.sparrowEnabled = true;
+			cfg.atlas.sparrowModeRank = 1u;
+			cfg.atlas.sparrowMemoryScale = 0.05f;
+			cfg.atlas.sparrowEdgeThreshold = 0.0f;
+			cfg.atlas.sparrowPoleMax = 0.95f;
+			cfg.atlas.asterEnabled = true;
+			cfg.atlas.aegisEnabled = true;
+			cfg.atlas.meritEnabled = true;
+			cfg.atlas.asterMemoryScale = 0.05f;
+			cfg.atlas.asterEdgeThreshold = 0.0f;
+			cfg.atlas.asterStateRank = 2u;
+			cfg.atlas.asterHiddenStackDepth = 2u;
+			cfg.atlas.asterPoleMax = 0.95f;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::MERIT_TRANSFORMER_TOKEN TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::MERIT_TRANSFORMER_TOKEN no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::MERIT_TRANSFORMER_TOKEN diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::MERIT_TRANSFORMER_TOKEN should expose one transformer MERIT observer==============",
+		       diag.meritMatrices == 1u);
+		ASSERT("==============ATLAS::MERIT_TRANSFORMER_TOKEN diagnostics should remain finite==============",
+		       diag.meritMeanTau == diag.meritMeanTau
+		       && diag.meritMeanBudget == diag.meritMeanBudget
+		       && diag.meritMeanCovariance == diag.meritMeanCovariance
+		       && diag.meritMeanSparrowTrust == diag.meritMeanSparrowTrust
+		       && diag.meritMeanGeometryTrust == diag.meritMeanGeometryTrust);
+		ASSERT("==============ATLAS::MERIT_TRANSFORMER_TOKEN diagnostics should be bounded==============",
+		       diag.meritMeanTau >= 0.0
+		       && diag.meritMeanBudget >= 0.0 && diag.meritMeanBudget <= 1.0001
+		       && diag.meritMeanCovariance >= 0.0 && diag.meritMeanCovariance <= 1.0001
+		       && diag.meritMeanSparrowTrust >= 0.0 && diag.meritMeanSparrowTrust <= 1.0001
+		       && diag.meritMeanGeometryTrust >= 0.0 && diag.meritMeanGeometryTrust <= 1.0001);
+
+		delete di;
+		delete info;
+	}
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+
+	// ---------------------------------------------------------------
+	// Test 1I: Transformer token-LM STRATA exposes bounded mode diagnostics.
+	// ---------------------------------------------------------------
+	printf("-----------------------------------\n");
+	printf("ATLAS Test 1I: Transformer token-LM STRATA diagnostics remain bounded\n");
+	printf("-----------------------------------\n");
+	{
+		const unsigned int vocab = 17u;
+		const unsigned int padTokenId = vocab - 1u;
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(vocab, 24u, 12u, 66423u, padTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_transformer_token_strata", vocab, 16u, 2u, 0.02f);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(66424u);
+		net.getTerminatorMutable().setEpoch(4);
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.optimizer.type = glades::OptimizerConfig::ATLAS;
+			cfg.atlas.rank = 8u;
+			cfg.atlas.complementRank = 4u;
+			cfg.atlas.tSub = 16u;
+			cfg.atlas.beta = 0.999f;
+			cfg.atlas.sparrowEnabled = true;
+			cfg.atlas.sparrowModeRank = 1u;
+			cfg.atlas.sparrowMemoryScale = 0.05f;
+			cfg.atlas.sparrowEdgeThreshold = 0.0f;
+			cfg.atlas.sparrowPoleMax = 0.95f;
+			cfg.atlas.asterEnabled = true;
+			cfg.atlas.aegisEnabled = true;
+			cfg.atlas.strataEnabled = true;
+			cfg.atlas.asterMemoryScale = 0.05f;
+			cfg.atlas.asterEdgeThreshold = 0.0f;
+			cfg.atlas.asterStateRank = 2u;
+			cfg.atlas.asterHiddenStackDepth = 2u;
+			cfg.atlas.asterPoleMax = 0.95f;
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.padTokenId = static_cast<int>(padTokenId);
+			cfg.transformer.nHeadsOverride = 4;
+			cfg.transformer.nKVHeadsOverride = 4;
+			cfg.transformer.dFFOverride = 32;
+			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		}
+
+		CaptureMetricsCallbacks cb;
+		const glades::NNetworkStatus st = net.train(di, &cb);
+		ASSERT("==============ATLAS::STRATA_TRANSFORMER_TOKEN TrainStatus() Failed==============", st.ok());
+		ASSERT("==============ATLAS::STRATA_TRANSFORMER_TOKEN no metrics captured==============", cb.saw);
+		glades::NNetwork::AtlasRuntimeDiagnostics diag;
+		ASSERT("==============ATLAS::STRATA_TRANSFORMER_TOKEN diagnostics unavailable==============", net.getAtlasRuntimeDiagnostics(diag));
+		ASSERT("==============ATLAS::STRATA_TRANSFORMER_TOKEN should expose one transformer STRATA observer==============",
+		       diag.strataMatrices == 1u);
+		ASSERT("==============ATLAS::STRATA_TRANSFORMER_TOKEN diagnostics should remain finite==============",
+		       diag.strataMeanNullMode == diag.strataMeanNullMode
+		       && diag.strataMeanPredictiveMode == diag.strataMeanPredictiveMode
+		       && diag.strataMeanOutputMode == diag.strataMeanOutputMode
+		       && diag.strataMeanCoupledMode == diag.strataMeanCoupledMode
+		       && diag.strataMeanBudget == diag.strataMeanBudget
+		       && diag.strataMeanNullBenefit == diag.strataMeanNullBenefit
+		       && diag.strataMeanPredictiveBenefit == diag.strataMeanPredictiveBenefit
+		       && diag.strataMeanOutputBenefit == diag.strataMeanOutputBenefit
+		       && diag.strataMeanCoupledBenefit == diag.strataMeanCoupledBenefit
+		       && diag.strataMeanSelectedExcess == diag.strataMeanSelectedExcess
+		       && diag.strataMeanSwitchRate == diag.strataMeanSwitchRate);
+		ASSERT("==============ATLAS::STRATA_TRANSFORMER_TOKEN diagnostics should be bounded==============",
+		       diag.strataMeanNullMode >= 0.0
+		       && diag.strataMeanPredictiveMode >= 0.0
+		       && diag.strataMeanOutputMode >= 0.0
+		       && diag.strataMeanCoupledMode >= 0.0
+		       && diag.strataMeanBudget >= 0.0 && diag.strataMeanBudget <= 1.0001
+		       && diag.strataMeanSwitchRate >= 0.0 && diag.strataMeanSwitchRate <= 1.0001
+		       && (diag.strataMeanNullMode + diag.strataMeanPredictiveMode
+		           + diag.strataMeanOutputMode + diag.strataMeanCoupledMode) <= 1.0001);
 
 		delete di;
 		delete info;

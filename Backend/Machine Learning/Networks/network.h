@@ -290,6 +290,55 @@ public:
 		double asterMeanStateFitMs;
 		double asterMeanInnovationFitMs;
 		double asterMeanApplyMs;
+		unsigned int aegisMatrices;
+		double aegisMeanLambdaSpatial;
+		double aegisMeanLambdaPredictive;
+		double aegisMeanLambdaOutput;
+		double aegisMeanPredictivePredicted;
+		double aegisMeanPredictiveRealized;
+		double aegisMeanOutputPredicted;
+		double aegisMeanOutputRealized;
+		double aegisMeanPredictiveError;
+		double aegisMeanOutputError;
+		double aegisMeanChannelDisagreement;
+		unsigned int citadelMatrices;
+		double citadelMeanAnchor;
+		double citadelMeanHardRegimeMass;
+		double citadelMeanSparrowTrust;
+		unsigned int rampartMatrices;
+		double rampartMeanTau;
+		double rampartMeanBudget;
+		double rampartMeanCovariance;
+		double rampartMeanSparrowTrust;
+		unsigned int meritMatrices;
+		double meritMeanTau;
+		double meritMeanBudget;
+		double meritMeanCovariance;
+		double meritMeanSparrowTrust;
+		double meritMeanGeometryTrust;
+		unsigned int strataMatrices;
+		double strataMeanNullMode;
+		double strataMeanPredictiveMode;
+		double strataMeanOutputMode;
+		double strataMeanCoupledMode;
+		double strataMeanBudget;
+		double strataMeanNullBenefit;
+		double strataMeanPredictiveBenefit;
+		double strataMeanOutputBenefit;
+		double strataMeanCoupledBenefit;
+		double strataMeanSelectedExcess;
+		double strataMeanSwitchRate;
+		unsigned int transformerGapBatches;
+		double transformerMeanInputUpdateNorm;
+		std::vector<double> transformerMeanBlockUpdateNorms;
+		double transformerMeanFinalNormUpdateNorm;
+		double transformerMeanHeadUpdateNorm;
+		double transformerMeanHeadShare;
+		double transformerMeanNonHeadShare;
+		double transformerMeanApplyMs;
+		unsigned int transformerMarginSnapshots;
+		double transformerMeanTargetMargin;
+		double transformerMeanHardNegativeLogit;
 
 		AtlasRuntimeDiagnostics()
 		    : atlasMatrices(0u),
@@ -330,7 +379,70 @@ public:
 		      asterMeanTransferFitMs(0.0),
 		      asterMeanStateFitMs(0.0),
 		      asterMeanInnovationFitMs(0.0),
-		      asterMeanApplyMs(0.0)
+		      asterMeanApplyMs(0.0),
+		      aegisMatrices(0u),
+		      aegisMeanLambdaSpatial(0.0),
+		      aegisMeanLambdaPredictive(0.0),
+		      aegisMeanLambdaOutput(0.0),
+		      aegisMeanPredictivePredicted(0.0),
+		      aegisMeanPredictiveRealized(0.0),
+		      aegisMeanOutputPredicted(0.0),
+		      aegisMeanOutputRealized(0.0),
+		      aegisMeanPredictiveError(0.0),
+		      aegisMeanOutputError(0.0),
+		      aegisMeanChannelDisagreement(0.0),
+		      citadelMatrices(0u),
+		      citadelMeanAnchor(0.0),
+		      citadelMeanHardRegimeMass(0.0),
+		      citadelMeanSparrowTrust(0.0),
+		      rampartMatrices(0u),
+		      rampartMeanTau(0.0),
+		      rampartMeanBudget(0.0),
+		      rampartMeanCovariance(0.0),
+		      rampartMeanSparrowTrust(0.0),
+		      meritMatrices(0u),
+		      meritMeanTau(0.0),
+		      meritMeanBudget(0.0),
+		      meritMeanCovariance(0.0),
+		      meritMeanSparrowTrust(0.0),
+		      meritMeanGeometryTrust(0.0),
+		      strataMatrices(0u),
+		      strataMeanNullMode(0.0),
+		      strataMeanPredictiveMode(0.0),
+		      strataMeanOutputMode(0.0),
+		      strataMeanCoupledMode(0.0),
+		      strataMeanBudget(0.0),
+		      strataMeanNullBenefit(0.0),
+		      strataMeanPredictiveBenefit(0.0),
+		      strataMeanOutputBenefit(0.0),
+		      strataMeanCoupledBenefit(0.0),
+		      strataMeanSelectedExcess(0.0),
+		      strataMeanSwitchRate(0.0),
+		      transformerGapBatches(0u),
+		      transformerMeanInputUpdateNorm(0.0),
+		      transformerMeanBlockUpdateNorms(),
+		      transformerMeanFinalNormUpdateNorm(0.0),
+		      transformerMeanHeadUpdateNorm(0.0),
+		      transformerMeanHeadShare(0.0),
+		      transformerMeanNonHeadShare(0.0),
+		      transformerMeanApplyMs(0.0),
+		      transformerMarginSnapshots(0u),
+		      transformerMeanTargetMargin(0.0),
+		      transformerMeanHardNegativeLogit(0.0)
+		{
+		}
+	};
+
+	struct TransformerGroupedParameterSnapshot
+	{
+		bool valid;
+		std::vector<float> inputGroup;
+		std::vector< std::vector<float> > blockGroups;
+		std::vector<float> finalNormGroup;
+		std::vector<float> headGroup;
+
+		TransformerGroupedParameterSnapshot()
+		    : valid(false)
 		{
 		}
 	};
@@ -472,6 +584,47 @@ private:
 			float lastSigma;
 			float lastPredR2;
 			float lastMemoryGain;
+			float aegisPredictiveErrorEma;
+			float aegisOutputErrorEma;
+			float aegisPrevPredictiveScore;
+			float aegisPrevOutputScore;
+			float aegisLastLambdaSpatial;
+			float aegisLastLambdaPredictive;
+			float aegisLastLambdaOutput;
+			float aegisLastPredictivePredicted;
+			float aegisLastPredictiveRealized;
+			float aegisLastOutputPredicted;
+			float aegisLastOutputRealized;
+			float aegisLastChannelDisagreement;
+			float citadelPredictiveTrustEma;
+			float citadelOutputTrustEma;
+			float citadelLastAnchor;
+			float citadelLastHardRegimeMass;
+			float citadelLastSparrowTrust;
+			float rampartLastTau;
+			float rampartLastBudget;
+			float rampartLastCovariance;
+			float rampartLastSparrowTrust;
+			float meritLastTau;
+			float meritLastBudget;
+			float meritLastCovariance;
+			float meritLastSparrowTrust;
+			float meritLastGeometryTrust;
+			float strataLastNullMode;
+			float strataLastPredictiveMode;
+			float strataLastOutputMode;
+			float strataLastCoupledMode;
+			float strataLastBudget;
+			float strataNullBenefitEma;
+			float strataPredictiveBenefitEma;
+			float strataOutputBenefitEma;
+			float strataCoupledBenefitEma;
+			float strataLastNullBenefit;
+			float strataLastPredictiveBenefit;
+			float strataLastOutputBenefit;
+			float strataLastCoupledBenefit;
+			float strataLastSelectedExcess;
+			float strataLastSwitchRate;
 			unsigned long long timingBoundaryCount;
 			double totalBoundaryNs;
 			double totalSetupNs;
@@ -495,6 +648,47 @@ private:
 			      lastSigma(0.0f),
 			      lastPredR2(0.0f),
 			      lastMemoryGain(0.0f),
+			      aegisPredictiveErrorEma(0.0f),
+			      aegisOutputErrorEma(0.0f),
+			      aegisPrevPredictiveScore(0.0f),
+			      aegisPrevOutputScore(0.0f),
+			      aegisLastLambdaSpatial(0.0f),
+			      aegisLastLambdaPredictive(0.0f),
+			      aegisLastLambdaOutput(0.0f),
+			      aegisLastPredictivePredicted(0.0f),
+			      aegisLastPredictiveRealized(0.0f),
+			      aegisLastOutputPredicted(0.0f),
+			      aegisLastOutputRealized(0.0f),
+			      aegisLastChannelDisagreement(0.0f),
+			      citadelPredictiveTrustEma(0.0f),
+			      citadelOutputTrustEma(0.0f),
+			      citadelLastAnchor(0.0f),
+			      citadelLastHardRegimeMass(0.0f),
+			      citadelLastSparrowTrust(1.0f),
+			      rampartLastTau(0.0f),
+			      rampartLastBudget(0.0f),
+			      rampartLastCovariance(0.0f),
+			      rampartLastSparrowTrust(1.0f),
+			      meritLastTau(0.0f),
+			      meritLastBudget(0.0f),
+			      meritLastCovariance(0.0f),
+			      meritLastSparrowTrust(1.0f),
+			      meritLastGeometryTrust(0.0f),
+			      strataLastNullMode(1.0f),
+			      strataLastPredictiveMode(0.0f),
+			      strataLastOutputMode(0.0f),
+			      strataLastCoupledMode(0.0f),
+			      strataLastBudget(0.0f),
+			      strataNullBenefitEma(0.0f),
+			      strataPredictiveBenefitEma(0.0f),
+			      strataOutputBenefitEma(0.0f),
+			      strataCoupledBenefitEma(0.0f),
+			      strataLastNullBenefit(0.0f),
+			      strataLastPredictiveBenefit(0.0f),
+			      strataLastOutputBenefit(0.0f),
+			      strataLastCoupledBenefit(0.0f),
+			      strataLastSelectedExcess(0.0f),
+			      strataLastSwitchRate(0.0f),
 			      timingBoundaryCount(0ULL),
 			      totalBoundaryNs(0.0),
 			      totalSetupNs(0.0),
@@ -546,6 +740,47 @@ private:
 				lastSigma = 0.0f;
 				lastPredR2 = 0.0f;
 				lastMemoryGain = 0.0f;
+				aegisPredictiveErrorEma = 0.0f;
+				aegisOutputErrorEma = 0.0f;
+				aegisPrevPredictiveScore = 0.0f;
+				aegisPrevOutputScore = 0.0f;
+				aegisLastLambdaSpatial = 0.0f;
+				aegisLastLambdaPredictive = 0.0f;
+				aegisLastLambdaOutput = 0.0f;
+				aegisLastPredictivePredicted = 0.0f;
+				aegisLastPredictiveRealized = 0.0f;
+				aegisLastOutputPredicted = 0.0f;
+				aegisLastOutputRealized = 0.0f;
+				aegisLastChannelDisagreement = 0.0f;
+				citadelPredictiveTrustEma = 0.0f;
+				citadelOutputTrustEma = 0.0f;
+				citadelLastAnchor = 0.0f;
+				citadelLastHardRegimeMass = 0.0f;
+				citadelLastSparrowTrust = 1.0f;
+				rampartLastTau = 0.0f;
+				rampartLastBudget = 0.0f;
+				rampartLastCovariance = 0.0f;
+				rampartLastSparrowTrust = 1.0f;
+				meritLastTau = 0.0f;
+				meritLastBudget = 0.0f;
+				meritLastCovariance = 0.0f;
+				meritLastSparrowTrust = 1.0f;
+				meritLastGeometryTrust = 0.0f;
+				strataLastNullMode = 1.0f;
+				strataLastPredictiveMode = 0.0f;
+				strataLastOutputMode = 0.0f;
+				strataLastCoupledMode = 0.0f;
+				strataLastBudget = 0.0f;
+				strataNullBenefitEma = 0.0f;
+				strataPredictiveBenefitEma = 0.0f;
+				strataOutputBenefitEma = 0.0f;
+				strataCoupledBenefitEma = 0.0f;
+				strataLastNullBenefit = 0.0f;
+				strataLastPredictiveBenefit = 0.0f;
+				strataLastOutputBenefit = 0.0f;
+				strataLastCoupledBenefit = 0.0f;
+				strataLastSelectedExcess = 0.0f;
+				strataLastSwitchRate = 0.0f;
 				timingBoundaryCount = 0ULL;
 				totalBoundaryNs = 0.0;
 				totalSetupNs = 0.0;
@@ -1985,6 +2220,7 @@ public:
 	const CMatrix& getConfusionMatrix() const;
 	const shmea::GList& getNodeActivations() const;
 	bool getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) const;
+	bool getTransformerGroupedParameterSnapshot(TransformerGroupedParameterSnapshot& out) const;
 
 	// graphing
 	shmea::GList getResults() const;

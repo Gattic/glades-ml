@@ -117,6 +117,13 @@ struct WeightState
 	std::vector<float> scratch_sparrowActive; // [r * n]
 	std::vector<float> scratch_sparrowScout;  // [complementRank * n]
 	std::vector<float> scratch_sparrowPastSignal; // [n]
+	std::vector<float> scratch_geodeRhsCol;   // [m]
+	std::vector<float> scratch_geodeInvDiagCol; // [m]
+	std::vector<float> scratch_geodeActiveCurrent; // [r]
+	std::vector<float> scratch_geodeActiveDelta; // [r]
+	std::vector<float> scratch_geodeSystemMat; // [r * r]
+	std::vector<float> scratch_geodeRhs;      // [r]
+	std::vector<float> scratch_geodeSolution; // [r]
 
 	float complementFisher;         // trace(complementBlock)
 	float totalTrace;               // EMA trace of the normalized covariance operator
@@ -182,6 +189,7 @@ struct WeightState
 	float lastOrbitSigma;           // latest ORBIT-Lite top generalized output-mode score
 	float lastOrbitHorizontalRatio; // latest ORBIT-Lite output-horizontal energy fraction
 	float lastOrbitMemoryGain;      // latest ORBIT-Lite active-memory gain
+	float externalSparrowTrust;     // outer-loop trust multiplier applied to SPARROW memory gain
 	float mu;                       // adaptive prediction coefficient
 	float lastBaselineRate;         // diagnostics for the most recent baseline step
 	unsigned long long step;        // optimizer step counter
@@ -221,6 +229,7 @@ struct WeightState
 	      orbitPoleNumer(0.0f), orbitPoleDenom(0.0f), orbitPole(0.0f),
 	      lastOrbitEdge(0.0f), lastOrbitSigma(0.0f),
 	      lastOrbitHorizontalRatio(1.0f), lastOrbitMemoryGain(0.0f),
+	      externalSparrowTrust(1.0f),
 	      mu(0.01f), lastBaselineRate(0.0f),
 	      step(0ULL), initialized(false)
 	{
@@ -291,6 +300,13 @@ struct WeightState
 		scratch_sparrowActive.clear();
 		scratch_sparrowScout.clear();
 		scratch_sparrowPastSignal.clear();
+		scratch_geodeRhsCol.clear();
+		scratch_geodeInvDiagCol.clear();
+		scratch_geodeActiveCurrent.clear();
+		scratch_geodeActiveDelta.clear();
+		scratch_geodeSystemMat.clear();
+		scratch_geodeRhs.clear();
+		scratch_geodeSolution.clear();
 		complementFisher = 0.0f;
 		totalTrace = 0.0f;
 		sigma2 = 0.0f;
@@ -355,6 +371,7 @@ struct WeightState
 		lastOrbitSigma = 0.0f;
 		lastOrbitHorizontalRatio = 1.0f;
 		lastOrbitMemoryGain = 0.0f;
+		externalSparrowTrust = 1.0f;
 		mu = 0.01f;
 		lastBaselineRate = 0.0f;
 		step = 0ULL;

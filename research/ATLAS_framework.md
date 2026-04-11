@@ -2439,8 +2439,3072 @@ Recommended next steps:
   - no architecture churn until the repeated result is stable.
 - Do not spend more time on the old default token-LM benchmark interactively; it is too expensive for the current harness budget and adds less information per iteration than `token-lm-large`.
 
+### N.16 ASTER-T threshold / memory sweep on token-lm-large
+
+Because the first repeated `token-lm-large` result placed ASTER just below the activation threshold (`edge≈0.096` vs threshold `0.10`), a small ASTER-only sweep was run on **April 9, 2026** to test whether the remaining gap was mostly gating or mostly model quality.
+
+Observed repeated results:
+
+- baseline repeated `token-lm-large`:
+  - `ATLAS-ASTER` with `edgeThreshold=0.10`, `memoryScale=0.05`
+  - `testNLL=4.57903 +/- 0.00832`
+  - `activeModes=0.33 +/- 0.47`
+  - `mem=0.000 +/- 0.000`
+
+- lower threshold:
+  - command:
+    - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant aster --atlas-aster-edge-threshold 0.08`
+  - result:
+    - `testNLL=4.57903 +/- 0.00832`
+    - `activeModes=1.00 +/- 0.00`
+    - `mem=0.006 +/- 0.002`
+
+- lower threshold + lower memory gain:
+  - command:
+    - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant aster --atlas-aster-edge-threshold 0.08 --atlas-aster-memory-scale 0.02`
+  - result:
+    - `testNLL=4.57903 +/- 0.00832`
+    - `mem=0.002 +/- 0.001`
+
+- lower threshold + higher memory gain:
+  - command:
+    - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant aster --atlas-aster-edge-threshold 0.08 --atlas-aster-memory-scale 0.10`
+  - result:
+    - `testNLL=4.57903 +/- 0.00832`
+    - `mem=0.012 +/- 0.003`
+
+Interpretation:
+
+- Lowering the threshold does exactly what it should operationally: ASTER activates consistently on `token-lm-large`.
+- Varying `memoryScale` also changes the applied ASTER gain in the expected direction.
+- But the held-out NLL stays numerically unchanged across the whole sweep.
+- That means the remaining bottleneck is no longer “ASTER does not turn on” or “ASTER is too weak.” The bottleneck is the quality of the current transformer ASTER observable/state model.
+
+Updated recommendation:
+
+- Stop tuning `asterEdgeThreshold` and `asterMemoryScale` on this preset.
+- Keep `token-lm-large` as the main interactive transformer benchmark.
+- The next transformer-side work should change the ASTER-T state/observable model itself:
+  - richer logit sketch,
+  - different hidden transport summary,
+  - or a stronger reduced innovation model.
+
+### N.17 Structural ASTER-T bundle-plus-support revision
+
+On **April 9, 2026**, the transformer ASTER-T branch was revised structurally rather than by further scalar tuning.
+
+Revision:
+
+- kept the persistent global logit sketch as the low-rank bundle observable,
+- added exact support channels for:
+  - the target residual,
+  - the top hard-negative residual ranks inside each token step,
+- kept hidden-state transport from the last decoder blocks,
+- changed the ASTER-T state model to run on the combined observation:
+  - `bundle sketch + exact support roles`,
+- changed the ASTER correction path to split into:
+  - bundle backprojection over the sketched residual bulk,
+  - exact sparse support-row corrections for touched target / hard-negative rows.
+
+Implementation notes:
+
+- transformer ASTER state now tracks:
+  - support-channel count,
+  - last-block raw hidden means as well as sketch means,
+  - sparse touched support ids plus per-role counts,
+  - per-role exact hidden means for the output-head correction.
+- the current unit-test harness did not need new CLI flags because the revision stayed under the existing `ATLAS-ASTER` variant.
+
+Validation status:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+  - result: `pass`
+
+Observed benchmark results after the structural revision:
+
+- reduced token-LM smoke:
+  - command:
+    - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --repeats 1 --token-train-seqs 4 --token-test-seqs 2 --token-epochs 1 --token-seq-len 16 --token-dmodel 16 --token-dff 32 --token-layers 1 --token-heads 1 --variant all`
+  - result:
+    - `AdamW`: `testNLL=4.17474`
+    - `ATLAS-BSRP`: `4.18314`
+    - `ATLAS-SPARROW`: `4.16570`
+    - `ATLAS-ASTER`: `4.16876`
+    - ASTER usage:
+      - `activeModes=2.00`
+      - `edge=0.377`
+      - `sigma=0.409`
+      - `predR2=0.910`
+      - `mem=0.033`
+
+- `token-lm-large`, repeated:
+  - command:
+    - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant all`
+  - result:
+    - `AdamW`: `testNLL=4.57676 +/- 0.00637`
+    - `ATLAS-BSRP`: `4.59059 +/- 0.00348`
+    - `ATLAS-SPARROW`: `4.58331 +/- 0.01515`
+    - `ATLAS-ASTER`: `4.57902 +/- 0.00832`
+    - ASTER usage:
+      - `activeModes=1.00 +/- 0.00`
+      - `edge=0.537 +/- 0.141`
+      - `sigma=0.544 +/- 0.139`
+      - `predR2=0.968 +/- 0.009`
+      - `mem=0.039 +/- 0.003`
+      - `boundaryMs=0.691 +/- 0.026`
+
+Interpretation:
+
+- The structural revision did what the threshold sweep could not:
+  - ASTER is no longer stuck in the near-threshold regime on `token-lm-large`.
+  - Mode activation and applied gain are now clearly nonzero across repeats.
+- But the ranking did **not** invert:
+  - `ASTER` remains stronger than `ATLAS-BSRP`,
+  - `ASTER` remains materially stronger than the old thresholded-no-op regime,
+  - but `AdamW` is still slightly best on held-out NLL on this preset,
+  - and `SPARROW` remains slightly better than `ASTER` on the tiny smoke case.
+
+Updated recommendation:
+
+- Keep `token-lm-large` as the primary interactive transformer benchmark.
+- Keep `ATLAS-ASTER` as the main transformer research branch.
+- Keep `ATLAS-BSRP` and `SPARROW` as controls.
+- Do **not** go back to threshold / memory sweeps on transformer ASTER-T.
+- The next useful transformer-side step, if the branch continues, should now target:
+  - stronger sequence state,
+  - regime conditioning,
+  - or a richer output-space realization,
+  not more scalar gate tuning.
+
+### N.18 Lag-2 ASTER-T sequence-state revision
+
+On **April 9, 2026**, the transformer ASTER-T branch was revised again to test a stronger sequence/state model rather than another observable or scalar-gate tweak.
+
+Revision:
+
+- expanded the ASTER-T transfer feature from a lag-1 ARX-style state to a lag-2 packed history:
+  - past residual sketch at lags 1 and 2,
+  - transported hidden controls at lags 0, 1, and 2,
+- expanded the latent transition feature similarly:
+  - latent state at lags 1 and 2,
+  - transported controls at lags 0, 1, and 2,
+- kept the bundle-plus-support observable family unchanged,
+- kept output-head-only ASTER correction unchanged.
+
+Implementation note:
+
+- the token benchmark harness was also hardened to set the transformer runtime knobs explicitly
+  (`kvCacheDType`, `tokenLmLossKind`, `layerNormEps`, dropout rates) instead of relying on inherited defaults.
+  This avoided a harness-local `setTrainingConfig: unknown kvCacheDType` failure and did not change the intended benchmark semantics.
+
+Validation status:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+  - result: `timeout`
+  - note: this is the same long-running logging-heavy DFF path seen earlier; it did not block the focused transformer benchmark.
+
+Observed benchmark result after the lag-2 state revision:
+
+- `token-lm-large`, repeated:
+  - command:
+    - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant all`
+  - result:
+    - `AdamW`: `testNLL=4.57676 +/- 0.00637`
+    - `ATLAS-BSRP`: `4.59059 +/- 0.00348`
+    - `ATLAS-SPARROW`: `4.58331 +/- 0.01515`
+    - `ATLAS-ASTER`: `4.57903 +/- 0.00832`
+    - ASTER usage:
+      - `activeModes=1.00 +/- 0.00`
+      - `edge=0.438 +/- 0.135`
+      - `sigma=0.443 +/- 0.133`
+      - `predR2=0.971 +/- 0.019`
+      - `mem=0.036 +/- 0.004`
+      - `boundaryMs=2.318 +/- 0.217`
+
+Interpretation:
+
+- The lag-2 state revision is **valid**:
+  - ASTER still activates consistently,
+  - predictive quality remains high,
+  - the branch still beats `ATLAS-BSRP` cleanly on this preset.
+- But it is **not** a ranking change:
+  - held-out NLL is effectively unchanged from the prior structural ASTER-T branch,
+  - `AdamW` still leads on `token-lm-large`,
+  - `SPARROW` remains behind ASTER here.
+- So the first stronger sequence-state upgrade did not unlock additional loss-critical signal.
+
+Updated recommendation:
+
+- Keep the bundle-plus-support ASTER-T branch as the transformer ATLAS baseline.
+- Treat lag-2 ASTER-T as a neutral result, not a new default.
+- If transformer ASTER continues, the next structural step should be:
+  - regime conditioning,
+  - or a richer output-space realization,
+  not further linear lag expansion or scalar threshold tuning.
+
+### N.19 Hard-bucket regime-conditioned ASTER-T
+
+On **April 9, 2026**, the next transformer ASTER-T revision tested the simplest practical form of regime conditioning rather than a richer global linear state.
+
+Revision:
+
+- added `4` hard output regimes per token:
+  - low entropy / high margin,
+  - low entropy / low margin,
+  - high entropy / high margin,
+  - high entropy / low margin,
+- accumulated ASTER bundle, support, hidden-transport, and latent-state statistics separately for each regime,
+- selected the dominant regime at each ATLAS control boundary and ran the existing ASTER-T update on that regime-local slice,
+- kept the bundle-plus-support output observable and output-head-only actuation unchanged.
+
+Implementation note:
+
+- the first benchmark run after the code change threw `std::bad_alloc`, but that turned out to be a stale `glades-unit-tests` binary after the transformer ASTER state layout change.
+- after relinking `glades-unit-tests` against the rebuilt backend, the benchmark path was stable again.
+
+Validation status:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --repeats 1 --token-train-seqs 4 --token-test-seqs 2 --token-epochs 1 --token-seq-len 16 --token-dmodel 16 --token-dff 32 --token-layers 1 --token-heads 1 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant all`
+  - result: `pass`
+
+Observed benchmark results after the hard-bucket regime revision:
+
+- reduced token-LM smoke:
+  - result:
+    - `AdamW`: `testNLL=4.17474`
+    - `ATLAS-BSRP`: `4.18314`
+    - `ATLAS-SPARROW`: `4.16570`
+    - `ATLAS-ASTER`: `4.16877`
+    - ASTER usage:
+      - `activeModes=2.00`
+      - `edge=0.373`
+      - `sigma=0.388`
+      - `predR2=0.875`
+      - `mem=0.032`
+
+- `token-lm-large`, repeated:
+  - result:
+    - `AdamW`: `testNLL=4.57676 +/- 0.00637`
+    - `ATLAS-BSRP`: `4.59059 +/- 0.00348`
+    - `ATLAS-SPARROW`: `4.58331 +/- 0.01515`
+    - `ATLAS-ASTER`: `4.57903 +/- 0.00832`
+    - ASTER usage:
+      - `activeModes=1.00 +/- 0.00`
+      - `edge=0.438 +/- 0.135`
+      - `sigma=0.443 +/- 0.133`
+      - `predR2=0.971 +/- 0.019`
+      - `mem=0.036 +/- 0.004`
+      - `boundaryMs=2.164 +/- 0.186`
+
+Interpretation:
+
+- The minimal hard-bucket regime conditioning is a **valid implementation**, not a no-op:
+  - ASTER still activates cleanly,
+  - bounded per-boundary cost remains small,
+  - the branch still beats `ATLAS-BSRP` on the larger token-LM preset.
+- But it is **not** a quality breakthrough:
+  - held-out NLL on `token-lm-large` is effectively unchanged from the prior lag-2 / global ASTER-T branch,
+  - `AdamW` still leads,
+  - the current dominant-regime approximation does not unlock additional loss-critical signal.
+
+Updated recommendation:
+
+- Keep global bundle-plus-support ASTER-T as the transformer ATLAS baseline.
+- Treat this first hard-bucket regime-conditioned ASTER as a neutral result, not a new default.
+- If transformer ASTER continues, the next structural step should be:
+  - a true multi-expert mixture instead of dominant-regime selection,
+  - or a richer output-space realization inside each regime,
+  not more threshold tuning.
+
+### N.20 True multi-expert MOSAIC-ASTER mixture
+
+On **April 10, 2026**, the dominant-regime ASTER-T approximation was replaced by the first true multi-expert mixture pass.
+
+Revision:
+
+- kept the same `4` hard output regimes:
+  - low entropy / high margin,
+  - low entropy / low margin,
+  - high entropy / high margin,
+  - high entropy / low margin,
+- kept the same regime-local state slices and bundle-plus-support observable family,
+- changed the ASTER boundary update from:
+  - pick the single dominant regime and ignore the rest,
+  to:
+  - run every nonempty regime expert,
+  - apply every regime-local correction,
+  - aggregate ASTER diagnostics across regimes instead of reporting only the dominant one.
+
+Implementation note:
+
+- the transformer ASTER timing buckets were also adjusted so setup / transport / fit times remain meaningful under the per-regime loop instead of double-counting elapsed time from the outer boundary start.
+
+Validation status:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --repeats 1 --token-train-seqs 4 --token-test-seqs 2 --token-epochs 1 --token-seq-len 16 --token-dmodel 16 --token-dff 32 --token-layers 1 --token-heads 1 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant all`
+  - result: `pass`
+
+Observed benchmark results after the true mixture revision:
+
+- reduced token-LM smoke:
+  - result:
+    - `AdamW`: `testNLL=4.17474`
+    - `ATLAS-BSRP`: `4.18314`
+    - `ATLAS-SPARROW`: `4.16570`
+    - `ATLAS-ASTER`: `4.16877`
+    - ASTER usage:
+      - `activeModes=2.00`
+      - `edge=0.373`
+      - `sigma=0.388`
+      - `predR2=0.875`
+      - `mem=0.032`
+      - `boundaryMs=0.561`
+
+- `token-lm-large`, repeated:
+  - result:
+    - `AdamW`: `testNLL=4.57676 +/- 0.00637`
+    - `ATLAS-BSRP`: `4.59059 +/- 0.00348`
+    - `ATLAS-SPARROW`: `4.58331 +/- 0.01515`
+    - `ATLAS-ASTER`: `4.57903 +/- 0.00832`
+    - ASTER usage:
+      - `activeModes=1.00 +/- 0.00`
+      - `edge=0.438 +/- 0.135`
+      - `sigma=0.443 +/- 0.133`
+      - `predR2=0.971 +/- 0.019`
+      - `mem=0.036 +/- 0.004`
+      - `boundaryMs=2.149 +/- 0.203`
+
+Interpretation:
+
+- The first true multi-expert MOSAIC-ASTER implementation is a **valid systems result**:
+  - all experts run cleanly,
+  - the aggregated diagnostics stay bounded,
+  - the transformer ASTER branch still beats `ATLAS-BSRP`.
+- But it is **not** a quality breakthrough:
+  - the held-out `token-lm-large` result is numerically unchanged from the dominant-regime approximation,
+  - `AdamW` still leads,
+  - the extra expert coverage does not convert the already strong ASTER predictive signal into better next-token loss.
+
+Updated recommendation:
+
+- Treat the regime-conditioning hypothesis as largely falsified in its current hard-bucket / linear-expert form.
+- Keep the current ASTER-T mixture as a documented neutral result, not a new default.
+- If transformer ASTER continues, the next useful structural step should be:
+  - a richer output-space realization inside each regime,
+  - or a token-conditioned / switched state model with a meaningfully different observable family,
+  not more threshold tuning and not more copies of the same linear expert.
+
+### N.21 Token-lm-large 10-repeat significance pass
+
+On **April 10, 2026**, the larger transformer preset was rerun with `repeats=10` before making another ASTER-T architecture change.
+
+Command:
+
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+
+Observed result:
+
+- `AdamW`: `testNLL=4.58178 +/- 0.00977`
+- `ATLAS-BSRP`: `4.58258 +/- 0.01477`
+- `ATLAS-SPARROW`: `4.57641 +/- 0.01124`
+- `ATLAS-ASTER`: `4.58045 +/- 0.00787`
+
+Interpretation:
+
+- the earlier `repeats=3` picture was too optimistic for ASTER-T,
+- on the current interactive transformer preset, `SPARROW` is the best branch,
+- `ASTER` is still better than `BSRP`, but it no longer looks like the lead transformer branch on this benchmark.
+
+Updated recommendation:
+
+- use this 10-repeat result as the transformer significance baseline,
+- require any future ASTER-T revision to beat `ATLAS-SPARROW`, not just `ATLAS-BSRP`,
+- stop treating the tiny gaps to AdamW or ASTER’s activation diagnostics as sufficient evidence on their own.
+
+### N.22 Margin-state ASTER-T revision
+
+On **April 10, 2026**, the next ASTER-T structural revision replaced the exact support-residual channels with a more loss-aligned support state:
+
+- kept the bundle residual sketch for low-rank output bulk,
+- replaced support residual channels by exact support logits,
+- added explicit target-minus-negative margin channels derived from those exact support logits,
+- kept the multi-expert regime mixture and output-head-only actuation unchanged.
+
+The intention was to make ASTER predict target-margin dynamics directly rather than approximate them through residual support roles.
+
+Validation status:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --repeats 1 --token-train-seqs 4 --token-test-seqs 2 --token-epochs 1 --token-seq-len 16 --token-dmodel 16 --token-dff 32 --token-layers 1 --token-heads 1 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - result: `pass`
+
+Observed benchmark result after the margin-state revision:
+
+- reduced token-LM smoke:
+  - `AdamW`: `testNLL=4.17474`
+  - `ATLAS-BSRP`: `4.18314`
+  - `ATLAS-SPARROW`: `4.16570`
+  - `ATLAS-ASTER`: `4.16878`
+  - ASTER usage:
+    - `edge=0.186`
+    - `sigma=0.216`
+    - `predR2=0.563`
+    - `mem=0.013`
+    - `boundaryMs=0.906`
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `testNLL=4.58178 +/- 0.00977`
+  - `ATLAS-BSRP`: `4.58258 +/- 0.01477`
+  - `ATLAS-SPARROW`: `4.57641 +/- 0.01124`
+  - `ATLAS-ASTER`: `4.58045 +/- 0.00787`
+  - ASTER usage:
+    - `edge=0.258 +/- 0.066`
+    - `sigma=0.265 +/- 0.064`
+    - `predR2=0.896 +/- 0.079`
+    - `mem=0.026 +/- 0.004`
+    - `boundaryMs=3.626 +/- 0.251`
+
+Interpretation:
+
+- This is a clean negative result for the margin-state hypothesis in its current lightweight form.
+- Held-out NLL is effectively unchanged from the pre-revision ASTER-T significance run.
+- The revision reduced ASTER’s internal edge/sigma signal and made it slower, without improving ranking.
+- So replacing support residual roles with exact support logits plus explicit margins did **not** recover the missing transformer-side loss signal.
+
+Updated recommendation:
+
+- stop local ASTER-T tuning on `token-lm-large`,
+- keep `SPARROW` as the best current transformer-side ATLAS control on this preset,
+- only resume ASTER-T transformer work if the next step is materially different:
+  - token-conditioned or attention-state observables,
+  - a larger / more realistic LM benchmark,
+  - or a richer function-side model that is not another small linear observable tweak.
+
+### N.23 Structured-context transformer benchmark
+
+On **April 10, 2026**, the alternate benchmark harness was extended with a new transformer LM mode, `token-lm-context`, to replace the old "larger preset on the same order-2 recurrence" escape hatch with a genuinely different sequence structure.
+
+Implementation:
+
+- added a new `atlas-alt-bench` mode:
+  - `token-lm-context`
+- added a dedicated preset:
+  - `vocab=129`
+  - `dModel=32`
+  - `dFF=128`
+  - `layers=2`
+  - `heads=4`
+  - `seqLen=56`
+  - `trainSeqs=24`
+  - `testSeqs=8`
+  - `epochs=2`
+- replaced the generator for this mode with a structured token program made of repeated segments containing:
+  - topic markers,
+  - delayed summary recall markers,
+  - delayed anchor recall markers,
+  - local continuation tokens,
+  - and separator/store control tokens.
+
+The point of the new mode is not "more tokens." It is to force the decoder to mix:
+
+- short-horizon local prediction,
+- marker-conditioned recall,
+- topic-conditioned content generation,
+- and cross-segment memory.
+
+Validation:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 3 --variant all`
+  - result: `pass`
+
+Observed benchmark result:
+
+- `AdamW`: `testNLL=4.22251 +/- 0.01795`
+- `ATLAS-BSRP`: `4.81371 +/- 0.01429`
+- `ATLAS-SPARROW`: `4.79139 +/- 0.00754`
+- `ATLAS-ASTER`: `4.80455 +/- 0.01402`
+
+Diagnostics:
+
+- `ATLAS-SPARROW`:
+  - `edge=0.477 +/- 0.018`
+  - `mem=0.021 +/- 0.001`
+- `ATLAS-ASTER`:
+  - `activeModes=1.83 +/- 0.24`
+  - `mode2Frac=0.833 +/- 0.236`
+  - `edge=0.474 +/- 0.103`
+  - `sigma=0.510 +/- 0.100`
+  - `predR2=0.892 +/- 0.047`
+  - `mem=0.034 +/- 0.004`
+  - `boundaryMs=4.748 +/- 0.078`
+
+Interpretation:
+
+- This benchmark is materially harsher than `token-lm-large`; the old near-tie between AdamW and the best ATLAS branch disappears here.
+- On this more realistic structured-context task, `AdamW` is clearly best.
+- Within the ATLAS family, `SPARROW` is stronger than `ASTER`, and both are materially better than isotropic `ATLAS-BSRP`.
+- ASTER still activates real modes here, so the result is not "ASTER failed to turn on." It is "the current ASTER transformer observable/control still does not beat the cheaper SPARROW branch once the task demands stronger context use."
+
+Updated recommendation:
+
+- use `token-lm-context` as the primary interactive transformer benchmark going forward,
+- keep `token-lm-large` as a lighter continuity/control preset,
+- keep `SPARROW` as the best current transformer-side ATLAS branch on the available token-LM tasks,
+- stop treating transformer ASTER as the lead branch unless a materially different observable family beats SPARROW on `token-lm-context`.
+
+### N.24 AEGIS minimal fusion optimizer
+
+On **April 10, 2026**, the first minimal implementation of the proposed unified optimizer, **AEGIS** (`Adaptive Evidence-Gated Integrated Subspaces`), was added as a new ATLAS-family branch.
+
+Implementation scope:
+
+- AEGIS is not a separate optimizer stack. It is a narrow fusion branch inside the existing ATLAS path.
+- The minimal prototype keeps:
+  - `ATLAS-BSRP` as the spatial base,
+  - `SPARROW` enabled on the active/scout parameter-space channel,
+  - `ASTER` enabled on the output-space innovation channel.
+- The first fusion rule is intentionally simple:
+  - compute ASTER's usual output-space gain,
+  - measure prior SPARROW evidence on the same head/update path,
+  - attenuate ASTER's applied gain when predictive parameter-space evidence is already stronger.
+- This gives a falsifiable first fusion branch without introducing a separate optimizer state stack beyond the existing ATLAS/SPARROW/ASTER components.
+
+Implementation notes:
+
+- new ATLAS config keys:
+  - `training.atlas.aegisEnabled`
+  - `training.atlas.aegisPredictiveScale`
+  - `training.atlas.aegisOutputScale`
+- checkpoint parse/write/mismatch validation was extended to include those keys.
+- `atlas-alt-bench` now supports:
+  - `--variant aegis`
+  - `ATLAS-AEGIS` in `--variant all`
+
+Validation:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - result: `pass`
+
+Observed benchmark result:
+
+- `teacher-student`, repeated:
+  - `AdamW`: `testMSE=0.07863 +/- 0.00278`
+  - `ATLAS-BSRP`: `0.05933 +/- 0.01585`
+  - `ATLAS-SPARROW`: `0.04640 +/- 0.00142`
+  - `ATLAS-AEGIS`: `0.05842 +/- 0.01678`
+
+- `latent-forecast`, repeated:
+  - `AdamW`: `testMSE=0.00351 +/- 0.00013`
+  - `ATLAS-BSRP`: `0.00284 +/- 0.00022`
+  - `ATLAS-SPARROW`: `0.00266 +/- 0.00017`
+  - `ATLAS-ASTER`: `0.00267 +/- 0.00016`
+  - `ATLAS-AEGIS`: `0.00267 +/- 0.00015`
+
+- `nonlinear-forecast`, repeated:
+  - `AdamW`: `testMSE=0.00182 +/- 0.00005`
+  - `ATLAS-BSRP`: `0.00143 +/- 0.00009`
+  - `ATLAS-SPARROW`: `0.00159 +/- 0.00014`
+  - `ATLAS-ASTER`: `0.00140 +/- 0.00014`
+  - `ATLAS-AEGIS`: `0.00138 +/- 0.00011`
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `testNLL=4.58178 +/- 0.00977`
+  - `ATLAS-BSRP`: `4.58258 +/- 0.01477`
+  - `ATLAS-SPARROW`: `4.57641 +/- 0.01124`
+  - `ATLAS-ASTER`: `4.58045 +/- 0.00787`
+  - `ATLAS-AEGIS`: `4.57398 +/- 0.01308`
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `ATLAS-BSRP`: `4.80616 +/- 0.01737`
+  - `ATLAS-SPARROW`: `4.79550 +/- 0.01327`
+  - `ATLAS-ASTER`: `4.80677 +/- 0.01414`
+  - `ATLAS-AEGIS`: `4.79785 +/- 0.02182`
+
+Diagnostics:
+
+- On `token-lm-large`, AEGIS keeps the strong SPARROW signal but only a small ASTER correction:
+  - `SPARROW edge=0.701 +/- 0.020`
+  - `SPARROW mem=0.034 +/- 0.001`
+  - `ASTER edge=0.194 +/- 0.037`
+  - `ASTER predR2=0.932 +/- 0.029`
+  - `ASTER mem=0.005 +/- 0.002`
+- On `token-lm-context`, AEGIS again retains both channels but with ASTER attenuated relative to standalone ASTER:
+  - `SPARROW edge=0.473 +/- 0.036`
+  - `SPARROW mem=0.021 +/- 0.002`
+  - `ASTER edge=0.389 +/- 0.059`
+  - `ASTER predR2=0.889 +/- 0.057`
+  - `ASTER mem=0.013 +/- 0.003`
+- On `latent-forecast` and `nonlinear-forecast`, the fusion mostly leaves SPARROW intact while shrinking ASTER to a very small or zero applied gain. That is exactly the intended conservative behavior of the first AEGIS prototype.
+
+Interpretation:
+
+- This is the first integrated optimizer branch in the ATLAS line that shows nontrivial wins across more than one task family.
+- AEGIS is **not** universally better:
+  - it is clearly worse than SPARROW on the planted `teacher-student` benchmark,
+  - essentially tied with the best existing branch on `latent-forecast`,
+  - slightly better than ASTER on `nonlinear-forecast`,
+  - best ATLAS-family branch on `token-lm-large`,
+  - but still worse than AdamW on `token-lm-context`.
+- The main lesson is that the design premise is correct:
+  - `SPARROW` and `ASTER` should be treated as complementary sensors, not mutually exclusive optimizers.
+- The minimal evidence gate is already strong enough to prevent ASTER from hurting the transformer branch as much as it did standalone, while preserving enough output-space signal to help on nonlinear dynamics.
+
+Updated recommendation:
+
+- keep `AEGIS` as the main **unified** research branch,
+- keep `SPARROW` as the best single-branch control on planted / easier dynamic / current structured-context transformer tasks,
+- keep `ASTER` as the nonlinear dynamic specialist branch and output-space control,
+- do **not** yet replace AdamW as the robustness anchor on harder transformer-context tasks,
+- next AEGIS work should improve evidence calibration and channel selection, not reopen standalone ASTER threshold tuning.
+
+### N.25 AEGIS-v2 delayed evidence calibration
+
+On **April 10, 2026**, the minimal AEGIS fusion rule was upgraded to **AEGIS-v2**, replacing the original one-shot ASTER attenuation with an explicit delayed-calibration scheme.
+
+Implementation scope:
+
+- kept the optimizer family fixed:
+  - `AdamW`-style base stability,
+  - `ATLAS-BSRP` spatial channel,
+  - `SPARROW` predictive channel,
+  - `ASTER` output-space channel.
+- added explicit bounded channel precisions:
+  - `lambdaSpatial`
+  - `lambdaPredictive`
+  - `lambdaOutput`
+- updated those precisions from delayed calibration error rather than raw edge alone:
+  - previous predictive/output evidence is stored,
+  - next-boundary realized evidence is compared against it,
+  - predictive/output error EMAs are updated,
+  - channel precisions are normalized before applying ASTER gain.
+- extended runtime diagnostics and the benchmark harness to report:
+  - lambda means,
+  - predicted vs realized predictive/output evidence,
+  - predictive/output calibration errors,
+  - channel disagreement.
+
+Validation:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - result: `pass`
+
+Observed benchmark result:
+
+- `teacher-student`, repeated:
+  - `AdamW`: `testMSE=0.07863 +/- 0.00278`
+  - `ATLAS-BSRP`: `0.05933 +/- 0.01585`
+  - `ATLAS-SPARROW`: `0.04640 +/- 0.00142`
+  - `ATLAS-AEGIS`: `0.05841 +/- 0.01678`
+
+- `latent-forecast`, repeated:
+  - `AdamW`: `testMSE=0.00351 +/- 0.00013`
+  - `ATLAS-BSRP`: `0.00284 +/- 0.00022`
+  - `ATLAS-SPARROW`: `0.00266 +/- 0.00017`
+  - `ATLAS-ASTER`: `0.00267 +/- 0.00016`
+  - `ATLAS-AEGIS`: `0.00267 +/- 0.00015`
+
+- `nonlinear-forecast`, repeated:
+  - `AdamW`: `testMSE=0.00182 +/- 0.00005`
+  - `ATLAS-BSRP`: `0.00143 +/- 0.00009`
+  - `ATLAS-SPARROW`: `0.00159 +/- 0.00014`
+  - `ATLAS-ASTER`: `0.00140 +/- 0.00014`
+  - `ATLAS-AEGIS`: `0.00138 +/- 0.00011`
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `testNLL=4.58178 +/- 0.00977`
+  - `ATLAS-BSRP`: `4.58258 +/- 0.01477`
+  - `ATLAS-SPARROW`: `4.57641 +/- 0.01124`
+  - `ATLAS-ASTER`: `4.58045 +/- 0.00787`
+  - `ATLAS-AEGIS`: `4.57398 +/- 0.01308`
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `ATLAS-BSRP`: `4.80616 +/- 0.01737`
+  - `ATLAS-SPARROW`: `4.79550 +/- 0.01327`
+  - `ATLAS-ASTER`: `4.80677 +/- 0.01414`
+  - `ATLAS-AEGIS`: `4.79782 +/- 0.02182`
+
+Diagnostics:
+
+- On planted and DFF dynamic tasks, AEGIS-v2 remains strongly predictive-dominant:
+  - `teacher-student`:
+    - `lambdaSpatial=0.088 +/- 0.022`
+    - `lambdaPredictive=0.889 +/- 0.040`
+    - `lambdaOutput=0.023 +/- 0.018`
+  - `latent-forecast`:
+    - `lambdaSpatial=0.057 +/- 0.004`
+    - `lambdaPredictive=0.919 +/- 0.008`
+    - `lambdaOutput=0.024 +/- 0.004`
+  - `nonlinear-forecast`:
+    - `lambdaSpatial=0.065 +/- 0.011`
+    - `lambdaPredictive=0.931 +/- 0.014`
+    - `lambdaOutput=0.005 +/- 0.003`
+- On `token-lm-large`, AEGIS-v2 becomes a genuinely balanced two-sensor fusion:
+  - `lambdaSpatial=0.081 +/- 0.010`
+  - `lambdaPredictive=0.461 +/- 0.022`
+  - `lambdaOutput=0.457 +/- 0.028`
+  - predictive calibration:
+    - `predicted=0.675 +/- 0.043`
+    - `realized=0.639 +/- 0.044`
+    - `error=0.087 +/- 0.004`
+  - output calibration:
+    - `predicted=0.168 +/- 0.033`
+    - `realized=0.181 +/- 0.038`
+    - `error=0.007 +/- 0.002`
+- On `token-lm-context`, both non-spatial channels remain active and reasonably calibrated:
+  - `lambdaSpatial=0.046 +/- 0.004`
+  - `lambdaPredictive=0.570 +/- 0.056`
+  - `lambdaOutput=0.384 +/- 0.058`
+  - predictive calibration:
+    - `predicted=0.508 +/- 0.046`
+    - `realized=0.507 +/- 0.046`
+    - `error=0.016 +/- 0.002`
+  - output calibration:
+    - `predicted=0.338 +/- 0.067`
+    - `realized=0.345 +/- 0.067`
+    - `error=0.014 +/- 0.002`
+
+Interpretation:
+
+- AEGIS-v2 is a **real calibration improvement**, but not yet a broad frontier shift.
+- The topline ranking is basically unchanged from the minimal AEGIS prototype:
+  - still clearly worse than SPARROW on `teacher-student`,
+  - still tied with the best branch on `latent-forecast`,
+  - still best on `nonlinear-forecast`,
+  - still best ATLAS-family branch on `token-lm-large`,
+  - still behind `AdamW` and slightly behind SPARROW on `token-lm-context`.
+- The important new lesson is diagnostic, not just numeric:
+  - on DFF tasks, AEGIS correctly learns that the predictive channel is the only one worth trusting,
+  - on `token-lm-large`, AEGIS now shows that the predictive and output channels are comparably credible,
+  - on `token-lm-context`, both channels are well calibrated but still do not close the much larger gap to `AdamW`.
+- That means the remaining transformer problem is no longer "bad evidence weighting." It is the quality of the underlying observable/state models on the harder structured-context task.
+
+Updated recommendation:
+
+- keep `AEGIS-v2` as the main unified optimizer branch,
+- treat the new lambda diagnostics as the primary signal for deciding which channel family is actually contributing,
+- stop tuning scalar AEGIS weights locally,
+- if transformer work continues, change the transformer-side observable/state model inside AEGIS rather than changing the fusion math again,
+- keep `SPARROW` as the planted/easier-dynamics control and `AdamW` as the robustness anchor on `token-lm-context`.
+
+### N.26 Transformer AEGIS attention-state observable revision
+
+On **April 10, 2026**, the transformer-side ASTER sensor inside `AEGIS-v2` was structurally widened rather than retuned.
+
+Implementation summary:
+
+- kept the `AEGIS-v2` fusion math and delayed evidence calibration unchanged,
+- added a second transformer control stream for the last tracked decoder blocks:
+  - existing stream: hidden-state transport,
+  - new stream: attention-output transport,
+- expanded transformer ASTER control construction so the output-space sensor sees both hidden and attention summaries at each boundary,
+- kept the correction head-only on the tied LM head.
+
+Code surface:
+
+- transformer ASTER state buffers:
+  - [transformer_model_state.inc](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/transformer_model_state.inc)
+- transformer ASTER initialization:
+  - [network.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/network.cpp)
+- transformer ASTER/AEGIS control accumulation and boundary update:
+  - [sgd_transformer.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_transformer.cpp)
+
+Validation:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - result: `pass`
+
+Observed benchmark result:
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `testNLL=4.58178 +/- 0.00977`
+  - `ATLAS-BSRP`: `4.58258 +/- 0.01477`
+  - `ATLAS-SPARROW`: `4.57641 +/- 0.01124`
+  - `ATLAS-ASTER`: `4.58045 +/- 0.00787`
+  - `ATLAS-AEGIS`: `4.57398 +/- 0.01308`
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `ATLAS-BSRP`: `4.80616 +/- 0.01737`
+  - `ATLAS-SPARROW`: `4.79550 +/- 0.01327`
+  - `ATLAS-ASTER`: `4.80678 +/- 0.01417`
+  - `ATLAS-AEGIS`: `4.79780 +/- 0.02182`
+
+Diagnostics:
+
+- `token-lm-large`:
+  - `AEGIS` channel trust:
+    - `lambdaSpatial=0.085 +/- 0.009`
+    - `lambdaPredictive=0.494 +/- 0.017`
+    - `lambdaOutput=0.420 +/- 0.019`
+  - calibration:
+    - predictive:
+      - `predicted=0.676 +/- 0.046`
+      - `realized=0.648 +/- 0.048`
+      - `error=0.086 +/- 0.004`
+    - output:
+      - `predicted=0.142 +/- 0.024`
+      - `realized=0.154 +/- 0.030`
+      - `error=0.006 +/- 0.003`
+
+- `token-lm-context`:
+  - `AEGIS` channel trust:
+    - `lambdaSpatial=0.049 +/- 0.004`
+    - `lambdaPredictive=0.612 +/- 0.048`
+    - `lambdaOutput=0.338 +/- 0.048`
+  - calibration:
+    - predictive:
+      - `predicted=0.508 +/- 0.046`
+      - `realized=0.507 +/- 0.045`
+      - `error=0.016 +/- 0.001`
+    - output:
+      - `predicted=0.244 +/- 0.040`
+      - `realized=0.249 +/- 0.042`
+      - `error=0.010 +/- 0.001`
+
+Interpretation:
+
+- This is a **clean neutral result**.
+- The added attention-state observable did **not** move the benchmark ranking:
+  - `AEGIS` remains best on `token-lm-large`,
+  - `AEGIS` remains behind `SPARROW` and far behind `AdamW` on `token-lm-context`.
+- The new transformer sensor also did not unlock a hidden output-channel surge:
+  - on `token-lm-large`, the two non-spatial channels remain balanced,
+  - on `token-lm-context`, the predictive channel is still dominant even after exposing attention-state transport.
+- So the remaining transformer gap is not explained by "missing attention-state information" alone.
+- The most important result is narrowing:
+  - `AEGIS-v2` fusion is already stable,
+  - adding last-block attention-output transport is not enough,
+  - the next transformer advance would need a materially richer token-conditioned or attention-pattern observable, not another small global control-stream expansion.
+
+Updated recommendation:
+
+- keep the current transformer `AEGIS-v2` implementation as the documented baseline,
+- stop local transformer observable tweaks of the same class,
+- keep `token-lm-large` as the light repeated control and `token-lm-context` as the primary transformer stress benchmark,
+- if transformer work continues, move to a materially different observable family:
+  - token-conditioned output observables,
+  - attention-pattern / key-value state observables,
+  - or a larger, more realistic LM benchmark before more optimizer-side refinements.
+
+### N.27 Transformer AEGIS token-conditioned output + attention-pattern revision
+
+On **April 10, 2026**, the transformer-side `AEGIS-v2` sensor was widened again, this time with a more explicitly token-conditioned observable and a separate attention-pattern control stream.
+
+Implementation summary:
+
+- kept the `AEGIS-v2` fusion math unchanged,
+- added a small token-conditioned tail to the transformer ASTER/AEGIS output observable,
+- accumulated exact support-role residual mass into that token-conditioned tail,
+- added a third transformer ASTER control stream for attention-pattern summaries from the last tracked decoder blocks,
+- introduced a harsher transformer benchmark, `token-lm-context-large`, to test whether the richer observable helps under longer-context delayed recall pressure.
+
+Code surface:
+
+- transformer ASTER / AEGIS state:
+  - [transformer_model_state.inc](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/transformer_model_state.inc)
+- transformer ASTER / AEGIS initialization:
+  - [network.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/network.cpp)
+- transformer token-conditioned residual / attention-pattern accumulation and boundary update:
+  - [sgd_transformer.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_transformer.cpp)
+- transformer alternate benchmark harness:
+  - [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp)
+
+Validation:
+
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - result: `pass`
+- command:
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - result: `pass`
+- command:
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+  - result: `timeout (existing long-running DFF/logging path)`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - result: `pass`
+- command:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context-large --repeats 3 --variant all`
+  - result: `pass`
+
+Observed benchmark result:
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `testNLL=4.58178 +/- 0.00977`
+  - `ATLAS-BSRP`: `4.58258 +/- 0.01477`
+  - `ATLAS-SPARROW`: `4.57641 +/- 0.01124`
+  - `ATLAS-ASTER`: `4.58045 +/- 0.00787`
+  - `ATLAS-AEGIS`: `4.57398 +/- 0.01308`
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `ATLAS-BSRP`: `4.80616 +/- 0.01737`
+  - `ATLAS-SPARROW`: `4.79550 +/- 0.01327`
+  - `ATLAS-ASTER`: `4.80681 +/- 0.01416`
+  - `ATLAS-AEGIS`: `4.79780 +/- 0.02183`
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `testNLL=4.26843 +/- 0.04316`
+  - `ATLAS-BSRP`: `5.14022 +/- 0.04002`
+  - `ATLAS-SPARROW`: `5.15660 +/- 0.00482`
+  - `ATLAS-ASTER`: `5.15688 +/- 0.01281`
+  - `ATLAS-AEGIS`: `5.16129 +/- 0.01511`
+
+Diagnostics:
+
+- `token-lm-large`:
+  - `AEGIS` channel trust:
+    - `lambdaSpatial=0.093 +/- 0.011`
+    - `lambdaPredictive=0.532 +/- 0.032`
+    - `lambdaOutput=0.376 +/- 0.038`
+  - `ASTER` timing:
+    - `boundaryMs=50.054 +/- 3.405`
+
+- `token-lm-context`:
+  - `AEGIS` channel trust:
+    - `lambdaSpatial=0.051 +/- 0.004`
+    - `lambdaPredictive=0.641 +/- 0.051`
+    - `lambdaOutput=0.307 +/- 0.052`
+  - `ASTER` timing:
+    - `boundaryMs=60.330 +/- 4.807`
+
+- `token-lm-context-large`:
+  - `SPARROW`:
+    - `edge=0.463 +/- 0.069`
+    - `mem=0.020 +/- 0.004`
+  - `ASTER`:
+    - `activeModes=1.50 +/- 0.00`
+    - `mode2Frac=0.500 +/- 0.000`
+    - `edge=0.234 +/- 0.017`
+    - `sigma=0.270 +/- 0.013`
+    - `predR2=0.907 +/- 0.016`
+    - `mem=0.008 +/- 0.002`
+    - `boundaryMs=61.300 +/- 0.937`
+  - `AEGIS`:
+    - `lambdaSpatial=0.051 +/- 0.004`
+    - `lambdaPredictive=0.616 +/- 0.071`
+    - `lambdaOutput=0.334 +/- 0.067`
+    - predictive calibration:
+      - `predicted=0.436 +/- 0.086`
+      - `realized=0.431 +/- 0.086`
+      - `error=0.010 +/- 0.000`
+    - output calibration:
+      - `predicted=0.207 +/- 0.019`
+      - `realized=0.211 +/- 0.018`
+      - `error=0.007 +/- 0.002`
+
+Interpretation:
+
+- This is a **measured neutral-to-negative result** for the new transformer sensor family.
+- The richer token-conditioned residual sketch plus attention-pattern stream does **not** improve the established transformer benchmarks:
+  - `token-lm-large` stays unchanged in held-out NLL,
+  - `token-lm-context` stays effectively unchanged and still trails `SPARROW`,
+  - `token-lm-context-large` is harsher still and leaves `AdamW` clearly ahead of every ATLAS-family branch.
+- The internal optimizer evidence is real but not sufficient:
+  - `AEGIS` still calibrates both predictive and output channels sensibly,
+  - `ASTER` still opens real retained modes,
+  - but those signals are not translating into better held-out language-model loss on the harder structured-context tasks.
+- The cost picture also worsens:
+  - transformer ASTER / AEGIS boundary time rose materially on the new sensor path,
+  - especially on `token-lm-context` and `token-lm-context-large`.
+
+Updated recommendation:
+
+- keep the current transformer `AEGIS-v2` branch as the documented baseline,
+- treat `token-lm-context-large` as a stronger negative-control stress benchmark,
+- stop local transformer observable expansion of this same class,
+- keep `SPARROW` as the best current ATLAS-family control on the available transformer LM tasks,
+- keep `AdamW` as the robustness anchor and topline baseline,
+- if transformer optimizer research continues, move to a materially different observable family or a more realistic larger LM setup:
+  - direct token-conditioned attention / KV-state observables,
+  - richer function-side sequence state,
+  - or a substantially more realistic LM benchmark before more optimizer-side refinement.
+
+### N.26 KAPPA-AEGIS compressed KV-retrieval observable
+
+On **April 10, 2026**, I implemented the first `KAPPA-AEGIS` prototype: a compressed KV-retrieval observable added to the existing transformer-side `AEGIS-v2` output channel.
+
+The implementation:
+
+- kept the `AEGIS-v2` fusion and calibration math unchanged,
+- added an opt-in KAPPA observable with:
+  - `kappaEnabled`
+  - `kappaHeads`
+  - `kappaLagBuckets`
+  - `kappaRank`
+- tracked a small projected retrieval summary from the first `kappaHeads` attention heads using lag buckets `{1, 2, 4, 8}`,
+- appended that retrieval summary to the transformer ASTER/AEGIS observation and control streams,
+- left actuation head-only.
+
+Important implementation note:
+
+- the first test pass exposed a shared `NNetwork::clean()` regression in the `TrainingConfig` reset path, not a KAPPA logic fault,
+- fixing that lifetime/reset bug restored `atlas-controller` and the small token-LM harness before the KAPPA benchmark pass.
+
+Focused validation:
+
+- `atlas-controller`
+- tiny `token-lm` smoke runs for `AdamW` and `AEGIS` with `--atlas-kappa-enabled 1`
+- `token-lm-large --repeats 10 --variant all --atlas-kappa-enabled 1`
+- `token-lm-context --repeats 10 --variant all --atlas-kappa-enabled 1`
+- `token-lm-context-large --repeats 3 --variant all --atlas-kappa-enabled 1`
+
+Results:
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `4.58178 +/- 0.00977`
+  - `ATLAS-BSRP`: `4.58258 +/- 0.01477`
+  - `ATLAS-SPARROW`: `4.57641 +/- 0.01124`
+  - `ATLAS-ASTER`: `4.58045 +/- 0.00787`
+  - `ATLAS-AEGIS`: `4.57398 +/- 0.01308`
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `4.24529 +/- 0.03627`
+  - `ATLAS-BSRP`: `4.80616 +/- 0.01737`
+  - `ATLAS-SPARROW`: `4.79550 +/- 0.01327`
+  - `ATLAS-ASTER`: `4.80683 +/- 0.01419`
+  - `ATLAS-AEGIS`: `4.79781 +/- 0.02185`
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `4.26843 +/- 0.04316`
+  - `ATLAS-BSRP`: `5.14022 +/- 0.04002`
+  - `ATLAS-SPARROW`: `5.15660 +/- 0.00482`
+  - `ATLAS-ASTER`: `5.15665 +/- 0.01296`
+  - `ATLAS-AEGIS`: `5.16122 +/- 0.01521`
+
+Diagnostics:
+
+- `token-lm-large`:
+  - `AEGIS`:
+    - `lambdaSpatial=0.096 +/- 0.010`
+    - `lambdaPredictive=0.549 +/- 0.034`
+    - `lambdaOutput=0.355 +/- 0.037`
+  - `ASTER`:
+    - `edge=0.177 +/- 0.030`
+    - `predR2=0.759 +/- 0.111`
+    - `boundaryMs=143.831 +/- 0.867`
+
+- `token-lm-context`:
+  - `AEGIS`:
+    - `lambdaSpatial=0.055 +/- 0.004`
+    - `lambdaPredictive=0.684 +/- 0.050`
+    - `lambdaOutput=0.261 +/- 0.050`
+  - `ASTER`:
+    - `edge=0.302 +/- 0.025`
+    - `predR2=0.766 +/- 0.093`
+    - `boundaryMs=160.069 +/- 6.996`
+
+- `token-lm-context-large`:
+  - `AEGIS`:
+    - `lambdaSpatial=0.060 +/- 0.003`
+    - `lambdaPredictive=0.745 +/- 0.133`
+    - `lambdaOutput=0.195 +/- 0.133`
+  - `ASTER`:
+    - `edge=0.339 +/- 0.059`
+    - `predR2=0.540 +/- 0.301`
+    - `boundaryMs=148.377 +/- 1.027`
+
+Interpretation:
+
+- This is a **clean negative result for KAPPA-Lite**.
+- The compressed KV-retrieval observable is implemented and active, but it does **not** improve the transformer rankings:
+  - `token-lm-large` stays effectively unchanged from the established `AEGIS-v2` result,
+  - `token-lm-context` still leaves `SPARROW` ahead of `AEGIS`,
+  - `token-lm-context-large` remains a strong negative-control case where `AdamW` is clearly best and `AEGIS` is now the weakest ATLAS-family branch in the repeated run.
+- The evidence still supports the earlier conclusion:
+  - transformer-side `AEGIS` is real on the easier LM preset,
+  - but local observable expansion of the same family is no longer yielding progress on context-heavy LM tasks.
+
+Updated recommendation:
+
+- keep `token-lm-large` as the light repeated transformer control,
+- keep `token-lm-context` and `token-lm-context-large` as the stress benchmarks,
+- keep `SPARROW` as the best current ATLAS-family control on the harder transformer LM cases,
+- keep `AEGIS-v2` as the unified branch for dynamic non-transformer work and the light transformer preset,
+- stop local KAPPA-style retrieval observable tuning,
+- if transformer optimizer research continues, move next to a materially different family or benchmark:
+  - richer token-conditioned attention/KV observables with stronger state structure,
+  - a more realistic larger LM setup,
+  - or a broader training regime where optimizer differences are not dominated by the tiny synthetic harness.
+
+### N.27 CITADEL-v3-lite delayed-evidence anchor pass
+
+On **April 10, 2026**, I replaced the earlier hard-regime `CITADEL-Lite` anchor with a softer **delayed-evidence CITADEL-v3-lite** pass.
+
+Important scope note:
+
+- This is still **not** the full research-design ideal of a literal `AdamW` prior plus fully modular `BSRP` / `SPARROW` / `ASTER` residual proposal APIs.
+- In the current codebase, the practical step is still to refine the existing `AEGIS-v2` shell:
+  - keep `SPARROW` and `ASTER` embedded in the ATLAS path,
+  - keep `AEGIS` delayed benefit/error tracking,
+  - replace the old hard regime anchor with a smoother anchor driven by **delayed trust EMAs**, **channel disagreement**, and **predictive-vs-output dominance** rather than raw hard-regime mass alone.
+
+Implementation summary:
+
+- core config and trust plumbing:
+  - [training_config.h](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/training_config.h)
+  - [atlas_optimizer.h](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/atlas_optimizer.h)
+  - [atlas_optimizer.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/atlas_optimizer.cpp)
+- runtime state and diagnostics:
+  - [network.h](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/network.h)
+  - [transformer_model_state.inc](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/transformer_model_state.inc)
+  - [network.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/network.cpp)
+- checkpoint/config persistence:
+  - [checkpoint_persistence.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/checkpoint_persistence.cpp)
+- DFF and transformer training paths:
+  - [sgd_dff.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_dff.cpp)
+  - [sgd_transformer.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_transformer.cpp)
+- benchmark/test harness:
+  - [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp)
+  - [atlas-test.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-test.cpp)
+
+Focused verification:
+
+- build:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- focused tests:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+- focused benchmark ladder:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context-large --repeats 3 --variant all`
+
+Results:
+
+- `teacher-student`, repeated:
+  - `SPARROW`: `testMSE=0.04640 +/- 0.00142`
+  - `AEGIS`: `0.05841 +/- 0.01678`
+  - `CITADEL`: `0.04906 +/- 0.00089`
+  - diagnostics:
+    - `anchor=0.301 +/- 0.047`
+    - `hard=0.000 +/- 0.000`
+    - `sparrowTrust=0.636 +/- 0.042`
+  - interpretation:
+    - CITADEL still **materially repairs** the AEGIS regression,
+    - but still does **not** beat `SPARROW`.
+
+- `latent-forecast`, repeated:
+  - `SPARROW`: `testMSE=0.00266 +/- 0.00017`
+  - `AEGIS`: `0.00267 +/- 0.00015`
+  - `CITADEL`: `0.00280 +/- 0.00018`
+  - diagnostics:
+    - `anchor=0.387 +/- 0.050`
+    - `hard=0.000 +/- 0.000`
+    - `sparrowTrust=0.561 +/- 0.039`
+  - interpretation:
+    - CITADEL is still a **clear regression** here.
+    - Even with the softer anchor, it is still suppressing useful predictive structure on a task where predictive memory is already the right answer.
+
+- `nonlinear-forecast`, repeated:
+  - `BSRP`: `0.00143 +/- 0.00009`
+  - `ASTER`: `0.00140 +/- 0.00014`
+  - `AEGIS`: `0.00138 +/- 0.00011`
+  - `CITADEL`: `0.00135 +/- 0.00004`
+  - diagnostics:
+    - `anchor=0.459 +/- 0.031`
+    - `hard=0.000 +/- 0.000`
+    - `sparrowTrust=0.501 +/- 0.029`
+  - interpretation:
+    - CITADEL remains the **best branch so far** on this benchmark.
+    - This is still the strongest positive result for the anchoring idea.
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `testNLL=4.58178 +/- 0.00977`
+  - `SPARROW`: `4.57641 +/- 0.01124`
+  - `AEGIS`: `4.57398 +/- 0.01308`
+  - `CITADEL`: `4.58191 +/- 0.01244`
+  - diagnostics:
+    - `anchor=0.000 +/- 0.000`
+    - `hard=1.000 +/- 0.000`
+    - `sparrowTrust=0.753 +/- 0.007`
+  - interpretation:
+    - The delayed-evidence anchor **fixes the pathological over-anchoring** from the earlier `CITADEL-Lite` pass.
+    - But it still does **not** beat `AEGIS` or `SPARROW` on the lighter transformer preset.
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `SPARROW`: `4.79550 +/- 0.01327`
+  - `AEGIS`: `4.79780 +/- 0.02183`
+  - `CITADEL`: `4.80268 +/- 0.01102`
+  - diagnostics:
+    - `anchor=0.028 +/- 0.013`
+    - `hard=1.000 +/- 0.000`
+    - `sparrowTrust=0.886 +/- 0.006`
+  - interpretation:
+    - The new anchor no longer saturates here either,
+    - but the branch is still a **regression** against `SPARROW` and remains far behind `AdamW`.
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `testNLL=4.26843 +/- 0.04316`
+  - `SPARROW`: `5.15660 +/- 0.00482`
+  - `AEGIS`: `5.16129 +/- 0.01511`
+  - `CITADEL`: `5.15084 +/- 0.03278`
+  - diagnostics:
+    - `anchor=0.028 +/- 0.013`
+    - `hard=1.000 +/- 0.000`
+    - `sparrowTrust=0.896 +/- 0.004`
+  - interpretation:
+    - CITADEL stays the **best ATLAS-family branch** on the hardest transformer stress case,
+    - but it is still **far behind `AdamW`**.
+
+Overall interpretation:
+
+- CITADEL-v3-lite is a **better-calibrated version** of the earlier CITADEL anchor pass.
+- It fixes the worst failure mode of `CITADEL-Lite`:
+  - the old branch saturated at `anchor≈0.95` on transformer tasks,
+  - the new branch does **not**.
+- But it is still **not** a universal optimizer upgrade.
+- The updated picture is:
+  - CITADEL remains useful where anchoring truly helps:
+    - `teacher-student` relative to `AEGIS`,
+    - `nonlinear-forecast`,
+    - `token-lm-context-large` within the ATLAS family.
+  - CITADEL still hurts where predictive structure should dominate:
+    - `latent-forecast`,
+    - `token-lm-large`,
+    - `token-lm-context`.
+
+Updated recommendation:
+
+- Keep **AEGIS-v2** as the documented unified branch.
+- Keep **CITADEL-v3-lite** as a recorded experimental branch, but do **not** promote it to the default optimizer.
+- The delayed-evidence anchor is a real improvement over the old hard heuristic, but it still does not solve the transformer gap to `AdamW`.
+- If this line is revisited, the next version should:
+  - use the full `AdamW`-prior posterior-fusion formulation,
+  - learn anchor strength from delayed benefit more directly than the current heuristic trust EMAs,
+  - and improve transformer observability rather than relying on anchor logic alone.
+- Until then:
+  - keep `SPARROW` as the best planted/easier-dynamics control,
+  - keep `AEGIS-v2` as the main unified research branch,
+  - keep `CITADEL-v3-lite` as evidence that **soft backbone anchoring can help**, but not yet as a broad replacement.
+
+### N.28 RAMPART-lite covariance-aware residual posterior
+
+On **April 10, 2026**, I implemented the first practical **RAMPART-lite** pass:
+
+- `RAMPART` in research-design form is an `AdamW`-centered residual posterior with correlated `BSRP` / `SPARROW` / `ASTER` sensors and an explicit residual trust region.
+- The current codebase does **not** yet expose fully modular optimizer proposals around a literal `AdamW` prior.
+- So the practical implementation is a **minimal ATLAS-family approximation** inside the existing `AEGIS` shell:
+  - add a covariance-aware three-channel posterior over `{spatial, predictive, output}`,
+  - add an explicit residual budget,
+  - keep `SPARROW` and `ASTER` as embedded ATLAS residual channels,
+  - and record `tau`, `budget`, covariance, and effective predictive trust as runtime diagnostics.
+
+Implementation summary:
+
+- config and persistence:
+  - [training_config.h](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/training_config.h)
+  - [checkpoint_persistence.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/checkpoint_persistence.cpp)
+- runtime diagnostics and state:
+  - [network.h](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/network.h)
+  - [transformer_model_state.inc](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/transformer_model_state.inc)
+  - [network.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/network.cpp)
+- DFF / transformer training paths:
+  - [sgd_dff.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_dff.cpp)
+  - [sgd_transformer.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_transformer.cpp)
+- benchmark / tests:
+  - [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp)
+  - [atlas-test.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-test.cpp)
+
+Verification:
+
+- build:
+  - `cmake --build /home/robert/dev/glades-ml/build -j4`
+  - `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- tests:
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas`
+- repeated benchmark ladder:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context-large --repeats 3 --variant all`
+
+Results:
+
+- `teacher-student`, repeated:
+  - `SPARROW`: `testMSE=0.04640 +/- 0.00142`
+  - `AEGIS`: `0.05841 +/- 0.01678`
+  - `CITADEL`: `0.04906 +/- 0.00089`
+  - `RAMPART`: `0.04803 +/- 0.00313`
+  - diagnostics:
+    - `tau=2.301 +/- 0.048`
+    - `budget=0.181 +/- 0.011`
+    - `cov=0.065 +/- 0.021`
+    - `sparrowTrust=0.177 +/- 0.014`
+  - interpretation:
+    - RAMPART materially improves over `AEGIS`,
+    - edges out `CITADEL`,
+    - but still does not recover `SPARROW`.
+
+- `latent-forecast`, repeated:
+  - `SPARROW`: `testMSE=0.00266 +/- 0.00017`
+  - `AEGIS`: `0.00267 +/- 0.00015`
+  - `CITADEL`: `0.00280 +/- 0.00018`
+  - `RAMPART`: `0.00274 +/- 0.00025`
+  - diagnostics:
+    - `tau=2.635 +/- 0.052`
+    - `budget=0.161 +/- 0.008`
+    - `cov=0.015 +/- 0.005`
+    - `sparrowTrust=0.160 +/- 0.008`
+  - interpretation:
+    - RAMPART is a regression versus both `SPARROW` and `AEGIS`.
+    - The current posterior is still suppressing the predictive channel too aggressively on a task where predictive memory is the right answer.
+
+- `nonlinear-forecast`, repeated:
+  - `ASTER`: `testMSE=0.00140 +/- 0.00014`
+  - `AEGIS`: `0.00138 +/- 0.00011`
+  - `CITADEL`: `0.00135 +/- 0.00004`
+  - `RAMPART`: `0.00130 +/- 0.00001`
+  - diagnostics:
+    - `tau=2.530 +/- 0.081`
+    - `budget=0.172 +/- 0.009`
+    - `cov=0.024 +/- 0.032`
+    - `sparrowTrust=0.170 +/- 0.007`
+  - interpretation:
+    - This is the strongest positive result of the branch.
+    - RAMPART becomes the **best result so far** on the hardest DFF dynamic benchmark.
+
+- `token-lm-large`, repeated:
+  - `AdamW`: `testNLL=4.58178 +/- 0.00977`
+  - `SPARROW`: `4.57641 +/- 0.01124`
+  - `AEGIS`: `4.57398 +/- 0.01308`
+  - `CITADEL`: `4.58191 +/- 0.01244`
+  - `RAMPART`: `4.58103 +/- 0.00835`
+  - diagnostics:
+    - `tau=1.601 +/- 0.047`
+    - `budget=0.247 +/- 0.010`
+    - `cov=0.116 +/- 0.029`
+    - `sparrowTrust=0.177 +/- 0.011`
+  - interpretation:
+    - RAMPART loses the current `AEGIS` transformer win.
+    - It is slightly better than `AdamW` and `CITADEL` here, but clearly worse than `SPARROW` and `AEGIS`.
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `SPARROW`: `4.79550 +/- 0.01327`
+  - `AEGIS`: `4.79780 +/- 0.02183`
+  - `CITADEL`: `4.80268 +/- 0.01102`
+  - `RAMPART`: `4.80289 +/- 0.01105`
+  - diagnostics:
+    - `tau=1.233 +/- 0.115`
+    - `budget=0.433 +/- 0.015`
+    - `cov=0.180 +/- 0.043`
+    - `sparrowTrust=0.327 +/- 0.015`
+  - interpretation:
+    - RAMPART does not close the transformer context gap.
+    - It is effectively tied with `CITADEL`, still behind `SPARROW`, and far behind `AdamW`.
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `testNLL=4.26843 +/- 0.04316`
+  - `SPARROW`: `5.15660 +/- 0.00482`
+  - `AEGIS`: `5.16129 +/- 0.01511`
+  - `CITADEL`: `5.15084 +/- 0.03278`
+  - `RAMPART`: `5.15856 +/- 0.01328`
+  - diagnostics:
+    - `tau=1.178 +/- 0.130`
+    - `budget=0.453 +/- 0.015`
+    - `cov=0.182 +/- 0.044`
+    - `sparrowTrust=0.337 +/- 0.014`
+  - interpretation:
+    - RAMPART is not the best ATLAS-family branch on the hardest transformer stress case.
+    - `CITADEL` still holds that position, though both remain far behind `AdamW`.
+
+Overall interpretation:
+
+- RAMPART-lite is a **real optimizer branch**, not a no-op:
+  - it improves over `AEGIS` and `CITADEL` on `teacher-student`,
+  - and it sets the best result so far on `nonlinear-forecast`.
+- But it is **not** a new default:
+  - it regresses on `latent-forecast`,
+  - loses the `token-lm-large` win that `AEGIS` currently holds,
+  - and does not solve the context-heavy transformer gap.
+- The current posterior is still leaning too hard toward the spatial channel on tasks that want predictive dominance.
+
+Updated recommendation:
+
+- Keep **AEGIS-v2** as the main unified branch.
+- Keep **RAMPART-lite** as a documented experimental branch, specifically because:
+  - it is now the best result on `nonlinear-forecast`,
+  - and it shows that covariance-aware residual budgeting can help on some dynamic regimes.
+- Do **not** promote RAMPART-lite to the default optimizer.
+- If this line continues, the next version should:
+  - move closer to the full research-design optimizer with a literal `AdamW` prior and modular residual proposals,
+  - improve the way predictive trust is preserved on easy/linear dynamic tasks,
+  - and avoid spending more time on transformer-side posterior math until the observable family improves.
+
+## N.30 MERIT-lite geometry-only residual posterior
+
+Date: April 10, 2026
+
+Goal:
+
+- test the next structural optimizer update after `RAMPART-lite`
+- keep `AdamW` as the backbone,
+- treat `BSRP` as geometry only instead of a competing residual sensor,
+- and let only `SPARROW` and `ASTER` provide residual evidence
+
+Implementation:
+
+- added `MERIT-lite` config/state/diagnostics in the optimizer/runtime path
+- wired a new `ATLAS-MERIT` benchmark variant into `atlas-alt-bench`
+- added a transformer MERIT smoke test
+- fixed a benchmark harness regression in the DFF alt-bench path by explicitly initializing transformer enum defaults so `setTrainingConfig` no longer fails with `unknown ffnKind`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- focused benchmarks:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context-large --repeats 3 --variant all`
+- note:
+  - `./unit-tests/build/glades-unit-tests atlas-controller` still fails in the existing controller probation test, outside the new MERIT path
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas` still runs into the long logging-heavy DFF path and is not a useful regression signal here
+
+Results:
+
+- `teacher-student`, repeated:
+  - `SPARROW`: `testMSE=0.04640 +/- 0.00142`
+  - `CITADEL`: `0.04906 +/- 0.00089`
+  - `RAMPART`: `0.04803 +/- 0.00313`
+  - `MERIT`: `0.06339 +/- 0.01503`
+  - diagnostics:
+    - `tau=0.760 +/- 0.113`
+    - `budget=0.268 +/- 0.015`
+    - `cov=0.011 +/- 0.006`
+    - `sparrowTrust=0.263 +/- 0.016`
+    - `geom=1.000 +/- 0.000`
+  - interpretation:
+    - MERIT is a clear regression on a task that wants predictive dominance.
+    - Treating spatial structure as pure geometry did not recover SPARROW-like behavior here.
+
+- `latent-forecast`, repeated:
+  - `SPARROW`: `testMSE=0.00266 +/- 0.00017`
+  - `AEGIS`: `0.00267 +/- 0.00015`
+  - `RAMPART`: `0.00274 +/- 0.00025`
+  - `MERIT`: `0.00273 +/- 0.00026`
+  - diagnostics:
+    - `tau=0.724 +/- 0.028`
+    - `budget=0.292 +/- 0.005`
+    - `cov=0.001 +/- 0.001`
+    - `sparrowTrust=0.292 +/- 0.005`
+    - `geom=1.000 +/- 0.000`
+  - interpretation:
+    - MERIT is slightly better than RAMPART-lite but still worse than SPARROW and AEGIS.
+    - The geometry-only reinterpretation does not fix the predictive-task regression.
+
+- `nonlinear-forecast`, repeated:
+  - `ASTER`: `testMSE=0.00140 +/- 0.00014`
+  - `AEGIS`: `0.00138 +/- 0.00011`
+  - `CITADEL`: `0.00135 +/- 0.00004`
+  - `RAMPART`: `0.00130 +/- 0.00001`
+  - `MERIT`: `0.00148 +/- 0.00017`
+  - diagnostics:
+    - `tau=0.722 +/- 0.021`
+    - `budget=0.287 +/- 0.002`
+    - `cov=0.019 +/- 0.006`
+    - `sparrowTrust=0.280 +/- 0.006`
+    - `geom=1.000 +/- 0.000`
+  - interpretation:
+    - This is the decisive negative result for MERIT-lite.
+    - The branch loses the strongest RAMPART-lite win instead of preserving it.
+
+- `token-lm-large`, repeated:
+  - `AEGIS`: `testNLL=4.57398 +/- 0.01308`
+  - `SPARROW`: `4.57641 +/- 0.01124`
+  - `MERIT`: `4.57922 +/- 0.01099`
+  - `RAMPART`: `4.58103 +/- 0.00835`
+  - `AdamW`: `4.58178 +/- 0.00977`
+  - diagnostics:
+    - `tau=1.083 +/- 0.037`
+    - `budget=0.104 +/- 0.009`
+    - `cov=0.094 +/- 0.019`
+    - `sparrowTrust=0.074 +/- 0.005`
+    - `geom=0.216 +/- 0.039`
+  - interpretation:
+    - MERIT loses the current AEGIS transformer win.
+    - It is better than RAMPART-lite and slightly better than AdamW, but still behind both AEGIS and SPARROW.
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `SPARROW`: `4.79550 +/- 0.01327`
+  - `AEGIS`: `4.79780 +/- 0.02183`
+  - `MERIT`: `4.80676 +/- 0.00960`
+  - diagnostics:
+    - `tau=0.749 +/- 0.080`
+    - `budget=0.228 +/- 0.015`
+    - `cov=0.164 +/- 0.029`
+    - `sparrowTrust=0.173 +/- 0.004`
+    - `geom=0.163 +/- 0.025`
+  - interpretation:
+    - MERIT does not help on the main structured-context transformer benchmark.
+    - It is worse than SPARROW and AEGIS and remains far behind AdamW.
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `testNLL=4.26843 +/- 0.04316`
+  - `ATLAS-BSRP`: `5.14022 +/- 0.04002`
+  - `CITADEL`: `5.15084 +/- 0.03278`
+  - `MERIT`: `5.15037 +/- 0.00973`
+  - `SPARROW`: `5.15660 +/- 0.00482`
+  - `RAMPART`: `5.15856 +/- 0.01328`
+  - diagnostics:
+    - `tau=0.612 +/- 0.043`
+    - `budget=0.258 +/- 0.007`
+    - `cov=0.196 +/- 0.019`
+    - `sparrowTrust=0.186 +/- 0.003`
+    - `geom=0.144 +/- 0.010`
+  - interpretation:
+    - MERIT edges out CITADEL and RAMPART on the hardest transformer stress case.
+    - But it still does not beat plain ATLAS-BSRP there, and it remains far behind AdamW.
+
+Overall interpretation:
+
+- MERIT-lite is a **real structural test**, not a no-op.
+- But it is **not a promotion candidate**:
+  - it regresses badly on `teacher-student`,
+  - stays behind SPARROW/AEGIS on `latent-forecast`,
+  - loses the strongest `RAMPART-lite` nonlinear-dynamics win,
+  - and does not improve the main transformer context benchmark.
+- The one modest positive sign is `token-lm-context-large`, where MERIT slightly improves over `CITADEL`/`RAMPART`, but that is not enough to outweigh the broader regressions.
+
+Updated recommendation:
+
+- Keep **AEGIS-v2** as the main unified branch.
+- Keep **RAMPART-lite** as the best nonlinear-dynamics experimental branch.
+- Keep **MERIT-lite** only as a documented structural falsifier:
+  - it shows that moving `BSRP` from sensor to geometry does not, by itself, solve the branch conflicts.
+- Do **not** promote MERIT-lite to the default optimizer.
+- The remaining work should go to better transformer observability, not more fusion-geometry rearrangements of the same sensor family.
+
+## N.31 STRATA-lite sparse regime-conditioned residual control
+
+On **April 10, 2026**, I implemented the first practical **STRATA-lite** branch:
+
+- `STRATA` in research-design form is a sparse `AdamW`-backed residual controller with four residual modes:
+  - `null`
+  - `predictive`
+  - `output`
+  - `coupled predictive+output`
+- In the minimal implementation, it reuses the existing `SPARROW` and head-only `ASTER` sensors, but replaces dense always-on fusion with a hard dominant-mode controller plus a bounded residual budget.
+
+Implementation summary:
+
+- added `STRATA-lite` config, checkpoint, runtime diagnostics, and persistent mode state
+- implemented the sparse mode controller in both the DFF and transformer optimizer paths
+- wired a new `ATLAS-STRATA` benchmark variant into `atlas-alt-bench`
+- added a transformer STRATA smoke test
+- fixed the alt-bench banner strings so `ATLAS-STRATA` is shown in the printed `Optimizers:` header alongside the already-running variant rows
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- focused benchmarks:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context-large --repeats 3 --variant all`
+- note:
+  - `./unit-tests/build/glades-unit-tests atlas-controller` still fails in the existing controller probation test, outside the new STRATA path
+  - `timeout 120s ./unit-tests/build/glades-unit-tests atlas` still runs into the long logging-heavy DFF path and is not a useful regression signal here
+
+Results:
+
+- `teacher-student`, repeated:
+  - `SPARROW`: `testMSE=0.04640 +/- 0.00142`
+  - `STRATA`: `0.04614 +/- 0.00158`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `pred=0.983 +/- 0.024`
+    - `out=0.000 +/- 0.000`
+    - `coupled=0.017 +/- 0.024`
+    - `budget=0.486 +/- 0.044`
+  - interpretation:
+    - STRATA recovers the expected predictive-dominant behavior.
+    - It slightly edges out SPARROW on point estimate, though well within repeated-run noise.
+
+- `latent-forecast`, repeated:
+  - `SPARROW`: `testMSE=0.00266 +/- 0.00017`
+  - `AEGIS`: `0.00267 +/- 0.00015`
+  - `STRATA`: `0.00257 +/- 0.00003`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `pred=1.000 +/- 0.000`
+    - `out=0.000 +/- 0.000`
+    - `coupled=0.000 +/- 0.000`
+    - `budget=0.537 +/- 0.007`
+  - interpretation:
+    - This is the strongest positive STRATA result.
+    - Sparse predictive-only control clearly beats the current dense fusion branches here.
+
+- `nonlinear-forecast`, repeated:
+  - `CITADEL`: `testMSE=0.00135 +/- 0.00004`
+  - `RAMPART`: `0.00130 +/- 0.00001`
+  - `STRATA`: `0.00135 +/- 0.00006`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `pred=1.000 +/- 0.000`
+    - `out=0.000 +/- 0.000`
+    - `coupled=0.000 +/- 0.000`
+    - `budget=0.546 +/- 0.012`
+  - interpretation:
+    - STRATA does not preserve the `RAMPART-lite` nonlinear win.
+    - It remains competitive with `CITADEL`, but the controller is still over-selecting predictive mode on a task that wants stronger output-side structure.
+
+- `token-lm-large`, repeated:
+  - `AEGIS`: `testNLL=4.57398 +/- 0.01308`
+  - `STRATA`: `4.57630 +/- 0.00844`
+  - `SPARROW`: `4.57641 +/- 0.01124`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `pred=0.000 +/- 0.000`
+    - `out=0.800 +/- 0.400`
+    - `coupled=0.200 +/- 0.400`
+    - `budget=0.382 +/- 0.026`
+  - interpretation:
+    - STRATA is clearly better than the weaker fusion branches here.
+    - It nearly matches SPARROW and stays close to AEGIS, but it does not recover the current AEGIS win.
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `SPARROW`: `4.79550 +/- 0.01327`
+  - `AEGIS`: `4.79780 +/- 0.02183`
+  - `STRATA`: `4.80881 +/- 0.01186`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `pred=0.000 +/- 0.000`
+    - `out=0.000 +/- 0.000`
+    - `coupled=1.000 +/- 0.000`
+    - `budget=0.446 +/- 0.012`
+  - interpretation:
+    - STRATA is a clear regression on the main context-heavy transformer stress case.
+    - The sparse controller is locking into coupled mode where the correct fallback is still much closer to `AdamW`.
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `testNLL=4.26843 +/- 0.04316`
+  - `ATLAS-BSRP`: `5.14022 +/- 0.04002`
+  - `MERIT`: `5.15037 +/- 0.00973`
+  - `CITADEL`: `5.15084 +/- 0.03278`
+  - `STRATA`: `5.15574 +/- 0.00228`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `pred=0.000 +/- 0.000`
+    - `out=0.000 +/- 0.000`
+    - `coupled=1.000 +/- 0.000`
+    - `budget=0.446 +/- 0.006`
+  - interpretation:
+    - STRATA improves over `AEGIS`, `RAMPART`, `SPARROW`, and `ASTER` on the hardest transformer stress case.
+    - But it still trails `BSRP`, `MERIT`, and `CITADEL`, and remains far behind `AdamW`.
+
+Overall interpretation:
+
+- STRATA-lite is a **real optimizer branch**, not a no-op.
+- It is the first sparse-controller branch here that cleanly recovers the expected predictive mode on the planted/light-dynamics tasks.
+- It produces the best current result on `latent-forecast` and is effectively tied for best on `teacher-student`.
+- But it is **not a new default**:
+  - it loses the `RAMPART-lite` nonlinear-dynamics win,
+  - it does not recover the `AEGIS-v2` `token-lm-large` win,
+  - and it regresses on the main transformer context benchmark.
+
+Updated recommendation:
+
+- Keep **AEGIS-v2** as the main unified branch.
+- Keep **RAMPART-lite** as the best nonlinear-dynamics experimental branch.
+- Keep **STRATA-lite** as the best sparse predictive-control experimental branch:
+  - especially because it wins `latent-forecast`,
+  - and because it shows sparse mode selection is better than dense fusion on the light predictive regimes.
+- Do **not** promote STRATA-lite to the default optimizer.
+- The next work should combine:
+  - sparse controller structure like STRATA,
+  - with better transformer observability and stronger null/AdamW fallback on context-heavy transformer regimes.
+
+## N.32 STRATA-v2 delayed-benefit null calibration
+
+On **April 10, 2026**, I implemented **STRATA-v2** as a direct refinement of `STRATA-lite`:
+
+- kept the same sparse controller modes `{null, predictive, output, coupled}`
+- replaced the old mode score with a delayed-benefit controller based on per-mode excess-gain EMAs
+- added explicit STRATA diagnostics for:
+  - per-mode realized benefit
+  - selected excess gain vs the backbone
+  - switch rate
+
+Implementation summary:
+
+- extended `STRATA` runtime state with delayed-benefit EMAs and per-step realized benefit fields
+- updated both the DFF and transformer STRATA controllers to score modes from delayed excess gain rather than raw instantaneous trust alone
+- extended runtime aggregation and the alt-bench printout with STRATA benefit diagnostics
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- focused benchmarks:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context-large --repeats 3 --variant all`
+
+Results:
+
+- `teacher-student`, repeated:
+  - `SPARROW`: `testMSE=0.04640 +/- 0.00142`
+  - `STRATA-v2`: `0.04600 +/- 0.00144`
+  - diagnostics:
+    - `null=0.017 +/- 0.024`
+    - `pred=0.983 +/- 0.024`
+    - `budget=0.256 +/- 0.064`
+    - `bPred=0.310 +/- 0.095`
+  - interpretation:
+    - STRATA-v2 preserves the predictive planted-task win.
+    - The new controller introduces a small null occupancy without hurting the result.
+
+- `latent-forecast`, repeated:
+  - `SPARROW`: `testMSE=0.00266 +/- 0.00017`
+  - `STRATA-v2`: `0.00257 +/- 0.00003`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `pred=1.000 +/- 0.000`
+    - `budget=0.306 +/- 0.012`
+    - `bPred=0.416 +/- 0.022`
+  - interpretation:
+    - STRATA-v2 cleanly preserves the best current `latent-forecast` result.
+    - This remains the strongest evidence that sparse predictive mode selection beats dense fusion on light predictive regimes.
+
+- `nonlinear-forecast`, repeated:
+  - `RAMPART`: `testMSE=0.00130 +/- 0.00001`
+  - `CITADEL`: `0.00135 +/- 0.00004`
+  - `STRATA-v2`: `0.00135 +/- 0.00006`
+  - diagnostics:
+    - `pred=1.000 +/- 0.000`
+    - `out=0.000 +/- 0.000`
+    - `bPred=0.471 +/- 0.056`
+    - `bCoupled=0.007 +/- 0.070`
+  - interpretation:
+    - STRATA-v2 still routes the nonlinear task through predictive mode.
+    - So the delayed-benefit change does not recover the `RAMPART-lite` nonlinear win.
+
+- `token-lm-large`, repeated:
+  - `AEGIS`: `testNLL=4.57398 +/- 0.01308`
+  - `SPARROW`: `4.57641 +/- 0.01124`
+  - `STRATA-v2`: `4.57630 +/- 0.00844`
+  - diagnostics:
+    - `out=1.000 +/- 0.000`
+    - `budget=0.155 +/- 0.056`
+    - `bOut=0.445 +/- 0.107`
+  - interpretation:
+    - STRATA-v2 is cleaner than STRATA-lite here:
+      - it chooses pure output mode instead of mixing in coupled mode.
+    - But the benchmark result is effectively unchanged, still behind `AEGIS-v2`.
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `SPARROW`: `4.79550 +/- 0.01327`
+  - `AEGIS`: `4.79780 +/- 0.02183`
+  - `STRATA-v2`: `4.80880 +/- 0.01186`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `out=1.000 +/- 0.000`
+    - `budget=0.386 +/- 0.031`
+    - `bOut=0.680 +/- 0.044`
+  - interpretation:
+    - This is the decisive negative result for STRATA-v2.
+    - The delayed-benefit controller still does not abstain on the main transformer context benchmark.
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `testNLL=4.26843 +/- 0.04316`
+  - `ATLAS-BSRP`: `5.14022 +/- 0.04002`
+  - `MERIT`: `5.15037 +/- 0.00973`
+  - `CITADEL`: `5.15084 +/- 0.03278`
+  - `STRATA-v2`: `5.15589 +/- 0.00225`
+  - diagnostics:
+    - `null=0.000 +/- 0.000`
+    - `out=1.000 +/- 0.000`
+    - `budget=0.403 +/- 0.016`
+    - `bOut=0.645 +/- 0.039`
+  - interpretation:
+    - STRATA-v2 is more internally coherent than STRATA-lite, but it still does not beat the stronger ATLAS-family transformer branches here.
+
+Overall interpretation:
+
+- STRATA-v2 is a **cleaner controller**, not a stronger optimizer.
+- It improves controller interpretation:
+  - predictive tasks now show explicit positive predictive excess,
+  - `token-lm-large` cleanly selects output mode,
+  - and switch rate collapses to zero once a regime is identified.
+- But it does **not** solve the main problem:
+  - it still fails to abstain on the context-heavy transformer tasks,
+  - and it still does not recover the nonlinear-dynamics win.
+
+Updated recommendation:
+
+- Keep **AEGIS-v2** as the main unified branch.
+- Keep **RAMPART-lite** as the best nonlinear-dynamics branch.
+- Keep **STRATA-v2** as the best sparse predictive-control branch.
+- Do **not** spend more time on controller calibration alone.
+- The next work should shift to better transformer observability and stronger `AdamW`-relative null evidence, because the current sensor family is still telling STRATA to act where it should stay close to the backbone.
+
+## N.33 Transformer Margin-Shortfall Observable Pass
+
+Objective:
+
+- Change the transformer ASTER/AEGIS observable family without touching controller or fusion math.
+- Add explicit regime-level target-margin shortfall features relative to running transformer baselines.
+
+Implementation:
+
+- widened the transformer token-conditioned observable tail from `4` to `8` dimensions in [network.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/network.cpp)
+- kept the original hashed support-residual sketch in the first 4 token-conditioned slots
+- used the extra 4 slots for explicit regime-level features:
+  - target-margin shortfall vs running EMA
+  - hard-negative logit pressure vs running EMA
+  - hard-regime shortfall vs running EMA
+  - rate of tokens whose target margin fell below the running baseline
+- threaded the same explicit features into the pattern/control stream, while leaving STRATA / AEGIS / CITADEL / RAMPART math unchanged
+
+State additions:
+
+- per-regime EMAs:
+  - `targetMarginEma`
+  - `hardNegativeLogitEma`
+  - `hardMarginShortfallEma`
+- per-batch regime summaries:
+  - `batchTargetMarginSum`
+  - `batchHardNegativeLogitSum`
+  - `batchBaselineWorseSum`
+
+Validation:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 10 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 10 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context-large --repeats 3 --variant all`
+
+Results:
+
+- `token-lm-large`, repeated:
+  - `AEGIS`: `testNLL=4.57398 +/- 0.01308`
+  - `SPARROW`: `4.57641 +/- 0.01124`
+  - `STRATA-v2`: `4.57630 +/- 0.00844`
+  - interpretation:
+    - no material change from the pre-observable-pass ordering
+    - the lighter transformer preset still favors `AEGIS-v2`
+
+- `token-lm-context`, repeated:
+  - `AdamW`: `testNLL=4.24529 +/- 0.03627`
+  - `SPARROW`: `4.79550 +/- 0.01327`
+  - `AEGIS`: `4.79789 +/- 0.02180`
+  - `STRATA-v2`: `4.80879 +/- 0.01183`
+  - interpretation:
+    - the explicit margin-shortfall features do not close the transformer context gap
+    - STRATA still selects pure output mode and still does not abstain
+
+- `token-lm-context-large`, repeated:
+  - `AdamW`: `testNLL=4.26843 +/- 0.04316`
+  - `BSRP`: `5.14022 +/- 0.04002`
+  - `MERIT`: `5.15034 +/- 0.00971`
+  - `CITADEL`: `5.15112 +/- 0.03287`
+  - `STRATA-v2`: `5.15589 +/- 0.00229`
+  - `AEGIS`: `5.16168 +/- 0.01503`
+  - interpretation:
+    - this is another clean falsification of the current transformer observable family
+    - explicit margin-shortfall signals sharpen the observable story, but they do not change the benchmark ranking
+
+Conclusion:
+
+- The transformer issue is not just “missing margin information.”
+- Even after adding explicit regime-level margin-shortfall observables, the ATLAS-family branches still fail to approach `AdamW` on the context-heavy transformer tasks.
+- So the remaining bottleneck is likely a deeper transformer observability problem:
+  - retrieval failure
+  - context compression failure
+  - or benchmark mismatch between these ATLAS observables and the true next-token error geometry
+
+Updated recommendation:
+
+- Keep **AEGIS-v2** as the main unified branch.
+- Keep **RAMPART-lite** as the best nonlinear-dynamics branch.
+- Keep **STRATA-v2** as the best sparse predictive-control branch.
+- Treat the margin-shortfall observable pass as a documented negative result.
+- Stop local observable/controller tinkering of this same class.
+- If transformer-side work continues, move next to a materially different observable family or a larger/more realistic LM benchmark.
+
+## N.34 Larger / More Realistic LM Benchmark: `token-lm-document`
+
+Objective:
+
+- Add a larger transformer benchmark that is more document-like than the current synthetic recurrence and structured-context presets, without depending on an external corpus.
+
+Implementation:
+
+- added a new alt-bench mode:
+  - `token-lm-document`
+- new preset:
+  - `vocab=257`
+  - `dModel=48`
+  - `dFF=192`
+  - `layers=3`
+  - `heads=6`
+  - `seqLen=96`
+  - `trainSeqs=48`
+  - `testSeqs=12`
+  - `epochs=2`
+- added a new pseudo-document generator in [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp):
+  - article-style sections
+  - topic markers
+  - entity / place / year / verb / object pools
+  - cross-paragraph recall of summaries, objects, places, years, and speakers
+  - mixed topical and global detail tokens
+
+Validation:
+
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant all`
+
+Results:
+
+- `AdamW`: `testNLL=4.71194 +/- 0.03683`
+- `ATLAS-SPARROW`: `5.44572 +/- 0.00859`
+- `ATLAS-ASTER`: `5.44583 +/- 0.00438`
+- `ATLAS-RAMPART`: `5.44799 +/- 0.01566`
+- `ATLAS-CITADEL`: `5.45769 +/- 0.01389`
+- `ATLAS-MERIT`: `5.45772 +/- 0.00891`
+- `ATLAS-STRATA`: `5.46286 +/- 0.00668`
+- `ATLAS-AEGIS`: `5.46353 +/- 0.00718`
+- `ATLAS-BSRP`: `5.46411 +/- 0.01637`
+
+Interpretation:
+
+- The new benchmark is materially harsher and more realistic than `token-lm-large`.
+- `AdamW` remains the only strong transformer-side answer here.
+- The ATLAS-family variants cluster tightly together far behind it.
+- Within the ATLAS family:
+  - `SPARROW`, `ASTER`, and `RAMPART` are effectively tied for best
+  - `AEGIS-v2` does not retain its `token-lm-large` advantage on this harder document-style task
+
+Updated recommendation:
+
+- Keep `token-lm-document` as the new larger / more realistic transformer stress benchmark.
+- Keep `token-lm-large` as the light control and `token-lm-context` / `token-lm-context-large` as structured-recall controls.
+- Treat the optimizer-side transformer story as stable for now:
+  - `AdamW` is still the robustness anchor
+  - ATLAS-family branches are not yet competitive on the more realistic LM-style benchmarks
+- If transformer work continues, the next step should change the observable family or use an even more realistic corpus-like benchmark, not another controller or fusion tweak.
+
+## N.35 Larger / More Realistic LM Benchmark: `token-lm-document`
+
+Objective:
+
+- Add a larger benchmark that is closer to document-style language modeling than the recurrence and structured-context synthetic tasks, while keeping the harness self-contained.
+
+Implementation:
+
+- added new mode:
+  - `token-lm-document`
+- added new preset in [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp):
+  - `vocab=257`
+  - `dModel=48`
+  - `dFF=192`
+  - `layers=3`
+  - `heads=6`
+  - `seqLen=96`
+  - `trainSeqs=48`
+  - `testSeqs=12`
+  - `epochs=2`
+- added a pseudo-document sequence generator:
+  - article-style sections
+  - topic markers
+  - entity / place / year / verb / object pools
+  - cross-paragraph recall of summaries, speakers, places, years, and objects
+  - mixed topic-local and globally shared detail tokens
+
+Validation:
+
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant all`
+
+Results:
+
+- `AdamW`: `testNLL=4.71194 +/- 0.03683`
+- `ATLAS-SPARROW`: `5.44572 +/- 0.00859`
+- `ATLAS-ASTER`: `5.44583 +/- 0.00438`
+- `ATLAS-RAMPART`: `5.44799 +/- 0.01566`
+- `ATLAS-CITADEL`: `5.45769 +/- 0.01389`
+- `ATLAS-MERIT`: `5.45772 +/- 0.00891`
+- `ATLAS-STRATA`: `5.46286 +/- 0.00668`
+- `ATLAS-AEGIS`: `5.46353 +/- 0.00718`
+- `ATLAS-BSRP`: `5.46411 +/- 0.01637`
+
+Interpretation:
+
+- `token-lm-document` is materially harsher than `token-lm-large`.
+- `AdamW` remains clearly best on the more realistic transformer-side benchmark.
+- The ATLAS-family variants are tightly clustered far behind it.
+- Within the ATLAS family, the current ordering is:
+  - `SPARROW ≈ ASTER ≈ RAMPART`
+  - then `CITADEL / MERIT`
+  - then `STRATA / AEGIS / BSRP`
+- So the `AEGIS-v2` advantage on `token-lm-large` does not survive the harder document-like task.
+
+Updated recommendation:
+
+- Keep `token-lm-document` as the primary larger transformer benchmark.
+- Keep `token-lm-large` as the quick control and `token-lm-context*` as structured-recall controls.
+- Keep `AdamW` as the transformer default.
+- Keep only `SPARROW`, `ASTER`, and `RAMPART` as the main transformer-side ATLAS controls.
+- Do not spend more time on controller/fusion tweaks before a materially different observable family or a genuinely corpus-backed benchmark is available.
+
+## N.36 Next-Generation AdamW Replacement Prototypes: `AURORA-lite`, `SEAM-lite`, `QUASAR-lite`
+
+Objective:
+
+- Implement minimal practical prototypes of the three next-generation AdamW-replacement frameworks proposed in the research design pass:
+  - `AURORA`
+  - `SEAM`
+  - `QUASAR`
+- Test them on the fixed mixed ladder before doing any deeper architectural investment.
+
+Implementation:
+
+- added new ATLAS-family variant flags in [training_config.h](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/training_config.h):
+  - `auroraEnabled`
+  - `seamEnabled`
+  - `quasarEnabled`
+- added tuning parameters:
+  - `auroraHorizonBlend`
+  - `auroraBudgetMax`
+  - `seamMirrorStep`
+  - `seamBudgetMax`
+  - `quasarTemperature`
+  - `quasarBudgetMax`
+- implemented minimal runtime branches in:
+  - [sgd_dff.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_dff.cpp)
+  - [sgd_transformer.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_transformer.cpp)
+- added benchmark harness variants and CLI routing in:
+  - [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp)
+
+Prototype interpretation:
+
+- `AURORA-lite`
+  - horizon-smoothed predictive/output residual fusion around the existing ATLAS state.
+- `SEAM-lite`
+  - mirror-descent-style coordinate reweighting over spatial / predictive / output channels.
+- `QUASAR-lite`
+  - entropy-regularized mode distribution over null / predictive / output / coupled residual modes.
+
+These are deliberately minimal practical instantiations, not full literal implementations of the original mathematical idealizations.
+
+Validation:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode teacher-student --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode latent-forecast --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode nonlinear-forecast --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant all`
+
+Results by case:
+
+- `teacher-student`
+  - `AURORA`: `0.05823 +/- 0.01678`
+  - `SEAM`: `0.05727 +/- 0.01730`
+  - `QUASAR`: `0.04955 +/- 0.00292`
+  - interpretation:
+    - only `QUASAR` is competitive here, but it still trails `SPARROW 0.04640` and `STRATA-v2 0.04600`
+
+- `latent-forecast`
+  - `AURORA`: `0.00257 +/- 0.00001`
+  - `SEAM`: `0.00284 +/- 0.00021`
+  - `QUASAR`: `0.00288 +/- 0.00026`
+  - interpretation:
+    - `AURORA-lite` is the strongest of the three and ties the best current ATLAS-family result on this case
+
+- `nonlinear-forecast`
+  - `AURORA`: `0.00135 +/- 0.00007`
+  - `SEAM`: `0.00154 +/- 0.00008`
+  - `QUASAR`: `0.00134 +/- 0.00005`
+  - interpretation:
+    - `QUASAR-lite` is the strongest of the three, but it does not beat `RAMPART-lite 0.00130`
+
+- `token-lm-large`
+  - `AURORA`: `4.58315 +/- 0.00276`
+  - `SEAM`: `4.57783 +/- 0.00226`
+  - `QUASAR`: `4.58082 +/- 0.01226`
+  - interpretation:
+    - `SEAM-lite` is clearly the best of the three on the light transformer preset
+    - but it still trails `AEGIS-v2 4.56779`
+
+- `token-lm-context`
+  - `AURORA`: `4.80784 +/- 0.00140`
+  - `SEAM`: `4.78930 +/- 0.00997`
+  - `QUASAR`: `4.80071 +/- 0.00903`
+  - interpretation:
+    - `SEAM-lite` is the best of the three and edges out the prior ATLAS-family front (`SPARROW 4.79139`)
+    - but all ATLAS-family branches remain far behind `AdamW 4.22251`
+
+- `token-lm-document`
+  - `AURORA`: `5.44241 +/- 0.01185`
+  - `SEAM`: `5.44980 +/- 0.00931`
+  - `QUASAR`: `5.45924 +/- 0.01230`
+  - interpretation:
+    - `AURORA-lite` is the best of the three and becomes the best current ATLAS-family branch on this larger document-style benchmark
+    - but it still remains far behind `AdamW 4.71194`
+
+Overall interpretation:
+
+- The three new frameworks are all real, functioning branches, not no-ops.
+- They separate into distinct niches:
+  - `AURORA-lite`: strongest on `latent-forecast` and the best new branch on `token-lm-document`
+  - `SEAM-lite`: strongest on the lighter transformer presets and the best ATLAS-family branch on `token-lm-context`
+  - `QUASAR-lite`: strongest of the three on `teacher-student` and `nonlinear-forecast`
+- None of the three is dominant enough to replace the current role map:
+  - `STRATA-v2` still owns the sparse predictive niche
+  - `RAMPART-lite` still owns the nonlinear niche
+  - `AEGIS-v2` still owns `token-lm-large`
+  - `AdamW` still dominates the realistic transformer benchmarks
+
+Updated recommendation:
+
+- Keep `AURORA-lite`, `SEAM-lite`, and `QUASAR-lite` as documented experimental branches.
+- Do not promote any of them to the default optimizer.
+- If this line continues, the most promising follow-up is:
+  - `SEAM`-style coordinate control on transformer-light tasks
+  - `AURORA`-style horizon fusion on document-like tasks
+  - but only after materially improving transformer observability
+- The main blocker remains unchanged:
+  - on realistic LM-style benchmarks, observability is still weaker than the optimizer-control law
+
+## N.37 AURORA-v2 Transformer Observability Pass + `token-lm-corpus`
+
+Objective:
+
+- Follow the post-`AURORA-lite` recommendation:
+  - keep only `AURORA` as the active next-generation replacement candidate
+  - upgrade its transformer path before inventing another optimizer family
+  - add a more corpus-like benchmark instead of relying only on synthetic recurrence/document generators
+
+Implementation:
+
+- upgraded the transformer `AURORA` branch in [sgd_transformer.cpp](/home/robert/dev/glades-ml/Backend/Machine%20Learning/Networks/sgd_transformer.cpp):
+  - `AURORA-v2` now consumes retrieval-aware transformer observables already accumulated by the ASTER path:
+    - lag-pattern signal from `batchLayerPatternSum`
+    - optional compressed KV signal from `batchLayerKappaSum` when enabled
+    - margin shortfall / hard-negative pressure / baseline-failure rate
+  - these signals now affect:
+    - adjusted predictive trust
+    - adjusted output trust
+    - AURORA covariance
+    - AURORA residual budget
+    - ASTER output-memory gain inside the AURORA branch
+- added a new token benchmark mode in [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp):
+  - `token-lm-corpus`
+  - checked-in small public-domain prose excerpts
+  - shared train/test vocabulary
+  - separate train and test document pools
+  - contiguous sequence windows drawn from each split
+
+Validation:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-context --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant all`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus --repeats 3 --variant all`
+
+Results:
+
+- `token-lm-large`
+  - `ATLAS-AURORA`: `4.58315 +/- 0.00276`
+  - unchanged in practice versus the earlier `AURORA-lite` result
+  - still behind `ATLAS-AEGIS 4.56779`
+
+- `token-lm-context`
+  - `ATLAS-AURORA`: `4.80784 +/- 0.00140`
+  - essentially unchanged
+  - still behind `ATLAS-SEAM 4.78930`
+  - still far behind `AdamW 4.22251`
+
+- `token-lm-document`
+  - `ATLAS-AURORA`: `5.44242 +/- 0.01184`
+  - effectively unchanged from the prior `AURORA-lite` result
+  - still the best ATLAS-family branch on this pseudo-document benchmark
+  - still far behind `AdamW 4.71194`
+
+- `token-lm-corpus`
+  - `AdamW`: `6.13689 +/- 0.02343`
+  - `ATLAS-BSRP`: `6.11350 +/- 0.01552`
+  - `ATLAS-AEGIS`: `6.13132 +/- 0.01645`
+  - `ATLAS-SEAM`: `6.13035 +/- 0.02041`
+  - `ATLAS-AURORA`: `6.13745 +/- 0.00790`
+  - `ATLAS-SPARROW`: `6.14640 +/- 0.01959`
+  - `ATLAS-RAMPART`: `6.14782 +/- 0.01119`
+  - interpretation:
+    - this benchmark changes the ordering materially
+    - unlike `token-lm-document`, the ATLAS family no longer uniformly trails `AdamW`
+    - the best branch here is actually `BSRP`, with `AEGIS` / `SEAM` close behind
+    - `AURORA-v2` is competitive but not leading
+
+Interpretation:
+
+- The `AURORA-v2` observability pass did **not** materially improve the existing synthetic/document transformer stress cases.
+- So the retrieval-aware trust rewrite, by itself, is not the missing ingredient.
+- The new `token-lm-corpus` benchmark is still useful because it reveals a different regime:
+  - it does **not** reproduce the strong `AdamW` dominance seen on `token-lm-document`
+  - it suggests the benchmark family matters as much as the optimizer family
+- So the transformer optimizer picture is now split:
+  - pseudo-document benchmark: `AdamW` clearly best
+  - small checked-in corpus benchmark: `BSRP / AEGIS / SEAM` are competitive and `AdamW` is no longer dominant
+
+Updated recommendation:
+
+- Keep `token-lm-document` as the primary harsher transformer stress benchmark.
+- Keep `token-lm-corpus` as a secondary realism check, not yet the new primary decision benchmark.
+- Keep `AURORA-v2` as the only active next-generation replacement candidate, but do not promote it.
+- Do not create another optimizer family until one of the following is true:
+  - `AURORA` materially narrows the `token-lm-document` gap to `AdamW`
+  - or the corpus benchmark is expanded enough to become more trustworthy than the pseudo-document generator
+- The main unresolved issue remains:
+  - transformer observability and benchmark realism are still entangled
+
+## N.38 `token-lm-corpus-large` + Reduced 10-Repeat Corpus/Document Ladder
+
+Objective:
+
+- Follow the next benchmark-first recommendation:
+  - freeze the transformer optimizer set to `AdamW`, `BSRP`, `AEGIS`, `SEAM`, and `AURORA`
+  - add a harder corpus benchmark before creating another optimizer family
+  - rerun `token-lm-document` and `token-lm-corpus` at `repeats=10`
+  - decide whether the corpus-side ATLAS advantage survives scale
+
+Implementation:
+
+- added a new benchmark mode in [atlas-alt-bench.cpp](/home/robert/dev/glades-ml/unit-tests/Backend/Machine%20Learning/atlas-alt-bench.cpp):
+  - `token-lm-corpus-large`
+  - more checked-in public-domain prose documents
+  - longer windows
+  - larger decoder preset
+  - larger train/test split than `token-lm-corpus`
+- the mode uses:
+  - `vocab=769`
+  - `dModel=56`
+  - `dFF=224`
+  - `layers=4`
+  - `heads=8`
+  - `seqLen=112`
+  - `trainSeqs=64`
+  - `testSeqs=16`
+  - `epochs=2`
+
+Validation:
+
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- smoke:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 1 --variant all`
+- reduced ladder:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant adamw`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant base`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant aegis`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant seam`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus --repeats 10 --variant adamw`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus --repeats 10 --variant base`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus --repeats 10 --variant aegis`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus --repeats 10 --variant seam`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus --repeats 10 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant adamw`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant base`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant aegis`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant seam`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant aurora`
+
+Results:
+
+- `token-lm-document`
+  - `AdamW`: `4.72491 +/- 0.04037`
+  - `ATLAS-BSRP`: `5.45081 +/- 0.01650`
+  - `ATLAS-AEGIS`: `5.45397 +/- 0.01089`
+  - `ATLAS-SEAM`: `5.45420 +/- 0.01070`
+  - `ATLAS-AURORA`: `5.45528 +/- 0.01526`
+
+- `token-lm-corpus`
+  - `AdamW`: `6.19049 +/- 0.06828`
+  - `ATLAS-BSRP`: `6.12795 +/- 0.02145`
+  - `ATLAS-SEAM`: `6.13086 +/- 0.01381`
+  - `ATLAS-AURORA`: `6.13373 +/- 0.01353`
+  - `ATLAS-AEGIS`: `6.13630 +/- 0.01229`
+
+- `token-lm-corpus-large`
+  - `AdamW`: `6.27182 +/- 0.10700`
+  - `ATLAS-BSRP`: `6.35582 +/- 0.01716`
+  - `ATLAS-AURORA`: `6.38183 +/- 0.02088`
+  - `ATLAS-SEAM`: `6.39078 +/- 0.02419`
+  - `ATLAS-AEGIS`: `6.39683 +/- 0.02174`
+
+Interpretation:
+
+- The old `token-lm-document` conclusion survives 10 repeats:
+  - `AdamW` is still decisively best
+  - the ATLAS-family branches remain clustered far behind it
+- The small-corpus anomaly is real enough to matter:
+  - after `repeats=10`, `BSRP` still beats `AdamW` on `token-lm-corpus`
+  - `SEAM`, `AURORA`, and `AEGIS` also remain close
+- But the scale-up resolves the ambiguity:
+  - on `token-lm-corpus-large`, `AdamW` becomes clearly best again
+  - the ATLAS-family advantage from `token-lm-corpus` does **not** survive the harder corpus setting
+- So the current picture is now consistent across the harder LM-style benchmarks:
+  - `token-lm-document`: `AdamW` clearly best
+  - `token-lm-corpus-large`: `AdamW` clearly best
+  - `token-lm-corpus`: useful secondary realism check, but too small to drive optimizer strategy by itself
+
+Updated recommendation:
+
+- Keep `token-lm-document` as the primary harsh transformer benchmark.
+- Keep `token-lm-corpus-large` as the secondary corpus-style benchmark.
+- Demote `token-lm-corpus` to a small realism sanity check, not a decision benchmark.
+- Freeze the transformer optimizer comparison set to:
+  - `AdamW`
+  - `ATLAS-BSRP`
+  - `ATLAS-AEGIS`
+  - `ATLAS-SEAM`
+  - `ATLAS-AURORA`
+- Do not create another optimizer family until one of those branches materially narrows the `token-lm-document` gap.
+- The practical research bottleneck remains:
+  - transformer observability and benchmark realism, not optimizer controller math
+
 ---
 
-*Document version: 1.3*
+## April 11, 2026: AdamW gap decomposition on the hard transformer benchmarks
+
+Implemented a focused transformer diagnostic pass instead of another optimizer branch.
+
+What changed:
+
+- Added benchmark-side grouped transformer parameter snapshots so the optimizer-profile comparison is measured as a before/after training displacement, not as a hot-path per-apply copy inside `sgd_transformer.cpp`.
+- Kept only the cheap runtime diagnostics in the training loop:
+  - train/test target margin
+  - hard-negative logit
+  - sampled apply-time
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- reduced hard-benchmark comparison:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant adamw`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant base`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant adamw`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant base`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant aurora`
+
+Results:
+
+- `token-lm-document`
+  - `AdamW`: `testNLL=4.71194 +/- 0.03683`
+    - proxy profile: `blk=[2.617 2.703 2.966] final=0.736 head=2.441 hShare=0.203 applyMs=0.851`
+    - margins: `train=-1.567`, `test=-1.363`
+  - `ATLAS-BSRP`: `5.46411 +/- 0.01637`
+    - proxy profile: `blk=[0.412 0.291 0.349] final=0.019 head=0.142 hShare=0.051 applyMs=3.825`
+    - margins: `train=-0.400`, `test=-0.460`
+    - profile cosine vs `AdamW`: `0.954`
+  - `ATLAS-AURORA`: `5.44242 +/- 0.01184`
+    - proxy profile: `blk=[0.401 0.361 0.395] final=0.026 head=0.146 hShare=0.045 applyMs=135.101`
+    - margins: `train=-0.399`, `test=-0.477`
+    - profile cosine vs `AdamW`: `0.961`
+
+- `token-lm-corpus-large`
+  - `AdamW`: `testNLL=6.19167 +/- 0.05172`
+    - proxy profile: `blk=[4.103 3.494 3.320 3.176] final=1.109 head=10.019 hShare=0.661 applyMs=1.548`
+    - margins: `train=-2.076`, `test=-3.119`
+  - `ATLAS-BSRP`: `6.34855 +/- 0.01436`
+    - proxy profile: `blk=[0.614 0.459 0.368 0.434] final=0.057 head=0.348 hShare=0.119 applyMs=6.600`
+    - margins: `train=-0.945`, `test=-1.410`
+    - profile cosine vs `AdamW`: `0.819`
+  - `ATLAS-AURORA`: `6.38980 +/- 0.01715`
+    - proxy profile: `blk=[0.569 0.432 0.424 0.426] final=0.052 head=0.313 hShare=0.101 applyMs=147.017`
+    - margins: `train=-0.771`, `test=-1.189`
+    - profile cosine vs `AdamW`: `0.807`
+
+Interpretation:
+
+- On both hard transformer benchmarks, the ATLAS-family branches are not merely mis-scaled copies of `AdamW`.
+- `BSRP` and `AURORA` have reasonably high coarse profile cosine on `token-lm-document`, but they act at dramatically smaller magnitude and with far less head-share than `AdamW`.
+- The divergence becomes stronger on `token-lm-corpus-large`, where the ATLAS-family profile departs more from `AdamW` and still loses badly in test NLL.
+- `AURORA` is especially informative here:
+  - it is directionally similar enough to be considered a real transformer-side control branch
+  - but its overhead is massive (`applyMs ~135-147 ms`) and it still does not close the loss gap
+- So the current transformer gap is not just a learning-rate or trust-budget problem.
+- The stronger diagnosis is:
+  - `AdamW` allocates much more update mass to the head and final decoder path on the hard LM tasks
+  - the current ATLAS-family branches do not generate enough high-impact head-side correction
+  - and `AURORA` pays heavy control cost without buying margin or NLL gains
+
+Updated recommendation:
+
+- Freeze the transformer comparison set to:
+  - `AdamW`
+  - `ATLAS-BSRP`
+  - `ATLAS-AURORA`
+- Keep this new gap decomposition pass for future transformer checks.
+- Do not build another optimizer family yet.
+- If transformer optimizer work continues, the next serious step should target:
+  - head-dominant actuation
+  - or materially richer transformer observability
+- If neither can materially narrow the `token-lm-document` gap, stop optimizer-side replacement work and treat `AdamW` as the effective transformer default.
+
+## April 11, 2026: AURORA head-dominant actuation pass is a clean negative result
+
+Implemented a narrow transformer-only AURORA split-budget pass:
+
+- added explicit AURORA knobs:
+  - `auroraHeadGain`
+  - `auroraBodyTrustScale`
+- exposed them in the alt-bench harness as:
+  - `--atlas-aurora-head-gain`
+  - `--atlas-aurora-body-trust-scale`
+- changed the transformer AURORA path to:
+  - amplify ASTER/AURORA head correction when the retrieval/margin signal is strong
+  - attenuate non-head SPARROW trust for `WIn/WOut` and block weights
+  - leave `tokE` on the full transformer-side predictive trust so the head can absorb more of the residual budget
+
+Default test values used in the benchmark harness:
+
+- `auroraHeadGain=3.0`
+- `auroraBodyTrustScale=0.60`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- focused hard-benchmark comparison:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant adamw`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant adamw`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant aurora`
+
+Results:
+
+- `token-lm-document`
+  - `AdamW`: unchanged at `testNLL=4.71194 +/- 0.03683`
+  - `ATLAS-AURORA`: unchanged at `5.44242 +/- 0.01184`
+    - proxy profile stayed effectively the same:
+      - `blk=[0.401 0.361 0.395]`
+      - `final=0.026`
+      - `head=0.146`
+      - `hShare=0.045`
+      - `applyMs=138.088`
+
+- `token-lm-corpus-large`
+  - `AdamW`: unchanged at `testNLL=6.19167 +/- 0.05172`
+  - `ATLAS-AURORA`: unchanged at `6.38980 +/- 0.01715`
+    - proxy profile also stayed effectively the same:
+      - `blk=[0.569 0.432 0.424 0.426]`
+      - `final=0.052`
+      - `head=0.313`
+      - `hShare=0.101`
+      - `applyMs=142.260`
+
+Interpretation:
+
+- The hard transformer gap is not being driven by a simple lack of head weighting inside the current AURORA controller.
+- Even a targeted split-budget pass that explicitly boosts the head and suppresses the body does not materially change:
+  - test NLL
+  - head share
+  - or AURORA's large runtime cost
+- So the remaining bottleneck is not a small controller-allocation mistake inside the current observable family.
+- The stronger conclusion is:
+  - current AURORA observables do not contain enough high-value transformer-side signal
+  - and the current head-local correction is too weak in substance, not just too weak in nominal gain
+
+Updated recommendation:
+
+- Keep the current AURORA implementation as a documented falsified branch extension.
+- Do not spend more time on local AURORA budget/head-allocation tuning.
+- If transformer optimizer work continues, it should now focus on:
+  - materially richer observability
+  - or a fundamentally different transformer actuation path
+- Until one branch closes the `token-lm-document` gap, treat `AdamW` as the effective transformer default.
+
+## April 11, 2026: corrected AdamW-backed AURORA schedule is a clean negative result
+
+The first AdamW-backed AURORA prototype changed the transformer update kernel but still inherited the ATLAS token learning rate in the alt-bench harness. That made the initial result ambiguous. I corrected the benchmark path so:
+
+- `ATLAS-AURORA` uses `cfg.token.adamLR` whenever `auroraAdamwBackbone=1`
+- the token benchmark header now reports the effective AURORA token learning rate correctly
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- focused AURORA reruns:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant aurora`
+
+Corrected results with `ATLAS-AURORA(lr=0.0010, adamwBackbone=1)`:
+
+- `token-lm-large`
+  - `ATLAS-AURORA`: `testNLL=4.58343 +/- 0.00283`
+  - proxy profile:
+    - `blk=[0.002 0.001]`
+    - `final=0.000`
+    - `head=0.000`
+    - `hShare=0.021`
+    - `applyMs=40.241`
+
+- `token-lm-document`
+  - `ATLAS-AURORA`: `testNLL=5.54653 +/- 0.00819`
+  - proxy profile:
+    - `blk=[0.030 0.024 0.023]`
+    - `final=0.001`
+    - `head=0.007`
+    - `hShare=0.024`
+    - `applyMs=132.445`
+
+- `token-lm-corpus-large`
+  - `ATLAS-AURORA`: `testNLL=6.64533 +/- 0.00463`
+  - proxy profile:
+    - `blk=[0.042 0.027 0.022 0.020]`
+    - `final=0.001`
+    - `head=0.013`
+    - `hShare=0.050`
+    - `applyMs=151.493`
+
+Interpretation:
+
+- The earlier near-neutral AdamW-backed AURORA result was a harness artifact caused by the wrong token learning-rate path.
+- Once AURORA actually runs with an AdamW-scale transformer schedule, it gets materially worse on every transformer benchmark that matters.
+- The update profile also collapses:
+  - even less head share
+  - very small parameter displacement
+  - still large AURORA controller cost
+- So the conclusion is now stronger than before:
+  - the current AURORA controller/observable family does not produce a useful AdamW replacement on transformer LM
+  - and simply swapping the backbone kernel to AdamW does not rescue it
+
+Updated recommendation:
+
+- Treat AdamW-backed AURORA as a falsified transformer branch.
+- Do not spend more time on local AURORA backbone/schedule tuning.
+- Keep:
+  - `AdamW` as the transformer default
+  - `AEGIS-v2` as the best ATLAS-family light-transformer control
+  - `AURORA` only as a documented next-generation research branch that failed this transformer replacement test
+- If transformer optimizer work continues, change observability or actuation path, not the local AURORA learning-rate/backbone configuration.
+
+## April 11, 2026: retrieval-distance observables are another clean negative result
+
+I used a materially different transformer observability patch rather than another controller or schedule change.
+
+What changed:
+
+- kept the corrected AdamW-backed AURORA schedule
+- widened the AURORA-only token-conditioned observation size from `8` to `12`
+- added generic sequence-retrieval observables in the transformer ASTER/AURORA path:
+  - whether the target token appeared earlier in the current context
+  - inverse distance to the previous target occurrence
+  - whether the top hard negative appeared earlier in the current context
+  - inverse distance to the previous hard-negative occurrence
+- injected those features into:
+  - the per-layer pattern summary stream
+  - the residual/control token-conditioned observation slots
+  - the AURORA observation-strength / recall-pressure computation
+
+This was intentionally generic:
+
+- no benchmark-specific token-role hacks
+- no new optimizer family
+- no new learning-rate or budget tuning
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- focused AURORA reruns:
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant aurora`
+  - `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant aurora`
+
+Results:
+
+- `token-lm-large`
+  - `ATLAS-AURORA`: `testNLL=4.58343 +/- 0.00283`
+  - effectively unchanged
+
+- `token-lm-document`
+  - `ATLAS-AURORA`: `testNLL=5.54653 +/- 0.00819`
+  - exactly unchanged at benchmark precision
+
+- `token-lm-corpus-large`
+  - `ATLAS-AURORA`: `testNLL=6.64533 +/- 0.00463`
+  - exactly unchanged at benchmark precision
+
+Interpretation:
+
+- The failure is now harder to blame on missing generic retrieval-distance summaries.
+- The new observables are real and they do flow through the AURORA controller, but they do not change held-out NLL on the transformer stress cases.
+- So the bottleneck is unlikely to be:
+  - simple backbone schedule choice
+  - local head-budget choice
+  - or missing generic target/hard-negative repeat-distance information
+- The remaining transformer gap is therefore likely to require one of:
+  - a fundamentally different observable family
+  - a fundamentally different actuation path
+  - or accepting that the current ATLAS/AURORA line is not competitive for realistic LM optimization
+
+Updated recommendation:
+
+- Stop local AURORA transformer tuning on the current branch family.
+- Keep:
+  - `token-lm-document` as the primary harsh transformer benchmark
+  - `token-lm-corpus-large` as the secondary corpus-style benchmark
+  - `AdamW` as the transformer default
+- If work continues, it should be a qualitatively new line, not another AURORA observable/controller refinement.
+
+## April 11, 2026: GEODE root cause and first real transformer results
+
+I implemented a transformer-only `ATLAS-GEODE` branch as the first geometry-first Adam-replacement candidate:
+
+- diagonal Adam-style moment backbone
+- ATLAS active subspace refresh and low-rank geometry
+- optional cheap predictive correction in active coordinates
+- no ASTER/AURORA-style output controller in the hot path
+
+### Root cause of the initial failure
+
+The first GEODE runs failed immediately on the token embedding update with:
+
+- `SGDHelper_Transformer: GEODE tokE update entered NaN recovery`
+
+That was not a numerical-stability failure in the low-rank solve. The actual mechanism was a transformer state-construction bug:
+
+- GEODE reuses Adam-style diagonal moment buffers (`v*`, `v2*`) for its backbone
+- transformer initialization in `network.cpp` only allocated those moment buffers for:
+  - plain `AdamW`
+  - `ATLAS-AURORA` with `auroraAdamwBackbone=1`
+- so GEODE entered its first `tokE` update with:
+  - `tokE.size() = gTokE.size() > 0`
+  - `vTokE.size() = v2TokE.size() = 0`
+- the update helper correctly rejected the buffer-size mismatch and surfaced the generic GEODE recovery error
+
+Fix:
+
+- extend the transformer `needAdamMoments` allocation condition to include `trainingConfig.atlas.geodeEnabled`
+
+After that fix, GEODE ran cleanly end-to-end.
+
+### Verification
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+
+Focused benchmark reruns:
+
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --repeats 3 --variant geode`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant base`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 3 --variant geode`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant base`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 3 --variant geode`
+
+### Results
+
+- `token-lm-large`
+  - `AdamW`: `testNLL=4.57676 +/- 0.00637`
+  - `ATLAS-BSRP`: `4.59059 +/- 0.00348`
+  - `ATLAS-GEODE`: `4.56488 +/- 0.00594`
+
+- `token-lm-document`
+  - `AdamW`: `testNLL=4.71194 +/- 0.03683`
+  - `ATLAS-BSRP`: `5.46411 +/- 0.01637`
+  - `ATLAS-GEODE`: `4.74741 +/- 0.01612`
+
+- `token-lm-corpus-large`
+  - `AdamW`: `testNLL=6.19167 +/- 0.05172`
+  - `ATLAS-BSRP`: `6.34855 +/- 0.01436`
+  - `ATLAS-GEODE`: `6.30823 +/- 0.10459`
+
+### Interpretation
+
+- GEODE is the first geometry-first transformer branch here that remains competitive after the AURORA/HELM/controller failures.
+- It is clearly better than the old BSRP transformer control on all three tested transformer cases.
+- It appears to beat `AdamW` on the light control `token-lm-large`.
+- On the harder realistic transformer cases:
+  - it nearly closes the `token-lm-document` gap
+  - but does not beat `AdamW` on `token-lm-corpus-large`
+- Its update profile also looks materially healthier than prior ATLAS transformer branches:
+  - higher head share than BSRP on the hard cases
+  - still much lower controller complexity than AURORA-like branches
+
+Updated recommendation:
+
+- keep `ATLAS-GEODE` as the new primary AdamW-replacement candidate for transformers
+- compare `AdamW` vs `GEODE` next on:
+  - `token-lm-document`
+  - `token-lm-corpus-large`
+  with `repeats=10`
+- if the `token-lm-document` near-match survives at `repeats=10`, GEODE becomes the main replacement line
+- if it collapses, stop AdamW-replacement work on this branch and conclude the remaining gap still needs a different signal or larger-scale benchmark
+
+## April 11, 2026: GEODE 10-repeat acceptance pass and predictive ablation
+
+I ran the narrow acceptance pass exactly as planned:
+
+- `AdamW` vs `ATLAS-GEODE` at `repeats=10` on:
+  - `token-lm-document`
+  - `token-lm-corpus-large`
+- `ATLAS-GEODE` ablation with `--atlas-geode-predictive-scale 0` on the same two hard benchmarks
+
+### Verification
+
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant geode`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant geode`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant geode --atlas-geode-predictive-scale 0`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant geode --atlas-geode-predictive-scale 0`
+
+### Results
+
+- `token-lm-document`
+  - `AdamW`: `testNLL=4.72491 +/- 0.04037`
+  - `ATLAS-GEODE`: `4.74337 +/- 0.04541`
+  - `ATLAS-GEODE (pred=0)`: `4.75211 +/- 0.04429`
+
+- `token-lm-corpus-large`
+  - `AdamW`: `testNLL=6.27182 +/- 0.10700`
+  - `ATLAS-GEODE`: `6.27839 +/- 0.07367`
+  - `ATLAS-GEODE (pred=0)`: `6.29094 +/- 0.06443`
+
+### Interpretation
+
+- The `token-lm-document` near-match survives the 10-repeat pass.
+  - GEODE does not beat AdamW there.
+  - But it remains very close, and far stronger than the older ATLAS transformer controls.
+- On `token-lm-corpus-large`, GEODE is effectively near-tied with AdamW at this benchmark scale, but still not clearly better.
+- The predictive term is helping, but only modestly:
+  - removing it worsens both hard benchmarks
+  - the branch still mostly lives or dies by the geometry backbone rather than the cheap predictive extrapolation
+- So the correct conclusion is:
+  - GEODE is a legitimate replacement candidate
+  - but it has not yet cleared the promotion bar over AdamW on the hard transformer benchmarks
+
+Updated recommendation:
+
+- keep `ATLAS-GEODE` as the only active AdamW-replacement line for transformers
+- stop creating new top-level optimizer families
+- if GEODE work continues, focus next on:
+  - runtime reduction
+  - geometry schedule / rank ablations
+  - GPU viability
+- do not return to controller-style branches unless GEODE is clearly falsified
+
+## April 11, 2026: GEODE rank and refresh-cadence ablations
+
+I ran the next narrow ablation pass on GEODE rather than changing the optimizer family again.
+
+Goal:
+
+- identify whether GEODE still has a useful local tuning lever
+- distinguish between:
+  - active rank
+  - subspace refresh cadence (`tSub`)
+
+Method:
+
+- screen on `token-lm-document`
+- carry only the best setting to `token-lm-corpus-large`
+
+### Document-side screen
+
+Baseline reference from the 10-repeat pass:
+
+- `ATLAS-GEODE` (`rank=16`, `tSub=64`): `testNLL=4.74337 +/- 0.04541`
+
+Screen results on `token-lm-document`:
+
+- `rank=8`, `tSub=64`:
+  - `testNLL=4.73145 +/- 0.03785`
+  - `applyMs=4.461 +/- 0.221`
+
+- `rank=24`, `tSub=64`:
+  - `testNLL=4.76557 +/- 0.03422`
+  - `applyMs=15.396 +/- 0.599`
+
+- `rank=16`, `tSub=32`:
+  - `testNLL=4.75609 +/- 0.03446`
+  - `applyMs=8.681 +/- 0.337`
+
+- `rank=16`, `tSub=128`:
+  - `testNLL=4.74693 +/- 0.03428`
+  - `applyMs=8.644 +/- 0.243`
+
+Interpretation:
+
+- rank is the real lever
+- lower rank helps both speed and held-out NLL on the harsh document benchmark
+- `tSub` changes are small and do not beat the `rank=8` setting
+
+### Corpus-large confirmation
+
+I carried the best screened setting to `token-lm-corpus-large`:
+
+- `ATLAS-GEODE` baseline (`rank=16`, `tSub=64`):
+  - `testNLL=6.27839 +/- 0.07367`
+  - `applyMs=33.374 +/- 1.517`
+
+- `ATLAS-GEODE` (`rank=8`, `tSub=64`):
+  - `testNLL=6.28702 +/- 0.08777`
+  - `applyMs=15.717 +/- 0.198`
+
+Interpretation:
+
+- `rank=8` is effectively accuracy-neutral on `token-lm-corpus-large`
+- but it cuts GEODE application cost by more than 2x
+- so `rank=8` is the better operating point for the current branch
+
+### Updated recommendation
+
+- treat `rank=8` as the new preferred GEODE operating point for transformer experiments
+- do not spend more time on `tSub` tuning
+- if GEODE continues, the next step should be:
+  - runtime / implementation efficiency
+  - especially GPU viability
+- the remaining question is no longer “is there a better small scalar schedule?”
+- it is “can the rank-8 GEODE branch beat AdamW on time-to-target once the implementation cost is reduced?”
+
+## N.39 GEODE Rank-8 Runtime Cleanup
+
+I followed the recommendation above and ran a narrow runtime pass on the `rank=8` GEODE implementation instead of changing optimizer shape again.
+
+Goal:
+
+- preserve the accepted `rank=8` accuracy point
+- reduce GEODE application overhead on the CPU transformer path
+- decide whether the next step should be more CPU cleanup or a GPU viability pass
+
+Method:
+
+- profile `token-lm-document --variant geode --rank 8`
+- optimize only the GEODE hot path
+- rerun `token-lm-document` and `token-lm-corpus-large`
+
+Profile finding:
+
+- the dominant user-space hotspot was `Geode::update_weight(...)`
+- `invert_small(...)` was not the problem
+- the main issue was repeated scratch construction and redundant temporary materialization inside the per-weight update path
+
+Implementation change:
+
+- moved GEODE scratch storage into persistent `atlas::WeightState` buffers
+- removed repeated per-update heap allocations in `Geode::update_weight(...)`
+- projected the active gradient through the packed basis using the GEMM helper path instead of rebuilding equivalent temporaries
+- kept the GEODE math unchanged
+
+Post-change results:
+
+- `token-lm-document`, `ATLAS-GEODE` (`rank=8`, `tSub=64`):
+  - before:
+    - `testNLL=4.73145 +/- 0.03785`
+    - `applyMs=4.461 +/- 0.221`
+  - after:
+    - `testNLL=4.73145 +/- 0.03785`
+    - `applyMs=3.929 +/- 0.027`
+
+- `token-lm-corpus-large`, `ATLAS-GEODE` (`rank=8`, `tSub=64`):
+  - before:
+    - `testNLL=6.28702 +/- 0.08777`
+    - `applyMs=15.717 +/- 0.198`
+  - after:
+    - `testNLL=6.28702 +/- 0.08777`
+    - `applyMs=15.408 +/- 0.684`
+
+Interpretation:
+
+- the cleanup is behavior-preserving
+- the document benchmark shows a meaningful CPU-side runtime win
+- the larger corpus benchmark still improves, but only modestly
+- this is enough to keep `rank=8` GEODE as the active replacement candidate
+- it is not enough to justify more CPU micro-tuning as the main path
+
+Updated recommendation:
+
+- keep `ATLAS-GEODE rank=8` as the only active AdamW-replacement line
+- stop small schedule and CPU micro-tuning after this pass
+- make the next engineering gate:
+  - GPU viability
+  - or explicit time-to-target measurement against `AdamW`
+- if GEODE cannot win on wall-clock efficiency after the runtime path is cleaned up, stop the replacement line
+- if it can, then it becomes the first branch worth promoting beyond research-control status
+
+---
+
+*Document version: 1.19*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
-*Date: 2026-04-09*
+*Date: 2026-04-11*

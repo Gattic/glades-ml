@@ -5,6 +5,7 @@
 #include "transformer_common_utils.h"
 #include "transformer_train_detail.h"
 #include "transformer_kernels.h"
+#include "gemm_helpers.h"
 #include "glades_thread_pool.h"
 #include "ddp_comm.h"
 
@@ -266,7 +267,8 @@ static void aster_sketch_dense_row(const float* row,
                                    unsigned int rowDim,
                                    unsigned int sketchDim,
                                    unsigned int seed,
-                                   std::vector<float>& accum)
+                                   std::vector<float>& accum,
+                                   size_t accumOffset = 0u)
 {
 	if (!row || sketchDim == 0u)
 		return;
@@ -278,7 +280,7 @@ static void aster_sketch_dense_row(const float* row,
 		const unsigned int h = aster_mix_u32(seed + i * 0x9e3779b9U);
 		const unsigned int bucket = h % sketchDim;
 		const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
-		accum[bucket] += sign * v;
+		accum[accumOffset + bucket] += sign * v;
 	}
 }
 
@@ -286,14 +288,160 @@ static inline void aster_sketch_sparse_value(unsigned int index,
                                              float value,
                                              unsigned int sketchDim,
                                              unsigned int seed,
-                                             std::vector<float>& accum)
+                                             std::vector<float>& accum,
+                                             size_t accumOffset = 0u)
 {
 	if (sketchDim == 0u || value == 0.0f)
 		return;
 	const unsigned int h = aster_mix_u32(seed + index * 0x9e3779b9U);
 	const unsigned int bucket = h % sketchDim;
 	const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
-	accum[bucket] += sign * value;
+	accum[accumOffset + bucket] += sign * value;
+}
+
+static void aster_insert_top_support(unsigned int vid,
+                                     float residual,
+                                     float logit,
+                                     std::vector<unsigned int>& ids,
+                                     std::vector<float>& residuals,
+                                     std::vector<float>& logits)
+{
+	if (ids.empty() || residual <= 0.0f || logits.size() != ids.size())
+		return;
+	const size_t n = ids.size();
+	size_t pos = n;
+	for (size_t i = 0; i < n; ++i)
+	{
+		if (residual > residuals[i])
+		{
+			pos = i;
+			break;
+		}
+	}
+	if (pos == n)
+		return;
+	for (size_t i = n - 1u; i > pos; --i)
+	{
+		ids[i] = ids[i - 1u];
+		residuals[i] = residuals[i - 1u];
+		logits[i] = logits[i - 1u];
+	}
+	ids[pos] = vid;
+	residuals[pos] = residual;
+	logits[pos] = logit;
+}
+
+static void aster_accumulate_support_role(unsigned int vid,
+                                          unsigned int regime,
+                                          unsigned int regimeCount,
+                                          unsigned int role,
+                                          unsigned int supportDim,
+                                          float roleValue,
+                                          const float* hiddenRow,
+                                          unsigned int dModel,
+                                          std::vector<float>& batchSupportValueSum,
+                                          std::vector<float>& batchSupportCount,
+                                          std::vector<float>& batchSupportHiddenRawSum,
+                                          std::vector<unsigned int>& batchSupportIds,
+                                          std::vector<float>& batchSupportRoleCounts)
+{
+	if (role >= supportDim || regime >= regimeCount)
+		return;
+	const size_t roleIndex = static_cast<size_t>(regime) * static_cast<size_t>(supportDim) + role;
+	const size_t hiddenRoleOff =
+	    (static_cast<size_t>(regime) * static_cast<size_t>(supportDim) + role) * static_cast<size_t>(dModel);
+	if (roleIndex >= batchSupportValueSum.size()
+	    || roleIndex >= batchSupportCount.size()
+	    || (hiddenRoleOff + static_cast<size_t>(dModel)) > batchSupportHiddenRawSum.size())
+		return;
+
+	batchSupportValueSum[roleIndex] += roleValue;
+	batchSupportCount[roleIndex] += 1.0f;
+	if (hiddenRow)
+	{
+		for (unsigned int i = 0; i < dModel; ++i)
+			batchSupportHiddenRawSum[hiddenRoleOff + i] += hiddenRow[i];
+	}
+
+	size_t slot = batchSupportIds.size();
+	for (size_t i = 0; i < batchSupportIds.size(); ++i)
+	{
+		if (batchSupportIds[i] == vid)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if (slot == batchSupportIds.size())
+	{
+		batchSupportIds.push_back(vid);
+		batchSupportRoleCounts.resize((slot + 1u) * static_cast<size_t>(regimeCount) * static_cast<size_t>(supportDim), 0.0f);
+	}
+	batchSupportRoleCounts[(slot * static_cast<size_t>(regimeCount) + regime) * static_cast<size_t>(supportDim) + role] += 1.0f;
+}
+
+static inline void aster_accumulate_support_value_only(unsigned int regime,
+                                                       unsigned int role,
+                                                       unsigned int supportDim,
+                                                       float value,
+                                                       std::vector<float>& batchSupportValueSum)
+{
+	if (role >= supportDim)
+		return;
+	const size_t roleIndex = static_cast<size_t>(regime) * static_cast<size_t>(supportDim) + role;
+	if (roleIndex >= batchSupportValueSum.size())
+		return;
+	batchSupportValueSum[roleIndex] += value;
+}
+
+static inline float aster_segment_mean(const float* row,
+                                       unsigned int dim,
+                                       unsigned int rank,
+                                       unsigned int slot)
+{
+	if (!row || dim == 0u || rank == 0u)
+		return 0.0f;
+	const unsigned int begin = (slot * dim) / rank;
+	const unsigned int end = std::max(begin + 1u, ((slot + 1u) * dim) / rank);
+	if (begin >= dim)
+		return 0.0f;
+	const unsigned int clampedEnd = std::min(end, dim);
+	double accum = 0.0;
+	for (unsigned int i = begin; i < clampedEnd; ++i)
+		accum += static_cast<double>(row[i]);
+	return static_cast<float>(accum / static_cast<double>(std::max(1u, clampedEnd - begin)));
+}
+
+static unsigned int aster_transformer_regime_from_logits(const float* probsRow,
+                                                         const float* logitsRow,
+                                                         unsigned int count,
+                                                         unsigned int targetIndex,
+                                                         int padIndex)
+{
+	if (!probsRow || !logitsRow || count == 0u || targetIndex >= count)
+		return 0u;
+	double entropy = 0.0;
+	double maxEntropy = 0.0;
+	float maxNegLogit = -std::numeric_limits<float>::max();
+	for (unsigned int i = 0; i < count; ++i)
+	{
+		if (padIndex >= 0 && static_cast<int>(i) == padIndex)
+			continue;
+		const float p = probsRow[i];
+		if (p > 1e-20f)
+			entropy -= static_cast<double>(p) * std::log(static_cast<double>(p));
+		maxEntropy += 1.0;
+		if (i != targetIndex)
+			maxNegLogit = std::max(maxNegLogit, logitsRow[i]);
+	}
+	if (maxEntropy > 1.0)
+		maxEntropy = std::log(maxEntropy);
+	else
+		maxEntropy = 0.0;
+	const bool highEntropy = (maxEntropy > 0.0) && (entropy > (0.75 * maxEntropy));
+	const float margin = logitsRow[targetIndex] - maxNegLogit;
+	const bool lowMargin = !(margin > 0.75f);
+	return (highEntropy ? 2u : 0u) + (lowMargin ? 1u : 0u);
 }
 
 static glades::transformer_train_detail::LinearWeightView make_linear_weight_view(const std::vector<float>& weights,
@@ -635,13 +783,36 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				std::fill(b.gB1.begin(), b.gB1.end(), 0.0f);
 				std::fill(b.gB2.begin(), b.gB2.end(), 0.0f);
 			}
+			if (tt.helm.initialized)
+			{
+				std::fill(tt.helm.batchHiddenSum.begin(), tt.helm.batchHiddenSum.end(), 0.0f);
+				std::fill(tt.helm.batchHiddenSqSum.begin(), tt.helm.batchHiddenSqSum.end(), 0.0f);
+				std::fill(tt.helm.batchResidualSum.begin(), tt.helm.batchResidualSum.end(), 0.0f);
+				std::fill(tt.helm.batchResidualSqSum.begin(), tt.helm.batchResidualSqSum.end(), 0.0f);
+				tt.helm.batchTokenCount = 0u;
+			}
 			if (tt.aster.initialized)
 			{
 				std::fill(tt.aster.batchFinalHiddenRawSum.begin(), tt.aster.batchFinalHiddenRawSum.end(), 0.0f);
 				std::fill(tt.aster.batchFinalHiddenSketchSum.begin(), tt.aster.batchFinalHiddenSketchSum.end(), 0.0f);
+				std::fill(tt.aster.batchLayerHiddenRawSum.begin(), tt.aster.batchLayerHiddenRawSum.end(), 0.0f);
 				std::fill(tt.aster.batchLayerHiddenSketchSum.begin(), tt.aster.batchLayerHiddenSketchSum.end(), 0.0f);
+				std::fill(tt.aster.batchLayerAttnRawSum.begin(), tt.aster.batchLayerAttnRawSum.end(), 0.0f);
+				std::fill(tt.aster.batchLayerAttnSketchSum.begin(), tt.aster.batchLayerAttnSketchSum.end(), 0.0f);
+				std::fill(tt.aster.batchLayerPatternSum.begin(), tt.aster.batchLayerPatternSum.end(), 0.0f);
+				std::fill(tt.aster.batchLayerKappaSum.begin(), tt.aster.batchLayerKappaSum.end(), 0.0f);
 				std::fill(tt.aster.batchResidualSum.begin(), tt.aster.batchResidualSum.end(), 0.0f);
+				std::fill(tt.aster.batchSupportLogitSum.begin(), tt.aster.batchSupportLogitSum.end(), 0.0f);
+				std::fill(tt.aster.batchSupportResidualSum.begin(), tt.aster.batchSupportResidualSum.end(), 0.0f);
+				std::fill(tt.aster.batchSupportCount.begin(), tt.aster.batchSupportCount.end(), 0.0f);
+				std::fill(tt.aster.batchSupportHiddenRawSum.begin(), tt.aster.batchSupportHiddenRawSum.end(), 0.0f);
+				std::fill(tt.aster.batchTargetMarginSum.begin(), tt.aster.batchTargetMarginSum.end(), 0.0f);
+				std::fill(tt.aster.batchHardNegativeLogitSum.begin(), tt.aster.batchHardNegativeLogitSum.end(), 0.0f);
+				std::fill(tt.aster.batchBaselineWorseSum.begin(), tt.aster.batchBaselineWorseSum.end(), 0.0f);
+				std::fill(tt.aster.batchRegimeTokenCount.begin(), tt.aster.batchRegimeTokenCount.end(), 0.0f);
 				tt.aster.batchTouchedIds.clear();
+				tt.aster.batchSupportIds.clear();
+				tt.aster.batchSupportRoleCounts.clear();
 				tt.aster.batchTokenCount = 0u;
 			}
 		}
@@ -899,6 +1070,409 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				return false;
 			}
 
+			const bool captureGapDiagnostics =
+			    net.trainingConfig.transformer.captureOptimizerGapDiagnostics
+			    && (tt.gapApplyCount == 0ULL);
+			timespec optimizerApplyStart;
+			optimizerApplyStart.tv_sec = 0;
+			optimizerApplyStart.tv_nsec = 0;
+			if (captureGapDiagnostics)
+				optimizerApplyStart = monotonic_now();
+
+			struct Adam
+			{
+				static float signf(float x) { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); }
+
+				static void update_weight(std::vector<float>& W,
+				                          std::vector<float>& m,
+				                          std::vector<float>& v2,
+				                          std::vector<float>& gW,
+				                          float lr,
+				                          float beta1,
+				                          float beta2,
+				                          float inv1mB1t,
+				                          float inv1mB2t,
+				                          float eps,
+				                          float invBatch,
+				                          float gradScale,
+				                          float wd1,
+				                          float wd2)
+				{
+					const float oneMinusB1 = 1.0f - beta1;
+					const float oneMinusB2 = 1.0f - beta2;
+					for (size_t i = 0; i < W.size(); ++i)
+					{
+						float g = gW[i] * invBatch;
+						if (wd1 != 0.0f)
+							g += wd1 * signf(W[i]);
+						g *= gradScale;
+
+						const float mi = (beta1 * m[i]) + (oneMinusB1 * g);
+						const float vi = (beta2 * v2[i]) + (oneMinusB2 * (g * g));
+						m[i] = mi;
+						v2[i] = vi;
+
+						const float mhat = mi * inv1mB1t;
+						const float vhat = vi * inv1mB2t;
+						const float denom = static_cast<float>(sqrt(static_cast<double>(vhat))) + eps;
+						const float step = mhat / denom;
+
+						if (wd2 != 0.0f)
+							W[i] -= lr * wd2 * W[i];
+						W[i] -= lr * step;
+						gW[i] = 0.0f;
+					}
+				}
+
+				static void update_param(std::vector<float>& P,
+				                         std::vector<float>& m,
+				                         std::vector<float>& v2,
+				                         std::vector<float>& gP,
+				                         float lr,
+				                         float beta1,
+				                         float beta2,
+				                         float inv1mB1t,
+				                         float inv1mB2t,
+				                         float eps,
+				                         float invBatch,
+				                         float gradScale)
+				{
+					const float oneMinusB1 = 1.0f - beta1;
+					const float oneMinusB2 = 1.0f - beta2;
+					for (size_t i = 0; i < P.size(); ++i)
+					{
+						float g = (gP[i] * invBatch) * gradScale;
+						const float mi = (beta1 * m[i]) + (oneMinusB1 * g);
+						const float vi = (beta2 * v2[i]) + (oneMinusB2 * (g * g));
+						m[i] = mi;
+						v2[i] = vi;
+
+						const float mhat = mi * inv1mB1t;
+						const float vhat = vi * inv1mB2t;
+						const float denom = static_cast<float>(sqrt(static_cast<double>(vhat))) + eps;
+						const float step = mhat / denom;
+
+						P[i] -= lr * step;
+						gP[i] = 0.0f;
+					}
+				}
+			};
+
+			struct Geode
+			{
+				static bool invert_small(std::vector<float>& mat, unsigned int dim)
+				{
+					if (dim == 0u)
+						return true;
+					std::vector<float> inv(static_cast<size_t>(dim) * dim, 0.0f);
+					for (unsigned int i = 0u; i < dim; ++i)
+						inv[static_cast<size_t>(i) * dim + i] = 1.0f;
+					for (unsigned int col = 0u; col < dim; ++col)
+					{
+						unsigned int pivotRow = col;
+						float pivotAbs = fabsf(mat[static_cast<size_t>(col) * dim + col]);
+						for (unsigned int row = col + 1u; row < dim; ++row)
+						{
+							const float candAbs = fabsf(mat[static_cast<size_t>(row) * dim + col]);
+							if (candAbs > pivotAbs)
+							{
+								pivotAbs = candAbs;
+								pivotRow = row;
+							}
+						}
+						if (!(pivotAbs > 1.0e-8f) || !is_finite(pivotAbs))
+							return false;
+						if (pivotRow != col)
+						{
+							for (unsigned int j = 0u; j < dim; ++j)
+							{
+								std::swap(mat[static_cast<size_t>(col) * dim + j],
+								          mat[static_cast<size_t>(pivotRow) * dim + j]);
+								std::swap(inv[static_cast<size_t>(col) * dim + j],
+								          inv[static_cast<size_t>(pivotRow) * dim + j]);
+							}
+						}
+						const float pivot = mat[static_cast<size_t>(col) * dim + col];
+						const float invPivot = 1.0f / pivot;
+						for (unsigned int j = 0u; j < dim; ++j)
+						{
+							mat[static_cast<size_t>(col) * dim + j] *= invPivot;
+							inv[static_cast<size_t>(col) * dim + j] *= invPivot;
+						}
+						for (unsigned int row = 0u; row < dim; ++row)
+						{
+							if (row == col)
+								continue;
+							const float factor = mat[static_cast<size_t>(row) * dim + col];
+							if (fabsf(factor) <= 1.0e-12f)
+								continue;
+							for (unsigned int j = 0u; j < dim; ++j)
+							{
+								mat[static_cast<size_t>(row) * dim + j] -= factor * mat[static_cast<size_t>(col) * dim + j];
+								inv[static_cast<size_t>(row) * dim + j] -= factor * inv[static_cast<size_t>(col) * dim + j];
+							}
+						}
+					}
+					mat.swap(inv);
+					return true;
+				}
+
+				static bool update_weight(std::vector<float>& W,
+				                          std::vector<float>& m,
+				                          std::vector<float>& v2,
+				                          std::vector<float>& gW,
+				                          glades::atlas::WeightState& state,
+				                          unsigned int rows,
+				                          unsigned int cols,
+				                          float lr,
+				                          float beta1,
+				                          float beta2,
+				                          float inv1mB1t,
+				                          float inv1mB2t,
+				                          float eps,
+				                          float invBatch,
+				                          float gradScale,
+				                          float wd1,
+				                          float wd2,
+				                          const glades::ATLASConfig& ac,
+				                          glades::rng::Engine& rng,
+				                          shmea::GLogger* logger,
+				                          const char* tag)
+				{
+					if (W.empty())
+						return true;
+					if (W.size() != gW.size() || W.size() != m.size() || W.size() != v2.size())
+						return false;
+
+					const bool predictiveEnabled = (ac.geodePredictiveScale > 0.0f);
+					if (!state.initialized && rows > 0u && cols > 0u)
+						glades::atlas::initWeightState(state, rows, cols, ac.rank, ac.muMin, rng, logger);
+					if (!state.initialized || state.m != rows || state.n != cols)
+						return false;
+					if ((state.step % std::max(1u, ac.tSub)) == 0u)
+					{
+						if (!glades::atlas::refreshSubspace(state, &gW[0], rows, cols,
+						                                    3u, ac.betaRefresh, false, rng, logger))
+							return false;
+					}
+
+					const unsigned int activeRank =
+					    std::min<unsigned int>(
+					        (state.activeRank > 0u) ? state.activeRank : state.r,
+					        std::min<unsigned int>(state.r,
+					                               static_cast<unsigned int>(state.fisherDiag.size())));
+					const float oneMinusB1 = 1.0f - beta1;
+					const float oneMinusB2 = 1.0f - beta2;
+					const float betaGeom = std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
+					for (size_t i = 0u; i < W.size(); ++i)
+					{
+						const float gScaledRaw = gW[i] * invBatch * gradScale;
+						float g = gScaledRaw;
+						if (wd1 != 0.0f)
+							g += (wd1 * Adam::signf(W[i]) * gradScale);
+						const float mi = (beta1 * m[i]) + (oneMinusB1 * g);
+						const float vi = (beta2 * v2[i]) + (oneMinusB2 * (g * g));
+						m[i] = mi;
+						v2[i] = vi;
+						gW[i] = gScaledRaw;
+					}
+
+					std::vector<float>& basisPacked = state.scratch_basisPacked;
+					if (basisPacked.size() < static_cast<size_t>(rows) * activeRank)
+						basisPacked.resize(static_cast<size_t>(rows) * activeRank);
+					for (unsigned int i = 0u; i < rows; ++i)
+					{
+						const size_t uOff = static_cast<size_t>(i) * state.r;
+						const size_t pOff = static_cast<size_t>(i) * activeRank;
+						for (unsigned int c = 0u; c < activeRank; ++c)
+							basisPacked[pOff + c] = state.U[uOff + c];
+					}
+					std::vector<float>& projectedGrad = state.scratch_gz;
+					if (projectedGrad.size() < static_cast<size_t>(activeRank) * cols)
+						projectedGrad.resize(static_cast<size_t>(activeRank) * cols);
+					if (activeRank > 0u && !state.U.empty())
+					{
+						glades::gemm::atb(&projectedGrad[0], &basisPacked[0], &gW[0],
+						                  activeRank, rows, cols, 1.0f);
+						for (unsigned int c = 0u; c < activeRank; ++c)
+						{
+							double meanSq = 0.0;
+							for (unsigned int j = 0u; j < cols; ++j)
+							{
+								const double v = static_cast<double>(projectedGrad[static_cast<size_t>(c) * cols + j]);
+								meanSq += v * v;
+							}
+							meanSq /= static_cast<double>(std::max(1u, cols));
+							state.fisherDiag[c] =
+							    betaGeom * state.fisherDiag[c]
+							    + (1.0f - betaGeom) * static_cast<float>(meanSq);
+						}
+					}
+
+					if (!(activeRank > 0u) || !(ac.geodeGeometryScale > 0.0f) || state.U.empty())
+					{
+						for (size_t i = 0u; i < W.size(); ++i)
+						{
+							const float mhatVal = m[i] * inv1mB1t;
+							const float vhat = v2[i] * inv1mB2t;
+							const float denom = static_cast<float>(sqrt(static_cast<double>(vhat))) + eps;
+							const float invDiag = 1.0f / std::max(denom, 1.0e-12f);
+							if (wd2 != 0.0f)
+								W[i] -= lr * wd2 * W[i];
+							W[i] -= lr * invDiag * mhatVal;
+							gW[i] = 0.0f;
+						}
+						return true;
+					}
+
+					std::vector<float> cInv(activeRank, 0.0f);
+					for (unsigned int c = 0u; c < activeRank; ++c)
+					{
+						const float fisher = (c < state.fisherDiag.size()) ? std::max(0.0f, state.fisherDiag[c]) : 0.0f;
+						const float geomDiag =
+						    std::max(1.0e-6f,
+						             std::max(0.0f, ac.geodeGeometryScale)
+						                 * (static_cast<float>(sqrt(static_cast<double>(fisher + eps))) + eps));
+						cInv[c] = 1.0f / geomDiag;
+					}
+
+					const float predictiveAlpha =
+					    predictiveEnabled
+					        ? std::max(0.0f,
+					                   std::min(1.0f, ac.geodePredictiveScale))
+					        : 0.0f;
+
+					std::vector<float>& rhsCol = state.scratch_geodeRhsCol;
+					std::vector<float>& invDiagCol = state.scratch_geodeInvDiagCol;
+					std::vector<float>& activeCurrent = state.scratch_geodeActiveCurrent;
+					std::vector<float>& activeDelta = state.scratch_geodeActiveDelta;
+					std::vector<float>& systemMat = state.scratch_geodeSystemMat;
+					std::vector<float>& rhs = state.scratch_geodeRhs;
+					std::vector<float>& solution = state.scratch_geodeSolution;
+					if (rhsCol.size() < rows)
+						rhsCol.resize(rows);
+					if (invDiagCol.size() < rows)
+						invDiagCol.resize(rows);
+					if (activeCurrent.size() < activeRank)
+						activeCurrent.resize(activeRank);
+					if (activeDelta.size() < activeRank)
+						activeDelta.resize(activeRank);
+					if (systemMat.size() < static_cast<size_t>(activeRank) * activeRank)
+						systemMat.resize(static_cast<size_t>(activeRank) * activeRank);
+					if (rhs.size() < activeRank)
+						rhs.resize(activeRank);
+					if (solution.size() < activeRank)
+						solution.resize(activeRank);
+
+					for (unsigned int j = 0u; j < cols; ++j)
+					{
+						std::fill(rhsCol.begin(), rhsCol.end(), 0.0f);
+						std::fill(invDiagCol.begin(), invDiagCol.end(), 0.0f);
+						std::fill(activeCurrent.begin(), activeCurrent.end(), 0.0f);
+						std::fill(activeDelta.begin(), activeDelta.end(), 0.0f);
+						for (unsigned int i = 0u; i < rows; ++i)
+						{
+							const size_t idx = static_cast<size_t>(i) * cols + j;
+							const float mhatVal = m[idx] * inv1mB1t;
+							const float vhat = v2[idx] * inv1mB2t;
+							const float denom = static_cast<float>(sqrt(static_cast<double>(vhat))) + eps;
+							const float invDiagVal = 1.0f / std::max(denom, 1.0e-12f);
+							rhsCol[i] = mhatVal;
+							invDiagCol[i] = invDiagVal;
+							const size_t pOff = static_cast<size_t>(i) * activeRank;
+							for (unsigned int c = 0u; c < activeRank; ++c)
+								activeCurrent[c] += basisPacked[pOff + c] * rhsCol[i];
+						}
+
+						if (predictiveAlpha > 0.0f && !state.prevGz.empty())
+						{
+							bool anyDelta = false;
+							for (unsigned int c = 0u; c < activeRank; ++c)
+							{
+								const size_t histIdx = static_cast<size_t>(c) * cols + j;
+								const float prevActive =
+								    (histIdx < state.prevGz.size()) ? state.prevGz[histIdx] : 0.0f;
+								const float currentActive =
+								    (histIdx < projectedGrad.size()) ? projectedGrad[histIdx] : activeCurrent[c];
+								const float predicted =
+								    activeCurrent[c] + predictiveAlpha * (currentActive - prevActive);
+								activeDelta[c] = predicted - activeCurrent[c];
+								anyDelta = anyDelta || (fabsf(activeDelta[c]) > 1.0e-12f);
+							}
+							if (anyDelta)
+							{
+								for (unsigned int i = 0u; i < rows; ++i)
+								{
+									const size_t pOff = static_cast<size_t>(i) * activeRank;
+									float delta = 0.0f;
+									for (unsigned int c = 0u; c < activeRank; ++c)
+										delta += basisPacked[pOff + c] * activeDelta[c];
+									rhsCol[i] += delta;
+								}
+							}
+						}
+
+						std::fill(systemMat.begin(), systemMat.end(), 0.0f);
+						std::fill(rhs.begin(), rhs.end(), 0.0f);
+						for (unsigned int c = 0u; c < activeRank; ++c)
+							systemMat[static_cast<size_t>(c) * activeRank + c] = cInv[c];
+						for (unsigned int i = 0u; i < rows; ++i)
+						{
+							const float invd = invDiagCol[i];
+							const size_t pOff = static_cast<size_t>(i) * activeRank;
+							for (unsigned int a = 0u; a < activeRank; ++a)
+							{
+								const float uia = basisPacked[pOff + a];
+								rhs[a] += uia * invd * rhsCol[i];
+								for (unsigned int b = 0u; b < activeRank; ++b)
+									systemMat[static_cast<size_t>(a) * activeRank + b]
+									    += uia * invd * basisPacked[pOff + b];
+							}
+						}
+
+						const bool solved = invert_small(systemMat, activeRank);
+						if (solved)
+						{
+							for (unsigned int a = 0u; a < activeRank; ++a)
+							{
+								double sum = 0.0;
+								for (unsigned int b = 0u; b < activeRank; ++b)
+									sum += static_cast<double>(systemMat[static_cast<size_t>(a) * activeRank + b])
+									     * static_cast<double>(rhs[b]);
+								solution[a] = static_cast<float>(sum);
+							}
+						}
+						else
+						{
+							std::fill(solution.begin(), solution.end(), 0.0f);
+						}
+
+						for (unsigned int i = 0u; i < rows; ++i)
+						{
+							const size_t idx = static_cast<size_t>(i) * cols + j;
+							float correction = 0.0f;
+							const size_t pOff = static_cast<size_t>(i) * activeRank;
+							for (unsigned int c = 0u; c < activeRank; ++c)
+								correction += basisPacked[pOff + c] * solution[c];
+							const float step = invDiagCol[i] * (rhsCol[i] - correction);
+							if (wd2 != 0.0f)
+								W[idx] -= lr * wd2 * W[idx];
+							W[idx] -= lr * step;
+							gW[idx] = 0.0f;
+						}
+					}
+
+					if (activeRank > 0u && state.prevGz.size() >= projectedGrad.size())
+					{
+						for (size_t k = 0u; k < projectedGrad.size(); ++k)
+							state.prevGz[k] = projectedGrad[k];
+					}
+					state.step += 1ULL;
+
+					return true;
+				}
+			};
+
 			// --- Apply updates ---
 			if (!useAdamW && !useAtlas)
 			{
@@ -1077,6 +1651,17 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const unsigned int dModelKVTT = nKVHeadsTT * dHeadTT;
 				const unsigned int ffnKindTT = tt.ffnKind;
 				const unsigned int ff1WidthTT = (ffnKindTT == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFFTT) : dFFTT;
+				const bool geodeEnabled = ac.geodeEnabled;
+				const bool auroraAdamwBackbone = ac.auroraEnabled && ac.auroraAdamwBackbone;
+				const float beta1 = net.trainingConfig.optimizer.adamBeta1;
+				const float beta2 = net.trainingConfig.optimizer.adamBeta2;
+				const float eps = net.trainingConfig.optimizer.adamEps;
+				const bool biasCorr = net.trainingConfig.optimizer.adamBiasCorrection;
+				const double t = static_cast<double>(tt.optimizerStep);
+				const double b1t = biasCorr ? pow(static_cast<double>(beta1), t) : 0.0;
+				const double b2t = biasCorr ? pow(static_cast<double>(beta2), t) : 0.0;
+				const float inv1mB1t = biasCorr ? static_cast<float>(1.0 / (1.0 - b1t)) : 1.0f;
+				const float inv1mB2t = biasCorr ? static_cast<float>(1.0 / (1.0 - b2t)) : 1.0f;
 
 				// Token embedding (index 0 in LM mode)
 				if (tt.tokenModel)
@@ -1084,7 +1669,181 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
+					TensorTransformerState::HelmState& helm = tt.helm;
 					TensorTransformerState::AsterState& aster = tt.aster;
+					if (ac.helmEnabled && helm.initialized
+					    && helm.batchTokenCount > 0u
+					    && !helm.batchHiddenSum.empty()
+					    && !helm.batchResidualSum.empty())
+					{
+						const unsigned int hiddenDim = helm.hiddenDim;
+						const unsigned int outputDim =
+						    std::min<unsigned int>(helm.outputDim, dModel);
+						const unsigned int pastDim = hiddenDim + outputDim;
+						const unsigned int modeRank =
+						    std::min<unsigned int>(std::max(1u, helm.modeRank),
+						                           std::max(1u, outputDim));
+						const float invTokenCount =
+						    1.0f / static_cast<float>(std::max(1u, helm.batchTokenCount));
+						const float betaHelm =
+						    std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
+						const float ridge = 1e-4f;
+						const float varEps = 1e-6f;
+						const float sigmaEps = 1e-12f;
+						std::vector<float> hiddenMean(hiddenDim, 0.0f);
+						std::vector<float> residualMean(outputDim, 0.0f);
+						std::vector<float> hiddenStd(hiddenDim, 1.0f);
+						std::vector<float> residualStd(outputDim, 1.0f);
+						std::vector<float> pastSignal(pastDim, 0.0f);
+						std::vector<float> currentResidualW(outputDim, 0.0f);
+						std::vector<float> predictedLatent(modeRank, 0.0f);
+						std::vector<float> predictedResidualW(outputDim, 0.0f);
+						std::vector<float> nextSigma;
+						std::vector<float> nextLeft;
+						std::vector<float> nextRight;
+						for (unsigned int i = 0; i < hiddenDim; ++i)
+						{
+							hiddenMean[i] = helm.batchHiddenSum[i] * invTokenCount;
+							const float secondMoment = helm.batchHiddenSqSum[i] * invTokenCount;
+							const float updatedVar =
+							    (betaHelm * helm.hiddenVar[i]) + ((1.0f - betaHelm) * std::max(secondMoment, varEps));
+							helm.hiddenVar[i] = std::max(updatedVar, varEps);
+							hiddenStd[i] = sqrtf(helm.hiddenVar[i]);
+							pastSignal[i] =
+							    (hiddenStd[i] > sigmaEps) ? (helm.prevHiddenMean[i] / hiddenStd[i]) : 0.0f;
+						}
+						for (unsigned int j = 0; j < outputDim; ++j)
+						{
+							residualMean[j] = helm.batchResidualSum[j] * invTokenCount;
+							const float secondMoment = helm.batchResidualSqSum[j] * invTokenCount;
+							const float updatedVar =
+							    (betaHelm * helm.residualVar[j]) + ((1.0f - betaHelm) * std::max(secondMoment, varEps));
+							helm.residualVar[j] = std::max(updatedVar, varEps);
+							residualStd[j] = sqrtf(helm.residualVar[j]);
+							pastSignal[hiddenDim + j] =
+							    (residualStd[j] > sigmaEps) ? (helm.prevResidualMean[j] / residualStd[j]) : 0.0f;
+							currentResidualW[j] =
+							    (residualStd[j] > sigmaEps) ? (residualMean[j] / residualStd[j]) : 0.0f;
+						}
+
+						double effectiveSigmaSq = 0.0;
+						for (unsigned int m = 0; m < modeRank; ++m)
+						{
+							const float modeSigma =
+							    (m < helm.sigma.size()) ? std::max(0.0f, helm.sigma[m]) : 0.0f;
+							const float modePole =
+							    (m < helm.pole.size()) ? helm.pole[m] : 0.0f;
+							const float modeLatent =
+							    (m < helm.latent.size()) ? helm.latent[m] : 0.0f;
+							double latentInput = 0.0;
+							const size_t rightOff =
+							    static_cast<size_t>(m) * static_cast<size_t>(pastDim);
+							for (unsigned int p = 0; p < pastDim && (rightOff + p) < helm.rightMode.size(); ++p)
+								latentInput += static_cast<double>(helm.rightMode[rightOff + p])
+								             * static_cast<double>(pastSignal[p]);
+							predictedLatent[m] = static_cast<float>(
+							    static_cast<double>(modePole) * static_cast<double>(modeLatent) + latentInput);
+							effectiveSigmaSq += static_cast<double>(modeSigma) * static_cast<double>(modeSigma);
+							const size_t leftOff =
+							    static_cast<size_t>(m) * static_cast<size_t>(outputDim);
+							for (unsigned int j = 0; j < outputDim && (leftOff + j) < helm.leftMode.size(); ++j)
+								predictedResidualW[j] += modeSigma * helm.leftMode[leftOff + j] * predictedLatent[m];
+						}
+						const float effectiveSigma =
+						    static_cast<float>(sqrt(std::max(0.0, effectiveSigmaSq)));
+
+						double targetNormSq = 0.0;
+						double errNormSq = 0.0;
+						for (unsigned int j = 0; j < outputDim; ++j)
+						{
+							const double target = static_cast<double>(currentResidualW[j]);
+							const double err = target - static_cast<double>(predictedResidualW[j]);
+							targetNormSq += target * target;
+							errNormSq += err * err;
+						}
+						float helmPredR2 = 0.0f;
+						if (targetNormSq > 1e-12)
+							helmPredR2 = static_cast<float>(
+							    std::max<double>(0.0, 1.0 - (errNormSq / targetNormSq)));
+						const float helmEdge = std::max(0.0f, effectiveSigma);
+						float helmTransferScale = 0.0f;
+						if (helmEdge > ac.helmEdgeThreshold)
+							helmTransferScale =
+							    (helmEdge - ac.helmEdgeThreshold) / (helmEdge + 1e-6f);
+						float helmMemoryGain = ac.helmMemoryScale
+						                     * std::max(0.0f, helmTransferScale)
+						                     * std::max(0.0f, helmPredR2);
+						if (!is_finite(helmMemoryGain))
+							helmMemoryGain = 0.0f;
+						if (helm.forwardCorrection.size() != outputDim)
+							helm.forwardCorrection.assign(outputDim, 0.0f);
+						for (unsigned int j = 0; j < outputDim; ++j)
+						{
+							const float predictedResidual = predictedResidualW[j] * residualStd[j];
+							const float corr =
+							    -helmMemoryGain
+							    * clipf_maybe(predictedResidual, net.trainingConfig.perElementGradClip);
+							helm.forwardCorrection[j] = is_finite(corr) ? corr : 0.0f;
+						}
+
+						for (unsigned int m = 0; m < modeRank; ++m)
+						{
+							if (m >= helm.poleNumer.size() || m >= helm.poleDenom.size()
+							    || m >= helm.pole.size() || m >= helm.latent.size())
+								continue;
+							const float oldLatent = helm.latent[m];
+							const float poleNumer = (betaHelm * helm.poleNumer[m])
+							                      + ((1.0f - betaHelm) * predictedLatent[m] * oldLatent);
+							const float poleDenom = (betaHelm * helm.poleDenom[m])
+							                      + ((1.0f - betaHelm) * oldLatent * oldLatent);
+							helm.poleNumer[m] = poleNumer;
+							helm.poleDenom[m] = poleDenom;
+							if (poleDenom > sigmaEps)
+								helm.pole[m] = std::max(-ac.helmPoleMax,
+								                        std::min(ac.helmPoleMax,
+								                                 poleNumer / (poleDenom + sigmaEps)));
+							helm.latent[m] = predictedLatent[m];
+						}
+
+						for (unsigned int j = 0; j < outputDim; ++j)
+						{
+							const size_t rowOff =
+							    static_cast<size_t>(j) * static_cast<size_t>(pastDim);
+							for (unsigned int p = 0; p < pastDim; ++p)
+							{
+								const float sample = currentResidualW[j] * pastSignal[p];
+								helm.crossCov[rowOff + p] =
+								    (betaHelm * helm.crossCov[rowOff + p]) + ((1.0f - betaHelm) * sample);
+							}
+						}
+						extract_top_singular_modes_row_major(helm.crossCov, outputDim, pastDim,
+						                                     modeRank, nextSigma, nextLeft, nextRight);
+						unsigned int helmActiveModes = 0u;
+						for (unsigned int m = 0; m < modeRank; ++m)
+						{
+							if (m < helm.sigma.size())
+								helm.sigma[m] = nextSigma[m];
+							if (nextSigma[m] > ac.helmEdgeThreshold)
+								helmActiveModes += 1u;
+						}
+						helm.leftMode.swap(nextLeft);
+						helm.rightMode.swap(nextRight);
+						helm.lastActiveModes = helmActiveModes;
+						helm.lastEdge = (modeRank > 0u) ? std::max(0.0f, helm.sigma[0]) : 0.0f;
+						helm.lastSecondEdge =
+						    (modeRank > 1u) ? std::max(0.0f, helm.sigma[1]) : 0.0f;
+						helm.lastSecondEdgeRatio =
+						    (helm.lastEdge > sigmaEps)
+						        ? std::max(0.0f, helm.lastSecondEdge / (helm.lastEdge + sigmaEps))
+						        : 0.0f;
+						helm.lastSigma = effectiveSigma;
+						helm.lastPredR2 = helmPredR2;
+						helm.lastMemoryGain = helmMemoryGain;
+						for (unsigned int i = 0; i < hiddenDim; ++i)
+							helm.prevHiddenMean[i] = hiddenMean[i];
+						for (unsigned int j = 0; j < outputDim; ++j)
+							helm.prevResidualMean[j] = residualMean[j];
+					}
 					if (ac.asterEnabled && aster.initialized
 					    && aster.batchTokenCount > 0u
 					    && !aster.batchFinalHiddenRawSum.empty()
@@ -1092,145 +1851,651 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					    && !tt.gLmBias.empty())
 					{
 						const timespec asterBoundaryStart = monotonic_now();
-						const unsigned int sketchDim = aster.sketchDim;
+						const unsigned int bundleDim = aster.sketchDim;
+						const unsigned int supportDim = aster.supportDim;
+						const unsigned int marginDim = (supportDim > 0u) ? (supportDim - 1u) : 0u;
+						const unsigned int tokenCondDim = std::max(1u, aster.tokenCondDim);
+						const unsigned int supportTokenCondDim = std::min<unsigned int>(tokenCondDim, 4u);
+						const unsigned int explicitTokenCondOff = supportTokenCondDim;
+						const unsigned int kappaObsDim = aster.kappaObsDim;
+						const unsigned int obsDim = bundleDim + supportDim + marginDim + tokenCondDim + kappaObsDim;
+						const unsigned int tokenCondOff = bundleDim + supportDim + marginDim;
+						const unsigned int kappaOff = tokenCondOff + tokenCondDim;
+						const unsigned int controlStreams = (kappaObsDim > 0u) ? 4u : 3u;
+						const unsigned int controlStride = controlStreams * obsDim;
 						const unsigned int controlDim = aster.controlDim;
-						const unsigned int featureDim = sketchDim + (2u * controlDim);
+						const unsigned int featureDim = (2u * obsDim) + (3u * controlDim);
 						const unsigned int stateRank =
-						    std::min<unsigned int>(std::max(1u, aster.stateRank), std::max(1u, sketchDim));
-						const unsigned int stateFeatureDim = stateRank + (2u * controlDim);
+						    std::min<unsigned int>(std::max(1u, aster.stateRank), std::max(1u, obsDim));
+						const unsigned int stateFeatureDim = (2u * stateRank) + (3u * controlDim);
+						const unsigned int regimeCount = std::max(1u, aster.regimeCount);
 						const unsigned int trackedLayers =
 						    std::min<unsigned int>(aster.hiddenStackDepth,
 						                           static_cast<unsigned int>(aster.trackedBlockIndices.size()));
-						const unsigned int tokenCount = std::max(1u, aster.batchTokenCount);
-						const float invTokenCount = 1.0f / static_cast<float>(tokenCount);
+						const bool sampledSoftmax =
+						    (net.trainingConfig.transformer.tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX);
+						if (sampledSoftmax)
+						{
+							std::sort(aster.batchTouchedIds.begin(), aster.batchTouchedIds.end());
+							aster.batchTouchedIds.erase(
+							    std::unique(aster.batchTouchedIds.begin(), aster.batchTouchedIds.end()),
+							    aster.batchTouchedIds.end());
+						}
 						const float betaAster =
 						    std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
+						const float marginBaselineBeta = 0.95f;
 						const float ridge = 1e-4f;
 						const float varEps = 1e-6f;
 						const float sigmaEps = 1e-12f;
-						std::vector<float> finalHiddenMeanRaw(dModel, 0.0f);
-						std::vector<float> finalHiddenMeanSketch(sketchDim, 0.0f);
-						std::vector<float> layerHiddenMeanSketch(static_cast<size_t>(trackedLayers) * sketchDim, 0.0f);
-						std::vector<float> controlMean(controlDim, 0.0f);
-						std::vector<float> residualMean(sketchDim, 0.0f);
-						std::vector<float> controlStd(controlDim, 1.0f);
-						std::vector<float> residualStd(sketchDim, 1.0f);
-						std::vector<float> feature(featureDim, 0.0f);
-						std::vector<float> prevControlW(controlDim, 0.0f);
-						std::vector<float> currentControlW(controlDim, 0.0f);
-						std::vector<float> currentResidualW(sketchDim, 0.0f);
-						std::vector<float> predictedResidualCurrentW(sketchDim, 0.0f);
-						std::vector<float> predictedResidualNextW(sketchDim, 0.0f);
-						std::vector<float> observedLatent(stateRank, 0.0f);
-						std::vector<float> prevLatentAligned(stateRank, 0.0f);
-						std::vector<float> predictedState(stateRank, 0.0f);
-						std::vector<float> filteredState(stateRank, 0.0f);
-						std::vector<float> nextState(stateRank, 0.0f);
-						std::vector<float> innovation(sketchDim, 0.0f);
-						std::vector<float> stateCorrection(stateRank, 0.0f);
-						std::vector<float> stateFeature(stateFeatureDim, 0.0f);
-						std::vector<float> invTransportCov;
-						std::vector<float> invPastCov;
-						std::vector<float> invStatePastCov;
-						std::vector<float> invInnovationCov;
-						std::vector<float> theta(static_cast<size_t>(sketchDim) * featureDim, 0.0f);
-						std::vector<float> stateModel(static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
-						std::vector<float> innovationGain(static_cast<size_t>(stateRank) * sketchDim, 0.0f);
-						std::vector<float> nextSigma;
-						std::vector<float> nextLeft;
-						std::vector<float> nextRight;
+						double weightedActiveModes = 0.0;
+						double weightedSecondModeFrac = 0.0;
+						double weightedEdge = 0.0;
+						double weightedSecondEdge = 0.0;
+						double weightedSecondEdgeRatio = 0.0;
+						double weightedSigma = 0.0;
+						double weightedPredR2 = 0.0;
+						double weightedMemoryGain = 0.0;
+						double weightedPole = 0.0;
+						double weightedAegisLambdaSpatial = 0.0;
+						double weightedAegisLambdaPredictive = 0.0;
+						double weightedAegisLambdaOutput = 0.0;
+						double weightedAegisPredictivePredicted = 0.0;
+						double weightedAegisPredictiveRealized = 0.0;
+						double weightedAegisOutputPredicted = 0.0;
+						double weightedAegisOutputRealized = 0.0;
+						double weightedAegisPredictiveError = 0.0;
+						double weightedAegisOutputError = 0.0;
+						double weightedAegisDisagreement = 0.0;
+						double weightedCitadelAnchor = 0.0;
+						double weightedCitadelHardRegimeMass = 0.0;
+						double weightedCitadelSparrowTrust = 0.0;
+						double weightedRampartTau = 0.0;
+						double weightedRampartBudget = 0.0;
+						double weightedRampartCovariance = 0.0;
+						double weightedRampartSparrowTrust = 0.0;
+						double weightedMeritTau = 0.0;
+						double weightedMeritBudget = 0.0;
+						double weightedMeritCovariance = 0.0;
+						double weightedMeritSparrowTrust = 0.0;
+						double weightedMeritGeometryTrust = 0.0;
+						double weightedStrataNullMode = 0.0;
+						double weightedStrataPredictiveMode = 0.0;
+						double weightedStrataOutputMode = 0.0;
+						double weightedStrataCoupledMode = 0.0;
+						double weightedStrataBudget = 0.0;
+						double weightedStrataNullBenefit = 0.0;
+						double weightedStrataPredictiveBenefit = 0.0;
+						double weightedStrataOutputBenefit = 0.0;
+						double weightedStrataCoupledBenefit = 0.0;
+						double weightedStrataSelectedExcess = 0.0;
+						double weightedStrataSwitchRate = 0.0;
+						double weightSum = 0.0;
+						unsigned int maxActiveModes = 0u;
+						double asterSetupNs = 0.0;
+						double asterTransportNs = 0.0;
+						double asterTransferFitNs = 0.0;
+						double asterStateFitNs = 0.0;
+						double asterInnovationFitNs = 0.0;
+						double asterApplyNs = 0.0;
+						const float batchHardRegimeMass =
+						    (aster.batchTokenCount > 0u && regimeCount > 3u
+						         && 3u < aster.batchRegimeTokenCount.size())
+						        ? std::max(0.0f, std::min(1.0f,
+						                                   aster.batchRegimeTokenCount[3u]
+						                                       / static_cast<float>(aster.batchTokenCount)))
+						        : 0.0f;
 
-						for (unsigned int i = 0; i < dModel && i < aster.batchFinalHiddenRawSum.size(); ++i)
-							finalHiddenMeanRaw[i] = aster.batchFinalHiddenRawSum[i] * invTokenCount;
-						for (unsigned int i = 0; i < sketchDim && i < aster.batchFinalHiddenSketchSum.size(); ++i)
-							finalHiddenMeanSketch[i] = aster.batchFinalHiddenSketchSum[i] * invTokenCount;
-						for (unsigned int i = 0; i < sketchDim && i < aster.batchResidualSum.size(); ++i)
-							residualMean[i] = aster.batchResidualSum[i] * invTokenCount;
+						for (unsigned int regime = 0; regime < regimeCount; ++regime)
+						{
+							const float regimeMass =
+							    (regime < aster.batchRegimeTokenCount.size()) ? aster.batchRegimeTokenCount[regime] : 0.0f;
+							if (!(regimeMass > 0.0f))
+								continue;
+							const timespec regimeStart = monotonic_now();
+							const unsigned int tokenCount = std::max(1u, static_cast<unsigned int>(regimeMass));
+							const float invTokenCount = 1.0f / static_cast<float>(tokenCount);
+							const size_t regimeFinalRawOff = static_cast<size_t>(regime) * static_cast<size_t>(dModel);
+							const size_t regimeBundleOff = static_cast<size_t>(regime) * static_cast<size_t>(bundleDim);
+							const size_t regimeSupportOff = static_cast<size_t>(regime) * static_cast<size_t>(supportDim);
+							const size_t regimeSupportHiddenOff = regimeSupportOff * static_cast<size_t>(dModel);
+							const size_t regimeLayerRawBase =
+							    static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) * static_cast<size_t>(dModel);
+							const size_t regimeLayerSketchBase =
+							    static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) * static_cast<size_t>(bundleDim);
+							const size_t regimeLayerAttnRawBase =
+							    static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) * static_cast<size_t>(dModel);
+							const size_t regimeLayerAttnSketchBase =
+							    static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) * static_cast<size_t>(bundleDim);
+							const size_t regimeLayerKappaBase =
+							    static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) * static_cast<size_t>(kappaObsDim);
+							const size_t regimeControlBase = static_cast<size_t>(regime) * static_cast<size_t>(controlDim);
+							const size_t regimeObsBase = static_cast<size_t>(regime) * static_cast<size_t>(obsDim);
+							const size_t regimeFeatureBase = static_cast<size_t>(regime) * static_cast<size_t>(featureDim) * static_cast<size_t>(featureDim);
+							const size_t regimeCrossBase = static_cast<size_t>(regime) * static_cast<size_t>(obsDim) * static_cast<size_t>(featureDim);
+							const size_t regimeStateFeatureBase = static_cast<size_t>(regime) * static_cast<size_t>(stateFeatureDim) * static_cast<size_t>(stateFeatureDim);
+							const size_t regimeStateCrossBase = static_cast<size_t>(regime) * static_cast<size_t>(stateRank) * static_cast<size_t>(stateFeatureDim);
+							const size_t regimeInnovationBase = static_cast<size_t>(regime) * static_cast<size_t>(obsDim) * static_cast<size_t>(obsDim);
+							const size_t regimeInnovationCrossBase = static_cast<size_t>(regime) * static_cast<size_t>(stateRank) * static_cast<size_t>(obsDim);
+							const size_t regimeLatentBase = static_cast<size_t>(regime) * static_cast<size_t>(stateRank);
+							const size_t regimeLeftBase = static_cast<size_t>(regime) * static_cast<size_t>(stateRank) * static_cast<size_t>(obsDim);
+							const size_t regimeRightBase = static_cast<size_t>(regime) * static_cast<size_t>(stateRank) * static_cast<size_t>(featureDim);
+							std::vector<float> finalHiddenMeanRaw(dModel, 0.0f);
+							std::vector<float> finalHiddenMeanSketch(bundleDim, 0.0f);
+							std::vector<float> layerHiddenMeanRaw(static_cast<size_t>(trackedLayers) * dModel, 0.0f);
+							std::vector<float> layerHiddenMeanSketch(static_cast<size_t>(trackedLayers) * bundleDim, 0.0f);
+							std::vector<float> layerAttnMeanRaw(static_cast<size_t>(trackedLayers) * dModel, 0.0f);
+							std::vector<float> layerAttnMeanSketch(static_cast<size_t>(trackedLayers) * bundleDim, 0.0f);
+							std::vector<float> layerPatternMean(static_cast<size_t>(trackedLayers) * tokenCondDim, 0.0f);
+							std::vector<float> layerKappaMean(static_cast<size_t>(trackedLayers) * kappaObsDim, 0.0f);
+							std::vector<float> supportHiddenMeanRaw(static_cast<size_t>(supportDim) * dModel, 0.0f);
+							std::vector<float> supportCount(supportDim, 0.0f);
+							std::vector<float> supportLogitMean(supportDim, 0.0f);
+							std::vector<float> supportResidualMean(supportDim, 0.0f);
+							std::vector<float> controlMean(controlDim, 0.0f);
+							std::vector<float> residualMean(obsDim, 0.0f);
+							std::vector<float> controlStd(controlDim, 1.0f);
+							std::vector<float> residualStd(obsDim, 1.0f);
+							std::vector<float> feature(featureDim, 0.0f);
+							std::vector<float> prevPrevControlW(controlDim, 0.0f);
+							std::vector<float> prevControlW(controlDim, 0.0f);
+							std::vector<float> currentControlW(controlDim, 0.0f);
+							std::vector<float> prevPrevResidualW(obsDim, 0.0f);
+							std::vector<float> currentResidualW(obsDim, 0.0f);
+							std::vector<float> predictedResidualCurrentW(obsDim, 0.0f);
+							std::vector<float> predictedResidualNextW(obsDim, 0.0f);
+							std::vector<float> observedLatent(stateRank, 0.0f);
+							std::vector<float> prevPrevLatent(stateRank, 0.0f);
+							std::vector<float> prevLatentAligned(stateRank, 0.0f);
+							std::vector<float> predictedState(stateRank, 0.0f);
+							std::vector<float> filteredState(stateRank, 0.0f);
+							std::vector<float> nextState(stateRank, 0.0f);
+							std::vector<float> innovation(obsDim, 0.0f);
+							std::vector<float> stateCorrection(stateRank, 0.0f);
+							std::vector<float> stateFeature(stateFeatureDim, 0.0f);
+							std::vector<float> invTransportCov;
+							std::vector<float> invPastCov;
+							std::vector<float> invStatePastCov;
+							std::vector<float> invInnovationCov;
+							std::vector<float> theta(static_cast<size_t>(obsDim) * featureDim, 0.0f);
+							std::vector<float> stateModel(static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
+							std::vector<float> innovationGain(static_cast<size_t>(stateRank) * obsDim, 0.0f);
+							std::vector<float> nextSigma;
+							std::vector<float> nextLeft;
+							std::vector<float> nextRight;
+							std::vector<float> prevPrevControlMeanHist(controlDim, 0.0f);
+							std::vector<float> prevControlMeanHist(controlDim, 0.0f);
+							std::vector<float> prevPrevResidualMeanHist(obsDim, 0.0f);
+							std::vector<float> prevResidualMeanHist(obsDim, 0.0f);
+							std::vector<float> controlVarHist(controlDim, 1.0f);
+							std::vector<float> residualVarHist(obsDim, 1.0f);
+							std::vector<float> transportPastCov(static_cast<size_t>(trackedLayers) * bundleDim * bundleDim, 0.0f);
+							std::vector<float> transportCrossCov(static_cast<size_t>(trackedLayers) * bundleDim * bundleDim, 0.0f);
+							std::vector<float> pastCovHist(static_cast<size_t>(featureDim) * featureDim, 0.0f);
+							std::vector<float> crossCovHist(static_cast<size_t>(obsDim) * featureDim, 0.0f);
+							std::vector<float> thetaHist(static_cast<size_t>(obsDim) * featureDim, 0.0f);
+							std::vector<float> statePastCovHist(static_cast<size_t>(stateFeatureDim) * stateFeatureDim, 0.0f);
+							std::vector<float> stateCrossCovHist(static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
+							std::vector<float> innovationCovHist(static_cast<size_t>(obsDim) * obsDim, 0.0f);
+							std::vector<float> innovationCrossHist(static_cast<size_t>(stateRank) * obsDim, 0.0f);
+							std::vector<float> sigmaHist(stateRank, 0.0f);
+							std::vector<float> leftModeHist(static_cast<size_t>(stateRank) * obsDim, 0.0f);
+							std::vector<float> rightModeHist(static_cast<size_t>(stateRank) * featureDim, 0.0f);
+							std::vector<float> prevPrevLatentHist(stateRank, 0.0f);
+							std::vector<float> latentHist(stateRank, 0.0f);
+							std::vector<float> poleNumerHist(stateRank, 0.0f);
+							std::vector<float> poleDenomHist(stateRank, 0.0f);
+							std::vector<float> poleHist(stateRank, 0.0f);
+
+						for (unsigned int i = 0; i < controlDim && (regimeControlBase + i) < aster.prevPrevControlMean.size(); ++i)
+							prevPrevControlMeanHist[i] = aster.prevPrevControlMean[regimeControlBase + i];
+						for (unsigned int i = 0; i < controlDim && (regimeControlBase + i) < aster.prevControlMean.size(); ++i)
+							prevControlMeanHist[i] = aster.prevControlMean[regimeControlBase + i];
+						for (unsigned int i = 0; i < obsDim && (regimeObsBase + i) < aster.prevPrevResidualMean.size(); ++i)
+							prevPrevResidualMeanHist[i] = aster.prevPrevResidualMean[regimeObsBase + i];
+						for (unsigned int i = 0; i < obsDim && (regimeObsBase + i) < aster.prevResidualMean.size(); ++i)
+							prevResidualMeanHist[i] = aster.prevResidualMean[regimeObsBase + i];
+						for (unsigned int i = 0; i < controlDim && (regimeControlBase + i) < aster.controlVar.size(); ++i)
+							controlVarHist[i] = aster.controlVar[regimeControlBase + i];
+						for (unsigned int i = 0; i < obsDim && (regimeObsBase + i) < aster.residualVar.size(); ++i)
+							residualVarHist[i] = aster.residualVar[regimeObsBase + i];
+						for (unsigned int i = 0; i < transportPastCov.size(); ++i)
+						{
+							const size_t src = static_cast<size_t>(regime) * transportPastCov.size() + i;
+							if (src < aster.transportPastCov.size())
+								transportPastCov[i] = aster.transportPastCov[src];
+							if (src < aster.transportCrossCov.size())
+								transportCrossCov[i] = aster.transportCrossCov[src];
+						}
+						for (unsigned int i = 0; i < pastCovHist.size(); ++i)
+						{
+							const size_t src = regimeFeatureBase + i;
+							if (src < aster.pastCov.size())
+								pastCovHist[i] = aster.pastCov[src];
+						}
+						for (unsigned int i = 0; i < crossCovHist.size(); ++i)
+						{
+							const size_t src = regimeCrossBase + i;
+							if (src < aster.crossCov.size())
+								crossCovHist[i] = aster.crossCov[src];
+							if (src < aster.theta.size())
+								thetaHist[i] = aster.theta[src];
+						}
+						for (unsigned int i = 0; i < statePastCovHist.size(); ++i)
+						{
+							const size_t src = regimeStateFeatureBase + i;
+							if (src < aster.statePastCov.size())
+								statePastCovHist[i] = aster.statePastCov[src];
+						}
+						for (unsigned int i = 0; i < stateCrossCovHist.size(); ++i)
+						{
+							const size_t src = regimeStateCrossBase + i;
+							if (src < aster.stateCrossCov.size())
+								stateCrossCovHist[i] = aster.stateCrossCov[src];
+						}
+						for (unsigned int i = 0; i < innovationCovHist.size(); ++i)
+						{
+							const size_t src = regimeInnovationBase + i;
+							if (src < aster.innovationCov.size())
+								innovationCovHist[i] = aster.innovationCov[src];
+						}
+						for (unsigned int i = 0; i < innovationCrossHist.size(); ++i)
+						{
+							const size_t src = regimeInnovationCrossBase + i;
+							if (src < aster.innovationCross.size())
+								innovationCrossHist[i] = aster.innovationCross[src];
+						}
+						for (unsigned int i = 0; i < stateRank; ++i)
+						{
+							const size_t sigmaIdx = static_cast<size_t>(regime) * static_cast<size_t>(stateRank) + i;
+							if (sigmaIdx < aster.sigma.size())
+								sigmaHist[i] = aster.sigma[sigmaIdx];
+							if ((regimeLatentBase + i) < aster.prevPrevLatent.size())
+								prevPrevLatentHist[i] = aster.prevPrevLatent[regimeLatentBase + i];
+							if ((regimeLatentBase + i) < aster.latent.size())
+								latentHist[i] = aster.latent[regimeLatentBase + i];
+							if ((regimeLatentBase + i) < aster.poleNumer.size())
+								poleNumerHist[i] = aster.poleNumer[regimeLatentBase + i];
+							if ((regimeLatentBase + i) < aster.poleDenom.size())
+								poleDenomHist[i] = aster.poleDenom[regimeLatentBase + i];
+							if ((regimeLatentBase + i) < aster.pole.size())
+								poleHist[i] = aster.pole[regimeLatentBase + i];
+						}
+						for (unsigned int i = 0; i < leftModeHist.size(); ++i)
+						{
+							const size_t src = regimeLeftBase + i;
+							if (src < aster.leftMode.size())
+								leftModeHist[i] = aster.leftMode[src];
+						}
+						for (unsigned int i = 0; i < rightModeHist.size(); ++i)
+						{
+							const size_t src = regimeRightBase + i;
+							if (src < aster.rightMode.size())
+								rightModeHist[i] = aster.rightMode[src];
+						}
+
+						for (unsigned int i = 0; i < dModel && (regimeFinalRawOff + i) < aster.batchFinalHiddenRawSum.size(); ++i)
+							finalHiddenMeanRaw[i] = aster.batchFinalHiddenRawSum[regimeFinalRawOff + i] * invTokenCount;
+						for (unsigned int i = 0; i < bundleDim && (regimeBundleOff + i) < aster.batchFinalHiddenSketchSum.size(); ++i)
+							finalHiddenMeanSketch[i] = aster.batchFinalHiddenSketchSum[regimeBundleOff + i] * invTokenCount;
+						for (unsigned int i = 0; i < bundleDim && (regimeBundleOff + i) < aster.batchResidualSum.size(); ++i)
+							residualMean[i] = aster.batchResidualSum[regimeBundleOff + i] * invTokenCount;
+						for (unsigned int r = 0; r < supportDim; ++r)
+						{
+							const size_t roleIndex = regimeSupportOff + r;
+							const float count =
+							    (roleIndex < aster.batchSupportCount.size()) ? aster.batchSupportCount[roleIndex] : 0.0f;
+							supportCount[r] = count;
+							if (!(count > 0.0f))
+								continue;
+							if (roleIndex < aster.batchSupportLogitSum.size())
+							{
+								supportLogitMean[r] = aster.batchSupportLogitSum[roleIndex] / count;
+								residualMean[bundleDim + r] = supportLogitMean[r];
+							}
+							if (roleIndex < aster.batchSupportResidualSum.size())
+								supportResidualMean[r] = aster.batchSupportResidualSum[roleIndex] / count;
+							const size_t roleOff = regimeSupportHiddenOff + static_cast<size_t>(r) * static_cast<size_t>(dModel);
+							const size_t localRoleOff = static_cast<size_t>(r) * static_cast<size_t>(dModel);
+							for (unsigned int i = 0; i < dModel
+							                        && (roleOff + i) < aster.batchSupportHiddenRawSum.size(); ++i)
+								supportHiddenMeanRaw[localRoleOff + i] =
+								    aster.batchSupportHiddenRawSum[roleOff + i] / count;
+						}
+						for (unsigned int r = 0; r < marginDim; ++r)
+						{
+							if (!(supportCount[0] > 0.0f) || !(supportCount[r + 1u] > 0.0f))
+								continue;
+							residualMean[bundleDim + supportDim + r] = supportLogitMean[0] - supportLogitMean[r + 1u];
+						}
+						const float targetMarginMean =
+						    (regime < aster.batchTargetMarginSum.size())
+						        ? (aster.batchTargetMarginSum[regime] * invTokenCount)
+						        : ((supportDim > 1u) ? (supportLogitMean[0] - supportLogitMean[1]) : 0.0f);
+						const float hardNegativeLogitMean =
+						    (regime < aster.batchHardNegativeLogitSum.size())
+						        ? (aster.batchHardNegativeLogitSum[regime] * invTokenCount)
+						        : ((supportDim > 1u) ? supportLogitMean[1] : supportLogitMean[0]);
+						const float marginBaseline =
+						    (regime < aster.targetMarginEma.size()) ? aster.targetMarginEma[regime] : 0.75f;
+						const float hardNegativeBaseline =
+						    (regime < aster.hardNegativeLogitEma.size()) ? aster.hardNegativeLogitEma[regime] : 0.0f;
+						const float hardShortfallBaseline =
+						    (regime < aster.hardMarginShortfallEma.size()) ? aster.hardMarginShortfallEma[regime] : 0.0f;
+						const float marginShortfallMean = std::max(0.0f, marginBaseline - targetMarginMean);
+						const float negativePressureMean = std::max(0.0f, hardNegativeLogitMean - hardNegativeBaseline);
+						const float rawHardMarginShortfallMean = (regime == 3u) ? marginShortfallMean : 0.0f;
+						const float hardMarginShortfallMean =
+						    std::max(0.0f, rawHardMarginShortfallMean - hardShortfallBaseline);
+						const float baselineWorseRate =
+						    (regime < aster.batchBaselineWorseSum.size())
+						        ? (aster.batchBaselineWorseSum[regime] * invTokenCount)
+						        : ((marginShortfallMean > 0.0f) ? 1.0f : 0.0f);
+						float targetRepeatHitMean = 0.0f;
+						float targetRepeatClosenessMean = 0.0f;
+						float hardNegRepeatHitMean = 0.0f;
+						float hardNegRepeatClosenessMean = 0.0f;
+						if (trackedLayers > 0u && tokenCondDim > 4u)
+						{
+							for (unsigned int l = 0; l < trackedLayers; ++l)
+							{
+								const size_t patternSrcOff =
+								    (static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) + l) * static_cast<size_t>(tokenCondDim);
+								if ((patternSrcOff + 4u) < aster.batchLayerPatternSum.size())
+									targetRepeatHitMean += aster.batchLayerPatternSum[patternSrcOff + 4u] * invTokenCount;
+								if ((patternSrcOff + 5u) < aster.batchLayerPatternSum.size())
+									targetRepeatClosenessMean += aster.batchLayerPatternSum[patternSrcOff + 5u] * invTokenCount;
+								if ((patternSrcOff + 6u) < aster.batchLayerPatternSum.size())
+									hardNegRepeatHitMean += aster.batchLayerPatternSum[patternSrcOff + 6u] * invTokenCount;
+								if ((patternSrcOff + 7u) < aster.batchLayerPatternSum.size())
+									hardNegRepeatClosenessMean += aster.batchLayerPatternSum[patternSrcOff + 7u] * invTokenCount;
+							}
+							const float invTracked = 1.0f / static_cast<float>(trackedLayers);
+							targetRepeatHitMean *= invTracked;
+							targetRepeatClosenessMean *= invTracked;
+							hardNegRepeatHitMean *= invTracked;
+							hardNegRepeatClosenessMean *= invTracked;
+						}
+						for (size_t slot = 0; slot < aster.batchSupportIds.size(); ++slot)
+						{
+							const unsigned int vid = aster.batchSupportIds[slot];
+							if (vid >= tt.vocabSize)
+								continue;
+							for (unsigned int r = 0; r < supportDim; ++r)
+							{
+								if (!(supportCount[r] > 0.0f))
+									continue;
+								const size_t countOff =
+								    (slot * static_cast<size_t>(regimeCount) + regime) * static_cast<size_t>(supportDim) + r;
+								if (countOff >= aster.batchSupportRoleCounts.size())
+									break;
+								const float roleMass = aster.batchSupportRoleCounts[countOff];
+								if (!(roleMass > 0.0f))
+									continue;
+								const float roleWeight = roleMass / supportCount[r];
+								if (supportTokenCondDim > 0u)
+									aster_sketch_sparse_value(vid,
+									                          roleWeight * supportResidualMean[r],
+									                          supportTokenCondDim,
+									                          0xA57E3001u,
+									                          residualMean,
+									                          tokenCondOff);
+							}
+						}
+						if ((explicitTokenCondOff + 0u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 0u] = marginShortfallMean;
+						if ((explicitTokenCondOff + 1u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 1u] = negativePressureMean;
+						if ((explicitTokenCondOff + 2u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 2u] = hardMarginShortfallMean;
+						if ((explicitTokenCondOff + 3u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 3u] = baselineWorseRate;
+						if ((explicitTokenCondOff + 4u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 4u] = targetRepeatHitMean;
+						if ((explicitTokenCondOff + 5u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 5u] = targetRepeatClosenessMean;
+						if ((explicitTokenCondOff + 6u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 6u] = hardNegRepeatHitMean;
+						if ((explicitTokenCondOff + 7u) < tokenCondDim)
+							residualMean[tokenCondOff + explicitTokenCondOff + 7u] = hardNegRepeatClosenessMean;
+						if (kappaObsDim > 0u)
+						{
+							for (unsigned int i = 0; i < kappaObsDim; ++i)
+							{
+								double accum = 0.0;
+								for (unsigned int l = 0; l < trackedLayers; ++l)
+								{
+									const size_t src = regimeLayerKappaBase
+									                 + static_cast<size_t>(l) * static_cast<size_t>(kappaObsDim)
+									                 + i;
+									if (src < aster.batchLayerKappaSum.size())
+										accum += static_cast<double>(aster.batchLayerKappaSum[src]) * static_cast<double>(invTokenCount);
+								}
+								residualMean[kappaOff + i] = static_cast<float>(accum / static_cast<double>(std::max(1u, trackedLayers)));
+							}
+						}
 						for (unsigned int l = 0; l < trackedLayers; ++l)
 						{
-							const size_t srcOff = static_cast<size_t>(l) * static_cast<size_t>(sketchDim);
-							for (unsigned int i = 0; i < sketchDim; ++i)
-								layerHiddenMeanSketch[srcOff + i] =
+							const size_t rawOff = regimeLayerRawBase + static_cast<size_t>(l) * static_cast<size_t>(dModel);
+							const size_t localRawOff = static_cast<size_t>(l) * static_cast<size_t>(dModel);
+							for (unsigned int i = 0; i < dModel && (rawOff + i) < aster.batchLayerHiddenRawSum.size(); ++i)
+								layerHiddenMeanRaw[localRawOff + i] =
+								    aster.batchLayerHiddenRawSum[rawOff + i] * invTokenCount;
+							const size_t attnRawOff = regimeLayerAttnRawBase + static_cast<size_t>(l) * static_cast<size_t>(dModel);
+							for (unsigned int i = 0; i < dModel && (attnRawOff + i) < aster.batchLayerAttnRawSum.size(); ++i)
+								layerAttnMeanRaw[localRawOff + i] =
+								    aster.batchLayerAttnRawSum[attnRawOff + i] * invTokenCount;
+							const size_t srcOff = regimeLayerSketchBase + static_cast<size_t>(l) * static_cast<size_t>(bundleDim);
+							const size_t localSrcOff = static_cast<size_t>(l) * static_cast<size_t>(bundleDim);
+							for (unsigned int i = 0; i < bundleDim; ++i)
+								layerHiddenMeanSketch[localSrcOff + i] =
 								    aster.batchLayerHiddenSketchSum[srcOff + i] * invTokenCount;
+							const size_t attnSrcOff = regimeLayerAttnSketchBase + static_cast<size_t>(l) * static_cast<size_t>(bundleDim);
+							for (unsigned int i = 0; i < bundleDim; ++i)
+								layerAttnMeanSketch[localSrcOff + i] =
+								    aster.batchLayerAttnSketchSum[attnSrcOff + i] * invTokenCount;
+							const size_t patternSrcOff =
+							    (static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) + l) * static_cast<size_t>(tokenCondDim);
+							const size_t localPatternOff = static_cast<size_t>(l) * static_cast<size_t>(tokenCondDim);
+							for (unsigned int i = 0; i < tokenCondDim && (patternSrcOff + i) < aster.batchLayerPatternSum.size(); ++i)
+								layerPatternMean[localPatternOff + i] =
+								    aster.batchLayerPatternSum[patternSrcOff + i] * invTokenCount;
+							const size_t kappaSrcOff =
+							    regimeLayerKappaBase + static_cast<size_t>(l) * static_cast<size_t>(kappaObsDim);
+							const size_t localKappaOff = static_cast<size_t>(l) * static_cast<size_t>(kappaObsDim);
+							for (unsigned int i = 0; i < kappaObsDim && (kappaSrcOff + i) < aster.batchLayerKappaSum.size(); ++i)
+								layerKappaMean[localKappaOff + i] =
+								    aster.batchLayerKappaSum[kappaSrcOff + i] * invTokenCount;
 						}
-						const double asterSetupNs =
-						    monotonic_elapsed_ns(asterBoundaryStart, monotonic_now());
+						const double regimeSetupNs =
+						    monotonic_elapsed_ns(regimeStart, monotonic_now());
 
 						const timespec asterTransportStart = monotonic_now();
-						for (unsigned int l = 0; l < trackedLayers && ((l + 1u) * sketchDim) <= controlDim; ++l)
+						for (unsigned int l = 0; l < trackedLayers && ((l + 1u) * controlStride) <= controlDim; ++l)
 						{
-							const size_t covOff = static_cast<size_t>(l) * static_cast<size_t>(sketchDim) * static_cast<size_t>(sketchDim);
-							const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(sketchDim);
-							for (unsigned int r = 0; r < sketchDim; ++r)
+							const size_t covOff = static_cast<size_t>(l) * static_cast<size_t>(bundleDim) * static_cast<size_t>(bundleDim);
+							const size_t rawLayerOff = static_cast<size_t>(l) * static_cast<size_t>(dModel);
+							const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(bundleDim);
+							const size_t patternLayerOff = static_cast<size_t>(l) * static_cast<size_t>(tokenCondDim);
+							const size_t kappaLayerOff = static_cast<size_t>(l) * static_cast<size_t>(kappaObsDim);
+							const unsigned int hiddenControlOff = l * controlStride;
+							const unsigned int attnControlOff = hiddenControlOff + obsDim;
+							const unsigned int patternControlOff = attnControlOff + obsDim;
+							const unsigned int kappaControlOff = patternControlOff + obsDim;
+							for (unsigned int r = 0; r < bundleDim; ++r)
 							{
-								const size_t rowOff = covOff + static_cast<size_t>(r) * static_cast<size_t>(sketchDim);
-								for (unsigned int c = 0; c < sketchDim; ++c)
+								const size_t rowOff = covOff + static_cast<size_t>(r) * static_cast<size_t>(bundleDim);
+								for (unsigned int c = 0; c < bundleDim; ++c)
 								{
 									const float layerSample = layerHiddenMeanSketch[layerOff + r] * layerHiddenMeanSketch[layerOff + c];
-									aster.transportPastCov[rowOff + c] =
-									    (betaAster * aster.transportPastCov[rowOff + c]) + ((1.0f - betaAster) * layerSample);
+									transportPastCov[rowOff + c] =
+									    (betaAster * transportPastCov[rowOff + c]) + ((1.0f - betaAster) * layerSample);
 									const float crossSample = finalHiddenMeanSketch[r] * layerHiddenMeanSketch[layerOff + c];
-									aster.transportCrossCov[rowOff + c] =
-									    (betaAster * aster.transportCrossCov[rowOff + c]) + ((1.0f - betaAster) * crossSample);
+									transportCrossCov[rowOff + c] =
+									    (betaAster * transportCrossCov[rowOff + c]) + ((1.0f - betaAster) * crossSample);
 								}
 							}
 							const std::vector<float> pastBlock(
-							    aster.transportPastCov.begin() + static_cast<std::ptrdiff_t>(covOff),
-							    aster.transportPastCov.begin() + static_cast<std::ptrdiff_t>(covOff + static_cast<size_t>(sketchDim) * sketchDim));
-							if (invert_small_dense_row_major(pastBlock, sketchDim, ridge, invTransportCov))
+							    transportPastCov.begin() + static_cast<std::ptrdiff_t>(covOff),
+							    transportPastCov.begin() + static_cast<std::ptrdiff_t>(covOff + static_cast<size_t>(bundleDim) * bundleDim));
+							if (invert_small_dense_row_major(pastBlock, bundleDim, ridge, invTransportCov))
 							{
-								const unsigned int controlOff = l * sketchDim;
-								for (unsigned int r = 0; r < sketchDim; ++r)
+								for (unsigned int r = 0; r < bundleDim; ++r)
 								{
 									double accum = 0.0;
-									for (unsigned int c = 0; c < sketchDim; ++c)
+									for (unsigned int c = 0; c < bundleDim; ++c)
 									{
 										double transportCoeff = 0.0;
-										for (unsigned int k = 0; k < sketchDim; ++k)
+										for (unsigned int k = 0; k < bundleDim; ++k)
 										{
-											const size_t rowOff = covOff + static_cast<size_t>(r) * static_cast<size_t>(sketchDim);
-											transportCoeff += static_cast<double>(aster.transportCrossCov[rowOff + k])
-											               * static_cast<double>(invTransportCov[static_cast<size_t>(k) * static_cast<size_t>(sketchDim) + c]);
+											const size_t rowOff = covOff + static_cast<size_t>(r) * static_cast<size_t>(bundleDim);
+											transportCoeff += static_cast<double>(transportCrossCov[rowOff + k])
+											               * static_cast<double>(invTransportCov[static_cast<size_t>(k) * static_cast<size_t>(bundleDim) + c]);
 										}
 										accum += transportCoeff * static_cast<double>(layerHiddenMeanSketch[layerOff + c]);
 									}
-									controlMean[controlOff + r] = static_cast<float>(accum);
+									controlMean[hiddenControlOff + r] = static_cast<float>(accum);
 								}
 							}
 							else
 							{
-								const unsigned int controlOff = l * sketchDim;
-								for (unsigned int i = 0; i < sketchDim; ++i)
-									controlMean[controlOff + i] = layerHiddenMeanSketch[layerOff + i];
+								for (unsigned int i = 0; i < bundleDim; ++i)
+									controlMean[hiddenControlOff + i] = layerHiddenMeanSketch[layerOff + i];
 							}
+							for (unsigned int i = 0; i < bundleDim; ++i)
+								controlMean[attnControlOff + i] = layerAttnMeanSketch[layerOff + i];
+							for (unsigned int r = 0; r < supportDim; ++r)
+							{
+								if (!(supportCount[r] > 0.0f))
+									continue;
+								double hiddenAccum = 0.0;
+								double attnAccum = 0.0;
+								for (size_t slot = 0; slot < aster.batchSupportIds.size(); ++slot)
+								{
+									const size_t countOff =
+									    (slot * static_cast<size_t>(regimeCount) + regime) * static_cast<size_t>(supportDim) + r;
+									if (countOff >= aster.batchSupportRoleCounts.size())
+										break;
+									const float roleMass = aster.batchSupportRoleCounts[countOff];
+									if (!(roleMass > 0.0f))
+										continue;
+									const unsigned int vid = aster.batchSupportIds[slot];
+									if (vid >= tt.vocabSize)
+										continue;
+									const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
+									double hiddenDot = 0.0;
+									double attnDot = 0.0;
+									for (unsigned int i = 0; i < dModel; ++i)
+									{
+										const double eVal = static_cast<double>(tt.tokE[eOff + i]);
+										hiddenDot += eVal * static_cast<double>(layerHiddenMeanRaw[rawLayerOff + i]);
+										attnDot += eVal * static_cast<double>(layerAttnMeanRaw[rawLayerOff + i]);
+									}
+									const double roleWeight =
+									    static_cast<double>(roleMass) / static_cast<double>(supportCount[r]);
+									hiddenAccum += roleWeight * hiddenDot;
+									attnAccum += roleWeight * attnDot;
+								}
+								controlMean[hiddenControlOff + bundleDim + r] = static_cast<float>(hiddenAccum);
+								controlMean[attnControlOff + bundleDim + r] = static_cast<float>(attnAccum);
+							}
+							for (unsigned int r = 0; r < marginDim; ++r)
+							{
+								controlMean[hiddenControlOff + bundleDim + supportDim + r] =
+								    controlMean[hiddenControlOff + bundleDim]
+								    - controlMean[hiddenControlOff + bundleDim + r + 1u];
+								controlMean[attnControlOff + bundleDim + supportDim + r] =
+								    controlMean[attnControlOff + bundleDim]
+								    - controlMean[attnControlOff + bundleDim + r + 1u];
+							}
+							for (size_t slot = 0; slot < aster.batchSupportIds.size(); ++slot)
+							{
+								const unsigned int vid = aster.batchSupportIds[slot];
+								if (vid >= tt.vocabSize)
+									continue;
+								for (unsigned int r = 0; r < supportDim; ++r)
+								{
+									if (!(supportCount[r] > 0.0f))
+										continue;
+									const size_t countOff =
+									    (slot * static_cast<size_t>(regimeCount) + regime) * static_cast<size_t>(supportDim) + r;
+									if (countOff >= aster.batchSupportRoleCounts.size())
+										break;
+									const float roleMass = aster.batchSupportRoleCounts[countOff];
+									if (!(roleMass > 0.0f))
+										continue;
+									const float roleWeight = roleMass / supportCount[r];
+									if (supportTokenCondDim > 0u)
+									{
+										aster_sketch_sparse_value(vid,
+										                          roleWeight * controlMean[hiddenControlOff + bundleDim + r],
+										                          supportTokenCondDim,
+										                          0xA57E3001u,
+										                          controlMean,
+										                          hiddenControlOff + tokenCondOff);
+										aster_sketch_sparse_value(vid,
+										                          roleWeight * controlMean[attnControlOff + bundleDim + r],
+										                          supportTokenCondDim,
+										                          0xA57E3001u,
+										                          controlMean,
+										                          attnControlOff + tokenCondOff);
+									}
+								}
+							}
+							for (unsigned int i = 0; i < supportTokenCondDim; ++i)
+								controlMean[patternControlOff + tokenCondOff + i] = layerPatternMean[patternLayerOff + i];
+							if ((explicitTokenCondOff + 0u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 0u] = marginShortfallMean;
+							if ((explicitTokenCondOff + 1u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 1u] = negativePressureMean;
+							if ((explicitTokenCondOff + 2u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 2u] = hardMarginShortfallMean;
+							if ((explicitTokenCondOff + 3u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 3u] = baselineWorseRate;
+							if ((explicitTokenCondOff + 4u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 4u] = targetRepeatHitMean;
+							if ((explicitTokenCondOff + 5u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 5u] = targetRepeatClosenessMean;
+							if ((explicitTokenCondOff + 6u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 6u] = hardNegRepeatHitMean;
+							if ((explicitTokenCondOff + 7u) < tokenCondDim)
+								controlMean[patternControlOff + tokenCondOff + explicitTokenCondOff + 7u] = hardNegRepeatClosenessMean;
+							for (unsigned int i = 0; i < kappaObsDim; ++i)
+								controlMean[kappaControlOff + kappaOff + i] = layerKappaMean[kappaLayerOff + i];
 						}
-						const double asterTransportNs =
+						const double regimeTransportNs =
 						    monotonic_elapsed_ns(asterTransportStart, monotonic_now());
 
 						const timespec asterTransferFitStart = monotonic_now();
-						for (unsigned int j = 0; j < sketchDim; ++j)
+						for (unsigned int j = 0; j < obsDim; ++j)
 						{
 							const float secondMoment = residualMean[j] * residualMean[j];
 							const float updatedVar =
-							    (betaAster * aster.residualVar[j]) + ((1.0f - betaAster) * std::max(secondMoment, varEps));
-							aster.residualVar[j] = std::max(updatedVar, varEps);
-							residualStd[j] = sqrtf(aster.residualVar[j]);
+							    (betaAster * residualVarHist[j]) + ((1.0f - betaAster) * std::max(secondMoment, varEps));
+							residualVarHist[j] = std::max(updatedVar, varEps);
+							residualStd[j] = sqrtf(residualVarHist[j]);
+							prevPrevResidualW[j] =
+							    (residualStd[j] > sigmaEps) ? (prevPrevResidualMeanHist[j] / residualStd[j]) : 0.0f;
 							currentResidualW[j] = (residualStd[j] > sigmaEps) ? (residualMean[j] / residualStd[j]) : 0.0f;
-							feature[j] = (residualStd[j] > sigmaEps) ? (aster.prevResidualMean[j] / residualStd[j]) : 0.0f;
+							feature[j] = prevPrevResidualW[j];
+							feature[obsDim + j] =
+							    (residualStd[j] > sigmaEps) ? (prevResidualMeanHist[j] / residualStd[j]) : 0.0f;
 						}
 						for (unsigned int i = 0; i < controlDim; ++i)
 						{
 							const float secondMoment = controlMean[i] * controlMean[i];
 							const float updatedVar =
-							    (betaAster * aster.controlVar[i]) + ((1.0f - betaAster) * std::max(secondMoment, varEps));
-							aster.controlVar[i] = std::max(updatedVar, varEps);
-							controlStd[i] = sqrtf(aster.controlVar[i]);
+							    (betaAster * controlVarHist[i]) + ((1.0f - betaAster) * std::max(secondMoment, varEps));
+							controlVarHist[i] = std::max(updatedVar, varEps);
+							controlStd[i] = sqrtf(controlVarHist[i]);
+							prevPrevControlW[i] =
+							    (controlStd[i] > sigmaEps) ? (prevPrevControlMeanHist[i] / controlStd[i]) : 0.0f;
 							prevControlW[i] =
-							    (controlStd[i] > sigmaEps) ? (aster.prevControlMean[i] / controlStd[i]) : 0.0f;
+							    (controlStd[i] > sigmaEps) ? (prevControlMeanHist[i] / controlStd[i]) : 0.0f;
 							currentControlW[i] =
 							    (controlStd[i] > sigmaEps) ? (controlMean[i] / controlStd[i]) : 0.0f;
-							feature[sketchDim + i] = prevControlW[i];
-							feature[sketchDim + controlDim + i] = currentControlW[i];
+							feature[(2u * obsDim) + i] = prevPrevControlW[i];
+							feature[(2u * obsDim) + controlDim + i] = prevControlW[i];
+							feature[(2u * obsDim) + (2u * controlDim) + i] = currentControlW[i];
 						}
 
 						for (unsigned int r = 0; r < featureDim; ++r)
@@ -1239,23 +2504,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							for (unsigned int c = 0; c < featureDim; ++c)
 							{
 								const float sample = feature[r] * feature[c];
-								aster.pastCov[rowOff + c] =
-								    (betaAster * aster.pastCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+								pastCovHist[rowOff + c] =
+								    (betaAster * pastCovHist[rowOff + c]) + ((1.0f - betaAster) * sample);
 							}
 						}
-						for (unsigned int j = 0; j < sketchDim; ++j)
+						for (unsigned int j = 0; j < obsDim; ++j)
 						{
 							const size_t rowOff = static_cast<size_t>(j) * static_cast<size_t>(featureDim);
 							for (unsigned int c = 0; c < featureDim; ++c)
 							{
 								const float sample = currentResidualW[j] * feature[c];
-								aster.crossCov[rowOff + c] =
-								    (betaAster * aster.crossCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+								crossCovHist[rowOff + c] =
+								    (betaAster * crossCovHist[rowOff + c]) + ((1.0f - betaAster) * sample);
 							}
 						}
-						if (invert_small_dense_row_major(aster.pastCov, featureDim, ridge, invPastCov))
+						if (invert_small_dense_row_major(pastCovHist, featureDim, ridge, invPastCov))
 						{
-							for (unsigned int j = 0; j < sketchDim; ++j)
+							for (unsigned int j = 0; j < obsDim; ++j)
 							{
 								const size_t rowOff = static_cast<size_t>(j) * static_cast<size_t>(featureDim);
 								for (unsigned int c = 0; c < featureDim; ++c)
@@ -1263,7 +2528,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 									double accum = 0.0;
 									for (unsigned int k = 0; k < featureDim; ++k)
 									{
-										accum += static_cast<double>(aster.crossCov[rowOff + k])
+										accum += static_cast<double>(crossCovHist[rowOff + k])
 										      * static_cast<double>(invPastCov[static_cast<size_t>(k) * static_cast<size_t>(featureDim) + c]);
 									}
 									theta[rowOff + c] = static_cast<float>(accum);
@@ -1271,57 +2536,65 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							}
 						}
 
-						aster.theta = theta;
-						extract_top_singular_modes_row_major(theta, sketchDim, featureDim, stateRank,
+						thetaHist = theta;
+						extract_top_singular_modes_row_major(theta, obsDim, featureDim, stateRank,
 						                                     nextSigma, nextLeft, nextRight);
 
 						for (unsigned int m = 0; m < stateRank; ++m)
 						{
 							bool aligned = false;
-							if ((m < aster.latent.size())
-							    && (aster.leftMode.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(sketchDim))
-							    && (nextLeft.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(sketchDim)))
+							if ((m < latentHist.size())
+							    && (leftModeHist.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(obsDim))
+							    && (nextLeft.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(obsDim)))
 							{
 								double accum = 0.0;
-								const size_t nextLeftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
-								for (unsigned int pm = 0; pm < stateRank && pm < aster.latent.size(); ++pm)
+								const size_t nextLeftOff = static_cast<size_t>(m) * static_cast<size_t>(obsDim);
+								for (unsigned int pm = 0; pm < stateRank && pm < latentHist.size(); ++pm)
 								{
-									const size_t prevLeftOff = static_cast<size_t>(pm) * static_cast<size_t>(sketchDim);
+									const size_t prevLeftOff = static_cast<size_t>(pm) * static_cast<size_t>(obsDim);
 									double corr = 0.0;
-									for (unsigned int j = 0; j < sketchDim; ++j)
+									for (unsigned int j = 0; j < obsDim; ++j)
 									{
 										corr += static_cast<double>(nextLeft[nextLeftOff + j])
-										      * static_cast<double>(aster.leftMode[prevLeftOff + j]);
+										      * static_cast<double>(leftModeHist[prevLeftOff + j]);
 									}
-									accum += corr * static_cast<double>(aster.latent[pm]);
+									accum += corr * static_cast<double>(latentHist[pm]);
 								}
 								prevLatentAligned[m] = static_cast<float>(accum);
 								aligned = true;
 							}
-							if (!aligned && m < aster.latent.size())
-								prevLatentAligned[m] = aster.latent[m];
+							if (!aligned && m < latentHist.size())
+								prevLatentAligned[m] = latentHist[m];
 						}
 
 						for (unsigned int m = 0; m < stateRank; ++m)
-							stateFeature[m] = prevLatentAligned[m];
+						{
+							if (m < prevPrevLatentHist.size())
+								prevPrevLatent[m] = prevPrevLatentHist[m];
+						}
+						for (unsigned int m = 0; m < stateRank; ++m)
+							stateFeature[m] = prevPrevLatent[m];
+						for (unsigned int m = 0; m < stateRank; ++m)
+							stateFeature[stateRank + m] = prevLatentAligned[m];
 						for (unsigned int i = 0; i < controlDim; ++i)
 						{
-							stateFeature[stateRank + i] = prevControlW[i];
-							stateFeature[stateRank + controlDim + i] = currentControlW[i];
+							stateFeature[(2u * stateRank) + i] = prevPrevControlW[i];
+							stateFeature[(2u * stateRank) + controlDim + i] = prevControlW[i];
+							stateFeature[(2u * stateRank) + (2u * controlDim) + i] = currentControlW[i];
 						}
 
 						for (unsigned int m = 0; m < stateRank; ++m)
 						{
-							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
-							for (unsigned int j = 0; j < sketchDim && (leftOff + j) < nextLeft.size(); ++j)
+							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(obsDim);
+							for (unsigned int j = 0; j < obsDim && (leftOff + j) < nextLeft.size(); ++j)
 								observedLatent[m] += nextLeft[leftOff + j] * currentResidualW[j];
 						}
-						const double asterTransferFitNs =
+						const double regimeTransferFitNs =
 						    monotonic_elapsed_ns(asterTransferFitStart, monotonic_now());
 
 						const timespec asterStateFitStart = monotonic_now();
-						if (aster.statePastCov.size() >= static_cast<size_t>(stateFeatureDim) * static_cast<size_t>(stateFeatureDim)
-						    && aster.stateCrossCov.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(stateFeatureDim))
+						if (statePastCovHist.size() >= static_cast<size_t>(stateFeatureDim) * static_cast<size_t>(stateFeatureDim)
+						    && stateCrossCovHist.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(stateFeatureDim))
 						{
 							for (unsigned int r = 0; r < stateFeatureDim; ++r)
 							{
@@ -1329,8 +2602,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 								for (unsigned int c = 0; c < stateFeatureDim; ++c)
 								{
 									const float sample = stateFeature[r] * stateFeature[c];
-									aster.statePastCov[rowOff + c] =
-									    (betaAster * aster.statePastCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+									statePastCovHist[rowOff + c] =
+									    (betaAster * statePastCovHist[rowOff + c]) + ((1.0f - betaAster) * sample);
 								}
 							}
 							for (unsigned int m = 0; m < stateRank; ++m)
@@ -1339,11 +2612,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 								for (unsigned int c = 0; c < stateFeatureDim; ++c)
 								{
 									const float sample = observedLatent[m] * stateFeature[c];
-									aster.stateCrossCov[rowOff + c] =
-									    (betaAster * aster.stateCrossCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+									stateCrossCovHist[rowOff + c] =
+									    (betaAster * stateCrossCovHist[rowOff + c]) + ((1.0f - betaAster) * sample);
 								}
 							}
-							if (invert_small_dense_row_major(aster.statePastCov, stateFeatureDim, ridge, invStatePastCov))
+							if (invert_small_dense_row_major(statePastCovHist, stateFeatureDim, ridge, invStatePastCov))
 							{
 								for (unsigned int m = 0; m < stateRank; ++m)
 								{
@@ -1353,7 +2626,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 										double accum = 0.0;
 										for (unsigned int k = 0; k < stateFeatureDim; ++k)
 										{
-											accum += static_cast<double>(aster.stateCrossCov[rowOff + k])
+											accum += static_cast<double>(stateCrossCovHist[rowOff + k])
 											      * static_cast<double>(invStatePastCov[static_cast<size_t>(k) * static_cast<size_t>(stateFeatureDim) + c]);
 										}
 										stateModel[rowOff + c] = static_cast<float>(accum);
@@ -1387,24 +2660,27 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
 							double accum = 0.0;
 							for (unsigned int s = 0; s < stateRank; ++s)
-								accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(prevLatentAligned[s]);
+								accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(prevPrevLatent[s]);
+							for (unsigned int s = 0; s < stateRank; ++s)
+								accum += static_cast<double>(stateModel[rowOff + stateRank + s]) * static_cast<double>(prevLatentAligned[s]);
 							for (unsigned int i = 0; i < controlDim; ++i)
 							{
-								accum += static_cast<double>(stateModel[rowOff + stateRank + i]) * static_cast<double>(prevControlW[i]);
-								accum += static_cast<double>(stateModel[rowOff + stateRank + controlDim + i]) * static_cast<double>(currentControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + (2u * stateRank) + i]) * static_cast<double>(prevPrevControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + (2u * stateRank) + controlDim + i]) * static_cast<double>(prevControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + (2u * stateRank) + (2u * controlDim) + i]) * static_cast<double>(currentControlW[i]);
 							}
 							predictedState[m] = static_cast<float>(accum);
 						}
 						for (unsigned int m = 0; m < stateRank; ++m)
 						{
-							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
-							for (unsigned int j = 0; j < sketchDim && (leftOff + j) < nextLeft.size(); ++j)
+							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(obsDim);
+							for (unsigned int j = 0; j < obsDim && (leftOff + j) < nextLeft.size(); ++j)
 								predictedResidualCurrentW[j] += nextLeft[leftOff + j] * predictedState[m];
 						}
 
 						double targetNormSq = 0.0;
 						double errNormSq = 0.0;
-						for (unsigned int j = 0; j < sketchDim; ++j)
+						for (unsigned int j = 0; j < obsDim; ++j)
 						{
 							const double target = static_cast<double>(currentResidualW[j]);
 							const double err = target - static_cast<double>(predictedResidualCurrentW[j]);
@@ -1415,47 +2691,47 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						float asterPredR2 = 0.0f;
 						if (targetNormSq > 1e-12)
 							asterPredR2 = static_cast<float>(std::max<double>(0.0, 1.0 - (errNormSq / targetNormSq)));
-						const double asterStateFitNs =
+						const double regimeStateFitNs =
 						    monotonic_elapsed_ns(asterStateFitStart, monotonic_now());
 
 						for (unsigned int m = 0; m < stateRank; ++m)
 							stateCorrection[m] = observedLatent[m] - predictedState[m];
 						const timespec asterInnovationFitStart = monotonic_now();
-						if (aster.innovationCov.size() >= static_cast<size_t>(sketchDim) * static_cast<size_t>(sketchDim)
-						    && aster.innovationCross.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(sketchDim))
+						if (innovationCovHist.size() >= static_cast<size_t>(obsDim) * static_cast<size_t>(obsDim)
+						    && innovationCrossHist.size() >= static_cast<size_t>(stateRank) * static_cast<size_t>(obsDim))
 						{
-							for (unsigned int r = 0; r < sketchDim; ++r)
+							for (unsigned int r = 0; r < obsDim; ++r)
 							{
-								const size_t rowOff = static_cast<size_t>(r) * static_cast<size_t>(sketchDim);
-								for (unsigned int c = 0; c < sketchDim; ++c)
+								const size_t rowOff = static_cast<size_t>(r) * static_cast<size_t>(obsDim);
+								for (unsigned int c = 0; c < obsDim; ++c)
 								{
 									const float sample = innovation[r] * innovation[c];
-									aster.innovationCov[rowOff + c] =
-									    (betaAster * aster.innovationCov[rowOff + c]) + ((1.0f - betaAster) * sample);
+									innovationCovHist[rowOff + c] =
+									    (betaAster * innovationCovHist[rowOff + c]) + ((1.0f - betaAster) * sample);
 								}
 							}
 							for (unsigned int m = 0; m < stateRank; ++m)
 							{
-								const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
-								for (unsigned int j = 0; j < sketchDim; ++j)
+								const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(obsDim);
+								for (unsigned int j = 0; j < obsDim; ++j)
 								{
 									const float sample = stateCorrection[m] * innovation[j];
-									aster.innovationCross[rowOff + j] =
-									    (betaAster * aster.innovationCross[rowOff + j]) + ((1.0f - betaAster) * sample);
+									innovationCrossHist[rowOff + j] =
+									    (betaAster * innovationCrossHist[rowOff + j]) + ((1.0f - betaAster) * sample);
 								}
 							}
-							if (invert_small_dense_row_major(aster.innovationCov, sketchDim, ridge, invInnovationCov))
+							if (invert_small_dense_row_major(innovationCovHist, obsDim, ridge, invInnovationCov))
 							{
 								for (unsigned int m = 0; m < stateRank; ++m)
 								{
-									const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
-									for (unsigned int j = 0; j < sketchDim; ++j)
+									const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(obsDim);
+									for (unsigned int j = 0; j < obsDim; ++j)
 									{
 										double accum = 0.0;
-										for (unsigned int k = 0; k < sketchDim; ++k)
+										for (unsigned int k = 0; k < obsDim; ++k)
 										{
-											accum += static_cast<double>(aster.innovationCross[rowOff + k])
-											      * static_cast<double>(invInnovationCov[static_cast<size_t>(k) * static_cast<size_t>(sketchDim) + j]);
+											accum += static_cast<double>(innovationCrossHist[rowOff + k])
+											      * static_cast<double>(invInnovationCov[static_cast<size_t>(k) * static_cast<size_t>(obsDim) + j]);
 										}
 										innovationGain[rowOff + j] = static_cast<float>(accum);
 									}
@@ -1465,8 +2741,8 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						for (unsigned int m = 0; m < stateRank; ++m)
 						{
 							double accum = static_cast<double>(predictedState[m]);
-							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
-							for (unsigned int j = 0; j < sketchDim; ++j)
+							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(obsDim);
+							for (unsigned int j = 0; j < obsDim; ++j)
 								accum += static_cast<double>(innovationGain[rowOff + j]) * static_cast<double>(innovation[j]);
 							filteredState[m] = static_cast<float>(accum);
 						}
@@ -1475,21 +2751,24 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
 							double accum = 0.0;
 							for (unsigned int s = 0; s < stateRank; ++s)
-								accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(filteredState[s]);
+								accum += static_cast<double>(stateModel[rowOff + s]) * static_cast<double>(prevLatentAligned[s]);
+							for (unsigned int s = 0; s < stateRank; ++s)
+								accum += static_cast<double>(stateModel[rowOff + stateRank + s]) * static_cast<double>(filteredState[s]);
 							for (unsigned int i = 0; i < controlDim; ++i)
 							{
-								accum += static_cast<double>(stateModel[rowOff + stateRank + i]) * static_cast<double>(currentControlW[i]);
-								accum += static_cast<double>(stateModel[rowOff + stateRank + controlDim + i]) * static_cast<double>(currentControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + (2u * stateRank) + i]) * static_cast<double>(prevControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + (2u * stateRank) + controlDim + i]) * static_cast<double>(currentControlW[i]);
+								accum += static_cast<double>(stateModel[rowOff + (2u * stateRank) + (2u * controlDim) + i]) * static_cast<double>(currentControlW[i]);
 							}
 							nextState[m] = static_cast<float>(accum);
 						}
 						for (unsigned int m = 0; m < stateRank; ++m)
 						{
-							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(sketchDim);
-							for (unsigned int j = 0; j < sketchDim && (leftOff + j) < nextLeft.size(); ++j)
+							const size_t leftOff = static_cast<size_t>(m) * static_cast<size_t>(obsDim);
+							for (unsigned int j = 0; j < obsDim && (leftOff + j) < nextLeft.size(); ++j)
 								predictedResidualNextW[j] += nextLeft[leftOff + j] * nextState[m];
 						}
-						const double asterInnovationFitNs =
+						const double regimeInnovationFitNs =
 						    monotonic_elapsed_ns(asterInnovationFitStart, monotonic_now());
 
 						const timespec asterApplyStart = monotonic_now();
@@ -1497,15 +2776,983 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						float asterTransferScale = 0.0f;
 						if (asterEdge > ac.asterEdgeThreshold)
 							asterTransferScale = (asterEdge - ac.asterEdgeThreshold) / (asterEdge + 1e-6f);
+						const atlas::WeightState& headAtlas =
+						    tt.tieEmbeddings ? tt.atlasTokE : tt.atlasWOut;
+						const float predictiveEvidence =
+						    std::max(0.0f, headAtlas.lastSparrowEdge)
+						    * std::max(0.0f, headAtlas.lastSparrowHorizontalRatio);
+						float meritGeometryTrust = 0.0f;
+						if (headAtlas.activeRank > 0u
+						    && !headAtlas.fisherDiag.empty()
+						    && headAtlas.totalTrace > 1.0e-6f)
+						{
+							const unsigned int captureRank =
+							    std::min(headAtlas.activeRank,
+							             static_cast<unsigned int>(headAtlas.fisherDiag.size()));
+							double activeTrace = 0.0;
+							for (unsigned int c = 0u; c < captureRank; ++c)
+								activeTrace += static_cast<double>(headAtlas.fisherDiag[c]);
+							const float capture =
+							    static_cast<float>(activeTrace / (static_cast<double>(headAtlas.totalTrace) + 1.0e-6));
+							meritGeometryTrust =
+							    std::max(0.0f,
+							             std::min(1.0f, ac.meritGeometryScale * std::max(0.0f, capture)));
+						}
+						const float outputEvidenceRaw =
+						    std::max(0.0f, asterEdge) * std::max(0.0f, asterPredR2);
 						float asterMemoryGain = ac.asterMemoryScale
 						                      * std::max(0.0f, asterTransferScale)
 						                      * std::max(0.0f, asterPredR2);
 						if (!is_finite(asterMemoryGain))
 							asterMemoryGain = 0.0f;
+						float aegisLambdaSpatial = 0.0f;
+						float aegisLambdaPredictive = 0.0f;
+						float aegisLambdaOutput = 0.0f;
+						float aegisPredictivePredicted = 0.0f;
+						float aegisPredictiveRealized = predictiveEvidence;
+						float aegisOutputPredicted = 0.0f;
+						float aegisOutputRealized = outputEvidenceRaw;
+						float citadelAnchor = 0.0f;
+						float citadelSparrowTrust = 1.0f;
+						float rampartTau = 0.0f;
+						float rampartBudget = 0.0f;
+						float rampartCovariance = 0.0f;
+						float rampartSparrowTrust = 1.0f;
+						float meritTau = 0.0f;
+						float meritBudget = 0.0f;
+						float meritCovariance = 0.0f;
+						float meritSparrowTrust = 1.0f;
+						float strataNullMode = 1.0f;
+						float strataPredictiveMode = 0.0f;
+						float strataOutputMode = 0.0f;
+						float strataCoupledMode = 0.0f;
+						float strataBudget = 0.0f;
+						float strataNullBenefit = 0.0f;
+						float strataPredictiveBenefit = 0.0f;
+						float strataOutputBenefit = 0.0f;
+						float strataCoupledBenefit = 0.0f;
+						float strataSelectedExcess = 0.0f;
+						float strataSwitchRate = 0.0f;
+						float auroraPatternSignal = 0.0f;
+						float auroraKappaSignal = 0.0f;
+						float auroraRepeatSignal = 0.0f;
+						float auroraRepeatConfusion = 0.0f;
+						float auroraRecallPressure = 0.0f;
+						float auroraObservationStrength = 0.0f;
+						{
+							const unsigned int patternObs = std::min<unsigned int>(4u, tokenCondDim);
+							double patternAccum = 0.0;
+							unsigned int patternCount = 0u;
+							for (unsigned int l = 0; l < trackedLayers; ++l)
+							{
+								const size_t patternLayerOff = static_cast<size_t>(l) * static_cast<size_t>(tokenCondDim);
+								for (unsigned int i = 0; i < patternObs; ++i)
+								{
+									patternAccum += fabs(static_cast<double>(layerPatternMean[patternLayerOff + i]));
+									patternCount += 1u;
+								}
+							}
+							if (patternCount > 0u)
+							{
+								const float meanAbsPattern =
+								    static_cast<float>(patternAccum / static_cast<double>(patternCount));
+								auroraPatternSignal =
+								    std::max(0.0f, std::min(1.0f, meanAbsPattern / (1.0f + meanAbsPattern)));
+							}
+							if (kappaObsDim > 0u)
+							{
+								double kappaAccum = 0.0;
+								unsigned int kappaCount = 0u;
+								for (unsigned int l = 0; l < trackedLayers; ++l)
+								{
+									const size_t kappaLayerOff = static_cast<size_t>(l) * static_cast<size_t>(kappaObsDim);
+									for (unsigned int i = 0; i < kappaObsDim; ++i)
+									{
+										kappaAccum += fabs(static_cast<double>(layerKappaMean[kappaLayerOff + i]));
+										kappaCount += 1u;
+									}
+								}
+								if (kappaCount > 0u)
+								{
+									const float meanAbsKappa =
+									    static_cast<float>(kappaAccum / static_cast<double>(kappaCount));
+									auroraKappaSignal =
+									    std::max(0.0f, std::min(1.0f, meanAbsKappa / (1.0f + meanAbsKappa)));
+								}
+							}
+							if (tokenCondDim > 4u)
+							{
+								double targetRepeatHitAccum = 0.0;
+								double targetRepeatCloseAccum = 0.0;
+								double hardNegRepeatHitAccum = 0.0;
+								double hardNegRepeatCloseAccum = 0.0;
+								unsigned int repeatCount = 0u;
+								for (unsigned int l = 0; l < trackedLayers; ++l)
+								{
+									const size_t patternLayerOff = static_cast<size_t>(l) * static_cast<size_t>(tokenCondDim);
+									if ((patternLayerOff + 7u) >= layerPatternMean.size())
+										break;
+									targetRepeatHitAccum += layerPatternMean[patternLayerOff + 4u];
+									targetRepeatCloseAccum += layerPatternMean[patternLayerOff + 5u];
+									hardNegRepeatHitAccum += layerPatternMean[patternLayerOff + 6u];
+									hardNegRepeatCloseAccum += layerPatternMean[patternLayerOff + 7u];
+									repeatCount += 1u;
+								}
+								if (repeatCount > 0u)
+								{
+									const float invRepeatCount = 1.0f / static_cast<float>(repeatCount);
+									const float targetRepeatHitMean =
+									    static_cast<float>(targetRepeatHitAccum) * invRepeatCount;
+									const float targetRepeatCloseMean =
+									    static_cast<float>(targetRepeatCloseAccum) * invRepeatCount;
+									const float hardNegRepeatHitMean =
+									    static_cast<float>(hardNegRepeatHitAccum) * invRepeatCount;
+									const float hardNegRepeatCloseMean =
+									    static_cast<float>(hardNegRepeatCloseAccum) * invRepeatCount;
+									const float targetRepeatSupport =
+									    std::max(0.0f,
+									             std::min(1.0f,
+									                      0.45f * targetRepeatHitMean
+									                          + 0.55f * targetRepeatCloseMean));
+									const float hardNegRepeatSupport =
+									    std::max(0.0f,
+									             std::min(1.0f,
+									                      0.35f * hardNegRepeatHitMean
+									                          + 0.65f * hardNegRepeatCloseMean));
+									auroraRepeatSignal = targetRepeatSupport;
+									auroraRepeatConfusion =
+									    std::max(0.0f,
+									             std::min(1.0f,
+									                      hardNegRepeatSupport
+									                          - 0.50f * targetRepeatSupport));
+								}
+							}
+							const float marginShortfallNorm =
+							    std::max(0.0f, std::min(1.0f, marginShortfallMean / (1.0f + marginShortfallMean)));
+							const float negativePressureNorm =
+							    std::max(0.0f, std::min(1.0f, negativePressureMean / (1.0f + negativePressureMean)));
+							const float hardShortfallNorm =
+							    std::max(0.0f, std::min(1.0f, hardMarginShortfallMean / (1.0f + hardMarginShortfallMean)));
+							auroraRecallPressure =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      0.28f * marginShortfallNorm
+							                          + 0.16f * negativePressureNorm
+							                          + 0.16f * hardShortfallNorm
+							                          + 0.18f * baselineWorseRate
+							                          + 0.14f * auroraRepeatSignal
+							                          + 0.08f * auroraRepeatConfusion));
+							auroraObservationStrength =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      0.35f * auroraPatternSignal
+							                          + 0.15f * auroraKappaSignal
+							                          + 0.25f * auroraRecallPressure
+							                          + 0.15f * auroraRepeatSignal
+							                          + 0.10f * auroraRepeatConfusion));
+						}
+						if (ac.aegisEnabled || ac.auroraEnabled || ac.seamEnabled || ac.quasarEnabled)
+						{
+							const float aegisCalibBeta = 0.90f;
+							const float aegisPrecisionFloor = 0.025f;
+							const float aegisPrecisionMax = 32.0f;
+							const float citadelTrustBeta = 0.90f;
+							const float strataBenefitBeta = 0.90f;
+							aegisPredictivePredicted = std::max(0.0f, aster.aegisPrevPredictiveScore);
+							aegisOutputPredicted = std::max(0.0f, aster.aegisPrevOutputScore);
+							if (aster.timingBoundaryCount > 0ULL)
+							{
+								const float predictiveErr =
+								    fabsf(aegisPredictivePredicted - aegisPredictiveRealized);
+								const float outputErr =
+								    fabsf(aegisOutputPredicted - aegisOutputRealized);
+								aster.aegisPredictiveErrorEma =
+								    aegisCalibBeta * aster.aegisPredictiveErrorEma
+								    + (1.0f - aegisCalibBeta) * predictiveErr;
+								aster.aegisOutputErrorEma =
+								    aegisCalibBeta * aster.aegisOutputErrorEma
+								    + (1.0f - aegisCalibBeta) * outputErr;
+							}
+							const float rawPredictiveTrust =
+							    std::min(aegisPrecisionMax,
+							             ac.aegisPredictiveScale * predictiveEvidence
+							                 / (aster.aegisPredictiveErrorEma + aegisPrecisionFloor));
+							const float rawOutputTrust =
+							    std::min(aegisPrecisionMax,
+							             ac.aegisOutputScale * outputEvidenceRaw
+							                 / (aster.aegisOutputErrorEma + aegisPrecisionFloor));
+							if (aster.timingBoundaryCount > 0ULL)
+							{
+								aster.citadelPredictiveTrustEma =
+								    citadelTrustBeta * aster.citadelPredictiveTrustEma
+								    + (1.0f - citadelTrustBeta) * rawPredictiveTrust;
+								aster.citadelOutputTrustEma =
+								    citadelTrustBeta * aster.citadelOutputTrustEma
+								    + (1.0f - citadelTrustBeta) * rawOutputTrust;
+							}
+							else
+							{
+								aster.citadelPredictiveTrustEma = rawPredictiveTrust;
+								aster.citadelOutputTrustEma = rawOutputTrust;
+							}
+							const float disagreementNorm =
+							    fabsf(aegisPredictiveRealized - aegisOutputRealized)
+							    / (fabsf(aegisPredictiveRealized) + fabsf(aegisOutputRealized) + 1e-6f);
+							float residualScale = 1.0f;
+							float spatialPrecision = 1.0f;
+							if (ac.auroraEnabled)
+							{
+								const float predictiveBoost =
+								    1.0f + 0.30f * auroraPatternSignal + 0.15f * auroraObservationStrength;
+								const float outputBoost =
+								    1.0f + 0.55f * auroraObservationStrength
+								    + 0.25f * auroraRecallPressure + 0.10f * auroraKappaSignal;
+								const float adjustedPredictiveTrust =
+								    std::max(0.0f, rawPredictiveTrust * predictiveBoost);
+								const float adjustedOutputTrust =
+								    std::max(0.0f,
+								             rawOutputTrust * outputBoost
+								                 + 0.50f * auroraObservationStrength
+								                 + 0.25f * auroraRecallPressure);
+								const float predictiveTrustNorm =
+								    adjustedPredictiveTrust / (adjustedPredictiveTrust + 1.0f);
+								const float outputTrustNorm =
+								    adjustedOutputTrust / (adjustedOutputTrust + 1.0f);
+								const float predictiveErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisPredictiveErrorEma
+								                          / (aegisPredictivePredicted
+								                             + aegisPredictiveRealized + 1.0e-6f)));
+								const float outputErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisOutputErrorEma
+								                          / (aegisOutputPredicted
+								                             + aegisOutputRealized + 1.0e-6f)));
+								const float uncertainty = 0.5f * (predictiveErrNorm + outputErrNorm);
+								const float contextPenalty =
+								    batchHardRegimeMass
+								    * std::max(0.0f,
+								               1.0f - outputTrustNorm
+								                         * (0.50f + 0.50f * auroraObservationStrength));
+								const float horizonPred =
+								    ac.auroraHorizonBlend * aster.citadelPredictiveTrustEma
+								    + (1.0f - ac.auroraHorizonBlend) * adjustedPredictiveTrust;
+								const float horizonOut =
+								    ac.auroraHorizonBlend * aster.citadelOutputTrustEma
+								    + (1.0f - ac.auroraHorizonBlend) * adjustedOutputTrust;
+								const float horizonPredNorm = horizonPred / (horizonPred + 1.0f);
+								const float horizonOutNorm = horizonOut / (horizonOut + 1.0f);
+								rampartTau =
+								    0.35f + 1.65f
+								                * std::max(0.0f,
+								                           std::min(1.0f,
+								                                    0.45f * uncertainty
+								                                        + 0.25f * disagreementNorm
+								                                        + 0.20f * contextPenalty
+								                                        - 0.10f * auroraObservationStrength));
+								rampartCovariance =
+								    std::max(0.0f,
+								             std::min(0.95f,
+								                      0.45f * std::min(horizonPredNorm, horizonOutNorm)
+								                          * std::max(0.0f, 1.0f - disagreementNorm)
+								                          * std::max(0.0f, 1.0f - 0.5f * uncertainty)
+								                          * (0.80f + 0.20f * auroraObservationStrength)
+								                          * std::max(0.0f, 1.0f - contextPenalty)));
+								const float coupling =
+								    rampartCovariance * sqrtf(std::max(0.0f, horizonPred * horizonOut));
+								const float h11 = std::max(1.0e-6f, rampartTau + horizonPred);
+								const float h22 = std::max(1.0e-6f, rampartTau + horizonOut);
+								const float det = std::max(1.0e-6f, h11 * h22 - coupling * coupling);
+								float wPredictive =
+								    (horizonPred * horizonPredNorm * h22
+								     - coupling * horizonOut * horizonOutNorm)
+								    / det;
+								float wOutput =
+								    (h11 * horizonOut * horizonOutNorm
+								     - coupling * horizonPred * horizonPredNorm)
+								    / det;
+								wPredictive = std::max(0.0f, wPredictive);
+								wOutput = std::max(0.0f, wOutput);
+								const float weightSum = wPredictive + wOutput + 1.0e-6f;
+								wPredictive /= weightSum;
+								wOutput /= weightSum;
+								const float budgetSignal =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      0.55f * (0.5f * (horizonPredNorm + horizonOutNorm))
+								                          + 0.15f * auroraObservationStrength
+								                          + 0.10f * auroraRecallPressure
+								                          + 0.20f * std::max(0.0f, 1.0f - uncertainty)
+								                          - 0.15f * disagreementNorm
+								                          - 0.25f * contextPenalty));
+								const float budgetTarget =
+								    std::max(0.0f,
+								             std::min(1.0f, ac.auroraBudgetMax * budgetSignal));
+								rampartBudget =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (citadelTrustBeta * aster.rampartLastBudget
+								           + (1.0f - citadelTrustBeta) * budgetTarget)
+								        : budgetTarget;
+								const float residualNorm =
+								    sqrtf(std::max(0.0f,
+								                   wPredictive * wPredictive + wOutput * wOutput
+								                       + 2.0f * rampartCovariance * wPredictive * wOutput));
+								const float budgetScale =
+								    (residualNorm > 1.0e-6f)
+								        ? std::max(0.0f, std::min(1.0f, rampartBudget / residualNorm))
+								        : 0.0f;
+								aegisLambdaPredictive =
+								    std::max(0.0f, std::min(1.0f, wPredictive * budgetScale));
+								aegisLambdaOutput =
+								    std::max(0.0f, std::min(1.0f, wOutput * budgetScale));
+								aegisLambdaSpatial =
+								    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+								rampartSparrowTrust = aegisLambdaPredictive;
+								const float headPriority =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      0.30f * horizonOutNorm
+								                          + 0.25f * auroraObservationStrength
+								                          + 0.20f * auroraRecallPressure
+								                          + 0.15f * contextPenalty
+								                          + 0.10f * std::max(0.0f, 1.0f - disagreementNorm)));
+								const float headGain =
+								    1.0f + std::max(0.0f, ac.auroraHeadGain - 1.0f) * headPriority;
+								asterMemoryGain *=
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aegisLambdaOutput
+								                          * (0.85f + 0.30f * auroraObservationStrength)))
+								    * headGain;
+							}
+							else if (ac.seamEnabled)
+							{
+								const float predictiveTrustNorm =
+								    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+								const float outputTrustNorm =
+								    rawOutputTrust / (rawOutputTrust + 1.0f);
+								const float predictiveErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisPredictiveErrorEma
+								                          / (aegisPredictivePredicted
+								                             + aegisPredictiveRealized + 1.0e-6f)));
+								const float outputErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisOutputErrorEma
+								                          / (aegisOutputPredicted
+								                             + aegisOutputRealized + 1.0e-6f)));
+								const float uncertainty = 0.5f * (predictiveErrNorm + outputErrNorm);
+								const float contextPenalty =
+								    batchHardRegimeMass * std::max(0.0f, 1.0f - outputTrustNorm);
+								const float spatialTarget =
+								    meritGeometryTrust - 0.35f * (predictiveTrustNorm + outputTrustNorm)
+								    + 0.10f * std::max(0.0f, contextPenalty - predictiveTrustNorm);
+								const float predictiveTarget =
+								    predictiveTrustNorm * std::max(0.0f, 1.0f - predictiveErrNorm)
+								    - 0.20f * disagreementNorm - 0.20f * contextPenalty;
+								const float outputTarget =
+								    outputTrustNorm * std::max(0.0f, 1.0f - outputErrNorm)
+								    + 0.10f * std::max(0.0f, 1.0f - meritGeometryTrust)
+								    - 0.15f * disagreementNorm - 0.15f * contextPenalty;
+								if (aster.timingBoundaryCount > 0ULL)
+								{
+									aster.strataNullBenefitEma =
+									    0.85f * aster.strataNullBenefitEma
+									    + ac.seamMirrorStep * spatialTarget;
+									aster.strataPredictiveBenefitEma =
+									    0.85f * aster.strataPredictiveBenefitEma
+									    + ac.seamMirrorStep * predictiveTarget;
+									aster.strataOutputBenefitEma =
+									    0.85f * aster.strataOutputBenefitEma
+									    + ac.seamMirrorStep * outputTarget;
+								}
+								else
+								{
+									aster.strataNullBenefitEma = ac.seamMirrorStep * spatialTarget;
+									aster.strataPredictiveBenefitEma = ac.seamMirrorStep * predictiveTarget;
+									aster.strataOutputBenefitEma = ac.seamMirrorStep * outputTarget;
+								}
+								const float maxLogit =
+								    std::max(aster.strataNullBenefitEma,
+								             std::max(aster.strataPredictiveBenefitEma,
+								                      aster.strataOutputBenefitEma));
+								const float expSpatial = expf(aster.strataNullBenefitEma - maxLogit);
+								const float expPredictive = expf(aster.strataPredictiveBenefitEma - maxLogit);
+								const float expOutput = expf(aster.strataOutputBenefitEma - maxLogit);
+								const float coordSum = expSpatial + expPredictive + expOutput + 1.0e-6f;
+								const float wSpatial = expSpatial / coordSum;
+								const float wPredictive = expPredictive / coordSum;
+								const float wOutput = expOutput / coordSum;
+								const float residualMass =
+								    std::max(0.0f, std::min(1.0f, 1.0f - wSpatial));
+								meritBudget =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      ac.seamBudgetMax * residualMass
+								                          * std::max(0.0f,
+								                                     1.0f - 0.5f * uncertainty
+								                                         - 0.20f * disagreementNorm
+								                                         - 0.20f * contextPenalty)));
+								const float residualShare = wPredictive + wOutput + 1.0e-6f;
+								aegisLambdaPredictive =
+								    std::max(0.0f, std::min(1.0f, meritBudget * (wPredictive / residualShare)));
+								aegisLambdaOutput =
+								    std::max(0.0f, std::min(1.0f, meritBudget * (wOutput / residualShare)));
+								aegisLambdaSpatial =
+								    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+								meritSparrowTrust = aegisLambdaPredictive;
+								asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+							}
+							else if (ac.quasarEnabled)
+							{
+								const float predictiveTrustNorm =
+								    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+								const float outputTrustNorm =
+								    rawOutputTrust / (rawOutputTrust + 1.0f);
+								const float predictiveErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisPredictiveErrorEma
+								                          / (aegisPredictivePredicted
+								                             + aegisPredictiveRealized + 1.0e-6f)));
+								const float outputErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisOutputErrorEma
+								                          / (aegisOutputPredicted
+								                             + aegisOutputRealized + 1.0e-6f)));
+								const float uncertainty = 0.5f * (predictiveErrNorm + outputErrNorm);
+								const float contextPenalty =
+								    batchHardRegimeMass * std::max(0.0f, 1.0f - outputTrustNorm);
+								const float residualPressure =
+								    std::max(predictiveTrustNorm, outputTrustNorm);
+								const float nullSignal =
+								    0.20f + 0.45f * uncertainty + 0.30f * disagreementNorm
+								    + 0.55f * contextPenalty - 0.25f * residualPressure;
+								const float predictiveSignal =
+								    predictiveTrustNorm * std::max(0.0f, 1.0f - predictiveErrNorm)
+								    + 0.20f * meritGeometryTrust
+								    - 0.10f * uncertainty - 0.15f * disagreementNorm
+								    - 0.20f * contextPenalty;
+								const float outputSignal =
+								    outputTrustNorm * std::max(0.0f, 1.0f - outputErrNorm)
+								    + 0.10f * std::max(0.0f, 1.0f - meritGeometryTrust)
+								    - 0.10f * uncertainty - 0.10f * disagreementNorm
+								    - 0.15f * contextPenalty;
+								const float coupledSignal =
+								    0.45f * (predictiveTrustNorm + outputTrustNorm)
+								    + 0.30f * std::min(predictiveTrustNorm, outputTrustNorm)
+								    + 0.15f * meritGeometryTrust
+								    - 0.15f * uncertainty - 0.25f * disagreementNorm
+								    - 0.30f * contextPenalty;
+								if (aster.timingBoundaryCount > 0ULL)
+								{
+									aster.strataNullBenefitEma =
+									    strataBenefitBeta * aster.strataNullBenefitEma
+									    + (1.0f - strataBenefitBeta) * nullSignal;
+									aster.strataPredictiveBenefitEma =
+									    strataBenefitBeta * aster.strataPredictiveBenefitEma
+									    + (1.0f - strataBenefitBeta) * predictiveSignal;
+									aster.strataOutputBenefitEma =
+									    strataBenefitBeta * aster.strataOutputBenefitEma
+									    + (1.0f - strataBenefitBeta) * outputSignal;
+									aster.strataCoupledBenefitEma =
+									    strataBenefitBeta * aster.strataCoupledBenefitEma
+									    + (1.0f - strataBenefitBeta) * coupledSignal;
+								}
+								else
+								{
+									aster.strataNullBenefitEma = nullSignal;
+									aster.strataPredictiveBenefitEma = predictiveSignal;
+									aster.strataOutputBenefitEma = outputSignal;
+									aster.strataCoupledBenefitEma = coupledSignal;
+								}
+								const float temperature = std::max(0.05f, ac.quasarTemperature);
+								const float maxScore =
+								    std::max(std::max(aster.strataNullBenefitEma, aster.strataPredictiveBenefitEma),
+								             std::max(aster.strataOutputBenefitEma, aster.strataCoupledBenefitEma));
+								const float qNull = expf((aster.strataNullBenefitEma - maxScore) / temperature);
+								const float qPredictive = expf((aster.strataPredictiveBenefitEma - maxScore) / temperature);
+								const float qOutput = expf((aster.strataOutputBenefitEma - maxScore) / temperature);
+								const float qCoupled = expf((aster.strataCoupledBenefitEma - maxScore) / temperature);
+								const float probSum = qNull + qPredictive + qOutput + qCoupled + 1.0e-6f;
+								strataNullMode = qNull / probSum;
+								strataPredictiveMode = qPredictive / probSum;
+								strataOutputMode = qOutput / probSum;
+								strataCoupledMode = qCoupled / probSum;
+								strataBudget =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      ac.quasarBudgetMax
+								                          * std::max(0.0f, 1.0f - strataNullMode)
+								                          * std::max(0.0f,
+								                                     1.0f - 0.5f * uncertainty
+								                                         - 0.15f * disagreementNorm
+								                                         - 0.25f * contextPenalty)));
+								aegisLambdaPredictive =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      strataBudget
+								                          * (strataPredictiveMode + 0.5f * strataCoupledMode)));
+								aegisLambdaOutput =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      strataBudget
+								                          * (strataOutputMode + 0.5f * strataCoupledMode)));
+								aegisLambdaSpatial =
+								    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+								asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+								strataSelectedExcess = 1.0f - strataNullMode;
+							}
+							else if (ac.strataEnabled)
+							{
+								const float predictiveTrustNorm =
+								    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+								const float outputTrustNorm =
+								    rawOutputTrust / (rawOutputTrust + 1.0f);
+								const float predictiveErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisPredictiveErrorEma
+								                          / (aegisPredictivePredicted
+								                             + aegisPredictiveRealized + 1.0e-6f)));
+								const float outputErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisOutputErrorEma
+								                          / (aegisOutputPredicted
+								                             + aegisOutputRealized + 1.0e-6f)));
+								const float uncertainty =
+								    0.5f * (predictiveErrNorm + outputErrNorm);
+								const float contextPenalty =
+								    batchHardRegimeMass * std::max(0.0f, 1.0f - outputTrustNorm);
+								const float predictiveGeom =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      meritGeometryTrust
+								                          * std::max(0.0f, ac.strataPredictiveGeometryScale)));
+								const float coupledGeom =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      meritGeometryTrust
+								                          * std::max(0.0f, ac.strataCoupledGeometryScale)));
+								const float residualPressure =
+								    std::max(predictiveTrustNorm, outputTrustNorm);
+								const float nullSignal =
+								    std::max(0.0f,
+								             ac.strataNullBias
+								                 + 0.45f * uncertainty
+								                 + 0.30f * disagreementNorm
+								                 + 0.80f * contextPenalty
+								                 - 0.25f * residualPressure);
+								const float predictiveSignal =
+								    std::max(0.0f,
+								             predictiveTrustNorm * std::max(0.0f, 1.0f - predictiveErrNorm)
+								                 + 0.25f * predictiveGeom
+								                 - 0.10f * uncertainty
+								                 - 0.15f * disagreementNorm
+								                 - 0.20f * contextPenalty);
+								const float outputSignal =
+								    std::max(0.0f,
+								             outputTrustNorm * std::max(0.0f, 1.0f - outputErrNorm)
+								                 + 0.10f * std::max(0.0f, 1.0f - predictiveGeom)
+								                 - 0.10f * uncertainty
+								                 - 0.10f * disagreementNorm
+								                 - 0.15f * contextPenalty);
+								const float coupledSignal =
+								    std::max(0.0f,
+								             0.45f * (predictiveTrustNorm + outputTrustNorm)
+								                 + 0.30f * std::min(predictiveTrustNorm, outputTrustNorm)
+								                 + 0.20f * coupledGeom
+								                 - 0.12f * uncertainty
+								                 - 0.20f * disagreementNorm
+								                 - 0.35f * contextPenalty);
+								const float maxResidualSignal =
+								    std::max(predictiveSignal, std::max(outputSignal, coupledSignal));
+								const float realizedNullBenefit = nullSignal - maxResidualSignal;
+								const float realizedPredictiveBenefit = predictiveSignal - nullSignal;
+								const float realizedOutputBenefit = outputSignal - nullSignal;
+								const float realizedCoupledBenefit = coupledSignal - nullSignal;
+								const float priorNullBenefit = aster.strataNullBenefitEma;
+								const float priorPredictiveBenefit = aster.strataPredictiveBenefitEma;
+								const float priorOutputBenefit = aster.strataOutputBenefitEma;
+								const float priorCoupledBenefit = aster.strataCoupledBenefitEma;
+								int previousMode = 0;
+								float previousModeWeight = aster.strataLastNullMode;
+								if (aster.strataLastPredictiveMode > previousModeWeight)
+								{
+									previousMode = 1;
+									previousModeWeight = aster.strataLastPredictiveMode;
+								}
+								if (aster.strataLastOutputMode > previousModeWeight)
+								{
+									previousMode = 2;
+									previousModeWeight = aster.strataLastOutputMode;
+								}
+								if (aster.strataLastCoupledMode > previousModeWeight)
+									previousMode = 3;
+								float modeScores[4];
+								modeScores[0] =
+								    priorNullBenefit
+								    + 0.25f * realizedNullBenefit
+								    + 0.20f * ac.strataNullBias;
+								modeScores[1] =
+								    priorPredictiveBenefit
+								    + 0.25f * realizedPredictiveBenefit
+								    + 0.10f * predictiveGeom;
+								modeScores[2] =
+								    priorOutputBenefit
+								    + 0.25f * realizedOutputBenefit;
+								modeScores[3] =
+								    priorCoupledBenefit
+								    + 0.25f * realizedCoupledBenefit
+								    + 0.05f * coupledGeom;
+								for (int modeIndex = 0; modeIndex < 4; ++modeIndex)
+								{
+									if (modeIndex != previousMode)
+										modeScores[modeIndex] -= std::max(0.0f, ac.strataDwellPenalty);
+								}
+								int selectedMode = 0;
+								float selectedScore = modeScores[0];
+								for (int modeIndex = 1; modeIndex < 4; ++modeIndex)
+								{
+									if (modeScores[modeIndex] > selectedScore)
+									{
+										selectedMode = modeIndex;
+										selectedScore = modeScores[modeIndex];
+									}
+								}
+								strataSelectedExcess =
+								    (selectedMode == 1)
+								        ? realizedPredictiveBenefit
+								        : ((selectedMode == 2)
+								               ? realizedOutputBenefit
+								               : ((selectedMode == 3)
+								                      ? realizedCoupledBenefit
+								                      : realizedNullBenefit));
+								if (selectedMode != 0 && strataSelectedExcess <= 0.0f)
+								{
+									selectedMode = 0;
+									strataSelectedExcess = realizedNullBenefit;
+								}
+								const float budgetSignal =
+								    std::max(0.0f, std::min(1.0f, strataSelectedExcess));
+								const float budgetTarget =
+								    std::max(0.0f, std::min(1.0f, ac.strataBudgetMax * budgetSignal));
+								strataBudget =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (citadelTrustBeta * aster.strataLastBudget
+								           + (1.0f - citadelTrustBeta) * budgetTarget)
+								        : budgetTarget;
+								strataNullBenefit = realizedNullBenefit;
+								strataPredictiveBenefit = realizedPredictiveBenefit;
+								strataOutputBenefit = realizedOutputBenefit;
+								strataCoupledBenefit = realizedCoupledBenefit;
+								strataSwitchRate = (selectedMode == previousMode) ? 0.0f : 1.0f;
+								aster.strataNullBenefitEma =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (strataBenefitBeta * aster.strataNullBenefitEma
+								           + (1.0f - strataBenefitBeta) * realizedNullBenefit)
+								        : realizedNullBenefit;
+								aster.strataPredictiveBenefitEma =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (strataBenefitBeta * aster.strataPredictiveBenefitEma
+								           + (1.0f - strataBenefitBeta) * realizedPredictiveBenefit)
+								        : realizedPredictiveBenefit;
+								aster.strataOutputBenefitEma =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (strataBenefitBeta * aster.strataOutputBenefitEma
+								           + (1.0f - strataBenefitBeta) * realizedOutputBenefit)
+								        : realizedOutputBenefit;
+								aster.strataCoupledBenefitEma =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (strataBenefitBeta * aster.strataCoupledBenefitEma
+								           + (1.0f - strataBenefitBeta) * realizedCoupledBenefit)
+								        : realizedCoupledBenefit;
+								if (selectedMode == 1)
+								{
+									strataNullMode = 0.0f;
+									strataPredictiveMode = 1.0f;
+									aegisLambdaPredictive = strataBudget;
+									aegisLambdaOutput = 0.0f;
+								}
+								else if (selectedMode == 2)
+								{
+									strataNullMode = 0.0f;
+									strataOutputMode = 1.0f;
+									aegisLambdaPredictive = 0.0f;
+									aegisLambdaOutput = strataBudget;
+								}
+								else if (selectedMode == 3)
+								{
+									strataNullMode = 0.0f;
+									strataCoupledMode = 1.0f;
+									const float predictiveShare =
+									    predictiveTrustNorm / (predictiveTrustNorm + outputTrustNorm + 1.0e-6f);
+									aegisLambdaPredictive =
+									    std::max(0.0f, std::min(1.0f, strataBudget * predictiveShare));
+									aegisLambdaOutput =
+									    std::max(0.0f, std::min(1.0f, strataBudget - aegisLambdaPredictive));
+								}
+								else
+								{
+									aegisLambdaPredictive = 0.0f;
+									aegisLambdaOutput = 0.0f;
+								}
+								aegisLambdaSpatial =
+								    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+								meritSparrowTrust = aegisLambdaPredictive;
+								asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+							}
+							else if (ac.meritEnabled)
+							{
+								const float predictiveTrustNorm =
+								    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+								const float outputTrustNorm =
+								    rawOutputTrust / (rawOutputTrust + 1.0f);
+								const float predictiveErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisPredictiveErrorEma
+								                          / (aegisPredictivePredicted
+								                             + aegisPredictiveRealized + 1.0e-6f)));
+								const float outputErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisOutputErrorEma
+								                          / (aegisOutputPredicted
+								                             + aegisOutputRealized + 1.0e-6f)));
+								const float uncertainty =
+								    0.5f * (predictiveErrNorm + outputErrNorm);
+								const float contextPenalty =
+								    batchHardRegimeMass * std::max(0.0f, 1.0f - outputTrustNorm);
+								const float tauSignal =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      0.45f * uncertainty
+								                          + 0.30f * disagreementNorm
+								                          - 0.30f * meritGeometryTrust
+								                          + 0.25f * contextPenalty));
+								const float tauTarget =
+								    ac.meritTauMin
+								    + (ac.meritTauMax - ac.meritTauMin) * tauSignal;
+								meritTau =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (citadelTrustBeta * aster.meritLastTau
+								           + (1.0f - citadelTrustBeta) * tauTarget)
+								        : tauTarget;
+								meritCovariance =
+								    std::max(0.0f,
+								             std::min(0.95f,
+								                      ac.meritCovarianceMix
+								                          * std::min(predictiveTrustNorm, outputTrustNorm)
+								                          * std::max(0.0f, 1.0f - disagreementNorm)));
+								const float coupling =
+								    meritCovariance
+								    * sqrtf(std::max(0.0f, rawPredictiveTrust * rawOutputTrust));
+								const float h11 = std::max(1.0e-6f, meritTau + rawPredictiveTrust);
+								const float h22 = std::max(1.0e-6f, meritTau + rawOutputTrust);
+								const float det = std::max(1.0e-6f, h11 * h22 - coupling * coupling);
+								float wPredictive =
+								    (rawPredictiveTrust * predictiveTrustNorm * h22
+								     - coupling * rawOutputTrust * outputTrustNorm)
+								    / det;
+								float wOutput =
+								    (h11 * rawOutputTrust * outputTrustNorm
+								     - coupling * rawPredictiveTrust * predictiveTrustNorm)
+								    / det;
+								wPredictive = std::max(0.0f, wPredictive);
+								wOutput = std::max(0.0f, wOutput);
+								const float weightSum = wPredictive + wOutput + 1.0e-6f;
+								wPredictive /= weightSum;
+								wOutput /= weightSum;
+								const float budgetSignal =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      0.45f * (0.5f * (predictiveTrustNorm + outputTrustNorm))
+								                          + 0.35f * meritGeometryTrust
+								                          - 0.15f * disagreementNorm
+								                          - 0.15f * uncertainty
+								                          - 0.20f * contextPenalty));
+								const float budgetTarget =
+								    std::max(0.0f, std::min(1.0f, ac.meritBudgetMax * budgetSignal));
+								meritBudget =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (citadelTrustBeta * aster.meritLastBudget
+								           + (1.0f - citadelTrustBeta) * budgetTarget)
+								        : budgetTarget;
+								const float residualNorm =
+								    sqrtf(std::max(0.0f,
+								                   wPredictive * wPredictive + wOutput * wOutput
+								                       + 2.0f * meritCovariance * wPredictive * wOutput));
+								const float budgetScale =
+								    (residualNorm > 1.0e-6f)
+								        ? std::max(0.0f, std::min(1.0f, meritBudget / residualNorm))
+								        : 0.0f;
+								aegisLambdaPredictive =
+								    std::max(0.0f, std::min(1.0f, wPredictive * budgetScale));
+								aegisLambdaOutput =
+								    std::max(0.0f, std::min(1.0f, wOutput * budgetScale));
+								aegisLambdaSpatial =
+								    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+								meritSparrowTrust = aegisLambdaPredictive;
+								asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+							}
+							else if (ac.rampartEnabled)
+							{
+								const float predictiveTrustNorm =
+								    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+								const float outputTrustNorm =
+								    rawOutputTrust / (rawOutputTrust + 1.0f);
+								const float predictiveErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisPredictiveErrorEma
+								                          / (aegisPredictivePredicted
+								                             + aegisPredictiveRealized + 1.0e-6f)));
+								const float outputErrNorm =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      aster.aegisOutputErrorEma
+								                          / (aegisOutputPredicted
+								                             + aegisOutputRealized + 1.0e-6f)));
+								const float uncertainty =
+								    0.5f * (predictiveErrNorm + outputErrNorm);
+								const float contextPenalty =
+								    batchHardRegimeMass * std::max(0.0f, 1.0f - outputTrustNorm);
+								const float tauSignal =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      0.4f * uncertainty + 0.3f * disagreementNorm
+								                          + 0.3f * contextPenalty));
+								const float tauTarget =
+								    ac.rampartTauMin
+								    + (ac.rampartTauMax - ac.rampartTauMin) * tauSignal;
+								rampartTau =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (citadelTrustBeta * aster.rampartLastTau
+								           + (1.0f - citadelTrustBeta) * tauTarget)
+								        : tauTarget;
+								rampartCovariance =
+								    std::max(0.0f,
+								             std::min(0.95f,
+								                      ac.rampartCovarianceMix
+								                          * std::min(predictiveTrustNorm, outputTrustNorm)
+								                          * std::max(0.0f, 1.0f - disagreementNorm)));
+								const float coupling =
+								    rampartCovariance
+								    * sqrtf(std::max(0.0f, rawPredictiveTrust * rawOutputTrust));
+								const float h11 = std::max(1.0e-6f, rampartTau + rawPredictiveTrust);
+								const float h22 = std::max(1.0e-6f, rampartTau + rawOutputTrust);
+								const float det = std::max(1.0e-6f, h11 * h22 - coupling * coupling);
+								float wSpatial = (rampartTau + spatialPrecision)
+								               / std::max(1.0e-6f, rampartTau + spatialPrecision);
+								float wPredictive =
+								    (rawPredictiveTrust * predictiveTrustNorm * h22
+								     - coupling * rawOutputTrust * outputTrustNorm)
+								    / det;
+								float wOutput =
+								    (h11 * rawOutputTrust * outputTrustNorm
+								     - coupling * rawPredictiveTrust * predictiveTrustNorm)
+								    / det;
+								wSpatial = std::max(0.0f, wSpatial);
+								wPredictive = std::max(0.0f, wPredictive);
+								wOutput = std::max(0.0f, wOutput);
+								const float weightSum = wSpatial + wPredictive + wOutput + 1.0e-6f;
+								wSpatial /= weightSum;
+								wPredictive /= weightSum;
+								wOutput /= weightSum;
+								const float budgetSignal =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      0.5f * (predictiveTrustNorm + outputTrustNorm)
+								                          - 0.20f * disagreementNorm
+								                          - 0.15f * uncertainty
+								                          - 0.15f * contextPenalty));
+								const float budgetTarget =
+								    std::max(0.0f, std::min(1.0f, ac.rampartBudgetMax * budgetSignal));
+								rampartBudget =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (citadelTrustBeta * aster.rampartLastBudget
+								           + (1.0f - citadelTrustBeta) * budgetTarget)
+								        : budgetTarget;
+								const float residualNorm =
+								    sqrtf(std::max(0.0f,
+								                   wPredictive * wPredictive + wOutput * wOutput
+								                       + 2.0f * rampartCovariance * wPredictive * wOutput));
+								const float budgetScale =
+								    (residualNorm > 1.0e-6f)
+								        ? std::max(0.0f, std::min(1.0f, rampartBudget / residualNorm))
+								        : 0.0f;
+								aegisLambdaPredictive = std::max(0.0f, std::min(1.0f, wPredictive * budgetScale));
+								aegisLambdaOutput = std::max(0.0f, std::min(1.0f, wOutput * budgetScale));
+								aegisLambdaSpatial =
+								    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+								rampartSparrowTrust = aegisLambdaPredictive;
+								asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+							}
+							else if (ac.citadelEnabled)
+							{
+								const float predictiveTrustNorm =
+								    aster.citadelPredictiveTrustEma / (aster.citadelPredictiveTrustEma + 1.0f);
+								const float outputTrustNorm =
+								    aster.citadelOutputTrustEma / (aster.citadelOutputTrustEma + 1.0f);
+								const float predictiveDominance =
+								    std::max(0.0f, predictiveTrustNorm - outputTrustNorm);
+								const float citadelConflict =
+								    disagreementNorm * predictiveDominance;
+								const float hardPressure =
+								    batchHardRegimeMass * predictiveDominance * std::max(0.0f, 1.0f - outputTrustNorm);
+								const float anchorTarget =
+								    std::max(0.0f,
+								             std::min(0.95f,
+								                      ac.citadelAnchorBase
+								                          + ac.citadelHardRegimeScale * hardPressure
+								                          + ac.citadelDisagreementScale * citadelConflict));
+								citadelAnchor =
+								    (aster.timingBoundaryCount > 0ULL)
+								        ? (citadelTrustBeta * aster.citadelLastAnchor
+								           + (1.0f - citadelTrustBeta) * anchorTarget)
+								        : anchorTarget;
+								residualScale = std::max(0.0f, 1.0f - citadelAnchor);
+								spatialPrecision +=
+								    std::max(0.0f, ac.citadelSpatialScale) * citadelAnchor;
+							}
+							const float predictivePrecision =
+							    residualScale
+							    * rawPredictiveTrust;
+							const float outputPrecision =
+							    residualScale
+							    * rawOutputTrust;
+							if (!ac.rampartEnabled && !ac.meritEnabled && !ac.strataEnabled
+							    && !ac.auroraEnabled && !ac.seamEnabled && !ac.quasarEnabled)
+							{
+								const float totalPrecision =
+								    spatialPrecision + predictivePrecision + outputPrecision + 1e-6f;
+								aegisLambdaSpatial = spatialPrecision / totalPrecision;
+								aegisLambdaPredictive = predictivePrecision / totalPrecision;
+								aegisLambdaOutput = outputPrecision / totalPrecision;
+								if (ac.citadelEnabled)
+								{
+									const float predictiveTrustNorm =
+									    aster.citadelPredictiveTrustEma / (aster.citadelPredictiveTrustEma + 1.0f);
+									citadelSparrowTrust =
+									    std::max(0.0f,
+									             std::min(1.0f,
+									                      predictiveTrustNorm
+									                          * std::max(0.0f, 1.0f - citadelAnchor)));
+								}
+								asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+							}
+						}
 
 						if (asterMemoryGain > 0.0f)
 						{
-							const float batchScale = static_cast<float>(tokenCount) * asterMemoryGain;
+							const float bundleBatchScale = static_cast<float>(tokenCount) * asterMemoryGain;
 							const bool sampledSoftmax =
 							    (net.trainingConfig.transformer.tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_SAMPLED_SOFTMAX);
 							if (sampledSoftmax)
@@ -1523,32 +3770,90 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 								if (vid >= tt.vocabSize)
 									continue;
 								const unsigned int h = aster_mix_u32(0xA57E0001u + vid * 0x9e3779b9U);
-								const unsigned int bucket = h % sketchDim;
+								const unsigned int bucket = h % bundleDim;
 								const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
 								const float predictedResidual =
 								    clip_maybe(sign * predictedResidualNextW[bucket] * residualStd[bucket],
 								               net.trainingConfig.perElementGradClip);
 								if (!is_finite(predictedResidual))
 									continue;
-								tt.gLmBias[static_cast<size_t>(vid)] += batchScale * predictedResidual;
+								tt.gLmBias[static_cast<size_t>(vid)] += bundleBatchScale * predictedResidual;
 								const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
 								for (unsigned int i = 0; i < dModel; ++i)
-									tt.gTokE[eOff + i] += batchScale * predictedResidual * finalHiddenMeanRaw[i];
+									tt.gTokE[eOff + i] += bundleBatchScale * predictedResidual * finalHiddenMeanRaw[i];
+							}
+							for (size_t slot = 0; slot < aster.batchSupportIds.size(); ++slot)
+							{
+								const unsigned int vid = aster.batchSupportIds[slot];
+								if (vid >= tt.vocabSize)
+									continue;
+								const size_t eOff = static_cast<size_t>(vid) * static_cast<size_t>(dModel);
+								for (unsigned int r = 0; r < supportDim; ++r)
+								{
+									if (!(supportCount[r] > 0.0f))
+										continue;
+									const size_t roleCountOff =
+									    (slot * static_cast<size_t>(regimeCount) + regime) * static_cast<size_t>(supportDim) + r;
+									if (roleCountOff >= aster.batchSupportRoleCounts.size())
+										break;
+									const float roleMass = aster.batchSupportRoleCounts[roleCountOff];
+									if (!(roleMass > 0.0f))
+										continue;
+									const float predictedSupportLogit =
+									    clip_maybe(predictedResidualNextW[bundleDim + r] * residualStd[bundleDim + r],
+									               net.trainingConfig.perElementGradClip);
+									if (!is_finite(predictedSupportLogit))
+										continue;
+									float predictedRoleSignal = predictedSupportLogit;
+									if (r == 0u && marginDim > 0u)
+									{
+										float marginAccum = 0.0f;
+										unsigned int marginCount = 0u;
+										for (unsigned int mr = 0; mr < marginDim; ++mr)
+										{
+											const float predictedMargin =
+											    clip_maybe(predictedResidualNextW[bundleDim + supportDim + mr]
+											                  * residualStd[bundleDim + supportDim + mr],
+											               net.trainingConfig.perElementGradClip);
+											if (!is_finite(predictedMargin))
+												continue;
+											marginAccum += predictedMargin;
+											marginCount += 1u;
+										}
+										if (marginCount > 0u)
+											predictedRoleSignal += marginAccum / static_cast<float>(marginCount);
+									}
+									else if (r > 0u && (r - 1u) < marginDim)
+									{
+										const float predictedMargin =
+										    clip_maybe(predictedResidualNextW[bundleDim + supportDim + (r - 1u)]
+										                  * residualStd[bundleDim + supportDim + (r - 1u)],
+										               net.trainingConfig.perElementGradClip);
+										if (is_finite(predictedMargin))
+											predictedRoleSignal -= predictedMargin;
+									}
+									const float delta = asterMemoryGain * roleMass * predictedRoleSignal;
+									tt.gLmBias[static_cast<size_t>(vid)] += delta;
+									const size_t roleHiddenOff = static_cast<size_t>(r) * static_cast<size_t>(dModel);
+									for (unsigned int i = 0; i < dModel; ++i)
+										tt.gTokE[eOff + i] += delta * supportHiddenMeanRaw[roleHiddenOff + i];
+								}
 							}
 						}
 
+						const std::vector<float> oldLatent = latentHist;
 						for (unsigned int m = 0; m < stateRank; ++m)
 						{
-							if (m >= aster.poleNumer.size() || m >= aster.poleDenom.size()
-							    || m >= aster.pole.size() || m >= aster.latent.size())
+							if (m >= poleNumerHist.size() || m >= poleDenomHist.size()
+							    || m >= poleHist.size() || m >= latentHist.size())
 								continue;
 							const size_t rowOff = static_cast<size_t>(m) * static_cast<size_t>(stateFeatureDim);
 							const float diagPole = (m < stateRank) ? stateModel[rowOff + m] : 0.0f;
-							aster.poleNumer[m] = diagPole;
-							aster.poleDenom[m] = 1.0f;
-							aster.pole[m] = std::max(-ac.asterPoleMax,
-							                         std::min(ac.asterPoleMax, diagPole));
-							aster.latent[m] = filteredState[m];
+							poleNumerHist[m] = diagPole;
+							poleDenomHist[m] = 1.0f;
+							poleHist[m] = std::max(-ac.asterPoleMax,
+							                       std::min(ac.asterPoleMax, diagPole));
+							latentHist[m] = filteredState[m];
 						}
 
 						unsigned int asterActiveModes = 0u;
@@ -1556,27 +3861,274 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						for (unsigned int m = 0; m < stateRank; ++m)
 						{
 							const float sigma = (m < nextSigma.size()) ? nextSigma[m] : 0.0f;
-							if (m < aster.sigma.size())
-								aster.sigma[m] = sigma;
+							if (m < sigmaHist.size())
+								sigmaHist[m] = sigma;
 							nextEffectiveSigmaSq += static_cast<double>(sigma) * static_cast<double>(sigma);
 							if (sigma > ac.asterEdgeThreshold)
 								asterActiveModes += 1u;
 						}
-						aster.leftMode.swap(nextLeft);
-						aster.rightMode.swap(nextRight);
-						aster.lastActiveModes = asterActiveModes;
-						aster.lastEdge = (stateRank > 0u) ? std::max(0.0f, aster.sigma[0]) : 0.0f;
-						aster.lastSecondEdge = (stateRank > 1u) ? std::max(0.0f, aster.sigma[1]) : 0.0f;
-						aster.lastSecondEdgeRatio = (aster.lastEdge > sigmaEps)
-						                          ? std::max(0.0f, aster.lastSecondEdge / (aster.lastEdge + sigmaEps))
-						                          : 0.0f;
-						aster.lastSigma = static_cast<float>(sqrt(nextEffectiveSigmaSq));
-						aster.lastPredR2 = asterPredR2;
-						aster.lastMemoryGain = asterMemoryGain;
+						leftModeHist = nextLeft;
+						rightModeHist = nextRight;
+						const float regimeEdge =
+						    (stateRank > 0u && !sigmaHist.empty()) ? std::max(0.0f, sigmaHist[0]) : 0.0f;
+						const float regimeSecondEdge =
+						    (stateRank > 1u && sigmaHist.size() > 1u) ? std::max(0.0f, sigmaHist[1]) : 0.0f;
+						const float regimeSecondEdgeRatio =
+						    (regimeEdge > sigmaEps)
+						        ? std::max(0.0f, regimeSecondEdge / (regimeEdge + sigmaEps))
+						        : 0.0f;
+						const float regimeSigma = static_cast<float>(sqrt(nextEffectiveSigmaSq));
+						const float regimePole = !poleHist.empty() ? poleHist[0] : 0.0f;
 						for (unsigned int i = 0; i < controlDim; ++i)
-							aster.prevControlMean[i] = controlMean[i];
-						for (unsigned int j = 0; j < sketchDim; ++j)
-							aster.prevResidualMean[j] = residualMean[j];
+							prevPrevControlMeanHist[i] = prevControlMeanHist[i];
+						for (unsigned int i = 0; i < controlDim; ++i)
+							prevControlMeanHist[i] = controlMean[i];
+						for (unsigned int j = 0; j < obsDim; ++j)
+							prevPrevResidualMeanHist[j] = prevResidualMeanHist[j];
+						for (unsigned int j = 0; j < obsDim; ++j)
+							prevResidualMeanHist[j] = residualMean[j];
+						for (unsigned int m = 0; m < stateRank && m < prevPrevLatentHist.size() && m < oldLatent.size(); ++m)
+							prevPrevLatentHist[m] = oldLatent[m];
+
+						for (unsigned int i = 0; i < controlDim && (regimeControlBase + i) < aster.prevPrevControlMean.size(); ++i)
+							aster.prevPrevControlMean[regimeControlBase + i] = prevPrevControlMeanHist[i];
+						for (unsigned int i = 0; i < controlDim && (regimeControlBase + i) < aster.prevControlMean.size(); ++i)
+							aster.prevControlMean[regimeControlBase + i] = prevControlMeanHist[i];
+						for (unsigned int i = 0; i < obsDim && (regimeObsBase + i) < aster.prevPrevResidualMean.size(); ++i)
+							aster.prevPrevResidualMean[regimeObsBase + i] = prevPrevResidualMeanHist[i];
+						for (unsigned int i = 0; i < obsDim && (regimeObsBase + i) < aster.prevResidualMean.size(); ++i)
+							aster.prevResidualMean[regimeObsBase + i] = prevResidualMeanHist[i];
+						for (unsigned int i = 0; i < controlDim && (regimeControlBase + i) < aster.controlVar.size(); ++i)
+							aster.controlVar[regimeControlBase + i] = controlVarHist[i];
+						for (unsigned int i = 0; i < obsDim && (regimeObsBase + i) < aster.residualVar.size(); ++i)
+							aster.residualVar[regimeObsBase + i] = residualVarHist[i];
+						for (unsigned int i = 0; i < transportPastCov.size(); ++i)
+						{
+							const size_t dst = static_cast<size_t>(regime) * transportPastCov.size() + i;
+							if (dst < aster.transportPastCov.size())
+								aster.transportPastCov[dst] = transportPastCov[i];
+							if (dst < aster.transportCrossCov.size())
+								aster.transportCrossCov[dst] = transportCrossCov[i];
+						}
+						for (unsigned int i = 0; i < pastCovHist.size(); ++i)
+						{
+							const size_t dst = regimeFeatureBase + i;
+							if (dst < aster.pastCov.size())
+								aster.pastCov[dst] = pastCovHist[i];
+						}
+						for (unsigned int i = 0; i < crossCovHist.size(); ++i)
+						{
+							const size_t dst = regimeCrossBase + i;
+							if (dst < aster.crossCov.size())
+								aster.crossCov[dst] = crossCovHist[i];
+							if (dst < aster.theta.size())
+								aster.theta[dst] = thetaHist[i];
+						}
+						for (unsigned int i = 0; i < statePastCovHist.size(); ++i)
+						{
+							const size_t dst = regimeStateFeatureBase + i;
+							if (dst < aster.statePastCov.size())
+								aster.statePastCov[dst] = statePastCovHist[i];
+						}
+						for (unsigned int i = 0; i < stateCrossCovHist.size(); ++i)
+						{
+							const size_t dst = regimeStateCrossBase + i;
+							if (dst < aster.stateCrossCov.size())
+								aster.stateCrossCov[dst] = stateCrossCovHist[i];
+						}
+						for (unsigned int i = 0; i < innovationCovHist.size(); ++i)
+						{
+							const size_t dst = regimeInnovationBase + i;
+							if (dst < aster.innovationCov.size())
+								aster.innovationCov[dst] = innovationCovHist[i];
+						}
+						for (unsigned int i = 0; i < innovationCrossHist.size(); ++i)
+						{
+							const size_t dst = regimeInnovationCrossBase + i;
+							if (dst < aster.innovationCross.size())
+								aster.innovationCross[dst] = innovationCrossHist[i];
+						}
+						for (unsigned int i = 0; i < stateRank; ++i)
+						{
+							const size_t sigmaIdx = static_cast<size_t>(regime) * static_cast<size_t>(stateRank) + i;
+							if (sigmaIdx < aster.sigma.size())
+								aster.sigma[sigmaIdx] = sigmaHist[i];
+							if ((regimeLatentBase + i) < aster.prevPrevLatent.size())
+								aster.prevPrevLatent[regimeLatentBase + i] = prevPrevLatentHist[i];
+							if ((regimeLatentBase + i) < aster.latent.size())
+								aster.latent[regimeLatentBase + i] = latentHist[i];
+							if ((regimeLatentBase + i) < aster.poleNumer.size())
+								aster.poleNumer[regimeLatentBase + i] = poleNumerHist[i];
+							if ((regimeLatentBase + i) < aster.poleDenom.size())
+								aster.poleDenom[regimeLatentBase + i] = poleDenomHist[i];
+							if ((regimeLatentBase + i) < aster.pole.size())
+								aster.pole[regimeLatentBase + i] = poleHist[i];
+						}
+						for (unsigned int i = 0; i < leftModeHist.size(); ++i)
+						{
+							const size_t dst = regimeLeftBase + i;
+							if (dst < aster.leftMode.size())
+								aster.leftMode[dst] = leftModeHist[i];
+						}
+						for (unsigned int i = 0; i < rightModeHist.size(); ++i)
+						{
+							const size_t dst = regimeRightBase + i;
+							if (dst < aster.rightMode.size())
+								aster.rightMode[dst] = rightModeHist[i];
+						}
+						if (regime < aster.targetMarginEma.size())
+							aster.targetMarginEma[regime] =
+							    (marginBaselineBeta * aster.targetMarginEma[regime]) + ((1.0f - marginBaselineBeta) * targetMarginMean);
+						if (regime < aster.hardNegativeLogitEma.size())
+							aster.hardNegativeLogitEma[regime] =
+							    (marginBaselineBeta * aster.hardNegativeLogitEma[regime]) + ((1.0f - marginBaselineBeta) * hardNegativeLogitMean);
+						if (regime < aster.hardMarginShortfallEma.size())
+							aster.hardMarginShortfallEma[regime] =
+							    (marginBaselineBeta * aster.hardMarginShortfallEma[regime]) + ((1.0f - marginBaselineBeta) * rawHardMarginShortfallMean);
+
+						const double regimeWeight =
+						    static_cast<double>(tokenCount) / static_cast<double>(std::max(1u, aster.batchTokenCount));
+						weightSum += regimeWeight;
+						weightedActiveModes += regimeWeight * static_cast<double>(asterActiveModes);
+						if (asterActiveModes >= 2u)
+							weightedSecondModeFrac += regimeWeight;
+						weightedEdge += regimeWeight * static_cast<double>(regimeEdge);
+						weightedSecondEdge += regimeWeight * static_cast<double>(regimeSecondEdge);
+						weightedSecondEdgeRatio += regimeWeight * static_cast<double>(regimeSecondEdgeRatio);
+						weightedSigma += regimeWeight * static_cast<double>(regimeSigma);
+						weightedPredR2 += regimeWeight * static_cast<double>(asterPredR2);
+						weightedMemoryGain += regimeWeight * static_cast<double>(asterMemoryGain);
+						weightedPole += regimeWeight * static_cast<double>(regimePole);
+						weightedAegisLambdaSpatial += regimeWeight * static_cast<double>(aegisLambdaSpatial);
+						weightedAegisLambdaPredictive += regimeWeight * static_cast<double>(aegisLambdaPredictive);
+						weightedAegisLambdaOutput += regimeWeight * static_cast<double>(aegisLambdaOutput);
+						weightedAegisPredictivePredicted += regimeWeight * static_cast<double>(aegisPredictivePredicted);
+						weightedAegisPredictiveRealized += regimeWeight * static_cast<double>(aegisPredictiveRealized);
+						weightedAegisOutputPredicted += regimeWeight * static_cast<double>(aegisOutputPredicted);
+						weightedAegisOutputRealized += regimeWeight * static_cast<double>(aegisOutputRealized);
+						weightedAegisPredictiveError += regimeWeight * static_cast<double>(aster.aegisPredictiveErrorEma);
+						weightedAegisOutputError += regimeWeight * static_cast<double>(aster.aegisOutputErrorEma);
+						weightedAegisDisagreement += regimeWeight * static_cast<double>(fabsf(aegisPredictiveRealized - aegisOutputRealized));
+						weightedCitadelAnchor += regimeWeight * static_cast<double>(citadelAnchor);
+						weightedCitadelHardRegimeMass += regimeWeight * static_cast<double>(batchHardRegimeMass);
+						weightedCitadelSparrowTrust += regimeWeight * static_cast<double>(citadelSparrowTrust);
+						weightedRampartTau += regimeWeight * static_cast<double>(rampartTau);
+						weightedRampartBudget += regimeWeight * static_cast<double>(rampartBudget);
+						weightedRampartCovariance += regimeWeight * static_cast<double>(rampartCovariance);
+						weightedRampartSparrowTrust += regimeWeight * static_cast<double>(rampartSparrowTrust);
+						weightedMeritTau += regimeWeight * static_cast<double>(meritTau);
+						weightedMeritBudget += regimeWeight * static_cast<double>(meritBudget);
+						weightedMeritCovariance += regimeWeight * static_cast<double>(meritCovariance);
+						weightedMeritSparrowTrust += regimeWeight * static_cast<double>(meritSparrowTrust);
+						weightedMeritGeometryTrust += regimeWeight * static_cast<double>(meritGeometryTrust);
+						weightedStrataNullMode += regimeWeight * static_cast<double>(strataNullMode);
+						weightedStrataPredictiveMode += regimeWeight * static_cast<double>(strataPredictiveMode);
+						weightedStrataOutputMode += regimeWeight * static_cast<double>(strataOutputMode);
+						weightedStrataCoupledMode += regimeWeight * static_cast<double>(strataCoupledMode);
+						weightedStrataBudget += regimeWeight * static_cast<double>(strataBudget);
+						weightedStrataNullBenefit += regimeWeight * static_cast<double>(strataNullBenefit);
+						weightedStrataPredictiveBenefit += regimeWeight * static_cast<double>(strataPredictiveBenefit);
+						weightedStrataOutputBenefit += regimeWeight * static_cast<double>(strataOutputBenefit);
+						weightedStrataCoupledBenefit += regimeWeight * static_cast<double>(strataCoupledBenefit);
+						weightedStrataSelectedExcess += regimeWeight * static_cast<double>(strataSelectedExcess);
+						weightedStrataSwitchRate += regimeWeight * static_cast<double>(strataSwitchRate);
+						maxActiveModes = std::max(maxActiveModes, asterActiveModes);
+						asterSetupNs += regimeSetupNs;
+						asterTransportNs += regimeTransportNs;
+						asterTransferFitNs += regimeTransferFitNs;
+						asterStateFitNs += regimeStateFitNs;
+						asterInnovationFitNs += regimeInnovationFitNs;
+						asterApplyNs += monotonic_elapsed_ns(asterApplyStart, monotonic_now());
+						}
+
+						if (weightSum > 0.0)
+						{
+							aster.lastActiveModes = maxActiveModes;
+							aster.lastEdge = static_cast<float>(weightedEdge / weightSum);
+							aster.lastSecondEdge = static_cast<float>(weightedSecondEdge / weightSum);
+							aster.lastSecondEdgeRatio = static_cast<float>(weightedSecondEdgeRatio / weightSum);
+							aster.lastSigma = static_cast<float>(weightedSigma / weightSum);
+							aster.lastPredR2 = static_cast<float>(weightedPredR2 / weightSum);
+							aster.lastMemoryGain = static_cast<float>(weightedMemoryGain / weightSum);
+							aster.lastPoleSummary = static_cast<float>(weightedPole / weightSum);
+							aster.aegisPrevPredictiveScore = static_cast<float>(weightedAegisPredictiveRealized / weightSum);
+							aster.aegisPrevOutputScore = static_cast<float>(weightedAegisOutputRealized / weightSum);
+							aster.aegisLastLambdaSpatial = static_cast<float>(weightedAegisLambdaSpatial / weightSum);
+							aster.aegisLastLambdaPredictive = static_cast<float>(weightedAegisLambdaPredictive / weightSum);
+							aster.aegisLastLambdaOutput = static_cast<float>(weightedAegisLambdaOutput / weightSum);
+							aster.aegisLastPredictivePredicted = static_cast<float>(weightedAegisPredictivePredicted / weightSum);
+							aster.aegisLastPredictiveRealized = static_cast<float>(weightedAegisPredictiveRealized / weightSum);
+							aster.aegisLastOutputPredicted = static_cast<float>(weightedAegisOutputPredicted / weightSum);
+							aster.aegisLastOutputRealized = static_cast<float>(weightedAegisOutputRealized / weightSum);
+							aster.aegisLastChannelDisagreement = static_cast<float>(weightedAegisDisagreement / weightSum);
+							aster.citadelLastAnchor = static_cast<float>(weightedCitadelAnchor / weightSum);
+							aster.citadelLastHardRegimeMass = static_cast<float>(weightedCitadelHardRegimeMass / weightSum);
+							aster.citadelLastSparrowTrust = static_cast<float>(weightedCitadelSparrowTrust / weightSum);
+							aster.rampartLastTau = static_cast<float>(weightedRampartTau / weightSum);
+							aster.rampartLastBudget = static_cast<float>(weightedRampartBudget / weightSum);
+							aster.rampartLastCovariance = static_cast<float>(weightedRampartCovariance / weightSum);
+							aster.rampartLastSparrowTrust = static_cast<float>(weightedRampartSparrowTrust / weightSum);
+							aster.meritLastTau = static_cast<float>(weightedMeritTau / weightSum);
+							aster.meritLastBudget = static_cast<float>(weightedMeritBudget / weightSum);
+							aster.meritLastCovariance = static_cast<float>(weightedMeritCovariance / weightSum);
+							aster.meritLastSparrowTrust = static_cast<float>(weightedMeritSparrowTrust / weightSum);
+							aster.meritLastGeometryTrust = static_cast<float>(weightedMeritGeometryTrust / weightSum);
+							aster.strataLastNullMode = static_cast<float>(weightedStrataNullMode / weightSum);
+							aster.strataLastPredictiveMode = static_cast<float>(weightedStrataPredictiveMode / weightSum);
+							aster.strataLastOutputMode = static_cast<float>(weightedStrataOutputMode / weightSum);
+							aster.strataLastCoupledMode = static_cast<float>(weightedStrataCoupledMode / weightSum);
+							aster.strataLastBudget = static_cast<float>(weightedStrataBudget / weightSum);
+							aster.strataLastNullBenefit = static_cast<float>(weightedStrataNullBenefit / weightSum);
+							aster.strataLastPredictiveBenefit = static_cast<float>(weightedStrataPredictiveBenefit / weightSum);
+							aster.strataLastOutputBenefit = static_cast<float>(weightedStrataOutputBenefit / weightSum);
+							aster.strataLastCoupledBenefit = static_cast<float>(weightedStrataCoupledBenefit / weightSum);
+							aster.strataLastSelectedExcess = static_cast<float>(weightedStrataSelectedExcess / weightSum);
+							aster.strataLastSwitchRate = static_cast<float>(weightedStrataSwitchRate / weightSum);
+						}
+						else
+						{
+							aster.lastActiveModes = 0u;
+							aster.lastEdge = 0.0f;
+							aster.lastSecondEdge = 0.0f;
+							aster.lastSecondEdgeRatio = 0.0f;
+							aster.lastSigma = 0.0f;
+							aster.lastPredR2 = 0.0f;
+							aster.lastMemoryGain = 0.0f;
+							aster.lastPoleSummary = 0.0f;
+							aster.aegisPrevPredictiveScore = 0.0f;
+							aster.aegisPrevOutputScore = 0.0f;
+							aster.aegisLastLambdaSpatial = 0.0f;
+							aster.aegisLastLambdaPredictive = 0.0f;
+							aster.aegisLastLambdaOutput = 0.0f;
+							aster.aegisLastPredictivePredicted = 0.0f;
+							aster.aegisLastPredictiveRealized = 0.0f;
+							aster.aegisLastOutputPredicted = 0.0f;
+							aster.aegisLastOutputRealized = 0.0f;
+							aster.aegisLastChannelDisagreement = 0.0f;
+							aster.citadelLastAnchor = 0.0f;
+							aster.citadelLastHardRegimeMass = 0.0f;
+							aster.citadelLastSparrowTrust = 1.0f;
+							aster.rampartLastTau = 0.0f;
+							aster.rampartLastBudget = 0.0f;
+							aster.rampartLastCovariance = 0.0f;
+							aster.rampartLastSparrowTrust = 1.0f;
+							aster.meritLastTau = 0.0f;
+							aster.meritLastBudget = 0.0f;
+							aster.meritLastCovariance = 0.0f;
+							aster.meritLastSparrowTrust = 1.0f;
+							aster.meritLastGeometryTrust = 0.0f;
+							aster.strataLastNullMode = 1.0f;
+							aster.strataLastPredictiveMode = 0.0f;
+							aster.strataLastOutputMode = 0.0f;
+							aster.strataLastCoupledMode = 0.0f;
+							aster.strataLastBudget = 0.0f;
+							aster.strataLastNullBenefit = 0.0f;
+							aster.strataLastPredictiveBenefit = 0.0f;
+							aster.strataLastOutputBenefit = 0.0f;
+							aster.strataLastCoupledBenefit = 0.0f;
+							aster.strataLastSelectedExcess = 0.0f;
+							aster.strataLastSwitchRate = 0.0f;
+						}
 						const timespec asterBoundaryEnd = monotonic_now();
 						aster.timingBoundaryCount += 1ULL;
 						aster.totalBoundaryNs += monotonic_elapsed_ns(asterBoundaryStart, asterBoundaryEnd);
@@ -1585,30 +4137,90 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						aster.totalTransferFitNs += asterTransferFitNs;
 						aster.totalStateFitNs += asterStateFitNs;
 						aster.totalInnovationFitNs += asterInnovationFitNs;
-						aster.totalApplyNs += monotonic_elapsed_ns(asterApplyStart, asterBoundaryEnd);
+						aster.totalApplyNs += asterApplyNs;
 					}
 
-					// tokE: [vocabSize, dModel]
-					if (!atlas::update(tt.atlasTokE, &tt.tokE[0], &tt.gTokE[0],
-					              tt.vocabSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
-					              ac, net.rngEngine, net.getLogger(), "tr.tokE"))
+					if (geodeEnabled)
 					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS tokE update entered NaN recovery");
-						net.storeRunningFlag(false);
-						return false;
+						if (!Geode::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
+						                          tt.atlasTokE, tt.vocabSize, dmTT, lr,
+						                          beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2,
+						                          ac, net.rngEngine, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: GEODE tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
 					}
+					else if (auroraAdamwBackbone)
+					{
+						Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
+						                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                    invBatch, gradScale, wd1, wd2);
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else
+					{
+						// tokE: [vocabSize, dModel]
+						if (!atlas::update(tt.atlasTokE, &tt.tokE[0], &tt.gTokE[0],
+						              tt.vocabSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
+						              ac, net.rngEngine, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
 
-					// lmBias: simple SGD (no subspace projection for 1D bias)
-					if (!atlas::updateBias(&tt.lmBias[0], &tt.gLmBias[0],
-					                       static_cast<unsigned int>(tt.lmBias.size()),
-					                       invBatch, lr, gradScale))
-					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS lmBias update produced NaN/Inf");
-						net.storeRunningFlag(false);
-						return false;
+						// lmBias: simple SGD (no subspace projection for 1D bias)
+						if (!atlas::updateBias(&tt.lmBias[0], &tt.gLmBias[0],
+						                       static_cast<unsigned int>(tt.lmBias.size()),
+						                       invBatch, lr, gradScale))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS lmBias update produced NaN/Inf");
+							net.storeRunningFlag(false);
+							return false;
+						}
 					}
+				}
+				const float transformerSparrowTrust =
+				    ((ac.citadelEnabled || ac.rampartEnabled || ac.meritEnabled || ac.strataEnabled
+				      || ac.auroraEnabled || ac.seamEnabled || ac.quasarEnabled) && tt.aster.initialized)
+				        ? std::max(0.0f,
+				                   std::min(1.0f,
+				                            (ac.strataEnabled || ac.auroraEnabled || ac.seamEnabled || ac.quasarEnabled)
+				                                ? tt.aster.aegisLastLambdaPredictive
+				                                : (ac.meritEnabled
+				                                ? tt.aster.meritLastSparrowTrust
+				                                : (ac.rampartEnabled
+				                                       ? tt.aster.rampartLastSparrowTrust
+				                                       : tt.aster.citadelLastSparrowTrust))))
+				        : 1.0f;
+				const float transformerBodySparrowTrust =
+				    ac.auroraEnabled
+				        ? std::max(0.0f,
+				                   std::min(1.0f, transformerSparrowTrust * ac.auroraBodyTrustScale))
+				        : transformerSparrowTrust;
+				tt.atlasTokE.externalSparrowTrust = transformerSparrowTrust;
+				tt.atlasWIn.externalSparrowTrust = transformerBodySparrowTrust;
+				tt.atlasWOut.externalSparrowTrust = transformerBodySparrowTrust;
+				for (unsigned int li = 0; li < nLayers; ++li)
+				{
+					TensorTransformerState::Block& b = tt.blocks[li];
+					b.atlasWq.externalSparrowTrust = transformerBodySparrowTrust;
+					b.atlasWk.externalSparrowTrust = transformerBodySparrowTrust;
+					b.atlasWv.externalSparrowTrust = transformerBodySparrowTrust;
+					b.atlasWo.externalSparrowTrust = transformerBodySparrowTrust;
+					b.atlasW1.externalSparrowTrust = transformerBodySparrowTrust;
+					b.atlasW2.externalSparrowTrust = transformerBodySparrowTrust;
 				}
 
 				// Input projection (index 0)
@@ -1616,27 +4228,55 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
-
-					// WIn: [dModel, inputSize]
-					if (!atlas::update(tt.atlasWIn, &tt.WIn[0], &tt.gWIn[0],
-					              dmTT, tt.inputSize, invBatch, lr, wd1, wd2, gradScale,
-					              ac, net.rngEngine, net.getLogger(), "tr.WIn"))
+					if (geodeEnabled)
 					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS WIn update entered NaN recovery");
-						net.storeRunningFlag(false);
-						return false;
+						if (!Geode::update_weight(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn,
+						                          tt.atlasWIn, dmTT, tt.inputSize, lr,
+						                          beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2,
+						                          ac, net.rngEngine, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: GEODE WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
 					}
-
-					// bIn: simple SGD
-					if (!atlas::updateBias(&tt.bIn[0], &tt.gBIn[0],
-					                       static_cast<unsigned int>(tt.bIn.size()),
-					                       invBatch, lr, gradScale))
+					else if (auroraAdamwBackbone)
 					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS bIn update produced NaN/Inf");
-						net.storeRunningFlag(false);
-						return false;
+						Adam::update_weight(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn,
+						                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                    invBatch, gradScale, wd1, wd2);
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else
+					{
+						// WIn: [dModel, inputSize]
+						if (!atlas::update(tt.atlasWIn, &tt.WIn[0], &tt.gWIn[0],
+						              dmTT, tt.inputSize, invBatch, lr, wd1, wd2, gradScale,
+						              ac, net.rngEngine, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+
+						// bIn: simple SGD
+						if (!atlas::updateBias(&tt.bIn[0], &tt.gBIn[0],
+						                       static_cast<unsigned int>(tt.bIn.size()),
+						                       invBatch, lr, gradScale))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS bIn update produced NaN/Inf");
+							net.storeRunningFlag(false);
+							return false;
+						}
 					}
 				}
 
@@ -1648,60 +4288,144 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
 					TensorTransformerState::Block& b = tt.blocks[li];
-
-					// Wq: [dModel, dModel]
-					if (!atlas::update(b.atlasWq, &b.Wq[0], &b.gWq[0], dmTT, dmTT,
-					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wq")
-					// Wk: [dModelKV, dModel]
-					    || !atlas::update(b.atlasWk, &b.Wk[0], &b.gWk[0], dModelKVTT, dmTT,
-					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wk")
-					// Wv: [dModelKV, dModel]
-					    || !atlas::update(b.atlasWv, &b.Wv[0], &b.gWv[0], dModelKVTT, dmTT,
-					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wv")
-					// Wo: [dModel, dModel]
-					    || !atlas::update(b.atlasWo, &b.Wo[0], &b.gWo[0], dmTT, dmTT,
-					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wo")
-					// W1: [ff1Width, dModel]
-					    || !atlas::update(b.atlasW1, &b.W1[0], &b.gW1[0], ff1WidthTT, dmTT,
-					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.W1")
-					// W2: [dModel, dFF]
-					    || !atlas::update(b.atlasW2, &b.W2[0], &b.gW2[0], dmTT, dFFTT,
-					              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.W2"))
+					if (geodeEnabled)
 					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS block weight update entered NaN recovery");
-						net.storeRunningFlag(false);
-						return false;
+						if (!Geode::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq,
+						                          b.atlasWq, dmTT, dmTT, lr,
+						                          beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2,
+						                          ac, net.rngEngine, net.getLogger(), "tr.Wq")
+						    || !Geode::update_weight(b.Wk, b.vWk, b.v2Wk, b.gWk,
+						                             b.atlasWk, dModelKVTT, dmTT, lr,
+						                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                             invBatch, gradScale, wd1, wd2,
+						                             ac, net.rngEngine, net.getLogger(), "tr.Wk")
+						    || !Geode::update_weight(b.Wv, b.vWv, b.v2Wv, b.gWv,
+						                             b.atlasWv, dModelKVTT, dmTT, lr,
+						                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                             invBatch, gradScale, wd1, wd2,
+						                             ac, net.rngEngine, net.getLogger(), "tr.Wv")
+						    || !Geode::update_weight(b.Wo, b.vWo, b.v2Wo, b.gWo,
+						                             b.atlasWo, dmTT, dmTT, lr,
+						                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                             invBatch, gradScale, wd1, wd2,
+						                             ac, net.rngEngine, net.getLogger(), "tr.Wo")
+						    || !Geode::update_weight(b.W1, b.vW1, b.v2W1, b.gW1,
+						                             b.atlasW1, ff1WidthTT, dmTT, lr,
+						                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                             invBatch, gradScale, wd1, wd2,
+						                             ac, net.rngEngine, net.getLogger(), "tr.W1")
+						    || !Geode::update_weight(b.W2, b.vW2, b.v2W2, b.gW2,
+						                             b.atlasW2, dmTT, dFFTT, lr,
+						                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                             invBatch, gradScale, wd1, wd2,
+						                             ac, net.rngEngine, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: GEODE block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
-
-					// Biases and LN params: simple SGD (no subspace projection)
-					if (!atlas::updateBias(&b.bq[0], &b.gBq[0], static_cast<unsigned int>(b.bq.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.bk[0], &b.gBk[0], static_cast<unsigned int>(b.bk.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.bv[0], &b.gBv[0], static_cast<unsigned int>(b.bv.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.bo[0], &b.gBo[0], static_cast<unsigned int>(b.bo.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.b1[0], &b.gB1[0], static_cast<unsigned int>(b.b1.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.b2[0], &b.gB2[0], static_cast<unsigned int>(b.b2.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.ln1Gamma[0], &b.gLn1Gamma[0], static_cast<unsigned int>(b.ln1Gamma.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.ln1Beta[0], &b.gLn1Beta[0], static_cast<unsigned int>(b.ln1Beta.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.ln2Gamma[0], &b.gLn2Gamma[0], static_cast<unsigned int>(b.ln2Gamma.size()), invBatch, lr, gradScale)
-					    || !atlas::updateBias(&b.ln2Beta[0], &b.gLn2Beta[0], static_cast<unsigned int>(b.ln2Beta.size()), invBatch, lr, gradScale))
+					else if (auroraAdamwBackbone)
 					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS block bias/LN update produced NaN/Inf");
-						net.storeRunningFlag(false);
-						return false;
+						Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						Adam::update_weight(b.Wk, b.vWk, b.v2Wk, b.gWk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						Adam::update_weight(b.Wv, b.vWv, b.v2Wv, b.gWv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						Adam::update_weight(b.Wo, b.vWo, b.v2Wo, b.gWo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						Adam::update_weight(b.W1, b.vW1, b.v2W1, b.gW1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						Adam::update_weight(b.W2, b.vW2, b.v2W2, b.gW2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else
+					{
+						// Wq: [dModel, dModel]
+						if (!atlas::update(b.atlasWq, &b.Wq[0], &b.gWq[0], dmTT, dmTT,
+						              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wq")
+						// Wk: [dModelKV, dModel]
+						    || !atlas::update(b.atlasWk, &b.Wk[0], &b.gWk[0], dModelKVTT, dmTT,
+						              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wk")
+						// Wv: [dModelKV, dModel]
+						    || !atlas::update(b.atlasWv, &b.Wv[0], &b.gWv[0], dModelKVTT, dmTT,
+						              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wv")
+						// Wo: [dModel, dModel]
+						    || !atlas::update(b.atlasWo, &b.Wo[0], &b.gWo[0], dmTT, dmTT,
+						              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.Wo")
+						// W1: [ff1Width, dModel]
+						    || !atlas::update(b.atlasW1, &b.W1[0], &b.gW1[0], ff1WidthTT, dmTT,
+						              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.W1")
+						// W2: [dModel, dFF]
+						    || !atlas::update(b.atlasW2, &b.W2[0], &b.gW2[0], dmTT, dFFTT,
+						              invBatch, lr, wd1, wd2, gradScale, ac, net.rngEngine, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+
+						// Biases and LN params: simple SGD (no subspace projection)
+						if (!atlas::updateBias(&b.bq[0], &b.gBq[0], static_cast<unsigned int>(b.bq.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.bk[0], &b.gBk[0], static_cast<unsigned int>(b.bk.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.bv[0], &b.gBv[0], static_cast<unsigned int>(b.bv.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.bo[0], &b.gBo[0], static_cast<unsigned int>(b.bo.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.b1[0], &b.gB1[0], static_cast<unsigned int>(b.b1.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.b2[0], &b.gB2[0], static_cast<unsigned int>(b.b2.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.ln1Gamma[0], &b.gLn1Gamma[0], static_cast<unsigned int>(b.ln1Gamma.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.ln1Beta[0], &b.gLn1Beta[0], static_cast<unsigned int>(b.ln1Beta.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.ln2Gamma[0], &b.gLn2Gamma[0], static_cast<unsigned int>(b.ln2Gamma.size()), invBatch, lr, gradScale)
+						    || !atlas::updateBias(&b.ln2Beta[0], &b.gLn2Beta[0], static_cast<unsigned int>(b.ln2Beta.size()), invBatch, lr, gradScale))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS block bias/LN update produced NaN/Inf");
+							net.storeRunningFlag(false);
+							return false;
+						}
 					}
 				}
 
 				// Final LayerNorm (SGD, use block 0 LR; no weight decay)
 				{
 					const float lr = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
-					if (!atlas::updateBias(&tt.lnFinalGamma[0], &tt.gLnFinalGamma[0],
-					                       static_cast<unsigned int>(tt.lnFinalGamma.size()),
-					                       invBatch, lr, gradScale)
-					    || !atlas::updateBias(&tt.lnFinalBeta[0], &tt.gLnFinalBeta[0],
-					                          static_cast<unsigned int>(tt.lnFinalBeta.size()),
-					                          invBatch, lr, gradScale))
+					if (geodeEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (auroraAdamwBackbone)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (!atlas::updateBias(&tt.lnFinalGamma[0], &tt.gLnFinalGamma[0],
+					                            static_cast<unsigned int>(tt.lnFinalGamma.size()),
+					                            invBatch, lr, gradScale)
+					         || !atlas::updateBias(&tt.lnFinalBeta[0], &tt.gLnFinalBeta[0],
+					                               static_cast<unsigned int>(tt.lnFinalBeta.size()),
+					                               invBatch, lr, gradScale))
 					{
 						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 							"SGDHelper_Transformer: ATLAS final LN update produced NaN/Inf");
@@ -1717,27 +4441,55 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
-
-					// WOut: [outSize, dModel]
-					if (!atlas::update(tt.atlasWOut, &tt.WOut[0], &tt.gWOut[0],
-					              outSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
-					              ac, net.rngEngine, net.getLogger(), "tr.WOut"))
+					if (geodeEnabled)
 					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS WOut update entered NaN recovery");
-						net.storeRunningFlag(false);
-						return false;
+						if (!Geode::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
+						                          tt.atlasWOut, outSize, dmTT, lr,
+						                          beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2,
+						                          ac, net.rngEngine, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: GEODE WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
 					}
-
-					// bOut: simple SGD
-					if (!atlas::updateBias(&tt.bOut[0], &tt.gBOut[0],
-					                       static_cast<unsigned int>(tt.bOut.size()),
-					                       invBatch, lr, gradScale))
+					else if (auroraAdamwBackbone)
 					{
-						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-							"SGDHelper_Transformer: ATLAS bOut update produced NaN/Inf");
-						net.storeRunningFlag(false);
-						return false;
+						Adam::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
+						                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                    invBatch, gradScale, wd1, wd2);
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else
+					{
+						// WOut: [outSize, dModel]
+						if (!atlas::update(tt.atlasWOut, &tt.WOut[0], &tt.gWOut[0],
+						              outSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
+						              ac, net.rngEngine, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+
+						// bOut: simple SGD
+						if (!atlas::updateBias(&tt.bOut[0], &tt.gBOut[0],
+						                       static_cast<unsigned int>(tt.bOut.size()),
+						                       invBatch, lr, gradScale))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ATLAS bOut update produced NaN/Inf");
+							net.storeRunningFlag(false);
+							return false;
+						}
 					}
 				}
 				else
@@ -1761,86 +4513,6 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const double b2t = biasCorr ? pow(static_cast<double>(beta2), t) : 0.0;
 				const float inv1mB1t = biasCorr ? static_cast<float>(1.0 / (1.0 - b1t)) : 1.0f;
 				const float inv1mB2t = biasCorr ? static_cast<float>(1.0 / (1.0 - b2t)) : 1.0f;
-
-				struct Adam
-				{
-					static float signf(float x) { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); }
-
-					static void update_weight(std::vector<float>& W,
-					                          std::vector<float>& m,
-					                          std::vector<float>& v2,
-					                          std::vector<float>& gW,
-					                          float lr,
-					                          float beta1,
-					                          float beta2,
-					                          float inv1mB1t,
-					                          float inv1mB2t,
-					                          float eps,
-					                          float invBatch,
-					                          float gradScale,
-					                          float wd1,
-					                          float wd2)
-					{
-						const float oneMinusB1 = 1.0f - beta1;
-						const float oneMinusB2 = 1.0f - beta2;
-						for (size_t i = 0; i < W.size(); ++i)
-						{
-							float g = gW[i] * invBatch;
-							if (wd1 != 0.0f)
-								g += wd1 * signf(W[i]);
-							g *= gradScale;
-
-							const float mi = (beta1 * m[i]) + (oneMinusB1 * g);
-							const float vi = (beta2 * v2[i]) + (oneMinusB2 * (g * g));
-							m[i] = mi;
-							v2[i] = vi;
-
-							const float mhat = mi * inv1mB1t;
-							const float vhat = vi * inv1mB2t;
-							const float denom = static_cast<float>(sqrt(static_cast<double>(vhat))) + eps;
-							const float step = mhat / denom;
-
-							// Decoupled weight decay.
-							if (wd2 != 0.0f)
-								W[i] -= lr * wd2 * W[i];
-							W[i] -= lr * step;
-							gW[i] = 0.0f;
-						}
-					}
-
-					static void update_param(std::vector<float>& P,
-					                         std::vector<float>& m,
-					                         std::vector<float>& v2,
-					                         std::vector<float>& gP,
-					                         float lr,
-					                         float beta1,
-					                         float beta2,
-					                         float inv1mB1t,
-					                         float inv1mB2t,
-					                         float eps,
-					                         float invBatch,
-					                         float gradScale)
-					{
-						const float oneMinusB1 = 1.0f - beta1;
-						const float oneMinusB2 = 1.0f - beta2;
-						for (size_t i = 0; i < P.size(); ++i)
-						{
-							float g = (gP[i] * invBatch) * gradScale;
-							const float mi = (beta1 * m[i]) + (oneMinusB1 * g);
-							const float vi = (beta2 * v2[i]) + (oneMinusB2 * (g * g));
-							m[i] = mi;
-							v2[i] = vi;
-
-							const float mhat = mi * inv1mB1t;
-							const float vhat = vi * inv1mB2t;
-							const float denom = static_cast<float>(sqrt(static_cast<double>(vhat))) + eps;
-							const float step = mhat / denom;
-
-							P[i] -= lr * step;
-							gP[i] = 0.0f;
-						}
-					}
-				};
 
 				// Token embedding (index 0 in LM mode)
 				if (tt.tokenModel)
@@ -1918,6 +4590,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					std::fill(tt.gWOut.begin(), tt.gWOut.end(), 0.0f);
 					std::fill(tt.gBOut.begin(), tt.gBOut.end(), 0.0f);
 				}
+			}
+
+			if (captureGapDiagnostics)
+			{
+				tt.gapApplyCount += 1ULL;
+				const timespec optimizerApplyEnd = monotonic_now();
+				tt.gapApplyNsSum += monotonic_elapsed_ns(optimizerApplyStart, optimizerApplyEnd);
 			}
 
 			return true;
@@ -2199,6 +4878,20 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	// Accumulate mean NLL over non-pad tokens (natural log).
 	double tokenLmNllSum = 0.0;
 	unsigned long long tokenLmTokenCount = 0ULL;
+	if (trainingConfig.transformer.captureOptimizerGapDiagnostics)
+	{
+		tt.gapApplyCount = 0ULL;
+		tt.gapInputUpdateNormSum = 0.0;
+		tt.gapBlockUpdateNormSums.assign(nLayers, 0.0);
+		tt.gapFinalNormUpdateNormSum = 0.0;
+		tt.gapHeadUpdateNormSum = 0.0;
+		tt.gapHeadShareSum = 0.0;
+		tt.gapNonHeadShareSum = 0.0;
+		tt.gapApplyNsSum = 0.0;
+		tt.gapMarginSnapshotCount = 0ULL;
+		tt.gapTargetMarginSum = 0.0;
+		tt.gapHardNegativeLogitSum = 0.0;
+	}
 
 	unsigned long long tokensProcessed = 0ULL;
 	unsigned long long targetsProcessed = 0ULL; // token LM: non-pad targets; else: timesteps
@@ -2583,6 +5276,24 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float py = clamp_prob01(transformerScratch.probs[off + static_cast<unsigned int>(yid)]);
 					tokenLmNllSum += -log(static_cast<double>(py));
 					++tokenLmTokenCount;
+					if (trainingConfig.transformer.captureOptimizerGapDiagnostics)
+					{
+						const float targetLogit = transformerScratch.logits[off + static_cast<unsigned int>(yid)];
+						float hardNegativeLogit = -std::numeric_limits<float>::infinity();
+						for (unsigned int v = 0; v < vocabSize; ++v)
+						{
+							if (v == static_cast<unsigned int>(yid))
+								continue;
+							const float z = transformerScratch.logits[off + v];
+							if (z > hardNegativeLogit)
+								hardNegativeLogit = z;
+						}
+						if (!is_finite(hardNegativeLogit))
+							hardNegativeLogit = targetLogit;
+						tt.gapTargetMarginSum += static_cast<double>(targetLogit - hardNegativeLogit);
+						tt.gapHardNegativeLogitSum += static_cast<double>(hardNegativeLogit);
+						tt.gapMarginSnapshotCount += 1ULL;
+					}
 
 					// Results: store [expectedTokenId, predictedTokenId] for last timestep processed.
 					results.clear();
@@ -2606,6 +5317,20 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					const float py = clamp_prob01(transformerScratch.probs[off + 0u]); // col 0 is target
 					tokenLmNllSum += -log(static_cast<double>(py));
 					++tokenLmTokenCount;
+					if (trainingConfig.transformer.captureOptimizerGapDiagnostics)
+					{
+						const float targetLogit = transformerScratch.logits[off + 0u];
+						float hardNegativeLogit = targetLogit;
+						for (unsigned int j = 1u; j < S; ++j)
+						{
+							const float z = transformerScratch.logits[off + j];
+							if (j == 1u || z > hardNegativeLogit)
+								hardNegativeLogit = z;
+						}
+						tt.gapTargetMarginSum += static_cast<double>(targetLogit - hardNegativeLogit);
+						tt.gapHardNegativeLogitSum += static_cast<double>(hardNegativeLogit);
+						tt.gapMarginSnapshotCount += 1ULL;
+					}
 
 					// Results: expected token, predicted token is unknown without full vocab.
 					results.clear();
@@ -2825,6 +5550,12 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = cfg.tokenLmLossKind;
 	const int tokenLmNegK = cfg.tokenLmNegK;
 	const int padTokenId = cfg.padTokenId;
+	const bool helmEnabled =
+	    tokenLM
+	    && cfg.isTrain
+	    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS)
+	    && trainingConfig.atlas.helmEnabled
+	    && tt.helm.initialized;
 
 	// === Forward ===
 	// Input to h
@@ -3165,6 +5896,19 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 		    tt.lnFinalGamma, tt.lnFinalBeta, lnEps,
 		    hPostFinalLN, transformerScratch.lnFinalMean.data(), transformerScratch.lnFinalInvStd.data());
 	}
+	if (helmEnabled && !tt.helm.forwardCorrection.empty() && tt.helm.lastMemoryGain > 0.0f)
+	{
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+			for (unsigned int i = 0; i < dModel && i < tt.helm.forwardCorrection.size(); ++i)
+			{
+				const float corr = tt.helm.forwardCorrection[i];
+				if (std::isfinite(static_cast<double>(corr)))
+					hPostFinalLN[hOff + i] += corr;
+			}
+		}
+	}
 
 	// Output head logits
 	if (tokenLM)
@@ -3334,6 +6078,11 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = cfg.tokenLmLossKind;
 	const int padTokenId = cfg.padTokenId;
 	const bool mpUseLossScaling = cfg.mpUseLossScaling;
+	const bool helmEnabled =
+	    tokenLM
+	    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS)
+	    && trainingConfig.atlas.helmEnabled
+	    && tt.helm.initialized;
 	const bool asterEnabled =
 	    tokenLM
 	    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS)
@@ -3356,10 +6105,13 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 
 	if (tokenLM)
 	{
+		TensorTransformerState::HelmState* helm = helmEnabled ? &tt.helm : NULL;
 		TensorTransformerState::AsterState* aster = asterEnabled ? &tt.aster : NULL;
+		const unsigned int asterRegimeCount = (aster && aster->regimeCount > 0u) ? aster->regimeCount : 1u;
 		const unsigned int asterSketchSeed = 0xA57E0001u;
 		const unsigned int hiddenSketchSeed = 0xA57E1001u;
 		unsigned int validTargetsThisSeq = 0u;
+		std::vector<int> tokenLastSeen(vocabSize, -1);
 		std::fill(dH.begin(), dH.end(), 0.0f);
 		if (tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX)
 		{
@@ -3369,26 +6121,120 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 				if (padTokenId >= 0 && yid == padTokenId) continue;
 				if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize) continue;
 				++validTargetsThisSeq;
+				if (t < tokenIds.size())
+				{
+					const int xid = tokenIds[t];
+					if (xid >= 0
+					    && static_cast<unsigned int>(xid) < vocabSize
+					    && !(padTokenId >= 0 && xid == padTokenId))
+						tokenLastSeen[static_cast<unsigned int>(xid)] = static_cast<int>(t);
+				}
 				const size_t off = static_cast<size_t>(t) * static_cast<size_t>(vocabSize);
+				const unsigned int supportNegCount =
+				    (aster && aster->supportDim > 0u) ? (aster->supportDim - 1u) : 0u;
+				std::vector<unsigned int> topNegIds(supportNegCount, vocabSize);
+				std::vector<float> topNegResiduals(supportNegCount, 0.0f);
+				std::vector<float> topNegLogits(supportNegCount, 0.0f);
 				for (unsigned int v = 0; v < vocabSize; ++v)
 				{
 					const float rawResidual = transformerScratch.probs[off + v]
 					                        - ((v == static_cast<unsigned int>(yid)) ? 1.0f : 0.0f);
 					dLogits[off + v] = rawResidual;
-					if (aster)
-						aster_sketch_sparse_value(v, rawResidual, aster->sketchDim,
-						                          asterSketchSeed, aster->batchResidualSum);
+					if (supportNegCount > 0u
+					    && v != static_cast<unsigned int>(yid)
+					    && !(padTokenId >= 0 && v == static_cast<unsigned int>(padTokenId)))
+					{
+						aster_insert_top_support(v, std::max(0.0f, rawResidual),
+						                         transformerScratch.logits[off + v],
+						                         topNegIds, topNegResiduals, topNegLogits);
+					}
 				}
+				const int targetLastSeen = tokenLastSeen[static_cast<unsigned int>(yid)];
+				const float targetRepeatHit = (targetLastSeen >= 0) ? 1.0f : 0.0f;
+				const float targetRepeatCloseness =
+				    (targetLastSeen >= 0)
+				        ? (1.0f / static_cast<float>((t + 1u) - static_cast<unsigned int>(targetLastSeen)))
+				        : 0.0f;
+				const unsigned int hardNegId =
+				    (!topNegIds.empty() && topNegIds[0] < vocabSize) ? topNegIds[0] : vocabSize;
+				const int hardNegLastSeen =
+				    (hardNegId < vocabSize) ? tokenLastSeen[hardNegId] : -1;
+				const float hardNegRepeatHit = (hardNegLastSeen >= 0) ? 1.0f : 0.0f;
+				const float hardNegRepeatCloseness =
+				    (hardNegLastSeen >= 0)
+				        ? (1.0f / static_cast<float>((t + 1u) - static_cast<unsigned int>(hardNegLastSeen)))
+				        : 0.0f;
 				if (aster)
 				{
-					const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
-					for (unsigned int i = 0; i < dModel && i < aster->batchFinalHiddenRawSum.size(); ++i)
-						aster->batchFinalHiddenRawSum[i] += hPostFinalLN[hOff + i];
-					aster_sketch_dense_row(&hPostFinalLN[hOff], dModel, aster->sketchDim,
-					                       hiddenSketchSeed, aster->batchFinalHiddenSketchSum);
 					const unsigned int trackedLayers =
 					    std::min<unsigned int>(aster->hiddenStackDepth,
 					                           static_cast<unsigned int>(aster->trackedBlockIndices.size()));
+					const unsigned int tokenCondDim = std::max(1u, aster->tokenCondDim);
+					const unsigned int regime =
+					    aster_transformer_regime_from_logits(&transformerScratch.probs[off],
+					                                         &transformerScratch.logits[off],
+					                                         vocabSize,
+					                                         static_cast<unsigned int>(yid),
+					                                         padTokenId);
+					const float targetLogit =
+					    transformerScratch.logits[off + static_cast<unsigned int>(yid)];
+					const float hardNegativeLogit =
+					    (supportNegCount > 0u && !topNegIds.empty() && topNegIds[0] < vocabSize)
+					        ? topNegLogits[0]
+					        : targetLogit;
+					const float targetMargin = targetLogit - hardNegativeLogit;
+					const float marginBaseline =
+					    (regime < aster->targetMarginEma.size()) ? aster->targetMarginEma[regime] : 0.75f;
+					if (regime < aster->batchTargetMarginSum.size())
+						aster->batchTargetMarginSum[regime] += targetMargin;
+					if (regime < aster->batchHardNegativeLogitSum.size())
+						aster->batchHardNegativeLogitSum[regime] += hardNegativeLogit;
+					if (regime < aster->batchBaselineWorseSum.size())
+						aster->batchBaselineWorseSum[regime] += (targetMargin < marginBaseline) ? 1.0f : 0.0f;
+					const size_t regimeBundleOff = static_cast<size_t>(regime) * static_cast<size_t>(aster->sketchDim);
+					const size_t regimeFinalRawOff = static_cast<size_t>(regime) * static_cast<size_t>(dModel);
+					const size_t regimeLayerRawBase =
+					    static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) * static_cast<size_t>(dModel);
+					const size_t regimeLayerSketchBase =
+					    static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) * static_cast<size_t>(aster->sketchDim);
+					for (unsigned int v = 0; v < vocabSize; ++v)
+					{
+						const float rawResidual = dLogits[off + v];
+						aster_sketch_sparse_value(v, rawResidual, aster->sketchDim,
+						                          asterSketchSeed, aster->batchResidualSum, regimeBundleOff);
+					}
+					const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+					const float* finalHiddenRow = &hPostFinalLN[hOff];
+					aster_accumulate_support_role(static_cast<unsigned int>(yid), regime, asterRegimeCount, 0u, aster->supportDim,
+					                              transformerScratch.logits[off + static_cast<unsigned int>(yid)],
+					                              finalHiddenRow, dModel,
+					                              aster->batchSupportLogitSum,
+					                              aster->batchSupportCount,
+					                              aster->batchSupportHiddenRawSum,
+					                              aster->batchSupportIds,
+					                              aster->batchSupportRoleCounts);
+					aster_accumulate_support_value_only(regime, 0u, aster->supportDim,
+					                                    dLogits[off + static_cast<unsigned int>(yid)],
+					                                    aster->batchSupportResidualSum);
+					for (unsigned int r = 0; r < supportNegCount; ++r)
+					{
+						if (topNegIds[r] >= vocabSize)
+							continue;
+						aster_accumulate_support_role(topNegIds[r], regime, asterRegimeCount, r + 1u, aster->supportDim,
+						                              topNegLogits[r], finalHiddenRow, dModel,
+						                              aster->batchSupportLogitSum,
+						                              aster->batchSupportCount,
+						                              aster->batchSupportHiddenRawSum,
+						                              aster->batchSupportIds,
+						                              aster->batchSupportRoleCounts);
+						aster_accumulate_support_value_only(regime, r + 1u, aster->supportDim,
+						                                    topNegResiduals[r],
+						                                    aster->batchSupportResidualSum);
+					}
+					for (unsigned int i = 0; i < dModel && (regimeFinalRawOff + i) < aster->batchFinalHiddenRawSum.size(); ++i)
+						aster->batchFinalHiddenRawSum[regimeFinalRawOff + i] += finalHiddenRow[i];
+					aster_sketch_dense_row(finalHiddenRow, dModel, aster->sketchDim,
+					                       hiddenSketchSeed, aster->batchFinalHiddenSketchSum, regimeBundleOff);
 					for (unsigned int l = 0; l < trackedLayers; ++l)
 					{
 						const unsigned int blockIdx = aster->trackedBlockIndices[l];
@@ -3398,20 +6244,105 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 						    transformerScratch.hAfterFF.data()
 						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
 						    + hOff;
-						const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(aster->sketchDim);
+						const float* layerAttn =
+						    transformerScratch.attnOut.data()
+						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
+						    + hOff;
+						const float* layerQ =
+						    transformerScratch.Q.data()
+						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
+						    + hOff;
+						const size_t rawLayerOff = regimeLayerRawBase + static_cast<size_t>(l) * static_cast<size_t>(dModel);
+						const size_t layerOff = regimeLayerSketchBase + static_cast<size_t>(l) * static_cast<size_t>(aster->sketchDim);
+						const size_t patternOff =
+						    (static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) + l) * static_cast<size_t>(tokenCondDim);
+						for (unsigned int i = 0; i < dModel && (rawLayerOff + i) < aster->batchLayerHiddenRawSum.size(); ++i)
+							aster->batchLayerHiddenRawSum[rawLayerOff + i] += layerHidden[i];
+						for (unsigned int i = 0; i < dModel && (rawLayerOff + i) < aster->batchLayerAttnRawSum.size(); ++i)
+							aster->batchLayerAttnRawSum[rawLayerOff + i] += layerAttn[i];
 						for (unsigned int i = 0; i < dModel; ++i)
 						{
-							const float v = layerHidden[i];
-							if (v == 0.0f)
-								continue;
 							const unsigned int h = aster_mix_u32(hiddenSketchSeed
 							                                     + (blockIdx + 1u) * 0x7f4a7c15U
 							                                     + i * 0x9e3779b9U);
 							const unsigned int bucket = h % aster->sketchDim;
 							const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
-							aster->batchLayerHiddenSketchSum[layerOff + bucket] += sign * v;
+							const float hiddenV = layerHidden[i];
+							if (hiddenV != 0.0f)
+								aster->batchLayerHiddenSketchSum[layerOff + bucket] += sign * hiddenV;
+							const float attnV = layerAttn[i];
+							if (attnV != 0.0f)
+								aster->batchLayerAttnSketchSum[layerOff + bucket] += sign * attnV;
+						}
+						static const unsigned int kPatternLags[4] = { 1u, 2u, 4u, 8u };
+						const unsigned int patternCount = std::min<unsigned int>(tokenCondDim, 4u);
+						const float invScale = (dModelKV > 0u) ? (1.0f / sqrtf(static_cast<float>(dModelKV))) : 1.0f;
+						for (unsigned int p = 0; p < patternCount && (patternOff + p) < aster->batchLayerPatternSum.size(); ++p)
+						{
+							float patternValue = 0.0f;
+							const unsigned int lag = kPatternLags[p];
+							if (t >= lag)
+							{
+								const size_t prevKOff =
+								    (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) + static_cast<size_t>(t - lag))
+								    * static_cast<size_t>(dModelKV);
+								const float* prevKey = transformerScratch.K.data() + prevKOff;
+								double accum = 0.0;
+								for (unsigned int i = 0; i < dModelKV; ++i)
+									accum += static_cast<double>(layerQ[i]) * static_cast<double>(prevKey[i]);
+								patternValue = static_cast<float>(accum) * invScale;
+							}
+							aster->batchLayerPatternSum[patternOff + p] += patternValue;
+						}
+						if ((4u + 0u) < tokenCondDim && (patternOff + 4u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 4u] += targetRepeatHit;
+						if ((4u + 1u) < tokenCondDim && (patternOff + 5u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 5u] += targetRepeatCloseness;
+						if ((4u + 2u) < tokenCondDim && (patternOff + 6u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 6u] += hardNegRepeatHit;
+						if ((4u + 3u) < tokenCondDim && (patternOff + 7u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 7u] += hardNegRepeatCloseness;
+						if (aster->kappaObsDim > 0u && dHead > 0u && nKVHeads > 0u)
+						{
+							const unsigned int kappaHeads = std::min<unsigned int>(aster->kappaHeads, nHeads);
+							const unsigned int kappaLagBuckets = std::min<unsigned int>(aster->kappaLagBuckets, 4u);
+							const unsigned int kappaRank = std::max(1u, aster->kappaRank);
+							const float invHeadScale = 1.0f / sqrtf(static_cast<float>(dHead));
+							const size_t kappaOff =
+							    (static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) + l)
+							    * static_cast<size_t>(aster->kappaObsDim);
+							for (unsigned int hq = 0; hq < kappaHeads; ++hq)
+							{
+								const unsigned int kvHead =
+								    std::min<unsigned int>((hq * nKVHeads) / std::max(1u, nHeads), nKVHeads - 1u);
+								const float* qHead = layerQ + static_cast<size_t>(hq) * static_cast<size_t>(dHead);
+								for (unsigned int p = 0; p < kappaLagBuckets; ++p)
+								{
+									const unsigned int lag = kPatternLags[p];
+									if (t < lag)
+										continue;
+									const size_t prevKVOff =
+									    (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) + static_cast<size_t>(t - lag))
+									    * static_cast<size_t>(dModelKV)
+									    + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead);
+									const float* prevKey = transformerScratch.K.data() + prevKVOff;
+									const float* prevValue = transformerScratch.V.data() + prevKVOff;
+									double qk = 0.0;
+									for (unsigned int i = 0; i < dHead; ++i)
+										qk += static_cast<double>(qHead[i]) * static_cast<double>(prevKey[i]);
+									const float attnScore = static_cast<float>(qk) * invHeadScale;
+									const size_t featureBase =
+									    kappaOff + (static_cast<size_t>(hq) * static_cast<size_t>(kappaLagBuckets) + p)
+									             * static_cast<size_t>(kappaRank);
+									for (unsigned int r = 0; r < kappaRank; ++r)
+										aster->batchLayerKappaSum[featureBase + r] +=
+										    attnScore * aster_segment_mean(prevValue, dHead, kappaRank, r);
+								}
+							}
 						}
 					}
+					if (regime < aster->batchRegimeTokenCount.size())
+						aster->batchRegimeTokenCount[regime] += 1.0f;
 					aster->batchTokenCount += 1u;
 				}
 			}
@@ -3440,14 +6371,37 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 				if (padTokenId >= 0 && yid == padTokenId) continue;
 				if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize) continue;
 				++validTargetsThisSeq;
+				if (t < tokenIds.size())
+				{
+					const int xid = tokenIds[t];
+					if (xid >= 0
+					    && static_cast<unsigned int>(xid) < vocabSize
+					    && !(padTokenId >= 0 && xid == padTokenId))
+						tokenLastSeen[static_cast<unsigned int>(xid)] = static_cast<int>(t);
+				}
 
 				const size_t off = static_cast<size_t>(t) * static_cast<size_t>(S);
 				for (unsigned int j = 0u; j < S; ++j)
 					dLogits[off + j] = transformerScratch.probs[off + j];
 				dLogits[off + 0u] -= 1.0f;
 
+				const unsigned int supportNegCount =
+				    (aster && aster->supportDim > 0u) ? (aster->supportDim - 1u) : 0u;
+				std::vector<unsigned int> topNegIds(supportNegCount, vocabSize);
+				std::vector<float> topNegResiduals(supportNegCount, 0.0f);
+				std::vector<float> topNegLogits(supportNegCount, 0.0f);
+
 				const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
 				const bool haveLowpE = useLowpWeights && (tt.tokELowp.size() == tt.tokE.size()) && !tt.tokELowp.empty();
+				unsigned int regime = 0u;
+				if (aster)
+				{
+					regime = aster_transformer_regime_from_logits(&transformerScratch.probs[off],
+					                                              &transformerScratch.logits[off],
+					                                              S,
+					                                              0u,
+					                                              -1);
+				}
 				for (unsigned int j = 0u; j < S; ++j)
 				{
 					const int vid = transformerScratch.tokenLmSampleIds[off + j];
@@ -3455,9 +6409,14 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 					{
 						const float rawResidual = dLogits[off + j];
 						aster_sketch_sparse_value(static_cast<unsigned int>(vid), rawResidual, aster->sketchDim,
-						                          asterSketchSeed, aster->batchResidualSum);
+						                          asterSketchSeed, aster->batchResidualSum,
+						                          static_cast<size_t>(regime) * static_cast<size_t>(aster->sketchDim));
 						aster->batchTouchedIds.push_back(static_cast<unsigned int>(vid));
 					}
+					if (supportNegCount > 0u && j > 0u && vid >= 0 && static_cast<unsigned int>(vid) < vocabSize)
+						aster_insert_top_support(static_cast<unsigned int>(vid), std::max(0.0f, dLogits[off + j]),
+						                         transformerScratch.logits[off + j],
+						                         topNegIds, topNegResiduals, topNegLogits);
 					const float dz = clip_maybe(dLogits[off + j], gradClip) * lossScale;
 					if (dz == 0.0f) continue;
 					if (vid < 0 || static_cast<unsigned int>(vid) >= vocabSize) continue;
@@ -3470,12 +6429,74 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 						dH[hOff + i] += dz * ev;
 					}
 				}
+				const int targetLastSeen = tokenLastSeen[static_cast<unsigned int>(yid)];
+				const float targetRepeatHit = (targetLastSeen >= 0) ? 1.0f : 0.0f;
+				const float targetRepeatCloseness =
+				    (targetLastSeen >= 0)
+				        ? (1.0f / static_cast<float>((t + 1u) - static_cast<unsigned int>(targetLastSeen)))
+				        : 0.0f;
+				const unsigned int hardNegId =
+				    (!topNegIds.empty() && topNegIds[0] < vocabSize) ? topNegIds[0] : vocabSize;
+				const int hardNegLastSeen =
+				    (hardNegId < vocabSize) ? tokenLastSeen[hardNegId] : -1;
+				const float hardNegRepeatHit = (hardNegLastSeen >= 0) ? 1.0f : 0.0f;
+				const float hardNegRepeatCloseness =
+				    (hardNegLastSeen >= 0)
+				        ? (1.0f / static_cast<float>((t + 1u) - static_cast<unsigned int>(hardNegLastSeen)))
+				        : 0.0f;
 				if (aster)
 				{
-					for (unsigned int i = 0; i < dModel && i < aster->batchFinalHiddenRawSum.size(); ++i)
-						aster->batchFinalHiddenRawSum[i] += hPostFinalLN[hOff + i];
-					aster_sketch_dense_row(&hPostFinalLN[hOff], dModel, aster->sketchDim,
-					                       hiddenSketchSeed, aster->batchFinalHiddenSketchSum);
+					const unsigned int tokenCondDim = std::max(1u, aster->tokenCondDim);
+					const float targetLogit = transformerScratch.logits[off + 0u];
+					const float hardNegativeLogit =
+					    (supportNegCount > 0u && !topNegIds.empty() && topNegIds[0] < vocabSize)
+					        ? topNegLogits[0]
+					        : targetLogit;
+					const float targetMargin = targetLogit - hardNegativeLogit;
+					const float marginBaseline =
+					    (regime < aster->targetMarginEma.size()) ? aster->targetMarginEma[regime] : 0.75f;
+					if (regime < aster->batchTargetMarginSum.size())
+						aster->batchTargetMarginSum[regime] += targetMargin;
+					if (regime < aster->batchHardNegativeLogitSum.size())
+						aster->batchHardNegativeLogitSum[regime] += hardNegativeLogit;
+					if (regime < aster->batchBaselineWorseSum.size())
+						aster->batchBaselineWorseSum[regime] += (targetMargin < marginBaseline) ? 1.0f : 0.0f;
+					const float* finalHiddenRow = &hPostFinalLN[hOff];
+					const size_t regimeFinalRawOff = static_cast<size_t>(regime) * static_cast<size_t>(dModel);
+					const size_t regimeLayerRawBase =
+					    static_cast<size_t>(regime) * static_cast<size_t>(aster->hiddenStackDepth) * static_cast<size_t>(dModel);
+					const size_t regimeLayerSketchBase =
+					    static_cast<size_t>(regime) * static_cast<size_t>(aster->hiddenStackDepth) * static_cast<size_t>(aster->sketchDim);
+					aster_accumulate_support_role(static_cast<unsigned int>(yid), regime, asterRegimeCount, 0u, aster->supportDim,
+					                              transformerScratch.logits[off + 0u], finalHiddenRow, dModel,
+					                              aster->batchSupportLogitSum,
+					                              aster->batchSupportCount,
+					                              aster->batchSupportHiddenRawSum,
+					                              aster->batchSupportIds,
+					                              aster->batchSupportRoleCounts);
+					aster_accumulate_support_value_only(regime, 0u, aster->supportDim,
+					                                    dLogits[off + 0u],
+					                                    aster->batchSupportResidualSum);
+					for (unsigned int r = 0; r < supportNegCount; ++r)
+					{
+						if (topNegIds[r] >= vocabSize)
+							continue;
+						aster_accumulate_support_role(topNegIds[r], regime, asterRegimeCount, r + 1u, aster->supportDim,
+						                              topNegLogits[r], finalHiddenRow, dModel,
+						                              aster->batchSupportLogitSum,
+						                              aster->batchSupportCount,
+						                              aster->batchSupportHiddenRawSum,
+						                              aster->batchSupportIds,
+						                              aster->batchSupportRoleCounts);
+						aster_accumulate_support_value_only(regime, r + 1u, aster->supportDim,
+						                                    topNegResiduals[r],
+						                                    aster->batchSupportResidualSum);
+					}
+					for (unsigned int i = 0; i < dModel && (regimeFinalRawOff + i) < aster->batchFinalHiddenRawSum.size(); ++i)
+						aster->batchFinalHiddenRawSum[regimeFinalRawOff + i] += finalHiddenRow[i];
+					aster_sketch_dense_row(finalHiddenRow, dModel, aster->sketchDim,
+					                       hiddenSketchSeed, aster->batchFinalHiddenSketchSum,
+					                       static_cast<size_t>(regime) * static_cast<size_t>(aster->sketchDim));
 					const unsigned int trackedLayers =
 					    std::min<unsigned int>(aster->hiddenStackDepth,
 					                           static_cast<unsigned int>(aster->trackedBlockIndices.size()));
@@ -3488,22 +6509,144 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 						    transformerScratch.hAfterFF.data()
 						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
 						    + hOff;
-						const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(aster->sketchDim);
+						const float* layerAttn =
+						    transformerScratch.attnOut.data()
+						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
+						    + hOff;
+						const float* layerQ =
+						    transformerScratch.Q.data()
+						    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
+						    + hOff;
+						const size_t rawLayerOff = regimeLayerRawBase + static_cast<size_t>(l) * static_cast<size_t>(dModel);
+						const size_t layerOff = regimeLayerSketchBase + static_cast<size_t>(l) * static_cast<size_t>(aster->sketchDim);
+						const size_t patternOff =
+						    (static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) + l) * static_cast<size_t>(tokenCondDim);
+						for (unsigned int i = 0; i < dModel && (rawLayerOff + i) < aster->batchLayerHiddenRawSum.size(); ++i)
+							aster->batchLayerHiddenRawSum[rawLayerOff + i] += layerHidden[i];
+						for (unsigned int i = 0; i < dModel && (rawLayerOff + i) < aster->batchLayerAttnRawSum.size(); ++i)
+							aster->batchLayerAttnRawSum[rawLayerOff + i] += layerAttn[i];
 						for (unsigned int i = 0; i < dModel; ++i)
 						{
-							const float v = layerHidden[i];
-							if (v == 0.0f)
-								continue;
 							const unsigned int h = aster_mix_u32(hiddenSketchSeed
 							                                     + (blockIdx + 1u) * 0x7f4a7c15U
 							                                     + i * 0x9e3779b9U);
 							const unsigned int bucket = h % aster->sketchDim;
 							const float sign = ((h >> 31) != 0u) ? -1.0f : 1.0f;
-							aster->batchLayerHiddenSketchSum[layerOff + bucket] += sign * v;
+							const float hiddenV = layerHidden[i];
+							if (hiddenV != 0.0f)
+								aster->batchLayerHiddenSketchSum[layerOff + bucket] += sign * hiddenV;
+							const float attnV = layerAttn[i];
+							if (attnV != 0.0f)
+								aster->batchLayerAttnSketchSum[layerOff + bucket] += sign * attnV;
+						}
+						static const unsigned int kPatternLags[4] = { 1u, 2u, 4u, 8u };
+						const unsigned int patternCount = std::min<unsigned int>(tokenCondDim, 4u);
+						const float invScale = (dModelKV > 0u) ? (1.0f / sqrtf(static_cast<float>(dModelKV))) : 1.0f;
+						for (unsigned int p = 0; p < patternCount && (patternOff + p) < aster->batchLayerPatternSum.size(); ++p)
+						{
+							float patternValue = 0.0f;
+							const unsigned int lag = kPatternLags[p];
+							if (t >= lag)
+							{
+								const size_t prevKOff =
+								    (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) + static_cast<size_t>(t - lag))
+								    * static_cast<size_t>(dModelKV);
+								const float* prevKey = transformerScratch.K.data() + prevKOff;
+								double accum = 0.0;
+								for (unsigned int i = 0; i < dModelKV; ++i)
+									accum += static_cast<double>(layerQ[i]) * static_cast<double>(prevKey[i]);
+								patternValue = static_cast<float>(accum) * invScale;
+							}
+							aster->batchLayerPatternSum[patternOff + p] += patternValue;
+						}
+						if ((4u + 0u) < tokenCondDim && (patternOff + 4u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 4u] += targetRepeatHit;
+						if ((4u + 1u) < tokenCondDim && (patternOff + 5u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 5u] += targetRepeatCloseness;
+						if ((4u + 2u) < tokenCondDim && (patternOff + 6u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 6u] += hardNegRepeatHit;
+						if ((4u + 3u) < tokenCondDim && (patternOff + 7u) < aster->batchLayerPatternSum.size())
+							aster->batchLayerPatternSum[patternOff + 7u] += hardNegRepeatCloseness;
+						if (aster->kappaObsDim > 0u && dHead > 0u && nKVHeads > 0u)
+						{
+							const unsigned int kappaHeads = std::min<unsigned int>(aster->kappaHeads, nHeads);
+							const unsigned int kappaLagBuckets = std::min<unsigned int>(aster->kappaLagBuckets, 4u);
+							const unsigned int kappaRank = std::max(1u, aster->kappaRank);
+							const float invHeadScale = 1.0f / sqrtf(static_cast<float>(dHead));
+							const size_t kappaOff =
+							    (static_cast<size_t>(regime) * static_cast<size_t>(trackedLayers) + l)
+							    * static_cast<size_t>(aster->kappaObsDim);
+							for (unsigned int hq = 0; hq < kappaHeads; ++hq)
+							{
+								const unsigned int kvHead =
+								    std::min<unsigned int>((hq * nKVHeads) / std::max(1u, nHeads), nKVHeads - 1u);
+								const float* qHead = layerQ + static_cast<size_t>(hq) * static_cast<size_t>(dHead);
+								for (unsigned int p = 0; p < kappaLagBuckets; ++p)
+								{
+									const unsigned int lag = kPatternLags[p];
+									if (t < lag)
+										continue;
+									const size_t prevKVOff =
+									    (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) + static_cast<size_t>(t - lag))
+									    * static_cast<size_t>(dModelKV)
+									    + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead);
+									const float* prevKey = transformerScratch.K.data() + prevKVOff;
+									const float* prevValue = transformerScratch.V.data() + prevKVOff;
+									double qk = 0.0;
+									for (unsigned int i = 0; i < dHead; ++i)
+										qk += static_cast<double>(qHead[i]) * static_cast<double>(prevKey[i]);
+									const float attnScore = static_cast<float>(qk) * invHeadScale;
+									const size_t featureBase =
+									    kappaOff + (static_cast<size_t>(hq) * static_cast<size_t>(kappaLagBuckets) + p)
+									             * static_cast<size_t>(kappaRank);
+									for (unsigned int r = 0; r < kappaRank; ++r)
+										aster->batchLayerKappaSum[featureBase + r] +=
+										    attnScore * aster_segment_mean(prevValue, dHead, kappaRank, r);
+								}
+							}
 						}
 					}
+					if (regime < aster->batchRegimeTokenCount.size())
+						aster->batchRegimeTokenCount[regime] += 1.0f;
 					aster->batchTokenCount += 1u;
 				}
+			}
+		}
+		if (helm)
+		{
+			const unsigned int trackedLayers =
+			    std::min<unsigned int>(helm->hiddenStackDepth,
+			                           static_cast<unsigned int>(helm->trackedBlockIndices.size()));
+			for (unsigned int t = 0; t < T; ++t)
+			{
+				const int yid = targetIds[t];
+				if (padTokenId >= 0 && yid == padTokenId) continue;
+				if (yid < 0 || static_cast<unsigned int>(yid) >= vocabSize) continue;
+				const size_t hOff = static_cast<size_t>(t) * static_cast<size_t>(dModel);
+				for (unsigned int l = 0; l < trackedLayers; ++l)
+				{
+					const unsigned int blockIdx = helm->trackedBlockIndices[l];
+					if (blockIdx >= nLayers)
+						continue;
+					const float* layerHidden =
+					    transformerScratch.hAfterFF.data()
+					    + (static_cast<size_t>(blockIdx) * static_cast<size_t>(T) * static_cast<size_t>(dModel))
+					    + hOff;
+					const size_t layerOff = static_cast<size_t>(l) * static_cast<size_t>(dModel);
+					for (unsigned int i = 0; i < dModel && (layerOff + i) < helm->batchHiddenSum.size(); ++i)
+					{
+						const float h = layerHidden[i];
+						helm->batchHiddenSum[layerOff + i] += h;
+						helm->batchHiddenSqSum[layerOff + i] += h * h;
+					}
+				}
+				for (unsigned int i = 0; i < dModel && i < helm->batchResidualSum.size(); ++i)
+				{
+					const float r = dH[hOff + i];
+					helm->batchResidualSum[i] += r;
+					helm->batchResidualSqSum[i] += r * r;
+				}
+				helm->batchTokenCount += 1u;
 			}
 		}
 		timeStepsInBatch += validTargetsThisSeq;
@@ -3942,6 +7085,9 @@ bool glades::NNetwork::tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg,
                                                  shmea::GLogger* logger)
 {
 	if (!trainingConfig.gpu.enable || !cfg.isTrain)
+		return false;
+	if (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS
+	    && trainingConfig.atlas.helmEnabled)
 		return false;
 
 	const bool gpuReady = ensureGpuState();

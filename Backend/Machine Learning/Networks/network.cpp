@@ -39,6 +39,7 @@
 #include <iomanip>
 #include <limits>
 #include <locale>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 
@@ -105,6 +106,55 @@ struct AtlasRuntimeAccumulator
 	double asterStateFitMsSum;
 	double asterInnovationFitMsSum;
 	double asterApplyMsSum;
+	unsigned int aegisMatrices;
+	double aegisLambdaSpatialSum;
+	double aegisLambdaPredictiveSum;
+	double aegisLambdaOutputSum;
+	double aegisPredictivePredictedSum;
+	double aegisPredictiveRealizedSum;
+	double aegisOutputPredictedSum;
+	double aegisOutputRealizedSum;
+	double aegisPredictiveErrorSum;
+	double aegisOutputErrorSum;
+	double aegisChannelDisagreementSum;
+	unsigned int citadelMatrices;
+	double citadelAnchorSum;
+	double citadelHardRegimeMassSum;
+	double citadelSparrowTrustSum;
+	unsigned int rampartMatrices;
+	double rampartTauSum;
+	double rampartBudgetSum;
+	double rampartCovarianceSum;
+	double rampartSparrowTrustSum;
+	unsigned int meritMatrices;
+	double meritTauSum;
+	double meritBudgetSum;
+	double meritCovarianceSum;
+	double meritSparrowTrustSum;
+	double meritGeometryTrustSum;
+	unsigned int strataMatrices;
+	double strataNullModeSum;
+	double strataPredictiveModeSum;
+	double strataOutputModeSum;
+	double strataCoupledModeSum;
+	double strataBudgetSum;
+	double strataNullBenefitSum;
+	double strataPredictiveBenefitSum;
+	double strataOutputBenefitSum;
+	double strataCoupledBenefitSum;
+	double strataSelectedExcessSum;
+	double strataSwitchRateSum;
+	unsigned int transformerGapBatches;
+	double transformerInputUpdateNormSum;
+	std::vector<double> transformerBlockUpdateNormSum;
+	double transformerFinalNormUpdateNormSum;
+	double transformerHeadUpdateNormSum;
+	double transformerHeadShareSum;
+	double transformerNonHeadShareSum;
+	double transformerApplyMsSum;
+	unsigned int transformerMarginSnapshots;
+	double transformerTargetMarginSum;
+	double transformerHardNegativeLogitSum;
 
 	AtlasRuntimeAccumulator()
 	    : atlasMatrices(0u),
@@ -142,7 +192,56 @@ struct AtlasRuntimeAccumulator
 	      asterTransferFitMsSum(0.0),
 	      asterStateFitMsSum(0.0),
 	      asterInnovationFitMsSum(0.0),
-	      asterApplyMsSum(0.0)
+	      asterApplyMsSum(0.0),
+	      aegisMatrices(0u),
+	      aegisLambdaSpatialSum(0.0),
+	      aegisLambdaPredictiveSum(0.0),
+	      aegisLambdaOutputSum(0.0),
+	      aegisPredictivePredictedSum(0.0),
+	      aegisPredictiveRealizedSum(0.0),
+	      aegisOutputPredictedSum(0.0),
+	      aegisOutputRealizedSum(0.0),
+	      aegisPredictiveErrorSum(0.0),
+	      aegisOutputErrorSum(0.0),
+	      aegisChannelDisagreementSum(0.0),
+	      citadelMatrices(0u),
+	      citadelAnchorSum(0.0),
+	      citadelHardRegimeMassSum(0.0),
+	      citadelSparrowTrustSum(0.0),
+	      rampartMatrices(0u),
+	      rampartTauSum(0.0),
+	      rampartBudgetSum(0.0),
+	      rampartCovarianceSum(0.0),
+	      rampartSparrowTrustSum(0.0),
+	      meritMatrices(0u),
+	      meritTauSum(0.0),
+	      meritBudgetSum(0.0),
+	      meritCovarianceSum(0.0),
+	      meritSparrowTrustSum(0.0),
+	      meritGeometryTrustSum(0.0),
+	      strataMatrices(0u),
+	      strataNullModeSum(0.0),
+	      strataPredictiveModeSum(0.0),
+	      strataOutputModeSum(0.0),
+	      strataCoupledModeSum(0.0),
+	      strataBudgetSum(0.0),
+	      strataNullBenefitSum(0.0),
+	      strataPredictiveBenefitSum(0.0),
+	      strataOutputBenefitSum(0.0),
+	      strataCoupledBenefitSum(0.0),
+	      strataSelectedExcessSum(0.0),
+	      strataSwitchRateSum(0.0),
+	      transformerGapBatches(0u),
+	      transformerInputUpdateNormSum(0.0),
+	      transformerBlockUpdateNormSum(),
+	      transformerFinalNormUpdateNormSum(0.0),
+	      transformerHeadUpdateNormSum(0.0),
+	      transformerHeadShareSum(0.0),
+	      transformerNonHeadShareSum(0.0),
+	      transformerApplyMsSum(0.0),
+	      transformerMarginSnapshots(0u),
+	      transformerTargetMarginSum(0.0),
+	      transformerHardNegativeLogitSum(0.0)
 	{
 	}
 };
@@ -217,8 +316,7 @@ glades::NNetwork::NNetwork(int newNetType)
 	serverInstance = NULL;
 	cConnection = NULL;
 	loggerOverride = NULL;
-	// Modern training loop defaults (preserve behavior)
-	trainingConfig = TrainingConfig();
+	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
 	lastGradNorm = 0.0f;
@@ -267,8 +365,7 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	serverInstance = NULL;
 	cConnection = NULL;
 	loggerOverride = NULL;
-	// Modern training loop defaults (preserve behavior)
-	trainingConfig = TrainingConfig();
+	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
 	lastGradNorm = 0.0f;
@@ -1298,6 +1395,59 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 				acc.asterInnovationFitMsSum += tensorDff.aster.totalInnovationFitNs * invCount * nsToMs;
 				acc.asterApplyMsSum += tensorDff.aster.totalApplyNs * invCount * nsToMs;
 			}
+			if (trainingConfig.atlas.aegisEnabled)
+			{
+				acc.aegisMatrices += 1u;
+				acc.aegisLambdaSpatialSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastLambdaSpatial);
+				acc.aegisLambdaPredictiveSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastLambdaPredictive);
+				acc.aegisLambdaOutputSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastLambdaOutput);
+				acc.aegisPredictivePredictedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastPredictivePredicted);
+				acc.aegisPredictiveRealizedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastPredictiveRealized);
+				acc.aegisOutputPredictedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastOutputPredicted);
+				acc.aegisOutputRealizedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastOutputRealized);
+				acc.aegisPredictiveErrorSum += atlas_runtime_nonneg(tensorDff.aster.aegisPredictiveErrorEma);
+				acc.aegisOutputErrorSum += atlas_runtime_nonneg(tensorDff.aster.aegisOutputErrorEma);
+				acc.aegisChannelDisagreementSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastChannelDisagreement);
+			}
+			if (trainingConfig.atlas.citadelEnabled)
+			{
+				acc.citadelMatrices += 1u;
+				acc.citadelAnchorSum += atlas_runtime_nonneg(tensorDff.aster.citadelLastAnchor);
+				acc.citadelHardRegimeMassSum += atlas_runtime_nonneg(tensorDff.aster.citadelLastHardRegimeMass);
+				acc.citadelSparrowTrustSum += atlas_runtime_nonneg(tensorDff.aster.citadelLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.rampartEnabled)
+			{
+				acc.rampartMatrices += 1u;
+				acc.rampartTauSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastTau);
+				acc.rampartBudgetSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastBudget);
+				acc.rampartCovarianceSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastCovariance);
+				acc.rampartSparrowTrustSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.meritEnabled)
+			{
+				acc.meritMatrices += 1u;
+				acc.meritTauSum += atlas_runtime_nonneg(tensorDff.aster.meritLastTau);
+				acc.meritBudgetSum += atlas_runtime_nonneg(tensorDff.aster.meritLastBudget);
+				acc.meritCovarianceSum += atlas_runtime_nonneg(tensorDff.aster.meritLastCovariance);
+				acc.meritSparrowTrustSum += atlas_runtime_nonneg(tensorDff.aster.meritLastSparrowTrust);
+				acc.meritGeometryTrustSum += atlas_runtime_nonneg(tensorDff.aster.meritLastGeometryTrust);
+			}
+			if (trainingConfig.atlas.strataEnabled)
+			{
+				acc.strataMatrices += 1u;
+				acc.strataNullModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastNullMode);
+				acc.strataPredictiveModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastPredictiveMode);
+				acc.strataOutputModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastOutputMode);
+				acc.strataCoupledModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastCoupledMode);
+				acc.strataBudgetSum += atlas_runtime_nonneg(tensorDff.aster.strataLastBudget);
+				acc.strataNullBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastNullBenefit, 0.0);
+				acc.strataPredictiveBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastPredictiveBenefit, 0.0);
+				acc.strataOutputBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastOutputBenefit, 0.0);
+				acc.strataCoupledBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastCoupledBenefit, 0.0);
+				acc.strataSelectedExcessSum += atlas_runtime_value(tensorDff.aster.strataLastSelectedExcess, 0.0);
+				acc.strataSwitchRateSum += atlas_runtime_nonneg(tensorDff.aster.strataLastSwitchRate);
+			}
 		}
 	}
 	if (tensorRnn.initialized)
@@ -1349,6 +1499,44 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 			accumulate_atlas_runtime(acc, b.atlasW2, sparrowEnabled);
 		}
 		accumulate_atlas_runtime(acc, tensorTransformer.atlasWOut, sparrowEnabled);
+		if (tensorTransformer.gapApplyCount > 0ULL)
+		{
+			const double denom = static_cast<double>(tensorTransformer.gapApplyCount);
+			acc.transformerGapBatches += 1u;
+			acc.transformerInputUpdateNormSum += tensorTransformer.gapInputUpdateNormSum / denom;
+			if (acc.transformerBlockUpdateNormSum.size() < tensorTransformer.gapBlockUpdateNormSums.size())
+				acc.transformerBlockUpdateNormSum.resize(tensorTransformer.gapBlockUpdateNormSums.size(), 0.0);
+			for (size_t i = 0; i < tensorTransformer.gapBlockUpdateNormSums.size(); ++i)
+				acc.transformerBlockUpdateNormSum[i] += tensorTransformer.gapBlockUpdateNormSums[i] / denom;
+			acc.transformerFinalNormUpdateNormSum += tensorTransformer.gapFinalNormUpdateNormSum / denom;
+			acc.transformerHeadUpdateNormSum += tensorTransformer.gapHeadUpdateNormSum / denom;
+			acc.transformerHeadShareSum += tensorTransformer.gapHeadShareSum / denom;
+			acc.transformerNonHeadShareSum += tensorTransformer.gapNonHeadShareSum / denom;
+			acc.transformerApplyMsSum += (tensorTransformer.gapApplyNsSum / denom) * 1.0e-6;
+		}
+		if (tensorTransformer.gapMarginSnapshotCount > 0ULL)
+		{
+			const double denom = static_cast<double>(tensorTransformer.gapMarginSnapshotCount);
+			acc.transformerMarginSnapshots += 1u;
+			acc.transformerTargetMarginSum += tensorTransformer.gapTargetMarginSum / denom;
+			acc.transformerHardNegativeLogitSum += tensorTransformer.gapHardNegativeLogitSum / denom;
+		}
+		if (helmEnabled && tensorTransformer.helm.initialized)
+		{
+			acc.helmMatrices += 1u;
+			acc.helmActiveModesSum += static_cast<double>(tensorTransformer.helm.lastActiveModes);
+			if (tensorTransformer.helm.lastActiveModes >= 2u)
+				acc.helmMode2Matrices += 1u;
+			acc.helmEdgeSum += atlas_runtime_nonneg(tensorTransformer.helm.lastEdge);
+			acc.helmSecondEdgeSum += atlas_runtime_nonneg(tensorTransformer.helm.lastSecondEdge);
+			acc.helmSecondEdgeRatioSum += atlas_runtime_nonneg(tensorTransformer.helm.lastSecondEdgeRatio);
+			acc.helmSigmaSum += atlas_runtime_nonneg(tensorTransformer.helm.lastSigma);
+			acc.helmPredR2Sum += atlas_runtime_value(tensorTransformer.helm.lastPredR2, 0.0);
+			acc.helmMemoryGainSum += atlas_runtime_nonneg(tensorTransformer.helm.lastMemoryGain);
+			acc.helmPoleSum += tensorTransformer.helm.pole.empty()
+			                   ? 0.0
+			                   : atlas_runtime_value(tensorTransformer.helm.pole[0], 0.0);
+		}
 		if (asterEnabled && tensorTransformer.aster.initialized)
 		{
 			acc.asterMatrices += 1u;
@@ -1361,9 +1549,7 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 			acc.asterSigmaSum += atlas_runtime_nonneg(tensorTransformer.aster.lastSigma);
 			acc.asterPredR2Sum += atlas_runtime_value(tensorTransformer.aster.lastPredR2, 0.0);
 			acc.asterMemoryGainSum += atlas_runtime_nonneg(tensorTransformer.aster.lastMemoryGain);
-			acc.asterPoleSum += tensorTransformer.aster.pole.empty()
-			                    ? 0.0
-			                    : atlas_runtime_value(tensorTransformer.aster.pole[0], 0.0);
+			acc.asterPoleSum += atlas_runtime_value(tensorTransformer.aster.lastPoleSummary, 0.0);
 			if (tensorTransformer.aster.timingBoundaryCount > 0ULL)
 			{
 				const double nsToMs = 1.0 / 1000000.0;
@@ -1376,6 +1562,59 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 				acc.asterStateFitMsSum += tensorTransformer.aster.totalStateFitNs * invCount * nsToMs;
 				acc.asterInnovationFitMsSum += tensorTransformer.aster.totalInnovationFitNs * invCount * nsToMs;
 				acc.asterApplyMsSum += tensorTransformer.aster.totalApplyNs * invCount * nsToMs;
+			}
+			if (trainingConfig.atlas.aegisEnabled)
+			{
+				acc.aegisMatrices += 1u;
+				acc.aegisLambdaSpatialSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastLambdaSpatial);
+				acc.aegisLambdaPredictiveSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastLambdaPredictive);
+				acc.aegisLambdaOutputSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastLambdaOutput);
+				acc.aegisPredictivePredictedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastPredictivePredicted);
+				acc.aegisPredictiveRealizedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastPredictiveRealized);
+				acc.aegisOutputPredictedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastOutputPredicted);
+				acc.aegisOutputRealizedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastOutputRealized);
+				acc.aegisPredictiveErrorSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisPredictiveErrorEma);
+				acc.aegisOutputErrorSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisOutputErrorEma);
+				acc.aegisChannelDisagreementSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastChannelDisagreement);
+			}
+			if (trainingConfig.atlas.citadelEnabled)
+			{
+				acc.citadelMatrices += 1u;
+				acc.citadelAnchorSum += atlas_runtime_nonneg(tensorTransformer.aster.citadelLastAnchor);
+				acc.citadelHardRegimeMassSum += atlas_runtime_nonneg(tensorTransformer.aster.citadelLastHardRegimeMass);
+				acc.citadelSparrowTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.citadelLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.rampartEnabled)
+			{
+				acc.rampartMatrices += 1u;
+				acc.rampartTauSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastTau);
+				acc.rampartBudgetSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastBudget);
+				acc.rampartCovarianceSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastCovariance);
+				acc.rampartSparrowTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.meritEnabled)
+			{
+				acc.meritMatrices += 1u;
+				acc.meritTauSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastTau);
+				acc.meritBudgetSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastBudget);
+				acc.meritCovarianceSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastCovariance);
+				acc.meritSparrowTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastSparrowTrust);
+				acc.meritGeometryTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastGeometryTrust);
+			}
+			if (trainingConfig.atlas.strataEnabled)
+			{
+				acc.strataMatrices += 1u;
+				acc.strataNullModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastNullMode);
+				acc.strataPredictiveModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastPredictiveMode);
+				acc.strataOutputModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastOutputMode);
+				acc.strataCoupledModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastCoupledMode);
+				acc.strataBudgetSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastBudget);
+				acc.strataNullBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastNullBenefit, 0.0);
+				acc.strataPredictiveBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastPredictiveBenefit, 0.0);
+				acc.strataOutputBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastOutputBenefit, 0.0);
+				acc.strataCoupledBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastCoupledBenefit, 0.0);
+				acc.strataSelectedExcessSum += atlas_runtime_value(tensorTransformer.aster.strataLastSelectedExcess, 0.0);
+				acc.strataSwitchRateSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastSwitchRate);
 			}
 		}
 	}
@@ -1432,6 +1671,148 @@ bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) 
 		out.asterMeanInnovationFitMs = acc.asterInnovationFitMsSum / denom;
 		out.asterMeanApplyMs = acc.asterApplyMsSum / denom;
 	}
+	out.aegisMatrices = acc.aegisMatrices;
+	if (acc.aegisMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.aegisMatrices);
+		out.aegisMeanLambdaSpatial = acc.aegisLambdaSpatialSum / denom;
+		out.aegisMeanLambdaPredictive = acc.aegisLambdaPredictiveSum / denom;
+		out.aegisMeanLambdaOutput = acc.aegisLambdaOutputSum / denom;
+		out.aegisMeanPredictivePredicted = acc.aegisPredictivePredictedSum / denom;
+		out.aegisMeanPredictiveRealized = acc.aegisPredictiveRealizedSum / denom;
+		out.aegisMeanOutputPredicted = acc.aegisOutputPredictedSum / denom;
+		out.aegisMeanOutputRealized = acc.aegisOutputRealizedSum / denom;
+		out.aegisMeanPredictiveError = acc.aegisPredictiveErrorSum / denom;
+		out.aegisMeanOutputError = acc.aegisOutputErrorSum / denom;
+		out.aegisMeanChannelDisagreement = acc.aegisChannelDisagreementSum / denom;
+	}
+	out.citadelMatrices = acc.citadelMatrices;
+	if (acc.citadelMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.citadelMatrices);
+		out.citadelMeanAnchor = acc.citadelAnchorSum / denom;
+		out.citadelMeanHardRegimeMass = acc.citadelHardRegimeMassSum / denom;
+		out.citadelMeanSparrowTrust = acc.citadelSparrowTrustSum / denom;
+	}
+	out.rampartMatrices = acc.rampartMatrices;
+	if (acc.rampartMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.rampartMatrices);
+		out.rampartMeanTau = acc.rampartTauSum / denom;
+		out.rampartMeanBudget = acc.rampartBudgetSum / denom;
+		out.rampartMeanCovariance = acc.rampartCovarianceSum / denom;
+		out.rampartMeanSparrowTrust = acc.rampartSparrowTrustSum / denom;
+	}
+	out.meritMatrices = acc.meritMatrices;
+	if (acc.meritMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.meritMatrices);
+		out.meritMeanTau = acc.meritTauSum / denom;
+		out.meritMeanBudget = acc.meritBudgetSum / denom;
+		out.meritMeanCovariance = acc.meritCovarianceSum / denom;
+		out.meritMeanSparrowTrust = acc.meritSparrowTrustSum / denom;
+		out.meritMeanGeometryTrust = acc.meritGeometryTrustSum / denom;
+	}
+	out.strataMatrices = acc.strataMatrices;
+	if (acc.strataMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.strataMatrices);
+		out.strataMeanNullMode = acc.strataNullModeSum / denom;
+		out.strataMeanPredictiveMode = acc.strataPredictiveModeSum / denom;
+		out.strataMeanOutputMode = acc.strataOutputModeSum / denom;
+		out.strataMeanCoupledMode = acc.strataCoupledModeSum / denom;
+		out.strataMeanBudget = acc.strataBudgetSum / denom;
+		out.strataMeanNullBenefit = acc.strataNullBenefitSum / denom;
+		out.strataMeanPredictiveBenefit = acc.strataPredictiveBenefitSum / denom;
+		out.strataMeanOutputBenefit = acc.strataOutputBenefitSum / denom;
+		out.strataMeanCoupledBenefit = acc.strataCoupledBenefitSum / denom;
+		out.strataMeanSelectedExcess = acc.strataSelectedExcessSum / denom;
+		out.strataMeanSwitchRate = acc.strataSwitchRateSum / denom;
+	}
+	out.transformerGapBatches = acc.transformerGapBatches;
+	if (acc.transformerGapBatches > 0u)
+	{
+		const double denom = static_cast<double>(acc.transformerGapBatches);
+		out.transformerMeanInputUpdateNorm = acc.transformerInputUpdateNormSum / denom;
+		out.transformerMeanBlockUpdateNorms.resize(acc.transformerBlockUpdateNormSum.size(), 0.0);
+		for (size_t i = 0; i < acc.transformerBlockUpdateNormSum.size(); ++i)
+			out.transformerMeanBlockUpdateNorms[i] = acc.transformerBlockUpdateNormSum[i] / denom;
+		out.transformerMeanFinalNormUpdateNorm = acc.transformerFinalNormUpdateNormSum / denom;
+		out.transformerMeanHeadUpdateNorm = acc.transformerHeadUpdateNormSum / denom;
+		out.transformerMeanHeadShare = acc.transformerHeadShareSum / denom;
+		out.transformerMeanNonHeadShare = acc.transformerNonHeadShareSum / denom;
+		out.transformerMeanApplyMs = acc.transformerApplyMsSum / denom;
+	}
+	out.transformerMarginSnapshots = acc.transformerMarginSnapshots;
+	if (acc.transformerMarginSnapshots > 0u)
+	{
+		const double denom = static_cast<double>(acc.transformerMarginSnapshots);
+		out.transformerMeanTargetMargin = acc.transformerTargetMarginSum / denom;
+		out.transformerMeanHardNegativeLogit = acc.transformerHardNegativeLogitSum / denom;
+	}
+	return true;
+}
+
+bool glades::NNetwork::getTransformerGroupedParameterSnapshot(TransformerGroupedParameterSnapshot& out) const
+{
+	out = TransformerGroupedParameterSnapshot();
+	if (!tensorTransformer.initialized)
+		return false;
+
+	const TensorTransformerState& tt = tensorTransformer;
+	const unsigned int nLayers = tt.nLayers;
+
+	out.inputGroup.reserve(tt.WIn.size() + tt.bIn.size());
+	out.inputGroup.insert(out.inputGroup.end(), tt.WIn.begin(), tt.WIn.end());
+	out.inputGroup.insert(out.inputGroup.end(), tt.bIn.begin(), tt.bIn.end());
+
+	out.blockGroups.resize(nLayers);
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		const TensorTransformerState::Block& b = tt.blocks[li];
+		std::vector<float>& group = out.blockGroups[li];
+		group.reserve(b.Wq.size() + b.Wk.size() + b.Wv.size() + b.Wo.size()
+		              + b.W1.size() + b.W2.size()
+		              + b.bq.size() + b.bk.size() + b.bv.size() + b.bo.size()
+		              + b.b1.size() + b.b2.size()
+		              + b.ln1Gamma.size() + b.ln1Beta.size()
+		              + b.ln2Gamma.size() + b.ln2Beta.size());
+		group.insert(group.end(), b.Wq.begin(), b.Wq.end());
+		group.insert(group.end(), b.Wk.begin(), b.Wk.end());
+		group.insert(group.end(), b.Wv.begin(), b.Wv.end());
+		group.insert(group.end(), b.Wo.begin(), b.Wo.end());
+		group.insert(group.end(), b.W1.begin(), b.W1.end());
+		group.insert(group.end(), b.W2.begin(), b.W2.end());
+		group.insert(group.end(), b.bq.begin(), b.bq.end());
+		group.insert(group.end(), b.bk.begin(), b.bk.end());
+		group.insert(group.end(), b.bv.begin(), b.bv.end());
+		group.insert(group.end(), b.bo.begin(), b.bo.end());
+		group.insert(group.end(), b.b1.begin(), b.b1.end());
+		group.insert(group.end(), b.b2.begin(), b.b2.end());
+		group.insert(group.end(), b.ln1Gamma.begin(), b.ln1Gamma.end());
+		group.insert(group.end(), b.ln1Beta.begin(), b.ln1Beta.end());
+		group.insert(group.end(), b.ln2Gamma.begin(), b.ln2Gamma.end());
+		group.insert(group.end(), b.ln2Beta.begin(), b.ln2Beta.end());
+	}
+
+	out.finalNormGroup.reserve(tt.lnFinalGamma.size() + tt.lnFinalBeta.size());
+	out.finalNormGroup.insert(out.finalNormGroup.end(), tt.lnFinalGamma.begin(), tt.lnFinalGamma.end());
+	out.finalNormGroup.insert(out.finalNormGroup.end(), tt.lnFinalBeta.begin(), tt.lnFinalBeta.end());
+
+	if (tt.tokenModel)
+	{
+		out.headGroup.reserve(tt.tokE.size() + tt.lmBias.size());
+		out.headGroup.insert(out.headGroup.end(), tt.tokE.begin(), tt.tokE.end());
+		out.headGroup.insert(out.headGroup.end(), tt.lmBias.begin(), tt.lmBias.end());
+	}
+	else
+	{
+		out.headGroup.reserve(tt.WOut.size() + tt.bOut.size());
+		out.headGroup.insert(out.headGroup.end(), tt.WOut.begin(), tt.WOut.end());
+		out.headGroup.insert(out.headGroup.end(), tt.bOut.begin(), tt.bOut.end());
+	}
+
+	out.valid = true;
 	return true;
 }
 
@@ -1596,10 +1977,11 @@ void glades::NNetwork::clean()
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
 	storeRunningFlag(false);
 	lastStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
-	// Reset training configuration to defaults.
-	trainingConfig = TrainingConfig();
-	// Reset transformer serving metrics config (opt-in).
-	transformerMetricsCfg = TransformerMetricsConfig();
+	// Reconstruct configs in place so reset does not depend on assignment over a live object.
+	trainingConfig.~TrainingConfig();
+	new (&trainingConfig) TrainingConfig();
+	transformerMetricsCfg.~TransformerMetricsConfig();
+	new (&transformerMetricsCfg) TransformerMetricsConfig();
 	// Reset tokenizer/vocab artifacts (deployment metadata).
 	tokenizerArtifactsPresent = false;
 	tokenizerArtifacts.reset();
@@ -2064,8 +2446,15 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		tensorTransformer.tieEmbeddings = modelCfg.tieEmbeddings;
 		tensorTransformer.optimizerStep = 0ULL;
 
-		// ATLAS uses its own per-matrix state; skip AdamW moment buffers (v*/v2*) to save memory.
-		const bool needAdamMoments = (trainingConfig.optimizer.type != OptimizerConfig::ATLAS);
+		// ATLAS normally uses its own per-matrix state and skips AdamW moments to
+		// save memory. Some transformer-side experimental branches reuse Adam-style
+		// diagonal moments as part of their backbone even under optimizer=ATLAS.
+		const bool needAdamMoments =
+		    (trainingConfig.optimizer.type != OptimizerConfig::ATLAS)
+		    || (trainingConfig.optimizer.type == OptimizerConfig::ATLAS
+		        && ((trainingConfig.atlas.auroraEnabled
+		             && trainingConfig.atlas.auroraAdamwBackbone)
+		            || trainingConfig.atlas.geodeEnabled));
 
 		// Token LM tensors (embedding + bias)
 		if (tokenModel)
@@ -2231,6 +2620,60 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		}
 
 		if ((trainingConfig.optimizer.type == OptimizerConfig::ATLAS)
+		    && trainingConfig.atlas.helmEnabled
+		    && tokenModel
+		    && modelCfg.nLayers > 0u
+		    && dModel > 0u)
+		{
+			TensorTransformerState::HelmState& helm = tensorTransformer.helm;
+			const unsigned int requestedDepth = std::max(1u, trainingConfig.atlas.helmHiddenStackDepth);
+			const unsigned int stackDepth = std::min(requestedDepth, modelCfg.nLayers);
+			const unsigned int hiddenDim = stackDepth * dModel;
+			const unsigned int outputDim = dModel;
+			const unsigned int pastDim = hiddenDim + outputDim;
+			const unsigned int modeRank =
+			    std::max(1u, std::min(trainingConfig.atlas.helmModeRank, std::max(1u, outputDim)));
+
+			helm.reset();
+			helm.initialized = (stackDepth > 0u) && (hiddenDim > 0u) && (outputDim > 0u);
+			helm.hiddenDim = hiddenDim;
+			helm.outputDim = outputDim;
+			helm.hiddenStackDepth = stackDepth;
+			helm.modeRank = modeRank;
+			helm.trackedBlockIndices.reserve(stackDepth);
+			for (unsigned int d = 0u; d < stackDepth; ++d)
+				helm.trackedBlockIndices.push_back(modelCfg.nLayers - stackDepth + d);
+			helm.prevHiddenMean.assign(hiddenDim, 0.0f);
+			helm.prevResidualMean.assign(outputDim, 0.0f);
+			helm.hiddenVar.assign(hiddenDim, 1.0f);
+			helm.residualVar.assign(outputDim, 1.0f);
+			helm.crossCov.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(pastDim), 0.0f);
+			helm.sigma.assign(modeRank, 0.0f);
+			helm.leftMode.assign(static_cast<size_t>(modeRank) * static_cast<size_t>(outputDim), 0.0f);
+			helm.rightMode.assign(static_cast<size_t>(modeRank) * static_cast<size_t>(pastDim), 0.0f);
+			for (unsigned int m = 0u; m < modeRank; ++m)
+			{
+				if (m < outputDim)
+					helm.leftMode[static_cast<size_t>(m) * static_cast<size_t>(outputDim) + m] = 1.0f;
+				if (m < pastDim)
+					helm.rightMode[static_cast<size_t>(m) * static_cast<size_t>(pastDim) + m] = 1.0f;
+			}
+			helm.batchHiddenSum.assign(hiddenDim, 0.0f);
+			helm.batchHiddenSqSum.assign(hiddenDim, 0.0f);
+			helm.batchResidualSum.assign(outputDim, 0.0f);
+			helm.batchResidualSqSum.assign(outputDim, 0.0f);
+			helm.latent.assign(modeRank, 0.0f);
+			helm.poleNumer.assign(modeRank, 0.0f);
+			helm.poleDenom.assign(modeRank, 0.0f);
+			helm.pole.assign(modeRank, 0.0f);
+			helm.forwardCorrection.assign(outputDim, 0.0f);
+		}
+		else
+		{
+			tensorTransformer.helm.reset();
+		}
+
+		if ((trainingConfig.optimizer.type == OptimizerConfig::ATLAS)
 		    && trainingConfig.atlas.asterEnabled
 		    && tokenModel
 		    && modelCfg.nLayers > 0u
@@ -2239,53 +2682,100 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			TensorTransformerState::AsterState& aster = tensorTransformer.aster;
 			const unsigned int requestedDepth = std::max(1u, trainingConfig.atlas.asterHiddenStackDepth);
 			const unsigned int stackDepth = std::min(requestedDepth, modelCfg.nLayers);
+			const unsigned int regimeCount = 4u;
 			const unsigned int sketchDim = std::max(4u, std::min(16u, vocabSize));
+			const unsigned int supportDim = std::max(1u, std::min(5u, vocabSize));
+			const unsigned int marginDim = (supportDim > 0u) ? (supportDim - 1u) : 0u;
+			const unsigned int tokenCondDim = trainingConfig.atlas.auroraEnabled ? 12u : 8u;
+			const unsigned int kappaHeads =
+			    trainingConfig.atlas.kappaEnabled ? std::max(1u, std::min(trainingConfig.atlas.kappaHeads, modelCfg.nHeads)) : 0u;
+			const unsigned int kappaLagBuckets =
+			    trainingConfig.atlas.kappaEnabled ? std::max(1u, std::min(trainingConfig.atlas.kappaLagBuckets, 4u)) : 0u;
+			const unsigned int kappaRank =
+			    trainingConfig.atlas.kappaEnabled ? std::max(1u, std::min(trainingConfig.atlas.kappaRank, 4u)) : 0u;
+			const unsigned int kappaObsDim =
+			    (trainingConfig.atlas.kappaEnabled && kappaHeads > 0u && kappaLagBuckets > 0u && kappaRank > 0u)
+			        ? (kappaHeads * kappaLagBuckets * kappaRank)
+			        : 0u;
+			const unsigned int obsDim = sketchDim + supportDim + marginDim + tokenCondDim + kappaObsDim;
+			const unsigned int controlStreams = (kappaObsDim > 0u) ? 4u : 3u;
 			const unsigned int stateRank =
-			    std::max(1u, std::min(trainingConfig.atlas.asterStateRank, sketchDim));
-			const unsigned int controlDim = stackDepth * sketchDim;
-			const unsigned int featureDim = sketchDim + (2u * controlDim);
-			const unsigned int stateFeatureDim = stateRank + (2u * controlDim);
+			    std::max(1u, std::min(trainingConfig.atlas.asterStateRank, obsDim));
+			const unsigned int controlDim = stackDepth * controlStreams * obsDim;
+			const unsigned int featureDim = (2u * obsDim) + (3u * controlDim);
+			const unsigned int stateFeatureDim = (2u * stateRank) + (3u * controlDim);
 
 			aster.reset();
-			aster.initialized = (stackDepth > 0u) && (controlDim > 0u) && (sketchDim > 0u);
+			aster.initialized = (stackDepth > 0u) && (controlDim > 0u) && (obsDim > 0u);
+			aster.regimeCount = regimeCount;
 			aster.sketchDim = sketchDim;
+			aster.supportDim = supportDim;
+			aster.tokenCondDim = tokenCondDim;
+			aster.kappaObsDim = kappaObsDim;
+			aster.kappaHeads = kappaHeads;
+			aster.kappaLagBuckets = kappaLagBuckets;
+			aster.kappaRank = kappaRank;
 			aster.controlDim = controlDim;
 			aster.hiddenStackDepth = stackDepth;
 			aster.stateRank = stateRank;
 			aster.trackedBlockIndices.reserve(stackDepth);
 			for (unsigned int d = 0u; d < stackDepth; ++d)
 				aster.trackedBlockIndices.push_back(modelCfg.nLayers - stackDepth + d);
-			aster.prevControlMean.assign(controlDim, 0.0f);
-			aster.prevResidualMean.assign(sketchDim, 0.0f);
-			aster.controlVar.assign(controlDim, 1.0f);
-			aster.residualVar.assign(sketchDim, 1.0f);
-			aster.transportPastCov.assign(static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
-			aster.transportCrossCov.assign(static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
-			aster.pastCov.assign(static_cast<size_t>(featureDim) * featureDim, 0.0f);
-			aster.crossCov.assign(static_cast<size_t>(sketchDim) * featureDim, 0.0f);
-			aster.theta.assign(static_cast<size_t>(sketchDim) * featureDim, 0.0f);
-			aster.statePastCov.assign(static_cast<size_t>(stateFeatureDim) * stateFeatureDim, 0.0f);
-			aster.stateCrossCov.assign(static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
-			aster.innovationCov.assign(static_cast<size_t>(sketchDim) * sketchDim, 0.0f);
-			aster.innovationCross.assign(static_cast<size_t>(stateRank) * sketchDim, 0.0f);
-			aster.sigma.assign(stateRank, 0.0f);
-			aster.leftMode.assign(static_cast<size_t>(stateRank) * sketchDim, 0.0f);
-			aster.rightMode.assign(static_cast<size_t>(stateRank) * featureDim, 0.0f);
-			for (unsigned int m = 0u; m < stateRank; ++m)
+			aster.prevPrevControlMean.assign(static_cast<size_t>(regimeCount) * controlDim, 0.0f);
+			aster.prevControlMean.assign(static_cast<size_t>(regimeCount) * controlDim, 0.0f);
+			aster.prevPrevResidualMean.assign(static_cast<size_t>(regimeCount) * obsDim, 0.0f);
+			aster.prevResidualMean.assign(static_cast<size_t>(regimeCount) * obsDim, 0.0f);
+			aster.controlVar.assign(static_cast<size_t>(regimeCount) * controlDim, 1.0f);
+			aster.residualVar.assign(static_cast<size_t>(regimeCount) * obsDim, 1.0f);
+			aster.transportPastCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
+			aster.transportCrossCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
+			aster.pastCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(featureDim) * featureDim, 0.0f);
+			aster.crossCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(obsDim) * featureDim, 0.0f);
+			aster.theta.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(obsDim) * featureDim, 0.0f);
+			aster.statePastCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateFeatureDim) * stateFeatureDim, 0.0f);
+			aster.stateCrossCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
+			aster.innovationCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(obsDim) * obsDim, 0.0f);
+			aster.innovationCross.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * obsDim, 0.0f);
+			aster.sigma.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.leftMode.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * obsDim, 0.0f);
+			aster.rightMode.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * featureDim, 0.0f);
+			for (unsigned int g = 0u; g < regimeCount; ++g)
 			{
-				if (m < sketchDim)
-					aster.leftMode[static_cast<size_t>(m) * sketchDim + m] = 1.0f;
-				if (m < featureDim)
-					aster.rightMode[static_cast<size_t>(m) * featureDim + m] = 1.0f;
+				const size_t leftBase = static_cast<size_t>(g) * static_cast<size_t>(stateRank) * obsDim;
+				const size_t rightBase = static_cast<size_t>(g) * static_cast<size_t>(stateRank) * featureDim;
+				for (unsigned int m = 0u; m < stateRank; ++m)
+				{
+					if (m < obsDim)
+						aster.leftMode[leftBase + static_cast<size_t>(m) * obsDim + m] = 1.0f;
+					if (m < featureDim)
+						aster.rightMode[rightBase + static_cast<size_t>(m) * featureDim + m] = 1.0f;
+				}
 			}
-			aster.batchFinalHiddenRawSum.assign(dModel, 0.0f);
-			aster.batchFinalHiddenSketchSum.assign(sketchDim, 0.0f);
-			aster.batchLayerHiddenSketchSum.assign(static_cast<size_t>(stackDepth) * sketchDim, 0.0f);
-			aster.batchResidualSum.assign(sketchDim, 0.0f);
-			aster.latent.assign(stateRank, 0.0f);
-			aster.poleNumer.assign(stateRank, 0.0f);
-			aster.poleDenom.assign(stateRank, 0.0f);
-			aster.pole.assign(stateRank, 0.0f);
+			aster.batchFinalHiddenRawSum.assign(static_cast<size_t>(regimeCount) * dModel, 0.0f);
+			aster.batchFinalHiddenSketchSum.assign(static_cast<size_t>(regimeCount) * sketchDim, 0.0f);
+			aster.batchLayerHiddenRawSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * dModel, 0.0f);
+			aster.batchLayerHiddenSketchSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim, 0.0f);
+			aster.batchLayerAttnRawSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * dModel, 0.0f);
+			aster.batchLayerAttnSketchSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim, 0.0f);
+			aster.batchLayerPatternSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * tokenCondDim, 0.0f);
+			aster.batchLayerKappaSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * kappaObsDim, 0.0f);
+			aster.batchResidualSum.assign(static_cast<size_t>(regimeCount) * sketchDim, 0.0f);
+			aster.batchSupportLogitSum.assign(static_cast<size_t>(regimeCount) * supportDim, 0.0f);
+			aster.batchSupportResidualSum.assign(static_cast<size_t>(regimeCount) * supportDim, 0.0f);
+			aster.batchSupportCount.assign(static_cast<size_t>(regimeCount) * supportDim, 0.0f);
+			aster.batchSupportHiddenRawSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(supportDim) * dModel, 0.0f);
+			aster.batchTargetMarginSum.assign(regimeCount, 0.0f);
+			aster.batchHardNegativeLogitSum.assign(regimeCount, 0.0f);
+			aster.batchBaselineWorseSum.assign(regimeCount, 0.0f);
+			aster.batchRegimeTokenCount.assign(regimeCount, 0.0f);
+			aster.targetMarginEma.assign(regimeCount, 0.75f);
+			aster.hardNegativeLogitEma.assign(regimeCount, 0.0f);
+			aster.hardMarginShortfallEma.assign(regimeCount, 0.0f);
+			aster.prevPrevLatent.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.latent.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.poleNumer.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.poleDenom.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.pole.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
 		}
 		else
 		{

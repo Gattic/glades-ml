@@ -2300,6 +2300,13 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 	state.scratch_sparrowActive.resize(rn);
 	state.scratch_sparrowScout.resize(cn);
 	state.scratch_sparrowPastSignal.resize(static_cast<size_t>(n));
+	state.scratch_geodeRhsCol.resize(static_cast<size_t>(m));
+	state.scratch_geodeInvDiagCol.resize(static_cast<size_t>(m));
+	state.scratch_geodeActiveCurrent.resize(static_cast<size_t>(r));
+	state.scratch_geodeActiveDelta.resize(static_cast<size_t>(r));
+	state.scratch_geodeSystemMat.resize(static_cast<size_t>(r) * static_cast<size_t>(r));
+	state.scratch_geodeRhs.resize(static_cast<size_t>(r));
+	state.scratch_geodeSolution.resize(static_cast<size_t>(r));
 
 	state.totalTrace = 0.0f;
 	state.sigma2 = 0.0f;
@@ -7106,6 +7113,10 @@ bool applyStep(WeightState& state,
 	    && !sparrowLatent.empty();
 	const float sparrowMemoryScale =
 	    sparrowMemoryEnabled ? atlas_nonnegative_finite(ac.sparrowMemoryScale, 0.0f) : 0.0f;
+	const float sparrowTrust =
+	    std::max(0.0f,
+	             std::min(1.0f,
+	                      atlas_nonnegative_finite(state.externalSparrowTrust, 1.0f)));
 	const bool ghostMemoryEnabled =
 	    !qrcMemoryEnabled
 	    && !riftMemoryEnabled
@@ -7258,7 +7269,8 @@ bool applyStep(WeightState& state,
 		sparrowMemoryGain = static_cast<float>(
 		    static_cast<double>(sparrowMemoryScale)
 		    * sparrowTransferScale
-		    * std::max<double>(0.0, static_cast<double>(sparrowHorizontalRatio)));
+		    * std::max<double>(0.0, static_cast<double>(sparrowHorizontalRatio))
+		    * static_cast<double>(sparrowTrust));
 	}
 	std::vector<float> ghostPastSignal;
 	if (ghostMemoryEnabled && ghostTransferScale > 0.0)
@@ -7794,6 +7806,7 @@ bool applyStep(WeightState& state,
 		append_kv(oss, "sparrow_active_modes", sparrowActiveModes);
 		append_kv(oss, "sparrow_pole", sparrowPole);
 		append_kv(oss, "sparrow_horizontal_ratio", sparrowHorizontalRatio);
+		append_kv(oss, "sparrow_trust", sparrowTrust);
 		append_kv(oss, "sparrow_memory_gain", sparrowMemoryGain);
 		append_kv(oss, "qbrt_edge", qbrtEdge);
 		append_kv(oss, "qbrt_sigma", qbrtSigma);

@@ -1696,11 +1696,799 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					float asterTransferScale = 0.0f;
 					if (asterEdge > acAster.asterEdgeThreshold)
 						asterTransferScale = (asterEdge - acAster.asterEdgeThreshold) / (asterEdge + 1e-6f);
+					const float outputEvidenceRaw =
+					    std::max(0.0f, asterEdge) * std::max(0.0f, asterPredR2);
+					float predictiveEvidence = 0.0f;
+					float meritGeometryTrust = 0.0f;
+					if (lastTransition < tensorDff.atlasState.size())
+					{
+						const atlas::WeightState& outputAtlas = tensorDff.atlasState[lastTransition];
+						predictiveEvidence =
+						    std::max(0.0f, outputAtlas.lastSparrowEdge)
+						    * std::max(0.0f, outputAtlas.lastSparrowHorizontalRatio);
+						if (outputAtlas.activeRank > 0u
+						    && !outputAtlas.fisherDiag.empty()
+						    && outputAtlas.totalTrace > 1.0e-6f)
+						{
+							const unsigned int captureRank =
+							    std::min(outputAtlas.activeRank,
+							             static_cast<unsigned int>(outputAtlas.fisherDiag.size()));
+							double activeTrace = 0.0;
+							for (unsigned int c = 0u; c < captureRank; ++c)
+								activeTrace += static_cast<double>(outputAtlas.fisherDiag[c]);
+							const float capture =
+							    static_cast<float>(activeTrace / (static_cast<double>(outputAtlas.totalTrace) + 1.0e-6));
+							meritGeometryTrust =
+							    std::max(0.0f,
+							             std::min(1.0f, acAster.meritGeometryScale * std::max(0.0f, capture)));
+						}
+					}
 					float asterMemoryGain = acAster.asterMemoryScale
 					                      * std::max(0.0f, asterTransferScale)
 					                      * std::max(0.0f, asterPredR2);
 					if (!is_finite(asterMemoryGain))
 						asterMemoryGain = 0.0f;
+					float aegisLambdaSpatial = 0.0f;
+					float aegisLambdaPredictive = 0.0f;
+					float aegisLambdaOutput = 0.0f;
+					float aegisPredictivePredicted = 0.0f;
+					float aegisPredictiveRealized = predictiveEvidence;
+					float aegisOutputPredicted = 0.0f;
+					float aegisOutputRealized = outputEvidenceRaw;
+					float citadelAnchor = 0.0f;
+					float citadelHardRegimeMass = 0.0f;
+					float citadelSparrowTrust = 1.0f;
+					float rampartTau = 0.0f;
+					float rampartBudget = 0.0f;
+					float rampartCovariance = 0.0f;
+					float rampartSparrowTrust = 1.0f;
+					float meritTau = 0.0f;
+					float meritBudget = 0.0f;
+					float meritCovariance = 0.0f;
+					float meritSparrowTrust = 1.0f;
+					float strataNullMode = 1.0f;
+					float strataPredictiveMode = 0.0f;
+					float strataOutputMode = 0.0f;
+					float strataCoupledMode = 0.0f;
+					float strataBudget = 0.0f;
+					float strataNullBenefit = 0.0f;
+					float strataPredictiveBenefit = 0.0f;
+					float strataOutputBenefit = 0.0f;
+					float strataCoupledBenefit = 0.0f;
+					float strataSelectedExcess = 0.0f;
+					float strataSwitchRate = 0.0f;
+					if (acAster.aegisEnabled || acAster.auroraEnabled || acAster.seamEnabled || acAster.quasarEnabled)
+					{
+						const float aegisCalibBeta = 0.90f;
+						const float aegisPrecisionFloor = 0.025f;
+						const float aegisPrecisionMax = 32.0f;
+						const float citadelTrustBeta = 0.90f;
+						const float strataBenefitBeta = 0.90f;
+						aegisPredictivePredicted = std::max(0.0f, aster.aegisPrevPredictiveScore);
+						aegisOutputPredicted = std::max(0.0f, aster.aegisPrevOutputScore);
+						if (aster.timingBoundaryCount > 0ULL)
+						{
+							const float predictiveErr =
+							    fabsf(aegisPredictivePredicted - aegisPredictiveRealized);
+							const float outputErr =
+							    fabsf(aegisOutputPredicted - aegisOutputRealized);
+							aster.aegisPredictiveErrorEma =
+							    aegisCalibBeta * aster.aegisPredictiveErrorEma
+							    + (1.0f - aegisCalibBeta) * predictiveErr;
+							aster.aegisOutputErrorEma =
+							    aegisCalibBeta * aster.aegisOutputErrorEma
+							    + (1.0f - aegisCalibBeta) * outputErr;
+						}
+						const float rawPredictiveTrust =
+						    std::min(aegisPrecisionMax,
+						             acAster.aegisPredictiveScale * std::max(0.0f, predictiveEvidence)
+						                 / (aster.aegisPredictiveErrorEma + aegisPrecisionFloor));
+						const float rawOutputTrust =
+						    std::min(aegisPrecisionMax,
+						             acAster.aegisOutputScale * outputEvidenceRaw
+						                 / (aster.aegisOutputErrorEma + aegisPrecisionFloor));
+						if (aster.timingBoundaryCount > 0ULL)
+						{
+							aster.citadelPredictiveTrustEma =
+							    citadelTrustBeta * aster.citadelPredictiveTrustEma
+							    + (1.0f - citadelTrustBeta) * rawPredictiveTrust;
+							aster.citadelOutputTrustEma =
+							    citadelTrustBeta * aster.citadelOutputTrustEma
+							    + (1.0f - citadelTrustBeta) * rawOutputTrust;
+						}
+						else
+						{
+							aster.citadelPredictiveTrustEma = rawPredictiveTrust;
+							aster.citadelOutputTrustEma = rawOutputTrust;
+						}
+						const float disagreementNorm =
+						    fabsf(aegisPredictiveRealized - aegisOutputRealized)
+						    / (fabsf(aegisPredictiveRealized) + fabsf(aegisOutputRealized) + 1e-6f);
+						float residualScale = 1.0f;
+						float spatialPrecision = 1.0f;
+						if (acAster.auroraEnabled)
+						{
+							const float predictiveTrustNorm =
+							    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+							const float outputTrustNorm =
+							    rawOutputTrust / (rawOutputTrust + 1.0f);
+							const float predictiveErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisPredictiveErrorEma
+							                          / (aegisPredictivePredicted
+							                             + aegisPredictiveRealized + 1.0e-6f)));
+							const float outputErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisOutputErrorEma
+							                          / (aegisOutputPredicted
+							                             + aegisOutputRealized + 1.0e-6f)));
+							const float uncertainty = 0.5f * (predictiveErrNorm + outputErrNorm);
+							const float horizonPred =
+							    acAster.auroraHorizonBlend * aster.citadelPredictiveTrustEma
+							    + (1.0f - acAster.auroraHorizonBlend) * rawPredictiveTrust;
+							const float horizonOut =
+							    acAster.auroraHorizonBlend * aster.citadelOutputTrustEma
+							    + (1.0f - acAster.auroraHorizonBlend) * rawOutputTrust;
+							const float horizonPredNorm = horizonPred / (horizonPred + 1.0f);
+							const float horizonOutNorm = horizonOut / (horizonOut + 1.0f);
+							rampartTau =
+							    0.35f + 1.65f
+							                * std::max(0.0f,
+							                           std::min(1.0f,
+							                                    0.45f * uncertainty
+							                                        + 0.35f * disagreementNorm));
+							rampartCovariance =
+							    std::max(0.0f,
+							             std::min(0.95f,
+							                      0.45f * std::min(horizonPredNorm, horizonOutNorm)
+							                          * std::max(0.0f, 1.0f - disagreementNorm)
+							                          * std::max(0.0f, 1.0f - 0.5f * uncertainty)));
+							const float coupling =
+							    rampartCovariance * sqrtf(std::max(0.0f, horizonPred * horizonOut));
+							const float h11 = std::max(1.0e-6f, rampartTau + horizonPred);
+							const float h22 = std::max(1.0e-6f, rampartTau + horizonOut);
+							const float det = std::max(1.0e-6f, h11 * h22 - coupling * coupling);
+							float wPredictive =
+							    (horizonPred * horizonPredNorm * h22
+							     - coupling * horizonOut * horizonOutNorm)
+							    / det;
+							float wOutput =
+							    (h11 * horizonOut * horizonOutNorm
+							     - coupling * horizonPred * horizonPredNorm)
+							    / det;
+							wPredictive = std::max(0.0f, wPredictive);
+							wOutput = std::max(0.0f, wOutput);
+							const float weightSum = wPredictive + wOutput + 1.0e-6f;
+							wPredictive /= weightSum;
+							wOutput /= weightSum;
+							const float budgetSignal =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      0.55f * (0.5f * (horizonPredNorm + horizonOutNorm))
+							                          + 0.20f * std::max(0.0f, 1.0f - uncertainty)
+							                          - 0.20f * disagreementNorm));
+							const float budgetTarget =
+							    std::max(0.0f,
+							             std::min(1.0f, acAster.auroraBudgetMax * budgetSignal));
+							rampartBudget =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (citadelTrustBeta * aster.rampartLastBudget
+							           + (1.0f - citadelTrustBeta) * budgetTarget)
+							        : budgetTarget;
+							const float residualNorm =
+							    sqrtf(std::max(0.0f,
+							                   wPredictive * wPredictive + wOutput * wOutput
+							                       + 2.0f * rampartCovariance * wPredictive * wOutput));
+							const float budgetScale =
+							    (residualNorm > 1.0e-6f)
+							        ? std::max(0.0f, std::min(1.0f, rampartBudget / residualNorm))
+							        : 0.0f;
+							aegisLambdaPredictive =
+							    std::max(0.0f, std::min(1.0f, wPredictive * budgetScale));
+							aegisLambdaOutput =
+							    std::max(0.0f, std::min(1.0f, wOutput * budgetScale));
+							aegisLambdaSpatial =
+							    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+							rampartSparrowTrust = aegisLambdaPredictive;
+							asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+						}
+						else if (acAster.seamEnabled)
+						{
+							const float predictiveTrustNorm =
+							    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+							const float outputTrustNorm =
+							    rawOutputTrust / (rawOutputTrust + 1.0f);
+							const float predictiveErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisPredictiveErrorEma
+							                          / (aegisPredictivePredicted
+							                             + aegisPredictiveRealized + 1.0e-6f)));
+							const float outputErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisOutputErrorEma
+							                          / (aegisOutputPredicted
+							                             + aegisOutputRealized + 1.0e-6f)));
+							const float uncertainty = 0.5f * (predictiveErrNorm + outputErrNorm);
+							const float spatialTarget =
+							    meritGeometryTrust - 0.35f * (predictiveTrustNorm + outputTrustNorm);
+							const float predictiveTarget =
+							    predictiveTrustNorm * std::max(0.0f, 1.0f - predictiveErrNorm)
+							    - 0.20f * disagreementNorm;
+							const float outputTarget =
+							    outputTrustNorm * std::max(0.0f, 1.0f - outputErrNorm)
+							    + 0.10f * std::max(0.0f, 1.0f - meritGeometryTrust)
+							    - 0.15f * disagreementNorm;
+							if (aster.timingBoundaryCount > 0ULL)
+							{
+								aster.strataNullBenefitEma =
+								    0.85f * aster.strataNullBenefitEma
+								    + acAster.seamMirrorStep * spatialTarget;
+								aster.strataPredictiveBenefitEma =
+								    0.85f * aster.strataPredictiveBenefitEma
+								    + acAster.seamMirrorStep * predictiveTarget;
+								aster.strataOutputBenefitEma =
+								    0.85f * aster.strataOutputBenefitEma
+								    + acAster.seamMirrorStep * outputTarget;
+							}
+							else
+							{
+								aster.strataNullBenefitEma = acAster.seamMirrorStep * spatialTarget;
+								aster.strataPredictiveBenefitEma = acAster.seamMirrorStep * predictiveTarget;
+								aster.strataOutputBenefitEma = acAster.seamMirrorStep * outputTarget;
+							}
+							const float maxLogit =
+							    std::max(aster.strataNullBenefitEma,
+							             std::max(aster.strataPredictiveBenefitEma,
+							                      aster.strataOutputBenefitEma));
+							const float expSpatial = expf(aster.strataNullBenefitEma - maxLogit);
+							const float expPredictive = expf(aster.strataPredictiveBenefitEma - maxLogit);
+							const float expOutput = expf(aster.strataOutputBenefitEma - maxLogit);
+							const float coordSum = expSpatial + expPredictive + expOutput + 1.0e-6f;
+							const float wSpatial = expSpatial / coordSum;
+							const float wPredictive = expPredictive / coordSum;
+							const float wOutput = expOutput / coordSum;
+							const float residualMass =
+							    std::max(0.0f, std::min(1.0f, 1.0f - wSpatial));
+							meritBudget =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      acAster.seamBudgetMax * residualMass
+							                          * std::max(0.0f,
+							                                     1.0f - 0.5f * uncertainty
+							                                         - 0.20f * disagreementNorm)));
+							const float residualShare = wPredictive + wOutput + 1.0e-6f;
+							aegisLambdaPredictive =
+							    std::max(0.0f, std::min(1.0f, meritBudget * (wPredictive / residualShare)));
+							aegisLambdaOutput =
+							    std::max(0.0f, std::min(1.0f, meritBudget * (wOutput / residualShare)));
+							aegisLambdaSpatial =
+							    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+							meritSparrowTrust = aegisLambdaPredictive;
+							asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+						}
+						else if (acAster.quasarEnabled)
+						{
+							const float predictiveTrustNorm =
+							    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+							const float outputTrustNorm =
+							    rawOutputTrust / (rawOutputTrust + 1.0f);
+							const float predictiveErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisPredictiveErrorEma
+							                          / (aegisPredictivePredicted
+							                             + aegisPredictiveRealized + 1.0e-6f)));
+							const float outputErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisOutputErrorEma
+							                          / (aegisOutputPredicted
+							                             + aegisOutputRealized + 1.0e-6f)));
+							const float uncertainty = 0.5f * (predictiveErrNorm + outputErrNorm);
+							const float residualPressure =
+							    std::max(predictiveTrustNorm, outputTrustNorm);
+							const float nullSignal =
+							    0.20f + 0.45f * uncertainty + 0.30f * disagreementNorm - 0.25f * residualPressure;
+							const float predictiveSignal =
+							    predictiveTrustNorm * std::max(0.0f, 1.0f - predictiveErrNorm)
+							    + 0.20f * meritGeometryTrust
+							    - 0.10f * uncertainty - 0.15f * disagreementNorm;
+							const float outputSignal =
+							    outputTrustNorm * std::max(0.0f, 1.0f - outputErrNorm)
+							    + 0.10f * std::max(0.0f, 1.0f - meritGeometryTrust)
+							    - 0.10f * uncertainty - 0.10f * disagreementNorm;
+							const float coupledSignal =
+							    0.45f * (predictiveTrustNorm + outputTrustNorm)
+							    + 0.30f * std::min(predictiveTrustNorm, outputTrustNorm)
+							    + 0.15f * meritGeometryTrust
+							    - 0.15f * uncertainty - 0.25f * disagreementNorm;
+							if (aster.timingBoundaryCount > 0ULL)
+							{
+								aster.strataNullBenefitEma =
+								    strataBenefitBeta * aster.strataNullBenefitEma
+								    + (1.0f - strataBenefitBeta) * nullSignal;
+								aster.strataPredictiveBenefitEma =
+								    strataBenefitBeta * aster.strataPredictiveBenefitEma
+								    + (1.0f - strataBenefitBeta) * predictiveSignal;
+								aster.strataOutputBenefitEma =
+								    strataBenefitBeta * aster.strataOutputBenefitEma
+								    + (1.0f - strataBenefitBeta) * outputSignal;
+								aster.strataCoupledBenefitEma =
+								    strataBenefitBeta * aster.strataCoupledBenefitEma
+								    + (1.0f - strataBenefitBeta) * coupledSignal;
+							}
+							else
+							{
+								aster.strataNullBenefitEma = nullSignal;
+								aster.strataPredictiveBenefitEma = predictiveSignal;
+								aster.strataOutputBenefitEma = outputSignal;
+								aster.strataCoupledBenefitEma = coupledSignal;
+							}
+							const float temperature = std::max(0.05f, acAster.quasarTemperature);
+							const float maxScore =
+							    std::max(std::max(aster.strataNullBenefitEma, aster.strataPredictiveBenefitEma),
+							             std::max(aster.strataOutputBenefitEma, aster.strataCoupledBenefitEma));
+							const float qNull = expf((aster.strataNullBenefitEma - maxScore) / temperature);
+							const float qPredictive = expf((aster.strataPredictiveBenefitEma - maxScore) / temperature);
+							const float qOutput = expf((aster.strataOutputBenefitEma - maxScore) / temperature);
+							const float qCoupled = expf((aster.strataCoupledBenefitEma - maxScore) / temperature);
+							const float probSum = qNull + qPredictive + qOutput + qCoupled + 1.0e-6f;
+							strataNullMode = qNull / probSum;
+							strataPredictiveMode = qPredictive / probSum;
+							strataOutputMode = qOutput / probSum;
+							strataCoupledMode = qCoupled / probSum;
+							strataBudget =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      acAster.quasarBudgetMax
+							                          * std::max(0.0f, 1.0f - strataNullMode)
+							                          * std::max(0.0f,
+							                                     1.0f - 0.5f * uncertainty
+							                                         - 0.15f * disagreementNorm)));
+							aegisLambdaPredictive =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      strataBudget
+							                          * (strataPredictiveMode + 0.5f * strataCoupledMode)));
+							aegisLambdaOutput =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      strataBudget
+							                          * (strataOutputMode + 0.5f * strataCoupledMode)));
+							aegisLambdaSpatial =
+							    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+							asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+							strataSelectedExcess = 1.0f - strataNullMode;
+						}
+						else if (acAster.strataEnabled)
+						{
+							const float predictiveTrustNorm =
+							    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+							const float outputTrustNorm =
+							    rawOutputTrust / (rawOutputTrust + 1.0f);
+							const float predictiveErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisPredictiveErrorEma
+							                          / (aegisPredictivePredicted
+							                             + aegisPredictiveRealized + 1.0e-6f)));
+							const float outputErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisOutputErrorEma
+							                          / (aegisOutputPredicted
+							                             + aegisOutputRealized + 1.0e-6f)));
+							const float uncertainty =
+							    0.5f * (predictiveErrNorm + outputErrNorm);
+							const float predictiveGeom =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      meritGeometryTrust
+							                          * std::max(0.0f, acAster.strataPredictiveGeometryScale)));
+							const float coupledGeom =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      meritGeometryTrust
+							                          * std::max(0.0f, acAster.strataCoupledGeometryScale)));
+							const float residualPressure =
+							    std::max(predictiveTrustNorm, outputTrustNorm);
+							const float nullSignal =
+							    std::max(0.0f,
+							             acAster.strataNullBias
+							                 + 0.55f * uncertainty
+							                 + 0.35f * disagreementNorm
+							                 - 0.25f * residualPressure);
+							const float predictiveSignal =
+							    std::max(0.0f,
+							             predictiveTrustNorm * std::max(0.0f, 1.0f - predictiveErrNorm)
+							                 + 0.25f * predictiveGeom
+							                 - 0.10f * uncertainty
+							                 - 0.15f * disagreementNorm);
+							const float outputSignal =
+							    std::max(0.0f,
+							             outputTrustNorm * std::max(0.0f, 1.0f - outputErrNorm)
+							                 + 0.10f * std::max(0.0f, 1.0f - predictiveGeom)
+							                 - 0.10f * uncertainty
+							                 - 0.10f * disagreementNorm);
+							const float coupledSignal =
+							    std::max(0.0f,
+							             0.45f * (predictiveTrustNorm + outputTrustNorm)
+							                 + 0.30f * std::min(predictiveTrustNorm, outputTrustNorm)
+							                 + 0.20f * coupledGeom
+							                 - 0.12f * uncertainty
+							                 - 0.25f * disagreementNorm);
+							const float maxResidualSignal =
+							    std::max(predictiveSignal, std::max(outputSignal, coupledSignal));
+							const float realizedNullBenefit = nullSignal - maxResidualSignal;
+							const float realizedPredictiveBenefit = predictiveSignal - nullSignal;
+							const float realizedOutputBenefit = outputSignal - nullSignal;
+							const float realizedCoupledBenefit = coupledSignal - nullSignal;
+							const float priorNullBenefit = aster.strataNullBenefitEma;
+							const float priorPredictiveBenefit = aster.strataPredictiveBenefitEma;
+							const float priorOutputBenefit = aster.strataOutputBenefitEma;
+							const float priorCoupledBenefit = aster.strataCoupledBenefitEma;
+							int previousMode = 0;
+							float previousModeWeight = aster.strataLastNullMode;
+							if (aster.strataLastPredictiveMode > previousModeWeight)
+							{
+								previousMode = 1;
+								previousModeWeight = aster.strataLastPredictiveMode;
+							}
+							if (aster.strataLastOutputMode > previousModeWeight)
+							{
+								previousMode = 2;
+								previousModeWeight = aster.strataLastOutputMode;
+							}
+							if (aster.strataLastCoupledMode > previousModeWeight)
+								previousMode = 3;
+							float modeScores[4];
+							modeScores[0] =
+							    priorNullBenefit
+							    + 0.25f * realizedNullBenefit
+							    + 0.20f * acAster.strataNullBias;
+							modeScores[1] =
+							    priorPredictiveBenefit
+							    + 0.25f * realizedPredictiveBenefit
+							    + 0.10f * predictiveGeom;
+							modeScores[2] =
+							    priorOutputBenefit
+							    + 0.25f * realizedOutputBenefit;
+							modeScores[3] =
+							    priorCoupledBenefit
+							    + 0.25f * realizedCoupledBenefit
+							    + 0.05f * coupledGeom;
+							for (int modeIndex = 0; modeIndex < 4; ++modeIndex)
+							{
+								if (modeIndex != previousMode)
+									modeScores[modeIndex] -= std::max(0.0f, acAster.strataDwellPenalty);
+							}
+							int selectedMode = 0;
+							float selectedScore = modeScores[0];
+							for (int modeIndex = 1; modeIndex < 4; ++modeIndex)
+							{
+								if (modeScores[modeIndex] > selectedScore)
+								{
+									selectedMode = modeIndex;
+									selectedScore = modeScores[modeIndex];
+								}
+							}
+							strataSelectedExcess =
+							    (selectedMode == 1)
+							        ? realizedPredictiveBenefit
+							        : ((selectedMode == 2)
+							               ? realizedOutputBenefit
+							               : ((selectedMode == 3)
+							                      ? realizedCoupledBenefit
+							                      : realizedNullBenefit));
+							if (selectedMode != 0 && strataSelectedExcess <= 0.0f)
+							{
+								selectedMode = 0;
+								strataSelectedExcess = realizedNullBenefit;
+							}
+							const float budgetSignal =
+							    std::max(0.0f, std::min(1.0f, strataSelectedExcess));
+							const float budgetTarget =
+							    std::max(0.0f, std::min(1.0f, acAster.strataBudgetMax * budgetSignal));
+							strataBudget =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (citadelTrustBeta * aster.strataLastBudget
+							           + (1.0f - citadelTrustBeta) * budgetTarget)
+							        : budgetTarget;
+							strataNullBenefit = realizedNullBenefit;
+							strataPredictiveBenefit = realizedPredictiveBenefit;
+							strataOutputBenefit = realizedOutputBenefit;
+							strataCoupledBenefit = realizedCoupledBenefit;
+							strataSwitchRate = (selectedMode == previousMode) ? 0.0f : 1.0f;
+							aster.strataNullBenefitEma =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (strataBenefitBeta * aster.strataNullBenefitEma
+							           + (1.0f - strataBenefitBeta) * realizedNullBenefit)
+							        : realizedNullBenefit;
+							aster.strataPredictiveBenefitEma =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (strataBenefitBeta * aster.strataPredictiveBenefitEma
+							           + (1.0f - strataBenefitBeta) * realizedPredictiveBenefit)
+							        : realizedPredictiveBenefit;
+							aster.strataOutputBenefitEma =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (strataBenefitBeta * aster.strataOutputBenefitEma
+							           + (1.0f - strataBenefitBeta) * realizedOutputBenefit)
+							        : realizedOutputBenefit;
+							aster.strataCoupledBenefitEma =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (strataBenefitBeta * aster.strataCoupledBenefitEma
+							           + (1.0f - strataBenefitBeta) * realizedCoupledBenefit)
+							        : realizedCoupledBenefit;
+							if (selectedMode == 1)
+							{
+								strataNullMode = 0.0f;
+								strataPredictiveMode = 1.0f;
+								aegisLambdaPredictive = strataBudget;
+								aegisLambdaOutput = 0.0f;
+							}
+							else if (selectedMode == 2)
+							{
+								strataNullMode = 0.0f;
+								strataOutputMode = 1.0f;
+								aegisLambdaPredictive = 0.0f;
+								aegisLambdaOutput = strataBudget;
+							}
+							else if (selectedMode == 3)
+							{
+								strataNullMode = 0.0f;
+								strataCoupledMode = 1.0f;
+								const float predictiveShare =
+								    predictiveTrustNorm / (predictiveTrustNorm + outputTrustNorm + 1.0e-6f);
+								aegisLambdaPredictive =
+								    std::max(0.0f, std::min(1.0f, strataBudget * predictiveShare));
+								aegisLambdaOutput =
+								    std::max(0.0f, std::min(1.0f, strataBudget - aegisLambdaPredictive));
+							}
+							else
+							{
+								aegisLambdaPredictive = 0.0f;
+								aegisLambdaOutput = 0.0f;
+							}
+							aegisLambdaSpatial =
+							    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+							meritSparrowTrust = aegisLambdaPredictive;
+							asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+						}
+						else if (acAster.meritEnabled)
+						{
+							const float predictiveTrustNorm =
+							    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+							const float outputTrustNorm =
+							    rawOutputTrust / (rawOutputTrust + 1.0f);
+							const float predictiveErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisPredictiveErrorEma
+							                          / (aegisPredictivePredicted
+							                             + aegisPredictiveRealized + 1.0e-6f)));
+							const float outputErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisOutputErrorEma
+							                          / (aegisOutputPredicted
+							                             + aegisOutputRealized + 1.0e-6f)));
+							const float uncertainty =
+							    0.5f * (predictiveErrNorm + outputErrNorm);
+							const float contextPenalty = 0.0f;
+							const float tauSignal =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      0.45f * uncertainty
+							                          + 0.30f * disagreementNorm
+							                          - 0.30f * meritGeometryTrust
+							                          + 0.25f * contextPenalty));
+							const float tauTarget =
+							    acAster.meritTauMin
+							    + (acAster.meritTauMax - acAster.meritTauMin) * tauSignal;
+							meritTau =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (citadelTrustBeta * aster.meritLastTau
+							           + (1.0f - citadelTrustBeta) * tauTarget)
+							        : tauTarget;
+							meritCovariance =
+							    std::max(0.0f,
+							             std::min(0.95f,
+							                      acAster.meritCovarianceMix
+							                          * std::min(predictiveTrustNorm, outputTrustNorm)
+							                          * std::max(0.0f, 1.0f - disagreementNorm)));
+							const float coupling =
+							    meritCovariance
+							    * sqrtf(std::max(0.0f, rawPredictiveTrust * rawOutputTrust));
+							const float h11 = std::max(1.0e-6f, meritTau + rawPredictiveTrust);
+							const float h22 = std::max(1.0e-6f, meritTau + rawOutputTrust);
+							const float det = std::max(1.0e-6f, h11 * h22 - coupling * coupling);
+							float wPredictive =
+							    (rawPredictiveTrust * predictiveTrustNorm * h22
+							     - coupling * rawOutputTrust * outputTrustNorm)
+							    / det;
+							float wOutput =
+							    (h11 * rawOutputTrust * outputTrustNorm
+							     - coupling * rawPredictiveTrust * predictiveTrustNorm)
+							    / det;
+							wPredictive = std::max(0.0f, wPredictive);
+							wOutput = std::max(0.0f, wOutput);
+							const float weightSum = wPredictive + wOutput + 1.0e-6f;
+							wPredictive /= weightSum;
+							wOutput /= weightSum;
+							const float budgetSignal =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      0.45f * (0.5f * (predictiveTrustNorm + outputTrustNorm))
+							                          + 0.35f * meritGeometryTrust
+							                          - 0.15f * disagreementNorm
+							                          - 0.15f * uncertainty
+							                          - 0.20f * contextPenalty));
+							const float budgetTarget =
+							    std::max(0.0f, std::min(1.0f, acAster.meritBudgetMax * budgetSignal));
+							meritBudget =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (citadelTrustBeta * aster.meritLastBudget
+							           + (1.0f - citadelTrustBeta) * budgetTarget)
+							        : budgetTarget;
+							const float residualNorm =
+							    sqrtf(std::max(0.0f,
+							                   wPredictive * wPredictive + wOutput * wOutput
+							                       + 2.0f * meritCovariance * wPredictive * wOutput));
+							const float budgetScale =
+							    (residualNorm > 1.0e-6f)
+							        ? std::max(0.0f, std::min(1.0f, meritBudget / residualNorm))
+							        : 0.0f;
+							aegisLambdaPredictive = std::max(0.0f, std::min(1.0f, wPredictive * budgetScale));
+							aegisLambdaOutput = std::max(0.0f, std::min(1.0f, wOutput * budgetScale));
+							aegisLambdaSpatial =
+							    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+							meritSparrowTrust = aegisLambdaPredictive;
+							asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+						}
+						else if (acAster.rampartEnabled)
+						{
+							const float predictiveTrustNorm =
+							    rawPredictiveTrust / (rawPredictiveTrust + 1.0f);
+							const float outputTrustNorm =
+							    rawOutputTrust / (rawOutputTrust + 1.0f);
+							const float predictiveErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisPredictiveErrorEma
+							                          / (aegisPredictivePredicted
+							                             + aegisPredictiveRealized + 1.0e-6f)));
+							const float outputErrNorm =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      aster.aegisOutputErrorEma
+							                          / (aegisOutputPredicted
+							                             + aegisOutputRealized + 1.0e-6f)));
+							const float uncertainty =
+							    0.5f * (predictiveErrNorm + outputErrNorm);
+							const float tauSignal =
+							    std::max(0.0f, std::min(1.0f, 0.5f * (uncertainty + disagreementNorm)));
+							const float tauTarget =
+							    acAster.rampartTauMin
+							    + (acAster.rampartTauMax - acAster.rampartTauMin) * tauSignal;
+							rampartTau =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (citadelTrustBeta * aster.rampartLastTau
+							           + (1.0f - citadelTrustBeta) * tauTarget)
+							        : tauTarget;
+							rampartCovariance =
+							    std::max(0.0f,
+							             std::min(0.95f,
+							                      acAster.rampartCovarianceMix
+							                          * std::min(predictiveTrustNorm, outputTrustNorm)
+							                          * std::max(0.0f, 1.0f - disagreementNorm)));
+							const float coupling =
+							    rampartCovariance
+							    * sqrtf(std::max(0.0f, rawPredictiveTrust * rawOutputTrust));
+							const float h11 = std::max(1.0e-6f, rampartTau + rawPredictiveTrust);
+							const float h22 = std::max(1.0e-6f, rampartTau + rawOutputTrust);
+							const float det = std::max(1.0e-6f, h11 * h22 - coupling * coupling);
+							float wSpatial = (rampartTau + spatialPrecision)
+							               / std::max(1.0e-6f, rampartTau + spatialPrecision);
+							float wPredictive =
+							    (rawPredictiveTrust * predictiveTrustNorm * h22
+							     - coupling * rawOutputTrust * outputTrustNorm)
+							    / det;
+							float wOutput =
+							    (h11 * rawOutputTrust * outputTrustNorm
+							     - coupling * rawPredictiveTrust * predictiveTrustNorm)
+							    / det;
+							wSpatial = std::max(0.0f, wSpatial);
+							wPredictive = std::max(0.0f, wPredictive);
+							wOutput = std::max(0.0f, wOutput);
+							const float weightSum = wSpatial + wPredictive + wOutput + 1.0e-6f;
+							wSpatial /= weightSum;
+							wPredictive /= weightSum;
+							wOutput /= weightSum;
+							const float contextPenalty = 0.0f;
+							const float budgetSignal =
+							    std::max(0.0f,
+							             std::min(1.0f,
+							                      0.5f * (predictiveTrustNorm + outputTrustNorm)
+							                          - 0.25f * disagreementNorm
+							                          - 0.25f * uncertainty
+							                          - 0.25f * contextPenalty));
+							const float budgetTarget =
+							    std::max(0.0f, std::min(1.0f, acAster.rampartBudgetMax * budgetSignal));
+							rampartBudget =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (citadelTrustBeta * aster.rampartLastBudget
+							           + (1.0f - citadelTrustBeta) * budgetTarget)
+							        : budgetTarget;
+							const float residualNorm =
+							    sqrtf(std::max(0.0f,
+							                   wPredictive * wPredictive + wOutput * wOutput
+							                       + 2.0f * rampartCovariance * wPredictive * wOutput));
+							const float budgetScale =
+							    (residualNorm > 1.0e-6f)
+							        ? std::max(0.0f, std::min(1.0f, rampartBudget / residualNorm))
+							        : 0.0f;
+							aegisLambdaPredictive = std::max(0.0f, std::min(1.0f, wPredictive * budgetScale));
+							aegisLambdaOutput = std::max(0.0f, std::min(1.0f, wOutput * budgetScale));
+							aegisLambdaSpatial =
+							    std::max(0.0f, std::min(1.0f, 1.0f - aegisLambdaPredictive - aegisLambdaOutput));
+							rampartSparrowTrust = aegisLambdaPredictive;
+							asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+						}
+						else if (acAster.citadelEnabled)
+						{
+							const float predictiveTrustNorm =
+							    aster.citadelPredictiveTrustEma / (aster.citadelPredictiveTrustEma + 1.0f);
+							const float outputTrustNorm =
+							    aster.citadelOutputTrustEma / (aster.citadelOutputTrustEma + 1.0f);
+							const float predictiveDominance =
+							    std::max(0.0f, predictiveTrustNorm - outputTrustNorm);
+							const float citadelConflict =
+							    disagreementNorm * predictiveDominance;
+							const float anchorTarget =
+							    std::max(0.0f,
+							             std::min(0.95f,
+							                      acAster.citadelAnchorBase
+							                          + acAster.citadelDisagreementScale * citadelConflict));
+							citadelAnchor =
+							    (aster.timingBoundaryCount > 0ULL)
+							        ? (citadelTrustBeta * aster.citadelLastAnchor
+							           + (1.0f - citadelTrustBeta) * anchorTarget)
+							        : anchorTarget;
+							residualScale = std::max(0.0f, 1.0f - citadelAnchor);
+							spatialPrecision +=
+							    std::max(0.0f, acAster.citadelSpatialScale) * citadelAnchor;
+						}
+						const float predictivePrecision =
+						    residualScale
+						    * rawPredictiveTrust;
+						const float outputPrecision =
+						    residualScale
+						    * rawOutputTrust;
+						if (!acAster.rampartEnabled && !acAster.meritEnabled && !acAster.strataEnabled
+						    && !acAster.auroraEnabled && !acAster.seamEnabled && !acAster.quasarEnabled)
+						{
+							const float totalPrecision =
+							    spatialPrecision + predictivePrecision + outputPrecision + 1e-6f;
+							aegisLambdaSpatial = spatialPrecision / totalPrecision;
+							aegisLambdaPredictive = predictivePrecision / totalPrecision;
+							aegisLambdaOutput = outputPrecision / totalPrecision;
+							if (acAster.citadelEnabled)
+							{
+								const float predictiveTrustNorm =
+								    aster.citadelPredictiveTrustEma / (aster.citadelPredictiveTrustEma + 1.0f);
+								citadelSparrowTrust =
+								    std::max(0.0f,
+								             std::min(1.0f,
+								                      predictiveTrustNorm
+								                          * std::max(0.0f, 1.0f - citadelAnchor)));
+							}
+							asterMemoryGain *= std::max(0.0f, std::min(1.0f, aegisLambdaOutput));
+						}
+					}
 
 					if (asterMemoryGain > 0.0f)
 					{
@@ -1755,6 +2543,40 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					aster.lastSigma = static_cast<float>(sqrt(nextEffectiveSigmaSq));
 					aster.lastPredR2 = asterPredR2;
 					aster.lastMemoryGain = asterMemoryGain;
+					aster.aegisPrevPredictiveScore = aegisPredictiveRealized;
+					aster.aegisPrevOutputScore = aegisOutputRealized;
+					aster.aegisLastLambdaSpatial = aegisLambdaSpatial;
+					aster.aegisLastLambdaPredictive = aegisLambdaPredictive;
+					aster.aegisLastLambdaOutput = aegisLambdaOutput;
+					aster.aegisLastPredictivePredicted = aegisPredictivePredicted;
+					aster.aegisLastPredictiveRealized = aegisPredictiveRealized;
+					aster.aegisLastOutputPredicted = aegisOutputPredicted;
+					aster.aegisLastOutputRealized = aegisOutputRealized;
+					aster.aegisLastChannelDisagreement =
+					    fabsf(aegisPredictiveRealized - aegisOutputRealized);
+					aster.citadelLastAnchor = citadelAnchor;
+					aster.citadelLastHardRegimeMass = citadelHardRegimeMass;
+					aster.citadelLastSparrowTrust = citadelSparrowTrust;
+					aster.rampartLastTau = rampartTau;
+					aster.rampartLastBudget = rampartBudget;
+					aster.rampartLastCovariance = rampartCovariance;
+					aster.rampartLastSparrowTrust = rampartSparrowTrust;
+					aster.meritLastTau = meritTau;
+					aster.meritLastBudget = meritBudget;
+					aster.meritLastCovariance = meritCovariance;
+					aster.meritLastSparrowTrust = meritSparrowTrust;
+					aster.meritLastGeometryTrust = meritGeometryTrust;
+					aster.strataLastNullMode = strataNullMode;
+					aster.strataLastPredictiveMode = strataPredictiveMode;
+					aster.strataLastOutputMode = strataOutputMode;
+					aster.strataLastCoupledMode = strataCoupledMode;
+					aster.strataLastBudget = strataBudget;
+					aster.strataLastNullBenefit = strataNullBenefit;
+					aster.strataLastPredictiveBenefit = strataPredictiveBenefit;
+					aster.strataLastOutputBenefit = strataOutputBenefit;
+					aster.strataLastCoupledBenefit = strataCoupledBenefit;
+					aster.strataLastSelectedExcess = strataSelectedExcess;
+					aster.strataLastSwitchRate = strataSwitchRate;
 					for (unsigned int i = 0; i < controlDim; ++i)
 						aster.prevControlMean[i] = controlMean[i];
 					for (unsigned int j = 0; j < outputDim; ++j)
@@ -1840,10 +2662,24 @@ void glades::NNetwork::SGDHelper_DFF(unsigned int inputRowCounter, int runType)
 					// Ensure ATLAS state is initialized
 					if (tensorDff.atlasState.size() != tensorDff.T.size())
 						tensorDff.atlasState.resize(tensorDff.T.size());
+					const float dffSparrowTrust =
+					    ((ac.citadelEnabled || ac.rampartEnabled || ac.meritEnabled || ac.strataEnabled
+					      || ac.auroraEnabled || ac.seamEnabled || ac.quasarEnabled) && tensorDff.aster.initialized)
+					        ? std::max(0.0f,
+					                   std::min(1.0f,
+					                            (ac.strataEnabled || ac.auroraEnabled || ac.seamEnabled || ac.quasarEnabled)
+					                                ? tensorDff.aster.aegisLastLambdaPredictive
+					                                : (ac.meritEnabled
+					                                ? tensorDff.aster.meritLastSparrowTrust
+					                                : (ac.rampartEnabled
+					                                       ? tensorDff.aster.rampartLastSparrowTrust
+					                                       : tensorDff.aster.citadelLastSparrowTrust))))
+					        : 1.0f;
 
 					for (unsigned int t = 0; t < tensorDff.T.size(); ++t)
 					{
 						TensorDFFState::Transition& tr = tensorDff.T[t];
+						tensorDff.atlasState[t].externalSparrowTrust = dffSparrowTrust;
 						const float lr = skeleton->getLearningRate(t) * lrScheduleMultiplier;
 						const float wd1 = skeleton->getWeightDecay1(t);
 						const float wd2 = skeleton->getWeightDecay2(t);
