@@ -11,3 +11,4 @@ alpaca.key
 .worktrees/
 .codex
 logs/
+artifacts/
