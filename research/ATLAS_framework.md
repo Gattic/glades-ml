@@ -5887,8 +5887,894 @@ Updated recommendation:
 - stop `BiMAP-v2` low-rank-factor refinement on this line
 - if optimizer replacement work continues, change matrix-preconditioner family rather than tuning `BiMAP`
 
+### April 11, 2026: `PACT` prototype (`Promoted Adaptive Compressed Tensor-preconditioner`)
+
+Implemented a compute-aware blockwise promotion prototype that keeps exact `AdamW` fallback on demoted or unsupported blocks and only activates a two-sided matrix preconditioner when a local gain proxy beats an analytical overhead proxy.
+
+Main code:
+
+- config surface:
+  - `Backend/Machine Learning/Networks/training_config.h`
+  - `Backend/Machine Learning/Networks/checkpoint_persistence.cpp`
+- optimizer core:
+  - `Backend/Machine Learning/Networks/atlas_optimizer.h`
+  - `Backend/Machine Learning/Networks/atlas_optimizer.cpp`
+- transformer integration:
+  - `Backend/Machine Learning/Networks/transformer_model_state.inc`
+  - `Backend/Machine Learning/Networks/network.cpp`
+  - `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- harness and dedicated tests:
+  - `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+  - `unit-tests/Backend/Machine Learning/atlas-test.cpp`
+  - `unit-tests/Backend/Machine Learning/atlas-test.h`
+  - `unit-tests/main.cpp`
+
+Key mechanics:
+
+- `PACT` keeps standard Adam moments on every matrix block
+- builds optional row/column geometry from diagonal-plus-low-rank block factors
+- adds a bounded secant-style predictive transport term
+- computes both:
+  - an exact Adam-style fallback step
+  - a promoted two-sided preconditioned step
+- promotes only when
+  - predicted preconditioned gain
+  - minus analytical cost penalty
+  exceeds the block EMA threshold
+- otherwise falls back exactly to `AdamW`
+
+Verification passed:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-pact-core`
+- `./unit-tests/build/glades-unit-tests atlas-pact-micro`
+
+Dedicated PACT tests:
+
+- `atlas-pact-core`
+  - confirms exact Adam-style fallback when promotion/geometry are disabled
+  - confirms promotion engages and changes the update on anisotropic blocks
+- `atlas-pact-micro`
+  - `AdamW`: `TrainNLL=2.80569`, `TrainPPL=16.53852`
+  - `BiMAP-lite`: `2.82781`, `16.90845`
+  - `PACT-lite`: `2.80709`, `16.56161`
+  - `PACT-v2-0`: `2.82075`, `16.78942`
+  - `PACT-v2`: `2.81469`, `16.68794`
+
+Minimal end-to-end transformer harness readout (`epochs=1`, `repeats=1`):
+
+- `token-lm-large`
+  - `AdamW`: `TestNLL=4.57676`
+  - `ATLAS-PACT`: `4.56867`
+  - `applyMs`: `AdamW 0.849`, `PACT 2.135`
+- `token-lm-document`
+  - `AdamW`: `Train(s)=0.39`, `TestNLL=5.06561`
+  - `ATLAS-PACT`: `0.47`, `5.07358`
+  - `applyMs`: `AdamW 0.849`, `PACT 11.914`
+- `token-lm-corpus-large`
+  - `AdamW`: `Train(s)=0.93`, `TestNLL=6.40179`
+  - `ATLAS-PACT`: `1.25`, `6.39441`
+  - `applyMs`: `AdamW 1.720`, `PACT 23.691`
+
+Conclusion:
+
+- `PACT` is a real working branch with exact Adam fallback and live promotion logic
+- it survives correctness testing and bounded transformer sanity checks
+- on the current hard transformer harness it shows mixed early-quality behavior:
+  - slightly better than `AdamW` on `token-lm-large`
+  - slightly worse on `token-lm-document`
+  - slightly better on `token-lm-corpus-large`
+- but the systems cost is still too high to argue for it as an `AdamW` replacement
+- the next serious gate, if this line continues, should be explicit GPU time-to-target rather than more local CPU tuning
+
+### April 11, 2026: `PACT-lite` minimal GPU path
+
+Implemented the first real GPU-capable `PACT-lite` transformer path.
+
+Main code:
+
+- CUDA optimizer/state:
+  - `Backend/Machine Learning/Networks/cuda/gpu_atlas.h`
+  - `Backend/Machine Learning/Networks/cuda/gpu_atlas.cu`
+  - `Backend/Machine Learning/Networks/cuda/gpu_transformer_state.h`
+- transformer runtime:
+  - `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- benchmark gate:
+  - `scripts/run_pact_gpu_gate.sh`
+
+Design:
+
+- keep the existing batched GPU `AdamW` update as the exact backbone
+- remove the old blanket GPU rejection for `pactEnabled`
+- run `PACT-lite` only as a residual on top of the already-applied GPU Adam step
+- use only diagonal row/column anisotropy on GPU
+  - no low-rank PACT factors
+  - no predictive transport
+- refresh promotion stats only on the configured cadence
+- score each block by:
+  - predicted preconditioned gain
+  - minus Adam gain
+  - minus analytical cost penalty
+- fall back exactly to `AdamW` whenever the block is demoted
+
+Verification passed locally:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-pact-core`
+- `./unit-tests/build/glades-unit-tests atlas-pact-micro`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant pact --gpu-enable 1 --gpu-device 0`
+
+Important scope note:
+
+- this sandbox still cannot execute the real CUDA training path
+- the local `--gpu-enable 1` smoke only verifies that the new branch compiles, routes correctly, and degrades cleanly when a CUDA device is unavailable
+- the actual decision gate is now:
+  - `scripts/run_pact_gpu_gate.sh --gpu-device 0`
+  - `scripts/run_pact_gpu_gate.sh --gpu-device 0 --acceptance`
+
+Current recommendation:
+
+- `PACT-v2` stays dropped
+- `PACT-lite` is now the only active PACT line
+- the next decision is purely empirical:
+  - whether GPU `PACT-lite` can beat `AdamW` on explicit wall-clock time-to-target on `token-lm-document` or `token-lm-corpus-large`
+
+### April 11, 2026: `PACT-lite` GPU gate verdict
+
+Ran the real GPU gate on a CUDA host with:
+
+- `scripts/run_pact_gpu_gate.sh --gpu-device 0`
+- `scripts/run_pact_gpu_gate.sh --gpu-device 0 --skip-build --acceptance`
+
+Artifacts:
+
+- `artifacts/pact_gpu_gate_20260411-104605/epoch_sweep_summary.tsv`
+- `artifacts/pact_gpu_gate_20260411-105654/epoch_sweep_summary.tsv`
+- `artifacts/pact_gpu_gate_20260411-105654/acceptance_summary.tsv`
+
+Acceptance summary:
+
+- `token-lm-document`
+  - `AdamW`: `Train(s)=0.10 +/- 0.05`, `TestNLL=4.87318 +/- 0.04835`
+  - `PACT-lite`: `0.12 +/- 0.05`, `4.91364 +/- 0.10252`
+- `token-lm-corpus-large`
+  - `AdamW`: `0.18 +/- 0.06`, `6.28685 +/- 0.06764`
+  - `PACT-lite`: `0.22 +/- 0.05`, `6.30785 +/- 0.11172`
+
+Epoch-sweep readout:
+
+- `token-lm-document`
+  - `PACT-lite` showed a small per-epoch quality signal late in the sweep
+  - but not a stable wall-clock advantage
+  - example:
+    - `AdamW`: `4.71289` at `0.20s`
+    - `PACT-lite`: `4.72488` at `0.24s`
+- `token-lm-corpus-large`
+  - `AdamW` kept the stronger frontier throughout
+  - example:
+    - `AdamW`: `6.25968` at `0.20s`
+    - `PACT-lite`: `6.32338` at `0.24s`
+
+Conclusion:
+
+- `PACT-lite` is a real GPU branch, not a dead prototype
+- but it does **not** beat `AdamW` on the actual decision metric:
+  - wall-clock time-to-target at matched or better validation NLL
+- the document-benchmark hint from the 5-repeat sweep does not survive the 10-repeat acceptance pass
+
+Updated recommendation:
+
+- freeze `AdamW` as the transformer default
+- keep `PACT-lite` only as a control branch
+- stop `PACT` refinement on this line
+- if optimizer replacement work continues, change family again rather than tuning `PACT-lite`
+
+### April 11, 2026: `ATLAS-KRON` block-factor preconditioner prototype
+
+Implemented a new transformer-only matrix-preconditioner control branch, `ATLAS-KRON`.
+
+Design:
+
+- exact `AdamW` fallback when `kronGeometryScale=0`
+- full row/column covariance EMA on each matrix block
+- two-sided inverse-square-root factor apply on Adam-normalized momentum
+- bounded secant transport inside the momentum signal
+- no controller shell, no output-side sidecar, no dense fusion
+
+Files touched:
+
+- `Backend/Machine Learning/Networks/atlas_optimizer.h`
+- `Backend/Machine Learning/Networks/atlas_optimizer.cpp`
+- `Backend/Machine Learning/Networks/training_config.h`
+- `Backend/Machine Learning/Networks/checkpoint_persistence.cpp`
+- `Backend/Machine Learning/Networks/network.cpp`
+- `Backend/Machine Learning/Networks/transformer_model_state.inc`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.h`
+- `unit-tests/main.cpp`
+
+Verification passed:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-kron-core`
+- `./unit-tests/build/glades-unit-tests atlas-kron-micro`
+
+Correctness checks:
+
+- `KRON` fallback matches exact Adam-style updates when `kronGeometryScale=0`
+- anisotropic test blocks diverge from Adam fallback and record nontrivial block conditioning
+
+Micro-benchmark:
+
+- `AdamW`: `TrainNLL=2.81549`
+- `BiMAP-lite`: `2.80846`
+- `KRON-0`: `2.81233`
+- `KRON`: `2.82362`
+
+Focused transformer smoke (`epochs=1`, `repeats=1`):
+
+- `token-lm-large`
+  - `AdamW`: `TestNLL=4.56885`, `Train(s)=0.00`, `applyMs=0.077`
+  - `KRON`: `4.57232`, `0.03`, `13.732`
+- `token-lm-document`
+  - `AdamW`: `5.06561`, `0.36s`, `applyMs=0.807`
+  - `KRON`: `5.06384`, `2.90s`, `250.510`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.40179`, `0.91s`, `applyMs=1.633`
+  - `KRON`: `6.39331`, `10.24s`, `626.725`
+
+Interpretation:
+
+- `KRON` is not a cosmetic variant; it is a genuinely different approximation class from `BiMAP`/`PACT`
+- but the systems-cost defect is already dominant on the bounded transformer smoke
+- it buys only tiny 1-epoch quality changes while introducing two to three orders of magnitude more apply-time overhead
+
+Verdict:
+
+- keep `ATLAS-KRON` only as a falsification/control branch
+- do **not** spend a GPU-kernel round on it in the current form
+- the branch failed the minimal local viability gate before the real GPU time-to-target gate
+- if replacement work continues, the next family should be even more compute-disciplined than `KRON`, not a fuller version of it
+
+## April 11, 2026: `ATLAS-MUON-lite` selective orthogonalized-momentum prototype
+
+Implemented a new matrix-only optimizer branch, `ATLAS-MUON-lite`, as the next family after `KRON`:
+
+\[
+\Delta W = -\eta \left[(1-\gamma)\,D^{-1}\hat m + \gamma\,s\,\operatorname{Polar}(D^{-1}\hat m)\right]
+\]
+
+with exact `AdamW` fallback when:
+
+- `muonGeometryScale = 0`
+- the matrix block is too rectangular: `max(m,n) / min(m,n) > muonMaxAspect`
+- the block is too small: `min(m,n) < muonMinDim`
+
+Scope:
+
+- no GPU path yet
+- only matrix blocks use the MUON update
+- embeddings, biases, norms, and ineligible matrix blocks stay on exact Adam-style updates
+- bounded secant transport is optional and small (`muonPredictiveScale`)
+
+Files touched:
+
+- `Backend/Machine Learning/Networks/training_config.h`
+- `Backend/Machine Learning/Networks/checkpoint_persistence.cpp`
+- `Backend/Machine Learning/Networks/network.cpp`
+- `Backend/Machine Learning/Networks/transformer_model_state.inc`
+- `Backend/Machine Learning/Networks/atlas_optimizer.h`
+- `Backend/Machine Learning/Networks/atlas_optimizer.cpp`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.h`
+- `unit-tests/main.cpp`
+
+Verification passed:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-muon-core`
+- `./unit-tests/build/glades-unit-tests atlas-muon-micro`
+
+Correctness checks:
+
+- `MUON` fallback matches exact Adam-style updates when `muonGeometryScale=0`
+- eligible square blocks diverge from Adam fallback on the second step once moment history exists
+
+Micro-benchmark:
+
+- `AdamW`: `TrainNLL=2.80163`
+- `MUON-0`: `2.80407`
+- `MUON`: `2.81027`
+
+Focused transformer smoke (`epochs=1`, `repeats=1`):
+
+- `token-lm-large`
+  - `AdamW`: `TestNLL=4.56885`, `Train(s)=0.01`, `applyMs=0.063`
+  - `ATLAS-MUON`: `4.57659`, `0.01`, `0.927`
+- `token-lm-document`
+  - `AdamW`: `5.06561`, `0.30s`, `applyMs=0.849`
+  - `ATLAS-MUON`: `5.04163`, `0.83s`, `9.823`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.40179`, `1.01s`, `applyMs=1.701`
+  - `ATLAS-MUON`: `6.21710`, `2.24s`, `18.769`
+
+Interpretation:
+
+- `MUON-lite` is directionally alive on the hard transformer cases in a way `KRON` was not: it materially improves bounded 1-epoch test NLL on `token-lm-document` and `token-lm-corpus-large`
+- but its CPU systems cost is still far too high to make it a wall-clock replacement candidate
+- the branch is therefore worth keeping alive, but only as the new leading replacement family for a real GPU time-to-target gate
+
+Verdict:
+
+- keep `ATLAS-MUON-lite` as the only active post-`KRON` replacement candidate
+- do **not** infer an `AdamW` win from these bounded CPU results
+- the next serious step, if this line continues, is a GPU-first implementation and explicit `T_\epsilon` measurement on:
+  - `token-lm-document`
+  - `token-lm-corpus-large`
+
+## April 11, 2026: minimal GPU MUON-lite residual path and gate script
+
+Implemented a minimal GPU `MUON-lite` route by reusing the existing batched Adam
+backbone and adding a host-assisted orthogonalized residual on eligible matrix
+blocks. This is intentionally a bridge implementation:
+
+- exact AdamW backbone remains the hot path
+- GPU `MUON-lite` only applies a residual correction after Adam
+- all unsensed or ineligible blocks degenerate exactly to AdamW
+- no claim of fused optimality yet; the purpose is to make the real gate runnable
+
+Files touched:
+
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.h`
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.cu`
+- `Backend/Machine Learning/Networks/cuda/gpu_transformer_state.h`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `scripts/run_muon_gpu_gate.sh`
+
+Verification passed:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-muon-core`
+- `./unit-tests/build/glades-unit-tests atlas-muon-micro`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant muon --gpu-enable 1 --gpu-device 0`
+
+Local sweep artifact:
+
+- `artifacts/muon_gpu_gate_20260411-120536/epoch_sweep_summary.tsv`
+
+Important caveat:
+
+- this sandbox still does **not** provide a stable real CUDA gate
+- the raw `AdamW` logs in that sweep explicitly report `No CUDA devices found`
+- the resulting frontier must therefore be treated as CPU fallback / directional only, not as a valid GPU `T_\epsilon` decision
+
+Directional fallback-only sweep summary:
+
+- `token-lm-document`
+  - `AdamW`
+    - `1 epoch`: `0.30s`, `TestNLL=5.08055`
+    - `2 epochs`: `0.61s`, `4.73422`
+    - `3 epochs`: `0.92s`, `4.22666`
+    - `4 epochs`: `1.22s`, `3.58111`
+  - `ATLAS-MUON`
+    - `1 epoch`: `0.70s`, `4.99930`
+    - `2 epochs`: `1.42s`, `4.35125`
+    - `3 epochs`: `2.12s`, `3.52163`
+    - `4 epochs`: `2.83s`, `2.97537`
+- `token-lm-corpus-large`
+  - `AdamW`
+    - `1 epoch`: `0.89s`, `TestNLL=6.40277`
+    - `2 epochs`: `1.77s`, `6.25672`
+    - `3 epochs`: `2.66s`, `6.40044`
+    - `4 epochs`: `3.56s`, `6.61852`
+  - `ATLAS-MUON`
+    - `1 epoch`: `2.09s`, `6.25034`
+    - `2 epochs`: `4.19s`, `6.27432`
+    - `3 epochs`: `6.28s`, `6.53348`
+    - `4 epochs`: `8.37s`, `6.74450`
+
+Interpretation:
+
+- `MUON-lite` remains interesting as a quality-per-epoch / quality-per-step family
+- the current local sweep does **not** establish a GPU wall-clock win
+- the only valid next decision is to run `scripts/run_muon_gpu_gate.sh` on a host with stable CUDA visibility
+
+Verdict:
+
+- GPU `MUON-lite` is now implemented and benchmarkable
+- no valid promotion or rejection decision should be made from the sandbox sweep
+- keep the line alive only until a real GPU host runs the gate
+
+## April 11, 2026: fixed real GPU alt-bench transformer init crash; ran valid MUON GPU gate
+
+The real CUDA crash in `atlas-alt-bench` was not a generic transformer GPU
+allocator failure. The same shapes ran cleanly in
+`transformer-gpu-bench`. The crash was specific to the alt-bench path enabling
+benchmark-only optimizer-gap diagnostics before the GPU fast path was selected.
+
+Root-cause fix:
+
+- moved the `captureOptimizerGapDiagnostics` reset block in
+  `Backend/Machine Learning/Networks/sgd_transformer.cpp` to run only after the
+  GPU fast path declines and the CPU fallback is actually taken
+- restored `atlas-alt-bench` token-LM configs to keep
+  `captureOptimizerGapDiagnostics = true`
+
+Why this is the right fix:
+
+- the gap-reset block is benchmark-only host bookkeeping
+- it has no role in the GPU epoch path itself
+- `atlas-alt-bench` no longer crashes on real CUDA for:
+  - `token-lm --variant adamw --gpu-enable 1`
+  - `token-lm-document --variant adamw --gpu-enable 1`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- real CUDA smoke:
+  - `stdbuf -oL ./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant adamw --gpu-enable 1 --gpu-device 0`
+  - `stdbuf -oL ./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 1 --variant adamw --gpu-enable 1 --gpu-device 0`
+
+Real GPU MUON gate artifact:
+
+- `artifacts/muon_gpu_gate_20260411-130403/epoch_sweep_summary.tsv`
+
+Real GPU frontier summary:
+
+- `token-lm-document`
+  - `AdamW`
+    - `1 epoch`: `0.08s`, `TestNLL=5.09990`
+    - `2 epochs`: `0.12s`, `4.84727`
+    - `3 epochs`: `0.16s`, `4.68956`
+    - `4 epochs`: `0.20s`, `4.75030`
+  - `ATLAS-MUON`
+    - `1 epoch`: `0.49s`, `5.04205`
+    - `2 epochs`: `0.98s`, `4.79342`
+    - `3 epochs`: `1.41s`, `4.64563`
+    - `4 epochs`: `1.91s`, `4.60492`
+- `token-lm-corpus-large`
+  - `AdamW`
+    - `1 epoch`: `0.13s`, `TestNLL=6.34261`
+    - `2 epochs`: `0.20s`, `6.20495`
+    - `3 epochs`: `0.29s`, `6.30748`
+    - `4 epochs`: `0.37s`, `6.50887`
+  - `ATLAS-MUON`
+    - `1 epoch`: `1.36s`, `6.24589`
+    - `2 epochs`: `2.70s`, `6.30244`
+    - `3 epochs`: `4.03s`, `6.39071`
+    - `4 epochs`: `5.36s`, `6.58369`
+
+Interpretation:
+
+- `MUON-lite` buys real quality-per-epoch on `token-lm-document`
+- it still fails the actual gate because it is far slower in wall-clock
+- on `token-lm-corpus-large`, it helps only at the loosest 1-epoch point and
+  loses the frontier afterward
+
+Verdict:
+
+- the alt-bench GPU gate is now valid again
+- `ATLAS-MUON-lite` is falsified as an `AdamW` replacement on explicit GPU
+  time-to-target
+- keep it only as a control if needed; do not spend more time refining it
+
+## April 11, 2026: Nsight Systems profile shows MUON-lite is host/orchestration bound, not kernel bound
+
+I added a reusable profiling script:
+
+- `scripts/run_muon_nsys_profile.sh`
+
+The important robustness fix is that the script no longer depends on Nsight
+auto-importing `.qdstrm` traces to `.nsys-rep`; it explicitly invokes
+`QdstrmImporter` before running `nsys stats`.
+
+Profiled pair:
+
+- `token-lm-document`
+- `epochs=1`
+- `AdamW` vs `ATLAS-MUON-lite`
+- real CUDA host
+
+Artifact:
+
+- `artifacts/muon_nsys_20260411-132148`
+
+Observed training result for the profiled run:
+
+- `AdamW`: `Train(s)=0.49`, `TestNLL=5.08509`
+- `ATLAS-MUON-lite`: `Train(s)=0.97`, `TestNLL=5.06455`
+
+So the profile is representative of the earlier gate:
+
+- `MUON-lite` buys a small quality improvement
+- but still roughly doubles wall-clock
+
+Nsight summary totals:
+
+- `AdamW`
+  - CUDA API time: `62.532 ms`
+  - GPU kernel time: `44.182 ms`
+  - GPU memory op time: `1.353 ms`
+- `ATLAS-MUON-lite`
+  - CUDA API time: `93.238 ms`
+  - GPU kernel time: `46.218 ms`
+  - GPU memory op time: `5.087 ms`
+
+Key breakdown:
+
+- kernel time is almost unchanged:
+  - `44.182 ms` -> `46.218 ms`
+- the slowdown is mostly outside the core math:
+  - CUDA API time rises by about `49%`
+  - GPU memory op time rises by about `3.8x`
+  - `cudaMemcpy` calls jump from `306` to `2370`
+  - `cudaStreamSynchronize` calls/total time rise sharply
+  - OS runtime waiting roughly doubles
+
+Important kernel detail:
+
+- `muon_lite_apply_residual_kernel` is present and small:
+  - `1.045 ms` total across `576` launches
+- the dominant transformer kernels remain the same flash-attention and GEMM
+  kernels as `AdamW`
+
+Interpretation:
+
+- the current `MUON-lite` slowdown is not primarily device-side linear algebra
+- it is primarily host-assisted orchestration, extra synchronization, and
+  device<->host movement
+- therefore a fully device-native `MUON-v2` remains the only technically
+  defensible continuation of this line
+
+Decision:
+
+- do not tune `MUON-lite`
+- only continue if willing to replace the host-assisted residual path with a
+  fully device-native implementation
+- otherwise stop optimizer-replacement work and keep `AdamW` as the transformer
+  default
+
+## April 11, 2026: fully device-native `MUON-lite` still loses the real CUDA gate
+
+I replaced the old host-assisted GPU MUON bridge with a fully device-native
+path.
+
+Main implementation changes:
+
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.h`
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.cu`
+
+What changed structurally:
+
+- removed per-step host downloads of Adam moments for MUON blocks
+- removed host-side orthogonalization and residual assembly
+- moved predictive trust and signal scaling fully onto the device
+- reused the existing tiny on-device Cholesky path for the MUON core solve
+- kept exact `AdamW` fallback for ineligible blocks
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-muon-core`
+- `./unit-tests/build/glades-unit-tests atlas-muon-micro`
+- real CUDA smoke:
+  - `atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 1 --variant adamw --gpu-enable 1`
+  - `atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 1 --variant muon --gpu-enable 1`
+
+Real CUDA sweep artifact:
+
+- `artifacts/muon_gpu_gate_20260411-134926/epoch_sweep_summary.tsv`
+
+True device-native frontier:
+
+- `token-lm-document`
+  - `AdamW`
+    - `1 epoch`: `0.08s`, `TestNLL=5.09820`
+    - `2 epochs`: `0.12s`, `4.85065`
+    - `3 epochs`: `0.16s`, `4.68609`
+    - `4 epochs`: `0.20s`, `4.75096`
+  - `ATLAS-MUON`
+    - `1 epoch`: `0.48s`, `5.07453`
+    - `2 epochs`: `0.92s`, `4.85126`
+    - `3 epochs`: `1.38s`, `4.78971`
+    - `4 epochs`: `1.82s`, `4.61171`
+- `token-lm-corpus-large`
+  - `AdamW`
+    - `1 epoch`: `0.12s`, `TestNLL=6.34269`
+    - `2 epochs`: `0.20s`, `6.28071`
+    - `3 epochs`: `0.28s`, `6.33483`
+    - `4 epochs`: `0.36s`, `6.53199`
+  - `ATLAS-MUON`
+    - `1 epoch`: `1.14s`, `6.27144`
+    - `2 epochs`: `2.22s`, `6.32167`
+    - `3 epochs`: `3.31s`, `6.41135`
+    - `4 epochs`: `4.44s`, `6.71464`
+
+Interpretation:
+
+- this is now the clean comparison the previous host-assisted MUON path could
+  not provide
+- device-native MUON still does not beat `AdamW` on explicit GPU
+  wall-clock time-to-target
+- on `token-lm-document`, it only shows a small loose-target quality advantage
+  while remaining roughly `6x` to `9x` slower
+- on `token-lm-corpus-large`, it helps only at the loosest 1-epoch point and
+  then loses both quality and wall-clock
+
+Verdict:
+
+- `ATLAS-MUON-lite` is now falsified as an `AdamW` replacement under a true
+  device-native CUDA comparison
+- keep it only as a control if needed
+- stop MUON refinement on this branch family
+
+## April 11, 2026: `RACER-lite` implements risk-adjusted sparse promotion, but the first CPU transformer pass is not a replacement win
+
+I implemented `RACER-lite` as a new transformer-side ATLAS branch with:
+
+- exact `AdamW` fallback on all unsensed or demoted blocks
+- BiMAP-style two-sided row/column preconditioning as the promoted action
+- delayed stable-signal EMA inside each matrix block
+- explicit promotion score:
+  stable reward minus curvature proxy minus noise penalty minus cost penalty
+- explicit CPU-only status on the transformer path for now; GPU RACER is not
+  implemented and is rejected rather than silently measured as fallback
+
+Main implementation changes:
+
+- `Backend/Machine Learning/Networks/training_config.h`
+- `Backend/Machine Learning/Networks/atlas_optimizer.h`
+- `Backend/Machine Learning/Networks/atlas_optimizer.cpp`
+- `Backend/Machine Learning/Networks/checkpoint_persistence.cpp`
+- `Backend/Machine Learning/Networks/network.cpp`
+- `Backend/Machine Learning/Networks/transformer_model_state.inc`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.h`
+- `unit-tests/main.cpp`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-racer-core`
+- `./unit-tests/build/glades-unit-tests atlas-racer-micro`
+
+Core correctness outcome:
+
+- fallback test: exact Adam-style update when RACER geometry is disabled and
+  promotion is blocked
+- promotion test: anisotropic matrix block diverges from exact Adam fallback
+  and records a finite promotion margin
+
+Transformer micro benchmark:
+
+- `AdamW`: `TrainNLL=2.79707`
+- `BiMAP-lite`: `2.82039`
+- `RACER-0`: `2.81524`
+- `RACER-lite`: `2.81332`
+
+Bounded 1-epoch transformer smoke:
+
+- `token-lm-large`
+  - `AdamW`: `TestNLL=4.56885`, `applyMs=0.066`
+  - `ATLAS-RACER`: `4.57231`, `applyMs=0.346`
+- `token-lm-document`
+  - `AdamW`: `5.06561`, `0.56s`, `applyMs=0.871`
+  - `ATLAS-RACER`: `5.06481`, `0.56s`, `applyMs=2.488`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.40179`, `1.17s`, `applyMs=1.841`
+  - `ATLAS-RACER`: `6.39173`, `1.39s`, `applyMs=5.123`
+
+Interpretation:
+
+- `RACER-lite` is now a real named branch, not a paper design
+- the stable-signal / risk-adjusted promotion logic is internally consistent
+- early transformer quality is mixed but real:
+  slightly worse on `token-lm-large`, roughly tied/slightly better on
+  `token-lm-document`, slightly better on `token-lm-corpus-large`
+- cost is still too high even in this narrow CPU pass, so there is no
+  replacement case against `AdamW` yet
+
+Verdict:
+
+- keep `RACER-lite` as a valid falsification/control branch
+- do not promote it as an `AdamW` replacement
+- if this line continues, the next honest gate is explicit GPU
+  wall-clock time-to-target, not more CPU-side optimizer-shape tuning
+
+## April 11, 2026: GPU `RACER-lite` is now wired through the real transformer epoch path
+
+I removed the old transformer-side `GPU RACER-lite path not implemented`
+rejection and added a minimal GPU residual branch:
+
+- exact batched `AdamW` backbone remains unchanged
+- GPU RACER keeps row/column second-moment EMAs resident on device
+- GPU RACER keeps `prevMhat` and `stableMhat` resident on device
+- promotion is still cheap and scalar-scored:
+  predicted stable reward minus risk penalty minus cost penalty
+- only the promoted residual difference from `AdamW` is applied
+
+Main CUDA/runtime changes:
+
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.h`
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.cu`
+- `Backend/Machine Learning/Networks/cuda/gpu_transformer_state.h`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `scripts/run_racer_gpu_gate.sh`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-racer-core`
+- `./unit-tests/build/glades-unit-tests atlas-racer-micro`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 1 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 1 --variant racer`
+- `bash -n ./scripts/run_racer_gpu_gate.sh`
+
+Sandbox-only GPU-requested smoke:
+
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant racer --gpu-enable 1 --gpu-device 0`
+- result: no more RACER-specific unsupported-path error
+- this sandbox still reports `No CUDA devices found (err=100, count=0)`,
+  so the run falls back and is not a valid GPU benchmark
+
+Interpretation:
+
+- GPU RACER is now benchmarkable on a real CUDA host
+- local correctness and CPU behavior still hold after the CUDA wiring
+- no promotion/rejection claim should be made until
+  `./scripts/run_racer_gpu_gate.sh --gpu-device 0`
+  is run on a machine with a visible NVIDIA device
+
+## April 11, 2026: zero-overhead `AdamW-Group` branch is live, but bounded CPU results do not justify promotion
+
+Instead of adding more geometry or controller state, I implemented a
+groupwise scalar modulation on top of the exact `AdamW` hot path:
+
+- optimizer type remains `AdamW`
+- extra state is only one previous-step RMS scalar per parameter group
+- per-group scale is computed from:
+  - step stability,
+  - moment SNR,
+  - update-to-weight ratio
+- small groups fall back exactly to `AdamW`
+- GPU path keeps batched Adam and only adds one batched group-scale kernel
+
+Main code paths:
+
+- `Backend/Machine Learning/Networks/training_config.h`
+- `Backend/Machine Learning/Networks/checkpoint_persistence.cpp`
+- `Backend/Machine Learning/Networks/model_persistence.cpp`
+- `Backend/Machine Learning/Networks/transformer_model_state.inc`
+- `Backend/Machine Learning/Networks/cuda/gpu_transformer_state.h`
+- `Backend/Machine Learning/Networks/cuda/gpu_transformer_state.cu`
+- `Backend/Machine Learning/Networks/cuda/gpu_kernels.h`
+- `Backend/Machine Learning/Networks/cuda/gpu_kernels.cu`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.cpp`
+- `scripts/run_groupadam_gpu_gate.sh`
+
+Verification:
+
+- `cmake --build /home/robert/dev/glades-ml/build -j4`
+- `cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-controller`
+- `./unit-tests/build/glades-unit-tests atlas-groupadam-micro`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --token-epochs 1 --repeats 1 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-large --token-epochs 1 --repeats 1 --variant adamw-group`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 1 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 1 --variant adamw-group`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 1 --variant adamw`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 1 --variant adamw-group`
+
+Bounded CPU results:
+
+- micro benchmark
+  - `AdamW`: `TrainNLL=2.81271`
+  - `AdamW-Group`: `2.80571`
+
+- `token-lm-large`
+  - `AdamW`: `TestNLL=4.56885`, `applyMs=0.069`
+  - `AdamW-Group`: `4.57867`, `applyMs=0.146`
+
+- `token-lm-document`
+  - `AdamW`: `TestNLL=5.06561`, `0.53s`, `applyMs=0.843`
+  - `AdamW-Group`: `5.10043`, `0.58s`, `applyMs=1.388`
+
+- `token-lm-corpus-large`
+  - `AdamW`: `TestNLL=6.40179`, `1.25s`, `applyMs=2.523`
+  - `AdamW-Group`: `6.34366`, `1.28s`, `applyMs=3.506`
+
+Interpretation:
+
+- the branch is real and zero-overhead in structure, not another ATLAS sidecar
+- local quality effects are mixed:
+  - slightly worse on `token-lm-large`
+  - worse on `token-lm-document`
+  - slightly better on `token-lm-corpus-large`
+- even this cheaper family still pays extra apply cost on CPU
+- there is no bounded-case argument for promotion over `AdamW`
+
+Recommendation:
+
+- run the real GPU gate next:
+  - `./scripts/run_groupadam_gpu_gate.sh --gpu-device 0`
+  - `./scripts/run_groupadam_gpu_gate.sh --gpu-device 0 --acceptance`
+- only continue the branch if it beats `AdamW` on GPU `T_epsilon`
+  on `token-lm-document` or `token-lm-corpus-large`
+
+## April 11, 2026: real GPU gate rejects `AdamW-Group` as an `AdamW` replacement
+
+GPU artifacts:
+
+- sweep:
+  - `artifacts/groupadam_gpu_gate_20260411-152722/epoch_sweep_summary.tsv`
+- acceptance:
+  - `artifacts/groupadam_gpu_gate_20260411-152722/acceptance_summary.tsv`
+
+5-repeat sweep:
+
+- `token-lm-document`
+  - `AdamW` dominates at every measured point
+  - `1 epoch`: `AdamW 5.09979 @ 0.08s`, `AdamW-Group 5.12598 @ 0.08s`
+  - `2 epochs`: `AdamW 4.85514 @ 0.12s`, `AdamW-Group 4.91335 @ 0.12s`
+  - `3 epochs`: `AdamW 4.70822 @ 0.16s`, `AdamW-Group 4.80596 @ 0.16s`
+  - `4 epochs`: `AdamW 4.62929 @ 0.20s`, `AdamW-Group 4.75050 @ 0.21s`
+
+- `token-lm-corpus-large`
+  - there is a weak loose-target signal, but not a clean frontier win
+  - `1 epoch`: `AdamW 6.34327 @ 0.12s`, `AdamW-Group 6.28580 @ 0.13s`
+  - `2 epochs`: `AdamW 6.26259 @ 0.20s`, `AdamW-Group 6.25732 @ 0.21s`
+  - `3 epochs`: `AdamW 6.30994 @ 0.28s`, `AdamW-Group 6.27191 @ 0.30s`
+  - `4 epochs`: `AdamW 6.53131 @ 0.37s`, `AdamW-Group 6.45454 @ 0.38s`
+
+Acceptance pass:
+
+- `token-lm-document`
+  - `AdamW`: `TestNLL=4.87007 @ 0.10s`
+  - `AdamW-Group`: `4.89741 @ 0.10s`
+
+- `token-lm-corpus-large`
+  - `AdamW`: `6.30836 @ 0.19s`
+  - `AdamW-Group`: `6.31116 @ 0.19s`
+
+Interpretation:
+
+- the document benchmark is a clean negative
+- the corpus-large loose-target hint does not survive the acceptance pass
+- `AdamW-Group` is a valid low-overhead control, not a promotion candidate
+
+Verdict:
+
+- keep `AdamW` as the transformer default
+- keep `AdamW-Group` only as a control
+- stop refining this branch
 ---
 
-*Document version: 1.19*
+*Document version: 1.23*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
 *Date: 2026-04-11*

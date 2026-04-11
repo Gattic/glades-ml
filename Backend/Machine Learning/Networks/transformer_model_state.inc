@@ -121,6 +121,14 @@
 			atlas::WeightState atlasW1, atlasW2;
 			atlas::BiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
 			atlas::BiMAPWeightState bimapW1, bimapW2;
+			atlas::BiMAPWeightState pactWq, pactWk, pactWv, pactWo;
+			atlas::BiMAPWeightState pactW1, pactW2;
+			atlas::BiMAPWeightState racerWq, racerWk, racerWv, racerWo;
+			atlas::BiMAPWeightState racerW1, racerW2;
+			atlas::KronWeightState kronWq, kronWk, kronWv, kronWo;
+			atlas::KronWeightState kronW1, kronW2;
+			atlas::MuonWeightState muonWq, muonWk, muonWv, muonWo;
+			atlas::MuonWeightState muonW1, muonW2;
 		};
 
 		std::vector<Block> blocks;
@@ -132,6 +140,18 @@
 		atlas::BiMAPWeightState bimapWIn;
 		atlas::BiMAPWeightState bimapWOut;
 		atlas::BiMAPWeightState bimapTokE;
+		atlas::BiMAPWeightState pactWIn;
+		atlas::BiMAPWeightState pactWOut;
+		atlas::BiMAPWeightState pactTokE;
+		atlas::BiMAPWeightState racerWIn;
+		atlas::BiMAPWeightState racerWOut;
+		atlas::BiMAPWeightState racerTokE;
+		atlas::KronWeightState kronWIn;
+		atlas::KronWeightState kronWOut;
+		atlas::KronWeightState kronTokE;
+		atlas::MuonWeightState muonWIn;
+		atlas::MuonWeightState muonWOut;
+		atlas::MuonWeightState muonTokE;
 
 		// Benchmark-only grouped optimizer-gap diagnostics. These stay at the
 		// top level so AdamW and plain ATLAS-BSRP runs can report the same
@@ -147,6 +167,8 @@
 		unsigned long long gapMarginSnapshotCount;
 		double gapTargetMarginSum;
 		double gapHardNegativeLogitSum;
+		std::vector<float> adamGroupPrevStepRms;
+		std::vector<float> adamGroupLastScale;
 
 		struct HelmState
 		{
@@ -644,6 +666,8 @@
 			gapMarginSnapshotCount = 0ULL;
 			gapTargetMarginSum = 0.0;
 			gapHardNegativeLogitSum = 0.0;
+			adamGroupPrevStepRms.clear();
+			adamGroupLastScale.clear();
 			adamBeta1Power = 1.0;
 			adamBeta2Power = 1.0;
 			mpLowpReady = false;

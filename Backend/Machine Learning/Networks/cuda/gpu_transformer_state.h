@@ -197,6 +197,12 @@ struct GpuTransformerWeights
 		// ATLAS optimizer state (one per weight matrix)
 		GpuAtlasWeightState atlasWq, atlasWk, atlasWv, atlasWo;
 		GpuAtlasWeightState atlasW1, atlasW2;
+		GpuPactWeightState pactWq, pactWk, pactWv, pactWo;
+		GpuPactWeightState pactW1, pactW2;
+		GpuRacerWeightState racerWq, racerWk, racerWv, racerWo;
+		GpuRacerWeightState racerW1, racerW2;
+		GpuMuonWeightState muonWq, muonWk, muonWv, muonWo;
+		GpuMuonWeightState muonW1, muonW2;
 	};
 
 	Block* blocks;  // array of nLayers blocks
@@ -210,6 +216,8 @@ struct GpuTransformerWeights
 	// Per-group scalars (device arrays of float): lr, wd.
 	float* d_adamLr;
 	float* d_adamWd;
+	float* d_adamGroupScales;
+	float* d_adamGroupPrevStepRms;
 	// Per-group element counts (device array of int).
 	int* d_adamSizes;
 	int adamGroupCount;   // number of parameter groups
@@ -220,6 +228,15 @@ struct GpuTransformerWeights
 	GpuAtlasWeightState atlasTokE;
 	GpuAtlasWeightState atlasWIn;
 	GpuAtlasWeightState atlasWOut;
+	GpuPactWeightState pactTokE;
+	GpuPactWeightState pactWIn;
+	GpuPactWeightState pactWOut;
+	GpuRacerWeightState racerTokE;
+	GpuRacerWeightState racerWIn;
+	GpuRacerWeightState racerWOut;
+	GpuMuonWeightState muonTokE;
+	GpuMuonWeightState muonWIn;
+	GpuMuonWeightState muonWOut;
 
 	GpuTransformerWeights();
 	~GpuTransformerWeights();

@@ -520,40 +520,50 @@ enum BenchMode
 enum VariantKind
 {
 	VARIANT_ADAMW = 0,
-	VARIANT_ATLAS_BASE = 1,
-	VARIANT_ATLAS_SPARROW = 2,
-	VARIANT_ATLAS_HELM = 3,
-	VARIANT_ATLAS_ASTER = 4,
-	VARIANT_ATLAS_AEGIS = 5,
-	VARIANT_ATLAS_CITADEL = 6,
-	VARIANT_ATLAS_RAMPART = 7,
-	VARIANT_ATLAS_MERIT = 8,
-	VARIANT_ATLAS_STRATA = 9,
-	VARIANT_ATLAS_AURORA = 10,
-	VARIANT_ATLAS_SEAM = 11,
-	VARIANT_ATLAS_QUASAR = 12,
-	VARIANT_ATLAS_GEODE = 13,
-	VARIANT_ATLAS_BIMAP = 14
+	VARIANT_ADAMW_GROUP = 1,
+	VARIANT_ATLAS_BASE = 2,
+	VARIANT_ATLAS_SPARROW = 3,
+	VARIANT_ATLAS_HELM = 4,
+	VARIANT_ATLAS_ASTER = 5,
+	VARIANT_ATLAS_AEGIS = 6,
+	VARIANT_ATLAS_CITADEL = 7,
+	VARIANT_ATLAS_RAMPART = 8,
+	VARIANT_ATLAS_MERIT = 9,
+	VARIANT_ATLAS_STRATA = 10,
+	VARIANT_ATLAS_AURORA = 11,
+	VARIANT_ATLAS_SEAM = 12,
+	VARIANT_ATLAS_QUASAR = 13,
+	VARIANT_ATLAS_GEODE = 14,
+	VARIANT_ATLAS_BIMAP = 15,
+	VARIANT_ATLAS_PACT = 16,
+	VARIANT_ATLAS_RACER = 17,
+	VARIANT_ATLAS_KRON = 18,
+	VARIANT_ATLAS_MUON = 19
 };
 
 enum VariantSelection
 {
 	VARIANT_SELECTION_ALL = 0,
 	VARIANT_SELECTION_ADAMW = 1,
-	VARIANT_SELECTION_ATLAS_BASE = 2,
-	VARIANT_SELECTION_ATLAS_SPARROW = 3,
-	VARIANT_SELECTION_ATLAS_HELM = 4,
-	VARIANT_SELECTION_ATLAS_ASTER = 5,
-	VARIANT_SELECTION_ATLAS_AEGIS = 6,
-	VARIANT_SELECTION_ATLAS_CITADEL = 7,
-	VARIANT_SELECTION_ATLAS_RAMPART = 8,
-	VARIANT_SELECTION_ATLAS_MERIT = 9,
-	VARIANT_SELECTION_ATLAS_STRATA = 10,
-	VARIANT_SELECTION_ATLAS_AURORA = 11,
-	VARIANT_SELECTION_ATLAS_SEAM = 12,
-	VARIANT_SELECTION_ATLAS_QUASAR = 13,
-	VARIANT_SELECTION_ATLAS_GEODE = 14,
-	VARIANT_SELECTION_ATLAS_BIMAP = 15
+	VARIANT_SELECTION_ADAMW_GROUP = 2,
+	VARIANT_SELECTION_ATLAS_BASE = 3,
+	VARIANT_SELECTION_ATLAS_SPARROW = 4,
+	VARIANT_SELECTION_ATLAS_HELM = 5,
+	VARIANT_SELECTION_ATLAS_ASTER = 6,
+	VARIANT_SELECTION_ATLAS_AEGIS = 7,
+	VARIANT_SELECTION_ATLAS_CITADEL = 8,
+	VARIANT_SELECTION_ATLAS_RAMPART = 9,
+	VARIANT_SELECTION_ATLAS_MERIT = 10,
+	VARIANT_SELECTION_ATLAS_STRATA = 11,
+	VARIANT_SELECTION_ATLAS_AURORA = 12,
+	VARIANT_SELECTION_ATLAS_SEAM = 13,
+	VARIANT_SELECTION_ATLAS_QUASAR = 14,
+	VARIANT_SELECTION_ATLAS_GEODE = 15,
+	VARIANT_SELECTION_ATLAS_BIMAP = 16,
+	VARIANT_SELECTION_ATLAS_PACT = 17,
+	VARIANT_SELECTION_ATLAS_RACER = 18,
+	VARIANT_SELECTION_ATLAS_KRON = 19,
+	VARIANT_SELECTION_ATLAS_MUON = 20
 };
 
 struct TokenConfig
@@ -700,6 +710,29 @@ struct BenchConfig
 	float atlasBiMAPGeometryScale;
 	float atlasBiMAPPredictiveScale;
 	unsigned int atlasBiMAPFactorCadence;
+	unsigned int atlasPACTLowRank;
+	float atlasPACTGeometryScale;
+	float atlasPACTPredictiveScale;
+	unsigned int atlasPACTFactorCadence;
+	float atlasPACTCostScale;
+	float atlasPACTPromoteThreshold;
+	float atlasPACTDemoteThreshold;
+	float atlasRACERGeometryScale;
+	float atlasRACERPredictiveScale;
+	unsigned int atlasRACERFactorCadence;
+	float atlasRACERRiskScale;
+	float atlasRACERCostScale;
+	float atlasRACERPromoteThreshold;
+	float atlasRACERDemoteThreshold;
+	float atlasKronGeometryScale;
+	float atlasKronPredictiveScale;
+	unsigned int atlasKronFactorCadence;
+	float atlasKronDamping;
+	float atlasMuonGeometryScale;
+	float atlasMuonPredictiveScale;
+	float atlasMuonMaxAspect;
+	unsigned int atlasMuonMinDim;
+	float atlasMuonDamping;
 	unsigned int gpuEnable;
 	int gpuDeviceId;
 	TokenConfig token;
@@ -747,6 +780,29 @@ struct BenchConfig
 	      atlasBiMAPGeometryScale(1.0f),
 	      atlasBiMAPPredictiveScale(0.15f),
 	      atlasBiMAPFactorCadence(8u),
+	      atlasPACTLowRank(1u),
+	      atlasPACTGeometryScale(1.0f),
+	      atlasPACTPredictiveScale(0.10f),
+	      atlasPACTFactorCadence(8u),
+	      atlasPACTCostScale(0.0010f),
+	      atlasPACTPromoteThreshold(0.0f),
+	      atlasPACTDemoteThreshold(-0.0005f),
+	      atlasRACERGeometryScale(1.0f),
+	      atlasRACERPredictiveScale(0.05f),
+	      atlasRACERFactorCadence(8u),
+	      atlasRACERRiskScale(0.50f),
+	      atlasRACERCostScale(0.0010f),
+	      atlasRACERPromoteThreshold(0.0f),
+	      atlasRACERDemoteThreshold(-0.0005f),
+	      atlasKronGeometryScale(1.0f),
+	      atlasKronPredictiveScale(0.05f),
+	      atlasKronFactorCadence(8u),
+	      atlasKronDamping(0.10f),
+	      atlasMuonGeometryScale(1.0f),
+	      atlasMuonPredictiveScale(0.05f),
+	      atlasMuonMaxAspect(1.50f),
+	      atlasMuonMinDim(8u),
+	      atlasMuonDamping(0.01f),
 	      gpuEnable(0u),
 	      gpuDeviceId(0),
 	      token(),
@@ -1234,6 +1290,7 @@ static const char* variant_label(VariantKind variant)
 	switch (variant)
 	{
 	case VARIANT_ADAMW: return "AdamW";
+	case VARIANT_ADAMW_GROUP: return "AdamW-Group";
 	case VARIANT_ATLAS_BASE: return "ATLAS-BSRP";
 	case VARIANT_ATLAS_SPARROW: return "ATLAS-SPARROW";
 	case VARIANT_ATLAS_HELM: return "ATLAS-HELM";
@@ -1248,6 +1305,10 @@ static const char* variant_label(VariantKind variant)
 	case VARIANT_ATLAS_QUASAR: return "ATLAS-QUASAR";
 	case VARIANT_ATLAS_GEODE: return "ATLAS-GEODE";
 	case VARIANT_ATLAS_BIMAP: return "ATLAS-BIMAP";
+	case VARIANT_ATLAS_PACT: return "ATLAS-PACT";
+	case VARIANT_ATLAS_RACER: return "ATLAS-RACER";
+	case VARIANT_ATLAS_KRON: return "ATLAS-KRON";
+	case VARIANT_ATLAS_MUON: return "ATLAS-MUON";
 	default: return "Unknown";
 	}
 }
@@ -1260,6 +1321,8 @@ static bool variant_matches_selection(VariantSelection selection, VariantKind va
 		return true;
 	case VARIANT_SELECTION_ADAMW:
 		return variant == VARIANT_ADAMW;
+	case VARIANT_SELECTION_ADAMW_GROUP:
+		return variant == VARIANT_ADAMW_GROUP;
 	case VARIANT_SELECTION_ATLAS_BASE:
 		return variant == VARIANT_ATLAS_BASE;
 	case VARIANT_SELECTION_ATLAS_SPARROW:
@@ -1288,6 +1351,14 @@ static bool variant_matches_selection(VariantSelection selection, VariantKind va
 		return variant == VARIANT_ATLAS_GEODE;
 	case VARIANT_SELECTION_ATLAS_BIMAP:
 		return variant == VARIANT_ATLAS_BIMAP;
+	case VARIANT_SELECTION_ATLAS_PACT:
+		return variant == VARIANT_ATLAS_PACT;
+	case VARIANT_SELECTION_ATLAS_RACER:
+		return variant == VARIANT_ATLAS_RACER;
+	case VARIANT_SELECTION_ATLAS_KRON:
+		return variant == VARIANT_ATLAS_KRON;
+	case VARIANT_SELECTION_ATLAS_MUON:
+		return variant == VARIANT_ATLAS_MUON;
 	default:
 		return false;
 	}
@@ -1425,7 +1496,7 @@ static void print_usage()
 	printf("Options:\n");
 	printf("  --mode all|token-lm|token-lm-large|token-lm-context|token-lm-context-large|token-lm-document|token-lm-corpus|token-lm-corpus-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
 	printf("                                         Run the alternate-task benches or the teacher-student sweep (default: all)\n");
-	printf("  --variant all|adamw|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|bimap\n");
+	printf("  --variant all|adamw|adamw-group|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|bimap|pact|racer|kron|muon\n");
 	printf("                                         Restrict runs to one optimizer variant when the case supports it (default: all)\n");
 	printf("  --repeats N                           Repeats per optimizer variant (default: 3)\n");
 	printf("  --seed N                              Base RNG seed (default: 1337)\n");
@@ -1463,6 +1534,29 @@ static void print_usage()
 	printf("  --atlas-bimap-geometry-scale X        Row/column geometry strength for BiMAP (default: 1.0)\n");
 	printf("  --atlas-bimap-predictive-scale X      Momentum secant blend for BiMAP (default: 0.15)\n");
 	printf("  --atlas-bimap-factor-cadence N        Steps between BiMAP factor EMA refreshes (default: 8)\n");
+	printf("  --atlas-pact-low-rank 0|1             Enable low-rank row/column factors for PACT (default: 1)\n");
+	printf("  --atlas-pact-geometry-scale X         Row/column geometry strength for PACT (default: 1.0)\n");
+	printf("  --atlas-pact-predictive-scale X       Bounded secant transport scale for PACT (default: 0.10)\n");
+	printf("  --atlas-pact-factor-cadence N         Steps between PACT factor EMA refreshes (default: 8)\n");
+	printf("  --atlas-pact-cost-scale X             Analytical overhead penalty scale for PACT promotion (default: 0.0010)\n");
+	printf("  --atlas-pact-promote-threshold X      Promotion threshold for PACT block EMA score (default: 0.0)\n");
+	printf("  --atlas-pact-demote-threshold X       Demotion threshold for PACT block EMA score (default: -0.0005)\n");
+	printf("  --atlas-racer-geometry-scale X        Two-sided geometry strength for RACER-lite (default: 1.0)\n");
+	printf("  --atlas-racer-predictive-scale X      Bounded secant transport scale for RACER-lite (default: 0.05)\n");
+	printf("  --atlas-racer-factor-cadence N        Steps between RACER-lite factor EMA refreshes (default: 8)\n");
+	printf("  --atlas-racer-risk-scale X            Noise-shaping penalty scale for RACER-lite (default: 0.50)\n");
+	printf("  --atlas-racer-cost-scale X            Compute-cost penalty scale for RACER-lite (default: 0.0010)\n");
+	printf("  --atlas-racer-promote-threshold X     Promotion threshold for RACER-lite block EMA score (default: 0.0)\n");
+	printf("  --atlas-racer-demote-threshold X      Demotion threshold for RACER-lite block EMA score (default: -0.0005)\n");
+	printf("  --atlas-kron-geometry-scale X         Two-sided factor strength for KRON (default: 1.0)\n");
+	printf("  --atlas-kron-predictive-scale X       Bounded secant blend for KRON (default: 0.05)\n");
+	printf("  --atlas-kron-factor-cadence N         Steps between KRON factor refreshes (default: 8)\n");
+	printf("  --atlas-kron-damping X                Normalized covariance damping for KRON (default: 0.10)\n");
+	printf("  --atlas-muon-geometry-scale X         Orthogonalized-momentum blend strength for MUON-lite (default: 1.0)\n");
+	printf("  --atlas-muon-predictive-scale X       Bounded secant blend for MUON-lite (default: 0.05)\n");
+	printf("  --atlas-muon-max-aspect X             Maximum block aspect ratio eligible for MUON-lite (default: 1.50)\n");
+	printf("  --atlas-muon-min-dim N                Minimum block side length eligible for MUON-lite (default: 8)\n");
+	printf("  --atlas-muon-damping X                Gram damping inside MUON-lite polar factors (default: 0.01)\n");
 	printf("  --gpu-enable 0|1                      Attempt GPU offload when available (default: 0)\n");
 	printf("  --gpu-device N                        CUDA device id when GPU offload is enabled (default: 0)\n");
 	printf("  --token-epochs N                      Token-LM epochs (default: 6)\n");
@@ -1688,6 +1782,11 @@ static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
 		outSelection = VARIANT_SELECTION_ADAMW;
 		return true;
 	}
+	if (streq(text, "adamw-group") || streq(text, "groupadam") || streq(text, "group"))
+	{
+		outSelection = VARIANT_SELECTION_ADAMW_GROUP;
+		return true;
+	}
 	if (streq(text, "base") || streq(text, "atlas-base") || streq(text, "bsrp"))
 	{
 		outSelection = VARIANT_SELECTION_ATLAS_BASE;
@@ -1756,6 +1855,26 @@ static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
 	if (streq(text, "bimap") || streq(text, "atlas-bimap"))
 	{
 		outSelection = VARIANT_SELECTION_ATLAS_BIMAP;
+		return true;
+	}
+	if (streq(text, "pact") || streq(text, "atlas-pact"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_PACT;
+		return true;
+	}
+	if (streq(text, "racer") || streq(text, "atlas-racer"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_RACER;
+		return true;
+	}
+	if (streq(text, "kron") || streq(text, "atlas-kron"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_KRON;
+		return true;
+	}
+	if (streq(text, "muon") || streq(text, "atlas-muon"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_MUON;
 		return true;
 	}
 	return false;
@@ -2081,6 +2200,190 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			if (!parse_uint_arg(argv[++i], cfg.atlasBiMAPFactorCadence) || cfg.atlasBiMAPFactorCadence == 0u)
 			{
 				err = "invalid --atlas-bimap-factor-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-pact-low-rank") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasPACTLowRank) || cfg.atlasPACTLowRank > 1u)
+			{
+				err = "invalid --atlas-pact-low-rank";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-pact-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPACTGeometryScale) || cfg.atlasPACTGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-pact-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-pact-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPACTPredictiveScale) || cfg.atlasPACTPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-pact-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-pact-factor-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasPACTFactorCadence) || cfg.atlasPACTFactorCadence == 0u)
+			{
+				err = "invalid --atlas-pact-factor-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-pact-cost-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPACTCostScale) || cfg.atlasPACTCostScale < 0.0f)
+			{
+				err = "invalid --atlas-pact-cost-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-pact-promote-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPACTPromoteThreshold))
+			{
+				err = "invalid --atlas-pact-promote-threshold";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-pact-demote-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasPACTDemoteThreshold))
+			{
+				err = "invalid --atlas-pact-demote-threshold";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-racer-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRACERGeometryScale) || cfg.atlasRACERGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-racer-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-racer-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRACERPredictiveScale) || cfg.atlasRACERPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-racer-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-racer-factor-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasRACERFactorCadence) || cfg.atlasRACERFactorCadence == 0u)
+			{
+				err = "invalid --atlas-racer-factor-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-racer-risk-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRACERRiskScale) || cfg.atlasRACERRiskScale < 0.0f)
+			{
+				err = "invalid --atlas-racer-risk-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-racer-cost-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRACERCostScale) || cfg.atlasRACERCostScale < 0.0f)
+			{
+				err = "invalid --atlas-racer-cost-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-racer-promote-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRACERPromoteThreshold))
+			{
+				err = "invalid --atlas-racer-promote-threshold";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-racer-demote-threshold") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasRACERDemoteThreshold))
+			{
+				err = "invalid --atlas-racer-demote-threshold";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kron-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasKronGeometryScale) || cfg.atlasKronGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-kron-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kron-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasKronPredictiveScale) || cfg.atlasKronPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-kron-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kron-factor-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasKronFactorCadence) || cfg.atlasKronFactorCadence == 0u)
+			{
+				err = "invalid --atlas-kron-factor-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-kron-damping") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasKronDamping) || cfg.atlasKronDamping < 0.0f)
+			{
+				err = "invalid --atlas-kron-damping";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-muon-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMuonGeometryScale) || cfg.atlasMuonGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-muon-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-muon-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMuonPredictiveScale) || cfg.atlasMuonPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-muon-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-muon-max-aspect") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMuonMaxAspect) || cfg.atlasMuonMaxAspect < 1.0f)
+			{
+				err = "invalid --atlas-muon-max-aspect";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-muon-min-dim") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasMuonMinDim) || cfg.atlasMuonMinDim == 0u)
+			{
+				err = "invalid --atlas-muon-min-dim";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-muon-damping") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMuonDamping) || cfg.atlasMuonDamping < 0.0f)
+			{
+				err = "invalid --atlas-muon-damping";
 				return false;
 			}
 		}
@@ -3352,6 +3655,10 @@ static void reset_atlas_family(glades::TrainingConfig& tc)
 	tc.atlas.quasarEnabled = false;
 	tc.atlas.geodeEnabled = false;
 	tc.atlas.bimapEnabled = false;
+	tc.atlas.pactEnabled = false;
+	tc.atlas.racerEnabled = false;
+	tc.atlas.kronEnabled = false;
+	tc.atlas.muonEnabled = false;
 	tc.atlas.kappaEnabled = false;
 }
 
@@ -3614,6 +3921,45 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.bimapPredictiveScale = cfg.atlasBiMAPPredictiveScale;
 		tc.atlas.bimapFactorCadence = cfg.atlasBiMAPFactorCadence;
 	}
+	else if (variant == VARIANT_ATLAS_PACT)
+	{
+		tc.atlas.pactEnabled = true;
+		tc.atlas.pactLowRankEnabled = (cfg.atlasPACTLowRank != 0u);
+		tc.atlas.pactGeometryScale = cfg.atlasPACTGeometryScale;
+		tc.atlas.pactPredictiveScale = cfg.atlasPACTPredictiveScale;
+		tc.atlas.pactFactorCadence = cfg.atlasPACTFactorCadence;
+		tc.atlas.pactCostScale = cfg.atlasPACTCostScale;
+		tc.atlas.pactPromoteThreshold = cfg.atlasPACTPromoteThreshold;
+		tc.atlas.pactDemoteThreshold = cfg.atlasPACTDemoteThreshold;
+	}
+	else if (variant == VARIANT_ATLAS_RACER)
+	{
+		tc.atlas.racerEnabled = true;
+		tc.atlas.racerGeometryScale = cfg.atlasRACERGeometryScale;
+		tc.atlas.racerPredictiveScale = cfg.atlasRACERPredictiveScale;
+		tc.atlas.racerFactorCadence = cfg.atlasRACERFactorCadence;
+		tc.atlas.racerRiskScale = cfg.atlasRACERRiskScale;
+		tc.atlas.racerCostScale = cfg.atlasRACERCostScale;
+		tc.atlas.racerPromoteThreshold = cfg.atlasRACERPromoteThreshold;
+		tc.atlas.racerDemoteThreshold = cfg.atlasRACERDemoteThreshold;
+	}
+	else if (variant == VARIANT_ATLAS_KRON)
+	{
+		tc.atlas.kronEnabled = true;
+		tc.atlas.kronGeometryScale = cfg.atlasKronGeometryScale;
+		tc.atlas.kronPredictiveScale = cfg.atlasKronPredictiveScale;
+		tc.atlas.kronFactorCadence = cfg.atlasKronFactorCadence;
+		tc.atlas.kronDamping = cfg.atlasKronDamping;
+	}
+	else if (variant == VARIANT_ATLAS_MUON)
+	{
+		tc.atlas.muonEnabled = true;
+		tc.atlas.muonGeometryScale = cfg.atlasMuonGeometryScale;
+		tc.atlas.muonPredictiveScale = cfg.atlasMuonPredictiveScale;
+		tc.atlas.muonMaxAspect = cfg.atlasMuonMaxAspect;
+		tc.atlas.muonMinDim = cfg.atlasMuonMinDim;
+		tc.atlas.muonDamping = cfg.atlasMuonDamping;
+	}
 }
 
 static bool configure_optimizer(glades::TrainingConfig& tc,
@@ -3633,6 +3979,22 @@ static bool configure_optimizer(glades::TrainingConfig& tc,
 		tc.optimizer.adamBiasCorrection = true;
 		return true;
 	}
+	if (variant == VARIANT_ADAMW_GROUP)
+	{
+		tc.optimizer.type = glades::OptimizerConfig::ADAMW;
+		tc.optimizer.adamBeta1 = 0.9f;
+		tc.optimizer.adamBeta2 = 0.999f;
+		tc.optimizer.adamEps = 1e-8f;
+		tc.optimizer.adamBiasCorrection = true;
+		tc.optimizer.adamGroupwiseEnabled = true;
+		tc.optimizer.adamGroupStabilityScale = 0.05f;
+		tc.optimizer.adamGroupSnrScale = 0.05f;
+		tc.optimizer.adamGroupRatioScale = 0.50f;
+		tc.optimizer.adamGroupMinScale = 0.90f;
+		tc.optimizer.adamGroupMaxScale = 1.15f;
+		tc.optimizer.adamGroupMinSize = 256u;
+		return true;
+	}
 
 	configure_atlas(tc, cfg, variant);
 	(void)atlasLR;
@@ -3643,9 +4005,14 @@ static bool configure_optimizer(glades::TrainingConfig& tc,
 static bool token_variant_uses_adamw_backbone(const BenchConfig& cfg, VariantKind variant)
 {
 	return (variant == VARIANT_ADAMW)
+	    || (variant == VARIANT_ADAMW_GROUP)
 	    || (variant == VARIANT_ATLAS_AURORA && cfg.atlasAuroraAdamwBackbone != 0u)
 	    || (variant == VARIANT_ATLAS_GEODE)
-	    || (variant == VARIANT_ATLAS_BIMAP);
+	    || (variant == VARIANT_ATLAS_BIMAP)
+	    || (variant == VARIANT_ATLAS_PACT)
+	    || (variant == VARIANT_ATLAS_RACER)
+	    || (variant == VARIANT_ATLAS_KRON)
+	    || (variant == VARIANT_ATLAS_MUON);
 }
 
 static float token_variant_learning_rate(const BenchConfig& cfg, VariantKind variant)
@@ -3699,7 +4066,7 @@ static bool make_token_network(const BenchConfig& cfg,
 	out.net->getTerminatorMutable().setEpoch(static_cast<int>(cfg.token.epochs));
 	out.net->getTerminatorMutable().setAccuracy(0.0f);
 
-	glades::TrainingConfig tc;
+	glades::TrainingConfig tc = out.net->getTrainingConfig();
 	tc.transformer.enableTokenEmbedding = true;
 	tc.transformer.vocabSizeOverride = static_cast<int>(cfg.token.vocab);
 	tc.transformer.tieEmbeddings = true;
@@ -3776,7 +4143,7 @@ static bool make_regression_network(const BenchConfig& cfg,
 	out.net->getTerminatorMutable().setEpoch(static_cast<int>(epochs));
 	out.net->getTerminatorMutable().setAccuracy(0.0f);
 
-	glades::TrainingConfig tc;
+	glades::TrainingConfig tc = out.net->getTrainingConfig();
 	tc.transformer.enableTokenEmbedding = false;
 	tc.transformer.vocabSizeOverride = 0;
 	tc.transformer.tieEmbeddings = true;
@@ -4933,7 +5300,11 @@ static bool run_token_case(const BenchConfig& cfg)
 	const float quasarTokenLR = cfg.token.atlasLR;
 	const float geodeTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_GEODE);
 	const float bimapTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_BIMAP);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-BIMAP(lr=%.4f lowRank=%u cadence=%u)\n",
+	const float pactTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_PACT);
+	const float racerTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_RACER);
+	const float kronTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_KRON);
+	const float muonTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MUON);
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-BIMAP(lr=%.4f lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f)\n",
 	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
 	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
 	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
@@ -4942,8 +5313,11 @@ static bool run_token_case(const BenchConfig& cfg)
 	       rampartTokenLR, cfg.atlasComplementRank, meritTokenLR, cfg.atlasComplementRank,
 	       strataTokenLR, cfg.atlasComplementRank, auroraTokenLR, cfg.atlasComplementRank,
 	       seamTokenLR, cfg.atlasComplementRank, quasarTokenLR, cfg.atlasComplementRank,
-	       geodeTokenLR, cfg.atlasComplementRank, bimapTokenLR, cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) bimap(lowRank=%u geom=%.3f pred=%.3f cadence=%u)\n",
+	       geodeTokenLR, cfg.atlasComplementRank, bimapTokenLR, cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence,
+	       pactTokenLR, cfg.atlasPACTLowRank, cfg.atlasPACTFactorCadence,
+	       racerTokenLR, cfg.atlasRACERFactorCadence,
+	       kronTokenLR, cfg.atlasKronFactorCadence, muonTokenLR, cfg.atlasMuonMinDim, cfg.atlasMuonMaxAspect);
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) bimap(lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
@@ -4958,12 +5332,18 @@ static bool run_token_case(const BenchConfig& cfg)
 	       cfg.atlasAuroraAdamwBackbone,
 	       cfg.atlasAuroraHeadGain, cfg.atlasAuroraBodyTrustScale,
 	       cfg.atlasGeodeGeometryScale, cfg.atlasGeodePredictiveScale,
-	       cfg.atlasBiMAPLowRank, cfg.atlasBiMAPGeometryScale, cfg.atlasBiMAPPredictiveScale, cfg.atlasBiMAPFactorCadence);
+	       cfg.atlasBiMAPLowRank, cfg.atlasBiMAPGeometryScale, cfg.atlasBiMAPPredictiveScale, cfg.atlasBiMAPFactorCadence,
+	       cfg.atlasPACTLowRank, cfg.atlasPACTGeometryScale, cfg.atlasPACTPredictiveScale, cfg.atlasPACTFactorCadence,
+	       cfg.atlasPACTCostScale, cfg.atlasPACTPromoteThreshold, cfg.atlasPACTDemoteThreshold,
+	       cfg.atlasRACERGeometryScale, cfg.atlasRACERPredictiveScale, cfg.atlasRACERFactorCadence,
+	       cfg.atlasRACERRiskScale, cfg.atlasRACERCostScale, cfg.atlasRACERPromoteThreshold, cfg.atlasRACERDemoteThreshold,
+	       cfg.atlasKronGeometryScale, cfg.atlasKronPredictiveScale, cfg.atlasKronFactorCadence, cfg.atlasKronDamping,
+	       cfg.atlasMuonGeometryScale, cfg.atlasMuonPredictiveScale, cfg.atlasMuonMaxAspect, cfg.atlasMuonMinDim, cfg.atlasMuonDamping);
 	printf("\n");
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_BIMAP };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ADAMW_GROUP, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_BIMAP, VARIANT_ATLAS_PACT, VARIANT_ATLAS_RACER, VARIANT_ATLAS_KRON, VARIANT_ATLAS_MUON };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	std::vector<VariantKind> summaryVariants;
@@ -5003,6 +5383,10 @@ static bool run_token_case(const BenchConfig& cfg)
 		int auroraIndex = -1;
 		int geodeIndex = -1;
 		int bimapIndex = -1;
+		int pactIndex = -1;
+		int racerIndex = -1;
+		int kronIndex = -1;
+		int muonIndex = -1;
 		for (size_t i = 0; i < summaryVariants.size(); ++i)
 		{
 			if (summaryVariants[i] == VARIANT_ADAMW)
@@ -5015,8 +5399,16 @@ static bool run_token_case(const BenchConfig& cfg)
 				geodeIndex = static_cast<int>(i);
 			else if (summaryVariants[i] == VARIANT_ATLAS_BIMAP)
 				bimapIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_PACT)
+				pactIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_RACER)
+				racerIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_KRON)
+				kronIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_MUON)
+				muonIndex = static_cast<int>(i);
 		}
-		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || bimapIndex >= 0))
+		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || bimapIndex >= 0 || pactIndex >= 0 || racerIndex >= 0 || kronIndex >= 0 || muonIndex >= 0))
 		{
 			printf("  AdamW gap comparison:\n");
 			if (baseIndex >= 0)
@@ -5031,6 +5423,18 @@ static bool run_token_case(const BenchConfig& cfg)
 			if (bimapIndex >= 0)
 				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
 				                                 summaries[static_cast<size_t>(bimapIndex)]);
+			if (pactIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(pactIndex)]);
+			if (racerIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(racerIndex)]);
+			if (kronIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(kronIndex)]);
+			if (muonIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(muonIndex)]);
 		}
 	}
 	printf("\n");

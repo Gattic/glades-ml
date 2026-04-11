@@ -1122,6 +1122,118 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 // Each block handles one element range within one parameter group.
 namespace {
 
+__global__ void adam_group_scale_batch_kernel(
+    float** __restrict__ params,
+    float** __restrict__ grads,
+    float** __restrict__ ms,
+    float** __restrict__ vs,
+    float* __restrict__ groupScales,
+    float* __restrict__ prevStepRms,
+    const int* __restrict__ sizes,
+    float beta1, float beta2, float eps,
+    float gradScale, int step, int groupCount,
+    unsigned int minGroupSize,
+    float stabilityScale, float snrScale, float ratioScale,
+    float minScale, float maxScale)
+{
+	int grp = blockIdx.x;
+	if (grp >= groupCount)
+		return;
+
+	const int n = sizes[grp];
+	if (n <= 0)
+		return;
+	if (static_cast<unsigned int>(n) < minGroupSize)
+	{
+		if (threadIdx.x == 0)
+			groupScales[grp] = 1.0f;
+		return;
+	}
+
+	float* param = params[grp];
+	float* grad = grads[grp];
+	float* m_arr = ms[grp];
+	float* v_arr = vs[grp];
+
+	__shared__ float sharedStepSq[8];
+	__shared__ float sharedWeightSq[8];
+	__shared__ float sharedMHatSq[8];
+	__shared__ float sharedVHat[8];
+
+	float stepSq = 0.0f;
+	float weightSq = 0.0f;
+	float mHatSq = 0.0f;
+	float vHatSum = 0.0f;
+
+	const float bc1 = 1.0f - powf(beta1, (float)step);
+	const float bc2 = 1.0f - powf(beta2, (float)step);
+	for (int idx = threadIdx.x; idx < n; idx += blockDim.x)
+	{
+		const float g = grad[idx] * gradScale;
+		const float m_new = beta1 * m_arr[idx] + (1.0f - beta1) * g;
+		const float v_new = beta2 * v_arr[idx] + (1.0f - beta2) * g * g;
+		const float m_hat = m_new / bc1;
+		const float v_hat = v_new / bc2;
+		const float denom = sqrtf(v_hat) + eps;
+		const float stepVal = m_hat / denom;
+		stepSq += stepVal * stepVal;
+		const float w = param[idx];
+		weightSq += w * w;
+		mHatSq += m_hat * m_hat;
+		vHatSum += v_hat;
+	}
+
+	stepSq = blockReduceSum(stepSq, sharedStepSq);
+	weightSq = blockReduceSum(weightSq, sharedWeightSq);
+	mHatSq = blockReduceSum(mHatSq, sharedMHatSq);
+	vHatSum = blockReduceSum(vHatSum, sharedVHat);
+
+	if (threadIdx.x == 0)
+	{
+		const float invN = 1.0f / static_cast<float>(n);
+		const float stepRms = sqrtf(fmaxf(stepSq * invN, 0.0f));
+		const float weightRms = sqrtf(fmaxf(weightSq * invN, 0.0f));
+		const float snr = (mHatSq * invN) / ((vHatSum * invN) + eps);
+		const float prev = prevStepRms[grp];
+		const float stability = (prev > 0.0f)
+		    ? (fminf(stepRms, prev) / (fmaxf(stepRms, prev) + eps))
+		    : 1.0f;
+		const float updateRatio = stepRms / (weightRms + eps);
+		float scale = 1.0f
+		    + stabilityScale * stability
+		    + snrScale * log1pf(fmaxf(snr, 0.0f))
+		    - ratioScale * updateRatio;
+		scale = fminf(maxScale, fmaxf(minScale, scale));
+		groupScales[grp] = scale;
+		prevStepRms[grp] = stepRms;
+	}
+}
+
+} // anonymous namespace
+
+bool adam_group_scale_batch(float** d_params, float** d_grads,
+                            float** d_ms, float** d_vs,
+                            float* d_groupScales, float* d_groupPrevStepRms,
+                            const int* d_sizes,
+                            float beta1, float beta2, float eps,
+                            float gradScale, int step, int groupCount,
+                            unsigned int minGroupSize,
+                            float stabilityScale, float snrScale, float ratioScale,
+                            float minScale, float maxScale)
+{
+	if (groupCount <= 0)
+		return true;
+	adam_group_scale_batch_kernel<<<groupCount, kBlockElem, 0, computeStream()>>>(
+	    d_params, d_grads, d_ms, d_vs,
+	    d_groupScales, d_groupPrevStepRms, d_sizes,
+	    beta1, beta2, eps, gradScale, step, groupCount,
+	    minGroupSize, stabilityScale, snrScale, ratioScale, minScale, maxScale);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
+
 __global__ void adam_update_batch_kernel(
     float** __restrict__ params,
     float** __restrict__ grads,
@@ -1129,6 +1241,7 @@ __global__ void adam_update_batch_kernel(
     float** __restrict__ vs,
     const float* __restrict__ lrs,
     const float* __restrict__ wds,
+    const float* __restrict__ stepScales,
     const int* __restrict__ sizes,
     float beta1, float beta2, float eps,
     float gradScale, int step, int groupCount)
@@ -1144,7 +1257,7 @@ __global__ void adam_update_batch_kernel(
 	float* grad = grads[grp];
 	float* m_arr = ms[grp];
 	float* v_arr = vs[grp];
-	float lr = lrs[grp];
+	float lr = lrs[grp] * (stepScales ? stepScales[grp] : 1.0f);
 	float weightDecay = wds[grp];
 
 	float g = grad[idx] * gradScale;
@@ -1170,6 +1283,7 @@ __global__ void adam_update_batch_kernel(
 bool adam_update_batch(float** d_params, float** d_grads,
                        float** d_ms, float** d_vs,
                        const float* d_lrs, const float* d_wds,
+                       const float* d_stepScales,
                        const int* d_sizes, int maxSize,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount)
@@ -1178,7 +1292,7 @@ bool adam_update_batch(float** d_params, float** d_grads,
 	int gridX = (maxSize + kBlockElem - 1) / kBlockElem;
 	dim3 grid(gridX, groupCount);
 	adam_update_batch_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
-		d_params, d_grads, d_ms, d_vs, d_lrs, d_wds, d_sizes,
+		d_params, d_grads, d_ms, d_vs, d_lrs, d_wds, d_stepScales, d_sizes,
 		beta1, beta2, eps, gradScale, step, groupCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;

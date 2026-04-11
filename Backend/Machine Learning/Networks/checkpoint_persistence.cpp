@@ -595,6 +595,13 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.optimizer.adamBeta2", f)) { cfg.optimizer.adamBeta2 = f; any = true; }
 	if (parse_float(kv, "training.optimizer.adamEps", f)) { cfg.optimizer.adamEps = f; any = true; }
 	if (parse_bool01(kv, "training.optimizer.adamBiasCorrection", b)) { cfg.optimizer.adamBiasCorrection = b; any = true; }
+	if (parse_bool01(kv, "training.optimizer.adamGroupwiseEnabled", b)) { cfg.optimizer.adamGroupwiseEnabled = b; any = true; }
+	if (parse_float(kv, "training.optimizer.adamGroupStabilityScale", f)) { cfg.optimizer.adamGroupStabilityScale = f; any = true; }
+	if (parse_float(kv, "training.optimizer.adamGroupSnrScale", f)) { cfg.optimizer.adamGroupSnrScale = f; any = true; }
+	if (parse_float(kv, "training.optimizer.adamGroupRatioScale", f)) { cfg.optimizer.adamGroupRatioScale = f; any = true; }
+	if (parse_float(kv, "training.optimizer.adamGroupMinScale", f)) { cfg.optimizer.adamGroupMinScale = f; any = true; }
+	if (parse_float(kv, "training.optimizer.adamGroupMaxScale", f)) { cfg.optimizer.adamGroupMaxScale = f; any = true; }
+	if (parse_int(kv, "training.optimizer.adamGroupMinSize", i) && i >= 0) { cfg.optimizer.adamGroupMinSize = static_cast<unsigned int>(i); any = true; }
 	if (parse_int(kv, "training.atlas.rank", i) && i >= 0) { cfg.atlas.rank = static_cast<unsigned int>(i); any = true; }
 	if (parse_int(kv, "training.atlas.complementRank", i) && i >= 0) { cfg.atlas.complementRank = static_cast<unsigned int>(i); any = true; }
 	if (parse_float(kv, "training.atlas.kappaMax", f)) { cfg.atlas.kappaMax = f; any = true; }
@@ -686,6 +693,33 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.atlas.bimapGeometryScale", f)) { cfg.atlas.bimapGeometryScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.bimapPredictiveScale", f)) { cfg.atlas.bimapPredictiveScale = f; any = true; }
 	if (parse_int(kv, "training.atlas.bimapFactorCadence", i) && i >= 0) { cfg.atlas.bimapFactorCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_bool01(kv, "training.atlas.pactEnabled", b)) { cfg.atlas.pactEnabled = b; any = true; }
+	if (parse_bool01(kv, "training.atlas.pactLowRankEnabled", b)) { cfg.atlas.pactLowRankEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.pactGeometryScale", f)) { cfg.atlas.pactGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.pactPredictiveScale", f)) { cfg.atlas.pactPredictiveScale = f; any = true; }
+	if (parse_int(kv, "training.atlas.pactFactorCadence", i) && i >= 0) { cfg.atlas.pactFactorCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.pactCostScale", f)) { cfg.atlas.pactCostScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.pactPromoteThreshold", f)) { cfg.atlas.pactPromoteThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.pactDemoteThreshold", f)) { cfg.atlas.pactDemoteThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.racerEnabled", b)) { cfg.atlas.racerEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.racerGeometryScale", f)) { cfg.atlas.racerGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.racerPredictiveScale", f)) { cfg.atlas.racerPredictiveScale = f; any = true; }
+	if (parse_int(kv, "training.atlas.racerFactorCadence", i) && i >= 0) { cfg.atlas.racerFactorCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.racerRiskScale", f)) { cfg.atlas.racerRiskScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.racerCostScale", f)) { cfg.atlas.racerCostScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.racerPromoteThreshold", f)) { cfg.atlas.racerPromoteThreshold = f; any = true; }
+	if (parse_float(kv, "training.atlas.racerDemoteThreshold", f)) { cfg.atlas.racerDemoteThreshold = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.kronEnabled", b)) { cfg.atlas.kronEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.kronGeometryScale", f)) { cfg.atlas.kronGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.kronPredictiveScale", f)) { cfg.atlas.kronPredictiveScale = f; any = true; }
+	if (parse_int(kv, "training.atlas.kronFactorCadence", i) && i >= 0) { cfg.atlas.kronFactorCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.kronDamping", f)) { cfg.atlas.kronDamping = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.muonEnabled", b)) { cfg.atlas.muonEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.muonGeometryScale", f)) { cfg.atlas.muonGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.muonPredictiveScale", f)) { cfg.atlas.muonPredictiveScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.muonMaxAspect", f)) { cfg.atlas.muonMaxAspect = f; any = true; }
+	if (parse_int(kv, "training.atlas.muonMinDim", i) && i >= 0) { cfg.atlas.muonMinDim = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.muonDamping", f)) { cfg.atlas.muonDamping = f; any = true; }
 	if (parse_float(kv, "training.atlas.seamMirrorStep", f)) { cfg.atlas.seamMirrorStep = f; any = true; }
 	if (parse_float(kv, "training.atlas.seamBudgetMax", f)) { cfg.atlas.seamBudgetMax = f; any = true; }
 	if (parse_float(kv, "training.atlas.quasarTemperature", f)) { cfg.atlas.quasarTemperature = f; any = true; }
@@ -1059,6 +1093,23 @@ static bool write_manifest(const std::string& manifestPath,
 		std::ostringstream oss; oss << trainingConfig.optimizer.adamEps; write_kv(out, "training.optimizer.adamEps", oss.str());
 	}
 	write_kv(out, "training.optimizer.adamBiasCorrection", trainingConfig.optimizer.adamBiasCorrection ? "1" : "0");
+	write_kv(out, "training.optimizer.adamGroupwiseEnabled", trainingConfig.optimizer.adamGroupwiseEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.optimizer.adamGroupStabilityScale; write_kv(out, "training.optimizer.adamGroupStabilityScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.optimizer.adamGroupSnrScale; write_kv(out, "training.optimizer.adamGroupSnrScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.optimizer.adamGroupRatioScale; write_kv(out, "training.optimizer.adamGroupRatioScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.optimizer.adamGroupMinScale; write_kv(out, "training.optimizer.adamGroupMinScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.optimizer.adamGroupMaxScale; write_kv(out, "training.optimizer.adamGroupMaxScale", oss.str());
+	}
+	write_kv(out, "training.optimizer.adamGroupMinSize", u64_to_string(static_cast<uint64_t>(trainingConfig.optimizer.adamGroupMinSize)));
 	write_kv(out, "training.atlas.rank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.rank)));
 	write_kv(out, "training.atlas.complementRank", u64_to_string(static_cast<uint64_t>(trainingConfig.atlas.complementRank)));
 	{
@@ -1243,6 +1294,77 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.bimapFactorCadence; write_kv(out, "training.atlas.bimapFactorCadence", oss.str());
+	}
+	write_kv(out, "training.atlas.pactEnabled", trainingConfig.atlas.pactEnabled ? "1" : "0");
+	write_kv(out, "training.atlas.pactLowRankEnabled", trainingConfig.atlas.pactLowRankEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.pactGeometryScale; write_kv(out, "training.atlas.pactGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.pactPredictiveScale; write_kv(out, "training.atlas.pactPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.pactFactorCadence; write_kv(out, "training.atlas.pactFactorCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.pactCostScale; write_kv(out, "training.atlas.pactCostScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.pactPromoteThreshold; write_kv(out, "training.atlas.pactPromoteThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.pactDemoteThreshold; write_kv(out, "training.atlas.pactDemoteThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.racerEnabled", trainingConfig.atlas.racerEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.racerGeometryScale; write_kv(out, "training.atlas.racerGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.racerPredictiveScale; write_kv(out, "training.atlas.racerPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.racerFactorCadence; write_kv(out, "training.atlas.racerFactorCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.racerRiskScale; write_kv(out, "training.atlas.racerRiskScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.racerCostScale; write_kv(out, "training.atlas.racerCostScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.racerPromoteThreshold; write_kv(out, "training.atlas.racerPromoteThreshold", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.racerDemoteThreshold; write_kv(out, "training.atlas.racerDemoteThreshold", oss.str());
+	}
+	write_kv(out, "training.atlas.kronEnabled", trainingConfig.atlas.kronEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.kronGeometryScale; write_kv(out, "training.atlas.kronGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.kronPredictiveScale; write_kv(out, "training.atlas.kronPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.kronFactorCadence; write_kv(out, "training.atlas.kronFactorCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.kronDamping; write_kv(out, "training.atlas.kronDamping", oss.str());
+	}
+	write_kv(out, "training.atlas.muonEnabled", trainingConfig.atlas.muonEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.muonGeometryScale; write_kv(out, "training.atlas.muonGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.muonPredictiveScale; write_kv(out, "training.atlas.muonPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.muonMaxAspect; write_kv(out, "training.atlas.muonMaxAspect", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.muonMinDim; write_kv(out, "training.atlas.muonMinDim", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.muonDamping; write_kv(out, "training.atlas.muonDamping", oss.str());
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.seamMirrorStep; write_kv(out, "training.atlas.seamMirrorStep", oss.str());
@@ -2571,6 +2693,276 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.bimapFactorCadence mismatch vs requested resume config (checkpoint "
 		    << savedBiMAPFactorCadence << ", current " << currentCfg.atlas.bimapFactorCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedPACTEnabled = false;
+	if (parse_bool01(kv, "training.atlas.pactEnabled", savedPACTEnabled) &&
+	    currentCfg.atlas.pactEnabled != savedPACTEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedPACTEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.pactEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedPACTLowRankEnabled = false;
+	if (parse_bool01(kv, "training.atlas.pactLowRankEnabled", savedPACTLowRankEnabled) &&
+	    currentCfg.atlas.pactLowRankEnabled != savedPACTLowRankEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactLowRankEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedPACTLowRankEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.pactLowRankEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedPACTGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.pactGeometryScale", savedPACTGeometryScale) &&
+	    fabsf(currentCfg.atlas.pactGeometryScale - savedPACTGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedPACTGeometryScale << ", current " << currentCfg.atlas.pactGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedPACTPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.pactPredictiveScale", savedPACTPredictiveScale) &&
+	    fabsf(currentCfg.atlas.pactPredictiveScale - savedPACTPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedPACTPredictiveScale << ", current " << currentCfg.atlas.pactPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedPACTFactorCadence = 0;
+	if (parse_int(kv, "training.atlas.pactFactorCadence", savedPACTFactorCadence) &&
+	    currentCfg.atlas.pactFactorCadence != static_cast<unsigned int>(savedPACTFactorCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactFactorCadence mismatch vs requested resume config (checkpoint "
+		    << savedPACTFactorCadence << ", current " << currentCfg.atlas.pactFactorCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedPACTCostScale = 0.0f;
+	if (parse_float(kv, "training.atlas.pactCostScale", savedPACTCostScale) &&
+	    fabsf(currentCfg.atlas.pactCostScale - savedPACTCostScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactCostScale mismatch vs requested resume config (checkpoint "
+		    << savedPACTCostScale << ", current " << currentCfg.atlas.pactCostScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedPACTPromoteThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.pactPromoteThreshold", savedPACTPromoteThreshold) &&
+	    fabsf(currentCfg.atlas.pactPromoteThreshold - savedPACTPromoteThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactPromoteThreshold mismatch vs requested resume config (checkpoint "
+		    << savedPACTPromoteThreshold << ", current " << currentCfg.atlas.pactPromoteThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedPACTDemoteThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.pactDemoteThreshold", savedPACTDemoteThreshold) &&
+	    fabsf(currentCfg.atlas.pactDemoteThreshold - savedPACTDemoteThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.pactDemoteThreshold mismatch vs requested resume config (checkpoint "
+		    << savedPACTDemoteThreshold << ", current " << currentCfg.atlas.pactDemoteThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedRACEREnabled = false;
+	if (parse_bool01(kv, "training.atlas.racerEnabled", savedRACEREnabled) &&
+	    currentCfg.atlas.racerEnabled != savedRACEREnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedRACEREnabled ? 1 : 0) << ", current " << (currentCfg.atlas.racerEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRACERGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.racerGeometryScale", savedRACERGeometryScale) &&
+	    fabsf(currentCfg.atlas.racerGeometryScale - savedRACERGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedRACERGeometryScale << ", current " << currentCfg.atlas.racerGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRACERPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.racerPredictiveScale", savedRACERPredictiveScale) &&
+	    fabsf(currentCfg.atlas.racerPredictiveScale - savedRACERPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedRACERPredictiveScale << ", current " << currentCfg.atlas.racerPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedRACERFactorCadence = 0;
+	if (parse_int(kv, "training.atlas.racerFactorCadence", savedRACERFactorCadence) &&
+	    currentCfg.atlas.racerFactorCadence != static_cast<unsigned int>(savedRACERFactorCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerFactorCadence mismatch vs requested resume config (checkpoint "
+		    << savedRACERFactorCadence << ", current " << currentCfg.atlas.racerFactorCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRACERRiskScale = 0.0f;
+	if (parse_float(kv, "training.atlas.racerRiskScale", savedRACERRiskScale) &&
+	    fabsf(currentCfg.atlas.racerRiskScale - savedRACERRiskScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerRiskScale mismatch vs requested resume config (checkpoint "
+		    << savedRACERRiskScale << ", current " << currentCfg.atlas.racerRiskScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRACERCostScale = 0.0f;
+	if (parse_float(kv, "training.atlas.racerCostScale", savedRACERCostScale) &&
+	    fabsf(currentCfg.atlas.racerCostScale - savedRACERCostScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerCostScale mismatch vs requested resume config (checkpoint "
+		    << savedRACERCostScale << ", current " << currentCfg.atlas.racerCostScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRACERPromoteThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.racerPromoteThreshold", savedRACERPromoteThreshold) &&
+	    fabsf(currentCfg.atlas.racerPromoteThreshold - savedRACERPromoteThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerPromoteThreshold mismatch vs requested resume config (checkpoint "
+		    << savedRACERPromoteThreshold << ", current " << currentCfg.atlas.racerPromoteThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedRACERDemoteThreshold = 0.0f;
+	if (parse_float(kv, "training.atlas.racerDemoteThreshold", savedRACERDemoteThreshold) &&
+	    fabsf(currentCfg.atlas.racerDemoteThreshold - savedRACERDemoteThreshold) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.racerDemoteThreshold mismatch vs requested resume config (checkpoint "
+		    << savedRACERDemoteThreshold << ", current " << currentCfg.atlas.racerDemoteThreshold << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedKRONEnabled = false;
+	if (parse_bool01(kv, "training.atlas.kronEnabled", savedKRONEnabled) &&
+	    currentCfg.atlas.kronEnabled != savedKRONEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.kronEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedKRONEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.kronEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedKRONGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.kronGeometryScale", savedKRONGeometryScale) &&
+	    fabsf(currentCfg.atlas.kronGeometryScale - savedKRONGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.kronGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedKRONGeometryScale << ", current " << currentCfg.atlas.kronGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedKRONPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.kronPredictiveScale", savedKRONPredictiveScale) &&
+	    fabsf(currentCfg.atlas.kronPredictiveScale - savedKRONPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.kronPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedKRONPredictiveScale << ", current " << currentCfg.atlas.kronPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedKRONFactorCadence = 0;
+	if (parse_int(kv, "training.atlas.kronFactorCadence", savedKRONFactorCadence) &&
+	    currentCfg.atlas.kronFactorCadence != static_cast<unsigned int>(savedKRONFactorCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.kronFactorCadence mismatch vs requested resume config (checkpoint "
+		    << savedKRONFactorCadence << ", current " << currentCfg.atlas.kronFactorCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedKRONDamping = 0.0f;
+	if (parse_float(kv, "training.atlas.kronDamping", savedKRONDamping) &&
+	    fabsf(currentCfg.atlas.kronDamping - savedKRONDamping) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.kronDamping mismatch vs requested resume config (checkpoint "
+		    << savedKRONDamping << ", current " << currentCfg.atlas.kronDamping << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedMUONEnabled = false;
+	if (parse_bool01(kv, "training.atlas.muonEnabled", savedMUONEnabled) &&
+	    currentCfg.atlas.muonEnabled != savedMUONEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.muonEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedMUONEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.muonEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMUONGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.muonGeometryScale", savedMUONGeometryScale) &&
+	    fabsf(currentCfg.atlas.muonGeometryScale - savedMUONGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.muonGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedMUONGeometryScale << ", current " << currentCfg.atlas.muonGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMUONPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.muonPredictiveScale", savedMUONPredictiveScale) &&
+	    fabsf(currentCfg.atlas.muonPredictiveScale - savedMUONPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.muonPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedMUONPredictiveScale << ", current " << currentCfg.atlas.muonPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMUONMaxAspect = 0.0f;
+	if (parse_float(kv, "training.atlas.muonMaxAspect", savedMUONMaxAspect) &&
+	    fabsf(currentCfg.atlas.muonMaxAspect - savedMUONMaxAspect) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.muonMaxAspect mismatch vs requested resume config (checkpoint "
+		    << savedMUONMaxAspect << ", current " << currentCfg.atlas.muonMaxAspect << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedMUONMinDim = 0;
+	if (parse_int(kv, "training.atlas.muonMinDim", savedMUONMinDim) &&
+	    currentCfg.atlas.muonMinDim != static_cast<unsigned int>(savedMUONMinDim))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.muonMinDim mismatch vs requested resume config (checkpoint "
+		    << savedMUONMinDim << ", current " << currentCfg.atlas.muonMinDim << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMUONDamping = 0.0f;
+	if (parse_float(kv, "training.atlas.muonDamping", savedMUONDamping) &&
+	    fabsf(currentCfg.atlas.muonDamping - savedMUONDamping) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.muonDamping mismatch vs requested resume config (checkpoint "
+		    << savedMUONDamping << ", current " << currentCfg.atlas.muonDamping << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

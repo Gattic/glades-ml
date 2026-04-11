@@ -28,6 +28,7 @@
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/hiddenlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/outputlayerinfo.h"
+#include "Backend/Database/GLogger.h"
 
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_atlas.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
@@ -91,6 +92,18 @@ static bool parse_kv_manifest(const std::string& path, std::map<std::string, std
 		outKv[line.substr(0u, eq)] = line.substr(eq + 1u);
 	}
 	return sawMagic;
+}
+
+static shmea::GLogger* quiet_logger()
+{
+	static shmea::GLogger logger(shmea::GLogger::LOG_ERROR);
+	static bool initialized = false;
+	if (!initialized)
+	{
+		logger.setPrintToConsole(false);
+		initialized = true;
+	}
+	return &logger;
 }
 
 static glades::NumberInput* make_atlas_transformer_resume_dataset()
@@ -381,65 +394,68 @@ void ATLASHelmMicroBenchmark()
 		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_helm_micro",
 		                                                         kVocab, kDModel, kLayers,
 		                                                         spec.learningRate);
-		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
-		net.setSeed(72000u + static_cast<unsigned int>(100u * i));
-		net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
-		net.getTerminatorMutable().setAccuracy(0.0f);
-
 		{
-			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
-			cfg.gpu.enable = false;
-			cfg.optimizer.type = spec.optimizerType;
-			cfg.transformer.enableTokenEmbedding = true;
-			cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
-			cfg.transformer.tieEmbeddings = true;
-			cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
-			cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
-			cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
-			cfg.transformer.dFFOverride = static_cast<int>(kDff);
-			cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
-			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
-			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(72000u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
 
-			if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
 			{
-				cfg.atlas.rank = 4u;
-				cfg.atlas.complementRank = 0u;
-				cfg.atlas.tSub = 8u;
-				cfg.atlas.beta = 0.999f;
-				cfg.atlas.helmEnabled = spec.helmEnabled;
-				cfg.atlas.helmMemoryScale = 0.05f;
-				cfg.atlas.helmEdgeThreshold = 0.0f;
-				cfg.atlas.helmModeRank = 2u;
-				cfg.atlas.helmHiddenStackDepth = 2u;
-				cfg.atlas.helmPoleMax = 0.95f;
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.gpu.enable = false;
+				cfg.optimizer.type = spec.optimizerType;
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+				cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.dFFOverride = static_cast<int>(kDff);
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+				if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+				{
+					cfg.atlas.rank = 4u;
+					cfg.atlas.complementRank = 0u;
+					cfg.atlas.tSub = 8u;
+					cfg.atlas.beta = 0.999f;
+					cfg.atlas.helmEnabled = spec.helmEnabled;
+					cfg.atlas.helmMemoryScale = 0.05f;
+					cfg.atlas.helmEdgeThreshold = 0.0f;
+					cfg.atlas.helmModeRank = 2u;
+					cfg.atlas.helmHiddenStackDepth = 2u;
+					cfg.atlas.helmPoleMax = 0.95f;
+				}
 			}
+
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const unsigned int helmMatrices = haveDiag ? diag.helmMatrices : 0u;
+			const double helmEdge = haveDiag ? diag.helmMeanEdge : 0.0;
+			const double helmMemoryGain = haveDiag ? diag.helmMeanMemoryGain : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10u %10.4f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       helmMatrices,
+			       helmEdge,
+			       helmMemoryGain,
+			       status.c_str());
 		}
-
-		CaptureMetricsCallbacks cb;
-		const int64_t startMs = now_ms();
-		const glades::NNetworkStatus st = net.train(di, &cb);
-		const int64_t endMs = now_ms();
-
-		glades::NNetwork::AtlasRuntimeDiagnostics diag;
-		const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
-		const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
-		const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
-		const unsigned int helmMatrices = haveDiag ? diag.helmMatrices : 0u;
-		const double helmEdge = haveDiag ? diag.helmMeanEdge : 0.0;
-		const double helmMemoryGain = haveDiag ? diag.helmMeanMemoryGain : 0.0;
-		const std::string status =
-		    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
-
-		printf("%-12s %10.3f %12.5f %12.5f %10u %10.4f %10.4f %s\n",
-		       spec.label,
-		       static_cast<double>(endMs - startMs) / 1000.0,
-		       trainNll,
-		       trainPpl,
-		       helmMatrices,
-		       helmEdge,
-		       helmMemoryGain,
-		       status.c_str());
 
 		delete di;
 		delete info;
@@ -497,15 +513,645 @@ void ATLASBiMAPMicroBenchmark()
 		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_bimap_micro",
 		                                                         kVocab, kDModel, kLayers,
 		                                                         spec.learningRate);
-		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
-		net.setSeed(74000u + static_cast<unsigned int>(100u * i));
-		net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
-		net.getTerminatorMutable().setAccuracy(0.0f);
-
 		{
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(74000u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
+
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.gpu.enable = false;
+				cfg.optimizer.type = spec.optimizerType;
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+				cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.dFFOverride = static_cast<int>(kDff);
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+				if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+				{
+					cfg.atlas.rank = spec.bimapRank;
+					cfg.atlas.complementRank = 0u;
+					cfg.atlas.tSub = 8u;
+					cfg.atlas.beta = 0.999f;
+					cfg.atlas.bimapEnabled = spec.bimapEnabled;
+					cfg.atlas.bimapLowRankEnabled = spec.bimapLowRankEnabled;
+					cfg.atlas.bimapGeometryScale = 1.0f;
+					cfg.atlas.bimapPredictiveScale = spec.bimapPredictiveScale;
+					cfg.atlas.bimapFactorCadence = spec.bimapCadence;
+				}
+			}
+
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const double applyMs =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+			const double headShare =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       applyMs,
+			       headShare,
+			       status.c_str());
+		}
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
+void ATLASKronMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		glades::OptimizerConfig::Type optimizerType;
+		float learningRate;
+		bool bimapEnabled;
+		bool kronEnabled;
+		float kronGeometryScale;
+		float kronPredictiveScale;
+		unsigned int kronCadence;
+		float kronDamping;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", glades::OptimizerConfig::ADAMW, 0.001f, false, false, 0.0f, 0.0f, 1u, 0.10f },
+		{ "BiMAP-lite", glades::OptimizerConfig::ATLAS, 0.001f, true, false, 0.0f, 0.0f, 1u, 0.10f },
+		{ "KRON-0", glades::OptimizerConfig::ATLAS, 0.001f, false, true, 0.0f, 0.0f, 1u, 0.10f },
+		{ "KRON", glades::OptimizerConfig::ATLAS, 0.001f, false, true, 1.0f, 0.05f, 8u, 0.10f },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("ATLAS KRON Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "ApplyMs", "HeadShr", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    78000u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_kron_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         spec.learningRate);
+		{
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(79000u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
+
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.gpu.enable = false;
+				cfg.optimizer.type = spec.optimizerType;
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+				cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.dFFOverride = static_cast<int>(kDff);
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+				if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+				{
+					cfg.atlas.rank = 4u;
+					cfg.atlas.complementRank = 0u;
+					cfg.atlas.tSub = 8u;
+					cfg.atlas.beta = 0.999f;
+					cfg.atlas.bimapEnabled = spec.bimapEnabled;
+					cfg.atlas.bimapLowRankEnabled = false;
+					cfg.atlas.kronEnabled = spec.kronEnabled;
+					cfg.atlas.kronGeometryScale = spec.kronGeometryScale;
+					cfg.atlas.kronPredictiveScale = spec.kronPredictiveScale;
+					cfg.atlas.kronFactorCadence = spec.kronCadence;
+					cfg.atlas.kronDamping = spec.kronDamping;
+				}
+			}
+
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const double applyMs =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+			const double headShare =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       applyMs,
+			       headShare,
+			       status.c_str());
+		}
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
+void ATLASMuonMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		glades::OptimizerConfig::Type optimizerType;
+		float learningRate;
+		bool muonEnabled;
+		float muonGeometryScale;
+		float muonPredictiveScale;
+		float muonMaxAspect;
+		unsigned int muonMinDim;
+		float muonDamping;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", glades::OptimizerConfig::ADAMW, 0.001f, false, 0.0f, 0.0f, 1.50f, 2u, 0.01f },
+		{ "MUON-0", glades::OptimizerConfig::ATLAS, 0.001f, true, 0.0f, 0.0f, 1.50f, 2u, 0.01f },
+		{ "MUON", glades::OptimizerConfig::ATLAS, 0.001f, true, 1.0f, 0.05f, 1.50f, 2u, 0.01f },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("ATLAS MUON Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "ApplyMs", "HeadShr", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    79500u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_muon_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         spec.learningRate);
+		{
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(79600u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
+
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.gpu.enable = false;
+				cfg.optimizer.type = spec.optimizerType;
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+				cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.dFFOverride = static_cast<int>(kDff);
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+				if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+				{
+					cfg.atlas.rank = 4u;
+					cfg.atlas.complementRank = 0u;
+					cfg.atlas.tSub = 8u;
+					cfg.atlas.beta = 0.999f;
+					cfg.atlas.muonEnabled = spec.muonEnabled;
+					cfg.atlas.muonGeometryScale = spec.muonGeometryScale;
+					cfg.atlas.muonPredictiveScale = spec.muonPredictiveScale;
+					cfg.atlas.muonMaxAspect = spec.muonMaxAspect;
+					cfg.atlas.muonMinDim = spec.muonMinDim;
+					cfg.atlas.muonDamping = spec.muonDamping;
+				}
+			}
+
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const double applyMs =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+			const double headShare =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       applyMs,
+			       headShare,
+			       status.c_str());
+		}
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
+void ATLASPACTMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		glades::OptimizerConfig::Type optimizerType;
+		float learningRate;
+		bool bimapEnabled;
+		bool bimapLowRankEnabled;
+		float bimapPredictiveScale;
+		bool pactEnabled;
+		bool pactLowRankEnabled;
+		float pactPredictiveScale;
+		unsigned int rank;
+		unsigned int cadence;
+		float pactCostScale;
+		float pactPromoteThreshold;
+		float pactDemoteThreshold;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", glades::OptimizerConfig::ADAMW, 0.001f, false, false, 0.0f, false, false, 0.0f, 4u, 1u, 0.0f, 0.0f, 0.0f },
+		{ "BiMAP-lite", glades::OptimizerConfig::ATLAS, 0.001f, true, false, 0.0f, false, false, 0.0f, 4u, 1u, 0.0f, 0.0f, 0.0f },
+		{ "PACT-lite", glades::OptimizerConfig::ATLAS, 0.001f, false, false, 0.0f, true, false, 0.0f, 4u, 1u, 0.0f, -1.0f, -1.0f },
+		{ "PACT-v2-0", glades::OptimizerConfig::ATLAS, 0.001f, false, false, 0.0f, true, true, 0.0f, 4u, 8u, 0.0f, -1.0f, -1.0f },
+		{ "PACT-v2", glades::OptimizerConfig::ATLAS, 0.001f, false, false, 0.0f, true, true, 0.10f, 4u, 8u, 0.0f, -1.0f, -1.0f },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("ATLAS PACT Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "ApplyMs", "HeadShr", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    76000u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_pact_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         spec.learningRate);
+		{
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(77000u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
+
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.gpu.enable = false;
+				cfg.optimizer.type = spec.optimizerType;
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+				cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.dFFOverride = static_cast<int>(kDff);
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+				if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+				{
+					cfg.atlas.rank = spec.rank;
+					cfg.atlas.complementRank = 0u;
+					cfg.atlas.tSub = 8u;
+					cfg.atlas.beta = 0.999f;
+					cfg.atlas.bimapEnabled = spec.bimapEnabled;
+					cfg.atlas.bimapLowRankEnabled = spec.bimapLowRankEnabled;
+					cfg.atlas.bimapGeometryScale = 1.0f;
+					cfg.atlas.bimapPredictiveScale = spec.bimapPredictiveScale;
+					cfg.atlas.bimapFactorCadence = spec.cadence;
+					cfg.atlas.pactEnabled = spec.pactEnabled;
+					cfg.atlas.pactLowRankEnabled = spec.pactLowRankEnabled;
+					cfg.atlas.pactGeometryScale = 1.0f;
+					cfg.atlas.pactPredictiveScale = spec.pactPredictiveScale;
+					cfg.atlas.pactFactorCadence = spec.cadence;
+					cfg.atlas.pactCostScale = spec.pactCostScale;
+					cfg.atlas.pactPromoteThreshold = spec.pactPromoteThreshold;
+					cfg.atlas.pactDemoteThreshold = spec.pactDemoteThreshold;
+				}
+			}
+
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const double applyMs =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+			const double headShare =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       applyMs,
+			       headShare,
+			       status.c_str());
+		}
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
+void ATLASRACERMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		glades::OptimizerConfig::Type optimizerType;
+		float learningRate;
+		bool bimapEnabled;
+		float bimapPredictiveScale;
+		bool racerEnabled;
+		float racerGeometryScale;
+		float racerPredictiveScale;
+		unsigned int rank;
+		unsigned int cadence;
+		float racerRiskScale;
+		float racerCostScale;
+		float racerPromoteThreshold;
+		float racerDemoteThreshold;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", glades::OptimizerConfig::ADAMW, 0.001f, false, 0.0f, false, 0.0f, 0.0f, 4u, 1u, 0.50f, 0.0010f, 0.0f, 0.0f },
+		{ "BiMAP-lite", glades::OptimizerConfig::ATLAS, 0.001f, true, 0.0f, false, 0.0f, 0.0f, 4u, 1u, 0.50f, 0.0010f, 0.0f, 0.0f },
+		{ "RACER-0", glades::OptimizerConfig::ATLAS, 0.001f, false, 0.0f, true, 0.0f, 0.0f, 4u, 1u, 0.50f, 0.0f, 1.0f, 0.5f },
+		{ "RACER-lite", glades::OptimizerConfig::ATLAS, 0.001f, false, 0.0f, true, 1.0f, 0.05f, 4u, 8u, 0.50f, 0.0010f, -1.0f, -1.0f },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("ATLAS RACER Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "ApplyMs", "HeadShr", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    81000u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_racer_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         spec.learningRate);
+		{
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(81100u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
+
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.gpu.enable = false;
+				cfg.optimizer.type = spec.optimizerType;
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+				cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.dFFOverride = static_cast<int>(kDff);
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+				if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+				{
+					cfg.atlas.rank = spec.rank;
+					cfg.atlas.complementRank = 0u;
+					cfg.atlas.tSub = 8u;
+					cfg.atlas.beta = 0.999f;
+					cfg.atlas.bimapEnabled = spec.bimapEnabled;
+					cfg.atlas.bimapLowRankEnabled = false;
+					cfg.atlas.bimapGeometryScale = 1.0f;
+					cfg.atlas.bimapPredictiveScale = spec.bimapPredictiveScale;
+					cfg.atlas.bimapFactorCadence = spec.cadence;
+					cfg.atlas.racerEnabled = spec.racerEnabled;
+					cfg.atlas.racerGeometryScale = spec.racerGeometryScale;
+					cfg.atlas.racerPredictiveScale = spec.racerPredictiveScale;
+					cfg.atlas.racerFactorCadence = spec.cadence;
+					cfg.atlas.racerRiskScale = spec.racerRiskScale;
+					cfg.atlas.racerCostScale = spec.racerCostScale;
+					cfg.atlas.racerPromoteThreshold = spec.racerPromoteThreshold;
+					cfg.atlas.racerDemoteThreshold = spec.racerDemoteThreshold;
+				}
+			}
+
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const double applyMs =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+			const double headShare =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       applyMs,
+			       headShare,
+			       status.c_str());
+		}
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
+void ATLASGroupAdamMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		bool groupwiseEnabled;
+		unsigned int minGroupSize;
+		float stabilityScale;
+		float snrScale;
+		float ratioScale;
+		float minScale;
+		float maxScale;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+	static const float kLearningRate = 0.001f;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", false, 256u, 0.05f, 0.05f, 0.50f, 0.90f, 1.15f },
+		{ "AdamW-Group", true, 8u, 0.10f, 0.10f, 0.35f, 0.90f, 1.20f },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("AdamW Groupwise Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "ApplyMs", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    82000u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_adamw_group_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         kLearningRate);
+		{
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(82100u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
+
 			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 			cfg.gpu.enable = false;
-			cfg.optimizer.type = spec.optimizerType;
+			cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+			cfg.optimizer.adamGroupwiseEnabled = spec.groupwiseEnabled;
+			cfg.optimizer.adamGroupMinSize = spec.minGroupSize;
+			cfg.optimizer.adamGroupStabilityScale = spec.stabilityScale;
+			cfg.optimizer.adamGroupSnrScale = spec.snrScale;
+			cfg.optimizer.adamGroupRatioScale = spec.ratioScale;
+			cfg.optimizer.adamGroupMinScale = spec.minScale;
+			cfg.optimizer.adamGroupMaxScale = spec.maxScale;
 			cfg.transformer.enableTokenEmbedding = true;
 			cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
 			cfg.transformer.tieEmbeddings = true;
@@ -517,50 +1163,575 @@ void ATLASBiMAPMicroBenchmark()
 			cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
 			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
 
-			if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
-			{
-				cfg.atlas.rank = spec.bimapRank;
-				cfg.atlas.complementRank = 0u;
-				cfg.atlas.tSub = 8u;
-				cfg.atlas.beta = 0.999f;
-				cfg.atlas.bimapEnabled = spec.bimapEnabled;
-				cfg.atlas.bimapLowRankEnabled = spec.bimapLowRankEnabled;
-				cfg.atlas.bimapGeometryScale = 1.0f;
-				cfg.atlas.bimapPredictiveScale = spec.bimapPredictiveScale;
-				cfg.atlas.bimapFactorCadence = spec.bimapCadence;
-			}
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const double applyMs =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       applyMs,
+			       status.c_str());
 		}
-
-		CaptureMetricsCallbacks cb;
-		const int64_t startMs = now_ms();
-		const glades::NNetworkStatus st = net.train(di, &cb);
-		const int64_t endMs = now_ms();
-
-		glades::NNetwork::AtlasRuntimeDiagnostics diag;
-		const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
-		const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
-		const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
-		const double applyMs =
-		    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
-		const double headShare =
-		    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
-		const std::string status =
-		    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
-
-		printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
-		       spec.label,
-		       static_cast<double>(endMs - startMs) / 1000.0,
-		       trainNll,
-		       trainPpl,
-		       applyMs,
-		       headShare,
-		       status.c_str());
 
 		delete di;
 		delete info;
 	}
 
 	printf("\n");
+}
+
+void ATLASPACTCoreUnitTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS PACT Core Unit Test\n");
+	printf("============================================================\n");
+
+	const unsigned int m = 3u;
+	const unsigned int n = 2u;
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float inv1mB1t = 1.0f / (1.0f - beta1);
+	const float inv1mB2t = 1.0f / (1.0f - beta2);
+	const float eps = 1.0e-8f;
+
+	{
+		std::vector<float> W(mn, 0.5f);
+		std::vector<float> m1(mn, 0.0f);
+		std::vector<float> v2(mn, 0.0f);
+		const float gRaw[] = { 0.25f, -0.50f, 1.00f, -1.50f, 0.75f, -0.25f };
+		std::vector<float> g(gRaw, gRaw + (sizeof(gRaw) / sizeof(gRaw[0])));
+
+		std::vector<float> expected = W;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const float grad = g[idx];
+			const float denom = fabsf(grad) + eps;
+			expected[idx] -= lr * (grad / denom);
+		}
+
+		glades::atlas::BiMAPWeightState state;
+		glades::ATLASConfig ac;
+		ac.rank = 2u;
+		ac.powerIters = 1u;
+		ac.beta = 0.999f;
+		ac.pactEnabled = true;
+		ac.pactLowRankEnabled = false;
+		ac.pactGeometryScale = 0.0f;
+		ac.pactPredictiveScale = 0.0f;
+		ac.pactFactorCadence = 1u;
+		ac.pactCostScale = 0.0f;
+		ac.pactPromoteThreshold = 1.0f;
+		ac.pactDemoteThreshold = 0.5f;
+
+		const bool ok = glades::atlas::pactUpdate(state,
+		                                          &W[0], &m1[0], &v2[0], &g[0],
+		                                          m, n, lr,
+		                                          beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                          1.0f, 1.0f, 0.0f, 0.0f,
+		                                          ac, 0, "ut.pact.fallback");
+		ASSERT("PACT fallback update failed", ok);
+		ASSERT("PACT fallback should stay demoted", !state.promoted);
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("PACT fallback should zero gradients", fabsf(g[idx]) < 1.0e-12f);
+			ASSERT("PACT fallback must match AdamW update", fabsf(W[idx] - expected[idx]) < 1.0e-6f);
+		}
+		printf("[UT] PACT fallback matches exact Adam-style update\n");
+	}
+
+	{
+		std::vector<float> WPromoted(mn, 0.5f);
+		std::vector<float> WFallback(mn, 0.5f);
+		std::vector<float> mPromoted(mn, 0.0f);
+		std::vector<float> vPromoted(mn, 0.0f);
+		std::vector<float> mFallback(mn, 0.0f);
+		std::vector<float> vFallback(mn, 0.0f);
+		const float g1Raw[] = { 2.0f, 0.1f, 2.0f, 0.1f, 0.1f, 0.1f };
+		const float g2Raw[] = { 1.5f, 0.05f, 1.5f, 0.05f, 0.05f, 0.05f };
+		std::vector<float> g1(g1Raw, g1Raw + (sizeof(g1Raw) / sizeof(g1Raw[0])));
+		std::vector<float> g2(g2Raw, g2Raw + (sizeof(g2Raw) / sizeof(g2Raw[0])));
+
+		glades::atlas::BiMAPWeightState promotedState;
+		glades::ATLASConfig promotedCfg;
+		promotedCfg.rank = 2u;
+		promotedCfg.powerIters = 1u;
+		promotedCfg.beta = 0.999f;
+		promotedCfg.pactEnabled = true;
+		promotedCfg.pactLowRankEnabled = true;
+		promotedCfg.pactGeometryScale = 1.0f;
+		promotedCfg.pactPredictiveScale = 0.10f;
+		promotedCfg.pactFactorCadence = 1u;
+		promotedCfg.pactCostScale = 0.0f;
+		promotedCfg.pactPromoteThreshold = -1.0f;
+		promotedCfg.pactDemoteThreshold = -1.0f;
+
+		glades::atlas::BiMAPWeightState fallbackState;
+		glades::ATLASConfig fallbackCfg = promotedCfg;
+		fallbackCfg.pactGeometryScale = 0.0f;
+		fallbackCfg.pactPredictiveScale = 0.0f;
+		fallbackCfg.pactLowRankEnabled = false;
+		fallbackCfg.pactPromoteThreshold = 1.0f;
+		fallbackCfg.pactDemoteThreshold = 0.5f;
+
+		bool ok = glades::atlas::pactUpdate(promotedState,
+		                                    &WPromoted[0], &mPromoted[0], &vPromoted[0], &g1[0],
+		                                    m, n, lr,
+		                                    beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                    1.0f, 1.0f, 0.0f, 0.0f,
+		                                    promotedCfg, 0, "ut.pact.promoted");
+		ASSERT("PACT promoted warmup step failed", ok);
+		ok = glades::atlas::pactUpdate(promotedState,
+		                               &WPromoted[0], &mPromoted[0], &vPromoted[0], &g2[0],
+		                               m, n, lr,
+		                               beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                               1.0f, 1.0f, 0.0f, 0.0f,
+		                               promotedCfg, 0, "ut.pact.promoted");
+		ASSERT("PACT promoted step failed", ok);
+
+		ok = glades::atlas::pactUpdate(fallbackState,
+		                               &WFallback[0], &mFallback[0], &vFallback[0], &g1[0],
+		                               m, n, lr,
+		                               beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                               1.0f, 1.0f, 0.0f, 0.0f,
+		                               fallbackCfg, 0, "ut.pact.baseline");
+		ASSERT("PACT fallback warmup step failed", ok);
+		ok = glades::atlas::pactUpdate(fallbackState,
+		                               &WFallback[0], &mFallback[0], &vFallback[0], &g2[0],
+		                               m, n, lr,
+		                               beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                               1.0f, 1.0f, 0.0f, 0.0f,
+		                               fallbackCfg, 0, "ut.pact.baseline");
+		ASSERT("PACT fallback comparison step failed", ok);
+
+		ASSERT("PACT promoted path should mark the block promoted", promotedState.promoted);
+		ASSERT("PACT promoted path should record promoted steps", promotedState.promotedSteps > 0ULL);
+		ASSERT("PACT low-rank path should retain some row/col structure",
+		       promotedState.rowRank > 0u || promotedState.colRank > 0u);
+
+		bool sawDifference = false;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("PACT promoted path should zero gradients", fabsf(g2[idx]) < 1.0e-12f);
+			if (fabsf(WPromoted[idx] - WFallback[idx]) > 1.0e-7f)
+				sawDifference = true;
+		}
+		ASSERT("PACT promoted path should diverge from exact Adam fallback on anisotropic gradients",
+		       sawDifference);
+		printf("[UT] PACT promotion engages and changes the matrix update on anisotropic blocks\n");
+	}
+
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+}
+
+void ATLASRACERCoreUnitTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS RACER Core Unit Test\n");
+	printf("============================================================\n");
+
+	const unsigned int m = 3u;
+	const unsigned int n = 2u;
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float inv1mB1t = 1.0f / (1.0f - beta1);
+	const float inv1mB2t = 1.0f / (1.0f - beta2);
+	const float eps = 1.0e-8f;
+
+	{
+		std::vector<float> W(mn, 0.5f);
+		std::vector<float> m1(mn, 0.0f);
+		std::vector<float> v2(mn, 0.0f);
+		const float gRaw[] = { 0.25f, -0.50f, 1.00f, -1.50f, 0.75f, -0.25f };
+		std::vector<float> g(gRaw, gRaw + (sizeof(gRaw) / sizeof(gRaw[0])));
+
+		std::vector<float> expected = W;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const float grad = g[idx];
+			const float denom = fabsf(grad) + eps;
+			expected[idx] -= lr * (grad / denom);
+		}
+
+		glades::atlas::BiMAPWeightState state;
+		glades::ATLASConfig ac;
+		ac.rank = 2u;
+		ac.powerIters = 1u;
+		ac.beta = 0.999f;
+		ac.racerEnabled = true;
+		ac.racerGeometryScale = 0.0f;
+		ac.racerPredictiveScale = 0.0f;
+		ac.racerFactorCadence = 1u;
+		ac.racerRiskScale = 0.50f;
+		ac.racerCostScale = 0.0f;
+		ac.racerPromoteThreshold = 1.0f;
+		ac.racerDemoteThreshold = 0.5f;
+
+		const bool ok = glades::atlas::racerUpdate(state,
+		                                           &W[0], &m1[0], &v2[0], &g[0],
+		                                           m, n, lr,
+		                                           beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                           1.0f, 1.0f, 0.0f, 0.0f,
+		                                           ac, 0, "ut.racer.fallback");
+		ASSERT("RACER fallback update failed", ok);
+		ASSERT("RACER fallback should stay demoted", !state.promoted);
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("RACER fallback should zero gradients", fabsf(g[idx]) < 1.0e-12f);
+			ASSERT("RACER fallback must match Adam-style update", fabsf(W[idx] - expected[idx]) < 1.0e-6f);
+		}
+		printf("[UT] RACER fallback matches exact Adam-style update\n");
+	}
+
+	{
+		std::vector<float> WPromoted(mn, 0.5f);
+		std::vector<float> WFallback(mn, 0.5f);
+		std::vector<float> mPromoted(mn, 0.0f);
+		std::vector<float> vPromoted(mn, 0.0f);
+		std::vector<float> mFallback(mn, 0.0f);
+		std::vector<float> vFallback(mn, 0.0f);
+		const float g1Raw[] = { 2.0f, 0.1f, 2.0f, 0.1f, 0.1f, 0.1f };
+		const float g2Raw[] = { 1.5f, 0.05f, 1.5f, 0.05f, 0.05f, 0.05f };
+		std::vector<float> g1(g1Raw, g1Raw + (sizeof(g1Raw) / sizeof(g1Raw[0])));
+		std::vector<float> g2(g2Raw, g2Raw + (sizeof(g2Raw) / sizeof(g2Raw[0])));
+
+		glades::atlas::BiMAPWeightState promotedState;
+		glades::ATLASConfig promotedCfg;
+		promotedCfg.rank = 2u;
+		promotedCfg.powerIters = 1u;
+		promotedCfg.beta = 0.999f;
+		promotedCfg.racerEnabled = true;
+		promotedCfg.racerGeometryScale = 1.0f;
+		promotedCfg.racerPredictiveScale = 0.05f;
+		promotedCfg.racerFactorCadence = 1u;
+		promotedCfg.racerRiskScale = 0.0f;
+		promotedCfg.racerCostScale = 0.0f;
+		promotedCfg.racerPromoteThreshold = -1.0f;
+		promotedCfg.racerDemoteThreshold = -1.0f;
+
+		glades::atlas::BiMAPWeightState fallbackState;
+		glades::ATLASConfig fallbackCfg = promotedCfg;
+		fallbackCfg.racerGeometryScale = 0.0f;
+		fallbackCfg.racerPredictiveScale = 0.0f;
+		fallbackCfg.racerPromoteThreshold = 1.0f;
+		fallbackCfg.racerDemoteThreshold = 0.5f;
+
+		bool ok = glades::atlas::racerUpdate(promotedState,
+		                                     &WPromoted[0], &mPromoted[0], &vPromoted[0], &g1[0],
+		                                     m, n, lr,
+		                                     beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                     1.0f, 1.0f, 0.0f, 0.0f,
+		                                     promotedCfg, 0, "ut.racer.promoted");
+		ASSERT("RACER promoted warmup step failed", ok);
+		ok = glades::atlas::racerUpdate(promotedState,
+		                                &WPromoted[0], &mPromoted[0], &vPromoted[0], &g2[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                promotedCfg, 0, "ut.racer.promoted");
+		ASSERT("RACER promoted step failed", ok);
+
+		ok = glades::atlas::racerUpdate(fallbackState,
+		                                &WFallback[0], &mFallback[0], &vFallback[0], &g1[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                fallbackCfg, 0, "ut.racer.baseline");
+		ASSERT("RACER fallback warmup step failed", ok);
+		ok = glades::atlas::racerUpdate(fallbackState,
+		                                &WFallback[0], &mFallback[0], &vFallback[0], &g2[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                fallbackCfg, 0, "ut.racer.baseline");
+		ASSERT("RACER fallback comparison step failed", ok);
+
+		ASSERT("RACER promoted path should mark the block promoted", promotedState.promoted);
+		ASSERT("RACER promoted path should record promoted steps", promotedState.promotedSteps > 0ULL);
+
+		bool sawDifference = false;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("RACER promoted path should zero gradients", fabsf(g2[idx]) < 1.0e-12f);
+			if (fabsf(WPromoted[idx] - WFallback[idx]) > 1.0e-7f)
+				sawDifference = true;
+		}
+		ASSERT("RACER promoted path should diverge from exact Adam fallback on anisotropic gradients",
+		       sawDifference);
+		ASSERT("RACER promoted path should record a finite promotion margin",
+		       std::isfinite(promotedState.lastPromotionMargin));
+		printf("[UT] RACER promotion engages and changes the matrix update on anisotropic blocks\n");
+	}
+
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+}
+
+void ATLASKronCoreUnitTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS KRON Core Unit Test\n");
+	printf("============================================================\n");
+
+	const unsigned int m = 3u;
+	const unsigned int n = 2u;
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float inv1mB1t = 1.0f / (1.0f - beta1);
+	const float inv1mB2t = 1.0f / (1.0f - beta2);
+	const float eps = 1.0e-8f;
+
+	{
+		std::vector<float> W(mn, 0.5f);
+		std::vector<float> m1(mn, 0.0f);
+		std::vector<float> v2(mn, 0.0f);
+		const float rawGrad[] = { 0.25f, -0.50f, 0.10f, 0.20f, -0.30f, 0.40f };
+		std::vector<float> g(rawGrad, rawGrad + (sizeof(rawGrad) / sizeof(rawGrad[0])));
+
+		std::vector<float> expected(W);
+		std::vector<float> expectedM(mn, 0.0f);
+		std::vector<float> expectedV(mn, 0.0f);
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const float grad = g[idx];
+			expectedM[idx] = beta1 * expectedM[idx] + (1.0f - beta1) * grad;
+			expectedV[idx] = beta2 * expectedV[idx] + (1.0f - beta2) * (grad * grad);
+			const float mhat = expectedM[idx] * inv1mB1t;
+			const float vhat = expectedV[idx] * inv1mB2t;
+			const float denom =
+			    static_cast<float>(sqrt(static_cast<double>(std::max(vhat, 0.0f)))) + eps;
+			expected[idx] -= lr * (mhat / denom);
+		}
+
+		glades::atlas::KronWeightState state;
+		glades::ATLASConfig ac;
+		ac.kronEnabled = true;
+		ac.kronGeometryScale = 0.0f;
+		ac.kronPredictiveScale = 0.0f;
+		ac.kronFactorCadence = 1u;
+		ac.kronDamping = 0.10f;
+
+		const bool ok = glades::atlas::kronUpdate(state,
+		                                          &W[0], &m1[0], &v2[0], &g[0],
+		                                          m, n, lr,
+		                                          beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                          1.0f, 1.0f, 0.0f, 0.0f,
+		                                          ac, 0, "ut.kron.fallback");
+		ASSERT("KRON fallback update failed", ok);
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("KRON fallback should zero gradients", fabsf(g[idx]) < 1.0e-12f);
+			ASSERT("KRON fallback must match Adam-style update", fabsf(W[idx] - expected[idx]) < 1.0e-6f);
+		}
+		printf("[UT] KRON fallback matches exact Adam-style update\n");
+	}
+
+	{
+		std::vector<float> WKron(mn, 0.5f);
+		std::vector<float> WAdam(mn, 0.5f);
+		std::vector<float> mKron(mn, 0.0f);
+		std::vector<float> vKron(mn, 0.0f);
+		std::vector<float> mAdam(mn, 0.0f);
+		std::vector<float> vAdam(mn, 0.0f);
+		const float gradRaw[] = { 2.0f, 0.1f, 2.0f, 0.1f, 0.1f, 0.1f };
+		std::vector<float> gKron(gradRaw, gradRaw + (sizeof(gradRaw) / sizeof(gradRaw[0])));
+		std::vector<float> gAdam(gradRaw, gradRaw + (sizeof(gradRaw) / sizeof(gradRaw[0])));
+
+		glades::atlas::KronWeightState kronState;
+		glades::ATLASConfig kronCfg;
+		kronCfg.kronEnabled = true;
+		kronCfg.kronGeometryScale = 1.0f;
+		kronCfg.kronPredictiveScale = 0.0f;
+		kronCfg.kronFactorCadence = 1u;
+		kronCfg.kronDamping = 0.10f;
+		kronCfg.beta = 0.999f;
+
+		glades::atlas::KronWeightState adamState;
+		glades::ATLASConfig adamCfg = kronCfg;
+		adamCfg.kronGeometryScale = 0.0f;
+
+		bool ok = glades::atlas::kronUpdate(kronState,
+		                                    &WKron[0], &mKron[0], &vKron[0], &gKron[0],
+		                                    m, n, lr,
+		                                    beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                    1.0f, 1.0f, 0.0f, 0.0f,
+		                                    kronCfg, 0, "ut.kron.promoted");
+		ASSERT("KRON anisotropic update failed", ok);
+		ok = glades::atlas::kronUpdate(adamState,
+		                               &WAdam[0], &mAdam[0], &vAdam[0], &gAdam[0],
+		                               m, n, lr,
+		                               beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                               1.0f, 1.0f, 0.0f, 0.0f,
+		                               adamCfg, 0, "ut.kron.adam");
+		ASSERT("KRON fallback comparison update failed", ok);
+
+		bool sawDifference = false;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("KRON promoted path should zero gradients", fabsf(gKron[idx]) < 1.0e-12f);
+			if (fabsf(WKron[idx] - WAdam[idx]) > 1.0e-7f)
+				sawDifference = true;
+		}
+		ASSERT("KRON anisotropic block should diverge from Adam fallback", sawDifference);
+		ASSERT("KRON should record nontrivial row or column conditioning",
+		       kronState.lastRowCond > 1.0f || kronState.lastColCond > 1.0f);
+		printf("[UT] KRON engages two-sided block geometry on anisotropic gradients\n");
+	}
+
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+}
+
+void ATLASMuonCoreUnitTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS MUON Core Unit Test\n");
+	printf("============================================================\n");
+
+	const unsigned int m = 3u;
+	const unsigned int n = 3u;
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float inv1mB1t = 1.0f / (1.0f - beta1);
+	const float inv1mB2t = 1.0f / (1.0f - beta2);
+	const float eps = 1.0e-8f;
+
+	{
+		std::vector<float> W(mn, 0.5f);
+		std::vector<float> m1(mn, 0.0f);
+		std::vector<float> v2(mn, 0.0f);
+		const float rawGrad[] = { 0.25f, -0.50f, 0.10f, 0.20f, -0.30f, 0.40f, 0.05f, -0.15f, 0.35f };
+		std::vector<float> g(rawGrad, rawGrad + (sizeof(rawGrad) / sizeof(rawGrad[0])));
+
+		std::vector<float> expected(W);
+		std::vector<float> expectedM(mn, 0.0f);
+		std::vector<float> expectedV(mn, 0.0f);
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const float grad = g[idx];
+			expectedM[idx] = beta1 * expectedM[idx] + (1.0f - beta1) * grad;
+			expectedV[idx] = beta2 * expectedV[idx] + (1.0f - beta2) * (grad * grad);
+			const float mhat = expectedM[idx] * inv1mB1t;
+			const float vhat = expectedV[idx] * inv1mB2t;
+			const float denom =
+			    static_cast<float>(sqrt(static_cast<double>(std::max(vhat, 0.0f)))) + eps;
+			expected[idx] -= lr * (mhat / denom);
+		}
+
+		glades::atlas::MuonWeightState state;
+		glades::ATLASConfig ac;
+		ac.muonEnabled = true;
+		ac.muonGeometryScale = 0.0f;
+		ac.muonPredictiveScale = 0.0f;
+		ac.muonMaxAspect = 1.50f;
+		ac.muonMinDim = 2u;
+		ac.muonDamping = 0.01f;
+
+		const bool ok = glades::atlas::muonUpdate(state,
+		                                          &W[0], &m1[0], &v2[0], &g[0],
+		                                          m, n, lr,
+		                                          beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                          1.0f, 1.0f, 0.0f, 0.0f,
+		                                          ac, 0, "ut.muon.fallback");
+		ASSERT("MUON fallback update failed", ok);
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("MUON fallback should zero gradients", fabsf(g[idx]) < 1.0e-12f);
+			ASSERT("MUON fallback must match Adam-style update", fabsf(W[idx] - expected[idx]) < 1.0e-6f);
+		}
+		printf("[UT] MUON fallback matches exact Adam-style update\n");
+	}
+
+	{
+		std::vector<float> WMuon(mn, 0.5f);
+		std::vector<float> WAdam(mn, 0.5f);
+		std::vector<float> mMuon(mn, 0.0f);
+		std::vector<float> vMuon(mn, 0.0f);
+		std::vector<float> mAdam(mn, 0.0f);
+		std::vector<float> vAdam(mn, 0.0f);
+		const float warmGradRaw[] = { 1.0f, 0.5f, 0.25f, 0.5f, 1.0f, 0.25f, 0.25f, 0.25f, 0.75f };
+		std::vector<float> gMuonWarm(warmGradRaw, warmGradRaw + (sizeof(warmGradRaw) / sizeof(warmGradRaw[0])));
+		std::vector<float> gAdamWarm(warmGradRaw, warmGradRaw + (sizeof(warmGradRaw) / sizeof(warmGradRaw[0])));
+		const float gradRaw[] = { 3.0f, 3.0f, 3.0f, 0.5f, 0.5f, 0.5f, 0.1f, 0.1f, 0.1f };
+		std::vector<float> gMuon(gradRaw, gradRaw + (sizeof(gradRaw) / sizeof(gradRaw[0])));
+		std::vector<float> gAdam(gradRaw, gradRaw + (sizeof(gradRaw) / sizeof(gradRaw[0])));
+
+		glades::atlas::MuonWeightState muonState;
+		glades::ATLASConfig muonCfg;
+		muonCfg.muonEnabled = true;
+		muonCfg.muonGeometryScale = 1.0f;
+		muonCfg.muonPredictiveScale = 0.0f;
+		muonCfg.muonMaxAspect = 1.50f;
+		muonCfg.muonMinDim = 2u;
+		muonCfg.muonDamping = 0.01f;
+
+		glades::atlas::MuonWeightState adamState;
+		glades::ATLASConfig adamCfg = muonCfg;
+		adamCfg.muonGeometryScale = 0.0f;
+
+		bool ok = glades::atlas::muonUpdate(muonState,
+		                                    &WMuon[0], &mMuon[0], &vMuon[0], &gMuonWarm[0],
+		                                    m, n, lr,
+		                                    beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                    1.0f, 1.0f, 0.0f, 0.0f,
+		                                    muonCfg, 0, "ut.muon.warm.promoted");
+		ASSERT("MUON warmup step failed", ok);
+		ok = glades::atlas::muonUpdate(adamState,
+		                               &WAdam[0], &mAdam[0], &vAdam[0], &gAdamWarm[0],
+		                               m, n, lr,
+		                               beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                               1.0f, 1.0f, 0.0f, 0.0f,
+		                               adamCfg, 0, "ut.muon.warm.adam");
+		ASSERT("MUON fallback warmup step failed", ok);
+
+		ok = glades::atlas::muonUpdate(muonState,
+		                                    &WMuon[0], &mMuon[0], &vMuon[0], &gMuon[0],
+		                                    m, n, lr,
+		                                    beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                    1.0f, 1.0f, 0.0f, 0.0f,
+		                                    muonCfg, 0, "ut.muon.promoted");
+		ASSERT("MUON anisotropic update failed", ok);
+		ok = glades::atlas::muonUpdate(adamState,
+		                               &WAdam[0], &mAdam[0], &vAdam[0], &gAdam[0],
+		                               m, n, lr,
+		                               beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                               1.0f, 1.0f, 0.0f, 0.0f,
+		                               adamCfg, 0, "ut.muon.adam");
+		ASSERT("MUON fallback comparison update failed", ok);
+
+		bool sawDifference = false;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			ASSERT("MUON promoted path should zero gradients", fabsf(gMuon[idx]) < 1.0e-12f);
+			if (fabsf(WMuon[idx] - WAdam[idx]) > 1.0e-7f)
+				sawDifference = true;
+		}
+		ASSERT("MUON eligible square block should diverge from Adam fallback", sawDifference);
+		ASSERT("MUON should mark the square block eligible", muonState.lastEligible);
+		ASSERT("MUON orthogonalization error should remain finite and bounded",
+		       std::isfinite(muonState.lastOrthError) && muonState.lastOrthError < 5.0f);
+		printf("[UT] MUON engages orthogonalized momentum on eligible square blocks\n");
+	}
+
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 }
 
 void ATLASUnitTest()

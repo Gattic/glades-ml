@@ -158,6 +158,24 @@ int main(int argc, char* argv[])
 		ATLASHelmMicroBenchmark();
 	    else if (strcmp(argv[1], "atlas-bimap-micro") == 0)
 		ATLASBiMAPMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-kron-micro") == 0)
+		ATLASKronMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-muon-micro") == 0)
+		ATLASMuonMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-pact-micro") == 0)
+		ATLASPACTMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-racer-micro") == 0)
+		ATLASRACERMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-groupadam-micro") == 0)
+		ATLASGroupAdamMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-pact-core") == 0)
+		ATLASPACTCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-racer-core") == 0)
+		ATLASRACERCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-kron-core") == 0)
+		ATLASKronCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-muon-core") == 0)
+		ATLASMuonCoreUnitTest();
 	    else if (strcmp(argv[1], "atlas-bench") == 0)
 		ATLASBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "atlas-alt-bench") == 0)

@@ -449,6 +449,41 @@ static bool read_kv_manifest(const std::string& manifestPath, ModelManifest& m)
 			int v = 0;
 			if (parse_int_strict(val, v)) { m.trainingConfig.optimizer.adamBiasCorrection = (v != 0); m.hasTrainingConfig = true; }
 		}
+		else if (key == "training.optimizer.adamGroupwiseEnabled")
+		{
+			int v = 0;
+			if (parse_int_strict(val, v)) { m.trainingConfig.optimizer.adamGroupwiseEnabled = (v != 0); m.hasTrainingConfig = true; }
+		}
+		else if (key == "training.optimizer.adamGroupStabilityScale")
+		{
+			float v = 0.0f;
+			if (parse_float_strict(val, v)) { m.trainingConfig.optimizer.adamGroupStabilityScale = v; m.hasTrainingConfig = true; }
+		}
+		else if (key == "training.optimizer.adamGroupSnrScale")
+		{
+			float v = 0.0f;
+			if (parse_float_strict(val, v)) { m.trainingConfig.optimizer.adamGroupSnrScale = v; m.hasTrainingConfig = true; }
+		}
+		else if (key == "training.optimizer.adamGroupRatioScale")
+		{
+			float v = 0.0f;
+			if (parse_float_strict(val, v)) { m.trainingConfig.optimizer.adamGroupRatioScale = v; m.hasTrainingConfig = true; }
+		}
+		else if (key == "training.optimizer.adamGroupMinScale")
+		{
+			float v = 0.0f;
+			if (parse_float_strict(val, v)) { m.trainingConfig.optimizer.adamGroupMinScale = v; m.hasTrainingConfig = true; }
+		}
+		else if (key == "training.optimizer.adamGroupMaxScale")
+		{
+			float v = 0.0f;
+			if (parse_float_strict(val, v)) { m.trainingConfig.optimizer.adamGroupMaxScale = v; m.hasTrainingConfig = true; }
+		}
+		else if (key == "training.optimizer.adamGroupMinSize")
+		{
+			int v = 0;
+			if (parse_int_strict(val, v) && v >= 0) { m.trainingConfig.optimizer.adamGroupMinSize = static_cast<unsigned int>(v); m.hasTrainingConfig = true; }
+		}
 		else if (key == "training.lrSchedule.type")
 		{
 			int v = 0;
@@ -1133,6 +1168,13 @@ static glades::NNetworkStatus write_model_package_manifest(const ModelPackagePat
 	out << "training.optimizer.adamBeta2=" << trainingConfig.optimizer.adamBeta2 << "\n";
 	out << "training.optimizer.adamEps=" << trainingConfig.optimizer.adamEps << "\n";
 	out << "training.optimizer.adamBiasCorrection=" << (trainingConfig.optimizer.adamBiasCorrection ? 1 : 0) << "\n";
+	out << "training.optimizer.adamGroupwiseEnabled=" << (trainingConfig.optimizer.adamGroupwiseEnabled ? 1 : 0) << "\n";
+	out << "training.optimizer.adamGroupStabilityScale=" << trainingConfig.optimizer.adamGroupStabilityScale << "\n";
+	out << "training.optimizer.adamGroupSnrScale=" << trainingConfig.optimizer.adamGroupSnrScale << "\n";
+	out << "training.optimizer.adamGroupRatioScale=" << trainingConfig.optimizer.adamGroupRatioScale << "\n";
+	out << "training.optimizer.adamGroupMinScale=" << trainingConfig.optimizer.adamGroupMinScale << "\n";
+	out << "training.optimizer.adamGroupMaxScale=" << trainingConfig.optimizer.adamGroupMaxScale << "\n";
+	out << "training.optimizer.adamGroupMinSize=" << trainingConfig.optimizer.adamGroupMinSize << "\n";
 	out << "training.lrSchedule.type=" << static_cast<int>(trainingConfig.lrSchedule.type) << "\n";
 	out << "training.lrSchedule.stepSizeEpochs=" << trainingConfig.lrSchedule.stepSizeEpochs << "\n";
 	out << "training.lrSchedule.gamma=" << trainingConfig.lrSchedule.gamma << "\n";

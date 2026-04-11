@@ -29,5 +29,14 @@ void ATLASControllerUnitTest();
 void ATLASGpuNaNTest();
 void ATLASHelmMicroBenchmark();
 void ATLASBiMAPMicroBenchmark();
+void ATLASKronMicroBenchmark();
+void ATLASMuonMicroBenchmark();
+void ATLASPACTMicroBenchmark();
+void ATLASRACERMicroBenchmark();
+void ATLASGroupAdamMicroBenchmark();
+void ATLASPACTCoreUnitTest();
+void ATLASRACERCoreUnitTest();
+void ATLASKronCoreUnitTest();
+void ATLASMuonCoreUnitTest();
 
 #endif

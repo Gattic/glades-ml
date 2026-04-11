@@ -392,6 +392,7 @@ struct BiMAPWeightState
 	std::vector<float> rowSecond;   // [m] EMA row second moments
 	std::vector<float> colSecond;   // [n] EMA column second moments
 	std::vector<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	std::vector<float> stableMhat;  // [m * n] delayed stable-signal EMA
 	std::vector<float> scratchRow;  // [m]
 	std::vector<float> scratchCol;  // [n]
 	std::vector<float> rowBasis;    // [m * rowRank] low-rank row factors
@@ -405,6 +406,13 @@ struct BiMAPWeightState
 	float lastColAnisotropy;
 	float lastRowCapture;
 	float lastColCapture;
+	float promotionScore;
+	float lastAdamGain;
+	float lastPrecondGain;
+	float lastCostPenalty;
+	float lastPromotionMargin;
+	bool promoted;
+	unsigned long long promotedSteps;
 	unsigned long long step;
 	bool initialized;
 
@@ -416,6 +424,13 @@ struct BiMAPWeightState
 	      lastColAnisotropy(1.0f),
 	      lastRowCapture(0.0f),
 	      lastColCapture(0.0f),
+	      promotionScore(0.0f),
+	      lastAdamGain(0.0f),
+	      lastPrecondGain(0.0f),
+	      lastCostPenalty(0.0f),
+	      lastPromotionMargin(0.0f),
+	      promoted(false),
+	      promotedSteps(0ULL),
 	      step(0ULL),
 	      initialized(false)
 	{
@@ -428,6 +443,7 @@ struct BiMAPWeightState
 		rowSecond.clear();
 		colSecond.clear();
 		prevMhat.clear();
+		stableMhat.clear();
 		scratchRow.clear();
 		scratchCol.clear();
 		rowBasis.clear();
@@ -441,6 +457,117 @@ struct BiMAPWeightState
 		lastColAnisotropy = 1.0f;
 		lastRowCapture = 0.0f;
 		lastColCapture = 0.0f;
+		promotionScore = 0.0f;
+		lastAdamGain = 0.0f;
+		lastPrecondGain = 0.0f;
+		lastCostPenalty = 0.0f;
+		lastPromotionMargin = 0.0f;
+		promoted = false;
+		promotedSteps = 0ULL;
+		step = 0ULL;
+		initialized = false;
+	}
+};
+
+// True two-sided block factor preconditioner state.
+//
+// KRON keeps Adam-style first/second moments outside this state, but tracks
+// full row/column covariance EMAs and their inverse-square-root factors for
+// matrix-block updates.
+struct KronWeightState
+{
+	unsigned int m;
+	unsigned int n;
+	std::vector<float> rowCov;      // [m * m] EMA row covariance
+	std::vector<float> colCov;      // [n * n] EMA column covariance
+	std::vector<float> rowInvSqrt;  // [m * m] inverse sqrt(rowCov + floor I)
+	std::vector<float> colInvSqrt;  // [n * n] inverse sqrt(colCov + floor I)
+	std::vector<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	std::vector<float> scratchMat;  // [max(m*n, max(m*m,n*n))]
+	std::vector<float> scratchAux;  // [max(m*n, max(m*m,n*n))]
+	float lastPredictiveTrust;
+	float lastRowTrace;
+	float lastColTrace;
+	float lastRowCond;
+	float lastColCond;
+	unsigned long long step;
+	bool initialized;
+
+	KronWeightState()
+	    : m(0u), n(0u),
+	      lastPredictiveTrust(0.0f),
+	      lastRowTrace(0.0f), lastColTrace(0.0f),
+	      lastRowCond(1.0f), lastColCond(1.0f),
+	      step(0ULL),
+	      initialized(false)
+	{
+	}
+
+	void reset()
+	{
+		m = 0u;
+		n = 0u;
+		rowCov.clear();
+		colCov.clear();
+		rowInvSqrt.clear();
+		colInvSqrt.clear();
+		prevMhat.clear();
+		scratchMat.clear();
+		scratchAux.clear();
+		lastPredictiveTrust = 0.0f;
+		lastRowTrace = 0.0f;
+		lastColTrace = 0.0f;
+		lastRowCond = 1.0f;
+		lastColCond = 1.0f;
+		step = 0ULL;
+		initialized = false;
+	}
+};
+
+// Selective orthogonalized-momentum state.
+//
+// MUON-lite keeps Adam-style first/second moments outside this state and only
+// stores the previous bias-corrected momentum plus small scratch buffers for
+// the polar-factor computation on eligible matrix blocks.
+struct MuonWeightState
+{
+	unsigned int m;
+	unsigned int n;
+	std::vector<float> prevMhat;     // [m * n] previous bias-corrected first moment
+	std::vector<float> scratchMat;   // [m * n] scratch/output matrix
+	std::vector<float> scratchCore;  // [min(m,n) * min(m,n)] Gram / inverse-sqrt core
+	float lastPredictiveTrust;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+
+	MuonWeightState()
+	    : m(0u), n(0u),
+	      lastPredictiveTrust(0.0f),
+	      lastAspect(1.0f),
+	      lastSignalScale(0.0f),
+	      lastOrthError(0.0f),
+	      lastEligible(false),
+	      step(0ULL),
+	      initialized(false)
+	{
+	}
+
+	void reset()
+	{
+		m = 0u;
+		n = 0u;
+		prevMhat.clear();
+		scratchMat.clear();
+		scratchCore.clear();
+		lastPredictiveTrust = 0.0f;
+		lastAspect = 1.0f;
+		lastSignalScale = 0.0f;
+		lastOrthError = 0.0f;
+		lastEligible = false;
 		step = 0ULL;
 		initialized = false;
 	}
@@ -462,6 +589,8 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 
 // Initialize BiMAP-lite state for a weight matrix of dimensions [m x n].
 void initBiMAPWeightState(BiMAPWeightState& state, unsigned int m, unsigned int n);
+void initKronWeightState(KronWeightState& state, unsigned int m, unsigned int n);
+void initMuonWeightState(MuonWeightState& state, unsigned int m, unsigned int n);
 
 // Refresh subspace basis U via randomized power iteration with EMA blending.
 // grad: [m * n] gradient (row-major), used as the signal for SVD.
@@ -538,6 +667,58 @@ bool bimapUpdate(BiMAPWeightState& state,
                  const ATLASConfig& ac,
                  shmea::GLogger* logger = 0,
                  const char* tag = 0);
+
+bool pactUpdate(BiMAPWeightState& state,
+                float* W, float* m1, float* v2, float* gW,
+                unsigned int m, unsigned int n,
+                float lr,
+                float beta1, float beta2,
+                float inv1mB1t, float inv1mB2t,
+                float eps,
+                float invBatch, float gradScale,
+                float wd1, float wd2,
+                const ATLASConfig& ac,
+                shmea::GLogger* logger = 0,
+                const char* tag = 0);
+
+bool racerUpdate(BiMAPWeightState& state,
+                 float* W, float* m1, float* v2, float* gW,
+                 unsigned int m, unsigned int n,
+                 float lr,
+                 float beta1, float beta2,
+                 float inv1mB1t, float inv1mB2t,
+                 float eps,
+                 float invBatch, float gradScale,
+                 float wd1, float wd2,
+                 const ATLASConfig& ac,
+                 shmea::GLogger* logger = 0,
+                 const char* tag = 0);
+
+bool kronUpdate(KronWeightState& state,
+                float* W, float* m1, float* v2, float* gW,
+                unsigned int m, unsigned int n,
+                float lr,
+                float beta1, float beta2,
+                float inv1mB1t, float inv1mB2t,
+                float eps,
+                float invBatch, float gradScale,
+                float wd1, float wd2,
+                const ATLASConfig& ac,
+                shmea::GLogger* logger = 0,
+                const char* tag = 0);
+
+bool muonUpdate(MuonWeightState& state,
+                float* W, float* m1, float* v2, float* gW,
+                unsigned int m, unsigned int n,
+                float lr,
+                float beta1, float beta2,
+                float inv1mB1t, float inv1mB2t,
+                float eps,
+                float invBatch, float gradScale,
+                float wd1, float wd2,
+                const ATLASConfig& ac,
+                shmea::GLogger* logger = 0,
+                const char* tag = 0);
 
 // Apply vanilla SGD to a 1D bias vector and zero the gradient.
 // Returns false if any bias element becomes non-finite (NaN/Inf).

@@ -383,12 +383,43 @@ struct OptimizerConfig
 	float adamEps;
 	bool adamBiasCorrection;
 
+	// Enable groupwise AdamW modulation. This keeps the exact AdamW update law
+	// but multiplies each parameter group's effective step size by a cheap
+	// scalar derived from group momentum stability, SNR, and update-to-weight
+	// ratio. When false, the optimizer is exact AdamW.
+	bool adamGroupwiseEnabled;
+
+	// Positive multiplier on the groupwise stability/coherence signal.
+	float adamGroupStabilityScale;
+
+	// Positive multiplier on the groupwise signal-to-noise statistic.
+	float adamGroupSnrScale;
+
+	// Positive multiplier on the update-to-weight penalty term.
+	float adamGroupRatioScale;
+
+	// Clamp range for the final groupwise step multiplier.
+	float adamGroupMinScale;
+	float adamGroupMaxScale;
+
+	// Minimum group size required before the groupwise multiplier is allowed to
+	// differ from 1. Small groups (biases, norms, tiny vectors) stay on exact
+	// AdamW.
+	unsigned int adamGroupMinSize;
+
 	OptimizerConfig()
 	    : type(SGD_MOMENTUM),
 	      adamBeta1(0.9f),
 	      adamBeta2(0.999f),
 	      adamEps(1e-8f),
-	      adamBiasCorrection(true)
+	      adamBiasCorrection(true),
+	      adamGroupwiseEnabled(false),
+	      adamGroupStabilityScale(0.05f),
+	      adamGroupSnrScale(0.05f),
+	      adamGroupRatioScale(0.50f),
+	      adamGroupMinScale(0.90f),
+	      adamGroupMaxScale(1.15f),
+	      adamGroupMinSize(256u)
 	{
 	}
 };
@@ -817,6 +848,115 @@ struct ATLASConfig
 	// Number of optimizer steps between BiMAP row/column factor refreshes.
 	unsigned int bimapFactorCadence;
 
+	// Enable PACT: Promoted Adaptive Compressed Tensor-preconditioner. PACT
+	// keeps an exact AdamW fallback and only promotes matrix blocks into a
+	// two-sided blockwise preconditioner when predicted gain clears a compute
+	// penalty proxy.
+	bool pactEnabled;
+
+	// Enable low-rank row/column factors inside the promoted PACT metric. When
+	// false, promoted blocks use only diagonal row/column anisotropy.
+	bool pactLowRankEnabled;
+
+	// Strength of the promoted row/column anisotropy term. 0 reduces promoted
+	// PACT blocks to the exact AdamW fallback.
+	float pactGeometryScale;
+
+	// Strength of the bounded secant-style transport blended into the promoted
+	// block signal before two-sided preconditioning.
+	float pactPredictiveScale;
+
+	// Number of optimizer steps between PACT factor refreshes on promoted
+	// matrix blocks.
+	unsigned int pactFactorCadence;
+
+	// Enable RACER-lite: Risk-Adjusted Compute-Efficient Reconditioner. RACER
+	// keeps exact AdamW fallback and only promotes matrix blocks into a BiMAP-
+	// style two-sided preconditioner when stable-signal reward minus
+	// curvature/noise penalties clears a compute-cost threshold.
+	bool racerEnabled;
+
+	// Strength of RACER-lite's row/column anisotropy term. 0 reduces RACER to
+	// the exact AdamW fallback.
+	float racerGeometryScale;
+
+	// Strength of the bounded secant-style transport blended into RACER's
+	// first-moment signal.
+	float racerPredictiveScale;
+
+	// Number of optimizer steps between RACER row/column factor refreshes.
+	unsigned int racerFactorCadence;
+
+	// Multiplier applied to RACER's residual-noise penalty when comparing the
+	// promoted matrix step against the exact AdamW fallback.
+	float racerRiskScale;
+
+	// Multiplier applied to RACER's analytical optimizer-overhead proxy.
+	float racerCostScale;
+
+	// Promote a block when its EMA'd RACER reward margin rises above this
+	// threshold.
+	float racerPromoteThreshold;
+
+	// Demote a previously promoted block when its EMA'd RACER reward margin
+	// falls below this threshold.
+	float racerDemoteThreshold;
+
+	// Enable KRON: a true blockwise row/column factor preconditioner that keeps
+	// Adam-style moments but replaces the matrix-block update with a two-sided
+	// inverse-square-root factor apply on the current momentum signal.
+	bool kronEnabled;
+
+	// Strength of the KRON two-sided matrix factor apply. 1.0 uses the full
+	// preconditioned step; 0.0 degenerates exactly to the Adam-style fallback.
+	float kronGeometryScale;
+
+	// Strength of the bounded secant-style transport blended into the KRON
+	// block signal before applying row/column inverse-square-root factors.
+	float kronPredictiveScale;
+
+	// Number of optimizer steps between KRON factor refreshes.
+	unsigned int kronFactorCadence;
+
+	// Additive normalized diagonal floor used when forming KRON row/column
+	// inverse-square-root factors from the EMA covariance blocks.
+	float kronDamping;
+
+	// Enable MUON-lite: selective orthogonalized-momentum updates on eligible
+	// matrix blocks with exact AdamW fallback on all other parameters.
+	bool muonEnabled;
+
+	// Blend strength for the orthogonalized-momentum direction. 0 reduces
+	// MUON-lite exactly to the Adam-style fallback.
+	float muonGeometryScale;
+
+	// Strength of the bounded secant-style transport blended into the Adam
+	// first-moment signal before orthogonalization.
+	float muonPredictiveScale;
+
+	// Only apply MUON-lite to matrix blocks whose aspect ratio
+	// max(m, n) / min(m, n) does not exceed this limit.
+	float muonMaxAspect;
+
+	// Minimum block side length required before MUON-lite is allowed to engage.
+	unsigned int muonMinDim;
+
+	// Additive floor used when inverting the small Gram matrix inside the polar
+	// factor computation.
+	float muonDamping;
+
+	// Multiplier applied to PACT's analytical optimizer-overhead proxy when
+	// deciding whether a block should remain promoted.
+	float pactCostScale;
+
+	// Promote a block when its EMA'd predicted-gain margin rises above this
+	// threshold.
+	float pactPromoteThreshold;
+
+	// Demote a previously promoted block when its EMA'd predicted-gain margin
+	// falls below this threshold.
+	float pactDemoteThreshold;
+
 	// Mirror-descent step size used by SEAM when updating its
 	// {spatial, predictive, output} coordinate simplex.
 	float seamMirrorStep;
@@ -1074,6 +1214,33 @@ struct ATLASConfig
 	      bimapGeometryScale(1.0f),
 	      bimapPredictiveScale(0.15f),
 	      bimapFactorCadence(8u),
+	      pactEnabled(false),
+	      pactLowRankEnabled(true),
+	      pactGeometryScale(1.0f),
+	      pactPredictiveScale(0.10f),
+	      pactFactorCadence(8u),
+	      racerEnabled(false),
+	      racerGeometryScale(1.0f),
+	      racerPredictiveScale(0.05f),
+	      racerFactorCadence(8u),
+	      racerRiskScale(0.50f),
+	      racerCostScale(0.0010f),
+	      racerPromoteThreshold(0.0f),
+	      racerDemoteThreshold(-0.0005f),
+	      kronEnabled(false),
+	      kronGeometryScale(1.0f),
+	      kronPredictiveScale(0.05f),
+	      kronFactorCadence(8u),
+	      kronDamping(0.10f),
+	      muonEnabled(false),
+	      muonGeometryScale(1.0f),
+	      muonPredictiveScale(0.05f),
+	      muonMaxAspect(1.50f),
+	      muonMinDim(8u),
+	      muonDamping(0.01f),
+	      pactCostScale(0.0010f),
+	      pactPromoteThreshold(0.0f),
+	      pactDemoteThreshold(-0.0005f),
 	      seamMirrorStep(0.35f),
 	      seamBudgetMax(0.65f),
 	      quasarTemperature(0.60f),

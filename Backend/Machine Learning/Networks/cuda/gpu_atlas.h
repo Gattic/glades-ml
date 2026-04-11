@@ -13,6 +13,7 @@
 #include "../training_config.h"
 #include "../../rng.h"
 #include <cstddef>
+#include <vector>
 
 namespace shmea { class GLogger; }
 
@@ -154,6 +155,154 @@ struct AtlasGpuDiag
 	                  step(0), rightSubspace(false), valid(false) {}
 };
 
+// Lightweight GPU PACT state.
+//
+// This intentionally implements only the PACT-lite path:
+// - AdamW backbone lives in the shared batched Adam kernel
+// - row/column anisotropy is tracked with diagonal second moments
+// - promotion is cadence-gated and host-scored from tiny downloaded summaries
+// - no low-rank factor extraction and no heavy sidecar controller
+struct GpuPactWeightState
+{
+	unsigned int m;
+	unsigned int n;
+
+	GpuBuffer<float> rowSecond;   // [m] EMA row second moments
+	GpuBuffer<float> colSecond;   // [n] EMA col second moments
+	GpuBuffer<float> colScratch;  // [n] raw column g^2 sums for the current refresh
+	GpuBuffer<float> gainScratch; // [2] adamGainSum, precondGainSum
+
+	std::vector<float> hostRowSecond;
+	std::vector<float> hostColSecond;
+	std::vector<float> hostColScratch;
+
+	float rowMean;
+	float colMean;
+	float promotionScore;
+	float lastAdamGain;
+	float lastPrecondGain;
+	float lastCostPenalty;
+	float lastPromotionMargin;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	bool promoted;
+	unsigned long long promotedSteps;
+	unsigned long long step;
+	bool initialized;
+
+	GpuPactWeightState()
+	    : m(0u), n(0u),
+	      rowMean(1.0e-12f), colMean(1.0e-12f),
+	      promotionScore(0.0f),
+	      lastAdamGain(0.0f), lastPrecondGain(0.0f),
+	      lastCostPenalty(0.0f), lastPromotionMargin(0.0f),
+	      lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      promoted(false), promotedSteps(0ULL), step(0ULL),
+	      initialized(false)
+	{
+	}
+};
+
+// Lightweight GPU RACER state.
+//
+// This is the minimal GPU RACER-lite path:
+// - exact AdamW backbone stays in the shared batched Adam kernel
+// - row/column anisotropy is tracked with cadence-gated diagonal statistics
+// - stable-signal and previous-momentum EMAs stay resident on device
+// - promotion is scored from tiny scalar summaries rather than host-side full
+//   matrix reconstruction
+// - all non-promoted blocks degenerate exactly to the AdamW backbone
+struct GpuRacerWeightState
+{
+	unsigned int m;
+	unsigned int n;
+
+	GpuBuffer<float> rowSecond;   // [m] EMA row second moments
+	GpuBuffer<float> colSecond;   // [n] EMA column second moments
+	GpuBuffer<float> colScratch;  // [n] raw column g^2 sums for the current refresh
+	GpuBuffer<float> gainScratch; // [2] adamRewardSum, racerRewardSum
+	GpuBuffer<float> corrScratch; // [4] dot, curNorm, prevNorm, reserved
+	GpuBuffer<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	GpuBuffer<float> stableMhat;  // [m * n] delayed stable-signal EMA
+	GpuBuffer<float> adamStep;    // [m * n] exact AdamW backbone step
+	GpuBuffer<float> racerStep;   // [m * n] promoted RACER step
+
+	std::vector<float> hostRowSecond;
+	std::vector<float> hostColSecond;
+	std::vector<float> hostColScratch;
+
+	float rowMean;
+	float colMean;
+	float promotionScore;
+	float lastAdamGain;
+	float lastPrecondGain;
+	float lastCostPenalty;
+	float lastPromotionMargin;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	bool promoted;
+	unsigned long long promotedSteps;
+	unsigned long long step;
+	bool initialized;
+
+	GpuRacerWeightState()
+	    : m(0u), n(0u),
+	      rowMean(1.0e-12f), colMean(1.0e-12f),
+	      promotionScore(0.0f),
+	      lastAdamGain(0.0f), lastPrecondGain(0.0f),
+	      lastCostPenalty(0.0f), lastPromotionMargin(0.0f),
+	      lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      promoted(false), promotedSteps(0ULL), step(0ULL),
+	      initialized(false)
+	{
+	}
+};
+
+// Lightweight GPU MUON state.
+//
+// This is the device-native MUON-lite path:
+// - AdamW backbone stays in the shared batched Adam kernel
+// - eligible blocks keep all momentum history and orthogonalization scratch
+//   resident on device
+// - the MUON residual is formed on the compute stream with no per-step host
+//   downloads or uploads
+// - all non-eligible blocks degenerate exactly to the AdamW backbone
+struct GpuMuonWeightState
+{
+	unsigned int m;
+	unsigned int n;
+
+	GpuBuffer<float> prevMhat;      // [m * n] previous bias-corrected first moment
+	GpuBuffer<float> adamStep;      // [m * n] current Adam-style step matrix
+	GpuBuffer<float> muonStep;      // [m * n] orthogonalized MUON direction
+	GpuBuffer<float> coreScratch;   // [2 * coreDim * coreDim] Gram + Cholesky scratch
+	GpuBuffer<float> scalarScratch; // [8] dot, curNorm, prevNorm, trust, froSq, signalScale, trace, spare
+
+	float lastPredictiveTrust;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+
+	GpuMuonWeightState()
+	    : m(0u), n(0u),
+	      lastPredictiveTrust(0.0f),
+	      lastAspect(1.0f),
+	      lastSignalScale(0.0f),
+	      lastOrthError(0.0f),
+	      lastEligible(false),
+	      step(0ULL),
+	      initialized(false)
+	{
+	}
+};
+
 // Convenience wrapper: initializes state if needed, then calls atlas_gpu_step.
 // Mirrors the CPU atlas::update() function. Returns true on success.
 bool atlas_gpu_update(GpuAtlasWeightState& state,
@@ -179,6 +328,60 @@ bool atlas_gpu_residual_update(GpuAtlasWeightState& state,
                                glades::rng::Engine& rng,
                                shmea::GLogger* logger = 0,
                                const char* tag = 0);
+
+// GPU PACT-lite residual update on top of an AdamW backbone that has already
+// updated W/m/v for the current step. The function:
+// - refreshes row/column anisotropy statistics on cadence boundaries
+// - scores promotion using predicted gain minus analytical cost
+// - applies only the residual difference from AdamW to the promoted blocks
+// - degenerates exactly to AdamW when promotion is off
+bool pact_gpu_update_lite(GpuPactWeightState& state,
+                          float* d_W, float* d_gW,
+                          float* d_m, float* d_v,
+                          unsigned int m, unsigned int n,
+                          float lr,
+                          float invBatch, float gradScale,
+                          float inv1mB1t, float inv1mB2t,
+                          float wd1, float eps,
+                          const glades::ATLASConfig& ac,
+                          shmea::GLogger* logger = 0,
+                          const char* tag = 0);
+
+// GPU RACER-lite residual update on top of an AdamW backbone that has already
+// updated W/m/v for the current step. The function:
+// - refreshes row/column anisotropy statistics on cadence boundaries
+// - maintains stable and previous momentum estimates resident on device
+// - scores promotion using stable reward minus curvature/noise/cost penalties
+// - applies only the residual difference from AdamW to promoted blocks
+// - degenerates exactly to AdamW when promotion is off
+bool racer_gpu_update_lite(GpuRacerWeightState& state,
+                           float* d_W, float* d_gW,
+                           float* d_m, float* d_v,
+                           unsigned int m, unsigned int n,
+                           float lr,
+                           float invBatch, float gradScale,
+                           float inv1mB1t, float inv1mB2t,
+                           float wd1, float eps,
+                           const glades::ATLASConfig& ac,
+                           shmea::GLogger* logger = 0,
+                           const char* tag = 0);
+
+// GPU MUON-lite residual update on top of an AdamW backbone that has already
+// updated W/m/v for the current step. This path:
+// - keeps previous momentum and scratch resident on device,
+// - computes predictive trust and orthogonalized momentum on the compute stream,
+// - applies only the residual difference from AdamW to eligible blocks,
+// - degenerates exactly to AdamW for ineligible blocks.
+bool muon_gpu_update_lite(GpuMuonWeightState& state,
+                          float* d_W, float* d_gW,
+                          float* d_m, float* d_v,
+                          unsigned int m, unsigned int n,
+                          float lr,
+                          float inv1mB1t, float inv1mB2t,
+                          float eps,
+                          const glades::ATLASConfig& ac,
+                          shmea::GLogger* logger = 0,
+                          const char* tag = 0);
 
 // Retrieve diagnostic info from the current state.
 // Downloads Fisher diagonal from GPU — call sparingly (e.g. every tSub steps).
@@ -264,6 +467,62 @@ struct AtlasGpuDiag
 	AtlasGpuDiag() : valid(false) {}
 };
 
+struct GpuPactWeightState
+{
+	float promotionScore;
+	float lastAdamGain;
+	float lastPrecondGain;
+	float lastCostPenalty;
+	float lastPromotionMargin;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	bool promoted;
+	unsigned long long promotedSteps;
+	unsigned long long step;
+	bool initialized;
+	GpuPactWeightState()
+	    : promotionScore(0.0f), lastAdamGain(0.0f), lastPrecondGain(0.0f),
+	      lastCostPenalty(0.0f), lastPromotionMargin(0.0f), lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      promoted(false), promotedSteps(0ULL), step(0ULL), initialized(false) {}
+};
+
+struct GpuRacerWeightState
+{
+	float promotionScore;
+	float lastAdamGain;
+	float lastPrecondGain;
+	float lastCostPenalty;
+	float lastPromotionMargin;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	bool promoted;
+	unsigned long long promotedSteps;
+	unsigned long long step;
+	bool initialized;
+	GpuRacerWeightState()
+	    : promotionScore(0.0f), lastAdamGain(0.0f), lastPrecondGain(0.0f),
+	      lastCostPenalty(0.0f), lastPromotionMargin(0.0f), lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      promoted(false), promotedSteps(0ULL), step(0ULL), initialized(false) {}
+};
+
+struct GpuMuonWeightState
+{
+	float lastPredictiveTrust;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+	GpuMuonWeightState()
+	    : lastPredictiveTrust(0.0f), lastAspect(1.0f), lastSignalScale(0.0f),
+	      lastOrthError(0.0f), lastEligible(false), step(0ULL), initialized(false) {}
+};
+
 inline bool atlas_gpu_init(GpuAtlasWeightState&, unsigned int, unsigned int,
                            unsigned int, float, glades::rng::Engine&) { return false; }
 inline bool atlas_gpu_step(GpuAtlasWeightState&, float*, float*,
@@ -288,6 +547,27 @@ inline bool atlas_gpu_residual_update(GpuAtlasWeightState&, float*, float*,
                                       glades::rng::Engine&,
                                       shmea::GLogger* = 0,
                                       const char* = 0) { return false; }
+inline bool pact_gpu_update_lite(GpuPactWeightState&, float*, float*, float*, float*,
+                                 unsigned int, unsigned int,
+                                 float, float, float,
+                                 float, float, float, float,
+                                 const glades::ATLASConfig&,
+                                 shmea::GLogger* = 0,
+                                 const char* = 0) { return false; }
+inline bool racer_gpu_update_lite(GpuRacerWeightState&, float*, float*, float*, float*,
+                                  unsigned int, unsigned int,
+                                  float, float, float,
+                                  float, float, float, float,
+                                  const glades::ATLASConfig&,
+                                  shmea::GLogger* = 0,
+                                  const char* = 0) { return false; }
+inline bool muon_gpu_update_lite(GpuMuonWeightState&, float*, float*, float*, float*,
+                                 unsigned int, unsigned int,
+                                 float, float, float,
+                                 float,
+                                 const glades::ATLASConfig&,
+                                 shmea::GLogger* = 0,
+                                 const char* = 0) { return false; }
 inline bool atlas_gpu_guard(float*, size_t) { return false; }
 
 } // namespace gpu

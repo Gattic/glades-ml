@@ -1082,6 +1082,72 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			struct Adam
 			{
 				static float signf(float x) { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); }
+				static float clampf(float x, float lo, float hi)
+				{
+					return (x < lo) ? lo : ((x > hi) ? hi : x);
+				}
+
+				static float compute_group_scale(const std::vector<float>& P,
+				                                const std::vector<float>& m,
+				                                const std::vector<float>& v2,
+				                                const std::vector<float>& gP,
+				                                float beta1,
+				                                float beta2,
+				                                float inv1mB1t,
+				                                float inv1mB2t,
+				                                float eps,
+				                                float invBatch,
+				                                float gradScale,
+				                                float prevStepRms,
+				                                const glades::OptimizerConfig& opt,
+				                                float* outStepRms)
+				{
+					if (!opt.adamGroupwiseEnabled || P.empty() || P.size() < opt.adamGroupMinSize)
+					{
+						if (outStepRms)
+							*outStepRms = prevStepRms;
+						return 1.0f;
+					}
+
+					const float oneMinusB1 = 1.0f - beta1;
+					const float oneMinusB2 = 1.0f - beta2;
+					double stepSqSum = 0.0;
+					double weightSqSum = 0.0;
+					double mHatSqSum = 0.0;
+					double vHatSum = 0.0;
+					for (size_t i = 0; i < P.size(); ++i)
+					{
+						const float g = (gP[i] * invBatch) * gradScale;
+						const float mi = (beta1 * m[i]) + (oneMinusB1 * g);
+						const float vi = (beta2 * v2[i]) + (oneMinusB2 * (g * g));
+						const float mhat = mi * inv1mB1t;
+						const float vhat = vi * inv1mB2t;
+						const float denom = static_cast<float>(sqrt(static_cast<double>(vhat))) + eps;
+						const float step = mhat / denom;
+						stepSqSum += static_cast<double>(step) * step;
+						weightSqSum += static_cast<double>(P[i]) * P[i];
+						mHatSqSum += static_cast<double>(mhat) * mhat;
+						vHatSum += static_cast<double>(vhat);
+					}
+
+					const double invN = 1.0 / static_cast<double>(P.size());
+					const float stepRms = static_cast<float>(sqrt(std::max(0.0, stepSqSum * invN)));
+					if (outStepRms)
+						*outStepRms = stepRms;
+					const float weightRms = static_cast<float>(sqrt(std::max(0.0, weightSqSum * invN)));
+					const float snr = static_cast<float>((mHatSqSum * invN) / ((vHatSum * invN) + eps));
+					const float stability = (prevStepRms > 0.0f)
+					    ? (std::min(stepRms, prevStepRms) / (std::max(stepRms, prevStepRms) + eps))
+					    : 1.0f;
+					const float updateRatio = stepRms / (weightRms + eps);
+					float scale = 1.0f
+					    + (opt.adamGroupStabilityScale * stability)
+					    + (opt.adamGroupSnrScale * log1pf(std::max(snr, 0.0f)))
+					    - (opt.adamGroupRatioScale * updateRatio);
+					if (!is_finite(scale))
+						scale = 1.0f;
+					return clampf(scale, opt.adamGroupMinScale, opt.adamGroupMaxScale);
+				}
 
 				static void update_weight(std::vector<float>& W,
 				                          std::vector<float>& m,
@@ -1653,6 +1719,10 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const unsigned int ff1WidthTT = (ffnKindTT == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFFTT) : dFFTT;
 				const bool geodeEnabled = ac.geodeEnabled;
 				const bool bimapEnabled = ac.bimapEnabled;
+				const bool pactEnabled = ac.pactEnabled;
+				const bool racerEnabled = ac.racerEnabled;
+				const bool kronEnabled = ac.kronEnabled;
+				const bool muonEnabled = ac.muonEnabled;
 				const bool auroraAdamwBackbone = ac.auroraEnabled && ac.auroraAdamwBackbone;
 				const float beta1 = net.trainingConfig.optimizer.adamBeta1;
 				const float beta2 = net.trainingConfig.optimizer.adamBeta2;
@@ -1663,7 +1733,6 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const double b2t = biasCorr ? pow(static_cast<double>(beta2), t) : 0.0;
 				const float inv1mB1t = biasCorr ? static_cast<float>(1.0 / (1.0 - b1t)) : 1.0f;
 				const float inv1mB2t = biasCorr ? static_cast<float>(1.0 / (1.0 - b2t)) : 1.0f;
-
 				// Token embedding (index 0 in LM mode)
 				if (tt.tokenModel)
 				{
@@ -4175,6 +4244,74 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (pactEnabled)
+					{
+						if (!atlas::pactUpdate(tt.pactTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+						                       tt.vocabSize, dmTT, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: PACT tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (racerEnabled)
+					{
+						if (!atlas::racerUpdate(tt.racerTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+						                        tt.vocabSize, dmTT, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: RACER tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (kronEnabled)
+					{
+						if (!atlas::kronUpdate(tt.kronTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+						                       tt.vocabSize, dmTT, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: KRON tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (muonEnabled)
+					{
+						if (!atlas::muonUpdate(tt.muonTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+						                       tt.vocabSize, dmTT, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MUON tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (auroraAdamwBackbone)
 					{
 						Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
@@ -4273,6 +4410,74 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						{
 							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 								"SGDHelper_Transformer: BiMAP WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (pactEnabled)
+					{
+						if (!atlas::pactUpdate(tt.pactWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+						                       dmTT, tt.inputSize, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: PACT WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (racerEnabled)
+					{
+						if (!atlas::racerUpdate(tt.racerWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+						                        dmTT, tt.inputSize, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: RACER WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (kronEnabled)
+					{
+						if (!atlas::kronUpdate(tt.kronWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+						                       dmTT, tt.inputSize, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: KRON WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (muonEnabled)
+					{
+						if (!atlas::muonUpdate(tt.muonWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+						                       dmTT, tt.inputSize, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MUON WIn update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
 						}
@@ -4409,6 +4614,154 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
+					else if (pactEnabled)
+					{
+						if (!atlas::pactUpdate(b.pactWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                       dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
+						    || !atlas::pactUpdate(b.pactWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                          dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
+						    || !atlas::pactUpdate(b.pactWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                          dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
+						    || !atlas::pactUpdate(b.pactWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                          dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
+						    || !atlas::pactUpdate(b.pactW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                          ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
+						    || !atlas::pactUpdate(b.pactW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                          dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: PACT block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (racerEnabled)
+					{
+						if (!atlas::racerUpdate(b.racerWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                        dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
+						    || !atlas::racerUpdate(b.racerWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
+						    || !atlas::racerUpdate(b.racerWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
+						    || !atlas::racerUpdate(b.racerWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                           dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
+						    || !atlas::racerUpdate(b.racerW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                           ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
+						    || !atlas::racerUpdate(b.racerW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                           dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: RACER block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (kronEnabled)
+					{
+						if (!atlas::kronUpdate(b.kronWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                       dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
+						    || !atlas::kronUpdate(b.kronWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                          dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
+						    || !atlas::kronUpdate(b.kronWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                          dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
+						    || !atlas::kronUpdate(b.kronWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                          dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
+						    || !atlas::kronUpdate(b.kronW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                          ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
+						    || !atlas::kronUpdate(b.kronW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                          dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: KRON block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (muonEnabled)
+					{
+						if (!atlas::muonUpdate(b.muonWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                       dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
+						    || !atlas::muonUpdate(b.muonWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                          dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
+						    || !atlas::muonUpdate(b.muonWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                          dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
+						    || !atlas::muonUpdate(b.muonWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                          dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
+						    || !atlas::muonUpdate(b.muonW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                          ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
+						    || !atlas::muonUpdate(b.muonW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                          dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                          invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MUON block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					else if (auroraAdamwBackbone)
 					{
 						Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
@@ -4492,6 +4845,34 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
+					else if (pactEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (racerEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (kronEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (muonEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					else if (auroraAdamwBackbone)
 					{
 						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
@@ -4554,6 +4935,74 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (pactEnabled)
+					{
+						if (!atlas::pactUpdate(tt.pactWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+						                       outSize, dmTT, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: PACT WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (racerEnabled)
+					{
+						if (!atlas::racerUpdate(tt.racerWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+						                        outSize, dmTT, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: RACER WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (kronEnabled)
+					{
+						if (!atlas::kronUpdate(tt.kronWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+						                       outSize, dmTT, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: KRON WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (muonEnabled)
+					{
+						if (!atlas::muonUpdate(tt.muonWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+						                       outSize, dmTT, lr,
+						                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                       invBatch, gradScale, wd1, wd2,
+						                       ac, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MUON WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (auroraAdamwBackbone)
 					{
 						Adam::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
@@ -4602,6 +5051,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const float beta2 = net.trainingConfig.optimizer.adamBeta2;
 				const float eps = net.trainingConfig.optimizer.adamEps;
 				const bool biasCorr = net.trainingConfig.optimizer.adamBiasCorrection;
+				const glades::OptimizerConfig& opt = net.trainingConfig.optimizer;
 
 				tt.optimizerStep += 1ULL;
 				const double t = static_cast<double>(tt.optimizerStep);
@@ -4609,77 +5059,148 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const double b2t = biasCorr ? pow(static_cast<double>(beta2), t) : 0.0;
 				const float inv1mB1t = biasCorr ? static_cast<float>(1.0 / (1.0 - b1t)) : 1.0f;
 				const float inv1mB2t = biasCorr ? static_cast<float>(1.0 / (1.0 - b2t)) : 1.0f;
+				struct AdamGroupScaleCursor
+				{
+					TensorTransformerState& tt;
+					const glades::OptimizerConfig& opt;
+					float beta1;
+					float beta2;
+					float inv1mB1t;
+					float inv1mB2t;
+					float eps;
+					float invBatch;
+					float gradScale;
+					size_t index;
+
+					AdamGroupScaleCursor(TensorTransformerState& state,
+					                     const glades::OptimizerConfig& optimizer,
+					                     float beta1_,
+					                     float beta2_,
+					                     float inv1mB1t_,
+					                     float inv1mB2t_,
+					                     float eps_,
+					                     float invBatch_,
+					                     float gradScale_)
+					    : tt(state),
+					      opt(optimizer),
+					      beta1(beta1_),
+					      beta2(beta2_),
+					      inv1mB1t(inv1mB1t_),
+					      inv1mB2t(inv1mB2t_),
+					      eps(eps_),
+					      invBatch(invBatch_),
+					      gradScale(gradScale_),
+					      index(0u)
+					{
+					}
+
+					void ensure_slot(size_t idx)
+					{
+						if (tt.adamGroupPrevStepRms.size() <= idx)
+						{
+							tt.adamGroupPrevStepRms.resize(idx + 1u, 0.0f);
+							tt.adamGroupLastScale.resize(idx + 1u, 1.0f);
+						}
+					}
+
+					float next(const std::vector<float>& P,
+					           const std::vector<float>& m,
+					           const std::vector<float>& v2,
+					           const std::vector<float>& gP)
+					{
+						const size_t idx = index++;
+						ensure_slot(idx);
+						float nextStepRms = tt.adamGroupPrevStepRms[idx];
+						const float scale = Adam::compute_group_scale(
+						    P, m, v2, gP,
+						    beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						    invBatch, gradScale,
+						    tt.adamGroupPrevStepRms[idx],
+						    opt, &nextStepRms);
+						tt.adamGroupPrevStepRms[idx] = nextStepRms;
+						tt.adamGroupLastScale[idx] = scale;
+						return scale;
+					}
+				};
+				AdamGroupScaleCursor groupScaleCursor(
+				    tt, opt, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 
 				// Token embedding (index 0 in LM mode)
 				if (tt.tokenModel)
 				{
-					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
+					const float lrBase = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
+					const float tokScale = groupScaleCursor.next(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE);
+					const float biasScale = groupScaleCursor.next(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias);
 					Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
-					                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					                    lrBase * tokScale, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
 					Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
-					                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					                   lrBase * biasScale, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 				}
 
 				// Input projection (index 0)
 				{
-					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
+					const float lrBase = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(0u);
 					const float wd2 = net.skeleton->getWeightDecay2(0u);
+					const float weightScale = groupScaleCursor.next(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn);
+					const float biasScale = groupScaleCursor.next(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn);
 					Adam::update_weight(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn,
-					                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					                    lrBase * weightScale, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
 					Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
-					                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					                   lrBase * biasScale, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 				}
 
 				// Blocks (index 1..nLayers)
 				for (unsigned int li = 0; li < nLayers; ++li)
 				{
 					const unsigned int idx = li + 1u;
-					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
+					const float lrBase = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
 					TensorTransformerState::Block& b = tt.blocks[li];
 
-					Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
-					Adam::update_weight(b.Wk, b.vWk, b.v2Wk, b.gWk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
-					Adam::update_weight(b.Wv, b.vWv, b.v2Wv, b.gWv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
-					Adam::update_weight(b.Wo, b.vWo, b.v2Wo, b.gWo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
-					Adam::update_weight(b.W1, b.vW1, b.v2W1, b.gW1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
-					Adam::update_weight(b.W2, b.vW2, b.v2W2, b.gW2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lrBase * groupScaleCursor.next(b.Wq, b.vWq, b.v2Wq, b.gWq), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					Adam::update_weight(b.Wk, b.vWk, b.v2Wk, b.gWk, lrBase * groupScaleCursor.next(b.Wk, b.vWk, b.v2Wk, b.gWk), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					Adam::update_weight(b.Wv, b.vWv, b.v2Wv, b.gWv, lrBase * groupScaleCursor.next(b.Wv, b.vWv, b.v2Wv, b.gWv), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					Adam::update_weight(b.Wo, b.vWo, b.v2Wo, b.gWo, lrBase * groupScaleCursor.next(b.Wo, b.vWo, b.v2Wo, b.gWo), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					Adam::update_weight(b.W1, b.vW1, b.v2W1, b.gW1, lrBase * groupScaleCursor.next(b.W1, b.vW1, b.v2W1, b.gW1), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					Adam::update_weight(b.W2, b.vW2, b.v2W2, b.gW2, lrBase * groupScaleCursor.next(b.W2, b.vW2, b.v2W2, b.gW2), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
 
 					// Biases + LN params (no weight decay)
-					Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lrBase * groupScaleCursor.next(b.bq, b.mBq, b.v2Bq, b.gBq), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lrBase * groupScaleCursor.next(b.bk, b.mBk, b.v2Bk, b.gBk), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lrBase * groupScaleCursor.next(b.bv, b.mBv, b.v2Bv, b.gBv), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lrBase * groupScaleCursor.next(b.bo, b.mBo, b.v2Bo, b.gBo), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lrBase * groupScaleCursor.next(b.b1, b.mB1, b.v2B1, b.gB1), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lrBase * groupScaleCursor.next(b.b2, b.mB2, b.v2B2, b.gB2), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lrBase * groupScaleCursor.next(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lrBase * groupScaleCursor.next(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lrBase * groupScaleCursor.next(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lrBase * groupScaleCursor.next(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 				}
 
 				// Final LayerNorm (use block 0 LR; no weight decay)
 				{
-					const float lr = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
-					Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
-					Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					const float lrBase = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
+					Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma, lrBase * groupScaleCursor.next(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta, lrBase * groupScaleCursor.next(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta), beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 				}
 
 				// Output projection (index nLayers) is unused in token LM tied-head mode.
 				if (!tokenLMTiedHead)
 				{
 					const unsigned int idx = nLayers;
-					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
+					const float lrBase = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
 					const float wd1 = net.skeleton->getWeightDecay1(idx);
 					const float wd2 = net.skeleton->getWeightDecay2(idx);
+					const float weightScale = groupScaleCursor.next(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut);
+					const float biasScale = groupScaleCursor.next(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut);
 					Adam::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
-					                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+					                    lrBase * weightScale, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
 					Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
-					                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					                   lrBase * biasScale, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 				}
 				else
 				{
@@ -4974,20 +5495,6 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	// Accumulate mean NLL over non-pad tokens (natural log).
 	double tokenLmNllSum = 0.0;
 	unsigned long long tokenLmTokenCount = 0ULL;
-	if (trainingConfig.transformer.captureOptimizerGapDiagnostics)
-	{
-		tt.gapApplyCount = 0ULL;
-		tt.gapInputUpdateNormSum = 0.0;
-		tt.gapBlockUpdateNormSums.assign(nLayers, 0.0);
-		tt.gapFinalNormUpdateNormSum = 0.0;
-		tt.gapHeadUpdateNormSum = 0.0;
-		tt.gapHeadShareSum = 0.0;
-		tt.gapNonHeadShareSum = 0.0;
-		tt.gapApplyNsSum = 0.0;
-		tt.gapMarginSnapshotCount = 0ULL;
-		tt.gapTargetMarginSum = 0.0;
-		tt.gapHardNegativeLogitSum = 0.0;
-	}
 
 	unsigned long long tokensProcessed = 0ULL;
 	unsigned long long targetsProcessed = 0ULL; // token LM: non-pad targets; else: timesteps
@@ -5151,6 +5658,21 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	                              clsCorrect, clsTotal, logger))
 		return; // GPU path complete; skip CPU fallback.
 #endif // GLADES_HAVE_CUDA
+
+	if (trainingConfig.transformer.captureOptimizerGapDiagnostics)
+	{
+		tt.gapApplyCount = 0ULL;
+		tt.gapInputUpdateNormSum = 0.0;
+		tt.gapBlockUpdateNormSums.assign(nLayers, 0.0);
+		tt.gapFinalNormUpdateNormSum = 0.0;
+		tt.gapHeadUpdateNormSum = 0.0;
+		tt.gapHeadShareSum = 0.0;
+		tt.gapNonHeadShareSum = 0.0;
+		tt.gapApplyNsSum = 0.0;
+		tt.gapMarginSnapshotCount = 0ULL;
+		tt.gapTargetMarginSum = 0.0;
+		tt.gapHardNegativeLogitSum = 0.0;
+	}
 
 	// Build shuffled sequence order. When DDP is active, each rank uses a different
 	// seed so workers process sequences in different orders (reducing correlation).
@@ -7183,7 +7705,9 @@ bool glades::NNetwork::tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg,
 	if (!trainingConfig.gpu.enable || !cfg.isTrain)
 		return false;
 	if (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS
-	    && (trainingConfig.atlas.helmEnabled || trainingConfig.atlas.bimapEnabled))
+	    && (trainingConfig.atlas.helmEnabled
+	        || trainingConfig.atlas.bimapEnabled
+	        || trainingConfig.atlas.kronEnabled))
 		return false;
 
 	const bool gpuReady = ensureGpuState();
@@ -8202,8 +8726,13 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 			const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 			const bool gpuUseGeode = gpuUseAtlas && trainingConfig.atlas.geodeEnabled;
+			const bool gpuUsePact = gpuUseAtlas && trainingConfig.atlas.pactEnabled;
+			const bool gpuUseRacer = gpuUseAtlas && trainingConfig.atlas.racerEnabled;
+			const bool gpuUseMuon = gpuUseAtlas && trainingConfig.atlas.muonEnabled;
+			const bool gpuUseGroupAdam =
+			    (!gpuUseAtlas) && trainingConfig.optimizer.adamGroupwiseEnabled;
 
-			if (gpuUseAtlas && !gpuUseGeode)
+			if (gpuUseAtlas && !gpuUseGeode && !gpuUsePact && !gpuUseRacer && !gpuUseMuon)
 			{
 			// === GPU ATLAS optimizer ===
 			// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
@@ -8372,10 +8901,17 @@ if (ad_.valid) { \
 			else
 			{
 			// === Batched Adam optimizer ===
+			const glades::ATLASConfig& ac = trainingConfig.atlas;
 			const float beta1 = trainingConfig.optimizer.adamBeta1;
 			const float beta2 = trainingConfig.optimizer.adamBeta2;
 			const float adamEps = trainingConfig.optimizer.adamEps;
 			const int stepInt = static_cast<int>(tensorTransformer.optimizerStep);
+			const double b1t = std::pow(static_cast<double>(beta1),
+			                            static_cast<double>(tensorTransformer.optimizerStep));
+			const double b2t = std::pow(static_cast<double>(beta2),
+			                            static_cast<double>(tensorTransformer.optimizerStep));
+			const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
+			const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
 
 			// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
 			if (!gpuTransformerWeights->adamPtrsUploaded)
@@ -8536,10 +9072,32 @@ if ((sz) > maxSz) maxSz = (sz); \
 				{
 					gpu::perfRecordBytesH2D(&gpuPerf->counters, static_cast<size_t>(2 * gc) * sizeof(float));
 					gpu::perfRecordSync(&gpuPerf->counters, 1u);
-					gpu::perfRecordKernel(&gpuPerf->counters, 1u);
+					gpu::perfRecordKernel(&gpuPerf->counters, gpuUseGroupAdam ? 2u : 1u);
 				}
 				gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 				gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
+
+				const float* dAdamGroupScales = NULL;
+				if (gpuUseGroupAdam)
+				{
+					gpu::adam_group_scale_batch(
+					    gpuTransformerWeights->d_adamParams,
+					    gpuTransformerWeights->d_adamGrads,
+					    gpuTransformerWeights->d_adamM,
+					    gpuTransformerWeights->d_adamV,
+					    gpuTransformerWeights->d_adamGroupScales,
+					    gpuTransformerWeights->d_adamGroupPrevStepRms,
+					    gpuTransformerWeights->d_adamSizes,
+					    beta1, beta2, adamEps,
+					    invBatch * gradScale, stepInt, gc,
+					    trainingConfig.optimizer.adamGroupMinSize,
+					    trainingConfig.optimizer.adamGroupStabilityScale,
+					    trainingConfig.optimizer.adamGroupSnrScale,
+					    trainingConfig.optimizer.adamGroupRatioScale,
+					    trainingConfig.optimizer.adamGroupMinScale,
+					    trainingConfig.optimizer.adamGroupMaxScale);
+					dAdamGroupScales = gpuTransformerWeights->d_adamGroupScales;
+				}
 
 				gpu::adam_update_batch(
 				    gpuTransformerWeights->d_adamParams,
@@ -8548,6 +9106,7 @@ if ((sz) > maxSz) maxSz = (sz); \
 				    gpuTransformerWeights->d_adamV,
 				    gpuTransformerWeights->d_adamLr,
 				    gpuTransformerWeights->d_adamWd,
+				    dAdamGroupScales,
 				    gpuTransformerWeights->d_adamSizes,
 				    gpuTransformerWeights->adamMaxSize,
 				    beta1, beta2, adamEps,
@@ -8555,7 +9114,6 @@ if ((sz) > maxSz) maxSz = (sz); \
 			}
 				if (gpuUseGeode)
 				{
-					const glades::ATLASConfig& ac = trainingConfig.atlas;
 					glades::ATLASConfig geodeAc = ac;
 					geodeAc.complementRank = 0u;
 					geodeAc.complementLrScale = 0.0f;
@@ -8633,6 +9191,230 @@ if ((sz) > maxSz) maxSz = (sz); \
 					{
 						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 						    "SGDHelper_TRANSFORMER: GPU GEODE residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+				if (gpuUsePact)
+				{
+					bool gpuPactError = false;
+
+#define GLADES_GPU_PACT_WEIGHT(state_, param_, grad_, m1_, v2_, rows_, cols_, lr_, wd1_, tag_) do { \
+	if (!gpuPactError && (param_).size() > 0u) { \
+		if (!gpu::pact_gpu_update_lite((state_), (param_).data(), (grad_).data(), \
+		                               (m1_).data(), (v2_).data(), \
+		                               (rows_), (cols_), (lr_), invBatch, gradScale, \
+		                               inv1mB1t, inv1mB2t, (wd1_), adamEps, \
+		                               ac, getLogger(), (tag_))) \
+			gpuPactError = true; \
+	} \
+} while (0)
+
+					if (tokenLM)
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_0 = skeleton->getWeightDecay1(0u);
+						GLADES_GPU_PACT_WEIGHT(gpuTransformerWeights->pactTokE,
+						                       gpuTransformerWeights->tokE,
+						                       gpuTransformerWeights->gTokE,
+						                       gpuTransformerWeights->vTokE,
+						                       gpuTransformerWeights->v2TokE,
+						                       vocabSize, dModel, lr0, wd1_0, "tr.tokE");
+					}
+					else
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_0 = skeleton->getWeightDecay1(0u);
+						GLADES_GPU_PACT_WEIGHT(gpuTransformerWeights->pactWIn,
+						                       gpuTransformerWeights->WIn,
+						                       gpuTransformerWeights->gWIn,
+						                       gpuTransformerWeights->vWIn,
+						                       gpuTransformerWeights->v2WIn,
+						                       dModel, inputSize, lr0, wd1_0, "tr.WIn");
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_l = skeleton->getWeightDecay1(bli + 1u);
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						GLADES_GPU_PACT_WEIGHT(gb.pactWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq, dModel, dModel, lr_l, wd1_l, "tr.Wq");
+						GLADES_GPU_PACT_WEIGHT(gb.pactWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk, dModelKV, dModel, lr_l, wd1_l, "tr.Wk");
+						GLADES_GPU_PACT_WEIGHT(gb.pactWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv, dModelKV, dModel, lr_l, wd1_l, "tr.Wv");
+						GLADES_GPU_PACT_WEIGHT(gb.pactWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo, dModel, dModel, lr_l, wd1_l, "tr.Wo");
+						GLADES_GPU_PACT_WEIGHT(gb.pactW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1, ff1Width, dModel, lr_l, wd1_l, "tr.W1");
+						GLADES_GPU_PACT_WEIGHT(gb.pactW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2, dModel, dFF, lr_l, wd1_l, "tr.W2");
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO =
+						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_o = skeleton->getWeightDecay1(nLayers);
+						GLADES_GPU_PACT_WEIGHT(gpuTransformerWeights->pactWOut,
+						                       gpuTransformerWeights->WOut,
+						                       gpuTransformerWeights->gWOut,
+						                       gpuTransformerWeights->vWOut,
+						                       gpuTransformerWeights->v2WOut,
+						                       outSize, dModel, lrO, wd1_o, "tr.WOut");
+					}
+
+#undef GLADES_GPU_PACT_WEIGHT
+
+					if (gpuPactError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU PACT-lite residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+				if (gpuUseRacer)
+				{
+					bool gpuRacerError = false;
+
+#define GLADES_GPU_RACER_WEIGHT(state_, param_, grad_, m1_, v2_, rows_, cols_, lr_, wd1_, tag_) do { \
+	if (!gpuRacerError && (param_).size() > 0u) { \
+		if (!gpu::racer_gpu_update_lite((state_), (param_).data(), (grad_).data(), \
+		                                (m1_).data(), (v2_).data(), \
+		                                (rows_), (cols_), (lr_), invBatch, gradScale, \
+		                                inv1mB1t, inv1mB2t, (wd1_), adamEps, \
+		                                ac, getLogger(), (tag_))) \
+			gpuRacerError = true; \
+	} \
+} while (0)
+
+					if (tokenLM)
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_0 = skeleton->getWeightDecay1(0u);
+						GLADES_GPU_RACER_WEIGHT(gpuTransformerWeights->racerTokE,
+						                        gpuTransformerWeights->tokE,
+						                        gpuTransformerWeights->gTokE,
+						                        gpuTransformerWeights->vTokE,
+						                        gpuTransformerWeights->v2TokE,
+						                        vocabSize, dModel, lr0, wd1_0, "tr.tokE");
+					}
+					else
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_0 = skeleton->getWeightDecay1(0u);
+						GLADES_GPU_RACER_WEIGHT(gpuTransformerWeights->racerWIn,
+						                        gpuTransformerWeights->WIn,
+						                        gpuTransformerWeights->gWIn,
+						                        gpuTransformerWeights->vWIn,
+						                        gpuTransformerWeights->v2WIn,
+						                        dModel, inputSize, lr0, wd1_0, "tr.WIn");
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_l = skeleton->getWeightDecay1(bli + 1u);
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						GLADES_GPU_RACER_WEIGHT(gb.racerWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq, dModel, dModel, lr_l, wd1_l, "tr.Wq");
+						GLADES_GPU_RACER_WEIGHT(gb.racerWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk, dModelKV, dModel, lr_l, wd1_l, "tr.Wk");
+						GLADES_GPU_RACER_WEIGHT(gb.racerWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv, dModelKV, dModel, lr_l, wd1_l, "tr.Wv");
+						GLADES_GPU_RACER_WEIGHT(gb.racerWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo, dModel, dModel, lr_l, wd1_l, "tr.Wo");
+						GLADES_GPU_RACER_WEIGHT(gb.racerW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1, ff1Width, dModel, lr_l, wd1_l, "tr.W1");
+						GLADES_GPU_RACER_WEIGHT(gb.racerW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2, dModel, dFF, lr_l, wd1_l, "tr.W2");
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO =
+						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float wd1_o = skeleton->getWeightDecay1(nLayers);
+						GLADES_GPU_RACER_WEIGHT(gpuTransformerWeights->racerWOut,
+						                        gpuTransformerWeights->WOut,
+						                        gpuTransformerWeights->gWOut,
+						                        gpuTransformerWeights->vWOut,
+						                        gpuTransformerWeights->v2WOut,
+						                        outSize, dModel, lrO, wd1_o, "tr.WOut");
+					}
+
+#undef GLADES_GPU_RACER_WEIGHT
+
+					if (gpuRacerError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU RACER-lite residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+				if (gpuUseMuon)
+				{
+					bool gpuMuonError = false;
+
+#define GLADES_GPU_MUON_WEIGHT(state_, param_, grad_, m1_, v2_, rows_, cols_, lr_, tag_) do { \
+	if (!gpuMuonError && (param_).size() > 0u) { \
+		if (!gpu::muon_gpu_update_lite((state_), (param_).data(), (grad_).data(), \
+		                               (m1_).data(), (v2_).data(), \
+		                               (rows_), (cols_), (lr_), \
+		                               inv1mB1t, inv1mB2t, adamEps, \
+		                               ac, getLogger(), (tag_))) \
+			gpuMuonError = true; \
+	} \
+} while (0)
+
+					if (tokenLM)
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_MUON_WEIGHT(gpuTransformerWeights->muonTokE,
+						                       gpuTransformerWeights->tokE,
+						                       gpuTransformerWeights->gTokE,
+						                       gpuTransformerWeights->vTokE,
+						                       gpuTransformerWeights->v2TokE,
+						                       vocabSize, dModel, lr0, "tr.tokE");
+					}
+					else
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_MUON_WEIGHT(gpuTransformerWeights->muonWIn,
+						                       gpuTransformerWeights->WIn,
+						                       gpuTransformerWeights->gWIn,
+						                       gpuTransformerWeights->vWIn,
+						                       gpuTransformerWeights->v2WIn,
+						                       dModel, inputSize, lr0, "tr.WIn");
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						GLADES_GPU_MUON_WEIGHT(gb.muonWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq, dModel, dModel, lr_l, "tr.Wq");
+						GLADES_GPU_MUON_WEIGHT(gb.muonWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk, dModelKV, dModel, lr_l, "tr.Wk");
+						GLADES_GPU_MUON_WEIGHT(gb.muonWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv, dModelKV, dModel, lr_l, "tr.Wv");
+						GLADES_GPU_MUON_WEIGHT(gb.muonWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo, dModel, dModel, lr_l, "tr.Wo");
+						GLADES_GPU_MUON_WEIGHT(gb.muonW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1, ff1Width, dModel, lr_l, "tr.W1");
+						GLADES_GPU_MUON_WEIGHT(gb.muonW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2, dModel, dFF, lr_l, "tr.W2");
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO =
+						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_MUON_WEIGHT(gpuTransformerWeights->muonWOut,
+						                       gpuTransformerWeights->WOut,
+						                       gpuTransformerWeights->gWOut,
+						                       gpuTransformerWeights->vWOut,
+						                       gpuTransformerWeights->v2WOut,
+						                       outSize, dModel, lrO, "tr.WOut");
+					}
+
+#undef GLADES_GPU_MUON_WEIGHT
+
+					if (gpuMuonError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU MUON-lite residual update failed");
 						storeRunningFlag(false);
 					}
 				}

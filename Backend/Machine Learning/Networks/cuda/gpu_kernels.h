@@ -134,6 +134,16 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
                  float weightDecay, float gradScale, int step, int n);
 
+bool adam_group_scale_batch(float** d_params, float** d_grads,
+                            float** d_ms, float** d_vs,
+                            float* d_groupScales, float* d_groupPrevStepRms,
+                            const int* d_sizes,
+                            float beta1, float beta2, float eps,
+                            float gradScale, int step, int groupCount,
+                            unsigned int minGroupSize,
+                            float stabilityScale, float snrScale, float ratioScale,
+                            float minScale, float maxScale);
+
 // Batched Adam: process all parameter groups in a single kernel launch.
 // d_params/d_grads/d_ms/d_vs are device arrays of groupCount pointers.
 // d_lrs/d_wds are device arrays of groupCount floats (per-group lr/wd).
@@ -142,6 +152,7 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 bool adam_update_batch(float** d_params, float** d_grads,
                        float** d_ms, float** d_vs,
                        const float* d_lrs, const float* d_wds,
+                       const float* d_stepScales,
                        const int* d_sizes, int maxSize,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount);
