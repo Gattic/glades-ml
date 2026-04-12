@@ -55,6 +55,127 @@ static double monotonic_elapsed_ns(const timespec& start, const timespec& end)
 	return sec + nsec;
 }
 
+static bool bimap_scope_uses_head(const glades::ATLASConfig& ac)
+{
+	return ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_ALL
+	    || ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_HEAD_ONLY
+	    || ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_LATE_HEAD;
+}
+
+static bool bimap_scope_uses_late_block(const glades::ATLASConfig& ac)
+{
+	return ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_ALL
+	    || ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_LATE_ONLY
+	    || ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_LATE_HEAD;
+}
+
+static bool bimap_scope_uses_input_block(const glades::ATLASConfig& ac)
+{
+	return ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_ALL;
+}
+
+static bool bimap_scope_uses_decoder_block(const glades::ATLASConfig& ac,
+                                           unsigned int blockIndex,
+                                           unsigned int layerCount)
+{
+	if (!bimap_scope_uses_late_block(ac))
+		return false;
+	if (ac.bimapScope == glades::ATLASConfig::BIMAP_SCOPE_ALL)
+		return true;
+	if (layerCount == 0u)
+		return false;
+	return blockIndex + 1u == layerCount;
+}
+
+static bool echo_scope_large_matrix(unsigned int rows, unsigned int cols)
+{
+	return static_cast<unsigned long long>(rows) * static_cast<unsigned long long>(cols) >= 4096ULL;
+}
+
+static bool echo_scope_uses_head_matrix(const glades::ATLASConfig& ac,
+                                        unsigned int rows,
+                                        unsigned int cols)
+{
+	switch (ac.echoScope)
+	{
+	case glades::ATLASConfig::ECHO_SCOPE_ALL:
+	case glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD:
+		return true;
+	case glades::ATLASConfig::ECHO_SCOPE_LARGE_ONLY:
+	case glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD_LARGE:
+		return echo_scope_large_matrix(rows, cols);
+	default:
+		return false;
+	}
+}
+
+static bool echo_scope_uses_input_matrix(const glades::ATLASConfig& ac,
+                                         unsigned int rows,
+                                         unsigned int cols)
+{
+	switch (ac.echoScope)
+	{
+	case glades::ATLASConfig::ECHO_SCOPE_ALL:
+		return true;
+	case glades::ATLASConfig::ECHO_SCOPE_LARGE_ONLY:
+		return echo_scope_large_matrix(rows, cols);
+	default:
+		return false;
+	}
+}
+
+static bool echo_scope_uses_decoder_matrix(const glades::ATLASConfig& ac,
+                                           unsigned int blockIndex,
+                                           unsigned int layerCount,
+                                           unsigned int rows,
+                                           unsigned int cols)
+{
+	switch (ac.echoScope)
+	{
+	case glades::ATLASConfig::ECHO_SCOPE_ALL:
+		return true;
+	case glades::ATLASConfig::ECHO_SCOPE_LARGE_ONLY:
+		return echo_scope_large_matrix(rows, cols);
+	case glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD:
+		return (layerCount > 0u) && (blockIndex + 1u == layerCount);
+	case glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD_LARGE:
+		return (layerCount > 0u) && (blockIndex + 1u == layerCount)
+		    && echo_scope_large_matrix(rows, cols);
+	default:
+		return false;
+	}
+}
+
+static bool observe_echo_cpu(glades::atlas::EchoWeightState& state,
+                             const float* rowObs,
+                             const float* colObs,
+                             unsigned int samples,
+                             unsigned int rows,
+                             unsigned int cols,
+                             const glades::ATLASConfig& ac,
+                             bool enabled)
+{
+	if (!ac.echoEnabled || !enabled)
+		return true;
+	return glades::atlas::echoObserve(state, rowObs, colObs, samples, rows, cols, ac);
+}
+
+#ifdef GLADES_HAVE_CUDA
+static bool observe_echo_gpu(glades::gpu::GpuEchoWeightState& state,
+                             const float* d_rowObs,
+                             const float* d_colObs,
+                             unsigned int samples,
+                             unsigned int rows,
+                             unsigned int cols,
+                             const glades::ATLASConfig& ac,
+                             bool enabled)
+{
+	if (!ac.echoEnabled || !enabled)
+		return true;
+	return glades::gpu::echo_gpu_observe(state, d_rowObs, d_colObs, samples, rows, cols, ac);
+}
+#endif
+
 static bool invert_small_dense_row_major(const std::vector<float>& matrix,
                                          unsigned int dim,
                                          float ridge,
@@ -1718,6 +1839,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const unsigned int ffnKindTT = tt.ffnKind;
 				const unsigned int ff1WidthTT = (ffnKindTT == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFFTT) : dFFTT;
 				const bool geodeEnabled = ac.geodeEnabled;
+				const bool echoEnabled = ac.echoEnabled;
 				const bool bimapEnabled = ac.bimapEnabled;
 				const bool pactEnabled = ac.pactEnabled;
 				const bool racerEnabled = ac.racerEnabled;
@@ -1733,6 +1855,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const double b2t = biasCorr ? pow(static_cast<double>(beta2), t) : 0.0;
 				const float inv1mB1t = biasCorr ? static_cast<float>(1.0 / (1.0 - b1t)) : 1.0f;
 				const float inv1mB2t = biasCorr ? static_cast<float>(1.0 / (1.0 - b2t)) : 1.0f;
+
 				// Token embedding (index 0 in LM mode)
 				if (tt.tokenModel)
 				{
@@ -4227,19 +4350,53 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (echoEnabled)
+					{
+						const bool useEchoTokE = echo_scope_uses_head_matrix(ac, tt.vocabSize, dmTT);
+						if (useEchoTokE)
+						{
+							if (!atlas::echoUpdate(tt.echoTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+							                       tt.vocabSize, dmTT, lr,
+							                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                       invBatch, gradScale, wd1, wd2,
+							                       tt.optimizerStep,
+							                       ac, net.getLogger(), "tr.tokE"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: ECHO tokE update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
+						}
+						else
+							Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (bimapEnabled)
 					{
-						if (!atlas::bimapUpdate(tt.bimapTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
-						                        tt.vocabSize, dmTT, lr,
-						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                        invBatch, gradScale, wd1, wd2,
-						                        ac, net.getLogger(), "tr.tokE"))
+						const bool useBiMAPTokE = bimap_scope_uses_head(ac);
+						if (useBiMAPTokE)
 						{
-							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-								"SGDHelper_Transformer: BiMAP tokE update entered NaN recovery");
-							net.storeRunningFlag(false);
-							return false;
+							if (!atlas::bimapUpdate(tt.bimapTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+							                        tt.vocabSize, dmTT, lr,
+							                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                        invBatch, gradScale, wd1, wd2,
+							                        ac, net.getLogger(), "tr.tokE"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: BiMAP tokE update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
 						}
+						else
+							Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
 						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
@@ -4400,19 +4557,53 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (echoEnabled)
+					{
+						const bool useEchoWIn = echo_scope_uses_input_matrix(ac, dmTT, tt.inputSize);
+						if (useEchoWIn)
+						{
+							if (!atlas::echoUpdate(tt.echoWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+							                       dmTT, tt.inputSize, lr,
+							                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                       invBatch, gradScale, wd1, wd2,
+							                       tt.optimizerStep,
+							                       ac, net.getLogger(), "tr.WIn"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: ECHO WIn update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
+						}
+						else
+							Adam::update_weight(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (bimapEnabled)
 					{
-						if (!atlas::bimapUpdate(tt.bimapWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
-						                        dmTT, tt.inputSize, lr,
-						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                        invBatch, gradScale, wd1, wd2,
-						                        ac, net.getLogger(), "tr.WIn"))
+						const bool useBiMAPWIn = bimap_scope_uses_input_block(ac);
+						if (useBiMAPWIn)
 						{
-							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-								"SGDHelper_Transformer: BiMAP WIn update entered NaN recovery");
-							net.storeRunningFlag(false);
-							return false;
+							if (!atlas::bimapUpdate(tt.bimapWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+							                        dmTT, tt.inputSize, lr,
+							                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                        invBatch, gradScale, wd1, wd2,
+							                        ac, net.getLogger(), "tr.WIn"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: BiMAP WIn update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
 						}
+						else
+							Adam::update_weight(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
 						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
@@ -4577,31 +4768,99 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
-					else if (bimapEnabled)
+					else if (echoEnabled)
 					{
-						if (!atlas::bimapUpdate(b.bimapWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
-						                        dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                        invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
-						    || !atlas::bimapUpdate(b.bimapWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
-						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
-						    || !atlas::bimapUpdate(b.bimapWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
-						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
-						    || !atlas::bimapUpdate(b.bimapWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
-						                           dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
-						    || !atlas::bimapUpdate(b.bimapW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
-						                           ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
-						    || !atlas::bimapUpdate(b.bimapW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
-						                           dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+						if ((echo_scope_uses_decoder_matrix(ac, li, nLayers, dmTT, dmTT)
+						      && !atlas::echoUpdate(b.echoWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                            dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                            invBatch, gradScale, wd1, wd2, tt.optimizerStep, ac, net.getLogger(), "tr.Wq"))
+						    || (echo_scope_uses_decoder_matrix(ac, li, nLayers, dModelKVTT, dmTT)
+						        && !atlas::echoUpdate(b.echoWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                              dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                              invBatch, gradScale, wd1, wd2, tt.optimizerStep, ac, net.getLogger(), "tr.Wk"))
+						    || (echo_scope_uses_decoder_matrix(ac, li, nLayers, dModelKVTT, dmTT)
+						        && !atlas::echoUpdate(b.echoWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                              dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                              invBatch, gradScale, wd1, wd2, tt.optimizerStep, ac, net.getLogger(), "tr.Wv"))
+						    || (echo_scope_uses_decoder_matrix(ac, li, nLayers, dmTT, dmTT)
+						        && !atlas::echoUpdate(b.echoWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                              dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                              invBatch, gradScale, wd1, wd2, tt.optimizerStep, ac, net.getLogger(), "tr.Wo"))
+						    || (echo_scope_uses_decoder_matrix(ac, li, nLayers, ff1WidthTT, dmTT)
+						        && !atlas::echoUpdate(b.echoW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                              ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                              invBatch, gradScale, wd1, wd2, tt.optimizerStep, ac, net.getLogger(), "tr.W1"))
+						    || (echo_scope_uses_decoder_matrix(ac, li, nLayers, dmTT, dFFTT)
+						        && !atlas::echoUpdate(b.echoW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                              dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                              invBatch, gradScale, wd1, wd2, tt.optimizerStep, ac, net.getLogger(), "tr.W2")))
 						{
 							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-								"SGDHelper_Transformer: BiMAP block weight update entered NaN recovery");
+								"SGDHelper_Transformer: ECHO block weight update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
+						}
+						if (!echo_scope_uses_decoder_matrix(ac, li, nLayers, dmTT, dmTT))
+							Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						if (!echo_scope_uses_decoder_matrix(ac, li, nLayers, dModelKVTT, dmTT))
+							Adam::update_weight(b.Wk, b.vWk, b.v2Wk, b.gWk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						if (!echo_scope_uses_decoder_matrix(ac, li, nLayers, dModelKVTT, dmTT))
+							Adam::update_weight(b.Wv, b.vWv, b.v2Wv, b.gWv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						if (!echo_scope_uses_decoder_matrix(ac, li, nLayers, dmTT, dmTT))
+							Adam::update_weight(b.Wo, b.vWo, b.v2Wo, b.gWo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						if (!echo_scope_uses_decoder_matrix(ac, li, nLayers, ff1WidthTT, dmTT))
+							Adam::update_weight(b.W1, b.vW1, b.v2W1, b.gW1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						if (!echo_scope_uses_decoder_matrix(ac, li, nLayers, dmTT, dFFTT))
+							Adam::update_weight(b.W2, b.vW2, b.v2W2, b.gW2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (bimapEnabled)
+					{
+						const bool useBiMAPBlock = bimap_scope_uses_decoder_block(ac, li, nLayers);
+						if (useBiMAPBlock)
+						{
+							if (!atlas::bimapUpdate(b.bimapWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+							                        dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                        invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
+							    || !atlas::bimapUpdate(b.bimapWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+							                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
+							    || !atlas::bimapUpdate(b.bimapWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+							                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
+							    || !atlas::bimapUpdate(b.bimapWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+							                           dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
+							    || !atlas::bimapUpdate(b.bimapW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+							                           ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
+							    || !atlas::bimapUpdate(b.bimapW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+							                           dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: BiMAP block weight update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
+						}
+						else
+						{
+							Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.Wk, b.vWk, b.v2Wk, b.gWk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.Wv, b.vWv, b.v2Wv, b.gWv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.Wo, b.vWo, b.v2Wo, b.gWo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.W1, b.vW1, b.v2W1, b.gW1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.W2, b.vW2, b.v2W2, b.gW2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
 						}
 						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -4838,6 +5097,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
+					else if (echoEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					else if (bimapEnabled)
 					{
 						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
@@ -4918,19 +5184,53 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (echoEnabled)
+					{
+						const bool useEchoWOut = echo_scope_uses_head_matrix(ac, outSize, dmTT);
+						if (useEchoWOut)
+						{
+							if (!atlas::echoUpdate(tt.echoWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+							                       outSize, dmTT, lr,
+							                       beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                       invBatch, gradScale, wd1, wd2,
+							                       tt.optimizerStep,
+							                       ac, net.getLogger(), "tr.WOut"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: ECHO WOut update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
+						}
+						else
+							Adam::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (bimapEnabled)
 					{
-						if (!atlas::bimapUpdate(tt.bimapWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
-						                        outSize, dmTT, lr,
-						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
-						                        invBatch, gradScale, wd1, wd2,
-						                        ac, net.getLogger(), "tr.WOut"))
+						const bool useBiMAPWOut = bimap_scope_uses_head(ac);
+						if (useBiMAPWOut)
 						{
-							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
-								"SGDHelper_Transformer: BiMAP WOut update entered NaN recovery");
-							net.storeRunningFlag(false);
-							return false;
+							if (!atlas::bimapUpdate(tt.bimapWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+							                        outSize, dmTT, lr,
+							                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                        invBatch, gradScale, wd1, wd2,
+							                        ac, net.getLogger(), "tr.WOut"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: BiMAP WOut update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
 						}
+						else
+							Adam::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
 						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
@@ -6696,18 +6996,29 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 	const glades::TransformerRunConfig::TokenLMLossKind tokenLmLossKind = cfg.tokenLmLossKind;
 	const int padTokenId = cfg.padTokenId;
 	const bool mpUseLossScaling = cfg.mpUseLossScaling;
+	const glades::ATLASConfig& ac = trainingConfig.atlas;
 	const bool helmEnabled =
 	    tokenLM
 	    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS)
-	    && trainingConfig.atlas.helmEnabled
+	    && ac.helmEnabled
 	    && tt.helm.initialized;
 	const bool asterEnabled =
 	    tokenLM
 	    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS)
-	    && trainingConfig.atlas.asterEnabled
+	    && ac.asterEnabled
 	    && tt.aster.initialized;
 
 	const float lossScale = (mpUseLossScaling ? tt.mpLossScale : 1.0f);
+
+#define GLADES_ECHO_CPU_OBSERVE(enabled_, state_, rowObs_, colObs_, samples_, rows_, cols_) do { \
+	if (!observe_echo_cpu((state_), (rowObs_), (colObs_), (samples_), (rows_), (cols_), ac, (enabled_))) \
+	{ \
+		lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, \
+		    "transformerCpuBackwardPass: ECHO operand observation failed"); \
+		storeRunningFlag(false); \
+		return; \
+	} \
+} while (0)
 
 	std::vector<float, glades::AlignedAllocator<float, 64> >& dLogits = transformerScratch.dLogits;
 	if (dLogits.size() != (static_cast<size_t>(T) * static_cast<size_t>(scratchOutSize)))
@@ -6979,6 +7290,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 			const LinearWeightView tiedEmbHead = make_linear_weight_view(tt.tokE, tt.tokELowp, tt.lmBias, useLowpWeights, lowpDType);
 			linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, vocabSize,
 			    tt.gTokE, tt.gLmBias, tiedEmbHead, dH.data());
+			GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_head_matrix(ac, vocabSize, dModel),
+			                        tt.echoTokE, dLogits.data(), hPostFinalLN, T, vocabSize, dModel);
 		}
 		else
 		{
@@ -7296,6 +7609,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		const LinearWeightView outProj = make_linear_weight_view(tt.WOut, tt.WOutLowp, tt.bOut, useLowpWeights, lowpDType);
 		linear_backward_accum_maybe_lowp(hPostFinalLN, dLogits.data(), T, dModel, outSize,
 		                                 tt.gWOut, tt.gBOut, outProj, dH.data());
+		GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_head_matrix(ac, outSize, dModel),
+		                        tt.echoWOut, dLogits.data(), hPostFinalLN, T, outSize, dModel);
 		timeStepsInBatch += T;
 	}
 
@@ -7375,6 +7690,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 			dFF1Act.resize(static_cast<size_t>(T) * static_cast<size_t>(dFF));
 		const LinearWeightView ff2Proj = make_linear_weight_view(b.W2, b.W2Lowp, b.b2, useLowpWeights, lowpDType);
 		linear_backward_accum_maybe_lowp(ff1Act, dH.data(), T, dFF, dModel, b.gW2, b.gB2, ff2Proj, dFF1Act.data());
+		GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_decoder_matrix(ac, static_cast<unsigned int>(li), nLayers, dModel, dFF),
+		                        b.echoW2, dH.data(), ff1Act, T, dModel, dFF);
 
 		std::vector<float, glades::AlignedAllocator<float, 64> >& dX2 = transformerScratch.dX2;
 		if (dX2.size() != (static_cast<size_t>(T) * static_cast<size_t>(dModel)))
@@ -7401,6 +7718,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 			}
 			const LinearWeightView ff1Proj = make_linear_weight_view(b.W1, b.W1Lowp, b.b1, useLowpWeights, lowpDType);
 			linear_backward_accum_maybe_lowp(x2, dFF1Cat.data(), T, dModel, ff1Width, b.gW1, b.gB1, ff1Proj, dX2.data());
+			GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_decoder_matrix(ac, static_cast<unsigned int>(li), nLayers, ff1Width, dModel),
+			                        b.echoW1, dFF1Cat.data(), x2, T, ff1Width, dModel);
 		}
 		else
 		{
@@ -7412,6 +7731,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 					dFF1Act[i] *= glades::transformer_ops::relu_deriv_from_y(ff1Act[i]);
 			const LinearWeightView ff1Proj = make_linear_weight_view(b.W1, b.W1Lowp, b.b1, useLowpWeights, lowpDType);
 			linear_backward_accum_maybe_lowp(x2, dFF1Act.data(), T, dModel, dFF, b.gW1, b.gB1, ff1Proj, dX2.data());
+			GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_decoder_matrix(ac, static_cast<unsigned int>(li), nLayers, dFF, dModel),
+			                        b.echoW1, dFF1Act.data(), x2, T, dFF, dModel);
 		}
 
 		// LN2 backward
@@ -7463,6 +7784,8 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		const LinearWeightView oProj = make_linear_weight_view(b.Wo, b.WoLowp, b.bo, useLowpWeights, lowpDType);
 		linear_backward_accum_maybe_lowp(attnConcat, dHAfterAttn.data(), T, dModel, dModel,
 		                                 b.gWo, b.gBo, oProj, dAttnConcat.data());
+		GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_decoder_matrix(ac, static_cast<unsigned int>(li), nLayers, dModel, dModel),
+		                        b.echoWo, dHAfterAttn.data(), attnConcat, T, dModel, dModel);
 
 		const float* Vfull = transformerScratch.V.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModelKV));
 		const float* Qfull = transformerScratch.Q.data() + (static_cast<size_t>(li) * static_cast<size_t>(T) * static_cast<size_t>(dModel));
@@ -7610,16 +7933,22 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		{
 			const LinearWeightView qProj = make_linear_weight_view(b.Wq, b.WqLowp, b.bq, useLowpWeights, lowpDType);
 			linear_backward_accum_maybe_lowp(x1, dQfull.data(), T, dModel, dModel, b.gWq, b.gBq, qProj, dXtmp.data());
+			GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_decoder_matrix(ac, static_cast<unsigned int>(li), nLayers, dModel, dModel),
+			                        b.echoWq, dQfull.data(), x1, T, dModel, dModel);
 			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
 		}
 		{
 			const LinearWeightView kProj = make_linear_weight_view(b.Wk, b.WkLowp, b.bk, useLowpWeights, lowpDType);
 			linear_backward_accum_maybe_lowp(x1, dKfull.data(), T, dModel, dModelKV, b.gWk, b.gBk, kProj, dXtmp.data());
+			GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_decoder_matrix(ac, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
+			                        b.echoWk, dKfull.data(), x1, T, dModelKV, dModel);
 			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
 		}
 		{
 			const LinearWeightView vProj = make_linear_weight_view(b.Wv, b.WvLowp, b.bv, useLowpWeights, lowpDType);
 			linear_backward_accum_maybe_lowp(x1, dVfull.data(), T, dModel, dModelKV, b.gWv, b.gBv, vProj, dXtmp.data());
+			GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_decoder_matrix(ac, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
+			                        b.echoWv, dVfull.data(), x1, T, dModelKV, dModel);
 			for (size_t i = 0; i < dX1.size(); ++i) dX1[i] += dXtmp[i];
 		}
 
@@ -7681,8 +8010,12 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 		const LinearWeightView inputProj = make_linear_weight_view(tt.WIn, tt.WInLowp, tt.bIn, useLowpWeights, lowpDType);
 		linear_backward_accum_maybe_lowp(transformerScratch.x.data(), dH.data(), T, inputSize, dModel,
 		                                 tt.gWIn, tt.gBIn, inputProj, dX.data());
+		GLADES_ECHO_CPU_OBSERVE(echo_scope_uses_input_matrix(ac, dModel, inputSize),
+		                        tt.echoWIn, dH.data(), transformerScratch.x.data(), T, dModel, inputSize);
 		(void)dX;
 	}
+
+#undef GLADES_ECHO_CPU_OBSERVE
 }
 
 
@@ -7706,7 +8039,6 @@ bool glades::NNetwork::tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg,
 		return false;
 	if (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS
 	    && (trainingConfig.atlas.helmEnabled
-	        || trainingConfig.atlas.bimapEnabled
 	        || trainingConfig.atlas.kronEnabled))
 		return false;
 
@@ -8244,6 +8576,16 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		    static_cast<size_t>(nLayers - 1) * T * dModel;
 		const float* bwdPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
 
+#define GLADES_ECHO_GPU_OBSERVE(enabled_, state_, rowObs_, colObs_, samples_, rows_, cols_) do { \
+	if (!observe_echo_gpu((state_), (rowObs_), (colObs_), (samples_), (rows_), (cols_), trainingConfig.atlas, (enabled_))) \
+	{ \
+		lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, \
+		    "transformerGpuTrainEpoch: GPU ECHO operand observation failed"); \
+		storeRunningFlag(false); \
+		return; \
+	} \
+} while (0)
+
 		if (tokenLM)
 		{
 			// dLogits = probs - one_hot(targets)
@@ -8267,6 +8609,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(vocabSize),
 			    bwdPostFinalLN, static_cast<int>(dModel),
 			    1.0f, gpuTransformerWeights->gTokE.data(), static_cast<int>(dModel));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_head_matrix(trainingConfig.atlas, vocabSize, dModel),
+			                        gpuTransformerWeights->echoTokE,
+			                        gpuTransformerScratch->dLogits.data(), bwdPostFinalLN,
+			                        T, vocabSize, dModel);
 
 			// gLmBias += sum_rows(dLogits)
 			gpu::reduce_rows_sum(
@@ -8309,6 +8655,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dLogits.data(), static_cast<int>(outSize),
 			    bwdPostFinalLN, static_cast<int>(dModel),
 			    1.0f, gpuTransformerWeights->gWOut.data(), static_cast<int>(dModel));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_head_matrix(trainingConfig.atlas, outSize, dModel),
+			                        gpuTransformerWeights->echoWOut,
+			                        gpuTransformerScratch->dLogits.data(), bwdPostFinalLN,
+			                        T, outSize, dModel);
 
 			// gBOut += sum_rows(dLogits)
 			gpu::reduce_rows_sum(
@@ -8379,6 +8729,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
 			    ff1Act_l, static_cast<int>(dFF),
 			    1.0f, gb.gW2.data(), static_cast<int>(dFF));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dFF),
+			                        gb.echoW2,
+			                        gpuTransformerScratch->dH.data(), ff1Act_l,
+			                        T, dModel, dFF);
 			// gB2 += sum_rows(dH)
 			gpu::reduce_rows_sum(
 			    gpuTransformerScratch->dH.data(),
@@ -8403,6 +8757,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    1.0f, gpuTransformerScratch->dFF1Cat.data(), static_cast<int>(ff1Width),
 				    x2_l, static_cast<int>(dModel),
 				    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+				GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, ff1Width, dModel),
+				                        gb.echoW1,
+				                        gpuTransformerScratch->dFF1Cat.data(), x2_l,
+				                        T, ff1Width, dModel);
 				gpu::reduce_rows_sum(
 				    gpuTransformerScratch->dFF1Cat.data(),
 				    static_cast<int>(T), static_cast<int>(ff1Width),
@@ -8436,6 +8794,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    1.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF),
 				    x2_l, static_cast<int>(dModel),
 				    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+				GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dFF, dModel),
+				                        gb.echoW1,
+				                        gpuTransformerScratch->dFF1Act.data(), x2_l,
+				                        T, dFF, dModel);
 				gpu::reduce_rows_sum(
 				    gpuTransformerScratch->dFF1Act.data(),
 				    static_cast<int>(T), static_cast<int>(dFF),
@@ -8482,6 +8844,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dH2.data(), static_cast<int>(dModel),
 			    attnConcat_l, static_cast<int>(dModel),
 			    1.0f, gb.gWo.data(), static_cast<int>(dModel));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dModel),
+			                        gb.echoWo,
+			                        gpuTransformerScratch->dH2.data(), attnConcat_l,
+			                        T, dModel, dModel);
 			gpu::reduce_rows_sum(
 			    gpuTransformerScratch->dH2.data(),
 			    static_cast<int>(T), static_cast<int>(dModel),
@@ -8539,6 +8905,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dQfull.data(), static_cast<int>(dModel),
 			    x1_l, static_cast<int>(dModel),
 			    1.0f, gb.gWq.data(), static_cast<int>(dModel));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dModel),
+			                        gb.echoWq,
+			                        gpuTransformerScratch->dQfull.data(), x1_l,
+			                        T, dModel, dModel);
 			gpu::reduce_rows_sum(
 			    gpuTransformerScratch->dQfull.data(),
 			    static_cast<int>(T), static_cast<int>(dModel),
@@ -8555,6 +8925,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dKfull.data(), static_cast<int>(dModelKV),
 			    x1_l, static_cast<int>(dModel),
 			    1.0f, gb.gWk.data(), static_cast<int>(dModel));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
+			                        gb.echoWk,
+			                        gpuTransformerScratch->dKfull.data(), x1_l,
+			                        T, dModelKV, dModel);
 			gpu::reduce_rows_sum(
 			    gpuTransformerScratch->dKfull.data(),
 			    static_cast<int>(T), static_cast<int>(dModelKV),
@@ -8571,6 +8945,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dVfull.data(), static_cast<int>(dModelKV),
 			    x1_l, static_cast<int>(dModel),
 			    1.0f, gb.gWv.data(), static_cast<int>(dModel));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
+			                        gb.echoWv,
+			                        gpuTransformerScratch->dVfull.data(), x1_l,
+			                        T, dModelKV, dModel);
 			gpu::reduce_rows_sum(
 			    gpuTransformerScratch->dVfull.data(),
 			    static_cast<int>(T), static_cast<int>(dModelKV),
@@ -8623,11 +9001,17 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel),
 			    gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
 			    1.0f, gpuTransformerWeights->gWIn.data(), static_cast<int>(inputSize));
+			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_input_matrix(trainingConfig.atlas, dModel, inputSize),
+			                        gpuTransformerWeights->echoWIn,
+			                        gpuTransformerScratch->dH.data(), gpuTransformerScratch->x.data(),
+			                        T, dModel, inputSize);
 			gpu::reduce_rows_sum(
 			    gpuTransformerScratch->dH.data(),
 			    static_cast<int>(T), static_cast<int>(dModel),
 			    1.0f, gpuTransformerWeights->gBIn.data());
 		}
+
+#undef GLADES_ECHO_GPU_OBSERVE
 
 		++seqInBatch;
 
@@ -8726,13 +9110,17 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 			const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 			const bool gpuUseGeode = gpuUseAtlas && trainingConfig.atlas.geodeEnabled;
+			const bool gpuUseEcho = gpuUseAtlas && trainingConfig.atlas.echoEnabled;
+			const bool gpuUseBiMAP = gpuUseAtlas && trainingConfig.atlas.bimapEnabled;
 			const bool gpuUsePact = gpuUseAtlas && trainingConfig.atlas.pactEnabled;
 			const bool gpuUseRacer = gpuUseAtlas && trainingConfig.atlas.racerEnabled;
 			const bool gpuUseMuon = gpuUseAtlas && trainingConfig.atlas.muonEnabled;
+			const bool gpuFuseEcho =
+			    gpuUseEcho && !gpuUseGeode && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMuon;
 			const bool gpuUseGroupAdam =
 			    (!gpuUseAtlas) && trainingConfig.optimizer.adamGroupwiseEnabled;
 
-			if (gpuUseAtlas && !gpuUseGeode && !gpuUsePact && !gpuUseRacer && !gpuUseMuon)
+			if (gpuUseAtlas && !gpuUseGeode && !gpuUseEcho && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMuon)
 			{
 			// === GPU ATLAS optimizer ===
 			// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
@@ -8913,164 +9301,279 @@ if (ad_.valid) { \
 			const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
 			const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
 
+			if (gpuFuseEcho)
+			{
+				bool gpuEchoPrepError = false;
+
+#define GLADES_GPU_ECHO_PREP(enabled_, state_, rows_, cols_) do { \
+	if (!gpuEchoPrepError && (enabled_) && (rows_) > 0u && (cols_) > 0u) { \
+		if (!gpu::echo_gpu_prepare_metrics((state_), (rows_), (cols_), \
+		                                   tensorTransformer.optimizerStep, \
+		                                   adamEps, ac)) \
+			gpuEchoPrepError = true; \
+	} \
+} while (0)
+
+				if (tokenLM)
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_head_matrix(ac, vocabSize, dModel),
+					                     gpuTransformerWeights->echoTokE, vocabSize, dModel);
+				else
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_input_matrix(ac, dModel, inputSize),
+					                     gpuTransformerWeights->echoWIn, dModel, inputSize);
+
+				for (unsigned int bli = 0; bli < nLayers; ++bli)
+				{
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWq, dModel, dModel);
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWk, dModelKV, dModel);
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWv, dModelKV, dModel);
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWo, dModel, dModel);
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_decoder_matrix(ac, bli, nLayers, ff1Width, dModel), gb.echoW1, ff1Width, dModel);
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dFF), gb.echoW2, dModel, dFF);
+				}
+
+				if (!tokenLM)
+					GLADES_GPU_ECHO_PREP(echo_scope_uses_head_matrix(ac, outSize, dModel),
+					                     gpuTransformerWeights->echoWOut, outSize, dModel);
+
+#undef GLADES_GPU_ECHO_PREP
+
+				if (gpuEchoPrepError)
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "SGDHelper_TRANSFORMER: GPU ECHO metric preparation failed");
+					storeRunningFlag(false);
+					return;
+				}
+			}
+
 			// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
 			if (!gpuTransformerWeights->adamPtrsUploaded)
 			{
-				float* hParams[6 + 16 * 256];
-				float* hGrads[6 + 16 * 256];
-				float* hMs[6 + 16 * 256];
-				float* hVs[6 + 16 * 256];
-				int hSizes[6 + 16 * 256];
+				const int maxAdamGroups = 6 + 16 * static_cast<int>(nLayers);
+				std::vector<float*> hParams(static_cast<size_t>(maxAdamGroups), static_cast<float*>(NULL));
+				std::vector<float*> hGrads(static_cast<size_t>(maxAdamGroups), static_cast<float*>(NULL));
+				std::vector<float*> hMs(static_cast<size_t>(maxAdamGroups), static_cast<float*>(NULL));
+				std::vector<float*> hVs(static_cast<size_t>(maxAdamGroups), static_cast<float*>(NULL));
+				std::vector<int> hSizes(static_cast<size_t>(maxAdamGroups), 0);
 				int gc = 0;
 				int maxSz = 0;
+				bool adamGroupOverflow = false;
 
-#define GLADES_ADD_ADAM_GROUP(p, g, m, v, sz) do { \
+#define GLADES_ADD_ADAM_GROUP_SAFE(p, g, m, v, sz) do { \
 	if ((sz) > 0) { \
-hParams[gc] = (p); hGrads[gc] = (g); \
-hMs[gc] = (m); hVs[gc] = (v); \
-hSizes[gc] = (sz); \
-if ((sz) > maxSz) maxSz = (sz); \
-++gc; \
+		if (gc >= maxAdamGroups) { \
+			adamGroupOverflow = true; \
+		} else { \
+			hParams[static_cast<size_t>(gc)] = (p); \
+			hGrads[static_cast<size_t>(gc)] = (g); \
+			hMs[static_cast<size_t>(gc)] = (m); \
+			hVs[static_cast<size_t>(gc)] = (v); \
+			hSizes[static_cast<size_t>(gc)] = (sz); \
+			if ((sz) > maxSz) maxSz = (sz); \
+			++gc; \
+		} \
 	} \
-} while(0)
+} while (0)
 
 				if (tokenLM)
 				{
-					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->tokE.data(),
-					    gpuTransformerWeights->gTokE.data(),
-					    gpuTransformerWeights->vTokE.data(),
-					    gpuTransformerWeights->v2TokE.data(),
-					    static_cast<int>(static_cast<size_t>(vocabSize) * dModel));
-					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lmBias.data(),
-					    gpuTransformerWeights->gLmBias.data(),
-					    gpuTransformerWeights->mLmBias.data(),
-					    gpuTransformerWeights->v2LmBias.data(),
-					    static_cast<int>(vocabSize));
+					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->tokE.data(),
+					                           gpuTransformerWeights->gTokE.data(),
+					                           gpuTransformerWeights->vTokE.data(),
+					                           gpuTransformerWeights->v2TokE.data(),
+					                           static_cast<int>(static_cast<size_t>(vocabSize) * dModel));
+					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->lmBias.data(),
+					                           gpuTransformerWeights->gLmBias.data(),
+					                           gpuTransformerWeights->mLmBias.data(),
+					                           gpuTransformerWeights->v2LmBias.data(),
+					                           static_cast<int>(vocabSize));
 				}
 				{
-					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WIn.data(),
-					    gpuTransformerWeights->gWIn.data(),
-					    gpuTransformerWeights->vWIn.data(),
-					    gpuTransformerWeights->v2WIn.data(),
-					    static_cast<int>(gpuTransformerWeights->WIn.size()));
-					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bIn.data(),
-					    gpuTransformerWeights->gBIn.data(),
-					    gpuTransformerWeights->mBIn.data(),
-					    gpuTransformerWeights->v2BIn.data(),
-					    static_cast<int>(gpuTransformerWeights->bIn.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WIn.data(),
+					                           gpuTransformerWeights->gWIn.data(),
+					                           gpuTransformerWeights->vWIn.data(),
+					                           gpuTransformerWeights->v2WIn.data(),
+					                           static_cast<int>(gpuTransformerWeights->WIn.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->bIn.data(),
+					                           gpuTransformerWeights->gBIn.data(),
+					                           gpuTransformerWeights->mBIn.data(),
+					                           gpuTransformerWeights->v2BIn.data(),
+					                           static_cast<int>(gpuTransformerWeights->bIn.size()));
 				}
 				for (unsigned int bli = 0; bli < nLayers; ++bli)
 				{
 					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
-					GLADES_ADD_ADAM_GROUP(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()));
-					GLADES_ADD_ADAM_GROUP(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()));
-					GLADES_ADD_ADAM_GROUP(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()));
-					GLADES_ADD_ADAM_GROUP(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()));
-					GLADES_ADD_ADAM_GROUP(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()));
-					GLADES_ADD_ADAM_GROUP(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()));
-					GLADES_ADD_ADAM_GROUP(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(), static_cast<int>(gb.bq.size()));
-					GLADES_ADD_ADAM_GROUP(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(), static_cast<int>(gb.bk.size()));
-					GLADES_ADD_ADAM_GROUP(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(), static_cast<int>(gb.bv.size()));
-					GLADES_ADD_ADAM_GROUP(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(), static_cast<int>(gb.bo.size()));
-					GLADES_ADD_ADAM_GROUP(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(), static_cast<int>(gb.b1.size()));
-					GLADES_ADD_ADAM_GROUP(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(), static_cast<int>(gb.b2.size()));
-					GLADES_ADD_ADAM_GROUP(gb.ln1Gamma.data(), gb.gLn1Gamma.data(), gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(), static_cast<int>(gb.ln1Gamma.size()));
-					GLADES_ADD_ADAM_GROUP(gb.ln1Beta.data(), gb.gLn1Beta.data(), gb.mLn1Beta.data(), gb.v2Ln1Beta.data(), static_cast<int>(gb.ln1Beta.size()));
-					GLADES_ADD_ADAM_GROUP(gb.ln2Gamma.data(), gb.gLn2Gamma.data(), gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(), static_cast<int>(gb.ln2Gamma.size()));
-					GLADES_ADD_ADAM_GROUP(gb.ln2Beta.data(), gb.gLn2Beta.data(), gb.mLn2Beta.data(), gb.v2Ln2Beta.data(), static_cast<int>(gb.ln2Beta.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(), static_cast<int>(gb.bq.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(), static_cast<int>(gb.bk.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(), static_cast<int>(gb.bv.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.bo.data(), gb.gBo.data(), gb.mBo.data(), gb.v2Bo.data(), static_cast<int>(gb.bo.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.b1.data(), gb.gB1.data(), gb.mB1.data(), gb.v2B1.data(), static_cast<int>(gb.b1.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.b2.data(), gb.gB2.data(), gb.mB2.data(), gb.v2B2.data(), static_cast<int>(gb.b2.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.ln1Gamma.data(), gb.gLn1Gamma.data(), gb.mLn1Gamma.data(), gb.v2Ln1Gamma.data(), static_cast<int>(gb.ln1Gamma.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.ln1Beta.data(), gb.gLn1Beta.data(), gb.mLn1Beta.data(), gb.v2Ln1Beta.data(), static_cast<int>(gb.ln1Beta.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.ln2Gamma.data(), gb.gLn2Gamma.data(), gb.mLn2Gamma.data(), gb.v2Ln2Gamma.data(), static_cast<int>(gb.ln2Gamma.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gb.ln2Beta.data(), gb.gLn2Beta.data(), gb.mLn2Beta.data(), gb.v2Ln2Beta.data(), static_cast<int>(gb.ln2Beta.size()));
 				}
 				// Final LayerNorm
-				GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalGamma.data(),
-				    gpuTransformerWeights->gLnFinalGamma.data(),
-				    gpuTransformerWeights->mLnFinalGamma.data(),
-				    gpuTransformerWeights->v2LnFinalGamma.data(),
-				    static_cast<int>(gpuTransformerWeights->lnFinalGamma.size()));
-				GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->lnFinalBeta.data(),
-				    gpuTransformerWeights->gLnFinalBeta.data(),
-				    gpuTransformerWeights->mLnFinalBeta.data(),
-				    gpuTransformerWeights->v2LnFinalBeta.data(),
-				    static_cast<int>(gpuTransformerWeights->lnFinalBeta.size()));
+				GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->lnFinalGamma.data(),
+				                           gpuTransformerWeights->gLnFinalGamma.data(),
+				                           gpuTransformerWeights->mLnFinalGamma.data(),
+				                           gpuTransformerWeights->v2LnFinalGamma.data(),
+				                           static_cast<int>(gpuTransformerWeights->lnFinalGamma.size()));
+				GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->lnFinalBeta.data(),
+				                           gpuTransformerWeights->gLnFinalBeta.data(),
+				                           gpuTransformerWeights->mLnFinalBeta.data(),
+				                           gpuTransformerWeights->v2LnFinalBeta.data(),
+				                           static_cast<int>(gpuTransformerWeights->lnFinalBeta.size()));
 				if (!tokenLM)
 				{
-					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->WOut.data(),
-					    gpuTransformerWeights->gWOut.data(),
-					    gpuTransformerWeights->vWOut.data(),
-					    gpuTransformerWeights->v2WOut.data(),
-					    static_cast<int>(gpuTransformerWeights->WOut.size()));
-					GLADES_ADD_ADAM_GROUP(gpuTransformerWeights->bOut.data(),
-					    gpuTransformerWeights->gBOut.data(),
-					    gpuTransformerWeights->mBOut.data(),
-					    gpuTransformerWeights->v2BOut.data(),
-					    static_cast<int>(gpuTransformerWeights->bOut.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WOut.data(),
+					                           gpuTransformerWeights->gWOut.data(),
+					                           gpuTransformerWeights->vWOut.data(),
+					                           gpuTransformerWeights->v2WOut.data(),
+					                           static_cast<int>(gpuTransformerWeights->WOut.size()));
+					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->bOut.data(),
+					                           gpuTransformerWeights->gBOut.data(),
+					                           gpuTransformerWeights->mBOut.data(),
+					                           gpuTransformerWeights->v2BOut.data(),
+					                           static_cast<int>(gpuTransformerWeights->bOut.size()));
 				}
-#undef GLADES_ADD_ADAM_GROUP
+				if (adamGroupOverflow)
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: Adam group packing overflow");
+					storeRunningFlag(false);
+					return;
+				}
 
-				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamParams, hParams, gc * sizeof(float*));
-				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamGrads, hGrads, gc * sizeof(float*));
-				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamM, hMs, gc * sizeof(float*));
-				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamV, hVs, gc * sizeof(float*));
-				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamSizes, hSizes, gc * sizeof(int));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamParams, hParams.data(), gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamGrads, hGrads.data(), gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamM, hMs.data(), gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamV, hVs.data(), gc * sizeof(float*));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamSizes, hSizes.data(), gc * sizeof(int));
+				if (!gpu::synchronizeTransferStream())
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: failed to upload Adam group pointers");
+					storeRunningFlag(false);
+					return;
+				}
 				gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 				gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 				gpuTransformerWeights->adamGroupCount = gc;
 				gpuTransformerWeights->adamMaxSize = maxSz;
 				gpuTransformerWeights->adamPtrsUploaded = true;
+
+#undef GLADES_ADD_ADAM_GROUP_SAFE
 			}
 
 			// Fill lr/wd arrays each step and launch single batched kernel.
 			{
 				const int gc = gpuTransformerWeights->adamGroupCount;
-				float hLrs[6 + 16 * 256];
-				float hWds[6 + 16 * 256];
+				std::vector<float> hLrs(static_cast<size_t>(gc), 0.0f);
+				std::vector<float> hWds(static_cast<size_t>(gc), 0.0f);
+				std::vector<float*> hRowMetrics(static_cast<size_t>(gc), static_cast<float*>(NULL));
+				std::vector<float*> hColMetrics(static_cast<size_t>(gc), static_cast<float*>(NULL));
+				std::vector<int> hMetricRows(static_cast<size_t>(gc), 0);
+				std::vector<int> hMetricCols(static_cast<size_t>(gc), 0);
 				int gi = 0;
+
+#define GLADES_SET_ECHO_META(enabled_, state_, rows_, cols_) do { \
+	if (gpuFuseEcho && (enabled_)) { \
+		hRowMetrics[static_cast<size_t>(gi)] = (state_).rowMetric.data(); \
+		hColMetrics[static_cast<size_t>(gi)] = (state_).colMetric.data(); \
+		hMetricRows[static_cast<size_t>(gi)] = static_cast<int>(rows_); \
+		hMetricCols[static_cast<size_t>(gi)] = static_cast<int>(cols_); \
+	} else { \
+		hRowMetrics[static_cast<size_t>(gi)] = static_cast<float*>(NULL); \
+		hColMetrics[static_cast<size_t>(gi)] = static_cast<float*>(NULL); \
+		hMetricRows[static_cast<size_t>(gi)] = 0; \
+		hMetricCols[static_cast<size_t>(gi)] = 0; \
+	} \
+} while (0)
 
 				if (tokenLM)
 				{
 					const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
 					const float wd0 = skeleton->getWeightDecay2(0u);
-					hLrs[gi] = lr0; hWds[gi] = wd0; ++gi;
-					hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi;
+					hLrs[gi] = lr0; hWds[gi] = wd0; GLADES_SET_ECHO_META(echo_scope_uses_head_matrix(ac, vocabSize, dModel), gpuTransformerWeights->echoTokE, vocabSize, dModel); ++gi;
+					hLrs[gi] = lr0; hWds[gi] = 0.0f; GLADES_SET_ECHO_META(false, gpuTransformerWeights->echoTokE, 0u, 0u); ++gi;
 				}
 				{
 					const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
 					const float wd0 = skeleton->getWeightDecay2(0u);
 					if (gpuTransformerWeights->WIn.size() > 0)
-					{ hLrs[gi] = lr0; hWds[gi] = wd0; ++gi; }
+					{ hLrs[gi] = lr0; hWds[gi] = wd0; GLADES_SET_ECHO_META(echo_scope_uses_input_matrix(ac, dModel, inputSize), gpuTransformerWeights->echoWIn, dModel, inputSize); ++gi; }
 					if (gpuTransformerWeights->bIn.size() > 0)
-					{ hLrs[gi] = lr0; hWds[gi] = 0.0f; ++gi; }
+					{ hLrs[gi] = lr0; hWds[gi] = 0.0f; GLADES_SET_ECHO_META(false, gpuTransformerWeights->echoWIn, 0u, 0u); ++gi; }
 				}
 				for (unsigned int bli = 0; bli < nLayers; ++bli)
 				{
 					const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
 					const float wd_l = skeleton->getWeightDecay2(bli + 1u);
-					// 6 weight groups (with wd)
-					for (int w = 0; w < 6; ++w)
-					{ hLrs[gi] = lr_l; hWds[gi] = wd_l; ++gi; }
-					// 10 bias/LN groups (no wd)
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+					hLrs[gi] = lr_l; hWds[gi] = wd_l; GLADES_SET_ECHO_META(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWq, dModel, dModel); ++gi;
+					hLrs[gi] = lr_l; hWds[gi] = wd_l; GLADES_SET_ECHO_META(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWk, dModelKV, dModel); ++gi;
+					hLrs[gi] = lr_l; hWds[gi] = wd_l; GLADES_SET_ECHO_META(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWv, dModelKV, dModel); ++gi;
+					hLrs[gi] = lr_l; hWds[gi] = wd_l; GLADES_SET_ECHO_META(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWo, dModel, dModel); ++gi;
+					hLrs[gi] = lr_l; hWds[gi] = wd_l; GLADES_SET_ECHO_META(echo_scope_uses_decoder_matrix(ac, bli, nLayers, ff1Width, dModel), gb.echoW1, ff1Width, dModel); ++gi;
+					hLrs[gi] = lr_l; hWds[gi] = wd_l; GLADES_SET_ECHO_META(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dFF), gb.echoW2, dModel, dFF); ++gi;
 					for (int b = 0; b < 10; ++b)
-					{ hLrs[gi] = lr_l; hWds[gi] = 0.0f; ++gi; }
+					{ hLrs[gi] = lr_l; hWds[gi] = 0.0f; GLADES_SET_ECHO_META(false, gb.echoWq, 0u, 0u); ++gi; }
 				}
 				// Final LayerNorm (use block 0 LR; no weight decay)
 				{
 					const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
-					hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalGamma
-					hLrs[gi] = lrLN; hWds[gi] = 0.0f; ++gi; // lnFinalBeta
+					hLrs[gi] = lrLN; hWds[gi] = 0.0f; GLADES_SET_ECHO_META(false, gpuTransformerWeights->echoTokE, 0u, 0u); ++gi; // lnFinalGamma
+					hLrs[gi] = lrLN; hWds[gi] = 0.0f; GLADES_SET_ECHO_META(false, gpuTransformerWeights->echoTokE, 0u, 0u); ++gi; // lnFinalBeta
 				}
 				if (!tokenLM)
 				{
 					const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
 					const float wdO = skeleton->getWeightDecay2(nLayers);
 					if (gpuTransformerWeights->WOut.size() > 0)
-					{ hLrs[gi] = lrO; hWds[gi] = wdO; ++gi; }
+					{ hLrs[gi] = lrO; hWds[gi] = wdO; GLADES_SET_ECHO_META(echo_scope_uses_head_matrix(ac, outSize, dModel), gpuTransformerWeights->echoWOut, outSize, dModel); ++gi; }
 					if (gpuTransformerWeights->bOut.size() > 0)
-					{ hLrs[gi] = lrO; hWds[gi] = 0.0f; ++gi; }
+					{ hLrs[gi] = lrO; hWds[gi] = 0.0f; GLADES_SET_ECHO_META(false, gpuTransformerWeights->echoWOut, 0u, 0u); ++gi; }
+				}
+				if (gi != gc)
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: Adam lr/wd group count mismatch");
+					storeRunningFlag(false);
+					return;
 				}
 
-				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamLr, hLrs, gc * sizeof(float));
-				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamWd, hWds, gc * sizeof(float));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamLr, hLrs.data(), gc * sizeof(float));
+				gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamWd, hWds.data(), gc * sizeof(float));
+				if (gpuFuseEcho)
+				{
+					gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamRowMetric, hRowMetrics.data(), gc * sizeof(float*));
+					gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamColMetric, hColMetrics.data(), gc * sizeof(float*));
+					gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamMetricRows, hMetricRows.data(), gc * sizeof(int));
+					gpu::device_memcpy_h2d(gpuTransformerWeights->d_adamMetricCols, hMetricCols.data(), gc * sizeof(int));
+				}
+				if (!gpu::synchronizeTransferStream())
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: failed to upload Adam lr/wd groups");
+					storeRunningFlag(false);
+					return;
+				}
 				if (gpuPerf)
 				{
-					gpu::perfRecordBytesH2D(&gpuPerf->counters, static_cast<size_t>(2 * gc) * sizeof(float));
+					size_t bytesH2D = static_cast<size_t>(2 * gc) * sizeof(float);
+					if (gpuFuseEcho)
+						bytesH2D += static_cast<size_t>(2 * gc) * sizeof(float*)
+						          + static_cast<size_t>(2 * gc) * sizeof(int);
+					gpu::perfRecordBytesH2D(&gpuPerf->counters, bytesH2D);
 					gpu::perfRecordSync(&gpuPerf->counters, 1u);
 					gpu::perfRecordKernel(&gpuPerf->counters, gpuUseGroupAdam ? 2u : 1u);
 				}
@@ -9109,8 +9612,14 @@ if ((sz) > maxSz) maxSz = (sz); \
 				    dAdamGroupScales,
 				    gpuTransformerWeights->d_adamSizes,
 				    gpuTransformerWeights->adamMaxSize,
+				    gpuFuseEcho ? gpuTransformerWeights->d_adamRowMetric : NULL,
+				    gpuFuseEcho ? gpuTransformerWeights->d_adamColMetric : NULL,
+				    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricRows : NULL,
+				    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricCols : NULL,
 				    beta1, beta2, adamEps,
 				    invBatch * gradScale, stepInt, gc);
+
+#undef GLADES_SET_ECHO_META
 			}
 				if (gpuUseGeode)
 				{
@@ -9191,6 +9700,207 @@ if ((sz) > maxSz) maxSz = (sz); \
 					{
 						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 						    "SGDHelper_TRANSFORMER: GPU GEODE residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+				if (gpuFuseEcho)
+				{
+					bool gpuEchoError = false;
+
+#define GLADES_GPU_ECHO_POST(enabled_, state_, rows_, cols_, tag_) do { \
+	if (!gpuEchoError && (enabled_) && (rows_) > 0u && (cols_) > 0u) { \
+		if (!gpu::echo_gpu_post_update((state_), ac, getLogger(), (tag_))) \
+			gpuEchoError = true; \
+	} \
+} while (0)
+
+					if (tokenLM)
+						GLADES_GPU_ECHO_POST(echo_scope_uses_head_matrix(ac, vocabSize, dModel),
+						                     gpuTransformerWeights->echoTokE, vocabSize, dModel, "tr.tokE");
+					else
+						GLADES_GPU_ECHO_POST(echo_scope_uses_input_matrix(ac, dModel, inputSize),
+						                     gpuTransformerWeights->echoWIn, dModel, inputSize, "tr.WIn");
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						GLADES_GPU_ECHO_POST(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWq, dModel, dModel, "tr.Wq");
+						GLADES_GPU_ECHO_POST(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWk, dModelKV, dModel, "tr.Wk");
+						GLADES_GPU_ECHO_POST(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWv, dModelKV, dModel, "tr.Wv");
+						GLADES_GPU_ECHO_POST(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWo, dModel, dModel, "tr.Wo");
+						GLADES_GPU_ECHO_POST(echo_scope_uses_decoder_matrix(ac, bli, nLayers, ff1Width, dModel), gb.echoW1, ff1Width, dModel, "tr.W1");
+						GLADES_GPU_ECHO_POST(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dFF), gb.echoW2, dModel, dFF, "tr.W2");
+					}
+
+					if (!tokenLM)
+						GLADES_GPU_ECHO_POST(echo_scope_uses_head_matrix(ac, outSize, dModel),
+						                     gpuTransformerWeights->echoWOut, outSize, dModel, "tr.WOut");
+
+#undef GLADES_GPU_ECHO_POST
+
+					if (gpuEchoError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU ECHO post-update bookkeeping failed");
+						storeRunningFlag(false);
+					}
+				}
+				else if (gpuUseEcho)
+				{
+					bool gpuEchoError = false;
+
+#define GLADES_GPU_ECHO_WEIGHT(enabled_, state_, param_, grad_, m1_, v2_, rows_, cols_, lr_, tag_) do { \
+	if (!gpuEchoError && (enabled_) && (param_).size() > 0u) { \
+		if (!gpu::echo_gpu_update((state_), (param_).data(), (grad_).data(), \
+		                          (m1_).data(), (v2_).data(), \
+		                          (rows_), (cols_), (lr_), invBatch * gradScale, \
+		                          tensorTransformer.optimizerStep, \
+		                          inv1mB1t, inv1mB2t, adamEps, \
+		                          ac, getLogger(), (tag_))) \
+			gpuEchoError = true; \
+	} \
+} while (0)
+
+					if (tokenLM)
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_head_matrix(ac, vocabSize, dModel),
+						                       gpuTransformerWeights->echoTokE,
+						                       gpuTransformerWeights->tokE,
+						                       gpuTransformerWeights->gTokE,
+						                       gpuTransformerWeights->vTokE,
+						                       gpuTransformerWeights->v2TokE,
+						                       vocabSize, dModel, lr0, "tr.tokE");
+					}
+					else
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_input_matrix(ac, dModel, inputSize),
+						                       gpuTransformerWeights->echoWIn,
+						                       gpuTransformerWeights->WIn,
+						                       gpuTransformerWeights->gWIn,
+						                       gpuTransformerWeights->vWIn,
+						                       gpuTransformerWeights->v2WIn,
+						                       dModel, inputSize, lr0, "tr.WIn");
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq, dModel, dModel, lr_l, "tr.Wq");
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk, dModelKV, dModel, lr_l, "tr.Wk");
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModelKV, dModel), gb.echoWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv, dModelKV, dModel, lr_l, "tr.Wv");
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dModel), gb.echoWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo, dModel, dModel, lr_l, "tr.Wo");
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_decoder_matrix(ac, bli, nLayers, ff1Width, dModel), gb.echoW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1, ff1Width, dModel, lr_l, "tr.W1");
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_decoder_matrix(ac, bli, nLayers, dModel, dFF), gb.echoW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2, dModel, dFF, lr_l, "tr.W2");
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO =
+						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						GLADES_GPU_ECHO_WEIGHT(echo_scope_uses_head_matrix(ac, outSize, dModel),
+						                       gpuTransformerWeights->echoWOut,
+						                       gpuTransformerWeights->WOut,
+						                       gpuTransformerWeights->gWOut,
+						                       gpuTransformerWeights->vWOut,
+						                       gpuTransformerWeights->v2WOut,
+						                       outSize, dModel, lrO, "tr.WOut");
+					}
+
+#undef GLADES_GPU_ECHO_WEIGHT
+
+					if (gpuEchoError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU ECHO residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+				if (gpuUseBiMAP)
+				{
+					bool gpuBiMAPError = false;
+
+#define GLADES_GPU_BIMAP_WEIGHT(state_, param_, grad_, m1_, v2_, rows_, cols_, lr_, tag_) do { \
+	if (!gpuBiMAPError && (param_).size() > 0u) { \
+		if (!gpu::bimap_gpu_update((state_), (param_).data(), (grad_).data(), \
+		                           (m1_).data(), (v2_).data(), \
+		                           (rows_), (cols_), (lr_), invBatch, gradScale, \
+		                           inv1mB1t, inv1mB2t, adamEps, \
+		                           ac, getLogger(), (tag_))) \
+			gpuBiMAPError = true; \
+	} \
+} while (0)
+
+					if (tokenLM)
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (bimap_scope_uses_head(ac))
+						{
+							GLADES_GPU_BIMAP_WEIGHT(gpuTransformerWeights->bimapTokE,
+							                        gpuTransformerWeights->tokE,
+							                        gpuTransformerWeights->gTokE,
+							                        gpuTransformerWeights->vTokE,
+							                        gpuTransformerWeights->v2TokE,
+							                        vocabSize, dModel, lr0, "tr.tokE");
+						}
+					}
+					else
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (bimap_scope_uses_input_block(ac))
+						{
+							GLADES_GPU_BIMAP_WEIGHT(gpuTransformerWeights->bimapWIn,
+							                        gpuTransformerWeights->WIn,
+							                        gpuTransformerWeights->gWIn,
+							                        gpuTransformerWeights->vWIn,
+							                        gpuTransformerWeights->v2WIn,
+							                        dModel, inputSize, lr0, "tr.WIn");
+						}
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						if (!bimap_scope_uses_decoder_block(ac, bli, nLayers))
+							continue;
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						GLADES_GPU_BIMAP_WEIGHT(gb.bimapWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq, dModel, dModel, lr_l, "tr.Wq");
+						GLADES_GPU_BIMAP_WEIGHT(gb.bimapWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk, dModelKV, dModel, lr_l, "tr.Wk");
+						GLADES_GPU_BIMAP_WEIGHT(gb.bimapWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv, dModelKV, dModel, lr_l, "tr.Wv");
+						GLADES_GPU_BIMAP_WEIGHT(gb.bimapWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo, dModel, dModel, lr_l, "tr.Wo");
+						GLADES_GPU_BIMAP_WEIGHT(gb.bimapW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1, ff1Width, dModel, lr_l, "tr.W1");
+						GLADES_GPU_BIMAP_WEIGHT(gb.bimapW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2, dModel, dFF, lr_l, "tr.W2");
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO =
+						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (bimap_scope_uses_head(ac))
+						{
+							GLADES_GPU_BIMAP_WEIGHT(gpuTransformerWeights->bimapWOut,
+							                        gpuTransformerWeights->WOut,
+							                        gpuTransformerWeights->gWOut,
+							                        gpuTransformerWeights->vWOut,
+							                        gpuTransformerWeights->v2WOut,
+							                        outSize, dModel, lrO, "tr.WOut");
+						}
+					}
+
+#undef GLADES_GPU_BIMAP_WEIGHT
+
+					if (gpuBiMAPError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						    "SGDHelper_TRANSFORMER: GPU BiMAP-lite residual update failed");
 						storeRunningFlag(false);
 					}
 				}

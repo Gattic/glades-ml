@@ -826,10 +826,55 @@ struct ATLASConfig
 	// the low-rank preconditioned step.
 	float geodePredictiveScale;
 
+	// Enable ECHO: Epilogue Curvature Harvesting Optimizer. ECHO keeps the
+	// exact AdamW backbone but applies a separable row/column metric estimated
+	// directly from backward operands rather than from post-hoc gradient passes.
+	bool echoEnabled;
+
+	// Strength of ECHO's two-sided diagonal geometry. 0 reduces ECHO exactly to
+	// the Adam-style diagonal backbone.
+	float echoGeometryScale;
+
+	// Final ECHO geometry strength reached after the decay schedule completes.
+	// Equal to echoGeometryScale when no schedule is active.
+	float echoGeometryScaleFinal;
+
+	// Number of optimizer steps over which ECHO linearly decays from
+	// echoGeometryScale to echoGeometryScaleFinal. 0 disables scheduling.
+	unsigned int echoGeometryDecaySteps;
+
+	// Scope of ECHO matrix activation:
+	// 0 = all eligible matrices,
+	// 1 = large-only (matrix area >= internal cutoff),
+	// 2 = late-head (last decoder block plus head/output),
+	// 3 = late-head-large (late-head restricted to large matrices).
+	enum
+	{
+		ECHO_SCOPE_ALL = 0u,
+		ECHO_SCOPE_LARGE_ONLY = 1u,
+		ECHO_SCOPE_LATE_HEAD = 2u,
+		ECHO_SCOPE_LATE_HEAD_LARGE = 3u
+	};
+	unsigned int echoScope;
+
 	// Enable BiMAP: a transformer-only blockwise matrix preconditioner that
 	// keeps Adam-style moments but scales matrix updates through row/column
 	// second-moment factors instead of a low-rank residual solve.
 	bool bimapEnabled;
+
+	// Scope of BiMAP matrix promotion:
+	// 0 = all eligible matrices,
+	// 1 = head-only (tied token embedding / output projection),
+	// 2 = late-only (last decoder block matrices),
+	// 3 = late-head (last decoder block plus head/output).
+	enum
+	{
+		BIMAP_SCOPE_ALL = 0u,
+		BIMAP_SCOPE_HEAD_ONLY = 1u,
+		BIMAP_SCOPE_LATE_ONLY = 2u,
+		BIMAP_SCOPE_LATE_HEAD = 3u
+	};
+	unsigned int bimapScope;
 
 	// Enable BiMAP-v2 low-rank row/column factors on top of the BiMAP-lite
 	// diagonal row/column scaling backbone. When false, BiMAP reduces to the
@@ -1209,7 +1254,13 @@ struct ATLASConfig
 	      geodeEnabled(false),
 	      geodeGeometryScale(1.0f),
 	      geodePredictiveScale(0.25f),
+	      echoEnabled(false),
+	      echoGeometryScale(1.0f),
+	      echoGeometryScaleFinal(1.0f),
+	      echoGeometryDecaySteps(0u),
+	      echoScope(ECHO_SCOPE_ALL),
 	      bimapEnabled(false),
+	      bimapScope(BIMAP_SCOPE_ALL),
 	      bimapLowRankEnabled(true),
 	      bimapGeometryScale(1.0f),
 	      bimapPredictiveScale(0.15f),
@@ -1281,6 +1332,23 @@ struct ATLASConfig
 	      flatSpectrumThreshold(1.05f),
 	      biasCorrection(true)
 	{
+	}
+
+	inline float echoEffectiveGeometryScale(unsigned long long optimizerStep) const
+	{
+		const float start = (echoGeometryScale > 0.0f) ? echoGeometryScale : 0.0f;
+		const float finalScale = (echoGeometryScaleFinal > 0.0f) ? echoGeometryScaleFinal : 0.0f;
+		if (echoGeometryDecaySteps == 0u)
+			return start;
+		if (optimizerStep <= 1ULL)
+			return start;
+		double progress = static_cast<double>(optimizerStep - 1ULL)
+		                / static_cast<double>(echoGeometryDecaySteps);
+		if (progress < 0.0)
+			progress = 0.0;
+		if (progress > 1.0)
+			progress = 1.0;
+		return start + static_cast<float>(progress) * (finalScale - start);
 	}
 };
 

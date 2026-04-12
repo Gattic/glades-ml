@@ -154,6 +154,8 @@ bool adam_update_batch(float** d_params, float** d_grads,
                        const float* d_lrs, const float* d_wds,
                        const float* d_stepScales,
                        const int* d_sizes, int maxSize,
+                       float** d_rowMetrics, float** d_colMetrics,
+                       const int* d_metricRows, const int* d_metricCols,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount);
 
@@ -342,7 +344,11 @@ inline bool embedding_gather(const float*, const int*, int, int, int, float*) { 
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
-inline bool adam_update_batch(float**, float**, float**, float**, const float*, const float*, const int*, int, float, float, float, float, int, int) { return false; }
+inline bool adam_update_batch(float**, float**, float**, float**,
+                              const float*, const float*, const float*,
+                              const int*, int,
+                              float**, float**, const int*, const int*,
+                              float, float, float, float, int, int) { return false; }
 
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }

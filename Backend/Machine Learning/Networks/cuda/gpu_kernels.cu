@@ -1243,6 +1243,10 @@ __global__ void adam_update_batch_kernel(
     const float* __restrict__ wds,
     const float* __restrict__ stepScales,
     const int* __restrict__ sizes,
+    float** __restrict__ rowMetrics,
+    float** __restrict__ colMetrics,
+    const int* __restrict__ metricRows,
+    const int* __restrict__ metricCols,
     float beta1, float beta2, float eps,
     float gradScale, int step, int groupCount)
 {
@@ -1259,6 +1263,12 @@ __global__ void adam_update_batch_kernel(
 	float* v_arr = vs[grp];
 	float lr = lrs[grp] * (stepScales ? stepScales[grp] : 1.0f);
 	float weightDecay = wds[grp];
+	float* rowMetric = rowMetrics ? rowMetrics[grp] : NULL;
+	float* colMetric = colMetrics ? colMetrics[grp] : NULL;
+	const int rows = metricRows ? metricRows[grp] : 0;
+	const int cols = metricCols ? metricCols[grp] : 0;
+	const bool useMatrixMetric =
+	    rowMetric && colMetric && rows > 0 && cols > 0 && (rows * cols) == n;
 
 	float g = grad[idx] * gradScale;
 
@@ -1274,8 +1284,16 @@ __global__ void adam_update_batch_kernel(
 	float bc2 = 1.0f - powf(beta2, (float)step);
 	float m_hat = m_new / bc1;
 	float v_hat = v_new / bc2;
+	float stepVal = m_hat / (sqrtf(v_hat) + eps);
+	if (useMatrixMetric)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		stepVal /= (fmaxf(rowMetric[row], 1.0e-12f) * fmaxf(colMetric[col], 1.0e-12f));
+		grad[idx] = 0.0f;
+	}
 
-	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+	param[idx] -= lr * stepVal;
 }
 
 } // anonymous namespace
@@ -1285,6 +1303,8 @@ bool adam_update_batch(float** d_params, float** d_grads,
                        const float* d_lrs, const float* d_wds,
                        const float* d_stepScales,
                        const int* d_sizes, int maxSize,
+                       float** d_rowMetrics, float** d_colMetrics,
+                       const int* d_metricRows, const int* d_metricCols,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount)
 {
@@ -1292,7 +1312,9 @@ bool adam_update_batch(float** d_params, float** d_grads,
 	int gridX = (maxSize + kBlockElem - 1) / kBlockElem;
 	dim3 grid(gridX, groupCount);
 	adam_update_batch_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
-		d_params, d_grads, d_ms, d_vs, d_lrs, d_wds, d_stepScales, d_sizes,
+		d_params, d_grads, d_ms, d_vs,
+		d_lrs, d_wds, d_stepScales, d_sizes,
+		d_rowMetrics, d_colMetrics, d_metricRows, d_metricCols,
 		beta1, beta2, eps, gradScale, step, groupCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;

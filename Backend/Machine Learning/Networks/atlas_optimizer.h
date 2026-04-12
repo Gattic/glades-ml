@@ -469,6 +469,47 @@ struct BiMAPWeightState
 	}
 };
 
+// Operand-harvested two-sided diagonal geometry state.
+//
+// ECHO tracks row/column second moments from the mandatory backward operands
+// (output adjoints and input activations) instead of inferring them from
+// post-hoc gradient matrix passes.
+struct EchoWeightState
+{
+	unsigned int m;
+	unsigned int n;
+	std::vector<float> rowSecond;   // [m] EMA row geometry from output adjoints
+	std::vector<float> colSecond;   // [n] EMA col geometry from input activations
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastGeometryScale;
+	unsigned long long step;
+	bool initialized;
+
+	EchoWeightState()
+	    : m(0u), n(0u),
+	      lastRowAnisotropy(1.0f),
+	      lastColAnisotropy(1.0f),
+	      lastGeometryScale(0.0f),
+	      step(0ULL),
+	      initialized(false)
+	{
+	}
+
+	void reset()
+	{
+		m = 0u;
+		n = 0u;
+		rowSecond.clear();
+		colSecond.clear();
+		lastRowAnisotropy = 1.0f;
+		lastColAnisotropy = 1.0f;
+		lastGeometryScale = 0.0f;
+		step = 0ULL;
+		initialized = false;
+	}
+};
+
 // True two-sided block factor preconditioner state.
 //
 // KRON keeps Adam-style first/second moments outside this state, but tracks
@@ -667,6 +708,28 @@ bool bimapUpdate(BiMAPWeightState& state,
                  const ATLASConfig& ac,
                  shmea::GLogger* logger = 0,
                  const char* tag = 0);
+
+bool echoObserve(EchoWeightState& state,
+                 const float* rowObs,
+                 const float* colObs,
+                 unsigned int samples,
+                 unsigned int m,
+                 unsigned int n,
+                 const ATLASConfig& ac);
+
+bool echoUpdate(EchoWeightState& state,
+                float* W, float* m1, float* v2, float* gW,
+                unsigned int m, unsigned int n,
+                float lr,
+                float beta1, float beta2,
+                float inv1mB1t, float inv1mB2t,
+                float eps,
+                float invBatch, float gradScale,
+                float wd1, float wd2,
+                unsigned long long optimizerStep,
+                const ATLASConfig& ac,
+                shmea::GLogger* logger = 0,
+                const char* tag = 0);
 
 bool pactUpdate(BiMAPWeightState& state,
                 float* W, float* m1, float* v2, float* gW,

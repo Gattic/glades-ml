@@ -6773,8 +6773,340 @@ Verdict:
 - keep `AdamW` as the transformer default
 - keep `AdamW-Group` only as a control
 - stop refining this branch
+
+## April 11, 2026: device-native `BiMAP-lite` changes the BiMAP verdict
+
+After wiring `BiMAP-lite` onto the transformer GPU fast path, I reran the focused
+and hard-gate suites with real CUDA instead of the earlier CPU-fallback timing path.
+
+Artifacts:
+
+- focused acceptance:
+  - `artifacts/bimap_focus_acceptance_20260411-184621/acceptance_summary.tsv`
+  - `artifacts/bimap_focus_acceptance_20260411-184621/ctx_delta_bimap_lite_vs_adamw.md`
+- hard-gate sweep:
+  - `artifacts/bimap_extended_suite_20260411-185207/epoch_sweep_summary.tsv`
+  - `artifacts/bimap_extended_suite_20260411-185207/ctx_delta_bimap_lite_vs_adamw.md`
+
+Focused acceptance (`BiMAP-lite late-head` vs `AdamW`):
+
+- `token-lm-large`
+  - `AdamW`: `4.58257 @ 0.03s`
+  - `BiMAP-lite`: `4.57542 @ 0.02s`
+- `token-lm-context`
+  - `AdamW`: `4.27857 @ 0.04s`
+  - `BiMAP-lite`: `4.34805 @ 0.05s`
+- `token-lm-context-large`
+  - `AdamW`: `4.30782 @ 0.07s`
+  - `BiMAP-lite`: `4.45575 @ 0.08s`
+
+This overturns the earlier context-family read. On the true GPU path:
+
+- `BiMAP-lite` keeps a small `token-lm-large` niche
+- it no longer wins `token-lm-context`
+- it clearly loses `token-lm-context-large`
+
+The CTX bucket deltas explain the reversal:
+
+- on the true GPU path, `BiMAP-lite` still helps some `topic` / `recall` / `anchor`
+  buckets
+- but it now hurts the structural buckets that mattered before:
+  - `query`
+  - `marker`
+  - `sep`
+
+Hard-gate sweep:
+
+- `token-lm-document`
+  - `AdamW`
+    - `e2`: `4.84733 @ 0.13s`
+    - `e3`: `4.70200 @ 0.17s`
+    - `e4`: `4.64279 @ 0.21s`
+  - `BiMAP-lite`
+    - `e2`: `4.92967 @ 0.14s`
+    - `e3`: `4.79302 @ 0.20s`
+    - `e4`: `4.66989 @ 0.25s`
+  - `BiMAP-v2`
+    - `e2`: `4.72748 @ 0.68s`
+    - `e3`: `4.22233 @ 1.02s`
+    - `e4`: `3.59063 @ 1.37s`
+
+- `token-lm-corpus-large`
+  - `AdamW`
+    - `e1`: `6.34148 @ 0.13s`
+    - `e2`: `6.27363 @ 0.21s`
+  - `BiMAP-lite`
+    - `e1`: `7.23378 @ 0.14s`
+    - `e2`: `7.23858 @ 0.23s`
+  - `BiMAP-v2`
+    - `e1`: `6.39099 @ 0.98s`
+    - `e2`: `6.26658 @ 1.95s`
+
+Interpretation:
+
+- device-native `BiMAP-lite` is not a replacement candidate
+- `BiMAP-lite` now looks like a narrow `token-lm-large` control, not a broader
+  context-family specialist
+- `BiMAP-v2` can still buy much lower `TestNLL` by epoch count on
+  `token-lm-document`, but its wall-clock cost is far too large to beat `AdamW`
+  on `T_epsilon`
+- `token-lm-corpus-large` is negative for every BiMAP branch that was tested
+
+Updated verdict:
+
+- keep `AdamW` as the transformer default
+- keep `BiMAP-lite` only as a specialized control
+- keep `BiMAP-v2` / `BiMAP-v2-0` retired as replacement lines
+- stop `BiMAP` refinement as an `AdamW` replacement family
+
+Follow-up implementation on April 12, 2026:
+
+- built a native transformer GPU path for `BiMAP-v2`
+- removed the `bimapLowRankEnabled` fast-path rejection in
+  `sgd_transformer.cpp`
+- the CUDA path now keeps:
+  - row / column second moments resident on device
+  - low-rank row / column bases resident on device
+  - predictive trust and two-sided Woodbury residual application resident on
+    device
+- local verification passed:
+  - `cmake --build build -j4`
+  - `cmake --build unit-tests/build -j4 --target glades-unit-tests`
+  - `./unit-tests/build/glades-unit-tests atlas-controller`
+  - `./unit-tests/build/glades-unit-tests atlas-bimap-micro`
+  - bounded route smoke:
+    `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant bimap --atlas-bimap-low-rank 1 --atlas-bimap-scope late-head --gpu-enable 1 --gpu-device 0`
+- this sandbox still cannot execute the real CUDA benchmark because it reports
+  `No CUDA devices found`, so the actual time-to-target verdict for native
+  `BiMAP-v2` still has to come from the GPU host
+
+## April 12, 2026: `ECHO` is the strongest post-AdamW branch, but still not a clean replacement winner
+
+I implemented the `ECHO` family as a geometry-harvesting Adam replacement that
+keeps the useful row/column geometry signal but removes the expensive
+post-gradient matrix machinery used by `BiMAP`:
+
+- geometry comes from operand-side row / column second moments
+- exact Adam-style backbone remains the base update
+- the GPU path was then progressively cleaned up:
+  - removed per-step host stats downloads
+  - removed hot-path `cudaStreamSynchronize` for scalar readback
+  - built device-resident row / column metric vectors
+  - fused ECHO metric application into the shared batched Adam path
+- finally added scope ablations:
+  - `all`
+  - `large-only`
+  - `late-head`
+  - `late-head-large`
+
+Key files:
+
+- `Backend/Machine Learning/Networks/atlas_optimizer.cpp`
+- `Backend/Machine Learning/Networks/cuda/gpu_atlas.cu`
+- `Backend/Machine Learning/Networks/sgd_transformer.cpp`
+- `Backend/Machine Learning/Networks/training_config.h`
+- `unit-tests/Backend/Machine Learning/atlas-alt-bench.cpp`
+- `unit-tests/Backend/Machine Learning/atlas-test.cpp`
+- `scripts/run_echo_gpu_gate.sh`
+- `scripts/run_echo_geometry_sweep.sh`
+- `scripts/run_echo_schedule_sweep.sh`
+- `scripts/run_echo_scope_sweep.sh`
+- `scripts/run_echo_nsys_profile.sh`
+- `scripts/run_echo_scaleup_gate.sh`
+- `scripts/run_echo_scaleup_nsys_profile.sh`
+
+Verification across the implementation stages included:
+
+- `cmake --build build -j4`
+- `cmake --build unit-tests/build -j4 --target glades-unit-tests`
+- `./unit-tests/build/glades-unit-tests atlas-echo-core`
+- `./unit-tests/build/glades-unit-tests atlas-echo-micro`
+- `./unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --repeats 1 --token-epochs 1 --variant echo`
+- GPU-host verification and profiling then came from the saved artifacts below
+
+### Small hard-gate result after the ECHO systems rewrites
+
+Artifacts:
+
+- initial hard gate:
+  - `artifacts/echo_gpu_gate_20260412-063748/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-063748/acceptance_summary.tsv`
+- schedule sweep:
+  - `artifacts/echo_schedule_sweep_20260412-070736/epoch_sweep_summary.tsv`
+  - `artifacts/echo_schedule_sweep_20260412-070736/acceptance_summary.tsv`
+- post-fusion hard gate:
+  - `artifacts/echo_gpu_gate_20260412-091735/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-091735/acceptance_summary.tsv`
+- scope sweep:
+  - `artifacts/echo_scope_sweep_20260412-103017/epoch_sweep_summary.tsv`
+  - `artifacts/echo_scope_sweep_20260412-103017/acceptance_summary.tsv`
+- narrowed `late-head` gate:
+  - `artifacts/echo_gpu_gate_20260412-104339/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-104339/acceptance_summary.tsv`
+
+Final small-gate read:
+
+- `ECHO 1.0 late-head` is the only serious live ECHO configuration
+- `token-lm-document` is genuinely positive for ECHO by quality:
+  - acceptance: `AdamW 4.87837 @ 0.10s`, `ECHO 4.87258 @ 0.11s`
+  - sweep `e3`: `AdamW 4.69635 @ 0.16s`, `ECHO 4.67906 @ 0.16s`
+  - sweep `e4`: `AdamW 4.65802 @ 0.20s`, `ECHO 4.59229 @ 0.21s`
+- `token-lm-corpus-large` remains the blocker:
+  - acceptance: `AdamW 6.28952 @ 0.18s`, `ECHO 6.27975 @ 0.19s`
+  - sweep `e2`: `AdamW 6.27894 @ 0.20s`, `ECHO 6.29306 @ 0.21s`
+  - sweep `e3`: `AdamW 6.29129 @ 0.28s`, `ECHO 6.42601 @ 0.29s`
+
+Interpretation:
+
+- ECHO finally extended the `token-lm-document` quality frontier
+- but it still did **not** produce a broad `AdamW` replacement win on the two
+  hard transformer benchmarks
+- `ECHO 1.0 large-only` is useful only as a document-quality control, not as
+  the mainline optimizer candidate
+
+### Nsight result: the ECHO systems problem was mostly solved
+
+Artifacts:
+
+- `artifacts/echo_nsys_20260412-072200`
+- `artifacts/echo_nsys_20260412-083501`
+- `artifacts/echo_nsys_20260412-091044`
+- `artifacts/echo_nsys_20260412-104701`
+
+The progressive CUDA rewrites materially changed the cost model:
+
+- early ECHO was losing mainly on:
+  - host stats downloads
+  - `cudaStreamSynchronize`
+  - extra memcpy / launch overhead
+- after ECHO-v2 and ECHO-v3:
+  - host round-trips were removed from the hot path
+  - metric finalization moved fully on device
+  - metric application was fused into the shared batched Adam update
+
+Scoped late-head Nsight (`artifacts/echo_nsys_20260412-104701`) showed that the
+remaining overhead on the small benchmark was already close to AdamW:
+
+- `token-lm-document`
+  - `cudaLaunchKernel`: `39.8ms / 9984 calls` for `AdamW` vs
+    `44.5ms / 10656 calls` for scoped ECHO
+  - `cudaMemcpy`: `1.89ms / 306` vs `2.02ms / 334`
+  - `cudaStreamSynchronize`: `1.05ms / 609` vs `1.12ms / 679`
+
+So by that point the remaining difference was no longer “bad implementation.”
+It was the actual optimizer tradeoff.
+
+### Scale-up study: ECHO only becomes interesting when the model is larger
+
+To test whether the remaining overhead would amortize, I froze the candidate set
+to:
+
+- `AdamW`
+- `ECHO 1.0 late-head`
+- `ECHO 1.0 large-only`
+
+and ran a larger-model study with:
+
+- `token-lm-document`:
+  - `dModel=96`
+  - `dFF=384`
+  - `layers=6`
+  - `heads=8`
+  - `seqLen=128`
+  - `trainSeqs=64`
+  - `testSeqs=16`
+- `token-lm-corpus-large`:
+  - `dModel=112`
+  - `dFF=448`
+  - `layers=6`
+  - `heads=8`
+  - `seqLen=128`
+  - `trainSeqs=80`
+  - `testSeqs=20`
+
+Artifacts:
+
+- first scale-up pass:
+  - `artifacts/echo_scaleup_gate_20260412-111322/epoch_sweep_summary.tsv`
+  - `artifacts/echo_scaleup_gate_20260412-111322/acceptance_summary.tsv`
+- 20-repeat confidence rerun:
+  - `artifacts/echo_scaleup_gate_20260412-112911/epoch_sweep_summary.tsv`
+- scale-up Nsight:
+  - `artifacts/echo_scaleup_nsys_20260412-111722`
+
+The first scale-up pass looked promising:
+
+- `token-lm-document` acceptance
+  - `AdamW`: `4.95290 @ 0.36s`
+  - `ECHO late-head`: `4.93254 @ 0.37s`
+- `token-lm-corpus-large` acceptance
+  - `AdamW`: `6.68770 @ 0.51s`
+  - `ECHO late-head`: `6.64396 @ 0.52s`
+
+and the scale-up Nsight profile showed the overhead had largely amortized:
+
+- `token-lm-document`
+  - `cudaLaunchKernel`: `110.6ms / 26240 calls` for `AdamW` vs
+    `112.6ms / 27136 calls` for `ECHO late-head`
+  - `cudaMemcpyAsync`: `55.5ms / 517` vs `57.0ms / 773`
+  - `cudaStreamSynchronize`: `3.29ms / 1057` vs `3.43ms / 1141`
+- `token-lm-corpus-large`
+  - `cudaLaunchKernel`: `132.3ms / 32800 calls` vs
+    `140.4ms / 33920 calls`
+  - `cudaMemcpyAsync`: `102.1ms / 645` vs `105.4ms / 965`
+  - `cudaStreamSynchronize`: `4.60ms / 1121` vs `5.02ms / 1205`
+
+So the scale-up result made one thing clear:
+
+- ECHO is the first branch where the overhead really does approach AdamW at
+  larger model sizes
+
+### 20-repeat confidence pass: not stable enough to promote
+
+The larger-model confidence rerun (`artifacts/echo_scaleup_gate_20260412-112911`)
+did not confirm a stable replacement win.
+
+Key points:
+
+- `token-lm-document`, `e1`
+  - `AdamW`: `4.86875 @ 0.18s`
+  - `ECHO late-head`: `4.86677 @ 0.19s`
+- `token-lm-document`, `e2`
+  - `AdamW`: `4.99376 @ 0.35s`
+  - `ECHO late-head`: `5.01022 @ 0.36s`
+
+- `token-lm-corpus-large`, `e1`
+  - `AdamW`: `6.49298 @ 0.26s`
+  - `ECHO late-head`: `6.54522 @ 0.26s`
+- `token-lm-corpus-large`, `e2`
+  - `AdamW`: `6.60706 @ 0.50s`
+  - `ECHO late-head`: `6.60237 @ 0.51s`
+
+Interpretation:
+
+- `ECHO late-head` is near AdamW, not clearly better
+- the effect is too small and too unstable to justify promotion
+- the larger-model benchmarks also show odd test-NLL behavior by epoch for both
+  optimizers, so they are not yet strong enough to support a default-optimizer
+  decision on their own
+
+### Current ECHO verdict
+
+Updated ranking:
+
+- `ECHO 1.0 late-head` is the strongest post-AdamW research branch in the repo
+- `ECHO 1.0 large-only` is only a document-quality probe
+- `AdamW` remains the transformer default
+
+Final recommendation:
+
+- stop optimizer-replacement work as a practical repo goal
+- keep `ECHO late-head` as the best research branch and documented control
+- if ECHO continues at all, run it as a separate retuned larger-model research
+  program rather than as “one more tweak” on the checked-in small gates
+- for practical training work in this repo, use tuned `AdamW` as the default
 ---
 
-*Document version: 1.23*
+*Document version: 1.24*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
-*Date: 2026-04-11*
+*Date: 2026-04-12*

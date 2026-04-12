@@ -688,7 +688,13 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_bool01(kv, "training.atlas.geodeEnabled", b)) { cfg.atlas.geodeEnabled = b; any = true; }
 	if (parse_float(kv, "training.atlas.geodeGeometryScale", f)) { cfg.atlas.geodeGeometryScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.geodePredictiveScale", f)) { cfg.atlas.geodePredictiveScale = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.echoEnabled", b)) { cfg.atlas.echoEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.echoGeometryScale", f)) { cfg.atlas.echoGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.echoGeometryScaleFinal", f)) { cfg.atlas.echoGeometryScaleFinal = f; any = true; }
+	if (parse_int(kv, "training.atlas.echoGeometryDecaySteps", i) && i >= 0) { cfg.atlas.echoGeometryDecaySteps = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.echoScope", i) && i >= 0) { cfg.atlas.echoScope = static_cast<unsigned int>(i); any = true; }
 	if (parse_bool01(kv, "training.atlas.bimapEnabled", b)) { cfg.atlas.bimapEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.bimapScope", i) && i >= 0) { cfg.atlas.bimapScope = static_cast<unsigned int>(i); any = true; }
 	if (parse_bool01(kv, "training.atlas.bimapLowRankEnabled", b)) { cfg.atlas.bimapLowRankEnabled = b; any = true; }
 	if (parse_float(kv, "training.atlas.bimapGeometryScale", f)) { cfg.atlas.bimapGeometryScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.bimapPredictiveScale", f)) { cfg.atlas.bimapPredictiveScale = f; any = true; }
@@ -1284,7 +1290,23 @@ static bool write_manifest(const std::string& manifestPath,
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.geodePredictiveScale; write_kv(out, "training.atlas.geodePredictiveScale", oss.str());
 	}
+	write_kv(out, "training.atlas.echoEnabled", trainingConfig.atlas.echoEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoGeometryScale; write_kv(out, "training.atlas.echoGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoGeometryScaleFinal; write_kv(out, "training.atlas.echoGeometryScaleFinal", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoGeometryDecaySteps; write_kv(out, "training.atlas.echoGeometryDecaySteps", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoScope; write_kv(out, "training.atlas.echoScope", oss.str());
+	}
 	write_kv(out, "training.atlas.bimapEnabled", trainingConfig.atlas.bimapEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.bimapScope; write_kv(out, "training.atlas.bimapScope", oss.str());
+	}
 	write_kv(out, "training.atlas.bimapLowRankEnabled", trainingConfig.atlas.bimapLowRankEnabled ? "1" : "0");
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.bimapGeometryScale; write_kv(out, "training.atlas.bimapGeometryScale", oss.str());
@@ -2663,6 +2685,69 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.bimapLowRankEnabled mismatch vs requested resume config (checkpoint "
 		    << (savedBiMAPLowRankEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.bimapLowRankEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedEchoEnabled = false;
+	if (parse_bool01(kv, "training.atlas.echoEnabled", savedEchoEnabled) &&
+	    currentCfg.atlas.echoEnabled != savedEchoEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedEchoEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.echoEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedEchoGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.echoGeometryScale", savedEchoGeometryScale) &&
+	    fabsf(currentCfg.atlas.echoGeometryScale - savedEchoGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedEchoGeometryScale << ", current " << currentCfg.atlas.echoGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedEchoGeometryScaleFinal = 0.0f;
+	if (parse_float(kv, "training.atlas.echoGeometryScaleFinal", savedEchoGeometryScaleFinal) &&
+	    fabsf(currentCfg.atlas.echoGeometryScaleFinal - savedEchoGeometryScaleFinal) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoGeometryScaleFinal mismatch vs requested resume config (checkpoint "
+		    << savedEchoGeometryScaleFinal << ", current " << currentCfg.atlas.echoGeometryScaleFinal << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedEchoGeometryDecaySteps = -1;
+	if (parse_int(kv, "training.atlas.echoGeometryDecaySteps", savedEchoGeometryDecaySteps) &&
+	    savedEchoGeometryDecaySteps >= 0 &&
+	    currentCfg.atlas.echoGeometryDecaySteps != static_cast<unsigned int>(savedEchoGeometryDecaySteps))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoGeometryDecaySteps mismatch vs requested resume config (checkpoint "
+		    << savedEchoGeometryDecaySteps << ", current " << currentCfg.atlas.echoGeometryDecaySteps << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedEchoScope = -1;
+	if (parse_int(kv, "training.atlas.echoScope", savedEchoScope) &&
+	    savedEchoScope >= 0 &&
+	    currentCfg.atlas.echoScope != static_cast<unsigned int>(savedEchoScope))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoScope mismatch vs requested resume config (checkpoint "
+		    << savedEchoScope << ", current " << currentCfg.atlas.echoScope << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedBiMAPScope = -1;
+	if (parse_int(kv, "training.atlas.bimapScope", savedBiMAPScope) &&
+	    savedBiMAPScope >= 0 &&
+	    currentCfg.atlas.bimapScope != static_cast<unsigned int>(savedBiMAPScope))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.bimapScope mismatch vs requested resume config (checkpoint "
+		    << savedBiMAPScope << ", current " << currentCfg.atlas.bimapScope << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

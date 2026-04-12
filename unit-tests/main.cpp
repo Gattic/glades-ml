@@ -156,8 +156,16 @@ int main(int argc, char* argv[])
 		ATLASGpuNaNTest();
 	    else if (strcmp(argv[1], "atlas-helm-micro") == 0)
 		ATLASHelmMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-echo-core") == 0)
+		ATLASECHOCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-echo-parity") == 0)
+		ATLASECHOParityTest();
+	    else if (strcmp(argv[1], "atlas-echo-micro") == 0)
+		ATLASECHOMicroBenchmark();
 	    else if (strcmp(argv[1], "atlas-bimap-micro") == 0)
 		ATLASBiMAPMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-bimap-parity") == 0)
+		ATLASBiMAPParityTest();
 	    else if (strcmp(argv[1], "atlas-kron-micro") == 0)
 		ATLASKronMicroBenchmark();
 	    else if (strcmp(argv[1], "atlas-muon-micro") == 0)

@@ -197,6 +197,10 @@ struct GpuTransformerWeights
 		// ATLAS optimizer state (one per weight matrix)
 		GpuAtlasWeightState atlasWq, atlasWk, atlasWv, atlasWo;
 		GpuAtlasWeightState atlasW1, atlasW2;
+		GpuEchoWeightState echoWq, echoWk, echoWv, echoWo;
+		GpuEchoWeightState echoW1, echoW2;
+		GpuBiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
+		GpuBiMAPWeightState bimapW1, bimapW2;
 		GpuPactWeightState pactWq, pactWk, pactWv, pactWo;
 		GpuPactWeightState pactW1, pactW2;
 		GpuRacerWeightState racerWq, racerWk, racerWv, racerWo;
@@ -213,6 +217,8 @@ struct GpuTransformerWeights
 	float** d_adamGrads;
 	float** d_adamM;
 	float** d_adamV;
+	float** d_adamRowMetric;
+	float** d_adamColMetric;
 	// Per-group scalars (device arrays of float): lr, wd.
 	float* d_adamLr;
 	float* d_adamWd;
@@ -220,6 +226,8 @@ struct GpuTransformerWeights
 	float* d_adamGroupPrevStepRms;
 	// Per-group element counts (device array of int).
 	int* d_adamSizes;
+	int* d_adamMetricRows;
+	int* d_adamMetricCols;
 	int adamGroupCount;   // number of parameter groups
 	int adamMaxSize;      // largest element count across groups
 	bool adamPtrsUploaded; // true after pointer arrays uploaded once
@@ -228,6 +236,12 @@ struct GpuTransformerWeights
 	GpuAtlasWeightState atlasTokE;
 	GpuAtlasWeightState atlasWIn;
 	GpuAtlasWeightState atlasWOut;
+	GpuEchoWeightState echoTokE;
+	GpuEchoWeightState echoWIn;
+	GpuEchoWeightState echoWOut;
+	GpuBiMAPWeightState bimapTokE;
+	GpuBiMAPWeightState bimapWIn;
+	GpuBiMAPWeightState bimapWOut;
 	GpuPactWeightState pactTokE;
 	GpuPactWeightState pactWIn;
 	GpuPactWeightState pactWOut;

@@ -919,6 +919,20 @@ __device__ __forceinline__ float warpReduceSum(float val)
 	return val;
 }
 
+__device__ __forceinline__ float warpReduceMin(float val)
+{
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		val = fminf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+	return val;
+}
+
+__device__ __forceinline__ float warpReduceMax(float val)
+{
+	for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+		val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+	return val;
+}
+
 __device__ float blockReduceSum(float val, float* smem)
 {
 	int lane = threadIdx.x & 31;
@@ -931,6 +945,36 @@ __device__ float blockReduceSum(float val, float* smem)
 	int numWarps = (blockDim.x + 31) / 32;
 	val = (threadIdx.x < (unsigned)numWarps) ? smem[threadIdx.x] : 0.0f;
 	if (wid == 0) val = warpReduceSum(val);
+	return val;
+}
+
+__device__ float blockReduceMin(float val, float* smem)
+{
+	int lane = threadIdx.x & 31;
+	int wid  = threadIdx.x >> 5;
+
+	val = warpReduceMin(val);
+	if (lane == 0) smem[wid] = val;
+	__syncthreads();
+
+	int numWarps = (blockDim.x + 31) / 32;
+	val = (threadIdx.x < (unsigned)numWarps) ? smem[threadIdx.x] : FLT_MAX;
+	if (wid == 0) val = warpReduceMin(val);
+	return val;
+}
+
+__device__ float blockReduceMax(float val, float* smem)
+{
+	int lane = threadIdx.x & 31;
+	int wid  = threadIdx.x >> 5;
+
+	val = warpReduceMax(val);
+	if (lane == 0) smem[wid] = val;
+	__syncthreads();
+
+	int numWarps = (blockDim.x + 31) / 32;
+	val = (threadIdx.x < (unsigned)numWarps) ? smem[threadIdx.x] : 0.0f;
+	if (wid == 0) val = warpReduceMax(val);
 	return val;
 }
 
@@ -3076,6 +3120,503 @@ __global__ void pact_lite_stats_kernel(const float* __restrict__ d_gW,
 	}
 }
 
+__global__ void bimap_update_col_second_kernel(float* __restrict__ d_colSecond,
+                                               const float* __restrict__ d_colScratch,
+                                               int rows, int cols,
+                                               float betaGeom)
+{
+	for (int col = blockIdx.x * blockDim.x + threadIdx.x;
+	     col < cols;
+	     col += blockDim.x * gridDim.x)
+	{
+		const float sample =
+		    fmaxf(d_colScratch[col] / fmaxf(static_cast<float>(rows), 1.0f), 1.0e-12f);
+		d_colSecond[col] = betaGeom * d_colSecond[col] + (1.0f - betaGeom) * sample;
+	}
+}
+
+__global__ void bimap_finalize_stats_kernel(const float* __restrict__ d_rowSecond,
+                                            const float* __restrict__ d_colSecond,
+                                            int rows, int cols,
+                                            float* __restrict__ d_stats)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0)
+		return;
+
+	double rowMean = 0.0;
+	double colMean = 0.0;
+	float rowMin = FLT_MAX;
+	float rowMax = 0.0f;
+	float colMin = FLT_MAX;
+	float colMax = 0.0f;
+
+	for (int i = 0; i < rows; ++i)
+	{
+		const float v = fmaxf(d_rowSecond[i], 1.0e-12f);
+		rowMean += static_cast<double>(v);
+		rowMin = fminf(rowMin, v);
+		rowMax = fmaxf(rowMax, v);
+	}
+	for (int j = 0; j < cols; ++j)
+	{
+		const float v = fmaxf(d_colSecond[j], 1.0e-12f);
+		colMean += static_cast<double>(v);
+		colMin = fminf(colMin, v);
+		colMax = fmaxf(colMax, v);
+	}
+
+	d_stats[0] = static_cast<float>(fmax(rowMean / static_cast<double>(rows > 0 ? rows : 1), 1.0e-12));
+	d_stats[1] = static_cast<float>(fmax(colMean / static_cast<double>(cols > 0 ? cols : 1), 1.0e-12));
+	d_stats[2] = (rows > 0) ? rowMin : 1.0e-12f;
+	d_stats[3] = (rows > 0) ? rowMax : 1.0e-12f;
+	d_stats[4] = (cols > 0) ? colMin : 1.0e-12f;
+	d_stats[5] = (cols > 0) ? colMax : 1.0e-12f;
+}
+
+__global__ void echo_operand_second_dual_kernel(const float* __restrict__ d_rowObs,
+                                                const float* __restrict__ d_colObs,
+                                                float* __restrict__ d_rowSecond,
+                                                float* __restrict__ d_colSecond,
+                                                int samples,
+                                                int rows,
+                                                int cols,
+                                                float betaGeom)
+{
+	const int featureIdx = blockIdx.x;
+	const bool useRow = featureIdx < rows;
+	const int feature = useRow ? featureIdx : (featureIdx - rows);
+	const int dim = useRow ? rows : cols;
+	if (feature < 0 || feature >= dim)
+		return;
+
+	const float* d_obs = useRow ? d_rowObs : d_colObs;
+	float* d_second = useRow ? d_rowSecond : d_colSecond;
+
+	extern __shared__ float smem[];
+	float localSq = 0.0f;
+	for (int sample = threadIdx.x; sample < samples; sample += blockDim.x)
+	{
+		const float v =
+		    d_obs[static_cast<size_t>(sample) * static_cast<size_t>(dim) + static_cast<size_t>(feature)];
+		localSq += v * v;
+	}
+	localSq = blockReduceSum(localSq, smem);
+	if (threadIdx.x == 0)
+	{
+		const float sampleMean =
+		    fmaxf(localSq / fmaxf(static_cast<float>(samples), 1.0f), 1.0e-12f);
+		d_second[feature] =
+		    betaGeom * d_second[feature] + (1.0f - betaGeom) * sampleMean;
+	}
+}
+
+__global__ void echo_finalize_metrics_kernel(const float* __restrict__ d_rowSecond,
+                                             const float* __restrict__ d_colSecond,
+                                             float* __restrict__ d_rowMetric,
+                                             float* __restrict__ d_colMetric,
+                                             int rows,
+                                             int cols,
+                                             float eps,
+                                             float geomScale,
+                                             float* __restrict__ d_stats)
+{
+	if (blockIdx.x != 0)
+		return;
+
+	extern __shared__ float smem[];
+
+	float localRowSum = 0.0f;
+	float localRowMin = FLT_MAX;
+	float localRowMax = 0.0f;
+	for (int i = threadIdx.x; i < rows; i += blockDim.x)
+	{
+		const float v = fmaxf(d_rowSecond[i], 1.0e-12f);
+		localRowSum += v;
+		localRowMin = fminf(localRowMin, v);
+		localRowMax = fmaxf(localRowMax, v);
+	}
+
+	const float rowSum = blockReduceSum(localRowSum, smem);
+	const float rowMin = blockReduceMin(localRowMin, smem);
+	const float rowMax = blockReduceMax(localRowMax, smem);
+
+	__shared__ float sRowMean;
+	__shared__ float sColMean;
+	__shared__ float sRowMin;
+	__shared__ float sRowMax;
+	__shared__ float sColMin;
+	__shared__ float sColMax;
+	if (threadIdx.x == 0)
+	{
+		sRowMean = fmaxf(rowSum / fmaxf(static_cast<float>(rows), 1.0f), 1.0e-12f);
+		sRowMin = (rows > 0) ? rowMin : 1.0e-12f;
+		sRowMax = (rows > 0) ? rowMax : 1.0e-12f;
+	}
+	__syncthreads();
+
+	float localColSum = 0.0f;
+	float localColMin = FLT_MAX;
+	float localColMax = 0.0f;
+	for (int j = threadIdx.x; j < cols; j += blockDim.x)
+	{
+		const float v = fmaxf(d_colSecond[j], 1.0e-12f);
+		localColSum += v;
+		localColMin = fminf(localColMin, v);
+		localColMax = fmaxf(localColMax, v);
+	}
+
+	const float colSum = blockReduceSum(localColSum, smem);
+	const float colMin = blockReduceMin(localColMin, smem);
+	const float colMax = blockReduceMax(localColMax, smem);
+	if (threadIdx.x == 0)
+	{
+		sColMean = fmaxf(colSum / fmaxf(static_cast<float>(cols), 1.0f), 1.0e-12f);
+		sColMin = (cols > 0) ? colMin : 1.0e-12f;
+		sColMax = (cols > 0) ? colMax : 1.0e-12f;
+		d_stats[0] = sRowMean;
+		d_stats[1] = sColMean;
+		d_stats[2] = sRowMin;
+		d_stats[3] = sRowMax;
+		d_stats[4] = sColMin;
+		d_stats[5] = sColMax;
+	}
+	__syncthreads();
+
+	for (int i = threadIdx.x; i < rows; i += blockDim.x)
+	{
+		if (geomScale > 0.0f)
+		{
+			const float rowScaleRaw =
+			    sqrtf((fmaxf(d_rowSecond[i], 1.0e-12f) + eps) / (sRowMean + eps));
+			d_rowMetric[i] =
+			    pact_clamp_unit(1.0f + geomScale * (rowScaleRaw - 1.0f), 0.25f, 4.0f);
+		}
+		else
+		{
+			d_rowMetric[i] = 1.0f;
+		}
+	}
+	for (int j = threadIdx.x; j < cols; j += blockDim.x)
+	{
+		if (geomScale > 0.0f)
+		{
+			const float colScaleRaw =
+			    sqrtf((fmaxf(d_colSecond[j], 1.0e-12f) + eps) / (sColMean + eps));
+			d_colMetric[j] =
+			    pact_clamp_unit(1.0f + geomScale * (colScaleRaw - 1.0f), 0.25f, 4.0f);
+		}
+		else
+		{
+			d_colMetric[j] = 1.0f;
+		}
+	}
+}
+
+__global__ void echo_adam_update_kernel(float* __restrict__ d_W,
+                                        float* __restrict__ d_gW,
+                                        float* __restrict__ d_m,
+                                        float* __restrict__ d_v,
+                                        const float* __restrict__ d_rowMetric,
+                                        const float* __restrict__ d_colMetric,
+                                        int rows, int cols,
+                                        float lr,
+                                        float beta1, float beta2,
+                                        float gradScale,
+                                        int step,
+                                        float eps)
+{
+	const int total = rows * cols;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		const float g = d_gW[idx] * gradScale;
+		const float mNew = beta1 * d_m[idx] + (1.0f - beta1) * g;
+		const float vNew = beta2 * d_v[idx] + (1.0f - beta2) * g * g;
+		d_m[idx] = mNew;
+		d_v[idx] = vNew;
+
+		const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
+		const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
+		const float mHat = mNew / bc1;
+		const float vHat = vNew / bc2;
+		float stepVal = mHat / (sqrtf(fmaxf(vHat, 0.0f)) + eps);
+		stepVal /= (fmaxf(d_rowMetric[row], 1.0e-12f) * fmaxf(d_colMetric[col], 1.0e-12f));
+		d_W[idx] -= lr * stepVal;
+		d_gW[idx] = 0.0f;
+	}
+}
+
+__global__ void bimap_build_metric_vectors_kernel(const float* __restrict__ d_rowSecond,
+                                                  const float* __restrict__ d_colSecond,
+                                                  float* __restrict__ d_rowMetric,
+                                                  float* __restrict__ d_colMetric,
+                                                  int rows, int cols,
+                                                  float eps, float geomScale,
+                                                  const float* __restrict__ d_stats)
+{
+	const float rowMean = fmaxf(d_stats[0], 1.0e-12f);
+	const float colMean = fmaxf(d_stats[1], 1.0e-12f);
+	const int limit = (rows > cols) ? rows : cols;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < limit;
+	     idx += blockDim.x * gridDim.x)
+	{
+		if (idx < rows)
+		{
+			const float rowScaleRaw =
+			    sqrtf((fmaxf(d_rowSecond[idx], 1.0e-12f) + eps) / (rowMean + eps));
+			d_rowMetric[idx] =
+			    pact_clamp_unit(1.0f + geomScale * (rowScaleRaw - 1.0f), 0.25f, 4.0f);
+		}
+		if (idx < cols)
+		{
+			const float colScaleRaw =
+			    sqrtf((fmaxf(d_colSecond[idx], 1.0e-12f) + eps) / (colMean + eps));
+			d_colMetric[idx] =
+			    pact_clamp_unit(1.0f + geomScale * (colScaleRaw - 1.0f), 0.25f, 4.0f);
+		}
+	}
+}
+
+__global__ void bimap_init_identity_basis_kernel(float* __restrict__ d_basis,
+                                                 int dim,
+                                                 int rank)
+{
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < dim * rank;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / rank;
+		const int col = idx - row * rank;
+		d_basis[idx] = (row == col) ? 1.0f : 0.0f;
+	}
+}
+
+__global__ void bimap_corr_reduce_kernel(const float* __restrict__ d_m,
+                                         const float* __restrict__ d_prevMhat,
+                                         float inv1mB1t,
+                                         int total,
+                                         float* __restrict__ d_stats)
+{
+	const int nWarps = (blockDim.x + 31) / 32;
+	extern __shared__ float smem[];
+	float* sDot = smem;
+	float* sCur = sDot + nWarps;
+	float* sPrev = sCur + nWarps;
+
+	float localDot = 0.0f;
+	float localCur = 0.0f;
+	float localPrev = 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float cur = d_m[idx] * inv1mB1t;
+		const float prev = d_prevMhat[idx];
+		localDot += cur * prev;
+		localCur += cur * cur;
+		localPrev += prev * prev;
+	}
+
+	const float dot = blockReduceSum(localDot, sDot);
+	const float curNorm = blockReduceSum(localCur, sCur);
+	const float prevNorm = blockReduceSum(localPrev, sPrev);
+	if (threadIdx.x == 0)
+	{
+		atomicAdd(&d_stats[0], dot);
+		atomicAdd(&d_stats[1], curNorm);
+		atomicAdd(&d_stats[2], prevNorm);
+	}
+}
+
+__global__ void bimap_finalize_trust_kernel(float* __restrict__ d_stats,
+                                            float predictiveScale,
+                                            unsigned int enabled)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0)
+		return;
+
+	float trust = 0.0f;
+	if (enabled != 0u && predictiveScale > 0.0f
+	    && d_stats[1] > 1.0e-18f && d_stats[2] > 1.0e-18f)
+	{
+		const float cosine = d_stats[0] / (sqrtf(d_stats[1] * d_stats[2]) + 1.0e-18f);
+		trust = predictiveScale * fminf(1.0f, fmaxf(0.0f, cosine));
+	}
+	d_stats[3] = trust;
+}
+
+__global__ void bimap_prepare_steps_kernel(const float* __restrict__ d_m,
+                                           const float* __restrict__ d_v,
+                                           float* __restrict__ d_prevMhat,
+                                           float inv1mB1t,
+                                           float inv1mB2t,
+                                           float eps,
+                                           const float* __restrict__ d_stats,
+                                           float* __restrict__ d_adamStep,
+                                           float* __restrict__ d_stepMatrix,
+                                           int total)
+{
+	const float trust = d_stats[3];
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float currentMhat = d_m[idx] * inv1mB1t;
+		float effectiveMhat = currentMhat;
+		if (trust > 0.0f)
+		{
+			float delta = currentMhat - d_prevMhat[idx];
+			const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+			if (delta > deltaCap)
+				delta = deltaCap;
+			else if (delta < -deltaCap)
+				delta = -deltaCap;
+			effectiveMhat += trust * delta;
+		}
+
+		const float vhat = d_v[idx] * inv1mB2t;
+		const float denom = sqrtf(fmaxf(vhat, 0.0f)) + eps;
+		d_adamStep[idx] = currentMhat / denom;
+		d_stepMatrix[idx] = effectiveMhat / denom;
+		d_prevMhat[idx] = currentMhat;
+	}
+}
+
+__global__ void bimap_update_eigvals_kernel(const float* __restrict__ d_rowProj,
+                                            const float* __restrict__ d_colProj,
+                                            float* __restrict__ d_rowEigVal,
+                                            float* __restrict__ d_colEigVal,
+                                            int rows, int cols, int rank,
+                                            float betaGeom,
+                                            float* __restrict__ d_stats)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0)
+		return;
+
+	const float rowMean = fmaxf(d_stats[0], 1.0e-6f);
+	const float colMean = fmaxf(d_stats[1], 1.0e-6f);
+	unsigned int rowActive = 0u;
+	unsigned int colActive = 0u;
+	for (int c = 0; c < rank; ++c)
+	{
+		double rowEnergy = 0.0;
+		for (int j = 0; j < cols; ++j)
+		{
+			const double v = static_cast<double>(d_rowProj[static_cast<size_t>(c) * cols + j]);
+			rowEnergy += v * v;
+		}
+		rowEnergy /= static_cast<double>(cols > 0 ? cols : 1);
+		const float rowSample = static_cast<float>(rowEnergy / static_cast<double>(rowMean));
+		const float rowExcess = fmaxf(0.0f, rowSample - 1.0f);
+		d_rowEigVal[c] = betaGeom * d_rowEigVal[c] + (1.0f - betaGeom) * rowExcess;
+		if (d_rowEigVal[c] > 1.0e-3f)
+			rowActive = static_cast<unsigned int>(c + 1);
+
+		double colEnergy = 0.0;
+		for (int i = 0; i < rows; ++i)
+		{
+			const double v = static_cast<double>(d_colProj[static_cast<size_t>(i) * rank + c]);
+			colEnergy += v * v;
+		}
+		colEnergy /= static_cast<double>(rows > 0 ? rows : 1);
+		const float colSample = static_cast<float>(colEnergy / static_cast<double>(colMean));
+		const float colExcess = fmaxf(0.0f, colSample - 1.0f);
+		d_colEigVal[c] = betaGeom * d_colEigVal[c] + (1.0f - betaGeom) * colExcess;
+		if (d_colEigVal[c] > 1.0e-3f)
+			colActive = static_cast<unsigned int>(c + 1);
+	}
+
+	d_stats[6] =
+	    (rank > 0) ? (static_cast<float>(rowActive) / static_cast<float>(rank)) : 0.0f;
+	d_stats[7] =
+	    (rank > 0) ? (static_cast<float>(colActive) / static_cast<float>(rank)) : 0.0f;
+}
+
+__global__ void bimap_scale_basis_diag_kernel(const float* __restrict__ d_basis,
+                                              const float* __restrict__ d_metric,
+                                              float* __restrict__ d_out,
+                                              int dim,
+                                              int rank,
+                                              float eps)
+{
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < dim * rank;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / rank;
+		d_out[idx] = d_basis[idx] / fmaxf(d_metric[row], eps);
+	}
+}
+
+__global__ void bimap_add_lambda_inv_kernel(float* __restrict__ d_core,
+                                            const float* __restrict__ d_eigVal,
+                                            int rank,
+                                            float geomScale,
+                                            float eps)
+{
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < rank;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float lambdaInv =
+		    1.0f / fmaxf(geomScale * fmaxf(d_eigVal[idx], 0.0f), eps);
+		d_core[static_cast<size_t>(idx) * rank + idx] += lambdaInv;
+	}
+}
+
+__global__ void bimap_apply_row_diag_kernel(float* __restrict__ d_matrix,
+                                            const float* __restrict__ d_rowMetric,
+                                            int rows,
+                                            int cols,
+                                            float eps)
+{
+	const int total = rows * cols;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / cols;
+		d_matrix[idx] /= fmaxf(d_rowMetric[row], eps);
+	}
+}
+
+__global__ void bimap_apply_col_diag_kernel(float* __restrict__ d_matrix,
+                                            const float* __restrict__ d_colMetric,
+                                            int rows,
+                                            int cols,
+                                            float eps)
+{
+	const int total = rows * cols;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		d_matrix[idx] /= fmaxf(d_colMetric[col], eps);
+	}
+}
+
+__global__ void bimap_apply_residual_from_grad_kernel(float* __restrict__ d_W,
+                                                      float* __restrict__ d_gW,
+                                                      const float* __restrict__ d_stepMatrix,
+                                                      float lr,
+                                                      int total)
+{
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float adamStep = d_gW[idx];
+		d_W[idx] -= lr * (d_stepMatrix[idx] - adamStep);
+		d_gW[idx] = 0.0f;
+	}
+}
+
 __global__ void pact_lite_gain_kernel(const float* __restrict__ d_m,
                                       const float* __restrict__ d_v,
                                       const float* __restrict__ d_rowSecond,
@@ -3148,6 +3689,40 @@ __global__ void pact_lite_apply_residual_kernel(float* __restrict__ d_W,
 		const float colMetric = pact_clamp_unit(1.0f + geomScale * (colScaleRaw - 1.0f), 0.25f, 4.0f);
 		const float pactStep = adamStep / (rowMetric * colMetric);
 		d_W[idx] -= lr * (pactStep - adamStep);
+			d_gW[idx] = 0.0f;
+		}
+}
+
+__global__ void bimap_lite_apply_residual_kernel(float* __restrict__ d_W,
+                                                 float* __restrict__ d_gW,
+                                                 const float* __restrict__ d_stepMatrix,
+                                                 const float* __restrict__ d_rowSecond,
+                                                 const float* __restrict__ d_colSecond,
+                                                 int rows, int cols,
+                                                 float lr,
+                                                 float eps, float geomScale,
+                                                 float rowMean, float colMean)
+{
+	const int total = rows * cols;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		const float rowScaleRaw =
+		    sqrtf((fmaxf(d_rowSecond[row], 1.0e-12f) + eps) / (fmaxf(rowMean, 1.0e-12f) + eps));
+		const float colScaleRaw =
+		    sqrtf((fmaxf(d_colSecond[col], 1.0e-12f) + eps) / (fmaxf(colMean, 1.0e-12f) + eps));
+		float matrixScale = rowScaleRaw * colScaleRaw;
+		if (matrixScale < 0.25f)
+			matrixScale = 0.25f;
+		else if (matrixScale > 4.0f)
+			matrixScale = 4.0f;
+		const float mixedScale = fmaxf(0.25f, 1.0f + geomScale * (matrixScale - 1.0f));
+		const float bimapStep = d_stepMatrix[idx] / mixedScale;
+		const float adamStep = d_gW[idx];
+		d_W[idx] -= lr * (bimapStep - adamStep);
 		d_gW[idx] = 0.0f;
 	}
 }
@@ -3434,8 +4009,8 @@ static bool pact_gpu_init_lite(GpuPactWeightState& state,
 	if (!state.colScratch.allocate(n)) return false;
 	if (!state.gainScratch.allocate(2u)) return false;
 
-	state.hostRowSecond.assign(static_cast<size_t>(m), 1.0e-12f);
-	state.hostColSecond.assign(static_cast<size_t>(n), 1.0e-12f);
+	state.hostRowSecond.assign(static_cast<size_t>(m), 1.0f);
+	state.hostColSecond.assign(static_cast<size_t>(n), 1.0f);
 	state.hostColScratch.assign(static_cast<size_t>(n), 0.0f);
 	if (!state.rowSecond.upload(state.hostRowSecond.data(), state.hostRowSecond.size())) return false;
 	if (!state.colSecond.upload(state.hostColSecond.data(), state.hostColSecond.size())) return false;
@@ -3444,8 +4019,8 @@ static bool pact_gpu_init_lite(GpuPactWeightState& state,
 
 	state.m = m;
 	state.n = n;
-	state.rowMean = 1.0e-12f;
-	state.colMean = 1.0e-12f;
+	state.rowMean = 1.0f;
+	state.colMean = 1.0f;
 	state.promotionScore = 0.0f;
 	state.lastAdamGain = 0.0f;
 	state.lastPrecondGain = 0.0f;
@@ -3456,6 +4031,209 @@ static bool pact_gpu_init_lite(GpuPactWeightState& state,
 	state.lastColAnisotropy = 1.0f;
 	state.promoted = false;
 	state.promotedSteps = 0ULL;
+	state.step = 0ULL;
+	state.initialized = true;
+	return true;
+}
+
+static bool bimap_gpu_init_lite(GpuBiMAPWeightState& state,
+                                unsigned int m,
+                                unsigned int n)
+{
+	if (state.initialized && state.m == m && state.n == n)
+		return true;
+
+	state.rowSecond.free();
+	state.colSecond.free();
+	state.colScratch.free();
+	state.prevMhat.free();
+	state.stepMatrix.free();
+	state.scalarScratch.free();
+
+	if (!state.rowSecond.allocate(m)) return false;
+	if (!state.colSecond.allocate(n)) return false;
+	if (!state.colScratch.allocate(n)) return false;
+	if (!state.prevMhat.allocate(static_cast<size_t>(m) * static_cast<size_t>(n))) return false;
+	if (!state.stepMatrix.allocate(static_cast<size_t>(m) * static_cast<size_t>(n))) return false;
+	if (!state.scalarScratch.allocate(4u)) return false;
+
+	state.hostRowSecond.assign(static_cast<size_t>(m), 1.0f);
+	state.hostColSecond.assign(static_cast<size_t>(n), 1.0f);
+	state.hostColScratch.assign(static_cast<size_t>(n), 0.0f);
+	if (!state.rowSecond.upload(state.hostRowSecond.data(), state.hostRowSecond.size())) return false;
+	if (!state.colSecond.upload(state.hostColSecond.data(), state.hostColSecond.size())) return false;
+	if (!state.colScratch.zero()) return false;
+	if (!state.prevMhat.zero()) return false;
+	if (!state.stepMatrix.zero()) return false;
+	if (!state.scalarScratch.zero()) return false;
+
+	state.m = m;
+	state.n = n;
+	state.rowMean = 1.0f;
+	state.colMean = 1.0f;
+	state.lastPredictiveTrust = 0.0f;
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.step = 0ULL;
+	state.initialized = true;
+	return true;
+}
+
+static bool echo_gpu_init(GpuEchoWeightState& state,
+                          unsigned int m,
+                          unsigned int n)
+{
+	if (state.initialized && state.m == m && state.n == n)
+		return true;
+
+	state.rowSecond.free();
+	state.colSecond.free();
+	state.rowMetric.free();
+	state.colMetric.free();
+	state.scalarScratch.free();
+
+	if (!state.rowSecond.allocate(m)) return false;
+	if (!state.colSecond.allocate(n)) return false;
+	if (!state.rowMetric.allocate(m)) return false;
+	if (!state.colMetric.allocate(n)) return false;
+	if (!state.scalarScratch.allocate(6u)) return false;
+
+	std::vector<float> hostRowSecond(static_cast<size_t>(m), 1.0f);
+	std::vector<float> hostColSecond(static_cast<size_t>(n), 1.0f);
+	std::vector<float> hostRowMetric(static_cast<size_t>(m), 1.0f);
+	std::vector<float> hostColMetric(static_cast<size_t>(n), 1.0f);
+	if (!state.rowSecond.upload(hostRowSecond.data(), hostRowSecond.size())) return false;
+	if (!state.colSecond.upload(hostColSecond.data(), hostColSecond.size())) return false;
+	if (!state.rowMetric.upload(hostRowMetric.data(), hostRowMetric.size())) return false;
+	if (!state.colMetric.upload(hostColMetric.data(), hostColMetric.size())) return false;
+	if (!state.scalarScratch.zero()) return false;
+
+	state.m = m;
+	state.n = n;
+	state.rowMean = 1.0f;
+	state.colMean = 1.0f;
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.step = 0ULL;
+	state.initialized = true;
+	return true;
+}
+
+static bool echo_gpu_refresh_host_stats(GpuEchoWeightState& state)
+{
+	float stats[6] = { 0.0f };
+	if (!state.scalarScratch.download(stats, 6u))
+		return false;
+	state.rowMean = std::max(stats[0], 1.0e-12f);
+	state.colMean = std::max(stats[1], 1.0e-12f);
+	state.lastRowAnisotropy = (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : 1.0f;
+	state.lastColAnisotropy = (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : 1.0f;
+	return true;
+}
+
+static bool bimap_gpu_init_v2(GpuBiMAPWeightState& state,
+                              unsigned int m,
+                              unsigned int n,
+                              unsigned int rankCap)
+{
+	if (state.initialized && state.m == m && state.n == n
+	    && state.storageRank == rankCap
+	    && state.prevMhat.size() == static_cast<size_t>(m) * static_cast<size_t>(n))
+		return true;
+
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const size_t maxDim = static_cast<size_t>(std::max(m, n));
+	const size_t rank = static_cast<size_t>(rankCap);
+
+	state.rowSecond.free();
+	state.colSecond.free();
+	state.colScratch.free();
+	state.prevMhat.free();
+	state.stepMatrix.free();
+	state.rowMetric.free();
+	state.colMetric.free();
+	state.rowBasis.free();
+	state.colBasis.free();
+	state.rowWork.free();
+	state.colWork.free();
+	state.rowProj.free();
+	state.colProj.free();
+	state.factorScratch.free();
+	state.rowEigVal.free();
+	state.colEigVal.free();
+	state.coreScratch.free();
+	state.scalarScratch.free();
+
+	if (!state.rowSecond.allocate(m)) return false;
+	if (!state.colSecond.allocate(n)) return false;
+	if (!state.colScratch.allocate(n)) return false;
+	if (!state.prevMhat.allocate(mn)) return false;
+	if (!state.stepMatrix.allocate(mn)) return false;
+	if (!state.rowMetric.allocate(m)) return false;
+	if (!state.colMetric.allocate(n)) return false;
+	if (!state.scalarScratch.allocate(8u)) return false;
+
+	if (rankCap > 0u)
+	{
+		if (!state.rowBasis.allocate(static_cast<size_t>(m) * rank)) return false;
+		if (!state.colBasis.allocate(static_cast<size_t>(n) * rank)) return false;
+		if (!state.rowWork.allocate(static_cast<size_t>(m) * rank)) return false;
+		if (!state.colWork.allocate(static_cast<size_t>(n) * rank)) return false;
+		if (!state.rowProj.allocate(static_cast<size_t>(n) * rank)) return false;
+		if (!state.colProj.allocate(static_cast<size_t>(m) * rank)) return false;
+		if (!state.factorScratch.allocate(maxDim * rank)) return false;
+		if (!state.rowEigVal.allocate(rank)) return false;
+		if (!state.colEigVal.allocate(rank)) return false;
+		if (!state.coreScratch.allocate(2u * rank * rank)) return false;
+	}
+
+	state.hostRowSecond.assign(static_cast<size_t>(m), 1.0f);
+	state.hostColSecond.assign(static_cast<size_t>(n), 1.0f);
+	state.hostColScratch.assign(static_cast<size_t>(n), 0.0f);
+	if (!state.rowSecond.upload(state.hostRowSecond.data(), state.hostRowSecond.size())) return false;
+	if (!state.colSecond.upload(state.hostColSecond.data(), state.hostColSecond.size())) return false;
+	if (!state.colScratch.zero()) return false;
+	if (!state.prevMhat.zero()) return false;
+	if (!state.stepMatrix.zero()) return false;
+	if (!state.rowMetric.zero()) return false;
+	if (!state.colMetric.zero()) return false;
+	if (!state.scalarScratch.zero()) return false;
+	if (rankCap > 0u)
+	{
+		if (!state.rowWork.zero()) return false;
+		if (!state.colWork.zero()) return false;
+		if (!state.rowProj.zero()) return false;
+		if (!state.colProj.zero()) return false;
+		if (!state.factorScratch.zero()) return false;
+		if (!state.rowEigVal.zero()) return false;
+		if (!state.colEigVal.zero()) return false;
+		if (!state.coreScratch.zero()) return false;
+
+		const int rowBasisElems = static_cast<int>(m * rankCap);
+		const int rowBasisGrid = std::max(1, (rowBasisElems + kBlock - 1) / kBlock);
+		bimap_init_identity_basis_kernel<<<rowBasisGrid, kBlock, 0, computeStream()>>>(
+		    state.rowBasis.data(), static_cast<int>(m), static_cast<int>(rankCap));
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		const int colBasisElems = static_cast<int>(n * rankCap);
+		const int colBasisGrid = std::max(1, (colBasisElems + kBlock - 1) / kBlock);
+		bimap_init_identity_basis_kernel<<<colBasisGrid, kBlock, 0, computeStream()>>>(
+		    state.colBasis.data(), static_cast<int>(n), static_cast<int>(rankCap));
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+	}
+
+	state.m = m;
+	state.n = n;
+	state.storageRank = rankCap;
+	state.rowMean = 1.0f;
+	state.colMean = 1.0f;
+	state.lastPredictiveTrust = 0.0f;
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.lastRowCapture = 0.0f;
+	state.lastColCapture = 0.0f;
+	state.rowRank = 0u;
+	state.colRank = 0u;
 	state.step = 0ULL;
 	state.initialized = true;
 	return true;
@@ -3720,6 +4498,639 @@ bool pact_gpu_update_lite(GpuPactWeightState& state,
 		    << " rowAniso=" << state.lastRowAnisotropy
 		    << " colAniso=" << state.lastColAnisotropy
 		    << " promotedSteps=" << state.promotedSteps;
+		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
+	return true;
+}
+
+bool bimap_gpu_update_lite(GpuBiMAPWeightState& state,
+                           float* d_W, float* d_gW,
+                           float* d_m, float* d_v,
+                           unsigned int m, unsigned int n,
+                           float lr,
+                           float invBatch, float gradScale,
+                           float inv1mB1t, float inv1mB2t,
+                           float eps,
+                           const glades::ATLASConfig& ac,
+                           shmea::GLogger* logger,
+                           const char* tag)
+{
+	if (!d_W || !d_gW || !d_m || !d_v || m == 0u || n == 0u)
+		return true;
+	if (!bimap_gpu_init_lite(state, m, n))
+		return false;
+
+	const float geomScale = std::max(0.0f, ac.bimapGeometryScale);
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.bimapPredictiveScale));
+	const unsigned int cadence = std::max(1u, ac.bimapFactorCadence);
+	const bool refresh = ((state.step % cadence) == 0ULL);
+	const bool logDue =
+	    logger && ac.tSub > 0u
+	    && (((state.step + 1ULL) % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL);
+
+	if (refresh)
+	{
+		const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+		if (!state.colScratch.zero())
+			return false;
+		int block = static_cast<int>(std::min<unsigned int>(n, 256u));
+		block = ((block + 31) / 32) * 32;
+		if (block < 32)
+			block = 32;
+		if (block > 256)
+			block = 256;
+		const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+		pact_lite_stats_kernel<<<m, block, smemBytes, computeStream()>>>(
+		    d_gW, state.rowSecond.data(), state.colScratch.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    invBatch, gradScale, betaGeom);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+
+		if (!state.rowSecond.download(state.hostRowSecond.data(), state.hostRowSecond.size()))
+			return false;
+		if (!state.colScratch.download(state.hostColScratch.data(), state.hostColScratch.size()))
+			return false;
+
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const float sample =
+			    std::max(state.hostColScratch[static_cast<size_t>(j)] / std::max(1.0f, static_cast<float>(m)),
+			             1.0e-12f);
+			state.hostColSecond[static_cast<size_t>(j)] =
+			    betaGeom * state.hostColSecond[static_cast<size_t>(j)]
+			    + (1.0f - betaGeom) * sample;
+		}
+		if (!state.colSecond.upload(state.hostColSecond.data(), state.hostColSecond.size()))
+			return false;
+
+		double rowMean = 0.0;
+		double colMean = 0.0;
+		float rowMin = FLT_MAX;
+		float rowMax = 0.0f;
+		float colMin = FLT_MAX;
+		float colMax = 0.0f;
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			const float v = std::max(state.hostRowSecond[static_cast<size_t>(i)], 1.0e-12f);
+			rowMean += static_cast<double>(v);
+			rowMin = std::min(rowMin, v);
+			rowMax = std::max(rowMax, v);
+		}
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const float v = std::max(state.hostColSecond[static_cast<size_t>(j)], 1.0e-12f);
+			colMean += static_cast<double>(v);
+			colMin = std::min(colMin, v);
+			colMax = std::max(colMax, v);
+		}
+		state.rowMean = static_cast<float>(std::max(rowMean / static_cast<double>(std::max(1u, m)), 1.0e-12));
+		state.colMean = static_cast<float>(std::max(colMean / static_cast<double>(std::max(1u, n)), 1.0e-12));
+		state.lastRowAnisotropy = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
+		state.lastColAnisotropy = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
+	}
+
+	const int total = static_cast<int>(m * n);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	if (!state.scalarScratch.zero())
+		return false;
+	const int nWarps = (kBlock + 31) / 32;
+	bimap_corr_reduce_kernel<<<grid, kBlock,
+	                           3 * nWarps * static_cast<int>(sizeof(float)),
+	                           computeStream()>>>(
+	    d_m, state.prevMhat.data(), inv1mB1t, total, state.scalarScratch.data());
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	bimap_finalize_trust_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.scalarScratch.data(),
+	    predictiveScale,
+	    (predictiveScale > 0.0f && state.step > 0ULL) ? 1u : 0u);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	bimap_prepare_steps_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    d_m, d_v, state.prevMhat.data(),
+	    inv1mB1t, inv1mB2t, eps,
+	    state.scalarScratch.data(),
+	    d_gW, state.stepMatrix.data(),
+	    total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	if (geomScale > 0.0f)
+	{
+		bimap_lite_apply_residual_kernel<<<grid, kBlock, 0, computeStream()>>>(
+		    d_W, d_gW, state.stepMatrix.data(),
+		    state.rowSecond.data(), state.colSecond.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    lr, eps, geomScale,
+		    state.rowMean, state.colMean);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		if (!atlas_gpu_guard(d_W, static_cast<size_t>(m) * static_cast<size_t>(n)))
+			return false;
+	}
+	else
+	{
+		ATLAS_CUDA_CHECK(cudaMemsetAsync(d_gW, 0, static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
+		                                 computeStream()));
+	}
+
+	if (logDue)
+	{
+		float trustStats[4] = {0.0f};
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+		if (!state.scalarScratch.download(trustStats, 4u))
+			return false;
+		state.lastPredictiveTrust = trustStats[3];
+	}
+
+	state.step += 1ULL;
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		std::ostringstream oss;
+		oss << "event=gpu_bimap_step";
+		if (tag && tag[0])
+			oss << " tag=" << tag;
+		oss << " step=" << state.step
+		    << " predTrust=" << state.lastPredictiveTrust
+		    << " rowAniso=" << state.lastRowAnisotropy
+		    << " colAniso=" << state.lastColAnisotropy;
+		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
+	return true;
+}
+
+bool echo_gpu_observe(GpuEchoWeightState& state,
+                      const float* d_rowObs,
+                      const float* d_colObs,
+                      unsigned int samples,
+                      unsigned int m,
+                      unsigned int n,
+                      const glades::ATLASConfig& ac)
+{
+	if (!d_rowObs || !d_colObs || samples == 0u || m == 0u || n == 0u)
+		return false;
+	if (!echo_gpu_init(state, m, n))
+		return false;
+
+	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+	int block = static_cast<int>(std::min<unsigned int>(samples, 256u));
+	block = ((block + 31) / 32) * 32;
+	if (block < 32)
+		block = 32;
+	if (block > 256)
+		block = 256;
+	const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+
+	echo_operand_second_dual_kernel<<<static_cast<int>(m + n), block, smemBytes, computeStream()>>>(
+	    d_rowObs, d_colObs,
+	    state.rowSecond.data(), state.colSecond.data(),
+	    static_cast<int>(samples), static_cast<int>(m), static_cast<int>(n), betaGeom);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool echo_gpu_prepare_metrics(GpuEchoWeightState& state,
+                              unsigned int m,
+                              unsigned int n,
+                              unsigned long long optimizerStep,
+                              float eps,
+                              const glades::ATLASConfig& ac)
+{
+	if (m == 0u || n == 0u)
+		return true;
+	if (!echo_gpu_init(state, m, n))
+		return false;
+
+	const float geomScale = ac.echoEffectiveGeometryScale(optimizerStep);
+	int block = static_cast<int>(std::min<unsigned int>(std::max(m, n), 256u));
+	block = ((block + 31) / 32) * 32;
+	if (block < 32)
+		block = 32;
+	const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+
+	echo_finalize_metrics_kernel<<<1, block, smemBytes, computeStream()>>>(
+	    state.rowSecond.data(), state.colSecond.data(),
+	    state.rowMetric.data(), state.colMetric.data(),
+	    static_cast<int>(m), static_cast<int>(n),
+	    eps, geomScale,
+	    state.scalarScratch.data());
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	state.lastGeometryScale = geomScale;
+	return true;
+}
+
+bool echo_gpu_post_update(GpuEchoWeightState& state,
+                          const glades::ATLASConfig& ac,
+                          shmea::GLogger* logger,
+                          const char* tag)
+{
+	state.step += 1ULL;
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		if (!echo_gpu_refresh_host_stats(state))
+			return false;
+		std::ostringstream oss;
+		oss << "event=gpu_echo_step";
+		if (tag && tag[0])
+			oss << " tag=" << tag;
+		oss << " step=" << state.step
+		    << " geom=" << state.lastGeometryScale
+		    << " rowAniso=" << state.lastRowAnisotropy
+		    << " colAniso=" << state.lastColAnisotropy;
+		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+	return true;
+}
+
+bool echo_gpu_update(GpuEchoWeightState& state,
+                     float* d_W, float* d_gW,
+                     float* d_m, float* d_v,
+                     unsigned int m, unsigned int n,
+                     float lr,
+                     float gradScale,
+                     unsigned long long optimizerStep,
+                     float inv1mB1t, float inv1mB2t,
+                     float eps,
+                     const glades::ATLASConfig& ac,
+                     shmea::GLogger* logger,
+                     const char* tag)
+{
+	if (!d_W || !d_gW || !d_m || !d_v || m == 0u || n == 0u)
+		return true;
+	if (!echo_gpu_prepare_metrics(state, m, n, optimizerStep, eps, ac))
+		return false;
+
+	const int total = static_cast<int>(m * n);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	const float stepF = std::max(1.0f, static_cast<float>(optimizerStep));
+	const float beta1Pow = fmaxf(0.0f, 1.0f - (inv1mB1t > 0.0f ? (1.0f / inv1mB1t) : 1.0f));
+	const float beta2Pow = fmaxf(0.0f, 1.0f - (inv1mB2t > 0.0f ? (1.0f / inv1mB2t) : 1.0f));
+	const float beta1 = powf(beta1Pow, 1.0f / stepF);
+	const float beta2 = powf(beta2Pow, 1.0f / stepF);
+	echo_adam_update_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    d_W, d_gW, d_m, d_v,
+	    state.rowMetric.data(), state.colMetric.data(),
+	    static_cast<int>(m), static_cast<int>(n),
+	    lr, beta1, beta2,
+	    gradScale, static_cast<int>(optimizerStep), eps);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	return echo_gpu_post_update(state, ac, logger, tag);
+}
+
+bool bimap_gpu_update(GpuBiMAPWeightState& state,
+                      float* d_W, float* d_gW,
+                      float* d_m, float* d_v,
+                      unsigned int m, unsigned int n,
+                      float lr,
+                      float invBatch, float gradScale,
+                      float inv1mB1t, float inv1mB2t,
+                      float eps,
+                      const glades::ATLASConfig& ac,
+                      shmea::GLogger* logger,
+                      const char* tag)
+{
+	const float geomScale = std::max(0.0f, ac.bimapGeometryScale);
+	const bool useLowRank = ac.bimapLowRankEnabled && geomScale > 0.0f;
+	const unsigned int rankCap =
+	    useLowRank ? std::min(ac.rank, std::min(m, n)) : 0u;
+	if (!useLowRank || rankCap == 0u)
+	{
+		return bimap_gpu_update_lite(state,
+		                             d_W, d_gW,
+		                             d_m, d_v,
+		                             m, n,
+		                             lr,
+		                             invBatch, gradScale,
+		                             inv1mB1t, inv1mB2t,
+		                             eps,
+		                             ac, logger, tag);
+	}
+
+	if (!d_W || !d_gW || !d_m || !d_v || m == 0u || n == 0u)
+		return true;
+	if (!bimap_gpu_init_v2(state, m, n, rankCap))
+		return false;
+
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.bimapPredictiveScale));
+	const unsigned int cadence = std::max(1u, ac.bimapFactorCadence);
+	const unsigned int powerIters = std::max(1u, std::min(ac.powerIters, 2u));
+	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+	const bool refresh = ((state.step % cadence) == 0ULL);
+	const bool logDue =
+	    logger && ac.tSub > 0u
+	    && (((state.step + 1ULL) % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL);
+
+	if (refresh)
+	{
+		if (!state.colScratch.zero())
+			return false;
+		int block = static_cast<int>(std::min<unsigned int>(n, 256u));
+		block = ((block + 31) / 32) * 32;
+		if (block < 32)
+			block = 32;
+		if (block > 256)
+			block = 256;
+		const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+		pact_lite_stats_kernel<<<m, block, smemBytes, computeStream()>>>(
+		    d_gW, state.rowSecond.data(), state.colScratch.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    invBatch, gradScale, betaGeom);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		const int colGrid = std::max(1, (static_cast<int>(n) + kBlock - 1) / kBlock);
+		bimap_update_col_second_kernel<<<colGrid, kBlock, 0, computeStream()>>>(
+		    state.colSecond.data(), state.colScratch.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    betaGeom);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		bimap_finalize_stats_kernel<<<1, 1, 0, computeStream()>>>(
+		    state.rowSecond.data(), state.colSecond.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    state.scalarScratch.data());
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		const int metricGrid =
+		    std::max(1, (static_cast<int>(std::max(m, n)) + kBlock - 1) / kBlock);
+		bimap_build_metric_vectors_kernel<<<metricGrid, kBlock, 0, computeStream()>>>(
+		    state.rowSecond.data(), state.colSecond.data(),
+		    state.rowMetric.data(), state.colMetric.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    eps, geomScale,
+		    state.scalarScratch.data());
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		for (unsigned int iter = 0u; iter < powerIters; ++iter)
+		{
+			if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(rankCap), static_cast<int>(n),
+			                    1.0f,
+			                    d_gW, static_cast<int>(n),
+			                    state.colBasis.data(), static_cast<int>(rankCap),
+			                    0.0f,
+			                    state.rowBasis.data(), static_cast<int>(rankCap)))
+				return false;
+			if (!cholesky_qr(state.rowBasis.data(),
+			                 static_cast<int>(m),
+			                 static_cast<int>(rankCap),
+			                 state.coreScratch.data(),
+			                 state.coreScratch.size(),
+			                 state.rowWork.data()))
+				return false;
+
+			if (!sgemm_rowmajor_atb(static_cast<int>(n), static_cast<int>(rankCap), static_cast<int>(m),
+			                        1.0f,
+			                        d_gW, static_cast<int>(n),
+			                        state.rowBasis.data(), static_cast<int>(rankCap),
+			                        0.0f,
+			                        state.colBasis.data(), static_cast<int>(rankCap)))
+				return false;
+			if (!cholesky_qr(state.colBasis.data(),
+			                 static_cast<int>(n),
+			                 static_cast<int>(rankCap),
+			                 state.coreScratch.data(),
+			                 state.coreScratch.size(),
+			                 state.colWork.data()))
+				return false;
+		}
+
+		if (!sgemm_rowmajor_atb(static_cast<int>(rankCap), static_cast<int>(n), static_cast<int>(m),
+		                        1.0f,
+		                        state.rowBasis.data(), static_cast<int>(rankCap),
+		                        d_gW, static_cast<int>(n),
+		                        0.0f,
+		                        state.rowProj.data(), static_cast<int>(n)))
+			return false;
+		if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(rankCap), static_cast<int>(n),
+		                    1.0f,
+		                    d_gW, static_cast<int>(n),
+		                    state.colBasis.data(), static_cast<int>(rankCap),
+		                    0.0f,
+		                    state.colProj.data(), static_cast<int>(rankCap)))
+			return false;
+
+		bimap_update_eigvals_kernel<<<1, 1, 0, computeStream()>>>(
+		    state.rowProj.data(), state.colProj.data(),
+		    state.rowEigVal.data(), state.colEigVal.data(),
+		    static_cast<int>(m), static_cast<int>(n), static_cast<int>(rankCap),
+		    betaGeom,
+		    state.scalarScratch.data());
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		float geomStats[8] = {0.0f};
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+		if (!state.scalarScratch.download(geomStats, 8u))
+			return false;
+		state.rowMean = std::max(geomStats[0], 1.0e-12f);
+		state.colMean = std::max(geomStats[1], 1.0e-12f);
+		state.lastRowAnisotropy =
+		    (geomStats[2] > 1.0e-12f) ? (geomStats[3] / geomStats[2]) : 1.0f;
+		state.lastColAnisotropy =
+		    (geomStats[4] > 1.0e-12f) ? (geomStats[5] / geomStats[4]) : 1.0f;
+		state.lastRowCapture = geomStats[6];
+		state.lastColCapture = geomStats[7];
+		state.rowRank = std::min(rankCap,
+		                         static_cast<unsigned int>(std::max(0.0f,
+		                             floorf(state.lastRowCapture * static_cast<float>(rankCap) + 0.5f))));
+		state.colRank = std::min(rankCap,
+		                         static_cast<unsigned int>(std::max(0.0f,
+		                             floorf(state.lastColCapture * static_cast<float>(rankCap) + 0.5f))));
+	}
+
+	if (!state.scalarScratch.zero())
+		return false;
+	const int total = static_cast<int>(m * n);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	const int nWarps = (kBlock + 31) / 32;
+	bimap_corr_reduce_kernel<<<grid, kBlock,
+	                           3 * nWarps * static_cast<int>(sizeof(float)),
+	                           computeStream()>>>(
+	    d_m, state.prevMhat.data(), inv1mB1t, total, state.scalarScratch.data());
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	bimap_finalize_trust_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.scalarScratch.data(),
+	    predictiveScale,
+	    (predictiveScale > 0.0f && state.step > 0ULL) ? 1u : 0u);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	bimap_prepare_steps_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    d_m, d_v, state.prevMhat.data(),
+	    inv1mB1t, inv1mB2t, eps,
+	    state.scalarScratch.data(),
+	    d_gW, state.stepMatrix.data(),
+	    total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	bimap_apply_row_diag_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    state.stepMatrix.data(), state.rowMetric.data(),
+	    static_cast<int>(m), static_cast<int>(n), eps);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	const unsigned int activeRowRank = std::min(rankCap, state.rowRank);
+	if (activeRowRank > 0u)
+	{
+		const int basisGrid =
+		    std::max(1, (static_cast<int>(m * activeRowRank) + kBlock - 1) / kBlock);
+		bimap_scale_basis_diag_kernel<<<basisGrid, kBlock, 0, computeStream()>>>(
+		    state.rowBasis.data(), state.rowMetric.data(), state.rowWork.data(),
+		    static_cast<int>(m), static_cast<int>(activeRowRank), eps);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		if (!sgemm_rowmajor_atb(static_cast<int>(activeRowRank), static_cast<int>(activeRowRank), static_cast<int>(m),
+		                        1.0f,
+		                        state.rowBasis.data(), static_cast<int>(rankCap),
+		                        state.rowWork.data(), static_cast<int>(rankCap),
+		                        0.0f,
+		                        state.coreScratch.data(), static_cast<int>(activeRowRank)))
+			return false;
+		bimap_add_lambda_inv_kernel<<<1, static_cast<int>(activeRowRank), 0, computeStream()>>>(
+		    state.coreScratch.data(), state.rowEigVal.data(),
+		    static_cast<int>(activeRowRank), geomScale, eps);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		atlas_cholesky_inv_kernel<<<1, 1, 0, computeStream()>>>(
+		    state.coreScratch.data(), static_cast<int>(activeRowRank), true);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		if (!sgemm_rowmajor_abt(static_cast<int>(activeRowRank),
+		                        static_cast<int>(activeRowRank),
+		                        static_cast<int>(activeRowRank),
+		                        1.0f,
+		                        state.coreScratch.data(), static_cast<int>(activeRowRank),
+		                        state.coreScratch.data(), static_cast<int>(activeRowRank),
+		                        0.0f,
+		                        state.coreScratch.data() + static_cast<size_t>(rankCap) * rankCap,
+		                        static_cast<int>(activeRowRank)))
+			return false;
+		ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.coreScratch.data(),
+		                                 state.coreScratch.data() + static_cast<size_t>(rankCap) * rankCap,
+		                                 static_cast<size_t>(activeRowRank) * activeRowRank * sizeof(float),
+		                                 cudaMemcpyDeviceToDevice,
+		                                 computeStream()));
+
+		if (!sgemm_rowmajor_atb(static_cast<int>(activeRowRank), static_cast<int>(n), static_cast<int>(m),
+		                        1.0f,
+		                        state.rowBasis.data(), static_cast<int>(rankCap),
+		                        state.stepMatrix.data(), static_cast<int>(n),
+		                        0.0f,
+		                        state.rowProj.data(), static_cast<int>(n)))
+			return false;
+		if (!sgemm_rowmajor(static_cast<int>(activeRowRank), static_cast<int>(n), static_cast<int>(activeRowRank),
+		                    1.0f,
+		                    state.coreScratch.data(), static_cast<int>(activeRowRank),
+		                    state.rowProj.data(), static_cast<int>(n),
+		                    0.0f,
+		                    state.factorScratch.data(), static_cast<int>(n)))
+			return false;
+		if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(n), static_cast<int>(activeRowRank),
+		                    -1.0f,
+		                    state.rowWork.data(), static_cast<int>(rankCap),
+		                    state.factorScratch.data(), static_cast<int>(n),
+		                    1.0f,
+		                    state.stepMatrix.data(), static_cast<int>(n)))
+			return false;
+	}
+
+	bimap_apply_col_diag_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    state.stepMatrix.data(), state.colMetric.data(),
+	    static_cast<int>(m), static_cast<int>(n), eps);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	const unsigned int activeColRank = std::min(rankCap, state.colRank);
+	if (activeColRank > 0u)
+	{
+		const int basisGrid =
+		    std::max(1, (static_cast<int>(n * activeColRank) + kBlock - 1) / kBlock);
+		bimap_scale_basis_diag_kernel<<<basisGrid, kBlock, 0, computeStream()>>>(
+		    state.colBasis.data(), state.colMetric.data(), state.colWork.data(),
+		    static_cast<int>(n), static_cast<int>(activeColRank), eps);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		if (!sgemm_rowmajor_atb(static_cast<int>(activeColRank), static_cast<int>(activeColRank), static_cast<int>(n),
+		                        1.0f,
+		                        state.colBasis.data(), static_cast<int>(rankCap),
+		                        state.colWork.data(), static_cast<int>(rankCap),
+		                        0.0f,
+		                        state.coreScratch.data(), static_cast<int>(activeColRank)))
+			return false;
+		bimap_add_lambda_inv_kernel<<<1, static_cast<int>(activeColRank), 0, computeStream()>>>(
+		    state.coreScratch.data(), state.colEigVal.data(),
+		    static_cast<int>(activeColRank), geomScale, eps);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		atlas_cholesky_inv_kernel<<<1, 1, 0, computeStream()>>>(
+		    state.coreScratch.data(), static_cast<int>(activeColRank), true);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		if (!sgemm_rowmajor_abt(static_cast<int>(activeColRank),
+		                        static_cast<int>(activeColRank),
+		                        static_cast<int>(activeColRank),
+		                        1.0f,
+		                        state.coreScratch.data(), static_cast<int>(activeColRank),
+		                        state.coreScratch.data(), static_cast<int>(activeColRank),
+		                        0.0f,
+		                        state.coreScratch.data() + static_cast<size_t>(rankCap) * rankCap,
+		                        static_cast<int>(activeColRank)))
+			return false;
+		ATLAS_CUDA_CHECK(cudaMemcpyAsync(state.coreScratch.data(),
+		                                 state.coreScratch.data() + static_cast<size_t>(rankCap) * rankCap,
+		                                 static_cast<size_t>(activeColRank) * activeColRank * sizeof(float),
+		                                 cudaMemcpyDeviceToDevice,
+		                                 computeStream()));
+
+		if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(activeColRank), static_cast<int>(n),
+		                    1.0f,
+		                    state.stepMatrix.data(), static_cast<int>(n),
+		                    state.colBasis.data(), static_cast<int>(rankCap),
+		                    0.0f,
+		                    state.colProj.data(), static_cast<int>(activeColRank)))
+			return false;
+		if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(activeColRank), static_cast<int>(activeColRank),
+		                    1.0f,
+		                    state.colProj.data(), static_cast<int>(activeColRank),
+		                    state.coreScratch.data(), static_cast<int>(activeColRank),
+		                    0.0f,
+		                    state.factorScratch.data(), static_cast<int>(activeColRank)))
+			return false;
+		if (!sgemm_rowmajor_abt(static_cast<int>(m), static_cast<int>(n), static_cast<int>(activeColRank),
+		                        -1.0f,
+		                        state.factorScratch.data(), static_cast<int>(activeColRank),
+		                        state.colWork.data(), static_cast<int>(rankCap),
+		                        1.0f,
+		                        state.stepMatrix.data(), static_cast<int>(n)))
+			return false;
+	}
+
+	bimap_apply_residual_from_grad_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    d_W, d_gW, state.stepMatrix.data(), lr, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	if (!atlas_gpu_guard(d_W, static_cast<size_t>(m) * static_cast<size_t>(n)))
+		return false;
+
+	if (logDue)
+	{
+		float trustStats[4] = {0.0f};
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+		if (!state.scalarScratch.download(trustStats, 4u))
+			return false;
+		state.lastPredictiveTrust = trustStats[3];
+	}
+
+	state.step += 1ULL;
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		std::ostringstream oss;
+		oss << "event=gpu_bimap_step";
+		if (tag && tag[0])
+			oss << " tag=" << tag;
+		oss << " step=" << state.step
+		    << " predTrust=" << state.lastPredictiveTrust
+		    << " rowAniso=" << state.lastRowAnisotropy
+		    << " colAniso=" << state.lastColAnisotropy
+		    << " rowCapture=" << state.lastRowCapture
+		    << " colCapture=" << state.lastColCapture
+		    << " nativeLowRank=1";
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
 

@@ -2491,6 +2491,19 @@ void initBiMAPWeightState(BiMAPWeightState& state, unsigned int m, unsigned int 
 	state.initialized = true;
 }
 
+void initEchoWeightState(EchoWeightState& state, unsigned int m, unsigned int n)
+{
+	state.reset();
+	state.m = m;
+	state.n = n;
+	state.rowSecond.assign(static_cast<size_t>(m), 1.0f);
+	state.colSecond.assign(static_cast<size_t>(n), 1.0f);
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.step = 0ULL;
+	state.initialized = true;
+}
+
 void initKronWeightState(KronWeightState& state, unsigned int m, unsigned int n)
 {
 	state.reset();
@@ -8599,6 +8612,181 @@ static void bimap_apply_right_inverse(std::vector<float>& matrix,
 			    * (1.0f / std::max(diagMetric[j], eps));
 		}
 	}
+}
+
+bool echoObserve(EchoWeightState& state,
+                 const float* rowObs,
+                 const float* colObs,
+                 unsigned int samples,
+                 unsigned int m,
+                 unsigned int n,
+                 const ATLASConfig& ac)
+{
+	if (!rowObs || !colObs || samples == 0u || m == 0u || n == 0u)
+		return false;
+	if (!state.initialized || state.m != m || state.n != n)
+		initEchoWeightState(state, m, n);
+	if (!state.initialized || state.m != m || state.n != n)
+		return false;
+
+	const float betaGeom = std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
+	const double invSamples = 1.0 / static_cast<double>(samples);
+
+	double rowMean = 0.0;
+	double colMean = 0.0;
+	float rowMin = FLT_MAX;
+	float rowMax = 0.0f;
+	float colMin = FLT_MAX;
+	float colMax = 0.0f;
+
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		double sumSq = 0.0;
+		for (unsigned int s = 0u; s < samples; ++s)
+		{
+			const float v = rowObs[static_cast<size_t>(s) * static_cast<size_t>(m) + i];
+			sumSq += static_cast<double>(v) * static_cast<double>(v);
+		}
+		const float sample = static_cast<float>(std::max(sumSq * invSamples, 1.0e-12));
+		state.rowSecond[static_cast<size_t>(i)] =
+		    betaGeom * state.rowSecond[static_cast<size_t>(i)]
+		    + (1.0f - betaGeom) * sample;
+		const float cur = std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f);
+		rowMean += static_cast<double>(cur);
+		rowMin = std::min(rowMin, cur);
+		rowMax = std::max(rowMax, cur);
+	}
+	for (unsigned int j = 0u; j < n; ++j)
+	{
+		double sumSq = 0.0;
+		for (unsigned int s = 0u; s < samples; ++s)
+		{
+			const float v = colObs[static_cast<size_t>(s) * static_cast<size_t>(n) + j];
+			sumSq += static_cast<double>(v) * static_cast<double>(v);
+		}
+		const float sample = static_cast<float>(std::max(sumSq * invSamples, 1.0e-12));
+		state.colSecond[static_cast<size_t>(j)] =
+		    betaGeom * state.colSecond[static_cast<size_t>(j)]
+		    + (1.0f - betaGeom) * sample;
+		const float cur = std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f);
+		colMean += static_cast<double>(cur);
+		colMin = std::min(colMin, cur);
+		colMax = std::max(colMax, cur);
+	}
+
+	state.lastRowAnisotropy = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
+	state.lastColAnisotropy = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
+	(void)rowMean;
+	(void)colMean;
+	return true;
+}
+
+bool echoUpdate(EchoWeightState& state,
+                float* W, float* m1, float* v2, float* gW,
+                unsigned int m, unsigned int n,
+                float lr,
+                float beta1, float beta2,
+                float inv1mB1t, float inv1mB2t,
+                float eps,
+                float invBatch, float gradScale,
+                float wd1, float wd2,
+                unsigned long long optimizerStep,
+                const ATLASConfig& ac,
+                shmea::GLogger* logger,
+                const char* tag)
+{
+	if (!W || !m1 || !v2 || !gW || m == 0u || n == 0u)
+		return true;
+	if (!state.initialized || state.m != m || state.n != n)
+		initEchoWeightState(state, m, n);
+	if (!state.initialized || state.m != m || state.n != n)
+		return false;
+
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float oneMinusB1 = 1.0f - beta1;
+	const float oneMinusB2 = 1.0f - beta2;
+	const float geomScale = ac.echoEffectiveGeometryScale(optimizerStep);
+
+	double rowMean = 0.0;
+	double colMean = 0.0;
+	float rowMin = FLT_MAX;
+	float rowMax = 0.0f;
+	float colMin = FLT_MAX;
+	float colMax = 0.0f;
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		const float v = std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f);
+		rowMean += static_cast<double>(v);
+		rowMin = std::min(rowMin, v);
+		rowMax = std::max(rowMax, v);
+	}
+	for (unsigned int j = 0u; j < n; ++j)
+	{
+		const float v = std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f);
+		colMean += static_cast<double>(v);
+		colMin = std::min(colMin, v);
+		colMax = std::max(colMax, v);
+	}
+	const float rowMeanF =
+	    static_cast<float>(std::max(rowMean / static_cast<double>(std::max(1u, m)), 1.0e-12));
+	const float colMeanF =
+	    static_cast<float>(std::max(colMean / static_cast<double>(std::max(1u, n)), 1.0e-12));
+
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		const float rowScaleRaw =
+		    std::sqrt((std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f) + eps) / (rowMeanF + eps));
+		const float rowMetric =
+		    std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (rowScaleRaw - 1.0f)));
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const size_t idx = static_cast<size_t>(i) * n + j;
+			const float gScaledRaw = gW[idx] * invBatch * gradScale;
+			float g = gScaledRaw;
+			if (wd1 != 0.0f)
+				g += wd1 * atlas_sign(W[idx]) * gradScale;
+			m1[idx] = beta1 * m1[idx] + oneMinusB1 * g;
+			v2[idx] = beta2 * v2[idx] + oneMinusB2 * (g * g);
+
+			const float colScaleRaw =
+			    std::sqrt((std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f) + eps) / (colMeanF + eps));
+			const float colMetric =
+			    std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (colScaleRaw - 1.0f)));
+			const float currentMhat = m1[idx] * inv1mB1t;
+			const float vhat = v2[idx] * inv1mB2t;
+			const float diagDen =
+			    static_cast<float>(std::sqrt(static_cast<double>(std::max(vhat, 0.0f)))) + eps;
+			const float echoStep = currentMhat / (diagDen * rowMetric * colMetric);
+
+			if (wd2 != 0.0f)
+				W[idx] -= lr * wd2 * W[idx];
+			W[idx] -= lr * echoStep;
+			gW[idx] = 0.0f;
+			if (!atlas_isfinite(W[idx]))
+				return false;
+		}
+	}
+
+	state.lastRowAnisotropy = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
+	state.lastColAnisotropy = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
+	state.lastGeometryScale = geomScale;
+	state.step += 1ULL;
+
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		std::ostringstream oss;
+		oss << "event=echo_step";
+		if (tag && tag[0])
+			append_kv(oss, "tag", tag);
+		append_kv(oss, "step", state.step);
+		append_kv(oss, "geom", state.lastGeometryScale);
+		append_kv(oss, "rowAniso", state.lastRowAnisotropy);
+		append_kv(oss, "colAniso", state.lastColAnisotropy);
+		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
+	return true;
 }
 
 bool bimapUpdate(BiMAPWeightState& state,

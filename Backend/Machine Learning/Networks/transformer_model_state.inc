@@ -119,6 +119,8 @@
 			// ATLAS optimizer state per weight matrix in this block.
 			atlas::WeightState atlasWq, atlasWk, atlasWv, atlasWo;
 			atlas::WeightState atlasW1, atlasW2;
+			atlas::EchoWeightState echoWq, echoWk, echoWv, echoWo;
+			atlas::EchoWeightState echoW1, echoW2;
 			atlas::BiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
 			atlas::BiMAPWeightState bimapW1, bimapW2;
 			atlas::BiMAPWeightState pactWq, pactWk, pactWv, pactWo;
@@ -137,6 +139,9 @@
 		atlas::WeightState atlasWIn;
 		atlas::WeightState atlasWOut;
 		atlas::WeightState atlasTokE;
+		atlas::EchoWeightState echoWIn;
+		atlas::EchoWeightState echoWOut;
+		atlas::EchoWeightState echoTokE;
 		atlas::BiMAPWeightState bimapWIn;
 		atlas::BiMAPWeightState bimapWOut;
 		atlas::BiMAPWeightState bimapTokE;

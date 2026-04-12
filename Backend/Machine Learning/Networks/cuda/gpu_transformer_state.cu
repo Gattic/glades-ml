@@ -20,7 +20,9 @@ GpuTransformerWeights::GpuTransformerWeights()
       tokenModel(false), tieEmbeddings(false),
       blocks(0),
       d_adamParams(0), d_adamGrads(0), d_adamM(0), d_adamV(0),
+      d_adamRowMetric(0), d_adamColMetric(0),
       d_adamLr(0), d_adamWd(0), d_adamGroupScales(0), d_adamGroupPrevStepRms(0), d_adamSizes(0),
+      d_adamMetricRows(0), d_adamMetricCols(0),
       adamGroupCount(0), adamMaxSize(0), adamPtrsUploaded(false)
 {
 }
@@ -199,13 +201,21 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		e = cudaMalloc(&d_adamGrads,  maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamM,      maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamV,      maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamRowMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamColMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamLr,     maxGroups * sizeof(float));   if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamWd,     maxGroups * sizeof(float));   if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamGroupScales, maxGroups * sizeof(float)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamGroupPrevStepRms, maxGroups * sizeof(float)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamSizes,  maxGroups * sizeof(int));     if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamMetricRows, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamMetricCols, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
 		cudaMemset(d_adamGroupScales, 0, maxGroups * sizeof(float));
 		cudaMemset(d_adamGroupPrevStepRms, 0, maxGroups * sizeof(float));
+		cudaMemset(d_adamRowMetric, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamColMetric, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamMetricRows, 0, maxGroups * sizeof(int));
+		cudaMemset(d_adamMetricCols, 0, maxGroups * sizeof(int));
 		adamGroupCount = 0;
 		adamMaxSize = 0;
 		adamPtrsUploaded = false;
@@ -226,11 +236,15 @@ void GpuTransformerWeights::free()
 	if (d_adamGrads)  { cudaFree(d_adamGrads);  d_adamGrads  = 0; }
 	if (d_adamM)      { cudaFree(d_adamM);      d_adamM      = 0; }
 	if (d_adamV)      { cudaFree(d_adamV);       d_adamV      = 0; }
+	if (d_adamRowMetric) { cudaFree(d_adamRowMetric); d_adamRowMetric = 0; }
+	if (d_adamColMetric) { cudaFree(d_adamColMetric); d_adamColMetric = 0; }
 	if (d_adamLr)     { cudaFree(d_adamLr);      d_adamLr     = 0; }
 	if (d_adamWd)     { cudaFree(d_adamWd);      d_adamWd     = 0; }
 	if (d_adamGroupScales) { cudaFree(d_adamGroupScales); d_adamGroupScales = 0; }
 	if (d_adamGroupPrevStepRms) { cudaFree(d_adamGroupPrevStepRms); d_adamGroupPrevStepRms = 0; }
 	if (d_adamSizes)  { cudaFree(d_adamSizes);   d_adamSizes  = 0; }
+	if (d_adamMetricRows) { cudaFree(d_adamMetricRows); d_adamMetricRows = 0; }
+	if (d_adamMetricCols) { cudaFree(d_adamMetricCols); d_adamMetricCols = 0; }
 	adamGroupCount = 0;
 	adamMaxSize = 0;
 	adamPtrsUploaded = false;

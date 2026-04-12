@@ -33,9 +33,11 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_atlas.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
 #include "test_token_id_input_fixture.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -104,6 +106,445 @@ static shmea::GLogger* quiet_logger()
 		initialized = true;
 	}
 	return &logger;
+}
+
+static bool atlas_close_abs(float a, float b, float tol)
+{
+	return fabsf(a - b) <= tol;
+}
+
+static void assert_close_value(const char* label, float got, float expected, float tol)
+{
+	char msg[256];
+	sprintf(msg, "%s: got %.8f expected %.8f tol %.8f", label, got, expected, tol);
+	ASSERT(msg, atlas_close_abs(got, expected, tol));
+}
+
+static void assert_close_vector(const char* label,
+                                const std::vector<float>& got,
+                                const std::vector<float>& expected,
+                                float tol)
+{
+	ASSERT("vector size mismatch", got.size() == expected.size());
+	for (size_t i = 0u; i < got.size(); ++i)
+	{
+		char msg[256];
+		sprintf(msg, "%s[%zu]: got %.8f expected %.8f tol %.8f",
+		        label, i, got[i], expected[i], tol);
+		ASSERT(msg, atlas_close_abs(got[i], expected[i], tol));
+	}
+}
+
+static void print_vector_sample(const char* label,
+                                const std::vector<float>& values,
+                                size_t maxCount = 8u)
+{
+	printf("  %s:", label);
+	const size_t count = std::min(values.size(), maxCount);
+	for (size_t i = 0u; i < count; ++i)
+		printf(" %.8f", values[i]);
+	if (values.size() > count)
+		printf(" ...");
+	printf("\n");
+}
+
+static unsigned int active_rank_from_eigs(const std::vector<float>& eig, float threshold)
+{
+	unsigned int active = 0u;
+	for (size_t i = 0u; i < eig.size(); ++i)
+	{
+		if (eig[i] > threshold)
+			active = static_cast<unsigned int>(i + 1u);
+	}
+	return active;
+}
+
+static std::vector<float> weighted_projector(const std::vector<float>& basis,
+                                             const std::vector<float>& eig,
+                                             unsigned int dim,
+                                             unsigned int rank)
+{
+	std::vector<float> out(static_cast<size_t>(dim) * dim, 0.0f);
+	if (basis.size() < static_cast<size_t>(dim) * rank || eig.size() < rank)
+		return out;
+	for (unsigned int a = 0u; a < rank; ++a)
+	{
+		const float lambda = std::max(0.0f, eig[a]);
+		for (unsigned int i = 0u; i < dim; ++i)
+		{
+			const float ui = basis[static_cast<size_t>(i) * rank + a];
+			for (unsigned int j = 0u; j < dim; ++j)
+			{
+				out[static_cast<size_t>(i) * dim + j] +=
+				    lambda * ui * basis[static_cast<size_t>(j) * rank + a];
+			}
+		}
+	}
+	return out;
+}
+
+struct BiMAPParitySnapshot
+{
+	std::vector<float> W;
+	std::vector<float> m1;
+	std::vector<float> v2;
+	std::vector<float> g;
+	std::vector<float> rowSecond;
+	std::vector<float> colSecond;
+	std::vector<float> rowEigVal;
+	std::vector<float> colEigVal;
+	std::vector<float> rowBasis;
+	std::vector<float> colBasis;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastRowCapture;
+	float lastColCapture;
+	unsigned int rowRank;
+	unsigned int colRank;
+
+	BiMAPParitySnapshot()
+	    : lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f),
+	      lastColAnisotropy(1.0f),
+	      lastRowCapture(0.0f),
+	      lastColCapture(0.0f),
+	      rowRank(0u),
+	      colRank(0u)
+	{
+	}
+};
+
+static void capture_cpu_bimap_snapshot(BiMAPParitySnapshot& snap,
+                                       const std::vector<float>& W,
+                                       const std::vector<float>& m1,
+                                       const std::vector<float>& v2,
+                                       const std::vector<float>& g,
+                                       const glades::atlas::BiMAPWeightState& state)
+{
+	snap.W = W;
+	snap.m1 = m1;
+	snap.v2 = v2;
+	snap.g = g;
+	snap.rowSecond = state.rowSecond;
+	snap.colSecond = state.colSecond;
+	snap.rowEigVal = state.rowEigVal;
+	snap.colEigVal = state.colEigVal;
+	snap.rowBasis = state.rowBasis;
+	snap.colBasis = state.colBasis;
+	snap.lastPredictiveTrust = state.lastPredictiveTrust;
+	snap.lastRowAnisotropy = state.lastRowAnisotropy;
+	snap.lastColAnisotropy = state.lastColAnisotropy;
+	snap.lastRowCapture = state.lastRowCapture;
+	snap.lastColCapture = state.lastColCapture;
+	snap.rowRank = state.rowRank;
+	snap.colRank = state.colRank;
+}
+
+#ifdef GLADES_HAVE_CUDA
+static bool run_gpu_bimap_step(glades::gpu::GpuBiMAPWeightState& state,
+                               glades::gpu::GpuBuffer<float>& dW,
+                               glades::gpu::GpuBuffer<float>& dM,
+                               glades::gpu::GpuBuffer<float>& dV,
+                               glades::gpu::GpuBuffer<float>& dG,
+                               unsigned int m,
+                               unsigned int n,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               float eps,
+                               float invBatch,
+                               float gradScale,
+                               int step,
+                               const glades::ATLASConfig& ac,
+                               const std::vector<float>& grad)
+{
+	const size_t mn = static_cast<size_t>(m) * n;
+	ASSERT("gpu grad size mismatch", grad.size() == mn);
+	if (!dG.upload(grad.data(), grad.size()))
+		return false;
+	if (!glades::gpu::adam_update(dW.data(), dG.data(), dM.data(), dV.data(),
+	                              lr, beta1, beta2, eps,
+	                              0.0f, invBatch * gradScale, step,
+	                              static_cast<int>(mn)))
+		return false;
+	const double b1t = std::pow(static_cast<double>(beta1), static_cast<double>(step));
+	const double b2t = std::pow(static_cast<double>(beta2), static_cast<double>(step));
+	const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
+	const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
+	if (!glades::gpu::bimap_gpu_update(state,
+	                                   dW.data(), dG.data(), dM.data(), dV.data(),
+	                                   m, n, lr,
+	                                   invBatch, gradScale,
+	                                   inv1mB1t, inv1mB2t, eps,
+	                                   ac, quiet_logger(), "ut.bimap.parity"))
+		return false;
+	return glades::gpu::synchronizeCheck("bimap parity step");
+}
+
+static void capture_gpu_bimap_snapshot(BiMAPParitySnapshot& snap,
+                                       glades::gpu::GpuBuffer<float>& dW,
+                                       glades::gpu::GpuBuffer<float>& dM,
+                                       glades::gpu::GpuBuffer<float>& dV,
+                                       glades::gpu::GpuBuffer<float>& dG,
+                                       const glades::gpu::GpuBiMAPWeightState& state)
+{
+	snap.W.resize(dW.size());
+	snap.m1.resize(dM.size());
+	snap.v2.resize(dV.size());
+	snap.g.resize(dG.size());
+	dW.download(snap.W.data(), snap.W.size());
+	dM.download(snap.m1.data(), snap.m1.size());
+	dV.download(snap.v2.data(), snap.v2.size());
+	dG.download(snap.g.data(), snap.g.size());
+
+	snap.rowSecond.resize(state.rowSecond.size());
+	snap.colSecond.resize(state.colSecond.size());
+	state.rowSecond.download(snap.rowSecond.data(), snap.rowSecond.size());
+	state.colSecond.download(snap.colSecond.data(), snap.colSecond.size());
+
+	snap.rowEigVal.resize(state.rowEigVal.size());
+	snap.colEigVal.resize(state.colEigVal.size());
+	snap.rowBasis.resize(state.rowBasis.size());
+	snap.colBasis.resize(state.colBasis.size());
+	if (!snap.rowEigVal.empty())
+		state.rowEigVal.download(snap.rowEigVal.data(), snap.rowEigVal.size());
+	if (!snap.colEigVal.empty())
+		state.colEigVal.download(snap.colEigVal.data(), snap.colEigVal.size());
+	if (!snap.rowBasis.empty())
+		state.rowBasis.download(snap.rowBasis.data(), snap.rowBasis.size());
+	if (!snap.colBasis.empty())
+		state.colBasis.download(snap.colBasis.data(), snap.colBasis.size());
+
+	snap.lastPredictiveTrust = state.lastPredictiveTrust;
+	snap.lastRowAnisotropy = state.lastRowAnisotropy;
+	snap.lastColAnisotropy = state.lastColAnisotropy;
+	snap.lastRowCapture = state.lastRowCapture;
+	snap.lastColCapture = state.lastColCapture;
+	snap.rowRank = active_rank_from_eigs(snap.rowEigVal, 1.0e-3f);
+	snap.colRank = active_rank_from_eigs(snap.colEigVal, 1.0e-3f);
+}
+#endif
+
+static void assert_bimap_parity_snapshot(const char* label,
+                                         const BiMAPParitySnapshot& cpu,
+                                         const BiMAPParitySnapshot& gpu,
+                                         float valueTol,
+                                         float stateTol,
+                                         bool expectLowRank)
+{
+	if (gpu.W.size() == cpu.W.size())
+	{
+		for (size_t i = 0u; i < gpu.W.size(); ++i)
+		{
+			if (!atlas_close_abs(gpu.W[i], cpu.W[i], valueTol))
+			{
+				printf("[BiMAP parity debug] %s weight mismatch at %zu\n", label, i);
+				printf("  cpu rowRank=%u colRank=%u predTrust=%.8f rowAniso=%.8f colAniso=%.8f rowCapture=%.8f colCapture=%.8f\n",
+				       cpu.rowRank, cpu.colRank, cpu.lastPredictiveTrust,
+				       cpu.lastRowAnisotropy, cpu.lastColAnisotropy,
+				       cpu.lastRowCapture, cpu.lastColCapture);
+				printf("  gpu rowRank=%u colRank=%u predTrust=%.8f rowAniso=%.8f colAniso=%.8f rowCapture=%.8f colCapture=%.8f\n",
+				       gpu.rowRank, gpu.colRank, gpu.lastPredictiveTrust,
+				       gpu.lastRowAnisotropy, gpu.lastColAnisotropy,
+				       gpu.lastRowCapture, gpu.lastColCapture);
+				print_vector_sample("cpu W", cpu.W);
+				print_vector_sample("gpu W", gpu.W);
+				print_vector_sample("cpu rowSecond", cpu.rowSecond);
+				print_vector_sample("gpu rowSecond", gpu.rowSecond);
+				print_vector_sample("cpu colSecond", cpu.colSecond);
+				print_vector_sample("gpu colSecond", gpu.colSecond);
+				if (expectLowRank)
+				{
+					print_vector_sample("cpu rowEigVal", cpu.rowEigVal);
+					print_vector_sample("gpu rowEigVal", gpu.rowEigVal);
+					print_vector_sample("cpu colEigVal", cpu.colEigVal);
+					print_vector_sample("gpu colEigVal", gpu.colEigVal);
+				}
+				break;
+			}
+		}
+	}
+	assert_close_vector(label, gpu.W, cpu.W, valueTol);
+	assert_close_vector(label, gpu.m1, cpu.m1, valueTol);
+	assert_close_vector(label, gpu.v2, cpu.v2, valueTol);
+	assert_close_vector(label, gpu.g, cpu.g, valueTol);
+	assert_close_vector("rowSecond", gpu.rowSecond, cpu.rowSecond, stateTol);
+	assert_close_vector("colSecond", gpu.colSecond, cpu.colSecond, stateTol);
+
+	assert_close_value("predTrust", gpu.lastPredictiveTrust, cpu.lastPredictiveTrust, stateTol);
+	assert_close_value("rowAniso", gpu.lastRowAnisotropy, cpu.lastRowAnisotropy, stateTol);
+	assert_close_value("colAniso", gpu.lastColAnisotropy, cpu.lastColAnisotropy, stateTol);
+	assert_close_value("rowCapture", gpu.lastRowCapture, cpu.lastRowCapture, stateTol);
+	assert_close_value("colCapture", gpu.lastColCapture, cpu.lastColCapture, stateTol);
+
+	ASSERT("rowRank mismatch", gpu.rowRank == cpu.rowRank);
+	ASSERT("colRank mismatch", gpu.colRank == cpu.colRank);
+
+	if (expectLowRank)
+	{
+		assert_close_vector("rowEigVal", gpu.rowEigVal, cpu.rowEigVal, stateTol);
+		assert_close_vector("colEigVal", gpu.colEigVal, cpu.colEigVal, stateTol);
+
+		const unsigned int rowRank = static_cast<unsigned int>(gpu.rowEigVal.size());
+		const unsigned int colRank = static_cast<unsigned int>(gpu.colEigVal.size());
+		const unsigned int rowDim = static_cast<unsigned int>(gpu.rowSecond.size());
+		const unsigned int colDim = static_cast<unsigned int>(gpu.colSecond.size());
+		const std::vector<float> gpuRowProj =
+		    weighted_projector(gpu.rowBasis, gpu.rowEigVal, rowDim, rowRank);
+		const std::vector<float> cpuRowProj =
+		    weighted_projector(cpu.rowBasis, cpu.rowEigVal, rowDim, rowRank);
+		const std::vector<float> gpuColProj =
+		    weighted_projector(gpu.colBasis, gpu.colEigVal, colDim, colRank);
+		const std::vector<float> cpuColProj =
+		    weighted_projector(cpu.colBasis, cpu.colEigVal, colDim, colRank);
+		assert_close_vector("rowProjector", gpuRowProj, cpuRowProj, 5.0e-3f);
+		assert_close_vector("colProjector", gpuColProj, cpuColProj, 5.0e-3f);
+	}
+}
+
+struct EchoParitySnapshot
+{
+	std::vector<float> W;
+	std::vector<float> m1;
+	std::vector<float> v2;
+	std::vector<float> g;
+	std::vector<float> rowSecond;
+	std::vector<float> colSecond;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastGeometryScale;
+	unsigned long long step;
+
+	EchoParitySnapshot()
+	    : lastRowAnisotropy(1.0f),
+	      lastColAnisotropy(1.0f),
+	      lastGeometryScale(0.0f),
+	      step(0ULL)
+	{
+	}
+};
+
+static void capture_cpu_echo_snapshot(EchoParitySnapshot& snap,
+                                      const std::vector<float>& W,
+                                      const std::vector<float>& m1,
+                                      const std::vector<float>& v2,
+                                      const std::vector<float>& g,
+                                      const glades::atlas::EchoWeightState& state)
+{
+	snap.W = W;
+	snap.m1 = m1;
+	snap.v2 = v2;
+	snap.g = g;
+	snap.rowSecond = state.rowSecond;
+	snap.colSecond = state.colSecond;
+	snap.lastRowAnisotropy = state.lastRowAnisotropy;
+	snap.lastColAnisotropy = state.lastColAnisotropy;
+	snap.lastGeometryScale = state.lastGeometryScale;
+	snap.step = state.step;
+}
+
+#ifdef GLADES_HAVE_CUDA
+static bool run_gpu_echo_step(glades::gpu::GpuEchoWeightState& state,
+                              glades::gpu::GpuBuffer<float>& dW,
+                              glades::gpu::GpuBuffer<float>& dM,
+                              glades::gpu::GpuBuffer<float>& dV,
+                              glades::gpu::GpuBuffer<float>& dG,
+                              glades::gpu::GpuBuffer<float>& dRowObs,
+                              glades::gpu::GpuBuffer<float>& dColObs,
+                              unsigned int m,
+                              unsigned int n,
+                              unsigned int samples,
+                              float lr,
+                              float beta1,
+                              float beta2,
+                              float eps,
+                              float invBatch,
+                              float gradScale,
+                              int step,
+                              const glades::ATLASConfig& ac,
+                              const std::vector<float>& grad,
+                              const std::vector<float>& rowObs,
+                              const std::vector<float>& colObs)
+{
+	const size_t mn = static_cast<size_t>(m) * n;
+	ASSERT("gpu grad size mismatch", grad.size() == mn);
+	ASSERT("gpu row obs size mismatch", rowObs.size() == static_cast<size_t>(samples) * m);
+	ASSERT("gpu col obs size mismatch", colObs.size() == static_cast<size_t>(samples) * n);
+	if (!dG.upload(grad.data(), grad.size()))
+		return false;
+	if (!dRowObs.upload(rowObs.data(), rowObs.size()))
+		return false;
+	if (!dColObs.upload(colObs.data(), colObs.size()))
+		return false;
+	if (!glades::gpu::echo_gpu_observe(state,
+	                                   dRowObs.data(), dColObs.data(),
+	                                   samples, m, n, ac))
+		return false;
+	const double b1t = std::pow(static_cast<double>(beta1), static_cast<double>(step));
+	const double b2t = std::pow(static_cast<double>(beta2), static_cast<double>(step));
+	const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
+	const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
+	if (!glades::gpu::echo_gpu_update(state,
+	                                  dW.data(), dG.data(),
+	                                  dM.data(), dV.data(),
+	                                  m, n, lr, invBatch * gradScale,
+	                                  static_cast<unsigned long long>(step),
+	                                  inv1mB1t, inv1mB2t, eps,
+	                                  ac, quiet_logger(), "ut.echo.parity"))
+		return false;
+	return glades::gpu::synchronizeCheck("echo parity step");
+}
+
+static void capture_gpu_echo_snapshot(EchoParitySnapshot& snap,
+                                      glades::gpu::GpuBuffer<float>& dW,
+                                      glades::gpu::GpuBuffer<float>& dM,
+                                      glades::gpu::GpuBuffer<float>& dV,
+                                      glades::gpu::GpuBuffer<float>& dG,
+                                      const glades::gpu::GpuEchoWeightState& state)
+{
+	snap.W.resize(dW.size());
+	snap.m1.resize(dM.size());
+	snap.v2.resize(dV.size());
+	snap.g.resize(dG.size());
+	dW.download(snap.W.data(), snap.W.size());
+	dM.download(snap.m1.data(), snap.m1.size());
+	dV.download(snap.v2.data(), snap.v2.size());
+	dG.download(snap.g.data(), snap.g.size());
+
+	snap.rowSecond.resize(state.rowSecond.size());
+	snap.colSecond.resize(state.colSecond.size());
+	if (!snap.rowSecond.empty())
+		state.rowSecond.download(snap.rowSecond.data(), snap.rowSecond.size());
+	if (!snap.colSecond.empty())
+		state.colSecond.download(snap.colSecond.data(), snap.colSecond.size());
+
+	float stats[6] = { 0.0f };
+	if (state.scalarScratch.size() >= 6u)
+		state.scalarScratch.download(stats, 6u);
+	snap.lastRowAnisotropy = (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : state.lastRowAnisotropy;
+	snap.lastColAnisotropy = (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : state.lastColAnisotropy;
+	snap.lastGeometryScale = state.lastGeometryScale;
+	snap.step = state.step;
+}
+#endif
+
+static void assert_echo_parity_snapshot(const char* label,
+                                        const EchoParitySnapshot& cpu,
+                                        const EchoParitySnapshot& gpu,
+                                        float valueTol,
+                                        float stateTol)
+{
+	assert_close_vector(label, gpu.W, cpu.W, valueTol);
+	assert_close_vector("m1", gpu.m1, cpu.m1, valueTol);
+	assert_close_vector("v2", gpu.v2, cpu.v2, valueTol);
+	assert_close_vector("g", gpu.g, cpu.g, valueTol);
+	assert_close_vector("rowSecond", gpu.rowSecond, cpu.rowSecond, stateTol);
+	assert_close_vector("colSecond", gpu.colSecond, cpu.colSecond, stateTol);
+	assert_close_value("rowAniso", gpu.lastRowAnisotropy, cpu.lastRowAnisotropy, stateTol);
+	assert_close_value("colAniso", gpu.lastColAnisotropy, cpu.lastColAnisotropy, stateTol);
+	assert_close_value("geomScale", gpu.lastGeometryScale, cpu.lastGeometryScale, stateTol);
+	ASSERT("echo step mismatch", gpu.step == cpu.step);
 }
 
 static glades::NumberInput* make_atlas_transformer_resume_dataset()
@@ -464,6 +905,429 @@ void ATLASHelmMicroBenchmark()
 	printf("\n");
 }
 
+void ATLASECHOCoreUnitTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS ECHO Core Unit Test\n");
+	printf("============================================================\n");
+
+	const unsigned int m = 4u;
+	const unsigned int n = 3u;
+	const unsigned int samples = 2u;
+	const size_t mn = static_cast<size_t>(m) * n;
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float eps = 1.0e-8f;
+	const float invBatch = 1.0f;
+	const float gradScale = 1.0f;
+	const float inv1mB1t = 1.0f / (1.0f - beta1);
+	const float inv1mB2t = 1.0f / (1.0f - beta2);
+
+	const float initWRaw[] = {
+		0.20f, -0.30f, 0.10f,
+		0.40f, -0.10f, 0.30f,
+		-0.20f, 0.50f, -0.40f,
+		0.15f, -0.25f, 0.35f
+	};
+	const float gradRaw[] = {
+		1.80f, 0.20f, -0.10f,
+		1.20f, -0.30f, 0.40f,
+		-0.90f, 0.10f, 0.05f,
+		0.70f, -0.15f, 0.02f
+	};
+	const float rowObsRaw[] = {
+		3.0f, 1.0f, 0.5f, 0.25f,
+		2.5f, 0.9f, 0.4f, 0.2f
+	};
+	const float colObsRaw[] = {
+		0.2f, 1.0f, 4.0f,
+		0.3f, 0.9f, 3.5f
+	};
+	const std::vector<float> initW(initWRaw, initWRaw + mn);
+	const std::vector<float> grad(gradRaw, gradRaw + mn);
+	const std::vector<float> rowObs(rowObsRaw, rowObsRaw + samples * m);
+	const std::vector<float> colObs(colObsRaw, colObsRaw + samples * n);
+
+	glades::ATLASConfig adamFallbackAc;
+	adamFallbackAc.beta = 0.0f;
+	adamFallbackAc.echoEnabled = true;
+	adamFallbackAc.echoGeometryScale = 0.0f;
+	adamFallbackAc.tSub = 1u;
+
+	glades::ATLASConfig echoAc = adamFallbackAc;
+	echoAc.echoGeometryScale = 1.0f;
+
+	glades::atlas::EchoWeightState fallbackState;
+	glades::atlas::EchoWeightState echoState;
+	ASSERT("echoObserve fallback failed",
+	       glades::atlas::echoObserve(fallbackState,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, adamFallbackAc));
+	ASSERT("echoObserve geometry failed",
+	       glades::atlas::echoObserve(echoState,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, echoAc));
+
+	std::vector<float> fallbackW = initW;
+	std::vector<float> fallbackM(mn, 0.0f);
+	std::vector<float> fallbackV(mn, 0.0f);
+	std::vector<float> fallbackG = grad;
+	ASSERT("echoUpdate fallback failed",
+	       glades::atlas::echoUpdate(fallbackState,
+	                                 fallbackW.data(), fallbackM.data(), fallbackV.data(), fallbackG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 adamFallbackAc, quiet_logger(), "ut.echo.fallback"));
+
+	std::vector<float> expectedW = initW;
+	std::vector<float> expectedM(mn, 0.0f);
+	std::vector<float> expectedV(mn, 0.0f);
+	for (size_t idx = 0u; idx < mn; ++idx)
+	{
+		const float g = grad[idx];
+		expectedM[idx] = (1.0f - beta1) * g;
+		expectedV[idx] = (1.0f - beta2) * (g * g);
+		const float step = g / (fabsf(g) + eps);
+		expectedW[idx] -= lr * step;
+	}
+
+	assert_close_vector("echo-fallback-W", fallbackW, expectedW, 1.0e-6f);
+	assert_close_vector("echo-fallback-m1", fallbackM, expectedM, 1.0e-6f);
+	assert_close_vector("echo-fallback-v2", fallbackV, expectedV, 1.0e-6f);
+	for (size_t idx = 0u; idx < mn; ++idx)
+		ASSERT("fallback gradients not cleared", fallbackG[idx] == 0.0f);
+
+	std::vector<float> echoW = initW;
+	std::vector<float> echoM(mn, 0.0f);
+	std::vector<float> echoV(mn, 0.0f);
+	std::vector<float> echoG = grad;
+	ASSERT("echoUpdate geometry failed",
+	       glades::atlas::echoUpdate(echoState,
+	                                 echoW.data(), echoM.data(), echoV.data(), echoG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 echoAc, quiet_logger(), "ut.echo.geometry"));
+
+	ASSERT("echo row anisotropy not active", echoState.lastRowAnisotropy > 1.5f);
+	ASSERT("echo col anisotropy not active", echoState.lastColAnisotropy > 1.5f);
+	ASSERT("echo geometry scale not recorded", fabsf(echoState.lastGeometryScale - 1.0f) < 1.0e-6f);
+	ASSERT("echo step counter not advanced", echoState.step == 1ULL);
+
+	double diffNorm = 0.0;
+	for (size_t idx = 0u; idx < mn; ++idx)
+	{
+		const double delta = static_cast<double>(echoW[idx]) - static_cast<double>(fallbackW[idx]);
+		diffNorm += delta * delta;
+	}
+	ASSERT("echo geometry did not change the step", diffNorm > 1.0e-8);
+
+	glades::ATLASConfig scheduleAc = echoAc;
+	scheduleAc.echoGeometryScale = 1.0f;
+	scheduleAc.echoGeometryScaleFinal = 0.25f;
+	scheduleAc.echoGeometryDecaySteps = 4u;
+	glades::atlas::EchoWeightState scheduleStateStep1;
+	glades::atlas::EchoWeightState scheduleStateStep5;
+	ASSERT("echoObserve schedule step1 failed",
+	       glades::atlas::echoObserve(scheduleStateStep1,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, scheduleAc));
+	ASSERT("echoObserve schedule step5 failed",
+	       glades::atlas::echoObserve(scheduleStateStep5,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, scheduleAc));
+	std::vector<float> scheduleW1 = initW;
+	std::vector<float> scheduleM1(mn, 0.0f);
+	std::vector<float> scheduleV1(mn, 0.0f);
+	std::vector<float> scheduleG1 = grad;
+	ASSERT("echoUpdate schedule step1 failed",
+	       glades::atlas::echoUpdate(scheduleStateStep1,
+	                                 scheduleW1.data(), scheduleM1.data(), scheduleV1.data(), scheduleG1.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 scheduleAc, quiet_logger(), "ut.echo.schedule1"));
+	std::vector<float> scheduleW5 = initW;
+	std::vector<float> scheduleM5(mn, 0.0f);
+	std::vector<float> scheduleV5(mn, 0.0f);
+	std::vector<float> scheduleG5 = grad;
+	ASSERT("echoUpdate schedule step5 failed",
+	       glades::atlas::echoUpdate(scheduleStateStep5,
+	                                 scheduleW5.data(), scheduleM5.data(), scheduleV5.data(), scheduleG5.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 5ULL,
+	                                 scheduleAc, quiet_logger(), "ut.echo.schedule5"));
+	ASSERT("echo schedule initial scale mismatch", fabsf(scheduleStateStep1.lastGeometryScale - 1.0f) < 1.0e-6f);
+	ASSERT("echo schedule final scale mismatch", fabsf(scheduleStateStep5.lastGeometryScale - 0.25f) < 1.0e-6f);
+	ASSERT("echo schedule did not decay", scheduleStateStep5.lastGeometryScale < scheduleStateStep1.lastGeometryScale);
+
+	printf("[UT] ECHO core: PASSED\n");
+	printf("============================================================\n");
+}
+
+void ATLASECHOParityTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS ECHO CPU-vs-GPU Parity Test\n");
+	printf("============================================================\n");
+
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		printf("No CUDA device available, skipping ECHO parity tests.\n");
+		printf("============================================================\n");
+		return;
+	}
+
+	const unsigned int m = 4u;
+	const unsigned int n = 3u;
+	const unsigned int samples = 2u;
+	const size_t mn = static_cast<size_t>(m) * n;
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float eps = 1.0e-8f;
+	const float invBatch = 1.0f;
+	const float gradScale = 1.0f;
+
+	const float initWRaw[] = {
+		0.20f, -0.30f, 0.10f,
+		0.40f, -0.10f, 0.30f,
+		-0.20f, 0.50f, -0.40f,
+		0.15f, -0.25f, 0.35f
+	};
+	const float g1Raw[] = {
+		1.80f, 0.20f, -0.10f,
+		1.20f, -0.30f, 0.40f,
+		-0.90f, 0.10f, 0.05f,
+		0.70f, -0.15f, 0.02f
+	};
+	const float g2Raw[] = {
+		1.30f, 0.18f, -0.06f,
+		0.95f, -0.22f, 0.35f,
+		-0.75f, 0.08f, 0.04f,
+		0.55f, -0.11f, 0.03f
+	};
+	const float rowObs1Raw[] = {
+		3.0f, 1.0f, 0.5f, 0.25f,
+		2.5f, 0.9f, 0.4f, 0.2f
+	};
+	const float rowObs2Raw[] = {
+		2.8f, 0.95f, 0.55f, 0.30f,
+		2.3f, 0.85f, 0.45f, 0.22f
+	};
+	const float colObs1Raw[] = {
+		0.2f, 1.0f, 4.0f,
+		0.3f, 0.9f, 3.5f
+	};
+	const float colObs2Raw[] = {
+		0.25f, 1.1f, 3.8f,
+		0.35f, 0.85f, 3.2f
+	};
+
+	const std::vector<float> initW(initWRaw, initWRaw + mn);
+	const std::vector<float> grads[] = {
+		std::vector<float>(g1Raw, g1Raw + mn),
+		std::vector<float>(g2Raw, g2Raw + mn)
+	};
+	const std::vector<float> rowObs[] = {
+		std::vector<float>(rowObs1Raw, rowObs1Raw + samples * m),
+		std::vector<float>(rowObs2Raw, rowObs2Raw + samples * m)
+	};
+	const std::vector<float> colObs[] = {
+		std::vector<float>(colObs1Raw, colObs1Raw + samples * n),
+		std::vector<float>(colObs2Raw, colObs2Raw + samples * n)
+	};
+
+	glades::ATLASConfig ac;
+	ac.beta = 0.7f;
+	ac.echoEnabled = true;
+	ac.echoGeometryScale = 1.0f;
+	ac.tSub = 1u;
+
+	std::vector<float> cpuW = initW;
+	std::vector<float> cpuM(mn, 0.0f);
+	std::vector<float> cpuV(mn, 0.0f);
+	std::vector<float> cpuG(mn, 0.0f);
+	glades::atlas::EchoWeightState cpuState;
+
+	glades::gpu::GpuBuffer<float> dW;
+	glades::gpu::GpuBuffer<float> dM;
+	glades::gpu::GpuBuffer<float> dV;
+	glades::gpu::GpuBuffer<float> dG;
+	glades::gpu::GpuBuffer<float> dRowObs;
+	glades::gpu::GpuBuffer<float> dColObs;
+	ASSERT("gpu dW alloc failed", dW.allocate(mn));
+	ASSERT("gpu dM alloc failed", dM.allocate(mn));
+	ASSERT("gpu dV alloc failed", dV.allocate(mn));
+	ASSERT("gpu dG alloc failed", dG.allocate(mn));
+	ASSERT("gpu dRowObs alloc failed", dRowObs.allocate(static_cast<size_t>(samples) * m));
+	ASSERT("gpu dColObs alloc failed", dColObs.allocate(static_cast<size_t>(samples) * n));
+	ASSERT("gpu dW upload failed", dW.upload(initW.data(), initW.size()));
+	ASSERT("gpu dM zero failed", dM.zero());
+	ASSERT("gpu dV zero failed", dV.zero());
+	ASSERT("gpu dG zero failed", dG.zero());
+	glades::gpu::GpuEchoWeightState gpuState;
+
+	for (int step = 0; step < 2; ++step)
+	{
+		cpuG = grads[step];
+		ASSERT("cpu echo observe failed",
+		       glades::atlas::echoObserve(cpuState,
+		                                  rowObs[step].data(), colObs[step].data(),
+		                                  samples, m, n, ac));
+		const double b1t = std::pow(static_cast<double>(beta1), static_cast<double>(step + 1));
+		const double b2t = std::pow(static_cast<double>(beta2), static_cast<double>(step + 1));
+		const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
+		const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
+		ASSERT("cpu echo update failed",
+		       glades::atlas::echoUpdate(cpuState,
+		                                 cpuW.data(), cpuM.data(), cpuV.data(), cpuG.data(),
+		                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                 invBatch, gradScale, 0.0f, 0.0f,
+		                                 static_cast<unsigned long long>(step + 1),
+		                                 ac, quiet_logger(), "ut.echo.cpu"));
+
+		ASSERT("gpu echo update failed",
+		       run_gpu_echo_step(gpuState,
+		                         dW, dM, dV, dG, dRowObs, dColObs,
+		                         m, n, samples,
+		                         lr, beta1, beta2, eps,
+		                         invBatch, gradScale, step + 1,
+		                         ac, grads[step], rowObs[step], colObs[step]));
+
+		EchoParitySnapshot cpuSnap;
+		EchoParitySnapshot gpuSnap;
+		capture_cpu_echo_snapshot(cpuSnap, cpuW, cpuM, cpuV, cpuG, cpuState);
+		capture_gpu_echo_snapshot(gpuSnap, dW, dM, dV, dG, gpuState);
+
+		char label[64];
+		sprintf(label, "echo step %d", step + 1);
+		assert_echo_parity_snapshot(label, cpuSnap, gpuSnap, 1.0e-5f, 1.0e-5f);
+	}
+
+	printf("[UT] ECHO parity: PASSED\n");
+	printf("============================================================\n");
+#else
+	printf("CUDA not enabled, skipping ECHO parity tests.\n");
+	printf("============================================================\n");
+#endif
+}
+
+void ATLASECHOMicroBenchmark()
+{
+	struct MicroVariantSpec
+	{
+		const char* label;
+		glades::OptimizerConfig::Type optimizerType;
+		float learningRate;
+		bool echoEnabled;
+		float echoGeometryScale;
+	};
+
+	static const unsigned int kVocab = 17u;
+	static const unsigned int kPadTokenId = kVocab - 1u;
+	static const unsigned int kTrainSeqs = 8u;
+	static const unsigned int kSeqLen = 8u;
+	static const unsigned int kLayers = 1u;
+	static const unsigned int kDModel = 8u;
+	static const unsigned int kHeads = 2u;
+	static const unsigned int kDff = 16u;
+	static const unsigned int kEpochs = 2u;
+
+	const MicroVariantSpec specs[] = {
+		{ "AdamW", glades::OptimizerConfig::ADAMW, 0.001f, false, 0.0f },
+		{ "ECHO-0", glades::OptimizerConfig::ATLAS, 0.001f, true, 0.0f },
+		{ "ECHO", glades::OptimizerConfig::ATLAS, 0.001f, true, 1.0f },
+	};
+	const size_t specCount = sizeof(specs) / sizeof(specs[0]);
+
+	printf("============================================================\n");
+	printf("ATLAS ECHO Transformer Micro-Benchmark\n");
+	printf("============================================================\n");
+	printf("Config: vocab=%u trainSeqs=%u seqLen=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u gpu=off\n",
+	       kVocab, kTrainSeqs, kSeqLen, kDModel, kDff, kLayers, kHeads, kEpochs);
+	printf("%-12s %10s %12s %12s %10s %10s %s\n",
+	       "Optimizer", "Train(s)", "TrainNLL", "TrainPPL", "ApplyMs", "HeadShr", "Status");
+
+	for (size_t i = 0u; i < specCount; ++i)
+	{
+		const MicroVariantSpec& spec = specs[i];
+		InMemoryTokenIdInput* di = make_atlas_token_dataset(kVocab, kTrainSeqs, kSeqLen,
+		                                                    90000u + static_cast<unsigned int>(100u * i),
+		                                                    kPadTokenId);
+		glades::NNInfo* info = make_atlas_transformer_token_info("ut_atlas_echo_micro",
+		                                                         kVocab, kDModel, kLayers,
+		                                                         spec.learningRate);
+		{
+			glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+			net.setSeed(90100u + static_cast<unsigned int>(100u * i));
+			net.setLogger(quiet_logger());
+			net.getTerminatorMutable().setEpoch(static_cast<int>(kEpochs));
+			net.getTerminatorMutable().setAccuracy(0.0f);
+
+			{
+				glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+				cfg.gpu.enable = false;
+				cfg.optimizer.type = spec.optimizerType;
+				cfg.transformer.enableTokenEmbedding = true;
+				cfg.transformer.vocabSizeOverride = static_cast<int>(kVocab);
+				cfg.transformer.tieEmbeddings = true;
+				cfg.transformer.padTokenId = static_cast<int>(kPadTokenId);
+				cfg.transformer.nHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.nKVHeadsOverride = static_cast<int>(kHeads);
+				cfg.transformer.dFFOverride = static_cast<int>(kDff);
+				cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+				cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+				cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+
+				if (spec.optimizerType == glades::OptimizerConfig::ATLAS)
+				{
+					cfg.atlas.rank = 4u;
+					cfg.atlas.complementRank = 0u;
+					cfg.atlas.tSub = 8u;
+					cfg.atlas.beta = 0.999f;
+					cfg.atlas.echoEnabled = spec.echoEnabled;
+					cfg.atlas.echoGeometryScale = spec.echoGeometryScale;
+				}
+			}
+
+			CaptureMetricsCallbacks cb;
+			const int64_t startMs = now_ms();
+			const glades::NNetworkStatus st = net.train(di, &cb);
+			const int64_t endMs = now_ms();
+
+			glades::NNetwork::AtlasRuntimeDiagnostics diag;
+			const bool haveDiag = net.getAtlasRuntimeDiagnostics(diag);
+			const float trainNll = cb.saw ? cb.last.totalError : 0.0f;
+			const float trainPpl = cb.saw ? cb.last.perplexity : 0.0f;
+			const double applyMs =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanApplyMs : 0.0;
+			const double headShare =
+			    (haveDiag && diag.transformerGapBatches > 0u) ? diag.transformerMeanHeadShare : 0.0;
+			const std::string status =
+			    (!st.ok()) ? st.message : (cb.saw ? "ok" : "no metrics");
+
+			printf("%-12s %10.3f %12.5f %12.5f %10.4f %10.4f %s\n",
+			       spec.label,
+			       static_cast<double>(endMs - startMs) / 1000.0,
+			       trainNll,
+			       trainPpl,
+			       applyMs,
+			       headShare,
+			       status.c_str());
+		}
+
+		delete di;
+		delete info;
+	}
+
+	printf("\n");
+}
+
 void ATLASBiMAPMicroBenchmark()
 {
 	struct MicroVariantSpec
@@ -580,6 +1444,168 @@ void ATLASBiMAPMicroBenchmark()
 	}
 
 	printf("\n");
+}
+
+void ATLASBiMAPParityTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS BiMAP CPU-vs-GPU Parity Test\n");
+	printf("============================================================\n");
+
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		printf("No CUDA device available, skipping BiMAP parity tests.\n");
+		printf("============================================================\n");
+		return;
+	}
+
+	struct ParityCase
+	{
+		const char* label;
+		bool lowRank;
+		float predictiveScale;
+		unsigned int rank;
+		unsigned int powerIters;
+	};
+
+	const ParityCase cases[] = {
+		{ "BiMAP-lite", false, 0.0f, 2u, 1u },
+		{ "BiMAP-lite-pred", false, 0.15f, 2u, 1u },
+		{ "BiMAP-v2-0", true, 0.0f, 2u, 2u },
+		{ "BiMAP-v2", true, 0.15f, 2u, 2u },
+	};
+
+	const unsigned int m = 4u;
+	const unsigned int n = 3u;
+	const size_t mn = static_cast<size_t>(m) * n;
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float eps = 1.0e-8f;
+	const float invBatch = 1.0f;
+	const float gradScale = 1.0f;
+	const float valueTolLite = 1.0e-5f;
+	const float stateTolLite = 1.0e-5f;
+	const float valueTolV2 = 2.5e-4f;
+	const float stateTolV2 = 2.5e-4f;
+
+	const float initWRaw[] = {
+		0.20f, -0.30f, 0.10f,
+		0.40f, -0.10f, 0.30f,
+		-0.20f, 0.50f, -0.40f,
+		0.15f, -0.25f, 0.35f
+	};
+	const float g1Raw[] = {
+		1.80f, 0.20f, -0.10f,
+		1.20f, -0.30f, 0.40f,
+		-0.90f, 0.10f, 0.05f,
+		0.70f, -0.15f, 0.02f
+	};
+	const float g2Raw[] = {
+		1.30f, 0.18f, -0.06f,
+		0.95f, -0.22f, 0.35f,
+		-0.75f, 0.08f, 0.04f,
+		0.55f, -0.11f, 0.03f
+	};
+	const std::vector<float> initW(initWRaw, initWRaw + mn);
+	const std::vector<float> grads[] = {
+		std::vector<float>(g1Raw, g1Raw + mn),
+		std::vector<float>(g2Raw, g2Raw + mn)
+	};
+
+	for (size_t caseIdx = 0u; caseIdx < sizeof(cases) / sizeof(cases[0]); ++caseIdx)
+	{
+		const ParityCase& spec = cases[caseIdx];
+		printf("-----------------------------------\n");
+		printf("%s parity\n", spec.label);
+		printf("-----------------------------------\n");
+
+		glades::ATLASConfig ac;
+		ac.beta = 0.999f;
+		ac.rank = spec.rank;
+		ac.powerIters = spec.powerIters;
+		ac.tSub = 1u;
+		ac.bimapEnabled = true;
+		ac.bimapLowRankEnabled = spec.lowRank;
+		ac.bimapGeometryScale = 1.0f;
+		ac.bimapPredictiveScale = spec.predictiveScale;
+		ac.bimapFactorCadence = 1u;
+
+		std::vector<float> cpuW = initW;
+		std::vector<float> cpuM(mn, 0.0f);
+		std::vector<float> cpuV(mn, 0.0f);
+		std::vector<float> cpuG(mn, 0.0f);
+		glades::atlas::BiMAPWeightState cpuState;
+
+		glades::gpu::GpuBuffer<float> dW;
+		glades::gpu::GpuBuffer<float> dM;
+		glades::gpu::GpuBuffer<float> dV;
+		glades::gpu::GpuBuffer<float> dG;
+		ASSERT("gpu dW alloc failed", dW.allocate(mn));
+		ASSERT("gpu dM alloc failed", dM.allocate(mn));
+		ASSERT("gpu dV alloc failed", dV.allocate(mn));
+		ASSERT("gpu dG alloc failed", dG.allocate(mn));
+		ASSERT("gpu dW upload failed", dW.upload(initW.data(), initW.size()));
+		ASSERT("gpu dM zero failed", dM.zero());
+		ASSERT("gpu dV zero failed", dV.zero());
+		ASSERT("gpu dG zero failed", dG.zero());
+		glades::gpu::GpuBiMAPWeightState gpuState;
+
+		for (int step = 0; step < 2; ++step)
+		{
+			cpuG = grads[step];
+			const double b1t = std::pow(static_cast<double>(beta1), static_cast<double>(step + 1));
+			const double b2t = std::pow(static_cast<double>(beta2), static_cast<double>(step + 1));
+			const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
+			const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
+
+			const bool cpuOk = glades::atlas::bimapUpdate(cpuState,
+			                                              cpuW.data(), cpuM.data(), cpuV.data(), cpuG.data(),
+			                                              m, n, lr,
+			                                              beta1, beta2,
+			                                              inv1mB1t, inv1mB2t,
+			                                              eps,
+			                                              invBatch, gradScale,
+			                                              0.0f, 0.0f,
+			                                              ac, quiet_logger(), "ut.bimap.cpu");
+			ASSERT("cpu bimap update failed", cpuOk);
+
+			const bool gpuOk = run_gpu_bimap_step(gpuState,
+			                                      dW, dM, dV, dG,
+			                                      m, n, lr,
+			                                      beta1, beta2, eps,
+			                                      invBatch, gradScale,
+			                                      step + 1,
+			                                      ac,
+			                                      grads[step]);
+			ASSERT("gpu bimap update failed", gpuOk);
+
+			BiMAPParitySnapshot cpuSnap;
+			BiMAPParitySnapshot gpuSnap;
+			capture_cpu_bimap_snapshot(cpuSnap, cpuW, cpuM, cpuV, cpuG, cpuState);
+			capture_gpu_bimap_snapshot(gpuSnap, dW, dM, dV, dG, gpuState);
+
+			char stepLabel[128];
+			sprintf(stepLabel, "%s step %d", spec.label, step + 1);
+			assert_bimap_parity_snapshot(stepLabel,
+			                             cpuSnap,
+			                             gpuSnap,
+			                             spec.lowRank ? valueTolV2 : valueTolLite,
+			                             spec.lowRank ? stateTolV2 : stateTolLite,
+			                             spec.lowRank);
+		}
+
+		printf("[UT] %s parity: PASSED\n", spec.label);
+	}
+
+	printf("============================================================\n");
+	printf("BiMAP parity tests: ALL PASSED\n");
+	printf("============================================================\n");
+#else
+	printf("CUDA not enabled, skipping BiMAP parity tests.\n");
+	printf("============================================================\n");
+#endif
 }
 
 void ATLASKronMicroBenchmark()

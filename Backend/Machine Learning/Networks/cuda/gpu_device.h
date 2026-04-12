@@ -65,6 +65,9 @@ void resetDevice();
 
 #else // !GLADES_HAVE_CUDA
 
+typedef void* cudaStream_t;
+typedef void* cudaEvent_t;
+
 namespace glades {
 namespace gpu {
 

@@ -205,6 +205,98 @@ struct GpuPactWeightState
 	}
 };
 
+// Lightweight GPU BiMAP state.
+//
+// This intentionally implements only the BiMAP-lite path:
+// - exact AdamW backbone stays in the shared batched Adam kernel
+// - row/column anisotropy is tracked with diagonal second moments
+// - the BiMAP residual is formed fully on device with no per-element host work
+// - low-rank BiMAP-v2 remains out of scope for the GPU fast path
+struct GpuBiMAPWeightState
+{
+	unsigned int m;
+	unsigned int n;
+	unsigned int storageRank;
+	unsigned int rowRank;
+	unsigned int colRank;
+
+	GpuBuffer<float> rowSecond;   // [m] EMA row second moments
+	GpuBuffer<float> colSecond;   // [n] EMA col second moments
+	GpuBuffer<float> colScratch;  // [n] raw column g^2 sums for the current refresh
+	GpuBuffer<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	GpuBuffer<float> stepMatrix;  // [m * n] BiMAP-v2 preconditioned step matrix
+	GpuBuffer<float> rowMetric;   // [m] diagonal row metric
+	GpuBuffer<float> colMetric;   // [n] diagonal column metric
+	GpuBuffer<float> rowBasis;    // [m * r] low-rank row basis
+	GpuBuffer<float> colBasis;    // [n * r] low-rank column basis
+	GpuBuffer<float> rowWork;     // [m * r] QR temp / scaled row basis
+	GpuBuffer<float> colWork;     // [n * r] QR temp / scaled column basis
+	GpuBuffer<float> rowProj;     // [r * n] row basis projection / solve scratch
+	GpuBuffer<float> colProj;     // [m * r] column basis projection / solve scratch
+	GpuBuffer<float> factorScratch; // [max(m, n) * r] factor solve scratch
+	GpuBuffer<float> rowEigVal;   // [r] retained normalized row energies
+	GpuBuffer<float> colEigVal;   // [r] retained normalized column energies
+	GpuBuffer<float> coreScratch; // [2 * r * r] small SPD core + Cholesky scratch
+	GpuBuffer<float> scalarScratch; // [8] stats / trust / capture scratch
+
+	std::vector<float> hostRowSecond;
+	std::vector<float> hostColSecond;
+	std::vector<float> hostColScratch;
+
+	float rowMean;
+	float colMean;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastRowCapture;
+	float lastColCapture;
+	unsigned long long step;
+	bool initialized;
+
+	GpuBiMAPWeightState()
+	    : m(0u), n(0u), storageRank(0u), rowRank(0u), colRank(0u),
+	      rowMean(1.0e-12f), colMean(1.0e-12f),
+	      lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      lastRowCapture(0.0f), lastColCapture(0.0f),
+	      step(0ULL), initialized(false)
+	{
+	}
+};
+
+// Lightweight GPU ECHO state.
+//
+// ECHO tracks separable row/column geometry directly from backward operands
+// and applies a two-sided diagonal residual on top of the AdamW backbone.
+struct GpuEchoWeightState
+{
+	unsigned int m;
+	unsigned int n;
+
+	GpuBuffer<float> rowSecond;     // [m] EMA row geometry from adjoint operands
+	GpuBuffer<float> colSecond;     // [n] EMA col geometry from input operands
+	GpuBuffer<float> rowMetric;     // [m] device-resident row metric for the current step
+	GpuBuffer<float> colMetric;     // [n] device-resident col metric for the current step
+	GpuBuffer<float> scalarScratch; // [6] rowMean, colMean, rowMin, rowMax, colMin, colMax
+
+	float rowMean;
+	float colMean;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastGeometryScale;
+	unsigned long long step;
+	bool initialized;
+
+	GpuEchoWeightState()
+	    : m(0u), n(0u),
+	      rowMean(1.0f), colMean(1.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      lastGeometryScale(0.0f),
+	      step(0ULL), initialized(false)
+	{
+	}
+};
+
 // Lightweight GPU RACER state.
 //
 // This is the minimal GPU RACER-lite path:
@@ -347,6 +439,71 @@ bool pact_gpu_update_lite(GpuPactWeightState& state,
                           shmea::GLogger* logger = 0,
                           const char* tag = 0);
 
+// GPU BiMAP-lite residual update on top of an AdamW backbone that has already
+// updated W/m/v for the current step. This path:
+// - refreshes row/column anisotropy statistics on cadence boundaries,
+// - applies the diagonal row/column BiMAP residual fully on device,
+// - degenerates exactly to AdamW when geometry scale is zero.
+// GPU BiMAP-v2 extends this with device-native low-rank row/column factors,
+// predictive transport, and two-sided Woodbury-style residual application.
+// The dispatcher picks lite vs v2 from `ac.bimapLowRankEnabled`.
+bool bimap_gpu_update(GpuBiMAPWeightState& state,
+                      float* d_W, float* d_gW,
+                      float* d_m, float* d_v,
+                      unsigned int m, unsigned int n,
+                      float lr,
+                      float invBatch, float gradScale,
+                      float inv1mB1t, float inv1mB2t,
+                      float eps,
+                      const glades::ATLASConfig& ac,
+                      shmea::GLogger* logger = 0,
+                      const char* tag = 0);
+
+bool bimap_gpu_update_lite(GpuBiMAPWeightState& state,
+                           float* d_W, float* d_gW,
+                           float* d_m, float* d_v,
+                           unsigned int m, unsigned int n,
+                           float lr,
+                           float invBatch, float gradScale,
+                           float inv1mB1t, float inv1mB2t,
+                           float eps,
+                           const glades::ATLASConfig& ac,
+                           shmea::GLogger* logger = 0,
+                           const char* tag = 0);
+
+bool echo_gpu_observe(GpuEchoWeightState& state,
+                      const float* d_rowObs,
+                      const float* d_colObs,
+                      unsigned int samples,
+                      unsigned int m,
+                      unsigned int n,
+                      const glades::ATLASConfig& ac);
+
+bool echo_gpu_prepare_metrics(GpuEchoWeightState& state,
+                              unsigned int m,
+                              unsigned int n,
+                              unsigned long long optimizerStep,
+                              float eps,
+                              const glades::ATLASConfig& ac);
+
+bool echo_gpu_post_update(GpuEchoWeightState& state,
+                          const glades::ATLASConfig& ac,
+                          shmea::GLogger* logger = 0,
+                          const char* tag = 0);
+
+bool echo_gpu_update(GpuEchoWeightState& state,
+                     float* d_W, float* d_gW,
+                     float* d_m, float* d_v,
+                     unsigned int m, unsigned int n,
+                     float lr,
+                     float gradScale,
+                     unsigned long long optimizerStep,
+                     float inv1mB1t, float inv1mB2t,
+                     float eps,
+                     const glades::ATLASConfig& ac,
+                     shmea::GLogger* logger = 0,
+                     const char* tag = 0);
+
 // GPU RACER-lite residual update on top of an AdamW backbone that has already
 // updated W/m/v for the current step. The function:
 // - refreshes row/column anisotropy statistics on cadence boundaries
@@ -488,6 +645,44 @@ struct GpuPactWeightState
 	      promoted(false), promotedSteps(0ULL), step(0ULL), initialized(false) {}
 };
 
+struct GpuBiMAPWeightState
+{
+	float rowMean;
+	float colMean;
+	float lastPredictiveTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastRowCapture;
+	float lastColCapture;
+	unsigned int rowRank;
+	unsigned int colRank;
+	unsigned long long step;
+	bool initialized;
+	GpuBiMAPWeightState()
+	    : rowMean(1.0f), colMean(1.0f),
+	      lastPredictiveTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      lastRowCapture(0.0f), lastColCapture(0.0f),
+	      rowRank(0u), colRank(0u),
+	      step(0ULL), initialized(false) {}
+};
+
+struct GpuEchoWeightState
+{
+	float rowMean;
+	float colMean;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastGeometryScale;
+	unsigned long long step;
+	bool initialized;
+	GpuEchoWeightState()
+	    : rowMean(1.0f), colMean(1.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      lastGeometryScale(0.0f),
+	      step(0ULL), initialized(false) {}
+};
+
 struct GpuRacerWeightState
 {
 	float promotionScore;
@@ -554,6 +749,37 @@ inline bool pact_gpu_update_lite(GpuPactWeightState&, float*, float*, float*, fl
                                  const glades::ATLASConfig&,
                                  shmea::GLogger* = 0,
                                  const char* = 0) { return false; }
+inline bool bimap_gpu_update(GpuBiMAPWeightState&, float*, float*, float*, float*,
+                             unsigned int, unsigned int,
+                             float, float, float,
+                             float, float, float,
+                             const glades::ATLASConfig&,
+                             shmea::GLogger* = 0,
+                             const char* = 0) { return false; }
+inline bool bimap_gpu_update_lite(GpuBiMAPWeightState&, float*, float*, float*, float*,
+                                  unsigned int, unsigned int,
+                                  float, float, float,
+                                  float, float, float,
+                                  const glades::ATLASConfig&,
+                                  shmea::GLogger* = 0,
+                                  const char* = 0) { return false; }
+inline bool echo_gpu_observe(GpuEchoWeightState&, const float*, const float*,
+                             unsigned int, unsigned int, unsigned int,
+                             const glades::ATLASConfig&) { return false; }
+inline bool echo_gpu_prepare_metrics(GpuEchoWeightState&, unsigned int, unsigned int,
+                                     unsigned long long, float,
+                                     const glades::ATLASConfig&) { return false; }
+inline bool echo_gpu_post_update(GpuEchoWeightState&,
+                                 const glades::ATLASConfig&,
+                                 shmea::GLogger* = 0,
+                                 const char* = 0) { return false; }
+inline bool echo_gpu_update(GpuEchoWeightState&, float*, float*, float*, float*,
+                            unsigned int, unsigned int,
+                            float, float, unsigned long long,
+                            float, float, float,
+                            const glades::ATLASConfig&,
+                            shmea::GLogger* = 0,
+                            const char* = 0) { return false; }
 inline bool racer_gpu_update_lite(GpuRacerWeightState&, float*, float*, float*, float*,
                                   unsigned int, unsigned int,
                                   float, float, float,

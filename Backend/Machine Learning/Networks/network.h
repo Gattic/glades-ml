@@ -33,6 +33,7 @@
 #include "transformer_ops.h"
 #include "transformer_types.h"
 #include "aligned_allocator.h"
+#include "cuda/gpu_dispatch.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -47,7 +48,6 @@
 
 #ifdef GLADES_HAVE_CUDA
 #include "cuda/gpu_device.h"
-#include "cuda/gpu_dispatch.h"
 #include "cuda/gpu_blas.h"
 #include "cuda/gpu_transformer_state.h"
 #include "cuda/gpu_dff_state.h"

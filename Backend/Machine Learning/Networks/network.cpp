@@ -68,6 +68,92 @@ struct GladesLinkAnchorsOnce
 static GladesLinkAnchorsOnce g_glades_link_anchors_once;
 static shmea::GLogger g_default_network_logger(shmea::GLogger::LOG_INFO);
 
+bool atlas_transformer_needs_adam_moments(const glades::TrainingConfig& trainingConfig)
+{
+	return (trainingConfig.optimizer.type != glades::OptimizerConfig::ATLAS)
+	    || (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS
+	        && ((trainingConfig.atlas.auroraEnabled
+	             && trainingConfig.atlas.auroraAdamwBackbone)
+	            || trainingConfig.atlas.geodeEnabled
+	            || trainingConfig.atlas.echoEnabled
+	            || trainingConfig.atlas.bimapEnabled
+	            || trainingConfig.atlas.pactEnabled
+	            || trainingConfig.atlas.racerEnabled
+	            || trainingConfig.atlas.kronEnabled
+	            || trainingConfig.atlas.muonEnabled));
+}
+
+void ensure_transformer_moment_buffer(std::vector<float>& buffer, size_t wanted)
+{
+	if (buffer.size() != wanted)
+		buffer.assign(wanted, 0.0f);
+}
+
+#ifdef GLADES_HAVE_CUDA
+bool gpu_transformer_has_adam_moments(const glades::gpu::GpuTransformerWeights& gt)
+{
+	if (gt.tokenModel)
+	{
+		if (gt.vTokE.size() != gt.tokE.size() || gt.v2TokE.size() != gt.tokE.size())
+			return false;
+		if (gt.mLmBias.size() != gt.lmBias.size() || gt.v2LmBias.size() != gt.lmBias.size())
+			return false;
+	}
+	else
+	{
+		if (gt.vWIn.size() != gt.WIn.size() || gt.v2WIn.size() != gt.WIn.size())
+			return false;
+		if (gt.mBIn.size() != gt.bIn.size() || gt.v2BIn.size() != gt.bIn.size())
+			return false;
+		if (gt.vWOut.size() != gt.WOut.size() || gt.v2WOut.size() != gt.WOut.size())
+			return false;
+		if (gt.mBOut.size() != gt.bOut.size() || gt.v2BOut.size() != gt.bOut.size())
+			return false;
+	}
+	if (gt.mLnFinalGamma.size() != gt.lnFinalGamma.size() || gt.v2LnFinalGamma.size() != gt.lnFinalGamma.size())
+		return false;
+	if (gt.mLnFinalBeta.size() != gt.lnFinalBeta.size() || gt.v2LnFinalBeta.size() != gt.lnFinalBeta.size())
+		return false;
+	for (unsigned int li = 0u; li < gt.nLayers; ++li)
+	{
+		const glades::gpu::GpuTransformerWeights::Block& b = gt.blocks[li];
+		if (b.mLn1Gamma.size() != b.ln1Gamma.size() || b.v2Ln1Gamma.size() != b.ln1Gamma.size())
+			return false;
+		if (b.mLn1Beta.size() != b.ln1Beta.size() || b.v2Ln1Beta.size() != b.ln1Beta.size())
+			return false;
+		if (b.vWq.size() != b.Wq.size() || b.v2Wq.size() != b.Wq.size())
+			return false;
+		if (b.vWk.size() != b.Wk.size() || b.v2Wk.size() != b.Wk.size())
+			return false;
+		if (b.vWv.size() != b.Wv.size() || b.v2Wv.size() != b.Wv.size())
+			return false;
+		if (b.vWo.size() != b.Wo.size() || b.v2Wo.size() != b.Wo.size())
+			return false;
+		if (b.mBq.size() != b.bq.size() || b.v2Bq.size() != b.bq.size())
+			return false;
+		if (b.mBk.size() != b.bk.size() || b.v2Bk.size() != b.bk.size())
+			return false;
+		if (b.mBv.size() != b.bv.size() || b.v2Bv.size() != b.bv.size())
+			return false;
+		if (b.mBo.size() != b.bo.size() || b.v2Bo.size() != b.bo.size())
+			return false;
+		if (b.mLn2Gamma.size() != b.ln2Gamma.size() || b.v2Ln2Gamma.size() != b.ln2Gamma.size())
+			return false;
+		if (b.mLn2Beta.size() != b.ln2Beta.size() || b.v2Ln2Beta.size() != b.ln2Beta.size())
+			return false;
+		if (b.vW1.size() != b.W1.size() || b.v2W1.size() != b.W1.size())
+			return false;
+		if (b.vW2.size() != b.W2.size() || b.v2W2.size() != b.W2.size())
+			return false;
+		if (b.mB1.size() != b.b1.size() || b.v2B1.size() != b.b1.size())
+			return false;
+		if (b.mB2.size() != b.b2.size() || b.v2B2.size() != b.b2.size())
+			return false;
+	}
+	return true;
+}
+#endif
+
 struct AtlasRuntimeAccumulator
 {
 	unsigned int atlasMatrices;
@@ -2417,6 +2503,7 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		const bool tokenModel = modelCfg.tokenModel;
 		const unsigned int ff1Width = modelCfg.ff1Width;
 
+		const bool needAdamMoments = atlas_transformer_needs_adam_moments(trainingConfig);
 		const bool mismatch = (!tensorTransformer.initialized) || (tensorTransformer.inputSize != inputSize) || (tensorTransformer.outSize != outSize) ||
 		                      (tensorTransformer.dModel != dModel) || (tensorTransformer.dFF != dFF) || (tensorTransformer.nHeads != nHeads) ||
 		                      (tensorTransformer.nKVHeads != nKVHeads) || (tensorTransformer.ffnKind != ffnKind) ||
@@ -2427,7 +2514,71 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		                      (tensorTransformer.nLayers != modelCfg.nLayers) ||
 		                      (tensorTransformer.causal != modelCfg.causal);
 		if (!mismatch)
+		{
+			if (needAdamMoments)
+			{
+				TensorTransformerState& tt = tensorTransformer;
+				if (tt.tokenModel)
+				{
+					ensure_transformer_moment_buffer(tt.vTokE, tt.tokE.size());
+					ensure_transformer_moment_buffer(tt.v2TokE, tt.tokE.size());
+					ensure_transformer_moment_buffer(tt.mLmBias, tt.lmBias.size());
+					ensure_transformer_moment_buffer(tt.v2LmBias, tt.lmBias.size());
+				}
+				else
+				{
+					ensure_transformer_moment_buffer(tt.vWIn, tt.WIn.size());
+					ensure_transformer_moment_buffer(tt.v2WIn, tt.WIn.size());
+					ensure_transformer_moment_buffer(tt.mBIn, tt.bIn.size());
+					ensure_transformer_moment_buffer(tt.v2BIn, tt.bIn.size());
+					ensure_transformer_moment_buffer(tt.vWOut, tt.WOut.size());
+					ensure_transformer_moment_buffer(tt.v2WOut, tt.WOut.size());
+					ensure_transformer_moment_buffer(tt.mBOut, tt.bOut.size());
+					ensure_transformer_moment_buffer(tt.v2BOut, tt.bOut.size());
+				}
+				ensure_transformer_moment_buffer(tt.mLnFinalGamma, tt.lnFinalGamma.size());
+				ensure_transformer_moment_buffer(tt.v2LnFinalGamma, tt.lnFinalGamma.size());
+				ensure_transformer_moment_buffer(tt.mLnFinalBeta, tt.lnFinalBeta.size());
+				ensure_transformer_moment_buffer(tt.v2LnFinalBeta, tt.lnFinalBeta.size());
+				for (size_t i = 0; i < tt.blocks.size(); ++i)
+				{
+					TensorTransformerState::Block& block = tt.blocks[i];
+					ensure_transformer_moment_buffer(block.mLn1Gamma, block.ln1Gamma.size());
+					ensure_transformer_moment_buffer(block.v2Ln1Gamma, block.ln1Gamma.size());
+					ensure_transformer_moment_buffer(block.mLn1Beta, block.ln1Beta.size());
+					ensure_transformer_moment_buffer(block.v2Ln1Beta, block.ln1Beta.size());
+					ensure_transformer_moment_buffer(block.vWq, block.Wq.size());
+					ensure_transformer_moment_buffer(block.v2Wq, block.Wq.size());
+					ensure_transformer_moment_buffer(block.vWk, block.Wk.size());
+					ensure_transformer_moment_buffer(block.v2Wk, block.Wk.size());
+					ensure_transformer_moment_buffer(block.vWv, block.Wv.size());
+					ensure_transformer_moment_buffer(block.v2Wv, block.Wv.size());
+					ensure_transformer_moment_buffer(block.vWo, block.Wo.size());
+					ensure_transformer_moment_buffer(block.v2Wo, block.Wo.size());
+					ensure_transformer_moment_buffer(block.mBq, block.bq.size());
+					ensure_transformer_moment_buffer(block.v2Bq, block.bq.size());
+					ensure_transformer_moment_buffer(block.mBk, block.bk.size());
+					ensure_transformer_moment_buffer(block.v2Bk, block.bk.size());
+					ensure_transformer_moment_buffer(block.mBv, block.bv.size());
+					ensure_transformer_moment_buffer(block.v2Bv, block.bv.size());
+					ensure_transformer_moment_buffer(block.mBo, block.bo.size());
+					ensure_transformer_moment_buffer(block.v2Bo, block.bo.size());
+					ensure_transformer_moment_buffer(block.mLn2Gamma, block.ln2Gamma.size());
+					ensure_transformer_moment_buffer(block.v2Ln2Gamma, block.ln2Gamma.size());
+					ensure_transformer_moment_buffer(block.mLn2Beta, block.ln2Beta.size());
+					ensure_transformer_moment_buffer(block.v2Ln2Beta, block.ln2Beta.size());
+					ensure_transformer_moment_buffer(block.vW1, block.W1.size());
+					ensure_transformer_moment_buffer(block.v2W1, block.W1.size());
+					ensure_transformer_moment_buffer(block.vW2, block.W2.size());
+					ensure_transformer_moment_buffer(block.v2W2, block.W2.size());
+					ensure_transformer_moment_buffer(block.mB1, block.b1.size());
+					ensure_transformer_moment_buffer(block.v2B1, block.b1.size());
+					ensure_transformer_moment_buffer(block.mB2, block.b2.size());
+					ensure_transformer_moment_buffer(block.v2B2, block.b2.size());
+				}
+			}
 			return true;
+		}
 
 		tensorTransformer.reset();
 		tensorTransformer.initialized = true;
@@ -2449,18 +2600,6 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		// ATLAS normally uses its own per-matrix state and skips AdamW moments to
 		// save memory. Some transformer-side experimental branches reuse Adam-style
 		// diagonal moments as part of their backbone even under optimizer=ATLAS.
-		const bool needAdamMoments =
-		    (trainingConfig.optimizer.type != OptimizerConfig::ATLAS)
-		    || (trainingConfig.optimizer.type == OptimizerConfig::ATLAS
-		        && ((trainingConfig.atlas.auroraEnabled
-		             && trainingConfig.atlas.auroraAdamwBackbone)
-		            || trainingConfig.atlas.geodeEnabled
-		            || trainingConfig.atlas.bimapEnabled
-		            || trainingConfig.atlas.pactEnabled
-		            || trainingConfig.atlas.racerEnabled
-		            || trainingConfig.atlas.kronEnabled
-		            || trainingConfig.atlas.muonEnabled));
-
 		// Token LM tensors (embedding + bias)
 		if (tokenModel)
 		{
@@ -4400,19 +4539,15 @@ bool glades::NNetwork::ensureGpuState()
 		if (!gpuTransformerWeights)
 			gpuTransformerWeights = new gpu::GpuTransformerWeights();
 
-		if (!gpuTransformerWeights->initialized)
+		const bool needAdamMoments = atlas_transformer_needs_adam_moments(trainingConfig);
+		const bool skipAdam = !needAdamMoments;
+		const bool needGpuReallocate =
+		    (!gpuTransformerWeights->initialized)
+		    || (needAdamMoments && !gpu_transformer_has_adam_moments(*gpuTransformerWeights));
+		if (needGpuReallocate)
 		{
-			const bool needAdamMoments =
-			    (trainingConfig.optimizer.type != OptimizerConfig::ATLAS)
-			    || (trainingConfig.optimizer.type == OptimizerConfig::ATLAS
-			        && ((trainingConfig.atlas.auroraEnabled
-			             && trainingConfig.atlas.auroraAdamwBackbone)
-			            || trainingConfig.atlas.geodeEnabled
-			            || trainingConfig.atlas.bimapEnabled
-			            || trainingConfig.atlas.pactEnabled
-			            || trainingConfig.atlas.racerEnabled
-			            || trainingConfig.atlas.muonEnabled));
-			const bool skipAdam = !needAdamMoments;
+			if (gpuTransformerWeights->initialized)
+				gpuTransformerWeights->free();
 			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
 			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
 			                                      ts.outSize, ts.ffnKind, ts.tokenModel,

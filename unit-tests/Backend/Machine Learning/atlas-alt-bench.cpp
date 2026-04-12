@@ -61,6 +61,84 @@ static bool parse_float_arg(const char* text, float& outValue)
 	return true;
 }
 
+static const char* bimap_scope_label(unsigned int scope)
+{
+	switch (scope)
+	{
+	case glades::ATLASConfig::BIMAP_SCOPE_ALL: return "all";
+	case glades::ATLASConfig::BIMAP_SCOPE_HEAD_ONLY: return "head";
+	case glades::ATLASConfig::BIMAP_SCOPE_LATE_ONLY: return "late";
+	case glades::ATLASConfig::BIMAP_SCOPE_LATE_HEAD: return "late-head";
+	default: return "unknown";
+	}
+}
+
+static bool parse_bimap_scope_arg(const char* text, unsigned int& outScope)
+{
+	if (!text)
+		return false;
+	if (streq(text, "all") || streq(text, "0"))
+	{
+		outScope = glades::ATLASConfig::BIMAP_SCOPE_ALL;
+		return true;
+	}
+	if (streq(text, "head") || streq(text, "head-only") || streq(text, "1"))
+	{
+		outScope = glades::ATLASConfig::BIMAP_SCOPE_HEAD_ONLY;
+		return true;
+	}
+	if (streq(text, "late") || streq(text, "late-only") || streq(text, "2"))
+	{
+		outScope = glades::ATLASConfig::BIMAP_SCOPE_LATE_ONLY;
+		return true;
+	}
+	if (streq(text, "late-head") || streq(text, "head-late") || streq(text, "3"))
+	{
+		outScope = glades::ATLASConfig::BIMAP_SCOPE_LATE_HEAD;
+		return true;
+	}
+	return false;
+}
+
+static const char* echo_scope_label(unsigned int scope)
+{
+	switch (scope)
+	{
+	case glades::ATLASConfig::ECHO_SCOPE_ALL: return "all";
+	case glades::ATLASConfig::ECHO_SCOPE_LARGE_ONLY: return "large-only";
+	case glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD: return "late-head";
+	case glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD_LARGE: return "late-head-large";
+	default: return "unknown";
+	}
+}
+
+static bool parse_echo_scope_arg(const char* text, unsigned int& outScope)
+{
+	if (!text)
+		return false;
+	if (streq(text, "all") || streq(text, "0"))
+	{
+		outScope = glades::ATLASConfig::ECHO_SCOPE_ALL;
+		return true;
+	}
+	if (streq(text, "large") || streq(text, "large-only") || streq(text, "1"))
+	{
+		outScope = glades::ATLASConfig::ECHO_SCOPE_LARGE_ONLY;
+		return true;
+	}
+	if (streq(text, "late-head") || streq(text, "head-late") || streq(text, "2"))
+	{
+		outScope = glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD;
+		return true;
+	}
+	if (streq(text, "late-head-large") || streq(text, "head-late-large") || streq(text, "3"))
+	{
+		outScope = glades::ATLASConfig::ECHO_SCOPE_LATE_HEAD_LARGE;
+		return true;
+	}
+	return false;
+}
+
 static unsigned int mix_u32(unsigned int x)
 {
 	x ^= x >> 16;
@@ -534,11 +612,12 @@ enum VariantKind
 	VARIANT_ATLAS_SEAM = 12,
 	VARIANT_ATLAS_QUASAR = 13,
 	VARIANT_ATLAS_GEODE = 14,
-	VARIANT_ATLAS_BIMAP = 15,
-	VARIANT_ATLAS_PACT = 16,
-	VARIANT_ATLAS_RACER = 17,
-	VARIANT_ATLAS_KRON = 18,
-	VARIANT_ATLAS_MUON = 19
+	VARIANT_ATLAS_ECHO = 15,
+	VARIANT_ATLAS_BIMAP = 16,
+	VARIANT_ATLAS_PACT = 17,
+	VARIANT_ATLAS_RACER = 18,
+	VARIANT_ATLAS_KRON = 19,
+	VARIANT_ATLAS_MUON = 20
 };
 
 enum VariantSelection
@@ -559,11 +638,12 @@ enum VariantSelection
 	VARIANT_SELECTION_ATLAS_SEAM = 13,
 	VARIANT_SELECTION_ATLAS_QUASAR = 14,
 	VARIANT_SELECTION_ATLAS_GEODE = 15,
-	VARIANT_SELECTION_ATLAS_BIMAP = 16,
-	VARIANT_SELECTION_ATLAS_PACT = 17,
-	VARIANT_SELECTION_ATLAS_RACER = 18,
-	VARIANT_SELECTION_ATLAS_KRON = 19,
-	VARIANT_SELECTION_ATLAS_MUON = 20
+	VARIANT_SELECTION_ATLAS_ECHO = 16,
+	VARIANT_SELECTION_ATLAS_BIMAP = 17,
+	VARIANT_SELECTION_ATLAS_PACT = 18,
+	VARIANT_SELECTION_ATLAS_RACER = 19,
+	VARIANT_SELECTION_ATLAS_KRON = 20,
+	VARIANT_SELECTION_ATLAS_MUON = 21
 };
 
 struct TokenConfig
@@ -706,7 +786,12 @@ struct BenchConfig
 	float atlasAuroraBodyTrustScale;
 	float atlasGeodeGeometryScale;
 	float atlasGeodePredictiveScale;
+	float atlasEchoGeometryScale;
+	float atlasEchoGeometryScaleFinal;
+	unsigned int atlasEchoGeometryDecaySteps;
+	unsigned int atlasEchoScope;
 	unsigned int atlasBiMAPLowRank;
+	unsigned int atlasBiMAPScope;
 	float atlasBiMAPGeometryScale;
 	float atlasBiMAPPredictiveScale;
 	unsigned int atlasBiMAPFactorCadence;
@@ -776,7 +861,12 @@ struct BenchConfig
 	      atlasAuroraBodyTrustScale(0.60f),
 	      atlasGeodeGeometryScale(1.0f),
 	      atlasGeodePredictiveScale(0.25f),
+	      atlasEchoGeometryScale(1.0f),
+	      atlasEchoGeometryScaleFinal(1.0f),
+	      atlasEchoGeometryDecaySteps(0u),
+	      atlasEchoScope(glades::ATLASConfig::ECHO_SCOPE_ALL),
 	      atlasBiMAPLowRank(1u),
+	      atlasBiMAPScope(glades::ATLASConfig::BIMAP_SCOPE_ALL),
 	      atlasBiMAPGeometryScale(1.0f),
 	      atlasBiMAPPredictiveScale(0.15f),
 	      atlasBiMAPFactorCadence(8u),
@@ -820,15 +910,99 @@ struct TokenDataset
 	unsigned int padTokenId;
 	unsigned long long trainTokensPerEpoch;
 	unsigned long long testTokens;
+	std::vector<unsigned int> testTokenStream;
+	std::vector<glades::DataInput::SequenceSpan> testSpans;
+	std::vector<unsigned char> testRoleBuckets;
+	std::vector<unsigned char> testRecallDistanceBuckets;
+	std::vector<unsigned char> testRecallSubtypeBuckets;
 
 	TokenDataset()
 	    : di(),
 	      padTokenId(0u),
 	      trainTokensPerEpoch(0ULL),
-	      testTokens(0ULL)
+	      testTokens(0ULL),
+	      testTokenStream(),
+	      testSpans(),
+	      testRoleBuckets(),
+	      testRecallDistanceBuckets(),
+	      testRecallSubtypeBuckets()
 	{
 	}
 };
+
+enum ContextFamilyRoleBucket
+{
+	CTX_ROLE_OTHER = 0,
+	CTX_ROLE_TOPIC = 1,
+	CTX_ROLE_MARKER = 2,
+	CTX_ROLE_QUERY = 3,
+	CTX_ROLE_RECALL = 4,
+	CTX_ROLE_STATE = 5,
+	CTX_ROLE_CONTENT = 6,
+	CTX_ROLE_SEPARATOR = 7,
+	CTX_ROLE_COUNT = 8
+};
+
+enum ContextFamilyRecallDistanceBucket
+{
+	CTX_RECALL_PREV = 0,
+	CTX_RECALL_OLDER = 1,
+	CTX_RECALL_DISTANCE_COUNT = 2
+};
+
+enum ContextFamilyRecallSubtypeBucket
+{
+	CTX_SUB_SUMMARY = 0,
+	CTX_SUB_ANCHOR = 1,
+	CTX_SUB_OBJECT = 2,
+	CTX_SUB_PLACE = 3,
+	CTX_SUB_YEAR = 4,
+	CTX_SUB_SPEAKER = 5,
+	CTX_SUBTYPE_COUNT = 6
+};
+
+static const unsigned char kContextRecallDistanceNone = 255u;
+static const unsigned char kContextRecallSubtypeNone = 255u;
+
+static const char* context_family_role_label(unsigned int idx)
+{
+	switch (idx)
+	{
+	case CTX_ROLE_OTHER: return "other";
+	case CTX_ROLE_TOPIC: return "topic";
+	case CTX_ROLE_MARKER: return "marker";
+	case CTX_ROLE_QUERY: return "query";
+	case CTX_ROLE_RECALL: return "recall";
+	case CTX_ROLE_STATE: return "state";
+	case CTX_ROLE_CONTENT: return "content";
+	case CTX_ROLE_SEPARATOR: return "sep";
+	default: return "unknown";
+	}
+}
+
+static const char* context_family_recall_distance_label(unsigned int idx)
+{
+	switch (idx)
+	{
+	case CTX_RECALL_PREV: return "prev";
+	case CTX_RECALL_OLDER: return "older";
+	default: return "unknown";
+	}
+}
+
+static const char* context_family_recall_subtype_label(unsigned int idx)
+{
+	switch (idx)
+	{
+	case CTX_SUB_SUMMARY: return "summary";
+	case CTX_SUB_ANCHOR: return "anchor";
+	case CTX_SUB_OBJECT: return "object";
+	case CTX_SUB_PLACE: return "place";
+	case CTX_SUB_YEAR: return "year";
+	case CTX_SUB_SPEAKER: return "speaker";
+	default: return "unknown";
+	}
+}
 
 struct TeacherSpec
 {
@@ -955,6 +1129,13 @@ struct RunResult
 	bool transformerTestMarginValid;
 	double transformerTestTargetMargin;
 	double transformerTestHardNegativeLogit;
+	bool contextFamilyDiagValid;
+	std::vector<double> contextRoleNll;
+	std::vector<double> contextRoleShare;
+	std::vector<double> contextRecallDistanceNll;
+	std::vector<double> contextRecallDistanceShare;
+	std::vector<double> contextRecallSubtypeNll;
+	std::vector<double> contextRecallSubtypeShare;
 	bool ok;
 	std::string err;
 
@@ -1051,6 +1232,13 @@ struct RunResult
 	      transformerTestMarginValid(false),
 	      transformerTestTargetMargin(0.0),
 	      transformerTestHardNegativeLogit(0.0),
+	      contextFamilyDiagValid(false),
+	      contextRoleNll(),
+	      contextRoleShare(),
+	      contextRecallDistanceNll(),
+	      contextRecallDistanceShare(),
+	      contextRecallSubtypeNll(),
+	      contextRecallSubtypeShare(),
 	      ok(true),
 	      err()
 	{
@@ -1157,6 +1345,13 @@ struct Summary
 	bool transformerTestMarginValid;
 	AggregateStats transformerTestTargetMargin;
 	AggregateStats transformerTestHardNegativeLogit;
+	bool contextFamilyDiagValid;
+	std::vector<AggregateStats> contextRoleNll;
+	std::vector<AggregateStats> contextRoleShare;
+	std::vector<AggregateStats> contextRecallDistanceNll;
+	std::vector<AggregateStats> contextRecallDistanceShare;
+	std::vector<AggregateStats> contextRecallSubtypeNll;
+	std::vector<AggregateStats> contextRecallSubtypeShare;
 	bool ok;
 	std::string status;
 
@@ -1252,6 +1447,13 @@ struct Summary
 	      transformerTestMarginValid(false),
 	      transformerTestTargetMargin(),
 	      transformerTestHardNegativeLogit(),
+	      contextFamilyDiagValid(false),
+	      contextRoleNll(),
+	      contextRoleShare(),
+	      contextRecallDistanceNll(),
+	      contextRecallDistanceShare(),
+	      contextRecallSubtypeNll(),
+	      contextRecallSubtypeShare(),
 	      ok(false),
 	      status()
 	{
@@ -1266,6 +1468,190 @@ static void fill_citadel_run_result(const CaptureMetricsCallbacks& cb, RunResult
 static void fill_rampart_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
 static void fill_merit_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
 static void fill_strata_run_result(const CaptureMetricsCallbacks& cb, RunResult& out);
+
+struct ContextFamilyBucketAccum
+{
+	double lossSum;
+	unsigned long long count;
+	ContextFamilyBucketAccum() : lossSum(0.0), count(0ULL) {}
+};
+
+static double logits_target_nll(const float* logits, unsigned int vocab, unsigned int targetId)
+{
+	if (!logits || vocab == 0u || targetId >= vocab)
+		return 0.0;
+	float maxLogit = logits[0];
+	for (unsigned int i = 1u; i < vocab; ++i)
+	{
+		if (logits[i] > maxLogit)
+			maxLogit = logits[i];
+	}
+	double sumExp = 0.0;
+	for (unsigned int i = 0u; i < vocab; ++i)
+		sumExp += exp(static_cast<double>(logits[i] - maxLogit));
+	const double logZ = static_cast<double>(maxLogit) + log(sumExp);
+	return logZ - static_cast<double>(logits[targetId]);
+}
+
+static bool fill_context_family_test_diag(const TokenDataset& data,
+                                          const glades::NNetwork& net,
+                                          RunResult& out,
+                                          std::string* errMsg)
+{
+	out.contextFamilyDiagValid = false;
+	out.contextRoleNll.clear();
+	out.contextRoleShare.clear();
+	out.contextRecallDistanceNll.clear();
+	out.contextRecallDistanceShare.clear();
+	out.contextRecallSubtypeNll.clear();
+	out.contextRecallSubtypeShare.clear();
+
+	if (data.testTokenStream.empty() || data.testSpans.empty() ||
+	    data.testRoleBuckets.size() != data.testTokenStream.size() ||
+	    data.testRecallDistanceBuckets.size() != data.testTokenStream.size() ||
+	    data.testRecallSubtypeBuckets.size() != data.testTokenStream.size())
+	{
+		return false;
+	}
+
+	const unsigned int batchSize = static_cast<unsigned int>(data.testSpans.size());
+	unsigned int maxLen = 0u;
+	for (size_t i = 0u; i < data.testSpans.size(); ++i)
+	{
+		if (data.testSpans[i].length > maxLen)
+			maxLen = data.testSpans[i].length;
+	}
+	if (batchSize == 0u || maxLen < 2u)
+		return false;
+
+	glades::NNetwork::TransformerLmBatchSession session;
+	const glades::NNetworkStatus stReset = net.transformerLmBatchSessionReset(session, batchSize, maxLen);
+	if (!stReset.ok())
+	{
+		if (errMsg)
+			*errMsg = stReset.message;
+		return false;
+	}
+
+	std::vector<unsigned int> tokenIds(batchSize, data.padTokenId);
+	std::vector<unsigned char> active(batchSize, 0u);
+	std::vector<float> logitsFlat;
+	std::vector<ContextFamilyBucketAccum> roleAcc(CTX_ROLE_COUNT);
+	std::vector<ContextFamilyBucketAccum> distanceAcc(CTX_RECALL_DISTANCE_COUNT);
+	std::vector<ContextFamilyBucketAccum> subtypeAcc(CTX_SUBTYPE_COUNT);
+	unsigned long long totalCount = 0ULL;
+	unsigned long long recallCount = 0ULL;
+
+	for (unsigned int t = 0u; t + 1u < maxLen; ++t)
+	{
+		bool anyActive = false;
+		for (unsigned int b = 0u; b < batchSize; ++b)
+		{
+			const glades::DataInput::SequenceSpan& span = data.testSpans[b];
+			if ((t + 1u) < span.length)
+			{
+				active[b] = 1u;
+				tokenIds[b] = data.testTokenStream[static_cast<size_t>(span.start + t)];
+				anyActive = true;
+			}
+			else
+			{
+				active[b] = 0u;
+				tokenIds[b] = data.padTokenId;
+			}
+		}
+		if (!anyActive)
+			break;
+
+		const glades::NNetworkStatus stStep =
+		    net.transformerLmBatchSessionAppendSelective(session, tokenIds, active, &logitsFlat);
+		if (!stStep.ok())
+		{
+			if (errMsg)
+				*errMsg = stStep.message;
+			return false;
+		}
+		const unsigned int vocab =
+		    (batchSize > 0u) ? static_cast<unsigned int>(logitsFlat.size() / static_cast<size_t>(batchSize)) : 0u;
+		if (vocab == 0u)
+		{
+			if (errMsg)
+				*errMsg = "context diagnostic produced empty logits";
+			return false;
+		}
+
+		for (unsigned int b = 0u; b < batchSize; ++b)
+		{
+			if (active[b] == 0u)
+				continue;
+			const glades::DataInput::SequenceSpan& span = data.testSpans[b];
+			const size_t targetIndex = static_cast<size_t>(span.start + t + 1u);
+			const unsigned int targetId = data.testTokenStream[targetIndex];
+			if (targetId >= vocab)
+				continue;
+			const float* row = &logitsFlat[static_cast<size_t>(b) * static_cast<size_t>(vocab)];
+			const double nll = logits_target_nll(row, vocab, targetId);
+
+			const unsigned char role = data.testRoleBuckets[targetIndex];
+			if (role < CTX_ROLE_COUNT)
+			{
+				roleAcc[role].lossSum += nll;
+				roleAcc[role].count += 1ULL;
+			}
+			totalCount += 1ULL;
+
+			const unsigned char dist = data.testRecallDistanceBuckets[targetIndex];
+			if (dist < CTX_RECALL_DISTANCE_COUNT)
+			{
+				distanceAcc[dist].lossSum += nll;
+				distanceAcc[dist].count += 1ULL;
+				recallCount += 1ULL;
+			}
+
+			const unsigned char subtype = data.testRecallSubtypeBuckets[targetIndex];
+			if (subtype < CTX_SUBTYPE_COUNT)
+			{
+				subtypeAcc[subtype].lossSum += nll;
+				subtypeAcc[subtype].count += 1ULL;
+			}
+		}
+	}
+
+	if (totalCount == 0ULL)
+		return false;
+
+	out.contextRoleNll.assign(CTX_ROLE_COUNT, 0.0);
+	out.contextRoleShare.assign(CTX_ROLE_COUNT, 0.0);
+	for (unsigned int i = 0u; i < CTX_ROLE_COUNT; ++i)
+	{
+		if (roleAcc[i].count > 0ULL)
+			out.contextRoleNll[i] = roleAcc[i].lossSum / static_cast<double>(roleAcc[i].count);
+		out.contextRoleShare[i] = static_cast<double>(roleAcc[i].count) / static_cast<double>(totalCount);
+	}
+
+	out.contextRecallDistanceNll.assign(CTX_RECALL_DISTANCE_COUNT, 0.0);
+	out.contextRecallDistanceShare.assign(CTX_RECALL_DISTANCE_COUNT, 0.0);
+	out.contextRecallSubtypeNll.assign(CTX_SUBTYPE_COUNT, 0.0);
+	out.contextRecallSubtypeShare.assign(CTX_SUBTYPE_COUNT, 0.0);
+	if (recallCount > 0ULL)
+	{
+		for (unsigned int i = 0u; i < CTX_RECALL_DISTANCE_COUNT; ++i)
+		{
+			if (distanceAcc[i].count > 0ULL)
+				out.contextRecallDistanceNll[i] = distanceAcc[i].lossSum / static_cast<double>(distanceAcc[i].count);
+			out.contextRecallDistanceShare[i] = static_cast<double>(distanceAcc[i].count) / static_cast<double>(recallCount);
+		}
+		for (unsigned int i = 0u; i < CTX_SUBTYPE_COUNT; ++i)
+		{
+			if (subtypeAcc[i].count > 0ULL)
+				out.contextRecallSubtypeNll[i] = subtypeAcc[i].lossSum / static_cast<double>(subtypeAcc[i].count);
+			out.contextRecallSubtypeShare[i] = static_cast<double>(subtypeAcc[i].count) / static_cast<double>(recallCount);
+		}
+	}
+
+	out.contextFamilyDiagValid = true;
+	return true;
+}
 
 class NetworkOwner
 {
@@ -1304,6 +1690,7 @@ static const char* variant_label(VariantKind variant)
 	case VARIANT_ATLAS_SEAM: return "ATLAS-SEAM";
 	case VARIANT_ATLAS_QUASAR: return "ATLAS-QUASAR";
 	case VARIANT_ATLAS_GEODE: return "ATLAS-GEODE";
+	case VARIANT_ATLAS_ECHO: return "ATLAS-ECHO";
 	case VARIANT_ATLAS_BIMAP: return "ATLAS-BIMAP";
 	case VARIANT_ATLAS_PACT: return "ATLAS-PACT";
 	case VARIANT_ATLAS_RACER: return "ATLAS-RACER";
@@ -1349,6 +1736,8 @@ static bool variant_matches_selection(VariantSelection selection, VariantKind va
 		return variant == VARIANT_ATLAS_QUASAR;
 	case VARIANT_SELECTION_ATLAS_GEODE:
 		return variant == VARIANT_ATLAS_GEODE;
+	case VARIANT_SELECTION_ATLAS_ECHO:
+		return variant == VARIANT_ATLAS_ECHO;
 	case VARIANT_SELECTION_ATLAS_BIMAP:
 		return variant == VARIANT_ATLAS_BIMAP;
 	case VARIANT_SELECTION_ATLAS_PACT:
@@ -1496,7 +1885,7 @@ static void print_usage()
 	printf("Options:\n");
 	printf("  --mode all|token-lm|token-lm-large|token-lm-context|token-lm-context-large|token-lm-document|token-lm-corpus|token-lm-corpus-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
 	printf("                                         Run the alternate-task benches or the teacher-student sweep (default: all)\n");
-	printf("  --variant all|adamw|adamw-group|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|bimap|pact|racer|kron|muon\n");
+	printf("  --variant all|adamw|adamw-group|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|echo|bimap|pact|racer|kron|muon\n");
 	printf("                                         Restrict runs to one optimizer variant when the case supports it (default: all)\n");
 	printf("  --repeats N                           Repeats per optimizer variant (default: 3)\n");
 	printf("  --seed N                              Base RNG seed (default: 1337)\n");
@@ -1530,7 +1919,12 @@ static void print_usage()
 	printf("  --atlas-aurora-body-trust-scale X     Retained non-head SPARROW trust inside AURORA (default: 0.60)\n");
 	printf("  --atlas-geode-geometry-scale X        Low-rank geometry strength for GEODE (default: 1.0)\n");
 	printf("  --atlas-geode-predictive-scale X      SPARROW-style active prediction blend for GEODE (default: 0.25)\n");
+	printf("  --atlas-echo-geometry-scale X         Operand-harvested two-sided diagonal strength for ECHO (default: 1.0)\n");
+	printf("  --atlas-echo-final-geometry-scale X   Final ECHO geometry strength after schedule decay (default: 1.0)\n");
+	printf("  --atlas-echo-decay-steps N            Optimizer steps for linear ECHO geometry decay (default: 0 = off)\n");
+	printf("  --atlas-echo-scope all|large-only|late-head|late-head-large  Restrict ECHO to all matrices, large matrices only, last block + head, or that subset filtered to large matrices (default: all)\n");
 	printf("  --atlas-bimap-low-rank 0|1            Enable BiMAP-v2 low-rank row/column factors (default: 1)\n");
+	printf("  --atlas-bimap-scope all|head|late|late-head  Restrict BiMAP to all matrices, head only, late block only, or late block + head (default: all)\n");
 	printf("  --atlas-bimap-geometry-scale X        Row/column geometry strength for BiMAP (default: 1.0)\n");
 	printf("  --atlas-bimap-predictive-scale X      Momentum secant blend for BiMAP (default: 0.15)\n");
 	printf("  --atlas-bimap-factor-cadence N        Steps between BiMAP factor EMA refreshes (default: 8)\n");
@@ -1852,6 +2246,11 @@ static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
 		outSelection = VARIANT_SELECTION_ATLAS_GEODE;
 		return true;
 	}
+	if (streq(text, "echo") || streq(text, "atlas-echo"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_ECHO;
+		return true;
+	}
 	if (streq(text, "bimap") || streq(text, "atlas-bimap"))
 	{
 		outSelection = VARIANT_SELECTION_ATLAS_BIMAP;
@@ -2171,11 +2570,51 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 				return false;
 			}
 		}
+		else if (streq(argv[i], "--atlas-echo-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasEchoGeometryScale) || cfg.atlasEchoGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-echo-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-final-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasEchoGeometryScaleFinal) || cfg.atlasEchoGeometryScaleFinal < 0.0f)
+			{
+				err = "invalid --atlas-echo-final-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-decay-steps") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasEchoGeometryDecaySteps))
+			{
+				err = "invalid --atlas-echo-decay-steps";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-scope") && i + 1 < argc)
+		{
+			if (!parse_echo_scope_arg(argv[++i], cfg.atlasEchoScope))
+			{
+				err = "invalid --atlas-echo-scope";
+				return false;
+			}
+		}
 		else if (streq(argv[i], "--atlas-bimap-low-rank") && i + 1 < argc)
 		{
 			if (!parse_uint_arg(argv[++i], cfg.atlasBiMAPLowRank) || cfg.atlasBiMAPLowRank > 1u)
 			{
 				err = "invalid --atlas-bimap-low-rank";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-bimap-scope") && i + 1 < argc)
+		{
+			if (!parse_bimap_scope_arg(argv[++i], cfg.atlasBiMAPScope))
+			{
+				err = "invalid --atlas-bimap-scope";
 				return false;
 			}
 		}
@@ -3576,6 +4015,296 @@ static void build_token_corpus_streams(bool largeCorpus,
 	}
 }
 
+static void clear_context_family_diag(TokenDataset& out)
+{
+	out.testRoleBuckets.clear();
+	out.testRecallDistanceBuckets.clear();
+	out.testRecallSubtypeBuckets.clear();
+}
+
+static void set_context_family_diag(std::vector<unsigned char>& roles,
+                                    std::vector<unsigned char>& distances,
+                                    std::vector<unsigned char>& subtypes,
+                                    size_t index,
+                                    unsigned char role,
+                                    unsigned char distance,
+                                    unsigned char subtype)
+{
+	if (index >= roles.size() || index >= distances.size() || index >= subtypes.size())
+		return;
+	roles[index] = role;
+	distances[index] = distance;
+	subtypes[index] = subtype;
+}
+
+static void annotate_context_family_context_split(const std::vector<glades::DataInput::SequenceSpan>& spans,
+                                                  std::vector<unsigned char>& roles,
+                                                  std::vector<unsigned char>& distances,
+                                                  std::vector<unsigned char>& subtypes)
+{
+	static const unsigned int kSegmentLen = 14u;
+	for (size_t s = 0u; s < spans.size(); ++s)
+	{
+		const glades::DataInput::SequenceSpan& span = spans[s];
+		for (unsigned int t = 0u; t < span.length; ++t)
+		{
+			const size_t idx = static_cast<size_t>(span.start + t);
+			const unsigned int segment = t / kSegmentLen;
+			const unsigned int slot = t % kSegmentLen;
+			switch (slot)
+			{
+				case 0u:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_TOPIC, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+					break;
+				case 1u:
+				case 3u:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_QUERY, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+					break;
+				case 2u:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_RECALL,
+					                       ((segment % 3u) == 2u) ? CTX_RECALL_OLDER : CTX_RECALL_PREV,
+					                       CTX_SUB_SUMMARY);
+					break;
+				case 4u:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_RECALL,
+					                       ((segment % 2u) == 1u) ? CTX_RECALL_OLDER : CTX_RECALL_PREV,
+					                       CTX_SUB_ANCHOR);
+					break;
+				case 5u:
+				case 6u:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_CONTENT, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+					break;
+				case 8u:
+				case 10u:
+				case 12u:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_STATE, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+					break;
+				case 13u:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_SEPARATOR, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+					break;
+				default:
+					set_context_family_diag(roles, distances, subtypes, idx,
+					                       CTX_ROLE_MARKER, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+					break;
+			}
+		}
+	}
+}
+
+static void annotate_context_family_document_split(const std::vector<glades::DataInput::SequenceSpan>& spans,
+                                                   std::vector<unsigned char>& roles,
+                                                   std::vector<unsigned char>& distances,
+                                                   std::vector<unsigned char>& subtypes)
+{
+	static const unsigned int kParagraphLen = 24u;
+	for (size_t s = 0u; s < spans.size(); ++s)
+	{
+		const glades::DataInput::SequenceSpan& span = spans[s];
+		for (unsigned int t = 0u; t < span.length; ++t)
+		{
+			const size_t idx = static_cast<size_t>(span.start + t);
+			const unsigned int paragraph = t / kParagraphLen;
+			const unsigned int slot = t % kParagraphLen;
+			const unsigned char prevDist = CTX_RECALL_PREV;
+			const unsigned char olderDist = CTX_RECALL_OLDER;
+			switch (paragraph % 4u)
+			{
+				case 0u:
+					switch (slot)
+					{
+						case 1u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_TOPIC, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 7u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_PLACE);
+							break;
+						case 9u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_YEAR);
+							break;
+						case 18u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_SUMMARY);
+							break;
+						case 20u:
+						case 21u:
+						case 22u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_STATE, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 23u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_SEPARATOR, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 0u:
+						case 2u:
+						case 4u:
+						case 6u:
+						case 8u:
+						case 10u:
+						case 14u:
+						case 17u:
+						case 19u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_MARKER, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						default:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_CONTENT, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+					}
+					break;
+				case 1u:
+					switch (slot)
+					{
+						case 0u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_TOPIC, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 13u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, olderDist, CTX_SUB_OBJECT);
+							break;
+						case 15u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_SUMMARY);
+							break;
+						case 17u:
+						case 20u:
+						case 21u:
+						case 22u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_STATE, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 23u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_SEPARATOR, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 4u:
+						case 6u:
+						case 12u:
+						case 14u:
+						case 16u:
+						case 18u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_MARKER, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						default:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_CONTENT, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+					}
+					break;
+				case 2u:
+					switch (slot)
+					{
+						case 7u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_TOPIC, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 1u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_SPEAKER);
+							break;
+						case 12u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_PLACE);
+							break;
+						case 14u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_YEAR);
+							break;
+						case 16u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, olderDist, CTX_SUB_SUMMARY);
+							break;
+						case 18u:
+						case 19u:
+						case 20u:
+						case 21u:
+						case 22u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_STATE, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 23u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_SEPARATOR, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 0u:
+						case 2u:
+						case 6u:
+						case 8u:
+						case 11u:
+						case 13u:
+						case 15u:
+						case 17u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_MARKER, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						default:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_CONTENT, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+					}
+					break;
+				default:
+					switch (slot)
+					{
+						case 1u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, olderDist, CTX_SUB_SPEAKER);
+							break;
+						case 2u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_SUMMARY);
+							break;
+						case 4u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, olderDist, CTX_SUB_PLACE);
+							break;
+						case 6u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, prevDist, CTX_SUB_YEAR);
+							break;
+						case 9u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, olderDist, CTX_SUB_OBJECT);
+							break;
+						case 11u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_RECALL, olderDist, CTX_SUB_YEAR);
+							break;
+						case 16u:
+						case 18u:
+						case 19u:
+						case 20u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_STATE, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 23u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_SEPARATOR, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						case 0u:
+						case 3u:
+						case 5u:
+						case 10u:
+						case 12u:
+						case 15u:
+						case 17u:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_MARKER, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+						default:
+							set_context_family_diag(roles, distances, subtypes, idx, CTX_ROLE_CONTENT, kContextRecallDistanceNone, kContextRecallSubtypeNone);
+							break;
+					}
+					break;
+			}
+		}
+	}
+}
+
+static void annotate_context_family_test_split(BenchMode mode, TokenDataset& out)
+{
+	clear_context_family_diag(out);
+	if (out.testTokenStream.empty() || out.testSpans.empty())
+		return;
+	out.testRoleBuckets.assign(out.testTokenStream.size(), static_cast<unsigned char>(CTX_ROLE_OTHER));
+	out.testRecallDistanceBuckets.assign(out.testTokenStream.size(), kContextRecallDistanceNone);
+	out.testRecallSubtypeBuckets.assign(out.testTokenStream.size(), kContextRecallSubtypeNone);
+	if (mode == MODE_TOKEN_LM_CONTEXT || mode == MODE_TOKEN_LM_CONTEXT_LARGE)
+	{
+		annotate_context_family_context_split(out.testSpans, out.testRoleBuckets,
+		                                      out.testRecallDistanceBuckets, out.testRecallSubtypeBuckets);
+	}
+	else if (mode == MODE_TOKEN_LM_DOCUMENT)
+	{
+		annotate_context_family_document_split(out.testSpans, out.testRoleBuckets,
+		                                       out.testRecallDistanceBuckets, out.testRecallSubtypeBuckets);
+	}
+	else
+	{
+		clear_context_family_diag(out);
+	}
+}
+
 static void build_token_dataset(const BenchConfig& cfg, TokenDataset& out)
 {
 	out = TokenDataset();
@@ -3623,6 +4352,9 @@ static void build_token_dataset(const BenchConfig& cfg, TokenDataset& out)
 	out.di.setTestTokens(testTokens, static_cast<int>(out.padTokenId));
 	(void)out.di.setTrainSequences(trainSpans);
 	(void)out.di.setTestSequences(testSpans);
+	out.testTokenStream = testTokens;
+	out.testSpans = testSpans;
+	annotate_context_family_test_split(cfg.mode, out);
 
 	out.trainTokensPerEpoch = static_cast<unsigned long long>(cfg.token.trainSeqs) *
 	                          static_cast<unsigned long long>(cfg.token.seqLen);
@@ -3654,6 +4386,7 @@ static void reset_atlas_family(glades::TrainingConfig& tc)
 	tc.atlas.seamEnabled = false;
 	tc.atlas.quasarEnabled = false;
 	tc.atlas.geodeEnabled = false;
+	tc.atlas.echoEnabled = false;
 	tc.atlas.bimapEnabled = false;
 	tc.atlas.pactEnabled = false;
 	tc.atlas.racerEnabled = false;
@@ -3913,10 +4646,19 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.geodeGeometryScale = cfg.atlasGeodeGeometryScale;
 		tc.atlas.geodePredictiveScale = cfg.atlasGeodePredictiveScale;
 	}
+	else if (variant == VARIANT_ATLAS_ECHO)
+	{
+		tc.atlas.echoEnabled = true;
+		tc.atlas.echoGeometryScale = cfg.atlasEchoGeometryScale;
+		tc.atlas.echoGeometryScaleFinal = cfg.atlasEchoGeometryScaleFinal;
+		tc.atlas.echoGeometryDecaySteps = cfg.atlasEchoGeometryDecaySteps;
+		tc.atlas.echoScope = cfg.atlasEchoScope;
+	}
 	else if (variant == VARIANT_ATLAS_BIMAP)
 	{
 		tc.atlas.bimapEnabled = true;
 		tc.atlas.bimapLowRankEnabled = (cfg.atlasBiMAPLowRank != 0u);
+		tc.atlas.bimapScope = cfg.atlasBiMAPScope;
 		tc.atlas.bimapGeometryScale = cfg.atlasBiMAPGeometryScale;
 		tc.atlas.bimapPredictiveScale = cfg.atlasBiMAPPredictiveScale;
 		tc.atlas.bimapFactorCadence = cfg.atlasBiMAPFactorCadence;
@@ -4008,6 +4750,7 @@ static bool token_variant_uses_adamw_backbone(const BenchConfig& cfg, VariantKin
 	    || (variant == VARIANT_ADAMW_GROUP)
 	    || (variant == VARIANT_ATLAS_AURORA && cfg.atlasAuroraAdamwBackbone != 0u)
 	    || (variant == VARIANT_ATLAS_GEODE)
+	    || (variant == VARIANT_ATLAS_ECHO)
 	    || (variant == VARIANT_ATLAS_BIMAP)
 	    || (variant == VARIANT_ATLAS_PACT)
 	    || (variant == VARIANT_ATLAS_RACER)
@@ -4322,6 +5065,8 @@ static RunResult run_token_variant(const BenchConfig& cfg,
 		out.transformerTestTargetMargin = testDiag.transformerMeanTargetMargin;
 		out.transformerTestHardNegativeLogit = testDiag.transformerMeanHardNegativeLogit;
 	}
+	std::string contextDiagErr;
+	(void)fill_context_family_test_diag(data, *owner.net, out, &contextDiagErr);
 
 	const double seconds = static_cast<double>(out.trainMs) / 1000.0;
 	const double tokens = static_cast<double>(data.trainTokensPerEpoch) * static_cast<double>(cfg.token.epochs);
@@ -4731,6 +5476,59 @@ static void print_transformer_gap_row(const Summary& s)
 	}
 }
 
+static void append_context_bucket(std::ostringstream& oss,
+                                  bool& first,
+                                  const char* label,
+                                  const std::vector<AggregateStats>& nlls,
+                                  const std::vector<AggregateStats>& shares,
+                                  size_t idx)
+{
+	if (idx >= nlls.size() || idx >= shares.size() || shares[idx].mean <= 0.0)
+		return;
+	if (!first)
+		oss << "  ";
+	first = false;
+	oss << label << '=' << std::fixed << std::setprecision(3) << nlls[idx].mean
+	    << '/' << shares[idx].mean;
+}
+
+static void print_context_family_diag_row(const Summary& s)
+{
+	if (!s.contextFamilyDiagValid)
+		return;
+
+	{
+		std::ostringstream oss;
+		oss << "  CTX role:     ";
+		bool first = true;
+		for (unsigned int i = 0u; i < CTX_ROLE_COUNT; ++i)
+			append_context_bucket(oss, first, context_family_role_label(i), s.contextRoleNll, s.contextRoleShare, i);
+		printf("%s\n", oss.str().c_str());
+	}
+
+	{
+		std::ostringstream oss;
+		oss << "  CTX recall:   ";
+		bool first = true;
+		for (unsigned int i = 0u; i < CTX_RECALL_DISTANCE_COUNT; ++i)
+			append_context_bucket(oss, first, context_family_recall_distance_label(i),
+			                     s.contextRecallDistanceNll, s.contextRecallDistanceShare, i);
+		if (!first)
+			printf("%s\n", oss.str().c_str());
+	}
+
+	{
+		std::ostringstream oss;
+		oss << "  CTX subtype:  ";
+		bool first = true;
+		for (unsigned int i = 0u; i < CTX_SUBTYPE_COUNT; ++i)
+			append_context_bucket(oss, first, context_family_recall_subtype_label(i),
+			                     s.contextRecallSubtypeNll, s.contextRecallSubtypeShare, i);
+		if (!first)
+			printf("%s\n", oss.str().c_str());
+	}
+}
+
 static void print_transformer_gap_compare_row(const Summary& adamw, const Summary& other)
 {
 	if (!adamw.transformerGapDiagValid || !other.transformerGapDiagValid)
@@ -4962,6 +5760,12 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 	std::vector<double> transformerTrainHardNegativeLogitVals;
 	std::vector<double> transformerTestTargetMarginVals;
 	std::vector<double> transformerTestHardNegativeLogitVals;
+	std::vector< std::vector<double> > contextRoleNllRows;
+	std::vector< std::vector<double> > contextRoleShareRows;
+	std::vector< std::vector<double> > contextRecallDistanceNllRows;
+	std::vector< std::vector<double> > contextRecallDistanceShareRows;
+	std::vector< std::vector<double> > contextRecallSubtypeNllRows;
+	std::vector< std::vector<double> > contextRecallSubtypeShareRows;
 	bool allOk = true;
 	std::string firstErr;
 	for (size_t i = 0; i < runs.size(); ++i)
@@ -5085,6 +5889,15 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 			transformerTestTargetMarginVals.push_back(runs[i].transformerTestTargetMargin);
 			transformerTestHardNegativeLogitVals.push_back(runs[i].transformerTestHardNegativeLogit);
 		}
+		if (runs[i].contextFamilyDiagValid)
+		{
+			contextRoleNllRows.push_back(runs[i].contextRoleNll);
+			contextRoleShareRows.push_back(runs[i].contextRoleShare);
+			contextRecallDistanceNllRows.push_back(runs[i].contextRecallDistanceNll);
+			contextRecallDistanceShareRows.push_back(runs[i].contextRecallDistanceShare);
+			contextRecallSubtypeNllRows.push_back(runs[i].contextRecallSubtypeNll);
+			contextRecallSubtypeShareRows.push_back(runs[i].contextRecallSubtypeShare);
+		}
 	}
 
 	s.ok = allOk && !trainSecVals.empty();
@@ -5179,6 +5992,13 @@ static Summary summarize_runs(const char* label, const std::vector<RunResult>& r
 	s.transformerTestMarginValid = !transformerTestTargetMarginVals.empty();
 	s.transformerTestTargetMargin = compute_stats(transformerTestTargetMarginVals);
 	s.transformerTestHardNegativeLogit = compute_stats(transformerTestHardNegativeLogitVals);
+	s.contextFamilyDiagValid = !contextRoleNllRows.empty();
+	s.contextRoleNll = compute_stats_by_index(contextRoleNllRows);
+	s.contextRoleShare = compute_stats_by_index(contextRoleShareRows);
+	s.contextRecallDistanceNll = compute_stats_by_index(contextRecallDistanceNllRows);
+	s.contextRecallDistanceShare = compute_stats_by_index(contextRecallDistanceShareRows);
+	s.contextRecallSubtypeNll = compute_stats_by_index(contextRecallSubtypeNllRows);
+	s.contextRecallSubtypeShare = compute_stats_by_index(contextRecallSubtypeShareRows);
 	return s;
 }
 
@@ -5299,12 +6119,13 @@ static bool run_token_case(const BenchConfig& cfg)
 	const float seamTokenLR = cfg.token.atlasLR;
 	const float quasarTokenLR = cfg.token.atlasLR;
 	const float geodeTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_GEODE);
+	const float echoTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_ECHO);
 	const float bimapTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_BIMAP);
 	const float pactTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_PACT);
 	const float racerTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_RACER);
 	const float kronTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_KRON);
 	const float muonTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MUON);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-BIMAP(lr=%.4f lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f)\n",
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f)\n",
 	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
 	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
 	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
@@ -5313,11 +6134,11 @@ static bool run_token_case(const BenchConfig& cfg)
 	       rampartTokenLR, cfg.atlasComplementRank, meritTokenLR, cfg.atlasComplementRank,
 	       strataTokenLR, cfg.atlasComplementRank, auroraTokenLR, cfg.atlasComplementRank,
 	       seamTokenLR, cfg.atlasComplementRank, quasarTokenLR, cfg.atlasComplementRank,
-	       geodeTokenLR, cfg.atlasComplementRank, bimapTokenLR, cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence,
+	       geodeTokenLR, cfg.atlasComplementRank, echoTokenLR, echo_scope_label(cfg.atlasEchoScope), bimapTokenLR, bimap_scope_label(cfg.atlasBiMAPScope), cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence,
 	       pactTokenLR, cfg.atlasPACTLowRank, cfg.atlasPACTFactorCadence,
 	       racerTokenLR, cfg.atlasRACERFactorCadence,
 	       kronTokenLR, cfg.atlasKronFactorCadence, muonTokenLR, cfg.atlasMuonMinDim, cfg.atlasMuonMaxAspect);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) bimap(lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f)\n",
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
@@ -5332,7 +6153,8 @@ static bool run_token_case(const BenchConfig& cfg)
 	       cfg.atlasAuroraAdamwBackbone,
 	       cfg.atlasAuroraHeadGain, cfg.atlasAuroraBodyTrustScale,
 	       cfg.atlasGeodeGeometryScale, cfg.atlasGeodePredictiveScale,
-	       cfg.atlasBiMAPLowRank, cfg.atlasBiMAPGeometryScale, cfg.atlasBiMAPPredictiveScale, cfg.atlasBiMAPFactorCadence,
+	       echo_scope_label(cfg.atlasEchoScope), cfg.atlasEchoGeometryScale, cfg.atlasEchoGeometryScaleFinal, cfg.atlasEchoGeometryDecaySteps,
+	       bimap_scope_label(cfg.atlasBiMAPScope), cfg.atlasBiMAPLowRank, cfg.atlasBiMAPGeometryScale, cfg.atlasBiMAPPredictiveScale, cfg.atlasBiMAPFactorCadence,
 	       cfg.atlasPACTLowRank, cfg.atlasPACTGeometryScale, cfg.atlasPACTPredictiveScale, cfg.atlasPACTFactorCadence,
 	       cfg.atlasPACTCostScale, cfg.atlasPACTPromoteThreshold, cfg.atlasPACTDemoteThreshold,
 	       cfg.atlasRACERGeometryScale, cfg.atlasRACERPredictiveScale, cfg.atlasRACERFactorCadence,
@@ -5343,7 +6165,7 @@ static bool run_token_case(const BenchConfig& cfg)
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ADAMW_GROUP, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_BIMAP, VARIANT_ATLAS_PACT, VARIANT_ATLAS_RACER, VARIANT_ATLAS_KRON, VARIANT_ATLAS_MUON };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ADAMW_GROUP, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_ECHO, VARIANT_ATLAS_BIMAP, VARIANT_ATLAS_PACT, VARIANT_ATLAS_RACER, VARIANT_ATLAS_KRON, VARIANT_ATLAS_MUON };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	std::vector<VariantKind> summaryVariants;
@@ -5368,6 +6190,7 @@ static bool run_token_case(const BenchConfig& cfg)
 		print_merit_usage_row(s);
 		print_strata_usage_row(s);
 		print_transformer_gap_row(s);
+		print_context_family_diag_row(s);
 		summaryVariants.push_back(variants[v]);
 		summaries.push_back(s);
 	}
@@ -5382,6 +6205,7 @@ static bool run_token_case(const BenchConfig& cfg)
 		int baseIndex = -1;
 		int auroraIndex = -1;
 		int geodeIndex = -1;
+		int echoIndex = -1;
 		int bimapIndex = -1;
 		int pactIndex = -1;
 		int racerIndex = -1;
@@ -5397,6 +6221,8 @@ static bool run_token_case(const BenchConfig& cfg)
 				auroraIndex = static_cast<int>(i);
 			else if (summaryVariants[i] == VARIANT_ATLAS_GEODE)
 				geodeIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_ECHO)
+				echoIndex = static_cast<int>(i);
 			else if (summaryVariants[i] == VARIANT_ATLAS_BIMAP)
 				bimapIndex = static_cast<int>(i);
 			else if (summaryVariants[i] == VARIANT_ATLAS_PACT)
@@ -5408,7 +6234,7 @@ static bool run_token_case(const BenchConfig& cfg)
 			else if (summaryVariants[i] == VARIANT_ATLAS_MUON)
 				muonIndex = static_cast<int>(i);
 		}
-		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || bimapIndex >= 0 || pactIndex >= 0 || racerIndex >= 0 || kronIndex >= 0 || muonIndex >= 0))
+		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || echoIndex >= 0 || bimapIndex >= 0 || pactIndex >= 0 || racerIndex >= 0 || kronIndex >= 0 || muonIndex >= 0))
 		{
 			printf("  AdamW gap comparison:\n");
 			if (baseIndex >= 0)
@@ -5420,6 +6246,9 @@ static bool run_token_case(const BenchConfig& cfg)
 			if (geodeIndex >= 0)
 				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
 				                                 summaries[static_cast<size_t>(geodeIndex)]);
+			if (echoIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(echoIndex)]);
 			if (bimapIndex >= 0)
 				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
 				                                 summaries[static_cast<size_t>(bimapIndex)]);
