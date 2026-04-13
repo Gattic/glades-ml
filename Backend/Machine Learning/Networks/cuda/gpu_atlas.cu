@@ -14,6 +14,7 @@
 #include "gpu_device.h"
 #include "Backend/Database/GLogger.h"
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
 #include <cstdio>
 #include <cfloat>
 #include <cmath>
@@ -43,9 +44,39 @@ namespace {
 	} while (0)
 
 static constexpr int kBlock = 256;
+static constexpr int kAtlasSmallCholeskyMaxDim = 64;
+static constexpr int kAtlasSmallCholeskyThreads = 128;
+static constexpr int kMuonFastOrthoIters = 0;
+static_assert((kMuonFastOrthoIters % 2) == 0, "MUON fast orthogonalization iterations must be even");
+static cusolverDnHandle_t g_atlasSolverHandle = 0;
+static bool g_atlasSolverInitialized = false;
 
 // Note: GPU memory tracking is done per-init via stderr logging.
 // No global state is maintained — callers can aggregate if needed.
+
+static bool atlas_solver_init()
+{
+	if (!g_atlasSolverInitialized)
+	{
+		const cusolverStatus_t st = cusolverDnCreate(&g_atlasSolverHandle);
+		if (st != CUSOLVER_STATUS_SUCCESS)
+		{
+			fprintf(stderr, "[atlas-gpu] cusolverDnCreate failed: %d\n",
+			        static_cast<int>(st));
+			return false;
+		}
+		g_atlasSolverInitialized = true;
+	}
+
+	const cusolverStatus_t st = cusolverDnSetStream(g_atlasSolverHandle, computeStream());
+	if (st != CUSOLVER_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[atlas-gpu] cusolverDnSetStream failed: %d\n",
+		        static_cast<int>(st));
+		return false;
+	}
+	return true;
+}
 
 static inline float atlas_bootstrap_or_ema(float prev,
                                            float sample,
@@ -1454,6 +1485,239 @@ __global__ void atlas_cholesky_inv_kernel(float* __restrict__ d_G, int r,
 	}
 }
 
+// Fast-path factorization for genuinely small SPD cores.
+//
+// The legacy atlas_cholesky_inv_kernel keeps the whole solve on a single thread
+// and operates directly out of global memory. That is acceptable for sporadic
+// CholeskyQR calls, but MUON hits this path every optimizer step on 48x48 and
+// 56x56 attention blocks. For those sizes, staging the core in shared memory
+// and stopping at the Cholesky factor lets the caller finish with cublasStrsm
+// much faster than explicitly inverting the factor on a single CUDA thread.
+__global__ void atlas_cholesky_factor_small_kernel(float* __restrict__ d_G,
+                                                   int r,
+                                                   float damping,
+                                                   float eps,
+                                                   bool regularize)
+{
+	extern __shared__ float smem[];
+	float* G = smem;
+	float* colScale = G + static_cast<size_t>(r) * static_cast<size_t>(r);
+	const int rr = r * r;
+
+	for (int idx = threadIdx.x; idx < rr; idx += blockDim.x)
+		G[idx] = d_G[idx];
+	__syncthreads();
+
+	if (threadIdx.x == 0)
+	{
+		float trace = 0.0f;
+		float maxDiag = 0.0f;
+		for (int j = 0; j < r; ++j)
+		{
+			const float diag = G[j * r + j];
+			trace += diag;
+			if (diag > maxDiag) maxDiag = diag;
+		}
+		const float meanDiag =
+		    fmaxf(trace / fmaxf(static_cast<float>(r), 1.0f), eps);
+		const float shift = fmaxf(eps, fmaxf(0.0f, damping) * meanDiag);
+		for (int j = 0; j < r; ++j)
+			G[j * r + j] += shift;
+		maxDiag += shift;
+		const float diagFloor = 1.0e-12f * (maxDiag > 0.0f ? maxDiag : 1.0f);
+
+		for (int j = 0; j < r; ++j)
+		{
+			const float d = G[j * r + j] > diagFloor ? G[j * r + j] : diagFloor;
+			colScale[j] = sqrtf(d);
+		}
+		for (int i = 0; i < r; ++i)
+			for (int j = 0; j < r; ++j)
+				G[i * r + j] /= (colScale[i] * colScale[j]);
+
+		if (regularize)
+			for (int j = 0; j < r; ++j)
+				G[j * r + j] += 1.0e-4f;
+
+		for (int j = 0; j < r; ++j)
+		{
+			float d = G[j * r + j];
+			for (int k = 0; k < j; ++k)
+				d -= G[k * r + j] * G[k * r + j];
+			if (d < 1.0e-8f) d = 1.0e-8f;
+			G[j * r + j] = sqrtf(d);
+			const float invD = 1.0f / G[j * r + j];
+			for (int i = j + 1; i < r; ++i)
+			{
+				float v = G[j * r + i];
+				for (int k = 0; k < j; ++k)
+					v -= G[k * r + j] * G[k * r + i];
+				G[j * r + i] = v * invD;
+			}
+		}
+
+		for (int i = 0; i < r; ++i)
+			for (int j = 0; j < i; ++j)
+				G[i * r + j] = 0.0f;
+
+		for (int i = 0; i < r; ++i)
+			for (int j = i; j < r; ++j)
+				G[i * r + j] *= colScale[j];
+	}
+	__syncthreads();
+
+	for (int idx = threadIdx.x; idx < rr; idx += blockDim.x)
+		d_G[idx] = G[idx];
+}
+
+__global__ void atlas_cholesky_factor_small_batched_kernel(float* const* __restrict__ d_G_ptrs,
+                                                           int count,
+                                                           int r,
+                                                           float damping,
+                                                           float eps,
+                                                           bool regularize)
+{
+	const int batchIdx = blockIdx.x;
+	if (!d_G_ptrs || batchIdx < 0 || batchIdx >= count)
+		return;
+
+	float* d_G = d_G_ptrs[batchIdx];
+	if (!d_G)
+		return;
+
+	extern __shared__ float smem[];
+	float* G = smem;
+	float* colScale = G + static_cast<size_t>(r) * static_cast<size_t>(r);
+	const int rr = r * r;
+
+	for (int idx = threadIdx.x; idx < rr; idx += blockDim.x)
+		G[idx] = d_G[idx];
+	__syncthreads();
+
+	if (threadIdx.x == 0)
+	{
+		float trace = 0.0f;
+		float maxDiag = 0.0f;
+		for (int j = 0; j < r; ++j)
+		{
+			const float diag = G[j * r + j];
+			trace += diag;
+			if (diag > maxDiag) maxDiag = diag;
+		}
+		const float meanDiag =
+		    fmaxf(trace / fmaxf(static_cast<float>(r), 1.0f), eps);
+		const float shift = fmaxf(eps, fmaxf(0.0f, damping) * meanDiag);
+		for (int j = 0; j < r; ++j)
+			G[j * r + j] += shift;
+		maxDiag += shift;
+		const float diagFloor = 1.0e-12f * (maxDiag > 0.0f ? maxDiag : 1.0f);
+
+		for (int j = 0; j < r; ++j)
+		{
+			const float d = G[j * r + j] > diagFloor ? G[j * r + j] : diagFloor;
+			colScale[j] = sqrtf(d);
+		}
+		for (int i = 0; i < r; ++i)
+			for (int j = 0; j < r; ++j)
+				G[i * r + j] /= (colScale[i] * colScale[j]);
+
+		if (regularize)
+			for (int j = 0; j < r; ++j)
+				G[j * r + j] += 1.0e-4f;
+
+		for (int j = 0; j < r; ++j)
+		{
+			float d = G[j * r + j];
+			for (int k = 0; k < j; ++k)
+				d -= G[k * r + j] * G[k * r + j];
+			if (d < 1.0e-8f) d = 1.0e-8f;
+			G[j * r + j] = sqrtf(d);
+			const float invD = 1.0f / G[j * r + j];
+			for (int i = j + 1; i < r; ++i)
+			{
+				float v = G[j * r + i];
+				for (int k = 0; k < j; ++k)
+					v -= G[k * r + j] * G[k * r + i];
+				G[j * r + i] = v * invD;
+			}
+		}
+
+		for (int i = 0; i < r; ++i)
+			for (int j = 0; j < i; ++j)
+				G[i * r + j] = 0.0f;
+
+		for (int i = 0; i < r; ++i)
+			for (int j = i; j < r; ++j)
+				G[i * r + j] *= colScale[j];
+	}
+	__syncthreads();
+
+	for (int idx = threadIdx.x; idx < rr; idx += blockDim.x)
+		d_G[idx] = G[idx];
+}
+
+__global__ void atlas_cholesky_precondition_small_batched_kernel(
+    float* const* __restrict__ d_G_ptrs,
+    int count,
+    int r,
+    float damping,
+    float eps)
+{
+	const int batchIdx = blockIdx.x;
+	if (!d_G_ptrs || batchIdx < 0 || batchIdx >= count)
+		return;
+
+	float* d_G = d_G_ptrs[batchIdx];
+	if (!d_G)
+		return;
+	float* d_scale =
+	    d_G + static_cast<size_t>(r) * static_cast<size_t>(r);
+
+	extern __shared__ float smem[];
+	float* G = smem;
+	float* colScale = G + static_cast<size_t>(r) * static_cast<size_t>(r);
+	const int rr = r * r;
+
+	for (int idx = threadIdx.x; idx < rr; idx += blockDim.x)
+		G[idx] = d_G[idx];
+	__syncthreads();
+
+	if (threadIdx.x == 0)
+	{
+		float trace = 0.0f;
+		float maxDiag = 0.0f;
+		for (int j = 0; j < r; ++j)
+		{
+			const float diag = G[j * r + j];
+			trace += diag;
+			if (diag > maxDiag) maxDiag = diag;
+		}
+		const float meanDiag =
+		    fmaxf(trace / fmaxf(static_cast<float>(r), 1.0f), eps);
+		const float shift = fmaxf(eps, fmaxf(0.0f, damping) * meanDiag);
+		for (int j = 0; j < r; ++j)
+			G[j * r + j] += shift;
+		maxDiag += shift;
+		const float diagFloor = 1.0e-12f * (maxDiag > 0.0f ? maxDiag : 1.0f);
+
+		for (int j = 0; j < r; ++j)
+		{
+			const float d = G[j * r + j] > diagFloor ? G[j * r + j] : diagFloor;
+			const float scale = sqrtf(d);
+			colScale[j] = scale;
+			d_scale[j] = scale;
+		}
+	}
+	__syncthreads();
+
+	for (int idx = threadIdx.x; idx < rr; idx += blockDim.x)
+	{
+		const int i = idx / r;
+		const int j = idx - i * r;
+		d_G[idx] = G[idx] / (colScale[i] * colScale[j]);
+	}
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -1469,6 +1733,87 @@ bool atlas_gpu_gram_schmidt(float* d_Q, int m, int r)
 	int smemBytes = ((blockSize / 32) + 1) * sizeof(double);
 	atlas_gs_kernel<<<1, blockSize, smemBytes, computeStream()>>>(d_Q, m, r);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+static bool atlas_cholesky_factor_small(float* d_G,
+                                        int r,
+                                        float damping,
+                                        float eps,
+                                        bool regularize)
+{
+	if (!d_G || r <= 0)
+		return true;
+	if (r > kAtlasSmallCholeskyMaxDim)
+		return false;
+
+	const size_t smemBytes =
+	    (static_cast<size_t>(r) * static_cast<size_t>(r) + static_cast<size_t>(r))
+	    * sizeof(float);
+	atlas_cholesky_factor_small_kernel<<<1, kAtlasSmallCholeskyThreads, smemBytes, computeStream()>>>(
+	    d_G, r, damping, eps, regularize);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+static bool atlas_cholesky_factor_small_batch(float** d_G_ptrs,
+                                              int count,
+                                              int r,
+                                              float damping,
+                                              float eps,
+                                              bool regularize)
+{
+	if (!d_G_ptrs || count <= 0 || r <= 0)
+		return true;
+	if (r > kAtlasSmallCholeskyMaxDim)
+		return false;
+
+	const size_t smemBytes =
+	    (static_cast<size_t>(r) * static_cast<size_t>(r) + static_cast<size_t>(r))
+	    * sizeof(float);
+	atlas_cholesky_factor_small_batched_kernel<<<count, kAtlasSmallCholeskyThreads, smemBytes, computeStream()>>>(
+	    d_G_ptrs, count, r, damping, eps, regularize);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+static bool atlas_cholesky_factor_small_batch_cusolver(float** d_G_ptrs,
+                                                       int* d_infoScratch,
+                                                       int count,
+                                                       int r,
+                                                       float damping,
+                                                       float eps)
+{
+	if (!d_G_ptrs || !d_infoScratch || count <= 0 || r <= 0)
+		return true;
+	if (r > kAtlasSmallCholeskyMaxDim)
+		return false;
+	if (!atlas_solver_init())
+		return false;
+
+	const size_t smemBytes =
+	    (static_cast<size_t>(r) * static_cast<size_t>(r) + static_cast<size_t>(r))
+	    * sizeof(float);
+	atlas_cholesky_precondition_small_batched_kernel<<<count, kAtlasSmallCholeskyThreads, smemBytes, computeStream()>>>(
+	    d_G_ptrs, count, r, damping, eps);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	ATLAS_CUDA_CHECK(cudaMemsetAsync(d_infoScratch, 0, static_cast<size_t>(count) * sizeof(int),
+	                                 computeStream()));
+
+	const cusolverStatus_t st =
+	    cusolverDnSpotrfBatched(g_atlasSolverHandle,
+	                            CUBLAS_FILL_MODE_LOWER,
+	                            r,
+	                            d_G_ptrs,
+	                            r,
+	                            d_infoScratch,
+	                            count);
+	if (st != CUSOLVER_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[atlas-gpu] cusolverDnSpotrfBatched failed: %d (r=%d batch=%d)\n",
+		        static_cast<int>(st), r, count);
+		return false;
+	}
 	return true;
 }
 
@@ -3091,6 +3436,114 @@ __device__ __forceinline__ float pact_clamp_unit(float x, float lo, float hi)
 	return x < lo ? lo : (x > hi ? hi : x);
 }
 
+enum
+{
+	ECHO_STAT_ROW_MEAN = 0,
+	ECHO_STAT_COL_MEAN = 1,
+	ECHO_STAT_ROW_MIN = 2,
+	ECHO_STAT_ROW_MAX = 3,
+	ECHO_STAT_COL_MIN = 4,
+	ECHO_STAT_COL_MAX = 5,
+	ECHO_STAT_PREV_ROW_ANISO = 6,
+	ECHO_STAT_PREV_COL_ANISO = 7,
+	ECHO_STAT_GEOM_TRUST = 8,
+	ECHO_STAT_PRED_TRUST = 9,
+	ECHO_STAT_STRUCT_TRUST = 10,
+	ECHO_STAT_MATURITY = 11,
+	ECHO_STAT_COUNT = 12
+};
+
+__device__ __forceinline__ unsigned int echo_group_index_device(unsigned int idx,
+                                                                unsigned int dim,
+                                                                unsigned int groups)
+{
+	if (dim == 0u || groups <= 1u)
+		return 0u;
+	unsigned int group =
+	    static_cast<unsigned int>((static_cast<unsigned long long>(idx) * groups) / dim);
+	return (group < groups) ? group : (groups - 1u);
+}
+
+__device__ __forceinline__ float echo_anisotropy_signal_device(float anisotropy)
+{
+	const float clamped = fmaxf(anisotropy, 1.0f);
+	return (clamped - 1.0f) / (clamped + 1.0f);
+}
+
+__device__ __forceinline__ float echo_persistence_score_device(float current,
+                                                               float previous)
+{
+	const float cur = fmaxf(current, 1.0f);
+	const float prev = fmaxf(previous, 1.0f);
+	const float hi = fmaxf(cur, prev);
+	if (hi <= 1.0e-12f)
+		return 1.0f;
+	return fminf(cur, prev) / hi;
+}
+
+__device__ __forceinline__ float echo_compute_geometry_trust_device(float rowAniso,
+                                                                    float colAniso,
+                                                                    float prevRowAniso,
+                                                                    float prevColAniso,
+                                                                    float trustScale)
+{
+	if (trustScale <= 0.0f)
+		return 1.0f;
+	const float rowScore =
+	    echo_anisotropy_signal_device(rowAniso)
+	    * echo_persistence_score_device(rowAniso, prevRowAniso);
+	const float colScore =
+	    echo_anisotropy_signal_device(colAniso)
+	    * echo_persistence_score_device(colAniso, prevColAniso);
+	return pact_clamp_unit(trustScale * 0.5f * (rowScore + colScore), 0.0f, 1.0f);
+}
+
+__device__ __forceinline__ float echo_compute_group_signal_device(const float* groupMean,
+                                                                  unsigned int groups)
+{
+	if (!groupMean || groups <= 1u)
+		return 0.0f;
+	float groupMin = FLT_MAX;
+	float groupMax = 0.0f;
+	for (unsigned int g = 0u; g < groups; ++g)
+	{
+		const float v = fmaxf(groupMean[g], 1.0e-12f);
+		groupMin = fminf(groupMin, v);
+		groupMax = fmaxf(groupMax, v);
+	}
+	const float anisotropy = (groupMin > 1.0e-12f) ? (groupMax / groupMin) : 1.0f;
+	return echo_anisotropy_signal_device(anisotropy);
+}
+
+__device__ __forceinline__ void echo_compute_simplex_weights_device(float auxBudget,
+                                                                    float predictiveScale,
+                                                                    float structuralScale,
+                                                                    float maturity,
+                                                                    float* baseWeight,
+                                                                    float* predictiveWeight,
+                                                                    float* structuralWeight)
+{
+	const float mu = pact_clamp_unit(maturity, 0.0f, 1.0f);
+	const float lateContraction = 1.0f - mu;
+	const float predRaw =
+	    (predictiveScale > 0.0f)
+	        ? (fmaxf(predictiveScale, 0.0f) * (1.0f - mu) * (1.0f - mu))
+	        : 0.0f;
+	const float structRaw =
+	    (structuralScale > 0.0f)
+	        ? (fmaxf(structuralScale, 0.0f) * (4.0f * mu * (1.0f - mu)))
+	        : 0.0f;
+	const float trustedAux = pact_clamp_unit(auxBudget, 0.0f, 1.0f) * lateContraction;
+	const float denom = 1.0f + trustedAux * (predRaw + structRaw);
+	const float base = 1.0f / fmaxf(denom, 1.0e-12f);
+	if (baseWeight)
+		*baseWeight = base;
+	if (predictiveWeight)
+		*predictiveWeight = base * trustedAux * predRaw;
+	if (structuralWeight)
+		*structuralWeight = base * trustedAux * structRaw;
+}
+
 __global__ void pact_lite_stats_kernel(const float* __restrict__ d_gW,
                                        float* __restrict__ d_rowSecond,
                                        float* __restrict__ d_colScratch,
@@ -3210,30 +3663,121 @@ __global__ void echo_operand_second_dual_kernel(const float* __restrict__ d_rowO
 	}
 }
 
+__global__ void echo_operand_second_batch_kernel(
+    const GpuEchoObserveEntry* __restrict__ d_entries,
+    int entryCount,
+    float betaGeom)
+{
+	const int globalFeature = blockIdx.x;
+	if (!d_entries || entryCount <= 0 || globalFeature < 0)
+		return;
+
+	int grp = 0;
+	while (grp < entryCount)
+	{
+		const GpuEchoObserveEntry entry = d_entries[grp];
+		const int featureEnd =
+		    entry.featureBase
+		    + ((entry.rows > 0) ? entry.rows : 0)
+		    + ((entry.cols > 0) ? entry.cols : 0);
+		if (globalFeature < featureEnd)
+			break;
+		++grp;
+	}
+	if (grp >= entryCount)
+		return;
+
+	const GpuEchoObserveEntry entry = d_entries[grp];
+	const int localFeature = globalFeature - entry.featureBase;
+	const bool useRow = localFeature < entry.rows;
+	const int feature = useRow ? localFeature : (localFeature - entry.rows);
+	const int dim = useRow ? entry.rows : entry.cols;
+	if (feature < 0 || feature >= dim || entry.samples <= 0)
+		return;
+
+	const float* d_obs = useRow ? entry.rowObs : entry.colObs;
+	float* d_second = useRow ? entry.rowSecond : entry.colSecond;
+	if (!d_obs || !d_second)
+		return;
+
+	extern __shared__ float smem[];
+	float localSq = 0.0f;
+	for (int sample = threadIdx.x; sample < entry.samples; sample += blockDim.x)
+	{
+		const float v =
+		    d_obs[static_cast<size_t>(sample) * static_cast<size_t>(dim) + static_cast<size_t>(feature)];
+		localSq += v * v;
+	}
+	localSq = blockReduceSum(localSq, smem);
+	if (threadIdx.x == 0)
+	{
+		const float sampleMean =
+		    fmaxf(localSq / fmaxf(static_cast<float>(entry.samples), 1.0f), 1.0e-12f);
+		d_second[feature] =
+		    betaGeom * d_second[feature] + (1.0f - betaGeom) * sampleMean;
+	}
+}
+
 __global__ void echo_finalize_metrics_kernel(const float* __restrict__ d_rowSecond,
                                              const float* __restrict__ d_colSecond,
-                                             float* __restrict__ d_rowMetric,
-                                             float* __restrict__ d_colMetric,
+                                             float* __restrict__ d_rowInvMetric,
+                                             float* __restrict__ d_colInvMetric,
+                                             float* __restrict__ d_rowStructInvMetric,
+                                             float* __restrict__ d_colStructInvMetric,
                                              int rows,
                                              int cols,
                                              float eps,
                                              float geomScale,
+                                             float trustScale,
+                                             float predictiveScale,
+                                             float structuralScale,
+                                             unsigned int structuralGroups,
                                              float* __restrict__ d_stats)
 {
 	if (blockIdx.x != 0)
 		return;
 
 	extern __shared__ float smem[];
+	__shared__ float sRowGroupMean[32];
+	__shared__ float sColGroupMean[32];
+	__shared__ float sRowGroupSum[32];
+	__shared__ float sColGroupSum[32];
+	__shared__ unsigned int sRowGroupCount[32];
+	__shared__ unsigned int sColGroupCount[32];
 
 	float localRowSum = 0.0f;
 	float localRowMin = FLT_MAX;
 	float localRowMax = 0.0f;
+	const unsigned int rowLimit = (rows > 0) ? static_cast<unsigned int>(rows) : 1u;
+	const unsigned int colLimit = (cols > 0) ? static_cast<unsigned int>(cols) : 1u;
+	const unsigned int requestedGroups = (structuralGroups > 0u) ? structuralGroups : 1u;
+	const unsigned int rowGroups = min(requestedGroups, min(rowLimit, 32u));
+	const unsigned int colGroups = min(requestedGroups, min(colLimit, 32u));
+	for (unsigned int g = threadIdx.x; g < 32u; g += blockDim.x)
+	{
+		sRowGroupMean[g] = 1.0f;
+		sColGroupMean[g] = 1.0f;
+		sRowGroupSum[g] = 0.0f;
+		sColGroupSum[g] = 0.0f;
+		sRowGroupCount[g] = 0u;
+		sColGroupCount[g] = 0u;
+	}
+	__syncthreads();
 	for (int i = threadIdx.x; i < rows; i += blockDim.x)
 	{
 		const float v = fmaxf(d_rowSecond[i], 1.0e-12f);
 		localRowSum += v;
 		localRowMin = fminf(localRowMin, v);
 		localRowMax = fmaxf(localRowMax, v);
+		if (structuralScale > 0.0f && rowGroups > 1u)
+		{
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(i),
+			                            static_cast<unsigned int>(rows),
+			                            rowGroups);
+			atomicAdd(&sRowGroupSum[g], v);
+			atomicAdd(&sRowGroupCount[g], 1u);
+		}
 	}
 
 	const float rowSum = blockReduceSum(localRowSum, smem);
@@ -3246,6 +3790,10 @@ __global__ void echo_finalize_metrics_kernel(const float* __restrict__ d_rowSeco
 	__shared__ float sRowMax;
 	__shared__ float sColMin;
 	__shared__ float sColMax;
+	__shared__ float sGeomTrust;
+	__shared__ float sPredTrust;
+	__shared__ float sStructTrust;
+	__shared__ float sMaturity;
 	if (threadIdx.x == 0)
 	{
 		sRowMean = fmaxf(rowSum / fmaxf(static_cast<float>(rows), 1.0f), 1.0e-12f);
@@ -3263,6 +3811,15 @@ __global__ void echo_finalize_metrics_kernel(const float* __restrict__ d_rowSeco
 		localColSum += v;
 		localColMin = fminf(localColMin, v);
 		localColMax = fmaxf(localColMax, v);
+		if (structuralScale > 0.0f && colGroups > 1u)
+		{
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(j),
+			                            static_cast<unsigned int>(cols),
+			                            colGroups);
+			atomicAdd(&sColGroupSum[g], v);
+			atomicAdd(&sColGroupCount[g], 1u);
+		}
 	}
 
 	const float colSum = blockReduceSum(localColSum, smem);
@@ -3273,42 +3830,367 @@ __global__ void echo_finalize_metrics_kernel(const float* __restrict__ d_rowSeco
 		sColMean = fmaxf(colSum / fmaxf(static_cast<float>(cols), 1.0f), 1.0e-12f);
 		sColMin = (cols > 0) ? colMin : 1.0e-12f;
 		sColMax = (cols > 0) ? colMax : 1.0e-12f;
+		const float rowAniso = (sRowMin > 1.0e-12f) ? (sRowMax / sRowMin) : 1.0f;
+		const float colAniso = (sColMin > 1.0e-12f) ? (sColMax / sColMin) : 1.0f;
+		const float prevRowAniso =
+		    d_stats ? fmaxf(d_stats[ECHO_STAT_PREV_ROW_ANISO], 1.0f) : 1.0f;
+		const float prevColAniso =
+		    d_stats ? fmaxf(d_stats[ECHO_STAT_PREV_COL_ANISO], 1.0f) : 1.0f;
+		sGeomTrust = echo_compute_geometry_trust_device(
+		    rowAniso, colAniso, prevRowAniso, prevColAniso, trustScale);
+		for (unsigned int g = 0u; g < rowGroups; ++g)
+		{
+			const unsigned int count = max(sRowGroupCount[g], 1u);
+			sRowGroupMean[g] = (sRowGroupCount[g] > 0u)
+			    ? fmaxf(sRowGroupSum[g] / static_cast<float>(count), 1.0e-12f)
+			    : sRowMean;
+		}
+		for (unsigned int g = 0u; g < colGroups; ++g)
+		{
+			const unsigned int count = max(sColGroupCount[g], 1u);
+			sColGroupMean[g] = (sColGroupCount[g] > 0u)
+			    ? fmaxf(sColGroupSum[g] / static_cast<float>(count), 1.0e-12f)
+			    : sColMean;
+		}
+		const float groupSignal =
+		    0.5f * (echo_compute_group_signal_device(sRowGroupMean, rowGroups)
+		          + echo_compute_group_signal_device(sColGroupMean, colGroups));
+		const float anisoSignal =
+		    0.5f * (echo_anisotropy_signal_device(rowAniso)
+		          + echo_anisotropy_signal_device(colAniso));
+		const float maturityTarget =
+		    pact_clamp_unit(0.5f * anisoSignal + 0.5f * groupSignal, 0.0f, 1.0f);
+		const float prevMaturity =
+		    d_stats ? pact_clamp_unit(d_stats[ECHO_STAT_MATURITY], 0.0f, 1.0f) : 0.0f;
+		const float maturityRate = 0.2f;
+		sMaturity = (prevMaturity <= 0.0f)
+		    ? (maturityRate * maturityTarget)
+		    : ((1.0f - maturityRate) * prevMaturity + maturityRate * maturityTarget);
+		float baseWeight = 1.0f;
+		echo_compute_simplex_weights_device(
+		    sGeomTrust,
+		    predictiveScale,
+		    ((rowGroups > 1u) || (colGroups > 1u)) ? structuralScale : 0.0f,
+		    sMaturity,
+		    &baseWeight,
+		    &sPredTrust,
+		    &sStructTrust);
 		d_stats[0] = sRowMean;
 		d_stats[1] = sColMean;
 		d_stats[2] = sRowMin;
 		d_stats[3] = sRowMax;
 		d_stats[4] = sColMin;
 		d_stats[5] = sColMax;
+		d_stats[ECHO_STAT_PREV_ROW_ANISO] = rowAniso;
+		d_stats[ECHO_STAT_PREV_COL_ANISO] = colAniso;
+		d_stats[ECHO_STAT_GEOM_TRUST] = sGeomTrust;
+		d_stats[ECHO_STAT_PRED_TRUST] = sPredTrust;
+		d_stats[ECHO_STAT_STRUCT_TRUST] = sStructTrust;
+		d_stats[ECHO_STAT_MATURITY] = sMaturity;
 	}
 	__syncthreads();
 
+	const float effectiveGeomScale = fmaxf(geomScale, 0.0f);
+	const float effectiveStructuralScale = fmaxf(structuralScale, 0.0f);
 	for (int i = threadIdx.x; i < rows; i += blockDim.x)
 	{
-		if (geomScale > 0.0f)
+		float rowMetric = 1.0f;
+		if (effectiveGeomScale > 0.0f)
 		{
 			const float rowScaleRaw =
 			    sqrtf((fmaxf(d_rowSecond[i], 1.0e-12f) + eps) / (sRowMean + eps));
-			d_rowMetric[i] =
-			    pact_clamp_unit(1.0f + geomScale * (rowScaleRaw - 1.0f), 0.25f, 4.0f);
+			rowMetric =
+			    pact_clamp_unit(1.0f + effectiveGeomScale * (rowScaleRaw - 1.0f), 0.25f, 4.0f);
 		}
-		else
+		float rowStructMetric = rowMetric;
+		if (effectiveStructuralScale > 0.0f && rowGroups > 1u)
 		{
-			d_rowMetric[i] = 1.0f;
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(i),
+			                            static_cast<unsigned int>(rows),
+			                            rowGroups);
+			const float groupScaleRaw =
+			    sqrtf((sRowGroupMean[g] + eps) / (sRowMean + eps));
+			const float structMetric =
+			    pact_clamp_unit(1.0f + effectiveStructuralScale * (groupScaleRaw - 1.0f), 0.25f, 4.0f);
+			rowStructMetric = pact_clamp_unit(rowMetric * structMetric, 0.25f, 4.0f);
 		}
+		d_rowInvMetric[i] = 1.0f / fmaxf(rowMetric, eps);
+		if (d_rowStructInvMetric)
+			d_rowStructInvMetric[i] = 1.0f / fmaxf(rowStructMetric, eps);
 	}
 	for (int j = threadIdx.x; j < cols; j += blockDim.x)
 	{
-		if (geomScale > 0.0f)
+		float colMetric = 1.0f;
+		if (effectiveGeomScale > 0.0f)
 		{
 			const float colScaleRaw =
 			    sqrtf((fmaxf(d_colSecond[j], 1.0e-12f) + eps) / (sColMean + eps));
-			d_colMetric[j] =
-			    pact_clamp_unit(1.0f + geomScale * (colScaleRaw - 1.0f), 0.25f, 4.0f);
+			colMetric =
+			    pact_clamp_unit(1.0f + effectiveGeomScale * (colScaleRaw - 1.0f), 0.25f, 4.0f);
 		}
-		else
+		float colStructMetric = colMetric;
+		if (effectiveStructuralScale > 0.0f && colGroups > 1u)
 		{
-			d_colMetric[j] = 1.0f;
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(j),
+			                            static_cast<unsigned int>(cols),
+			                            colGroups);
+			const float groupScaleRaw =
+			    sqrtf((sColGroupMean[g] + eps) / (sColMean + eps));
+			const float structMetric =
+			    pact_clamp_unit(1.0f + effectiveStructuralScale * (groupScaleRaw - 1.0f), 0.25f, 4.0f);
+			colStructMetric = pact_clamp_unit(colMetric * structMetric, 0.25f, 4.0f);
 		}
+		d_colInvMetric[j] = 1.0f / fmaxf(colMetric, eps);
+		if (d_colStructInvMetric)
+			d_colStructInvMetric[j] = 1.0f / fmaxf(colStructMetric, eps);
+	}
+}
+
+__global__ void echo_finalize_metrics_batch_kernel(
+    float** __restrict__ d_rowSecond,
+    float** __restrict__ d_colSecond,
+    float** __restrict__ d_rowInvMetric,
+    float** __restrict__ d_colInvMetric,
+    float** __restrict__ d_rowStructInvMetric,
+    float** __restrict__ d_colStructInvMetric,
+    float** __restrict__ d_stats,
+    const int* __restrict__ d_rows,
+    const int* __restrict__ d_cols,
+    int groupCount,
+    float eps,
+    float geomScale,
+    float trustScale,
+    float predictiveScale,
+    float structuralScale,
+    unsigned int structuralGroups)
+{
+	const int grp = blockIdx.x;
+	if (grp >= groupCount)
+		return;
+
+	const int rows = d_rows ? d_rows[grp] : 0;
+	const int cols = d_cols ? d_cols[grp] : 0;
+	float* rowSecond = d_rowSecond ? d_rowSecond[grp] : NULL;
+	float* colSecond = d_colSecond ? d_colSecond[grp] : NULL;
+	float* rowInvMetric = d_rowInvMetric ? d_rowInvMetric[grp] : NULL;
+	float* colInvMetric = d_colInvMetric ? d_colInvMetric[grp] : NULL;
+	float* rowStructInvMetric = d_rowStructInvMetric ? d_rowStructInvMetric[grp] : NULL;
+	float* colStructInvMetric = d_colStructInvMetric ? d_colStructInvMetric[grp] : NULL;
+	float* stats = d_stats ? d_stats[grp] : NULL;
+	if (!rowSecond || !colSecond || !rowInvMetric || !colInvMetric || rows <= 0 || cols <= 0)
+		return;
+
+	extern __shared__ float smem[];
+	__shared__ float sRowGroupMean[32];
+	__shared__ float sColGroupMean[32];
+	__shared__ float sRowGroupSum[32];
+	__shared__ float sColGroupSum[32];
+	__shared__ unsigned int sRowGroupCount[32];
+	__shared__ unsigned int sColGroupCount[32];
+	const unsigned int requestedGroups = (structuralGroups > 0u) ? structuralGroups : 1u;
+	const unsigned int rowGroups = min(requestedGroups, min(static_cast<unsigned int>(rows), 32u));
+	const unsigned int colGroups = min(requestedGroups, min(static_cast<unsigned int>(cols), 32u));
+	for (unsigned int g = threadIdx.x; g < 32u; g += blockDim.x)
+	{
+		sRowGroupMean[g] = 1.0f;
+		sColGroupMean[g] = 1.0f;
+		sRowGroupSum[g] = 0.0f;
+		sColGroupSum[g] = 0.0f;
+		sRowGroupCount[g] = 0u;
+		sColGroupCount[g] = 0u;
+	}
+	__syncthreads();
+
+	float localRowSum = 0.0f;
+	float localRowMin = FLT_MAX;
+	float localRowMax = 0.0f;
+	for (int i = threadIdx.x; i < rows; i += blockDim.x)
+	{
+		const float v = fmaxf(rowSecond[i], 1.0e-12f);
+		localRowSum += v;
+		localRowMin = fminf(localRowMin, v);
+		localRowMax = fmaxf(localRowMax, v);
+		if (structuralScale > 0.0f && rowGroups > 1u)
+		{
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(i),
+			                            static_cast<unsigned int>(rows),
+			                            rowGroups);
+			atomicAdd(&sRowGroupSum[g], v);
+			atomicAdd(&sRowGroupCount[g], 1u);
+		}
+	}
+
+	const float rowSum = blockReduceSum(localRowSum, smem);
+	const float rowMin = blockReduceMin(localRowMin, smem);
+	const float rowMax = blockReduceMax(localRowMax, smem);
+
+	__shared__ float sRowMean;
+	__shared__ float sColMean;
+	__shared__ float sRowMin;
+	__shared__ float sRowMax;
+	__shared__ float sColMin;
+	__shared__ float sColMax;
+	__shared__ float sGeomTrust;
+	__shared__ float sPredTrust;
+	__shared__ float sStructTrust;
+	__shared__ float sMaturity;
+	if (threadIdx.x == 0)
+	{
+		sRowMean = fmaxf(rowSum / fmaxf(static_cast<float>(rows), 1.0f), 1.0e-12f);
+		sRowMin = rowMin;
+		sRowMax = rowMax;
+	}
+	__syncthreads();
+
+	float localColSum = 0.0f;
+	float localColMin = FLT_MAX;
+	float localColMax = 0.0f;
+	for (int j = threadIdx.x; j < cols; j += blockDim.x)
+	{
+		const float v = fmaxf(colSecond[j], 1.0e-12f);
+		localColSum += v;
+		localColMin = fminf(localColMin, v);
+		localColMax = fmaxf(localColMax, v);
+		if (structuralScale > 0.0f && colGroups > 1u)
+		{
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(j),
+			                            static_cast<unsigned int>(cols),
+			                            colGroups);
+			atomicAdd(&sColGroupSum[g], v);
+			atomicAdd(&sColGroupCount[g], 1u);
+		}
+	}
+
+	const float colSum = blockReduceSum(localColSum, smem);
+	const float colMin = blockReduceMin(localColMin, smem);
+	const float colMax = blockReduceMax(localColMax, smem);
+	if (threadIdx.x == 0)
+	{
+		sColMean = fmaxf(colSum / fmaxf(static_cast<float>(cols), 1.0f), 1.0e-12f);
+		sColMin = colMin;
+		sColMax = colMax;
+		const float rowAniso = (sRowMin > 1.0e-12f) ? (sRowMax / sRowMin) : 1.0f;
+		const float colAniso = (sColMin > 1.0e-12f) ? (sColMax / sColMin) : 1.0f;
+		const float prevRowAniso =
+		    stats ? fmaxf(stats[ECHO_STAT_PREV_ROW_ANISO], 1.0f) : 1.0f;
+		const float prevColAniso =
+		    stats ? fmaxf(stats[ECHO_STAT_PREV_COL_ANISO], 1.0f) : 1.0f;
+		sGeomTrust = echo_compute_geometry_trust_device(
+		    rowAniso, colAniso, prevRowAniso, prevColAniso, trustScale);
+		for (unsigned int g = 0u; g < rowGroups; ++g)
+		{
+			const unsigned int count = max(sRowGroupCount[g], 1u);
+			sRowGroupMean[g] = (sRowGroupCount[g] > 0u)
+			    ? fmaxf(sRowGroupSum[g] / static_cast<float>(count), 1.0e-12f)
+			    : sRowMean;
+		}
+		for (unsigned int g = 0u; g < colGroups; ++g)
+		{
+			const unsigned int count = max(sColGroupCount[g], 1u);
+			sColGroupMean[g] = (sColGroupCount[g] > 0u)
+			    ? fmaxf(sColGroupSum[g] / static_cast<float>(count), 1.0e-12f)
+			    : sColMean;
+		}
+		const float groupSignal =
+		    0.5f * (echo_compute_group_signal_device(sRowGroupMean, rowGroups)
+		          + echo_compute_group_signal_device(sColGroupMean, colGroups));
+		const float anisoSignal =
+		    0.5f * (echo_anisotropy_signal_device(rowAniso)
+		          + echo_anisotropy_signal_device(colAniso));
+		const float maturityTarget =
+		    pact_clamp_unit(0.5f * anisoSignal + 0.5f * groupSignal, 0.0f, 1.0f);
+		const float prevMaturity =
+		    stats ? pact_clamp_unit(stats[ECHO_STAT_MATURITY], 0.0f, 1.0f) : 0.0f;
+		const float maturityRate = 0.2f;
+		sMaturity = (prevMaturity <= 0.0f)
+		    ? (maturityRate * maturityTarget)
+		    : ((1.0f - maturityRate) * prevMaturity + maturityRate * maturityTarget);
+		float baseWeight = 1.0f;
+		echo_compute_simplex_weights_device(
+		    sGeomTrust,
+		    predictiveScale,
+		    ((rowGroups > 1u) || (colGroups > 1u)) ? structuralScale : 0.0f,
+		    sMaturity,
+		    &baseWeight,
+		    &sPredTrust,
+		    &sStructTrust);
+		if (stats)
+		{
+			stats[ECHO_STAT_ROW_MEAN] = sRowMean;
+			stats[ECHO_STAT_COL_MEAN] = sColMean;
+			stats[ECHO_STAT_ROW_MIN] = sRowMin;
+			stats[ECHO_STAT_ROW_MAX] = sRowMax;
+			stats[ECHO_STAT_COL_MIN] = sColMin;
+			stats[ECHO_STAT_COL_MAX] = sColMax;
+			stats[ECHO_STAT_PREV_ROW_ANISO] = rowAniso;
+			stats[ECHO_STAT_PREV_COL_ANISO] = colAniso;
+			stats[ECHO_STAT_GEOM_TRUST] = sGeomTrust;
+			stats[ECHO_STAT_PRED_TRUST] = sPredTrust;
+			stats[ECHO_STAT_STRUCT_TRUST] = sStructTrust;
+			stats[ECHO_STAT_MATURITY] = sMaturity;
+		}
+	}
+	__syncthreads();
+
+	const float effectiveGeomScale = fmaxf(geomScale, 0.0f);
+	const float effectiveStructuralScale = fmaxf(structuralScale, 0.0f);
+	for (int i = threadIdx.x; i < rows; i += blockDim.x)
+	{
+		float rowMetric = 1.0f;
+		if (effectiveGeomScale > 0.0f)
+		{
+			const float rowScaleRaw =
+			    sqrtf((fmaxf(rowSecond[i], 1.0e-12f) + eps) / (sRowMean + eps));
+			rowMetric =
+			    pact_clamp_unit(1.0f + effectiveGeomScale * (rowScaleRaw - 1.0f), 0.25f, 4.0f);
+		}
+		float rowStructMetric = rowMetric;
+		if (effectiveStructuralScale > 0.0f && rowGroups > 1u)
+		{
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(i),
+			                            static_cast<unsigned int>(rows),
+			                            rowGroups);
+			const float groupScaleRaw =
+			    sqrtf((sRowGroupMean[g] + eps) / (sRowMean + eps));
+			const float structMetric =
+			    pact_clamp_unit(1.0f + effectiveStructuralScale * (groupScaleRaw - 1.0f), 0.25f, 4.0f);
+			rowStructMetric = pact_clamp_unit(rowMetric * structMetric, 0.25f, 4.0f);
+		}
+		rowInvMetric[i] = 1.0f / fmaxf(rowMetric, eps);
+		if (rowStructInvMetric)
+			rowStructInvMetric[i] = 1.0f / fmaxf(rowStructMetric, eps);
+	}
+	for (int j = threadIdx.x; j < cols; j += blockDim.x)
+	{
+		float colMetric = 1.0f;
+		if (effectiveGeomScale > 0.0f)
+		{
+			const float colScaleRaw =
+			    sqrtf((fmaxf(colSecond[j], 1.0e-12f) + eps) / (sColMean + eps));
+			colMetric =
+			    pact_clamp_unit(1.0f + effectiveGeomScale * (colScaleRaw - 1.0f), 0.25f, 4.0f);
+		}
+		float colStructMetric = colMetric;
+		if (effectiveStructuralScale > 0.0f && colGroups > 1u)
+		{
+			const unsigned int g =
+			    echo_group_index_device(static_cast<unsigned int>(j),
+			                            static_cast<unsigned int>(cols),
+			                            colGroups);
+			const float groupScaleRaw =
+			    sqrtf((sColGroupMean[g] + eps) / (sColMean + eps));
+			const float structMetric =
+			    pact_clamp_unit(1.0f + effectiveStructuralScale * (groupScaleRaw - 1.0f), 0.25f, 4.0f);
+			colStructMetric = pact_clamp_unit(colMetric * structMetric, 0.25f, 4.0f);
+		}
+		colInvMetric[j] = 1.0f / fmaxf(colMetric, eps);
+		if (colStructInvMetric)
+			colStructInvMetric[j] = 1.0f / fmaxf(colStructMetric, eps);
 	}
 }
 
@@ -3316,8 +4198,12 @@ __global__ void echo_adam_update_kernel(float* __restrict__ d_W,
                                         float* __restrict__ d_gW,
                                         float* __restrict__ d_m,
                                         float* __restrict__ d_v,
-                                        const float* __restrict__ d_rowMetric,
-                                        const float* __restrict__ d_colMetric,
+                                        const float* __restrict__ d_rowInvMetric,
+                                        const float* __restrict__ d_colInvMetric,
+                                        const float* __restrict__ d_rowStructInvMetric,
+                                        const float* __restrict__ d_colStructInvMetric,
+                                        float* __restrict__ d_prevMhat,
+                                        const float* __restrict__ d_stats,
                                         int rows, int cols,
                                         float lr,
                                         float beta1, float beta2,
@@ -3326,6 +4212,14 @@ __global__ void echo_adam_update_kernel(float* __restrict__ d_W,
                                         float eps)
 {
 	const int total = rows * cols;
+	const float predictiveWeight =
+	    (d_prevMhat && d_stats && step > 1)
+	        ? fmaxf(d_stats[ECHO_STAT_PRED_TRUST], 0.0f)
+	        : 0.0f;
+	const float structuralWeight =
+	    d_stats ? fmaxf(d_stats[ECHO_STAT_STRUCT_TRUST], 0.0f) : 0.0f;
+	const float baseWeight =
+	    d_stats ? fmaxf(0.0f, 1.0f - predictiveWeight - structuralWeight) : 1.0f;
 	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	     idx < total;
 	     idx += blockDim.x * gridDim.x)
@@ -3341,9 +4235,33 @@ __global__ void echo_adam_update_kernel(float* __restrict__ d_W,
 		const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
 		const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
 		const float mHat = mNew / bc1;
+		float predictiveMhat = mHat;
+		if (predictiveWeight > 0.0f)
+		{
+			float delta = mHat - d_prevMhat[idx];
+			const float deltaCap = 0.5f * (fabsf(mHat) + eps);
+			if (delta > deltaCap)
+				delta = deltaCap;
+			else if (delta < -deltaCap)
+				delta = -deltaCap;
+			predictiveMhat += delta;
+		}
 		const float vHat = vNew / bc2;
-		float stepVal = mHat / (sqrtf(fmaxf(vHat, 0.0f)) + eps);
-		stepVal /= (fmaxf(d_rowMetric[row], 1.0e-12f) * fmaxf(d_colMetric[col], 1.0e-12f));
+		const float diagInv = 1.0f / (sqrtf(fmaxf(vHat, 0.0f)) + eps);
+		const float baseMetric = d_rowInvMetric[row] * d_colInvMetric[col];
+		const float structMetric =
+		    (d_rowStructInvMetric && d_colStructInvMetric)
+		        ? (d_rowStructInvMetric[row] * d_colStructInvMetric[col])
+		        : baseMetric;
+		const float baseStep = mHat * diagInv * baseMetric;
+		const float predictiveStep = predictiveMhat * diagInv * baseMetric;
+		const float structuralStep = mHat * diagInv * structMetric;
+		const float stepVal =
+		    baseWeight * baseStep
+		    + predictiveWeight * predictiveStep
+		    + structuralWeight * structuralStep;
+		if (d_prevMhat)
+			d_prevMhat[idx] = mHat;
 		d_W[idx] -= lr * stepVal;
 		d_gW[idx] = 0.0f;
 	}
@@ -3892,6 +4810,7 @@ __global__ void muon_prepare_signal_kernel(const float* __restrict__ d_m,
                                            float eps,
                                            float* __restrict__ d_stats,
                                            float* __restrict__ d_adamStep,
+                                           float* __restrict__ d_muonStep,
                                            int total)
 {
 	const int nWarps = (blockDim.x + 31) / 32;
@@ -3919,6 +4838,8 @@ __global__ void muon_prepare_signal_kernel(const float* __restrict__ d_m,
 		const float vhat = d_v[idx] * inv1mB2t;
 		const float step = effectiveMhat / (sqrtf(fmaxf(vhat, 0.0f)) + eps);
 		d_adamStep[idx] = step;
+		if (d_muonStep)
+			d_muonStep[idx] = step;
 		d_prevMhat[idx] = currentMhat;
 		localFro += step * step;
 	}
@@ -3989,6 +4910,296 @@ __global__ void muon_lite_apply_residual_kernel(float* __restrict__ d_W,
 		    lr * geomScale * (signalScale * d_muonStep[idx] - d_adamStep[idx]);
 		d_W[idx] -= residual;
 		d_gW[idx] = 0.0f;
+	}
+}
+
+__global__ void muon_reset_stats_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                              float** __restrict__ corePtrs,
+                                              float** __restrict__ stepPtrs,
+                                              int count)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	if (threadIdx.x == 0)
+	{
+		corePtrs[batchIdx] = item.d_coreScratch;
+		stepPtrs[batchIdx] = item.d_muonStep;
+	}
+	float* d_stats = item.d_scalarScratch;
+	if (!d_stats)
+		return;
+	for (int idx = threadIdx.x; idx < 8; idx += blockDim.x)
+		d_stats[idx] = 0.0f;
+	if (threadIdx.x == 0)
+		d_stats[7] = 1.0f;
+}
+
+__global__ void muon_corr_reduce_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                              int count,
+                                              float inv1mB1t,
+                                              int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	if (!item.d_m || !item.d_prevMhat || !item.d_scalarScratch)
+		return;
+
+	const int nWarps = (blockDim.x + 31) / 32;
+	extern __shared__ float smem[];
+	float* sDot = smem;
+	float* sCur = sDot + nWarps;
+	float* sPrev = sCur + nWarps;
+
+	float localDot = 0.0f;
+	float localCur = 0.0f;
+	float localPrev = 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float cur = item.d_m[idx] * inv1mB1t;
+		const float prev = item.d_prevMhat[idx];
+		localDot += cur * prev;
+		localCur += cur * cur;
+		localPrev += prev * prev;
+	}
+
+	const float dot = blockReduceSum(localDot, sDot);
+	const float curNorm = blockReduceSum(localCur, sCur);
+	const float prevNorm = blockReduceSum(localPrev, sPrev);
+	if (threadIdx.x == 0)
+	{
+		atomicAdd(&item.d_scalarScratch[0], dot);
+		atomicAdd(&item.d_scalarScratch[1], curNorm);
+		atomicAdd(&item.d_scalarScratch[2], prevNorm);
+	}
+}
+
+__global__ void muon_finalize_trust_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                                 int count,
+                                                 float predictiveScale)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || batchIdx < 0 || batchIdx >= count || threadIdx.x != 0)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	float* d_stats = item.d_scalarScratch;
+	if (!d_stats)
+		return;
+
+	float trust = 0.0f;
+	if (item.predictiveEnabled != 0u && predictiveScale > 0.0f
+	    && d_stats[1] > 1.0e-18f && d_stats[2] > 1.0e-18f)
+	{
+		const float cosine = d_stats[0] / (sqrtf(d_stats[1] * d_stats[2]) + 1.0e-18f);
+		trust = predictiveScale * fminf(1.0f, fmaxf(0.0f, cosine));
+	}
+	d_stats[3] = trust;
+}
+
+__global__ void muon_prepare_signal_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                                 int count,
+                                                 float inv1mB1t,
+                                                 float inv1mB2t,
+                                                 float eps,
+                                                 int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	if (!item.d_m || !item.d_v || !item.d_prevMhat
+	    || !item.d_adamStep || !item.d_muonStep || !item.d_scalarScratch)
+		return;
+
+	extern __shared__ float smem[];
+	const float trust = item.d_scalarScratch[3];
+	float localFro = 0.0f;
+
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float currentMhat = item.d_m[idx] * inv1mB1t;
+		float effectiveMhat = currentMhat;
+		if (trust > 0.0f)
+		{
+			float delta = currentMhat - item.d_prevMhat[idx];
+			const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+			if (delta > deltaCap)
+				delta = deltaCap;
+			else if (delta < -deltaCap)
+				delta = -deltaCap;
+			effectiveMhat += trust * delta;
+		}
+
+		const float vhat = item.d_v[idx] * inv1mB2t;
+		const float step = effectiveMhat / (sqrtf(fmaxf(vhat, 0.0f)) + eps);
+		item.d_adamStep[idx] = step;
+		item.d_muonStep[idx] = step;
+		item.d_prevMhat[idx] = currentMhat;
+		localFro += step * step;
+	}
+
+	const float froSq = blockReduceSum(localFro, smem);
+	if (threadIdx.x == 0)
+		atomicAdd(&item.d_scalarScratch[4], froSq);
+}
+
+__global__ void muon_finalize_scale_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                                 int count,
+                                                 unsigned int shortDim)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || batchIdx < 0 || batchIdx >= count || threadIdx.x != 0)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	float* d_stats = item.d_scalarScratch;
+	if (!d_stats)
+		return;
+	d_stats[5] =
+	    sqrtf(fmaxf(d_stats[4], 0.0f))
+	    / sqrtf(static_cast<float>(shortDim > 0u ? shortDim : 1u));
+}
+
+__global__ void muon_normalize_step_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                                 int count,
+                                                 float eps,
+                                                 int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	if (!item.d_muonStep || !item.d_scalarScratch)
+		return;
+
+	const float froSq = item.d_scalarScratch[4];
+	const float invFro =
+	    (froSq > eps * eps) ? rsqrtf(froSq) : 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+		item.d_muonStep[idx] *= invFro;
+}
+
+__global__ void muon_select_step_ptrs_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                                   float** __restrict__ stepPtrs,
+                                                   int count,
+                                                   unsigned int useScratchInput)
+{
+	const int batchIdx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (!items || !stepPtrs || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	stepPtrs[batchIdx] = (useScratchInput != 0u) ? item.d_gW : item.d_muonStep;
+}
+
+__global__ void muon_cubic_core_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                             int count,
+                                             int dim)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count || dim <= 0)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	if (!item.d_coreScratch)
+		return;
+
+	const int rr = dim * dim;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < rr;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / dim;
+		const int col = idx - row * dim;
+		const float gram = item.d_coreScratch[idx];
+		item.d_coreScratch[idx] =
+		    (row == col)
+		        ? (1.5f - 0.5f * gram)
+		        : (-0.5f * gram);
+	}
+}
+
+__global__ void muon_right_multiply_core_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                                      int count,
+                                                      int cols,
+                                                      int total,
+                                                      unsigned int useScratchInput)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count || cols <= 0)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	const float* d_in = (useScratchInput != 0u) ? item.d_gW : item.d_muonStep;
+	float* d_out = (useScratchInput != 0u) ? item.d_muonStep : item.d_gW;
+	if (!d_in || !d_out || !item.d_coreScratch)
+		return;
+
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		const float* d_row = d_in + static_cast<size_t>(row) * static_cast<size_t>(cols);
+		float sum = 0.0f;
+		for (int k = 0; k < cols; ++k)
+			sum += d_row[k] * item.d_coreScratch[static_cast<size_t>(k) * static_cast<size_t>(cols) + col];
+		d_out[idx] = sum;
+	}
+}
+
+__global__ void muon_scale_step_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                             int count,
+                                             int cols,
+                                             int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	if (!item.d_muonStep || !item.d_coreScratch || cols <= 0)
+		return;
+	const float* d_scale =
+	    item.d_coreScratch + static_cast<size_t>(cols) * static_cast<size_t>(cols);
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int col = idx % cols;
+		item.d_muonStep[idx] /= fmaxf(d_scale[col], 1.0e-12f);
+	}
+}
+
+__global__ void muon_lite_apply_residual_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
+                                                      int count,
+                                                      float geomScale,
+                                                      int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMuonBatchItem item = items[batchIdx];
+	if (!item.d_W || !item.d_gW || !item.d_adamStep || !item.d_muonStep || !item.d_scalarScratch)
+		return;
+
+	const float signalScale = item.d_scalarScratch[5];
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float residual =
+		    item.lr * geomScale * (signalScale * item.d_muonStep[idx] - item.d_adamStep[idx]);
+		float w = item.d_W[idx] - residual;
+		if (!isfinite(w))
+			w = 0.0f;
+		item.d_W[idx] = w;
+		item.d_gW[idx] = 0.0f;
 	}
 }
 
@@ -4088,25 +5299,47 @@ static bool echo_gpu_init(GpuEchoWeightState& state,
 
 	state.rowSecond.free();
 	state.colSecond.free();
-	state.rowMetric.free();
-	state.colMetric.free();
+	state.rowInvMetric.free();
+	state.colInvMetric.free();
+	state.rowStructInvMetric.free();
+	state.colStructInvMetric.free();
+	state.prevMhat.free();
 	state.scalarScratch.free();
 
 	if (!state.rowSecond.allocate(m)) return false;
 	if (!state.colSecond.allocate(n)) return false;
-	if (!state.rowMetric.allocate(m)) return false;
-	if (!state.colMetric.allocate(n)) return false;
-	if (!state.scalarScratch.allocate(6u)) return false;
+	if (!state.rowInvMetric.allocate(m)) return false;
+	if (!state.colInvMetric.allocate(n)) return false;
+	if (!state.rowStructInvMetric.allocate(m)) return false;
+	if (!state.colStructInvMetric.allocate(n)) return false;
+	if (!state.prevMhat.allocate(static_cast<size_t>(m) * static_cast<size_t>(n))) return false;
+	if (!state.scalarScratch.allocate(ECHO_STAT_COUNT)) return false;
 
 	std::vector<float> hostRowSecond(static_cast<size_t>(m), 1.0f);
 	std::vector<float> hostColSecond(static_cast<size_t>(n), 1.0f);
-	std::vector<float> hostRowMetric(static_cast<size_t>(m), 1.0f);
-	std::vector<float> hostColMetric(static_cast<size_t>(n), 1.0f);
+	std::vector<float> hostRowInvMetric(static_cast<size_t>(m), 1.0f);
+	std::vector<float> hostColInvMetric(static_cast<size_t>(n), 1.0f);
+	std::vector<float> hostStats(ECHO_STAT_COUNT, 0.0f);
+	hostStats[ECHO_STAT_ROW_MEAN] = 1.0f;
+	hostStats[ECHO_STAT_COL_MEAN] = 1.0f;
+	hostStats[ECHO_STAT_ROW_MIN] = 1.0f;
+	hostStats[ECHO_STAT_ROW_MAX] = 1.0f;
+	hostStats[ECHO_STAT_COL_MIN] = 1.0f;
+	hostStats[ECHO_STAT_COL_MAX] = 1.0f;
+	hostStats[ECHO_STAT_PREV_ROW_ANISO] = 1.0f;
+	hostStats[ECHO_STAT_PREV_COL_ANISO] = 1.0f;
+	hostStats[ECHO_STAT_GEOM_TRUST] = 1.0f;
+	hostStats[ECHO_STAT_PRED_TRUST] = 0.0f;
+	hostStats[ECHO_STAT_STRUCT_TRUST] = 0.0f;
+	hostStats[ECHO_STAT_MATURITY] = 0.0f;
 	if (!state.rowSecond.upload(hostRowSecond.data(), hostRowSecond.size())) return false;
 	if (!state.colSecond.upload(hostColSecond.data(), hostColSecond.size())) return false;
-	if (!state.rowMetric.upload(hostRowMetric.data(), hostRowMetric.size())) return false;
-	if (!state.colMetric.upload(hostColMetric.data(), hostColMetric.size())) return false;
-	if (!state.scalarScratch.zero()) return false;
+	if (!state.rowInvMetric.upload(hostRowInvMetric.data(), hostRowInvMetric.size())) return false;
+	if (!state.colInvMetric.upload(hostColInvMetric.data(), hostColInvMetric.size())) return false;
+	if (!state.rowStructInvMetric.upload(hostRowInvMetric.data(), hostRowInvMetric.size())) return false;
+	if (!state.colStructInvMetric.upload(hostColInvMetric.data(), hostColInvMetric.size())) return false;
+	if (!state.prevMhat.zero()) return false;
+	if (!state.scalarScratch.upload(hostStats.data(), hostStats.size())) return false;
 
 	state.m = m;
 	state.n = n;
@@ -4114,6 +5347,11 @@ static bool echo_gpu_init(GpuEchoWeightState& state,
 	state.colMean = 1.0f;
 	state.lastRowAnisotropy = 1.0f;
 	state.lastColAnisotropy = 1.0f;
+	state.lastGeometryScale = 0.0f;
+	state.lastGeometryTrust = 1.0f;
+	state.lastPredictiveTrust = 0.0f;
+	state.lastStructuralTrust = 0.0f;
+	state.lastMaturity = 0.0f;
 	state.step = 0ULL;
 	state.initialized = true;
 	return true;
@@ -4121,13 +5359,23 @@ static bool echo_gpu_init(GpuEchoWeightState& state,
 
 static bool echo_gpu_refresh_host_stats(GpuEchoWeightState& state)
 {
-	float stats[6] = { 0.0f };
-	if (!state.scalarScratch.download(stats, 6u))
+	float stats[ECHO_STAT_COUNT] = { 0.0f };
+	if (!state.scalarScratch.download(stats, ECHO_STAT_COUNT))
 		return false;
-	state.rowMean = std::max(stats[0], 1.0e-12f);
-	state.colMean = std::max(stats[1], 1.0e-12f);
-	state.lastRowAnisotropy = (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : 1.0f;
-	state.lastColAnisotropy = (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : 1.0f;
+	state.rowMean = std::max(stats[ECHO_STAT_ROW_MEAN], 1.0e-12f);
+	state.colMean = std::max(stats[ECHO_STAT_COL_MEAN], 1.0e-12f);
+	state.lastRowAnisotropy =
+	    (stats[ECHO_STAT_ROW_MIN] > 1.0e-12f)
+	        ? (stats[ECHO_STAT_ROW_MAX] / stats[ECHO_STAT_ROW_MIN])
+	        : 1.0f;
+	state.lastColAnisotropy =
+	    (stats[ECHO_STAT_COL_MIN] > 1.0e-12f)
+	        ? (stats[ECHO_STAT_COL_MAX] / stats[ECHO_STAT_COL_MIN])
+	        : 1.0f;
+	state.lastGeometryTrust = stats[ECHO_STAT_GEOM_TRUST];
+	state.lastPredictiveTrust = stats[ECHO_STAT_PRED_TRUST];
+	state.lastStructuralTrust = stats[ECHO_STAT_STRUCT_TRUST];
+	state.lastMaturity = stats[ECHO_STAT_MATURITY];
 	return true;
 }
 
@@ -4674,6 +5922,8 @@ bool echo_gpu_observe(GpuEchoWeightState& state,
 		return false;
 	if (!echo_gpu_init(state, m, n))
 		return false;
+	if (!ac.echoShouldRefresh(state.step + 1ULL))
+		return true;
 
 	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
 	int block = static_cast<int>(std::min<unsigned int>(samples, 256u));
@@ -4692,6 +5942,85 @@ bool echo_gpu_observe(GpuEchoWeightState& state,
 	return true;
 }
 
+bool echo_gpu_ensure_state(GpuEchoWeightState& state,
+                           unsigned int m,
+                           unsigned int n)
+{
+	if (m == 0u || n == 0u)
+		return true;
+	return echo_gpu_init(state, m, n);
+}
+
+bool echo_gpu_observe_batch(GpuEchoObserveEntry* d_entries,
+                            int entryCapacity,
+                            const GpuEchoObserveEntry* h_entries,
+                            int entryCount,
+                            int totalFeatures,
+                            unsigned long long optimizerStep,
+                            const glades::ATLASConfig& ac)
+{
+	if (entryCount <= 0 || totalFeatures <= 0)
+		return true;
+	if (!d_entries || entryCapacity < entryCount)
+		return false;
+	if (!ac.echoShouldRefresh(optimizerStep))
+		return true;
+
+	int maxSamples = 0;
+	if (h_entries)
+	{
+		for (int i = 0; i < entryCount; ++i)
+			maxSamples = std::max(maxSamples, h_entries[i].samples);
+	}
+	else
+	{
+		maxSamples = 256;
+	}
+	if (maxSamples <= 0)
+		return true;
+
+	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+	int block = static_cast<int>(std::min<unsigned int>(static_cast<unsigned int>(maxSamples), 256u));
+	block = ((block + 31) / 32) * 32;
+	if (block < 32)
+		block = 32;
+	if (block > 256)
+		block = 256;
+	const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+
+	if (h_entries)
+	{
+		ATLAS_CUDA_CHECK(cudaMemcpyAsync(
+		    d_entries,
+		    h_entries,
+		    static_cast<size_t>(entryCount) * sizeof(GpuEchoObserveEntry),
+		    cudaMemcpyHostToDevice,
+		    computeStream()));
+	}
+	return echo_gpu_launch_observe_batch(
+	    d_entries, entryCount, totalFeatures, optimizerStep, ac);
+}
+
+bool echo_gpu_launch_observe_batch(const GpuEchoObserveEntry* d_entries,
+                                   int entryCount,
+                                   int totalFeatures,
+                                   unsigned long long optimizerStep,
+                                   const glades::ATLASConfig& ac)
+{
+	if (!d_entries || entryCount <= 0 || totalFeatures <= 0)
+		return true;
+	if (!ac.echoShouldRefresh(optimizerStep))
+		return true;
+
+	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+	const int block = 256;
+	const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+	echo_operand_second_batch_kernel<<<totalFeatures, block, smemBytes, computeStream()>>>(
+	    d_entries, entryCount, betaGeom);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool echo_gpu_prepare_metrics(GpuEchoWeightState& state,
                               unsigned int m,
                               unsigned int n,
@@ -4703,6 +6032,8 @@ bool echo_gpu_prepare_metrics(GpuEchoWeightState& state,
 		return true;
 	if (!echo_gpu_init(state, m, n))
 		return false;
+	if (!ac.echoShouldRefresh(optimizerStep))
+		return true;
 
 	const float geomScale = ac.echoEffectiveGeometryScale(optimizerStep);
 	int block = static_cast<int>(std::min<unsigned int>(std::max(m, n), 256u));
@@ -4713,13 +6044,52 @@ bool echo_gpu_prepare_metrics(GpuEchoWeightState& state,
 
 	echo_finalize_metrics_kernel<<<1, block, smemBytes, computeStream()>>>(
 	    state.rowSecond.data(), state.colSecond.data(),
-	    state.rowMetric.data(), state.colMetric.data(),
+	    state.rowInvMetric.data(), state.colInvMetric.data(),
+	    state.rowStructInvMetric.data(), state.colStructInvMetric.data(),
 	    static_cast<int>(m), static_cast<int>(n),
 	    eps, geomScale,
+	    std::max(0.0f, ac.echoTrustScale),
+	    std::max(0.0f, ac.echoPredictiveScale),
+	    std::max(0.0f, ac.echoStructuralScale),
+	    ac.echoStructuralGroups,
 	    state.scalarScratch.data());
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 
 	state.lastGeometryScale = geomScale;
+	return true;
+}
+
+bool echo_gpu_prepare_metrics_batch(float** d_rowSecond,
+                                    float** d_colSecond,
+                                    float** d_rowInvMetric,
+                                    float** d_colInvMetric,
+                                    float** d_rowStructInvMetric,
+                                    float** d_colStructInvMetric,
+                                    float** d_scalarScratch,
+                                    const int* d_rows,
+                                    const int* d_cols,
+                                    int groupCount,
+                                    unsigned long long optimizerStep,
+                                    float eps,
+                                    const glades::ATLASConfig& ac)
+{
+	if (groupCount <= 0)
+		return true;
+	if (!ac.echoShouldRefresh(optimizerStep))
+		return true;
+
+	const float geomScale = ac.echoEffectiveGeometryScale(optimizerStep);
+	echo_finalize_metrics_batch_kernel<<<groupCount, 256, 9 * static_cast<int>(sizeof(float)), computeStream()>>>(
+	    d_rowSecond, d_colSecond,
+	    d_rowInvMetric, d_colInvMetric,
+	    d_rowStructInvMetric, d_colStructInvMetric,
+	    d_scalarScratch,
+	    d_rows, d_cols, groupCount, eps, geomScale,
+	    std::max(0.0f, ac.echoTrustScale),
+	    std::max(0.0f, ac.echoPredictiveScale),
+	    std::max(0.0f, ac.echoStructuralScale),
+	    ac.echoStructuralGroups);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
 
@@ -4740,6 +6110,10 @@ bool echo_gpu_post_update(GpuEchoWeightState& state,
 			oss << " tag=" << tag;
 		oss << " step=" << state.step
 		    << " geom=" << state.lastGeometryScale
+		    << " geomTrust=" << state.lastGeometryTrust
+		    << " predTrust=" << state.lastPredictiveTrust
+		    << " structTrust=" << state.lastStructuralTrust
+		    << " maturity=" << state.lastMaturity
 		    << " rowAniso=" << state.lastRowAnisotropy
 		    << " colAniso=" << state.lastColAnisotropy;
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
@@ -4774,7 +6148,9 @@ bool echo_gpu_update(GpuEchoWeightState& state,
 	const float beta2 = powf(beta2Pow, 1.0f / stepF);
 	echo_adam_update_kernel<<<grid, kBlock, 0, computeStream()>>>(
 	    d_W, d_gW, d_m, d_v,
-	    state.rowMetric.data(), state.colMetric.data(),
+	    state.rowInvMetric.data(), state.colInvMetric.data(),
+	    state.rowStructInvMetric.data(), state.colStructInvMetric.data(),
+	    state.prevMhat.data(), state.scalarScratch.data(),
 	    static_cast<int>(m), static_cast<int>(n),
 	    lr, beta1, beta2,
 	    gradScale, static_cast<int>(optimizerStep), eps);
@@ -5341,48 +6717,21 @@ bool racer_gpu_update_lite(GpuRacerWeightState& state,
 	return true;
 }
 
-bool muon_gpu_update_lite(GpuMuonWeightState& state,
-                          float* d_W, float* d_gW,
-                          float* d_m, float* d_v,
-                          unsigned int m, unsigned int n,
-                          float lr,
-                          float inv1mB1t, float inv1mB2t,
-                          float eps,
-                          const glades::ATLASConfig& ac,
-                          shmea::GLogger* logger,
-                          const char* tag)
+static bool muon_gpu_prepare_lite_core(GpuMuonWeightState& state,
+                                       float* d_m, float* d_v,
+                                       unsigned int m, unsigned int n,
+                                       float inv1mB1t, float inv1mB2t,
+                                       float eps,
+                                       const glades::ATLASConfig& ac)
 {
-	if (!d_W || !d_gW || !d_m || !d_v || m == 0u || n == 0u)
-		return true;
-
-	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
 	const unsigned int shortDim = std::min(m, n);
-	const unsigned int longDim = std::max(m, n);
-	const float aspect =
-	    static_cast<float>(longDim) / static_cast<float>(std::max(1u, shortDim));
-	const float geomScale = std::max(0.0f, ac.muonGeometryScale);
 	const float predictiveScale =
 	    std::max(0.0f, std::min(1.0f, ac.muonPredictiveScale));
-	const unsigned int minDim = std::max(1u, ac.muonMinDim);
-	const bool eligible =
-	    (geomScale > 0.0f) && (shortDim >= minDim)
-	    && (aspect <= std::max(1.0f, ac.muonMaxAspect));
-
-	if (!eligible)
-	{
-		ATLAS_CUDA_CHECK(cudaMemsetAsync(d_gW, 0, mn * sizeof(float), computeStream()));
-		state.lastPredictiveTrust = 0.0f;
-		state.lastAspect = aspect;
-		state.lastSignalScale = 0.0f;
-		state.lastOrthError = 0.0f;
-		state.lastEligible = false;
-		state.step += 1ULL;
-		return true;
-	}
 
 	if (!muon_gpu_init_lite(state, m, n))
 		return false;
 
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
 	const int total = static_cast<int>(mn);
 	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
 	const int nWarps = (kBlock + 31) / 32;
@@ -5405,6 +6754,7 @@ bool muon_gpu_update_lite(GpuMuonWeightState& state,
 	    inv1mB1t, inv1mB2t, eps,
 	    state.scalarScratch.data(),
 	    state.adamStep.data(),
+	    state.muonStep.data(),
 	    total);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 
@@ -5437,62 +6787,22 @@ bool muon_gpu_update_lite(GpuMuonWeightState& state,
 			return false;
 	}
 
-	const int coreGrid = std::max(1, (static_cast<int>(coreDim) + kBlock - 1) / kBlock);
-	muon_trace_reduce_kernel<<<coreGrid, kBlock, nWarps * static_cast<int>(sizeof(float)), computeStream()>>>(
-	    state.coreScratch.data(),
-	    static_cast<int>(coreDim),
-	    state.scalarScratch.data());
-	ATLAS_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
 
-	muon_regularize_core_kernel<<<coreGrid, kBlock, 0, computeStream()>>>(
-	    state.coreScratch.data(),
-	    static_cast<int>(coreDim),
-	    state.scalarScratch.data(),
-	    ac.muonDamping,
-	    eps);
-	ATLAS_CUDA_CHECK(cudaGetLastError());
-
-	atlas_cholesky_inv_kernel<<<1, 1, 0, computeStream()>>>(
-	    state.coreScratch.data(), static_cast<int>(coreDim), false);
-	ATLAS_CUDA_CHECK(cudaGetLastError());
-
-	if (tall)
-	{
-		if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
-		                    1.0f,
-		                    state.adamStep.data(), static_cast<int>(n),
-		                    state.coreScratch.data(), static_cast<int>(n),
-		                    0.0f,
-		                    state.muonStep.data(), static_cast<int>(n)))
-			return false;
-	}
-	else
-	{
-		if (!sgemm_rowmajor_atb(static_cast<int>(m), static_cast<int>(n), static_cast<int>(m),
-		                        1.0f,
-		                        state.coreScratch.data(), static_cast<int>(m),
-		                        state.adamStep.data(), static_cast<int>(n),
-		                        0.0f,
-		                        state.muonStep.data(), static_cast<int>(n)))
-			return false;
-	}
-
-	muon_lite_apply_residual_kernel<<<grid, kBlock, 0, computeStream()>>>(
-	    d_W, d_gW,
-	    state.adamStep.data(),
-	    state.muonStep.data(),
-	    state.scalarScratch.data(),
-	    lr, geomScale,
-	    total);
-	ATLAS_CUDA_CHECK(cudaGetLastError());
-	if (!atlas_gpu_guard(d_W, mn))
-		return false;
-
+static bool muon_gpu_record_lite_step(GpuMuonWeightState& state,
+                                      float aspect,
+                                      const glades::ATLASConfig& ac,
+                                      shmea::GLogger* logger,
+                                      const char* tag)
+{
+	const float geomScale = std::max(0.0f, ac.muonGeometryScale);
+	const unsigned int minDim = std::max(1u, ac.muonMinDim);
 	state.lastPredictiveTrust = 0.0f;
 	state.lastAspect = aspect;
 	state.lastSignalScale = 0.0f;
 	state.lastOrthError = 0.0f;
-	state.lastEligible = eligible;
+	state.lastEligible = true;
 	state.step += 1ULL;
 
 	if (logger && ac.tSub > 0u
@@ -5520,6 +6830,435 @@ bool muon_gpu_update_lite(GpuMuonWeightState& state,
 	}
 
 	return true;
+}
+
+static bool muon_gpu_finalize_lite_step(GpuMuonWeightState& state,
+                                        float* d_W, float* d_gW,
+                                        unsigned int m, unsigned int n,
+                                        float lr,
+                                        float aspect,
+                                        const glades::ATLASConfig& ac,
+                                        shmea::GLogger* logger,
+                                        const char* tag)
+{
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const int total = static_cast<int>(mn);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	const float geomScale = std::max(0.0f, ac.muonGeometryScale);
+
+	muon_lite_apply_residual_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    d_W, d_gW,
+	    state.adamStep.data(),
+	    state.muonStep.data(),
+	    state.scalarScratch.data(),
+	    lr, geomScale,
+	    total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	if (!atlas_gpu_guard(d_W, mn))
+		return false;
+
+	return muon_gpu_record_lite_step(state, aspect, ac, logger, tag);
+}
+
+static bool muon_prepare_lite_small_batch_items(const GpuMuonBatchItem* items,
+                                                int count,
+                                                const glades::ATLASConfig& ac,
+                                                std::vector<GpuMuonBatchItem>& batchItems)
+{
+	if (!items || count <= 0)
+		return true;
+
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.muonPredictiveScale));
+	batchItems.resize(static_cast<size_t>(count));
+	for (int i = 0; i < count; ++i)
+	{
+		GpuMuonBatchItem item = items[i];
+		if (!item.state || !item.d_W || !item.d_gW || !item.d_m || !item.d_v)
+			return false;
+		if (!muon_gpu_init_lite(*item.state, item.m, item.n))
+			return false;
+		item.d_prevMhat = item.state->prevMhat.data();
+		item.d_adamStep = item.state->adamStep.data();
+		item.d_muonStep = item.state->muonStep.data();
+		item.d_coreScratch = item.state->coreScratch.data();
+		item.d_scalarScratch = item.state->scalarScratch.data();
+		item.predictiveEnabled =
+		    (predictiveScale > 0.0f && item.state->step > 0ULL) ? 1u : 0u;
+		batchItems[static_cast<size_t>(i)] = item;
+	}
+
+	return true;
+}
+
+static bool muon_gpu_launch_lite_small_batch_prepared(const GpuMuonBatchItem* items,
+                                                      const GpuMuonBatchItem* d_batchItems,
+                                                      int count,
+                                                      float** d_corePtrScratch,
+                                                      float** d_stepPtrScratch,
+                                                      int* d_infoScratch,
+                                                      int corePtrCapacity,
+                                                      float inv1mB1t, float inv1mB2t,
+                                                      float eps,
+                                                      const glades::ATLASConfig& ac,
+                                                      shmea::GLogger* logger)
+{
+	if (!items || count <= 0)
+		return true;
+	(void)d_infoScratch;
+	if (!d_batchItems || !d_corePtrScratch || !d_stepPtrScratch || !d_infoScratch
+	    || corePtrCapacity < count)
+		return false;
+
+	const unsigned int m = items[0].m;
+	const unsigned int n = items[0].n;
+	if (m == 0u || n == 0u || m < n || n > static_cast<unsigned int>(kAtlasSmallCholeskyMaxDim))
+		return false;
+
+	for (int i = 0; i < count; ++i)
+	{
+		const GpuMuonBatchItem& item = items[i];
+		if (item.m != m || item.n != n)
+			return false;
+	}
+
+	const unsigned int shortDim = n;
+	const unsigned int longDim = m;
+	const float aspect =
+	    static_cast<float>(longDim) / static_cast<float>(std::max(1u, shortDim));
+	const float geomScale = std::max(0.0f, ac.muonGeometryScale);
+	const unsigned int minDim = std::max(1u, ac.muonMinDim);
+	const bool eligible =
+	    (geomScale > 0.0f) && (shortDim >= minDim)
+	    && (aspect <= std::max(1.0f, ac.muonMaxAspect));
+	if (!eligible)
+		return false;
+
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.muonPredictiveScale));
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const int total = static_cast<int>(mn);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	const int nWarps = (kBlock + 31) / 32;
+
+	muon_reset_stats_batch_kernel<<<count, 32, 0, computeStream()>>>(
+	    d_batchItems, d_corePtrScratch, d_stepPtrScratch, count);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	dim3 batchGrid(static_cast<unsigned int>(grid),
+	               static_cast<unsigned int>(count),
+	               1u);
+	muon_corr_reduce_batch_kernel<<<batchGrid, kBlock,
+	                               3 * nWarps * static_cast<int>(sizeof(float)),
+	                               computeStream()>>>(
+	    d_batchItems, count, inv1mB1t, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	muon_finalize_trust_batch_kernel<<<count, 1, 0, computeStream()>>>(
+	    d_batchItems, count, predictiveScale);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	muon_prepare_signal_batch_kernel<<<batchGrid, kBlock,
+	                                  nWarps * static_cast<int>(sizeof(float)),
+	                                  computeStream()>>>(
+	    d_batchItems, count, inv1mB1t, inv1mB2t, eps, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	muon_finalize_scale_batch_kernel<<<count, 1, 0, computeStream()>>>(
+	    d_batchItems, count, shortDim);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	const float* d_beta = items[0].d_scalarScratch + 6;
+	const float* d_alpha = items[0].d_scalarScratch + 7;
+	if (kMuonFastOrthoIters <= 0)
+	{
+		if (!sgemm_batched_pointer_atb(static_cast<int>(n), static_cast<int>(n), static_cast<int>(m),
+		                               1.0f / static_cast<float>(std::max(1u, longDim)),
+		                               d_stepPtrScratch, static_cast<int>(n),
+		                               d_stepPtrScratch, static_cast<int>(n),
+		                               0.0f,
+		                               d_corePtrScratch, static_cast<int>(n),
+		                               count))
+			return false;
+		if (!atlas_cholesky_factor_small_batch_cusolver(d_corePtrScratch,
+		                                                d_infoScratch,
+		                                                count,
+		                                                static_cast<int>(shortDim),
+		                                                ac.muonDamping,
+		                                                eps))
+			return false;
+		muon_scale_step_batch_kernel<<<batchGrid, kBlock, 0, computeStream()>>>(
+		    d_batchItems, count, static_cast<int>(n), total);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		if (!strsm_rowmajor_right_upper_batched(static_cast<int>(m), static_cast<int>(n),
+		                                        1.0f,
+		                                        d_corePtrScratch, static_cast<int>(n),
+		                                        d_stepPtrScratch, static_cast<int>(n),
+		                                        count))
+			return false;
+	}
+	else
+	{
+		muon_normalize_step_batch_kernel<<<batchGrid, kBlock, 0, computeStream()>>>(
+		    d_batchItems, count, eps, total);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		const int coreTotal = static_cast<int>(n) * static_cast<int>(n);
+		const int coreGrid = std::max(1, (coreTotal + kBlock - 1) / kBlock);
+		dim3 coreBatchGrid(static_cast<unsigned int>(coreGrid),
+		                   static_cast<unsigned int>(count),
+		                   1u);
+		unsigned int useScratchInput = 0u;
+		for (int iter = 0; iter < kMuonFastOrthoIters; ++iter)
+		{
+			if (useScratchInput != 0u)
+			{
+				const int ptrGrid = std::max(1, (count + kBlock - 1) / kBlock);
+				muon_select_step_ptrs_batch_kernel<<<ptrGrid, kBlock, 0, computeStream()>>>(
+				    d_batchItems, d_stepPtrScratch, count, useScratchInput);
+				ATLAS_CUDA_CHECK(cudaGetLastError());
+			}
+			if (!sgemm_batched_pointer_atb_device_scalars(static_cast<int>(n), static_cast<int>(n), static_cast<int>(m),
+			                                              d_alpha,
+			                                              d_stepPtrScratch, static_cast<int>(n),
+			                                              d_stepPtrScratch, static_cast<int>(n),
+			                                              d_beta,
+			                                              d_corePtrScratch, static_cast<int>(n),
+			                                              count))
+				return false;
+			muon_cubic_core_batch_kernel<<<coreBatchGrid, kBlock, 0, computeStream()>>>(
+			    d_batchItems, count, static_cast<int>(n));
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+			muon_right_multiply_core_batch_kernel<<<batchGrid, kBlock, 0, computeStream()>>>(
+			    d_batchItems, count, static_cast<int>(n), total, useScratchInput);
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+			useScratchInput = 1u - useScratchInput;
+		}
+	}
+	muon_lite_apply_residual_batch_kernel<<<batchGrid, kBlock, 0, computeStream()>>>(
+	    d_batchItems, count, geomScale, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	for (int i = 0; i < count; ++i)
+	{
+		const GpuMuonBatchItem& item = items[static_cast<size_t>(i)];
+		if (!muon_gpu_record_lite_step(*item.state,
+		                               aspect,
+		                               ac,
+		                               logger,
+		                               item.tag))
+			return false;
+	}
+
+	return true;
+}
+
+bool muon_gpu_update_lite_small_batch(const GpuMuonBatchItem* items,
+                                      int count,
+                                      GpuMuonBatchItem* d_batchItems,
+                                      float** d_corePtrScratch,
+                                      float** d_stepPtrScratch,
+                                      int* d_infoScratch,
+                                      int corePtrCapacity,
+                                      float inv1mB1t, float inv1mB2t,
+                                      float eps,
+                                      const glades::ATLASConfig& ac,
+                                      shmea::GLogger* logger)
+{
+	if (!items || count <= 0)
+		return true;
+	if (!d_batchItems || !d_corePtrScratch || !d_stepPtrScratch || !d_infoScratch
+	    || corePtrCapacity < count)
+		return false;
+
+	std::vector<GpuMuonBatchItem> batchItems;
+	if (!muon_prepare_lite_small_batch_items(items, count, ac, batchItems))
+		return false;
+
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(d_batchItems,
+	                                 batchItems.data(),
+	                                 static_cast<size_t>(count) * sizeof(GpuMuonBatchItem),
+	                                 cudaMemcpyHostToDevice,
+	                                 computeStream()));
+	return muon_gpu_launch_lite_small_batch_prepared(batchItems.data(),
+	                                                 d_batchItems,
+	                                                 count,
+	                                                 d_corePtrScratch,
+	                                                 d_stepPtrScratch,
+	                                                 d_infoScratch,
+	                                                 corePtrCapacity,
+	                                                 inv1mB1t, inv1mB2t,
+	                                                 eps,
+	                                                 ac,
+	                                                 logger);
+}
+
+bool muon_gpu_update_lite_small_batches(const GpuMuonBatchItem* items,
+                                        int itemCount,
+                                        const int* groupOffsets,
+                                        const int* groupCounts,
+                                        int groupCount,
+                                        GpuMuonBatchItem* d_batchItems,
+                                        float** d_corePtrScratch,
+                                        float** d_stepPtrScratch,
+                                        int* d_infoScratch,
+                                        int corePtrCapacity,
+                                        float inv1mB1t, float inv1mB2t,
+                                        float eps,
+                                        const glades::ATLASConfig& ac,
+                                        shmea::GLogger* logger)
+{
+	if (!items || itemCount <= 0 || !groupOffsets || !groupCounts || groupCount <= 0)
+		return true;
+	if (!d_batchItems || !d_corePtrScratch || !d_stepPtrScratch || !d_infoScratch
+	    || corePtrCapacity < itemCount)
+		return false;
+
+	std::vector<GpuMuonBatchItem> batchItems;
+	if (!muon_prepare_lite_small_batch_items(items, itemCount, ac, batchItems))
+		return false;
+
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(d_batchItems,
+	                                 batchItems.data(),
+	                                 static_cast<size_t>(itemCount) * sizeof(GpuMuonBatchItem),
+	                                 cudaMemcpyHostToDevice,
+	                                 computeStream()));
+
+	for (int gi = 0; gi < groupCount; ++gi)
+	{
+		const int offset = groupOffsets[gi];
+		const int count = groupCounts[gi];
+		if (count <= 0)
+			continue;
+		if (offset < 0 || offset + count > itemCount)
+			return false;
+		if (!muon_gpu_launch_lite_small_batch_prepared(
+		        batchItems.data() + offset,
+		        d_batchItems + offset,
+		        count,
+		        d_corePtrScratch,
+		        d_stepPtrScratch,
+		        d_infoScratch,
+		        corePtrCapacity,
+		        inv1mB1t, inv1mB2t,
+		        eps,
+		        ac,
+		        logger))
+			return false;
+	}
+
+	return true;
+}
+
+bool muon_gpu_update_lite(GpuMuonWeightState& state,
+                          float* d_W, float* d_gW,
+                          float* d_m, float* d_v,
+                          unsigned int m, unsigned int n,
+                          float lr,
+                          float inv1mB1t, float inv1mB2t,
+                          float eps,
+                          const glades::ATLASConfig& ac,
+                          shmea::GLogger* logger,
+                          const char* tag)
+{
+	if (!d_W || !d_gW || !d_m || !d_v || m == 0u || n == 0u)
+		return true;
+
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const unsigned int shortDim = std::min(m, n);
+	const unsigned int longDim = std::max(m, n);
+	const float aspect =
+	    static_cast<float>(longDim) / static_cast<float>(std::max(1u, shortDim));
+	const float geomScale = std::max(0.0f, ac.muonGeometryScale);
+	const unsigned int minDim = std::max(1u, ac.muonMinDim);
+	const bool eligible =
+	    (geomScale > 0.0f) && (shortDim >= minDim)
+	    && (aspect <= std::max(1.0f, ac.muonMaxAspect));
+
+	if (!eligible)
+	{
+		ATLAS_CUDA_CHECK(cudaMemsetAsync(d_gW, 0, mn * sizeof(float), computeStream()));
+		state.lastPredictiveTrust = 0.0f;
+		state.lastAspect = aspect;
+		state.lastSignalScale = 0.0f;
+		state.lastOrthError = 0.0f;
+		state.lastEligible = false;
+		state.step += 1ULL;
+		return true;
+	}
+
+	if (!muon_gpu_prepare_lite_core(state,
+	                                d_m, d_v,
+	                                m, n,
+	                                inv1mB1t, inv1mB2t,
+	                                eps, ac))
+		return false;
+
+	const bool tall = (m >= n);
+	const unsigned int coreDim = tall ? n : m;
+	const bool useSmallTallSolve =
+	    tall && (coreDim <= static_cast<unsigned int>(kAtlasSmallCholeskyMaxDim));
+	if (useSmallTallSolve)
+	{
+		if (!atlas_cholesky_factor_small(state.coreScratch.data(),
+		                                 static_cast<int>(coreDim),
+		                                 ac.muonDamping,
+		                                 eps,
+		                                 false))
+			return false;
+		if (!strsm_rowmajor_right_upper(static_cast<int>(m), static_cast<int>(n),
+		                                1.0f,
+		                                state.coreScratch.data(), static_cast<int>(coreDim),
+		                                state.muonStep.data(), static_cast<int>(n)))
+			return false;
+	}
+	else
+	{
+		const int nWarps = (kBlock + 31) / 32;
+		const int coreGrid = std::max(1, (static_cast<int>(coreDim) + kBlock - 1) / kBlock);
+		muon_trace_reduce_kernel<<<coreGrid, kBlock, nWarps * static_cast<int>(sizeof(float)), computeStream()>>>(
+		    state.coreScratch.data(),
+		    static_cast<int>(coreDim),
+		    state.scalarScratch.data());
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		muon_regularize_core_kernel<<<coreGrid, kBlock, 0, computeStream()>>>(
+		    state.coreScratch.data(),
+		    static_cast<int>(coreDim),
+		    state.scalarScratch.data(),
+		    ac.muonDamping,
+		    eps);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		atlas_cholesky_inv_kernel<<<1, 1, 0, computeStream()>>>(
+		    state.coreScratch.data(), static_cast<int>(coreDim), false);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		if (tall)
+		{
+			if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
+			                    1.0f,
+			                    state.adamStep.data(), static_cast<int>(n),
+			                    state.coreScratch.data(), static_cast<int>(n),
+			                    0.0f,
+			                    state.muonStep.data(), static_cast<int>(n)))
+				return false;
+		}
+		else
+		{
+			if (!sgemm_rowmajor_atb(static_cast<int>(m), static_cast<int>(n), static_cast<int>(m),
+			                        1.0f,
+			                        state.coreScratch.data(), static_cast<int>(m),
+			                        state.adamStep.data(), static_cast<int>(n),
+			                        0.0f,
+			                        state.muonStep.data(), static_cast<int>(n)))
+				return false;
+		}
+	}
+
+	return muon_gpu_finalize_lite_step(state,
+	                                   d_W, d_gW,
+	                                   m, n,
+	                                   lr,
+	                                   aspect,
+	                                   ac,
+	                                   logger,
+	                                   tag);
 }
 
 AtlasGpuDiag atlas_gpu_get_diag(const GpuAtlasWeightState& state)

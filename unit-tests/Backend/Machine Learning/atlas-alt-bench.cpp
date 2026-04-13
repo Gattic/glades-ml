@@ -789,6 +789,11 @@ struct BenchConfig
 	float atlasEchoGeometryScale;
 	float atlasEchoGeometryScaleFinal;
 	unsigned int atlasEchoGeometryDecaySteps;
+	unsigned int atlasEchoMetricCadence;
+	float atlasEchoTrustScale;
+	float atlasEchoPredictiveScale;
+	float atlasEchoStructuralScale;
+	unsigned int atlasEchoStructuralGroups;
 	unsigned int atlasEchoScope;
 	unsigned int atlasBiMAPLowRank;
 	unsigned int atlasBiMAPScope;
@@ -864,6 +869,11 @@ struct BenchConfig
 	      atlasEchoGeometryScale(1.0f),
 	      atlasEchoGeometryScaleFinal(1.0f),
 	      atlasEchoGeometryDecaySteps(0u),
+	      atlasEchoMetricCadence(1u),
+	      atlasEchoTrustScale(0.0f),
+	      atlasEchoPredictiveScale(0.0f),
+	      atlasEchoStructuralScale(0.0f),
+	      atlasEchoStructuralGroups(1u),
 	      atlasEchoScope(glades::ATLASConfig::ECHO_SCOPE_ALL),
 	      atlasBiMAPLowRank(1u),
 	      atlasBiMAPScope(glades::ATLASConfig::BIMAP_SCOPE_ALL),
@@ -1922,6 +1932,11 @@ static void print_usage()
 	printf("  --atlas-echo-geometry-scale X         Operand-harvested two-sided diagonal strength for ECHO (default: 1.0)\n");
 	printf("  --atlas-echo-final-geometry-scale X   Final ECHO geometry strength after schedule decay (default: 1.0)\n");
 	printf("  --atlas-echo-decay-steps N            Optimizer steps for linear ECHO geometry decay (default: 0 = off)\n");
+	printf("  --atlas-echo-cadence N                Optimizer steps between ECHO metric refreshes (default: 1)\n");
+	printf("  --atlas-echo-trust-scale X            Scalar trust gate for ECHO geometry, 0 disables gating (default: 0.0)\n");
+	printf("  --atlas-echo-predictive-scale X       Bounded one-step predictive blend for ECHO momentum (default: 0.0)\n");
+	printf("  --atlas-echo-structural-scale X       Strength of grouped structural factors inside ECHO (default: 0.0)\n");
+	printf("  --atlas-echo-structural-groups N      Number of contiguous row/col groups for ECHO structure (default: 1)\n");
 	printf("  --atlas-echo-scope all|large-only|late-head|late-head-large  Restrict ECHO to all matrices, large matrices only, last block + head, or that subset filtered to large matrices (default: all)\n");
 	printf("  --atlas-bimap-low-rank 0|1            Enable BiMAP-v2 low-rank row/column factors (default: 1)\n");
 	printf("  --atlas-bimap-scope all|head|late|late-head  Restrict BiMAP to all matrices, head only, late block only, or late block + head (default: all)\n");
@@ -2591,6 +2606,46 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			if (!parse_uint_arg(argv[++i], cfg.atlasEchoGeometryDecaySteps))
 			{
 				err = "invalid --atlas-echo-decay-steps";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasEchoMetricCadence))
+			{
+				err = "invalid --atlas-echo-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-trust-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasEchoTrustScale) || cfg.atlasEchoTrustScale < 0.0f)
+			{
+				err = "invalid --atlas-echo-trust-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasEchoPredictiveScale) || cfg.atlasEchoPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-echo-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-structural-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasEchoStructuralScale) || cfg.atlasEchoStructuralScale < 0.0f)
+			{
+				err = "invalid --atlas-echo-structural-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-echo-structural-groups") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasEchoStructuralGroups) || cfg.atlasEchoStructuralGroups == 0u)
+			{
+				err = "invalid --atlas-echo-structural-groups";
 				return false;
 			}
 		}
@@ -4652,6 +4707,11 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.echoGeometryScale = cfg.atlasEchoGeometryScale;
 		tc.atlas.echoGeometryScaleFinal = cfg.atlasEchoGeometryScaleFinal;
 		tc.atlas.echoGeometryDecaySteps = cfg.atlasEchoGeometryDecaySteps;
+		tc.atlas.echoMetricCadence = cfg.atlasEchoMetricCadence;
+		tc.atlas.echoTrustScale = cfg.atlasEchoTrustScale;
+		tc.atlas.echoPredictiveScale = cfg.atlasEchoPredictiveScale;
+		tc.atlas.echoStructuralScale = cfg.atlasEchoStructuralScale;
+		tc.atlas.echoStructuralGroups = cfg.atlasEchoStructuralGroups;
 		tc.atlas.echoScope = cfg.atlasEchoScope;
 	}
 	else if (variant == VARIANT_ATLAS_BIMAP)
@@ -6125,7 +6185,7 @@ static bool run_token_case(const BenchConfig& cfg)
 	const float racerTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_RACER);
 	const float kronTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_KRON);
 	const float muonTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MUON);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f)\n",
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s cadence=%u groups=%u) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f)\n",
 	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
 	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
 	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
@@ -6134,11 +6194,11 @@ static bool run_token_case(const BenchConfig& cfg)
 	       rampartTokenLR, cfg.atlasComplementRank, meritTokenLR, cfg.atlasComplementRank,
 	       strataTokenLR, cfg.atlasComplementRank, auroraTokenLR, cfg.atlasComplementRank,
 	       seamTokenLR, cfg.atlasComplementRank, quasarTokenLR, cfg.atlasComplementRank,
-	       geodeTokenLR, cfg.atlasComplementRank, echoTokenLR, echo_scope_label(cfg.atlasEchoScope), bimapTokenLR, bimap_scope_label(cfg.atlasBiMAPScope), cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence,
+	       geodeTokenLR, cfg.atlasComplementRank, echoTokenLR, echo_scope_label(cfg.atlasEchoScope), cfg.atlasEchoMetricCadence, cfg.atlasEchoStructuralGroups, bimapTokenLR, bimap_scope_label(cfg.atlasBiMAPScope), cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence,
 	       pactTokenLR, cfg.atlasPACTLowRank, cfg.atlasPACTFactorCadence,
 	       racerTokenLR, cfg.atlasRACERFactorCadence,
 	       kronTokenLR, cfg.atlasKronFactorCadence, muonTokenLR, cfg.atlasMuonMinDim, cfg.atlasMuonMaxAspect);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f)\n",
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u cadence=%u trust=%.3f pred=%.3f struct=%.3f groups=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
@@ -6153,7 +6213,7 @@ static bool run_token_case(const BenchConfig& cfg)
 	       cfg.atlasAuroraAdamwBackbone,
 	       cfg.atlasAuroraHeadGain, cfg.atlasAuroraBodyTrustScale,
 	       cfg.atlasGeodeGeometryScale, cfg.atlasGeodePredictiveScale,
-	       echo_scope_label(cfg.atlasEchoScope), cfg.atlasEchoGeometryScale, cfg.atlasEchoGeometryScaleFinal, cfg.atlasEchoGeometryDecaySteps,
+	       echo_scope_label(cfg.atlasEchoScope), cfg.atlasEchoGeometryScale, cfg.atlasEchoGeometryScaleFinal, cfg.atlasEchoGeometryDecaySteps, cfg.atlasEchoMetricCadence, cfg.atlasEchoTrustScale, cfg.atlasEchoPredictiveScale, cfg.atlasEchoStructuralScale, cfg.atlasEchoStructuralGroups,
 	       bimap_scope_label(cfg.atlasBiMAPScope), cfg.atlasBiMAPLowRank, cfg.atlasBiMAPGeometryScale, cfg.atlasBiMAPPredictiveScale, cfg.atlasBiMAPFactorCadence,
 	       cfg.atlasPACTLowRank, cfg.atlasPACTGeometryScale, cfg.atlasPACTPredictiveScale, cfg.atlasPACTFactorCadence,
 	       cfg.atlasPACTCostScale, cfg.atlasPACTPromoteThreshold, cfg.atlasPACTDemoteThreshold,

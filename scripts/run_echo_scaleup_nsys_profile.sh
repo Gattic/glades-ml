@@ -4,13 +4,26 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT_DIR/unit-tests/build/glades-unit-tests"
 NSYS_BIN="$(command -v nsys)"
-NSYS_HOST_DIR="$(cd "$(dirname "$NSYS_BIN")/../lib/nsight-systems/host-linux-x64" 2>/dev/null && pwd || true)"
-QDSTRM_IMPORTER="${QDSTRM_IMPORTER:-${NSYS_HOST_DIR}/QdstrmImporter}"
+NSYS_REAL_BIN="$(readlink -f "$NSYS_BIN" 2>/dev/null || printf '%s' "$NSYS_BIN")"
+NSYS_BIN_DIR="$(dirname "$NSYS_REAL_BIN")"
+NSYS_HOST_DIR_CANDIDATES=(
+  "/usr/lib/nsight-systems/host-linux-x64"
+  "$NSYS_BIN_DIR/../host-linux-x64"
+  "$NSYS_BIN_DIR/../../host-linux-x64"
+  "$(cd "$NSYS_BIN_DIR/../host-linux-x64" 2>/dev/null && pwd || true)"
+  "$(cd "$NSYS_BIN_DIR/../../host-linux-x64" 2>/dev/null && pwd || true)"
+)
+QDSTRM_IMPORTER="${QDSTRM_IMPORTER:-}"
 
 GPU_DEVICE=0
 SKIP_BUILD=0
 EPOCHS=1
 BENCHMARKS=("token-lm-document" "token-lm-corpus-large")
+ECHO_CADENCE=1
+ECHO_TRUST_SCALE=0.0
+ECHO_PREDICTIVE_SCALE=0.0
+ECHO_STRUCTURAL_SCALE=0.0
+ECHO_STRUCTURAL_GROUPS=1
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR_DEFAULT="$ROOT_DIR/artifacts/echo_scaleup_nsys_${TIMESTAMP}"
 OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
@@ -46,11 +59,34 @@ Options:
   --gpu-device N              CUDA device id to request (default: 0)
   --benchmark NAME            Benchmark to profile; may be passed multiple times
   --epochs N                  Token epochs per run (default: 1)
+  --echo-cadence N            Optimizer steps between ECHO metric refreshes (default: 1)
+  --echo-trust-scale X        ECHO trust-gate strength (default: 0.0)
+  --echo-predictive-scale X   ECHO bounded predictive blend strength (default: 0.0)
+  --echo-structural-scale X   ECHO grouped structural factor strength (default: 0.0)
+  --echo-structural-groups N  ECHO contiguous row/col group count (default: 1)
   --out-dir PATH              Output directory
   --skip-build                Skip build + ECHO verification steps
   --qdstrm-importer PATH      Explicit QdstrmImporter path
   --help                      Show this message
 EOF
+}
+
+resolve_qdstrm_importer() {
+  if [[ -n "$QDSTRM_IMPORTER" && -x "$QDSTRM_IMPORTER" ]]; then
+    return 0
+  fi
+  if command -v QdstrmImporter >/dev/null 2>&1; then
+    QDSTRM_IMPORTER="$(command -v QdstrmImporter)"
+    return 0
+  fi
+  local candidate
+  for candidate in "${NSYS_HOST_DIR_CANDIDATES[@]}"; do
+    if [[ -n "$candidate" && -x "$candidate/QdstrmImporter" ]]; then
+      QDSTRM_IMPORTER="$candidate/QdstrmImporter"
+      return 0
+    fi
+  done
+  return 1
 }
 
 BENCHMARKS=()
@@ -67,6 +103,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --epochs)
       EPOCHS="$2"
+      shift 2
+      ;;
+    --echo-cadence|--atlas-echo-cadence)
+      ECHO_CADENCE="$2"
+      shift 2
+      ;;
+    --echo-trust-scale|--atlas-echo-trust-scale)
+      ECHO_TRUST_SCALE="$2"
+      shift 2
+      ;;
+    --echo-predictive-scale|--atlas-echo-predictive-scale)
+      ECHO_PREDICTIVE_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-scale|--atlas-echo-structural-scale)
+      ECHO_STRUCTURAL_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-groups|--atlas-echo-structural-groups)
+      ECHO_STRUCTURAL_GROUPS="$2"
       shift 2
       ;;
     --out-dir)
@@ -98,7 +154,21 @@ if [[ ${#BENCHMARKS[@]} -eq 0 ]]; then
 fi
 
 mkdir -p "$OUT_DIR/raw" "$OUT_DIR/stats"
+echo "Writing Nsight artifacts to: $OUT_DIR"
+
+if ! resolve_qdstrm_importer; then
+  echo "Unable to locate QdstrmImporter. Set --qdstrm-importer PATH or QDSTRM_IMPORTER." >&2
+  exit 1
+fi
+ECHO_COMMON_ARGS=(
+  --atlas-echo-cadence "$ECHO_CADENCE"
+  --atlas-echo-trust-scale "$ECHO_TRUST_SCALE"
+  --atlas-echo-predictive-scale "$ECHO_PREDICTIVE_SCALE"
+  --atlas-echo-structural-scale "$ECHO_STRUCTURAL_SCALE"
+  --atlas-echo-structural-groups "$ECHO_STRUCTURAL_GROUPS"
+)
 RUN_LOG="$OUT_DIR/run.log"
+printf 'Using QdstrmImporter: %s\n' "$QDSTRM_IMPORTER" >> "$RUN_LOG"
 
 log_cmd() {
   printf '$' >> "$RUN_LOG"
@@ -157,19 +227,38 @@ run_nsys_profile() {
   shift
   local rep_base="$OUT_DIR/${tag}"
   local rep_file="${rep_base}.nsys-rep"
+  local sqlite_file="${rep_base}.sqlite"
   local qdstrm_file="${rep_base}.qdstrm"
   local stats_base="$OUT_DIR/stats/${tag}"
+  local stats_input=""
+  local profile_rc=0
 
   echo "[profile] $tag" | tee -a "$RUN_LOG" >&2
-  log_cmd nsys profile --force-overwrite=true -o "$rep_base" --sample=none --cpuctxsw=none --trace=cuda,nvtx,osrt "$@"
+  log_cmd nsys profile --force-overwrite=true --export=sqlite -o "$rep_base" --sample=none --cpuctxsw=none --trace=cuda,nvtx,osrt "$@"
+  set +e
   nsys profile \
     --force-overwrite=true \
+    --export=sqlite \
     -o "$rep_base" \
     --sample=none \
     --cpuctxsw=none \
     --trace=cuda,nvtx,osrt \
     "$@" \
     >"$OUT_DIR/raw/${tag}.stdout.log" 2>"$OUT_DIR/raw/${tag}.stderr.log"
+  profile_rc=$?
+  set -e
+
+  if [[ "$profile_rc" -ne 0 && ! -f "$rep_file" && ! -f "$qdstrm_file" ]]; then
+    echo "nsys profile failed for $tag (rc=$profile_rc)" | tee -a "$RUN_LOG" >&2
+    return "$profile_rc"
+  fi
+  if [[ "$profile_rc" -ne 0 && -f "$qdstrm_file" ]]; then
+    echo "nsys profile returned rc=$profile_rc for $tag; recovering via manual QDSTRM import" | tee -a "$RUN_LOG" >&2
+  fi
+
+  if [[ -f "$sqlite_file" ]]; then
+    stats_input="$sqlite_file"
+  fi
 
   if [[ ! -f "$rep_file" && -f "$qdstrm_file" ]]; then
     if [[ -x "$QDSTRM_IMPORTER" ]]; then
@@ -182,18 +271,26 @@ run_nsys_profile() {
     fi
   fi
 
-  if [[ ! -f "$rep_file" ]]; then
-    echo "nsys profile did not produce a report for $tag" | tee -a "$RUN_LOG" >&2
+  if [[ -z "$stats_input" && -f "$sqlite_file" ]]; then
+    stats_input="$sqlite_file"
+  fi
+
+  if [[ -z "$stats_input" && -f "$rep_file" ]]; then
+    stats_input="$rep_file"
+  fi
+
+  if [[ -z "$stats_input" ]]; then
+    echo "nsys profile did not produce a usable sqlite/report for $tag" | tee -a "$RUN_LOG" >&2
     return 1
   fi
 
-  log_cmd nsys stats --force-overwrite true --report cudaapisum,gpukernsum,gpumemtimesum,osrtsum --format csv --output "$stats_base" "$rep_file"
+  log_cmd nsys stats --force-overwrite true --report cudaapisum,gpukernsum,gpumemtimesum,osrtsum --format csv --output "$stats_base" "$stats_input"
   nsys stats \
     --force-overwrite true \
     --report cudaapisum,gpukernsum,gpumemtimesum,osrtsum \
     --format csv \
     --output "$stats_base" \
-    "$rep_file" \
+    "$stats_input" \
     >"$OUT_DIR/raw/${tag}.stats.stdout.log" 2>"$OUT_DIR/raw/${tag}.stats.stderr.log"
 }
 
@@ -226,6 +323,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
     "${SHAPE_ARGS[@]}" \
     --variant echo \
     --atlas-echo-geometry-scale 1.0 \
+    "${ECHO_COMMON_ARGS[@]}" \
     --atlas-echo-scope late-head \
     --gpu-enable 1 \
     --gpu-device "$GPU_DEVICE"
@@ -238,6 +336,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
     "${SHAPE_ARGS[@]}" \
     --variant echo \
     --atlas-echo-geometry-scale 1.0 \
+    "${ECHO_COMMON_ARGS[@]}" \
     --atlas-echo-scope large-only \
     --gpu-enable 1 \
     --gpu-device "$GPU_DEVICE"

@@ -14,6 +14,11 @@ SCALES_CSV="0.25,0.5,0.75,1.0"
 BENCHMARKS_CSV="token-lm-document,token-lm-corpus-large"
 EPOCHS_CSV="1,2,3,4"
 ECHO_SCOPE=all
+ECHO_CADENCE=1
+ECHO_TRUST_SCALE=0.0
+ECHO_PREDICTIVE_SCALE=0.0
+ECHO_STRUCTURAL_SCALE=0.0
+ECHO_STRUCTURAL_GROUPS=1
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR_DEFAULT="$ROOT_DIR/artifacts/echo_geometry_sweep_${TIMESTAMP}"
 OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
@@ -35,7 +40,15 @@ Options:
   --scales CSV          Comma-separated ECHO geometry scales
   --benchmarks CSV      Comma-separated benchmark list
   --epochs CSV          Comma-separated epoch list
+  --echo-cadence N      Optimizer steps between ECHO metric refreshes (default: 1)
   --echo-scope NAME     ECHO scope: all|large-only|late-head|late-head-large (default: all)
+  --echo-trust-scale X  ECHO trust-gate strength (default: 0.0)
+  --echo-predictive-scale X
+                        ECHO bounded predictive blend strength (default: 0.0)
+  --echo-structural-scale X
+                        ECHO grouped structural factor strength (default: 0.0)
+  --echo-structural-groups N
+                        ECHO contiguous row/col group count (default: 1)
   --out-dir PATH        Output directory (default: $OUT_DIR_DEFAULT)
   --skip-build          Skip build + unit test verification steps
   --acceptance          Also run the 10-repeat acceptance pass
@@ -65,8 +78,28 @@ while [[ $# -gt 0 ]]; do
       EPOCHS_CSV="$2"
       shift 2
       ;;
-    --echo-scope)
+    --echo-cadence|--atlas-echo-cadence)
+      ECHO_CADENCE="$2"
+      shift 2
+      ;;
+    --echo-scope|--atlas-echo-scope)
       ECHO_SCOPE="$2"
+      shift 2
+      ;;
+    --echo-trust-scale|--atlas-echo-trust-scale)
+      ECHO_TRUST_SCALE="$2"
+      shift 2
+      ;;
+    --echo-predictive-scale|--atlas-echo-predictive-scale)
+      ECHO_PREDICTIVE_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-scale|--atlas-echo-structural-scale)
+      ECHO_STRUCTURAL_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-groups|--atlas-echo-structural-groups)
+      ECHO_STRUCTURAL_GROUPS="$2"
       shift 2
       ;;
     --out-dir)
@@ -98,6 +131,15 @@ IFS=',' read -r -a BENCHMARKS <<< "$BENCHMARKS_CSV"
 IFS=',' read -r -a EPOCHS <<< "$EPOCHS_CSV"
 
 mkdir -p "$OUT_DIR/raw"
+
+ECHO_COMMON_ARGS=(
+  --atlas-echo-cadence "$ECHO_CADENCE"
+  --atlas-echo-scope "$ECHO_SCOPE"
+  --atlas-echo-trust-scale "$ECHO_TRUST_SCALE"
+  --atlas-echo-predictive-scale "$ECHO_PREDICTIVE_SCALE"
+  --atlas-echo-structural-scale "$ECHO_STRUCTURAL_SCALE"
+  --atlas-echo-structural-groups "$ECHO_STRUCTURAL_GROUPS"
+)
 
 SUMMARY_TSV="$OUT_DIR/epoch_sweep_summary.tsv"
 ACCEPT_TSV="$OUT_DIR/acceptance_summary.tsv"
@@ -220,7 +262,7 @@ run_capture 06_smoke_echo_gpu \
   --repeats 1 \
   --variant echo \
   --atlas-echo-geometry-scale "${SCALES[0]}" \
-  --atlas-echo-scope "$ECHO_SCOPE" \
+  "${ECHO_COMMON_ARGS[@]}" \
   --gpu-enable 1 \
   --gpu-device "$GPU_DEVICE"
 
@@ -236,7 +278,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
         "$benchmark" "$epochs" "echo" "$scale" \
         --variant echo \
         --atlas-echo-geometry-scale "$scale" \
-        --atlas-echo-scope "$ECHO_SCOPE"
+        "${ECHO_COMMON_ARGS[@]}"
     done
   done
 done
@@ -253,7 +295,7 @@ if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
         "$benchmark" "echo" "$scale" \
         --variant echo \
         --atlas-echo-geometry-scale "$scale" \
-        --atlas-echo-scope "$ECHO_SCOPE"
+        "${ECHO_COMMON_ARGS[@]}"
     done
   done
 fi

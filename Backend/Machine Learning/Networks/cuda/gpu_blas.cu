@@ -13,6 +13,7 @@ namespace gpu {
 namespace {
 static cublasHandle_t g_handle = 0;
 static bool g_initialized = false;
+static float* g_deviceOne = 0;
 } // namespace
 
 bool blasInit()
@@ -32,6 +33,25 @@ bool blasInit()
 	{
 		cublasSetMathMode(g_handle, CUBLAS_TF32_TENSOR_OP_MATH);
 	}
+	float hostOne = 1.0f;
+	cudaError_t e = cudaMalloc(&g_deviceOne, sizeof(float));
+	if (e != cudaSuccess)
+	{
+		fprintf(stderr, "[glades-cuda] cudaMalloc for BLAS scalar failed: %d\n", static_cast<int>(e));
+		cublasDestroy(g_handle);
+		g_handle = 0;
+		return false;
+	}
+	e = cudaMemcpy(g_deviceOne, &hostOne, sizeof(float), cudaMemcpyHostToDevice);
+	if (e != cudaSuccess)
+	{
+		fprintf(stderr, "[glades-cuda] cudaMemcpy for BLAS scalar failed: %d\n", static_cast<int>(e));
+		cudaFree(g_deviceOne);
+		g_deviceOne = 0;
+		cublasDestroy(g_handle);
+		g_handle = 0;
+		return false;
+	}
 
 	g_initialized = true;
 	return true;
@@ -41,6 +61,11 @@ void blasDestroy()
 {
 	if (g_initialized && g_handle)
 	{
+		if (g_deviceOne)
+		{
+			cudaFree(g_deviceOne);
+			g_deviceOne = 0;
+		}
 		cublasDestroy(g_handle);
 		g_handle = 0;
 		g_initialized = false;
@@ -229,6 +254,67 @@ bool strsm_rowmajor_right_upper(int M, int N,
 	return true;
 }
 
+bool strsm_rowmajor_right_upper_batched(int M, int N,
+                                        float alpha,
+                                        float** Rarray, int ldr,
+                                        float** Barray, int ldb,
+                                        int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	if (!Rarray || !Barray || batchCount <= 0)
+		return true;
+
+	const bool useDeviceAlpha = (alpha == 1.0f && g_deviceOne != 0);
+	cublasPointerMode_t oldPointerMode = CUBLAS_POINTER_MODE_HOST;
+	if (useDeviceAlpha)
+	{
+		cublasStatus_t pst = cublasGetPointerMode(g_handle, &oldPointerMode);
+		if (pst != CUBLAS_STATUS_SUCCESS)
+		{
+			fprintf(stderr, "[glades-cuda] cublasGetPointerMode failed: %d\n",
+			        static_cast<int>(pst));
+			return false;
+		}
+		pst = cublasSetPointerMode(g_handle, CUBLAS_POINTER_MODE_DEVICE);
+		if (pst != CUBLAS_STATUS_SUCCESS)
+		{
+			fprintf(stderr, "[glades-cuda] cublasSetPointerMode(device) failed: %d\n",
+			        static_cast<int>(pst));
+			return false;
+		}
+	}
+
+	const float* alphaPtr = useDeviceAlpha ? g_deviceOne : &alpha;
+	cublasStatus_t st = cublasStrsmBatched(g_handle,
+	                                       CUBLAS_SIDE_LEFT,
+	                                       CUBLAS_FILL_MODE_LOWER,
+	                                       CUBLAS_OP_N,
+	                                       CUBLAS_DIAG_NON_UNIT,
+	                                       N, M,
+	                                       alphaPtr,
+	                                       reinterpret_cast<const float* const*>(Rarray), ldr,
+	                                       reinterpret_cast<float* const*>(Barray), ldb,
+	                                       batchCount);
+	if (useDeviceAlpha)
+	{
+		cublasStatus_t rst = cublasSetPointerMode(g_handle, oldPointerMode);
+		if (rst != CUBLAS_STATUS_SUCCESS)
+		{
+			fprintf(stderr, "[glades-cuda] cublasSetPointerMode(host) failed: %d\n",
+			        static_cast<int>(rst));
+			return false;
+		}
+	}
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasStrsmBatched failed: %d (M=%d N=%d batch=%d)\n",
+		        static_cast<int>(st), M, N, batchCount);
+		return false;
+	}
+	return true;
+}
+
 bool sgemm_batched_strided(int M, int N, int K,
                             float alpha,
                             const float* A, int lda, long long int strideA,
@@ -314,6 +400,177 @@ bool sgemm_batched_strided_atb(int M, int N, int K,
 	{
 		fprintf(stderr, "[glades-cuda] cublasSgemmStridedBatched(ATB) failed: %d\n",
 		        static_cast<int>(st));
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_batched_pointer_atb(int M, int N, int K,
+                               float alpha,
+                               float** Aarray, int lda,
+                               float** Barray, int ldb,
+                               float beta,
+                               float** Carray, int ldc,
+                               int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	if (!Aarray || !Barray || !Carray || batchCount <= 0)
+		return true;
+
+	cublasStatus_t st = cublasSgemmBatched(g_handle,
+	                                       CUBLAS_OP_N, CUBLAS_OP_T,
+	                                       N, M, K,
+	                                       &alpha,
+	                                       reinterpret_cast<const float* const*>(Barray), ldb,
+	                                       reinterpret_cast<const float* const*>(Aarray), lda,
+	                                       &beta,
+	                                       Carray, ldc,
+	                                       batchCount);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmBatched(ATB) failed: %d (M=%d N=%d K=%d batch=%d)\n",
+		        static_cast<int>(st), M, N, K, batchCount);
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_batched_pointer(int M, int N, int K,
+                           float alpha,
+                           float** Aarray, int lda,
+                           float** Barray, int ldb,
+                           float beta,
+                           float** Carray, int ldc,
+                           int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	if (!Aarray || !Barray || !Carray || batchCount <= 0)
+		return true;
+
+	cublasStatus_t st = cublasSgemmBatched(g_handle,
+	                                       CUBLAS_OP_N, CUBLAS_OP_N,
+	                                       N, M, K,
+	                                       &alpha,
+	                                       reinterpret_cast<const float* const*>(Barray), ldb,
+	                                       reinterpret_cast<const float* const*>(Aarray), lda,
+	                                       &beta,
+	                                       Carray, ldc,
+	                                       batchCount);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmBatched failed: %d (M=%d N=%d K=%d batch=%d)\n",
+		        static_cast<int>(st), M, N, K, batchCount);
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_batched_pointer_device_scalars(int M, int N, int K,
+                                          const float* d_alpha,
+                                          float** Aarray, int lda,
+                                          float** Barray, int ldb,
+                                          const float* d_beta,
+                                          float** Carray, int ldc,
+                                          int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	if (!d_alpha || !d_beta || !Aarray || !Barray || !Carray || batchCount <= 0)
+		return true;
+
+	cublasPointerMode_t oldPointerMode = CUBLAS_POINTER_MODE_HOST;
+	cublasStatus_t pst = cublasGetPointerMode(g_handle, &oldPointerMode);
+	if (pst != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasGetPointerMode failed: %d\n",
+		        static_cast<int>(pst));
+		return false;
+	}
+	pst = cublasSetPointerMode(g_handle, CUBLAS_POINTER_MODE_DEVICE);
+	if (pst != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSetPointerMode(device) failed: %d\n",
+		        static_cast<int>(pst));
+		return false;
+	}
+
+	cublasStatus_t st = cublasSgemmBatched(g_handle,
+	                                       CUBLAS_OP_N, CUBLAS_OP_N,
+	                                       N, M, K,
+	                                       d_alpha,
+	                                       reinterpret_cast<const float* const*>(Barray), ldb,
+	                                       reinterpret_cast<const float* const*>(Aarray), lda,
+	                                       d_beta,
+	                                       Carray, ldc,
+	                                       batchCount);
+	cublasStatus_t rst = cublasSetPointerMode(g_handle, oldPointerMode);
+	if (rst != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSetPointerMode(host) failed: %d\n",
+		        static_cast<int>(rst));
+		return false;
+	}
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmBatched failed: %d (M=%d N=%d K=%d batch=%d)\n",
+		        static_cast<int>(st), M, N, K, batchCount);
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_batched_pointer_atb_device_scalars(int M, int N, int K,
+                                              const float* d_alpha,
+                                              float** Aarray, int lda,
+                                              float** Barray, int ldb,
+                                              const float* d_beta,
+                                              float** Carray, int ldc,
+                                              int batchCount)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	if (!d_alpha || !d_beta || !Aarray || !Barray || !Carray || batchCount <= 0)
+		return true;
+
+	cublasPointerMode_t oldPointerMode = CUBLAS_POINTER_MODE_HOST;
+	cublasStatus_t pst = cublasGetPointerMode(g_handle, &oldPointerMode);
+	if (pst != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasGetPointerMode failed: %d\n",
+		        static_cast<int>(pst));
+		return false;
+	}
+	pst = cublasSetPointerMode(g_handle, CUBLAS_POINTER_MODE_DEVICE);
+	if (pst != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSetPointerMode(device) failed: %d\n",
+		        static_cast<int>(pst));
+		return false;
+	}
+
+	cublasStatus_t st = cublasSgemmBatched(g_handle,
+	                                       CUBLAS_OP_N, CUBLAS_OP_T,
+	                                       N, M, K,
+	                                       d_alpha,
+	                                       reinterpret_cast<const float* const*>(Barray), ldb,
+	                                       reinterpret_cast<const float* const*>(Aarray), lda,
+	                                       d_beta,
+	                                       Carray, ldc,
+	                                       batchCount);
+
+	cublasStatus_t rst = cublasSetPointerMode(g_handle, oldPointerMode);
+	if (rst != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSetPointerMode(host) failed: %d\n",
+		        static_cast<int>(rst));
+		return false;
+	}
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasSgemmBatched(ATB,device) failed: %d (M=%d N=%d K=%d batch=%d)\n",
+		        static_cast<int>(st), M, N, K, batchCount);
 		return false;
 	}
 	return true;

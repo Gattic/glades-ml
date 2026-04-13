@@ -2498,8 +2498,20 @@ void initEchoWeightState(EchoWeightState& state, unsigned int m, unsigned int n)
 	state.n = n;
 	state.rowSecond.assign(static_cast<size_t>(m), 1.0f);
 	state.colSecond.assign(static_cast<size_t>(n), 1.0f);
+	state.rowInvMetric.assign(static_cast<size_t>(m), 1.0f);
+	state.colInvMetric.assign(static_cast<size_t>(n), 1.0f);
+	state.rowStructInvMetric.assign(static_cast<size_t>(m), 1.0f);
+	state.colStructInvMetric.assign(static_cast<size_t>(n), 1.0f);
+	state.prevMhat.assign(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
 	state.lastRowAnisotropy = 1.0f;
 	state.lastColAnisotropy = 1.0f;
+	state.lastGeometryScale = 0.0f;
+	state.lastGeometryTrust = 1.0f;
+	state.lastPredictiveTrust = 0.0f;
+	state.lastStructuralTrust = 0.0f;
+	state.lastMaturity = 0.0f;
+	state.prevRowAnisotropy = 1.0f;
+	state.prevColAnisotropy = 1.0f;
 	state.step = 0ULL;
 	state.initialized = true;
 }
@@ -8614,6 +8626,109 @@ static void bimap_apply_right_inverse(std::vector<float>& matrix,
 	}
 }
 
+static inline float echo_clamp(float x, float lo, float hi)
+{
+	return (x < lo) ? lo : ((x > hi) ? hi : x);
+}
+
+static inline unsigned int echo_effective_structural_groups(unsigned int groups,
+                                                            unsigned int dim)
+{
+	if (dim == 0u)
+		return 1u;
+	const unsigned int desired = std::max(1u, groups);
+	return std::min<unsigned int>(std::min<unsigned int>(desired, dim), 32u);
+}
+
+static inline unsigned int echo_group_index(unsigned int idx,
+                                            unsigned int dim,
+                                            unsigned int groups)
+{
+	if (dim == 0u || groups <= 1u)
+		return 0u;
+	const unsigned long long numer =
+	    static_cast<unsigned long long>(idx) * static_cast<unsigned long long>(groups);
+	unsigned int group = static_cast<unsigned int>(numer / static_cast<unsigned long long>(dim));
+	if (group >= groups)
+		group = groups - 1u;
+	return group;
+}
+
+static inline float echo_anisotropy_signal(float anisotropy)
+{
+	const float clamped = std::max(1.0f, anisotropy);
+	return (clamped - 1.0f) / (clamped + 1.0f);
+}
+
+static inline float echo_persistence_score(float current, float previous)
+{
+	const float cur = std::max(1.0f, current);
+	const float prev = std::max(1.0f, previous);
+	const float hi = std::max(cur, prev);
+	if (hi <= 1.0e-12f)
+		return 1.0f;
+	return std::min(cur, prev) / hi;
+}
+
+static inline float echo_compute_geometry_trust(float rowAniso,
+                                                float colAniso,
+                                                float prevRowAniso,
+                                                float prevColAniso,
+                                                const ATLASConfig& ac)
+{
+	if (ac.echoTrustScale <= 0.0f)
+		return 1.0f;
+	const float rowScore =
+	    echo_anisotropy_signal(rowAniso) * echo_persistence_score(rowAniso, prevRowAniso);
+	const float colScore =
+	    echo_anisotropy_signal(colAniso) * echo_persistence_score(colAniso, prevColAniso);
+	return echo_clamp(ac.echoTrustScale * 0.5f * (rowScore + colScore), 0.0f, 1.0f);
+}
+
+static inline float echo_compute_group_signal(const std::vector<float>& groupMean)
+{
+	if (groupMean.size() <= 1u)
+		return 0.0f;
+	float groupMin = FLT_MAX;
+	float groupMax = 0.0f;
+	for (size_t i = 0u; i < groupMean.size(); ++i)
+	{
+		const float v = std::max(groupMean[i], 1.0e-12f);
+		groupMin = std::min(groupMin, v);
+		groupMax = std::max(groupMax, v);
+	}
+	const float anisotropy = (groupMin > 1.0e-12f) ? (groupMax / groupMin) : 1.0f;
+	return echo_anisotropy_signal(anisotropy);
+}
+
+static inline void echo_compute_simplex_weights(float auxBudget,
+                                                float predictiveScale,
+                                                float structuralScale,
+                                                float maturity,
+                                                float& baseWeight,
+                                                float& predictiveWeight,
+                                                float& structuralWeight)
+{
+	const float mu = echo_clamp(maturity, 0.0f, 1.0f);
+	// As the geometry matures we want the blend to collapse back toward the
+	// plain ECHO anchor, not to keep carrying auxiliary predictive/structural
+	// mass late into training.
+	const float lateContraction = 1.0f - mu;
+	const float predRaw =
+	    (predictiveScale > 0.0f)
+	        ? (std::max(0.0f, predictiveScale) * (1.0f - mu) * (1.0f - mu))
+	        : 0.0f;
+	const float structRaw =
+	    (structuralScale > 0.0f)
+	        ? (std::max(0.0f, structuralScale) * (4.0f * mu * (1.0f - mu)))
+	        : 0.0f;
+	const float trustedAux = echo_clamp(auxBudget, 0.0f, 1.0f) * lateContraction;
+	const float denom = 1.0f + trustedAux * (predRaw + structRaw);
+	baseWeight = 1.0f / std::max(denom, 1.0e-12f);
+	predictiveWeight = baseWeight * trustedAux * predRaw;
+	structuralWeight = baseWeight * trustedAux * structRaw;
+}
+
 bool echoObserve(EchoWeightState& state,
                  const float* rowObs,
                  const float* colObs,
@@ -8628,12 +8743,12 @@ bool echoObserve(EchoWeightState& state,
 		initEchoWeightState(state, m, n);
 	if (!state.initialized || state.m != m || state.n != n)
 		return false;
+	if (!ac.echoShouldRefresh(state.step + 1ULL))
+		return true;
 
 	const float betaGeom = std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
 	const double invSamples = 1.0 / static_cast<double>(samples);
 
-	double rowMean = 0.0;
-	double colMean = 0.0;
 	float rowMin = FLT_MAX;
 	float rowMax = 0.0f;
 	float colMin = FLT_MAX;
@@ -8652,7 +8767,6 @@ bool echoObserve(EchoWeightState& state,
 		    betaGeom * state.rowSecond[static_cast<size_t>(i)]
 		    + (1.0f - betaGeom) * sample;
 		const float cur = std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f);
-		rowMean += static_cast<double>(cur);
 		rowMin = std::min(rowMin, cur);
 		rowMax = std::max(rowMax, cur);
 	}
@@ -8669,15 +8783,12 @@ bool echoObserve(EchoWeightState& state,
 		    betaGeom * state.colSecond[static_cast<size_t>(j)]
 		    + (1.0f - betaGeom) * sample;
 		const float cur = std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f);
-		colMean += static_cast<double>(cur);
 		colMin = std::min(colMin, cur);
 		colMax = std::max(colMax, cur);
 	}
 
 	state.lastRowAnisotropy = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
 	state.lastColAnisotropy = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
-	(void)rowMean;
-	(void)colMean;
 	return true;
 }
 
@@ -8705,39 +8816,171 @@ bool echoUpdate(EchoWeightState& state,
 	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
 	const float oneMinusB1 = 1.0f - beta1;
 	const float oneMinusB2 = 1.0f - beta2;
-	const float geomScale = ac.echoEffectiveGeometryScale(optimizerStep);
+	if (ac.echoShouldRefresh(optimizerStep))
+	{
+		const float geomScale = ac.echoEffectiveGeometryScale(optimizerStep);
+		double rowMean = 0.0;
+		double colMean = 0.0;
+		float rowMin = FLT_MAX;
+		float rowMax = 0.0f;
+		float colMin = FLT_MAX;
+		float colMax = 0.0f;
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			const float v = std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f);
+			rowMean += static_cast<double>(v);
+			rowMin = std::min(rowMin, v);
+			rowMax = std::max(rowMax, v);
+		}
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const float v = std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f);
+			colMean += static_cast<double>(v);
+			colMin = std::min(colMin, v);
+			colMax = std::max(colMax, v);
+		}
+		const float rowMeanF =
+		    static_cast<float>(std::max(rowMean / static_cast<double>(std::max(1u, m)), 1.0e-12));
+		const float colMeanF =
+		    static_cast<float>(std::max(colMean / static_cast<double>(std::max(1u, n)), 1.0e-12));
+		const float rowAniso = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
+		const float colAniso = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
+		const float auxiliaryTrust =
+		    echo_compute_geometry_trust(rowAniso, colAniso,
+		                                state.prevRowAnisotropy,
+		                                state.prevColAnisotropy,
+		                                ac);
+		const float effectiveGeomScale = std::max(0.0f, geomScale);
+		const float effectiveStructuralScale = std::max(0.0f, ac.echoStructuralScale);
+		const unsigned int rowGroups =
+		    echo_effective_structural_groups(ac.echoStructuralGroups, m);
+		const unsigned int colGroups =
+		    echo_effective_structural_groups(ac.echoStructuralGroups, n);
+		std::vector<float> rowGroupMean(static_cast<size_t>(rowGroups), rowMeanF);
+		std::vector<float> colGroupMean(static_cast<size_t>(colGroups), colMeanF);
+		if (effectiveStructuralScale > 0.0f)
+		{
+			std::vector<double> rowGroupSum(static_cast<size_t>(rowGroups), 0.0);
+			std::vector<double> colGroupSum(static_cast<size_t>(colGroups), 0.0);
+			std::vector<unsigned int> rowGroupCount(static_cast<size_t>(rowGroups), 0u);
+			std::vector<unsigned int> colGroupCount(static_cast<size_t>(colGroups), 0u);
+			for (unsigned int i = 0u; i < m; ++i)
+			{
+				const unsigned int g =
+				    echo_group_index(i, m, rowGroups);
+				rowGroupSum[static_cast<size_t>(g)] +=
+				    static_cast<double>(std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f));
+				rowGroupCount[static_cast<size_t>(g)] += 1u;
+			}
+			for (unsigned int j = 0u; j < n; ++j)
+			{
+				const unsigned int g =
+				    echo_group_index(j, n, colGroups);
+				colGroupSum[static_cast<size_t>(g)] +=
+				    static_cast<double>(std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f));
+				colGroupCount[static_cast<size_t>(g)] += 1u;
+			}
+			for (unsigned int g = 0u; g < rowGroups; ++g)
+			{
+				const unsigned int count = std::max(1u, rowGroupCount[static_cast<size_t>(g)]);
+				rowGroupMean[static_cast<size_t>(g)] =
+				    static_cast<float>(std::max(rowGroupSum[static_cast<size_t>(g)]
+				                                / static_cast<double>(count), 1.0e-12));
+			}
+			for (unsigned int g = 0u; g < colGroups; ++g)
+			{
+				const unsigned int count = std::max(1u, colGroupCount[static_cast<size_t>(g)]);
+				colGroupMean[static_cast<size_t>(g)] =
+				    static_cast<float>(std::max(colGroupSum[static_cast<size_t>(g)]
+				                                / static_cast<double>(count), 1.0e-12));
+			}
+		}
 
-	double rowMean = 0.0;
-	double colMean = 0.0;
-	float rowMin = FLT_MAX;
-	float rowMax = 0.0f;
-	float colMin = FLT_MAX;
-	float colMax = 0.0f;
+		const float groupSignal =
+		    0.5f * (echo_compute_group_signal(rowGroupMean)
+		          + echo_compute_group_signal(colGroupMean));
+		const float anisoSignal =
+		    0.5f * (echo_anisotropy_signal(rowAniso) + echo_anisotropy_signal(colAniso));
+		const float maturityTarget =
+		    echo_clamp(0.5f * anisoSignal + 0.5f * groupSignal, 0.0f, 1.0f);
+		const float maturityRate = 0.2f;
+		const float prevMaturity = echo_clamp(state.lastMaturity, 0.0f, 1.0f);
+		state.lastMaturity =
+		    (state.step == 0ULL)
+		        ? (maturityRate * maturityTarget)
+		        : ((1.0f - maturityRate) * prevMaturity + maturityRate * maturityTarget);
+
+		float baseWeight = 1.0f;
+		float predictiveWeight = 0.0f;
+		float structuralWeight = 0.0f;
+		echo_compute_simplex_weights(auxiliaryTrust,
+		                             std::max(0.0f, ac.echoPredictiveScale),
+		                             (rowGroups > 1u || colGroups > 1u) ? effectiveStructuralScale : 0.0f,
+		                             state.lastMaturity,
+		                             baseWeight,
+		                             predictiveWeight,
+		                             structuralWeight);
+
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			const float rowScaleRaw =
+			    std::sqrt((std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f) + eps) / (rowMeanF + eps));
+			float rowMetric =
+			    echo_clamp(1.0f + effectiveGeomScale * (rowScaleRaw - 1.0f), 0.25f, 4.0f);
+			float rowStructMetric = rowMetric;
+			if (effectiveStructuralScale > 0.0f && rowGroups > 1u)
+			{
+				const unsigned int group =
+				    echo_group_index(i, m, rowGroups);
+				const float groupScaleRaw =
+				    std::sqrt((rowGroupMean[static_cast<size_t>(group)] + eps) / (rowMeanF + eps));
+				const float structMetric =
+				    echo_clamp(1.0f + effectiveStructuralScale * (groupScaleRaw - 1.0f), 0.25f, 4.0f);
+				rowStructMetric = echo_clamp(rowMetric * structMetric, 0.25f, 4.0f);
+			}
+			state.rowInvMetric[static_cast<size_t>(i)] = 1.0f / std::max(rowMetric, eps);
+			state.rowStructInvMetric[static_cast<size_t>(i)] =
+			    1.0f / std::max(rowStructMetric, eps);
+		}
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const float colScaleRaw =
+			    std::sqrt((std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f) + eps) / (colMeanF + eps));
+			float colMetric =
+			    echo_clamp(1.0f + effectiveGeomScale * (colScaleRaw - 1.0f), 0.25f, 4.0f);
+			float colStructMetric = colMetric;
+			if (effectiveStructuralScale > 0.0f && colGroups > 1u)
+			{
+				const unsigned int group =
+				    echo_group_index(j, n, colGroups);
+				const float groupScaleRaw =
+				    std::sqrt((colGroupMean[static_cast<size_t>(group)] + eps) / (colMeanF + eps));
+				const float structMetric =
+				    echo_clamp(1.0f + effectiveStructuralScale * (groupScaleRaw - 1.0f), 0.25f, 4.0f);
+				colStructMetric = echo_clamp(colMetric * structMetric, 0.25f, 4.0f);
+			}
+			state.colInvMetric[static_cast<size_t>(j)] = 1.0f / std::max(colMetric, eps);
+			state.colStructInvMetric[static_cast<size_t>(j)] =
+			    1.0f / std::max(colStructMetric, eps);
+		}
+		state.lastRowAnisotropy = rowAniso;
+		state.lastColAnisotropy = colAniso;
+		state.lastGeometryScale = geomScale;
+		state.lastGeometryTrust = auxiliaryTrust;
+		state.lastPredictiveTrust = predictiveWeight;
+		state.lastStructuralTrust = structuralWeight;
+		state.prevRowAnisotropy = rowAniso;
+		state.prevColAnisotropy = colAniso;
+	}
+
+	const float baseWeight = echo_clamp(1.0f - state.lastPredictiveTrust - state.lastStructuralTrust,
+	                                    0.0f, 1.0f);
+	const float predictiveWeight = state.lastPredictiveTrust;
+	const float structuralWeight = state.lastStructuralTrust;
 	for (unsigned int i = 0u; i < m; ++i)
 	{
-		const float v = std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f);
-		rowMean += static_cast<double>(v);
-		rowMin = std::min(rowMin, v);
-		rowMax = std::max(rowMax, v);
-	}
-	for (unsigned int j = 0u; j < n; ++j)
-	{
-		const float v = std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f);
-		colMean += static_cast<double>(v);
-		colMin = std::min(colMin, v);
-		colMax = std::max(colMax, v);
-	}
-	const float rowMeanF =
-	    static_cast<float>(std::max(rowMean / static_cast<double>(std::max(1u, m)), 1.0e-12));
-	const float colMeanF =
-	    static_cast<float>(std::max(colMean / static_cast<double>(std::max(1u, n)), 1.0e-12));
-
-	for (unsigned int i = 0u; i < m; ++i)
-	{
-		const float rowScaleRaw =
-		    std::sqrt((std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f) + eps) / (rowMeanF + eps));
-		const float rowMetric =
-		    std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (rowScaleRaw - 1.0f)));
+		const float rowInvMetric = state.rowInvMetric[static_cast<size_t>(i)];
+		const float rowStructInvMetric = state.rowStructInvMetric[static_cast<size_t>(i)];
 		for (unsigned int j = 0u; j < n; ++j)
 		{
 			const size_t idx = static_cast<size_t>(i) * n + j;
@@ -8748,15 +8991,34 @@ bool echoUpdate(EchoWeightState& state,
 			m1[idx] = beta1 * m1[idx] + oneMinusB1 * g;
 			v2[idx] = beta2 * v2[idx] + oneMinusB2 * (g * g);
 
-			const float colScaleRaw =
-			    std::sqrt((std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f) + eps) / (colMeanF + eps));
-			const float colMetric =
-			    std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (colScaleRaw - 1.0f)));
 			const float currentMhat = m1[idx] * inv1mB1t;
+			float predictiveMhat = currentMhat;
+			if (predictiveWeight > 0.0f && state.step > 0ULL)
+			{
+				float delta = currentMhat - state.prevMhat[idx];
+				const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+				if (delta > deltaCap)
+					delta = deltaCap;
+				else if (delta < -deltaCap)
+					delta = -deltaCap;
+				predictiveMhat += delta;
+			}
 			const float vhat = v2[idx] * inv1mB2t;
 			const float diagDen =
 			    static_cast<float>(std::sqrt(static_cast<double>(std::max(vhat, 0.0f)))) + eps;
-			const float echoStep = currentMhat / (diagDen * rowMetric * colMetric);
+			const float colInvMetric = state.colInvMetric[static_cast<size_t>(j)];
+			const float colStructInvMetric = state.colStructInvMetric[static_cast<size_t>(j)];
+			const float baseStep =
+			    (currentMhat / diagDen) * rowInvMetric * colInvMetric;
+			const float predictiveStep =
+			    (predictiveMhat / diagDen) * rowInvMetric * colInvMetric;
+			const float structuralStep =
+			    (currentMhat / diagDen) * rowStructInvMetric * colStructInvMetric;
+			const float echoStep =
+			    baseWeight * baseStep
+			    + predictiveWeight * predictiveStep
+			    + structuralWeight * structuralStep;
+			state.prevMhat[idx] = currentMhat;
 
 			if (wd2 != 0.0f)
 				W[idx] -= lr * wd2 * W[idx];
@@ -8767,9 +9029,6 @@ bool echoUpdate(EchoWeightState& state,
 		}
 	}
 
-	state.lastRowAnisotropy = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
-	state.lastColAnisotropy = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
-	state.lastGeometryScale = geomScale;
 	state.step += 1ULL;
 
 	if (logger && ac.tSub > 0u
@@ -8781,6 +9040,10 @@ bool echoUpdate(EchoWeightState& state,
 			append_kv(oss, "tag", tag);
 		append_kv(oss, "step", state.step);
 		append_kv(oss, "geom", state.lastGeometryScale);
+		append_kv(oss, "geomTrust", state.lastGeometryTrust);
+		append_kv(oss, "predTrust", state.lastPredictiveTrust);
+		append_kv(oss, "structTrust", state.lastStructuralTrust);
+		append_kv(oss, "maturity", state.lastMaturity);
 		append_kv(oss, "rowAniso", state.lastRowAnisotropy);
 		append_kv(oss, "colAniso", state.lastColAnisotropy);
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));

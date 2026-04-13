@@ -6964,6 +6964,61 @@ Interpretation:
 - `ECHO 1.0 large-only` is useful only as a document-quality control, not as
   the mainline optimizer candidate
 
+### Hybrid borrowing experiments: mathematically interesting, but not a better default
+
+I then tried to import the cheap parts of `GEODE` and `BiMAP` into ECHO without
+reintroducing the heavy matrix machinery:
+
+- trust-gated geometry
+- bounded predictive blending
+- grouped structural factors
+- then a continuous non-selector simplex blend around plain ECHO
+
+Artifacts:
+
+- bundled hybrid gate:
+  - `artifacts/echo_gpu_gate_20260412-131706/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-131706/acceptance_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-131954/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-131954/acceptance_summary.tsv`
+- ablation gate:
+  - `artifacts/echo_ablation_gate_20260412-133100/epoch_sweep_summary.tsv`
+  - `artifacts/echo_ablation_gate_20260412-133100/acceptance_summary.tsv`
+- continuous simplex blend:
+  - `artifacts/echo_gpu_gate_20260412-140958/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-140958/acceptance_summary.tsv`
+- late-contracted simplex blend:
+  - `artifacts/echo_gpu_gate_20260412-141611/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-141611/acceptance_summary.tsv`
+- 20-repeat confidence rerun:
+  - `artifacts/echo_gpu_gate_20260412-142826/epoch_sweep_summary.tsv`
+  - `artifacts/echo_gpu_gate_20260412-142826/acceptance_summary.tsv`
+
+Read:
+
+- the bundled `trust + predictive + structural` branch was real but not broad:
+  - it sometimes helped `token-lm-document`
+  - it consistently hurt or destabilized `token-lm-corpus-large`
+- the ablation result was clear:
+  - plain `echo_base` beat `echo_trust`
+  - plain `echo_base` beat `echo_trust_pred`
+  - plain `echo_base` beat `echo_trust_struct` as the default branch
+- the continuous simplex blend was mathematically cleaner than the naive bundle,
+  and the late-contraction variant repaired some of the late-run damage on the
+  5-repeat gate
+- but the 20-repeat confidence pass falsified the promotion case:
+  - `token-lm-document`: `AdamW 4.87030 @ 0.10s`, contracted blend
+    `ECHO 4.86820 @ 0.10s`
+  - `token-lm-corpus-large`: `AdamW 6.29929 @ 0.18s`, contracted blend
+    `ECHO 6.31763 @ 0.19s`
+
+Interpretation:
+
+- the borrowed `GEODE` / `BiMAP` terms are scientifically useful diagnostics
+- they did **not** beat plain `ECHO 1.0 late-head` as a checked-in default
+- the live ECHO branch therefore returned to plain `late-head` with
+  `trust=0`, `pred=0`, `struct=0`
+
 ### Nsight result: the ECHO systems problem was mostly solved
 
 Artifacts:
@@ -6972,6 +7027,9 @@ Artifacts:
 - `artifacts/echo_nsys_20260412-083501`
 - `artifacts/echo_nsys_20260412-091044`
 - `artifacts/echo_nsys_20260412-104701`
+- `artifacts/echo_nsys_20260412-145837`
+- `artifacts/echo_nsys_20260412-163804`
+- `artifacts/echo_nsys_20260412-165635`
 
 The progressive CUDA rewrites materially changed the cost model:
 
@@ -6995,6 +7053,31 @@ remaining overhead on the small benchmark was already close to AdamW:
 
 So by that point the remaining difference was no longer “bad implementation.”
 It was the actual optimizer tradeoff.
+
+Two later systems passes tightened the hot path further:
+
+- lazy allocation of ECHO-only GPU buffers so plain `AdamW` no longer touched
+  unused ECHO metadata during the benchmark-path allocation chain
+- static per-group base LR / WD metadata on device, with only a scalar
+  `lrScale` applied in the fused Adam kernel
+
+The latest valid Nsight comparison (`artifacts/echo_nsys_20260412-165635`
+vs `artifacts/echo_nsys_20260412-163804`) showed that this last runtime cut
+removed the remaining per-step LR/WD transfer overhead without changing the
+launch envelope:
+
+- `token-lm-document`, `ECHO fixed`
+  - `cudaMemcpyAsync`: `400 -> 306`
+  - `cudaStreamSynchronize`: `722 -> 674`
+  - `cudaLaunchKernel`: unchanged at `10080`
+- `token-lm-corpus-large`, `ECHO fixed`
+  - `cudaMemcpyAsync`: `528 -> 402`
+  - `cudaStreamSynchronize`: `928 -> 864`
+  - `cudaLaunchKernel`: unchanged at `17792`
+
+So the remaining runtime question is no longer copy/sync churn. The next real
+systems levers, if ECHO continues, are launch compression (`CUDA Graphs`) or
+deeper kernel fusion.
 
 ### Scale-up study: ECHO only becomes interesting when the model is larger
 
@@ -7098,6 +7181,38 @@ Updated ranking:
 - `ECHO 1.0 large-only` is only a document-quality probe
 - `AdamW` remains the transformer default
 
+Latest gate:
+
+- `artifacts/echo_gpu_gate_20260412-171040/epoch_sweep_summary.tsv`
+- `artifacts/echo_gpu_gate_20260412-171040/acceptance_summary.tsv`
+
+Current read:
+
+- the live branch is plain `ECHO late-head`
+  - `geom=1.0`
+  - `cadence=1`
+  - `trust=0`
+  - `pred=0`
+  - `struct=0`
+- acceptance:
+  - `token-lm-document`: `AdamW 4.87532 @ 0.10s`, `ECHO 4.87433 @ 0.10s`
+  - `token-lm-corpus-large`: `AdamW 6.29052 @ 0.18s`, `ECHO 6.27868 @ 0.19s`
+- full sweep:
+  - `token-lm-document`: ECHO is ahead at all four epoch points and materially
+    ahead late (`e4: 4.57435 @ 0.20s` vs `AdamW 4.66519 @ 0.20s`)
+  - `token-lm-corpus-large`: ECHO is only good early (`e1`), while `AdamW`
+    remains better from `e2` onward
+
+Interpretation:
+
+- ECHO remains the strongest post-AdamW branch in the repo
+- it is now close enough to AdamW that the remaining difference is the real
+  optimizer tradeoff, not obvious implementation waste
+- it still does **not** justify replacing `AdamW` as the repo-wide default,
+  because `token-lm-corpus-large` remains inconsistent
+- on document-style transformer tasks, ECHO is a real quality branch worth
+  keeping as a research control
+
 Final recommendation:
 
 - stop optimizer-replacement work as a practical repo goal
@@ -7105,8 +7220,193 @@ Final recommendation:
 - if ECHO continues at all, run it as a separate retuned larger-model research
   program rather than as “one more tweak” on the checked-in small gates
 - for practical training work in this repo, use tuned `AdamW` as the default
+
+## April 13, 2026: MUON-lite CUDA optimization campaign materially changed the practical MUON verdict
+
+The April 11 device-native MUON result was scientifically correct, but it was
+not the end of the systems story. On April 13, 2026 I ran an iterative,
+Nsight-guided CUDA optimization campaign across:
+
+- `artifacts/muon_nsys_20260413-*`
+- `artifacts/muon_gpu_gate_20260413-*`
+
+Starting point on the first April 13 exact-path gate
+(`artifacts/muon_gpu_gate_20260413-064809/acceptance_summary.tsv`):
+
+- `token-lm-document`
+  - `AdamW`: `4.86803 @ 0.10s`
+  - `MUON-lite`: `4.81667 @ 0.92s`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.28885 @ 0.19s`
+  - `MUON-lite`: `6.30417 @ 2.19s`
+
+So MUON still had attractive quality, but the wall-clock cost was
+unacceptable.
+
+The optimization campaign then progressively removed the real bottlenecks:
+
+- host-side eligibility/orchestration overhead on ineligible blocks
+- per-matrix small-core factorization launches
+- per-matrix triangular solves
+- per-matrix MUON bookkeeping kernels
+- per-matrix Gram formation
+- the custom small-core Cholesky bottleneck, by switching to batched cuSOLVER
+  `potrf`
+
+The high-ROI systems passes were:
+
+- host-side MUON eligibility gate plus one batched gradient clear
+- batched same-shape small-core factorization
+- batched `TRSM`
+- batched MUON prep/apply housekeeping
+- batched Gram GEMM
+- cuSOLVER batched Cholesky for the grouped small-core exact solve
+
+By the later exact-path plateau, MUON was no longer a `6x` to `12x` slower
+branch. Representative later exact gates:
+
+- `artifacts/muon_gpu_gate_20260413-114641/acceptance_summary.tsv`
+  - `token-lm-document`: `AdamW 4.88145 @ 0.10s`, `MUON-lite 4.80562 @ 0.11s`
+  - `token-lm-corpus-large`: `AdamW 6.31030 @ 0.18s`, `MUON-lite 6.29686 @ 0.19s`
+- `artifacts/muon_gpu_gate_20260413-123247/acceptance_summary.tsv`
+  - `token-lm-document`: `AdamW 4.87028 @ 0.10s`, `MUON-lite 4.83742 @ 0.11s`
+  - `token-lm-corpus-large`: `AdamW 6.30071 @ 0.18s`, `MUON-lite 6.26461 @ 0.20s`
+
+Late in the same exact-path frontier (`artifacts/muon_gpu_gate_20260413-123247/epoch_sweep_summary.tsv`):
+
+- `token-lm-document`, `e4`
+  - `AdamW`: `4.65370 @ 0.20s`
+  - `MUON-lite`: `4.57286 @ 0.22s`
+- `token-lm-corpus-large`, `e4`
+  - `AdamW`: `6.44646 @ 0.36s`
+  - `MUON-lite`: `6.68020 @ 0.39s`
+
+Final systems finding:
+
+- the April 13 campaign moved MUON from obviously impractical to genuinely
+  competitive on wall-clock
+- the remaining fixed tax appears to be mostly library-floor overhead rather
+  than obvious repo-side waste
+- at the plateau Nsight still showed one extra async-copy group per MUON batch:
+  - `token-lm-document`: `343` `cudaMemcpyAsync` calls for `MUON-lite` vs `295`
+    for `AdamW`
+  - `token-lm-corpus-large`: `455` vs `391`
+  - see `artifacts/muon_nsys_20260413-122803/stats/*_cudaapisum.csv`
+
+Updated MUON verdict:
+
+- the old April 11 “stop MUON refinement immediately” verdict was too
+  pessimistic about systems headroom
+- exact-path `MUON-lite` is now a real research branch on GPU
+- it is strongest on `token-lm-document`
+- it is still inconsistent on `token-lm-corpus-large`, especially late in the
+  sweep
+- do **not** replace repo-default `AdamW` with MUON on the basis of the current
+  two-benchmark evidence alone
+
+## April 13, 2026: approximate MUON orthogonalization fast path failed and was reverted
+
+After the exact MUON path reached the apparent library floor, I tested a more
+algorithmic speed substitute: a grouped small-core approximate orthogonalization
+path using a 2-step cubic Newton-Schulz iteration on the normalized step.
+
+Artifacts:
+
+- `artifacts/muon_nsys_20260413-132659`
+- `artifacts/muon_gpu_gate_20260413-132936/acceptance_summary.tsv`
+- `artifacts/muon_gpu_gate_20260413-132936/epoch_sweep_summary.tsv`
+
+Result:
+
+- `token-lm-document`
+  - `AdamW`: `4.87070 @ 0.10s`
+  - approximate `MUON-lite`: `4.88507 @ 0.11s`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.30796 @ 0.18s`
+  - approximate `MUON-lite`: `6.43808 @ 0.19s`
+
+Interpretation:
+
+- the approximate branch did **not** remove the fixed MUON copy overhead
+- it materially damaged quality, especially on `token-lm-corpus-large`
+- this is not a promotion candidate
+
+Decision:
+
+- keep the grouped exact solve as the checked-in MUON path
+- treat the approximate orthogonalization branch as a falsified research dead
+  end for the current benchmark family
+
+## April 13, 2026: clean same-codebase optimizer reranking updates the cross-branch verdict
+
+To remove the “different day / different codebase” ambiguity, I added
+`scripts/run_optimizer_clean_ranking.sh` and ran a unified GPU rerank on the
+same checked-in codebase for:
+
+- `AdamW`
+- live exact-path `MUON-lite`
+- live `ECHO late-head`
+- `BiMAP-lite`
+- `BiMAP-v2`
+
+Artifacts:
+
+- `artifacts/optimizer_clean_ranking_20260413-141452/acceptance_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260413-141452/epoch_sweep_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260413-141452/acceptance_rank_by_nll.tsv`
+- `artifacts/optimizer_clean_ranking_20260413-141452/epoch4_rank_by_nll.tsv`
+
+Acceptance ranking by benchmark:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.81613 @ 0.11s`
+  - `BiMAP-lite`: `4.86633 @ 0.13s`
+  - `AdamW`: `4.86955 @ 0.10s`
+  - `ECHO`: `4.87305 @ 0.10s`
+  - `BiMAP-v2`: `4.88624 @ 0.15s`
+- `token-lm-corpus-large`
+  - `ECHO`: `6.29683 @ 0.19s`
+  - `AdamW`: `6.30220 @ 0.18s`
+  - `BiMAP-lite`: `6.31839 @ 0.22s`
+  - `MUON-lite`: `6.32128 @ 0.20s`
+  - `BiMAP-v2`: `6.52011 @ 0.26s`
+
+Epoch-4 ranking by benchmark:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.51939 @ 0.22s`
+  - `ECHO`: `4.56536 @ 0.20s`
+  - `BiMAP-lite`: `4.59567 @ 0.25s`
+  - `AdamW`: `4.64589 @ 0.20s`
+  - `BiMAP-v2`: `4.65474 @ 0.30s`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.50439 @ 0.36s`
+  - `BiMAP-lite`: `6.56006 @ 0.44s`
+  - `ECHO`: `6.58692 @ 0.37s`
+  - `BiMAP-v2`: `6.63715 @ 0.52s`
+  - `MUON-lite`: `6.64363 @ 0.39s`
+
+Interpretation:
+
+- the old “`ECHO` is the strongest post-AdamW branch” statement is no longer a
+  clean repo-wide summary after the April 13 rerank
+- the current ranking is benchmark-specific:
+  - `token-lm-document`: `MUON-lite` is now the strongest checked-in branch
+  - `token-lm-corpus-large`: `ECHO` is best at acceptance, but `AdamW` is best
+    from `e2` onward and at `e4`
+- `BiMAP-lite` is competitive but not leading
+- `BiMAP-v2` remains a raw-NLL / high-cost branch, not a practical optimizer
+
+Superseding practical verdict:
+
+- for practical default training in this repo, keep tuned `AdamW`
+- keep `MUON-lite` as the strongest document-style research branch
+- keep `ECHO late-head` as a strong control, especially for corpus-acceptance
+  comparisons
+- keep `BiMAP-lite` as a secondary control
+- keep `BiMAP-v2` retired as a practical replacement line
 ---
 
-*Document version: 1.24*
+*Document version: 1.26*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
-*Date: 2026-04-12*
+*Date: 2026-04-13*

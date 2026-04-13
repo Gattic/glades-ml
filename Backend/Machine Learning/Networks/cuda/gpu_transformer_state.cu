@@ -20,10 +20,20 @@ GpuTransformerWeights::GpuTransformerWeights()
       tokenModel(false), tieEmbeddings(false),
       blocks(0),
       d_adamParams(0), d_adamGrads(0), d_adamM(0), d_adamV(0),
+      d_adamRowSecond(0), d_adamColSecond(0),
       d_adamRowMetric(0), d_adamColMetric(0),
-      d_adamLr(0), d_adamWd(0), d_adamGroupScales(0), d_adamGroupPrevStepRms(0), d_adamSizes(0),
+      d_adamRowStructMetric(0), d_adamColStructMetric(0),
+      d_adamPrevMhat(0), d_adamMetricScratch(0), d_echoObserveEntries(0),
+      d_muonBatchItems(0),
+      d_muonCoreBatchPtrs(0), d_muonStepBatchPtrs(0), d_muonInfoBatch(0),
+      d_adamBaseLr(0), d_adamWd(0), d_adamGroupScales(0), d_adamGroupPrevStepRms(0), d_adamSizes(0),
       d_adamMetricRows(0), d_adamMetricCols(0),
-      adamGroupCount(0), adamMaxSize(0), adamPtrsUploaded(false)
+      adamGroupCount(0), adamMaxSize(0), echoObserveCapacity(0), muonCoreBatchCapacity(0),
+      echoObserveEntryCount(0), echoObserveTotalFeatures(0),
+      echoObserveSeqLen(0u), echoObserveScope(0u), echoObserveTokenModel(false),
+      echoObserveMetaUploaded(false),
+      adamPtrsUploaded(false),
+      adamMetricMetaUploaded(false), adamMetricScope(0u)
 {
 }
 
@@ -192,36 +202,97 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gB2, dm)) return false;
 	}
 
-	// Allocate batched Adam device arrays (only needed for Adam optimizer).
+	// Allocate batched Adam device arrays shared by AdamW-like backbones.
+	// ECHO-specific batched observe / metric metadata is allocated lazily when
+	// the fused ECHO path is actually active.
+	int maxGroups = 6 + 16 * static_cast<int>(nl);
+	cudaError_t e;
+	echoObserveCapacity = 0;
+	echoObserveEntryCount = 0;
+	echoObserveTotalFeatures = 0;
+	echoObserveSeqLen = 0u;
+	echoObserveScope = 0u;
+	echoObserveTokenModel = false;
+	echoObserveMetaUploaded = false;
+
 	if (!skipAdamBufs)
 	{
-		int maxGroups = 6 + 16 * static_cast<int>(nl);
-		cudaError_t e;
 		e = cudaMalloc(&d_adamParams, maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamGrads,  maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamM,      maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamV,      maxGroups * sizeof(float*));  if (e != cudaSuccess) return false;
-		e = cudaMalloc(&d_adamRowMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
-		e = cudaMalloc(&d_adamColMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
-		e = cudaMalloc(&d_adamLr,     maxGroups * sizeof(float));   if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamBaseLr, maxGroups * sizeof(float));   if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamWd,     maxGroups * sizeof(float));   if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamGroupScales, maxGroups * sizeof(float)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamGroupPrevStepRms, maxGroups * sizeof(float)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamSizes,  maxGroups * sizeof(int));     if (e != cudaSuccess) return false;
-		e = cudaMalloc(&d_adamMetricRows, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
-		e = cudaMalloc(&d_adamMetricCols, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_muonBatchItems, maxGroups * sizeof(GpuMuonBatchItem)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_muonCoreBatchPtrs, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_muonStepBatchPtrs, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_muonInfoBatch, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
 		cudaMemset(d_adamGroupScales, 0, maxGroups * sizeof(float));
 		cudaMemset(d_adamGroupPrevStepRms, 0, maxGroups * sizeof(float));
-		cudaMemset(d_adamRowMetric, 0, maxGroups * sizeof(float*));
-		cudaMemset(d_adamColMetric, 0, maxGroups * sizeof(float*));
-		cudaMemset(d_adamMetricRows, 0, maxGroups * sizeof(int));
-		cudaMemset(d_adamMetricCols, 0, maxGroups * sizeof(int));
+		cudaMemset(d_muonBatchItems, 0, maxGroups * sizeof(GpuMuonBatchItem));
+		cudaMemset(d_muonCoreBatchPtrs, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_muonStepBatchPtrs, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_muonInfoBatch, 0, maxGroups * sizeof(int));
 		adamGroupCount = 0;
 		adamMaxSize = 0;
+		muonCoreBatchCapacity = maxGroups;
 		adamPtrsUploaded = false;
+		adamMetricMetaUploaded = false;
+		adamMetricScope = 0u;
 	}
 
 	initialized = true;
+	return true;
+}
+
+bool GpuTransformerWeights::ensureEchoBuffers()
+{
+	const int maxGroups = 6 + 16 * static_cast<int>(nLayers);
+	cudaError_t e = cudaSuccess;
+
+	if (!d_echoObserveEntries)
+	{
+		e = cudaMalloc(&d_echoObserveEntries, static_cast<size_t>(maxGroups) * sizeof(GpuEchoObserveEntry));
+		if (e != cudaSuccess)
+			return false;
+		echoObserveCapacity = maxGroups;
+		echoObserveEntryCount = 0;
+		echoObserveTotalFeatures = 0;
+		echoObserveSeqLen = 0u;
+		echoObserveScope = 0u;
+		echoObserveTokenModel = false;
+		echoObserveMetaUploaded = false;
+	}
+
+	if (!d_adamRowSecond)
+	{
+		e = cudaMalloc(&d_adamRowSecond, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamColSecond, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamRowMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamColMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamRowStructMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamColStructMetric, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamPrevMhat, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamMetricScratch, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamMetricRows, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_adamMetricCols, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
+		cudaMemset(d_adamRowSecond, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamColSecond, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamRowMetric, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamColMetric, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamRowStructMetric, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamColStructMetric, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamPrevMhat, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamMetricScratch, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_adamMetricRows, 0, maxGroups * sizeof(int));
+		cudaMemset(d_adamMetricCols, 0, maxGroups * sizeof(int));
+		adamMetricMetaUploaded = false;
+		adamMetricScope = 0u;
+	}
+
 	return true;
 }
 
@@ -236,9 +307,20 @@ void GpuTransformerWeights::free()
 	if (d_adamGrads)  { cudaFree(d_adamGrads);  d_adamGrads  = 0; }
 	if (d_adamM)      { cudaFree(d_adamM);      d_adamM      = 0; }
 	if (d_adamV)      { cudaFree(d_adamV);       d_adamV      = 0; }
+	if (d_adamRowSecond) { cudaFree(d_adamRowSecond); d_adamRowSecond = 0; }
+	if (d_adamColSecond) { cudaFree(d_adamColSecond); d_adamColSecond = 0; }
 	if (d_adamRowMetric) { cudaFree(d_adamRowMetric); d_adamRowMetric = 0; }
 	if (d_adamColMetric) { cudaFree(d_adamColMetric); d_adamColMetric = 0; }
-	if (d_adamLr)     { cudaFree(d_adamLr);      d_adamLr     = 0; }
+	if (d_adamRowStructMetric) { cudaFree(d_adamRowStructMetric); d_adamRowStructMetric = 0; }
+	if (d_adamColStructMetric) { cudaFree(d_adamColStructMetric); d_adamColStructMetric = 0; }
+	if (d_adamPrevMhat) { cudaFree(d_adamPrevMhat); d_adamPrevMhat = 0; }
+	if (d_adamMetricScratch) { cudaFree(d_adamMetricScratch); d_adamMetricScratch = 0; }
+	if (d_echoObserveEntries) { cudaFree(d_echoObserveEntries); d_echoObserveEntries = 0; }
+	if (d_muonBatchItems) { cudaFree(d_muonBatchItems); d_muonBatchItems = 0; }
+	if (d_muonCoreBatchPtrs) { cudaFree(d_muonCoreBatchPtrs); d_muonCoreBatchPtrs = 0; }
+	if (d_muonStepBatchPtrs) { cudaFree(d_muonStepBatchPtrs); d_muonStepBatchPtrs = 0; }
+	if (d_muonInfoBatch) { cudaFree(d_muonInfoBatch); d_muonInfoBatch = 0; }
+	if (d_adamBaseLr) { cudaFree(d_adamBaseLr);  d_adamBaseLr = 0; }
 	if (d_adamWd)     { cudaFree(d_adamWd);      d_adamWd     = 0; }
 	if (d_adamGroupScales) { cudaFree(d_adamGroupScales); d_adamGroupScales = 0; }
 	if (d_adamGroupPrevStepRms) { cudaFree(d_adamGroupPrevStepRms); d_adamGroupPrevStepRms = 0; }
@@ -247,7 +329,17 @@ void GpuTransformerWeights::free()
 	if (d_adamMetricCols) { cudaFree(d_adamMetricCols); d_adamMetricCols = 0; }
 	adamGroupCount = 0;
 	adamMaxSize = 0;
+	echoObserveCapacity = 0;
+	muonCoreBatchCapacity = 0;
+	echoObserveEntryCount = 0;
+	echoObserveTotalFeatures = 0;
+	echoObserveSeqLen = 0u;
+	echoObserveScope = 0u;
+	echoObserveTokenModel = false;
+	echoObserveMetaUploaded = false;
 	adamPtrsUploaded = false;
+	adamMetricMetaUploaded = false;
+	adamMetricScope = 0u;
 	initialized = false;
 	// GpuBuffer destructors handle cudaFree automatically.
 }

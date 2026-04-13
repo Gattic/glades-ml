@@ -65,6 +65,15 @@ bool strsm_rowmajor_right_upper(int M, int N,
                                  const float* R, int ldr,
                                  float* B, int ldb);
 
+// Row-major batched right-side upper-triangular solve (in-place):
+// X_i[M,N] * R_i[N,N] = alpha * B_i[M,N] for i in [0, batchCount).
+// Arrays of device pointers are themselves device-resident.
+bool strsm_rowmajor_right_upper_batched(int M, int N,
+                                        float alpha,
+                                        float** Rarray, int ldr,
+                                        float** Barray, int ldb,
+                                        int batchCount);
+
 // Row-major batched strided SGEMM:
 // C_i[M,N] = alpha * A_i[M,K] * B_i[K,N] + beta * C_i[M,N]
 // for i in [0, batchCount).
@@ -99,6 +108,47 @@ bool sgemm_batched_strided_atb(int M, int N, int K,
                                 float* C, int ldc, long long int strideC,
                                 int batchCount);
 
+// Row-major batched pointer-array SGEMM with A transposed:
+// C_i[M,N] = alpha * A_i^T[M,K] * B_i[K,N] + beta * C_i[M,N]
+// where each A_i is stored as [K,M] row-major, B_i as [K,N], and C_i as [M,N].
+// Arrays of pointers are themselves device-resident.
+bool sgemm_batched_pointer_atb(int M, int N, int K,
+                               float alpha,
+                               float** Aarray, int lda,
+                               float** Barray, int ldb,
+                               float beta,
+                               float** Carray, int ldc,
+                               int batchCount);
+
+// Row-major batched pointer-array SGEMM:
+// C_i[M,N] = alpha * A_i[M,K] * B_i[K,N] + beta * C_i[M,N]
+// Arrays of pointers are themselves device-resident.
+bool sgemm_batched_pointer(int M, int N, int K,
+                           float alpha,
+                           float** Aarray, int lda,
+                           float** Barray, int ldb,
+                           float beta,
+                           float** Carray, int ldc,
+                           int batchCount);
+
+// Same as above, but alpha/beta are device-resident scalars.
+bool sgemm_batched_pointer_device_scalars(int M, int N, int K,
+                                          const float* d_alpha,
+                                          float** Aarray, int lda,
+                                          float** Barray, int ldb,
+                                          const float* d_beta,
+                                          float** Carray, int ldc,
+                                          int batchCount);
+
+// Same as above, but alpha/beta are device-resident scalars.
+bool sgemm_batched_pointer_atb_device_scalars(int M, int N, int K,
+                                              const float* d_alpha,
+                                              float** Aarray, int lda,
+                                              float** Barray, int ldb,
+                                              const float* d_beta,
+                                              float** Carray, int ldc,
+                                              int batchCount);
+
 } // namespace gpu
 } // namespace glades
 
@@ -111,6 +161,7 @@ inline bool blasInit() { return false; }
 inline void blasDestroy() {}
 
 inline bool strsm_rowmajor_right_upper(int, int, float, const float*, int, float*, int) { return false; }
+inline bool strsm_rowmajor_right_upper_batched(int, int, float, float**, int, float**, int, int) { return false; }
 inline bool sgemm_rowmajor(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
@@ -118,6 +169,10 @@ inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, flo
 inline bool sgemm_batched_strided(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
 inline bool sgemm_batched_strided_abt(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
 inline bool sgemm_batched_strided_atb(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
+inline bool sgemm_batched_pointer(int, int, int, float, float**, int, float**, int, float, float**, int, int) { return false; }
+inline bool sgemm_batched_pointer_device_scalars(int, int, int, const float*, float**, int, float**, int, const float*, float**, int, int) { return false; }
+inline bool sgemm_batched_pointer_atb(int, int, int, float, float**, int, float**, int, float, float**, int, int) { return false; }
+inline bool sgemm_batched_pointer_atb_device_scalars(int, int, int, const float*, float**, int, float**, int, const float*, float**, int, int) { return false; }
 
 } // namespace gpu
 } // namespace glades

@@ -480,9 +480,20 @@ struct EchoWeightState
 	unsigned int n;
 	std::vector<float> rowSecond;   // [m] EMA row geometry from output adjoints
 	std::vector<float> colSecond;   // [n] EMA col geometry from input activations
+	std::vector<float> rowInvMetric; // [m] cached inverse row metric for the base ECHO anchor
+	std::vector<float> colInvMetric; // [n] cached inverse col metric for the base ECHO anchor
+	std::vector<float> rowStructInvMetric; // [m] cached inverse row metric for the structural anchor
+	std::vector<float> colStructInvMetric; // [n] cached inverse col metric for the structural anchor
+	std::vector<float> prevMhat;    // [m * n] previous bias-corrected first moment for predictive blend
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastGeometryScale;
+	float lastGeometryTrust; // auxiliary trust budget for the simplex blend
+	float lastPredictiveTrust; // predictive anchor simplex weight
+	float lastStructuralTrust; // structural anchor simplex weight
+	float lastMaturity;        // smooth geometry maturity state in [0,1]
+	float prevRowAnisotropy;
+	float prevColAnisotropy;
 	unsigned long long step;
 	bool initialized;
 
@@ -491,6 +502,12 @@ struct EchoWeightState
 	      lastRowAnisotropy(1.0f),
 	      lastColAnisotropy(1.0f),
 	      lastGeometryScale(0.0f),
+	      lastGeometryTrust(1.0f),
+	      lastPredictiveTrust(0.0f),
+	      lastStructuralTrust(0.0f),
+	      lastMaturity(0.0f),
+	      prevRowAnisotropy(1.0f),
+	      prevColAnisotropy(1.0f),
 	      step(0ULL),
 	      initialized(false)
 	{
@@ -502,9 +519,20 @@ struct EchoWeightState
 		n = 0u;
 		rowSecond.clear();
 		colSecond.clear();
+		rowInvMetric.clear();
+		colInvMetric.clear();
+		rowStructInvMetric.clear();
+		colStructInvMetric.clear();
+		prevMhat.clear();
 		lastRowAnisotropy = 1.0f;
 		lastColAnisotropy = 1.0f;
 		lastGeometryScale = 0.0f;
+		lastGeometryTrust = 1.0f;
+		lastPredictiveTrust = 0.0f;
+		lastStructuralTrust = 0.0f;
+		lastMaturity = 0.0f;
+		prevRowAnisotropy = 1.0f;
+		prevColAnisotropy = 1.0f;
 		step = 0ULL;
 		initialized = false;
 	}

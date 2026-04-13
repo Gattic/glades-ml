@@ -12,6 +12,11 @@ RUN_ACCEPTANCE=0
 SKIP_BUILD=0
 EPOCHS_CSV="1,2,3,4"
 BENCHMARKS_CSV="token-lm-document,token-lm-corpus-large"
+ECHO_CADENCE=1
+ECHO_TRUST_SCALE=0.0
+ECHO_PREDICTIVE_SCALE=0.0
+ECHO_STRUCTURAL_SCALE=0.0
+ECHO_STRUCTURAL_GROUPS=1
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR_DEFAULT="$ROOT_DIR/artifacts/echo_scaleup_gate_${TIMESTAMP}"
 OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
@@ -56,6 +61,11 @@ Options:
   --repeats N                 Repeats per epoch point (default: 5)
   --benchmarks CSV            Comma-separated benchmark list
   --epochs CSV                Comma-separated epoch list
+  --echo-cadence N           Optimizer steps between ECHO metric refreshes (default: 1)
+  --echo-trust-scale X       ECHO trust-gate strength (default: 0.0)
+  --echo-predictive-scale X  ECHO bounded predictive blend strength (default: 0.0)
+  --echo-structural-scale X  ECHO grouped structural factor strength (default: 0.0)
+  --echo-structural-groups N ECHO contiguous row/col group count (default: 1)
   --out-dir PATH              Output directory
   --skip-build                Skip build + ECHO verification steps
   --acceptance                Also run the 10-repeat acceptance pass
@@ -96,6 +106,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --epochs)
       EPOCHS_CSV="$2"
+      shift 2
+      ;;
+    --echo-cadence|--atlas-echo-cadence)
+      ECHO_CADENCE="$2"
+      shift 2
+      ;;
+    --echo-trust-scale|--atlas-echo-trust-scale)
+      ECHO_TRUST_SCALE="$2"
+      shift 2
+      ;;
+    --echo-predictive-scale|--atlas-echo-predictive-scale)
+      ECHO_PREDICTIVE_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-scale|--atlas-echo-structural-scale)
+      ECHO_STRUCTURAL_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-groups|--atlas-echo-structural-groups)
+      ECHO_STRUCTURAL_GROUPS="$2"
       shift 2
       ;;
     --out-dir)
@@ -182,6 +212,14 @@ IFS=',' read -r -a BENCHMARKS <<< "$BENCHMARKS_CSV"
 IFS=',' read -r -a EPOCHS <<< "$EPOCHS_CSV"
 
 mkdir -p "$OUT_DIR/raw"
+
+ECHO_COMMON_ARGS=(
+  --atlas-echo-cadence "$ECHO_CADENCE"
+  --atlas-echo-trust-scale "$ECHO_TRUST_SCALE"
+  --atlas-echo-predictive-scale "$ECHO_PREDICTIVE_SCALE"
+  --atlas-echo-structural-scale "$ECHO_STRUCTURAL_SCALE"
+  --atlas-echo-structural-groups "$ECHO_STRUCTURAL_GROUPS"
+)
 
 SUMMARY_TSV="$OUT_DIR/epoch_sweep_summary.tsv"
 ACCEPT_TSV="$OUT_DIR/acceptance_summary.tsv"
@@ -342,6 +380,7 @@ run_variant_epoch "05_smoke_document_echo_late_head_e1" \
   "token-lm-document" "1" "echo" "late-head" \
   --variant echo \
   --atlas-echo-geometry-scale 1.0 \
+  "${ECHO_COMMON_ARGS[@]}" \
   --atlas-echo-scope late-head
 
 for benchmark in "${BENCHMARKS[@]}"; do
@@ -354,12 +393,14 @@ for benchmark in "${BENCHMARKS[@]}"; do
       "$benchmark" "$epochs" "echo" "late-head" \
       --variant echo \
       --atlas-echo-geometry-scale 1.0 \
+      "${ECHO_COMMON_ARGS[@]}" \
       --atlas-echo-scope late-head
 
     run_variant_epoch "sweep_${benchmark}_echo_large_only_e${epochs}" \
       "$benchmark" "$epochs" "echo" "large-only" \
       --variant echo \
       --atlas-echo-geometry-scale 1.0 \
+      "${ECHO_COMMON_ARGS[@]}" \
       --atlas-echo-scope large-only
   done
 done
@@ -374,12 +415,14 @@ if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
       "$benchmark" "echo" "late-head" \
       --variant echo \
       --atlas-echo-geometry-scale 1.0 \
+      "${ECHO_COMMON_ARGS[@]}" \
       --atlas-echo-scope late-head
 
     run_variant_accept "accept_${benchmark}_echo_large_only" \
       "$benchmark" "echo" "large-only" \
       --variant echo \
       --atlas-echo-geometry-scale 1.0 \
+      "${ECHO_COMMON_ARGS[@]}" \
       --atlas-echo-scope large-only
   done
 fi

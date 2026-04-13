@@ -843,6 +843,29 @@ struct ATLASConfig
 	// echoGeometryScale to echoGeometryScaleFinal. 0 disables scheduling.
 	unsigned int echoGeometryDecaySteps;
 
+	// Number of optimizer steps between ECHO metric refreshes. 1 refreshes on
+	// every step. Larger values reuse the previously prepared row/column metric
+	// vectors on skipped steps.
+	unsigned int echoMetricCadence;
+
+	// Optional scalar trust gate applied to ECHO geometry. 0 keeps the current
+	// always-on ECHO metric. Positive values scale geometry down when observed
+	// anisotropy is weak or unstable across steps.
+	float echoTrustScale;
+
+	// Optional bounded one-step predictive blend applied to the Adam first
+	// moment before ECHO's row/column metric is applied. 0 disables the blend.
+	float echoPredictiveScale;
+
+	// Optional grouped structural factor strength. Positive values multiply a
+	// coarse contiguous row/column chunk factor into the existing ECHO metric,
+	// approximating a fixed-basis structural prior without low-rank solves.
+	float echoStructuralScale;
+
+	// Number of contiguous row/column groups used by the structural factor. 1
+	// disables grouping.
+	unsigned int echoStructuralGroups;
+
 	// Scope of ECHO matrix activation:
 	// 0 = all eligible matrices,
 	// 1 = large-only (matrix area >= internal cutoff),
@@ -1258,6 +1281,11 @@ struct ATLASConfig
 	      echoGeometryScale(1.0f),
 	      echoGeometryScaleFinal(1.0f),
 	      echoGeometryDecaySteps(0u),
+	      echoMetricCadence(1u),
+	      echoTrustScale(0.0f),
+	      echoPredictiveScale(0.0f),
+	      echoStructuralScale(0.0f),
+	      echoStructuralGroups(1u),
 	      echoScope(ECHO_SCOPE_ALL),
 	      bimapEnabled(false),
 	      bimapScope(BIMAP_SCOPE_ALL),
@@ -1349,6 +1377,16 @@ struct ATLASConfig
 		if (progress > 1.0)
 			progress = 1.0;
 		return start + static_cast<float>(progress) * (finalScale - start);
+	}
+
+	inline bool echoShouldRefresh(unsigned long long optimizerStep) const
+	{
+		const unsigned long long cadence =
+		    static_cast<unsigned long long>(std::max(1u, echoMetricCadence));
+		if (cadence <= 1ULL)
+			return true;
+		const unsigned long long stepIndex = (optimizerStep > 0ULL) ? optimizerStep : 1ULL;
+		return ((stepIndex - 1ULL) % cadence) == 0ULL;
 	}
 };
 

@@ -1239,12 +1239,17 @@ __global__ void adam_update_batch_kernel(
     float** __restrict__ grads,
     float** __restrict__ ms,
     float** __restrict__ vs,
-    const float* __restrict__ lrs,
+    const float* __restrict__ baseLrs,
     const float* __restrict__ wds,
+    float lrScale,
     const float* __restrict__ stepScales,
     const int* __restrict__ sizes,
     float** __restrict__ rowMetrics,
     float** __restrict__ colMetrics,
+    float** __restrict__ rowStructMetrics,
+    float** __restrict__ colStructMetrics,
+    float** __restrict__ prevMhats,
+    float** __restrict__ metricScratch,
     const int* __restrict__ metricRows,
     const int* __restrict__ metricCols,
     float beta1, float beta2, float eps,
@@ -1261,14 +1266,27 @@ __global__ void adam_update_batch_kernel(
 	float* grad = grads[grp];
 	float* m_arr = ms[grp];
 	float* v_arr = vs[grp];
-	float lr = lrs[grp] * (stepScales ? stepScales[grp] : 1.0f);
+	const float baseLr = baseLrs[grp] * lrScale;
+	float lr = baseLr * (stepScales ? stepScales[grp] : 1.0f);
 	float weightDecay = wds[grp];
 	float* rowMetric = rowMetrics ? rowMetrics[grp] : NULL;
 	float* colMetric = colMetrics ? colMetrics[grp] : NULL;
+	float* rowStructMetric = rowStructMetrics ? rowStructMetrics[grp] : NULL;
+	float* colStructMetric = colStructMetrics ? colStructMetrics[grp] : NULL;
+	float* prevMhat = prevMhats ? prevMhats[grp] : NULL;
+	float* metricStats = metricScratch ? metricScratch[grp] : NULL;
 	const int rows = metricRows ? metricRows[grp] : 0;
 	const int cols = metricCols ? metricCols[grp] : 0;
 	const bool useMatrixMetric =
 	    rowMetric && colMetric && rows > 0 && cols > 0 && (rows * cols) == n;
+	const float predictiveWeight =
+	    (useMatrixMetric && prevMhat && metricStats && step > 1)
+	        ? fmaxf(metricStats[9], 0.0f)
+	        : 0.0f;
+	const float structuralWeight =
+	    (useMatrixMetric && metricStats) ? fmaxf(metricStats[10], 0.0f) : 0.0f;
+	const float baseWeight =
+	    useMatrixMetric ? fmaxf(0.0f, 1.0f - predictiveWeight - structuralWeight) : 1.0f;
 
 	float g = grad[idx] * gradScale;
 
@@ -1284,15 +1302,41 @@ __global__ void adam_update_batch_kernel(
 	float bc2 = 1.0f - powf(beta2, (float)step);
 	float m_hat = m_new / bc1;
 	float v_hat = v_new / bc2;
-	float stepVal = m_hat / (sqrtf(v_hat) + eps);
+	float predictiveMhat = m_hat;
+	if (predictiveWeight > 0.0f)
+	{
+		float delta = m_hat - prevMhat[idx];
+		const float deltaCap = 0.5f * (fabsf(m_hat) + eps);
+		if (delta > deltaCap)
+			delta = deltaCap;
+		else if (delta < -deltaCap)
+			delta = -deltaCap;
+		predictiveMhat += delta;
+	}
+	const float diagInv = 1.0f / (sqrtf(v_hat) + eps);
+	if (prevMhat)
+		prevMhat[idx] = m_hat;
 	if (useMatrixMetric)
 	{
 		const int row = idx / cols;
 		const int col = idx - row * cols;
-		stepVal /= (fmaxf(rowMetric[row], 1.0e-12f) * fmaxf(colMetric[col], 1.0e-12f));
+		const float baseMetric = rowMetric[row] * colMetric[col];
+		const float structMetric =
+		    (rowStructMetric && colStructMetric)
+		        ? (rowStructMetric[row] * colStructMetric[col])
+		        : baseMetric;
+		const float baseStep = m_hat * diagInv * baseMetric;
+		const float predictiveStep = predictiveMhat * diagInv * baseMetric;
+		const float structuralStep = m_hat * diagInv * structMetric;
+		const float stepVal =
+		    baseWeight * baseStep
+		    + predictiveWeight * predictiveStep
+		    + structuralWeight * structuralStep;
+		param[idx] -= lr * stepVal;
 		grad[idx] = 0.0f;
+		return;
 	}
-
+	const float stepVal = m_hat * diagInv;
 	param[idx] -= lr * stepVal;
 }
 
@@ -1300,10 +1344,13 @@ __global__ void adam_update_batch_kernel(
 
 bool adam_update_batch(float** d_params, float** d_grads,
                        float** d_ms, float** d_vs,
-                       const float* d_lrs, const float* d_wds,
+                       const float* d_baseLrs, const float* d_wds,
+                       float lrScale,
                        const float* d_stepScales,
                        const int* d_sizes, int maxSize,
                        float** d_rowMetrics, float** d_colMetrics,
+                       float** d_rowStructMetrics, float** d_colStructMetrics,
+                       float** d_prevMhats, float** d_metricScratch,
                        const int* d_metricRows, const int* d_metricCols,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount)
@@ -1313,8 +1360,10 @@ bool adam_update_batch(float** d_params, float** d_grads,
 	dim3 grid(gridX, groupCount);
 	adam_update_batch_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
 		d_params, d_grads, d_ms, d_vs,
-		d_lrs, d_wds, d_stepScales, d_sizes,
-		d_rowMetrics, d_colMetrics, d_metricRows, d_metricCols,
+		d_baseLrs, d_wds, lrScale, d_stepScales, d_sizes,
+		d_rowMetrics, d_colMetrics, d_rowStructMetrics, d_colStructMetrics,
+		d_prevMhats, d_metricScratch,
+		d_metricRows, d_metricCols,
 		beta1, beta2, eps, gradScale, step, groupCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;

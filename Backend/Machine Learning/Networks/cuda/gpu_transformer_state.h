@@ -217,10 +217,21 @@ struct GpuTransformerWeights
 	float** d_adamGrads;
 	float** d_adamM;
 	float** d_adamV;
+	float** d_adamRowSecond;
+	float** d_adamColSecond;
 	float** d_adamRowMetric;
 	float** d_adamColMetric;
-	// Per-group scalars (device arrays of float): lr, wd.
-	float* d_adamLr;
+	float** d_adamRowStructMetric;
+	float** d_adamColStructMetric;
+	float** d_adamPrevMhat;
+	float** d_adamMetricScratch;
+	GpuEchoObserveEntry* d_echoObserveEntries;
+	GpuMuonBatchItem* d_muonBatchItems; // device scratch array of MUON batch descriptors
+	float** d_muonCoreBatchPtrs; // device scratch array of coreScratch pointers for batched MUON factorization
+	float** d_muonStepBatchPtrs; // device scratch array of muonStep pointers for batched MUON triangular solves
+	int* d_muonInfoBatch; // device scratch array of batched MUON Cholesky status codes
+	// Per-group scalars (device arrays of float): static base lr and wd.
+	float* d_adamBaseLr;
 	float* d_adamWd;
 	float* d_adamGroupScales;
 	float* d_adamGroupPrevStepRms;
@@ -230,7 +241,17 @@ struct GpuTransformerWeights
 	int* d_adamMetricCols;
 	int adamGroupCount;   // number of parameter groups
 	int adamMaxSize;      // largest element count across groups
+	int echoObserveCapacity; // capacity of the batched ECHO observe descriptor buffer
+	int muonCoreBatchCapacity; // capacity of the batched MUON core pointer scratch array
+	int echoObserveEntryCount; // cached descriptor count for the current scratch shape
+	int echoObserveTotalFeatures; // total row+col features across cached observe descriptors
+	unsigned int echoObserveSeqLen; // sequence length used to build cached descriptors
+	unsigned int echoObserveScope; // ECHO scope used to build cached descriptors
+	bool echoObserveTokenModel; // token-lm vs projection mode for cached descriptors
+	bool echoObserveMetaUploaded; // true after cached observe descriptors uploaded
 	bool adamPtrsUploaded; // true after pointer arrays uploaded once
+	bool adamMetricMetaUploaded; // true after static ECHO metric metadata uploaded
+	unsigned int adamMetricScope; // ECHO scope for the uploaded static metric metadata
 
 	// ATLAS optimizer state (one per weight matrix, biases use Adam).
 	GpuAtlasWeightState atlasTokE;
@@ -267,6 +288,10 @@ struct GpuTransformerWeights
 
 	// Free all GPU memory.
 	void free();
+
+	// Allocate ECHO-specific batched observe / metric metadata buffers on demand.
+	// Plain AdamW and non-ECHO ATLAS variants do not need these arrays.
+	bool ensureEchoBuffers();
 };
 
 // GPU-resident forward/backward scratch buffers for transformer training.

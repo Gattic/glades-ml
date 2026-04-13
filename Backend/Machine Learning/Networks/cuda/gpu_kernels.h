@@ -146,15 +146,19 @@ bool adam_group_scale_batch(float** d_params, float** d_grads,
 
 // Batched Adam: process all parameter groups in a single kernel launch.
 // d_params/d_grads/d_ms/d_vs are device arrays of groupCount pointers.
-// d_lrs/d_wds are device arrays of groupCount floats (per-group lr/wd).
+// d_baseLrs/d_wds are device arrays of groupCount floats (static per-group
+// base lr and weight decay). lrScale is multiplied into each base lr in-kernel.
 // d_sizes is a device array of groupCount ints (element counts).
 // maxSize is the largest element count across all groups.
 bool adam_update_batch(float** d_params, float** d_grads,
                        float** d_ms, float** d_vs,
-                       const float* d_lrs, const float* d_wds,
+                       const float* d_baseLrs, const float* d_wds,
+                       float lrScale,
                        const float* d_stepScales,
                        const int* d_sizes, int maxSize,
                        float** d_rowMetrics, float** d_colMetrics,
+                       float** d_rowStructMetrics, float** d_colStructMetrics,
+                       float** d_prevMhats, float** d_metricScratch,
                        const int* d_metricRows, const int* d_metricCols,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount);
@@ -345,9 +349,9 @@ inline bool embedding_scatter_add(float*, const int*, const float*, int, int, in
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool adam_update_batch(float**, float**, float**, float**,
-                              const float*, const float*, const float*,
+                              const float*, const float*, float, const float*,
                               const int*, int,
-                              float**, float**, const int*, const int*,
+                              float**, float**, float**, float**, float**, float**, const int*, const int*,
                               float, float, float, float, int, int) { return false; }
 
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }

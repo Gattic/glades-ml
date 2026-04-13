@@ -275,15 +275,22 @@ struct GpuEchoWeightState
 
 	GpuBuffer<float> rowSecond;     // [m] EMA row geometry from adjoint operands
 	GpuBuffer<float> colSecond;     // [n] EMA col geometry from input operands
-	GpuBuffer<float> rowMetric;     // [m] device-resident row metric for the current step
-	GpuBuffer<float> colMetric;     // [n] device-resident col metric for the current step
-	GpuBuffer<float> scalarScratch; // [6] rowMean, colMean, rowMin, rowMax, colMin, colMax
+	GpuBuffer<float> rowInvMetric;  // [m] cached inverse row metric for the base ECHO anchor
+	GpuBuffer<float> colInvMetric;  // [n] cached inverse col metric for the base ECHO anchor
+	GpuBuffer<float> rowStructInvMetric; // [m] cached inverse row metric for the structural anchor
+	GpuBuffer<float> colStructInvMetric; // [n] cached inverse col metric for the structural anchor
+	GpuBuffer<float> prevMhat;      // [m * n] previous bias-corrected first moment
+	GpuBuffer<float> scalarScratch; // row/col stats plus simplex trust weights and maturity
 
 	float rowMean;
 	float colMean;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastGeometryScale;
+	float lastGeometryTrust;
+	float lastPredictiveTrust;
+	float lastStructuralTrust;
+	float lastMaturity;
 	unsigned long long step;
 	bool initialized;
 
@@ -292,7 +299,35 @@ struct GpuEchoWeightState
 	      rowMean(1.0f), colMean(1.0f),
 	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
 	      lastGeometryScale(0.0f),
+	      lastGeometryTrust(1.0f),
+	      lastPredictiveTrust(0.0f),
+	      lastStructuralTrust(0.0f),
+	      lastMaturity(0.0f),
 	      step(0ULL), initialized(false)
+	{
+	}
+};
+
+struct GpuEchoObserveEntry
+{
+	const float* rowObs;
+	const float* colObs;
+	float* rowSecond;
+	float* colSecond;
+	int samples;
+	int rows;
+	int cols;
+	int featureBase;
+
+	GpuEchoObserveEntry()
+	    : rowObs(0),
+	      colObs(0),
+	      rowSecond(0),
+	      colSecond(0),
+	      samples(0),
+	      rows(0),
+	      cols(0),
+	      featureBase(0)
 	{
 	}
 };
@@ -395,6 +430,33 @@ struct GpuMuonWeightState
 	}
 };
 
+struct GpuMuonBatchItem
+{
+	GpuMuonWeightState* state;
+	float* d_W;
+	float* d_gW;
+	float* d_m;
+	float* d_v;
+	float* d_prevMhat;
+	float* d_adamStep;
+	float* d_muonStep;
+	float* d_coreScratch;
+	float* d_scalarScratch;
+	unsigned int m;
+	unsigned int n;
+	unsigned int predictiveEnabled;
+	float lr;
+	const char* tag;
+
+	GpuMuonBatchItem()
+	    : state(0),
+	      d_W(0), d_gW(0), d_m(0), d_v(0),
+	      d_prevMhat(0), d_adamStep(0), d_muonStep(0), d_coreScratch(0), d_scalarScratch(0),
+	      m(0u), n(0u), predictiveEnabled(0u), lr(0.0f), tag(0)
+	{
+	}
+};
+
 // Convenience wrapper: initializes state if needed, then calls atlas_gpu_step.
 // Mirrors the CPU atlas::update() function. Returns true on success.
 bool atlas_gpu_update(GpuAtlasWeightState& state,
@@ -479,12 +541,44 @@ bool echo_gpu_observe(GpuEchoWeightState& state,
                       unsigned int n,
                       const glades::ATLASConfig& ac);
 
+bool echo_gpu_ensure_state(GpuEchoWeightState& state,
+                           unsigned int m,
+                           unsigned int n);
+
+bool echo_gpu_observe_batch(GpuEchoObserveEntry* d_entries,
+                            int entryCapacity,
+                            const GpuEchoObserveEntry* h_entries,
+                            int entryCount,
+                            int totalFeatures,
+                            unsigned long long optimizerStep,
+                            const glades::ATLASConfig& ac);
+
+bool echo_gpu_launch_observe_batch(const GpuEchoObserveEntry* d_entries,
+                                   int entryCount,
+                                   int totalFeatures,
+                                   unsigned long long optimizerStep,
+                                   const glades::ATLASConfig& ac);
+
 bool echo_gpu_prepare_metrics(GpuEchoWeightState& state,
                               unsigned int m,
                               unsigned int n,
                               unsigned long long optimizerStep,
                               float eps,
                               const glades::ATLASConfig& ac);
+
+bool echo_gpu_prepare_metrics_batch(float** d_rowSecond,
+                                    float** d_colSecond,
+                                    float** d_rowInvMetric,
+                                    float** d_colInvMetric,
+                                    float** d_rowStructInvMetric,
+                                    float** d_colStructInvMetric,
+                                    float** d_scalarScratch,
+                                    const int* d_rows,
+                                    const int* d_cols,
+                                    int groupCount,
+                                    unsigned long long optimizerStep,
+                                    float eps,
+                                    const glades::ATLASConfig& ac);
 
 bool echo_gpu_post_update(GpuEchoWeightState& state,
                           const glades::ATLASConfig& ac,
@@ -539,6 +633,40 @@ bool muon_gpu_update_lite(GpuMuonWeightState& state,
                           const glades::ATLASConfig& ac,
                           shmea::GLogger* logger = 0,
                           const char* tag = 0);
+
+// Batched MUON-lite update for small tall matrices with the same shape.
+// This path prepares each eligible matrix independently, batches the small
+// Cholesky factorization across all cores to improve GPU occupancy, then
+// completes the per-matrix triangular solve and residual application.
+bool muon_gpu_update_lite_small_batch(const GpuMuonBatchItem* items,
+                                      int count,
+                                      GpuMuonBatchItem* d_batchItems,
+                                      float** d_corePtrScratch,
+                                      float** d_stepPtrScratch,
+                                      int* d_infoScratch,
+                                      int corePtrCapacity,
+                                      float inv1mB1t, float inv1mB2t,
+                                      float eps,
+                                      const glades::ATLASConfig& ac,
+                                      shmea::GLogger* logger = 0);
+
+// Bulk batched MUON-lite update for multiple same-shape groups. The caller
+// provides a flat item array plus per-group offsets/counts so the device batch
+// descriptors can be uploaded once and reused across each grouped launch.
+bool muon_gpu_update_lite_small_batches(const GpuMuonBatchItem* items,
+                                        int itemCount,
+                                        const int* groupOffsets,
+                                        const int* groupCounts,
+                                        int groupCount,
+                                        GpuMuonBatchItem* d_batchItems,
+                                        float** d_corePtrScratch,
+                                        float** d_stepPtrScratch,
+                                        int* d_infoScratch,
+                                        int corePtrCapacity,
+                                        float inv1mB1t, float inv1mB2t,
+                                        float eps,
+                                        const glades::ATLASConfig& ac,
+                                        shmea::GLogger* logger = 0);
 
 // Retrieve diagnostic info from the current state.
 // Downloads Fisher diagonal from GPU — call sparingly (e.g. every tSub steps).
@@ -674,13 +802,45 @@ struct GpuEchoWeightState
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastGeometryScale;
+	float lastGeometryTrust;
+	float lastPredictiveTrust;
+	float lastStructuralTrust;
+	float lastMaturity;
 	unsigned long long step;
 	bool initialized;
 	GpuEchoWeightState()
 	    : rowMean(1.0f), colMean(1.0f),
 	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
 	      lastGeometryScale(0.0f),
+	      lastGeometryTrust(1.0f),
+	      lastPredictiveTrust(0.0f),
+	      lastStructuralTrust(0.0f),
+	      lastMaturity(0.0f),
 	      step(0ULL), initialized(false) {}
+};
+
+struct GpuEchoObserveEntry
+{
+	const float* rowObs;
+	const float* colObs;
+	float* rowSecond;
+	float* colSecond;
+	int samples;
+	int rows;
+	int cols;
+	int featureBase;
+
+	GpuEchoObserveEntry()
+	    : rowObs(0),
+	      colObs(0),
+	      rowSecond(0),
+	      colSecond(0),
+	      samples(0),
+	      rows(0),
+	      cols(0),
+	      featureBase(0)
+	{
+	}
 };
 
 struct GpuRacerWeightState
@@ -766,9 +926,21 @@ inline bool bimap_gpu_update_lite(GpuBiMAPWeightState&, float*, float*, float*, 
 inline bool echo_gpu_observe(GpuEchoWeightState&, const float*, const float*,
                              unsigned int, unsigned int, unsigned int,
                              const glades::ATLASConfig&) { return false; }
+inline bool echo_gpu_ensure_state(GpuEchoWeightState&, unsigned int, unsigned int) { return false; }
+inline bool echo_gpu_observe_batch(GpuEchoObserveEntry*, int,
+                                   const GpuEchoObserveEntry*, int, int,
+                                   unsigned long long,
+                                   const glades::ATLASConfig&) { return false; }
+inline bool echo_gpu_launch_observe_batch(const GpuEchoObserveEntry*, int, int,
+                                          unsigned long long,
+                                          const glades::ATLASConfig&) { return false; }
 inline bool echo_gpu_prepare_metrics(GpuEchoWeightState&, unsigned int, unsigned int,
                                      unsigned long long, float,
                                      const glades::ATLASConfig&) { return false; }
+inline bool echo_gpu_prepare_metrics_batch(float**, float**, float**, float**, float**, float**, float**,
+                                           const int*, const int*, int,
+                                           unsigned long long, float,
+                                           const glades::ATLASConfig&) { return false; }
 inline bool echo_gpu_post_update(GpuEchoWeightState&,
                                  const glades::ATLASConfig&,
                                  shmea::GLogger* = 0,
@@ -794,6 +966,19 @@ inline bool muon_gpu_update_lite(GpuMuonWeightState&, float*, float*, float*, fl
                                  const glades::ATLASConfig&,
                                  shmea::GLogger* = 0,
                                  const char* = 0) { return false; }
+inline bool muon_gpu_update_lite_small_batch(const GpuMuonBatchItem*, int,
+                                             GpuMuonBatchItem*, float**, float**, int*, int,
+                                             float, float,
+                                             float,
+                                             const glades::ATLASConfig&,
+                                             shmea::GLogger* = 0) { return false; }
+inline bool muon_gpu_update_lite_small_batches(const GpuMuonBatchItem*, int,
+                                               const int*, const int*, int,
+                                               GpuMuonBatchItem*, float**, float**, int*, int,
+                                               float, float,
+                                               float,
+                                               const glades::ATLASConfig&,
+                                               shmea::GLogger* = 0) { return false; }
 inline bool atlas_gpu_guard(float*, size_t) { return false; }
 
 } // namespace gpu

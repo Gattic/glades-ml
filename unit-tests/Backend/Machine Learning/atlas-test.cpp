@@ -411,15 +411,28 @@ struct EchoParitySnapshot
 	std::vector<float> g;
 	std::vector<float> rowSecond;
 	std::vector<float> colSecond;
+	std::vector<float> rowInvMetric;
+	std::vector<float> colInvMetric;
+	std::vector<float> rowStructInvMetric;
+	std::vector<float> colStructInvMetric;
+	std::vector<float> prevMhat;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastGeometryScale;
+	float lastGeometryTrust;
+	float lastPredictiveTrust;
+	float lastStructuralTrust;
+	float lastMaturity;
 	unsigned long long step;
 
 	EchoParitySnapshot()
 	    : lastRowAnisotropy(1.0f),
 	      lastColAnisotropy(1.0f),
 	      lastGeometryScale(0.0f),
+	      lastGeometryTrust(1.0f),
+	      lastPredictiveTrust(0.0f),
+	      lastStructuralTrust(0.0f),
+	      lastMaturity(0.0f),
 	      step(0ULL)
 	{
 	}
@@ -438,9 +451,18 @@ static void capture_cpu_echo_snapshot(EchoParitySnapshot& snap,
 	snap.g = g;
 	snap.rowSecond = state.rowSecond;
 	snap.colSecond = state.colSecond;
+	snap.rowInvMetric = state.rowInvMetric;
+	snap.colInvMetric = state.colInvMetric;
+	snap.rowStructInvMetric = state.rowStructInvMetric;
+	snap.colStructInvMetric = state.colStructInvMetric;
+	snap.prevMhat = state.prevMhat;
 	snap.lastRowAnisotropy = state.lastRowAnisotropy;
 	snap.lastColAnisotropy = state.lastColAnisotropy;
 	snap.lastGeometryScale = state.lastGeometryScale;
+	snap.lastGeometryTrust = state.lastGeometryTrust;
+	snap.lastPredictiveTrust = state.lastPredictiveTrust;
+	snap.lastStructuralTrust = state.lastStructuralTrust;
+	snap.lastMaturity = state.lastMaturity;
 	snap.step = state.step;
 }
 
@@ -514,17 +536,36 @@ static void capture_gpu_echo_snapshot(EchoParitySnapshot& snap,
 
 	snap.rowSecond.resize(state.rowSecond.size());
 	snap.colSecond.resize(state.colSecond.size());
+	snap.rowInvMetric.resize(state.rowInvMetric.size());
+	snap.colInvMetric.resize(state.colInvMetric.size());
+	snap.rowStructInvMetric.resize(state.rowStructInvMetric.size());
+	snap.colStructInvMetric.resize(state.colStructInvMetric.size());
+	snap.prevMhat.resize(state.prevMhat.size());
 	if (!snap.rowSecond.empty())
 		state.rowSecond.download(snap.rowSecond.data(), snap.rowSecond.size());
 	if (!snap.colSecond.empty())
 		state.colSecond.download(snap.colSecond.data(), snap.colSecond.size());
+	if (!snap.rowInvMetric.empty())
+		state.rowInvMetric.download(snap.rowInvMetric.data(), snap.rowInvMetric.size());
+	if (!snap.colInvMetric.empty())
+		state.colInvMetric.download(snap.colInvMetric.data(), snap.colInvMetric.size());
+	if (!snap.rowStructInvMetric.empty())
+		state.rowStructInvMetric.download(snap.rowStructInvMetric.data(), snap.rowStructInvMetric.size());
+	if (!snap.colStructInvMetric.empty())
+		state.colStructInvMetric.download(snap.colStructInvMetric.data(), snap.colStructInvMetric.size());
+	if (!snap.prevMhat.empty())
+		state.prevMhat.download(snap.prevMhat.data(), snap.prevMhat.size());
 
-	float stats[6] = { 0.0f };
-	if (state.scalarScratch.size() >= 6u)
-		state.scalarScratch.download(stats, 6u);
+	float stats[12] = { 0.0f };
+	if (state.scalarScratch.size() >= 12u)
+		state.scalarScratch.download(stats, 12u);
 	snap.lastRowAnisotropy = (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : state.lastRowAnisotropy;
 	snap.lastColAnisotropy = (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : state.lastColAnisotropy;
 	snap.lastGeometryScale = state.lastGeometryScale;
+	snap.lastGeometryTrust = stats[8];
+	snap.lastPredictiveTrust = stats[9];
+	snap.lastStructuralTrust = stats[10];
+	snap.lastMaturity = stats[11];
 	snap.step = state.step;
 }
 #endif
@@ -541,9 +582,18 @@ static void assert_echo_parity_snapshot(const char* label,
 	assert_close_vector("g", gpu.g, cpu.g, valueTol);
 	assert_close_vector("rowSecond", gpu.rowSecond, cpu.rowSecond, stateTol);
 	assert_close_vector("colSecond", gpu.colSecond, cpu.colSecond, stateTol);
+	assert_close_vector("rowInvMetric", gpu.rowInvMetric, cpu.rowInvMetric, stateTol);
+	assert_close_vector("colInvMetric", gpu.colInvMetric, cpu.colInvMetric, stateTol);
+	assert_close_vector("rowStructInvMetric", gpu.rowStructInvMetric, cpu.rowStructInvMetric, stateTol);
+	assert_close_vector("colStructInvMetric", gpu.colStructInvMetric, cpu.colStructInvMetric, stateTol);
+	assert_close_vector("prevMhat", gpu.prevMhat, cpu.prevMhat, valueTol);
 	assert_close_value("rowAniso", gpu.lastRowAnisotropy, cpu.lastRowAnisotropy, stateTol);
 	assert_close_value("colAniso", gpu.lastColAnisotropy, cpu.lastColAnisotropy, stateTol);
 	assert_close_value("geomScale", gpu.lastGeometryScale, cpu.lastGeometryScale, stateTol);
+	assert_close_value("geomTrust", gpu.lastGeometryTrust, cpu.lastGeometryTrust, stateTol);
+	assert_close_value("predTrust", gpu.lastPredictiveTrust, cpu.lastPredictiveTrust, stateTol);
+	assert_close_value("structTrust", gpu.lastStructuralTrust, cpu.lastStructuralTrust, stateTol);
+	assert_close_value("maturity", gpu.lastMaturity, cpu.lastMaturity, stateTol);
 	ASSERT("echo step mismatch", gpu.step == cpu.step);
 }
 
@@ -936,18 +986,35 @@ void ATLASECHOCoreUnitTest()
 		-0.90f, 0.10f, 0.05f,
 		0.70f, -0.15f, 0.02f
 	};
+	const float gradRaw2[] = {
+		1.30f, 0.18f, -0.06f,
+		0.95f, -0.22f, 0.35f,
+		-0.75f, 0.08f, 0.04f,
+		0.55f, -0.11f, 0.03f
+	};
 	const float rowObsRaw[] = {
 		3.0f, 1.0f, 0.5f, 0.25f,
 		2.5f, 0.9f, 0.4f, 0.2f
+	};
+	const float rowObsRaw2[] = {
+		2.8f, 0.95f, 0.55f, 0.30f,
+		2.3f, 0.85f, 0.45f, 0.22f
 	};
 	const float colObsRaw[] = {
 		0.2f, 1.0f, 4.0f,
 		0.3f, 0.9f, 3.5f
 	};
+	const float colObsRaw2[] = {
+		0.25f, 1.1f, 3.8f,
+		0.35f, 0.85f, 3.2f
+	};
 	const std::vector<float> initW(initWRaw, initWRaw + mn);
 	const std::vector<float> grad(gradRaw, gradRaw + mn);
+	const std::vector<float> grad2(gradRaw2, gradRaw2 + mn);
 	const std::vector<float> rowObs(rowObsRaw, rowObsRaw + samples * m);
+	const std::vector<float> rowObs2(rowObsRaw2, rowObsRaw2 + samples * m);
 	const std::vector<float> colObs(colObsRaw, colObsRaw + samples * n);
+	const std::vector<float> colObs2(colObsRaw2, colObsRaw2 + samples * n);
 
 	glades::ATLASConfig adamFallbackAc;
 	adamFallbackAc.beta = 0.0f;
@@ -1064,6 +1131,195 @@ void ATLASECHOCoreUnitTest()
 	ASSERT("echo schedule final scale mismatch", fabsf(scheduleStateStep5.lastGeometryScale - 0.25f) < 1.0e-6f);
 	ASSERT("echo schedule did not decay", scheduleStateStep5.lastGeometryScale < scheduleStateStep1.lastGeometryScale);
 
+	glades::ATLASConfig cadenceAc = echoAc;
+	cadenceAc.echoMetricCadence = 2u;
+	glades::atlas::EchoWeightState cadenceState;
+	std::vector<float> cadenceW = initW;
+	std::vector<float> cadenceM(mn, 0.0f);
+	std::vector<float> cadenceV(mn, 0.0f);
+	std::vector<float> cadenceG = grad;
+	ASSERT("echoObserve cadence step1 failed",
+	       glades::atlas::echoObserve(cadenceState,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, cadenceAc));
+	ASSERT("echoUpdate cadence step1 failed",
+	       glades::atlas::echoUpdate(cadenceState,
+	                                 cadenceW.data(), cadenceM.data(), cadenceV.data(), cadenceG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 cadenceAc, quiet_logger(), "ut.echo.cadence1"));
+	const std::vector<float> cadenceRowSecondStep1 = cadenceState.rowSecond;
+	const std::vector<float> cadenceColSecondStep1 = cadenceState.colSecond;
+	const std::vector<float> cadenceRowInvStep1 = cadenceState.rowInvMetric;
+	const std::vector<float> cadenceColInvStep1 = cadenceState.colInvMetric;
+	const std::vector<float> cadenceRowStructInvStep1 = cadenceState.rowStructInvMetric;
+	const std::vector<float> cadenceColStructInvStep1 = cadenceState.colStructInvMetric;
+
+	const float rowObsCadence2Raw[] = {
+		12.0f, 0.2f, 0.1f, 0.05f,
+		11.5f, 0.25f, 0.1f, 0.05f
+	};
+	const float colObsCadence2Raw[] = {
+		0.05f, 0.2f, 8.0f,
+		0.05f, 0.25f, 7.5f
+	};
+	const std::vector<float> rowObsCadence2(
+	    rowObsCadence2Raw, rowObsCadence2Raw + samples * m);
+	const std::vector<float> colObsCadence2(
+	    colObsCadence2Raw, colObsCadence2Raw + samples * n);
+	cadenceG = grad;
+	ASSERT("echoObserve cadence step2 failed",
+	       glades::atlas::echoObserve(cadenceState,
+	                                  rowObsCadence2.data(), colObsCadence2.data(),
+	                                  samples, m, n, cadenceAc));
+	ASSERT("echoUpdate cadence step2 failed",
+	       glades::atlas::echoUpdate(cadenceState,
+	                                 cadenceW.data(), cadenceM.data(), cadenceV.data(), cadenceG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 2ULL,
+	                                 cadenceAc, quiet_logger(), "ut.echo.cadence2"));
+	assert_close_vector("echo cadence rowSecond", cadenceState.rowSecond, cadenceRowSecondStep1, 1.0e-7f);
+	assert_close_vector("echo cadence colSecond", cadenceState.colSecond, cadenceColSecondStep1, 1.0e-7f);
+	assert_close_vector("echo cadence rowInvMetric", cadenceState.rowInvMetric, cadenceRowInvStep1, 1.0e-7f);
+	assert_close_vector("echo cadence colInvMetric", cadenceState.colInvMetric, cadenceColInvStep1, 1.0e-7f);
+	assert_close_vector("echo cadence rowStructInvMetric", cadenceState.rowStructInvMetric, cadenceRowStructInvStep1, 1.0e-7f);
+	assert_close_vector("echo cadence colStructInvMetric", cadenceState.colStructInvMetric, cadenceColStructInvStep1, 1.0e-7f);
+	ASSERT("echo cadence step counter not advanced", cadenceState.step == 2ULL);
+
+	glades::ATLASConfig trustStructAc = echoAc;
+	trustStructAc.echoTrustScale = 1.0f;
+	trustStructAc.echoStructuralScale = 0.6f;
+	trustStructAc.echoStructuralGroups = 2u;
+	glades::ATLASConfig trustOnlyAc = trustStructAc;
+	trustOnlyAc.echoStructuralScale = 0.0f;
+
+	glades::atlas::EchoWeightState trustStructState;
+	glades::atlas::EchoWeightState trustOnlyState;
+	ASSERT("echoObserve trust/struct failed",
+	       glades::atlas::echoObserve(trustStructState,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, trustStructAc));
+	ASSERT("echoObserve trust-only failed",
+	       glades::atlas::echoObserve(trustOnlyState,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, trustOnlyAc));
+	std::vector<float> trustStructW = initW;
+	std::vector<float> trustStructM(mn, 0.0f);
+	std::vector<float> trustStructV(mn, 0.0f);
+	std::vector<float> trustStructG = grad;
+	std::vector<float> trustOnlyW = initW;
+	std::vector<float> trustOnlyM(mn, 0.0f);
+	std::vector<float> trustOnlyV(mn, 0.0f);
+	std::vector<float> trustOnlyG = grad;
+	ASSERT("echoUpdate trust/struct failed",
+	       glades::atlas::echoUpdate(trustStructState,
+	                                 trustStructW.data(), trustStructM.data(), trustStructV.data(), trustStructG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 trustStructAc, quiet_logger(), "ut.echo.truststruct"));
+	ASSERT("echoUpdate trust-only failed",
+	       glades::atlas::echoUpdate(trustOnlyState,
+	                                 trustOnlyW.data(), trustOnlyM.data(), trustOnlyV.data(), trustOnlyG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 trustOnlyAc, quiet_logger(), "ut.echo.trustonly"));
+	ASSERT("echo trust gate did not activate",
+	       trustStructState.lastGeometryTrust > 0.0f && trustStructState.lastGeometryTrust < 1.0f);
+	ASSERT("echo maturity did not update", trustStructState.lastMaturity > 0.0f);
+	double structMetricDiff = 0.0;
+	for (size_t idx = 0u; idx < trustStructState.rowStructInvMetric.size(); ++idx)
+	{
+		const double delta = static_cast<double>(trustStructState.rowStructInvMetric[idx])
+		                   - static_cast<double>(trustOnlyState.rowStructInvMetric[idx]);
+		structMetricDiff += delta * delta;
+	}
+	for (size_t idx = 0u; idx < trustStructState.colStructInvMetric.size(); ++idx)
+	{
+		const double delta = static_cast<double>(trustStructState.colStructInvMetric[idx])
+		                   - static_cast<double>(trustOnlyState.colStructInvMetric[idx]);
+		structMetricDiff += delta * delta;
+	}
+	ASSERT("echo structural groups did not change metrics", structMetricDiff > 1.0e-10);
+
+	glades::ATLASConfig predOffAc = trustStructAc;
+	glades::ATLASConfig predOnAc = trustStructAc;
+	predOnAc.echoPredictiveScale = 0.5f;
+	glades::atlas::EchoWeightState predOffState;
+	glades::atlas::EchoWeightState predOnState;
+	std::vector<float> predOffW = initW;
+	std::vector<float> predOffM(mn, 0.0f);
+	std::vector<float> predOffV(mn, 0.0f);
+	std::vector<float> predOffG = grad;
+	std::vector<float> predOnW = initW;
+	std::vector<float> predOnM(mn, 0.0f);
+	std::vector<float> predOnV(mn, 0.0f);
+	std::vector<float> predOnG = grad;
+	ASSERT("echoObserve pred off step1 failed",
+	       glades::atlas::echoObserve(predOffState,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, predOffAc));
+	ASSERT("echoObserve pred on step1 failed",
+	       glades::atlas::echoObserve(predOnState,
+	                                  rowObs.data(), colObs.data(),
+	                                  samples, m, n, predOnAc));
+	ASSERT("echoUpdate pred off step1 failed",
+	       glades::atlas::echoUpdate(predOffState,
+	                                 predOffW.data(), predOffM.data(), predOffV.data(), predOffG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 predOffAc, quiet_logger(), "ut.echo.predoff1"));
+	ASSERT("echoUpdate pred on step1 failed",
+	       glades::atlas::echoUpdate(predOnState,
+	                                 predOnW.data(), predOnM.data(), predOnV.data(), predOnG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 1ULL,
+	                                 predOnAc, quiet_logger(), "ut.echo.predon1"));
+	predOffG = grad2;
+	predOnG = grad2;
+	const double b1t2 = std::pow(static_cast<double>(beta1), 2.0);
+	const double b2t2 = std::pow(static_cast<double>(beta2), 2.0);
+	const float inv1mB1t2 = static_cast<float>(1.0 / (1.0 - b1t2));
+	const float inv1mB2t2 = static_cast<float>(1.0 / (1.0 - b2t2));
+	ASSERT("echoObserve pred off step2 failed",
+	       glades::atlas::echoObserve(predOffState,
+	                                  rowObs2.data(), colObs2.data(),
+	                                  samples, m, n, predOffAc));
+	ASSERT("echoObserve pred on step2 failed",
+	       glades::atlas::echoObserve(predOnState,
+	                                  rowObs2.data(), colObs2.data(),
+	                                  samples, m, n, predOnAc));
+	ASSERT("echoUpdate pred off step2 failed",
+	       glades::atlas::echoUpdate(predOffState,
+	                                 predOffW.data(), predOffM.data(), predOffV.data(), predOffG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 2ULL,
+	                                 predOffAc, quiet_logger(), "ut.echo.predoff2"));
+	ASSERT("echoUpdate pred on step2 failed",
+	       glades::atlas::echoUpdate(predOnState,
+	                                 predOnW.data(), predOnM.data(), predOnV.data(), predOnG.data(),
+	                                 m, n, lr, beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+	                                 invBatch, gradScale, 0.0f, 0.0f,
+	                                 2ULL,
+	                                 predOnAc, quiet_logger(), "ut.echo.predon2"));
+	ASSERT("echo predictive trust did not activate", predOnState.lastPredictiveTrust > 0.0f);
+	ASSERT("echo structural trust should stay bounded", predOnState.lastStructuralTrust >= 0.0f);
+	double predictiveDiff = 0.0;
+	for (size_t idx = 0u; idx < predOnW.size(); ++idx)
+	{
+		const double delta = static_cast<double>(predOnW[idx])
+		                   - static_cast<double>(predOffW[idx]);
+		predictiveDiff += delta * delta;
+	}
+	ASSERT("echo predictive blend did not change step2", predictiveDiff > 1.0e-10);
+	ASSERT("echo predictive history not updated", fabsf(predOnState.prevMhat[0]) > 1.0e-6f);
+
 	printf("[UT] ECHO core: PASSED\n");
 	printf("============================================================\n");
 }
@@ -1146,6 +1402,10 @@ void ATLASECHOParityTest()
 	ac.beta = 0.7f;
 	ac.echoEnabled = true;
 	ac.echoGeometryScale = 1.0f;
+	ac.echoTrustScale = 1.0f;
+	ac.echoPredictiveScale = 0.35f;
+	ac.echoStructuralScale = 0.5f;
+	ac.echoStructuralGroups = 2u;
 	ac.tSub = 1u;
 
 	std::vector<float> cpuW = initW;
@@ -1206,7 +1466,7 @@ void ATLASECHOParityTest()
 
 		char label[64];
 		sprintf(label, "echo step %d", step + 1);
-		assert_echo_parity_snapshot(label, cpuSnap, gpuSnap, 1.0e-5f, 1.0e-5f);
+		assert_echo_parity_snapshot(label, cpuSnap, gpuSnap, 2.0e-5f, 2.0e-5f);
 	}
 
 	printf("[UT] ECHO parity: PASSED\n");

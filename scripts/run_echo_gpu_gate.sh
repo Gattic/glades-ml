@@ -13,7 +13,12 @@ SKIP_BUILD=0
 ECHO_GEOMETRY_SCALE=1.0
 ECHO_FINAL_GEOMETRY_SCALE=1.0
 ECHO_DECAY_STEPS=0
+ECHO_CADENCE=1
 ECHO_SCOPE=late-head
+ECHO_TRUST_SCALE=0.0
+ECHO_PREDICTIVE_SCALE=0.0
+ECHO_STRUCTURAL_SCALE=0.0
+ECHO_STRUCTURAL_GROUPS=1
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR_DEFAULT="$ROOT_DIR/artifacts/echo_gpu_gate_${TIMESTAMP}"
 OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
@@ -36,7 +41,12 @@ Options:
   --echo-final-geometry-scale X
                               Final ECHO geometry strength after linear decay (default: 1.0)
   --echo-decay-steps N        Optimizer steps for linear ECHO geometry decay (default: 0)
+  --echo-cadence N           Optimizer steps between ECHO metric refreshes (default: 1)
   --echo-scope NAME           ECHO scope: all|large-only|late-head|late-head-large (default: late-head)
+  --echo-trust-scale X        ECHO trust-gate strength (default: 0.0)
+  --echo-predictive-scale X   ECHO bounded predictive blend strength (default: 0.0)
+  --echo-structural-scale X   ECHO grouped structural factor strength (default: 0.0)
+  --echo-structural-groups N  ECHO contiguous row/col group count (default: 1)
   --out-dir PATH              Output directory (default: $OUT_DIR_DEFAULT)
   --skip-build                Skip build + unit test verification steps
   --acceptance                Also run the 10-repeat acceptance pass
@@ -54,20 +64,40 @@ while [[ $# -gt 0 ]]; do
       REPEATS="$2"
       shift 2
       ;;
-    --echo-geometry-scale)
+    --echo-geometry-scale|--atlas-echo-geometry-scale)
       ECHO_GEOMETRY_SCALE="$2"
       shift 2
       ;;
-    --echo-final-geometry-scale)
+    --echo-final-geometry-scale|--atlas-echo-final-geometry-scale)
       ECHO_FINAL_GEOMETRY_SCALE="$2"
       shift 2
       ;;
-    --echo-decay-steps)
+    --echo-decay-steps|--atlas-echo-decay-steps)
       ECHO_DECAY_STEPS="$2"
       shift 2
       ;;
-    --echo-scope)
+    --echo-cadence|--atlas-echo-cadence)
+      ECHO_CADENCE="$2"
+      shift 2
+      ;;
+    --echo-scope|--atlas-echo-scope)
       ECHO_SCOPE="$2"
+      shift 2
+      ;;
+    --echo-trust-scale|--atlas-echo-trust-scale)
+      ECHO_TRUST_SCALE="$2"
+      shift 2
+      ;;
+    --echo-predictive-scale|--atlas-echo-predictive-scale)
+      ECHO_PREDICTIVE_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-scale|--atlas-echo-structural-scale)
+      ECHO_STRUCTURAL_SCALE="$2"
+      shift 2
+      ;;
+    --echo-structural-groups|--atlas-echo-structural-groups)
+      ECHO_STRUCTURAL_GROUPS="$2"
       shift 2
       ;;
     --out-dir)
@@ -95,6 +125,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "$OUT_DIR/raw"
+
+ECHO_ARGS=(
+  --atlas-echo-geometry-scale "$ECHO_GEOMETRY_SCALE"
+  --atlas-echo-final-geometry-scale "$ECHO_FINAL_GEOMETRY_SCALE"
+  --atlas-echo-decay-steps "$ECHO_DECAY_STEPS"
+  --atlas-echo-cadence "$ECHO_CADENCE"
+  --atlas-echo-scope "$ECHO_SCOPE"
+  --atlas-echo-trust-scale "$ECHO_TRUST_SCALE"
+  --atlas-echo-predictive-scale "$ECHO_PREDICTIVE_SCALE"
+  --atlas-echo-structural-scale "$ECHO_STRUCTURAL_SCALE"
+  --atlas-echo-structural-groups "$ECHO_STRUCTURAL_GROUPS"
+)
 
 SUMMARY_TSV="$OUT_DIR/epoch_sweep_summary.tsv"
 ACCEPT_TSV="$OUT_DIR/acceptance_summary.tsv"
@@ -204,10 +246,7 @@ run_capture 06_smoke_echo_gpu \
   --token-epochs 1 \
   --repeats 1 \
   --variant echo \
-  --atlas-echo-geometry-scale "$ECHO_GEOMETRY_SCALE" \
-  --atlas-echo-final-geometry-scale "$ECHO_FINAL_GEOMETRY_SCALE" \
-  --atlas-echo-decay-steps "$ECHO_DECAY_STEPS" \
-  --atlas-echo-scope "$ECHO_SCOPE" \
+  "${ECHO_ARGS[@]}" \
   --gpu-enable 1 \
   --gpu-device "$GPU_DEVICE"
 
@@ -220,10 +259,7 @@ for benchmark in token-lm-document token-lm-corpus-large; do
     run_variant_epoch "sweep_${benchmark}_echo_e${epochs}" \
       "$benchmark" "$epochs" "echo" \
       --variant echo \
-      --atlas-echo-geometry-scale "$ECHO_GEOMETRY_SCALE" \
-      --atlas-echo-final-geometry-scale "$ECHO_FINAL_GEOMETRY_SCALE" \
-      --atlas-echo-decay-steps "$ECHO_DECAY_STEPS" \
-      --atlas-echo-scope "$ECHO_SCOPE"
+      "${ECHO_ARGS[@]}"
   done
 done
 
@@ -236,10 +272,7 @@ if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
     run_variant_accept "accept_${benchmark}_echo" \
       "$benchmark" "echo" \
       --variant echo \
-      --atlas-echo-geometry-scale "$ECHO_GEOMETRY_SCALE" \
-      --atlas-echo-final-geometry-scale "$ECHO_FINAL_GEOMETRY_SCALE" \
-      --atlas-echo-decay-steps "$ECHO_DECAY_STEPS" \
-      --atlas-echo-scope "$ECHO_SCOPE"
+      "${ECHO_ARGS[@]}"
   done
 fi
 

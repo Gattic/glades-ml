@@ -692,6 +692,11 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.atlas.echoGeometryScale", f)) { cfg.atlas.echoGeometryScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.echoGeometryScaleFinal", f)) { cfg.atlas.echoGeometryScaleFinal = f; any = true; }
 	if (parse_int(kv, "training.atlas.echoGeometryDecaySteps", i) && i >= 0) { cfg.atlas.echoGeometryDecaySteps = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.echoMetricCadence", i) && i >= 0) { cfg.atlas.echoMetricCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.echoTrustScale", f)) { cfg.atlas.echoTrustScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.echoPredictiveScale", f)) { cfg.atlas.echoPredictiveScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.echoStructuralScale", f)) { cfg.atlas.echoStructuralScale = f; any = true; }
+	if (parse_int(kv, "training.atlas.echoStructuralGroups", i) && i >= 0) { cfg.atlas.echoStructuralGroups = static_cast<unsigned int>(i); any = true; }
 	if (parse_int(kv, "training.atlas.echoScope", i) && i >= 0) { cfg.atlas.echoScope = static_cast<unsigned int>(i); any = true; }
 	if (parse_bool01(kv, "training.atlas.bimapEnabled", b)) { cfg.atlas.bimapEnabled = b; any = true; }
 	if (parse_int(kv, "training.atlas.bimapScope", i) && i >= 0) { cfg.atlas.bimapScope = static_cast<unsigned int>(i); any = true; }
@@ -1299,6 +1304,21 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.echoGeometryDecaySteps; write_kv(out, "training.atlas.echoGeometryDecaySteps", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoMetricCadence; write_kv(out, "training.atlas.echoMetricCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoTrustScale; write_kv(out, "training.atlas.echoTrustScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoPredictiveScale; write_kv(out, "training.atlas.echoPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoStructuralScale; write_kv(out, "training.atlas.echoStructuralScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.echoStructuralGroups; write_kv(out, "training.atlas.echoStructuralGroups", oss.str());
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.echoScope; write_kv(out, "training.atlas.echoScope", oss.str());
@@ -2726,6 +2746,58 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.echoGeometryDecaySteps mismatch vs requested resume config (checkpoint "
 		    << savedEchoGeometryDecaySteps << ", current " << currentCfg.atlas.echoGeometryDecaySteps << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedEchoMetricCadence = -1;
+	if (parse_int(kv, "training.atlas.echoMetricCadence", savedEchoMetricCadence) &&
+	    savedEchoMetricCadence >= 0 &&
+	    currentCfg.atlas.echoMetricCadence != static_cast<unsigned int>(savedEchoMetricCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoMetricCadence mismatch vs requested resume config (checkpoint "
+		    << savedEchoMetricCadence << ", current " << currentCfg.atlas.echoMetricCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedEchoTrustScale = 0.0f;
+	if (parse_float(kv, "training.atlas.echoTrustScale", savedEchoTrustScale) &&
+	    fabsf(currentCfg.atlas.echoTrustScale - savedEchoTrustScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoTrustScale mismatch vs requested resume config (checkpoint "
+		    << savedEchoTrustScale << ", current " << currentCfg.atlas.echoTrustScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedEchoPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.echoPredictiveScale", savedEchoPredictiveScale) &&
+	    fabsf(currentCfg.atlas.echoPredictiveScale - savedEchoPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedEchoPredictiveScale << ", current " << currentCfg.atlas.echoPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedEchoStructuralScale = 0.0f;
+	if (parse_float(kv, "training.atlas.echoStructuralScale", savedEchoStructuralScale) &&
+	    fabsf(currentCfg.atlas.echoStructuralScale - savedEchoStructuralScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoStructuralScale mismatch vs requested resume config (checkpoint "
+		    << savedEchoStructuralScale << ", current " << currentCfg.atlas.echoStructuralScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedEchoStructuralGroups = -1;
+	if (parse_int(kv, "training.atlas.echoStructuralGroups", savedEchoStructuralGroups) &&
+	    savedEchoStructuralGroups >= 0 &&
+	    currentCfg.atlas.echoStructuralGroups != static_cast<unsigned int>(savedEchoStructuralGroups))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.echoStructuralGroups mismatch vs requested resume config (checkpoint "
+		    << savedEchoStructuralGroups << ", current " << currentCfg.atlas.echoStructuralGroups << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 
