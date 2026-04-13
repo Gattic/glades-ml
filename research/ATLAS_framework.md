@@ -7405,8 +7405,193 @@ Superseding practical verdict:
   comparisons
 - keep `BiMAP-lite` as a secondary control
 - keep `BiMAP-v2` retired as a practical replacement line
+
+## April 13, 2026: `MATRA` is now fully implemented, parity-validated, and ready for the same-codebase GPU rerank
+
+I completed the first full `MATRA` implementation pass as a real optimizer line
+in the repo, not just a framework note:
+
+- CPU `MATRA` lives in `atlas_optimizer.cpp` / `atlas_optimizer.h`
+- GPU `MATRA` lives in `gpu_atlas.cu` / `gpu_atlas.h`
+- transformer dispatch, checkpoint/config plumbing, and state allocation are
+  wired through the normal transformer training path
+- unit coverage includes:
+  - `atlas-matra-core`
+  - `atlas-matra-parity`
+
+Important implementation finding:
+
+- the hard GPU parity failure was **not** ultimately a scratch-buffer issue and
+  not primarily an orthogonalizer-quality issue
+- the real step-2 drift came from the GPU decomposition of the `MATRA` update:
+  GPU was applying plain Adam first and then only the geometry / orthogonal
+  residuals, while CPU `MATRA` forms its Adam prior **after** the bounded
+  predictive transport
+- the final fix was to keep the pre-applied plain Adam backbone step separate on
+  GPU and add the missing correction from backbone Adam to the predictive
+  `MATRA` Adam prior before the geometry and orthogonal residual terms
+
+Current implementation verdict:
+
+- `MATRA` now has a checked-in CPU implementation
+- `MATRA` now has a checked-in GPU implementation
+- GPU parity now passes on real CUDA hardware
+- `scripts/run_optimizer_clean_ranking.sh` was extended to include `MATRA` in
+  the same-codebase benchmark gate, using the checked-in defaults:
+  - `matraGeometryScale=1.0`
+  - `matraOrthogonalScale=0.5`
+  - `matraPredictiveScale=0.05`
+  - `matraTrustRadius=0.50`
+  - `matraMetricCadence=1`
+  - `matraMaxAspect=1.50`
+  - `matraMinDim=8`
+  - `matraDamping=0.01`
+
+What is **not** claimed yet:
+
+- no repo verdict should rank `MATRA` against `AdamW` / `MUON-lite` / `ECHO` /
+  `BiMAP-lite` until the updated clean GPU rerank is actually run
+- as of this entry, `MATRA` is implementation-complete and test-valid, but not
+  yet performance-ranked in the research log
+
+Decision:
+
+- keep `MATRA` as a live research branch
+- do the next comparison with the same-codebase clean ranking gate, not with
+  ad-hoc single-branch runs
+- if `MATRA` fails that matched-codebase gate, treat the framework as a
+  research falsification rather than spending another loop on systems polish
+
+## April 13, 2026: clean same-codebase GPU rerank falsifies `MATRA` as a practical optimizer default
+
+I ran the updated clean ranking gate with `MATRA` included on the same checked-in
+codebase:
+
+- `artifacts/optimizer_clean_ranking_20260413-165114/acceptance_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260413-165114/epoch_sweep_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260413-165114/acceptance_rank_by_nll.tsv`
+- `artifacts/optimizer_clean_ranking_20260413-165114/epoch4_rank_by_nll.tsv`
+
+Acceptance result:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.81375 @ 0.11s`
+  - `BiMAP-lite`: `4.86184 @ 0.13s`
+  - `AdamW`: `4.87394 @ 0.10s`
+  - `ECHO`: `4.87874 @ 0.10s`
+  - `BiMAP-v2`: `4.89054 @ 0.15s`
+  - `MATRA`: `4.89311 @ 0.69s`
+- `token-lm-corpus-large`
+  - `MATRA`: `6.26683 @ 1.92s`
+  - `AdamW`: `6.29584 @ 0.18s`
+  - `ECHO`: `6.31077 @ 0.19s`
+  - `MUON-lite`: `6.31584 @ 0.20s`
+  - `BiMAP-lite`: `6.31940 @ 0.22s`
+  - `BiMAP-v2`: `6.53076 @ 0.26s`
+
+Epoch-4 result:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.53920 @ 0.22s`
+  - `ECHO`: `4.59427 @ 0.20s`
+  - `BiMAP-lite`: `4.62747 @ 0.25s`
+  - `AdamW`: `4.63484 @ 0.20s`
+  - `BiMAP-v2`: `4.70897 @ 0.31s`
+  - `MATRA`: `4.80251 @ 1.42s`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.47953 @ 0.36s`
+  - `MATRA`: `6.51687 @ 3.76s`
+  - `MUON-lite`: `6.57568 @ 0.39s`
+  - `ECHO`: `6.57945 @ 0.37s`
+  - `BiMAP-lite`: `6.61691 @ 0.44s`
+  - `BiMAP-v2`: `6.64413 @ 0.51s`
+
+Interpretation:
+
+- `MATRA` does show a real acceptance-quality signal on `token-lm-corpus-large`
+  and is the best branch there by raw acceptance `TestNLL`
+- that gain is bought at roughly a `10x` wall-clock penalty versus `AdamW`, so
+  it is not a practical optimizer recommendation
+- on `token-lm-document`, `MATRA` is dominated on both speed and quality by the
+  existing live branches
+- `MATRA` therefore failed the practical matched-codebase gate that was defined
+  at the end of the implementation/parity phase
+
+Updated `MATRA` verdict:
+
+- keep `MATRA` as a scientifically interesting corpus-large quality probe
+- do **not** promote `MATRA` as a repo-default optimizer
+- do **not** replace `MUON-lite` / `ECHO` / `BiMAP-lite` controls with `MATRA`
+  for normal optimizer studies
+- if `MATRA` continues, the next step must be an explicit systems or algorithmic
+  cost-reduction program with a hard matched-wall-clock gate, not further
+  conceptual expansion
+
+## April 13, 2026: the first `MATRA` systems campaign recovered most of the gap, then hit a micro-optimization plateau
+
+I ran a focused CUDA optimization loop on the checked-in `MATRA` branch using:
+
+- `artifacts/matra_nsys_20260413-171249/`
+- `artifacts/matra_gpu_gate_20260413-171528/`
+- through
+- `artifacts/matra_nsys_20260413-184311/`
+- `artifacts/matra_gpu_gate_20260413-184559/`
+
+Main systems findings:
+
+- the original `MATRA` GPU implementation was dominated by exact orthogonal-core
+  housekeeping and per-group launch overhead
+- moving the orthogonal path fully on-device and batching the small exact solves
+  cut acceptance wall clock from the original rerank result of:
+  - `token-lm-document`: `0.69s`
+  - `token-lm-corpus-large`: `1.92s`
+  down to the stable post-optimization band of about:
+  - `token-lm-document`: `0.12s`
+  - `token-lm-corpus-large`: `0.21s`
+- after that large gain, further micro-passes only shaved small amounts of
+  kernel / memcpy / synchronize overhead without moving the actual acceptance
+  frontier in a meaningful way
+
+Current trustworthy frontier from the post-optimization branch:
+
+- `artifacts/matra_gpu_gate_20260413-181005/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.87063 @ 0.12s`
+  - `token-lm-corpus-large`: `MATRA 6.25067 @ 0.21s`
+- `artifacts/matra_gpu_gate_20260413-182150/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.87351 @ 0.12s`
+  - `token-lm-corpus-large`: `MATRA 6.23707 @ 0.21s`
+
+Latest plateau confirmation:
+
+- `artifacts/matra_gpu_gate_20260413-184559/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.87413 @ 0.12s` vs `AdamW 4.87464 @ 0.10s`
+  - `token-lm-corpus-large`: `MATRA 6.27135 @ 0.21s` vs `AdamW 6.30253 @ 0.18s`
+- `artifacts/matra_nsys_20260413-184311/stats/`
+  showed that the packed batch-recording pass reduced some blocking host
+  bookkeeping on `token-lm-corpus-large`
+  - `cudaMemcpy`: `478 -> 454` calls
+  - `cudaStreamSynchronize`: `1312 -> 1238` calls
+  but the fixed async-copy surplus versus `AdamW` remained unchanged:
+  - document: `343` vs `295` `cudaMemcpyAsync` calls
+  - corpus-large: `455` vs `391` `cudaMemcpyAsync` calls
+
+Interpretation:
+
+- the optimization campaign was successful in making `MATRA` operationally
+  competitive enough to study under matched wall clock
+- `MATRA` still preserves a real quality signal on `token-lm-corpus-large`
+- the remaining gap now looks like a mixture of launch-count tax and library
+  behavior, not an obvious repo-side kernel bug
+- I would stop `MATRA` micro-optimization at this point
+
+Updated action rule:
+
+- only continue `MATRA` work if the next step is structural, for example:
+  - a dedicated geometry-only fast path
+  - a tighter fusion with the batched Adam backbone update
+  - or a new algorithmic simplification of the orthogonal branch
 ---
 
-*Document version: 1.26*
+*Document version: 1.28*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
 *Date: 2026-04-13*

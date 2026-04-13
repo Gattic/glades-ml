@@ -205,6 +205,8 @@ struct GpuTransformerWeights
 		GpuPactWeightState pactW1, pactW2;
 		GpuRacerWeightState racerWq, racerWk, racerWv, racerWo;
 		GpuRacerWeightState racerW1, racerW2;
+		GpuMatraWeightState matraWq, matraWk, matraWv, matraWo;
+		GpuMatraWeightState matraW1, matraW2;
 		GpuMuonWeightState muonWq, muonWk, muonWv, muonWo;
 		GpuMuonWeightState muonW1, muonW2;
 	};
@@ -226,6 +228,11 @@ struct GpuTransformerWeights
 	float** d_adamPrevMhat;
 	float** d_adamMetricScratch;
 	GpuEchoObserveEntry* d_echoObserveEntries;
+	GpuMatraBatchItem* d_matraBatchItems; // device scratch array of MATRA batch descriptors
+	float* d_matraStatsBatch; // device scratch array of packed MATRA scalar stats [batch, 20]
+	float** d_matraCoreBatchPtrs; // device scratch array of MATRA coreScratch pointers for batched factorization
+	float** d_matraStepBatchPtrs; // device scratch array of MATRA orthStep pointers for batched triangular solves
+	int* d_matraInfoBatch; // device scratch array of batched MATRA Cholesky status codes
 	GpuMuonBatchItem* d_muonBatchItems; // device scratch array of MUON batch descriptors
 	float** d_muonCoreBatchPtrs; // device scratch array of coreScratch pointers for batched MUON factorization
 	float** d_muonStepBatchPtrs; // device scratch array of muonStep pointers for batched MUON triangular solves
@@ -242,6 +249,7 @@ struct GpuTransformerWeights
 	int adamGroupCount;   // number of parameter groups
 	int adamMaxSize;      // largest element count across groups
 	int echoObserveCapacity; // capacity of the batched ECHO observe descriptor buffer
+	int matraCoreBatchCapacity; // capacity of the batched MATRA core pointer scratch array
 	int muonCoreBatchCapacity; // capacity of the batched MUON core pointer scratch array
 	int echoObserveEntryCount; // cached descriptor count for the current scratch shape
 	int echoObserveTotalFeatures; // total row+col features across cached observe descriptors
@@ -269,6 +277,9 @@ struct GpuTransformerWeights
 	GpuRacerWeightState racerTokE;
 	GpuRacerWeightState racerWIn;
 	GpuRacerWeightState racerWOut;
+	GpuMatraWeightState matraTokE;
+	GpuMatraWeightState matraWIn;
+	GpuMatraWeightState matraWOut;
 	GpuMuonWeightState muonTokE;
 	GpuMuonWeightState muonWIn;
 	GpuMuonWeightState muonWOut;

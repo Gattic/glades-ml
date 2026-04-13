@@ -166,6 +166,10 @@ int main(int argc, char* argv[])
 		ATLASBiMAPMicroBenchmark();
 	    else if (strcmp(argv[1], "atlas-bimap-parity") == 0)
 		ATLASBiMAPParityTest();
+	    else if (strcmp(argv[1], "atlas-matra-core") == 0)
+		ATLASMATRACoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-matra-parity") == 0)
+		ATLASMATRAParityTest();
 	    else if (strcmp(argv[1], "atlas-kron-micro") == 0)
 		ATLASKronMicroBenchmark();
 	    else if (strcmp(argv[1], "atlas-muon-micro") == 0)

@@ -725,6 +725,15 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.atlas.kronPredictiveScale", f)) { cfg.atlas.kronPredictiveScale = f; any = true; }
 	if (parse_int(kv, "training.atlas.kronFactorCadence", i) && i >= 0) { cfg.atlas.kronFactorCadence = static_cast<unsigned int>(i); any = true; }
 	if (parse_float(kv, "training.atlas.kronDamping", f)) { cfg.atlas.kronDamping = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.matraEnabled", b)) { cfg.atlas.matraEnabled = b; any = true; }
+	if (parse_float(kv, "training.atlas.matraGeometryScale", f)) { cfg.atlas.matraGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.matraOrthogonalScale", f)) { cfg.atlas.matraOrthogonalScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.matraPredictiveScale", f)) { cfg.atlas.matraPredictiveScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.matraTrustRadius", f)) { cfg.atlas.matraTrustRadius = f; any = true; }
+	if (parse_int(kv, "training.atlas.matraMetricCadence", i) && i >= 0) { cfg.atlas.matraMetricCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.matraMaxAspect", f)) { cfg.atlas.matraMaxAspect = f; any = true; }
+	if (parse_int(kv, "training.atlas.matraMinDim", i) && i >= 0) { cfg.atlas.matraMinDim = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.matraDamping", f)) { cfg.atlas.matraDamping = f; any = true; }
 	if (parse_bool01(kv, "training.atlas.muonEnabled", b)) { cfg.atlas.muonEnabled = b; any = true; }
 	if (parse_float(kv, "training.atlas.muonGeometryScale", f)) { cfg.atlas.muonGeometryScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.muonPredictiveScale", f)) { cfg.atlas.muonPredictiveScale = f; any = true; }
@@ -1391,6 +1400,31 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.kronDamping; write_kv(out, "training.atlas.kronDamping", oss.str());
+	}
+	write_kv(out, "training.atlas.matraEnabled", trainingConfig.atlas.matraEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraGeometryScale; write_kv(out, "training.atlas.matraGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraOrthogonalScale; write_kv(out, "training.atlas.matraOrthogonalScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraPredictiveScale; write_kv(out, "training.atlas.matraPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraTrustRadius; write_kv(out, "training.atlas.matraTrustRadius", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraMetricCadence; write_kv(out, "training.atlas.matraMetricCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraMaxAspect; write_kv(out, "training.atlas.matraMaxAspect", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraMinDim; write_kv(out, "training.atlas.matraMinDim", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraDamping; write_kv(out, "training.atlas.matraDamping", oss.str());
 	}
 	write_kv(out, "training.atlas.muonEnabled", trainingConfig.atlas.muonEnabled ? "1" : "0");
 	{
@@ -3060,6 +3094,96 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.kronDamping mismatch vs requested resume config (checkpoint "
 		    << savedKRONDamping << ", current " << currentCfg.atlas.kronDamping << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedMATRAEnabled = false;
+	if (parse_bool01(kv, "training.atlas.matraEnabled", savedMATRAEnabled) &&
+	    currentCfg.atlas.matraEnabled != savedMATRAEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedMATRAEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.matraEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMATRAGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.matraGeometryScale", savedMATRAGeometryScale) &&
+	    fabsf(currentCfg.atlas.matraGeometryScale - savedMATRAGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedMATRAGeometryScale << ", current " << currentCfg.atlas.matraGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMATRAOrthogonalScale = 0.0f;
+	if (parse_float(kv, "training.atlas.matraOrthogonalScale", savedMATRAOrthogonalScale) &&
+	    fabsf(currentCfg.atlas.matraOrthogonalScale - savedMATRAOrthogonalScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraOrthogonalScale mismatch vs requested resume config (checkpoint "
+		    << savedMATRAOrthogonalScale << ", current " << currentCfg.atlas.matraOrthogonalScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMATRAPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.matraPredictiveScale", savedMATRAPredictiveScale) &&
+	    fabsf(currentCfg.atlas.matraPredictiveScale - savedMATRAPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedMATRAPredictiveScale << ", current " << currentCfg.atlas.matraPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMATRATrustRadius = 0.0f;
+	if (parse_float(kv, "training.atlas.matraTrustRadius", savedMATRATrustRadius) &&
+	    fabsf(currentCfg.atlas.matraTrustRadius - savedMATRATrustRadius) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraTrustRadius mismatch vs requested resume config (checkpoint "
+		    << savedMATRATrustRadius << ", current " << currentCfg.atlas.matraTrustRadius << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedMATRAMetricCadence = 0;
+	if (parse_int(kv, "training.atlas.matraMetricCadence", savedMATRAMetricCadence) &&
+	    currentCfg.atlas.matraMetricCadence != static_cast<unsigned int>(savedMATRAMetricCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraMetricCadence mismatch vs requested resume config (checkpoint "
+		    << savedMATRAMetricCadence << ", current " << currentCfg.atlas.matraMetricCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMATRAMaxAspect = 0.0f;
+	if (parse_float(kv, "training.atlas.matraMaxAspect", savedMATRAMaxAspect) &&
+	    fabsf(currentCfg.atlas.matraMaxAspect - savedMATRAMaxAspect) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraMaxAspect mismatch vs requested resume config (checkpoint "
+		    << savedMATRAMaxAspect << ", current " << currentCfg.atlas.matraMaxAspect << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedMATRAMinDim = 0;
+	if (parse_int(kv, "training.atlas.matraMinDim", savedMATRAMinDim) &&
+	    currentCfg.atlas.matraMinDim != static_cast<unsigned int>(savedMATRAMinDim))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraMinDim mismatch vs requested resume config (checkpoint "
+		    << savedMATRAMinDim << ", current " << currentCfg.atlas.matraMinDim << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedMATRADamping = 0.0f;
+	if (parse_float(kv, "training.atlas.matraDamping", savedMATRADamping) &&
+	    fabsf(currentCfg.atlas.matraDamping - savedMATRADamping) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraDamping mismatch vs requested resume config (checkpoint "
+		    << savedMATRADamping << ", current " << currentCfg.atlas.matraDamping << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

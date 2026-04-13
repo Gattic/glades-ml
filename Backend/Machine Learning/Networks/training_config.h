@@ -990,6 +990,42 @@ struct ATLASConfig
 	// inverse-square-root factors from the EMA covariance blocks.
 	float kronDamping;
 
+	// Enable MATRA: Manifold-Admissible Trust-Region Adam. MATRA keeps the
+	// exact AdamW backbone, blends in a cheap two-sided matrix-geometry
+	// candidate on anisotropic blocks, and optionally adds a trusted
+	// orthogonal matrix residual on eligible shapes.
+	bool matraEnabled;
+
+	// Maximum trust weight assigned to MATRA's two-sided geometry candidate.
+	// 0 reduces MATRA to the Adam-style backbone (up to orthogonal residuals).
+	float matraGeometryScale;
+
+	// Maximum trust weight assigned to MATRA's orthogonal matrix candidate.
+	// 0 disables the orthogonal branch and leaves only the geometry residual.
+	float matraOrthogonalScale;
+
+	// Strength of the bounded one-step predictive transport blended into the
+	// first-moment signal before forming MATRA's candidates.
+	float matraPredictiveScale;
+
+	// Maximum total structured-update budget. MATRA constrains the sum of its
+	// geometry and orthogonal trust weights to this value on every block.
+	float matraTrustRadius;
+
+	// Number of optimizer steps between MATRA row/column second-moment refreshes.
+	unsigned int matraMetricCadence;
+
+	// Only allow MATRA's orthogonal branch on matrix blocks whose aspect ratio
+	// max(m, n) / min(m, n) does not exceed this limit.
+	float matraMaxAspect;
+
+	// Minimum block side length required before MATRA's orthogonal branch can engage.
+	unsigned int matraMinDim;
+
+	// Additive floor used when inverting the small Gram matrix inside MATRA's
+	// orthogonal candidate.
+	float matraDamping;
+
 	// Enable MUON-lite: selective orthogonalized-momentum updates on eligible
 	// matrix blocks with exact AdamW fallback on all other parameters.
 	bool muonEnabled;
@@ -1311,6 +1347,15 @@ struct ATLASConfig
 	      kronPredictiveScale(0.05f),
 	      kronFactorCadence(8u),
 	      kronDamping(0.10f),
+	      matraEnabled(false),
+	      matraGeometryScale(1.0f),
+	      matraOrthogonalScale(0.5f),
+	      matraPredictiveScale(0.05f),
+	      matraTrustRadius(0.50f),
+	      matraMetricCadence(1u),
+	      matraMaxAspect(1.50f),
+	      matraMinDim(8u),
+	      matraDamping(0.01f),
 	      muonEnabled(false),
 	      muonGeometryScale(1.0f),
 	      muonPredictiveScale(0.05f),

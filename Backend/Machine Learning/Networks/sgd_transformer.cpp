@@ -105,6 +105,19 @@ static bool muon_matrix_eligible(const glades::ATLASConfig& ac,
 	return aspect <= std::max(1.0f, ac.muonMaxAspect);
 }
 
+static bool matra_batch_eligible(const glades::ATLASConfig& ac,
+                                 unsigned int rows,
+                                 unsigned int cols)
+{
+	if (rows == 0u || cols == 0u)
+		return false;
+	const float geomScale = std::max(0.0f, ac.matraGeometryScale);
+	const float orthScale = std::max(0.0f, ac.matraOrthogonalScale);
+	if (geomScale <= 0.0f && orthScale <= 0.0f)
+		return false;
+	return true;
+}
+
 static bool echo_scope_large_matrix(unsigned int rows, unsigned int cols)
 {
 	return static_cast<unsigned long long>(rows) * static_cast<unsigned long long>(cols) >= 4096ULL;
@@ -204,6 +217,87 @@ struct MuonBatchGroup
 	{
 	}
 };
+
+struct MatraBatchGroup
+{
+	unsigned int rows;
+	unsigned int cols;
+	std::vector<glades::gpu::GpuMatraBatchItem> items;
+
+	MatraBatchGroup()
+	    : rows(0u), cols(0u), items()
+	{
+	}
+};
+
+static bool queue_or_run_matra_gpu(std::vector<MatraBatchGroup>& groups,
+                                   glades::gpu::GpuTransformerWeights* gpuTransformerWeights,
+                                   glades::gpu::GpuMatraWeightState& state,
+                                   glades::gpu::GpuBuffer<float>& param,
+                                   glades::gpu::GpuBuffer<float>& grad,
+                                   glades::gpu::GpuBuffer<float>& m1,
+                                   glades::gpu::GpuBuffer<float>& v2,
+                                   unsigned int rows,
+                                   unsigned int cols,
+                                   float lr,
+                                   float invBatch,
+                                   float gradScale,
+                                   float inv1mB1t,
+                                   float inv1mB2t,
+                                   float adamEps,
+                                   const glades::ATLASConfig& ac,
+                                   shmea::GLogger* logger,
+                                   const char* tag)
+{
+	if (param.size() == 0u)
+		return true;
+
+	const bool batchEligible =
+	    matra_batch_eligible(ac, rows, cols)
+	    && (std::min(rows, cols) <= 64u)
+	    && (gpuTransformerWeights != NULL)
+	    && (gpuTransformerWeights->d_matraBatchItems != NULL)
+	    && (gpuTransformerWeights->d_matraCoreBatchPtrs != NULL)
+	    && (gpuTransformerWeights->d_matraStepBatchPtrs != NULL)
+	    && (gpuTransformerWeights->d_matraInfoBatch != NULL)
+	    && (gpuTransformerWeights->matraCoreBatchCapacity > 0);
+	if (!batchEligible)
+	{
+		return glades::gpu::matra_gpu_update(state, param.data(), grad.data(),
+		                                     m1.data(), v2.data(),
+		                                     rows, cols, lr,
+		                                     invBatch, gradScale,
+		                                     inv1mB1t, inv1mB2t, adamEps,
+		                                     ac, logger, tag);
+	}
+
+	glades::gpu::GpuMatraBatchItem item;
+	item.state = &state;
+	item.d_W = param.data();
+	item.d_gW = grad.data();
+	item.d_m = m1.data();
+	item.d_v = v2.data();
+	item.m = rows;
+	item.n = cols;
+	item.lr = lr;
+	item.tag = tag;
+
+	for (size_t gi = 0; gi < groups.size(); ++gi)
+	{
+		if (groups[gi].rows == rows && groups[gi].cols == cols)
+		{
+			groups[gi].items.push_back(item);
+			return true;
+		}
+	}
+
+	MatraBatchGroup group;
+	group.rows = rows;
+	group.cols = cols;
+	group.items.push_back(item);
+	groups.push_back(group);
+	return true;
+}
 
 static bool queue_or_run_muon_gpu(std::vector<MuonBatchGroup>& groups,
                                   glades::gpu::GpuTransformerWeights* gpuTransformerWeights,
@@ -1939,6 +2033,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const bool pactEnabled = ac.pactEnabled;
 				const bool racerEnabled = ac.racerEnabled;
 				const bool kronEnabled = ac.kronEnabled;
+				const bool matraEnabled = ac.matraEnabled;
 				const bool muonEnabled = ac.muonEnabled;
 				const bool auroraAdamwBackbone = ac.auroraEnabled && ac.auroraAdamwBackbone;
 				const float beta1 = net.trainingConfig.optimizer.adamBeta1;
@@ -4547,6 +4642,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (matraEnabled)
+					{
+						if (!atlas::matraUpdate(tt.matraTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+						                        tt.vocabSize, dmTT, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.tokE"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MATRA tokE update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (muonEnabled)
 					{
 						if (!atlas::muonUpdate(tt.muonTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
@@ -4747,6 +4859,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						{
 							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 								"SGDHelper_Transformer: KRON WIn update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (matraEnabled)
+					{
+						if (!atlas::matraUpdate(tt.matraWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+						                        dmTT, tt.inputSize, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.WIn"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MATRA WIn update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
 						}
@@ -5079,6 +5208,43 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
+					else if (matraEnabled)
+					{
+						if (!atlas::matraUpdate(b.matraWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                        dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wq")
+						    || !atlas::matraUpdate(b.matraWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wk")
+						    || !atlas::matraUpdate(b.matraWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                           dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wv")
+						    || !atlas::matraUpdate(b.matraWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                           dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.Wo")
+						    || !atlas::matraUpdate(b.matraW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                           ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W1")
+						    || !atlas::matraUpdate(b.matraW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                           dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                           invBatch, gradScale, wd1, wd2, ac, net.getLogger(), "tr.W2"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MATRA block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					else if (muonEnabled)
 					{
 						if (!atlas::muonUpdate(b.muonWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
@@ -5221,6 +5387,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
 					else if (kronEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (matraEnabled)
 					{
 						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5374,6 +5547,23 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						{
 							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 								"SGDHelper_Transformer: KRON WOut update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (matraEnabled)
+					{
+						if (!atlas::matraUpdate(tt.matraWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+						                        outSize, dmTT, lr,
+						                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                        invBatch, gradScale, wd1, wd2,
+						                        ac, net.getLogger(), "tr.WOut"))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: MATRA WOut update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
 						}
@@ -8270,6 +8460,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	    && !trainingConfig.atlas.bimapEnabled
 	    && !trainingConfig.atlas.pactEnabled
 	    && !trainingConfig.atlas.racerEnabled
+	    && !trainingConfig.atlas.matraEnabled
 	    && !trainingConfig.atlas.muonEnabled;
 	std::vector<glades::gpu::GpuEchoObserveEntry> echoObserveEntries;
 	echoObserveEntries.reserve(static_cast<size_t>(2u + 6u * nLayers));
@@ -9306,13 +9497,14 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			const bool gpuUseBiMAP = gpuUseAtlas && trainingConfig.atlas.bimapEnabled;
 			const bool gpuUsePact = gpuUseAtlas && trainingConfig.atlas.pactEnabled;
 			const bool gpuUseRacer = gpuUseAtlas && trainingConfig.atlas.racerEnabled;
+			const bool gpuUseMatra = gpuUseAtlas && trainingConfig.atlas.matraEnabled;
 			const bool gpuUseMuon = gpuUseAtlas && trainingConfig.atlas.muonEnabled;
 			const bool gpuFuseEcho =
-			    gpuUseEcho && !gpuUseGeode && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMuon;
+			    gpuUseEcho && !gpuUseGeode && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMatra && !gpuUseMuon;
 			const bool gpuUseGroupAdam =
 			    (!gpuUseAtlas) && trainingConfig.optimizer.adamGroupwiseEnabled;
 
-			if (gpuUseAtlas && !gpuUseGeode && !gpuUseEcho && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMuon)
+			if (gpuUseAtlas && !gpuUseGeode && !gpuUseEcho && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMatra && !gpuUseMuon)
 			{
 			// === GPU ATLAS optimizer ===
 			// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
@@ -10299,6 +10491,177 @@ if (ad_.valid) { \
 					{
 						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 						    "SGDHelper_TRANSFORMER: GPU RACER-lite residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+				if (gpuUseMatra)
+				{
+					bool gpuMatraError = false;
+					std::vector<MatraBatchGroup> matraSmallBatchGroups;
+
+					if (tokenLM)
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups,
+						                               gpuTransformerWeights,
+						                               gpuTransformerWeights->matraTokE,
+						                               gpuTransformerWeights->tokE,
+						                               gpuTransformerWeights->gTokE,
+						                               gpuTransformerWeights->vTokE,
+						                               gpuTransformerWeights->v2TokE,
+						                               vocabSize, dModel, lr0,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.tokE"))
+							gpuMatraError = true;
+					}
+					else
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups,
+						                               gpuTransformerWeights,
+						                               gpuTransformerWeights->matraWIn,
+						                               gpuTransformerWeights->WIn,
+						                               gpuTransformerWeights->gWIn,
+						                               gpuTransformerWeights->vWIn,
+						                               gpuTransformerWeights->v2WIn,
+						                               dModel, inputSize, lr0,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.WIn"))
+							gpuMatraError = true;
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
+						                               gb.matraWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq,
+						                               dModel, dModel, lr_l,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.Wq"))
+							gpuMatraError = true;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
+						                               gb.matraWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk,
+						                               dModelKV, dModel, lr_l,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.Wk"))
+							gpuMatraError = true;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
+						                               gb.matraWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv,
+						                               dModelKV, dModel, lr_l,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.Wv"))
+							gpuMatraError = true;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
+						                               gb.matraWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo,
+						                               dModel, dModel, lr_l,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.Wo"))
+							gpuMatraError = true;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
+						                               gb.matraW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1,
+						                               ff1Width, dModel, lr_l,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.W1"))
+							gpuMatraError = true;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
+						                               gb.matraW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2,
+						                               dModel, dFF, lr_l,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.W2"))
+							gpuMatraError = true;
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO =
+						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (!gpuMatraError
+						    && !queue_or_run_matra_gpu(matraSmallBatchGroups,
+						                               gpuTransformerWeights,
+						                               gpuTransformerWeights->matraWOut,
+						                               gpuTransformerWeights->WOut,
+						                               gpuTransformerWeights->gWOut,
+						                               gpuTransformerWeights->vWOut,
+						                               gpuTransformerWeights->v2WOut,
+						                               outSize, dModel, lrO,
+						                               invBatch, gradScale,
+						                               inv1mB1t, inv1mB2t, adamEps,
+						                               ac, getLogger(), "tr.WOut"))
+							gpuMatraError = true;
+					}
+
+					if (!gpuMatraError && !matraSmallBatchGroups.empty())
+					{
+						size_t totalMatraBatchItems = 0u;
+						for (size_t gi = 0; gi < matraSmallBatchGroups.size(); ++gi)
+							totalMatraBatchItems += matraSmallBatchGroups[gi].items.size();
+
+						std::vector<gpu::GpuMatraBatchItem> matraBatchItems;
+						std::vector<int> matraBatchOffsets;
+						std::vector<int> matraBatchCounts;
+						matraBatchItems.reserve(totalMatraBatchItems);
+						matraBatchOffsets.reserve(matraSmallBatchGroups.size());
+						matraBatchCounts.reserve(matraSmallBatchGroups.size());
+
+						for (size_t gi = 0; gi < matraSmallBatchGroups.size(); ++gi)
+						{
+							MatraBatchGroup& group = matraSmallBatchGroups[gi];
+							if (group.items.empty())
+								continue;
+							matraBatchOffsets.push_back(static_cast<int>(matraBatchItems.size()));
+							matraBatchCounts.push_back(static_cast<int>(group.items.size()));
+							matraBatchItems.insert(matraBatchItems.end(),
+							                       group.items.begin(),
+							                       group.items.end());
+						}
+
+						if (!matraBatchItems.empty()
+						    && !gpu::matra_gpu_update_small_batches(
+						        matraBatchItems.data(),
+						        static_cast<int>(matraBatchItems.size()),
+						        matraBatchOffsets.data(),
+						        matraBatchCounts.data(),
+						        static_cast<int>(matraBatchOffsets.size()),
+						        gpuTransformerWeights->d_matraBatchItems,
+						        gpuTransformerWeights->d_matraStatsBatch,
+						        gpuTransformerWeights->d_matraCoreBatchPtrs,
+						        gpuTransformerWeights->d_matraStepBatchPtrs,
+						        gpuTransformerWeights->d_matraInfoBatch,
+						        gpuTransformerWeights->matraCoreBatchCapacity,
+						        invBatch, gradScale,
+						        inv1mB1t, inv1mB2t,
+						        adamEps,
+						        ac,
+						        getLogger()))
+						{
+							gpuMatraError = true;
+						}
+					}
+
+					if (gpuMatraError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						                            "SGDHelper_TRANSFORMER: GPU MATRA residual update failed");
 						storeRunningFlag(false);
 					}
 				}

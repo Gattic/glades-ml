@@ -593,6 +593,76 @@ struct KronWeightState
 	}
 };
 
+// Manifold-Admissible Trust-Region Adam state.
+//
+// MATRA keeps Adam-style first/second moments outside this state, tracks
+// lightweight row/column anisotropy EMAs, and forms a convex blend between
+// the Adam backbone, a two-sided geometry candidate, and an optional
+// MUON-style orthogonal candidate on eligible matrix blocks.
+struct MatraWeightState
+{
+	unsigned int m;
+	unsigned int n;
+	std::vector<float> rowSecond;   // [m] EMA row second moments from raw gradients
+	std::vector<float> colSecond;   // [n] EMA column second moments from raw gradients
+	std::vector<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	std::vector<float> adamStep;    // [m * n] Adam backbone step
+	std::vector<float> geomStep;    // [m * n] two-sided geometry candidate
+	std::vector<float> orthStep;    // [m * n] orthogonal candidate
+	std::vector<float> coreScratch; // [min(m,n) * min(m,n)] Gram / inverse-sqrt core
+	float lastPredictiveTrust;
+	float lastGeometryTrust;
+	float lastOrthTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+
+	MatraWeightState()
+	    : m(0u), n(0u),
+	      lastPredictiveTrust(0.0f),
+	      lastGeometryTrust(0.0f),
+	      lastOrthTrust(0.0f),
+	      lastRowAnisotropy(1.0f),
+	      lastColAnisotropy(1.0f),
+	      lastAspect(1.0f),
+	      lastSignalScale(0.0f),
+	      lastOrthError(0.0f),
+	      lastEligible(false),
+	      step(0ULL),
+	      initialized(false)
+	{
+	}
+
+	void reset()
+	{
+		m = 0u;
+		n = 0u;
+		rowSecond.clear();
+		colSecond.clear();
+		prevMhat.clear();
+		adamStep.clear();
+		geomStep.clear();
+		orthStep.clear();
+		coreScratch.clear();
+		lastPredictiveTrust = 0.0f;
+		lastGeometryTrust = 0.0f;
+		lastOrthTrust = 0.0f;
+		lastRowAnisotropy = 1.0f;
+		lastColAnisotropy = 1.0f;
+		lastAspect = 1.0f;
+		lastSignalScale = 0.0f;
+		lastOrthError = 0.0f;
+		lastEligible = false;
+		step = 0ULL;
+		initialized = false;
+	}
+};
+
 // Selective orthogonalized-momentum state.
 //
 // MUON-lite keeps Adam-style first/second moments outside this state and only
@@ -659,6 +729,7 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 // Initialize BiMAP-lite state for a weight matrix of dimensions [m x n].
 void initBiMAPWeightState(BiMAPWeightState& state, unsigned int m, unsigned int n);
 void initKronWeightState(KronWeightState& state, unsigned int m, unsigned int n);
+void initMatraWeightState(MatraWeightState& state, unsigned int m, unsigned int n);
 void initMuonWeightState(MuonWeightState& state, unsigned int m, unsigned int n);
 
 // Refresh subspace basis U via randomized power iteration with EMA blending.
@@ -797,6 +868,19 @@ bool kronUpdate(KronWeightState& state,
                 const ATLASConfig& ac,
                 shmea::GLogger* logger = 0,
                 const char* tag = 0);
+
+bool matraUpdate(MatraWeightState& state,
+                 float* W, float* m1, float* v2, float* gW,
+                 unsigned int m, unsigned int n,
+                 float lr,
+                 float beta1, float beta2,
+                 float inv1mB1t, float inv1mB2t,
+                 float eps,
+                 float invBatch, float gradScale,
+                 float wd1, float wd2,
+                 const ATLASConfig& ac,
+                 shmea::GLogger* logger = 0,
+                 const char* tag = 0);
 
 bool muonUpdate(MuonWeightState& state,
                 float* W, float* m1, float* v2, float* gW,

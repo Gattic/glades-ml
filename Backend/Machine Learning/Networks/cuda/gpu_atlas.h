@@ -389,6 +389,93 @@ struct GpuRacerWeightState
 	}
 };
 
+// Lightweight GPU MATRA state.
+//
+// MATRA keeps AdamW as the exact backbone, tracks cheap row/column anisotropy
+// statistics on device, builds a two-sided geometry candidate from those
+// statistics, and optionally forms an exact MUON-style orthogonal candidate on
+// trusted matrix blocks.
+struct GpuMatraWeightState
+{
+	unsigned int m;
+	unsigned int n;
+
+	GpuBuffer<float> rowSecond;   // [m] EMA row second moments
+	GpuBuffer<float> colSecond;   // [n] EMA column second moments
+	GpuBuffer<float> colScratch;  // [n] raw column g^2 sums for the current refresh
+	GpuBuffer<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	GpuBuffer<float> backboneStep; // [m * n] exact pre-applied Adam step on GPU
+	GpuBuffer<float> adamStep;    // [m * n] MATRA Adam prior step after predictive transport
+	GpuBuffer<float> geomStep;    // [m * n] two-sided geometry candidate
+	GpuBuffer<float> orthStep;    // [m * n] orthogonal candidate
+	GpuBuffer<float> coreScratch; // [2 * coreDim * coreDim] Gram + factor scratch
+	GpuBuffer<float> scalarScratch; // [20] means / trust / eligibility / scale / corr stats
+
+	float rowMean;
+	float colMean;
+	float lastPredictiveTrust;
+	float lastGeometryTrust;
+	float lastOrthTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+
+	GpuMatraWeightState()
+	    : m(0u), n(0u),
+	      rowMean(1.0e-12f), colMean(1.0e-12f),
+	      lastPredictiveTrust(0.0f),
+	      lastGeometryTrust(0.0f),
+	      lastOrthTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      lastAspect(1.0f),
+	      lastSignalScale(0.0f),
+	      lastOrthError(0.0f),
+	      lastEligible(false),
+	      step(0ULL), initialized(false)
+	{
+	}
+};
+
+struct GpuMatraBatchItem
+{
+	GpuMatraWeightState* state;
+	float* d_W;
+	float* d_gW;
+	float* d_m;
+	float* d_v;
+	float* d_rowSecond;
+	float* d_colSecond;
+	float* d_colScratch;
+	float* d_prevMhat;
+	float* d_backboneStep;
+	float* d_adamStep;
+	float* d_geomStep;
+	float* d_orthStep;
+	float* d_coreScratch;
+	float* d_scalarScratch;
+	unsigned int m;
+	unsigned int n;
+	unsigned int predictiveEnabled;
+	unsigned int refreshMetrics;
+	float lr;
+	const char* tag;
+
+	GpuMatraBatchItem()
+	    : state(0),
+	      d_W(0), d_gW(0), d_m(0), d_v(0),
+	      d_rowSecond(0), d_colSecond(0), d_colScratch(0),
+	      d_prevMhat(0), d_backboneStep(0), d_adamStep(0),
+	      d_geomStep(0), d_orthStep(0), d_coreScratch(0), d_scalarScratch(0),
+	      m(0u), n(0u), predictiveEnabled(0u), refreshMetrics(0u), lr(0.0f), tag(0)
+	{
+	}
+};
+
 // Lightweight GPU MUON state.
 //
 // This is the device-native MUON-lite path:
@@ -616,6 +703,44 @@ bool racer_gpu_update_lite(GpuRacerWeightState& state,
                            const glades::ATLASConfig& ac,
                            shmea::GLogger* logger = 0,
                            const char* tag = 0);
+
+// GPU MATRA residual update on top of an AdamW backbone that has already
+// updated W/m/v for the current step. This path:
+// - tracks row/column anisotropy with cheap diagonal EMAs,
+// - blends trusted geometry and orthogonal candidates under a fixed residual budget,
+// - degenerates exactly to AdamW when MATRA trust weights collapse to zero.
+bool matra_gpu_update(GpuMatraWeightState& state,
+                      float* d_W, float* d_gW,
+                      float* d_m, float* d_v,
+                      unsigned int m, unsigned int n,
+                      float lr,
+                      float invBatch, float gradScale,
+                      float inv1mB1t, float inv1mB2t,
+                      float eps,
+                      const glades::ATLASConfig& ac,
+                      shmea::GLogger* logger = 0,
+                      const char* tag = 0);
+
+// Batched MATRA update for small tall matrices with the same shape.
+// This path batches the exact small-core orthogonal solve across eligible
+// matrices while preserving the existing single-matrix fallback for all other
+// shapes.
+bool matra_gpu_update_small_batches(const GpuMatraBatchItem* items,
+                                    int itemCount,
+                                    const int* groupOffsets,
+                                    const int* groupCounts,
+                                    int groupCount,
+                                    GpuMatraBatchItem* d_batchItems,
+                                    float* d_statsBatch,
+                                    float** d_corePtrScratch,
+                                    float** d_stepPtrScratch,
+                                    int* d_infoScratch,
+                                    int corePtrCapacity,
+                                    float invBatch, float gradScale,
+                                    float inv1mB1t, float inv1mB2t,
+                                    float eps,
+                                    const glades::ATLASConfig& ac,
+                                    shmea::GLogger* logger = 0);
 
 // GPU MUON-lite residual update on top of an AdamW backbone that has already
 // updated W/m/v for the current step. This path:
@@ -864,6 +989,29 @@ struct GpuRacerWeightState
 	      promoted(false), promotedSteps(0ULL), step(0ULL), initialized(false) {}
 };
 
+struct GpuMatraWeightState
+{
+	float rowMean;
+	float colMean;
+	float lastPredictiveTrust;
+	float lastGeometryTrust;
+	float lastOrthTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+	GpuMatraWeightState()
+	    : rowMean(1.0e-12f), colMean(1.0e-12f),
+	      lastPredictiveTrust(0.0f), lastGeometryTrust(0.0f), lastOrthTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f), lastAspect(1.0f),
+	      lastSignalScale(0.0f), lastOrthError(0.0f), lastEligible(false),
+	      step(0ULL), initialized(false) {}
+};
+
 struct GpuMuonWeightState
 {
 	float lastPredictiveTrust;
@@ -959,6 +1107,21 @@ inline bool racer_gpu_update_lite(GpuRacerWeightState&, float*, float*, float*, 
                                   const glades::ATLASConfig&,
                                   shmea::GLogger* = 0,
                                   const char* = 0) { return false; }
+inline bool matra_gpu_update(GpuMatraWeightState&, float*, float*, float*, float*,
+                             unsigned int, unsigned int,
+                             float, float, float,
+                             float, float, float,
+                             const glades::ATLASConfig&,
+                             shmea::GLogger* = 0,
+                             const char* = 0) { return false; }
+inline bool matra_gpu_update_small_batches(const GpuMatraBatchItem*, int,
+                                           const int*, const int*, int,
+                                           GpuMatraBatchItem*, float*, float**, float**, int*, int,
+                                           float, float,
+                                           float, float,
+                                           float,
+                                           const glades::ATLASConfig&,
+                                           shmea::GLogger* = 0) { return false; }
 inline bool muon_gpu_update_lite(GpuMuonWeightState&, float*, float*, float*, float*,
                                  unsigned int, unsigned int,
                                  float, float, float,

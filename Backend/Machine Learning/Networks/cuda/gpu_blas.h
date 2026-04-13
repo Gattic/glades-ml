@@ -27,6 +27,15 @@ bool sgemm_rowmajor(int M, int N, int K,
                      float beta,
                      float* C, int ldc);
 
+// Exact row-major SGEMM using default cuBLAS math mode.
+// This avoids TF32 tensor-core contraction on Ampere+ for parity-sensitive paths.
+bool sgemm_rowmajor_exact(int M, int N, int K,
+                          float alpha,
+                          const float* A, int lda,
+                          const float* B, int ldb,
+                          float beta,
+                          float* C, int ldc);
+
 // Row-major SGEMV: y[M] = alpha * A[M,N] * x[N] + beta * y[M]
 // All pointers are device pointers.
 bool sgemv_rowmajor(int M, int N,
@@ -47,6 +56,13 @@ bool sgemm_rowmajor_atb(int M, int N, int K,
                           float beta,
                           float* C, int ldc);
 
+bool sgemm_rowmajor_atb_exact(int M, int N, int K,
+                              float alpha,
+                              const float* A, int lda,
+                              const float* B, int ldb,
+                              float beta,
+                              float* C, int ldc);
+
 // Row-major SGEMM with B transposed:
 // C[M,N] = alpha * A[M,K] * B^T[K,N] + beta * C[M,N]
 // where A is [M,K], B is stored as [N,K] row-major, C is [M,N].
@@ -57,6 +73,13 @@ bool sgemm_rowmajor_abt(int M, int N, int K,
                           float beta,
                           float* C, int ldc);
 
+bool sgemm_rowmajor_abt_exact(int M, int N, int K,
+                              float alpha,
+                              const float* A, int lda,
+                              const float* B, int ldb,
+                              float beta,
+                              float* C, int ldc);
+
 // Row-major right-side upper-triangular solve (in-place):
 // Solves X[M,N] * R[N,N] = alpha * B[M,N]  where R is upper triangular.
 // B is overwritten with the solution X.
@@ -64,6 +87,23 @@ bool strsm_rowmajor_right_upper(int M, int N,
                                  float alpha,
                                  const float* R, int ldr,
                                  float* B, int ldb);
+
+// Row-major left-side transpose solve (in-place):
+// Solves R^T[M,M] * X[M,N] = alpha * B[M,N] where R is upper triangular.
+// B is overwritten with the solution X.
+bool strsm_rowmajor_left_upper_transpose(int M, int N,
+                                         float alpha,
+                                         const float* R, int ldr,
+                                         float* B, int ldb);
+
+// Row-major batched left-side transpose solve (in-place):
+// R_i^T[M,M] * X_i[M,N] = alpha * B_i[M,N] for i in [0, batchCount).
+// Arrays of device pointers are themselves device-resident.
+bool strsm_rowmajor_left_upper_transpose_batched(int M, int N,
+                                                 float alpha,
+                                                 float** Rarray, int ldr,
+                                                 float** Barray, int ldb,
+                                                 int batchCount);
 
 // Row-major batched right-side upper-triangular solve (in-place):
 // X_i[M,N] * R_i[N,N] = alpha * B_i[M,N] for i in [0, batchCount).
@@ -120,6 +160,17 @@ bool sgemm_batched_pointer_atb(int M, int N, int K,
                                float** Carray, int ldc,
                                int batchCount);
 
+// Row-major batched pointer-array SGEMM with B transposed:
+// C_i[M,N] = alpha * A_i[M,K] * B_i^T[K,N] + beta * C_i[M,N]
+// where each B_i is stored as [N,K] row-major.
+bool sgemm_batched_pointer_abt(int M, int N, int K,
+                               float alpha,
+                               float** Aarray, int lda,
+                               float** Barray, int ldb,
+                               float beta,
+                               float** Carray, int ldc,
+                               int batchCount);
+
 // Row-major batched pointer-array SGEMM:
 // C_i[M,N] = alpha * A_i[M,K] * B_i[K,N] + beta * C_i[M,N]
 // Arrays of pointers are themselves device-resident.
@@ -149,6 +200,15 @@ bool sgemm_batched_pointer_atb_device_scalars(int M, int N, int K,
                                               float** Carray, int ldc,
                                               int batchCount);
 
+// Same as above, but for the ABT row-major variant with device-resident scalars.
+bool sgemm_batched_pointer_abt_device_scalars(int M, int N, int K,
+                                              const float* d_alpha,
+                                              float** Aarray, int lda,
+                                              float** Barray, int ldb,
+                                              const float* d_beta,
+                                              float** Carray, int ldc,
+                                              int batchCount);
+
 } // namespace gpu
 } // namespace glades
 
@@ -161,10 +221,15 @@ inline bool blasInit() { return false; }
 inline void blasDestroy() {}
 
 inline bool strsm_rowmajor_right_upper(int, int, float, const float*, int, float*, int) { return false; }
+inline bool strsm_rowmajor_left_upper_transpose(int, int, float, const float*, int, float*, int) { return false; }
+inline bool strsm_rowmajor_left_upper_transpose_batched(int, int, float, float**, int, float**, int, int) { return false; }
 inline bool strsm_rowmajor_right_upper_batched(int, int, float, float**, int, float**, int, int) { return false; }
 inline bool sgemm_rowmajor(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_exact(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_atb_exact(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_abt_exact(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, float, float*) { return false; }
 inline bool sgemm_batched_strided(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
 inline bool sgemm_batched_strided_abt(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
@@ -172,7 +237,9 @@ inline bool sgemm_batched_strided_atb(int, int, int, float, const float*, int, l
 inline bool sgemm_batched_pointer(int, int, int, float, float**, int, float**, int, float, float**, int, int) { return false; }
 inline bool sgemm_batched_pointer_device_scalars(int, int, int, const float*, float**, int, float**, int, const float*, float**, int, int) { return false; }
 inline bool sgemm_batched_pointer_atb(int, int, int, float, float**, int, float**, int, float, float**, int, int) { return false; }
+inline bool sgemm_batched_pointer_abt(int, int, int, float, float**, int, float**, int, float, float**, int, int) { return false; }
 inline bool sgemm_batched_pointer_atb_device_scalars(int, int, int, const float*, float**, int, float**, int, const float*, float**, int, int) { return false; }
+inline bool sgemm_batched_pointer_abt_device_scalars(int, int, int, const float*, float**, int, float**, int, const float*, float**, int, int) { return false; }
 
 } // namespace gpu
 } // namespace glades

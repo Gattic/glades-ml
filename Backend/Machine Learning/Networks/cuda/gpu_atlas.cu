@@ -4913,6 +4913,737 @@ __global__ void muon_lite_apply_residual_kernel(float* __restrict__ d_W,
 	}
 }
 
+__global__ void matra_finalize_budget_kernel(float* __restrict__ d_stats,
+                                             float geometryScale,
+                                             float orthScale,
+                                             float trustRadius,
+                                             float maxAspect,
+                                             unsigned int minDim,
+                                             int rows,
+                                             int cols)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0 || !d_stats || rows <= 0 || cols <= 0)
+		return;
+
+	const float rowMin = fmaxf(d_stats[2], 1.0e-12f);
+	const float rowMax = fmaxf(d_stats[3], rowMin);
+	const float colMin = fmaxf(d_stats[4], 1.0e-12f);
+	const float colMax = fmaxf(d_stats[5], colMin);
+	const float rowAniso = rowMax / rowMin;
+	const float colAniso = colMax / colMin;
+	const float rowSignal =
+	    fminf(1.0f, fmaxf(0.0f, (rowAniso - 1.0f) / (rowAniso + 1.0f)));
+	const float colSignal =
+	    fminf(1.0f, fmaxf(0.0f, (colAniso - 1.0f) / (colAniso + 1.0f)));
+	const float geometryEvidence = 0.5f * (rowSignal + colSignal);
+	const float predictiveTrust = fminf(1.0f, fmaxf(0.0f, d_stats[6]));
+	const int shortDim = (rows < cols) ? rows : cols;
+	const int longDim = (rows > cols) ? rows : cols;
+	const float aspect =
+	    static_cast<float>(longDim) / fmaxf(static_cast<float>(shortDim > 0 ? shortDim : 1), 1.0f);
+	const unsigned int eligible =
+	    (orthScale > 0.0f)
+	    && (shortDim >= static_cast<int>(minDim > 0u ? minDim : 1u))
+	    && (aspect <= fmaxf(1.0f, maxAspect))
+	    ? 1u : 0u;
+	const float budget =
+	    fminf(1.0f, fmaxf(0.0f, trustRadius) * fminf(1.0f, fmaxf(0.0f, geometryEvidence)));
+	float geometryScore =
+	    fmaxf(0.0f, geometryScale) * fminf(1.0f, fmaxf(0.0f, geometryEvidence));
+	float orthScore = 0.0f;
+	if (eligible != 0u)
+	{
+		orthScore =
+		    fmaxf(0.0f, orthScale)
+		    * fminf(1.0f, fmaxf(0.0f, geometryEvidence))
+		    * (0.25f + 0.75f * predictiveTrust);
+	}
+	const float totalScore = geometryScore + orthScore;
+	if (budget > 0.0f && totalScore > budget && totalScore > 1.0e-12f)
+	{
+		const float scale = budget / totalScore;
+		geometryScore *= scale;
+		orthScore *= scale;
+	}
+	float geomTrust = fminf(1.0f, fmaxf(0.0f, geometryScore));
+	float orthTrust = fminf(1.0f, fmaxf(0.0f, orthScore));
+	if (geomTrust + orthTrust > 1.0f)
+	{
+		const float invSum = 1.0f / fmaxf(geomTrust + orthTrust, 1.0e-12f);
+		geomTrust *= invSum;
+		orthTrust *= invSum;
+	}
+
+	d_stats[7] = geomTrust;
+	d_stats[8] = orthTrust;
+	d_stats[9] = static_cast<float>(eligible);
+	d_stats[10] = 0.0f;
+	d_stats[11] = 0.0f;
+	d_stats[12] = aspect;
+	d_stats[13] = 0.0f;
+}
+
+__global__ void matra_corr_reduce_kernel(const float* __restrict__ d_m,
+                                         const float* __restrict__ d_prevMhat,
+                                         float inv1mB1t,
+                                         int total,
+                                         float* __restrict__ d_stats)
+{
+	const int nWarps = (blockDim.x + 31) / 32;
+	extern __shared__ float smem[];
+	float* sDot = smem;
+	float* sCur = sDot + nWarps;
+	float* sPrev = sCur + nWarps;
+
+	float localDot = 0.0f;
+	float localCur = 0.0f;
+	float localPrev = 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float cur = d_m[idx] * inv1mB1t;
+		const float prev = d_prevMhat[idx];
+		localDot += cur * prev;
+		localCur += cur * cur;
+		localPrev += prev * prev;
+	}
+
+	const float dot = blockReduceSum(localDot, sDot);
+	const float curNorm = blockReduceSum(localCur, sCur);
+	const float prevNorm = blockReduceSum(localPrev, sPrev);
+	if (threadIdx.x == 0)
+	{
+		atomicAdd(&d_stats[14], dot);
+		atomicAdd(&d_stats[15], curNorm);
+		atomicAdd(&d_stats[16], prevNorm);
+	}
+}
+
+__global__ void matra_finalize_predictive_kernel(float* __restrict__ d_stats,
+                                                 float predictiveScale,
+                                                 unsigned int enabled)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0 || !d_stats)
+		return;
+
+	float trust = 0.0f;
+	if (enabled != 0u && predictiveScale > 0.0f
+	    && d_stats[15] > 1.0e-18f && d_stats[16] > 1.0e-18f)
+	{
+		const float cosine = d_stats[14] / (sqrtf(d_stats[15] * d_stats[16]) + 1.0e-18f);
+		trust = predictiveScale * fminf(1.0f, fmaxf(0.0f, cosine));
+	}
+	d_stats[6] = trust;
+}
+
+__global__ void matra_prepare_steps_kernel(const float* __restrict__ d_m,
+                                           const float* __restrict__ d_v,
+                                           const float* __restrict__ d_rowSecond,
+                                           const float* __restrict__ d_colSecond,
+                                           float* __restrict__ d_prevMhat,
+                                           float inv1mB1t,
+                                           float inv1mB2t,
+                                           float eps,
+                                           float* __restrict__ d_stats,
+                                           float* __restrict__ d_backboneStep,
+                                           float* __restrict__ d_adamStep,
+                                           float* __restrict__ d_geomStep,
+                                           float* __restrict__ d_orthStep,
+                                           int rows,
+                                           int cols)
+{
+	extern __shared__ float smem[];
+	const float predictiveTrust = d_stats[6];
+	const float rowMean = fmaxf(d_stats[0], 1.0e-12f);
+	const float colMean = fmaxf(d_stats[1], 1.0e-12f);
+	const int total = rows * cols;
+	float localFro = 0.0f;
+
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		const float currentMhat = d_m[idx] * inv1mB1t;
+		float effectiveMhat = currentMhat;
+		if (predictiveTrust > 0.0f)
+		{
+			float delta = currentMhat - d_prevMhat[idx];
+			const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+			if (delta > deltaCap)
+				delta = deltaCap;
+			else if (delta < -deltaCap)
+				delta = -deltaCap;
+			effectiveMhat += predictiveTrust * delta;
+		}
+
+		const float vhat = d_v[idx] * inv1mB2t;
+		const float diagDen = sqrtf(fmaxf(vhat, 0.0f)) + eps;
+		const float backboneStep = currentMhat / diagDen;
+		const float adamStep = effectiveMhat / diagDen;
+		const float rowScaleRaw =
+		    sqrtf((fmaxf(d_rowSecond[row], 1.0e-12f) + eps) / (rowMean + eps));
+		const float colScaleRaw =
+		    sqrtf((fmaxf(d_colSecond[col], 1.0e-12f) + eps) / (colMean + eps));
+		float matrixScale = rowScaleRaw * colScaleRaw;
+		if (matrixScale < 0.25f)
+			matrixScale = 0.25f;
+		else if (matrixScale > 4.0f)
+			matrixScale = 4.0f;
+
+		d_prevMhat[idx] = currentMhat;
+		d_backboneStep[idx] = backboneStep;
+		d_adamStep[idx] = adamStep;
+		d_geomStep[idx] = adamStep / matrixScale;
+		d_orthStep[idx] = adamStep;
+		localFro += adamStep * adamStep;
+	}
+
+	const float froSq = blockReduceSum(localFro, smem);
+	if (threadIdx.x == 0)
+		atomicAdd(&d_stats[10], froSq);
+}
+
+__global__ void matra_finalize_scale_kernel(float* __restrict__ d_stats,
+                                            unsigned int shortDim)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0 || !d_stats)
+		return;
+	d_stats[11] =
+	    sqrtf(fmaxf(d_stats[10], 0.0f))
+	    / sqrtf(static_cast<float>(shortDim > 0u ? shortDim : 1u));
+}
+
+__global__ void matra_trace_reduce_kernel(const float* __restrict__ d_core,
+                                          int dim,
+                                          float* __restrict__ d_stats)
+{
+	const int nWarps = (blockDim.x + 31) / 32;
+	extern __shared__ float smem[];
+	float localTrace = 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < dim;
+	     idx += blockDim.x * gridDim.x)
+		localTrace += d_core[static_cast<size_t>(idx) * dim + idx];
+
+	const float trace = blockReduceSum(localTrace, smem);
+	if (threadIdx.x == 0)
+		atomicAdd(&d_stats[17], trace);
+}
+
+__global__ void matra_regularize_core_kernel(float* __restrict__ d_core,
+                                             int dim,
+                                             const float* __restrict__ d_stats,
+                                             float damping,
+                                             float eps)
+{
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < dim;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float meanDiag = fmaxf(d_stats[17] / fmaxf(1.0f, static_cast<float>(dim)), eps);
+		const float shift = fmaxf(eps, fmaxf(0.0f, damping) * meanDiag);
+		d_core[static_cast<size_t>(idx) * dim + idx] += shift;
+	}
+}
+
+__global__ void matra_scale_candidate_kernel(float* __restrict__ d_step,
+                                             int total,
+                                             const float* __restrict__ d_stats)
+{
+	if (!d_step || !d_stats)
+		return;
+	const float scale = d_stats[11];
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		d_step[idx] *= scale;
+	}
+}
+
+__global__ void matra_commit_orth_candidate_kernel(const float* __restrict__ d_adamStep,
+                                                   const float* __restrict__ d_candidate,
+                                                   const float* __restrict__ d_stats,
+                                                   float* __restrict__ d_out,
+                                                   int total)
+{
+	if (!d_adamStep || !d_candidate || !d_stats || !d_out)
+		return;
+	const bool useOrth = d_stats[8] > 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		d_out[idx] = useOrth ? d_candidate[idx] : d_adamStep[idx];
+	}
+}
+
+__global__ void matra_apply_residual_kernel(float* __restrict__ d_W,
+                                            float* __restrict__ d_gW,
+                                            const float* __restrict__ d_backboneStep,
+                                            const float* __restrict__ d_adamStep,
+                                            const float* __restrict__ d_geomStep,
+                                            const float* __restrict__ d_orthStep,
+                                            const float* __restrict__ d_stats,
+                                            float lr,
+                                            int total)
+{
+	const float geomTrust = d_stats[7];
+	const float orthTrust = d_stats[8];
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		float correction =
+		    (d_adamStep[idx] - d_backboneStep[idx])
+		    + geomTrust * (d_geomStep[idx] - d_adamStep[idx]);
+		if (orthTrust > 0.0f)
+			correction += orthTrust * (d_orthStep[idx] - d_adamStep[idx]);
+		float w = d_W[idx] - lr * correction;
+		if (!isfinite(w))
+			w = 0.0f;
+		d_W[idx] = w;
+		d_gW[idx] = 0.0f;
+	}
+}
+
+__global__ void matra_reset_stats_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                               float** __restrict__ corePtrs,
+                                               float** __restrict__ stepPtrs,
+                                               int count)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (threadIdx.x == 0)
+	{
+		corePtrs[batchIdx] = item.d_coreScratch;
+		stepPtrs[batchIdx] = item.d_orthStep;
+	}
+	if (!item.d_scalarScratch)
+		return;
+	for (int idx = threadIdx.x; idx < 20; idx += blockDim.x)
+		item.d_scalarScratch[idx] = 0.0f;
+	if (item.refreshMetrics != 0u && item.d_colScratch)
+	{
+		for (unsigned int idx = static_cast<unsigned int>(threadIdx.x); idx < item.n; idx += static_cast<unsigned int>(blockDim.x))
+			item.d_colScratch[idx] = 0.0f;
+	}
+	if (threadIdx.x == 0)
+	{
+		const unsigned int longDim = (item.m > item.n) ? item.m : item.n;
+		item.d_scalarScratch[17] =
+		    1.0f / static_cast<float>(longDim > 0u ? longDim : 1u);
+		item.d_scalarScratch[18] = 0.0f;
+	}
+}
+
+__global__ void matra_refresh_row_stats_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                     int count,
+                                                     float invBatch,
+                                                     float gradScale,
+                                                     float betaGeom,
+                                                     int rows,
+                                                     int cols)
+{
+	const int row = blockIdx.x;
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count || row < 0 || row >= rows)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (item.refreshMetrics == 0u || !item.d_gW || !item.d_rowSecond || !item.d_colScratch)
+		return;
+
+	extern __shared__ float smem[];
+	float localRowSq = 0.0f;
+	const size_t base = static_cast<size_t>(row) * static_cast<size_t>(cols);
+	for (int col = threadIdx.x; col < cols; col += blockDim.x)
+	{
+		const float gScaled =
+		    item.d_gW[base + static_cast<size_t>(col)] * invBatch * gradScale;
+		const float g2 = gScaled * gScaled;
+		localRowSq += g2;
+		atomicAdd(item.d_colScratch + col, g2);
+	}
+	localRowSq = blockReduceSum(localRowSq, smem);
+	if (threadIdx.x == 0)
+	{
+		const float sample =
+		    fmaxf(localRowSq / fmaxf(static_cast<float>(cols), 1.0f), 1.0e-12f);
+		item.d_rowSecond[row] =
+		    betaGeom * item.d_rowSecond[row] + (1.0f - betaGeom) * sample;
+	}
+}
+
+__global__ void matra_refresh_col_stats_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                     int count,
+                                                     int rows,
+                                                     int cols,
+                                                     float betaGeom)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (item.refreshMetrics == 0u || !item.d_colSecond || !item.d_colScratch)
+		return;
+
+	for (int col = blockIdx.x * blockDim.x + threadIdx.x;
+	     col < cols;
+	     col += blockDim.x * gridDim.x)
+	{
+		const float sample =
+		    fmaxf(item.d_colScratch[col] / fmaxf(static_cast<float>(rows), 1.0f), 1.0e-12f);
+		item.d_colSecond[col] =
+		    betaGeom * item.d_colSecond[col] + (1.0f - betaGeom) * sample;
+	}
+}
+
+__global__ void matra_finalize_stats_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                  int count)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (!item.d_rowSecond || !item.d_colSecond || !item.d_scalarScratch || item.m == 0u || item.n == 0u)
+		return;
+
+	const int nWarps = (blockDim.x + 31) / 32;
+	extern __shared__ unsigned char smemRaw[];
+	double* sRowSum = reinterpret_cast<double*>(smemRaw);
+	double* sColSum = sRowSum + nWarps;
+	float* sRowMin = reinterpret_cast<float*>(sColSum + nWarps);
+	float* sRowMax = sRowMin + nWarps;
+	float* sColMin = sRowMax + nWarps;
+	float* sColMax = sColMin + nWarps;
+
+	double localRowSum = 0.0;
+	float localRowMin = FLT_MAX;
+	float localRowMax = 0.0f;
+	for (unsigned int i = static_cast<unsigned int>(threadIdx.x); i < item.m; i += static_cast<unsigned int>(blockDim.x))
+	{
+		const float v = fmaxf(item.d_rowSecond[i], 1.0e-12f);
+		localRowSum += static_cast<double>(v);
+		localRowMin = fminf(localRowMin, v);
+		localRowMax = fmaxf(localRowMax, v);
+	}
+	const double rowSum = blockReduceSumD(localRowSum, sRowSum);
+	const float rowMin = blockReduceMin(localRowMin, sRowMin);
+	const float rowMax = blockReduceMax(localRowMax, sRowMax);
+
+	double localColSum = 0.0;
+	float localColMin = FLT_MAX;
+	float localColMax = 0.0f;
+	for (unsigned int j = static_cast<unsigned int>(threadIdx.x); j < item.n; j += static_cast<unsigned int>(blockDim.x))
+	{
+		const float v = fmaxf(item.d_colSecond[j], 1.0e-12f);
+		localColSum += static_cast<double>(v);
+		localColMin = fminf(localColMin, v);
+		localColMax = fmaxf(localColMax, v);
+	}
+	const double colSum = blockReduceSumD(localColSum, sColSum);
+	const float colMin = blockReduceMin(localColMin, sColMin);
+	const float colMax = blockReduceMax(localColMax, sColMax);
+
+	if (threadIdx.x == 0)
+	{
+		item.d_scalarScratch[0] =
+		    static_cast<float>(fmax(rowSum / static_cast<double>(item.m), 1.0e-12));
+		item.d_scalarScratch[1] =
+		    static_cast<float>(fmax(colSum / static_cast<double>(item.n), 1.0e-12));
+		item.d_scalarScratch[2] = rowMin;
+		item.d_scalarScratch[3] = rowMax;
+		item.d_scalarScratch[4] = colMin;
+		item.d_scalarScratch[5] = colMax;
+	}
+}
+
+__global__ void matra_corr_reduce_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                               int count,
+                                               float inv1mB1t,
+                                               int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (!item.d_m || !item.d_prevMhat || !item.d_scalarScratch)
+		return;
+
+	const int nWarps = (blockDim.x + 31) / 32;
+	extern __shared__ float smem[];
+	float* sDot = smem;
+	float* sCur = sDot + nWarps;
+	float* sPrev = sCur + nWarps;
+
+	float localDot = 0.0f;
+	float localCur = 0.0f;
+	float localPrev = 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float cur = item.d_m[idx] * inv1mB1t;
+		const float prev = item.d_prevMhat[idx];
+		localDot += cur * prev;
+		localCur += cur * cur;
+		localPrev += prev * prev;
+	}
+
+	const float dot = blockReduceSum(localDot, sDot);
+	const float curNorm = blockReduceSum(localCur, sCur);
+	const float prevNorm = blockReduceSum(localPrev, sPrev);
+	if (threadIdx.x == 0)
+	{
+		atomicAdd(&item.d_scalarScratch[14], dot);
+		atomicAdd(&item.d_scalarScratch[15], curNorm);
+		atomicAdd(&item.d_scalarScratch[16], prevNorm);
+	}
+}
+
+__global__ void matra_finalize_budget_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                   int count,
+                                                   float predictiveScale,
+                                                   float geometryScale,
+                                                   float orthScale,
+                                                   float trustRadius,
+                                                   float maxAspect,
+                                                   unsigned int minDim)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || batchIdx < 0 || batchIdx >= count || threadIdx.x != 0)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	float* d_stats = item.d_scalarScratch;
+	if (!d_stats || item.m == 0u || item.n == 0u)
+		return;
+
+	float predictiveTrust = 0.0f;
+	if (item.predictiveEnabled != 0u && predictiveScale > 0.0f
+	    && d_stats[15] > 1.0e-18f && d_stats[16] > 1.0e-18f)
+	{
+		const float cosine =
+		    d_stats[14] / (sqrtf(d_stats[15] * d_stats[16]) + 1.0e-18f);
+		predictiveTrust = predictiveScale * fminf(1.0f, fmaxf(0.0f, cosine));
+	}
+	d_stats[6] = predictiveTrust;
+
+	const float rowMin = fmaxf(d_stats[2], 1.0e-12f);
+	const float rowMax = fmaxf(d_stats[3], rowMin);
+	const float colMin = fmaxf(d_stats[4], 1.0e-12f);
+	const float colMax = fmaxf(d_stats[5], colMin);
+	const float rowAniso = rowMax / rowMin;
+	const float colAniso = colMax / colMin;
+	const float rowSignal =
+	    fminf(1.0f, fmaxf(0.0f, (rowAniso - 1.0f) / (rowAniso + 1.0f)));
+	const float colSignal =
+	    fminf(1.0f, fmaxf(0.0f, (colAniso - 1.0f) / (colAniso + 1.0f)));
+	const float geometryEvidence = 0.5f * (rowSignal + colSignal);
+	const int shortDim = (item.m < item.n) ? static_cast<int>(item.m) : static_cast<int>(item.n);
+	const int longDim = (item.m > item.n) ? static_cast<int>(item.m) : static_cast<int>(item.n);
+	const float aspect =
+	    static_cast<float>(longDim) / fmaxf(static_cast<float>(shortDim > 0 ? shortDim : 1), 1.0f);
+	const unsigned int eligible =
+	    (orthScale > 0.0f)
+	    && (shortDim >= static_cast<int>(minDim > 0u ? minDim : 1u))
+	    && (aspect <= fmaxf(1.0f, maxAspect))
+	    ? 1u : 0u;
+	const float budget =
+	    fminf(1.0f, fmaxf(0.0f, trustRadius) * fminf(1.0f, fmaxf(0.0f, geometryEvidence)));
+	float geometryScore =
+	    fmaxf(0.0f, geometryScale) * fminf(1.0f, fmaxf(0.0f, geometryEvidence));
+	float orthScore = 0.0f;
+	if (eligible != 0u)
+	{
+		orthScore =
+		    fmaxf(0.0f, orthScale)
+		    * fminf(1.0f, fmaxf(0.0f, geometryEvidence))
+		    * (0.25f + 0.75f * predictiveTrust);
+	}
+	const float totalScore = geometryScore + orthScore;
+	if (budget > 0.0f && totalScore > budget && totalScore > 1.0e-12f)
+	{
+		const float scale = budget / totalScore;
+		geometryScore *= scale;
+		orthScore *= scale;
+	}
+	float geomTrust = fminf(1.0f, fmaxf(0.0f, geometryScore));
+	float orthTrust = fminf(1.0f, fmaxf(0.0f, orthScore));
+	if (geomTrust + orthTrust > 1.0f)
+	{
+		const float invSum = 1.0f / fmaxf(geomTrust + orthTrust, 1.0e-12f);
+		geomTrust *= invSum;
+		orthTrust *= invSum;
+	}
+
+	d_stats[7] = geomTrust;
+	d_stats[8] = orthTrust;
+	d_stats[9] = static_cast<float>(eligible);
+	d_stats[10] = 0.0f;
+	d_stats[11] = 0.0f;
+	d_stats[12] = aspect;
+	d_stats[13] = 0.0f;
+}
+
+__global__ void matra_prepare_steps_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                 int count,
+                                                 float inv1mB1t,
+                                                 float inv1mB2t,
+                                                 float eps,
+                                                 int rows,
+                                                 int cols,
+                                                 int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (!item.d_m || !item.d_v || !item.d_rowSecond || !item.d_colSecond
+	    || !item.d_prevMhat || !item.d_backboneStep || !item.d_adamStep
+	    || !item.d_geomStep || !item.d_orthStep || !item.d_scalarScratch)
+		return;
+
+	extern __shared__ float smem[];
+	const float predictiveTrust = item.d_scalarScratch[6];
+	const float rowMean = fmaxf(item.d_scalarScratch[0], 1.0e-12f);
+	const float colMean = fmaxf(item.d_scalarScratch[1], 1.0e-12f);
+	float localFro = 0.0f;
+
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		const float currentMhat = item.d_m[idx] * inv1mB1t;
+		float effectiveMhat = currentMhat;
+		if (predictiveTrust > 0.0f)
+		{
+			float delta = currentMhat - item.d_prevMhat[idx];
+			const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+			if (delta > deltaCap)
+				delta = deltaCap;
+			else if (delta < -deltaCap)
+				delta = -deltaCap;
+			effectiveMhat += predictiveTrust * delta;
+		}
+
+		const float vhat = item.d_v[idx] * inv1mB2t;
+		const float diagDen = sqrtf(fmaxf(vhat, 0.0f)) + eps;
+		const float backboneStep = currentMhat / diagDen;
+		const float adamStep = effectiveMhat / diagDen;
+		const float rowScaleRaw =
+		    sqrtf((fmaxf(item.d_rowSecond[row], 1.0e-12f) + eps) / (rowMean + eps));
+		const float colScaleRaw =
+		    sqrtf((fmaxf(item.d_colSecond[col], 1.0e-12f) + eps) / (colMean + eps));
+		float matrixScale = rowScaleRaw * colScaleRaw;
+		if (matrixScale < 0.25f)
+			matrixScale = 0.25f;
+		else if (matrixScale > 4.0f)
+			matrixScale = 4.0f;
+
+		item.d_prevMhat[idx] = currentMhat;
+		item.d_backboneStep[idx] = backboneStep;
+		item.d_adamStep[idx] = adamStep;
+		item.d_geomStep[idx] = adamStep / matrixScale;
+		item.d_orthStep[idx] = adamStep;
+		localFro += adamStep * adamStep;
+	}
+
+	const float froSq = blockReduceSum(localFro, smem);
+	if (threadIdx.x == 0)
+		atomicAdd(&item.d_scalarScratch[10], froSq);
+}
+
+__global__ void matra_finalize_scale_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                  int count,
+                                                  unsigned int shortDim)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || batchIdx < 0 || batchIdx >= count || threadIdx.x != 0)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (!item.d_scalarScratch)
+		return;
+	const unsigned int longDim = (item.m > item.n) ? item.m : item.n;
+	item.d_scalarScratch[11] =
+	    sqrtf(fmaxf(item.d_scalarScratch[10], 0.0f))
+	    / sqrtf(static_cast<float>(shortDim > 0u ? shortDim : 1u));
+	item.d_scalarScratch[17] =
+	    1.0f / static_cast<float>(longDim > 0u ? longDim : 1u);
+	item.d_scalarScratch[18] = 0.0f;
+}
+
+__global__ void matra_scale_candidate_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                   int count,
+                                                   int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (!item.d_orthStep || !item.d_scalarScratch)
+		return;
+	const unsigned int shortDim = (item.m < item.n) ? item.m : item.n;
+	const float scale =
+	    sqrtf(fmaxf(item.d_scalarScratch[10], 0.0f))
+	    / sqrtf(static_cast<float>(shortDim > 0u ? shortDim : 1u));
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+		item.d_orthStep[idx] *= scale;
+}
+
+__global__ void matra_apply_residual_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                                  int count,
+                                                  int total)
+{
+	const int batchIdx = blockIdx.y;
+	if (!items || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	if (!item.d_W || !item.d_gW || !item.d_backboneStep || !item.d_adamStep
+	    || !item.d_geomStep || !item.d_orthStep || !item.d_scalarScratch)
+		return;
+
+	const float geomTrust = item.d_scalarScratch[7];
+	const float orthTrust = item.d_scalarScratch[8];
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		float correction =
+		    (item.d_adamStep[idx] - item.d_backboneStep[idx])
+		    + geomTrust * (item.d_geomStep[idx] - item.d_adamStep[idx]);
+		if (orthTrust > 0.0f)
+			correction += orthTrust * (item.d_orthStep[idx] - item.d_adamStep[idx]);
+		float w = item.d_W[idx] - item.lr * correction;
+		if (!isfinite(w))
+			w = 0.0f;
+		item.d_W[idx] = w;
+		item.d_gW[idx] = 0.0f;
+	}
+}
+
+__global__ void matra_pack_stats_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
+                                              float* __restrict__ d_statsBatch,
+                                              int count)
+{
+	const int batchIdx = blockIdx.x;
+	if (!items || !d_statsBatch || batchIdx < 0 || batchIdx >= count)
+		return;
+	const GpuMatraBatchItem item = items[batchIdx];
+	const float* d_stats = item.d_scalarScratch;
+	float* d_out = d_statsBatch + static_cast<size_t>(batchIdx) * 20u;
+	for (int idx = threadIdx.x; idx < 20; idx += blockDim.x)
+		d_out[idx] = d_stats ? d_stats[idx] : 0.0f;
+}
+
 __global__ void muon_reset_stats_batch_kernel(const GpuMuonBatchItem* __restrict__ items,
                                               float** __restrict__ corePtrs,
                                               float** __restrict__ stepPtrs,
@@ -5542,6 +6273,68 @@ static bool racer_gpu_init_lite(GpuRacerWeightState& state,
 	state.lastColAnisotropy = 1.0f;
 	state.promoted = false;
 	state.promotedSteps = 0ULL;
+	state.step = 0ULL;
+	state.initialized = true;
+	return true;
+}
+
+static bool matra_gpu_init(GpuMatraWeightState& state,
+                           unsigned int m,
+                           unsigned int n)
+{
+	if (state.initialized && state.m == m && state.n == n)
+		return true;
+
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const size_t coreDim = static_cast<size_t>(std::min(m, n));
+	state.rowSecond.free();
+	state.colSecond.free();
+	state.colScratch.free();
+	state.prevMhat.free();
+	state.backboneStep.free();
+	state.adamStep.free();
+	state.geomStep.free();
+	state.orthStep.free();
+	state.coreScratch.free();
+	state.scalarScratch.free();
+
+	if (!state.rowSecond.allocate(m)) return false;
+	if (!state.colSecond.allocate(n)) return false;
+	if (!state.colScratch.allocate(n)) return false;
+	if (!state.prevMhat.allocate(mn)) return false;
+	if (!state.backboneStep.allocate(mn)) return false;
+	if (!state.adamStep.allocate(mn)) return false;
+	if (!state.geomStep.allocate(mn)) return false;
+	if (!state.orthStep.allocate(mn)) return false;
+	if (!state.coreScratch.allocate(2u * coreDim * coreDim)) return false;
+	if (!state.scalarScratch.allocate(20u)) return false;
+
+	std::vector<float> initRow(static_cast<size_t>(m), 1.0f);
+	std::vector<float> initCol(static_cast<size_t>(n), 1.0f);
+	if (!state.rowSecond.upload(initRow.data(), initRow.size())) return false;
+	if (!state.colSecond.upload(initCol.data(), initCol.size())) return false;
+	if (!state.colScratch.zero()) return false;
+	if (!state.prevMhat.zero()) return false;
+	if (!state.backboneStep.zero()) return false;
+	if (!state.adamStep.zero()) return false;
+	if (!state.geomStep.zero()) return false;
+	if (!state.orthStep.zero()) return false;
+	if (!state.coreScratch.zero()) return false;
+	if (!state.scalarScratch.zero()) return false;
+
+	state.m = m;
+	state.n = n;
+	state.rowMean = 1.0e-12f;
+	state.colMean = 1.0e-12f;
+	state.lastPredictiveTrust = 0.0f;
+	state.lastGeometryTrust = 0.0f;
+	state.lastOrthTrust = 0.0f;
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.lastAspect = 1.0f;
+	state.lastSignalScale = 0.0f;
+	state.lastOrthError = 0.0f;
+	state.lastEligible = false;
 	state.step = 0ULL;
 	state.initialized = true;
 	return true;
@@ -6715,6 +7508,666 @@ bool racer_gpu_update_lite(GpuRacerWeightState& state,
 	}
 
 	return true;
+}
+
+static bool matra_gpu_record_step(GpuMatraWeightState& state,
+                                  float aspect,
+                                  const glades::ATLASConfig& ac,
+                                  shmea::GLogger* logger,
+                                  const char* tag);
+
+bool matra_gpu_update(GpuMatraWeightState& state,
+                      float* d_W, float* d_gW,
+                      float* d_m, float* d_v,
+                      unsigned int m, unsigned int n,
+                      float lr,
+                      float invBatch, float gradScale,
+                      float inv1mB1t, float inv1mB2t,
+                      float eps,
+                      const glades::ATLASConfig& ac,
+                      shmea::GLogger* logger,
+                      const char* tag)
+{
+	if (!d_W || !d_gW || !d_m || !d_v || m == 0u || n == 0u)
+		return true;
+	if (!matra_gpu_init(state, m, n))
+		return false;
+
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.matraPredictiveScale));
+	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	const bool refresh =
+	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(cadence)) == 0ULL);
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const int total = static_cast<int>(mn);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	const int nWarps = (kBlock + 31) / 32;
+	const unsigned int shortDim = std::min(m, n);
+	const unsigned int longDim = std::max(m, n);
+	const float aspect =
+	    static_cast<float>(longDim) / static_cast<float>(std::max(1u, shortDim));
+	const bool orthShapeEligible =
+	    (std::max(0.0f, ac.matraOrthogonalScale) > 0.0f)
+	    && (shortDim >= std::max(1u, ac.matraMinDim))
+	    && (aspect <= std::max(1.0f, ac.matraMaxAspect));
+
+	if (refresh)
+	{
+		if (!state.colScratch.zero())
+			return false;
+		int block = static_cast<int>(std::min<unsigned int>(n, 256u));
+		block = ((block + 31) / 32) * 32;
+		if (block < 32)
+			block = 32;
+		if (block > 256)
+			block = 256;
+		const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+		pact_lite_stats_kernel<<<m, block, smemBytes, computeStream()>>>(
+		    d_gW, state.rowSecond.data(), state.colScratch.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    invBatch, gradScale, betaGeom);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		const int colGrid = std::max(1, (static_cast<int>(n) + kBlock - 1) / kBlock);
+		bimap_update_col_second_kernel<<<colGrid, kBlock, 0, computeStream()>>>(
+		    state.colSecond.data(), state.colScratch.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    betaGeom);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+	}
+
+	if (!state.scalarScratch.zero())
+		return false;
+	bimap_finalize_stats_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.rowSecond.data(), state.colSecond.data(),
+	    static_cast<int>(m), static_cast<int>(n),
+	    state.scalarScratch.data());
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	matra_corr_reduce_kernel<<<grid, kBlock,
+	                           3 * nWarps * static_cast<int>(sizeof(float)),
+	                           computeStream()>>>(
+	    d_m, state.prevMhat.data(), inv1mB1t, total, state.scalarScratch.data());
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	matra_finalize_predictive_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.scalarScratch.data(),
+	    predictiveScale,
+	    (predictiveScale > 0.0f && state.step > 0ULL) ? 1u : 0u);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	matra_finalize_budget_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.scalarScratch.data(),
+	    std::max(0.0f, ac.matraGeometryScale),
+	    std::max(0.0f, ac.matraOrthogonalScale),
+	    std::max(0.0f, ac.matraTrustRadius),
+	    ac.matraMaxAspect,
+	    ac.matraMinDim,
+	    static_cast<int>(m),
+	    static_cast<int>(n));
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	matra_prepare_steps_kernel<<<grid, kBlock,
+	                             nWarps * static_cast<int>(sizeof(float)),
+	                             computeStream()>>>(
+	    d_m, d_v,
+	    state.rowSecond.data(), state.colSecond.data(),
+	    state.prevMhat.data(),
+	    inv1mB1t, inv1mB2t, eps,
+	    state.scalarScratch.data(),
+	    state.backboneStep.data(),
+	    state.adamStep.data(),
+	    state.geomStep.data(),
+	    state.orthStep.data(),
+	    static_cast<int>(m), static_cast<int>(n));
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	const float* dOrthCandidate = state.orthStep.data();
+	if (orthShapeEligible)
+	{
+		matra_finalize_scale_kernel<<<1, 1, 0, computeStream()>>>(
+		    state.scalarScratch.data(), shortDim);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		const bool tall = (m >= n);
+		const unsigned int coreDim = tall ? n : m;
+		const bool useSmallSolve =
+		    (coreDim <= static_cast<unsigned int>(kAtlasSmallCholeskyMaxDim));
+		const float gramScale =
+		    1.0f / static_cast<float>(tall ? std::max(1u, m) : std::max(1u, n));
+		if (tall)
+		{
+			if (!sgemm_rowmajor_atb_exact(static_cast<int>(coreDim), static_cast<int>(coreDim), static_cast<int>(m),
+			                              gramScale,
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              0.0f,
+			                              state.coreScratch.data(), static_cast<int>(coreDim)))
+				return false;
+		}
+		else
+		{
+			if (!sgemm_rowmajor_abt_exact(static_cast<int>(coreDim), static_cast<int>(coreDim), static_cast<int>(n),
+			                              gramScale,
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              0.0f,
+			                              state.coreScratch.data(), static_cast<int>(coreDim)))
+				return false;
+		}
+
+		if (useSmallSolve)
+		{
+			if (!atlas_cholesky_factor_small(state.coreScratch.data(),
+			                                 static_cast<int>(coreDim),
+			                                 ac.matraDamping,
+			                                 eps,
+			                                 false))
+				return false;
+			if (tall)
+			{
+				if (!strsm_rowmajor_right_upper(static_cast<int>(m), static_cast<int>(n),
+				                                1.0f,
+				                                state.coreScratch.data(), static_cast<int>(coreDim),
+				                                state.orthStep.data(), static_cast<int>(n)))
+					return false;
+			}
+			else
+			{
+				if (!strsm_rowmajor_left_upper_transpose(static_cast<int>(m), static_cast<int>(n),
+				                                         1.0f,
+				                                         state.coreScratch.data(), static_cast<int>(coreDim),
+				                                         state.orthStep.data(), static_cast<int>(n)))
+					return false;
+			}
+		}
+		else
+		{
+			const int nWarps = (kBlock + 31) / 32;
+			const int coreGrid =
+			    std::max(1, (static_cast<int>(coreDim) + kBlock - 1) / kBlock);
+			matra_trace_reduce_kernel<<<coreGrid, kBlock,
+			                            nWarps * static_cast<int>(sizeof(float)),
+			                            computeStream()>>>(
+			    state.coreScratch.data(),
+			    static_cast<int>(coreDim),
+			    state.scalarScratch.data());
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+
+			matra_regularize_core_kernel<<<coreGrid, kBlock, 0, computeStream()>>>(
+			    state.coreScratch.data(),
+			    static_cast<int>(coreDim),
+			    state.scalarScratch.data(),
+			    ac.matraDamping,
+			    eps);
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+
+			atlas_cholesky_inv_kernel<<<1, 1, 0, computeStream()>>>(
+			    state.coreScratch.data(), static_cast<int>(coreDim), false);
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+
+			if (tall)
+			{
+				if (!sgemm_rowmajor_exact(static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
+				                          1.0f,
+				                          state.orthStep.data(), static_cast<int>(n),
+				                          state.coreScratch.data(), static_cast<int>(n),
+				                          0.0f,
+				                          d_gW, static_cast<int>(n)))
+					return false;
+			}
+			else
+			{
+				if (!sgemm_rowmajor_atb_exact(static_cast<int>(m), static_cast<int>(n), static_cast<int>(m),
+				                              1.0f,
+				                              state.coreScratch.data(), static_cast<int>(m),
+				                              state.orthStep.data(), static_cast<int>(n),
+				                              0.0f,
+				                              d_gW, static_cast<int>(n)))
+					return false;
+			}
+			dOrthCandidate = d_gW;
+		}
+
+		matra_scale_candidate_kernel<<<grid, kBlock, 0, computeStream()>>>(
+		    const_cast<float*>(dOrthCandidate), total, state.scalarScratch.data());
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		matra_commit_orth_candidate_kernel<<<grid, kBlock, 0, computeStream()>>>(
+		    state.adamStep.data(),
+		    dOrthCandidate,
+		    state.scalarScratch.data(),
+		    state.orthStep.data(),
+		    total);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+	}
+	dOrthCandidate = state.orthStep.data();
+
+	matra_apply_residual_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    d_W, d_gW,
+	    state.backboneStep.data(),
+	    state.adamStep.data(),
+	    state.geomStep.data(),
+	    dOrthCandidate,
+	    state.scalarScratch.data(),
+	    lr, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	if (!atlas_gpu_guard(d_W, mn))
+		return false;
+
+	return matra_gpu_record_step(state, aspect, ac, logger, tag);
+}
+
+static bool matra_gpu_record_step(GpuMatraWeightState& state,
+                                  float aspect,
+                                  const glades::ATLASConfig& ac,
+                                  shmea::GLogger* logger,
+                                  const char* tag)
+;
+
+static void matra_gpu_refresh_host_stats(GpuMatraWeightState& state,
+                                         const float* stats)
+{
+	if (!stats)
+		return;
+	state.rowMean = std::max(stats[0], 1.0e-12f);
+	state.colMean = std::max(stats[1], 1.0e-12f);
+	state.lastPredictiveTrust = stats[6];
+	state.lastGeometryTrust = stats[7];
+	state.lastOrthTrust = stats[8];
+	state.lastRowAnisotropy =
+	    (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : 1.0f;
+	state.lastColAnisotropy =
+	    (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : 1.0f;
+	state.lastEligible = (stats[8] > 0.0f);
+	state.lastSignalScale = stats[11];
+}
+
+static void matra_gpu_log_step_event(const GpuMatraWeightState& state,
+                                     unsigned int cadence,
+                                     shmea::GLogger* logger,
+                                     const char* tag)
+{
+	if (!logger)
+		return;
+	std::ostringstream oss;
+	oss << "event=gpu_matra_step";
+	if (tag && tag[0])
+		oss << " tag=" << tag;
+	oss << " step=" << state.step
+	    << " predTrust=" << state.lastPredictiveTrust
+	    << " geomTrust=" << state.lastGeometryTrust
+	    << " orthTrust=" << state.lastOrthTrust
+	    << " rowAniso=" << state.lastRowAnisotropy
+	    << " colAniso=" << state.lastColAnisotropy
+	    << " eligible=" << (state.lastEligible ? 1 : 0)
+	    << " aspect=" << state.lastAspect
+	    << " signalScale=" << state.lastSignalScale
+	    << " orthErr=" << state.lastOrthError
+	    << " cadence=" << cadence;
+	logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+}
+
+static bool matra_gpu_record_small_batch_steps(const GpuMatraBatchItem* items,
+                                               const GpuMatraBatchItem* d_batchItems,
+                                               int count,
+                                               float* d_statsBatch,
+                                               const glades::ATLASConfig& ac,
+                                               shmea::GLogger* logger)
+{
+	if (!items || count <= 0)
+		return true;
+	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	const unsigned long long logCadence =
+	    static_cast<unsigned long long>(std::max(1u, ac.tSub));
+	std::vector<unsigned char> dueLog(static_cast<size_t>(count), 0u);
+	bool needStats = false;
+
+	for (int i = 0; i < count; ++i)
+	{
+		GpuMatraWeightState* state = items[i].state;
+		if (!state)
+			return false;
+		const float aspect =
+		    static_cast<float>(std::max(items[i].m, items[i].n))
+		    / static_cast<float>(std::max(1u, std::min(items[i].m, items[i].n)));
+		state->lastAspect = aspect;
+		state->lastOrthError = 0.0f;
+		state->step += 1ULL;
+		if (logger && ac.tSub > 0u && ((state->step % logCadence) == 0ULL))
+		{
+			dueLog[static_cast<size_t>(i)] = 1u;
+			needStats = true;
+		}
+	}
+
+	if (!needStats)
+		return true;
+	if (!d_batchItems || !d_statsBatch)
+		return false;
+
+	matra_pack_stats_batch_kernel<<<count, 32, 0, computeStream()>>>(
+	    d_batchItems, d_statsBatch, count);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+
+	std::vector<float> hostStats(static_cast<size_t>(count) * 20u, 0.0f);
+	ATLAS_CUDA_CHECK(cudaMemcpy(hostStats.data(),
+	                            d_statsBatch,
+	                            hostStats.size() * sizeof(float),
+	                            cudaMemcpyDeviceToHost));
+
+	for (int i = 0; i < count; ++i)
+	{
+		if (dueLog[static_cast<size_t>(i)] == 0u)
+			continue;
+		GpuMatraWeightState& state = *items[i].state;
+		matra_gpu_refresh_host_stats(state, hostStats.data() + static_cast<size_t>(i) * 20u);
+		matra_gpu_log_step_event(state, cadence, logger, items[i].tag);
+	}
+
+	return true;
+}
+
+static bool matra_gpu_record_step(GpuMatraWeightState& state,
+                                  float aspect,
+                                  const glades::ATLASConfig& ac,
+                                  shmea::GLogger* logger,
+                                  const char* tag)
+{
+	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	state.lastAspect = aspect;
+	state.lastOrthError = 0.0f;
+	state.step += 1ULL;
+
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		float stats[20] = {0.0f};
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+		if (!state.scalarScratch.download(stats, 20u))
+			return false;
+		matra_gpu_refresh_host_stats(state, stats);
+		matra_gpu_log_step_event(state, cadence, logger, tag);
+	}
+
+	return true;
+}
+
+static bool matra_prepare_small_batch_items(const GpuMatraBatchItem* items,
+                                            int count,
+                                            const glades::ATLASConfig& ac,
+                                            std::vector<GpuMatraBatchItem>& batchItems)
+{
+	if (!items || count <= 0)
+		return true;
+
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.matraPredictiveScale));
+	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	batchItems.resize(static_cast<size_t>(count));
+	for (int i = 0; i < count; ++i)
+	{
+		GpuMatraBatchItem item = items[i];
+		if (!item.state || !item.d_W || !item.d_gW || !item.d_m || !item.d_v)
+			return false;
+		if (!matra_gpu_init(*item.state, item.m, item.n))
+			return false;
+		item.d_rowSecond = item.state->rowSecond.data();
+		item.d_colSecond = item.state->colSecond.data();
+		item.d_colScratch = item.state->colScratch.data();
+		item.d_prevMhat = item.state->prevMhat.data();
+		item.d_backboneStep = item.state->backboneStep.data();
+		item.d_adamStep = item.state->adamStep.data();
+		item.d_geomStep = item.state->geomStep.data();
+		item.d_orthStep = item.state->orthStep.data();
+		item.d_coreScratch = item.state->coreScratch.data();
+		item.d_scalarScratch = item.state->scalarScratch.data();
+		item.predictiveEnabled =
+		    (predictiveScale > 0.0f && item.state->step > 0ULL) ? 1u : 0u;
+		item.refreshMetrics =
+		    (item.state->step == 0ULL
+		     || ((item.state->step % static_cast<unsigned long long>(cadence)) == 0ULL))
+		    ? 1u : 0u;
+		batchItems[static_cast<size_t>(i)] = item;
+	}
+
+	return true;
+}
+
+static bool matra_gpu_launch_small_batch_prepared(const GpuMatraBatchItem* items,
+                                                  const GpuMatraBatchItem* d_batchItems,
+                                                  int count,
+                                                  float** d_corePtrScratch,
+                                                  float** d_stepPtrScratch,
+                                                  int* d_infoScratch,
+                                                  int corePtrCapacity,
+                                                  float invBatch,
+                                                  float gradScale,
+                                                  float inv1mB1t, float inv1mB2t,
+                                                  float eps,
+                                                  const glades::ATLASConfig& ac,
+                                                  shmea::GLogger* logger)
+{
+	if (!items || count <= 0)
+		return true;
+	(void)logger;
+	(void)d_infoScratch;
+	if (!d_batchItems || !d_corePtrScratch || !d_stepPtrScratch || !d_infoScratch
+	    || corePtrCapacity < count)
+		return false;
+
+	const unsigned int m = items[0].m;
+	const unsigned int n = items[0].n;
+	const bool tall = (m >= n);
+	const unsigned int coreDim = tall ? n : m;
+	if (m == 0u || n == 0u || coreDim > static_cast<unsigned int>(kAtlasSmallCholeskyMaxDim))
+		return false;
+
+	for (int i = 0; i < count; ++i)
+	{
+		const GpuMatraBatchItem& item = items[i];
+		if (item.m != m || item.n != n)
+			return false;
+	}
+	const float orthScale = std::max(0.0f, ac.matraOrthogonalScale);
+	const float maxAspect = std::max(1.0f, ac.matraMaxAspect);
+	const unsigned int minDim = std::max(1u, ac.matraMinDim);
+	const float aspect =
+	    static_cast<float>(std::max(m, n))
+	    / static_cast<float>(std::max(1u, std::min(m, n)));
+	const bool orthShapeEligible =
+	    (orthScale > 0.0f)
+	    && (coreDim >= minDim)
+	    && (aspect <= maxAspect);
+
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.matraPredictiveScale));
+	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const int total = static_cast<int>(mn);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	const int nWarps = (kBlock + 31) / 32;
+	int statBlock = static_cast<int>(std::min<unsigned int>(n, 256u));
+	statBlock = ((statBlock + 31) / 32) * 32;
+	if (statBlock < 32)
+		statBlock = 32;
+	if (statBlock > 256)
+		statBlock = 256;
+	const int statSmemBytes =
+	    (statBlock / 32 + 1) * static_cast<int>(sizeof(float));
+	const int statFinalizeSmemBytes =
+	    2 * nWarps * static_cast<int>(sizeof(double))
+	    + 4 * nWarps * static_cast<int>(sizeof(float));
+
+	matra_reset_stats_batch_kernel<<<count, 32, 0, computeStream()>>>(
+	    d_batchItems, d_corePtrScratch, d_stepPtrScratch, count);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	dim3 statGrid(static_cast<unsigned int>(m),
+	              static_cast<unsigned int>(count),
+	              1u);
+	matra_refresh_row_stats_batch_kernel<<<statGrid, statBlock, statSmemBytes, computeStream()>>>(
+	    d_batchItems, count, invBatch, gradScale, betaGeom, static_cast<int>(m), static_cast<int>(n));
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	dim3 colGrid(static_cast<unsigned int>(std::max(1, (static_cast<int>(n) + kBlock - 1) / kBlock)),
+	             static_cast<unsigned int>(count),
+	             1u);
+	matra_refresh_col_stats_batch_kernel<<<colGrid, kBlock, 0, computeStream()>>>(
+	    d_batchItems, count, static_cast<int>(m), static_cast<int>(n), betaGeom);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	matra_finalize_stats_batch_kernel<<<count, kBlock, statFinalizeSmemBytes, computeStream()>>>(
+	    d_batchItems, count);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	dim3 batchGrid(static_cast<unsigned int>(grid),
+	               static_cast<unsigned int>(count),
+	               1u);
+	matra_corr_reduce_batch_kernel<<<batchGrid, kBlock,
+	                                3 * nWarps * static_cast<int>(sizeof(float)),
+	                                computeStream()>>>(
+	    d_batchItems, count, inv1mB1t, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	matra_finalize_budget_batch_kernel<<<count, 1, 0, computeStream()>>>(
+	    d_batchItems, count,
+	    predictiveScale,
+	    std::max(0.0f, ac.matraGeometryScale),
+	    std::max(0.0f, ac.matraOrthogonalScale),
+	    std::max(0.0f, ac.matraTrustRadius),
+	    ac.matraMaxAspect,
+	    ac.matraMinDim);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	matra_prepare_steps_batch_kernel<<<batchGrid, kBlock,
+	                                  nWarps * static_cast<int>(sizeof(float)),
+	                                  computeStream()>>>(
+	    d_batchItems, count, inv1mB1t, inv1mB2t, eps,
+	    static_cast<int>(m), static_cast<int>(n), total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	if (orthShapeEligible)
+	{
+		const float* d_alpha = items[0].d_scalarScratch + 17;
+		const float* d_beta = items[0].d_scalarScratch + 18;
+
+		if (tall)
+		{
+			if (!sgemm_batched_pointer_atb_device_scalars(static_cast<int>(n), static_cast<int>(n), static_cast<int>(m),
+			                                              d_alpha,
+			                                              d_stepPtrScratch, static_cast<int>(n),
+			                                              d_stepPtrScratch, static_cast<int>(n),
+			                                              d_beta,
+			                                              d_corePtrScratch, static_cast<int>(n),
+			                                              count))
+				return false;
+		}
+		else
+		{
+			if (!sgemm_batched_pointer_abt_device_scalars(static_cast<int>(m), static_cast<int>(m), static_cast<int>(n),
+			                                              d_alpha,
+			                                              d_stepPtrScratch, static_cast<int>(n),
+			                                              d_stepPtrScratch, static_cast<int>(n),
+			                                              d_beta,
+			                                              d_corePtrScratch, static_cast<int>(m),
+			                                              count))
+				return false;
+		}
+		if (!atlas_cholesky_factor_small_batch_cusolver(d_corePtrScratch,
+		                                                d_infoScratch,
+		                                                count,
+		                                                static_cast<int>(coreDim),
+		                                                ac.matraDamping,
+		                                                eps))
+			return false;
+		if (tall)
+		{
+			if (!strsm_rowmajor_right_upper_batched(static_cast<int>(m), static_cast<int>(n),
+			                                        1.0f,
+			                                        d_corePtrScratch, static_cast<int>(n),
+			                                        d_stepPtrScratch, static_cast<int>(n),
+			                                        count))
+				return false;
+		}
+		else
+		{
+			if (!strsm_rowmajor_left_upper_transpose_batched(static_cast<int>(m), static_cast<int>(n),
+			                                                 1.0f,
+			                                                 d_corePtrScratch, static_cast<int>(m),
+			                                                 d_stepPtrScratch, static_cast<int>(n),
+			                                                 count))
+				return false;
+		}
+		matra_scale_candidate_batch_kernel<<<batchGrid, kBlock, 0, computeStream()>>>(
+		    d_batchItems, count, total);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+	}
+	matra_apply_residual_batch_kernel<<<batchGrid, kBlock, 0, computeStream()>>>(
+	    d_batchItems, count, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	return true;
+}
+
+bool matra_gpu_update_small_batches(const GpuMatraBatchItem* items,
+                                    int itemCount,
+                                    const int* groupOffsets,
+                                    const int* groupCounts,
+                                    int groupCount,
+                                    GpuMatraBatchItem* d_batchItems,
+                                    float* d_statsBatch,
+                                    float** d_corePtrScratch,
+                                    float** d_stepPtrScratch,
+                                    int* d_infoScratch,
+                                    int corePtrCapacity,
+                                    float invBatch,
+                                    float gradScale,
+                                    float inv1mB1t, float inv1mB2t,
+                                    float eps,
+                                    const glades::ATLASConfig& ac,
+                                    shmea::GLogger* logger)
+{
+	if (!items || itemCount <= 0 || !groupOffsets || !groupCounts || groupCount <= 0)
+		return true;
+	if (!d_batchItems || !d_statsBatch || !d_corePtrScratch || !d_stepPtrScratch || !d_infoScratch
+	    || corePtrCapacity < itemCount)
+		return false;
+
+	std::vector<GpuMatraBatchItem> batchItems;
+	if (!matra_prepare_small_batch_items(items, itemCount, ac, batchItems))
+		return false;
+
+	ATLAS_CUDA_CHECK(cudaMemcpyAsync(d_batchItems,
+	                                 batchItems.data(),
+	                                 static_cast<size_t>(itemCount) * sizeof(GpuMatraBatchItem),
+	                                 cudaMemcpyHostToDevice,
+	                                 computeStream()));
+
+	for (int gi = 0; gi < groupCount; ++gi)
+	{
+		const int offset = groupOffsets[gi];
+		const int count = groupCounts[gi];
+		if (count <= 0)
+			continue;
+		if (offset < 0 || offset + count > itemCount)
+			return false;
+		if (!matra_gpu_launch_small_batch_prepared(
+		        batchItems.data() + offset,
+		        d_batchItems + offset,
+		        count,
+		        d_corePtrScratch,
+		        d_stepPtrScratch,
+		        d_infoScratch,
+		        corePtrCapacity,
+		        invBatch,
+		        gradScale,
+		        inv1mB1t, inv1mB2t,
+		        eps,
+		        ac,
+		        logger))
+			return false;
+	}
+
+	return matra_gpu_record_small_batch_steps(batchItems.data(),
+	                                          d_batchItems,
+	                                          itemCount,
+	                                          d_statsBatch,
+	                                          ac,
+	                                          logger);
 }
 
 static bool muon_gpu_prepare_lite_core(GpuMuonWeightState& state,

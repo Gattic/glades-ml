@@ -617,7 +617,8 @@ enum VariantKind
 	VARIANT_ATLAS_PACT = 17,
 	VARIANT_ATLAS_RACER = 18,
 	VARIANT_ATLAS_KRON = 19,
-	VARIANT_ATLAS_MUON = 20
+	VARIANT_ATLAS_MUON = 20,
+	VARIANT_ATLAS_MATRA = 21
 };
 
 enum VariantSelection
@@ -643,7 +644,8 @@ enum VariantSelection
 	VARIANT_SELECTION_ATLAS_PACT = 18,
 	VARIANT_SELECTION_ATLAS_RACER = 19,
 	VARIANT_SELECTION_ATLAS_KRON = 20,
-	VARIANT_SELECTION_ATLAS_MUON = 21
+	VARIANT_SELECTION_ATLAS_MUON = 21,
+	VARIANT_SELECTION_ATLAS_MATRA = 22
 };
 
 struct TokenConfig
@@ -823,6 +825,14 @@ struct BenchConfig
 	float atlasMuonMaxAspect;
 	unsigned int atlasMuonMinDim;
 	float atlasMuonDamping;
+	float atlasMatraGeometryScale;
+	float atlasMatraOrthogonalScale;
+	float atlasMatraPredictiveScale;
+	float atlasMatraTrustRadius;
+	unsigned int atlasMatraMetricCadence;
+	float atlasMatraMaxAspect;
+	unsigned int atlasMatraMinDim;
+	float atlasMatraDamping;
 	unsigned int gpuEnable;
 	int gpuDeviceId;
 	TokenConfig token;
@@ -903,6 +913,14 @@ struct BenchConfig
 	      atlasMuonMaxAspect(1.50f),
 	      atlasMuonMinDim(8u),
 	      atlasMuonDamping(0.01f),
+	      atlasMatraGeometryScale(1.0f),
+	      atlasMatraOrthogonalScale(0.5f),
+	      atlasMatraPredictiveScale(0.05f),
+	      atlasMatraTrustRadius(0.50f),
+	      atlasMatraMetricCadence(1u),
+	      atlasMatraMaxAspect(1.50f),
+	      atlasMatraMinDim(8u),
+	      atlasMatraDamping(0.01f),
 	      gpuEnable(0u),
 	      gpuDeviceId(0),
 	      token(),
@@ -1706,6 +1724,7 @@ static const char* variant_label(VariantKind variant)
 	case VARIANT_ATLAS_RACER: return "ATLAS-RACER";
 	case VARIANT_ATLAS_KRON: return "ATLAS-KRON";
 	case VARIANT_ATLAS_MUON: return "ATLAS-MUON";
+	case VARIANT_ATLAS_MATRA: return "ATLAS-MATRA";
 	default: return "Unknown";
 	}
 }
@@ -1758,6 +1777,8 @@ static bool variant_matches_selection(VariantSelection selection, VariantKind va
 		return variant == VARIANT_ATLAS_KRON;
 	case VARIANT_SELECTION_ATLAS_MUON:
 		return variant == VARIANT_ATLAS_MUON;
+	case VARIANT_SELECTION_ATLAS_MATRA:
+		return variant == VARIANT_ATLAS_MATRA;
 	default:
 		return false;
 	}
@@ -1895,7 +1916,7 @@ static void print_usage()
 	printf("Options:\n");
 	printf("  --mode all|token-lm|token-lm-large|token-lm-context|token-lm-context-large|token-lm-document|token-lm-corpus|token-lm-corpus-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
 	printf("                                         Run the alternate-task benches or the teacher-student sweep (default: all)\n");
-	printf("  --variant all|adamw|adamw-group|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|echo|bimap|pact|racer|kron|muon\n");
+	printf("  --variant all|adamw|adamw-group|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|echo|bimap|pact|racer|kron|muon|matra\n");
 	printf("                                         Restrict runs to one optimizer variant when the case supports it (default: all)\n");
 	printf("  --repeats N                           Repeats per optimizer variant (default: 3)\n");
 	printf("  --seed N                              Base RNG seed (default: 1337)\n");
@@ -1966,6 +1987,14 @@ static void print_usage()
 	printf("  --atlas-muon-max-aspect X             Maximum block aspect ratio eligible for MUON-lite (default: 1.50)\n");
 	printf("  --atlas-muon-min-dim N                Minimum block side length eligible for MUON-lite (default: 8)\n");
 	printf("  --atlas-muon-damping X                Gram damping inside MUON-lite polar factors (default: 0.01)\n");
+	printf("  --atlas-matra-geometry-scale X        Two-sided geometry trust cap for MATRA (default: 1.0)\n");
+	printf("  --atlas-matra-orthogonal-scale X      Orthogonal residual trust cap for MATRA (default: 0.5)\n");
+	printf("  --atlas-matra-predictive-scale X      Bounded one-step predictive transport for MATRA (default: 0.05)\n");
+	printf("  --atlas-matra-trust-radius X          Total structured trust budget for MATRA (default: 0.50)\n");
+	printf("  --atlas-matra-cadence N               Steps between MATRA row/column metric refreshes (default: 1)\n");
+	printf("  --atlas-matra-max-aspect X            Maximum block aspect ratio eligible for MATRA orthogonal branch (default: 1.50)\n");
+	printf("  --atlas-matra-min-dim N               Minimum block side length eligible for MATRA orthogonal branch (default: 8)\n");
+	printf("  --atlas-matra-damping X               Gram damping inside MATRA orthogonal factors (default: 0.01)\n");
 	printf("  --gpu-enable 0|1                      Attempt GPU offload when available (default: 0)\n");
 	printf("  --gpu-device N                        CUDA device id when GPU offload is enabled (default: 0)\n");
 	printf("  --token-epochs N                      Token-LM epochs (default: 6)\n");
@@ -2289,6 +2318,11 @@ static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
 	if (streq(text, "muon") || streq(text, "atlas-muon"))
 	{
 		outSelection = VARIANT_SELECTION_ATLAS_MUON;
+		return true;
+	}
+	if (streq(text, "matra") || streq(text, "atlas-matra"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_MATRA;
 		return true;
 	}
 	return false;
@@ -2878,6 +2912,70 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			if (!parse_float_arg(argv[++i], cfg.atlasMuonDamping) || cfg.atlasMuonDamping < 0.0f)
 			{
 				err = "invalid --atlas-muon-damping";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMatraGeometryScale) || cfg.atlasMatraGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-matra-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-orthogonal-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMatraOrthogonalScale) || cfg.atlasMatraOrthogonalScale < 0.0f)
+			{
+				err = "invalid --atlas-matra-orthogonal-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMatraPredictiveScale) || cfg.atlasMatraPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-matra-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-trust-radius") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMatraTrustRadius) || cfg.atlasMatraTrustRadius < 0.0f)
+			{
+				err = "invalid --atlas-matra-trust-radius";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasMatraMetricCadence) || cfg.atlasMatraMetricCadence == 0u)
+			{
+				err = "invalid --atlas-matra-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-max-aspect") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMatraMaxAspect) || cfg.atlasMatraMaxAspect < 1.0f)
+			{
+				err = "invalid --atlas-matra-max-aspect";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-min-dim") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasMatraMinDim) || cfg.atlasMatraMinDim == 0u)
+			{
+				err = "invalid --atlas-matra-min-dim";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-damping") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasMatraDamping) || cfg.atlasMatraDamping < 0.0f)
+			{
+				err = "invalid --atlas-matra-damping";
 				return false;
 			}
 		}
@@ -4447,6 +4545,7 @@ static void reset_atlas_family(glades::TrainingConfig& tc)
 	tc.atlas.racerEnabled = false;
 	tc.atlas.kronEnabled = false;
 	tc.atlas.muonEnabled = false;
+	tc.atlas.matraEnabled = false;
 	tc.atlas.kappaEnabled = false;
 }
 
@@ -4762,6 +4861,18 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.muonMinDim = cfg.atlasMuonMinDim;
 		tc.atlas.muonDamping = cfg.atlasMuonDamping;
 	}
+	else if (variant == VARIANT_ATLAS_MATRA)
+	{
+		tc.atlas.matraEnabled = true;
+		tc.atlas.matraGeometryScale = cfg.atlasMatraGeometryScale;
+		tc.atlas.matraOrthogonalScale = cfg.atlasMatraOrthogonalScale;
+		tc.atlas.matraPredictiveScale = cfg.atlasMatraPredictiveScale;
+		tc.atlas.matraTrustRadius = cfg.atlasMatraTrustRadius;
+		tc.atlas.matraMetricCadence = cfg.atlasMatraMetricCadence;
+		tc.atlas.matraMaxAspect = cfg.atlasMatraMaxAspect;
+		tc.atlas.matraMinDim = cfg.atlasMatraMinDim;
+		tc.atlas.matraDamping = cfg.atlasMatraDamping;
+	}
 }
 
 static bool configure_optimizer(glades::TrainingConfig& tc,
@@ -4815,7 +4926,8 @@ static bool token_variant_uses_adamw_backbone(const BenchConfig& cfg, VariantKin
 	    || (variant == VARIANT_ATLAS_PACT)
 	    || (variant == VARIANT_ATLAS_RACER)
 	    || (variant == VARIANT_ATLAS_KRON)
-	    || (variant == VARIANT_ATLAS_MUON);
+	    || (variant == VARIANT_ATLAS_MUON)
+	    || (variant == VARIANT_ATLAS_MATRA);
 }
 
 static float token_variant_learning_rate(const BenchConfig& cfg, VariantKind variant)
@@ -6185,7 +6297,8 @@ static bool run_token_case(const BenchConfig& cfg)
 	const float racerTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_RACER);
 	const float kronTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_KRON);
 	const float muonTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MUON);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s cadence=%u groups=%u) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f)\n",
+	const float matraTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MATRA);
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s cadence=%u groups=%u) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f) ATLAS-MATRA(lr=%.4f cadence=%u trust=%.2f)\n",
 	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
 	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
 	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
@@ -6197,8 +6310,9 @@ static bool run_token_case(const BenchConfig& cfg)
 	       geodeTokenLR, cfg.atlasComplementRank, echoTokenLR, echo_scope_label(cfg.atlasEchoScope), cfg.atlasEchoMetricCadence, cfg.atlasEchoStructuralGroups, bimapTokenLR, bimap_scope_label(cfg.atlasBiMAPScope), cfg.atlasBiMAPLowRank, cfg.atlasBiMAPFactorCadence,
 	       pactTokenLR, cfg.atlasPACTLowRank, cfg.atlasPACTFactorCadence,
 	       racerTokenLR, cfg.atlasRACERFactorCadence,
-	       kronTokenLR, cfg.atlasKronFactorCadence, muonTokenLR, cfg.atlasMuonMinDim, cfg.atlasMuonMaxAspect);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u cadence=%u trust=%.3f pred=%.3f struct=%.3f groups=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f)\n",
+	       kronTokenLR, cfg.atlasKronFactorCadence, muonTokenLR, cfg.atlasMuonMinDim, cfg.atlasMuonMaxAspect,
+	       matraTokenLR, cfg.atlasMatraMetricCadence, cfg.atlasMatraTrustRadius);
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u cadence=%u trust=%.3f pred=%.3f struct=%.3f groups=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f) matra(geom=%.3f orth=%.3f pred=%.3f trust=%.3f cadence=%u maxAspect=%.3f minDim=%u damping=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
@@ -6220,12 +6334,14 @@ static bool run_token_case(const BenchConfig& cfg)
 	       cfg.atlasRACERGeometryScale, cfg.atlasRACERPredictiveScale, cfg.atlasRACERFactorCadence,
 	       cfg.atlasRACERRiskScale, cfg.atlasRACERCostScale, cfg.atlasRACERPromoteThreshold, cfg.atlasRACERDemoteThreshold,
 	       cfg.atlasKronGeometryScale, cfg.atlasKronPredictiveScale, cfg.atlasKronFactorCadence, cfg.atlasKronDamping,
-	       cfg.atlasMuonGeometryScale, cfg.atlasMuonPredictiveScale, cfg.atlasMuonMaxAspect, cfg.atlasMuonMinDim, cfg.atlasMuonDamping);
+	       cfg.atlasMuonGeometryScale, cfg.atlasMuonPredictiveScale, cfg.atlasMuonMaxAspect, cfg.atlasMuonMinDim, cfg.atlasMuonDamping,
+	       cfg.atlasMatraGeometryScale, cfg.atlasMatraOrthogonalScale, cfg.atlasMatraPredictiveScale, cfg.atlasMatraTrustRadius,
+	       cfg.atlasMatraMetricCadence, cfg.atlasMatraMaxAspect, cfg.atlasMatraMinDim, cfg.atlasMatraDamping);
 	printf("\n");
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ADAMW_GROUP, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_ECHO, VARIANT_ATLAS_BIMAP, VARIANT_ATLAS_PACT, VARIANT_ATLAS_RACER, VARIANT_ATLAS_KRON, VARIANT_ATLAS_MUON };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ADAMW_GROUP, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_ECHO, VARIANT_ATLAS_BIMAP, VARIANT_ATLAS_PACT, VARIANT_ATLAS_RACER, VARIANT_ATLAS_KRON, VARIANT_ATLAS_MUON, VARIANT_ATLAS_MATRA };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	std::vector<VariantKind> summaryVariants;
@@ -6271,6 +6387,7 @@ static bool run_token_case(const BenchConfig& cfg)
 		int racerIndex = -1;
 		int kronIndex = -1;
 		int muonIndex = -1;
+		int matraIndex = -1;
 		for (size_t i = 0; i < summaryVariants.size(); ++i)
 		{
 			if (summaryVariants[i] == VARIANT_ADAMW)
@@ -6293,8 +6410,10 @@ static bool run_token_case(const BenchConfig& cfg)
 				kronIndex = static_cast<int>(i);
 			else if (summaryVariants[i] == VARIANT_ATLAS_MUON)
 				muonIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_MATRA)
+				matraIndex = static_cast<int>(i);
 		}
-		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || echoIndex >= 0 || bimapIndex >= 0 || pactIndex >= 0 || racerIndex >= 0 || kronIndex >= 0 || muonIndex >= 0))
+		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || echoIndex >= 0 || bimapIndex >= 0 || pactIndex >= 0 || racerIndex >= 0 || kronIndex >= 0 || muonIndex >= 0 || matraIndex >= 0))
 		{
 			printf("  AdamW gap comparison:\n");
 			if (baseIndex >= 0)
@@ -6324,6 +6443,9 @@ static bool run_token_case(const BenchConfig& cfg)
 			if (muonIndex >= 0)
 				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
 				                                 summaries[static_cast<size_t>(muonIndex)]);
+			if (matraIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(matraIndex)]);
 		}
 	}
 	printf("\n");

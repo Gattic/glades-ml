@@ -28,6 +28,15 @@ MUON_MAX_ASPECT=1.50
 MUON_MIN_DIM=8
 MUON_DAMPING=0.01
 
+MATRA_GEOM=1.0
+MATRA_ORTH=0.5
+MATRA_PRED=0.05
+MATRA_TRUST=0.50
+MATRA_CADENCE=1
+MATRA_MAX_ASPECT=1.50
+MATRA_MIN_DIM=8
+MATRA_DAMPING=0.01
+
 BIMAP_SCOPE="late-head"
 BIMAP_RANK=8
 BIMAP_LITE_CADENCE=1
@@ -48,6 +57,7 @@ Runs a clean same-codebase GPU ranking gate for:
   - AdamW
   - ATLAS-ECHO late-head
   - ATLAS-MUON-lite
+  - ATLAS-MATRA
   - ATLAS-BiMAP-lite
 
 Optional:
@@ -155,7 +165,7 @@ append_epoch_summary() {
   local epochs="$3"
   local logfile="$4"
   awk -v benchmark="$benchmark" -v optimizer="$optimizer" -v epochs="$epochs" -v logfile="$logfile" '
-    /^(AdamW|ATLAS-ECHO|ATLAS-BIMAP|ATLAS-MUON)[[:space:]]/ && NF >= 20 {
+    /^(AdamW|ATLAS-ECHO|ATLAS-BIMAP|ATLAS-MUON|ATLAS-MATRA)[[:space:]]/ && NF >= 20 {
       printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
              benchmark, optimizer, epochs,
              $2, $4, $5, $7, $8, $10, $14, $16, $20, logfile;
@@ -169,7 +179,7 @@ append_acceptance_summary() {
   local optimizer="$2"
   local logfile="$3"
   awk -v benchmark="$benchmark" -v optimizer="$optimizer" -v logfile="$logfile" '
-    /^(AdamW|ATLAS-ECHO|ATLAS-BIMAP|ATLAS-MUON)[[:space:]]/ && NF >= 20 {
+    /^(AdamW|ATLAS-ECHO|ATLAS-BIMAP|ATLAS-MUON|ATLAS-MATRA)[[:space:]]/ && NF >= 20 {
       printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
              benchmark, optimizer,
              $2, $4, $5, $7, $8, $10, $14, $16, $20, logfile;
@@ -263,9 +273,11 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   run_capture 06_bimap_micro "$BIN" atlas-bimap-micro
   run_capture 07_muon_core "$BIN" atlas-muon-core
   run_capture 08_muon_micro "$BIN" atlas-muon-micro
+  run_capture 09_matra_core "$BIN" atlas-matra-core
+  run_capture 10_matra_parity "$BIN" atlas-matra-parity
 fi
 
-run_capture 09_smoke_echo_gpu \
+run_capture 11_smoke_echo_gpu \
   "$BIN" atlas-alt-bench \
   --mode token-lm \
   --token-epochs 1 \
@@ -283,7 +295,7 @@ run_capture 09_smoke_echo_gpu \
   --gpu-enable 1 \
   --gpu-device "$GPU_DEVICE"
 
-run_capture 10_smoke_bimap_gpu \
+run_capture 12_smoke_bimap_gpu \
   "$BIN" atlas-alt-bench \
   --mode token-lm \
   --token-epochs 1 \
@@ -295,7 +307,7 @@ run_capture 10_smoke_bimap_gpu \
   --gpu-enable 1 \
   --gpu-device "$GPU_DEVICE"
 
-run_capture 11_smoke_muon_gpu \
+run_capture 13_smoke_muon_gpu \
   "$BIN" atlas-alt-bench \
   --mode token-lm \
   --token-epochs 1 \
@@ -306,6 +318,23 @@ run_capture 11_smoke_muon_gpu \
   --atlas-muon-max-aspect "$MUON_MAX_ASPECT" \
   --atlas-muon-min-dim "$MUON_MIN_DIM" \
   --atlas-muon-damping "$MUON_DAMPING" \
+  --gpu-enable 1 \
+  --gpu-device "$GPU_DEVICE"
+
+run_capture 14_smoke_matra_gpu \
+  "$BIN" atlas-alt-bench \
+  --mode token-lm \
+  --token-epochs 1 \
+  --repeats 1 \
+  --variant matra \
+  --atlas-matra-geometry-scale "$MATRA_GEOM" \
+  --atlas-matra-orthogonal-scale "$MATRA_ORTH" \
+  --atlas-matra-predictive-scale "$MATRA_PRED" \
+  --atlas-matra-trust-radius "$MATRA_TRUST" \
+  --atlas-matra-cadence "$MATRA_CADENCE" \
+  --atlas-matra-max-aspect "$MATRA_MAX_ASPECT" \
+  --atlas-matra-min-dim "$MATRA_MIN_DIM" \
+  --atlas-matra-damping "$MATRA_DAMPING" \
   --gpu-enable 1 \
   --gpu-device "$GPU_DEVICE"
 
@@ -343,6 +372,18 @@ for benchmark in "${BENCHMARKS[@]}"; do
       --atlas-muon-max-aspect "$MUON_MAX_ASPECT" \
       --atlas-muon-min-dim "$MUON_MIN_DIM" \
       --atlas-muon-damping "$MUON_DAMPING"
+
+    run_variant_epoch "sweep_${benchmark}_matra_e${epochs}" \
+      "$benchmark" "$epochs" "matra" \
+      --variant matra \
+      --atlas-matra-geometry-scale "$MATRA_GEOM" \
+      --atlas-matra-orthogonal-scale "$MATRA_ORTH" \
+      --atlas-matra-predictive-scale "$MATRA_PRED" \
+      --atlas-matra-trust-radius "$MATRA_TRUST" \
+      --atlas-matra-cadence "$MATRA_CADENCE" \
+      --atlas-matra-max-aspect "$MATRA_MAX_ASPECT" \
+      --atlas-matra-min-dim "$MATRA_MIN_DIM" \
+      --atlas-matra-damping "$MATRA_DAMPING"
 
     if [[ "$INCLUDE_BIMAP_V2" -eq 1 ]]; then
       run_variant_epoch "sweep_${benchmark}_bimap_v2_e${epochs}" \
@@ -392,6 +433,18 @@ if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
       --atlas-muon-min-dim "$MUON_MIN_DIM" \
       --atlas-muon-damping "$MUON_DAMPING"
 
+    run_variant_accept "accept_${benchmark}_matra" \
+      "$benchmark" "matra" \
+      --variant matra \
+      --atlas-matra-geometry-scale "$MATRA_GEOM" \
+      --atlas-matra-orthogonal-scale "$MATRA_ORTH" \
+      --atlas-matra-predictive-scale "$MATRA_PRED" \
+      --atlas-matra-trust-radius "$MATRA_TRUST" \
+      --atlas-matra-cadence "$MATRA_CADENCE" \
+      --atlas-matra-max-aspect "$MATRA_MAX_ASPECT" \
+      --atlas-matra-min-dim "$MATRA_MIN_DIM" \
+      --atlas-matra-damping "$MATRA_DAMPING"
+
     if [[ "$INCLUDE_BIMAP_V2" -eq 1 ]]; then
       run_variant_accept "accept_${benchmark}_bimap_v2" \
         "$benchmark" "bimap_v2" \
@@ -413,7 +466,7 @@ Output directory: $OUT_DIR
 
 Purpose:
 - apples-to-apples ranking gate on the current codebase
-- compares AdamW, live ECHO late-head, current exact-path MUON-lite, and BiMAP-lite
+- compares AdamW, live ECHO late-head, current exact-path MUON-lite, MATRA, and BiMAP-lite
 - optional BiMAP-v2 inclusion via --include-bimap-v2
 
 Files:

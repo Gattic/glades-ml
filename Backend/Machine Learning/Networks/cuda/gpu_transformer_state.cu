@@ -24,11 +24,13 @@ GpuTransformerWeights::GpuTransformerWeights()
       d_adamRowMetric(0), d_adamColMetric(0),
       d_adamRowStructMetric(0), d_adamColStructMetric(0),
       d_adamPrevMhat(0), d_adamMetricScratch(0), d_echoObserveEntries(0),
+      d_matraBatchItems(0), d_matraStatsBatch(0),
+      d_matraCoreBatchPtrs(0), d_matraStepBatchPtrs(0), d_matraInfoBatch(0),
       d_muonBatchItems(0),
       d_muonCoreBatchPtrs(0), d_muonStepBatchPtrs(0), d_muonInfoBatch(0),
       d_adamBaseLr(0), d_adamWd(0), d_adamGroupScales(0), d_adamGroupPrevStepRms(0), d_adamSizes(0),
       d_adamMetricRows(0), d_adamMetricCols(0),
-      adamGroupCount(0), adamMaxSize(0), echoObserveCapacity(0), muonCoreBatchCapacity(0),
+      adamGroupCount(0), adamMaxSize(0), echoObserveCapacity(0), matraCoreBatchCapacity(0), muonCoreBatchCapacity(0),
       echoObserveEntryCount(0), echoObserveTotalFeatures(0),
       echoObserveSeqLen(0u), echoObserveScope(0u), echoObserveTokenModel(false),
       echoObserveMetaUploaded(false),
@@ -226,18 +228,29 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		e = cudaMalloc(&d_adamGroupScales, maxGroups * sizeof(float)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamGroupPrevStepRms, maxGroups * sizeof(float)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_adamSizes,  maxGroups * sizeof(int));     if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_matraBatchItems, maxGroups * sizeof(GpuMatraBatchItem)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_matraStatsBatch, static_cast<size_t>(maxGroups) * 20u * sizeof(float)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_matraCoreBatchPtrs, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_matraStepBatchPtrs, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
+		e = cudaMalloc(&d_matraInfoBatch, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_muonBatchItems, maxGroups * sizeof(GpuMuonBatchItem)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_muonCoreBatchPtrs, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_muonStepBatchPtrs, maxGroups * sizeof(float*)); if (e != cudaSuccess) return false;
 		e = cudaMalloc(&d_muonInfoBatch, maxGroups * sizeof(int)); if (e != cudaSuccess) return false;
 		cudaMemset(d_adamGroupScales, 0, maxGroups * sizeof(float));
 		cudaMemset(d_adamGroupPrevStepRms, 0, maxGroups * sizeof(float));
+		cudaMemset(d_matraBatchItems, 0, maxGroups * sizeof(GpuMatraBatchItem));
+		cudaMemset(d_matraStatsBatch, 0, static_cast<size_t>(maxGroups) * 20u * sizeof(float));
+		cudaMemset(d_matraCoreBatchPtrs, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_matraStepBatchPtrs, 0, maxGroups * sizeof(float*));
+		cudaMemset(d_matraInfoBatch, 0, maxGroups * sizeof(int));
 		cudaMemset(d_muonBatchItems, 0, maxGroups * sizeof(GpuMuonBatchItem));
 		cudaMemset(d_muonCoreBatchPtrs, 0, maxGroups * sizeof(float*));
 		cudaMemset(d_muonStepBatchPtrs, 0, maxGroups * sizeof(float*));
 		cudaMemset(d_muonInfoBatch, 0, maxGroups * sizeof(int));
 		adamGroupCount = 0;
 		adamMaxSize = 0;
+		matraCoreBatchCapacity = maxGroups;
 		muonCoreBatchCapacity = maxGroups;
 		adamPtrsUploaded = false;
 		adamMetricMetaUploaded = false;
@@ -316,6 +329,11 @@ void GpuTransformerWeights::free()
 	if (d_adamPrevMhat) { cudaFree(d_adamPrevMhat); d_adamPrevMhat = 0; }
 	if (d_adamMetricScratch) { cudaFree(d_adamMetricScratch); d_adamMetricScratch = 0; }
 	if (d_echoObserveEntries) { cudaFree(d_echoObserveEntries); d_echoObserveEntries = 0; }
+	if (d_matraBatchItems) { cudaFree(d_matraBatchItems); d_matraBatchItems = 0; }
+	if (d_matraStatsBatch) { cudaFree(d_matraStatsBatch); d_matraStatsBatch = 0; }
+	if (d_matraCoreBatchPtrs) { cudaFree(d_matraCoreBatchPtrs); d_matraCoreBatchPtrs = 0; }
+	if (d_matraStepBatchPtrs) { cudaFree(d_matraStepBatchPtrs); d_matraStepBatchPtrs = 0; }
+	if (d_matraInfoBatch) { cudaFree(d_matraInfoBatch); d_matraInfoBatch = 0; }
 	if (d_muonBatchItems) { cudaFree(d_muonBatchItems); d_muonBatchItems = 0; }
 	if (d_muonCoreBatchPtrs) { cudaFree(d_muonCoreBatchPtrs); d_muonCoreBatchPtrs = 0; }
 	if (d_muonStepBatchPtrs) { cudaFree(d_muonStepBatchPtrs); d_muonStepBatchPtrs = 0; }
@@ -330,6 +348,7 @@ void GpuTransformerWeights::free()
 	adamGroupCount = 0;
 	adamMaxSize = 0;
 	echoObserveCapacity = 0;
+	matraCoreBatchCapacity = 0;
 	muonCoreBatchCapacity = 0;
 	echoObserveEntryCount = 0;
 	echoObserveTotalFeatures = 0;
