@@ -105,6 +105,38 @@ static bool muon_matrix_eligible(const glades::ATLASConfig& ac,
 	return aspect <= std::max(1.0f, ac.muonMaxAspect);
 }
 
+static bool argos_scope_uses_head(const glades::ATLASConfig& ac)
+{
+	return ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_ALL
+	    || ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_HEAD_ONLY
+	    || ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_LATE_HEAD;
+}
+
+static bool argos_scope_uses_late_block(const glades::ATLASConfig& ac)
+{
+	return ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_ALL
+	    || ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_LATE_ONLY
+	    || ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_LATE_HEAD;
+}
+
+static bool argos_scope_uses_input_block(const glades::ATLASConfig& ac)
+{
+	return ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_ALL;
+}
+
+static bool argos_scope_uses_decoder_block(const glades::ATLASConfig& ac,
+                                           unsigned int blockIndex,
+                                           unsigned int layerCount)
+{
+	if (!argos_scope_uses_late_block(ac))
+		return false;
+	if (ac.argosScope == glades::ATLASConfig::ARGOS_SCOPE_ALL)
+		return true;
+	if (layerCount == 0u)
+		return false;
+	return blockIndex + 1u == layerCount;
+}
+
 static bool matra_batch_eligible(const glades::ATLASConfig& ac,
                                  unsigned int rows,
                                  unsigned int cols)
@@ -229,6 +261,51 @@ struct MatraBatchGroup
 	{
 	}
 };
+
+static unsigned int argos_role_flags_for_head()
+{
+	return glades::atlas::ARGOS_ROLE_HEAD;
+}
+
+static unsigned int argos_role_flags_for_block(unsigned int blockIndex,
+                                               unsigned int nLayers)
+{
+	unsigned int flags = glades::atlas::ARGOS_ROLE_NONE;
+	if ((blockIndex + 1u) == nLayers)
+		flags |= glades::atlas::ARGOS_ROLE_LATE;
+	return flags;
+}
+
+static bool run_argos_gpu(glades::gpu::GpuArgosWeightState& state,
+                          glades::gpu::GpuBuffer<float>& param,
+                          glades::gpu::GpuBuffer<float>& grad,
+                          glades::gpu::GpuBuffer<float>& m1,
+                          glades::gpu::GpuBuffer<float>& v2,
+                          unsigned int rows,
+                          unsigned int cols,
+                          float lr,
+                          float invBatch,
+                          float gradScale,
+                          float inv1mB1t,
+                          float inv1mB2t,
+                          float adamEps,
+                          const glades::ATLASConfig& ac,
+                          unsigned int roleFlags,
+                          shmea::GLogger* logger,
+                          const char* tag)
+{
+	if (param.size() == 0u)
+		return true;
+	return glades::gpu::argos_gpu_update_with_role(state,
+	                                               param.data(), grad.data(),
+	                                               m1.data(), v2.data(),
+	                                               rows, cols, lr,
+	                                               invBatch, gradScale,
+	                                               inv1mB1t, inv1mB2t, adamEps,
+	                                               ac,
+	                                               roleFlags,
+	                                               logger, tag);
+}
 
 static bool queue_or_run_matra_gpu(std::vector<MatraBatchGroup>& groups,
                                    glades::gpu::GpuTransformerWeights* gpuTransformerWeights,
@@ -2035,6 +2112,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				const bool racerEnabled = ac.racerEnabled;
 				const bool kronEnabled = ac.kronEnabled;
 				const bool matraEnabled = ac.matraEnabled;
+				const bool argosEnabled = ac.argosEnabled;
 				const bool muonEnabled = ac.muonEnabled;
 				const bool auroraAdamwBackbone = ac.auroraEnabled && ac.auroraAdamwBackbone;
 				const float beta1 = net.trainingConfig.optimizer.adamBeta1;
@@ -4660,6 +4738,34 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
 						                   invBatch, gradScale);
 					}
+					else if (argosEnabled)
+					{
+						if (argos_scope_uses_head(ac))
+						{
+							if (!atlas::argosUpdateWithRole(tt.argosTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
+							                                tt.vocabSize, dmTT, lr,
+							                                beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                                invBatch, gradScale, wd1, wd2,
+							                                ac,
+							                                argos_role_flags_for_head(),
+							                                net.getLogger(), "tr.tokE"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: ARGOS tokE update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
+						}
+						else
+						{
+							Adam::update_weight(tt.tokE, tt.vTokE, tt.v2TokE, tt.gTokE,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
+						}
+						Adam::update_param(tt.lmBias, tt.mLmBias, tt.v2LmBias, tt.gLmBias,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
 					else if (muonEnabled)
 					{
 						if (!atlas::muonUpdate(tt.muonTokE, &tt.tokE[0], &tt.vTokE[0], &tt.v2TokE[0], &tt.gTokE[0],
@@ -4879,6 +4985,34 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 								"SGDHelper_Transformer: MATRA WIn update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
+						}
+						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (argosEnabled)
+					{
+						if (argos_scope_uses_input_block(ac))
+						{
+							if (!atlas::argosUpdateWithRole(tt.argosWIn, &tt.WIn[0], &tt.vWIn[0], &tt.v2WIn[0], &tt.gWIn[0],
+							                                dmTT, tt.inputSize, lr,
+							                                beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                                invBatch, gradScale, wd1, wd2,
+							                                ac,
+							                                glades::atlas::ARGOS_ROLE_NONE,
+							                                net.getLogger(), "tr.WIn"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: ARGOS WIn update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
+						}
+						else
+						{
+							Adam::update_weight(tt.WIn, tt.vWIn, tt.v2WIn, tt.gWIn,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
 						}
 						Adam::update_param(tt.bIn, tt.mBIn, tt.v2BIn, tt.gBIn,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
@@ -5246,6 +5380,55 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
+					else if (argosEnabled)
+					{
+						const unsigned int argosRoleFlags = argos_role_flags_for_block(li, nLayers);
+						const bool useArgosBlock = argos_scope_uses_decoder_block(ac, li, nLayers);
+						if ((useArgosBlock
+						     && (!atlas::argosUpdateWithRole(b.argosWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
+						                                   dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                                   invBatch, gradScale, wd1, wd2, ac, argosRoleFlags, net.getLogger(), "tr.Wq")
+						         || !atlas::argosUpdateWithRole(b.argosWk, &b.Wk[0], &b.vWk[0], &b.v2Wk[0], &b.gWk[0],
+						                                        dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                                        invBatch, gradScale, wd1, wd2, ac, argosRoleFlags, net.getLogger(), "tr.Wk")
+						         || !atlas::argosUpdateWithRole(b.argosWv, &b.Wv[0], &b.vWv[0], &b.v2Wv[0], &b.gWv[0],
+						                                        dModelKVTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                                        invBatch, gradScale, wd1, wd2, ac, argosRoleFlags, net.getLogger(), "tr.Wv")
+						         || !atlas::argosUpdateWithRole(b.argosWo, &b.Wo[0], &b.vWo[0], &b.v2Wo[0], &b.gWo[0],
+						                                        dmTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                                        invBatch, gradScale, wd1, wd2, ac, argosRoleFlags, net.getLogger(), "tr.Wo")
+						         || !atlas::argosUpdateWithRole(b.argosW1, &b.W1[0], &b.vW1[0], &b.v2W1[0], &b.gW1[0],
+						                                        ff1WidthTT, dmTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                                        invBatch, gradScale, wd1, wd2, ac, argosRoleFlags, net.getLogger(), "tr.W1")
+						         || !atlas::argosUpdateWithRole(b.argosW2, &b.W2[0], &b.vW2[0], &b.v2W2[0], &b.gW2[0],
+						                                        dmTT, dFFTT, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                                        invBatch, gradScale, wd1, wd2, ac, argosRoleFlags, net.getLogger(), "tr.W2"))))
+						{
+							net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+								"SGDHelper_Transformer: ARGOS block weight update entered NaN recovery");
+							net.storeRunningFlag(false);
+							return false;
+						}
+						if (!useArgosBlock)
+						{
+							Adam::update_weight(b.Wq, b.vWq, b.v2Wq, b.gWq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.Wk, b.vWk, b.v2Wk, b.gWk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.Wv, b.vWv, b.v2Wv, b.gWv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.Wo, b.vWo, b.v2Wo, b.gWo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.W1, b.vW1, b.v2W1, b.gW1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+							Adam::update_weight(b.W2, b.vW2, b.v2W2, b.gW2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale, wd1, wd2);
+						}
+						Adam::update_param(b.bq, b.mBq, b.v2Bq, b.gBq, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bk, b.mBk, b.v2Bk, b.gBk, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bv, b.mBv, b.v2Bv, b.gBv, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.bo, b.mBo, b.v2Bo, b.gBo, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b1, b.mB1, b.v2B1, b.gB1, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.b2, b.mB2, b.v2B2, b.gB2, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Gamma, b.mLn1Gamma, b.v2Ln1Gamma, b.gLn1Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln1Beta, b.mLn1Beta, b.v2Ln1Beta, b.gLn1Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Gamma, b.mLn2Gamma, b.v2Ln2Gamma, b.gLn2Gamma, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(b.ln2Beta, b.mLn2Beta, b.v2Ln2Beta, b.gLn2Beta, lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
 					else if (muonEnabled)
 					{
 						if (!atlas::muonUpdate(b.muonWq, &b.Wq[0], &b.vWq[0], &b.v2Wq[0], &b.gWq[0],
@@ -5395,6 +5578,13 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
 					}
 					else if (matraEnabled)
+					{
+						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+						Adam::update_param(tt.lnFinalBeta, tt.mLnFinalBeta, tt.v2LnFinalBeta, tt.gLnFinalBeta,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
+					}
+					else if (argosEnabled)
 					{
 						Adam::update_param(tt.lnFinalGamma, tt.mLnFinalGamma, tt.v2LnFinalGamma, tt.gLnFinalGamma,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps, invBatch, gradScale);
@@ -5567,6 +5757,34 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 								"SGDHelper_Transformer: MATRA WOut update entered NaN recovery");
 							net.storeRunningFlag(false);
 							return false;
+						}
+						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
+						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+						                   invBatch, gradScale);
+					}
+					else if (argosEnabled)
+					{
+						if (argos_scope_uses_head(ac))
+						{
+							if (!atlas::argosUpdateWithRole(tt.argosWOut, &tt.WOut[0], &tt.vWOut[0], &tt.v2WOut[0], &tt.gWOut[0],
+							                                outSize, dmTT, lr,
+							                                beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                                invBatch, gradScale, wd1, wd2,
+							                                ac,
+							                                argos_role_flags_for_head(),
+							                                net.getLogger(), "tr.WOut"))
+							{
+								net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+									"SGDHelper_Transformer: ARGOS WOut update entered NaN recovery");
+								net.storeRunningFlag(false);
+								return false;
+							}
+						}
+						else
+						{
+							Adam::update_weight(tt.WOut, tt.vWOut, tt.v2WOut, tt.gWOut,
+							                    lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
+							                    invBatch, gradScale, wd1, wd2);
 						}
 						Adam::update_param(tt.bOut, tt.mBOut, tt.v2BOut, tt.gBOut,
 						                   lr, beta1, beta2, inv1mB1t, inv1mB2t, eps,
@@ -8462,6 +8680,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	    && !trainingConfig.atlas.pactEnabled
 	    && !trainingConfig.atlas.racerEnabled
 	    && !trainingConfig.atlas.matraEnabled
+	    && !trainingConfig.atlas.argosEnabled
 	    && !trainingConfig.atlas.muonEnabled;
 	std::vector<glades::gpu::GpuEchoObserveEntry> echoObserveEntries;
 	echoObserveEntries.reserve(static_cast<size_t>(2u + 6u * nLayers));
@@ -9499,13 +9718,14 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			const bool gpuUsePact = gpuUseAtlas && trainingConfig.atlas.pactEnabled;
 			const bool gpuUseRacer = gpuUseAtlas && trainingConfig.atlas.racerEnabled;
 			const bool gpuUseMatra = gpuUseAtlas && trainingConfig.atlas.matraEnabled;
+			const bool gpuUseArgos = gpuUseAtlas && trainingConfig.atlas.argosEnabled;
 			const bool gpuUseMuon = gpuUseAtlas && trainingConfig.atlas.muonEnabled;
 			const bool gpuFuseEcho =
-			    gpuUseEcho && !gpuUseGeode && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMatra && !gpuUseMuon;
+			    gpuUseEcho && !gpuUseGeode && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMatra && !gpuUseArgos && !gpuUseMuon;
 			const bool gpuUseGroupAdam =
 			    (!gpuUseAtlas) && trainingConfig.optimizer.adamGroupwiseEnabled;
 
-			if (gpuUseAtlas && !gpuUseGeode && !gpuUseEcho && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMatra && !gpuUseMuon)
+			if (gpuUseAtlas && !gpuUseGeode && !gpuUseEcho && !gpuUseBiMAP && !gpuUsePact && !gpuUseRacer && !gpuUseMatra && !gpuUseArgos && !gpuUseMuon)
 			{
 			// === GPU ATLAS optimizer ===
 			// Weight matrices use atlas_gpu_step (BRSP subspace preconditioning).
@@ -10664,6 +10884,128 @@ if (ad_.valid) { \
 					{
 						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
 						                            "SGDHelper_TRANSFORMER: GPU MATRA residual update failed");
+						storeRunningFlag(false);
+					}
+				}
+				if (gpuUseArgos)
+				{
+					bool gpuArgosError = false;
+
+					if (tokenLM)
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (argos_scope_uses_head(ac)
+						    && !gpuArgosError
+						    && !run_argos_gpu(gpuTransformerWeights->argosTokE,
+						                      gpuTransformerWeights->tokE,
+						                      gpuTransformerWeights->gTokE,
+						                      gpuTransformerWeights->vTokE,
+						                      gpuTransformerWeights->v2TokE,
+						                      vocabSize, dModel, lr0,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac,
+						                      argos_role_flags_for_head(),
+						                      getLogger(), "tr.tokE"))
+							gpuArgosError = true;
+					}
+					else
+					{
+						const float lr0 =
+						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (argos_scope_uses_input_block(ac)
+						    && !gpuArgosError
+						    && !run_argos_gpu(gpuTransformerWeights->argosWIn,
+						                      gpuTransformerWeights->WIn,
+						                      gpuTransformerWeights->gWIn,
+						                      gpuTransformerWeights->vWIn,
+						                      gpuTransformerWeights->v2WIn,
+						                      dModel, inputSize, lr0,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac,
+						                      glades::atlas::ARGOS_ROLE_NONE,
+						                      getLogger(), "tr.WIn"))
+							gpuArgosError = true;
+					}
+
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						const float lr_l =
+						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const unsigned int argosRoleFlags = argos_role_flags_for_block(bli, nLayers);
+						if (!argos_scope_uses_decoder_block(ac, bli, nLayers))
+							continue;
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						if (!gpuArgosError
+						    && !run_argos_gpu(gb.argosWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq,
+						                      dModel, dModel, lr_l,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac, argosRoleFlags, getLogger(), "tr.Wq"))
+							gpuArgosError = true;
+						if (!gpuArgosError
+						    && !run_argos_gpu(gb.argosWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk,
+						                      dModelKV, dModel, lr_l,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac, argosRoleFlags, getLogger(), "tr.Wk"))
+							gpuArgosError = true;
+						if (!gpuArgosError
+						    && !run_argos_gpu(gb.argosWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv,
+						                      dModelKV, dModel, lr_l,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac, argosRoleFlags, getLogger(), "tr.Wv"))
+							gpuArgosError = true;
+						if (!gpuArgosError
+						    && !run_argos_gpu(gb.argosWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo,
+						                      dModel, dModel, lr_l,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac, argosRoleFlags, getLogger(), "tr.Wo"))
+							gpuArgosError = true;
+						if (!gpuArgosError
+						    && !run_argos_gpu(gb.argosW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1,
+						                      ff1Width, dModel, lr_l,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac, argosRoleFlags, getLogger(), "tr.W1"))
+							gpuArgosError = true;
+						if (!gpuArgosError
+						    && !run_argos_gpu(gb.argosW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2,
+						                      dModel, dFF, lr_l,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac, argosRoleFlags, getLogger(), "tr.W2"))
+							gpuArgosError = true;
+					}
+
+					if (!tokenLM)
+					{
+						const float lrO =
+						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						if (argos_scope_uses_head(ac)
+						    && !gpuArgosError
+						    && !run_argos_gpu(gpuTransformerWeights->argosWOut,
+						                      gpuTransformerWeights->WOut,
+						                      gpuTransformerWeights->gWOut,
+						                      gpuTransformerWeights->vWOut,
+						                      gpuTransformerWeights->v2WOut,
+						                      outSize, dModel, lrO,
+						                      invBatch, gradScale,
+						                      inv1mB1t, inv1mB2t, adamEps,
+						                      ac,
+						                      argos_role_flags_for_head(),
+						                      getLogger(), "tr.WOut"))
+							gpuArgosError = true;
+					}
+
+					if (gpuArgosError)
+					{
+						lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+						                            "SGDHelper_TRANSFORMER: GPU ARGOS residual update failed");
 						storeRunningFlag(false);
 					}
 				}

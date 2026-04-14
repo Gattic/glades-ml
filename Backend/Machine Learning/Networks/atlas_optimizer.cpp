@@ -2579,6 +2579,41 @@ void initMatraWeightState(MatraWeightState& state, unsigned int m, unsigned int 
 	state.initialized = true;
 }
 
+void initArgosWeightState(ArgosWeightState& state, unsigned int m, unsigned int n)
+{
+	state.reset();
+	state.m = m;
+	state.n = n;
+	state.rowSecond.assign(static_cast<size_t>(m), 1.0f);
+	state.colSecond.assign(static_cast<size_t>(n), 1.0f);
+	state.prevMhat.assign(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
+	state.backboneStep.assign(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
+	state.adamStep.assign(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
+	state.geomStep.assign(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
+	state.orthStep.assign(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
+	const unsigned int coreDim = std::max(1u, std::min(m, n));
+	state.coreScratch.assign(static_cast<size_t>(coreDim) * static_cast<size_t>(coreDim), 0.0f);
+	state.lastPredictiveTrust = 0.0f;
+	state.lastGeometryTrust = 0.0f;
+	state.lastOrthTrust = 0.0f;
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.lastAspect =
+	    (coreDim > 0u)
+	        ? (static_cast<float>(std::max(m, n)) / static_cast<float>(coreDim))
+	        : 1.0f;
+	state.lastSignalScale = 0.0f;
+	state.lastOrthError = 0.0f;
+	state.lastObservability = 0.0f;
+	state.lastRoleBonus = 0.0f;
+	state.lastAdamReward = 0.0f;
+	state.lastGeometryReward = 0.0f;
+	state.lastOrthReward = 0.0f;
+	state.lastEligible = false;
+	state.step = 0ULL;
+	state.initialized = true;
+}
+
 void initMuonWeightState(MuonWeightState& state, unsigned int m, unsigned int n)
 {
 	state.reset();
@@ -8417,6 +8452,98 @@ static void matra_compute_trust_weights(float geometryEvidence,
 		*orthTrustOut = orthTrust;
 }
 
+static float argos_role_bonus_from_flags(const ATLASConfig& ac, unsigned int roleFlags)
+{
+	float bonus = 0.0f;
+	if ((roleFlags & ARGOS_ROLE_HEAD) != 0u)
+		bonus += std::max(0.0f, ac.argosHeadBonus);
+	if ((roleFlags & ARGOS_ROLE_LATE) != 0u)
+		bonus += std::max(0.0f, ac.argosLateBonus);
+	return bonus;
+}
+
+static float argos_observability_score(float geometryEvidence,
+                                       float predictiveTrust,
+                                       float roleBonus,
+                                       const ATLASConfig& ac)
+{
+	const float signal =
+	    std::max(0.0f, ac.argosObservabilityScale) * matra_clamp_unit(geometryEvidence)
+	    + 0.5f * matra_clamp_unit(predictiveTrust)
+	    + std::max(0.0f, roleBonus);
+	return matra_clamp_unit(signal);
+}
+
+static float argos_reward_gain(float candidateReward,
+                               float anchorReward,
+                               float eps)
+{
+	const float diff = candidateReward - anchorReward;
+	if (!(diff > 0.0f))
+		return 0.0f;
+	const float denom =
+	    std::fabs(candidateReward) + std::fabs(anchorReward) + std::max(eps, 1.0e-12f);
+	return matra_clamp_unit(diff / denom);
+}
+
+static void argos_compute_trust_weights(float geometryGain,
+                                        float orthGain,
+                                        float observability,
+                                        float predictiveTrust,
+                                        bool orthEligible,
+                                        float trustRadiusBudget,
+                                        const ATLASConfig& ac,
+                                        float* geometryTrustOut,
+                                        float* orthTrustOut)
+{
+	float geometryTrust = 0.0f;
+	float orthTrust = 0.0f;
+	const float obs = matra_clamp_unit(observability);
+	const float budget =
+	    matra_clamp_unit(std::max(0.0f, trustRadiusBudget) * obs);
+	if (!(budget > 0.0f))
+	{
+		*geometryTrustOut = 0.0f;
+		*orthTrustOut = 0.0f;
+		return;
+	}
+	float geometryScore =
+	    std::max(0.0f, ac.argosGeometryScale)
+	    * obs
+	    * matra_clamp_unit(geometryGain);
+	float orthScore = 0.0f;
+	if (orthEligible)
+	{
+		orthScore =
+		    std::max(0.0f, ac.argosOrthogonalScale)
+		    * obs
+		    * matra_clamp_unit(orthGain)
+		    * (0.25f + 0.75f * matra_clamp_unit(predictiveTrust));
+	}
+
+	const float totalScore = geometryScore + orthScore;
+	if (budget > 0.0f && totalScore > budget && totalScore > 1.0e-12f)
+	{
+		const float scale = budget / totalScore;
+		geometryScore *= scale;
+		orthScore *= scale;
+	}
+
+	geometryTrust = matra_clamp_unit(geometryScore);
+	orthTrust = matra_clamp_unit(orthScore);
+	if (geometryTrust + orthTrust > 1.0f)
+	{
+		const float invSum = 1.0f / std::max(geometryTrust + orthTrust, 1.0e-12f);
+		geometryTrust *= invSum;
+		orthTrust *= invSum;
+	}
+
+	if (geometryTrustOut)
+		*geometryTrustOut = geometryTrust;
+	if (orthTrustOut)
+		*orthTrustOut = orthTrust;
+}
+
 static void bimap_refresh_low_rank_factors(BiMAPWeightState& state,
                                            const std::vector<float>& grad,
                                            unsigned int m,
@@ -10425,6 +10552,353 @@ bool matraUpdate(MatraWeightState& state,
 		append_kv(oss, "aspect", state.lastAspect);
 		append_kv(oss, "signalScale", state.lastSignalScale);
 		append_kv(oss, "orthErr", state.lastOrthError);
+		append_kv(oss, "cadence", cadence);
+		append_kv(oss, "orthCadence", orthCadence);
+		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+	}
+
+	return true;
+}
+
+bool argosUpdate(ArgosWeightState& state,
+                 float* W, float* m1, float* v2, float* gW,
+                 unsigned int m, unsigned int n,
+                 float lr,
+                 float beta1, float beta2,
+                 float inv1mB1t, float inv1mB2t,
+                 float eps,
+                 float invBatch, float gradScale,
+                 float wd1, float wd2,
+                 const ATLASConfig& ac,
+                 shmea::GLogger* logger,
+                 const char* tag)
+{
+	return argosUpdateWithRole(state, W, m1, v2, gW,
+	                           m, n,
+	                           lr,
+	                           beta1, beta2,
+	                           inv1mB1t, inv1mB2t,
+	                           eps,
+	                           invBatch, gradScale,
+	                           wd1, wd2,
+	                           ac,
+	                           ARGOS_ROLE_NONE,
+	                           logger, tag);
+}
+
+bool argosUpdateWithRole(ArgosWeightState& state,
+                         float* W, float* m1, float* v2, float* gW,
+                         unsigned int m, unsigned int n,
+                         float lr,
+                         float beta1, float beta2,
+                         float inv1mB1t, float inv1mB2t,
+                         float eps,
+                         float invBatch, float gradScale,
+                         float wd1, float wd2,
+                         const ATLASConfig& ac,
+                         unsigned int roleFlags,
+                         shmea::GLogger* logger,
+                         const char* tag)
+{
+	if (!W || !m1 || !v2 || !gW || m == 0u || n == 0u)
+		return true;
+	if (!state.initialized || state.m != m || state.n != n)
+		initArgosWeightState(state, m, n);
+	if (!state.initialized || state.m != m || state.n != n)
+		return false;
+
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float oneMinusB1 = 1.0f - beta1;
+	const float oneMinusB2 = 1.0f - beta2;
+	const float betaGeom = std::min<float>(std::max<float>(ac.beta, 0.0f), 1.0f);
+	const float argosWarmup = ac.argosWarmupMultiplier(state.step);
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.argosPredictiveScale)) * argosWarmup;
+	const float trustRadiusBudget =
+	    std::max(0.0f, ac.argosTrustRadius) * argosWarmup;
+	const unsigned int cadence = std::max(1u, ac.argosMetricCadence);
+	const unsigned int orthCadence = std::max(1u, ac.argosOrthCadence);
+	const bool refreshGeometry =
+	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(cadence)) == 0ULL);
+	const bool orthCadenceHit =
+	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(orthCadence)) == 0ULL);
+
+	std::vector<float> rowSample;
+	std::vector<float> colSample;
+	if (refreshGeometry)
+	{
+		rowSample.assign(static_cast<size_t>(m), 0.0f);
+		colSample.assign(static_cast<size_t>(n), 0.0f);
+	}
+
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		double rowSq = 0.0;
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const size_t idx = static_cast<size_t>(i) * n + j;
+			const float gScaledRaw = gW[idx] * invBatch * gradScale;
+			float g = gScaledRaw;
+			if (wd1 != 0.0f)
+				g += wd1 * atlas_sign(W[idx]) * gradScale;
+			m1[idx] = beta1 * m1[idx] + oneMinusB1 * g;
+			v2[idx] = beta2 * v2[idx] + oneMinusB2 * (g * g);
+			if (refreshGeometry)
+			{
+				const double g2 = static_cast<double>(gScaledRaw) * static_cast<double>(gScaledRaw);
+				rowSq += g2;
+				colSample[static_cast<size_t>(j)] += static_cast<float>(g2);
+			}
+		}
+		if (refreshGeometry)
+		{
+			rowSample[static_cast<size_t>(i)] =
+			    static_cast<float>(rowSq / static_cast<double>(std::max(1u, n)));
+		}
+	}
+
+	if (refreshGeometry)
+	{
+		for (unsigned int j = 0u; j < n; ++j)
+			colSample[static_cast<size_t>(j)] /=
+			    static_cast<float>(std::max(1u, m));
+		for (unsigned int i = 0u; i < m; ++i)
+			state.rowSecond[static_cast<size_t>(i)] =
+			    betaGeom * state.rowSecond[static_cast<size_t>(i)]
+			    + (1.0f - betaGeom) * std::max(rowSample[static_cast<size_t>(i)], 1.0e-12f);
+		for (unsigned int j = 0u; j < n; ++j)
+			state.colSecond[static_cast<size_t>(j)] =
+			    betaGeom * state.colSecond[static_cast<size_t>(j)]
+			    + (1.0f - betaGeom) * std::max(colSample[static_cast<size_t>(j)], 1.0e-12f);
+	}
+
+	double rowMean = 0.0;
+	double colMean = 0.0;
+	float rowMin = FLT_MAX;
+	float rowMax = 0.0f;
+	float colMin = FLT_MAX;
+	float colMax = 0.0f;
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		const float v = std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f);
+		rowMean += static_cast<double>(v);
+		rowMin = std::min(rowMin, v);
+		rowMax = std::max(rowMax, v);
+	}
+	for (unsigned int j = 0u; j < n; ++j)
+	{
+		const float v = std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f);
+		colMean += static_cast<double>(v);
+		colMin = std::min(colMin, v);
+		colMax = std::max(colMax, v);
+	}
+	const float rowMeanF =
+	    static_cast<float>(std::max(rowMean / static_cast<double>(std::max(1u, m)), 1.0e-12));
+	const float colMeanF =
+	    static_cast<float>(std::max(colMean / static_cast<double>(std::max(1u, n)), 1.0e-12));
+	const float rowAniso = (rowMin > 1.0e-12f) ? (rowMax / rowMin) : 1.0f;
+	const float colAniso = (colMin > 1.0e-12f) ? (colMax / colMin) : 1.0f;
+	const float geometryEvidence =
+	    0.5f * (matra_anisotropy_signal(rowAniso) + matra_anisotropy_signal(colAniso));
+
+	double dot = 0.0;
+	double curNorm = 0.0;
+	double prevNorm = 0.0;
+	if (predictiveScale > 0.0f && state.step > 0ULL && state.prevMhat.size() == mn)
+	{
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const double cur = static_cast<double>(m1[idx] * inv1mB1t);
+			const double prev = static_cast<double>(state.prevMhat[idx]);
+			dot += cur * prev;
+			curNorm += cur * cur;
+			prevNorm += prev * prev;
+		}
+	}
+	float predictiveTrust = 0.0f;
+	if (curNorm > 1.0e-18 && prevNorm > 1.0e-18)
+	{
+		const double cosine = dot / (std::sqrt(curNorm * prevNorm) + 1.0e-18);
+		predictiveTrust =
+		    predictiveScale * std::max(0.0f, std::min(1.0f, static_cast<float>(cosine)));
+	}
+
+	const unsigned int shortDim = std::min(m, n);
+	const unsigned int longDim = std::max(m, n);
+	const float aspect =
+	    static_cast<float>(longDim) / static_cast<float>(std::max(1u, shortDim));
+	const bool orthEligibleShape =
+	    (std::max(0.0f, ac.argosOrthogonalScale) > 0.0f)
+	    && (shortDim >= std::max(1u, ac.argosMinDim))
+	    && (aspect <= std::max(1.0f, ac.argosMaxAspect));
+	const bool orthEnabled = orthCadenceHit && orthEligibleShape;
+
+	double froSignalSq = 0.0;
+	for (unsigned int i = 0u; i < m; ++i)
+	{
+		const float rowScaleRaw =
+		    std::sqrt((std::max(state.rowSecond[static_cast<size_t>(i)], 1.0e-12f) + eps)
+		              / (rowMeanF + eps));
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			const size_t idx = static_cast<size_t>(i) * n + j;
+			const float vhat = v2[idx] * inv1mB2t;
+			const float diagDen =
+			    static_cast<float>(std::sqrt(static_cast<double>(std::max(vhat, 0.0f)))) + eps;
+			const float currentMhat = m1[idx] * inv1mB1t;
+			float effectiveMhat = currentMhat;
+			if (predictiveTrust > 0.0f && state.prevMhat.size() == mn)
+			{
+				float delta = currentMhat - state.prevMhat[idx];
+				const float deltaCap = 0.5f * (fabsf(currentMhat) + eps);
+				if (delta > deltaCap)
+					delta = deltaCap;
+				else if (delta < -deltaCap)
+					delta = -deltaCap;
+				effectiveMhat += predictiveTrust * delta;
+			}
+
+			const float backboneStep = currentMhat / diagDen;
+			const float adamStep = effectiveMhat / diagDen;
+			const float colScaleRaw =
+			    std::sqrt((std::max(state.colSecond[static_cast<size_t>(j)], 1.0e-12f) + eps)
+			              / (colMeanF + eps));
+			float matrixScale = rowScaleRaw * colScaleRaw;
+			if (matrixScale < 0.25f)
+				matrixScale = 0.25f;
+			else if (matrixScale > 4.0f)
+				matrixScale = 4.0f;
+
+			state.backboneStep[idx] = backboneStep;
+			state.adamStep[idx] = adamStep;
+			state.geomStep[idx] = adamStep / matrixScale;
+			state.orthStep[idx] = adamStep;
+			state.prevMhat[idx] = currentMhat;
+			froSignalSq += static_cast<double>(adamStep) * static_cast<double>(adamStep);
+		}
+	}
+
+	float signalScale = 0.0f;
+	float orthErr = 0.0f;
+	if (orthEnabled)
+	{
+		const std::vector<float> orthInput(state.orthStep.begin(), state.orthStep.end());
+		muon_polar_orthogonalize(orthInput, m, n, ac.argosDamping, eps,
+		                         state.orthStep, &orthErr);
+		const double froSignal = std::sqrt(std::max(0.0, froSignalSq));
+		signalScale =
+		    static_cast<float>(froSignal
+		                       / std::sqrt(static_cast<double>(std::max(1u, shortDim))));
+		for (size_t idx = 0u; idx < mn; ++idx)
+			state.orthStep[idx] *= signalScale;
+	}
+
+	double adamReward = 0.0;
+	double geomReward = 0.0;
+	double orthReward = 0.0;
+	for (size_t idx = 0u; idx < mn; ++idx)
+	{
+		const float vhat = std::max(v2[idx] * inv1mB2t, 0.0f);
+		const float diagDen =
+		    static_cast<float>(std::sqrt(static_cast<double>(vhat))) + eps;
+		const float effectiveMhat = state.adamStep[idx] * diagDen;
+		const float adamStep = state.adamStep[idx];
+		const float geomStep = state.geomStep[idx];
+		adamReward += static_cast<double>(effectiveMhat) * static_cast<double>(adamStep)
+		              - 0.5 * static_cast<double>(vhat)
+		                  * static_cast<double>(adamStep) * static_cast<double>(adamStep);
+		geomReward += static_cast<double>(effectiveMhat) * static_cast<double>(geomStep)
+		              - 0.5 * static_cast<double>(vhat)
+		                  * static_cast<double>(geomStep) * static_cast<double>(geomStep);
+		if (orthEnabled)
+		{
+			const float orthStep = state.orthStep[idx];
+			orthReward += static_cast<double>(effectiveMhat) * static_cast<double>(orthStep)
+			              - 0.5 * static_cast<double>(vhat)
+			                  * static_cast<double>(orthStep) * static_cast<double>(orthStep);
+		}
+	}
+	adamReward /= static_cast<double>(std::max<size_t>(1u, mn));
+	geomReward /= static_cast<double>(std::max<size_t>(1u, mn));
+	if (orthEnabled)
+		orthReward /= static_cast<double>(std::max<size_t>(1u, mn));
+	else
+		orthReward = adamReward;
+
+	const float roleBonus = argos_role_bonus_from_flags(ac, roleFlags);
+	const float observability =
+	    argos_observability_score(geometryEvidence, predictiveTrust, roleBonus, ac);
+	const float geometryGain =
+	    argos_reward_gain(static_cast<float>(geomReward), static_cast<float>(adamReward), eps);
+	const float orthGain =
+	    orthEnabled
+	        ? argos_reward_gain(static_cast<float>(orthReward), static_cast<float>(adamReward), eps)
+	        : 0.0f;
+
+	float geometryTrust = 0.0f;
+	float orthTrust = 0.0f;
+	argos_compute_trust_weights(geometryGain,
+	                            orthGain,
+	                            observability,
+	                            predictiveTrust,
+	                            orthEnabled,
+	                            trustRadiusBudget,
+	                            ac,
+	                            &geometryTrust,
+	                            &orthTrust);
+
+	for (size_t idx = 0u; idx < mn; ++idx)
+	{
+		float chosenStep =
+		    state.adamStep[idx] + geometryTrust * (state.geomStep[idx] - state.adamStep[idx]);
+		if (orthEnabled)
+			chosenStep += orthTrust * (state.orthStep[idx] - state.adamStep[idx]);
+		if (wd2 != 0.0f)
+			W[idx] -= lr * wd2 * W[idx];
+		W[idx] -= lr * chosenStep;
+		gW[idx] = 0.0f;
+		if (!atlas_isfinite(W[idx]))
+			return false;
+	}
+
+	state.lastPredictiveTrust = predictiveTrust;
+	state.lastGeometryTrust = geometryTrust;
+	state.lastOrthTrust = orthTrust;
+	state.lastRowAnisotropy = rowAniso;
+	state.lastColAnisotropy = colAniso;
+	state.lastAspect = aspect;
+	state.lastSignalScale = signalScale;
+	state.lastOrthError = orthErr;
+	state.lastObservability = observability;
+	state.lastRoleBonus = roleBonus;
+	state.lastAdamReward = static_cast<float>(adamReward);
+	state.lastGeometryReward = static_cast<float>(geomReward);
+	state.lastOrthReward = static_cast<float>(orthReward);
+	state.lastEligible = orthEnabled;
+	state.step += 1ULL;
+
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		std::ostringstream oss;
+		oss << "event=argos_step";
+		if (tag && tag[0])
+			append_kv(oss, "tag", tag);
+		append_kv(oss, "step", state.step);
+		append_kv(oss, "predTrust", state.lastPredictiveTrust);
+		append_kv(oss, "geomTrust", state.lastGeometryTrust);
+		append_kv(oss, "orthTrust", state.lastOrthTrust);
+		append_kv(oss, "rowAniso", state.lastRowAnisotropy);
+		append_kv(oss, "colAniso", state.lastColAnisotropy);
+		append_kv(oss, "eligible", state.lastEligible ? 1u : 0u);
+		append_kv(oss, "aspect", state.lastAspect);
+		append_kv(oss, "signalScale", state.lastSignalScale);
+		append_kv(oss, "orthErr", state.lastOrthError);
+		append_kv(oss, "obs", state.lastObservability);
+		append_kv(oss, "roleBonus", state.lastRoleBonus);
+		append_kv(oss, "adamReward", state.lastAdamReward);
+		append_kv(oss, "geomReward", state.lastGeometryReward);
+		append_kv(oss, "orthReward", state.lastOrthReward);
 		append_kv(oss, "cadence", cadence);
 		append_kv(oss, "orthCadence", orthCadence);
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));

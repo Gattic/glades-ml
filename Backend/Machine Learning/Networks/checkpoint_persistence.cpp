@@ -735,6 +735,21 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.atlas.matraMaxAspect", f)) { cfg.atlas.matraMaxAspect = f; any = true; }
 	if (parse_int(kv, "training.atlas.matraMinDim", i) && i >= 0) { cfg.atlas.matraMinDim = static_cast<unsigned int>(i); any = true; }
 	if (parse_float(kv, "training.atlas.matraDamping", f)) { cfg.atlas.matraDamping = f; any = true; }
+	if (parse_bool01(kv, "training.atlas.argosEnabled", b)) { cfg.atlas.argosEnabled = b; any = true; }
+	if (parse_int(kv, "training.atlas.argosScope", i) && i >= 0) { cfg.atlas.argosScope = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.argosGeometryScale", f)) { cfg.atlas.argosGeometryScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.argosOrthogonalScale", f)) { cfg.atlas.argosOrthogonalScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.argosPredictiveScale", f)) { cfg.atlas.argosPredictiveScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.argosTrustRadius", f)) { cfg.atlas.argosTrustRadius = f; any = true; }
+	if (parse_int(kv, "training.atlas.argosWarmupSteps", i) && i >= 0) { cfg.atlas.argosWarmupSteps = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.argosMetricCadence", i) && i >= 0) { cfg.atlas.argosMetricCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.argosOrthCadence", i) && i >= 0) { cfg.atlas.argosOrthCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.argosMaxAspect", f)) { cfg.atlas.argosMaxAspect = f; any = true; }
+	if (parse_int(kv, "training.atlas.argosMinDim", i) && i >= 0) { cfg.atlas.argosMinDim = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.argosDamping", f)) { cfg.atlas.argosDamping = f; any = true; }
+	if (parse_float(kv, "training.atlas.argosObservabilityScale", f)) { cfg.atlas.argosObservabilityScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.argosHeadBonus", f)) { cfg.atlas.argosHeadBonus = f; any = true; }
+	if (parse_float(kv, "training.atlas.argosLateBonus", f)) { cfg.atlas.argosLateBonus = f; any = true; }
 	if (parse_bool01(kv, "training.atlas.muonEnabled", b)) { cfg.atlas.muonEnabled = b; any = true; }
 	if (parse_float(kv, "training.atlas.muonGeometryScale", f)) { cfg.atlas.muonGeometryScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.muonPredictiveScale", f)) { cfg.atlas.muonPredictiveScale = f; any = true; }
@@ -1429,6 +1444,49 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.matraDamping; write_kv(out, "training.atlas.matraDamping", oss.str());
+	}
+	write_kv(out, "training.atlas.argosEnabled", trainingConfig.atlas.argosEnabled ? "1" : "0");
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosScope; write_kv(out, "training.atlas.argosScope", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosGeometryScale; write_kv(out, "training.atlas.argosGeometryScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosOrthogonalScale; write_kv(out, "training.atlas.argosOrthogonalScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosPredictiveScale; write_kv(out, "training.atlas.argosPredictiveScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosTrustRadius; write_kv(out, "training.atlas.argosTrustRadius", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosWarmupSteps; write_kv(out, "training.atlas.argosWarmupSteps", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosMetricCadence; write_kv(out, "training.atlas.argosMetricCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosOrthCadence; write_kv(out, "training.atlas.argosOrthCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosMaxAspect; write_kv(out, "training.atlas.argosMaxAspect", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosMinDim; write_kv(out, "training.atlas.argosMinDim", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosDamping; write_kv(out, "training.atlas.argosDamping", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosObservabilityScale; write_kv(out, "training.atlas.argosObservabilityScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosHeadBonus; write_kv(out, "training.atlas.argosHeadBonus", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosLateBonus; write_kv(out, "training.atlas.argosLateBonus", oss.str());
 	}
 	write_kv(out, "training.atlas.muonEnabled", trainingConfig.atlas.muonEnabled ? "1" : "0");
 	{
@@ -3198,6 +3256,156 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.matraDamping mismatch vs requested resume config (checkpoint "
 		    << savedMATRADamping << ", current " << currentCfg.atlas.matraDamping << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	bool savedARGOSEnabled = false;
+	if (parse_bool01(kv, "training.atlas.argosEnabled", savedARGOSEnabled) &&
+	    currentCfg.atlas.argosEnabled != savedARGOSEnabled)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosEnabled mismatch vs requested resume config (checkpoint "
+		    << (savedARGOSEnabled ? 1 : 0) << ", current " << (currentCfg.atlas.argosEnabled ? 1 : 0) << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedARGOSScope = 0;
+	if (parse_int(kv, "training.atlas.argosScope", savedARGOSScope) &&
+	    currentCfg.atlas.argosScope != static_cast<unsigned int>(savedARGOSScope))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosScope mismatch vs requested resume config (checkpoint "
+		    << savedARGOSScope << ", current " << currentCfg.atlas.argosScope << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSGeometryScale = 0.0f;
+	if (parse_float(kv, "training.atlas.argosGeometryScale", savedARGOSGeometryScale) &&
+	    fabsf(currentCfg.atlas.argosGeometryScale - savedARGOSGeometryScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosGeometryScale mismatch vs requested resume config (checkpoint "
+		    << savedARGOSGeometryScale << ", current " << currentCfg.atlas.argosGeometryScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSOrthogonalScale = 0.0f;
+	if (parse_float(kv, "training.atlas.argosOrthogonalScale", savedARGOSOrthogonalScale) &&
+	    fabsf(currentCfg.atlas.argosOrthogonalScale - savedARGOSOrthogonalScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosOrthogonalScale mismatch vs requested resume config (checkpoint "
+		    << savedARGOSOrthogonalScale << ", current " << currentCfg.atlas.argosOrthogonalScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSPredictiveScale = 0.0f;
+	if (parse_float(kv, "training.atlas.argosPredictiveScale", savedARGOSPredictiveScale) &&
+	    fabsf(currentCfg.atlas.argosPredictiveScale - savedARGOSPredictiveScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosPredictiveScale mismatch vs requested resume config (checkpoint "
+		    << savedARGOSPredictiveScale << ", current " << currentCfg.atlas.argosPredictiveScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSTrustRadius = 0.0f;
+	if (parse_float(kv, "training.atlas.argosTrustRadius", savedARGOSTrustRadius) &&
+	    fabsf(currentCfg.atlas.argosTrustRadius - savedARGOSTrustRadius) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosTrustRadius mismatch vs requested resume config (checkpoint "
+		    << savedARGOSTrustRadius << ", current " << currentCfg.atlas.argosTrustRadius << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedARGOSWarmupSteps = 0;
+	if (parse_int(kv, "training.atlas.argosWarmupSteps", savedARGOSWarmupSteps) &&
+	    currentCfg.atlas.argosWarmupSteps != static_cast<unsigned int>(savedARGOSWarmupSteps))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosWarmupSteps mismatch vs requested resume config (checkpoint "
+		    << savedARGOSWarmupSteps << ", current " << currentCfg.atlas.argosWarmupSteps << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedARGOSMetricCadence = 0;
+	if (parse_int(kv, "training.atlas.argosMetricCadence", savedARGOSMetricCadence) &&
+	    currentCfg.atlas.argosMetricCadence != static_cast<unsigned int>(savedARGOSMetricCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosMetricCadence mismatch vs requested resume config (checkpoint "
+		    << savedARGOSMetricCadence << ", current " << currentCfg.atlas.argosMetricCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedARGOSOrthCadence = 0;
+	if (parse_int(kv, "training.atlas.argosOrthCadence", savedARGOSOrthCadence) &&
+	    currentCfg.atlas.argosOrthCadence != static_cast<unsigned int>(savedARGOSOrthCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosOrthCadence mismatch vs requested resume config (checkpoint "
+		    << savedARGOSOrthCadence << ", current " << currentCfg.atlas.argosOrthCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSMaxAspect = 0.0f;
+	if (parse_float(kv, "training.atlas.argosMaxAspect", savedARGOSMaxAspect) &&
+	    fabsf(currentCfg.atlas.argosMaxAspect - savedARGOSMaxAspect) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosMaxAspect mismatch vs requested resume config (checkpoint "
+		    << savedARGOSMaxAspect << ", current " << currentCfg.atlas.argosMaxAspect << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedARGOSMinDim = 0;
+	if (parse_int(kv, "training.atlas.argosMinDim", savedARGOSMinDim) &&
+	    currentCfg.atlas.argosMinDim != static_cast<unsigned int>(savedARGOSMinDim))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosMinDim mismatch vs requested resume config (checkpoint "
+		    << savedARGOSMinDim << ", current " << currentCfg.atlas.argosMinDim << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSDamping = 0.0f;
+	if (parse_float(kv, "training.atlas.argosDamping", savedARGOSDamping) &&
+	    fabsf(currentCfg.atlas.argosDamping - savedARGOSDamping) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosDamping mismatch vs requested resume config (checkpoint "
+		    << savedARGOSDamping << ", current " << currentCfg.atlas.argosDamping << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSObservabilityScale = 0.0f;
+	if (parse_float(kv, "training.atlas.argosObservabilityScale", savedARGOSObservabilityScale) &&
+	    fabsf(currentCfg.atlas.argosObservabilityScale - savedARGOSObservabilityScale) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosObservabilityScale mismatch vs requested resume config (checkpoint "
+		    << savedARGOSObservabilityScale << ", current " << currentCfg.atlas.argosObservabilityScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSHeadBonus = 0.0f;
+	if (parse_float(kv, "training.atlas.argosHeadBonus", savedARGOSHeadBonus) &&
+	    fabsf(currentCfg.atlas.argosHeadBonus - savedARGOSHeadBonus) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosHeadBonus mismatch vs requested resume config (checkpoint "
+		    << savedARGOSHeadBonus << ", current " << currentCfg.atlas.argosHeadBonus << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSLateBonus = 0.0f;
+	if (parse_float(kv, "training.atlas.argosLateBonus", savedARGOSLateBonus) &&
+	    fabsf(currentCfg.atlas.argosLateBonus - savedARGOSLateBonus) > 1e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosLateBonus mismatch vs requested resume config (checkpoint "
+		    << savedARGOSLateBonus << ", current " << currentCfg.atlas.argosLateBonus << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

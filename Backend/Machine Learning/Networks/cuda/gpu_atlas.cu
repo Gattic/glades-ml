@@ -5218,6 +5218,148 @@ __global__ void matra_apply_residual_kernel(float* __restrict__ d_W,
 	}
 }
 
+__global__ void argos_reward_reduce_kernel(const float* __restrict__ d_adamStep,
+                                           const float* __restrict__ d_candidateStep,
+                                           const float* __restrict__ d_v,
+                                           float inv1mB2t,
+                                           float eps,
+                                           int total,
+                                           float* __restrict__ d_stats,
+                                           int rewardOffset)
+{
+	const int nWarps = (blockDim.x + 31) / 32;
+	extern __shared__ float smem[];
+	float localReward = 0.0f;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < total;
+	     idx += blockDim.x * gridDim.x)
+	{
+		const float vhat = fmaxf(d_v[idx] * inv1mB2t, 0.0f);
+		const float diagDen = sqrtf(vhat) + eps;
+		const float effectiveMhat = d_adamStep[idx] * diagDen;
+		const float step = d_candidateStep[idx];
+		localReward += effectiveMhat * step - 0.5f * vhat * step * step;
+	}
+	const float reward = blockReduceSum(localReward, smem);
+	if (threadIdx.x == 0)
+		atomicAdd(&d_stats[rewardOffset], reward);
+}
+
+__global__ void argos_finalize_budget_kernel(float* __restrict__ d_stats,
+                                             float geometryScale,
+                                             float orthScale,
+                                             float trustRadius,
+                                             float observabilityScale,
+                                             float roleBonus,
+                                             float maxAspect,
+                                             unsigned int minDim,
+                                             int rows,
+                                             int cols,
+                                             int total)
+{
+	if (blockIdx.x != 0 || threadIdx.x != 0 || !d_stats || rows <= 0 || cols <= 0 || total <= 0)
+		return;
+
+	const float rowMin = fmaxf(d_stats[2], 1.0e-12f);
+	const float rowMax = fmaxf(d_stats[3], rowMin);
+	const float colMin = fmaxf(d_stats[4], 1.0e-12f);
+	const float colMax = fmaxf(d_stats[5], colMin);
+	const float rowAniso = rowMax / rowMin;
+	const float colAniso = colMax / colMin;
+	const float rowSignal =
+	    fminf(1.0f, fmaxf(0.0f, (rowAniso - 1.0f) / (rowAniso + 1.0f)));
+	const float colSignal =
+	    fminf(1.0f, fmaxf(0.0f, (colAniso - 1.0f) / (colAniso + 1.0f)));
+	const float geometryEvidence = 0.5f * (rowSignal + colSignal);
+	const float predictiveTrust = fminf(1.0f, fmaxf(0.0f, d_stats[6]));
+	const int shortDim = (rows < cols) ? rows : cols;
+	const int longDim = (rows > cols) ? rows : cols;
+	const float aspect =
+	    static_cast<float>(longDim) / fmaxf(static_cast<float>(shortDim > 0 ? shortDim : 1), 1.0f);
+	const unsigned int eligible =
+	    (orthScale > 0.0f)
+	    && (shortDim >= static_cast<int>(minDim > 0u ? minDim : 1u))
+	    && (aspect <= fmaxf(1.0f, maxAspect))
+	    ? 1u : 0u;
+
+	const float adamReward = d_stats[18] / static_cast<float>(total);
+	const float geomReward = d_stats[19] / static_cast<float>(total);
+	float orthReward = eligible != 0u ? (d_stats[20] / static_cast<float>(total)) : adamReward;
+
+	const float geomDiff = geomReward - adamReward;
+	const float geomDenom = fabsf(geomReward) + fabsf(adamReward) + 1.0e-12f;
+	const float geometryGain =
+	    (geomDiff > 0.0f) ? fminf(1.0f, fmaxf(0.0f, geomDiff / geomDenom)) : 0.0f;
+	const float orthDiff = orthReward - adamReward;
+	const float orthDenom = fabsf(orthReward) + fabsf(adamReward) + 1.0e-12f;
+	const float orthGain =
+	    (eligible != 0u && orthDiff > 0.0f)
+	        ? fminf(1.0f, fmaxf(0.0f, orthDiff / orthDenom))
+	        : 0.0f;
+
+	const float observability =
+	    fminf(1.0f,
+	          fmaxf(0.0f,
+	                fmaxf(0.0f, observabilityScale) * geometryEvidence
+	                + 0.5f * predictiveTrust
+	                + fmaxf(0.0f, roleBonus)));
+	const float budget =
+	    fminf(1.0f, fmaxf(0.0f, trustRadius) * observability);
+	if (!(budget > 0.0f))
+	{
+		d_stats[7] = 0.0f;
+		d_stats[8] = 0.0f;
+		d_stats[9] = static_cast<float>(eligible);
+		d_stats[12] = aspect;
+		d_stats[21] = observability;
+		d_stats[22] = 0.0f;
+		d_stats[23] = 0.0f;
+		d_stats[24] = roleBonus;
+		d_stats[25] = adamReward;
+		d_stats[26] = geomReward;
+		d_stats[27] = (eligible != 0u) ? (d_stats[20] / static_cast<float>(total)) : adamReward;
+		return;
+	}
+	float geomTrust =
+	    fmaxf(0.0f, geometryScale) * observability * geometryGain;
+	float orthTrust = 0.0f;
+	if (eligible != 0u)
+	{
+		orthTrust =
+		    fmaxf(0.0f, orthScale)
+		    * observability
+		    * orthGain
+		    * (0.25f + 0.75f * predictiveTrust);
+	}
+	const float totalTrust = geomTrust + orthTrust;
+	if (budget > 0.0f && totalTrust > budget && totalTrust > 1.0e-12f)
+	{
+		const float scale = budget / totalTrust;
+		geomTrust *= scale;
+		orthTrust *= scale;
+	}
+	if (geomTrust + orthTrust > 1.0f)
+	{
+		const float scale = 1.0f / fmaxf(geomTrust + orthTrust, 1.0e-12f);
+		geomTrust *= scale;
+		orthTrust *= scale;
+	}
+
+	d_stats[7] = fminf(1.0f, fmaxf(0.0f, geomTrust));
+	d_stats[8] = fminf(1.0f, fmaxf(0.0f, orthTrust));
+	d_stats[9] = static_cast<float>(eligible);
+	d_stats[12] = aspect;
+	d_stats[21] = observability;
+	d_stats[22] = geometryGain;
+	d_stats[23] = orthGain;
+	d_stats[24] = roleBonus;
+	if (eligible == 0u)
+		orthReward = adamReward;
+	d_stats[25] = adamReward;
+	d_stats[26] = geomReward;
+	d_stats[27] = orthReward;
+}
+
 __global__ void matra_reset_stats_batch_kernel(const GpuMatraBatchItem* __restrict__ items,
                                                float** __restrict__ corePtrs,
                                                float** __restrict__ stepPtrs,
@@ -6669,6 +6811,73 @@ static bool matra_gpu_init(GpuMatraWeightState& state,
 	state.lastAspect = 1.0f;
 	state.lastSignalScale = 0.0f;
 	state.lastOrthError = 0.0f;
+	state.lastEligible = false;
+	state.step = 0ULL;
+	state.initialized = true;
+	return true;
+}
+
+static bool argos_gpu_init(GpuArgosWeightState& state,
+                           unsigned int m,
+                           unsigned int n)
+{
+	if (state.initialized && state.m == m && state.n == n)
+		return true;
+
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const size_t coreDim = static_cast<size_t>(std::min(m, n));
+	state.rowSecond.free();
+	state.colSecond.free();
+	state.colScratch.free();
+	state.prevMhat.free();
+	state.backboneStep.free();
+	state.adamStep.free();
+	state.geomStep.free();
+	state.orthStep.free();
+	state.coreScratch.free();
+	state.scalarScratch.free();
+
+	if (!state.rowSecond.allocate(m)) return false;
+	if (!state.colSecond.allocate(n)) return false;
+	if (!state.colScratch.allocate(n)) return false;
+	if (!state.prevMhat.allocate(mn)) return false;
+	if (!state.backboneStep.allocate(mn)) return false;
+	if (!state.adamStep.allocate(mn)) return false;
+	if (!state.geomStep.allocate(mn)) return false;
+	if (!state.orthStep.allocate(mn)) return false;
+	if (!state.coreScratch.allocate(2u * coreDim * coreDim)) return false;
+	if (!state.scalarScratch.allocate(32u)) return false;
+
+	std::vector<float> initRow(static_cast<size_t>(m), 1.0f);
+	std::vector<float> initCol(static_cast<size_t>(n), 1.0f);
+	if (!state.rowSecond.upload(initRow.data(), initRow.size())) return false;
+	if (!state.colSecond.upload(initCol.data(), initCol.size())) return false;
+	if (!state.colScratch.zero()) return false;
+	if (!state.prevMhat.zero()) return false;
+	if (!state.backboneStep.zero()) return false;
+	if (!state.adamStep.zero()) return false;
+	if (!state.geomStep.zero()) return false;
+	if (!state.orthStep.zero()) return false;
+	if (!state.coreScratch.zero()) return false;
+	if (!state.scalarScratch.zero()) return false;
+
+	state.m = m;
+	state.n = n;
+	state.rowMean = 1.0e-12f;
+	state.colMean = 1.0e-12f;
+	state.lastPredictiveTrust = 0.0f;
+	state.lastGeometryTrust = 0.0f;
+	state.lastOrthTrust = 0.0f;
+	state.lastRowAnisotropy = 1.0f;
+	state.lastColAnisotropy = 1.0f;
+	state.lastAspect = 1.0f;
+	state.lastSignalScale = 0.0f;
+	state.lastOrthError = 0.0f;
+	state.lastObservability = 0.0f;
+	state.lastRoleBonus = 0.0f;
+	state.lastAdamReward = 0.0f;
+	state.lastGeometryReward = 0.0f;
+	state.lastOrthReward = 0.0f;
 	state.lastEligible = false;
 	state.step = 0ULL;
 	state.initialized = true;
@@ -8232,6 +8441,385 @@ static bool matra_gpu_record_step(GpuMatraWeightState& state,
 	}
 
 	return true;
+}
+
+static float argos_gpu_role_bonus(const glades::ATLASConfig& ac,
+                                  unsigned int roleFlags)
+{
+	float bonus = 0.0f;
+	if ((roleFlags & 1u) != 0u)
+		bonus += std::max(0.0f, ac.argosHeadBonus);
+	if ((roleFlags & 2u) != 0u)
+		bonus += std::max(0.0f, ac.argosLateBonus);
+	return bonus;
+}
+
+static void argos_gpu_refresh_host_stats(GpuArgosWeightState& state,
+                                         const float* stats)
+{
+	if (!stats)
+		return;
+	state.rowMean = std::max(stats[0], 1.0e-12f);
+	state.colMean = std::max(stats[1], 1.0e-12f);
+	state.lastPredictiveTrust = stats[6];
+	state.lastGeometryTrust = stats[7];
+	state.lastOrthTrust = stats[8];
+	state.lastRowAnisotropy =
+	    (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : 1.0f;
+	state.lastColAnisotropy =
+	    (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : 1.0f;
+	state.lastEligible = (stats[9] > 0.0f);
+	state.lastSignalScale = stats[11];
+	state.lastObservability = stats[21];
+	state.lastRoleBonus = stats[24];
+	state.lastAdamReward = stats[25];
+	state.lastGeometryReward = stats[26];
+	state.lastOrthReward = stats[27];
+}
+
+static void argos_gpu_log_step_event(const GpuArgosWeightState& state,
+                                     unsigned int cadence,
+                                     unsigned int orthCadence,
+                                     shmea::GLogger* logger,
+                                     const char* tag)
+{
+	if (!logger)
+		return;
+	std::ostringstream oss;
+	oss << "event=gpu_argos_step";
+	if (tag && tag[0])
+		oss << " tag=" << tag;
+	oss << " step=" << state.step
+	    << " predTrust=" << state.lastPredictiveTrust
+	    << " geomTrust=" << state.lastGeometryTrust
+	    << " orthTrust=" << state.lastOrthTrust
+	    << " rowAniso=" << state.lastRowAnisotropy
+	    << " colAniso=" << state.lastColAnisotropy
+	    << " eligible=" << (state.lastEligible ? 1 : 0)
+	    << " aspect=" << state.lastAspect
+	    << " signalScale=" << state.lastSignalScale
+	    << " orthErr=" << state.lastOrthError
+	    << " obs=" << state.lastObservability
+	    << " roleBonus=" << state.lastRoleBonus
+	    << " adamReward=" << state.lastAdamReward
+	    << " geomReward=" << state.lastGeometryReward
+	    << " orthReward=" << state.lastOrthReward
+	    << " cadence=" << cadence
+	    << " orthCadence=" << orthCadence;
+	logger->info("ATLAS", shmea::GString(oss.str().c_str()));
+}
+
+static bool argos_gpu_record_step(GpuArgosWeightState& state,
+                                  float aspect,
+                                  const glades::ATLASConfig& ac,
+                                  shmea::GLogger* logger,
+                                  const char* tag)
+{
+	const unsigned int cadence = std::max(1u, ac.argosMetricCadence);
+	const unsigned int orthCadence = std::max(1u, ac.argosOrthCadence);
+	state.lastAspect = aspect;
+	state.lastOrthError = 0.0f;
+	state.step += 1ULL;
+
+	if (logger && ac.tSub > 0u
+	    && ((state.step % static_cast<unsigned long long>(std::max(1u, ac.tSub))) == 0ULL))
+	{
+		float stats[32] = {0.0f};
+		ATLAS_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+		if (!state.scalarScratch.download(stats, 32u))
+			return false;
+		argos_gpu_refresh_host_stats(state, stats);
+		argos_gpu_log_step_event(state, cadence, orthCadence, logger, tag);
+	}
+
+	return true;
+}
+
+bool argos_gpu_update(GpuArgosWeightState& state,
+                      float* d_W, float* d_gW,
+                      float* d_m, float* d_v,
+                      unsigned int m, unsigned int n,
+                      float lr,
+                      float invBatch, float gradScale,
+                      float inv1mB1t, float inv1mB2t,
+                      float eps,
+                      const glades::ATLASConfig& ac,
+                      shmea::GLogger* logger,
+                      const char* tag)
+{
+	return argos_gpu_update_with_role(state, d_W, d_gW, d_m, d_v,
+	                                  m, n,
+	                                  lr,
+	                                  invBatch, gradScale,
+	                                  inv1mB1t, inv1mB2t,
+	                                  eps,
+	                                  ac,
+	                                  0u,
+	                                  logger, tag);
+}
+
+bool argos_gpu_update_with_role(GpuArgosWeightState& state,
+                                float* d_W, float* d_gW,
+                                float* d_m, float* d_v,
+                                unsigned int m, unsigned int n,
+                                float lr,
+                                float invBatch, float gradScale,
+                                float inv1mB1t, float inv1mB2t,
+                                float eps,
+                                const glades::ATLASConfig& ac,
+                                unsigned int roleFlags,
+                                shmea::GLogger* logger,
+                                const char* tag)
+{
+	if (!d_W || !d_gW || !d_m || !d_v || m == 0u || n == 0u)
+		return true;
+	if (!argos_gpu_init(state, m, n))
+		return false;
+
+	const float argosWarmup = ac.argosWarmupMultiplier(state.step);
+	const float predictiveScale =
+	    std::max(0.0f, std::min(1.0f, ac.argosPredictiveScale)) * argosWarmup;
+	const float trustRadiusBudget =
+	    std::max(0.0f, ac.argosTrustRadius) * argosWarmup;
+	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
+	const unsigned int cadence = std::max(1u, ac.argosMetricCadence);
+	const unsigned int orthCadence = std::max(1u, ac.argosOrthCadence);
+	const bool refresh =
+	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(cadence)) == 0ULL);
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const int total = static_cast<int>(mn);
+	const int grid = std::max(1, (total + kBlock - 1) / kBlock);
+	const int nWarps = (kBlock + 31) / 32;
+	const unsigned int shortDim = std::min(m, n);
+	const unsigned int longDim = std::max(m, n);
+	const float aspect =
+	    static_cast<float>(longDim) / static_cast<float>(std::max(1u, shortDim));
+	const bool orthShapeEligible =
+	    (std::max(0.0f, ac.argosOrthogonalScale) > 0.0f)
+	    && (shortDim >= std::max(1u, ac.argosMinDim))
+	    && (aspect <= std::max(1.0f, ac.argosMaxAspect));
+	const bool orthCadenceHit =
+	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(orthCadence)) == 0ULL);
+	const bool orthEnabledThisStep = orthShapeEligible && orthCadenceHit;
+
+	if (refresh)
+	{
+		if (!state.colScratch.zero())
+			return false;
+		int block = static_cast<int>(std::min<unsigned int>(n, 256u));
+		block = ((block + 31) / 32) * 32;
+		if (block < 32)
+			block = 32;
+		if (block > 256)
+			block = 256;
+		const int smemBytes = (block / 32 + 1) * static_cast<int>(sizeof(float));
+		pact_lite_stats_kernel<<<m, block, smemBytes, computeStream()>>>(
+		    d_gW, state.rowSecond.data(), state.colScratch.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    invBatch, gradScale, betaGeom);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		const int colGrid = std::max(1, (static_cast<int>(n) + kBlock - 1) / kBlock);
+		bimap_update_col_second_kernel<<<colGrid, kBlock, 0, computeStream()>>>(
+		    state.colSecond.data(), state.colScratch.data(),
+		    static_cast<int>(m), static_cast<int>(n),
+		    betaGeom);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+	}
+
+	if (!state.scalarScratch.zero())
+		return false;
+	bimap_finalize_stats_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.rowSecond.data(), state.colSecond.data(),
+	    static_cast<int>(m), static_cast<int>(n),
+	    state.scalarScratch.data());
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	matra_corr_reduce_kernel<<<grid, kBlock,
+	                           3 * nWarps * static_cast<int>(sizeof(float)),
+	                           computeStream()>>>(
+	    d_m, state.prevMhat.data(), inv1mB1t, total, state.scalarScratch.data());
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	matra_finalize_predictive_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.scalarScratch.data(),
+	    predictiveScale,
+	    (predictiveScale > 0.0f && state.step > 0ULL) ? 1u : 0u);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	matra_prepare_steps_kernel<<<grid, kBlock,
+	                             nWarps * static_cast<int>(sizeof(float)),
+	                             computeStream()>>>(
+	    d_m, d_v,
+	    state.rowSecond.data(), state.colSecond.data(),
+	    state.prevMhat.data(),
+	    inv1mB1t, inv1mB2t, eps,
+	    state.scalarScratch.data(),
+	    state.backboneStep.data(),
+	    state.adamStep.data(),
+	    state.geomStep.data(),
+	    state.orthStep.data(),
+	    static_cast<int>(m), static_cast<int>(n));
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	const int rewardSmemBytes = nWarps * static_cast<int>(sizeof(float));
+	argos_reward_reduce_kernel<<<grid, kBlock, rewardSmemBytes, computeStream()>>>(
+	    state.adamStep.data(), state.adamStep.data(), d_v,
+	    inv1mB2t, eps, total, state.scalarScratch.data(), 18);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	argos_reward_reduce_kernel<<<grid, kBlock, rewardSmemBytes, computeStream()>>>(
+	    state.adamStep.data(), state.geomStep.data(), d_v,
+	    inv1mB2t, eps, total, state.scalarScratch.data(), 19);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	const float* dOrthCandidate = state.orthStep.data();
+	if (orthEnabledThisStep)
+	{
+		matra_finalize_scale_kernel<<<1, 1, 0, computeStream()>>>(
+		    state.scalarScratch.data(), shortDim);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
+		const bool tall = (m >= n);
+		const unsigned int coreDim = tall ? n : m;
+		const bool useSmallSolve =
+		    (coreDim <= static_cast<unsigned int>(kAtlasSmallCholeskyMaxDim));
+		const float gramScale =
+		    1.0f / static_cast<float>(tall ? std::max(1u, m) : std::max(1u, n));
+		if (tall)
+		{
+			if (!sgemm_rowmajor_atb_exact(static_cast<int>(coreDim), static_cast<int>(coreDim), static_cast<int>(m),
+			                              gramScale,
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              0.0f,
+			                              state.coreScratch.data(), static_cast<int>(coreDim)))
+				return false;
+		}
+		else
+		{
+			if (!sgemm_rowmajor_abt_exact(static_cast<int>(coreDim), static_cast<int>(coreDim), static_cast<int>(n),
+			                              gramScale,
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              state.orthStep.data(), static_cast<int>(n),
+			                              0.0f,
+			                              state.coreScratch.data(), static_cast<int>(coreDim)))
+				return false;
+		}
+
+		if (useSmallSolve)
+		{
+			if (!atlas_cholesky_factor_small(state.coreScratch.data(),
+			                                 static_cast<int>(coreDim),
+			                                 ac.argosDamping,
+			                                 eps,
+			                                 false))
+				return false;
+			if (tall)
+			{
+				if (!strsm_rowmajor_right_upper(static_cast<int>(m), static_cast<int>(n),
+				                                1.0f,
+				                                state.coreScratch.data(), static_cast<int>(coreDim),
+				                                state.orthStep.data(), static_cast<int>(n)))
+					return false;
+			}
+			else
+			{
+				if (!strsm_rowmajor_left_upper_transpose(static_cast<int>(m), static_cast<int>(n),
+				                                         1.0f,
+				                                         state.coreScratch.data(), static_cast<int>(coreDim),
+				                                         state.orthStep.data(), static_cast<int>(n)))
+					return false;
+			}
+		}
+		else
+		{
+			const int coreGrid =
+			    std::max(1, (static_cast<int>(coreDim) + kBlock - 1) / kBlock);
+			matra_trace_reduce_kernel<<<coreGrid, kBlock,
+			                            nWarps * static_cast<int>(sizeof(float)),
+			                            computeStream()>>>(
+			    state.coreScratch.data(),
+			    static_cast<int>(coreDim),
+			    state.scalarScratch.data());
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+
+			matra_regularize_core_kernel<<<coreGrid, kBlock, 0, computeStream()>>>(
+			    state.coreScratch.data(),
+			    static_cast<int>(coreDim),
+			    state.scalarScratch.data(),
+			    ac.argosDamping,
+			    eps);
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+
+			atlas_cholesky_inv_kernel<<<1, 1, 0, computeStream()>>>(
+			    state.coreScratch.data(), static_cast<int>(coreDim), false);
+			ATLAS_CUDA_CHECK(cudaGetLastError());
+
+			if (tall)
+			{
+				if (!sgemm_rowmajor_exact(static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
+				                          1.0f,
+				                          state.orthStep.data(), static_cast<int>(n),
+				                          state.coreScratch.data(), static_cast<int>(n),
+				                          0.0f,
+				                          d_gW, static_cast<int>(n)))
+					return false;
+			}
+			else
+			{
+				if (!sgemm_rowmajor_atb_exact(static_cast<int>(m), static_cast<int>(n), static_cast<int>(m),
+				                              1.0f,
+				                              state.coreScratch.data(), static_cast<int>(m),
+				                              state.orthStep.data(), static_cast<int>(n),
+				                              0.0f,
+				                              d_gW, static_cast<int>(n)))
+					return false;
+			}
+			dOrthCandidate = d_gW;
+		}
+
+		matra_scale_candidate_kernel<<<grid, kBlock, 0, computeStream()>>>(
+		    const_cast<float*>(dOrthCandidate), total, state.scalarScratch.data());
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		matra_commit_orth_candidate_kernel<<<grid, kBlock, 0, computeStream()>>>(
+		    state.adamStep.data(),
+		    dOrthCandidate,
+		    state.scalarScratch.data(),
+		    state.orthStep.data(),
+		    total);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+		argos_reward_reduce_kernel<<<grid, kBlock, rewardSmemBytes, computeStream()>>>(
+		    state.adamStep.data(), state.orthStep.data(), d_v,
+		    inv1mB2t, eps, total, state.scalarScratch.data(), 20);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+	}
+	dOrthCandidate = state.orthStep.data();
+
+	argos_finalize_budget_kernel<<<1, 1, 0, computeStream()>>>(
+	    state.scalarScratch.data(),
+	    std::max(0.0f, ac.argosGeometryScale),
+	    orthEnabledThisStep ? std::max(0.0f, ac.argosOrthogonalScale) : 0.0f,
+	    trustRadiusBudget,
+	    std::max(0.0f, ac.argosObservabilityScale),
+	    argos_gpu_role_bonus(ac, roleFlags),
+	    ac.argosMaxAspect,
+	    ac.argosMinDim,
+	    static_cast<int>(m),
+	    static_cast<int>(n),
+	    total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+
+	matra_apply_residual_kernel<<<grid, kBlock, 0, computeStream()>>>(
+	    d_W, d_gW,
+	    state.backboneStep.data(),
+	    state.adamStep.data(),
+	    state.geomStep.data(),
+	    dOrthCandidate,
+	    state.scalarScratch.data(),
+	    lr, total);
+	ATLAS_CUDA_CHECK(cudaGetLastError());
+	if (!atlas_gpu_guard(d_W, mn))
+		return false;
+
+	return argos_gpu_record_step(state, aspect, ac, logger, tag);
 }
 
 static bool matra_prepare_small_batch_items(const GpuMatraBatchItem* items,

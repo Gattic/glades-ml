@@ -100,6 +100,45 @@ static bool parse_bimap_scope_arg(const char* text, unsigned int& outScope)
 	return false;
 }
 
+static const char* argos_scope_label(unsigned int scope)
+{
+	switch (scope)
+	{
+	case glades::ATLASConfig::ARGOS_SCOPE_ALL: return "all";
+	case glades::ATLASConfig::ARGOS_SCOPE_HEAD_ONLY: return "head";
+	case glades::ATLASConfig::ARGOS_SCOPE_LATE_ONLY: return "late";
+	case glades::ATLASConfig::ARGOS_SCOPE_LATE_HEAD: return "late-head";
+	default: return "unknown";
+	}
+}
+
+static bool parse_argos_scope_arg(const char* text, unsigned int& outScope)
+{
+	if (!text)
+		return false;
+	if (streq(text, "all") || streq(text, "0"))
+	{
+		outScope = glades::ATLASConfig::ARGOS_SCOPE_ALL;
+		return true;
+	}
+	if (streq(text, "head") || streq(text, "head-only") || streq(text, "1"))
+	{
+		outScope = glades::ATLASConfig::ARGOS_SCOPE_HEAD_ONLY;
+		return true;
+	}
+	if (streq(text, "late") || streq(text, "late-only") || streq(text, "2"))
+	{
+		outScope = glades::ATLASConfig::ARGOS_SCOPE_LATE_ONLY;
+		return true;
+	}
+	if (streq(text, "late-head") || streq(text, "head-late") || streq(text, "3"))
+	{
+		outScope = glades::ATLASConfig::ARGOS_SCOPE_LATE_HEAD;
+		return true;
+	}
+	return false;
+}
+
 static const char* echo_scope_label(unsigned int scope)
 {
 	switch (scope)
@@ -618,7 +657,8 @@ enum VariantKind
 	VARIANT_ATLAS_RACER = 18,
 	VARIANT_ATLAS_KRON = 19,
 	VARIANT_ATLAS_MUON = 20,
-	VARIANT_ATLAS_MATRA = 21
+	VARIANT_ATLAS_MATRA = 21,
+	VARIANT_ATLAS_ARGOS = 22
 };
 
 enum VariantSelection
@@ -645,7 +685,8 @@ enum VariantSelection
 	VARIANT_SELECTION_ATLAS_RACER = 19,
 	VARIANT_SELECTION_ATLAS_KRON = 20,
 	VARIANT_SELECTION_ATLAS_MUON = 21,
-	VARIANT_SELECTION_ATLAS_MATRA = 22
+	VARIANT_SELECTION_ATLAS_MATRA = 22,
+	VARIANT_SELECTION_ATLAS_ARGOS = 23
 };
 
 struct TokenConfig
@@ -834,6 +875,20 @@ struct BenchConfig
 	float atlasMatraMaxAspect;
 	unsigned int atlasMatraMinDim;
 	float atlasMatraDamping;
+	float atlasArgosGeometryScale;
+	float atlasArgosOrthogonalScale;
+	float atlasArgosPredictiveScale;
+	float atlasArgosTrustRadius;
+	unsigned int atlasArgosWarmupSteps;
+	unsigned int atlasArgosScope;
+	unsigned int atlasArgosMetricCadence;
+	unsigned int atlasArgosOrthCadence;
+	float atlasArgosMaxAspect;
+	unsigned int atlasArgosMinDim;
+	float atlasArgosDamping;
+	float atlasArgosObservabilityScale;
+	float atlasArgosHeadBonus;
+	float atlasArgosLateBonus;
 	unsigned int gpuEnable;
 	int gpuDeviceId;
 	TokenConfig token;
@@ -923,6 +978,20 @@ struct BenchConfig
 	      atlasMatraMaxAspect(1.50f),
 	      atlasMatraMinDim(8u),
 	      atlasMatraDamping(0.01f),
+	      atlasArgosGeometryScale(1.0f),
+	      atlasArgosOrthogonalScale(0.5f),
+	      atlasArgosPredictiveScale(0.05f),
+	      atlasArgosTrustRadius(0.20f),
+	      atlasArgosWarmupSteps(32u),
+	      atlasArgosScope(glades::ATLASConfig::ARGOS_SCOPE_HEAD_ONLY),
+	      atlasArgosMetricCadence(1u),
+	      atlasArgosOrthCadence(1u),
+	      atlasArgosMaxAspect(1.50f),
+	      atlasArgosMinDim(8u),
+	      atlasArgosDamping(0.01f),
+	      atlasArgosObservabilityScale(0.75f),
+	      atlasArgosHeadBonus(0.35f),
+	      atlasArgosLateBonus(0.00f),
 	      gpuEnable(0u),
 	      gpuDeviceId(0),
 	      token(),
@@ -1727,6 +1796,7 @@ static const char* variant_label(VariantKind variant)
 	case VARIANT_ATLAS_KRON: return "ATLAS-KRON";
 	case VARIANT_ATLAS_MUON: return "ATLAS-MUON";
 	case VARIANT_ATLAS_MATRA: return "ATLAS-MATRA";
+	case VARIANT_ATLAS_ARGOS: return "ATLAS-ARGOS";
 	default: return "Unknown";
 	}
 }
@@ -1781,6 +1851,8 @@ static bool variant_matches_selection(VariantSelection selection, VariantKind va
 		return variant == VARIANT_ATLAS_MUON;
 	case VARIANT_SELECTION_ATLAS_MATRA:
 		return variant == VARIANT_ATLAS_MATRA;
+	case VARIANT_SELECTION_ATLAS_ARGOS:
+		return variant == VARIANT_ATLAS_ARGOS;
 	default:
 		return false;
 	}
@@ -1918,7 +1990,7 @@ static void print_usage()
 	printf("Options:\n");
 	printf("  --mode all|token-lm|token-lm-large|token-lm-context|token-lm-context-large|token-lm-document|token-lm-corpus|token-lm-corpus-large|teacher-student|latent-forecast|nonlinear-forecast|teacher-sweep|teacher-canonical\n");
 	printf("                                         Run the alternate-task benches or the teacher-student sweep (default: all)\n");
-	printf("  --variant all|adamw|adamw-group|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|echo|bimap|pact|racer|kron|muon|matra\n");
+	printf("  --variant all|adamw|adamw-group|base|sparrow|helm|aster|aegis|citadel|rampart|merit|strata|aurora|seam|quasar|geode|echo|bimap|pact|racer|kron|muon|matra|argos\n");
 	printf("                                         Restrict runs to one optimizer variant when the case supports it (default: all)\n");
 	printf("  --repeats N                           Repeats per optimizer variant (default: 3)\n");
 	printf("  --seed N                              Base RNG seed (default: 1337)\n");
@@ -1998,6 +2070,20 @@ static void print_usage()
 	printf("  --atlas-matra-max-aspect X            Maximum block aspect ratio eligible for MATRA orthogonal branch (default: 1.50)\n");
 	printf("  --atlas-matra-min-dim N               Minimum block side length eligible for MATRA orthogonal branch (default: 8)\n");
 	printf("  --atlas-matra-damping X               Gram damping inside MATRA orthogonal factors (default: 0.01)\n");
+	printf("  --atlas-argos-geometry-scale X        ARGOS geometry trust cap around the Adam backbone (default: 1.0)\n");
+	printf("  --atlas-argos-orthogonal-scale X      ARGOS orthogonal residual trust cap (default: 0.5)\n");
+	printf("  --atlas-argos-predictive-scale X      ARGOS bounded one-step predictive transport scale (default: 0.05)\n");
+	printf("  --atlas-argos-trust-radius X          Total structured trust budget for ARGOS (default: 0.20)\n");
+	printf("  --atlas-argos-warmup-steps N          Completed optimizer steps used to warm ARGOS from Adam-only to full strength (default: 32)\n");
+	printf("  --atlas-argos-scope all|head|late|late-head  Restrict ARGOS to all matrices, head only, late block only, or late block + head (default: head)\n");
+	printf("  --atlas-argos-cadence N               Steps between ARGOS row/column metric refreshes (default: 1)\n");
+	printf("  --atlas-argos-orth-cadence N          Steps between exact ARGOS orth solves (default: 1)\n");
+	printf("  --atlas-argos-max-aspect X            Maximum block aspect ratio eligible for ARGOS orthogonal branch (default: 1.50)\n");
+	printf("  --atlas-argos-min-dim N               Minimum block side length eligible for ARGOS orthogonal branch (default: 8)\n");
+	printf("  --atlas-argos-damping X               Gram damping inside ARGOS orthogonal factors (default: 0.01)\n");
+	printf("  --atlas-argos-observability-scale X   Weight on ARGOS observability/anisotropy routing score (default: 0.75)\n");
+	printf("  --atlas-argos-head-bonus X            Extra ARGOS routing bonus on token-head matrices (default: 0.35)\n");
+	printf("  --atlas-argos-late-bonus X            Extra ARGOS routing bonus on final decoder blocks (default: 0.00)\n");
 	printf("  --gpu-enable 0|1                      Attempt GPU offload when available (default: 0)\n");
 	printf("  --gpu-device N                        CUDA device id when GPU offload is enabled (default: 0)\n");
 	printf("  --token-epochs N                      Token-LM epochs (default: 6)\n");
@@ -2326,6 +2412,11 @@ static bool parse_variant_arg(const char* text, VariantSelection& outSelection)
 	if (streq(text, "matra") || streq(text, "atlas-matra"))
 	{
 		outSelection = VARIANT_SELECTION_ATLAS_MATRA;
+		return true;
+	}
+	if (streq(text, "argos") || streq(text, "atlas-argos"))
+	{
+		outSelection = VARIANT_SELECTION_ATLAS_ARGOS;
 		return true;
 	}
 	return false;
@@ -2987,6 +3078,118 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			if (!parse_float_arg(argv[++i], cfg.atlasMatraDamping) || cfg.atlasMatraDamping < 0.0f)
 			{
 				err = "invalid --atlas-matra-damping";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-geometry-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosGeometryScale) || cfg.atlasArgosGeometryScale < 0.0f)
+			{
+				err = "invalid --atlas-argos-geometry-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-orthogonal-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosOrthogonalScale) || cfg.atlasArgosOrthogonalScale < 0.0f)
+			{
+				err = "invalid --atlas-argos-orthogonal-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-predictive-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosPredictiveScale) || cfg.atlasArgosPredictiveScale < 0.0f)
+			{
+				err = "invalid --atlas-argos-predictive-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-trust-radius") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosTrustRadius) || cfg.atlasArgosTrustRadius < 0.0f)
+			{
+				err = "invalid --atlas-argos-trust-radius";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-warmup-steps") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasArgosWarmupSteps))
+			{
+				err = "invalid --atlas-argos-warmup-steps";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-scope") && i + 1 < argc)
+		{
+			if (!parse_argos_scope_arg(argv[++i], cfg.atlasArgosScope))
+			{
+				err = "invalid --atlas-argos-scope";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasArgosMetricCadence) || cfg.atlasArgosMetricCadence == 0u)
+			{
+				err = "invalid --atlas-argos-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-orth-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasArgosOrthCadence) || cfg.atlasArgosOrthCadence == 0u)
+			{
+				err = "invalid --atlas-argos-orth-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-max-aspect") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosMaxAspect) || cfg.atlasArgosMaxAspect < 1.0f)
+			{
+				err = "invalid --atlas-argos-max-aspect";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-min-dim") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasArgosMinDim) || cfg.atlasArgosMinDim == 0u)
+			{
+				err = "invalid --atlas-argos-min-dim";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-damping") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosDamping) || cfg.atlasArgosDamping < 0.0f)
+			{
+				err = "invalid --atlas-argos-damping";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-observability-scale") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosObservabilityScale) || cfg.atlasArgosObservabilityScale < 0.0f)
+			{
+				err = "invalid --atlas-argos-observability-scale";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-head-bonus") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosHeadBonus) || cfg.atlasArgosHeadBonus < 0.0f)
+			{
+				err = "invalid --atlas-argos-head-bonus";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-argos-late-bonus") && i + 1 < argc)
+		{
+			if (!parse_float_arg(argv[++i], cfg.atlasArgosLateBonus) || cfg.atlasArgosLateBonus < 0.0f)
+			{
+				err = "invalid --atlas-argos-late-bonus";
 				return false;
 			}
 		}
@@ -4557,6 +4760,7 @@ static void reset_atlas_family(glades::TrainingConfig& tc)
 	tc.atlas.kronEnabled = false;
 	tc.atlas.muonEnabled = false;
 	tc.atlas.matraEnabled = false;
+	tc.atlas.argosEnabled = false;
 	tc.atlas.kappaEnabled = false;
 }
 
@@ -4885,6 +5089,24 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.matraMinDim = cfg.atlasMatraMinDim;
 		tc.atlas.matraDamping = cfg.atlasMatraDamping;
 	}
+	else if (variant == VARIANT_ATLAS_ARGOS)
+	{
+		tc.atlas.argosEnabled = true;
+		tc.atlas.argosGeometryScale = cfg.atlasArgosGeometryScale;
+		tc.atlas.argosOrthogonalScale = cfg.atlasArgosOrthogonalScale;
+		tc.atlas.argosPredictiveScale = cfg.atlasArgosPredictiveScale;
+		tc.atlas.argosTrustRadius = cfg.atlasArgosTrustRadius;
+		tc.atlas.argosWarmupSteps = cfg.atlasArgosWarmupSteps;
+		tc.atlas.argosScope = cfg.atlasArgosScope;
+		tc.atlas.argosMetricCadence = cfg.atlasArgosMetricCadence;
+		tc.atlas.argosOrthCadence = cfg.atlasArgosOrthCadence;
+		tc.atlas.argosMaxAspect = cfg.atlasArgosMaxAspect;
+		tc.atlas.argosMinDim = cfg.atlasArgosMinDim;
+		tc.atlas.argosDamping = cfg.atlasArgosDamping;
+		tc.atlas.argosObservabilityScale = cfg.atlasArgosObservabilityScale;
+		tc.atlas.argosHeadBonus = cfg.atlasArgosHeadBonus;
+		tc.atlas.argosLateBonus = cfg.atlasArgosLateBonus;
+	}
 }
 
 static bool configure_optimizer(glades::TrainingConfig& tc,
@@ -4939,7 +5161,8 @@ static bool token_variant_uses_adamw_backbone(const BenchConfig& cfg, VariantKin
 	    || (variant == VARIANT_ATLAS_RACER)
 	    || (variant == VARIANT_ATLAS_KRON)
 	    || (variant == VARIANT_ATLAS_MUON)
-	    || (variant == VARIANT_ATLAS_MATRA);
+	    || (variant == VARIANT_ATLAS_MATRA)
+	    || (variant == VARIANT_ATLAS_ARGOS);
 }
 
 static float token_variant_learning_rate(const BenchConfig& cfg, VariantKind variant)
@@ -6310,7 +6533,8 @@ static bool run_token_case(const BenchConfig& cfg)
 	const float kronTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_KRON);
 	const float muonTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MUON);
 	const float matraTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MATRA);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s cadence=%u groups=%u) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f) ATLAS-MATRA(lr=%.4f cadence=%u orthCadence=%u trust=%.2f)\n",
+	const float argosTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_ARGOS);
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s cadence=%u groups=%u) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f) ATLAS-MATRA(lr=%.4f cadence=%u orthCadence=%u trust=%.2f) ATLAS-ARGOS(lr=%.4f scope=%s cadence=%u orthCadence=%u trust=%.2f warmup=%u)\n",
 	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
 	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
 	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
@@ -6323,8 +6547,9 @@ static bool run_token_case(const BenchConfig& cfg)
 	       pactTokenLR, cfg.atlasPACTLowRank, cfg.atlasPACTFactorCadence,
 	       racerTokenLR, cfg.atlasRACERFactorCadence,
 	       kronTokenLR, cfg.atlasKronFactorCadence, muonTokenLR, cfg.atlasMuonMinDim, cfg.atlasMuonMaxAspect,
-	       matraTokenLR, cfg.atlasMatraMetricCadence, cfg.atlasMatraOrthCadence, cfg.atlasMatraTrustRadius);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u cadence=%u trust=%.3f pred=%.3f struct=%.3f groups=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f) matra(geom=%.3f orth=%.3f pred=%.3f trust=%.3f cadence=%u orthCadence=%u maxAspect=%.3f minDim=%u damping=%.3f)\n",
+	       matraTokenLR, cfg.atlasMatraMetricCadence, cfg.atlasMatraOrthCadence, cfg.atlasMatraTrustRadius,
+	       argosTokenLR, argos_scope_label(cfg.atlasArgosScope), cfg.atlasArgosMetricCadence, cfg.atlasArgosOrthCadence, cfg.atlasArgosTrustRadius, cfg.atlasArgosWarmupSteps);
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u cadence=%u trust=%.3f pred=%.3f struct=%.3f groups=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f) matra(geom=%.3f orth=%.3f pred=%.3f trust=%.3f cadence=%u orthCadence=%u maxAspect=%.3f minDim=%u damping=%.3f) argos(scope=%s geom=%.3f orth=%.3f pred=%.3f trust=%.3f warmup=%u cadence=%u orthCadence=%u maxAspect=%.3f minDim=%u damping=%.3f obs=%.3f head=%.3f late=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
@@ -6348,12 +6573,16 @@ static bool run_token_case(const BenchConfig& cfg)
 	       cfg.atlasKronGeometryScale, cfg.atlasKronPredictiveScale, cfg.atlasKronFactorCadence, cfg.atlasKronDamping,
 	       cfg.atlasMuonGeometryScale, cfg.atlasMuonPredictiveScale, cfg.atlasMuonMaxAspect, cfg.atlasMuonMinDim, cfg.atlasMuonDamping,
 	       cfg.atlasMatraGeometryScale, cfg.atlasMatraOrthogonalScale, cfg.atlasMatraPredictiveScale, cfg.atlasMatraTrustRadius,
-	       cfg.atlasMatraMetricCadence, cfg.atlasMatraOrthCadence, cfg.atlasMatraMaxAspect, cfg.atlasMatraMinDim, cfg.atlasMatraDamping);
+	       cfg.atlasMatraMetricCadence, cfg.atlasMatraOrthCadence, cfg.atlasMatraMaxAspect, cfg.atlasMatraMinDim, cfg.atlasMatraDamping,
+	       argos_scope_label(cfg.atlasArgosScope),
+	       cfg.atlasArgosGeometryScale, cfg.atlasArgosOrthogonalScale, cfg.atlasArgosPredictiveScale, cfg.atlasArgosTrustRadius, cfg.atlasArgosWarmupSteps,
+	       cfg.atlasArgosMetricCadence, cfg.atlasArgosOrthCadence, cfg.atlasArgosMaxAspect, cfg.atlasArgosMinDim, cfg.atlasArgosDamping,
+	       cfg.atlasArgosObservabilityScale, cfg.atlasArgosHeadBonus, cfg.atlasArgosLateBonus);
 	printf("\n");
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");
 
-	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ADAMW_GROUP, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_ECHO, VARIANT_ATLAS_BIMAP, VARIANT_ATLAS_PACT, VARIANT_ATLAS_RACER, VARIANT_ATLAS_KRON, VARIANT_ATLAS_MUON, VARIANT_ATLAS_MATRA };
+	const VariantKind variants[] = { VARIANT_ADAMW, VARIANT_ADAMW_GROUP, VARIANT_ATLAS_BASE, VARIANT_ATLAS_SPARROW, VARIANT_ATLAS_HELM, VARIANT_ATLAS_ASTER, VARIANT_ATLAS_AEGIS, VARIANT_ATLAS_CITADEL, VARIANT_ATLAS_RAMPART, VARIANT_ATLAS_MERIT, VARIANT_ATLAS_STRATA, VARIANT_ATLAS_AURORA, VARIANT_ATLAS_SEAM, VARIANT_ATLAS_QUASAR, VARIANT_ATLAS_GEODE, VARIANT_ATLAS_ECHO, VARIANT_ATLAS_BIMAP, VARIANT_ATLAS_PACT, VARIANT_ATLAS_RACER, VARIANT_ATLAS_KRON, VARIANT_ATLAS_MUON, VARIANT_ATLAS_MATRA, VARIANT_ATLAS_ARGOS };
 	const size_t variantCount = sizeof(variants) / sizeof(variants[0]);
 	bool ranAny = false;
 	std::vector<VariantKind> summaryVariants;
@@ -6400,6 +6629,7 @@ static bool run_token_case(const BenchConfig& cfg)
 		int kronIndex = -1;
 		int muonIndex = -1;
 		int matraIndex = -1;
+		int argosIndex = -1;
 		for (size_t i = 0; i < summaryVariants.size(); ++i)
 		{
 			if (summaryVariants[i] == VARIANT_ADAMW)
@@ -6424,8 +6654,10 @@ static bool run_token_case(const BenchConfig& cfg)
 				muonIndex = static_cast<int>(i);
 			else if (summaryVariants[i] == VARIANT_ATLAS_MATRA)
 				matraIndex = static_cast<int>(i);
+			else if (summaryVariants[i] == VARIANT_ATLAS_ARGOS)
+				argosIndex = static_cast<int>(i);
 		}
-		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || echoIndex >= 0 || bimapIndex >= 0 || pactIndex >= 0 || racerIndex >= 0 || kronIndex >= 0 || muonIndex >= 0 || matraIndex >= 0))
+		if (adamwIndex >= 0 && (baseIndex >= 0 || auroraIndex >= 0 || geodeIndex >= 0 || echoIndex >= 0 || bimapIndex >= 0 || pactIndex >= 0 || racerIndex >= 0 || kronIndex >= 0 || muonIndex >= 0 || matraIndex >= 0 || argosIndex >= 0))
 		{
 			printf("  AdamW gap comparison:\n");
 			if (baseIndex >= 0)
@@ -6458,6 +6690,9 @@ static bool run_token_case(const BenchConfig& cfg)
 			if (matraIndex >= 0)
 				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
 				                                 summaries[static_cast<size_t>(matraIndex)]);
+			if (argosIndex >= 0)
+				print_transformer_gap_compare_row(summaries[static_cast<size_t>(adamwIndex)],
+				                                 summaries[static_cast<size_t>(argosIndex)]);
 		}
 	}
 	printf("\n");

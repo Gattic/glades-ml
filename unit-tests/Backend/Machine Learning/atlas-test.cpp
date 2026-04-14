@@ -779,6 +779,245 @@ static void assert_matra_parity_snapshot(const char* label,
 	ASSERT("MATRA step mismatch", gpu.step == cpu.step);
 }
 
+struct ArgosParitySnapshot
+{
+	std::vector<float> W;
+	std::vector<float> m1;
+	std::vector<float> v2;
+	std::vector<float> g;
+	std::vector<float> rowSecond;
+	std::vector<float> colSecond;
+	std::vector<float> prevMhat;
+	std::vector<float> backboneStep;
+	std::vector<float> adamStep;
+	std::vector<float> geomStep;
+	std::vector<float> orthStep;
+	float lastPredictiveTrust;
+	float lastGeometryTrust;
+	float lastOrthTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastAspect;
+	float lastSignalScale;
+	float lastObservability;
+	float lastRoleBonus;
+	float lastAdamReward;
+	float lastGeometryReward;
+	float lastOrthReward;
+	bool lastEligible;
+	unsigned long long step;
+
+	ArgosParitySnapshot()
+	    : lastPredictiveTrust(0.0f),
+	      lastGeometryTrust(0.0f),
+	      lastOrthTrust(0.0f),
+	      lastRowAnisotropy(1.0f),
+	      lastColAnisotropy(1.0f),
+	      lastAspect(1.0f),
+	      lastSignalScale(0.0f),
+	      lastObservability(0.0f),
+	      lastRoleBonus(0.0f),
+	      lastAdamReward(0.0f),
+	      lastGeometryReward(0.0f),
+	      lastOrthReward(0.0f),
+	      lastEligible(false),
+	      step(0ULL)
+	{
+	}
+};
+
+static void capture_cpu_argos_snapshot(ArgosParitySnapshot& snap,
+                                       const std::vector<float>& W,
+                                       const std::vector<float>& m1,
+                                       const std::vector<float>& v2,
+                                       const std::vector<float>& g,
+                                       const glades::atlas::ArgosWeightState& state)
+{
+	snap.W = W;
+	snap.m1 = m1;
+	snap.v2 = v2;
+	snap.g = g;
+	snap.rowSecond = state.rowSecond;
+	snap.colSecond = state.colSecond;
+	snap.prevMhat = state.prevMhat;
+	snap.backboneStep = state.backboneStep;
+	snap.adamStep = state.adamStep;
+	snap.geomStep = state.geomStep;
+	snap.orthStep = state.orthStep;
+	snap.lastPredictiveTrust = state.lastPredictiveTrust;
+	snap.lastGeometryTrust = state.lastGeometryTrust;
+	snap.lastOrthTrust = state.lastOrthTrust;
+	snap.lastRowAnisotropy = state.lastRowAnisotropy;
+	snap.lastColAnisotropy = state.lastColAnisotropy;
+	snap.lastAspect = state.lastAspect;
+	snap.lastSignalScale = state.lastSignalScale;
+	snap.lastObservability = state.lastObservability;
+	snap.lastRoleBonus = state.lastRoleBonus;
+	snap.lastAdamReward = state.lastAdamReward;
+	snap.lastGeometryReward = state.lastGeometryReward;
+	snap.lastOrthReward = state.lastOrthReward;
+	snap.lastEligible = state.lastEligible;
+	snap.step = state.step;
+}
+
+#ifdef GLADES_HAVE_CUDA
+static bool run_gpu_argos_step(glades::gpu::GpuArgosWeightState& state,
+                               glades::gpu::GpuBuffer<float>& dW,
+                               glades::gpu::GpuBuffer<float>& dM,
+                               glades::gpu::GpuBuffer<float>& dV,
+                               glades::gpu::GpuBuffer<float>& dG,
+                               unsigned int m,
+                               unsigned int n,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               float eps,
+                               float invBatch,
+                               float gradScale,
+                               int step,
+                               unsigned int roleFlags,
+                               const glades::ATLASConfig& ac,
+                               const std::vector<float>& grad)
+{
+	const size_t mn = static_cast<size_t>(m) * n;
+	ASSERT("gpu grad size mismatch", grad.size() == mn);
+	if (!dG.upload(grad.data(), grad.size()))
+		return false;
+	if (!glades::gpu::adam_update(dW.data(), dG.data(), dM.data(), dV.data(),
+	                              lr, beta1, beta2, eps,
+	                              0.0f, invBatch * gradScale, step,
+	                              static_cast<int>(mn)))
+		return false;
+	const double b1t = std::pow(static_cast<double>(beta1), static_cast<double>(step));
+	const double b2t = std::pow(static_cast<double>(beta2), static_cast<double>(step));
+	const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
+	const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
+	if (!glades::gpu::argos_gpu_update_with_role(state,
+	                                             dW.data(), dG.data(), dM.data(), dV.data(),
+	                                             m, n, lr,
+	                                             invBatch, gradScale,
+	                                             inv1mB1t, inv1mB2t, eps,
+	                                             ac, roleFlags,
+	                                             quiet_logger(), "ut.argos.parity"))
+		return false;
+	return glades::gpu::synchronizeCheck("argos parity step");
+}
+
+static void capture_gpu_argos_snapshot(ArgosParitySnapshot& snap,
+                                       glades::gpu::GpuBuffer<float>& dW,
+                                       glades::gpu::GpuBuffer<float>& dM,
+                                       glades::gpu::GpuBuffer<float>& dV,
+                                       glades::gpu::GpuBuffer<float>& dG,
+                                       const glades::gpu::GpuArgosWeightState& state)
+{
+	snap.W.resize(dW.size());
+	snap.m1.resize(dM.size());
+	snap.v2.resize(dV.size());
+	snap.g.resize(dG.size());
+	dW.download(snap.W.data(), snap.W.size());
+	dM.download(snap.m1.data(), snap.m1.size());
+	dV.download(snap.v2.data(), snap.v2.size());
+	dG.download(snap.g.data(), snap.g.size());
+
+	snap.rowSecond.resize(state.rowSecond.size());
+	snap.colSecond.resize(state.colSecond.size());
+	snap.prevMhat.resize(state.prevMhat.size());
+	snap.backboneStep.resize(state.backboneStep.size());
+	snap.adamStep.resize(state.adamStep.size());
+	snap.geomStep.resize(state.geomStep.size());
+	snap.orthStep.resize(state.orthStep.size());
+	if (!snap.rowSecond.empty())
+		state.rowSecond.download(snap.rowSecond.data(), snap.rowSecond.size());
+	if (!snap.colSecond.empty())
+		state.colSecond.download(snap.colSecond.data(), snap.colSecond.size());
+	if (!snap.prevMhat.empty())
+		state.prevMhat.download(snap.prevMhat.data(), snap.prevMhat.size());
+	if (!snap.backboneStep.empty())
+		state.backboneStep.download(snap.backboneStep.data(), snap.backboneStep.size());
+	if (!snap.adamStep.empty())
+		state.adamStep.download(snap.adamStep.data(), snap.adamStep.size());
+	if (!snap.geomStep.empty())
+		state.geomStep.download(snap.geomStep.data(), snap.geomStep.size());
+	if (!snap.orthStep.empty())
+		state.orthStep.download(snap.orthStep.data(), snap.orthStep.size());
+
+	float stats[32] = { 0.0f };
+	if (state.scalarScratch.size() >= 32u)
+		state.scalarScratch.download(stats, 32u);
+	snap.lastPredictiveTrust = stats[6];
+	snap.lastGeometryTrust = stats[7];
+	snap.lastOrthTrust = stats[8];
+	snap.lastRowAnisotropy = (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : state.lastRowAnisotropy;
+	snap.lastColAnisotropy = (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : state.lastColAnisotropy;
+	snap.lastAspect = (stats[12] > 0.0f) ? stats[12] : state.lastAspect;
+	snap.lastSignalScale = stats[11];
+	snap.lastObservability = stats[21];
+	snap.lastRoleBonus = stats[24];
+	snap.lastAdamReward = stats[25];
+	snap.lastGeometryReward = stats[26];
+	snap.lastOrthReward = stats[27];
+	snap.lastEligible = (stats[9] > 0.0f);
+	snap.step = state.step;
+}
+#endif
+
+static void assert_argos_parity_snapshot(const char* label,
+                                         const ArgosParitySnapshot& cpu,
+                                         const ArgosParitySnapshot& gpu,
+                                         float valueTol,
+                                         float stateTol)
+{
+	assert_close_vector(label, gpu.W, cpu.W, valueTol);
+	assert_close_vector("m1", gpu.m1, cpu.m1, valueTol);
+	assert_close_vector("v2", gpu.v2, cpu.v2, valueTol);
+	assert_close_vector("g", gpu.g, cpu.g, valueTol);
+	assert_close_vector("rowSecond", gpu.rowSecond, cpu.rowSecond, stateTol);
+	assert_close_vector("colSecond", gpu.colSecond, cpu.colSecond, stateTol);
+	assert_close_vector("prevMhat", gpu.prevMhat, cpu.prevMhat, valueTol);
+	assert_close_vector("backboneStep", gpu.backboneStep, cpu.backboneStep, valueTol);
+	assert_close_vector("adamStep", gpu.adamStep, cpu.adamStep, valueTol);
+	assert_close_vector("geomStep", gpu.geomStep, cpu.geomStep, valueTol);
+	ASSERT("orthStep size mismatch", gpu.orthStep.size() == cpu.orthStep.size());
+	ASSERT("orthStep/adamStep size mismatch", gpu.orthStep.size() == gpu.adamStep.size()
+	                                      && cpu.orthStep.size() == cpu.adamStep.size());
+	std::vector<float> cpuOrthResidual(cpu.orthStep.size(), 0.0f);
+	std::vector<float> gpuOrthResidual(gpu.orthStep.size(), 0.0f);
+	float cpuOrthResidualMax = 0.0f;
+	float gpuOrthResidualMax = 0.0f;
+	for (size_t idx = 0u; idx < cpuOrthResidual.size(); ++idx)
+	{
+		cpuOrthResidual[idx] =
+		    cpu.lastOrthTrust * (cpu.orthStep[idx] - cpu.adamStep[idx]);
+		gpuOrthResidual[idx] =
+		    gpu.lastOrthTrust * (gpu.orthStep[idx] - gpu.adamStep[idx]);
+		cpuOrthResidualMax = std::max(cpuOrthResidualMax, fabsf(cpuOrthResidual[idx]));
+		gpuOrthResidualMax = std::max(gpuOrthResidualMax, fabsf(gpuOrthResidual[idx]));
+	}
+	const bool orthApplied =
+	    (cpuOrthResidualMax > valueTol) || (gpuOrthResidualMax > valueTol);
+	if (orthApplied)
+		assert_close_vector("orthResidual", gpuOrthResidual, cpuOrthResidual, valueTol);
+	assert_close_value("predTrust", gpu.lastPredictiveTrust, cpu.lastPredictiveTrust, stateTol);
+	assert_close_value("geomTrust", gpu.lastGeometryTrust, cpu.lastGeometryTrust, stateTol);
+	if (orthApplied)
+		assert_close_value("orthTrust", gpu.lastOrthTrust, cpu.lastOrthTrust, stateTol);
+	else
+		ASSERT("ARGOS orthTrust diagnostics should stay finite",
+		       std::isfinite(cpu.lastOrthTrust) && std::isfinite(gpu.lastOrthTrust));
+	assert_close_value("rowAniso", gpu.lastRowAnisotropy, cpu.lastRowAnisotropy, stateTol);
+	assert_close_value("colAniso", gpu.lastColAnisotropy, cpu.lastColAnisotropy, stateTol);
+	assert_close_value("aspect", gpu.lastAspect, cpu.lastAspect, stateTol);
+	assert_close_value("signalScale", gpu.lastSignalScale, cpu.lastSignalScale, stateTol);
+	assert_close_value("observability", gpu.lastObservability, cpu.lastObservability, stateTol);
+	assert_close_value("roleBonus", gpu.lastRoleBonus, cpu.lastRoleBonus, stateTol);
+	assert_close_value("adamReward", gpu.lastAdamReward, cpu.lastAdamReward, stateTol);
+	assert_close_value("geomReward", gpu.lastGeometryReward, cpu.lastGeometryReward, stateTol);
+	ASSERT("ARGOS orth reward should stay finite",
+	       std::isfinite(cpu.lastOrthReward) && std::isfinite(gpu.lastOrthReward));
+	ASSERT("ARGOS eligibility mismatch", gpu.lastEligible == cpu.lastEligible);
+	ASSERT("ARGOS step mismatch", gpu.step == cpu.step);
+}
+
 static glades::NumberInput* make_atlas_transformer_resume_dataset()
 {
 	const int numSamples = 8;
@@ -2565,6 +2804,532 @@ void ATLASMATRAParityTest()
 	printf("============================================================\n");
 #else
 	printf("CUDA not enabled, skipping MATRA parity tests.\n");
+	printf("============================================================\n");
+#endif
+}
+
+void ATLASARGOSCoreUnitTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS ARGOS Core Unit Test\n");
+	printf("============================================================\n");
+
+	const unsigned int m = 4u;
+	const unsigned int n = 4u;
+	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float inv1mB1t = 1.0f / (1.0f - beta1);
+	const float inv1mB2t = 1.0f / (1.0f - beta2);
+	const float eps = 1.0e-8f;
+
+	const float initWRaw[] = {
+		0.40f, -0.30f, 0.20f, -0.10f,
+		0.25f, -0.15f, 0.05f, 0.10f,
+		-0.20f, 0.35f, -0.25f, 0.15f,
+		0.05f, -0.10f, 0.30f, -0.35f
+	};
+	const float geomGradRaw[] = {
+		3.50f, 2.00f, 0.50f, 0.10f,
+		2.20f, 1.10f, 0.30f, 0.05f,
+		0.60f, 0.25f, 0.10f, 0.02f,
+		0.12f, 0.05f, 0.02f, 0.01f
+	};
+	const float warmGradRaw[] = {
+		1.20f, 0.90f, 0.40f, 0.20f,
+		0.95f, 1.05f, 0.35f, 0.25f,
+		0.35f, 0.30f, 0.85f, 0.60f,
+		0.20f, 0.22f, 0.55f, 0.95f
+	};
+	const float orthGradRaw[] = {
+		2.40f, 1.60f, 0.60f, 0.25f,
+		1.75f, 2.10f, 0.55f, 0.35f,
+		0.55f, 0.45f, 1.65f, 1.10f,
+		0.30f, 0.28f, 0.90f, 1.80f
+	};
+
+	const std::vector<float> initW(initWRaw, initWRaw + mn);
+	const std::vector<float> geomGrad(geomGradRaw, geomGradRaw + mn);
+	const std::vector<float> warmGrad(warmGradRaw, warmGradRaw + mn);
+	const std::vector<float> orthGrad(orthGradRaw, orthGradRaw + mn);
+
+	{
+		std::vector<float> W = initW;
+		std::vector<float> m1(mn, 0.0f);
+		std::vector<float> v2(mn, 0.0f);
+		std::vector<float> g = geomGrad;
+		std::vector<float> expectedW = initW;
+		std::vector<float> expectedM(mn, 0.0f);
+		std::vector<float> expectedV(mn, 0.0f);
+
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const float grad = geomGrad[idx];
+			expectedM[idx] = (1.0f - beta1) * grad;
+			expectedV[idx] = (1.0f - beta2) * (grad * grad);
+			expectedW[idx] -= lr * (grad / (fabsf(grad) + eps));
+		}
+
+		glades::atlas::ArgosWeightState state;
+		glades::ATLASConfig ac;
+		ac.argosEnabled = true;
+		ac.argosGeometryScale = 0.0f;
+		ac.argosOrthogonalScale = 0.0f;
+		ac.argosPredictiveScale = 0.0f;
+		ac.argosTrustRadius = 0.0f;
+		ac.argosMetricCadence = 1u;
+		ac.argosOrthCadence = 1u;
+		ac.argosMaxAspect = 2.0f;
+		ac.argosMinDim = 2u;
+		ac.argosDamping = 0.01f;
+		ac.argosObservabilityScale = 0.0f;
+		ac.argosHeadBonus = 0.0f;
+		ac.argosLateBonus = 0.0f;
+
+		const bool ok = glades::atlas::argosUpdate(state,
+		                                           &W[0], &m1[0], &v2[0], &g[0],
+		                                           m, n, lr,
+		                                           beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                           1.0f, 1.0f, 0.0f, 0.0f,
+		                                           ac, quiet_logger(), "ut.argos.fallback");
+		ASSERT("ARGOS fallback update failed", ok);
+		assert_close_vector("argos-fallback-W", W, expectedW, 1.0e-6f);
+		assert_close_vector("argos-fallback-m1", m1, expectedM, 1.0e-6f);
+		assert_close_vector("argos-fallback-v2", v2, expectedV, 1.0e-6f);
+		for (size_t idx = 0u; idx < mn; ++idx)
+			ASSERT("ARGOS fallback should zero gradients", fabsf(g[idx]) < 1.0e-12f);
+		printf("[UT] ARGOS fallback matches exact Adam-style update\n");
+	}
+
+	{
+		std::vector<float> WHead = initW;
+		std::vector<float> WBody = initW;
+		std::vector<float> mHead(mn, 0.0f);
+		std::vector<float> vHead(mn, 0.0f);
+		std::vector<float> mBody(mn, 0.0f);
+		std::vector<float> vBody(mn, 0.0f);
+		std::vector<float> gHead = geomGrad;
+		std::vector<float> gBody = geomGrad;
+
+		glades::atlas::ArgosWeightState headState;
+		glades::atlas::ArgosWeightState bodyState;
+		glades::ATLASConfig ac;
+		ac.argosEnabled = true;
+		ac.argosGeometryScale = 1.0f;
+		ac.argosOrthogonalScale = 0.0f;
+		ac.argosPredictiveScale = 0.0f;
+		ac.argosTrustRadius = 1.0f;
+		ac.argosMetricCadence = 1u;
+		ac.argosOrthCadence = 1u;
+		ac.argosMaxAspect = 2.0f;
+		ac.argosMinDim = 2u;
+		ac.argosDamping = 0.01f;
+		ac.argosObservabilityScale = 0.20f;
+		ac.argosHeadBonus = 0.45f;
+		ac.argosLateBonus = 0.0f;
+
+		bool ok = glades::atlas::argosUpdateWithRole(headState,
+		                                             &WHead[0], &mHead[0], &vHead[0], &gHead[0],
+		                                             m, n, lr,
+		                                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                             1.0f, 1.0f, 0.0f, 0.0f,
+		                                             ac,
+		                                             glades::atlas::ARGOS_ROLE_HEAD,
+		                                             quiet_logger(), "ut.argos.head");
+		ASSERT("ARGOS head-biased update failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(bodyState,
+		                                        &WBody[0], &mBody[0], &vBody[0], &gBody[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        ac,
+		                                        glades::atlas::ARGOS_ROLE_NONE,
+		                                        quiet_logger(), "ut.argos.body");
+		ASSERT("ARGOS body update failed", ok);
+
+		ASSERT("ARGOS head bonus should raise observability",
+		       headState.lastObservability > bodyState.lastObservability);
+		ASSERT("ARGOS head role bonus should be retained in diagnostics",
+		       headState.lastRoleBonus > bodyState.lastRoleBonus);
+		printf("[UT] ARGOS role bonuses raise observability on otherwise identical gradients\n");
+	}
+
+	{
+		std::vector<float> WFull = initW;
+		std::vector<float> WGeom = initW;
+		std::vector<float> mFull(mn, 0.0f);
+		std::vector<float> vFull(mn, 0.0f);
+		std::vector<float> mGeom(mn, 0.0f);
+		std::vector<float> vGeom(mn, 0.0f);
+		std::vector<float> gFull = warmGrad;
+		std::vector<float> gGeom = warmGrad;
+
+		glades::atlas::ArgosWeightState fullState;
+		glades::atlas::ArgosWeightState geomOnlyState;
+		glades::ATLASConfig fullCfg;
+		fullCfg.argosEnabled = true;
+		fullCfg.argosGeometryScale = 1.0f;
+		fullCfg.argosOrthogonalScale = 1.0f;
+		fullCfg.argosPredictiveScale = 0.35f;
+		fullCfg.argosTrustRadius = 0.85f;
+		fullCfg.argosMetricCadence = 1u;
+		fullCfg.argosOrthCadence = 1u;
+		fullCfg.argosMaxAspect = 2.0f;
+		fullCfg.argosMinDim = 2u;
+		fullCfg.argosDamping = 0.01f;
+		fullCfg.argosObservabilityScale = 0.35f;
+		fullCfg.argosHeadBonus = 0.45f;
+		fullCfg.argosLateBonus = 0.20f;
+
+		glades::ATLASConfig geomCfg = fullCfg;
+		geomCfg.argosOrthogonalScale = 0.0f;
+
+		bool ok = glades::atlas::argosUpdateWithRole(fullState,
+		                                             &WFull[0], &mFull[0], &vFull[0], &gFull[0],
+		                                             m, n, lr,
+		                                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                             1.0f, 1.0f, 0.0f, 0.0f,
+		                                             fullCfg,
+		                                             glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                             quiet_logger(), "ut.argos.full.warm");
+		ASSERT("ARGOS warmup step failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(geomOnlyState,
+		                                        &WGeom[0], &mGeom[0], &vGeom[0], &gGeom[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        geomCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.geom.warm");
+		ASSERT("ARGOS geometry-only warmup step failed", ok);
+
+		gFull = orthGrad;
+		gGeom = orthGrad;
+		const double b1t2 = std::pow(static_cast<double>(beta1), 2.0);
+		const double b2t2 = std::pow(static_cast<double>(beta2), 2.0);
+		const float inv1mB1t2 = static_cast<float>(1.0 / (1.0 - b1t2));
+		const float inv1mB2t2 = static_cast<float>(1.0 / (1.0 - b2t2));
+		ok = glades::atlas::argosUpdateWithRole(fullState,
+		                                        &WFull[0], &mFull[0], &vFull[0], &gFull[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        fullCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.full.step2");
+		ASSERT("ARGOS second step failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(geomOnlyState,
+		                                        &WGeom[0], &mGeom[0], &vGeom[0], &gGeom[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        geomCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.geom.step2");
+		ASSERT("ARGOS geometry-only second step failed", ok);
+
+		ASSERT("ARGOS predictive trust should activate on the second step",
+		       fullState.lastPredictiveTrust > 0.0f);
+		ASSERT("ARGOS observability should stay finite", fullState.lastObservability >= 0.0f);
+		ASSERT("ARGOS rewards should remain finite",
+		       std::isfinite(fullState.lastAdamReward)
+		       && std::isfinite(fullState.lastGeometryReward)
+		       && std::isfinite(fullState.lastOrthReward));
+		if (fullState.lastOrthTrust > 0.0f)
+		{
+			double diff = 0.0;
+			for (size_t idx = 0u; idx < mn; ++idx)
+			{
+				const double delta = static_cast<double>(WFull[idx]) - static_cast<double>(WGeom[idx]);
+				diff += delta * delta;
+			}
+			ASSERT("ARGOS orth trust should change the step relative to geometry-only control", diff > 1.0e-8);
+			ASSERT("ARGOS orth branch should be eligible on square blocks", fullState.lastEligible);
+			ASSERT("ARGOS signal scale should become positive when orth trust is active",
+			       fullState.lastSignalScale > 0.0f);
+		printf("[UT] ARGOS activates predictive trust and reward-routed orthogonal residuals\n");
+		}
+		else
+		{
+			ASSERT("ARGOS should keep diagnostics finite when orth trust remains dormant",
+			       fullState.lastSignalScale >= 0.0f);
+			printf("[UT] ARGOS keeps predictive/observability diagnostics finite when orth trust stays dormant\n");
+		}
+	}
+
+	{
+		std::vector<float> WWarm = initW;
+		std::vector<float> WExact = initW;
+		std::vector<float> mWarm(mn, 0.0f);
+		std::vector<float> vWarm(mn, 0.0f);
+		std::vector<float> mExact(mn, 0.0f);
+		std::vector<float> vExact(mn, 0.0f);
+		std::vector<float> gWarm = warmGrad;
+		std::vector<float> gExact = warmGrad;
+
+		glades::atlas::ArgosWeightState warmState;
+		glades::atlas::ArgosWeightState exactState;
+		glades::ATLASConfig warmCfg;
+		warmCfg.argosEnabled = true;
+		warmCfg.argosGeometryScale = 1.0f;
+		warmCfg.argosOrthogonalScale = 1.0f;
+		warmCfg.argosPredictiveScale = 0.35f;
+		warmCfg.argosTrustRadius = 0.85f;
+		warmCfg.argosWarmupSteps = 2u;
+		warmCfg.argosMetricCadence = 1u;
+		warmCfg.argosOrthCadence = 1u;
+		warmCfg.argosMaxAspect = 2.0f;
+		warmCfg.argosMinDim = 2u;
+		warmCfg.argosDamping = 0.01f;
+		warmCfg.argosObservabilityScale = 0.35f;
+		warmCfg.argosHeadBonus = 0.45f;
+		warmCfg.argosLateBonus = 0.20f;
+
+		glades::ATLASConfig exactCfg = warmCfg;
+		exactCfg.argosGeometryScale = 0.0f;
+		exactCfg.argosOrthogonalScale = 0.0f;
+		exactCfg.argosPredictiveScale = 0.0f;
+		exactCfg.argosTrustRadius = 0.0f;
+		exactCfg.argosWarmupSteps = 0u;
+		exactCfg.argosObservabilityScale = 0.0f;
+		exactCfg.argosHeadBonus = 0.0f;
+		exactCfg.argosLateBonus = 0.0f;
+
+		bool ok = glades::atlas::argosUpdateWithRole(warmState,
+		                                             &WWarm[0], &mWarm[0], &vWarm[0], &gWarm[0],
+		                                             m, n, lr,
+		                                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                             1.0f, 1.0f, 0.0f, 0.0f,
+		                                             warmCfg,
+		                                             glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                             quiet_logger(), "ut.argos.warmup.step1");
+		ASSERT("ARGOS warmup step1 failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(exactState,
+		                                        &WExact[0], &mExact[0], &vExact[0], &gExact[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        exactCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.exact.step1");
+		ASSERT("ARGOS exact baseline step1 failed", ok);
+
+		assert_close_vector("argos-warmup-step1-W", WWarm, WExact, 1.0e-6f);
+		assert_close_vector("argos-warmup-step1-m1", mWarm, mExact, 1.0e-6f);
+		assert_close_vector("argos-warmup-step1-v2", vWarm, vExact, 1.0e-6f);
+		ASSERT("ARGOS warmup should suppress predictive trust on step1",
+		       fabsf(warmState.lastPredictiveTrust) < 1.0e-7f);
+		ASSERT("ARGOS warmup step1 diagnostics should stay finite",
+		       std::isfinite(warmState.lastGeometryTrust)
+		       && std::isfinite(warmState.lastOrthTrust));
+
+		gWarm = orthGrad;
+		gExact = orthGrad;
+		const double b1t2 = std::pow(static_cast<double>(beta1), 2.0);
+		const double b2t2 = std::pow(static_cast<double>(beta2), 2.0);
+		const float inv1mB1t2 = static_cast<float>(1.0 / (1.0 - b1t2));
+		const float inv1mB2t2 = static_cast<float>(1.0 / (1.0 - b2t2));
+		ok = glades::atlas::argosUpdateWithRole(warmState,
+		                                        &WWarm[0], &mWarm[0], &vWarm[0], &gWarm[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        warmCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.warmup.step2");
+		ASSERT("ARGOS warmup step2 failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(exactState,
+		                                        &WExact[0], &mExact[0], &vExact[0], &gExact[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        exactCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.exact.step2");
+		ASSERT("ARGOS exact baseline step2 failed", ok);
+
+		ASSERT("ARGOS warmup should allow predictive trust after step1",
+		       warmState.lastPredictiveTrust > 0.0f);
+		double diff = 0.0;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const double delta = static_cast<double>(WWarm[idx]) - static_cast<double>(WExact[idx]);
+			diff += delta * delta;
+		}
+		ASSERT("ARGOS warmup should diverge from exact Adam after the ramp begins", diff > 1.0e-8);
+		printf("[UT] ARGOS warmup preserves exact Adam on step1 and activates on later steps\n");
+	}
+
+	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
+}
+
+void ATLASARGOSParityTest()
+{
+	printf("============================================================\n");
+	printf("ATLAS ARGOS CPU-vs-GPU Parity Test\n");
+	printf("============================================================\n");
+
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		printf("No CUDA device available, skipping ARGOS parity tests.\n");
+		printf("============================================================\n");
+		return;
+	}
+
+	struct ParityCase
+	{
+		const char* label;
+		unsigned int roleFlags;
+		float geometryScale;
+		float orthScale;
+		float predictiveScale;
+		float trustRadius;
+		float observabilityScale;
+		float headBonus;
+		float lateBonus;
+		unsigned int warmupSteps;
+		float valueTol;
+		float stateTol;
+	};
+
+	const ParityCase cases[] = {
+		{ "ARGOS-body", glades::atlas::ARGOS_ROLE_NONE, 1.0f, 0.0f, 0.0f, 0.80f, 0.25f, 0.0f, 0.0f, 0u, 3.0e-5f, 3.0e-5f },
+		{ "ARGOS-headlate", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 0u, 4.0e-4f, 4.0e-4f },
+		{ "ARGOS-headlate-warmup", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 2u, 4.0e-4f, 4.0e-4f },
+	};
+
+	const unsigned int m = 4u;
+	const unsigned int n = 4u;
+	const size_t mn = static_cast<size_t>(m) * n;
+	const float lr = 0.01f;
+	const float beta1 = 0.9f;
+	const float beta2 = 0.999f;
+	const float eps = 1.0e-8f;
+	const float invBatch = 1.0f;
+	const float gradScale = 1.0f;
+
+	const float initWRaw[] = {
+		0.40f, -0.30f, 0.20f, -0.10f,
+		0.25f, -0.15f, 0.05f, 0.10f,
+		-0.20f, 0.35f, -0.25f, 0.15f,
+		0.05f, -0.10f, 0.30f, -0.35f
+	};
+	const float g1Raw[] = {
+		1.20f, 0.90f, 0.40f, 0.20f,
+		0.95f, 1.05f, 0.35f, 0.25f,
+		0.35f, 0.30f, 0.85f, 0.60f,
+		0.20f, 0.22f, 0.55f, 0.95f
+	};
+	const float g2Raw[] = {
+		2.40f, 1.60f, 0.60f, 0.25f,
+		1.75f, 2.10f, 0.55f, 0.35f,
+		0.55f, 0.45f, 1.65f, 1.10f,
+		0.30f, 0.28f, 0.90f, 1.80f
+	};
+	const std::vector<float> initW(initWRaw, initWRaw + mn);
+	const std::vector<float> grads[] = {
+		std::vector<float>(g1Raw, g1Raw + mn),
+		std::vector<float>(g2Raw, g2Raw + mn)
+	};
+
+	for (size_t caseIdx = 0u; caseIdx < sizeof(cases) / sizeof(cases[0]); ++caseIdx)
+	{
+		const ParityCase& spec = cases[caseIdx];
+		printf("-----------------------------------\n");
+		printf("%s parity\n", spec.label);
+		printf("-----------------------------------\n");
+
+		glades::ATLASConfig ac;
+		ac.argosEnabled = true;
+		ac.argosGeometryScale = spec.geometryScale;
+		ac.argosOrthogonalScale = spec.orthScale;
+		ac.argosPredictiveScale = spec.predictiveScale;
+		ac.argosTrustRadius = spec.trustRadius;
+		ac.argosWarmupSteps = spec.warmupSteps;
+		ac.argosMetricCadence = 1u;
+		ac.argosOrthCadence = 1u;
+		ac.argosMaxAspect = 2.0f;
+		ac.argosMinDim = 2u;
+		ac.argosDamping = 0.01f;
+		ac.argosObservabilityScale = spec.observabilityScale;
+		ac.argosHeadBonus = spec.headBonus;
+		ac.argosLateBonus = spec.lateBonus;
+		ac.tSub = 1u;
+
+		std::vector<float> cpuW = initW;
+		std::vector<float> cpuM(mn, 0.0f);
+		std::vector<float> cpuV(mn, 0.0f);
+		std::vector<float> cpuG(mn, 0.0f);
+		glades::atlas::ArgosWeightState cpuState;
+
+		glades::gpu::GpuBuffer<float> dW;
+		glades::gpu::GpuBuffer<float> dM;
+		glades::gpu::GpuBuffer<float> dV;
+		glades::gpu::GpuBuffer<float> dG;
+		ASSERT("gpu dW alloc failed", dW.allocate(mn));
+		ASSERT("gpu dM alloc failed", dM.allocate(mn));
+		ASSERT("gpu dV alloc failed", dV.allocate(mn));
+		ASSERT("gpu dG alloc failed", dG.allocate(mn));
+		ASSERT("gpu dW upload failed", dW.upload(initW.data(), initW.size()));
+		ASSERT("gpu dM zero failed", dM.zero());
+		ASSERT("gpu dV zero failed", dV.zero());
+		ASSERT("gpu dG zero failed", dG.zero());
+		glades::gpu::GpuArgosWeightState gpuState;
+
+		for (int step = 0; step < 2; ++step)
+		{
+			cpuG = grads[step];
+			const double b1t = std::pow(static_cast<double>(beta1), static_cast<double>(step + 1));
+			const double b2t = std::pow(static_cast<double>(beta2), static_cast<double>(step + 1));
+			const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
+			const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
+
+			const bool cpuOk = glades::atlas::argosUpdateWithRole(cpuState,
+			                                                      cpuW.data(), cpuM.data(), cpuV.data(), cpuG.data(),
+			                                                      m, n, lr,
+			                                                      beta1, beta2,
+			                                                      inv1mB1t, inv1mB2t,
+			                                                      eps,
+			                                                      invBatch, gradScale,
+			                                                      0.0f, 0.0f,
+			                                                      ac,
+			                                                      spec.roleFlags,
+			                                                      quiet_logger(), "ut.argos.cpu");
+			ASSERT("cpu ARGOS update failed", cpuOk);
+
+			const bool gpuOk = run_gpu_argos_step(gpuState,
+			                                      dW, dM, dV, dG,
+			                                      m, n, lr,
+			                                      beta1, beta2, eps,
+			                                      invBatch, gradScale,
+			                                      step + 1,
+			                                      spec.roleFlags,
+			                                      ac,
+			                                      grads[step]);
+			ASSERT("gpu ARGOS update failed", gpuOk);
+
+			ArgosParitySnapshot cpuSnap;
+			ArgosParitySnapshot gpuSnap;
+			capture_cpu_argos_snapshot(cpuSnap, cpuW, cpuM, cpuV, cpuG, cpuState);
+			capture_gpu_argos_snapshot(gpuSnap, dW, dM, dV, dG, gpuState);
+
+			char stepLabel[128];
+			sprintf(stepLabel, "%s step %d", spec.label, step + 1);
+			assert_argos_parity_snapshot(stepLabel,
+			                             cpuSnap, gpuSnap,
+			                             spec.valueTol, spec.stateTol);
+		}
+
+		printf("[UT] %s parity: PASSED\n", spec.label);
+	}
+
+	printf("============================================================\n");
+	printf("ARGOS parity tests: ALL PASSED\n");
+	printf("============================================================\n");
+#else
+	printf("CUDA not enabled, skipping ARGOS parity tests.\n");
 	printf("============================================================\n");
 #endif
 }

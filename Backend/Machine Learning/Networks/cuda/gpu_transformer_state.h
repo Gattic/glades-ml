@@ -207,6 +207,8 @@ struct GpuTransformerWeights
 		GpuRacerWeightState racerW1, racerW2;
 		GpuMatraWeightState matraWq, matraWk, matraWv, matraWo;
 		GpuMatraWeightState matraW1, matraW2;
+		GpuArgosWeightState argosWq, argosWk, argosWv, argosWo;
+		GpuArgosWeightState argosW1, argosW2;
 		GpuMuonWeightState muonWq, muonWk, muonWv, muonWo;
 		GpuMuonWeightState muonW1, muonW2;
 	};
@@ -283,6 +285,9 @@ struct GpuTransformerWeights
 	GpuMatraWeightState matraTokE;
 	GpuMatraWeightState matraWIn;
 	GpuMatraWeightState matraWOut;
+	GpuArgosWeightState argosTokE;
+	GpuArgosWeightState argosWIn;
+	GpuArgosWeightState argosWOut;
 	GpuMuonWeightState muonTokE;
 	GpuMuonWeightState muonWIn;
 	GpuMuonWeightState muonWOut;

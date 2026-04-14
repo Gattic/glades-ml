@@ -441,6 +441,67 @@ struct GpuMatraWeightState
 	}
 };
 
+// Lightweight GPU ARGOS state.
+//
+// ARGOS keeps AdamW as the exact backbone, reuses MATRA/MUON-style structured
+// candidates, and routes the residual trust budget using observability and
+// role bonuses supplied from the transformer trainer.
+struct GpuArgosWeightState
+{
+	unsigned int m;
+	unsigned int n;
+
+	GpuBuffer<float> rowSecond;   // [m] EMA row second moments
+	GpuBuffer<float> colSecond;   // [n] EMA col second moments
+	GpuBuffer<float> colScratch;  // [n] raw column g^2 sums for the current refresh
+	GpuBuffer<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	GpuBuffer<float> backboneStep; // [m * n] exact pre-applied Adam step on GPU
+	GpuBuffer<float> adamStep;    // [m * n] ARGOS predictive anchor
+	GpuBuffer<float> geomStep;    // [m * n] two-sided geometry candidate
+	GpuBuffer<float> orthStep;    // [m * n] orthogonal candidate
+	GpuBuffer<float> coreScratch; // [2 * coreDim * coreDim] Gram + factor scratch
+	GpuBuffer<float> scalarScratch; // [32] means / trust / reward / observability scratch
+
+	float rowMean;
+	float colMean;
+	float lastPredictiveTrust;
+	float lastGeometryTrust;
+	float lastOrthTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	float lastObservability;
+	float lastRoleBonus;
+	float lastAdamReward;
+	float lastGeometryReward;
+	float lastOrthReward;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+
+	GpuArgosWeightState()
+	    : m(0u), n(0u),
+	      rowMean(1.0e-12f), colMean(1.0e-12f),
+	      lastPredictiveTrust(0.0f),
+	      lastGeometryTrust(0.0f),
+	      lastOrthTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
+	      lastAspect(1.0f),
+	      lastSignalScale(0.0f),
+	      lastOrthError(0.0f),
+	      lastObservability(0.0f),
+	      lastRoleBonus(0.0f),
+	      lastAdamReward(0.0f),
+	      lastGeometryReward(0.0f),
+	      lastOrthReward(0.0f),
+	      lastEligible(false),
+	      step(0ULL), initialized(false)
+	{
+	}
+};
+
 struct GpuMatraBatchItem
 {
 	GpuMatraWeightState* state;
@@ -720,6 +781,31 @@ bool matra_gpu_update(GpuMatraWeightState& state,
                       const glades::ATLASConfig& ac,
                       shmea::GLogger* logger = 0,
                       const char* tag = 0);
+
+bool argos_gpu_update(GpuArgosWeightState& state,
+                      float* d_W, float* d_gW,
+                      float* d_m, float* d_v,
+                      unsigned int m, unsigned int n,
+                      float lr,
+                      float invBatch, float gradScale,
+                      float inv1mB1t, float inv1mB2t,
+                      float eps,
+                      const glades::ATLASConfig& ac,
+                      shmea::GLogger* logger = 0,
+                      const char* tag = 0);
+
+bool argos_gpu_update_with_role(GpuArgosWeightState& state,
+                                float* d_W, float* d_gW,
+                                float* d_m, float* d_v,
+                                unsigned int m, unsigned int n,
+                                float lr,
+                                float invBatch, float gradScale,
+                                float inv1mB1t, float inv1mB2t,
+                                float eps,
+                                const glades::ATLASConfig& ac,
+                                unsigned int roleFlags,
+                                shmea::GLogger* logger = 0,
+                                const char* tag = 0);
 
 // Batched MATRA update for small tall matrices with the same shape.
 // This path batches the exact small-core orthogonal solve across eligible
@@ -1016,6 +1102,36 @@ struct GpuMatraWeightState
 	      step(0ULL), initialized(false) {}
 };
 
+struct GpuArgosWeightState
+{
+	float rowMean;
+	float colMean;
+	float lastPredictiveTrust;
+	float lastGeometryTrust;
+	float lastOrthTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	float lastObservability;
+	float lastRoleBonus;
+	float lastAdamReward;
+	float lastGeometryReward;
+	float lastOrthReward;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+	GpuArgosWeightState()
+	    : rowMean(1.0e-12f), colMean(1.0e-12f),
+	      lastPredictiveTrust(0.0f), lastGeometryTrust(0.0f), lastOrthTrust(0.0f),
+	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f), lastAspect(1.0f),
+	      lastSignalScale(0.0f), lastOrthError(0.0f),
+	      lastObservability(0.0f), lastRoleBonus(0.0f),
+	      lastAdamReward(0.0f), lastGeometryReward(0.0f), lastOrthReward(0.0f),
+	      lastEligible(false), step(0ULL), initialized(false) {}
+};
+
 struct GpuMuonWeightState
 {
 	float lastPredictiveTrust;
@@ -1118,6 +1234,21 @@ inline bool matra_gpu_update(GpuMatraWeightState&, float*, float*, float*, float
                              const glades::ATLASConfig&,
                              shmea::GLogger* = 0,
                              const char* = 0) { return false; }
+inline bool argos_gpu_update(GpuArgosWeightState&, float*, float*, float*, float*,
+                             unsigned int, unsigned int,
+                             float, float, float,
+                             float, float, float,
+                             const glades::ATLASConfig&,
+                             shmea::GLogger* = 0,
+                             const char* = 0) { return false; }
+inline bool argos_gpu_update_with_role(GpuArgosWeightState&, float*, float*, float*, float*,
+                                       unsigned int, unsigned int,
+                                       float, float, float,
+                                       float, float, float,
+                                       const glades::ATLASConfig&,
+                                       unsigned int,
+                                       shmea::GLogger* = 0,
+                                       const char* = 0) { return false; }
 inline bool matra_gpu_update_small_batches(const GpuMatraBatchItem*, int,
                                            const int*, const int*, int,
                                            GpuMatraBatchItem*, float*, float**, float**, int*, int,

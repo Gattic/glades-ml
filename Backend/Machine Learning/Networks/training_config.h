@@ -1031,6 +1031,74 @@ struct ATLASConfig
 	// orthogonal candidate.
 	float matraDamping;
 
+	// Enable ARGOS: Actuation-Routed Geometry with Observability Steering.
+	// ARGOS keeps the exact AdamW backbone, reuses MATRA/MUON-style structured
+	// candidates, and routes the residual budget toward head-observable blocks
+	// when the measured block reward clears the Adam anchor.
+	bool argosEnabled;
+
+	// Scope of ARGOS matrix promotion:
+	// 0 = all eligible matrices,
+	// 1 = head-only (tied token embedding / output projection),
+	// 2 = late-only (last decoder block matrices),
+	// 3 = late-head (last decoder block plus head/output).
+	enum
+	{
+		ARGOS_SCOPE_ALL = 0u,
+		ARGOS_SCOPE_HEAD_ONLY = 1u,
+		ARGOS_SCOPE_LATE_ONLY = 2u,
+		ARGOS_SCOPE_LATE_HEAD = 3u
+	};
+	unsigned int argosScope;
+
+	// Maximum trust weight assigned to ARGOS's two-sided geometry candidate.
+	// 0 reduces ARGOS to the Adam-style predictive anchor (up to orthogonal
+	// trust, if enabled).
+	float argosGeometryScale;
+
+	// Maximum trust weight assigned to ARGOS's orthogonal matrix candidate.
+	float argosOrthogonalScale;
+
+	// Strength of the bounded one-step predictive transport blended into the
+	// first-moment signal before ARGOS evaluates structured candidates.
+	float argosPredictiveScale;
+
+	// Maximum total structured-update budget after observability routing.
+	float argosTrustRadius;
+
+	// Number of completed optimizer steps over which ARGOS linearly warms its
+	// predictive anchor and structured trust budget from zero to their
+	// configured strengths. 0 disables warmup.
+	unsigned int argosWarmupSteps;
+
+	// Number of optimizer steps between ARGOS row/column metric refreshes.
+	unsigned int argosMetricCadence;
+
+	// Number of optimizer steps between exact ARGOS orthogonal residual solves.
+	unsigned int argosOrthCadence;
+
+	// Only allow ARGOS's orthogonal branch on matrix blocks whose aspect ratio
+	// max(m, n) / min(m, n) does not exceed this limit.
+	float argosMaxAspect;
+
+	// Minimum block side length required before ARGOS's orthogonal branch can engage.
+	unsigned int argosMinDim;
+
+	// Additive floor used when inverting the small Gram matrix inside ARGOS's
+	// orthogonal candidate.
+	float argosDamping;
+
+	// Multiplier applied to the block observability signal before routing the
+	// residual budget. Larger values make ARGOS more willing to spend trust on
+	// anisotropic, reward-positive blocks.
+	float argosObservabilityScale;
+
+	// Additional observability bonus for head/output blocks.
+	float argosHeadBonus;
+
+	// Additional observability bonus for blocks in the final decoder layer.
+	float argosLateBonus;
+
 	// Enable MUON-lite: selective orthogonalized-momentum updates on eligible
 	// matrix blocks with exact AdamW fallback on all other parameters.
 	bool muonEnabled;
@@ -1362,6 +1430,21 @@ struct ATLASConfig
 	      matraMaxAspect(1.50f),
 	      matraMinDim(8u),
 	      matraDamping(0.01f),
+	      argosEnabled(false),
+	      argosScope(ARGOS_SCOPE_ALL),
+	      argosGeometryScale(1.0f),
+	      argosOrthogonalScale(0.5f),
+	      argosPredictiveScale(0.05f),
+	      argosTrustRadius(0.60f),
+	      argosWarmupSteps(0u),
+	      argosMetricCadence(1u),
+	      argosOrthCadence(1u),
+	      argosMaxAspect(1.50f),
+	      argosMinDim(8u),
+	      argosDamping(0.01f),
+	      argosObservabilityScale(0.75f),
+	      argosHeadBonus(0.35f),
+	      argosLateBonus(0.20f),
 	      muonEnabled(false),
 	      muonGeometryScale(1.0f),
 	      muonPredictiveScale(0.05f),
@@ -1438,6 +1521,16 @@ struct ATLASConfig
 			return true;
 		const unsigned long long stepIndex = (optimizerStep > 0ULL) ? optimizerStep : 1ULL;
 		return ((stepIndex - 1ULL) % cadence) == 0ULL;
+	}
+
+	inline float argosWarmupMultiplier(unsigned long long optimizerStep) const
+	{
+		if (argosWarmupSteps == 0u)
+			return 1.0f;
+		if (optimizerStep >= static_cast<unsigned long long>(argosWarmupSteps))
+			return 1.0f;
+		return static_cast<float>(optimizerStep)
+		       / static_cast<float>(std::max(1u, argosWarmupSteps));
 	}
 };
 

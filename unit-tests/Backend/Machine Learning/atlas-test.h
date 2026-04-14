@@ -35,6 +35,8 @@ void ATLASBiMAPMicroBenchmark();
 void ATLASBiMAPParityTest();
 void ATLASMATRACoreUnitTest();
 void ATLASMATRAParityTest();
+void ATLASARGOSCoreUnitTest();
+void ATLASARGOSParityTest();
 void ATLASKronMicroBenchmark();
 void ATLASMuonMicroBenchmark();
 void ATLASPACTMicroBenchmark();

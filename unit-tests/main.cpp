@@ -170,6 +170,10 @@ int main(int argc, char* argv[])
 		ATLASMATRACoreUnitTest();
 	    else if (strcmp(argv[1], "atlas-matra-parity") == 0)
 		ATLASMATRAParityTest();
+	    else if (strcmp(argv[1], "atlas-argos-core") == 0)
+		ATLASARGOSCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-argos-parity") == 0)
+		ATLASARGOSParityTest();
 	    else if (strcmp(argv[1], "atlas-kron-micro") == 0)
 		ATLASKronMicroBenchmark();
 	    else if (strcmp(argv[1], "atlas-muon-micro") == 0)

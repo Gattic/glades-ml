@@ -81,6 +81,7 @@ bool atlas_transformer_needs_adam_moments(const glades::TrainingConfig& training
 	            || trainingConfig.atlas.racerEnabled
 	            || trainingConfig.atlas.kronEnabled
 	            || trainingConfig.atlas.matraEnabled
+	            || trainingConfig.atlas.argosEnabled
 	            || trainingConfig.atlas.muonEnabled));
 }
 

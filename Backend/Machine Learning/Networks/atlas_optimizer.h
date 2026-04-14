@@ -25,6 +25,13 @@ struct ATLASConfig;
 
 namespace atlas {
 
+enum ArgosRoleFlags
+{
+	ARGOS_ROLE_NONE = 0u,
+	ARGOS_ROLE_HEAD = 1u << 0,
+	ARGOS_ROLE_LATE = 1u << 1
+};
+
 // Per-weight-matrix ATLAS optimizer state.
 //
 // For a weight matrix W in R^{m x n}, ATLAS maintains:
@@ -663,6 +670,93 @@ struct MatraWeightState
 	}
 };
 
+// Actuation-Routed Geometry with Observability Steering state.
+//
+// ARGOS keeps Adam-style first/second moments outside this state, tracks the
+// same lightweight matrix statistics as MATRA, and routes a limited residual
+// budget toward reward-positive geometry and orthogonal candidates using a
+// scalar observability score.
+struct ArgosWeightState
+{
+	unsigned int m;
+	unsigned int n;
+	std::vector<float> rowSecond;   // [m] EMA row second moments from raw gradients
+	std::vector<float> colSecond;   // [n] EMA column second moments from raw gradients
+	std::vector<float> prevMhat;    // [m * n] previous bias-corrected first moment
+	std::vector<float> backboneStep; // [m * n] exact Adam backbone step
+	std::vector<float> adamStep;    // [m * n] predictive Adam anchor
+	std::vector<float> geomStep;    // [m * n] two-sided geometry candidate
+	std::vector<float> orthStep;    // [m * n] orthogonal candidate
+	std::vector<float> coreScratch; // [min(m,n) * min(m,n)] Gram / inverse-sqrt core
+	float lastPredictiveTrust;
+	float lastGeometryTrust;
+	float lastOrthTrust;
+	float lastRowAnisotropy;
+	float lastColAnisotropy;
+	float lastAspect;
+	float lastSignalScale;
+	float lastOrthError;
+	float lastObservability;
+	float lastRoleBonus;
+	float lastAdamReward;
+	float lastGeometryReward;
+	float lastOrthReward;
+	bool lastEligible;
+	unsigned long long step;
+	bool initialized;
+
+	ArgosWeightState()
+	    : m(0u), n(0u),
+	      lastPredictiveTrust(0.0f),
+	      lastGeometryTrust(0.0f),
+	      lastOrthTrust(0.0f),
+	      lastRowAnisotropy(1.0f),
+	      lastColAnisotropy(1.0f),
+	      lastAspect(1.0f),
+	      lastSignalScale(0.0f),
+	      lastOrthError(0.0f),
+	      lastObservability(0.0f),
+	      lastRoleBonus(0.0f),
+	      lastAdamReward(0.0f),
+	      lastGeometryReward(0.0f),
+	      lastOrthReward(0.0f),
+	      lastEligible(false),
+	      step(0ULL),
+	      initialized(false)
+	{
+	}
+
+	void reset()
+	{
+		m = 0u;
+		n = 0u;
+		rowSecond.clear();
+		colSecond.clear();
+		prevMhat.clear();
+		backboneStep.clear();
+		adamStep.clear();
+		geomStep.clear();
+		orthStep.clear();
+		coreScratch.clear();
+		lastPredictiveTrust = 0.0f;
+		lastGeometryTrust = 0.0f;
+		lastOrthTrust = 0.0f;
+		lastRowAnisotropy = 1.0f;
+		lastColAnisotropy = 1.0f;
+		lastAspect = 1.0f;
+		lastSignalScale = 0.0f;
+		lastOrthError = 0.0f;
+		lastObservability = 0.0f;
+		lastRoleBonus = 0.0f;
+		lastAdamReward = 0.0f;
+		lastGeometryReward = 0.0f;
+		lastOrthReward = 0.0f;
+		lastEligible = false;
+		step = 0ULL;
+		initialized = false;
+	}
+};
+
 // Selective orthogonalized-momentum state.
 //
 // MUON-lite keeps Adam-style first/second moments outside this state and only
@@ -730,6 +824,7 @@ void initWeightState(WeightState& state, unsigned int m, unsigned int n,
 void initBiMAPWeightState(BiMAPWeightState& state, unsigned int m, unsigned int n);
 void initKronWeightState(KronWeightState& state, unsigned int m, unsigned int n);
 void initMatraWeightState(MatraWeightState& state, unsigned int m, unsigned int n);
+void initArgosWeightState(ArgosWeightState& state, unsigned int m, unsigned int n);
 void initMuonWeightState(MuonWeightState& state, unsigned int m, unsigned int n);
 
 // Refresh subspace basis U via randomized power iteration with EMA blending.
@@ -881,6 +976,33 @@ bool matraUpdate(MatraWeightState& state,
                  const ATLASConfig& ac,
                  shmea::GLogger* logger = 0,
                  const char* tag = 0);
+
+bool argosUpdate(ArgosWeightState& state,
+                 float* W, float* m1, float* v2, float* gW,
+                 unsigned int m, unsigned int n,
+                 float lr,
+                 float beta1, float beta2,
+                 float inv1mB1t, float inv1mB2t,
+                 float eps,
+                 float invBatch, float gradScale,
+                 float wd1, float wd2,
+                 const ATLASConfig& ac,
+                 shmea::GLogger* logger = 0,
+                 const char* tag = 0);
+
+bool argosUpdateWithRole(ArgosWeightState& state,
+                         float* W, float* m1, float* v2, float* gW,
+                         unsigned int m, unsigned int n,
+                         float lr,
+                         float beta1, float beta2,
+                         float inv1mB1t, float inv1mB2t,
+                         float eps,
+                         float invBatch, float gradScale,
+                         float wd1, float wd2,
+                         const ATLASConfig& ac,
+                         unsigned int roleFlags,
+                         shmea::GLogger* logger = 0,
+                         const char* tag = 0);
 
 bool muonUpdate(MuonWeightState& state,
                 float* W, float* m1, float* v2, float* gW,

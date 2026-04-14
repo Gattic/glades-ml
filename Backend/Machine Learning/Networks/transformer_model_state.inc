@@ -131,6 +131,8 @@
 			atlas::KronWeightState kronW1, kronW2;
 			atlas::MatraWeightState matraWq, matraWk, matraWv, matraWo;
 			atlas::MatraWeightState matraW1, matraW2;
+			atlas::ArgosWeightState argosWq, argosWk, argosWv, argosWo;
+			atlas::ArgosWeightState argosW1, argosW2;
 			atlas::MuonWeightState muonWq, muonWk, muonWv, muonWo;
 			atlas::MuonWeightState muonW1, muonW2;
 		};
@@ -159,6 +161,9 @@
 		atlas::MatraWeightState matraWIn;
 		atlas::MatraWeightState matraWOut;
 		atlas::MatraWeightState matraTokE;
+		atlas::ArgosWeightState argosWIn;
+		atlas::ArgosWeightState argosWOut;
+		atlas::ArgosWeightState argosTokE;
 		atlas::MuonWeightState muonWIn;
 		atlas::MuonWeightState muonWOut;
 		atlas::MuonWeightState muonTokE;
