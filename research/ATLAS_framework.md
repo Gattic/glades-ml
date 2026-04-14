@@ -7571,17 +7571,114 @@ Latest plateau confirmation:
   bookkeeping on `token-lm-corpus-large`
   - `cudaMemcpy`: `478 -> 454` calls
   - `cudaStreamSynchronize`: `1312 -> 1238` calls
-  but the fixed async-copy surplus versus `AdamW` remained unchanged:
-  - document: `343` vs `295` `cudaMemcpyAsync` calls
-  - corpus-large: `455` vs `391` `cudaMemcpyAsync` calls
+
+Final structural systems result:
+
+- `artifacts/matra_gpu_gate_20260413-190506/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.86999 @ 0.12s` vs `AdamW 4.86686 @ 0.10s`
+  - `token-lm-corpus-large`: `MATRA 6.25424 @ 0.21s` vs `AdamW 6.29996 @ 0.18s`
+- `artifacts/matra_nsys_20260413-190142/stats/`
+  showed that the persistent MATRA batch-descriptor cache removed the fixed
+  async-copy surplus almost completely:
+  - document `cudaMemcpyAsync`: `343 -> 296` calls for `MATRA`, versus `AdamW 295`
+  - corpus-large `cudaMemcpyAsync`: `455 -> 392` calls for `MATRA`, versus `AdamW 391`
+- despite that, wall clock still stayed in the same practical band:
+  - document remained `0.12s`
+  - corpus-large remained `0.21s`
+- this means the remaining gap is no longer explained by MATRA batch descriptor
+  uploads; it is now dominated by MATRA’s extra launch count and residual kernel
+  stack versus the simpler `AdamW` path
+
+Latest measured confirmation before the next structural pass:
+
+- `artifacts/matra_gpu_gate_20260413-191843/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.87570 @ 0.12s` vs `AdamW 4.88271 @ 0.10s`
+  - `token-lm-corpus-large`: `MATRA 6.26440 @ 0.20s` vs `AdamW 6.30597 @ 0.18s`
+- `artifacts/matra_nsys_20260413-191606/stats/`
+  confirmed that the fixed metadata-copy tax was effectively gone:
+  - document `cudaMemcpyAsync`: `296` calls for `MATRA`, versus `AdamW 295`
+  - corpus-large `cudaMemcpyAsync`: `392` calls for `MATRA`, versus `AdamW 391`
+  while launch count was still materially higher:
+  - document `cudaLaunchKernel`: `MATRA 12000`
+  - corpus-large `cudaLaunchKernel`: `MATRA 20545`
+- interpretation:
+  - the remaining cost is no longer MATRA descriptor upload or obvious host-side
+    metadata plumbing
+  - the remaining gap is mostly the MATRA launch stack plus solver / library
+    overhead relative to `AdamW`
+
+Checked-in next structural pass, pending rerun:
+
+- a dedicated geometry-only MATRA fused batch path now skips the separate
+  prepare/apply residual sequence for non-orth groups
+- the MATRA batch path also folds trust-budget finalization into the stats
+  finalization kernel to remove another control launch
+- those changes were built and `atlas-matra-core` passed locally, but they still
+  require a fresh GPU rerun before any new speed claim is valid
+
+Follow-up measurement of that fused geometry-only path:
+
+- `artifacts/matra_gpu_gate_20260413-192828/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.87217 @ 0.11s` vs `AdamW 4.87222 @ 0.10s`
+  - `token-lm-corpus-large`: `MATRA 6.26947 @ 0.20s` vs `AdamW 6.30198 @ 0.18s`
+- `artifacts/matra_nsys_20260413-192506/stats/`
+  - document `cudaLaunchKernel`: `12000 -> 11808`
+  - corpus-large `cudaLaunchKernel`: `20545 -> 20289`
+  - `cudaMemcpyAsync` remained effectively at parity with `AdamW`
+- interpretation:
+  - the geometry-only fused path did remove a small amount of fixed launch tax
+  - it modestly improved the document acceptance frontier
+  - the broader `MATRA` verdict did not change; the remaining gap is still
+    mostly launch / solver overhead rather than metadata-copy traffic
+
+Falsification of the over-fused geometry-only kernel:
+
+- `artifacts/matra_gpu_gate_20260413-194142/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.86972 @ 0.14s` vs `AdamW 4.87594 @ 0.10s`
+  - `token-lm-corpus-large`: `MATRA 6.24540 @ 0.28s` vs `AdamW 6.30433 @ 0.18s`
+- `artifacts/matra_nsys_20260413-193709/stats/`
+  showed why that branch failed:
+  - the compact geometry-only kernel became the dominant MATRA hotspot
+  - document: about `18.6 ms` total across `96 + 48` instances
+  - corpus-large: about `44.4 ms` total across `128 + 64` instances
+  - `cudaLaunchKernel` counts did go down further
+    - document: `11808 -> 11088`
+    - corpus-large: `20289 -> 19329`
+  - but `cudaStreamSynchronize` exploded
+    - document: `0.94 ms -> 18.47 ms`
+    - corpus-large: `1.24 ms -> 44.83 ms`
+- interpretation:
+  - collapsing the entire geometry-only MATRA path into one heavy kernel was the
+    wrong tradeoff
+  - the kernel reduced launch count but replaced it with a much larger per-group
+    execution cost dominated by reductions / atomics / low-occupancy work
+  - that branch was therefore rolled back locally, restoring the earlier
+    geometry-only path as the last known-good baseline
+
+Rollback confirmation:
+
+- `artifacts/matra_gpu_gate_20260413-195800/acceptance_summary.tsv`
+  - `token-lm-document`: `MATRA 4.88542 @ 0.11s` vs `AdamW 4.87553 @ 0.10s`
+  - `token-lm-corpus-large`: `MATRA 6.26701 @ 0.20s` vs `AdamW 6.29907 @ 0.18s`
+- `artifacts/matra_nsys_20260413-195523/stats/`
+  confirmed that the rollback returned MATRA to the earlier good systems band:
+  - document `cudaLaunchKernel`: back to `11808`
+  - corpus-large `cudaLaunchKernel`: back to `20289`
+  - document `cudaStreamSynchronize`: back down to about `1.23 ms`
+  - corpus-large `cudaStreamSynchronize`: back down to about `2.17 ms`
+- interpretation:
+  - the regression was isolated to the compact geometry-only kernel
+  - the rollback restores the previous MATRA systems frontier
+  - no further evidence currently suggests another high-ROI repo-side
+    micro-optimization remains
 
 Interpretation:
 
 - the optimization campaign was successful in making `MATRA` operationally
   competitive enough to study under matched wall clock
 - `MATRA` still preserves a real quality signal on `token-lm-corpus-large`
-- the remaining gap now looks like a mixture of launch-count tax and library
-  behavior, not an obvious repo-side kernel bug
+- the remaining gap now looks like a mixture of launch-count tax and library /
+  solver behavior, not an obvious repo-side metadata or host-copy bug
 - I would stop `MATRA` micro-optimization at this point
 
 Updated action rule:
@@ -7590,8 +7687,76 @@ Updated action rule:
   - a dedicated geometry-only fast path
   - a tighter fusion with the batched Adam backbone update
   - or a new algorithmic simplification of the orthogonal branch
+
+## April 14, 2026: clean same-codebase rerank on the restored `MATRA` branch updates the cross-optimizer picture again
+
+After the April 13 `MATRA` systems work and the rollback of the failed
+over-fused geometry-only kernel, I reran the clean same-codebase ranking on the
+restored stable branch using:
+
+- `artifacts/optimizer_clean_ranking_20260414-041121/acceptance_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260414-041121/epoch_sweep_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260414-041121/acceptance_rank_by_nll.tsv`
+- `artifacts/optimizer_clean_ranking_20260414-041121/epoch4_rank_by_nll.tsv`
+
+Acceptance ranking by benchmark:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.81535 @ 0.11s`
+  - `BiMAP-lite`: `4.86350 @ 0.13s`
+  - `MATRA`: `4.87195 @ 0.12s`
+  - `ECHO`: `4.87300 @ 0.10s`
+  - `AdamW`: `4.87636 @ 0.10s`
+  - `BiMAP-v2`: `4.89802 @ 0.15s`
+- `token-lm-corpus-large`
+  - `MATRA`: `6.25805 @ 0.20s`
+  - `AdamW`: `6.30330 @ 0.18s`
+  - `ECHO`: `6.30588 @ 0.19s`
+  - `MUON-lite`: `6.31724 @ 0.20s`
+  - `BiMAP-lite`: `6.33291 @ 0.22s`
+  - `BiMAP-v2`: `6.52259 @ 0.26s`
+
+Epoch-4 ranking by benchmark:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.59419 @ 0.22s`
+  - `ECHO`: `4.61979 @ 0.20s`
+  - `BiMAP-v2`: `4.64928 @ 0.30s`
+  - `AdamW`: `4.65121 @ 0.20s`
+  - `BiMAP-lite`: `4.65899 @ 0.26s`
+  - `MATRA`: `4.73031 @ 0.23s`
+- `token-lm-corpus-large`
+  - `MATRA`: `6.47817 @ 0.40s`
+  - `AdamW`: `6.49354 @ 0.36s`
+  - `ECHO`: `6.55310 @ 0.37s`
+  - `BiMAP-lite`: `6.59928 @ 0.44s`
+  - `BiMAP-v2`: `6.64940 @ 0.52s`
+  - `MUON-lite`: `6.68172 @ 0.39s`
+
+What changed relative to the April 13 clean rerank:
+
+- `MATRA` is no longer a high-cost outlier branch; the systems work moved it
+  from `0.69s / 1.92s` acceptance into the same practical wall-clock band as
+  the live branches
+- on `token-lm-corpus-large`, `MATRA` is now the best checked-in branch at both
+  acceptance and `e4`
+- on `token-lm-document`, `MATRA` improved enough to be competitive at
+  acceptance, but it is still the weakest branch by `e4`
+
+Updated practical verdict after the April 14 rerank:
+
+- `AdamW` remains the safest general default for broad large-LLM training in
+  this repo because it is still the most balanced cross-benchmark optimizer and
+  gives nearly the same corpus-large quality as `MATRA` at lower wall clock
+- `MUON-lite` remains the strongest document-style branch
+- `MATRA` is now the strongest corpus-large research branch and the best current
+  option when that benchmark family is the actual target
+- `ECHO` remains a useful near-AdamW control, but it is no longer the strongest
+  corpus-side branch after the stable `MATRA` systems work
+- `BiMAP-lite` remains competitive but secondary, and `BiMAP-v2` remains a
+  high-cost specialist rather than a practical default
 ---
 
-*Document version: 1.28*
+*Document version: 1.29*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
-*Date: 2026-04-13*
+*Date: 2026-04-14*

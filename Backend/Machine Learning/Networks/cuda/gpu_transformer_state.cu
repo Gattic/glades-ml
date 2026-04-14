@@ -34,8 +34,10 @@ GpuTransformerWeights::GpuTransformerWeights()
       echoObserveEntryCount(0), echoObserveTotalFeatures(0),
       echoObserveSeqLen(0u), echoObserveScope(0u), echoObserveTokenModel(false),
       echoObserveMetaUploaded(false),
+      matraBatchDescriptorsUploaded(false),
       adamPtrsUploaded(false),
-      adamMetricMetaUploaded(false), adamMetricScope(0u)
+      adamMetricMetaUploaded(false), adamMetricScope(0u),
+      matraBatchDescriptorCount(0), matraBatchDescriptorHash(0ULL)
 {
 }
 
@@ -252,6 +254,9 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		adamMaxSize = 0;
 		matraCoreBatchCapacity = maxGroups;
 		muonCoreBatchCapacity = maxGroups;
+		matraBatchDescriptorsUploaded = false;
+		matraBatchDescriptorCount = 0;
+		matraBatchDescriptorHash = 0ULL;
 		adamPtrsUploaded = false;
 		adamMetricMetaUploaded = false;
 		adamMetricScope = 0u;
@@ -356,9 +361,12 @@ void GpuTransformerWeights::free()
 	echoObserveScope = 0u;
 	echoObserveTokenModel = false;
 	echoObserveMetaUploaded = false;
+	matraBatchDescriptorsUploaded = false;
 	adamPtrsUploaded = false;
 	adamMetricMetaUploaded = false;
 	adamMetricScope = 0u;
+	matraBatchDescriptorCount = 0;
+	matraBatchDescriptorHash = 0ULL;
 	initialized = false;
 	// GpuBuffer destructors handle cudaFree automatically.
 }

@@ -239,7 +239,8 @@ static bool queue_or_run_matra_gpu(std::vector<MatraBatchGroup>& groups,
                                    glades::gpu::GpuBuffer<float>& v2,
                                    unsigned int rows,
                                    unsigned int cols,
-                                   float lr,
+                                   float baseLr,
+                                   float lrScale,
                                    float invBatch,
                                    float gradScale,
                                    float inv1mB1t,
@@ -265,7 +266,7 @@ static bool queue_or_run_matra_gpu(std::vector<MatraBatchGroup>& groups,
 	{
 		return glades::gpu::matra_gpu_update(state, param.data(), grad.data(),
 		                                     m1.data(), v2.data(),
-		                                     rows, cols, lr,
+		                                     rows, cols, baseLr * lrScale,
 		                                     invBatch, gradScale,
 		                                     inv1mB1t, inv1mB2t, adamEps,
 		                                     ac, logger, tag);
@@ -279,7 +280,7 @@ static bool queue_or_run_matra_gpu(std::vector<MatraBatchGroup>& groups,
 	item.d_v = v2.data();
 	item.m = rows;
 	item.n = cols;
-	item.lr = lr;
+	item.lr = baseLr;
 	item.tag = tag;
 
 	for (size_t gi = 0; gi < groups.size(); ++gi)
@@ -10498,11 +10499,11 @@ if (ad_.valid) { \
 				{
 					bool gpuMatraError = false;
 					std::vector<MatraBatchGroup> matraSmallBatchGroups;
+					const float matraLrScale = lrScheduleMultiplier * gpuExtraLRMult;
 
 					if (tokenLM)
 					{
-						const float lr0 =
-						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float lr0Base = skeleton->getLearningRate(0u);
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups,
 						                               gpuTransformerWeights,
@@ -10511,7 +10512,7 @@ if (ad_.valid) { \
 						                               gpuTransformerWeights->gTokE,
 						                               gpuTransformerWeights->vTokE,
 						                               gpuTransformerWeights->v2TokE,
-						                               vocabSize, dModel, lr0,
+						                               vocabSize, dModel, lr0Base, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.tokE"))
@@ -10519,8 +10520,7 @@ if (ad_.valid) { \
 					}
 					else
 					{
-						const float lr0 =
-						    skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float lr0Base = skeleton->getLearningRate(0u);
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups,
 						                               gpuTransformerWeights,
@@ -10529,7 +10529,7 @@ if (ad_.valid) { \
 						                               gpuTransformerWeights->gWIn,
 						                               gpuTransformerWeights->vWIn,
 						                               gpuTransformerWeights->v2WIn,
-						                               dModel, inputSize, lr0,
+						                               dModel, inputSize, lr0Base, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.WIn"))
@@ -10538,13 +10538,12 @@ if (ad_.valid) { \
 
 					for (unsigned int bli = 0; bli < nLayers; ++bli)
 					{
-						const float lr_l =
-						    skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float lrBase = skeleton->getLearningRate(bli + 1u);
 						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
 						                               gb.matraWq, gb.Wq, gb.gWq, gb.vWq, gb.v2Wq,
-						                               dModel, dModel, lr_l,
+						                               dModel, dModel, lrBase, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.Wq"))
@@ -10552,7 +10551,7 @@ if (ad_.valid) { \
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
 						                               gb.matraWk, gb.Wk, gb.gWk, gb.vWk, gb.v2Wk,
-						                               dModelKV, dModel, lr_l,
+						                               dModelKV, dModel, lrBase, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.Wk"))
@@ -10560,7 +10559,7 @@ if (ad_.valid) { \
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
 						                               gb.matraWv, gb.Wv, gb.gWv, gb.vWv, gb.v2Wv,
-						                               dModelKV, dModel, lr_l,
+						                               dModelKV, dModel, lrBase, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.Wv"))
@@ -10568,7 +10567,7 @@ if (ad_.valid) { \
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
 						                               gb.matraWo, gb.Wo, gb.gWo, gb.vWo, gb.v2Wo,
-						                               dModel, dModel, lr_l,
+						                               dModel, dModel, lrBase, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.Wo"))
@@ -10576,7 +10575,7 @@ if (ad_.valid) { \
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
 						                               gb.matraW1, gb.W1, gb.gW1, gb.vW1, gb.v2W1,
-						                               ff1Width, dModel, lr_l,
+						                               ff1Width, dModel, lrBase, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.W1"))
@@ -10584,7 +10583,7 @@ if (ad_.valid) { \
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups, gpuTransformerWeights,
 						                               gb.matraW2, gb.W2, gb.gW2, gb.vW2, gb.v2W2,
-						                               dModel, dFF, lr_l,
+						                               dModel, dFF, lrBase, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.W2"))
@@ -10593,8 +10592,7 @@ if (ad_.valid) { \
 
 					if (!tokenLM)
 					{
-						const float lrO =
-						    skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+						const float lrOBase = skeleton->getLearningRate(nLayers);
 						if (!gpuMatraError
 						    && !queue_or_run_matra_gpu(matraSmallBatchGroups,
 						                               gpuTransformerWeights,
@@ -10603,7 +10601,7 @@ if (ad_.valid) { \
 						                               gpuTransformerWeights->gWOut,
 						                               gpuTransformerWeights->vWOut,
 						                               gpuTransformerWeights->v2WOut,
-						                               outSize, dModel, lrO,
+						                               outSize, dModel, lrOBase, matraLrScale,
 						                               invBatch, gradScale,
 						                               inv1mB1t, inv1mB2t, adamEps,
 						                               ac, getLogger(), "tr.WOut"))
@@ -10648,6 +10646,10 @@ if (ad_.valid) { \
 						        gpuTransformerWeights->d_matraStepBatchPtrs,
 						        gpuTransformerWeights->d_matraInfoBatch,
 						        gpuTransformerWeights->matraCoreBatchCapacity,
+						        &gpuTransformerWeights->matraBatchDescriptorsUploaded,
+						        &gpuTransformerWeights->matraBatchDescriptorCount,
+						        &gpuTransformerWeights->matraBatchDescriptorHash,
+						        matraLrScale,
 						        invBatch, gradScale,
 						        inv1mB1t, inv1mB2t,
 						        adamEps,

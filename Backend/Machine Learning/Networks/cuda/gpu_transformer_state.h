@@ -257,9 +257,12 @@ struct GpuTransformerWeights
 	unsigned int echoObserveScope; // ECHO scope used to build cached descriptors
 	bool echoObserveTokenModel; // token-lm vs projection mode for cached descriptors
 	bool echoObserveMetaUploaded; // true after cached observe descriptors uploaded
+	bool matraBatchDescriptorsUploaded; // true after MATRA static batch descriptors uploaded
 	bool adamPtrsUploaded; // true after pointer arrays uploaded once
 	bool adamMetricMetaUploaded; // true after static ECHO metric metadata uploaded
 	unsigned int adamMetricScope; // ECHO scope for the uploaded static metric metadata
+	int matraBatchDescriptorCount; // cached MATRA descriptor count
+	unsigned long long matraBatchDescriptorHash; // cached hash of uploaded MATRA descriptor layout
 
 	// ATLAS optimizer state (one per weight matrix, biases use Adam).
 	GpuAtlasWeightState atlasTokE;
