@@ -2566,6 +2566,7 @@ void initMatraWeightState(MatraWeightState& state, unsigned int m, unsigned int 
 	state.lastPredictiveTrust = 0.0f;
 	state.lastGeometryTrust = 0.0f;
 	state.lastOrthTrust = 0.0f;
+	state.lastActuationScale = 1.0f;
 	state.lastRowAnisotropy = 1.0f;
 	state.lastColAnisotropy = 1.0f;
 	state.lastAspect =
@@ -9413,13 +9414,21 @@ bool bimapUpdate(BiMAPWeightState& state,
 	{
 		for (unsigned int i = 0u; i < m; ++i)
 		{
-			const float rowScaleRaw =
+			state.scratchRow[i] =
 			    std::sqrt((std::max(state.rowSecond[i], 1.0e-12f) + eps) / (rowMeanF + eps));
+		}
+		for (unsigned int j = 0u; j < n; ++j)
+		{
+			state.scratchCol[j] =
+			    std::sqrt((std::max(state.colSecond[j], 1.0e-12f) + eps) / (colMeanF + eps));
+		}
+		for (unsigned int i = 0u; i < m; ++i)
+		{
+			const float rowScaleRaw = state.scratchRow[i];
 			for (unsigned int j = 0u; j < n; ++j)
 			{
 				const size_t idx = static_cast<size_t>(i) * n + j;
-				const float colScaleRaw =
-				    std::sqrt((std::max(state.colSecond[j], 1.0e-12f) + eps) / (colMeanF + eps));
+				const float colScaleRaw = state.scratchCol[j];
 				float matrixScale = rowScaleRaw * colScaleRaw;
 				if (matrixScale < 0.25f)
 					matrixScale = 0.25f;
@@ -9455,20 +9464,20 @@ bool bimapUpdate(BiMAPWeightState& state,
 	}
 	else
 	{
-		std::vector<float> rowMetric(static_cast<size_t>(m), 1.0f);
-		std::vector<float> colMetric(static_cast<size_t>(n), 1.0f);
 		std::vector<float> stepMatrix(mn, 0.0f);
 		for (unsigned int i = 0u; i < m; ++i)
 		{
 			const float rowScaleRaw =
 			    std::sqrt((std::max(state.rowSecond[i], 1.0e-12f) + eps) / (rowMeanF + eps));
-			rowMetric[i] = std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (rowScaleRaw - 1.0f)));
+			state.scratchRow[i] =
+			    std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (rowScaleRaw - 1.0f)));
 		}
 		for (unsigned int j = 0u; j < n; ++j)
 		{
 			const float colScaleRaw =
 			    std::sqrt((std::max(state.colSecond[j], 1.0e-12f) + eps) / (colMeanF + eps));
-			colMetric[j] = std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (colScaleRaw - 1.0f)));
+			state.scratchCol[j] =
+			    std::max(0.25f, std::min(4.0f, 1.0f + geomScale * (colScaleRaw - 1.0f)));
 		}
 		for (unsigned int i = 0u; i < m; ++i)
 		{
@@ -9497,7 +9506,7 @@ bool bimapUpdate(BiMAPWeightState& state,
 		bimap_apply_left_inverse(stepMatrix,
 		                         m,
 		                         n,
-		                         rowMetric,
+		                         state.scratchRow,
 		                         state.rowBasis,
 		                         state.rowEigVal,
 		                         state.rowRank,
@@ -9506,7 +9515,7 @@ bool bimapUpdate(BiMAPWeightState& state,
 		bimap_apply_right_inverse(stepMatrix,
 		                          m,
 		                          n,
-		                          colMetric,
+		                          state.scratchCol,
 		                          state.colBasis,
 		                          state.colEigVal,
 		                          state.colRank,
@@ -10616,6 +10625,8 @@ bool argosUpdateWithRole(ArgosWeightState& state,
 	    std::max(0.0f, std::min(1.0f, ac.argosPredictiveScale)) * argosWarmup;
 	const float trustRadiusBudget =
 	    std::max(0.0f, ac.argosTrustRadius) * argosWarmup;
+	const float actuationScale =
+	    std::max(0.0f, std::min(1.0f, ac.argosActuationScale));
 	const unsigned int cadence = std::max(1u, ac.argosMetricCadence);
 	const unsigned int orthCadence = std::max(1u, ac.argosOrthCadence);
 	const bool refreshGeometry =
@@ -10849,10 +10860,12 @@ bool argosUpdateWithRole(ArgosWeightState& state,
 
 	for (size_t idx = 0u; idx < mn; ++idx)
 	{
-		float chosenStep =
+		const float argosStep =
 		    state.adamStep[idx] + geometryTrust * (state.geomStep[idx] - state.adamStep[idx]);
+		float chosenStep =
+		    state.backboneStep[idx] + actuationScale * (argosStep - state.backboneStep[idx]);
 		if (orthEnabled)
-			chosenStep += orthTrust * (state.orthStep[idx] - state.adamStep[idx]);
+			chosenStep += actuationScale * orthTrust * (state.orthStep[idx] - state.adamStep[idx]);
 		if (wd2 != 0.0f)
 			W[idx] -= lr * wd2 * W[idx];
 		W[idx] -= lr * chosenStep;
@@ -10864,6 +10877,7 @@ bool argosUpdateWithRole(ArgosWeightState& state,
 	state.lastPredictiveTrust = predictiveTrust;
 	state.lastGeometryTrust = geometryTrust;
 	state.lastOrthTrust = orthTrust;
+	state.lastActuationScale = actuationScale;
 	state.lastRowAnisotropy = rowAniso;
 	state.lastColAnisotropy = colAniso;
 	state.lastAspect = aspect;
@@ -10888,6 +10902,7 @@ bool argosUpdateWithRole(ArgosWeightState& state,
 		append_kv(oss, "predTrust", state.lastPredictiveTrust);
 		append_kv(oss, "geomTrust", state.lastGeometryTrust);
 		append_kv(oss, "orthTrust", state.lastOrthTrust);
+		append_kv(oss, "actScale", state.lastActuationScale);
 		append_kv(oss, "rowAniso", state.lastRowAnisotropy);
 		append_kv(oss, "colAniso", state.lastColAnisotropy);
 		append_kv(oss, "eligible", state.lastEligible ? 1u : 0u);

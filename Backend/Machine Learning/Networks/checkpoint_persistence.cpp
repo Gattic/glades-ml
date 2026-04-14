@@ -742,6 +742,8 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.atlas.argosPredictiveScale", f)) { cfg.atlas.argosPredictiveScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.argosTrustRadius", f)) { cfg.atlas.argosTrustRadius = f; any = true; }
 	if (parse_int(kv, "training.atlas.argosWarmupSteps", i) && i >= 0) { cfg.atlas.argosWarmupSteps = static_cast<unsigned int>(i); any = true; }
+	if (parse_float(kv, "training.atlas.argosWarmupStartScale", f)) { cfg.atlas.argosWarmupStartScale = f; any = true; }
+	if (parse_float(kv, "training.atlas.argosActuationScale", f)) { cfg.atlas.argosActuationScale = f; any = true; }
 	if (parse_int(kv, "training.atlas.argosMetricCadence", i) && i >= 0) { cfg.atlas.argosMetricCadence = static_cast<unsigned int>(i); any = true; }
 	if (parse_int(kv, "training.atlas.argosOrthCadence", i) && i >= 0) { cfg.atlas.argosOrthCadence = static_cast<unsigned int>(i); any = true; }
 	if (parse_float(kv, "training.atlas.argosMaxAspect", f)) { cfg.atlas.argosMaxAspect = f; any = true; }
@@ -1463,6 +1465,12 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.argosWarmupSteps; write_kv(out, "training.atlas.argosWarmupSteps", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosWarmupStartScale; write_kv(out, "training.atlas.argosWarmupStartScale", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.argosActuationScale; write_kv(out, "training.atlas.argosActuationScale", oss.str());
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.argosMetricCadence; write_kv(out, "training.atlas.argosMetricCadence", oss.str());
@@ -3326,6 +3334,26 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.argosWarmupSteps mismatch vs requested resume config (checkpoint "
 		    << savedARGOSWarmupSteps << ", current " << currentCfg.atlas.argosWarmupSteps << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSWarmupStartScale = 0.0f;
+	if (parse_float(kv, "training.atlas.argosWarmupStartScale", savedARGOSWarmupStartScale) &&
+	    std::fabs(currentCfg.atlas.argosWarmupStartScale - savedARGOSWarmupStartScale) > 1.0e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosWarmupStartScale mismatch vs requested resume config (checkpoint "
+		    << savedARGOSWarmupStartScale << ", current " << currentCfg.atlas.argosWarmupStartScale << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	float savedARGOSActuationScale = 1.0f;
+	if (parse_float(kv, "training.atlas.argosActuationScale", savedARGOSActuationScale) &&
+	    std::fabs(currentCfg.atlas.argosActuationScale - savedARGOSActuationScale) > 1.0e-6f)
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.argosActuationScale mismatch vs requested resume config (checkpoint "
+		    << savedARGOSActuationScale << ", current " << currentCfg.atlas.argosActuationScale << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

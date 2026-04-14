@@ -416,6 +416,7 @@ struct GpuMatraWeightState
 	float lastPredictiveTrust;
 	float lastGeometryTrust;
 	float lastOrthTrust;
+	float lastActuationScale;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastAspect;
@@ -431,6 +432,7 @@ struct GpuMatraWeightState
 	      lastPredictiveTrust(0.0f),
 	      lastGeometryTrust(0.0f),
 	      lastOrthTrust(0.0f),
+	      lastActuationScale(1.0f),
 	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
 	      lastAspect(1.0f),
 	      lastSignalScale(0.0f),
@@ -467,6 +469,7 @@ struct GpuArgosWeightState
 	float lastPredictiveTrust;
 	float lastGeometryTrust;
 	float lastOrthTrust;
+	float lastActuationScale;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastAspect;
@@ -487,6 +490,7 @@ struct GpuArgosWeightState
 	      lastPredictiveTrust(0.0f),
 	      lastGeometryTrust(0.0f),
 	      lastOrthTrust(0.0f),
+	      lastActuationScale(1.0f),
 	      lastRowAnisotropy(1.0f), lastColAnisotropy(1.0f),
 	      lastAspect(1.0f),
 	      lastSignalScale(0.0f),

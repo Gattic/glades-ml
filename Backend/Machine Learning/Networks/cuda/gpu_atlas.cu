@@ -4307,6 +4307,36 @@ __global__ void bimap_build_metric_vectors_kernel(const float* __restrict__ d_ro
 	}
 }
 
+__global__ void bimap_build_lite_scale_vectors_kernel(const float* __restrict__ d_rowSecond,
+                                                      const float* __restrict__ d_colSecond,
+                                                      float* __restrict__ d_rowScale,
+                                                      float* __restrict__ d_colScale,
+                                                      int rows,
+                                                      int cols,
+                                                      float eps,
+                                                      float rowMean,
+                                                      float colMean)
+{
+	const float safeRowMean = fmaxf(rowMean, 1.0e-12f);
+	const float safeColMean = fmaxf(colMean, 1.0e-12f);
+	const int limit = (rows > cols) ? rows : cols;
+	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < limit;
+	     idx += blockDim.x * gridDim.x)
+	{
+		if (idx < rows)
+		{
+			d_rowScale[idx] =
+			    sqrtf((fmaxf(d_rowSecond[idx], 1.0e-12f) + eps) / (safeRowMean + eps));
+		}
+		if (idx < cols)
+		{
+			d_colScale[idx] =
+			    sqrtf((fmaxf(d_colSecond[idx], 1.0e-12f) + eps) / (safeColMean + eps));
+		}
+	}
+}
+
 __global__ void bimap_init_identity_basis_kernel(float* __restrict__ d_basis,
                                                  int dim,
                                                  int rank)
@@ -4622,12 +4652,11 @@ __global__ void pact_lite_apply_residual_kernel(float* __restrict__ d_W,
 __global__ void bimap_lite_apply_residual_kernel(float* __restrict__ d_W,
                                                  float* __restrict__ d_gW,
                                                  const float* __restrict__ d_stepMatrix,
-                                                 const float* __restrict__ d_rowSecond,
-                                                 const float* __restrict__ d_colSecond,
+                                                 const float* __restrict__ d_rowScale,
+                                                 const float* __restrict__ d_colScale,
                                                  int rows, int cols,
                                                  float lr,
-                                                 float eps, float geomScale,
-                                                 float rowMean, float colMean)
+                                                 float geomScale)
 {
 	const int total = rows * cols;
 	for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4636,10 +4665,8 @@ __global__ void bimap_lite_apply_residual_kernel(float* __restrict__ d_W,
 	{
 		const int row = idx / cols;
 		const int col = idx - row * cols;
-		const float rowScaleRaw =
-		    sqrtf((fmaxf(d_rowSecond[row], 1.0e-12f) + eps) / (fmaxf(rowMean, 1.0e-12f) + eps));
-		const float colScaleRaw =
-		    sqrtf((fmaxf(d_colSecond[col], 1.0e-12f) + eps) / (fmaxf(colMean, 1.0e-12f) + eps));
+		const float rowScaleRaw = d_rowScale[row];
+		const float colScaleRaw = d_colScale[col];
 		float matrixScale = rowScaleRaw * colScaleRaw;
 		if (matrixScale < 0.25f)
 			matrixScale = 0.25f;
@@ -5197,6 +5224,7 @@ __global__ void matra_apply_residual_kernel(float* __restrict__ d_W,
                                             const float* __restrict__ d_orthStep,
                                             const float* __restrict__ d_stats,
                                             float lr,
+                                            float actuationScale,
                                             int total)
 {
 	const float geomTrust = d_stats[7];
@@ -5210,6 +5238,7 @@ __global__ void matra_apply_residual_kernel(float* __restrict__ d_W,
 		    + geomTrust * (d_geomStep[idx] - d_adamStep[idx]);
 		if (orthTrust > 0.0f)
 			correction += orthTrust * (d_orthStep[idx] - d_adamStep[idx]);
+		correction *= actuationScale;
 		float w = d_W[idx] - lr * correction;
 		if (!isfinite(w))
 			w = 0.0f;
@@ -6467,6 +6496,8 @@ static bool bimap_gpu_init_lite(GpuBiMAPWeightState& state,
 	state.colScratch.free();
 	state.prevMhat.free();
 	state.stepMatrix.free();
+	state.rowMetric.free();
+	state.colMetric.free();
 	state.scalarScratch.free();
 
 	if (!state.rowSecond.allocate(m)) return false;
@@ -6474,6 +6505,8 @@ static bool bimap_gpu_init_lite(GpuBiMAPWeightState& state,
 	if (!state.colScratch.allocate(n)) return false;
 	if (!state.prevMhat.allocate(static_cast<size_t>(m) * static_cast<size_t>(n))) return false;
 	if (!state.stepMatrix.allocate(static_cast<size_t>(m) * static_cast<size_t>(n))) return false;
+	if (!state.rowMetric.allocate(m)) return false;
+	if (!state.colMetric.allocate(n)) return false;
 	if (!state.scalarScratch.allocate(4u)) return false;
 
 	state.hostRowSecond.assign(static_cast<size_t>(m), 1.0f);
@@ -6484,6 +6517,8 @@ static bool bimap_gpu_init_lite(GpuBiMAPWeightState& state,
 	if (!state.colScratch.zero()) return false;
 	if (!state.prevMhat.zero()) return false;
 	if (!state.stepMatrix.zero()) return false;
+	if (!state.rowMetric.zero()) return false;
+	if (!state.colMetric.zero()) return false;
 	if (!state.scalarScratch.zero()) return false;
 
 	state.m = m;
@@ -6806,6 +6841,7 @@ static bool matra_gpu_init(GpuMatraWeightState& state,
 	state.lastPredictiveTrust = 0.0f;
 	state.lastGeometryTrust = 0.0f;
 	state.lastOrthTrust = 0.0f;
+	state.lastActuationScale = 1.0f;
 	state.lastRowAnisotropy = 1.0f;
 	state.lastColAnisotropy = 1.0f;
 	state.lastAspect = 1.0f;
@@ -7204,12 +7240,25 @@ bool bimap_gpu_update_lite(GpuBiMAPWeightState& state,
 
 	if (geomScale > 0.0f)
 	{
+		const int metricLimit = static_cast<int>((m > n) ? m : n);
+		const int metricGrid = std::max(1, (metricLimit + kBlock - 1) / kBlock);
+		bimap_build_lite_scale_vectors_kernel<<<metricGrid, kBlock, 0, computeStream()>>>(
+		    state.rowSecond.data(),
+		    state.colSecond.data(),
+		    state.rowMetric.data(),
+		    state.colMetric.data(),
+		    static_cast<int>(m),
+		    static_cast<int>(n),
+		    eps,
+		    state.rowMean,
+		    state.colMean);
+		ATLAS_CUDA_CHECK(cudaGetLastError());
+
 		bimap_lite_apply_residual_kernel<<<grid, kBlock, 0, computeStream()>>>(
 		    d_W, d_gW, state.stepMatrix.data(),
-		    state.rowSecond.data(), state.colSecond.data(),
+		    state.rowMetric.data(), state.colMetric.data(),
 		    static_cast<int>(m), static_cast<int>(n),
-		    lr, eps, geomScale,
-		    state.rowMean, state.colMean);
+		    lr, geomScale);
 		ATLAS_CUDA_CHECK(cudaGetLastError());
 		if (!atlas_gpu_guard(d_W, static_cast<size_t>(m) * static_cast<size_t>(n)))
 			return false;
@@ -8295,7 +8344,7 @@ bool matra_gpu_update(GpuMatraWeightState& state,
 	    state.geomStep.data(),
 	    dOrthCandidate,
 	    state.scalarScratch.data(),
-	    lr, total);
+	    lr, 1.0f, total);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	if (!atlas_gpu_guard(d_W, mn))
 		return false;
@@ -8344,6 +8393,7 @@ static void matra_gpu_log_step_event(const GpuMatraWeightState& state,
 	    << " predTrust=" << state.lastPredictiveTrust
 	    << " geomTrust=" << state.lastGeometryTrust
 	    << " orthTrust=" << state.lastOrthTrust
+	    << " actScale=" << state.lastActuationScale
 	    << " rowAniso=" << state.lastRowAnisotropy
 	    << " colAniso=" << state.lastColAnisotropy
 	    << " eligible=" << (state.lastEligible ? 1 : 0)
@@ -8517,6 +8567,8 @@ static bool argos_gpu_record_step(GpuArgosWeightState& state,
 {
 	const unsigned int cadence = std::max(1u, ac.argosMetricCadence);
 	const unsigned int orthCadence = std::max(1u, ac.argosOrthCadence);
+	state.lastActuationScale =
+	    std::max(0.0f, std::min(1.0f, ac.argosActuationScale));
 	state.lastAspect = aspect;
 	state.lastOrthError = 0.0f;
 	state.step += 1ULL;
@@ -8581,6 +8633,8 @@ bool argos_gpu_update_with_role(GpuArgosWeightState& state,
 	    std::max(0.0f, std::min(1.0f, ac.argosPredictiveScale)) * argosWarmup;
 	const float trustRadiusBudget =
 	    std::max(0.0f, ac.argosTrustRadius) * argosWarmup;
+	const float actuationScale =
+	    std::max(0.0f, std::min(1.0f, ac.argosActuationScale));
 	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
 	const unsigned int cadence = std::max(1u, ac.argosMetricCadence);
 	const unsigned int orthCadence = std::max(1u, ac.argosOrthCadence);
@@ -8814,7 +8868,7 @@ bool argos_gpu_update_with_role(GpuArgosWeightState& state,
 	    state.geomStep.data(),
 	    dOrthCandidate,
 	    state.scalarScratch.data(),
-	    lr, total);
+	    lr, actuationScale, total);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 	if (!atlas_gpu_guard(d_W, mn))
 		return false;

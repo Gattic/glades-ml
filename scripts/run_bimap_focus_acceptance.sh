@@ -10,6 +10,7 @@ CTX_DELTA_PARSER="$ROOT_DIR/scripts/parse_ctx_delta.py"
 GPU_DEVICE=0
 SKIP_BUILD=0
 BIMAP_SCOPE="late-head"
+BIMAP_LITE_CADENCE=4
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR_DEFAULT="$ROOT_DIR/artifacts/bimap_focus_acceptance_${TIMESTAMP}"
 OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
@@ -164,7 +165,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
     --variant bimap \
     --atlas-bimap-scope "$BIMAP_SCOPE" \
     --atlas-bimap-low-rank 0 \
-    --atlas-bimap-factor-cadence 1
+    --atlas-bimap-factor-cadence "$BIMAP_LITE_CADENCE"
 done
 
 run_ctx_delta_parser
@@ -181,6 +182,8 @@ Files:
 
 BiMAP scope:
   - $BIMAP_SCOPE
+- BiMAP-lite cadence:
+  - $BIMAP_LITE_CADENCE
 
 Benchmarks:
 $(printf '  - %s\n' "${BENCHMARKS[@]}")

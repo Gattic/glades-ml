@@ -1067,9 +1067,18 @@ struct ATLASConfig
 	float argosTrustRadius;
 
 	// Number of completed optimizer steps over which ARGOS linearly warms its
-	// predictive anchor and structured trust budget from zero to their
-	// configured strengths. 0 disables warmup.
+	// predictive anchor and structured trust budget from argosWarmupStartScale
+	// to their configured strengths. 0 disables warmup.
 	unsigned int argosWarmupSteps;
+
+	// Starting multiplier used on the first ARGOS step when warmup is enabled.
+	// 0 preserves exact AdamW on step 1; 1 keeps full ARGOS strength throughout.
+	float argosWarmupStartScale;
+
+	// Final actuation scale applied to ARGOS's deviation away from the exact
+	// AdamW backbone after candidate/trust computation. 0 keeps exact AdamW
+	// updates while still refreshing ARGOS state; 1 applies full ARGOS.
+	float argosActuationScale;
 
 	// Number of optimizer steps between ARGOS row/column metric refreshes.
 	unsigned int argosMetricCadence;
@@ -1437,6 +1446,8 @@ struct ATLASConfig
 	      argosPredictiveScale(0.05f),
 	      argosTrustRadius(0.60f),
 	      argosWarmupSteps(0u),
+	      argosWarmupStartScale(0.0f),
+	      argosActuationScale(1.0f),
 	      argosMetricCadence(1u),
 	      argosOrthCadence(1u),
 	      argosMaxAspect(1.50f),
@@ -1527,10 +1538,13 @@ struct ATLASConfig
 	{
 		if (argosWarmupSteps == 0u)
 			return 1.0f;
+		const float startScale = std::max(0.0f, std::min(1.0f, argosWarmupStartScale));
 		if (optimizerStep >= static_cast<unsigned long long>(argosWarmupSteps))
 			return 1.0f;
-		return static_cast<float>(optimizerStep)
-		       / static_cast<float>(std::max(1u, argosWarmupSteps));
+		const float progress =
+		    static_cast<float>(optimizerStep)
+		    / static_cast<float>(std::max(1u, argosWarmupSteps));
+		return startScale + progress * (1.0f - startScale);
 	}
 };
 

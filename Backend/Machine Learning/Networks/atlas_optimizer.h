@@ -620,6 +620,7 @@ struct MatraWeightState
 	float lastPredictiveTrust;
 	float lastGeometryTrust;
 	float lastOrthTrust;
+	float lastActuationScale;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastAspect;
@@ -634,6 +635,7 @@ struct MatraWeightState
 	      lastPredictiveTrust(0.0f),
 	      lastGeometryTrust(0.0f),
 	      lastOrthTrust(0.0f),
+	      lastActuationScale(1.0f),
 	      lastRowAnisotropy(1.0f),
 	      lastColAnisotropy(1.0f),
 	      lastAspect(1.0f),
@@ -659,6 +661,7 @@ struct MatraWeightState
 		lastPredictiveTrust = 0.0f;
 		lastGeometryTrust = 0.0f;
 		lastOrthTrust = 0.0f;
+		lastActuationScale = 1.0f;
 		lastRowAnisotropy = 1.0f;
 		lastColAnisotropy = 1.0f;
 		lastAspect = 1.0f;
@@ -691,6 +694,7 @@ struct ArgosWeightState
 	float lastPredictiveTrust;
 	float lastGeometryTrust;
 	float lastOrthTrust;
+	float lastActuationScale;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastAspect;
@@ -710,6 +714,7 @@ struct ArgosWeightState
 	      lastPredictiveTrust(0.0f),
 	      lastGeometryTrust(0.0f),
 	      lastOrthTrust(0.0f),
+	      lastActuationScale(1.0f),
 	      lastRowAnisotropy(1.0f),
 	      lastColAnisotropy(1.0f),
 	      lastAspect(1.0f),
@@ -741,6 +746,7 @@ struct ArgosWeightState
 		lastPredictiveTrust = 0.0f;
 		lastGeometryTrust = 0.0f;
 		lastOrthTrust = 0.0f;
+		lastActuationScale = 1.0f;
 		lastRowAnisotropy = 1.0f;
 		lastColAnisotropy = 1.0f;
 		lastAspect = 1.0f;

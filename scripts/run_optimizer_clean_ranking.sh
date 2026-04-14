@@ -40,7 +40,7 @@ MATRA_DAMPING=0.01
 
 BIMAP_SCOPE="late-head"
 BIMAP_RANK=8
-BIMAP_LITE_CADENCE=1
+BIMAP_LITE_CADENCE=4
 BIMAP_V2_CADENCE=8
 BIMAP_V2_PRED=0.15
 
@@ -192,6 +192,17 @@ append_acceptance_summary() {
       exit 0;
     }
   ' "$logfile" >> "$ACCEPT_TSV"
+}
+
+bimap_lite_cadence_for_benchmark() {
+  case "$1" in
+    token-lm-corpus-large|token-lm-corpus-xlarge)
+      echo 2
+      ;;
+    *)
+      echo 4
+      ;;
+  esac
 }
 
 generate_acceptance_rank() {
@@ -346,6 +357,7 @@ run_capture 14_smoke_matra_gpu \
   --gpu-device "$GPU_DEVICE"
 
 for benchmark in "${BENCHMARKS[@]}"; do
+  bimap_lite_cadence="$(bimap_lite_cadence_for_benchmark "$benchmark")"
   for epochs in "${EPOCHS[@]}"; do
     run_variant_epoch "sweep_${benchmark}_adamw_e${epochs}" \
       "$benchmark" "$epochs" "adamw" \
@@ -369,7 +381,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
       --variant bimap \
       --atlas-bimap-scope "$BIMAP_SCOPE" \
       --atlas-bimap-low-rank 0 \
-      --atlas-bimap-factor-cadence "$BIMAP_LITE_CADENCE"
+      --atlas-bimap-factor-cadence "$bimap_lite_cadence"
 
     run_variant_epoch "sweep_${benchmark}_muon_lite_e${epochs}" \
       "$benchmark" "$epochs" "muon_lite" \
@@ -408,6 +420,7 @@ done
 
 if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
   for benchmark in "${BENCHMARKS[@]}"; do
+    bimap_lite_cadence="$(bimap_lite_cadence_for_benchmark "$benchmark")"
     run_variant_accept "accept_${benchmark}_adamw" \
       "$benchmark" "adamw" \
       --variant adamw
@@ -430,7 +443,7 @@ if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
       --variant bimap \
       --atlas-bimap-scope "$BIMAP_SCOPE" \
       --atlas-bimap-low-rank 0 \
-      --atlas-bimap-factor-cadence "$BIMAP_LITE_CADENCE"
+      --atlas-bimap-factor-cadence "$bimap_lite_cadence"
 
     run_variant_accept "accept_${benchmark}_muon_lite" \
       "$benchmark" "muon_lite" \
@@ -499,7 +512,7 @@ Optimizer settings:
 - MUON geom/pred/maxAspect/minDim/damping:
   $MUON_GEOM / $MUON_PRED / $MUON_MAX_ASPECT / $MUON_MIN_DIM / $MUON_DAMPING
 - BiMAP scope/rank/liteCadence/v2Cadence/v2Pred:
-  $BIMAP_SCOPE / $BIMAP_RANK / $BIMAP_LITE_CADENCE / $BIMAP_V2_CADENCE / $BIMAP_V2_PRED
+  $BIMAP_SCOPE / $BIMAP_RANK / family-specific(4 non-corpus-large, 2 corpus-large/xlarge) / $BIMAP_V2_CADENCE / $BIMAP_V2_PRED
 EOF
 
 echo "Saved results to: $OUT_DIR"

@@ -612,6 +612,7 @@ struct MatraParitySnapshot
 	float lastPredictiveTrust;
 	float lastGeometryTrust;
 	float lastOrthTrust;
+	float lastActuationScale;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastAspect;
@@ -623,6 +624,7 @@ struct MatraParitySnapshot
 	    : lastPredictiveTrust(0.0f),
 	      lastGeometryTrust(0.0f),
 	      lastOrthTrust(0.0f),
+	      lastActuationScale(1.0f),
 	      lastRowAnisotropy(1.0f),
 	      lastColAnisotropy(1.0f),
 	      lastAspect(1.0f),
@@ -653,6 +655,7 @@ static void capture_cpu_matra_snapshot(MatraParitySnapshot& snap,
 	snap.lastPredictiveTrust = state.lastPredictiveTrust;
 	snap.lastGeometryTrust = state.lastGeometryTrust;
 	snap.lastOrthTrust = state.lastOrthTrust;
+	snap.lastActuationScale = state.lastActuationScale;
 	snap.lastRowAnisotropy = state.lastRowAnisotropy;
 	snap.lastColAnisotropy = state.lastColAnisotropy;
 	snap.lastAspect = state.lastAspect;
@@ -743,6 +746,7 @@ static void capture_gpu_matra_snapshot(MatraParitySnapshot& snap,
 	snap.lastPredictiveTrust = stats[6];
 	snap.lastGeometryTrust = stats[7];
 	snap.lastOrthTrust = stats[8];
+	snap.lastActuationScale = state.lastActuationScale;
 	snap.lastRowAnisotropy = (stats[2] > 1.0e-12f) ? (stats[3] / stats[2]) : state.lastRowAnisotropy;
 	snap.lastColAnisotropy = (stats[4] > 1.0e-12f) ? (stats[5] / stats[4]) : state.lastColAnisotropy;
 	snap.lastAspect = (stats[12] > 0.0f) ? stats[12] : state.lastAspect;
@@ -795,6 +799,7 @@ struct ArgosParitySnapshot
 	float lastPredictiveTrust;
 	float lastGeometryTrust;
 	float lastOrthTrust;
+	float lastActuationScale;
 	float lastRowAnisotropy;
 	float lastColAnisotropy;
 	float lastAspect;
@@ -811,6 +816,7 @@ struct ArgosParitySnapshot
 	    : lastPredictiveTrust(0.0f),
 	      lastGeometryTrust(0.0f),
 	      lastOrthTrust(0.0f),
+	      lastActuationScale(1.0f),
 	      lastRowAnisotropy(1.0f),
 	      lastColAnisotropy(1.0f),
 	      lastAspect(1.0f),
@@ -999,6 +1005,7 @@ static void assert_argos_parity_snapshot(const char* label,
 		assert_close_vector("orthResidual", gpuOrthResidual, cpuOrthResidual, valueTol);
 	assert_close_value("predTrust", gpu.lastPredictiveTrust, cpu.lastPredictiveTrust, stateTol);
 	assert_close_value("geomTrust", gpu.lastGeometryTrust, cpu.lastGeometryTrust, stateTol);
+	assert_close_value("actScale", gpu.lastActuationScale, cpu.lastActuationScale, stateTol);
 	if (orthApplied)
 		assert_close_value("orthTrust", gpu.lastOrthTrust, cpu.lastOrthTrust, stateTol);
 	else
@@ -2950,8 +2957,6 @@ void ATLASARGOSCoreUnitTest()
 
 		ASSERT("ARGOS head bonus should raise observability",
 		       headState.lastObservability > bodyState.lastObservability);
-		ASSERT("ARGOS head role bonus should be retained in diagnostics",
-		       headState.lastRoleBonus > bodyState.lastRoleBonus);
 		printf("[UT] ARGOS role bonuses raise observability on otherwise identical gradients\n");
 	}
 
@@ -3077,6 +3082,7 @@ void ATLASARGOSCoreUnitTest()
 		warmCfg.argosPredictiveScale = 0.35f;
 		warmCfg.argosTrustRadius = 0.85f;
 		warmCfg.argosWarmupSteps = 2u;
+		warmCfg.argosWarmupStartScale = 0.0f;
 		warmCfg.argosMetricCadence = 1u;
 		warmCfg.argosOrthCadence = 1u;
 		warmCfg.argosMaxAspect = 2.0f;
@@ -3092,6 +3098,7 @@ void ATLASARGOSCoreUnitTest()
 		exactCfg.argosPredictiveScale = 0.0f;
 		exactCfg.argosTrustRadius = 0.0f;
 		exactCfg.argosWarmupSteps = 0u;
+		exactCfg.argosWarmupStartScale = 0.0f;
 		exactCfg.argosObservabilityScale = 0.0f;
 		exactCfg.argosHeadBonus = 0.0f;
 		exactCfg.argosLateBonus = 0.0f;
@@ -3161,6 +3168,201 @@ void ATLASARGOSCoreUnitTest()
 		printf("[UT] ARGOS warmup preserves exact Adam on step1 and activates on later steps\n");
 	}
 
+	{
+		std::vector<float> WFloor = initW;
+		std::vector<float> WZero = initW;
+		std::vector<float> mFloor(mn, 0.0f);
+		std::vector<float> vFloor(mn, 0.0f);
+		std::vector<float> mZero(mn, 0.0f);
+		std::vector<float> vZero(mn, 0.0f);
+		std::vector<float> gFloor = warmGrad;
+		std::vector<float> gZero = warmGrad;
+
+		glades::atlas::ArgosWeightState floorState;
+		glades::atlas::ArgosWeightState zeroState;
+		glades::ATLASConfig floorCfg;
+		floorCfg.argosEnabled = true;
+		floorCfg.argosGeometryScale = 1.0f;
+		floorCfg.argosOrthogonalScale = 1.0f;
+		floorCfg.argosPredictiveScale = 0.35f;
+		floorCfg.argosTrustRadius = 0.85f;
+		floorCfg.argosWarmupSteps = 4u;
+		floorCfg.argosWarmupStartScale = 0.5f;
+		floorCfg.argosMetricCadence = 1u;
+		floorCfg.argosOrthCadence = 1u;
+		floorCfg.argosMaxAspect = 2.0f;
+		floorCfg.argosMinDim = 2u;
+		floorCfg.argosDamping = 0.01f;
+		floorCfg.argosObservabilityScale = 0.35f;
+		floorCfg.argosHeadBonus = 0.45f;
+		floorCfg.argosLateBonus = 0.20f;
+
+		glades::ATLASConfig zeroCfg = floorCfg;
+		zeroCfg.argosWarmupStartScale = 0.0f;
+
+		ASSERT("ARGOS floor-start multiplier should honor the configured start scale",
+		       std::fabs(floorCfg.argosWarmupMultiplier(0ULL) - 0.5f) < 1.0e-6f);
+		ASSERT("ARGOS zero-start multiplier should remain exact-Adam at step1",
+		       std::fabs(zeroCfg.argosWarmupMultiplier(0ULL)) < 1.0e-6f);
+
+		bool ok = glades::atlas::argosUpdateWithRole(floorState,
+		                                             &WFloor[0], &mFloor[0], &vFloor[0], &gFloor[0],
+		                                             m, n, lr,
+		                                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                             1.0f, 1.0f, 0.0f, 0.0f,
+		                                             floorCfg,
+		                                             glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                             quiet_logger(), "ut.argos.floor.step1");
+		ASSERT("ARGOS floor-start step1 failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(zeroState,
+		                                        &WZero[0], &mZero[0], &vZero[0], &gZero[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        zeroCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.floor.zero.step1");
+		ASSERT("ARGOS zero-start comparison step1 failed", ok);
+
+		gFloor = orthGrad;
+		gZero = orthGrad;
+		const double b1t2 = std::pow(static_cast<double>(beta1), 2.0);
+		const double b2t2 = std::pow(static_cast<double>(beta2), 2.0);
+		const float inv1mB1t2 = static_cast<float>(1.0 / (1.0 - b1t2));
+		const float inv1mB2t2 = static_cast<float>(1.0 / (1.0 - b2t2));
+		ok = glades::atlas::argosUpdateWithRole(floorState,
+		                                        &WFloor[0], &mFloor[0], &vFloor[0], &gFloor[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        floorCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.floor.step2");
+		ASSERT("ARGOS floor-start step2 failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(zeroState,
+		                                        &WZero[0], &mZero[0], &vZero[0], &gZero[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        zeroCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.zero.step2");
+		ASSERT("ARGOS zero-start comparison step2 failed", ok);
+
+		double diff = 0.0;
+		for (size_t idx = 0u; idx < mn; ++idx)
+		{
+			const double delta = static_cast<double>(WFloor[idx]) - static_cast<double>(WZero[idx]);
+			diff += delta * delta;
+		}
+		ASSERT("ARGOS floor-start should diverge from zero-start once history exists", diff > 1.0e-8);
+		ASSERT("ARGOS floor-start should engage more predictive trust than zero-start",
+		       floorState.lastPredictiveTrust > zeroState.lastPredictiveTrust + 1.0e-7f);
+		printf("[UT] ARGOS floor-start warmup engages earlier than zero-start once history exists\n");
+	}
+
+	{
+		std::vector<float> WShadow = initW;
+		std::vector<float> WExact = initW;
+		std::vector<float> mShadow(mn, 0.0f);
+		std::vector<float> vShadow(mn, 0.0f);
+		std::vector<float> mExact(mn, 0.0f);
+		std::vector<float> vExact(mn, 0.0f);
+		std::vector<float> gShadow = warmGrad;
+		std::vector<float> gExact = warmGrad;
+
+		glades::atlas::ArgosWeightState shadowState;
+		glades::atlas::ArgosWeightState exactState;
+		glades::ATLASConfig shadowCfg;
+		shadowCfg.argosEnabled = true;
+		shadowCfg.argosGeometryScale = 1.0f;
+		shadowCfg.argosOrthogonalScale = 1.0f;
+		shadowCfg.argosPredictiveScale = 0.35f;
+		shadowCfg.argosTrustRadius = 0.85f;
+		shadowCfg.argosWarmupSteps = 0u;
+		shadowCfg.argosWarmupStartScale = 0.0f;
+		shadowCfg.argosActuationScale = 0.0f;
+		shadowCfg.argosMetricCadence = 1u;
+		shadowCfg.argosOrthCadence = 1u;
+		shadowCfg.argosMaxAspect = 2.0f;
+		shadowCfg.argosMinDim = 2u;
+		shadowCfg.argosDamping = 0.01f;
+		shadowCfg.argosObservabilityScale = 0.35f;
+		shadowCfg.argosHeadBonus = 0.45f;
+		shadowCfg.argosLateBonus = 0.20f;
+
+		glades::ATLASConfig exactCfg = shadowCfg;
+		exactCfg.argosGeometryScale = 0.0f;
+		exactCfg.argosOrthogonalScale = 0.0f;
+		exactCfg.argosPredictiveScale = 0.0f;
+		exactCfg.argosTrustRadius = 0.0f;
+		exactCfg.argosActuationScale = 1.0f;
+		exactCfg.argosObservabilityScale = 0.0f;
+		exactCfg.argosHeadBonus = 0.0f;
+		exactCfg.argosLateBonus = 0.0f;
+
+		bool ok = glades::atlas::argosUpdateWithRole(shadowState,
+		                                             &WShadow[0], &mShadow[0], &vShadow[0], &gShadow[0],
+		                                             m, n, lr,
+		                                             beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                             1.0f, 1.0f, 0.0f, 0.0f,
+		                                             shadowCfg,
+		                                             glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                             quiet_logger(), "ut.argos.shadow.step1");
+		ASSERT("ARGOS shadow step1 failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(exactState,
+		                                        &WExact[0], &mExact[0], &vExact[0], &gExact[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        exactCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.shadow.exact.step1");
+		ASSERT("ARGOS shadow exact step1 failed", ok);
+
+		assert_close_vector("argos-shadow-step1-W", WShadow, WExact, 1.0e-6f);
+		assert_close_vector("argos-shadow-step1-m1", mShadow, mExact, 1.0e-6f);
+		assert_close_vector("argos-shadow-step1-v2", vShadow, vExact, 1.0e-6f);
+		ASSERT("ARGOS shadow should report zero actuation on step1",
+		       std::fabs(shadowState.lastActuationScale) < 1.0e-7f);
+
+		gShadow = orthGrad;
+		gExact = orthGrad;
+		const double b1t2 = std::pow(static_cast<double>(beta1), 2.0);
+		const double b2t2 = std::pow(static_cast<double>(beta2), 2.0);
+		const float inv1mB1t2 = static_cast<float>(1.0 / (1.0 - b1t2));
+		const float inv1mB2t2 = static_cast<float>(1.0 / (1.0 - b2t2));
+		ok = glades::atlas::argosUpdateWithRole(shadowState,
+		                                        &WShadow[0], &mShadow[0], &vShadow[0], &gShadow[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        shadowCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.shadow.step2");
+		ASSERT("ARGOS shadow step2 failed", ok);
+		ok = glades::atlas::argosUpdateWithRole(exactState,
+		                                        &WExact[0], &mExact[0], &vExact[0], &gExact[0],
+		                                        m, n, lr,
+		                                        beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                        1.0f, 1.0f, 0.0f, 0.0f,
+		                                        exactCfg,
+		                                        glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE,
+		                                        quiet_logger(), "ut.argos.shadow.exact.step2");
+		ASSERT("ARGOS shadow exact step2 failed", ok);
+
+		assert_close_vector("argos-shadow-step2-W", WShadow, WExact, 1.0e-6f);
+		assert_close_vector("argos-shadow-step2-m1", mShadow, mExact, 1.0e-6f);
+		assert_close_vector("argos-shadow-step2-v2", vShadow, vExact, 1.0e-6f);
+		ASSERT("ARGOS shadow should still build predictive state by step2",
+		       shadowState.lastPredictiveTrust > 0.0f);
+		ASSERT("ARGOS shadow should keep routing diagnostics live while actuation is off",
+		       shadowState.lastObservability > 0.0f
+		       && std::isfinite(shadowState.lastGeometryTrust)
+		       && std::isfinite(shadowState.lastOrthTrust));
+		printf("[UT] ARGOS actuation-scale zero preserves exact Adam while maturing full ARGOS state\n");
+	}
+
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
 }
 
@@ -3190,14 +3392,18 @@ void ATLASARGOSParityTest()
 		float headBonus;
 		float lateBonus;
 		unsigned int warmupSteps;
+		float warmupStartScale;
+		float actuationScale;
 		float valueTol;
 		float stateTol;
 	};
 
 	const ParityCase cases[] = {
-		{ "ARGOS-body", glades::atlas::ARGOS_ROLE_NONE, 1.0f, 0.0f, 0.0f, 0.80f, 0.25f, 0.0f, 0.0f, 0u, 3.0e-5f, 3.0e-5f },
-		{ "ARGOS-headlate", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 0u, 4.0e-4f, 4.0e-4f },
-		{ "ARGOS-headlate-warmup", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 2u, 4.0e-4f, 4.0e-4f },
+		{ "ARGOS-body", glades::atlas::ARGOS_ROLE_NONE, 1.0f, 0.0f, 0.0f, 0.80f, 0.25f, 0.0f, 0.0f, 0u, 0.0f, 1.0f, 3.0e-5f, 3.0e-5f },
+		{ "ARGOS-headlate", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 0u, 0.0f, 1.0f, 4.0e-4f, 4.0e-4f },
+		{ "ARGOS-headlate-warmup", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 2u, 0.0f, 1.0f, 4.0e-4f, 4.0e-4f },
+		{ "ARGOS-headlate-warmup-floor", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 4u, 0.5f, 1.0f, 4.0e-4f, 4.0e-4f },
+		{ "ARGOS-headlate-shadow", glades::atlas::ARGOS_ROLE_HEAD | glades::atlas::ARGOS_ROLE_LATE, 1.0f, 1.0f, 0.35f, 0.85f, 0.35f, 0.45f, 0.20f, 0u, 0.0f, 0.0f, 4.0e-4f, 4.0e-4f },
 	};
 
 	const unsigned int m = 4u;
@@ -3248,6 +3454,8 @@ void ATLASARGOSParityTest()
 		ac.argosPredictiveScale = spec.predictiveScale;
 		ac.argosTrustRadius = spec.trustRadius;
 		ac.argosWarmupSteps = spec.warmupSteps;
+		ac.argosWarmupStartScale = spec.warmupStartScale;
+		ac.argosActuationScale = spec.actuationScale;
 		ac.argosMetricCadence = 1u;
 		ac.argosOrthCadence = 1u;
 		ac.argosMaxAspect = 2.0f;

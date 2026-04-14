@@ -7903,8 +7903,765 @@ Updated practical verdict:
 - `MATRA` is no longer clearly better than `AdamW` by late corpus-large
   training horizon; they should be treated as effectively tied there
 - `ECHO` remains a useful control but not the frontier branch
----
 
-*Document version: 1.31*
+## April 14, 2026: staged `ARGOS` is now falsified in both direct-switch and shadow-state forms, so the next loop stays on pure ARGOS only
+
+I ran the two staged `ARGOS` hypotheses on the same `token-lm-corpus-large`
+benchmark family:
+
+- `artifacts/argos_switch_corpus_gate_20260414-115352/`
+- `artifacts/argos_shadow_switch_corpus_gate_20260414-131759/`
+
+The direct switch result from `11:53:52` already looked bad:
+
+- `ARGOS-SWITCH 0.67` barely improved acceptance over `AdamW`
+  - `6.29233` vs `6.29834`
+- but its late result was clearly worse
+  - `6.65458` vs `AdamW 6.47836`
+  - `6.65458` vs pure `ARGOS 6.45210`
+
+That left one remaining hypothesis: maybe the switch only failed because
+ARGOS was turned on cold. The shadow-state version tested exactly that:
+ARGOS statistics evolve from step 1, but its applied deviation is held at zero
+until the late phase.
+
+Shadow-state results from `13:17:59`:
+
+- acceptance ranking
+  - `ARGOS-SHADOW-SWITCH 0.50`: `6.29561`
+  - `ARGOS-SHADOW-SWITCH 0.67`: `6.29561`
+  - `ARGOS-SHADOW-SWITCH 0.75`: `6.29864`
+  - `AdamW`: `6.30276`
+  - pure `ARGOS`: `6.31405`
+- epoch-4 ranking
+  - `AdamW`: `6.47460`
+  - pure `ARGOS`: `6.48826`
+  - `ARGOS-SHADOW-SWITCH 0.50`: `6.52578`
+  - `ARGOS-SHADOW-SWITCH 0.67`: `6.55828`
+  - `ARGOS-SHADOW-SWITCH 0.75`: `6.55829`
+
+Interpretation:
+
+- shadow-state recovered the acceptance side
+  - the best shadow variants narrowly beat `AdamW` on acceptance
+- but it did not preserve the late-horizon gain
+  - every shadow variant lost to `AdamW` at `e4`
+  - every shadow variant also lost to pure `ARGOS` at `e4`
+- the routing story remained weak
+  - acceptance head share was essentially unchanged
+    - `AdamW`: `0.617`
+    - `ARGOS-SHADOW-SWITCH 0.67`: `0.616`
+  - at `e4`, pure `ARGOS` still routed more strongly than shadow-state
+    - pure `ARGOS`: `0.546`
+    - `ARGOS-SHADOW-SWITCH 0.67`: `0.538`
+
+Practical conclusion:
+
+- close the staged-ARGOS branch family
+  - `ARGOS-SWITCH` is falsified
+  - `ARGOS-SHADOW-SWITCH` is also falsified
+- keep `AdamW` as the default large-LLM optimizer
+- keep pure head-only scheduled `ARGOS` only as a research branch
+- stop spending GPU time on switch-fraction or shadow-fraction sweeps
+
+Next recommended experiment:
+
+- stay on pure `ARGOS`
+- run a lighter one-factor ablation around the currently best surviving branch
+  - `scope=head`
+  - `warmup=32`
+  - `warmupStartScale=0.25`
+- tune only:
+  - `trustRadius`
+  - `observabilityScale`
+  - `headBonus`
+
+I added a dedicated runner for that next step:
+
+- `scripts/run_argos_pure_corpus_ablation_sweep.sh`
+
+It compares `AdamW` against a pure-ARGOS default plus one-factor perturbations
+around:
+
+- trust: `0.16, 0.20, 0.24`
+- observability: `0.50, 0.75, 1.00`
+- head bonus: `0.20, 0.35, 0.50`
+
+That is the highest-ROI remaining loop. It changes optimizer behavior directly
+without reopening the now-failed staged-control line.
+
+## April 14, 2026: pure `ARGOS` ablations narrow to a smaller head bonus, while observability sweeps are now a dead end
+
+I ran the dedicated pure-`ARGOS` ablation sweep on the same
+`token-lm-corpus-large` benchmark family:
+
+- `artifacts/argos_pure_corpus_ablation_20260414-143421/`
+
+This tested one-factor deviations around the surviving pure-`ARGOS` branch:
+
+- trust radius: `0.16, 0.20, 0.24`
+- observability scale: `0.50, 0.75, 1.00`
+- head bonus: `0.20, 0.35, 0.50`
+
+Acceptance ranking:
+
+- `AdamW`: `6.28659`
+- `ARGOS h=0.50`: `6.31324`
+- `ARGOS trust=0.24`: `6.31831`
+- `ARGOS default`: `6.32712`
+- `ARGOS trust=0.16`: `6.33030`
+- `ARGOS h=0.20`: `6.33639`
+- `ARGOS obs=0.50`: `6.33921`
+- `ARGOS obs=1.00`: `6.34128`
+
+Epoch-4 ranking:
+
+- `ARGOS h=0.20`: `6.43757`
+- `ARGOS trust=0.24`: `6.45762`
+- `AdamW`: `6.46259`
+- `ARGOS h=0.50`: `6.47766`
+- `ARGOS default`: `6.49316`
+- `ARGOS trust=0.16`: `6.50174`
+- `ARGOS obs=0.50`: `6.51675`
+- `ARGOS obs=1.00`: `6.55366`
+
+Interpretation:
+
+- no pure `ARGOS` variant beat `AdamW` on acceptance in this sweep
+- the late-horizon winner is clearly the smaller head bonus
+  - `headBonus = 0.20` gave the best `e4` result
+  - `6.43757` vs `AdamW 6.46259`
+- the only balanced secondary branch is a slightly larger trust radius
+  - `trustRadius = 0.24` modestly improved both sides relative to the old
+    pure-`ARGOS` default
+  - it also edged `AdamW` at `e4`
+    - `6.45762` vs `6.46259`
+- changing observability away from `0.75` hurt both acceptance and `e4`
+  - that line should now be treated as closed until a different mechanism
+    exists
+- the routing signal is still modest rather than dramatic
+  - acceptance head share moved from `AdamW 0.615` to `ARGOS 0.626-0.627`
+  - `e4` head share moved from `AdamW 0.539` to `ARGOS 0.545-0.547`
+  - so the gain is not coming from a large new actuation regime
+
+Practical conclusion:
+
+- keep `AdamW` as the default large-LLM optimizer
+- promote pure head-only scheduled `ARGOS` with `headBonus = 0.20` as the
+  current late-horizon research default
+- keep `trustRadius = 0.24` as the only serious balanced comparison branch
+- freeze `observabilityScale = 0.75` for future ARGOS work unless the
+  optimizer mechanism changes
+
+I promoted the pure-`ARGOS` research default in the benchmark harness and
+direct GPU gate to:
+
+- `scope=head`
+- `warmup=32`
+- `warmupStartScale=0.25`
+- `trustRadius=0.20`
+- `observabilityScale=0.75`
+- `headBonus=0.20`
+
+Next recommended experiment:
+
+- do not reopen staged control or observability sweeps
+- run a tight confirmation around the two surviving pure-`ARGOS` settings:
+  - late-horizon branch: `headBonus=0.20`, `trustRadius=0.20`
+  - balanced branch: `headBonus=0.35`, `trustRadius=0.24`
+- judge them only against `AdamW` on `token-lm-corpus-large`
+  acceptance and `e4`
+
+I then ran the direct confirmation gate for the promoted late-horizon default:
+
+- `artifacts/argos_gpu_gate_20260414-145319/`
+
+That gate confirmed the intended large-LLM direction:
+
+- `token-lm-corpus-large` acceptance still lost to `AdamW`
+  - `6.33177` vs `6.30475`
+- but `token-lm-corpus-large` `e4` improved cleanly over `AdamW`
+  - `6.43524` vs `6.48119`
+- relative to the previous pure-`ARGOS` gate default, it also improved both
+  corpus-large sides
+  - previous acceptance: `6.34153`
+  - new acceptance: `6.33177`
+  - previous `e4`: `6.44426`
+  - new `e4`: `6.43524`
+
+That same confirmation also showed why this should remain a narrow research
+default rather than a broad repo-wide promotion:
+
+- document acceptance improved slightly
+  - `4.86466` vs `AdamW 4.86658`
+- but document `e4` remained essentially tied rather than clearly improved
+  - `4.69852` vs `AdamW 4.69971`
+- the routing signal stayed modest
+  - corpus-large acceptance head share: `0.617 -> 0.626`
+  - corpus-large `e4` head share: `0.537 -> 0.548`
+
+Updated practical verdict:
+
+- keep `AdamW` as the default production optimizer
+- keep pure `ARGOS` with `headBonus = 0.20` as the current
+  corpus-large / late-horizon research default
+- keep `trustRadius = 0.24` as the balanced comparison branch if further pure
+  `ARGOS` work continues
+- do not expand the search space again until this pair has been compared
+  directly in the same-run frontier harness
+
+## April 14, 2026: first `token-lm-corpus-xlarge` ranking says AdamW still wins overall, BiMAP-lite scales best among structured branches, and current ARGOS does not transfer its late-horizon edge
+
+I added a new checked-in benchmark mode, `token-lm-corpus-xlarge`, and ran the
+first same-run top-model sweep:
+
+- `artifacts/corpus_xlarge_top_models_20260414-151656/`
+
+The benchmark uses the broader corpus-large document pool but increases the
+decoder and window preset:
+
+- `vocab = 1537`
+- `dModel = 72`
+- `dFF = 288`
+- `layers = 5`
+- `heads = 8`
+- `seqLen = 144`
+- `trainSeqs = 96`
+- `testSeqs = 24`
+
+Acceptance ranking:
+
+- `AdamW`: `6.77678`, `65.0k tok/s`
+- `BiMAP-lite`: `6.79673`, `57.0k tok/s`
+- `ARGOS`: `6.80133`, `62.7k tok/s`
+- `ECHO`: `6.82375`, `64.5k tok/s`
+- `MATRA`: `6.85138`, `6.7k tok/s`
+- `MUON-lite`: `6.91125`, `3.7k tok/s`
+- `BiMAP-v2`: `7.10293`, `50.7k tok/s`
+
+Epoch-4 ranking:
+
+- `BiMAP-lite`: `7.61540`, `56.8k tok/s`
+- `AdamW`: `7.61898`, `65.0k tok/s`
+- `BiMAP-v2`: `7.64167`, `50.4k tok/s`
+- `ECHO`: `7.68781`, `64.4k tok/s`
+- `ARGOS`: `7.73844`, `62.4k tok/s`
+- `MATRA`: `7.76969`, `6.7k tok/s`
+- `MUON-lite`: `7.85776`, `3.7k tok/s`
+
+Interpretation:
+
+- `AdamW` is still the best overall practical optimizer on the new larger case
+  - best acceptance
+  - near-best late result
+  - and no wall-clock penalty
+- `BiMAP-lite` is the strongest structured branch on this scale
+  - small acceptance gap to `AdamW`
+  - best `e4`, though only by a hair
+  - much better scaling than `MATRA` or `MUON-lite`
+- current pure `ARGOS` does not transfer its corpus-large late-horizon
+  advantage
+  - acceptance is competitive
+  - but `e4` is clearly behind both `AdamW` and `BiMAP-lite`
+  - its routing signal is effectively unchanged from `AdamW`
+    - acceptance head share: `0.694 -> 0.696`
+    - `e4` head share: `0.624 -> 0.624`
+- `MATRA` and `MUON-lite` both look computationally non-viable at this scale
+  with the current implementation
+  - `MATRA`: about `10x` slower than `AdamW`
+  - `MUON-lite`: about `17x` slower than `AdamW`
+- `BiMAP-v2` remains dominated
+  - slower than `BiMAP-lite`
+  - worse than `BiMAP-lite` on both acceptance and `e4`
+
+One important benchmark-design read also showed up immediately:
+
+- every optimizer is better at `e2` than at `e4`
+- so this first xlarge preset behaves more like an early-horizon stress test
+  than a stable late-horizon promotion gate
+- until the split is widened or train volume is increased, acceptance / `e2`
+  is the more trustworthy signal than `e4`
+
+Updated practical verdict:
+
+- keep `AdamW` as the best overall large-scale default
+- elevate `BiMAP-lite` to the top structured comparison branch for
+  `corpus-xlarge`
+- keep `ARGOS` as a corpus-large research branch only; do not treat xlarge as
+  evidence for promoting it
+- stop treating `MATRA` and `MUON-lite` as plausible large-scale defaults
+  unless their implementation cost changes materially
+
+Next recommended experiment:
+
+- keep the new `token-lm-corpus-xlarge` benchmark
+- compare only `AdamW`, `BiMAP-lite`, `ARGOS`, and `ECHO` on a wider training
+  regime that reduces the current late-epoch overfit
+- do not spend more xlarge GPU time on `MATRA`, `MUON-lite`, or `BiMAP-v2`
+  until the scaling or implementation story changes
+## April 14, 2026: focused BiMAP xlarge sweep promotes `BiMAP-lite cadence=2` as the xlarge BiMAP branch to keep
+
+After profiling BiMAP and removing redundant row/column scale recomputation in
+the CPU and CUDA lite path, I ran a focused GPU sweep:
+
+- `artifacts/bimap_gpu_focus_20260414-155624/`
+
+Compared variants:
+
+- `AdamW`
+- `ECHO late-head`
+- `BiMAP-lite cadence=1`
+- `BiMAP-lite cadence=1, predictive=0`
+- `BiMAP-lite cadence=2`
+- `BiMAP-lite cadence=4`
+- `BiMAP-v2 cadence=8`
+
+Acceptance ranking on `token-lm-corpus-xlarge`:
+
+- `AdamW`: `6.75892`, `65.0k tok/s`
+- `BiMAP-lite cadence=2`: `6.78256`, `58.9k tok/s`
+- `BiMAP-lite cadence=1`: `6.80204`, `56.3k tok/s`
+- `ECHO late-head`: `6.80973`, `64.5k tok/s`
+- `BiMAP-lite cadence=1, predictive=0`: `6.81347`, `56.7k tok/s`
+- `BiMAP-lite cadence=4`: `6.81959`, `60.0k tok/s`
+- `BiMAP-v2 cadence=8`: `7.10551`, `50.7k tok/s`
+
+Epoch-4 ranking:
+
+- `AdamW`: `7.55860`, `64.9k tok/s`
+- `BiMAP-lite cadence=1, predictive=0`: `7.64207`, `56.5k tok/s`
+- `BiMAP-v2 cadence=8`: `7.65452`, `50.2k tok/s`
+- `BiMAP-lite cadence=2`: `7.69794`, `58.4k tok/s`
+- `BiMAP-lite cadence=4`: `7.70226`, `59.9k tok/s`
+- `ECHO late-head`: `7.70995`, `64.4k tok/s`
+- `BiMAP-lite cadence=1`: `7.73621`, `56.3k tok/s`
+
+Interpretation:
+
+- the BiMAP-lite optimization carried through to the practical GPU frontier
+  - the promoted xlarge BiMAP setting is now `cadence=2`
+  - relative to the earlier xlarge top-model sweep `BiMAP-lite` baseline,
+    acceptance improved from `6.79673` to `6.78256`
+  - throughput improved from `57.0k tok/s` to `58.9k tok/s`
+- `BiMAP-lite cadence=2` is now the strongest structured acceptance branch on
+  xlarge inside the BiMAP family
+  - still behind `AdamW`, but only by about `0.024` NLL
+  - better than `ECHO late-head` on acceptance
+- `epoch-4` remains a weak xlarge promotion signal
+  - the best late BiMAP setting (`predictive=0`) is still behind `AdamW`
+  - late-ordering also moves around more than acceptance-ordering
+- `BiMAP-v2` remains unjustified on xlarge
+  - much worse acceptance than every lite branch
+  - still slower than every lite branch
+
+Updated xlarge BiMAP verdict:
+
+- promote `BiMAP-lite cadence=2` as the xlarge-specific BiMAP comparison branch
+- keep `AdamW` as the overall xlarge default
+- keep `ECHO` as a near-Adam throughput baseline, not as the best structured
+  branch
+- stop treating `BiMAP-v2` as a serious xlarge contender
+
+## April 14, 2026: corpus-large follow-up says `BiMAP-lite cadence=2` is the best balanced corpus-scale BiMAP setting, but not a new overall default
+
+I then reran the focused BiMAP sweep on `token-lm-corpus-large`:
+
+- `artifacts/bimap_gpu_focus_20260414-161940/`
+
+Acceptance ranking:
+
+- `BiMAP-lite cadence=1`: `6.31067`, `66.3k tok/s`
+- `BiMAP-lite cadence=2`: `6.31178`, `70.3k tok/s`
+- `AdamW`: `6.31197`, `82.7k tok/s`
+- `ECHO late-head`: `6.31467`, `81.2k tok/s`
+- `BiMAP-lite cadence=4`: `6.31851`, `72.3k tok/s`
+- `BiMAP-lite cadence=1, predictive=0`: `6.31994`, `66.4k tok/s`
+- `BiMAP-v2 cadence=8`: `6.51877`, `57.7k tok/s`
+
+Epoch-4 ranking:
+
+- `AdamW`: `6.51307`, `81.9k tok/s`
+- `ECHO late-head`: `6.58042`, `80.4k tok/s`
+- `BiMAP-lite cadence=2`: `6.59003`, `69.3k tok/s`
+- `BiMAP-lite cadence=1, predictive=0`: `6.59719`, `65.3k tok/s`
+- `BiMAP-lite cadence=4`: `6.60511`, `71.8k tok/s`
+- `BiMAP-lite cadence=1`: `6.64533`, `66.1k tok/s`
+- `BiMAP-v2 cadence=8`: `6.64719`, `57.2k tok/s`
+
+Interpretation:
+
+- `BiMAP-lite cadence=1` wins acceptance by a hair, but only by about `0.001`
+  NLL over `cadence=2`
+- `BiMAP-lite cadence=2` is the better practical BiMAP setting
+  - nearly tied with `cadence=1` on acceptance
+  - about `6%` faster than `cadence=1`
+  - best `epoch-4` result inside the BiMAP family on corpus-large
+- `AdamW` remains the overall corpus-large default
+  - essentially tied or slightly behind on acceptance
+  - clearly best by `epoch-4`
+  - still much faster than any BiMAP branch
+- `ECHO late-head` remains the stronger structured late-horizon baseline on
+  corpus-large than BiMAP-lite
+- `BiMAP-v2` is still not defensible
+  - worse than every lite variant on acceptance
+  - worse than every lite variant on `epoch-4`
+  - slower than every lite variant
+
+Updated practical BiMAP read:
+
+- `BiMAP-lite cadence=2` is now the best balanced corpus-scale BiMAP setting
+- keep `cadence=2` as the xlarge-specific BiMAP comparison branch
+- do not promote BiMAP over `AdamW` on corpus-large
+- do not promote BiMAP over `ECHO` for late-horizon corpus-large work
+- keep broader multi-benchmark defaults unchanged until `document` / context
+  modes are checked with the same cadence sweep
+
+## April 14, 2026: document and context follow-up says there is no single broader BiMAP-lite cadence default
+
+I then ran a focused acceptance-only cadence sweep on the remaining important
+non-corpus transformer modes:
+
+- `artifacts/bimap_mode_cadence_acceptance_20260414-162928/`
+
+Benchmarks:
+
+- `token-lm-document`
+- `token-lm-context`
+- `token-lm-context-large`
+
+Acceptance ranking by benchmark:
+
+- `token-lm-document`
+  - `BiMAP-lite cadence=4`: `4.86446`, `85.1k tok/s`
+  - `BiMAP-lite cadence=1`: `4.86451`, `75.8k tok/s`
+  - `AdamW`: `4.87257`, `103.8k tok/s`
+  - `BiMAP-lite cadence=2`: `4.87603`, `81.9k tok/s`
+- `token-lm-context`
+  - `AdamW`: `4.27857`, `100.5k tok/s`
+  - `BiMAP-lite cadence=4`: `4.28456`, `74.0k tok/s`
+  - `BiMAP-lite cadence=2`: `4.28456`, `68.6k tok/s`
+  - `BiMAP-lite cadence=1`: `4.28457`, `62.1k tok/s`
+- `token-lm-context-large`
+  - `AdamW`: `4.30698`, `92.6k tok/s`
+  - `BiMAP-lite cadence=4`: `4.32130`, `75.3k tok/s`
+  - `BiMAP-lite cadence=1`: `4.32166`, `66.7k tok/s`
+  - `BiMAP-lite cadence=2`: `4.32229`, `72.1k tok/s`
+
+Read:
+
+- on document/context-style modes, `cadence=4` is the best BiMAP-lite setting
+  - clearly best on `document`
+  - tied for best NLL on `context`, with higher throughput than `cadence=2`
+  - best on `context-large`
+- `cadence=2` does not generalize as the broader BiMAP-lite default
+  - it is best on `corpus-large` and `corpus-xlarge`
+  - but not on `document`, `context`, or `context-large`
+- `AdamW` still wins the context-family modes overall
+  - both context benchmarks remain better under `AdamW`
+  - `document` remains the one checked mode here where BiMAP-lite still holds a
+    small acceptance edge
+
+Context-bucket deltas support the same read:
+
+- for `token-lm-context`, all three BiMAP cadences are effectively identical on
+  the bucketed readouts; the difference is throughput, which favors `cadence=4`
+- for `token-lm-context-large`, `cadence=4` keeps the same trade as the other
+  BiMAP variants but is marginally better than `cadence=1` / `cadence=2` on the
+  strongest helpful buckets like `sep` and `topic`
+- for `token-lm-document`, `cadence=4` gives the best combined improvements on
+  `older` recall, `content`, `place`, and `summary`, while keeping the harmful
+  `topic` / `speaker` regressions smaller than `cadence=2`
+
+Updated practical cadence verdict:
+
+- there is no single benchmark-agnostic BiMAP-lite cadence default
+- use `cadence=4` for document/context-style BiMAP comparisons
+- use `cadence=2` for corpus-scale and xlarge BiMAP comparisons
+- keep the mixed clean-ranking default unchanged until `token-lm-large` and
+  `token-lm-corpus` are checked with the same cadence sweep
+
+## April 14, 2026: `token-lm-large` and `token-lm-corpus` close the remaining BiMAP-lite cadence policy gap
+
+I then reran the same focused BiMAP-lite cadence acceptance sweep on the last
+two mixed defaults that had not yet been checked under the same runner:
+
+- `artifacts/bimap_mode_cadence_acceptance_20260414-164122/`
+
+Benchmarks:
+
+- `token-lm-large`
+- `token-lm-corpus`
+
+Acceptance ranking by benchmark:
+
+- `token-lm-large`
+  - `BiMAP-lite cadence=4`: `4.57145`, `27.1k tok/s`
+  - `BiMAP-lite cadence=2`: `4.57145`, `26.2k tok/s`
+  - `BiMAP-lite cadence=1`: `4.57145`, `23.1k tok/s`
+  - `AdamW`: `4.58257`, `35.6k tok/s`
+- `token-lm-corpus`
+  - `AdamW`: `6.10445`, `102.1k tok/s`
+  - `BiMAP-lite cadence=4`: `6.11489`, `84.3k tok/s`
+  - `BiMAP-lite cadence=2`: `6.12385`, `81.5k tok/s`
+  - `BiMAP-lite cadence=1`: `6.12411`, `75.9k tok/s`
+
+Read:
+
+- `cadence=4` is also the best BiMAP-lite setting on both remaining mixed modes
+  - on `token-lm-large`, all three cadences tie on NLL and `cadence=4` wins on
+    throughput
+  - on `token-lm-corpus`, `cadence=4` is clearly the best BiMAP-lite branch on
+    both NLL and throughput
+- this closes the policy gap from the previous note
+  - use `cadence=4` for `token-lm-large`, `token-lm-corpus`,
+    `token-lm-document`, `token-lm-context`, and `token-lm-context-large`
+  - use `cadence=2` for `token-lm-corpus-large` and
+    `token-lm-corpus-xlarge`
+- the noisy `ctx delta parse` warnings in this run were not benchmark failures
+  - `token-lm-large` and `token-lm-corpus` do not emit `CTX` bucket rows
+  - the runner should skip delta parsing automatically on non-context-mode
+    sweeps, and that has now been fixed
+
+Final practical BiMAP-lite cadence policy:
+
+- use `cadence=4` for `token-lm-large`
+- use `cadence=4` for `token-lm-corpus`
+- use `cadence=4` for `token-lm-document`
+- use `cadence=4` for `token-lm-context`
+- use `cadence=4` for `token-lm-context-large`
+- use `cadence=2` for `token-lm-corpus-large`
+- use `cadence=2` for `token-lm-corpus-xlarge`
+
+## April 14, 2026: family-specific BiMAP-lite cadence improves acceptance in the clean rerank, but does not change the practical cross-optimizer winners
+
+After applying the benchmark-family BiMAP-lite cadence policy directly to the
+main ranking runners, I reran the clean same-codebase GPU ranking gate:
+
+- `artifacts/optimizer_clean_ranking_20260414-170706/`
+
+Acceptance ranking:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.81695`, `94.4k tok/s`
+  - `BiMAP-lite`: `4.86459`, `85.6k tok/s`
+  - `MATRA`: `4.86474`, `89.1k tok/s`
+  - `AdamW`: `4.87043`, `102.8k tok/s`
+  - `ECHO`: `4.87831`, `102.2k tok/s`
+- `token-lm-corpus-large`
+  - `MATRA`: `6.26186`, `73.4k tok/s`
+  - `AdamW`: `6.29262`, `82.4k tok/s`
+  - `MUON-lite`: `6.30865`, `76.7k tok/s`
+  - `ECHO`: `6.31348`, `80.9k tok/s`
+  - `BiMAP-lite`: `6.31917`, `70.0k tok/s`
+
+Epoch-4 ranking:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.57816`, `91.8k tok/s`
+  - `ECHO`: `4.64919`, `99.1k tok/s`
+  - `AdamW`: `4.65119`, `100.4k tok/s`
+  - `BiMAP-lite`: `4.65569`, `83.7k tok/s`
+  - `MATRA`: `4.70343`, `87.1k tok/s`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.47457`, `81.7k tok/s`
+  - `MATRA`: `6.50718`, `72.7k tok/s`
+  - `ECHO`: `6.57207`, `79.9k tok/s`
+  - `MUON-lite`: `6.62419`, `76.4k tok/s`
+  - `BiMAP-lite`: `6.64572`, `69.2k tok/s`
+
+Read:
+
+- the family-specific BiMAP-lite cadence policy improves BiMAP-lite acceptance
+  relative to the earlier mixed-default rerank
+  - `token-lm-document`: `4.86996 -> 4.86459`
+  - `token-lm-corpus-large`: `6.33056 -> 6.31917`
+- but the late-horizon clean rerank still does not promote BiMAP-lite
+  - `token-lm-document e4`: `4.65569`
+  - `token-lm-corpus-large e4`: `6.64572`
+  - both remain behind the best checked-in alternatives on those tasks
+- the broader cross-optimizer verdict is unchanged
+  - `MUON-lite` remains the strongest checked-in document-style branch
+  - `MATRA` remains the best corpus-large acceptance branch
+  - `AdamW` remains the safest corpus-large late-horizon / practical default
+
+## April 14, 2026: extended BiMAP suite confirms the cadence policy and keeps `BiMAP-v2` closed as a broad branch
+
+I then reran the broader BiMAP-only comparison suite with the family-specific
+cadence policy active:
+
+- `artifacts/bimap_extended_suite_20260414-170919/`
+
+Acceptance highlights:
+
+- `token-lm-large`
+  - `BiMAP-lite`: `4.57145`, `26.2k tok/s`
+  - `BiMAP-v2`: `4.57145`, `18.5k tok/s`
+  - `AdamW`: `4.58257`, `35.6k tok/s`
+- `token-lm-context`
+  - `AdamW`: `4.27857`, `98.7k tok/s`
+  - `BiMAP-lite`: `4.28456`, `72.7k tok/s`
+  - `BiMAP-v2`: `4.40049`, `52.8k tok/s`
+- `token-lm-context-large`
+  - `AdamW`: `4.30610`, `92.0k tok/s`
+  - `BiMAP-lite`: `4.32342`, `74.2k tok/s`
+  - `BiMAP-v2`: `4.61196`, `53.6k tok/s`
+- `token-lm-document`
+  - `BiMAP-lite`: `4.86176`, `85.8k tok/s`
+  - `AdamW`: `4.87162`, `103.8k tok/s`
+  - `BiMAP-v2`: `4.88562`, `65.2k tok/s`
+- `token-lm-corpus`
+  - `AdamW`: `6.09681`, `102.1k tok/s`
+  - `BiMAP-lite`: `6.11784`, `84.8k tok/s`
+  - `BiMAP-v2`: `6.23008`, `63.2k tok/s`
+- `token-lm-corpus-large`
+  - `BiMAP-lite`: `6.31053`, `70.1k tok/s`
+  - `AdamW`: `6.31281`, `82.6k tok/s`
+  - `BiMAP-v2`: `6.52208`, `57.8k tok/s`
+
+Read:
+
+- the family-specific cadence policy is stable under the broader suite
+  - `BiMAP-lite` keeps its non-corpus and corpus-large roles without exposing a
+    new regression
+- `BiMAP-v2` still should not be reopened as a broad branch
+  - it remains clearly worse on acceptance across context, context-large,
+    document, corpus, and corpus-large
+  - where it ties or slightly helps on some narrow late-horizon pockets, the
+    cost and inconsistency are still not competitive with the live branches
+- the final practical status therefore stays:
+  - `AdamW` is the production default
+  - `MUON-lite` is the strongest document-style research branch
+  - `MATRA` is the strongest corpus-large acceptance branch
+  - pure `ARGOS` remains the late-horizon corpus-large research branch
+  - `BiMAP-lite` is a tuned structured comparison branch, not the repo default
+
+## April 14, 2026: rerunning the top-model `corpus-xlarge` sweep with the updated BiMAP-lite policy keeps `AdamW` on top and removes the earlier weak late-horizon BiMAP-lite edge
+
+I reran the checked-in `token-lm-corpus-xlarge` top-model sweep after the
+BiMAP-lite cadence-policy updates:
+
+- `artifacts/corpus_xlarge_top_models_20260414-171903/`
+
+Acceptance ranking:
+
+- `AdamW`: `6.77864`, `65.0k tok/s`
+- `BiMAP-lite`: `6.79800`, `58.7k tok/s`
+- `ARGOS`: `6.81346`, `62.6k tok/s`
+- `ECHO`: `6.82217`, `64.4k tok/s`
+- `MATRA`: `6.85230`, `6.7k tok/s`
+- `MUON-lite`: `6.88021`, `3.7k tok/s`
+- `BiMAP-v2`: `7.10931`, `50.4k tok/s`
+
+Epoch-4 ranking:
+
+- `AdamW`: `7.62112`, `65.0k tok/s`
+- `BiMAP-v2`: `7.63562`, `50.2k tok/s`
+- `BiMAP-lite`: `7.65554`, `58.6k tok/s`
+- `ECHO`: `7.69730`, `64.4k tok/s`
+- `MATRA`: `7.70881`, `6.7k tok/s`
+- `ARGOS`: `7.71798`, `62.7k tok/s`
+- `MUON-lite`: `7.89945`, `3.8k tok/s`
+
+Read:
+
+- the xlarge top-line verdict is now cleaner than before
+  - `AdamW` is best at both acceptance and `e4`
+  - so there is no remaining case for treating xlarge as a possible late-horizon
+    `BiMAP-lite` or `ARGOS` win
+- `BiMAP-lite` still scales best among the structured practical branches
+  - it remains second at acceptance while keeping throughput in the same rough
+    operating band as `AdamW`, `ARGOS`, and `ECHO`
+  - but it is not the best xlarge branch overall
+- `BiMAP-v2` still should not be reopened
+  - it reached `e4` rank 2 here, but only after a clearly dominated acceptance
+    result and with worse throughput than `BiMAP-lite`
+  - that does not overturn the broader evidence against it
+- `ARGOS` does not transfer its corpus-large late-horizon behavior to xlarge
+  - acceptance is only rank 3
+  - `e4` is only rank 6
+- `MATRA` and `MUON-lite` remain computationally non-viable on xlarge
+  - both are an order of magnitude slower than the practical top group
+
+Updated xlarge verdict:
+
+- keep `AdamW` as the xlarge default
+- keep `BiMAP-lite` as the top structured xlarge comparison branch
+- keep `ECHO` and `ARGOS` as secondary xlarge comparisons only
+- keep `MATRA`, `MUON-lite`, and `BiMAP-v2` out of future xlarge default sweeps
+  unless the goal is explicitly to study scaling failure modes
+
+## April 14, 2026: wider-train `corpus-xlarge` closes the remaining xlarge question and confirms `AdamW` dominates beyond the short horizon
+
+I then ran a dedicated wider-train `token-lm-corpus-xlarge` sweep with only the
+four live practical branches on this scale:
+
+- `artifacts/corpus_xlarge_wide_train_20260414-174016/`
+
+Branches:
+
+- `AdamW`
+- `ECHO`
+- `BiMAP-lite`
+- `ARGOS`
+
+Sweep settings:
+
+- epochs: `1,2,4,6,8`
+- acceptance: `10` repeats
+
+Acceptance ranking:
+
+- `AdamW`: `6.78456`, `66.2k tok/s`
+- `ARGOS`: `6.79317`, `63.5k tok/s`
+- `BiMAP-lite`: `6.81127`, `59.7k tok/s`
+- `ECHO`: `6.83161`, `65.5k tok/s`
+
+Epoch-4 ranking:
+
+- `AdamW`: `7.50513`, `65.0k tok/s`
+- `ECHO`: `7.61644`, `64.4k tok/s`
+- `BiMAP-lite`: `7.64030`, `58.5k tok/s`
+- `ARGOS`: `7.73214`, `62.3k tok/s`
+
+Final-epoch (`e8`) ranking:
+
+- `AdamW`: `8.65525`, `66.2k tok/s`
+- `ECHO`: `8.79525`, `65.5k tok/s`
+- `BiMAP-lite`: `8.89159`, `59.7k tok/s`
+- `ARGOS`: `9.34974`, `63.5k tok/s`
+
+Read:
+
+- this closes the remaining xlarge uncertainty
+  - `AdamW` is best at acceptance, `e4`, and `e8`
+  - so there is no remaining evidence that longer xlarge training reveals a late
+    `ARGOS` or `BiMAP-lite` win
+- `ARGOS` is specifically not a viable xlarge continuation branch
+  - it is only narrowly competitive at acceptance
+  - by `e4` it is clearly behind `AdamW`, `ECHO`, and `BiMAP-lite`
+  - by `e8` it has separated badly from the whole practical pack
+- `BiMAP-lite` remains the best structured xlarge comparison branch
+  - it stays materially closer to `AdamW` than `ARGOS`
+  - but it still does not produce a true xlarge win
+- `ECHO` is now the clean secondary xlarge comparison
+  - it is not best at acceptance
+  - but it is clearly the second-best late branch at both `e4` and `e8`
+- the xlarge preset itself remains an early-horizon stress benchmark more than a
+  long-horizon promotion gate
+  - all four branches degrade substantially after `e4`
+  - so future xlarge comparisons should focus on acceptance through roughly
+    `e4`, not very late training
+
+Updated xlarge policy:
+
+- keep `AdamW` as the xlarge default
+- keep `ECHO` as the secondary late-horizon xlarge comparison
+- keep `BiMAP-lite` as the top structured xlarge comparison branch
+- drop `ARGOS` from future routine xlarge sweeps
+- treat `token-lm-corpus-xlarge` as an acceptance-to-`e4` stress benchmark unless
+  the explicit goal is to study late-training degradation
+
+---
+*Document version: 1.42*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
 *Date: 2026-04-14*

@@ -172,6 +172,17 @@ run_variant_accept() {
   append_acceptance_summary "$benchmark" "$optimizer" "$OUT_DIR/raw/${name}.log"
 }
 
+bimap_lite_cadence_for_benchmark() {
+  case "$1" in
+    token-lm-corpus-large|token-lm-corpus-xlarge)
+      echo 2
+      ;;
+    *)
+      echo 4
+      ;;
+  esac
+}
+
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   run_capture 00_nvidia_smi nvidia-smi
   run_capture 01_build_main cmake --build "$BUILD_DIR" -j4
@@ -192,6 +203,7 @@ run_capture 04_smoke_bimap_gpu \
   --gpu-device "$GPU_DEVICE"
 
 for benchmark in token-lm-document token-lm-corpus-large; do
+  bimap_lite_cadence="$(bimap_lite_cadence_for_benchmark "$benchmark")"
   for epochs in "${EPOCHS[@]}"; do
     run_variant_epoch "sweep_${benchmark}_adamw_e${epochs}" \
       "$benchmark" "$epochs" "adamw" \
@@ -201,7 +213,7 @@ for benchmark in token-lm-document token-lm-corpus-large; do
       "$benchmark" "$epochs" "bimap_lite" \
       --variant bimap \
       --atlas-bimap-low-rank 0 \
-      --atlas-bimap-factor-cadence 1
+      --atlas-bimap-factor-cadence "$bimap_lite_cadence"
 
     run_variant_epoch "sweep_${benchmark}_bimap_v2_0_e${epochs}" \
       "$benchmark" "$epochs" "bimap_v2_0" \
@@ -222,6 +234,7 @@ done
 
 if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
   for benchmark in token-lm-document token-lm-corpus-large; do
+    bimap_lite_cadence="$(bimap_lite_cadence_for_benchmark "$benchmark")"
     run_variant_accept "accept_${benchmark}_adamw" \
       "$benchmark" "adamw" \
       --variant adamw
@@ -230,7 +243,7 @@ if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
       "$benchmark" "bimap_lite" \
       --variant bimap \
       --atlas-bimap-low-rank 0 \
-      --atlas-bimap-factor-cadence 1
+      --atlas-bimap-factor-cadence "$bimap_lite_cadence"
 
     run_variant_accept "accept_${benchmark}_bimap_v2_0" \
       "$benchmark" "bimap_v2_0" \

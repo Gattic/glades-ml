@@ -230,6 +230,17 @@ run_ctx_delta_parser() {
   return 0
 }
 
+bimap_lite_cadence_for_benchmark() {
+  case "$1" in
+    token-lm-corpus-large|token-lm-corpus-xlarge)
+      echo 2
+      ;;
+    *)
+      echo 4
+      ;;
+  esac
+}
+
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   run_capture 00_nvidia_smi nvidia-smi
   run_capture 01_build_main cmake --build "$BUILD_DIR" -j4
@@ -252,6 +263,7 @@ run_capture 05_smoke_bimap_gpu \
   --gpu-device "$GPU_DEVICE"
 
 for benchmark in "${BENCHMARKS[@]}"; do
+  bimap_lite_cadence="$(bimap_lite_cadence_for_benchmark "$benchmark")"
   for epochs in "${EPOCHS[@]}"; do
     run_variant_epoch "sweep_${benchmark}_adamw_e${epochs}" \
       "$benchmark" "$epochs" "adamw" \
@@ -262,7 +274,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
       --variant bimap \
       --atlas-bimap-scope "$BIMAP_SCOPE" \
       --atlas-bimap-low-rank 0 \
-      --atlas-bimap-factor-cadence 1
+      --atlas-bimap-factor-cadence "$bimap_lite_cadence"
 
     run_variant_epoch "sweep_${benchmark}_bimap_v2_0_e${epochs}" \
       "$benchmark" "$epochs" "bimap_v2_0" \
@@ -285,6 +297,7 @@ done
 
 if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
   for benchmark in "${BENCHMARKS[@]}"; do
+    bimap_lite_cadence="$(bimap_lite_cadence_for_benchmark "$benchmark")"
     run_variant_accept "accept_${benchmark}_adamw" \
       "$benchmark" "adamw" \
       --variant adamw
@@ -294,7 +307,7 @@ if [[ "$RUN_ACCEPTANCE" -eq 1 ]]; then
       --variant bimap \
       --atlas-bimap-scope "$BIMAP_SCOPE" \
       --atlas-bimap-low-rank 0 \
-      --atlas-bimap-factor-cadence 1
+      --atlas-bimap-factor-cadence "$bimap_lite_cadence"
 
     run_variant_accept "accept_${benchmark}_bimap_v2_0" \
       "$benchmark" "bimap_v2_0" \
@@ -330,6 +343,9 @@ Files:
 
 BiMAP scope:
   - $BIMAP_SCOPE
+- BiMAP-lite cadence policy:
+  - 4 for non-corpus-large families
+  - 2 for corpus-large/xlarge families
 
 Configured benchmarks:
 $(printf '  - %s\n' "${BENCHMARKS[@]}")
