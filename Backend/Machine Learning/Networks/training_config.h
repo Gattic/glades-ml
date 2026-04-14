@@ -1015,6 +1015,11 @@ struct ATLASConfig
 	// Number of optimizer steps between MATRA row/column second-moment refreshes.
 	unsigned int matraMetricCadence;
 
+	// Number of optimizer steps between exact MATRA orthogonal residual solves.
+	// 1 runs the orthogonal branch on every eligible step; larger values keep
+	// predictive + geometry active every step while sparsifying the exact solve.
+	unsigned int matraOrthCadence;
+
 	// Only allow MATRA's orthogonal branch on matrix blocks whose aspect ratio
 	// max(m, n) / min(m, n) does not exceed this limit.
 	float matraMaxAspect;
@@ -1353,6 +1358,7 @@ struct ATLASConfig
 	      matraPredictiveScale(0.05f),
 	      matraTrustRadius(0.50f),
 	      matraMetricCadence(1u),
+	      matraOrthCadence(1u),
 	      matraMaxAspect(1.50f),
 	      matraMinDim(8u),
 	      matraDamping(0.01f),

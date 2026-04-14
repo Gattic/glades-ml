@@ -10202,8 +10202,11 @@ bool matraUpdate(MatraWeightState& state,
 	const float predictiveScale =
 	    std::max(0.0f, std::min(1.0f, ac.matraPredictiveScale));
 	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	const unsigned int orthCadence = std::max(1u, ac.matraOrthCadence);
 	const bool refreshGeometry =
 	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(cadence)) == 0ULL);
+	const bool orthCadenceHit =
+	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(orthCadence)) == 0ULL);
 
 	std::vector<float> rowSample;
 	std::vector<float> colSample;
@@ -10316,7 +10319,7 @@ bool matraUpdate(MatraWeightState& state,
 	float orthTrust = 0.0f;
 	matra_compute_trust_weights(geometryEvidence,
 	                            predictiveTrust,
-	                            orthEligibleShape,
+	                            orthEligibleShape && orthCadenceHit,
 	                            ac,
 	                            &geometryTrust,
 	                            &orthTrust);
@@ -10364,7 +10367,7 @@ bool matraUpdate(MatraWeightState& state,
 		}
 	}
 
-	const bool orthEnabled = orthEligibleShape && (orthTrust > 0.0f);
+	const bool orthEnabled = orthCadenceHit && orthEligibleShape && (orthTrust > 0.0f);
 	float signalScale = 0.0f;
 	float orthErr = 0.0f;
 	if (orthEnabled)
@@ -10423,6 +10426,7 @@ bool matraUpdate(MatraWeightState& state,
 		append_kv(oss, "signalScale", state.lastSignalScale);
 		append_kv(oss, "orthErr", state.lastOrthError);
 		append_kv(oss, "cadence", cadence);
+		append_kv(oss, "orthCadence", orthCadence);
 		logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 	}
 

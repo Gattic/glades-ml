@@ -16,6 +16,7 @@ MATRA_ORTH=0.5
 MATRA_PRED=0.05
 MATRA_TRUST=0.5
 MATRA_CADENCE=1
+MATRA_ORTH_CADENCE=1
 MATRA_MAX_ASPECT=1.50
 MATRA_MIN_DIM=8
 MATRA_DAMPING=0.01
@@ -42,6 +43,7 @@ Options:
   --atlas-matra-predictive-scale X
   --atlas-matra-trust-radius X
   --atlas-matra-cadence N
+  --atlas-matra-orth-cadence N
   --atlas-matra-max-aspect X
   --atlas-matra-min-dim N
   --atlas-matra-damping X
@@ -92,6 +94,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --atlas-matra-cadence)
       MATRA_CADENCE="$2"
+      shift 2
+      ;;
+    --atlas-matra-orth-cadence)
+      MATRA_ORTH_CADENCE="$2"
       shift 2
       ;;
     --atlas-matra-max-aspect)
@@ -225,6 +231,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
     --atlas-matra-predictive-scale "$MATRA_PRED" \
     --atlas-matra-trust-radius "$MATRA_TRUST" \
     --atlas-matra-cadence "$MATRA_CADENCE" \
+    --atlas-matra-orth-cadence "$MATRA_ORTH_CADENCE" \
     --atlas-matra-max-aspect "$MATRA_MAX_ASPECT" \
     --atlas-matra-min-dim "$MATRA_MIN_DIM" \
     --atlas-matra-damping "$MATRA_DAMPING" \

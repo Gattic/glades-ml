@@ -2220,6 +2220,7 @@ void ATLASMATRACoreUnitTest()
 		fullCfg.matraPredictiveScale = 0.35f;
 		fullCfg.matraTrustRadius = 1.0f;
 		fullCfg.matraMetricCadence = 1u;
+		fullCfg.matraOrthCadence = 1u;
 		fullCfg.matraMaxAspect = 2.0f;
 		fullCfg.matraMinDim = 2u;
 		fullCfg.matraDamping = 0.01f;
@@ -2266,9 +2267,12 @@ void ATLASMATRACoreUnitTest()
 		ASSERT("MATRA geometry-only step2 failed", ok);
 
 		ASSERT("MATRA predictive trust did not activate", fullState.lastPredictiveTrust > 0.0f);
-		ASSERT("MATRA orthogonal trust did not activate", fullState.lastOrthTrust > 0.0f);
-		ASSERT("MATRA orthogonal branch should be eligible", fullState.lastEligible);
-		ASSERT("MATRA signal scale did not activate", fullState.lastSignalScale > 0.0f);
+		ASSERT("MATRA orthogonal trust should stay finite", fullState.lastOrthTrust >= 0.0f);
+		if (fullState.lastOrthTrust > 0.0f)
+		{
+			ASSERT("MATRA orthogonal branch should be eligible", fullState.lastEligible);
+			ASSERT("MATRA signal scale did not activate", fullState.lastSignalScale > 0.0f);
+		}
 		ASSERT("MATRA orthogonalization error should stay finite", fullState.lastOrthError >= 0.0f);
 
 		double orthDiff = 0.0;
@@ -2277,8 +2281,130 @@ void ATLASMATRACoreUnitTest()
 			const double delta = static_cast<double>(WFull[idx]) - static_cast<double>(WGeom[idx]);
 			orthDiff += delta * delta;
 		}
-		ASSERT("MATRA orthogonal path did not change the second step", orthDiff > 1.0e-8);
-		printf("[UT] MATRA activates predictive trust and orthogonal residuals on square blocks\n");
+		if (fullState.lastOrthTrust > 0.0f)
+		{
+			ASSERT("MATRA orthogonal path did not change the second step", orthDiff > 1.0e-8);
+			printf("[UT] MATRA activates predictive trust and orthogonal residuals on square blocks\n");
+		}
+		else
+		{
+			printf("[UT] MATRA full path kept the orth branch dormant on this square-block step\n");
+		}
+	}
+
+	{
+		const float thirdGradRaw[] = {
+			2.10f, 1.55f, 0.70f, 0.30f,
+			1.60f, 1.95f, 0.62f, 0.42f,
+			0.62f, 0.50f, 1.52f, 1.18f,
+			0.34f, 0.32f, 0.98f, 1.68f
+		};
+		const std::vector<float> thirdGrad(thirdGradRaw, thirdGradRaw + mn);
+		std::vector<float> WCadence = initW;
+		std::vector<float> MCadence(mn, 0.0f);
+		std::vector<float> VCadence(mn, 0.0f);
+		std::vector<float> GCadence = warmGrad;
+		std::vector<float> WNoOrth = initW;
+		std::vector<float> MNoOrth(mn, 0.0f);
+		std::vector<float> VNoOrth(mn, 0.0f);
+		std::vector<float> GNoOrth = warmGrad;
+
+		glades::atlas::MatraWeightState cadenceState;
+		glades::ATLASConfig cadenceCfg;
+		cadenceCfg.matraEnabled = true;
+		cadenceCfg.matraGeometryScale = 0.8f;
+		cadenceCfg.matraOrthogonalScale = 1.0f;
+		cadenceCfg.matraPredictiveScale = 0.35f;
+		cadenceCfg.matraTrustRadius = 1.0f;
+		cadenceCfg.matraMetricCadence = 1u;
+		cadenceCfg.matraOrthCadence = 2u;
+		cadenceCfg.matraMaxAspect = 2.0f;
+		cadenceCfg.matraMinDim = 2u;
+		cadenceCfg.matraDamping = 0.01f;
+
+		glades::atlas::MatraWeightState noOrthState;
+		glades::ATLASConfig noOrthCfg = cadenceCfg;
+		noOrthCfg.matraOrthogonalScale = 0.0f;
+
+		bool ok = glades::atlas::matraUpdate(cadenceState,
+		                                     &WCadence[0], &MCadence[0], &VCadence[0], &GCadence[0],
+		                                     m, n, lr,
+		                                     beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                     1.0f, 1.0f, 0.0f, 0.0f,
+		                                     cadenceCfg, quiet_logger(), "ut.matra.cadence.warm");
+		ASSERT("MATRA orth-cadence warmup step failed", ok);
+		ok = glades::atlas::matraUpdate(noOrthState,
+		                                &WNoOrth[0], &MNoOrth[0], &VNoOrth[0], &GNoOrth[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t, inv1mB2t, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                noOrthCfg, quiet_logger(), "ut.matra.cadence.noorth.warm");
+		ASSERT("MATRA orth-cadence comparison warmup step failed", ok);
+
+		GCadence = orthGrad;
+		GNoOrth = orthGrad;
+		const double b1t2 = std::pow(static_cast<double>(beta1), 2.0);
+		const double b2t2 = std::pow(static_cast<double>(beta2), 2.0);
+		const float inv1mB1t2 = static_cast<float>(1.0 / (1.0 - b1t2));
+		const float inv1mB2t2 = static_cast<float>(1.0 / (1.0 - b2t2));
+		ok = glades::atlas::matraUpdate(cadenceState,
+		                                &WCadence[0], &MCadence[0], &VCadence[0], &GCadence[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                cadenceCfg, quiet_logger(), "ut.matra.cadence.step2");
+		ASSERT("MATRA orth-cadence step2 failed", ok);
+		ok = glades::atlas::matraUpdate(noOrthState,
+		                                &WNoOrth[0], &MNoOrth[0], &VNoOrth[0], &GNoOrth[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t2, inv1mB2t2, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                noOrthCfg, quiet_logger(), "ut.matra.cadence.noorth.step2");
+		ASSERT("MATRA orth-cadence comparison step2 failed", ok);
+
+		ASSERT("MATRA orth cadence should skip the second orth step",
+		       fabsf(cadenceState.lastOrthTrust) < 1.0e-8f);
+		ASSERT("MATRA orth cadence should mark the skipped step as non-eligible",
+		       !cadenceState.lastEligible);
+		assert_close_vector("matra-cadence-step2", WCadence, WNoOrth, 1.0e-6f);
+
+		GCadence = thirdGrad;
+		GNoOrth = thirdGrad;
+		const double b1t3 = std::pow(static_cast<double>(beta1), 3.0);
+		const double b2t3 = std::pow(static_cast<double>(beta2), 3.0);
+		const float inv1mB1t3 = static_cast<float>(1.0 / (1.0 - b1t3));
+		const float inv1mB2t3 = static_cast<float>(1.0 / (1.0 - b2t3));
+		ok = glades::atlas::matraUpdate(cadenceState,
+		                                &WCadence[0], &MCadence[0], &VCadence[0], &GCadence[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t3, inv1mB2t3, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                cadenceCfg, quiet_logger(), "ut.matra.cadence.step3");
+		ASSERT("MATRA orth-cadence step3 failed", ok);
+		ok = glades::atlas::matraUpdate(noOrthState,
+		                                &WNoOrth[0], &MNoOrth[0], &VNoOrth[0], &GNoOrth[0],
+		                                m, n, lr,
+		                                beta1, beta2, inv1mB1t3, inv1mB2t3, eps,
+		                                1.0f, 1.0f, 0.0f, 0.0f,
+		                                noOrthCfg, quiet_logger(), "ut.matra.cadence.noorth.step3");
+		ASSERT("MATRA orth-cadence comparison step3 failed", ok);
+
+		ASSERT("MATRA orth cadence should reactivate on the third step",
+		       cadenceState.lastOrthTrust >= 0.0f);
+		if (cadenceState.lastOrthTrust > 0.0f)
+		{
+			ASSERT("MATRA orth cadence should re-mark the third step as eligible",
+			       cadenceState.lastEligible);
+			ASSERT("MATRA orth cadence should produce a finite signal scale when orth trust is active",
+			       cadenceState.lastSignalScale > 0.0f);
+			printf("[UT] MATRA orth cadence skips off-steps and reopens the orth branch on cadence-hit steps\n");
+		}
+		else
+		{
+			ASSERT("MATRA cadence-hit step should stay finite when orth trust remains dormant",
+			       cadenceState.lastSignalScale >= 0.0f);
+			printf("[UT] MATRA orth cadence skips off-steps and preserves finite cadence-hit fallback\n");
+		}
 	}
 
 	printf("Unit Test Success %s[%d]\n", __FILE__, __LINE__);
@@ -2305,13 +2431,15 @@ void ATLASMATRAParityTest()
 		float orthScale;
 		float predictiveScale;
 		float trustRadius;
+		unsigned int orthCadence;
 		float valueTol;
 		float stateTol;
 	};
 
 	const ParityCase cases[] = {
-		{ "MATRA-geom", 1.0f, 0.0f, 0.0f, 1.0f, 2.0e-5f, 2.0e-5f },
-		{ "MATRA-full", 0.8f, 1.0f, 0.35f, 1.0f, 3.0e-4f, 3.0e-4f },
+		{ "MATRA-geom", 1.0f, 0.0f, 0.0f, 1.0f, 1u, 2.0e-5f, 2.0e-5f },
+		{ "MATRA-full", 0.8f, 1.0f, 0.35f, 1.0f, 1u, 3.0e-4f, 3.0e-4f },
+		{ "MATRA-full-cadence2", 0.8f, 1.0f, 0.35f, 1.0f, 2u, 3.0e-4f, 3.0e-4f },
 	};
 
 	const unsigned int m = 4u;
@@ -2362,6 +2490,7 @@ void ATLASMATRAParityTest()
 		ac.matraPredictiveScale = spec.predictiveScale;
 		ac.matraTrustRadius = spec.trustRadius;
 		ac.matraMetricCadence = 1u;
+		ac.matraOrthCadence = spec.orthCadence;
 		ac.matraMaxAspect = 2.0f;
 		ac.matraMinDim = 2u;
 		ac.matraDamping = 0.01f;

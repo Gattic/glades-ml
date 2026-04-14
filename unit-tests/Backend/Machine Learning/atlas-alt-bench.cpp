@@ -830,6 +830,7 @@ struct BenchConfig
 	float atlasMatraPredictiveScale;
 	float atlasMatraTrustRadius;
 	unsigned int atlasMatraMetricCadence;
+	unsigned int atlasMatraOrthCadence;
 	float atlasMatraMaxAspect;
 	unsigned int atlasMatraMinDim;
 	float atlasMatraDamping;
@@ -918,6 +919,7 @@ struct BenchConfig
 	      atlasMatraPredictiveScale(0.05f),
 	      atlasMatraTrustRadius(0.50f),
 	      atlasMatraMetricCadence(1u),
+	      atlasMatraOrthCadence(1u),
 	      atlasMatraMaxAspect(1.50f),
 	      atlasMatraMinDim(8u),
 	      atlasMatraDamping(0.01f),
@@ -1992,6 +1994,7 @@ static void print_usage()
 	printf("  --atlas-matra-predictive-scale X      Bounded one-step predictive transport for MATRA (default: 0.05)\n");
 	printf("  --atlas-matra-trust-radius X          Total structured trust budget for MATRA (default: 0.50)\n");
 	printf("  --atlas-matra-cadence N               Steps between MATRA row/column metric refreshes (default: 1)\n");
+	printf("  --atlas-matra-orth-cadence N          Steps between exact MATRA orth solves (default: 1)\n");
 	printf("  --atlas-matra-max-aspect X            Maximum block aspect ratio eligible for MATRA orthogonal branch (default: 1.50)\n");
 	printf("  --atlas-matra-min-dim N               Minimum block side length eligible for MATRA orthogonal branch (default: 8)\n");
 	printf("  --atlas-matra-damping X               Gram damping inside MATRA orthogonal factors (default: 0.01)\n");
@@ -2952,6 +2955,14 @@ static bool parse_args(int argc, char* argv[], BenchConfig& cfg, std::string& er
 			if (!parse_uint_arg(argv[++i], cfg.atlasMatraMetricCadence) || cfg.atlasMatraMetricCadence == 0u)
 			{
 				err = "invalid --atlas-matra-cadence";
+				return false;
+			}
+		}
+		else if (streq(argv[i], "--atlas-matra-orth-cadence") && i + 1 < argc)
+		{
+			if (!parse_uint_arg(argv[++i], cfg.atlasMatraOrthCadence) || cfg.atlasMatraOrthCadence == 0u)
+			{
+				err = "invalid --atlas-matra-orth-cadence";
 				return false;
 			}
 		}
@@ -4869,6 +4880,7 @@ static void configure_atlas(glades::TrainingConfig& tc,
 		tc.atlas.matraPredictiveScale = cfg.atlasMatraPredictiveScale;
 		tc.atlas.matraTrustRadius = cfg.atlasMatraTrustRadius;
 		tc.atlas.matraMetricCadence = cfg.atlasMatraMetricCadence;
+		tc.atlas.matraOrthCadence = cfg.atlasMatraOrthCadence;
 		tc.atlas.matraMaxAspect = cfg.atlasMatraMaxAspect;
 		tc.atlas.matraMinDim = cfg.atlasMatraMinDim;
 		tc.atlas.matraDamping = cfg.atlasMatraDamping;
@@ -6298,7 +6310,7 @@ static bool run_token_case(const BenchConfig& cfg)
 	const float kronTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_KRON);
 	const float muonTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MUON);
 	const float matraTokenLR = token_variant_learning_rate(cfg, VARIANT_ATLAS_MATRA);
-	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s cadence=%u groups=%u) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f) ATLAS-MATRA(lr=%.4f cadence=%u trust=%.2f)\n",
+	printf("Optimizers: AdamW(lr=%.4f) ATLAS-BSRP(lr=%.4f cRank=0) ATLAS-SPARROW(lr=%.4f cRank=%u modeRankCap=%u autoGate=%u) ATLAS-HELM(lr=%.4f modeRank=%u hiddenStack=%u) ATLAS-ASTER(lr=%.4f stateRank=%u hiddenStack=%u) ATLAS-AEGIS(lr=%.4f cRank=%u) ATLAS-CITADEL(lr=%.4f cRank=%u) ATLAS-RAMPART(lr=%.4f cRank=%u) ATLAS-MERIT(lr=%.4f cRank=%u) ATLAS-STRATA(lr=%.4f cRank=%u) ATLAS-AURORA(lr=%.4f cRank=%u) ATLAS-SEAM(lr=%.4f cRank=%u) ATLAS-QUASAR(lr=%.4f cRank=%u) ATLAS-GEODE(lr=%.4f cRank=%u) ATLAS-ECHO(lr=%.4f scope=%s cadence=%u groups=%u) ATLAS-BIMAP(lr=%.4f scope=%s lowRank=%u cadence=%u) ATLAS-PACT(lr=%.4f lowRank=%u cadence=%u) ATLAS-RACER(lr=%.4f cadence=%u) ATLAS-KRON(lr=%.4f cadence=%u) ATLAS-MUON(lr=%.4f minDim=%u maxAspect=%.2f) ATLAS-MATRA(lr=%.4f cadence=%u orthCadence=%u trust=%.2f)\n",
 	       cfg.token.adamLR, baseTokenLR, sparrowTokenLR, cfg.atlasComplementRank,
 	       cfg.atlasSparrowModeRank, cfg.atlasSparrowAutoModeGate,
 	       helmTokenLR, cfg.atlasHelmModeRank, cfg.atlasHelmHiddenStackDepth, asterTokenLR,
@@ -6311,8 +6323,8 @@ static bool run_token_case(const BenchConfig& cfg)
 	       pactTokenLR, cfg.atlasPACTLowRank, cfg.atlasPACTFactorCadence,
 	       racerTokenLR, cfg.atlasRACERFactorCadence,
 	       kronTokenLR, cfg.atlasKronFactorCadence, muonTokenLR, cfg.atlasMuonMinDim, cfg.atlasMuonMaxAspect,
-	       matraTokenLR, cfg.atlasMatraMetricCadence, cfg.atlasMatraTrustRadius);
-	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u cadence=%u trust=%.3f pred=%.3f struct=%.3f groups=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f) matra(geom=%.3f orth=%.3f pred=%.3f trust=%.3f cadence=%u maxAspect=%.3f minDim=%u damping=%.3f)\n",
+	       matraTokenLR, cfg.atlasMatraMetricCadence, cfg.atlasMatraOrthCadence, cfg.atlasMatraTrustRadius);
+	printf("ATLAS: rank=%u tSub=%u kappaMax=%.3f sparrow(modeRankCap=%u autoGate=%u memoryScale=%.3f edge=%.3f secondEdge=%.3f secondFrac=%.3f poleMax=%.3f) helm(modeRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) aster(stateRank=%u hiddenStack=%u memoryScale=%.3f edge=%.3f poleMax=%.3f) kappa(enabled=%u heads=%u lags=%u rank=%u) aurora(adamwBackbone=%u headGain=%.3f bodyTrust=%.3f) geode(geom=%.3f pred=%.3f) echo(scope=%s geom=%.3f final=%.3f decay=%u cadence=%u trust=%.3f pred=%.3f struct=%.3f groups=%u) bimap(scope=%s lowRank=%u geom=%.3f pred=%.3f cadence=%u) pact(lowRank=%u geom=%.3f pred=%.3f cadence=%u cost=%.4f promote=%.4f demote=%.4f) racer(geom=%.3f pred=%.3f cadence=%u risk=%.3f cost=%.4f promote=%.4f demote=%.4f) kron(geom=%.3f pred=%.3f cadence=%u damping=%.3f) muon(geom=%.3f pred=%.3f maxAspect=%.3f minDim=%u damping=%.3f) matra(geom=%.3f orth=%.3f pred=%.3f trust=%.3f cadence=%u orthCadence=%u maxAspect=%.3f minDim=%u damping=%.3f)\n",
 	       cfg.atlasRank, cfg.atlasTSub, cfg.atlasKappaMax,
 	       cfg.atlasSparrowModeRank,
 	       cfg.atlasSparrowAutoModeGate,
@@ -6336,7 +6348,7 @@ static bool run_token_case(const BenchConfig& cfg)
 	       cfg.atlasKronGeometryScale, cfg.atlasKronPredictiveScale, cfg.atlasKronFactorCadence, cfg.atlasKronDamping,
 	       cfg.atlasMuonGeometryScale, cfg.atlasMuonPredictiveScale, cfg.atlasMuonMaxAspect, cfg.atlasMuonMinDim, cfg.atlasMuonDamping,
 	       cfg.atlasMatraGeometryScale, cfg.atlasMatraOrthogonalScale, cfg.atlasMatraPredictiveScale, cfg.atlasMatraTrustRadius,
-	       cfg.atlasMatraMetricCadence, cfg.atlasMatraMaxAspect, cfg.atlasMatraMinDim, cfg.atlasMatraDamping);
+	       cfg.atlasMatraMetricCadence, cfg.atlasMatraOrthCadence, cfg.atlasMatraMaxAspect, cfg.atlasMatraMinDim, cfg.atlasMatraDamping);
 	printf("\n");
 	printf("%-15s  %7s          %10s            %9s           %9s           %9s           %9s         %s\n",
 	       "Optimizer", "Train(s)", "Tok/s", "TrainNLL", "TrainPPL", "TestNLL", "TestPPL", "Status");

@@ -731,6 +731,7 @@ static void apply_training_config_from_kv(const std::map<std::string, std::strin
 	if (parse_float(kv, "training.atlas.matraPredictiveScale", f)) { cfg.atlas.matraPredictiveScale = f; any = true; }
 	if (parse_float(kv, "training.atlas.matraTrustRadius", f)) { cfg.atlas.matraTrustRadius = f; any = true; }
 	if (parse_int(kv, "training.atlas.matraMetricCadence", i) && i >= 0) { cfg.atlas.matraMetricCadence = static_cast<unsigned int>(i); any = true; }
+	if (parse_int(kv, "training.atlas.matraOrthCadence", i) && i >= 0) { cfg.atlas.matraOrthCadence = static_cast<unsigned int>(i); any = true; }
 	if (parse_float(kv, "training.atlas.matraMaxAspect", f)) { cfg.atlas.matraMaxAspect = f; any = true; }
 	if (parse_int(kv, "training.atlas.matraMinDim", i) && i >= 0) { cfg.atlas.matraMinDim = static_cast<unsigned int>(i); any = true; }
 	if (parse_float(kv, "training.atlas.matraDamping", f)) { cfg.atlas.matraDamping = f; any = true; }
@@ -1416,6 +1417,9 @@ static bool write_manifest(const std::string& manifestPath,
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.matraMetricCadence; write_kv(out, "training.atlas.matraMetricCadence", oss.str());
+	}
+	{
+		std::ostringstream oss; oss << trainingConfig.atlas.matraOrthCadence; write_kv(out, "training.atlas.matraOrthCadence", oss.str());
 	}
 	{
 		std::ostringstream oss; oss << trainingConfig.atlas.matraMaxAspect; write_kv(out, "training.atlas.matraMaxAspect", oss.str());
@@ -3154,6 +3158,16 @@ static glades::NNetworkStatus validate_checkpoint_training_config_compatibility(
 		std::ostringstream oss;
 		oss << "loadCheckpoint: training.atlas.matraMetricCadence mismatch vs requested resume config (checkpoint "
 		    << savedMATRAMetricCadence << ", current " << currentCfg.atlas.matraMetricCadence << ")";
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
+	}
+
+	int savedMATRAOrthCadence = 0;
+	if (parse_int(kv, "training.atlas.matraOrthCadence", savedMATRAOrthCadence) &&
+	    currentCfg.atlas.matraOrthCadence != static_cast<unsigned int>(savedMATRAOrthCadence))
+	{
+		std::ostringstream oss;
+		oss << "loadCheckpoint: training.atlas.matraOrthCadence mismatch vs requested resume config (checkpoint "
+		    << savedMATRAOrthCadence << ", current " << currentCfg.atlas.matraOrthCadence << ")";
 		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, oss.str());
 	}
 

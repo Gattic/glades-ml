@@ -7755,8 +7755,156 @@ Updated practical verdict after the April 14 rerank:
   corpus-side branch after the stable `MATRA` systems work
 - `BiMAP-lite` remains competitive but secondary, and `BiMAP-v2` remains a
   high-cost specialist rather than a practical default
+
+## April 14, 2026: `MATRA` exact-orth cadence sweep shows the best corpus-large tradeoff is every 2 steps
+
+I then tested the first structural performance recommendation for `MATRA`: keep
+predictive + geometry active every step, but only run the exact orthogonal
+branch every `N` steps.
+
+Implementation notes:
+
+- added `matraOrthCadence` to the ATLAS config, checkpoint persistence, CLI
+  surface, and CPU / GPU MATRA paths
+- semantics:
+  - step `0` still allows the orth branch
+  - after that, exact orth is only eligible when `step % matraOrthCadence == 0`
+  - on skipped steps, `MATRA` keeps the same predictive + geometry update and
+    only suppresses the exact orth solve
+- local verification:
+  - `atlas-matra-core` passed
+  - `atlas-matra-parity` remains the GPU-host verification check
+
+Sweep runs, in execution order:
+
+- `artifacts/matra_gpu_gate_20260414-050503/`
+  - `matraOrthCadence = 1`
+- `artifacts/matra_gpu_gate_20260414-050618/`
+  - `matraOrthCadence = 2`
+- `artifacts/matra_gpu_gate_20260414-050719/`
+  - `matraOrthCadence = 4`
+
+Acceptance comparison:
+
+- `token-lm-document`
+  - cadence `1`: `MATRA 4.85875 @ 0.12s`
+  - cadence `2`: `MATRA 4.87179 @ 0.11s`
+  - cadence `4`: `MATRA 4.87572 @ 0.11s`
+  - `AdamW` reference in the same runs stayed around `4.87 @ 0.10s`
+- `token-lm-corpus-large`
+  - cadence `1`: `MATRA 6.26262 @ 0.20s`
+  - cadence `2`: `MATRA 6.24490 @ 0.20s`
+  - cadence `4`: `MATRA 6.26325 @ 0.20s`
+  - `AdamW` reference in the same runs stayed around `6.30 @ 0.18s`
+
+Epoch-4 comparison:
+
+- `token-lm-document`
+  - cadence `1`: `MATRA 4.78005 @ 0.23s`
+  - cadence `2`: `MATRA 4.81819 @ 0.22s`
+  - cadence `4`: `MATRA 4.79618 @ 0.22s`
+- `token-lm-corpus-large`
+  - cadence `1`: `MATRA 6.45442 @ 0.40s`
+  - cadence `2`: `MATRA 6.45465 @ 0.39s`
+  - cadence `4`: `MATRA 6.46282 @ 0.39s`
+
+Interpretation:
+
+- the exact orth branch is still useful often enough that sparsifying it
+  aggressively to every `4` steps hurts both document and corpus quality
+- `matraOrthCadence = 2` is the best large-LLM / corpus-large tradeoff:
+  - same practical acceptance speed as cadence `1`
+  - clearly better corpus-large acceptance NLL
+  - essentially tied corpus-large `e4`
+  - slightly better `e4` wall clock
+- `matraOrthCadence = 1` remains preferable only if the target is
+  document-style acceptance quality specifically
+
+Updated practical rule:
+
+- for large-LLM-style / corpus-large MATRA runs, prefer:
+  - `matraOrthCadence = 2`
+- for document-style MATRA experiments where acceptance quality matters more
+  than the last `0.01s`, keep:
+  - `matraOrthCadence = 1`
+- do not use:
+  - `matraOrthCadence = 4`
+    because it gives up quality without buying meaningful additional speed
+
+This does not overturn the broader optimizer recommendation:
+
+- `AdamW` remains the safest overall default
+- `MATRA` becomes a slightly better corpus-large branch when configured with
+  `matraOrthCadence = 2`
+- the next clean rerank should use `MATRA` with that cadence setting if the
+  goal is a corpus-large-centered comparison
+
+## April 14, 2026: clean rerank with `MATRA matraOrthCadence=2` keeps MATRA best at corpus acceptance but no longer clearly best at `e4`
+
+I reran the clean same-codebase ranking with the new preferred corpus-side
+`MATRA` setting:
+
+- `artifacts/optimizer_clean_ranking_20260414-051611/acceptance_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260414-051611/epoch_sweep_summary.tsv`
+- `artifacts/optimizer_clean_ranking_20260414-051611/acceptance_rank_by_nll.tsv`
+- `artifacts/optimizer_clean_ranking_20260414-051611/epoch4_rank_by_nll.tsv`
+
+Acceptance ranking by benchmark:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.81874 @ 0.11s`
+  - `MATRA`: `4.86823 @ 0.11s`
+  - `BiMAP-lite`: `4.86996 @ 0.13s`
+  - `AdamW`: `4.87212 @ 0.10s`
+  - `ECHO`: `4.88157 @ 0.10s`
+  - `BiMAP-v2`: `4.89044 @ 0.15s`
+- `token-lm-corpus-large`
+  - `MATRA`: `6.26854 @ 0.20s`
+  - `MUON-lite`: `6.29803 @ 0.19s`
+  - `AdamW`: `6.30592 @ 0.18s`
+  - `ECHO`: `6.30698 @ 0.18s`
+  - `BiMAP-lite`: `6.33056 @ 0.22s`
+  - `BiMAP-v2`: `6.52154 @ 0.26s`
+
+Epoch-4 ranking by benchmark:
+
+- `token-lm-document`
+  - `MUON-lite`: `4.54773 @ 0.22s`
+  - `ECHO`: `4.58823 @ 0.20s`
+  - `BiMAP-lite`: `4.62711 @ 0.26s`
+  - `BiMAP-v2`: `4.62801 @ 0.30s`
+  - `AdamW`: `4.66382 @ 0.20s`
+  - `MATRA`: `4.74992 @ 0.22s`
+- `token-lm-corpus-large`
+  - `AdamW`: `6.47005 @ 0.36s`
+  - `MATRA`: `6.47006 @ 0.39s`
+  - `ECHO`: `6.59047 @ 0.37s`
+  - `BiMAP-lite`: `6.59653 @ 0.44s`
+  - `BiMAP-v2`: `6.61974 @ 0.52s`
+  - `MUON-lite`: `6.64958 @ 0.39s`
+
+Interpretation:
+
+- the cadence-2 rerank preserves the main corpus-side result:
+  - `MATRA` is still the best acceptance branch on `token-lm-corpus-large`
+- but it weakens the earlier stronger claim that MATRA is also clearly the best
+  late-horizon corpus branch:
+  - at `e4`, `AdamW` is effectively tied and wins by a hair
+  - `6.47005` vs `6.47006` is not a meaningful practical separation
+- on `token-lm-document`, the new cadence setting improves MATRA acceptance
+  enough to place it second, but it remains weak by `e4`
+
+Updated practical verdict:
+
+- `AdamW` remains the safest general default for large-LLM training in this repo
+- `MUON-lite` remains the strongest document-style branch
+- `MATRA` with `matraOrthCadence = 2` is now the best checked-in corpus-large
+  acceptance branch
+- `MATRA` is no longer clearly better than `AdamW` by late corpus-large
+  training horizon; they should be treated as effectively tied there
+- `ECHO` remains a useful control but not the frontier branch
 ---
 
-*Document version: 1.29*
+*Document version: 1.31*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
 *Date: 2026-04-14*

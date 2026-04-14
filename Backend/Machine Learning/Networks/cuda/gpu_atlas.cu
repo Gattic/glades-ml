@@ -5328,7 +5328,8 @@ __global__ void matra_finalize_stats_batch_kernel(const GpuMatraBatchItem* __res
                                                   float orthScale,
                                                   float trustRadius,
                                                   float maxAspect,
-                                                  unsigned int minDim)
+                                                  unsigned int minDim,
+                                                  unsigned int orthCadence)
 {
 	const int batchIdx = blockIdx.x;
 	if (!items || batchIdx < 0 || batchIdx >= count)
@@ -5411,8 +5412,14 @@ __global__ void matra_finalize_stats_batch_kernel(const GpuMatraBatchItem* __res
 		const int longDim = (item.m > item.n) ? static_cast<int>(item.m) : static_cast<int>(item.n);
 		const float aspect =
 		    static_cast<float>(longDim) / fmaxf(static_cast<float>(shortDim > 0 ? shortDim : 1), 1.0f);
+		const unsigned int stepInt =
+		    static_cast<unsigned int>(d_stats[19] > 0.0f ? (d_stats[19] + 0.5f) : 0.0f);
+		const unsigned int orthCadenceSafe = orthCadence > 0u ? orthCadence : 1u;
+		const unsigned int orthDue =
+		    (stepInt == 0u || (stepInt % orthCadenceSafe) == 0u) ? 1u : 0u;
 		const unsigned int eligible =
-		    (orthScale > 0.0f)
+		    (orthDue != 0u)
+		    && (orthScale > 0.0f)
 		    && (shortDim >= static_cast<int>(minDim > 0u ? minDim : 1u))
 		    && (aspect <= fmaxf(1.0f, maxAspect))
 		    ? 1u : 0u;
@@ -7865,6 +7872,7 @@ bool matra_gpu_update(GpuMatraWeightState& state,
 	    std::max(0.0f, std::min(1.0f, ac.matraPredictiveScale));
 	const float betaGeom = std::min(std::max(ac.beta, 0.0f), 1.0f);
 	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	const unsigned int orthCadence = std::max(1u, ac.matraOrthCadence);
 	const bool refresh =
 	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(cadence)) == 0ULL);
 	const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
@@ -7879,6 +7887,9 @@ bool matra_gpu_update(GpuMatraWeightState& state,
 	    (std::max(0.0f, ac.matraOrthogonalScale) > 0.0f)
 	    && (shortDim >= std::max(1u, ac.matraMinDim))
 	    && (aspect <= std::max(1.0f, ac.matraMaxAspect));
+	const bool orthCadenceHit =
+	    (state.step == 0ULL) || ((state.step % static_cast<unsigned long long>(orthCadence)) == 0ULL);
+	const bool orthEnabledThisStep = orthShapeEligible && orthCadenceHit;
 
 	if (refresh)
 	{
@@ -7925,7 +7936,7 @@ bool matra_gpu_update(GpuMatraWeightState& state,
 	matra_finalize_budget_kernel<<<1, 1, 0, computeStream()>>>(
 	    state.scalarScratch.data(),
 	    std::max(0.0f, ac.matraGeometryScale),
-	    std::max(0.0f, ac.matraOrthogonalScale),
+	    orthEnabledThisStep ? std::max(0.0f, ac.matraOrthogonalScale) : 0.0f,
 	    std::max(0.0f, ac.matraTrustRadius),
 	    ac.matraMaxAspect,
 	    ac.matraMinDim,
@@ -7949,7 +7960,7 @@ bool matra_gpu_update(GpuMatraWeightState& state,
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 
 	const float* dOrthCandidate = state.orthStep.data();
-	if (orthShapeEligible)
+	if (orthEnabledThisStep)
 	{
 		matra_finalize_scale_kernel<<<1, 1, 0, computeStream()>>>(
 		    state.scalarScratch.data(), shortDim);
@@ -8110,6 +8121,7 @@ static void matra_gpu_refresh_host_stats(GpuMatraWeightState& state,
 
 static void matra_gpu_log_step_event(const GpuMatraWeightState& state,
                                      unsigned int cadence,
+                                     unsigned int orthCadence,
                                      shmea::GLogger* logger,
                                      const char* tag)
 {
@@ -8129,7 +8141,8 @@ static void matra_gpu_log_step_event(const GpuMatraWeightState& state,
 	    << " aspect=" << state.lastAspect
 	    << " signalScale=" << state.lastSignalScale
 	    << " orthErr=" << state.lastOrthError
-	    << " cadence=" << cadence;
+	    << " cadence=" << cadence
+	    << " orthCadence=" << orthCadence;
 	logger->info("ATLAS", shmea::GString(oss.str().c_str()));
 }
 
@@ -8143,6 +8156,7 @@ static bool matra_gpu_record_small_batch_steps(const GpuMatraBatchItem* items,
 	if (!items || count <= 0)
 		return true;
 	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	const unsigned int orthCadence = std::max(1u, ac.matraOrthCadence);
 	const unsigned long long logCadence =
 	    static_cast<unsigned long long>(std::max(1u, ac.tSub));
 	std::vector<unsigned char> dueLog(static_cast<size_t>(count), 0u);
@@ -8188,7 +8202,7 @@ static bool matra_gpu_record_small_batch_steps(const GpuMatraBatchItem* items,
 			continue;
 		GpuMatraWeightState& state = *items[i].state;
 		matra_gpu_refresh_host_stats(state, hostStats.data() + static_cast<size_t>(i) * 20u);
-		matra_gpu_log_step_event(state, cadence, logger, items[i].tag);
+		matra_gpu_log_step_event(state, cadence, orthCadence, logger, items[i].tag);
 	}
 
 	return true;
@@ -8201,6 +8215,7 @@ static bool matra_gpu_record_step(GpuMatraWeightState& state,
                                   const char* tag)
 {
 	const unsigned int cadence = std::max(1u, ac.matraMetricCadence);
+	const unsigned int orthCadence = std::max(1u, ac.matraOrthCadence);
 	state.lastAspect = aspect;
 	state.lastOrthError = 0.0f;
 	state.step += 1ULL;
@@ -8213,7 +8228,7 @@ static bool matra_gpu_record_step(GpuMatraWeightState& state,
 		if (!state.scalarScratch.download(stats, 20u))
 			return false;
 		matra_gpu_refresh_host_stats(state, stats);
-		matra_gpu_log_step_event(state, cadence, logger, tag);
+		matra_gpu_log_step_event(state, cadence, orthCadence, logger, tag);
 	}
 
 	return true;
@@ -8321,6 +8336,7 @@ static bool matra_gpu_launch_small_batch_prepared(const GpuMatraBatchItem* items
 	const float orthScale = std::max(0.0f, ac.matraOrthogonalScale);
 	const float maxAspect = std::max(1.0f, ac.matraMaxAspect);
 	const unsigned int minDim = std::max(1u, ac.matraMinDim);
+	const unsigned int orthCadence = std::max(1u, ac.matraOrthCadence);
 	const float aspect =
 	    static_cast<float>(std::max(m, n))
 	    / static_cast<float>(std::max(1u, std::min(m, n)));
@@ -8328,6 +8344,17 @@ static bool matra_gpu_launch_small_batch_prepared(const GpuMatraBatchItem* items
 	    (orthScale > 0.0f)
 	    && (coreDim >= minDim)
 	    && (aspect <= maxAspect);
+	bool orthCadenceDueAny = false;
+	for (int i = 0; i < count; ++i)
+	{
+		const GpuMatraWeightState* state = items[i].state;
+		const bool orthDue =
+		    !state
+		    || state->step == 0ULL
+		    || ((state->step % static_cast<unsigned long long>(orthCadence)) == 0ULL);
+		orthCadenceDueAny = orthCadenceDueAny || orthDue;
+	}
+	const bool orthEnabledThisBatch = orthShapeEligible && orthCadenceDueAny;
 
 	const float predictiveScale =
 	    std::max(0.0f, std::min(1.0f, ac.matraPredictiveScale));
@@ -8379,10 +8406,11 @@ static bool matra_gpu_launch_small_batch_prepared(const GpuMatraBatchItem* items
 	    std::max(0.0f, ac.matraOrthogonalScale),
 	    std::max(0.0f, ac.matraTrustRadius),
 	    ac.matraMaxAspect,
-	    ac.matraMinDim);
+	    ac.matraMinDim,
+	    orthCadence);
 	ATLAS_CUDA_CHECK(cudaGetLastError());
 
-	if (!orthShapeEligible)
+	if (!orthEnabledThisBatch)
 	{
 		matra_prepare_apply_geom_batch_kernel<<<batchGrid, kBlock, 0, computeStream()>>>(
 		    d_batchItems, count, lrScale, inv1mB1t, inv1mB2t, eps,
