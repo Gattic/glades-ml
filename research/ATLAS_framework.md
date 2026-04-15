@@ -8661,7 +8661,63 @@ Updated xlarge policy:
 - treat `token-lm-corpus-xlarge` as an acceptance-to-`e4` stress benchmark unless
   the explicit goal is to study late-training degradation
 
+## April 15, 2026: targeted `ECHO` corpus-large sweep finds a small cheap acceptance win, but no variant clears the full `AdamW` replacement bar
+
+I then ran a focused `ECHO` sweep on `token-lm-corpus-large` after fixing the
+runner bugs in the initial draft:
+
+- `artifacts/echo_corpus_large_sweep_20260415-062526/`
+
+The sweep compared `AdamW` against a narrow `ECHO` candidate set varying only:
+
+- `scope`
+- `final_geometry_scale`
+- small `predictive_scale`
+
+Acceptance ranking:
+
+- `ECHO late-head-large / g=1.0 -> 1.0 / decay=0 / pred=0.00`:
+  `6.29213`, `81.4k tok/s`
+- `ECHO late-head / g=1.0 -> 1.0 / decay=0 / pred=0.00`:
+  `6.29821`, `81.1k tok/s`
+- `ECHO late-head / g=1.0 -> 0.25 / decay=96 / pred=0.00`:
+  `6.30122`, `81.5k tok/s`
+- `AdamW`: `6.30491`, `82.1k tok/s`
+
+Epoch-4 ranking:
+
+- `AdamW`: `6.50903`, `81.5k tok/s`
+- `ECHO late-head-large / g=1.0 -> 1.0 / decay=0 / pred=0.00`:
+  `6.54059`, `80.5k tok/s`
+- `ECHO late-head / g=1.0 -> 1.0 / decay=0 / pred=0.02`:
+  `6.54067`, `80.1k tok/s`
+
+Read:
+
+- this is a real, meaningful `ECHO` result
+  - the best branch beats `AdamW` on corpus-large acceptance by about `0.0128`
+    NLL
+  - it does so at almost the same throughput, only about `0.9%` slower on tok/s
+- but it is still not a full promotion candidate
+  - no `ECHO` branch beat `AdamW` on both acceptance and `e4`
+  - `AdamW` remains clearly better on the more important late-horizon corpus-large
+    readout
+- the best `ECHO` branch is simpler than the earlier hypothesis suggested
+  - `scope = late-head-large`
+  - `geometry start/final = 1.0 / 1.0`
+  - `decay = 0`
+  - `predictive = 0.00`
+- small predictive terms are not the main story here
+  - `pred=0.02` gave one near-tied `e4` row
+  - but it did not produce the best overall branch
+- the immediate `ECHO` conclusion is therefore narrow
+  - keep `late-head-large / 1.0 / 1.0 / decay 0 / pred 0.00` as the current
+    best corpus-large `ECHO` setting
+  - do not promote `ECHO` over `AdamW` as the corpus-large default
+  - do not spend more time on broad scalar `ECHO` grids without a new structural
+    hypothesis
+
 ---
-*Document version: 1.42*
+*Document version: 1.43*
 *Framework: ATLAS (Adaptive Temporally-Predictive Learning in Active Subspaces)*
-*Date: 2026-04-14*
+*Date: 2026-04-15*
