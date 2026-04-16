@@ -29,6 +29,8 @@
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/rng.h"
 
+#include <sys/time.h>
+
 #ifdef GLADES_HAVE_CUDA
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_vesta.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
@@ -602,6 +604,261 @@ void VESTATransformerIntegrationTest()
 	ASSERT("VESTA transformer: post-train test", net.test(&di).ok());
 
 	delete info;
+}
+
+// =================================================================
+// Sweep benchmark: VESTA vs AdamW vs ATLAS on a tiny token-LM.
+// =================================================================
+
+namespace {
+
+struct SweepResult
+{
+	float finalTrainNll;
+	float finalTrainPpl;
+	float finalTestNll;
+	float finalTestPpl;
+	double wallSec;
+	bool ok;
+	SweepResult() : finalTrainNll(0.0f), finalTrainPpl(0.0f),
+	                finalTestNll(0.0f), finalTestPpl(0.0f),
+	                wallSec(0.0), ok(false) {}
+};
+
+class MetricCapture : public glades::ITrainingCallbacks
+{
+public:
+	MetricCapture() : saw(false), last() {}
+	virtual void onRunStart(const glades::NNetwork&, int) {}
+	virtual bool onEpochEnd(const glades::NNetwork&, const glades::NNetworkEpochMetrics& m)
+	{
+		last = m;
+		saw = true;
+		return false;
+	}
+	virtual void onRunEnd(const glades::NNetwork&, int) {}
+	bool saw;
+	glades::NNetworkEpochMetrics last;
+};
+
+static double wall_ms()
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return static_cast<double>(tv.tv_sec) * 1000.0 + static_cast<double>(tv.tv_usec) / 1000.0;
+}
+
+static void build_token_corpus(std::vector<unsigned int>& toks, unsigned int vocab, unsigned int length, uint64_t seed)
+{
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, seed);
+	toks.clear();
+	toks.reserve(length);
+	// Structured pattern + noise — non-trivial to memorize but learnable.
+	for (unsigned int i = 0; i < length; ++i)
+	{
+		unsigned int t;
+		if ((i % 7u) == 0u)
+			t = glades::rng::uniform_uint(eng, 0u, vocab - 1u);
+		else
+			t = static_cast<unsigned int>((i * 3u + (i / 7u)) % vocab);
+		toks.push_back(t);
+	}
+}
+
+static SweepResult run_one(glades::OptimizerConfig::Type optType,
+                           unsigned int seed,
+                           unsigned int vocab,
+                           unsigned int dModel,
+                           unsigned int dFF,
+                           unsigned int nLayers,
+                           unsigned int nHeads,
+                           unsigned int epochs,
+                           unsigned int corpusLen,
+                           const char* label)
+{
+	SweepResult res;
+
+	std::vector<unsigned int> trainToks;
+	build_token_corpus(trainToks, vocab, corpusLen, 0x5EEDULL + seed);
+	std::vector<unsigned int> testToks;
+	build_token_corpus(testToks, vocab, corpusLen, 0x7357ULL + seed);
+
+	InMemoryTokenIdInput di;
+	di.setTrainTokens(trainToks, -1);
+	di.setTestTokens(testToks, -1);
+
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	for (unsigned int i = 0; i < nLayers; ++i)
+		hidden.push_back(new glades::HiddenLayerInfo(
+		    static_cast<int>(dModel), 0.001f, 0.0f, 0.0f, 0.0f, 0.0f,
+		    glades::GMath::LINEAR, 1.0f));
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	glades::NNInfo* info = new glades::NNInfo("vesta_sweep", in, hidden, out);
+
+	glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+	net.setSeed(seed);
+	net.getTerminatorMutable().setEpoch(static_cast<int>(epochs));
+	net.getTerminatorMutable().setAccuracy(0.0f);
+	{
+		glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+		cfg.transformer.enableTokenEmbedding = true;
+		cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+		cfg.transformer.tieEmbeddings = true;
+		cfg.transformer.nHeadsOverride = static_cast<int>(nHeads);
+		cfg.transformer.dFFOverride = static_cast<int>(dFF);
+		cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+		cfg.optimizer.type = optType;
+		cfg.optimizer.adamBeta1 = 0.9f;
+		cfg.optimizer.adamBeta2 = 0.999f;
+		cfg.optimizer.adamEps = 1e-8f;
+		cfg.optimizer.adamBiasCorrection = true;
+		cfg.atlas.rank = 4u;
+		cfg.vesta.rank = 4u;
+		cfg.vesta.tau = 0.1f;
+		cfg.vesta.rho = 0.1f;
+		cfg.vesta.tSk = 8u;
+		cfg.vesta.lambdaPerp = 0.2f;
+	}
+
+	MetricCapture trainCb;
+	const double t0 = wall_ms();
+	const glades::NNetworkStatus stTrain = net.train(&di, &trainCb);
+	const double t1 = wall_ms();
+	res.wallSec = (t1 - t0) / 1000.0;
+	if (!stTrain.ok() || !trainCb.saw)
+	{
+		printf("  [sweep:%s seed=%u] TRAIN FAILED: %s\n",
+		       label, seed, stTrain.message.c_str());
+		delete info;
+		return res;
+	}
+	res.finalTrainNll = trainCb.last.totalError;
+	res.finalTrainPpl = trainCb.last.perplexity;
+
+	MetricCapture testCb;
+	const glades::NNetworkStatus stTest = net.test(&di, &testCb);
+	if (!stTest.ok() || !testCb.saw)
+	{
+		printf("  [sweep:%s seed=%u] TEST FAILED\n", label, seed);
+		delete info;
+		return res;
+	}
+	res.finalTestNll = testCb.last.totalError;
+	res.finalTestPpl = testCb.last.perplexity;
+	res.ok = true;
+
+	delete info;
+	return res;
+}
+
+struct AggStats
+{
+	float mean;
+	float stddev;
+	AggStats() : mean(0.0f), stddev(0.0f) {}
+};
+
+static AggStats aggregate(const std::vector<float>& xs)
+{
+	AggStats a;
+	if (xs.empty()) return a;
+	float sum = 0.0f;
+	for (size_t i = 0; i < xs.size(); ++i) sum += xs[i];
+	a.mean = sum / static_cast<float>(xs.size());
+	float sq = 0.0f;
+	for (size_t i = 0; i < xs.size(); ++i) sq += (xs[i] - a.mean) * (xs[i] - a.mean);
+	a.stddev = (xs.size() > 1u) ? sqrtf(sq / static_cast<float>(xs.size() - 1u)) : 0.0f;
+	return a;
+}
+
+} // namespace
+
+void VESTASweepBenchmark()
+{
+	printf("\n============================================================\n");
+	printf("VESTA sweep: VESTA vs AdamW vs ATLAS on tiny token-LM\n");
+	printf("============================================================\n");
+
+	const unsigned int vocab = 29u;
+	const unsigned int dModel = 64u;
+	const unsigned int dFF = 128u;
+	const unsigned int nLayers = 3u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 30u;
+	const unsigned int corpusLen = 256u;
+	const unsigned int seeds[] = { 101u, 202u, 303u, 404u, 505u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	printf("Config: vocab=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u seq=%u seeds=%u\n",
+	       vocab, dModel, dFF, nLayers, nHeads, epochs, corpusLen, nSeeds);
+
+	struct OptSpec
+	{
+		glades::OptimizerConfig::Type type;
+		const char* label;
+	};
+	OptSpec specs[3];
+	specs[0].type = glades::OptimizerConfig::ADAMW; specs[0].label = "AdamW";
+	specs[1].type = glades::OptimizerConfig::ATLAS; specs[1].label = "ATLAS";
+	specs[2].type = glades::OptimizerConfig::VESTA; specs[2].label = "VESTA";
+
+	printf("\n%-8s  %-6s  %-10s  %-10s  %-10s  %-10s  %-8s\n",
+	       "opt", "seed", "trainNLL", "trainPPL", "testNLL", "testPPL", "wall(s)");
+	printf("%-8s  %-6s  %-10s  %-10s  %-10s  %-10s  %-8s\n",
+	       "---", "---", "----------", "----------", "----------", "----------", "-------");
+
+	std::vector<std::vector<float> > testNlls(3);
+	std::vector<std::vector<float> > testPpls(3);
+	std::vector<std::vector<float> > trainNlls(3);
+	std::vector<std::vector<float> > walls(3);
+	std::vector<unsigned int> okCounts(3, 0u);
+
+	for (unsigned int o = 0; o < 3u; ++o)
+	{
+		for (unsigned int s = 0; s < nSeeds; ++s)
+		{
+			const SweepResult r = run_one(specs[o].type, seeds[s],
+			                              vocab, dModel, dFF, nLayers, nHeads,
+			                              epochs, corpusLen, specs[o].label);
+			printf("%-8s  %-6u  %-10.4f  %-10.4f  %-10.4f  %-10.4f  %-8.2f%s\n",
+			       specs[o].label, seeds[s],
+			       r.finalTrainNll, r.finalTrainPpl,
+			       r.finalTestNll, r.finalTestPpl, r.wallSec,
+			       r.ok ? "" : "  [FAIL]");
+			if (r.ok)
+			{
+				testNlls[o].push_back(r.finalTestNll);
+				testPpls[o].push_back(r.finalTestPpl);
+				trainNlls[o].push_back(r.finalTrainNll);
+				walls[o].push_back(static_cast<float>(r.wallSec));
+				okCounts[o]++;
+			}
+		}
+	}
+
+	printf("\nSummary (mean +/- stddev across seeds):\n");
+	printf("%-8s  %-4s  %-18s  %-18s  %-18s  %-12s\n",
+	       "opt", "n", "trainNLL", "testNLL", "testPPL", "wall(s)");
+	printf("%-8s  %-4s  %-18s  %-18s  %-18s  %-12s\n",
+	       "---", "---", "------------------", "------------------",
+	       "------------------", "------------");
+	for (unsigned int o = 0; o < 3u; ++o)
+	{
+		const AggStats tNll = aggregate(trainNlls[o]);
+		const AggStats vNll = aggregate(testNlls[o]);
+		const AggStats vPpl = aggregate(testPpls[o]);
+		const AggStats wAgg = aggregate(walls[o]);
+		printf("%-8s  %-4u  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %5.2f +/- %-5.2f\n",
+		       specs[o].label, okCounts[o],
+		       tNll.mean, tNll.stddev,
+		       vNll.mean, vNll.stddev,
+		       vPpl.mean, vPpl.stddev,
+		       wAgg.mean, wAgg.stddev);
+	}
+	printf("\n");
 }
 
 void VESTAUnitTest()

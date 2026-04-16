@@ -199,6 +199,8 @@ int main(int argc, char* argv[])
 		ATLASAltBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "vesta") == 0)
 		VESTAUnitTest();
+	    else if (strcmp(argv[1], "vesta-sweep") == 0)
+		VESTASweepBenchmark();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)
