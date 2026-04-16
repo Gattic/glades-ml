@@ -20,6 +20,7 @@
 #include "Backend/Database/GString.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GPointer.h"
+#include "network.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,6 @@
 namespace glades {
 
 class NNInfo;
-class NNetwork;
 
 class MetaNetwork
 {
