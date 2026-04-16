@@ -2,20 +2,21 @@
 //
 // This file is NOT compiled by default in the normal unit-tests build.
 //
-// Build example (clang):
-//   clang++ -std=c++98 -O1 -g -fsanitize=fuzzer,address,undefined \
-//     -I. -I./include -I./Backend -I./services \
-//     unit-tests/Backend/Machine\ Learning/fuzz_transformer_infer.cpp \
-//     -lglades -lshmea -o fuzz_transformer_infer
+// Preferred build:
+//   cmake -S unit-tests -B unit-tests/build \
+//     -DGLADES_BUILD_TRANSFORMER_INFER_FUZZER=ON \
+//     -DCMAKE_CXX_COMPILER=clang++
+//   cmake --build unit-tests/build --target fuzz_transformer_infer
 //
-// Then run:
-//   ./fuzz_transformer_infer -runs=100000 corpus_dir/
+// Quick smoke run:
+//   cmake --build unit-tests/build --target fuzz_transformer_infer_smoke
 //
 // Notes:
 // - This harness avoids filesystem IO.
 // - It keeps maxSeqLen small to avoid large allocations.
 
 #include "../../../Backend/Machine Learning/Networks/network.h"
+#include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
 #include "../../../Backend/Machine Learning/Structure/hiddenlayerinfo.h"
@@ -143,6 +144,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 	glades::NNetwork::TransformerGenerateResult out;
 	(void)fx.net->transformerLmGenerate(prompt, cfg, out, NULL);
 
+	std::vector<glades::NNetwork::TransformerServeRequest> requests(1);
+	requests[0].promptTokens = prompt;
+	requests[0].cfg = cfg;
+	glades::NNetwork::TransformerServeBatchResult serveOut;
+	(void)fx.net->transformerLmServeGenerateBatch(requests, serveOut, NULL);
+
 	// KV session append.
 	glades::NNetwork::TransformerLmSession sess;
 	(void)fx.net->transformerLmSessionReset(sess, cfg.maxSeqLen);
@@ -152,6 +159,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 		(void)fx.net->transformerLmSessionAppend(sess, prompt[i], &step);
 	}
 
+	glades::NNetwork::TransformerServeBatcher batcher;
+	glades::NNetwork::TransformerServeBatcherConfig batcherCfg;
+	batcherCfg.maxBatchSize = 2u;
+	batcherCfg.maxSeqLen = cfg.maxSeqLen;
+	if (fx.net->transformerLmServeBatcherReset(batcher, batcherCfg).ok())
+	{
+		unsigned int slot = 0u;
+		if (fx.net->transformerLmServeBatcherSubmit(batcher, requests[0], slot).ok())
+		{
+			const unsigned int maxSteps = static_cast<unsigned int>(prompt.size()) + cfg.maxNewTokens + 2u;
+			for (unsigned int stepIdx = 0u; stepIdx < maxSteps; ++stepIdx)
+			{
+				const glades::NNetworkStatus st = fx.net->transformerLmServeBatcherStep(batcher, NULL);
+				if (!st.ok())
+					break;
+				if (batcher.slotDone(slot))
+					break;
+			}
+		}
+	}
+
 	return 0;
 }
-

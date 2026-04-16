@@ -15,6 +15,8 @@
 // DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "network.h"
+#include "transformer_config.h"
+#include "transformer_public_api.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
@@ -37,10 +39,14 @@
 #include <iomanip>
 #include <limits>
 #include <locale>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 
+#include "logfmt_utils.h"
+
 using namespace glades;
+using namespace glades::logfmt;
 
 // Force-link optional DataObjects translation units that otherwise may be discarded when building
 // libglades.so from static sub-libraries. These are public APIs used by production/CLI consumers.
@@ -60,6 +66,322 @@ struct GladesLinkAnchorsOnce
 	}
 };
 static GladesLinkAnchorsOnce g_glades_link_anchors_once;
+static shmea::GLogger g_default_network_logger(shmea::GLogger::LOG_INFO);
+
+bool atlas_transformer_needs_adam_moments(const glades::TrainingConfig& trainingConfig)
+{
+	return (trainingConfig.optimizer.type != glades::OptimizerConfig::ATLAS)
+	    || (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS
+	        && ((trainingConfig.atlas.auroraEnabled
+	             && trainingConfig.atlas.auroraAdamwBackbone)
+	            || trainingConfig.atlas.geodeEnabled
+	            || trainingConfig.atlas.echoEnabled
+	            || trainingConfig.atlas.bimapEnabled
+	            || trainingConfig.atlas.pactEnabled
+	            || trainingConfig.atlas.racerEnabled
+	            || trainingConfig.atlas.kronEnabled
+	            || trainingConfig.atlas.matraEnabled
+	            || trainingConfig.atlas.argosEnabled
+	            || trainingConfig.atlas.muonEnabled));
+}
+
+void ensure_transformer_moment_buffer(std::vector<float>& buffer, size_t wanted)
+{
+	if (buffer.size() != wanted)
+		buffer.assign(wanted, 0.0f);
+}
+
+#ifdef GLADES_HAVE_CUDA
+bool gpu_transformer_has_adam_moments(const glades::gpu::GpuTransformerWeights& gt)
+{
+	if (gt.tokenModel)
+	{
+		if (gt.vTokE.size() != gt.tokE.size() || gt.v2TokE.size() != gt.tokE.size())
+			return false;
+		if (gt.mLmBias.size() != gt.lmBias.size() || gt.v2LmBias.size() != gt.lmBias.size())
+			return false;
+	}
+	else
+	{
+		if (gt.vWIn.size() != gt.WIn.size() || gt.v2WIn.size() != gt.WIn.size())
+			return false;
+		if (gt.mBIn.size() != gt.bIn.size() || gt.v2BIn.size() != gt.bIn.size())
+			return false;
+		if (gt.vWOut.size() != gt.WOut.size() || gt.v2WOut.size() != gt.WOut.size())
+			return false;
+		if (gt.mBOut.size() != gt.bOut.size() || gt.v2BOut.size() != gt.bOut.size())
+			return false;
+	}
+	if (gt.mLnFinalGamma.size() != gt.lnFinalGamma.size() || gt.v2LnFinalGamma.size() != gt.lnFinalGamma.size())
+		return false;
+	if (gt.mLnFinalBeta.size() != gt.lnFinalBeta.size() || gt.v2LnFinalBeta.size() != gt.lnFinalBeta.size())
+		return false;
+	for (unsigned int li = 0u; li < gt.nLayers; ++li)
+	{
+		const glades::gpu::GpuTransformerWeights::Block& b = gt.blocks[li];
+		if (b.mLn1Gamma.size() != b.ln1Gamma.size() || b.v2Ln1Gamma.size() != b.ln1Gamma.size())
+			return false;
+		if (b.mLn1Beta.size() != b.ln1Beta.size() || b.v2Ln1Beta.size() != b.ln1Beta.size())
+			return false;
+		if (b.vWq.size() != b.Wq.size() || b.v2Wq.size() != b.Wq.size())
+			return false;
+		if (b.vWk.size() != b.Wk.size() || b.v2Wk.size() != b.Wk.size())
+			return false;
+		if (b.vWv.size() != b.Wv.size() || b.v2Wv.size() != b.Wv.size())
+			return false;
+		if (b.vWo.size() != b.Wo.size() || b.v2Wo.size() != b.Wo.size())
+			return false;
+		if (b.mBq.size() != b.bq.size() || b.v2Bq.size() != b.bq.size())
+			return false;
+		if (b.mBk.size() != b.bk.size() || b.v2Bk.size() != b.bk.size())
+			return false;
+		if (b.mBv.size() != b.bv.size() || b.v2Bv.size() != b.bv.size())
+			return false;
+		if (b.mBo.size() != b.bo.size() || b.v2Bo.size() != b.bo.size())
+			return false;
+		if (b.mLn2Gamma.size() != b.ln2Gamma.size() || b.v2Ln2Gamma.size() != b.ln2Gamma.size())
+			return false;
+		if (b.mLn2Beta.size() != b.ln2Beta.size() || b.v2Ln2Beta.size() != b.ln2Beta.size())
+			return false;
+		if (b.vW1.size() != b.W1.size() || b.v2W1.size() != b.W1.size())
+			return false;
+		if (b.vW2.size() != b.W2.size() || b.v2W2.size() != b.W2.size())
+			return false;
+		if (b.mB1.size() != b.b1.size() || b.v2B1.size() != b.b1.size())
+			return false;
+		if (b.mB2.size() != b.b2.size() || b.v2B2.size() != b.b2.size())
+			return false;
+	}
+	return true;
+}
+#endif
+
+struct AtlasRuntimeAccumulator
+{
+	unsigned int atlasMatrices;
+	unsigned int sparrowMatrices;
+	unsigned int sparrowMode2Matrices;
+	double sparrowActiveModesSum;
+	double sparrowEdgeSum;
+	double sparrowSecondEdgeSum;
+	double sparrowSecondEdgeRatioSum;
+	double sparrowMemoryGainSum;
+	double sparrowHorizontalRatioSum;
+	unsigned int helmMatrices;
+	unsigned int helmMode2Matrices;
+	double helmActiveModesSum;
+	double helmEdgeSum;
+	double helmSecondEdgeSum;
+	double helmSecondEdgeRatioSum;
+	double helmSigmaSum;
+	double helmPredR2Sum;
+	double helmMemoryGainSum;
+	double helmPoleSum;
+	unsigned int asterMatrices;
+	unsigned int asterMode2Matrices;
+	double asterActiveModesSum;
+	double asterEdgeSum;
+	double asterSecondEdgeSum;
+	double asterSecondEdgeRatioSum;
+	double asterSigmaSum;
+	double asterPredR2Sum;
+	double asterMemoryGainSum;
+	double asterPoleSum;
+	double asterBoundaryMsSum;
+	double asterSetupMsSum;
+	double asterTransportMsSum;
+	double asterTransferFitMsSum;
+	double asterStateFitMsSum;
+	double asterInnovationFitMsSum;
+	double asterApplyMsSum;
+	unsigned int aegisMatrices;
+	double aegisLambdaSpatialSum;
+	double aegisLambdaPredictiveSum;
+	double aegisLambdaOutputSum;
+	double aegisPredictivePredictedSum;
+	double aegisPredictiveRealizedSum;
+	double aegisOutputPredictedSum;
+	double aegisOutputRealizedSum;
+	double aegisPredictiveErrorSum;
+	double aegisOutputErrorSum;
+	double aegisChannelDisagreementSum;
+	unsigned int citadelMatrices;
+	double citadelAnchorSum;
+	double citadelHardRegimeMassSum;
+	double citadelSparrowTrustSum;
+	unsigned int rampartMatrices;
+	double rampartTauSum;
+	double rampartBudgetSum;
+	double rampartCovarianceSum;
+	double rampartSparrowTrustSum;
+	unsigned int meritMatrices;
+	double meritTauSum;
+	double meritBudgetSum;
+	double meritCovarianceSum;
+	double meritSparrowTrustSum;
+	double meritGeometryTrustSum;
+	unsigned int strataMatrices;
+	double strataNullModeSum;
+	double strataPredictiveModeSum;
+	double strataOutputModeSum;
+	double strataCoupledModeSum;
+	double strataBudgetSum;
+	double strataNullBenefitSum;
+	double strataPredictiveBenefitSum;
+	double strataOutputBenefitSum;
+	double strataCoupledBenefitSum;
+	double strataSelectedExcessSum;
+	double strataSwitchRateSum;
+	unsigned int transformerGapBatches;
+	double transformerInputUpdateNormSum;
+	std::vector<double> transformerBlockUpdateNormSum;
+	double transformerFinalNormUpdateNormSum;
+	double transformerHeadUpdateNormSum;
+	double transformerHeadShareSum;
+	double transformerNonHeadShareSum;
+	double transformerApplyMsSum;
+	unsigned int transformerMarginSnapshots;
+	double transformerTargetMarginSum;
+	double transformerHardNegativeLogitSum;
+
+	AtlasRuntimeAccumulator()
+	    : atlasMatrices(0u),
+	      sparrowMatrices(0u),
+	      sparrowMode2Matrices(0u),
+	      sparrowActiveModesSum(0.0),
+	      sparrowEdgeSum(0.0),
+	      sparrowSecondEdgeSum(0.0),
+	      sparrowSecondEdgeRatioSum(0.0),
+	      sparrowMemoryGainSum(0.0),
+	      sparrowHorizontalRatioSum(0.0),
+	      helmMatrices(0u),
+	      helmMode2Matrices(0u),
+	      helmActiveModesSum(0.0),
+	      helmEdgeSum(0.0),
+	      helmSecondEdgeSum(0.0),
+	      helmSecondEdgeRatioSum(0.0),
+	      helmSigmaSum(0.0),
+	      helmPredR2Sum(0.0),
+	      helmMemoryGainSum(0.0),
+	      helmPoleSum(0.0),
+	      asterMatrices(0u),
+	      asterMode2Matrices(0u),
+	      asterActiveModesSum(0.0),
+	      asterEdgeSum(0.0),
+	      asterSecondEdgeSum(0.0),
+	      asterSecondEdgeRatioSum(0.0),
+	      asterSigmaSum(0.0),
+	      asterPredR2Sum(0.0),
+	      asterMemoryGainSum(0.0),
+	      asterPoleSum(0.0),
+	      asterBoundaryMsSum(0.0),
+	      asterSetupMsSum(0.0),
+	      asterTransportMsSum(0.0),
+	      asterTransferFitMsSum(0.0),
+	      asterStateFitMsSum(0.0),
+	      asterInnovationFitMsSum(0.0),
+	      asterApplyMsSum(0.0),
+	      aegisMatrices(0u),
+	      aegisLambdaSpatialSum(0.0),
+	      aegisLambdaPredictiveSum(0.0),
+	      aegisLambdaOutputSum(0.0),
+	      aegisPredictivePredictedSum(0.0),
+	      aegisPredictiveRealizedSum(0.0),
+	      aegisOutputPredictedSum(0.0),
+	      aegisOutputRealizedSum(0.0),
+	      aegisPredictiveErrorSum(0.0),
+	      aegisOutputErrorSum(0.0),
+	      aegisChannelDisagreementSum(0.0),
+	      citadelMatrices(0u),
+	      citadelAnchorSum(0.0),
+	      citadelHardRegimeMassSum(0.0),
+	      citadelSparrowTrustSum(0.0),
+	      rampartMatrices(0u),
+	      rampartTauSum(0.0),
+	      rampartBudgetSum(0.0),
+	      rampartCovarianceSum(0.0),
+	      rampartSparrowTrustSum(0.0),
+	      meritMatrices(0u),
+	      meritTauSum(0.0),
+	      meritBudgetSum(0.0),
+	      meritCovarianceSum(0.0),
+	      meritSparrowTrustSum(0.0),
+	      meritGeometryTrustSum(0.0),
+	      strataMatrices(0u),
+	      strataNullModeSum(0.0),
+	      strataPredictiveModeSum(0.0),
+	      strataOutputModeSum(0.0),
+	      strataCoupledModeSum(0.0),
+	      strataBudgetSum(0.0),
+	      strataNullBenefitSum(0.0),
+	      strataPredictiveBenefitSum(0.0),
+	      strataOutputBenefitSum(0.0),
+	      strataCoupledBenefitSum(0.0),
+	      strataSelectedExcessSum(0.0),
+	      strataSwitchRateSum(0.0),
+	      transformerGapBatches(0u),
+	      transformerInputUpdateNormSum(0.0),
+	      transformerBlockUpdateNormSum(),
+	      transformerFinalNormUpdateNormSum(0.0),
+	      transformerHeadUpdateNormSum(0.0),
+	      transformerHeadShareSum(0.0),
+	      transformerNonHeadShareSum(0.0),
+	      transformerApplyMsSum(0.0),
+	      transformerMarginSnapshots(0u),
+	      transformerTargetMarginSum(0.0),
+	      transformerHardNegativeLogitSum(0.0)
+	{
+	}
+};
+
+static bool atlas_runtime_finite(float v)
+{
+	return (v == v)
+	    && (v != std::numeric_limits<float>::infinity())
+	    && (v != -std::numeric_limits<float>::infinity());
+}
+
+static double atlas_runtime_nonneg(float v)
+{
+	if (!atlas_runtime_finite(v))
+		return 0.0;
+	return std::max<double>(0.0, static_cast<double>(v));
+}
+
+static double atlas_runtime_value(float v, double fallback)
+{
+	if (!atlas_runtime_finite(v))
+		return fallback;
+	return static_cast<double>(v);
+}
+
+static void accumulate_atlas_runtime(AtlasRuntimeAccumulator& acc,
+                                     const glades::atlas::WeightState& st,
+                                     bool sparrowEnabled)
+{
+	if (!st.initialized)
+		return;
+
+	acc.atlasMatrices += 1u;
+	if (!sparrowEnabled)
+		return;
+
+	acc.sparrowMatrices += 1u;
+	acc.sparrowActiveModesSum += static_cast<double>(st.lastSparrowActiveModes);
+	if (st.lastSparrowActiveModes >= 2u)
+		acc.sparrowMode2Matrices += 1u;
+	acc.sparrowEdgeSum += atlas_runtime_nonneg(st.lastSparrowEdge);
+	acc.sparrowSecondEdgeSum += atlas_runtime_nonneg(st.lastSparrowSecondEdge);
+	acc.sparrowMemoryGainSum += atlas_runtime_nonneg(st.lastSparrowMemoryGain);
+	acc.sparrowHorizontalRatioSum += atlas_runtime_value(st.lastSparrowHorizontalRatio, 1.0);
+	if (atlas_runtime_finite(st.lastSparrowSigma) && st.lastSparrowSigma > 1e-12f
+	    && atlas_runtime_finite(st.lastSparrowSecondSigma) && st.lastSparrowSecondSigma > 0.0f)
+	{
+		acc.sparrowSecondEdgeRatioSum += static_cast<double>(st.lastSparrowSecondSigma)
+		                               / static_cast<double>(st.lastSparrowSigma);
+	}
+}
+
 } // namespace
 
 // for stopping ml  training instances
@@ -70,7 +392,7 @@ static GladesLinkAnchorsOnce g_glades_link_anchors_once;
  */
 glades::NNetwork::NNetwork(int newNetType)
 {
-	running = false;
+	storeRunningFlag(false);
 #if GLADES_HAVE_STD_ATOMICS
 	runLock.clear(std::memory_order_release);
 #else
@@ -82,8 +404,7 @@ glades::NNetwork::NNetwork(int newNetType)
 	serverInstance = NULL;
 	cConnection = NULL;
 	loggerOverride = NULL;
-	// Modern training loop defaults (preserve behavior)
-	trainingConfig = TrainingConfig();
+	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
 	lastGradNorm = 0.0f;
@@ -120,7 +441,7 @@ glades::NNetwork::NNetwork(int newNetType)
 glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 {
 	// Constructors must always fully initialize the object. Never early-return.
-	running = false;
+	storeRunningFlag(false);
 #if GLADES_HAVE_STD_ATOMICS
 	runLock.clear(std::memory_order_release);
 #else
@@ -132,8 +453,7 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	serverInstance = NULL;
 	cConnection = NULL;
 	loggerOverride = NULL;
-	// Modern training loop defaults (preserve behavior)
-	trainingConfig = TrainingConfig();
+	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
 	lastGradNorm = 0.0f;
@@ -191,6 +511,88 @@ bool glades::NNetwork::tryAcquireRunLock()
 	// Atomic compare-and-swap from 0 -> 1.
 	return __sync_bool_compare_and_swap(&runLock, 0, 1);
 #endif
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::generate(const glades::NNetwork& net,
+                                                              const std::vector<glades::TokenId>& promptTokens,
+                                                              const glades::TransformerGenerateConfig& cfg,
+                                                              glades::TransformerGenerateResult& out,
+                                                              glades::ITransformerGenerateCallbacks* cb)
+{
+	return TransformerPublicAPI::runtime(net).generate(promptTokens, cfg, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::generateBatch(const glades::NNetwork& net,
+                                                                   const std::vector<glades::TransformerServeRequest>& requests,
+                                                                   glades::TransformerServeBatchResult& out,
+                                                                   glades::ITransformerServeCallbacks* cb)
+{
+	return TransformerPublicAPI::runtime(net).generateBatch(requests, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::forwardLastLogits(const glades::NNetwork& net,
+                                                                       const std::vector<glades::TokenId>& tokenIds,
+                                                                       std::vector<float>& outLogits)
+{
+	return TransformerPublicAPI::runtime(net).forwardLastLogits(tokenIds, outLogits);
+}
+
+glades::TransformerPublicAPI::Runtime glades::TransformerPublicAPI::runtime(const glades::NNetwork& net)
+{
+	return Runtime(net);
+}
+
+glades::TransformerPublicAPI::ServingRuntime glades::TransformerPublicAPI::serving(const glades::NNetwork& net)
+{
+	return ServingRuntime(net);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::generate(const std::vector<glades::TokenId>& promptTokens,
+                                                                       const glades::TransformerGenerateConfig& cfg,
+                                                                       glades::TransformerGenerateResult& out,
+                                                                       glades::ITransformerGenerateCallbacks* cb) const
+{
+	return net.transformerLmGenerate(promptTokens, cfg, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::generateBatch(const std::vector<glades::TransformerServeRequest>& requests,
+                                                                            glades::TransformerServeBatchResult& out,
+                                                                            glades::ITransformerServeCallbacks* cb) const
+{
+	return net.transformerLmServeGenerateBatch(requests, out, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::Runtime::forwardLastLogits(const std::vector<glades::TokenId>& tokenIds,
+                                                                                std::vector<float>& outLogits) const
+{
+	return net.transformerLmForwardLastLogits(tokenIds, outLogits);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::resetBatcher(Batcher& batcher, const BatcherConfig& cfg) const
+{
+	return net.transformerLmServeBatcherReset(batcher, cfg);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::submit(Batcher& batcher,
+                                                                            const glades::TransformerServeRequest& request,
+                                                                            unsigned int& outSlot) const
+{
+	return net.transformerLmServeBatcherSubmit(batcher, request, outSlot);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::remove(Batcher& batcher, unsigned int slot) const
+{
+	return net.transformerLmServeBatcherRemove(batcher, slot);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::step(Batcher& batcher, glades::ITransformerServeCallbacks* cb) const
+{
+	return net.transformerLmServeBatcherStep(batcher, cb);
+}
+
+glades::NNetworkStatus glades::TransformerPublicAPI::ServingRuntime::cancelSlot(Batcher& batcher, unsigned int slot) const
+{
+	return net.transformerLmServeBatcherCancelSlot(batcher, slot);
 }
 
 void glades::NNetwork::releaseRunLock()
@@ -369,7 +771,7 @@ int64_t NNetwork::getCurrentTimeMilliseconds() const
 
 bool glades::NNetwork::getRunning() const
 {
-	return running;
+	return loadRunningFlag();
 }
 
 int glades::NNetwork::getEpochs() const
@@ -379,13 +781,45 @@ int glades::NNetwork::getEpochs() const
 
 void glades::NNetwork::stop()
 {
-	running = false;
+	storeRunningFlag(false);
+}
+
+bool glades::NNetwork::loadRunningFlag() const
+{
+	return (__atomic_load_n(&running, __ATOMIC_SEQ_CST) != 0);
+}
+
+void glades::NNetwork::storeRunningFlag(bool value)
+{
+	__atomic_store_n(&running, value ? 1 : 0, __ATOMIC_SEQ_CST);
+}
+
+uint64_t glades::NNetwork::loadConfiguredSeed() const
+{
+	return __atomic_load_n(&rngSeed, __ATOMIC_SEQ_CST);
+}
+
+void glades::NNetwork::storeConfiguredSeed(uint64_t seed)
+{
+	__atomic_store_n(&rngSeed, seed, __ATOMIC_SEQ_CST);
+}
+
+shmea::GLogger* glades::NNetwork::loadLoggerOverride() const
+{
+	return __atomic_load_n(&loggerOverride, __ATOMIC_SEQ_CST);
+}
+
+void glades::NNetwork::storeLoggerOverride(shmea::GLogger* logger)
+{
+	__atomic_store_n(&loggerOverride, logger, __ATOMIC_SEQ_CST);
 }
 
 void glades::NNetwork::setSeed(uint64_t seed)
 {
-	rngSeed = seed;
-	glades::rng::seed_engine(rngEngine, seed);
+	storeConfiguredSeed(seed);
+	RunLockGuard runGuard(*this);
+	if (runGuard.ok())
+		glades::rng::seed_engine(rngEngine, seed);
 }
 
 glades::NNetworkStatus glades::NNetwork::train(const DataInput* newDataInput)
@@ -454,6 +888,20 @@ static const char* run_type_name(int runType)
 	}
 }
 
+static const char* status_code_name(glades::NNetworkStatus::Code code)
+{
+	switch (code)
+	{
+	case glades::NNetworkStatus::OK: return "OK";
+	case glades::NNetworkStatus::INVALID_ARGUMENT: return "INVALID_ARGUMENT";
+	case glades::NNetworkStatus::INVALID_STATE: return "INVALID_STATE";
+	case glades::NNetworkStatus::EMPTY_DATA: return "EMPTY_DATA";
+	case glades::NNetworkStatus::BUILD_FAILED: return "BUILD_FAILED";
+	case glades::NNetworkStatus::INTERNAL_ERROR: return "INTERNAL_ERROR";
+	default: return "UNKNOWN";
+	}
+}
+
 static const char* output_type_name(int outType)
 {
 	switch (outType)
@@ -464,46 +912,6 @@ static const char* output_type_name(int outType)
 	default: return "unknown";
 	}
 }
-
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
-{
-	oss << ' ' << k << '=';
-	bool needQuote = false;
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
-		{
-			needQuote = true;
-			break;
-		}
-	}
-	if (!needQuote)
-	{
-		oss << v;
-		return;
-	}
-	oss << '"';
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == '\\' || c == '"')
-			oss << '\\' << c;
-		else if (c == '\n')
-			oss << "\\n";
-		else if (c == '\r')
-			oss << "\\r";
-		else if (c == '\t')
-			oss << "\\t";
-		else
-			oss << c;
-	}
-	oss << '"';
-}
-
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, int v) { oss << ' ' << k << '=' << v; }
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned long long v) { oss << ' ' << k << '=' << v; }
-static void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { oss << ' ' << k << '=' << v; }
 
 class LoggerCallbacks : public glades::ITrainingCallbacks
 {
@@ -609,6 +1017,70 @@ private:
 	glades::NNetworkEpochMetrics last;
 	int64_t lastEpochLogTime;
 };
+
+static bool emit_trainer_preflight_failure_log(const glades::NNetwork& net,
+                                               int runType,
+                                               const glades::NNetworkStatus& st)
+{
+	glades::NNetwork::TrainerRunDiagnostics diag;
+	if (!net.getTrainerRunDiagnostics(diag))
+		return false;
+	if (!diag.lastFailureDuringPreflight)
+		return false;
+	if (diag.lastRunType != runType)
+		return false;
+	if (diag.lastFailureStatus.code != st.code || diag.lastFailureStatus.message != st.message)
+		return false;
+
+	shmea::GLogger* logger = net.getLogger();
+	if (!logger)
+		return false;
+
+	std::ostringstream oss;
+	oss << "event=nn_run_preflight_fail";
+	append_logfmt_kv(oss, "run_type", std::string(run_type_name(runType)));
+	append_logfmt_kv(oss, "net_type", net.getNetType());
+	append_logfmt_kv(oss, "stage", diag.lastFailureStage);
+	append_logfmt_kv(oss, "run_attempts", static_cast<unsigned long long>(diag.totalRunAttempts));
+	append_logfmt_kv(oss, "run_failures", static_cast<unsigned long long>(diag.totalRunFailures));
+	append_logfmt_kv(oss, "preflight_failures", static_cast<unsigned long long>(diag.totalPreflightFailures));
+	append_logfmt_kv(oss, "post_build_check", diag.lastFailurePostBuildCheck);
+	append_logfmt_kv(oss, "data_size", diag.lastDataSize);
+	append_logfmt_kv(oss, "feature_count", diag.lastFeatureCount);
+	append_logfmt_kv(oss, "output_size", diag.lastOutputSize);
+	append_logfmt_kv(oss, "expected_feature_count", diag.lastExpectedFeatureCount);
+	append_logfmt_kv(oss, "expected_output_size", diag.lastExpectedOutputSize);
+	append_logfmt_kv(oss, "token_lm", diag.lastTokenLM);
+	append_logfmt_kv(oss, "token_lm_input", diag.lastTokenLMInput);
+	append_logfmt_kv(oss, "sequence_model", diag.lastSequenceModel);
+	append_logfmt_kv(oss, "status_code", std::string(status_code_name(st.code)));
+	append_logfmt_kv(oss, "status_ok", st.ok());
+	if (!st.message.empty())
+		append_logfmt_kv(oss, "error", st.message);
+	if (!diag.lastDataInputStatus.ok())
+	{
+		append_logfmt_kv(oss, "data_status_code", std::string(status_code_name(diag.lastDataInputStatus.code)));
+		if (!diag.lastDataInputStatus.message.empty())
+			append_logfmt_kv(oss, "data_error", diag.lastDataInputStatus.message);
+	}
+
+	const glades::NNInfo* sk = net.getNNInfo();
+	if (sk)
+	{
+		append_logfmt_kv(oss, "name", std::string(sk->getName().c_str()));
+		append_logfmt_kv(oss, "output_type", std::string(output_type_name(sk->getOutputType())));
+		append_logfmt_kv(oss, "hidden_layers", sk->numHiddenLayers());
+	}
+
+	const bool hardFailure =
+	    (st.code == glades::NNetworkStatus::INTERNAL_ERROR) ||
+	    (diag.lastFailureStage == "initialize_tensors");
+	if (hardFailure)
+		logger->error("NNetwork", shmea::GString(oss.str().c_str()));
+	else
+		logger->warning("NNetwork", shmea::GString(oss.str().c_str()));
+	return true;
+}
 
 class GuiCallbacks : public glades::ITrainingCallbacks
 {
@@ -799,9 +1271,12 @@ glades::NNetworkStatus glades::NNetwork::run(const DataInput* newDataInput, int 
 		const glades::NNetworkStatus st = glades::Trainer::run(*this, newDataInput, runType, callbacks);
 		if (!st.ok())
 		{
-			shmea::GLogger* logger = getLogger();
-			if (logger)
-				logger->error("NNetwork", st.message.c_str());
+			if (!emit_trainer_preflight_failure_log(*this, runType, st))
+			{
+				shmea::GLogger* logger = getLogger();
+				if (logger)
+					logger->error("NNetwork", st.message.c_str());
+			}
 		}
 		return st;
 	}
@@ -813,9 +1288,12 @@ glades::NNetworkStatus glades::NNetwork::run(const DataInput* newDataInput, int 
 		const glades::NNetworkStatus st = glades::Trainer::run(*this, newDataInput, runType, static_cast<glades::ITrainingCallbacks*>(&defaultCb));
 		if (!st.ok())
 		{
-			shmea::GLogger* logger = getLogger();
-			if (logger)
-				logger->error("NNetwork", st.message.c_str());
+			if (!emit_trainer_preflight_failure_log(*this, runType, st))
+			{
+				shmea::GLogger* logger = getLogger();
+				if (logger)
+					logger->error("NNetwork", st.message.c_str());
+			}
 		}
 		return st;
 	}
@@ -824,7 +1302,7 @@ glades::NNetworkStatus glades::NNetwork::run(const DataInput* newDataInput, int 
 glades::NNetworkStatus glades::NNetwork::failStatus(glades::NNetworkStatus::Code code, const std::string& message)
 {
 	lastStatus = glades::NNetworkStatus(code, message);
-	running = false;
+	storeRunningFlag(false);
 	return lastStatus;
 }
 
@@ -935,6 +1413,609 @@ const shmea::GList& glades::NNetwork::getNodeActivations() const
 	return cNodeActivations;
 }
 
+bool glades::NNetwork::getTrainerRunDiagnostics(TrainerRunDiagnostics& out) const
+{
+	out = trainerRunDiagnostics;
+	return true;
+}
+
+bool glades::NNetwork::getPersistenceDiagnostics(PersistenceDiagnostics& out) const
+{
+	out = persistenceDiagnostics;
+	return true;
+}
+
+bool glades::NNetwork::getAtlasRuntimeDiagnostics(AtlasRuntimeDiagnostics& out) const
+{
+	AtlasRuntimeAccumulator acc;
+	const bool sparrowEnabled =
+	    (trainingConfig.optimizer.type == OptimizerConfig::ATLAS) && trainingConfig.atlas.sparrowEnabled;
+	const bool helmEnabled =
+	    (trainingConfig.optimizer.type == OptimizerConfig::ATLAS) && trainingConfig.atlas.helmEnabled;
+	const bool asterEnabled =
+	    (trainingConfig.optimizer.type == OptimizerConfig::ATLAS) && trainingConfig.atlas.asterEnabled;
+
+	if (tensorDff.initialized)
+	{
+		for (size_t i = 0; i < tensorDff.atlasState.size(); ++i)
+			accumulate_atlas_runtime(acc, tensorDff.atlasState[i], sparrowEnabled);
+		if (helmEnabled && tensorDff.helm.initialized)
+		{
+			acc.helmMatrices += 1u;
+			acc.helmActiveModesSum += static_cast<double>(tensorDff.helm.lastActiveModes);
+			if (tensorDff.helm.lastActiveModes >= 2u)
+				acc.helmMode2Matrices += 1u;
+			acc.helmEdgeSum += atlas_runtime_nonneg(tensorDff.helm.lastEdge);
+			acc.helmSecondEdgeSum += atlas_runtime_nonneg(tensorDff.helm.lastSecondEdge);
+			acc.helmSecondEdgeRatioSum += atlas_runtime_nonneg(tensorDff.helm.lastSecondEdgeRatio);
+			acc.helmSigmaSum += atlas_runtime_nonneg(tensorDff.helm.lastSigma);
+			acc.helmPredR2Sum += atlas_runtime_value(tensorDff.helm.lastPredR2, 0.0);
+			acc.helmMemoryGainSum += atlas_runtime_nonneg(tensorDff.helm.lastMemoryGain);
+			acc.helmPoleSum += tensorDff.helm.pole.empty()
+			                   ? 0.0
+			                   : atlas_runtime_value(tensorDff.helm.pole[0], 0.0);
+		}
+		if (asterEnabled && tensorDff.aster.initialized)
+		{
+			acc.asterMatrices += 1u;
+			acc.asterActiveModesSum += static_cast<double>(tensorDff.aster.lastActiveModes);
+			if (tensorDff.aster.lastActiveModes >= 2u)
+				acc.asterMode2Matrices += 1u;
+			acc.asterEdgeSum += atlas_runtime_nonneg(tensorDff.aster.lastEdge);
+			acc.asterSecondEdgeSum += atlas_runtime_nonneg(tensorDff.aster.lastSecondEdge);
+			acc.asterSecondEdgeRatioSum += atlas_runtime_nonneg(tensorDff.aster.lastSecondEdgeRatio);
+			acc.asterSigmaSum += atlas_runtime_nonneg(tensorDff.aster.lastSigma);
+			acc.asterPredR2Sum += atlas_runtime_value(tensorDff.aster.lastPredR2, 0.0);
+			acc.asterMemoryGainSum += atlas_runtime_nonneg(tensorDff.aster.lastMemoryGain);
+			acc.asterPoleSum += tensorDff.aster.pole.empty()
+			                    ? 0.0
+			                    : atlas_runtime_value(tensorDff.aster.pole[0], 0.0);
+			if (tensorDff.aster.timingBoundaryCount > 0ULL)
+			{
+				const double invCount =
+				    1.0 / static_cast<double>(tensorDff.aster.timingBoundaryCount);
+				const double nsToMs = 1.0e-6;
+				acc.asterBoundaryMsSum += tensorDff.aster.totalBoundaryNs * invCount * nsToMs;
+				acc.asterSetupMsSum += tensorDff.aster.totalSetupNs * invCount * nsToMs;
+				acc.asterTransportMsSum += tensorDff.aster.totalTransportNs * invCount * nsToMs;
+				acc.asterTransferFitMsSum += tensorDff.aster.totalTransferFitNs * invCount * nsToMs;
+				acc.asterStateFitMsSum += tensorDff.aster.totalStateFitNs * invCount * nsToMs;
+				acc.asterInnovationFitMsSum += tensorDff.aster.totalInnovationFitNs * invCount * nsToMs;
+				acc.asterApplyMsSum += tensorDff.aster.totalApplyNs * invCount * nsToMs;
+			}
+			if (trainingConfig.atlas.aegisEnabled)
+			{
+				acc.aegisMatrices += 1u;
+				acc.aegisLambdaSpatialSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastLambdaSpatial);
+				acc.aegisLambdaPredictiveSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastLambdaPredictive);
+				acc.aegisLambdaOutputSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastLambdaOutput);
+				acc.aegisPredictivePredictedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastPredictivePredicted);
+				acc.aegisPredictiveRealizedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastPredictiveRealized);
+				acc.aegisOutputPredictedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastOutputPredicted);
+				acc.aegisOutputRealizedSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastOutputRealized);
+				acc.aegisPredictiveErrorSum += atlas_runtime_nonneg(tensorDff.aster.aegisPredictiveErrorEma);
+				acc.aegisOutputErrorSum += atlas_runtime_nonneg(tensorDff.aster.aegisOutputErrorEma);
+				acc.aegisChannelDisagreementSum += atlas_runtime_nonneg(tensorDff.aster.aegisLastChannelDisagreement);
+			}
+			if (trainingConfig.atlas.citadelEnabled)
+			{
+				acc.citadelMatrices += 1u;
+				acc.citadelAnchorSum += atlas_runtime_nonneg(tensorDff.aster.citadelLastAnchor);
+				acc.citadelHardRegimeMassSum += atlas_runtime_nonneg(tensorDff.aster.citadelLastHardRegimeMass);
+				acc.citadelSparrowTrustSum += atlas_runtime_nonneg(tensorDff.aster.citadelLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.rampartEnabled)
+			{
+				acc.rampartMatrices += 1u;
+				acc.rampartTauSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastTau);
+				acc.rampartBudgetSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastBudget);
+				acc.rampartCovarianceSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastCovariance);
+				acc.rampartSparrowTrustSum += atlas_runtime_nonneg(tensorDff.aster.rampartLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.meritEnabled)
+			{
+				acc.meritMatrices += 1u;
+				acc.meritTauSum += atlas_runtime_nonneg(tensorDff.aster.meritLastTau);
+				acc.meritBudgetSum += atlas_runtime_nonneg(tensorDff.aster.meritLastBudget);
+				acc.meritCovarianceSum += atlas_runtime_nonneg(tensorDff.aster.meritLastCovariance);
+				acc.meritSparrowTrustSum += atlas_runtime_nonneg(tensorDff.aster.meritLastSparrowTrust);
+				acc.meritGeometryTrustSum += atlas_runtime_nonneg(tensorDff.aster.meritLastGeometryTrust);
+			}
+			if (trainingConfig.atlas.strataEnabled)
+			{
+				acc.strataMatrices += 1u;
+				acc.strataNullModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastNullMode);
+				acc.strataPredictiveModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastPredictiveMode);
+				acc.strataOutputModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastOutputMode);
+				acc.strataCoupledModeSum += atlas_runtime_nonneg(tensorDff.aster.strataLastCoupledMode);
+				acc.strataBudgetSum += atlas_runtime_nonneg(tensorDff.aster.strataLastBudget);
+				acc.strataNullBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastNullBenefit, 0.0);
+				acc.strataPredictiveBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastPredictiveBenefit, 0.0);
+				acc.strataOutputBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastOutputBenefit, 0.0);
+				acc.strataCoupledBenefitSum += atlas_runtime_value(tensorDff.aster.strataLastCoupledBenefit, 0.0);
+				acc.strataSelectedExcessSum += atlas_runtime_value(tensorDff.aster.strataLastSelectedExcess, 0.0);
+				acc.strataSwitchRateSum += atlas_runtime_nonneg(tensorDff.aster.strataLastSwitchRate);
+			}
+		}
+	}
+	if (tensorRnn.initialized)
+	{
+		for (size_t i = 0; i < tensorRnn.H.size(); ++i)
+		{
+			accumulate_atlas_runtime(acc, tensorRnn.H[i].atlasWxh, sparrowEnabled);
+			accumulate_atlas_runtime(acc, tensorRnn.H[i].atlasWhh, sparrowEnabled);
+		}
+		accumulate_atlas_runtime(acc, tensorRnn.O.atlasWhy, sparrowEnabled);
+	}
+	if (tensorGru.initialized)
+	{
+		for (size_t i = 0; i < tensorGru.H.size(); ++i)
+		{
+			accumulate_atlas_runtime(acc, tensorGru.H[i].atlasW, sparrowEnabled);
+			accumulate_atlas_runtime(acc, tensorGru.H[i].atlasU, sparrowEnabled);
+		}
+		accumulate_atlas_runtime(acc, tensorGru.O.atlasWhy, sparrowEnabled);
+	}
+	if (tensorLstm.initialized)
+	{
+		for (size_t i = 0; i < tensorLstm.H.size(); ++i)
+		{
+			accumulate_atlas_runtime(acc, tensorLstm.H[i].atlasW, sparrowEnabled);
+			accumulate_atlas_runtime(acc, tensorLstm.H[i].atlasU, sparrowEnabled);
+		}
+		accumulate_atlas_runtime(acc, tensorLstm.O.atlasWhy, sparrowEnabled);
+	}
+	if (tensorCnn.initialized)
+	{
+		for (size_t i = 0; i < tensorCnn.convLayers.size(); ++i)
+			accumulate_atlas_runtime(acc, tensorCnn.convLayers[i].atlasW, sparrowEnabled);
+		for (size_t i = 0; i < tensorCnn.fcLayers.size(); ++i)
+			accumulate_atlas_runtime(acc, tensorCnn.fcLayers[i].atlasW, sparrowEnabled);
+	}
+	if (tensorTransformer.initialized)
+	{
+		accumulate_atlas_runtime(acc, tensorTransformer.atlasTokE, sparrowEnabled);
+		accumulate_atlas_runtime(acc, tensorTransformer.atlasWIn, sparrowEnabled);
+		for (size_t i = 0; i < tensorTransformer.blocks.size(); ++i)
+		{
+			const TensorTransformerState::Block& b = tensorTransformer.blocks[i];
+			accumulate_atlas_runtime(acc, b.atlasWq, sparrowEnabled);
+			accumulate_atlas_runtime(acc, b.atlasWk, sparrowEnabled);
+			accumulate_atlas_runtime(acc, b.atlasWv, sparrowEnabled);
+			accumulate_atlas_runtime(acc, b.atlasWo, sparrowEnabled);
+			accumulate_atlas_runtime(acc, b.atlasW1, sparrowEnabled);
+			accumulate_atlas_runtime(acc, b.atlasW2, sparrowEnabled);
+		}
+		accumulate_atlas_runtime(acc, tensorTransformer.atlasWOut, sparrowEnabled);
+		if (tensorTransformer.gapApplyCount > 0ULL)
+		{
+			const double denom = static_cast<double>(tensorTransformer.gapApplyCount);
+			acc.transformerGapBatches += 1u;
+			acc.transformerInputUpdateNormSum += tensorTransformer.gapInputUpdateNormSum / denom;
+			if (acc.transformerBlockUpdateNormSum.size() < tensorTransformer.gapBlockUpdateNormSums.size())
+				acc.transformerBlockUpdateNormSum.resize(tensorTransformer.gapBlockUpdateNormSums.size(), 0.0);
+			for (size_t i = 0; i < tensorTransformer.gapBlockUpdateNormSums.size(); ++i)
+				acc.transformerBlockUpdateNormSum[i] += tensorTransformer.gapBlockUpdateNormSums[i] / denom;
+			acc.transformerFinalNormUpdateNormSum += tensorTransformer.gapFinalNormUpdateNormSum / denom;
+			acc.transformerHeadUpdateNormSum += tensorTransformer.gapHeadUpdateNormSum / denom;
+			acc.transformerHeadShareSum += tensorTransformer.gapHeadShareSum / denom;
+			acc.transformerNonHeadShareSum += tensorTransformer.gapNonHeadShareSum / denom;
+			acc.transformerApplyMsSum += (tensorTransformer.gapApplyNsSum / denom) * 1.0e-6;
+		}
+		if (tensorTransformer.gapMarginSnapshotCount > 0ULL)
+		{
+			const double denom = static_cast<double>(tensorTransformer.gapMarginSnapshotCount);
+			acc.transformerMarginSnapshots += 1u;
+			acc.transformerTargetMarginSum += tensorTransformer.gapTargetMarginSum / denom;
+			acc.transformerHardNegativeLogitSum += tensorTransformer.gapHardNegativeLogitSum / denom;
+		}
+		if (helmEnabled && tensorTransformer.helm.initialized)
+		{
+			acc.helmMatrices += 1u;
+			acc.helmActiveModesSum += static_cast<double>(tensorTransformer.helm.lastActiveModes);
+			if (tensorTransformer.helm.lastActiveModes >= 2u)
+				acc.helmMode2Matrices += 1u;
+			acc.helmEdgeSum += atlas_runtime_nonneg(tensorTransformer.helm.lastEdge);
+			acc.helmSecondEdgeSum += atlas_runtime_nonneg(tensorTransformer.helm.lastSecondEdge);
+			acc.helmSecondEdgeRatioSum += atlas_runtime_nonneg(tensorTransformer.helm.lastSecondEdgeRatio);
+			acc.helmSigmaSum += atlas_runtime_nonneg(tensorTransformer.helm.lastSigma);
+			acc.helmPredR2Sum += atlas_runtime_value(tensorTransformer.helm.lastPredR2, 0.0);
+			acc.helmMemoryGainSum += atlas_runtime_nonneg(tensorTransformer.helm.lastMemoryGain);
+			acc.helmPoleSum += tensorTransformer.helm.pole.empty()
+			                   ? 0.0
+			                   : atlas_runtime_value(tensorTransformer.helm.pole[0], 0.0);
+		}
+		if (asterEnabled && tensorTransformer.aster.initialized)
+		{
+			acc.asterMatrices += 1u;
+			acc.asterActiveModesSum += static_cast<double>(tensorTransformer.aster.lastActiveModes);
+			if (tensorTransformer.aster.lastActiveModes >= 2u)
+				acc.asterMode2Matrices += 1u;
+			acc.asterEdgeSum += atlas_runtime_nonneg(tensorTransformer.aster.lastEdge);
+			acc.asterSecondEdgeSum += atlas_runtime_nonneg(tensorTransformer.aster.lastSecondEdge);
+			acc.asterSecondEdgeRatioSum += atlas_runtime_nonneg(tensorTransformer.aster.lastSecondEdgeRatio);
+			acc.asterSigmaSum += atlas_runtime_nonneg(tensorTransformer.aster.lastSigma);
+			acc.asterPredR2Sum += atlas_runtime_value(tensorTransformer.aster.lastPredR2, 0.0);
+			acc.asterMemoryGainSum += atlas_runtime_nonneg(tensorTransformer.aster.lastMemoryGain);
+			acc.asterPoleSum += atlas_runtime_value(tensorTransformer.aster.lastPoleSummary, 0.0);
+			if (tensorTransformer.aster.timingBoundaryCount > 0ULL)
+			{
+				const double nsToMs = 1.0 / 1000000.0;
+				const double invCount =
+				    1.0 / static_cast<double>(tensorTransformer.aster.timingBoundaryCount);
+				acc.asterBoundaryMsSum += tensorTransformer.aster.totalBoundaryNs * invCount * nsToMs;
+				acc.asterSetupMsSum += tensorTransformer.aster.totalSetupNs * invCount * nsToMs;
+				acc.asterTransportMsSum += tensorTransformer.aster.totalTransportNs * invCount * nsToMs;
+				acc.asterTransferFitMsSum += tensorTransformer.aster.totalTransferFitNs * invCount * nsToMs;
+				acc.asterStateFitMsSum += tensorTransformer.aster.totalStateFitNs * invCount * nsToMs;
+				acc.asterInnovationFitMsSum += tensorTransformer.aster.totalInnovationFitNs * invCount * nsToMs;
+				acc.asterApplyMsSum += tensorTransformer.aster.totalApplyNs * invCount * nsToMs;
+			}
+			if (trainingConfig.atlas.aegisEnabled)
+			{
+				acc.aegisMatrices += 1u;
+				acc.aegisLambdaSpatialSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastLambdaSpatial);
+				acc.aegisLambdaPredictiveSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastLambdaPredictive);
+				acc.aegisLambdaOutputSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastLambdaOutput);
+				acc.aegisPredictivePredictedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastPredictivePredicted);
+				acc.aegisPredictiveRealizedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastPredictiveRealized);
+				acc.aegisOutputPredictedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastOutputPredicted);
+				acc.aegisOutputRealizedSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastOutputRealized);
+				acc.aegisPredictiveErrorSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisPredictiveErrorEma);
+				acc.aegisOutputErrorSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisOutputErrorEma);
+				acc.aegisChannelDisagreementSum += atlas_runtime_nonneg(tensorTransformer.aster.aegisLastChannelDisagreement);
+			}
+			if (trainingConfig.atlas.citadelEnabled)
+			{
+				acc.citadelMatrices += 1u;
+				acc.citadelAnchorSum += atlas_runtime_nonneg(tensorTransformer.aster.citadelLastAnchor);
+				acc.citadelHardRegimeMassSum += atlas_runtime_nonneg(tensorTransformer.aster.citadelLastHardRegimeMass);
+				acc.citadelSparrowTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.citadelLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.rampartEnabled)
+			{
+				acc.rampartMatrices += 1u;
+				acc.rampartTauSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastTau);
+				acc.rampartBudgetSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastBudget);
+				acc.rampartCovarianceSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastCovariance);
+				acc.rampartSparrowTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.rampartLastSparrowTrust);
+			}
+			if (trainingConfig.atlas.meritEnabled)
+			{
+				acc.meritMatrices += 1u;
+				acc.meritTauSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastTau);
+				acc.meritBudgetSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastBudget);
+				acc.meritCovarianceSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastCovariance);
+				acc.meritSparrowTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastSparrowTrust);
+				acc.meritGeometryTrustSum += atlas_runtime_nonneg(tensorTransformer.aster.meritLastGeometryTrust);
+			}
+			if (trainingConfig.atlas.strataEnabled)
+			{
+				acc.strataMatrices += 1u;
+				acc.strataNullModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastNullMode);
+				acc.strataPredictiveModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastPredictiveMode);
+				acc.strataOutputModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastOutputMode);
+				acc.strataCoupledModeSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastCoupledMode);
+				acc.strataBudgetSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastBudget);
+				acc.strataNullBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastNullBenefit, 0.0);
+				acc.strataPredictiveBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastPredictiveBenefit, 0.0);
+				acc.strataOutputBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastOutputBenefit, 0.0);
+				acc.strataCoupledBenefitSum += atlas_runtime_value(tensorTransformer.aster.strataLastCoupledBenefit, 0.0);
+				acc.strataSelectedExcessSum += atlas_runtime_value(tensorTransformer.aster.strataLastSelectedExcess, 0.0);
+				acc.strataSwitchRateSum += atlas_runtime_nonneg(tensorTransformer.aster.strataLastSwitchRate);
+			}
+		}
+	}
+
+	out = AtlasRuntimeDiagnostics();
+	out.atlasMatrices = acc.atlasMatrices;
+	out.sparrowMatrices = acc.sparrowMatrices;
+	out.sparrowMode2Matrices = acc.sparrowMode2Matrices;
+	if (acc.sparrowMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.sparrowMatrices);
+		out.sparrowMeanActiveModes = acc.sparrowActiveModesSum / denom;
+		out.sparrowMode2Fraction = static_cast<double>(acc.sparrowMode2Matrices) / denom;
+		out.sparrowMeanEdge = acc.sparrowEdgeSum / denom;
+		out.sparrowMeanSecondEdge = acc.sparrowSecondEdgeSum / denom;
+		out.sparrowMeanSecondEdgeRatio = acc.sparrowSecondEdgeRatioSum / denom;
+		out.sparrowMeanMemoryGain = acc.sparrowMemoryGainSum / denom;
+		out.sparrowMeanHorizontalRatio = acc.sparrowHorizontalRatioSum / denom;
+	}
+	out.helmMatrices = acc.helmMatrices;
+	out.helmMode2Matrices = acc.helmMode2Matrices;
+	if (acc.helmMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.helmMatrices);
+		out.helmMeanActiveModes = acc.helmActiveModesSum / denom;
+		out.helmMode2Fraction = static_cast<double>(acc.helmMode2Matrices) / denom;
+		out.helmMeanEdge = acc.helmEdgeSum / denom;
+		out.helmMeanSecondEdge = acc.helmSecondEdgeSum / denom;
+		out.helmMeanSecondEdgeRatio = acc.helmSecondEdgeRatioSum / denom;
+		out.helmMeanSigma = acc.helmSigmaSum / denom;
+		out.helmMeanPredR2 = acc.helmPredR2Sum / denom;
+		out.helmMeanMemoryGain = acc.helmMemoryGainSum / denom;
+		out.helmMeanPole = acc.helmPoleSum / denom;
+	}
+	out.asterMatrices = acc.asterMatrices;
+	out.asterMode2Matrices = acc.asterMode2Matrices;
+	if (acc.asterMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.asterMatrices);
+		out.asterMeanActiveModes = acc.asterActiveModesSum / denom;
+		out.asterMode2Fraction = static_cast<double>(acc.asterMode2Matrices) / denom;
+		out.asterMeanEdge = acc.asterEdgeSum / denom;
+		out.asterMeanSecondEdge = acc.asterSecondEdgeSum / denom;
+		out.asterMeanSecondEdgeRatio = acc.asterSecondEdgeRatioSum / denom;
+		out.asterMeanSigma = acc.asterSigmaSum / denom;
+		out.asterMeanPredR2 = acc.asterPredR2Sum / denom;
+		out.asterMeanMemoryGain = acc.asterMemoryGainSum / denom;
+		out.asterMeanPole = acc.asterPoleSum / denom;
+		out.asterMeanBoundaryMs = acc.asterBoundaryMsSum / denom;
+		out.asterMeanSetupMs = acc.asterSetupMsSum / denom;
+		out.asterMeanTransportMs = acc.asterTransportMsSum / denom;
+		out.asterMeanTransferFitMs = acc.asterTransferFitMsSum / denom;
+		out.asterMeanStateFitMs = acc.asterStateFitMsSum / denom;
+		out.asterMeanInnovationFitMs = acc.asterInnovationFitMsSum / denom;
+		out.asterMeanApplyMs = acc.asterApplyMsSum / denom;
+	}
+	out.aegisMatrices = acc.aegisMatrices;
+	if (acc.aegisMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.aegisMatrices);
+		out.aegisMeanLambdaSpatial = acc.aegisLambdaSpatialSum / denom;
+		out.aegisMeanLambdaPredictive = acc.aegisLambdaPredictiveSum / denom;
+		out.aegisMeanLambdaOutput = acc.aegisLambdaOutputSum / denom;
+		out.aegisMeanPredictivePredicted = acc.aegisPredictivePredictedSum / denom;
+		out.aegisMeanPredictiveRealized = acc.aegisPredictiveRealizedSum / denom;
+		out.aegisMeanOutputPredicted = acc.aegisOutputPredictedSum / denom;
+		out.aegisMeanOutputRealized = acc.aegisOutputRealizedSum / denom;
+		out.aegisMeanPredictiveError = acc.aegisPredictiveErrorSum / denom;
+		out.aegisMeanOutputError = acc.aegisOutputErrorSum / denom;
+		out.aegisMeanChannelDisagreement = acc.aegisChannelDisagreementSum / denom;
+	}
+	out.citadelMatrices = acc.citadelMatrices;
+	if (acc.citadelMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.citadelMatrices);
+		out.citadelMeanAnchor = acc.citadelAnchorSum / denom;
+		out.citadelMeanHardRegimeMass = acc.citadelHardRegimeMassSum / denom;
+		out.citadelMeanSparrowTrust = acc.citadelSparrowTrustSum / denom;
+	}
+	out.rampartMatrices = acc.rampartMatrices;
+	if (acc.rampartMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.rampartMatrices);
+		out.rampartMeanTau = acc.rampartTauSum / denom;
+		out.rampartMeanBudget = acc.rampartBudgetSum / denom;
+		out.rampartMeanCovariance = acc.rampartCovarianceSum / denom;
+		out.rampartMeanSparrowTrust = acc.rampartSparrowTrustSum / denom;
+	}
+	out.meritMatrices = acc.meritMatrices;
+	if (acc.meritMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.meritMatrices);
+		out.meritMeanTau = acc.meritTauSum / denom;
+		out.meritMeanBudget = acc.meritBudgetSum / denom;
+		out.meritMeanCovariance = acc.meritCovarianceSum / denom;
+		out.meritMeanSparrowTrust = acc.meritSparrowTrustSum / denom;
+		out.meritMeanGeometryTrust = acc.meritGeometryTrustSum / denom;
+	}
+	out.strataMatrices = acc.strataMatrices;
+	if (acc.strataMatrices > 0u)
+	{
+		const double denom = static_cast<double>(acc.strataMatrices);
+		out.strataMeanNullMode = acc.strataNullModeSum / denom;
+		out.strataMeanPredictiveMode = acc.strataPredictiveModeSum / denom;
+		out.strataMeanOutputMode = acc.strataOutputModeSum / denom;
+		out.strataMeanCoupledMode = acc.strataCoupledModeSum / denom;
+		out.strataMeanBudget = acc.strataBudgetSum / denom;
+		out.strataMeanNullBenefit = acc.strataNullBenefitSum / denom;
+		out.strataMeanPredictiveBenefit = acc.strataPredictiveBenefitSum / denom;
+		out.strataMeanOutputBenefit = acc.strataOutputBenefitSum / denom;
+		out.strataMeanCoupledBenefit = acc.strataCoupledBenefitSum / denom;
+		out.strataMeanSelectedExcess = acc.strataSelectedExcessSum / denom;
+		out.strataMeanSwitchRate = acc.strataSwitchRateSum / denom;
+	}
+	out.transformerGapBatches = acc.transformerGapBatches;
+	if (acc.transformerGapBatches > 0u)
+	{
+		const double denom = static_cast<double>(acc.transformerGapBatches);
+		out.transformerMeanInputUpdateNorm = acc.transformerInputUpdateNormSum / denom;
+		out.transformerMeanBlockUpdateNorms.resize(acc.transformerBlockUpdateNormSum.size(), 0.0);
+		for (size_t i = 0; i < acc.transformerBlockUpdateNormSum.size(); ++i)
+			out.transformerMeanBlockUpdateNorms[i] = acc.transformerBlockUpdateNormSum[i] / denom;
+		out.transformerMeanFinalNormUpdateNorm = acc.transformerFinalNormUpdateNormSum / denom;
+		out.transformerMeanHeadUpdateNorm = acc.transformerHeadUpdateNormSum / denom;
+		out.transformerMeanHeadShare = acc.transformerHeadShareSum / denom;
+		out.transformerMeanNonHeadShare = acc.transformerNonHeadShareSum / denom;
+		out.transformerMeanApplyMs = acc.transformerApplyMsSum / denom;
+	}
+	out.transformerMarginSnapshots = acc.transformerMarginSnapshots;
+	if (acc.transformerMarginSnapshots > 0u)
+	{
+		const double denom = static_cast<double>(acc.transformerMarginSnapshots);
+		out.transformerMeanTargetMargin = acc.transformerTargetMarginSum / denom;
+		out.transformerMeanHardNegativeLogit = acc.transformerHardNegativeLogitSum / denom;
+	}
+	return true;
+}
+
+bool glades::NNetwork::getTransformerGroupedParameterSnapshot(TransformerGroupedParameterSnapshot& out) const
+{
+	out = TransformerGroupedParameterSnapshot();
+	if (!tensorTransformer.initialized)
+		return false;
+
+	const TensorTransformerState& tt = tensorTransformer;
+	const unsigned int nLayers = tt.nLayers;
+
+	out.inputGroup.reserve(tt.WIn.size() + tt.bIn.size());
+	out.inputGroup.insert(out.inputGroup.end(), tt.WIn.begin(), tt.WIn.end());
+	out.inputGroup.insert(out.inputGroup.end(), tt.bIn.begin(), tt.bIn.end());
+
+	out.blockGroups.resize(nLayers);
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		const TensorTransformerState::Block& b = tt.blocks[li];
+		std::vector<float>& group = out.blockGroups[li];
+		group.reserve(b.Wq.size() + b.Wk.size() + b.Wv.size() + b.Wo.size()
+		              + b.W1.size() + b.W2.size()
+		              + b.bq.size() + b.bk.size() + b.bv.size() + b.bo.size()
+		              + b.b1.size() + b.b2.size()
+		              + b.ln1Gamma.size() + b.ln1Beta.size()
+		              + b.ln2Gamma.size() + b.ln2Beta.size());
+		group.insert(group.end(), b.Wq.begin(), b.Wq.end());
+		group.insert(group.end(), b.Wk.begin(), b.Wk.end());
+		group.insert(group.end(), b.Wv.begin(), b.Wv.end());
+		group.insert(group.end(), b.Wo.begin(), b.Wo.end());
+		group.insert(group.end(), b.W1.begin(), b.W1.end());
+		group.insert(group.end(), b.W2.begin(), b.W2.end());
+		group.insert(group.end(), b.bq.begin(), b.bq.end());
+		group.insert(group.end(), b.bk.begin(), b.bk.end());
+		group.insert(group.end(), b.bv.begin(), b.bv.end());
+		group.insert(group.end(), b.bo.begin(), b.bo.end());
+		group.insert(group.end(), b.b1.begin(), b.b1.end());
+		group.insert(group.end(), b.b2.begin(), b.b2.end());
+		group.insert(group.end(), b.ln1Gamma.begin(), b.ln1Gamma.end());
+		group.insert(group.end(), b.ln1Beta.begin(), b.ln1Beta.end());
+		group.insert(group.end(), b.ln2Gamma.begin(), b.ln2Gamma.end());
+		group.insert(group.end(), b.ln2Beta.begin(), b.ln2Beta.end());
+	}
+
+	out.finalNormGroup.reserve(tt.lnFinalGamma.size() + tt.lnFinalBeta.size());
+	out.finalNormGroup.insert(out.finalNormGroup.end(), tt.lnFinalGamma.begin(), tt.lnFinalGamma.end());
+	out.finalNormGroup.insert(out.finalNormGroup.end(), tt.lnFinalBeta.begin(), tt.lnFinalBeta.end());
+
+	if (tt.tokenModel)
+	{
+		out.headGroup.reserve(tt.tokE.size() + tt.lmBias.size());
+		out.headGroup.insert(out.headGroup.end(), tt.tokE.begin(), tt.tokE.end());
+		out.headGroup.insert(out.headGroup.end(), tt.lmBias.begin(), tt.lmBias.end());
+	}
+	else
+	{
+		out.headGroup.reserve(tt.WOut.size() + tt.bOut.size());
+		out.headGroup.insert(out.headGroup.end(), tt.WOut.begin(), tt.WOut.end());
+		out.headGroup.insert(out.headGroup.end(), tt.bOut.begin(), tt.bOut.end());
+	}
+
+	out.valid = true;
+	return true;
+}
+
+void glades::NNetwork::resetPersistenceDiagnosticsAttempt(PersistenceDiagnostics& d,
+                                                          const char* operation,
+                                                          const std::string& name,
+                                                          int netType,
+                                                          bool isCheckpoint,
+                                                          bool tokenizerPresent,
+                                                          bool includeOptimizerState,
+                                                          uint64_t maxShardBytes)
+{
+	d.totalPersistenceOps += 1ULL;
+	if (isCheckpoint)
+		d.totalCheckpointSaveAttempts += 1ULL;
+	else
+		d.totalModelSaveAttempts += 1ULL;
+
+	d.lastNetType = netType;
+	d.lastOperationWasCheckpoint = isCheckpoint;
+	d.lastOperationSucceeded = false;
+	d.lastOperationRejected = false;
+	d.lastRotatedPrevious = false;
+	d.lastTokenizerPresent = tokenizerPresent;
+	d.lastIncludeOptimizerState = includeOptimizerState;
+	d.lastShardCount = 0ULL;
+	d.lastTensorCount = 0ULL;
+	d.lastWeightsBytes = 0ULL;
+	d.lastMaxShardBytes = maxShardBytes;
+	d.lastOperation = operation ? std::string(operation) : std::string();
+	d.lastName = name;
+	d.lastStage = "begin";
+	d.lastStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+void glades::NNetwork::notePersistenceDiagnosticsFailure(PersistenceDiagnostics& d,
+                                                         const char* stage,
+                                                         bool rejectedInput,
+                                                         bool rotatedPrevious,
+                                                         const NNetworkStatus& st,
+                                                         uint64_t shardCount,
+                                                         uint64_t tensorCount,
+                                                         uint64_t weightsBytes)
+{
+	d.totalPersistenceFailures += 1ULL;
+	if (d.lastOperationWasCheckpoint)
+		d.totalCheckpointSaveFailures += 1ULL;
+	else
+		d.totalModelSaveFailures += 1ULL;
+
+	d.lastOperationSucceeded = false;
+	d.lastOperationRejected = rejectedInput;
+	d.lastRotatedPrevious = rotatedPrevious;
+	d.lastStage = stage ? std::string(stage) : std::string();
+	d.lastStatus = st;
+	d.lastShardCount = shardCount;
+	d.lastTensorCount = tensorCount;
+	d.lastWeightsBytes = weightsBytes;
+
+	if (rejectedInput)
+	{
+		d.totalRejectedInputs += 1ULL;
+		return;
+	}
+
+	d.totalPublishFailures += 1ULL;
+	if (d.lastOperationWasCheckpoint)
+		d.totalCheckpointPublishFailures += 1ULL;
+	else
+		d.totalModelPublishFailures += 1ULL;
+
+	if (d.lastStage == "rotate_existing")
+		d.totalRotateFailures += 1ULL;
+	else if (d.lastStage == "publish")
+		d.totalPublishRenameFailures += 1ULL;
+	else if (d.lastStage == "write_manifest")
+		d.totalManifestWriteFailures += 1ULL;
+	else if (d.lastStage == "write_nninfo")
+		d.totalNninfoWriteFailures += 1ULL;
+	else if (d.lastStage == "write_weights")
+		d.totalWeightsWriteFailures += 1ULL;
+	else if (d.lastStage == "compute_integrity")
+		d.totalIntegrityFailures += 1ULL;
+	else if (d.lastStage == "collect_tensors")
+		d.totalCheckpointTensorCollectionFailures += 1ULL;
+	else if (d.lastStage == "open_first_shard" ||
+	         d.lastStage == "write_shards" ||
+	         d.lastStage == "finalize_shards")
+		d.totalCheckpointShardWriteFailures += 1ULL;
+}
+
+void glades::NNetwork::notePersistenceDiagnosticsSuccess(PersistenceDiagnostics& d,
+                                                         const char* stage,
+                                                         bool rotatedPrevious,
+                                                         const NNetworkStatus& st,
+                                                         uint64_t shardCount,
+                                                         uint64_t tensorCount,
+                                                         uint64_t weightsBytes)
+{
+	d.totalPersistenceSuccesses += 1ULL;
+	if (d.lastOperationWasCheckpoint)
+		d.totalCheckpointSaveSuccesses += 1ULL;
+	else
+		d.totalModelSaveSuccesses += 1ULL;
+
+	d.lastOperationSucceeded = true;
+	d.lastOperationRejected = false;
+	d.lastRotatedPrevious = rotatedPrevious;
+	d.lastStage = stage ? std::string(stage) : std::string();
+	d.lastStatus = st;
+	d.lastShardCount = shardCount;
+	d.lastTensorCount = tensorCount;
+	d.lastWeightsBytes = weightsBytes;
+}
+
 void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* newConnection)
 {
 	serverInstance = newServer;
@@ -943,17 +2024,17 @@ void glades::NNetwork::setServer(GNet::GServer* newServer, GNet::Connection* new
 
 void glades::NNetwork::setLogger(shmea::GLogger* logger)
 {
-	loggerOverride = logger;
+	storeLoggerOverride(logger);
 }
 
 shmea::GLogger* glades::NNetwork::getLogger() const
 {
-	if (loggerOverride)
-		return loggerOverride;
+	shmea::GLogger* logger = loadLoggerOverride();
+	if (logger)
+		return logger;
 	if (serverInstance && serverInstance->logger)
 		return serverInstance->logger.get();
-	static shmea::GLogger defaultLogger(shmea::GLogger::LOG_INFO);
-	return &defaultLogger;
+	return &g_default_network_logger;
 }
 
 shmea::GList glades::NNetwork::getResults() const
@@ -982,12 +2063,13 @@ void glades::NNetwork::clean()
 	overallClassSpecificity = 0.0f;
 	overallClassF1 = 0.0f;
 	minibatchSize = NNInfo::BATCH_STOCHASTIC;
-	running = false;
+	storeRunningFlag(false);
 	lastStatus = NNetworkStatus(NNetworkStatus::OK, std::string());
-	// Reset training configuration to defaults.
-	trainingConfig = TrainingConfig();
-	// Reset transformer serving metrics config (opt-in).
-	transformerMetricsCfg = TransformerMetricsConfig();
+	// Reconstruct configs in place so reset does not depend on assignment over a live object.
+	trainingConfig.~TrainingConfig();
+	new (&trainingConfig) TrainingConfig();
+	transformerMetricsCfg.~TransformerMetricsConfig();
+	new (&transformerMetricsCfg) TransformerMetricsConfig();
 	// Reset tokenizer/vocab artifacts (deployment metadata).
 	tokenizerArtifactsPresent = false;
 	tokenizerArtifacts.reset();
@@ -1016,6 +2098,8 @@ void glades::NNetwork::clean()
 	regCount = 0ULL;
 	clsCorrect = 0ULL;
 	clsTotal = 0ULL;
+	trainerRunDiagnostics = TrainerRunDiagnostics();
+	persistenceDiagnostics = PersistenceDiagnostics();
 
 	// Ensure the run lock is released when resetting the instance state.
 #if GLADES_HAVE_STD_ATOMICS
@@ -1040,7 +2124,9 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 
 	// Determinism: parameter initialization must always use this network's RNG engine.
 
-	const unsigned int inputSize = di->getFeatureCount();
+	const bool tokenModel = trainingConfig.transformer.enableTokenEmbedding;
+	const bool tokenIdInput = tokenModel && di->hasTokenIdInput();
+	const unsigned int inputSize = tokenIdInput ? 1u : di->getFeatureCount();
 	const unsigned int outSize = skeleton->getOutputLayerSize();
 	const int H = skeleton->numHiddenLayers();
 	if (inputSize == 0u || outSize == 0u)
@@ -1118,6 +2204,127 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			tr.gBias.assign(out, 0.0f);
 
 			InitGlorot::run(rngEngine, tr.W, in, out);
+		}
+
+		tensorDff.helm.reset();
+		tensorDff.aster.reset();
+		if (numTransitions > 0u)
+		{
+			const TensorDFFState::Transition& outTr = tensorDff.T[numTransitions - 1u];
+			const unsigned int hiddenLayerCount = (numTransitions > 0u) ? (numTransitions - 1u) : 0u;
+			const unsigned int requestedStackDepth = std::max(1u, trainingConfig.atlas.helmHiddenStackDepth);
+			const unsigned int stackDepth = std::min(requestedStackDepth, hiddenLayerCount);
+			const unsigned int outputDim = outTr.out;
+			unsigned int rawHiddenDim = 0u;
+			tensorDff.helm.hiddenLayerActivationIndices.clear();
+			tensorDff.helm.hiddenLayerOffsets.clear();
+			tensorDff.helm.hiddenLayerSizes.clear();
+			if (stackDepth > 0u)
+			{
+				const unsigned int firstActIndex = numTransitions - stackDepth;
+				for (unsigned int d = 0; d < stackDepth; ++d)
+				{
+					const unsigned int actIndex = firstActIndex + d;
+					const unsigned int layerSize = (actIndex < tensorDff.sizes.size()) ? tensorDff.sizes[actIndex] : 0u;
+					tensorDff.helm.hiddenLayerActivationIndices.push_back(actIndex);
+					tensorDff.helm.hiddenLayerOffsets.push_back(rawHiddenDim);
+					tensorDff.helm.hiddenLayerSizes.push_back(layerSize);
+					rawHiddenDim += layerSize;
+				}
+			}
+			const unsigned int hiddenDim = stackDepth * outputDim;
+			const unsigned int pastDim = hiddenDim + outputDim;
+			const unsigned int modeRank =
+			    std::max(1u, std::min(trainingConfig.atlas.helmModeRank, std::max(1u, outputDim)));
+			tensorDff.helm.initialized = (rawHiddenDim > 0u) && (hiddenDim > 0u) && (outputDim > 0u);
+			tensorDff.helm.rawHiddenDim = rawHiddenDim;
+			tensorDff.helm.hiddenDim = hiddenDim;
+			tensorDff.helm.outputDim = outputDim;
+			tensorDff.helm.hiddenStackDepth = stackDepth;
+			tensorDff.helm.modeRank = modeRank;
+			tensorDff.helm.prevHiddenMean.assign(hiddenDim, 0.0f);
+			tensorDff.helm.prevResidualMean.assign(outputDim, 0.0f);
+			tensorDff.helm.hiddenVar.assign(hiddenDim, 1.0f);
+			tensorDff.helm.residualVar.assign(outputDim, 1.0f);
+			tensorDff.helm.crossCov.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(pastDim), 0.0f);
+			tensorDff.helm.sigma.assign(modeRank, 0.0f);
+			tensorDff.helm.leftMode.assign(static_cast<size_t>(modeRank) * static_cast<size_t>(outputDim), 0.0f);
+			tensorDff.helm.rightMode.assign(static_cast<size_t>(modeRank) * static_cast<size_t>(pastDim), 0.0f);
+			for (unsigned int m = 0; m < modeRank; ++m)
+			{
+				if (m < outputDim)
+					tensorDff.helm.leftMode[static_cast<size_t>(m) * static_cast<size_t>(outputDim) + m] = 1.0f;
+				if (m < pastDim)
+					tensorDff.helm.rightMode[static_cast<size_t>(m) * static_cast<size_t>(pastDim) + m] = 1.0f;
+			}
+			tensorDff.helm.batchHiddenSum.assign(rawHiddenDim, 0.0f);
+			tensorDff.helm.batchHiddenSqSum.assign(rawHiddenDim, 0.0f);
+			tensorDff.helm.batchResidualSum.assign(outputDim, 0.0f);
+			tensorDff.helm.batchResidualSqSum.assign(outputDim, 0.0f);
+			tensorDff.helm.latent.assign(modeRank, 0.0f);
+			tensorDff.helm.poleNumer.assign(modeRank, 0.0f);
+			tensorDff.helm.poleDenom.assign(modeRank, 0.0f);
+			tensorDff.helm.pole.assign(modeRank, 0.0f);
+
+			const unsigned int requestedAsterDepth = std::max(1u, trainingConfig.atlas.asterHiddenStackDepth);
+			const unsigned int asterStackDepth = std::min(requestedAsterDepth, hiddenLayerCount);
+			unsigned int asterRawHiddenDim = 0u;
+			tensorDff.aster.hiddenLayerActivationIndices.clear();
+			tensorDff.aster.hiddenLayerOffsets.clear();
+			tensorDff.aster.hiddenLayerSizes.clear();
+			if (asterStackDepth > 0u)
+			{
+				const unsigned int firstActIndex = numTransitions - asterStackDepth;
+				for (unsigned int d = 0; d < asterStackDepth; ++d)
+				{
+					const unsigned int actIndex = firstActIndex + d;
+					const unsigned int layerSize = (actIndex < tensorDff.sizes.size()) ? tensorDff.sizes[actIndex] : 0u;
+					tensorDff.aster.hiddenLayerActivationIndices.push_back(actIndex);
+					tensorDff.aster.hiddenLayerOffsets.push_back(asterRawHiddenDim);
+					tensorDff.aster.hiddenLayerSizes.push_back(layerSize);
+					asterRawHiddenDim += layerSize;
+				}
+			}
+			const unsigned int asterControlDim = asterStackDepth * outputDim;
+			const unsigned int asterFeatureDim = outputDim + (2u * asterControlDim);
+			const unsigned int asterStateRank =
+			    std::max(1u, std::min(trainingConfig.atlas.asterStateRank, std::max(1u, outputDim)));
+			const unsigned int asterStateFeatureDim = asterStateRank + (2u * asterControlDim);
+			tensorDff.aster.initialized = (asterRawHiddenDim > 0u) && (asterControlDim > 0u) && (outputDim > 0u);
+			tensorDff.aster.rawHiddenDim = asterRawHiddenDim;
+			tensorDff.aster.controlDim = asterControlDim;
+			tensorDff.aster.outputDim = outputDim;
+			tensorDff.aster.hiddenStackDepth = asterStackDepth;
+			tensorDff.aster.stateRank = asterStateRank;
+			tensorDff.aster.prevControlMean.assign(asterControlDim, 0.0f);
+			tensorDff.aster.prevResidualMean.assign(outputDim, 0.0f);
+			tensorDff.aster.controlVar.assign(asterControlDim, 1.0f);
+			tensorDff.aster.residualVar.assign(outputDim, 1.0f);
+			tensorDff.aster.pastCov.assign(static_cast<size_t>(asterFeatureDim) * static_cast<size_t>(asterFeatureDim), 0.0f);
+			tensorDff.aster.crossCov.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(asterFeatureDim), 0.0f);
+			tensorDff.aster.theta.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(asterFeatureDim), 0.0f);
+			tensorDff.aster.statePastCov.assign(static_cast<size_t>(asterStateFeatureDim) * static_cast<size_t>(asterStateFeatureDim), 0.0f);
+			tensorDff.aster.stateCrossCov.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(asterStateFeatureDim), 0.0f);
+			tensorDff.aster.innovationCov.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(outputDim), 0.0f);
+			tensorDff.aster.innovationCross.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(outputDim), 0.0f);
+			tensorDff.aster.sigma.assign(asterStateRank, 0.0f);
+			tensorDff.aster.leftMode.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(outputDim), 0.0f);
+			tensorDff.aster.rightMode.assign(static_cast<size_t>(asterStateRank) * static_cast<size_t>(asterFeatureDim), 0.0f);
+			for (unsigned int m = 0; m < asterStateRank; ++m)
+			{
+				if (m < outputDim)
+					tensorDff.aster.leftMode[static_cast<size_t>(m) * static_cast<size_t>(outputDim) + m] = 1.0f;
+				if (m < asterFeatureDim)
+					tensorDff.aster.rightMode[static_cast<size_t>(m) * static_cast<size_t>(asterFeatureDim) + m] = 1.0f;
+			}
+			tensorDff.aster.batchHiddenSum.assign(asterRawHiddenDim, 0.0f);
+			tensorDff.aster.batchHiddenSqSum.assign(asterRawHiddenDim, 0.0f);
+			tensorDff.aster.batchResidualSum.assign(outputDim, 0.0f);
+			tensorDff.aster.batchResidualSqSum.assign(outputDim, 0.0f);
+			tensorDff.aster.latent.assign(asterStateRank, 0.0f);
+			tensorDff.aster.poleNumer.assign(asterStateRank, 0.0f);
+			tensorDff.aster.poleDenom.assign(asterStateRank, 0.0f);
+			tensorDff.aster.pole.assign(asterStateRank, 0.0f);
 		}
 
 		tensorDff.batchCount = 0u;
@@ -1270,112 +2477,110 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 	// === Transformer (encoder/decoder) ===
 	if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
 	{
-		if (H <= 0)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: transformer requires >= 1 hidden layer (blocks)");
-			return false;
-		}
-
-		const int dModelCfg = skeleton->getHiddenLayerSize(0u);
-		const unsigned int dModel = (dModelCfg > 0) ? static_cast<unsigned int>(dModelCfg) : 0u;
-		// Proper transformer config:
-		// Use TrainingConfig.transformer overrides (persisted in the model manifest).
-		// NOTE: We intentionally do NOT read heads/dFF from NNInfo hidden-layer activation metadata.
-		int headsCfg = trainingConfig.transformer.nHeadsOverride;
-		if (headsCfg <= 0)
-			headsCfg = 4;
-		const unsigned int nHeads = static_cast<unsigned int>(headsCfg);
-
-		// Grouped-query attention: KV head count.
-		int kvHeadsCfg = trainingConfig.transformer.nKVHeadsOverride;
-		if (kvHeadsCfg <= 0)
-			kvHeadsCfg = static_cast<int>(nHeads);
-		const unsigned int nKVHeads = (kvHeadsCfg > 0) ? static_cast<unsigned int>(kvHeadsCfg) : 0u;
-
-		int dffCfg = trainingConfig.transformer.dFFOverride;
-		if (dffCfg <= 0)
-			dffCfg = static_cast<int>(4u * dModel);
-		const unsigned int dFF = (dffCfg > 0) ? static_cast<unsigned int>(dffCfg) : 0u;
-
-		// Token LM mode: derive vocab size and expect input features == 1 token id.
-		const bool tokenModel = trainingConfig.transformer.enableTokenEmbedding;
-		unsigned int vocabSize = outSize;
-		if (trainingConfig.transformer.vocabSizeOverride > 0)
-			vocabSize = static_cast<unsigned int>(trainingConfig.transformer.vocabSizeOverride);
-		if (tokenModel)
-		{
-			if (!trainingConfig.transformer.tieEmbeddings)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM mode currently requires tieEmbeddings=true");
-				return false;
-			}
-			if (inputSize != 1u)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM mode requires DataInput featureCount == 1 (token id)");
-				return false;
-			}
-			if (vocabSize == 0u)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM mode requires vocabSize > 0");
-				return false;
-			}
-			// In LM mode, require the network output layer size to match vocab unless overridden.
-			if (trainingConfig.transformer.vocabSizeOverride > 0 && outSize != vocabSize)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: token LM vocabSizeOverride must match NNInfo output layer size");
-				return false;
-			}
-		}
-
-		const unsigned int ffnKind = static_cast<unsigned int>(trainingConfig.transformer.ffnKind);
-		const unsigned int ff1Width = (ffnKind == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU))
-		                                  ? (2u * dFF)
-		                                  : dFF;
-
-		if (dModel == 0u || nHeads == 0u || nKVHeads == 0u || dFF == 0u || ff1Width == 0u)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_STATE, "ensureTensorParametersInitialized: invalid transformer config (dModel/heads/dFF)");
-			return false;
-		}
-		if ((dModel % nHeads) != 0u)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-			                            "ensureTensorParametersInitialized: transformer dModel must be divisible by nHeads");
-			return false;
-		}
-		if ((nHeads % nKVHeads) != 0u)
-		{
-			lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-			                            "ensureTensorParametersInitialized: transformer nKVHeads must divide nHeads");
-			return false;
-		}
-
+		std::vector<unsigned int> hiddenSizes;
+		hiddenSizes.reserve(static_cast<size_t>(H > 0 ? H : 0));
 		for (int l = 0; l < H; ++l)
 		{
 			const int hs = skeleton->getHiddenLayerSize(static_cast<unsigned int>(l));
-			if (hs <= 0 || static_cast<unsigned int>(hs) != dModel)
-			{
-				lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-				                            "ensureTensorParametersInitialized: transformer requires constant hidden size (dModel) across all blocks");
-				return false;
-			}
+			hiddenSizes.push_back(hs > 0 ? static_cast<unsigned int>(hs) : 0u);
 		}
 
+		TransformerModelConfigSnapshot modelCfg;
+		lastStatus = buildTransformerModelConfigSnapshot("ensureTensorParametersInitialized",
+		                                                 trainingConfig,
+		                                                 hiddenSizes,
+		                                                 outSize,
+		                                                 tokenIdInput,
+		                                                 netType == TYPE_TRANSFORMER_DECODER,
+		                                                 modelCfg);
+		if (!lastStatus.ok())
+			return false;
+
+		const unsigned int dModel = modelCfg.dModel;
+		const unsigned int nHeads = modelCfg.nHeads;
+		const unsigned int nKVHeads = modelCfg.nKVHeads;
+		const unsigned int dFF = modelCfg.dFF;
+		const unsigned int vocabSize = modelCfg.vocabSize;
+		const unsigned int ffnKind = modelCfg.ffnKind;
+		const bool tokenModel = modelCfg.tokenModel;
+		const unsigned int ff1Width = modelCfg.ff1Width;
+
+		const bool needAdamMoments = atlas_transformer_needs_adam_moments(trainingConfig);
 		const bool mismatch = (!tensorTransformer.initialized) || (tensorTransformer.inputSize != inputSize) || (tensorTransformer.outSize != outSize) ||
 		                      (tensorTransformer.dModel != dModel) || (tensorTransformer.dFF != dFF) || (tensorTransformer.nHeads != nHeads) ||
 		                      (tensorTransformer.nKVHeads != nKVHeads) || (tensorTransformer.ffnKind != ffnKind) ||
 		                      (tensorTransformer.tokenModel != tokenModel) ||
 		                      (tensorTransformer.vocabSize != vocabSize) ||
-		                      (tensorTransformer.padTokenId != trainingConfig.transformer.padTokenId) ||
-		                      (tensorTransformer.tieEmbeddings != trainingConfig.transformer.tieEmbeddings) ||
-		                      (tensorTransformer.nLayers != static_cast<unsigned int>(H)) ||
-		                      (tensorTransformer.causal != (netType == TYPE_TRANSFORMER_DECODER));
+		                      (tensorTransformer.padTokenId != modelCfg.padTokenId) ||
+		                      (tensorTransformer.tieEmbeddings != modelCfg.tieEmbeddings) ||
+		                      (tensorTransformer.nLayers != modelCfg.nLayers) ||
+		                      (tensorTransformer.causal != modelCfg.causal);
 		if (!mismatch)
+		{
+			if (needAdamMoments)
+			{
+				TensorTransformerState& tt = tensorTransformer;
+				if (tt.tokenModel)
+				{
+					ensure_transformer_moment_buffer(tt.vTokE, tt.tokE.size());
+					ensure_transformer_moment_buffer(tt.v2TokE, tt.tokE.size());
+					ensure_transformer_moment_buffer(tt.mLmBias, tt.lmBias.size());
+					ensure_transformer_moment_buffer(tt.v2LmBias, tt.lmBias.size());
+				}
+				else
+				{
+					ensure_transformer_moment_buffer(tt.vWIn, tt.WIn.size());
+					ensure_transformer_moment_buffer(tt.v2WIn, tt.WIn.size());
+					ensure_transformer_moment_buffer(tt.mBIn, tt.bIn.size());
+					ensure_transformer_moment_buffer(tt.v2BIn, tt.bIn.size());
+					ensure_transformer_moment_buffer(tt.vWOut, tt.WOut.size());
+					ensure_transformer_moment_buffer(tt.v2WOut, tt.WOut.size());
+					ensure_transformer_moment_buffer(tt.mBOut, tt.bOut.size());
+					ensure_transformer_moment_buffer(tt.v2BOut, tt.bOut.size());
+				}
+				ensure_transformer_moment_buffer(tt.mLnFinalGamma, tt.lnFinalGamma.size());
+				ensure_transformer_moment_buffer(tt.v2LnFinalGamma, tt.lnFinalGamma.size());
+				ensure_transformer_moment_buffer(tt.mLnFinalBeta, tt.lnFinalBeta.size());
+				ensure_transformer_moment_buffer(tt.v2LnFinalBeta, tt.lnFinalBeta.size());
+				for (size_t i = 0; i < tt.blocks.size(); ++i)
+				{
+					TensorTransformerState::Block& block = tt.blocks[i];
+					ensure_transformer_moment_buffer(block.mLn1Gamma, block.ln1Gamma.size());
+					ensure_transformer_moment_buffer(block.v2Ln1Gamma, block.ln1Gamma.size());
+					ensure_transformer_moment_buffer(block.mLn1Beta, block.ln1Beta.size());
+					ensure_transformer_moment_buffer(block.v2Ln1Beta, block.ln1Beta.size());
+					ensure_transformer_moment_buffer(block.vWq, block.Wq.size());
+					ensure_transformer_moment_buffer(block.v2Wq, block.Wq.size());
+					ensure_transformer_moment_buffer(block.vWk, block.Wk.size());
+					ensure_transformer_moment_buffer(block.v2Wk, block.Wk.size());
+					ensure_transformer_moment_buffer(block.vWv, block.Wv.size());
+					ensure_transformer_moment_buffer(block.v2Wv, block.Wv.size());
+					ensure_transformer_moment_buffer(block.vWo, block.Wo.size());
+					ensure_transformer_moment_buffer(block.v2Wo, block.Wo.size());
+					ensure_transformer_moment_buffer(block.mBq, block.bq.size());
+					ensure_transformer_moment_buffer(block.v2Bq, block.bq.size());
+					ensure_transformer_moment_buffer(block.mBk, block.bk.size());
+					ensure_transformer_moment_buffer(block.v2Bk, block.bk.size());
+					ensure_transformer_moment_buffer(block.mBv, block.bv.size());
+					ensure_transformer_moment_buffer(block.v2Bv, block.bv.size());
+					ensure_transformer_moment_buffer(block.mBo, block.bo.size());
+					ensure_transformer_moment_buffer(block.v2Bo, block.bo.size());
+					ensure_transformer_moment_buffer(block.mLn2Gamma, block.ln2Gamma.size());
+					ensure_transformer_moment_buffer(block.v2Ln2Gamma, block.ln2Gamma.size());
+					ensure_transformer_moment_buffer(block.mLn2Beta, block.ln2Beta.size());
+					ensure_transformer_moment_buffer(block.v2Ln2Beta, block.ln2Beta.size());
+					ensure_transformer_moment_buffer(block.vW1, block.W1.size());
+					ensure_transformer_moment_buffer(block.v2W1, block.W1.size());
+					ensure_transformer_moment_buffer(block.vW2, block.W2.size());
+					ensure_transformer_moment_buffer(block.v2W2, block.W2.size());
+					ensure_transformer_moment_buffer(block.mB1, block.b1.size());
+					ensure_transformer_moment_buffer(block.v2B1, block.b1.size());
+					ensure_transformer_moment_buffer(block.mB2, block.b2.size());
+					ensure_transformer_moment_buffer(block.v2B2, block.b2.size());
+				}
+			}
 			return true;
+		}
 
 		tensorTransformer.reset();
 		tensorTransformer.initialized = true;
@@ -1385,18 +2590,18 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		tensorTransformer.dFF = dFF;
 		tensorTransformer.nHeads = nHeads;
 		tensorTransformer.nKVHeads = nKVHeads;
-		tensorTransformer.nLayers = static_cast<unsigned int>(H);
-		tensorTransformer.causal = (netType == TYPE_TRANSFORMER_DECODER);
+		tensorTransformer.nLayers = modelCfg.nLayers;
+		tensorTransformer.causal = modelCfg.causal;
 		tensorTransformer.ffnKind = ffnKind;
 		tensorTransformer.tokenModel = tokenModel;
 		tensorTransformer.vocabSize = vocabSize;
-		tensorTransformer.padTokenId = trainingConfig.transformer.padTokenId;
-		tensorTransformer.tieEmbeddings = trainingConfig.transformer.tieEmbeddings;
+		tensorTransformer.padTokenId = modelCfg.padTokenId;
+		tensorTransformer.tieEmbeddings = modelCfg.tieEmbeddings;
 		tensorTransformer.optimizerStep = 0ULL;
 
-		// ATLAS uses its own per-matrix state; skip AdamW moment buffers (v*/v2*) to save memory.
-		const bool needAdamMoments = (trainingConfig.optimizer.type != OptimizerConfig::ATLAS);
-
+		// ATLAS normally uses its own per-matrix state and skips AdamW moments to
+		// save memory. Some transformer-side experimental branches reuse Adam-style
+		// diagonal moments as part of their backbone even under optimizer=ATLAS.
 		// Token LM tensors (embedding + bias)
 		if (tokenModel)
 		{
@@ -1558,6 +2763,169 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 				glades::ddp::broadcastFromRoot(&b.b1[0], b.b1.size());
 				glades::ddp::broadcastFromRoot(&b.b2[0], b.b2.size());
 			}
+		}
+
+		if ((trainingConfig.optimizer.type == OptimizerConfig::ATLAS)
+		    && trainingConfig.atlas.helmEnabled
+		    && tokenModel
+		    && modelCfg.nLayers > 0u
+		    && dModel > 0u)
+		{
+			TensorTransformerState::HelmState& helm = tensorTransformer.helm;
+			const unsigned int requestedDepth = std::max(1u, trainingConfig.atlas.helmHiddenStackDepth);
+			const unsigned int stackDepth = std::min(requestedDepth, modelCfg.nLayers);
+			const unsigned int hiddenDim = stackDepth * dModel;
+			const unsigned int outputDim = dModel;
+			const unsigned int pastDim = hiddenDim + outputDim;
+			const unsigned int modeRank =
+			    std::max(1u, std::min(trainingConfig.atlas.helmModeRank, std::max(1u, outputDim)));
+
+			helm.reset();
+			helm.initialized = (stackDepth > 0u) && (hiddenDim > 0u) && (outputDim > 0u);
+			helm.hiddenDim = hiddenDim;
+			helm.outputDim = outputDim;
+			helm.hiddenStackDepth = stackDepth;
+			helm.modeRank = modeRank;
+			helm.trackedBlockIndices.reserve(stackDepth);
+			for (unsigned int d = 0u; d < stackDepth; ++d)
+				helm.trackedBlockIndices.push_back(modelCfg.nLayers - stackDepth + d);
+			helm.prevHiddenMean.assign(hiddenDim, 0.0f);
+			helm.prevResidualMean.assign(outputDim, 0.0f);
+			helm.hiddenVar.assign(hiddenDim, 1.0f);
+			helm.residualVar.assign(outputDim, 1.0f);
+			helm.crossCov.assign(static_cast<size_t>(outputDim) * static_cast<size_t>(pastDim), 0.0f);
+			helm.sigma.assign(modeRank, 0.0f);
+			helm.leftMode.assign(static_cast<size_t>(modeRank) * static_cast<size_t>(outputDim), 0.0f);
+			helm.rightMode.assign(static_cast<size_t>(modeRank) * static_cast<size_t>(pastDim), 0.0f);
+			for (unsigned int m = 0u; m < modeRank; ++m)
+			{
+				if (m < outputDim)
+					helm.leftMode[static_cast<size_t>(m) * static_cast<size_t>(outputDim) + m] = 1.0f;
+				if (m < pastDim)
+					helm.rightMode[static_cast<size_t>(m) * static_cast<size_t>(pastDim) + m] = 1.0f;
+			}
+			helm.batchHiddenSum.assign(hiddenDim, 0.0f);
+			helm.batchHiddenSqSum.assign(hiddenDim, 0.0f);
+			helm.batchResidualSum.assign(outputDim, 0.0f);
+			helm.batchResidualSqSum.assign(outputDim, 0.0f);
+			helm.latent.assign(modeRank, 0.0f);
+			helm.poleNumer.assign(modeRank, 0.0f);
+			helm.poleDenom.assign(modeRank, 0.0f);
+			helm.pole.assign(modeRank, 0.0f);
+			helm.forwardCorrection.assign(outputDim, 0.0f);
+		}
+		else
+		{
+			tensorTransformer.helm.reset();
+		}
+
+		if ((trainingConfig.optimizer.type == OptimizerConfig::ATLAS)
+		    && trainingConfig.atlas.asterEnabled
+		    && tokenModel
+		    && modelCfg.nLayers > 0u
+		    && dModel > 0u)
+		{
+			TensorTransformerState::AsterState& aster = tensorTransformer.aster;
+			const unsigned int requestedDepth = std::max(1u, trainingConfig.atlas.asterHiddenStackDepth);
+			const unsigned int stackDepth = std::min(requestedDepth, modelCfg.nLayers);
+			const unsigned int regimeCount = 4u;
+			const unsigned int sketchDim = std::max(4u, std::min(16u, vocabSize));
+			const unsigned int supportDim = std::max(1u, std::min(5u, vocabSize));
+			const unsigned int marginDim = (supportDim > 0u) ? (supportDim - 1u) : 0u;
+			const unsigned int tokenCondDim = trainingConfig.atlas.auroraEnabled ? 12u : 8u;
+			const unsigned int kappaHeads =
+			    trainingConfig.atlas.kappaEnabled ? std::max(1u, std::min(trainingConfig.atlas.kappaHeads, modelCfg.nHeads)) : 0u;
+			const unsigned int kappaLagBuckets =
+			    trainingConfig.atlas.kappaEnabled ? std::max(1u, std::min(trainingConfig.atlas.kappaLagBuckets, 4u)) : 0u;
+			const unsigned int kappaRank =
+			    trainingConfig.atlas.kappaEnabled ? std::max(1u, std::min(trainingConfig.atlas.kappaRank, 4u)) : 0u;
+			const unsigned int kappaObsDim =
+			    (trainingConfig.atlas.kappaEnabled && kappaHeads > 0u && kappaLagBuckets > 0u && kappaRank > 0u)
+			        ? (kappaHeads * kappaLagBuckets * kappaRank)
+			        : 0u;
+			const unsigned int obsDim = sketchDim + supportDim + marginDim + tokenCondDim + kappaObsDim;
+			const unsigned int controlStreams = (kappaObsDim > 0u) ? 4u : 3u;
+			const unsigned int stateRank =
+			    std::max(1u, std::min(trainingConfig.atlas.asterStateRank, obsDim));
+			const unsigned int controlDim = stackDepth * controlStreams * obsDim;
+			const unsigned int featureDim = (2u * obsDim) + (3u * controlDim);
+			const unsigned int stateFeatureDim = (2u * stateRank) + (3u * controlDim);
+
+			aster.reset();
+			aster.initialized = (stackDepth > 0u) && (controlDim > 0u) && (obsDim > 0u);
+			aster.regimeCount = regimeCount;
+			aster.sketchDim = sketchDim;
+			aster.supportDim = supportDim;
+			aster.tokenCondDim = tokenCondDim;
+			aster.kappaObsDim = kappaObsDim;
+			aster.kappaHeads = kappaHeads;
+			aster.kappaLagBuckets = kappaLagBuckets;
+			aster.kappaRank = kappaRank;
+			aster.controlDim = controlDim;
+			aster.hiddenStackDepth = stackDepth;
+			aster.stateRank = stateRank;
+			aster.trackedBlockIndices.reserve(stackDepth);
+			for (unsigned int d = 0u; d < stackDepth; ++d)
+				aster.trackedBlockIndices.push_back(modelCfg.nLayers - stackDepth + d);
+			aster.prevPrevControlMean.assign(static_cast<size_t>(regimeCount) * controlDim, 0.0f);
+			aster.prevControlMean.assign(static_cast<size_t>(regimeCount) * controlDim, 0.0f);
+			aster.prevPrevResidualMean.assign(static_cast<size_t>(regimeCount) * obsDim, 0.0f);
+			aster.prevResidualMean.assign(static_cast<size_t>(regimeCount) * obsDim, 0.0f);
+			aster.controlVar.assign(static_cast<size_t>(regimeCount) * controlDim, 1.0f);
+			aster.residualVar.assign(static_cast<size_t>(regimeCount) * obsDim, 1.0f);
+			aster.transportPastCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
+			aster.transportCrossCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim * sketchDim, 0.0f);
+			aster.pastCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(featureDim) * featureDim, 0.0f);
+			aster.crossCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(obsDim) * featureDim, 0.0f);
+			aster.theta.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(obsDim) * featureDim, 0.0f);
+			aster.statePastCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateFeatureDim) * stateFeatureDim, 0.0f);
+			aster.stateCrossCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * stateFeatureDim, 0.0f);
+			aster.innovationCov.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(obsDim) * obsDim, 0.0f);
+			aster.innovationCross.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * obsDim, 0.0f);
+			aster.sigma.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.leftMode.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * obsDim, 0.0f);
+			aster.rightMode.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stateRank) * featureDim, 0.0f);
+			for (unsigned int g = 0u; g < regimeCount; ++g)
+			{
+				const size_t leftBase = static_cast<size_t>(g) * static_cast<size_t>(stateRank) * obsDim;
+				const size_t rightBase = static_cast<size_t>(g) * static_cast<size_t>(stateRank) * featureDim;
+				for (unsigned int m = 0u; m < stateRank; ++m)
+				{
+					if (m < obsDim)
+						aster.leftMode[leftBase + static_cast<size_t>(m) * obsDim + m] = 1.0f;
+					if (m < featureDim)
+						aster.rightMode[rightBase + static_cast<size_t>(m) * featureDim + m] = 1.0f;
+				}
+			}
+			aster.batchFinalHiddenRawSum.assign(static_cast<size_t>(regimeCount) * dModel, 0.0f);
+			aster.batchFinalHiddenSketchSum.assign(static_cast<size_t>(regimeCount) * sketchDim, 0.0f);
+			aster.batchLayerHiddenRawSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * dModel, 0.0f);
+			aster.batchLayerHiddenSketchSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim, 0.0f);
+			aster.batchLayerAttnRawSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * dModel, 0.0f);
+			aster.batchLayerAttnSketchSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * sketchDim, 0.0f);
+			aster.batchLayerPatternSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * tokenCondDim, 0.0f);
+			aster.batchLayerKappaSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(stackDepth) * kappaObsDim, 0.0f);
+			aster.batchResidualSum.assign(static_cast<size_t>(regimeCount) * sketchDim, 0.0f);
+			aster.batchSupportLogitSum.assign(static_cast<size_t>(regimeCount) * supportDim, 0.0f);
+			aster.batchSupportResidualSum.assign(static_cast<size_t>(regimeCount) * supportDim, 0.0f);
+			aster.batchSupportCount.assign(static_cast<size_t>(regimeCount) * supportDim, 0.0f);
+			aster.batchSupportHiddenRawSum.assign(static_cast<size_t>(regimeCount) * static_cast<size_t>(supportDim) * dModel, 0.0f);
+			aster.batchTargetMarginSum.assign(regimeCount, 0.0f);
+			aster.batchHardNegativeLogitSum.assign(regimeCount, 0.0f);
+			aster.batchBaselineWorseSum.assign(regimeCount, 0.0f);
+			aster.batchRegimeTokenCount.assign(regimeCount, 0.0f);
+			aster.targetMarginEma.assign(regimeCount, 0.75f);
+			aster.hardNegativeLogitEma.assign(regimeCount, 0.0f);
+			aster.hardMarginShortfallEma.assign(regimeCount, 0.0f);
+			aster.prevPrevLatent.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.latent.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.poleNumer.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.poleDenom.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+			aster.pole.assign(static_cast<size_t>(regimeCount) * stateRank, 0.0f);
+		}
+		else
+		{
+			tensorTransformer.aster.reset();
 		}
 
 		return true;
@@ -1897,6 +3265,307 @@ static bool read_vec_f32_exact(std::istream& in, std::vector<float>& v, size_t e
 	}
 	return true;
 }
+
+struct TransformerTensorWeightsHeader
+{
+	unsigned int causal;
+	unsigned int nLayers;
+	unsigned int inputSize;
+	unsigned int dModel;
+	unsigned int dFF;
+	unsigned int nHeads;
+	unsigned int outSize;
+	unsigned int nKVHeads;
+	unsigned int ffnKind;
+	unsigned int tokenModel;
+	unsigned int vocabSize;
+	unsigned int padTokenId;
+	unsigned int tieEmbeddings;
+
+	TransformerTensorWeightsHeader()
+	    : causal(0u),
+	      nLayers(0u),
+	      inputSize(0u),
+	      dModel(0u),
+	      dFF(0u),
+	      nHeads(0u),
+	      outSize(0u),
+	      nKVHeads(0u),
+	      ffnKind(0u),
+	      tokenModel(0u),
+	      vocabSize(0u),
+	      padTokenId(0u),
+	      tieEmbeddings(0u)
+	{
+	}
+};
+
+struct TransformerWeightWriteField
+{
+	const char* name;
+	const std::vector<float>* values;
+
+	TransformerWeightWriteField(const char* fieldName, const std::vector<float>& fieldValues)
+	    : name(fieldName), values(&fieldValues)
+	{
+	}
+};
+
+struct TransformerWeightReadField
+{
+	const char* name;
+	std::vector<float>* values;
+	size_t expectedCount;
+
+	TransformerWeightReadField(const char* fieldName, std::vector<float>& fieldValues, size_t fieldExpectedCount)
+	    : name(fieldName), values(&fieldValues), expectedCount(fieldExpectedCount)
+	{
+	}
+};
+
+static void append_transformer_write_field(std::vector<TransformerWeightWriteField>& fields,
+                                           const char* name,
+                                           const std::vector<float>& values)
+{
+	fields.push_back(TransformerWeightWriteField(name, values));
+}
+
+static void append_transformer_read_field(std::vector<TransformerWeightReadField>& fields,
+                                          const char* name,
+                                          std::vector<float>& values,
+                                          size_t expectedCount)
+{
+	fields.push_back(TransformerWeightReadField(name, values, expectedCount));
+}
+
+static glades::NNetworkStatus write_transformer_weights_header(std::ostream& out,
+                                                               const TransformerTensorWeightsHeader& header)
+{
+	write_u32_le(out, header.causal);
+	write_u32_le(out, header.nLayers);
+	write_u32_le(out, header.inputSize);
+	write_u32_le(out, header.dModel);
+	write_u32_le(out, header.dFF);
+	write_u32_le(out, header.nHeads);
+	write_u32_le(out, header.outSize);
+	write_u32_le(out, header.nKVHeads);
+	write_u32_le(out, header.ffnKind);
+	write_u32_le(out, header.tokenModel);
+	write_u32_le(out, header.vocabSize);
+	write_u32_le(out, header.padTokenId);
+	write_u32_le(out, header.tieEmbeddings);
+	if (!out)
+		return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: failed to write transformer header");
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus read_transformer_weights_header(std::istream& in,
+                                                              TransformerTensorWeightsHeader& header)
+{
+	if (!read_u32_le(in, header.causal))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.causal");
+	if (!read_u32_le(in, header.nLayers))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nLayers");
+	if (!read_u32_le(in, header.inputSize))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.inputSize");
+	if (!read_u32_le(in, header.dModel))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dModel");
+	if (!read_u32_le(in, header.dFF))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dFF");
+	if (!read_u32_le(in, header.nHeads))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nHeads");
+	if (!read_u32_le(in, header.outSize))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.outSize");
+	if (!read_u32_le(in, header.nKVHeads))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nKVHeads");
+	if (!read_u32_le(in, header.ffnKind))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.ffnKind");
+	if (!read_u32_le(in, header.tokenModel))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tokenModel");
+	if (!read_u32_le(in, header.vocabSize))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.vocabSize");
+	if (!read_u32_le(in, header.padTokenId))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.padTokenId");
+	if (!read_u32_le(in, header.tieEmbeddings))
+		return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tieEmbeddings");
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus write_transformer_weight_fields(std::ostream& out,
+                                                              const std::vector<TransformerWeightWriteField>& fields)
+{
+	for (size_t i = 0; i < fields.size(); ++i)
+	{
+		if (!write_vec_f32(out, *fields[i].values))
+		{
+			std::string msg("saveTensorWeightsToFile: write failed (Transformer ");
+			msg += fields[i].name;
+			msg += ")";
+			return glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR, msg);
+		}
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static glades::NNetworkStatus read_transformer_weight_fields(std::istream& in,
+                                                             const std::vector<TransformerWeightReadField>& fields)
+{
+	for (size_t i = 0; i < fields.size(); ++i)
+	{
+		if (!read_vec_f32_exact(in, *fields[i].values, fields[i].expectedCount))
+		{
+			std::string msg("loadTensorWeightsFromFile: failed to read Transformer ");
+			msg += fields[i].name;
+			msg += " (size mismatch/corrupt)";
+			return glades::NNetworkStatus(glades::NNetworkStatus::INVALID_STATE, msg);
+		}
+	}
+	return glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
+}
+
+static void append_transformer_global_write_fields(std::vector<TransformerWeightWriteField>& fields,
+                                                   const std::vector<float>& WIn,
+                                                   const std::vector<float>& bIn,
+                                                   const std::vector<float>& WOut,
+                                                   const std::vector<float>& bOut,
+                                                   const std::vector<float>& tokE,
+                                                   const std::vector<float>& lmBias,
+                                                   const std::vector<float>& lnFinalGamma,
+                                                   const std::vector<float>& lnFinalBeta)
+{
+	fields.clear();
+	fields.reserve(8u);
+	append_transformer_write_field(fields, "WIn", WIn);
+	append_transformer_write_field(fields, "bIn", bIn);
+	append_transformer_write_field(fields, "WOut", WOut);
+	append_transformer_write_field(fields, "bOut", bOut);
+	append_transformer_write_field(fields, "tokE", tokE);
+	append_transformer_write_field(fields, "lmBias", lmBias);
+	append_transformer_write_field(fields, "lnFinalGamma", lnFinalGamma);
+	append_transformer_write_field(fields, "lnFinalBeta", lnFinalBeta);
+}
+
+static void append_transformer_global_read_fields(std::vector<TransformerWeightReadField>& fields,
+                                                  std::vector<float>& WIn,
+                                                  size_t WInCount,
+                                                  std::vector<float>& bIn,
+                                                  size_t bInCount,
+                                                  std::vector<float>& WOut,
+                                                  size_t WOutCount,
+                                                  std::vector<float>& bOut,
+                                                  size_t bOutCount,
+                                                  std::vector<float>& tokE,
+                                                  size_t tokECount,
+                                                  std::vector<float>& lmBias,
+                                                  size_t lmBiasCount,
+                                                  std::vector<float>& lnFinalGamma,
+                                                  size_t lnFinalGammaCount,
+                                                  std::vector<float>& lnFinalBeta,
+                                                  size_t lnFinalBetaCount)
+{
+	fields.clear();
+	fields.reserve(8u);
+	append_transformer_read_field(fields, "WIn", WIn, WInCount);
+	append_transformer_read_field(fields, "bIn", bIn, bInCount);
+	append_transformer_read_field(fields, "WOut", WOut, WOutCount);
+	append_transformer_read_field(fields, "bOut", bOut, bOutCount);
+	append_transformer_read_field(fields, "tokE", tokE, tokECount);
+	append_transformer_read_field(fields, "lmBias", lmBias, lmBiasCount);
+	append_transformer_read_field(fields, "lnFinalGamma", lnFinalGamma, lnFinalGammaCount);
+	append_transformer_read_field(fields, "lnFinalBeta", lnFinalBeta, lnFinalBetaCount);
+}
+
+static void append_transformer_block_write_fields(std::vector<TransformerWeightWriteField>& fields,
+                                                  const std::vector<float>& ln1Gamma,
+                                                  const std::vector<float>& ln1Beta,
+                                                  const std::vector<float>& Wq,
+                                                  const std::vector<float>& Wk,
+                                                  const std::vector<float>& Wv,
+                                                  const std::vector<float>& Wo,
+                                                  const std::vector<float>& bq,
+                                                  const std::vector<float>& bk,
+                                                  const std::vector<float>& bv,
+                                                  const std::vector<float>& bo,
+                                                  const std::vector<float>& ln2Gamma,
+                                                  const std::vector<float>& ln2Beta,
+                                                  const std::vector<float>& W1,
+                                                  const std::vector<float>& b1,
+                                                  const std::vector<float>& W2,
+                                                  const std::vector<float>& b2)
+{
+	fields.clear();
+	fields.reserve(16u);
+	append_transformer_write_field(fields, "ln1Gamma", ln1Gamma);
+	append_transformer_write_field(fields, "ln1Beta", ln1Beta);
+	append_transformer_write_field(fields, "Wq", Wq);
+	append_transformer_write_field(fields, "Wk", Wk);
+	append_transformer_write_field(fields, "Wv", Wv);
+	append_transformer_write_field(fields, "Wo", Wo);
+	append_transformer_write_field(fields, "bq", bq);
+	append_transformer_write_field(fields, "bk", bk);
+	append_transformer_write_field(fields, "bv", bv);
+	append_transformer_write_field(fields, "bo", bo);
+	append_transformer_write_field(fields, "ln2Gamma", ln2Gamma);
+	append_transformer_write_field(fields, "ln2Beta", ln2Beta);
+	append_transformer_write_field(fields, "W1", W1);
+	append_transformer_write_field(fields, "b1", b1);
+	append_transformer_write_field(fields, "W2", W2);
+	append_transformer_write_field(fields, "b2", b2);
+}
+
+static void append_transformer_block_read_fields(std::vector<TransformerWeightReadField>& fields,
+                                                 std::vector<float>& ln1Gamma,
+                                                 size_t ln1GammaCount,
+                                                 std::vector<float>& ln1Beta,
+                                                 size_t ln1BetaCount,
+                                                 std::vector<float>& Wq,
+                                                 size_t WqCount,
+                                                 std::vector<float>& Wk,
+                                                 size_t WkCount,
+                                                 std::vector<float>& Wv,
+                                                 size_t WvCount,
+                                                 std::vector<float>& Wo,
+                                                 size_t WoCount,
+                                                 std::vector<float>& bq,
+                                                 size_t bqCount,
+                                                 std::vector<float>& bk,
+                                                 size_t bkCount,
+                                                 std::vector<float>& bv,
+                                                 size_t bvCount,
+                                                 std::vector<float>& bo,
+                                                 size_t boCount,
+                                                 std::vector<float>& ln2Gamma,
+                                                 size_t ln2GammaCount,
+                                                 std::vector<float>& ln2Beta,
+                                                 size_t ln2BetaCount,
+                                                 std::vector<float>& W1,
+                                                 size_t W1Count,
+                                                 std::vector<float>& b1,
+                                                 size_t b1Count,
+                                                 std::vector<float>& W2,
+                                                 size_t W2Count,
+                                                 std::vector<float>& b2,
+                                                 size_t b2Count)
+{
+	fields.clear();
+	fields.reserve(16u);
+	append_transformer_read_field(fields, "ln1Gamma", ln1Gamma, ln1GammaCount);
+	append_transformer_read_field(fields, "ln1Beta", ln1Beta, ln1BetaCount);
+	append_transformer_read_field(fields, "Wq", Wq, WqCount);
+	append_transformer_read_field(fields, "Wk", Wk, WkCount);
+	append_transformer_read_field(fields, "Wv", Wv, WvCount);
+	append_transformer_read_field(fields, "Wo", Wo, WoCount);
+	append_transformer_read_field(fields, "bq", bq, bqCount);
+	append_transformer_read_field(fields, "bk", bk, bkCount);
+	append_transformer_read_field(fields, "bv", bv, bvCount);
+	append_transformer_read_field(fields, "bo", bo, boCount);
+	append_transformer_read_field(fields, "ln2Gamma", ln2Gamma, ln2GammaCount);
+	append_transformer_read_field(fields, "ln2Beta", ln2Beta, ln2BetaCount);
+	append_transformer_read_field(fields, "W1", W1, W1Count);
+	append_transformer_read_field(fields, "b1", b1, b1Count);
+	append_transformer_read_field(fields, "W2", W2, W2Count);
+	append_transformer_read_field(fields, "b2", b2, b2Count);
+}
 } // namespace
 
 glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::string& filePath) const
@@ -2042,52 +3711,50 @@ glades::NNetworkStatus glades::NNetwork::saveTensorWeightsToFile(const std::stri
 	if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
 	{
 		const TensorTransformerState& tt = tensorTransformer;
-		write_u32_le(out, tt.causal ? 1u : 0u);
-		write_u32_le(out, static_cast<unsigned int>(tt.blocks.size()));
-		write_u32_le(out, tt.inputSize);
-		write_u32_le(out, tt.dModel);
-		write_u32_le(out, tt.dFF);
-		write_u32_le(out, tt.nHeads);
-		write_u32_le(out, tt.outSize);
-		// v2+ transformer extras
-		write_u32_le(out, tt.nKVHeads);
-		write_u32_le(out, tt.ffnKind);
-		// v3+ token LM extras
-		write_u32_le(out, tt.tokenModel ? 1u : 0u);
-		write_u32_le(out, tt.vocabSize);
-		write_u32_le(out, static_cast<unsigned int>(tt.padTokenId));
-		write_u32_le(out, tt.tieEmbeddings ? 1u : 0u);
+		TransformerTensorWeightsHeader header;
+		header.causal = tt.causal ? 1u : 0u;
+		header.nLayers = static_cast<unsigned int>(tt.blocks.size());
+		header.inputSize = tt.inputSize;
+		header.dModel = tt.dModel;
+		header.dFF = tt.dFF;
+		header.nHeads = tt.nHeads;
+		header.outSize = tt.outSize;
+		header.nKVHeads = tt.nKVHeads;
+		header.ffnKind = tt.ffnKind;
+		header.tokenModel = tt.tokenModel ? 1u : 0u;
+		header.vocabSize = tt.vocabSize;
+		header.padTokenId = static_cast<unsigned int>(tt.padTokenId);
+		header.tieEmbeddings = tt.tieEmbeddings ? 1u : 0u;
+		{
+			const NNetworkStatus stHeader = write_transformer_weights_header(out, header);
+			if (!stHeader.ok())
+				return stHeader;
+		}
 
-		if (!write_vec_f32(out, tt.WIn)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer WIn)");
-		if (!write_vec_f32(out, tt.bIn)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bIn)");
-		if (!write_vec_f32(out, tt.WOut)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer WOut)");
-		if (!write_vec_f32(out, tt.bOut)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bOut)");
-		// Token LM tensors (present only when tokenModel==true, but written in a fixed slot for v3+)
-		if (!write_vec_f32(out, tt.tokE)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer tokE)");
-		if (!write_vec_f32(out, tt.lmBias)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lmBias)");
-		// Final LayerNorm
-		if (!write_vec_f32(out, tt.lnFinalGamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lnFinalGamma)");
-		if (!write_vec_f32(out, tt.lnFinalBeta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer lnFinalBeta)");
+		std::vector<TransformerWeightWriteField> fields;
+		append_transformer_global_write_fields(fields,
+		                                     tt.WIn, tt.bIn,
+		                                     tt.WOut, tt.bOut,
+		                                     tt.tokE, tt.lmBias,
+		                                     tt.lnFinalGamma, tt.lnFinalBeta);
+		{
+			const NNetworkStatus stGlobals = write_transformer_weight_fields(out, fields);
+			if (!stGlobals.ok())
+				return stGlobals;
+		}
 
 		for (size_t l = 0; l < tt.blocks.size(); ++l)
 		{
 			const TensorTransformerState::Block& b = tt.blocks[l];
-			if (!write_vec_f32(out, b.ln1Gamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln1Gamma)");
-			if (!write_vec_f32(out, b.ln1Beta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln1Beta)");
-			if (!write_vec_f32(out, b.Wq)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wq)");
-			if (!write_vec_f32(out, b.Wk)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wk)");
-			if (!write_vec_f32(out, b.Wv)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wv)");
-			if (!write_vec_f32(out, b.Wo)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer Wo)");
-			if (!write_vec_f32(out, b.bq)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bq)");
-			if (!write_vec_f32(out, b.bk)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bk)");
-			if (!write_vec_f32(out, b.bv)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bv)");
-			if (!write_vec_f32(out, b.bo)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer bo)");
-			if (!write_vec_f32(out, b.ln2Gamma)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln2Gamma)");
-			if (!write_vec_f32(out, b.ln2Beta)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer ln2Beta)");
-			if (!write_vec_f32(out, b.W1)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer W1)");
-			if (!write_vec_f32(out, b.b1)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer b1)");
-			if (!write_vec_f32(out, b.W2)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer W2)");
-			if (!write_vec_f32(out, b.b2)) return NNetworkStatus(NNetworkStatus::INTERNAL_ERROR, "saveTensorWeightsToFile: write failed (Transformer b2)");
+			append_transformer_block_write_fields(fields,
+			                                      b.ln1Gamma, b.ln1Beta,
+			                                      b.Wq, b.Wk, b.Wv, b.Wo,
+			                                      b.bq, b.bk, b.bv, b.bo,
+			                                      b.ln2Gamma, b.ln2Beta,
+			                                      b.W1, b.b1, b.W2, b.b2);
+			const NNetworkStatus stBlock = write_transformer_weight_fields(out, fields);
+			if (!stBlock.ok())
+				return stBlock;
 		}
 
 		out.flush();
@@ -2408,42 +4075,26 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 
 	if (netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER)
 	{
-		unsigned int causalIntU = 0u;
-		unsigned int nLayersU = 0u;
-		unsigned int inputSize = 0, dModel = 0, dFF = 0, nHeads = 0, outSize = 0;
-		unsigned int nKVHeads = 0u;
-		unsigned int ffnKind = 0u;
-		unsigned int tokenModelU = 0u;
-		unsigned int vocabSizeU = 0u;
-		unsigned int padTokenU = 0u;
-		unsigned int tieEmbU = 0u;
-		if (!read_u32_le(in, causalIntU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.causal");
-		if (!read_u32_le(in, nLayersU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nLayers");
-		if (!read_u32_le(in, inputSize))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.inputSize");
-		if (!read_u32_le(in, dModel))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dModel");
-		if (!read_u32_le(in, dFF))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.dFF");
-		if (!read_u32_le(in, nHeads))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nHeads");
-		if (!read_u32_le(in, outSize))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.outSize");
-		// v3-only
-		if (!read_u32_le(in, nKVHeads))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.nKVHeads");
-		if (!read_u32_le(in, ffnKind))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.ffnKind");
-		if (!read_u32_le(in, tokenModelU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tokenModel");
-		if (!read_u32_le(in, vocabSizeU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.vocabSize");
-		if (!read_u32_le(in, padTokenU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.padTokenId");
-		if (!read_u32_le(in, tieEmbU))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: missing transformer.tieEmbeddings");
+		TransformerTensorWeightsHeader header;
+		{
+			const NNetworkStatus stHeader = read_transformer_weights_header(in, header);
+			if (!stHeader.ok())
+				return failStatus(stHeader.code, stHeader.message);
+		}
+
+		const unsigned int causalIntU = header.causal;
+		const unsigned int nLayersU = header.nLayers;
+		const unsigned int inputSize = header.inputSize;
+		const unsigned int dModel = header.dModel;
+		const unsigned int dFF = header.dFF;
+		const unsigned int nHeads = header.nHeads;
+		const unsigned int outSize = header.outSize;
+		const unsigned int nKVHeads = header.nKVHeads;
+		const unsigned int ffnKind = header.ffnKind;
+		const unsigned int tokenModelU = header.tokenModel;
+		const unsigned int vocabSizeU = header.vocabSize;
+		const unsigned int padTokenU = header.padTokenId;
+		const unsigned int tieEmbU = header.tieEmbeddings;
 		const size_t nLayers = static_cast<size_t>(nLayersU);
 
 		tensorTransformer.reset();
@@ -2479,39 +4130,36 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		if (tensorTransformer.tokenModel && !tensorTransformer.tieEmbeddings)
 			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: tokenModel requires tieEmbeddings");
 
+		size_t WInCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(inputSize), WInCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WIn size overflow");
+		size_t WOutCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(outSize), static_cast<size_t>(dModel), WOutCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WOut size overflow");
+		size_t tokECount = 0u;
+		if (tensorTransformer.tokenModel &&
+		    !mul_size_checked(static_cast<size_t>(tensorTransformer.vocabSize), static_cast<size_t>(dModel), tokECount))
 		{
-			size_t want = 0u;
-			if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(inputSize), want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WIn size overflow");
-			if (!read_vec_f32_exact(in, tensorTransformer.WIn, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer WIn (size mismatch/corrupt)");
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer tokE size overflow");
 		}
-		if (!read_vec_f32_exact(in, tensorTransformer.bIn, static_cast<size_t>(dModel)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bIn (size mismatch/corrupt)");
+		const size_t dModelCount = static_cast<size_t>(dModel);
+		const size_t outSizeCount = static_cast<size_t>(outSize);
+		const size_t vocabCount = tensorTransformer.tokenModel ? static_cast<size_t>(tensorTransformer.vocabSize) : 0u;
+		std::vector<TransformerWeightReadField> fields;
+		append_transformer_global_read_fields(fields,
+		                                     tensorTransformer.WIn, WInCount,
+		                                     tensorTransformer.bIn, dModelCount,
+		                                     tensorTransformer.WOut, WOutCount,
+		                                     tensorTransformer.bOut, outSizeCount,
+		                                     tensorTransformer.tokE, tokECount,
+		                                     tensorTransformer.lmBias, vocabCount,
+		                                     tensorTransformer.lnFinalGamma, dModelCount,
+		                                     tensorTransformer.lnFinalBeta, dModelCount);
 		{
-			size_t want = 0u;
-			if (!mul_size_checked(static_cast<size_t>(outSize), static_cast<size_t>(dModel), want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer WOut size overflow");
-			if (!read_vec_f32_exact(in, tensorTransformer.WOut, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer WOut (size mismatch/corrupt)");
+			const NNetworkStatus stGlobals = read_transformer_weight_fields(in, fields);
+			if (!stGlobals.ok())
+				return failStatus(stGlobals.code, stGlobals.message);
 		}
-		if (!read_vec_f32_exact(in, tensorTransformer.bOut, static_cast<size_t>(outSize)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bOut (size mismatch/corrupt)");
-		{
-			const size_t want = tensorTransformer.tokenModel ? (static_cast<size_t>(tensorTransformer.vocabSize) * static_cast<size_t>(dModel)) : 0u;
-			if (!read_vec_f32_exact(in, tensorTransformer.tokE, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer tokE (size mismatch/corrupt)");
-		}
-		{
-			const size_t want = tensorTransformer.tokenModel ? static_cast<size_t>(tensorTransformer.vocabSize) : 0u;
-			if (!read_vec_f32_exact(in, tensorTransformer.lmBias, want))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lmBias (size mismatch/corrupt)");
-		}
-		// Final LayerNorm
-		if (!read_vec_f32_exact(in, tensorTransformer.lnFinalGamma, static_cast<size_t>(dModel)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lnFinalGamma (size mismatch/corrupt)");
-		if (!read_vec_f32_exact(in, tensorTransformer.lnFinalBeta, static_cast<size_t>(dModel)))
-			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer lnFinalBeta (size mismatch/corrupt)");
 
 		tensorTransformer.vWIn.assign(tensorTransformer.WIn.size(), 0.0f);
 		tensorTransformer.v2WIn.assign(tensorTransformer.WIn.size(), 0.0f);
@@ -2538,72 +4186,51 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		tensorTransformer.v2LnFinalBeta.assign(tensorTransformer.lnFinalBeta.size(), 0.0f);
 		tensorTransformer.gLnFinalBeta.assign(tensorTransformer.lnFinalBeta.size(), 0.0f);
 
+		size_t WqCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), WqCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wq size overflow");
+		size_t WkCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), WkCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wk size overflow");
+		size_t WvCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), WvCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wv size overflow");
+		size_t WoCount = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), WoCount))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wo size overflow");
+		size_t W1Count = 0u;
+		if (!mul_size_checked(static_cast<size_t>(ff1Width), static_cast<size_t>(dModel), W1Count))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W1 size overflow");
+		size_t W2Count = 0u;
+		if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dFF), W2Count))
+			return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W2 size overflow");
+		const size_t dModelKVCount = static_cast<size_t>(dModelKV);
+		const size_t ff1WidthCount = static_cast<size_t>(ff1Width);
+
 		tensorTransformer.blocks.resize(nLayers);
 		for (size_t l = 0; l < nLayers; ++l)
 		{
 			TensorTransformerState::Block& b = tensorTransformer.blocks[l];
-			if (!read_vec_f32_exact(in, b.ln1Gamma, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln1Gamma (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.ln1Beta, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln1Beta (size mismatch/corrupt)");
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wq size overflow");
-				if (!read_vec_f32_exact(in, b.Wq, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wq (size mismatch/corrupt)");
-			}
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wk size overflow");
-				if (!read_vec_f32_exact(in, b.Wk, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wk (size mismatch/corrupt)");
-			}
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModelKV), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wv size overflow");
-				if (!read_vec_f32_exact(in, b.Wv, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wv (size mismatch/corrupt)");
-			}
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer Wo size overflow");
-				if (!read_vec_f32_exact(in, b.Wo, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer Wo (size mismatch/corrupt)");
-			}
-			if (!read_vec_f32_exact(in, b.bq, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bq (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.bk, static_cast<size_t>(dModelKV)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bk (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.bv, static_cast<size_t>(dModelKV)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bv (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.bo, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer bo (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.ln2Gamma, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln2Gamma (size mismatch/corrupt)");
-			if (!read_vec_f32_exact(in, b.ln2Beta, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer ln2Beta (size mismatch/corrupt)");
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(ff1Width), static_cast<size_t>(dModel), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W1 size overflow");
-				if (!read_vec_f32_exact(in, b.W1, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer W1 (size mismatch/corrupt)");
-			}
-			if (!read_vec_f32_exact(in, b.b1, static_cast<size_t>(ff1Width)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer b1 (size mismatch/corrupt)");
-			{
-				size_t want = 0u;
-				if (!mul_size_checked(static_cast<size_t>(dModel), static_cast<size_t>(dFF), want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: Transformer W2 size overflow");
-				if (!read_vec_f32_exact(in, b.W2, want))
-					return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer W2 (size mismatch/corrupt)");
-			}
-			if (!read_vec_f32_exact(in, b.b2, static_cast<size_t>(dModel)))
-				return failStatus(NNetworkStatus::INVALID_STATE, "loadTensorWeightsFromFile: failed to read Transformer b2 (size mismatch/corrupt)");
+			append_transformer_block_read_fields(fields,
+			                                     b.ln1Gamma, dModelCount,
+			                                     b.ln1Beta, dModelCount,
+			                                     b.Wq, WqCount,
+			                                     b.Wk, WkCount,
+			                                     b.Wv, WvCount,
+			                                     b.Wo, WoCount,
+			                                     b.bq, dModelCount,
+			                                     b.bk, dModelKVCount,
+			                                     b.bv, dModelKVCount,
+			                                     b.bo, dModelCount,
+			                                     b.ln2Gamma, dModelCount,
+			                                     b.ln2Beta, dModelCount,
+			                                     b.W1, W1Count,
+			                                     b.b1, ff1WidthCount,
+			                                     b.W2, W2Count,
+			                                     b.b2, dModelCount);
+			const NNetworkStatus stBlock = read_transformer_weight_fields(in, fields);
+			if (!stBlock.ok())
+				return failStatus(stBlock.code, stBlock.message);
 
 			b.mLn1Gamma.assign(b.ln1Gamma.size(), 0.0f);
 			b.v2Ln1Gamma.assign(b.ln1Gamma.size(), 0.0f);
@@ -2818,6 +4445,30 @@ glades::NNetworkStatus glades::NNetwork::setTrainingConfig(const glades::Trainin
 	RunLockGuard runGuard(*this);
 	if (!runGuard.ok())
 		return NNetworkStatus(NNetworkStatus::INVALID_STATE, "setTrainingConfig: network is running (not thread-safe/re-entrant)");
+	NNetworkStatus st = validateTransformerTrainingConfig("setTrainingConfig", cfg);
+	if (!st.ok())
+		return st;
+	if ((netType == TYPE_TRANSFORMER_ENCODER || netType == TYPE_TRANSFORMER_DECODER) && skeleton && di)
+	{
+		std::vector<unsigned int> hiddenSizes;
+		const int hiddenCount = skeleton->numHiddenLayers();
+		hiddenSizes.reserve(static_cast<size_t>(hiddenCount > 0 ? hiddenCount : 0));
+		for (int i = 0; i < hiddenCount; ++i)
+		{
+			const int hs = skeleton->getHiddenLayerSize(static_cast<unsigned int>(i));
+			hiddenSizes.push_back(hs > 0 ? static_cast<unsigned int>(hs) : 0u);
+		}
+		TransformerModelConfigSnapshot modelCfg;
+		st = buildTransformerModelConfigSnapshot("setTrainingConfig",
+		                                         cfg,
+		                                         hiddenSizes,
+		                                         skeleton->getOutputLayerSize(),
+		                                         cfg.transformer.enableTokenEmbedding && di->hasTokenIdInput(),
+		                                         netType == TYPE_TRANSFORMER_DECODER,
+		                                         modelCfg);
+		if (!st.ok())
+			return st;
+	}
 	trainingConfig = cfg;
 	// Reset schedule bookkeeping to avoid leaking stale multipliers into the next run.
 	lrScheduleMultiplier = 1.0f;
@@ -2890,9 +4541,15 @@ bool glades::NNetwork::ensureGpuState()
 		if (!gpuTransformerWeights)
 			gpuTransformerWeights = new gpu::GpuTransformerWeights();
 
-		if (!gpuTransformerWeights->initialized)
+		const bool needAdamMoments = atlas_transformer_needs_adam_moments(trainingConfig);
+		const bool skipAdam = !needAdamMoments;
+		const bool needGpuReallocate =
+		    (!gpuTransformerWeights->initialized)
+		    || (needAdamMoments && !gpu_transformer_has_adam_moments(*gpuTransformerWeights));
+		if (needGpuReallocate)
 		{
-			const bool skipAdam = (trainingConfig.optimizer.type == OptimizerConfig::ATLAS);
+			if (gpuTransformerWeights->initialized)
+				gpuTransformerWeights->free();
 			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
 			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
 			                                      ts.outSize, ts.ffnKind, ts.tokenModel,
@@ -3068,4 +4725,3 @@ void glades::NNetwork::freeGpuState()
 #endif
 	gpuStateReady = false;
 }
-

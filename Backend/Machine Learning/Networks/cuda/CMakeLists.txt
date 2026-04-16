@@ -40,6 +40,14 @@ else()
 	target_link_libraries(GladesCUDA cublas)
 endif()
 
+# Link cuSOLVER for batched factorizations.
+find_library(CUSOLVER_LIB cusolver HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+if(CUSOLVER_LIB)
+	target_link_libraries(GladesCUDA ${CUSOLVER_LIB})
+else()
+	target_link_libraries(GladesCUDA cusolver)
+endif()
+
 # Link CUDA runtime so downstream consumers (unit tests, etc.) get it transitively.
 find_library(CUDART_LIB cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
 if(CUDART_LIB)

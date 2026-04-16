@@ -33,6 +33,17 @@ project(glades-unit-tests)
 set(G_VERSION_MAJOR 0)
 set(G_VERSION_MINOR 57)
 
+option(GLADES_BUILD_TRANSFORMER_INFER_FUZZER "Build the opt-in libFuzzer harness for transformer infer APIs" OFF)
+
+if(GLADES_BUILD_TRANSFORMER_INFER_FUZZER)
+	if(NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+		message(FATAL_ERROR
+			"GLADES_BUILD_TRANSFORMER_INFER_FUZZER requires Clang/AppleClang with libFuzzer support. "
+			"Reconfigure unit-tests with -DCMAKE_CXX_COMPILER=clang++.")
+	endif()
+	set(GLADES_LIBFUZZER_SANITIZER_FLAGS "-fsanitize=fuzzer,address,undefined")
+endif()
+
 set(DEFAULT_BUILD_TYPE "Release")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)

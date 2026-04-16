@@ -13,50 +13,10 @@
 #include <sstream>
 #include <vector>
 
-using namespace glades;
+#include "logfmt_utils.h"
 
-namespace {
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, const std::string& v)
-{
-	oss << ' ' << k << '=';
-	bool needQuote = false;
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == ' ' || c == '=' || c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t')
-		{
-			needQuote = true;
-			break;
-		}
-	}
-	if (!needQuote)
-	{
-		oss << v;
-		return;
-	}
-	oss << '"';
-	for (size_t i = 0; i < v.size(); ++i)
-	{
-		const char c = v[i];
-		if (c == '\\' || c == '"')
-			oss << '\\' << c;
-		else if (c == '\n')
-			oss << "\\n";
-		else if (c == '\r')
-			oss << "\\r";
-		else if (c == '\t')
-			oss << "\\t";
-		else
-			oss << c;
-	}
-	oss << '"';
-}
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, int v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned int v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, unsigned long long v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, float v) { oss << ' ' << k << '=' << v; }
-static inline void append_logfmt_kv(std::ostringstream& oss, const char* k, double v) { oss << ' ' << k << '=' << v; }
-} // namespace
+using namespace glades;
+using namespace glades::logfmt;
 
 void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 {
@@ -202,7 +162,7 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		float& lastGradNorm;
 		float& lastGradNormScale;
 		NNetworkStatus& lastStatus;
-		volatile bool& running;
+		volatile int& running;
 		TensorRNNState& tensorRnn;
 		int H;
 		unsigned int outSize;
@@ -1006,4 +966,3 @@ void glades::NNetwork::SGDHelper_RNN(unsigned int inputRowCounter, int runType)
 		timeStepsInBatch = 0u;
 	}
 }
-

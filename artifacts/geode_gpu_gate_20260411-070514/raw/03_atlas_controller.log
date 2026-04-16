@@ -1,0 +1,95 @@
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-controller
+============================================================
+ATLAS Complement Controller Unit Test Suite
+============================================================
+-----------------------------------
+ATLAS Controller Test C1: probation before promotion
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[272]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6049]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6050]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6052]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6063]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6064]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6066]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6069]
+-----------------------------------
+ATLAS Controller Test C2: scout evidence stays on probation
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[272]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6122]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6123]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6132]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6133]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6137]
+-----------------------------------
+ATLAS Controller Test C4: rotated scout subspace remains promotable
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[272]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6193]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6194]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6207]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6208]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6211]
+-----------------------------------
+ATLAS Controller Test C5: PRISM predictive-edge gate blocks stale complement modes
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[272]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6259]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6260]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6262]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6265]
+-----------------------------------
+ATLAS Controller Test C6: PRISM active memory damps aligned active corrections
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6327]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6331]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6346]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6348]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6351]
+-----------------------------------
+ATLAS Controller Test C7: RESOLVE transfer-edge gate blocks stale complement modes
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[272]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6400]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6401]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6403]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6406]
+-----------------------------------
+ATLAS Controller Test C8: RESOLVE active memory damps aligned active corrections
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6470]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6474]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6489]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6491]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6494]
+-----------------------------------
+ATLAS Controller Test C9: HERO Hankel-edge gate blocks stale complement modes
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[272]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6543]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6544]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6546]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6549]
+-----------------------------------
+ATLAS Controller Test C10: HERO active memory damps aligned active corrections
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6613]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6617]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6632]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6634]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6637]
+-----------------------------------
+ATLAS Controller Test C3: misaligned scout rejection
+-----------------------------------
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[272]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6690]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6691]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6699]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6700]
+Unit Test Success /home/robert/dev/glades-ml/unit-tests/Backend/Machine Learning/atlas-test.cpp[6703]
+
+============================================================
+========================
+| Unit Tests Completed |
+========================

@@ -7,40 +7,63 @@
 #include "Backend/Database/GTable.h"
 
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <limits>
+#include <sys/stat.h>
 
 using namespace glades;
 
 namespace {
-// Thread-local storage for row-view scratch scalars.
-//
-// This codebase may be compiled in a pre-C++11 mode, so we cannot rely on `thread_local`.
-// Prefer standard TLS when available; otherwise fall back to compiler TLS.
-#if defined(__cplusplus) && (__cplusplus >= 201103L)
-#define GLADES_THREAD_LOCAL thread_local
-#elif defined(_MSC_VER)
-#define GLADES_THREAD_LOCAL __declspec(thread)
-#elif defined(__GNUC__) || defined(__clang__)
-#define GLADES_THREAD_LOCAL __thread
-#else
-#error "TokenInput row-view APIs require thread-local storage support"
-#endif
 
 static inline std::string to_std_string(const shmea::GString& s)
 {
 	return std::string(s.c_str());
 }
 
-static inline bool path_ends_with(const std::string& s, const std::string& suf)
+static inline bool path_is_directory(const std::string& p)
 {
-	if (s.size() < suf.size())
+	struct stat st;
+	if (::stat(p.c_str(), &st) != 0)
 		return false;
-	return s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+	return S_ISDIR(st.st_mode);
+}
+
+static inline std::string join_path(const std::string& base, const char* leaf)
+{
+	if (base.empty())
+		return std::string(leaf);
+	if (base[base.size() - 1] == '/')
+		return base + leaf;
+	return base + "/" + leaf;
+}
+
+static inline bool parse_non_negative_int_token(const std::string& s, int& outTok)
+{
+	if (s.empty())
+		return false;
+
+	char* end = NULL;
+	errno = 0;
+	const long long v = strtoll(s.c_str(), &end, 10);
+	if (end == s.c_str() || errno != 0)
+		return false;
+	while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end)))
+		++end;
+	if (*end != '\0')
+		return false;
+	if (v < static_cast<long long>(std::numeric_limits<int>::min()) ||
+	    v > static_cast<long long>(std::numeric_limits<int>::max()))
+		return false;
+	if (v < 0ll)
+		return false;
+
+	outTok = static_cast<int>(v);
+	return true;
 }
 
 static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
@@ -48,25 +71,51 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 	outTok = 0;
 	switch (cell.getType())
 	{
-	case shmea::GType::CHAR_TYPE: outTok = static_cast<int>(cell.getChar()); return true;
-	case shmea::GType::SHORT_TYPE: outTok = static_cast<int>(cell.getShort()); return true;
-	case shmea::GType::INT_TYPE: outTok = cell.getInt(); return true;
+	case shmea::GType::CHAR_TYPE:
+		outTok = static_cast<int>(cell.getChar());
+		return outTok >= 0;
+	case shmea::GType::SHORT_TYPE:
+		outTok = static_cast<int>(cell.getShort());
+		return outTok >= 0;
+	case shmea::GType::INT_TYPE:
+		outTok = cell.getInt();
+		return outTok >= 0;
 	case shmea::GType::LONG_TYPE:
 	{
-		const long long v = static_cast<long long>(cell.getLong());
+		const long long v = cell.getLong();
 		if (v < static_cast<long long>(std::numeric_limits<int>::min()) || v > static_cast<long long>(std::numeric_limits<int>::max()))
+			return false;
+		if (v < 0ll)
 			return false;
 		outTok = static_cast<int>(v);
 		return true;
 	}
-	case shmea::GType::BOOLEAN_TYPE: outTok = cell.getBoolean() ? 1 : 0; return true;
+	case shmea::GType::BOOLEAN_TYPE:
+		return false;
 	case shmea::GType::FLOAT_TYPE:
-	case shmea::GType::DOUBLE_TYPE:
 	{
 		const double v = static_cast<double>(cell.getFloat());
 		if (!std::isfinite(v))
 			return false;
+		if (std::floor(v) != v)
+			return false;
 		if (v < static_cast<double>(std::numeric_limits<int>::min()) || v > static_cast<double>(std::numeric_limits<int>::max()))
+			return false;
+		if (v < 0.0)
+			return false;
+		outTok = static_cast<int>(v);
+		return true;
+	}
+	case shmea::GType::DOUBLE_TYPE:
+	{
+		const double v = cell.getDouble();
+		if (!std::isfinite(v))
+			return false;
+		if (std::floor(v) != v)
+			return false;
+		if (v < static_cast<double>(std::numeric_limits<int>::min()) || v > static_cast<double>(std::numeric_limits<int>::max()))
+			return false;
+		if (v < 0.0)
 			return false;
 		outTok = static_cast<int>(v);
 		return true;
@@ -74,26 +123,49 @@ static bool cell_to_int_token(const shmea::GType& cell, int& outTok)
 	case shmea::GType::STRING_TYPE:
 	default:
 	{
-		// Best-effort parse from string.
-		const std::string s = std::string(cell.c_str());
-		if (s.empty())
-			return false;
-		std::istringstream iss(s);
-		long long v = 0;
-		if (!(iss >> v))
-			return false;
-		if (v < static_cast<long long>(std::numeric_limits<int>::min()) || v > static_cast<long long>(std::numeric_limits<int>::max()))
-			return false;
-		outTok = static_cast<int>(v);
+		return parse_non_negative_int_token(std::string(cell.c_str()), outTok);
+	}
+	}
+}
+
+static bool append_token_id_sequence(const std::vector<int>& toks,
+                                     int padTokenId,
+                                     std::vector<int>& outTok,
+                                     std::vector<int>& outNext,
+                                     std::vector<DataInput::SequenceSpan>& outSeq,
+                                     unsigned int& cursor)
+{
+	if (toks.empty())
 		return true;
+
+	const unsigned int len = static_cast<unsigned int>(toks.size());
+	const bool usePad = (padTokenId >= 0);
+	const unsigned int emitLen = usePad ? len : (len > 0u ? (len - 1u) : 0u);
+	if (emitLen == 0u)
+		return true;
+
+	const unsigned int start = cursor;
+	outTok.reserve(outTok.size() + emitLen);
+	outNext.reserve(outNext.size() + emitLen);
+	for (unsigned int i = 0; i < emitLen; ++i)
+	{
+		outTok.push_back(toks[i]);
+		if (i + 1u < len)
+			outNext.push_back(toks[i + 1u]);
+		else
+			outNext.push_back(padTokenId);
 	}
-	}
+
+	outSeq.push_back(DataInput::SequenceSpan(start, emitLen));
+	cursor += emitLen;
+	return true;
 }
 } // namespace
 
 glades::TokenInput::TokenInput()
     : loaded(false),
       padTokenId(-1),
+      mirrorTrainToTestOnImplicitSplit(false),
       lastImportStatus(glades::NNetworkStatus::OK, std::string())
 {
 	trainTok.clear();
@@ -104,11 +176,18 @@ glades::TokenInput::TokenInput()
 
 glades::TokenInput::~TokenInput()
 {
+	clearLoadedData();
+}
+
+void glades::TokenInput::clearLoadedData()
+{
 	loaded = false;
 	trainTok.clear();
 	trainNextTok.clear();
 	testTok.clear();
 	testNextTok.clear();
+	clearTrainSequences();
+	clearTestSequences();
 }
 
 glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path,
@@ -169,34 +248,8 @@ glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path
 		if (toks.empty())
 			continue;
 
-		// Emit language-model rows:
-		// - For each token, the target is the next token in the same sequence.
-		// - For the final token, there is no "next token". If padTokenId >= 0, we emit an
-		//   explicit pad/ignore target; otherwise we DO NOT emit the final timestep.
-		//
-		// Rationale:
-		// - Token IDs are first-class ints, but many downstream call sites historically cast
-		//   expected rows to unsigned token IDs; emitting a negative pad/ignore id is not safe.
-		const unsigned int len = static_cast<unsigned int>(toks.size());
-		const bool usePad = (padTokenId >= 0);
-		const unsigned int emitLen = (usePad ? len : (len > 0u ? (len - 1u) : 0u));
-		if (emitLen == 0u)
-			continue;
-
-		const unsigned int start = cursor;
-		outTok.reserve(outTok.size() + emitLen);
-		outNext.reserve(outNext.size() + emitLen);
-		for (unsigned int i = 0; i < emitLen; ++i)
-		{
-			outTok.push_back(toks[i]);
-			if (i + 1u < len)
-				outNext.push_back(toks[i + 1u]);
-			else
-				outNext.push_back(padTokenId); // only reachable when usePad==true
-		}
-
-		outSeq.push_back(SequenceSpan(start, emitLen));
-		cursor += emitLen;
+		// Emit one language-model sequence span per non-empty line.
+		append_token_id_sequence(toks, padTokenId, outTok, outNext, outSeq, cursor);
 	}
 
 	if (outTok.empty())
@@ -208,61 +261,69 @@ glades::NNetworkStatus glades::TokenInput::loadTokenFile(const std::string& path
 
 void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 {
-	if (loaded)
-	{
-		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
-		return;
-	}
-
 	const std::string p = to_std_string(fname);
 	if (p.empty())
 	{
+		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import: empty path");
-		loaded = false;
 		return;
 	}
+	const bool isDirectoryImport = path_is_directory(p);
 
-	// Directory semantics: if path ends with '/', accept "train.tok" + "test.tok".
-	// File semantics: treat as train only (mirror to test).
+	std::vector<int> newTrainTok;
+	std::vector<int> newTrainNextTok;
+	std::vector<int> newTestTok;
+	std::vector<int> newTestNextTok;
+	// Directory semantics: require both "train.tok" and "test.tok".
+	// File semantics: treat the file as train-only unless mirroring was explicitly requested.
 	std::vector<SequenceSpan> trSeq;
 	std::vector<SequenceSpan> teSeq;
 
 	glades::NNetworkStatus stTrain(glades::NNetworkStatus::OK, std::string());
-	if (path_ends_with(p, "/"))
+	glades::NNetworkStatus stTest(glades::NNetworkStatus::OK, std::string());
+	if (isDirectoryImport)
 	{
-		stTrain = loadTokenFile(p + "train.tok", trainTok, trainNextTok, trSeq);
-		// Test split is optional; ignore failures and mirror train->test below.
-		(void)loadTokenFile(p + "test.tok", testTok, testNextTok, teSeq);
+		stTrain = loadTokenFile(join_path(p, "train.tok"), newTrainTok, newTrainNextTok, trSeq);
+		stTest = loadTokenFile(join_path(p, "test.tok"), newTestTok, newTestNextTok, teSeq);
 	}
 	else
 	{
-		stTrain = loadTokenFile(p, trainTok, trainNextTok, trSeq);
+		stTrain = loadTokenFile(p, newTrainTok, newTrainNextTok, trSeq);
 	}
 
 	if (!stTrain.ok())
 	{
-		trainTok.clear();
-		trainNextTok.clear();
-		testTok.clear();
-		testNextTok.clear();
-		clearTrainSequences();
-		clearTestSequences();
-		loaded = false;
+		clearLoadedData();
 		lastImportStatus = stTrain;
 		return;
 	}
-
-	// Default: if no explicit test split loaded, mirror train->test.
-	if (testTok.empty() && !trainTok.empty())
+	if (isDirectoryImport && !stTest.ok())
 	{
-		testTok = trainTok;
-		testNextTok = trainNextTok;
+		clearLoadedData();
+		lastImportStatus = stTest;
+		return;
+	}
+
+	// Optional compatibility mode for single-input imports.
+	if (!isDirectoryImport && mirrorTrainToTestOnImplicitSplit && newTestTok.empty() && !newTrainTok.empty())
+	{
+		newTestTok = newTrainTok;
+		newTestNextTok = newTrainNextTok;
 		teSeq = trSeq;
 	}
 
+	trainTok.swap(newTrainTok);
+	trainNextTok.swap(newTrainNextTok);
+	testTok.swap(newTestTok);
+	testNextTok.swap(newTestNextTok);
 	// Install sequence spans.
-	setTrainSequences(trSeq);
-	setTestSequences(teSeq);
+	if (!setTrainSequences(trSeq) || !setTestSequences(teSeq))
+	{
+		clearLoadedData();
+		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                                         "TokenInput::import: invalid sequence spans after load");
+		return;
+	}
 
 	loaded = true;
 	lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
@@ -270,12 +331,6 @@ void glades::TokenInput::import(shmea::GString fname, int /*standardizeFlag*/)
 
 void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 {
-	if (loaded)
-	{
-		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
-		return;
-	}
-
 	// Interpret a table as token IDs:
 	// - If cols==1: each row is one timestep; the whole table is a single sequence.
 	// - If cols>1: each table row is treated as one independent sequence spanning all columns.
@@ -285,28 +340,18 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 	const unsigned int C = t.numberOfCols();
 	if (R == 0u || C == 0u)
 	{
+		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::EMPTY_DATA, "TokenInput::import(table): empty table");
-		loaded = false;
 		return;
 	}
 
+	std::vector<int> newTrainTok;
+	std::vector<int> newTrainNextTok;
 	std::vector<SequenceSpan> trSeq;
-	trainTok.clear();
-	trainNextTok.clear();
+	std::vector<SequenceSpan> teSeq;
 
 	if (C == 1u)
 	{
-		// One sequence spanning all rows.
-		// When padTokenId < 0, we omit the final timestep to avoid negative expected token ids.
-		const bool usePad = (padTokenId >= 0);
-		const unsigned int emitLen = (usePad ? R : (R > 0u ? (R - 1u) : 0u));
-		if (emitLen == 0u)
-		{
-			lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::EMPTY_DATA, "TokenInput::import(table): empty after LM pair emission");
-			loaded = false;
-			return;
-		}
-
 		std::vector<int> toks;
 		toks.reserve(R);
 		for (unsigned int r = 0; r < R; ++r)
@@ -314,180 +359,127 @@ void glades::TokenInput::import(const shmea::GTable& t, int /*standardizeFlag*/)
 			int tok = 0;
 			if (!cell_to_int_token(t.getCell(r, 0u), tok))
 			{
+				clearLoadedData();
 				lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): invalid token cell");
-				loaded = false;
-				return;
-			}
-			if (tok < 0)
-			{
-				lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): negative token id not allowed");
-				loaded = false;
 				return;
 			}
 			toks.push_back(tok);
 		}
 
-		trainTok.reserve(emitLen);
-		trainNextTok.reserve(emitLen);
-		for (unsigned int r = 0; r < emitLen; ++r)
-		{
-			trainTok.push_back(toks[r]);
-			if (r + 1u < R)
-				trainNextTok.push_back(toks[r + 1u]);
-			else
-				trainNextTok.push_back(padTokenId); // only when usePad==true
-		}
-		trSeq.push_back(SequenceSpan(0u, emitLen));
+		// One table column becomes one sequence whose timesteps are the rows.
+		unsigned int cursor = 0u;
+		append_token_id_sequence(toks, padTokenId, newTrainTok, newTrainNextTok, trSeq, cursor);
 	}
 	else
 	{
-		// Row-per-sequence.
+		// Each table row becomes one independent sequence.
 		unsigned int cursor = 0u;
 		for (unsigned int r = 0; r < R; ++r)
 		{
-			const unsigned int len = C;
-			const bool usePad = (padTokenId >= 0);
-			const unsigned int emitLen = (usePad ? len : (len > 0u ? (len - 1u) : 0u));
-			if (emitLen == 0u)
-				continue;
-
 			std::vector<int> toks;
-			toks.reserve(len);
+			toks.reserve(C);
 			for (unsigned int c = 0; c < C; ++c)
 			{
 				int tok = 0;
 				if (!cell_to_int_token(t.getCell(r, c), tok))
 				{
+					clearLoadedData();
 					lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): invalid token cell");
-					loaded = false;
-					return;
-				}
-				if (tok < 0)
-				{
-					lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INVALID_ARGUMENT, "TokenInput::import(table): negative token id not allowed");
-					loaded = false;
 					return;
 				}
 				toks.push_back(tok);
 			}
 
-			trSeq.push_back(SequenceSpan(cursor, emitLen));
-			trainTok.reserve(trainTok.size() + emitLen);
-			trainNextTok.reserve(trainNextTok.size() + emitLen);
-			for (unsigned int c = 0; c < emitLen; ++c)
-			{
-				trainTok.push_back(toks[c]);
-				if (c + 1u < len)
-					trainNextTok.push_back(toks[c + 1u]);
-				else
-					trainNextTok.push_back(padTokenId); // only when usePad==true
-			}
-			cursor += emitLen;
+			append_token_id_sequence(toks, padTokenId, newTrainTok, newTrainNextTok, trSeq, cursor);
 		}
 	}
 
-	if (trainTok.empty() || trainNextTok.empty() || trainTok.size() != trainNextTok.size())
+	if (newTrainTok.empty() || newTrainNextTok.empty() || newTrainTok.size() != newTrainNextTok.size())
 	{
+		clearLoadedData();
 		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::EMPTY_DATA, "TokenInput::import(table): no LM pairs produced");
-		loaded = false;
 		return;
 	}
 
-	// Mirror train->test by default (same semantics as file import when no explicit test split exists).
-	testTok = trainTok;
-	testNextTok = trainNextTok;
-	setTrainSequences(trSeq);
-	setTestSequences(trSeq);
+	trainTok.swap(newTrainTok);
+	trainNextTok.swap(newTrainNextTok);
+	if (mirrorTrainToTestOnImplicitSplit)
+	{
+		testTok = trainTok;
+		testNextTok = trainNextTok;
+		teSeq = trSeq;
+	}
+	else
+	{
+		testTok.clear();
+		testNextTok.clear();
+		teSeq.clear();
+	}
+	if (!setTrainSequences(trSeq) || !setTestSequences(teSeq))
+	{
+		clearLoadedData();
+		lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::INTERNAL_ERROR,
+		                                         "TokenInput::import(table): invalid sequence spans after load");
+		return;
+	}
 	loaded = true;
 	lastImportStatus = glades::NNetworkStatus(glades::NNetworkStatus::OK, std::string());
 }
 
 shmea::GVector<float> glades::TokenInput::getTrainRow(unsigned int index) const
 {
-	if (index >= trainTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(trainTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 shmea::GVector<float> glades::TokenInput::getTrainExpectedRow(unsigned int index) const
 {
-	if (index >= trainNextTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(trainNextTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 shmea::GVector<float> glades::TokenInput::getTestRow(unsigned int index) const
 {
-	if (index >= testTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(testTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 shmea::GVector<float> glades::TokenInput::getTestExpectedRow(unsigned int index) const
 {
-	if (index >= testNextTok.size())
-		return shmea::GVector<float>();
-	shmea::GVector<float> v(1, 0.0f);
-	v[0] = static_cast<float>(testNextTok[index]);
-	return v;
+	(void)index;
+	return shmea::GVector<float>();
 }
 
 bool glades::TokenInput::getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= trainTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsTok;
-	tlsTok = static_cast<float>(trainTok[index]);
-	outData = &tlsTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= trainNextTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsNextTok;
-	tlsNextTok = static_cast<float>(trainNextTok[index]);
-	outData = &tlsNextTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= testTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsTok;
-	tlsTok = static_cast<float>(testTok[index]);
-	outData = &tlsTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const
 {
+	(void)index;
 	outData = NULL;
 	outSize = 0u;
-	if (index >= testNextTok.size())
-		return false;
-	static GLADES_THREAD_LOCAL float tlsNextTok;
-	tlsNextTok = static_cast<float>(testNextTok[index]);
-	outData = &tlsNextTok;
-	outSize = 1u;
-	return true;
+	return false;
 }
 
 bool glades::TokenInput::getTrainTokenId(unsigned int index, int& outTokenId) const
@@ -540,4 +532,3 @@ unsigned int glades::TokenInput::getFeatureCount() const
 {
 	return 1u;
 }
-

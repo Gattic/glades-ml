@@ -6,8 +6,96 @@
 
 #include "gpu_device.h"
 
+#include <cstddef>
+#include <sys/time.h>
+
 namespace glades {
 namespace gpu {
+
+struct DispatchPerfCounters
+{
+	unsigned long long kernelLaunches;
+	unsigned long long syncPoints;
+	unsigned long long bytesH2D;
+	unsigned long long bytesD2H;
+	unsigned long long bytesD2D;
+	double msCompute;
+	double msTransfer;
+	double msSync;
+
+	DispatchPerfCounters()
+	    : kernelLaunches(0ULL),
+	      syncPoints(0ULL),
+	      bytesH2D(0ULL),
+	      bytesD2H(0ULL),
+	      bytesD2D(0ULL),
+	      msCompute(0.0),
+	      msTransfer(0.0),
+	      msSync(0.0)
+	{
+	}
+
+	void reset() { *this = DispatchPerfCounters(); }
+};
+
+inline void perfRecordKernel(DispatchPerfCounters* perf, unsigned long long count = 1ULL)
+{
+	if (perf)
+		perf->kernelLaunches += count;
+}
+
+inline void perfRecordSync(DispatchPerfCounters* perf, unsigned long long count = 1ULL)
+{
+	if (perf)
+		perf->syncPoints += count;
+}
+
+inline void perfRecordBytesH2D(DispatchPerfCounters* perf, size_t bytes)
+{
+	if (perf)
+		perf->bytesH2D += static_cast<unsigned long long>(bytes);
+}
+
+inline void perfRecordBytesD2H(DispatchPerfCounters* perf, size_t bytes)
+{
+	if (perf)
+		perf->bytesD2H += static_cast<unsigned long long>(bytes);
+}
+
+inline void perfRecordBytesD2D(DispatchPerfCounters* perf, size_t bytes)
+{
+	if (perf)
+		perf->bytesD2D += static_cast<unsigned long long>(bytes);
+}
+
+class ScopedPerfTimerMs
+{
+public:
+	explicit ScopedPerfTimerMs(double* acc)
+	    : accumulator(acc), t0ms(0.0)
+	{
+		if (accumulator)
+			t0ms = nowMs();
+	}
+
+	~ScopedPerfTimerMs()
+	{
+		if (!accumulator)
+			return;
+		*accumulator += (nowMs() - t0ms);
+	}
+
+private:
+	static double nowMs()
+	{
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		return static_cast<double>(tv.tv_sec) * 1000.0 + static_cast<double>(tv.tv_usec) / 1000.0;
+	}
+
+	double* accumulator;
+	double t0ms;
+};
 
 // Runtime check: returns true if GPU should be used for the current operation.
 // Considers:

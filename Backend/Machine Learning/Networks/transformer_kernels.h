@@ -345,12 +345,13 @@ inline void add_sinusoidal_positional_encoding_inplace(float* h, unsigned int po
 inline void add_sinusoidal_positional_encoding_inplace(float* h,
                                                        unsigned int pos,
                                                        unsigned int dModel,
-                                                       const std::vector<double>& invDenomPair)
+                                                       const double* invDenomPair,
+                                                       unsigned int invDenomPairSize)
 {
 	if (!h || dModel == 0u)
 		return;
 	const unsigned int needPairs = (dModel + 1u) / 2u;
-	if (invDenomPair.size() < static_cast<size_t>(needPairs))
+	if (!invDenomPair || invDenomPairSize < needPairs)
 	{
 		// Precondition violation: caller must provide a correctly-sized cache.
 		GLADES_KERNEL_ASSERT(false && "add_sinusoidal_positional_encoding_inplace: invDenomPair cache too small");
@@ -363,6 +364,17 @@ inline void add_sinusoidal_positional_encoding_inplace(float* h,
 		const float pe = ((i % 2u) == 0u) ? static_cast<float>(sin(angle)) : static_cast<float>(cos(angle));
 		h[i] += pe;
 	}
+}
+
+// Overload using a precomputed invDenomPair (avoids pow() in inner loop).
+inline void add_sinusoidal_positional_encoding_inplace(float* h,
+                                                       unsigned int pos,
+                                                       unsigned int dModel,
+                                                       const std::vector<double>& invDenomPair)
+{
+	add_sinusoidal_positional_encoding_inplace(h, pos, dModel,
+	                                           invDenomPair.empty() ? NULL : &invDenomPair[0],
+	                                           static_cast<unsigned int>(invDenomPair.size()));
 }
 
 inline void add_sinusoidal_positional_encoding_inplace(std::vector<float>& h, unsigned int pos, unsigned int dModel)
@@ -397,15 +409,26 @@ inline void add_sinusoidal_positional_encoding_seq_inplace(float* h, unsigned in
 inline void add_sinusoidal_positional_encoding_seq_inplace(float* h,
                                                            unsigned int T,
                                                            unsigned int dModel,
-                                                           const std::vector<double>& invDenomPair)
+                                                           const double* invDenomPair,
+                                                           unsigned int invDenomPairSize)
 {
 	if (!h || T == 0u || dModel == 0u)
 		return;
 	for (unsigned int t = 0; t < T; ++t)
 	{
 		float* ht = h + (static_cast<size_t>(t) * static_cast<size_t>(dModel));
-		add_sinusoidal_positional_encoding_inplace(ht, t, dModel, invDenomPair);
+		add_sinusoidal_positional_encoding_inplace(ht, t, dModel, invDenomPair, invDenomPairSize);
 	}
+}
+
+inline void add_sinusoidal_positional_encoding_seq_inplace(float* h,
+                                                           unsigned int T,
+                                                           unsigned int dModel,
+                                                           const std::vector<double>& invDenomPair)
+{
+	add_sinusoidal_positional_encoding_seq_inplace(h, T, dModel,
+	                                               invDenomPair.empty() ? NULL : &invDenomPair[0],
+	                                               static_cast<unsigned int>(invDenomPair.size()));
 }
 
 // === Linear ===
@@ -442,16 +465,18 @@ inline void linear_into(const float* x,
 // Intended for inference/training hot paths where throughput matters more than double-accum parity.
 inline void linear_into_opt(const float* x,
                             unsigned int inSize,
-                            const std::vector<float>& W,
-                            const std::vector<float>& b,
+                            const float* W,
+                            size_t WSize,
+                            const float* b,
+                            unsigned int bSize,
                             unsigned int outSize,
                             float* y)
 {
-	if (!x || !y)
+	if (!x || !W || !y)
 		return;
 	{
 		const size_t need = static_cast<size_t>(outSize) * static_cast<size_t>(inSize);
-		if (W.size() < need)
+		if (WSize < need)
 		{
 			GLADES_KERNEL_ASSERT(false && "linear_into_opt: W is smaller than outSize*inSize");
 			return;
@@ -459,10 +484,25 @@ inline void linear_into_opt(const float* x,
 	}
 	for (unsigned int o = 0; o < outSize; ++o)
 	{
-		const float bias = (o < b.size()) ? b[o] : 0.0f;
-		const float* wRow = &W[static_cast<size_t>(o) * static_cast<size_t>(inSize)];
+		const float bias = (b && o < bSize) ? b[o] : 0.0f;
+		const float* wRow = W + static_cast<size_t>(o) * static_cast<size_t>(inSize);
 		y[o] = bias + dot_f32(wRow, x, inSize);
 	}
+}
+
+// Optimized matvec (float accumulation + optional AVX2).
+// Intended for inference/training hot paths where throughput matters more than double-accum parity.
+inline void linear_into_opt(const float* x,
+                            unsigned int inSize,
+                            const std::vector<float>& W,
+                            const std::vector<float>& b,
+                            unsigned int outSize,
+                            float* y)
+{
+	linear_into_opt(x, inSize,
+	                W.empty() ? NULL : &W[0], W.size(),
+	                b.empty() ? NULL : &b[0], static_cast<unsigned int>(b.size()),
+	                outSize, y);
 }
 
 // Blocked GEMV specialization for row-major W:
@@ -627,12 +667,14 @@ inline void linear_vec(const float* x,
 inline void linear_forward_opt(const float* X,
                                unsigned int T,
                                unsigned int inSize,
-                               const std::vector<float>& W,
-                               const std::vector<float>& b,
+                               const float* W,
+                               size_t WSize,
+                               const float* b,
+                               unsigned int bSize,
                                unsigned int outSize,
                                float* Y)
 {
-	if (!X || !Y)
+	if (!X || !W || !Y)
 		return;
 	if (T == 0u || inSize == 0u || outSize == 0u)
 		return;
@@ -640,8 +682,22 @@ inline void linear_forward_opt(const float* X,
 	{
 		const float* xt = X + static_cast<size_t>(t) * static_cast<size_t>(inSize);
 		float* yt = Y + static_cast<size_t>(t) * static_cast<size_t>(outSize);
-		linear_into_opt(xt, inSize, W, b, outSize, yt);
+		linear_into_opt(xt, inSize, W, WSize, b, bSize, outSize, yt);
 	}
+}
+
+inline void linear_forward_opt(const float* X,
+                               unsigned int T,
+                               unsigned int inSize,
+                               const std::vector<float>& W,
+                               const std::vector<float>& b,
+                               unsigned int outSize,
+                               float* Y)
+{
+	linear_forward_opt(X, T, inSize,
+	                   W.empty() ? NULL : &W[0], W.size(),
+	                   b.empty() ? NULL : &b[0], static_cast<unsigned int>(b.size()),
+	                   outSize, Y);
 }
 
 // Y[t,out] = b[out] + sum_in W[out,in] * X[t,in]
@@ -677,7 +733,8 @@ inline void linear_forward_lowp(const float* X,
                                 unsigned int inSize,
                                 const uint16_t* GLADES_RESTRICT W,
                                 int lowpDType,
-                                const std::vector<float>& b,
+                                const float* GLADES_RESTRICT b,
+                                unsigned int bSize,
                                 unsigned int outSize,
                                 float* Y)
 {
@@ -689,13 +746,29 @@ inline void linear_forward_lowp(const float* X,
 		const size_t yOff = static_cast<size_t>(t) * static_cast<size_t>(outSize);
 		for (unsigned int o = 0; o < outSize; ++o)
 		{
-			double acc = (o < b.size() ? static_cast<double>(b[o]) : 0.0);
+			double acc = (b && o < bSize) ? static_cast<double>(b[o]) : 0.0;
 			const size_t wOff = static_cast<size_t>(o) * static_cast<size_t>(inSize);
 			for (unsigned int i = 0; i < inSize; ++i)
 				acc += static_cast<double>(lowp_to_float(W[wOff + i], lowpDType)) * static_cast<double>(X[xOff + i]);
 			Y[yOff + o] = static_cast<float>(acc);
 		}
 	}
+}
+
+// Low-precision linear forward:
+// Y[t,out] = b[out] + sum_in W_lowp[out,in] * X[t,in]
+inline void linear_forward_lowp(const float* X,
+                                unsigned int T,
+                                unsigned int inSize,
+                                const uint16_t* GLADES_RESTRICT W,
+                                int lowpDType,
+                                const std::vector<float>& b,
+                                unsigned int outSize,
+                                float* Y)
+{
+	linear_forward_lowp(X, T, inSize, W, lowpDType,
+	                    b.empty() ? NULL : &b[0], static_cast<unsigned int>(b.size()),
+	                    outSize, Y);
 }
 
 // === Normalization ===
@@ -877,7 +950,8 @@ inline void rope_apply_inplace_strided(float* buf,
                                       unsigned int rowStride,
                                       unsigned int dHead,
                                       unsigned int ropeDim,
-                                      const std::vector<double>& invFreq,
+                                      const double* invFreq,
+                                      unsigned int invFreqSize,
                                       bool inverse)
 {
 	if (!buf)
@@ -888,7 +962,7 @@ inline void rope_apply_inplace_strided(float* buf,
 		ropeDim -= 1u;
 	if (ropeDim > dHead)
 		ropeDim = dHead - (dHead % 2u);
-	if (invFreq.size() < static_cast<size_t>(ropeDim / 2u))
+	if (!invFreq || invFreqSize < (ropeDim / 2u))
 	{
 		GLADES_KERNEL_ASSERT(false && "rope_apply_inplace_strided: invFreq cache too small");
 		return;
@@ -911,6 +985,23 @@ inline void rope_apply_inplace_strided(float* buf,
 			vec[j + 1u] = x0 * s + x1 * c;
 		}
 	}
+}
+
+// Strided RoPE apply: rotate a [T, dHead] view where each timestep vector has stride `rowStride`.
+// This allows applying RoPE in-place to packed Q/K buffers laid out as [T, dModel] (stride=dModel)
+// or [T, dModelKV] (stride=dModelKV) without gathering into contiguous temporaries.
+inline void rope_apply_inplace_strided(float* buf,
+                                      unsigned int T,
+                                      unsigned int rowStride,
+                                      unsigned int dHead,
+                                      unsigned int ropeDim,
+                                      const std::vector<double>& invFreq,
+                                      bool inverse)
+{
+	rope_apply_inplace_strided(buf, T, rowStride, dHead, ropeDim,
+	                           invFreq.empty() ? NULL : &invFreq[0],
+	                           static_cast<unsigned int>(invFreq.size()),
+	                           inverse);
 }
 
 // === Softmax ===
@@ -1412,4 +1503,3 @@ inline void gelu_backward_buf(const float* x, float* dAct, size_t n)
 
 } // namespace transformer_kernels
 } // namespace glades
-

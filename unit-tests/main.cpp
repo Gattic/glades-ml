@@ -20,6 +20,8 @@
 #include "Backend/Machine Learning/nn-save-load-test.h"
 #include "Backend/Machine Learning/nn-mixed-precision-test.h"
 #include "Backend/Machine Learning/nn-benchmarks.h"
+#include "Backend/Machine Learning/transformer-gpu-bench.h"
+#include "Backend/Machine Learning/transformer-verification-test.h"
 #include "Backend/Machine Learning/pca-test.h"
 #include "Backend/Machine Learning/kmeans-test.h"
 #include "Backend/Machine Learning/bayes-test.h"
@@ -39,7 +41,15 @@
 #include "Backend/Machine Learning/hyperparameter-tuner-test.h"
 #include "Backend/Machine Learning/atlas-test.h"
 #include "Backend/Machine Learning/atlas-bench.h"
+#include "Backend/Machine Learning/atlas-alt-bench.h"
 #include "Backend/Machine Learning/sfcka-test.h"
+#include "Backend/Machine Learning/transformer-gradient-test.h"
+#include "Backend/Machine Learning/simd-parity-test.h"
+#include "Backend/Machine Learning/sampling-test.h"
+#include "Backend/Machine Learning/attention-backward-test.h"
+#include "Backend/Machine Learning/transformer-ops-test.h"
+#include "Backend/Machine Learning/transformer-kernels-test.h"
+#include "Backend/Machine Learning/numerical-edge-test.h"
 #include <vector>
 
 int main(int argc, char* argv[])
@@ -52,6 +62,7 @@ int main(int argc, char* argv[])
 	    NNUnitTest();
 	    NNRecurrentUnitTest();
 	    NNTransformerUnitTest();
+	    TransformerVerificationUnitTest();
 	    TransformerServingLayerUnitTest();
 	    PCAUnitTest();
 	    KMeansUnitTest();
@@ -77,10 +88,18 @@ int main(int argc, char* argv[])
 		NNRecurrentUnitTest();
 	    else if (strcmp(argv[1], "nn-transformer") == 0)
 		NNTransformerUnitTest();
-	    else if (strcmp(argv[1], "transformer-serving") == 0 || strcmp(argv[1], "serving") == 0)
+	    else if (strcmp(argv[1], "transformer-verification") == 0 ||
+	             strcmp(argv[1], "transformer-verify") == 0 ||
+	             strcmp(argv[1], "tverify") == 0)
+		TransformerVerificationUnitTest();
+	    else if (strcmp(argv[1], "transformer-serving") == 0 ||
+	             strcmp(argv[1], "transformer-serving-layer") == 0 ||
+	             strcmp(argv[1], "serving") == 0)
 		TransformerServingLayerUnitTest();
 	    else if (strcmp(argv[1], "nn-bench") == 0)
 		NNBenchmarks(argc, argv);
+	    else if (strcmp(argv[1], "transformer-gpu-bench") == 0 || strcmp(argv[1], "tgpu-bench") == 0)
+		TransformerGpuBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "pca") == 0)
 		PCAUnitTest();
 	    else if (strcmp(argv[1], "kmeans") == 0)
@@ -131,10 +150,52 @@ int main(int argc, char* argv[])
 		HyperparameterTunerFullLoopTest();
 	    else if (strcmp(argv[1], "atlas") == 0)
 		ATLASUnitTest();
+	    else if (strcmp(argv[1], "atlas-controller") == 0)
+		ATLASControllerUnitTest();
 	    else if (strcmp(argv[1], "atlas-gpu-nan") == 0)
 		ATLASGpuNaNTest();
+	    else if (strcmp(argv[1], "atlas-helm-micro") == 0)
+		ATLASHelmMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-echo-core") == 0)
+		ATLASECHOCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-echo-parity") == 0)
+		ATLASECHOParityTest();
+	    else if (strcmp(argv[1], "atlas-echo-micro") == 0)
+		ATLASECHOMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-bimap-micro") == 0)
+		ATLASBiMAPMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-bimap-parity") == 0)
+		ATLASBiMAPParityTest();
+	    else if (strcmp(argv[1], "atlas-matra-core") == 0)
+		ATLASMATRACoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-matra-parity") == 0)
+		ATLASMATRAParityTest();
+	    else if (strcmp(argv[1], "atlas-argos-core") == 0)
+		ATLASARGOSCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-argos-parity") == 0)
+		ATLASARGOSParityTest();
+	    else if (strcmp(argv[1], "atlas-kron-micro") == 0)
+		ATLASKronMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-muon-micro") == 0)
+		ATLASMuonMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-pact-micro") == 0)
+		ATLASPACTMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-racer-micro") == 0)
+		ATLASRACERMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-groupadam-micro") == 0)
+		ATLASGroupAdamMicroBenchmark();
+	    else if (strcmp(argv[1], "atlas-pact-core") == 0)
+		ATLASPACTCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-racer-core") == 0)
+		ATLASRACERCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-kron-core") == 0)
+		ATLASKronCoreUnitTest();
+	    else if (strcmp(argv[1], "atlas-muon-core") == 0)
+		ATLASMuonCoreUnitTest();
 	    else if (strcmp(argv[1], "atlas-bench") == 0)
 		ATLASBenchmark(argc, argv);
+	    else if (strcmp(argv[1], "atlas-alt-bench") == 0)
+		ATLASAltBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)
@@ -143,6 +204,20 @@ int main(int argc, char* argv[])
 		KellyUnitTest();
 	    else if (strcmp(argv[1], "qp") == 0)
 		QPSolverUnitTest();
+	    else if (strcmp(argv[1], "transformer-grad") == 0)
+		TransformerGradientUnitTest();
+	    else if (strcmp(argv[1], "simd-parity") == 0)
+		SIMDParityUnitTest();
+	    else if (strcmp(argv[1], "sampling") == 0)
+		SamplingUnitTest();
+	    else if (strcmp(argv[1], "attention-bwd") == 0)
+		AttentionBackwardUnitTest();
+	    else if (strcmp(argv[1], "transformer-ops") == 0)
+		TransformerOpsUnitTest();
+	    else if (strcmp(argv[1], "transformer-kernels") == 0)
+		TransformerKernelsUnitTest();
+	    else if (strcmp(argv[1], "numerical-edge") == 0)
+		NumericalEdgeUnitTest();
 	    else if (strcmp(argv[1], "sfcka") == 0)
 	    {
 		FFTUnitTest();
@@ -152,11 +227,12 @@ int main(int argc, char* argv[])
 	    }
 	    else if (strcmp(argv[1], "nnall") == 0)
         {
-	        OHEUnitTest();
+		    OHEUnitTest();
 		    MappedDatasetUnitTest();
 		    NNUnitTest();
 		    NNRecurrentUnitTest();
 		    NNTransformerUnitTest();
+		    TransformerVerificationUnitTest();
 		    TransformerServingLayerUnitTest();
 
 		    // Run a fixed benchmark configuration when invoked via `nnall`.
@@ -184,12 +260,39 @@ int main(int argc, char* argv[])
 		    for (int i = 0; i < bench_argc; ++i)
 			    free(bench_argv[i]);
 
+		    const char* transformer_bench_args[] = {
+			"transformer-gpu-bench",
+			"--repeats", "1",
+			"--epochs", "1",
+			"--train-seqs", "2",
+			"--seq-len", "8",
+			"--infer-prompt", "8",
+			"--infer-steps", "8",
+			"--dmodel", "16",
+			"--dff", "32",
+			"--layers", "1",
+			"--heads", "4",
+			"--kv-heads", "2",
+			"--vocab", "33",
+		    };
+		    const int transformer_bench_argc = (int)(sizeof(transformer_bench_args) / sizeof(transformer_bench_args[0]));
+
+		    std::vector<char*> transformer_bench_argv(transformer_bench_argc, (char*)0);
+		    for (int i = 0; i < transformer_bench_argc; ++i)
+			    transformer_bench_argv[i] = strdup(transformer_bench_args[i]);
+
+		    TransformerGpuBenchmark(transformer_bench_argc, &transformer_bench_argv[0]);
+
+		    for (int i = 0; i < transformer_bench_argc; ++i)
+			    free(transformer_bench_argv[i]);
+
 		    NNSaveLoadUnitTest();
 		    NNMixedPrecisionUnitTest();
 		    PropFuzzUnitTest();
 		    ParallelUnitTest();
 		    DDPUnitTest();
 		    TransformerImprovementsUnitTest();
+		    TransformerGradientUnitTest();
 		    NNCNNUnitTest();
         }
 	    else

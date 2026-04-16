@@ -3,6 +3,8 @@ set(Networks_src_files
 	metanetwork.h
 	network.cpp
 	network.h
+	transformer_config.cpp
+	transformer_config.h
 	cross_validation.cpp
 	cross_validation.h
 	model_persistence.cpp
@@ -14,6 +16,7 @@ set(Networks_src_files
 	sgd_lstm.cpp
 	sgd_cnn.cpp
 	sgd_transformer.cpp
+	transformer_train_detail.cpp
 	atlas_optimizer.cpp
 	glades_thread_pool.cpp
 	transformer_infer.cpp
