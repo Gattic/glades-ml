@@ -254,17 +254,195 @@ void VESTALogScaleUpdateTest()
 
 void VESTATrustRegionClampTest()
 {
-	printf("[vesta] TrustRegionClampTest (stub)\n");
+	printf("[vesta] TrustRegionClampTest\n");
+	const unsigned int m = 12, n = 10;
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	for (unsigned int i = 0; i < m && i < n; ++i)
+		W[i * n + i] = 1.0f - 0.1f * static_cast<float>(i);
+
+	glades::VestaConfig vc;
+	vc.rank = 3u;
+	vc.tau = 0.0f;
+	vc.rho = 0.05f;       // tight trust region
+	vc.lambdaPerp = 0.0f;
+	vc.tSk = 1000u;        // no refresh during this test
+	vc.tHom = 1000000u;    // no homeostasis
+	vc.gamma = 0.0f;       // disable momentum for predictable behavior
+	vc.kappa = 0.0f;
+
+	glades::vesta::WeightState st;
+	glades::rng::Engine rng;
+	glades::rng::seed_engine(rng, 0xBEEFULL);
+	glades::vesta::initWeightState(st, &W[0], m, n, vc, rng, 0);
+
+	const float initMaxSigma = expf(st.ell[0]);
+
+	std::vector<float> g(W.size(), 0.0f);
+	for (unsigned int s = 0; s < 50u; ++s)
+	{
+		// Gradient that drives ell[0] upward: g = -U[:,0] V[:,0]^T → A[0,0] = -1
+		for (unsigned int i = 0; i < m; ++i)
+			for (unsigned int j = 0; j < n; ++j)
+				g[i * n + j] = -st.U[i * st.r + 0] * st.V[j * st.r + 0];
+
+		const bool ok = glades::vesta::applyStep(st, &W[0], &g[0], m, n,
+		                                         1.0f, 0.1f, 0.0f, 0.0f, 1.0f,
+		                                         vc, rng, 0, 0);
+		ASSERT("applyStep non-finite", ok);
+	}
+
+	const float finalMaxSigma = expf(st.ell[0]);
+	// With rho=0.05 per step, after 50 steps max growth is (1.05)^50 ≈ 11.47x.
+	ASSERT("trust region allowed unbounded growth",
+	       finalMaxSigma < 15.0f * initMaxSigma);
 }
 
 void VESTAStepDescentTest()
 {
-	printf("[vesta] StepDescentTest (stub)\n");
+	printf("[vesta] StepDescentTest (longer horizon)\n");
+	const unsigned int m = 24, n = 20;
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	std::vector<float> Wtarget(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0x424242ULL);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		W[i] = 0.3f * glades::rng::standard_normal(eng);
+		Wtarget[i] = 0.5f * glades::rng::standard_normal(eng);
+	}
+
+	glades::VestaConfig vc;
+	vc.rank = 6u;
+	vc.tau = 0.0f;
+	vc.lambdaPerp = 0.2f;
+	vc.rho = 0.1f;
+	vc.tSk = 4u;
+
+	glades::vesta::WeightState st;
+	glades::rng::Engine rng;
+	glades::rng::seed_engine(rng, 0xABCULL);
+
+	float prevLoss = 0.0f;
+	for (size_t i = 0; i < W.size(); ++i)
+		prevLoss += (W[i] - Wtarget[i]) * (W[i] - Wtarget[i]);
+	prevLoss *= 0.5f;
+
+	const unsigned int steps = 50u;
+	float lastLoss = prevLoss;
+	for (unsigned int s = 0; s < steps; ++s)
+	{
+		std::vector<float> g(W.size(), 0.0f);
+		for (size_t i = 0; i < W.size(); ++i)
+			g[i] = W[i] - Wtarget[i];
+		const bool ok = glades::vesta::update(st, &W[0], &g[0], m, n,
+		                                      1.0f, 0.1f, 0.0f, 0.0f, 1.0f,
+		                                      vc, rng, 0, 0);
+		ASSERT("non-finite during long horizon", ok);
+		float loss = 0.0f;
+		for (size_t i = 0; i < W.size(); ++i)
+			loss += (W[i] - Wtarget[i]) * (W[i] - Wtarget[i]);
+		loss *= 0.5f;
+		lastLoss = loss;
+	}
+
+	printf("  init loss=%.4f final loss=%.4f ratio=%.4f\n",
+	       prevLoss, lastLoss, lastLoss / prevLoss);
+	ASSERT("50-step ratio", lastLoss < 0.5f * prevLoss);
 }
 
+// Verify that the singular-value spectrum is invariant under left/right
+// orthogonal transforms of W and g (same rng seed used on both sides).
+// Exact weight-level equivariance requires a rotationally equivariant
+// sketch Omega, which we do not enforce; we therefore check the spectrum,
+// which is intrinsic.
 void VESTAOrthogonalInvarianceTest()
 {
-	printf("[vesta] OrthogonalInvarianceTest (stub)\n");
+	printf("[vesta] OrthogonalInvarianceTest\n");
+	const unsigned int m = 8, n = 6, r = 3;
+
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	std::vector<float> g(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0x99ULL);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		W[i] = glades::rng::standard_normal(eng);
+		g[i] = glades::rng::standard_normal(eng);
+	}
+
+	std::vector<float> P(static_cast<size_t>(m) * m, 0.0f);
+	std::vector<float> Q(static_cast<size_t>(n) * n, 0.0f);
+	for (size_t i = 0; i < P.size(); ++i) P[i] = glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < Q.size(); ++i) Q[i] = glades::rng::standard_normal(eng);
+	glades::vesta::gramSchmidt(&P[0], m, m);
+	glades::vesta::gramSchmidt(&Q[0], n, n);
+
+	// W2 = P W Q^T, g2 = P g Q^T.
+	std::vector<float> W2(W.size(), 0.0f), g2(g.size(), 0.0f);
+	std::vector<float> tmp(W.size(), 0.0f);
+	// tmp = P * W
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				acc += P[i * m + k] * W[k * n + j];
+			tmp[i * n + j] = acc;
+		}
+	// W2 = tmp * Q^T: (tmp Q^T)[i,j] = sum_k tmp[i,k] * Q[j,k]
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < n; ++k)
+				acc += tmp[i * n + k] * Q[j * n + k];
+			W2[i * n + j] = acc;
+		}
+	// g2 similarly.
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				acc += P[i * m + k] * g[k * n + j];
+			tmp[i * n + j] = acc;
+		}
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < n; ++k)
+				acc += tmp[i * n + k] * Q[j * n + k];
+			g2[i * n + j] = acc;
+		}
+
+	glades::VestaConfig vc;
+	vc.rank = r;
+	vc.tau = 0.0f;
+	vc.rho = 0.5f;
+	vc.lambdaPerp = 0.0f;
+	vc.tSk = 1u;
+
+	glades::vesta::WeightState st1, st2;
+	glades::rng::Engine rng1, rng2;
+	glades::rng::seed_engine(rng1, 0xFEEDULL);
+	glades::rng::seed_engine(rng2, 0xFEEDULL);
+	glades::vesta::initWeightState(st1, &W[0], m, n, vc, rng1, 0);
+	glades::vesta::initWeightState(st2, &W2[0], m, n, vc, rng2, 0);
+
+	std::vector<float> g1 = g, g2b = g2;
+	(void)glades::vesta::applyStep(st1, &W[0], &g1[0], m, n, 1.0f, 0.05f,
+	                               0.0f, 0.0f, 1.0f, vc, rng1, 0, 0);
+	(void)glades::vesta::applyStep(st2, &W2[0], &g2b[0], m, n, 1.0f, 0.05f,
+	                               0.0f, 0.0f, 1.0f, vc, rng2, 0, 0);
+
+	for (unsigned int i = 0; i < r; ++i)
+	{
+		const float delta = fabsf(st1.ell[i] - st2.ell[i]);
+		char msg[128];
+		sprintf(msg, "orth invariance ell[%u] delta %.6g", i, delta);
+		ASSERT(msg, delta < 5e-3f);
+	}
 }
 
 void VESTAGpuParityTest()
@@ -279,4 +457,8 @@ void VESTAUnitTest()
 	VESTASketchedSVDTest();
 	VESTAInitStateTest();
 	VESTALogScaleUpdateTest();
+	VESTATrustRegionClampTest();
+	VESTAOrthogonalInvarianceTest();
+	VESTAStepDescentTest();
+	VESTAGpuParityTest();
 }
