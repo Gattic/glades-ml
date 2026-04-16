@@ -372,7 +372,8 @@ struct OptimizerConfig
 	{
 		SGD_MOMENTUM = 0,
 		ADAMW = 1,
-		ATLAS = 2
+		ATLAS = 2,
+		VESTA = 3
 	};
 
 	Type type;
@@ -1713,6 +1714,79 @@ struct DeconvConfig
 	}
 };
 
+// VESTA optimizer configuration (Variational Entropy-Spectral Trust-region Adaptation).
+//
+// Per-weight-matrix Bregman mirror descent on the von Neumann spectral entropy
+// potential Phi(W) = -1/2 tr(W^T W log W^T W) + mu/2 |W|_F^2. Tracks the top-r
+// SVD of each weight matrix; updates are derived from the KKT conditions of a
+// trust-region-constrained mirror step with spectral-homeostatic regularization.
+// No second-moment EMA of squared gradients is maintained.
+struct VestaConfig
+{
+	// Sketch rank per weight matrix. Clamped to min(rank, min(m, n)) at init.
+	unsigned int rank;
+
+	// Frobenius stabilizer of the spectral entropy potential Phi(W).
+	// Must satisfy mu >= 3.0 for strict convexity near sigma=1; default 4.0.
+	float mu;
+
+	// Strength of the spectral-control regularizer R(W) = 1/2 * sum (ell - ellStar)^2.
+	// 0 disables spectral homeostasis; default 0.1.
+	float tau;
+
+	// Operator-norm trust-region radius: max exp(ell[0]) is clamped to
+	// (1 + rho) * prev_max. Default 0.05.
+	float rho;
+
+	// Scale of the signed complement step (for gradient components outside the
+	// tracked subspace). Default 0.2.
+	float lambdaPerp;
+
+	// EMA rate for log-scale momentum beta = (1-gamma)*beta + gamma*ell. Default 0.01.
+	float gamma;
+
+	// Feedback rate from beta to ell: ell = (1-kappa)*ell + kappa*beta. Default 0.1.
+	float kappa;
+
+	// Homeostasis rate for ellStar update: ellStar = (1-nu)*ellStar + nu*ell.
+	// Default 0.01.
+	float nu;
+
+	// Subspace refresh period (steps between sketched SVD refresh). Default 4.
+	unsigned int tSk;
+
+	// Homeostasis update period (steps between ellStar update). Default 1000.
+	unsigned int tHom;
+
+	// Power iteration count inside the sketch refresh. Default 2.
+	unsigned int powerIters;
+
+	// Clamp range on ell = log(sigma) to prevent over/underflow.
+	float ellMin; // default -10.0
+	float ellMax; // default   4.0
+
+	// Numerical floor on phi_dd = -2*ell - 3 + mu to avoid division by near-zero.
+	float phiDdFloor; // default 0.1
+
+	VestaConfig()
+	    : rank(32u),
+	      mu(4.0f),
+	      tau(0.1f),
+	      rho(0.05f),
+	      lambdaPerp(0.2f),
+	      gamma(0.01f),
+	      kappa(0.1f),
+	      nu(0.01f),
+	      tSk(4u),
+	      tHom(1000u),
+	      powerIters(2u),
+	      ellMin(-10.0f),
+	      ellMax(4.0f),
+	      phiDdFloor(0.1f)
+	{
+	}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -1738,6 +1812,9 @@ struct TrainingConfig
 
 	// ATLAS optimizer configuration (used when optimizer.type==ATLAS).
 	ATLASConfig atlas;
+
+	// VESTA optimizer configuration (used when optimizer.type==VESTA).
+	VestaConfig vesta;
 
 	// Learning rate schedule multiplier configuration.
 	LearningRateScheduleConfig lrSchedule;
@@ -1791,6 +1868,7 @@ struct TrainingConfig
 	      perElementGradClip(10.0f),
 	      optimizer(),
 	      atlas(),
+	      vesta(),
 	      lrSchedule(),
 	      bayesianLR(),
 	      transformer(),
