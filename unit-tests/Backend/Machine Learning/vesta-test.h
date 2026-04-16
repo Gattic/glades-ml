@@ -33,6 +33,7 @@ void VESTATrustRegionClampTest();
 void VESTAStepDescentTest();
 void VESTAOrthogonalInvarianceTest();
 void VESTAGpuParityTest();
+void VESTATransformerIntegrationTest();
 void VESTAUnitTest();
 
 #endif

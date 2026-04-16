@@ -27,6 +27,7 @@
 #include "training_callbacks.h"
 #include "training_config.h"
 #include "atlas_optimizer.h"
+#include "vesta_optimizer.h"
 #include "../nnetwork_status.h"
 #include "bayes.h"
 #include "bayes-optimizer.h"

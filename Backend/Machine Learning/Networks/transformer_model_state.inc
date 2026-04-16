@@ -135,6 +135,8 @@
 			atlas::ArgosWeightState argosW1, argosW2;
 			atlas::MuonWeightState muonWq, muonWk, muonWv, muonWo;
 			atlas::MuonWeightState muonW1, muonW2;
+			vesta::WeightState vestaWq, vestaWk, vestaWv, vestaWo;
+			vesta::WeightState vestaW1, vestaW2;
 		};
 
 		std::vector<Block> blocks;
@@ -167,6 +169,9 @@
 		atlas::MuonWeightState muonWIn;
 		atlas::MuonWeightState muonWOut;
 		atlas::MuonWeightState muonTokE;
+		vesta::WeightState vestaWIn;
+		vesta::WeightState vestaWOut;
+		vesta::WeightState vestaTokE;
 
 		// Benchmark-only grouped optimizer-gap diagnostics. These stay at the
 		// top level so AdamW and plain ATLAS-BSRP runs can report the same

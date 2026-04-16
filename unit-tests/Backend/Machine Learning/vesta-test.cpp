@@ -17,9 +17,16 @@
 
 #include "vesta-test.h"
 #include "../../unit-test.h"
+#include "test_token_id_input_fixture.h"
 
 #include "../../../Backend/Machine Learning/Networks/vesta_optimizer.h"
 #include "../../../Backend/Machine Learning/Networks/training_config.h"
+#include "../../../Backend/Machine Learning/Networks/network.h"
+#include "../../../Backend/Machine Learning/Structure/nninfo.h"
+#include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
+#include "../../../Backend/Machine Learning/Structure/hiddenlayerinfo.h"
+#include "../../../Backend/Machine Learning/Structure/outputlayerinfo.h"
+#include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/rng.h"
 
 #ifdef GLADES_HAVE_CUDA
@@ -548,6 +555,55 @@ void VESTAGpuParityTest()
 
 #endif
 
+// End-to-end: configure a tiny token-LM transformer with optimizer=VESTA and
+// train it for a couple of epochs. Verifies the sgd_transformer.cpp dispatch
+// reaches the VESTA branch and that a full train step produces finite weights.
+void VESTATransformerIntegrationTest()
+{
+	printf("[vesta] TransformerIntegrationTest\n");
+	const unsigned int vocab = 7u;
+
+	InMemoryTokenIdInput di;
+	{
+		std::vector<unsigned int> toks;
+		for (unsigned int i = 0; i < 32u; ++i)
+			toks.push_back((i * 3u + 1u) % vocab);
+		di.setTrainTokens(toks, -1);
+		di.mirrorTrainToTest();
+	}
+
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	hidden.push_back(new glades::HiddenLayerInfo(16, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	glades::NNInfo* info = new glades::NNInfo("vesta_transformer_integration", in, hidden, out);
+
+	glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+	net.getTerminatorMutable().setEpoch(1);
+	net.getTerminatorMutable().setAccuracy(0);
+	{
+		glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+		cfg.transformer.enableTokenEmbedding = true;
+		cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+		cfg.transformer.tieEmbeddings = true;
+		cfg.transformer.nHeadsOverride = 2;
+		cfg.transformer.dFFOverride = 32;
+		cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+		cfg.optimizer.type = glades::OptimizerConfig::VESTA;
+		cfg.vesta.rank = 4u;
+		cfg.vesta.tau = 0.0f;
+		cfg.vesta.rho = 0.1f;
+		cfg.vesta.tSk = 100u; // avoid sketched-SVD refresh in a single-epoch test
+	}
+
+	ASSERT("VESTA transformer: initial test", net.test(&di).ok());
+	const glades::NNetworkStatus st = net.train(&di);
+	ASSERT("VESTA transformer: train status", st.ok());
+	ASSERT("VESTA transformer: post-train test", net.test(&di).ok());
+
+	delete info;
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
@@ -559,4 +615,5 @@ void VESTAUnitTest()
 	VESTAOrthogonalInvarianceTest();
 	VESTAStepDescentTest();
 	VESTAGpuParityTest();
+	VESTATransformerIntegrationTest();
 }
