@@ -444,17 +444,266 @@ bool refreshSubspace(WeightState& state,
 	return sketched_svd(W, m, n, state.r, state, vc, rng);
 }
 
-bool applyStep(WeightState& /*state*/,
-               float* /*W*/, float* /*gW*/,
-               unsigned int /*m*/, unsigned int /*n*/,
-               float /*invBatch*/, float /*lr*/,
-               float /*wd1*/, float /*wd2*/, float /*gradScale*/,
-               const VestaConfig& /*vc*/,
-               glades::rng::Engine& /*rng*/,
+// ---------------- Step helpers ----------------
+
+// W_r = U diag(exp(ell)) V^T  [m * n]
+static void reconstruct_rank_block(const float* U, const float* V, const float* ell,
+                                   unsigned int m, unsigned int n, unsigned int r,
+                                   float* out)
+{
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < r; ++k)
+				acc += U[i * r + k] * expf(ell[k]) * V[j * r + k];
+			out[i * n + j] = acc;
+		}
+	}
+}
+
+// A = U^T g V [r * r]; also stores (g V) in scratchUA[m * r].
+static void compute_A_and_gV(const float* U, const float* g, const float* V,
+                             unsigned int m, unsigned int n, unsigned int r,
+                             float* scratchUA, float* A)
+{
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int k = 0; k < r; ++k)
+		{
+			float acc = 0.0f;
+			for (unsigned int j = 0; j < n; ++j)
+				acc += g[i * n + j] * V[j * r + k];
+			scratchUA[i * r + k] = acc;
+		}
+	for (unsigned int a = 0; a < r; ++a)
+		for (unsigned int b = 0; b < r; ++b)
+		{
+			float acc = 0.0f;
+			for (unsigned int i = 0; i < m; ++i)
+				acc += U[i * r + a] * scratchUA[i * r + b];
+			A[a * r + b] = acc;
+		}
+}
+
+// g_perp = g - U A V^T [m * n]; uses scratchUA[m * r] as temp.
+static void form_g_perp(const float* g,
+                        const float* U, const float* A, const float* V,
+                        unsigned int m, unsigned int n, unsigned int r,
+                        float* scratchUA, float* g_perp)
+{
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int b = 0; b < r; ++b)
+		{
+			float acc = 0.0f;
+			for (unsigned int a = 0; a < r; ++a)
+				acc += U[i * r + a] * A[a * r + b];
+			scratchUA[i * r + b] = acc;
+		}
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int b = 0; b < r; ++b)
+				acc += scratchUA[i * r + b] * V[j * r + b];
+			g_perp[i * n + j] = g[i * n + j] - acc;
+		}
+}
+
+bool applyStep(WeightState& state,
+               float* W, float* gW,
+               unsigned int m, unsigned int n,
+               float invBatch, float lr,
+               float /*wd1*/, float /*wd2*/, float gradScale,
+               const VestaConfig& vc,
+               glades::rng::Engine& rng,
                shmea::GLogger* /*logger*/,
                const char* /*tag*/)
 {
-	return false;
+	if (!state.initialized || state.m != m || state.n != n) return false;
+	const unsigned int r = state.r;
+	const size_t mn = static_cast<size_t>(m) * n;
+
+	// Step 0: apply invBatch and gradScale to gW in place.
+	const float gFactor = gradScale * invBatch;
+	for (size_t i = 0; i < mn; ++i)
+		gW[i] *= gFactor;
+
+	// Step 1: maybe refresh subspace.
+	if (state.step != 0ULL && vc.tSk > 0u && (state.step % vc.tSk) == 0ULL)
+	{
+		if (!sketched_svd(W, m, n, r, state, vc, rng))
+			return false;
+	}
+
+	// Step 2: compute WrOld, A, g_perp.
+	reconstruct_rank_block(&state.U[0], &state.V[0], &state.ell[0], m, n, r,
+	                       &state.scratch_WrOld[0]);
+	compute_A_and_gV(&state.U[0], gW, &state.V[0], m, n, r,
+	                 &state.scratch_UA[0], &state.scratch_A[0]);
+	form_g_perp(gW, &state.U[0], &state.scratch_A[0], &state.V[0], m, n, r,
+	            &state.scratch_UA[0], &state.scratch_gPerp[0]);
+
+	// Step 3: log-scale update using OLD ell (save a copy).
+	std::vector<float> ellOld = state.ell;
+	std::vector<float> ellNew(r, 0.0f);
+	for (unsigned int i = 0; i < r; ++i)
+	{
+		const float l = ellOld[i];
+		float phi_dd = -2.0f * l - 3.0f + vc.mu;
+		if (phi_dd < vc.phiDdFloor) phi_dd = vc.phiDdFloor;
+		const float sigma = expf(l);
+		const float denom = phi_dd * sigma * sigma;
+		const float Aii = state.scratch_A[i * r + i];
+		float lNext = l - lr * Aii / denom - lr * vc.tau * (l - state.ellStar[i]);
+		if (lNext < vc.ellMin) lNext = vc.ellMin;
+		if (lNext > vc.ellMax) lNext = vc.ellMax;
+		ellNew[i] = lNext;
+	}
+
+	// Step 4: log-scale momentum.
+	std::vector<float> betaNew(r, 0.0f);
+	for (unsigned int i = 0; i < r; ++i)
+	{
+		betaNew[i] = (1.0f - vc.gamma) * state.beta[i] + vc.gamma * ellNew[i];
+		ellNew[i] = (1.0f - vc.kappa) * ellNew[i] + vc.kappa * betaNew[i];
+		if (ellNew[i] < vc.ellMin) ellNew[i] = vc.ellMin;
+		if (ellNew[i] > vc.ellMax) ellNew[i] = vc.ellMax;
+	}
+
+	// Step 5: Stiefel QR retraction on U.
+	// Omega_U = (I - U U^T) gW V diag(exp(-ell_old))
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int k = 0; k < r; ++k)
+		{
+			float acc = 0.0f;
+			for (unsigned int j = 0; j < n; ++j)
+				acc += gW[i * n + j] * state.V[j * r + k];
+			state.scratch_Omega_U[i * r + k] = acc;
+		}
+	std::vector<float> UtOmU(static_cast<size_t>(r) * r, 0.0f);
+	for (unsigned int a = 0; a < r; ++a)
+		for (unsigned int b = 0; b < r; ++b)
+		{
+			float acc = 0.0f;
+			for (unsigned int i = 0; i < m; ++i)
+				acc += state.U[i * r + a] * state.scratch_Omega_U[i * r + b];
+			UtOmU[a * r + b] = acc;
+		}
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int b = 0; b < r; ++b)
+		{
+			float acc = 0.0f;
+			for (unsigned int a = 0; a < r; ++a)
+				acc += state.U[i * r + a] * UtOmU[a * r + b];
+			state.scratch_Omega_U[i * r + b] -= acc;
+		}
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int k = 0; k < r; ++k)
+			state.scratch_Omega_U[i * r + k] *= expf(-ellOld[k]);
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int k = 0; k < r; ++k)
+			state.scratch_URaw[i * r + k] = state.U[i * r + k] - lr * state.scratch_Omega_U[i * r + k];
+	gramSchmidt(&state.scratch_URaw[0], m, r);
+
+	// Stiefel QR retraction on V. Omega_V = (I - V V^T) gW^T U diag(exp(-ell_old))
+	for (unsigned int j = 0; j < n; ++j)
+		for (unsigned int k = 0; k < r; ++k)
+		{
+			float acc = 0.0f;
+			for (unsigned int i = 0; i < m; ++i)
+				acc += gW[i * n + j] * state.U[i * r + k];
+			state.scratch_Omega_V[j * r + k] = acc;
+		}
+	std::vector<float> VtOmV(static_cast<size_t>(r) * r, 0.0f);
+	for (unsigned int a = 0; a < r; ++a)
+		for (unsigned int b = 0; b < r; ++b)
+		{
+			float acc = 0.0f;
+			for (unsigned int j = 0; j < n; ++j)
+				acc += state.V[j * r + a] * state.scratch_Omega_V[j * r + b];
+			VtOmV[a * r + b] = acc;
+		}
+	for (unsigned int j = 0; j < n; ++j)
+		for (unsigned int b = 0; b < r; ++b)
+		{
+			float acc = 0.0f;
+			for (unsigned int a = 0; a < r; ++a)
+				acc += state.V[j * r + a] * VtOmV[a * r + b];
+			state.scratch_Omega_V[j * r + b] -= acc;
+		}
+	for (unsigned int j = 0; j < n; ++j)
+		for (unsigned int k = 0; k < r; ++k)
+			state.scratch_Omega_V[j * r + k] *= expf(-ellOld[k]);
+	for (unsigned int j = 0; j < n; ++j)
+		for (unsigned int k = 0; k < r; ++k)
+			state.scratch_VRaw[j * r + k] = state.V[j * r + k] - lr * state.scratch_Omega_V[j * r + k];
+	gramSchmidt(&state.scratch_VRaw[0], n, r);
+
+	// Step 6: write new state.
+	state.U = state.scratch_URaw;
+	state.V = state.scratch_VRaw;
+	state.ell = ellNew;
+	state.beta = betaNew;
+
+	// Step 7: reconstruct new rank block and apply delta to W.
+	reconstruct_rank_block(&state.U[0], &state.V[0], &state.ell[0], m, n, r,
+	                       &state.scratch_WrNew[0]);
+	for (size_t i = 0; i < mn; ++i)
+		W[i] += (state.scratch_WrNew[i] - state.scratch_WrOld[i]);
+
+	// Step 8: signed complement step.
+	float meanInvSigma = 0.0f;
+	for (unsigned int i = 0; i < r; ++i)
+		meanInvSigma += expf(-state.ell[i]);
+	meanInvSigma /= static_cast<float>(r);
+	const float c_perp = vc.lambdaPerp / (meanInvSigma > 1e-12f ? meanInvSigma : 1e-12f);
+	for (size_t i = 0; i < mn; ++i)
+	{
+		const float gp = state.scratch_gPerp[i];
+		const float sgn = (gp > 0.0f) ? 1.0f : ((gp < 0.0f) ? -1.0f : 0.0f);
+		W[i] -= lr * c_perp * sgn;
+	}
+
+	// Step 9: trust-region clamp on max exp(ell).
+	float curMaxExpEll = expf(state.ell[0]);
+	for (unsigned int i = 1; i < r; ++i)
+	{
+		const float c = expf(state.ell[i]);
+		if (c > curMaxExpEll) curMaxExpEll = c;
+	}
+	if (curMaxExpEll > (1.0f + vc.rho) * state.maxExpEllPrev)
+	{
+		const float allowed = (1.0f + vc.rho) * state.maxExpEllPrev;
+		unsigned int iMax = 0;
+		for (unsigned int i = 1; i < r; ++i)
+			if (state.ell[i] > state.ell[iMax]) iMax = i;
+		state.ell[iMax] = logf(allowed);
+		if (state.beta[iMax] > state.ell[iMax])
+			state.beta[iMax] = state.ell[iMax];
+		curMaxExpEll = allowed;
+	}
+	state.maxExpEllPrev = curMaxExpEll;
+
+	// Step 10: homeostatic update of ellStar.
+	if (vc.tHom > 0u && ((state.step + 1ULL) % vc.tHom) == 0ULL)
+	{
+		for (unsigned int i = 0; i < r; ++i)
+			state.ellStar[i] = (1.0f - vc.nu) * state.ellStar[i] + vc.nu * state.ell[i];
+	}
+
+	// Step 11: finiteness check.
+	bool allFinite = true;
+	for (unsigned int i = 0; i < r && allFinite; ++i)
+		if (!(state.ell[i] == state.ell[i])) allFinite = false;
+	for (size_t i = 0; i < state.U.size() && allFinite; ++i)
+		if (!(state.U[i] == state.U[i])) allFinite = false;
+	for (size_t i = 0; i < state.V.size() && allFinite; ++i)
+		if (!(state.V[i] == state.V[i])) allFinite = false;
+
+	std::memset(gW, 0, mn * sizeof(float));
+	state.step += 1ULL;
+	return allFinite;
 }
 
 bool update(WeightState& state,

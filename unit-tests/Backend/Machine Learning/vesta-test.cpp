@@ -195,9 +195,61 @@ void VESTAInitStateTest()
 	}
 }
 
+// Verify applyStep reduces ||W - W_target||_F^2 over a few steps on a
+// simple quadratic loss: L = 0.5 * ||W - W_target||_F^2, grad = W - W_target.
 void VESTALogScaleUpdateTest()
 {
-	printf("[vesta] LogScaleUpdateTest (stub)\n");
+	printf("[vesta] LogScaleUpdateTest\n");
+	const unsigned int m = 16, n = 12;
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	std::vector<float> Wtarget(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0x33ULL);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		W[i] = glades::rng::standard_normal(eng);
+		Wtarget[i] = glades::rng::standard_normal(eng);
+	}
+
+	glades::VestaConfig vc;
+	vc.rank = 4u;
+	vc.tau = 0.0f;
+	vc.lambdaPerp = 0.2f;
+	vc.rho = 0.5f;
+	vc.tSk = 1u;
+
+	glades::vesta::WeightState st;
+	glades::rng::Engine rng;
+	glades::rng::seed_engine(rng, 0xBULL);
+
+	float prevLoss = 0.0f;
+	for (size_t i = 0; i < W.size(); ++i)
+		prevLoss += (W[i] - Wtarget[i]) * (W[i] - Wtarget[i]);
+	prevLoss *= 0.5f;
+
+	const unsigned int steps = 5u;
+	float lastLoss = prevLoss;
+	for (unsigned int s = 0; s < steps; ++s)
+	{
+		std::vector<float> g(W.size(), 0.0f);
+		for (size_t i = 0; i < W.size(); ++i)
+			g[i] = W[i] - Wtarget[i];
+
+		const bool ok = glades::vesta::update(st, &W[0], &g[0], m, n,
+		                                      1.0f, 0.05f, 0.0f, 0.0f, 1.0f,
+		                                      vc, rng, 0, 0);
+		ASSERT("applyStep non-finite", ok);
+
+		float loss = 0.0f;
+		for (size_t i = 0; i < W.size(); ++i)
+			loss += (W[i] - Wtarget[i]) * (W[i] - Wtarget[i]);
+		loss *= 0.5f;
+		lastLoss = loss;
+	}
+
+	printf("  init loss=%.4f final loss=%.4f ratio=%.4f\n",
+	       prevLoss, lastLoss, lastLoss / prevLoss);
+	ASSERT("loss did not decrease", lastLoss < 0.9f * prevLoss);
 }
 
 void VESTATrustRegionClampTest()
@@ -226,4 +278,5 @@ void VESTAUnitTest()
 	VESTAThinQRTest();
 	VESTASketchedSVDTest();
 	VESTAInitStateTest();
+	VESTALogScaleUpdateTest();
 }
