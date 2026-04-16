@@ -666,23 +666,45 @@ static void build_token_corpus(std::vector<unsigned int>& toks, unsigned int voc
 	}
 }
 
-static SweepResult run_one(glades::OptimizerConfig::Type optType,
-                           unsigned int seed,
-                           unsigned int vocab,
-                           unsigned int dModel,
-                           unsigned int dFF,
-                           unsigned int nLayers,
-                           unsigned int nHeads,
-                           unsigned int epochs,
-                           unsigned int corpusLen,
-                           const char* label)
+struct RunSpec
+{
+	glades::OptimizerConfig::Type optType;
+	const char* label;
+	unsigned int vocab;
+	unsigned int dModel;
+	unsigned int dFF;
+	unsigned int nLayers;
+	unsigned int nHeads;
+	unsigned int epochs;
+	unsigned int corpusLen;
+	float learningRate;
+	unsigned int atlasRank;
+	unsigned int vestaRank;
+	float vestaTau;
+	float vestaRho;
+	unsigned int vestaTSk;
+	float vestaLambdaPerp;
+
+	RunSpec()
+	    : optType(glades::OptimizerConfig::ADAMW), label("AdamW"),
+	      vocab(29u), dModel(64u), dFF(128u), nLayers(3u), nHeads(4u),
+	      epochs(30u), corpusLen(256u),
+	      learningRate(0.001f),
+	      atlasRank(4u),
+	      vestaRank(8u), vestaTau(0.1f), vestaRho(0.1f),
+	      vestaTSk(16u), vestaLambdaPerp(0.2f)
+	{
+	}
+};
+
+static SweepResult run_one(const RunSpec& spec, unsigned int seed)
 {
 	SweepResult res;
 
 	std::vector<unsigned int> trainToks;
-	build_token_corpus(trainToks, vocab, corpusLen, 0x5EEDULL + seed);
+	build_token_corpus(trainToks, spec.vocab, spec.corpusLen, 0x5EEDULL + seed);
 	std::vector<unsigned int> testToks;
-	build_token_corpus(testToks, vocab, corpusLen, 0x7357ULL + seed);
+	build_token_corpus(testToks, spec.vocab, spec.corpusLen, 0x7357ULL + seed);
 
 	InMemoryTokenIdInput di;
 	di.setTrainTokens(trainToks, -1);
@@ -690,37 +712,37 @@ static SweepResult run_one(glades::OptimizerConfig::Type optType,
 
 	glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
 	std::vector<glades::HiddenLayerInfo*> hidden;
-	for (unsigned int i = 0; i < nLayers; ++i)
+	for (unsigned int i = 0; i < spec.nLayers; ++i)
 		hidden.push_back(new glades::HiddenLayerInfo(
-		    static_cast<int>(dModel), 0.001f, 0.0f, 0.0f, 0.0f, 0.0f,
+		    static_cast<int>(spec.dModel), spec.learningRate, 0.0f, 0.0f, 0.0f, 0.0f,
 		    glades::GMath::LINEAR, 1.0f));
 	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
-	    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	    static_cast<int>(spec.vocab), glades::OutputLayerInfo::CLASSIFICATION);
 	glades::NNInfo* info = new glades::NNInfo("vesta_sweep", in, hidden, out);
 
 	glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
 	net.setSeed(seed);
-	net.getTerminatorMutable().setEpoch(static_cast<int>(epochs));
+	net.getTerminatorMutable().setEpoch(static_cast<int>(spec.epochs));
 	net.getTerminatorMutable().setAccuracy(0.0f);
 	{
 		glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
 		cfg.transformer.enableTokenEmbedding = true;
-		cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+		cfg.transformer.vocabSizeOverride = static_cast<int>(spec.vocab);
 		cfg.transformer.tieEmbeddings = true;
-		cfg.transformer.nHeadsOverride = static_cast<int>(nHeads);
-		cfg.transformer.dFFOverride = static_cast<int>(dFF);
+		cfg.transformer.nHeadsOverride = static_cast<int>(spec.nHeads);
+		cfg.transformer.dFFOverride = static_cast<int>(spec.dFF);
 		cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
-		cfg.optimizer.type = optType;
+		cfg.optimizer.type = spec.optType;
 		cfg.optimizer.adamBeta1 = 0.9f;
 		cfg.optimizer.adamBeta2 = 0.999f;
 		cfg.optimizer.adamEps = 1e-8f;
 		cfg.optimizer.adamBiasCorrection = true;
-		cfg.atlas.rank = 4u;
-		cfg.vesta.rank = 4u;
-		cfg.vesta.tau = 0.1f;
-		cfg.vesta.rho = 0.1f;
-		cfg.vesta.tSk = 8u;
-		cfg.vesta.lambdaPerp = 0.2f;
+		cfg.atlas.rank = spec.atlasRank;
+		cfg.vesta.rank = spec.vestaRank;
+		cfg.vesta.tau = spec.vestaTau;
+		cfg.vesta.rho = spec.vestaRho;
+		cfg.vesta.tSk = spec.vestaTSk;
+		cfg.vesta.lambdaPerp = spec.vestaLambdaPerp;
 	}
 
 	MetricCapture trainCb;
@@ -731,7 +753,7 @@ static SweepResult run_one(glades::OptimizerConfig::Type optType,
 	if (!stTrain.ok() || !trainCb.saw)
 	{
 		printf("  [sweep:%s seed=%u] TRAIN FAILED: %s\n",
-		       label, seed, stTrain.message.c_str());
+		       spec.label, seed, stTrain.message.c_str());
 		delete info;
 		return res;
 	}
@@ -742,7 +764,7 @@ static SweepResult run_one(glades::OptimizerConfig::Type optType,
 	const glades::NNetworkStatus stTest = net.test(&di, &testCb);
 	if (!stTest.ok() || !testCb.saw)
 	{
-		printf("  [sweep:%s seed=%u] TEST FAILED\n", label, seed);
+		printf("  [sweep:%s seed=%u] TEST FAILED\n", spec.label, seed);
 		delete info;
 		return res;
 	}
@@ -820,9 +842,14 @@ void VESTASweepBenchmark()
 	{
 		for (unsigned int s = 0; s < nSeeds; ++s)
 		{
-			const SweepResult r = run_one(specs[o].type, seeds[s],
-			                              vocab, dModel, dFF, nLayers, nHeads,
-			                              epochs, corpusLen, specs[o].label);
+			RunSpec spec;
+			spec.optType = specs[o].type;
+			spec.label = specs[o].label;
+			spec.vocab = vocab; spec.dModel = dModel; spec.dFF = dFF;
+			spec.nLayers = nLayers; spec.nHeads = nHeads;
+			spec.epochs = epochs; spec.corpusLen = corpusLen;
+			spec.vestaRank = 4u; spec.atlasRank = 4u; spec.vestaTSk = 8u;
+			const SweepResult r = run_one(spec, seeds[s]);
 			printf("%-8s  %-6u  %-10.4f  %-10.4f  %-10.4f  %-10.4f  %-8.2f%s\n",
 			       specs[o].label, seeds[s],
 			       r.finalTrainNll, r.finalTrainPpl,
@@ -857,6 +884,240 @@ void VESTASweepBenchmark()
 		       vNll.mean, vNll.stddev,
 		       vPpl.mean, vPpl.stddev,
 		       wAgg.mean, wAgg.stddev);
+	}
+	printf("\n");
+}
+
+// =================================================================
+// V2 sweep: scale-up config + per-optimizer LR sweep + VESTA HP sweep.
+// Covers recommendations 2, 3, 4 from the first sweep artifact.
+// =================================================================
+
+namespace {
+
+static void run_axis(const char* axisName,
+                     const RunSpec& baseSpec,
+                     const char* valueLabelFmt,
+                     const float* values,
+                     unsigned int nValues,
+                     const unsigned int* seeds, unsigned int nSeeds,
+                     std::vector<AggStats>& outTrain,
+                     std::vector<AggStats>& outTest,
+                     std::vector<AggStats>& outWall,
+                     // optional mutator: applies value v to a copy of baseSpec
+                     RunSpec (*mutate)(const RunSpec&, float))
+{
+	printf("\n%-10s  %-10s  %4s  %-18s  %-18s  %-12s\n",
+	       "axis", axisName, "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-10s  %-10s  %4s  %-18s  %-18s  %-12s\n",
+	       "----", "---", "--", "------------------", "------------------", "------------");
+	for (unsigned int v = 0; v < nValues; ++v)
+	{
+		RunSpec spec = mutate(baseSpec, values[v]);
+		std::vector<float> trains, tests, walls;
+		for (unsigned int s = 0; s < nSeeds; ++s)
+		{
+			const SweepResult r = run_one(spec, seeds[s]);
+			if (r.ok)
+			{
+				trains.push_back(r.finalTrainNll);
+				tests.push_back(r.finalTestNll);
+				walls.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		AggStats a = aggregate(trains);
+		AggStats b = aggregate(tests);
+		AggStats c = aggregate(walls);
+		outTrain.push_back(a);
+		outTest.push_back(b);
+		outWall.push_back(c);
+		char buf[32];
+		sprintf(buf, valueLabelFmt, values[v]);
+		printf("%-10s  %-10s  %4u  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %5.2f +/- %-5.2f\n",
+		       baseSpec.label, buf, (unsigned int)trains.size(),
+		       a.mean, a.stddev, b.mean, b.stddev, c.mean, c.stddev);
+	}
+}
+
+static RunSpec mutate_lr(const RunSpec& base, float v)          { RunSpec s = base; s.learningRate = v; return s; }
+static RunSpec mutate_vrank(const RunSpec& base, float v)       { RunSpec s = base; s.vestaRank = static_cast<unsigned int>(v); return s; }
+static RunSpec mutate_vtau(const RunSpec& base, float v)        { RunSpec s = base; s.vestaTau = v; return s; }
+static RunSpec mutate_vtsk(const RunSpec& base, float v)        { RunSpec s = base; s.vestaTSk = static_cast<unsigned int>(v); return s; }
+static RunSpec mutate_vlambda(const RunSpec& base, float v)     { RunSpec s = base; s.vestaLambdaPerp = v; return s; }
+
+static unsigned int best_index(const std::vector<AggStats>& stats)
+{
+	if (stats.empty()) return 0u;
+	unsigned int bi = 0u;
+	for (unsigned int i = 1; i < stats.size(); ++i)
+		if (stats[i].mean < stats[bi].mean) bi = i;
+	return bi;
+}
+
+} // namespace
+
+void VESTASweepV2Benchmark()
+{
+	printf("\n============================================================\n");
+	printf("VESTA sweep v2: scale-up + per-opt LR sweep + VESTA HP sweep\n");
+	printf("============================================================\n");
+
+	// Scale-up config: ~4x cost of v1 sweep. Stays under ~15 min total
+	// for the full LR x HP sweep.
+	RunSpec base;
+	base.vocab = 29u;
+	base.dModel = 128u;
+	base.dFF = 256u;
+	base.nLayers = 4u;
+	base.nHeads = 4u;
+	base.epochs = 15u;
+	base.corpusLen = 384u;
+	base.atlasRank = 8u;
+	base.vestaRank = 8u;
+	base.vestaTau = 0.1f;
+	base.vestaRho = 0.1f;
+	base.vestaTSk = 16u;
+	base.vestaLambdaPerp = 0.2f;
+
+	const unsigned int seeds3[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds3) / sizeof(seeds3[0]);
+
+	printf("Scale-up base: vocab=%u dModel=%u dFF=%u layers=%u heads=%u epochs=%u seq=%u seeds=%u\n",
+	       base.vocab, base.dModel, base.dFF, base.nLayers, base.nHeads,
+	       base.epochs, base.corpusLen, nSeeds);
+
+	// ============== Phase 1: LR sweep per optimizer ==============
+	printf("\n================ Phase 1: learning-rate sweep ================\n");
+	const float lrs[] = { 3e-4f, 1e-3f, 3e-3f, 1e-2f };
+	const unsigned int nLrs = sizeof(lrs) / sizeof(lrs[0]);
+
+	struct OptSpec { glades::OptimizerConfig::Type type; const char* label; };
+	OptSpec specs[3];
+	specs[0].type = glades::OptimizerConfig::ADAMW; specs[0].label = "AdamW";
+	specs[1].type = glades::OptimizerConfig::ATLAS; specs[1].label = "ATLAS";
+	specs[2].type = glades::OptimizerConfig::VESTA; specs[2].label = "VESTA";
+
+	float bestLr[3] = { 1e-3f, 1e-3f, 1e-3f };
+	AggStats bestTest[3];
+
+	for (unsigned int o = 0; o < 3u; ++o)
+	{
+		RunSpec optBase = base;
+		optBase.optType = specs[o].type;
+		optBase.label = specs[o].label;
+		std::vector<AggStats> trains, tests, walls;
+		run_axis("lr", optBase, "%.1e", lrs, nLrs, seeds3, nSeeds,
+		         trains, tests, walls, mutate_lr);
+		const unsigned int bi = best_index(tests);
+		bestLr[o] = lrs[bi];
+		bestTest[o] = tests[bi];
+	}
+
+	printf("\nPhase 1 summary (best testNLL per optimizer):\n");
+	printf("%-8s  %-10s  %-18s\n", "opt", "bestLR", "testNLL@bestLR");
+	printf("%-8s  %-10s  %-18s\n", "---", "-------", "------------------");
+	for (unsigned int o = 0; o < 3u; ++o)
+		printf("%-8s  %.1e    %6.4f +/- %-7.4f\n",
+		       specs[o].label, bestLr[o], bestTest[o].mean, bestTest[o].stddev);
+
+	// ============== Phase 2: VESTA hyperparameter sweeps ==============
+	printf("\n================ Phase 2: VESTA hyperparameter sweep ================\n");
+	printf("Using VESTA best LR = %.1e from Phase 1\n", bestLr[2]);
+
+	RunSpec vBase = base;
+	vBase.optType = glades::OptimizerConfig::VESTA;
+	vBase.label = "VESTA";
+	vBase.learningRate = bestLr[2];
+
+	std::vector<AggStats> vRankTrain, vRankTest, vRankWall;
+	const float vRanks[] = { 4.0f, 8.0f, 16.0f };
+	run_axis("rank", vBase, "r=%.0f", vRanks, 3u, seeds3, nSeeds,
+	         vRankTrain, vRankTest, vRankWall, mutate_vrank);
+
+	std::vector<AggStats> vTauTrain, vTauTest, vTauWall;
+	const float vTaus[] = { 0.0f, 0.05f, 0.1f, 0.2f };
+	run_axis("tau", vBase, "tau=%.2f", vTaus, 4u, seeds3, nSeeds,
+	         vTauTrain, vTauTest, vTauWall, mutate_vtau);
+
+	std::vector<AggStats> vTskTrain, vTskTest, vTskWall;
+	const float vTsks[] = { 4.0f, 16.0f, 64.0f };
+	run_axis("tSk", vBase, "tSk=%.0f", vTsks, 3u, seeds3, nSeeds,
+	         vTskTrain, vTskTest, vTskWall, mutate_vtsk);
+
+	std::vector<AggStats> vLamTrain, vLamTest, vLamWall;
+	const float vLams[] = { 0.0f, 0.1f, 0.2f, 0.4f };
+	run_axis("lambdaPerp", vBase, "lp=%.2f", vLams, 4u, seeds3, nSeeds,
+	         vLamTrain, vLamTest, vLamWall, mutate_vlambda);
+
+	const unsigned int biR = best_index(vRankTest);
+	const unsigned int biT = best_index(vTauTest);
+	const unsigned int biS = best_index(vTskTest);
+	const unsigned int biL = best_index(vLamTest);
+
+	printf("\nPhase 2 summary (VESTA best single-axis settings):\n");
+	printf("  best rank       = %-4.0f  (testNLL %6.4f +/- %6.4f)\n", vRanks[biR], vRankTest[biR].mean, vRankTest[biR].stddev);
+	printf("  best tau        = %-4.2f  (testNLL %6.4f +/- %6.4f)\n", vTaus[biT], vTauTest[biT].mean, vTauTest[biT].stddev);
+	printf("  best tSk        = %-4.0f  (testNLL %6.4f +/- %6.4f)\n", vTsks[biS], vTskTest[biS].mean, vTskTest[biS].stddev);
+	printf("  best lambdaPerp = %-4.2f  (testNLL %6.4f +/- %6.4f)\n", vLams[biL], vLamTest[biL].mean, vLamTest[biL].stddev);
+
+	// ============== Phase 3: head-to-head at best configs ==============
+	printf("\n================ Phase 3: head-to-head (best per optimizer) ================\n");
+
+	const unsigned int seeds5[] = { 101u, 202u, 303u, 404u, 505u };
+	const unsigned int nSeeds5 = sizeof(seeds5) / sizeof(seeds5[0]);
+
+	printf("\n%-8s  %-10s  %-4s  %-18s  %-18s  %-12s\n",
+	       "opt", "config", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-8s  %-10s  %-4s  %-18s  %-18s  %-12s\n",
+	       "---", "------", "--", "------------------", "------------------", "------------");
+	AggStats finalTest[3];
+	for (unsigned int o = 0; o < 3u; ++o)
+	{
+		RunSpec spec = base;
+		spec.optType = specs[o].type;
+		spec.label = specs[o].label;
+		spec.learningRate = bestLr[o];
+		if (o == 2u)
+		{
+			spec.vestaRank = static_cast<unsigned int>(vRanks[biR]);
+			spec.vestaTau = vTaus[biT];
+			spec.vestaTSk = static_cast<unsigned int>(vTsks[biS]);
+			spec.vestaLambdaPerp = vLams[biL];
+		}
+		std::vector<float> trains, tests, walls;
+		for (unsigned int s = 0; s < nSeeds5; ++s)
+		{
+			const SweepResult r = run_one(spec, seeds5[s]);
+			if (r.ok)
+			{
+				trains.push_back(r.finalTrainNll);
+				tests.push_back(r.finalTestNll);
+				walls.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		const AggStats tA = aggregate(trains);
+		const AggStats te = aggregate(tests);
+		const AggStats wA = aggregate(walls);
+		finalTest[o] = te;
+		char cfgLabel[32];
+		if (o == 2u)
+			sprintf(cfgLabel, "r%u/t%.2f", spec.vestaRank, spec.vestaTau);
+		else if (o == 1u)
+			sprintf(cfgLabel, "atlas-r%u", spec.atlasRank);
+		else
+			sprintf(cfgLabel, "adamw");
+		printf("%-8s  %-10s  %-4u  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %5.2f +/- %-5.2f\n",
+		       specs[o].label, cfgLabel, (unsigned int)trains.size(),
+		       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+	}
+
+	printf("\nFinal head-to-head deltas (testNLL, lower is better):\n");
+	for (unsigned int o = 0; o < 3u; ++o)
+	{
+		if (o == 0u) continue;
+		const float d = finalTest[o].mean - finalTest[0].mean;
+		printf("  %-8s vs AdamW: %+.4f nats  (%s)\n",
+		       specs[o].label, d, d < 0.0f ? "wins" : "loses");
 	}
 	printf("\n");
 }

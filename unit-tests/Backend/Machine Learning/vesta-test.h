@@ -35,6 +35,7 @@ void VESTAOrthogonalInvarianceTest();
 void VESTAGpuParityTest();
 void VESTATransformerIntegrationTest();
 void VESTASweepBenchmark();
+void VESTASweepV2Benchmark();
 void VESTAUnitTest();
 
 #endif
