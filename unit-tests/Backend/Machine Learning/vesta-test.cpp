@@ -445,10 +445,108 @@ void VESTAOrthogonalInvarianceTest()
 	}
 }
 
+#ifdef GLADES_HAVE_CUDA
+
 void VESTAGpuParityTest()
 {
-	printf("[vesta] GpuParityTest (stub)\n");
+	printf("[vesta] GpuParityTest\n");
+
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping parity test\n");
+			return;
+		}
+	}
+
+	const unsigned int m = 32, n = 24;
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xC0DEULL);
+	for (size_t i = 0; i < W.size(); ++i)
+		W[i] = 0.5f * glades::rng::standard_normal(eng);
+
+	glades::VestaConfig vc;
+	vc.rank = 5u;
+	vc.tau = 0.1f;
+	vc.rho = 0.05f;
+	vc.lambdaPerp = 0.2f;
+	vc.tSk = 5u;
+
+	std::vector<float> Wcpu = W;
+	glades::vesta::WeightState stCpu;
+	glades::rng::Engine rngCpu;
+	glades::rng::seed_engine(rngCpu, 0x555ULL);
+	glades::vesta::initWeightState(stCpu, &Wcpu[0], m, n, vc, rngCpu, 0);
+
+	glades::gpu::GpuBuffer<float> dW, dG;
+	ASSERT("alloc dW", dW.allocate(static_cast<size_t>(m) * n));
+	ASSERT("alloc dG", dG.allocate(static_cast<size_t>(m) * n));
+	ASSERT("upload W", dW.upload(&W[0], static_cast<size_t>(m) * n));
+
+	glades::gpu::GpuVestaWeightState stGpu;
+	glades::rng::Engine rngGpu;
+	glades::rng::seed_engine(rngGpu, 0x555ULL);
+	ASSERT("gpu init",
+	       glades::gpu::vesta_gpu_init(stGpu, dW.data(), m, n, vc, rngGpu, 0));
+
+	const unsigned int steps = 10u;
+	for (unsigned int s = 0; s < steps; ++s)
+	{
+		glades::rng::Engine gradEng;
+		glades::rng::seed_engine(gradEng, 0xAA00ULL + s);
+		std::vector<float> gStep(static_cast<size_t>(m) * n, 0.0f);
+		for (size_t i = 0; i < gStep.size(); ++i)
+			gStep[i] = 0.05f * glades::rng::standard_normal(gradEng);
+
+		std::vector<float> gCpuStep = gStep;
+		std::vector<float> gGpuStep = gStep;
+
+		const bool okCpu = glades::vesta::applyStep(stCpu, &Wcpu[0], &gCpuStep[0], m, n,
+		                                            1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                            vc, rngCpu, 0, 0);
+		ASSERT("cpu step", okCpu);
+
+		ASSERT("upload g", dG.upload(&gGpuStep[0], static_cast<size_t>(m) * n));
+		const bool okGpu = glades::gpu::vesta_gpu_step(stGpu, dW.data(), dG.data(), m, n,
+		                                               1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                               vc, rngGpu, 0, 0);
+		ASSERT("gpu step", okGpu);
+	}
+
+	std::vector<float> Wgpu(static_cast<size_t>(m) * n, 0.0f);
+	ASSERT("download Wgpu", dW.download(&Wgpu[0], static_cast<size_t>(m) * n));
+	float maxAbs = 0.0f, meanAbs = 0.0f;
+	for (size_t i = 0; i < Wcpu.size(); ++i)
+	{
+		const float d = fabsf(Wcpu[i] - Wgpu[i]);
+		if (d > maxAbs) maxAbs = d;
+		meanAbs += d;
+	}
+	meanAbs /= static_cast<float>(Wcpu.size());
+	printf("  parity W maxAbs=%.6g meanAbs=%.6g\n", maxAbs, meanAbs);
+	ASSERT("parity W maxAbs", maxAbs < 5e-3f);
+	ASSERT("parity W meanAbs", meanAbs < 5e-4f);
+
+	std::vector<float> ellGpu(stGpu.r, 0.0f);
+	ASSERT("download ell", stGpu.ell.download(&ellGpu[0], stGpu.r));
+	for (unsigned int i = 0; i < stGpu.r; ++i)
+	{
+		char msg[128];
+		sprintf(msg, "parity ell[%u] cpu=%.6g gpu=%.6g", i, stCpu.ell[i], ellGpu[i]);
+		ASSERT(msg, fabsf(stCpu.ell[i] - ellGpu[i]) < 1e-3f);
+	}
 }
+
+#else
+
+void VESTAGpuParityTest()
+{
+	printf("[vesta] GpuParityTest: CUDA not compiled; skipping\n");
+}
+
+#endif
 
 void VESTAUnitTest()
 {
