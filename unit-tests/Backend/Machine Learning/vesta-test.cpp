@@ -91,12 +91,47 @@ void VESTAGramSchmidtTest()
 
 void VESTAThinQRTest()
 {
-	printf("[vesta] ThinQRTest (stub)\n");
+	printf("[vesta] ThinQRTest\n");
+	const unsigned int m = 32;
+	const unsigned int r = 8;
+	std::vector<float> Q;
+	fill_random(Q, m, r, 0xDECAFULL);
+
+	const bool ok = glades::vesta::thinQR(&Q[0], m, r);
+	ASSERT("thinQR returned false on full-rank input", ok);
+	const float err = orth_error(&Q[0], m, r);
+	assert_close("thinQR orth err", err, 0.0f, 1e-5f);
+
+	// Rank-deficient case: third column is a copy of the first.
+	std::vector<float> QDef;
+	fill_random(QDef, m, r, 0xBADF00DULL);
+	for (unsigned int i = 0; i < m; ++i)
+		QDef[i * r + 2] = QDef[i * r + 0];
+	const bool okDef = glades::vesta::thinQR(&QDef[0], m, r);
+	ASSERT("thinQR returned true on rank-deficient input", !okDef);
 }
 
 void VESTASketchedSVDTest()
 {
-	printf("[vesta] SketchedSVDTest (stub)\n");
+	printf("[vesta] SketchedSVDTest\n");
+	// Diagonal B[4 x 8] = diag(4,3,2,1) padded.
+	const unsigned int mB = 4, nB = 8;
+	std::vector<float> B(static_cast<size_t>(mB) * nB, 0.0f);
+	for (unsigned int i = 0; i < 4; ++i)
+		B[i * nB + i] = static_cast<float>(4 - i);
+
+	const unsigned int r = 3;
+	std::vector<float> V(static_cast<size_t>(nB) * r, 0.0f);
+	std::vector<float> s(r, 0.0f);
+	const bool ok = glades::vesta::denseSVD_rightV(&B[0], mB, nB, &V[0], &s[0], r);
+	ASSERT("denseSVD returned false", ok);
+
+	assert_close("s[0]", s[0], 4.0f, 1e-4f);
+	assert_close("s[1]", s[1], 3.0f, 1e-4f);
+	assert_close("s[2]", s[2], 2.0f, 1e-4f);
+
+	const float err = orth_error(&V[0], nB, r);
+	assert_close("denseSVD V orth err", err, 0.0f, 1e-4f);
 }
 
 void VESTAInitStateTest()
@@ -132,4 +167,6 @@ void VESTAGpuParityTest()
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
+	VESTAThinQRTest();
+	VESTASketchedSVDTest();
 }
