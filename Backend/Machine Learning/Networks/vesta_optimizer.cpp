@@ -17,12 +17,20 @@ namespace vesta {
 // ---------------- Small linear-algebra helpers ----------------
 
 // Modified Gram-Schmidt on Q[m x r] row-major.
-// Zeros out any columns that become numerically zero.
+// Zeros out any columns whose post-projection residual norm drops below
+// a relative threshold of the pre-projection norm — this is the correct
+// rank-deficiency detector for floating-point MGS.
 void gramSchmidt(float* Q, unsigned int m, unsigned int r)
 {
 	const float kTiny = 1e-12f;
+	const float kRelThresh = 1e-5f;
 	for (unsigned int j = 0; j < r; ++j)
 	{
+		float origNorm2 = 0.0f;
+		for (unsigned int i = 0; i < m; ++i)
+			origNorm2 += Q[i * r + j] * Q[i * r + j];
+		const float origNorm = sqrtf(origNorm2);
+
 		for (unsigned int k = 0; k < j; ++k)
 		{
 			float dot = 0.0f;
@@ -35,7 +43,7 @@ void gramSchmidt(float* Q, unsigned int m, unsigned int r)
 		for (unsigned int i = 0; i < m; ++i)
 			norm2 += Q[i * r + j] * Q[i * r + j];
 		const float norm = sqrtf(norm2);
-		if (norm <= kTiny)
+		if (norm <= kTiny || (origNorm > 0.0f && norm <= kRelThresh * origNorm))
 		{
 			for (unsigned int i = 0; i < m; ++i)
 				Q[i * r + j] = 0.0f;
@@ -202,26 +210,238 @@ bool denseSVD_rightV(const float* B, unsigned int mB, unsigned int nB,
 	return true;
 }
 
-// ---------------- Stubs (implemented in later tasks) ----------------
+// ---------------- State initialization and sketched SVD refresh ----------------
 
-
-void initWeightState(WeightState& /*state*/,
-                     const float* /*W*/,
-                     unsigned int /*m*/, unsigned int /*n*/,
-                     const VestaConfig& /*vc*/,
-                     glades::rng::Engine& /*rng*/,
-                     shmea::GLogger* /*logger*/)
+static void allocate_scratch(WeightState& s)
 {
+	const unsigned int m = s.m, n = s.n, r = s.r;
+	const unsigned int over = 8u;
+	const unsigned int rp = r + over;
+	s.scratch_A.assign(static_cast<size_t>(r) * r, 0.0f);
+	s.scratch_UA.assign(static_cast<size_t>(m) * r, 0.0f);
+	s.scratch_WrOld.assign(static_cast<size_t>(m) * n, 0.0f);
+	s.scratch_WrNew.assign(static_cast<size_t>(m) * n, 0.0f);
+	s.scratch_gPerp.assign(static_cast<size_t>(m) * n, 0.0f);
+	s.scratch_Omega_U.assign(static_cast<size_t>(m) * r, 0.0f);
+	s.scratch_Omega_V.assign(static_cast<size_t>(n) * r, 0.0f);
+	s.scratch_URaw.assign(static_cast<size_t>(m) * r, 0.0f);
+	s.scratch_VRaw.assign(static_cast<size_t>(n) * r, 0.0f);
+	s.scratch_sketchOmega.assign(static_cast<size_t>(n) * rp, 0.0f);
+	s.scratch_sketchY.assign(static_cast<size_t>(m) * rp, 0.0f);
+	s.scratch_sketchB.assign(static_cast<size_t>(rp) * n, 0.0f);
+	s.scratch_sketchVr.assign(static_cast<size_t>(n) * r, 0.0f);
+	s.scratch_sketchS.assign(rp, 0.0f);
 }
 
-bool refreshSubspace(WeightState& /*state*/,
-                     const float* /*W*/,
-                     unsigned int /*m*/, unsigned int /*n*/,
-                     const VestaConfig& /*vc*/,
-                     glades::rng::Engine& /*rng*/,
+// Randomized range-finder sketched SVD:
+//   1. Omega ~ N(0,1) [n, rp]
+//   2. Y = W Omega [m, rp]
+//   3. Power iterations: Y = W (W^T Y), thin-QR after each
+//   4. U_over = QR(Y) [m, rp]
+//   5. B = U_over^T W [rp, n]
+//   6. Dense SVD of B: right singular vectors V [n, r], singular values s [r]
+//   7. Reassemble U = U_over * U_B[:, :r]
+static bool sketched_svd(const float* W, unsigned int m, unsigned int n,
+                         unsigned int r,
+                         WeightState& s,
+                         const VestaConfig& vc,
+                         glades::rng::Engine& rng)
+{
+	const unsigned int over = 8u;
+	unsigned int rp = r + over;
+	if (rp > m) rp = m;
+	if (rp > n) rp = n;
+	if (rp < r) return false;
+
+	for (size_t i = 0; i < static_cast<size_t>(n) * rp; ++i)
+		s.scratch_sketchOmega[i] = glades::rng::standard_normal(rng);
+
+	// Y = W Omega
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		for (unsigned int c = 0; c < rp; ++c)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < n; ++k)
+				acc += W[i * n + k] * s.scratch_sketchOmega[k * rp + c];
+			s.scratch_sketchY[i * rp + c] = acc;
+		}
+	}
+
+	std::vector<float> WtY(static_cast<size_t>(n) * rp, 0.0f);
+	for (unsigned int p = 0; p < vc.powerIters; ++p)
+	{
+		// gramSchmidt tolerates rank-deficient input (zeros out degenerate columns),
+		// which is important when W has low effective rank: power iteration drives
+		// the oversample columns into the same subspace.
+		gramSchmidt(&s.scratch_sketchY[0], m, rp);
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			for (unsigned int c = 0; c < rp; ++c)
+			{
+				float acc = 0.0f;
+				for (unsigned int i = 0; i < m; ++i)
+					acc += W[i * n + j] * s.scratch_sketchY[i * rp + c];
+				WtY[j * rp + c] = acc;
+			}
+		}
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			for (unsigned int c = 0; c < rp; ++c)
+			{
+				float acc = 0.0f;
+				for (unsigned int k = 0; k < n; ++k)
+					acc += W[i * n + k] * WtY[k * rp + c];
+				s.scratch_sketchY[i * rp + c] = acc;
+			}
+		}
+	}
+
+	gramSchmidt(&s.scratch_sketchY[0], m, rp);
+
+	// B = Y^T W  [rp, n]
+	for (unsigned int c = 0; c < rp; ++c)
+	{
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				acc += s.scratch_sketchY[k * rp + c] * W[k * n + j];
+			s.scratch_sketchB[c * n + j] = acc;
+		}
+	}
+
+	std::vector<float> Vrp(static_cast<size_t>(n) * rp, 0.0f);
+	std::vector<float> srp(rp, 0.0f);
+	if (!denseSVD_rightV(&s.scratch_sketchB[0], rp, n, &Vrp[0], &srp[0], rp))
+		return false;
+
+	// Singular-value threshold: below this we declare rank deficiency and
+	// fill U[:, i], V[:, i] with random orthonormal extensions. We use a
+	// generous relative threshold because when the true rank is < r, the
+	// "tail" singular value comes from numerical noise in B which can easily
+	// be 1e-3 to 1e-1 of the leading singular value in float precision.
+	const float kRankThresh = std::max(1e-6f, srp[0] * 1e-3f);
+
+	// U_B[:, i] = B V[:, i] / s[i] for valid directions; zeros for deficient ones.
+	std::vector<float> UB(static_cast<size_t>(rp) * r, 0.0f);
+	std::vector<bool> validCol(r, false);
+	for (unsigned int i = 0; i < r; ++i)
+	{
+		const float si = srp[i];
+		if (si > kRankThresh)
+		{
+			validCol[i] = true;
+			for (unsigned int a = 0; a < rp; ++a)
+			{
+				float acc = 0.0f;
+				for (unsigned int j = 0; j < n; ++j)
+					acc += s.scratch_sketchB[a * n + j] * Vrp[j * rp + i];
+				UB[a * r + i] = acc / si;
+			}
+		}
+	}
+
+	std::vector<float> Ufinal(static_cast<size_t>(m) * r, 0.0f);
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		for (unsigned int c = 0; c < r; ++c)
+		{
+			if (!validCol[c]) continue;
+			float acc = 0.0f;
+			for (unsigned int a = 0; a < rp; ++a)
+				acc += s.scratch_sketchY[i * rp + a] * UB[a * r + c];
+			Ufinal[i * r + c] = acc;
+		}
+	}
+
+	std::vector<float> Vfinal(static_cast<size_t>(n) * r, 0.0f);
+	for (unsigned int j = 0; j < n; ++j)
+		for (unsigned int c = 0; c < r; ++c)
+			if (validCol[c])
+				Vfinal[j * r + c] = Vrp[j * rp + c];
+
+	// Fill deficient columns with random vectors then orthonormalize U, V.
+	for (unsigned int c = 0; c < r; ++c)
+	{
+		if (!validCol[c])
+		{
+			for (unsigned int i = 0; i < m; ++i)
+				Ufinal[i * r + c] = glades::rng::standard_normal(rng);
+			for (unsigned int j = 0; j < n; ++j)
+				Vfinal[j * r + c] = glades::rng::standard_normal(rng);
+		}
+	}
+	gramSchmidt(&Ufinal[0], m, r);
+	gramSchmidt(&Vfinal[0], n, r);
+
+	s.U = Ufinal;
+	s.V = Vfinal;
+	s.ell.assign(r, 0.0f);
+	for (unsigned int i = 0; i < r; ++i)
+	{
+		float l;
+		if (validCol[i])
+			l = logf(std::max(srp[i], 1e-20f));
+		else
+			l = vc.ellMin;
+		if (l < vc.ellMin) l = vc.ellMin;
+		if (l > vc.ellMax) l = vc.ellMax;
+		s.ell[i] = l;
+	}
+	return true;
+}
+
+void initWeightState(WeightState& state,
+                     const float* W,
+                     unsigned int m, unsigned int n,
+                     const VestaConfig& vc,
+                     glades::rng::Engine& rng,
                      shmea::GLogger* /*logger*/)
 {
-	return false;
+	unsigned int r = vc.rank;
+	const unsigned int dMin = std::min(m, n);
+	if (r > dMin) r = dMin;
+	if (r == 0u) r = 1u;
+
+	state.reset();
+	state.m = m;
+	state.n = n;
+	state.r = r;
+	state.U.assign(static_cast<size_t>(m) * r, 0.0f);
+	state.V.assign(static_cast<size_t>(n) * r, 0.0f);
+	state.ell.assign(r, 0.0f);
+	state.beta.assign(r, 0.0f);
+	state.ellStar.assign(r, 0.0f);
+	allocate_scratch(state);
+
+	if (!sketched_svd(W, m, n, r, state, vc, rng))
+	{
+		// Fallback: identity-like basis, unit singular values.
+		for (unsigned int i = 0; i < r; ++i)
+		{
+			state.U[i * r + i] = 1.0f;
+			state.V[i * r + i] = 1.0f;
+			state.ell[i] = 0.0f;
+		}
+	}
+	state.beta = state.ell;
+	state.ellStar = state.ell;
+	state.maxExpEllPrev = expf(state.ell[0]);
+	state.step = 0ULL;
+	state.initialized = true;
+}
+
+bool refreshSubspace(WeightState& state,
+                     const float* W,
+                     unsigned int m, unsigned int n,
+                     const VestaConfig& vc,
+                     glades::rng::Engine& rng,
+                     shmea::GLogger* /*logger*/)
+{
+	if (!state.initialized || state.m != m || state.n != n)
+		return false;
+	return sketched_svd(W, m, n, state.r, state, vc, rng);
 }
 
 bool applyStep(WeightState& /*state*/,

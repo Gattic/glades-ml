@@ -136,7 +136,63 @@ void VESTASketchedSVDTest()
 
 void VESTAInitStateTest()
 {
-	printf("[vesta] InitStateTest (stub)\n");
+	printf("[vesta] InitStateTest\n");
+	const unsigned int m = 16, n = 12;
+	// W = sum_k svs[k] * u_k v_k^T with orthonormal u_k and orthonormal v_k,
+	// so the true singular values are exactly svs = (5, 3, 2).
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0x12345ULL);
+
+	// Build U[m, 3] and V[n, 3] as orthonormal matrices via Gram-Schmidt.
+	std::vector<float> Uorth(static_cast<size_t>(m) * 3u, 0.0f);
+	std::vector<float> Vorth(static_cast<size_t>(n) * 3u, 0.0f);
+	for (size_t i = 0; i < Uorth.size(); ++i) Uorth[i] = glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < Vorth.size(); ++i) Vorth[i] = glades::rng::standard_normal(eng);
+	glades::vesta::gramSchmidt(&Uorth[0], m, 3u);
+	glades::vesta::gramSchmidt(&Vorth[0], n, 3u);
+
+	const float svs[3] = { 5.0f, 3.0f, 2.0f };
+	for (unsigned int k = 0; k < 3u; ++k)
+		for (unsigned int i = 0; i < m; ++i)
+			for (unsigned int j = 0; j < n; ++j)
+				W[i * n + j] += svs[k] * Uorth[i * 3u + k] * Vorth[j * 3u + k];
+
+	glades::VestaConfig vc;
+	vc.rank = 4u;
+	glades::vesta::WeightState st;
+	glades::rng::Engine rng;
+	glades::rng::seed_engine(rng, 0xABCULL);
+	glades::vesta::initWeightState(st, &W[0], m, n, vc, rng, 0);
+
+	ASSERT("init: initialized flag", st.initialized);
+	ASSERT("init: m", st.m == m);
+	ASSERT("init: n", st.n == n);
+	ASSERT("init: r", st.r == 4u);
+	ASSERT("init: step", st.step == 0ULL);
+	ASSERT("init: ell size", st.ell.size() == 4u);
+	ASSERT("init: U size", st.U.size() == static_cast<size_t>(m) * 4u);
+
+	for (int k = 0; k < 3; ++k)
+	{
+		const float got = expf(st.ell[k]);
+		const float expected = svs[k];
+		const float rel = fabsf(got - expected) / expected;
+		char msg[128];
+		sprintf(msg, "init: exp(ell[%d])=%.4f expected %.2f rel %.4f", k, got, expected, rel);
+		ASSERT(msg, rel < 0.05f);
+	}
+
+	const float uErr = orth_error(&st.U[0], m, st.r);
+	assert_close("init: U orth err", uErr, 0.0f, 1e-3f);
+	const float vErr = orth_error(&st.V[0], n, st.r);
+	assert_close("init: V orth err", vErr, 0.0f, 1e-3f);
+
+	for (unsigned int i = 0; i < st.r; ++i)
+	{
+		assert_close("init: beta[i]==ell[i]", st.beta[i], st.ell[i], 1e-7f);
+		assert_close("init: ellStar[i]==ell[i]", st.ellStar[i], st.ell[i], 1e-7f);
+	}
 }
 
 void VESTALogScaleUpdateTest()
@@ -169,4 +225,5 @@ void VESTAUnitTest()
 	VESTAGramSchmidtTest();
 	VESTAThinQRTest();
 	VESTASketchedSVDTest();
+	VESTAInitStateTest();
 }
