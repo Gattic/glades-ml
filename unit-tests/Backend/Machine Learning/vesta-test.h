@@ -48,6 +48,7 @@ void VESTASweepScaleLadder();
 void VESTASweepScalePush();
 void VESTASweepRawMomentumLongHorizon();
 void VESTASweepPlainRawAtScale();
+void VESTASweepScaleGpu();
 void VESTAUnitTest();
 
 #endif

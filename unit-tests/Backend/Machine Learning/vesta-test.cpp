@@ -880,6 +880,7 @@ struct RunSpec
 	bool vestaComplementMomentum;
 	float vestaComplementBeta;
 	bool vestaComplementUseSign;
+	bool useGpu;
 	bool vestaTrackedEma;
 	float vestaTrackedEmaBeta;
 	unsigned int vestaBasisSource; // 0=weights, 1=gradient
@@ -895,6 +896,7 @@ struct RunSpec
 	      vestaTSk(16u), vestaLambdaPerp(0.2f),
 	      vestaComplementMomentum(false), vestaComplementBeta(0.9f),
 	      vestaComplementUseSign(true),
+	      useGpu(false),
 	      vestaTrackedEma(false), vestaTrackedEmaBeta(0.9f),
 	      vestaBasisSource(0u), vestaBasisEmaBeta(0.99f)
 	{
@@ -954,6 +956,8 @@ static SweepResult run_one(const RunSpec& spec, unsigned int seed)
 		cfg.vesta.trackedEmaBeta = spec.vestaTrackedEmaBeta;
 		cfg.vesta.basisSource = spec.vestaBasisSource;
 		cfg.vesta.basisEmaBeta = spec.vestaBasisEmaBeta;
+		cfg.gpu.enable = spec.useGpu;
+		cfg.gpu.deviceId = 0;
 	}
 
 	MetricCapture trainCb;
@@ -2406,6 +2410,112 @@ void VESTASweepScalePush()
 		       variants[vi].label, d, pooledSd, fabsf(d) / std::max(pooledSd, 1e-6f));
 	}
 	printf("\n");
+}
+
+// GPU-accelerated scale ladder: AdamW vs VESTA-raw-plain at dModel up to
+// 2048, 50 epochs, meant to pin down whether the design's advantage holds
+// at LLM-scale dimensions. Requires the GPU training-loop integration.
+void VESTASweepScaleGpu()
+{
+	printf("\n============================================================\n");
+	printf("VESTA GPU scale ladder: AdamW vs VESTA-plain-raw\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping GPU scale ladder.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	const unsigned int vocab = 29u;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 50u;
+	const unsigned int corpusLen = 512u;
+	const float lr = 1e-2f;
+
+	const unsigned int scales[] = { 256u, 512u, 1024u, 2048u };
+	const unsigned int nScales = sizeof(scales) / sizeof(scales[0]);
+	const unsigned int seeds[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	printf("Config: vocab=%u layers=%u heads=%u epochs=%u seq=%u LR=%.1e r=8 GPU=1\n\n",
+	       vocab, nLayers, nHeads, epochs, corpusLen, lr);
+
+	printf("%-8s  %-18s  %-4s  %-20s  %-20s  %-10s\n",
+	       "dModel", "optimizer", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-8s  %-18s  %-4s  %-20s  %-20s  %-10s\n",
+	       "------", "---------", "---", "--------------------", "--------------------", "----------");
+
+	for (unsigned int si = 0; si < nScales; ++si)
+	{
+		const unsigned int d = scales[si];
+		const unsigned int dFF = 2u * d;
+		std::vector<AggStats> testPerVariant(2);
+
+		// AdamW
+		{
+			RunSpec s;
+			s.optType = glades::OptimizerConfig::ADAMW;
+			s.label = "AdamW-GPU";
+			s.vocab = vocab; s.dModel = d; s.dFF = dFF;
+			s.nLayers = nLayers; s.nHeads = nHeads;
+			s.epochs = epochs; s.corpusLen = corpusLen;
+			s.learningRate = lr;
+			s.useGpu = true;
+			std::vector<float> tr, te, wA;
+			for (unsigned int k = 0; k < nSeeds; ++k)
+			{
+				const SweepResult r = run_one(s, seeds[k]);
+				if (r.ok) { tr.push_back(r.finalTrainNll); te.push_back(r.finalTestNll); wA.push_back(static_cast<float>(r.wallSec)); }
+			}
+			const AggStats tA = aggregate(tr), teA = aggregate(te), wAg = aggregate(wA);
+			testPerVariant[0] = teA;
+			printf("%-8u  %-18s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+			       d, "AdamW-GPU", (unsigned int)tr.size(),
+			       tA.mean, tA.stddev, teA.mean, teA.stddev, wAg.mean, wAg.stddev);
+		}
+
+		// VESTA plain-raw (memory-frontier config, best lambdaPerp from prior sweeps)
+		{
+			RunSpec s;
+			s.optType = glades::OptimizerConfig::VESTA;
+			s.label = "VESTA-plain-raw";
+			s.vocab = vocab; s.dModel = d; s.dFF = dFF;
+			s.nLayers = nLayers; s.nHeads = nHeads;
+			s.epochs = epochs; s.corpusLen = corpusLen;
+			s.learningRate = lr;
+			s.vestaRank = 8u;
+			s.vestaTSk = 16u;
+			// lp=1.0 was best at dModel=1024; raw-mode tends to prefer
+			// smaller lp at larger dModel (gradient magnitude grows).
+			s.vestaLambdaPerp = (d >= 1024u) ? 1.0f : 2.0f;
+			s.vestaComplementMomentum = false;
+			s.vestaComplementUseSign = false;
+			s.useGpu = true;
+			std::vector<float> tr, te, wA;
+			for (unsigned int k = 0; k < nSeeds; ++k)
+			{
+				const SweepResult r = run_one(s, seeds[k]);
+				if (r.ok) { tr.push_back(r.finalTrainNll); te.push_back(r.finalTestNll); wA.push_back(static_cast<float>(r.wallSec)); }
+			}
+			const AggStats tA = aggregate(tr), teA = aggregate(te), wAg = aggregate(wA);
+			testPerVariant[1] = teA;
+			printf("%-8u  %-18s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+			       d, "VESTA-plain-raw", (unsigned int)tr.size(),
+			       tA.mean, tA.stddev, teA.mean, teA.stddev, wAg.mean, wAg.stddev);
+		}
+
+		const float d_ = testPerVariant[1].mean - testPerVariant[0].mean;
+		printf("          delta = %+.4f nats   (VESTA-plain-raw vs AdamW)\n\n", d_);
+	}
+#endif
 }
 
 void VESTAUnitTest()
