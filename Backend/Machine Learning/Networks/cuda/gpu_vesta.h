@@ -57,6 +57,11 @@ struct GpuVestaWeightState
 	GpuBuffer<float> sketchY;     // [m * (r+8)]
 	GpuBuffer<float> sketchB;     // [(r+8) * n]
 
+	// Optional Lion-style / heavy-ball complement momentum buffer [m*n],
+	// allocated lazily on first enabled step. Mirrors CPU WeightState::
+	// complementMomentum.
+	GpuBuffer<float> complementMomentum;
+
 	unsigned long long step;
 	float maxExpEllPrev;
 	bool initialized;

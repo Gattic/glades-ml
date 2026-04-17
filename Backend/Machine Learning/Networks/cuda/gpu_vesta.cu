@@ -102,6 +102,7 @@ __global__ void k_form_raw(const float* U, const float* Omega, float lr,
 }
 
 // W += (WrNew - WrOld) - lrCperp * sign(gPerp)
+// Stateless complement step; matches CPU path when complementMomentumEnabled is false.
 __global__ void k_apply_W_delta(float* W,
                                 const float* WrNew, const float* WrOld,
                                 const float* gPerp,
@@ -113,6 +114,55 @@ __global__ void k_apply_W_delta(float* W,
 	const float gp = gPerp[idx];
 	const float sgn = (gp > 0.0f) ? 1.0f : ((gp < 0.0f) ? -1.0f : 0.0f);
 	W[idx] += (WrNew[idx] - WrOld[idx]) - lrCperp * sgn;
+}
+
+// Momentum-sign variant:
+//   m = beta * m + (1-beta) * gPerp
+//   W += (WrNew - WrOld) - lrCperp * sign(m)
+__global__ void k_apply_W_delta_mom_sign(float* W,
+                                         const float* WrNew, const float* WrOld,
+                                         const float* gPerp,
+                                         float* m,
+                                         float beta,
+                                         float lrCperp,
+                                         unsigned int size)
+{
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= size) return;
+	const float gp = gPerp[idx];
+	float mi = m[idx];
+	mi = beta * mi + (1.0f - beta) * gp;
+	m[idx] = mi;
+	const float sgn = (mi > 0.0f) ? 1.0f : ((mi < 0.0f) ? -1.0f : 0.0f);
+	W[idx] += (WrNew[idx] - WrOld[idx]) - lrCperp * sgn;
+}
+
+// Raw-momentum (heavy-ball) variant:
+//   m = beta * m + (1-beta) * gPerp
+//   W += (WrNew - WrOld) - lrLambdaPerp * m
+__global__ void k_apply_W_delta_mom_raw(float* W,
+                                        const float* WrNew, const float* WrOld,
+                                        const float* gPerp,
+                                        float* m,
+                                        float beta,
+                                        float lrLambdaPerp,
+                                        unsigned int size)
+{
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= size) return;
+	const float gp = gPerp[idx];
+	float mi = m[idx];
+	mi = beta * mi + (1.0f - beta) * gp;
+	m[idx] = mi;
+	W[idx] += (WrNew[idx] - WrOld[idx]) - lrLambdaPerp * mi;
+}
+
+// Zero-init a buffer. Used when lazy-allocating complementMomentum.
+__global__ void k_zero_f(float* x, unsigned int size)
+{
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= size) return;
+	x[idx] = 0.0f;
 }
 
 // Wr[i,j] = sum_k U[i,k] * expEll[k] * V[j,k]
@@ -449,12 +499,41 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 	const float cPerp = vc.lambdaPerp / (meanInvSigma > 1e-12f ? meanInvSigma : 1e-12f);
 	const float lrCperp = lr * cPerp;
 
-	// Step 7: W += (WrNew - WrOld) - lrCperp * sign(gPerp)
+	// Step 7: apply combined tracked-block delta + complement step.
 	{
 		const unsigned int total = static_cast<unsigned int>(mn);
 		const unsigned int blocks = (total + TPB - 1) / TPB;
-		k_apply_W_delta<<<blocks, TPB>>>(d_W, state.WrNew.data(), state.WrOld.data(),
-		                                 state.gPerp.data(), lrCperp, total);
+		if (vc.complementMomentumEnabled)
+		{
+			// Lazy-allocate and zero-init the momentum buffer on first use.
+			if (state.complementMomentum.size() != mn)
+			{
+				if (!state.complementMomentum.allocate(mn))
+					return false;
+				k_zero_f<<<blocks, TPB>>>(state.complementMomentum.data(), total);
+			}
+			if (vc.complementUseSign)
+			{
+				k_apply_W_delta_mom_sign<<<blocks, TPB>>>(
+				    d_W, state.WrNew.data(), state.WrOld.data(),
+				    state.gPerp.data(), state.complementMomentum.data(),
+				    vc.complementBeta, lrCperp, total);
+			}
+			else
+			{
+				// Raw heavy-ball: scale by lr * lambdaPerp (c_perp not used
+				// here — m already carries magnitude from the gradient EMA).
+				k_apply_W_delta_mom_raw<<<blocks, TPB>>>(
+				    d_W, state.WrNew.data(), state.WrOld.data(),
+				    state.gPerp.data(), state.complementMomentum.data(),
+				    vc.complementBeta, lr * vc.lambdaPerp, total);
+			}
+		}
+		else
+		{
+			k_apply_W_delta<<<blocks, TPB>>>(d_W, state.WrNew.data(), state.WrOld.data(),
+			                                 state.gPerp.data(), lrCperp, total);
+		}
 	}
 
 	// Step 8: trust-region clamp on host.

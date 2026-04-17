@@ -548,11 +548,135 @@ void VESTAGpuParityTest()
 	}
 }
 
+// Parity test with complement momentum, both sign and raw modes. Runs 20
+// steps at dModel=32, n=24, rank=5. Compares CPU and GPU weight matrices
+// element-wise and asserts max abs difference is below 5e-3 (same tolerance
+// as the stateless parity test).
+void VESTAGpuParityMomentumTest()
+{
+	printf("[vesta] GpuParityMomentumTest\n");
+
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping parity test\n");
+			return;
+		}
+	}
+
+	const unsigned int m = 32, n = 24;
+	std::vector<float> W0(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xC0DE01ULL);
+	for (size_t i = 0; i < W0.size(); ++i)
+		W0[i] = 0.5f * glades::rng::standard_normal(eng);
+
+	// Two variants to test: momentum+sign, momentum+raw.
+	struct Variant { const char* label; bool useSign; float lp; };
+	Variant variants[2];
+	variants[0].label = "mom+sign"; variants[0].useSign = true;  variants[0].lp = 0.2f;
+	variants[1].label = "mom+raw";  variants[1].useSign = false; variants[1].lp = 2.0f;
+
+	for (unsigned int v = 0; v < 2u; ++v)
+	{
+		glades::VestaConfig vc;
+		vc.rank = 5u;
+		vc.tau = 0.1f;
+		vc.rho = 0.05f;
+		vc.lambdaPerp = variants[v].lp;
+		vc.tSk = 5u;
+		vc.complementMomentumEnabled = true;
+		vc.complementBeta = 0.9f;
+		vc.complementUseSign = variants[v].useSign;
+
+		// CPU run.
+		std::vector<float> Wcpu = W0;
+		glades::vesta::WeightState stCpu;
+		glades::rng::Engine rngCpu;
+		glades::rng::seed_engine(rngCpu, 0x556601ULL);
+		glades::vesta::initWeightState(stCpu, &Wcpu[0], m, n, vc, rngCpu, 0);
+
+		// GPU run (same init).
+		glades::gpu::GpuBuffer<float> dW, dG;
+		ASSERT("alloc dW", dW.allocate(static_cast<size_t>(m) * n));
+		ASSERT("alloc dG", dG.allocate(static_cast<size_t>(m) * n));
+		ASSERT("upload W", dW.upload(&W0[0], static_cast<size_t>(m) * n));
+		glades::gpu::GpuVestaWeightState stGpu;
+		glades::rng::Engine rngGpu;
+		glades::rng::seed_engine(rngGpu, 0x556601ULL);
+		ASSERT("gpu init",
+		       glades::gpu::vesta_gpu_init(stGpu, dW.data(), m, n, vc, rngGpu, 0));
+
+		const unsigned int steps = 20u;
+		for (unsigned int s = 0; s < steps; ++s)
+		{
+			// Deterministic gradient per step.
+			glades::rng::Engine gradEng;
+			glades::rng::seed_engine(gradEng, 0xAAAA0001ULL + s);
+			std::vector<float> gStep(static_cast<size_t>(m) * n, 0.0f);
+			for (size_t i = 0; i < gStep.size(); ++i)
+				gStep[i] = 0.05f * glades::rng::standard_normal(gradEng);
+
+			std::vector<float> gCpu = gStep;
+			std::vector<float> gGpuHost = gStep;
+			const bool okCpu = glades::vesta::applyStep(
+			    stCpu, &Wcpu[0], &gCpu[0], m, n,
+			    1.0f, 0.01f, 0.0f, 0.0f, 1.0f, vc, rngCpu, 0, 0);
+			ASSERT("cpu step", okCpu);
+
+			ASSERT("upload g", dG.upload(&gGpuHost[0], static_cast<size_t>(m) * n));
+			const bool okGpu = glades::gpu::vesta_gpu_step(
+			    stGpu, dW.data(), dG.data(), m, n,
+			    1.0f, 0.01f, 0.0f, 0.0f, 1.0f, vc, rngGpu, 0, 0);
+			ASSERT("gpu step", okGpu);
+		}
+
+		// Compare final W.
+		std::vector<float> Wgpu(Wcpu.size(), 0.0f);
+		ASSERT("download Wgpu", dW.download(&Wgpu[0], Wcpu.size()));
+		float maxAbs = 0.0f, meanAbs = 0.0f;
+		for (size_t i = 0; i < Wcpu.size(); ++i)
+		{
+			const float d = fabsf(Wcpu[i] - Wgpu[i]);
+			if (d > maxAbs) maxAbs = d;
+			meanAbs += d;
+		}
+		meanAbs /= static_cast<float>(Wcpu.size());
+		printf("  [%s] parity W maxAbs=%.6g meanAbs=%.6g\n",
+		       variants[v].label, maxAbs, meanAbs);
+		char tagMax[128], tagMean[128];
+		sprintf(tagMax, "%s parity W maxAbs", variants[v].label);
+		sprintf(tagMean, "%s parity W meanAbs", variants[v].label);
+		ASSERT(tagMax, maxAbs < 5e-3f);
+		ASSERT(tagMean, meanAbs < 5e-4f);
+
+		// Compare complement momentum buffer itself.
+		std::vector<float> momGpu(Wcpu.size(), 0.0f);
+		ASSERT("download mom", stGpu.complementMomentum.download(&momGpu[0], Wcpu.size()));
+		float maxMomAbs = 0.0f;
+		for (size_t i = 0; i < stCpu.complementMomentum.size(); ++i)
+		{
+			const float d = fabsf(stCpu.complementMomentum[i] - momGpu[i]);
+			if (d > maxMomAbs) maxMomAbs = d;
+		}
+		char tagMom[128];
+		sprintf(tagMom, "%s parity momentum buffer maxAbs", variants[v].label);
+		printf("  [%s] parity momentum maxAbs=%.6g\n", variants[v].label, maxMomAbs);
+		ASSERT(tagMom, maxMomAbs < 1e-4f);
+	}
+}
+
 #else
 
 void VESTAGpuParityTest()
 {
 	printf("[vesta] GpuParityTest: CUDA not compiled; skipping\n");
+}
+
+void VESTAGpuParityMomentumTest()
+{
+	printf("[vesta] GpuParityMomentumTest: CUDA not compiled; skipping\n");
 }
 
 #endif
@@ -2112,6 +2236,7 @@ void VESTAUnitTest()
 	VESTAOrthogonalInvarianceTest();
 	VESTAStepDescentTest();
 	VESTAGpuParityTest();
+	VESTAGpuParityMomentumTest();
 	VESTAComplementMomentumTest();
 	VESTATrackedEmaTest();
 	VESTAGradientBasisTest();
