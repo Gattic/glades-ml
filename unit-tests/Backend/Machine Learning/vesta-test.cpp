@@ -881,6 +881,10 @@ struct RunSpec
 	float vestaComplementBeta;
 	bool vestaComplementUseSign;
 	bool useGpu;
+	bool cosineSchedule;        // when true: warmup_linear + cosine LR decay
+	int warmupSteps;            // if cosineSchedule, linear warmup over this many opt steps
+	int cosineTMaxEpochs;       // cosine period (typically = epochs)
+	float cosineMinMultiplier;  // floor of LR (e.g., 0.01)
 	bool vestaTrackedEma;
 	float vestaTrackedEmaBeta;
 	unsigned int vestaBasisSource; // 0=weights, 1=gradient
@@ -897,6 +901,10 @@ struct RunSpec
 	      vestaComplementMomentum(false), vestaComplementBeta(0.9f),
 	      vestaComplementUseSign(true),
 	      useGpu(false),
+	      cosineSchedule(false),
+	      warmupSteps(0),
+	      cosineTMaxEpochs(0),
+	      cosineMinMultiplier(0.01f),
 	      vestaTrackedEma(false), vestaTrackedEmaBeta(0.9f),
 	      vestaBasisSource(0u), vestaBasisEmaBeta(0.99f)
 	{
@@ -958,6 +966,19 @@ static SweepResult run_one(const RunSpec& spec, unsigned int seed)
 		cfg.vesta.basisEmaBeta = spec.vestaBasisEmaBeta;
 		cfg.gpu.enable = spec.useGpu;
 		cfg.gpu.deviceId = 0;
+		if (spec.cosineSchedule)
+		{
+			cfg.lrSchedule.type = glades::LearningRateScheduleConfig::COSINE;
+			cfg.lrSchedule.cosineTMaxEpochs = (spec.cosineTMaxEpochs > 0)
+			                                  ? spec.cosineTMaxEpochs
+			                                  : static_cast<int>(spec.epochs);
+			cfg.lrSchedule.minMultiplier = spec.cosineMinMultiplier;
+			if (spec.warmupSteps > 0)
+			{
+				cfg.warmup.type = glades::WarmupConfig::WARMUP_LINEAR;
+				cfg.warmup.warmupSteps = spec.warmupSteps;
+			}
+		}
 	}
 
 	MetricCapture trainCb;
@@ -2621,6 +2642,225 @@ void VESTASweepLpAtScale()
 		printf("  Best lp=%.2f  testNLL=%.4f  delta vs AdamW = %+.4f nats\n\n",
 		       bestLp, best.mean, best.mean - adamE.mean);
 	}
+#endif
+}
+
+// 100-epoch sweep with cosine LR schedule + warmup at dModel=1024 and 2048.
+// Two questions: (a) does longer training narrow VESTA's lead, (b) does the
+// schedule rescue AdamW from the dModel=2048 fixed-LR divergence?
+void VESTASweepLongHorizonSchedule()
+{
+	printf("\n============================================================\n");
+	printf("VESTA long-horizon (100 epochs) + cosine LR schedule (GPU)\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	const unsigned int vocab = 29u;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 100u;
+	const unsigned int corpusLen = 512u;
+	const float lr = 1e-2f;
+	const unsigned int seeds[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	struct Cfg { unsigned int dModel; float vestaLp; };
+	Cfg cfgs[2];
+	cfgs[0].dModel = 1024u; cfgs[0].vestaLp = 1.0f;
+	cfgs[1].dModel = 2048u; cfgs[1].vestaLp = 0.1f;
+
+	printf("Config: vocab=%u layers=%u heads=%u epochs=%u seq=%u LR=%.1e r=8 GPU=1\n",
+	       vocab, nLayers, nHeads, epochs, corpusLen, lr);
+	printf("Schedule: WARMUP_LINEAR(%d steps) + COSINE(T_max=%u, min=%.2f)\n\n",
+	       10, epochs, 0.01f);
+
+	for (unsigned int ci = 0; ci < 2u; ++ci)
+	{
+		const unsigned int d = cfgs[ci].dModel;
+		const unsigned int dFF = 2u * d;
+		printf("--- dModel=%u ---\n", d);
+		printf("%-30s  %-4s  %-20s  %-20s  %-10s\n",
+		       "config", "n", "trainNLL", "testNLL", "wall(s)");
+		printf("%-30s  %-4s  %-20s  %-20s  %-10s\n",
+		       "------", "---", "--------------------", "--------------------", "----------");
+
+		// AdamW: fixed LR (control), and AdamW: cosine schedule.
+		struct Variant { const char* label; bool isVesta; bool sched; };
+		Variant variants[4];
+		variants[0].label = "AdamW fixed LR";       variants[0].isVesta = false; variants[0].sched = false;
+		variants[1].label = "AdamW cosine+warmup";  variants[1].isVesta = false; variants[1].sched = true;
+		variants[2].label = "VESTA-plain-raw fixed";variants[2].isVesta = true;  variants[2].sched = false;
+		variants[3].label = "VESTA-plain-raw cos";  variants[3].isVesta = true;  variants[3].sched = true;
+		for (unsigned int v = 0; v < 4u; ++v)
+		{
+			RunSpec s;
+			s.optType = variants[v].isVesta ? glades::OptimizerConfig::VESTA
+			                                : glades::OptimizerConfig::ADAMW;
+			s.label = variants[v].label;
+			s.vocab = vocab; s.dModel = d; s.dFF = dFF;
+			s.nLayers = nLayers; s.nHeads = nHeads;
+			s.epochs = epochs; s.corpusLen = corpusLen;
+			s.learningRate = lr;
+			s.useGpu = true;
+			if (variants[v].isVesta)
+			{
+				s.vestaRank = 8u;
+				s.vestaTSk = 16u;
+				s.vestaLambdaPerp = cfgs[ci].vestaLp;
+				s.vestaComplementMomentum = false;
+				s.vestaComplementUseSign = false;
+			}
+			if (variants[v].sched)
+			{
+				s.cosineSchedule = true;
+				s.warmupSteps = 10;
+				s.cosineTMaxEpochs = static_cast<int>(epochs);
+				s.cosineMinMultiplier = 0.01f;
+			}
+			std::vector<float> tr, te, wA;
+			for (unsigned int k = 0; k < nSeeds; ++k)
+			{
+				const SweepResult r = run_one(s, seeds[k]);
+				if (r.ok) { tr.push_back(r.finalTrainNll); te.push_back(r.finalTestNll); wA.push_back(static_cast<float>(r.wallSec)); }
+			}
+			const AggStats tA = aggregate(tr), te2 = aggregate(te), wA2 = aggregate(wA);
+			printf("%-30s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+			       variants[v].label, (unsigned int)tr.size(),
+			       tA.mean, tA.stddev, te2.mean, te2.stddev, wA2.mean, wA2.stddev);
+		}
+		printf("\n");
+	}
+#endif
+}
+
+// Same-memory shootout: AdamW @ dModel_A vs VESTA-plain-raw @ dModel_V
+// where total memory (model weights + optimizer state) is approximately equal.
+//
+// For our 4-layer transformer, model weights ≈ 32*d^2 fp32 ≈ 128*d^2 bytes.
+// AdamW state ≈ 2*32*d^2 fp32 = 256*d^2 bytes. Total AdamW ≈ 384*d^2 bytes.
+// VESTA-plain-raw state ≈ 56*d*r fp32 ≈ 224*d*r bytes. Total VESTA ≈ 128*d^2 + 224*d*r.
+//
+// For AdamW@d_A and VESTA@d_V at parity:
+//   384*d_A^2 ≈ 128*d_V^2 + 224*d_V*r
+//   d_V ≈ sqrt(3) * d_A  (approx, ignoring linear-d term).
+//
+// We test:
+//   (a) AdamW @ dModel=512  -> ~99 MiB total
+//   (b) VESTA-plain-raw @ dModel=896 (~1.75x AdamW width) -> similar memory
+//   (c) reference: AdamW @ dModel=896 (uses ~3x AdamW@512 memory; for comparison)
+void VESTASweepSameMemory()
+{
+	printf("\n============================================================\n");
+	printf("VESTA same-memory shootout (50 epochs, GPU)\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	const unsigned int vocab = 29u;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 50u;
+	const unsigned int corpusLen = 512u;
+	const float lr = 1e-2f;
+	const unsigned int seeds[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	struct Variant
+	{
+		const char* label;
+		glades::OptimizerConfig::Type opt;
+		unsigned int dModel;
+		float lp;
+	};
+	Variant variants[3];
+	variants[0].label = "AdamW d=512";              variants[0].opt = glades::OptimizerConfig::ADAMW; variants[0].dModel = 512u;  variants[0].lp = 0.0f;
+	variants[1].label = "VESTA-plain-raw d=896";    variants[1].opt = glades::OptimizerConfig::VESTA; variants[1].dModel = 896u;  variants[1].lp = 1.5f;
+	variants[2].label = "AdamW d=896 (ref, +mem)";  variants[2].opt = glades::OptimizerConfig::ADAMW; variants[2].dModel = 896u;  variants[2].lp = 0.0f;
+	const unsigned int nVar = sizeof(variants) / sizeof(variants[0]);
+
+	printf("Config: vocab=%u layers=%u heads=%u epochs=%u seq=%u LR=%.1e r=8 GPU=1\n\n",
+	       vocab, nLayers, nHeads, epochs, corpusLen, lr);
+
+	auto memoryBytes = [&](const Variant& v) -> double {
+		const double d = static_cast<double>(v.dModel);
+		const double model_b = 128.0 * d * d;
+		double opt_b = 0.0;
+		if (v.opt == glades::OptimizerConfig::ADAMW)
+			opt_b = 256.0 * d * d;
+		else
+		{
+			const double r = 8.0;
+			opt_b = 224.0 * d * r;
+		}
+		return model_b + opt_b;
+	};
+
+	printf("%-30s  %-10s  %-12s  %-4s  %-20s  %-20s  %-10s\n",
+	       "variant", "model_MiB", "opt_MiB", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-30s  %-10s  %-12s  %-4s  %-20s  %-20s  %-10s\n",
+	       "-------", "---------", "-------", "---", "--------------------", "--------------------", "----------");
+
+	for (unsigned int v = 0; v < nVar; ++v)
+	{
+		const double model_MiB = (variants[v].opt == glades::OptimizerConfig::ADAMW
+		                         ? 128.0 : 128.0) * variants[v].dModel * variants[v].dModel / (1024.0 * 1024.0);
+		const double opt_MiB = (variants[v].opt == glades::OptimizerConfig::ADAMW
+		                       ? 256.0 * variants[v].dModel * variants[v].dModel
+		                       : 224.0 * variants[v].dModel * 8.0) / (1024.0 * 1024.0);
+
+		RunSpec s;
+		s.optType = variants[v].opt;
+		s.label = variants[v].label;
+		s.vocab = vocab; s.dModel = variants[v].dModel; s.dFF = 2u * variants[v].dModel;
+		s.nLayers = nLayers; s.nHeads = nHeads;
+		s.epochs = epochs; s.corpusLen = corpusLen;
+		s.learningRate = lr;
+		s.useGpu = true;
+		if (variants[v].opt == glades::OptimizerConfig::VESTA)
+		{
+			s.vestaRank = 8u;
+			s.vestaTSk = 16u;
+			s.vestaLambdaPerp = variants[v].lp;
+			s.vestaComplementMomentum = false;
+			s.vestaComplementUseSign = false;
+		}
+		std::vector<float> tr, te, wA;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok) { tr.push_back(r.finalTrainNll); te.push_back(r.finalTestNll); wA.push_back(static_cast<float>(r.wallSec)); }
+		}
+		const AggStats tA = aggregate(tr), te2 = aggregate(te), wA2 = aggregate(wA);
+		printf("%-30s  %-10.1f  %-12.1f  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+		       variants[v].label, model_MiB, opt_MiB, (unsigned int)tr.size(),
+		       tA.mean, tA.stddev, te2.mean, te2.stddev, wA2.mean, wA2.stddev);
+	}
+
+	printf("\nCompare row 1 (AdamW d=512) vs row 2 (VESTA-plain-raw d=896):\n");
+	printf("  Row 1 total memory: ~99 MiB.  Row 2 total memory: ~120 MiB.\n");
+	printf("  At ~comparable memory, VESTA at 1.75x dModel should beat AdamW.\n");
+	printf("  Row 3 (AdamW @ d=896) is the upper-bound 'AdamW with VESTA's wider model' check.\n\n");
 #endif
 }
 

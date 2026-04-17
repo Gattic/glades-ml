@@ -221,6 +221,10 @@ int main(int argc, char* argv[])
 		VESTASweepScaleGpu();
 	    else if (strcmp(argv[1], "vesta-sweep-lp-scale") == 0)
 		VESTASweepLpAtScale();
+	    else if (strcmp(argv[1], "vesta-sweep-long-sched") == 0)
+		VESTASweepLongHorizonSchedule();
+	    else if (strcmp(argv[1], "vesta-sweep-same-mem") == 0)
+		VESTASweepSameMemory();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)

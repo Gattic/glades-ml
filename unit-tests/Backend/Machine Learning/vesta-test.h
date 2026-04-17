@@ -50,6 +50,8 @@ void VESTASweepRawMomentumLongHorizon();
 void VESTASweepPlainRawAtScale();
 void VESTASweepScaleGpu();
 void VESTASweepLpAtScale();
+void VESTASweepLongHorizonSchedule();
+void VESTASweepSameMemory();
 void VESTAUnitTest();
 
 #endif
