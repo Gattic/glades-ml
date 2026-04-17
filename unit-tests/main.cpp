@@ -219,6 +219,8 @@ int main(int argc, char* argv[])
 		VESTASweepPlainRawAtScale();
 	    else if (strcmp(argv[1], "vesta-sweep-scale-gpu") == 0)
 		VESTASweepScaleGpu();
+	    else if (strcmp(argv[1], "vesta-sweep-lp-scale") == 0)
+		VESTASweepLpAtScale();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)

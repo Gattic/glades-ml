@@ -2518,6 +2518,112 @@ void VESTASweepScaleGpu()
 #endif
 }
 
+// Per-scale lambdaPerp sweep on GPU. Hypothesis: optimal lp scales DOWN with
+// dModel because gradient magnitudes at the complement scale up with model
+// width.
+void VESTASweepLpAtScale()
+{
+	printf("\n============================================================\n");
+	printf("VESTA per-scale lambdaPerp sweep (GPU)\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	const unsigned int vocab = 29u;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 50u;
+	const unsigned int corpusLen = 512u;
+	const float lr = 1e-2f;
+	const unsigned int seeds[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	struct Cfg { unsigned int dModel; const float* lps; unsigned int nLps; };
+	const float lps_d256[]  = { 0.05f, 0.1f, 0.2f, 0.5f, 1.0f, 2.0f };
+	const float lps_d512[]  = { 0.1f, 0.2f, 0.5f, 1.0f, 2.0f };
+	const float lps_d1024[] = { 0.1f, 0.5f, 1.0f, 2.0f };
+	const float lps_d2048[] = { 0.05f, 0.1f, 0.5f, 1.0f };
+	Cfg cfgs[4];
+	cfgs[0].dModel = 256u;  cfgs[0].lps = lps_d256;  cfgs[0].nLps = sizeof(lps_d256)/sizeof(float);
+	cfgs[1].dModel = 512u;  cfgs[1].lps = lps_d512;  cfgs[1].nLps = sizeof(lps_d512)/sizeof(float);
+	cfgs[2].dModel = 1024u; cfgs[2].lps = lps_d1024; cfgs[2].nLps = sizeof(lps_d1024)/sizeof(float);
+	cfgs[3].dModel = 2048u; cfgs[3].lps = lps_d2048; cfgs[3].nLps = sizeof(lps_d2048)/sizeof(float);
+
+	printf("Config: vocab=%u layers=%u epochs=%u seq=%u LR=%.1e r=8 GPU=1 seeds=%u\n\n",
+	       vocab, nLayers, epochs, corpusLen, lr, nSeeds);
+
+	for (unsigned int ci = 0; ci < 4u; ++ci)
+	{
+		const unsigned int d = cfgs[ci].dModel;
+		const unsigned int dFF = 2u * d;
+
+		// AdamW reference at this scale.
+		RunSpec adam;
+		adam.optType = glades::OptimizerConfig::ADAMW;
+		adam.label = "AdamW";
+		adam.vocab = vocab; adam.dModel = d; adam.dFF = dFF;
+		adam.nLayers = nLayers; adam.nHeads = nHeads;
+		adam.epochs = epochs; adam.corpusLen = corpusLen;
+		adam.learningRate = lr;
+		adam.useGpu = true;
+		std::vector<float> aTr, aTe, aWa;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(adam, seeds[k]);
+			if (r.ok) { aTr.push_back(r.finalTrainNll); aTe.push_back(r.finalTestNll); aWa.push_back(static_cast<float>(r.wallSec)); }
+		}
+		const AggStats adamE = aggregate(aTe);
+		printf("dModel=%u, AdamW reference: testNLL = %.4f +/- %.4f\n", d, adamE.mean, adamE.stddev);
+		printf("%-8s  %-4s  %-20s  %-20s  %-10s\n",
+		       "lp", "n", "trainNLL", "testNLL", "wall(s)");
+		printf("%-8s  %-4s  %-20s  %-20s  %-10s\n",
+		       "--", "---", "--------------------", "--------------------", "----------");
+
+		AggStats best; best.mean = 1e30f;
+		float bestLp = 0.0f;
+		for (unsigned int li = 0; li < cfgs[ci].nLps; ++li)
+		{
+			RunSpec s;
+			s.optType = glades::OptimizerConfig::VESTA;
+			s.label = "VESTA-plain-raw";
+			s.vocab = vocab; s.dModel = d; s.dFF = dFF;
+			s.nLayers = nLayers; s.nHeads = nHeads;
+			s.epochs = epochs; s.corpusLen = corpusLen;
+			s.learningRate = lr;
+			s.vestaRank = 8u;
+			s.vestaTSk = 16u;
+			s.vestaLambdaPerp = cfgs[ci].lps[li];
+			s.vestaComplementMomentum = false;
+			s.vestaComplementUseSign = false;
+			s.useGpu = true;
+			std::vector<float> tr, te, wA;
+			for (unsigned int k = 0; k < nSeeds; ++k)
+			{
+				const SweepResult r = run_one(s, seeds[k]);
+				if (r.ok) { tr.push_back(r.finalTrainNll); te.push_back(r.finalTestNll); wA.push_back(static_cast<float>(r.wallSec)); }
+			}
+			const AggStats tA = aggregate(tr), te2 = aggregate(te), wA2 = aggregate(wA);
+			printf("lp=%-5.2f  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+			       cfgs[ci].lps[li], (unsigned int)tr.size(),
+			       tA.mean, tA.stddev, te2.mean, te2.stddev, wA2.mean, wA2.stddev);
+			if (te2.mean < best.mean) { best = te2; bestLp = cfgs[ci].lps[li]; }
+		}
+		printf("  Best lp=%.2f  testNLL=%.4f  delta vs AdamW = %+.4f nats\n\n",
+		       bestLp, best.mean, best.mean - adamE.mean);
+	}
+#endif
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
