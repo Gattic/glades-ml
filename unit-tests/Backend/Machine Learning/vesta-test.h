@@ -43,6 +43,7 @@ void VESTASweepLambdaPerpExtended();
 void VESTASweepMomentumCompare();
 void VESTASweepAblationCompare();
 void VESTASweepScaleLadder();
+void VESTASweepScalePush();
 void VESTAUnitTest();
 
 #endif

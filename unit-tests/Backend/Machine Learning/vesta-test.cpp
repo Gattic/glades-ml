@@ -1849,6 +1849,108 @@ void VESTASweepScaleLadder()
 	printf("and an asymptotically small wall-clock ratio as scale grows.\n");
 }
 
+// =================================================================
+// Push-NLL sweep at dModel=512: longer training + rank sweep + more
+// seeds. The previous 3-seed 15-epoch result showed VESTA+mom beating
+// AdamW by -0.15 nats but with wide AdamW stddev. This pushes both
+// optimizers harder to measure asymptotic gap.
+// =================================================================
+
+void VESTASweepScalePush()
+{
+	printf("\n============================================================\n");
+	printf("VESTA push-NLL sweep at dModel=512\n");
+	printf("50 epochs, 5 seeds, rank sweep over {8, 16, 32}\n");
+	printf("============================================================\n");
+
+	const unsigned int vocab = 29u;
+	const unsigned int dModel = 512u;
+	const unsigned int dFF = 2u * dModel;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 50u;
+	const unsigned int corpusLen = 384u;
+	const float lr = 1e-2f;
+
+	const unsigned int seeds[] = { 101u, 202u, 303u, 404u, 505u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	printf("Config: dModel=%u dFF=%u layers=%u heads=%u epochs=%u corpus=%u LR=%.1e\n\n",
+	       dModel, dFF, nLayers, nHeads, epochs, corpusLen, lr);
+
+	struct Variant
+	{
+		const char* label;
+		glades::OptimizerConfig::Type type;
+		bool vestaMom;
+		unsigned int vestaRank;
+	};
+	Variant variants[5];
+	variants[0].label = "AdamW"; variants[0].type = glades::OptimizerConfig::ADAMW; variants[0].vestaMom = false; variants[0].vestaRank = 0u;
+	variants[1].label = "VESTA-plain r=8"; variants[1].type = glades::OptimizerConfig::VESTA; variants[1].vestaMom = false; variants[1].vestaRank = 8u;
+	variants[2].label = "VESTA+mom r=8"; variants[2].type = glades::OptimizerConfig::VESTA; variants[2].vestaMom = true; variants[2].vestaRank = 8u;
+	variants[3].label = "VESTA+mom r=16"; variants[3].type = glades::OptimizerConfig::VESTA; variants[3].vestaMom = true; variants[3].vestaRank = 16u;
+	variants[4].label = "VESTA+mom r=32"; variants[4].type = glades::OptimizerConfig::VESTA; variants[4].vestaMom = true; variants[4].vestaRank = 32u;
+	const unsigned int nVariants = sizeof(variants) / sizeof(variants[0]);
+
+	printf("%-18s  %-4s  %-20s  %-20s  %-10s\n",
+	       "variant", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-18s  %-4s  %-20s  %-20s  %-10s\n",
+	       "-------", "---", "--------------------", "--------------------", "----------");
+
+	AggStats adamResult;
+	std::vector<AggStats> vestaResults(nVariants);
+	for (unsigned int vi = 0; vi < nVariants; ++vi)
+	{
+		RunSpec s;
+		s.optType = variants[vi].type;
+		s.label = variants[vi].label;
+		s.vocab = vocab;
+		s.dModel = dModel;
+		s.dFF = dFF;
+		s.nLayers = nLayers;
+		s.nHeads = nHeads;
+		s.epochs = epochs;
+		s.corpusLen = corpusLen;
+		s.learningRate = lr;
+		s.vestaRank = variants[vi].vestaRank > 0u ? variants[vi].vestaRank : 8u;
+		s.vestaTSk = 16u;
+		s.vestaLambdaPerp = variants[vi].vestaMom ? 0.2f : 0.4f;
+		s.vestaComplementMomentum = variants[vi].vestaMom;
+		s.vestaComplementBeta = 0.9f;
+		std::vector<float> trains, tests, walls;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok)
+			{
+				trains.push_back(r.finalTrainNll);
+				tests.push_back(r.finalTestNll);
+				walls.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		const AggStats tA = aggregate(trains);
+		const AggStats te = aggregate(tests);
+		const AggStats wA = aggregate(walls);
+		printf("%-18s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+		       variants[vi].label, (unsigned int)trains.size(),
+		       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+		vestaResults[vi] = te;
+		if (vi == 0u) adamResult = te;
+	}
+
+	printf("\nDeltas vs AdamW (testNLL, lower is better):\n");
+	for (unsigned int vi = 1; vi < nVariants; ++vi)
+	{
+		const float d = vestaResults[vi].mean - adamResult.mean;
+		const float pooledSd = sqrtf(vestaResults[vi].stddev * vestaResults[vi].stddev
+		                             + adamResult.stddev * adamResult.stddev);
+		printf("  %-18s: %+.4f nats  (pooled sd %.4f, ratio %.2f)\n",
+		       variants[vi].label, d, pooledSd, fabsf(d) / std::max(pooledSd, 1e-6f));
+	}
+	printf("\n");
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
