@@ -1684,20 +1684,26 @@ bool argmax_count_matches(const float* probs, const int* targets,
 
 namespace {
 
-// Tile size for keys/values loaded into shared memory.
+// Default tile size for keys/values loaded into shared memory.
+// The *runtime* tile may be smaller when `dHead` is large enough that the
+// full-tile shared-memory requirement (`flashTile * 2 * dHead * sizeof(float)`)
+// exceeds the device's per-block max-opt-in shared memory.
 static constexpr int kFlashTile = 64;
 
 // Forward kernel. One block per (query row, query head).
 // Shared memory layout:
-//   float sK[kFlashTile * dK]   -- tile of keys
-//   float sV[kFlashTile * dV]   -- tile of values
-// Passed as dynamic shared memory.
+//   float sK[flashTile * dK]   -- tile of keys
+//   float sV[flashTile * dV]   -- tile of values
+// Passed as dynamic shared memory. `flashTile` is a runtime parameter so
+// the launcher can shrink it when `dHead * flashTile * 2 * sizeof(float)`
+// exceeds the device's shared-memory budget.
 __global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q,
                                                      const float* __restrict__ K,
                                                      const float* __restrict__ V,
                                                      int T, int nHeads, int nKVHeads,
                                                      int dHead, int dModel, int dModelKV,
                                                      int causal,
+                                                     int flashTile,
                                                      float* __restrict__ O)
 {
 	const int q = static_cast<int>(blockIdx.x);
@@ -1705,8 +1711,8 @@ __global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q
 	if (q >= T || h >= nHeads) return;
 
 	extern __shared__ float smem[];
-	float* sK = smem;                             // [kFlashTile, dHead]
-	float* sV = smem + kFlashTile * dHead;        // [kFlashTile, dHead]
+	float* sK = smem;                              // [flashTile, dHead]
+	float* sV = smem + flashTile * dHead;          // [flashTile, dHead]
 
 	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
 	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
@@ -1724,11 +1730,11 @@ __global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q
 
 	const float scale = rsqrtf(static_cast<float>(dHead));
 
-	const int numTiles = (T + kFlashTile - 1) / kFlashTile;
+	const int numTiles = (T + flashTile - 1) / flashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		const int kStart = tile * kFlashTile;
-		int tileLen = kFlashTile;
+		const int kStart = tile * flashTile;
+		int tileLen = flashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
 		// Cooperatively load sK[tileLen, dHead] and sV[tileLen, dHead].
@@ -1785,6 +1791,7 @@ __global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q
                                                      int T, int nHeads, int nKVHeads,
                                                      int dHead, int dModel, int dModelKV,
                                                      int causal,
+                                                     int flashTile,
                                                      float* __restrict__ dQ,
                                                      float* __restrict__ dK_out,
                                                      float* __restrict__ dV_out)
@@ -1794,8 +1801,8 @@ __global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q
 	if (q >= T || h >= nHeads) return;
 
 	extern __shared__ float smem[];
-	float* sK = smem;                           // [kFlashTile, dHead]
-	float* sV = smem + kFlashTile * dHead;      // [kFlashTile, dHead]
+	float* sK = smem;                             // [flashTile, dHead]
+	float* sV = smem + flashTile * dHead;         // [flashTile, dHead]
 
 	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
 	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
@@ -1810,11 +1817,11 @@ __global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q
 	float runMax = -FLT_MAX;
 	float runSum = 0.0f;
 
-	const int numTiles = (T + kFlashTile - 1) / kFlashTile;
+	const int numTiles = (T + flashTile - 1) / flashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		const int kStart = tile * kFlashTile;
-		int tileLen = kFlashTile;
+		const int kStart = tile * flashTile;
+		int tileLen = flashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
 		const int loadCount = tileLen * dHead;
@@ -1852,8 +1859,8 @@ __global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q
 	__syncthreads();
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		const int kStart = tile * kFlashTile;
-		int tileLen = kFlashTile;
+		const int kStart = tile * flashTile;
+		int tileLen = flashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
 		const int loadCount = tileLen * dHead;
@@ -1920,6 +1927,39 @@ bool flash_attention_backward(const float* Q, const float* K, const float* V,
 	                                          dQ, dK_out, dV_out);
 }
 
+namespace {
+
+// Compute a runtime flashTile that fits in the device's per-block shared-memory
+// budget. Opts into the max dynamic shared memory for the given kernel so the
+// large-dHead case works on Ampere+ / Ada / Hopper GPUs.
+template <typename KernelT>
+static int setup_flash_tile(KernelT kernel, int dHead)
+{
+	// Query device's per-block opt-in max shared memory (bytes).
+	int dev = 0;
+	cudaGetDevice(&dev);
+	int maxOptin = 48 * 1024; // default static limit
+	cudaDeviceGetAttribute(&maxOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+
+	// Start at kFlashTile and halve until the tile fits.
+	int tile = kFlashTile;
+	auto required = [&](int t) {
+		return static_cast<size_t>(t) * static_cast<size_t>(2 * dHead) * sizeof(float);
+	};
+	while (tile > 4 && required(tile) > static_cast<size_t>(maxOptin))
+		tile /= 2;
+
+	// Opt into the required shared memory per block.
+	const size_t smem = required(tile);
+	if (smem > 48u * 1024u)
+		cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+		                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+		                     static_cast<int>(smem));
+	return tile;
+}
+
+} // anonymous namespace
+
 bool flash_attention_multihead_forward(const float* Q, const float* K, const float* V,
                                        int T, int nHeads, int nKVHeads,
                                        int dHead, int dModel, int dModelKV,
@@ -1928,14 +1968,16 @@ bool flash_attention_multihead_forward(const float* Q, const float* K, const flo
 	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
 		return true;
 
-	int block = kFlashTile;
+	const int flashTile = setup_flash_tile(flash_attention_fwd_multihead_kernel, dHead);
+
+	int block = flashTile;
 	if (block > kMaxBlockRow) block = kMaxBlockRow;
 
 	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
-	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
+	const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
 
 	flash_attention_fwd_multihead_kernel<<<grid, block, smemBytes, computeStream()>>>(
-		Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0, O);
+		Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0, flashTile, O);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1953,15 +1995,17 @@ bool flash_attention_multihead_backward(const float* Q, const float* K, const fl
 	GLADES_CUDA_CHECK(cudaMemset(dK_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
 	GLADES_CUDA_CHECK(cudaMemset(dV_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
 
-	int block = kFlashTile;
+	const int flashTile = setup_flash_tile(flash_attention_bwd_multihead_kernel, dHead);
+
+	int block = flashTile;
 	if (block > kMaxBlockRow) block = kMaxBlockRow;
 
 	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
-	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
+	const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
 
 	flash_attention_bwd_multihead_kernel<<<grid, block, smemBytes, computeStream()>>>(
 		Q, K, V, O, dO, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0,
-		dQ, dK_out, dV_out);
+		flashTile, dQ, dK_out, dV_out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
