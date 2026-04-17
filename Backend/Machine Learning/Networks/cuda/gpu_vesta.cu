@@ -169,6 +169,87 @@ __global__ void k_apply_W_delta_raw(float* W,
 	W[idx] += (WrNew[idx] - WrOld[idx]) - lrLambdaPerp * gPerp[idx];
 }
 
+// Modified Gram-Schmidt for Q[m x r] stored row-major (Q[i*r + j] = row i, col j).
+// Runs as a single cooperative block. One thread per row (blockDim.x = min(m, 1024));
+// block-wide reduction for dot products and squared norms. This avoids the
+// host roundtrip that synchronizes the GPU pipeline every step.
+//
+// Shared memory layout: sdata[0..blockDim.x) for reductions.
+__global__ void k_gram_schmidt(float* Q, unsigned int m, unsigned int r)
+{
+	extern __shared__ float sdata[];
+	const unsigned int tid = threadIdx.x;
+	const float kTiny = 1e-12f;
+	const float kRelThresh = 1e-5f;
+	for (unsigned int j = 0; j < r; ++j)
+	{
+		// Original column norm (before orthogonalization), for rank-deficiency.
+		float local = 0.0f;
+		for (unsigned int i = tid; i < m; i += blockDim.x)
+		{
+			const float v = Q[i * r + j];
+			local += v * v;
+		}
+		sdata[tid] = local;
+		__syncthreads();
+		for (unsigned int s = blockDim.x / 2u; s > 0u; s >>= 1u)
+		{
+			if (tid < s) sdata[tid] += sdata[tid + s];
+			__syncthreads();
+		}
+		const float origNorm = sqrtf(sdata[0]);
+
+		// Subtract projections onto previous normalized columns 0..j-1.
+		for (unsigned int k = 0; k < j; ++k)
+		{
+			float d = 0.0f;
+			for (unsigned int i = tid; i < m; i += blockDim.x)
+				d += Q[i * r + k] * Q[i * r + j];
+			sdata[tid] = d;
+			__syncthreads();
+			for (unsigned int s = blockDim.x / 2u; s > 0u; s >>= 1u)
+			{
+				if (tid < s) sdata[tid] += sdata[tid + s];
+				__syncthreads();
+			}
+			const float dot = sdata[0];
+			for (unsigned int i = tid; i < m; i += blockDim.x)
+				Q[i * r + j] -= dot * Q[i * r + k];
+			__syncthreads();
+		}
+
+		// Compute residual norm.
+		float local2 = 0.0f;
+		for (unsigned int i = tid; i < m; i += blockDim.x)
+		{
+			const float v = Q[i * r + j];
+			local2 += v * v;
+		}
+		sdata[tid] = local2;
+		__syncthreads();
+		for (unsigned int s = blockDim.x / 2u; s > 0u; s >>= 1u)
+		{
+			if (tid < s) sdata[tid] += sdata[tid + s];
+			__syncthreads();
+		}
+		const float norm = sqrtf(sdata[0]);
+
+		// Zero out if rank-deficient (residual norm below threshold); otherwise normalize.
+		if (norm <= kTiny || (origNorm > 0.0f && norm <= kRelThresh * origNorm))
+		{
+			for (unsigned int i = tid; i < m; i += blockDim.x)
+				Q[i * r + j] = 0.0f;
+		}
+		else
+		{
+			const float inv = 1.0f / norm;
+			for (unsigned int i = tid; i < m; i += blockDim.x)
+				Q[i * r + j] *= inv;
+		}
+		__syncthreads();
+	}
+}
+
 // Zero-init a buffer. Used when lazy-allocating complementMomentum.
 __global__ void k_zero_f(float* x, unsigned int size)
 {
@@ -261,18 +342,19 @@ static bool allocate_buffers(GpuVestaWeightState& s,
 	return true;
 }
 
-// Thin QR on device via CPU fallback: download, orthogonalize with gramSchmidt, upload.
-static bool gpu_gramSchmidt_hostfallback(float* d_Q, unsigned int m, unsigned int r)
+// On-device modified Gram-Schmidt for Q[m x r]. Avoids host roundtrip.
+static bool gpu_gramSchmidt_device(float* d_Q, unsigned int m, unsigned int r)
 {
-	std::vector<float> host(static_cast<size_t>(m) * r, 0.0f);
-	if (cudaMemcpy(&host[0], d_Q, static_cast<size_t>(m) * r * sizeof(float),
-	               cudaMemcpyDeviceToHost) != cudaSuccess)
-		return false;
-	vesta::gramSchmidt(&host[0], m, r);
-	if (cudaMemcpy(d_Q, &host[0], static_cast<size_t>(m) * r * sizeof(float),
-	               cudaMemcpyHostToDevice) != cudaSuccess)
-		return false;
-	return true;
+	if (m == 0u || r == 0u) return true;
+	unsigned int threads = 1024u;
+	if (threads > m) threads = m;
+	// Round down to power-of-2 for the reduction pattern.
+	unsigned int pow2 = 1u;
+	while ((pow2 * 2u) <= threads) pow2 *= 2u;
+	threads = pow2;
+	const size_t shmem = threads * sizeof(float);
+	k_gram_schmidt<<<1, threads, shmem>>>(d_Q, m, r);
+	return cudaGetLastError() == cudaSuccess;
 }
 
 // ---------------- Public API ----------------
@@ -451,8 +533,9 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		k_form_raw<<<blocks, TPB>>>(state.U.data(), state.Omega_U.data(), lr,
 		                            state.URaw.data(), total);
 	}
-	if (!gpu_gramSchmidt_hostfallback(state.URaw.data(), m, r))
+	if (!gpu_gramSchmidt_device(state.URaw.data(), m, r))
 		return false;
+
 
 	// Stiefel retraction on V: Omega_V = (I - V V^T) gW^T U diag(invExpEll_old)
 	if (!sgemm_rowmajor_atb(n, r, m, 1.0f, d_gW, n, state.U.data(), r,
@@ -475,7 +558,7 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		k_form_raw<<<blocks, TPB>>>(state.V.data(), state.Omega_V.data(), lr,
 		                            state.VRaw.data(), total);
 	}
-	if (!gpu_gramSchmidt_hostfallback(state.VRaw.data(), n, r))
+	if (!gpu_gramSchmidt_device(state.VRaw.data(), n, r))
 		return false;
 
 	// Commit U = URaw, V = VRaw.
@@ -601,6 +684,11 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		k_zero<<<blocks, TPB>>>(d_gW, total);
 	}
 
+	// Restore per-step sync. Without it, downstream kernels race with our
+	// k_log_scale_update / k_apply_W_delta writes to state.ell and W; at
+	// dModel=2048 this produces NaN in some seeds. The sync isn't dominant
+	// in wall-clock (cudaMemcpy ops below already synchronize the default
+	// stream), so removing it offered no speedup and broke correctness.
 	cudaDeviceSynchronize();
 	state.step += 1ULL;
 	return true;
