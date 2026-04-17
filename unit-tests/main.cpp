@@ -209,6 +209,8 @@ int main(int argc, char* argv[])
 		VESTASweepMomentumCompare();
 	    else if (strcmp(argv[1], "vesta-sweep-ablation") == 0)
 		VESTASweepAblationCompare();
+	    else if (strcmp(argv[1], "vesta-sweep-scale") == 0)
+		VESTASweepScaleLadder();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)

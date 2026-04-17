@@ -1671,6 +1671,184 @@ void VESTASweepAblationCompare()
 	printf("\n");
 }
 
+// =================================================================
+// Scale ladder: does VESTA's gap to AdamW close as dModel grows, and
+// does the memory advantage become real? Test at dModel in {64..512}.
+// =================================================================
+
+// Analytical optimizer-state bytes per weight matrix (fp32).
+struct StateByteBreakdown
+{
+	size_t adamw;
+	size_t vestaPlain;
+	size_t vestaMom;
+};
+
+// File-scope (not namespace-anonymous, not local) so it can be used with
+// std::vector under C++98.
+struct AccShape { unsigned int m; unsigned int n; };
+
+static StateByteBreakdown compute_state_bytes(unsigned int vocab,
+                                              unsigned int dModel,
+                                              unsigned int dFF,
+                                              unsigned int nLayers,
+                                              unsigned int vestaRank)
+{
+	StateByteBreakdown out;
+	out.adamw = 0u; out.vestaPlain = 0u; out.vestaMom = 0u;
+
+	std::vector<AccShape> shapes;
+	// tokE [V, d]
+	AccShape s; s.m = vocab; s.n = dModel; shapes.push_back(s);
+	// per-block: Wq/Wk/Wv/Wo [d, d], W1 [dFF, d], W2 [d, dFF]
+	for (unsigned int l = 0; l < nLayers; ++l)
+	{
+		AccShape a; a.m = dModel; a.n = dModel;
+		shapes.push_back(a);
+		shapes.push_back(a);
+		shapes.push_back(a);
+		shapes.push_back(a);
+		AccShape w1; w1.m = dFF; w1.n = dModel; shapes.push_back(w1);
+		AccShape w2; w2.m = dModel; w2.n = dFF; shapes.push_back(w2);
+	}
+
+	for (size_t i = 0; i < shapes.size(); ++i)
+	{
+		const size_t m = shapes[i].m, n = shapes[i].n;
+		size_t rEff = vestaRank;
+		if (rEff > m) rEff = m;
+		if (rEff > n) rEff = n;
+		const size_t adamw = 2u * m * n;
+		const size_t vestaPlain = (m + n) * rEff + 2u * rEff;
+		const size_t vestaMom = vestaPlain + m * n;
+		out.adamw += adamw;
+		out.vestaPlain += vestaPlain;
+		out.vestaMom += vestaMom;
+	}
+	out.adamw *= sizeof(float);
+	out.vestaPlain *= sizeof(float);
+	out.vestaMom *= sizeof(float);
+	return out;
+}
+
+void VESTASweepScaleLadder()
+{
+	printf("\n============================================================\n");
+	printf("VESTA scale ladder: AdamW vs VESTA-plain vs VESTA+mom\n");
+	printf("dModel in {64, 128, 256, 512}, 3 seeds each\n");
+	printf("============================================================\n");
+
+	const unsigned int vocab = 29u;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 15u;
+	const unsigned int corpusLen = 384u;
+	const float lr = 1e-2f;
+	const unsigned int vestaRank = 8u;
+
+	// dModel=512 is unreasonably slow on CPU due to O(n^3) Jacobi SVD at
+	// each subspace refresh. Stopping at 256 for the feasibility-bound
+	// ladder; a follow-up GPU-training-loop run is needed for >=512.
+	const unsigned int scales[] = { 64u, 128u, 256u };
+	const unsigned int nScales = sizeof(scales) / sizeof(scales[0]);
+	const unsigned int seeds[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	printf("Fixed: vocab=%u layers=%u heads=%u epochs=%u corpus=%u LR=%.1e rank=%u\n\n",
+	       vocab, nLayers, nHeads, epochs, corpusLen, lr, vestaRank);
+
+	// State-size comparison (analytical, no training needed).
+	printf("Optimizer state (KiB, fp32, summed across all transformer weights):\n");
+	printf("%-8s  %-10s  %-12s  %-11s  %-12s  %-11s\n",
+	       "dModel", "AdamW(KiB)", "VESTA_plain", "plain/Adam", "VESTA+mom", "+mom/Adam");
+	printf("%-8s  %-10s  %-12s  %-11s  %-12s  %-11s\n",
+	       "------", "----------", "------------", "-----------", "------------", "-----------");
+	for (unsigned int si = 0; si < nScales; ++si)
+	{
+		const unsigned int d = scales[si];
+		const unsigned int dFF = 2u * d;
+		const StateByteBreakdown sb = compute_state_bytes(vocab, d, dFF, nLayers, vestaRank);
+		printf("%-8u  %-10.1f  %-12.1f  %-11.3f  %-12.1f  %-11.3f\n",
+		       d,
+		       sb.adamw / 1024.0,
+		       sb.vestaPlain / 1024.0,
+		       (double)sb.vestaPlain / sb.adamw,
+		       sb.vestaMom / 1024.0,
+		       (double)sb.vestaMom / sb.adamw);
+	}
+
+	printf("\nTrain/test NLL at each scale:\n\n");
+
+	struct Variant { const char* label; glades::OptimizerConfig::Type type; bool mom; };
+	Variant variants[3];
+	variants[0].label = "AdamW";       variants[0].type = glades::OptimizerConfig::ADAMW; variants[0].mom = false;
+	variants[1].label = "VESTA-plain"; variants[1].type = glades::OptimizerConfig::VESTA; variants[1].mom = false;
+	variants[2].label = "VESTA+mom";   variants[2].type = glades::OptimizerConfig::VESTA; variants[2].mom = true;
+
+	printf("%-8s  %-12s  %-4s  %-18s  %-18s  %-10s\n",
+	       "dModel", "optimizer", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-8s  %-12s  %-4s  %-18s  %-18s  %-10s\n",
+	       "------", "----------", "---", "------------------", "------------------", "----------");
+
+	for (unsigned int si = 0; si < nScales; ++si)
+	{
+		const unsigned int d = scales[si];
+		const unsigned int dFF = 2u * d;
+		std::vector<AggStats> testPerVariant(3);
+		std::vector<AggStats> wallPerVariant(3);
+		for (unsigned int vi = 0; vi < 3u; ++vi)
+		{
+			RunSpec s;
+			s.optType = variants[vi].type;
+			s.label = variants[vi].label;
+			s.vocab = vocab;
+			s.dModel = d;
+			s.dFF = dFF;
+			s.nLayers = nLayers;
+			s.nHeads = nHeads;
+			s.epochs = epochs;
+			s.corpusLen = corpusLen;
+			s.learningRate = lr;
+			s.vestaRank = vestaRank;
+			s.vestaTSk = 16u;
+			s.vestaLambdaPerp = variants[vi].mom ? 0.2f : 0.4f;
+			s.vestaComplementMomentum = variants[vi].mom;
+			s.vestaComplementBeta = 0.9f;
+			std::vector<float> trains, tests, walls;
+			for (unsigned int k = 0; k < nSeeds; ++k)
+			{
+				const SweepResult r = run_one(s, seeds[k]);
+				if (r.ok)
+				{
+					trains.push_back(r.finalTrainNll);
+					tests.push_back(r.finalTestNll);
+					walls.push_back(static_cast<float>(r.wallSec));
+				}
+			}
+			const AggStats tA = aggregate(trains);
+			const AggStats te = aggregate(tests);
+			const AggStats wA = aggregate(walls);
+			testPerVariant[vi] = te;
+			wallPerVariant[vi] = wA;
+			printf("%-8u  %-12s  %-4u  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %5.2f +/- %-5.2f\n",
+			       d, variants[vi].label, (unsigned int)trains.size(),
+			       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+		}
+		// Row summary: deltas and wall-clock ratios.
+		const float gapPlain = testPerVariant[1].mean - testPerVariant[0].mean;
+		const float gapMom = testPerVariant[2].mean - testPerVariant[0].mean;
+		const float wRatioPlain = wallPerVariant[1].mean / std::max(wallPerVariant[0].mean, 1e-6f);
+		const float wRatioMom = wallPerVariant[2].mean / std::max(wallPerVariant[0].mean, 1e-6f);
+		printf("%-8s  plain:  testNLL delta = %+.4f nats   wall ratio = %.2fx\n",
+		       "", gapPlain, wRatioPlain);
+		printf("%-8s  +mom :  testNLL delta = %+.4f nats   wall ratio = %.2fx\n\n",
+		       "", gapMom, wRatioMom);
+	}
+
+	printf("\nEnd of ladder. Look for monotone shrinking gap in +mom delta\n");
+	printf("and an asymptotically small wall-clock ratio as scale grows.\n");
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
