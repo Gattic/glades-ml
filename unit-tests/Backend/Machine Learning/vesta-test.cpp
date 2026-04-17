@@ -686,6 +686,7 @@ struct RunSpec
 	float vestaLambdaPerp;
 	bool vestaComplementMomentum;
 	float vestaComplementBeta;
+	bool vestaComplementUseSign;
 	bool vestaTrackedEma;
 	float vestaTrackedEmaBeta;
 	unsigned int vestaBasisSource; // 0=weights, 1=gradient
@@ -700,6 +701,7 @@ struct RunSpec
 	      vestaRank(8u), vestaTau(0.1f), vestaRho(0.1f),
 	      vestaTSk(16u), vestaLambdaPerp(0.2f),
 	      vestaComplementMomentum(false), vestaComplementBeta(0.9f),
+	      vestaComplementUseSign(true),
 	      vestaTrackedEma(false), vestaTrackedEmaBeta(0.9f),
 	      vestaBasisSource(0u), vestaBasisEmaBeta(0.99f)
 	{
@@ -754,6 +756,7 @@ static SweepResult run_one(const RunSpec& spec, unsigned int seed)
 		cfg.vesta.lambdaPerp = spec.vestaLambdaPerp;
 		cfg.vesta.complementMomentumEnabled = spec.vestaComplementMomentum;
 		cfg.vesta.complementBeta = spec.vestaComplementBeta;
+		cfg.vesta.complementUseSign = spec.vestaComplementUseSign;
 		cfg.vesta.trackedEmaEnabled = spec.vestaTrackedEma;
 		cfg.vesta.trackedEmaBeta = spec.vestaTrackedEmaBeta;
 		cfg.vesta.basisSource = spec.vestaBasisSource;
@@ -1850,12 +1853,159 @@ void VESTASweepScaleLadder()
 }
 
 // =================================================================
-// Push-NLL sweep at dModel=512: longer training + rank sweep + more
-// seeds. The previous 3-seed 15-epoch result showed VESTA+mom beating
-// AdamW by -0.15 nats but with wide AdamW stddev. This pushes both
-// optimizers harder to measure asymptotic gap.
+// Raw-momentum (non-sign) complement mode sweep at long horizons.
+// Tests whether classical heavy-ball (step = lr * lp * m_perp, no sign)
+// rescues VESTA from the long-horizon stall observed at 50 epochs.
 // =================================================================
 
+// Runs raw-momentum vs sign vs AdamW comparison at one dModel+epochs pair.
+// Returns nothing; prints a table.
+static void raw_vs_sign_at_scale(unsigned int dModel,
+                                  unsigned int epochs,
+                                  const unsigned int* seeds,
+                                  unsigned int nSeeds)
+{
+	const unsigned int vocab = 29u;
+	const unsigned int dFF = 2u * dModel;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int corpusLen = 384u;
+	const float lr = 1e-2f;
+
+	printf("\n--- dModel=%u, epochs=%u, %u seeds ---\n",
+	       dModel, epochs, nSeeds);
+
+	printf("%-22s  %-4s  %-20s  %-20s  %-10s\n",
+	       "variant", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-22s  %-4s  %-20s  %-20s  %-10s\n",
+	       "-------", "---", "--------------------", "--------------------", "----------");
+
+	// AdamW reference.
+	RunSpec adam;
+	adam.optType = glades::OptimizerConfig::ADAMW;
+	adam.label = "AdamW";
+	adam.vocab = vocab; adam.dModel = dModel; adam.dFF = dFF;
+	adam.nLayers = nLayers; adam.nHeads = nHeads;
+	adam.epochs = epochs; adam.corpusLen = corpusLen;
+	adam.learningRate = lr;
+	std::vector<float> adamTrain, adamTest, adamWall;
+	for (unsigned int k = 0; k < nSeeds; ++k)
+	{
+		const SweepResult r = run_one(adam, seeds[k]);
+		if (r.ok)
+		{
+			adamTrain.push_back(r.finalTrainNll);
+			adamTest.push_back(r.finalTestNll);
+			adamWall.push_back(static_cast<float>(r.wallSec));
+		}
+	}
+	const AggStats adamT = aggregate(adamTrain);
+	const AggStats adamE = aggregate(adamTest);
+	const AggStats adamW = aggregate(adamWall);
+	printf("%-22s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+	       "AdamW baseline", (unsigned int)adamTrain.size(),
+	       adamT.mean, adamT.stddev, adamE.mean, adamE.stddev, adamW.mean, adamW.stddev);
+
+	// Sign mode at best known lp.
+	{
+		RunSpec s;
+		s.optType = glades::OptimizerConfig::VESTA;
+		s.label = "VESTA-sign";
+		s.vocab = vocab; s.dModel = dModel; s.dFF = dFF;
+		s.nLayers = nLayers; s.nHeads = nHeads;
+		s.epochs = epochs; s.corpusLen = corpusLen;
+		s.learningRate = lr;
+		s.vestaRank = 8u;
+		s.vestaTSk = 16u;
+		s.vestaLambdaPerp = 0.2f;
+		s.vestaComplementMomentum = true;
+		s.vestaComplementBeta = 0.9f;
+		s.vestaComplementUseSign = true;
+		std::vector<float> trains, tests, walls;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok)
+			{
+				trains.push_back(r.finalTrainNll);
+				tests.push_back(r.finalTestNll);
+				walls.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		const AggStats tA = aggregate(trains), te = aggregate(tests), wA = aggregate(walls);
+		printf("%-22s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+		       "VESTA+sign lp=0.2", (unsigned int)trains.size(),
+		       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+	}
+
+	// Raw mode lambdaPerp sweep. With no sign, the scale is set by m_perp's
+	// natural magnitude which is O(|g|). We need larger lambdaPerp to
+	// compensate. Try a wide sweep.
+	const float lpsRaw[] = { 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 20.0f };
+	const unsigned int nLps = sizeof(lpsRaw) / sizeof(lpsRaw[0]);
+	AggStats bestRaw;
+	bestRaw.mean = 1e30f;
+	float bestLp = 0.0f;
+	for (unsigned int i = 0; i < nLps; ++i)
+	{
+		RunSpec s;
+		s.optType = glades::OptimizerConfig::VESTA;
+		s.label = "VESTA-raw";
+		s.vocab = vocab; s.dModel = dModel; s.dFF = dFF;
+		s.nLayers = nLayers; s.nHeads = nHeads;
+		s.epochs = epochs; s.corpusLen = corpusLen;
+		s.learningRate = lr;
+		s.vestaRank = 8u;
+		s.vestaTSk = 16u;
+		s.vestaLambdaPerp = lpsRaw[i];
+		s.vestaComplementMomentum = true;
+		s.vestaComplementBeta = 0.9f;
+		s.vestaComplementUseSign = false;
+		std::vector<float> trains, tests, walls;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok)
+			{
+				trains.push_back(r.finalTrainNll);
+				tests.push_back(r.finalTestNll);
+				walls.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		const AggStats tA = aggregate(trains), te = aggregate(tests), wA = aggregate(walls);
+		char label[48];
+		sprintf(label, "VESTA-raw lp=%.1f", lpsRaw[i]);
+		printf("%-22s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+		       label, (unsigned int)trains.size(),
+		       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+		if (te.mean < bestRaw.mean)
+		{
+			bestRaw = te;
+			bestLp = lpsRaw[i];
+		}
+	}
+
+	printf("\nBest VESTA-raw: lp = %.1f, testNLL = %.4f +/- %.4f\n",
+	       bestLp, bestRaw.mean, bestRaw.stddev);
+	printf("Delta vs AdamW: %+.4f nats\n",
+	       bestRaw.mean - adamE.mean);
+	printf("\n");
+}
+
+void VESTASweepRawMomentumLongHorizon()
+{
+	printf("\n============================================================\n");
+	printf("VESTA raw-momentum mode: scale ladder x horizon\n");
+	printf("============================================================\n");
+
+	const unsigned int seeds3[] = { 101u, 202u, 303u };
+	// Short horizon reproducibility check at dModel=512.
+	raw_vs_sign_at_scale(512u, 50u, seeds3, 3u);
+	// Extended: dModel=1024 at 50 epochs — larger scale, same long horizon.
+	raw_vs_sign_at_scale(1024u, 50u, seeds3, 3u);
+}
+
+// Existing push-NLL at 50 epochs (kept for regression comparison).
 void VESTASweepScalePush()
 {
 	printf("\n============================================================\n");

@@ -795,13 +795,30 @@ bool applyStep(WeightState& state,
 			state.complementMomentum.assign(mn, 0.0f);
 		const float b = vc.complementBeta;
 		const float ombeta = 1.0f - b;
-		for (size_t i = 0; i < mn; ++i)
+		if (vc.complementUseSign)
 		{
-			float m = state.complementMomentum[i];
-			m = b * m + ombeta * state.scratch_gPerp[i];
-			state.complementMomentum[i] = m;
-			const float sgn = (m > 0.0f) ? 1.0f : ((m < 0.0f) ? -1.0f : 0.0f);
-			W[i] -= lr * c_perp * sgn;
+			// Lion-style: fixed-magnitude signed step via sign of EMA.
+			for (size_t i = 0; i < mn; ++i)
+			{
+				float m = state.complementMomentum[i];
+				m = b * m + ombeta * state.scratch_gPerp[i];
+				state.complementMomentum[i] = m;
+				const float sgn = (m > 0.0f) ? 1.0f : ((m < 0.0f) ? -1.0f : 0.0f);
+				W[i] -= lr * c_perp * sgn;
+			}
+		}
+		else
+		{
+			// Raw heavy-ball: step shrinks with gradient magnitude, enabling
+			// fine-tuning at long horizons. lambdaPerp tuning scale changes
+			// (typically 3-10x larger than sign-mode).
+			for (size_t i = 0; i < mn; ++i)
+			{
+				float m = state.complementMomentum[i];
+				m = b * m + ombeta * state.scratch_gPerp[i];
+				state.complementMomentum[i] = m;
+				W[i] -= lr * vc.lambdaPerp * m;
+			}
 		}
 	}
 	else

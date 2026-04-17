@@ -1775,6 +1775,16 @@ struct VestaConfig
 	bool complementMomentumEnabled; // default false (opt-in)
 	float complementBeta;           // default 0.9 (heavy-ball-style EMA rate)
 
+	// When complementMomentumEnabled is true, controls whether the step is
+	//   sign(m_perp)  — Lion-style, fixed-magnitude (default, good short horizons)
+	// or
+	//   m_perp        — classical heavy-ball, gradient-magnitude-aware (good long horizons)
+	// Set to false to switch to raw-momentum mode. The lr * lambdaPerp product
+	// typically needs re-tuning: raw-mode optima have lambdaPerp 3-10x larger
+	// than sign-mode optima because the step magnitude now scales with the
+	// gradient's own EMA.
+	bool complementUseSign;         // default true (Lion-style)
+
 	// Sign-stabilized tracked update: maintain an EMA of the tracked-subspace
 	// diagonal A[i,i] = (U^T g V)_ii and use the EMA (rather than the
 	// instantaneous value) in the log-scale mirror step. Kills per-step
@@ -1807,6 +1817,7 @@ struct VestaConfig
 	      phiDdFloor(0.1f),
 	      complementMomentumEnabled(false),
 	      complementBeta(0.9f),
+	      complementUseSign(true),
 	      trackedEmaEnabled(false),
 	      trackedEmaBeta(0.9f),
 	      basisSource(0u),
