@@ -2129,6 +2129,120 @@ void VESTASweepRawMomentumLongHorizon()
 	raw_vs_sign_at_scale(1024u, 50u, seeds3, 3u);
 }
 
+// VESTA-plain-raw: stateless complement (no momentum buffer), raw g_perp.
+// This is the memory-frontier configuration: ~0.7% of AdamW state at
+// dModel=1024. Tests whether the long-horizon win survives dropping the
+// complement-momentum buffer.
+void VESTASweepPlainRawAtScale()
+{
+	printf("\n============================================================\n");
+	printf("VESTA-plain-raw (stateless complement) at dModel=1024, 50 epochs\n");
+	printf("============================================================\n");
+
+	const unsigned int vocab = 29u;
+	const unsigned int dModel = 1024u;
+	const unsigned int dFF = 2u * dModel;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 50u;
+	const unsigned int corpusLen = 384u;
+	const float lr = 1e-2f;
+
+	const unsigned int seeds[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	printf("Config: dModel=%u dFF=%u layers=%u epochs=%u LR=%.1e\n\n",
+	       dModel, dFF, nLayers, epochs, lr);
+
+	printf("%-30s  %-4s  %-20s  %-20s  %-10s\n",
+	       "variant", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-30s  %-4s  %-20s  %-20s  %-10s\n",
+	       "-------", "---", "--------------------", "--------------------", "----------");
+
+	// AdamW reference
+	RunSpec adam;
+	adam.optType = glades::OptimizerConfig::ADAMW;
+	adam.label = "AdamW";
+	adam.vocab = vocab; adam.dModel = dModel; adam.dFF = dFF;
+	adam.nLayers = nLayers; adam.nHeads = nHeads;
+	adam.epochs = epochs; adam.corpusLen = corpusLen;
+	adam.learningRate = lr;
+	std::vector<float> adamTrain, adamTest, adamWall;
+	for (unsigned int k = 0; k < nSeeds; ++k)
+	{
+		const SweepResult r = run_one(adam, seeds[k]);
+		if (r.ok)
+		{
+			adamTrain.push_back(r.finalTrainNll);
+			adamTest.push_back(r.finalTestNll);
+			adamWall.push_back(static_cast<float>(r.wallSec));
+		}
+	}
+	const AggStats adamT = aggregate(adamTrain);
+	const AggStats adamE = aggregate(adamTest);
+	const AggStats adamW = aggregate(adamWall);
+	printf("%-30s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+	       "AdamW", (unsigned int)adamTrain.size(),
+	       adamT.mean, adamT.stddev, adamE.mean, adamE.stddev, adamW.mean, adamW.stddev);
+
+	// VESTA-plain-raw: sweep lambdaPerp (no momentum state to maintain).
+	const float lps[] = { 0.2f, 0.5f, 1.0f, 2.0f };
+	const unsigned int nLps = sizeof(lps) / sizeof(lps[0]);
+	AggStats bestE; bestE.mean = 1e30f;
+	float bestLp = 0.0f;
+	for (unsigned int i = 0; i < nLps; ++i)
+	{
+		RunSpec s;
+		s.optType = glades::OptimizerConfig::VESTA;
+		s.label = "VESTA-plain-raw";
+		s.vocab = vocab; s.dModel = dModel; s.dFF = dFF;
+		s.nLayers = nLayers; s.nHeads = nHeads;
+		s.epochs = epochs; s.corpusLen = corpusLen;
+		s.learningRate = lr;
+		s.vestaRank = 8u;
+		s.vestaTSk = 16u;
+		s.vestaLambdaPerp = lps[i];
+		s.vestaComplementMomentum = false;   // <-- no momentum buffer
+		s.vestaComplementUseSign = false;    // <-- raw g_perp
+		std::vector<float> tr, te, wA;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok)
+			{
+				tr.push_back(r.finalTrainNll);
+				te.push_back(r.finalTestNll);
+				wA.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		const AggStats tA = aggregate(tr), teA = aggregate(te), wAg = aggregate(wA);
+		char label[64];
+		sprintf(label, "VESTA-plain-raw lp=%.1f", lps[i]);
+		printf("%-30s  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f\n",
+		       label, (unsigned int)tr.size(),
+		       tA.mean, tA.stddev, teA.mean, teA.stddev, wAg.mean, wAg.stddev);
+		if (teA.mean < bestE.mean)
+		{
+			bestE = teA;
+			bestLp = lps[i];
+		}
+	}
+
+	printf("\nBest VESTA-plain-raw: lp=%.1f testNLL=%.4f +/- %.4f\n",
+	       bestLp, bestE.mean, bestE.stddev);
+	printf("Delta vs AdamW: %+.4f nats\n", bestE.mean - adamE.mean);
+
+	// Memory accounting.
+	// VESTA-plain-raw state per matrix: (m+n)*r + 2r only (U, V, ell, beta, ellStar).
+	// AdamW state per matrix: 2*m*n.
+	// For dModel=1024 transformer weights (approximation): AdamW ~ 262 MiB.
+	// VESTA-plain-raw ~ 1.83 MiB.
+	printf("\nMemory at dModel=1024 (approximate, summed over weight matrices):\n");
+	printf("  AdamW:           262 MiB\n");
+	printf("  VESTA-plain-raw: 1.83 MiB   (0.70%% of AdamW)\n");
+	printf("\n");
+}
+
 // Existing push-NLL at 50 epochs (kept for regression comparison).
 void VESTASweepScalePush()
 {

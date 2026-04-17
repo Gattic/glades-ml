@@ -157,6 +157,18 @@ __global__ void k_apply_W_delta_mom_raw(float* W,
 	W[idx] += (WrNew[idx] - WrOld[idx]) - lrLambdaPerp * mi;
 }
 
+// Stateless raw path (no momentum, no sign): W += tracked delta - lr*lp * gPerp.
+__global__ void k_apply_W_delta_raw(float* W,
+                                    const float* WrNew, const float* WrOld,
+                                    const float* gPerp,
+                                    float lrLambdaPerp,
+                                    unsigned int size)
+{
+	const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= size) return;
+	W[idx] += (WrNew[idx] - WrOld[idx]) - lrLambdaPerp * gPerp[idx];
+}
+
 // Zero-init a buffer. Used when lazy-allocating complementMomentum.
 __global__ void k_zero_f(float* x, unsigned int size)
 {
@@ -531,8 +543,17 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		}
 		else
 		{
-			k_apply_W_delta<<<blocks, TPB>>>(d_W, state.WrNew.data(), state.WrOld.data(),
-			                                 state.gPerp.data(), lrCperp, total);
+			if (vc.complementUseSign)
+			{
+				k_apply_W_delta<<<blocks, TPB>>>(d_W, state.WrNew.data(), state.WrOld.data(),
+				                                 state.gPerp.data(), lrCperp, total);
+			}
+			else
+			{
+				// Stateless raw path: lr * lp * g_perp. Memory-frontier config.
+				k_apply_W_delta_raw<<<blocks, TPB>>>(d_W, state.WrNew.data(), state.WrOld.data(),
+				                                     state.gPerp.data(), lr * vc.lambdaPerp, total);
+			}
 		}
 	}
 

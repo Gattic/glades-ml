@@ -823,11 +823,23 @@ bool applyStep(WeightState& state,
 	}
 	else
 	{
-		for (size_t i = 0; i < mn; ++i)
+		// No momentum. useSign=true (default) → Lion-style signed step.
+		//                  useSign=false       → raw instantaneous g_perp
+		//                                        (SGD on complement; zero state).
+		if (vc.complementUseSign)
 		{
-			const float gp = state.scratch_gPerp[i];
-			const float sgn = (gp > 0.0f) ? 1.0f : ((gp < 0.0f) ? -1.0f : 0.0f);
-			W[i] -= lr * c_perp * sgn;
+			for (size_t i = 0; i < mn; ++i)
+			{
+				const float gp = state.scratch_gPerp[i];
+				const float sgn = (gp > 0.0f) ? 1.0f : ((gp < 0.0f) ? -1.0f : 0.0f);
+				W[i] -= lr * c_perp * sgn;
+			}
+		}
+		else
+		{
+			const float lrLp = lr * vc.lambdaPerp;
+			for (size_t i = 0; i < mn; ++i)
+				W[i] -= lrLp * state.scratch_gPerp[i];
 		}
 	}
 

@@ -46,6 +46,7 @@ void VESTASweepAblationCompare();
 void VESTASweepScaleLadder();
 void VESTASweepScalePush();
 void VESTASweepRawMomentumLongHorizon();
+void VESTASweepPlainRawAtScale();
 void VESTAUnitTest();
 
 #endif
