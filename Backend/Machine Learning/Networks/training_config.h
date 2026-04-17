@@ -1768,6 +1768,13 @@ struct VestaConfig
 	// Numerical floor on phi_dd = -2*ell - 3 + mu to avoid division by near-zero.
 	float phiDdFloor; // default 0.1
 
+	// Lion-style momentum on the signed complement step. When enabled, VESTA
+	// tracks an EMA of the out-of-subspace gradient and signs the EMA rather
+	// than the instantaneous gradient. Costs one extra [m*n] buffer per weight
+	// matrix, but empirically closes a large fraction of the AdamW gap.
+	bool complementMomentumEnabled; // default false (opt-in)
+	float complementBeta;           // default 0.9 (heavy-ball-style EMA rate)
+
 	VestaConfig()
 	    : rank(32u),
 	      mu(4.0f),
@@ -1782,7 +1789,9 @@ struct VestaConfig
 	      powerIters(2u),
 	      ellMin(-10.0f),
 	      ellMax(4.0f),
-	      phiDdFloor(0.1f)
+	      phiDdFloor(0.1f),
+	      complementMomentumEnabled(false),
+	      complementBeta(0.9f)
 	{
 	}
 };

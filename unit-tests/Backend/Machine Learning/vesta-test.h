@@ -33,9 +33,12 @@ void VESTATrustRegionClampTest();
 void VESTAStepDescentTest();
 void VESTAOrthogonalInvarianceTest();
 void VESTAGpuParityTest();
+void VESTAComplementMomentumTest();
 void VESTATransformerIntegrationTest();
 void VESTASweepBenchmark();
 void VESTASweepV2Benchmark();
+void VESTASweepLambdaPerpExtended();
+void VESTASweepMomentumCompare();
 void VESTAUnitTest();
 
 #endif

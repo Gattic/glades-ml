@@ -203,6 +203,10 @@ int main(int argc, char* argv[])
 		VESTASweepBenchmark();
 	    else if (strcmp(argv[1], "vesta-sweep-v2") == 0)
 		VESTASweepV2Benchmark();
+	    else if (strcmp(argv[1], "vesta-sweep-lp") == 0)
+		VESTASweepLambdaPerpExtended();
+	    else if (strcmp(argv[1], "vesta-sweep-mom") == 0)
+		VESTASweepMomentumCompare();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)

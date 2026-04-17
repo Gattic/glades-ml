@@ -684,6 +684,8 @@ struct RunSpec
 	float vestaRho;
 	unsigned int vestaTSk;
 	float vestaLambdaPerp;
+	bool vestaComplementMomentum;
+	float vestaComplementBeta;
 
 	RunSpec()
 	    : optType(glades::OptimizerConfig::ADAMW), label("AdamW"),
@@ -692,7 +694,8 @@ struct RunSpec
 	      learningRate(0.001f),
 	      atlasRank(4u),
 	      vestaRank(8u), vestaTau(0.1f), vestaRho(0.1f),
-	      vestaTSk(16u), vestaLambdaPerp(0.2f)
+	      vestaTSk(16u), vestaLambdaPerp(0.2f),
+	      vestaComplementMomentum(false), vestaComplementBeta(0.9f)
 	{
 	}
 };
@@ -743,6 +746,8 @@ static SweepResult run_one(const RunSpec& spec, unsigned int seed)
 		cfg.vesta.rho = spec.vestaRho;
 		cfg.vesta.tSk = spec.vestaTSk;
 		cfg.vesta.lambdaPerp = spec.vestaLambdaPerp;
+		cfg.vesta.complementMomentumEnabled = spec.vestaComplementMomentum;
+		cfg.vesta.complementBeta = spec.vestaComplementBeta;
 	}
 
 	MetricCapture trainCb;
@@ -1122,6 +1127,293 @@ void VESTASweepV2Benchmark()
 	printf("\n");
 }
 
+// =================================================================
+// Extended lambdaPerp sweep: investigate whether the monotone trend
+// observed in v2 (lp 0.2 → 0.4) continues.
+// =================================================================
+
+namespace {
+
+// Runs a fixed NOISY quadratic descent with the given VESTA config and returns
+// the final 0.5*||W - Wstar||_F^2. Noise is injected into the gradient at each
+// step to simulate mini-batch stochasticity — the regime where momentum
+// actually helps. Seed controls both VESTA internals and the noise stream.
+static float run_noisy_quadratic_vesta(const std::vector<float>& Wstar,
+                                       const std::vector<float>& W0,
+                                       unsigned int m, unsigned int n,
+                                       const glades::VestaConfig& vc,
+                                       unsigned int steps,
+                                       float lr,
+                                       float noiseSigma,
+                                       uint64_t rngSeed,
+                                       uint64_t noiseSeed)
+{
+	std::vector<float> W = W0;
+	glades::vesta::WeightState st;
+	glades::rng::Engine rng;
+	glades::rng::seed_engine(rng, rngSeed);
+	glades::rng::Engine noise;
+	glades::rng::seed_engine(noise, noiseSeed);
+	for (unsigned int s = 0; s < steps; ++s)
+	{
+		std::vector<float> g(W.size(), 0.0f);
+		for (size_t i = 0; i < W.size(); ++i)
+			g[i] = (W[i] - Wstar[i]) + noiseSigma * glades::rng::standard_normal(noise);
+		const bool ok = glades::vesta::update(st, &W[0], &g[0], m, n,
+		                                      1.0f, lr, 0.0f, 0.0f, 1.0f,
+		                                      vc, rng, 0, 0);
+		ASSERT("run_noisy_quadratic_vesta: non-finite", ok);
+	}
+	float loss = 0.0f;
+	for (size_t i = 0; i < W.size(); ++i)
+		loss += (W[i] - Wstar[i]) * (W[i] - Wstar[i]);
+	return 0.5f * loss;
+}
+
+} // namespace
+
+// TDD: Lion-style complement momentum must actually accelerate descent.
+void VESTAComplementMomentumTest()
+{
+	printf("[vesta] ComplementMomentumTest\n");
+	const unsigned int m = 20, n = 16;
+	std::vector<float> Wstar(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xBADC0FFEEULL);
+	for (size_t i = 0; i < Wstar.size(); ++i)
+		Wstar[i] = glades::rng::standard_normal(eng);
+
+	std::vector<float> W0(Wstar.size(), 0.0f);
+	for (size_t i = 0; i < W0.size(); ++i)
+		W0[i] = 0.2f * glades::rng::standard_normal(eng);
+
+	glades::VestaConfig vcNo;
+	vcNo.rank = 4u;
+	vcNo.tau = 0.0f;
+	vcNo.lambdaPerp = 0.4f;
+	vcNo.rho = 0.5f;
+	vcNo.tSk = 4u;
+	vcNo.complementMomentumEnabled = false;
+
+	glades::VestaConfig vcYes = vcNo;
+	vcYes.complementMomentumEnabled = true;
+	vcYes.complementBeta = 0.9f;
+
+	// Average over several noise draws so the comparison isn't seed-dependent.
+	const unsigned int trials = 5u;
+	float sumNo = 0.0f, sumYes = 0.0f;
+	for (unsigned int k = 0; k < trials; ++k)
+	{
+		sumNo  += run_noisy_quadratic_vesta(Wstar, W0, m, n, vcNo,  50u, 0.05f, 0.3f,
+		                                    0xCAFEULL, 0xBEEFULL + k);
+		sumYes += run_noisy_quadratic_vesta(Wstar, W0, m, n, vcYes, 50u, 0.05f, 0.3f,
+		                                    0xCAFEULL, 0xBEEFULL + k);
+	}
+	const float lossNo  = sumNo  / static_cast<float>(trials);
+	const float lossYes = sumYes / static_cast<float>(trials);
+	printf("  [no mom] mean final loss over %u trials = %.4f\n", trials, lossNo);
+	printf("  [+mom]   mean final loss over %u trials = %.4f\n", trials, lossYes);
+	ASSERT("momentum should reduce loss on noisy quadratic", lossYes < lossNo);
+}
+
+void VESTASweepLambdaPerpExtended()
+{
+	printf("\n============================================================\n");
+	printf("VESTA: extended lambdaPerp sweep (5 seeds)\n");
+	printf("============================================================\n");
+
+	RunSpec base;
+	base.optType = glades::OptimizerConfig::VESTA;
+	base.label = "VESTA";
+	base.vocab = 29u;
+	base.dModel = 128u;
+	base.dFF = 256u;
+	base.nLayers = 4u;
+	base.nHeads = 4u;
+	base.epochs = 15u;
+	base.corpusLen = 384u;
+	base.learningRate = 1e-2f;
+	base.vestaRank = 8u;
+	base.vestaTau = 0.1f;
+	base.vestaRho = 0.1f;
+	base.vestaTSk = 16u;
+
+	const unsigned int seeds[] = { 101u, 202u, 303u, 404u, 505u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	const float lps[] = { 0.2f, 0.4f, 0.6f, 0.8f, 1.0f, 1.5f, 2.0f, 3.0f };
+	const unsigned int nLps = sizeof(lps) / sizeof(lps[0]);
+
+	printf("Base: dModel=%u layers=%u epochs=%u seq=%u LR=%.1e rank=%u tSk=%u\n\n",
+	       base.dModel, base.nLayers, base.epochs, base.corpusLen,
+	       base.learningRate, base.vestaRank, base.vestaTSk);
+
+	printf("%-12s  %-4s  %-18s  %-18s  %-10s\n",
+	       "lambdaPerp", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-12s  %-4s  %-18s  %-18s  %-10s\n",
+	       "----------", "---", "------------------", "------------------", "----------");
+
+	AggStats bestTest;
+	bestTest.mean = 1e30f;
+	float bestLp = 0.0f;
+
+	for (unsigned int i = 0; i < nLps; ++i)
+	{
+		RunSpec s = base;
+		s.vestaLambdaPerp = lps[i];
+		std::vector<float> trains, tests, walls;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok)
+			{
+				trains.push_back(r.finalTrainNll);
+				tests.push_back(r.finalTestNll);
+				walls.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		const AggStats tA = aggregate(trains);
+		const AggStats te = aggregate(tests);
+		const AggStats wA = aggregate(walls);
+		printf("lp=%-10.2f  %-4u  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %5.2f +/- %-5.2f\n",
+		       lps[i], (unsigned int)trains.size(),
+		       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+		if (te.mean < bestTest.mean)
+		{
+			bestTest = te;
+			bestLp = lps[i];
+		}
+	}
+
+	printf("\nBest lambdaPerp = %.2f  (testNLL %.4f +/- %.4f)\n",
+	       bestLp, bestTest.mean, bestTest.stddev);
+	printf("\n");
+}
+
+// =================================================================
+// Momentum compare: VESTA-plain vs VESTA+Lion-style complement momentum
+// swept over lambdaPerp. Final row: head-to-head vs AdamW at best VESTA.
+// =================================================================
+
+void VESTASweepMomentumCompare()
+{
+	printf("\n============================================================\n");
+	printf("VESTA momentum comparison (5 seeds, lp x {no-mom, +mom})\n");
+	printf("============================================================\n");
+
+	RunSpec base;
+	base.optType = glades::OptimizerConfig::VESTA;
+	base.label = "VESTA";
+	base.vocab = 29u;
+	base.dModel = 128u;
+	base.dFF = 256u;
+	base.nLayers = 4u;
+	base.nHeads = 4u;
+	base.epochs = 15u;
+	base.corpusLen = 384u;
+	base.learningRate = 1e-2f;
+	base.vestaRank = 8u;
+	base.vestaTau = 0.1f;
+	base.vestaRho = 0.1f;
+	base.vestaTSk = 16u;
+
+	const unsigned int seeds[] = { 101u, 202u, 303u, 404u, 505u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+	const float lps[] = { 0.2f, 0.4f, 0.6f, 0.8f, 1.0f };
+	const unsigned int nLps = sizeof(lps) / sizeof(lps[0]);
+
+	printf("Base: dModel=%u layers=%u epochs=%u seq=%u LR=%.1e\n\n",
+	       base.dModel, base.nLayers, base.epochs, base.corpusLen,
+	       base.learningRate);
+
+	printf("%-8s  %-10s  %-4s  %-18s  %-18s  %-10s\n",
+	       "mom", "lambdaPerp", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-8s  %-10s  %-4s  %-18s  %-18s  %-10s\n",
+	       "---", "----------", "---", "------------------", "------------------", "----------");
+
+	AggStats bestTestNo, bestTestYes;
+	bestTestNo.mean = 1e30f; bestTestYes.mean = 1e30f;
+	float bestLpNo = 0.0f, bestLpYes = 0.0f;
+
+	for (unsigned int momOn = 0; momOn < 2u; ++momOn)
+	{
+		for (unsigned int i = 0; i < nLps; ++i)
+		{
+			RunSpec s = base;
+			s.vestaLambdaPerp = lps[i];
+			s.vestaComplementMomentum = (momOn == 1u);
+			s.vestaComplementBeta = 0.9f;
+			std::vector<float> trains, tests, walls;
+			for (unsigned int k = 0; k < nSeeds; ++k)
+			{
+				const SweepResult r = run_one(s, seeds[k]);
+				if (r.ok)
+				{
+					trains.push_back(r.finalTrainNll);
+					tests.push_back(r.finalTestNll);
+					walls.push_back(static_cast<float>(r.wallSec));
+				}
+			}
+			const AggStats tA = aggregate(trains);
+			const AggStats te = aggregate(tests);
+			const AggStats wA = aggregate(walls);
+			const char* tag = (momOn == 1u) ? "+mom" : "plain";
+			printf("%-8s  lp=%-7.2f  %-4u  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %5.2f +/- %-5.2f\n",
+			       tag, lps[i], (unsigned int)trains.size(),
+			       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+
+			if (momOn == 0u && te.mean < bestTestNo.mean)
+			{
+				bestTestNo = te; bestLpNo = lps[i];
+			}
+			if (momOn == 1u && te.mean < bestTestYes.mean)
+			{
+				bestTestYes = te; bestLpYes = lps[i];
+			}
+		}
+	}
+
+	printf("\nBest per branch:\n");
+	printf("  plain  lambdaPerp = %.2f  testNLL = %.4f +/- %.4f\n",
+	       bestLpNo, bestTestNo.mean, bestTestNo.stddev);
+	printf("  +mom   lambdaPerp = %.2f  testNLL = %.4f +/- %.4f\n",
+	       bestLpYes, bestTestYes.mean, bestTestYes.stddev);
+	printf("  Delta (+mom - plain) = %+.4f nats\n",
+	       bestTestYes.mean - bestTestNo.mean);
+
+	// Final head-to-head: AdamW @ best-known vs VESTA+mom @ best lambdaPerp.
+	printf("\nAdamW reference (LR=1e-2, same seeds, 5 runs):\n");
+	RunSpec adam;
+	adam.optType = glades::OptimizerConfig::ADAMW;
+	adam.label = "AdamW";
+	adam.vocab = base.vocab; adam.dModel = base.dModel; adam.dFF = base.dFF;
+	adam.nLayers = base.nLayers; adam.nHeads = base.nHeads;
+	adam.epochs = base.epochs; adam.corpusLen = base.corpusLen;
+	adam.learningRate = 1e-2f;
+	std::vector<float> adamTrain, adamTest, adamWall;
+	for (unsigned int k = 0; k < nSeeds; ++k)
+	{
+		const SweepResult r = run_one(adam, seeds[k]);
+		if (r.ok)
+		{
+			adamTrain.push_back(r.finalTrainNll);
+			adamTest.push_back(r.finalTestNll);
+			adamWall.push_back(static_cast<float>(r.wallSec));
+		}
+	}
+	const AggStats adamT = aggregate(adamTest);
+	const AggStats adamW = aggregate(adamWall);
+	printf("  AdamW   testNLL = %.4f +/- %.4f   wall = %.2f s\n",
+	       adamT.mean, adamT.stddev, adamW.mean);
+
+	printf("\nFinal deltas vs AdamW (testNLL, lower is better):\n");
+	printf("  VESTA plain  (lp=%.2f) : %+.4f nats\n",
+	       bestLpNo,  bestTestNo.mean  - adamT.mean);
+	printf("  VESTA +mom   (lp=%.2f) : %+.4f nats\n",
+	       bestLpYes, bestTestYes.mean - adamT.mean);
+	printf("\n");
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
@@ -1133,5 +1425,6 @@ void VESTAUnitTest()
 	VESTAOrthogonalInvarianceTest();
 	VESTAStepDescentTest();
 	VESTAGpuParityTest();
+	VESTAComplementMomentumTest();
 	VESTATransformerIntegrationTest();
 }

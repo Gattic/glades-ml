@@ -66,6 +66,10 @@ struct WeightState
 	std::vector<float> scratch_sketchVr;    // [n * r]
 	std::vector<float> scratch_sketchS;     // [(r + oversample)]
 
+	// Optional Lion-style complement momentum. Allocated [m * n] when
+	// VestaConfig::complementMomentumEnabled is true; empty otherwise.
+	std::vector<float> complementMomentum;
+
 	unsigned long long step;
 	float maxExpEllPrev;
 	bool initialized;
@@ -90,6 +94,7 @@ struct WeightState
 		scratch_sketchOmega.clear(); scratch_sketchY.clear();
 		scratch_sketchB.clear(); scratch_sketchVr.clear();
 		scratch_sketchS.clear();
+		complementMomentum.clear();
 		step = 0ULL;
 		maxExpEllPrev = 1.0f;
 		initialized = false;

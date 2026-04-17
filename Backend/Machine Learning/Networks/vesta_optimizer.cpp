@@ -653,16 +653,38 @@ bool applyStep(WeightState& state,
 		W[i] += (state.scratch_WrNew[i] - state.scratch_WrOld[i]);
 
 	// Step 8: signed complement step.
+	// Classical form:          W -= lr * c_perp * sign(g_perp)
+	// With Lion-style momentum: m = beta * m + (1-beta) * g_perp
+	//                           W -= lr * c_perp * sign(m)
 	float meanInvSigma = 0.0f;
 	for (unsigned int i = 0; i < r; ++i)
 		meanInvSigma += expf(-state.ell[i]);
 	meanInvSigma /= static_cast<float>(r);
 	const float c_perp = vc.lambdaPerp / (meanInvSigma > 1e-12f ? meanInvSigma : 1e-12f);
-	for (size_t i = 0; i < mn; ++i)
+
+	if (vc.complementMomentumEnabled)
 	{
-		const float gp = state.scratch_gPerp[i];
-		const float sgn = (gp > 0.0f) ? 1.0f : ((gp < 0.0f) ? -1.0f : 0.0f);
-		W[i] -= lr * c_perp * sgn;
+		if (state.complementMomentum.size() != mn)
+			state.complementMomentum.assign(mn, 0.0f);
+		const float b = vc.complementBeta;
+		const float ombeta = 1.0f - b;
+		for (size_t i = 0; i < mn; ++i)
+		{
+			float m = state.complementMomentum[i];
+			m = b * m + ombeta * state.scratch_gPerp[i];
+			state.complementMomentum[i] = m;
+			const float sgn = (m > 0.0f) ? 1.0f : ((m < 0.0f) ? -1.0f : 0.0f);
+			W[i] -= lr * c_perp * sgn;
+		}
+	}
+	else
+	{
+		for (size_t i = 0; i < mn; ++i)
+		{
+			const float gp = state.scratch_gPerp[i];
+			const float sgn = (gp > 0.0f) ? 1.0f : ((gp < 0.0f) ? -1.0f : 0.0f);
+			W[i] -= lr * c_perp * sgn;
+		}
 	}
 
 	// Step 9: trust-region clamp on max exp(ell).
