@@ -529,11 +529,34 @@ bool applyStep(WeightState& state,
 	for (size_t i = 0; i < mn; ++i)
 		gW[i] *= gFactor;
 
+	// Update gradient EMA (used as basis source when vc.basisSource == 1).
+	if (vc.basisSource == 1u)
+	{
+		if (state.gradientEma.size() != mn)
+		{
+			state.gradientEma.assign(mn, 0.0f);
+			state.gradientEmaWarm = false;
+		}
+		const float b = vc.basisEmaBeta;
+		const float ombeta = 1.0f - b;
+		for (size_t i = 0; i < mn; ++i)
+			state.gradientEma[i] = b * state.gradientEma[i] + ombeta * gW[i];
+		state.gradientEmaWarm = true;
+	}
+
 	// Step 1: maybe refresh subspace.
 	if (state.step != 0ULL && vc.tSk > 0u && (state.step % vc.tSk) == 0ULL)
 	{
-		if (!sketched_svd(W, m, n, r, state, vc, rng))
+		const float* basisSrc = W;
+		if (vc.basisSource == 1u && state.gradientEmaWarm)
+			basisSrc = &state.gradientEma[0];
+		if (!sketched_svd(basisSrc, m, n, r, state, vc, rng))
 			return false;
+		// Note: aDiagEma is deliberately NOT reset on refresh. In practice
+		// consecutive refreshes produce small (U,V) rotations and the EMA's
+		// drift across them is empirically smaller than the variance reduction
+		// it provides per-step. Resetting would kill the EMA's benefit when
+		// tSk is small.
 	}
 
 	// Step 2: compute WrOld, A, g_perp.
@@ -547,6 +570,18 @@ bool applyStep(WeightState& state,
 	// Step 3: log-scale update using OLD ell (save a copy).
 	std::vector<float> ellOld = state.ell;
 	std::vector<float> ellNew(r, 0.0f);
+
+	// Optional EMA of tracked-subspace diagonal (sign-stabilized update).
+	if (vc.trackedEmaEnabled)
+	{
+		if (state.aDiagEma.size() != r)
+			state.aDiagEma.assign(r, 0.0f);
+		const float b = vc.trackedEmaBeta;
+		const float ombeta = 1.0f - b;
+		for (unsigned int i = 0; i < r; ++i)
+			state.aDiagEma[i] = b * state.aDiagEma[i] + ombeta * state.scratch_A[i * r + i];
+	}
+
 	for (unsigned int i = 0; i < r; ++i)
 	{
 		const float l = ellOld[i];
@@ -554,7 +589,9 @@ bool applyStep(WeightState& state,
 		if (phi_dd < vc.phiDdFloor) phi_dd = vc.phiDdFloor;
 		const float sigma = expf(l);
 		const float denom = phi_dd * sigma * sigma;
-		const float Aii = state.scratch_A[i * r + i];
+		const float Aii = vc.trackedEmaEnabled
+		                      ? state.aDiagEma[i]
+		                      : state.scratch_A[i * r + i];
 		float lNext = l - lr * Aii / denom - lr * vc.tau * (l - state.ellStar[i]);
 		if (lNext < vc.ellMin) lNext = vc.ellMin;
 		if (lNext > vc.ellMax) lNext = vc.ellMax;

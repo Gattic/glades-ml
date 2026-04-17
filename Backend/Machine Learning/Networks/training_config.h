@@ -1775,6 +1775,21 @@ struct VestaConfig
 	bool complementMomentumEnabled; // default false (opt-in)
 	float complementBeta;           // default 0.9 (heavy-ball-style EMA rate)
 
+	// Sign-stabilized tracked update: maintain an EMA of the tracked-subspace
+	// diagonal A[i,i] = (U^T g V)_ii and use the EMA (rather than the
+	// instantaneous value) in the log-scale mirror step. Kills per-step
+	// variance in ell without changing the Bregman-mirror geometry.
+	// Costs r fp32 floats of extra state per weight matrix.
+	bool trackedEmaEnabled;         // default false (opt-in)
+	float trackedEmaBeta;           // default 0.9
+
+	// Basis source for the tracked subspace:
+	//   0 = weights  (sketched SVD of W; original VESTA design)
+	//   1 = gradient (sketched SVD of EMA(g); Fisher-adjacent)
+	// When 1, an m*n buffer per matrix tracks the gradient EMA.
+	unsigned int basisSource;       // default 0 (weights)
+	float basisEmaBeta;             // default 0.99 (EMA rate for gradientEma)
+
 	VestaConfig()
 	    : rank(32u),
 	      mu(4.0f),
@@ -1791,7 +1806,11 @@ struct VestaConfig
 	      ellMax(4.0f),
 	      phiDdFloor(0.1f),
 	      complementMomentumEnabled(false),
-	      complementBeta(0.9f)
+	      complementBeta(0.9f),
+	      trackedEmaEnabled(false),
+	      trackedEmaBeta(0.9f),
+	      basisSource(0u),
+	      basisEmaBeta(0.99f)
 	{
 	}
 };

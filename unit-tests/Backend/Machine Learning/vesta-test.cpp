@@ -686,6 +686,10 @@ struct RunSpec
 	float vestaLambdaPerp;
 	bool vestaComplementMomentum;
 	float vestaComplementBeta;
+	bool vestaTrackedEma;
+	float vestaTrackedEmaBeta;
+	unsigned int vestaBasisSource; // 0=weights, 1=gradient
+	float vestaBasisEmaBeta;
 
 	RunSpec()
 	    : optType(glades::OptimizerConfig::ADAMW), label("AdamW"),
@@ -695,7 +699,9 @@ struct RunSpec
 	      atlasRank(4u),
 	      vestaRank(8u), vestaTau(0.1f), vestaRho(0.1f),
 	      vestaTSk(16u), vestaLambdaPerp(0.2f),
-	      vestaComplementMomentum(false), vestaComplementBeta(0.9f)
+	      vestaComplementMomentum(false), vestaComplementBeta(0.9f),
+	      vestaTrackedEma(false), vestaTrackedEmaBeta(0.9f),
+	      vestaBasisSource(0u), vestaBasisEmaBeta(0.99f)
 	{
 	}
 };
@@ -748,6 +754,10 @@ static SweepResult run_one(const RunSpec& spec, unsigned int seed)
 		cfg.vesta.lambdaPerp = spec.vestaLambdaPerp;
 		cfg.vesta.complementMomentumEnabled = spec.vestaComplementMomentum;
 		cfg.vesta.complementBeta = spec.vestaComplementBeta;
+		cfg.vesta.trackedEmaEnabled = spec.vestaTrackedEma;
+		cfg.vesta.trackedEmaBeta = spec.vestaTrackedEmaBeta;
+		cfg.vesta.basisSource = spec.vestaBasisSource;
+		cfg.vesta.basisEmaBeta = spec.vestaBasisEmaBeta;
 	}
 
 	MetricCapture trainCb;
@@ -1172,6 +1182,126 @@ static float run_noisy_quadratic_vesta(const std::vector<float>& Wstar,
 
 } // namespace
 
+// TDD: EMA of tracked-subspace diagonal should reduce final loss on a noisy
+// low-rank target where the useful signal lives in the tracked subspace.
+void VESTATrackedEmaTest()
+{
+	printf("[vesta] TrackedEmaTest\n");
+	const unsigned int m = 24, n = 18;
+	const unsigned int rank = 4;
+	// Build a rank-rank target so all signal lives inside the tracked subspace.
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xFACEFEEDULL);
+	std::vector<float> U0(static_cast<size_t>(m) * rank, 0.0f);
+	std::vector<float> V0(static_cast<size_t>(n) * rank, 0.0f);
+	for (size_t i = 0; i < U0.size(); ++i) U0[i] = glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < V0.size(); ++i) V0[i] = glades::rng::standard_normal(eng);
+	glades::vesta::gramSchmidt(&U0[0], m, rank);
+	glades::vesta::gramSchmidt(&V0[0], n, rank);
+	const float svs[4] = { 3.0f, 2.0f, 1.0f, 0.5f };
+	std::vector<float> Wstar(static_cast<size_t>(m) * n, 0.0f);
+	for (unsigned int k = 0; k < rank; ++k)
+		for (unsigned int i = 0; i < m; ++i)
+			for (unsigned int j = 0; j < n; ++j)
+				Wstar[i * n + j] += svs[k] * U0[i * rank + k] * V0[j * rank + k];
+
+	std::vector<float> W0(Wstar.size(), 0.0f);
+	for (size_t i = 0; i < W0.size(); ++i)
+		W0[i] = 0.2f * glades::rng::standard_normal(eng);
+
+	glades::VestaConfig vcNo;
+	vcNo.rank = rank;
+	vcNo.tau = 0.0f;
+	vcNo.lambdaPerp = 0.0f; // isolate the tracked update entirely
+	vcNo.rho = 0.5f;
+	vcNo.tSk = 2u;          // aggressive refresh so U,V are near W's SVD
+	vcNo.trackedEmaEnabled = false;
+
+	glades::VestaConfig vcYes = vcNo;
+	vcYes.trackedEmaEnabled = true;
+	vcYes.trackedEmaBeta = 0.9f;
+
+	// Average over noise draws: high per-step noise is where EMA helps.
+	const unsigned int trials = 6u;
+	const unsigned int steps = 80u;
+	const float lr = 0.05f;
+	const float noise = 0.8f;
+	float sumNo = 0.0f, sumYes = 0.0f;
+	for (unsigned int k = 0; k < trials; ++k)
+	{
+		sumNo  += run_noisy_quadratic_vesta(Wstar, W0, m, n, vcNo,  steps, lr, noise,
+		                                    0xCAFE00ULL, 0xABCDEF00ULL + k);
+		sumYes += run_noisy_quadratic_vesta(Wstar, W0, m, n, vcYes, steps, lr, noise,
+		                                    0xCAFE00ULL, 0xABCDEF00ULL + k);
+	}
+	const float lossNo  = sumNo  / static_cast<float>(trials);
+	const float lossYes = sumYes / static_cast<float>(trials);
+	printf("  [no ema] mean final loss = %.4f\n", lossNo);
+	printf("  [+ema]   mean final loss = %.4f\n", lossYes);
+	ASSERT("tracked EMA should reduce loss on noisy low-rank target",
+	       lossYes < lossNo);
+}
+
+// TDD: When the loss's natural descent direction is orthogonal to W's own
+// SVD directions (small random W, big rank-r target Wstar), the gradient-driven
+// basis should align U,V with the target and learn faster than the weight-driven
+// basis which is tracking essentially noise directions.
+//
+// With complement disabled (lambdaPerp = 0) the tracked-subspace update is the
+// ONLY learning path, so the comparison isolates which basis source wins.
+void VESTAGradientBasisTest()
+{
+	printf("[vesta] GradientBasisTest\n");
+	const unsigned int m = 24, n = 18;
+	const unsigned int rank = 4;
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xA11CE);
+
+	// Wstar: clean rank-4 with strong singular values.
+	std::vector<float> U0(static_cast<size_t>(m) * rank, 0.0f);
+	std::vector<float> V0(static_cast<size_t>(n) * rank, 0.0f);
+	for (size_t i = 0; i < U0.size(); ++i) U0[i] = glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < V0.size(); ++i) V0[i] = glades::rng::standard_normal(eng);
+	glades::vesta::gramSchmidt(&U0[0], m, rank);
+	glades::vesta::gramSchmidt(&V0[0], n, rank);
+	const float svs[4] = { 4.0f, 3.0f, 2.0f, 1.0f };
+	std::vector<float> Wstar(static_cast<size_t>(m) * n, 0.0f);
+	for (unsigned int k = 0; k < rank; ++k)
+		for (unsigned int i = 0; i < m; ++i)
+			for (unsigned int j = 0; j < n; ++j)
+				Wstar[i * n + j] += svs[k] * U0[i * rank + k] * V0[j * rank + k];
+
+	// W0: tiny random, unrelated to Wstar.
+	std::vector<float> W0(Wstar.size(), 0.0f);
+	for (size_t i = 0; i < W0.size(); ++i)
+		W0[i] = 0.05f * glades::rng::standard_normal(eng);
+
+	glades::VestaConfig vcWt;
+	vcWt.rank = rank;
+	vcWt.tau = 0.0f;
+	vcWt.lambdaPerp = 0.0f; // disable complement; isolate tracked update
+	vcWt.rho = 0.5f;
+	vcWt.tSk = 4u;
+	vcWt.trackedEmaEnabled = false;
+	vcWt.basisSource = 0u; // weight-driven
+
+	glades::VestaConfig vcGd = vcWt;
+	vcGd.basisSource = 1u; // gradient-driven
+	vcGd.basisEmaBeta = 0.95f;
+
+	const unsigned int steps = 60u;
+	const float lr = 0.05f;
+	const float noise = 0.0f;
+	const float lossWt = run_noisy_quadratic_vesta(Wstar, W0, m, n, vcWt, steps, lr,
+	                                               noise, 0xFEDC0DEULL, 0xDEAD01ULL);
+	const float lossGd = run_noisy_quadratic_vesta(Wstar, W0, m, n, vcGd, steps, lr,
+	                                               noise, 0xFEDC0DEULL, 0xDEAD01ULL);
+	printf("  [weight-basis]   final loss = %.4f\n", lossWt);
+	printf("  [gradient-basis] final loss = %.4f\n", lossGd);
+	ASSERT("gradient-basis should beat weight-basis when W is unrelated to Wstar",
+	       lossGd < lossWt);
+}
+
 // TDD: Lion-style complement momentum must actually accelerate descent.
 void VESTAComplementMomentumTest()
 {
@@ -1414,6 +1544,133 @@ void VESTASweepMomentumCompare()
 	printf("\n");
 }
 
+// =================================================================
+// Ablation: measure marginal contribution of each VESTA feature by
+// toggling {momentum, tracked-EMA, gradient-basis} independently at
+// the current best config.
+// =================================================================
+
+namespace {
+
+struct AblationRow
+{
+	const char* label;
+	bool mom;
+	bool ema;
+	unsigned int basis;  // 0 = weights, 1 = gradient
+};
+
+} // namespace
+
+void VESTASweepAblationCompare()
+{
+	printf("\n============================================================\n");
+	printf("VESTA feature ablation (5 seeds)\n");
+	printf("============================================================\n");
+
+	RunSpec base;
+	base.optType = glades::OptimizerConfig::VESTA;
+	base.label = "VESTA";
+	base.vocab = 29u;
+	base.dModel = 128u;
+	base.dFF = 256u;
+	base.nLayers = 4u;
+	base.nHeads = 4u;
+	base.epochs = 15u;
+	base.corpusLen = 384u;
+	base.learningRate = 1e-2f;
+	base.vestaRank = 8u;
+	base.vestaTau = 0.1f;
+	base.vestaRho = 0.1f;
+	base.vestaTSk = 4u; // exercise refresh path within ~15 optimizer steps
+	base.vestaLambdaPerp = 0.2f; // best for +mom; neutral starting point
+	// Fast EMA so gradientEma carries signal within a 15-step training horizon.
+	// (basisEmaBeta is consulted only when basisSource == 1.)
+
+	const unsigned int seeds[] = { 101u, 202u, 303u, 404u, 505u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	// Always include plain and +mom for continuity with prior sweeps, plus
+	// single-feature and combined ablations.
+	AblationRow rows[] = {
+	    { "plain",             false, false, 0u },
+	    { "+mom",              true,  false, 0u },
+	    { "+ema",              false, true,  0u },
+	    { "+gradbasis",        false, false, 1u },
+	    { "+mom+ema",          true,  true,  0u },
+	    { "+mom+gradbasis",    true,  false, 1u },
+	    { "+ema+gradbasis",    false, true,  1u },
+	    { "all3",              true,  true,  1u },
+	};
+	const unsigned int nRows = sizeof(rows) / sizeof(rows[0]);
+
+	printf("Base: dModel=%u layers=%u epochs=%u seq=%u LR=%.1e rank=%u lp=%.2f tSk=%u\n\n",
+	       base.dModel, base.nLayers, base.epochs, base.corpusLen,
+	       base.learningRate, base.vestaRank, base.vestaLambdaPerp, base.vestaTSk);
+
+	printf("%-18s  %-4s  %-18s  %-18s  %-10s\n",
+	       "config", "n", "trainNLL", "testNLL", "wall(s)");
+	printf("%-18s  %-4s  %-18s  %-18s  %-10s\n",
+	       "------", "---", "------------------", "------------------", "----------");
+
+	AggStats bestTest;
+	bestTest.mean = 1e30f;
+	const char* bestLabel = "(none)";
+
+	for (unsigned int i = 0; i < nRows; ++i)
+	{
+		RunSpec s = base;
+		s.vestaComplementMomentum = rows[i].mom;
+		s.vestaTrackedEma = rows[i].ema;
+		s.vestaBasisSource = rows[i].basis;
+		s.vestaBasisEmaBeta = 0.7f; // fast warmup for short training horizon
+		std::vector<float> trains, tests, walls;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok)
+			{
+				trains.push_back(r.finalTrainNll);
+				tests.push_back(r.finalTestNll);
+				walls.push_back(static_cast<float>(r.wallSec));
+			}
+		}
+		const AggStats tA = aggregate(trains);
+		const AggStats te = aggregate(tests);
+		const AggStats wA = aggregate(walls);
+		printf("%-18s  %-4u  %6.4f +/- %-7.4f  %6.4f +/- %-7.4f  %5.2f +/- %-5.2f\n",
+		       rows[i].label, (unsigned int)trains.size(),
+		       tA.mean, tA.stddev, te.mean, te.stddev, wA.mean, wA.stddev);
+		if (te.mean < bestTest.mean)
+		{
+			bestTest = te;
+			bestLabel = rows[i].label;
+		}
+	}
+
+	// AdamW reference.
+	RunSpec adam;
+	adam.optType = glades::OptimizerConfig::ADAMW;
+	adam.label = "AdamW";
+	adam.vocab = base.vocab; adam.dModel = base.dModel; adam.dFF = base.dFF;
+	adam.nLayers = base.nLayers; adam.nHeads = base.nHeads;
+	adam.epochs = base.epochs; adam.corpusLen = base.corpusLen;
+	adam.learningRate = 1e-2f;
+	std::vector<float> adamTest;
+	for (unsigned int k = 0; k < nSeeds; ++k)
+	{
+		const SweepResult r = run_one(adam, seeds[k]);
+		if (r.ok) adamTest.push_back(r.finalTestNll);
+	}
+	const AggStats adamT = aggregate(adamTest);
+
+	printf("\nAdamW reference: testNLL = %.4f +/- %.4f\n", adamT.mean, adamT.stddev);
+	printf("\nBest VESTA variant: %s\n", bestLabel);
+	printf("  testNLL = %.4f +/- %.4f\n", bestTest.mean, bestTest.stddev);
+	printf("  Delta vs AdamW  = %+.4f nats\n", bestTest.mean - adamT.mean);
+	printf("\n");
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
@@ -1426,5 +1683,7 @@ void VESTAUnitTest()
 	VESTAStepDescentTest();
 	VESTAGpuParityTest();
 	VESTAComplementMomentumTest();
+	VESTATrackedEmaTest();
+	VESTAGradientBasisTest();
 	VESTATransformerIntegrationTest();
 }

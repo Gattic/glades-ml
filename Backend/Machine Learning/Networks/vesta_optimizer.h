@@ -70,12 +70,23 @@ struct WeightState
 	// VestaConfig::complementMomentumEnabled is true; empty otherwise.
 	std::vector<float> complementMomentum;
 
+	// Optional EMA of the tracked-subspace diagonal A[i,i]. [r] when
+	// VestaConfig::trackedEmaEnabled is true; empty otherwise.
+	std::vector<float> aDiagEma;
+
+	// Optional gradient EMA for gradient-driven basis sketching. [m * n] when
+	// VestaConfig::basisSource == 1; empty otherwise. First refresh after
+	// initialization still uses W (since gradientEma starts at 0).
+	std::vector<float> gradientEma;
+	bool gradientEmaWarm;     // false until after the first step populates it
+
 	unsigned long long step;
 	float maxExpEllPrev;
 	bool initialized;
 
 	WeightState()
 	    : m(0u), n(0u), r(0u),
+	      gradientEmaWarm(false),
 	      step(0ULL),
 	      maxExpEllPrev(1.0f),
 	      initialized(false)
@@ -95,6 +106,9 @@ struct WeightState
 		scratch_sketchB.clear(); scratch_sketchVr.clear();
 		scratch_sketchS.clear();
 		complementMomentum.clear();
+		aDiagEma.clear();
+		gradientEma.clear();
+		gradientEmaWarm = false;
 		step = 0ULL;
 		maxExpEllPrev = 1.0f;
 		initialized = false;

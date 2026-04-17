@@ -207,6 +207,8 @@ int main(int argc, char* argv[])
 		VESTASweepLambdaPerpExtended();
 	    else if (strcmp(argv[1], "vesta-sweep-mom") == 0)
 		VESTASweepMomentumCompare();
+	    else if (strcmp(argv[1], "vesta-sweep-ablation") == 0)
+		VESTASweepAblationCompare();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)
