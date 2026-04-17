@@ -684,6 +684,75 @@ void VESTAGpuParityMomentumTest()
 // End-to-end: configure a tiny token-LM transformer with optimizer=VESTA and
 // train it for a couple of epochs. Verifies the sgd_transformer.cpp dispatch
 // reaches the VESTA branch and that a full train step produces finite weights.
+#ifdef GLADES_HAVE_CUDA
+// End-to-end: token-LM transformer with VESTA on the GPU training path.
+void VESTATransformerGpuIntegrationTest()
+{
+	printf("[vesta] TransformerGpuIntegrationTest\n");
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	const unsigned int vocab = 11u;
+
+	InMemoryTokenIdInput di;
+	{
+		std::vector<unsigned int> toks;
+		for (unsigned int i = 0; i < 64u; ++i)
+			toks.push_back((i * 3u + 1u) % vocab);
+		di.setTrainTokens(toks, -1);
+		di.mirrorTrainToTest();
+	}
+
+	glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+	std::vector<glades::HiddenLayerInfo*> hidden;
+	hidden.push_back(new glades::HiddenLayerInfo(32, 0.001f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	hidden.push_back(new glades::HiddenLayerInfo(32, 0.001f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+	glades::OutputLayerInfo* out = new glades::OutputLayerInfo(static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+	glades::NNInfo* info = new glades::NNInfo("vesta_gpu_integration", in, hidden, out);
+
+	glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+	net.getTerminatorMutable().setEpoch(2);
+	net.getTerminatorMutable().setAccuracy(0);
+	{
+		glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+		cfg.transformer.enableTokenEmbedding = true;
+		cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+		cfg.transformer.tieEmbeddings = true;
+		cfg.transformer.nHeadsOverride = 4;
+		cfg.transformer.dFFOverride = 64;
+		cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+		cfg.optimizer.type = glades::OptimizerConfig::VESTA;
+		cfg.vesta.rank = 4u;
+		cfg.vesta.tau = 0.0f;
+		cfg.vesta.rho = 0.1f;
+		cfg.vesta.tSk = 100u; // skip refresh within 2 epochs
+		cfg.vesta.lambdaPerp = 0.2f;
+		cfg.vesta.complementMomentumEnabled = true;
+		cfg.vesta.complementBeta = 0.9f;
+		cfg.vesta.complementUseSign = false; // raw mode
+		cfg.gpu.enable = true;
+		cfg.gpu.deviceId = 0;
+	}
+
+	ASSERT("VESTA GPU transformer: initial test", net.test(&di).ok());
+	const glades::NNetworkStatus st = net.train(&di);
+	ASSERT("VESTA GPU transformer: train status", st.ok());
+	ASSERT("VESTA GPU transformer: post-train test", net.test(&di).ok());
+
+	delete info;
+}
+#else
+void VESTATransformerGpuIntegrationTest()
+{
+	printf("[vesta] TransformerGpuIntegrationTest: CUDA not compiled; skipping\n");
+}
+#endif
+
 void VESTATransformerIntegrationTest()
 {
 	printf("[vesta] TransformerIntegrationTest\n");
@@ -2355,4 +2424,5 @@ void VESTAUnitTest()
 	VESTATrackedEmaTest();
 	VESTAGradientBasisTest();
 	VESTATransformerIntegrationTest();
+	VESTATransformerGpuIntegrationTest();
 }

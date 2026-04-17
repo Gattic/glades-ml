@@ -9876,6 +9876,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
+			const bool gpuUseVesta = (trainingConfig.optimizer.type == glades::OptimizerConfig::VESTA);
 			const bool gpuUseGeode = gpuUseAtlas && trainingConfig.atlas.geodeEnabled;
 			const bool gpuUseEcho = gpuUseAtlas && trainingConfig.atlas.echoEnabled;
 			const bool gpuUseBiMAP = gpuUseAtlas && trainingConfig.atlas.bimapEnabled;
@@ -10054,6 +10055,143 @@ if (ad_.valid) { \
 				storeRunningFlag(false);
 			}
 #undef GLADES_GPU_SGD_BIAS
+			}
+			else if (gpuUseVesta)
+			{
+			// === GPU VESTA optimizer ===
+			// Weight matrices use vesta_gpu_step (Bregman-mirror spectral update).
+			// Biases and LN params use vanilla SGD (matches CPU VESTA path).
+			const glades::VestaConfig& vc = trainingConfig.vesta;
+
+			bool gpuVestaError = false;
+
+#define GLADES_GPU_VESTA_SGD_BIAS(param, grad, lr_) do { \
+	const int sgd_sz_ = static_cast<int>((param).size()); \
+	if (sgd_sz_ > 0) { \
+		gpu::atlas_gpu_baseline_update((param).data(), (grad).data(), sgd_sz_, (lr_) * invBatch * gradScale); \
+		gpu::atlas_gpu_guard((param).data(), sgd_sz_); \
+		(grad).zero(); \
+	} \
+} while(0)
+
+			// Token embedding (layer index 0).
+			if (tokenLM)
+			{
+				const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_0 = skeleton->getWeightDecay1(0u);
+				const float wd2_0 = skeleton->getWeightDecay2(0u);
+				if (!gpuTransformerWeights->vestaTokE.initialized)
+				{
+					if (!gpu::vesta_gpu_init(gpuTransformerWeights->vestaTokE,
+					    gpuTransformerWeights->tokE.data(),
+					    vocabSize, dModel, vc, rngEngine, getLogger()))
+						gpuVestaError = true;
+				}
+				if (!gpuVestaError && !gpu::vesta_gpu_step(gpuTransformerWeights->vestaTokE,
+				    gpuTransformerWeights->tokE.data(), gpuTransformerWeights->gTokE.data(),
+				    vocabSize, dModel, invBatch, lr0, wd1_0, wd2_0, gradScale,
+				    vc, rngEngine, getLogger(), "tr.tokE"))
+					gpuVestaError = true;
+				GLADES_GPU_VESTA_SGD_BIAS(gpuTransformerWeights->lmBias, gpuTransformerWeights->gLmBias, lr0);
+			}
+
+			// Input projection (for non-tokenLM models).
+			if (!tokenLM)
+			{
+				const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_0 = skeleton->getWeightDecay1(0u);
+				const float wd2_0 = skeleton->getWeightDecay2(0u);
+				if (!gpuTransformerWeights->vestaWIn.initialized)
+				{
+					if (!gpu::vesta_gpu_init(gpuTransformerWeights->vestaWIn,
+					    gpuTransformerWeights->WIn.data(),
+					    dModel, inputSize, vc, rngEngine, getLogger()))
+						gpuVestaError = true;
+				}
+				if (!gpuVestaError && !gpu::vesta_gpu_step(gpuTransformerWeights->vestaWIn,
+				    gpuTransformerWeights->WIn.data(), gpuTransformerWeights->gWIn.data(),
+				    dModel, inputSize, invBatch, lr0, wd1_0, wd2_0, gradScale,
+				    vc, rngEngine, getLogger(), "tr.WIn"))
+					gpuVestaError = true;
+				GLADES_GPU_VESTA_SGD_BIAS(gpuTransformerWeights->bIn, gpuTransformerWeights->gBIn, lr0);
+			}
+
+			// Per-layer blocks.
+			for (unsigned int bli = 0; bli < nLayers; ++bli)
+			{
+				const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_l = skeleton->getWeightDecay1(bli + 1u);
+				const float wd2_l = skeleton->getWeightDecay2(bli + 1u);
+				gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+
+				#define GLADES_GPU_VESTA_INIT_STEP(st, W, gW, m_, n_, tag) do { \
+					if (!gpuVestaError) { \
+						if (!(st).initialized) { \
+							if (!gpu::vesta_gpu_init((st), (W).data(), (m_), (n_), vc, rngEngine, getLogger())) \
+								gpuVestaError = true; \
+						} \
+					} \
+					if (!gpuVestaError && !gpu::vesta_gpu_step((st), (W).data(), (gW).data(), \
+					    (m_), (n_), invBatch, lr_l, wd1_l, wd2_l, gradScale, \
+					    vc, rngEngine, getLogger(), (tag))) \
+						gpuVestaError = true; \
+				} while(0)
+
+				GLADES_GPU_VESTA_INIT_STEP(gb.vestaWq, gb.Wq, gb.gWq, dModel, dModel, "tr.Wq");
+				GLADES_GPU_VESTA_INIT_STEP(gb.vestaWk, gb.Wk, gb.gWk, dModelKV, dModel, "tr.Wk");
+				GLADES_GPU_VESTA_INIT_STEP(gb.vestaWv, gb.Wv, gb.gWv, dModelKV, dModel, "tr.Wv");
+				GLADES_GPU_VESTA_INIT_STEP(gb.vestaWo, gb.Wo, gb.gWo, dModel, dModel, "tr.Wo");
+				GLADES_GPU_VESTA_INIT_STEP(gb.vestaW1, gb.W1, gb.gW1, ff1Width, dModel, "tr.W1");
+				GLADES_GPU_VESTA_INIT_STEP(gb.vestaW2, gb.W2, gb.gW2, dModel, dFF, "tr.W2");
+				#undef GLADES_GPU_VESTA_INIT_STEP
+
+				GLADES_GPU_VESTA_SGD_BIAS(gb.bq, gb.gBq, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.bk, gb.gBk, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.bv, gb.gBv, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.bo, gb.gBo, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.b1, gb.gB1, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.b2, gb.gB2, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.ln1Gamma, gb.gLn1Gamma, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.ln1Beta, gb.gLn1Beta, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.ln2Gamma, gb.gLn2Gamma, lr_l);
+				GLADES_GPU_VESTA_SGD_BIAS(gb.ln2Beta, gb.gLn2Beta, lr_l);
+			}
+
+			// Final LayerNorm.
+			{
+				const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
+				GLADES_GPU_VESTA_SGD_BIAS(gpuTransformerWeights->lnFinalGamma, gpuTransformerWeights->gLnFinalGamma, lrLN);
+				GLADES_GPU_VESTA_SGD_BIAS(gpuTransformerWeights->lnFinalBeta, gpuTransformerWeights->gLnFinalBeta, lrLN);
+			}
+
+			// Output projection (skipped under tied heads in tokenLM mode).
+			if (!tokenLM)
+			{
+				const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_o = skeleton->getWeightDecay1(nLayers);
+				const float wd2_o = skeleton->getWeightDecay2(nLayers);
+				if (!gpuTransformerWeights->vestaWOut.initialized)
+				{
+					if (!gpu::vesta_gpu_init(gpuTransformerWeights->vestaWOut,
+					    gpuTransformerWeights->WOut.data(),
+					    outSize, dModel, vc, rngEngine, getLogger()))
+						gpuVestaError = true;
+				}
+				if (!gpuVestaError && !gpu::vesta_gpu_step(gpuTransformerWeights->vestaWOut,
+				    gpuTransformerWeights->WOut.data(), gpuTransformerWeights->gWOut.data(),
+				    outSize, dModel, invBatch, lrO, wd1_o, wd2_o, gradScale,
+				    vc, rngEngine, getLogger(), "tr.WOut"))
+					gpuVestaError = true;
+				GLADES_GPU_VESTA_SGD_BIAS(gpuTransformerWeights->bOut, gpuTransformerWeights->gBOut, lrO);
+			}
+
+			if (gpuVestaError)
+			{
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+				    "SGDHelper_TRANSFORMER: GPU VESTA update failed");
+				storeRunningFlag(false);
+			}
+#undef GLADES_GPU_VESTA_SGD_BIAS
 			}
 			else
 			{

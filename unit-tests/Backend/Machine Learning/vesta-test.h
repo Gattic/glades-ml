@@ -38,6 +38,7 @@ void VESTAComplementMomentumTest();
 void VESTATrackedEmaTest();
 void VESTAGradientBasisTest();
 void VESTATransformerIntegrationTest();
+void VESTATransformerGpuIntegrationTest();
 void VESTASweepBenchmark();
 void VESTASweepV2Benchmark();
 void VESTASweepLambdaPerpExtended();

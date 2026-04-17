@@ -6,6 +6,7 @@
 
 #include "gpu_buffer.h"
 #include "gpu_atlas.h"
+#include "gpu_vesta.h"
 #include <cstddef>
 
 #ifdef GLADES_HAVE_CUDA
@@ -197,6 +198,8 @@ struct GpuTransformerWeights
 		// ATLAS optimizer state (one per weight matrix)
 		GpuAtlasWeightState atlasWq, atlasWk, atlasWv, atlasWo;
 		GpuAtlasWeightState atlasW1, atlasW2;
+		GpuVestaWeightState vestaWq, vestaWk, vestaWv, vestaWo;
+		GpuVestaWeightState vestaW1, vestaW2;
 		GpuEchoWeightState echoWq, echoWk, echoWv, echoWo;
 		GpuEchoWeightState echoW1, echoW2;
 		GpuBiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
@@ -270,6 +273,9 @@ struct GpuTransformerWeights
 	GpuAtlasWeightState atlasTokE;
 	GpuAtlasWeightState atlasWIn;
 	GpuAtlasWeightState atlasWOut;
+	GpuVestaWeightState vestaTokE;
+	GpuVestaWeightState vestaWIn;
+	GpuVestaWeightState vestaWOut;
 	GpuEchoWeightState echoTokE;
 	GpuEchoWeightState echoWIn;
 	GpuEchoWeightState echoWOut;
