@@ -2802,20 +2802,6 @@ void VESTASweepSameMemory()
 	printf("Config: vocab=%u layers=%u heads=%u epochs=%u seq=%u LR=%.1e r=8 GPU=1\n\n",
 	       vocab, nLayers, nHeads, epochs, corpusLen, lr);
 
-	auto memoryBytes = [&](const Variant& v) -> double {
-		const double d = static_cast<double>(v.dModel);
-		const double model_b = 128.0 * d * d;
-		double opt_b = 0.0;
-		if (v.opt == glades::OptimizerConfig::ADAMW)
-			opt_b = 256.0 * d * d;
-		else
-		{
-			const double r = 8.0;
-			opt_b = 224.0 * d * r;
-		}
-		return model_b + opt_b;
-	};
-
 	printf("%-30s  %-10s  %-12s  %-4s  %-20s  %-20s  %-10s\n",
 	       "variant", "model_MiB", "opt_MiB", "n", "trainNLL", "testNLL", "wall(s)");
 	printf("%-30s  %-10s  %-12s  %-4s  %-20s  %-20s  %-10s\n",

@@ -1,0 +1,30 @@
+
+============================================================
+VESTA same-memory shootout (50 epochs, GPU)
+============================================================
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+Config: vocab=29 layers=4 heads=4 epochs=50 seq=512 LR=1.0e-02 r=8 GPU=1
+
+variant                         model_MiB   opt_MiB       n     trainNLL              testNLL               wall(s)   
+-------                         ---------   -------       ---   --------------------  --------------------  ----------
+[i]2026-04-17 21:53:22 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4522.12 token_lm_loss_kind=full_softmax nll=1.94615 perplexity=7.0017 acc_top1=66.9276 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 21:53:34 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4188.52 token_lm_loss_kind=full_softmax nll=1.88315 perplexity=6.57415 acc_top1=71.0372 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 21:53:45 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=4443.48 token_lm_loss_kind=full_softmax nll=1.95036 perplexity=7.03124 acc_top1=68.1018 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+AdamW d=512                     32.0        64.0          3      1.1846 +/- 0.1299     1.9266 +/- 0.0377     11.4 +/- 0.1  
+[i]2026-04-17 21:54:26 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=2312.22 token_lm_loss_kind=full_softmax nll=1.77845 perplexity=5.92065 acc_top1=70.4501 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 21:55:06 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=2492.68 token_lm_loss_kind=full_softmax nll=1.71295 perplexity=5.54529 acc_top1=71.0372 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 21:55:46 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=2504.9 token_lm_loss_kind=full_softmax nll=1.65621 perplexity=5.2394 acc_top1=73.1898 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+VESTA-plain-raw d=896           98.0        1.5           3      1.0813 +/- 0.0065     1.7159 +/- 0.0612     40.0 +/- 0.4  
+[i]2026-04-17 21:56:14 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=2444.98 token_lm_loss_kind=full_softmax nll=2.22399 perplexity=9.24412 acc_top1=55.5773 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 21:56:41 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=2399.06 token_lm_loss_kind=full_softmax nll=1.94235 perplexity=6.97513 acc_top1=71.0372 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+[i]2026-04-17 21:57:09 [NNetwork]: event=nn_epoch_progress net_type=5 run_type=eval epoch=50 seq_done=1 seq_total=1 tokens_seen=512 targets_seen=511 targets_per_sec=2399.06 token_lm_loss_kind=full_softmax nll=1.86178 perplexity=6.43519 acc_top1=71.6243 lr_mult=1 grad_norm=na grad_norm_scale=na optimizer_step=50
+AdamW d=896 (ref, +mem)         98.0        196.0         3      1.6274 +/- 0.4050     2.0094 +/- 0.1902     27.3 +/- 0.0  
+
+Compare row 1 (AdamW d=512) vs row 2 (VESTA-plain-raw d=896):
+  Row 1 total memory: ~99 MiB.  Row 2 total memory: ~120 MiB.
+  At ~comparable memory, VESTA at 1.75x dModel should beat AdamW.
+  Row 3 (AdamW @ d=896) is the upper-bound 'AdamW with VESTA's wider model' check.
+
+========================
+| Unit Tests Completed |
+========================
