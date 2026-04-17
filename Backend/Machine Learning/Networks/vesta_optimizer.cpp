@@ -154,7 +154,99 @@ bool denseSVD_rightV(const float* B, unsigned int mB, unsigned int nB,
 	if (r == 0u || r > nB)
 		return false;
 
-	// S = B^T B, symmetric PSD [nB x nB].
+	// Which side is smaller? For B shape (mB x nB) with mB << nB (typical in
+	// the sketched-SVD path where mB = r+8 and nB = dModel), we Jacobi on
+	// B B^T (size mB x mB = small) and derive right singular vectors via
+	//   V[:, i] = B^T U_B[:, i] / sigma_i
+	// This avoids the O(nB^3) cost of Jacobi on B^T B. For mB >= nB we keep
+	// the original B^T B path (nB is small).
+	if (mB < nB)
+	{
+		// Small side Jacobi: S = B B^T, symmetric PSD [mB x mB].
+		std::vector<float> S(static_cast<size_t>(mB) * mB, 0.0f);
+		for (unsigned int i = 0; i < mB; ++i)
+		{
+			for (unsigned int j = i; j < mB; ++j)
+			{
+				float dot = 0.0f;
+				for (unsigned int k = 0; k < nB; ++k)
+					dot += B[i * nB + k] * B[j * nB + k];
+				S[i * mB + j] = dot;
+				S[j * mB + i] = dot;
+			}
+		}
+
+		std::vector<float> U_B(static_cast<size_t>(mB) * mB, 0.0f);
+		for (unsigned int i = 0; i < mB; ++i)
+			U_B[i * mB + i] = 1.0f;
+
+		const unsigned int maxSweeps = 80u;
+		for (unsigned int sweep = 0; sweep < maxSweeps; ++sweep)
+		{
+			float off = 0.0f;
+			jacobi_sweep(&S[0], &U_B[0], mB, &off);
+			if (off < 1e-12f)
+				break;
+		}
+
+		// Extract (eigenvalue, index), sort descending by eigenvalue.
+		std::vector<std::pair<float, unsigned int> > eigs(mB);
+		for (unsigned int i = 0; i < mB; ++i)
+		{
+			const float ev = S[i * mB + i];
+			const float sv = (ev > 0.0f) ? sqrtf(ev) : 0.0f;
+			eigs[i] = std::make_pair(sv, i);
+		}
+		for (unsigned int i = 0; i < mB; ++i)
+		{
+			unsigned int maxIdx = i;
+			for (unsigned int j = i + 1; j < mB; ++j)
+				if (eigs[j].first > eigs[maxIdx].first)
+					maxIdx = j;
+			if (maxIdx != i)
+				std::swap(eigs[i], eigs[maxIdx]);
+		}
+
+		// r could exceed mB — VESTA callers ask for r = min(m_orig, n_orig)
+		// top singular values; any beyond mB have singular value 0 and any
+		// orthonormal vectors in the n-space complement work. Limit to
+		// min(r, mB) for the well-defined part; pad the remainder with zeros
+		// and orthogonal extension via gramSchmidt on random fill.
+		const unsigned int rReal = (r < mB) ? r : mB;
+		for (unsigned int i = 0; i < rReal; ++i)
+		{
+			const float si = eigs[i].first;
+			sOut[i] = si;
+			const unsigned int col = eigs[i].second;
+			// V[:, i] = B^T U_B[:, col] / si
+			if (si > 1e-12f)
+			{
+				const float invSi = 1.0f / si;
+				for (unsigned int k = 0; k < nB; ++k)
+				{
+					float acc = 0.0f;
+					for (unsigned int a = 0; a < mB; ++a)
+						acc += B[a * nB + k] * U_B[a * mB + col];
+					Vout[k * r + i] = acc * invSi;
+				}
+			}
+			else
+			{
+				for (unsigned int k = 0; k < nB; ++k)
+					Vout[k * r + i] = 0.0f;
+			}
+		}
+		for (unsigned int i = rReal; i < r; ++i)
+		{
+			sOut[i] = 0.0f;
+			for (unsigned int k = 0; k < nB; ++k)
+				Vout[k * r + i] = 0.0f;
+		}
+		return true;
+	}
+
+	// Fallback (mB >= nB): original B^T B path. nB is small here so the
+	// O(nB^3) cost is cheap.
 	std::vector<float> S(static_cast<size_t>(nB) * nB, 0.0f);
 	for (unsigned int i = 0; i < nB; ++i)
 	{
@@ -168,7 +260,6 @@ bool denseSVD_rightV(const float* B, unsigned int mB, unsigned int nB,
 		}
 	}
 
-	// V = I_{nB}.
 	std::vector<float> V(static_cast<size_t>(nB) * nB, 0.0f);
 	for (unsigned int i = 0; i < nB; ++i)
 		V[i * nB + i] = 1.0f;
@@ -182,7 +273,6 @@ bool denseSVD_rightV(const float* B, unsigned int mB, unsigned int nB,
 			break;
 	}
 
-	// Singular values = sqrt(max(eig, 0)).
 	std::vector<std::pair<float, unsigned int> > eigs(nB);
 	for (unsigned int i = 0; i < nB; ++i)
 	{

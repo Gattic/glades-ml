@@ -1746,10 +1746,10 @@ void VESTASweepScaleLadder()
 	const float lr = 1e-2f;
 	const unsigned int vestaRank = 8u;
 
-	// dModel=512 is unreasonably slow on CPU due to O(n^3) Jacobi SVD at
-	// each subspace refresh. Stopping at 256 for the feasibility-bound
-	// ladder; a follow-up GPU-training-loop run is needed for >=512.
-	const unsigned int scales[] = { 64u, 128u, 256u };
+	// With the small-side Jacobi fix in denseSVD_rightV (B B^T on size
+	// r+8 << n instead of B^T B on size n), dModel up to 1024 is feasible
+	// on CPU. The cost ratio VESTA/AdamW no longer scales as n^2.
+	const unsigned int scales[] = { 128u, 256u, 512u, 1024u };
 	const unsigned int nScales = sizeof(scales) / sizeof(scales[0]);
 	const unsigned int seeds[] = { 101u, 202u, 303u };
 	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
