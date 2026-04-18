@@ -92,6 +92,22 @@ __global__ void k_project_out_span(float* M, const float* U, const float* UtM,
 	M[i * r + c] -= acc;
 }
 
+// Transpose-aware variant: M[rows, r] -= U[rows, r] * A^T[r, r]
+// where A is stored as [r, r] row-major (so A^T[a, c] = A[c, a]).
+// Used in the V-direction Stiefel retraction where VtOmV = A^T and we avoid
+// computing it explicitly.
+__global__ void k_project_out_span_AT(float* M, const float* U, const float* A,
+                                      unsigned int rows, unsigned int r)
+{
+	const unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= rows || c >= r) return;
+	float acc = 0.0f;
+	for (unsigned int a = 0; a < r; ++a)
+		acc += U[i * r + a] * A[c * r + a];  // A^T[a, c]
+	M[i * r + c] -= acc;
+}
+
 // URaw[i,c] = U[i,c] - lr * Omega[i,c]
 __global__ void k_form_raw(const float* U, const float* Omega, float lr,
                            float* URaw, unsigned int size)
@@ -674,17 +690,20 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		                                           state.expEll.data(), m, n, r);
 	}
 
-	// Step 2c: UA = gW * V  [m, r]
+	// Step 2c: Omega_U = gW * V  [m, r].
+	// This is both the tracked-space coefficient input AND (after scaling
+	// and projection in step 4) the Stiefel update; computing it once into
+	// state.Omega_U avoids a duplicate gW*V later.
 	if (!sgemm_rowmajor(m, r, n, 1.0f, d_gW, n, state.V.data(), r,
-	                    0.0f, state.UA.data(), r))
+	                    0.0f, state.Omega_U.data(), r))
 		return false;
-	// Step 2d: A = U^T * UA  [r, r]
-	if (!sgemm_rowmajor_atb(r, r, m, 1.0f, state.U.data(), r, state.UA.data(), r,
+	// Step 2d: A = U^T * Omega_U = U^T * gW * V  [r, r].
+	if (!sgemm_rowmajor_atb(r, r, m, 1.0f, state.U.data(), r, state.Omega_U.data(), r,
 	                        0.0f, state.A.data(), r))
 		return false;
 
 	// Step 2e: g_perp = gW - (U * A) V^T.
-	// First compute UA2 = U * A into state.UA (reusing buffer).
+	// Compute UA = U * A into state.UA; used by form_gperp below.
 	if (!sgemm_rowmajor(m, r, r, 1.0f, state.U.data(), r, state.A.data(), r,
 	                    0.0f, state.UA.data(), r))
 		return false;
@@ -706,20 +725,15 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		                                   vc.ellMin, vc.ellMax, vc.phiDdFloor);
 	}
 
-	// Step 4: Stiefel QR retraction on U using OLD invExpEll (already in state.invExpEll
-	//   because we haven't recomputed it after ell update).
-	// Omega_U = (I - U U^T) gW V diag(invExpEll_old)  [m, r]
-	if (!sgemm_rowmajor(m, r, n, 1.0f, d_gW, n, state.V.data(), r,
-	                    0.0f, state.Omega_U.data(), r))
-		return false;
-	if (!sgemm_rowmajor_atb(r, r, m, 1.0f, state.U.data(), r, state.Omega_U.data(), r,
-	                        0.0f, state.UtOmU.data(), r))
-		return false;
+	// Step 4: Stiefel QR retraction on U.
+	// Omega_U = (I - U U^T) gW V diag(invExpEll_old)  [m, r].
+	// Omega_U already holds gW * V from step 2c. UtOmU = U^T * Omega_U = A
+	// (same computation as step 2d), so we reuse state.A for the projection.
 	{
 		const dim3 TPB2(16, 16);
 		const dim3 blocks((r + 15) / 16, (m + 15) / 16);
 		k_project_out_span<<<blocks, TPB2>>>(state.Omega_U.data(), state.U.data(),
-		                                     state.UtOmU.data(), m, r);
+		                                     state.A.data(), m, r);
 	}
 	{
 		const unsigned int total = m * r;
@@ -733,18 +747,17 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		return false;
 
 
-	// Stiefel retraction on V: Omega_V = (I - V V^T) gW^T U diag(invExpEll_old)
+	// Stiefel retraction on V: Omega_V = (I - V V^T) gW^T U diag(invExpEll_old).
+	// VtOmV = V^T * Omega_V = V^T * gW^T * U = (U^T * gW * V)^T = A^T.
+	// Skip the VtOmV SGEMM and apply the A^T projection directly.
 	if (!sgemm_rowmajor_atb(n, r, m, 1.0f, d_gW, n, state.U.data(), r,
 	                        0.0f, state.Omega_V.data(), r))
-		return false;
-	if (!sgemm_rowmajor_atb(r, r, n, 1.0f, state.V.data(), r, state.Omega_V.data(), r,
-	                        0.0f, state.VtOmV.data(), r))
 		return false;
 	{
 		const dim3 TPB2(16, 16);
 		const dim3 blocks((r + 15) / 16, (n + 15) / 16);
-		k_project_out_span<<<blocks, TPB2>>>(state.Omega_V.data(), state.V.data(),
-		                                     state.VtOmV.data(), n, r);
+		k_project_out_span_AT<<<blocks, TPB2>>>(state.Omega_V.data(), state.V.data(),
+		                                        state.A.data(), n, r);
 	}
 	{
 		const unsigned int total = n * r;

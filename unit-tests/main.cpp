@@ -229,8 +229,12 @@ int main(int argc, char* argv[])
 		VESTASweepRankAtScale();
 	    else if (strcmp(argv[1], "vesta-sweep-ultra") == 0)
 		VESTASweepScaleUltra();
+	    else if (strcmp(argv[1], "vesta-sweep-mega") == 0)
+		VESTASweepScaleMega();
 	    else if (strcmp(argv[1], "vesta-refresh-bench") == 0)
 		VESTAGpuRefreshBenchmark();
+	    else if (strcmp(argv[1], "vesta-step-bench") == 0)
+		VESTAGpuStepBenchmark();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)

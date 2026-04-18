@@ -37,6 +37,7 @@ void VESTAGpuParityMomentumTest();
 void VESTAGpuRefreshDeviceTest();
 void VESTAGpuSingleRefreshTest();
 void VESTAGpuRefreshBenchmark();
+void VESTAGpuStepBenchmark();
 void VESTAComplementMomentumTest();
 void VESTATrackedEmaTest();
 void VESTAGradientBasisTest();
@@ -57,6 +58,7 @@ void VESTASweepLongHorizonSchedule();
 void VESTASweepSameMemory();
 void VESTASweepRankAtScale();
 void VESTASweepScaleUltra();
+void VESTASweepScaleMega();
 void VESTAUnitTest();
 
 #endif

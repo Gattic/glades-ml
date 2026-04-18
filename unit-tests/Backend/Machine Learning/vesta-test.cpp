@@ -870,6 +870,83 @@ void VESTAGpuRefreshDeviceTest()
 	ASSERT("device refresh ||W|| within 1%% of host refresh", relDiff < 0.01f);
 }
 
+// Microbenchmark: time N steps of vesta_gpu_step on a single weight matrix
+// at realistic scale. This isolates the per-step work (excluding refresh) to
+// quantify the impact of step-code optimizations.
+void VESTAGpuStepBenchmark()
+{
+	printf("[vesta] GpuStepBenchmark\n");
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+
+	const unsigned int dModel = 2048;
+	const unsigned int m = dModel, n = dModel;
+	const unsigned int rank = 8u;
+	const unsigned int nSteps = 100u;
+
+	std::vector<float> W(static_cast<size_t>(m) * n, 0.0f);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xCAFEULL);
+	for (size_t i = 0; i < W.size(); ++i)
+		W[i] = 0.02f * glades::rng::standard_normal(eng);
+
+	glades::gpu::GpuBuffer<float> dW, dG;
+	ASSERT("alloc dW", dW.allocate(static_cast<size_t>(m) * n));
+	ASSERT("alloc dG", dG.allocate(static_cast<size_t>(m) * n));
+	ASSERT("upload W", dW.upload(&W[0], static_cast<size_t>(m) * n));
+
+	glades::VestaConfig vc;
+	vc.rank = rank;
+	vc.tau = 0.0f;
+	vc.rho = 0.1f;
+	vc.lambdaPerp = 0.0f;
+	vc.tSk = 1000000u;  // never refresh during the benchmark
+	vc.gpuRefreshOnDevice = true;
+
+	glades::gpu::GpuVestaWeightState st;
+	glades::rng::Engine rng;
+	glades::rng::seed_engine(rng, 0xD00DULL);
+	ASSERT("gpu init",
+	       glades::gpu::vesta_gpu_init(st, dW.data(), m, n, vc, rng, 0));
+
+	// Generate one gradient and reuse — kernel work per step is the same.
+	std::vector<float> gStep(static_cast<size_t>(m) * n, 0.0f);
+	for (size_t i = 0; i < gStep.size(); ++i)
+		gStep[i] = 0.01f * glades::rng::standard_normal(eng);
+	ASSERT("upload g", dG.upload(&gStep[0], static_cast<size_t>(m) * n));
+
+	// Warmup.
+	for (unsigned int i = 0; i < 5u; ++i)
+	{
+		ASSERT("warmup step",
+		       glades::gpu::vesta_gpu_step(st, dW.data(), dG.data(), m, n,
+		                                    1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                    vc, rng, 0, 0));
+	}
+	cudaDeviceSynchronize();
+
+	struct timeval t0, t1;
+	gettimeofday(&t0, 0);
+	for (unsigned int i = 0; i < nSteps; ++i)
+	{
+		ASSERT("step", glades::gpu::vesta_gpu_step(st, dW.data(), dG.data(), m, n,
+		                                            1.0f, 0.01f, 0.0f, 0.0f, 1.0f,
+		                                            vc, rng, 0, 0));
+	}
+	cudaDeviceSynchronize();
+	gettimeofday(&t1, 0);
+	const double seconds = (t1.tv_sec - t0.tv_sec) + 1e-6 * (t1.tv_usec - t0.tv_usec);
+
+	printf("  dModel=%u rank=%u, %u steps (no refresh): %.3fs total, %.3fms per step\n",
+	       dModel, rank, nSteps, seconds, seconds * 1000.0 / static_cast<double>(nSteps));
+}
+
 // Microbenchmark: time N refreshes at a realistic-scale weight matrix
 // (m=n=dModel, rank=8), reporting host-path vs device-path wall-clock.
 // This quantifies the speedup of the on-device sketched-SVD refresh.
@@ -973,6 +1050,11 @@ void VESTAGpuSingleRefreshTest()
 void VESTAGpuRefreshBenchmark()
 {
 	printf("[vesta] GpuRefreshBenchmark: CUDA not compiled; skipping\n");
+}
+
+void VESTAGpuStepBenchmark()
+{
+	printf("[vesta] GpuStepBenchmark: CUDA not compiled; skipping\n");
 }
 
 #endif
@@ -3323,6 +3405,96 @@ void VESTASweepScaleUltra()
 		       ranks[ri], (unsigned int)tr.size(),
 		       tA.mean, tA.stddev, te2.mean, te2.stddev, wA2.mean, wA2.stddev,
 		       optMiB);
+	}
+#endif
+}
+
+// dModel=8192 mega-scale sweep. This is the regime where AdamW's 2x-weights
+// optimizer state becomes prohibitive: for a 2-layer model with dFF=2*dModel
+// the weights alone are ~4 GiB, so AdamW needs ~8 GiB of optimizer memory,
+// bumping against the 16 GiB budget once gradients and activations are added.
+// VESTA r=8 uses 16 MiB for the optimizer state across all matrices -- a
+// ~500x reduction that makes this tractable. nLayers=2 keeps the total
+// memory footprint under 16 GiB for AdamW comparison.
+void VESTASweepScaleMega()
+{
+	printf("\n============================================================\n");
+	printf("VESTA mega-scale sweep at dModel=8192, 30 epochs (GPU)\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	const unsigned int vocab = 29u;
+	const unsigned int dModel = 8192u;
+	const unsigned int dFF = 2u * dModel;     // 16384; matches prior scale pattern
+	const unsigned int nLayers = 2u;           // reduced from 4 to fit AdamW in 16 GiB
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 30u;           // reduced from 50 for runtime
+	const unsigned int corpusLen = 256u;       // reduced from 512 for memory
+	const float lr = 1e-2f;
+	const unsigned int seed = 101u;            // single seed at this scale
+
+	// AdamW reference. May OOM at full config -- that itself is the finding.
+	RunSpec adam;
+	adam.optType = glades::OptimizerConfig::ADAMW;
+	adam.label = "AdamW";
+	adam.vocab = vocab; adam.dModel = dModel; adam.dFF = dFF;
+	adam.nLayers = nLayers; adam.nHeads = nHeads;
+	adam.epochs = epochs; adam.corpusLen = corpusLen;
+	adam.learningRate = lr;
+	adam.useGpu = true;
+	printf("Running AdamW reference ...\n");
+	const SweepResult adamR = run_one(adam, seed);
+	if (adamR.ok)
+	{
+		printf("AdamW: testNLL = %.4f  wall %.1f s\n\n", adamR.finalTestNll, adamR.wallSec);
+	}
+	else
+	{
+		printf("AdamW: FAILED (likely OOM)\n\n");
+	}
+
+	printf("%-10s  %-4s  %-20s  %-20s  %-10s  %-10s\n",
+	       "rank", "n", "trainNLL", "testNLL", "wall(s)", "opt MiB");
+	printf("%-10s  %-4s  %-20s  %-20s  %-10s  %-10s\n",
+	       "----", "---", "--------------------", "--------------------", "----------", "-------");
+
+	// VESTA r=8 only -- at dModel=8192 the efficient rank ceiling is r=8
+	// (same insight as dModel=4096 where r=16 gave no NLL gain over r=8).
+	RunSpec s;
+	s.optType = glades::OptimizerConfig::VESTA;
+	s.label = "VESTA-plain-raw";
+	s.vocab = vocab; s.dModel = dModel; s.dFF = dFF;
+	s.nLayers = nLayers; s.nHeads = nHeads;
+	s.epochs = epochs; s.corpusLen = corpusLen;
+	s.learningRate = lr;
+	s.useGpu = true;
+	s.vestaRank = 8u;
+	s.vestaTSk = 16u;
+	s.vestaLambdaPerp = 0.1f;
+	s.vestaComplementMomentum = false;
+	s.vestaComplementUseSign = false;
+
+	const SweepResult vr = run_one(s, seed);
+	if (vr.ok)
+	{
+		const double optMiB = 224.0 * dModel * 8u / (1024.0 * 1024.0);
+		printf("r=8        1     %7.4f             %7.4f             %6.1f       %-10.2f\n",
+		       vr.finalTrainNll, vr.finalTestNll, vr.wallSec, optMiB);
+	}
+	else
+	{
+		printf("VESTA r=8: FAILED\n");
 	}
 #endif
 }
