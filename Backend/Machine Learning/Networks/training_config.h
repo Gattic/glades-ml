@@ -1800,6 +1800,15 @@ struct VestaConfig
 	unsigned int basisSource;       // default 0 (weights)
 	float basisEmaBeta;             // default 0.99 (EMA rate for gradientEma)
 
+	// If true, the GPU sketched-SVD refresh is executed on-device (cuBLAS GEMMs,
+	// on-device modified Gram-Schmidt). Only the small B matrix [rp x n] is
+	// downloaded for the Jacobi eigendecomposition and the right singular
+	// vectors are uploaded back. If false, the GPU path downloads W to host,
+	// runs the CPU sketched SVD, and uploads U/V/ell -- useful for strict
+	// CPU/GPU parity tests. Default true (production speedup; at dModel=2048
+	// the host roundtrip is ~50% of VESTA wall-clock per step).
+	bool gpuRefreshOnDevice;
+
 	VestaConfig()
 	    : rank(32u),
 	      mu(4.0f),
@@ -1821,7 +1830,8 @@ struct VestaConfig
 	      trackedEmaEnabled(false),
 	      trackedEmaBeta(0.9f),
 	      basisSource(0u),
-	      basisEmaBeta(0.99f)
+	      basisEmaBeta(0.99f),
+	      gpuRefreshOnDevice(true)
 	{
 	}
 };

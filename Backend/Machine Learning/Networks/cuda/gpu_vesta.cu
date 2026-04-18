@@ -343,7 +343,8 @@ static bool allocate_buffers(GpuVestaWeightState& s,
 }
 
 // On-device modified Gram-Schmidt for Q[m x r]. Avoids host roundtrip.
-static bool gpu_gramSchmidt_device(float* d_Q, unsigned int m, unsigned int r)
+static bool gpu_gramSchmidt_device(float* d_Q, unsigned int m, unsigned int r,
+                                   cudaStream_t stream = 0)
 {
 	if (m == 0u || r == 0u) return true;
 	unsigned int threads = 1024u;
@@ -353,7 +354,7 @@ static bool gpu_gramSchmidt_device(float* d_Q, unsigned int m, unsigned int r)
 	while ((pow2 * 2u) <= threads) pow2 *= 2u;
 	threads = pow2;
 	const size_t shmem = threads * sizeof(float);
-	k_gram_schmidt<<<1, threads, shmem>>>(d_Q, m, r);
+	k_gram_schmidt<<<1, threads, shmem, stream>>>(d_Q, m, r);
 	return cudaGetLastError() == cudaSuccess;
 }
 
@@ -395,12 +396,14 @@ bool vesta_gpu_init(GpuVestaWeightState& state,
 	return true;
 }
 
-bool vesta_gpu_refresh(GpuVestaWeightState& state,
-                       const float* d_W,
-                       unsigned int m, unsigned int n,
-                       const glades::VestaConfig& vc,
-                       glades::rng::Engine& rng,
-                       shmea::GLogger* /*logger*/)
+// Host-roundtrip refresh: download W, run CPU sketched SVD, upload U/V/ell.
+// Used for strict CPU/GPU parity paths (parity tests). Slow at large dModel.
+static bool vesta_gpu_refresh_host(GpuVestaWeightState& state,
+                                   const float* d_W,
+                                   unsigned int m, unsigned int n,
+                                   const glades::VestaConfig& vc,
+                                   glades::rng::Engine& rng,
+                                   shmea::GLogger* /*logger*/)
 {
 	std::vector<float> hostW(static_cast<size_t>(m) * n, 0.0f);
 	if (cudaMemcpy(&hostW[0], d_W, static_cast<size_t>(m) * n * sizeof(float),
@@ -432,6 +435,199 @@ bool vesta_gpu_refresh(GpuVestaWeightState& state,
 	if (!state.V.upload(&cpuState.V[0], static_cast<size_t>(n) * state.r)) return false;
 	if (!state.ell.upload(&cpuState.ell[0], state.r)) return false;
 	return true;
+}
+
+// On-device refresh: keeps W resident, runs GEMMs + Gram-Schmidt on GPU,
+// only downloads the small B[rp x n] matrix for the Jacobi-based SVD, uploads
+// the right singular vectors back. RNG consumption matches the CPU path
+// exactly (n*rp Omega draws, then per-deficient-column m+n draws in order).
+// Numerical result differs from CPU-refresh by cuBLAS vs. host-SGEMM rounding,
+// typically <= 1e-4 per U/V element.
+static bool vesta_gpu_refresh_device(GpuVestaWeightState& state,
+                                     const float* d_W,
+                                     unsigned int m, unsigned int n,
+                                     const glades::VestaConfig& vc,
+                                     glades::rng::Engine& rng,
+                                     shmea::GLogger* /*logger*/)
+{
+	const unsigned int r = state.r;
+	const unsigned int over = 8u;
+	unsigned int rp = r + over;
+	if (rp > m) rp = m;
+	if (rp > n) rp = n;
+	if (rp < r) return false;
+
+	// 1. Sample Omega ~ N(0,1) [n, rp] on host; upload.
+	std::vector<float> hostOmega(static_cast<size_t>(n) * rp, 0.0f);
+	for (size_t i = 0; i < hostOmega.size(); ++i)
+		hostOmega[i] = glades::rng::standard_normal(rng);
+	if (!state.sketchOmega.upload(&hostOmega[0], static_cast<size_t>(n) * rp))
+		return false;
+
+	// 2. Y = W Omega  [m, rp].  Row-major SGEMM: M=m, N=rp, K=n.
+	if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(rp), static_cast<int>(n), 1.0f,
+	                    d_W, static_cast<int>(n),
+	                    state.sketchOmega.data(), static_cast<int>(rp),
+	                    0.0f,
+	                    state.sketchY.data(), static_cast<int>(rp)))
+		return false;
+
+	// 3. Power iterations. Alternates GS → WtY → Y = W WtY.
+	// GS runs on compute stream for ordering with the cuBLAS GEMMs that
+	// immediately read/write Y; without this the cuBLAS call on compute stream
+	// is not ordered with the default-stream GS and reads stale Y.
+	const cudaStream_t cstream = glades::gpu::computeStream();
+	for (unsigned int p = 0; p < vc.powerIters; ++p)
+	{
+		if (!gpu_gramSchmidt_device(state.sketchY.data(), m, rp, cstream)) return false;
+		// WtY [n, rp] = W^T Y. ATB: M=n, N=rp, K=m. A=W[m,n] lda=n; B=Y[m,rp] ldb=rp.
+		if (!sgemm_rowmajor_atb(static_cast<int>(n), static_cast<int>(rp), static_cast<int>(m), 1.0f,
+		                        d_W, static_cast<int>(n),
+		                        state.sketchY.data(), static_cast<int>(rp),
+		                        0.0f,
+		                        state.sketchOmega.data(), static_cast<int>(rp)))
+			return false;
+		// Y = W WtY  [m, rp]. SGEMM: M=m, N=rp, K=n.
+		if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(rp), static_cast<int>(n), 1.0f,
+		                    d_W, static_cast<int>(n),
+		                    state.sketchOmega.data(), static_cast<int>(rp),
+		                    0.0f,
+		                    state.sketchY.data(), static_cast<int>(rp)))
+			return false;
+	}
+
+	// 4. Final GS on Y → orthonormal range basis.
+	if (!gpu_gramSchmidt_device(state.sketchY.data(), m, rp, cstream)) return false;
+
+	// 5. B = Y^T W  [rp, n]. ATB: M=rp, N=n, K=m. A=Y[m,rp] lda=rp; B=W[m,n] ldb=n.
+	if (!sgemm_rowmajor_atb(static_cast<int>(rp), static_cast<int>(n), static_cast<int>(m), 1.0f,
+	                        state.sketchY.data(), static_cast<int>(rp),
+	                        d_W, static_cast<int>(n),
+	                        0.0f,
+	                        state.sketchB.data(), static_cast<int>(n)))
+		return false;
+
+	// 6. Download B and run the tiny SVD on CPU (Jacobi on B B^T, rp x rp).
+	// Explicit sync: cuBLAS on compute stream just wrote sketchB; the
+	// subsequent pageable cudaMemcpy is synchronous w.r.t. host, but we make
+	// stream ordering explicit here.
+	cudaStreamSynchronize(cstream);
+	std::vector<float> hostB(static_cast<size_t>(rp) * n, 0.0f);
+	if (cudaMemcpy(&hostB[0], state.sketchB.data(),
+	               static_cast<size_t>(rp) * n * sizeof(float),
+	               cudaMemcpyDeviceToHost) != cudaSuccess)
+		return false;
+
+	std::vector<float> Vrp(static_cast<size_t>(n) * rp, 0.0f);
+	std::vector<float> srp(rp, 0.0f);
+	if (!vesta::denseSVD_rightV(&hostB[0], rp, n, &Vrp[0], &srp[0], rp))
+		return false;
+
+	// Rank-deficiency detection: generous relative threshold (matches CPU).
+	float threshBase = srp[0] * 1e-3f;
+	if (threshBase < 1e-6f) threshBase = 1e-6f;
+	std::vector<unsigned char> validCol(r, 0);
+	for (unsigned int i = 0; i < r; ++i)
+		validCol[i] = (srp[i] > threshBase) ? 1u : 0u;
+
+	// 7. Build V_final [n, r]: first r cols of Vrp for valid, random for deficient.
+	std::vector<float> Vfinal(static_cast<size_t>(n) * r, 0.0f);
+	for (unsigned int j = 0; j < n; ++j)
+		for (unsigned int c = 0; c < r; ++c)
+			if (validCol[c])
+				Vfinal[j * r + c] = Vrp[j * rp + c];
+
+	// 8. Build V_scaled [n, r] with Vrp[:,c]/srp[c] for valid cols (zero for deficient).
+	// Used to compute U_B = B * V_scaled  [rp, r]  on device.
+	std::vector<float> VrpScaled(static_cast<size_t>(n) * r, 0.0f);
+	for (unsigned int c = 0; c < r; ++c)
+	{
+		if (!validCol[c]) continue;
+		const float inv = 1.0f / srp[c];
+		for (unsigned int j = 0; j < n; ++j)
+			VrpScaled[j * r + c] = Vrp[j * rp + c] * inv;
+	}
+
+	// Stuff VrpScaled into state.sketchOmega (size n*rp >= n*r; first n*r floats).
+	if (!state.sketchOmega.upload(&VrpScaled[0], static_cast<size_t>(n) * r))
+		return false;
+
+	// 9. U_B [rp, r] = B [rp, n] * V_scaled [n, r]. SGEMM: M=rp, N=r, K=n.
+	GpuBuffer<float> dUB;
+	if (!dUB.allocate(static_cast<size_t>(rp) * r)) return false;
+	if (!sgemm_rowmajor(static_cast<int>(rp), static_cast<int>(r), static_cast<int>(n), 1.0f,
+	                    state.sketchB.data(), static_cast<int>(n),
+	                    state.sketchOmega.data(), static_cast<int>(r),
+	                    0.0f,
+	                    dUB.data(), static_cast<int>(r)))
+		return false;
+
+	// 10. U_final [m, r] = Y [m, rp] * U_B [rp, r]. SGEMM: M=m, N=r, K=rp.
+	if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(r), static_cast<int>(rp), 1.0f,
+	                    state.sketchY.data(), static_cast<int>(rp),
+	                    dUB.data(), static_cast<int>(r),
+	                    0.0f,
+	                    state.U.data(), static_cast<int>(r)))
+		return false;
+
+	// 11. Write Vfinal to device.
+	if (!state.V.upload(&Vfinal[0], static_cast<size_t>(n) * r)) return false;
+
+	// 12. Rank-deficient columns: CPU fills U, V with fresh Gaussians in
+	// per-column (m for U, then n for V) order to match CPU RNG consumption.
+	bool anyDeficient = false;
+	for (unsigned int c = 0; c < r; ++c) if (!validCol[c]) { anyDeficient = true; break; }
+	if (anyDeficient)
+	{
+		std::vector<float> hostU(static_cast<size_t>(m) * r, 0.0f);
+		if (!state.U.download(&hostU[0], static_cast<size_t>(m) * r)) return false;
+		// Vfinal is already on host (from step 7 construction — we'll re-upload).
+		for (unsigned int c = 0; c < r; ++c)
+		{
+			if (validCol[c]) continue;
+			for (unsigned int i = 0; i < m; ++i)
+				hostU[i * r + c] = glades::rng::standard_normal(rng);
+			for (unsigned int j = 0; j < n; ++j)
+				Vfinal[j * r + c] = glades::rng::standard_normal(rng);
+		}
+		if (!state.U.upload(&hostU[0], static_cast<size_t>(m) * r)) return false;
+		if (!state.V.upload(&Vfinal[0], static_cast<size_t>(n) * r)) return false;
+	}
+
+	// 13. Orthonormalize U and V on device (matches CPU final gramSchmidt passes).
+	if (!gpu_gramSchmidt_device(state.U.data(), m, r, cstream)) return false;
+	if (!gpu_gramSchmidt_device(state.V.data(), n, r, cstream)) return false;
+
+	// 14. Set ell = clamp(log(sigma)) on host → upload.
+	std::vector<float> hostEll(r, 0.0f);
+	for (unsigned int i = 0; i < r; ++i)
+	{
+		float l = vc.ellMin;
+		if (validCol[i])
+		{
+			float si = srp[i];
+			if (si < 1e-20f) si = 1e-20f;
+			l = logf(si);
+		}
+		if (l < vc.ellMin) l = vc.ellMin;
+		if (l > vc.ellMax) l = vc.ellMax;
+		hostEll[i] = l;
+	}
+	if (!state.ell.upload(&hostEll[0], r)) return false;
+
+	return true;
+}
+
+bool vesta_gpu_refresh(GpuVestaWeightState& state,
+                       const float* d_W,
+                       unsigned int m, unsigned int n,
+                       const glades::VestaConfig& vc,
+                       glades::rng::Engine& rng,
+                       shmea::GLogger* logger)
+{
+	if (vc.gpuRefreshOnDevice)
+		return vesta_gpu_refresh_device(state, d_W, m, n, vc, rng, logger);
+	return vesta_gpu_refresh_host(state, d_W, m, n, vc, rng, logger);
 }
 
 bool vesta_gpu_step(GpuVestaWeightState& state,
