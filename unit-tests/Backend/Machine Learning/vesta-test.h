@@ -59,6 +59,7 @@ void VESTASweepSameMemory();
 void VESTASweepRankAtScale();
 void VESTASweepScaleUltra();
 void VESTASweepScaleMega();
+void VESTAProfileBench();
 void VESTAUnitTest();
 
 #endif

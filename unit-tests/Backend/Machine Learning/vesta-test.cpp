@@ -3499,6 +3499,60 @@ void VESTASweepScaleMega()
 #endif
 }
 
+// Profile target: realistic VESTA training at dModel=4096, nLayers=4, 3 epochs.
+// This is a short run (~40s) intended for nsys/ncu profiling to see where
+// VESTA spends time in a real transformer training context (forward/backward
+// + optimizer), not just in the isolated step as vesta-step-bench does.
+void VESTAProfileBench()
+{
+	printf("\n============================================================\n");
+	printf("VESTA profile bench at dModel=4096, nLayers=4, 3 epochs\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+
+	RunSpec s;
+	s.optType = glades::OptimizerConfig::VESTA;
+	s.label = "VESTA-plain-raw";
+	s.vocab = 29u;
+	s.dModel = 4096u;
+	s.dFF = 2u * s.dModel;
+	s.nLayers = 4u;
+	s.nHeads = 4u;
+	s.epochs = 3u;     // short for profiling
+	s.corpusLen = 512u;
+	s.learningRate = 1e-2f;
+	s.useGpu = true;
+	s.vestaRank = 8u;
+	s.vestaTSk = 16u;
+	s.vestaLambdaPerp = 0.1f;
+	s.vestaComplementMomentum = false;
+	s.vestaComplementUseSign = false;
+
+	const SweepResult r = run_one(s, 101u);
+	if (r.ok)
+	{
+		printf("VESTA dModel=4096 3ep 1seed: trainNLL=%.4f  testNLL=%.4f  wall=%.1fs\n",
+		       r.finalTrainNll, r.finalTestNll, r.wallSec);
+	}
+	else
+	{
+		printf("VESTA profile bench: FAILED\n");
+	}
+#endif
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();
