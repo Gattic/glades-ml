@@ -212,7 +212,7 @@ __global__ void k_vesta_fused_update(
     const float* __restrict__ V_new,
     const float* __restrict__ expEll_new,
     const float* __restrict__ UA,
-    const float* __restrict__ gW,
+    float* __restrict__ gW,
     float* __restrict__ momentum,
     float beta,
     float cScale)
@@ -257,6 +257,49 @@ __global__ void k_vesta_fused_update(
 	}
 
 	W[idx] += delta - cScale * cStep;
+	// Zero gW for next step's gradient accumulation. Fused here so we avoid
+	// a separate k_zero kernel over the full m*n buffer.
+	gW[idx] = 0.0f;
+}
+
+// In-place upper Cholesky on M[r x r] row-major: writes R such that R^T R = M
+// in the upper triangle; zeros the lower triangle. Single block, single thread.
+// r is small (typically 4-16), so serial is optimal.
+// Writes status[0] = 1 on success, 0 if a non-positive pivot is encountered
+// (indicating M is not positive-definite; caller should fall back to MGS).
+__global__ void k_cholesky_small_upper(float* __restrict__ M, unsigned int r,
+                                       int* __restrict__ status)
+{
+	if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+	*status = 1;
+	for (unsigned int k = 0; k < r; ++k)
+	{
+		float diag = M[k * r + k];
+		for (unsigned int i = 0; i < k; ++i)
+		{
+			const float v = M[i * r + k];
+			diag -= v * v;
+		}
+		if (!(diag > 0.0f) || !isfinite(diag))
+		{
+			*status = 0;
+			return;
+		}
+		const float Rkk = sqrtf(diag);
+		M[k * r + k] = Rkk;
+		const float invRkk = 1.0f / Rkk;
+		for (unsigned int j = k + 1; j < r; ++j)
+		{
+			float s = M[k * r + j];
+			for (unsigned int i = 0; i < k; ++i)
+				s -= M[i * r + k] * M[i * r + j];
+			M[k * r + j] = s * invRkk;
+		}
+	}
+	// Zero lower triangle (optional but cleaner).
+	for (unsigned int i = 1; i < r; ++i)
+		for (unsigned int j = 0; j < i; ++j)
+			M[i * r + j] = 0.0f;
 }
 
 // Modified Gram-Schmidt for Q[m x r] stored row-major (Q[i*r + j] = row i, col j).
@@ -424,6 +467,7 @@ static bool allocate_buffers(GpuVestaWeightState& s,
 	if (!alloc_or_check(s.Adiag, r)) return false;
 	if (!alloc_or_check(s.UtOmU, static_cast<size_t>(r) * r)) return false;
 	if (!alloc_or_check(s.VtOmV, static_cast<size_t>(r) * r)) return false;
+	if (!s.cholStatus.allocated() && !s.cholStatus.allocate(1)) return false;
 	if (!alloc_or_check(s.sketchOmega, static_cast<size_t>(n) * rp)) return false;
 	if (!alloc_or_check(s.sketchY, static_cast<size_t>(m) * rp)) return false;
 	if (!alloc_or_check(s.sketchB, static_cast<size_t>(rp) * n)) return false;
@@ -444,6 +488,53 @@ static bool gpu_gramSchmidt_device(float* d_Q, unsigned int m, unsigned int r,
 	const size_t shmem = threads * sizeof(float);
 	k_gram_schmidt<<<1, threads, shmem, stream>>>(d_Q, m, r);
 	return cudaGetLastError() == cudaSuccess;
+}
+
+// CholQR-based orthonormalization: Q = U * R^(-1) where R^T R = U^T U.
+// Produces the same Q as modified Gram-Schmidt (both are the unique thin-QR
+// Q with R having positive diagonal) for full-rank U, at a fraction of the
+// wall-clock cost for small r:
+//   1. sgemm:   M = U^T U              [r, r]   (cuBLAS, multi-SM)
+//   2. chol:    M = R^T R              [r, r]   (custom single-block serial)
+//   3. strsm:   U := U * R^(-1)        [m, r]   (cuBLAS, multi-SM)
+// Scratch: r*r float matrix + 1 int status.
+// Returns true on success; on Cholesky failure (non-PSD M), leaves d_U
+// untouched and the caller can fall back to classical GS.
+static bool gpu_cholqr_device(float* d_U, unsigned int m, unsigned int r,
+                              float* d_scratch_M,   // [r * r]
+                              int* d_scratch_status,
+                              int* host_status_buf,
+                              cudaStream_t /*stream (ignored, cuBLAS uses computeStream)*/)
+{
+	if (m == 0u || r == 0u) return true;
+
+	// Step 1: M = U^T U  [r, r]. ATB: M=r, N=r, K=m. A=U[m,r] lda=r; B=U[m,r] ldb=r.
+	if (!sgemm_rowmajor_atb(static_cast<int>(r), static_cast<int>(r), static_cast<int>(m),
+	                         1.0f, d_U, static_cast<int>(r), d_U, static_cast<int>(r),
+	                         0.0f, d_scratch_M, static_cast<int>(r)))
+		return false;
+
+	// Step 2: Cholesky on the r×r matrix (custom single-block, serial, tiny).
+	// Launch on computeStream so it is serialized with the cuBLAS call above.
+	k_cholesky_small_upper<<<1, 1, 0, glades::gpu::computeStream()>>>(
+	    d_scratch_M, r, d_scratch_status);
+
+	// Sync host status so we can fall back on failure. Host sync is 5-10us;
+	// still dominated by the compute savings vs classical MGS.
+	if (cudaMemcpy(host_status_buf, d_scratch_status, sizeof(int),
+	               cudaMemcpyDeviceToHost) != cudaSuccess)
+		return false;
+	if (*host_status_buf == 0)
+		return false;
+
+	// Step 3: Q = U * R^(-1). strsm: X * R = alpha * B where X overwrites B.
+	// With alpha=1, B = U on input → B = U * R^(-1) on output. Both B and R
+	// are upper triangular row-major. ldr = r, ldb = r.
+	if (!strsm_rowmajor_right_upper(static_cast<int>(m), static_cast<int>(r),
+	                                 1.0f, d_scratch_M, static_cast<int>(r),
+	                                 d_U, static_cast<int>(r)))
+		return false;
+	return true;
 }
 
 // ---------------- Public API ----------------
@@ -806,8 +897,17 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		k_form_raw<<<blocks, TPB>>>(state.U.data(), state.Omega_U.data(), lr,
 		                            state.URaw.data(), total);
 	}
-	if (!gpu_gramSchmidt_device(state.URaw.data(), m, r))
-		return false;
+	// CholQR for URaw; fall back to MGS on rank deficiency (rare in practice).
+	{
+		int hostStatus = 0;
+		if (!gpu_cholqr_device(state.URaw.data(), m, r,
+		                        state.UtOmU.data(), state.cholStatus.data(),
+		                        &hostStatus, 0))
+		{
+			if (!gpu_gramSchmidt_device(state.URaw.data(), m, r))
+				return false;
+		}
+	}
 
 
 	// Stiefel retraction on V: Omega_V = (I - V V^T) gW^T U diag(invExpEll_old).
@@ -832,8 +932,16 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		k_form_raw<<<blocks, TPB>>>(state.V.data(), state.Omega_V.data(), lr,
 		                            state.VRaw.data(), total);
 	}
-	if (!gpu_gramSchmidt_device(state.VRaw.data(), n, r))
-		return false;
+	{
+		int hostStatus = 0;
+		if (!gpu_cholqr_device(state.VRaw.data(), n, r,
+		                        state.VtOmV.data(), state.cholStatus.data(),
+		                        &hostStatus, 0))
+		{
+			if (!gpu_gramSchmidt_device(state.VRaw.data(), n, r))
+				return false;
+		}
+	}
 
 	// Step 5: recompute expEll with NEW ell (overwrites the expEll_old in
 	// state.expEll; saved copy in state.expEllPrev from step 2b).
@@ -935,9 +1043,10 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 	                    cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
 		return false;
 
-	// Step 8: trust-region clamp on host.
+	// Step 8: trust-region clamp on host. Reuses hostEll from step 6 (ell is
+	// not modified between step 6 and here, since the fused kernel reads
+	// expEll_new but doesn't write state.ell).
 	{
-		cudaMemcpy(&hostEll[0], state.ell.data(), r * sizeof(float), cudaMemcpyDeviceToHost);
 		float curMaxExpEll = expf(hostEll[0]);
 		for (unsigned int i = 1; i < r; ++i)
 		{
@@ -972,12 +1081,7 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		           cudaMemcpyHostToDevice);
 	}
 
-	// Step 10: zero gW.
-	{
-		const unsigned int total = static_cast<unsigned int>(mn);
-		const unsigned int blocks = (total + TPB - 1) / TPB;
-		k_zero<<<blocks, TPB>>>(d_gW, total);
-	}
+	// Step 10: gW zeroing is fused into k_vesta_fused_update (step 7).
 
 	// Restore per-step sync. Without it, downstream kernels race with our
 	// k_log_scale_update / k_apply_W_delta writes to state.ell and W; at

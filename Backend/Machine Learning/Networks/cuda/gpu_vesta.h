@@ -47,8 +47,9 @@ struct GpuVestaWeightState
 	GpuBuffer<float> invExpEll;  // [r]
 	GpuBuffer<float> expEllPrev; // [r] — saved before log_scale_update for fused reconstruct
 	GpuBuffer<float> Adiag;      // [r]
-	GpuBuffer<float> UtOmU;      // [r * r]
-	GpuBuffer<float> VtOmV;      // [r * r]
+	GpuBuffer<float> UtOmU;      // [r * r] — reused as CholQR scratch (R of U^T U)
+	GpuBuffer<float> VtOmV;      // [r * r] — reused as CholQR scratch (R of V^T V)
+	GpuBuffer<int>   cholStatus; // [1] — device int, 1=success 0=failure
 
 	// Sketch scratch (oversampled by 8).
 	GpuBuffer<float> sketchOmega; // [n * (r+8)]
