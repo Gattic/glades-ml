@@ -1690,13 +1690,35 @@ namespace {
 // exceeds the device's per-block max-opt-in shared memory.
 static constexpr int kFlashTile = 64;
 
+// One warp per block for flash attention kernels. All reductions are
+// warp-level via __shfl_down_sync — no __syncthreads in the inner j loop,
+// which is the dominant cost when T is large (T×T dot products). The
+// scalar softmax state is simply replicated across the 32 lanes.
+static constexpr int kFlashBlock = 32;
+
+// Warp-wide sum-reduction via shuffle. Broadcasts to all lanes.
+// No shared memory, no __syncthreads required.
+__device__ __forceinline__ float flash_warp_reduce_sum(float val)
+{
+	for (int o = 16; o > 0; o >>= 1)
+		val += __shfl_down_sync(0xffffffffu, val, o);
+	return __shfl_sync(0xffffffffu, val, 0);
+}
+
 // Forward kernel. One block per (query row, query head).
 // Shared memory layout:
-//   float sK[flashTile * dK]   -- tile of keys
-//   float sV[flashTile * dV]   -- tile of values
+//   float sK[flashTile * dHead]    -- tile of keys
+//   float sV[flashTile * dHead]    -- tile of values
+//   float sReduce[blockDim.x]      -- scratch for block-wide reductions
 // Passed as dynamic shared memory. `flashTile` is a runtime parameter so
 // the launcher can shrink it when `dHead * flashTile * 2 * sizeof(float)`
 // exceeds the device's shared-memory budget.
+//
+// Key optimization (2026-04): the Q·K dot product is now computed in parallel
+// across threads (each handles dHead/blockDim.x elements, then block-reduce).
+// Previously every thread redundantly computed the full dot product while
+// blockDim.x was coupled to flashTile (as small as 8 at dHead=1024). Decoupling
+// block size from flashTile lifts the effective parallelism from ~8 to 128.
 __global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q,
                                                      const float* __restrict__ K,
                                                      const float* __restrict__ V,
@@ -1720,16 +1742,17 @@ __global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q
 	const float* qRow = Q + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 	float* oRow = O + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 
-	// Online softmax state.
+	const int tid = threadIdx.x;
+
+	// Online softmax state (replicated across the 32 lanes; all see the same
+	// warp-reduced `dot` so they derive the same state).
 	float runMax = -FLT_MAX;
 	float runSum = 0.0f;
 
-	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+	for (int d = tid; d < dHead; d += blockDim.x)
 		oRow[d] = 0.0f;
-	__syncthreads();
 
 	const float scale = rsqrtf(static_cast<float>(dHead));
-
 	const int numTiles = (T + flashTile - 1) / flashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
@@ -1737,47 +1760,45 @@ __global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q
 		int tileLen = flashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
-		// Cooperatively load sK[tileLen, dHead] and sV[tileLen, dHead].
+		// Cooperatively load sK and sV (one warp striding over loadCount).
 		const int loadCount = tileLen * dHead;
-		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+		for (int i = tid; i < loadCount; i += blockDim.x) {
 			const int kr = i / dHead;
 			const int kd = i % dHead;
 			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
-		const int loadCountV = tileLen * dHead;
-		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
+		for (int i = tid; i < loadCount; i += blockDim.x) {
 			const int vr = i / dHead;
 			const int vd = i % dHead;
 			sV[i] = V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd];
 		}
-		__syncthreads();
+		__syncwarp();
 
 		for (int j = 0; j < tileLen; ++j) {
 			const int kIdx = kStart + j;
-
 			if (causal && kIdx > q) break;
 
-			float dot = 0.0f;
-			for (int d = 0; d < dHead; ++d)
-				dot += qRow[d] * sK[j * dHead + d];
-			dot *= scale;
+			// Warp-parallel Q·K dot product.
+			float partial = 0.0f;
+			for (int d = tid; d < dHead; d += blockDim.x)
+				partial += qRow[d] * sK[j * dHead + d];
+			const float dot = flash_warp_reduce_sum(partial) * scale;
 
+			// Scalar softmax state update (all 32 lanes compute identical values).
 			const float prevMax = runMax;
 			if (dot > runMax) runMax = dot;
 			const float exp_prev = expf(prevMax - runMax);
 			const float exp_cur  = expf(dot - runMax);
-
 			runSum = runSum * exp_prev + exp_cur;
 
-			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+			// Parallel O update (each lane writes a disjoint strip of d).
+			for (int d = tid; d < dHead; d += blockDim.x)
 				oRow[d] = oRow[d] * exp_prev + exp_cur * sV[j * dHead + d];
 		}
-
-		__syncthreads();
 	}
 
 	const float invSum = (runSum > 0.0f) ? (1.0f / runSum) : 0.0f;
-	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+	for (int d = tid; d < dHead; d += blockDim.x)
 		oRow[d] *= invSum;
 }
 
@@ -1812,12 +1833,13 @@ __global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q
 	const float* doRow = dO + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 	float* dqRow       = dQ + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 
+	const int tid = threadIdx.x;
 	const float scale = rsqrtf(static_cast<float>(dHead));
+	const int numTiles = (T + flashTile - 1) / flashTile;
 
+	// ---- Pass 1: compute runMax, runSum (=> logSumExp) with warp-parallel dot products.
 	float runMax = -FLT_MAX;
 	float runSum = 0.0f;
-
-	const int numTiles = (T + flashTile - 1) / flashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
 		const int kStart = tile * flashTile;
@@ -1825,85 +1847,88 @@ __global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
 		const int loadCount = tileLen * dHead;
-		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+		for (int i = tid; i < loadCount; i += blockDim.x) {
 			const int kr = i / dHead;
 			const int kd = i % dHead;
 			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
-		__syncthreads();
+		__syncwarp();
 
 		for (int j = 0; j < tileLen; ++j) {
 			const int kIdx = kStart + j;
 			if (causal && kIdx > q) break;
-			float dot = 0.0f;
-			for (int d = 0; d < dHead; ++d)
-				dot += qRow[d] * sK[j * dHead + d];
-			dot *= scale;
+			float partial = 0.0f;
+			for (int d = tid; d < dHead; d += blockDim.x)
+				partial += qRow[d] * sK[j * dHead + d];
+			const float dot = flash_warp_reduce_sum(partial) * scale;
 			if (dot > runMax) {
 				runSum = runSum * expf(runMax - dot);
 				runMax = dot;
 			}
 			runSum += expf(dot - runMax);
 		}
-		__syncthreads();
 	}
 
 	const float logSumExp = runMax + logf(runSum + 1e-20f);
 
-	float D = 0.0f;
-	for (int d = 0; d < dHead; ++d)
-		D += doRow[d] * oRow[d];
+	// ---- D = dO · O (warp reduce).
+	float Dpartial = 0.0f;
+	for (int d = tid; d < dHead; d += blockDim.x)
+		Dpartial += doRow[d] * oRow[d];
+	const float D = flash_warp_reduce_sum(Dpartial);
 
-	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+	for (int d = tid; d < dHead; d += blockDim.x)
 		dqRow[d] = 0.0f;
-	__syncthreads();
 
+	// ---- Pass 2: compute dQ (accumulate), dK/dV via atomic adds.
 	for (int tile = 0; tile < numTiles; ++tile) {
 		const int kStart = tile * flashTile;
 		int tileLen = flashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
 		const int loadCount = tileLen * dHead;
-		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+		for (int i = tid; i < loadCount; i += blockDim.x) {
 			const int kr = i / dHead;
 			const int kd = i % dHead;
 			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
-		const int loadCountV = tileLen * dHead;
-		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
+		for (int i = tid; i < loadCount; i += blockDim.x) {
 			const int vr = i / dHead;
 			const int vd = i % dHead;
 			sV[i] = V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd];
 		}
-		__syncthreads();
+		__syncwarp();
 
 		for (int j = 0; j < tileLen; ++j) {
 			const int kIdx = kStart + j;
 			if (causal && kIdx > q) break;
 
-			float dot = 0.0f;
-			for (int d = 0; d < dHead; ++d)
-				dot += qRow[d] * sK[j * dHead + d];
-			dot *= scale;
+			// Warp-parallel Q·K dot product.
+			float partialQK = 0.0f;
+			for (int d = tid; d < dHead; d += blockDim.x)
+				partialQK += qRow[d] * sK[j * dHead + d];
+			const float dot = flash_warp_reduce_sum(partialQK) * scale;
 			const float p = expf(dot - logSumExp);
 
-			float doV = 0.0f;
-			for (int d = 0; d < dHead; ++d)
-				doV += doRow[d] * sV[j * dHead + d];
+			// Warp-parallel dO·V dot product.
+			float partialDoV = 0.0f;
+			for (int d = tid; d < dHead; d += blockDim.x)
+				partialDoV += doRow[d] * sV[j * dHead + d];
+			const float doV = flash_warp_reduce_sum(partialDoV);
 			const float ds = p * (doV - D);
 
-			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+			// dQ accumulate (each lane writes a disjoint strip).
+			for (int d = tid; d < dHead; d += blockDim.x)
 				dqRow[d] += ds * scale * sK[j * dHead + d];
 
-			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+			// dK, dV atomically accumulated into global (many blocks target same kIdx).
+			for (int d = tid; d < dHead; d += blockDim.x)
 				atomicAdd(&dK_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
 				          ds * scale * qRow[d]);
-
-			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+			for (int d = tid; d < dHead; d += blockDim.x)
 				atomicAdd(&dV_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
 				          p * doRow[d]);
 		}
-		__syncthreads();
 	}
 }
 
@@ -1970,8 +1995,11 @@ bool flash_attention_multihead_forward(const float* Q, const float* K, const flo
 
 	const int flashTile = setup_flash_tile(flash_attention_fwd_multihead_kernel, dHead);
 
-	int block = flashTile;
-	if (block > kMaxBlockRow) block = kMaxBlockRow;
+	// Block = one warp (32 threads). Decoupled from flashTile: previously
+	// block was flashTile which was 8 at dHead=1024, starving parallelism.
+	// The cooperative load loops handle blockDim.x != flashTile via stride.
+	// Warp-level reduction avoids __syncthreads in the j loop.
+	const int block = kFlashBlock;
 
 	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
 	const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
@@ -1997,8 +2025,7 @@ bool flash_attention_multihead_backward(const float* Q, const float* K, const fl
 
 	const int flashTile = setup_flash_tile(flash_attention_bwd_multihead_kernel, dHead);
 
-	int block = flashTile;
-	if (block > kMaxBlockRow) block = kMaxBlockRow;
+	const int block = kFlashBlock;
 
 	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
 	const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
