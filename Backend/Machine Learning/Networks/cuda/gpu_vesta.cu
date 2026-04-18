@@ -185,6 +185,80 @@ __global__ void k_apply_W_delta_raw(float* W,
 	W[idx] += (WrNew[idx] - WrOld[idx]) - lrLambdaPerp * gPerp[idx];
 }
 
+// Fused reconstruct-and-update kernel.
+// For each (i, j):
+//   WrNew[i,j] = sum_k U_new[i,k] * expEll_new[k] * V_new[j,k]
+//   WrOld[i,j] = sum_k U_old[i,k] * expEll_old[k] * V_old[j,k]
+//   gPerp[i,j] = gW[i,j] - sum_k UA[i,k] * V_old[j,k]
+//   (if momentum) m[i,j] = beta*m + (1-beta)*gPerp
+//   cStep = sign(m) or m or sign(gPerp) or gPerp  based on variant
+//   W[i,j] += (WrNew - WrOld) - cScale * cStep
+//
+// Variants (compile-time via template parameters):
+//   UseMomentum (bool): whether to update/use the m[m*n] momentum buffer.
+//   UseSign (bool):     whether to sign() the complement step (Lion-style).
+//
+// Eliminates the three O(m*n) scratch buffers WrOld, WrNew, gPerp previously
+// materialized by three separate kernels; inner loop over k runs three fused
+// accumulators of length r.
+template <bool UseMomentum, bool UseSign>
+__global__ void k_vesta_fused_update(
+    float* __restrict__ W,
+    unsigned int m, unsigned int n, unsigned int r,
+    const float* __restrict__ U_old,
+    const float* __restrict__ V_old,
+    const float* __restrict__ expEll_old,
+    const float* __restrict__ U_new,
+    const float* __restrict__ V_new,
+    const float* __restrict__ expEll_new,
+    const float* __restrict__ UA,
+    const float* __restrict__ gW,
+    float* __restrict__ momentum,
+    float beta,
+    float cScale)
+{
+	const unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= m || j >= n) return;
+	const size_t idx = static_cast<size_t>(i) * n + j;
+
+	float accNew = 0.0f, accOld = 0.0f, accUAV = 0.0f;
+	#pragma unroll 8
+	for (unsigned int k = 0; k < r; ++k)
+	{
+		const float ek_new = expEll_new[k];
+		const float ek_old = expEll_old[k];
+		const float vj_new = V_new[j * r + k];
+		const float vj_old = V_old[j * r + k];
+		accNew += U_new[i * r + k] * ek_new * vj_new;
+		accOld += U_old[i * r + k] * ek_old * vj_old;
+		accUAV += UA[i * r + k] * vj_old;
+	}
+	const float delta = accNew - accOld;
+	const float gPerp = gW[idx] - accUAV;
+
+	float cStep;
+	if (UseMomentum)
+	{
+		float mi = momentum[idx];
+		mi = beta * mi + (1.0f - beta) * gPerp;
+		momentum[idx] = mi;
+		if (UseSign)
+			cStep = (mi > 0.0f) ? 1.0f : ((mi < 0.0f) ? -1.0f : 0.0f);
+		else
+			cStep = mi;
+	}
+	else
+	{
+		if (UseSign)
+			cStep = (gPerp > 0.0f) ? 1.0f : ((gPerp < 0.0f) ? -1.0f : 0.0f);
+		else
+			cStep = gPerp;
+	}
+
+	W[idx] += delta - cScale * cStep;
+}
+
 // Modified Gram-Schmidt for Q[m x r] stored row-major (Q[i*r + j] = row i, col j).
 // Runs as a single cooperative block. One thread per row (blockDim.x = min(m, 1024));
 // block-wide reduction for dot products and squared norms. This avoids the
@@ -340,15 +414,13 @@ static bool allocate_buffers(GpuVestaWeightState& s,
 	if (!alloc_or_check(s.ellStar, r)) return false;
 	if (!alloc_or_check(s.A, static_cast<size_t>(r) * r)) return false;
 	if (!alloc_or_check(s.UA, static_cast<size_t>(m) * r)) return false;
-	if (!alloc_or_check(s.WrOld, static_cast<size_t>(m) * n)) return false;
-	if (!alloc_or_check(s.WrNew, static_cast<size_t>(m) * n)) return false;
-	if (!alloc_or_check(s.gPerp, static_cast<size_t>(m) * n)) return false;
 	if (!alloc_or_check(s.Omega_U, static_cast<size_t>(m) * r)) return false;
 	if (!alloc_or_check(s.Omega_V, static_cast<size_t>(n) * r)) return false;
 	if (!alloc_or_check(s.URaw, static_cast<size_t>(m) * r)) return false;
 	if (!alloc_or_check(s.VRaw, static_cast<size_t>(n) * r)) return false;
 	if (!alloc_or_check(s.expEll, r)) return false;
 	if (!alloc_or_check(s.invExpEll, r)) return false;
+	if (!alloc_or_check(s.expEllPrev, r)) return false;
 	if (!alloc_or_check(s.Adiag, r)) return false;
 	if (!alloc_or_check(s.UtOmU, static_cast<size_t>(r) * r)) return false;
 	if (!alloc_or_check(s.VtOmV, static_cast<size_t>(r) * r)) return false;
@@ -681,14 +753,13 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		                          state.expEll.data(), state.invExpEll.data());
 	}
 
-	// Step 2b: reconstruct WrOld = U diag(exp(ell_old)) V^T.
-	{
-		const dim3 TPB2(16, 16);
-		const dim3 blocks((n + 15) / 16, (m + 15) / 16);
-		k_reconstruct_rank_block<<<blocks, TPB2>>>(state.WrOld.data(),
-		                                           state.U.data(), state.V.data(),
-		                                           state.expEll.data(), m, n, r);
-	}
+	// Step 2b: save expEll_old to expEllPrev (for fused reconstruct in step 7).
+	// state.expEll will be overwritten at step 5 with expEll_new. Runs on
+	// default stream so it is ordered with the k_exp_ell call at step 2a.
+	if (cudaMemcpyAsync(state.expEllPrev.data(), state.expEll.data(),
+	                    static_cast<size_t>(r) * sizeof(float),
+	                    cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
+		return false;
 
 	// Step 2c: Omega_U = gW * V  [m, r].
 	// This is both the tracked-space coefficient input AND (after scaling
@@ -702,17 +773,10 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 	                        0.0f, state.A.data(), r))
 		return false;
 
-	// Step 2e: g_perp = gW - (U * A) V^T.
-	// Compute UA = U * A into state.UA; used by form_gperp below.
+	// Step 2e: Compute UA = U * A (used in step 7's fused reconstruct-and-update).
 	if (!sgemm_rowmajor(m, r, r, 1.0f, state.U.data(), r, state.A.data(), r,
 	                    0.0f, state.UA.data(), r))
 		return false;
-	{
-		const dim3 TPB2(16, 16);
-		const dim3 blocks((n + 15) / 16, (m + 15) / 16);
-		k_form_gperp<<<blocks, TPB2>>>(d_gW, state.UA.data(), state.V.data(),
-		                               state.gPerp.data(), m, n, r);
-	}
 
 	// Step 3: Extract diag(A) → Adiag, then log-scale update + momentum.
 	{
@@ -725,8 +789,7 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 		                                   vc.ellMin, vc.ellMax, vc.phiDdFloor);
 	}
 
-	// Step 4: Stiefel QR retraction on U.
-	// Omega_U = (I - U U^T) gW V diag(invExpEll_old)  [m, r].
+	// Step 4: Stiefel QR retraction on U (URaw = U_new; do NOT commit yet).
 	// Omega_U already holds gW * V from step 2c. UtOmU = U^T * Omega_U = A
 	// (same computation as step 2d), so we reuse state.A for the projection.
 	{
@@ -749,7 +812,9 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 
 	// Stiefel retraction on V: Omega_V = (I - V V^T) gW^T U diag(invExpEll_old).
 	// VtOmV = V^T * Omega_V = V^T * gW^T * U = (U^T * gW * V)^T = A^T.
-	// Skip the VtOmV SGEMM and apply the A^T projection directly.
+	// Skip the VtOmV SGEMM and apply the A^T projection directly. VRaw = V_new
+	// (not committed yet — fused kernel below reads both U_old/V_old from
+	// state.U/state.V and U_new/V_new from state.URaw/state.VRaw).
 	if (!sgemm_rowmajor_atb(n, r, m, 1.0f, d_gW, n, state.U.data(), r,
 	                        0.0f, state.Omega_V.data(), r))
 		return false;
@@ -770,27 +835,12 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 	if (!gpu_gramSchmidt_device(state.VRaw.data(), n, r))
 		return false;
 
-	// Commit U = URaw, V = VRaw.
-	if (cudaMemcpy(state.U.data(), state.URaw.data(),
-	               static_cast<size_t>(m) * r * sizeof(float),
-	               cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
-	if (cudaMemcpy(state.V.data(), state.VRaw.data(),
-	               static_cast<size_t>(n) * r * sizeof(float),
-	               cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
-
-	// Step 5: recompute expEll with NEW ell.
+	// Step 5: recompute expEll with NEW ell (overwrites the expEll_old in
+	// state.expEll; saved copy in state.expEllPrev from step 2b).
 	{
 		const unsigned int blocks = (r + 63) / 64;
 		k_exp_ell<<<blocks, 64>>>(state.ell.data(), r,
 		                          state.expEll.data(), state.invExpEll.data());
-	}
-	// Reconstruct WrNew.
-	{
-		const dim3 TPB2(16, 16);
-		const dim3 blocks((n + 15) / 16, (m + 15) / 16);
-		k_reconstruct_rank_block<<<blocks, TPB2>>>(state.WrNew.data(),
-		                                           state.U.data(), state.V.data(),
-		                                           state.expEll.data(), m, n, r);
 	}
 
 	// Step 6: compute c_perp on host via tiny download.
@@ -803,10 +853,17 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 	const float cPerp = vc.lambdaPerp / (meanInvSigma > 1e-12f ? meanInvSigma : 1e-12f);
 	const float lrCperp = lr * cPerp;
 
-	// Step 7: apply combined tracked-block delta + complement step.
+	// Step 7: FUSED reconstruct-and-update.
+	// One kernel computes (WrNew - WrOld) - cScale * cStep inline, without
+	// materializing the O(m*n) scratch buffers WrOld/WrNew/gPerp.
+	//
+	//   U_old = state.U, V_old = state.V, expEll_old = state.expEllPrev
+	//   U_new = state.URaw, V_new = state.VRaw, expEll_new = state.expEll
+	//   UA    = state.UA (= U_old * A, from step 2e)
 	{
-		const unsigned int total = static_cast<unsigned int>(mn);
-		const unsigned int blocks = (total + TPB - 1) / TPB;
+		const dim3 TPB2(16, 16);
+		const dim3 blocks((n + 15) / 16, (m + 15) / 16);
+
 		if (vc.complementMomentumEnabled)
 		{
 			// Lazy-allocate and zero-init the momentum buffer on first use.
@@ -814,40 +871,69 @@ bool vesta_gpu_step(GpuVestaWeightState& state,
 			{
 				if (!state.complementMomentum.allocate(mn))
 					return false;
-				k_zero_f<<<blocks, TPB>>>(state.complementMomentum.data(), total);
+				const unsigned int zBlocks =
+				    (static_cast<unsigned int>(mn) + TPB - 1) / TPB;
+				k_zero_f<<<zBlocks, TPB>>>(state.complementMomentum.data(),
+				                           static_cast<unsigned int>(mn));
 			}
+
 			if (vc.complementUseSign)
 			{
-				k_apply_W_delta_mom_sign<<<blocks, TPB>>>(
-				    d_W, state.WrNew.data(), state.WrOld.data(),
-				    state.gPerp.data(), state.complementMomentum.data(),
-				    vc.complementBeta, lrCperp, total);
+				k_vesta_fused_update<true, true><<<blocks, TPB2>>>(
+				    d_W, m, n, r,
+				    state.U.data(), state.V.data(), state.expEllPrev.data(),
+				    state.URaw.data(), state.VRaw.data(), state.expEll.data(),
+				    state.UA.data(), d_gW,
+				    state.complementMomentum.data(),
+				    vc.complementBeta, lrCperp);
 			}
 			else
 			{
-				// Raw heavy-ball: scale by lr * lambdaPerp (c_perp not used
-				// here — m already carries magnitude from the gradient EMA).
-				k_apply_W_delta_mom_raw<<<blocks, TPB>>>(
-				    d_W, state.WrNew.data(), state.WrOld.data(),
-				    state.gPerp.data(), state.complementMomentum.data(),
-				    vc.complementBeta, lr * vc.lambdaPerp, total);
+				k_vesta_fused_update<true, false><<<blocks, TPB2>>>(
+				    d_W, m, n, r,
+				    state.U.data(), state.V.data(), state.expEllPrev.data(),
+				    state.URaw.data(), state.VRaw.data(), state.expEll.data(),
+				    state.UA.data(), d_gW,
+				    state.complementMomentum.data(),
+				    vc.complementBeta, lr * vc.lambdaPerp);
 			}
 		}
 		else
 		{
 			if (vc.complementUseSign)
 			{
-				k_apply_W_delta<<<blocks, TPB>>>(d_W, state.WrNew.data(), state.WrOld.data(),
-				                                 state.gPerp.data(), lrCperp, total);
+				k_vesta_fused_update<false, true><<<blocks, TPB2>>>(
+				    d_W, m, n, r,
+				    state.U.data(), state.V.data(), state.expEllPrev.data(),
+				    state.URaw.data(), state.VRaw.data(), state.expEll.data(),
+				    state.UA.data(), d_gW,
+				    /*momentum=*/static_cast<float*>(0),
+				    /*beta=*/0.0f, lrCperp);
 			}
 			else
 			{
-				// Stateless raw path: lr * lp * g_perp. Memory-frontier config.
-				k_apply_W_delta_raw<<<blocks, TPB>>>(d_W, state.WrNew.data(), state.WrOld.data(),
-				                                     state.gPerp.data(), lr * vc.lambdaPerp, total);
+				k_vesta_fused_update<false, false><<<blocks, TPB2>>>(
+				    d_W, m, n, r,
+				    state.U.data(), state.V.data(), state.expEllPrev.data(),
+				    state.URaw.data(), state.VRaw.data(), state.expEll.data(),
+				    state.UA.data(), d_gW,
+				    /*momentum=*/static_cast<float*>(0),
+				    /*beta=*/0.0f, lr * vc.lambdaPerp);
 			}
 		}
 	}
+
+	// Commit U = URaw, V = VRaw AFTER the fused update (which read old values).
+	// Runs on default stream so it is ordered with the fused kernel above
+	// and with subsequent custom kernels (clamp, next step's k_exp_ell).
+	if (cudaMemcpyAsync(state.U.data(), state.URaw.data(),
+	                    static_cast<size_t>(m) * r * sizeof(float),
+	                    cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
+		return false;
+	if (cudaMemcpyAsync(state.V.data(), state.VRaw.data(),
+	                    static_cast<size_t>(n) * r * sizeof(float),
+	                    cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
+		return false;
 
 	// Step 8: trust-region clamp on host.
 	{

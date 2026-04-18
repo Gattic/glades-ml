@@ -39,15 +39,13 @@ struct GpuVestaWeightState
 	// Scratch buffers.
 	GpuBuffer<float> A;          // [r * r]
 	GpuBuffer<float> UA;         // [m * r]
-	GpuBuffer<float> WrOld;      // [m * n]
-	GpuBuffer<float> WrNew;      // [m * n]
-	GpuBuffer<float> gPerp;      // [m * n]
 	GpuBuffer<float> Omega_U;    // [m * r]
 	GpuBuffer<float> Omega_V;    // [n * r]
 	GpuBuffer<float> URaw;       // [m * r]
 	GpuBuffer<float> VRaw;       // [n * r]
 	GpuBuffer<float> expEll;     // [r]
 	GpuBuffer<float> invExpEll;  // [r]
+	GpuBuffer<float> expEllPrev; // [r] — saved before log_scale_update for fused reconstruct
 	GpuBuffer<float> Adiag;      // [r]
 	GpuBuffer<float> UtOmU;      // [r * r]
 	GpuBuffer<float> VtOmV;      // [r * r]
