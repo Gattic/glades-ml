@@ -227,6 +227,8 @@ int main(int argc, char* argv[])
 		VESTASweepSameMemory();
 	    else if (strcmp(argv[1], "vesta-sweep-rank") == 0)
 		VESTASweepRankAtScale();
+	    else if (strcmp(argv[1], "vesta-sweep-ultra") == 0)
+		VESTASweepScaleUltra();
 	    else if (strcmp(argv[1], "vesta-refresh-bench") == 0)
 		VESTAGpuRefreshBenchmark();
 	    else if (strcmp(argv[1], "fft") == 0)

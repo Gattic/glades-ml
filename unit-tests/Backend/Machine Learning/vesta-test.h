@@ -56,6 +56,7 @@ void VESTASweepLpAtScale();
 void VESTASweepLongHorizonSchedule();
 void VESTASweepSameMemory();
 void VESTASweepRankAtScale();
+void VESTASweepScaleUltra();
 void VESTAUnitTest();
 
 #endif
