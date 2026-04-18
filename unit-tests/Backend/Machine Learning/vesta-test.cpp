@@ -2850,6 +2850,95 @@ void VESTASweepSameMemory()
 #endif
 }
 
+// Rank sweep at dModel=2048. Higher r has two effects: (a) more spectral
+// structure captured (better NLL) and (b) larger inner dim for the SGEMMs,
+// which may improve tensor-core utilization (faster wall-clock).
+void VESTASweepRankAtScale()
+{
+	printf("\n============================================================\n");
+	printf("VESTA rank sweep at dModel=2048, 50 epochs (GPU)\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	const unsigned int vocab = 29u;
+	const unsigned int dModel = 2048u;
+	const unsigned int dFF = 2u * dModel;
+	const unsigned int nLayers = 4u;
+	const unsigned int nHeads = 4u;
+	const unsigned int epochs = 50u;
+	const unsigned int corpusLen = 512u;
+	const float lr = 1e-2f;
+	const unsigned int seeds[] = { 101u, 202u, 303u };
+	const unsigned int nSeeds = sizeof(seeds) / sizeof(seeds[0]);
+
+	// AdamW reference.
+	RunSpec adam;
+	adam.optType = glades::OptimizerConfig::ADAMW;
+	adam.label = "AdamW";
+	adam.vocab = vocab; adam.dModel = dModel; adam.dFF = dFF;
+	adam.nLayers = nLayers; adam.nHeads = nHeads;
+	adam.epochs = epochs; adam.corpusLen = corpusLen;
+	adam.learningRate = lr;
+	adam.useGpu = true;
+	std::vector<float> at, ae, aw;
+	for (unsigned int k = 0; k < nSeeds; ++k)
+	{
+		const SweepResult r = run_one(adam, seeds[k]);
+		if (r.ok) { at.push_back(r.finalTrainNll); ae.push_back(r.finalTestNll); aw.push_back(static_cast<float>(r.wallSec)); }
+	}
+	const AggStats adamE = aggregate(ae);
+	printf("AdamW reference: testNLL = %.4f +/- %.4f  wall %.1f s\n\n",
+	       adamE.mean, adamE.stddev, aggregate(aw).mean);
+
+	printf("%-10s  %-4s  %-20s  %-20s  %-10s  %-10s\n",
+	       "rank", "n", "trainNLL", "testNLL", "wall(s)", "opt MiB");
+	printf("%-10s  %-4s  %-20s  %-20s  %-10s  %-10s\n",
+	       "----", "---", "--------------------", "--------------------", "----------", "-------");
+
+	const unsigned int ranks[] = { 4u, 8u, 16u, 32u, 64u };
+	const unsigned int nRanks = sizeof(ranks) / sizeof(ranks[0]);
+	for (unsigned int ri = 0; ri < nRanks; ++ri)
+	{
+		RunSpec s;
+		s.optType = glades::OptimizerConfig::VESTA;
+		s.label = "VESTA-plain-raw";
+		s.vocab = vocab; s.dModel = dModel; s.dFF = dFF;
+		s.nLayers = nLayers; s.nHeads = nHeads;
+		s.epochs = epochs; s.corpusLen = corpusLen;
+		s.learningRate = lr;
+		s.useGpu = true;
+		s.vestaRank = ranks[ri];
+		s.vestaTSk = 16u;
+		s.vestaLambdaPerp = 0.1f;
+		s.vestaComplementMomentum = false;
+		s.vestaComplementUseSign = false;
+		std::vector<float> tr, te, wA;
+		for (unsigned int k = 0; k < nSeeds; ++k)
+		{
+			const SweepResult r = run_one(s, seeds[k]);
+			if (r.ok) { tr.push_back(r.finalTrainNll); te.push_back(r.finalTestNll); wA.push_back(static_cast<float>(r.wallSec)); }
+		}
+		const AggStats tA = aggregate(tr), te2 = aggregate(te), wA2 = aggregate(wA);
+		const double optMiB = 224.0 * dModel * ranks[ri] / (1024.0 * 1024.0);
+		printf("r=%-8u  %-4u  %7.4f +/- %-8.4f  %7.4f +/- %-8.4f  %5.1f +/- %-5.1f  %-10.2f\n",
+		       ranks[ri], (unsigned int)tr.size(),
+		       tA.mean, tA.stddev, te2.mean, te2.stddev, wA2.mean, wA2.stddev,
+		       optMiB);
+	}
+#endif
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();

@@ -225,6 +225,8 @@ int main(int argc, char* argv[])
 		VESTASweepLongHorizonSchedule();
 	    else if (strcmp(argv[1], "vesta-sweep-same-mem") == 0)
 		VESTASweepSameMemory();
+	    else if (strcmp(argv[1], "vesta-sweep-rank") == 0)
+		VESTASweepRankAtScale();
 	    else if (strcmp(argv[1], "fft") == 0)
 		FFTUnitTest();
 	    else if (strcmp(argv[1], "fisher") == 0)

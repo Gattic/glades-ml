@@ -52,6 +52,7 @@ void VESTASweepScaleGpu();
 void VESTASweepLpAtScale();
 void VESTASweepLongHorizonSchedule();
 void VESTASweepSameMemory();
+void VESTASweepRankAtScale();
 void VESTAUnitTest();
 
 #endif
