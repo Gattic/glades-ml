@@ -35,6 +35,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_vesta.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -950,6 +951,69 @@ void VESTAGpuStepBenchmark()
 // Microbenchmark: time N refreshes at a realistic-scale weight matrix
 // (m=n=dModel, rank=8), reporting host-path vs device-path wall-clock.
 // This quantifies the speedup of the on-device sketched-SVD refresh.
+// GPU BF16 <-> FP32 round-trip test. Validates the cast kernel primitives
+// are correct at device-level before building BF16 weight-storage on top.
+// Exact round-trip for BF16-representable values; mantissa-truncated for
+// others (matches the host float_to_bf16_rn semantics in transformer_kernels.h).
+void VESTAGpuBf16CastTest()
+{
+	printf("[vesta] GpuBf16CastTest\n");
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+
+	// Build a test vector with: BF16-exact values, non-representable values,
+	// zeros, small, large, negatives.
+	std::vector<float> src;
+	const float exactVals[] = { 0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 100.0f, -100.0f, 2.0f, 4.0f };
+	for (unsigned int i = 0; i < sizeof(exactVals) / sizeof(exactVals[0]); ++i)
+		src.push_back(exactVals[i]);
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xBF16ULL);
+	for (int i = 0; i < 512; ++i)
+		src.push_back(static_cast<float>(glades::rng::standard_normal(eng)));
+	const size_t n = src.size();
+
+	glades::gpu::GpuBuffer<float> dSrc, dOut;
+	glades::gpu::GpuBuffer<uint16_t> dBf16;
+	ASSERT("alloc src", dSrc.allocate(n));
+	ASSERT("alloc bf16", dBf16.allocate(n));
+	ASSERT("alloc out", dOut.allocate(n));
+	ASSERT("upload src", dSrc.upload(&src[0], n));
+
+	ASSERT("cast f32->bf16", glades::gpu::cast_f32_to_bf16(dSrc.data(), dBf16.data(), n));
+	ASSERT("cast bf16->f32", glades::gpu::cast_bf16_to_f32(dBf16.data(), dOut.data(), n));
+
+	std::vector<float> out(n, 0.0f);
+	ASSERT("download out", dOut.download(&out[0], n));
+
+	// Exact values: no rounding error expected.
+	const unsigned int nExact = sizeof(exactVals) / sizeof(exactVals[0]);
+	float maxExactErr = 0.0f;
+	for (unsigned int i = 0; i < nExact; ++i)
+	{
+		const float err = fabsf(out[i] - src[i]);
+		if (err > maxExactErr) maxExactErr = err;
+	}
+	ASSERT("BF16-exact values round-trip exactly", maxExactErr == 0.0f);
+
+	// General values: BF16 has ~3 decimal digits precision. 1e-2 relative is conservative.
+	float maxRelErr = 0.0f;
+	for (size_t i = nExact; i < n; ++i)
+	{
+		const float denom = fabsf(src[i]) > 1e-6f ? fabsf(src[i]) : 1.0f;
+		const float rel = fabsf(out[i] - src[i]) / denom;
+		if (rel > maxRelErr) maxRelErr = rel;
+	}
+	printf("  exact maxErr=%.3g  general maxRelErr=%.3g\n", maxExactErr, maxRelErr);
+	ASSERT("BF16 general round-trip <1%% relative error", maxRelErr < 0.01f);
+}
+
 void VESTAGpuRefreshBenchmark()
 {
 	printf("[vesta] GpuRefreshBenchmark\n");
@@ -1045,6 +1109,11 @@ void VESTAGpuRefreshDeviceTest()
 void VESTAGpuSingleRefreshTest()
 {
 	printf("[vesta] GpuSingleRefreshTest: CUDA not compiled; skipping\n");
+}
+
+void VESTAGpuBf16CastTest()
+{
+	printf("[vesta] GpuBf16CastTest: CUDA not compiled; skipping\n");
 }
 
 void VESTAGpuRefreshBenchmark()
@@ -3622,6 +3691,7 @@ void VESTAUnitTest()
 	VESTAGpuParityMomentumTest();
 	VESTAGpuSingleRefreshTest();
 	VESTAGpuRefreshDeviceTest();
+	VESTAGpuBf16CastTest();
 	VESTAComplementMomentumTest();
 	VESTATrackedEmaTest();
 	VESTAGradientBasisTest();
