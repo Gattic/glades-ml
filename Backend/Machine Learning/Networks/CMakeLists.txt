@@ -19,6 +19,7 @@ set(Networks_src_files
 	transformer_train_detail.cpp
 	atlas_optimizer.cpp
 	vesta_optimizer.cpp
+	helios_optimizer.cpp
 	glades_thread_pool.cpp
 	transformer_infer.cpp
 	transformer_generate.cpp

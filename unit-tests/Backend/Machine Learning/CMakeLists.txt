@@ -32,6 +32,7 @@ atlas-test.cpp
 atlas-bench.cpp
 atlas-alt-bench.cpp
 vesta-test.cpp
+helios-test.cpp
 sfcka-test.cpp
 simd-parity-test.cpp
 sampling-test.cpp

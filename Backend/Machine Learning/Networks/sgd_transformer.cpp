@@ -1115,10 +1115,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	// - Full softmax is guarded to avoid silently allocating/computing O(T*vocab) buffers.
 	if (tokenLM && isTrain && (trainingConfig.optimizer.type != glades::OptimizerConfig::ADAMW)
 	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::ATLAS)
-	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::VESTA))
+	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::VESTA)
+	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::HELIOS))
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-		                            "SGDHelper_TRANSFORMER: token LM training requires optimizer=ADAMW, ATLAS, or VESTA for LLM-scale stability");
+		                            "SGDHelper_TRANSFORMER: token LM training requires optimizer=ADAMW, ATLAS, VESTA, or HELIOS for LLM-scale stability");
 		storeRunningFlag(false);
 		return;
 	}
@@ -1231,6 +1232,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			const bool useAdamW = (net.trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW);
 			const bool useAtlas = (net.trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 			const bool useVesta = (net.trainingConfig.optimizer.type == glades::OptimizerConfig::VESTA);
+			const bool useHelios = (net.trainingConfig.optimizer.type == glades::OptimizerConfig::HELIOS);
 			// Token LM mode uses a tied embedding head: logits = H * E^T + lmBias.
 			// In this mode, the generic output projection (WOut/bOut) is UNUSED and must not:
 			// - contribute to global grad-norm clipping (via weight decay terms), or
@@ -6012,6 +6014,165 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 					std::fill(tt.gBOut.begin(), tt.gBOut.end(), 0.0f);
 				}
 			}
+			else if (useHelios)
+			{
+				// HELIOS: Hamiltonian Ensemble Langevin Integrator with
+				// Sharpness-adaptive Thermostat. BAOAB stochastic-symplectic
+				// integration of the underdamped Langevin-Nose-Hoover SDE.
+				const glades::HeliosConfig& hc = net.trainingConfig.helios;
+
+				tt.optimizerStep += 1ULL;
+
+				const unsigned int dmTT = tt.dModel;
+				const unsigned int dFFTT = tt.dFF;
+				const unsigned int nHeadsTT = tt.nHeads;
+				const unsigned int nKVHeadsTT = (tt.nKVHeads > 0u ? tt.nKVHeads : nHeadsTT);
+				const unsigned int dHeadTT = dmTT / nHeadsTT;
+				const unsigned int dModelKVTT = nKVHeadsTT * dHeadTT;
+				const unsigned int ffnKindTT = tt.ffnKind;
+				const unsigned int ff1WidthTT = (ffnKindTT == static_cast<unsigned int>(glades::TransformerRunConfig::FFN_SWIGLU)) ? (2u * dFFTT) : dFFTT;
+
+				if (tt.tokenModel)
+				{
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(0u);
+					const float wd2 = net.skeleton->getWeightDecay2(0u);
+					if (!helios::update(tt.heliosTokE, &tt.tokE[0], &tt.gTokE[0],
+					                    tt.vocabSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
+					                    hc, net.rngEngine, net.getLogger(), "tr.tokE"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS tokE update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+					if (!atlas::updateBias(&tt.lmBias[0], &tt.gLmBias[0],
+					                       static_cast<unsigned int>(tt.lmBias.size()),
+					                       invBatch, lr, gradScale))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS lmBias update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+				}
+
+				{
+					const float lr = net.skeleton->getLearningRate(0u) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(0u);
+					const float wd2 = net.skeleton->getWeightDecay2(0u);
+					if (!helios::update(tt.heliosWIn, &tt.WIn[0], &tt.gWIn[0],
+					                    dmTT, tt.inputSize, invBatch, lr, wd1, wd2, gradScale,
+					                    hc, net.rngEngine, net.getLogger(), "tr.WIn"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS WIn update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+					if (!atlas::updateBias(&tt.bIn[0], &tt.gBIn[0],
+					                       static_cast<unsigned int>(tt.bIn.size()),
+					                       invBatch, lr, gradScale))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS bIn update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+				}
+
+				for (unsigned int li = 0; li < nLayers; ++li)
+				{
+					const unsigned int idx = li + 1u;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(idx);
+					const float wd2 = net.skeleton->getWeightDecay2(idx);
+					TensorTransformerState::Block& b = tt.blocks[li];
+
+					if (!helios::update(b.heliosWq, &b.Wq[0], &b.gWq[0], dmTT, dmTT,
+					                    invBatch, lr, wd1, wd2, gradScale, hc, net.rngEngine, net.getLogger(), "tr.Wq")
+					    || !helios::update(b.heliosWk, &b.Wk[0], &b.gWk[0], dModelKVTT, dmTT,
+					                       invBatch, lr, wd1, wd2, gradScale, hc, net.rngEngine, net.getLogger(), "tr.Wk")
+					    || !helios::update(b.heliosWv, &b.Wv[0], &b.gWv[0], dModelKVTT, dmTT,
+					                       invBatch, lr, wd1, wd2, gradScale, hc, net.rngEngine, net.getLogger(), "tr.Wv")
+					    || !helios::update(b.heliosWo, &b.Wo[0], &b.gWo[0], dmTT, dmTT,
+					                       invBatch, lr, wd1, wd2, gradScale, hc, net.rngEngine, net.getLogger(), "tr.Wo")
+					    || !helios::update(b.heliosW1, &b.W1[0], &b.gW1[0], ff1WidthTT, dmTT,
+					                       invBatch, lr, wd1, wd2, gradScale, hc, net.rngEngine, net.getLogger(), "tr.W1")
+					    || !helios::update(b.heliosW2, &b.W2[0], &b.gW2[0], dmTT, dFFTT,
+					                       invBatch, lr, wd1, wd2, gradScale, hc, net.rngEngine, net.getLogger(), "tr.W2"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS block weight update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+
+					if (!atlas::updateBias(&b.bq[0], &b.gBq[0], static_cast<unsigned int>(b.bq.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.bk[0], &b.gBk[0], static_cast<unsigned int>(b.bk.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.bv[0], &b.gBv[0], static_cast<unsigned int>(b.bv.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.bo[0], &b.gBo[0], static_cast<unsigned int>(b.bo.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.b1[0], &b.gB1[0], static_cast<unsigned int>(b.b1.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.b2[0], &b.gB2[0], static_cast<unsigned int>(b.b2.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln1Gamma[0], &b.gLn1Gamma[0], static_cast<unsigned int>(b.ln1Gamma.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln1Beta[0], &b.gLn1Beta[0], static_cast<unsigned int>(b.ln1Beta.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln2Gamma[0], &b.gLn2Gamma[0], static_cast<unsigned int>(b.ln2Gamma.size()), invBatch, lr, gradScale)
+					    || !atlas::updateBias(&b.ln2Beta[0], &b.gLn2Beta[0], static_cast<unsigned int>(b.ln2Beta.size()), invBatch, lr, gradScale))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS block bias/LN update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+				}
+
+				{
+					const float lr = net.skeleton->getLearningRate(1u) * net.lrScheduleMultiplier * extraLRMult;
+					if (!atlas::updateBias(&tt.lnFinalGamma[0], &tt.gLnFinalGamma[0],
+					                       static_cast<unsigned int>(tt.lnFinalGamma.size()),
+					                       invBatch, lr, gradScale)
+					    || !atlas::updateBias(&tt.lnFinalBeta[0], &tt.gLnFinalBeta[0],
+					                          static_cast<unsigned int>(tt.lnFinalBeta.size()),
+					                          invBatch, lr, gradScale))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS lnFinal update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+				}
+
+				if (!tokenLMTiedHead)
+				{
+					const unsigned int idx = nLayers;
+					const float lr = net.skeleton->getLearningRate(idx) * net.lrScheduleMultiplier * extraLRMult;
+					const float wd1 = net.skeleton->getWeightDecay1(idx);
+					const float wd2 = net.skeleton->getWeightDecay2(idx);
+					if (!helios::update(tt.heliosWOut, &tt.WOut[0], &tt.gWOut[0],
+					                    outSize, dmTT, invBatch, lr, wd1, wd2, gradScale,
+					                    hc, net.rngEngine, net.getLogger(), "tr.WOut"))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS WOut update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+					if (!atlas::updateBias(&tt.bOut[0], &tt.gBOut[0],
+					                       static_cast<unsigned int>(tt.bOut.size()),
+					                       invBatch, lr, gradScale))
+					{
+						net.lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+							"SGDHelper_Transformer: HELIOS bOut update produced NaN/Inf");
+						net.storeRunningFlag(false);
+						return false;
+					}
+				}
+				else
+				{
+					std::fill(tt.gWOut.begin(), tt.gWOut.end(), 0.0f);
+					std::fill(tt.gBOut.begin(), tt.gBOut.end(), 0.0f);
+				}
+			}
 			else
 			{
 				// AdamW (recommended for transformers).
@@ -9228,18 +9389,29 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				append_logfmt_kv(oss, "targets_per_sec", tokPerSec);
 				if (tokenLM)
 				{
-					append_logfmt_kv(oss, "token_lm_loss_kind", std::string("full_softmax"));
+					const bool tokenLmFullSoftmax =
+					    (cfg.tokenLmLossKind == glades::TransformerRunConfig::TOKEN_LM_FULL_SOFTMAX);
+					append_logfmt_kv(oss, "token_lm_loss_kind",
+					                 std::string(tokenLmFullSoftmax ? "full_softmax" : "sampled_softmax"));
 					append_logfmt_kv(oss, "nll", meanNll);
-					double ppl = 0.0;
-					if (tokenLmTokenCount > 0ULL)
+					if (tokenLmFullSoftmax)
 					{
-						double arg = meanNll;
-						if (arg > 80.0) arg = 80.0;
-						if (arg < -80.0) arg = -80.0;
-						ppl = exp(arg);
+						double ppl = 0.0;
+						if (tokenLmTokenCount > 0ULL)
+						{
+							double arg = meanNll;
+							if (arg > 80.0) arg = 80.0;
+							if (arg < -80.0) arg = -80.0;
+							ppl = exp(arg);
+						}
+						append_logfmt_kv(oss, "perplexity", ppl);
+						append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
 					}
-					append_logfmt_kv(oss, "perplexity", ppl);
-					append_logfmt_kv(oss, "acc_top1", (clsTotal > 0ULL) ? (100.0 * static_cast<double>(clsCorrect) / static_cast<double>(clsTotal)) : 0.0);
+					else
+					{
+						append_logfmt_kv(oss, "perplexity", std::string("na"));
+						append_logfmt_kv(oss, "acc_top1", std::string("na"));
+					}
 				}
 				else
 				{

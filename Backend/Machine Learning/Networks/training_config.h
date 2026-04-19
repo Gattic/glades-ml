@@ -373,7 +373,8 @@ struct OptimizerConfig
 		SGD_MOMENTUM = 0,
 		ADAMW = 1,
 		ATLAS = 2,
-		VESTA = 3
+		VESTA = 3,
+		HELIOS = 4
 	};
 
 	Type type;
@@ -1836,6 +1837,86 @@ struct VestaConfig
 	}
 };
 
+// HELIOS optimizer configuration (Hamiltonian Ensemble Langevin Integrator with
+// Sharpness-adaptive Thermostat).
+//
+// HELIOS discretizes an underdamped Langevin-Nose-Hoover SDE with the BAOAB
+// stochastic-symplectic splitting. Minimum viable instantiation uses a scalar
+// global temperature, a single thermostat variable, no sharpness feedback, and
+// no anchor regularizer. The full design (per-group T, sharpness probe,
+// anchor EMA, Li-Sato-Tan noise correction) is described in
+// research/HELIOS_framework.md.
+//
+// Per-weight-matrix state: momentum p [m*n] (and optional anchor thetaBar [m*n]).
+// Per-group scalar state: {xi, T, kappa, m_mass}.
+struct HeliosConfig
+{
+	// Step size h. Used only inside the integrator (the outer learning-rate
+	// schedule still multiplies it). Default 1.0 so that `lr` passed to
+	// applyStep acts as the effective step.
+	float h;
+
+	// Base friction floor gamma_0 (>= 0). The effective per-parameter friction
+	// is Gamma = gamma_0 + xi + alpha * kappa. Default 0.1.
+	float gamma0;
+
+	// Target temperature T_0. Sets the invariant-measure scale: at static T,
+	// the theta-marginal is prop. exp(-U(theta)/T). Default 1e-4.
+	// For deterministic descent behavior set to 0.
+	float T0;
+
+	// Scalar group mass m (units of mass). Momentum has kinetic energy
+	// (1/2) * ||p||^2 / m, so effective step on theta is (h/m) * p. Default 1.0.
+	float mass;
+
+	// Nose-Hoover thermostat inertia Q. Standard tuning gives Q = N * T /
+	// omega_xi^2 with omega_xi ~ 1/(10 h) (i.e. xi relaxes ~10 steps).
+	// When 0, thermostat is disabled (pure underdamped Langevin). Default 0.
+	float Q;
+
+	// Sharpness feedback coefficient alpha (>= 0). Scales the contribution of
+	// kappa to Gamma. Set 0 to disable (minimum viable instantiation). Default 0.
+	float alpha;
+
+	// Upper clamp on the sharpness probe kappa_g (prevents runaway friction).
+	// Only used when alpha > 0. Default 1e4.
+	float kappaMax;
+
+	// Sharpness probe refresh period K_hvp (one HVP per K_hvp steps, round-
+	// robined across groups when per-group is enabled). 0 disables HVP
+	// probing entirely (kappa stays at 0 and alpha is effectively ignored).
+	// Default 0 (off in minimum viable instantiation).
+	unsigned int kHvp;
+
+	// Anchor EMA decay beta_a. theta_bar <- beta_a * theta_bar + (1-beta_a) * theta.
+	// Anchor penalty in U is (lambda_a/2) * ||theta - theta_bar||^2. When
+	// lambda_a == 0 the anchor is disabled and theta_bar is not allocated.
+	// Defaults: beta_a = 0.999, lambda_a = 0 (off).
+	float betaAnchor;
+	float lambdaAnchor;
+
+	// Li-Sato-Tan noise-temperature correction: T_eff = T0 + (h/4) *
+	// tr(Sigma_B) / N, where tr(Sigma_B) is the mini-batch gradient noise
+	// covariance trace. 0 disables the correction. Default 0 (off in minimum
+	// viable instantiation).
+	float noiseCorrection;
+
+	HeliosConfig()
+	    : h(1.0f),
+	      gamma0(0.1f),
+	      T0(1e-4f),
+	      mass(1.0f),
+	      Q(0.0f),
+	      alpha(0.0f),
+	      kappaMax(1e4f),
+	      kHvp(0u),
+	      betaAnchor(0.999f),
+	      lambdaAnchor(0.0f),
+	      noiseCorrection(0.0f)
+	{
+	}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -1864,6 +1945,9 @@ struct TrainingConfig
 
 	// VESTA optimizer configuration (used when optimizer.type==VESTA).
 	VestaConfig vesta;
+
+	// HELIOS optimizer configuration (used when optimizer.type==HELIOS).
+	HeliosConfig helios;
 
 	// Learning rate schedule multiplier configuration.
 	LearningRateScheduleConfig lrSchedule;

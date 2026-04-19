@@ -43,6 +43,7 @@
 #include "Backend/Machine Learning/atlas-bench.h"
 #include "Backend/Machine Learning/atlas-alt-bench.h"
 #include "Backend/Machine Learning/vesta-test.h"
+#include "Backend/Machine Learning/helios-test.h"
 #include "Backend/Machine Learning/sfcka-test.h"
 #include "Backend/Machine Learning/transformer-gradient-test.h"
 #include "Backend/Machine Learning/simd-parity-test.h"
@@ -199,6 +200,8 @@ int main(int argc, char* argv[])
 		ATLASAltBenchmark(argc, argv);
 	    else if (strcmp(argv[1], "vesta") == 0)
 		VESTAUnitTest();
+	    else if (strcmp(argv[1], "helios") == 0)
+		HELIOSUnitTest();
 	    else if (strcmp(argv[1], "vesta-sweep") == 0)
 		VESTASweepBenchmark();
 	    else if (strcmp(argv[1], "vesta-sweep-v2") == 0)

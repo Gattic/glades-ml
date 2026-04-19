@@ -137,6 +137,8 @@
 			atlas::MuonWeightState muonW1, muonW2;
 			vesta::WeightState vestaWq, vestaWk, vestaWv, vestaWo;
 			vesta::WeightState vestaW1, vestaW2;
+			helios::WeightState heliosWq, heliosWk, heliosWv, heliosWo;
+			helios::WeightState heliosW1, heliosW2;
 		};
 
 		std::vector<Block> blocks;
@@ -172,6 +174,9 @@
 		vesta::WeightState vestaWIn;
 		vesta::WeightState vestaWOut;
 		vesta::WeightState vestaTokE;
+		helios::WeightState heliosWIn;
+		helios::WeightState heliosWOut;
+		helios::WeightState heliosTokE;
 
 		// Benchmark-only grouped optimizer-gap diagnostics. These stay at the
 		// top level so AdamW and plain ATLAS-BSRP runs can report the same
