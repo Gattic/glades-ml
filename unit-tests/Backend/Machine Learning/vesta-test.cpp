@@ -3553,6 +3553,61 @@ void VESTAProfileBench()
 #endif
 }
 
+// Long-context profile target. Same dModel/nLayers as vesta-profile-bench
+// but with T=2048 tokens to shift the attention fraction of wall-clock from
+// <1% (at T=512) into the measurable range. T=2048 is 16x the T**2 of
+// T=512, so flash attention scales accordingly and becomes the dominant
+// kernel cost — which is exactly the regime WMMA tensor cores matter for.
+void VESTAProfileBenchLong()
+{
+	printf("\n============================================================\n");
+	printf("VESTA profile bench LONG at dModel=4096, nLayers=4, T=2048, 2 epochs\n");
+	printf("============================================================\n");
+
+#ifndef GLADES_HAVE_CUDA
+	printf("  CUDA not compiled; skipping.\n");
+	return;
+#else
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+
+	RunSpec s;
+	s.optType = glades::OptimizerConfig::VESTA;
+	s.label = "VESTA-plain-raw";
+	s.vocab = 29u;
+	s.dModel = 4096u;
+	s.dFF = 2u * s.dModel;
+	s.nLayers = 4u;
+	s.nHeads = 4u;
+	s.epochs = 2u;
+	s.corpusLen = 2048u;       // long context for T**2 attention scaling
+	s.learningRate = 1e-2f;
+	s.useGpu = true;
+	s.vestaRank = 8u;
+	s.vestaTSk = 16u;
+	s.vestaLambdaPerp = 0.1f;
+	s.vestaComplementMomentum = false;
+	s.vestaComplementUseSign = false;
+
+	const SweepResult r = run_one(s, 101u);
+	if (r.ok)
+	{
+		printf("VESTA dModel=4096 T=2048 2ep 1seed: trainNLL=%.4f  testNLL=%.4f  wall=%.1fs\n",
+		       r.finalTrainNll, r.finalTestNll, r.wallSec);
+	}
+	else
+	{
+		printf("VESTA profile bench long: FAILED\n");
+	}
+#endif
+}
+
 void VESTAUnitTest()
 {
 	VESTAGramSchmidtTest();

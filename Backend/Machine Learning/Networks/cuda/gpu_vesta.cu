@@ -548,12 +548,20 @@ static bool gpu_cholqr_device(float* d_U, unsigned int m, unsigned int r,
 
 // ---------------- Public API ----------------
 
+// Forward decl for on-device refresh (defined further down in this TU).
+static bool vesta_gpu_refresh_device(GpuVestaWeightState& state,
+                                     const float* d_W,
+                                     unsigned int m, unsigned int n,
+                                     const glades::VestaConfig& vc,
+                                     glades::rng::Engine& rng,
+                                     shmea::GLogger* logger);
+
 bool vesta_gpu_init(GpuVestaWeightState& state,
                     const float* d_W,
                     unsigned int m, unsigned int n,
                     const glades::VestaConfig& vc,
                     glades::rng::Engine& rng,
-                    shmea::GLogger* /*logger*/)
+                    shmea::GLogger* logger)
 {
 	unsigned int r = vc.rank;
 	const unsigned int dMin = (m < n) ? m : n;
@@ -566,7 +574,40 @@ bool vesta_gpu_init(GpuVestaWeightState& state,
 	state.step = 0ULL;
 	if (!allocate_buffers(state, m, n, r)) return false;
 
-	// Reference init via CPU: download W, run CPU init, upload state.
+	// Populate U, V, ell via the sketched SVD. When vc.gpuRefreshOnDevice is
+	// true (default) we use the GPU path — on a dModel=4096 4-layer transformer
+	// this drops the init cost from ~270s (CPU sketched_svd, 83% of wall
+	// profiled with perf) to ~1s. The strict-parity path (gpuRefreshOnDevice
+	// = false, used by parity tests) falls back to the CPU reference init
+	// so CPU/GPU trajectories stay bit-exact.
+	if (vc.gpuRefreshOnDevice)
+	{
+		state.initialized = true;  // refresh path reads state.r etc.
+		if (!vesta_gpu_refresh_device(state, d_W, m, n, vc, rng, logger))
+		{
+			state.initialized = false;
+			return false;
+		}
+		// beta = ell, ellStar = ell (matches CPU initWeightState semantics).
+		const cudaStream_t cs = glades::gpu::computeStream();
+		if (cudaMemcpyAsync(state.beta.data(), state.ell.data(),
+		                    static_cast<size_t>(r) * sizeof(float),
+		                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
+			return false;
+		if (cudaMemcpyAsync(state.ellStar.data(), state.ell.data(),
+		                    static_cast<size_t>(r) * sizeof(float),
+		                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
+			return false;
+		// maxExpEllPrev = exp(ell[0]). ell is sorted descending by the SVD.
+		float hostEll0 = 0.0f;
+		if (cudaMemcpy(&hostEll0, state.ell.data(), sizeof(float),
+		               cudaMemcpyDeviceToHost) != cudaSuccess)
+			return false;
+		state.maxExpEllPrev = expf(hostEll0);
+		return true;
+	}
+
+	// Strict-parity path: CPU reference init with host roundtrip.
 	std::vector<float> hostW(static_cast<size_t>(m) * n, 0.0f);
 	if (cudaMemcpy(&hostW[0], d_W, static_cast<size_t>(m) * n * sizeof(float),
 	               cudaMemcpyDeviceToHost) != cudaSuccess)

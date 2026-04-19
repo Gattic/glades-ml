@@ -233,6 +233,8 @@ int main(int argc, char* argv[])
 		VESTASweepScaleMega();
 	    else if (strcmp(argv[1], "vesta-profile-bench") == 0)
 		VESTAProfileBench();
+	    else if (strcmp(argv[1], "vesta-profile-bench-long") == 0)
+		VESTAProfileBenchLong();
 	    else if (strcmp(argv[1], "vesta-refresh-bench") == 0)
 		VESTAGpuRefreshBenchmark();
 	    else if (strcmp(argv[1], "vesta-step-bench") == 0)
