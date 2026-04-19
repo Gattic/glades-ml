@@ -2682,6 +2682,80 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator)
 	return true;
 }
 
+// ===========================================================================
+// BF16 / FP32 cast kernels — foundation for mixed-precision training.
+//
+// BF16 keeps FP32's 8-bit exponent and truncates mantissa to 7 bits (vs FP16's
+// 5-exp/10-mantissa). Because the exponent range matches FP32, conversion is
+// a simple high-half-word extraction with round-to-nearest-even.
+//
+// These cast kernels are the primitives for:
+//   * BF16 weight storage (halves weight VRAM; FP32 master weights in optimizer)
+//   * BF16 gradient storage
+//   * Any buffer where we want to sacrifice mantissa precision for capacity
+// ===========================================================================
+
+namespace {
+
+__global__ void k_cast_f32_to_bf16(const float* __restrict__ src,
+                                   uint16_t* __restrict__ dst,
+                                   size_t n)
+{
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+	// Reinterpret float as uint32, apply RN-even rounding on the low half-word,
+	// and take the upper 16 bits.
+	const float f = src[idx];
+	union { float f; uint32_t u; } v;
+	v.f = f;
+	// Flush NaN to BF16 quiet NaN (preserve sign, set high mantissa bit).
+	if (isnan(f)) {
+		const uint32_t sign = v.u & 0x80000000u;
+		dst[idx] = static_cast<uint16_t>(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		return;
+	}
+	const uint32_t lsb = (v.u >> 16) & 1u;
+	const uint32_t roundingBias = 0x7FFFu + lsb;
+	dst[idx] = static_cast<uint16_t>((v.u + roundingBias) >> 16);
+}
+
+__global__ void k_cast_bf16_to_f32(const uint16_t* __restrict__ src,
+                                   float* __restrict__ dst,
+                                   size_t n)
+{
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+	union { uint32_t u; float f; } v;
+	v.u = static_cast<uint32_t>(src[idx]) << 16;
+	dst[idx] = v.f;
+}
+
+} // anonymous namespace
+
+bool cast_f32_to_bf16(const float* src, uint16_t* dst, size_t n)
+{
+	if (n == 0) return true;
+	const unsigned int TPB = 256u;
+	const size_t blocks = (n + TPB - 1u) / TPB;
+	// Grid cap to avoid >2^31 block count on extremely large buffers; the
+	// kernel strides aren't needed below that because we size n per the caller.
+	if (blocks > 0x7FFFFFFFu) return false;
+	k_cast_f32_to_bf16<<<static_cast<unsigned int>(blocks), TPB, 0, computeStream()>>>(src, dst, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n)
+{
+	if (n == 0) return true;
+	const unsigned int TPB = 256u;
+	const size_t blocks = (n + TPB - 1u) / TPB;
+	if (blocks > 0x7FFFFFFFu) return false;
+	k_cast_bf16_to_f32<<<static_cast<unsigned int>(blocks), TPB, 0, computeStream()>>>(src, dst, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

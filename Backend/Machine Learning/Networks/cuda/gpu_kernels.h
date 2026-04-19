@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstddef>
+#include <stdint.h>
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -295,6 +296,15 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 // Multiple calls accumulate across different buffers.
 bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
 
+// BF16 ↔ FP32 element-wise casts. Operates element-wise on GPU buffers.
+// `n` is the number of elements (not bytes). Designed as primitives for
+// mixed-precision training: store a weight matrix as BF16 on the GPU (half
+// the memory) and cast to FP32 just before a kernel consumes it. Pair with
+// FP32 master weights in the optimizer to avoid compounding rounding errors
+// across training steps.
+bool cast_f32_to_bf16(const float* src, uint16_t* dst, size_t n);
+bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n);
+
 // ---------------------------------------------------------------------------
 // Device memory operations (callable from .cpp files without cuda_runtime.h)
 // ---------------------------------------------------------------------------
@@ -371,6 +381,8 @@ inline bool zero_buffers_batch(float**, const int*, int) { return false; }
 inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, int*) { return false; }
 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
+inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
+inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}
