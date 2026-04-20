@@ -36,6 +36,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -1012,6 +1013,110 @@ void VESTAGpuBf16CastTest()
 	}
 	printf("  exact maxErr=%.3g  general maxRelErr=%.3g\n", maxExactErr, maxRelErr);
 	ASSERT("BF16 general round-trip <1%% relative error", maxRelErr < 0.01f);
+}
+
+// Correctness sanity for the BF16 GEMM wrappers. Computes C_fp32 = A*B via the
+// FP32 path and C_bf16 = cast(A)*cast(B) via the BF16 path, verifies the two
+// agree within BF16 quantization tolerance (a few % relative error on generic
+// Gaussian inputs). Tests all three variants: plain, ATB, ABT.
+void VESTAGpuBf16GemmTest()
+{
+	printf("[vesta] GpuBf16GemmTest\n");
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	if (!glades::gpu::blasInit())
+	{
+		printf("  cuBLAS init failed; skipping\n");
+		return;
+	}
+
+	const int M = 128, N = 96, K = 160;
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xB1605EEDULL);
+	std::vector<float> A(M * K), B(K * N), B_T(N * K), A_T(K * M);
+	for (size_t i = 0; i < A.size(); ++i) A[i] = 0.1f * glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < B.size(); ++i) B[i] = 0.1f * glades::rng::standard_normal(eng);
+	// Transposed layouts for ATB / ABT variants.
+	for (int k = 0; k < K; ++k)
+		for (int m = 0; m < M; ++m)
+			A_T[k * M + m] = A[m * K + k];
+	for (int n = 0; n < N; ++n)
+		for (int k = 0; k < K; ++k)
+			B_T[n * K + k] = B[k * N + n];
+
+	glades::gpu::GpuBuffer<float> dA, dB, dA_T, dB_T, dC_fp, dC_bf;
+	glades::gpu::GpuBuffer<uint16_t> dA_bf, dB_bf, dA_T_bf, dB_T_bf;
+	ASSERT("alloc", dA.allocate(M * K) && dB.allocate(K * N)
+	                && dA_T.allocate(K * M) && dB_T.allocate(N * K)
+	                && dC_fp.allocate(M * N) && dC_bf.allocate(M * N)
+	                && dA_bf.allocate(M * K) && dB_bf.allocate(K * N)
+	                && dA_T_bf.allocate(K * M) && dB_T_bf.allocate(N * K));
+	ASSERT("upload", dA.upload(&A[0], A.size()) && dB.upload(&B[0], B.size())
+	                 && dA_T.upload(&A_T[0], A_T.size()) && dB_T.upload(&B_T[0], B_T.size()));
+	ASSERT("cast A,B to BF16",
+	    glades::gpu::cast_f32_to_bf16(dA.data(), dA_bf.data(), M * K) &&
+	    glades::gpu::cast_f32_to_bf16(dB.data(), dB_bf.data(), K * N) &&
+	    glades::gpu::cast_f32_to_bf16(dA_T.data(), dA_T_bf.data(), K * M) &&
+	    glades::gpu::cast_f32_to_bf16(dB_T.data(), dB_T_bf.data(), N * K));
+
+	// --- Plain GEMM: C = A * B ---
+	ASSERT("fp32 gemm", glades::gpu::sgemm_rowmajor(M, N, K,
+	        1.0f, dA.data(), K, dB.data(), N, 0.0f, dC_fp.data(), N));
+	ASSERT("bf16 gemm", glades::gpu::sgemm_rowmajor_bf16(M, N, K,
+	        1.0f, dA_bf.data(), K, dB_bf.data(), N, 0.0f, dC_bf.data(), N));
+	std::vector<float> Cfp(M * N), Cbf(M * N);
+	ASSERT("download", dC_fp.download(&Cfp[0], Cfp.size()) && dC_bf.download(&Cbf[0], Cbf.size()));
+	float maxRel = 0.0f, fpNorm = 0.0f, errNorm = 0.0f;
+	for (size_t i = 0; i < Cfp.size(); ++i)
+	{
+		fpNorm += Cfp[i] * Cfp[i];
+		const float e = Cbf[i] - Cfp[i];
+		errNorm += e * e;
+		const float d = fabsf(Cfp[i]) > 1e-3f ? fabsf(Cfp[i]) : 1.0f;
+		const float r = fabsf(e) / d;
+		if (r > maxRel) maxRel = r;
+	}
+	const float relFro = sqrtf(errNorm / (fpNorm + 1e-12f));
+	printf("  plain: maxRel=%.3g relFro=%.3g\n", maxRel, relFro);
+	ASSERT("BF16 GEMM Frobenius rel error < 2%%", relFro < 0.02f);
+
+	// --- ATB: C = A^T * B where A stored as [K,M]. ---
+	ASSERT("fp32 gemm_atb", glades::gpu::sgemm_rowmajor_atb(M, N, K,
+	        1.0f, dA_T.data(), M, dB.data(), N, 0.0f, dC_fp.data(), N));
+	ASSERT("bf16 gemm_atb", glades::gpu::sgemm_rowmajor_atb_bf16(M, N, K,
+	        1.0f, dA_T_bf.data(), M, dB_bf.data(), N, 0.0f, dC_bf.data(), N));
+	ASSERT("download atb", dC_fp.download(&Cfp[0], Cfp.size()) && dC_bf.download(&Cbf[0], Cbf.size()));
+	fpNorm = 0.0f; errNorm = 0.0f;
+	for (size_t i = 0; i < Cfp.size(); ++i)
+	{
+		fpNorm += Cfp[i] * Cfp[i];
+		const float e = Cbf[i] - Cfp[i];
+		errNorm += e * e;
+	}
+	printf("  atb: relFro=%.3g\n", sqrtf(errNorm / (fpNorm + 1e-12f)));
+	ASSERT("BF16 GEMM ATB relFro < 2%%", sqrtf(errNorm / (fpNorm + 1e-12f)) < 0.02f);
+
+	// --- ABT: C = A * B^T where B stored as [N,K]. ---
+	ASSERT("fp32 gemm_abt", glades::gpu::sgemm_rowmajor_abt(M, N, K,
+	        1.0f, dA.data(), K, dB_T.data(), K, 0.0f, dC_fp.data(), N));
+	ASSERT("bf16 gemm_abt", glades::gpu::sgemm_rowmajor_abt_bf16(M, N, K,
+	        1.0f, dA_bf.data(), K, dB_T_bf.data(), K, 0.0f, dC_bf.data(), N));
+	ASSERT("download abt", dC_fp.download(&Cfp[0], Cfp.size()) && dC_bf.download(&Cbf[0], Cbf.size()));
+	fpNorm = 0.0f; errNorm = 0.0f;
+	for (size_t i = 0; i < Cfp.size(); ++i)
+	{
+		fpNorm += Cfp[i] * Cfp[i];
+		const float e = Cbf[i] - Cfp[i];
+		errNorm += e * e;
+	}
+	printf("  abt: relFro=%.3g\n", sqrtf(errNorm / (fpNorm + 1e-12f)));
+	ASSERT("BF16 GEMM ABT relFro < 2%%", sqrtf(errNorm / (fpNorm + 1e-12f)) < 0.02f);
 }
 
 void VESTAGpuRefreshBenchmark()
@@ -3692,6 +3797,7 @@ void VESTAUnitTest()
 	VESTAGpuSingleRefreshTest();
 	VESTAGpuRefreshDeviceTest();
 	VESTAGpuBf16CastTest();
+	VESTAGpuBf16GemmTest();
 	VESTAComplementMomentumTest();
 	VESTATrackedEmaTest();
 	VESTAGradientBasisTest();

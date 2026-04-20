@@ -37,6 +37,7 @@ void VESTAGpuParityMomentumTest();
 void VESTAGpuRefreshDeviceTest();
 void VESTAGpuSingleRefreshTest();
 void VESTAGpuBf16CastTest();
+void VESTAGpuBf16GemmTest();
 void VESTAGpuRefreshBenchmark();
 void VESTAGpuStepBenchmark();
 void VESTAComplementMomentumTest();
