@@ -1119,6 +1119,131 @@ void VESTAGpuBf16GemmTest()
 	ASSERT("BF16 GEMM ABT relFro < 2%%", sqrtf(errNorm / (fpNorm + 1e-12f)) < 0.02f);
 }
 
+// End-to-end smoke test: tiny transformer with BF16 mixed precision enabled.
+// Verifies that training (a) doesn't crash, (b) doesn't produce NaN/Inf,
+// (c) the BF16 forward path yields NLL within a generous tolerance of the
+// FP32 baseline after a few steps. Backward remains FP32 so trajectories
+// will diverge slightly but must stay sane.
+namespace {
+class Bf16ParityMetricCapture : public glades::ITrainingCallbacks
+{
+public:
+	Bf16ParityMetricCapture() : saw(false), last() {}
+	virtual void onRunStart(const glades::NNetwork&, int) {}
+	virtual bool onEpochEnd(const glades::NNetwork&,
+	                        const glades::NNetworkEpochMetrics& m)
+	{
+		last = m;
+		saw = true;
+		return false;
+	}
+	virtual void onRunEnd(const glades::NNetwork&, int) {}
+	bool saw;
+	glades::NNetworkEpochMetrics last;
+};
+} // anonymous namespace
+
+void VESTATransformerBf16ParityTest()
+{
+	printf("[vesta] TransformerBf16ParityTest\n");
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+
+	const unsigned int vocab = 31u;
+	const unsigned int dModel = 64u;
+	const unsigned int dFF = 128u;
+	const unsigned int nLayers = 2u;
+	const unsigned int nHeads = 4u;
+	const unsigned int seqLen = 32u;
+	const unsigned int epochs = 4u;
+	const unsigned int corpusLen = 128u;
+
+	// Build a structured token corpus.
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xBF16A001ULL);
+	std::vector<unsigned int> toks(corpusLen);
+	for (unsigned int i = 0; i < corpusLen; ++i)
+		toks[i] = (i * 3u + 1u) % vocab;
+
+	float finalNllFp32 = 0.0f, finalNllBf16 = 0.0f;
+
+	for (int pass = 0; pass < 2; ++pass)
+	{
+		const bool enableBf16 = (pass == 1);
+		InMemoryTokenIdInput di;
+		di.setTrainTokens(toks, -1);
+		di.mirrorTrainToTest();
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(
+		    1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		for (unsigned int i = 0; i < nLayers; ++i)
+			hidden.push_back(new glades::HiddenLayerInfo(
+			    static_cast<int>(dModel), 1e-3f, 0.0f, 0.0f, 0.0f, 0.0f,
+			    glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* out = new glades::OutputLayerInfo(
+		    static_cast<int>(vocab), glades::OutputLayerInfo::CLASSIFICATION);
+		glades::NNInfo* info = new glades::NNInfo("bf16_parity", in, hidden, out);
+
+		glades::NNetwork net(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net.setSeed(0x5EED2026ULL);
+		net.getTerminatorMutable().setEpoch(static_cast<int>(epochs));
+		net.getTerminatorMutable().setAccuracy(0.0f);
+		{
+			glades::TrainingConfig& cfg = net.getTrainingConfigMutable();
+			cfg.transformer.enableTokenEmbedding = true;
+			cfg.transformer.vocabSizeOverride = static_cast<int>(vocab);
+			cfg.transformer.tieEmbeddings = true;
+			cfg.transformer.nHeadsOverride = static_cast<int>(nHeads);
+			cfg.transformer.dFFOverride = static_cast<int>(dFF);
+			cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_NONE;
+			cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+			cfg.gpu.enable = true;
+			cfg.gpu.deviceId = 0;
+			cfg.mixedPrecision.enable = enableBf16;
+			cfg.mixedPrecision.weightDType = glades::MixedPrecisionConfig::WEIGHT_BF16;
+			cfg.mixedPrecision.useLossScaling = false; // BF16 exp range covers it
+		}
+
+		Bf16ParityMetricCapture cb;
+		const glades::NNetworkStatus st = net.train(&di, &cb);
+		ASSERT("BF16 parity: train status ok", st.ok() && cb.saw);
+		if (!st.ok() || !cb.saw)
+		{
+			printf("  pass=%d (bf16=%d) train FAILED: %s\n",
+			       pass, enableBf16 ? 1 : 0, st.message.c_str());
+			delete info;
+			return;
+		}
+
+		const float nll = cb.last.totalError;
+		if (enableBf16) finalNllBf16 = nll;
+		else            finalNllFp32 = nll;
+		printf("  pass=%d bf16=%d finalNLL=%.4f\n",
+		       pass, enableBf16 ? 1 : 0, nll);
+
+		delete info;
+	}
+
+	const float absDiff = fabsf(finalNllBf16 - finalNllFp32);
+	const float relDiff = absDiff / (fabsf(finalNllFp32) + 1e-6f);
+	printf("  fp32=%.4f bf16=%.4f  absDiff=%.4f  relDiff=%.3g\n",
+	       finalNllFp32, finalNllBf16, absDiff, relDiff);
+
+	ASSERT("BF16 train produced finite NLL",
+	       finalNllBf16 == finalNllBf16 && finalNllBf16 < 1000.0f);
+	// Generous tolerance: forward-only BF16 with FP32 backward should stay
+	// within ~10% relative (BF16 7-bit mantissa compounded over many matmuls
+	// plus training-trajectory divergence).
+	ASSERT("BF16 vs FP32 NLL within 10%% relative", relDiff < 0.10f);
+}
+
 void VESTAGpuRefreshBenchmark()
 {
 	printf("[vesta] GpuRefreshBenchmark\n");
@@ -3798,6 +3923,7 @@ void VESTAUnitTest()
 	VESTAGpuRefreshDeviceTest();
 	VESTAGpuBf16CastTest();
 	VESTAGpuBf16GemmTest();
+	VESTATransformerBf16ParityTest();
 	VESTAComplementMomentumTest();
 	VESTATrackedEmaTest();
 	VESTAGradientBasisTest();

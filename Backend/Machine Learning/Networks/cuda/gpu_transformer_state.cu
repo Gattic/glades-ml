@@ -536,6 +536,19 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	if (!gpuInvFreq.allocate(dHead / 2)) return false;
 	if (!gpuTargetsT.allocate(sT)) return false;
 
+	// BF16 activation staging, sized for the widest activation tile in the net
+	// (T * max(dModel, ff1Width, vocabSize, inputSize)). Allocated
+	// unconditionally so mpEnable can be toggled without re-allocating scratch.
+	{
+		size_t widest = sT * sdm;
+		if (sT * sf1w > widest) widest = sT * sf1w;
+		if (sT * sdf  > widest) widest = sT * sdf;
+		if (sT * sos  > widest) widest = sT * sos;
+		if (sT * sis  > widest) widest = sT * sis;
+		if (!activationLowp.allocate(widest)) return false;
+		if (!activationLowp2.allocate(widest)) return false;
+	}
+
 	// GPU loss computation scalars
 	if (!lossSum.allocate(1)) return false;
 	if (!lossCount.allocate(1)) return false;

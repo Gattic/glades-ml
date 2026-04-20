@@ -407,6 +407,15 @@ struct GpuTransformerScratch
 	GpuBuffer<float> gpuInvFreq; // [dHead/2]  (RoPE inverse frequencies)
 	GpuBuffer<int> gpuTargetsT;  // [T]        (target token IDs for loss/backward)
 
+	// BF16 activation staging for mixed-precision GEMMs. Sized to T*max(dModel,
+	// ff1Width) so a single buffer can hold any single activation tile. Used
+	// at forward/backward GEMM call sites to cast FP32 activations to BF16
+	// right before feeding cublasGemmEx with BF16 weight mirrors.
+	GpuBuffer<uint16_t> activationLowp;
+	// Secondary BF16 activation staging used when two distinct activations
+	// must be live at once (e.g. dY and X for the weight-grad GEMM).
+	GpuBuffer<uint16_t> activationLowp2;
+
 	// GPU loss computation scalars
 	GpuBuffer<float> lossSum;    // [1]
 	GpuBuffer<int> lossCount;    // [1]  (valid token count)

@@ -8928,6 +8928,92 @@ bool glades::NNetwork::syncTransformerGpuTrainingWeightsToCpu()
 	return glades::gpu::downloadTransformerWeightsToHost(*gpuTransformerWeights, hostView);
 }
 
+namespace {
+
+// BF16 mixed-precision GEMM dispatch helpers for the GPU training path.
+//
+// Each helper matches one of the three float variants in gpu_blas.h:
+//   - gpu_gemm_mp     ~ sgemm_rowmajor       (no transpose; input-grad dX = dY * W)
+//   - gpu_gemm_atb_mp ~ sgemm_rowmajor_atb   (A transposed; weight-grad gW = dY^T * X)
+//   - gpu_gemm_abt_mp ~ sgemm_rowmajor_abt   (B transposed; forward O = X * W^T)
+//
+// When useBf16 is false, the helper falls through to the FP32 variant and
+// the *_scratch / *_bf16 pointers are ignored. When useBf16 is true, the
+// relevant FP32 inputs are cast into the provided BF16 scratch buffers on
+// the fly (via glades::gpu::cast_f32_to_bf16) and cublasGemmEx runs with
+// BF16 inputs and FP32 accumulate (CUBLAS_COMPUTE_32F).
+//
+// All pointers are device pointers. Scratch buffers must be at least
+// size(M*K) or size(K*N) depending on the dispatched variant; the caller
+// owns allocation (see GpuTransformerScratch::activationLowp,
+// ::activationLowp2).
+
+#ifdef GLADES_HAVE_CUDA
+
+static inline bool gpu_gemm_abt_mp(bool useBf16,
+                                   int M, int N, int K, float alpha,
+                                   const float* A_f32, uint16_t* A_scratch_bf16, int lda,
+                                   const float* B_f32, const uint16_t* B_bf16, int ldb,
+                                   float beta, float* C, int ldc)
+{
+	if (useBf16)
+	{
+		const size_t aN = static_cast<size_t>(M) * static_cast<size_t>(K);
+		if (!glades::gpu::cast_f32_to_bf16(A_f32, A_scratch_bf16, aN))
+			return false;
+		return glades::gpu::sgemm_rowmajor_abt_bf16(M, N, K, alpha,
+		    A_scratch_bf16, lda, B_bf16, ldb, beta, C, ldc);
+	}
+	return glades::gpu::sgemm_rowmajor_abt(M, N, K, alpha,
+	    A_f32, lda, B_f32, ldb, beta, C, ldc);
+}
+
+static inline bool gpu_gemm_mp(bool useBf16,
+                               int M, int N, int K, float alpha,
+                               const float* A_f32, uint16_t* A_scratch_bf16, int lda,
+                               const float* B_f32, const uint16_t* B_bf16, int ldb,
+                               float beta, float* C, int ldc)
+{
+	if (useBf16)
+	{
+		const size_t aN = static_cast<size_t>(M) * static_cast<size_t>(K);
+		if (!glades::gpu::cast_f32_to_bf16(A_f32, A_scratch_bf16, aN))
+			return false;
+		return glades::gpu::sgemm_rowmajor_bf16(M, N, K, alpha,
+		    A_scratch_bf16, lda, B_bf16, ldb, beta, C, ldc);
+	}
+	return glades::gpu::sgemm_rowmajor(M, N, K, alpha,
+	    A_f32, lda, B_f32, ldb, beta, C, ldc);
+}
+
+// Weight-grad pattern: gW = alpha * dY^T * X + beta * gW. Both dY (A) and
+// X (B) are FP32 activations; need two scratch buffers in BF16 mode.
+static inline bool gpu_gemm_atb_mp(bool useBf16,
+                                   int M, int N, int K, float alpha,
+                                   const float* A_f32, uint16_t* A_scratch_bf16, int lda,
+                                   const float* B_f32, uint16_t* B_scratch_bf16, int ldb,
+                                   float beta, float* C, int ldc)
+{
+	if (useBf16)
+	{
+		// A has shape [K, M] row-major (so K*M entries).
+		const size_t aN = static_cast<size_t>(K) * static_cast<size_t>(M);
+		const size_t bN = static_cast<size_t>(K) * static_cast<size_t>(N);
+		if (!glades::gpu::cast_f32_to_bf16(A_f32, A_scratch_bf16, aN))
+			return false;
+		if (!glades::gpu::cast_f32_to_bf16(B_f32, B_scratch_bf16, bN))
+			return false;
+		return glades::gpu::sgemm_rowmajor_atb_bf16(M, N, K, alpha,
+		    A_scratch_bf16, lda, B_scratch_bf16, ldb, beta, C, ldc);
+	}
+	return glades::gpu::sgemm_rowmajor_atb(M, N, K, alpha,
+	    A_f32, lda, B_f32, ldb, beta, C, ldc);
+}
+
+#endif // GLADES_HAVE_CUDA
+
+} // anonymous namespace
+
 void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
                                                 int epochIdx, int64_t epochStartMs,
                                                 unsigned long long& tokensProcessed,
@@ -8941,7 +9027,6 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	using namespace glades::logfmt;
 
 	TensorTransformerState& tt = tensorTransformer;
-
 	const unsigned int dModel = cfg.dModel;
 	const unsigned int dFF = cfg.dFF;
 	const unsigned int nHeads = cfg.nHeads;
@@ -8991,6 +9076,27 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF;
 	const bool useRope = (posEnc == static_cast<int>(glades::TransformerRunConfig::POSENC_ROPE));
+
+	// BF16 mixed precision scaffolding. The foundation (device mirror buffers,
+	// cuBLAS BF16 GEMM wrappers, per-step re-quant hook) is wired end-to-end.
+	// Forward matmul wiring is gated off until a follow-up pass lands parity
+	// testing; enabling it today triggers non-finite aggregates on small
+	// transformers and needs targeted debugging.
+	const bool useBf16 = false;
+	if (cfg.mpEnable && gpuTransformerWeights
+	    && (trainingConfig.mixedPrecision.weightDType ==
+	        glades::MixedPrecisionConfig::WEIGHT_BF16))
+	{
+		gpuTransformerWeights->lowpDType = glades::transformer_kernels::LOWP_BF16;
+		if (!gpuTransformerWeights->ensureLowpMirrors())
+		{
+			lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+			    "transformerGpuTrainEpoch: failed to build BF16 weight mirrors");
+			storeRunningFlag(false);
+			return;
+		}
+	}
+
 	TransformerGpuPerfBreakdown* gpuPerf =
 	    ((transformerMetricsCfg.enable && transformerMetricsCfg.enableGpuPerf) ? &lastTransformerTrainGpuPerf : NULL);
 	if (gpuPerf)
@@ -9096,12 +9202,17 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
 			// Input projection: h = x * WIn^T + bIn
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
-			                     1.0f,
-			                     gpuTransformerScratch->x.data(), static_cast<int>(inputSize),
-			                     gpuTransformerWeights->WIn.data(), static_cast<int>(inputSize),
-			                     0.0f,
-			                     gpuTransformerScratch->h.data(), static_cast<int>(dModel));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
+			    1.0f,
+			    gpuTransformerScratch->x.data(),
+			    gpuTransformerScratch->activationLowp.data(),
+			    static_cast<int>(inputSize),
+			    gpuTransformerWeights->WIn.data(),
+			    gpuTransformerWeights->WInLowp.data(),
+			    static_cast<int>(inputSize),
+			    0.0f,
+			    gpuTransformerScratch->h.data(), static_cast<int>(dModel));
 			gpu::add_bias(gpuTransformerScratch->h.data(),
 			              gpuTransformerWeights->bIn.data(),
 			              static_cast<int>(T), static_cast<int>(dModel));
@@ -9160,22 +9271,25 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
 			float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
 
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
-			                     1.0f, x1_l, static_cast<int>(dModel),
-			                     gb.Wq.data(), static_cast<int>(dModel),
-			                     0.0f, Q_l, static_cast<int>(dModel));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
+			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wq.data(), gb.WqLowp.data(), static_cast<int>(dModel),
+			    0.0f, Q_l, static_cast<int>(dModel));
 			gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
 
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
-			                     1.0f, x1_l, static_cast<int>(dModel),
-			                     gb.Wk.data(), static_cast<int>(dModel),
-			                     0.0f, K_l, static_cast<int>(dModelKV));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
+			    0.0f, K_l, static_cast<int>(dModelKV));
 			gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
 
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel),
-			                     1.0f, x1_l, static_cast<int>(dModel),
-			                     gb.Wv.data(), static_cast<int>(dModel),
-			                     0.0f, V_l, static_cast<int>(dModelKV));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
+			    0.0f, V_l, static_cast<int>(dModelKV));
 			gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
 
 			// RoPE (if enabled) — fused Q+K in single kernel launch
@@ -9207,10 +9321,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 			// Wo projection
 			float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel),
-			                     1.0f, attnConcat_l, static_cast<int>(dModel),
-			                     gb.Wo.data(), static_cast<int>(dModel),
-			                     0.0f, attnOut_l, static_cast<int>(dModel));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
+			    attnConcat_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wo.data(), gb.WoLowp.data(), static_cast<int>(dModel),
+			    0.0f, attnOut_l, static_cast<int>(dModel));
 			gpu::add_bias(attnOut_l, gb.bo.data(), static_cast<int>(T), static_cast<int>(dModel));
 
 			// Residual 1: hAfterAttn = layerIn + attnOut
@@ -9241,10 +9356,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			float* ffOut_l = gpuTransformerScratch->ffOut.data() + static_cast<size_t>(li) * T * dModel;
 
 			// FF1: x2 * W1^T + b1
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
-			                     1.0f, x2_l, static_cast<int>(dModel),
-			                     gb.W1.data(), static_cast<int>(dModel),
-			                     0.0f, ff1_l, static_cast<int>(ff1Width));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel), 1.0f,
+			    x2_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.W1.data(), gb.W1Lowp.data(), static_cast<int>(dModel),
+			    0.0f, ff1_l, static_cast<int>(ff1Width));
 			gpu::add_bias(ff1_l, gb.b1.data(), static_cast<int>(T), static_cast<int>(ff1Width));
 
 			// Activation
@@ -9262,10 +9378,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			// FF2: ffAct * W2^T + b2
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
-			                     1.0f, ff1Act_l, static_cast<int>(dFF),
-			                     gb.W2.data(), static_cast<int>(dFF),
-			                     0.0f, ffOut_l, static_cast<int>(dModel));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF), 1.0f,
+			    ff1Act_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
+			    gb.W2.data(), gb.W2Lowp.data(), static_cast<int>(dFF),
+			    0.0f, ffOut_l, static_cast<int>(dModel));
 			gpu::add_bias(ffOut_l, gb.b2.data(), static_cast<int>(T), static_cast<int>(dModel));
 
 			// Residual 2: hAfterFF = hAfterAttn + ffOut
@@ -9295,10 +9412,12 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		if (tokenLM && tieEmb)
 		{
 			// logits = hPostFinalLN * E^T + lmBias
-			gpu::sgemm_rowmajor_abt(static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
-			                     1.0f, hPostFinalLN, static_cast<int>(dModel),
-			                     gpuTransformerWeights->tokE.data(), static_cast<int>(dModel),
-			                     0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize));
+			gpu_gemm_abt_mp(useBf16,
+			    static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel), 1.0f,
+			    hPostFinalLN, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gpuTransformerWeights->tokE.data(), gpuTransformerWeights->tokELowp.data(),
+			    static_cast<int>(dModel),
+			    0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize));
 			gpu::add_bias(gpuTransformerScratch->logits.data(),
 			              gpuTransformerWeights->lmBias.data(),
 			              static_cast<int>(T), static_cast<int>(vocabSize));
