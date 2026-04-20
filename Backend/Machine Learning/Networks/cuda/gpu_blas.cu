@@ -858,6 +858,94 @@ bool sgemm_batched_pointer_abt_device_scalars(int M, int N, int K,
 	return true;
 }
 
+// === BF16 GEMM wrappers ===
+//
+// All wrappers use cublasGemmEx with CUDA_R_16BF inputs and CUDA_R_32F output.
+// Compute type is CUBLAS_COMPUTE_32F so products accumulate in FP32 on the
+// tensor cores, matching the numerical profile of TF32 SGEMM with half the
+// input memory bandwidth and 2x the arithmetic throughput on Ampere/Ada/Hopper.
+//
+// Row-major -> column-major transpose trick is identical to the float path:
+//   C_row[M,N] = alpha * A_row[M,K] * B_row[K,N] + beta * C_row[M,N]
+//   cuBLAS sees it as (in column-major):
+//     C_col[N,M] = alpha * B_col[N,K] * A_col[K,M] + beta * C_col[N,M]
+// so we pass (B, A) in swapped order with shape (N, M, K).
+
+static bool gemmex_bf16_impl(cublasOperation_t transa, cublasOperation_t transb,
+                             int M, int N, int K,
+                             float alpha,
+                             const unsigned short* A, int lda,
+                             const unsigned short* B, int ldb,
+                             float beta,
+                             float* C, int ldc,
+                             const char* label)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+
+	cublasStatus_t st = cublasGemmEx(g_handle,
+	                                 transa, transb,
+	                                 N, M, K,
+	                                 &alpha,
+	                                 B, CUDA_R_16BF, ldb,
+	                                 A, CUDA_R_16BF, lda,
+	                                 &beta,
+	                                 C, CUDA_R_32F, ldc,
+	                                 CUBLAS_COMPUTE_32F,
+	                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] %s failed: %d (M=%d N=%d K=%d)\n",
+		        label, static_cast<int>(st), M, N, K);
+		return false;
+	}
+	return true;
+}
+
+// C[M,N] = alpha * A[M,K] * B[K,N] + beta * C (row-major, BF16 inputs, FP32 out).
+bool sgemm_rowmajor_bf16(int M, int N, int K,
+                         float alpha,
+                         const unsigned short* A, int lda,
+                         const unsigned short* B, int ldb,
+                         float beta,
+                         float* C, int ldc)
+{
+	return gemmex_bf16_impl(CUBLAS_OP_N, CUBLAS_OP_N,
+	                        M, N, K,
+	                        alpha, A, lda, B, ldb, beta, C, ldc,
+	                        "cublasGemmEx(BF16)");
+}
+
+// C[M,N] = alpha * A^T[M,K] * B[K,N] + beta * C (A stored as [K,M] row-major).
+// Same col-major transpose logic as the float variant: (transa, transb) = (N, T).
+bool sgemm_rowmajor_atb_bf16(int M, int N, int K,
+                             float alpha,
+                             const unsigned short* A, int lda,
+                             const unsigned short* B, int ldb,
+                             float beta,
+                             float* C, int ldc)
+{
+	return gemmex_bf16_impl(CUBLAS_OP_N, CUBLAS_OP_T,
+	                        M, N, K,
+	                        alpha, A, lda, B, ldb, beta, C, ldc,
+	                        "cublasGemmEx(BF16,ATB)");
+}
+
+// C[M,N] = alpha * A[M,K] * B^T[K,N] + beta * C (B stored as [N,K] row-major).
+// Col-major transpose: (transa, transb) = (T, N).
+bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
+                             float alpha,
+                             const unsigned short* A, int lda,
+                             const unsigned short* B, int ldb,
+                             float beta,
+                             float* C, int ldc)
+{
+	return gemmex_bf16_impl(CUBLAS_OP_T, CUBLAS_OP_N,
+	                        M, N, K,
+	                        alpha, A, lda, B, ldb, beta, C, ldc,
+	                        "cublasGemmEx(BF16,ABT)");
+}
+
 } // namespace gpu
 } // namespace glades
 

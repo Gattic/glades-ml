@@ -37,7 +37,8 @@ GpuTransformerWeights::GpuTransformerWeights()
       matraBatchDescriptorsUploaded(false),
       adamPtrsUploaded(false),
       adamMetricMetaUploaded(false), adamMetricScope(0u),
-      matraBatchDescriptorCount(0), matraBatchDescriptorHash(0ULL)
+      matraBatchDescriptorCount(0), matraBatchDescriptorHash(0ULL),
+      lowpReady(false), lowpDType(0)
 {
 }
 
@@ -368,7 +369,53 @@ void GpuTransformerWeights::free()
 	matraBatchDescriptorCount = 0;
 	matraBatchDescriptorHash = 0ULL;
 	initialized = false;
+	lowpReady = false;
+	lowpDType = 0;
 	// GpuBuffer destructors handle cudaFree automatically.
+}
+
+// Populate every BF16 Lowp mirror from its FP32 master via the existing
+// cast_f32_to_bf16 kernel. Allocates mirror buffers on first call.
+bool GpuTransformerWeights::ensureLowpMirrors()
+{
+	if (!initialized)
+		return false;
+
+	// For each master -> mirror pair, allocate the mirror if empty and cast.
+	// Helper captures the shape from the master buffer's allocated size.
+#define GLADES_LOWP_ENSURE(master, mirror)                                 \
+	do {                                                                   \
+		const size_t n_ = (master).allocated();                            \
+		if (n_ == 0) { break; }                                            \
+		if ((mirror).allocated() != n_) {                                  \
+			if (!(mirror).allocate(n_)) return false;                      \
+		}                                                                  \
+		if (!cast_f32_to_bf16((master).data(), (mirror).data(), n_))       \
+			return false;                                                  \
+	} while (0)
+
+	if (tokenModel)
+		GLADES_LOWP_ENSURE(tokE, tokELowp);
+	GLADES_LOWP_ENSURE(WIn, WInLowp);
+	if (!tieEmbeddings)
+		GLADES_LOWP_ENSURE(WOut, WOutLowp);
+
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		Block& b = blocks[li];
+		GLADES_LOWP_ENSURE(b.Wq, b.WqLowp);
+		GLADES_LOWP_ENSURE(b.Wk, b.WkLowp);
+		GLADES_LOWP_ENSURE(b.Wv, b.WvLowp);
+		GLADES_LOWP_ENSURE(b.Wo, b.WoLowp);
+		GLADES_LOWP_ENSURE(b.W1, b.W1Lowp);
+		GLADES_LOWP_ENSURE(b.W2, b.W2Lowp);
+	}
+#undef GLADES_LOWP_ENSURE
+
+	lowpReady = true;
+	// lowpDType is set by the caller (sgd_transformer) based on
+	// TrainingConfig.mixedPrecision.weightDType; only BF16 is supported here.
+	return true;
 }
 
 // ---- GpuTransformerScratch ----

@@ -11666,6 +11666,22 @@ if (ad_.valid) { \
 			if (gpuPerf)
 				gpu::perfRecordSync(&gpuPerf->counters, 1u);
 			gpu::synchronizeComputeStream();
+
+			// Refresh the device-side BF16 weight mirrors from the just-updated
+			// FP32 masters so the next forward pass reads weights consistent
+			// with the optimizer's update. No-op when mixed precision is off.
+			if (cfg.mpEnable && gpuTransformerWeights)
+			{
+				gpuTransformerWeights->lowpDType =
+				    glades::transformer_kernels::LOWP_BF16;
+				if (!gpuTransformerWeights->ensureLowpMirrors())
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: failed to refresh BF16 weight mirrors");
+					storeRunningFlag(false);
+				}
+			}
+
 			seqInBatch = 0u;
 			timeStepsInBatch = 0u;
 		}

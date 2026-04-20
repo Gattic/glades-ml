@@ -115,6 +115,9 @@ struct GpuTransformerWeights
 	GpuBuffer<float> vTokE;   // Adam m1
 	GpuBuffer<float> v2TokE;  // Adam m2
 	GpuBuffer<float> gTokE;   // gradients
+	// BF16 low-precision mirror, kept in sync with the FP32 master after each
+	// optimizer step (ensureGpuLowpMirrors). Empty when mixed precision is off.
+	GpuBuffer<uint16_t> tokELowp;
 
 	// LM head bias: [vocabSize]
 	GpuBuffer<float> lmBias;
@@ -127,6 +130,7 @@ struct GpuTransformerWeights
 	GpuBuffer<float> vWIn;
 	GpuBuffer<float> v2WIn;
 	GpuBuffer<float> gWIn;
+	GpuBuffer<uint16_t> WInLowp;
 	GpuBuffer<float> bIn;    // [dModel]
 	GpuBuffer<float> mBIn;
 	GpuBuffer<float> v2BIn;
@@ -137,6 +141,7 @@ struct GpuTransformerWeights
 	GpuBuffer<float> vWOut;
 	GpuBuffer<float> v2WOut;
 	GpuBuffer<float> gWOut;
+	GpuBuffer<uint16_t> WOutLowp;
 	GpuBuffer<float> bOut;   // [outSize]
 	GpuBuffer<float> mBOut;
 	GpuBuffer<float> v2BOut;
@@ -170,6 +175,7 @@ struct GpuTransformerWeights
 		GpuBuffer<float> vWq, vWk, vWv, vWo;
 		GpuBuffer<float> v2Wq, v2Wk, v2Wv, v2Wo;
 		GpuBuffer<float> gWq, gWk, gWv, gWo;
+		GpuBuffer<uint16_t> WqLowp, WkLowp, WvLowp, WoLowp;
 		GpuBuffer<float> bq, bk, bv, bo;     // [dModel] or [dModelKV]
 		GpuBuffer<float> mBq, mBk, mBv, mBo;
 		GpuBuffer<float> v2Bq, v2Bk, v2Bv, v2Bo;
@@ -190,6 +196,7 @@ struct GpuTransformerWeights
 		GpuBuffer<float> vW1, vW2;
 		GpuBuffer<float> v2W1, v2W2;
 		GpuBuffer<float> gW1, gW2;
+		GpuBuffer<uint16_t> W1Lowp, W2Lowp;
 		GpuBuffer<float> b1, b2;     // [dFF or 2*dFF], [dModel]
 		GpuBuffer<float> mB1, mB2;
 		GpuBuffer<float> v2B1, v2B2;
@@ -298,6 +305,15 @@ struct GpuTransformerWeights
 	GpuMuonWeightState muonWIn;
 	GpuMuonWeightState muonWOut;
 
+	// BF16 mixed-precision state.
+	// When mixed precision is enabled (training_config.mixedPrecision.enable),
+	// the *Lowp buffers above hold a BF16 mirror of every major weight matrix,
+	// refreshed from the FP32 master after every optimizer step. Inference and
+	// BF16 matmul paths read from the Lowp mirrors; gradients and master
+	// weights stay FP32 throughout.
+	bool lowpReady;      // true after ensureLowpMirrors has populated all Lowp buffers
+	int  lowpDType;      // glades::transformer_kernels::LOWP_BF16 (others unsupported on GPU for now)
+
 	GpuTransformerWeights();
 	~GpuTransformerWeights();
 
@@ -317,6 +333,13 @@ struct GpuTransformerWeights
 	// Allocate ECHO-specific batched observe / metric metadata buffers on demand.
 	// Plain AdamW and non-ECHO ATLAS variants do not need these arrays.
 	bool ensureEchoBuffers();
+
+	// Allocate every BF16 Lowp mirror (if not already sized) and populate each
+	// one from its FP32 master via the on-device cast kernel. Should be called
+	// once after the FP32 weights have been uploaded (ensureGpuState) and then
+	// after every optimizer step while mixed precision is enabled.
+	// Returns false if any device allocation or cast kernel dispatch fails.
+	bool ensureLowpMirrors();
 };
 
 // GPU-resident forward/backward scratch buffers for transformer training.

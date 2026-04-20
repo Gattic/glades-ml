@@ -80,6 +80,36 @@ bool sgemm_rowmajor_abt_exact(int M, int N, int K,
                               float beta,
                               float* C, int ldc);
 
+// === BF16 GEMM wrappers ===
+//
+// Inputs A and B are BF16 (uint16_t storage). Compute accumulates in FP32 via
+// tensor cores (CUBLAS_COMPUTE_32F). Output C is FP32. The row-major layout
+// matches the float variants: C[M,N] = alpha * A[M,K] * B[K,N] + beta * C[M,N]
+// (plus the usual transposed variants for weight-grad and attention paths).
+//
+// Tensor cores on SM 8.0+ (Ampere/Ada/Hopper) accelerate these. On pre-Ampere
+// hardware cuBLAS will fall back to a software path.
+bool sgemm_rowmajor_bf16(int M, int N, int K,
+                         float alpha,
+                         const unsigned short* A, int lda,
+                         const unsigned short* B, int ldb,
+                         float beta,
+                         float* C, int ldc);
+
+bool sgemm_rowmajor_atb_bf16(int M, int N, int K,
+                             float alpha,
+                             const unsigned short* A, int lda,
+                             const unsigned short* B, int ldb,
+                             float beta,
+                             float* C, int ldc);
+
+bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
+                             float alpha,
+                             const unsigned short* A, int lda,
+                             const unsigned short* B, int ldb,
+                             float beta,
+                             float* C, int ldc);
+
 // Row-major right-side upper-triangular solve (in-place):
 // Solves X[M,N] * R[N,N] = alpha * B[M,N]  where R is upper triangular.
 // B is overwritten with the solution X.
@@ -230,6 +260,9 @@ inline bool sgemm_rowmajor_atb(int, int, int, float, const float*, int, const fl
 inline bool sgemm_rowmajor_atb_exact(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt_exact(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_atb_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, float, float*) { return false; }
 inline bool sgemm_batched_strided(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
 inline bool sgemm_batched_strided_abt(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
