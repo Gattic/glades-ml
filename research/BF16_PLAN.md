@@ -151,7 +151,32 @@ Regression: parity unchanged at 5.1e-5 after adding backward wiring.
 All 10 backward input-grad sites are wired through `gpu_gemm_mp`. Weight
 mirrors supply the BF16 operand.
 
-### 5. Loss-scaling wiring (~2h)
+### 5. Loss-scaling wiring — NOT NEEDED for BF16
+
+Loss scaling is a remedy for **FP16's 5-bit exponent** underflowing
+small gradient magnitudes. BF16 has an 8-bit exponent (identical to
+FP32's range ~1e-38..1e+38), so no gradient representable in FP32 can
+underflow when cast to BF16. In our implementation all gradients stay
+in FP32 anyway (cast happens only on forward/backward activation
+inputs into GEMM/attention, not on gradient outputs), so even the
+narrow mantissa of BF16 doesn't bite.
+
+The scaffolding is present (`MixedPrecisionConfig::useLossScaling`,
+`TensorTransformerState::mpLossScale`, growth / backoff functions on
+the CPU path) should an FP16 variant be wired later. For BF16
+deployments, this task is intentionally a no-op — the config defaults
+`useLossScaling=false` when `weightDType==BF16`.
+
+### BF16 backward flash attention (DONE 2026-04-20)
+
+Parallel to forward BF16 flash attention: Q/K/V are loaded as BF16 in
+both pass-1 (runMax/runSum) and pass-2 (dQ/dK/dV). O, dO, dQ, dK, dV
+stay FP32 since each is only loaded/written once. Softmax, atomic
+adds, accumulations all in FP32. Falls back to FP32 if the
+multi-query shmem budget exceeds device opt-in.
+
+Wired into `transformerGpuTrainEpoch` alongside forward BF16
+flash attention. Parity at 2.98e-05 relative NLL drift unchanged.
 
 `MixedPrecisionConfig::useLossScaling` + `mpLossScale` are plumbed through
 `TransformerEpochCfg` but not currently applied in the GPU backward.
