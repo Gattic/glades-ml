@@ -9328,16 +9328,47 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 			// Flash-style packed multi-head attention without materializing T*T scores/probs.
 			float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
-			gpu::flash_attention_multihead_forward(
-			    Q_l, K_l, V_l,
-			    static_cast<int>(T),
-			    static_cast<int>(nHeads),
-			    static_cast<int>(nKVHeads),
-			    static_cast<int>(dHead),
-			    static_cast<int>(dModel),
-			    static_cast<int>(dModelKV),
-			    causal,
-			    attnConcat_l);
+			if (useBf16)
+			{
+				// Cast Q/K/V to BF16 scratches and invoke the BF16 flash
+				// kernel. Halves the attention memory bandwidth (dominant
+				// at long seq) and leaves softmax/accumulation in FP32 for
+				// numerical stability.
+				glades::gpu::cast_f32_to_bf16(Q_l,
+				    gpuTransformerScratch->qLowp.data(),
+				    static_cast<size_t>(T) * dModel);
+				glades::gpu::cast_f32_to_bf16(K_l,
+				    gpuTransformerScratch->kLowp.data(),
+				    static_cast<size_t>(T) * dModelKV);
+				glades::gpu::cast_f32_to_bf16(V_l,
+				    gpuTransformerScratch->vLowp.data(),
+				    static_cast<size_t>(T) * dModelKV);
+				gpu::flash_attention_multihead_forward_bf16(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    static_cast<int>(T),
+				    static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads),
+				    static_cast<int>(dHead),
+				    static_cast<int>(dModel),
+				    static_cast<int>(dModelKV),
+				    causal,
+				    attnConcat_l);
+			}
+			else
+			{
+				gpu::flash_attention_multihead_forward(
+				    Q_l, K_l, V_l,
+				    static_cast<int>(T),
+				    static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads),
+				    static_cast<int>(dHead),
+				    static_cast<int>(dModel),
+				    static_cast<int>(dModelKV),
+				    causal,
+				    attnConcat_l);
+			}
 
 			// Wo projection
 			float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;

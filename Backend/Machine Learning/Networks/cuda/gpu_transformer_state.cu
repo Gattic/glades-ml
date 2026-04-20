@@ -547,6 +547,12 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 		if (sT * sis  > widest) widest = sT * sis;
 		if (!activationLowp.allocate(widest)) return false;
 		if (!activationLowp2.allocate(widest)) return false;
+		// Q/K/V BF16 scratches: one layer's worth each. Use max(dModel, dModelKV)
+		// to cover both Q (dModel) and K/V (dModelKV) within a single dimension.
+		const size_t qkvMax = (sdm > sdmkv ? sT * sdm : sT * sdmkv);
+		if (!qLowp.allocate(sT * sdm)) return false;
+		if (!kLowp.allocate(qkvMax)) return false;
+		if (!vLowp.allocate(qkvMax)) return false;
 	}
 
 	// GPU loss computation scalars

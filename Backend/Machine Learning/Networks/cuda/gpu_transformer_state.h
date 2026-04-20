@@ -415,6 +415,12 @@ struct GpuTransformerScratch
 	// Secondary BF16 activation staging used when two distinct activations
 	// must be live at once (e.g. dY and X for the weight-grad GEMM).
 	GpuBuffer<uint16_t> activationLowp2;
+	// BF16 scratches for Q/K/V that feed flash_attention_multihead_forward_bf16.
+	// Only live for the current layer's attention forward; cast from the FP32
+	// Q/K/V buffers right before the attention call.
+	GpuBuffer<uint16_t> qLowp;
+	GpuBuffer<uint16_t> kLowp;
+	GpuBuffer<uint16_t> vLowp;
 
 	// GPU loss computation scalars
 	GpuBuffer<float> lossSum;    // [1]

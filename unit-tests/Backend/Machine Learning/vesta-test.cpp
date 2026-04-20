@@ -1187,6 +1187,79 @@ void VESTAGpuBf16TrainShapeReproTest()
 	ASSERT("BF16 train-shape: no Inf output", infCount == 0);
 }
 
+// Parity test for the BF16 flash attention variant. Runs both the FP32 and
+// BF16 kernels on the same inputs (BF16 uses cast versions of the FP32
+// tensors) and asserts the outputs agree within BF16 quantization tolerance.
+void VESTAGpuBf16FlashAttentionTest()
+{
+	printf("[vesta] GpuBf16FlashAttentionTest\n");
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+
+	const int T = 32, nHeads = 4, nKVHeads = 4, dHead = 16;
+	const int dModel = nHeads * dHead;
+	const int dModelKV = nKVHeads * dHead;
+	const bool causal = true;
+
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xF1A5A77EULL);
+	std::vector<float> Q(T * dModel), K(T * dModelKV), V(T * dModelKV);
+	for (size_t i = 0; i < Q.size(); ++i) Q[i] = glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < K.size(); ++i) K[i] = glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < V.size(); ++i) V[i] = glades::rng::standard_normal(eng);
+
+	glades::gpu::GpuBuffer<float> dQ, dK, dV, dO_fp, dO_bf;
+	glades::gpu::GpuBuffer<uint16_t> dQ_bf, dK_bf, dV_bf;
+	ASSERT("alloc flash-bf16",
+	    dQ.allocate(Q.size()) && dK.allocate(K.size()) && dV.allocate(V.size())
+	    && dO_fp.allocate(T * dModel) && dO_bf.allocate(T * dModel)
+	    && dQ_bf.allocate(Q.size()) && dK_bf.allocate(K.size()) && dV_bf.allocate(V.size()));
+	ASSERT("upload",
+	    dQ.upload(&Q[0], Q.size()) && dK.upload(&K[0], K.size())
+	    && dV.upload(&V[0], V.size()));
+	ASSERT("cast Q/K/V to bf16",
+	    glades::gpu::cast_f32_to_bf16(dQ.data(), dQ_bf.data(), Q.size()) &&
+	    glades::gpu::cast_f32_to_bf16(dK.data(), dK_bf.data(), K.size()) &&
+	    glades::gpu::cast_f32_to_bf16(dV.data(), dV_bf.data(), V.size()));
+
+	// FP32 reference.
+	ASSERT("flash fp32", glades::gpu::flash_attention_multihead_forward(
+	    dQ.data(), dK.data(), dV.data(),
+	    T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	    dO_fp.data()));
+	// BF16 variant.
+	ASSERT("flash bf16", glades::gpu::flash_attention_multihead_forward_bf16(
+	    dQ_bf.data(), dK_bf.data(), dV_bf.data(),
+	    T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal,
+	    dO_bf.data()));
+
+	std::vector<float> Ofp(T * dModel), Obf(T * dModel);
+	ASSERT("download", dO_fp.download(&Ofp[0], Ofp.size())
+	    && dO_bf.download(&Obf[0], Obf.size()));
+
+	float fpNorm = 0.0f, errNorm = 0.0f;
+	int nanCount = 0;
+	for (size_t i = 0; i < Ofp.size(); ++i)
+	{
+		if (Obf[i] != Obf[i]) { ++nanCount; continue; }
+		fpNorm += Ofp[i] * Ofp[i];
+		const float e = Obf[i] - Ofp[i];
+		errNorm += e * e;
+	}
+	const float relFro = sqrtf(errNorm / (fpNorm + 1e-12f));
+	printf("  flash bf16 vs fp32: relFro=%.3g  nan=%d\n", relFro, nanCount);
+	ASSERT("BF16 flash no NaN", nanCount == 0);
+	// BF16 has ~3 decimal digits precision; softmax over 32 tokens compounds
+	// roundoff. 2% is a safe-but-informative bound at this scale.
+	ASSERT("BF16 flash relFro < 2%%", relFro < 0.02f);
+}
+
 // End-to-end smoke test: tiny transformer with BF16 mixed precision enabled.
 // Verifies that training (a) doesn't crash, (b) doesn't produce NaN/Inf,
 // (c) the BF16 forward path yields NLL within a generous tolerance of the
@@ -3993,6 +4066,7 @@ void VESTAUnitTest()
 	VESTAGpuBf16CastTest();
 	VESTAGpuBf16GemmTest();
 	VESTAGpuBf16TrainShapeReproTest();
+	VESTAGpuBf16FlashAttentionTest();
 	VESTATransformerBf16ParityTest();
 	VESTAComplementMomentumTest();
 	VESTATrackedEmaTest();

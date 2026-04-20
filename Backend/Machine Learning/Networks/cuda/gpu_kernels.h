@@ -187,6 +187,15 @@ bool flash_attention_multihead_forward(const float* Q, const float* K, const flo
                                        int dHead, int dModel, int dModelKV,
                                        bool causal, float* O);
 
+// BF16-input variant: Q/K/V are uint16_t BF16 values; softmax/accumulation
+// stays FP32 inside the kernel. Reduces attention memory traffic by 2x
+// (the dominant cost at long seq length).
+bool flash_attention_multihead_forward_bf16(const uint16_t* Q, const uint16_t* K,
+                                            const uint16_t* V,
+                                            int T, int nHeads, int nKVHeads,
+                                            int dHead, int dModel, int dModelKV,
+                                            bool causal, float* O);
+
 // Backward for packed multi-head/GQA flash-style attention.
 // dQ is written per query head; dK/dV are accumulated per KV head.
 bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
@@ -367,6 +376,7 @@ inline bool adam_update_batch(float**, float**, float**, float**,
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
 inline bool flash_attention_multihead_forward(const float*, const float*, const float*, int, int, int, int, int, int, bool, float*) { return false; }
+inline bool flash_attention_multihead_forward_bf16(const unsigned short*, const unsigned short*, const unsigned short*, int, int, int, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_multihead_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 
 inline bool reduce_rows_sum(const float*, int, int, float, float*) { return false; }

@@ -39,6 +39,7 @@ void VESTAGpuSingleRefreshTest();
 void VESTAGpuBf16CastTest();
 void VESTAGpuBf16GemmTest();
 void VESTAGpuBf16TrainShapeReproTest();
+void VESTAGpuBf16FlashAttentionTest();
 void VESTATransformerBf16ParityTest();
 void VESTAGpuRefreshBenchmark();
 void VESTAGpuStepBenchmark();
