@@ -9086,12 +9086,12 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	const bool useBf16 = cfg.mpEnable && gpuTransformerWeights
 	    && (trainingConfig.mixedPrecision.weightDType ==
 	        glades::MixedPrecisionConfig::WEIGHT_BF16);
-	// Per-site BF16 enable bitmask. Default is 0 (all sites take the FP32
-	// fallback even when useBf16 is true) until the forward-NaN debug from
-	// research/BF16_PLAN.md lands. Opt-in via env: GLADES_BF16_SITES=0xFF
-	// enables all forward GEMMs; bit i selects site i (see table below).
+	// Per-site BF16 enable bitmask. Default when useBf16 is true is 0xFF
+	// (all forward GEMMs take the BF16 path). GLADES_BF16_SITES env var
+	// overrides for per-site rollout / parity debugging.
+	// Bits: 0=WIn, 1=Wq, 2=Wk, 3=Wv, 4=Wo, 5=W1, 6=W2, 7=tied-head.
 	const char* bf16SitesEnv = std::getenv("GLADES_BF16_SITES");
-	unsigned int bf16SitesMask = 0u;
+	unsigned int bf16SitesMask = useBf16 ? 0xFFu : 0u;
 	if (bf16SitesEnv)
 		bf16SitesMask = static_cast<unsigned int>(strtoul(bf16SitesEnv, NULL, 0));
 	// Site bits: 0=WIn, 1=Wq, 2=Wk, 3=Wv, 4=Wo, 5=W1, 6=W2, 7=tied-head.

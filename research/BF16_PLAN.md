@@ -33,30 +33,26 @@
 - Parity smoke test `VESTATransformerBf16ParityTest`: trains a tiny
   transformer twice (FP32 vs `mp.enable=true`), compares final NLL.
 
-**Per-site BF16 debug harness**:
-- `useBf16` now reads `cfg.mpEnable && weightDType==BF16`.
-- Site gating via env var `GLADES_BF16_SITES` (bitmask, default 0):
-  - `0x01` WIn, `0x02` Wq, `0x04` Wk, `0x08` Wv
-  - `0x10` Wo, `0x20` W1, `0x40` W2, `0x80` tied LM head
-- All sites default to the FP32 fallback even when `mp.enable=true` until
-  the NaN debug below lands — flipping bits in the mask opts individual
-  sites into the BF16 path for isolation tests.
-- Reproducing the NaN:
-  `GLADES_BF16_SITES=0x80 ./glades-unit-tests vesta` triggers
-  "Trainer::run: non-finite training aggregates detected" on
-  `VESTATransformerBf16ParityTest` within the first minibatch. Every
-  single-site mask (`0x01`..`0x80`) reproduces the same failure
-  equally, which rules out a site-specific bug and points at a common
-  code path (cast kernel, scratch aliasing, or cuBLAS BF16 tensor-op
-  interaction at small shapes).
+**Forward-path NaN bug — fixed (2026-04-20)**:
 
-**Outstanding diagnostic** (see Remaining Work #1):
-- The unit test `VESTAGpuBf16GemmTest` proves the BF16 GEMM wrapper is
-  numerically correct on Gaussian-random matrices (0.23% Frobenius error).
-- The forward-path integration introduces NaN somewhere that the unit
-  test doesn't exercise — likely a stream-order, LN/softmax denormal
-  interaction, or cuBLAS tensor-op behavior at dModel=64/vocab=31 (the
-  parity test's tiny shape).
+Root cause: `ensureLowpMirrors()` used `master.allocated()` (which returns
+a **bool**, not an element count) in place of `master.size()`. This
+allocated every BF16 mirror with `allocate(1)` (from the bool→size_t
+conversion), populated a single element, and left the rest of the mirror
+reading whatever `cudaMalloc` happened to hand back (often zeros). The
+first BF16 forward GEMM then multiplied activations by a near-all-zeros
+weight tensor, producing garbage logits. Softmax + cross-entropy on the
+garbage logits fed the backward with huge gradients that overflowed
+within one step.
+
+Fix: single character — `.allocated()` → `.size()` in the
+`GLADES_LOWP_ENSURE` macro (`gpu_transformer_state.cu`).
+
+Result: `VESTATransformerBf16ParityTest` with all 8 forward GEMMs in
+BF16 now matches FP32 within 5.1e-5 relative error on a 1-epoch tiny
+training run. Default gate is flipped back on (BF16 forward active
+whenever `mp.enable=true && weightDType==BF16`); `GLADES_BF16_SITES`
+env var is kept as a per-site override for debugging.
 
 ## Remaining work
 

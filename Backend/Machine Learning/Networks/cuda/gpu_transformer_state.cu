@@ -385,9 +385,9 @@ bool GpuTransformerWeights::ensureLowpMirrors()
 	// Helper captures the shape from the master buffer's allocated size.
 #define GLADES_LOWP_ENSURE(master, mirror)                                 \
 	do {                                                                   \
-		const size_t n_ = (master).allocated();                            \
+		const size_t n_ = (master).size();                                 \
 		if (n_ == 0) { break; }                                            \
-		if ((mirror).allocated() != n_) {                                  \
+		if ((mirror).size() != n_) {                                       \
 			if (!(mirror).allocate(n_)) return false;                      \
 		}                                                                  \
 		if (!cast_f32_to_bf16((master).data(), (mirror).data(), n_))       \

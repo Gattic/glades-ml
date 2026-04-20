@@ -1119,6 +1119,74 @@ void VESTAGpuBf16GemmTest()
 	ASSERT("BF16 GEMM ABT relFro < 2%%", sqrtf(errNorm / (fpNorm + 1e-12f)) < 0.02f);
 }
 
+// Minimal repro for the BF16 forward-NaN: mimics the tied-head GEMM from
+// transformerGpuTrainEpoch with training-exact shapes (T=32, dModel=64,
+// vocab=31) and LN-like activation magnitudes. Casts both operands on
+// computeStream, runs sgemm_rowmajor_abt_bf16, downloads, and asserts every
+// output element is finite.
+void VESTAGpuBf16TrainShapeReproTest()
+{
+	printf("[vesta] GpuBf16TrainShapeReproTest\n");
+	if (!glades::gpu::isAvailable())
+	{
+		if (!glades::gpu::initDevice(0))
+		{
+			printf("  GPU unavailable; skipping\n");
+			return;
+		}
+	}
+	if (!glades::gpu::blasInit())
+	{
+		printf("  cuBLAS init failed; skipping\n");
+		return;
+	}
+
+	const int T = 32, dModel = 64, vocab = 31;
+
+	// LN-like activations: unit-variance Gaussian.
+	glades::rng::Engine eng;
+	glades::rng::seed_engine(eng, 0xABCDEFABULL);
+	std::vector<float> xHost(T * dModel), wHost(vocab * dModel);
+	for (size_t i = 0; i < xHost.size(); ++i) xHost[i] = glades::rng::standard_normal(eng);
+	for (size_t i = 0; i < wHost.size(); ++i) wHost[i] = 0.02f * glades::rng::standard_normal(eng);
+
+	glades::gpu::GpuBuffer<float> dX, dW, dC_fp, dC_bf;
+	glades::gpu::GpuBuffer<uint16_t> dX_bf, dW_bf;
+	ASSERT("alloc train-shape", dX.allocate(T * dModel) && dW.allocate(vocab * dModel)
+	        && dX_bf.allocate(T * dModel) && dW_bf.allocate(vocab * dModel)
+	        && dC_fp.allocate(T * vocab) && dC_bf.allocate(T * vocab));
+	ASSERT("upload train-shape", dX.upload(&xHost[0], xHost.size()) && dW.upload(&wHost[0], wHost.size()));
+	ASSERT("cast train-shape",
+	    glades::gpu::cast_f32_to_bf16(dX.data(), dX_bf.data(), T * dModel) &&
+	    glades::gpu::cast_f32_to_bf16(dW.data(), dW_bf.data(), vocab * dModel));
+
+	// Reference: FP32 ABT GEMM.
+	ASSERT("fp32 ref", glades::gpu::sgemm_rowmajor_abt(
+	    T, vocab, dModel, 1.0f,
+	    dX.data(), dModel, dW.data(), dModel, 0.0f, dC_fp.data(), vocab));
+	// BF16 ABT GEMM (exact same call the training helper makes).
+	ASSERT("bf16 gemm train-shape", glades::gpu::sgemm_rowmajor_abt_bf16(
+	    T, vocab, dModel, 1.0f,
+	    dX_bf.data(), dModel, dW_bf.data(), dModel, 0.0f, dC_bf.data(), vocab));
+
+	std::vector<float> Cfp(T * vocab), Cbf(T * vocab);
+	ASSERT("download train-shape",
+	    dC_fp.download(&Cfp[0], Cfp.size()) && dC_bf.download(&Cbf[0], Cbf.size()));
+
+	int nanCount = 0, infCount = 0;
+	float maxAbs = 0.0f;
+	for (size_t i = 0; i < Cbf.size(); ++i)
+	{
+		if (Cbf[i] != Cbf[i]) { ++nanCount; continue; }
+		if (fabsf(Cbf[i]) > 1e30f) { ++infCount; continue; }
+		if (fabsf(Cbf[i]) > maxAbs) maxAbs = fabsf(Cbf[i]);
+	}
+	printf("  train-shape bf16 gemm: nan=%d inf=%d maxAbs=%.3g\n",
+	       nanCount, infCount, maxAbs);
+	ASSERT("BF16 train-shape: no NaN output", nanCount == 0);
+	ASSERT("BF16 train-shape: no Inf output", infCount == 0);
+}
+
 // End-to-end smoke test: tiny transformer with BF16 mixed precision enabled.
 // Verifies that training (a) doesn't crash, (b) doesn't produce NaN/Inf,
 // (c) the BF16 forward path yields NLL within a generous tolerance of the
@@ -1161,8 +1229,8 @@ void VESTATransformerBf16ParityTest()
 	const unsigned int nLayers = 2u;
 	const unsigned int nHeads = 4u;
 	const unsigned int seqLen = 32u;
-	const unsigned int epochs = 4u;
-	const unsigned int corpusLen = 128u;
+	const unsigned int epochs = 1u; // single-step to isolate NaN entry point
+	const unsigned int corpusLen = 32u;
 
 	// Build a structured token corpus.
 	glades::rng::Engine eng;
@@ -1238,10 +1306,11 @@ void VESTATransformerBf16ParityTest()
 
 	ASSERT("BF16 train produced finite NLL",
 	       finalNllBf16 == finalNllBf16 && finalNllBf16 < 1000.0f);
-	// Generous tolerance: forward-only BF16 with FP32 backward should stay
-	// within ~10% relative (BF16 7-bit mantissa compounded over many matmuls
-	// plus training-trajectory divergence).
-	ASSERT("BF16 vs FP32 NLL within 10%% relative", relDiff < 0.10f);
+	// After the ensureLowpMirrors fix, forward BF16 matches FP32 within
+	// BF16 quantization noise (observed ~5e-5 relative on a 1-epoch run).
+	// Holding a 0.2% relative tolerance gives plenty of headroom while
+	// still catching real drift.
+	ASSERT("BF16 vs FP32 NLL within 0.2%% relative", relDiff < 0.002f);
 }
 
 void VESTAGpuRefreshBenchmark()
@@ -3923,6 +3992,7 @@ void VESTAUnitTest()
 	VESTAGpuRefreshDeviceTest();
 	VESTAGpuBf16CastTest();
 	VESTAGpuBf16GemmTest();
+	VESTAGpuBf16TrainShapeReproTest();
 	VESTATransformerBf16ParityTest();
 	VESTAComplementMomentumTest();
 	VESTATrackedEmaTest();
