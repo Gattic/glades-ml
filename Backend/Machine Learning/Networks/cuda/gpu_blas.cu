@@ -883,6 +883,10 @@ static bool gemmex_bf16_impl(cublasOperation_t transa, cublasOperation_t transb,
 	if (!g_initialized && !blasInit())
 		return false;
 
+	// CUBLAS_COMPUTE_32F_FAST_16BF: compute via BF16 tensor cores with FP32
+	// accumulate. This is the explicit BF16 tensor-core path and can be faster
+	// on Ampere/Ada than plain CUBLAS_COMPUTE_32F with BF16 inputs, which may
+	// defensively promote to TF32.
 	cublasStatus_t st = cublasGemmEx(g_handle,
 	                                 transa, transb,
 	                                 N, M, K,
@@ -891,7 +895,7 @@ static bool gemmex_bf16_impl(cublasOperation_t transa, cublasOperation_t transb,
 	                                 A, CUDA_R_16BF, lda,
 	                                 &beta,
 	                                 C, CUDA_R_32F, ldc,
-	                                 CUBLAS_COMPUTE_32F,
+	                                 CUBLAS_COMPUTE_32F_FAST_16BF,
 	                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 	if (st != CUBLAS_STATUS_SUCCESS)
 	{
