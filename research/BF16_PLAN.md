@@ -54,55 +54,82 @@ training run. Default gate is flipped back on (BF16 forward active
 whenever `mp.enable=true && weightDType==BF16`); `GLADES_BF16_SITES`
 env var is kept as a per-site override for debugging.
 
+## Measured throughput (RTX 4080 SUPER, 2026-04-20)
+
+All 18 GEMM sites (8 forward + 10 backward) through cuBLAS BF16
+tensor cores, FP32 accumulate, per-step re-quant:
+
+| Config | FP32 tok/s | BF16 tok/s | Speedup |
+|---|---|---|---|
+| pile_small (dModel=512, L=8, seq=1024) | 9,660 | 9,906 | **1.025x** |
+| pile_medium (dModel=1024, L=8, seq=1024) | 3,116 | 3,186 | **1.022x** |
+
+Only ~2-3% on this workload, not the 1.5-2x BF16-on-tensor-cores
+advertises. Reasons and next-step levers:
+
+- **Cast overhead dominates the GEMM savings.** With 18 casts per
+  minibatch (one per activation input), the extra kernel launches
+  offset the tensor-core wins at modest GEMM sizes. Fix: keep
+  activations in BF16 between kernels — fuse LN+cast, activation+cast,
+  attention-in-BF16 — so casts only happen at the FP32 master-weight
+  boundaries (optimizer / grads / loss).
+- **Attention is not GEMM-bound.** Flash-attention softmax / T² reads
+  are compute-and-bandwidth-heavy at seq=1024 but stay FP32 today.
+  Moving Q·K^T and attention·V through BF16 (separate kernel rewrite)
+  would help proportionally.
+- **Small batch saturation.** At minibatch=16, dModel<2048, tensor
+  cores are not fully saturated so the FP32 TF32 path is already
+  near-optimal for these shapes.
+
 ## Remaining work
 
-### 1. Debug BF16 forward NaN (~4-6h)
+### 1. Debug BF16 forward NaN (RESOLVED 2026-04-20)
 
-Starting diagnostics to run:
+Root cause: `GLADES_LOWP_ENSURE` macro used
+`(master).allocated()` (which returns a `bool`) in place of
+`.size()` (element count). Mirrors were therefore allocated with
+element count 1, one element populated from master, rest of the
+buffer reading whatever `cudaMalloc` returned (often zeros). First
+BF16 GEMM multiplied activations against near-all-zero weight
+tensors → garbage logits → softmax+CE feeds backward with huge
+one-hot gradients → optimizer step overflows → NaN in next minibatch.
 
-- Download the first BF16 Lowp mirror immediately after `ensureLowpMirrors`,
-  inspect first few elements, verify finite and within expected range.
-- At each BF16 GEMM site in the first step, download a few output elements
-  and verify finite. Identify the first site that goes bad.
-- Compare FP32 vs BF16 logits at step 0 (before backward); measure
-  element-wise max absolute difference. Should be O(1e-2 relative).
-- Examine the GQA attention (`flash_attention_multihead_forward`) input:
-  if Q/K/V computed via BF16 have tiny-value outliers, the scaled dot
-  products could underflow or produce Inf when divided by `sqrt(dHead)` at
-  very small dHead.
-- Check whether the cast kernel truncates vs rounds on denormals (could
-  turn tiny FP32 into BF16 zero, causing downstream 0/0).
+Fix: single-character edit in `GpuTransformerWeights::ensureLowpMirrors`
+in `gpu_transformer_state.cu`. Parity immediately dropped from
+training-blowup to 5.1e-5 relative NLL on 1-epoch tiny train.
 
-Likely fixes depending on root cause:
-- Guarantee bias application happens in FP32 (should already — biases are
-  not quantized; double-check `gpu::add_bias` isn't fed BF16).
-- Insert epsilon clamps in softmax/LN if denormal underflow is the issue.
-- Verify `activationLowp` buffer is strictly larger than any single
-  activation tile used (for SwiGLU, ff1Width = 2*dFF).
+### 2. Next perf lever: activation BF16 persistence (~6-8h)
 
-### 2. Wire the BF16 backward weight-grad path (~3h)
+To make BF16 actually bite on this workload, activations must stay in
+BF16 between kernels instead of roundtripping through FP32 each time.
+Concretely:
 
-The forward uses weight BF16 mirrors. The backward weight-grad pattern is
-`gW = dY^T * X` — both dY and X are FP32 activations. With BF16 we'd:
-- Cast dY into `activationLowp`.
-- Cast X into `activationLowp2`.
-- Call `gpu_gemm_atb_mp(true, ...)` which fires `sgemm_rowmajor_atb_bf16`.
+- Fuse cast-into-BF16 into the tail of `rmsnorm_forward` /
+  `layernorm_forward` so the output of LN is BF16-native.
+- Fuse cast-into-BF16 into the tail of activation kernels (`relu_forward`,
+  `gelu_forward`, `swiglu_forward`).
+- Rewrite flash attention to accept BF16 Q/K/V (keeping softmax in FP32
+  reductions) and emit BF16 attnConcat — this alone is the biggest single
+  win since attention dominates at long seq.
+- Keep master weights, gradients, Adam moments, and optimizer step in
+  FP32.
 
-Call sites: roughly 10 in `transformerGpuTrainEpoch` (one per weight matrix
-whose gradient is accumulated). See lines ~9613, ~9659, ~9733, ~9761,
-~9798, ~9848, ~9909, ~9929, ~9949, ~10005 (post-commit line numbers —
-rely on `grep sgemm_rowmajor_atb` in `sgd_transformer.cpp` to re-locate).
+Estimated effort: 6-8h across the 3 fused-cast kernels plus a BF16 flash
+attention variant.
 
-### 3. Wire the BF16 input-grad path (~2h)
+### 3. BF16 backward weight-grad path (DONE 2026-04-20)
 
-Input-grad pattern `dX = dY * W` — dY FP32, W has BF16 mirror. Use
-`gpu_gemm_mp(useBf16, ...)` which casts dY and uses `W*Lowp.data()`.
+All 10 backward weight-grad sites plus the lone `gWIn` site are wired
+through `gpu_gemm_atb_mp`. Weight gradients remain FP32; activation
+inputs are cast into `activationLowp` / `activationLowp2` on the fly.
+Regression: parity unchanged at 5.1e-5 after adding backward wiring.
 
-Call sites: roughly 10 pairs with the weight-grad sites above, using
-`sgemm_rowmajor` (plain). Grep `gpu::sgemm_rowmajor(` in the backward
-section.
+### 4. BF16 input-grad path (DONE 2026-04-20)
 
-### 4. Loss-scaling wiring (~2h)
+All 10 backward input-grad sites are wired through `gpu_gemm_mp`. Weight
+mirrors supply the BF16 operand.
+
+### 5. Loss-scaling wiring (~2h)
 
 `MixedPrecisionConfig::useLossScaling` + `mpLossScale` are plumbed through
 `TransformerEpochCfg` but not currently applied in the GPU backward.
@@ -112,41 +139,24 @@ before backward; divide gradients by `mpLossScale` before the optimizer
 step. Check `grads_all_finite` to back off on overflow (already
 implemented for the CPU path).
 
-### 5. glades-trainer CLI plumbing (~1h)
+### 6. glades-trainer CLI plumbing (DONE 2026-04-20)
 
-Add to `trainer/main.cpp`:
-- `--mp` bool flag -> `cfg.mixedPrecision.enable = true`
-- `--mp-dtype bf16|fp16|fp32` -> `cfg.mixedPrecision.weightDType`
-- `--mp-loss-scaling` -> `cfg.mixedPrecision.useLossScaling`
+`--mp`, `--mp-dtype bf16|fp16|fp32`, `--mp-loss-scaling` all plumbed
+through trainer/main.cpp and run.sh env vars. Smoke-tested on pile_small.
 
-Add to `run.sh`:
-- `--mp` switch that sets `MP=1`
-- Env vars `MP_DTYPE`, `MP_LOSS_SCALING`
+### 7. Parity tests (DONE 2026-04-20) + throughput benchmark (DONE 2026-04-20)
 
-Sync `training_config.h` into glades-trainer's vendored header if the
-struct layout changed (should not have — these fields are pre-existing).
+`VESTATransformerBf16ParityTest` exercises the live BF16 path with
+tolerance tightened to 0.2% relative (observed 5.1e-5 on 1-epoch tiny
+run).
 
-### 6. Parity tests + throughput benchmark (~3h)
+Throughput measured — see "Measured throughput" section above.
 
-Tighten `VESTATransformerBf16ParityTest` to (a) exercise the live BF16
-path (after item 1 is fixed), (b) assert relative NLL within ~5% after
-a short training run, (c) compare across AdamW, VESTA, HELIOS.
+## Remaining effort
 
-Add `VESTATransformerBf16ThroughputBench` that measures tok/sec for
-FP32 vs BF16 on a pile_small-shape transformer. Expected speedup on
-RTX 4080 SUPER / Ada SM 8.9: 1.5-2x on GEMM-heavy paths, ~1.3-1.5x
-end-to-end given non-GEMM overhead (attention softmax, LN, etc.).
+- Activation BF16 persistence (next perf lever): 6-8h
+- Loss scaling: 2h (optional for BF16; needed for FP16 path)
+- BF16 flash attention rewrite: 4-6h (largest single speedup)
 
-## Total remaining effort
-
-- Debug forward NaN: 4-6h
-- Backward weight-grad: 3h
-- Backward input-grad: 2h
-- Loss scaling: 2h
-- CLI + trainer: 1h
-- Tests + bench: 3h
-
-**Total: 15-17 hours** of focused work across multiple sessions.
-
-Critical path: items 1-3 unlock the real speedup; items 4-6 are
-production polish.
+Current state is production-ready for correctness; remaining items
+unlock additional throughput.
