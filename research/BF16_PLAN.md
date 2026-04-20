@@ -33,13 +33,30 @@
 - Parity smoke test `VESTATransformerBf16ParityTest`: trains a tiny
   transformer twice (FP32 vs `mp.enable=true`), compares final NLL.
 
-**Blocked (hard-gated off in code)**:
-- `useBf16` is currently forced to `false` in `transformerGpuTrainEpoch`
-  pending debugging. When flipped to read the config, a tiny 2-layer
-  transformer training run produces non-finite aggregates within the first
-  minibatch. The BF16 GEMMs themselves are numerically correct (unit test
-  proves 0.23% Frobenius error); the failure mode is somewhere in the
-  forward/backward integration.
+**Per-site BF16 debug harness**:
+- `useBf16` now reads `cfg.mpEnable && weightDType==BF16`.
+- Site gating via env var `GLADES_BF16_SITES` (bitmask, default 0):
+  - `0x01` WIn, `0x02` Wq, `0x04` Wk, `0x08` Wv
+  - `0x10` Wo, `0x20` W1, `0x40` W2, `0x80` tied LM head
+- All sites default to the FP32 fallback even when `mp.enable=true` until
+  the NaN debug below lands — flipping bits in the mask opts individual
+  sites into the BF16 path for isolation tests.
+- Reproducing the NaN:
+  `GLADES_BF16_SITES=0x80 ./glades-unit-tests vesta` triggers
+  "Trainer::run: non-finite training aggregates detected" on
+  `VESTATransformerBf16ParityTest` within the first minibatch. Every
+  single-site mask (`0x01`..`0x80`) reproduces the same failure
+  equally, which rules out a site-specific bug and points at a common
+  code path (cast kernel, scratch aliasing, or cuBLAS BF16 tensor-op
+  interaction at small shapes).
+
+**Outstanding diagnostic** (see Remaining Work #1):
+- The unit test `VESTAGpuBf16GemmTest` proves the BF16 GEMM wrapper is
+  numerically correct on Gaussian-random matrices (0.23% Frobenius error).
+- The forward-path integration introduces NaN somewhere that the unit
+  test doesn't exercise — likely a stream-order, LN/softmax denormal
+  interaction, or cuBLAS tensor-op behavior at dModel=64/vocab=31 (the
+  parity test's tiny shape).
 
 ## Remaining work
 
