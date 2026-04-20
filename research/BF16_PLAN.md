@@ -67,12 +67,16 @@ tensor cores, FP32 accumulate, per-step re-quant:
 Only ~2-3% on this workload, not the 1.5-2x BF16-on-tensor-cores
 advertises. Reasons and next-step levers:
 
-- **Cast overhead dominates the GEMM savings.** With 18 casts per
-  minibatch (one per activation input), the extra kernel launches
-  offset the tensor-core wins at modest GEMM sizes. Fix: keep
-  activations in BF16 between kernels — fuse LN+cast, activation+cast,
-  attention-in-BF16 — so casts only happen at the FP32 master-weight
-  boundaries (optimizer / grads / loss).
+- **Cast overhead is NOT the bottleneck** (empirically verified
+  2026-04-20). Hoisting the Q/K/V-shared x1 cast so it runs once per
+  layer instead of three times produced no measurable throughput gain
+  (9866 vs 9906 tok/s pile_small, within noise). This rules out cast
+  overhead as a meaningful target.
+- **GEMM wins are small because TF32 is already fast.** The FP32 path
+  uses `CUBLAS_TF32_TENSOR_OP_MATH` (on SM 8.0+), which already runs
+  on tensor cores at comparable throughput to BF16 at modest shapes.
+  Going from TF32 to BF16 gives less than 2x even in theory at these
+  dModel / batch sizes.
 - **Attention is not GEMM-bound.** Flash-attention softmax / T² reads
   are compute-and-bandwidth-heavy at seq=1024 but stay FP32 today.
   Moving Q·K^T and attention·V through BF16 (separate kernel rewrite)
