@@ -9081,7 +9081,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	// cuBLAS BF16 GEMM wrappers, per-step re-quant hook) is wired end-to-end.
 	// Forward matmul wiring is gated off until a follow-up pass lands parity
 	// testing; enabling it today triggers non-finite aggregates on small
-	// transformers and needs targeted debugging.
+	// transformers and needs targeted debugging (see research/BF16_PLAN.md).
 	const bool useBf16 = false;
 	if (cfg.mpEnable && gpuTransformerWeights
 	    && (trainingConfig.mixedPrecision.weightDType ==
