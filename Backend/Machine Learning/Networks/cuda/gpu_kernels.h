@@ -196,6 +196,18 @@ bool flash_attention_multihead_forward_bf16(const uint16_t* Q, const uint16_t* K
                                             int dHead, int dModel, int dModelKV,
                                             bool causal, float* O);
 
+// BF16-input backward variant. Q/K/V BF16; O/dO/dQ/dK/dV FP32 (each loaded
+// or written once so the traffic savings are negligible there). Returns
+// false if the kernel cannot be launched for the requested shape (caller
+// should route through the FP32 variant in that case).
+bool flash_attention_multihead_backward_bf16(
+    const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+    const float* O, const float* dO,
+    int T, int nHeads, int nKVHeads,
+    int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* dQ, float* dK_out, float* dV_out);
+
 // Backward for packed multi-head/GQA flash-style attention.
 // dQ is written per query head; dK/dV are accumulated per KV head.
 bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
@@ -377,6 +389,7 @@ inline bool flash_attention_forward(const float*, const float*, const float*, in
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
 inline bool flash_attention_multihead_forward(const float*, const float*, const float*, int, int, int, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_multihead_forward_bf16(const unsigned short*, const unsigned short*, const unsigned short*, int, int, int, int, int, int, bool, float*) { return false; }
+inline bool flash_attention_multihead_backward_bf16(const unsigned short*, const unsigned short*, const unsigned short*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 inline bool flash_attention_multihead_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 
 inline bool reduce_rows_sum(const float*, int, int, float, float*) { return false; }

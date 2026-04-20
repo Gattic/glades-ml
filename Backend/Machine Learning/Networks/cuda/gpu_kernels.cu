@@ -2434,7 +2434,198 @@ __global__ void flash_attention_fwd_multiq_kernel_bf16(
 	}
 }
 
+// BF16-input multi-query flash attention backward. Q/K/V are BF16 in global
+// memory (the dominant memory-traffic tensors in backward, loaded in both
+// pass 1 and pass 2). O, dO, dQ, dK, dV stay FP32 since they are each loaded
+// or written once. Softmax / accumulation all in FP32 for numerical
+// stability.
+template <int QROWS>
+__global__ void flash_attention_bwd_multiq_kernel_bf16(
+    const uint16_t* __restrict__ Q,
+    const uint16_t* __restrict__ K,
+    const uint16_t* __restrict__ V,
+    const float* __restrict__ O,
+    const float* __restrict__ dO,
+    int T, int nHeads, int nKVHeads,
+    int dHead, int dModel, int dModelKV,
+    int causal,
+    int flashTile,
+    float* __restrict__ dQ,
+    float* __restrict__ dK_out,
+    float* __restrict__ dV_out)
+{
+	const int qBlock = static_cast<int>(blockIdx.x);
+	const int h = static_cast<int>(blockIdx.y);
+	if (h >= nHeads) return;
+
+	const int warpId = static_cast<int>(threadIdx.x) >> 5;
+	const int laneId = static_cast<int>(threadIdx.x) & 31;
+	const int q = qBlock * QROWS + warpId;
+	const bool myRowActive = (q < T);
+
+	extern __shared__ float smem[];
+	float* sK = smem;
+	float* sV = sK + flashTile * dHead;
+
+	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
+	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
+
+	const uint16_t* qRow = myRowActive
+	    ? (Q + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead)
+	    : Q;
+	const float* oRow  = myRowActive
+	    ? (O  + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead)
+	    : O;
+	const float* doRow = myRowActive
+	    ? (dO + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead)
+	    : dO;
+	float* dqRow = myRowActive
+	    ? (dQ + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead)
+	    : nullptr;
+
+	const float scale = rsqrtf(static_cast<float>(dHead));
+	const int numTiles = (T + flashTile - 1) / flashTile;
+
+	// Pass 1: runMax, runSum.
+	float runMax = -FLT_MAX;
+	float runSum = 0.0f;
+
+	for (int tile = 0; tile < numTiles; ++tile) {
+		const int kStart = tile * flashTile;
+		int tileLen = flashTile;
+		if (kStart + tileLen > T) tileLen = T - kStart;
+
+		const int loadCount = tileLen * dHead;
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = bf16_as_float(K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd]);
+		}
+		__syncthreads();
+
+		if (myRowActive) {
+			for (int j = 0; j < tileLen; ++j) {
+				const int kIdx = kStart + j;
+				if (causal && kIdx > q) break;
+				float partial = 0.0f;
+				for (int d = laneId; d < dHead; d += 32)
+					partial += bf16_as_float(qRow[d]) * sK[j * dHead + d];
+				const float dot = flash_warp_reduce_sum(partial) * scale;
+				if (dot > runMax) {
+					runSum = runSum * expf(runMax - dot);
+					runMax = dot;
+				}
+				runSum += expf(dot - runMax);
+			}
+		}
+		__syncthreads();
+	}
+
+	const float logSumExp = runMax + logf(runSum + 1e-20f);
+
+	float D = 0.0f;
+	if (myRowActive) {
+		float Dpartial = 0.0f;
+		for (int d = laneId; d < dHead; d += 32)
+			Dpartial += doRow[d] * oRow[d];
+		D = flash_warp_reduce_sum(Dpartial);
+
+		for (int d = laneId; d < dHead; d += 32)
+			dqRow[d] = 0.0f;
+	}
+
+	// Pass 2: dQ accumulate, dK/dV via atomic adds.
+	for (int tile = 0; tile < numTiles; ++tile) {
+		const int kStart = tile * flashTile;
+		int tileLen = flashTile;
+		if (kStart + tileLen > T) tileLen = T - kStart;
+
+		const int loadCount = tileLen * dHead;
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = bf16_as_float(K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd]);
+		}
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			const int vr = i / dHead;
+			const int vd = i % dHead;
+			sV[i] = bf16_as_float(V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd]);
+		}
+		__syncthreads();
+
+		if (myRowActive) {
+			for (int j = 0; j < tileLen; ++j) {
+				const int kIdx = kStart + j;
+				if (causal && kIdx > q) break;
+
+				float partialQK = 0.0f;
+				for (int d = laneId; d < dHead; d += 32)
+					partialQK += bf16_as_float(qRow[d]) * sK[j * dHead + d];
+				const float dot = flash_warp_reduce_sum(partialQK) * scale;
+				const float p = expf(dot - logSumExp);
+
+				float partialDoV = 0.0f;
+				for (int d = laneId; d < dHead; d += 32)
+					partialDoV += doRow[d] * sV[j * dHead + d];
+				const float doV = flash_warp_reduce_sum(partialDoV);
+				const float ds = p * (doV - D);
+
+				for (int d = laneId; d < dHead; d += 32)
+					dqRow[d] += ds * scale * sK[j * dHead + d];
+
+				for (int d = laneId; d < dHead; d += 32)
+					atomicAdd(&dK_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
+					          ds * scale * bf16_as_float(qRow[d]));
+				for (int d = laneId; d < dHead; d += 32)
+					atomicAdd(&dV_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
+					          p * doRow[d]);
+			}
+		}
+		__syncthreads();
+	}
+}
+
 } // anonymous namespace
+
+bool flash_attention_multihead_backward_bf16(
+    const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+    const float* O, const float* dO,
+    int T, int nHeads, int nKVHeads,
+    int dHead, int dModel, int dModelKV,
+    bool causal,
+    float* dQ, float* dK_out, float* dV_out)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
+		return true;
+
+	GLADES_CUDA_CHECK(cudaMemset(dK_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
+	GLADES_CUDA_CHECK(cudaMemset(dV_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
+
+	int dev = 0;
+	cudaGetDevice(&dev);
+	int maxOptin = 48 * 1024;
+	cudaDeviceGetAttribute(&maxOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+	const size_t minMultiQ = static_cast<size_t>(4) * static_cast<size_t>(2 * dHead) * sizeof(float);
+	const bool multiQFits = (minMultiQ <= static_cast<size_t>(maxOptin));
+
+	if (multiQFits) {
+		const int flashTile = setup_flash_tile(flash_attention_bwd_multiq_kernel_bf16<kFlashQRows>, dHead);
+		const int block = 32 * kFlashQRows;
+		const dim3 grid(static_cast<unsigned int>((T + kFlashQRows - 1) / kFlashQRows),
+		                static_cast<unsigned int>(nHeads), 1u);
+		const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
+		flash_attention_bwd_multiq_kernel_bf16<kFlashQRows><<<grid, block, smemBytes, computeStream()>>>(
+			Q, K, V, O, dO, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0,
+			flashTile, dQ, dK_out, dV_out);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
+
+	// Single-query fallback not implemented yet for BF16 backward (large-dHead
+	// path would need its own kernel copy); fall back to FP32 path by
+	// returning false for the caller to route around.
+	return false;
+}
 
 bool flash_attention_multihead_forward_bf16(const uint16_t* Q, const uint16_t* K,
                                             const uint16_t* V,

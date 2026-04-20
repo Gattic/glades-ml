@@ -9941,20 +9941,49 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			if (gpuPerf)
 				gpu::perfRecordKernel(&gpuPerf->counters, 2u);
 
-			gpu::flash_attention_multihead_backward(
-			    Q_l, K_l, V_l,
-			    attnConcat_l,
-			    gpuTransformerScratch->dAttnConcat.data(),
-			    static_cast<int>(T),
-			    static_cast<int>(nHeads),
-			    static_cast<int>(nKVHeads),
-			    static_cast<int>(dHead),
-			    static_cast<int>(dModel),
-			    static_cast<int>(dModelKV),
-			    causal,
-			    gpuTransformerScratch->dQfull.data(),
-			    gpuTransformerScratch->dKfull.data(),
-			    gpuTransformerScratch->dVfull.data());
+			bool attnBwdDone = false;
+			if (useBf16)
+			{
+				// The q/k/vLowp scratches were already populated by the
+				// forward attention call, and Q/K/V haven't been modified
+				// between forward and backward — so we can feed the same
+				// BF16 views without re-casting. Fall back to FP32 on any
+				// kernel launch failure (e.g., shape exceeds the
+				// multi-query shmem budget on this device).
+				attnBwdDone = gpu::flash_attention_multihead_backward_bf16(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    attnConcat_l,
+				    gpuTransformerScratch->dAttnConcat.data(),
+				    static_cast<int>(T),
+				    static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads),
+				    static_cast<int>(dHead),
+				    static_cast<int>(dModel),
+				    static_cast<int>(dModelKV),
+				    causal,
+				    gpuTransformerScratch->dQfull.data(),
+				    gpuTransformerScratch->dKfull.data(),
+				    gpuTransformerScratch->dVfull.data());
+			}
+			if (!attnBwdDone)
+			{
+				gpu::flash_attention_multihead_backward(
+				    Q_l, K_l, V_l,
+				    attnConcat_l,
+				    gpuTransformerScratch->dAttnConcat.data(),
+				    static_cast<int>(T),
+				    static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads),
+				    static_cast<int>(dHead),
+				    static_cast<int>(dModel),
+				    static_cast<int>(dModelKV),
+				    causal,
+				    gpuTransformerScratch->dQfull.data(),
+				    gpuTransformerScratch->dKfull.data(),
+				    gpuTransformerScratch->dVfull.data());
+			}
 
 			// --- RoPE backward (inverse rotation) — fused Q+K ---
 			if (useRope && gpuTransformerScratch->gpuInvFreq.allocated())
