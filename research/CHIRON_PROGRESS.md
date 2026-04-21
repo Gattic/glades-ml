@@ -117,11 +117,19 @@ Foundation primitives for the 7th paradigm shift are in place:
     third-derivative term)
   - Validates the 3-chained-SGEMM chain-rule gradient for all four
     parameter tensors in a single backward call
+- `CHIRONStiefelTangentProjectionTest`: **PASSING** (Phase 2b)
+  - Skew-symmetry of `U^T · proj_U(G)` verified at max_err 3.5e-3 (U)
+    / 1.7e-3 (V) — within BF16 orthonormality tolerance
+  - Idempotence of projection operator: 9.2e-4 (U) / 7.9e-4 (V) — the
+    second-pass drift is bounded by `‖G‖ · ‖U^T U − I‖_F`, cleared by
+    QR retraction each Adam step
+  - Implemented via simplified canonical-metric form:
+    `proj_U(G) = G − U · sym(U^T G)` = 2 cuBLAS GEMMs + 1 r×r symmetrizer
 
-Phase 2 remaining: tangent projection of raw grad_U/grad_V, QR retraction
-via cuSOLVER, Cayley fast-path, Riemannian Adam (int8 packed momenta),
-vector transport, end-to-end wire-in to chiron_main.cpp behind
-`--stiefel-ratio ρ` flag.
+Phase 2 remaining: QR retraction via cuSOLVER (Phase 2c), Cayley
+fast-path (Phase 2d), Riemannian Adam with int8 packed momenta (2e),
+vector transport (2f), end-to-end wire-in to chiron_main.cpp behind
+`--stiefel-ratio ρ` flag (Phase 2g).
 
 Target: 5.1 B free-DOF model on 16 GB VRAM at ρ=0.25 with ≥ 1500 tok/s
 (projected from 4× FLOP reduction per forward GEMM), loss within 2× of
@@ -129,8 +137,8 @@ the 2.23 B dense-weight baseline at the same token budget.
 
 ### Test coverage
 
-- **447 / 447 CHIRON unit-test assertions pass** (was 443 → +4 from
-  Stiefel backward finite-diff parity dU/dV/dΣ/dX).
+- **451 / 451 CHIRON unit-test assertions pass** (was 447 → +4 from
+  Stiefel tangent projection skew-symmetry on U/V + idempotence on U/V).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),

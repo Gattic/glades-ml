@@ -381,10 +381,80 @@ void stiefel_backward_unconstrained(
 		return;
 }
 
-void stiefel_tangent_project_grad(const GpuStiefelWeight&,
-                                  float*, float*, float*, float*)
+// ===========================================================================
+// stiefel_tangent_project_grad — canonical Stiefel tangent-space projection
+//
+// For each Stiefel factor (U or V) with gradient G, the canonical-metric
+// tangent projection reduces to
+//     proj_U(G) = G − U · sym(U^T G)
+// where sym(A) = (A + A^T)/2.  Derivation:
+//     proj_U(G) = (I − UU^T) G + U · skew(U^T G)
+//               = G − U(U^T G) + (U(U^T G) − U G^T U)/2
+//               = G − (1/2) U (U^T G + G^T U)
+//
+// Implemented with two cuBLAS calls + one r×r symmetrization kernel:
+//   S = U^T · G                           (atb, r×r)
+//   S ← (S + S^T) / 2                     (in-place kernel)
+//   G ← G − U · S                         (standard GEMM, alpha=−1, beta=1)
+// ===========================================================================
+
+namespace {
+__global__ void k_symmetrize_inplace(float* S, unsigned int r)
 {
-	// TODO Phase-2b: implement canonical Stiefel tangent projection.
+	unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= r || j >= r) return;
+	if (i > j) return;
+	const float a = S[i * r + j];
+	const float b = S[j * r + i];
+	const float sym = 0.5f * (a + b);
+	S[i * r + j] = sym;
+	if (i != j) S[j * r + i] = sym;
+}
+
+static void stiefel_project_one(const uint16_t* A_bf, unsigned int rows,
+                                unsigned int r, float* G, float* scratch_rr)
+{
+	// FP32 staging of A (U or V).
+	static thread_local float* A_f32 = nullptr;
+	static thread_local size_t A_f32_cap = 0;
+	size_t sz = size_t(rows) * r;
+	if (sz > A_f32_cap)
+	{
+		if (A_f32) cudaFree(A_f32);
+		if (cudaMalloc(&A_f32, sz * sizeof(float)) != cudaSuccess) return;
+		A_f32_cap = sz;
+	}
+	cast_bf16_to_f32(A_bf, A_f32, sz);
+
+	// S = A^T · G   (atb: A [rows,r], G [rows,r] → S [r,r])
+	if (!sgemm_rowmajor_atb(r, r, rows, 1.0f, A_f32, r, G, r, 0.0f, scratch_rr, r))
+		return;
+
+	// S ← (S + S^T) / 2
+	{
+		dim3 block(16, 16);
+		dim3 grid((r + block.x - 1) / block.x, (r + block.y - 1) / block.y);
+		k_symmetrize_inplace<<<grid, block>>>(scratch_rr, r);
+		cudaGetLastError();
+	}
+
+	// G ← G − A · S
+	if (!sgemm_rowmajor(rows, r, r, -1.0f, A_f32, r, scratch_rr, r,
+	                    1.0f, G, r))
+		return;
+}
+}
+
+void stiefel_tangent_project_grad(const GpuStiefelWeight& s,
+                                  float* grad_U, float* grad_V,
+                                  float* scratch_UtGU, float* scratch_VtGV)
+{
+	if (!s.allocated()) return;
+	if (grad_U != nullptr && scratch_UtGU != nullptr)
+		stiefel_project_one(s.U.data(), s.m, s.r, grad_U, scratch_UtGU);
+	if (grad_V != nullptr && scratch_VtGV != nullptr)
+		stiefel_project_one(s.V.data(), s.n, s.r, grad_V, scratch_VtGV);
 }
 
 void stiefel_backward_project(const float*, const void*, bool,

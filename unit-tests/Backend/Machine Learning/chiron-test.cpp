@@ -3123,11 +3123,138 @@ void CHIRONStiefelBackwardFiniteDiffTest()
 #endif
 }
 
+// CHIRONStiefelTangentProjectionTest ----------------------------------------
+// For an arbitrary gradient G on Stiefel(m,r), the canonical tangent-space
+// projection proj_U(G) must satisfy U^T · proj_U(G) skew-symmetric. This
+// test verifies the invariant and idempotence of the projection operator.
+void CHIRONStiefelTangentProjectionTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel tangent] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m = 24, n = 18, r = 6;
+
+	LCG rng(20260421u);
+	std::vector<float> U(m * r), V(n * r), G_U(m * r), G_V(n * r);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, r);
+	gram_schmidt_cols(V, n, r);
+	for (size_t i = 0; i < G_U.size(); ++i) G_U[i] = rng.next_unit();
+	for (size_t i = 0; i < G_V.size(); ++i) G_V[i] = rng.next_unit();
+
+	std::vector<uint16_t> U_bf, V_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+
+	std::vector<float> sigma_stub(r, 1.0f);
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, r);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma_stub[0], sigma_stub.size());
+
+	glades::gpu::GpuBuffer<float> d_GU, d_GV, d_sUtU, d_sVtV;
+	d_GU.allocate(m * r); d_GV.allocate(n * r);
+	d_sUtU.allocate(r * r); d_sVtV.allocate(r * r);
+	d_GU.upload(&G_U[0], G_U.size());
+	d_GV.upload(&G_V[0], G_V.size());
+
+	glades::gpu::stiefel_tangent_project_grad(sw, d_GU.data(), d_GV.data(),
+	                                          d_sUtU.data(), d_sVtV.data());
+	std::vector<float> pGU(m * r), pGV(n * r);
+	d_GU.download(&pGU[0], pGU.size());
+	d_GV.download(&pGV[0], pGV.size());
+
+	// Reload U/V from BF16 round-trip so host-side math uses matching values.
+	std::vector<float> Ur(m * r), Vr(n * r);
+	bf16_to_fp32(U_bf, Ur);
+	bf16_to_fp32(V_bf, Vr);
+
+	// Compute A = U^T · proj_U(G) and verify A + A^T ≈ 0 (skew-symmetry).
+	// C++98-safe: inline the check twice rather than use a lambda.
+	float err_U = 0.0f, err_V = 0.0f;
+	{
+		std::vector<float> AtP(r * r, 0.0f);
+		for (unsigned int i = 0; i < r; ++i)
+			for (unsigned int j = 0; j < r; ++j)
+			{
+				float acc = 0.0f;
+				for (unsigned int k = 0; k < m; ++k)
+					acc += Ur[k * r + i] * pGU[k * r + j];
+				AtP[i * r + j] = acc;
+			}
+		for (unsigned int i = 0; i < r; ++i)
+			for (unsigned int j = 0; j < r; ++j)
+			{
+				const float sg = std::fabs(AtP[i * r + j] + AtP[j * r + i]);
+				if (sg > err_U) err_U = sg;
+			}
+		std::printf("  stiefel U^T · proj(G_U) skew-symmetry max_err = %.3e\n", err_U);
+	}
+	{
+		std::vector<float> AtP(r * r, 0.0f);
+		for (unsigned int i = 0; i < r; ++i)
+			for (unsigned int j = 0; j < r; ++j)
+			{
+				float acc = 0.0f;
+				for (unsigned int k = 0; k < n; ++k)
+					acc += Vr[k * r + i] * pGV[k * r + j];
+				AtP[i * r + j] = acc;
+			}
+		for (unsigned int i = 0; i < r; ++i)
+			for (unsigned int j = 0; j < r; ++j)
+			{
+				const float sg = std::fabs(AtP[i * r + j] + AtP[j * r + i]);
+				if (sg > err_V) err_V = sg;
+			}
+		std::printf("  stiefel V^T · proj(G_V) skew-symmetry max_err = %.3e\n", err_V);
+	}
+	// BF16 round-trip of U/V limits precision of the device-side projection
+	// to ~0.5% per element (1/2^7); accumulated over m=24, the skew-symmetry
+	// residual bound is ~sqrt(m)·eps_bf16 ≈ 1e-2.
+	ASSERT("U^T · proj_U(G_U) is skew-symmetric (within BF16 tolerance)",
+	       err_U < 1e-2f);
+	ASSERT("V^T · proj_V(G_V) is skew-symmetric (within BF16 tolerance)",
+	       err_V < 1e-2f);
+
+	// Idempotence: projecting twice should match projecting once.
+	d_GU.upload(&G_U[0], G_U.size());
+	d_GV.upload(&G_V[0], G_V.size());
+	glades::gpu::stiefel_tangent_project_grad(sw, d_GU.data(), d_GV.data(),
+	                                          d_sUtU.data(), d_sVtV.data());
+	glades::gpu::stiefel_tangent_project_grad(sw, d_GU.data(), d_GV.data(),
+	                                          d_sUtU.data(), d_sVtV.data());
+	std::vector<float> pGU2(m * r), pGV2(n * r);
+	d_GU.download(&pGU2[0], pGU2.size());
+	d_GV.download(&pGV2[0], pGV2.size());
+	const float idem_U = max_abs_diff(pGU, pGU2);
+	const float idem_V = max_abs_diff(pGV, pGV2);
+	std::printf("  stiefel idempotence: U=%.3e V=%.3e\n", idem_U, idem_V);
+	// BF16 U/V is only orthonormal to ~1/2^7 per element; true idempotence
+	// requires exact U^T U = I, so the second projection can drift by up to
+	// ‖G‖ · ‖U^T U − I‖_F ≈ 5e-3 at m=24, r=6. QR retraction restores this
+	// each Adam step — see Phase 2c QR wrapper.
+	ASSERT("stiefel tangent projection near-idempotent on U (BF16-limited)",
+	       idem_U < 5e-3f);
+	ASSERT("stiefel tangent projection near-idempotent on V (BF16-limited)",
+	       idem_V < 5e-3f);
+
+	sw.release();
+#else
+	std::printf("  [stiefel tangent] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
+	CHIRONStiefelTangentProjectionTest();
 	CHIRONStochasticBf16RoundingTest();
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();
