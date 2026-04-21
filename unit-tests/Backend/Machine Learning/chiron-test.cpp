@@ -2219,7 +2219,546 @@ void CHIRONUnitTest()
 	CHIRONGpuFullBlockEndToEndTest();
 	CHIRONGpuReLNBackwardTest();
 	CHIRONGpuAttentionShearBackwardTest();
+	CHIRONGpuFullBlockBackwardTest();
+	CHIRONGpuMultiBlockBackwardTest();
 	std::printf("=== CHIRON tests done ===\n\n");
+}
+
+#ifdef GLADES_HAVE_CUDA
+// -----------------------------------------------------------------------
+// Helper: GPU-side full CHIRON block forward (one layer).
+// Block = attn_shear + reln   (MLP shears omitted for test simplicity;
+// their backward is trivial — shear is identity on one branch).
+// -----------------------------------------------------------------------
+struct ChironGpuBlock
+{
+	unsigned int T, m, nH, nKVH, dH, dM;
+	bool causal;
+	float eps;
+
+	// Weights (device).
+	glades::gpu::GpuBuffer<float>* Wq;
+	glades::gpu::GpuBuffer<float>* Wk;
+	glades::gpu::GpuBuffer<float>* Wv;
+	glades::gpu::GpuBuffer<float>* Wo;
+	glades::gpu::GpuBuffer<float>* gamma;
+	glades::gpu::GpuBuffer<float>* beta;
+
+	// Scratch (device).
+	glades::gpu::GpuBuffer<float>* sQ;
+	glades::gpu::GpuBuffer<float>* sK;
+	glades::gpu::GpuBuffer<float>* sV;
+	glades::gpu::GpuBuffer<float>* sO;
+	glades::gpu::GpuBuffer<float>* sdO;
+	glades::gpu::GpuBuffer<float>* sdQ;
+	glades::gpu::GpuBuffer<float>* sdK;
+	glades::gpu::GpuBuffer<float>* sdV;
+	glades::gpu::GpuBuffer<float>* qtmp;
+	glades::gpu::GpuBuffer<float>* stats_split;
+
+	// Forward: (q, p) → (q_out, p_out), stats written to `stats`.
+	bool forward(float* q, float* p, float* q_out, float* stats)
+	{
+		// 1. Attention shear: p += Y(q)
+		if (!glades::gpu::chiron_attention_shear(
+		    q, p, Wq->data(), Wk->data(), Wv->data(), Wo->data(),
+		    (int)T, (int)m, (int)nH, (int)nKVH, (int)dH, causal, /*invert=*/false,
+		    sQ->data(), sK->data(), sV->data(), sO->data()))
+			return false;
+		// 2. ReLN: q_out = norm(q); stats set
+		return glades::gpu::chiron_reln_forward(
+		    q, q_out, stats, gamma->data(), beta->data(),
+		    (int)T, (int)m, eps);
+	}
+
+	// Inverse: (q_out, p_out, stats) → (q, p) in-place on (q, p_out).
+	bool inverse(float* q_out, float* p, float* q_in_out, const float* stats)
+	{
+		if (!glades::gpu::chiron_reln_inverse(
+		    q_out, q_in_out, stats, gamma->data(), beta->data(),
+		    (int)T, (int)m))
+			return false;
+		// Attn shear inverse: p -= Y(q_reconstructed)
+		return glades::gpu::chiron_attention_shear(
+		    q_in_out, p, Wq->data(), Wk->data(), Wv->data(), Wo->data(),
+		    (int)T, (int)m, (int)nH, (int)nKVH, (int)dH, causal, /*invert=*/true,
+		    sQ->data(), sK->data(), sV->data(), sO->data());
+	}
+
+	// Backward: given upstream (dq_out, dp_out) and reconstructed (q_in, p_in_unused),
+	// compute (dq_in, dp_in) and accumulate weight gradients (+=).
+	// p_in is not used directly because the shear is identity on p: dp_in = dp_out.
+	bool backward(const float* dq_out, const float* dp_out,
+	              const float* q_in, const float* stats,
+	              float* dq_in, float* dp_in,
+	              float* dWq, float* dWk, float* dWv, float* dWo,
+	              float* dgamma, float* dbeta)
+	{
+		// ReLN backward: uses stats + q_in to produce dq_pre_reln (= partial dq_in)
+		if (!glades::gpu::chiron_reln_backward(
+		    dq_out, q_in, gamma->data(), stats, (int)T, (int)m,
+		    dq_in, dgamma, dbeta, stats_split->data()))
+			return false;
+
+		// Attention-shear backward: adds dq_from_attn into dq_in (beta=1 inside).
+		// dp_post_shear = dp_out (reln is identity on p).
+		if (!glades::gpu::chiron_attention_shear_backward(
+		    q_in, dp_out,
+		    Wq->data(), Wk->data(), Wv->data(), Wo->data(),
+		    (int)T, (int)m, (int)nH, (int)nKVH, (int)dH, causal,
+		    dq_in,  // accumulate into the ReLN's dq output
+		    dWq, dWk, dWv, dWo,
+		    sQ->data(), sK->data(), sV->data(), sO->data(),
+		    sdO->data(), sdQ->data(), sdK->data(), sdV->data()))
+			return false;
+
+		// dp_in = dp_out (shear identity).
+		return glades::gpu::device_memcpy_d2d(dp_in, dp_out, sizeof(float) * T * m), true;
+	}
+};
+
+static void chiron_setup_block(ChironGpuBlock& blk,
+                               unsigned int T, unsigned int m,
+                               unsigned int nH, unsigned int dH,
+                               bool causal, float eps,
+                               glades::gpu::GpuBuffer<float>& Wq,
+                               glades::gpu::GpuBuffer<float>& Wk,
+                               glades::gpu::GpuBuffer<float>& Wv,
+                               glades::gpu::GpuBuffer<float>& Wo,
+                               glades::gpu::GpuBuffer<float>& gamma,
+                               glades::gpu::GpuBuffer<float>& beta,
+                               glades::gpu::GpuBuffer<float>& sQ,
+                               glades::gpu::GpuBuffer<float>& sK,
+                               glades::gpu::GpuBuffer<float>& sV,
+                               glades::gpu::GpuBuffer<float>& sO,
+                               glades::gpu::GpuBuffer<float>& sdO,
+                               glades::gpu::GpuBuffer<float>& sdQ,
+                               glades::gpu::GpuBuffer<float>& sdK,
+                               glades::gpu::GpuBuffer<float>& sdV,
+                               glades::gpu::GpuBuffer<float>& qtmp,
+                               glades::gpu::GpuBuffer<float>& stats_split)
+{
+	blk.T = T; blk.m = m; blk.nH = nH; blk.nKVH = nH; blk.dH = dH; blk.dM = nH * dH;
+	blk.causal = causal; blk.eps = eps;
+	blk.Wq = &Wq; blk.Wk = &Wk; blk.Wv = &Wv; blk.Wo = &Wo;
+	blk.gamma = &gamma; blk.beta = &beta;
+	blk.sQ = &sQ; blk.sK = &sK; blk.sV = &sV; blk.sO = &sO;
+	blk.sdO = &sdO; blk.sdQ = &sdQ; blk.sdK = &sdK; blk.sdV = &sdV;
+	blk.qtmp = &qtmp; blk.stats_split = &stats_split;
+}
+#endif // GLADES_HAVE_CUDA
+
+// ---------------------------------------------------------------------------
+// Case 19: full CHIRON block backward — FD verification.
+// ---------------------------------------------------------------------------
+void CHIRONGpuFullBlockBackwardTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) { std::printf("  [CHIRON full-block bwd] no CUDA device\n"); return; }
+
+	const unsigned int T = 4, m = 16, nH = 1, dH = 16, dM = nH * dH;
+	const bool causal = true;
+	const float eps = 1e-4f;
+
+	LCG rng(2024u);
+	std::vector<float> q0(T * m), p0(T * m), q_ref(T * m), p_ref(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	std::vector<float> gamma(m), beta(m);
+	for (size_t i = 0; i < q0.size(); ++i) q0[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < p0.size(); ++i) p0[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < q_ref.size(); ++i) q_ref[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < p_ref.size(); ++i) p_ref[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < Wq.size(); ++i) { Wq[i] = 0.08f * rng.next_unit(); Wk[i] = 0.08f * rng.next_unit(); Wv[i] = 0.08f * rng.next_unit(); }
+	for (size_t i = 0; i < Wo.size(); ++i) Wo[i] = 0.08f * rng.next_unit();
+	for (unsigned int i = 0; i < m; ++i) { gamma[i] = 1.0f + 0.08f * rng.next_unit(); beta[i] = 0.03f * rng.next_unit(); }
+
+	// GPU buffers.
+	glades::gpu::GpuBuffer<float> d_q, d_p, d_q_out, d_stats;
+	glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo, d_gamma, d_beta;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV;
+	glades::gpu::GpuBuffer<float> d_qtmp, d_stats_split;
+	glades::gpu::GpuBuffer<float> d_dq_out, d_dp_out, d_dq_in, d_dp_in;
+	glades::gpu::GpuBuffer<float> d_dWq, d_dWk, d_dWv, d_dWo, d_dgamma, d_dbeta;
+
+	d_q.allocate(T * m); d_p.allocate(T * m);
+	d_q_out.allocate(T * m); d_stats.allocate(T * 2u);
+	d_Wq.allocate(m * dM); d_Wk.allocate(m * dM); d_Wv.allocate(m * dM); d_Wo.allocate(dM * m);
+	d_gamma.allocate(m); d_beta.allocate(m);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM); d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_sdO.allocate(T * dM); d_sdQ.allocate(T * dM); d_sdK.allocate(T * dM); d_sdV.allocate(T * dM);
+	d_qtmp.allocate(T * m); d_stats_split.allocate(2 * T);
+	d_dq_out.allocate(T * m); d_dp_out.allocate(T * m);
+	d_dq_in.allocate(T * m); d_dp_in.allocate(T * m);
+	d_dWq.allocate(m * dM); d_dWk.allocate(m * dM); d_dWv.allocate(m * dM); d_dWo.allocate(dM * m);
+	d_dgamma.allocate(m); d_dbeta.allocate(m);
+
+	d_Wq.upload(&Wq[0], Wq.size()); d_Wk.upload(&Wk[0], Wk.size());
+	d_Wv.upload(&Wv[0], Wv.size()); d_Wo.upload(&Wo[0], Wo.size());
+	d_gamma.upload(&gamma[0], m); d_beta.upload(&beta[0], m);
+
+	ChironGpuBlock blk;
+	chiron_setup_block(blk, T, m, nH, dH, causal, eps,
+	                    d_Wq, d_Wk, d_Wv, d_Wo, d_gamma, d_beta,
+	                    d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV,
+	                    d_qtmp, d_stats_split);
+
+	// --- FORWARD ---
+	d_q.upload(&q0[0], T * m); d_p.upload(&p0[0], T * m);
+	ASSERT("block fwd", blk.forward(d_q.data(), d_p.data(),
+	                                  d_q_out.data(), d_stats.data()));
+	// q_out is in d_q_out; p_out is in d_p (shear updated in place).
+
+	// --- BACKWARD ---
+	d_dq_out.upload(&q_ref[0], T * m);    // dL/dq_out = q_ref
+	d_dp_out.upload(&p_ref[0], T * m);    // dL/dp_out = p_ref
+
+	// Reconstruct q_in via inverse (in d_q), p_in via shear inverse (in d_p).
+	ASSERT("block inv",
+	       blk.inverse(d_q_out.data(), d_p.data(), d_q.data(), d_stats.data()));
+	// Now d_q holds reconstructed q_in, d_p holds reconstructed p_in.
+
+	d_dq_in.zero(); d_dp_in.zero();
+	d_dWq.zero(); d_dWk.zero(); d_dWv.zero(); d_dWo.zero();
+	d_dgamma.zero(); d_dbeta.zero();
+
+	ASSERT("block bwd",
+	       blk.backward(d_dq_out.data(), d_dp_out.data(),
+	                    d_q.data(), d_stats.data(),
+	                    d_dq_in.data(), d_dp_in.data(),
+	                    d_dWq.data(), d_dWk.data(), d_dWv.data(), d_dWo.data(),
+	                    d_dgamma.data(), d_dbeta.data()));
+
+	std::vector<float> dq_in_gpu(T * m), dp_in_gpu(T * m);
+	d_dq_in.download(&dq_in_gpu[0], T * m);
+	d_dp_in.download(&dp_in_gpu[0], T * m);
+
+	// --- FD reference on CPU ---
+	// L(q0, p0) = sum(q_ref * q_out) + sum(p_ref * p_out_pert)
+	const float fd_eps = 1e-3f;
+	std::vector<float> dq_in_fd(T * m, 0.0f), dp_in_fd(T * m, 0.0f);
+	std::vector<float> q_pert(q0), p_pert(p0);
+	std::vector<float> qo_p(T * m), po_p(T * m), qo_m(T * m), po_m(T * m);
+	std::vector<float> Y(T * m);
+	std::vector<float> stats_scratch(T * 2u);
+
+	for (size_t i = 0; i < q0.size(); ++i)
+	{
+		// +eps
+		q_pert[i] += fd_eps;
+		chiron_attn_shear(&q_pert[0], &Wq[0], &Wk[0], &Wv[0], &Wo[0], T, m, dM, causal, &Y[0]);
+		po_p = p0;
+		for (size_t j = 0; j < po_p.size(); ++j) po_p[j] += Y[j];
+		glades::chiron::reln_forward(&q_pert[0], &qo_p[0], &stats_scratch[0],
+		                              &gamma[0], &beta[0], T, m, eps);
+
+		// -eps
+		q_pert[i] -= 2.0f * fd_eps;
+		chiron_attn_shear(&q_pert[0], &Wq[0], &Wk[0], &Wv[0], &Wo[0], T, m, dM, causal, &Y[0]);
+		po_m = p0;
+		for (size_t j = 0; j < po_m.size(); ++j) po_m[j] += Y[j];
+		glades::chiron::reln_forward(&q_pert[0], &qo_m[0], &stats_scratch[0],
+		                              &gamma[0], &beta[0], T, m, eps);
+		q_pert[i] += fd_eps;
+
+		double Lp = 0.0, Lm = 0.0;
+		for (size_t j = 0; j < qo_p.size(); ++j) {
+			Lp += (double)q_ref[j] * qo_p[j];
+			Lm += (double)q_ref[j] * qo_m[j];
+		}
+		for (size_t j = 0; j < po_p.size(); ++j) {
+			Lp += (double)p_ref[j] * po_p[j];
+			Lm += (double)p_ref[j] * po_m[j];
+		}
+		dq_in_fd[i] = static_cast<float>((Lp - Lm) / (2.0 * fd_eps));
+	}
+
+	for (size_t i = 0; i < p0.size(); ++i)
+	{
+		p_pert[i] += fd_eps;
+		chiron_attn_shear(&q0[0], &Wq[0], &Wk[0], &Wv[0], &Wo[0], T, m, dM, causal, &Y[0]);
+		po_p = p_pert;
+		for (size_t j = 0; j < po_p.size(); ++j) po_p[j] += Y[j];
+		glades::chiron::reln_forward(&q0[0], &qo_p[0], &stats_scratch[0],
+		                              &gamma[0], &beta[0], T, m, eps);
+
+		p_pert[i] -= 2.0f * fd_eps;
+		// q is unchanged so Y is same as previous iteration. Recompute for clarity.
+		chiron_attn_shear(&q0[0], &Wq[0], &Wk[0], &Wv[0], &Wo[0], T, m, dM, causal, &Y[0]);
+		po_m = p_pert;
+		for (size_t j = 0; j < po_m.size(); ++j) po_m[j] += Y[j];
+		glades::chiron::reln_forward(&q0[0], &qo_m[0], &stats_scratch[0],
+		                              &gamma[0], &beta[0], T, m, eps);
+		p_pert[i] += fd_eps;
+
+		double Lp = 0.0, Lm = 0.0;
+		for (size_t j = 0; j < qo_p.size(); ++j) {
+			Lp += (double)q_ref[j] * qo_p[j];
+			Lm += (double)q_ref[j] * qo_m[j];
+		}
+		for (size_t j = 0; j < po_p.size(); ++j) {
+			Lp += (double)p_ref[j] * po_p[j];
+			Lm += (double)p_ref[j] * po_m[j];
+		}
+		dp_in_fd[i] = static_cast<float>((Lp - Lm) / (2.0 * fd_eps));
+	}
+
+	const float dq_err = max_abs_diff(dq_in_gpu, dq_in_fd);
+	const float dp_err = max_abs_diff(dp_in_gpu, dp_in_fd);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "full-block backward: dq_err=%.3e dp_err=%.3e (tol 5e-2)",
+	              dq_err, dp_err);
+	ASSERT(msg, dq_err < 5e-2f && dp_err < 5e-2f);
+
+	std::printf("  CHIRON full-block backward: dq_err=%.3e  dp_err=%.3e\n",
+	            dq_err, dp_err);
+#else
+	std::printf("  [CHIRON full-block bwd] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Case 20: L=3 full-block forward + inverse-reconstructed backward — FD check
+// on the input gradients dq0, dp0. This is the capstone test proving CHIRON's
+// multi-layer backward pass produces correct gradients without storing any
+// per-layer activations.
+// ---------------------------------------------------------------------------
+void CHIRONGpuMultiBlockBackwardTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) { std::printf("  [CHIRON multi-bwd] no CUDA device\n"); return; }
+
+	const unsigned int T = 4, m = 16, nH = 1, dH = 16, dM = nH * dH;
+	const unsigned int L = 3;
+	const bool causal = true;
+	const float eps = 1e-4f;
+
+	LCG rng(9999u);
+	std::vector<float> q0(T * m), p0(T * m), q_ref(T * m), p_ref(T * m);
+	for (size_t i = 0; i < q0.size(); ++i) q0[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < p0.size(); ++i) p0[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < q_ref.size(); ++i) q_ref[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < p_ref.size(); ++i) p_ref[i] = 0.2f * rng.next_unit();
+
+	// Per-layer weights.
+	std::vector<std::vector<float> > Wq(L), Wk(L), Wv(L), Wo(L), gamma(L), beta(L);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		Wq[l].resize(m * dM); Wk[l].resize(m * dM); Wv[l].resize(m * dM); Wo[l].resize(dM * m);
+		gamma[l].resize(m); beta[l].resize(m);
+		for (size_t i = 0; i < Wq[l].size(); ++i) { Wq[l][i] = 0.06f * rng.next_unit(); Wk[l][i] = 0.06f * rng.next_unit(); Wv[l][i] = 0.06f * rng.next_unit(); }
+		for (size_t i = 0; i < Wo[l].size(); ++i) Wo[l][i] = 0.06f * rng.next_unit();
+		for (unsigned int i = 0; i < m; ++i) { gamma[l][i] = 1.0f + 0.06f * rng.next_unit(); beta[l][i] = 0.02f * rng.next_unit(); }
+	}
+
+	// Per-layer GPU buffers (share scratch).
+	std::vector<glades::gpu::GpuBuffer<float>*> d_Wq(L), d_Wk(L), d_Wv(L), d_Wo(L);
+	std::vector<glades::gpu::GpuBuffer<float>*> d_gamma(L), d_beta(L);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		d_Wq[l] = new glades::gpu::GpuBuffer<float>(); d_Wq[l]->allocate(m * dM); d_Wq[l]->upload(&Wq[l][0], Wq[l].size());
+		d_Wk[l] = new glades::gpu::GpuBuffer<float>(); d_Wk[l]->allocate(m * dM); d_Wk[l]->upload(&Wk[l][0], Wk[l].size());
+		d_Wv[l] = new glades::gpu::GpuBuffer<float>(); d_Wv[l]->allocate(m * dM); d_Wv[l]->upload(&Wv[l][0], Wv[l].size());
+		d_Wo[l] = new glades::gpu::GpuBuffer<float>(); d_Wo[l]->allocate(dM * m); d_Wo[l]->upload(&Wo[l][0], Wo[l].size());
+		d_gamma[l] = new glades::gpu::GpuBuffer<float>(); d_gamma[l]->allocate(m); d_gamma[l]->upload(&gamma[l][0], m);
+		d_beta[l]  = new glades::gpu::GpuBuffer<float>(); d_beta[l]->allocate(m);  d_beta[l]->upload(&beta[l][0], m);
+	}
+
+	// Shared scratch + state buffers.
+	glades::gpu::GpuBuffer<float> d_q, d_p, d_qtmp, d_stats_all;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV;
+	glades::gpu::GpuBuffer<float> d_stats_split;
+	glades::gpu::GpuBuffer<float> d_dq, d_dp, d_dq_next, d_dp_next;
+	glades::gpu::GpuBuffer<float> d_dWq_scratch, d_dWk_scratch, d_dWv_scratch, d_dWo_scratch;
+	glades::gpu::GpuBuffer<float> d_dgamma_scratch, d_dbeta_scratch;
+
+	d_q.allocate(T * m); d_p.allocate(T * m); d_qtmp.allocate(T * m);
+	d_stats_all.allocate(L * T * 2u);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM); d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_sdO.allocate(T * dM); d_sdQ.allocate(T * dM); d_sdK.allocate(T * dM); d_sdV.allocate(T * dM);
+	d_stats_split.allocate(2 * T);
+	d_dq.allocate(T * m); d_dp.allocate(T * m);
+	d_dq_next.allocate(T * m); d_dp_next.allocate(T * m);
+	d_dWq_scratch.allocate(m * dM); d_dWk_scratch.allocate(m * dM);
+	d_dWv_scratch.allocate(m * dM); d_dWo_scratch.allocate(dM * m);
+	d_dgamma_scratch.allocate(m); d_dbeta_scratch.allocate(m);
+
+	// --- Forward L blocks ---
+	d_q.upload(&q0[0], T * m); d_p.upload(&p0[0], T * m);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		ChironGpuBlock blk;
+		chiron_setup_block(blk, T, m, nH, dH, causal, eps,
+		                    *d_Wq[l], *d_Wk[l], *d_Wv[l], *d_Wo[l],
+		                    *d_gamma[l], *d_beta[l],
+		                    d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV,
+		                    d_qtmp, d_stats_split);
+		ASSERT("multi fwd", blk.forward(d_q.data(), d_p.data(),
+		                                  d_qtmp.data(),
+		                                  d_stats_all.data() + (size_t)l * T * 2u));
+		// Swap: q <- q_out
+		glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(), sizeof(float) * T * m);
+	}
+
+	// --- Backward L blocks ---
+	// Upstream gradient at output.
+	d_dq_next.upload(&q_ref[0], T * m);
+	d_dp_next.upload(&p_ref[0], T * m);
+
+	// We do NOT need to accumulate weight grads for the FD check; zeros are fine.
+	// But we do need the grads wrt (q0, p0).
+	for (unsigned int ll = 0; ll < L; ++ll)
+	{
+		const unsigned int l = L - 1 - ll;
+		ChironGpuBlock blk;
+		chiron_setup_block(blk, T, m, nH, dH, causal, eps,
+		                    *d_Wq[l], *d_Wk[l], *d_Wv[l], *d_Wo[l],
+		                    *d_gamma[l], *d_beta[l],
+		                    d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV,
+		                    d_qtmp, d_stats_split);
+		// Reconstruct input: inverse of the (l+1)-th step.  d_q currently holds
+		// the output of the last block (if ll=0) or previous iteration's
+		// reconstructed state.  Use d_q as q_out input.
+		ASSERT("multi inv", blk.inverse(d_q.data(), d_p.data(), d_qtmp.data(),
+		                                  d_stats_all.data() + (size_t)l * T * 2u));
+		// After inverse: d_qtmp = reconstructed q_in (of this block), d_p = reconstructed p_in.
+		// Now run backward with reconstructed q_in.
+		d_dq.zero(); d_dp.zero();
+		d_dWq_scratch.zero(); d_dWk_scratch.zero();
+		d_dWv_scratch.zero(); d_dWo_scratch.zero();
+		d_dgamma_scratch.zero(); d_dbeta_scratch.zero();
+		ASSERT("multi bwd", blk.backward(
+		    d_dq_next.data(), d_dp_next.data(),
+		    d_qtmp.data(), d_stats_all.data() + (size_t)l * T * 2u,
+		    d_dq.data(), d_dp.data(),
+		    d_dWq_scratch.data(), d_dWk_scratch.data(),
+		    d_dWv_scratch.data(), d_dWo_scratch.data(),
+		    d_dgamma_scratch.data(), d_dbeta_scratch.data()));
+		// Swap d_q <- d_qtmp for next inverse.
+		glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(), sizeof(float) * T * m);
+		// Upstream grads for next layer (toward input) are (d_dq, d_dp).
+		glades::gpu::device_memcpy_d2d(d_dq_next.data(), d_dq.data(), sizeof(float) * T * m);
+		glades::gpu::device_memcpy_d2d(d_dp_next.data(), d_dp.data(), sizeof(float) * T * m);
+	}
+
+	std::vector<float> dq0_gpu(T * m), dp0_gpu(T * m);
+	d_dq_next.download(&dq0_gpu[0], T * m);
+	d_dp_next.download(&dp0_gpu[0], T * m);
+
+	// --- CPU FD reference over L blocks ---
+	const float fd_eps = 1e-3f;
+	std::vector<float> dq0_fd(T * m, 0.0f), dp0_fd(T * m, 0.0f);
+	std::vector<float> q_pert(q0), p_pert(p0), qo_p(T * m), po_p(T * m), qo_m(T * m), po_m(T * m);
+	std::vector<float> Y(T * m), stats_scratch(T * 2u);
+	std::vector<float> q_running(T * m), p_running(T * m), qn(T * m);
+
+	// Helper inline via a struct-free form: inline the forward each call.
+	for (size_t i = 0; i < q0.size(); ++i)
+	{
+		// +eps run
+		q_pert[i] += fd_eps;
+		q_running = q_pert; p_running = p0;
+		for (unsigned int l = 0; l < L; ++l)
+		{
+			chiron_attn_shear(&q_running[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+			                   T, m, dM, causal, &Y[0]);
+			for (size_t j = 0; j < p_running.size(); ++j) p_running[j] += Y[j];
+			glades::chiron::reln_forward(&q_running[0], &qn[0], &stats_scratch[0],
+			                              &gamma[l][0], &beta[l][0], T, m, eps);
+			q_running = qn;
+		}
+		qo_p = q_running; po_p = p_running;
+
+		// -eps run
+		q_pert[i] -= 2.0f * fd_eps;
+		q_running = q_pert; p_running = p0;
+		for (unsigned int l = 0; l < L; ++l)
+		{
+			chiron_attn_shear(&q_running[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+			                   T, m, dM, causal, &Y[0]);
+			for (size_t j = 0; j < p_running.size(); ++j) p_running[j] += Y[j];
+			glades::chiron::reln_forward(&q_running[0], &qn[0], &stats_scratch[0],
+			                              &gamma[l][0], &beta[l][0], T, m, eps);
+			q_running = qn;
+		}
+		qo_m = q_running; po_m = p_running;
+		q_pert[i] += fd_eps;
+
+		double Lp = 0.0, Lm = 0.0;
+		for (size_t j = 0; j < qo_p.size(); ++j) {
+			Lp += (double)q_ref[j] * qo_p[j];
+			Lm += (double)q_ref[j] * qo_m[j];
+		}
+		for (size_t j = 0; j < po_p.size(); ++j) {
+			Lp += (double)p_ref[j] * po_p[j];
+			Lm += (double)p_ref[j] * po_m[j];
+		}
+		dq0_fd[i] = static_cast<float>((Lp - Lm) / (2.0 * fd_eps));
+	}
+
+	for (size_t i = 0; i < p0.size(); ++i)
+	{
+		p_pert[i] += fd_eps;
+		q_running = q0; p_running = p_pert;
+		for (unsigned int l = 0; l < L; ++l)
+		{
+			chiron_attn_shear(&q_running[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+			                   T, m, dM, causal, &Y[0]);
+			for (size_t j = 0; j < p_running.size(); ++j) p_running[j] += Y[j];
+			glades::chiron::reln_forward(&q_running[0], &qn[0], &stats_scratch[0],
+			                              &gamma[l][0], &beta[l][0], T, m, eps);
+			q_running = qn;
+		}
+		qo_p = q_running; po_p = p_running;
+
+		p_pert[i] -= 2.0f * fd_eps;
+		q_running = q0; p_running = p_pert;
+		for (unsigned int l = 0; l < L; ++l)
+		{
+			chiron_attn_shear(&q_running[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+			                   T, m, dM, causal, &Y[0]);
+			for (size_t j = 0; j < p_running.size(); ++j) p_running[j] += Y[j];
+			glades::chiron::reln_forward(&q_running[0], &qn[0], &stats_scratch[0],
+			                              &gamma[l][0], &beta[l][0], T, m, eps);
+			q_running = qn;
+		}
+		qo_m = q_running; po_m = p_running;
+		p_pert[i] += fd_eps;
+
+		double Lp = 0.0, Lm = 0.0;
+		for (size_t j = 0; j < qo_p.size(); ++j) {
+			Lp += (double)q_ref[j] * qo_p[j];
+			Lm += (double)q_ref[j] * qo_m[j];
+		}
+		for (size_t j = 0; j < po_p.size(); ++j) {
+			Lp += (double)p_ref[j] * po_p[j];
+			Lm += (double)p_ref[j] * po_m[j];
+		}
+		dp0_fd[i] = static_cast<float>((Lp - Lm) / (2.0 * fd_eps));
+	}
+
+	const float dq_err = max_abs_diff(dq0_gpu, dq0_fd);
+	const float dp_err = max_abs_diff(dp0_gpu, dp0_fd);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "L=%u multi-block backward: dq0_err=%.3e dp0_err=%.3e (tol 1e-1)",
+	              L, dq_err, dp_err);
+	ASSERT(msg, dq_err < 1e-1f && dp_err < 1e-1f);
+
+	std::printf("  CHIRON L=%u multi-block backward: dq0_err=%.3e dp0_err=%.3e\n",
+	            L, dq_err, dp_err);
+
+	// Cleanup.
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		delete d_Wq[l]; delete d_Wk[l]; delete d_Wv[l]; delete d_Wo[l];
+		delete d_gamma[l]; delete d_beta[l];
+	}
+#else
+	std::printf("  [CHIRON multi-bwd] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
 }
 
 // ---------------------------------------------------------------------------
