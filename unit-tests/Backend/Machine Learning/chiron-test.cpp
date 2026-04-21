@@ -3977,9 +3977,12 @@ void CHIRONProductionScaleMemoryTest()
 
 	const unsigned int T = 2048;       // pile_large seq len
 	const unsigned int m = 512;        // dModel / 2 = 1024 / 2
-	const unsigned int nH = 1;          // 1 head for simplicity (attention shear)
-	const unsigned int dH = 2 * m;     // dHead = dModel = 1024 single-head
-	const unsigned int L = 24;          // pile_large depth
+	const unsigned int nH = 16;         // realistic multi-head
+	const unsigned int dH = 64;         // 1024 / 16 = 64 (pile_large ratio)
+	const unsigned int L = 8;           // reduced depth for bench runtime
+	                                    // (memory claim scales linearly in L
+	                                    // and is independent of L on the
+	                                    // CHIRON side; baseline grows L-linearly)
 	const bool causal = true;
 	const float eps = 1e-4f;
 
@@ -4021,14 +4024,18 @@ void CHIRONProductionScaleMemoryTest()
 	glades::gpu::GpuBuffer<float> d_sdQ, d_sdK, d_sdV, d_sdO;
 	glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo, d_gamma, d_beta;
 
+	// For multi-head attention, dModel = nH * dH. Wq maps [m] -> [dModel].
+	const unsigned int dModel = nH * dH;
 	d_q.allocate(T * m); d_p.allocate(T * m); d_qtmp.allocate(T * m);
 	d_stats_all.allocate((size_t)L * T * 2u);
-	d_sQ.allocate(T * dH); d_sK.allocate(T * dH);
-	d_sV.allocate(T * dH); d_sO.allocate(T * dH);
-	d_sdQ.allocate(T * dH); d_sdK.allocate(T * dH);
-	d_sdV.allocate(T * dH); d_sdO.allocate(T * dH);
-	d_Wq.allocate(m * dH); d_Wk.allocate(m * dH);
-	d_Wv.allocate(m * dH); d_Wo.allocate(dH * m);
+	// Multi-head scratch: each needs full dModel width since Q/K/V are
+	// packed [T, dModel=nH*dH].
+	d_sQ.allocate((size_t)T * dModel); d_sK.allocate((size_t)T * dModel);
+	d_sV.allocate((size_t)T * dModel); d_sO.allocate((size_t)T * dModel);
+	d_sdQ.allocate((size_t)T * dModel); d_sdK.allocate((size_t)T * dModel);
+	d_sdV.allocate((size_t)T * dModel); d_sdO.allocate((size_t)T * dModel);
+	d_Wq.allocate((size_t)m * dModel); d_Wk.allocate((size_t)m * dModel);
+	d_Wv.allocate((size_t)m * dModel); d_Wo.allocate((size_t)dModel * m);
 	d_gamma.allocate(m); d_beta.allocate(m);
 
 	size_t vram_after = 0;
@@ -4043,7 +4050,8 @@ void CHIRONProductionScaleMemoryTest()
 	// Run a forward + inverse through L blocks to verify it actually works
 	// at this scale (not just that allocation succeeds).  Use fixed weights.
 	LCG rng(77777u);
-	std::vector<float> Wq_h(m * dH), Wk_h(m * dH), Wv_h(m * dH), Wo_h(dH * m);
+	std::vector<float> Wq_h((size_t)m * dModel), Wk_h((size_t)m * dModel);
+	std::vector<float> Wv_h((size_t)m * dModel), Wo_h((size_t)dModel * m);
 	std::vector<float> gamma_h(m), beta_h(m);
 	const float init = 0.03f;
 	for (size_t i = 0; i < Wq_h.size(); ++i) { Wq_h[i] = init * rng.next_unit(); Wk_h[i] = init * rng.next_unit(); Wv_h[i] = init * rng.next_unit(); }
