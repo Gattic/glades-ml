@@ -2287,10 +2287,200 @@ void CHIRONStochasticBf16RoundingTest()
 #endif
 }
 
+// Parity test for the flash-attention BF16 shear (non-materialized) vs. the
+// cuBLAS-tiled BF16 shear (materializes scratch_P in HBM).  Both paths produce
+// the same p-update in expectation; BF16 quantization accounts for residual
+// difference.
+void CHIRONFlashShearVsTiledBf16ParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [flash-vs-tiled parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T = 64, m = 32, nH = 4, dH = 16;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(54321u);
+	std::vector<float> q_init(T * m), p_init(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	for (size_t i = 0; i < q_init.size(); ++i) q_init[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < p_init.size(); ++i) p_init[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < Wq.size(); ++i) Wq[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wk.size(); ++i) Wk[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wv.size(); ++i) Wv[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wo.size(); ++i) Wo[i] = 0.1f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_q, d_p_flash, d_p_tiled;
+	glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO;
+	glades::gpu::GpuBuffer<float> d_S;
+	glades::gpu::GpuBuffer<uint16_t> d_Qbf, d_Kbf, d_Vbf, d_Pbf;
+
+	d_q.allocate(T * m); d_p_flash.allocate(T * m); d_p_tiled.allocate(T * m);
+	d_Wq.allocate(m * dM); d_Wk.allocate(m * dM);
+	d_Wv.allocate(m * dM); d_Wo.allocate(dM * m);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM);
+	d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_S.allocate((size_t)nH * T * T);
+	d_Qbf.allocate(T * dM); d_Kbf.allocate(T * dM);
+	d_Vbf.allocate(T * dM); d_Pbf.allocate((size_t)nH * T * T);
+
+	d_q.upload(&q_init[0], q_init.size());
+	d_Wq.upload(&Wq[0], Wq.size()); d_Wk.upload(&Wk[0], Wk.size());
+	d_Wv.upload(&Wv[0], Wv.size()); d_Wo.upload(&Wo[0], Wo.size());
+
+	// Run flash (non-materialized) path.
+	d_p_flash.upload(&p_init[0], p_init.size());
+	ASSERT("flash shear forward",
+	       glades::gpu::chiron_attention_shear_bf16(
+	           d_q.data(), d_p_flash.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           (int)T, (int)m, (int)nH, (int)nH, (int)dH,
+	           causal, /*invert=*/false,
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+	           d_Qbf.data(), d_Kbf.data(), d_Vbf.data()));
+
+	// Run tiled (materializing) path on a fresh p copy.
+	d_p_tiled.upload(&p_init[0], p_init.size());
+	ASSERT("tiled shear forward",
+	       glades::gpu::chiron_attention_shear_bf16_tiled(
+	           d_q.data(), d_p_tiled.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           (int)T, (int)m, (int)nH, (int)dH,
+	           causal, /*invert=*/false,
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+	           d_S.data(),
+	           d_Qbf.data(), d_Kbf.data(), d_Vbf.data(), d_Pbf.data()));
+
+	std::vector<float> p_flash(T * m), p_tiled(T * m);
+	d_p_flash.download(&p_flash[0], T * m);
+	d_p_tiled.download(&p_tiled[0], T * m);
+
+	const float err = max_abs_diff(p_flash, p_tiled);
+	std::printf("  flash vs cuBLAS-tiled BF16 shear forward: max_err=%.3e\n", err);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "flash vs tiled parity: max_err=%.3e (tol 5e-2 for BF16 core)", err);
+	ASSERT(msg, err < 5e-2f);
+#else
+	std::printf("  [flash-vs-tiled parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// Parity for the flash-attention BF16 BACKWARD shear vs. the cuBLAS-tiled
+// FP32 backward.  Both paths compute dq, dWq, dWk, dWv, dWo — verify they
+// match within BF16 tolerance on the flash-path side.
+void CHIRONFlashShearBackwardBf16ParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [flash-bwd parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T = 64, m = 32, nH = 4, dH = 16;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(11223u);
+	std::vector<float> q_h(T * m), dp_h(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	for (size_t i = 0; i < q_h.size(); ++i) q_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < dp_h.size(); ++i) dp_h[i] = 0.15f * rng.next_unit();
+	for (size_t i = 0; i < Wq.size(); ++i) Wq[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wk.size(); ++i) Wk[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wv.size(); ++i) Wv[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wo.size(); ++i) Wo[i] = 0.1f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_q, d_dp;
+	glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo;
+	glades::gpu::GpuBuffer<float> d_dq_flash, d_dWq_flash, d_dWk_flash, d_dWv_flash, d_dWo_flash;
+	glades::gpu::GpuBuffer<float> d_dq_tile,  d_dWq_tile,  d_dWk_tile,  d_dWv_tile,  d_dWo_tile;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV;
+	glades::gpu::GpuBuffer<float> d_P, d_dP;
+	glades::gpu::GpuBuffer<uint16_t> d_Qbf, d_Kbf, d_Vbf;
+
+	d_q.allocate(T * m); d_dp.allocate(T * m);
+	d_Wq.allocate(m * dM); d_Wk.allocate(m * dM);
+	d_Wv.allocate(m * dM); d_Wo.allocate(dM * m);
+	d_dq_flash.allocate(T * m);  d_dq_tile.allocate(T * m);
+	d_dWq_flash.allocate(m * dM); d_dWq_tile.allocate(m * dM);
+	d_dWk_flash.allocate(m * dM); d_dWk_tile.allocate(m * dM);
+	d_dWv_flash.allocate(m * dM); d_dWv_tile.allocate(m * dM);
+	d_dWo_flash.allocate(dM * m); d_dWo_tile.allocate(dM * m);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM);
+	d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_sdO.allocate(T * dM); d_sdQ.allocate(T * dM);
+	d_sdK.allocate(T * dM); d_sdV.allocate(T * dM);
+	d_P.allocate((size_t)nH * T * T); d_dP.allocate((size_t)nH * T * T);
+	d_Qbf.allocate(T * dM); d_Kbf.allocate(T * dM); d_Vbf.allocate(T * dM);
+
+	d_q.upload(&q_h[0], q_h.size());   d_dp.upload(&dp_h[0], dp_h.size());
+	d_Wq.upload(&Wq[0], Wq.size());    d_Wk.upload(&Wk[0], Wk.size());
+	d_Wv.upload(&Wv[0], Wv.size());    d_Wo.upload(&Wo[0], Wo.size());
+
+	// Flash path — zero all accumulators first.
+	d_dq_flash.zero();  d_dWq_flash.zero(); d_dWk_flash.zero();
+	d_dWv_flash.zero(); d_dWo_flash.zero();
+	ASSERT("flash bwd",
+	       glades::gpu::chiron_attention_shear_backward_bf16(
+	           d_q.data(), d_dp.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           (int)T, (int)m, (int)nH, (int)nH, (int)dH, causal,
+	           d_dq_flash.data(),
+	           d_dWq_flash.data(), d_dWk_flash.data(), d_dWv_flash.data(), d_dWo_flash.data(),
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+	           d_sdO.data(), d_sdQ.data(), d_sdK.data(), d_sdV.data(),
+	           d_Qbf.data(), d_Kbf.data(), d_Vbf.data()));
+
+	// Tiled (reference) path — same inputs, separate dW accumulators.
+	d_dq_tile.zero();  d_dWq_tile.zero(); d_dWk_tile.zero();
+	d_dWv_tile.zero(); d_dWo_tile.zero();
+	ASSERT("tiled bwd",
+	       glades::gpu::chiron_attention_shear_backward_tiled(
+	           d_q.data(), d_dp.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           (int)T, (int)m, (int)nH, (int)dH, causal,
+	           d_dq_tile.data(),
+	           d_dWq_tile.data(), d_dWk_tile.data(), d_dWv_tile.data(), d_dWo_tile.data(),
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+	           d_sdO.data(), d_sdQ.data(), d_sdK.data(), d_sdV.data(),
+	           d_P.data(), d_dP.data()));
+
+	std::vector<float> dq_f(T * m),      dq_t(T * m);
+	std::vector<float> dWq_f(m * dM),    dWq_t(m * dM);
+	std::vector<float> dWo_f(dM * m),    dWo_t(dM * m);
+	d_dq_flash.download(&dq_f[0], T * m);   d_dq_tile.download(&dq_t[0], T * m);
+	d_dWq_flash.download(&dWq_f[0], m * dM); d_dWq_tile.download(&dWq_t[0], m * dM);
+	d_dWo_flash.download(&dWo_f[0], dM * m); d_dWo_tile.download(&dWo_t[0], dM * m);
+
+	const float eq  = max_abs_diff(dq_f, dq_t);
+	const float eWq = max_abs_diff(dWq_f, dWq_t);
+	const float eWo = max_abs_diff(dWo_f, dWo_t);
+	std::printf("  flash vs tiled BF16 backward: max_err dq=%.3e dWq=%.3e dWo=%.3e\n",
+	            eq, eWq, eWo);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "flash vs tiled backward parity: max dq=%.3e dWq=%.3e dWo=%.3e (tol 5e-2)",
+	              eq, eWq, eWo);
+	ASSERT(msg, eq < 5e-2f && eWq < 5e-2f && eWo < 5e-2f);
+#else
+	std::printf("  [flash-bwd parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONStochasticBf16RoundingTest();
+	CHIRONFlashShearVsTiledBf16ParityTest();
+	CHIRONFlashShearBackwardBf16ParityTest();
 	CHIRONShearReversibilityTest();
 	CHIRONReLNRoundtripTest();
 	CHIRONBlockRoundtripTest();
