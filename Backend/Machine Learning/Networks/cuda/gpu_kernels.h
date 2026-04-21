@@ -135,6 +135,17 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
                  float weightDecay, float gradScale, int step, int n);
 
+// Adam with BF16-packed optimizer state (m, v as uint16_t BF16 views).
+// Loads are lossless-upcast to FP32, compute is FP32, stores are
+// round-to-nearest-even FP32 -> BF16. Weights + grads stay FP32.
+// Halves optimizer-state VRAM (4 bytes -> 2 bytes per parameter per moment).
+// Same mathematical update as adam_update up to BF16 precision of the EMAs.
+bool adam_update_bf16_state(float* param, const float* grad,
+                            uint16_t* m_bf16, uint16_t* v_bf16,
+                            float lr, float beta1, float beta2, float eps,
+                            float weightDecay, float gradScale,
+                            int step, int n);
+
 bool adam_group_scale_batch(float** d_params, float** d_grads,
                             float** d_ms, float** d_vs,
                             float* d_groupScales, float* d_groupPrevStepRms,
@@ -406,6 +417,9 @@ inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
+inline bool adam_update_bf16_state(float*, const float*, uint16_t*, uint16_t*,
+                                   float, float, float, float, float, float,
+                                   int, int) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}

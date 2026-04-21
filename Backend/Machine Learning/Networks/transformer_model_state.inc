@@ -29,6 +29,13 @@
 		bool tieEmbeddings;
 		// Optimizer update step (used for Adam bias correction).
 		unsigned long long optimizerStep;
+		// HELIOS sharpness-probe state (framework Section 7 step 10): counts
+		// how many minibatches have elapsed since the last FD-HVP probe, and
+		// cycles through target weight matrices round-robin across probes.
+		// Ignored unless trainingConfig.optimizer.type == HELIOS and
+		// trainingConfig.helios.alpha > 0 and trainingConfig.helios.kHvp > 0.
+		unsigned long long heliosHvpStepCounter;
+		unsigned long long heliosHvpCycleCounter;
 		// Token embedding table E: [vocabSize, dModel]
 		std::vector<float> tokE;
 		// Low-precision weight copy of tokE used by mixed-precision training (optional).
@@ -680,6 +687,8 @@
 			padTokenId = -1;
 			tieEmbeddings = true;
 			optimizerStep = 0ULL;
+			heliosHvpStepCounter = 0ULL;
+			heliosHvpCycleCounter = 0ULL;
 			gapApplyCount = 0ULL;
 			gapInputUpdateNormSum = 0.0;
 			gapBlockUpdateNormSums.clear();

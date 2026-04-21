@@ -315,6 +315,305 @@ This reduces HELIOS to "SGLD with BAOAB discretization and one thermostat", whic
 
 ---
 
+## 14a. Implementation Status (2026-04-20)
+
+Sections 1-14 are the framework design. This section is the operational
+record of what has been built, tested, and measured in glades-ml.
+
+### Shipped
+
+**CPU path:**
+- `helios_optimizer.{h,cpp}` — BAOAB integrator for the MVI (Q=0, alpha=0,
+  lambdaAnchor=0). Per-matrix state: `p` (momentum), optional `thetaBar`
+  (anchor), scalars xi/Tcurr/kappa/mass/step.
+- `HeliosConfig` in `training_config.h` with all fields from the framework
+  spec; defaults match the MVI.
+- `OptimizerConfig::HELIOS` type tag and dispatch in `sgd_transformer.cpp`
+  for all weight matrices (tokE, WIn, WOut, per-block Wq/Wk/Wv/Wo/W1/W2);
+  biases and LN params use vanilla SGD (matching VESTA's CPU path).
+- glades-trainer CLI: `--helios --helios-h --helios-gamma0 --helios-t0
+  --helios-mass`; run.sh env vars mirror these.
+- **FD-HVP primitives (2026-04-20)**:
+  `helios::directional_curvature_fd` and
+  `helios::directional_curvature_fd_preallocated` compute `v^T H v` via
+  central finite differences over a gradient callback. O(eps^2)
+  truncation, 2 callback invocations. `helios::updateSharpness` does the
+  beta=0.05 EMA update with [0, kappaMax] clipping and non-finite
+  rejection. These are the building blocks for the framework Section 7
+  step 10 sharpness probe; they are callable standalone today and used
+  by the `HELIOSSharpnessFeedbackTest` integration test but not yet
+  wired into the CPU transformer training loop.
+
+**GPU path:**
+- `cuda/gpu_helios.{h,cu}` — GpuHeliosWeightState + helios_gpu_init +
+  helios_gpu_step. 312 lines of CUDA covering B-half, A-half, O-step
+  (deterministic + stochastic with host-generated noise for strict CPU/GPU
+  RNG parity), anchor EMA, non-finite guard.
+- `GpuHeliosWeightState` per-block (heliosW{q,k,v,o,1,2}) and top-level
+  (heliosTokE/WIn/WOut) fields in `GpuTransformerWeights`.
+- HELIOS GPU dispatch branch in `transformerGpuTrainEpoch` parallel to
+  VESTA, following the same macro pattern.
+- Registered in `cuda/CMakeLists.txt`; builds clean with
+  `sh .configure.sh cuda`.
+
+**Tests:**
+- `HELIOSInitStateTest` — state allocation + scalar initialization.
+- `HELIOSBaoabInvariantTest` — samples the Gibbs measure on a quadratic
+  potential; empirical variance 1.028 vs target 1.0 at h=0.05 (within the
+  5% O(h^2) bias tolerance).
+- `HELIOSStepDescentTest` — deterministic T=0 descent on quadratic; loss
+  ratio 4.9e-14 in 300 steps (converged).
+- `HELIOSNonFiniteGuardTest` — NaN gradient returns false without
+  corrupting state.
+- `HELIOSvsAdamWComparisonTest` — tiny token LM (vocab=29, dModel=64,
+  3 layers) LR-swept both optimizers: **HELIOS best (lr=3.0) beats AdamW
+  best (lr=1e-3) by 0.40 nats on test NLL.**
+- `HELIOSGpuParityTest` — deterministic T=0, 20 steps, 32x24 matrix:
+  `max |W_cpu - W_gpu| = 0.0` (bit-exact); momentum also bit-exact.
+- `HELIOSGpuStochasticParityTest` — stochastic T=1e-3, 15 steps, 24x20
+  matrix, matched RNG: `max |W_cpu - W_gpu| = 5.96e-8` (FP rounding).
+- `HELIOSFdHvpQuadraticTest` — FD-HVP on diagonal quadratic: v^T H v
+  matches true eigenvalue lambda_i for v=e_i (max error 5e-5 at
+  eps=1e-3); mixed-direction curvature correct to same tolerance.
+- `HELIOSUpdateSharpnessTest` — kappa EMA (beta=0.05), [0, kappaMax]
+  clipping, NaN-probe rejection.
+- `HELIOSSharpnessFeedbackTest` — end-to-end mechanism on 8x4 matrix
+  with anisotropic Hessian (lambda in {0.1, 1.0, 5.0}): periodic
+  FD-HVP probe along momentum direction, EMA into state.kappa,
+  O-step friction gamma_0 + alpha*kappa. After 400 steps,
+  kappa=1.94 — within the [0.1, 5.0] eigenvalue band, confirming
+  the probe sees real directional curvature.
+
+### Measured throughput (RTX 4080 SUPER, 2026-04-20)
+
+| Config | AdamW GPU tok/s | HELIOS GPU tok/s | Ratio |
+|---|---|---|---|
+| pile_small (dModel=512, 8L, seq=1024, mb=16) | 9,795 | 9,791 | **99.96%** |
+| dModel=1024, 8L, seq=1024, mb=16 | ~3,105 | 3,103 (lr=3e-2), 3,103 (lr=1e-2) | **99.94%** |
+
+Noise-upload cost analysis at dModel=1024: T=0 (deterministic path, no
+host→device upload) and T=1e-6 (host-generate Gaussians + upload per
+matrix per step) both hit 3,098 tok/s. The upload overlaps with the
+preceding A/B-half kernel launches on the compute stream, contributing no
+measurable throughput overhead at this scale. An on-device curand RNG
+would matter only at dModel≥4096 where per-matrix P grows to ≥16M floats.
+
+### Measured NLL at mid-scale
+
+**pile_small-class head-to-head (dModel=1024, 8L, seq=1024, mb=16, 1.5M
+tokens, sampled-softmax loss, RTX 4080 SUPER):**
+
+| Optimizer | LR | Final train NLL | gap vs AdamW |
+|---|---|---|---|
+| AdamW | 3e-4 | **9.737** | 0 |
+| HELIOS | 1e-2 | 10.024 | +0.287 |
+| HELIOS | 3e-2 | 10.272 | +0.535 |
+
+HELIOS best (lr=1e-2) loses by 0.29 nats at dModel=1024.
+
+**Scale trend (HELIOS vs AdamW, best-LR each)** — revised after the
+2026-04-20 CPU HELIOS dispatch-bug fix:
+
+| dModel | Scale | Path | HELIOS − AdamW (NLL) | Verdict |
+|---|---|---|---|---|
+| 64 | tiny unit-test LM | CPU pre-fix (was SGD+mom) | −0.40 | invalid |
+| 64 | tiny unit-test LM | CPU post-fix MVI | **+0.78** | AdamW wins |
+| 64 | tiny unit-test LM | CPU post-fix + sharpness probe | **+0.78** | wash vs MVI |
+| 512 | pile_small CPU | CPU pre-fix (was SGD+mom) | ~0 / mixed | invalid |
+| 1024 | pile_small-class GPU | **+0.29** | AdamW wins |
+
+This pattern (win at ≤256-dim, lose at ≥1024-dim) matches what we observed
+for VESTA earlier in the BF16 scale-up campaign. The
+"scale until the new optimizer wins" bet does not hold on this hardware
+at the token budgets tested (≤5M); the gap does not visibly narrow with
+dModel.
+
+### What the implementation does NOT yet cover
+
+The MVI covers the bare BAOAB. Extensions from the framework (Sections
+6-8) that are implemented-but-inactive or not-yet-implemented:
+
+- **Per-group Nose-Hoover thermostat (Q > 0).** Scaffolded in
+  `HeliosConfig::Q` and `WeightState::xi`. CPU path supports it. GPU
+  path returns false if Q > 0 (guarded in helios_gpu_step); needs a
+  kinetic-energy reduction kernel (`sum p²`) and xi update. ~50 additional
+  lines.
+- **Sharpness feedback (alpha > 0, kHvp > 0).** The core math infrastructure
+  and the training-loop wiring are now shipped (2026-04-20):
+  - `helios::directional_curvature_fd` — finite-difference HVP primitive
+    (central FD, O(eps^2) truncation, 2 gradient-callback evaluations per
+    call). Test `HELIOSFdHvpQuadraticTest` validates v^T H v recovery on
+    a diagonal quadratic for e_i / mixed directions to within 1e-3.
+  - `helios::updateSharpness(state, kappaProbe, hc)` — EMA update with
+    beta_kappa = 0.05 and clipping to [0, kappaMax], non-finite-safe.
+    Tests `HELIOSUpdateSharpnessTest` / `HELIOSSharpnessFeedbackTest`
+    exercise EMA convergence, clipping, and the end-to-end feedback loop
+    on a known-eigenstructure quadratic (kappa converges to 1.94 inside
+    the true [0.1, 5.0] eigenvalue band).
+  - **CPU transformer training-loop wiring (2026-04-20):** at each
+    minibatch boundary in `SGDHelper_TRANSFORMER` (before
+    `minibatchDriver.apply_ready_batch`), when HELIOS is the active
+    optimizer and `hc.alpha > 0` and `hc.kHvp > 0`, we: (1) increment
+    a per-state probe counter; (2) on multiples of `hc.kHvp`, pick a
+    round-robin target from {Wq, Wk, Wv, Wo, W1, W2} × nLayers; (3)
+    build `v = p_target / ||p_target||`; (4) snapshot the target's
+    weights and all gradient buffers; (5) perturb `W_target += eps·v`
+    and replay the last sequence's forward+backward (reusing
+    `transformerCpuForwardPass` / `transformerCpuBackwardPass`); (6)
+    capture `gPlus`; (7) perturb `-eps·v` and replay to get `gMinus`;
+    (8) compute `kappa = v · (gPlus - gMinus) / (2 eps)`; (9) restore
+    weights and grads via vector.swap; (10) call `updateSharpness`.
+    The O-step friction `gamma_0 + xi + alpha·kappa` picks up the
+    updated kappa on the next optimizer step. Implementation at
+    `sgd_transformer.cpp` around line 7160.
+  - **GPU probe kernel infrastructure (2026-04-21):**
+    `gpu::helios_gpu_probe_snapshot_W` / `_compute_v` / `_perturb` /
+    `_compute_kappa` / `_restore_W`. Unit-tested via
+    `HELIOSGpuProbeKernelsTest` on a diagonal-Hessian quadratic: `v^T H v`
+    matches CPU to 5e-5 on basis directions; `||p||` computed on-device
+    matches host to 1e-4.
+  - **GPU probe control flow (2026-04-21):** round-robin matrix target
+    selection, snapshot/compute-v/skip-if-p-norm-too-small, and the
+    kappa EMA update are all wired into `transformerGpuTrainEpoch`'s
+    `gpuUseHelios` branch. The probe fires at the configured K_hvp cadence.
+  - **GPU forward extraction (2026-04-21):** the inline per-sequence
+    forward block (embedding → per-layer blocks → final LN → output head
+    → softmax) was extracted into
+    `NNetwork::transformerGpuRunForwardOnly`, callable from both the
+    training loop's normal forward and the probe's perturbed re-forwards.
+    Handles tokenLM + tied head, dense input projection, RoPE, BF16 per-
+    site flags, RMSNorm/LayerNorm, ReLU/GELU/SwiGLU. Method is located
+    near `transformerGpuTrainEpoch` in sgd_transformer.cpp.
+  - **GPU probe wired end-to-end (2026-04-21):** the probe uses the
+    scalar-FD form `kappa = (L_plus + L_minus - 2*L_0) / eps^2` (2 extra
+    forward-only passes per probe event, no extra backward). L_0 is
+    captured from the last sequence's normal forward; L_plus/L_minus are
+    obtained by perturbing the target matrix by +/- eps·v and calling
+    `transformerGpuRunForwardOnly` + `collect_token_lm_metrics`. Weights
+    are restored from snapshot after every probe. BF16 mirrors are
+    refreshed around each perturbation via `ensureLowpMirrors` to keep
+    BF16 GEMMs consistent with FP32 master. CLI surface:
+    `--helios-alpha`, `--helios-khvp` in glades-trainer.
+
+- **Critical routing bug in CPU HELIOS dispatch (found + fixed
+  2026-04-20):** the optimizer-dispatch if/else chain in
+  `ApplyBatch::operator()` started with
+  `if (!useAdamW && !useAtlas && !useVesta) { /* SGD + momentum */ }`.
+  This branch triggers whenever AdamW / ATLAS / VESTA is not selected —
+  which includes every HELIOS run. As a result, **every historical CPU
+  HELIOS training run was silently executing SGD + momentum instead**,
+  including all prior `HELIOSvsAdamWComparisonTest` runs that reported
+  "HELIOS wins by 0.4 nats". Fix: add `&& !useHelios` to the fallback
+  branch. The GPU HELIOS dispatch was unaffected (its branch chain is
+  `ATLAS / VESTA / HELIOS / else Adam`, no fallback catch-all).
+  Consequence: the dModel=1024 GPU NLL comparison (AdamW 9.737 vs
+  HELIOS 10.024) IS a valid HELIOS measurement, but the tiny
+  `HELIOSvsAdamWComparisonTest` "win" was a measurement of SGD+momentum
+  and is now invalid. After the fix, real HELIOS MVI does not train
+  stably at the tested configs on the tiny tokenLM — see next bullet.
+
+- **Second latent bug — lr=0 handling (fixed 2026-04-20).** `applyStep`
+  treated `hEff == 0` (i.e. `lr == 0`) as a failure and returned false.
+  The test fixture sets the InputLayerInfo learning rate to 0.0 (input
+  layer isn't trained), so the first `helios::update` call on tokE
+  received lr=0 and was reported as "HELIOS tokE update produced NaN/Inf"
+  even though the state was valid. Fix: treat `hEff == 0` as a no-op
+  success (matching AdamW/ATLAS semantics); only reject negative hEff.
+
+- **Empirical result (tiny-scale, post-bug-fixes, 2026-04-20):**
+
+  | Config | LR | Test NLL (mean, 3 seeds) |
+  |---|---|---|
+  | AdamW (best-LR) | 1e-2 | **2.244** |
+  | HELIOS MVI (best-LR) | 1e-1 | 3.023 |
+  | HELIOS + sharpness (α=0.1, K_hvp=3) | 1e-1 | 3.025 |
+
+  The sharpness probe is a wash on tiny tokenLM: it hurts by 0.002 nats
+  vs MVI (within seed variance), and MVI loses to AdamW by 0.78 nats.
+  Three seeds, identical-within-1e-3 between MVI and sharp. The probe
+  fires (verified via debug), kappa gets updated, but α·κ friction
+  doesn't materially change the trajectory at this scale.
+
+  Possible reasons:
+  (a) The flat-minimum thesis is just wrong at small scale — tiny
+      transformers have loss landscapes where directional curvature
+      doesn't predict generalization.
+  (b) Single-sequence FD-HVP is too noisy: replaying one 256-token
+      sequence per probe (vs a full minibatch) gives a high-variance
+      kappa estimate whose EMA (β=0.05) hasn't converged in the
+      30-epoch window.
+  (c) α=0.1 is the wrong setting (too small for signal, or too big
+      for stability at this LR).
+
+  Disambiguating (a) vs (b/c) requires either: (i) larger-scale
+  benchmarking at dModel≥1024 where HELIOS is known to train (needs
+  GPU port of the probe); or (ii) a less noisy probe estimate
+  (full-minibatch replay, or Hutchinson's trace estimator).
+- **Anchor term in the force (lambdaAnchor > 0).** Anchor EMA IS updated
+  on both CPU and GPU; the anchor force `lambda (theta - thetaBar)` is
+  NOT yet added to gW in the B-halves. Small change (fused scale-and-add
+  into the b-half kernel).
+- **Li-Sato-Tan noise-temperature correction (noiseCorrection > 0).**
+  Scaffolded; defaults to 0 on both paths.
+- **muP-compatible per-group masses.** Framework Section 5 specifies
+  m_g ∝ sqrt(fan-in). Current implementation uses a single scalar mass
+  from `HeliosConfig::mass`. Extension requires a per-matrix-role mass
+  override at the dispatch sites.
+
+### Decision points validated/invalidated by measurement
+
+- **"Throughput-optimize the GPU kernel"** (the user's stated request for
+  this session) — measurement shows HELIOS GPU already hits 99.94-99.96%
+  of AdamW GPU throughput at dModel=512 and dModel=1024. No optimization
+  is needed at these scales; the host-upload noise path is
+  compute-overlapped. Further throughput work should be deferred until a
+  run at dModel≥4096 demonstrates a real bottleneck.
+
+- **"HELIOS beats AdamW at pile_small scale"** (conjecture from
+  Section 13) — **falsified on this hardware.** At dModel=1024, 1.5M
+  tokens, best-LR HELIOS loses to best-LR AdamW by 0.29 nats. The
+  tiny-transformer win (dModel=64, 60 epochs on period-7 pattern) does
+  not survive scale-up in our setup. Conjecture C1 (flat-minimum
+  advantage at ≥1B scale) is still untested — requires sharpness
+  feedback (alpha > 0, kHvp > 0) which is not yet implemented.
+
+- **"MVI is enough to prove the concept"** — not yet. The MVI is plain
+  underdamped Langevin with constant friction; it lacks the sharpness
+  feedback that the flat-minimum theorem (Section 9) depends on. The
+  measurable advantage of HELIOS over AdamW in Section 6 is specifically
+  the sharpness-tilted Gibbs measure; without alpha > 0 and a working
+  HVP, we are testing only the stochastic-symplectic half of the claim.
+
+### Next experiments with positive EV
+
+Given what has been measured, the highest-EV next steps are:
+
+1. **Wire the FD-HVP probe into `SGDHelper_TRANSFORMER`** (CPU first).
+   The math primitives are now shipped and unit-tested; the remaining
+   work is training-loop surgery. Concrete steps:
+   (a) at the minibatch boundary, before the HELIOS dispatch, save
+   target matrix weights and all accumulated gradient buffers;
+   (b) perturb target += eps * v (where v = p_target / ||p_target||);
+   (c) replay the minibatch's forward+backward — need to reuse the
+   existing `transformerCpuForwardPass` / `transformerCpuBackwardPass`
+   entry points and a saved minibatch data snapshot;
+   (d) extract target's gradient as grad_plus; repeat with -eps; compute
+   kappa via `directional_curvature_fd_preallocated`;
+   (e) call `updateSharpness(state, kappa, hc)`;
+   (f) restore saved gradients and continue to the optimizer step.
+   Estimated 1 week focused. ~2% amortized overhead at K_hvp=100.
+2. **Anchor force in B-half** (small change). Adds the SAM-like
+   regularization that the framework's Laplace expansion depends on.
+3. **Per-group thermostats on GPU** (Q > 0 support). Needed to validate
+   C3 (hypocoercivity-optimal friction).
+4. **Extend the NLL benchmark to dModel=2048 with BF16** to confirm the
+   scale trend under the production precision target. 5M-token budget
+   already used for AdamW and VESTA in the BF16_PLAN; HELIOS run costs
+   ~3x a single pile_small run on this hardware (3k tok/s at ~5M tokens
+   ≈ 28 min per LR).
+
+---
+
 ## 15. Open Conjectures and Validation Criteria
 
 **C1 (Flat-minimum advantage).** For transformer LMs at >= 1B scale, HELIOS endpoints achieve strictly smaller Hessian trace than AdamW endpoints at matched validation NLL. Falsifier: Hutchinson trace estimate on both is statistically equivalent after n = 100 probes.

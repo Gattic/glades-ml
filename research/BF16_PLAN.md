@@ -207,3 +207,67 @@ Throughput measured — see "Measured throughput" section above.
 
 Current state is production-ready for correctness; remaining items
 unlock additional throughput.
+
+## BF16 optimizer state (AdamW, 2026-04-21)
+
+Separately from the BF16 weight/activation mixed-precision path above:
+we now support storing the AdamW optimizer state (m, v) in BF16 for the
+9 large weight matrices (tokE, WIn, WOut, per-layer Wq/Wk/Wv/Wo/W1/W2),
+halving their optimizer-state VRAM. Biases and LN params stay FP32.
+
+**Kernel**: `gpu::adam_update_bf16_state` in `gpu_kernels.cu`. Loads m, v
+as uint16_t BF16 bit patterns, upcasts to FP32 for EMA compute, stores
+back BF16 with round-to-nearest-even. Weights + grads remain FP32.
+Identical math to `adam_update` up to 7-bit mantissa quantization on
+the EMAs.
+
+**Test**: `GpuTrainingUnitTest` Test 3 (gpu-training-test.cpp) runs both
+kernels side-by-side on a 512-element synthetic problem for 100 steps
+with identical gradients. Observed deviation: **L2-relative 0.27%**
+between FP32-Adam and BF16-state-Adam weight trajectories (well under
+the 2% bound). Per-coordinate max-rel drift 1.9% (filtered to |W|>1e-3
+to avoid divisor blow-up at zero crossings).
+
+**Buffers**: BF16 shadow buffers `vTokE_bf16`, `v2TokE_bf16`, etc. added
+to `GpuTransformerWeights`. Allocation is mutually exclusive with FP32
+m/v — `allocate(..., adamStateBf16=true)` allocates BF16 only.
+
+**Dispatch**: in `transformerGpuTrainEpoch`'s AdamW branch, when
+`trainingConfig.mixedPrecision.adamStateBf16` is true, the 9 large
+matrices are skipped from the batched Adam and processed per-matrix
+via `adam_update_bf16_state`. Biases/LN continue through the batched
+FP32 Adam. Zero measurable throughput impact at dModel=1024.
+
+**Measured VRAM savings at dModel=1024, 8 layers**:
+
+| Config | total GPU VRAM used (nvidia-smi) |
+|---|---|
+| AdamW FP32 state | 3,955 MB |
+| AdamW BF16 state | 3,415 MB |
+| **savings** | **540 MB** (~4.5% of card; matches theoretical ~467 MB for 9 big matrices × 2 moments × 2 bytes saved per param) |
+
+CLI: `--adam-state-bf16` in glades-trainer.
+
+**Next step for even bigger savings**: 8-bit quantized Adam state
+(bitsandbytes-style block-wise scaling) would halve memory again
+(~2 GB savings at this scale), at the cost of another quantization
+stage. Out of scope for this session.
+
+## Cross-optimizer coverage (2026-04-20)
+
+The BF16 mirror refresh (`ensureLowpMirrors`) runs at the tail of
+`transformerGpuTrainEpoch` AFTER all optimizer branches (AdamW, ATLAS,
+VESTA, HELIOS), so any optimizer that updates the FP32 master weights
+picks up a fresh BF16 mirror for the next forward pass automatically.
+
+| Optimizer | GPU path | BF16-compatible | Parity tests |
+|---|---|---|---|
+| AdamW | yes | yes | existing |
+| ATLAS (+ECHO/BiMAP/PACT/etc.) | yes | yes | existing |
+| VESTA | yes | yes | VESTATransformerBf16ParityTest (5.1e-5) |
+| HELIOS | yes (2026-04-20) | yes (via master-weight update) | HELIOSGpuParityTest + HELIOSGpuStochasticParityTest (bit-exact / 5.96e-8) |
+
+No new BF16 work was needed to integrate HELIOS — HELIOS mutates the FP32
+master weights in-place, identical to AdamW/VESTA, and the existing
+post-step refresh rebuilds the BF16 mirrors. See
+`research/HELIOS_framework.md` §14a for the HELIOS implementation status.

@@ -7,6 +7,7 @@
 #include "gpu_buffer.h"
 #include "gpu_atlas.h"
 #include "gpu_vesta.h"
+#include "gpu_helios.h"
 #include <cstddef>
 
 #ifdef GLADES_HAVE_CUDA
@@ -118,6 +119,11 @@ struct GpuTransformerWeights
 	// BF16 low-precision mirror, kept in sync with the FP32 master after each
 	// optimizer step (ensureGpuLowpMirrors). Empty when mixed precision is off.
 	GpuBuffer<uint16_t> tokELowp;
+	// BF16 Adam state (m1, m2) — used when MixedPrecisionConfig::adamStateBf16
+	// is true. Exactly one of {vTokE, vTokE_bf16} and {v2TokE, v2TokE_bf16}
+	// is allocated at a time to save VRAM; allocate() picks based on config.
+	GpuBuffer<uint16_t> vTokE_bf16;
+	GpuBuffer<uint16_t> v2TokE_bf16;
 
 	// LM head bias: [vocabSize]
 	GpuBuffer<float> lmBias;
@@ -131,6 +137,8 @@ struct GpuTransformerWeights
 	GpuBuffer<float> v2WIn;
 	GpuBuffer<float> gWIn;
 	GpuBuffer<uint16_t> WInLowp;
+	GpuBuffer<uint16_t> vWIn_bf16;
+	GpuBuffer<uint16_t> v2WIn_bf16;
 	GpuBuffer<float> bIn;    // [dModel]
 	GpuBuffer<float> mBIn;
 	GpuBuffer<float> v2BIn;
@@ -142,6 +150,8 @@ struct GpuTransformerWeights
 	GpuBuffer<float> v2WOut;
 	GpuBuffer<float> gWOut;
 	GpuBuffer<uint16_t> WOutLowp;
+	GpuBuffer<uint16_t> vWOut_bf16;
+	GpuBuffer<uint16_t> v2WOut_bf16;
 	GpuBuffer<float> bOut;   // [outSize]
 	GpuBuffer<float> mBOut;
 	GpuBuffer<float> v2BOut;
@@ -176,6 +186,9 @@ struct GpuTransformerWeights
 		GpuBuffer<float> v2Wq, v2Wk, v2Wv, v2Wo;
 		GpuBuffer<float> gWq, gWk, gWv, gWo;
 		GpuBuffer<uint16_t> WqLowp, WkLowp, WvLowp, WoLowp;
+		// BF16 Adam state (used when adamStateBf16=true, saves ~2x VRAM).
+		GpuBuffer<uint16_t> vWq_bf16, vWk_bf16, vWv_bf16, vWo_bf16;
+		GpuBuffer<uint16_t> v2Wq_bf16, v2Wk_bf16, v2Wv_bf16, v2Wo_bf16;
 		GpuBuffer<float> bq, bk, bv, bo;     // [dModel] or [dModelKV]
 		GpuBuffer<float> mBq, mBk, mBv, mBo;
 		GpuBuffer<float> v2Bq, v2Bk, v2Bv, v2Bo;
@@ -195,6 +208,8 @@ struct GpuTransformerWeights
 		GpuBuffer<float> W1, W2;
 		GpuBuffer<float> vW1, vW2;
 		GpuBuffer<float> v2W1, v2W2;
+		GpuBuffer<uint16_t> vW1_bf16, vW2_bf16;
+		GpuBuffer<uint16_t> v2W1_bf16, v2W2_bf16;
 		GpuBuffer<float> gW1, gW2;
 		GpuBuffer<uint16_t> W1Lowp, W2Lowp;
 		GpuBuffer<float> b1, b2;     // [dFF or 2*dFF], [dModel]
@@ -207,6 +222,8 @@ struct GpuTransformerWeights
 		GpuAtlasWeightState atlasW1, atlasW2;
 		GpuVestaWeightState vestaWq, vestaWk, vestaWv, vestaWo;
 		GpuVestaWeightState vestaW1, vestaW2;
+		GpuHeliosWeightState heliosWq, heliosWk, heliosWv, heliosWo;
+		GpuHeliosWeightState heliosW1, heliosW2;
 		GpuEchoWeightState echoWq, echoWk, echoWv, echoWo;
 		GpuEchoWeightState echoW1, echoW2;
 		GpuBiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
@@ -283,6 +300,9 @@ struct GpuTransformerWeights
 	GpuVestaWeightState vestaTokE;
 	GpuVestaWeightState vestaWIn;
 	GpuVestaWeightState vestaWOut;
+	GpuHeliosWeightState heliosTokE;
+	GpuHeliosWeightState heliosWIn;
+	GpuHeliosWeightState heliosWOut;
 	GpuEchoWeightState echoTokE;
 	GpuEchoWeightState echoWIn;
 	GpuEchoWeightState echoWOut;
@@ -321,11 +341,16 @@ struct GpuTransformerWeights
 	// When skipAdamBufs is true, Adam moment buffers (v*/v2*/m*) are not
 	// allocated on GPU.  Used when the optimizer is ATLAS (which maintains
 	// its own per-matrix state) to avoid wasting ~2x model-size in VRAM.
+	// When adamStateBf16 is true, the m/v moments for the 9 large weight
+	// matrices (tokE, WIn, WOut, Wq/Wk/Wv/Wo/W1/W2 per block) are stored
+	// in BF16 (uint16_t) instead of FP32, halving their VRAM cost. Biases
+	// and LN params keep FP32 state (their size is negligible).
 	bool allocate(unsigned int dModel, unsigned int dFF, unsigned int nHeads,
 	              unsigned int nKVHeads, unsigned int nLayers,
 	              unsigned int vocabSize, unsigned int inputSize, unsigned int outSize,
 	              unsigned int ffnKind, bool tokenModel, bool tieEmbeddings,
-	              bool skipAdamBufs = false);
+	              bool skipAdamBufs = false,
+	              bool adamStateBf16 = false);
 
 	// Free all GPU memory.
 	void free();

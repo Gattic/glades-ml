@@ -1118,6 +1118,93 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Adam with BF16-packed optimizer state
+// ---------------------------------------------------------------------------
+// Loads m, v from uint16_t (BF16 bit pattern in high half-word), casts to
+// FP32 for EMA compute, stores back as BF16 with round-to-nearest-even.
+// Weights and grads stay FP32 throughout. Mathematical semantics identical
+// to adam_update; only EMA storage precision differs.
+
+namespace {
+
+__device__ __forceinline__ float bf16_load_as_f32(uint16_t b)
+{
+	union { uint32_t u; float f; } v;
+	v.u = static_cast<uint32_t>(b) << 16;
+	return v.f;
+}
+
+__device__ __forceinline__ uint16_t bf16_store_from_f32(float f)
+{
+	union { float f; uint32_t u; } v;
+	v.f = f;
+	if (isnan(f))
+	{
+		const uint32_t sign = v.u & 0x80000000u;
+		return static_cast<uint16_t>(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+	}
+	const uint32_t lsb = (v.u >> 16) & 1u;
+	const uint32_t roundingBias = 0x7FFFu + lsb;
+	return static_cast<uint16_t>((v.u + roundingBias) >> 16);
+}
+
+__global__ void adam_update_bf16_state_kernel(
+    float* __restrict__ param,
+    const float* __restrict__ grad,
+    uint16_t* __restrict__ m_bf16,
+    uint16_t* __restrict__ v_bf16,
+    float lr, float beta1, float beta2,
+    float eps, float weightDecay,
+    float gradScale,
+    int step, int n)
+{
+	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	const float g = grad[idx] * gradScale;
+
+	// Decoupled weight decay (AdamW) — weights are FP32.
+	if (weightDecay != 0.0f)
+		param[idx] -= lr * weightDecay * param[idx];
+
+	// Load BF16 moments, upcast to FP32 for EMA arithmetic.
+	const float m_old = bf16_load_as_f32(m_bf16[idx]);
+	const float v_old = bf16_load_as_f32(v_bf16[idx]);
+
+	const float m_new = beta1 * m_old + (1.0f - beta1) * g;
+	const float v_new = beta2 * v_old + (1.0f - beta2) * g * g;
+
+	// Store back as BF16 (round-to-nearest-even).
+	m_bf16[idx] = bf16_store_from_f32(m_new);
+	v_bf16[idx] = bf16_store_from_f32(v_new);
+
+	// Bias correction (matches FP32 adam_update_kernel).
+	const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
+	const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
+	const float m_hat = m_new / bc1;
+	const float v_hat = v_new / bc2;
+
+	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
+} // anonymous namespace
+
+bool adam_update_bf16_state(float* param, const float* grad,
+                            uint16_t* m_bf16, uint16_t* v_bf16,
+                            float lr, float beta1, float beta2, float eps,
+                            float weightDecay, float gradScale,
+                            int step, int n)
+{
+	if (n <= 0) return true;
+	const int grid = (n + kBlockElem - 1) / kBlockElem;
+	adam_update_bf16_state_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    param, grad, m_bf16, v_bf16,
+	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // Batched Adam: process all parameter groups in a single kernel launch.
 // Each block handles one element range within one parameter group.
 namespace {

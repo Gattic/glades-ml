@@ -149,5 +149,46 @@ bool update(WeightState& state,
             shmea::GLogger* logger = 0,
             const char* tag = 0);
 
+// Callback type for the finite-difference HVP: write the gradient of U at
+// `theta` into `gradOut`. Must not modify theta beyond reading it. Called
+// twice per directional_curvature_fd invocation.
+typedef void (*GradFn)(void* ctx, const float* theta, std::size_t N,
+                       float* gradOut);
+
+// Compute v^T H v at theta via central finite differences, where H is the
+// Hessian of the potential U implicitly defined by gradFn.
+//
+// Formula: kappa = (1/(2 eps)) * v . (gradFn(theta + eps v) - gradFn(theta - eps v))
+//
+// Does not modify theta or v. Uses O(N) scratch allocated internally (4 N
+// floats); callers that need a no-alloc version can use
+// directional_curvature_fd_preallocated below.
+//
+// If gradFn returns a non-finite result on either perturbed evaluation,
+// returns 0.0f (the caller should treat the probe as failed and skip the
+// kappa EMA update).
+float directional_curvature_fd(GradFn gradFn, void* ctx,
+                               const float* theta, const float* v,
+                               std::size_t N, float eps);
+
+// Zero-alloc variant. scratch* buffers must each have at least N elements.
+float directional_curvature_fd_preallocated(
+    GradFn gradFn, void* ctx,
+    const float* theta, const float* v,
+    std::size_t N, float eps,
+    float* scratchThetaPlus, float* scratchThetaMinus,
+    float* scratchGradPlus, float* scratchGradMinus);
+
+// EMA-update the per-matrix sharpness estimate kappa from a fresh probe
+// kappaProbe. The probe is clipped to [0, hc.kappaMax] to enforce non-
+// negativity of the Rayleigh quotient under finite-batch noise (Section 12,
+// failure mode 2 in research/HELIOS_framework.md). Uses a fixed EMA
+// coefficient beta_kappa = 0.05 (framework Section 7 step 10).
+//
+// Returns true on success; false if state is uninitialized or kappaProbe is
+// non-finite.
+bool updateSharpness(WeightState& state, float kappaProbe,
+                     const HeliosConfig& hc);
+
 } // namespace helios
 } // namespace glades

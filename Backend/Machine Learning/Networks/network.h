@@ -2021,6 +2021,27 @@ private:
 	                                unsigned int& seqInBatch,
 	                                unsigned int& timeStepsInBatch);
 
+#ifdef GLADES_HAVE_CUDA
+	// Runs the GPU forward pass (embedding → per-layer blocks → final LN →
+	// output head → softmax) for ONE sequence. Token IDs must already be
+	// uploaded to gpuTransformerScratch->tokenIds (tokenLM mode) by the
+	// caller. Does NOT compute loss/metrics and does NOT run backward.
+	// Writes logits/probs to scratch buffers. Used for both the normal
+	// training forward and the HELIOS FD-HVP probe's perturbed re-forward.
+	//
+	// gpuPerfOpaque: nullable pointer to TransformerGpuPerfBreakdown (cast
+	// internally to avoid exposing the perf struct in this header).
+	bool transformerGpuRunForwardOnly(const TransformerEpochCfg& cfg,
+	                                  unsigned int T,
+	                                  bool useBf16, bool useRope,
+	                                  bool bf16WIn, bool bf16Wq, bool bf16Wk,
+	                                  bool bf16Wv, bool bf16Wo, bool bf16W1,
+	                                  bool bf16W2, bool bf16Head,
+	                                  int ropeDimOverride,
+	                                  void* gpuPerfOpaque);
+#endif
+
+
 	// Owned resources (used only in some construction paths)
 	shmea::GPointer<NNInfo> ownedSkeleton;
 

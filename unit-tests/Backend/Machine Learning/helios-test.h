@@ -22,6 +22,13 @@ void HELIOSBaoabInvariantTest();
 void HELIOSStepDescentTest();
 void HELIOSNonFiniteGuardTest();
 void HELIOSvsAdamWComparisonTest();
+void HELIOSGpuParityTest();
+void HELIOSGpuStochasticParityTest();
+void HELIOSFdHvpQuadraticTest();
+void HELIOSGpuProbeKernelsTest();
+void HELIOSUpdateSharpnessTest();
+void HELIOSSharpnessFeedbackTest();
+void HELIOSSharpnessTransformerTest();
 void HELIOSUnitTest();
 
 #endif

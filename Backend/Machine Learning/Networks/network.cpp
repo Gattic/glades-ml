@@ -2598,6 +2598,8 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		tensorTransformer.padTokenId = modelCfg.padTokenId;
 		tensorTransformer.tieEmbeddings = modelCfg.tieEmbeddings;
 		tensorTransformer.optimizerStep = 0ULL;
+		tensorTransformer.heliosHvpStepCounter = 0ULL;
+		tensorTransformer.heliosHvpCycleCounter = 0ULL;
 
 		// ATLAS normally uses its own per-matrix state and skips AdamW moments to
 		// save memory. Some transformer-side experimental branches reuse Adam-style
@@ -4113,6 +4115,8 @@ glades::NNetworkStatus glades::NNetwork::loadTensorWeightsFromFile(const std::st
 		tensorTransformer.padTokenId = static_cast<int>(padTokenU);
 		tensorTransformer.tieEmbeddings = (tieEmbU != 0u);
 		tensorTransformer.optimizerStep = 0ULL;
+		tensorTransformer.heliosHvpStepCounter = 0ULL;
+		tensorTransformer.heliosHvpCycleCounter = 0ULL;
 
 		// Validate transformer dimensions before any large allocations.
 		if (dModel == 0u || nHeads == 0u)
@@ -4550,10 +4554,13 @@ bool glades::NNetwork::ensureGpuState()
 		{
 			if (gpuTransformerWeights->initialized)
 				gpuTransformerWeights->free();
+			const bool useBf16State =
+			    trainingConfig.mixedPrecision.adamStateBf16
+			    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW);
 			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
 			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
 			                                      ts.outSize, ts.ffnKind, ts.tokenModel,
-			                                      ts.tieEmbeddings, skipAdam))
+			                                      ts.tieEmbeddings, skipAdam, useBf16State))
 			{
 				return false;
 			}

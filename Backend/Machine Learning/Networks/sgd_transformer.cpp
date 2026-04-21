@@ -1933,7 +1933,7 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			};
 
 			// --- Apply updates ---
-			if (!useAdamW && !useAtlas && !useVesta)
+			if (!useAdamW && !useAtlas && !useVesta && !useHelios)
 			{
 				// SGD + momentum (historical behavior).
 				// Token embedding (index 0 in LM mode)
@@ -7166,6 +7166,203 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 				// (e.g. all-pad targets). In that case applyBatch() is a no-op.
 				if (timeStepsInBatch > 0u)
 				{
+					// === HELIOS sharpness probe (FD-HVP, framework Section 7 step 10) ===
+					// Every K_hvp minibatches, perturb one weight matrix along its
+					// momentum direction by +-eps, replay the last sequence's
+					// forward+backward, and EMA the resulting directional curvature
+					// v^T H v into that matrix's helios::WeightState::kappa. The
+					// O-step friction gamma_0 + alpha*kappa then adapts per
+					// framework Section 6. Probe is a no-op unless HELIOS is the
+					// active optimizer and hc.alpha > 0 and hc.kHvp > 0. One probe
+					// event costs 2 extra forward+backward passes on ONE sequence
+					// (not the full minibatch); amortized ~2/K_hvp overhead per
+					// minibatch.
+					{
+						const bool useHeliosProbe = (trainingConfig.optimizer.type
+						    == glades::OptimizerConfig::HELIOS);
+						const glades::HeliosConfig& hc = trainingConfig.helios;
+						if (useHeliosProbe && hc.alpha > 0.0f && hc.kHvp > 0u
+						    && tokenIds.size() == static_cast<size_t>(T))
+						{
+							tt.heliosHvpStepCounter++;
+							if ((tt.heliosHvpStepCounter
+							     % static_cast<unsigned long long>(hc.kHvp)) == 0ULL)
+							{
+								// Round-robin 6 matrix types * nLayers.
+								const unsigned int totalTargets = 6u * nLayers;
+								const unsigned int cycleIdx = static_cast<unsigned int>(
+								    tt.heliosHvpCycleCounter
+								    % static_cast<unsigned long long>(totalTargets));
+								tt.heliosHvpCycleCounter++;
+								const unsigned int layerIdx = cycleIdx / 6u;
+								const unsigned int mtypeIdx = cycleIdx % 6u;
+
+								TensorTransformerState::Block& bPrb = tt.blocks[layerIdx];
+								std::vector<float>* W_p = 0;
+								std::vector<float>* g_p = 0;
+								glades::helios::WeightState* hst = 0;
+								switch (mtypeIdx)
+								{
+									case 0: W_p = &bPrb.Wq; g_p = &bPrb.gWq;
+									        hst = &bPrb.heliosWq; break;
+									case 1: W_p = &bPrb.Wk; g_p = &bPrb.gWk;
+									        hst = &bPrb.heliosWk; break;
+									case 2: W_p = &bPrb.Wv; g_p = &bPrb.gWv;
+									        hst = &bPrb.heliosWv; break;
+									case 3: W_p = &bPrb.Wo; g_p = &bPrb.gWo;
+									        hst = &bPrb.heliosWo; break;
+									case 4: W_p = &bPrb.W1; g_p = &bPrb.gW1;
+									        hst = &bPrb.heliosW1; break;
+									case 5: W_p = &bPrb.W2; g_p = &bPrb.gW2;
+									        hst = &bPrb.heliosW2; break;
+								}
+
+								if (W_p && g_p && hst && hst->initialized
+								    && W_p->size() > 0
+								    && hst->p.size() == W_p->size())
+								{
+									const size_t Np = W_p->size();
+									// v = p / ||p||. Skip if momentum is ~0 (first
+									// minibatch typically): there is no meaningful
+									// direction yet.
+									double pNorm2 = 0.0;
+									for (size_t i = 0; i < Np; ++i)
+									{
+										const double pi =
+										    static_cast<double>(hst->p[i]);
+										pNorm2 += pi * pi;
+									}
+									if (pNorm2 > 1e-12)
+									{
+										const float invNorm = 1.0f /
+										    static_cast<float>(std::sqrt(pNorm2));
+										std::vector<float> v(Np);
+										for (size_t i = 0; i < Np; ++i)
+											v[i] = hst->p[i] * invNorm;
+
+										// Snapshot target matrix weights.
+										std::vector<float> W_save = *W_p;
+
+										// Snapshot ALL grad buffers (probe will
+										// overwrite via clearGrads+backward).
+										std::vector<float> snapTokE = tt.gTokE;
+										std::vector<float> snapLmBias = tt.gLmBias;
+										std::vector<float> snapWIn = tt.gWIn;
+										std::vector<float> snapBIn = tt.gBIn;
+										std::vector<float> snapWOut = tt.gWOut;
+										std::vector<float> snapBOut = tt.gBOut;
+										std::vector<float> snapLnFG = tt.gLnFinalGamma;
+										std::vector<float> snapLnFB = tt.gLnFinalBeta;
+										std::vector<std::vector<float> > snapBlocks(
+										    static_cast<size_t>(nLayers) * 16u);
+										for (unsigned int li = 0; li < nLayers; ++li)
+										{
+											TensorTransformerState::Block& bl = tt.blocks[li];
+											const size_t base = static_cast<size_t>(li) * 16u;
+											snapBlocks[base+0]  = bl.gLn1Gamma;
+											snapBlocks[base+1]  = bl.gLn1Beta;
+											snapBlocks[base+2]  = bl.gWq;
+											snapBlocks[base+3]  = bl.gWk;
+											snapBlocks[base+4]  = bl.gWv;
+											snapBlocks[base+5]  = bl.gWo;
+											snapBlocks[base+6]  = bl.gBq;
+											snapBlocks[base+7]  = bl.gBk;
+											snapBlocks[base+8]  = bl.gBv;
+											snapBlocks[base+9]  = bl.gBo;
+											snapBlocks[base+10] = bl.gLn2Gamma;
+											snapBlocks[base+11] = bl.gLn2Beta;
+											snapBlocks[base+12] = bl.gW1;
+											snapBlocks[base+13] = bl.gW2;
+											snapBlocks[base+14] = bl.gB1;
+											snapBlocks[base+15] = bl.gB2;
+										}
+
+										const float epsFd = 1e-3f;
+
+										// +eps perturbation, replay on last sequence.
+										for (size_t i = 0; i < Np; ++i)
+											(*W_p)[i] = W_save[i] + epsFd * v[i];
+										clearGrads();
+										{
+											unsigned int rsib = 0u, rtsb = 0u;
+											transformerCpuForwardPass(epochCfg, T, s,
+											    tokenIds, targetIds, keyAllowed,
+											    scratchOutSize, sampleCount);
+											transformerCpuBackwardPass(epochCfg, T, s,
+											    tokenIds, targetIds, scratchOutSize,
+											    rsib, rtsb);
+										}
+										std::vector<float> gPlus = *g_p;
+
+										// -eps perturbation, replay again.
+										for (size_t i = 0; i < Np; ++i)
+											(*W_p)[i] = W_save[i] - epsFd * v[i];
+										clearGrads();
+										{
+											unsigned int rsib = 0u, rtsb = 0u;
+											transformerCpuForwardPass(epochCfg, T, s,
+											    tokenIds, targetIds, keyAllowed,
+											    scratchOutSize, sampleCount);
+											transformerCpuBackwardPass(epochCfg, T, s,
+											    tokenIds, targetIds, scratchOutSize,
+											    rsib, rtsb);
+										}
+
+										// kappa = v . (gPlus - gMinus) / (2 eps).
+										double kappaAcc = 0.0;
+										for (size_t i = 0; i < Np; ++i)
+										{
+											kappaAcc += static_cast<double>(v[i]) *
+											    (static_cast<double>(gPlus[i])
+											     - static_cast<double>((*g_p)[i]));
+										}
+										const float kappa = static_cast<float>(
+										    kappaAcc / (2.0 * static_cast<double>(epsFd)));
+
+										// Restore target weights.
+										*W_p = W_save;
+
+										// Restore all grad buffers (swap is O(1)).
+										tt.gTokE.swap(snapTokE);
+										tt.gLmBias.swap(snapLmBias);
+										tt.gWIn.swap(snapWIn);
+										tt.gBIn.swap(snapBIn);
+										tt.gWOut.swap(snapWOut);
+										tt.gBOut.swap(snapBOut);
+										tt.gLnFinalGamma.swap(snapLnFG);
+										tt.gLnFinalBeta.swap(snapLnFB);
+										for (unsigned int li = 0; li < nLayers; ++li)
+										{
+											TensorTransformerState::Block& bl = tt.blocks[li];
+											const size_t base =
+											    static_cast<size_t>(li) * 16u;
+											bl.gLn1Gamma.swap(snapBlocks[base+0]);
+											bl.gLn1Beta.swap(snapBlocks[base+1]);
+											bl.gWq.swap(snapBlocks[base+2]);
+											bl.gWk.swap(snapBlocks[base+3]);
+											bl.gWv.swap(snapBlocks[base+4]);
+											bl.gWo.swap(snapBlocks[base+5]);
+											bl.gBq.swap(snapBlocks[base+6]);
+											bl.gBk.swap(snapBlocks[base+7]);
+											bl.gBv.swap(snapBlocks[base+8]);
+											bl.gBo.swap(snapBlocks[base+9]);
+											bl.gLn2Gamma.swap(snapBlocks[base+10]);
+											bl.gLn2Beta.swap(snapBlocks[base+11]);
+											bl.gW1.swap(snapBlocks[base+12]);
+											bl.gW2.swap(snapBlocks[base+13]);
+											bl.gB1.swap(snapBlocks[base+14]);
+											bl.gB2.swap(snapBlocks[base+15]);
+										}
+
+											// EMA update kappa on the probed matrix's state.
+										glades::helios::updateSharpness(*hst, kappa, hc);
+									}
+								}
+							}
+						}
+					}
+					// === End HELIOS sharpness probe ===
+
 					const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
 					if (!minibatchDriver.apply_ready_batch(timeStepsInBatch, stepInEpoch))
 						return;
@@ -9015,6 +9212,312 @@ static inline bool gpu_gemm_atb_mp(bool useBf16,
 
 } // anonymous namespace
 
+#ifdef GLADES_HAVE_CUDA
+
+// Extracted GPU forward pass for one sequence. Used by:
+//   (1) transformerGpuTrainEpoch's per-sequence inner body (normal forward).
+//   (2) HELIOS FD-HVP probe — called 2× with perturbed target weights to
+//       compute kappa = (L_plus + L_minus - 2 L_0) / eps^2 (scalar-FD form).
+// See research/HELIOS_framework.md §14a for the probe protocol.
+//
+// Preconditions:
+//   - For tokenLM: token IDs already uploaded to gpuTransformerScratch->tokenIds.
+//   - For dense: input features already uploaded to gpuTransformerScratch->x.
+//   - RoPE invFreq uploaded to gpuTransformerScratch->gpuInvFreq (if useRope).
+//   - BF16 mirrors refreshed (if useBf16) via ensureLowpMirrors().
+//
+// Writes to: gpuTransformerScratch activations (h, x1, Q, K, V, attnConcat,
+// attnOut, hAfterAttn, x2, ff1, ff1Act, ffOut, hAfterFF, hPostFinalLN,
+// logits, probs). Does not touch gradient buffers or loss accumulators.
+bool glades::NNetwork::transformerGpuRunForwardOnly(
+    const TransformerEpochCfg& cfg,
+    unsigned int T,
+    bool useBf16, bool useRope,
+    bool bf16WIn, bool bf16Wq, bool bf16Wk,
+    bool bf16Wv, bool bf16Wo, bool bf16W1,
+    bool bf16W2, bool bf16Head,
+    int ropeDimOverride,
+    void* gpuPerfOpaque)
+{
+	if (!gpuTransformerWeights || !gpuTransformerScratch) return false;
+	if (T == 0u) return false;
+
+	const unsigned int dModel = cfg.dModel;
+	const unsigned int dFF = cfg.dFF;
+	const unsigned int nHeads = cfg.nHeads;
+	const unsigned int nKVHeads = cfg.nKVHeads > 0u ? cfg.nKVHeads : cfg.nHeads;
+	const unsigned int nLayers = cfg.nLayers;
+	const unsigned int vocabSize = cfg.vocabSize;
+	const unsigned int inputSize = cfg.inputSize;
+	const unsigned int outSize = cfg.outSize;
+	const unsigned int dHead = dModel / nHeads;
+	const unsigned int dModelKV = nKVHeads * dHead;
+	const unsigned int ffnKind = static_cast<unsigned int>(cfg.ffnKind);
+	const unsigned int ff1Width = (ffnKind == 1u) ? (2u * dFF) : dFF;
+	const bool tokenLM = cfg.tokenLM;
+	const bool tieEmb = cfg.tieEmb;
+	const bool causal = cfg.causal;
+	const int normType = cfg.normType;
+	const int ffnAct = cfg.ffnAct;
+	const float lnEps = cfg.lnEps;
+
+	TransformerGpuPerfBreakdown* gpuPerf =
+	    reinterpret_cast<TransformerGpuPerfBreakdown*>(gpuPerfOpaque);
+	(void)gpuPerf; // reserved for fine-grained timing; not used for probe calls
+
+	// Embedding / input projection.
+	if (tokenLM)
+	{
+		gpu::embedding_gather(
+		    gpuTransformerWeights->tokE.data(),
+		    gpuTransformerScratch->tokenIds.data(),
+		    static_cast<int>(T), static_cast<int>(vocabSize),
+		    static_cast<int>(dModel),
+		    gpuTransformerScratch->h.data());
+	}
+	else
+	{
+		if (!gpu_gemm_abt_mp(bf16WIn,
+		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(inputSize),
+		    1.0f,
+		    gpuTransformerScratch->x.data(),
+		    gpuTransformerScratch->activationLowp.data(),
+		    static_cast<int>(inputSize),
+		    gpuTransformerWeights->WIn.data(),
+		    gpuTransformerWeights->WInLowp.data(),
+		    static_cast<int>(inputSize),
+		    0.0f,
+		    gpuTransformerScratch->h.data(), static_cast<int>(dModel)))
+			return false;
+		gpu::add_bias(gpuTransformerScratch->h.data(),
+		              gpuTransformerWeights->bIn.data(),
+		              static_cast<int>(T), static_cast<int>(dModel));
+	}
+
+	// Per-layer transformer blocks.
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
+		const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+
+		const float* layerIn = (li == 0)
+		    ? gpuTransformerScratch->h.data()
+		    : (gpuTransformerScratch->hAfterFF.data()
+		       + static_cast<size_t>(li - 1) * T * dModel);
+
+		float* x1_l = gpuTransformerScratch->x1.data()
+		              + static_cast<size_t>(li) * T * dModel;
+		float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
+		float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
+
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			gpu::rmsnorm_forward(layerIn, gb.ln1Gamma.data(), lnEps,
+			                     static_cast<int>(T), static_cast<int>(dModel),
+			                     x1_l, ln1InvStd_l);
+		else
+			gpu::layernorm_forward(layerIn, gb.ln1Gamma.data(), gb.ln1Beta.data(),
+			                       lnEps, static_cast<int>(T), static_cast<int>(dModel),
+			                       x1_l, ln1Mean_l, ln1InvStd_l);
+
+		float* Q_l = gpuTransformerScratch->Q.data()
+		             + static_cast<size_t>(li) * T * dModel;
+		float* K_l = gpuTransformerScratch->K.data()
+		             + static_cast<size_t>(li) * T * dModelKV;
+		float* V_l = gpuTransformerScratch->V.data()
+		             + static_cast<size_t>(li) * T * dModelKV;
+
+		if (!gpu_gemm_abt_mp(bf16Wq,
+		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
+		    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+		    gb.Wq.data(), gb.WqLowp.data(), static_cast<int>(dModel),
+		    0.0f, Q_l, static_cast<int>(dModel)))
+			return false;
+		gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+		if (!gpu_gemm_abt_mp(bf16Wk,
+		    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+		    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+		    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
+		    0.0f, K_l, static_cast<int>(dModelKV)))
+			return false;
+		gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+
+		if (!gpu_gemm_abt_mp(bf16Wv,
+		    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+		    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+		    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
+		    0.0f, V_l, static_cast<int>(dModelKV)))
+			return false;
+		gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+
+		if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
+		{
+			const unsigned int rd =
+			    (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
+			    ? static_cast<unsigned int>(ropeDimOverride) : dHead;
+			gpu::rope_apply_qk(Q_l, K_l, gpuTransformerScratch->gpuInvFreq.data(),
+			                   static_cast<int>(T), static_cast<int>(nHeads),
+			                   static_cast<int>(nKVHeads), static_cast<int>(dHead),
+			                   static_cast<int>(rd / 2u));
+		}
+
+		float* attnConcat_l = gpuTransformerScratch->attnConcat.data()
+		                      + static_cast<size_t>(li) * T * dModel;
+		if (useBf16)
+		{
+			glades::gpu::cast_f32_to_bf16(Q_l, gpuTransformerScratch->qLowp.data(),
+			    static_cast<size_t>(T) * dModel);
+			glades::gpu::cast_f32_to_bf16(K_l, gpuTransformerScratch->kLowp.data(),
+			    static_cast<size_t>(T) * dModelKV);
+			glades::gpu::cast_f32_to_bf16(V_l, gpuTransformerScratch->vLowp.data(),
+			    static_cast<size_t>(T) * dModelKV);
+			gpu::flash_attention_multihead_forward_bf16(
+			    gpuTransformerScratch->qLowp.data(),
+			    gpuTransformerScratch->kLowp.data(),
+			    gpuTransformerScratch->vLowp.data(),
+			    static_cast<int>(T), static_cast<int>(nHeads),
+			    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+			    static_cast<int>(dModel), static_cast<int>(dModelKV),
+			    causal, attnConcat_l);
+		}
+		else
+		{
+			gpu::flash_attention_multihead_forward(Q_l, K_l, V_l,
+			    static_cast<int>(T), static_cast<int>(nHeads),
+			    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+			    static_cast<int>(dModel), static_cast<int>(dModelKV),
+			    causal, attnConcat_l);
+		}
+
+		float* attnOut_l = gpuTransformerScratch->attnOut.data()
+		                   + static_cast<size_t>(li) * T * dModel;
+		if (!gpu_gemm_abt_mp(bf16Wo,
+		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
+		    attnConcat_l, gpuTransformerScratch->activationLowp.data(),
+		    static_cast<int>(dModel),
+		    gb.Wo.data(), gb.WoLowp.data(), static_cast<int>(dModel),
+		    0.0f, attnOut_l, static_cast<int>(dModel)))
+			return false;
+		gpu::add_bias(attnOut_l, gb.bo.data(),
+		              static_cast<int>(T), static_cast<int>(dModel));
+
+		float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data()
+		                      + static_cast<size_t>(li) * T * dModel;
+		gpu::add_two(hAfterAttn_l, layerIn, attnOut_l,
+		             static_cast<int>(T * dModel));
+
+		float* x2_l = gpuTransformerScratch->x2.data()
+		              + static_cast<size_t>(li) * T * dModel;
+		float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
+		float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
+
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			gpu::rmsnorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), lnEps,
+			                     static_cast<int>(T), static_cast<int>(dModel),
+			                     x2_l, ln2InvStd_l);
+		else
+			gpu::layernorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), gb.ln2Beta.data(),
+			                       lnEps, static_cast<int>(T), static_cast<int>(dModel),
+			                       x2_l, ln2Mean_l, ln2InvStd_l);
+
+		float* ff1_l = gpuTransformerScratch->ff1.data()
+		               + static_cast<size_t>(li) * T * ff1Width;
+		float* ff1Act_l = gpuTransformerScratch->ff1Act.data()
+		                  + static_cast<size_t>(li) * T * dFF;
+		float* ffOut_l = gpuTransformerScratch->ffOut.data()
+		                 + static_cast<size_t>(li) * T * dModel;
+
+		if (!gpu_gemm_abt_mp(bf16W1,
+		    static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel), 1.0f,
+		    x2_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+		    gb.W1.data(), gb.W1Lowp.data(), static_cast<int>(dModel),
+		    0.0f, ff1_l, static_cast<int>(ff1Width)))
+			return false;
+		gpu::add_bias(ff1_l, gb.b1.data(),
+		              static_cast<int>(T), static_cast<int>(ff1Width));
+
+		if (ffnKind == 1u)
+			gpu::swiglu_forward(ff1_l, static_cast<int>(T), static_cast<int>(dFF),
+			                    ff1Act_l);
+		else if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+			gpu::gelu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+		else
+			gpu::relu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+
+		if (!gpu_gemm_abt_mp(bf16W2,
+		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF), 1.0f,
+		    ff1Act_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
+		    gb.W2.data(), gb.W2Lowp.data(), static_cast<int>(dFF),
+		    0.0f, ffOut_l, static_cast<int>(dModel)))
+			return false;
+		gpu::add_bias(ffOut_l, gb.b2.data(),
+		              static_cast<int>(T), static_cast<int>(dModel));
+
+		float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data()
+		                    + static_cast<size_t>(li) * T * dModel;
+		gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l,
+		             static_cast<int>(T * dModel));
+	}
+
+	// Final LayerNorm.
+	const float* finalH = gpuTransformerScratch->hAfterFF.data()
+	                      + static_cast<size_t>(nLayers - 1) * T * dModel;
+	float* hPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
+	if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+		gpu::rmsnorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(),
+		                     lnEps, static_cast<int>(T), static_cast<int>(dModel),
+		                     hPostFinalLN,
+		                     gpuTransformerScratch->lnFinalInvStd.data());
+	else
+		gpu::layernorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(),
+		                       gpuTransformerWeights->lnFinalBeta.data(), lnEps,
+		                       static_cast<int>(T), static_cast<int>(dModel),
+		                       hPostFinalLN,
+		                       gpuTransformerScratch->lnFinalMean.data(),
+		                       gpuTransformerScratch->lnFinalInvStd.data());
+
+	// Output head: tied (tokenLM + tieEmb) or WOut.
+	if (tokenLM && tieEmb)
+	{
+		if (!gpu_gemm_abt_mp(bf16Head,
+		    static_cast<int>(T), static_cast<int>(vocabSize), static_cast<int>(dModel),
+		    1.0f,
+		    hPostFinalLN, gpuTransformerScratch->activationLowp.data(),
+		    static_cast<int>(dModel),
+		    gpuTransformerWeights->tokE.data(),
+		    gpuTransformerWeights->tokELowp.data(),
+		    static_cast<int>(dModel),
+		    0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(vocabSize)))
+			return false;
+		gpu::add_bias(gpuTransformerScratch->logits.data(),
+		              gpuTransformerWeights->lmBias.data(),
+		              static_cast<int>(T), static_cast<int>(vocabSize));
+	}
+	else if (!tokenLM)
+	{
+		if (!gpu_gemm_abt_mp(bf16Head,
+		    static_cast<int>(T), static_cast<int>(outSize), static_cast<int>(dModel),
+		    1.0f,
+		    hPostFinalLN, gpuTransformerScratch->activationLowp.data(),
+		    static_cast<int>(dModel),
+		    gpuTransformerWeights->WOut.data(),
+		    gpuTransformerWeights->WOutLowp.data(),
+		    static_cast<int>(dModel),
+		    0.0f, gpuTransformerScratch->logits.data(), static_cast<int>(outSize)))
+			return false;
+		gpu::add_bias(gpuTransformerScratch->logits.data(),
+		              gpuTransformerWeights->bOut.data(),
+		              static_cast<int>(T), static_cast<int>(outSize));
+	}
+
+	gpu::softmax_forward(gpuTransformerScratch->logits.data(),
+	                     static_cast<int>(T), static_cast<int>(outSize),
+	                     gpuTransformerScratch->probs.data());
+	return true;
+}
+
+#endif // GLADES_HAVE_CUDA
+
 void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
                                                 int epochIdx, int64_t epochStartMs,
                                                 unsigned long long& tokensProcessed,
@@ -9138,6 +9641,15 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 	glades::gpu::ScopedPerfTimerMs gpuTotal(gpuPerf ? &gpuPerf->msTotal : NULL);
 	cudaEvent_t gpuTransferReadyEvent = gpu::createEvent(false);
 	cudaEvent_t gpuComputeReadyEvent = gpu::createEvent(false);
+
+	// HELIOS FD-HVP probe state: last-sequence metadata captured per-iteration
+	// and used at the minibatch-boundary optimizer dispatch for the scalar-FD
+	// loss evaluation (L_plus, L_minus) against L_0 = lastSeqLoss0. See the
+	// gpuUseHelios branch below for the probe protocol. Only populated on
+	// sequences that ran the tokenLM metrics path.
+	float heliosProbeLastSeqLoss0 = 0.0f;
+	unsigned int heliosProbeLastSeqT = 0u;
+	bool heliosProbeLastSeqValid = false;
 
 	for (unsigned int s = 0; s < seqCount; ++s)
 	{
@@ -9519,6 +10031,14 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			float lossVal;
 			memcpy(&lossVal, &lossPacked[0], sizeof(float));
 			int lossCountVal = lossPacked[1], correctVal = lossPacked[2], validVal = lossPacked[3];
+
+			// Capture L_0 for the HELIOS FD-HVP scalar-FD probe. This value
+			// is the per-sequence NLL sum at unperturbed weights; the probe
+			// at minibatch boundary will compare it to L_plus and L_minus
+			// obtained with perturbed weights via transformerGpuRunForwardOnly.
+			heliosProbeLastSeqLoss0 = lossVal;
+			heliosProbeLastSeqT = T;
+			heliosProbeLastSeqValid = true;
 
 			gpuValidTargets = static_cast<unsigned int>(lossCountVal);
 			tokenLmNllSum += static_cast<double>(lossVal);
@@ -10279,6 +10799,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 
 			const bool gpuUseAtlas = (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS);
 			const bool gpuUseVesta = (trainingConfig.optimizer.type == glades::OptimizerConfig::VESTA);
+			const bool gpuUseHelios = (trainingConfig.optimizer.type == glades::OptimizerConfig::HELIOS);
 			const bool gpuUseGeode = gpuUseAtlas && trainingConfig.atlas.geodeEnabled;
 			const bool gpuUseEcho = gpuUseAtlas && trainingConfig.atlas.echoEnabled;
 			const bool gpuUseBiMAP = gpuUseAtlas && trainingConfig.atlas.bimapEnabled;
@@ -10595,6 +11116,331 @@ if (ad_.valid) { \
 			}
 #undef GLADES_GPU_VESTA_SGD_BIAS
 			}
+			else if (gpuUseHelios)
+			{
+			// === GPU HELIOS optimizer ===
+			// Weight matrices use helios_gpu_step (BAOAB Langevin integrator).
+			// Biases and LN params use vanilla SGD (matching CPU HELIOS path).
+			const glades::HeliosConfig& hc = trainingConfig.helios;
+
+			bool gpuHeliosError = false;
+
+			// === GPU FD-HVP probe (framework Section 7 step 10) ===
+			// Runs before the optimizer step: perturbs one weight matrix
+			// by +/- eps along v = p/||p||, replays the last sequence's
+			// forward+backward twice, computes kappa = v.(gPlus-gMinus)/(2eps),
+			// and EMA-updates state.kappa. The replay call site is currently
+			// gated by hc.kHvp > 0 AND a not-yet-implemented helper method
+			// `runGpuReplayForwardBackward` which requires extracting the
+			// inline forward/backward blocks from transformerGpuTrainEpoch
+			// into callable methods (see research/HELIOS_framework.md §14a).
+			// The probe kernel infrastructure (helios_gpu_probe_*) is unit-
+			// tested and ready; only the replay call-site plumbing remains.
+			const bool gpuHvpProbeActive =
+			    (hc.alpha > 0.0f && hc.kHvp > 0u);
+			if (gpuHvpProbeActive)
+			{
+				tensorTransformer.heliosHvpStepCounter++;
+				if ((tensorTransformer.heliosHvpStepCounter
+				     % static_cast<unsigned long long>(hc.kHvp)) == 0ULL)
+				{
+					// Round-robin target matrix: 6 matrix types × nLayers.
+					const unsigned int totalTargets = 6u * nLayers;
+					const unsigned int cycleIdx = static_cast<unsigned int>(
+					    tensorTransformer.heliosHvpCycleCounter
+					    % static_cast<unsigned long long>(totalTargets));
+					tensorTransformer.heliosHvpCycleCounter++;
+					const unsigned int layerIdx = cycleIdx / 6u;
+					const unsigned int mtypeIdx = cycleIdx % 6u;
+					gpu::GpuTransformerWeights::Block& gbPrb =
+					    gpuTransformerWeights->blocks[layerIdx];
+
+					gpu::GpuBuffer<float>* W_b = 0;
+					gpu::GpuBuffer<float>* gW_b = 0;
+					gpu::GpuHeliosWeightState* hst = 0;
+					unsigned int pM = 0u, pN = 0u;
+					switch (mtypeIdx)
+					{
+						case 0: W_b=&gbPrb.Wq; gW_b=&gbPrb.gWq;
+						        hst=&gbPrb.heliosWq; pM=dModel;    pN=dModel; break;
+						case 1: W_b=&gbPrb.Wk; gW_b=&gbPrb.gWk;
+						        hst=&gbPrb.heliosWk; pM=dModelKV;  pN=dModel; break;
+						case 2: W_b=&gbPrb.Wv; gW_b=&gbPrb.gWv;
+						        hst=&gbPrb.heliosWv; pM=dModelKV;  pN=dModel; break;
+						case 3: W_b=&gbPrb.Wo; gW_b=&gbPrb.gWo;
+						        hst=&gbPrb.heliosWo; pM=dModel;    pN=dModel; break;
+						case 4: W_b=&gbPrb.W1; gW_b=&gbPrb.gW1;
+						        hst=&gbPrb.heliosW1; pM=ff1Width;  pN=dModel; break;
+						case 5: W_b=&gbPrb.W2; gW_b=&gbPrb.gW2;
+						        hst=&gbPrb.heliosW2; pM=dModel;    pN=dFF;    break;
+					}
+
+					if (W_b && gW_b && hst && hst->initialized
+					    && W_b->allocated() && W_b->size() == pM * pN
+					    && hst->p.allocated() && hst->p.size() == pM * pN)
+					{
+						// Ensure probe scratch buffers are allocated.
+						const size_t Np = static_cast<size_t>(pM) * pN;
+						gpu::GpuBuffer<float> dWsave, dV, dGPlus, dGMinus;
+						if (!dWsave.allocate(Np) || !dV.allocate(Np)
+						    || !dGPlus.allocate(Np) || !dGMinus.allocate(Np))
+						{
+							// Allocation failure; skip this probe event.
+						}
+						else
+						{
+							float pNormOut = 0.0f;
+							// Scalar-FD HVP (framework §7 step 10, lighter-
+							// cost variant): kappa = (L_plus + L_minus - 2 L_0) / eps^2
+							// where L_* is the per-sequence NLL sum at
+							// +/- eps * v. Requires only 2 extra forwards
+							// (no backward) per probe event on the last
+							// sequence. Uses transformerGpuRunForwardOnly
+							// which was extracted from this epoch's inline
+							// forward block in 2026-04-21.
+							if (heliosProbeLastSeqValid
+							    && heliosProbeLastSeqT > 0u
+							    && gpu::helios_gpu_probe_compute_v(
+							           hst->p.data(), dV.data(),
+							           pM, pN, pNormOut)
+							    && pNormOut > 1e-6f
+							    && gpu::helios_gpu_probe_snapshot_W(
+							           dWsave.data(), W_b->data(), pM, pN))
+							{
+								const float epsFd = 1e-3f;
+								const float L0 = heliosProbeLastSeqLoss0;
+								const unsigned int Tprb = heliosProbeLastSeqT;
+
+								// + perturbation.
+								float Lplus = 0.0f, Lminus = 0.0f;
+								bool probeOk =
+								    gpu::helios_gpu_probe_perturb(
+								        W_b->data(), dWsave.data(),
+								        dV.data(), epsFd, +1.0f, pM, pN);
+								if (probeOk)
+								{
+									// Refresh BF16 mirror of the perturbed
+									// target if mixed precision is active.
+									if (cfg.mpEnable)
+										gpuTransformerWeights->ensureLowpMirrors();
+									probeOk = transformerGpuRunForwardOnly(
+									    cfg, Tprb,
+									    useBf16, useRope,
+									    bf16WIn, bf16Wq, bf16Wk, bf16Wv,
+									    bf16Wo, bf16W1, bf16W2, bf16Head,
+									    ropeDimOverride, gpuPerf);
+								}
+								if (probeOk)
+								{
+									// Compute per-seq NLL from probs+targets.
+									// gpuTargetsT was populated for this seq.
+									gpu::collect_token_lm_metrics(
+									    gpuTransformerScratch->probs.data(),
+									    gpuTransformerScratch->gpuTargetsT.data(),
+									    static_cast<int>(Tprb),
+									    static_cast<int>(vocabSize),
+									    padTokenId,
+									    gpuTransformerScratch->lossPack.data());
+									int lp[4];
+									gpuTransformerScratch->lossPack.downloadAsync(lp, 4);
+									gpu::synchronizeTransferStream();
+									memcpy(&Lplus, &lp[0], sizeof(float));
+								}
+
+								// - perturbation.
+								if (probeOk)
+								{
+									probeOk = gpu::helios_gpu_probe_perturb(
+									    W_b->data(), dWsave.data(),
+									    dV.data(), epsFd, -1.0f, pM, pN);
+								}
+								if (probeOk)
+								{
+									if (cfg.mpEnable)
+										gpuTransformerWeights->ensureLowpMirrors();
+									probeOk = transformerGpuRunForwardOnly(
+									    cfg, Tprb,
+									    useBf16, useRope,
+									    bf16WIn, bf16Wq, bf16Wk, bf16Wv,
+									    bf16Wo, bf16W1, bf16W2, bf16Head,
+									    ropeDimOverride, gpuPerf);
+								}
+								if (probeOk)
+								{
+									gpu::collect_token_lm_metrics(
+									    gpuTransformerScratch->probs.data(),
+									    gpuTransformerScratch->gpuTargetsT.data(),
+									    static_cast<int>(Tprb),
+									    static_cast<int>(vocabSize),
+									    padTokenId,
+									    gpuTransformerScratch->lossPack.data());
+									int lm[4];
+									gpuTransformerScratch->lossPack.downloadAsync(lm, 4);
+									gpu::synchronizeTransferStream();
+									memcpy(&Lminus, &lm[0], sizeof(float));
+								}
+
+								// Restore unperturbed weights unconditionally.
+								gpu::helios_gpu_probe_restore_W(
+								    W_b->data(), dWsave.data(), pM, pN);
+								if (cfg.mpEnable)
+									gpuTransformerWeights->ensureLowpMirrors();
+
+								if (probeOk)
+								{
+									const float kappa =
+									    (Lplus + Lminus - 2.0f * L0)
+									    / (epsFd * epsFd);
+									// GpuHeliosWeightState::kappa is a host
+									// scalar; helios::updateSharpness operates
+									// on CPU WeightState. Do the EMA inline
+									// here to avoid creating a CPU stub state.
+									if (kappa == kappa) // finite check
+									{
+										float clipped = kappa;
+										if (clipped < 0.0f) clipped = 0.0f;
+										if (clipped > hc.kappaMax)
+											clipped = hc.kappaMax;
+										const float betaK = 0.05f;
+										hst->kappa =
+										    (1.0f - betaK) * hst->kappa
+										    + betaK * clipped;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+#define GLADES_GPU_HELIOS_SGD_BIAS(param, grad, lr_) do { \
+	const int sgd_sz_ = static_cast<int>((param).size()); \
+	if (sgd_sz_ > 0) { \
+		gpu::atlas_gpu_baseline_update((param).data(), (grad).data(), sgd_sz_, (lr_) * invBatch * gradScale); \
+		gpu::atlas_gpu_guard((param).data(), sgd_sz_); \
+		(grad).zero(); \
+	} \
+} while(0)
+
+			// Token embedding (tied-head LM).
+			if (tokenLM)
+			{
+				const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_0 = skeleton->getWeightDecay1(0u);
+				const float wd2_0 = skeleton->getWeightDecay2(0u);
+				if (!gpuTransformerWeights->heliosTokE.initialized)
+				{
+					if (!gpu::helios_gpu_init(gpuTransformerWeights->heliosTokE,
+					    gpuTransformerWeights->tokE.data(),
+					    vocabSize, dModel, hc, rngEngine, getLogger()))
+						gpuHeliosError = true;
+				}
+				if (!gpuHeliosError && !gpu::helios_gpu_step(gpuTransformerWeights->heliosTokE,
+				    gpuTransformerWeights->tokE.data(), gpuTransformerWeights->gTokE.data(),
+				    vocabSize, dModel, invBatch, lr0, wd1_0, wd2_0, gradScale,
+				    hc, rngEngine, getLogger(), "tr.tokE"))
+					gpuHeliosError = true;
+				GLADES_GPU_HELIOS_SGD_BIAS(gpuTransformerWeights->lmBias, gpuTransformerWeights->gLmBias, lr0);
+			}
+
+			// Input projection (non-tokenLM).
+			if (!tokenLM)
+			{
+				const float lr0 = skeleton->getLearningRate(0u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_0 = skeleton->getWeightDecay1(0u);
+				const float wd2_0 = skeleton->getWeightDecay2(0u);
+				if (!gpuTransformerWeights->heliosWIn.initialized)
+				{
+					if (!gpu::helios_gpu_init(gpuTransformerWeights->heliosWIn,
+					    gpuTransformerWeights->WIn.data(),
+					    dModel, inputSize, hc, rngEngine, getLogger()))
+						gpuHeliosError = true;
+				}
+				if (!gpuHeliosError && !gpu::helios_gpu_step(gpuTransformerWeights->heliosWIn,
+				    gpuTransformerWeights->WIn.data(), gpuTransformerWeights->gWIn.data(),
+				    dModel, inputSize, invBatch, lr0, wd1_0, wd2_0, gradScale,
+				    hc, rngEngine, getLogger(), "tr.WIn"))
+					gpuHeliosError = true;
+				GLADES_GPU_HELIOS_SGD_BIAS(gpuTransformerWeights->bIn, gpuTransformerWeights->gBIn, lr0);
+			}
+
+			// Per-layer blocks.
+			for (unsigned int bli = 0; bli < nLayers; ++bli)
+			{
+				const float lr_l = skeleton->getLearningRate(bli + 1u) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_l = skeleton->getWeightDecay1(bli + 1u);
+				const float wd2_l = skeleton->getWeightDecay2(bli + 1u);
+				gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+
+				#define GLADES_GPU_HELIOS_INIT_STEP(st, W, gW, m_, n_, tag) do { \
+					if (!gpuHeliosError) { \
+						if (!(st).initialized) { \
+							if (!gpu::helios_gpu_init((st), (W).data(), (m_), (n_), hc, rngEngine, getLogger())) \
+								gpuHeliosError = true; \
+						} \
+					} \
+					if (!gpuHeliosError && !gpu::helios_gpu_step((st), (W).data(), (gW).data(), \
+					    (m_), (n_), invBatch, lr_l, wd1_l, wd2_l, gradScale, \
+					    hc, rngEngine, getLogger(), (tag))) \
+						gpuHeliosError = true; \
+				} while(0)
+
+				GLADES_GPU_HELIOS_INIT_STEP(gb.heliosWq, gb.Wq, gb.gWq, dModel, dModel, "tr.Wq");
+				GLADES_GPU_HELIOS_INIT_STEP(gb.heliosWk, gb.Wk, gb.gWk, dModelKV, dModel, "tr.Wk");
+				GLADES_GPU_HELIOS_INIT_STEP(gb.heliosWv, gb.Wv, gb.gWv, dModelKV, dModel, "tr.Wv");
+				GLADES_GPU_HELIOS_INIT_STEP(gb.heliosWo, gb.Wo, gb.gWo, dModel, dModel, "tr.Wo");
+				GLADES_GPU_HELIOS_INIT_STEP(gb.heliosW1, gb.W1, gb.gW1, ff1Width, dModel, "tr.W1");
+				GLADES_GPU_HELIOS_INIT_STEP(gb.heliosW2, gb.W2, gb.gW2, dModel, dFF, "tr.W2");
+				#undef GLADES_GPU_HELIOS_INIT_STEP
+
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.bq, gb.gBq, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.bk, gb.gBk, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.bv, gb.gBv, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.bo, gb.gBo, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.b1, gb.gB1, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.b2, gb.gB2, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.ln1Gamma, gb.gLn1Gamma, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.ln1Beta, gb.gLn1Beta, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.ln2Gamma, gb.gLn2Gamma, lr_l);
+				GLADES_GPU_HELIOS_SGD_BIAS(gb.ln2Beta, gb.gLn2Beta, lr_l);
+			}
+
+			// Final LayerNorm.
+			{
+				const float lrLN = skeleton->getLearningRate(1u) * lrScheduleMultiplier * gpuExtraLRMult;
+				GLADES_GPU_HELIOS_SGD_BIAS(gpuTransformerWeights->lnFinalGamma, gpuTransformerWeights->gLnFinalGamma, lrLN);
+				GLADES_GPU_HELIOS_SGD_BIAS(gpuTransformerWeights->lnFinalBeta, gpuTransformerWeights->gLnFinalBeta, lrLN);
+			}
+
+			// Output projection.
+			if (!tokenLM)
+			{
+				const float lrO = skeleton->getLearningRate(nLayers) * lrScheduleMultiplier * gpuExtraLRMult;
+				const float wd1_o = skeleton->getWeightDecay1(nLayers);
+				const float wd2_o = skeleton->getWeightDecay2(nLayers);
+				if (!gpuTransformerWeights->heliosWOut.initialized)
+				{
+					if (!gpu::helios_gpu_init(gpuTransformerWeights->heliosWOut,
+					    gpuTransformerWeights->WOut.data(),
+					    outSize, dModel, hc, rngEngine, getLogger()))
+						gpuHeliosError = true;
+				}
+				if (!gpuHeliosError && !gpu::helios_gpu_step(gpuTransformerWeights->heliosWOut,
+				    gpuTransformerWeights->WOut.data(), gpuTransformerWeights->gWOut.data(),
+				    outSize, dModel, invBatch, lrO, wd1_o, wd2_o, gradScale,
+				    hc, rngEngine, getLogger(), "tr.WOut"))
+					gpuHeliosError = true;
+				GLADES_GPU_HELIOS_SGD_BIAS(gpuTransformerWeights->bOut, gpuTransformerWeights->gBOut, lrO);
+			}
+
+			if (gpuHeliosError)
+			{
+				lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+				    "SGDHelper_TRANSFORMER: GPU HELIOS update failed");
+				storeRunningFlag(false);
+			}
+#undef GLADES_GPU_HELIOS_SGD_BIAS
+			}
 			else
 			{
 			// === Batched Adam optimizer ===
@@ -10609,6 +11455,14 @@ if (ad_.valid) { \
 			                            static_cast<double>(tensorTransformer.optimizerStep));
 			const float inv1mB1t = static_cast<float>(1.0 / (1.0 - b1t));
 			const float inv1mB2t = static_cast<float>(1.0 / (1.0 - b2t));
+
+			// BF16 optimizer state: when enabled, the 9 large weight matrices
+			// (tokE, WIn, WOut, per-layer Wq/Wk/Wv/Wo/W1/W2) use BF16 m, v
+			// buffers via adam_update_bf16_state (per-matrix, not batched),
+			// halving their optimizer-state VRAM. Biases + LN params stay in
+			// the batched FP32 path (their total size is < 1% of the model).
+			const bool useBf16AdamState =
+			    trainingConfig.mixedPrecision.adamStateBf16;
 
 			// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
 			if (!gpuTransformerWeights->adamPtrsUploaded)
@@ -10647,12 +11501,13 @@ if (ad_.valid) { \
 				{
 					const float lr0Base = skeleton->getLearningRate(0u);
 					const float wd0 = skeleton->getWeightDecay2(0u);
-					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->tokE.data(),
-					                           gpuTransformerWeights->gTokE.data(),
-					                           gpuTransformerWeights->vTokE.data(),
-					                           gpuTransformerWeights->v2TokE.data(),
-					                           static_cast<int>(static_cast<size_t>(vocabSize) * dModel),
-					                           lr0Base, wd0);
+					if (!useBf16AdamState)
+						GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->tokE.data(),
+						                           gpuTransformerWeights->gTokE.data(),
+						                           gpuTransformerWeights->vTokE.data(),
+						                           gpuTransformerWeights->v2TokE.data(),
+						                           static_cast<int>(static_cast<size_t>(vocabSize) * dModel),
+						                           lr0Base, wd0);
 					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->lmBias.data(),
 					                           gpuTransformerWeights->gLmBias.data(),
 					                           gpuTransformerWeights->mLmBias.data(),
@@ -10663,12 +11518,13 @@ if (ad_.valid) { \
 				{
 					const float lr0Base = skeleton->getLearningRate(0u);
 					const float wd0 = skeleton->getWeightDecay2(0u);
-					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WIn.data(),
-					                           gpuTransformerWeights->gWIn.data(),
-					                           gpuTransformerWeights->vWIn.data(),
-					                           gpuTransformerWeights->v2WIn.data(),
-					                           static_cast<int>(gpuTransformerWeights->WIn.size()),
-					                           lr0Base, wd0);
+					if (!useBf16AdamState)
+						GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WIn.data(),
+						                           gpuTransformerWeights->gWIn.data(),
+						                           gpuTransformerWeights->vWIn.data(),
+						                           gpuTransformerWeights->v2WIn.data(),
+						                           static_cast<int>(gpuTransformerWeights->WIn.size()),
+						                           lr0Base, wd0);
 					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->bIn.data(),
 					                           gpuTransformerWeights->gBIn.data(),
 					                           gpuTransformerWeights->mBIn.data(),
@@ -10681,12 +11537,15 @@ if (ad_.valid) { \
 					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
 					const float lrBase = skeleton->getLearningRate(bli + 1u);
 					const float wdBase = skeleton->getWeightDecay2(bli + 1u);
-					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()), lrBase, wdBase);
-					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()), lrBase, wdBase);
-					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()), lrBase, wdBase);
-					GLADES_ADD_ADAM_GROUP_SAFE(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()), lrBase, wdBase);
-					GLADES_ADD_ADAM_GROUP_SAFE(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()), lrBase, wdBase);
-					GLADES_ADD_ADAM_GROUP_SAFE(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()), lrBase, wdBase);
+					if (!useBf16AdamState)
+					{
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()), lrBase, wdBase);
+					}
 					GLADES_ADD_ADAM_GROUP_SAFE(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(), static_cast<int>(gb.bq.size()), lrBase, 0.0f);
 					GLADES_ADD_ADAM_GROUP_SAFE(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(), static_cast<int>(gb.bk.size()), lrBase, 0.0f);
 					GLADES_ADD_ADAM_GROUP_SAFE(gb.bv.data(), gb.gBv.data(), gb.mBv.data(), gb.v2Bv.data(), static_cast<int>(gb.bv.size()), lrBase, 0.0f);
@@ -10716,12 +11575,13 @@ if (ad_.valid) { \
 				{
 					const float lrOutBase = skeleton->getLearningRate(nLayers);
 					const float wdOut = skeleton->getWeightDecay2(nLayers);
-					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WOut.data(),
-					                           gpuTransformerWeights->gWOut.data(),
-					                           gpuTransformerWeights->vWOut.data(),
-					                           gpuTransformerWeights->v2WOut.data(),
-					                           static_cast<int>(gpuTransformerWeights->WOut.size()),
-					                           lrOutBase, wdOut);
+					if (!useBf16AdamState)
+						GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WOut.data(),
+						                           gpuTransformerWeights->gWOut.data(),
+						                           gpuTransformerWeights->vWOut.data(),
+						                           gpuTransformerWeights->v2WOut.data(),
+						                           static_cast<int>(gpuTransformerWeights->WOut.size()),
+						                           lrOutBase, wdOut);
 					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->bOut.data(),
 					                           gpuTransformerWeights->gBOut.data(),
 					                           gpuTransformerWeights->mBOut.data(),
@@ -10983,6 +11843,69 @@ if (ad_.valid) { \
 				    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricCols : NULL,
 				    beta1, beta2, adamEps,
 				    invBatch * gradScale, stepInt, gc);
+			}
+
+			// --- BF16 Adam state dispatch (large weight matrices) ---
+			// When adamStateBf16 is enabled, the 9 large weight matrices were
+			// excluded from the batched Adam above. Run per-matrix BF16-state
+			// Adam for each. Math is identical up to BF16 quantization on the
+			// m, v EMAs; weight + grad remain FP32.
+			if (useBf16AdamState)
+			{
+				const float bf16LrScale = lrScheduleMultiplier * gpuExtraLRMult;
+				const float gradScaleEff = invBatch * gradScale;
+#define GLADES_BF16_ADAM_BIG(W, gW, vBf, v2Bf, baseLr_, wd_) do { \
+	const int sz_ = static_cast<int>((W).size()); \
+	if (sz_ > 0 && (vBf).allocated() && (v2Bf).allocated()) { \
+		gpu::adam_update_bf16_state((W).data(), (gW).data(), \
+		    (vBf).data(), (v2Bf).data(), \
+		    (baseLr_) * bf16LrScale, beta1, beta2, adamEps, \
+		    (wd_), gradScaleEff, stepInt, sz_); \
+	} \
+} while (0)
+
+				if (tokenLM)
+				{
+					const float lr0Base = skeleton->getLearningRate(0u);
+					const float wd0 = skeleton->getWeightDecay2(0u);
+					GLADES_BF16_ADAM_BIG(gpuTransformerWeights->tokE,
+					                     gpuTransformerWeights->gTokE,
+					                     gpuTransformerWeights->vTokE_bf16,
+					                     gpuTransformerWeights->v2TokE_bf16,
+					                     lr0Base, wd0);
+				}
+				else
+				{
+					const float lr0Base = skeleton->getLearningRate(0u);
+					const float wd0 = skeleton->getWeightDecay2(0u);
+					GLADES_BF16_ADAM_BIG(gpuTransformerWeights->WIn,
+					                     gpuTransformerWeights->gWIn,
+					                     gpuTransformerWeights->vWIn_bf16,
+					                     gpuTransformerWeights->v2WIn_bf16,
+					                     lr0Base, wd0);
+					const float lrOutBase = skeleton->getLearningRate(nLayers);
+					const float wdOut = skeleton->getWeightDecay2(nLayers);
+					GLADES_BF16_ADAM_BIG(gpuTransformerWeights->WOut,
+					                     gpuTransformerWeights->gWOut,
+					                     gpuTransformerWeights->vWOut_bf16,
+					                     gpuTransformerWeights->v2WOut_bf16,
+					                     lrOutBase, wdOut);
+				}
+				for (unsigned int bli = 0; bli < nLayers; ++bli)
+				{
+					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+					const float lrBase = skeleton->getLearningRate(bli + 1u);
+					const float wdBase = skeleton->getWeightDecay2(bli + 1u);
+					GLADES_BF16_ADAM_BIG(gb.Wq, gb.gWq, gb.vWq_bf16, gb.v2Wq_bf16, lrBase, wdBase);
+					GLADES_BF16_ADAM_BIG(gb.Wk, gb.gWk, gb.vWk_bf16, gb.v2Wk_bf16, lrBase, wdBase);
+					GLADES_BF16_ADAM_BIG(gb.Wv, gb.gWv, gb.vWv_bf16, gb.v2Wv_bf16, lrBase, wdBase);
+					GLADES_BF16_ADAM_BIG(gb.Wo, gb.gWo, gb.vWo_bf16, gb.v2Wo_bf16, lrBase, wdBase);
+					GLADES_BF16_ADAM_BIG(gb.W1, gb.gW1, gb.vW1_bf16, gb.v2W1_bf16, lrBase, wdBase);
+					GLADES_BF16_ADAM_BIG(gb.W2, gb.gW2, gb.vW2_bf16, gb.v2W2_bf16, lrBase, wdBase);
+				}
+				// Gradients are zeroed at minibatch boundaries by the outer
+				// training loop's clearGrads; no explicit zeroing needed here.
+#undef GLADES_BF16_ADAM_BIG
 			}
 				if (gpuUseGeode)
 				{

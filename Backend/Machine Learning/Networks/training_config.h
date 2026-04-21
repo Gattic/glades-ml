@@ -1570,6 +1570,15 @@ struct MixedPrecisionConfig
 	// Low-precision dtype for weight copies used in forward/backward.
 	WeightDType weightDType;
 
+	// Store AdamW optimizer state (m, v) in BF16 instead of FP32. Halves
+	// optimizer-state VRAM (4 bytes -> 2 bytes per parameter per moment,
+	// so 4x params -> 2x params per GB). Compute (EMA, bias-correction,
+	// sqrt, division) still happens in FP32 — only storage is BF16. BF16's
+	// 8-bit exponent avoids FP16's underflow in v; 7-bit mantissa incurs
+	// ~0.4% per-update quantization bias that the EMA averages out.
+	// Requires GPU; takes the non-batched Adam path.
+	bool adamStateBf16;
+
 	// Loss scaling:
 	// - If enable==true and useLossScaling==true, backprop deltas are multiplied by lossScale
 	//   and the optimizer divides gradients by lossScale before applying updates.
@@ -1587,6 +1596,7 @@ struct MixedPrecisionConfig
 	MixedPrecisionConfig()
 	    : enable(false),
 	      weightDType(WEIGHT_F16),
+	      adamStateBf16(false),
 	      useLossScaling(true),
 	      dynamicLossScaling(true),
 	      lossScaleInit(1024.0f),

@@ -54,13 +54,23 @@ static bool allocBuf(GpuBuffer<float>& buf, size_t n)
 	return buf.allocate(n);
 }
 
+static bool allocBuf(GpuBuffer<uint16_t>& buf, size_t n)
+{
+	if (n == 0)
+		return true;
+	return buf.allocate(n);
+}
+
 bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned int nh,
                                       unsigned int nkvh, unsigned int nl,
                                       unsigned int vs, unsigned int is, unsigned int os,
                                       unsigned int ffk, bool tm, bool te,
-                                      bool skipAdamBufs)
+                                      bool skipAdamBufs,
+                                      bool adamStateBf16)
 {
 	free();
+	const bool allocFpMV  = !skipAdamBufs && !adamStateBf16;
+	const bool allocBfMV  = !skipAdamBufs &&  adamStateBf16;
 
 	dModel = dm;
 	dFF = df;
@@ -82,8 +92,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (tokenModel)
 	{
 		if (!allocBuf(tokE, (size_t)vs * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(vTokE, (size_t)vs * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
+		if (allocFpMV && !allocBuf(vTokE, (size_t)vs * dm)) return false;
+		if (allocFpMV && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
+		if (allocBfMV && !allocBuf(vTokE_bf16, (size_t)vs * dm)) return false;
+		if (allocBfMV && !allocBuf(v2TokE_bf16, (size_t)vs * dm)) return false;
 		if (!allocBuf(gTokE, (size_t)vs * dm)) return false;
 		if (!allocBuf(lmBias, vs)) return false;
 		if (!skipAdamBufs && !allocBuf(mLmBias, vs)) return false;
@@ -95,8 +107,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (!tokenModel)
 	{
 		if (!allocBuf(WIn, (size_t)dm * is)) return false;
-		if (!skipAdamBufs && !allocBuf(vWIn, (size_t)dm * is)) return false;
-		if (!skipAdamBufs && !allocBuf(v2WIn, (size_t)dm * is)) return false;
+		if (allocFpMV && !allocBuf(vWIn, (size_t)dm * is)) return false;
+		if (allocFpMV && !allocBuf(v2WIn, (size_t)dm * is)) return false;
+		if (allocBfMV && !allocBuf(vWIn_bf16, (size_t)dm * is)) return false;
+		if (allocBfMV && !allocBuf(v2WIn_bf16, (size_t)dm * is)) return false;
 		if (!allocBuf(gWIn, (size_t)dm * is)) return false;
 		if (!allocBuf(bIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(mBIn, dm)) return false;
@@ -108,8 +122,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (!tokenModel)
 	{
 		if (!allocBuf(WOut, (size_t)os * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(vWOut, (size_t)os * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(v2WOut, (size_t)os * dm)) return false;
+		if (allocFpMV && !allocBuf(vWOut, (size_t)os * dm)) return false;
+		if (allocFpMV && !allocBuf(v2WOut, (size_t)os * dm)) return false;
+		if (allocBfMV && !allocBuf(vWOut_bf16, (size_t)os * dm)) return false;
+		if (allocBfMV && !allocBuf(v2WOut_bf16, (size_t)os * dm)) return false;
 		if (!allocBuf(gWOut, (size_t)os * dm)) return false;
 		if (!allocBuf(bOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(mBOut, os)) return false;
@@ -148,14 +164,22 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.Wk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.Wv, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.Wo, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWq, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWk, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWv, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vWo, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wq, (size_t)dm * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wk, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wv, (size_t)dm * dModelKV)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2Wo, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.vWq, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.vWk, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.vWv, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.vWo, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wq, (size_t)dm * dm)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wk, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wv, (size_t)dm * dModelKV)) return false;
+		if (allocFpMV && !allocBuf(b.v2Wo, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.vWq_bf16, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.vWk_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.vWv_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.vWo_bf16, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wq_bf16, (size_t)dm * dm)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wk_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wv_bf16, (size_t)dm * dModelKV)) return false;
+		if (allocBfMV && !allocBuf(b.v2Wo_bf16, (size_t)dm * dm)) return false;
 		if (!allocBuf(b.gWq, (size_t)dm * dm)) return false;
 		if (!allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
@@ -191,10 +215,14 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		// FFN
 		if (!allocBuf(b.W1, (size_t)ff1Width * dm)) return false;
 		if (!allocBuf(b.W2, (size_t)dm * df)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.vW2, (size_t)dm * df)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2W1, (size_t)ff1Width * dm)) return false;
-		if (!skipAdamBufs && !allocBuf(b.v2W2, (size_t)dm * df)) return false;
+		if (allocFpMV && !allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
+		if (allocFpMV && !allocBuf(b.vW2, (size_t)dm * df)) return false;
+		if (allocFpMV && !allocBuf(b.v2W1, (size_t)ff1Width * dm)) return false;
+		if (allocFpMV && !allocBuf(b.v2W2, (size_t)dm * df)) return false;
+		if (allocBfMV && !allocBuf(b.vW1_bf16, (size_t)ff1Width * dm)) return false;
+		if (allocBfMV && !allocBuf(b.vW2_bf16, (size_t)dm * df)) return false;
+		if (allocBfMV && !allocBuf(b.v2W1_bf16, (size_t)ff1Width * dm)) return false;
+		if (allocBfMV && !allocBuf(b.v2W2_bf16, (size_t)dm * df)) return false;
 		if (!allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
 		if (!allocBuf(b.gW2, (size_t)dm * df)) return false;
 		if (!allocBuf(b.b1, ff1Width)) return false;
