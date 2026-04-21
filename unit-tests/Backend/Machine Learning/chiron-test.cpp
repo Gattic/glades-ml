@@ -1692,6 +1692,55 @@ void CHIRONGpuParityTest()
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Case 13: batched CPU sketch ops parity with scalar reference.
+// Verifies the Phase 3.5 optimized batched kernels (sketch_project_batched /
+// sketch_lift_add_batched) produce the same result (up to FP accumulation
+// order) as the scalar per-token reference.
+// ---------------------------------------------------------------------------
+void CHIRONBatchedSketchParityTest()
+{
+	const unsigned int T = 16;
+	const unsigned int N = 64;
+	const unsigned int r = 32;
+
+	LCG rng(11111u);
+	std::vector<float> X(T * N), S(r * N);
+	for (unsigned int i = 0; i < X.size(); ++i) X[i] = rng.next_unit();
+	for (unsigned int i = 0; i < S.size(); ++i) S[i] = 0.3f * rng.next_unit();
+
+	// Scalar reference.
+	std::vector<float> Z_ref(T * r, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		glades::chiron::sketch_project(&S[0], &X[t * N], r, N, &Z_ref[t * r]);
+
+	// Batched.
+	std::vector<float> Z_bat(T * r, 0.0f);
+	glades::chiron::sketch_project_batched(&S[0], &X[0], T, N, r, &Z_bat[0]);
+
+	// Must match within FP accumulation-order slop (same set of FMAs, same order).
+	const float proj_err = max_abs_diff(Z_ref, Z_bat);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "batched sketch_project parity: max_err=%.3e (want < 1e-5)",
+	              proj_err);
+	ASSERT(msg, proj_err < 1e-5f);
+
+	// Lift parity.
+	std::vector<float> X_lift_ref(X);
+	for (unsigned int t = 0; t < T; ++t)
+		glades::chiron::sketch_lift_add(&S[0], &Z_ref[t * r], r, N, &X_lift_ref[t * N]);
+
+	std::vector<float> X_lift_bat(X);
+	glades::chiron::sketch_lift_add_batched(&S[0], &Z_ref[0], T, N, r, &X_lift_bat[0]);
+
+	const float lift_err = max_abs_diff(X_lift_ref, X_lift_bat);
+	std::snprintf(msg, sizeof(msg),
+	              "batched sketch_lift_add parity: max_err=%.3e (want < 1e-5)",
+	              lift_err);
+	ASSERT(msg, lift_err < 1e-5f);
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -1707,5 +1756,327 @@ void CHIRONUnitTest()
 	CHIRONSketchCorrectedBf16Test();
 	CHIRONPerTokenSketchBf16Test();
 	CHIRONGpuParityTest();
+	CHIRONBatchedSketchParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
+}
+
+// ===========================================================================
+// Performance benchmark — Phase 3.5 baseline.
+//
+// Measures CPU and GPU wall-clock for the CHIRON primitives at realistic
+// sizes. Provides the numbers that Phase 3.5 optimization iterations will
+// try to improve.
+// ===========================================================================
+
+#include <sys/time.h>
+
+#ifdef GLADES_HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+namespace {
+
+static double wall_ms_chiron()
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return static_cast<double>(tv.tv_sec) * 1000.0
+	     + static_cast<double>(tv.tv_usec) / 1000.0;
+}
+
+// Warm a CPU value so the compiler doesn't optimize the loop body away.
+static float g_chiron_sink = 0.0f;
+
+// Query VRAM (free/total) in bytes.  Returns 0 if CUDA unavailable.
+static void get_vram_info(size_t& free_bytes, size_t& total_bytes)
+{
+	free_bytes = 0;
+	total_bytes = 0;
+#ifdef GLADES_HAVE_CUDA
+	cudaMemGetInfo(&free_bytes, &total_bytes);
+#endif
+}
+
+} // namespace
+
+void CHIRONBenchmark()
+{
+	std::printf("\n=== CHIRON benchmark (Phase 3.5 baseline) ===\n");
+
+	// Benchmark sizes — intermediate between toy and production.
+	struct Size { unsigned int T, m, r; const char* label; };
+	const Size sizes[] = {
+		{ 256u,   256u,  128u,  "small  (T=256, m=256, r=128)" },
+		{ 1024u,  1024u, 512u,  "medium (T=1024, m=1024, r=512)" },
+		{ 2048u,  2048u, 1024u, "large  (T=2048, m=2048, r=1024)" }
+	};
+	const int num_sizes = sizeof(sizes) / sizeof(sizes[0]);
+
+	const int warmup_iters = 3;
+	const int bench_iters  = 10;
+	const float eps = 1e-4f;
+
+	// Budget cap so we don't spend minutes in CPU sketch at large sizes.
+	// Anything heavier than this gets one iteration only (or skipped).
+	const size_t kCpuSketchFlopBudget = 500ULL * 1000ULL * 1000ULL; // 500M FLOPs
+
+	for (int sz = 0; sz < num_sizes; ++sz)
+	{
+		const unsigned int T = sizes[sz].T;
+		const unsigned int m = sizes[sz].m;
+		const unsigned int Ntok = 2u * m;
+		const unsigned int r = sizes[sz].r;
+
+		const size_t pSize = static_cast<size_t>(T) * m;
+		const size_t xSize = static_cast<size_t>(T) * Ntok;
+		const size_t sSize = static_cast<size_t>(r) * Ntok;
+		const size_t zSize = static_cast<size_t>(T) * r;
+
+		std::printf("\n--- %s ---\n", sizes[sz].label);
+		std::printf("  Buffers: p [%zu], X [%zu], S [%zu], Z [%zu]\n",
+		            pSize, xSize, sSize, zSize);
+		const double activation_mb = (2.0 * pSize * 4.0) / (1024.0 * 1024.0);
+		std::printf("  Per-layer activation footprint (q+p FP32): %.1f MB\n",
+		            activation_mb);
+
+		LCG rng(123u + sz);
+		std::vector<float> p(pSize), u(pSize);
+		std::vector<float> q_in(pSize), gamma(m), beta(m);
+		std::vector<float> X(xSize), S(sSize);
+		for (size_t i = 0; i < pSize; ++i) { p[i] = rng.next_unit(); u[i] = 0.05f * rng.next_unit(); }
+		for (size_t i = 0; i < pSize; ++i) q_in[i] = rng.next_unit();
+		for (unsigned int i = 0; i < m; ++i) { gamma[i] = 1.0f + 0.1f * rng.next_unit(); beta[i] = 0.05f * rng.next_unit(); }
+		for (size_t i = 0; i < xSize; ++i) X[i] = rng.next_unit();
+		for (size_t i = 0; i < sSize; ++i) S[i] = 0.3f * rng.next_unit();
+		std::vector<float> q_out(pSize), stats(T * 2u);
+		std::vector<float> Z(zSize), X_lift(X);
+
+		// ---------------- CPU ----------------
+		std::printf("  CPU:\n");
+
+		// shear_add — N element-wise adds.
+		for (int it = 0; it < warmup_iters; ++it)
+		{
+			for (unsigned int t = 0; t < T; ++t)
+				glades::chiron::shear_add_to_p(&p[t * m], &u[t * m], m);
+		}
+		double t0 = wall_ms_chiron();
+		for (int it = 0; it < bench_iters; ++it)
+		{
+			for (unsigned int t = 0; t < T; ++t)
+				glades::chiron::shear_add_to_p(&p[t * m], &u[t * m], m);
+		}
+		double tcpu_shear = (wall_ms_chiron() - t0) / bench_iters;
+		// Light sink to keep the compiler honest.
+		g_chiron_sink += p[0];
+		const double shear_bw = (2.0 * pSize * 4.0) / (tcpu_shear * 1e-3) / (1024.0 * 1024.0 * 1024.0);
+		std::printf("    shear_add/iter   %.3f ms   (~%.1f GB/s)\n", tcpu_shear, shear_bw);
+
+		// reln_forward
+		for (int it = 0; it < warmup_iters; ++it)
+			glades::chiron::reln_forward(&q_in[0], &q_out[0], &stats[0],
+			                              &gamma[0], &beta[0], T, m, eps);
+		t0 = wall_ms_chiron();
+		for (int it = 0; it < bench_iters; ++it)
+			glades::chiron::reln_forward(&q_in[0], &q_out[0], &stats[0],
+			                              &gamma[0], &beta[0], T, m, eps);
+		double tcpu_reln = (wall_ms_chiron() - t0) / bench_iters;
+		g_chiron_sink += q_out[0];
+		std::printf("    reln_forward/iter %.3f ms\n", tcpu_reln);
+
+		// sketch ops — adaptive iteration count based on estimated FLOPs.
+		const size_t flops_per_iter = 2ULL * T * r * Ntok;
+		const bool run_scalar = flops_per_iter < kCpuSketchFlopBudget;
+		const int cpu_iters = static_cast<int>(
+		    (flops_per_iter < kCpuSketchFlopBudget) ? bench_iters :
+		    (flops_per_iter < kCpuSketchFlopBudget * 10u) ? 3 : 1);
+
+		if (run_scalar)
+		{
+			// Scalar baseline.
+			for (int it = 0; it < warmup_iters; ++it)
+			{
+				for (unsigned int t = 0; t < T; ++t)
+					glades::chiron::sketch_project(&S[0], &X[t * Ntok],
+					                                r, Ntok, &Z[t * r]);
+			}
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < cpu_iters; ++it)
+			{
+				for (unsigned int t = 0; t < T; ++t)
+					glades::chiron::sketch_project(&S[0], &X[t * Ntok],
+					                                r, Ntok, &Z[t * r]);
+			}
+			double tcpu_proj = (wall_ms_chiron() - t0) / cpu_iters;
+			g_chiron_sink += Z[0];
+			const double gflops = (2.0 * T * r * Ntok) / (tcpu_proj * 1e-3) / 1e9;
+			std::printf("    sketch_project/iter        %.3f ms  (~%.1f GFLOP/s)\n",
+			            tcpu_proj, gflops);
+		}
+		else
+		{
+			std::printf("    sketch_project scalar     SKIPPED (%llu M FLOPs > budget)\n",
+			            (unsigned long long)(flops_per_iter / 1000000));
+		}
+
+		// Batched always — it's what we'd use in production.
+		for (int it = 0; it < warmup_iters; ++it)
+			glades::chiron::sketch_project_batched(&S[0], &X[0], T, Ntok, r, &Z[0]);
+		t0 = wall_ms_chiron();
+		for (int it = 0; it < cpu_iters; ++it)
+			glades::chiron::sketch_project_batched(&S[0], &X[0], T, Ntok, r, &Z[0]);
+		double tcpu_proj_bat = (wall_ms_chiron() - t0) / cpu_iters;
+		g_chiron_sink += Z[0];
+		const double gflops_bat = (2.0 * T * r * Ntok) / (tcpu_proj_bat * 1e-3) / 1e9;
+		std::printf("    sketch_project_batched/iter %.3f ms  (~%.1f GFLOP/s)\n",
+		            tcpu_proj_bat, gflops_bat);
+
+		if (run_scalar)
+		{
+			// Scalar lift.
+			for (unsigned int i = 0; i < xSize; ++i) X_lift[i] = X[i];
+			for (int it = 0; it < warmup_iters; ++it)
+			{
+				for (unsigned int t = 0; t < T; ++t)
+					glades::chiron::sketch_lift_add(&S[0], &Z[t * r],
+					                                 r, Ntok, &X_lift[t * Ntok]);
+			}
+			for (unsigned int i = 0; i < xSize; ++i) X_lift[i] = X[i];
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < cpu_iters; ++it)
+			{
+				for (unsigned int t = 0; t < T; ++t)
+					glades::chiron::sketch_lift_add(&S[0], &Z[t * r],
+					                                 r, Ntok, &X_lift[t * Ntok]);
+			}
+			double tcpu_lift = (wall_ms_chiron() - t0) / cpu_iters;
+			const double gflops_lift = (2.0 * T * r * Ntok) / (tcpu_lift * 1e-3) / 1e9;
+			std::printf("    sketch_lift/iter            %.3f ms  (~%.1f GFLOP/s)\n",
+			            tcpu_lift, gflops_lift);
+		}
+
+		for (unsigned int i = 0; i < xSize; ++i) X_lift[i] = X[i];
+		for (int it = 0; it < warmup_iters; ++it)
+			glades::chiron::sketch_lift_add_batched(&S[0], &Z[0], T, Ntok, r, &X_lift[0]);
+		for (unsigned int i = 0; i < xSize; ++i) X_lift[i] = X[i];
+		t0 = wall_ms_chiron();
+		for (int it = 0; it < cpu_iters; ++it)
+			glades::chiron::sketch_lift_add_batched(&S[0], &Z[0], T, Ntok, r, &X_lift[0]);
+		double tcpu_lift_bat = (wall_ms_chiron() - t0) / cpu_iters;
+		const double gflops_lift_bat = (2.0 * T * r * Ntok) / (tcpu_lift_bat * 1e-3) / 1e9;
+		std::printf("    sketch_lift_batched/iter    %.3f ms  (~%.1f GFLOP/s)\n",
+		            tcpu_lift_bat, gflops_lift_bat);
+
+#ifdef GLADES_HAVE_CUDA
+		// ---------------- GPU ----------------
+		if (glades::gpu::initDevice())
+		{
+			size_t vram_free_before = 0, vram_total = 0;
+			get_vram_info(vram_free_before, vram_total);
+			std::printf("  GPU:  (VRAM free before alloc: %.1f / %.1f MB)\n",
+			            vram_free_before / (1024.0 * 1024.0),
+			            vram_total / (1024.0 * 1024.0));
+
+			glades::gpu::GpuBuffer<float> d_p, d_u;
+			glades::gpu::GpuBuffer<float> d_qin, d_qout, d_stats, d_gamma, d_beta;
+			glades::gpu::GpuBuffer<float> d_X, d_S, d_Z;
+			d_p.allocate(pSize); d_u.allocate(pSize);
+			d_qin.allocate(pSize); d_qout.allocate(pSize);
+			d_stats.allocate(T * 2u);
+			d_gamma.allocate(m); d_beta.allocate(m);
+			d_X.allocate(xSize); d_S.allocate(sSize); d_Z.allocate(zSize);
+			d_p.upload(&p[0], pSize);
+			d_u.upload(&u[0], pSize);
+			d_qin.upload(&q_in[0], pSize);
+			d_gamma.upload(&gamma[0], m);
+			d_beta.upload(&beta[0], m);
+			d_X.upload(&X[0], xSize);
+			d_S.upload(&S[0], sSize);
+
+			// Warmup + sync.
+			for (int it = 0; it < warmup_iters; ++it)
+				glades::gpu::chiron_shear_add(d_p.data(), d_u.data(),
+				                               static_cast<int>(pSize));
+			glades::gpu::synchronizeCheck("bench chiron warmup");
+
+			// shear_add
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < bench_iters; ++it)
+				glades::gpu::chiron_shear_add(d_p.data(), d_u.data(),
+				                               static_cast<int>(pSize));
+			glades::gpu::synchronizeCheck("bench shear_add");
+			double tgpu_shear = (wall_ms_chiron() - t0) / bench_iters;
+			const double gpu_shear_bw = (2.0 * pSize * 4.0) / (tgpu_shear * 1e-3)
+			                             / (1024.0 * 1024.0 * 1024.0);
+			std::printf("    shear_add/iter    %.4f ms   (~%.1f GB/s)\n",
+			            tgpu_shear, gpu_shear_bw);
+
+			// reln_forward
+			for (int it = 0; it < warmup_iters; ++it)
+				glades::gpu::chiron_reln_forward(d_qin.data(), d_qout.data(),
+				                                  d_stats.data(), d_gamma.data(),
+				                                  d_beta.data(),
+				                                  static_cast<int>(T), static_cast<int>(m), eps);
+			glades::gpu::synchronizeCheck("bench chiron reln warmup");
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < bench_iters; ++it)
+				glades::gpu::chiron_reln_forward(d_qin.data(), d_qout.data(),
+				                                  d_stats.data(), d_gamma.data(),
+				                                  d_beta.data(),
+				                                  static_cast<int>(T), static_cast<int>(m), eps);
+			glades::gpu::synchronizeCheck("bench reln_fwd");
+			double tgpu_reln = (wall_ms_chiron() - t0) / bench_iters;
+			std::printf("    reln_forward/iter %.4f ms\n", tgpu_reln);
+
+			// sketch_project
+			for (int it = 0; it < warmup_iters; ++it)
+				glades::gpu::chiron_sketch_project(d_X.data(), d_S.data(),
+				                                    static_cast<int>(T), static_cast<int>(Ntok),
+				                                    static_cast<int>(r), d_Z.data());
+			glades::gpu::synchronizeCheck("bench sketch warmup");
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < bench_iters; ++it)
+				glades::gpu::chiron_sketch_project(d_X.data(), d_S.data(),
+				                                    static_cast<int>(T), static_cast<int>(Ntok),
+				                                    static_cast<int>(r), d_Z.data());
+			glades::gpu::synchronizeCheck("bench sketch_project");
+			double tgpu_proj = (wall_ms_chiron() - t0) / bench_iters;
+			const double gpu_gflops = (2.0 * T * r * Ntok) / (tgpu_proj * 1e-3) / 1e9;
+			std::printf("    sketch_project/iter %.4f ms  (~%.1f GFLOP/s)\n",
+			            tgpu_proj, gpu_gflops);
+
+			// sketch_lift_add
+			for (int it = 0; it < warmup_iters; ++it)
+				glades::gpu::chiron_sketch_lift_add(d_X.data(), d_Z.data(), d_S.data(),
+				                                     static_cast<int>(T), static_cast<int>(Ntok),
+				                                     static_cast<int>(r));
+			glades::gpu::synchronizeCheck("bench lift warmup");
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < bench_iters; ++it)
+				glades::gpu::chiron_sketch_lift_add(d_X.data(), d_Z.data(), d_S.data(),
+				                                     static_cast<int>(T), static_cast<int>(Ntok),
+				                                     static_cast<int>(r));
+			glades::gpu::synchronizeCheck("bench sketch_lift_add");
+			double tgpu_lift = (wall_ms_chiron() - t0) / bench_iters;
+			const double gpu_lift_gflops = (2.0 * T * r * Ntok) / (tgpu_lift * 1e-3) / 1e9;
+			std::printf("    sketch_lift/iter  %.4f ms  (~%.1f GFLOP/s)\n",
+			            tgpu_lift, gpu_lift_gflops);
+
+			size_t vram_free_after = 0;
+			get_vram_info(vram_free_after, vram_total);
+			const double vram_used_mb = static_cast<double>(vram_free_before - vram_free_after)
+			                             / (1024.0 * 1024.0);
+			std::printf("    actual VRAM allocated (bench): %.1f MB\n", vram_used_mb);
+		}
+		else
+		{
+			std::printf("  GPU: CUDA device unavailable, GPU timings skipped.\n");
+		}
+#else
+		std::printf("  GPU: GLADES_HAVE_CUDA not defined, GPU timings skipped.\n");
+#endif
+	}
+
+	std::printf("\nSink prevention: %g\n", static_cast<double>(g_chiron_sink));
+	std::printf("=== CHIRON benchmark done ===\n\n");
 }

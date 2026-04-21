@@ -258,5 +258,143 @@ inline void sketch_lift_add(const float* S, const float* residual,
 	}
 }
 
+// -------------- Batched + tiled CPU variants (Phase 3.5 optimized) --------
+//
+// The per-token sketch ops above are correct but CPU-inefficient: they load
+// each row of S once per token, yielding ~3 GFLOP/s on modern x86 because
+// the inner loop is memory-bound and not vectorizable across tokens.
+//
+// The batched variants process all T tokens in one blocked SIMD-friendly
+// matrix multiply:
+//   - sketch_project_batched: Z [T, r] = X [T, N] · S^T [N, r]
+//   - sketch_lift_add_batched: X [T, N] += (1/r) · Z [T, r] · S [r, N]
+//
+// Tiling: T/M_TILE outer, r or N inner. The `K_TILE` inner loop accumulates
+// FMAs with S streamed into L1. On a 4-wide SSE or 8-wide AVX host, GCC can
+// auto-vectorize the inner K loop; we keep the loop structure compiler-
+// friendly (contiguous strided loads, known trip counts via tile bounds).
+
+#ifndef GLADES_CHIRON_TILE_M
+#define GLADES_CHIRON_TILE_M 8
+#endif
+#ifndef GLADES_CHIRON_TILE_N
+#define GLADES_CHIRON_TILE_N 32
+#endif
+#ifndef GLADES_CHIRON_TILE_K
+#define GLADES_CHIRON_TILE_K 64
+#endif
+
+// Z [T, r] = X [T, N] · S^T [N, r]   (i.e. Z[t, k] = Σ_i X[t, i] * S[k, i])
+//
+// Performance: blocked tiling on (M, N, K) plus an unrolled inner FMA loop.
+// Outer M dim is the token index (trivially independent) — can be parallelized
+// by the caller via OpenMP around the mb loop. We keep the function itself
+// serial-safe to retain header-only reusability.
+inline void sketch_project_batched(const float* S, const float* X,
+                                    unsigned int T, unsigned int N, unsigned int r,
+                                    float* Z)
+{
+	// Zero output.
+	const size_t total = static_cast<size_t>(T) * static_cast<size_t>(r);
+	for (size_t i = 0; i < total; ++i) Z[i] = 0.0f;
+
+	const unsigned int TM = GLADES_CHIRON_TILE_M;
+	const unsigned int TN = GLADES_CHIRON_TILE_N; // tile over r (output cols)
+	const unsigned int TK = GLADES_CHIRON_TILE_K;
+
+	for (unsigned int mb = 0; mb < T; mb += TM)
+	{
+		const unsigned int me = (mb + TM < T) ? (mb + TM) : T;
+		for (unsigned int nb = 0; nb < r; nb += TN)
+		{
+			const unsigned int ne = (nb + TN < r) ? (nb + TN) : r;
+			for (unsigned int kb = 0; kb < N; kb += TK)
+			{
+				const unsigned int ke = (kb + TK < N) ? (kb + TK) : N;
+
+				// Inner: Z[mb:me, nb:ne] += X[mb:me, kb:ke] · S[nb:ne, kb:ke]^T.
+				// Token-major outer: better Z locality across the k loop.
+				for (unsigned int t = mb; t < me; ++t)
+				{
+					const float* xRow = X + static_cast<size_t>(t) * N;
+					float*       zRow = Z + static_cast<size_t>(t) * r;
+					for (unsigned int k = nb; k < ne; ++k)
+					{
+						const float* sRow = S + static_cast<size_t>(k) * N;
+						// Accumulate into four parallel lanes so the compiler
+						// can emit 4-wide FMAs even without SIMD intrinsics.
+						float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+						unsigned int i = kb;
+						const unsigned int ke4 = kb + ((ke - kb) & ~3u);
+						for (; i < ke4; i += 4)
+						{
+							acc0 += xRow[i + 0] * sRow[i + 0];
+							acc1 += xRow[i + 1] * sRow[i + 1];
+							acc2 += xRow[i + 2] * sRow[i + 2];
+							acc3 += xRow[i + 3] * sRow[i + 3];
+						}
+						float acc = acc0 + acc1 + acc2 + acc3;
+						for (; i < ke; ++i) acc += xRow[i] * sRow[i];
+						zRow[k] += acc;
+					}
+				}
+			}
+		}
+	}
+}
+
+// X [T, N] += (1/r) · Z [T, r] · S [r, N]  (i.e. X[t, i] += (1/r) · Σ_k Z[t, k] · S[k, i])
+//
+// Loop order: outer-product with k outermost inside a token.  Each row of
+// S[k, :] is loaded once and multiplied by Z[t, k] into a contiguous stripe
+// of X[t, :].  This gives SEQUENTIAL access to both X[t, :] and S[k, :],
+// which is dramatically more cache-friendly than the sum-k-over-stride-N
+// access pattern of a straightforward dot-product formulation.
+inline void sketch_lift_add_batched(const float* S, const float* Z,
+                                     unsigned int T, unsigned int N, unsigned int r,
+                                     float* X)
+{
+	const float inv_r = 1.0f / static_cast<float>(r);
+	const unsigned int TM = GLADES_CHIRON_TILE_M;
+	const unsigned int TN = GLADES_CHIRON_TILE_N;
+	const unsigned int TK = GLADES_CHIRON_TILE_K;
+
+	for (unsigned int mb = 0; mb < T; mb += TM)
+	{
+		const unsigned int me = (mb + TM < T) ? (mb + TM) : T;
+		for (unsigned int nb = 0; nb < N; nb += TN)
+		{
+			const unsigned int ne = (nb + TN < N) ? (nb + TN) : N;
+			for (unsigned int kb = 0; kb < r; kb += TK)
+			{
+				const unsigned int ke = (kb + TK < r) ? (kb + TK) : r;
+
+				for (unsigned int t = mb; t < me; ++t)
+				{
+					float*       xRow = X + static_cast<size_t>(t) * N;
+					const float* zRow = Z + static_cast<size_t>(t) * r;
+					// Outer over k: each k-row of S is contiguous in i.
+					for (unsigned int k = kb; k < ke; ++k)
+					{
+						const float* sRow = S + static_cast<size_t>(k) * N;
+						const float  scale = inv_r * zRow[k];
+						unsigned int i = nb;
+						const unsigned int ne4 = nb + ((ne - nb) & ~3u);
+						for (; i < ne4; i += 4)
+						{
+							xRow[i + 0] += scale * sRow[i + 0];
+							xRow[i + 1] += scale * sRow[i + 1];
+							xRow[i + 2] += scale * sRow[i + 2];
+							xRow[i + 3] += scale * sRow[i + 3];
+						}
+						for (; i < ne; ++i)
+							xRow[i] += scale * sRow[i];
+					}
+				}
+			}
+		}
+	}
+}
+
 } // namespace chiron
 } // namespace glades

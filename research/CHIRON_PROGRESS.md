@@ -56,6 +56,83 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 
 ---
 
+## 2026-04-21 — Phase 3 + Phase 3.5 complete (GPU port + optimization)
+
+### Phase 3 — GPU port
+
+New files:
+- `Backend/Machine Learning/Networks/cuda/gpu_chiron.{h,cu}` — GPU kernels
+  for the CHIRON primitives, mirroring `transformer_chiron_ops.h` on the host.
+- `chiron_shear_add` / `chiron_shear_sub`: element-wise saxpy-like kernels.
+- `chiron_reln_forward` / `chiron_reln_inverse`: one-block-per-token
+  LayerNorm-style kernels with warp/block reductions.
+- `chiron_sketch_project` / `chiron_sketch_lift_add`: routed through
+  `sgemm_rowmajor_abt` and `sgemm_rowmajor` cuBLAS wrappers.
+
+New test: `CHIRONGpuParityTest` — compares every GPU primitive against CPU
+reference at T=8, m=32, r=64:
+
+| Op            | max element-wise error |
+|---|---|
+| shear_add     | 0.0e+00 (bit-exact) |
+| shear_sub     | 0.0e+00 (bit-exact) |
+| reln_fwd  (q) | 1.2e-07 |
+| reln_fwd stats| 8.9e-08 |
+| reln_inv      | 6.0e-08 |
+| sketch_proj   | 6.6e-07 (GEMM, TF32 inside tolerance) |
+| sketch_lift   | 1.2e-07 |
+
+### Phase 3.5 — CPU + GPU performance baseline and optimization
+
+New benchmark: `chiron-bench` (test.sh alias) runs each primitive on three
+sizes, reports wall-clock and GFLOP/s, and also measures actual VRAM via
+`cudaMemGetInfo`.
+
+**CPU optimizations added** (header-only blocked kernels in
+`transformer_chiron_ops.h`):
+- `sketch_project_batched` — blocked tiling (M/N/K tile macros) + 4-lane
+  accumulator unroll in the inner FMA loop.
+- `sketch_lift_add_batched` — outer-product loop order: for each (t, k),
+  scale row S[k, :] by Z[t, k] and fuse into X[t, :]. This gives
+  sequential access on both S and X; strictly better than the straightforward
+  dot-product formulation because it eliminates the stride-N load on S.
+
+Correctness: new `CHIRONBatchedSketchParityTest` — max element-wise error
+vs scalar reference < 1e-5 (FP accumulation-order slop only).
+
+**Measured throughput** (CPU via 4-lane FMA unroll; GPU via cuBLAS + warp
+reductions; host: RTX 4080 SUPER, 52 TFLOP/s FP32 peak, 736 GB/s HBM):
+
+Small (T=256, m=256, Ntok=512, r=128):
+- CPU shear_add:            0.005 ms @ 90 GB/s
+- CPU sketch_project scalar: 11.1 ms @ 3.0 GFLOP/s (naive)
+- CPU sketch_project batched: 7.4 ms @ 4.5 GFLOP/s (1.5× scalar)
+- CPU sketch_lift scalar:   16.1 ms @ 2.1 GFLOP/s
+- CPU sketch_lift batched:   3.0 ms @ 11.2 GFLOP/s (**5.3× scalar**)
+- GPU shear_add:           0.0028 ms @ 174 GB/s
+- GPU sketch_project:      0.008 ms @ 4.0 TFLOP/s
+- GPU sketch_lift:         0.005 ms @ 6.2 TFLOP/s
+- GPU VRAM footprint: 14 MB
+
+Large (T=2048, m=2048, Ntok=4096, r=1024):
+- CPU shear_add:           2.0 ms @ 15 GB/s
+- CPU sketch batched:      3.0-3.8 s @ 4.5 GFLOP/s
+- GPU shear_add:          0.014 ms @ 2.2 TB/s (L2-cached, hot-data regime)
+- GPU sketch_project:      0.36 ms @ 45 TFLOP/s (87% of peak)
+- GPU sketch_lift:         0.39 ms @ 44 TFLOP/s (85% of peak)
+- GPU VRAM footprint: 120 MB
+
+**Bottom line**: GPU kernels are at ~85-90% of RTX 4080 SUPER peak FP32 —
+no further optimization needed. CPU sketch_lift_add_batched now delivers
+5.3× over the scalar baseline; this is sufficient for the CPU path to be
+usable for testing and small-model training, though the production path
+will remain GPU-only (GPU is ~8000× faster at these sizes).
+
+VRAM measurement: confirmed the per-block state footprint matches
+theoretical `2·T·m·4` bytes; sketch memory footprint at production scale
+(96L, T=4k, r=1024) projects to ~1.5 GB via this benchmark — confirms
+framework amendment §11a viability.
+
 ## Next milestones
 
 ### Phase 2 — BF16 + sketch correction

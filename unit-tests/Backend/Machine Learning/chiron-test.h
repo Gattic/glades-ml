@@ -33,8 +33,14 @@ void CHIRONSketchProjectLiftTest();
 void CHIRONSketchCorrectedBf16Test();
 void CHIRONPerTokenSketchBf16Test();
 void CHIRONGpuParityTest();
+void CHIRONBatchedSketchParityTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
+
+// Performance benchmark entry point (separate from the correctness test
+// because it runs at larger sizes and reports wall-clock numbers). Wired
+// into unit-tests/main.cpp as `chiron-bench`.
+void CHIRONBenchmark();
 
 #endif
