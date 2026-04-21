@@ -46,10 +46,20 @@ reduction from random**.  Largest LLM trained end-to-end on a single
 
 ### Test coverage
 
-- 430 / 430 CHIRON unit-test assertions pass.
-- GPU parity at the 1e-5 level (below BF16 ULP) across all alt-precision
-  paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16 weights vs FP32,
-  flash attention vs cuBLAS-tiled (forward + backward).
+- 433 / 433 CHIRON unit-test assertions pass.
+- GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
+  alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
+  weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),
+  **BF16-projection GEMMs vs FP32 projections** (new, max_err 1.3e-4).
+
+### Next lever — BF16 projection GEMMs (shipped, forward)
+
+`chiron_attention_shear_bf16w_tiled` (new) takes BF16 weight pointers
+directly and runs Q/K/V/O projections through `sgemm_rowmajor_bf16`
+(BF16 × BF16 → FP32 via BF16 TC, ~2× TF32-TC throughput).  Pairs with
+`--bf16-weights` to eliminate the 4 per-layer weight-cast kernels
+(~200 MB of HBM traffic saved per layer at 2 B).  Backward variant
+pending; trainer integration next.
 
 Production wire-in path:
   forward: `flash_attention_cublas_tiled` (1.56× alone)
