@@ -108,3 +108,50 @@ memory already shipped, we know the remaining savings are realizable on
 the optimizer/weight/gradient axes — they don't need new theory, only
 careful engineering. A 10 B LLM on a 16 GB consumer card in the next
 iteration horizon is a concrete, credible target.
+
+## 2026-04-21 update — progress on direction #3
+
+Shipped:
+  - Asymmetric int8 Adam state (signed m, unsigned v) — 4× smaller than FP32
+  - CPU-offloaded Adam Phase 1 (blocking) + Phase 2 (transferStream async)
+    — 1.78 B GPU-only ceiling @ 307 tok/s
+  - BF16 gradient accumulators via bf16_accum_axpy — halves gradient VRAM
+    — 1.68 B GPU-only ceiling @ 1484 tok/s (preferred production path)
+
+Now shipping the foundation for direction #4 — stochastic-rounded BF16
+weights.  The `cast_f32_to_bf16_stochastic` kernel is in place and
+unit-tested (50/50 halfway rounds, 1.00× expected on sub-ULP
+accumulation).  Once the trainer wires BF16 master weights end-to-end,
+the FP32 weight storage (currently 3.36 GB at 1.38 B) drops to BF16
+(1.68 GB), unlocking the projected 2.2-2.5 B GPU-only ceiling.
+
+## Direction #4 — Stochastic-rounded BF16 weights (new)
+
+*Hypothesis:* eliminate the FP32 master weights entirely.  Adam reads
+the BF16 weight, decodes to FP32, applies the update in FP32, and stores
+back with stochastic rounding — the expected value of the stored BF16
+weight equals the true FP32 update exactly, so sub-ULP updates
+accumulate correctly across steps (instead of being quantized to zero
+by deterministic round-to-nearest-even).
+
+*Memory impact at 1.38 B (CHIRON + int8 Adam + BF16 grads baseline):*
+  - FP32 weights persistent:  3.36 GB  →  BF16 weights: 1.68 GB.  Save 1.68 GB.
+  - Shared FP32 weight scratch: one layer's worth (~108 MB) — not
+    persistent, reused before each layer's forward / backward / Adam.
+  - Net saving: 1.57 GB → new ceiling ~2.2 B GPU-only.
+
+*Risks:*
+  - BF16 storage doubles rounding noise on the weight values (~0.2%)
+    vs FP32 master.  Training should still converge — BF16-master
+    training is an established technique in production LLMs.
+  - Cast-before-forward overhead: ~5-10 ms per step (~1-2 % of a 500 ms
+    step at 1.4 B).  Acceptable.
+
+*Engineering path:*
+  1. kernel (SHIPPED): `cast_f32_to_bf16_stochastic`
+  2. kernel: BF16-weight-reading Adam variant (thin wrapper: cast,
+     adam_update, cast back with stochastic round)
+  3. trainer: --bf16-weights flag; BF16 weight buffers per layer;
+     shared FP32 weight scratches; cast-before-compute in forward/backward
+  4. validation: unit-test end-to-end training convergence matches FP32
+     weights within acceptable margin
