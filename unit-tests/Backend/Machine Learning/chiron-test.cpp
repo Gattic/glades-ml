@@ -2221,8 +2221,12 @@ void CHIRONUnitTest()
 	CHIRONGpuAttentionShearBackwardTest();
 	CHIRONGpuFullBlockBackwardTest();
 	CHIRONGpuMultiBlockBackwardTest();
+	CHIRONMicroTrainingDemoTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
+
+// (CHIRONMicroTrainingDemoTest is defined at the end of this file,
+//  after the ChironGpuBlock helper struct.)
 
 #ifdef GLADES_HAVE_CUDA
 // -----------------------------------------------------------------------
@@ -3610,4 +3614,139 @@ void CHIRONBenchmark()
 
 	std::printf("\nSink prevention: %g\n", static_cast<double>(g_chiron_sink));
 	std::printf("=== CHIRON benchmark done ===\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Case 21: CHIRON micro-training demo.
+//
+// Overfit a single (q0, p0) → (q_target, p_target) regression mapping by
+// running SGD through ONE CHIRON block for N steps.  Asserts final loss is
+// materially lower than initial loss — the simplest end-to-end proof that
+// CHIRON's backward-via-inverse pathway produces gradients that actually
+// descend loss.  (Placed at end of file so ChironGpuBlock / chiron_setup_block
+// are defined by the time this function is compiled.)
+// ---------------------------------------------------------------------------
+void CHIRONMicroTrainingDemoTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) { std::printf("  [CHIRON micro-train] no CUDA device\n"); return; }
+
+	const unsigned int T = 4, m = 16, nH = 1, dH = 16, dM = nH * dH;
+	const bool causal = true;
+	const float eps = 1e-4f;
+	const int n_steps = 80;
+	const float lr = 0.05f;
+
+	LCG rng(5678u);
+	std::vector<float> q0(T * m), p0(T * m);
+	std::vector<float> q_tgt(T * m), p_tgt(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	std::vector<float> gamma(m), beta(m);
+	for (size_t i = 0; i < q0.size(); ++i) q0[i] = 0.5f * rng.next_unit();
+	for (size_t i = 0; i < p0.size(); ++i) p0[i] = 0.5f * rng.next_unit();
+	for (size_t i = 0; i < q_tgt.size(); ++i) q_tgt[i] = 0.5f * rng.next_unit();
+	for (size_t i = 0; i < p_tgt.size(); ++i) p_tgt[i] = 0.5f * rng.next_unit();
+	const float init = 0.05f;
+	for (size_t i = 0; i < Wq.size(); ++i) { Wq[i] = init * rng.next_unit(); Wk[i] = init * rng.next_unit(); Wv[i] = init * rng.next_unit(); }
+	for (size_t i = 0; i < Wo.size(); ++i) Wo[i] = init * rng.next_unit();
+	for (unsigned int i = 0; i < m; ++i) { gamma[i] = 1.0f; beta[i] = 0.0f; }
+
+	glades::gpu::GpuBuffer<float> d_q, d_p, d_q_out, d_stats;
+	glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo, d_gamma, d_beta;
+	glades::gpu::GpuBuffer<float> d_q_tgt, d_p_tgt;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV;
+	glades::gpu::GpuBuffer<float> d_qtmp, d_stats_split;
+	glades::gpu::GpuBuffer<float> d_dq_out, d_dp_out, d_dq_in, d_dp_in;
+	glades::gpu::GpuBuffer<float> d_dWq, d_dWk, d_dWv, d_dWo, d_dgamma, d_dbeta;
+
+	d_q.allocate(T * m); d_p.allocate(T * m); d_q_out.allocate(T * m); d_stats.allocate(T * 2u);
+	d_Wq.allocate(m * dM); d_Wk.allocate(m * dM); d_Wv.allocate(m * dM); d_Wo.allocate(dM * m);
+	d_gamma.allocate(m); d_beta.allocate(m);
+	d_q_tgt.allocate(T * m); d_p_tgt.allocate(T * m);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM); d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_sdO.allocate(T * dM); d_sdQ.allocate(T * dM); d_sdK.allocate(T * dM); d_sdV.allocate(T * dM);
+	d_qtmp.allocate(T * m); d_stats_split.allocate(2 * T);
+	d_dq_out.allocate(T * m); d_dp_out.allocate(T * m);
+	d_dq_in.allocate(T * m); d_dp_in.allocate(T * m);
+	d_dWq.allocate(m * dM); d_dWk.allocate(m * dM); d_dWv.allocate(m * dM); d_dWo.allocate(dM * m);
+	d_dgamma.allocate(m); d_dbeta.allocate(m);
+
+	d_Wq.upload(&Wq[0], Wq.size()); d_Wk.upload(&Wk[0], Wk.size());
+	d_Wv.upload(&Wv[0], Wv.size()); d_Wo.upload(&Wo[0], Wo.size());
+	d_gamma.upload(&gamma[0], m); d_beta.upload(&beta[0], m);
+	d_q_tgt.upload(&q_tgt[0], T * m); d_p_tgt.upload(&p_tgt[0], T * m);
+
+	ChironGpuBlock blk;
+	chiron_setup_block(blk, T, m, nH, dH, causal, eps,
+	                    d_Wq, d_Wk, d_Wv, d_Wo, d_gamma, d_beta,
+	                    d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV,
+	                    d_qtmp, d_stats_split);
+
+	float loss_init = 0.0f, loss_final = 0.0f;
+
+	for (int step = 0; step < n_steps; ++step)
+	{
+		d_q.upload(&q0[0], T * m); d_p.upload(&p0[0], T * m);
+		ASSERT("microtrain fwd", blk.forward(d_q.data(), d_p.data(),
+		                                       d_q_out.data(), d_stats.data()));
+
+		std::vector<float> q_out_h(T * m), p_out_h(T * m);
+		d_q_out.download(&q_out_h[0], T * m);
+		d_p.download(&p_out_h[0], T * m);
+		double L = 0.0;
+		std::vector<float> dq_out_h(T * m), dp_out_h(T * m);
+		for (size_t i = 0; i < q_out_h.size(); ++i)
+		{
+			const float dq = q_out_h[i] - q_tgt[i];
+			const float dp = p_out_h[i] - p_tgt[i];
+			L += dq * dq + dp * dp;
+			dq_out_h[i] = 2.0f * dq;
+			dp_out_h[i] = 2.0f * dp;
+		}
+		if (step == 0) loss_init = static_cast<float>(L);
+		if (step == n_steps - 1) loss_final = static_cast<float>(L);
+		if (step % 20 == 0)
+			std::printf("  microtrain step %3d: loss=%.4f\n", step, L);
+
+		d_dq_out.upload(&dq_out_h[0], T * m); d_dp_out.upload(&dp_out_h[0], T * m);
+
+		ASSERT("microtrain inv",
+		       blk.inverse(d_q_out.data(), d_p.data(), d_qtmp.data(), d_stats.data()));
+
+		d_dq_in.zero(); d_dp_in.zero();
+		d_dWq.zero(); d_dWk.zero(); d_dWv.zero(); d_dWo.zero();
+		d_dgamma.zero(); d_dbeta.zero();
+		ASSERT("microtrain bwd",
+		       blk.backward(d_dq_out.data(), d_dp_out.data(),
+		                    d_qtmp.data(), d_stats.data(),
+		                    d_dq_in.data(), d_dp_in.data(),
+		                    d_dWq.data(), d_dWk.data(), d_dWv.data(), d_dWo.data(),
+		                    d_dgamma.data(), d_dbeta.data()));
+
+		std::vector<float> dWq_h(Wq.size()), dWk_h(Wk.size()), dWv_h(Wv.size()), dWo_h(Wo.size());
+		std::vector<float> dgamma_h(m), dbeta_h(m);
+		d_dWq.download(&dWq_h[0], Wq.size()); d_dWk.download(&dWk_h[0], Wk.size());
+		d_dWv.download(&dWv_h[0], Wv.size()); d_dWo.download(&dWo_h[0], Wo.size());
+		d_dgamma.download(&dgamma_h[0], m); d_dbeta.download(&dbeta_h[0], m);
+		for (size_t i = 0; i < Wq.size(); ++i) { Wq[i] -= lr * dWq_h[i]; Wk[i] -= lr * dWk_h[i]; Wv[i] -= lr * dWv_h[i]; }
+		for (size_t i = 0; i < Wo.size(); ++i) Wo[i] -= lr * dWo_h[i];
+		for (unsigned int i = 0; i < m; ++i) { gamma[i] -= lr * dgamma_h[i]; beta[i] -= lr * dbeta_h[i]; }
+		d_Wq.upload(&Wq[0], Wq.size()); d_Wk.upload(&Wk[0], Wk.size());
+		d_Wv.upload(&Wv[0], Wv.size()); d_Wo.upload(&Wo[0], Wo.size());
+		d_gamma.upload(&gamma[0], m); d_beta.upload(&beta[0], m);
+	}
+
+	std::printf("  CHIRON micro-training: initial loss=%.4f, final loss=%.4f, "
+	            "reduction=%.2fx\n",
+	            loss_init, loss_final,
+	            loss_final > 0.0f ? (loss_init / loss_final) : 0.0f);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "CHIRON SGD must decrease loss: initial=%.4f final=%.4f "
+	              "(want < 0.5 * initial)", loss_init, loss_final);
+	ASSERT(msg, loss_final < 0.5f * loss_init);
+#else
+	std::printf("  [CHIRON micro-train] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
 }
