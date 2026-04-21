@@ -1205,6 +1205,190 @@ bool adam_update_bf16_state(float* param, const float* grad,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Adam with int8-packed optimizer state (block-wise scale).
+// ---------------------------------------------------------------------------
+// Each block of ADAM_INT8_BS parameters stores one FP32 absmax scale plus
+// ADAM_INT8_BS int8 values.  Load: value = int8 * scale / 127.  Store:
+// compute new absmax across the block (shuffle-reduce), quantize to int8.
+//
+// Memory per param per moment: 1 byte + 4/ADAM_INT8_BS scale bytes =
+// ~1.002 bytes.  Compared to 2 BF16, 4 FP32 — 2× / 4× reduction.
+//
+// Math is identical to adam_update up to quantization noise (~1/127 of
+// block absmax).  Adam is known to tolerate 8-bit EMAs well empirically
+// (see bitsandbytes); the decoupled weight decay + bias-correction stays
+// in FP32 on the param path.
+
+namespace {
+
+#define ADAM_INT8_BS 256   // chosen so shmem = 2 * BS * 4 = 2 KB — fits in L1
+
+__global__ void adam_update_int8_state_kernel(
+    float* __restrict__ param,
+    const float* __restrict__ grad,
+    int8_t* __restrict__ m_int8,
+    int8_t* __restrict__ v_int8,
+    float* __restrict__ m_scale,
+    float* __restrict__ v_scale,
+    float lr, float beta1, float beta2,
+    float eps, float weightDecay,
+    float gradScale,
+    int step, int n, int numBlocks)
+{
+	const int blockId = blockIdx.x;
+	if (blockId >= numBlocks) return;
+
+	const int start = blockId * ADAM_INT8_BS;
+	const int end = min(start + ADAM_INT8_BS, n);
+	const int len = end - start;
+
+	const float oldMScale = m_scale[blockId];
+	const float oldVScale = v_scale[blockId];
+	const float qinv = 1.0f / 127.0f;
+
+	__shared__ float sM[ADAM_INT8_BS];
+	__shared__ float sV[ADAM_INT8_BS];
+
+	float localMmax = 0.0f;
+	float localVmax = 0.0f;
+
+	for (int i = threadIdx.x; i < len; i += blockDim.x)
+	{
+		const int gi = start + i;
+		const float g = grad[gi] * gradScale;
+
+		// Dequantize old m, v from int8.
+		const float mOld = (float)m_int8[gi] * oldMScale * qinv;
+		const float vOld = (float)v_int8[gi] * oldVScale * qinv;
+
+		const float mNew = beta1 * mOld + (1.0f - beta1) * g;
+		const float vNew = beta2 * vOld + (1.0f - beta2) * g * g;
+
+		sM[i] = mNew;
+		sV[i] = vNew;
+
+		const float am = fabsf(mNew);
+		const float av = fabsf(vNew);
+		if (am > localMmax) localMmax = am;
+		if (av > localVmax) localVmax = av;
+	}
+
+	// Block-reduce absmax via shuffle.  Works for blockDim.x ≤ 1024 and a
+	// power of two; we launch with blockDim.x = ADAM_INT8_BS.
+	__shared__ float sMax[2];
+	float mMax = localMmax;
+	float vMax = localVmax;
+	for (int off = warpSize / 2; off > 0; off /= 2)
+	{
+		float o = __shfl_xor_sync(0xFFFFFFFF, mMax, off);
+		if (o > mMax) mMax = o;
+		o = __shfl_xor_sync(0xFFFFFFFF, vMax, off);
+		if (o > vMax) vMax = o;
+	}
+	// Write per-warp results to shared.
+	if ((threadIdx.x & (warpSize - 1)) == 0)
+	{
+		const int warpId = threadIdx.x / warpSize;
+		sMax[warpId == 0 ? 0 : 0] = mMax;  // we only use warp 0 below
+	}
+	__syncthreads();
+
+	// Block-wide reduction (one warp since BS=256 = 8 warps; do a second
+	// shuffle pass through shared memory).
+	__shared__ float sWarpM[32], sWarpV[32];
+	const int warpId = threadIdx.x / warpSize;
+	const int lane = threadIdx.x % warpSize;
+	if (lane == 0)
+	{
+		sWarpM[warpId] = mMax;
+		sWarpV[warpId] = vMax;
+	}
+	__syncthreads();
+
+	if (warpId == 0)
+	{
+		const int numWarps = blockDim.x / warpSize;
+		float mm = (lane < numWarps) ? sWarpM[lane] : 0.0f;
+		float vv = (lane < numWarps) ? sWarpV[lane] : 0.0f;
+		for (int off = warpSize / 2; off > 0; off /= 2)
+		{
+			float o = __shfl_xor_sync(0xFFFFFFFF, mm, off);
+			if (o > mm) mm = o;
+			o = __shfl_xor_sync(0xFFFFFFFF, vv, off);
+			if (o > vv) vv = o;
+		}
+		if (lane == 0)
+		{
+			sWarpM[0] = mm;
+			sWarpV[0] = vv;
+		}
+	}
+	__syncthreads();
+
+	const float newMMax = fmaxf(sWarpM[0], 1e-20f);  // guard div-by-zero
+	const float newVMax = fmaxf(sWarpV[0], 1e-20f);
+
+	if (threadIdx.x == 0)
+	{
+		m_scale[blockId] = newMMax;
+		v_scale[blockId] = newVMax;
+	}
+
+	const float bc1 = 1.0f - powf(beta1, (float)step);
+	const float bc2 = 1.0f - powf(beta2, (float)step);
+	const float invNewM = 127.0f / newMMax;
+	const float invNewV = 127.0f / newVMax;
+
+	for (int i = threadIdx.x; i < len; i += blockDim.x)
+	{
+		const int gi = start + i;
+		const float mNew = sM[i];
+		const float vNew = sV[i];
+
+		// Requantize to int8 with rounding-to-nearest, clamped to [-127, 127].
+		float mq = mNew * invNewM;
+		float vq = vNew * invNewV;
+		mq = fmaxf(-127.0f, fminf(127.0f, rintf(mq)));
+		vq = fmaxf(-127.0f, fminf(127.0f, rintf(vq)));
+		m_int8[gi] = (int8_t)mq;
+		v_int8[gi] = (int8_t)vq;
+
+		// AdamW weight decay on the current param (FP32).
+		if (weightDecay != 0.0f)
+			param[gi] -= lr * weightDecay * param[gi];
+
+		// Bias-corrected Adam update on param.
+		const float mHat = mNew / bc1;
+		const float vHat = vNew / bc2;
+		param[gi] -= lr * mHat / (sqrtf(vHat) + eps);
+	}
+}
+
+} // anonymous namespace
+
+bool adam_update_int8_state(float* param, const float* grad,
+                             int8_t* m_int8, int8_t* v_int8,
+                             float* m_scale, float* v_scale,
+                             float lr, float beta1, float beta2, float eps,
+                             float weightDecay, float gradScale,
+                             int step, int n)
+{
+	if (n <= 0) return true;
+	const int numBlocks = (n + ADAM_INT8_BS - 1) / ADAM_INT8_BS;
+	adam_update_int8_state_kernel<<<numBlocks, ADAM_INT8_BS, 0, computeStream()>>>(
+	    param, grad, m_int8, v_int8, m_scale, v_scale,
+	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n, numBlocks);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Number of scale blocks (one FP32 scale per block of ADAM_INT8_BS params).
+int adam_int8_scale_count(int n)
+{
+	return (n + ADAM_INT8_BS - 1) / ADAM_INT8_BS;
+}
+
 // Batched Adam: process all parameter groups in a single kernel launch.
 // Each block handles one element range within one parameter group.
 namespace {

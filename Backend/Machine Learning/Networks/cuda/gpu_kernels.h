@@ -146,6 +146,27 @@ bool adam_update_bf16_state(float* param, const float* grad,
                             float weightDecay, float gradScale,
                             int step, int n);
 
+// Adam with int8-packed optimizer state (block-wise absmax scale).
+// Each block of 256 parameters stores one FP32 absmax scale plus 256 int8
+// values for each moment.  Memory: ~1.016 bytes/param/moment, half the BF16
+// cost and one-quarter the FP32 cost.  Math matches adam_update up to
+// quantization noise (~1/127 of block absmax — Adam tolerates this well
+// empirically, as in bitsandbytes).  param and grad stay FP32.
+//
+// The caller must allocate m_scale, v_scale with at least
+// adam_int8_scale_count(n) FP32 entries; they are persistent state updated
+// each step.  Initial values: zero (first-step read dequantizes to 0).
+bool adam_update_int8_state(float* param, const float* grad,
+                             int8_t* m_int8, int8_t* v_int8,
+                             float* m_scale, float* v_scale,
+                             float lr, float beta1, float beta2, float eps,
+                             float weightDecay, float gradScale,
+                             int step, int n);
+
+// Returns the number of FP32 scale entries required for int8 Adam state
+// given a parameter count n.
+int adam_int8_scale_count(int n);
+
 bool adam_group_scale_batch(float** d_params, float** d_grads,
                             float** d_ms, float** d_vs,
                             float* d_groupScales, float* d_groupPrevStepRms,
@@ -417,6 +438,10 @@ inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
+inline bool adam_update_int8_state(float*, const float*, int8_t*, int8_t*,
+                                    float*, float*, float, float, float, float,
+                                    float, float, int, int) { return false; }
+inline int adam_int8_scale_count(int n) { return (n + 255) / 256; }
 inline bool adam_update_bf16_state(float*, const float*, uint16_t*, uint16_t*,
                                    float, float, float, float, float, float,
                                    int, int) { return false; }
