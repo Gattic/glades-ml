@@ -9383,11 +9383,38 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		}
 		else
 		{
+			// cuBLAS-tiled tensor-core attention (eval forward path).
+			const bool chiron_fast_eval = (nHeads == nKVHeads);
+			if (chiron_fast_eval)
+			{
+				const size_t scoresNeeded = static_cast<size_t>(nHeads) * T * T;
+				if (gpuTransformerScratch->attnScoresScratch.size() < scoresNeeded)
+					gpuTransformerScratch->attnScoresScratch.allocate(scoresNeeded);
+				if (gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded)
+				{
+					gpu::flash_attention_cublas_tiled(Q_l, K_l, V_l,
+					    static_cast<int>(T), static_cast<int>(nHeads),
+					    static_cast<int>(dHead), static_cast<int>(dModel),
+					    causal, attnConcat_l,
+					    gpuTransformerScratch->attnScoresScratch.data());
+				}
+				else
+				{
+					gpu::flash_attention_multihead_forward(Q_l, K_l, V_l,
+					    static_cast<int>(T), static_cast<int>(nHeads),
+					    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+					    static_cast<int>(dModel), static_cast<int>(dModelKV),
+					    causal, attnConcat_l);
+				}
+			}
+			else
+			{
 			gpu::flash_attention_multihead_forward(Q_l, K_l, V_l,
 			    static_cast<int>(T), static_cast<int>(nHeads),
 			    static_cast<int>(nKVHeads), static_cast<int>(dHead),
 			    static_cast<int>(dModel), static_cast<int>(dModelKV),
 			    causal, attnConcat_l);
+			}
 		}
 
 		float* attnOut_l = gpuTransformerScratch->attnOut.data()
