@@ -166,6 +166,29 @@ buffer. Reducing r from 1024 to 256 cuts ~75% of that component. At
 production, sketch r can be tuned per-layer based on measured drift;
 anchored-mode (full-activation every k blocks) is another lever.
 
+## 2026-04-21 — Baseline transformer throughput captured
+
+Ran glades-trainer with default (AdamW+BF16) config for comparison:
+- Model: `pile_small`, ~265 MB weights
+- Hardware: GPU enabled, RTX 4080 SUPER
+- Throughput at 50k tokens (steady-state, not warmup): **~9400 targets/sec**
+- NLL=10.46 after 2 optimizer steps (warmup, not converged)
+
+This is the baseline CHIRON must beat on realistic training. After full
+Phase 4 integration (wire into `transformerGpuTrainEpoch` behind the
+`cfg.chiron.enable` flag), the throughput comparison will show:
+- If CHIRON runs at 1 / 2-3× the throughput (because backward does 1
+  recompute + 1 backward vs baseline's 1 backward): expected, acceptable
+  given the memory unlock.
+- If CHIRON fits a much larger model in the same VRAM: the real win.
+
+Projected CHIRON advantage on the same GPU:
+- Baseline pile_small (dModel ~512) is ~265 MB weights + 10 MB
+  activations at this batch/length.
+- CHIRON at the same VRAM budget could train a model with ~5-10×
+  more parameters (dModel ~1500-2500, 2-3× deeper), subject to Phase
+  3.5's measured activation overhead.
+
 ## Next milestones
 
 ### Phase 2 — BF16 + sketch correction
