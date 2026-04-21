@@ -9884,6 +9884,45 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				glades::gpu::cast_f32_to_bf16(V_l,
 				    gpuTransformerScratch->vLowp.data(),
 				    static_cast<size_t>(T) * dModelKV);
+				// cuBLAS-tiled BF16 path when eligible (no GQA, scratch ok).
+				// Q/K/V are already cast to BF16 above (qLowp/kLowp/vLowp)
+				// so we pass them in via a dummy FP32 pointer that gets
+				// ignored — use the BF16 variant which takes the cast pointers.
+				// Falls back to the existing custom BF16 flash_attention
+				// kernel when scratch alloc fails or GQA is configured.
+				const bool chiron_fast_bf16 = (nHeads == nKVHeads);
+				bool bf16_attn_done = false;
+				if (chiron_fast_bf16)
+				{
+					const size_t scoresNeeded = static_cast<size_t>(nHeads) * T * T;
+					if (gpuTransformerScratch->attnScoresScratch.size() < scoresNeeded)
+						gpuTransformerScratch->attnScoresScratch.allocate(scoresNeeded);
+					if (gpuTransformerScratch->attnPbf16.size() < scoresNeeded)
+						gpuTransformerScratch->attnPbf16.allocate(scoresNeeded);
+					if (gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded &&
+					    gpuTransformerScratch->attnPbf16.size() >= scoresNeeded)
+					{
+						// Re-use existing qLowp/kLowp/vLowp BF16 scratch as inputs.
+						// Call the BF16 variant but have it skip its internal cast
+						// by passing the BF16 scratches as the scratch_*bf16 outputs
+						// — we'll call a dedicated "from-bf16" inline implementation
+						// to avoid an unneeded cast.  For now, just call the variant
+						// that re-casts — cast overhead is small vs attention compute
+						// at real production shapes.
+						bf16_attn_done = gpu::flash_attention_cublas_tiled_bf16(
+						    Q_l, K_l, V_l,
+						    static_cast<int>(T), static_cast<int>(nHeads),
+						    static_cast<int>(dHead), static_cast<int>(dModel),
+						    causal, attnConcat_l,
+						    gpuTransformerScratch->attnScoresScratch.data(),
+						    gpuTransformerScratch->qLowp.data(),  // reuse
+						    gpuTransformerScratch->kLowp.data(),  // reuse
+						    gpuTransformerScratch->vLowp.data(),  // reuse
+						    gpuTransformerScratch->attnPbf16.data());
+					}
+				}
+				if (!bf16_attn_done)
+				{
 				gpu::flash_attention_multihead_forward_bf16(
 				    gpuTransformerScratch->qLowp.data(),
 				    gpuTransformerScratch->kLowp.data(),
@@ -9896,6 +9935,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    static_cast<int>(dModelKV),
 				    causal,
 				    attnConcat_l);
+				}
 			}
 			else
 			{
