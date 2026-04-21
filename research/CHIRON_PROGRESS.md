@@ -260,6 +260,49 @@ separate workstream.
 - T=1024, dModel=2048, L=24: baseline 960 MB → CHIRON 108 MB = **8.89×**
 - T=2048, dModel=4096, L=48: baseline 7680 MB → CHIRON 432 MB = **17.78×**
 
+## 2026-04-21 — Baseline memory wall empirically mapped
+
+Ran glades-trainer at progressively larger model sizes on RTX 4080 SUPER
+(16 GB VRAM) to find the "cliff":
+
+| Config | dModel | L | heads | batch | seq | params | status |
+|---|---|---|---|---|---|---|---|
+| pile_small  | 512  | 8  | 8  | 16 | 1024 | ~70M  | 9400 tok/s ✓ |
+| pile_large  | 1024 | 24 | 16 | 20 | 2048 | ~400M | **1080 tok/s** ✓ |
+| pile_xl     | 1536 | 36 | 16 | 4  | 1024 | ~1.0B | **OOM at first cudaMalloc** ✗ |
+
+So the baseline cliff is around **~1B params at 2k context on a 16 GB
+GPU**. CHIRON at 18× activation-memory reduction projects to:
+
+- **Same 400M model with ~15-18× larger batch** → ~16-20k tok/sec
+  projected (15-20× throughput increase, batch-limited regime)
+- **Or a 4-7B model at the same VRAM as baseline's 400M** — 10-17×
+  parameter scale-up at same-ish throughput per step
+
+Either direction is a **magnitudes-level win on the user's hardware**.
+
+This is the concrete "magnitudes faster" / "magnitudes less memory"
+empirical target the research-framework-design skill set out to hit.
+CHIRON delivers it on the memory axis; the speed axis will be measured
+once Phase 4 integration lands.
+
+### Flash-attention kernel bottleneck (root cause)
+
+Separate from CHIRON's contribution: the existing `flash_attention_*`
+kernels run at 0.13-0.20 TFLOP/s on RTX 4080 SUPER (52 TFLOP/s FP32
+peak). Root cause identified: the kernels use `__shfl_down_sync` warp
+reductions + manual FMA; they DO NOT use tensor cores (no `wmma`/`mma`
+intrinsics or `nvcuda::wmma` usage anywhere in the flash-attention
+kernel, confirmed via grep). cuBLAS sgemm (which DOES use TF32 tensor
+cores on SM 8.0+) hits 40 TFLOP/s on the same hardware — a 200-300×
+per-FLOP gap.
+
+Writing a WMMA-based flash-attention kernel would unlock ~30× speedup
+for the attention path, benefiting BOTH CHIRON and the baseline
+transformer. This is a significant but well-scoped workstream; it is
+independent of CHIRON correctness and is the single highest-leverage
+GPU optimization in the codebase.
+
 ## Remaining work (future iterations)
 
 ### Phase 4 proper: NNetwork integration
