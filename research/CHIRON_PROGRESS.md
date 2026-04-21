@@ -133,6 +133,39 @@ theoretical `2·T·m·4` bytes; sketch memory footprint at production scale
 (96L, T=4k, r=1024) projects to ~1.5 GB via this benchmark — confirms
 framework amendment §11a viability.
 
+## 2026-04-21 — Phase 4 start: GPU end-to-end + measured memory savings
+
+**GPU end-to-end multi-block roundtrip** (CHIRONGpuEndToEndTest): composes
+L=8 reduced CHIRON blocks (shear+shear+ReLN) on GPU, runs forward then
+inverse chain, recovers initial state within FP32 machine epsilon
+(q_err=2.1e-7, p_err=7.5e-8). First end-to-end proof that the GPU
+primitives compose correctly.
+
+**Measured memory savings** (via cudaMemGetInfo, benchmark extension):
+
+At T=1024, dModel=2048, L=24:
+- Baseline q+p activations:                192 MB
+- CHIRON state (current q+p+tmp + stats + sketch r=1024): **108 MB**
+- Naive reduction:                         1.78×
+- Full-transformer-scratch baseline (q+p+attn+mlp ≈ 10-12 tensors/layer): ~960 MB
+- **CHIRON vs full-scratch: ~8.89×**
+
+At T=2048, dModel=4096, L=48:
+- Baseline q+p activations:                1536 MB (1.5 GB)
+- CHIRON state (r=1024):                   **432 MB**
+- Naive reduction:                         3.56×
+- Full-transformer-scratch baseline:       ~7.68 GB
+- **CHIRON vs full-scratch: ~17.78×**
+
+At production 70B / 96L / T=4k / r=1024: projected ~**20-30×** VRAM
+reduction on activations alone, consistent with the framework §11a
+amendment target.
+
+Note: the CHIRON figure is dominated by the `LxTxr` per-token sketch
+buffer. Reducing r from 1024 to 256 cuts ~75% of that component. At
+production, sketch r can be tuned per-layer based on measured drift;
+anchored-mode (full-activation every k blocks) is another lever.
+
 ## Next milestones
 
 ### Phase 2 — BF16 + sketch correction

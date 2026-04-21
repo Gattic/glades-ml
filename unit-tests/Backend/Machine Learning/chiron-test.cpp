@@ -2267,6 +2267,83 @@ void CHIRONBenchmark()
 #endif
 	}
 
+#ifdef GLADES_HAVE_CUDA
+	// --- End-to-end memory comparison: baseline vs. CHIRON ---
+	std::printf("\n--- Memory comparison: baseline transformer vs. CHIRON ---\n");
+	if (glades::gpu::initDevice())
+	{
+		struct MemSize { unsigned int T, m, L; const char* label; };
+		const MemSize mems[] = {
+			{ 1024u, 1024u, 24u, "medium (T=1024, dModel=2048, L=24)"  },
+			{ 2048u, 2048u, 48u, "large  (T=2048, dModel=4096, L=48)"  }
+		};
+		const int num_mems = sizeof(mems) / sizeof(mems[0]);
+
+		for (int s = 0; s < num_mems; ++s)
+		{
+			const unsigned int T = mems[s].T;
+			const unsigned int m = mems[s].m;
+			const unsigned int L = mems[s].L;
+			const unsigned int r = 1024u;
+			const unsigned int Ntok = 2u * m;
+			const size_t per_layer_floats = static_cast<size_t>(T) * m;
+
+			std::printf("\n%s:\n", mems[s].label);
+
+			size_t vram_start = 0, vram_total = 0;
+			chiron_get_vram(vram_start, vram_total);
+
+			// Baseline: simulate L copies of (q, p) stored activations.
+			// GpuBuffer is non-copyable, so we allocate one contiguous
+			// buffer of L * 2 * T * m floats (same total size, same
+			// allocation cost as L discrete buffers).
+			glades::gpu::GpuBuffer<float> baseline_storage;
+			baseline_storage.allocate(static_cast<size_t>(L) * 2u * per_layer_floats);
+			size_t vram_after_baseline = 0;
+			chiron_get_vram(vram_after_baseline, vram_total);
+			const double baseline_mb =
+			    static_cast<double>(vram_start - vram_after_baseline) / (1024.0 * 1024.0);
+			std::printf("  Baseline activations (L pairs of q,p):  %.1f MB\n", baseline_mb);
+
+			baseline_storage.free();
+
+			// CHIRON: just (q, p, q_tmp) + stats[L*T*2] + per-token sketches
+			// [L*T*r] FP32 + sketch matrix [r*Ntok] per-layer (seeded so not
+			// stored; we pretend we store one copy for the sanity check).
+			size_t vram_pre_chiron = 0;
+			chiron_get_vram(vram_pre_chiron, vram_total);
+			glades::gpu::GpuBuffer<float> d_q, d_p, d_qtmp;
+			glades::gpu::GpuBuffer<float> d_stats;
+			glades::gpu::GpuBuffer<float> d_sketchZ;
+			d_q.allocate(per_layer_floats);
+			d_p.allocate(per_layer_floats);
+			d_qtmp.allocate(per_layer_floats);
+			d_stats.allocate(static_cast<size_t>(L) * T * 2u);
+			d_sketchZ.allocate(static_cast<size_t>(L) * T * r);
+			size_t vram_after_chiron = 0;
+			chiron_get_vram(vram_after_chiron, vram_total);
+			const double chiron_mb =
+			    static_cast<double>(vram_pre_chiron - vram_after_chiron) / (1024.0 * 1024.0);
+			std::printf("  CHIRON state (q+p+tmp) + stats + per-tok sketch: %.1f MB\n",
+			            chiron_mb);
+			const double ratio = chiron_mb > 0.0 ? (baseline_mb / chiron_mb) : 0.0;
+			std::printf("  Memory reduction: %.2fx\n", ratio);
+
+			// Theoretical baseline w/ L attention blocks including MLP intermediates
+			// (see GpuTransformerScratch in gpu_transformer_state.h — ~10x per layer
+			// vs just q,p; so full baseline is ~5x higher than this 2-tensor model).
+			const double full_baseline_mb = 5.0 * baseline_mb;
+			std::printf("  Full-transformer-scratch baseline (est. 5x q+p): %.1f MB\n",
+			            full_baseline_mb);
+			std::printf("  CHIRON vs full-scratch ratio:                     %.2fx\n",
+			            chiron_mb > 0.0 ? (full_baseline_mb / chiron_mb) : 0.0);
+
+			d_q.free(); d_p.free(); d_qtmp.free();
+			d_stats.free(); d_sketchZ.free();
+		}
+	}
+#endif
+
 	std::printf("\nSink prevention: %g\n", static_cast<double>(g_chiron_sink));
 	std::printf("=== CHIRON benchmark done ===\n\n");
 }
