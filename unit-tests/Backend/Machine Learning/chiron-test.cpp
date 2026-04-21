@@ -1244,6 +1244,256 @@ void CHIRONSketchCorrectedBf16Test()
 	ASSERT(msg, bf16_L12_corrected_r256 <= bf16_L12_corrected_r64 * 1.2f);
 }
 
+// ---------------------------------------------------------------------------
+// Case 11: per-token local sketch in BF16 pipeline.
+//
+// Instead of sketching the full flattened block state (size N = 2·T·m),
+// apply an independent rank-r sketch to each of the T tokens (size 2m
+// each).  The sketch matrix is SHARED across tokens within a single
+// layer (for memory efficiency), but different per layer.
+//
+// Per-coord noise factor per the corrected scaling law:
+//   √(N_eff / r)  with  N_eff = 2m  (per token) rather than 2·T·m (global)
+//
+// For T=6, m=16: global N = 192, per-token N = 32. Same r=256 gives
+// √(N_eff/r) = √(32/256) ≈ 0.35 vs. √(192/256) ≈ 0.87 for the global
+// sketch — ~2.5× tighter per-coord correction.
+// ---------------------------------------------------------------------------
+static float run_multifullblock_roundtrip_per_token_sketch(
+    unsigned int L, unsigned int T, unsigned int m, unsigned int dH,
+    bool causal, float eps, unsigned int seed,
+    unsigned int r_sketch, unsigned int sketch_seed_base)
+{
+	const unsigned int Ntok = 2u * m;  // per-token flattened state size
+	const unsigned int qSize = T * m;
+
+	LCG rng(seed);
+	std::vector<float> q0(T * m), p0(T * m);
+	for (unsigned int i = 0; i < q0.size(); ++i) q0[i] = 0.5f * rng.next_unit();
+	for (unsigned int i = 0; i < p0.size(); ++i) p0[i] = 0.5f * rng.next_unit();
+
+	std::vector<std::vector<float> > Wq(L), Wk(L), Wv(L), Wo(L);
+	std::vector<std::vector<float> > w_p(L), b_p(L), w_q(L), b_q(L);
+	std::vector<std::vector<float> > gamma(L), beta(L);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		Wq[l].resize(m * dH); Wk[l].resize(m * dH);
+		Wv[l].resize(m * dH); Wo[l].resize(dH * m);
+		w_p[l].resize(m); b_p[l].resize(m);
+		w_q[l].resize(m); b_q[l].resize(m);
+		gamma[l].resize(m); beta[l].resize(m);
+		for (unsigned int i = 0; i < m * dH; ++i)
+		{
+			Wq[l][i] = 0.15f * rng.next_unit();
+			Wk[l][i] = 0.15f * rng.next_unit();
+			Wv[l][i] = 0.15f * rng.next_unit();
+		}
+		for (unsigned int i = 0; i < dH * m; ++i)
+			Wo[l][i] = 0.15f * rng.next_unit();
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			w_p[l][i] = 0.2f * rng.next_unit();
+			b_p[l][i] = 0.03f * rng.next_unit();
+			w_q[l][i] = 0.2f * rng.next_unit();
+			b_q[l][i] = 0.03f * rng.next_unit();
+			gamma[l][i] = 1.0f + 0.1f * rng.next_unit();
+			beta[l][i]  = 0.03f * rng.next_unit();
+		}
+		bf16_round_all(&Wq[l][0], Wq[l].size());
+		bf16_round_all(&Wk[l][0], Wk[l].size());
+		bf16_round_all(&Wv[l][0], Wv[l].size());
+		bf16_round_all(&Wo[l][0], Wo[l].size());
+		bf16_round_all(&w_p[l][0], w_p[l].size());
+		bf16_round_all(&b_p[l][0], b_p[l].size());
+		bf16_round_all(&w_q[l][0], w_q[l].size());
+		bf16_round_all(&b_q[l][0], b_q[l].size());
+		bf16_round_all(&gamma[l][0], gamma[l].size());
+		bf16_round_all(&beta[l][0], beta[l].size());
+	}
+
+	// One [r, Ntok] sketch per layer, shared across the T tokens of that layer.
+	std::vector<std::vector<float> > S(L);
+	for (unsigned int l = 0; l < L; ++l)
+		generate_gaussian_sketch(S[l], r_sketch, Ntok, sketch_seed_base + l);
+
+	// Stored sketches: [L, T, r]. Memory = L·T·r scalars — compare to
+	// global-sketch [L, r] = L·r scalars. Trade memory for tighter bound.
+	std::vector<std::vector<float> > z_stored(L);
+	for (unsigned int l = 0; l < L; ++l)
+		z_stored[l].resize(static_cast<size_t>(T) * r_sketch, 0.0f);
+
+	std::vector<float> stats(L * T * 2u, 0.0f);
+	std::vector<float> q(q0), p(p0);
+	bf16_round_all(&q[0], q.size());
+	bf16_round_all(&p[0], p.size());
+
+	std::vector<float> tok_flat(Ntok);
+	std::vector<float> y(T * m), u(T * m), q_tmp(T * m);
+
+	// Forward loop.
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		// For each token: concat (q_t, p_t), sketch.
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				tok_flat[i]       = q[t * m + i];
+				tok_flat[m + i]   = p[t * m + i];
+			}
+			glades::chiron::sketch_project(&S[l][0], &tok_flat[0],
+			                                r_sketch, Ntok,
+			                                &z_stored[l][t * r_sketch]);
+		}
+
+		// Run block in BF16.
+		chiron_attn_shear(&q[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+		                   T, m, dH, causal, &y[0]);
+		bf16_round_all(&y[0], y.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_p(&p[t * m], &y[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		potential_f_apply_all(&q[0], &w_p[l][0], &b_p[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_p(&p[t * m], &u[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		potential_f_apply_all(&p[0], &w_q[l][0], &b_q[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_q(&q[t * m], &u[t * m], m);
+		bf16_round_all(&q[0], q.size());
+
+		float* stats_l = &stats[l * T * 2u];
+		glades::chiron::reln_forward(&q[0], &q_tmp[0], stats_l,
+		                              &gamma[l][0], &beta[l][0], T, m, eps);
+		bf16_round_all(&q_tmp[0], q_tmp.size());
+		q.swap(q_tmp);
+	}
+
+	// Inverse loop with per-token correction.
+	std::vector<float> z_fresh(r_sketch, 0.0f);
+	std::vector<float> residual(r_sketch, 0.0f);
+	(void)qSize;
+
+	for (unsigned int ll = 0; ll < L; ++ll)
+	{
+		const unsigned int l = L - 1 - ll;
+
+		// 4^-1 ReLN
+		const float* stats_l = &stats[l * T * 2u];
+		glades::chiron::reln_inverse(&q[0], &q_tmp[0], stats_l,
+		                              &gamma[l][0], &beta[l][0], T, m);
+		bf16_round_all(&q_tmp[0], q_tmp.size());
+		q.swap(q_tmp);
+
+		// 3^-1
+		potential_f_apply_all(&p[0], &w_q[l][0], &b_q[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_q(&q[t * m], &u[t * m], m);
+		bf16_round_all(&q[0], q.size());
+
+		// 2^-1
+		potential_f_apply_all(&q[0], &w_p[l][0], &b_p[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_p(&p[t * m], &u[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		// 1^-1
+		chiron_attn_shear(&q[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+		                   T, m, dH, causal, &y[0]);
+		bf16_round_all(&y[0], y.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_p(&p[t * m], &y[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		// Per-token sketch correction on (q_t, p_t).
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				tok_flat[i]     = q[t * m + i];
+				tok_flat[m + i] = p[t * m + i];
+			}
+			glades::chiron::sketch_project(&S[l][0], &tok_flat[0],
+			                                r_sketch, Ntok, &z_fresh[0]);
+			for (unsigned int k = 0; k < r_sketch; ++k)
+				residual[k] = z_stored[l][t * r_sketch + k] - z_fresh[k];
+			glades::chiron::sketch_lift_add(&S[l][0], &residual[0],
+			                                 r_sketch, Ntok, &tok_flat[0]);
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				q[t * m + i] = tok_flat[i];
+				p[t * m + i] = tok_flat[m + i];
+			}
+		}
+		bf16_round_all(&q[0], q.size());
+		bf16_round_all(&p[0], p.size());
+	}
+
+	std::vector<float> q0_bf16(q0), p0_bf16(p0);
+	bf16_round_all(&q0_bf16[0], q0_bf16.size());
+	bf16_round_all(&p0_bf16[0], p0_bf16.size());
+	const float qe = max_abs_diff(q, q0_bf16);
+	const float pe = max_abs_diff(p, p0_bf16);
+	return (qe > pe) ? qe : pe;
+}
+
+void CHIRONPerTokenSketchBf16Test()
+{
+	const unsigned int T = 6;
+	const unsigned int m = 16;
+	const unsigned int dH = 4;
+	const bool causal = true;
+	const float eps = 1e-4f;
+	const unsigned int L = 12;
+	const unsigned int sketch_seed_base = 5150u;
+
+	// Baselines for comparison.
+	const float bf16_uncorrected =
+	    run_multifullblock_roundtrip(L, T, m, dH, causal, eps, 24601u, true);
+
+	// Global sketch at r=256 (same as Case 10).
+	const float bf16_global_r256 =
+	    run_multifullblock_roundtrip_sketch(L, T, m, dH, causal, eps,
+	                                         24601u, 256u, 111111u);
+
+	// Per-token sketch at r=128 (Ntok=2m=32, so N/r ≈ 0.25 — tight).
+	const float bf16_pertok_r128 =
+	    run_multifullblock_roundtrip_per_token_sketch(
+	        L, T, m, dH, causal, eps, 24601u, 128u, sketch_seed_base);
+
+	// Per-token sketch at r=256 — even tighter.
+	const float bf16_pertok_r256 =
+	    run_multifullblock_roundtrip_per_token_sketch(
+	        L, T, m, dH, causal, eps, 24601u, 256u, sketch_seed_base);
+
+	std::printf("  CHIRON per-token sketch @ L=12: uncorrected=%.3e  "
+	            "global_r256=%.3e  pertok_r128=%.3e  pertok_r256=%.3e\n",
+	            bf16_uncorrected, bf16_global_r256,
+	            bf16_pertok_r128, bf16_pertok_r256);
+
+	char msg[256];
+	// Per-token sketch at r=256 should be better than global sketch at r=256
+	// because effective N is 2m=32 vs. global N=2·T·m=192 — 6× smaller.
+	std::snprintf(msg, sizeof(msg),
+	              "per-token sketch should beat global at same r: "
+	              "global_r256=%.3e pertok_r256=%.3e",
+	              bf16_global_r256, bf16_pertok_r256);
+	ASSERT(msg, bf16_pertok_r256 <= bf16_global_r256);
+
+	// Per-token sketch should beat uncorrected.
+	std::snprintf(msg, sizeof(msg),
+	              "per-token sketch should beat uncorrected: "
+	              "uncorrected=%.3e pertok_r128=%.3e",
+	              bf16_uncorrected, bf16_pertok_r128);
+	ASSERT(msg, bf16_pertok_r128 < bf16_uncorrected);
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -1257,5 +1507,6 @@ void CHIRONUnitTest()
 	CHIRONBf16DriftTest();
 	CHIRONSketchProjectLiftTest();
 	CHIRONSketchCorrectedBf16Test();
+	CHIRONPerTokenSketchBf16Test();
 	std::printf("=== CHIRON tests done ===\n\n");
 }

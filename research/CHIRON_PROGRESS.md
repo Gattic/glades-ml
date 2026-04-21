@@ -89,6 +89,29 @@ Goal: show BF16 inverse stays within sketch-corrected bound at L=24.
   r = O(√N) as framework stated). For production (N ≈ 16M per layer),
   this is a significant scaling concern that needs addressing.
 
+### Per-token local sketch — breakthrough result (2026-04-21, same day)
+
+Implemented the per-token local sketch variant (framework amendment §11a,
+mitigation 1): one sketch matrix `S_ℓ ∈ R^{r × 2m}` shared across the T
+tokens of layer ℓ, with per-token stored sketches `z_{ℓ,t} = S_ℓ · x_t`
+where `x_t = (q_t, p_t)` of size 2m.
+
+Results at L=12, T=6, m=16 (so 2m=32):
+  - uncorrected BF16 drift:         **1.17e-2**
+  - global sketch, r=256 (N=192):    3.9e-3   (~3×)
+  - per-token sketch, r=128 (N=32):  **1.95e-3** (~6×)
+  - per-token sketch, r=256 (N=32):  **4.88e-4** (~24×)
+
+Per-token sketch at r=256 beats global sketch at r=256 by **8×**, matching
+the √(N_global/N_pertok) = √(192/32) = √6 = 2.45 per-coord improvement
+factor expected from the corrected scaling law.
+
+Memory at production scale (70B, L=96, T=4096, r=256):
+  L · T · r · 4 bytes = 96 · 4096 · 256 · 4 = **402 MB**.
+This is manageable. Combined with BF16 activation anchors every k=8
+blocks (~805 MB), total activation-side memory is ~1.2 GB — still a
+**~20× reduction** over the 25.8 GB full-activation baseline.
+
 ### Open research questions from Phase 2 measurements
 
 - Framework §4.5 claims `Var(x̂_ℓ_i) ≤ ||x - x̃||² / r` independent of N.

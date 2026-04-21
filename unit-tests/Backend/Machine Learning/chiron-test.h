@@ -31,6 +31,7 @@ void CHIRONMultiFullBlockRoundtripTest();
 void CHIRONBf16DriftTest();
 void CHIRONSketchProjectLiftTest();
 void CHIRONSketchCorrectedBf16Test();
+void CHIRONPerTokenSketchBf16Test();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
