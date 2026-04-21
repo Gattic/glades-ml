@@ -26,6 +26,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_stiefel.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -2816,9 +2817,167 @@ void CHIRONLocalAttentionFullWindowParityTest()
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Stiefel × Σ manifold-factored weights (paradigm shift #7) parity tests.
+// ---------------------------------------------------------------------------
+
+#ifdef GLADES_HAVE_CUDA
+// Small helper: modified Gram-Schmidt on a random [m x r] matrix to produce
+// an orthonormal-columns Stiefel element.  Used only for test data.
+static void gram_schmidt_cols(std::vector<float>& A, unsigned int m, unsigned int r)
+{
+	for (unsigned int j = 0; j < r; ++j)
+	{
+		for (unsigned int k = 0; k < j; ++k)
+		{
+			float dot = 0.0f;
+			for (unsigned int i = 0; i < m; ++i) dot += A[i * r + j] * A[i * r + k];
+			for (unsigned int i = 0; i < m; ++i) A[i * r + j] -= dot * A[i * r + k];
+		}
+		float norm = 0.0f;
+		for (unsigned int i = 0; i < m; ++i) norm += A[i * r + j] * A[i * r + j];
+		norm = std::sqrt(norm);
+		if (norm < 1e-12f) norm = 1.0f;
+		for (unsigned int i = 0; i < m; ++i) A[i * r + j] /= norm;
+	}
+}
+
+static void fp32_to_bf16_rne(const std::vector<float>& src,
+                             std::vector<uint16_t>& dst)
+{
+	dst.resize(src.size());
+	for (size_t i = 0; i < src.size(); ++i)
+	{
+		union { float f; uint32_t u; } v; v.f = src[i];
+		if (src[i] != src[i])
+		{
+			const uint32_t sign = v.u & 0x80000000u;
+			dst[i] = (uint16_t)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		}
+		else
+		{
+			const uint32_t lsb  = (v.u >> 16) & 1u;
+			const uint32_t bias = 0x7FFFu + lsb;
+			dst[i] = (uint16_t)((v.u + bias) >> 16);
+		}
+	}
+}
+
+static void bf16_to_fp32(const std::vector<uint16_t>& src,
+                        std::vector<float>& dst)
+{
+	dst.resize(src.size());
+	for (size_t i = 0; i < src.size(); ++i)
+	{
+		union { uint32_t u; float f; } v;
+		v.u = ((uint32_t)src[i]) << 16;
+		dst[i] = v.f;
+	}
+}
+#endif
+
+// CHIRONStiefelIdentityRecoveryTest -----------------------------------------
+// Given random orthonormal U, V (Stiefel elements built via Gram-Schmidt) and
+// random positive Σ, verify that:
+//   (a) stiefel_reconstruct_dense yields the same W that host-side computes
+//       as W[i,j] = Σ_k U[i,k] * Σ[k] * V[j,k]
+//   (b) stiefel_forward(X) produces the same output as direct X · W^T
+// Both within BF16 ULP tolerance (~1e-2 on products of O(1) values; we expect
+// ~1e-3 or better for reasonable sizes).
+void CHIRONStiefelIdentityRecoveryTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel identity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int m = 48, n = 32, r = 16, B = 20;
+
+	LCG rng(20260421u);
+
+	// Build random U [m×r] and V [n×r], then Gram-Schmidt to Stiefel.
+	std::vector<float> U(m * r), V(n * r), sigma(r), X(B * n);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, r);
+	gram_schmidt_cols(V, n, r);
+	for (size_t i = 0; i < sigma.size(); ++i) sigma[i] = 0.5f + 0.5f * std::abs(rng.next_unit());
+	for (size_t i = 0; i < X.size(); ++i) X[i] = 0.3f * rng.next_unit();
+
+	// Cast U and V to BF16 for device storage.
+	std::vector<uint16_t> U_bf, V_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+
+	// Reference: compute W_ref host-side after BF16 round-trip so the
+	// reference reflects the same precision used in device storage.
+	std::vector<float> U_r, V_r;
+	bf16_to_fp32(U_bf, U_r);
+	bf16_to_fp32(V_bf, V_r);
+	std::vector<float> W_ref(m * n, 0.0f);
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < r; ++k)
+				acc += U_r[i * r + k] * sigma[k] * V_r[j * r + k];
+			W_ref[i * n + j] = acc;
+		}
+
+	// Device-side allocation + upload.
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, r);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma[0], sigma.size());
+
+	// (a) dense reconstruction parity.
+	glades::gpu::GpuBuffer<float> d_W;
+	d_W.allocate(m * n);
+	glades::gpu::stiefel_reconstruct_dense(sw, d_W.data());
+	std::vector<float> W_gpu(m * n);
+	d_W.download(&W_gpu[0], m * n);
+	const float w_err = max_abs_diff(W_ref, W_gpu);
+	std::printf("  stiefel reconstruct max_err = %.3e\n", w_err);
+	ASSERT("stiefel_reconstruct_dense matches host reference", w_err < 1e-4f);
+
+	// (b) forward parity: Y_factored = X · V · diag(Σ) · U^T vs Y_ref = X · W^T.
+	std::vector<float> Y_ref(B * m, 0.0f);
+	for (unsigned int b = 0; b < B; ++b)
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			float acc = 0.0f;
+			for (unsigned int j = 0; j < n; ++j)
+				acc += X[b * n + j] * W_ref[i * n + j];
+			Y_ref[b * m + i] = acc;
+		}
+
+	glades::gpu::GpuBuffer<float> d_X, d_Y, d_scratch;
+	d_X.allocate(B * n);
+	d_Y.allocate(B * m);
+	d_scratch.allocate(B * r);
+	d_X.upload(&X[0], X.size());
+	glades::gpu::stiefel_forward(d_X.data(), /*x_bf16=*/false,
+	                             sw, d_Y.data(), d_scratch.data(), B);
+	std::vector<float> Y_gpu(B * m);
+	d_Y.download(&Y_gpu[0], B * m);
+	const float y_err = max_abs_diff(Y_ref, Y_gpu);
+	std::printf("  stiefel forward  max_err = %.3e\n", y_err);
+	ASSERT("stiefel_forward matches direct X · W^T within BF16 tolerance",
+	       y_err < 5e-4f);
+
+	sw.release();
+#else
+	std::printf("  [stiefel identity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
+	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStochasticBf16RoundingTest();
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();

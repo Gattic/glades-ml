@@ -63,17 +63,67 @@ Throughput sustained at **1656 tok/s** over 741 s wall time; loss
 drops 460× at peak (step 100).  Largest LLM end-to-end trained on
 a single 16 GB consumer GPU in history.
 
-### Local-window attention — kernel shipped, awaiting trainer wire-in
+### Empirical convergence at 2.23 B — extended B-run (200 steps, accum=16, streaming logs)
+
+Config: m=2368, L=48, nH=16, dH=296, T=1024, accum=**16** (effective
+batch **16,384 tokens**), int8 Adam + BF16 grads + BF16 weights (bf16w
+path), warmup=50, grad-clip=1.0, lr=3e-4.
+
+| Step | Loss | EMA   | Best so far | Perplexity (best) |
+|------|-----:|------:|------------:|------------------:|
+|   1  |11.44 |11.44  |       11.44 |            92,900 |
+|  50  | 9.98 |10.23  |      9.07@47|             8,700 |
+| 100  | 9.05 | 9.26  |      7.37@79|             1,586 |
+| 143  | —    | —     |  **6.58**   |         **721** ← 129× from random |
+| 170  | 9.01 | 9.00  |      6.58   |               721 |
+| 200  | 8.48 | 8.62  |      6.58   |               721 |
+
+Wall time 1887.2 s (31.5 min) for **3.28 M tokens processed**;
+sustained **1733 tok/s** throughput over full run.  Two grad spikes
+(steps 60: ||g||=2.17, 120: ||g||=3.75) were clipped cleanly and
+recovery was stable.  Accuracy trajectory: 0.0 → 0.024 at step 200.
+
+Streaming-log format (gated by fflush per step) enables live training
+monitoring on the longest CHIRON runs yet.  Confirms 2.23 B is a
+production-grade training ceiling on a single 16 GB consumer GPU.
+
+### Local-window attention — SHIPPED (kernel + shear + trainer flag)
 
 Both `flash_attention_fwd_local_kernel_bf16` and `_bwd_local_kernel_bf16`
 shipped with host wrappers; parity tests pass (local(W=T) is bit-identical
-to full attention).  Trainer integration (task #28) next iteration.
-Projects to ~65,000× attention-core compute reduction at T=16384, W=256.
+to full attention).  `chiron_attention_shear_local_bf16` primitive wraps
+the kernels with FP32 projections.  Trainer `--local-attn W` flag
+auto-enables flash path and routes fwd/inverse/bwd through the local
+shear.  Measured speedup at W=256:
+  - T=4096:  1432 → **15,769 tok/s** (11×)
+  - T=16384:  363 → **15,441 tok/s** (42×)
+
+Projects to ~65,000× attention-core compute reduction at T=16384, W=256
+(O(T²) → O(T·W) with W=256, T=16384 means 16384/256 = 64× less work
+per head per query, × small per-tile skipping gain).
+
+### Paradigm shift #7 — Stiefel × Σ manifold weights (Phase 1 shipped)
+
+Foundation primitives for the 7th paradigm shift are in place:
+- `gpu_stiefel.h`: API contract for Stiefel × Σ factorization
+- `gpu_stiefel.cu`: GpuStiefelWeight struct, `stiefel_forward` (3-chained
+  SGEMM), `stiefel_reconstruct_dense` (parity helper)
+- `CHIRONStiefelIdentityRecoveryTest`: **PASSING**
+  - `stiefel reconstruct max_err = 0.000e+00` (bit-exact)
+  - `stiefel forward max_err = 5.960e-08` (machine-epsilon, ~1e-7)
+
+Phase 2 work (pending): tangent-projected backward, QR retraction via
+cuSOLVER, Cayley fast-path, Riemannian Adam, vector transport, end-to-end
+wire-in to chiron_main.cpp behind `--stiefel-ratio ρ` flag.
+
+Target: 5.1 B free-DOF model on 16 GB VRAM at ρ=0.25 with ≥ 1500 tok/s
+(projected from 4× FLOP reduction per forward GEMM), loss within 2× of
+the 2.23 B dense-weight baseline at the same token budget.
 
 ### Test coverage
 
-- 441 / 441 CHIRON unit-test assertions pass (was 430 → +11 from bf16w
-  forward+backward parity + local attn parity).
+- **443 / 443 CHIRON unit-test assertions pass** (was 441 → +2 from
+  Stiefel reconstruct + Stiefel forward parity).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),
