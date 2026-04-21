@@ -15,6 +15,7 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
 #include <cstdio>
 #include <cstring>
 
@@ -464,9 +465,203 @@ void stiefel_backward_project(const float*, const void*, bool,
 	// Legacy symbol — unused for now.
 }
 
-void stiefel_retract_qr(GpuStiefelWeight&, const float*, const float*, const float*)
+// ===========================================================================
+// QR retraction U ← qf(U + η_U), V ← qf(V + η_V), Σ ← Σ ⊙ exp(η_Σ / Σ)
+//
+// cuSOLVER works in column-major. Our A [rows × r] stored row-major has the
+// same byte pattern as A^T [r × rows] stored column-major. Calling sgeqrf
+// with m=rows, n=r on the row-major buffer interpreted as column-major
+// [rows × r] actually QRs the matrix whose columns are our rows. We want
+// the thin QR of the row-major [rows × r] (orthonormal columns). Simplest:
+// maintain a column-major scratch and transpose in/out via a trivial kernel.
+// ===========================================================================
+
+namespace {
+
+__global__ void k_transpose_2d(const float* in, float* out,
+                               unsigned int rows, unsigned int cols)
 {
-	// TODO Phase-2: implement cuSOLVER sgeqrf + sorgqr retraction.
+	unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= rows || j >= cols) return;
+	// out is [cols × rows] row-major = [rows × cols] column-major
+	out[j * rows + i] = in[i * cols + j];
+}
+
+__global__ void k_add_inplace(float* dst, const float* add, size_t n)
+{
+	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n) dst[idx] += add[idx];
+}
+
+__global__ void k_sigma_fisher_rao(float* sigma, const float* eta,
+                                   unsigned int r)
+{
+	unsigned int k = blockIdx.x * blockDim.x + threadIdx.x;
+	if (k >= r) return;
+	const float sig = sigma[k];
+	const float exp_arg = eta[k] / (sig + 1e-12f);
+	// Clip extremely large exponents to keep Σ bounded during large updates.
+	const float capped = (exp_arg > 10.0f) ? 10.0f :
+	                     (exp_arg < -10.0f ? -10.0f : exp_arg);
+	sigma[k] = sig * expf(capped);
+}
+
+static cusolverDnHandle_t g_stiefelSolver = 0;
+static bool g_stiefelSolverReady = false;
+static float* g_stiefelQrWork = nullptr;
+static size_t g_stiefelQrWorkCap = 0;
+static int*   g_stiefelInfo = nullptr;
+
+static bool stiefel_solver_init()
+{
+	if (!g_stiefelSolverReady)
+	{
+		if (cusolverDnCreate(&g_stiefelSolver) != CUSOLVER_STATUS_SUCCESS)
+			return false;
+		g_stiefelSolverReady = true;
+	}
+	cusolverDnSetStream(g_stiefelSolver, computeStream());
+	if (g_stiefelInfo == nullptr)
+	{
+		if (cudaMalloc(&g_stiefelInfo, sizeof(int)) != cudaSuccess)
+			return false;
+	}
+	return true;
+}
+
+static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
+                                   unsigned int rows, unsigned int r,
+                                   const float* eta)
+{
+	if (!stiefel_solver_init()) return false;
+
+	// Stage A [rows × r] FP32.
+	static thread_local float* A_f32 = nullptr;
+	static thread_local size_t A_f32_cap = 0;
+	// Column-major scratch [rows × r].
+	static thread_local float* A_col = nullptr;
+	static thread_local size_t A_col_cap = 0;
+
+	const size_t sz = size_t(rows) * r;
+	if (sz > A_f32_cap)
+	{
+		if (A_f32) cudaFree(A_f32);
+		if (cudaMalloc(&A_f32, sz * sizeof(float)) != cudaSuccess) return false;
+		A_f32_cap = sz;
+	}
+	if (sz > A_col_cap)
+	{
+		if (A_col) cudaFree(A_col);
+		if (cudaMalloc(&A_col, sz * sizeof(float)) != cudaSuccess) return false;
+		A_col_cap = sz;
+	}
+
+	// 1. A_f32 = BF16(A) + eta
+	cast_bf16_to_f32(A_bf, A_f32, sz);
+	if (eta != nullptr)
+	{
+		const size_t n = sz;
+		dim3 block(256);
+		dim3 grid((n + block.x - 1) / block.x);
+		k_add_inplace<<<grid, block>>>(A_f32, eta, n);
+		cudaGetLastError();
+	}
+
+	// 2. Transpose to column-major [rows × r] in A_col (so sgeqrf reads it
+	// correctly as column-major [rows × r]).
+	{
+		dim3 block(16, 16);
+		dim3 grid((r + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
+		k_transpose_2d<<<grid, block>>>(A_f32, A_col, rows, r);
+		cudaGetLastError();
+	}
+
+	// 3. Query sgeqrf workspace.
+	int lwork_geqrf = 0, lwork_orgqr = 0;
+	if (cusolverDnSgeqrf_bufferSize(g_stiefelSolver, rows, r,
+	                                A_col, rows, &lwork_geqrf)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	if (cusolverDnSorgqr_bufferSize(g_stiefelSolver, rows, r, r,
+	                                A_col, rows, tau, &lwork_orgqr)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	const int lwork = lwork_geqrf > lwork_orgqr ? lwork_geqrf : lwork_orgqr;
+
+	if (size_t(lwork) > g_stiefelQrWorkCap)
+	{
+		if (g_stiefelQrWork) cudaFree(g_stiefelQrWork);
+		if (cudaMalloc(&g_stiefelQrWork, lwork * sizeof(float)) != cudaSuccess)
+			return false;
+		g_stiefelQrWorkCap = lwork;
+	}
+
+	// 4. QR factorization in place.
+	cusolverStatus_t st = cusolverDnSgeqrf(g_stiefelSolver, rows, r, A_col, rows, tau,
+	                     g_stiefelQrWork, lwork, g_stiefelInfo);
+	if (st != CUSOLVER_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[stiefel-qr] sgeqrf status=%d rows=%u r=%u\n",
+		        (int)st, rows, r);
+		return false;
+	}
+	int host_info = 0;
+	cudaMemcpy(&host_info, g_stiefelInfo, sizeof(int), cudaMemcpyDeviceToHost);
+	if (host_info != 0)
+	{
+		fprintf(stderr, "[stiefel-qr] sgeqrf info=%d rows=%u r=%u\n",
+		        host_info, rows, r);
+		return false;
+	}
+
+	// 5. Form Q explicitly.
+	st = cusolverDnSorgqr(g_stiefelSolver, rows, r, r, A_col, rows, tau,
+	                     g_stiefelQrWork, lwork, g_stiefelInfo);
+	if (st != CUSOLVER_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[stiefel-qr] sorgqr status=%d rows=%u r=%u\n",
+		        (int)st, rows, r);
+		return false;
+	}
+	cudaMemcpy(&host_info, g_stiefelInfo, sizeof(int), cudaMemcpyDeviceToHost);
+	if (host_info != 0)
+	{
+		fprintf(stderr, "[stiefel-qr] sorgqr info=%d rows=%u r=%u\n",
+		        host_info, rows, r);
+		return false;
+	}
+
+	// 6. Transpose back to row-major and cast to BF16.
+	{
+		dim3 block(16, 16);
+		dim3 grid((rows + block.x - 1) / block.x, (r + block.y - 1) / block.y);
+		// A_col is column-major [rows × r] = row-major [r × rows]; transpose
+		// back into A_f32 row-major [rows × r].
+		k_transpose_2d<<<grid, block>>>(A_col, A_f32, r, rows);
+		cudaGetLastError();
+	}
+	cast_f32_to_bf16(A_f32, A_bf, sz);
+	return true;
+}
+
+} // anonymous namespace
+
+void stiefel_retract_qr(GpuStiefelWeight& s,
+                        const float* eta_U,
+                        const float* eta_sigma,
+                        const float* eta_V)
+{
+	if (!s.allocated()) return;
+	stiefel_qr_retract_one(s.U.data(), s.qr_tau_U.data(), s.m, s.r, eta_U);
+	stiefel_qr_retract_one(s.V.data(), s.qr_tau_V.data(), s.n, s.r, eta_V);
+	if (eta_sigma != nullptr)
+	{
+		dim3 block(64);
+		dim3 grid((s.r + block.x - 1) / block.x);
+		k_sigma_fisher_rao<<<grid, block>>>(s.sigma.data(), eta_sigma, s.r);
+		cudaGetLastError();
+	}
 }
 
 void stiefel_retract_cayley(GpuStiefelWeight&, const float*, const float*, const float*,

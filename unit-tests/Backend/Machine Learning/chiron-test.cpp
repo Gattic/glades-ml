@@ -3249,12 +3249,140 @@ void CHIRONStiefelTangentProjectionTest()
 #endif
 }
 
+// CHIRONStiefelQRRetractionTest ---------------------------------------------
+// Verifies that after QR retraction U ← qf(U + η_U), the columns of U are
+// orthonormal to within BF16 round-trip precision.  Tests two regimes:
+//   (a) η = 0  → U stays orthonormal (idempotency of qf on Stiefel input)
+//   (b) η random with ‖η‖ ~ 0.3  → A = U + η is notably non-orthonormal;
+//       after qf, it is orthonormal again.
+void CHIRONStiefelQRRetractionTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel qr] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m = 64, n = 40, r = 16;
+
+	LCG rng(2026042100u);
+	std::vector<float> U(m * r), V(n * r);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, r);
+	gram_schmidt_cols(V, n, r);
+
+	std::vector<uint16_t> U_bf, V_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+	std::vector<float> sigma_stub(r, 1.0f);
+
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, r);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma_stub[0], sigma_stub.size());
+
+	// ---- (a) Zero eta: retraction should leave U/V orthonormal.
+	glades::gpu::stiefel_retract_qr(sw, (const float*)0,
+	                                (const float*)0,
+	                                (const float*)0);
+
+	std::vector<uint16_t> U_after_bf(m * r), V_after_bf(n * r);
+	sw.U.download(&U_after_bf[0], U_after_bf.size());
+	sw.V.download(&V_after_bf[0], V_after_bf.size());
+	std::vector<float> Uaft, Vaft;
+	bf16_to_fp32(U_after_bf, Uaft);
+	bf16_to_fp32(V_after_bf, Vaft);
+
+	// Host-side: ‖U^T U − I_r‖_F.
+	float drift_U = 0.0f, drift_V = 0.0f;
+	for (unsigned int i = 0; i < r; ++i)
+		for (unsigned int j = 0; j < r; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				acc += Uaft[k * r + i] * Uaft[k * r + j];
+			const float target = (i == j) ? 1.0f : 0.0f;
+			drift_U += (acc - target) * (acc - target);
+		}
+	drift_U = std::sqrt(drift_U);
+	for (unsigned int i = 0; i < r; ++i)
+		for (unsigned int j = 0; j < r; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < n; ++k)
+				acc += Vaft[k * r + i] * Vaft[k * r + j];
+			const float target = (i == j) ? 1.0f : 0.0f;
+			drift_V += (acc - target) * (acc - target);
+		}
+	drift_V = std::sqrt(drift_V);
+	std::printf("  stiefel QR (eta=0): ‖U^T U − I‖=%.3e  ‖V^T V − I‖=%.3e\n",
+	            drift_U, drift_V);
+	// BF16 cast afterward limits orthonormality to ~ sqrt(m*r) * 2^{-8} ~ 1e-1.
+	ASSERT("QR-retracted U orthonormal within BF16 bound", drift_U < 1.5e-1f);
+	ASSERT("QR-retracted V orthonormal within BF16 bound", drift_V < 1.5e-1f);
+
+	// ---- (b) Random eta with notable magnitude: verifies qf re-orthonormalizes.
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+
+	std::vector<float> eta_U(m * r), eta_V(n * r), eta_sigma(r, 0.0f);
+	for (size_t i = 0; i < eta_U.size(); ++i) eta_U[i] = 0.15f * rng.next_unit();
+	for (size_t i = 0; i < eta_V.size(); ++i) eta_V[i] = 0.15f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_etaU, d_etaV, d_etaS;
+	d_etaU.allocate(m * r); d_etaV.allocate(n * r); d_etaS.allocate(r);
+	d_etaU.upload(&eta_U[0], eta_U.size());
+	d_etaV.upload(&eta_V[0], eta_V.size());
+	d_etaS.upload(&eta_sigma[0], eta_sigma.size());
+
+	glades::gpu::stiefel_retract_qr(sw, d_etaU.data(), d_etaS.data(), d_etaV.data());
+
+	sw.U.download(&U_after_bf[0], U_after_bf.size());
+	sw.V.download(&V_after_bf[0], V_after_bf.size());
+	bf16_to_fp32(U_after_bf, Uaft);
+	bf16_to_fp32(V_after_bf, Vaft);
+
+	drift_U = 0.0f; drift_V = 0.0f;
+	for (unsigned int i = 0; i < r; ++i)
+		for (unsigned int j = 0; j < r; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				acc += Uaft[k * r + i] * Uaft[k * r + j];
+			const float target = (i == j) ? 1.0f : 0.0f;
+			drift_U += (acc - target) * (acc - target);
+		}
+	drift_U = std::sqrt(drift_U);
+	for (unsigned int i = 0; i < r; ++i)
+		for (unsigned int j = 0; j < r; ++j)
+		{
+			float acc = 0.0f;
+			for (unsigned int k = 0; k < n; ++k)
+				acc += Vaft[k * r + i] * Vaft[k * r + j];
+			const float target = (i == j) ? 1.0f : 0.0f;
+			drift_V += (acc - target) * (acc - target);
+		}
+	drift_V = std::sqrt(drift_V);
+	std::printf("  stiefel QR (eta~0.15): ‖U^T U − I‖=%.3e  ‖V^T V − I‖=%.3e\n",
+	            drift_U, drift_V);
+	ASSERT("QR re-orthonormalizes perturbed U", drift_U < 1.5e-1f);
+	ASSERT("QR re-orthonormalizes perturbed V", drift_V < 1.5e-1f);
+
+	sw.release();
+#else
+	std::printf("  [stiefel qr] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
+	CHIRONStiefelQRRetractionTest();
 	CHIRONStochasticBf16RoundingTest();
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();

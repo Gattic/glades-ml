@@ -125,11 +125,21 @@ Foundation primitives for the 7th paradigm shift are in place:
     QR retraction each Adam step
   - Implemented via simplified canonical-metric form:
     `proj_U(G) = G − U · sym(U^T G)` = 2 cuBLAS GEMMs + 1 r×r symmetrizer
+- `CHIRONStiefelQRRetractionTest`: **PASSING** (Phase 2c)
+  - Zero-η regime: `‖U^T U − I‖_F = 4.3e-3`, `‖V^T V − I‖_F = 4.9e-3`
+    — qf is near-idempotent on already-orthonormal input
+  - η ≈ 0.15 regime: `‖U^T U − I‖_F = 4.6e-3`, `‖V^T V − I‖_F = 6.8e-3`
+    — qf successfully re-orthonormalizes notably-perturbed input
+  - Cost: cusolverDnSgeqrf + cusolverDnSorgqr (column-major), bracketed by
+    row-major↔column-major transpose kernels. Shared cuSOLVER handle +
+    workspace; info-check synchronizes between successive retractions
+    (required — without sync U/V workspaces race on the shared buffer)
+  - Fisher–Rao Σ update `Σ ← Σ ⊙ exp(η_Σ / Σ)` with ±10 arg-capping
+    for numerical stability
 
-Phase 2 remaining: QR retraction via cuSOLVER (Phase 2c), Cayley
-fast-path (Phase 2d), Riemannian Adam with int8 packed momenta (2e),
-vector transport (2f), end-to-end wire-in to chiron_main.cpp behind
-`--stiefel-ratio ρ` flag (Phase 2g).
+Phase 2 remaining: Cayley fast-path (Phase 2d), Riemannian Adam with int8
+packed momenta (2e), vector transport (2f), end-to-end wire-in to
+chiron_main.cpp behind `--stiefel-ratio ρ` flag (Phase 2g).
 
 Target: 5.1 B free-DOF model on 16 GB VRAM at ρ=0.25 with ≥ 1500 tok/s
 (projected from 4× FLOP reduction per forward GEMM), loss within 2× of
@@ -137,8 +147,8 @@ the 2.23 B dense-weight baseline at the same token budget.
 
 ### Test coverage
 
-- **451 / 451 CHIRON unit-test assertions pass** (was 447 → +4 from
-  Stiefel tangent projection skew-symmetry on U/V + idempotence on U/V).
+- **455 / 455 CHIRON unit-test assertions pass** (was 451 → +4 from
+  Stiefel QR retraction drift-bounds on zero-η and η≈0.15 regimes).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),
