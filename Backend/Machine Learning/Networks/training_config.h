@@ -1927,6 +1927,54 @@ struct HeliosConfig
 	}
 };
 
+// CHIRON reversible-flow transformer configuration.  When enabled, the
+// training loop treats the transformer as a sequence of symplectic
+// bijective blocks and reconstructs activations during backward via the
+// block inverse rather than storing them (framework:
+// research/CHIRON_framework.md).
+//
+// See research/CHIRON_PROGRESS.md for the current implementation phase.
+// Default = disabled: existing code paths are untouched when enable=false.
+struct ChironConfig
+{
+	// Master enable.  When false, CHIRON machinery is inert and the
+	// standard transformer block path is used unchanged.
+	bool enable;
+
+	// Rank of the per-layer sketch used for BF16 reconstruction-error
+	// correction (framework §4.4 / amendment §11a). Ignored when enable
+	// is false or when anchorPeriod == 1.
+	int sketchRank;
+
+	// Per-token local sketch vs global block sketch. Per-token is the
+	// practical choice (framework amendment §11a mitigation 1): the
+	// effective sketch input dim shrinks from 2·T·m to 2·m, giving
+	// √(T)× tighter per-coord correction at the same rank.
+	bool perTokenSketch;
+
+	// Anchor period k (framework §6.4 remedy 2 / amendment §11a
+	// mitigation 2). Every k-th block stores a full BF16 activation
+	// "anchor" so drift accumulation is capped at length k. With k=1
+	// every block is an anchor (degenerates to full-activation
+	// training); with k=L no anchors (pure sketch-corrected inverse).
+	// Default 8 is the practical sweet spot per the framework.
+	int anchorPeriod;
+
+	// Deterministic seed base for sketch matrix generation. The actual
+	// per-layer seed is `sketchSeed + layerIndex`. Sketches are
+	// regenerated on demand from this seed rather than being stored.
+	unsigned int sketchSeed;
+
+	ChironConfig()
+	    : enable(false),
+	      sketchRank(256),
+	      perTokenSketch(true),
+	      anchorPeriod(8),
+	      sketchSeed(0xC4120Fu)
+	{
+	}
+};
+
 struct TrainingConfig
 {
 	// If > 0, overrides NNInfo::batchSize for this run.
@@ -2001,6 +2049,11 @@ struct TrainingConfig
 	// during backward instead of storing all per-layer intermediates.
 	bool gradientCheckpointing;
 
+	// CHIRON reversible-flow transformer configuration. When enabled, the
+	// transformer backward reconstructs activations via the block inverse
+	// rather than storing them (research/CHIRON_framework.md).
+	ChironConfig chiron;
+
 	// CNN run config (used only for TYPE_CNN).
 	CNNConfig cnn;
 
@@ -2020,6 +2073,7 @@ struct TrainingConfig
 	      warmup(),
 	      ddp(),
 	      gradientCheckpointing(false),
+	      chiron(),
 	      cnn()
 	{
 	}
