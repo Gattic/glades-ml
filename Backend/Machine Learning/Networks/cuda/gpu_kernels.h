@@ -231,6 +231,19 @@ bool flash_attention_multihead_forward_bf16(const uint16_t* Q, const uint16_t* K
                                             int dHead, int dModel, int dModelKV,
                                             bool causal, float* O);
 
+// Local-window BF16 flash attention.  Each query attends only to keys
+// within ±windowSize tokens (causal: [q-W, q]; non-causal: [q-W, q+W]).
+// Tiles falling entirely outside the window are skipped — compute goes
+// from O(T·T·dH) to O(T·W·dH), a 10-100× reduction at long context.
+// windowSize <= 0 or >= T falls back to full attention.
+// See research/SUBQUADRATIC_ATTENTION_DESIGN.md.
+bool flash_attention_multihead_forward_bf16_local(const uint16_t* Q, const uint16_t* K,
+                                                   const uint16_t* V,
+                                                   int T, int nHeads, int nKVHeads,
+                                                   int dHead, int dModel, int dModelKV,
+                                                   bool causal, int windowSize,
+                                                   float* O);
+
 // BF16-input backward variant. Q/K/V BF16; O/dO/dQ/dK/dV FP32 (each loaded
 // or written once so the traffic savings are negligible there). Returns
 // false if the kernel cannot be launched for the requested shape (caller
@@ -447,6 +460,7 @@ inline bool flash_attention_forward(const float*, const float*, const float*, in
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
 inline bool flash_attention_multihead_forward(const float*, const float*, const float*, int, int, int, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_multihead_forward_bf16(const unsigned short*, const unsigned short*, const unsigned short*, int, int, int, int, int, int, bool, float*) { return false; }
+inline bool flash_attention_multihead_forward_bf16_local(const unsigned short*, const unsigned short*, const unsigned short*, int, int, int, int, int, int, bool, int, float*) { return false; }
 inline bool flash_attention_multihead_backward_bf16(const unsigned short*, const unsigned short*, const unsigned short*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 inline bool flash_attention_multihead_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 

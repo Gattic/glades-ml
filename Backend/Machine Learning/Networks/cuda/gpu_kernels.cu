@@ -2727,6 +2727,129 @@ __global__ void flash_attention_fwd_multiq_kernel_bf16(
 	}
 }
 
+// Local-window BF16 flash attention forward.  Each query attends to keys in
+// [q - windowSize, q] (causal) or [q - windowSize, q + windowSize] (non-causal).
+// Skips tiles that fall entirely outside the window, giving an O(T·W) compute
+// profile instead of O(T²).  For windowSize <= 0, degenerates to full
+// attention (same output as the non-local kernel).  See
+// research/SUBQUADRATIC_ATTENTION_DESIGN.md for the full rationale.
+template <int QROWS>
+__global__ void flash_attention_fwd_local_kernel_bf16(
+    const uint16_t* __restrict__ Q,
+    const uint16_t* __restrict__ K,
+    const uint16_t* __restrict__ V,
+    int T, int nHeads, int nKVHeads,
+    int dHead, int dModel, int dModelKV,
+    int causal, int windowSize,
+    int flashTile,
+    float* __restrict__ O)
+{
+	const int qBlock = static_cast<int>(blockIdx.x);
+	const int h = static_cast<int>(blockIdx.y);
+	if (h >= nHeads) return;
+
+	const int warpId = static_cast<int>(threadIdx.x) >> 5;
+	const int laneId = static_cast<int>(threadIdx.x) & 31;
+	const int q = qBlock * QROWS + warpId;
+	const bool myRowActive = (q < T);
+
+	extern __shared__ float smem[];
+	float* sK = smem;
+	float* sV = sK + flashTile * dHead;
+	float* sO = sV + flashTile * dHead;
+	float* myO = sO + warpId * dHead;
+
+	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
+	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
+
+	const uint16_t* qRow = myRowActive
+	    ? (Q + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead)
+	    : Q;
+	float* oRowGlobal = myRowActive
+	    ? (O + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead)
+	    : nullptr;
+
+	for (int d = laneId; d < dHead; d += 32)
+		myO[d] = 0.0f;
+
+	float runMax = -FLT_MAX;
+	float runSum = 0.0f;
+
+	const float scale = rsqrtf(static_cast<float>(dHead));
+
+	// Compute this query row's window: [kLo, kHi).
+	// windowSize <= 0 → full attention.
+	const int kLo_row = (windowSize > 0 && q > windowSize) ? (q - windowSize) : 0;
+	const int kHi_row_raw = causal
+	    ? (q + 1)
+	    : (windowSize > 0 ? (q + windowSize + 1) : T);
+	const int kHi_row = (kHi_row_raw > T) ? T : kHi_row_raw;
+
+	// For cross-warp tile loading we use the UNION across the QROWS warps in this block:
+	// the first query in the block has the lowest row-kLo; the last has the highest row-kHi.
+	const int qBlockStart = qBlock * QROWS;
+	const int qBlockEnd = qBlockStart + QROWS - 1;  // inclusive
+	const int qBlockEndCap = (qBlockEnd < T - 1) ? qBlockEnd : (T - 1);
+	const int blockKLo = (windowSize > 0 && qBlockStart > windowSize) ? (qBlockStart - windowSize) : 0;
+	const int blockKHi_raw = causal
+	    ? (qBlockEndCap + 1)
+	    : (windowSize > 0 ? (qBlockEndCap + windowSize + 1) : T);
+	const int blockKHi = (blockKHi_raw > T) ? T : blockKHi_raw;
+
+	const int numTiles = (blockKHi - blockKLo + flashTile - 1) / flashTile;
+
+	for (int tile = 0; tile < numTiles; ++tile) {
+		const int kStart = blockKLo + tile * flashTile;
+		int tileLen = flashTile;
+		if (kStart + tileLen > blockKHi) tileLen = blockKHi - kStart;
+
+		const int loadCount = tileLen * dHead;
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = bf16_as_float(K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd]);
+		}
+		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
+			const int vr = i / dHead;
+			const int vd = i % dHead;
+			sV[i] = bf16_as_float(V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd]);
+		}
+		__syncthreads();
+
+		if (myRowActive) {
+			for (int j = 0; j < tileLen; ++j) {
+				const int kIdx = kStart + j;
+				// Skip if outside this row's window — each row has its own
+				// window bounds (kLo_row, kHi_row) narrower than the block-
+				// level (blockKLo, blockKHi).
+				if (kIdx < kLo_row) continue;
+				if (kIdx >= kHi_row) break;   // sorted order; no more valid
+
+				float partial = 0.0f;
+				for (int d = laneId; d < dHead; d += 32)
+					partial += bf16_as_float(qRow[d]) * sK[j * dHead + d];
+				const float dot = flash_warp_reduce_sum(partial) * scale;
+
+				const float prevMax = runMax;
+				if (dot > runMax) runMax = dot;
+				const float exp_prev = expf(prevMax - runMax);
+				const float exp_cur  = expf(dot - runMax);
+				runSum = runSum * exp_prev + exp_cur;
+
+				for (int d = laneId; d < dHead; d += 32)
+					myO[d] = myO[d] * exp_prev + exp_cur * sV[j * dHead + d];
+			}
+		}
+		__syncthreads();
+	}
+
+	if (myRowActive) {
+		const float invSum = (runSum > 0.0f) ? (1.0f / runSum) : 0.0f;
+		for (int d = laneId; d < dHead; d += 32)
+			oRowGlobal[d] = myO[d] * invSum;
+	}
+}
+
 // BF16-input multi-query flash attention backward. Q/K/V are BF16 in global
 // memory (the dominant memory-traffic tensors in backward, loaded in both
 // pass 1 and pass 2). O, dO, dQ, dK, dV stay FP32 since they are each loaded
@@ -2955,6 +3078,48 @@ bool flash_attention_multihead_forward_bf16(const uint16_t* Q, const uint16_t* K
 	const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
 	flash_attention_fwd_multihead_kernel_bf16<<<grid, block, smemBytes, computeStream()>>>(
 		Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0, flashTile, O);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Local-window BF16 flash attention forward wrapper.  windowSize <= 0 falls
+// back to full attention via flash_attention_multihead_forward_bf16.
+bool flash_attention_multihead_forward_bf16_local(const uint16_t* Q, const uint16_t* K,
+                                                   const uint16_t* V,
+                                                   int T, int nHeads, int nKVHeads,
+                                                   int dHead, int dModel, int dModelKV,
+                                                   bool causal, int windowSize,
+                                                   float* O)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
+		return true;
+	if (windowSize <= 0 || windowSize >= T) {
+		return flash_attention_multihead_forward_bf16(
+		    Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal, O);
+	}
+
+	const size_t sOBytes = static_cast<size_t>(kFlashQRows) * static_cast<size_t>(dHead) * sizeof(float);
+	int dev = 0;
+	cudaGetDevice(&dev);
+	int maxOptin = 48 * 1024;
+	cudaDeviceGetAttribute(&maxOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+	const size_t minMultiQ = static_cast<size_t>(4) * static_cast<size_t>(2 * dHead) * sizeof(float) + sOBytes;
+	const bool multiQFits = (minMultiQ <= static_cast<size_t>(maxOptin));
+
+	if (!multiQFits) {
+		// Fall back to full attention — local-only single-query path not implemented.
+		return flash_attention_multihead_forward_bf16(
+		    Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal, O);
+	}
+
+	const int flashTile = setup_flash_tile(flash_attention_fwd_local_kernel_bf16<kFlashQRows>, dHead, sOBytes);
+	const int block = 32 * kFlashQRows;
+	const dim3 grid(static_cast<unsigned int>((T + kFlashQRows - 1) / kFlashQRows),
+	                static_cast<unsigned int>(nHeads), 1u);
+	const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float) + sOBytes;
+	flash_attention_fwd_local_kernel_bf16<kFlashQRows><<<grid, block, smemBytes, computeStream()>>>(
+	    Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV,
+	    causal ? 1 : 0, windowSize, flashTile, O);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
