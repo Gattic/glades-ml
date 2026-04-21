@@ -15,6 +15,7 @@
 #include "cuda/gpu_kernels.h"
 #include "cuda/gpu_blas.h"
 #include "cuda/gpu_atlas.h"
+#include "cuda/gpu_chiron.h"
 #include "cuda/gpu_transformer_state.h"
 #endif
 
@@ -9870,6 +9871,40 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 			else
 			{
+				// cuBLAS-tiled tensor-core attention path (40-46x faster
+				// than the custom flash_attention kernel — see
+				// research/WMMA_ATTENTION_PLAN.md).  Eligible only when
+				// no GQA (nHeads == nKVHeads); falls back otherwise.
+				const bool chiron_fast_attn = (nHeads == nKVHeads);
+				if (chiron_fast_attn)
+				{
+					const size_t scoresNeeded = static_cast<size_t>(nHeads) * T * T;
+					if (gpuTransformerScratch->attnScoresScratch.size() < scoresNeeded)
+						gpuTransformerScratch->attnScoresScratch.allocate(scoresNeeded);
+					if (gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded)
+					{
+						gpu::flash_attention_cublas_tiled(Q_l, K_l, V_l,
+						    static_cast<int>(T), static_cast<int>(nHeads),
+						    static_cast<int>(dHead), static_cast<int>(dModel),
+						    causal, attnConcat_l,
+						    gpuTransformerScratch->attnScoresScratch.data());
+					}
+					else
+					{
+						gpu::flash_attention_multihead_forward(
+						    Q_l, K_l, V_l,
+						    static_cast<int>(T),
+						    static_cast<int>(nHeads),
+						    static_cast<int>(nKVHeads),
+						    static_cast<int>(dHead),
+						    static_cast<int>(dModel),
+						    static_cast<int>(dModelKV),
+						    causal,
+						    attnConcat_l);
+					}
+				}
+				else
+				{
 				gpu::flash_attention_multihead_forward(
 				    Q_l, K_l, V_l,
 				    static_cast<int>(T),
@@ -9880,6 +9915,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    static_cast<int>(dModelKV),
 				    causal,
 				    attnConcat_l);
+				}
 			}
 
 			// Wo projection

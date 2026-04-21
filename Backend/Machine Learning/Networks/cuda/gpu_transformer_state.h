@@ -447,6 +447,13 @@ struct GpuTransformerScratch
 	GpuBuffer<uint16_t> kLowp;
 	GpuBuffer<uint16_t> vLowp;
 
+	// Full attention scores matrix [nHeads, T, T] used by the
+	// cuBLAS-tiled flash_attention path (research/WMMA_ATTENTION_PLAN.md).
+	// Trades O(nH*T^2) memory for tensor-core throughput.  Allocated
+	// lazily on first use when the fast path is eligible (nHeads == nKVHeads).
+	// Left unallocated (empty) otherwise to keep VRAM budget unchanged.
+	GpuBuffer<float> attnScoresScratch;
+
 	// GPU loss computation scalars
 	GpuBuffer<float> lossSum;    // [1]
 	GpuBuffer<int> lossCount;    // [1]  (valid token count)
