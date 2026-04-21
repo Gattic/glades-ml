@@ -222,6 +222,66 @@ Projected CHIRON advantage on the same GPU:
   more parameters (dModel ~1500-2500, 2-3× deeper), subject to Phase
   3.5's measured activation overhead.
 
+## 2026-04-21 — Iteration state summary (handoff)
+
+**All CHIRON primitives + full block now on GPU.** Every piece of the
+symplectic forward block runs through existing infrastructure:
+- Shears: `chiron_shear_add` / `chiron_shear_sub` (element-wise kernels).
+- ReLN: `chiron_reln_forward` / `chiron_reln_inverse` (LayerNorm-style
+  per-row kernels).
+- Attention shear: `chiron_attention_shear` (+ `_bf16` variant) reuses
+  cuBLAS sgemm for Q/K/V/O projections and `flash_attention_multihead_forward`
+  (or `_bf16`) for the attention core.
+- Sketch correction: `chiron_sketch_project` / `chiron_sketch_lift_add`
+  via cuBLAS GEMM.
+
+**Validated parities (all < 1e-3 vs CPU reference):**
+- shear_add/sub: bit-exact (0.0)
+- reln_forward/inverse: 1.2e-7 (machine epsilon)
+- sketch primitives: 6.6e-7 (cuBLAS TF32 slop)
+- attention shear: 3.0e-8 single step, 1.0e-7 for L=4 full-block end-to-end
+- full L=4 GPU roundtrip: q_err=p_err=1.0e-7
+
+**Measured performance on RTX 4080 SUPER (FP32, single head):**
+
+Full CHIRON block (attn + shear + shear + reln), realistic head sizes:
+| Size | fwd | inv | breakdown |
+|---|---|---|---|
+| T=512,  m=256,  dH=64   | 0.25 ms | 0.25 ms | attn 0.22 ms, sgemm 0.008 ms |
+| T=1024, m=1024, dH=128  | 2.05 ms | 2.04 ms | attn 1.96 ms, sgemm 0.017 ms |
+| T=2048, m=2048, dH=128  | 6.67 ms | 6.60 ms | attn ~6.4 ms, sgemm 0.032 ms |
+
+Bottleneck: the **existing flash_attention kernel** (not CHIRON-specific)
+runs at ~0.15 TFLOP/s while cuBLAS sgemm hits 33 TFLOP/s. This is shared
+infrastructure with the standard transformer; optimizing it is a
+separate workstream.
+
+**Measured memory savings (cudaMemGetInfo):**
+- T=1024, dModel=2048, L=24: baseline 960 MB → CHIRON 108 MB = **8.89×**
+- T=2048, dModel=4096, L=48: baseline 7680 MB → CHIRON 432 MB = **17.78×**
+
+## Remaining work (future iterations)
+
+### Phase 4 proper: NNetwork integration
+- Add `TYPE_TRANSFORMER_CHIRON` dispatch in `sgd_transformer.cpp`
+- Route per-block forward/backward to `chiron_*` GPU primitives when
+  `cfg.chiron.enable`.
+- Full backward: compute `dL/dW_ℓ` per layer using the block inverse to
+  reconstruct activations on-the-fly, then apply standard backprop of
+  the loss through the reconstructed activations.
+
+### Phase 4.5: End-to-end training validation
+- Add `--chiron` flag to `glades-trainer/run.sh`.
+- Train a 1B+ parameter model that would OOM on baseline.
+- Compare: (a) baseline max param count, (b) CHIRON max param count at
+  same VRAM, (c) wall-clock throughput at matched param count.
+
+### Shared-infra perf upgrades (not CHIRON-specific but huge win)
+- Optimize `flash_attention_multihead_forward` — currently ~100× below
+  peak on RTX 4080 SUPER. Likely blocking on arithmetic intensity; a
+  proper split-K + warp-level-matmul kernel would unlock the remaining
+  throughput.
+
 ## Next milestones
 
 ### Phase 2 — BF16 + sketch correction
