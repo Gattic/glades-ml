@@ -368,6 +368,45 @@ trainer runs again, the 10-line `flash_attention_multihead_forward →
 flash_attention_cublas_tiled` swap delivers the 46x speedup to the
 production training path.
 
+### Deep diagnosis (gdb backtrace)
+
+```
+Thread 1 "glades_pile_tra" received signal SIGSEGV
+#0  NNInfo::getOutputLayerSize (this=0x555500000000) at nninfo.cpp:283
+#1  build_run_preflight (skeleton=..., ...) at trainer.cpp:298
+#2  Trainer::run at trainer.cpp:479
+#3  NNetwork::run at network.cpp:1271
+#4  NNetwork::train at network.cpp:1256
+```
+
+`this=0x555500000000` is the smoking gun — PIE base is 0x5555_5555_xxxx
+on x86-64 Linux; `this` being 0x5555_0000_0000 means the upper 16
+bits of the NNInfo pointer are right but the lower 48 bits are zero.
+This is a pointer-corruption pattern, not a nullptr dereference.
+
+The object in question is `net.skeleton` (a `NNInfo*`), set in
+`network.cpp:484` via:
+```cpp
+ownedSkeleton = shmea::GPointer<NNInfo>(new NNInfo(n, g));
+skeleton = ownedSkeleton.get();
+```
+(`ownedSkeleton` is a shmea smart pointer). Either the GPointer
+assignment or the NNInfo-from-GTable constructor is leaving the
+ownedSkeleton pointing at bad memory.
+
+**Repro**: any config on the pile trainer after rebuilding against
+current installed glades libs. Crash is deterministic at startup.
+Does NOT depend on any research-work commits; reproduces on commit
+`828b6ea89` (pre-Stage-1) after clean rebuild.
+
+**Hypothesis to verify next iteration**: shmea's GPointer had an ABI
+change that doesn't roundtrip with the older trainer-built-against
+expectations. Rebuilding `/home/robert/dev/ShmeaDB` and reinstalling
+(already done; no apparent change) did not fix it, so the regression
+might be in glades-ml itself (network.cpp or NNInfo serialization).
+Look for unintended struct layout changes between the last working
+run (~1080 tok/s, earlier today) and now.
+
 ## Remaining work (future iterations)
 
 ### Phase 4 proper: NNetwork integration
