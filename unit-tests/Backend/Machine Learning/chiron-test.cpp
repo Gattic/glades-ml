@@ -2734,6 +2734,88 @@ void CHIRONBf16WeightBackwardParityTest()
 #endif
 }
 
+// Parity test: local-window attention with windowSize >= T produces bit-equivalent
+// output to the full (non-local) attention kernel.  This validates the local
+// kernel's correctness on the "no windowing" degenerate case before we exercise
+// it at small W.
+void CHIRONLocalAttentionFullWindowParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [local-attn full parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T = 64, nH = 4, dH = 32;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(2468u);
+	std::vector<float> Qf(T * dM), Kf(T * dM), Vf(T * dM);
+	for (size_t i = 0; i < Qf.size(); ++i) Qf[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < Kf.size(); ++i) Kf[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < Vf.size(); ++i) Vf[i] = 0.3f * rng.next_unit();
+
+	// Cast to BF16 on host.
+	std::vector<uint16_t> Qb(T * dM), Kb(T * dM), Vb(T * dM);
+	#define _CAST_FP32_BF16(f_, out_) do {                            \
+		union { float f; uint32_t u; } _v; _v.f = (f_);                \
+		const uint32_t _l = (_v.u >> 16) & 1u;                         \
+		(out_) = (uint16_t)((_v.u + 0x7FFFu + _l) >> 16);              \
+	} while (0)
+	for (size_t i = 0; i < Qf.size(); ++i) _CAST_FP32_BF16(Qf[i], Qb[i]);
+	for (size_t i = 0; i < Kf.size(); ++i) _CAST_FP32_BF16(Kf[i], Kb[i]);
+	for (size_t i = 0; i < Vf.size(); ++i) _CAST_FP32_BF16(Vf[i], Vb[i]);
+	#undef _CAST_FP32_BF16
+
+	glades::gpu::GpuBuffer<uint16_t> d_Q, d_K, d_V;
+	glades::gpu::GpuBuffer<float> d_O_full, d_O_local;
+	d_Q.allocate(T * dM); d_K.allocate(T * dM); d_V.allocate(T * dM);
+	d_O_full.allocate(T * dM); d_O_local.allocate(T * dM);
+	d_Q.upload(&Qb[0], Qb.size()); d_K.upload(&Kb[0], Kb.size()); d_V.upload(&Vb[0], Vb.size());
+
+	ASSERT("full attention",
+	       glades::gpu::flash_attention_multihead_forward_bf16(
+	           d_Q.data(), d_K.data(), d_V.data(),
+	           (int)T, (int)nH, (int)nH, (int)dH, (int)dM, (int)dM,
+	           causal, d_O_full.data()));
+
+	// Local with windowSize >= T — should degenerate to full attention.
+	ASSERT("local attention (W=T)",
+	       glades::gpu::flash_attention_multihead_forward_bf16_local(
+	           d_Q.data(), d_K.data(), d_V.data(),
+	           (int)T, (int)nH, (int)nH, (int)dH, (int)dM, (int)dM,
+	           causal, (int)T, d_O_local.data()));
+
+	std::vector<float> O_full(T * dM), O_local(T * dM);
+	d_O_full.download(&O_full[0], T * dM);
+	d_O_local.download(&O_local[0], T * dM);
+	const float err = max_abs_diff(O_full, O_local);
+	std::printf("  local-attn (W=T) vs full attn: max_err=%.3e\n", err);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "local(W=T) == full: max_err=%.3e (tol 1e-6)", err);
+	ASSERT(msg, err < 1e-6f);
+
+	// Local with small window — at T=64, W=8 gives each query access to only
+	// 8 previous keys.  The output should differ from full-attention since
+	// the softmax normalizer changes.
+	ASSERT("local attention (W=8)",
+	       glades::gpu::flash_attention_multihead_forward_bf16_local(
+	           d_Q.data(), d_K.data(), d_V.data(),
+	           (int)T, (int)nH, (int)nH, (int)dH, (int)dM, (int)dM,
+	           causal, 8, d_O_local.data()));
+	d_O_local.download(&O_local[0], T * dM);
+	const float errW8 = max_abs_diff(O_full, O_local);
+	std::printf("  local-attn (W=8) vs full attn: max_err=%.3e (expect nonzero)\n", errW8);
+	ASSERT("local(W=8) should differ from full attention (W=8 restricts context)",
+	       errW8 > 1e-3f);
+#else
+	std::printf("  [local-attn full parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -2742,6 +2824,7 @@ void CHIRONUnitTest()
 	CHIRONFlashShearBackwardBf16ParityTest();
 	CHIRONBf16WeightProjectionParityTest();
 	CHIRONBf16WeightBackwardParityTest();
+	CHIRONLocalAttentionFullWindowParityTest();
 	CHIRONShearReversibilityTest();
 	CHIRONReLNRoundtripTest();
 	CHIRONBlockRoundtripTest();
