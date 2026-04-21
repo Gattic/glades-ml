@@ -25,6 +25,9 @@ void CHIRONShearReversibilityTest();
 void CHIRONReLNRoundtripTest();
 void CHIRONBlockRoundtripTest();
 void CHIRONMultiBlockRoundtripTest();
+void CHIRONAttentionShearReversibilityTest();
+void CHIRONFullBlockRoundtripTest();
+void CHIRONMultiFullBlockRoundtripTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
