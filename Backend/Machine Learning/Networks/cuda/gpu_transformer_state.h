@@ -454,6 +454,11 @@ struct GpuTransformerScratch
 	// Left unallocated (empty) otherwise to keep VRAM budget unchanged.
 	GpuBuffer<float> attnScoresScratch;
 
+	// Second [nHeads, T, T] scratch used by the cuBLAS-tiled
+	// flash_attention BACKWARD kernel for the dP intermediate.
+	// Allocated lazily.
+	GpuBuffer<float> attnDPScratch;
+
 	// GPU loss computation scalars
 	GpuBuffer<float> lossSum;    // [1]
 	GpuBuffer<int> lossCount;    // [1]  (valid token count)

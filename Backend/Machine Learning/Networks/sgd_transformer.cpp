@@ -10552,6 +10552,39 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 			if (!attnBwdDone)
 			{
+				// cuBLAS-tiled tensor-core attention BACKWARD (companion to
+				// the forward fast-attn path — research/WMMA_ATTENTION_PLAN.md).
+				// Eligible only when no GQA.  Uses the same attnScoresScratch
+				// buffer for P (recomputed) and allocates a second T*T*nH
+				// buffer for dP.  Parity-verified against flash_attention_
+				// multihead_backward (dQ/dK/dV max_err < 5e-3 in unit test).
+				const bool chiron_fast_bwd = (nHeads == nKVHeads);
+				if (chiron_fast_bwd)
+				{
+					const size_t scoresNeeded = static_cast<size_t>(nHeads) * T * T;
+					if (gpuTransformerScratch->attnScoresScratch.size() < scoresNeeded)
+						gpuTransformerScratch->attnScoresScratch.allocate(scoresNeeded);
+					if (gpuTransformerScratch->attnDPScratch.size() < scoresNeeded)
+						gpuTransformerScratch->attnDPScratch.allocate(scoresNeeded);
+					if (gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded
+					    && gpuTransformerScratch->attnDPScratch.size() >= scoresNeeded)
+					{
+						attnBwdDone = gpu::flash_attention_backward_cublas_tiled(
+						    Q_l, K_l, V_l,
+						    attnConcat_l,
+						    gpuTransformerScratch->dAttnConcat.data(),
+						    static_cast<int>(T), static_cast<int>(nHeads),
+						    static_cast<int>(dHead), static_cast<int>(dModel),
+						    causal,
+						    gpuTransformerScratch->dQfull.data(),
+						    gpuTransformerScratch->dKfull.data(),
+						    gpuTransformerScratch->dVfull.data(),
+						    gpuTransformerScratch->attnScoresScratch.data(),
+						    gpuTransformerScratch->attnDPScratch.data());
+					}
+				}
+				if (!attnBwdDone)
+				{
 				gpu::flash_attention_multihead_backward(
 				    Q_l, K_l, V_l,
 				    attnConcat_l,
@@ -10566,6 +10599,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    gpuTransformerScratch->dQfull.data(),
 				    gpuTransformerScratch->dKfull.data(),
 				    gpuTransformerScratch->dVfull.data());
+				}
 			}
 
 			// --- RoPE backward (inverse rotation) — fused Q+K ---

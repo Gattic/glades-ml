@@ -2223,7 +2223,86 @@ void CHIRONUnitTest()
 	CHIRONGpuMultiBlockBackwardTest();
 	CHIRONMicroTrainingDemoTest();
 	CHIRONCublasTiledAttentionParityTest();
+	CHIRONCublasTiledAttentionBackwardParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Case 23: flash_attention_backward_cublas_tiled parity vs. the existing
+// flash_attention_multihead_backward kernel.  Produces dQ/dK/dV and asserts
+// element-wise match within cuBLAS TF32 tolerance.
+// ---------------------------------------------------------------------------
+void CHIRONCublasTiledAttentionBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) { std::printf("  [backward parity] no CUDA\n"); return; }
+
+	const unsigned int T = 32, nH = 4, dH = 32;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(987123u);
+	std::vector<float> Q(T * dM), K(T * dM), V(T * dM), dO_vec(T * dM);
+	for (size_t i = 0; i < Q.size(); ++i) Q[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < K.size(); ++i) K[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < dO_vec.size(); ++i) dO_vec[i] = 0.2f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_dO, d_O;
+	glades::gpu::GpuBuffer<float> d_dQ_ref, d_dK_ref, d_dV_ref;
+	glades::gpu::GpuBuffer<float> d_dQ_new, d_dK_new, d_dV_new;
+	glades::gpu::GpuBuffer<float> d_P, d_dP;
+	d_Q.allocate(Q.size()); d_K.allocate(K.size()); d_V.allocate(V.size());
+	d_dO.allocate(dO_vec.size()); d_O.allocate(T * dM);
+	d_dQ_ref.allocate(T * dM); d_dK_ref.allocate(T * dM); d_dV_ref.allocate(T * dM);
+	d_dQ_new.allocate(T * dM); d_dK_new.allocate(T * dM); d_dV_new.allocate(T * dM);
+	d_P.allocate((size_t)nH * T * T); d_dP.allocate((size_t)nH * T * T);
+	d_Q.upload(&Q[0], Q.size()); d_K.upload(&K[0], K.size());
+	d_V.upload(&V[0], V.size()); d_dO.upload(&dO_vec[0], dO_vec.size());
+	d_dQ_ref.zero(); d_dK_ref.zero(); d_dV_ref.zero();
+	d_dQ_new.zero(); d_dK_new.zero(); d_dV_new.zero();
+
+	ASSERT("fwd for reference",
+	       glades::gpu::flash_attention_multihead_forward(
+	           d_Q.data(), d_K.data(), d_V.data(),
+	           (int)T, (int)nH, (int)nH, (int)dH, (int)dM, (int)dM,
+	           causal, d_O.data()));
+	ASSERT("ref backward",
+	       glades::gpu::flash_attention_multihead_backward(
+	           d_Q.data(), d_K.data(), d_V.data(),
+	           d_O.data(), d_dO.data(),
+	           (int)T, (int)nH, (int)nH, (int)dH, (int)dM, (int)dM,
+	           causal,
+	           d_dQ_ref.data(), d_dK_ref.data(), d_dV_ref.data()));
+	ASSERT("new backward",
+	       glades::gpu::flash_attention_backward_cublas_tiled(
+	           d_Q.data(), d_K.data(), d_V.data(),
+	           d_O.data(), d_dO.data(),
+	           (int)T, (int)nH, (int)dH, (int)dM,
+	           causal,
+	           d_dQ_new.data(), d_dK_new.data(), d_dV_new.data(),
+	           d_P.data(), d_dP.data()));
+
+	std::vector<float> dQr(T * dM), dKr(T * dM), dVr(T * dM);
+	std::vector<float> dQn(T * dM), dKn(T * dM), dVn(T * dM);
+	d_dQ_ref.download(&dQr[0], T * dM); d_dK_ref.download(&dKr[0], T * dM);
+	d_dV_ref.download(&dVr[0], T * dM); d_dQ_new.download(&dQn[0], T * dM);
+	d_dK_new.download(&dKn[0], T * dM); d_dV_new.download(&dVn[0], T * dM);
+
+	const float dQ_err = max_abs_diff(dQr, dQn);
+	const float dK_err = max_abs_diff(dKr, dKn);
+	const float dV_err = max_abs_diff(dVr, dVn);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "backward parity: dQ=%.3e dK=%.3e dV=%.3e (tol 5e-3)",
+	              dQ_err, dK_err, dV_err);
+	ASSERT(msg, dQ_err < 5e-3f && dK_err < 5e-3f && dV_err < 5e-3f);
+	std::printf("  cuBLAS-tiled backward parity: dQ=%.3e dK=%.3e dV=%.3e\n",
+	            dQ_err, dK_err, dV_err);
+#else
+	std::printf("  [backward parity] GLADES_HAVE_CUDA not defined\n");
+#endif
 }
 
 // ---------------------------------------------------------------------------

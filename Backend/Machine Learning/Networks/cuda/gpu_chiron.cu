@@ -440,6 +440,94 @@ bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V
 }
 
 // ===========================================================================
+//  5c. cuBLAS-tiled flash attention — BACKWARD.
+// ===========================================================================
+//
+// Math:
+//   P   = softmax_row(causal((1/sqrt(dH)) Q K^T))   [recompute]
+//   dV += P^T · dO
+//   dP  = dO · V^T
+//   dS  = softmax_backward_attn(P, dP)              [existing kernel]
+//   dQ  = (1/sqrt(dH)) · dS · K
+//   dK += (1/sqrt(dH)) · dS^T · Q
+
+bool flash_attention_backward_cublas_tiled(
+    const float* Q, const float* K, const float* V,
+    const float* /*O unused*/, const float* dO,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    float* dQ, float* dK, float* dV,
+    float* scratch_P, float* scratch_dP)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+
+	// Recompute P.
+	if (!sgemm_batched_strided_abt(
+	        T, T, dHead, invSqrtDH,
+	        Q, dModel, (long long)dHead,
+	        K, dModel, (long long)dHead,
+	        0.0f,
+	        scratch_P, T, (long long)T * T,
+	        nHeads))
+		return false;
+	if (causal)
+	{
+		if (!causal_mask_softmax_inplace(scratch_P, nHeads, T)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_P, nHeads * T, T, scratch_P)) return false;
+	}
+
+	// dV += P^T · dO.
+	if (!sgemm_batched_strided_atb(
+	        T, dHead, T, 1.0f,
+	        scratch_P, T, (long long)T * T,
+	        dO, dModel, (long long)dHead,
+	        1.0f,
+	        dV, dModel, (long long)dHead,
+	        nHeads))
+		return false;
+
+	// dP = dO · V^T.
+	if (!sgemm_batched_strided_abt(
+	        T, T, dHead, 1.0f,
+	        dO, dModel, (long long)dHead,
+	        V, dModel, (long long)dHead,
+	        0.0f,
+	        scratch_dP, T, (long long)T * T,
+	        nHeads))
+		return false;
+
+	// dS = softmax_backward(P, dP) in place on scratch_dP.
+	if (!softmax_backward_attn(scratch_P, scratch_dP, nHeads, T, 1.0f, scratch_dP))
+		return false;
+
+	// dQ = (1/sqrt(dH)) · dS · K.
+	if (!sgemm_batched_strided(
+	        T, dHead, T, invSqrtDH,
+	        scratch_dP, T, (long long)T * T,
+	        K, dModel, (long long)dHead,
+	        0.0f,
+	        dQ, dModel, (long long)dHead,
+	        nHeads))
+		return false;
+
+	// dK += (1/sqrt(dH)) · dS^T · Q.
+	if (!sgemm_batched_strided_atb(
+	        T, dHead, T, invSqrtDH,
+	        scratch_dP, T, (long long)T * T,
+	        Q, dModel, (long long)dHead,
+	        1.0f,
+	        dK, dModel, (long long)dHead,
+	        nHeads))
+		return false;
+
+	return true;
+}
+
+// ===========================================================================
 //  6b. Symplectic attention shear — backward.
 // ===========================================================================
 //

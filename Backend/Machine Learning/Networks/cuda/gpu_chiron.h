@@ -182,6 +182,35 @@ bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V
                                     bool causal,
                                     float* O, float* scratch_S);
 
+// cuBLAS-tiled backward counterpart.  Given Q, K, V, O (unused, kept for
+// API symmetry), and the upstream gradient dO, produces dQ, dK, dV.
+//
+// Math:
+//   P     = softmax_row(causal_mask((1/sqrt(dH)) Q K^T))   (recomputed)
+//   dV   += P^T · dO                                        (per head, batched)
+//   dP    = dO · V^T                                        (per head, batched)
+//   dS    = softmax_backward(P, dP)                         (with causal mask)
+//   dQ    = (1/sqrt(dH)) dS · K                             (batched)
+//   dK   += (1/sqrt(dH)) dS^T · Q                           (batched)
+//
+// Constraints: nHeads == nKVHeads (no GQA).
+//
+// Scratch:
+//   scratch_P  [nH, T, T] — recomputed attention probs
+//   scratch_dP [nH, T, T] — backward intermediate dP
+//
+// dV, dK are ACCUMULATED (+=). dQ is WRITTEN. The attention output O is
+// not needed by the cuBLAS-tiled path (we recompute P internally) but is
+// kept in the signature for drop-in compatibility with
+// flash_attention_multihead_backward.
+bool flash_attention_backward_cublas_tiled(
+    const float* Q, const float* K, const float* V,
+    const float* O, const float* dO,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    float* dQ, float* dK, float* dV,
+    float* scratch_P, float* scratch_dP);
+
 // BF16-input attention shear.  Computes Q/K/V in FP32 via cuBLAS, casts
 // down to BF16 for the flash-attention core, then casts the output back.
 // The existing flash_attention_multihead_forward_bf16 kernel is heavily
@@ -232,6 +261,11 @@ inline bool chiron_attention_shear(const float*, float*,
 inline bool flash_attention_cublas_tiled(const float*, const float*, const float*,
                                           int, int, int, int, bool,
                                           float*, float*) { return false; }
+inline bool flash_attention_backward_cublas_tiled(
+    const float*, const float*, const float*,
+    const float*, const float*,
+    int, int, int, int, bool,
+    float*, float*, float*, float*, float*) { return false; }
 inline bool chiron_attention_shear_bf16(const float*, float*,
                                          const float*, const float*, const float*,
                                          const float*,
