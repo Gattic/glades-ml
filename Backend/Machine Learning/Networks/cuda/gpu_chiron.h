@@ -157,6 +157,31 @@ bool chiron_attention_shear_backward(
     float* sQ, float* sK, float* sV, float* sO,
     float* sdO, float* sdQ, float* sdK, float* sdV);
 
+// ---------------------------------------------------------------------------
+// cuBLAS-tiled flash attention — tensor-core-backed drop-in alternative.
+// ---------------------------------------------------------------------------
+//
+// Decomposes attention into three cuBLAS / custom kernel calls:
+//   S[nH, T, T] = Q · K^T   (cuBLAS sgemm_batched_strided_abt, TF32 TC)
+//   P[nH, T, T] = softmax_row(S, causal mask, 1/sqrt(dHead) scaled)
+//   O[nH, T, dHead] = P · V  (cuBLAS sgemm_batched_strided, TF32 TC)
+//
+// The existing `flash_attention_multihead_forward` avoids materialising
+// S/P via an online-softmax streaming kernel; that keeps HBM usage down
+// to O(T·dHead) but runs at 0.15 TFLOP/s (100x below cuBLAS peak)
+// because the kernel uses no tensor cores.  This variant trades
+// O(nH·T²) scratch memory for cuBLAS-backed tensor-core throughput —
+// the best option for T ≤ 2048 where nH·T²·4 stays under a few hundred
+// MB.
+//
+// Scratch: scratch_S [nH, T, T], FP32, caller-owned.
+//
+// Constraints: nHeads must equal nKVHeads (no GQA in this version).
+bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
+                                    int T, int nHeads, int dHead, int dModel,
+                                    bool causal,
+                                    float* O, float* scratch_S);
+
 // BF16-input attention shear.  Computes Q/K/V in FP32 via cuBLAS, casts
 // down to BF16 for the flash-attention core, then casts the output back.
 // The existing flash_attention_multihead_forward_bf16 kernel is heavily
@@ -204,6 +229,9 @@ inline bool chiron_attention_shear(const float*, float*,
                                     int, int, int, int, int,
                                     bool, bool,
                                     float*, float*, float*, float*) { return false; }
+inline bool flash_attention_cublas_tiled(const float*, const float*, const float*,
+                                          int, int, int, int, bool,
+                                          float*, float*) { return false; }
 inline bool chiron_attention_shear_bf16(const float*, float*,
                                          const float*, const float*, const float*,
                                          const float*,

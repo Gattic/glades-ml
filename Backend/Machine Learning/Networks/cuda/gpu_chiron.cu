@@ -382,6 +382,64 @@ bool chiron_attention_shear(const float* q, float* p,
 }
 
 // ===========================================================================
+//  5b. cuBLAS-tiled flash attention (Stage-1 tensor-core variant).
+// ===========================================================================
+
+bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V,
+                                    int T, int nHeads, int dHead, int dModel,
+                                    bool causal,
+                                    float* O, float* scratch_S)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+
+	// S[nH, T, T] = invSqrtDH · Q_h · K_h^T for each head h.
+	// Q and K are laid out as [T, dModel] with heads packed along dModel.
+	// For head h, the head slice is Q[:, h*dHead : (h+1)*dHead].
+	// Batched strided: stride_between_batches = dHead (the slice starts
+	// dHead elements later in the packed layout).
+	if (!sgemm_batched_strided_abt(
+	        T, T, dHead,
+	        invSqrtDH,
+	        Q, dModel, (long long)dHead,   // A = Q_h; lda=dModel, strideA=dHead
+	        K, dModel, (long long)dHead,   // B = K_h; ldb=dModel, strideB=dHead
+	        0.0f,
+	        scratch_S, T, (long long)T * T,  // C = S_h; ldc=T, strideC=T*T
+	        nHeads))
+		return false;
+
+	// Apply causal mask + row-softmax in place.
+	// `causal_mask_softmax_inplace` expects [batch, T, T] — we treat
+	// nHeads as batch.  (For non-causal we'd want a separate softmax
+	// but CHIRON always trains causal; assume causal here.)
+	if (causal)
+	{
+		if (!causal_mask_softmax_inplace(scratch_S, nHeads, T))
+			return false;
+	}
+	else
+	{
+		// Fall back to plain rowwise softmax (still in-place).
+		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S))
+			return false;
+	}
+
+	// O[nH, T, dHead] = S · V  for each head.
+	if (!sgemm_batched_strided(
+	        T, dHead, T,
+	        1.0f,
+	        scratch_S, T, (long long)T * T,  // A = P_h; lda=T, strideA=T*T
+	        V, dModel, (long long)dHead,     // B = V_h; ldb=dModel, strideB=dHead
+	        0.0f,
+	        O, dModel, (long long)dHead,     // C = O_h; ldc=dModel, strideC=dHead
+	        nHeads))
+		return false;
+
+	return true;
+}
+
+// ===========================================================================
 //  6b. Symplectic attention shear — backward.
 // ===========================================================================
 //

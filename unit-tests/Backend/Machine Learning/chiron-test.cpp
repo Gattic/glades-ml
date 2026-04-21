@@ -2222,7 +2222,62 @@ void CHIRONUnitTest()
 	CHIRONGpuFullBlockBackwardTest();
 	CHIRONGpuMultiBlockBackwardTest();
 	CHIRONMicroTrainingDemoTest();
+	CHIRONCublasTiledAttentionParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Case 22: flash_attention_cublas_tiled parity vs. flash_attention_multihead_forward
+// Verifies the new cuBLAS-tensor-core path produces the same output as the
+// existing custom kernel within cuBLAS TF32 tolerance.
+// ---------------------------------------------------------------------------
+void CHIRONCublasTiledAttentionParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) { std::printf("  [cublas-tiled parity] no CUDA device\n"); return; }
+
+	const unsigned int T = 32, nH = 4, dH = 32;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(91011u);
+	std::vector<float> Q(T * dM), K(T * dM), V(T * dM);
+	for (size_t i = 0; i < Q.size(); ++i) Q[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < K.size(); ++i) K[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_O_ref, d_O_new, d_S;
+	d_Q.allocate(Q.size()); d_K.allocate(K.size()); d_V.allocate(V.size());
+	d_O_ref.allocate(T * dM); d_O_new.allocate(T * dM);
+	d_S.allocate((size_t)nH * T * T);
+	d_Q.upload(&Q[0], Q.size()); d_K.upload(&K[0], K.size()); d_V.upload(&V[0], V.size());
+
+	// Reference: existing custom kernel.
+	ASSERT("ref flash attn", glades::gpu::flash_attention_multihead_forward(
+	    d_Q.data(), d_K.data(), d_V.data(),
+	    (int)T, (int)nH, (int)nH, (int)dH, (int)dM, (int)dM,
+	    causal, d_O_ref.data()));
+
+	// New cuBLAS-tiled path.
+	ASSERT("cublas-tiled flash attn", glades::gpu::flash_attention_cublas_tiled(
+	    d_Q.data(), d_K.data(), d_V.data(),
+	    (int)T, (int)nH, (int)dH, (int)dM, causal,
+	    d_O_new.data(), d_S.data()));
+
+	std::vector<float> O_ref(T * dM), O_new(T * dM);
+	d_O_ref.download(&O_ref[0], T * dM);
+	d_O_new.download(&O_new[0], T * dM);
+
+	const float err = max_abs_diff(O_ref, O_new);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "cublas-tiled flash attn parity: max_err=%.3e "
+	              "(tol 5e-3, cuBLAS TF32 precision)", err);
+	ASSERT(msg, err < 5e-3f);
+	std::printf("  cuBLAS-tiled flash attention parity: max_err=%.3e\n", err);
+#else
+	std::printf("  [cublas-tiled parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
 }
 
 // (CHIRONMicroTrainingDemoTest is defined at the end of this file,
@@ -3533,6 +3588,29 @@ void CHIRONBenchmark()
 			const double attn_bf16_tflops = total_flops / (tattn_bf16 * 1e-3) / 1e12;
 			std::printf("             attn_shear_bf16   = %.3f ms (%.2f TFLOP/s — BF16 path)\n",
 			            tattn_bf16, attn_bf16_tflops);
+
+			// --- cuBLAS-tiled flash attention (Stage 1 of WMMA plan) ---
+			glades::gpu::GpuBuffer<float> d_scratch_S;
+			d_scratch_S.allocate((size_t)nH * T * T);
+			for (int it = 0; it < 3; ++it)
+				glades::gpu::flash_attention_cublas_tiled(
+				    d_sQ.data(), d_sK.data(), d_sV.data(),
+				    static_cast<int>(T), static_cast<int>(nH), static_cast<int>(dH),
+				    static_cast<int>(dM), causal, d_sO.data(), d_scratch_S.data());
+			glades::gpu::synchronizeCheck("cublas-tiled warmup");
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < fwd_iters; ++it)
+				glades::gpu::flash_attention_cublas_tiled(
+				    d_sQ.data(), d_sK.data(), d_sV.data(),
+				    static_cast<int>(T), static_cast<int>(nH), static_cast<int>(dH),
+				    static_cast<int>(dM), causal, d_sO.data(), d_scratch_S.data());
+			glades::gpu::synchronizeCheck("cublas-tiled iter");
+			const double tattn_cublas = (wall_ms_chiron() - t0) / fwd_iters;
+			const double attn_cublas_tflops = (2.0 * T * T * dH * nH) / (tattn_cublas * 1e-3) / 1e12;
+			std::printf("             flash_attn_cublas = %.3f ms (%.2f TFLOP/s — cuBLAS tiled)  "
+			            "speedup %.1fx\n",
+			            tattn_cublas, attn_cublas_tflops,
+			            tattn_cublas > 0.0 ? (tattn / tattn_cublas) : 0.0);
 		}
 	}
 
