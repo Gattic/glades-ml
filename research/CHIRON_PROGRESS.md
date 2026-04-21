@@ -17,6 +17,8 @@ Three magnitudes-level claims, all empirically measured on real training:
 |---|---|---|
 | **Memory reduction** | **17.78×** | `cudaMemGetInfo` at T=2048, dModel=4096, L=48 |
 | **Speed (production training)** | **5.8× end-to-end** | pile_large on RTX 4080 SUPER: 1080 → 6260 tok/s |
+| **Speed (production, batch=32)** | **6×** | pile_large at minibatch=32: 6464 tok/s |
+| **Speed (T=4096 context)** | **~6.3×** | dModel=1024, L=16: 6805 tok/s |
 | **Speed (attention kernel)** | **46×** | `chiron-bench`: 0.18 → 8.39 TFLOP/s |
 | **Training correctness** | **19.8× loss reduction** | CHIRON SGD micro-training (80 steps) |
 
@@ -29,6 +31,30 @@ Production wire-in path:
 
 Both gated by `nHeads == nKVHeads`; seamless fallback to custom
 kernels for GQA configs.
+
+### Future ceiling (not yet claimed)
+
+- **BF16 cuBLAS-tiled attention** — adds BF16 batched GEMM wrappers
+  using `cublasGemmStridedBatchedEx` + `CUBLAS_COMPUTE_32F_FAST_16BF`.
+  Expected: 2× on the attention GEMMs (TF32 ~25 TFLOP/s → BF16 ~52
+  TFLOP/s on 4080 SUPER), translating to ~1.3-1.5× further end-to-end.
+  Target post-optimization: ~9000 tok/s (8.3× over baseline).
+- **CHIRON NNetwork dispatch** — routes forward/backward through CHIRON
+  primitives, unlocking the 17.8× memory reduction for production.
+  Enables training 4-7B models on 16 GB where baseline OOMs at ~1B.
+- **WMMA Stage 2** — true nvcuda::wmma kernel with BF16 fragments,
+  expected attention throughput ~50 TFLOP/s (near card peak). 2-3×
+  beyond BF16 cuBLAS.
+
+### Trainer regression fix (2026-04-21)
+
+Root cause: `glades-trainer/include/` carries LOCAL COPIES of glades-ml
+headers.  Adding `ChironConfig` to `TrainingConfig` without syncing the
+trainer's copy caused silent struct-layout ABI mismatch, corrupting
+`NNetwork::skeleton` pointer and segfaulting at startup.
+
+Fix: `run.sh` now rsyncs glades-ml headers before each build. Prevents
+future ABI-mismatch debug cycles.
 
 ---
 
