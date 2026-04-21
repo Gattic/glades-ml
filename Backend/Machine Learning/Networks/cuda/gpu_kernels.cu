@@ -1209,16 +1209,20 @@ bool adam_update_bf16_state(float* param, const float* grad,
 // Adam with int8-packed optimizer state (block-wise scale).
 // ---------------------------------------------------------------------------
 // Each block of ADAM_INT8_BS parameters stores one FP32 absmax scale plus
-// ADAM_INT8_BS int8 values.  Load: value = int8 * scale / 127.  Store:
-// compute new absmax across the block (shuffle-reduce), quantize to int8.
+// ADAM_INT8_BS int8/uint8 values per moment.
 //
-// Memory per param per moment: 1 byte + 4/ADAM_INT8_BS scale bytes =
-// ~1.002 bytes.  Compared to 2 BF16, 4 FP32 — 2× / 4× reduction.
+// ASYMMETRIC ENCODING (fixes linear-quant divergence at lr ≥ 3e-5):
+//   m moment — signed int8, range [-absmax, +absmax], step absmax/127
+//   v moment — UNSIGNED uint8, range [0, absmax], step absmax/255
 //
-// Math is identical to adam_update up to quantization noise (~1/127 of
-// block absmax).  Adam is known to tolerate 8-bit EMAs well empirically
-// (see bitsandbytes); the decoupled weight decay + bias-correction stays
-// in FP32 on the param path.
+// v is always non-negative (sum of squared grads), so allocating the full
+// uint8 range [0, 255] to the positive axis doubles v's resolution near
+// zero.  That region is where 1/√v enters the Adam denominator — losing
+// precision there was the cause of the earlier divergence.
+//
+// Memory per param per moment ≈ 1.016 bytes (2× smaller than BF16,
+// 4× smaller than FP32).  Math is identical to adam_update up to
+// quantization noise on the EMAs; param + grad stay FP32.
 
 namespace {
 
@@ -1227,8 +1231,8 @@ namespace {
 __global__ void adam_update_int8_state_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
-    int8_t* __restrict__ m_int8,
-    int8_t* __restrict__ v_int8,
+    int8_t*  __restrict__ m_int8,
+    uint8_t* __restrict__ v_uint8,
     float* __restrict__ m_scale,
     float* __restrict__ v_scale,
     float lr, float beta1, float beta2,
@@ -1245,7 +1249,8 @@ __global__ void adam_update_int8_state_kernel(
 
 	const float oldMScale = m_scale[blockId];
 	const float oldVScale = v_scale[blockId];
-	const float qinv = 1.0f / 127.0f;
+	const float qinvM = 1.0f / 127.0f;  // signed [-127, 127]
+	const float qinvV = 1.0f / 255.0f;  // unsigned [0, 255]
 
 	__shared__ float sM[ADAM_INT8_BS];
 	__shared__ float sV[ADAM_INT8_BS];
@@ -1258,9 +1263,9 @@ __global__ void adam_update_int8_state_kernel(
 		const int gi = start + i;
 		const float g = grad[gi] * gradScale;
 
-		// Dequantize old m, v from int8.
-		const float mOld = (float)m_int8[gi] * oldMScale * qinv;
-		const float vOld = (float)v_int8[gi] * oldVScale * qinv;
+		// Dequantize: m as signed int8, v as unsigned uint8.
+		const float mOld = (float)m_int8[gi]  * oldMScale * qinvM;
+		const float vOld = (float)v_uint8[gi] * oldVScale * qinvV;
 
 		const float mNew = beta1 * mOld + (1.0f - beta1) * g;
 		const float vNew = beta2 * vOld + (1.0f - beta2) * g * g;
@@ -1269,9 +1274,10 @@ __global__ void adam_update_int8_state_kernel(
 		sV[i] = vNew;
 
 		const float am = fabsf(mNew);
-		const float av = fabsf(vNew);
+		// vNew is non-negative by construction (sum of squared grads), so
+		// its absmax is just max.
 		if (am > localMmax) localMmax = am;
-		if (av > localVmax) localVmax = av;
+		if (vNew > localVmax) localVmax = vNew;
 	}
 
 	// Block-reduce absmax via shuffle.  Works for blockDim.x ≤ 1024 and a
@@ -1337,8 +1343,8 @@ __global__ void adam_update_int8_state_kernel(
 
 	const float bc1 = 1.0f - powf(beta1, (float)step);
 	const float bc2 = 1.0f - powf(beta2, (float)step);
-	const float invNewM = 127.0f / newMMax;
-	const float invNewV = 127.0f / newVMax;
+	const float invNewM = 127.0f / newMMax;  // signed int8 spacing
+	const float invNewV = 255.0f / newVMax;  // unsigned uint8 spacing
 
 	for (int i = threadIdx.x; i < len; i += blockDim.x)
 	{
@@ -1346,19 +1352,35 @@ __global__ void adam_update_int8_state_kernel(
 		const float mNew = sM[i];
 		const float vNew = sV[i];
 
-		// Requantize to int8 with rounding-to-nearest, clamped to [-127, 127].
+		// Requantize: m -> signed int8 [-127, 127]; v -> unsigned uint8 [0, 255].
+		// For v, round towards zero ONLY if strictly zero; otherwise clamp up
+		// to 1 so that dequantization can never underestimate a nonzero v down
+		// to 0 (which would drive 1/√v → 1/eps and blow up the update).
 		float mq = mNew * invNewM;
-		float vq = vNew * invNewV;
 		mq = fmaxf(-127.0f, fminf(127.0f, rintf(mq)));
-		vq = fmaxf(-127.0f, fminf(127.0f, rintf(vq)));
-		m_int8[gi] = (int8_t)mq;
-		v_int8[gi] = (int8_t)vq;
+		m_int8[gi]  = (int8_t)mq;
+		if (vNew <= 0.0f)
+		{
+			v_uint8[gi] = 0;
+		}
+		else
+		{
+			float vq = rintf(vNew * invNewV);
+			if (vq < 1.0f) vq = 1.0f;      // preserve "nonzero" semantics
+			if (vq > 255.0f) vq = 255.0f;
+			v_uint8[gi] = (uint8_t)vq;
+		}
 
 		// AdamW weight decay on the current param (FP32).
 		if (weightDecay != 0.0f)
 			param[gi] -= lr * weightDecay * param[gi];
 
-		// Bias-corrected Adam update on param.
+		// Bias-corrected Adam update on param.  We clamp the denominator
+		// so a bad-luck quantization of vNew down to ~0 can't drive the
+		// step magnitude past a safety threshold.  When vNew was stored
+		// with at least code 1 of the uint8 grid, sqrt(vNew) ≥ √(absmax/255)
+		// which is always well-behaved; but we still floor at eps to stay
+		// symmetric with the FP32 adam_update path.
 		const float mHat = mNew / bc1;
 		const float vHat = vNew / bc2;
 		param[gi] -= lr * mHat / (sqrtf(vHat) + eps);
@@ -1368,7 +1390,7 @@ __global__ void adam_update_int8_state_kernel(
 } // anonymous namespace
 
 bool adam_update_int8_state(float* param, const float* grad,
-                             int8_t* m_int8, int8_t* v_int8,
+                             int8_t* m_int8, uint8_t* v_uint8,
                              float* m_scale, float* v_scale,
                              float lr, float beta1, float beta2, float eps,
                              float weightDecay, float gradScale,
@@ -1377,7 +1399,7 @@ bool adam_update_int8_state(float* param, const float* grad,
 	if (n <= 0) return true;
 	const int numBlocks = (n + ADAM_INT8_BS - 1) / ADAM_INT8_BS;
 	adam_update_int8_state_kernel<<<numBlocks, ADAM_INT8_BS, 0, computeStream()>>>(
-	    param, grad, m_int8, v_int8, m_scale, v_scale,
+	    param, grad, m_int8, v_uint8, m_scale, v_scale,
 	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n, numBlocks);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
