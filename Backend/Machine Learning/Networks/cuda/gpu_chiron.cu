@@ -848,6 +848,93 @@ bool chiron_attention_shear_backward(
 // Cast overhead: one device-side BF16 cast per Q/K/V buffer, each O(T*dModel)
 // — negligible compared to the T*T*dHead attention work.
 
+// Backward counterpart to chiron_attention_shear_bf16 (non-materialized
+// flash attention).  Same orchestration as chiron_attention_shear_backward
+// (FP32 projections, O recomputation, output-projection backward, attention
+// backward, weight-grad accumulation) except the attention backward uses
+// flash_attention_multihead_backward_bf16 — which recomputes softmax
+// probabilities block-wise instead of reading a materialized probs tensor.
+//
+// Scratch: same as chiron_attention_shear_backward plus BF16 staging
+// buffers for Q/K/V (same as the forward).  No scratch_P / scratch_dP
+// (the whole point of flash attention).
+//
+// Intended for long-context (T >= 4096) training where the tiled variant's
+// O(nH*T^2) scratch_P + scratch_dP exceeds the GPU's remaining VRAM.
+bool chiron_attention_shear_backward_bf16(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    uint16_t* scratch_Qbf, uint16_t* scratch_Kbf, uint16_t* scratch_Vbf)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// Recompute forward intermediates.
+	if (!sgemm_rowmajor(T, dModel,   m, 1.0f, q, m, Wq, dModel,   0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+
+	// Cast to BF16 for flash attention.
+	if (!cast_f32_to_bf16(sQ, scratch_Qbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!cast_f32_to_bf16(sK, scratch_Kbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!cast_f32_to_bf16(sV, scratch_Vbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+
+	// Forward (recompute O in FP32) — needed by the tiled PV backward path
+	// that flash_attention_multihead_backward_bf16 takes as input.
+	if (!flash_attention_multihead_forward_bf16(scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	                                             T, nHeads, nKVHeads,
+	                                             dHead, dModel, dModelKV,
+	                                             causal, sO))
+		return false;
+
+	// Output-projection backward.
+	if (!sgemm_rowmajor_abt(T, dModel, m, 1.0f, dp_new, m, Wo, m, 0.0f, sdO, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	// Attention backward (flash, BF16 inputs).
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel,   computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModelKV, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModelKV, computeStream()));
+	if (!flash_attention_multihead_backward_bf16(scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	                                              sO, sdO,
+	                                              T, nHeads, nKVHeads,
+	                                              dHead, dModel, dModelKV,
+	                                              causal, sdQ, sdK, sdV))
+		return false;
+
+	// Project dQ/dK/dV back into q space.
+	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdQ, dModel, Wq, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdK, dModelKV, Wk, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdV, dModelKV, Wv, dModelKV, 1.0f, dq, m))
+		return false;
+
+	// Weight gradients.
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdK, dModelKV, 1.0f, dWk, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdV, dModelKV, 1.0f, dWv, dModelKV))
+		return false;
+	return true;
+}
+
 bool chiron_attention_shear_bf16(const float* q, float* p,
                                   const float* Wq, const float* Wk,
                                   const float* Wv, const float* Wo,

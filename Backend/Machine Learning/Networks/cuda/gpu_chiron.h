@@ -295,6 +295,24 @@ bool chiron_attention_shear_bf16(const float* q, float* p,
                                   uint16_t* scratch_Qbf, uint16_t* scratch_Kbf,
                                   uint16_t* scratch_Vbf);
 
+// Backward counterpart to chiron_attention_shear_bf16.  Uses flash attention
+// (non-materialized) for the attention backward — no O(nH*T^2) scratch for
+// the softmax probabilities.  Intended for long-context training where the
+// cuBLAS-tiled variant's scratch_P + scratch_dP exceeds GPU VRAM.
+//
+// dV, dK are ACCUMULATED (+=).  dQ is WRITTEN by the flash backward, then
+// projected back into q-space with +=.
+bool chiron_attention_shear_backward_bf16(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    uint16_t* scratch_Qbf, uint16_t* scratch_Kbf, uint16_t* scratch_Vbf);
+
 } // namespace gpu
 } // namespace glades
 
@@ -363,6 +381,13 @@ inline bool chiron_attention_shear_bf16(const float*, float*,
                                          bool, bool,
                                          float*, float*, float*, float*,
                                          uint16_t*, uint16_t*, uint16_t*) { return false; }
+inline bool chiron_attention_shear_backward_bf16(const float*, const float*,
+                                                  const float*, const float*, const float*, const float*,
+                                                  int, int, int, int, int, bool,
+                                                  float*, float*, float*, float*, float*,
+                                                  float*, float*, float*, float*,
+                                                  float*, float*, float*, float*,
+                                                  uint16_t*, uint16_t*, uint16_t*) { return false; }
 inline bool chiron_attention_shear_backward(const float*, const float*,
                                              const float*, const float*, const float*, const float*,
                                              int, int, int, int, int, bool,
