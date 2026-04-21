@@ -440,6 +440,69 @@ bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V
 }
 
 // ===========================================================================
+//  5b2. BF16 cuBLAS-tiled flash attention (tensor-core path).
+// ===========================================================================
+//
+// Same algorithm as flash_attention_cublas_tiled but with Q/K/V cast to
+// BF16 and GEMMs running on BF16 tensor cores (2x over TF32 on 4080 SUPER).
+// Softmax runs on the FP32 scratch_S; P is cast to BF16 for the PV GEMM.
+
+bool flash_attention_cublas_tiled_bf16(
+    const float* Q, const float* K, const float* V,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const size_t nPacked = static_cast<size_t>(T) * dModel;
+
+	// Cast Q/K/V once.
+	if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPacked)) return false;
+	if (!cast_f32_to_bf16(K, scratch_Kbf16, nPacked)) return false;
+	if (!cast_f32_to_bf16(V, scratch_Vbf16, nPacked)) return false;
+
+	// S = (1/sqrt(dH)) Q K^T via BF16 batched (_abt).
+	if (!sgemm_batched_strided_abt_bf16(
+	        T, T, dHead, invSqrtDH,
+	        scratch_Qbf16, dModel, (long long)dHead,
+	        scratch_Kbf16, dModel, (long long)dHead,
+	        0.0f,
+	        scratch_S, T, (long long)T * T,
+	        nHeads))
+		return false;
+
+	// Softmax in FP32 (same as FP32 path).
+	if (causal)
+	{
+		if (!causal_mask_softmax_inplace(scratch_S, nHeads, T)) return false;
+	}
+	else
+	{
+		if (!softmax_forward(scratch_S, nHeads * T, T, scratch_S)) return false;
+	}
+
+	// Cast P to BF16 for the PV GEMM.
+	const size_t nScores = static_cast<size_t>(nHeads) * T * T;
+	if (!cast_f32_to_bf16(scratch_S, scratch_Pbf16, nScores)) return false;
+
+	// O = P · V via BF16 batched (plain NN).
+	if (!sgemm_batched_strided_bf16(
+	        T, dHead, T, 1.0f,
+	        scratch_Pbf16, T, (long long)T * T,
+	        scratch_Vbf16, dModel, (long long)dHead,
+	        0.0f,
+	        O, dModel, (long long)dHead,
+	        nHeads))
+		return false;
+
+	return true;
+}
+
+// ===========================================================================
 //  5c. cuBLAS-tiled flash attention — BACKWARD.
 // ===========================================================================
 //

@@ -43,6 +43,7 @@ void CHIRONGpuFullBlockBackwardTest();
 void CHIRONGpuMultiBlockBackwardTest();
 void CHIRONMicroTrainingDemoTest();
 void CHIRONCublasTiledAttentionParityTest();
+void CHIRONCublasTiledAttentionBf16ParityTest();
 void CHIRONCublasTiledAttentionBackwardParityTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.

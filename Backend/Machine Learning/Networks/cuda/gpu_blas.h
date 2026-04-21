@@ -110,6 +110,32 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
                              float beta,
                              float* C, int ldc);
 
+// Batched-strided BF16 GEMMs (attention path). Inputs are BF16 bit
+// patterns (unsigned short); output is FP32. Uses BF16 tensor cores
+// via cublasGemmStridedBatchedEx + CUBLAS_COMPUTE_32F_FAST_16BF, giving
+// ~2x throughput over TF32-tensor-core SGEMM on Ampere/Ada/Hopper.
+bool sgemm_batched_strided_bf16(int M, int N, int K,
+                                float alpha,
+                                const unsigned short* A, int lda, long long strideA,
+                                const unsigned short* B, int ldb, long long strideB,
+                                float beta,
+                                float* C, int ldc, long long strideC,
+                                int batchCount);
+bool sgemm_batched_strided_abt_bf16(int M, int N, int K,
+                                    float alpha,
+                                    const unsigned short* A, int lda, long long strideA,
+                                    const unsigned short* B, int ldb, long long strideB,
+                                    float beta,
+                                    float* C, int ldc, long long strideC,
+                                    int batchCount);
+bool sgemm_batched_strided_atb_bf16(int M, int N, int K,
+                                    float alpha,
+                                    const unsigned short* A, int lda, long long strideA,
+                                    const unsigned short* B, int ldb, long long strideB,
+                                    float beta,
+                                    float* C, int ldc, long long strideC,
+                                    int batchCount);
+
 // Row-major right-side upper-triangular solve (in-place):
 // Solves X[M,N] * R[N,N] = alpha * B[M,N]  where R is upper triangular.
 // B is overwritten with the solution X.

@@ -2224,7 +2224,55 @@ void CHIRONUnitTest()
 	CHIRONMicroTrainingDemoTest();
 	CHIRONCublasTiledAttentionParityTest();
 	CHIRONCublasTiledAttentionBackwardParityTest();
+	CHIRONCublasTiledAttentionBf16ParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
+}
+
+// BF16 cuBLAS-tiled attention parity vs. the FP32 cuBLAS-tiled variant.
+void CHIRONCublasTiledAttentionBf16ParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice()) { std::printf("  [bf16 parity] no CUDA\n"); return; }
+
+	const unsigned int T = 32, nH = 4, dH = 32;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(42u);
+	std::vector<float> Q(T * dM), K(T * dM), V(T * dM);
+	for (size_t i = 0; i < Q.size(); ++i) Q[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < K.size(); ++i) K[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_O_fp32, d_O_bf16, d_S;
+	glades::gpu::GpuBuffer<uint16_t> d_Qbf, d_Kbf, d_Vbf, d_Pbf;
+	d_Q.allocate(Q.size()); d_K.allocate(K.size()); d_V.allocate(V.size());
+	d_O_fp32.allocate(T * dM); d_O_bf16.allocate(T * dM);
+	d_S.allocate((size_t)nH * T * T);
+	d_Qbf.allocate(T * dM); d_Kbf.allocate(T * dM); d_Vbf.allocate(T * dM);
+	d_Pbf.allocate((size_t)nH * T * T);
+	d_Q.upload(&Q[0], Q.size()); d_K.upload(&K[0], K.size()); d_V.upload(&V[0], V.size());
+
+	ASSERT("fp32 cublas-tiled", glades::gpu::flash_attention_cublas_tiled(
+	    d_Q.data(), d_K.data(), d_V.data(),
+	    (int)T, (int)nH, (int)dH, (int)dM, causal, d_O_fp32.data(), d_S.data()));
+	ASSERT("bf16 cublas-tiled", glades::gpu::flash_attention_cublas_tiled_bf16(
+	    d_Q.data(), d_K.data(), d_V.data(),
+	    (int)T, (int)nH, (int)dH, (int)dM, causal, d_O_bf16.data(),
+	    d_S.data(), d_Qbf.data(), d_Kbf.data(), d_Vbf.data(), d_Pbf.data()));
+
+	std::vector<float> O_fp32(T * dM), O_bf16(T * dM);
+	d_O_fp32.download(&O_fp32[0], T * dM);
+	d_O_bf16.download(&O_bf16[0], T * dM);
+	const float err = max_abs_diff(O_fp32, O_bf16);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "bf16 vs fp32 cublas-tiled parity: max_err=%.3e (tol 5e-2 BF16)", err);
+	ASSERT(msg, err < 5e-2f);
+	std::printf("  cuBLAS-tiled BF16 attention parity: max_err=%.3e\n", err);
+#else
+	std::printf("  [bf16 parity] GLADES_HAVE_CUDA not defined\n");
+#endif
 }
 
 // ---------------------------------------------------------------------------

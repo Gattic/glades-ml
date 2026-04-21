@@ -459,6 +459,17 @@ struct GpuTransformerScratch
 	// Allocated lazily.
 	GpuBuffer<float> attnDPScratch;
 
+	// BF16 scratches for the cuBLAS-tiled BF16 flash-attention variant
+	// (research/WMMA_ATTENTION_PLAN.md — doubles the attention GEMM
+	// throughput by running on BF16 tensor cores).  Q/K/V are cast
+	// from the FP32 inputs once per forward.  P is cast after softmax.
+	// Allocated lazily and shared across the FWD path; the BWD path
+	// still uses the FP32 cuBLAS variant for numerical safety on dP.
+	GpuBuffer<uint16_t> attnQbf16;      // [T, dModel]
+	GpuBuffer<uint16_t> attnKbf16;      // [T, dModelKV]
+	GpuBuffer<uint16_t> attnVbf16;      // [T, dModelKV]
+	GpuBuffer<uint16_t> attnPbf16;      // [nHeads, T, T]
+
 	// GPU loss computation scalars
 	GpuBuffer<float> lossSum;    // [1]
 	GpuBuffer<int> lossCount;    // [1]  (valid token count)

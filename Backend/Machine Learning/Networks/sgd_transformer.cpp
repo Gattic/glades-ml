@@ -9,6 +9,7 @@
 #include "glades_thread_pool.h"
 #include "ddp_comm.h"
 #include <cstdlib> // getenv for BF16 per-site debug
+#include <cstring> // strcmp for GLADES_CHIRON_ATTN env gating
 
 #ifdef GLADES_HAVE_CUDA
 #include "cuda/gpu_dispatch.h"
@@ -9908,7 +9909,45 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 					const size_t scoresNeeded = static_cast<size_t>(nHeads) * T * T;
 					if (gpuTransformerScratch->attnScoresScratch.size() < scoresNeeded)
 						gpuTransformerScratch->attnScoresScratch.allocate(scoresNeeded);
-					if (gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded)
+					// BF16 tensor-core path (opt-in): 2x GEMM throughput but
+					// cast overhead dominates at small dHead.  Benefits larger
+					// shapes (T>=2048, dHead>=128).  Gate via GLADES_CHIRON_ATTN=bf16.
+					// Default "fp32" (or unset) keeps the proven 5.8x fp32 cuBLAS path.
+					static const char* s_attnMode = std::getenv("GLADES_CHIRON_ATTN");
+					const bool want_bf16 = s_attnMode && std::strcmp(s_attnMode, "bf16") == 0;
+					bool bf16_ok = false;
+					if (want_bf16)
+					{
+						const size_t qkvN = static_cast<size_t>(T) * dModel;
+						if (gpuTransformerScratch->attnQbf16.size() < qkvN)
+							gpuTransformerScratch->attnQbf16.allocate(qkvN);
+						if (gpuTransformerScratch->attnKbf16.size() < qkvN)
+							gpuTransformerScratch->attnKbf16.allocate(qkvN);
+						if (gpuTransformerScratch->attnVbf16.size() < qkvN)
+							gpuTransformerScratch->attnVbf16.allocate(qkvN);
+						if (gpuTransformerScratch->attnPbf16.size() < scoresNeeded)
+							gpuTransformerScratch->attnPbf16.allocate(scoresNeeded);
+						bf16_ok =
+						    gpuTransformerScratch->attnQbf16.size() >= qkvN &&
+						    gpuTransformerScratch->attnKbf16.size() >= qkvN &&
+						    gpuTransformerScratch->attnVbf16.size() >= qkvN &&
+						    gpuTransformerScratch->attnPbf16.size() >= scoresNeeded &&
+						    gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded;
+					}
+					if (bf16_ok)
+					{
+						gpu::flash_attention_cublas_tiled_bf16(
+						    Q_l, K_l, V_l,
+						    static_cast<int>(T), static_cast<int>(nHeads),
+						    static_cast<int>(dHead), static_cast<int>(dModel),
+						    causal, attnConcat_l,
+						    gpuTransformerScratch->attnScoresScratch.data(),
+						    gpuTransformerScratch->attnQbf16.data(),
+						    gpuTransformerScratch->attnKbf16.data(),
+						    gpuTransformerScratch->attnVbf16.data(),
+						    gpuTransformerScratch->attnPbf16.data());
+					}
+					else if (gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded)
 					{
 						gpu::flash_attention_cublas_tiled(Q_l, K_l, V_l,
 						    static_cast<int>(T), static_cast<int>(nHeads),

@@ -950,6 +950,97 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
 	                        "cublasGemmEx(BF16,ABT)");
 }
 
+// === Batched-strided BF16 GEMMs (attention path) ===
+//
+// Mirrors the FP32 batched-strided variants but uses
+// cublasGemmStridedBatchedEx with CUDA_R_16BF inputs and FP32 accumulate
+// on BF16 tensor cores (CUBLAS_COMPUTE_32F_FAST_16BF). Throughput on
+// Ampere/Ada is ~2x the TF32-tensor-core SGEMM path.
+//
+// Inputs are unsigned short (BF16 bit patterns); outputs remain FP32.
+// Caller must pre-cast FP32 tensors to BF16 via cast_f32_to_bf16 once
+// per forward (cheap relative to the attention FLOP cost).
+
+static bool gemmex_sb_bf16_impl(cublasOperation_t transa, cublasOperation_t transb,
+                                int M, int N, int K,
+                                float alpha,
+                                const unsigned short* A, int lda, long long strideA,
+                                const unsigned short* B, int ldb, long long strideB,
+                                float beta,
+                                float* C, int ldc, long long strideC,
+                                int batchCount,
+                                const char* label)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+	cublasStatus_t st = cublasGemmStridedBatchedEx(g_handle,
+	    transa, transb,
+	    N, M, K,
+	    &alpha,
+	    B, CUDA_R_16BF, ldb, strideB,
+	    A, CUDA_R_16BF, lda, strideA,
+	    &beta,
+	    C, CUDA_R_32F, ldc, strideC,
+	    batchCount,
+	    CUBLAS_COMPUTE_32F_FAST_16BF,
+	    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] %s failed: %d (M=%d N=%d K=%d bc=%d)\n",
+		        label, static_cast<int>(st), M, N, K, batchCount);
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_batched_strided_bf16(int M, int N, int K,
+                                float alpha,
+                                const unsigned short* A, int lda, long long strideA,
+                                const unsigned short* B, int ldb, long long strideB,
+                                float beta,
+                                float* C, int ldc, long long strideC,
+                                int batchCount)
+{
+	return gemmex_sb_bf16_impl(CUBLAS_OP_N, CUBLAS_OP_N,
+	                            M, N, K,
+	                            alpha, A, lda, strideA, B, ldb, strideB,
+	                            beta, C, ldc, strideC,
+	                            batchCount,
+	                            "cublasGemmStridedBatchedEx(BF16)");
+}
+
+bool sgemm_batched_strided_abt_bf16(int M, int N, int K,
+                                    float alpha,
+                                    const unsigned short* A, int lda, long long strideA,
+                                    const unsigned short* B, int ldb, long long strideB,
+                                    float beta,
+                                    float* C, int ldc, long long strideC,
+                                    int batchCount)
+{
+	return gemmex_sb_bf16_impl(CUBLAS_OP_T, CUBLAS_OP_N,
+	                            M, N, K,
+	                            alpha, A, lda, strideA, B, ldb, strideB,
+	                            beta, C, ldc, strideC,
+	                            batchCount,
+	                            "cublasGemmStridedBatchedEx(BF16,ABT)");
+}
+
+bool sgemm_batched_strided_atb_bf16(int M, int N, int K,
+                                    float alpha,
+                                    const unsigned short* A, int lda, long long strideA,
+                                    const unsigned short* B, int ldb, long long strideB,
+                                    float beta,
+                                    float* C, int ldc, long long strideC,
+                                    int batchCount)
+{
+	return gemmex_sb_bf16_impl(CUBLAS_OP_N, CUBLAS_OP_T,
+	                            M, N, K,
+	                            alpha, A, lda, strideA, B, ldb, strideB,
+	                            beta, C, ldc, strideC,
+	                            batchCount,
+	                            "cublasGemmStridedBatchedEx(BF16,ATB)");
+}
+
 } // namespace gpu
 } // namespace glades
 

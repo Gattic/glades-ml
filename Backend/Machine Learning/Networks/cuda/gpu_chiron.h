@@ -182,6 +182,26 @@ bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V
                                     bool causal,
                                     float* O, float* scratch_S);
 
+// BF16-tensor-core variant.  Casts Q/K/V to BF16 once, uses BF16 batched
+// GEMMs (CUBLAS_COMPUTE_32F_FAST_16BF).  Throughput ~2x over the FP32
+// variant on Ampere/Ada/Hopper (TF32 ~25 TFLOP/s vs BF16 ~52 TFLOP/s on
+// RTX 4080 SUPER).
+//
+// Scratch:
+//   scratch_S       [nH, T, T]   FP32 attention scores
+//   scratch_Qbf16   [T, dModel]  BF16 Q cast
+//   scratch_Kbf16   [T, dModel]  BF16 K cast
+//   scratch_Vbf16   [T, dModel]  BF16 V cast
+//   scratch_Pbf16   [nH, T, T]   BF16 P cast (for the PV GEMM)
+bool flash_attention_cublas_tiled_bf16(
+    const float* Q, const float* K, const float* V,
+    int T, int nHeads, int dHead, int dModel,
+    bool causal,
+    float* O,
+    float* scratch_S,
+    unsigned short* scratch_Qbf16, unsigned short* scratch_Kbf16,
+    unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16);
+
 // cuBLAS-tiled backward counterpart.  Given Q, K, V, O (unused, kept for
 // API symmetry), and the upstream gradient dO, produces dQ, dK, dV.
 //
@@ -261,6 +281,11 @@ inline bool chiron_attention_shear(const float*, float*,
 inline bool flash_attention_cublas_tiled(const float*, const float*, const float*,
                                           int, int, int, int, bool,
                                           float*, float*) { return false; }
+inline bool flash_attention_cublas_tiled_bf16(
+    const float*, const float*, const float*,
+    int, int, int, int, bool,
+    float*, float*,
+    unsigned short*, unsigned short*, unsigned short*, unsigned short*) { return false; }
 inline bool flash_attention_backward_cublas_tiled(
     const float*, const float*, const float*,
     const float*, const float*,
