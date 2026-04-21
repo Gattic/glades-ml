@@ -4115,6 +4115,104 @@ void CHIRONProductionScaleMemoryTest()
 	              "prod-scale reconstruction: q_err=%.3e p_err=%.3e (FP32 tol 1e-3)",
 	              q_err, p_err);
 	ASSERT(msg, q_err < 1e-3f && p_err < 1e-3f);
+
+	// --- Run full L-block backward with inverse-based reconstruction ---
+	// Measures backward time + additional VRAM for the backward scratch.
+	// Upstream gradient: arbitrary (the loss functional doesn't matter here,
+	// we only care about wall-clock and memory).
+	glades::gpu::GpuBuffer<float> d_dq_next, d_dp_next, d_dq, d_dp;
+	glades::gpu::GpuBuffer<float> d_dWq, d_dWk, d_dWv, d_dWo, d_dgamma, d_dbeta;
+	glades::gpu::GpuBuffer<float> d_stats_split;
+	d_dq_next.allocate(T * m); d_dp_next.allocate(T * m);
+	d_dq.allocate(T * m); d_dp.allocate(T * m);
+	d_dWq.allocate(m * dH); d_dWk.allocate(m * dH);
+	d_dWv.allocate(m * dH); d_dWo.allocate(dH * m);
+	d_dgamma.allocate(m); d_dbeta.allocate(m);
+	d_stats_split.allocate(2 * T);
+
+	size_t vram_after_bwd_scratch = 0;
+	chiron_get_vram(vram_after_bwd_scratch, vram_total);
+	const double total_chiron_mb =
+	    static_cast<double>(vram_start - vram_after_bwd_scratch) / (1024.0 * 1024.0);
+	std::printf("    CHIRON total VRAM (fwd+bwd scratch):                 %.1f MB\n",
+	            total_chiron_mb);
+	std::printf("    End-to-end reduction:                                 %.2fx\n",
+	            total_chiron_mb > 0.0 ? (std_act_mb / total_chiron_mb) : 0.0);
+
+	// Reset upstream gradient.
+	std::vector<float> dq_out(T * m, 1e-3f), dp_out(T * m, 1e-3f);
+	d_dq_next.upload(&dq_out[0], T * m);
+	d_dp_next.upload(&dp_out[0], T * m);
+	// Reset weight grads so we actually accumulate.
+	d_dWq.zero(); d_dWk.zero(); d_dWv.zero(); d_dWo.zero();
+	d_dgamma.zero(); d_dbeta.zero();
+
+	// Also re-run forward to re-populate d_q at the top of the stack (it was
+	// consumed by the inverse loop above).
+	d_q.upload(&q0[0], T * m); d_p.upload(&p0[0], T * m);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		glades::gpu::chiron_attention_shear(
+		    d_q.data(), d_p.data(),
+		    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+		    (int)T, (int)m, (int)nH, (int)nH, (int)dH,
+		    causal, false,
+		    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data());
+		glades::gpu::chiron_reln_forward(
+		    d_q.data(), d_qtmp.data(),
+		    d_stats_all.data() + (size_t)l * T * 2u,
+		    d_gamma.data(), d_beta.data(), (int)T, (int)m, eps);
+		glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(), sizeof(float) * T * m);
+	}
+	glades::gpu::synchronizeCheck("prod fwd2");
+
+	t0 = wall_ms_chiron();
+	for (unsigned int ll = 0; ll < L; ++ll)
+	{
+		const unsigned int l = L - 1 - ll;
+
+		// Inverse: reconstruct q_in for this layer.
+		glades::gpu::chiron_reln_inverse(
+		    d_q.data(), d_qtmp.data(),
+		    d_stats_all.data() + (size_t)l * T * 2u,
+		    d_gamma.data(), d_beta.data(), (int)T, (int)m);
+		// d_qtmp now holds q_post_attn; d_q still holds q_out (before reln).
+		// We want d_q to hold q_post_attn for the backward (post-attn,
+		// pre-reln reconstruction).  Swap via memcpy.
+		glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(), sizeof(float) * T * m);
+		glades::gpu::chiron_attention_shear(
+		    d_q.data(), d_p.data(),
+		    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+		    (int)T, (int)m, (int)nH, (int)nH, (int)dH,
+		    causal, true,
+		    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data());
+
+		// Backward: ReLN + shear backward via the composition helpers.
+		glades::gpu::chiron_reln_backward(
+		    d_dq_next.data(), d_q.data(),
+		    d_gamma.data(),
+		    d_stats_all.data() + (size_t)l * T * 2u,
+		    (int)T, (int)m,
+		    d_dq.data(), d_dgamma.data(), d_dbeta.data(),
+		    d_stats_split.data());
+		glades::gpu::chiron_attention_shear_backward(
+		    d_q.data(), d_dp_next.data(),
+		    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+		    (int)T, (int)m, (int)nH, (int)nH, (int)dH, causal,
+		    d_dq.data(),
+		    d_dWq.data(), d_dWk.data(), d_dWv.data(), d_dWo.data(),
+		    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+		    d_sdO.data(), d_sdQ.data(), d_sdK.data(), d_sdV.data());
+		glades::gpu::device_memcpy_d2d(d_dq_next.data(), d_dq.data(), sizeof(float) * T * m);
+		// dp_new = dp_out for shear; no change.
+	}
+	glades::gpu::synchronizeCheck("prod bwd");
+	const double tbwd_ms = wall_ms_chiron() - t0;
+	std::printf("    Backward (L=%u blocks) time:  %.2f ms  (%.2f ms/block)\n",
+	            L, tbwd_ms, tbwd_ms / L);
+	std::printf("    Full fwd+bwd step time:       %.2f ms\n", tfwd_ms + tbwd_ms);
+	std::printf("    Tokens/sec throughput:         %.0f (T=%u per step)\n",
+	            T * 1000.0 / (tfwd_ms + tbwd_ms), T);
 #else
 	std::printf("  [CHIRON prod-scale mem] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
