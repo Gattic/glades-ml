@@ -2218,7 +2218,115 @@ void CHIRONUnitTest()
 	CHIRONGpuAttentionShearParityTest();
 	CHIRONGpuFullBlockEndToEndTest();
 	CHIRONGpuReLNBackwardTest();
+	CHIRONGpuAttentionShearBackwardTest();
 	std::printf("=== CHIRON tests done ===\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Case 18: chiron_attention_shear_backward — FD gradient check.
+//
+// For the loss L = sum(dp_ref * p_new), we have dL/dp_new = dp_ref,
+// dL/dp = dp_ref (identity, since shear is p += Y), and dL/dq flows
+// only through Y(q).  We verify dL/dq via central-difference.
+// ---------------------------------------------------------------------------
+void CHIRONGpuAttentionShearBackwardTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON attn_shear_backward] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T  = 4;
+	const unsigned int m  = 16;
+	const unsigned int nH = 1;
+	const unsigned int dH = 16;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(4242u);
+	std::vector<float> q(T * m), p(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	std::vector<float> dp_ref(T * m);
+	for (unsigned int i = 0; i < q.size(); ++i) q[i] = 0.3f * rng.next_unit();
+	for (unsigned int i = 0; i < p.size(); ++i) p[i] = 0.3f * rng.next_unit();
+	for (unsigned int i = 0; i < dp_ref.size(); ++i) dp_ref[i] = 0.3f * rng.next_unit();
+	for (unsigned int i = 0; i < Wq.size(); ++i) Wq[i] = 0.1f * rng.next_unit();
+	for (unsigned int i = 0; i < Wk.size(); ++i) Wk[i] = 0.1f * rng.next_unit();
+	for (unsigned int i = 0; i < Wv.size(); ++i) Wv[i] = 0.1f * rng.next_unit();
+	for (unsigned int i = 0; i < Wo.size(); ++i) Wo[i] = 0.1f * rng.next_unit();
+
+	// --- Analytical dq via GPU ---
+	glades::gpu::GpuBuffer<float> d_q, d_dp, d_Wq, d_Wk, d_Wv, d_Wo;
+	glades::gpu::GpuBuffer<float> d_dq, d_dWq, d_dWk, d_dWv, d_dWo;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO;
+	glades::gpu::GpuBuffer<float> d_sdO, d_sdQ, d_sdK, d_sdV;
+	d_q.allocate(q.size()); d_dp.allocate(dp_ref.size());
+	d_Wq.allocate(Wq.size()); d_Wk.allocate(Wk.size());
+	d_Wv.allocate(Wv.size()); d_Wo.allocate(Wo.size());
+	d_dq.allocate(q.size());
+	d_dWq.allocate(Wq.size()); d_dWk.allocate(Wk.size());
+	d_dWv.allocate(Wv.size()); d_dWo.allocate(Wo.size());
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM); d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_sdO.allocate(T * dM); d_sdQ.allocate(T * dM); d_sdK.allocate(T * dM); d_sdV.allocate(T * dM);
+	d_q.upload(&q[0], q.size()); d_dp.upload(&dp_ref[0], dp_ref.size());
+	d_Wq.upload(&Wq[0], Wq.size()); d_Wk.upload(&Wk[0], Wk.size());
+	d_Wv.upload(&Wv[0], Wv.size()); d_Wo.upload(&Wo[0], Wo.size());
+	d_dq.zero(); d_dWq.zero(); d_dWk.zero(); d_dWv.zero(); d_dWo.zero();
+
+	ASSERT("chiron_attention_shear_backward",
+	       glades::gpu::chiron_attention_shear_backward(
+	           d_q.data(), d_dp.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           static_cast<int>(T), static_cast<int>(m),
+	           static_cast<int>(nH), static_cast<int>(nH), static_cast<int>(dH),
+	           causal,
+	           d_dq.data(),
+	           d_dWq.data(), d_dWk.data(), d_dWv.data(), d_dWo.data(),
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+	           d_sdO.data(), d_sdQ.data(), d_sdK.data(), d_sdV.data()));
+	std::vector<float> dq_gpu(q.size());
+	d_dq.download(&dq_gpu[0], q.size());
+
+	// --- Finite-difference dL/dq using the CPU reference ---
+	// L(q) = sum(dp_ref * (p + Y(q))) = const + sum(dp_ref * Y(q)).
+	// Perturb each q[i] by +/-fd_eps, compute Y, measure L change.
+	const float fd_eps = 1e-3f;
+	std::vector<float> q_pert(q);
+	std::vector<float> Y_plus(T * m), Y_minus(T * m);
+	std::vector<float> dq_fd(q.size(), 0.0f);
+
+	for (unsigned int i = 0; i < q.size(); ++i)
+	{
+		q_pert[i] += fd_eps;
+		chiron_attn_shear(&q_pert[0], &Wq[0], &Wk[0], &Wv[0], &Wo[0],
+		                   T, m, dM, causal, &Y_plus[0]);
+		q_pert[i] -= 2.0f * fd_eps;
+		chiron_attn_shear(&q_pert[0], &Wq[0], &Wk[0], &Wv[0], &Wo[0],
+		                   T, m, dM, causal, &Y_minus[0]);
+		q_pert[i] += fd_eps;
+		double Lp = 0.0, Lm = 0.0;
+		for (unsigned int j = 0; j < T * m; ++j)
+		{
+			Lp += static_cast<double>(dp_ref[j]) * Y_plus[j];
+			Lm += static_cast<double>(dp_ref[j]) * Y_minus[j];
+		}
+		dq_fd[i] = static_cast<float>((Lp - Lm) / (2.0 * fd_eps));
+	}
+
+	const float err = max_abs_diff(dq_gpu, dq_fd);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "chiron_attention_shear_backward dq vs FD: max_err=%.3e "
+	              "(tol 5e-2 — attention FD is noisier than LN FD)",
+	              err);
+	ASSERT(msg, err < 5e-2f);
+
+	std::printf("  CHIRON attn_shear_backward dq vs FD: max_err=%.3e\n", err);
+#else
+	std::printf("  [CHIRON attn_shear_backward] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
 }
 
 // ---------------------------------------------------------------------------

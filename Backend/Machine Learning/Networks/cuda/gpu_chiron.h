@@ -131,6 +131,32 @@ bool chiron_attention_shear(const float* q, float* p,
                              float* scratch_Q, float* scratch_K,
                              float* scratch_V, float* scratch_O);
 
+// Backward through the symplectic attention shear.  Given the upstream
+// p-gradient dp_new and the reconstructed q (via the block inverse),
+// computes:
+//   dq        += dL/dq contribution from the three Q/K/V projections
+//                and the two p·Wo-like paths.  Shear-additive in p
+//                means dL/dp = dL/dp_new (no change).
+//   dWq, dWk, dWv, dWo: accumulated weight gradients (+=).
+//
+// Internally: recomputes Q/K/V/O from q, then calls
+// flash_attention_multihead_backward for dQ/dK/dV, plus the output
+// projection backward via cuBLAS.
+//
+// Scratch (caller-owned):
+//   sQ, sK, sV, sO             : each [T, dModel] (dModelKV for K/V)
+//   sdO, sdQ, sdK, sdV         : each same size, for the backward
+//                                intermediates.
+bool chiron_attention_shear_backward(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV);
+
 // BF16-input attention shear.  Computes Q/K/V in FP32 via cuBLAS, casts
 // down to BF16 for the flash-attention core, then casts the output back.
 // The existing flash_attention_multihead_forward_bf16 kernel is heavily
@@ -185,6 +211,12 @@ inline bool chiron_attention_shear_bf16(const float*, float*,
                                          bool, bool,
                                          float*, float*, float*, float*,
                                          uint16_t*, uint16_t*, uint16_t*) { return false; }
+inline bool chiron_attention_shear_backward(const float*, const float*,
+                                             const float*, const float*, const float*, const float*,
+                                             int, int, int, int, int, bool,
+                                             float*, float*, float*, float*, float*,
+                                             float*, float*, float*, float*,
+                                             float*, float*, float*, float*) { return false; }
 
 } // namespace gpu
 } // namespace glades

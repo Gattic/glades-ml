@@ -38,6 +38,7 @@ void CHIRONGpuEndToEndTest();
 void CHIRONGpuAttentionShearParityTest();
 void CHIRONGpuFullBlockEndToEndTest();
 void CHIRONGpuReLNBackwardTest();
+void CHIRONGpuAttentionShearBackwardTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

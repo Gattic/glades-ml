@@ -382,6 +382,101 @@ bool chiron_attention_shear(const float* q, float* p,
 }
 
 // ===========================================================================
+//  6b. Symplectic attention shear — backward.
+// ===========================================================================
+//
+// Backward through the forward:
+//   Q = q · Wq,   K = q · Wk,   V = q · Wv
+//   O = flash_attn(Q, K, V)
+//   Y = O · Wo
+//   p_new = p + Y
+//
+// Gradients (composition of chain rule):
+//   dL/dp      = dL/dp_new                                         (identity)
+//   dL/dY      = dL/dp_new                                         (identity)
+//   dL/dO      = dL/dY · Wo^T          (sgemm_rowmajor_abt)
+//   dL/dWo    += O^T · dL/dY           (sgemm_rowmajor_atb)
+//   dL/dQ, dK, dV  ← flash_attention_multihead_backward(Q, K, V, O, dO)
+//   dL/dq     += dL/dQ · Wq^T          (sgemm_rowmajor_abt, beta=1)
+//   dL/dq     += dL/dK · Wk^T
+//   dL/dq     += dL/dV · Wv^T
+//   dL/dWq    += q^T · dL/dQ           (sgemm_rowmajor_atb, beta=1)
+//   dL/dWk    += q^T · dL/dK
+//   dL/dWv    += q^T · dL/dV
+//
+// All the sgemms are existing cuBLAS wrappers.  The flash-attention
+// backward is the existing kernel.  This function is pure orchestration.
+
+bool chiron_attention_shear_backward(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// --- Recompute forward intermediates (Q, K, V, O) from q ---
+	if (!sgemm_rowmajor(T, dModel,   m, 1.0f, q, m, Wq, dModel,   0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, sK, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, sV, dModelKV))
+		return false;
+	if (!flash_attention_multihead_forward(sQ, sK, sV,
+	                                        T, nHeads, nKVHeads,
+	                                        dHead, dModel, dModelKV,
+	                                        causal, sO))
+		return false;
+
+	// --- Output-projection backward: dL/dO = dL/dp_new · Wo^T ---
+	// dp_new: [T, m]; Wo: [dModel, m]; dO: [T, dModel]; dO = dp_new · Wo^T
+	if (!sgemm_rowmajor_abt(T, dModel, m, 1.0f, dp_new, m, Wo, m, 0.0f, sdO, dModel))
+		return false;
+
+	// --- dL/dWo += O^T · dp_new ---
+	// O: [T, dModel]; dp_new: [T, m]; dWo: [dModel, m]; dWo += O^T · dp_new
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	// --- Attention backward: given dO, produce dQ, dK, dV ---
+	// Note: flash_attention_multihead_backward WRITES to dQ and ACCUMULATES
+	// into dK, dV (via atomicAdd for the shared K/V case).  Zero them first.
+	// We use sdQ/sdK/sdV as LOCAL dQ/dK/dV accumulators.
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel,   computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModelKV, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModelKV, computeStream()));
+	if (!flash_attention_multihead_backward(sQ, sK, sV, sO, sdO,
+	                                         T, nHeads, nKVHeads,
+	                                         dHead, dModel, dModelKV,
+	                                         causal, sdQ, sdK, sdV))
+		return false;
+
+	// --- Project dQ/dK/dV back into q space.  dq += dQ · Wq^T (etc.) ---
+	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdQ, dModel, Wq, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdK, dModelKV, Wk, dModelKV, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModelKV, 1.0f, sdV, dModelKV, Wv, dModelKV, 1.0f, dq, m))
+		return false;
+
+	// --- Weight gradients: dWq += q^T · dQ (etc.) ---
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdK, dModelKV, 1.0f, dWk, dModelKV))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModelKV, T, 1.0f, q, m, sdV, dModelKV, 1.0f, dWv, dModelKV))
+		return false;
+
+	return true;
+}
+
+// ===========================================================================
 //  7. Symplectic attention shear — BF16-input flash-attention variant.
 // ===========================================================================
 //
