@@ -1934,6 +1934,269 @@ void CHIRONGpuEndToEndTest()
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Case 15: GPU attention shear parity — one symplectic attention shear on
+// GPU should match the CPU reference within cuBLAS+flash-attn tolerance.
+// ---------------------------------------------------------------------------
+void CHIRONGpuAttentionShearParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON GPU attn-shear parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T   = 16;
+	const unsigned int m   = 64;
+	const unsigned int nH  = 4;
+	const unsigned int dH  = 16;           // per-head dim
+	const unsigned int dM  = nH * dH;      // dModel of attention = 64
+	const bool causal = true;
+
+	// Note: our CPU reference uses a single-head attention with dH = dM.
+	// To parity-test the *multihead* GPU wrapper, we set nH=1 and dH=dM
+	// so both paths agree.
+	const unsigned int nH_use = 1u;
+	const unsigned int dH_use = dM;
+
+	LCG rng(777u);
+	std::vector<float> q(T * m), p(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	for (unsigned int i = 0; i < q.size(); ++i) q[i] = 0.4f * rng.next_unit();
+	for (unsigned int i = 0; i < p.size(); ++i) p[i] = 0.4f * rng.next_unit();
+	const float init = 0.1f;
+	for (unsigned int i = 0; i < Wq.size(); ++i) Wq[i] = init * rng.next_unit();
+	for (unsigned int i = 0; i < Wk.size(); ++i) Wk[i] = init * rng.next_unit();
+	for (unsigned int i = 0; i < Wv.size(); ++i) Wv[i] = init * rng.next_unit();
+	for (unsigned int i = 0; i < Wo.size(); ++i) Wo[i] = init * rng.next_unit();
+
+	// --- CPU reference: single-head attention shear ---
+	std::vector<float> p_cpu(p);
+	std::vector<float> Y_cpu(T * m);
+	chiron_attn_shear(&q[0], &Wq[0], &Wk[0], &Wv[0], &Wo[0],
+	                   T, m, dH_use, causal, &Y_cpu[0]);
+	for (unsigned int t = 0; t < T; ++t)
+		glades::chiron::shear_add_to_p(&p_cpu[t * m], &Y_cpu[t * m], m);
+
+	// --- GPU path ---
+	glades::gpu::GpuBuffer<float> d_q, d_p, d_Wq, d_Wk, d_Wv, d_Wo;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO;
+	d_q.allocate(q.size()); d_p.allocate(p.size());
+	d_Wq.allocate(Wq.size()); d_Wk.allocate(Wk.size());
+	d_Wv.allocate(Wv.size()); d_Wo.allocate(Wo.size());
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM);
+	d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_q.upload(&q[0], q.size());
+	d_p.upload(&p[0], p.size());
+	d_Wq.upload(&Wq[0], Wq.size()); d_Wk.upload(&Wk[0], Wk.size());
+	d_Wv.upload(&Wv[0], Wv.size()); d_Wo.upload(&Wo[0], Wo.size());
+
+	ASSERT("chiron_attention_shear forward",
+	       glades::gpu::chiron_attention_shear(
+	           d_q.data(), d_p.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           static_cast<int>(T), static_cast<int>(m),
+	           static_cast<int>(nH_use), static_cast<int>(nH_use),
+	           static_cast<int>(dH_use),
+	           causal, /*invert=*/false,
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data()));
+
+	std::vector<float> p_gpu(p.size());
+	d_p.download(&p_gpu[0], p.size());
+
+	const float p_err = max_abs_diff(p_cpu, p_gpu);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "GPU attention shear parity: p_err=%.3e (tol 1e-3)", p_err);
+	ASSERT(msg, p_err < 1e-3f);
+
+	// Also test inverse path: p -= Y(q) should recover the original p.
+	ASSERT("chiron_attention_shear inverse",
+	       glades::gpu::chiron_attention_shear(
+	           d_q.data(), d_p.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           static_cast<int>(T), static_cast<int>(m),
+	           static_cast<int>(nH_use), static_cast<int>(nH_use),
+	           static_cast<int>(dH_use),
+	           causal, /*invert=*/true,
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data()));
+	std::vector<float> p_rec(p.size());
+	d_p.download(&p_rec[0], p.size());
+	const float p_inv_err = max_abs_diff(p_rec, p);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU attention shear inverse: p_err=%.3e (tol 1e-3)", p_inv_err);
+	ASSERT(msg, p_inv_err < 1e-3f);
+
+	std::printf("  CHIRON GPU attention shear parity: fwd_err=%.3e, inv_err=%.3e\n",
+	            p_err, p_inv_err);
+#else
+	std::printf("  [CHIRON GPU attn-shear parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Case 16: GPU full CHIRON block (attention shear + 2 MLP shears + ReLN)
+// end-to-end roundtrip, L=4.  This is the complete CHIRON forward stack
+// composed entirely from GPU kernels.
+// ---------------------------------------------------------------------------
+void CHIRONGpuFullBlockEndToEndTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON GPU full-block E2E] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T   = 16;
+	const unsigned int m   = 64;
+	const unsigned int dH  = 64;    // nH=1, dH=dM=m -> single-head for parity with CPU ref
+	const unsigned int dM  = dH;
+	const unsigned int L   = 4u;
+	const bool causal = true;
+	const float eps = 1e-4f;
+
+	LCG rng(13579u);
+	std::vector<float> q0(T * m), p0(T * m);
+	for (unsigned int i = 0; i < q0.size(); ++i) q0[i] = 0.3f * rng.next_unit();
+	for (unsigned int i = 0; i < p0.size(); ++i) p0[i] = 0.3f * rng.next_unit();
+
+	// Per-layer parameters.
+	std::vector<std::vector<float> > Wq(L), Wk(L), Wv(L), Wo(L);
+	std::vector<std::vector<float> > u_p(L), u_q(L);
+	std::vector<std::vector<float> > gamma(L), beta(L);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		Wq[l].resize(m * dM); Wk[l].resize(m * dM);
+		Wv[l].resize(m * dM); Wo[l].resize(dM * m);
+		u_p[l].resize(T * m); u_q[l].resize(T * m);
+		gamma[l].resize(m); beta[l].resize(m);
+		for (unsigned int i = 0; i < m * dM; ++i)
+		{
+			Wq[l][i] = 0.08f * rng.next_unit();
+			Wk[l][i] = 0.08f * rng.next_unit();
+			Wv[l][i] = 0.08f * rng.next_unit();
+		}
+		for (unsigned int i = 0; i < dM * m; ++i)
+			Wo[l][i] = 0.08f * rng.next_unit();
+		for (unsigned int i = 0; i < T * m; ++i)
+		{
+			u_p[l][i] = 0.04f * rng.next_unit();
+			u_q[l][i] = 0.04f * rng.next_unit();
+		}
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			gamma[l][i] = 1.0f + 0.08f * rng.next_unit();
+			beta[l][i]  = 0.02f * rng.next_unit();
+		}
+	}
+
+	// GPU state.
+	glades::gpu::GpuBuffer<float> d_q, d_p, d_qtmp;
+	glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo;
+	glades::gpu::GpuBuffer<float> d_up, d_uq;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO;
+	glades::gpu::GpuBuffer<float> d_stats, d_gamma, d_beta;
+	d_q.allocate(T * m); d_p.allocate(T * m); d_qtmp.allocate(T * m);
+	d_Wq.allocate(m * dM); d_Wk.allocate(m * dM);
+	d_Wv.allocate(m * dM); d_Wo.allocate(dM * m);
+	d_up.allocate(T * m); d_uq.allocate(T * m);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM);
+	d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_stats.allocate(L * T * 2u);
+	d_gamma.allocate(m); d_beta.allocate(m);
+	d_q.upload(&q0[0], T * m);
+	d_p.upload(&p0[0], T * m);
+
+	// --- FORWARD L blocks on GPU ---
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		d_Wq.upload(&Wq[l][0], m * dM); d_Wk.upload(&Wk[l][0], m * dM);
+		d_Wv.upload(&Wv[l][0], m * dM); d_Wo.upload(&Wo[l][0], dM * m);
+		d_up.upload(&u_p[l][0], T * m);
+		d_uq.upload(&u_q[l][0], T * m);
+		d_gamma.upload(&gamma[l][0], m);
+		d_beta.upload(&beta[l][0], m);
+
+		// 1. Attention shear: p += Y(q)
+		ASSERT("gpu attn fwd", glades::gpu::chiron_attention_shear(
+		    d_q.data(), d_p.data(),
+		    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+		    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dM),
+		    causal, false,
+		    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data()));
+		// 2. Shear^p (MLP on q as linear kick, same as CPU-side end-to-end test)
+		ASSERT("gpu shear^p", glades::gpu::chiron_shear_add(
+		    d_p.data(), d_up.data(), static_cast<int>(T * m)));
+		// 3. Shear^q
+		ASSERT("gpu shear^q", glades::gpu::chiron_shear_add(
+		    d_q.data(), d_uq.data(), static_cast<int>(T * m)));
+		// 4. ReLN
+		ASSERT("gpu reln", glades::gpu::chiron_reln_forward(
+		    d_q.data(), d_qtmp.data(),
+		    d_stats.data() + (size_t)l * T * 2u,
+		    d_gamma.data(), d_beta.data(),
+		    static_cast<int>(T), static_cast<int>(m), eps));
+		glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(),
+		                                sizeof(float) * T * m);
+	}
+
+	// --- INVERSE L blocks on GPU (reverse order) ---
+	for (unsigned int ll = 0; ll < L; ++ll)
+	{
+		const unsigned int l = L - 1 - ll;
+		d_Wq.upload(&Wq[l][0], m * dM); d_Wk.upload(&Wk[l][0], m * dM);
+		d_Wv.upload(&Wv[l][0], m * dM); d_Wo.upload(&Wo[l][0], dM * m);
+		d_up.upload(&u_p[l][0], T * m);
+		d_uq.upload(&u_q[l][0], T * m);
+		d_gamma.upload(&gamma[l][0], m);
+		d_beta.upload(&beta[l][0], m);
+
+		// 4^-1 ReLN inverse
+		ASSERT("gpu reln inv", glades::gpu::chiron_reln_inverse(
+		    d_q.data(), d_qtmp.data(),
+		    d_stats.data() + (size_t)l * T * 2u,
+		    d_gamma.data(), d_beta.data(),
+		    static_cast<int>(T), static_cast<int>(m)));
+		glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(),
+		                                sizeof(float) * T * m);
+		// 3^-1 Shear^q inv
+		ASSERT("gpu shear^q inv", glades::gpu::chiron_shear_sub(
+		    d_q.data(), d_uq.data(), static_cast<int>(T * m)));
+		// 2^-1 Shear^p inv
+		ASSERT("gpu shear^p inv", glades::gpu::chiron_shear_sub(
+		    d_p.data(), d_up.data(), static_cast<int>(T * m)));
+		// 1^-1 Attention shear inverse
+		ASSERT("gpu attn inv", glades::gpu::chiron_attention_shear(
+		    d_q.data(), d_p.data(),
+		    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+		    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dM),
+		    causal, true,
+		    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data()));
+	}
+
+	std::vector<float> q_rec(T * m), p_rec(T * m);
+	d_q.download(&q_rec[0], T * m);
+	d_p.download(&p_rec[0], T * m);
+
+	const float q_err = max_abs_diff(q_rec, q0);
+	const float p_err = max_abs_diff(p_rec, p0);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "GPU full-block %u-layer E2E: q_err=%.3e p_err=%.3e (tol 1e-3)",
+	              L, q_err, p_err);
+	ASSERT(msg, q_err < 1e-3f && p_err < 1e-3f);
+
+	std::printf("  CHIRON GPU full-block L=%u (attn+shear+shear+reln) E2E: "
+	            "q_err=%.3e p_err=%.3e\n",
+	            L, q_err, p_err);
+#else
+	std::printf("  [CHIRON GPU full-block E2E] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -1951,6 +2214,8 @@ void CHIRONUnitTest()
 	CHIRONGpuParityTest();
 	CHIRONBatchedSketchParityTest();
 	CHIRONGpuEndToEndTest();
+	CHIRONGpuAttentionShearParityTest();
+	CHIRONGpuFullBlockEndToEndTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
 

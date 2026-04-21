@@ -15,6 +15,7 @@
 #include "gpu_chiron.h"
 #include "gpu_device.h"
 #include "gpu_blas.h"
+#include "gpu_kernels.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -278,6 +279,55 @@ bool chiron_sketch_lift_add(float* X, const float* R, const float* S,
 	                       S, Ntok,
 	                       1.0f,
 	                       X, Ntok);
+}
+
+// ===========================================================================
+//  6. Symplectic attention shear — composition wrapper.
+// ===========================================================================
+//
+// Layered on top of existing GPU primitives:
+//   Q = q · Wq       (sgemm_rowmajor: [T,m] · [m,dH] -> [T,dH])
+//   K = q · Wk
+//   V = q · Wv
+//   O = flash_attention_multihead_forward(Q, K, V)
+//   p += ± O · Wo    (sgemm_rowmajor with alpha=±1, beta=1: accumulates into p)
+//
+// For the inverse shear, the caller passes invert=true and we use alpha=-1
+// in the final GEMM (equivalent to p -= Y(q) since q is unchanged).
+
+bool chiron_attention_shear(const float* q, float* p,
+                             const float* Wq, const float* Wk,
+                             const float* Wv, const float* Wo,
+                             int T, int m, int nHeads, int nKVHeads, int dHead,
+                             bool causal, bool invert,
+                             float* scratch_Q, float* scratch_K,
+                             float* scratch_V, float* scratch_O)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// Q = q · Wq.  q: [T, m] ld=m; Wq: [m, dModel] ld=dModel; Q: [T, dModel] ld=dModel.
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, scratch_K, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, scratch_V, dModelKV))
+		return false;
+
+	// Flash attention: O[T, dModel] = softmax(Q K^T / sqrt(dHead)) · V.
+	if (!flash_attention_multihead_forward(scratch_Q, scratch_K, scratch_V,
+	                                        T, nHeads, nKVHeads,
+	                                        dHead, dModel, dModelKV,
+	                                        causal, scratch_O))
+		return false;
+
+	// p += ±  O · Wo.  O: [T, dModel] ld=dModel; Wo: [dModel, m] ld=m; p: [T, m] ld=m.
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+
+	return true;
 }
 
 } // namespace gpu

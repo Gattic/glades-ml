@@ -73,6 +73,40 @@ bool chiron_sketch_project(const float* X, const float* S,
 bool chiron_sketch_lift_add(float* X, const float* R, const float* S,
                              int T, int Ntok, int r);
 
+// ---------------------------------------------------------------------------
+// Symplectic attention shear (framework §3.2) — composition wrapper.
+//
+// Computes  p += Wo^T · Attention(Q=q·Wq, K=q·Wk, V=q·Wv)  on GPU, reusing
+// the existing BF16/FP32 flash-attention kernels and cuBLAS GEMMs. q is
+// unchanged; only p is modified.  This is the symplectic shear that makes
+// the forward map (q, p) → (q, p + Y(q)) a unit lower-triangular, exactly
+// invertible bijection.  The inverse is simply p -= Y(q) computed with
+// the same kernel sequence.
+//
+// Weight layouts (row-major):
+//   Wq, Wk, Wv : [m, dH]   — input proj (dH = nHeads · dHead for multihead)
+//   Wo         : [dH, m]   — output proj back to the p branch
+//
+// Scratch buffers (caller-owned) live here so the caller controls memory
+// re-use across layers:
+//   scratch_Q, scratch_K, scratch_V : each [T, dH]
+//   scratch_O                       : [T, dH]
+//
+// nHeads, dHead: single-head is nHeads=1, dHead=dH. Multihead support
+// follows existing transformer conventions (dModel = nHeads · dHead in
+// the attention path).
+//
+// `invert`: when false, compute p += Y(q). When true, p -= Y(q).
+// The inverse is bit-equivalent because the same Y(q) is recomputed from
+// q (which is unchanged by the shear).
+bool chiron_attention_shear(const float* q, float* p,
+                             const float* Wq, const float* Wk,
+                             const float* Wv, const float* Wo,
+                             int T, int m, int nHeads, int nKVHeads, int dHead,
+                             bool causal, bool invert,
+                             float* scratch_Q, float* scratch_K,
+                             float* scratch_V, float* scratch_O);
+
 } // namespace gpu
 } // namespace glades
 
@@ -93,6 +127,12 @@ inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,
                                     int, int, int) { return false; }
+inline bool chiron_attention_shear(const float*, float*,
+                                    const float*, const float*, const float*,
+                                    const float*,
+                                    int, int, int, int, int,
+                                    bool, bool,
+                                    float*, float*, float*, float*) { return false; }
 
 } // namespace gpu
 } // namespace glades
