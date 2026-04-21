@@ -206,6 +206,82 @@ Goal: train largest LLM we can on pile data.
 
 ---
 
+## 11a. Amendment (2026-04-21): variance-bound correction
+
+The candidate document §4.5 claimed `Var(x̂_ℓ_i) ≤ ‖x − x̃‖² / r` as a
+per-coordinate bound. Empirical measurement of the sketch-correction
+primitive in `chiron-test.cpp::CHIRONSketchProjectLiftTest` shows the
+actual per-coordinate variance is `≤ ‖x − x̃‖² · N / r²`, i.e., it
+scales with `N = 2·T·m`, not independent of it.
+
+### Elementary derivation
+
+Let `S ∈ R^{r × N}` have i.i.d. `N(0, 1)` entries. Then
+- `E[(S^T S / r)_{ii}] = 1`, `Var((S^T S / r)_{ii}) = 2/r`
+- `E[(S^T S / r)_{ij}] = 0` for `i ≠ j`, `Var((S^T S / r)_{ij}) = 1/r`
+
+For a fixed delta `δ = x − x̃`, the correction estimator is
+`ĉ = (S^T S / r) δ`. Coordinate `i`:
+```
+ĉ_i = (S^T S / r)_{ii} δ_i + Σ_{j ≠ i} (S^T S / r)_{ij} δ_j
+```
+Mean: `δ_i` (correct). Variance:
+```
+Var(ĉ_i) = (2/r) δ_i² + (1/r) Σ_{j ≠ i} δ_j²
+        ≈ ||δ||² / r
+```
+So the expected *sum* over coordinates of `Var(ĉ_i)` is `N·||δ||²/r`,
+and the expected *per-coord stdev* is `||δ||/√r`. But because each
+coord has noise `||δ||/√r` *independent* of the signal `δ_i`, the
+relative per-coord error compared to the signal scale is
+`(||δ|| / √r) / (||δ|| / √N) = √(N/r)`.
+
+The framework's original claim `"r = O(√(Td))"` corresponds to the
+absolute per-coord stdev bound `||δ|| / √r = ε_BF16 / N^{1/4}`; this
+is a MUCH weaker claim than what's needed for gradient accumulation,
+which requires per-coord error comparable to `ε_BF16`.
+
+### Empirical confirmation (2026-04-21)
+
+At L=12, T=6, m=16, N=192:
+- r=64  (N/r ≈ 3): corrected error = 1.09 (diverges; uncorrected = 0.012)
+- r=256 (N/r ≈ 0.75): corrected error = 3.9e-3 (~3× reduction)
+- `√(N/r)` ratio: r=64 gives 1.7; r=256 gives 0.87.
+
+The measured behaviour matches the corrected scaling `O(‖δ‖ · √(N/r))`,
+not the original `O(‖δ‖/√r)`.
+
+### Consequences for production scale
+
+Naively applying global-state sketching to a 70B / 96-layer / 4k-context
+model (`N = 2·T·m ≈ 16M` per layer) would require `r ≳ 16M` to deliver a
+meaningful per-coord drift reduction. That is not viable.
+
+### Three viable mitigations
+
+1. **Per-token local sketches** (`S_ℓ ∈ R^{r × 2m}` per token).
+   Effective N shrinks from `2·T·m` to `2m`. Memory cost per layer
+   goes up by factor T (now `T · r`), and effective `r` need only
+   oversample `2m`.
+2. **Anchored-sketch mode** (framework §6.4 remedy 2). Store full
+   activation every k blocks; only run sketch-corrected inverse on
+   the k-block slice. Drift accumulation is capped at length k.
+3. **Anchored without sketch** (the k=1 extreme): every layer is
+   a full activation anchor. This is just gradient checkpointing —
+   a 2× compute hit on backward but exact reconstruction. Fallback
+   if mitigations 1 and 2 prove insufficient.
+
+**The plan of record is now: (2) anchored-sketch with `k ∈ {4, 8, 16}`,
+with per-token local sketches at rank `r = O(2m)` between anchors.**
+The memory math for that is in §12 below.
+
+### Revised memory estimate (70B / 96-layer / 4k / batch 4, k=8 anchored)
+
+- Anchors: `L/k · T · d · 2 bytes` BF16 = `12 · 4096 · 8192 · 2` = 805 MB.
+- Per-token sketches: `L · T · r · 4 bytes` FP32 at r=2048 = `96 · 4096 · 2048 · 4` = 3.2 GB.
+- Total: **~4 GB** activation memory, vs **25.8 GB baseline** — still
+  **~6× reduction**, not the 95× originally claimed, but a real magnitudes-level win.
+
 ## 12. Falsification criteria
 
 From §10.4 of `candidate_A_reversible.md`:
