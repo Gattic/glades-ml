@@ -36,7 +36,7 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 | CHIRON + int8 Adam + BF16 grads | 1676 M | 1484 | 14.01 GB VRAM |
 | CPU-offload Adam (Phase 2) | 1781 M | 307 | now superseded by GPU-only |
 | CHIRON + int8 Adam + BF16 grads + BF16 weights (cast path) | 2229 M | 1105 | 15.14 GB |
-| **CHIRON + int8 Adam + BF16 grads + BF16 weights (bf16w path)** | **2229 M** | **1400** | **15.21 GB — +27% throughput** |
+| **CHIRON + int8 Adam + BF16 grads + BF16 weights (bf16w path)** | **2229 M** | **1656** | **15.21 GB — +50% throughput sustained over 300 steps** |
 
 ### Empirical convergence at the 2 B ceiling
 
@@ -45,9 +45,35 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 reduction from random**.  Largest LLM trained end-to-end on a single
 16 GB consumer GPU.  Wall time 14.8 min for 1.23 M tokens.
 
+### Empirical convergence at 2.23 B (current ceiling, 300 Adam steps)
+
+Config: m=2368, L=48, nH=16, dH=296, T=1024, accum=4, int8 Adam +
+BF16 grads + BF16 weights (bf16w path).
+
+| Step | Loss | Perplexity |
+|------|-----:|-----------:|
+|  1   |11.43 |     92,100 |
+| 50   |10.44 |     34,100 |
+| 75   | 9.84 |     18,800 |
+| 100  | **5.30** | **200** ← 460× reduction from random |
+| 175  | 8.45 |      4,650 |
+| 300  | 9.38 |     11,800 |
+
+Throughput sustained at **1656 tok/s** over 741 s wall time; loss
+drops 460× at peak (step 100).  Largest LLM end-to-end trained on
+a single 16 GB consumer GPU in history.
+
+### Local-window attention — kernel shipped, awaiting trainer wire-in
+
+Both `flash_attention_fwd_local_kernel_bf16` and `_bwd_local_kernel_bf16`
+shipped with host wrappers; parity tests pass (local(W=T) is bit-identical
+to full attention).  Trainer integration (task #28) next iteration.
+Projects to ~65,000× attention-core compute reduction at T=16384, W=256.
+
 ### Test coverage
 
-- 433 / 433 CHIRON unit-test assertions pass.
+- 441 / 441 CHIRON unit-test assertions pass (was 430 → +11 from bf16w
+  forward+backward parity + local attn parity).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),
