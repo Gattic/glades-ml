@@ -3376,6 +3376,168 @@ void CHIRONStiefelQRRetractionTest()
 #endif
 }
 
+// CHIRONStiefelAdamDescentTest ----------------------------------------------
+// End-to-end validation of Phase 2e: a few full Adam steps on a toy
+// regression objective must (a) reduce the loss, (b) preserve orthonormality
+// of the Stiefel factors at every step.  Combines backward + tangent
+// projection + Adam moments + QR retraction in one call.
+void CHIRONStiefelAdamDescentTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel adam] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m = 32, n = 24, r = 8, B = 16;
+	const int num_steps = 50;
+	const float lr = 1e-1f;
+	const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+
+	LCG rng(20260421u);
+
+	// Ground-truth: a random Stiefel-factored matrix W*.  We'll regress from
+	// our initial guess toward W* using squared-error loss.
+	std::vector<float> Us(m * r), Vs(n * r), sig_s(r);
+	for (size_t i = 0; i < Us.size(); ++i) Us[i] = rng.next_unit();
+	for (size_t i = 0; i < Vs.size(); ++i) Vs[i] = rng.next_unit();
+	gram_schmidt_cols(Us, m, r);
+	gram_schmidt_cols(Vs, n, r);
+	for (size_t i = 0; i < sig_s.size(); ++i)
+		sig_s[i] = 0.8f + 0.4f * std::abs(rng.next_unit());
+
+	// Initial guess — different Stiefel point + different Σ.
+	std::vector<float> U(m * r), V(n * r), sigma(r);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, r);
+	gram_schmidt_cols(V, n, r);
+	for (size_t i = 0; i < sigma.size(); ++i) sigma[i] = 1.0f;
+
+	std::vector<uint16_t> U_bf, V_bf, Us_bf, Vs_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+	fp32_to_bf16_rne(Us, Us_bf);
+	fp32_to_bf16_rne(Vs, Vs_bf);
+
+	// Set up device state.
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, r);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma[0], sigma.size());
+
+	glades::gpu::GpuStiefelWeight sw_star;
+	sw_star.allocate(m, n, r);
+	sw_star.U.upload(&Us_bf[0], Us_bf.size());
+	sw_star.V.upload(&Vs_bf[0], Vs_bf.size());
+	sw_star.sigma.upload(&sig_s[0], sig_s.size());
+
+	// Precompute X and target Y* = X · W*^T on the device.
+	std::vector<float> Xh(B * n);
+	for (size_t i = 0; i < Xh.size(); ++i) Xh[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_Y_tgt, d_Y, d_scratchBr, d_dY,
+	    d_dU, d_dV, d_dsigma,
+	    d_etaU, d_etaV, d_etaS, d_rrU, d_rrV;
+	d_X.allocate(B * n);          d_X.upload(&Xh[0], Xh.size());
+	d_Y_tgt.allocate(B * m);
+	d_Y.allocate(B * m);
+	d_scratchBr.allocate(B * r);
+	d_dY.allocate(B * m);
+	d_dU.allocate(m * r);
+	d_dV.allocate(n * r);
+	d_dsigma.allocate(r);
+	d_etaU.allocate(m * r);
+	d_etaV.allocate(n * r);
+	d_etaS.allocate(r);
+	d_rrU.allocate(r * r);
+	d_rrV.allocate(r * r);
+
+	glades::gpu::stiefel_forward(d_X.data(), /*x_bf16=*/false, sw_star,
+	                             d_Y_tgt.data(), d_scratchBr.data(), B);
+
+	// Training loop: compute dY = (Y − Y*), then backward, then Adam step.
+	float loss_first = -1.0f, loss_last = -1.0f;
+	float max_drift_U = 0.0f, max_drift_V = 0.0f;
+
+	std::vector<float> Y(B * m), Y_tgt(B * m), dY(B * m);
+	d_Y_tgt.download(&Y_tgt[0], Y_tgt.size());
+
+	for (int step = 1; step <= num_steps; ++step)
+	{
+		// Forward Y = X · W^T
+		glades::gpu::stiefel_forward(d_X.data(), false, sw, d_Y.data(),
+		                             d_scratchBr.data(), B);
+		d_Y.download(&Y[0], Y.size());
+
+		// Host-side MSE loss and dY = Y − Y* (scaled by 2/N).
+		float loss = 0.0f;
+		for (size_t i = 0; i < Y.size(); ++i)
+		{
+			const float d = Y[i] - Y_tgt[i];
+			loss += d * d;
+			dY[i] = (2.0f / float(Y.size())) * d;
+		}
+		loss /= float(Y.size());
+		if (step == 1) loss_first = loss;
+		loss_last = loss;
+
+		d_dY.upload(&dY[0], dY.size());
+
+		// Backward: raw grads.
+		glades::gpu::stiefel_backward_unconstrained(
+		    d_dY.data(), d_X.data(), false, sw,
+		    /*dX=*/NULL, d_dU.data(), d_dsigma.data(), d_dV.data(),
+		    d_scratchBr.data(), B);
+
+		// One Riemannian Adam step.
+		glades::gpu::stiefel_adam_step(
+		    sw, d_dU.data(), d_dsigma.data(), d_dV.data(),
+		    lr, beta1, beta2, eps, step,
+		    d_rrU.data(), d_rrV.data(),
+		    d_etaU.data(), d_etaV.data(), d_etaS.data());
+
+		// Orthonormality check.
+		std::vector<uint16_t> Ucur_bf(m * r), Vcur_bf(n * r);
+		sw.U.download(&Ucur_bf[0], Ucur_bf.size());
+		sw.V.download(&Vcur_bf[0], Vcur_bf.size());
+		std::vector<float> Uc, Vc;
+		bf16_to_fp32(Ucur_bf, Uc);
+		bf16_to_fp32(Vcur_bf, Vc);
+		float dU2 = 0.0f, dV2 = 0.0f;
+		for (unsigned int i = 0; i < r; ++i)
+			for (unsigned int j = 0; j < r; ++j)
+			{
+				float a = 0.0f, b = 0.0f;
+				for (unsigned int k = 0; k < m; ++k) a += Uc[k * r + i] * Uc[k * r + j];
+				for (unsigned int k = 0; k < n; ++k) b += Vc[k * r + i] * Vc[k * r + j];
+				const float ta = (i == j) ? 1.0f : 0.0f;
+				dU2 += (a - ta) * (a - ta);
+				dV2 += (b - ta) * (b - ta);
+			}
+		const float dU_nrm = std::sqrt(dU2), dV_nrm = std::sqrt(dV2);
+		if (dU_nrm > max_drift_U) max_drift_U = dU_nrm;
+		if (dV_nrm > max_drift_V) max_drift_V = dV_nrm;
+	}
+
+	std::printf("  stiefel adam: loss %6.4f → %6.4f (%.2fx reduction) "
+	            "max orth drift U=%.3e V=%.3e over %d steps\n",
+	            loss_first, loss_last, loss_first / loss_last,
+	            max_drift_U, max_drift_V, num_steps);
+	ASSERT("Riemannian Adam reduces loss", loss_last < loss_first);
+	ASSERT("Riemannian Adam reduces loss by >= 2x (toy problem)",
+	       loss_first / loss_last >= 2.0f);
+	ASSERT("U stays orthonormal across Adam steps", max_drift_U < 2e-1f);
+	ASSERT("V stays orthonormal across Adam steps", max_drift_V < 2e-1f);
+
+	sw.release();
+	sw_star.release();
+#else
+	std::printf("  [stiefel adam] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -3383,6 +3545,7 @@ void CHIRONUnitTest()
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
 	CHIRONStiefelQRRetractionTest();
+	CHIRONStiefelAdamDescentTest();
 	CHIRONStochasticBf16RoundingTest();
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();

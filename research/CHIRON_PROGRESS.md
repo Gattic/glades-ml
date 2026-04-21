@@ -131,15 +131,28 @@ Foundation primitives for the 7th paradigm shift are in place:
   - η ≈ 0.15 regime: `‖U^T U − I‖_F = 4.6e-3`, `‖V^T V − I‖_F = 6.8e-3`
     — qf successfully re-orthonormalizes notably-perturbed input
   - Cost: cusolverDnSgeqrf + cusolverDnSorgqr (column-major), bracketed by
-    row-major↔column-major transpose kernels. Shared cuSOLVER handle +
-    workspace; info-check synchronizes between successive retractions
-    (required — without sync U/V workspaces race on the shared buffer)
+    row-major↔column-major transpose kernels.  Separate per-factor
+    cuSOLVER workspaces (slot 0 = U, slot 1 = V) — shared workspaces
+    caused ~10% cold-start flakiness (the second call stomped on the
+    first's pending data)
   - Fisher–Rao Σ update `Σ ← Σ ⊙ exp(η_Σ / Σ)` with ±10 arg-capping
     for numerical stability
+- `CHIRONStiefelAdamDescentTest`: **PASSING** (Phase 2e — end-to-end optimizer)
+  - Toy MSE regression from one Stiefel point toward a ground-truth W*
+    factorization. 50 Adam steps @ lr=1e-1, β₁=0.9, β₂=0.999, ε=1e-8
+  - Loss 0.0136 → 0.0045 = **3.05× reduction** (assertion bar: ≥ 2×)
+  - Max orthonormality drift over all 50 steps: `U = 5.1e-3`, `V = 5.7e-3`
+    — BF16-round-trip-bounded, confirms retraction is holding manifold
+  - Deterministic across 10/10 consecutive runs after the per-factor
+    workspace fix
+  - Signature: `stiefel_adam_step(sw, dU, dσ, dV, lr, β1, β2, ε, step,
+    scratch_rr_U, scratch_rr_V, scratch_etaU, scratch_etaV, scratch_etaS)`
+    fuses tangent-project + moment-update + bias-correct + η-build + QR
+    retract + Fisher-Rao Σ step into one call
 
-Phase 2 remaining: Cayley fast-path (Phase 2d), Riemannian Adam with int8
-packed momenta (2e), vector transport (2f), end-to-end wire-in to
-chiron_main.cpp behind `--stiefel-ratio ρ` flag (Phase 2g).
+Phase 2 remaining: Cayley fast-path (Phase 2d), int8-packed moments
+(Phase 2f), Stiefel-aware vector transport (2g), end-to-end wire-in to
+chiron_main.cpp behind `--stiefel-ratio ρ` flag (Phase 2h).
 
 Target: 5.1 B free-DOF model on 16 GB VRAM at ρ=0.25 with ≥ 1500 tok/s
 (projected from 4× FLOP reduction per forward GEMM), loss within 2× of
@@ -147,8 +160,9 @@ the 2.23 B dense-weight baseline at the same token budget.
 
 ### Test coverage
 
-- **455 / 455 CHIRON unit-test assertions pass** (was 451 → +4 from
-  Stiefel QR retraction drift-bounds on zero-η and η≈0.15 regimes).
+- **459 / 459 CHIRON unit-test assertions pass** (was 455 → +4 from
+  Stiefel Adam descent test: loss reduction, loss reduction ≥ 2×,
+  U orthonormality, V orthonormality).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),

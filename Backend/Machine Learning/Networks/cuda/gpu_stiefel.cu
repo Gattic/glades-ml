@@ -90,21 +90,24 @@ void GpuStiefelWeight::allocate(unsigned int m_, unsigned int n_, unsigned int r
 	sigma.allocate(r);
 	V.allocate(size_t(n) * r);
 
+	// Adam moments (FP32 for now; int8 packing is a follow-up phase).
 	m_U.allocate(size_t(m) * r);
-	m_U_scale.allocate(1);
 	m_sigma.allocate(r);
 	m_V.allocate(size_t(n) * r);
-	m_V_scale.allocate(1);
-
 	v_U.allocate(size_t(m) * r);
-	v_U_scale.allocate(1);
 	v_sigma.allocate(r);
 	v_V.allocate(size_t(n) * r);
-	v_V_scale.allocate(1);
+
+	// Zero-initialize moments so bias correction works from step 1.
+	cudaMemset(m_U.data(), 0, size_t(m) * r * sizeof(float));
+	cudaMemset(m_V.data(), 0, size_t(n) * r * sizeof(float));
+	cudaMemset(m_sigma.data(), 0, r * sizeof(float));
+	cudaMemset(v_U.data(), 0, size_t(m) * r * sizeof(float));
+	cudaMemset(v_V.data(), 0, size_t(n) * r * sizeof(float));
+	cudaMemset(v_sigma.data(), 0, r * sizeof(float));
 
 	qr_tau_U.allocate(r);
 	qr_tau_V.allocate(r);
-	// qr_work sized lazily by the retraction wrappers once cuSOLVER is wired.
 
 	orthogonality_drift.allocate(1);
 }
@@ -115,15 +118,11 @@ void GpuStiefelWeight::release()
 	sigma.free();
 	V.free();
 	m_U.free();
-	m_U_scale.free();
 	m_sigma.free();
 	m_V.free();
-	m_V_scale.free();
 	v_U.free();
-	v_U_scale.free();
 	v_sigma.free();
 	v_V.free();
-	v_V_scale.free();
 	qr_tau_U.free();
 	qr_tau_V.free();
 	qr_work.free();
@@ -509,9 +508,12 @@ __global__ void k_sigma_fisher_rao(float* sigma, const float* eta,
 
 static cusolverDnHandle_t g_stiefelSolver = 0;
 static bool g_stiefelSolverReady = false;
-static float* g_stiefelQrWork = nullptr;
-static size_t g_stiefelQrWorkCap = 0;
-static int*   g_stiefelInfo = nullptr;
+// Per-factor workspace (U vs V). Separate buffers prevent the second
+// cuSOLVER call from stomping on workspace the first is still using —
+// without this, we saw ~10% cold-start flakiness even after stream sync.
+static float* g_stiefelQrWork[2] = {0, 0};
+static size_t g_stiefelQrWorkCap[2] = {0, 0};
+static int*   g_stiefelInfo[2] = {0, 0};
 
 static bool stiefel_solver_init()
 {
@@ -522,17 +524,21 @@ static bool stiefel_solver_init()
 		g_stiefelSolverReady = true;
 	}
 	cusolverDnSetStream(g_stiefelSolver, computeStream());
-	if (g_stiefelInfo == nullptr)
+	for (int k = 0; k < 2; ++k)
 	{
-		if (cudaMalloc(&g_stiefelInfo, sizeof(int)) != cudaSuccess)
-			return false;
+		if (g_stiefelInfo[k] == nullptr)
+		{
+			if (cudaMalloc(&g_stiefelInfo[k], sizeof(int)) != cudaSuccess)
+				return false;
+		}
 	}
 	return true;
 }
 
+// slot 0 = U factor, slot 1 = V factor — separate workspaces required.
 static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
                                    unsigned int rows, unsigned int r,
-                                   const float* eta)
+                                   const float* eta, int slot)
 {
 	if (!stiefel_solver_init()) return false;
 
@@ -589,17 +595,18 @@ static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
 		return false;
 	const int lwork = lwork_geqrf > lwork_orgqr ? lwork_geqrf : lwork_orgqr;
 
-	if (size_t(lwork) > g_stiefelQrWorkCap)
+	if (size_t(lwork) > g_stiefelQrWorkCap[slot])
 	{
-		if (g_stiefelQrWork) cudaFree(g_stiefelQrWork);
-		if (cudaMalloc(&g_stiefelQrWork, lwork * sizeof(float)) != cudaSuccess)
+		if (g_stiefelQrWork[slot]) cudaFree(g_stiefelQrWork[slot]);
+		if (cudaMalloc(&g_stiefelQrWork[slot], lwork * sizeof(float))
+		    != cudaSuccess)
 			return false;
-		g_stiefelQrWorkCap = lwork;
+		g_stiefelQrWorkCap[slot] = lwork;
 	}
 
 	// 4. QR factorization in place.
 	cusolverStatus_t st = cusolverDnSgeqrf(g_stiefelSolver, rows, r, A_col, rows, tau,
-	                     g_stiefelQrWork, lwork, g_stiefelInfo);
+	                     g_stiefelQrWork[slot], lwork, g_stiefelInfo[slot]);
 	if (st != CUSOLVER_STATUS_SUCCESS)
 	{
 		fprintf(stderr, "[stiefel-qr] sgeqrf status=%d rows=%u r=%u\n",
@@ -607,7 +614,7 @@ static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
 		return false;
 	}
 	int host_info = 0;
-	cudaMemcpy(&host_info, g_stiefelInfo, sizeof(int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(&host_info, g_stiefelInfo[slot], sizeof(int), cudaMemcpyDeviceToHost);
 	if (host_info != 0)
 	{
 		fprintf(stderr, "[stiefel-qr] sgeqrf info=%d rows=%u r=%u\n",
@@ -617,14 +624,14 @@ static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
 
 	// 5. Form Q explicitly.
 	st = cusolverDnSorgqr(g_stiefelSolver, rows, r, r, A_col, rows, tau,
-	                     g_stiefelQrWork, lwork, g_stiefelInfo);
+	                     g_stiefelQrWork[slot], lwork, g_stiefelInfo[slot]);
 	if (st != CUSOLVER_STATUS_SUCCESS)
 	{
 		fprintf(stderr, "[stiefel-qr] sorgqr status=%d rows=%u r=%u\n",
 		        (int)st, rows, r);
 		return false;
 	}
-	cudaMemcpy(&host_info, g_stiefelInfo, sizeof(int), cudaMemcpyDeviceToHost);
+	cudaMemcpy(&host_info, g_stiefelInfo[slot], sizeof(int), cudaMemcpyDeviceToHost);
 	if (host_info != 0)
 	{
 		fprintf(stderr, "[stiefel-qr] sorgqr info=%d rows=%u r=%u\n",
@@ -653,8 +660,8 @@ void stiefel_retract_qr(GpuStiefelWeight& s,
                         const float* eta_V)
 {
 	if (!s.allocated()) return;
-	stiefel_qr_retract_one(s.U.data(), s.qr_tau_U.data(), s.m, s.r, eta_U);
-	stiefel_qr_retract_one(s.V.data(), s.qr_tau_V.data(), s.n, s.r, eta_V);
+	stiefel_qr_retract_one(s.U.data(), s.qr_tau_U.data(), s.m, s.r, eta_U, /*slot=*/0);
+	stiefel_qr_retract_one(s.V.data(), s.qr_tau_V.data(), s.n, s.r, eta_V, /*slot=*/1);
 	if (eta_sigma != nullptr)
 	{
 		dim3 block(64);
@@ -670,9 +677,96 @@ void stiefel_retract_cayley(GpuStiefelWeight&, const float*, const float*, const
 	// TODO Phase-2: implement Cayley fast-path.
 }
 
+// ===========================================================================
+// Adam moment update + tangent-space step assembly
+//
+//   m ← β1·m + (1−β1)·g
+//   v ← β2·v + (1−β2)·g²
+//   m̂ = m / (1 − β1^t),  v̂ = v / (1 − β2^t)
+//   η = −lr · m̂ / (√v̂ + eps)
+//
+// Written as a single elementwise kernel over the flattened tensor.  Note
+// the minus sign is folded into η so that the QR retraction receives a
+// descent direction directly:  U_new = qf(U + η).
+// ===========================================================================
+
+namespace {
+
+__global__ void k_adam_step_and_eta(
+    const float* __restrict__ g,
+    float* __restrict__ mom,
+    float* __restrict__ vel,
+    float* __restrict__ eta_out,
+    float lr,
+    float beta1, float beta2, float eps,
+    float bc1, float bc2,  // 1 / (1 − β^t) for first/second moments
+    size_t n)
+{
+	size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float gi = g[i];
+	const float m_new = beta1 * mom[i] + (1.0f - beta1) * gi;
+	const float v_new = beta2 * vel[i] + (1.0f - beta2) * gi * gi;
+	mom[i] = m_new;
+	vel[i] = v_new;
+	const float m_hat = m_new * bc1;
+	const float v_hat = v_new * bc2;
+	eta_out[i] = -lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
+} // anonymous namespace
+
+void stiefel_adam_step(GpuStiefelWeight& s,
+                       float* dU, float* dsigma, float* dV,
+                       float lr, float beta1, float beta2, float eps,
+                       int step_1based,
+                       float* scratch_rr_U, float* scratch_rr_V,
+                       float* scratch_etaU, float* scratch_etaV,
+                       float* scratch_etaS)
+{
+	if (!s.allocated()) return;
+	if (step_1based < 1) step_1based = 1;
+
+	// (1) Tangent-project the raw gradients in place.
+	stiefel_tangent_project_grad(s, dU, dV, scratch_rr_U, scratch_rr_V);
+
+	// (2–3) Adam moment update and η computation (per sub-tensor).
+	const float bc1 = 1.0f / (1.0f - std::pow(beta1, step_1based));
+	const float bc2 = 1.0f / (1.0f - std::pow(beta2, step_1based));
+
+	{
+		dim3 block(256);
+		const size_t nU = size_t(s.m) * s.r;
+		dim3 grid((nU + block.x - 1) / block.x);
+		k_adam_step_and_eta<<<grid, block>>>(dU, s.m_U.data(), s.v_U.data(),
+		                                     scratch_etaU, lr, beta1, beta2,
+		                                     eps, bc1, bc2, nU);
+	}
+	{
+		dim3 block(256);
+		const size_t nV = size_t(s.n) * s.r;
+		dim3 grid((nV + block.x - 1) / block.x);
+		k_adam_step_and_eta<<<grid, block>>>(dV, s.m_V.data(), s.v_V.data(),
+		                                     scratch_etaV, lr, beta1, beta2,
+		                                     eps, bc1, bc2, nV);
+	}
+	{
+		dim3 block(64);
+		dim3 grid((s.r + block.x - 1) / block.x);
+		k_adam_step_and_eta<<<grid, block>>>(dsigma, s.m_sigma.data(),
+		                                     s.v_sigma.data(),
+		                                     scratch_etaS, lr, beta1, beta2,
+		                                     eps, bc1, bc2, s.r);
+	}
+
+	// (4–5) Retract onto the manifold.
+	stiefel_retract_qr(s, scratch_etaU, scratch_etaS, scratch_etaV);
+}
+
 void stiefel_vector_transport(GpuStiefelWeight&, float*)
 {
-	// TODO Phase-2: modified Gram-Schmidt vector transport for Adam momenta.
+	// TODO Phase-2f: Gram-Schmidt vector transport of moments onto new
+	// tangent space (currently an approximation — keep moments in place).
 }
 
 void stiefel_check_orthogonality(GpuStiefelWeight&)

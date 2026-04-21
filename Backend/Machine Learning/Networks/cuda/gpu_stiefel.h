@@ -67,19 +67,14 @@ struct GpuStiefelWeight
 	GpuBuffer<float>    sigma;  // [r]     FP32 (positive orthant)
 	GpuBuffer<uint16_t> V;      // [n * r] BF16
 
-	// Riemannian Adam first moments (int8 asymmetric packed).
-	GpuBuffer<int8_t>  m_U;     // [m * r]
-	GpuBuffer<float>   m_U_scale;  // per-tensor scale
-	GpuBuffer<float>   m_sigma; // [r] FP32 (small, kept dense)
-	GpuBuffer<int8_t>  m_V;     // [n * r]
-	GpuBuffer<float>   m_V_scale;
-
-	// Second moments (uint8 unsigned for v; asymmetric).
-	GpuBuffer<uint8_t> v_U;     // [m * r]
-	GpuBuffer<float>   v_U_scale;
-	GpuBuffer<float>   v_sigma; // [r] FP32
-	GpuBuffer<uint8_t> v_V;     // [n * r]
-	GpuBuffer<float>   v_V_scale;
+	// Riemannian Adam moments. Phase 2e ships these as FP32 for ease of
+	// validation; Phase 2f will compress to int8/uint8 packed.
+	GpuBuffer<float>   m_U;     // [m * r]
+	GpuBuffer<float>   m_sigma; // [r]
+	GpuBuffer<float>   m_V;     // [n * r]
+	GpuBuffer<float>   v_U;     // [m * r]
+	GpuBuffer<float>   v_sigma; // [r]
+	GpuBuffer<float>   v_V;     // [n * r]
 
 	// QR retraction scratch (tau vectors + workspace).
 	GpuBuffer<float>   qr_tau_U;  // [r]
@@ -165,6 +160,33 @@ void stiefel_backward_project(
     float* grad_U, float* grad_sigma, float* grad_V,
     float* scratch_UtGV,
     unsigned int B);
+
+// ========================================================================
+// Riemannian Adam step. Composes the Phase 2 building blocks:
+//   (1) Tangent-project dU, dV onto T_U Stiefel, T_V Stiefel
+//   (2) Update FP32 first/second moments on U, Σ, V
+//   (3) Compute bias-corrected Adam step in tangent space
+//   (4) QR-retract U ← qf(U + η_U), V ← qf(V + η_V)
+//   (5) Fisher–Rao exp update Σ ← Σ ⊙ exp(η_Σ / Σ)
+//
+// `step_1based` is the current optimizer step (≥ 1), used for Adam bias
+// correction. Scratches:
+//   scratch_rr_U [r × r], scratch_rr_V [r × r] — for tangent projection
+//   scratch_etaU [m × r], scratch_etaV [n × r] — for Adam tangent step η
+//   scratch_etaS [r]                            — for Adam Σ step
+// The raw gradient buffers dU, dV are overwritten with their tangent
+// projections during this call.
+// ========================================================================
+void stiefel_adam_step(
+    GpuStiefelWeight& stiefel,
+    float* dU,
+    float* dsigma,
+    float* dV,
+    float lr, float beta1, float beta2, float eps,
+    int step_1based,
+    float* scratch_rr_U, float* scratch_rr_V,
+    float* scratch_etaU, float* scratch_etaV,
+    float* scratch_etaS);
 
 // ========================================================================
 // QR retraction: U ← qf(U + η_U) (and same for V). Uses cuSOLVER sgeqrf
