@@ -35,7 +35,8 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 | CHIRON + int8 Adam | 1382 M | 2017 | 15.32 GB VRAM |
 | CHIRON + int8 Adam + BF16 grads | 1676 M | 1484 | 14.01 GB VRAM |
 | CPU-offload Adam (Phase 2) | 1781 M | 307 | now superseded by GPU-only |
-| **CHIRON + int8 Adam + BF16 grads + BF16 weights** | **2229 M** | **1105** | **15.14 GB — 9× lift over baseline** |
+| CHIRON + int8 Adam + BF16 grads + BF16 weights (cast path) | 2229 M | 1105 | 15.14 GB |
+| **CHIRON + int8 Adam + BF16 grads + BF16 weights (bf16w path)** | **2229 M** | **1400** | **15.21 GB — +27% throughput** |
 
 ### Empirical convergence at the 2 B ceiling
 
@@ -52,14 +53,28 @@ reduction from random**.  Largest LLM trained end-to-end on a single
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),
   **BF16-projection GEMMs vs FP32 projections** (new, max_err 1.3e-4).
 
-### Next lever — BF16 projection GEMMs (shipped, forward)
+### BF16 projection GEMMs — SHIPPED (forward + backward + trainer)
 
-`chiron_attention_shear_bf16w_tiled` (new) takes BF16 weight pointers
-directly and runs Q/K/V/O projections through `sgemm_rowmajor_bf16`
-(BF16 × BF16 → FP32 via BF16 TC, ~2× TF32-TC throughput).  Pairs with
-`--bf16-weights` to eliminate the 4 per-layer weight-cast kernels
-(~200 MB of HBM traffic saved per layer at 2 B).  Backward variant
-pending; trainer integration next.
+Both `chiron_attention_shear_bf16w_tiled` and
+`chiron_attention_shear_backward_bf16w_tiled` take BF16 weight pointers
+directly.  Projections, output-proj backward, and dq-projection all run
+through BF16-TC GEMMs.  Eliminates 4 weight-cast kernels per layer (fwd)
++ 7 per layer (bwd, including abt variants); ~300 MB HBM cast traffic
+saved per step at 2 B scale.
+
+Trainer wiring auto-dispatches when `--bf16-weights` + tiled is active
+(not combined with `--flash-attn` which uses the flash kernels directly).
+
+Measured throughput at 2.0 B and 2.23 B (m=2240 / m=2368):
+  - 2.0 B:  1218 → 1562 tok/s  (+28% throughput, identical loss trajectory)
+  - 2.23 B: 1105 → 1400 tok/s  (+27%, VRAM ~same)
+
+Parity:
+  CHIRONBf16WeightProjectionParityTest   max_err = 1.328e-4 (fwd)
+  CHIRONBf16WeightBackwardParityTest     dq=1.057e-4 dWq=1.048e-7 dWo=4.380e-5
+Both inside BF16 ULP by orders of magnitude.
+
+Test suite: 436 / 436 assertions, 0 failures.
 
 Production wire-in path:
   forward: `flash_attention_cublas_tiled` (1.56× alone)
