@@ -20,6 +20,12 @@
 
 #include "../../../Backend/Machine Learning/Networks/transformer_chiron_ops.h"
 
+#ifdef GLADES_HAVE_CUDA
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_chiron.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
+#endif
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1494,6 +1500,198 @@ void CHIRONPerTokenSketchBf16Test()
 	ASSERT(msg, bf16_pertok_r128 < bf16_uncorrected);
 }
 
+// ---------------------------------------------------------------------------
+// Case 12: GPU parity — compare gpu_chiron primitives against CPU reference.
+// Runs shear_add/sub, reln_forward/inverse, and sketch_project/lift_add on
+// both paths and asserts element-wise equality within tolerance.
+// Skipped (with a printed notice) when CUDA is not available at runtime.
+// ---------------------------------------------------------------------------
+void CHIRONGpuParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON GPU parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T = 8;
+	const unsigned int m = 32;
+	const unsigned int Ntok = 2u * m;
+	const unsigned int r_sketch = 64u;
+	const float eps = 1e-4f;
+
+	LCG rng(54321u);
+
+	// --- Data ---
+	std::vector<float> p(T * m), u(T * m);
+	for (unsigned int i = 0; i < p.size(); ++i) p[i] = rng.next_unit();
+	for (unsigned int i = 0; i < u.size(); ++i) u[i] = 0.1f * rng.next_unit();
+
+	std::vector<float> q_in(T * m), gamma(m), beta(m);
+	for (unsigned int i = 0; i < q_in.size(); ++i) q_in[i] = rng.next_unit();
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		gamma[i] = 1.0f + 0.1f * rng.next_unit();
+		beta[i]  = 0.05f * rng.next_unit();
+	}
+
+	std::vector<float> X(T * Ntok);
+	for (unsigned int i = 0; i < X.size(); ++i) X[i] = rng.next_unit();
+	std::vector<float> S(r_sketch * Ntok);
+	LCG sketch_rng(99999u);
+	for (unsigned int i = 0; i < S.size(); ++i) S[i] = 0.3f * sketch_rng.next_unit();
+
+	// --- CPU reference ---
+	std::vector<float> p_cpu(p);
+	for (unsigned int t = 0; t < T; ++t)
+		glades::chiron::shear_add_to_p(&p_cpu[t * m], &u[t * m], m);
+
+	std::vector<float> p_cpu_sub(p);
+	for (unsigned int t = 0; t < T; ++t)
+		glades::chiron::shear_sub_from_p(&p_cpu_sub[t * m], &u[t * m], m);
+
+	std::vector<float> q_out_cpu(T * m), stats_cpu(T * 2u);
+	glades::chiron::reln_forward(&q_in[0], &q_out_cpu[0], &stats_cpu[0],
+	                              &gamma[0], &beta[0], T, m, eps);
+
+	std::vector<float> q_inv_cpu(T * m);
+	glades::chiron::reln_inverse(&q_out_cpu[0], &q_inv_cpu[0], &stats_cpu[0],
+	                              &gamma[0], &beta[0], T, m);
+
+	std::vector<float> Z_cpu(T * r_sketch, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		glades::chiron::sketch_project(&S[0], &X[t * Ntok],
+		                                r_sketch, Ntok, &Z_cpu[t * r_sketch]);
+
+	std::vector<float> X_lifted_cpu(X);
+	for (unsigned int t = 0; t < T; ++t)
+		glades::chiron::sketch_lift_add(&S[0], &Z_cpu[t * r_sketch],
+		                                 r_sketch, Ntok, &X_lifted_cpu[t * Ntok]);
+
+	// --- GPU path ---
+	glades::gpu::GpuBuffer<float> d_p, d_u;
+	d_p.allocate(p.size()); d_u.allocate(u.size());
+	d_p.upload(&p[0], p.size());
+	d_u.upload(&u[0], u.size());
+
+	ASSERT("chiron_shear_add", glades::gpu::chiron_shear_add(
+	        d_p.data(), d_u.data(), static_cast<int>(p.size())));
+	std::vector<float> p_gpu(p.size());
+	d_p.download(&p_gpu[0], p.size());
+
+	// Reset d_p to original, test sub variant.
+	d_p.upload(&p[0], p.size());
+	ASSERT("chiron_shear_sub", glades::gpu::chiron_shear_sub(
+	        d_p.data(), d_u.data(), static_cast<int>(p.size())));
+	std::vector<float> p_gpu_sub(p.size());
+	d_p.download(&p_gpu_sub[0], p.size());
+
+	// ReLN forward.
+	glades::gpu::GpuBuffer<float> d_qin, d_qout, d_stats, d_gamma, d_beta;
+	d_qin.allocate(q_in.size()); d_qout.allocate(q_in.size());
+	d_stats.allocate(T * 2u);
+	d_gamma.allocate(m); d_beta.allocate(m);
+	d_qin.upload(&q_in[0], q_in.size());
+	d_gamma.upload(&gamma[0], m);
+	d_beta.upload(&beta[0], m);
+
+	ASSERT("chiron_reln_forward", glades::gpu::chiron_reln_forward(
+	        d_qin.data(), d_qout.data(), d_stats.data(),
+	        d_gamma.data(), d_beta.data(),
+	        static_cast<int>(T), static_cast<int>(m), eps));
+	std::vector<float> q_out_gpu(q_in.size()), stats_gpu(T * 2u);
+	d_qout.download(&q_out_gpu[0], q_in.size());
+	d_stats.download(&stats_gpu[0], T * 2u);
+
+	// ReLN inverse.
+	glades::gpu::GpuBuffer<float> d_qinv;
+	d_qinv.allocate(q_in.size());
+	ASSERT("chiron_reln_inverse", glades::gpu::chiron_reln_inverse(
+	        d_qout.data(), d_qinv.data(), d_stats.data(),
+	        d_gamma.data(), d_beta.data(),
+	        static_cast<int>(T), static_cast<int>(m)));
+	std::vector<float> q_inv_gpu(q_in.size());
+	d_qinv.download(&q_inv_gpu[0], q_in.size());
+
+	// Sketch project.
+	glades::gpu::GpuBuffer<float> d_X, d_S, d_Z;
+	d_X.allocate(X.size()); d_S.allocate(S.size()); d_Z.allocate(T * r_sketch);
+	d_X.upload(&X[0], X.size());
+	d_S.upload(&S[0], S.size());
+	ASSERT("chiron_sketch_project", glades::gpu::chiron_sketch_project(
+	        d_X.data(), d_S.data(),
+	        static_cast<int>(T), static_cast<int>(Ntok), static_cast<int>(r_sketch),
+	        d_Z.data()));
+	std::vector<float> Z_gpu(T * r_sketch);
+	d_Z.download(&Z_gpu[0], T * r_sketch);
+
+	// Sketch lift-add.
+	d_X.upload(&X[0], X.size());  // reset to raw X
+	ASSERT("chiron_sketch_lift_add", glades::gpu::chiron_sketch_lift_add(
+	        d_X.data(), d_Z.data(), d_S.data(),
+	        static_cast<int>(T), static_cast<int>(Ntok), static_cast<int>(r_sketch)));
+	std::vector<float> X_lifted_gpu(X.size());
+	d_X.download(&X_lifted_gpu[0], X.size());
+
+	// --- Compare ---
+	char msg[256];
+	const float tol_elem = 5e-5f;   // element-wise tolerance for simple ops
+	const float tol_gemm = 5e-4f;   // slightly looser for GEMM-routed ops
+
+	float err_add = max_abs_diff(p_cpu, p_gpu);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU shear_add parity: cpu vs gpu max_err=%.3e (tol %.1e)", err_add, tol_elem);
+	ASSERT(msg, err_add < tol_elem);
+
+	float err_sub = max_abs_diff(p_cpu_sub, p_gpu_sub);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU shear_sub parity: max_err=%.3e (tol %.1e)", err_sub, tol_elem);
+	ASSERT(msg, err_sub < tol_elem);
+
+	float err_reln_fwd = max_abs_diff(q_out_cpu, q_out_gpu);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU reln_forward q_out parity: max_err=%.3e (tol %.1e)", err_reln_fwd, tol_elem);
+	ASSERT(msg, err_reln_fwd < tol_elem);
+
+	float err_reln_stats = max_abs_diff(stats_cpu, stats_gpu);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU reln_forward stats parity: max_err=%.3e (tol %.1e)", err_reln_stats, tol_elem);
+	ASSERT(msg, err_reln_stats < tol_elem);
+
+	float err_reln_inv = max_abs_diff(q_inv_cpu, q_inv_gpu);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU reln_inverse parity: max_err=%.3e (tol %.1e)", err_reln_inv, tol_elem);
+	ASSERT(msg, err_reln_inv < tol_elem);
+
+	float err_sketch_proj = max_abs_diff(Z_cpu, Z_gpu);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU sketch_project parity: max_err=%.3e (tol %.1e)",
+	              err_sketch_proj, tol_gemm);
+	ASSERT(msg, err_sketch_proj < tol_gemm);
+
+	float err_sketch_lift = max_abs_diff(X_lifted_cpu, X_lifted_gpu);
+	std::snprintf(msg, sizeof(msg),
+	              "GPU sketch_lift_add parity: max_err=%.3e (tol %.1e)",
+	              err_sketch_lift, tol_gemm);
+	ASSERT(msg, err_sketch_lift < tol_gemm);
+
+	std::printf("  CHIRON GPU parity @ T=%u m=%u r=%u:\n"
+	            "    shear_add      max_err=%.3e\n"
+	            "    shear_sub      max_err=%.3e\n"
+	            "    reln_fwd  (q)  max_err=%.3e\n"
+	            "    reln_fwd stats max_err=%.3e\n"
+	            "    reln_inv       max_err=%.3e\n"
+	            "    sketch_project max_err=%.3e\n"
+	            "    sketch_lift    max_err=%.3e\n",
+	            T, m, r_sketch,
+	            err_add, err_sub, err_reln_fwd, err_reln_stats, err_reln_inv,
+	            err_sketch_proj, err_sketch_lift);
+#else
+	std::printf("  [CHIRON GPU parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -1508,5 +1706,6 @@ void CHIRONUnitTest()
 	CHIRONSketchProjectLiftTest();
 	CHIRONSketchCorrectedBf16Test();
 	CHIRONPerTokenSketchBf16Test();
+	CHIRONGpuParityTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
