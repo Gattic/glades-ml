@@ -2533,6 +2533,172 @@ void CHIRONBenchmark()
 	}
 
 #ifdef GLADES_HAVE_CUDA
+	// --- Full-block forward + inverse GPU benchmark ---
+	std::printf("\n--- Full CHIRON block (attn+shear+shear+reln) GPU timing ---\n");
+	if (glades::gpu::initDevice())
+	{
+		struct BlockSize { unsigned int T, m, dH; const char* label; };
+		const BlockSize block_sizes[] = {
+			{ 256u,  256u,  256u, "small  (T=256, m=256,  dH=256)"  },
+			{ 1024u, 1024u, 1024u, "medium (T=1024, m=1024, dH=1024)" },
+			{ 2048u, 2048u, 2048u, "large  (T=2048, m=2048, dH=2048)" }
+		};
+		const int n_block_sizes = sizeof(block_sizes) / sizeof(block_sizes[0]);
+
+		const float eps = 1e-4f;
+		const bool causal = true;
+		const int fwd_iters = 10;
+
+		for (int s = 0; s < n_block_sizes; ++s)
+		{
+			const unsigned int T  = block_sizes[s].T;
+			const unsigned int m  = block_sizes[s].m;
+			const unsigned int dH = block_sizes[s].dH;
+
+			std::printf("\n%s:\n", block_sizes[s].label);
+
+			LCG brng(8765u + s);
+			std::vector<float> q(T * m), p(T * m);
+			std::vector<float> Wq(m * dH), Wk(m * dH), Wv(m * dH), Wo(dH * m);
+			std::vector<float> u(T * m), v(T * m);
+			std::vector<float> gamma(m), beta(m);
+			for (unsigned int i = 0; i < T * m; ++i)
+			{
+				q[i] = 0.3f * brng.next_unit();
+				p[i] = 0.3f * brng.next_unit();
+				u[i] = 0.05f * brng.next_unit();
+				v[i] = 0.05f * brng.next_unit();
+			}
+			for (unsigned int i = 0; i < m * dH; ++i)
+			{
+				Wq[i] = 0.05f * brng.next_unit();
+				Wk[i] = 0.05f * brng.next_unit();
+				Wv[i] = 0.05f * brng.next_unit();
+			}
+			for (unsigned int i = 0; i < dH * m; ++i)
+				Wo[i] = 0.05f * brng.next_unit();
+			for (unsigned int i = 0; i < m; ++i)
+			{
+				gamma[i] = 1.0f + 0.08f * brng.next_unit();
+				beta[i]  = 0.02f * brng.next_unit();
+			}
+
+			glades::gpu::GpuBuffer<float> d_q, d_p, d_qtmp;
+			glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo;
+			glades::gpu::GpuBuffer<float> d_u, d_v;
+			glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO;
+			glades::gpu::GpuBuffer<float> d_stats, d_gamma, d_beta;
+			d_q.allocate(T * m); d_p.allocate(T * m); d_qtmp.allocate(T * m);
+			d_Wq.allocate(m * dH); d_Wk.allocate(m * dH);
+			d_Wv.allocate(m * dH); d_Wo.allocate(dH * m);
+			d_u.allocate(T * m); d_v.allocate(T * m);
+			d_sQ.allocate(T * dH); d_sK.allocate(T * dH);
+			d_sV.allocate(T * dH); d_sO.allocate(T * dH);
+			d_stats.allocate(T * 2u);
+			d_gamma.allocate(m); d_beta.allocate(m);
+			d_q.upload(&q[0], T * m); d_p.upload(&p[0], T * m);
+			d_Wq.upload(&Wq[0], m * dH); d_Wk.upload(&Wk[0], m * dH);
+			d_Wv.upload(&Wv[0], m * dH); d_Wo.upload(&Wo[0], dH * m);
+			d_u.upload(&u[0], T * m); d_v.upload(&v[0], T * m);
+			d_gamma.upload(&gamma[0], m); d_beta.upload(&beta[0], m);
+
+			// Warmup.
+			for (int it = 0; it < 3; ++it)
+			{
+				glades::gpu::chiron_attention_shear(
+				    d_q.data(), d_p.data(),
+				    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+				    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dH),
+				    causal, false,
+				    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data());
+				glades::gpu::chiron_shear_add(d_p.data(), d_u.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_shear_add(d_q.data(), d_v.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_reln_forward(
+				    d_q.data(), d_qtmp.data(), d_stats.data(),
+				    d_gamma.data(), d_beta.data(),
+				    static_cast<int>(T), static_cast<int>(m), eps);
+				glades::gpu::chiron_reln_inverse(
+				    d_qtmp.data(), d_q.data(), d_stats.data(),
+				    d_gamma.data(), d_beta.data(),
+				    static_cast<int>(T), static_cast<int>(m));
+				glades::gpu::chiron_shear_sub(d_q.data(), d_v.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_shear_sub(d_p.data(), d_u.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_attention_shear(
+				    d_q.data(), d_p.data(),
+				    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+				    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dH),
+				    causal, true,
+				    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data());
+			}
+			glades::gpu::synchronizeCheck("fullblock warmup");
+
+			// Measure forward-only per block (representative of training forward).
+			double t0 = wall_ms_chiron();
+			for (int it = 0; it < fwd_iters; ++it)
+			{
+				glades::gpu::chiron_attention_shear(
+				    d_q.data(), d_p.data(),
+				    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+				    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dH),
+				    causal, false,
+				    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data());
+				glades::gpu::chiron_shear_add(d_p.data(), d_u.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_shear_add(d_q.data(), d_v.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_reln_forward(
+				    d_q.data(), d_qtmp.data(), d_stats.data(),
+				    d_gamma.data(), d_beta.data(),
+				    static_cast<int>(T), static_cast<int>(m), eps);
+				glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(),
+				                                sizeof(float) * T * m);
+			}
+			glades::gpu::synchronizeCheck("fullblock fwd");
+			double tfwd = (wall_ms_chiron() - t0) / fwd_iters;
+
+			// Measure inverse (the backward-time work that replaces stored activations).
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < fwd_iters; ++it)
+			{
+				glades::gpu::chiron_reln_inverse(
+				    d_q.data(), d_qtmp.data(), d_stats.data(),
+				    d_gamma.data(), d_beta.data(),
+				    static_cast<int>(T), static_cast<int>(m));
+				glades::gpu::device_memcpy_d2d(d_q.data(), d_qtmp.data(),
+				                                sizeof(float) * T * m);
+				glades::gpu::chiron_shear_sub(d_q.data(), d_v.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_shear_sub(d_p.data(), d_u.data(),
+				                               static_cast<int>(T * m));
+				glades::gpu::chiron_attention_shear(
+				    d_q.data(), d_p.data(),
+				    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+				    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dH),
+				    causal, true,
+				    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data());
+			}
+			glades::gpu::synchronizeCheck("fullblock inv");
+			double tinv = (wall_ms_chiron() - t0) / fwd_iters;
+
+			// Approximate flop count per block (dominated by 4 m*dH GEMMs + attention).
+			const double gemm_flops = 4.0 * T * m * dH * 2.0; // 3 in proj + 1 out proj
+			const double attn_flops = 2.0 * T * T * dH * 2.0; // QK^T + prob·V
+			const double total_flops = gemm_flops + attn_flops;
+			const double fwd_tflops = total_flops / (tfwd * 1e-3) / 1e12;
+			const double inv_tflops = total_flops / (tinv * 1e-3) / 1e12;
+			std::printf("  fwd_block_time = %.3f ms  (%.2f TFLOP/s)\n",
+			            tfwd, fwd_tflops);
+			std::printf("  inv_block_time = %.3f ms  (%.2f TFLOP/s)\n",
+			            tinv, inv_tflops);
+			std::printf("  fwd+inv (full step, without gradient) = %.3f ms\n",
+			            tfwd + tinv);
+		}
+	}
+
 	// --- End-to-end memory comparison: baseline vs. CHIRON ---
 	std::printf("\n--- Memory comparison: baseline transformer vs. CHIRON ---\n");
 	if (glades::gpu::initDevice())

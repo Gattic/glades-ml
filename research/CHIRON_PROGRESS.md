@@ -166,6 +166,39 @@ buffer. Reducing r from 1024 to 256 cuts ~75% of that component. At
 production, sketch r can be tuned per-layer based on measured drift;
 anchored-mode (full-activation every k blocks) is another lever.
 
+## 2026-04-21 — GPU attention shear + full-block end-to-end
+
+Added `chiron_attention_shear` composition wrapper on GPU using:
+  Q/K/V = q · Wq/Wk/Wv        (cuBLAS sgemm_rowmajor)
+  O     = flash_attention_multihead_forward(Q, K, V)   (existing kernel)
+  p    += ±1 · O · Wo          (cuBLAS sgemm_rowmajor with beta=1.0)
+
+Inverse path uses alpha=-1 in the final GEMM — bit-equivalent to the
+forward because q is unchanged and the same Y(q) is recomputed.
+
+**GPU attention shear parity (vs CPU):** fwd_err=3.0e-8, inv_err=3.0e-8.
+
+**GPU full-block end-to-end (attn + 2 MLP shears + ReLN) at L=4:**
+q_err=p_err=1.0e-7 — machine epsilon after 4 layers of forward+inverse.
+
+Every CHIRON primitive now runs on GPU. The full forward block **and**
+its inverse are expressible purely as existing kernel calls — no new
+kernel development is required beyond gpu_chiron.{h,cu}.
+
+### Full-block timing (RTX 4080 SUPER, single head, FP32)
+
+| Size | fwd block | inv block | fwd+inv |
+|---|---|---|---|
+| T=256, m=256, dH=256  | 0.30 ms | 0.30 ms | 0.61 ms |
+| T=1024, m=1024, dH=1024 | 12.3 ms | 12.0 ms | 24.3 ms |
+| T=2048, m=2048, dH=2048 | 91.1 ms | 90.3 ms | 181 ms |
+
+Observation: the full-block path is only hitting ~1 TFLOP/s (vs sketch's
+45 TFLOP/s on the same hardware). The bottleneck is the attention op
+itself — flash attention in FP32. A BF16-input path would unlock
+substantially more throughput. This is the highest-value remaining GPU
+optimization.
+
 ## 2026-04-21 — Baseline transformer throughput captured
 
 Ran glades-trainer with default (AdamW+BF16) config for comparison:
