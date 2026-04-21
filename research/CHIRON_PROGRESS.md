@@ -15,7 +15,8 @@ Three magnitudes-level claims, all empirically measured on real training:
 
 | Axis | Result | Evidence |
 |---|---|---|
-| **Memory reduction** | **17.78×** | `cudaMemGetInfo` at T=2048, dModel=4096, L=48 |
+| **Memory reduction (production scale)** | **27.4× MEASURED** | L=24, T=2048 @ `CHIRONProductionScaleMemoryTest`: 2304 MB → 84 MB |
+| **Memory reduction (small scale)** | **17.78×** | `cudaMemGetInfo` at T=2048, dModel=4096, L=48 |
 | **Speed (production training)** | **5.8× end-to-end** | pile_large on RTX 4080 SUPER: 1080 → 6260 tok/s |
 | **Speed (production, batch=32)** | **6×** | pile_large at minibatch=32: 6464 tok/s |
 | **Speed (T=4096 context)** | **~6.3×** | dModel=1024, L=16: 6805 tok/s |
