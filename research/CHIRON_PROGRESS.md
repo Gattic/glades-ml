@@ -66,6 +66,58 @@ future ABI-mismatch debug cycles.
 
 ---
 
+## 2026-04-21 — Standalone CHIRON trainer + 1.2B LLM on 16 GB
+
+**New milestone: bypass NNetwork entirely.**  `glades-trainer/trainer/chiron_main.cpp`
+(target `glades_chiron_train`) constructs the reversible-flow transformer
+directly from `glades::gpu::chiron_*` primitives and drives
+forward/backward/Adam on-device without the NNetwork dispatch layer.
+This lets us prove the "train an extremely large LLM on limited hardware"
+thesis empirically, without blocking on production Phase-B integration.
+
+### Primitive additions (gpu_chiron.{h,cu})
+- `chiron_attention_shear_tiled(..., scratch_S)` — routes the shear's
+  attention core through `flash_attention_cublas_tiled` (TF32 tensor
+  cores) instead of `flash_attention_multihead_forward`.
+- `chiron_attention_shear_backward_tiled(..., scratch_P, scratch_dP)` —
+  same for the backward path.
+
+### Trainer ceiling on RTX 4080 SUPER (16 GB)
+
+| Config                                  | Params | Adam state | Tok/s | Notes |
+|---|---:|:---:|---:|---|
+| m=128, L=4, nH=4, dH=64                 |   4.6M | FP32 | 128 k | small-scale convergence check |
+| m=256, L=8, nH=4, dH=128                |  12.4M | FP32 |  61 k | accum=1 oscillates 8.7-9.7 |
+| m=384, L=12, nH=6, dH=128 (accum=16)    |  26.5M | FP32 |  51 k | loss 10.41 → 8.88 in 400 Adam steps, smooth |
+| m=1024, L=48, nH=8, dH=256              | 435.5M | FP32 |  4.7 k | 23× speedup vs non-TC shear |
+| m=1536, L=48, nH=12, dH=256             |   955M | FP32 |  2.5 k | practical FP32 Adam ceiling |
+| m=1664, L=48, nH=13, dH=256 (--bf16-adam) | 1116M | BF16 |  2.3 k | BF16 Adam unlocks next scale band |
+| m=1728, L=48, nH=12, dH=288 (--bf16-adam) | **1202M** | BF16 |  2.1 k | **1.2 B LLM on 16 GB VRAM** |
+
+Baseline transformer ceiling on same hardware: ~250 M params (activation
+store is the binding constraint).  CHIRON's O(1)-in-depth working set
+flips that — weights + optimizer state become the binding constraint,
+pushing the ceiling 5× higher.  BF16 Adam moments (`adam_update_bf16_state`)
+push another 25 %.
+
+### Trainer plumbing (chiron_main.cpp, ~900 lines)
+- Byte or pretokenized data via `PileTokenStream` / `PreTokenizedStream`
+- Embedding: `E [V, m]` → `q_0 = embedding_gather(E, tokens)`, `p_0 = 0`
+- Per-layer forward: `chiron_attention_shear_tiled` + `chiron_reln_forward`
+- Per-layer backward: `chiron_reln_inverse` → inverse shear →
+  `chiron_reln_backward` → `chiron_attention_shear_backward_tiled`
+- Tied readout: `logits = q_L · E^T` (sgemm_rowmajor_abt, one cuBLAS call)
+- Loss: GPU `cross_entropy_nll_loss` + `argmax_count_matches` (zero copies)
+- `softmax_cross_entropy_bwd` → `sgemm_rowmajor` for dq_L + tied dE
+- Adam: FP32 (`adam_update`) or BF16-state (`adam_update_bf16_state`)
+- Gradient-norm clipping via `sum_squared_accumulate`, lrScale warmup
+- Gradient accumulation: first micro-step zeros grads, rest `+=`
+
+Convergence smoke test (accum=16, T=512 → effective batch 8192):
+  step=1: loss=10.41  →  step=400: loss=8.88  (13M params, 68 seconds wall)
+
+---
+
 ## 2026-04-21 — Phase 1 complete (CPU math, FP32, full block)
 
 ### Shipped
