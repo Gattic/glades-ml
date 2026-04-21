@@ -190,6 +190,35 @@ bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
                                          unsigned short* scratch_Vbf16,
                                          unsigned short* scratch_Pbf16);
 
+// BF16-weight variant of chiron_attention_shear_bf16_tiled.  Takes BF16
+// weight pointers directly — no per-layer weight-cast scratch needed.
+// Q/K/V/O projections run through sgemm_rowmajor_bf16 (BF16×BF16→FP32 via
+// BF16 tensor cores, ~2× TF32-TC throughput on Ampere/Ada).  Intended for
+// use with --bf16-weights on the trainer; eliminates 4 weight-cast kernels
+// per layer (~200 MB of HBM traffic saved per layer at 2 B scale) and
+// doubles projection GEMM throughput.
+//
+// Extra scratch (caller-owned):
+//   scratch_qbf   [T, m]          BF16 cast of q (one cast per layer)
+//   scratch_Obf   [T, dModel]     BF16 cast of attention output for Wo proj
+//   (plus the same scratch_Qbf16/Kbf16/Vbf16/Pbf16 as _bf16_tiled)
+bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
+                                          const unsigned short* Wq_bf,
+                                          const unsigned short* Wk_bf,
+                                          const unsigned short* Wv_bf,
+                                          const unsigned short* Wo_bf,
+                                          int T, int m, int nHeads, int dHead,
+                                          bool causal, bool invert,
+                                          unsigned short* scratch_qbf,
+                                          unsigned short* scratch_Obf,
+                                          float* scratch_Q, float* scratch_K,
+                                          float* scratch_V, float* scratch_O,
+                                          float* scratch_S,
+                                          unsigned short* scratch_Qbf16,
+                                          unsigned short* scratch_Kbf16,
+                                          unsigned short* scratch_Vbf16,
+                                          unsigned short* scratch_Pbf16);
+
 // Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
 // scratch_dP, each [nHeads, T, T], caller-owned.
@@ -369,6 +398,14 @@ inline bool flash_attention_cublas_tiled_bf16(
     int, int, int, int, bool,
     float*, float*,
     unsigned short*, unsigned short*, unsigned short*, unsigned short*) { return false; }
+inline bool chiron_attention_shear_bf16w_tiled(const float*, float*,
+                                                 const unsigned short*, const unsigned short*,
+                                                 const unsigned short*, const unsigned short*,
+                                                 int, int, int, int, bool, bool,
+                                                 unsigned short*, unsigned short*,
+                                                 float*, float*, float*, float*, float*,
+                                                 unsigned short*, unsigned short*,
+                                                 unsigned short*, unsigned short*) { return false; }
 inline bool flash_attention_backward_cublas_tiled(
     const float*, const float*, const float*,
     const float*, const float*,

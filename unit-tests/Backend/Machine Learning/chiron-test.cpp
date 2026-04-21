@@ -2475,12 +2475,137 @@ void CHIRONFlashShearBackwardBf16ParityTest()
 #endif
 }
 
+// Parity test for bf16w-tiled shear (takes BF16 weight pointers directly,
+// uses sgemm_rowmajor_bf16 for Q/K/V/O projections) vs. bf16-tiled shear
+// (takes FP32 weights and uses sgemm_rowmajor).  Both produce identical p
+// modulo BF16 precision on the additional Q/K/V/O BF16 projection GEMMs.
+void CHIRONBf16WeightProjectionParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [bf16w parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T = 64, m = 32, nH = 4, dH = 16;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(91234u);
+	std::vector<float> q_init(T * m), p_init(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	for (size_t i = 0; i < q_init.size(); ++i) q_init[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < p_init.size(); ++i) p_init[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < Wq.size(); ++i) Wq[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wk.size(); ++i) Wk[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wv.size(); ++i) Wv[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wo.size(); ++i) Wo[i] = 0.1f * rng.next_unit();
+
+	// Host-side RNE cast for the BF16 weight input (same as what the
+	// trainer uses when --bf16-weights initializes).  C++98-compatible
+	// inline logic rather than lambdas.
+	std::vector<uint16_t> Wq_bf(m * dM), Wk_bf(m * dM), Wv_bf(m * dM), Wo_bf(dM * m);
+	#define FP32_TO_BF16_RNE(f_, out_) do {                                 \
+		union { float f; uint32_t u; } __v; __v.f = (f_);                    \
+		if ((f_) != (f_)) {                                                  \
+			const uint32_t __sign = __v.u & 0x80000000u;                     \
+			(out_) = (uint16_t)(((__sign | 0x7FC00000u) >> 16) & 0xFFFFu);   \
+		} else {                                                             \
+			const uint32_t __lsb = (__v.u >> 16) & 1u;                       \
+			const uint32_t __bias = 0x7FFFu + __lsb;                         \
+			(out_) = (uint16_t)((__v.u + __bias) >> 16);                     \
+		}                                                                    \
+	} while (0)
+	#define BF16_TO_FP32(b_, out_) do {                                     \
+		union { uint32_t u; float f; } __v;                                  \
+		__v.u = ((uint32_t)(b_)) << 16;                                      \
+		(out_) = __v.f;                                                      \
+	} while (0)
+
+	for (size_t i = 0; i < Wq.size(); ++i) FP32_TO_BF16_RNE(Wq[i], Wq_bf[i]);
+	for (size_t i = 0; i < Wk.size(); ++i) FP32_TO_BF16_RNE(Wk[i], Wk_bf[i]);
+	for (size_t i = 0; i < Wv.size(); ++i) FP32_TO_BF16_RNE(Wv[i], Wv_bf[i]);
+	for (size_t i = 0; i < Wo.size(); ++i) FP32_TO_BF16_RNE(Wo[i], Wo_bf[i]);
+
+	// FP32 -> BF16 -> FP32 round-trip for the reference so the precision
+	// difference reflects only the BF16-GEMM on projections (not weight
+	// storage).
+	std::vector<float> WqR(m * dM), WkR(m * dM), WvR(m * dM), WoR(dM * m);
+	for (size_t i = 0; i < Wq.size(); ++i) BF16_TO_FP32(Wq_bf[i], WqR[i]);
+	for (size_t i = 0; i < Wk.size(); ++i) BF16_TO_FP32(Wk_bf[i], WkR[i]);
+	for (size_t i = 0; i < Wv.size(); ++i) BF16_TO_FP32(Wv_bf[i], WvR[i]);
+	for (size_t i = 0; i < Wo.size(); ++i) BF16_TO_FP32(Wo_bf[i], WoR[i]);
+	#undef FP32_TO_BF16_RNE
+	#undef BF16_TO_FP32
+
+	glades::gpu::GpuBuffer<float> d_q, d_p_ref, d_p_new;
+	glades::gpu::GpuBuffer<float> d_Wq, d_Wk, d_Wv, d_Wo;
+	glades::gpu::GpuBuffer<uint16_t> d_Wq_bf, d_Wk_bf, d_Wv_bf, d_Wo_bf;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO, d_S;
+	glades::gpu::GpuBuffer<uint16_t> d_qbf, d_Obf, d_Qbf, d_Kbf, d_Vbf, d_Pbf;
+
+	d_q.allocate(T * m); d_p_ref.allocate(T * m); d_p_new.allocate(T * m);
+	d_Wq.allocate(m * dM); d_Wk.allocate(m * dM);
+	d_Wv.allocate(m * dM); d_Wo.allocate(dM * m);
+	d_Wq_bf.allocate(m * dM); d_Wk_bf.allocate(m * dM);
+	d_Wv_bf.allocate(m * dM); d_Wo_bf.allocate(dM * m);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM);
+	d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_S.allocate((size_t)nH * T * T);
+	d_qbf.allocate(T * m); d_Obf.allocate(T * dM);
+	d_Qbf.allocate(T * dM); d_Kbf.allocate(T * dM);
+	d_Vbf.allocate(T * dM); d_Pbf.allocate((size_t)nH * T * T);
+
+	d_q.upload(&q_init[0], q_init.size());
+	d_Wq.upload(&WqR[0], WqR.size());   d_Wk.upload(&WkR[0], WkR.size());
+	d_Wv.upload(&WvR[0], WvR.size());   d_Wo.upload(&WoR[0], WoR.size());
+	d_Wq_bf.upload(&Wq_bf[0], Wq_bf.size()); d_Wk_bf.upload(&Wk_bf[0], Wk_bf.size());
+	d_Wv_bf.upload(&Wv_bf[0], Wv_bf.size()); d_Wo_bf.upload(&Wo_bf[0], Wo_bf.size());
+
+	// Reference: bf16_tiled (FP32 weights, FP32 projections, BF16 attn core).
+	d_p_ref.upload(&p_init[0], p_init.size());
+	ASSERT("bf16 tiled ref",
+	       glades::gpu::chiron_attention_shear_bf16_tiled(
+	           d_q.data(), d_p_ref.data(),
+	           d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+	           (int)T, (int)m, (int)nH, (int)dH, causal, /*invert=*/false,
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(), d_S.data(),
+	           d_Qbf.data(), d_Kbf.data(), d_Vbf.data(), d_Pbf.data()));
+
+	// New: bf16w_tiled (BF16 weights, BF16 TC projections, BF16 attn core).
+	d_p_new.upload(&p_init[0], p_init.size());
+	ASSERT("bf16w tiled new",
+	       glades::gpu::chiron_attention_shear_bf16w_tiled(
+	           d_q.data(), d_p_new.data(),
+	           d_Wq_bf.data(), d_Wk_bf.data(), d_Wv_bf.data(), d_Wo_bf.data(),
+	           (int)T, (int)m, (int)nH, (int)dH, causal, /*invert=*/false,
+	           d_qbf.data(), d_Obf.data(),
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(), d_S.data(),
+	           d_Qbf.data(), d_Kbf.data(), d_Vbf.data(), d_Pbf.data()));
+
+	std::vector<float> p_ref(T * m), p_new(T * m);
+	d_p_ref.download(&p_ref[0], T * m);
+	d_p_new.download(&p_new[0], T * m);
+	const float err = max_abs_diff(p_ref, p_new);
+	std::printf("  bf16w (BF16 projections) vs bf16 (FP32 projections) shear: max_err=%.3e\n", err);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "bf16w parity: max_err=%.3e (tol 1e-1 — BF16 projection input precision)",
+	              err);
+	ASSERT(msg, err < 1e-1f);
+#else
+	std::printf("  [bf16w parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONStochasticBf16RoundingTest();
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();
+	CHIRONBf16WeightProjectionParityTest();
 	CHIRONShearReversibilityTest();
 	CHIRONReLNRoundtripTest();
 	CHIRONBlockRoundtripTest();

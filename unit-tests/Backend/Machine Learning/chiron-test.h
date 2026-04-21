@@ -49,6 +49,7 @@ void CHIRONCublasTiledAttentionBackwardParityTest();
 void CHIRONStochasticBf16RoundingTest();
 void CHIRONFlashShearVsTiledBf16ParityTest();
 void CHIRONFlashShearBackwardBf16ParityTest();
+void CHIRONBf16WeightProjectionParityTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();

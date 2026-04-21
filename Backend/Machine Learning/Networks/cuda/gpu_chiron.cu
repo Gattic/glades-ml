@@ -429,6 +429,71 @@ bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
 	return true;
 }
 
+// BF16-weight variant of chiron_attention_shear_bf16_tiled.  Takes BF16
+// weight pointers directly — no per-layer FP32 cast scratch needed for
+// weights.  Q/K/V/O projections run through sgemm_rowmajor_bf16
+// (BF16 x BF16 -> FP32 via BF16 tensor cores, ~2x TF32 throughput on
+// Ampere/Ada).
+//
+// Extra scratch (caller-owned):
+//   scratch_qbf   [T, m]     — BF16 cast of q (one cast per layer)
+//   scratch_Obf   [T, dModel] — BF16 cast of attention output for Wo proj
+//
+// Combined with --bf16-weights on the trainer: eliminates 4 weight-cast
+// kernels per layer and replaces 4 TF32-TC GEMMs with BF16-TC GEMMs.
+// Projected 8% e2e throughput improvement at 2 B scale (see
+// research/BF16_PROJECTION_OPT.md).
+bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
+                                          const unsigned short* Wq_bf,
+                                          const unsigned short* Wk_bf,
+                                          const unsigned short* Wv_bf,
+                                          const unsigned short* Wo_bf,
+                                          int T, int m, int nHeads, int dHead,
+                                          bool causal, bool invert,
+                                          unsigned short* scratch_qbf,
+                                          unsigned short* scratch_Obf,
+                                          float* scratch_Q, float* scratch_K,
+                                          float* scratch_V, float* scratch_O,
+                                          float* scratch_S,
+                                          unsigned short* scratch_Qbf16,
+                                          unsigned short* scratch_Kbf16,
+                                          unsigned short* scratch_Vbf16,
+                                          unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	// Cast q FP32 -> BF16 once per layer.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// BF16 x BF16 -> FP32 projections via BF16 tensor cores.
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_K, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_V, dModel))
+		return false;
+
+	// Attention core (BF16 inputs, FP32 output).
+	if (!flash_attention_cublas_tiled_bf16(
+	        scratch_Q, scratch_K, scratch_V,
+	        T, nHeads, dHead, dModel, causal,
+	        scratch_O, scratch_S,
+	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
+		return false;
+
+	// Cast scratch_O -> BF16 for the output projection.
+	if (!cast_f32_to_bf16(scratch_O, scratch_Obf, static_cast<size_t>(T) * dModel))
+		return false;
+
+	// Output projection: p += sign * scratch_Obf @ Wo_bf (BF16 TC, FP32 accum).
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor_bf16(T, m, dModel, sign, scratch_Obf, dModel, Wo_bf, m, 1.0f, p, m))
+		return false;
+	return true;
+}
+
 // Tiled variant of chiron_attention_shear.  Same math as chiron_attention_shear
 // but replaces the O(T²·dH) flash-attention core with flash_attention_cublas_tiled
 // (TF32 tensor cores via cuBLAS batched strided GEMM).  Typical 5-10× wall-clock
