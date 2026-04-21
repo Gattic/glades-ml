@@ -157,10 +157,16 @@ Convergence check (4.6 M params, T=512, lr=3e-3, accum=8):
   **int8 Adam: loss 10.40 → 8.87  (500 steps)** — new variant
 
 Training-scale ceiling on RTX 4080 SUPER (16 GB):
-  FP32 Adam:  955M params  (7.56 GB used)
-  BF16 Adam: 1202M params  (15.29 GB used)
-  int8 Adam: 1382M params  (15.32 GB used) — 15% larger than BF16
-  **CPU-offload Adam: 1781M params (15.29 GB used) — 29% larger than int8**
+  FP32 Adam:                955M params  (7.56 GB used)  @ 2464 tok/s
+  BF16 Adam:               1202M params  (15.29 GB used) @ 2105 tok/s
+  int8 Adam:               1382M params  (15.32 GB used) @ 2017 tok/s
+  **int8 + BF16 grads (GPU-only): 1676M params (14.01 GB used) @ 1484 tok/s**
+  CPU-offload Adam:        1781M params  (15.29 GB used) @  307 tok/s (P2 async)
+
+The GPU-only int8+bf16-grads combination reaches within 6% of the
+CPU-offload ceiling at ~5× the throughput — preserves the GPU path as
+the primary training lever while delivering the same 7× lift over the
+non-CHIRON baseline (~250M).
 
 At 1.2 B both fit, but int8 Adam uses only 12.98 GB — 2.3 GB of free
 headroom at identical param count.
