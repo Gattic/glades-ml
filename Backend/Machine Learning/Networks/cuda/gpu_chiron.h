@@ -50,6 +50,30 @@ bool chiron_reln_inverse(const float* q_out, float* q_in, const float* stats,
                           const float* gamma, const float* beta,
                           int T, int m);
 
+// Reversible LayerNorm backward.  Given the output-space gradient dq_out
+// [T, m], the pre-ReLN input q_in [T, m] (typically RECONSTRUCTED via
+// reln_inverse during the CHIRON backward pass), the affine parameters
+// gamma/beta [m], and the stats [T, 2] stored at forward time, this
+// computes:
+//   dq_in [T, m]   : gradient of the loss with respect to q_in.
+//   dgamma [m]     : ACCUMULATED gradient w.r.t. gamma (pre-initialize).
+//   dbeta  [m]     : ACCUMULATED gradient w.r.t. beta.
+//
+// Math: identical to the standard LayerNorm backward (our ReLN forward
+// is numerically identical to LayerNorm forward — the only novelty is
+// that stats are stored externally and the map is framed as a reversible
+// shear in p-coordinates).  This is a thin wrapper that converts stats
+// from (mu, log_sigma) to (mean, invStd) format and calls the existing
+// layernorm_backward kernel.
+//
+// scratch_stats_split: caller-owned buffer of size 2*T floats, used as
+// scratch for the (mean, invStd) tensors.
+bool chiron_reln_backward(const float* dq_out, const float* q_in,
+                           const float* gamma, const float* stats,
+                           int T, int m,
+                           float* dq_in, float* dgamma, float* dbeta,
+                           float* scratch_stats_split);
+
 // ---------------------------------------------------------------------------
 // Sketch primitives — per-token local sketch (framework amendment §11a,
 // mitigation 1).
@@ -140,6 +164,10 @@ inline bool chiron_reln_forward(const float*, float*, float*,
 inline bool chiron_reln_inverse(const float*, float*, const float*,
                                  const float*, const float*,
                                  int, int) { return false; }
+inline bool chiron_reln_backward(const float*, const float*,
+                                  const float*, const float*,
+                                  int, int,
+                                  float*, float*, float*, float*) { return false; }
 inline bool chiron_sketch_project(const float*, const float*, int, int, int,
                                    float*) { return false; }
 inline bool chiron_sketch_lift_add(float*, const float*, const float*,

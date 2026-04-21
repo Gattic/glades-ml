@@ -2217,7 +2217,106 @@ void CHIRONUnitTest()
 	CHIRONGpuEndToEndTest();
 	CHIRONGpuAttentionShearParityTest();
 	CHIRONGpuFullBlockEndToEndTest();
+	CHIRONGpuReLNBackwardTest();
 	std::printf("=== CHIRON tests done ===\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Case 17: chiron_reln_backward — verify the ReLN gradient wrapper against
+// a finite-difference reference.  For a loss L(q_out) = sum(q_out * ref),
+// dL/dq_in = d/dq_in sum(ReLN(q_in) * ref), which we compute analytically
+// via chiron_reln_backward and numerically via central differences.
+// ---------------------------------------------------------------------------
+void CHIRONGpuReLNBackwardTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [CHIRON reln_backward] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T = 4;
+	const unsigned int m = 8;
+	const float eps = 1e-4f;
+
+	LCG rng(31415u);
+	std::vector<float> q_in(T * m), gamma(m), beta(m);
+	std::vector<float> dq_out(T * m);   // upstream gradient
+	for (unsigned int i = 0; i < q_in.size(); ++i) q_in[i] = 0.7f * rng.next_unit();
+	for (unsigned int i = 0; i < dq_out.size(); ++i) dq_out[i] = 0.5f * rng.next_unit();
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		gamma[i] = 1.0f + 0.1f * rng.next_unit();
+		beta[i]  = 0.05f * rng.next_unit();
+	}
+
+	// Run forward to get stats.
+	std::vector<float> q_out(T * m), stats(T * 2u);
+	glades::chiron::reln_forward(&q_in[0], &q_out[0], &stats[0],
+	                              &gamma[0], &beta[0], T, m, eps);
+
+	// Analytical dq_in via GPU.
+	glades::gpu::GpuBuffer<float> d_q_in, d_gamma, d_stats, d_dq_out;
+	glades::gpu::GpuBuffer<float> d_dq_in, d_dgamma, d_dbeta, d_scratch;
+	d_q_in.allocate(q_in.size()); d_gamma.allocate(m);
+	d_stats.allocate(stats.size()); d_dq_out.allocate(dq_out.size());
+	d_dq_in.allocate(q_in.size()); d_dgamma.allocate(m); d_dbeta.allocate(m);
+	d_scratch.allocate(2 * T);
+	d_q_in.upload(&q_in[0], q_in.size());
+	d_gamma.upload(&gamma[0], m);
+	d_stats.upload(&stats[0], stats.size());
+	d_dq_out.upload(&dq_out[0], dq_out.size());
+	d_dgamma.zero();
+	d_dbeta.zero();
+
+	ASSERT("chiron_reln_backward", glades::gpu::chiron_reln_backward(
+	    d_dq_out.data(), d_q_in.data(),
+	    d_gamma.data(), d_stats.data(),
+	    static_cast<int>(T), static_cast<int>(m),
+	    d_dq_in.data(), d_dgamma.data(), d_dbeta.data(),
+	    d_scratch.data()));
+	std::vector<float> dq_in_gpu(q_in.size());
+	d_dq_in.download(&dq_in_gpu[0], q_in.size());
+
+	// Finite-difference dq_in: for each coordinate, perturb q_in[i] by ±fd_eps,
+	// recompute q_out and L = sum(dq_out * q_out), use central difference.
+	const float fd_eps = 1e-3f;
+	std::vector<float> q_in_pert(q_in);
+	std::vector<float> q_out_plus(T * m), q_out_minus(T * m);
+	std::vector<float> stats_scratch(T * 2u);
+	std::vector<float> dq_in_fd(T * m, 0.0f);
+
+	for (unsigned int i = 0; i < T * m; ++i)
+	{
+		q_in_pert[i] += fd_eps;
+		glades::chiron::reln_forward(&q_in_pert[0], &q_out_plus[0], &stats_scratch[0],
+		                              &gamma[0], &beta[0], T, m, eps);
+		q_in_pert[i] -= 2.0f * fd_eps;
+		glades::chiron::reln_forward(&q_in_pert[0], &q_out_minus[0], &stats_scratch[0],
+		                              &gamma[0], &beta[0], T, m, eps);
+		q_in_pert[i] += fd_eps;
+		double Lp = 0.0, Lm = 0.0;
+		for (unsigned int j = 0; j < T * m; ++j)
+		{
+			Lp += static_cast<double>(dq_out[j]) * q_out_plus[j];
+			Lm += static_cast<double>(dq_out[j]) * q_out_minus[j];
+		}
+		dq_in_fd[i] = static_cast<float>((Lp - Lm) / (2.0 * fd_eps));
+	}
+
+	// Compare.
+	const float err = max_abs_diff(dq_in_gpu, dq_in_fd);
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "chiron_reln_backward dq_in vs finite-diff: max_err=%.3e "
+	              "(tol 5e-3 — FD truncation error)", err);
+	ASSERT(msg, err < 5e-3f);
+
+	std::printf("  CHIRON reln_backward dq_in vs FD: max_err=%.3e\n", err);
+#else
+	std::printf("  [CHIRON reln_backward] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
 }
 
 // ===========================================================================

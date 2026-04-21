@@ -242,6 +242,57 @@ bool chiron_reln_inverse(const float* q_out, float* q_in, const float* stats,
 }
 
 // ===========================================================================
+//  3b. Reversible LayerNorm backward (wraps layernorm_backward).
+// ===========================================================================
+//
+// ReLN forward is numerically identical to LayerNorm forward — the only
+// novelty is where (mu, log_sigma) are stored. For the backward pass
+// we convert the external (mu, log_sigma) stats buffer into the
+// (mean[T], invStd[T]) format that the existing layernorm_backward
+// kernel expects, then defer to that kernel.
+
+namespace {
+
+// Kernel to split [T, 2] (mu, log_sigma) -> two separate [T] buffers
+// (mean, invStd).  One thread per row.
+__global__ void chiron_stats_split_kernel(const float* __restrict__ stats,
+                                          int T,
+                                          float* __restrict__ mean,
+                                          float* __restrict__ invStd)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < T)
+	{
+		mean[i]   = stats[(size_t)i * 2 + 0];
+		invStd[i] = expf(-stats[(size_t)i * 2 + 1]);
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_reln_backward(const float* dq_out, const float* q_in,
+                           const float* gamma, const float* stats,
+                           int T, int m,
+                           float* dq_in, float* dgamma, float* dbeta,
+                           float* scratch_stats_split)
+{
+	if (T <= 0 || m <= 0) return true;
+
+	// Split stats[T, 2] into mean[T] and invStd[T] via a small kernel.
+	float* d_mean  = scratch_stats_split;
+	float* d_invStd = scratch_stats_split + T;
+	const int grid = (T + kBlockElem - 1) / kBlockElem;
+	chiron_stats_split_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    stats, T, d_mean, d_invStd);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	// Delegate to the existing LayerNorm backward kernel, which
+	// already handles the complex dx / dgamma / dbeta computation.
+	return layernorm_backward(dq_out, q_in, gamma, d_mean, d_invStd,
+	                           T, m, dq_in, dgamma, dbeta);
+}
+
+// ===========================================================================
 //  4. Sketch project — Z = X · S^T   (X: [T, Ntok], S: [r, Ntok], Z: [T, r]).
 // ===========================================================================
 //
