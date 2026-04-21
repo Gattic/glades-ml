@@ -159,10 +159,25 @@ Convergence check (4.6 M params, T=512, lr=3e-3, accum=8):
 Training-scale ceiling on RTX 4080 SUPER (16 GB):
   FP32 Adam:  955M params  (7.56 GB used)
   BF16 Adam: 1202M params  (15.29 GB used)
-  **int8 Adam: 1382M params (15.32 GB used) — 15% larger than BF16**
+  int8 Adam: 1382M params  (15.32 GB used) — 15% larger than BF16
+  **CPU-offload Adam: 1781M params (15.29 GB used) — 29% larger than int8**
 
 At 1.2 B both fit, but int8 Adam uses only 12.98 GB — 2.3 GB of free
 headroom at identical param count.
+
+**CPU-offload Adam SHIPPED** (BEYOND_CHIRON.md direction #3, Phase 1).
+Adam m, v, and FP32 master weights all live in CPU pinned memory
+(cudaMallocHost).  Per Adam step:
+  - cudaMemcpy grad GPU → host staging buffer (FP32)
+  - OpenMP-parallel Adam math on CPU (identical to adam_update kernel)
+  - cudaMemcpy updated master → GPU param buffer
+
+Empirical ceiling with --cpu-adam: **1.78 B params** (m=2112, L=48,
+nH=16, dH=264), using 15.29 GB of 15.56 GB VRAM.  Zero GPU optimizer
+state.  Throughput: 208 tok/s at 1.78 B (vs 2010 tok/s for --int8-adam
+at 1.38 B — 10× slower due to per-group PCIe transfers).  Phase 2 will
+pipeline the transfers with CHIRON's per-layer inverse cadence to
+recover most of the lost throughput.
 
 **1.38 B training is REAL.**  On the 1382M config (m=1856, L=48, nH=16,
 dH=232), a 100-step run at effective batch 4096 (accum=4), T=1024,
