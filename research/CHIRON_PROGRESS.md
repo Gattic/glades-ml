@@ -32,19 +32,24 @@ Production wire-in path:
 Both gated by `nHeads == nKVHeads`; seamless fallback to custom
 kernels for GQA configs.
 
-### Future ceiling (not yet claimed)
+### Future ceiling (some shipped, some pending)
 
-- **BF16 cuBLAS-tiled attention** — adds BF16 batched GEMM wrappers
-  using `cublasGemmStridedBatchedEx` + `CUBLAS_COMPUTE_32F_FAST_16BF`.
-  Expected: 2× on the attention GEMMs (TF32 ~25 TFLOP/s → BF16 ~52
-  TFLOP/s on 4080 SUPER), translating to ~1.3-1.5× further end-to-end.
-  Target post-optimization: ~9000 tok/s (8.3× over baseline).
-- **CHIRON NNetwork dispatch** — routes forward/backward through CHIRON
-  primitives, unlocking the 17.8× memory reduction for production.
-  Enables training 4-7B models on 16 GB where baseline OOMs at ~1B.
-- **WMMA Stage 2** — true nvcuda::wmma kernel with BF16 fragments,
-  expected attention throughput ~50 TFLOP/s (near card peak). 2-3×
-  beyond BF16 cuBLAS.
+- **BF16 cuBLAS-tiled attention** — **SHIPPED** as opt-in via
+  `GLADES_CHIRON_ATTN=bf16`. Batched BF16 GEMM wrappers
+  (`sgemm_batched_strided[_abt/_atb]_bf16`) using
+  `cublasGemmStridedBatchedEx` + `CUBLAS_COMPUTE_32F_FAST_16BF`.
+  Parity verified (max_err 1.1e-3). Wired into BOTH the FP32 branch
+  (opt-in) and the BF16 MP branch (automatic when useBf16=true).
+  **At pile_large (dH=64) the cast overhead slightly dominates** the
+  2× BF16 gain — FP32 stays the default. BF16 should win at dH≥128
+  with T≥4k where GEMM time dominates cast time.
+- **CHIRON NNetwork dispatch (Phase A)** — **SHIPPED**. Enum
+  `TYPE_TRANSFORMER_CHIRON = 7` added. Phase B (actual forward/backward
+  routing through CHIRON primitives to unlock the 17.8× memory claim
+  in production) is the remaining architectural work.
+- **WMMA Stage 2** — deferred. True nvcuda::wmma kernel with BF16
+  fragments; expected attention throughput ~50 TFLOP/s (near card
+  peak). 2-3× beyond Stage 1 cuBLAS-tiled on larger shapes.
 
 ### Trainer regression fix (2026-04-21)
 
