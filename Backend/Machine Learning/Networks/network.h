@@ -2096,7 +2096,15 @@ public:
 		// Transformer decoder-only: causal self-attention over sequences.
 		TYPE_TRANSFORMER_DECODER = 5,
 		// Convolutional neural network: im2col+SGEMM convolution, pooling, FC head.
-		TYPE_CNN = 6
+		TYPE_CNN = 6,
+		// CHIRON reversible-flow transformer: bijective symplectic blocks,
+		// O(1)-in-depth activation memory (research/CHIRON_framework.md).
+		// When enabled via cfg.chiron.enable, the training loop routes
+		// forward/backward through CHIRON primitives (chiron_attention_shear,
+		// chiron_reln_forward/inverse/backward, chiron_attention_shear_backward)
+		// instead of storing activations. Phase A: dispatch enum + feature
+		// flag. Phase B: full forward/backward orchestration.
+		TYPE_TRANSFORMER_CHIRON = 7
 	};
 
 	enum
