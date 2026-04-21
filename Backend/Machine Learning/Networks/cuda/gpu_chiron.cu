@@ -381,6 +381,109 @@ bool chiron_attention_shear(const float* q, float* p,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Tiled variant of chiron_attention_shear.  Same math as chiron_attention_shear
+// but replaces the O(T²·dH) flash-attention core with flash_attention_cublas_tiled
+// (TF32 tensor cores via cuBLAS batched strided GEMM).  Typical 5-10× wall-clock
+// improvement at T≥512 on Ampere/Ada hardware, at the cost of an [nH, T, T]
+// scratch buffer (caller-owned).
+//
+// Constraint: nHeads == nKVHeads (no GQA — the tiled kernel does not expand
+// the KV head dimension).
+bool chiron_attention_shear_tiled(const float* q, float* p,
+                                    const float* Wq, const float* Wk,
+                                    const float* Wv, const float* Wo,
+                                    int T, int m, int nHeads, int dHead,
+                                    bool causal, bool invert,
+                                    float* scratch_Q, float* scratch_K,
+                                    float* scratch_V, float* scratch_O,
+                                    float* scratch_S)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wk, dModel, 0.0f, scratch_K, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wv, dModel, 0.0f, scratch_V, dModel))
+		return false;
+
+	if (!flash_attention_cublas_tiled(scratch_Q, scratch_K, scratch_V,
+	                                    T, nHeads, dHead, dModel, causal,
+	                                    scratch_O, scratch_S))
+		return false;
+
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+	return true;
+}
+
+// Tiled variant of the shear backward.  Replaces flash_attention_multihead_backward
+// with flash_attention_backward_cublas_tiled — TF32 tensor-core batched GEMMs for
+// P = softmax(QK^T), dV += P^T dO, dP = dO V^T, dS = softmax_bwd(P, dP),
+// dQ = dS K, dK += dS^T Q.  Extra scratch: scratch_P and scratch_dP, each [nH, T, T].
+bool chiron_attention_shear_backward_tiled(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	// Recompute Q, K, V, O from q.
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wk, dModel, 0.0f, sK, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wv, dModel, 0.0f, sV, dModel))
+		return false;
+	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, dHead, dModel, causal,
+	                                    sO, scratch_P))
+		return false;
+
+	// dO = dp_new · Wo^T
+	if (!sgemm_rowmajor_abt(T, dModel, m, 1.0f, dp_new, m, Wo, m, 0.0f, sdO, dModel))
+		return false;
+	// dWo += O^T · dp_new
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	// Tiled attention backward: writes dQ, accumulates dK+=, dV+=.
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModel, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModel, computeStream()));
+	if (!flash_attention_backward_cublas_tiled(
+	        sQ, sK, sV, sO, sdO,
+	        T, nHeads, dHead, dModel, causal,
+	        sdQ, sdK, sdV, scratch_P, scratch_dP))
+		return false;
+
+	// dq += dQ · Wq^T + dK · Wk^T + dV · Wv^T
+	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdQ, dModel, Wq, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdK, dModel, Wk, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_abt(T, m, dModel, 1.0f, sdV, dModel, Wv, dModel, 1.0f, dq, m))
+		return false;
+
+	// dWq, dWk, dWv += q^T · dQ, dK, dV
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdK, dModel, 1.0f, dWk, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdV, dModel, 1.0f, dWv, dModel))
+		return false;
+	return true;
+}
+
 // ===========================================================================
 //  5b. cuBLAS-tiled flash attention (Stage-1 tensor-core variant).
 // ===========================================================================

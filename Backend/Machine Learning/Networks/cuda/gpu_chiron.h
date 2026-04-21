@@ -157,6 +157,34 @@ bool chiron_attention_shear_backward(
     float* sQ, float* sK, float* sV, float* sO,
     float* sdO, float* sdQ, float* sdK, float* sdV);
 
+// Tensor-core-backed shear forward.  Identical math to chiron_attention_shear
+// but routes the attention core through flash_attention_cublas_tiled (TF32
+// tensor cores).  Typical 5-10× wall-clock improvement at T≥512 on Ampere/Ada.
+// Extra scratch: scratch_S [nHeads, T, T], caller-owned.
+// Constraint: nHeads == nKVHeads (no GQA — tiled kernel doesn't broadcast).
+bool chiron_attention_shear_tiled(const float* q, float* p,
+                                    const float* Wq, const float* Wk,
+                                    const float* Wv, const float* Wo,
+                                    int T, int m, int nHeads, int dHead,
+                                    bool causal, bool invert,
+                                    float* scratch_Q, float* scratch_K,
+                                    float* scratch_V, float* scratch_O,
+                                    float* scratch_S);
+
+// Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
+// with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
+// scratch_dP, each [nHeads, T, T], caller-owned.
+bool chiron_attention_shear_backward_tiled(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP);
+
 // ---------------------------------------------------------------------------
 // cuBLAS-tiled flash attention — tensor-core-backed drop-in alternative.
 // ---------------------------------------------------------------------------
@@ -278,6 +306,18 @@ inline bool chiron_attention_shear(const float*, float*,
                                     int, int, int, int, int,
                                     bool, bool,
                                     float*, float*, float*, float*) { return false; }
+inline bool chiron_attention_shear_tiled(const float*, float*,
+                                          const float*, const float*, const float*, const float*,
+                                          int, int, int, int, bool, bool,
+                                          float*, float*, float*, float*, float*) { return false; }
+inline bool chiron_attention_shear_backward_tiled(
+    const float*, const float*,
+    const float*, const float*, const float*, const float*,
+    int, int, int, int, bool,
+    float*, float*, float*, float*, float*,
+    float*, float*, float*, float*,
+    float*, float*, float*, float*,
+    float*, float*) { return false; }
 inline bool flash_attention_cublas_tiled(const float*, const float*, const float*,
                                           int, int, int, int, bool,
                                           float*, float*) { return false; }
