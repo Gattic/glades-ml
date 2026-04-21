@@ -382,6 +382,53 @@ bool chiron_attention_shear(const float* q, float* p,
 }
 
 // ---------------------------------------------------------------------------
+// BF16-tensor-core variant of chiron_attention_shear_tiled.  Same math as
+// chiron_attention_shear, but the attention-core GEMMs (QK^T and P·V) run
+// with BF16 inputs via flash_attention_cublas_tiled_bf16.  On RTX 4080 SUPER
+// this is ~2× over the TF32 variant on large shapes.  The Q/K/V projections
+// and output projection remain FP32 (they're only 3+1 GEMMs per block and
+// gain little from BF16).
+//
+// Extra scratch (all caller-owned):
+//   scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16 — BF16
+//     staging buffers for the BF16 attention kernel.  Sized [T, dModel]
+//     for Q/K/V and [nH, T, T] for P.
+bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int dHead,
+                                         bool causal, bool invert,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wk, dModel, 0.0f, scratch_K, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wv, dModel, 0.0f, scratch_V, dModel))
+		return false;
+
+	if (!flash_attention_cublas_tiled_bf16(
+	        scratch_Q, scratch_K, scratch_V,
+	        T, nHeads, dHead, dModel, causal,
+	        scratch_O, scratch_S,
+	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
+		return false;
+
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+	return true;
+}
+
 // Tiled variant of chiron_attention_shear.  Same math as chiron_attention_shear
 // but replaces the O(T²·dH) flash-attention core with flash_attention_cublas_tiled
 // (TF32 tensor cores via cuBLAS batched strided GEMM).  Typical 5-10× wall-clock

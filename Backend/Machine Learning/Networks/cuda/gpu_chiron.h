@@ -171,6 +171,25 @@ bool chiron_attention_shear_tiled(const float* q, float* p,
                                     float* scratch_V, float* scratch_O,
                                     float* scratch_S);
 
+// BF16-tensor-core variant of chiron_attention_shear_tiled.  Q/K/V/O
+// projections stay FP32 (only 4 GEMMs per layer — modest cost); the attention
+// core (QK^T, softmax, P·V) runs with BF16 inputs via
+// flash_attention_cublas_tiled_bf16.  ~2× over TF32-tiled on Ampere/Ada.
+// Extra scratch: BF16 staging for Q, K, V (each [T, dModel]) and P
+// ([nHeads, T, T]).
+bool chiron_attention_shear_bf16_tiled(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int dHead,
+                                         bool causal, bool invert,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16);
+
 // Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
 // scratch_dP, each [nHeads, T, T], caller-owned.
@@ -310,6 +329,12 @@ inline bool chiron_attention_shear_tiled(const float*, float*,
                                           const float*, const float*, const float*, const float*,
                                           int, int, int, int, bool, bool,
                                           float*, float*, float*, float*, float*) { return false; }
+inline bool chiron_attention_shear_bf16_tiled(const float*, float*,
+                                                const float*, const float*, const float*, const float*,
+                                                int, int, int, int, bool, bool,
+                                                float*, float*, float*, float*, float*,
+                                                unsigned short*, unsigned short*,
+                                                unsigned short*, unsigned short*) { return false; }
 inline bool chiron_attention_shear_backward_tiled(
     const float*, const float*,
     const float*, const float*, const float*, const float*,
