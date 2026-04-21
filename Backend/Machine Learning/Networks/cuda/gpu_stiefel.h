@@ -118,20 +118,52 @@ void stiefel_forward(
     unsigned int B);
 
 // ========================================================================
-// Tangent-projected backward. Given `G = ∂L/∂Y` and forward inputs,
-// computes the Riemannian gradient triple (grad_U, grad_sigma, grad_V)
-// in the tangent space of (U, Σ, V). Writes results into the provided
-// device buffers.
+// Unconstrained backward: raw chain-rule gradient through the 3-GEMM
+// factored forward Y = X · V · diag(Σ) · U^T. Computes:
+//   dX[B,n]        = dY · U · diag(Σ) · V^T
+//   dU[m,r]        = dY^T · (X · V · diag(Σ))      ← raw, NOT tangent-projected
+//   dΣ[r]          = diag(V^T · X^T · dY · U)
+//   dV[n,r]        = X^T · (dY · U · diag(Σ))      ← raw
+//
+// This matches finite differences of (X, U, Σ, V) → Y exactly and serves
+// as the parity-test oracle before tangent projection is layered on top.
+// All dtypes FP32; BF16 variant comes later.
 // ========================================================================
-void stiefel_backward_project(
-    const float* G,                    // [B × m] upstream grad
-    const void* X,                     // [B × n] forward input
+void stiefel_backward_unconstrained(
+    const float* dY,                  // [B × m] upstream grad
+    const void* X,                    // [B × n] forward input
     bool x_bf16,
     const GpuStiefelWeight& stiefel,
-    float* grad_U,                     // [m × r] tangent-projected
-    float* grad_sigma,                 // [r]
-    float* grad_V,                     // [n × r]
-    float* scratch_UtGV,               // [r × r]
+    float* dX,                        // [B × n] output, may be nullptr
+    float* dU,                        // [m × r] output (raw, NOT tangent)
+    float* dsigma,                    // [r] output
+    float* dV,                        // [n × r] output (raw, NOT tangent)
+    float* scratch_Br,                // [B × r] scratch
+    unsigned int B);
+
+// ========================================================================
+// Tangent-space projection of raw grad_U, grad_V onto the tangent space
+// of the Stiefel factors. Canonical metric:
+//   proj_U(G_U) = (I − U U^T) G_U + U · skew(U^T G_U)
+//   proj_V(G_V) = (I − V V^T) G_V + V · skew(V^T G_V)
+// where skew(A) = (A − A^T) / 2. Done in place on grad_U, grad_V.
+// ========================================================================
+void stiefel_tangent_project_grad(
+    const GpuStiefelWeight& stiefel,
+    float* grad_U,                    // [m × r] in/out
+    float* grad_V,                    // [n × r] in/out
+    float* scratch_UtGU,              // [r × r]
+    float* scratch_VtGV);             // [r × r]
+
+// Legacy symbol retained — combines the unconstrained and project steps.
+// (TODO: remove once callers migrate.)
+void stiefel_backward_project(
+    const float* G,
+    const void* X,
+    bool x_bf16,
+    const GpuStiefelWeight& stiefel,
+    float* grad_U, float* grad_sigma, float* grad_V,
+    float* scratch_UtGV,
     unsigned int B);
 
 // ========================================================================

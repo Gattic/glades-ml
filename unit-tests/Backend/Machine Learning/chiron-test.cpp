@@ -2974,10 +2974,160 @@ void CHIRONStiefelIdentityRecoveryTest()
 #endif
 }
 
+// CHIRONStiefelBackwardFiniteDiffTest ---------------------------------------
+// Validates stiefel_backward_unconstrained against numerical finite
+// differences on a small example. The test uses a simple scalar loss
+// L = sum(Y) so dL/dY = 1, giving a clean parity check on the chain rule.
+//
+// Parity criteria: max_err < 5e-3 (FD precision is the limiting factor).
+void CHIRONStiefelBackwardFiniteDiffTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel backward] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int m = 8, n = 6, r = 3, B = 4;
+
+	LCG rng(20260421u);
+	std::vector<float> U(m * r), V(n * r), sigma(r), X(B * n);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, r);
+	gram_schmidt_cols(V, n, r);
+	for (size_t i = 0; i < sigma.size(); ++i)
+		sigma[i] = 0.7f + 0.3f * std::abs(rng.next_unit());
+	for (size_t i = 0; i < X.size(); ++i) X[i] = 0.3f * rng.next_unit();
+
+	std::vector<uint16_t> U_bf, V_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+	// Work with the BF16-round-tripped values so forward and FD use the
+	// same numerical storage.
+	std::vector<float> U_r, V_r;
+	bf16_to_fp32(U_bf, U_r);
+	bf16_to_fp32(V_bf, V_r);
+
+	// Helper: evaluate Y = X · V · diag(Σ) · U^T on host and return sum(Y).
+	// (Loss L = sum(Y); dL/dY is all-ones.)
+	// Pointers passed so we can perturb elements for finite differences.
+	struct HostFwd {
+		static float sumY(const std::vector<float>& Xv,
+		                  const std::vector<float>& Uv,
+		                  const std::vector<float>& Sv,
+		                  const std::vector<float>& Vv,
+		                  unsigned int B_, unsigned int m_,
+		                  unsigned int n_, unsigned int r_)
+		{
+			float acc = 0.0f;
+			for (unsigned int b = 0; b < B_; ++b)
+			for (unsigned int i = 0; i < m_; ++i)
+			{
+				float yi = 0.0f;
+				for (unsigned int k = 0; k < r_; ++k)
+				{
+					float t = 0.0f;
+					for (unsigned int j = 0; j < n_; ++j)
+						t += Xv[b * n_ + j] * Vv[j * r_ + k];
+					t *= Sv[k];
+					yi += t * Uv[i * r_ + k];
+				}
+				acc += yi;
+			}
+			return acc;
+		}
+	};
+
+	// Run GPU backward with dY = all-ones.
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, r);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma[0], sigma.size());
+
+	glades::gpu::GpuBuffer<float> d_X, d_dY, d_dU, d_dV, d_dsigma, d_scratch, d_dX;
+	d_X.allocate(B * n);       d_X.upload(&X[0], X.size());
+	d_dY.allocate(B * m);
+	std::vector<float> dY_ones(B * m, 1.0f);
+	d_dY.upload(&dY_ones[0], dY_ones.size());
+	d_dU.allocate(m * r);
+	d_dV.allocate(n * r);
+	d_dsigma.allocate(r);
+	d_scratch.allocate(B * r);
+	d_dX.allocate(B * n);
+
+	glades::gpu::stiefel_backward_unconstrained(
+	    d_dY.data(), d_X.data(), /*x_bf16=*/false, sw,
+	    d_dX.data(), d_dU.data(), d_dsigma.data(), d_dV.data(),
+	    d_scratch.data(), B);
+
+	std::vector<float> dU_gpu(m * r), dV_gpu(n * r), dsigma_gpu(r), dX_gpu(B * n);
+	d_dU.download(&dU_gpu[0], dU_gpu.size());
+	d_dV.download(&dV_gpu[0], dV_gpu.size());
+	d_dsigma.download(&dsigma_gpu[0], dsigma_gpu.size());
+	d_dX.download(&dX_gpu[0], dX_gpu.size());
+
+	// FD check one coordinate from each tensor (full sweep is O(mr)+O(nr)+r
+	// FD steps — acceptable at this small size).
+	const float h = 1e-3f;
+	float max_err_U = 0.0f, max_err_V = 0.0f, max_err_sigma = 0.0f, max_err_X = 0.0f;
+	for (size_t idx = 0; idx < U_r.size(); ++idx)
+	{
+		std::vector<float> Up = U_r, Um = U_r;
+		Up[idx] += h; Um[idx] -= h;
+		const float grad_fd = (HostFwd::sumY(X, Up, sigma, V_r, B, m, n, r) -
+		                       HostFwd::sumY(X, Um, sigma, V_r, B, m, n, r)) / (2.0f * h);
+		const float err = std::fabs(grad_fd - dU_gpu[idx]);
+		if (err > max_err_U) max_err_U = err;
+	}
+	for (size_t idx = 0; idx < V_r.size(); ++idx)
+	{
+		std::vector<float> Vp = V_r, Vm = V_r;
+		Vp[idx] += h; Vm[idx] -= h;
+		const float grad_fd = (HostFwd::sumY(X, U_r, sigma, Vp, B, m, n, r) -
+		                       HostFwd::sumY(X, U_r, sigma, Vm, B, m, n, r)) / (2.0f * h);
+		const float err = std::fabs(grad_fd - dV_gpu[idx]);
+		if (err > max_err_V) max_err_V = err;
+	}
+	for (size_t idx = 0; idx < sigma.size(); ++idx)
+	{
+		std::vector<float> Sp = sigma, Sm = sigma;
+		Sp[idx] += h; Sm[idx] -= h;
+		const float grad_fd = (HostFwd::sumY(X, U_r, Sp, V_r, B, m, n, r) -
+		                       HostFwd::sumY(X, U_r, Sm, V_r, B, m, n, r)) / (2.0f * h);
+		const float err = std::fabs(grad_fd - dsigma_gpu[idx]);
+		if (err > max_err_sigma) max_err_sigma = err;
+	}
+	for (size_t idx = 0; idx < X.size(); ++idx)
+	{
+		std::vector<float> Xp = X, Xm = X;
+		Xp[idx] += h; Xm[idx] -= h;
+		const float grad_fd = (HostFwd::sumY(Xp, U_r, sigma, V_r, B, m, n, r) -
+		                       HostFwd::sumY(Xm, U_r, sigma, V_r, B, m, n, r)) / (2.0f * h);
+		const float err = std::fabs(grad_fd - dX_gpu[idx]);
+		if (err > max_err_X) max_err_X = err;
+	}
+
+	std::printf("  stiefel backward max_err: dU=%.3e dV=%.3e dΣ=%.3e dX=%.3e\n",
+	            max_err_U, max_err_V, max_err_sigma, max_err_X);
+	ASSERT("stiefel dU matches finite-diff", max_err_U < 5e-3f);
+	ASSERT("stiefel dV matches finite-diff", max_err_V < 5e-3f);
+	ASSERT("stiefel dΣ matches finite-diff", max_err_sigma < 5e-3f);
+	ASSERT("stiefel dX matches finite-diff", max_err_X < 5e-3f);
+
+	sw.release();
+#else
+	std::printf("  [stiefel backward] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONStiefelIdentityRecoveryTest();
+	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStochasticBf16RoundingTest();
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();

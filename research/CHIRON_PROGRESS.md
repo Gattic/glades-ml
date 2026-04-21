@@ -111,10 +111,17 @@ Foundation primitives for the 7th paradigm shift are in place:
 - `CHIRONStiefelIdentityRecoveryTest`: **PASSING**
   - `stiefel reconstruct max_err = 0.000e+00` (bit-exact)
   - `stiefel forward max_err = 5.960e-08` (machine-epsilon, ~1e-7)
+- `CHIRONStiefelBackwardFiniteDiffTest`: **PASSING** (Phase 2a)
+  - `dU max_err = 5.88e-5`, `dV = 9.92e-5`, `dΣ = 8.87e-5`, `dX = 7.65e-5`
+  - All inside finite-diff precision bound (limiting factor: h² ~ 1e-6
+    third-derivative term)
+  - Validates the 3-chained-SGEMM chain-rule gradient for all four
+    parameter tensors in a single backward call
 
-Phase 2 work (pending): tangent-projected backward, QR retraction via
-cuSOLVER, Cayley fast-path, Riemannian Adam, vector transport, end-to-end
-wire-in to chiron_main.cpp behind `--stiefel-ratio ρ` flag.
+Phase 2 remaining: tangent projection of raw grad_U/grad_V, QR retraction
+via cuSOLVER, Cayley fast-path, Riemannian Adam (int8 packed momenta),
+vector transport, end-to-end wire-in to chiron_main.cpp behind
+`--stiefel-ratio ρ` flag.
 
 Target: 5.1 B free-DOF model on 16 GB VRAM at ρ=0.25 with ≥ 1500 tok/s
 (projected from 4× FLOP reduction per forward GEMM), loss within 2× of
@@ -122,8 +129,8 @@ the 2.23 B dense-weight baseline at the same token budget.
 
 ### Test coverage
 
-- **443 / 443 CHIRON unit-test assertions pass** (was 441 → +2 from
-  Stiefel reconstruct + Stiefel forward parity).
+- **447 / 447 CHIRON unit-test assertions pass** (was 443 → +4 from
+  Stiefel backward finite-diff parity dU/dV/dΣ/dX).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),

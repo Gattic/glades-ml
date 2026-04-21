@@ -232,14 +232,166 @@ void stiefel_forward(const void* X, bool x_bf16,
 }
 
 // ===========================================================================
-// Phase-1 stubs for later primitives — keep link graph intact.
+// stiefel_backward_unconstrained — raw chain-rule gradients
+//
+// Given Y = X · V · diag(Σ) · U^T:
+//   T1 = dY · U             [B × r]     (abt: dY [B,m], U [m,r])
+//   dsigma[k] = Σ_b (T1[b,k] · (X · V)[b,k])        — row-wise reduction
+//   T2 = T1 · diag(Σ)       [B × r]     in-place
+//   dV = X^T · T2           [n × r]     (atb: X [B,n], T2 [B,r])
+//   dX (optional) = T2 · V^T [B × n]    (abt: T2 [B,r], V [n,r])
+//
+//   T3 = X · V · diag(Σ)    [B × r]     — we reconstruct via forward path
+//   dU = dY^T · T3          [m × r]     (atb: dY [B,m], T3 [B,r])
 // ===========================================================================
+
+namespace {
+__global__ void k_rowwise_sum_product(const float* A, const float* B,
+                                       float* out, unsigned int rows,
+                                       unsigned int cols)
+{
+	unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+	if (col >= cols) return;
+	float acc = 0.0f;
+	for (unsigned int r = 0; r < rows; ++r)
+		acc += A[r * cols + col] * B[r * cols + col];
+	out[col] = acc;
+}
+}
+
+void stiefel_backward_unconstrained(
+    const float* dY,
+    const void* X,
+    bool /*x_bf16*/,
+    const GpuStiefelWeight& s,
+    float* dX,
+    float* dU,
+    float* dsigma,
+    float* dV,
+    float* scratch_Br,
+    unsigned int B)
+{
+	if (!s.allocated() || dY == nullptr || X == nullptr ||
+	    dU == nullptr || dV == nullptr || dsigma == nullptr || scratch_Br == nullptr)
+		return;
+
+	const float* Xf = static_cast<const float*>(X);
+	const uint16_t* Ubf = s.U.data();
+	const uint16_t* Vbf = s.V.data();
+	const float*    sig = s.sigma.data();
+
+	// FP32 staging of U, V. (Same thread-local caches as the forward path.)
+	static thread_local float* U_f32 = nullptr;
+	static thread_local size_t U_f32_cap = 0;
+	static thread_local float* V_f32 = nullptr;
+	static thread_local size_t V_f32_cap = 0;
+	size_t U_size = size_t(s.m) * s.r;
+	size_t V_size = size_t(s.n) * s.r;
+	if (U_size > U_f32_cap)
+	{
+		if (U_f32) cudaFree(U_f32);
+		if (cudaMalloc(&U_f32, U_size * sizeof(float)) != cudaSuccess) return;
+		U_f32_cap = U_size;
+	}
+	if (V_size > V_f32_cap)
+	{
+		if (V_f32) cudaFree(V_f32);
+		if (cudaMalloc(&V_f32, V_size * sizeof(float)) != cudaSuccess) return;
+		V_f32_cap = V_size;
+	}
+	cast_bf16_to_f32(Ubf, U_f32, U_size);
+	cast_bf16_to_f32(Vbf, V_f32, V_size);
+
+	// --- Compute T3 = X · V · diag(Σ)  [B × r] into a scratch buffer.
+	// We re-use scratch_Br for this, since it is also [B × r]. Callers need
+	// two [B × r] scratches if they want to keep T1 around; we allocate a
+	// second thread-local buffer for T1.
+	static thread_local float* T1_cache = nullptr;
+	static thread_local size_t T1_cap = 0;
+	size_t T1_size = size_t(B) * s.r;
+	if (T1_size > T1_cap)
+	{
+		if (T1_cache) cudaFree(T1_cache);
+		if (cudaMalloc(&T1_cache, T1_size * sizeof(float)) != cudaSuccess) return;
+		T1_cap = T1_size;
+	}
+	float* T3 = scratch_Br;  // [B × r]
+	if (!sgemm_rowmajor(B, s.r, s.n, 1.0f, Xf, s.n, V_f32, s.r,
+	                    0.0f, T3, s.r))
+		return;
+	{
+		dim3 block(64);
+		dim3 grid(B, (s.r + block.x - 1) / block.x);
+		k_scale_cols_by_diag<<<grid, block>>>(T3, sig, B, s.r);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// --- T1 = dY · U  [B × r]  (abt: dY [B,m], U [m,r])
+	float* T1 = T1_cache;
+	if (!sgemm_rowmajor(B, s.r, s.m, 1.0f, dY, s.m, U_f32, s.r,
+	                    0.0f, T1, s.r))
+		return;
+
+	// --- dΣ[k] = Σ_b T1[b,k] * T3_preScale[b,k]  — but T3 already has Σ applied.
+	// dΣ[k] = Σ_b T1[b,k] * (X·V)[b,k], so we need (X·V) = T3 / Σ. Simpler:
+	// recompute (X·V) into T1_cache-like buffer; we actually already have
+	// T1 = dY·U, so we need a separate buffer. Use a third thread-local.
+	static thread_local float* XV_cache = nullptr;
+	static thread_local size_t XV_cap = 0;
+	if (T1_size > XV_cap)
+	{
+		if (XV_cache) cudaFree(XV_cache);
+		if (cudaMalloc(&XV_cache, T1_size * sizeof(float)) != cudaSuccess) return;
+		XV_cap = T1_size;
+	}
+	if (!sgemm_rowmajor(B, s.r, s.n, 1.0f, Xf, s.n, V_f32, s.r,
+	                    0.0f, XV_cache, s.r))
+		return;
+	{
+		dim3 block(64);
+		dim3 grid((s.r + block.x - 1) / block.x);
+		k_rowwise_sum_product<<<grid, block>>>(T1, XV_cache, dsigma, B, s.r);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// --- T1 <- T1 · diag(Σ)  in place
+	{
+		dim3 block(64);
+		dim3 grid(B, (s.r + block.x - 1) / block.x);
+		k_scale_cols_by_diag<<<grid, block>>>(T1, sig, B, s.r);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// --- dV = X^T · T1  [n × r]  (atb: X [B,n], T1 [B,r])
+	if (!sgemm_rowmajor_atb(s.n, s.r, B, 1.0f, Xf, s.n, T1, s.r,
+	                        0.0f, dV, s.r))
+		return;
+
+	// --- dX (optional) = T1 · V^T  [B × n]  (abt: T1 [B,r], V [n,r])
+	if (dX != nullptr)
+	{
+		if (!sgemm_rowmajor_abt(B, s.n, s.r, 1.0f, T1, s.r, V_f32, s.r,
+		                        0.0f, dX, s.n))
+			return;
+	}
+
+	// --- dU = dY^T · T3  [m × r]  (atb: dY [B,m], T3 [B,r])
+	if (!sgemm_rowmajor_atb(s.m, s.r, B, 1.0f, dY, s.m, T3, s.r,
+	                        0.0f, dU, s.r))
+		return;
+}
+
+void stiefel_tangent_project_grad(const GpuStiefelWeight&,
+                                  float*, float*, float*, float*)
+{
+	// TODO Phase-2b: implement canonical Stiefel tangent projection.
+}
 
 void stiefel_backward_project(const float*, const void*, bool,
                               const GpuStiefelWeight&,
                               float*, float*, float*, float*, unsigned int)
 {
-	// TODO Phase-2: implement tangent projection backward.
+	// Legacy symbol — unused for now.
 }
 
 void stiefel_retract_qr(GpuStiefelWeight&, const float*, const float*, const float*)
