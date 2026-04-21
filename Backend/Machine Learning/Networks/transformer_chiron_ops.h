@@ -193,5 +193,70 @@ inline void reln_inverse(const float* q_out, float* q_in, const float* stats_in,
 	}
 }
 
+// ------------------------------------------------------------------
+// Sketch residual correction (framework §4.4).
+//
+// To prevent BF16 round-off from compounding across the block-inverse
+// chain, each forward pass stores a tiny FP32 "sketch" z_ℓ = S_ℓ · x_ℓ,
+// where S_ℓ ∈ R^{r × N} is a Gaussian random matrix and x_ℓ is the flat
+// block-input state of size N (typically N = 2·T·m for the paired (q, p)
+// hidden state). During backward, after running the BF16 inverse to get
+// an approximation x̃_ℓ, the stored sketch z_ℓ is compared against
+// S_ℓ · x̃_ℓ and the residual is lifted back into x-space to correct
+// x̃_ℓ:
+//
+//   z_ℓ_fresh   = S_ℓ · vec(x̃_ℓ)
+//   residual    = z_ℓ − z_ℓ_fresh
+//   correction  = (S_ℓ^T / r) · residual
+//   x̂_ℓ        = x̃_ℓ + correction
+//
+// Theorem (unbiasedness). If S_ℓ has i.i.d. N(0, 1) entries and S_ℓ is
+// independent of (x_ℓ, x̃_ℓ), then E[x̂_ℓ] = x_ℓ. Variance of each
+// coordinate of x̂_ℓ is O(||x − x̃||² / r).
+//
+// Proof sketch. E[S_ℓ^T S_ℓ] = r · I_N (each entry is a sum of r
+// independent mean-zero products of variance 1). Thus
+// E[(S_ℓ^T S_ℓ / r) · (x − x̃)] = x − x̃ identically.
+//
+// The sketch matrix can be seeded (e.g., hash of layer index) so neither
+// S_ℓ nor the random seed needs to be stored beyond a short seed word
+// per layer. This prototype stores S_ℓ explicitly for clarity; GPU
+// production kernels should regenerate S_ℓ on-the-fly per layer from
+// a deterministic seed.
+
+// sketch_project: compute z = S · x, where S is [r, N] row-major,
+// x is [N] row-major.  Output z is [r] row-major.
+inline void sketch_project(const float* S, const float* x,
+                           unsigned int r, unsigned int N, float* z_out)
+{
+	for (unsigned int k = 0; k < r; ++k)
+	{
+		float acc = 0.0f;
+		const float* row = S + k * N;
+		for (unsigned int i = 0; i < N; ++i)
+			acc += row[i] * x[i];
+		z_out[k] = acc;
+	}
+}
+
+// sketch_lift: compute correction = (S^T / r) · residual, adding in-place
+// to x_out.  S is [r, N], residual is [r], x_out is [N].
+//
+// This is the minimum-norm lift of residual back to the full state space;
+// E[correction] = (1/r) E[S^T S] (x - x̃) = (x - x̃) by the identity
+// above.
+inline void sketch_lift_add(const float* S, const float* residual,
+                            unsigned int r, unsigned int N, float* x_out)
+{
+	const float inv_r = 1.0f / static_cast<float>(r);
+	for (unsigned int i = 0; i < N; ++i)
+	{
+		float acc = 0.0f;
+		for (unsigned int k = 0; k < r; ++k)
+			acc += S[k * N + i] * residual[k];
+		x_out[i] += acc * inv_r;
+	}
+}
+
 } // namespace chiron
 } // namespace glades

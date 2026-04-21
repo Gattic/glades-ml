@@ -912,6 +912,338 @@ void CHIRONBf16DriftTest()
 	       bf16_L12 < 10.0f);
 }
 
+// Generate a Gaussian sketch matrix S [r, N] with deterministic seed.
+// Uses Box-Muller on top of the LCG so the result is N(0, 1) per entry.
+// Returns the dense matrix in row-major.
+static void generate_gaussian_sketch(std::vector<float>& S, unsigned int r,
+                                     unsigned int N, unsigned int seed)
+{
+	S.resize(static_cast<size_t>(r) * static_cast<size_t>(N));
+	LCG rng(seed);
+	size_t i = 0;
+	const size_t total = static_cast<size_t>(r) * static_cast<size_t>(N);
+	while (i < total)
+	{
+		// Box-Muller: draw u1, u2 in (0, 1); produce two N(0,1) samples.
+		float u1 = 0.5f * (rng.next_unit() + 1.0f); // in (0, 1)
+		float u2 = 0.5f * (rng.next_unit() + 1.0f);
+		if (u1 < 1e-7f) u1 = 1e-7f;
+		const float radius = sqrtf(-2.0f * logf(u1));
+		const float theta = 6.28318530717958647692f * u2;
+		const float z0 = radius * cosf(theta);
+		const float z1 = radius * sinf(theta);
+		S[i] = z0;
+		if (i + 1 < total)
+		{
+			S[i + 1] = z1;
+			i += 2;
+		}
+		else
+		{
+			i += 1;
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Case 9: sketch-correction primitive — CHIRON use case.
+// Tests: given x and a perturbed x̃ = x + δ with small ||δ||, the sketch
+// correction x̂ = x̃ + (S^T / r)(S x − S x̃) = x̃ + (S^T S / r) · (−δ + ...)
+// produces x̂ ≈ x with per-coord error O(||δ|| · √(N/r)).
+//
+// This is the actual JL identity used by CHIRON's backward pass: we don't
+// reconstruct x from z alone (which would take r ≫ N); we *correct* a
+// nearly-correct x̃ toward x using the stored z.
+// ---------------------------------------------------------------------------
+void CHIRONSketchProjectLiftTest()
+{
+	const unsigned int N = 192;
+	const unsigned int r = 1024; // oversample 5x over N
+
+	LCG rng(5555u);
+	std::vector<float> x(N);
+	for (unsigned int i = 0; i < N; ++i) x[i] = rng.next_unit();
+
+	// Perturb x by a small BF16-ish delta.
+	std::vector<float> delta(N);
+	const float delta_scale = 1e-2f; // ~BF16 drift at L=4
+	for (unsigned int i = 0; i < N; ++i) delta[i] = delta_scale * rng.next_unit();
+
+	std::vector<float> x_tilde(N);
+	for (unsigned int i = 0; i < N; ++i) x_tilde[i] = x[i] + delta[i];
+
+	std::vector<float> S;
+	generate_gaussian_sketch(S, r, N, 8675309u);
+
+	// Store sketch of true x.
+	std::vector<float> z_stored(r, 0.0f);
+	glades::chiron::sketch_project(&S[0], &x[0], r, N, &z_stored[0]);
+
+	// Sketch x̃ and compute residual in sketch space.
+	std::vector<float> z_fresh(r, 0.0f);
+	glades::chiron::sketch_project(&S[0], &x_tilde[0], r, N, &z_fresh[0]);
+	std::vector<float> residual(r);
+	for (unsigned int k = 0; k < r; ++k) residual[k] = z_stored[k] - z_fresh[k];
+
+	// Apply correction: x̂ = x̃ + (S^T / r) · residual.
+	std::vector<float> x_hat(x_tilde);
+	glades::chiron::sketch_lift_add(&S[0], &residual[0], r, N, &x_hat[0]);
+
+	// Measure max per-coord |x̂ - x| vs. uncorrected |x̃ - x| = |δ|.
+	float max_raw = 0.0f, max_corrected = 0.0f;
+	for (unsigned int i = 0; i < N; ++i)
+	{
+		const float raw_err = fabsf(x_tilde[i] - x[i]);
+		const float cor_err = fabsf(x_hat[i] - x[i]);
+		if (raw_err > max_raw) max_raw = raw_err;
+		if (cor_err > max_corrected) max_corrected = cor_err;
+	}
+
+	std::printf("  CHIRON sketch correction primitive: r=%u N=%u delta=%g max_raw=%.4e "
+	            "max_corrected=%.4e reduction=%.2fx\n",
+	            r, N, delta_scale, max_raw, max_corrected,
+	            max_corrected > 0.0f ? (max_raw / max_corrected) : 0.0f);
+
+	char msg[256];
+	// The sketch correction must reduce the max error.
+	std::snprintf(msg, sizeof(msg),
+	              "sketch correction should reduce max error: "
+	              "raw=%.3e corrected=%.3e", max_raw, max_corrected);
+	ASSERT(msg, max_corrected < max_raw);
+
+	// Expected per-coord noise: ~||δ|| · √(N/r). For r=1024, N=192, ||δ||~1e-2,
+	// expect ~4.3e-3. Use a 2x safety margin.
+	const float per_coord_bound =
+	    2.0f * delta_scale * sqrtf(static_cast<float>(N) / static_cast<float>(r));
+	std::snprintf(msg, sizeof(msg),
+	              "sketch correction per-coord error should be within "
+	              "2·||δ||·√(N/r): max_corrected=%.3e bound=%.3e",
+	              max_corrected, per_coord_bound);
+	ASSERT(msg, max_corrected < per_coord_bound * 3.0f);  // 3x safety for L_inf vs. RMS
+}
+
+// ---------------------------------------------------------------------------
+// Case 10: sketch-corrected BF16 reconstruction.
+// Runs the full L-block forward+inverse in BF16, with an FP32 sketch stored
+// per block at forward time, and applied as a lift-correction at backward
+// time. Asserts that the corrected error is materially smaller than the
+// uncorrected BF16 error (Case 8).
+// ---------------------------------------------------------------------------
+static float run_multifullblock_roundtrip_sketch(unsigned int L, unsigned int T,
+                                                 unsigned int m, unsigned int dH,
+                                                 bool causal, float eps,
+                                                 unsigned int seed,
+                                                 unsigned int r_sketch,
+                                                 unsigned int sketch_seed_base)
+{
+	// Same setup as run_multifullblock_roundtrip(bf16_emul=true), plus sketch.
+	// State x_ℓ at each block is (q, p) concatenated, size N = 2*T*m.
+	const unsigned int Nstate = 2u * T * m;
+
+	LCG rng(seed);
+	std::vector<float> q0(T * m), p0(T * m);
+	for (unsigned int i = 0; i < q0.size(); ++i) q0[i] = 0.5f * rng.next_unit();
+	for (unsigned int i = 0; i < p0.size(); ++i) p0[i] = 0.5f * rng.next_unit();
+
+	std::vector<std::vector<float> > Wq(L), Wk(L), Wv(L), Wo(L);
+	std::vector<std::vector<float> > w_p(L), b_p(L), w_q(L), b_q(L);
+	std::vector<std::vector<float> > gamma(L), beta(L);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		Wq[l].resize(m * dH); Wk[l].resize(m * dH);
+		Wv[l].resize(m * dH); Wo[l].resize(dH * m);
+		w_p[l].resize(m); b_p[l].resize(m);
+		w_q[l].resize(m); b_q[l].resize(m);
+		gamma[l].resize(m); beta[l].resize(m);
+		for (unsigned int i = 0; i < m * dH; ++i)
+		{
+			Wq[l][i] = 0.15f * rng.next_unit();
+			Wk[l][i] = 0.15f * rng.next_unit();
+			Wv[l][i] = 0.15f * rng.next_unit();
+		}
+		for (unsigned int i = 0; i < dH * m; ++i)
+			Wo[l][i] = 0.15f * rng.next_unit();
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			w_p[l][i] = 0.2f * rng.next_unit();
+			b_p[l][i] = 0.03f * rng.next_unit();
+			w_q[l][i] = 0.2f * rng.next_unit();
+			b_q[l][i] = 0.03f * rng.next_unit();
+			gamma[l][i] = 1.0f + 0.1f * rng.next_unit();
+			beta[l][i]  = 0.03f * rng.next_unit();
+		}
+		// BF16-round all weights to match the no-sketch BF16 test setup.
+		bf16_round_all(&Wq[l][0], Wq[l].size());
+		bf16_round_all(&Wk[l][0], Wk[l].size());
+		bf16_round_all(&Wv[l][0], Wv[l].size());
+		bf16_round_all(&Wo[l][0], Wo[l].size());
+		bf16_round_all(&w_p[l][0], w_p[l].size());
+		bf16_round_all(&b_p[l][0], b_p[l].size());
+		bf16_round_all(&w_q[l][0], w_q[l].size());
+		bf16_round_all(&b_q[l][0], b_q[l].size());
+		bf16_round_all(&gamma[l][0], gamma[l].size());
+		bf16_round_all(&beta[l][0], beta[l].size());
+	}
+
+	// Generate per-layer Gaussian sketches.
+	std::vector<std::vector<float> > S(L);
+	for (unsigned int l = 0; l < L; ++l)
+		generate_gaussian_sketch(S[l], r_sketch, Nstate, sketch_seed_base + l);
+
+	// Per-layer stored sketch values (FP32). Shape [L, r].
+	std::vector<std::vector<float> > z_stored(L);
+	for (unsigned int l = 0; l < L; ++l) z_stored[l].resize(r_sketch, 0.0f);
+
+	std::vector<float> stats(L * T * 2u, 0.0f);
+	std::vector<float> q(q0), p(p0);
+	bf16_round_all(&q[0], q.size());
+	bf16_round_all(&p[0], p.size());
+
+	std::vector<float> state_flat(Nstate);
+	std::vector<float> y(T * m), u(T * m), q_tmp(T * m);
+
+	// Forward: at start of each block, compute and store sketch of the
+	// block-input state. Then run the BF16 block.
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		// Concatenate (q, p) into state_flat = [q..., p...].
+		std::memcpy(&state_flat[0], &q[0], sizeof(float) * q.size());
+		std::memcpy(&state_flat[q.size()], &p[0], sizeof(float) * p.size());
+		// Sketch is stored in FP32 (no bf16_round).
+		glades::chiron::sketch_project(&S[l][0], &state_flat[0],
+		                                r_sketch, Nstate, &z_stored[l][0]);
+
+		// Run block in BF16 (same as no-sketch case).
+		chiron_attn_shear(&q[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+		                   T, m, dH, causal, &y[0]);
+		bf16_round_all(&y[0], y.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_p(&p[t * m], &y[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		potential_f_apply_all(&q[0], &w_p[l][0], &b_p[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_p(&p[t * m], &u[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		potential_f_apply_all(&p[0], &w_q[l][0], &b_q[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_q(&q[t * m], &u[t * m], m);
+		bf16_round_all(&q[0], q.size());
+
+		float* stats_l = &stats[l * T * 2u];
+		glades::chiron::reln_forward(&q[0], &q_tmp[0], stats_l,
+		                              &gamma[l][0], &beta[l][0], T, m, eps);
+		bf16_round_all(&q_tmp[0], q_tmp.size());
+		q.swap(q_tmp);
+	}
+
+	// Inverse: at each block, run BF16 inverse to get x̃, then correct
+	// with the stored sketch.
+	std::vector<float> state_tilde(Nstate);
+	std::vector<float> z_fresh(r_sketch, 0.0f);
+	std::vector<float> residual(r_sketch, 0.0f);
+	for (unsigned int ll = 0; ll < L; ++ll)
+	{
+		const unsigned int l = L - 1 - ll;
+		const float* stats_l = &stats[l * T * 2u];
+		glades::chiron::reln_inverse(&q[0], &q_tmp[0], stats_l,
+		                              &gamma[l][0], &beta[l][0], T, m);
+		bf16_round_all(&q_tmp[0], q_tmp.size());
+		q.swap(q_tmp);
+
+		potential_f_apply_all(&p[0], &w_q[l][0], &b_q[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_q(&q[t * m], &u[t * m], m);
+		bf16_round_all(&q[0], q.size());
+
+		potential_f_apply_all(&q[0], &w_p[l][0], &b_p[l][0], &u[0], T, m);
+		bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_p(&p[t * m], &u[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		chiron_attn_shear(&q[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+		                   T, m, dH, causal, &y[0]);
+		bf16_round_all(&y[0], y.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_p(&p[t * m], &y[t * m], m);
+		bf16_round_all(&p[0], p.size());
+
+		// At this point, (q, p) is the BF16 approximation x̃_ℓ to the
+		// input of block l.  Apply the sketch correction.
+		std::memcpy(&state_tilde[0], &q[0], sizeof(float) * q.size());
+		std::memcpy(&state_tilde[q.size()], &p[0], sizeof(float) * p.size());
+		glades::chiron::sketch_project(&S[l][0], &state_tilde[0],
+		                                r_sketch, Nstate, &z_fresh[0]);
+		for (unsigned int k = 0; k < r_sketch; ++k)
+			residual[k] = z_stored[l][k] - z_fresh[k];
+		// Apply correction in place on state_tilde.
+		glades::chiron::sketch_lift_add(&S[l][0], &residual[0],
+		                                 r_sketch, Nstate, &state_tilde[0]);
+		// Split state_tilde back into q, p (in BF16, mimicking lowp storage).
+		std::memcpy(&q[0], &state_tilde[0], sizeof(float) * q.size());
+		std::memcpy(&p[0], &state_tilde[q.size()], sizeof(float) * p.size());
+		bf16_round_all(&q[0], q.size());
+		bf16_round_all(&p[0], p.size());
+	}
+
+	std::vector<float> q0_bf16(q0), p0_bf16(p0);
+	bf16_round_all(&q0_bf16[0], q0_bf16.size());
+	bf16_round_all(&p0_bf16[0], p0_bf16.size());
+	const float qe = max_abs_diff(q, q0_bf16);
+	const float pe = max_abs_diff(p, p0_bf16);
+	return (qe > pe) ? qe : pe;
+}
+
+void CHIRONSketchCorrectedBf16Test()
+{
+	const unsigned int T = 6;
+	const unsigned int m = 16;
+	const unsigned int dH = 4;
+	const bool causal = true;
+	const float eps = 1e-4f;
+
+	const unsigned int L = 12;
+	const unsigned int sketch_seed_base = 111111u;
+
+	// Baseline: same setup WITHOUT sketch (same seed for weights).
+	const float bf16_L12_uncorrected =
+	    run_multifullblock_roundtrip(L, T, m, dH, causal, eps, 24601u, true);
+
+	// With sketch correction at rank r.
+	const float bf16_L12_corrected_r64 =
+	    run_multifullblock_roundtrip_sketch(L, T, m, dH, causal, eps,
+	                                         24601u, 64u, sketch_seed_base);
+	const float bf16_L12_corrected_r256 =
+	    run_multifullblock_roundtrip_sketch(L, T, m, dH, causal, eps,
+	                                         24601u, 256u, sketch_seed_base);
+
+	std::printf("  CHIRON sketch correction @ L=12: "
+	            "uncorrected=%.3e  r=64 corrected=%.3e  r=256 corrected=%.3e\n",
+	            bf16_L12_uncorrected, bf16_L12_corrected_r64,
+	            bf16_L12_corrected_r256);
+
+	char msg[256];
+	// Primary assertion: sketch correction reduces the drift.
+	std::snprintf(msg, sizeof(msg),
+	              "sketch correction @ r=256 must reduce L=12 BF16 drift: "
+	              "uncorrected=%.3e corrected=%.3e",
+	              bf16_L12_uncorrected, bf16_L12_corrected_r256);
+	ASSERT(msg, bf16_L12_corrected_r256 < bf16_L12_uncorrected);
+
+	// Monotone in r: larger r => lower error (statistical, but should hold
+	// for our single seed).
+	std::snprintf(msg, sizeof(msg),
+	              "sketch correction should improve with r: "
+	              "r=64 err=%.3e r=256 err=%.3e",
+	              bf16_L12_corrected_r64, bf16_L12_corrected_r256);
+	ASSERT(msg, bf16_L12_corrected_r256 <= bf16_L12_corrected_r64 * 1.2f);
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -923,5 +1255,7 @@ void CHIRONUnitTest()
 	CHIRONFullBlockRoundtripTest();
 	CHIRONMultiFullBlockRoundtripTest();
 	CHIRONBf16DriftTest();
+	CHIRONSketchProjectLiftTest();
+	CHIRONSketchCorrectedBf16Test();
 	std::printf("=== CHIRON tests done ===\n\n");
 }

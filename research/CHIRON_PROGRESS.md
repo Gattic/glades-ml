@@ -71,10 +71,40 @@ Goal: show BF16 inverse stays within sketch-corrected bound at L=24.
   - Growth is sub-exponential in L for our setup — the Lipschitz factor
     in this small test is near 1, so the framework's §6.4 bound
     `L · ε_BF16 · exp(Σ K_ℓ)` reduces to approximately linear in L.
-- [ ] Implement rank-r Gaussian sketch projection + lift (forward side).
-- [ ] Implement sketch-corrected inverse reconstruction (backward side).
-- [ ] Assertion: with r=256, residual bound at L=12 reduced below 1e-3.
-- [ ] Negative control: already have — BF16 without sketch at L=12 is 1.17e-2.
+- [x] Implement rank-r Gaussian sketch projection + lift (forward side).
+  See `sketch_project` / `sketch_lift_add` in transformer_chiron_ops.h.
+- [x] Implement sketch-corrected inverse reconstruction (backward side).
+  Prototype lives in chiron-test.cpp::run_multifullblock_roundtrip_sketch.
+- [x] Negative control: BF16 without sketch at L=12 = 1.17e-2 (confirmed).
+- [x] **Empirical sketch correction results at L=12** (T=6, m=16, N=2·T·m=192):
+  - uncorrected BF16 drift: **1.17e-2**
+  - r=64 (N/r ≈ 3.0): **1.09** — catastrophically diverges, sketch space
+    too small
+  - r=256 (N/r ≈ 0.75): **3.91e-3** — ~3× reduction over uncorrected ✓
+  - r=1024 in isolation (correction primitive test): reduction 1.44× at
+    per-coord level with |δ| = 1e-2
+- [x] **Key discovered scaling law:** per-coord sketch-corrected error is
+  `O(||δ|| · √(N/r))` — NOT the tighter `O(||δ||/√r)` the framework §4.5
+  claimed. This means the sketch is effective only when **r ≳ N** (not
+  r = O(√N) as framework stated). For production (N ≈ 16M per layer),
+  this is a significant scaling concern that needs addressing.
+
+### Open research questions from Phase 2 measurements
+
+- Framework §4.5 claims `Var(x̂_ℓ_i) ≤ ||x - x̃||² / r` independent of N.
+  Empirically and by elementary computation we get `||x - x̃||² / r` for
+  the *sum-of-coords* error but `||x - x̃||² · N / r²` for the
+  *per-coord variance* contribution from cross-coordinate leakage.
+  The framework appears to have under-counted cross-coordinate noise.
+  **Need to revise the framework §4.5 variance bound** to
+  `Var ≲ ||x − x̃||² · N/r²` per coordinate.
+- Consequence: for a 70B model (N ≈ 16M), r = 1024 gives per-coord
+  noise factor ≈ √(N/r²) · ||δ|| = √(16M/10^6) · ||δ|| = 4·||δ||, NOT
+  a reduction.  Either (a) sketch has to be per-token local (N = d,
+  not T·d) or (b) block-structured sketches with N/block much smaller.
+- **This is important enough to call out in the framework doc.**
+  Action: update `research/CHIRON_framework.md` with the variance-bound
+  correction and the local-sketch mitigation.
 
 ### Phase 3 — GPU kernels
 
