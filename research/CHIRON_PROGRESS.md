@@ -210,13 +210,29 @@ Memory win at long context (T=8192, 12L, 42M params):
   tiled: 8.14 GB (scratch_P + dP dominate)
   flash: 4.19 GB — **4 GB saved**
 
+**T=16384 paradigm shift** (m=256, L=8, 12M params):
+  tiled: 14.86 GB (4.5% free)
+  flash:  6.91 GB — **7.95 GB saved**
+
+**T=16384 at m=384, 22M params:**
+  tiled: OOMs (tries to allocate 2 GB scratch tensor, fails)
+  flash:  7.19 GB (53.8% free) — **unlocks a config tiled cannot fit**
+
 Throughput cost at this config: 9100 → 181 tok/s (~50× slower),
 because the flash kernel doesn't pipeline through cuBLAS tensor
-cores on the QK^T step.  Worth it when tiled would OOM (T >> 4096
-at 2 B params) — unlocks context windows that the tiled path
-cannot fit on 16 GB at all.  See research/FLASH_ATTENTION_DESIGN.md
-for the Phase-2 path to close the speed gap (shared forward state
-m, ℓ for backward).
+cores on the QK^T step.  Worth it when tiled would OOM — unlocks
+context windows that the tiled path cannot fit on 16 GB at all.
+See research/FLASH_ATTENTION_DESIGN.md for the Phase-2 path to
+close the speed gap (shared forward state m, ℓ for backward).
+
+**GPU parity tests shipped** — 2 new CHIRON tests verify:
+  forward: flash vs cuBLAS-tiled BF16 shear, max_err=3.984e-5
+  backward: flash vs tiled FP32 shear, max_err dq=9.6e-6, dWq=1.1e-7, dWo=6.1e-5
+Both orders of magnitude tighter than BF16 ULP (1/256 ≈ 4e-3).  Confirms
+that --flash-attn is bit-equivalent (up to BF16 precision) to the tiled
+reference — swapping it in only changes scratch memory, not training math.
+
+Test suite: 430/430 pass, 0 failures.
 
 At 1.2 B both fit, but int8 Adam uses only 12.98 GB — 2.3 GB of free
 headroom at identical param count.
