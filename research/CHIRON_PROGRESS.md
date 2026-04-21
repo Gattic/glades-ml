@@ -157,16 +157,18 @@ Convergence check (4.6 M params, T=512, lr=3e-3, accum=8):
   **int8 Adam: loss 10.40 → 8.87  (500 steps)** — new variant
 
 Training-scale ceiling on RTX 4080 SUPER (16 GB):
-  FP32 Adam:                955M params  (7.56 GB used)  @ 2464 tok/s
-  BF16 Adam:               1202M params  (15.29 GB used) @ 2105 tok/s
-  int8 Adam:               1382M params  (15.32 GB used) @ 2017 tok/s
-  **int8 + BF16 grads (GPU-only): 1676M params (14.01 GB used) @ 1484 tok/s**
-  CPU-offload Adam:        1781M params  (15.29 GB used) @  307 tok/s (P2 async)
+  FP32 Adam:                                        955M params  (7.56 GB) @ 2464 tok/s
+  BF16 Adam:                                       1202M params  (15.29 GB) @ 2105 tok/s
+  int8 Adam:                                       1382M params  (15.32 GB) @ 2017 tok/s
+  int8 + BF16 grads (GPU-only):                    1676M params  (14.01 GB) @ 1484 tok/s
+  CPU-offload Adam (P2 async):                     1781M params  (15.29 GB) @  307 tok/s
+  **int8 + BF16 grads + BF16 weights (GPU-only):   2229M params  (15.14 GB) @ 1105 tok/s**
 
-The GPU-only int8+bf16-grads combination reaches within 6% of the
-CPU-offload ceiling at ~5× the throughput — preserves the GPU path as
-the primary training lever while delivering the same 7× lift over the
-non-CHIRON baseline (~250M).
+The GPU-only stack (int8 Adam + bf16 grads + bf16 weights with stochastic
+rounding) now exceeds the CPU-offload ceiling by 25% on params AND runs
+3.6× faster — decisively the production training lever.  2.23 B params
+on a consumer 16 GB card represents a **9× lift** over the baseline
+transformer's ~250 M activation-bound ceiling on the same hardware.
 
 At 1.2 B both fit, but int8 Adam uses only 12.98 GB — 2.3 GB of free
 headroom at identical param count.
