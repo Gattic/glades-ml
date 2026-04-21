@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdint.h>
 #include <vector>
 
 namespace {
@@ -54,6 +55,28 @@ static float max_abs_diff(const std::vector<float>& a, const std::vector<float>&
 		if (d > worst) worst = d;
 	}
 	return worst;
+}
+
+// BF16 round-trip (float -> bf16 -> float) to emulate BF16 arithmetic at
+// operation boundaries. Mirrors transformer_kernels.h's float_to_bf16_rn
+// but inlined here to avoid the glades::rng include chain.
+static float bf16_round(float f)
+{
+	union { float fv; uint32_t u; } v;
+	v.fv = f;
+	const uint32_t lsb = (v.u >> 16) & 1u;
+	const uint32_t roundingBias = 0x7FFFu + lsb;
+	const uint16_t bits = static_cast<uint16_t>((v.u + roundingBias) >> 16);
+	union { uint32_t u; float fv; } w;
+	w.u = static_cast<uint32_t>(bits) << 16;
+	return w.fv;
+}
+
+// BF16-round a whole buffer in place. Emulates storing activations in BF16.
+static void bf16_round_all(float* buf, size_t n)
+{
+	for (size_t i = 0; i < n; ++i)
+		buf[i] = bf16_round(buf[i]);
 }
 
 // Simple deterministic nonlinear "potential" map f: R^m -> R^m used as a
@@ -696,6 +719,199 @@ void CHIRONMultiFullBlockRoundtripTest()
 	            L, q_err, p_err);
 }
 
+// ---------------------------------------------------------------------------
+// Case 8: BF16 reconstruction drift (negative control).
+// Runs the forward block chain in BF16 precision (each op's output is
+// rounded to BF16), then runs the inverse chain in BF16. Measures the
+// reconstruction error `‖x̂_0 − x_0‖_∞` as a function of L.
+// Expected (per framework §6.4): without sketch correction the error grows
+// approximately linearly with L times ε_BF16 ≈ 2^−8 ≈ 4e-3, with a
+// multiplicative factor from the Lipschitz constant of the block.
+// This test does NOT assert a tight bound on drift — its purpose is to
+// PROVE that BF16 reconstruction is materially worse than FP32 (thus
+// motivating the sketch correction in the next phase). It asserts:
+//   (1) BF16 error > FP32 error by an order of magnitude at L=4.
+//   (2) BF16 error grows with L (at L=12 strictly larger than L=4).
+// ---------------------------------------------------------------------------
+static float run_multifullblock_roundtrip(unsigned int L, unsigned int T,
+                                          unsigned int m, unsigned int dH,
+                                          bool causal, float eps,
+                                          unsigned int seed, bool bf16_emul)
+{
+	LCG rng(seed);
+
+	std::vector<float> q0(T * m), p0(T * m);
+	for (unsigned int i = 0; i < q0.size(); ++i) q0[i] = 0.5f * rng.next_unit();
+	for (unsigned int i = 0; i < p0.size(); ++i) p0[i] = 0.5f * rng.next_unit();
+
+	std::vector<std::vector<float> > Wq(L), Wk(L), Wv(L), Wo(L);
+	std::vector<std::vector<float> > w_p(L), b_p(L), w_q(L), b_q(L);
+	std::vector<std::vector<float> > gamma(L), beta(L);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		Wq[l].resize(m * dH); Wk[l].resize(m * dH);
+		Wv[l].resize(m * dH); Wo[l].resize(dH * m);
+		w_p[l].resize(m); b_p[l].resize(m);
+		w_q[l].resize(m); b_q[l].resize(m);
+		gamma[l].resize(m); beta[l].resize(m);
+		for (unsigned int i = 0; i < m * dH; ++i)
+		{
+			Wq[l][i] = 0.15f * rng.next_unit();
+			Wk[l][i] = 0.15f * rng.next_unit();
+			Wv[l][i] = 0.15f * rng.next_unit();
+		}
+		for (unsigned int i = 0; i < dH * m; ++i)
+			Wo[l][i] = 0.15f * rng.next_unit();
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			w_p[l][i] = 0.2f * rng.next_unit();
+			b_p[l][i] = 0.03f * rng.next_unit();
+			w_q[l][i] = 0.2f * rng.next_unit();
+			b_q[l][i] = 0.03f * rng.next_unit();
+			gamma[l][i] = 1.0f + 0.1f * rng.next_unit();
+			beta[l][i]  = 0.03f * rng.next_unit();
+		}
+		if (bf16_emul)
+		{
+			bf16_round_all(&Wq[l][0], Wq[l].size());
+			bf16_round_all(&Wk[l][0], Wk[l].size());
+			bf16_round_all(&Wv[l][0], Wv[l].size());
+			bf16_round_all(&Wo[l][0], Wo[l].size());
+			bf16_round_all(&w_p[l][0], w_p[l].size());
+			bf16_round_all(&b_p[l][0], b_p[l].size());
+			bf16_round_all(&w_q[l][0], w_q[l].size());
+			bf16_round_all(&b_q[l][0], b_q[l].size());
+			bf16_round_all(&gamma[l][0], gamma[l].size());
+			bf16_round_all(&beta[l][0], beta[l].size());
+		}
+	}
+
+	std::vector<float> stats(L * T * 2u, 0.0f);
+	std::vector<float> q(q0), p(p0);
+	std::vector<float> y(T * m), u(T * m), q_tmp(T * m);
+
+	if (bf16_emul)
+	{
+		bf16_round_all(&q[0], q.size());
+		bf16_round_all(&p[0], p.size());
+	}
+
+	// Forward.
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		chiron_attn_shear(&q[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+		                   T, m, dH, causal, &y[0]);
+		if (bf16_emul) bf16_round_all(&y[0], y.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_p(&p[t * m], &y[t * m], m);
+		if (bf16_emul) bf16_round_all(&p[0], p.size());
+
+		potential_f_apply_all(&q[0], &w_p[l][0], &b_p[l][0], &u[0], T, m);
+		if (bf16_emul) bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_p(&p[t * m], &u[t * m], m);
+		if (bf16_emul) bf16_round_all(&p[0], p.size());
+
+		potential_f_apply_all(&p[0], &w_q[l][0], &b_q[l][0], &u[0], T, m);
+		if (bf16_emul) bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_add_to_q(&q[t * m], &u[t * m], m);
+		if (bf16_emul) bf16_round_all(&q[0], q.size());
+
+		float* stats_l = &stats[l * T * 2u];
+		glades::chiron::reln_forward(&q[0], &q_tmp[0], stats_l,
+		                              &gamma[l][0], &beta[l][0], T, m, eps);
+		if (bf16_emul)
+		{
+			bf16_round_all(&q_tmp[0], q_tmp.size());
+			// Stats kept in FP32 per the framework (§4.4: z_ℓ in FP32).
+		}
+		q.swap(q_tmp);
+	}
+
+	// Inverse.
+	for (unsigned int ll = 0; ll < L; ++ll)
+	{
+		const unsigned int l = L - 1 - ll;
+		const float* stats_l = &stats[l * T * 2u];
+		glades::chiron::reln_inverse(&q[0], &q_tmp[0], stats_l,
+		                              &gamma[l][0], &beta[l][0], T, m);
+		if (bf16_emul) bf16_round_all(&q_tmp[0], q_tmp.size());
+		q.swap(q_tmp);
+
+		potential_f_apply_all(&p[0], &w_q[l][0], &b_q[l][0], &u[0], T, m);
+		if (bf16_emul) bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_q(&q[t * m], &u[t * m], m);
+		if (bf16_emul) bf16_round_all(&q[0], q.size());
+
+		potential_f_apply_all(&q[0], &w_p[l][0], &b_p[l][0], &u[0], T, m);
+		if (bf16_emul) bf16_round_all(&u[0], u.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_p(&p[t * m], &u[t * m], m);
+		if (bf16_emul) bf16_round_all(&p[0], p.size());
+
+		chiron_attn_shear(&q[0], &Wq[l][0], &Wk[l][0], &Wv[l][0], &Wo[l][0],
+		                   T, m, dH, causal, &y[0]);
+		if (bf16_emul) bf16_round_all(&y[0], y.size());
+		for (unsigned int t = 0; t < T; ++t)
+			glades::chiron::shear_sub_from_p(&p[t * m], &y[t * m], m);
+		if (bf16_emul) bf16_round_all(&p[0], p.size());
+	}
+
+	// If we emulate BF16 we must also bf16-round the reference start to
+	// measure drift correctly (else we compare FP32-precision original
+	// against BF16-precision reconstruction, which conflates the two
+	// error sources).
+	std::vector<float> q0_bf16(q0), p0_bf16(p0);
+	if (bf16_emul)
+	{
+		bf16_round_all(&q0_bf16[0], q0_bf16.size());
+		bf16_round_all(&p0_bf16[0], p0_bf16.size());
+	}
+
+	const float qe = max_abs_diff(q, q0_bf16);
+	const float pe = max_abs_diff(p, p0_bf16);
+	return (qe > pe) ? qe : pe;
+}
+
+void CHIRONBf16DriftTest()
+{
+	const unsigned int T = 6;
+	const unsigned int m = 16;
+	const unsigned int dH = 4;
+	const bool causal = true;
+	const float eps = 1e-4f;
+
+	const float fp32_L4  = run_multifullblock_roundtrip(4u,  T, m, dH, causal, eps, 24601u, false);
+	const float bf16_L4  = run_multifullblock_roundtrip(4u,  T, m, dH, causal, eps, 24601u, true);
+	const float bf16_L12 = run_multifullblock_roundtrip(12u, T, m, dH, causal, eps, 24601u, true);
+
+	std::printf("  CHIRON drift: FP32 L=4 err=%.3e | BF16 L=4 err=%.3e | BF16 L=12 err=%.3e\n",
+	            fp32_L4, bf16_L4, bf16_L12);
+
+	char msg[256];
+	// Assertion 1: BF16 is materially worse than FP32.
+	std::snprintf(msg, sizeof(msg),
+	              "BF16 at L=4 should be materially worse than FP32 at L=4: "
+	              "fp32_L4=%.3e bf16_L4=%.3e (want bf16 > 10x fp32)",
+	              fp32_L4, bf16_L4);
+	ASSERT(msg, bf16_L4 > 10.0f * fp32_L4);
+
+	// Assertion 2: drift grows with depth under BF16.
+	std::snprintf(msg, sizeof(msg),
+	              "BF16 drift must grow with L: bf16_L4=%.3e bf16_L12=%.3e",
+	              bf16_L4, bf16_L12);
+	ASSERT(msg, bf16_L12 > bf16_L4);
+
+	// Assertion 3: BF16 drift at L=12 should be in the 10^-3 to 1 regime.
+	// This is NOT a tight bound; it's a loose sanity check that our
+	// emulation produces reasonable-magnitude drift, not astronomical
+	// (which would indicate a bug in the emulation).
+	ASSERT("BF16 L=12 drift must be in loose expected regime (< 10)",
+	       bf16_L12 < 10.0f);
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -706,5 +922,6 @@ void CHIRONUnitTest()
 	CHIRONAttentionShearReversibilityTest();
 	CHIRONFullBlockRoundtripTest();
 	CHIRONMultiFullBlockRoundtripTest();
+	CHIRONBf16DriftTest();
 	std::printf("=== CHIRON tests done ===\n\n");
 }
