@@ -361,6 +361,18 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
 bool cast_f32_to_bf16(const float* src, uint16_t* dst, size_t n);
 bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n);
 
+// Stochastic FP32 -> BF16 cast.  Rounds up with probability equal to the
+// low-16-bit fractional part of the source (so the expected value matches
+// the true FP32 value exactly, preserving sub-ULP updates that deterministic
+// round-to-nearest-even would quantize to zero).  Needed for BF16-master
+// weight training where small Adam updates would otherwise vanish.
+//
+// RNG is a per-element splittable hash of (idx, stepIdx, baseSeed); no
+// global state.  baseSeed and stepIdx should vary per Adam step to avoid
+// biased rounding across steps on the same weight entry.
+bool cast_f32_to_bf16_stochastic(const float* src, uint16_t* dst, size_t n,
+                                  uint32_t baseSeed, uint32_t stepIdx);
+
 // BF16 gradient accumulation helper.  Computes in FP32:
 //   dst_bf16[i] = bf16( alpha * src_f32[i] + beta * fp32(dst_bf16[i]) )
 // with round-to-nearest-even on the output cast.  Used to accumulate FP32
@@ -452,6 +464,7 @@ inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
+inline bool cast_f32_to_bf16_stochastic(const float*, uint16_t*, size_t, uint32_t, uint32_t) { return false; }
 inline bool bf16_accum_axpy(uint16_t*, const float*, float, float, size_t) { return false; }
 inline bool adam_update_int8_state(float*, const float*, int8_t*, uint8_t*,
                                     float*, float*, float, float, float, float,

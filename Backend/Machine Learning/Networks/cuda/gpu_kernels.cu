@@ -3467,6 +3467,87 @@ bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n)
 }
 
 // ===========================================================================
+//  Stochastic-rounded FP32 -> BF16 cast
+// ===========================================================================
+// Deterministic RN-even rounding quantizes away updates smaller than one ULP
+// (1 / 2^8 = 1/256 of the weight magnitude for BF16).  In training that stalls
+// small gradient accumulations indefinitely.
+//
+// Stochastic rounding instead rounds:
+//   - up   with probability  p = frac / (1 ULP)
+//   - down with probability  1 - p
+// where frac is the low 16 bits of the FP32 representation (the BF16 mantissa
+// remainder).  Matches deterministic RN in expectation; preserves sub-ULP
+// updates over many steps.
+//
+// RNG: a simple per-element splittable hash seeded from (baseSeed, idx, step).
+// No global RNG state needed; each element's rounding is independent.
+
+namespace {
+
+__device__ __forceinline__ uint32_t sr_hash32(uint32_t a, uint32_t b, uint32_t c)
+{
+	// xorshift-mixed hash — cheap, good enough for rounding randomness.
+	uint32_t x = a ^ (b * 0x9E3779B1u) ^ (c * 0x85EBCA6Bu);
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	return x;
+}
+
+__global__ void k_cast_f32_to_bf16_stochastic(const float* __restrict__ src,
+                                               uint16_t* __restrict__ dst,
+                                               size_t n,
+                                               uint32_t baseSeed,
+                                               uint32_t stepIdx)
+{
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+	const float f = src[idx];
+	union { float f; uint32_t u; } v;
+	v.f = f;
+
+	// NaN: emit BF16 quiet NaN preserving sign (same as RN path).
+	if (isnan(f))
+	{
+		const uint32_t sign = v.u & 0x80000000u;
+		dst[idx] = static_cast<uint16_t>(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		return;
+	}
+
+	// Stochastic rounding: compare low 16 bits against a per-element hash.
+	// If hash's low 16 bits < low16 of the float, we round up (= truncate high16 + 1).
+	// Otherwise truncate toward zero w.r.t. the low bits (= high16 alone).
+	const uint32_t low16 = v.u & 0xFFFFu;
+	const uint32_t rnd = sr_hash32(static_cast<uint32_t>(idx),
+	                                 stepIdx, baseSeed) & 0xFFFFu;
+	uint32_t high16 = v.u >> 16;
+	if (rnd < low16)
+	{
+		// Round up; propagate carry if mantissa overflows.  For BF16 encoding
+		// the high16 IS {sign | exp | m[6..0]} so a simple +1 is correct for
+		// non-NaN inputs (exp increments take care of mantissa overflow).
+		high16 += 1u;
+	}
+	dst[idx] = static_cast<uint16_t>(high16 & 0xFFFFu);
+}
+
+} // anonymous namespace
+
+bool cast_f32_to_bf16_stochastic(const float* src, uint16_t* dst, size_t n,
+                                  uint32_t baseSeed, uint32_t stepIdx)
+{
+	if (n == 0) return true;
+	const unsigned int TPB = 256u;
+	const size_t blocks = (n + TPB - 1u) / TPB;
+	if (blocks > 0x7FFFFFFFu) return false;
+	k_cast_f32_to_bf16_stochastic<<<static_cast<unsigned int>(blocks), TPB, 0, computeStream()>>>(
+	    src, dst, n, baseSeed, stepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  BF16 gradient accumulation: write dst_bf16 = bf16(alpha * src_f32 + fp32(dst_bf16) * beta)
 // ===========================================================================
 // Used for BF16 gradient accumulation across gradient-accumulation micro-steps:

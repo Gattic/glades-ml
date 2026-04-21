@@ -2198,9 +2198,99 @@ void CHIRONGpuFullBlockEndToEndTest()
 #endif
 }
 
+// Verify that stochastic FP32->BF16 cast matches FP32 value in expectation
+// (the key property that makes BF16-master weight training viable) and that
+// sub-ULP updates accumulate correctly over many steps, whereas deterministic
+// round-to-nearest-even would quantize them to zero.
+void CHIRONStochasticBf16RoundingTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stoch bf16 round] no CUDA device — skipped\n");
+		return;
+	}
+
+	// Test 1: unbiased rounding at the mid-point of two BF16 codes.
+	// Pick an FP32 value whose mantissa bits 15..0 are exactly 0x8000 (halfway);
+	// stochastic rounding should round up ~50% of the time across many samples.
+	const size_t N = 1024 * 1024;  // 1M samples for statistical stability
+	std::vector<float> src_h(N);
+	// Halfway-value FP32 pattern: start from 1.0 (0x3F800000) and set the
+	// low bits to exactly 0x8000 (mid of a BF16 ULP).
+	union { uint32_t u; float f; } halfway;
+	halfway.u = 0x3F808000u;   // 1.0 + 0.5 ULPs of BF16
+	for (size_t i = 0; i < N; ++i) src_h[i] = halfway.f;
+
+	glades::gpu::GpuBuffer<float>    d_src;
+	glades::gpu::GpuBuffer<uint16_t> d_dst;
+	d_src.allocate(N);  d_dst.allocate(N);
+	d_src.upload(&src_h[0], N);
+
+	ASSERT("stoch bf16 round: kernel launch",
+	       glades::gpu::cast_f32_to_bf16_stochastic(d_src.data(), d_dst.data(), N,
+	                                                  /*baseSeed=*/0x13579BDFu,
+	                                                  /*stepIdx=*/1u));
+
+	std::vector<uint16_t> dst_h(N);
+	d_dst.download(&dst_h[0], N);
+
+	// The two possible BF16 codes: floor = 0x3F80 (=1.0), ceil = 0x3F81 (=1 + 1 ULP).
+	size_t upCount = 0;
+	for (size_t i = 0; i < N; ++i)
+	{
+		if (dst_h[i] == 0x3F81u) ++upCount;
+		else if (dst_h[i] != 0x3F80u)
+		{
+			// Unexpected code.
+			std::printf("  unexpected bf16 code 0x%04X at idx=%zu\n", dst_h[i], i);
+		}
+	}
+	const double upFrac = (double)upCount / (double)N;
+	std::printf("  stochastic BF16 halfway-round: %.4f up / %.4f down (expect 0.5 / 0.5)\n",
+	            upFrac, 1.0 - upFrac);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "stoch rounding must be within 1%% of 50/50 at halfway: got %.4f",
+	              upFrac);
+	ASSERT(msg, upFrac > 0.49 && upFrac < 0.51);
+
+	// Test 2: accumulation of sub-ULP updates.  Feed 0.25 ULP to the cast 1000 times;
+	// deterministic RNE would always round to the floor (losing everything).
+	// Stochastic rounding should accumulate to ~250 ULPs in expectation.
+	union { uint32_t u; float f; } quarter_ulp;
+	quarter_ulp.u = 0x3F804000u;    // 1.0 + 0.25 BF16-ULP
+	for (size_t i = 0; i < N; ++i) src_h[i] = quarter_ulp.f;
+	d_src.upload(&src_h[0], N);
+
+	size_t sum_up = 0;
+	for (int step = 0; step < 100; ++step)
+	{
+		glades::gpu::cast_f32_to_bf16_stochastic(d_src.data(), d_dst.data(), N,
+		                                          /*baseSeed=*/0x13579BDFu,
+		                                          /*stepIdx=*/(uint32_t)(step + 2));
+		std::vector<uint16_t> local(N);
+		d_dst.download(&local[0], N);
+		for (size_t i = 0; i < N; ++i) if (local[i] == 0x3F81u) ++sum_up;
+	}
+	// Expected: 0.25 * 100 * N = 25 * N up-rounds.  Actual within 2% is fine.
+	const double expected = 0.25 * 100.0 * (double)N;
+	const double actualFrac = (double)sum_up / expected;
+	std::printf("  stochastic BF16 0.25-ULP: %.2fx expected (want ~1.0)\n", actualFrac);
+	std::snprintf(msg, sizeof(msg),
+	              "sub-ULP updates must accumulate: got %.3f * expected",
+	              actualFrac);
+	ASSERT(msg, actualFrac > 0.98 && actualFrac < 1.02);
+#else
+	std::printf("  [stoch bf16 round] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
+	CHIRONStochasticBf16RoundingTest();
 	CHIRONShearReversibilityTest();
 	CHIRONReLNRoundtripTest();
 	CHIRONBlockRoundtripTest();
