@@ -345,6 +345,35 @@ bool chiron_attention_shear_bf16(const float* q, float* p,
                                   uint16_t* scratch_Qbf, uint16_t* scratch_Kbf,
                                   uint16_t* scratch_Vbf);
 
+// Local-window BF16 shear forward.  Uses the windowed flash kernel — each
+// query attends only to ±windowSize tokens (O(T·W) compute vs O(T²)).
+// Preserves CHIRON reversibility (the shear's algebraic form is unchanged;
+// only Y(q)'s internal complexity changes).  Falls back to full attention
+// when windowSize <= 0 or >= T.  Same extra scratches as chiron_attention_shear_bf16.
+bool chiron_attention_shear_local_bf16(const float* q, float* p,
+                                         const float* Wq, const float* Wk,
+                                         const float* Wv, const float* Wo,
+                                         int T, int m, int nHeads, int nKVHeads, int dHead,
+                                         bool causal, bool invert, int windowSize,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         unsigned short* scratch_Qbf,
+                                         unsigned short* scratch_Kbf,
+                                         unsigned short* scratch_Vbf);
+
+// Local-window BF16 shear backward.  Mirrors chiron_attention_shear_backward_bf16
+// with windowed attention bwd.
+bool chiron_attention_shear_backward_local_bf16(
+    const float* q, const float* dp_new,
+    const float* Wq, const float* Wk, const float* Wv, const float* Wo,
+    int T, int m, int nHeads, int nKVHeads, int dHead,
+    bool causal, int windowSize,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    unsigned short* scratch_Qbf, unsigned short* scratch_Kbf, unsigned short* scratch_Vbf);
+
 // Backward counterpart to chiron_attention_shear_bf16.  Uses flash attention
 // (non-materialized) for the attention backward — no O(nH*T^2) scratch for
 // the softmax probabilities.  Intended for long-context training where the
@@ -457,6 +486,18 @@ inline bool chiron_attention_shear_backward_bf16(const float*, const float*,
                                                   float*, float*, float*, float*,
                                                   float*, float*, float*, float*,
                                                   uint16_t*, uint16_t*, uint16_t*) { return false; }
+inline bool chiron_attention_shear_local_bf16(const float*, float*,
+                                                const float*, const float*, const float*, const float*,
+                                                int, int, int, int, int, bool, bool, int,
+                                                float*, float*, float*, float*,
+                                                unsigned short*, unsigned short*, unsigned short*) { return false; }
+inline bool chiron_attention_shear_backward_local_bf16(const float*, const float*,
+                                                        const float*, const float*, const float*, const float*,
+                                                        int, int, int, int, int, bool, int,
+                                                        float*, float*, float*, float*, float*,
+                                                        float*, float*, float*, float*,
+                                                        float*, float*, float*, float*,
+                                                        unsigned short*, unsigned short*, unsigned short*) { return false; }
 inline bool chiron_attention_shear_backward(const float*, const float*,
                                              const float*, const float*, const float*, const float*,
                                              int, int, int, int, int, bool,
