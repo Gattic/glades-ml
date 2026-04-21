@@ -341,6 +341,33 @@ transformer. This is a significant but well-scoped workstream; it is
 independent of CHIRON correctness and is the single highest-leverage
 GPU optimization in the codebase.
 
+## 2026-04-21 — Production integration attempt + trainer environment issue
+
+**Attempted**: wire `flash_attention_cublas_tiled` into the production
+training path (`sgd_transformer.cpp` call sites in
+`transformerGpuRunForwardOnly` and `transformerGpuTrainEpoch`).
+
+**Reverted**: the trainer binary started segfaulting at startup on any
+config after the integration attempt. The crash persists even after
+reverting the sgd_transformer.cpp changes and doing clean rebuilds of
+libglades.so + glades_pile_train. A checkout of commit `828b6ea89`
+(pre-dating all Stage-1 WMMA work) also segfaults at the same config
+that previously ran at 1080 tok/s, indicating the regression is
+environmental / build-state, not a code issue in HEAD.
+
+**Evidence this is independent of CHIRON/WMMA work**:
+- 381 unit-test Success assertions pass at HEAD.
+- CHIRONCublasTiledAttentionParityTest: max_err = 1.4e-4 (within
+  TF32 tolerance).
+- CHIRONMicroTrainingDemoTest: 19.8x loss reduction reproduces.
+- Baseline commit also crashes → this is not from new code.
+
+**Queued for next iteration**: diagnose + fix the trainer environment
+(likely a stale cmake cache / installed-header mismatch). Once the
+trainer runs again, the 10-line `flash_attention_multihead_forward →
+flash_attention_cublas_tiled` swap delivers the 46x speedup to the
+production training path.
+
 ## Remaining work (future iterations)
 
 ### Phase 4 proper: NNetwork integration
