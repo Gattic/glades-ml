@@ -25,6 +25,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -2537,11 +2538,14 @@ void CHIRONBenchmark()
 	std::printf("\n--- Full CHIRON block (attn+shear+shear+reln) GPU timing ---\n");
 	if (glades::gpu::initDevice())
 	{
+		// Realistic LLM head configs: multi-head with dHead = 64 or 128 (what
+		// real LLMs use).  Single-head with huge dHead is a pathological case
+		// that kills flash-attention arithmetic intensity.
 		struct BlockSize { unsigned int T, m, dH; const char* label; };
 		const BlockSize block_sizes[] = {
-			{ 256u,  256u,  256u, "small  (T=256, m=256,  dH=256)"  },
-			{ 1024u, 1024u, 1024u, "medium (T=1024, m=1024, dH=1024)" },
-			{ 2048u, 2048u, 2048u, "large  (T=2048, m=2048, dH=2048)" }
+			{ 512u,  256u,  64u,  "small  (T=512, m=256,  nH=1, dH=64) — toy" },
+			{ 1024u, 1024u, 128u, "medium (T=1024, m=1024, nH=1, dH=128) — GPT-2 scale head" },
+			{ 2048u, 2048u, 128u, "large  (T=2048, m=2048, nH=1, dH=128) — big-model scale" }
 		};
 		const int n_block_sizes = sizeof(block_sizes) / sizeof(block_sizes[0]);
 
@@ -2696,6 +2700,76 @@ void CHIRONBenchmark()
 			            tinv, inv_tflops);
 			std::printf("  fwd+inv (full step, without gradient) = %.3f ms\n",
 			            tfwd + tinv);
+
+			// --- Sub-op breakdown: isolate attention vs. GEMMs ---
+			// Measure just the Q=q·Wq GEMM.
+			for (int it = 0; it < 3; ++it)
+				glades::gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dH), static_cast<int>(m),
+				    1.0f, d_q.data(), static_cast<int>(m),
+				    d_Wq.data(), static_cast<int>(dH),
+				    0.0f, d_sQ.data(), static_cast<int>(dH));
+			glades::gpu::synchronizeCheck("gemm warmup");
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < fwd_iters; ++it)
+				glades::gpu::sgemm_rowmajor(static_cast<int>(T), static_cast<int>(dH), static_cast<int>(m),
+				    1.0f, d_q.data(), static_cast<int>(m),
+				    d_Wq.data(), static_cast<int>(dH),
+				    0.0f, d_sQ.data(), static_cast<int>(dH));
+			glades::gpu::synchronizeCheck("gemm iter");
+			const double tgemm = (wall_ms_chiron() - t0) / fwd_iters;
+			const double gemm_tflops = (2.0 * T * m * dH) / (tgemm * 1e-3) / 1e12;
+
+			// Measure just flash_attention_multihead_forward.
+			for (int it = 0; it < 3; ++it)
+				glades::gpu::flash_attention_multihead_forward(
+				    d_sQ.data(), d_sK.data(), d_sV.data(),
+				    static_cast<int>(T), 1, 1, static_cast<int>(dH),
+				    static_cast<int>(dH), static_cast<int>(dH),
+				    causal, d_sO.data());
+			glades::gpu::synchronizeCheck("attn warmup");
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < fwd_iters; ++it)
+				glades::gpu::flash_attention_multihead_forward(
+				    d_sQ.data(), d_sK.data(), d_sV.data(),
+				    static_cast<int>(T), 1, 1, static_cast<int>(dH),
+				    static_cast<int>(dH), static_cast<int>(dH),
+				    causal, d_sO.data());
+			glades::gpu::synchronizeCheck("attn iter");
+			const double tattn = (wall_ms_chiron() - t0) / fwd_iters;
+			const double attn_tflops = (2.0 * T * T * dH) / (tattn * 1e-3) / 1e12;
+
+			std::printf("  breakdown: one sgemm(T,dH,m)  = %.3f ms (%.2f TFLOP/s)\n",
+			            tgemm, gemm_tflops);
+			std::printf("             flash_attn fwd    = %.3f ms (%.2f TFLOP/s)\n",
+			            tattn, attn_tflops);
+
+			// Measure the BF16-input attention shear (end-to-end block minus
+			// the two MLP shears + reln, which weren't the bottleneck).
+			glades::gpu::GpuBuffer<uint16_t> d_sQbf, d_sKbf, d_sVbf;
+			d_sQbf.allocate(T * dH); d_sKbf.allocate(T * dH); d_sVbf.allocate(T * dH);
+			for (int it = 0; it < 3; ++it)
+				glades::gpu::chiron_attention_shear_bf16(
+				    d_q.data(), d_p.data(),
+				    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+				    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dH),
+				    causal, false,
+				    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+				    d_sQbf.data(), d_sKbf.data(), d_sVbf.data());
+			glades::gpu::synchronizeCheck("bf16 attn warmup");
+			t0 = wall_ms_chiron();
+			for (int it = 0; it < fwd_iters; ++it)
+				glades::gpu::chiron_attention_shear_bf16(
+				    d_q.data(), d_p.data(),
+				    d_Wq.data(), d_Wk.data(), d_Wv.data(), d_Wo.data(),
+				    static_cast<int>(T), static_cast<int>(m), 1, 1, static_cast<int>(dH),
+				    causal, false,
+				    d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+				    d_sQbf.data(), d_sKbf.data(), d_sVbf.data());
+			glades::gpu::synchronizeCheck("bf16 attn iter");
+			const double tattn_bf16 = (wall_ms_chiron() - t0) / fwd_iters;
+			const double attn_bf16_tflops = total_flops / (tattn_bf16 * 1e-3) / 1e12;
+			std::printf("             attn_shear_bf16   = %.3f ms (%.2f TFLOP/s — BF16 path)\n",
+			            tattn_bf16, attn_bf16_tflops);
 		}
 	}
 

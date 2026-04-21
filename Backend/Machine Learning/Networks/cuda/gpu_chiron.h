@@ -107,6 +107,23 @@ bool chiron_attention_shear(const float* q, float* p,
                              float* scratch_Q, float* scratch_K,
                              float* scratch_V, float* scratch_O);
 
+// BF16-input attention shear.  Computes Q/K/V in FP32 via cuBLAS, casts
+// down to BF16 for the flash-attention core, then casts the output back.
+// The existing flash_attention_multihead_forward_bf16 kernel is heavily
+// optimized (see research/BF16_PLAN.md) and is 50-200x faster than the
+// FP32 path at training-scale T/dHead.
+//
+// Extra scratch (caller-owned): BF16 staging for Q, K, V [T, dModel/Kv].
+bool chiron_attention_shear_bf16(const float* q, float* p,
+                                  const float* Wq, const float* Wk,
+                                  const float* Wv, const float* Wo,
+                                  int T, int m, int nHeads, int nKVHeads, int dHead,
+                                  bool causal, bool invert,
+                                  float* scratch_Q, float* scratch_K,
+                                  float* scratch_V, float* scratch_O,
+                                  uint16_t* scratch_Qbf, uint16_t* scratch_Kbf,
+                                  uint16_t* scratch_Vbf);
+
 } // namespace gpu
 } // namespace glades
 
@@ -133,6 +150,13 @@ inline bool chiron_attention_shear(const float*, float*,
                                     int, int, int, int, int,
                                     bool, bool,
                                     float*, float*, float*, float*) { return false; }
+inline bool chiron_attention_shear_bf16(const float*, float*,
+                                         const float*, const float*, const float*,
+                                         const float*,
+                                         int, int, int, int, int,
+                                         bool, bool,
+                                         float*, float*, float*, float*,
+                                         uint16_t*, uint16_t*, uint16_t*) { return false; }
 
 } // namespace gpu
 } // namespace glades

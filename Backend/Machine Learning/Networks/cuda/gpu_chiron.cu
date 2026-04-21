@@ -330,6 +330,64 @@ bool chiron_attention_shear(const float* q, float* p,
 	return true;
 }
 
+// ===========================================================================
+//  7. Symplectic attention shear — BF16-input flash-attention variant.
+// ===========================================================================
+//
+// Same control flow as chiron_attention_shear, but the flash-attention core
+// runs with BF16 Q/K/V. On profiling hardware (RTX 4080 SUPER), the BF16
+// kernel is 50-200x faster than the FP32 variant at training-scale T and
+// dHead; this variant closes the gap between CHIRON's attention path and
+// cuBLAS's sgemm throughput.
+//
+// Cast overhead: one device-side BF16 cast per Q/K/V buffer, each O(T*dModel)
+// — negligible compared to the T*T*dHead attention work.
+
+bool chiron_attention_shear_bf16(const float* q, float* p,
+                                  const float* Wq, const float* Wk,
+                                  const float* Wv, const float* Wo,
+                                  int T, int m, int nHeads, int nKVHeads, int dHead,
+                                  bool causal, bool invert,
+                                  float* scratch_Q, float* scratch_K,
+                                  float* scratch_V, float* scratch_O,
+                                  uint16_t* scratch_Qbf, uint16_t* scratch_Kbf,
+                                  uint16_t* scratch_Vbf)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel    = nHeads   * dHead;
+	const int dModelKV  = nKVHeads * dHead;
+
+	// Projections in FP32 (fast on cuBLAS).
+	if (!sgemm_rowmajor(T, dModel, m, 1.0f, q, m, Wq, dModel, 0.0f, scratch_Q, dModel))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wk, dModelKV, 0.0f, scratch_K, dModelKV))
+		return false;
+	if (!sgemm_rowmajor(T, dModelKV, m, 1.0f, q, m, Wv, dModelKV, 0.0f, scratch_V, dModelKV))
+		return false;
+
+	// Cast Q/K/V FP32 -> BF16 for the flash-attention core.
+	if (!cast_f32_to_bf16(scratch_Q, scratch_Qbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!cast_f32_to_bf16(scratch_K, scratch_Kbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+	if (!cast_f32_to_bf16(scratch_V, scratch_Vbf, static_cast<size_t>(T) * dModelKV))
+		return false;
+
+	// BF16-input flash attention. Output stays FP32 (written to scratch_O).
+	if (!flash_attention_multihead_forward_bf16(scratch_Qbf, scratch_Kbf, scratch_Vbf,
+	                                             T, nHeads, nKVHeads,
+	                                             dHead, dModel, dModelKV,
+	                                             causal, scratch_O))
+		return false;
+
+	// Output projection (FP32).
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor(T, m, dModel, sign, scratch_O, dModel, Wo, m, 1.0f, p, m))
+		return false;
+
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 
