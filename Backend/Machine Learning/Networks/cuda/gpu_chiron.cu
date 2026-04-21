@@ -494,6 +494,100 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	return true;
 }
 
+// BF16-weight backward counterpart to chiron_attention_shear_bf16w_tiled.
+// Eliminates weight casts on the backward path by using BF16-TC GEMMs for
+// the projections, the dq-projection (abt), and the forward recompute.
+// The weight-grad GEMMs (dWq += q^T · sdQ etc.) stay FP32 — caller may
+// pair with --bf16-grads to accumulate them into BF16 persistent storage
+// via bf16_accum_axpy downstream.
+//
+// Extra scratch (caller-owned):
+//   scratch_qbf    [T, m]      — reused for q cast and for dp_new cast
+//   scratch_sdbf   [T, dModel] — rotates through sdQ/sdK/sdV casts
+//
+// Savings vs chiron_attention_shear_backward_tiled (with bf16-weights
+// caller casting each weight to FP32): 7 fewer weight casts per layer,
+// 7 BF16-TC GEMMs instead of TF32-TC (projection + abt dq-projection),
+// net ~200 MB HBM cast traffic saved per layer at 2 B scale.
+bool chiron_attention_shear_backward_bf16w_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	// 1. Cast q -> BF16 for projections.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 2. Forward recompute: Q/K/V projections via BF16-TC GEMMs.
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, sK, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, sV, dModel))
+		return false;
+	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, dHead, dModel, causal,
+	                                    sO, scratch_P))
+		return false;
+
+	// 3. Output-projection backward.  dO = dp_new · Wo^T.  Cast dp_new to
+	//    BF16 (overwriting scratch_qbf — q_bf is no longer needed here)
+	//    and use abt_bf16 for BF16 × BF16 × Wo^T.
+	if (!cast_f32_to_bf16(dp_new, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wo_bf, m, 0.0f, sdO, dModel))
+		return false;
+
+	// 4. dWo += sO^T · dp_new (FP32 × FP32 -> FP32; sO and dp_new are FP32).
+	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+		return false;
+
+	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModel, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModel, computeStream()));
+	if (!flash_attention_backward_cublas_tiled(
+	        sQ, sK, sV, sO, sdO,
+	        T, nHeads, dHead, dModel, causal,
+	        sdQ, sdK, sdV, scratch_P, scratch_dP))
+		return false;
+
+	// 6. dq += sdQ · Wq^T (and for sdK, sdV).  Use abt_bf16 — cast each sdX
+	//    to BF16 one at a time into scratch_sdbf, then BF16 × BF16 -> FP32.
+	if (!cast_f32_to_bf16(sdQ, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wq_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
+		return false;
+
+	// 7. Weight gradients: dWq += q^T · sdQ etc.  FP32 throughout.
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdK, dModel, 1.0f, dWk, dModel))
+		return false;
+	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdV, dModel, 1.0f, dWv, dModel))
+		return false;
+	return true;
+}
+
 // Tiled variant of chiron_attention_shear.  Same math as chiron_attention_shear
 // but replaces the O(T²·dH) flash-attention core with flash_attention_cublas_tiled
 // (TF32 tensor cores via cuBLAS batched strided GEMM).  Typical 5-10× wall-clock

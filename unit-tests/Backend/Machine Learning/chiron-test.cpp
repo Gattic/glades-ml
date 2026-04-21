@@ -2599,6 +2599,141 @@ void CHIRONBf16WeightProjectionParityTest()
 #endif
 }
 
+// Parity test for the bf16w backward shear.  Compare against the standard
+// tiled backward on identical BF16-quantized weights.  All outputs (dq,
+// dWq/dWk/dWv/dWo) should match within BF16 projection noise.
+void CHIRONBf16WeightBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [bf16w bwd parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int T = 64, m = 32, nH = 4, dH = 16;
+	const unsigned int dM = nH * dH;
+	const bool causal = true;
+
+	LCG rng(77722u);
+	std::vector<float> q_h(T * m), dp_h(T * m);
+	std::vector<float> Wq(m * dM), Wk(m * dM), Wv(m * dM), Wo(dM * m);
+	for (size_t i = 0; i < q_h.size(); ++i) q_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < dp_h.size(); ++i) dp_h[i] = 0.15f * rng.next_unit();
+	for (size_t i = 0; i < Wq.size(); ++i) Wq[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wk.size(); ++i) Wk[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wv.size(); ++i) Wv[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < Wo.size(); ++i) Wo[i] = 0.1f * rng.next_unit();
+
+	// Host-side BF16 cast (round-to-nearest-even).
+	#define CAST_BF16_RNE(f_, out_) do {                                \
+		union { float f; uint32_t u; } __v; __v.f = (f_);                \
+		const uint32_t __lsb = (__v.u >> 16) & 1u;                       \
+		(out_) = (uint16_t)((__v.u + 0x7FFFu + __lsb) >> 16);             \
+	} while (0)
+	#define CAST_BF16_TO_FP32(b_, out_) do {                            \
+		union { uint32_t u; float f; } __v;                              \
+		__v.u = ((uint32_t)(b_)) << 16;                                  \
+		(out_) = __v.f;                                                  \
+	} while (0)
+
+	std::vector<uint16_t> Wq_bf(m * dM), Wk_bf(m * dM), Wv_bf(m * dM), Wo_bf(dM * m);
+	for (size_t i = 0; i < Wq.size(); ++i) CAST_BF16_RNE(Wq[i], Wq_bf[i]);
+	for (size_t i = 0; i < Wk.size(); ++i) CAST_BF16_RNE(Wk[i], Wk_bf[i]);
+	for (size_t i = 0; i < Wv.size(); ++i) CAST_BF16_RNE(Wv[i], Wv_bf[i]);
+	for (size_t i = 0; i < Wo.size(); ++i) CAST_BF16_RNE(Wo[i], Wo_bf[i]);
+	// Round-trip FP32 for the reference path.
+	std::vector<float> WqR(m * dM), WkR(m * dM), WvR(m * dM), WoR(dM * m);
+	for (size_t i = 0; i < Wq.size(); ++i) CAST_BF16_TO_FP32(Wq_bf[i], WqR[i]);
+	for (size_t i = 0; i < Wk.size(); ++i) CAST_BF16_TO_FP32(Wk_bf[i], WkR[i]);
+	for (size_t i = 0; i < Wv.size(); ++i) CAST_BF16_TO_FP32(Wv_bf[i], WvR[i]);
+	for (size_t i = 0; i < Wo.size(); ++i) CAST_BF16_TO_FP32(Wo_bf[i], WoR[i]);
+
+	glades::gpu::GpuBuffer<float> d_q, d_dp;
+	glades::gpu::GpuBuffer<float> d_WqR, d_WkR, d_WvR, d_WoR;
+	glades::gpu::GpuBuffer<uint16_t> d_Wq_bf, d_Wk_bf, d_Wv_bf, d_Wo_bf;
+	glades::gpu::GpuBuffer<float> d_dq_ref, d_dWq_ref, d_dWk_ref, d_dWv_ref, d_dWo_ref;
+	glades::gpu::GpuBuffer<float> d_dq_new, d_dWq_new, d_dWk_new, d_dWv_new, d_dWo_new;
+	glades::gpu::GpuBuffer<float> d_sQ, d_sK, d_sV, d_sO, d_sdO, d_sdQ, d_sdK, d_sdV;
+	glades::gpu::GpuBuffer<float> d_P, d_dP;
+	glades::gpu::GpuBuffer<uint16_t> d_qbf, d_sdbf;
+
+	d_q.allocate(T * m); d_dp.allocate(T * m);
+	d_WqR.allocate(m * dM); d_WkR.allocate(m * dM);
+	d_WvR.allocate(m * dM); d_WoR.allocate(dM * m);
+	d_Wq_bf.allocate(m * dM); d_Wk_bf.allocate(m * dM);
+	d_Wv_bf.allocate(m * dM); d_Wo_bf.allocate(dM * m);
+	d_dq_ref.allocate(T * m);  d_dq_new.allocate(T * m);
+	d_dWq_ref.allocate(m * dM); d_dWq_new.allocate(m * dM);
+	d_dWk_ref.allocate(m * dM); d_dWk_new.allocate(m * dM);
+	d_dWv_ref.allocate(m * dM); d_dWv_new.allocate(m * dM);
+	d_dWo_ref.allocate(dM * m); d_dWo_new.allocate(dM * m);
+	d_sQ.allocate(T * dM); d_sK.allocate(T * dM);
+	d_sV.allocate(T * dM); d_sO.allocate(T * dM);
+	d_sdO.allocate(T * dM); d_sdQ.allocate(T * dM);
+	d_sdK.allocate(T * dM); d_sdV.allocate(T * dM);
+	d_P.allocate((size_t)nH * T * T); d_dP.allocate((size_t)nH * T * T);
+	d_qbf.allocate(T * m); d_sdbf.allocate(T * dM);
+
+	d_q.upload(&q_h[0], q_h.size());   d_dp.upload(&dp_h[0], dp_h.size());
+	d_WqR.upload(&WqR[0], WqR.size()); d_WkR.upload(&WkR[0], WkR.size());
+	d_WvR.upload(&WvR[0], WvR.size()); d_WoR.upload(&WoR[0], WoR.size());
+	d_Wq_bf.upload(&Wq_bf[0], Wq_bf.size()); d_Wk_bf.upload(&Wk_bf[0], Wk_bf.size());
+	d_Wv_bf.upload(&Wv_bf[0], Wv_bf.size()); d_Wo_bf.upload(&Wo_bf[0], Wo_bf.size());
+
+	// Reference path: standard tiled backward with FP32 round-tripped weights.
+	d_dq_ref.zero(); d_dWq_ref.zero(); d_dWk_ref.zero(); d_dWv_ref.zero(); d_dWo_ref.zero();
+	ASSERT("tiled bwd ref",
+	       glades::gpu::chiron_attention_shear_backward_tiled(
+	           d_q.data(), d_dp.data(),
+	           d_WqR.data(), d_WkR.data(), d_WvR.data(), d_WoR.data(),
+	           (int)T, (int)m, (int)nH, (int)dH, causal,
+	           d_dq_ref.data(),
+	           d_dWq_ref.data(), d_dWk_ref.data(), d_dWv_ref.data(), d_dWo_ref.data(),
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+	           d_sdO.data(), d_sdQ.data(), d_sdK.data(), d_sdV.data(),
+	           d_P.data(), d_dP.data()));
+
+	// New path: bf16w backward with BF16 weight pointers direct.
+	d_dq_new.zero(); d_dWq_new.zero(); d_dWk_new.zero(); d_dWv_new.zero(); d_dWo_new.zero();
+	ASSERT("bf16w bwd new",
+	       glades::gpu::chiron_attention_shear_backward_bf16w_tiled(
+	           d_q.data(), d_dp.data(),
+	           d_Wq_bf.data(), d_Wk_bf.data(), d_Wv_bf.data(), d_Wo_bf.data(),
+	           (int)T, (int)m, (int)nH, (int)dH, causal,
+	           d_dq_new.data(),
+	           d_dWq_new.data(), d_dWk_new.data(), d_dWv_new.data(), d_dWo_new.data(),
+	           d_qbf.data(), d_sdbf.data(),
+	           d_sQ.data(), d_sK.data(), d_sV.data(), d_sO.data(),
+	           d_sdO.data(), d_sdQ.data(), d_sdK.data(), d_sdV.data(),
+	           d_P.data(), d_dP.data()));
+
+	std::vector<float> dq_r(T * m),    dq_n(T * m);
+	std::vector<float> dWq_r(m * dM),  dWq_n(m * dM);
+	std::vector<float> dWo_r(dM * m),  dWo_n(dM * m);
+	d_dq_ref.download(&dq_r[0], T * m);    d_dq_new.download(&dq_n[0], T * m);
+	d_dWq_ref.download(&dWq_r[0], m * dM); d_dWq_new.download(&dWq_n[0], m * dM);
+	d_dWo_ref.download(&dWo_r[0], dM * m); d_dWo_new.download(&dWo_n[0], dM * m);
+
+	const float eq  = max_abs_diff(dq_r, dq_n);
+	const float eWq = max_abs_diff(dWq_r, dWq_n);
+	const float eWo = max_abs_diff(dWo_r, dWo_n);
+	std::printf("  bf16w backward vs tiled backward: dq=%.3e dWq=%.3e dWo=%.3e\n",
+	            eq, eWq, eWo);
+
+	char msg[256];
+	std::snprintf(msg, sizeof(msg),
+	              "bf16w backward parity: dq=%.3e dWq=%.3e dWo=%.3e (tol 1e-1)",
+	              eq, eWq, eWo);
+	ASSERT(msg, eq < 1e-1f && eWq < 1e-1f && eWo < 1e-1f);
+
+	#undef CAST_BF16_RNE
+	#undef CAST_BF16_TO_FP32
+#else
+	std::printf("  [bf16w bwd parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -2606,6 +2741,7 @@ void CHIRONUnitTest()
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();
 	CHIRONBf16WeightProjectionParityTest();
+	CHIRONBf16WeightBackwardParityTest();
 	CHIRONShearReversibilityTest();
 	CHIRONReLNRoundtripTest();
 	CHIRONBlockRoundtripTest();

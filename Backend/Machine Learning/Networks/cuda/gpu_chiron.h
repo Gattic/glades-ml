@@ -219,6 +219,27 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
                                           unsigned short* scratch_Vbf16,
                                           unsigned short* scratch_Pbf16);
 
+// BF16-weight backward counterpart.  Takes BF16 weight pointers directly
+// and uses BF16-TC GEMMs throughout the projection, dO, and dq-projection
+// paths.  Weight-grad GEMMs (dWq += q^T · sdQ etc.) stay FP32 — caller may
+// combine with --bf16-grads to accumulate into BF16 storage externally.
+//
+// Extra scratch: scratch_qbf [T, m] (reused for q cast and dp_new cast)
+// and scratch_sdbf [T, dModel] (rotates through sdQ/sdK/sdV BF16 casts).
+bool chiron_attention_shear_backward_bf16w_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead,
+    bool causal,
+    float* dq,
+    float* dWq, float* dWk, float* dWv, float* dWo,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP);
+
 // Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
 // scratch_dP, each [nHeads, T, T], caller-owned.
@@ -406,6 +427,17 @@ inline bool chiron_attention_shear_bf16w_tiled(const float*, float*,
                                                  float*, float*, float*, float*, float*,
                                                  unsigned short*, unsigned short*,
                                                  unsigned short*, unsigned short*) { return false; }
+inline bool chiron_attention_shear_backward_bf16w_tiled(
+    const float*, const float*,
+    const unsigned short*, const unsigned short*,
+    const unsigned short*, const unsigned short*,
+    int, int, int, int, bool,
+    float*,
+    float*, float*, float*, float*,
+    unsigned short*, unsigned short*,
+    float*, float*, float*, float*,
+    float*, float*, float*, float*,
+    float*, float*) { return false; }
 inline bool flash_attention_backward_cublas_tiled(
     const float*, const float*, const float*,
     const float*, const float*,
