@@ -137,6 +137,23 @@ composes into a working token-LM at 26 M scale.  Next step for
 convergence quality: multi-document batching or bigger effective batches
 to reduce the within-batch perplexity variance on Pile-mixed data.
 
+### Int8 Adam state experiment (parked)
+
+Added `adam_update_int8_state` kernel: block-wise int8 quantization of
+the m, v EMAs with one FP32 absmax scale per 256-param block.  Memory
+per param per moment ≈ 1.016 bytes (2× smaller than BF16, 4× smaller
+than FP32) — would let us push past the 1.2 B ceiling to ~2-4 B.
+
+Known limitation (confirmed empirically at 4.6 M params): linear int8
+levels compress most EMA entries to ±1 after ~5 training steps, so
+quantization noise dominates the Adam update.  Divergence at lr ≥ 3e-5
+where FP32 Adam is stable up to lr ≈ 3e-3 on the same config.
+
+Kept as infrastructure.  The fix requires bitsandbytes-style dynamic
+tree quantization (non-uniform int8 levels spaced on a signed base-2
+tree) — deferred to a future iteration.  `adam_update_bf16_state`
+remains the production-grade memory reducer at ~50% savings.
+
 ---
 
 ## 2026-04-21 — Phase 1 complete (CPU math, FP32, full block)
