@@ -3466,6 +3466,56 @@ bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n)
 	return true;
 }
 
+// ===========================================================================
+//  BF16 gradient accumulation: write dst_bf16 = bf16(alpha * src_f32 + fp32(dst_bf16) * beta)
+// ===========================================================================
+// Used for BF16 gradient accumulation across gradient-accumulation micro-steps:
+//   - First micro-step of a window: beta=0, alpha=1 — writes bf16(src)
+//   - Subsequent micro-steps: beta=1, alpha=1 — adds in src to existing bf16 accum
+// The cast back to BF16 uses the same RN-even rule as cast_f32_to_bf16.
+
+namespace {
+
+__global__ void k_bf16_accum_axpy(uint16_t* __restrict__ dst_bf16,
+                                   const float* __restrict__ src_f32,
+                                   float alpha, float beta,
+                                   size_t n)
+{
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+	// Decode existing BF16 accumulator.
+	union { uint32_t u; float f; } uv;
+	uv.u = static_cast<uint32_t>(dst_bf16[idx]) << 16;
+	const float acc = uv.f * beta + alpha * src_f32[idx];
+
+	// Re-encode with round-to-nearest-even.
+	union { float f; uint32_t u; } v;
+	v.f = acc;
+	if (isnan(acc)) {
+		const uint32_t sign = v.u & 0x80000000u;
+		dst_bf16[idx] = static_cast<uint16_t>(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		return;
+	}
+	const uint32_t lsb = (v.u >> 16) & 1u;
+	const uint32_t roundingBias = 0x7FFFu + lsb;
+	dst_bf16[idx] = static_cast<uint16_t>((v.u + roundingBias) >> 16);
+}
+
+} // anonymous namespace
+
+bool bf16_accum_axpy(uint16_t* dst_bf16, const float* src_f32,
+                      float alpha, float beta, size_t n)
+{
+	if (n == 0) return true;
+	const unsigned int TPB = 256u;
+	const size_t blocks = (n + TPB - 1u) / TPB;
+	if (blocks > 0x7FFFFFFFu) return false;
+	k_bf16_accum_axpy<<<static_cast<unsigned int>(blocks), TPB, 0, computeStream()>>>(
+	    dst_bf16, src_f32, alpha, beta, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

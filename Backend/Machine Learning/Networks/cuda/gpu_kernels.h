@@ -361,6 +361,17 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
 bool cast_f32_to_bf16(const float* src, uint16_t* dst, size_t n);
 bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n);
 
+// BF16 gradient accumulation helper.  Computes in FP32:
+//   dst_bf16[i] = bf16( alpha * src_f32[i] + beta * fp32(dst_bf16[i]) )
+// with round-to-nearest-even on the output cast.  Used to accumulate FP32
+// gradient chunks into a BF16 persistent accumulator across gradient-
+// accumulation micro-steps:
+//   - first micro-step of window:  beta=0, alpha=1  (overwrite)
+//   - subsequent micro-steps:      beta=1, alpha=1  (add into accum)
+// Single-pass compute — no intermediate FP32 materialization of dst.
+bool bf16_accum_axpy(uint16_t* dst_bf16, const float* src_f32,
+                      float alpha, float beta, size_t n);
+
 // ---------------------------------------------------------------------------
 // Device memory operations (callable from .cpp files without cuda_runtime.h)
 // ---------------------------------------------------------------------------
@@ -441,6 +452,7 @@ inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
+inline bool bf16_accum_axpy(uint16_t*, const float*, float, float, size_t) { return false; }
 inline bool adam_update_int8_state(float*, const float*, int8_t*, uint8_t*,
                                     float*, float*, float, float, float, float,
                                     float, float, int, int) { return false; }
