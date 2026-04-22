@@ -7,7 +7,9 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
 #include <cstdio>
+#include <cmath>
 
 namespace glades {
 namespace gpu {
@@ -53,6 +55,101 @@ __global__ void k_mpot_reconstruct(const float* __restrict__ A,
 	W_out[(size_t)i * n + j] = sum;
 }
 
+// Permute W[i, j] where i = i_1·m_2 + i_2, j = j_1·n_2 + j_2 into
+// M[p, q] where p = i_1·n_1 + j_1, q = i_2·n_2 + j_2.  Output M is
+// row-major with dims (m_1·n_1, m_2·n_2).  One thread per output cell.
+__global__ void k_mpot_index_permute(const float* __restrict__ W,
+                                     unsigned int m_1, unsigned int m_2,
+                                     unsigned int n_1, unsigned int n_2,
+                                     float* __restrict__ M)
+{
+	const unsigned int P = m_1 * n_1;
+	const unsigned int Q = m_2 * n_2;
+	const unsigned int p = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int q = blockIdx.x * blockDim.x + threadIdx.x;
+	if (p >= P || q >= Q) return;
+
+	const unsigned int i_1 = p / n_1;
+	const unsigned int j_1 = p % n_1;
+	const unsigned int i_2 = q / n_2;
+	const unsigned int j_2 = q % n_2;
+	const unsigned int i = i_1 * m_2 + i_2;
+	const unsigned int j = j_1 * n_2 + j_2;
+	const unsigned int n = n_1 * n_2;
+	M[(size_t)p * Q + q] = W[(size_t)i * n + j];
+}
+
+// Transpose a row-major (rows × cols) matrix to column-major with
+// leading-dim rows (equivalent to a row-major (cols × rows) transpose).
+// Used to hand row-major matrices into cuSOLVER.  Simple non-tiled.
+__global__ void k_mpot_rm_to_cm(const float* __restrict__ X,
+                                unsigned int rows, unsigned int cols,
+                                float* __restrict__ Y_col)
+{
+	const unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= rows || j >= cols) return;
+	// col-major: element (i, j) at offset j * rows + i.
+	Y_col[(size_t)j * rows + i] = X[(size_t)i * cols + j];
+}
+
+// Transpose column-major (rows × cols) to row-major (rows × cols).
+__global__ void k_mpot_cm_to_rm(const float* __restrict__ X_col,
+                                unsigned int rows, unsigned int cols,
+                                float* __restrict__ Y_row)
+{
+	const unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= rows || j >= cols) return;
+	Y_row[(size_t)i * cols + j] = X_col[(size_t)j * rows + i];
+}
+
+// Scatter the first D left singular vectors U_rm [P × D] into A:
+//   A[i_1, j_1, α] = U_rm[i_1·n_1 + j_1, α] · √Σ[α]       for α < D
+// Input U_full_rm is row-major [P × P] (only first D columns used).
+__global__ void k_mpot_scatter_A(const float* __restrict__ U_full_rm,
+                                 unsigned int P_ld,
+                                 const float* __restrict__ Sigma,
+                                 unsigned int m_1, unsigned int n_1,
+                                 unsigned int D,
+                                 float* __restrict__ A)
+{
+	const unsigned int p = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int a = blockIdx.x * blockDim.x + threadIdx.x;
+	const unsigned int P = m_1 * n_1;
+	if (p >= P || a >= D) return;
+	const unsigned int i_1 = p / n_1;
+	const unsigned int j_1 = p % n_1;
+	const float s = Sigma[a];
+	const float sqs = s > 0.0f ? sqrtf(s) : 0.0f;
+	// A[i_1, j_1, α] at row-major offset i_1*n_1*D + j_1*D + α.
+	A[(size_t)i_1 * n_1 * D + (size_t)j_1 * D + a] =
+	    U_full_rm[(size_t)p * P_ld + a] * sqs;
+}
+
+// Scatter the first D right singular vectors V_rm [Q × D] into B:
+//   B[α, i_2, j_2] = √Σ[α] · V_rm[i_2·n_2 + j_2, α]        for α < D
+// Input V_full_rm is row-major [Q × Q] (only first D columns used).
+__global__ void k_mpot_scatter_B(const float* __restrict__ V_full_rm,
+                                 unsigned int Q_ld,
+                                 const float* __restrict__ Sigma,
+                                 unsigned int m_2, unsigned int n_2,
+                                 unsigned int D,
+                                 float* __restrict__ B)
+{
+	const unsigned int q = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int a = blockIdx.x * blockDim.x + threadIdx.x;
+	const unsigned int Q = m_2 * n_2;
+	if (q >= Q || a >= D) return;
+	const unsigned int i_2 = q / n_2;
+	const unsigned int j_2 = q % n_2;
+	const float s = Sigma[a];
+	const float sqs = s > 0.0f ? sqrtf(s) : 0.0f;
+	// B[α, i_2, j_2] at offset α*m_2*n_2 + i_2*n_2 + j_2.
+	B[(size_t)a * m_2 * n_2 + (size_t)i_2 * n_2 + j_2] =
+	    sqs * V_full_rm[(size_t)q * Q_ld + a];
+}
+
 } // anonymous namespace
 
 bool mpot_reconstruct_dense(const float* A, const float* B,
@@ -73,6 +170,158 @@ bool mpot_reconstruct_dense(const float* A, const float* B,
 	k_mpot_reconstruct<<<grid, block, 0, computeStream()>>>(
 	    A, B, m_1, m_2, n_1, n_2, D, W_out);
 	return cudaGetLastError() == cudaSuccess;
+}
+
+// ========================================================================
+// File-local cuSOLVER state for MPOT.  Separate handle from OVFG/Stiefel
+// to avoid workspace contention.
+// ========================================================================
+namespace {
+cusolverDnHandle_t g_mpotSolver = nullptr;
+bool g_mpotSolverReady = false;
+int* g_mpotInfo = nullptr;
+
+bool mpot_solver_init()
+{
+	if (!g_mpotSolverReady)
+	{
+		if (cusolverDnCreate(&g_mpotSolver) != CUSOLVER_STATUS_SUCCESS)
+			return false;
+		g_mpotSolverReady = true;
+	}
+	cusolverDnSetStream(g_mpotSolver, computeStream());
+	if (g_mpotInfo == nullptr)
+	{
+		if (cudaMalloc(&g_mpotInfo, sizeof(int)) != cudaSuccess) return false;
+	}
+	return true;
+}
+} // anonymous namespace
+
+// ========================================================================
+// mpot_init_from_dense — full SVD of the permuted W matrix, truncate to
+// bond D, scatter into (A, B).  See gpu_mpot.h for the math.
+//
+// Scratch layout (floats, caller-owned):
+//   [0 .. P·Q)         M (permuted W, row-major)
+//   [P·Q ..)           M_col (column-major copy for cuSOLVER)
+//   then                U_col (P × P), Sigma (min(P,Q)), VT_col (Q × Q)
+//   then                U_rm (P × P), V_rm (Q × Q) row-major staging
+// where P = m_1·n_1, Q = m_2·n_2.
+//
+// Total: P·Q + P·Q + P·P + min(P,Q) + Q·Q + P·P + Q·Q
+//      = 2 P·Q + 2 P² + 2 Q² + min(P,Q).
+// ========================================================================
+bool mpot_init_from_dense(const float* W,
+                          unsigned int m_1, unsigned int m_2,
+                          unsigned int n_1, unsigned int n_2,
+                          unsigned int D,
+                          float* A, float* B,
+                          float* scratch)
+{
+	if (W == nullptr || A == nullptr || B == nullptr || scratch == nullptr)
+		return false;
+	if (m_1 == 0u || m_2 == 0u || n_1 == 0u || n_2 == 0u || D == 0u) return false;
+
+	const unsigned int P = m_1 * n_1;
+	const unsigned int Q = m_2 * n_2;
+	const unsigned int K = P < Q ? P : Q;
+	if (D > K) return false;
+	if (!mpot_solver_init()) return false;
+
+	// Scratch carve-out.
+	size_t off = 0;
+	float* M       = scratch + off; off += (size_t)P * Q;
+	float* M_col   = scratch + off; off += (size_t)P * Q;
+	float* U_col   = scratch + off; off += (size_t)P * P;
+	float* Sigma   = scratch + off; off += K;
+	float* VT_col  = scratch + off; off += (size_t)Q * Q;
+	float* U_rm    = scratch + off; off += (size_t)P * P;
+	float* V_rm    = scratch + off; off += (size_t)Q * Q;
+	(void)off;
+
+	// (1) Permute W into M.
+	{
+		dim3 block(32, 8);
+		dim3 grid((Q + block.x - 1u) / block.x,
+		          (P + block.y - 1u) / block.y);
+		k_mpot_index_permute<<<grid, block, 0, computeStream()>>>(
+		    W, m_1, m_2, n_1, n_2, M);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (2) M (row-major P × Q) → M_col (column-major P × Q).
+	{
+		dim3 block(32, 8);
+		dim3 grid((Q + block.x - 1u) / block.x,
+		          (P + block.y - 1u) / block.y);
+		k_mpot_rm_to_cm<<<grid, block, 0, computeStream()>>>(
+		    M, P, Q, M_col);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (3) Full SVD (jobu='A', jobvt='A').
+	int lwork = 0;
+	if (cusolverDnSgesvd_bufferSize(g_mpotSolver, P, Q, &lwork)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	static thread_local float* svd_work = nullptr;
+	static thread_local size_t svd_work_cap = 0;
+	if (static_cast<size_t>(lwork) > svd_work_cap)
+	{
+		if (svd_work) cudaFree(svd_work);
+		if (cudaMalloc(&svd_work, lwork * sizeof(float)) != cudaSuccess)
+			return false;
+		svd_work_cap = lwork;
+	}
+
+	cusolverStatus_t st = cusolverDnSgesvd(
+	    g_mpotSolver, 'A', 'A', P, Q, M_col, P,
+	    Sigma, U_col, P, VT_col, Q,
+	    svd_work, lwork, nullptr, g_mpotInfo);
+	if (st != CUSOLVER_STATUS_SUCCESS) return false;
+	int host_info = 0;
+	cudaMemcpyAsync(&host_info, g_mpotInfo, sizeof(int),
+	                cudaMemcpyDeviceToHost, computeStream());
+	cudaStreamSynchronize(computeStream());
+	if (host_info != 0) return false;
+
+	// (4) Transpose U_col (col-major P × P) to U_rm (row-major P × P).
+	{
+		dim3 block(32, 8);
+		dim3 grid((P + block.x - 1u) / block.x,
+		          (P + block.y - 1u) / block.y);
+		k_mpot_cm_to_rm<<<grid, block, 0, computeStream()>>>(
+		    U_col, P, P, U_rm);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// cuSOLVER's VT_col is V^T in column-major layout: raw element at
+	// offset (j*Q + i) holds V^T[i, j] = V[j, i].  Reinterpreted as
+	// row-major, raw at (i*Q + j) = VT_col raw[i*Q + j] = V[i, j].
+	// So VT_col reinterpreted as row-major IS V row-major — a plain
+	// byte copy into V_rm suffices.
+	cudaMemcpyAsync(V_rm, VT_col, (size_t)Q * Q * sizeof(float),
+	                cudaMemcpyDeviceToDevice, computeStream());
+
+	// (5) Scatter into A and B.
+	{
+		dim3 block(32, 8);
+		dim3 grid((D + block.x - 1u) / block.x,
+		          (P + block.y - 1u) / block.y);
+		k_mpot_scatter_A<<<grid, block, 0, computeStream()>>>(
+		    U_rm, P, Sigma, m_1, n_1, D, A);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	{
+		dim3 block(32, 8);
+		dim3 grid((D + block.x - 1u) / block.x,
+		          (Q + block.y - 1u) / block.y);
+		k_mpot_scatter_B<<<grid, block, 0, computeStream()>>>(
+		    V_rm, Q, Sigma, m_2, n_2, D, B);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	return true;
 }
 
 } // namespace gpu
