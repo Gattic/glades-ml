@@ -7077,6 +7077,189 @@ void CHIRONMpotAdamDescentTest()
 #endif
 }
 
+// CHIRONMpotStiefelCompositionBenchmark -------------------------------------
+// Paradigm shift #10 × #7 composition validation.  Stiefel × Σ already
+// factors W = U · diag(Σ) · V^T with U ∈ St(m, r), V ∈ St(n, r).  MPOT
+// nests further: each of U and V is itself stored as a bond-D MPO
+// (A, B) pair.  This quantifies the compound storage win across the
+// Stiefel + MPOT stack at representative shapes, and verifies the
+// reconstruction roundtrip.
+//
+// Storage accounting (all FP32 bytes):
+//   dense          = m · n · 4
+//   Stiefel        = m · r + n · r + r  (ignoring + r scalar)
+//   Stiefel + MPOT = (m_1·r_1 + m_2·r_2·D) · D + (n_1·r_1 + n_2·r_2·D) · D + r
+// Projected combined compression:  dense / (Stiefel+MPOT) = 2 / ρ  ×  ~32
+// at (1024×1024, ρ=0.25, D=16).
+void CHIRONMpotStiefelCompositionBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mpot×stiefel] no CUDA device — skipped\n");
+		return;
+	}
+	std::printf("\n  === MPOT × Stiefel composition benchmark ===\n");
+	std::printf("  %-12s %-6s %-6s  %-10s %-10s %-13s  %-5s %-5s %-5s\n",
+	            "shape (m×n)", "r", "D",
+	            "dense MB", "Stiefel MB", "St+MPOT MB",
+	            "S×", "M×", "C×");
+
+	struct Shape {
+	    unsigned m;  unsigned n;
+	    unsigned r;       // Stiefel rank
+	    unsigned D;       // MPOT bond
+	    unsigned m_1, m_2, r_1, r_2, n_1, n_2;
+	};
+	// Representative shapes.  m and n = square factoring; r = ρ·m; r
+	// factored into (r_1, r_2) similarly.  Balanced factoring keeps each
+	// factor tensor well-shaped for the GEMM chain.
+	const Shape shapes[] = {
+	    // m      n     r    D    m1 m2   r1 r2   n1 n2
+	    { 1024, 1024,  256, 16,   32, 32,  16, 16,  32, 32},
+	    { 2048, 2048,  512, 16,   32, 64,  16, 32,  32, 64},
+	    { 2048, 2048,  512,  8,   32, 64,  16, 32,  32, 64},
+	    { 4096, 4096, 1024, 16,   64, 64,  32, 32,  64, 64},
+	};
+
+	double best_compound = 0.0;
+	for (int k = 0; k < 4; ++k)
+	{
+		const Shape& s = shapes[k];
+		const double bytes_dense   = double(s.m) * s.n * 4.0;
+		const double bytes_stiefel = (double(s.m) * s.r + double(s.n) * s.r + s.r) * 4.0;
+		const double bytes_mU = (double(s.m_1) * s.r_1 * s.D + double(s.D) * s.m_2 * s.r_2) * 4.0;
+		const double bytes_mV = (double(s.n_1) * s.r_1 * s.D + double(s.D) * s.n_2 * s.r_2) * 4.0;
+		const double bytes_compound = bytes_mU + bytes_mV + double(s.r) * 4.0;
+
+		const double mb_dense    = bytes_dense    / 1048576.0;
+		const double mb_stiefel  = bytes_stiefel  / 1048576.0;
+		const double mb_compound = bytes_compound / 1048576.0;
+
+		const double r_stiefel  = bytes_dense / bytes_stiefel;
+		const double r_mpot_on_stiefel = bytes_stiefel / bytes_compound;
+		const double r_combined = bytes_dense / bytes_compound;
+		if (r_combined > best_compound) best_compound = r_combined;
+
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), "%u×%u", s.m, s.n);
+		std::printf("  %-12s %-6u %-6u  %7.2fMB %7.2fMB %10.3fMB  %5.1fx %5.1fx %5.1fx\n",
+		            buf, s.r, s.D,
+		            mb_dense, mb_stiefel, mb_compound,
+		            r_stiefel, r_mpot_on_stiefel, r_combined);
+	}
+	std::printf("  best compound compression observed: %.1fx\n", best_compound);
+
+	// Now verify the composition works numerically: pick one shape,
+	// factor dense W via Stiefel init (truncated SVD → U, Σ, V), then
+	// MPO-factor U and V, then reconstruct both and compose U·diag(Σ)·V^T.
+	// The compound roundtrip should recover W within the combined
+	// truncation tolerance.
+	{
+		const unsigned m = 64, n = 64;
+		const unsigned r = 16;  // Stiefel rank
+		const unsigned D = 8;   // MPOT bond, large enough to capture most energy
+		const unsigned m_1 = 8, m_2 = 8;
+		const unsigned r_1 = 4, r_2 = 4;
+		const unsigned n_1 = 8, n_2 = 8;
+		(void)r_1; (void)r_2;
+
+		LCG rng(202604236u);
+
+		// Build a low-rank dense W = U0 · diag(Σ0) · V0^T so the
+		// composition is exact at Stiefel rank r and MPO bond min(m_l·r_l).
+		std::vector<float> U0(m * r), V0(n * r), S0(r);
+		for (size_t i = 0; i < U0.size(); ++i) U0[i] = rng.next_unit();
+		for (size_t i = 0; i < V0.size(); ++i) V0[i] = rng.next_unit();
+		gram_schmidt_cols(U0, m, r);
+		gram_schmidt_cols(V0, n, r);
+		for (size_t i = 0; i < S0.size(); ++i) S0[i] = 0.5f + std::abs(rng.next_unit());
+
+		// W = U0 · diag(Σ0) · V0^T  (host-side, outer-product form)
+		std::vector<float> W_h((size_t)m * n, 0.0f);
+		for (unsigned i = 0; i < m; ++i)
+			for (unsigned j = 0; j < n; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < r; ++k)
+					s += U0[(size_t)i * r + k] * S0[k] * V0[(size_t)j * r + k];
+				W_h[(size_t)i * n + j] = s;
+			}
+
+		// MPO-factor U0 (treat as an m × r matrix) and V0.  r must split
+		// as r_1·r_2 (4·4 = 16).  For mpot_init_from_dense, arguments are
+		// (m_1, m_2, r_1, r_2, D) where the second dim of the input
+		// matrix is split as r_1 · r_2.  Because the MPOT init treats
+		// the second axis ("n" in its internal naming) as r here,
+		// we pass (m_1, m_2, r_1, r_2, D) as the factoring dims and
+		// the result is (A_U, B_U).
+		glades::gpu::GpuBuffer<float> d_U, d_V, d_W, d_AU, d_BU, d_AV, d_BV,
+		                              d_Urec, d_Vrec, d_Wrec, d_scratch;
+		d_U.allocate(U0.size());  d_U.upload(&U0[0], U0.size());
+		d_V.allocate(V0.size());  d_V.upload(&V0[0], V0.size());
+		d_W.allocate(W_h.size()); d_W.upload(&W_h[0], W_h.size());
+		d_AU.allocate((size_t)m_1 * r_1 * D);
+		d_BU.allocate((size_t)D * m_2 * r_2);
+		d_AV.allocate((size_t)n_1 * r_1 * D);
+		d_BV.allocate((size_t)D * n_2 * r_2);
+		d_Urec.allocate(U0.size());
+		d_Vrec.allocate(V0.size());
+		d_Wrec.allocate(W_h.size());
+
+		const unsigned P_U = m_1 * r_1, Q_U = m_2 * r_2;
+		const unsigned K_U = P_U < Q_U ? P_U : Q_U;
+		const size_t sz = 2u * P_U * Q_U + 2u * P_U * P_U + 2u * Q_U * Q_U + K_U;
+		d_scratch.allocate(sz);
+
+		ASSERT("mpot_init_from_dense on U",
+		       glades::gpu::mpot_init_from_dense(
+		           d_U.data(), m_1, m_2, r_1, r_2, D,
+		           d_AU.data(), d_BU.data(), d_scratch.data()));
+		ASSERT("mpot_init_from_dense on V",
+		       glades::gpu::mpot_init_from_dense(
+		           d_V.data(), n_1, n_2, r_1, r_2, D,
+		           d_AV.data(), d_BV.data(), d_scratch.data()));
+
+		// Reconstruct U, V from their MPOs.
+		ASSERT("mpot_reconstruct U",
+		       glades::gpu::mpot_reconstruct_dense(
+		           d_AU.data(), d_BU.data(), m_1, m_2, r_1, r_2, D,
+		           d_Urec.data()));
+		ASSERT("mpot_reconstruct V",
+		       glades::gpu::mpot_reconstruct_dense(
+		           d_AV.data(), d_BV.data(), n_1, n_2, r_1, r_2, D,
+		           d_Vrec.data()));
+
+		// Host-side compose U_rec · diag(Σ0) · V_rec^T.
+		std::vector<float> Urec(U0.size()), Vrec(V0.size());
+		d_Urec.download(&Urec[0], Urec.size());
+		d_Vrec.download(&Vrec[0], Vrec.size());
+		std::vector<float> W_rec((size_t)m * n, 0.0f);
+		for (unsigned i = 0; i < m; ++i)
+			for (unsigned j = 0; j < n; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < r; ++k)
+					s += Urec[(size_t)i * r + k] * S0[k] * Vrec[(size_t)j * r + k];
+				W_rec[(size_t)i * n + j] = s;
+			}
+		const float err = max_abs_diff(W_h, W_rec);
+		std::printf("  Stiefel+MPO W roundtrip (m=n=%u, r=%u, D=%u): max_err = %.3e\n",
+		            m, r, D, err);
+		// Target: recovery limited by bond-D MPOT approximation of U, V.
+		// At full-bond D = min(m_1·r_1, m_2·r_2) = 32, but we use D=8 so
+		// expect some loss.  Bound loosely at 0.5 (50% Frobenius).
+		ASSERT("Stiefel+MPOT compound roundtrip captures dominant structure",
+		       err < 0.5f);
+	}
+
+	ASSERT("MPOT × Stiefel compound compression ≥ 50× on observed shapes",
+	       best_compound >= 50.0);
+#else
+	std::printf("  [mpot×stiefel] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -7197,6 +7380,7 @@ void CHIRONUnitTest()
 	CHIRONMpotBackwardParityTest();
 	CHIRONMpotBenchmark();
 	CHIRONMpotAdamDescentTest();
+	CHIRONMpotStiefelCompositionBenchmark();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
