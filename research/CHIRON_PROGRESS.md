@@ -14,7 +14,7 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
-### The five paradigm shifts, stacked on CHIRON
+### The seven paradigm shifts, stacked on CHIRON
 
 | # | Shift | Axis | Delivered | Evidence |
 |---|-------|------|-----------|----------|
@@ -23,6 +23,8 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 | 3 | **Int8 Adam state** (asym: signed m, unsigned v, per-block scale) | optimizer memory | 4× smaller than FP32 Adam | `CHIRONStochasticBf16RoundingTest` + end-to-end training stable at lr=3e-3 |
 | 4 | **BF16 gradient accumulation** (`bf16_accum_axpy`) | gradient memory | 2× smaller than FP32 grads | parity verified at 1e-5 vs FP32 grad path |
 | 5 | **Stochastic-rounded BF16 weights** | weight memory | 2× smaller than FP32 weights; Adam updates unbiased in expectation | `CHIRONStochasticBf16RoundingTest`: 50.05% up/49.95% down at halfway; 1.00× expected on sub-ULP accumulation |
+| 6 | **Local-window attention** (sub-quadratic BF16 shear) | attention compute | O(T²) → O(T·W); 42× @ T=16384,W=256 | `CHIRONLocalAttentionFullWindowParityTest` + trainer `--local-attn` (shipped) |
+| 7 | **Stiefel × Σ weight factorization (IN PROGRESS)** | weights + Adam state + forward compute | 2.67× — 10.66× weight VRAM compression at ρ=0.25 — 0.0625; 1.75× — 4.14× forward-GEMM speedup; proven convergence at d=1024 | full Phase 2 unit test suite (9 tests); trainer `--stiefel-preview` / `--stiefel-ratio` hooks landed (compute wire-in pending) |
 | +  | **Flash attention** (non-materialized softmax) | long-context memory | eliminates O(nH·T²) scratch; unlocks T=16384 where tiled OOMs | `CHIRONFlashShear{,Backward}Bf16ParityTest` both max_err ≈ 1e-5 |
 
 ### Training-scale ceilings on a single 16 GB consumer GPU (RTX 4080 SUPER)
@@ -191,6 +193,33 @@ the benchmark now gives us a **concrete 8× headroom** to close.
 Decision: Cayley retraction (Phase 2d) is promoted to critical-path
 status — without it, the QR per-step cost would make Stiefel unviable
 for real training even with BF16-direct GEMMs.
+
+### Phase 2h — trainer hooks landed (glades-trainer `356edcf`)
+
+The CHIRON trainer (`glades_chiron_train`) now accepts two Stiefel flags:
+
+- `--stiefel-preview`: computes projected VRAM savings at ρ ∈ {1, 0.5, 0.25,
+  0.125, 0.0625, 0.03125} for the configured model dims and exits without
+  GPU init.  Fast planning tool — answers "how much VRAM would I save if
+  I Stiefel-factored the attention weights at ratio ρ?".
+- `--stiefel-ratio RHO`: landing-pad flag for the full wire-in.  Currently
+  parses + prints a warning; training path is still dense.
+
+Example output at the current 2.23B ceiling config (m=2368, L=48):
+
+| ρ      | r    | Attention weight VRAM | Compression |
+|--------|-----:|----------------------:|------------:|
+| dense  |    — |              4.011 GB |       1.00× |
+| 0.50   | 1184 |              3.009 GB |       1.33× |
+| **0.25** | **592** |        **1.504 GB** |   **2.67×** |
+| **0.125** | **296** |      **0.752 GB** |   **5.33×** |
+| 0.0625 |  148 |              0.376 GB |      10.66× |
+| 0.03125|   74 |              0.188 GB |      21.33× |
+
+At ρ=0.125 the saved weight VRAM alone is ~3.3 GB, and Adam state shrinks
+by the same ratio when the Stiefel optimizer replaces dense Adam — so
+roughly 6-7 GB freed total.  On a 16 GB card this projects **~4-5 B
+parameter training ceiling** once the compute path lands.
 
 ### Phase 2d — Cayley retraction SHIPPED
 
