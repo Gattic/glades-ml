@@ -5967,6 +5967,150 @@ void CHIRONOvfgStiefelAdamDescentTest()
 #endif
 }
 
+// CHIRONChunkedCrossEntropyBackwardParityTest -------------------------------
+// Validates chunked_cross_entropy_backward.  The reference path:
+//   (1) dense logits = X · W_lm^T   (T × V)
+//   (2) softmax_fwd(logits) → probs (T × V)
+//   (3) dL/dlogits[t, v] = (probs[t, v] − (v == target[t] ? 1 : 0)) / N_valid
+//       with invalid rows zeroed.
+//   (4) dX_ref    = dL/dlogits · W_lm           (T × d)
+//   (5) dW_lm_ref = dL/dlogits^T · X            (V × d)
+// is compared to the streaming chunked path that never materializes
+// (T × V) tensors.
+void CHIRONChunkedCrossEntropyBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [chunked-CE bwd] no CUDA device — skipped\n");
+		return;
+	}
+	const int T = 37;
+	const int d = 64;
+	const int V = 1024;
+	const int padToken = -1;
+
+	LCG rng(202604230u);
+	std::vector<float> X_h(T * d), W_h(V * d);
+	for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.15f * rng.next_unit();
+	for (size_t i = 0; i < W_h.size(); ++i) W_h[i] = 0.15f * rng.next_unit();
+	std::vector<int> tgt_h(T);
+	for (int t = 0; t < T; ++t)
+	{
+		const unsigned int u = ((unsigned int)rng.next_unit() * 0x7fffffffu) & 0x7fffffffu;
+		tgt_h[t] = (int)(u % V);
+	}
+
+	glades::gpu::GpuBuffer<float> d_X, d_W, d_logits, d_probs, d_dlogits,
+	                              d_dX_ref, d_dW_ref, d_dX_ch, d_dW_ch,
+	                              d_scratch_fwd, d_scratch_bwd, d_loss, d_rmax_buf;
+	glades::gpu::GpuBuffer<int>   d_targets, d_cnt;
+	d_X.allocate(T * d);       d_X.upload(&X_h[0], X_h.size());
+	d_W.allocate(V * d);       d_W.upload(&W_h[0], W_h.size());
+	d_targets.allocate(T);     d_targets.upload(&tgt_h[0], tgt_h.size());
+	d_logits.allocate(T * V);
+	d_probs.allocate(T * V);
+	d_dlogits.allocate(T * V);
+	d_dX_ref.allocate(T * d);
+	d_dW_ref.allocate(V * d);
+	d_dX_ch.allocate(T * d);
+	d_dW_ch.allocate(V * d);
+	d_loss.allocate(1);
+	d_cnt.allocate(1);
+
+	const int V_chunk = 128;   // multi-chunk, well below V=1024
+	d_scratch_fwd.allocate(T * (V_chunk + 3));
+	d_scratch_bwd.allocate(T * V_chunk);
+
+	// --- Reference backward path (dense) ---
+	ASSERT("dense logits GEMM for bwd ref",
+	       glades::gpu::sgemm_rowmajor_abt(T, V, d, 1.0f,
+	                                       d_X.data(), d,
+	                                       d_W.data(), d,
+	                                       0.0f,
+	                                       d_logits.data(), V));
+	ASSERT("softmax_forward for bwd ref",
+	       glades::gpu::softmax_forward(d_logits.data(), T, V, d_probs.data()));
+	// Host-side: dlogits = (probs − onehot) / N_valid, invalid rows zero.
+	std::vector<float> probs_h(T * V), dlogits_h(T * V, 0.0f);
+	d_probs.download(&probs_h[0], probs_h.size());
+	int N_valid_h = 0;
+	for (int t = 0; t < T; ++t)
+	{
+		const int tgt = tgt_h[t];
+		if (tgt < 0 || tgt >= V) continue;
+		if (padToken >= 0 && tgt == padToken) continue;
+		++N_valid_h;
+	}
+	ASSERT("dense path produces some valid tokens", N_valid_h > 0);
+	const float inv_valid_h = 1.0f / (float)N_valid_h;
+	for (int t = 0; t < T; ++t)
+	{
+		const int tgt = tgt_h[t];
+		if (tgt < 0 || tgt >= V) continue;
+		if (padToken >= 0 && tgt == padToken) continue;
+		for (int v = 0; v < V; ++v)
+		{
+			const float o = (v == tgt) ? 1.0f : 0.0f;
+			dlogits_h[t * V + v] = inv_valid_h * (probs_h[t * V + v] - o);
+		}
+	}
+	d_dlogits.upload(&dlogits_h[0], dlogits_h.size());
+	// dX_ref = dlogits · W   (T × V) · (V × d) → (T × d)
+	ASSERT("dense dX GEMM for ref",
+	       glades::gpu::sgemm_rowmajor(T, d, V, 1.0f,
+	                                   d_dlogits.data(), V,
+	                                   d_W.data(), d,
+	                                   0.0f,
+	                                   d_dX_ref.data(), d));
+	// dW_ref = dlogits^T · X  (V × T) · (T × d) → (V × d), via atb.
+	ASSERT("dense dW GEMM for ref",
+	       glades::gpu::sgemm_rowmajor_atb(V, d, T, 1.0f,
+	                                       d_dlogits.data(), V,
+	                                       d_X.data(), d,
+	                                       0.0f,
+	                                       d_dW_ref.data(), d));
+
+	// --- Chunked backward path ---
+	// First run the forward to populate running_max, running_sum.
+	ASSERT("chunked forward for bwd",
+	       glades::gpu::chunked_cross_entropy_loss(
+	           d_X.data(), d_W.data(), d_targets.data(),
+	           T, V, d, padToken, V_chunk,
+	           d_loss.data(), d_cnt.data(),
+	           d_scratch_fwd.data()));
+	int cnt_gpu = 0;
+	d_cnt.download(&cnt_gpu, 1);
+	ASSERT("chunked forward valid count matches host", cnt_gpu == N_valid_h);
+
+	const float* running_max = d_scratch_fwd.data() + (size_t)T * V_chunk;
+	const float* running_sum = running_max + T;
+
+	ASSERT("chunked_cross_entropy_backward runs",
+	       glades::gpu::chunked_cross_entropy_backward(
+	           d_X.data(), d_W.data(), d_targets.data(),
+	           running_max, running_sum,
+	           T, V, d, padToken, V_chunk, cnt_gpu,
+	           /*accumulate=*/false,
+	           d_dX_ch.data(), d_dW_ch.data(),
+	           d_scratch_bwd.data()));
+
+	std::vector<float> dX_ref(T * d), dW_ref(V * d), dX_ch(T * d), dW_ch(V * d);
+	d_dX_ref.download(&dX_ref[0], dX_ref.size());
+	d_dW_ref.download(&dW_ref[0], dW_ref.size());
+	d_dX_ch.download(&dX_ch[0], dX_ch.size());
+	d_dW_ch.download(&dW_ch[0], dW_ch.size());
+	const float err_dX = max_abs_diff(dX_ref, dX_ch);
+	const float err_dW = max_abs_diff(dW_ref, dW_ch);
+	std::printf("  chunked-CE bwd: dX max_err=%.3e   dW max_err=%.3e\n",
+	            err_dX, err_dW);
+	ASSERT("chunked dX matches dense dX within tolerance", err_dX < 1e-4f);
+	ASSERT("chunked dW matches dense dW within tolerance", err_dW < 1e-4f);
+#else
+	std::printf("  [chunked-CE bwd] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -6079,6 +6223,7 @@ void CHIRONUnitTest()
 	CHIRONOvfgTruncateBenchmark();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
+	CHIRONChunkedCrossEntropyBackwardParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();

@@ -382,6 +382,46 @@ bool chunked_cross_entropy_loss(const float* X, const float* W_lm,
                                 float* loss_sum, int* valid_count,
                                 float* scratch);
 
+// Chunked cross-entropy BACKWARD — produces dL/dX [T × d] and dL/dW_lm
+// [V × d] given the forward's running_max, running_sum (carried over in
+// the forward scratch — DO NOT clobber those between forward and
+// backward).
+//
+// For each (valid) token t with target[t] = τ, the softmax-CE gradient
+// at column v is
+//     dL/dlogits[t, v] = softmax(logits[t])[v] - (v == τ ? 1 : 0)
+// scaled by (1 / valid_count) for token-averaged loss.  Invalid rows
+// (pad, out-of-range target, or target not captured by forward) emit
+// zero gradient.
+//
+// Chunked backward path (mirrors the forward structure):
+//   for cs, ce = 0, V_chunk; cs < V; cs += V_chunk:
+//     recompute logits_chunk  = X · W_lm[cs:ce, :]^T       (same GEMM)
+//     kernel: softmax_chunk[t, v] = exp(logits[t, v] - running_max[t])
+//                                   / running_sum[t]
+//                                 - (cs + v == target[t] ? 1 : 0)
+//             (scaled by 1/valid_count, masked to 0 on invalid rows)
+//     dX    += softmax_chunk · W_lm[cs:ce, :]              (T × d)
+//     dW_lm_chunk += softmax_chunk^T · X                   (V_ch × d)
+//
+// Memory: same scratch as forward (T × (V_chunk + 3) floats, of which
+// only T × V_chunk is used here since running_max/running_sum/
+// target_logit are supplied by the forward).  dX and dW_lm MUST be
+// pre-zeroed (or caller must set accumulate=false).
+//
+// accumulate=false:  dX and dW_lm are overwritten (zeroed first).
+// accumulate=true:   dX and dW_lm are added into (caller pre-seeds).
+bool chunked_cross_entropy_backward(const float* X, const float* W_lm,
+                                    const int* targets,
+                                    const float* running_max,
+                                    const float* running_sum,
+                                    int T, int V, int d, int padToken,
+                                    int V_chunk_size,
+                                    int valid_count,
+                                    bool accumulate,
+                                    float* dX, float* dW_lm,
+                                    float* scratch);
+
 // ---------------------------------------------------------------------------
 // Batch zero: zero multiple GPU buffers with a single kernel launch
 // ---------------------------------------------------------------------------
@@ -524,6 +564,10 @@ inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, 
 inline bool chunked_cross_entropy_loss(const float*, const float*, const int*,
                                        int, int, int, int, int,
                                        float*, int*, float*) { return false; }
+inline bool chunked_cross_entropy_backward(const float*, const float*, const int*,
+                                           const float*, const float*,
+                                           int, int, int, int, int, int, bool,
+                                           float*, float*, float*) { return false; }
 
 inline bool kv_attention_incremental(const float*, const float*, const float*, float*, const unsigned char*, int, int, int, int, int, int, float, float*) { return false; }
 

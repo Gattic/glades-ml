@@ -2139,6 +2139,156 @@ __global__ void k_cce_finalize(const float* __restrict__ running_max,
 
 } // anonymous namespace
 
+namespace {
+
+// Per-chunk softmax + (−onehot) fused kernel for the CE backward.  Replaces
+// logits_chunk in place with dL/dlogits_chunk:
+//     dL/dlogits[t, v] = inv_valid ·
+//                        ( exp(logits[t, v] - running_max[t]) / running_sum[t]
+//                        − (cs + v == target[t] ? 1 : 0) )
+//
+// Invalid rows (pad, OOR target, NaN target_logit) emit zero gradient
+// across the whole chunk.  One block per row, threads tile the V axis.
+__global__ void k_cce_softmax_minus_onehot_scaled(
+    float* __restrict__ logits_chunk_inout,
+    const int* __restrict__ targets,
+    const float* __restrict__ running_max,
+    const float* __restrict__ running_sum,
+    int T, int V_ch, int chunk_start, int padToken,
+    float inv_valid)
+{
+    const int t = blockIdx.x;
+    if (t >= T) return;
+    const int tid = threadIdx.x;
+
+    const int tgt = targets[t];
+    const bool valid_row = !(padToken >= 0 && tgt == padToken) &&
+                           (tgt >= 0);
+    // Note: even if tgt >= V, we still correctly zero the gradient here
+    // because no column v in any chunk matches, and the onehot term never
+    // fires.  But we still scale softmax by inv_valid, so we'd spread
+    // non-zero grad onto what should be invalid.  For safety, mask hard.
+
+    const float rmax  = running_max[t];
+    const float rsum  = running_sum[t];
+    const bool sum_ok = isfinite(rmax) && rsum > 0.0f;
+
+    float* row = logits_chunk_inout + (size_t)t * V_ch;
+    for (int v = tid; v < V_ch; v += blockDim.x)
+    {
+        float g;
+        if (!valid_row || !sum_ok)
+        {
+            g = 0.0f;
+        }
+        else
+        {
+            const float p    = expf(row[v] - rmax) / rsum;
+            const int   vidx = chunk_start + v;
+            const float o    = (vidx == tgt) ? 1.0f : 0.0f;
+            g = inv_valid * (p - o);
+        }
+        row[v] = g;
+    }
+}
+
+} // anonymous namespace
+
+bool chunked_cross_entropy_backward(const float* X, const float* W_lm,
+                                    const int* targets,
+                                    const float* running_max,
+                                    const float* running_sum,
+                                    int T, int V, int d, int padToken,
+                                    int V_chunk_size,
+                                    int valid_count,
+                                    bool accumulate,
+                                    float* dX, float* dW_lm,
+                                    float* scratch)
+{
+    if (X == nullptr || W_lm == nullptr || targets == nullptr) return false;
+    if (running_max == nullptr || running_sum == nullptr) return false;
+    if (dX == nullptr || dW_lm == nullptr || scratch == nullptr) return false;
+    if (T <= 0 || V <= 0 || d <= 0 || V_chunk_size <= 0) return false;
+
+    // If there are no valid targets, gradients are zero — just honor
+    // accumulate semantics and return.
+    if (valid_count <= 0)
+    {
+        if (!accumulate)
+        {
+            GLADES_CUDA_CHECK(cudaMemsetAsync(dX,    0, (size_t)T * d * sizeof(float),
+                                              computeStream()));
+            GLADES_CUDA_CHECK(cudaMemsetAsync(dW_lm, 0, (size_t)V * d * sizeof(float),
+                                              computeStream()));
+        }
+        return true;
+    }
+
+    const float inv_valid = 1.0f / (float)valid_count;
+    float* logits_chunk = scratch;   // [T × V_chunk_size]
+
+    // Initialize dX, dW_lm if not accumulating.
+    if (!accumulate)
+    {
+        GLADES_CUDA_CHECK(cudaMemsetAsync(dX,    0, (size_t)T * d * sizeof(float),
+                                          computeStream()));
+        GLADES_CUDA_CHECK(cudaMemsetAsync(dW_lm, 0, (size_t)V * d * sizeof(float),
+                                          computeStream()));
+    }
+
+    for (int cs = 0; cs < V; cs += V_chunk_size)
+    {
+        const int ce   = (cs + V_chunk_size < V) ? (cs + V_chunk_size) : V;
+        const int V_ch = ce - cs;
+
+        // (1) Re-compute logits_chunk [T × V_ch] = X · W_lm[cs:ce, :]^T.
+        if (!sgemm_rowmajor_abt(T, V_ch, d,
+                                1.0f,
+                                X,                           d,
+                                W_lm + (size_t)cs * d,       d,
+                                0.0f,
+                                logits_chunk,                V_ch))
+            return false;
+
+        // (2) In-place: logits_chunk → dL/dlogits_chunk (scaled).
+        {
+            const int block = 128;
+            k_cce_softmax_minus_onehot_scaled<<<T, block, 0, computeStream()>>>(
+                logits_chunk, targets, running_max, running_sum,
+                T, V_ch, cs, padToken, inv_valid);
+            GLADES_CUDA_CHECK(cudaGetLastError());
+        }
+
+        // (3) dX += dL/dlogits_chunk · W_lm_chunk.
+        //     sgemm_rowmajor: C[M,N] = A[M,K] · B[K,N].
+        //     A = dL/dlogits_chunk [T, V_ch], B = W_lm[cs:ce, :] [V_ch, d],
+        //     result dX [T, d].  beta=1 accumulates across chunks.
+        if (!sgemm_rowmajor(T, d, V_ch,
+                            1.0f,
+                            logits_chunk,                V_ch,
+                            W_lm + (size_t)cs * d,       d,
+                            1.0f,
+                            dX,                          d))
+            return false;
+
+        // (4) dW_lm[cs:ce, :] += dL/dlogits_chunk^T · X.
+        //     sgemm_rowmajor_atb: C[M,N] = A^T[M,K] · B[K,N], A stored [K,M].
+        //     A = dL/dlogits_chunk [T, V_ch] (K=T, M=V_ch),
+        //     B = X [T, d], result dW_lm_chunk [V_ch, d].
+        //     beta=1 accumulates if caller chose accumulate=true; our
+        //     cudaMemsetAsync already zeroed the chunk when !accumulate.
+        if (!sgemm_rowmajor_atb(V_ch, d, T,
+                                1.0f,
+                                logits_chunk,                V_ch,
+                                X,                           d,
+                                1.0f,
+                                dW_lm + (size_t)cs * d,      d))
+            return false;
+    }
+
+    return true;
+}
+
 bool chunked_cross_entropy_loss(const float* X, const float* W_lm,
                                 const int* targets,
                                 int T, int V, int d, int padToken,
