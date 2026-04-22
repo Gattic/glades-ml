@@ -9420,6 +9420,7 @@ void CHIRONUnitTest()
 	CHIRONTrcdLambdaPiControllerTest();
 	CHIRONTrcdApplyGateConvexParityTest();
 	CHIRONLcpGatherScatterRoundtripTest();
+	CHIRONLcpDeltaParityTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
@@ -11907,6 +11908,122 @@ void CHIRONLcpGatherScatterRoundtripTest()
 	ASSERT("LSH projection is deterministic", deterministic);
 #else
 	std::printf("  [lcp gather-scatter] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONLcpDeltaParityTest --------------------------------------------------
+// Paradigm shift #16 Phase 2: validate delta = h - h_rep[cluster] forward
+// + backward.  Key invariant: representative tokens have delta=0.
+void CHIRONLcpDeltaParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [lcp delta] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 64;
+	const unsigned int d = 48;
+	const unsigned int n_reps = 8;
+	LCG rng(202604229u);
+
+	std::vector<float> h_host((size_t)T * d), reps_host((size_t)n_reps * d);
+	std::vector<unsigned int> cluster_host(T);
+	for (size_t i = 0; i < h_host.size(); ++i)   h_host[i]    = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < reps_host.size(); ++i) reps_host[i] = 0.3f * rng.next_unit();
+	// Random cluster assignment ∈ [0, n_reps).
+	for (unsigned int t = 0; t < T; ++t) {
+		unsigned int c = (unsigned int)((rng.next_unit() + 1.0f) * 0.5f * (float)n_reps);
+		if (c >= n_reps) c = n_reps - 1u;
+		cluster_host[t] = c;
+	}
+
+	// CPU reference forward.
+	std::vector<float> delta_ref((size_t)T * d);
+	for (unsigned int t = 0; t < T; ++t) {
+		const unsigned int c = cluster_host[t];
+		for (unsigned int j = 0; j < d; ++j)
+			delta_ref[(size_t)t * d + j] =
+			    h_host[(size_t)t * d + j] - reps_host[(size_t)c * d + j];
+	}
+
+	glades::gpu::GpuBuffer<float> d_h, d_reps, d_delta, d_ddelta, d_dh, d_dreps;
+	glades::gpu::GpuBuffer<unsigned int> d_cluster;
+	d_h.allocate(h_host.size());      d_h.upload(&h_host[0], h_host.size());
+	d_reps.allocate(reps_host.size()); d_reps.upload(&reps_host[0], reps_host.size());
+	d_cluster.allocate(T);             d_cluster.upload(&cluster_host[0], T);
+	d_delta.allocate(h_host.size());
+
+	ASSERT("lcp_compute_delta fwd",
+	    glades::gpu::lcp_compute_delta(d_h.data(), d_reps.data(), d_cluster.data(),
+	        T, d, d_delta.data()));
+	glades::gpu::synchronizeCheck("lcp_compute_delta fwd");
+
+	std::vector<float> delta_gpu((size_t)T * d);
+	d_delta.download(&delta_gpu[0], delta_gpu.size());
+
+	float fwd_err = 0.0f;
+	for (size_t i = 0; i < delta_ref.size(); ++i) {
+		float e = std::fabs(delta_gpu[i] - delta_ref[i]);
+		if (e > fwd_err) fwd_err = e;
+	}
+	std::printf("  [lcp delta fwd] T=%u d=%u n_reps=%u max_err=%.3e\n",
+	            T, d, n_reps, fwd_err);
+	ASSERT("lcp delta fwd < 1e-6", fwd_err < 1e-6f);
+
+	// Backward parity: given upstream d_delta, CPU computes reference
+	// dh_in[t, :] = d_delta[t, :] and dh_reps[c, :] = -Σ_t∈c d_delta[t, :].
+	std::vector<float> ddelta_host((size_t)T * d);
+	for (size_t i = 0; i < ddelta_host.size(); ++i) ddelta_host[i] = 0.4f * rng.next_unit();
+
+	std::vector<float> dh_ref((size_t)T * d), dreps_ref((size_t)n_reps * d, 0.0f);
+	for (unsigned int t = 0; t < T; ++t) {
+		const unsigned int c = cluster_host[t];
+		for (unsigned int j = 0; j < d; ++j) {
+			dh_ref[(size_t)t * d + j] = ddelta_host[(size_t)t * d + j];
+			dreps_ref[(size_t)c * d + j] -= ddelta_host[(size_t)t * d + j];
+		}
+	}
+
+	d_ddelta.allocate(ddelta_host.size()); d_ddelta.upload(&ddelta_host[0], ddelta_host.size());
+	d_dh.allocate(h_host.size());          // pre-zero: caller's responsibility
+	d_dreps.allocate(reps_host.size());
+	{
+		std::vector<float> zh(h_host.size(), 0.0f), zr(reps_host.size(), 0.0f);
+		d_dh.upload(&zh[0], zh.size());
+		d_dreps.upload(&zr[0], zr.size());
+	}
+
+	ASSERT("lcp_compute_delta_backward",
+	    glades::gpu::lcp_compute_delta_backward(
+	        d_ddelta.data(), d_cluster.data(), T, d, n_reps,
+	        d_dh.data(), d_dreps.data()));
+	glades::gpu::synchronizeCheck("lcp_compute_delta_backward");
+
+	std::vector<float> dh_gpu((size_t)T * d), dreps_gpu((size_t)n_reps * d);
+	d_dh.download(&dh_gpu[0], dh_gpu.size());
+	d_dreps.download(&dreps_gpu[0], dreps_gpu.size());
+
+	float dh_err = 0.0f, dreps_err = 0.0f;
+	for (size_t i = 0; i < dh_ref.size(); ++i) {
+		float e = std::fabs(dh_gpu[i] - dh_ref[i]);
+		if (e > dh_err) dh_err = e;
+	}
+	for (size_t i = 0; i < dreps_ref.size(); ++i) {
+		float e = std::fabs(dreps_gpu[i] - dreps_ref[i]);
+		if (e > dreps_err) dreps_err = e;
+	}
+	std::printf("  [lcp delta bwd] dh_err=%.3e dreps_err=%.3e\n", dh_err, dreps_err);
+	ASSERT("lcp delta bwd dh    < 1e-6", dh_err    < 1e-6f);
+	ASSERT("lcp delta bwd dreps < 1e-5", dreps_err < 1e-5f);
+
+	// Invariant: if the representative token itself is used (cluster[rep] == rep's cluster),
+	// then forward-pushing its own h_row through delta-vs-its-own-rep gives 0.
+	// Strict form: build a test where rep_token == t and cluster[t] maps to the cluster
+	// whose rep is exactly h[t, :] — then delta should be exactly 0.  Done implicitly
+	// when gather+scatter+delta cascade is composed.
+#else
+	std::printf("  [lcp delta] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 

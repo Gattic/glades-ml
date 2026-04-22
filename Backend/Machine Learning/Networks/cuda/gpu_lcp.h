@@ -109,6 +109,41 @@ bool lcp_scatter(const float* h_reps_in,
                  float* h_out);
 
 // ========================================================================
+// lcp_compute_delta — compute within-cluster deviations:
+//
+//     delta[t, :] = h_in[t, :] − h_reps_in[cluster_of_token[t], :]
+//
+// This is the input to the detail network D_φ.  It measures how much
+// each token differs from its cluster representative.  By construction,
+// the rep token itself has delta = 0.
+//
+//   h_in             [T × d]
+//   h_reps_in        [n_reps × d]
+//   cluster_of_token [T]
+//   T, d             dimensions
+//   delta_out        [T × d]
+// ========================================================================
+bool lcp_compute_delta(const float* h_in, const float* h_reps_in,
+                       const unsigned int* cluster_of_token,
+                       unsigned int T, unsigned int d,
+                       float* delta_out);
+
+// ========================================================================
+// lcp_compute_delta_backward — split upstream d_delta into dh_in and dh_reps.
+//
+//     dh_in[t, :]    += d_delta[t, :]
+//     dh_reps[c, :]  -= Σ_{t : cluster_of_token[t]==c} d_delta[t, :]
+//
+// dh_in_out and dh_reps_out may be NULL to skip.  Both accumulate into
+// existing buffers (caller must pre-zero if desired).
+// ========================================================================
+bool lcp_compute_delta_backward(const float* d_delta,
+                                const unsigned int* cluster_of_token,
+                                unsigned int T, unsigned int d,
+                                unsigned int n_reps,
+                                float* dh_in_out, float* dh_reps_out);
+
+// ========================================================================
 // lcp_scatter_backward — inverse of lcp_scatter.  Accumulate per-token
 // gradients back to per-rep slots:
 //
@@ -148,6 +183,11 @@ inline bool lcp_scatter(const float*, const unsigned int*,
 inline bool lcp_scatter_backward(const float*, const unsigned int*,
                                  unsigned int, unsigned int, unsigned int,
                                  bool, float*) { return false; }
+inline bool lcp_compute_delta(const float*, const float*, const unsigned int*,
+                              unsigned int, unsigned int, float*) { return false; }
+inline bool lcp_compute_delta_backward(const float*, const unsigned int*,
+                                       unsigned int, unsigned int, unsigned int,
+                                       float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

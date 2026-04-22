@@ -157,6 +157,62 @@ __global__ void k_zero_floats(float* p, int n)
 	if (i < n) p[i] = 0.0f;
 }
 
+// ------------------------------------------------------------------------
+// delta[t, :] = h[t, :] - h_reps[cluster_of_token[t], :]
+// ------------------------------------------------------------------------
+__global__ void k_lcp_compute_delta(const float* __restrict__ h_in,
+                                    const float* __restrict__ h_reps,
+                                    const unsigned int* __restrict__ cluster,
+                                    int T, int d,
+                                    float* __restrict__ delta_out)
+{
+	const int t = blockIdx.x;
+	if (t >= T) return;
+
+	const unsigned int c = cluster[t];
+	const float* h_row    = h_in    + (size_t)t * d;
+	const float* rep_row  = h_reps  + (size_t)c * d;
+	float*       out_row  = delta_out + (size_t)t * d;
+
+	for (int j = threadIdx.x; j < d; j += blockDim.x)
+		out_row[j] = h_row[j] - rep_row[j];
+}
+
+// ------------------------------------------------------------------------
+// delta backward:
+//   dh_in[t, :]   += d_delta[t, :]
+//   dh_reps[c, :] -= Σ_{t : cluster[t]==c} d_delta[t, :]
+// ------------------------------------------------------------------------
+__global__ void k_lcp_delta_backward_dh_in(const float* __restrict__ d_delta,
+                                           int T, int d,
+                                           float* __restrict__ dh_in)
+{
+	const int t = blockIdx.x;
+	if (t >= T) return;
+
+	const float* src_row = d_delta + (size_t)t * d;
+	float*       dst_row = dh_in   + (size_t)t * d;
+
+	for (int j = threadIdx.x; j < d; j += blockDim.x)
+		dst_row[j] += src_row[j];
+}
+
+__global__ void k_lcp_delta_backward_dh_reps(const float* __restrict__ d_delta,
+                                             const unsigned int* __restrict__ cluster,
+                                             int T, int d,
+                                             float* __restrict__ dh_reps)
+{
+	const int t = blockIdx.x;
+	if (t >= T) return;
+
+	const unsigned int c = cluster[t];
+	const float* src_row = d_delta + (size_t)t * d;
+	float*       dst_row = dh_reps + (size_t)c * d;
+
+	for (int j = threadIdx.x; j < d; j += blockDim.x)
+		atomicAdd(&dst_row[j], -src_row[j]);
+}
+
 } // anonymous namespace
 
 bool lcp_lsh_project(const float* h_in, const float* R,
@@ -322,6 +378,44 @@ bool lcp_scatter_backward(const float* dh_out,
 	k_lcp_scatter_backward<<<(int)T, block, 0, computeStream()>>>(
 	    dh_out, cluster_of_token, (int)T, (int)d, dh_reps_out);
 	return cudaGetLastError() == cudaSuccess;
+}
+
+bool lcp_compute_delta(const float* h_in, const float* h_reps_in,
+                       const unsigned int* cluster_of_token,
+                       unsigned int T, unsigned int d,
+                       float* delta_out)
+{
+	if (h_in == nullptr || h_reps_in == nullptr ||
+	    cluster_of_token == nullptr || delta_out == nullptr) return false;
+	if (T == 0u || d == 0u) return false;
+
+	const int block = (d >= 256) ? 256 : ((d >= 64) ? 64 : 32);
+	k_lcp_compute_delta<<<(int)T, block, 0, computeStream()>>>(
+	    h_in, h_reps_in, cluster_of_token, (int)T, (int)d, delta_out);
+	return cudaGetLastError() == cudaSuccess;
+}
+
+bool lcp_compute_delta_backward(const float* d_delta,
+                                const unsigned int* cluster_of_token,
+                                unsigned int T, unsigned int d,
+                                unsigned int n_reps,
+                                float* dh_in_out, float* dh_reps_out)
+{
+	if (d_delta == nullptr || cluster_of_token == nullptr) return false;
+	if (T == 0u || d == 0u || n_reps == 0u) return false;
+
+	const int block = (d >= 256) ? 256 : ((d >= 64) ? 64 : 32);
+	if (dh_in_out != nullptr) {
+		k_lcp_delta_backward_dh_in<<<(int)T, block, 0, computeStream()>>>(
+		    d_delta, (int)T, (int)d, dh_in_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	if (dh_reps_out != nullptr) {
+		k_lcp_delta_backward_dh_reps<<<(int)T, block, 0, computeStream()>>>(
+		    d_delta, cluster_of_token, (int)T, (int)d, dh_reps_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	return true;
 }
 
 } // namespace gpu

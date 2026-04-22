@@ -59,6 +59,7 @@ void CHIRONTrcdApplyGateParityTest();
 void CHIRONTrcdLambdaPiControllerTest();
 void CHIRONTrcdApplyGateConvexParityTest();
 void CHIRONLcpGatherScatterRoundtripTest();
+void CHIRONLcpDeltaParityTest();
 void CHIRONTrcdRoutingThroughputBenchmark();
 void CHIRONTrcdEndToEndConvergenceTest();
 
