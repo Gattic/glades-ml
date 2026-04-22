@@ -127,6 +127,105 @@ bool mfio_update(float* theta, const float* g,
 	return cudaGetLastError() == cudaSuccess;
 }
 
+// ========================================================================
+// Column-sum-of-squares reductions for z [T × d_in] and δ [T × d_out].
+// One block per column, threads stride across T.
+// ========================================================================
+namespace {
+
+__global__ void k_mfio_col_sqsum(const float* __restrict__ X,
+                                 unsigned int T, unsigned int d,
+                                 float* __restrict__ out)
+{
+	extern __shared__ float smem[];
+	const unsigned int col = blockIdx.x;
+	const unsigned int tid = threadIdx.x;
+	if (col >= d) return;
+
+	float partial = 0.0f;
+	for (unsigned int t = tid; t < T; t += blockDim.x)
+	{
+		const float v = X[(size_t)t * d + col];
+		partial += v * v;
+	}
+	// warp reduce
+	for (int off = 16; off > 0; off >>= 1)
+		partial += __shfl_xor_sync(0xffffffffu, partial, off);
+	const int lane = tid & 31;
+	const int warp = tid >> 5;
+	if (lane == 0) smem[warp] = partial;
+	__syncthreads();
+	if (warp == 0)
+	{
+		const int nwarps = (blockDim.x + 31) >> 5;
+		float v = (tid < nwarps) ? smem[tid] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+			v += __shfl_xor_sync(0xffffffffu, v, off);
+		if (tid == 0) out[col] = v;
+	}
+}
+
+// Per-weight MFIO update using row/col norms.
+__global__ void k_mfio_update_rowcol(float* __restrict__ theta,
+                                     const float* __restrict__ g,
+                                     const float* __restrict__ zn,
+                                     const float* __restrict__ dn,
+                                     unsigned int d_in, unsigned int d_out,
+                                     float T_normalizer,
+                                     float lr, float beta, float eps, float wd)
+{
+	const unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= d_in || j >= d_out) return;
+	const float zi = zn[i];
+	const float dj = dn[j];
+	const float s  = zi * dj * beta / T_normalizer;
+	const float sigma = 1.0f / (sqrtf(s) + eps);
+	const size_t off = (size_t)i * d_out + j;
+	const float wd_scale = 1.0f - lr * wd;
+	theta[off] = wd_scale * theta[off] - lr * sigma * g[off];
+}
+
+} // anonymous namespace
+
+bool mfio_compute_rowcol_norms(const float* z, const float* delta,
+                               unsigned int T, unsigned int d_in, unsigned int d_out,
+                               float* zn_out, float* dn_out)
+{
+	if (z == nullptr || delta == nullptr || zn_out == nullptr || dn_out == nullptr)
+		return false;
+	if (T == 0u || d_in == 0u || d_out == 0u) return false;
+
+	const int block = 256;
+	const int nwarps = (block + 31) >> 5;
+	const size_t smemBytes = nwarps * sizeof(float);
+	k_mfio_col_sqsum<<<d_in, block, smemBytes, computeStream()>>>(
+	    z, T, d_in, zn_out);
+	if (cudaGetLastError() != cudaSuccess) return false;
+	k_mfio_col_sqsum<<<d_out, block, smemBytes, computeStream()>>>(
+	    delta, T, d_out, dn_out);
+	return cudaGetLastError() == cudaSuccess;
+}
+
+bool mfio_update_rowcol(float* theta, const float* g,
+                        const float* zn, const float* dn,
+                        unsigned int d_in, unsigned int d_out,
+                        float T_normalizer,
+                        float lr, float beta, float eps, float wd)
+{
+	if (theta == nullptr || g == nullptr || zn == nullptr || dn == nullptr)
+		return false;
+	if (d_in == 0u || d_out == 0u) return false;
+
+	dim3 block(32, 8);
+	dim3 grid((d_out + block.x - 1u) / block.x,
+	          (d_in  + block.y - 1u) / block.y);
+	k_mfio_update_rowcol<<<grid, block, 0, computeStream()>>>(
+	    theta, g, zn, dn, d_in, d_out,
+	    T_normalizer, lr, beta, eps, wd);
+	return cudaGetLastError() == cudaSuccess;
+}
+
 } // namespace gpu
 } // namespace glades
 

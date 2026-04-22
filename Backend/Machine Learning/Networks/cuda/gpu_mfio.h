@@ -79,6 +79,38 @@ bool mfio_update(float* theta, const float* g,
                  float lr, float wd,
                  int n_params);
 
+// ========================================================================
+// mfio_compute_rowcol_norms — Adafactor-style row/col activation norms.
+//
+//     zn[i] = Σ_t z[t, i]²        for i in [0, d_in)    (vector length d_in)
+//     dn[j] = Σ_t δ[t, j]²        for j in [0, d_out)   (vector length d_out)
+//
+// The tensor of per-weight preconditioners is then σ_{ij} ≤
+// 1/(√(zn[i] · dn[j]) + ε), closer to Adam's per-param v than the
+// single-scalar σ of the base MFIO.  Storage: d_in + d_out floats per
+// layer (vs Adam's 2 · d_in · d_out).  At m=n=2048: 16 KB/layer vs
+// Adam's 32 MB/layer — still >2000× reduction.
+//
+// Written as two independent column-reductions; each gets its own grid
+// block allowing them to run on the same stream without barrier.
+// ========================================================================
+bool mfio_compute_rowcol_norms(const float* z, const float* delta,
+                               unsigned int T, unsigned int d_in, unsigned int d_out,
+                               float* zn_out, float* dn_out);
+
+// ========================================================================
+// mfio_update_rowcol — per-weight MFIO v2 update:
+//     σ_{ij} = 1 / (√((zn[i] · dn[j]) · β / (T·T)) + ε)
+//     θ[i, j] ← θ[i, j] · (1 − lr·wd) − lr · σ_{ij} · g[i, j]
+//
+// Where T is the batch dimension used when computing (zn, dn).
+// ========================================================================
+bool mfio_update_rowcol(float* theta, const float* g,
+                        const float* zn, const float* dn,
+                        unsigned int d_in, unsigned int d_out,
+                        float T_normalizer,
+                        float lr, float beta, float eps, float wd);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -88,6 +120,13 @@ inline bool mfio_compute_sigma(const float*, const float*,
                                float, float, float*) { return false; }
 inline bool mfio_update(float*, const float*, const float*,
                         float, float, int) { return false; }
+inline bool mfio_compute_rowcol_norms(const float*, const float*,
+                                      unsigned int, unsigned int, unsigned int,
+                                      float*, float*) { return false; }
+inline bool mfio_update_rowcol(float*, const float*,
+                               const float*, const float*,
+                               unsigned int, unsigned int,
+                               float, float, float, float, float) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 
