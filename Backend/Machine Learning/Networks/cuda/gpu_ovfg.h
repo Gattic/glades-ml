@@ -226,6 +226,28 @@ bool ovfg_stiefel_tangent_grad(const GpuStiefelWeight& s,
                                float* dU, float* dSigma, float* dV,
                                float* scratch);
 
+// ========================================================================
+// ovfg_stiefel_unconstrained_grad — variant producing RAW (unprojected)
+// Stiefel gradients, byte-equivalent to stiefel_backward_unconstrained.
+//
+// Intended composition path: OVFG → stiefel_adam_step (which applies
+// its own tangent projection as step 1).  Using this variant instead of
+// ovfg_stiefel_tangent_grad eliminates the double-projection numerical
+// drift observed in CHIRONOvfgStiefelAdamDescentTest (1.84× reduction
+// vs dense 2.51× on a 50-step toy regression).
+//
+// Same inputs and math as ovfg_stiefel_tangent_grad, EXCEPT the final
+// stiefel_tangent_project_grad call is omitted.
+//
+// Scratch requirement: 2·ρ·r floats (for A, B only — no r×r scratches
+// needed since projection is skipped).
+// ========================================================================
+bool ovfg_stiefel_unconstrained_grad(const GpuStiefelWeight& s,
+                                     const float* L, const float* R,
+                                     unsigned int r,
+                                     float* dU, float* dSigma, float* dV,
+                                     float* scratch);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -255,6 +277,9 @@ struct GpuStiefelWeight;
 inline bool ovfg_stiefel_tangent_grad(const GpuStiefelWeight&,
                                       const float*, const float*, unsigned int,
                                       float*, float*, float*, float*) { return false; }
+inline bool ovfg_stiefel_unconstrained_grad(const GpuStiefelWeight&,
+                                            const float*, const float*, unsigned int,
+                                            float*, float*, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

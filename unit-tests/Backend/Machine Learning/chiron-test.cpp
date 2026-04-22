@@ -5180,6 +5180,103 @@ void CHIRONOvfgStiefelTangentGradParityTest()
 #endif
 }
 
+// CHIRONOvfgStiefelUnconstrainedGradParityTest -------------------------------
+// Paradigm shift #9, Phase 3 complement: ovfg_stiefel_unconstrained_grad
+// must match stiefel_backward_unconstrained byte-for-byte (up to GEMM
+// round-off).  This is the "no-project" OVFG variant intended to feed
+// stiefel_adam_step, which applies its own projection.
+//
+// Test structure: generate random (dY, X), run both paths, compare.
+void CHIRONOvfgStiefelUnconstrainedGradParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg unconstrained] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m = 32, n = 40, rho = 10, B = 16;
+
+	LCG rng(202604226u);
+	std::vector<float> U(m * rho), V(n * rho), sigma(rho);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, rho);
+	gram_schmidt_cols(V, n, rho);
+	for (size_t i = 0; i < sigma.size(); ++i)
+		sigma[i] = 0.5f + std::abs(rng.next_unit());
+	std::vector<uint16_t> U_bf, V_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, rho);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma[0], sigma.size());
+
+	// Random (X, dY).
+	std::vector<float> Xh(B * n), dYh(B * m);
+	for (size_t i = 0; i < Xh.size(); ++i)  Xh[i]  = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < dYh.size(); ++i) dYh[i] = 0.2f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_dY, d_L, d_R;
+	glades::gpu::GpuBuffer<float> d_dU_ref, d_dS_ref, d_dV_ref;
+	glades::gpu::GpuBuffer<float> d_dU_ovfg, d_dS_ovfg, d_dV_ovfg;
+	glades::gpu::GpuBuffer<float> d_scr_Br, d_scr_ovfg;
+	d_X.allocate(B * n);   d_X.upload(&Xh[0], Xh.size());
+	d_dY.allocate(B * m);  d_dY.upload(&dYh[0], dYh.size());
+	d_L.allocate(m * B);
+	d_R.allocate(n * B);
+	d_dU_ref.allocate(m * rho);   d_dS_ref.allocate(rho);   d_dV_ref.allocate(n * rho);
+	d_dU_ovfg.allocate(m * rho);  d_dS_ovfg.allocate(rho);  d_dV_ovfg.allocate(n * rho);
+	d_scr_Br.allocate(B * rho);
+	d_scr_ovfg.allocate(2u * rho * B);
+
+	// --- Reference: stiefel_backward_unconstrained(dY, X, sw) ---
+	glades::gpu::stiefel_backward_unconstrained(
+	    d_dY.data(), d_X.data(), /*x_bf16=*/false, sw,
+	    /*dX=*/(float*)0,
+	    d_dU_ref.data(), d_dS_ref.data(), d_dV_ref.data(),
+	    d_scr_Br.data(), B);
+
+	// --- OVFG: factor (dY, X) → (L, R), then unconstrained grad ---
+	ASSERT("ovfg_factored_grad_from_activation runs (unconstrained test)",
+	       glades::gpu::ovfg_factored_grad_from_activation(
+	           d_dY.data(), d_X.data(), B, m, n, d_L.data(), d_R.data()));
+	ASSERT("ovfg_stiefel_unconstrained_grad runs",
+	       glades::gpu::ovfg_stiefel_unconstrained_grad(
+	           sw, d_L.data(), d_R.data(), B,
+	           d_dU_ovfg.data(), d_dS_ovfg.data(), d_dV_ovfg.data(),
+	           d_scr_ovfg.data()));
+
+	std::vector<float> dU_ref(m * rho), dV_ref(n * rho), dS_ref(rho);
+	std::vector<float> dU_ovfg(m * rho), dV_ovfg(n * rho), dS_ovfg(rho);
+	d_dU_ref.download(&dU_ref[0], dU_ref.size());
+	d_dV_ref.download(&dV_ref[0], dV_ref.size());
+	d_dS_ref.download(&dS_ref[0], dS_ref.size());
+	d_dU_ovfg.download(&dU_ovfg[0], dU_ovfg.size());
+	d_dV_ovfg.download(&dV_ovfg[0], dV_ovfg.size());
+	d_dS_ovfg.download(&dS_ovfg[0], dS_ovfg.size());
+
+	const float err_U = max_abs_diff(dU_ref, dU_ovfg);
+	const float err_V = max_abs_diff(dV_ref, dV_ovfg);
+	const float err_S = max_abs_diff(dS_ref, dS_ovfg);
+	std::printf("  ovfg unconstrained parity: dU=%.3e dV=%.3e dΣ=%.3e\n",
+	            err_U, err_V, err_S);
+	ASSERT("OVFG unconstrained matches stiefel_backward_unconstrained — dU",
+	       err_U < 5e-3f);
+	ASSERT("OVFG unconstrained matches stiefel_backward_unconstrained — dV",
+	       err_V < 5e-3f);
+	ASSERT("OVFG unconstrained matches stiefel_backward_unconstrained — dΣ",
+	       err_S < 5e-3f);
+
+	sw.release();
+#else
+	std::printf("  [ovfg unconstrained] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONOvfgCompressionBenchmark --------------------------------------------
 // Paradigm shift #9, Phase 4a: empirical memory & throughput benchmark.
 //
@@ -5506,8 +5603,11 @@ void CHIRONOvfgStiefelAdamDescentTest()
 		glades::gpu::ovfg_factored_grad_from_activation(
 		    d_dY.data(), d_X.data(), B, m, n, d_L.data(), d_R.data());
 
-		// Stiefel tangent grads via OVFG closed form, no dense dW.
-		glades::gpu::ovfg_stiefel_tangent_grad(
+		// Stiefel RAW grads via OVFG closed form, no dense dW.  We use the
+		// UNCONSTRAINED variant here so that stiefel_adam_step applies its
+		// single tangent projection — matching the dense backward path's
+		// numerical sequence exactly.
+		glades::gpu::ovfg_stiefel_unconstrained_grad(
 		    sw, d_L.data(), d_R.data(), B,
 		    d_dU.data(), d_dsigma.data(), d_dV.data(),
 		    d_scratch_ovfg.data());
@@ -5523,13 +5623,11 @@ void CHIRONOvfgStiefelAdamDescentTest()
 	std::printf("  ovfg+stiefel adam: loss %6.4f → %6.4f (%.2fx reduction) over %d steps\n",
 	            loss_first, loss_last, loss_first / loss_last, num_steps);
 	ASSERT("OVFG+Stiefel Adam reduces loss", loss_last < loss_first);
-	// Loosen from the dense-path 2× threshold — OVFG routes the grad
-	// through a different GEMM chain (factored A^T·L path), so small
-	// numerical differences compound across 50 steps.  Measured ~1.8×
-	// in practice; we cap at 1.5× as a generous floor that still
-	// clearly distinguishes descent from stagnation.
-	ASSERT("OVFG+Stiefel Adam reduces loss by >= 1.5x (toy problem)",
-	       loss_first / loss_last >= 1.5f);
+	// With the unconstrained OVFG variant (single tangent projection
+	// inside stiefel_adam_step, matching the dense path), descent
+	// quality matches the dense-path 2× threshold exactly.
+	ASSERT("OVFG+Stiefel Adam reduces loss by >= 2x (toy problem)",
+	       loss_first / loss_last >= 2.0f);
 
 	sw.release();
 	sw_star.release();
@@ -5549,6 +5647,7 @@ void CHIRONUnitTest()
 	CHIRONOvfgAdafactorMomentsParityTest();
 	CHIRONOvfgFirstMomentAppendParityTest();
 	CHIRONOvfgStiefelTangentGradParityTest();
+	CHIRONOvfgStiefelUnconstrainedGradParityTest();
 	CHIRONOvfgCompressionBenchmark();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONStiefelIdentityRecoveryTest();

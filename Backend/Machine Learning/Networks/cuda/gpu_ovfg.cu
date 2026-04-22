@@ -474,6 +474,94 @@ bool ovfg_stiefel_tangent_grad(const GpuStiefelWeight& s,
 	return true;
 }
 
+// ========================================================================
+// ovfg_stiefel_unconstrained_grad — RAW (pre-projection) variant, matches
+// stiefel_backward_unconstrained byte-for-byte.  Intended to feed
+// stiefel_adam_step which applies tangent projection as its first step.
+//
+// Scratch: 2·ρ·r floats for A, B (no r×r scratches needed).
+// ========================================================================
+bool ovfg_stiefel_unconstrained_grad(const GpuStiefelWeight& s,
+                                     const float* L, const float* R,
+                                     unsigned int r,
+                                     float* dU, float* dSigma, float* dV,
+                                     float* scratch)
+{
+	if (!s.allocated()) return false;
+	if (L == nullptr || R == nullptr || scratch == nullptr) return false;
+	if (dU == nullptr || dSigma == nullptr || dV == nullptr) return false;
+	if (r == 0u) return false;
+
+	stiefel_refresh_fp32_cache(s);
+
+	const unsigned int m   = s.m;
+	const unsigned int n   = s.n;
+	const unsigned int rho = s.r;
+	const float* U_f32 = s.U_f32_cache.data();
+	const float* V_f32 = s.V_f32_cache.data();
+	const float* sig   = s.sigma.data();
+
+	float* A = scratch;                    // [rho × r]
+	float* B = A + (size_t)rho * r;        // [rho × r]
+
+	if (!sgemm_rowmajor_atb(static_cast<int>(rho), static_cast<int>(r), static_cast<int>(m),
+	                        1.0f,
+	                        U_f32, static_cast<int>(rho),
+	                        L,     static_cast<int>(r),
+	                        0.0f,
+	                        A,     static_cast<int>(r)))
+		return false;
+	if (!sgemm_rowmajor_atb(static_cast<int>(rho), static_cast<int>(r), static_cast<int>(n),
+	                        1.0f,
+	                        V_f32, static_cast<int>(rho),
+	                        R,     static_cast<int>(r),
+	                        0.0f,
+	                        B,     static_cast<int>(r)))
+		return false;
+
+	{
+		const unsigned int block = 128;
+		const unsigned int nwarps = (block + 31u) >> 5;
+		const size_t smemBytes = nwarps * sizeof(float);
+		k_ovfg_adafactor_row_update<<<rho, block, smemBytes, computeStream()>>>(
+		    A, B, rho, r, 0.0f, dSigma);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	if (!sgemm_rowmajor_abt(static_cast<int>(m), static_cast<int>(rho), static_cast<int>(r),
+	                        1.0f,
+	                        L, static_cast<int>(r),
+	                        B, static_cast<int>(r),
+	                        0.0f,
+	                        dU, static_cast<int>(rho)))
+		return false;
+	{
+		dim3 block(64);
+		dim3 grid(m, (rho + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(
+		    dU, sig, m, rho);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	if (!sgemm_rowmajor_abt(static_cast<int>(n), static_cast<int>(rho), static_cast<int>(r),
+	                        1.0f,
+	                        R, static_cast<int>(r),
+	                        A, static_cast<int>(r),
+	                        0.0f,
+	                        dV, static_cast<int>(rho)))
+		return false;
+	{
+		dim3 block(64);
+		dim3 grid(n, (rho + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(
+		    dV, sig, n, rho);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// No tangent projection — caller (typically stiefel_adam_step) applies.
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 
