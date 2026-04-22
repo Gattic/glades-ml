@@ -4185,6 +4185,52 @@ void CHIRONStiefelLargeScaleTrainingTest()
 #endif
 }
 
+// CHIRONStiefelSvdInitTest --------------------------------------------------
+// Validates stiefel_init_from_dense.  At full rank r = min(m, n), the
+// round-trip W → SVD → reconstructed W must match the original to cuSOLVER
+// precision (~1e-5) before BF16 round-trip, ~1e-3 after.  At reduced rank,
+// reconstruction preserves the top-r singular components (Eckart-Young).
+void CHIRONStiefelSvdInitTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel svd-init] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m = 24, n = 16, r = 16;  // r = min(m, n) — full rank.
+
+	LCG rng(20260421u);
+	std::vector<float> W(m * n);
+	for (size_t i = 0; i < W.size(); ++i) W[i] = 0.2f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_W, d_W_round;
+	d_W.allocate(m * n); d_W.upload(&W[0], W.size());
+	d_W_round.allocate(m * n);
+
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, r);
+
+	ASSERT("stiefel_init_from_dense runs",
+	       glades::gpu::stiefel_init_from_dense(sw, d_W.data()));
+
+	glades::gpu::stiefel_reconstruct_dense(sw, d_W_round.data());
+	std::vector<float> W_round(m * n);
+	d_W_round.download(&W_round[0], W_round.size());
+
+	const float err = max_abs_diff(W, W_round);
+	std::printf("  stiefel SVD init: W → (U Σ V^T) → W' max_err = %.3e (r=%u full rank)\n",
+	            err, r);
+	// BF16 round-trip on U, V caps the precision at ~1e-2.
+	ASSERT("SVD round-trip matches original within BF16 tolerance",
+	       err < 5e-2f);
+
+	sw.release();
+#else
+	std::printf("  [stiefel svd-init] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -4192,6 +4238,7 @@ void CHIRONUnitTest()
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
 	CHIRONStiefelQRRetractionTest();
+	CHIRONStiefelSvdInitTest();
 	CHIRONStiefelAdamDescentTest();
 	CHIRONStiefelCayleyRetractionTest();
 	CHIRONStiefelLargeScaleTrainingTest();

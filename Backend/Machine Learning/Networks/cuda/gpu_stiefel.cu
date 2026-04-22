@@ -18,6 +18,7 @@
 #include <cusolverDn.h>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace glades {
 namespace gpu {
@@ -175,14 +176,11 @@ void stiefel_reconstruct_dense(const GpuStiefelWeight& s, float* W_dense)
 	GLADES_CUDA_CHECK(cudaGetLastError());
 }
 
-// ===========================================================================
-// stiefel_forward — Y[B × m] = X[B × n] · V · diag(Σ) · U^T via 3 SGEMMs.
-//
-// Step 1: T1[B × r]  = X    · V         (X [B,n], V [n,r])
-// Step 2: T1       *= Σ (broadcast per column)
-// Step 3: Y [B × m]  = T1   · U^T       (T1 [B,r], U [m,r] stored row-major so
-//                                        U^T access is a straightforward abt)
-//
+// Forward declaration — definition appended at EOF after the cuSOLVER
+// handle, transpose kernel, and stiefel_solver_init are in scope.
+bool stiefel_init_from_dense(GpuStiefelWeight& s, const float* W_dense);
+
+// (Body of the SVD init is at the bottom of this file.)
 // FP32 fast-path first. BF16 path (x_bf16 = true) will be added in the next
 // iteration once sgemm_rowmajor_bf16 wrappers accept Stiefel-shaped inputs.
 // ===========================================================================
@@ -978,6 +976,146 @@ void stiefel_vector_transport(GpuStiefelWeight&, float*)
 void stiefel_check_orthogonality(GpuStiefelWeight&)
 {
 	// TODO Phase-2: compute ‖U^T U − I_r‖_F.
+}
+
+// ===========================================================================
+// stiefel_init_from_dense — truncated-SVD initialization (Phase 2h).
+// Declared earlier in the file; body here after the cuSOLVER handle,
+// transpose kernel, and stiefel_solver_init are all defined.
+// ===========================================================================
+
+bool stiefel_init_from_dense(GpuStiefelWeight& s, const float* W_dense)
+{
+	if (!s.allocated() || W_dense == nullptr) return false;
+	if (!stiefel_solver_init()) return false;
+
+	const unsigned int m = s.m, n = s.n, r = s.r;
+	const unsigned int k_full = m < n ? m : n;
+	if (r > k_full) return false;
+
+	// Stage W to column-major [m × n].
+	static thread_local float* W_col = nullptr;
+	static thread_local size_t W_col_cap = 0;
+	const size_t sz_W = size_t(m) * n;
+	if (sz_W > W_col_cap)
+	{
+		if (W_col) cudaFree(W_col);
+		if (cudaMalloc(&W_col, sz_W * sizeof(float)) != cudaSuccess) return false;
+		W_col_cap = sz_W;
+	}
+	{
+		dim3 block(16, 16);
+		dim3 grid((n + block.x - 1) / block.x, (m + block.y - 1) / block.y);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(W_dense, W_col, m, n);
+		cudaGetLastError();
+	}
+
+	// Full SVD outputs in column-major.
+	static thread_local float* U_full_col = nullptr;
+	static thread_local size_t U_full_cap = 0;
+	static thread_local float* S_full = nullptr;
+	static thread_local size_t S_full_cap = 0;
+	static thread_local float* VT_full_col = nullptr;
+	static thread_local size_t VT_full_cap = 0;
+
+	const size_t sz_U_full = size_t(m) * m;
+	const size_t sz_VT_full = size_t(n) * n;
+	if (sz_U_full > U_full_cap)
+	{
+		if (U_full_col) cudaFree(U_full_col);
+		if (cudaMalloc(&U_full_col, sz_U_full * sizeof(float)) != cudaSuccess) return false;
+		U_full_cap = sz_U_full;
+	}
+	if (size_t(k_full) > S_full_cap)
+	{
+		if (S_full) cudaFree(S_full);
+		if (cudaMalloc(&S_full, k_full * sizeof(float)) != cudaSuccess) return false;
+		S_full_cap = k_full;
+	}
+	if (sz_VT_full > VT_full_cap)
+	{
+		if (VT_full_col) cudaFree(VT_full_col);
+		if (cudaMalloc(&VT_full_col, sz_VT_full * sizeof(float)) != cudaSuccess) return false;
+		VT_full_cap = sz_VT_full;
+	}
+
+	// Workspace for cusolverDnSgesvd.
+	int lwork = 0;
+	if (cusolverDnSgesvd_bufferSize(g_stiefelSolver, m, n, &lwork)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	static thread_local float* svd_work = nullptr;
+	static thread_local size_t svd_work_cap = 0;
+	if (size_t(lwork) > svd_work_cap)
+	{
+		if (svd_work) cudaFree(svd_work);
+		if (cudaMalloc(&svd_work, lwork * sizeof(float)) != cudaSuccess) return false;
+		svd_work_cap = lwork;
+	}
+
+	cusolverStatus_t st = cusolverDnSgesvd(
+	    g_stiefelSolver, 'A', 'A', m, n, W_col, m,
+	    S_full, U_full_col, m, VT_full_col, n,
+	    svd_work, lwork, nullptr, g_stiefelInfo[0]);
+	if (st != CUSOLVER_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[stiefel-svd] cusolverDnSgesvd failed: %d (m=%u n=%u)\n",
+		        (int)st, m, n);
+		return false;
+	}
+	cudaStreamSynchronize(computeStream());
+
+	// Extract top-r columns of U (col-major [m × m]) as row-major [m × r].
+	// U_full_col element (i, j) at j*m + i → row-major dst[i*r + j] at j < r.
+	std::vector<float> h_U_full(sz_U_full);
+	cudaMemcpy(&h_U_full[0], U_full_col, sz_U_full * sizeof(float),
+	           cudaMemcpyDeviceToHost);
+	std::vector<float> h_U(size_t(m) * r);
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int j = 0; j < r; ++j)
+			h_U[size_t(i) * r + j] = h_U_full[size_t(j) * m + i];
+	static thread_local float* U_trunc = nullptr;
+	static thread_local size_t U_trunc_cap = 0;
+	const size_t sz_U_trunc = size_t(m) * r;
+	if (sz_U_trunc > U_trunc_cap)
+	{
+		if (U_trunc) cudaFree(U_trunc);
+		if (cudaMalloc(&U_trunc, sz_U_trunc * sizeof(float)) != cudaSuccess) return false;
+		U_trunc_cap = sz_U_trunc;
+	}
+	cudaMemcpy(U_trunc, &h_U[0], sz_U_trunc * sizeof(float), cudaMemcpyHostToDevice);
+	cast_f32_to_bf16(U_trunc, s.U.data(), sz_U_trunc);
+
+	// Extract V from VT_full_col.  VT_full_col is col-major [n × n] holding
+	// V^T.  Element VT[j, i] (col-major) = (j*n + i).  V[i, j] = VT[j, i],
+	// so V_row[i * r + j] = VT_full_col[j * n + i].
+	std::vector<float> h_VT(sz_VT_full);
+	cudaMemcpy(&h_VT[0], VT_full_col, sz_VT_full * sizeof(float),
+	           cudaMemcpyDeviceToHost);
+	// VT col-major [n × n]: element (a, b) is V^T(a, b) at position b*n + a.
+	// V_row(i, j) = V(i, j) = V^T(j, i) = h_VT[i*n + j].
+	std::vector<float> h_V(size_t(n) * r);
+	for (unsigned int i = 0; i < n; ++i)
+		for (unsigned int j = 0; j < r; ++j)
+			h_V[size_t(i) * r + j] = h_VT[size_t(i) * n + j];
+	static thread_local float* V_trunc = nullptr;
+	static thread_local size_t V_trunc_cap = 0;
+	const size_t sz_V_trunc = size_t(n) * r;
+	if (sz_V_trunc > V_trunc_cap)
+	{
+		if (V_trunc) cudaFree(V_trunc);
+		if (cudaMalloc(&V_trunc, sz_V_trunc * sizeof(float)) != cudaSuccess) return false;
+		V_trunc_cap = sz_V_trunc;
+	}
+	cudaMemcpy(V_trunc, &h_V[0], sz_V_trunc * sizeof(float), cudaMemcpyHostToDevice);
+	cast_f32_to_bf16(V_trunc, s.V.data(), sz_V_trunc);
+
+	// Σ: copy first r singular values.
+	cudaMemcpy(s.sigma.data(), S_full, size_t(r) * sizeof(float),
+	           cudaMemcpyDeviceToDevice);
+
+	s.param_version++;  // invalidate FP32 cache
+	return true;
 }
 
 } // namespace gpu

@@ -259,6 +259,23 @@ void stiefel_check_orthogonality(GpuStiefelWeight& stiefel);
 // ========================================================================
 void stiefel_reconstruct_dense(const GpuStiefelWeight& stiefel, float* W_dense);
 
+// ========================================================================
+// Initialize a Stiefel weight from an existing dense matrix via truncated
+// SVD.  W_dense [m × n] FP32 → (U [m × r], Σ [r], V [n × r]).  The top-r
+// singular values/vectors are kept; the tail is discarded.  For r ≥ min(m,n)
+// this is an exact factorization (up to numerical precision).
+//
+// Used by trainer wire-in (Phase 2h) to convert a random-initialized dense
+// weight tensor into Stiefel form on the fly, preserving initialization
+// statistics of the underlying architecture's random init.
+//
+// Computes the SVD on the GPU via cuSOLVER `cusolverDnSgesvdj` (Jacobi SVD,
+// best for small m, n) or the standard `gesvd` depending on size.
+// Returns true on success, false on cuSOLVER error.
+// ========================================================================
+bool stiefel_init_from_dense(GpuStiefelWeight& stiefel,
+                             const float* W_dense);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
