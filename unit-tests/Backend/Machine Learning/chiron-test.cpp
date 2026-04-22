@@ -33,6 +33,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_mfio.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_dfa.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_trcd.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_lcp.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -9418,6 +9419,7 @@ void CHIRONUnitTest()
 	CHIRONTrcdApplyGateParityTest();
 	CHIRONTrcdLambdaPiControllerTest();
 	CHIRONTrcdApplyGateConvexParityTest();
+	CHIRONLcpGatherScatterRoundtripTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
@@ -11777,6 +11779,134 @@ void CHIRONTrcdLambdaPiControllerTest()
 	ASSERT("λ-PI stays bounded [0, L]", lambda >= 0.0f && lambda <= L);
 #else
 	std::printf("  [trcd λ-PI] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONLcpGatherScatterRoundtripTest ---------------------------------------
+// Paradigm shift #16 Phase 1: validate that scatter(gather(h)) is the
+// cluster-quantization of h.  Specifically, every two tokens that share
+// a cluster should end up with identical h values after a gather+scatter
+// roundtrip — each gets its cluster-representative's value.
+//
+// Also validates the LSH projection is deterministic for a given seed.
+void CHIRONLcpGatherScatterRoundtripTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [lcp gather-scatter] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 128;
+	const unsigned int d = 64;
+	const unsigned int K = 8;      // 2^8 = 256 buckets > T so most tokens get unique bucket
+	const unsigned int M_max = T;  // allow unlimited reps for correctness test
+	LCG rng(202604228u);
+
+	std::vector<float> h_host((size_t)T * d);
+	// Structure the data so groups of 4 consecutive tokens are IDENTICAL —
+	// they must all land in the same bucket under LSH, so gather+scatter
+	// collapses them to one representative.
+	for (unsigned int t = 0; t < T; t += 4u) {
+		std::vector<float> tmpl(d);
+		for (unsigned int j = 0; j < d; ++j) tmpl[j] = 0.5f * rng.next_unit();
+		for (unsigned int k = 0; k < 4u && (t + k) < T; ++k)
+			for (unsigned int j = 0; j < d; ++j)
+				h_host[(size_t)(t + k) * d + j] = tmpl[j];
+	}
+
+	glades::gpu::GpuBuffer<float> d_h, d_R, d_hreps, d_hout;
+	glades::gpu::GpuBuffer<unsigned int> d_buckets, d_repidx, d_cluster;
+	d_h.allocate(h_host.size()); d_h.upload(&h_host[0], h_host.size());
+	d_R.allocate((size_t)d * K);
+	d_hreps.allocate((size_t)M_max * d);
+	d_hout.allocate(h_host.size());
+	d_buckets.allocate(T);
+	d_repidx.allocate(M_max);
+	d_cluster.allocate(T);
+
+	// Init LSH matrix once.
+	ASSERT("lcp_lsh_init_matrix",
+	    glades::gpu::lcp_lsh_init_matrix(d_R.data(), d, K, 0xA5B6C7D8E9F00A11ULL));
+	// Project tokens to buckets.
+	ASSERT("lcp_lsh_project",
+	    glades::gpu::lcp_lsh_project(d_h.data(), d_R.data(), T, d, K, d_buckets.data()));
+	glades::gpu::synchronizeCheck("lcp_lsh_project");
+
+	// First-occurrence index + cluster-of-token map (host-side).
+	int n_reps = 0;
+	ASSERT("lcp_bucket_first_index",
+	    glades::gpu::lcp_bucket_first_index(
+	        d_buckets.data(), T, M_max,
+	        d_repidx.data(), &n_reps, d_cluster.data()));
+
+	// Download bucket ids to verify: every 4-token group shares a bucket.
+	std::vector<unsigned int> buckets_h(T);
+	d_buckets.download(&buckets_h[0], T);
+	int group_consistent = 0, group_total = 0;
+	for (unsigned int t = 0; t < T; t += 4u) {
+		const unsigned int b0 = buckets_h[t];
+		bool all_same = true;
+		for (unsigned int k = 1u; k < 4u && (t + k) < T; ++k)
+			if (buckets_h[t + k] != b0) { all_same = false; break; }
+		if (all_same) ++group_consistent;
+		++group_total;
+	}
+	std::printf("  [lcp gather-scatter] T=%u d=%u K=%u n_reps=%d (%d/%d 4-token groups "
+	            "hash-consistent)\n",
+	            T, d, K, n_reps, group_consistent, group_total);
+
+	// Gather representatives (n_reps × d).
+	ASSERT("lcp_gather",
+	    glades::gpu::lcp_gather(d_h.data(), d_repidx.data(),
+	        (unsigned int)n_reps, d, d_hreps.data()));
+	// Scatter back.
+	ASSERT("lcp_scatter",
+	    glades::gpu::lcp_scatter(d_hreps.data(), d_cluster.data(),
+	        T, d, d_hout.data()));
+	glades::gpu::synchronizeCheck("lcp_gather+scatter");
+
+	// Download and verify: any two tokens with the same cluster id end up
+	// with identical h_out values.
+	std::vector<unsigned int> cluster_h(T);
+	std::vector<float> hout_h((size_t)T * d);
+	d_cluster.download(&cluster_h[0], T);
+	d_hout.download(&hout_h[0], hout_h.size());
+
+	float max_intra_cluster_diff = 0.0f;
+	int compared = 0;
+	for (unsigned int t1 = 0; t1 < T; ++t1) {
+		for (unsigned int t2 = t1 + 1; t2 < T; ++t2) {
+			if (cluster_h[t1] == cluster_h[t2]) {
+				for (unsigned int j = 0; j < d; ++j) {
+					float e = std::fabs(hout_h[(size_t)t1 * d + j] -
+					                    hout_h[(size_t)t2 * d + j]);
+					if (e > max_intra_cluster_diff) max_intra_cluster_diff = e;
+				}
+				++compared;
+			}
+		}
+	}
+	std::printf("  [lcp gather-scatter] cluster-invariant check: %d intra-cluster "
+	            "pairs, max diff=%.3e\n", compared, max_intra_cluster_diff);
+	ASSERT("n_reps ≤ M_max",            n_reps > 0 && n_reps <= (int)M_max);
+	ASSERT("scatter is cluster-invariant (diff ≈ 0)", max_intra_cluster_diff < 1e-6f);
+
+	// Determinism: re-project, buckets must be identical.
+	glades::gpu::GpuBuffer<unsigned int> d_buckets2;
+	d_buckets2.allocate(T);
+	ASSERT("lcp_lsh_project (rerun)",
+	    glades::gpu::lcp_lsh_project(d_h.data(), d_R.data(), T, d, K, d_buckets2.data()));
+	std::vector<unsigned int> b2(T);
+	d_buckets2.download(&b2[0], T);
+	bool deterministic = true;
+	for (unsigned int t = 0; t < T; ++t)
+		if (b2[t] != buckets_h[t]) { deterministic = false; break; }
+	std::printf("  [lcp gather-scatter] determinism: %s\n",
+	            deterministic ? "yes" : "NO");
+	ASSERT("LSH projection is deterministic", deterministic);
+#else
+	std::printf("  [lcp gather-scatter] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 
