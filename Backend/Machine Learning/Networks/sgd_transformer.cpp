@@ -9373,14 +9373,28 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 			    static_cast<size_t>(T) * dModelKV);
 			glades::gpu::cast_f32_to_bf16(V_l, gpuTransformerScratch->vLowp.data(),
 			    static_cast<size_t>(T) * dModelKV);
-			gpu::flash_attention_multihead_forward_bf16(
-			    gpuTransformerScratch->qLowp.data(),
-			    gpuTransformerScratch->kLowp.data(),
-			    gpuTransformerScratch->vLowp.data(),
-			    static_cast<int>(T), static_cast<int>(nHeads),
-			    static_cast<int>(nKVHeads), static_cast<int>(dHead),
-			    static_cast<int>(dModel), static_cast<int>(dModelKV),
-			    causal, attnConcat_l);
+			// Local-window attention (paradigm shift #6 port to main transformer).
+			// When localAttnWindow > 0, use the O(T·W) variant.
+			const int localW = trainingConfig.transformer.localAttnWindow;
+			if (localW > 0 && localW < static_cast<int>(T)) {
+				gpu::flash_attention_multihead_forward_bf16_local(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    static_cast<int>(T), static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+				    static_cast<int>(dModel), static_cast<int>(dModelKV),
+				    causal, localW, attnConcat_l);
+			} else {
+				gpu::flash_attention_multihead_forward_bf16(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    static_cast<int>(T), static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+				    static_cast<int>(dModel), static_cast<int>(dModelKV),
+				    causal, attnConcat_l);
+			}
 		}
 		else
 		{
@@ -9923,6 +9937,22 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				}
 				if (!bf16_attn_done)
 				{
+				const int localW_tr = trainingConfig.transformer.localAttnWindow;
+				if (localW_tr > 0 && localW_tr < static_cast<int>(T)) {
+				gpu::flash_attention_multihead_forward_bf16_local(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    static_cast<int>(T),
+				    static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads),
+				    static_cast<int>(dHead),
+				    static_cast<int>(dModel),
+				    static_cast<int>(dModelKV),
+				    causal,
+				    localW_tr,
+				    attnConcat_l);
+				} else {
 				gpu::flash_attention_multihead_forward_bf16(
 				    gpuTransformerScratch->qLowp.data(),
 				    gpuTransformerScratch->kLowp.data(),
@@ -9935,6 +9965,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    static_cast<int>(dModelKV),
 				    causal,
 				    attnConcat_l);
+				}
 				}
 			}
 			else
@@ -10612,6 +10643,27 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				// BF16 views without re-casting. Fall back to FP32 on any
 				// kernel launch failure (e.g., shape exceeds the
 				// multi-query shmem budget on this device).
+				// Local-window attention backward (paradigm shift #6 port).
+				const int localW_bw = trainingConfig.transformer.localAttnWindow;
+				if (localW_bw > 0 && localW_bw < static_cast<int>(T)) {
+				attnBwdDone = gpu::flash_attention_multihead_backward_bf16_local(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    attnConcat_l,
+				    gpuTransformerScratch->dAttnConcat.data(),
+				    static_cast<int>(T),
+				    static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads),
+				    static_cast<int>(dHead),
+				    static_cast<int>(dModel),
+				    static_cast<int>(dModelKV),
+				    causal,
+				    localW_bw,
+				    gpuTransformerScratch->dQfull.data(),
+				    gpuTransformerScratch->dKfull.data(),
+				    gpuTransformerScratch->dVfull.data());
+				} else {
 				attnBwdDone = gpu::flash_attention_multihead_backward_bf16(
 				    gpuTransformerScratch->qLowp.data(),
 				    gpuTransformerScratch->kLowp.data(),
@@ -10628,6 +10680,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    gpuTransformerScratch->dQfull.data(),
 				    gpuTransformerScratch->dKfull.data(),
 				    gpuTransformerScratch->dVfull.data());
+				}
 			}
 			if (!attnBwdDone)
 			{

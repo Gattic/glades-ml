@@ -159,6 +159,14 @@ struct TransformerRunConfig
 	// Residual dropout: applied to attention output and FFN output before residual adds.
 	float residualDropoutRate;
 
+	// Local-window attention (paradigm shift #6 extension for main transformer).
+	// If > 0, each query attends to ±localAttnWindow tokens (plus BOS), giving
+	// O(T·W) compute instead of O(T²).  If 0, full attention.  Requires the
+	// flash path; silently ignored on the non-flash path.
+	// Validated via CHIRONLocalAttentionFullWindowParityTest + chiron_train
+	// `--local-attn` benchmarks (5.2-38.1× speedup at T=2k-16k).
+	int localAttnWindow;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -182,7 +190,8 @@ struct TransformerRunConfig
 	      ffnKind(FFN_MLP),
 	      ffnActivation(FFN_RELU),
 	      embeddingDropoutRate(0.0f),
-	      residualDropoutRate(0.0f)
+	      residualDropoutRate(0.0f),
+	      localAttnWindow(0)
 	{
 	}
 };
