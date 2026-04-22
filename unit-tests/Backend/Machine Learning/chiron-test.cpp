@@ -9421,6 +9421,7 @@ void CHIRONUnitTest()
 	CHIRONTrcdApplyGateConvexParityTest();
 	CHIRONLcpGatherScatterRoundtripTest();
 	CHIRONLcpDeltaParityTest();
+	CHIRONLcpEndToEndDetailCorrectionTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
@@ -12024,6 +12025,289 @@ void CHIRONLcpDeltaParityTest()
 	// when gather+scatter+delta cascade is composed.
 #else
 	std::printf("  [lcp delta] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONLcpEndToEndDetailCorrectionTest ------------------------------------
+// Paradigm shift #16 Phase 2: decisive gate for LCP.  Validates that a
+// small rank-r ReLU detail network D_φ trained to approximate the
+// Jacobian-style residual of a fixed main block can make the LCP-pooled
+// forward match the dense forward to within a tight tolerance.
+//
+// Mechanism:
+//   f(x) = relu(x · W_main)                           (the "main block")
+//   Y_dense[t, :] = f(X[t, :])                        (dense: per-token)
+//   cluster[t], rep_idx = LCP_cluster_assign(X)
+//   Y_pooled[t, :] = f(X[rep_idx[cluster[t]]])
+//                  + β · D_φ(X[t] − X[rep_idx[cluster[t]]])
+//   D_φ(δ) = W_up · relu(W_down · δ)  with rank r ≪ d
+//
+// Training: fit (W_down, W_up, β) to minimize ‖Y_dense − Y_pooled‖²
+// for K Adam steps, main block's W_main frozen.
+//
+// Assertions:
+//   - Initial MSE (β=0, D untrained): measure baseline cluster-pool error.
+//   - After K steps: MSE / baseline < 0.5  (detail net captures ≥50% of residual).
+//   - No NaN / Inf.
+void CHIRONLcpEndToEndDetailCorrectionTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [lcp e2e] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 128;
+	const unsigned int d = 48;
+	const unsigned int K_hash = 6;       // 2^6 = 64 potential buckets
+	const unsigned int r = 16;           // rank of detail network (r << d)
+	const unsigned int M_max = T;
+	const int          N_steps = 200;
+	const float        lr = 1e-2f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+
+	LCG rng(202604230u);
+
+	// Structured X: groups of 4 tokens share a "template" plus small noise,
+	// so LSH will cluster them together and the detail network has a real
+	// per-token residual to learn.
+	std::vector<float> X_h((size_t)T * d);
+	for (unsigned int t = 0; t < T; t += 4u) {
+		std::vector<float> tmpl(d);
+		for (unsigned int j = 0; j < d; ++j) tmpl[j] = 0.5f * rng.next_unit();
+		for (unsigned int k = 0; k < 4u && (t + k) < T; ++k)
+			for (unsigned int j = 0; j < d; ++j)
+				X_h[(size_t)(t + k) * d + j] = tmpl[j] + 0.1f * rng.next_unit();
+	}
+	std::vector<float> Wmain_h((size_t)d * d);
+	for (size_t i = 0; i < Wmain_h.size(); ++i) Wmain_h[i] = 0.30f * rng.next_unit();
+
+	// Detail network params (tiny random init).
+	std::vector<float> Wdown_h((size_t)d * r), Wup_h((size_t)r * d);
+	for (size_t i = 0; i < Wdown_h.size(); ++i) Wdown_h[i] = 0.10f * rng.next_unit();
+	for (size_t i = 0; i < Wup_h.size();   ++i) Wup_h[i]   = 0.10f * rng.next_unit();
+	float beta_h = 1.0f;
+
+	// Host-compute Y_dense = relu(X · W_main).
+	std::vector<float> Ydense_h((size_t)T * d);
+	{
+		std::vector<float> pre((size_t)T * d);
+		for (unsigned int t = 0; t < T; ++t)
+			for (unsigned int j = 0; j < d; ++j) {
+				float s = 0.0f;
+				for (unsigned int k = 0; k < d; ++k)
+					s += X_h[(size_t)t * d + k] * Wmain_h[(size_t)k * d + j];
+				pre[(size_t)t * d + j] = s;
+			}
+		for (size_t i = 0; i < pre.size(); ++i)
+			Ydense_h[i] = (pre[i] > 0.0f) ? pre[i] : 0.0f;
+	}
+
+	// Device allocations.
+	glades::gpu::GpuBuffer<float> d_X, d_Wmain, d_Wdown, d_Wup, d_beta;
+	glades::gpu::GpuBuffer<float> d_Ydense, d_Rlsh;
+	glades::gpu::GpuBuffer<unsigned int> d_buckets, d_repidx, d_cluster;
+	d_X.allocate(X_h.size());          d_X.upload(&X_h[0], X_h.size());
+	d_Wmain.allocate(Wmain_h.size());  d_Wmain.upload(&Wmain_h[0], Wmain_h.size());
+	d_Wdown.allocate(Wdown_h.size());  d_Wdown.upload(&Wdown_h[0], Wdown_h.size());
+	d_Wup.allocate(Wup_h.size());      d_Wup.upload(&Wup_h[0], Wup_h.size());
+	d_beta.allocate(1);                d_beta.upload(&beta_h, 1);
+	d_Ydense.allocate(Ydense_h.size()); d_Ydense.upload(&Ydense_h[0], Ydense_h.size());
+	d_Rlsh.allocate((size_t)d * K_hash);
+	d_buckets.allocate(T);
+	d_repidx.allocate(M_max);
+	d_cluster.allocate(T);
+
+	// Compute LSH buckets + cluster assignment ONCE (data is fixed for this test).
+	ASSERT("lcp_lsh_init_matrix",
+	    glades::gpu::lcp_lsh_init_matrix(d_Rlsh.data(), d, K_hash, 0xC0FFEE123ULL));
+	ASSERT("lcp_lsh_project",
+	    glades::gpu::lcp_lsh_project(d_X.data(), d_Rlsh.data(), T, d, K_hash, d_buckets.data()));
+	int n_reps = 0;
+	ASSERT("lcp_bucket_first_index",
+	    glades::gpu::lcp_bucket_first_index(
+	        d_buckets.data(), T, M_max,
+	        d_repidx.data(), &n_reps, d_cluster.data()));
+
+	// Scratch buffers.
+	glades::gpu::GpuBuffer<float> d_Xreps, d_prereps, d_Yreps;
+	glades::gpu::GpuBuffer<float> d_Yscatter, d_delta, d_mid, d_midpre;
+	glades::gpu::GpuBuffer<float> d_detail, d_Ypooled, d_dY, d_ddetail;
+	glades::gpu::GpuBuffer<float> d_dmid, d_dmidpre, d_ddelta, d_dWdown, d_dWup, d_dbeta;
+	glades::gpu::GpuBuffer<float> d_mWdown, d_vWdown, d_mWup, d_vWup, d_mbeta, d_vbeta;
+	d_Xreps.allocate((size_t)M_max * d);
+	d_prereps.allocate((size_t)M_max * d);
+	d_Yreps.allocate((size_t)M_max * d);
+	d_Yscatter.allocate((size_t)T * d);
+	d_delta.allocate((size_t)T * d);
+	d_mid.allocate((size_t)T * r);
+	d_midpre.allocate((size_t)T * r);
+	d_detail.allocate((size_t)T * d);
+	d_Ypooled.allocate((size_t)T * d);
+	d_dY.allocate((size_t)T * d);
+	d_ddetail.allocate((size_t)T * d);
+	d_dmid.allocate((size_t)T * r);
+	d_dmidpre.allocate((size_t)T * r);
+	d_ddelta.allocate((size_t)T * d);
+	d_dWdown.allocate(Wdown_h.size());
+	d_dWup.allocate(Wup_h.size());
+	d_dbeta.allocate(1);
+	d_mWdown.allocate(Wdown_h.size()); d_vWdown.allocate(Wdown_h.size());
+	d_mWup.allocate(Wup_h.size());     d_vWup.allocate(Wup_h.size());
+	d_mbeta.allocate(1); d_vbeta.allocate(1);
+	{
+		std::vector<float> zlarge(std::max(Wdown_h.size(), Wup_h.size()), 0.0f);
+		d_mWdown.upload(&zlarge[0], Wdown_h.size()); d_vWdown.upload(&zlarge[0], Wdown_h.size());
+		d_mWup.upload(&zlarge[0], Wup_h.size());     d_vWup.upload(&zlarge[0], Wup_h.size());
+		float zs = 0.0f; d_mbeta.upload(&zs, 1); d_vbeta.upload(&zs, 1);
+	}
+
+	// Gather reps and compute Y_reps = relu(X_reps · W_main) — FIXED across training.
+	ASSERT("lcp_gather for Xreps",
+	    glades::gpu::lcp_gather(d_X.data(), d_repidx.data(),
+	        (unsigned int)n_reps, d, d_Xreps.data()));
+	ASSERT("sgemm reps through Wmain",
+	    glades::gpu::sgemm_rowmajor((unsigned int)n_reps, d, d, 1.0f,
+	        d_Xreps.data(), d,
+	        d_Wmain.data(), d,
+	        0.0f,
+	        d_prereps.data(), d));
+	ASSERT("relu reps",
+	    glades::gpu::relu_forward(d_prereps.data(), n_reps * (int)d, d_Yreps.data()));
+
+	// Scatter Y_reps back to per-token Y_scatter — FIXED across training.
+	ASSERT("scatter Yreps",
+	    glades::gpu::lcp_scatter(d_Yreps.data(), d_cluster.data(),
+	        T, d, d_Yscatter.data()));
+
+	// Compute delta = X - X_reps[cluster].  Also FIXED (X and clusters don't change).
+	// Need X_reps per-token first: use lcp_scatter on X_reps.
+	glades::gpu::GpuBuffer<float> d_Xrep_per_token;
+	d_Xrep_per_token.allocate((size_t)T * d);
+	ASSERT("scatter Xreps",
+	    glades::gpu::lcp_scatter(d_Xreps.data(), d_cluster.data(),
+	        T, d, d_Xrep_per_token.data()));
+	ASSERT("lcp_compute_delta",
+	    glades::gpu::lcp_compute_delta(d_X.data(), d_Xreps.data(), d_cluster.data(),
+	        T, d, d_delta.data()));
+
+	// Baseline MSE: Y_scatter vs Y_dense (β=0, no detail correction).
+	float mse_init = 0.0f;
+	{
+		std::vector<float> ysc((size_t)T * d);
+		d_Yscatter.download(&ysc[0], ysc.size());
+		for (size_t i = 0; i < ysc.size(); ++i) {
+			float dv = ysc[i] - Ydense_h[i];
+			mse_init += dv * dv;
+		}
+		mse_init /= (float)ysc.size();
+	}
+
+	float mse_final = 0.0f;
+	for (int step = 1; step <= N_steps; ++step) {
+		// --- Forward detail network ---
+		// midpre = delta · W_down  [T × r]
+		ASSERT("sgemm delta·Wdown",
+		    glades::gpu::sgemm_rowmajor(T, r, d, 1.0f,
+		        d_delta.data(), d,
+		        d_Wdown.data(), r,
+		        0.0f,
+		        d_midpre.data(), r));
+		ASSERT("relu mid",
+		    glades::gpu::relu_forward(d_midpre.data(), (int)(T * r), d_mid.data()));
+		// detail = mid · W_up  [T × d]
+		ASSERT("sgemm mid·Wup",
+		    glades::gpu::sgemm_rowmajor(T, d, r, 1.0f,
+		        d_mid.data(), r,
+		        d_Wup.data(), d,
+		        0.0f,
+		        d_detail.data(), d));
+
+		// Ypooled = Yscatter + β · detail.  Do host-side axpy (small T).
+		float beta_now = 0.0f; d_beta.download(&beta_now, 1);
+		{
+			std::vector<float> ys((size_t)T * d), dt((size_t)T * d), yp((size_t)T * d);
+			d_Yscatter.download(&ys[0], ys.size());
+			d_detail.download(&dt[0], dt.size());
+			for (size_t i = 0; i < yp.size(); ++i) yp[i] = ys[i] + beta_now * dt[i];
+			d_Ypooled.upload(&yp[0], yp.size());
+		}
+
+		// Loss: (1/N) Σ (Ypooled - Ydense)².  dY = 2/N · (Ypooled - Ydense).
+		std::vector<float> yp_h((size_t)T * d), dy_h((size_t)T * d);
+		d_Ypooled.download(&yp_h[0], yp_h.size());
+		float loss = 0.0f;
+		const float inv_N = 1.0f / (float)yp_h.size();
+		for (size_t i = 0; i < yp_h.size(); ++i) {
+			float dv = yp_h[i] - Ydense_h[i];
+			dy_h[i] = 2.0f * inv_N * dv;
+			loss  += dv * dv * inv_N;
+		}
+		d_dY.upload(&dy_h[0], dy_h.size());
+
+		// --- Backward ---
+		// d_detail = β · dY (every t, j).  d_β = Σ detail · dY.
+		float dbeta_cpu = 0.0f;
+		{
+			std::vector<float> dt((size_t)T * d), ddet((size_t)T * d);
+			d_detail.download(&dt[0], dt.size());
+			for (size_t i = 0; i < ddet.size(); ++i) {
+				ddet[i] = beta_now * dy_h[i];
+				dbeta_cpu += dt[i] * dy_h[i];
+			}
+			d_ddetail.upload(&ddet[0], ddet.size());
+		}
+		float dbeta_arr[1] = { dbeta_cpu };
+		d_dbeta.upload(dbeta_arr, 1);
+
+		// d_Wup = mid^T · d_detail  [r × d];  d_mid = d_detail · W_up^T  [T × r]
+		ASSERT("bwd dWup",
+		    glades::gpu::sgemm_rowmajor_atb(r, d, T, 1.0f,
+		        d_mid.data(), r,
+		        d_ddetail.data(), d,
+		        0.0f,
+		        d_dWup.data(), d));
+		ASSERT("bwd dmid",
+		    glades::gpu::sgemm_rowmajor_abt(T, r, d, 1.0f,
+		        d_ddetail.data(), d,
+		        d_Wup.data(), d,
+		        0.0f,
+		        d_dmid.data(), r));
+		// ReLU backward: d_midpre = (midpre > 0) · d_mid.
+		ASSERT("bwd relu",
+		    glades::gpu::relu_backward(d_dmid.data(), d_midpre.data(),
+		        (int)(T * r), d_dmidpre.data()));
+		// d_Wdown = delta^T · d_midpre [d × r]
+		ASSERT("bwd dWdown",
+		    glades::gpu::sgemm_rowmajor_atb(d, r, T, 1.0f,
+		        d_delta.data(), d,
+		        d_dmidpre.data(), r,
+		        0.0f,
+		        d_dWdown.data(), r));
+
+		// --- Adam updates ---
+		ASSERT("adam Wdown", glades::gpu::adam_update(d_Wdown.data(), d_dWdown.data(),
+		    d_mWdown.data(), d_vWdown.data(), lr, b1, b2, eps, 0.0f, 1.0f, step,
+		    (int)Wdown_h.size()));
+		ASSERT("adam Wup", glades::gpu::adam_update(d_Wup.data(), d_dWup.data(),
+		    d_mWup.data(), d_vWup.data(), lr, b1, b2, eps, 0.0f, 1.0f, step,
+		    (int)Wup_h.size()));
+		ASSERT("adam beta", glades::gpu::adam_update(d_beta.data(), d_dbeta.data(),
+		    d_mbeta.data(), d_vbeta.data(), lr, b1, b2, eps, 0.0f, 1.0f, step, 1));
+
+		if (step == 1 || step == N_steps || step % 50 == 0) {
+			std::printf("  [lcp e2e] step=%d loss=%.4e  β=%.3f\n", step, loss, beta_now);
+		}
+		if (step == N_steps) mse_final = loss;
+	}
+
+	const float mse_ratio = mse_init / mse_final;
+	std::printf("  [lcp e2e] n_reps=%d T=%u d=%u r=%u K=%d: "
+	            "baseline MSE=%.4e, trained MSE=%.4e, ratio=%.2fx\n",
+	            n_reps, T, d, r, N_steps, mse_init, mse_final, mse_ratio);
+	ASSERT("lcp e2e weights finite", mse_final == mse_final && mse_final < 1e6f);
+	ASSERT("lcp e2e trained ≥2x baseline",  mse_ratio >= 2.0f);
+#else
+	std::printf("  [lcp e2e] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 
