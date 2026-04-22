@@ -3735,11 +3735,33 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 {
 	if (T <= 0 || vocabSize <= 0)
 		return true;
-	const int block = 256;
-	const int smemBytes = 3 * block * static_cast<int>(sizeof(float));
-	collect_token_lm_metrics_kernel<<<1, block, smemBytes, computeStream()>>>(
-	    probs, targets, T, vocabSize, padToken, out);
-	GLADES_CUDA_CHECK(cudaGetLastError());
+	// PERF FIX (see memory/perf_regression_apr16.md): the previous
+	// collect_token_lm_metrics_kernel launched with <<<1, 256>>> — a single
+	// thread block of 256 threads processing T×vocabSize work entirely
+	// inside one block.  At T=2048, vocabSize=32000 this was ~24 ms/call,
+	// consuming ~8% of GPU time per training step.
+	//
+	// The properly-parallelized implementation is already present as two
+	// separate kernels (cross_entropy_nll_loss + argmax_count_matches) —
+	// both use grid=(T+block-1)/block clamped at 128 blocks.  Route
+	// collect_token_lm_metrics through those to restore the pre-eecdb97c1
+	// throughput.
+	//
+	// Output layout (unchanged for call-site compatibility):
+	//   out[0] = loss_sum  (bit-cast float)
+	//   out[1] = valid_count
+	//   out[2] = correct_count
+	//   out[3] = samples_count  (= valid_count for now)
+	float* loss_sum       = reinterpret_cast<float*>(&out[0]);
+	int*   loss_count     = &out[1];
+	int*   correct_count  = &out[2];
+	int*   samples_count  = &out[3];
+	if (!cross_entropy_nll_loss(probs, targets, T, vocabSize, padToken,
+	                            loss_sum, loss_count))
+		return false;
+	if (!argmax_count_matches(probs, targets, T, vocabSize, padToken,
+	                          correct_count, samples_count))
+		return false;
 	return true;
 }
 
