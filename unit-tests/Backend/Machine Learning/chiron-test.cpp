@@ -31,6 +31,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_ovfg.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_mpot.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_mfio.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_dfa.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -8180,6 +8181,175 @@ void CHIRONMfioV2DeepMLPTest()
 #endif
 }
 
+// CHIRONDfaMLPTest ----------------------------------------------------------
+// Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
+// on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
+// DFA uses a FIXED RANDOM backward matrix per layer:
+//   e_1_proj = e_global · R_1        (projected error at layer 1's output)
+//   dW_1     = X_0^T · e_1_proj      (local update, no true gradient flow)
+// Layer 2 still gets the true e_global (it IS the output layer).
+//
+// Expectation per prior art: DFA converges on shallow MLPs at ≥ 40-80%
+// of backprop's final-loss reduction.  Test asserts ≥ 5× loss reduction
+// (a conservative floor; actual expected ~50-200× on 2-layer ReLU).
+void CHIRONDfaMLPTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [dfa mlp] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T     = 64;
+	const unsigned int m_in  = 24;
+	const unsigned int m_hid = 32;
+	const unsigned int n_out = 16;
+	const int          N     = 200;
+	const float        lr    = 5e-3f;
+	const float        b1    = 0.9f;
+	const float        b2    = 0.999f;
+	const float        eps   = 1e-8f;
+
+	LCG rng(202604241u);
+	std::vector<float> W1s_h((size_t)m_in  * m_hid);
+	std::vector<float> W2s_h((size_t)m_hid * n_out);
+	std::vector<float> X_h((size_t)T * m_in);
+	std::vector<float> W10_h((size_t)m_in  * m_hid);
+	std::vector<float> W20_h((size_t)m_hid * n_out);
+	for (size_t i = 0; i < W1s_h.size(); ++i) W1s_h[i] = 0.3f  * rng.next_unit();
+	for (size_t i = 0; i < W2s_h.size(); ++i) W2s_h[i] = 0.3f  * rng.next_unit();
+	for (size_t i = 0; i < X_h.size(); ++i)   X_h[i]   = 0.5f  * rng.next_unit();
+	for (size_t i = 0; i < W10_h.size(); ++i) W10_h[i] = 0.08f * rng.next_unit();
+	for (size_t i = 0; i < W20_h.size(); ++i) W20_h[i] = 0.08f * rng.next_unit();
+
+	// Host-compute Y_tgt = W2_tgt · sigmoid(W1_tgt · x)
+	std::vector<float> Ytgt_h((size_t)T * n_out);
+	{
+		std::vector<float> h((size_t)T * m_hid);
+		for (unsigned t = 0; t < T; ++t)
+			for (unsigned j = 0; j < m_hid; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < m_in; ++k)
+					s += X_h[(size_t)t * m_in + k] * W1s_h[(size_t)k * m_hid + j];
+				h[(size_t)t * m_hid + j] = 1.0f / (1.0f + std::exp(-s));
+			}
+		for (unsigned t = 0; t < T; ++t)
+			for (unsigned j = 0; j < n_out; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < m_hid; ++k)
+					s += h[(size_t)t * m_hid + k] * W2s_h[(size_t)k * n_out + j];
+				Ytgt_h[(size_t)t * n_out + j] = s;
+			}
+	}
+
+	glades::gpu::GpuBuffer<float> d_X, d_Ytgt, d_W1, d_W2, d_H_pre, d_H, d_Y,
+	                              d_dY, d_dH_pre, d_e_proj, d_dW1, d_dW2,
+	                              d_R1, d_m1, d_v1, d_m2, d_v2;
+	d_X.allocate(X_h.size());         d_X.upload(&X_h[0], X_h.size());
+	d_Ytgt.allocate(Ytgt_h.size());   d_Ytgt.upload(&Ytgt_h[0], Ytgt_h.size());
+	d_W1.allocate(W10_h.size());      d_W1.upload(&W10_h[0], W10_h.size());
+	d_W2.allocate(W20_h.size());      d_W2.upload(&W20_h[0], W20_h.size());
+	d_H_pre.allocate((size_t)T * m_hid);
+	d_H.allocate((size_t)T * m_hid);
+	d_Y.allocate((size_t)T * n_out);
+	d_dY.allocate((size_t)T * n_out);
+	d_dH_pre.allocate((size_t)T * m_hid);
+	d_e_proj.allocate((size_t)T * m_hid);
+	d_dW1.allocate(W10_h.size());
+	d_dW2.allocate(W20_h.size());
+	d_R1.allocate((size_t)n_out * m_hid);
+	d_m1.allocate(W10_h.size()); d_v1.allocate(W10_h.size());
+	d_m2.allocate(W20_h.size()); d_v2.allocate(W20_h.size());
+	std::vector<float> z1(W10_h.size(), 0.0f), z2(W20_h.size(), 0.0f);
+	d_m1.upload(&z1[0], z1.size()); d_v1.upload(&z1[0], z1.size());
+	d_m2.upload(&z2[0], z2.size()); d_v2.upload(&z2[0], z2.size());
+
+	// DFA fixed random backward matrix for layer 1.  R_1 is [n_out × m_hid].
+	// Scale = 1/√m_hid keeps projected-error variance ~O(1) per-hidden-unit.
+	ASSERT("dfa_init_random_matrix R_1",
+	       glades::gpu::dfa_init_random_matrix(
+	           d_R1.data(), n_out, m_hid, 0x9E3779B97F4A7C15ULL,
+	           1.0f / std::sqrt((float)m_hid)));
+
+	std::vector<float> Y((size_t)T * n_out), dY((size_t)T * n_out);
+	float loss_first = -1.0f, loss_last = -1.0f;
+	for (int step = 1; step <= N; ++step)
+	{
+		// Forward
+		glades::gpu::sgemm_rowmajor(T, m_hid, m_in, 1.0f,
+		                            d_X.data(), m_in,
+		                            d_W1.data(), m_hid,
+		                            0.0f,
+		                            d_H_pre.data(), m_hid);
+		glades::gpu::relu_forward(d_H_pre.data(), (int)((size_t)T * m_hid),
+		                          d_H.data());
+		glades::gpu::sgemm_rowmajor(T, n_out, m_hid, 1.0f,
+		                            d_H.data(), m_hid,
+		                            d_W2.data(), n_out,
+		                            0.0f,
+		                            d_Y.data(), n_out);
+		d_Y.download(&Y[0], Y.size());
+		float loss = 0.0f;
+		for (size_t i = 0; i < Y.size(); ++i)
+		{
+			const float d = Y[i] - Ytgt_h[i];
+			loss += d * d;
+			dY[i] = (2.0f / float(Y.size())) * d;
+		}
+		loss /= float(Y.size());
+		if (step == 1) loss_first = loss;
+		loss_last = loss;
+		d_dY.upload(&dY[0], dY.size());
+
+		// Layer 2 gets TRUE gradient (it's the output layer).
+		glades::gpu::sgemm_rowmajor_atb(m_hid, n_out, T, 1.0f,
+		                                d_H.data(), m_hid,
+		                                d_dY.data(), n_out,
+		                                0.0f,
+		                                d_dW2.data(), n_out);
+
+		// Layer 1 gets DFA fake gradient: dH = dY · R_1.
+		// Then apply ReLU backward mask, then dW1 = X^T · dH_pre.
+		ASSERT("dfa_project_error for layer 1",
+		       glades::gpu::dfa_project_error(
+		           d_dY.data(), d_R1.data(),
+		           T, n_out, m_hid,
+		           d_e_proj.data()));
+		glades::gpu::relu_backward(d_e_proj.data(), d_H_pre.data(),
+		                           (int)((size_t)T * m_hid),
+		                           d_dH_pre.data());
+		glades::gpu::sgemm_rowmajor_atb(m_in, m_hid, T, 1.0f,
+		                                d_X.data(), m_in,
+		                                d_dH_pre.data(), m_hid,
+		                                0.0f,
+		                                d_dW1.data(), m_hid);
+
+		// Adam on both layers — DFA + Adam is a common pairing; the
+		// DFA-ness is in how dW1 is COMPUTED, not in the optimizer.
+		glades::gpu::adam_update(
+		    d_W2.data(), d_dW2.data(),
+		    d_m2.data(), d_v2.data(),
+		    lr, b1, b2, eps, 0.0f, 1.0f,
+		    step, (int)W20_h.size());
+		glades::gpu::adam_update(
+		    d_W1.data(), d_dW1.data(),
+		    d_m1.data(), d_v1.data(),
+		    lr, b1, b2, eps, 0.0f, 1.0f,
+		    step, (int)W10_h.size());
+	}
+
+	std::printf("  [dfa mlp L=2] loss %.4e -> %.4e (%.2fx reduction) over %d steps\n",
+	            loss_first, loss_last, loss_first / loss_last, N);
+	ASSERT("DFA descends on 2-layer MLP", loss_last < loss_first);
+	ASSERT("DFA achieves ≥ 5× loss reduction on 2-layer MLP (weak floor)",
+	       loss_first / loss_last >= 5.0f);
+#else
+	std::printf("  [dfa mlp] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -8306,6 +8476,7 @@ void CHIRONUnitTest()
 	CHIRONMfioNonlinearMLPTest();
 	CHIRONMfioDeeperMLPTest();
 	CHIRONMfioV2DeepMLPTest();
+	CHIRONDfaMLPTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
