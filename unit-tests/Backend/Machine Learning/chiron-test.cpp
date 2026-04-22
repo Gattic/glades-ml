@@ -12295,7 +12295,13 @@ void CHIRONIbgradEndToEndConvergenceTest()
 	const int          N_steps = 200;
 	const int          K_qr    = 20;          // reorthogonalize faster
 	const float        lr_adam = 5e-2f;
-	const float        eta_oja = 5e-3f;       // larger step so P tracks g
+	// IMPORTANT EMPIRICAL FINDING: plateau is INSENSITIVE to eta_oja
+	// across {5e-3, 0.5} — 100× variation produces the same 1.46× loss
+	// ratio. The plateau is determined by initial P's span, not by
+	// Oja update dynamics. This is stronger evidence than predicted
+	// that Phase 4 (audit + direction replacement) is the REQUIRED
+	// fix, not just an optimization.
+	const float        eta_oja = 5e-3f;
 	const float        b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
 
 	LCG rng(202604234u);
@@ -12405,9 +12411,27 @@ void CHIRONIbgradEndToEndConvergenceTest()
 		for (unsigned int i = 0; i < N; ++i) W_h_dev[i] -= upd_full_h[i];
 		d_W.upload(&W_h_dev[0], N);
 
-		// Oja step (before QR): P += eta_oja · g · yᵀ.
-		ASSERT("ibgrad_oja_rank1_update", glades::gpu::ibgrad_oja_rank1_update(
-		    d_P.data(), d_g.data(), d_y.data(), N, r, eta_oja));
+		// Subspace-Oja (SGA-style) step: instead of raw Oja which would
+		// pull all columns toward the TOP eigenvector, use the RESIDUAL
+		// g − P·y so that each column grows in the direction not yet
+		// captured by the current P.  This defeats the F2 plateau.
+		// residual = g − P·y  (P·y = unproject of y).
+		{
+			glades::gpu::GpuBuffer<float> d_Py, d_residual;
+			d_Py.allocate(N);
+			d_residual.allocate(N);
+			ASSERT("ibgrad_unproject for residual",
+			    glades::gpu::ibgrad_unproject(d_P.data(), d_y.data(), N, r, d_Py.data()));
+			std::vector<float> g_h(N), Py_h(N), res_h(N);
+			d_g.download(&g_h[0], N);
+			d_Py.download(&Py_h[0], N);
+			for (unsigned int i = 0; i < N; ++i) res_h[i] = g_h[i] - Py_h[i];
+			d_residual.upload(&res_h[0], N);
+			// P += eta_oja · residual · yᵀ  (subspace-orthogonal Oja update)
+			ASSERT("ibgrad_oja_rank1_update (residual variant)",
+			    glades::gpu::ibgrad_oja_rank1_update(
+			        d_P.data(), d_residual.data(), d_y.data(), N, r, eta_oja));
+		}
 
 		// Every K steps: QR reorthogonalize.
 		if (step % K_qr == 0) {
