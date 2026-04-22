@@ -979,6 +979,101 @@ void stiefel_check_orthogonality(GpuStiefelWeight&)
 }
 
 // ===========================================================================
+// stiefel_dense_grad_to_tangent — chain-rule projection of dW to Stiefel tangent.
+//
+// Given W = U · diag(Σ) · V^T and dW ∈ R^{m×n}, compute:
+//   dU_raw[m,r] = dW · V · diag(Σ)          (sgemm + scale)
+//   dΣ[r]       = diag(U^T · dW · V)         (sgemm + row-sum)
+//   dV_raw[n,r] = dW^T · U · diag(Σ)         (atb sgemm + scale)
+//
+// Then project dU, dV onto the Stiefel tangent spaces via
+// stiefel_tangent_project_grad.  Output dU, dV are in-place
+// tangent-projected (ready for stiefel_adam_step / stiefel_adam_step_cayley).
+// ===========================================================================
+
+void stiefel_dense_grad_to_tangent(const GpuStiefelWeight& s,
+                                   const float* dW_dense,
+                                   float* dU, float* dsigma, float* dV,
+                                   float* scratch_mr,
+                                   float* scratch_rr,
+                                   float* scratch_rr2)
+{
+	if (!s.allocated() || dW_dense == nullptr) return;
+	if (dU == nullptr || dV == nullptr || dsigma == nullptr) return;
+
+	// Refresh FP32 U, V cache.
+	GpuStiefelWeight& sref = const_cast<GpuStiefelWeight&>(s);
+	stiefel_refresh_fp32_cache_impl(sref);
+	const float* U_f32 = s.U_f32_cache.data();
+	const float* V_f32 = s.V_f32_cache.data();
+	const float* sig   = s.sigma.data();
+
+	const unsigned int m = s.m, n = s.n, r = s.r;
+
+	// (1) dU_raw = dW · V   [m × r].
+	if (!sgemm_rowmajor(m, r, n, 1.0f, dW_dense, n, V_f32, r, 0.0f, dU, r))
+		return;
+	// dU_raw ← dU_raw · diag(Σ)  (column-broadcast)
+	{
+		dim3 block(64);
+		dim3 grid(m, (r + block.x - 1) / block.x);
+		k_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(dU, sig, m, r);
+		cudaGetLastError();
+	}
+
+	// (2) Intermediate T = U^T · dW  [r × n] via atb (A=U [m,r], B=dW [m,n]).
+	// Reuse scratch_mr: it has m*r floats, we need r*n.  If r*n > m*r, that is
+	// if n > m, the buffer is too small — the caller must size scratch_mr as
+	// max(m*r, r*n).  For square-ish (m ≈ n, r ≤ min(m,n)) this is fine.
+	float* UtW = scratch_mr;
+	if (!sgemm_rowmajor_atb(r, n, m, 1.0f, U_f32, r, dW_dense, n, 0.0f, UtW, n))
+		return;
+
+	// (3) dV_raw = dW^T · U · diag(Σ)  [n × r]: first compute (dW^T · U),
+	// which is the transpose of (U^T · dW) = UtW.  Then scale by Σ.
+	// dW^T · U [n, r] is the transpose of UtW [r, n].  So we just need
+	// dV_raw[n, r] such that dV_raw[i, j] = UtW[j, i].
+	// Use k_transpose_2d to perform this.
+	{
+		dim3 block(16, 16);
+		dim3 grid((n + block.x - 1) / block.x, (r + block.y - 1) / block.y);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(UtW, dV, r, n);
+		cudaGetLastError();
+	}
+	// dV_raw ← dV_raw · diag(Σ)
+	{
+		dim3 block(64);
+		dim3 grid(n, (r + block.x - 1) / block.x);
+		k_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(dV, sig, n, r);
+		cudaGetLastError();
+	}
+
+	// (4) dΣ[k] = (U^T · dW · V)[k, k]  = Σ_j UtW[k, j] · V[j, k].
+	// Compute UtW_V = UtW · V  [r × r], take diagonal.
+	if (!sgemm_rowmajor(r, r, n, 1.0f, UtW, n, V_f32, r, 0.0f, scratch_rr2, r))
+		return;
+	// Extract diagonal into dsigma.
+	{
+		// Small kernel would be ideal; use a simple download-diagonal path
+		// (this is a small r×r operation).
+		// Inline kernel:
+		// For each k, dsigma[k] = scratch_rr2[k*r + k]
+		// For correctness + simplicity, do it host-side since r is small.
+		std::vector<float> h_rr(size_t(r) * r);
+		cudaMemcpyAsync(&h_rr[0], scratch_rr2, size_t(r) * r * sizeof(float),
+		                cudaMemcpyDeviceToHost, computeStream());
+		cudaStreamSynchronize(computeStream());
+		std::vector<float> h_diag(r);
+		for (unsigned int k = 0; k < r; ++k) h_diag[k] = h_rr[size_t(k) * r + k];
+		cudaMemcpyAsync(dsigma, &h_diag[0], size_t(r) * sizeof(float),
+		                cudaMemcpyHostToDevice, computeStream());
+	}
+
+	// (5) Tangent-project dU and dV in place.
+	stiefel_tangent_project_grad(s, dU, dV, scratch_rr, scratch_rr2);
+}
+
+// ===========================================================================
 // stiefel_init_from_dense — truncated-SVD initialization (Phase 2h).
 // Declared earlier in the file; body here after the cuSOLVER handle,
 // transpose kernel, and stiefel_solver_init are all defined.

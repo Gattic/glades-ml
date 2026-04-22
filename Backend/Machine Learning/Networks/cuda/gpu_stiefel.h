@@ -276,6 +276,36 @@ void stiefel_reconstruct_dense(const GpuStiefelWeight& stiefel, float* W_dense);
 bool stiefel_init_from_dense(GpuStiefelWeight& stiefel,
                              const float* W_dense);
 
+// ========================================================================
+// Convert a dense weight gradient dW ∈ R^{m × n} (from a standard
+// dense-backed forward/backward) into Stiefel tangent-space gradients
+// (dU, dΣ, dV).  Chain rule through W = U·diag(Σ)·V^T gives:
+//
+//     dL/dU = dW · V · diag(Σ)          [m × r], then tangent-project
+//     dL/dΣ[k] = (U^T · dW · V)[k, k]    [r]
+//     dL/dV = dW^T · U · diag(Σ)         [n × r], then tangent-project
+//
+// Used by the Phase 2h trainer wire-in: the existing dense attention
+// shear computes dW exactly as before; the Stiefel optimizer then
+// consumes it via this function + stiefel_adam_step_cayley.
+//
+// Scratches required:
+//   scratch_mn [m × n] — temporary U^T · dW (or reuse if n ≥ m)
+//   scratch_rr [r × r] — symmetrization buffer for tangent projection
+//   scratch_rr2 [r × r]
+//
+// Output dU, dV are written in-place tangent-projected (ready for Adam).
+// ========================================================================
+void stiefel_dense_grad_to_tangent(
+    const GpuStiefelWeight& stiefel,
+    const float* dW_dense,       // [m × n]
+    float* dU,                    // [m × r] output (tangent-projected)
+    float* dsigma,                // [r]
+    float* dV,                    // [n × r] output (tangent-projected)
+    float* scratch_mr,            // [m × r] scratch
+    float* scratch_rr,            // [r × r] scratch for U projection
+    float* scratch_rr2);          // [r × r] scratch for V projection
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
