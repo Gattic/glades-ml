@@ -57,6 +57,8 @@ void CHIRONTrcdRouteLogitsBackwardParityTest();
 void CHIRONTrcdGumbelGateEvalTest();
 void CHIRONTrcdApplyGateParityTest();
 void CHIRONTrcdLambdaPiControllerTest();
+void CHIRONTrcdApplyGateConvexParityTest();
+void CHIRONTrcdRoutingThroughputBenchmark();
 void CHIRONTrcdEndToEndConvergenceTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.

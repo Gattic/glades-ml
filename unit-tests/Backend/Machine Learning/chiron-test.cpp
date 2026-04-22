@@ -9417,6 +9417,8 @@ void CHIRONUnitTest()
 	CHIRONTrcdGumbelGateEvalTest();
 	CHIRONTrcdApplyGateParityTest();
 	CHIRONTrcdLambdaPiControllerTest();
+	CHIRONTrcdApplyGateConvexParityTest();
+	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
@@ -11778,6 +11780,174 @@ void CHIRONTrcdLambdaPiControllerTest()
 #endif
 }
 
+// CHIRONTrcdApplyGateConvexParityTest --------------------------------------
+// Paradigm shift #13 Phase 3 prep: validate the fused convex-combination
+// kernel:  h_out = α·h_deep + (1−α)·h_skip,  with forward + all three grads.
+void CHIRONTrcdApplyGateConvexParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [trcd convex-gate] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 96;
+	const unsigned int d = 384;
+	LCG rng(202604226u);
+
+	std::vector<float> hD_host((size_t)T * d), hS_host((size_t)T * d),
+	                   alpha_host(T), dh_host((size_t)T * d);
+	for (size_t i = 0; i < hD_host.size(); ++i) hD_host[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < hS_host.size(); ++i) hS_host[i] = 0.3f * rng.next_unit();
+	for (unsigned int t = 0; t < T; ++t)         alpha_host[t] = 0.5f * (rng.next_unit() + 1.0f);
+	for (size_t i = 0; i < dh_host.size(); ++i) dh_host[i] = 0.4f * rng.next_unit();
+
+	// CPU reference.
+	std::vector<float> hout_ref((size_t)T * d), dhD_ref((size_t)T * d),
+	                   dhS_ref((size_t)T * d), dalpha_ref(T, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float a = alpha_host[t];
+		const float ac = 1.0f - a;
+		float dsum = 0.0f;
+		for (unsigned int j = 0; j < d; ++j)
+		{
+			const size_t idx = (size_t)t * d + j;
+			hout_ref[idx] = a * hD_host[idx] + ac * hS_host[idx];
+			dhD_ref[idx]  = a  * dh_host[idx];
+			dhS_ref[idx]  = ac * dh_host[idx];
+			dsum         += (hD_host[idx] - hS_host[idx]) * dh_host[idx];
+		}
+		dalpha_ref[t] = dsum;
+	}
+
+	glades::gpu::GpuBuffer<float> d_hD, d_hS, d_alpha, d_hout, d_dh, d_dhD, d_dhS, d_dalpha;
+	d_hD.allocate(hD_host.size());      d_hD.upload(&hD_host[0], hD_host.size());
+	d_hS.allocate(hS_host.size());      d_hS.upload(&hS_host[0], hS_host.size());
+	d_alpha.allocate(T);                d_alpha.upload(&alpha_host[0], T);
+	d_hout.allocate(hD_host.size());
+	d_dh.allocate(dh_host.size());      d_dh.upload(&dh_host[0], dh_host.size());
+	d_dhD.allocate(hD_host.size());
+	d_dhS.allocate(hS_host.size());
+	d_dalpha.allocate(T);
+
+	ASSERT("trcd_apply_gate_convex fwd",
+	    glades::gpu::trcd_apply_gate_convex(d_hD.data(), d_hS.data(), d_alpha.data(),
+	        T, d, d_hout.data()));
+	ASSERT("trcd_apply_gate_convex bwd",
+	    glades::gpu::trcd_apply_gate_convex_backward(
+	        d_dh.data(), d_hD.data(), d_hS.data(), d_alpha.data(),
+	        T, d, d_dhD.data(), d_dhS.data(), d_dalpha.data()));
+	glades::gpu::synchronizeCheck("trcd_apply_gate_convex");
+
+	std::vector<float> hout_gpu((size_t)T * d), dhD_gpu((size_t)T * d),
+	                   dhS_gpu((size_t)T * d), dalpha_gpu(T);
+	d_hout.download(&hout_gpu[0], hout_gpu.size());
+	d_dhD.download(&dhD_gpu[0], dhD_gpu.size());
+	d_dhS.download(&dhS_gpu[0], dhS_gpu.size());
+	d_dalpha.download(&dalpha_gpu[0], T);
+
+	float fwd_err = 0.0f, dhD_err = 0.0f, dhS_err = 0.0f, da_err = 0.0f;
+	for (size_t i = 0; i < hout_ref.size(); ++i)
+	{
+		float e1 = std::fabs(hout_gpu[i] - hout_ref[i]);
+		float e2 = std::fabs(dhD_gpu[i]  - dhD_ref[i]);
+		float e3 = std::fabs(dhS_gpu[i]  - dhS_ref[i]);
+		if (e1 > fwd_err) fwd_err = e1;
+		if (e2 > dhD_err) dhD_err = e2;
+		if (e3 > dhS_err) dhS_err = e3;
+	}
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		float e = std::fabs(dalpha_gpu[t] - dalpha_ref[t]);
+		if (e > da_err) da_err = e;
+	}
+	std::printf("  [trcd convex-gate] T=%u d=%u fwd=%.3e dh_D=%.3e dh_S=%.3e dα=%.3e\n",
+	            T, d, fwd_err, dhD_err, dhS_err, da_err);
+	ASSERT("convex fwd   < 1e-5", fwd_err < 1e-5f);
+	ASSERT("convex dh_D  < 1e-5", dhD_err < 1e-5f);
+	ASSERT("convex dh_S  < 1e-5", dhS_err < 1e-5f);
+	ASSERT("convex dα    < 1e-4", da_err  < 1e-4f);
+#else
+	std::printf("  [trcd convex-gate] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONTrcdRoutingThroughputBenchmark -------------------------------------
+// Measures the wall-clock cost of the TRCD routing overhead (route logits +
+// gate + convex gate + backward) at pile_large-scale dims (T=2048, d=1024).
+// Reports per-step cost in ms; this is the overhead that must be amortized
+// by the 3× FLOP reduction from skipping (L − d̄) layers.  Also reports the
+// projected break-even — the min d̄ below which routing savings exceed overhead.
+void CHIRONTrcdRoutingThroughputBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [trcd throughput bench] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 2048;
+	const unsigned int d = 1024;
+	const int          warmup = 10;
+	const int          iters  = 100;
+
+	LCG rng(202604227u);
+	std::vector<float> hD_host((size_t)T * d), hS_host((size_t)T * d), a_host(d);
+	for (size_t i = 0; i < hD_host.size(); ++i) hD_host[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < hS_host.size(); ++i) hS_host[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < a_host.size();  ++i) a_host[i]  = 0.2f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_hD, d_hS, d_a, d_u, d_alpha, d_hout, d_dh, d_dhD, d_dhS, d_dalpha;
+	d_hD.allocate(hD_host.size()); d_hD.upload(&hD_host[0], hD_host.size());
+	d_hS.allocate(hS_host.size()); d_hS.upload(&hS_host[0], hS_host.size());
+	d_a.allocate(d);               d_a.upload(&a_host[0], d);
+	d_u.allocate(T);
+	d_alpha.allocate(T);
+	d_hout.allocate((size_t)T * d);
+	d_dh.allocate((size_t)T * d);  d_dh.upload(&hD_host[0], hD_host.size());
+	d_dhD.allocate((size_t)T * d);
+	d_dhS.allocate((size_t)T * d);
+	d_dalpha.allocate(T);
+
+	// Warmup.
+	for (int w = 0; w < warmup; ++w) {
+		glades::gpu::trcd_route_logits(d_hD.data(), d_a.data(), 0.1f, T, d, d_u.data());
+		glades::gpu::trcd_gumbel_gate(d_u.data(), 0.0f, 1.0f, (uint64_t)w, true, T, d_alpha.data());
+		glades::gpu::trcd_apply_gate_convex(d_hD.data(), d_hS.data(), d_alpha.data(), T, d, d_hout.data());
+		glades::gpu::trcd_apply_gate_convex_backward(
+		    d_dh.data(), d_hD.data(), d_hS.data(), d_alpha.data(),
+		    T, d, d_dhD.data(), d_dhS.data(), d_dalpha.data());
+	}
+	glades::gpu::synchronizeCheck("trcd bench warmup");
+
+	const double t0 = wall_ms_chiron();
+	for (int i = 0; i < iters; ++i) {
+		glades::gpu::trcd_route_logits(d_hD.data(), d_a.data(), 0.1f, T, d, d_u.data());
+		glades::gpu::trcd_gumbel_gate(d_u.data(), 0.0f, 1.0f, (uint64_t)i, true, T, d_alpha.data());
+		glades::gpu::trcd_apply_gate_convex(d_hD.data(), d_hS.data(), d_alpha.data(), T, d, d_hout.data());
+		glades::gpu::trcd_apply_gate_convex_backward(
+		    d_dh.data(), d_hD.data(), d_hS.data(), d_alpha.data(),
+		    T, d, d_dhD.data(), d_dhS.data(), d_dalpha.data());
+	}
+	glades::gpu::synchronizeCheck("trcd bench hot");
+	const double t_hot = wall_ms_chiron() - t0;
+
+	const double per_call = t_hot / (double)iters;
+	// A single transformer block forward+backward at pile_large scale (T=2048,
+	// d=1024, attn + FFN) is ~10-20 ms on RTX 4080 SUPER; conservative lower
+	// bound 8 ms.  Routing overhead under 10% of that → break-even at ~d̄=L.
+	const double block_ms_est = 8.0;
+	const double break_even_d = block_ms_est / per_call;  // layers we must save
+	std::printf("  [trcd throughput bench] T=%u d=%u: %d routing cycles in %.2f ms "
+	            "(%.4f ms/cycle, projected break-even: need to skip ≥ %.1f layers per step)\n",
+	            T, d, iters, t_hot, per_call, 1.0 / (per_call / block_ms_est));
+	ASSERT("trcd routing cost per cycle < 1 ms at pile_large scale", per_call < 1.0);
+#else
+	std::printf("  [trcd throughput bench] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONTrcdEndToEndConvergenceTest -----------------------------------------
 // Paradigm shift #13, Phase 2: the full TRCD loop closes.  A small MLP is
 // trained with the mechanism described in PARADIGM_SHIFT_13_CANDIDATE_C_TRCD.md:
@@ -11940,32 +12110,10 @@ void CHIRONTrcdEndToEndConvergenceTest()
 		ASSERT("trcd e2e gumbel gate",
 		    glades::gpu::trcd_gumbel_gate(d_u.data(), lambda, tau,
 		        (uint64_t)step * 0x9E3779B97F4A7C15ULL, training_mode, T, d_alpha.data()));
-		// h_routed = α * h_D + (1 − α) * h_S — implemented via two applies + axpy.
-		ASSERT("trcd e2e apply gate deep",
-		    glades::gpu::trcd_apply_gate(d_hD.data(), d_alpha.data(),
+		// h_routed = α * h_D + (1 − α) * h_S — fused convex-gate kernel (Phase 3 prep).
+		ASSERT("trcd e2e apply gate convex",
+		    glades::gpu::trcd_apply_gate_convex(d_hD.data(), d_hS.data(), d_alpha.data(),
 		        T, m_hid, d_h_routed.data()));
-		// compute h_routed += (1 − α) * h_S  via host-side axpy loop substitute:
-		// use a second apply_gate with complement alpha, then add.  Since there's
-		// no batched add primitive, roll it into a single dedicated kernel would
-		// be cleanest; for test we download + add on host (small T).
-		{
-			std::vector<float> alpha_h(T);
-			d_alpha.download(&alpha_h[0], T);
-			std::vector<float> comp(T);
-			for (unsigned t = 0; t < T; ++t) comp[t] = 1.0f - alpha_h[t];
-			glades::gpu::GpuBuffer<float> d_comp;
-			d_comp.allocate(T); d_comp.upload(&comp[0], T);
-			glades::gpu::GpuBuffer<float> d_gatedS; d_gatedS.allocate((size_t)T * m_hid);
-			ASSERT("trcd e2e apply gate skip (1-α)",
-			    glades::gpu::trcd_apply_gate(d_hS.data(), d_comp.data(),
-			        T, m_hid, d_gatedS.data()));
-			// d_h_routed += d_gatedS — axpy via cuBLAS sgemv on ones?  Easier: host.
-			std::vector<float> hr((size_t)T * m_hid), gs((size_t)T * m_hid);
-			d_h_routed.download(&hr[0], hr.size());
-			d_gatedS.download(&gs[0], gs.size());
-			for (size_t i = 0; i < hr.size(); ++i) hr[i] += gs[i];
-			d_h_routed.upload(&hr[0], hr.size());
-		}
 		// Y = h_routed · W_out
 		ASSERT("trcd e2e sgemm W_out",
 		    glades::gpu::sgemm_rowmajor(T, n_out, m_hid, 1.0f,

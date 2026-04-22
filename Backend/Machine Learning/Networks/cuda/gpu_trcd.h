@@ -106,6 +106,35 @@ bool trcd_apply_gate(const float* h_in, const float* alpha,
                      float* h_out);
 
 // ========================================================================
+// trcd_apply_gate_convex — fused two-input convex combination:
+//
+//   h_out[t, :] = alpha[t] * h_deep[t, :] + (1 - alpha[t]) * h_skip[t, :]
+//
+// This is the routing mechanism's core — one kernel launch instead of two
+// separate applies + a host-side add.  Used in the forward pass.
+// ========================================================================
+bool trcd_apply_gate_convex(const float* h_deep, const float* h_skip,
+                            const float* alpha,
+                            unsigned int T, unsigned int d,
+                            float* h_out);
+
+// ========================================================================
+// trcd_apply_gate_convex_backward — gradients for (h_deep, h_skip, alpha).
+//
+//   dh_deep[t, :] = alpha[t] * dh_out[t, :]
+//   dh_skip[t, :] = (1 - alpha[t]) * dh_out[t, :]
+//   dalpha[t]     = sum_j (h_deep[t, j] - h_skip[t, j]) * dh_out[t, j]
+//
+// Any of the three outputs may be NULL to skip computation.
+// ========================================================================
+bool trcd_apply_gate_convex_backward(const float* dh_out,
+                                     const float* h_deep, const float* h_skip,
+                                     const float* alpha,
+                                     unsigned int T, unsigned int d,
+                                     float* dh_deep_out, float* dh_skip_out,
+                                     float* dalpha_out);
+
+// ========================================================================
 // trcd_apply_gate_backward — gradients for (h_in, alpha) given dh_out.
 //
 //   dh_out     [T × d]   upstream grad on h_out
@@ -164,6 +193,13 @@ inline bool trcd_apply_gate_backward(const float*, const float*,
                                      const float*,
                                      unsigned int, unsigned int,
                                      float*, float*) { return false; }
+inline bool trcd_apply_gate_convex(const float*, const float*, const float*,
+                                   unsigned int, unsigned int,
+                                   float*) { return false; }
+inline bool trcd_apply_gate_convex_backward(const float*, const float*, const float*,
+                                            const float*,
+                                            unsigned int, unsigned int,
+                                            float*, float*, float*) { return false; }
 inline void trcd_lambda_pi_update(float, float, float, float,
                                   float&, float&, float) { }
 

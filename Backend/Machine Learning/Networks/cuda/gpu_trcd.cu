@@ -249,6 +249,90 @@ __global__ void k_trcd_apply_gate_dalpha(const float* __restrict__ dh_out,
 	}
 }
 
+// ------------------------------------------------------------------------
+// Fused convex gate: h_out[t, :] = α·h_deep + (1−α)·h_skip.
+// One block per token, block_size threads cooperate on d.
+// ------------------------------------------------------------------------
+__global__ void k_trcd_apply_gate_convex(const float* __restrict__ h_deep,
+                                         const float* __restrict__ h_skip,
+                                         const float* __restrict__ alpha,
+                                         int T, int d,
+                                         float* __restrict__ h_out)
+{
+	const int t = blockIdx.x;
+	if (t >= T) return;
+
+	const float a = alpha[t];
+	const float a_c = 1.0f - a;
+	const float* deep_row = h_deep + (size_t)t * d;
+	const float* skip_row = h_skip + (size_t)t * d;
+	float* out_row = h_out + (size_t)t * d;
+
+	for (int j = threadIdx.x; j < d; j += blockDim.x)
+		out_row[j] = a * deep_row[j] + a_c * skip_row[j];
+}
+
+__global__ void k_trcd_apply_gate_convex_dh(const float* __restrict__ dh_out,
+                                            const float* __restrict__ alpha,
+                                            int T, int d,
+                                            float* __restrict__ dh_deep,
+                                            float* __restrict__ dh_skip)
+{
+	const int t = blockIdx.x;
+	if (t >= T) return;
+
+	const float a = alpha[t];
+	const float a_c = 1.0f - a;
+	const float* dh_row = dh_out + (size_t)t * d;
+	float* dd_row = (dh_deep != nullptr) ? dh_deep + (size_t)t * d : nullptr;
+	float* ds_row = (dh_skip != nullptr) ? dh_skip + (size_t)t * d : nullptr;
+
+	for (int j = threadIdx.x; j < d; j += blockDim.x) {
+		const float g = dh_row[j];
+		if (dd_row) dd_row[j] = a   * g;
+		if (ds_row) ds_row[j] = a_c * g;
+	}
+}
+
+__global__ void k_trcd_apply_gate_convex_dalpha(const float* __restrict__ dh_out,
+                                                const float* __restrict__ h_deep,
+                                                const float* __restrict__ h_skip,
+                                                int T, int d,
+                                                float* __restrict__ dalpha)
+{
+	// Row t: dα[t] = sum_j (h_deep[t,j] − h_skip[t,j]) · dh_out[t,j].
+	const int t = blockIdx.x;
+	if (t >= T) return;
+
+	const int tid = threadIdx.x;
+	const int block = blockDim.x;
+
+	const float* dh_row = dh_out + (size_t)t * d;
+	const float* hd_row = h_deep + (size_t)t * d;
+	const float* hs_row = h_skip + (size_t)t * d;
+
+	float local = 0.0f;
+	for (int j = tid; j < d; j += block)
+		local += (hd_row[j] - hs_row[j]) * dh_row[j];
+
+	__shared__ float shm[32];
+	const int lane = tid & 31;
+	const int warp = tid >> 5;
+
+	for (int off = 16; off > 0; off >>= 1)
+		local += __shfl_down_sync(0xffffffffu, local, off);
+	if (lane == 0) shm[warp] = local;
+	__syncthreads();
+
+	if (warp == 0) {
+		const int nwarps = (block + 31) >> 5;
+		float v = (tid < nwarps) ? shm[tid] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+			v += __shfl_down_sync(0xffffffffu, v, off);
+		if (tid == 0) dalpha[t] = v;
+	}
+}
+
 } // anonymous namespace
 
 bool trcd_route_logits(const float* h_in, const float* a_l, float b_l,
@@ -355,6 +439,46 @@ bool trcd_apply_gate_backward(const float* dh_out, const float* h_in,
 	if (dalpha_out != nullptr) {
 		k_trcd_apply_gate_dalpha<<<(int)T, block, 0, computeStream()>>>(
 		    dh_out, h_in, (int)T, (int)d, dalpha_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	return true;
+}
+
+bool trcd_apply_gate_convex(const float* h_deep, const float* h_skip,
+                            const float* alpha,
+                            unsigned int T, unsigned int d,
+                            float* h_out)
+{
+	if (h_deep == nullptr || h_skip == nullptr || alpha == nullptr || h_out == nullptr) return false;
+	if (T == 0u || d == 0u) return false;
+
+	const int block = (d >= 256) ? 256 : ((d >= 64) ? 64 : 32);
+	k_trcd_apply_gate_convex<<<(int)T, block, 0, computeStream()>>>(
+	    h_deep, h_skip, alpha, (int)T, (int)d, h_out);
+	return cudaGetLastError() == cudaSuccess;
+}
+
+bool trcd_apply_gate_convex_backward(const float* dh_out,
+                                     const float* h_deep, const float* h_skip,
+                                     const float* alpha,
+                                     unsigned int T, unsigned int d,
+                                     float* dh_deep_out, float* dh_skip_out,
+                                     float* dalpha_out)
+{
+	if (dh_out == nullptr || alpha == nullptr) return false;
+	if (T == 0u || d == 0u) return false;
+
+	if (dh_deep_out != nullptr || dh_skip_out != nullptr) {
+		const int block = (d >= 256) ? 256 : ((d >= 64) ? 64 : 32);
+		k_trcd_apply_gate_convex_dh<<<(int)T, block, 0, computeStream()>>>(
+		    dh_out, alpha, (int)T, (int)d, dh_deep_out, dh_skip_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	if (dalpha_out != nullptr) {
+		if (h_deep == nullptr || h_skip == nullptr) return false;
+		const int block = (d >= 256) ? 256 : ((d >= 64) ? 64 : 32);
+		k_trcd_apply_gate_convex_dalpha<<<(int)T, block, 0, computeStream()>>>(
+		    dh_out, h_deep, h_skip, (int)T, (int)d, dalpha_out);
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
 	return true;
