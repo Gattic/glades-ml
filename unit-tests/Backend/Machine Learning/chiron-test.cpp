@@ -4344,6 +4344,178 @@ void CHIRONStiefelDenseGradParityTest()
 #endif
 }
 
+// CHIRONStiefelMultiLayerTrainingTest ---------------------------------------
+// Chains L=4 Stiefel layers and trains them via backprop across the stack.
+// This is the composition proof point for trainer wire-in — if it converges
+// at depth with the same Cayley + periodic QR sequence, the single-layer
+// results generalize to a real LLM stack.
+//
+// Architecture: X_0 → σ(X_1 · W_1^T) → σ(X_2 · W_2^T) → ... → Y
+//   where σ = ReLU-like activation (skipping for linearity; just chain GEMMs)
+//   and each W_l is Stiefel-factored at ρ = 0.25.
+//
+// Loss: ½ Σ (Y - Y*)² against a ground-truth stack also Stiefel-factored.
+void CHIRONStiefelMultiLayerTrainingTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel multi-layer] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int d = 128, r = 32, B = 64, L = 4;   // ρ=0.25 at each layer
+	const int num_steps = 50;
+	const float lr = 3e-4f;
+	const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+
+	LCG rng(20260421u);
+
+	// Build the ground-truth stack (L Stiefel layers) and the current stack.
+	std::vector<glades::gpu::GpuStiefelWeight*> sw(L, (glades::gpu::GpuStiefelWeight*)0);
+	std::vector<glades::gpu::GpuStiefelWeight*> sw_star(L, (glades::gpu::GpuStiefelWeight*)0);
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		sw[l] = new glades::gpu::GpuStiefelWeight();
+		sw[l]->allocate(d, d, r);
+		sw_star[l] = new glades::gpu::GpuStiefelWeight();
+		sw_star[l]->allocate(d, d, r);
+
+		// Random init for ground truth.
+		std::vector<float> Us(d * r), Vs(d * r), sigs(r);
+		for (size_t i = 0; i < Us.size(); ++i) Us[i] = rng.next_unit();
+		for (size_t i = 0; i < Vs.size(); ++i) Vs[i] = rng.next_unit();
+		gram_schmidt_cols(Us, d, r);
+		gram_schmidt_cols(Vs, d, r);
+		for (size_t i = 0; i < sigs.size(); ++i)
+			sigs[i] = 0.7f + 0.3f * std::abs(rng.next_unit());
+		std::vector<uint16_t> Us_bf, Vs_bf;
+		fp32_to_bf16_rne(Us, Us_bf); fp32_to_bf16_rne(Vs, Vs_bf);
+		sw_star[l]->U.upload(&Us_bf[0], Us_bf.size());
+		sw_star[l]->V.upload(&Vs_bf[0], Vs_bf.size());
+		sw_star[l]->sigma.upload(&sigs[0], sigs.size());
+
+		// Different random init for the trainee.
+		std::vector<float> U(d * r), V(d * r), sigma(r, 1.0f);
+		for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+		for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+		gram_schmidt_cols(U, d, r);
+		gram_schmidt_cols(V, d, r);
+		std::vector<uint16_t> U_bf, V_bf;
+		fp32_to_bf16_rne(U, U_bf); fp32_to_bf16_rne(V, V_bf);
+		sw[l]->U.upload(&U_bf[0], U_bf.size());
+		sw[l]->V.upload(&V_bf[0], V_bf.size());
+		sw[l]->sigma.upload(&sigma[0], sigma.size());
+	}
+
+	// Inputs X and activations at each layer boundary.  Per-layer scratches.
+	std::vector<float> Xh(B * d);
+	for (size_t i = 0; i < Xh.size(); ++i) Xh[i] = 0.2f * rng.next_unit();
+	std::vector<glades::gpu::GpuBuffer<float>*> act(L + 1);
+	std::vector<glades::gpu::GpuBuffer<float>*> act_star(L + 1);
+	std::vector<glades::gpu::GpuBuffer<float>*> grad(L + 1);
+	for (unsigned int l = 0; l <= L; ++l)
+	{
+		act[l] = new glades::gpu::GpuBuffer<float>(); act[l]->allocate(B * d);
+		act_star[l] = new glades::gpu::GpuBuffer<float>(); act_star[l]->allocate(B * d);
+		grad[l] = new glades::gpu::GpuBuffer<float>(); grad[l]->allocate(B * d);
+	}
+	act[0]->upload(&Xh[0], Xh.size());
+	act_star[0]->upload(&Xh[0], Xh.size());
+
+	glades::gpu::GpuBuffer<float> scratchBr;
+	scratchBr.allocate(B * r);
+	// Shared scratches for Adam step.
+	glades::gpu::GpuBuffer<float> d_dU, d_dV, d_ds, d_etaU, d_etaV, d_etaS, d_rrU, d_rrV;
+	d_dU.allocate(d * r);
+	d_dV.allocate(d * r);
+	d_ds.allocate(r);
+	d_etaU.allocate(d * r);
+	d_etaV.allocate(d * r);
+	d_etaS.allocate(r);
+	d_rrU.allocate(r * r);
+	d_rrV.allocate(r * r);
+
+	// Ground-truth target Y*.
+	for (unsigned int l = 0; l < L; ++l)
+		glades::gpu::stiefel_forward(act_star[l]->data(), false, *sw_star[l],
+		                             act_star[l + 1]->data(), scratchBr.data(), B);
+
+	std::vector<float> Y_tgt(B * d), Y(B * d), dY(B * d);
+	act_star[L]->download(&Y_tgt[0], Y_tgt.size());
+
+	float loss_first = -1.0f, loss_last = -1.0f;
+	for (int step = 1; step <= num_steps; ++step)
+	{
+		// Forward through the stack.
+		for (unsigned int l = 0; l < L; ++l)
+			glades::gpu::stiefel_forward(act[l]->data(), false, *sw[l],
+			                             act[l + 1]->data(), scratchBr.data(), B);
+		act[L]->download(&Y[0], Y.size());
+
+		float loss = 0.0f;
+		for (size_t i = 0; i < Y.size(); ++i)
+		{
+			const float d_ = Y[i] - Y_tgt[i];
+			loss += d_ * d_;
+			dY[i] = (2.0f / float(Y.size())) * d_;
+		}
+		loss /= float(Y.size());
+		if (step == 1) loss_first = loss;
+		loss_last = loss;
+
+		// Seed the final-layer gradient.
+		grad[L]->upload(&dY[0], dY.size());
+
+		// Backprop + per-layer Adam, from last layer to first.
+		for (int l = int(L) - 1; l >= 0; --l)
+		{
+			glades::gpu::stiefel_backward_unconstrained(
+			    grad[l + 1]->data(), act[l]->data(), false, *sw[l],
+			    grad[l]->data(),            // dX for the previous layer
+			    d_dU.data(), d_ds.data(), d_dV.data(),
+			    scratchBr.data(), B);
+			if (step % 10 == 0)
+			{
+				glades::gpu::stiefel_adam_step(
+				    *sw[l], d_dU.data(), d_ds.data(), d_dV.data(),
+				    lr, beta1, beta2, eps, step,
+				    d_rrU.data(), d_rrV.data(),
+				    d_etaU.data(), d_etaV.data(), d_etaS.data());
+			}
+			else
+			{
+				glades::gpu::stiefel_adam_step_cayley(
+				    *sw[l], d_dU.data(), d_ds.data(), d_dV.data(),
+				    lr, beta1, beta2, eps, step,
+				    d_rrU.data(), d_rrV.data(),
+				    d_etaU.data(), d_etaV.data(), d_etaS.data());
+			}
+		}
+	}
+
+	std::printf("  stiefel multi-layer (L=%u, d=%u, r=%u, %d steps): "
+	            "loss %.5f → %.5f (%.2fx reduction)\n",
+	            L, d, r, num_steps, loss_first, loss_last, loss_first / loss_last);
+	ASSERT("Multi-layer Stiefel stack trains (loss decreases at depth)",
+	       loss_last < loss_first);
+	ASSERT("Multi-layer Stiefel loss reduces ≥ 1.2x across L=4 layers",
+	       loss_first / loss_last >= 1.2f);
+
+	// Cleanup.
+	for (unsigned int l = 0; l < L; ++l)
+	{
+		sw[l]->release(); delete sw[l];
+		sw_star[l]->release(); delete sw_star[l];
+	}
+	for (unsigned int l = 0; l <= L; ++l)
+	{
+		delete act[l]; delete act_star[l]; delete grad[l];
+	}
+#else
+	std::printf("  [stiefel multi-layer] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -4353,6 +4525,7 @@ void CHIRONUnitTest()
 	CHIRONStiefelQRRetractionTest();
 	CHIRONStiefelSvdInitTest();
 	CHIRONStiefelDenseGradParityTest();
+	CHIRONStiefelMultiLayerTrainingTest();
 	CHIRONStiefelAdamDescentTest();
 	CHIRONStiefelCayleyRetractionTest();
 	CHIRONStiefelLargeScaleTrainingTest();
