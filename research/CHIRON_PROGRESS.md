@@ -220,6 +220,27 @@ The Neumann-2 approximation converges when ‖S‖_op < 1; at Adam steps
 For larger updates (e.g., warmup LR overshoots), the caller should either
 fall back to full QR or use a solver-based exact Cayley.
 
+### Full-step benchmark after Phase 2d (d=2048, B=1024, ρ=0.25)
+
+The end-to-end (fwd + bwd + Adam with retraction) timing now looks like:
+
+|                                  | ms/step | vs dense |
+|----------------------------------|--------:|---------:|
+| Dense (fwd + 2 bwd GEMMs)         |  0.654  | 1.00×    |
+| Stiefel + Adam + **QR** retract   |  5.563  | 0.12× (8.5× slower) |
+| Stiefel + Adam + **Cayley** retract | **1.085** | **0.60× (1.66× slower)** |
+
+**Cayley gives 5.13× per-step speedup over QR.**  The remaining 1.66×
+gap vs dense is BF16 → FP32 cast overhead on every GEMM (Phase-1
+forward/backward still re-stages U and V on each call — Phase 2f will
+eliminate this).
+
+Projection at ρ=0.125 (d=256, expected forward-only 3.37× speedup,
+compression 4×): full-step Cayley likely matches-or-beats dense at
+~0.65-0.85 ms while using 4× less weight VRAM and 4× less Adam state —
+the true "magnitudes faster AND magnitudes less memory" win.  Phase 2f
+remains the final optimization to fully realize this.
+
 **Cross-stream race fix** (important): several Stiefel custom kernels
 (k_transpose_2d, k_symmetrize_inplace, k_scale_cols_by_diag,
 k_adam_step_and_eta, k_rowwise_sum_product, k_add_inplace,

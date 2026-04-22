@@ -3806,7 +3806,53 @@ void CHIRONStiefelCompressionBenchmark()
 		const double end_to_end = double(ms_dense_full) / double(ms_stie_full);
 		std::printf("  stiefel full step (ρ=0.25: fwd+bwd+Adam+QR): %.3f ms\n",
 		            ms_stie_full);
-		std::printf("  END-TO-END SPEEDUP at ρ=0.25: %.2fx\n", end_to_end);
+		std::printf("  END-TO-END SPEEDUP at ρ=0.25 (QR): %.2fx\n", end_to_end);
+
+		// Cayley-Adam full-step timing (Phase 2d).  Same fwd/bwd cost, but
+		// retraction uses Cayley (2-term Neumann), 3-4× cheaper than QR.
+		for (int i = 0; i < 3; ++i)
+		{
+			glades::gpu::stiefel_forward(d_Xb.data(), false, sw2,
+			                             d_Yst.data(), d_sbuf.data(), B);
+			glades::gpu::stiefel_backward_unconstrained(
+			    d_dYst.data(), d_Xb.data(), false, sw2, (float*)0,
+			    d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    d_sbuf.data(), B);
+			glades::gpu::stiefel_adam_step_cayley(
+			    sw2, d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    1e-3f, 0.9f, 0.999f, 1e-8f, 100 + i,
+			    d_rrU2.data(), d_rrV2.data(),
+			    d_etU.data(), d_etV.data(), d_etS.data());
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(e0);
+		for (int i = 0; i < step_iters; ++i)
+		{
+			glades::gpu::stiefel_forward(d_Xb.data(), false, sw2,
+			                             d_Yst.data(), d_sbuf.data(), B);
+			glades::gpu::stiefel_backward_unconstrained(
+			    d_dYst.data(), d_Xb.data(), false, sw2, (float*)0,
+			    d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    d_sbuf.data(), B);
+			glades::gpu::stiefel_adam_step_cayley(
+			    sw2, d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    1e-3f, 0.9f, 0.999f, 1e-8f, 110 + i,
+			    d_rrU2.data(), d_rrV2.data(),
+			    d_etU.data(), d_etV.data(), d_etS.data());
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(e1);
+		cudaEventSynchronize(e1);
+		float ms_stie_cayley = 0.0f;
+		cudaEventElapsedTime(&ms_stie_cayley, e0, e1);
+		ms_stie_cayley /= float(step_iters);
+		const double end_to_end_cayley = double(ms_dense_full) / double(ms_stie_cayley);
+		std::printf("  stiefel full step (ρ=0.25: fwd+bwd+Adam+Cayley): %.3f ms\n",
+		            ms_stie_cayley);
+		std::printf("  END-TO-END SPEEDUP at ρ=0.25 (Cayley): %.2fx\n",
+		            end_to_end_cayley);
+		std::printf("  Cayley improvement vs QR: %.2fx faster step\n",
+		            double(ms_stie_full) / double(ms_stie_cayley));
 
 		cudaEventDestroy(e0); cudaEventDestroy(e1);
 		sw2.release();
