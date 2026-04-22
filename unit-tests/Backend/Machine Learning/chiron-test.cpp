@@ -27,6 +27,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_stiefel.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_hrtc.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -4516,9 +4517,67 @@ void CHIRONStiefelMultiLayerTrainingTest()
 #endif
 }
 
+// CHIRONHRTCHaarRoundtripTest -----------------------------------------------
+// Paradigm shift #8, Phase 1: verify the k=2 Haar pool/unpool round-trip
+// recovers the original sequence to FP32 precision.  This is the core
+// reversibility property that lets HRTC compose with CHIRON's inverse walk.
+void CHIRONHRTCHaarRoundtripTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [hrtc haar] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 64, m = 32;  // T even, both small.
+
+	LCG rng(20260422u);
+	std::vector<float> X(T * m), Xrt(T * m);
+	for (size_t i = 0; i < X.size(); ++i) X[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_super, d_res, d_Xrt;
+	d_X.allocate(T * m);     d_X.upload(&X[0], X.size());
+	d_super.allocate((T / 2) * m);
+	d_res.allocate((T / 2) * m);
+	d_Xrt.allocate(T * m);
+
+	ASSERT("hrtc_pool_haar_k2 runs",
+	       glades::gpu::hrtc_pool_haar_k2(d_X.data(), d_super.data(),
+	                                      d_res.data(), T, m));
+	ASSERT("hrtc_unpool_haar_k2 runs",
+	       glades::gpu::hrtc_unpool_haar_k2(d_super.data(), d_res.data(),
+	                                        d_Xrt.data(), T, m));
+	d_Xrt.download(&Xrt[0], Xrt.size());
+	const float err = max_abs_diff(X, Xrt);
+	std::printf("  hrtc Haar k=2 roundtrip max_err = %.3e (expect < 1e-6)\n", err);
+	ASSERT("Haar k=2 pool → unpool recovers original to FP32 precision",
+	       err < 1e-5f);
+
+	// Verify super-token is ~ sum/√2, residual is ~ diff/√2 (sanity).
+	std::vector<float> super_h((T / 2) * m), res_h((T / 2) * m);
+	d_super.download(&super_h[0], super_h.size());
+	d_res.download(&res_h[0], res_h.size());
+	const float inv_sqrt2 = 0.70710678f;
+	const float expected_super_0 = inv_sqrt2 * (X[0] + X[m]);
+	const float expected_res_0   = inv_sqrt2 * (X[0] - X[m]);
+	ASSERT("Haar k=2 super[0] matches analytic formula",
+	       std::fabs(super_h[0] - expected_super_0) < 1e-5f);
+	ASSERT("Haar k=2 residual[0] matches analytic formula",
+	       std::fabs(res_h[0] - expected_res_0) < 1e-5f);
+
+	// Shape check: T=odd should be rejected.
+	ASSERT("hrtc_pool rejects odd T",
+	       !glades::gpu::hrtc_pool_haar_k2(d_X.data(), d_super.data(),
+	                                        d_res.data(), T - 1u, m));
+#else
+	std::printf("  [hrtc haar] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
+	CHIRONHRTCHaarRoundtripTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
