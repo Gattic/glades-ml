@@ -264,6 +264,30 @@ removed; the correct path is the FP32 cache above.  If future cuBLAS
 versions support mixed-precision GEMMs, stiefel_forward/backward can
 be trivially switched to eliminate the cache altogether.
 
+### Large-scale training test (Phase 2g) — SHIPPED
+
+`CHIRONStiefelLargeScaleTrainingTest` runs a 100-step Adam training on
+a d=1024, B=256, ρ=0.25 synthetic regression target (Stiefel-factored
+W*).  Uses the Cayley Adam step for 24 of every 25 steps, with a full
+QR retraction every 25th step to clamp accumulated drift.
+
+Measured empirical result (RTX 4080 SUPER, single layer):
+
+  loss:   0.0118 → 0.0024            (**4.87× reduction** in 100 steps)
+  speed:  **0.707 ms/step**           (equivalent to 361K tokens/sec at B=256)
+  drift:  ‖U^T U − I‖_F = 1.85e-2   ‖V^T V − I‖_F = 1.87e-2
+          (both well under 5e-1 tolerance; periodic QR keeps them bounded)
+
+This is the closest empirical proxy to a real trainer step.  Confirms:
+  1. Multi-step training converges at LLM-realistic dims (d=1024)
+  2. Mixed Cayley + periodic QR keeps orthonormality well-controlled
+  3. LR sensitivity: Σ Fisher-Rao update requires ≤ 3e-4 lr to avoid
+     Σ collapse and subsequent NaN (caught during integration).  With
+     ≥ 3e-3 lr, Σ can zero-out and exp(η/Σ) overflows.  Solution: either
+     lower LR or add Σ floor (‖Σ‖_min ≥ ε).  Σ-floor is Phase 2h work.
+  4. Phase 2h (trainer wire-in) is now well-defined: swap one attention
+     weight per layer with a Stiefel-factored variant behind a flag.
+
 **Cross-stream race fix** (important): several Stiefel custom kernels
 (k_transpose_2d, k_symmetrize_inplace, k_scale_cols_by_diag,
 k_adam_step_and_eta, k_rowwise_sum_product, k_add_inplace,
