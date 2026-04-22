@@ -9057,6 +9057,229 @@ void CHIRONDfaMfioCompositionTest()
 #endif
 }
 
+// CHIRONDfaL16Test ----------------------------------------------------------
+// Paradigm shift #12, depth ceiling probe: DFA at L=16 with head-to-head
+// Adam+backprop baseline.  Prior art places the DFA ceiling around L=10;
+// our earlier L=4 and L=8 results blew through that ceiling.  L=16 tells
+// us whether the Adam+DFA pairing holds or finally breaks.
+void CHIRONDfaL16Test()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [dfa L=16] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 64;
+	const int          L = 16;
+	// Shape: 24 → (32)^15 → 16  (16-layer network, all hidden 32).
+	unsigned int d[17];
+	d[0] = 24;  d[L] = 16;
+	for (int i = 1; i < L; ++i) d[i] = 32;
+
+	const int   N    = 400;
+	const float lr   = 2e-3f;
+	const float b1   = 0.9f;
+	const float b2   = 0.999f;
+	const float eps  = 1e-8f;
+
+	LCG rng(202604245u);
+	std::vector<std::vector<float> > Ws_h(L), W0_h(L);
+	for (int l = 0; l < L; ++l)
+	{
+		Ws_h[l].resize((size_t)d[l] * d[l+1]);
+		W0_h[l].resize((size_t)d[l] * d[l+1]);
+		for (size_t i = 0; i < Ws_h[l].size(); ++i) Ws_h[l][i] = 0.18f * rng.next_unit();
+		for (size_t i = 0; i < W0_h[l].size(); ++i) W0_h[l][i] = 0.05f * rng.next_unit();
+	}
+
+	std::vector<float> X_h((size_t)T * d[0]);
+	for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.4f * rng.next_unit();
+
+	// Host target via sigmoid-nonlinear cascade.
+	std::vector<float> Ytgt_h((size_t)T * d[L]);
+	{
+		std::vector<float> cur((size_t)T * d[0]);
+		for (size_t i = 0; i < cur.size(); ++i) cur[i] = X_h[i];
+		for (int l = 0; l < L; ++l)
+		{
+			std::vector<float> nxt((size_t)T * d[l+1], 0.0f);
+			for (unsigned t = 0; t < T; ++t)
+				for (unsigned j = 0; j < d[l+1]; ++j)
+				{
+					float s = 0.0f;
+					for (unsigned k = 0; k < d[l]; ++k)
+						s += cur[(size_t)t * d[l] + k] * Ws_h[l][(size_t)k * d[l+1] + j];
+					nxt[(size_t)t * d[l+1] + j] = (l < L-1) ? (1.0f / (1.0f + std::exp(-s))) : s;
+				}
+			cur.swap(nxt);
+		}
+		for (size_t i = 0; i < Ytgt_h.size(); ++i) Ytgt_h[i] = cur[i];
+	}
+
+	glades::gpu::GpuBuffer<float> d_X, d_Ytgt;
+	d_X.allocate(X_h.size());     d_X.upload(&X_h[0], X_h.size());
+	d_Ytgt.allocate(Ytgt_h.size());d_Ytgt.upload(&Ytgt_h[0], Ytgt_h.size());
+
+	float dfa_first = 0, dfa_last = 0, bp_first = 0, bp_last = 0;
+
+	for (int pass = 0; pass < 2; ++pass)
+	{
+		const bool use_dfa = (pass == 0);
+
+		std::vector<glades::gpu::GpuBuffer<float>*> d_W(L), d_dW(L),
+		    d_H_pre(L), d_H(L), d_dH(L), d_dH_pre(L), d_e_proj(L),
+		    d_R(L-1), d_mA(L), d_vA(L);
+		for (int l = 0; l < L; ++l)
+		{
+			d_W[l]     = new glades::gpu::GpuBuffer<float>(); d_W[l]->allocate(W0_h[l].size()); d_W[l]->upload(&W0_h[l][0], W0_h[l].size());
+			d_dW[l]    = new glades::gpu::GpuBuffer<float>(); d_dW[l]->allocate(W0_h[l].size());
+			d_H_pre[l] = new glades::gpu::GpuBuffer<float>(); d_H_pre[l]->allocate((size_t)T * d[l+1]);
+			d_H[l]     = new glades::gpu::GpuBuffer<float>(); d_H[l]->allocate((size_t)T * d[l+1]);
+			d_dH[l]    = new glades::gpu::GpuBuffer<float>(); d_dH[l]->allocate((size_t)T * d[l+1]);
+			d_dH_pre[l]= new glades::gpu::GpuBuffer<float>(); d_dH_pre[l]->allocate((size_t)T * d[l+1]);
+			d_e_proj[l]= new glades::gpu::GpuBuffer<float>(); d_e_proj[l]->allocate((size_t)T * d[l+1]);
+			d_mA[l]    = new glades::gpu::GpuBuffer<float>(); d_mA[l]->allocate(W0_h[l].size());
+			d_vA[l]    = new glades::gpu::GpuBuffer<float>(); d_vA[l]->allocate(W0_h[l].size());
+			std::vector<float> z(W0_h[l].size(), 0.0f);
+			d_mA[l]->upload(&z[0], z.size()); d_vA[l]->upload(&z[0], z.size());
+		}
+		if (use_dfa)
+		{
+			for (int l = 0; l < L-1; ++l)
+			{
+				d_R[l] = new glades::gpu::GpuBuffer<float>();
+				d_R[l]->allocate((size_t)d[L] * d[l+1]);
+				glades::gpu::dfa_init_random_matrix(
+				    d_R[l]->data(), d[L], d[l+1],
+				    0xDEE1000000ULL + (uint64_t)l,
+				    1.0f / std::sqrt((float)d[l+1]));
+			}
+		}
+
+		std::vector<float> Y((size_t)T * d[L]), dY((size_t)T * d[L]);
+		glades::gpu::GpuBuffer<float> d_dY_buf;
+		d_dY_buf.allocate((size_t)T * d[L]);
+		float loss_first = -1.0f, loss_last = -1.0f;
+
+		for (int step = 1; step <= N; ++step)
+		{
+			// Forward
+			const float* cur = d_X.data();
+			unsigned cur_d = d[0];
+			for (int l = 0; l < L; ++l)
+			{
+				glades::gpu::sgemm_rowmajor(T, d[l+1], cur_d, 1.0f,
+				                            cur, cur_d, d_W[l]->data(), d[l+1],
+				                            0.0f, d_H_pre[l]->data(), d[l+1]);
+				if (l < L-1)
+					glades::gpu::relu_forward(d_H_pre[l]->data(),
+					                          (int)((size_t)T * d[l+1]), d_H[l]->data());
+				else
+					cudaMemcpyAsync(d_H[l]->data(), d_H_pre[l]->data(),
+					                (size_t)T * d[l+1] * sizeof(float),
+					                cudaMemcpyDeviceToDevice, glades::gpu::computeStream());
+				cur = d_H[l]->data(); cur_d = d[l+1];
+			}
+			d_H[L-1]->download(&Y[0], Y.size());
+			float loss = 0.0f;
+			for (size_t i = 0; i < Y.size(); ++i)
+			{
+				const float dv = Y[i] - Ytgt_h[i];
+				loss += dv * dv;
+				dY[i] = (2.0f / float(Y.size())) * dv;
+			}
+			loss /= float(Y.size());
+			if (step == 1) loss_first = loss;
+			loss_last = loss;
+			d_dY_buf.upload(&dY[0], dY.size());
+
+			// Output layer: true gradient always.
+			glades::gpu::sgemm_rowmajor_atb(d[L-1], d[L], T, 1.0f,
+			                                d_H[L-2]->data(), d[L-1],
+			                                d_dY_buf.data(), d[L],
+			                                0.0f, d_dW[L-1]->data(), d[L]);
+			if (!use_dfa)
+			{
+				glades::gpu::sgemm_rowmajor_abt(T, d[L-1], d[L], 1.0f,
+				                                d_dY_buf.data(), d[L],
+				                                d_W[L-1]->data(), d[L],
+				                                0.0f, d_dH[L-2]->data(), d[L-1]);
+			}
+
+			// Inner layers.
+			for (int l = L-2; l >= 0; --l)
+			{
+				const float* grad_h_src;
+				if (use_dfa)
+				{
+					glades::gpu::dfa_project_error(
+					    d_dY_buf.data(), d_R[l]->data(),
+					    T, d[L], d[l+1], d_e_proj[l]->data());
+					grad_h_src = d_e_proj[l]->data();
+				}
+				else
+				{
+					grad_h_src = d_dH[l]->data();
+				}
+				glades::gpu::relu_backward(grad_h_src, d_H_pre[l]->data(),
+				                           (int)((size_t)T * d[l+1]),
+				                           d_dH_pre[l]->data());
+				const float* input_l = (l == 0) ? d_X.data() : d_H[l-1]->data();
+				const unsigned in_d  = d[l];
+				glades::gpu::sgemm_rowmajor_atb(in_d, d[l+1], T, 1.0f,
+				                                input_l, in_d,
+				                                d_dH_pre[l]->data(), d[l+1],
+				                                0.0f, d_dW[l]->data(), d[l+1]);
+				if (!use_dfa && l > 0)
+				{
+					glades::gpu::sgemm_rowmajor_abt(T, in_d, d[l+1], 1.0f,
+					                                d_dH_pre[l]->data(), d[l+1],
+					                                d_W[l]->data(), d[l+1],
+					                                0.0f, d_dH[l-1]->data(), in_d);
+				}
+			}
+			for (int l = 0; l < L; ++l)
+			{
+				glades::gpu::adam_update(
+				    d_W[l]->data(), d_dW[l]->data(),
+				    d_mA[l]->data(), d_vA[l]->data(),
+				    lr, b1, b2, eps, 0.0f, 1.0f,
+				    step, (int)W0_h[l].size());
+			}
+		}
+		const char* name = use_dfa ? "DFA+Adam    " : "Adam+backprop";
+		std::printf("  [L=16] %s: loss %.4e -> %.4e (%.2fx reduction) over %d steps\n",
+		            name, loss_first, loss_last, loss_first / loss_last, N);
+		if (use_dfa) { dfa_first = loss_first; dfa_last = loss_last; }
+		else         { bp_first  = loss_first; bp_last  = loss_last; }
+
+		for (int l = 0; l < L; ++l)
+		{
+			delete d_W[l]; delete d_dW[l]; delete d_H_pre[l]; delete d_H[l];
+			delete d_dH[l]; delete d_dH_pre[l]; delete d_e_proj[l];
+			delete d_mA[l]; delete d_vA[l];
+		}
+		if (use_dfa) for (int l = 0; l < L-1; ++l) delete d_R[l];
+	}
+
+	const float dfa_ratio = dfa_first / dfa_last;
+	const float bp_ratio  = bp_first  / bp_last;
+	const float log_eff = std::log(dfa_ratio) / std::log(bp_ratio);
+	std::printf("  [L=16] DFA/backprop log-descent efficiency: %.1f%% "
+	            "(DFA %.1fx vs backprop %.1fx)\n",
+	            100.0f * log_eff, dfa_ratio, bp_ratio);
+	std::printf("  [L=16]   DFA per-step log-rate: %.4f/step (was 0.024-0.026 at L=2-8)\n",
+	            std::log(dfa_ratio) / (float)N);
+
+	ASSERT("DFA reduces loss at L=16", dfa_last < dfa_first);
+	ASSERT("DFA at L=16 achieves ≥ 1.5× loss reduction (depth-ceiling probe)",
+	       dfa_ratio >= 1.5f);
+#else
+	std::printf("  [dfa L=16] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -9187,6 +9410,7 @@ void CHIRONUnitTest()
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();
 	CHIRONDfaMfioCompositionTest();
+	CHIRONDfaL16Test();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
