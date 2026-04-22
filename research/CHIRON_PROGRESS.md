@@ -173,6 +173,25 @@ The paradigm-shift thesis validated **empirically** on real GPU:
 - ρ=0.0625: 4.14× wall-clock + 8× VRAM (theory: 8× / 8× — GEMM
   efficiency drops at r=128, so compute is capped at ~4×)
 
+**Full-step benchmark reveals the Phase-1-limited critical path**:
+Including backward + Adam + QR retraction, the end-to-end cost is
+dominated by (i) BF16→FP32 casts of U, V on each forward/backward/adam
+call (Phase-1 implementation has no BF16-direct GEMM yet), (ii) QR
+retraction every step (cuSOLVER sgeqrf + sorgqr).
+
+Measured at d=2048, B=1024, ρ=0.25:
+- Dense full step (fwd + 2 bwd GEMMs):    0.65 ms
+- Stiefel full step (fwd+bwd+Adam+QR):    5.38 ms  (**8× slower**)
+
+This is the ideal target for Phase 2d (Cayley retraction — cheap
+between-step re-orthonormalization) + Phase 2f (BF16-direct GEMMs
+eliminate cast overhead). Both were on the Phase-2 roadmap already;
+the benchmark now gives us a **concrete 8× headroom** to close.
+
+Decision: Cayley retraction (Phase 2d) is promoted to critical-path
+status — without it, the QR per-step cost would make Stiefel unviable
+for real training even with BF16-direct GEMMs.
+
 **Cross-stream race fix** (important): several Stiefel custom kernels
 (k_transpose_2d, k_symmetrize_inplace, k_scale_cols_by_diag,
 k_adam_step_and_eta, k_rowwise_sum_product, k_add_inplace,

@@ -3680,9 +3680,140 @@ void CHIRONStiefelCompressionBenchmark()
 
 	cudaEventDestroy(ev0); cudaEventDestroy(ev1);
 
+	// --- Full training-step benchmark: forward + backward + Adam step -------
+	// This measures the actual critical path a trainer hits each iteration,
+	// not just a raw GEMM.
+	std::printf("\n  === full training step benchmark (fwd + bwd + Adam) ===\n");
+	{
+		const int step_iters = 30;
+		// Dense reference: we approximate the dense-Adam step time by 1 forward
+		// (1 GEMM) + 1 backward (2 GEMMs: dX, dW) + 1 Adam kernel. That's the
+		// standard transformer MLP layer cost at the same dims. We measure
+		// each piece and sum.
+
+		// Dense forward + backward = 3 GEMMs at d × d × B dims.
+		cudaEvent_t e0, e1;
+		cudaEventCreate(&e0); cudaEventCreate(&e1);
+		glades::gpu::GpuBuffer<float> d_Xb, d_Wb, d_Yb, d_dYb, d_dXb, d_dWb;
+		d_Xb.allocate(B * d); d_Xb.upload(&Xh[0], Xh.size());
+		d_Wb.allocate(d * d); d_Wb.upload(&Wh[0], Wh.size());
+		d_Yb.allocate(B * d);
+		d_dYb.allocate(B * d);
+		std::vector<float> ones(B * d, 1.0f);
+		d_dYb.upload(&ones[0], ones.size());
+		d_dXb.allocate(B * d);
+		d_dWb.allocate(d * d);
+		for (int i = 0; i < 5; ++i)
+		{
+			glades::gpu::sgemm_rowmajor_abt(B, d, d, 1.0f, d_Xb.data(), d,
+			                                d_Wb.data(), d, 0.0f, d_Yb.data(), d);
+			glades::gpu::sgemm_rowmajor(B, d, d, 1.0f, d_dYb.data(), d,
+			                            d_Wb.data(), d, 0.0f, d_dXb.data(), d);
+			glades::gpu::sgemm_rowmajor_atb(d, d, B, 1.0f, d_dYb.data(), d,
+			                                d_Xb.data(), d, 0.0f, d_dWb.data(), d);
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(e0);
+		for (int i = 0; i < step_iters; ++i)
+		{
+			glades::gpu::sgemm_rowmajor_abt(B, d, d, 1.0f, d_Xb.data(), d,
+			                                d_Wb.data(), d, 0.0f, d_Yb.data(), d);
+			glades::gpu::sgemm_rowmajor(B, d, d, 1.0f, d_dYb.data(), d,
+			                            d_Wb.data(), d, 0.0f, d_dXb.data(), d);
+			glades::gpu::sgemm_rowmajor_atb(d, d, B, 1.0f, d_dYb.data(), d,
+			                                d_Xb.data(), d, 0.0f, d_dWb.data(), d);
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(e1);
+		cudaEventSynchronize(e1);
+		float ms_dense_full = 0.0f;
+		cudaEventElapsedTime(&ms_dense_full, e0, e1);
+		ms_dense_full /= float(step_iters);
+		std::printf("  dense full step (fwd+bwd, 3 GEMMs): %.3f ms\n", ms_dense_full);
+
+		// Stiefel full step at ρ=0.25 using real primitives.
+		const unsigned int r_mid = d / 4u;
+		std::vector<float> Us(d * r_mid), Vs(d * r_mid), sig_s(r_mid);
+		for (size_t i = 0; i < Us.size(); ++i) Us[i] = rng.next_unit();
+		for (size_t i = 0; i < Vs.size(); ++i) Vs[i] = rng.next_unit();
+		gram_schmidt_cols(Us, d, r_mid);
+		gram_schmidt_cols(Vs, d, r_mid);
+		for (size_t i = 0; i < sig_s.size(); ++i) sig_s[i] = 1.0f;
+
+		std::vector<uint16_t> Us_bf, Vs_bf;
+		fp32_to_bf16_rne(Us, Us_bf);
+		fp32_to_bf16_rne(Vs, Vs_bf);
+
+		glades::gpu::GpuStiefelWeight sw2;
+		sw2.allocate(d, d, r_mid);
+		sw2.U.upload(&Us_bf[0], Us_bf.size());
+		sw2.V.upload(&Vs_bf[0], Vs_bf.size());
+		sw2.sigma.upload(&sig_s[0], sig_s.size());
+
+		glades::gpu::GpuBuffer<float> d_Yst, d_sbuf, d_dYst, d_dU2, d_dV2, d_ds2,
+		    d_etU, d_etV, d_etS, d_rrU2, d_rrV2;
+		d_Yst.allocate(B * d);
+		d_sbuf.allocate(B * r_mid);
+		d_dYst.allocate(B * d);
+		d_dYst.upload(&ones[0], B * d);
+		d_dU2.allocate(d * r_mid);
+		d_dV2.allocate(d * r_mid);
+		d_ds2.allocate(r_mid);
+		d_etU.allocate(d * r_mid);
+		d_etV.allocate(d * r_mid);
+		d_etS.allocate(r_mid);
+		d_rrU2.allocate(r_mid * r_mid);
+		d_rrV2.allocate(r_mid * r_mid);
+
+		// Warmup.
+		for (int i = 0; i < 3; ++i)
+		{
+			glades::gpu::stiefel_forward(d_Xb.data(), false, sw2,
+			                             d_Yst.data(), d_sbuf.data(), B);
+			glades::gpu::stiefel_backward_unconstrained(
+			    d_dYst.data(), d_Xb.data(), false, sw2, (float*)0,
+			    d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    d_sbuf.data(), B);
+			glades::gpu::stiefel_adam_step(
+			    sw2, d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    1e-3f, 0.9f, 0.999f, 1e-8f, 1 + i,
+			    d_rrU2.data(), d_rrV2.data(),
+			    d_etU.data(), d_etV.data(), d_etS.data());
+		}
+		cudaDeviceSynchronize();
+
+		cudaEventRecord(e0);
+		for (int i = 0; i < step_iters; ++i)
+		{
+			glades::gpu::stiefel_forward(d_Xb.data(), false, sw2,
+			                             d_Yst.data(), d_sbuf.data(), B);
+			glades::gpu::stiefel_backward_unconstrained(
+			    d_dYst.data(), d_Xb.data(), false, sw2, (float*)0,
+			    d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    d_sbuf.data(), B);
+			glades::gpu::stiefel_adam_step(
+			    sw2, d_dU2.data(), d_ds2.data(), d_dV2.data(),
+			    1e-3f, 0.9f, 0.999f, 1e-8f, 10 + i,
+			    d_rrU2.data(), d_rrV2.data(),
+			    d_etU.data(), d_etV.data(), d_etS.data());
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(e1);
+		cudaEventSynchronize(e1);
+		float ms_stie_full = 0.0f;
+		cudaEventElapsedTime(&ms_stie_full, e0, e1);
+		ms_stie_full /= float(step_iters);
+		const double end_to_end = double(ms_dense_full) / double(ms_stie_full);
+		std::printf("  stiefel full step (ρ=0.25: fwd+bwd+Adam+QR): %.3f ms\n",
+		            ms_stie_full);
+		std::printf("  END-TO-END SPEEDUP at ρ=0.25: %.2fx\n", end_to_end);
+
+		cudaEventDestroy(e0); cudaEventDestroy(e1);
+		sw2.release();
+	}
 	std::printf("  (timing is informational; paradigm-shift primary metric is\n"
 	            "   the weight-VRAM compression, which is exact by construction.\n"
-	            "   End-to-end tok/s will be measured from Phase 2h trainer wire-in.)\n");
+	            "   End-to-end tok/s in the real trainer will come in Phase 2h.)\n");
 #else
 	std::printf("  [stiefel bench] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
