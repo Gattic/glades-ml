@@ -30,6 +30,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_hrtc.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_ovfg.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_mpot.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_mfio.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -7260,6 +7261,121 @@ void CHIRONMpotStiefelCompositionBenchmark()
 #endif
 }
 
+// CHIRONMfioDescentTest ------------------------------------------------------
+// Paradigm shift #11, Phase 1: validate the moment-free implicit optimizer
+// on a linear regression.  Fit  Y_pred = X · W^T  to a known target
+// W_star via the MFIO update rule:
+//   σ_ℓ = 1 / (ŝ_ℓ · β + ε),  ŝ_ℓ = (1/T) Σ ‖z‖² · ‖δ‖²
+//   W ← W − η · σ · dW
+// where dW = δ^T · z (standard backward) and (z, δ) are the inputs to
+// and gradients out of the linear layer.  MFIO uses ZERO per-parameter
+// optimizer state — only a single σ scalar per layer.
+//
+// Expectation: loss decreases monotonically at a rate comparable to
+// Adam (within 2-3×).
+void CHIRONMfioDescentTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mfio descent] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T     = 32;
+	const unsigned int m     = 24;
+	const unsigned int n     = 16;
+	const int          N     = 80;
+	const float        lr    = 1e-2f;
+	const float        beta  = 1.0f;        // no warmup schedule for toy test
+	const float        eps   = 1e-8f;
+	const float        wd    = 0.0f;
+
+	LCG rng(202604237u);
+	std::vector<float> W_star_h((size_t)m * n), X_h((size_t)T * m), W_h((size_t)m * n);
+	for (size_t i = 0; i < W_star_h.size(); ++i) W_star_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < X_h.size(); ++i)      X_h[i]      = 0.4f * rng.next_unit();
+	for (size_t i = 0; i < W_h.size(); ++i)      W_h[i]      = 0.05f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_Wstar, d_Ytgt, d_W, d_Y, d_dY, d_dW, d_sigma;
+	d_X.allocate(X_h.size());            d_X.upload(&X_h[0], X_h.size());
+	d_Wstar.allocate(W_star_h.size());   d_Wstar.upload(&W_star_h[0], W_star_h.size());
+	d_Ytgt.allocate((size_t)T * n);
+	d_W.allocate(W_h.size());            d_W.upload(&W_h[0], W_h.size());
+	d_Y.allocate((size_t)T * n);
+	d_dY.allocate((size_t)T * n);
+	d_dW.allocate(W_h.size());
+	d_sigma.allocate(1);
+
+	// Y_target = X · W_star   (shape T × n, row-major)
+	ASSERT("mfio target GEMM",
+	       glades::gpu::sgemm_rowmajor(
+	           T, n, m, 1.0f,
+	           d_X.data(), m,
+	           d_Wstar.data(), n,
+	           0.0f,
+	           d_Ytgt.data(), n));
+
+	std::vector<float> Y((size_t)T * n), Ytgt((size_t)T * n), dY((size_t)T * n);
+	d_Ytgt.download(&Ytgt[0], Ytgt.size());
+
+	float loss_first = -1.0f, loss_last = -1.0f;
+	for (int step = 1; step <= N; ++step)
+	{
+		// Forward Y = X · W
+		glades::gpu::sgemm_rowmajor(T, n, m, 1.0f,
+		                            d_X.data(), m,
+		                            d_W.data(), n,
+		                            0.0f,
+		                            d_Y.data(), n);
+		d_Y.download(&Y[0], Y.size());
+
+		// Loss + dY = (2/N) · (Y - Ytgt)
+		float loss = 0.0f;
+		for (size_t i = 0; i < Y.size(); ++i)
+		{
+			const float d = Y[i] - Ytgt[i];
+			loss += d * d;
+			dY[i] = (2.0f / float(Y.size())) * d;
+		}
+		loss /= float(Y.size());
+		if (step == 1) loss_first = loss;
+		loss_last = loss;
+		d_dY.upload(&dY[0], dY.size());
+
+		// dW = X^T · dY   (standard backward through Y = X · W)
+		glades::gpu::sgemm_rowmajor_atb(m, n, T, 1.0f,
+		                                d_X.data(), m,
+		                                d_dY.data(), n,
+		                                0.0f,
+		                                d_dW.data(), n);
+
+		// MFIO: compute σ from (X, dY) — here X plays role of z (input
+		// activation), dY plays role of δ (output gradient).
+		ASSERT("mfio_compute_sigma runs",
+		       glades::gpu::mfio_compute_sigma(
+		           d_X.data(), d_dY.data(),
+		           T, m, n,
+		           beta, eps,
+		           d_sigma.data()));
+
+		// Weight update: W -= η · σ · dW
+		ASSERT("mfio_update runs",
+		       glades::gpu::mfio_update(
+		           d_W.data(), d_dW.data(), d_sigma.data(),
+		           lr, wd,
+		           (int)W_h.size()));
+	}
+
+	std::printf("  mfio descent (T=%u, m=%u, n=%u): loss %.4e → %.4e (%.2fx) over %d steps\n",
+	            T, m, n, loss_first, loss_last, loss_first / loss_last, N);
+	ASSERT("MFIO reduces loss on linear regression", loss_last < loss_first);
+	ASSERT("MFIO reduces loss by ≥ 3× (toy problem)",
+	       loss_first / loss_last >= 3.0f);
+#else
+	std::printf("  [mfio descent] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -7381,6 +7497,7 @@ void CHIRONUnitTest()
 	CHIRONMpotBenchmark();
 	CHIRONMpotAdamDescentTest();
 	CHIRONMpotStiefelCompositionBenchmark();
+	CHIRONMfioDescentTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
