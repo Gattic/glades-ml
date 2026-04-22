@@ -29,6 +29,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_stiefel.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_hrtc.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_ovfg.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_mpot.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -6288,6 +6289,123 @@ void CHIRONChunkedCrossEntropyBenchmark()
 #endif
 }
 
+// CHIRONMpotReconstructParityTest -------------------------------------------
+// Paradigm shift #10, Phase 1a: verify mpot_reconstruct_dense implements
+// the MPO contraction
+//   W[i_1·m_2 + i_2, j_1·n_2 + j_2] = Σ_α A[i_1, j_1, α] · B[α, i_2, j_2]
+// exactly.  The GPU kernel must match a naive host implementation to
+// FP32 round-off.
+void CHIRONMpotReconstructParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mpot reconstruct] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int m_1 = 4, m_2 = 6, n_1 = 5, n_2 = 3, D = 8;
+	const unsigned int m   = m_1 * m_2;
+	const unsigned int n   = n_1 * n_2;
+
+	LCG rng(202604231u);
+	std::vector<float> A_h((size_t)m_1 * n_1 * D);
+	std::vector<float> B_h((size_t)D * m_2 * n_2);
+	for (size_t i = 0; i < A_h.size(); ++i) A_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < B_h.size(); ++i) B_h[i] = 0.2f * rng.next_unit();
+
+	// Host reference: straightforward triple-index loop.
+	std::vector<float> W_ref((size_t)m * n, 0.0f);
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		const unsigned int i_1 = i / m_2;
+		const unsigned int i_2 = i % m_2;
+		for (unsigned int j = 0; j < n; ++j)
+		{
+			const unsigned int j_1 = j / n_2;
+			const unsigned int j_2 = j % n_2;
+			float s = 0.0f;
+			for (unsigned int a = 0; a < D; ++a)
+			{
+				const float av = A_h[(size_t)i_1 * n_1 * D + (size_t)j_1 * D + a];
+				const float bv = B_h[(size_t)a * m_2 * n_2 + (size_t)i_2 * n_2 + j_2];
+				s += av * bv;
+			}
+			W_ref[(size_t)i * n + j] = s;
+		}
+	}
+
+	// GPU path.
+	glades::gpu::GpuBuffer<float> d_A, d_B, d_W;
+	d_A.allocate(A_h.size()); d_A.upload(&A_h[0], A_h.size());
+	d_B.allocate(B_h.size()); d_B.upload(&B_h[0], B_h.size());
+	d_W.allocate((size_t)m * n);
+
+	ASSERT("mpot_reconstruct_dense runs",
+	       glades::gpu::mpot_reconstruct_dense(
+	           d_A.data(), d_B.data(), m_1, m_2, n_1, n_2, D, d_W.data()));
+
+	std::vector<float> W_gpu((size_t)m * n);
+	d_W.download(&W_gpu[0], W_gpu.size());
+	const float err = max_abs_diff(W_ref, W_gpu);
+	std::printf("  mpot_reconstruct (%u·%u × %u·%u, D=%u): max_err = %.3e\n",
+	            m_1, m_2, n_1, n_2, D, err);
+	ASSERT("MPOT reconstruct matches host naive contraction",
+	       err < 1e-5f);
+
+	// Edge case: degenerate D = 1 (rank-1 outer product).
+	{
+		const unsigned int D1 = 1;
+		std::vector<float> A1((size_t)m_1 * n_1 * D1);
+		std::vector<float> B1((size_t)D1 * m_2 * n_2);
+		for (size_t i = 0; i < A1.size(); ++i) A1[i] = 0.3f * rng.next_unit();
+		for (size_t i = 0; i < B1.size(); ++i) B1[i] = 0.3f * rng.next_unit();
+		glades::gpu::GpuBuffer<float> d_A1, d_B1, d_W1;
+		d_A1.allocate(A1.size()); d_A1.upload(&A1[0], A1.size());
+		d_B1.allocate(B1.size()); d_B1.upload(&B1[0], B1.size());
+		d_W1.allocate((size_t)m * n);
+		ASSERT("mpot_reconstruct_dense D=1 runs",
+		       glades::gpu::mpot_reconstruct_dense(
+		           d_A1.data(), d_B1.data(), m_1, m_2, n_1, n_2, D1, d_W1.data()));
+		std::vector<float> W1_ref((size_t)m * n, 0.0f);
+		for (unsigned int i = 0; i < m; ++i)
+		{
+			const unsigned int i_1 = i / m_2;
+			const unsigned int i_2 = i % m_2;
+			for (unsigned int j = 0; j < n; ++j)
+			{
+				const unsigned int j_1 = j / n_2;
+				const unsigned int j_2 = j % n_2;
+				const float av = A1[(size_t)i_1 * n_1 * D1 + (size_t)j_1 * D1];
+				const float bv = B1[(size_t)0 * m_2 * n_2 + (size_t)i_2 * n_2 + j_2];
+				W1_ref[(size_t)i * n + j] = av * bv;
+			}
+		}
+		std::vector<float> W1_gpu((size_t)m * n);
+		d_W1.download(&W1_gpu[0], W1_gpu.size());
+		const float err1 = max_abs_diff(W1_ref, W1_gpu);
+		std::printf("  mpot_reconstruct D=1 (rank-1 outer product): max_err = %.3e\n", err1);
+		ASSERT("MPOT reconstruct at D=1 matches rank-1 outer product",
+		       err1 < 1e-6f);
+	}
+
+	// Storage ratio sanity: verify the MPO factoring has fewer entries than
+	// dense at a realistic shape (pile_large-ish: m=n=1024, D=16).
+	{
+		const unsigned int m_1L = 32, m_2L = 32, n_1L = 32, n_2L = 32, DL = 16;
+		const size_t mpo_entries   = (size_t)m_1L * n_1L * DL + (size_t)DL * m_2L * n_2L;
+		const size_t dense_entries = (size_t)m_1L * m_2L * (size_t)n_1L * n_2L;
+		const double ratio = double(dense_entries) / double(mpo_entries);
+		std::printf("  mpot storage (1024×1024, D=16): %zu vs dense %zu  → %.2fx compression\n",
+		            mpo_entries, dense_entries, ratio);
+		ASSERT("MPOT at D=16 gives ≥ 32× compression on (1024×1024)",
+		       ratio >= 32.0);
+	}
+#else
+	std::printf("  [mpot reconstruct] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -6402,6 +6520,7 @@ void CHIRONUnitTest()
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
 	CHIRONChunkedCrossEntropyBenchmark();
+	CHIRONMpotReconstructParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
