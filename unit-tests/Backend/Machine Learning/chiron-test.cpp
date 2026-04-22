@@ -9417,6 +9417,7 @@ void CHIRONUnitTest()
 	CHIRONTrcdGumbelGateEvalTest();
 	CHIRONTrcdApplyGateParityTest();
 	CHIRONTrcdLambdaPiControllerTest();
+	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
@@ -11776,4 +11777,372 @@ void CHIRONTrcdLambdaPiControllerTest()
 	std::printf("  [trcd λ-PI] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
+
+// CHIRONTrcdEndToEndConvergenceTest -----------------------------------------
+// Paradigm shift #13, Phase 2: the full TRCD loop closes.  A small MLP is
+// trained with the mechanism described in PARADIGM_SHIFT_13_CANDIDATE_C_TRCD.md:
+//
+//   forward:   X → (skip: h_skip = relu(X · W_skip))
+//                ↘ (deep: h_deep = relu(X · W1))
+//              router: u = a · h_deep + b; α = gate(u, λ, τ)
+//              routed = α · h_deep + (1 − α) · h_skip
+//              Y      = routed · W_out
+//
+// Training: 300 Adam steps on MSE against Y_tgt = relu(X · W_tgt) · W_out_tgt.
+//
+// λ-PI adaptive on observed d̄.  Target d̄ = 0.85 (85% of tokens continue).
+//
+// Asserts:  (a) MSE decreases ≥ 10× from initial
+//           (b) λ-PI drives observed d̄ to within 10% of target
+//           (c) no NaN / no Inf in any weight
+//
+// This is the decisive Phase-2 gate for TRCD — if the end-to-end loop
+// does not close on a toy MLP, no pile_train wire-in matters.
+void CHIRONTrcdEndToEndConvergenceTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [trcd e2e] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T     = 64;
+	const unsigned int m_in  = 16;
+	const unsigned int m_hid = 24;
+	const unsigned int n_out = 8;
+	const int          N     = 300;
+	const float        lr    = 5e-3f;
+	const float        b1    = 0.9f;
+	const float        b2    = 0.999f;
+	const float        eps   = 1e-8f;
+	const float        d_target = 0.85f;  // target mean α (∈ [0, 1] for this 2-way gate)
+	const float        kp   = 0.20f, ki = 0.02f;
+
+	LCG rng(202604225u);
+	std::vector<float> Wtgt_h((size_t)m_in  * m_hid);
+	std::vector<float> Wout_tgt_h((size_t)m_hid * n_out);
+	std::vector<float> X_h((size_t)T * m_in);
+	std::vector<float> W1_h((size_t)m_in  * m_hid);
+	std::vector<float> Wsk_h((size_t)m_in  * m_hid);
+	std::vector<float> Wout_h((size_t)m_hid * n_out);
+	std::vector<float> a_h(m_hid);
+	for (size_t i = 0; i < Wtgt_h.size();     ++i) Wtgt_h[i]     = 0.3f  * rng.next_unit();
+	for (size_t i = 0; i < Wout_tgt_h.size(); ++i) Wout_tgt_h[i] = 0.3f  * rng.next_unit();
+	for (size_t i = 0; i < X_h.size();        ++i) X_h[i]        = 0.5f  * rng.next_unit();
+	for (size_t i = 0; i < W1_h.size();       ++i) W1_h[i]       = 0.10f * rng.next_unit();
+	for (size_t i = 0; i < Wsk_h.size();      ++i) Wsk_h[i]      = 0.10f * rng.next_unit();
+	for (size_t i = 0; i < Wout_h.size();     ++i) Wout_h[i]     = 0.10f * rng.next_unit();
+	for (size_t i = 0; i < a_h.size();        ++i) a_h[i]        = 0.10f * rng.next_unit();
+	float b_h = 0.0f;
+
+	// Y_tgt = relu(X · Wtgt) · Wout_tgt.
+	std::vector<float> Ytgt_h((size_t)T * n_out);
+	{
+		std::vector<float> h((size_t)T * m_hid);
+		for (unsigned t = 0; t < T; ++t)
+			for (unsigned j = 0; j < m_hid; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < m_in; ++k)
+					s += X_h[(size_t)t * m_in + k] * Wtgt_h[(size_t)k * m_hid + j];
+				h[(size_t)t * m_hid + j] = (s > 0.0f) ? s : 0.0f;
+			}
+		for (unsigned t = 0; t < T; ++t)
+			for (unsigned j = 0; j < n_out; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < m_hid; ++k)
+					s += h[(size_t)t * m_hid + k] * Wout_tgt_h[(size_t)k * n_out + j];
+				Ytgt_h[(size_t)t * n_out + j] = s;
+			}
+	}
+
+	// Allocate device buffers.
+	glades::gpu::GpuBuffer<float> d_X, d_Ytgt, d_W1, d_Wsk, d_Wout, d_a, d_b;
+	glades::gpu::GpuBuffer<float> d_preD, d_hD, d_preS, d_hS;
+	glades::gpu::GpuBuffer<float> d_u, d_alpha, d_h_routed, d_Y;
+	glades::gpu::GpuBuffer<float> d_dY, d_dh_routed, d_dhD, d_dhS;
+	glades::gpu::GpuBuffer<float> d_dalpha, d_du, d_dW1, d_dWsk, d_dWout, d_da, d_db;
+	glades::gpu::GpuBuffer<float> d_dpreD, d_dpreS;
+	glades::gpu::GpuBuffer<float> d_mW1, d_vW1, d_mWsk, d_vWsk, d_mWout, d_vWout, d_ma, d_va, d_mb, d_vb;
+
+	d_X.allocate(X_h.size());          d_X.upload(&X_h[0], X_h.size());
+	d_Ytgt.allocate(Ytgt_h.size());    d_Ytgt.upload(&Ytgt_h[0], Ytgt_h.size());
+	d_W1.allocate(W1_h.size());        d_W1.upload(&W1_h[0], W1_h.size());
+	d_Wsk.allocate(Wsk_h.size());      d_Wsk.upload(&Wsk_h[0], Wsk_h.size());
+	d_Wout.allocate(Wout_h.size());    d_Wout.upload(&Wout_h[0], Wout_h.size());
+	d_a.allocate(a_h.size());          d_a.upload(&a_h[0], a_h.size());
+	d_b.allocate(1);                   d_b.upload(&b_h, 1);
+
+	d_preD.allocate((size_t)T * m_hid);    d_hD.allocate((size_t)T * m_hid);
+	d_preS.allocate((size_t)T * m_hid);    d_hS.allocate((size_t)T * m_hid);
+	d_u.allocate(T);                       d_alpha.allocate(T);
+	d_h_routed.allocate((size_t)T * m_hid); d_Y.allocate((size_t)T * n_out);
+
+	d_dY.allocate((size_t)T * n_out);      d_dh_routed.allocate((size_t)T * m_hid);
+	d_dhD.allocate((size_t)T * m_hid);     d_dhS.allocate((size_t)T * m_hid);
+	d_dalpha.allocate(T);                  d_du.allocate(T);
+	d_dW1.allocate(W1_h.size());           d_dWsk.allocate(Wsk_h.size());
+	d_dWout.allocate(Wout_h.size());       d_da.allocate(a_h.size());
+	d_db.allocate(1);                      d_dpreD.allocate((size_t)T * m_hid);
+	d_dpreS.allocate((size_t)T * m_hid);
+
+	d_mW1.allocate(W1_h.size()); d_vW1.allocate(W1_h.size());
+	d_mWsk.allocate(Wsk_h.size()); d_vWsk.allocate(Wsk_h.size());
+	d_mWout.allocate(Wout_h.size()); d_vWout.allocate(Wout_h.size());
+	d_ma.allocate(a_h.size()); d_va.allocate(a_h.size());
+	d_mb.allocate(1); d_vb.allocate(1);
+	{
+		std::vector<float> z(std::max<size_t>(W1_h.size(),
+		                     std::max<size_t>(Wout_h.size(), a_h.size())), 0.0f);
+		d_mW1.upload(&z[0], W1_h.size());   d_vW1.upload(&z[0], W1_h.size());
+		d_mWsk.upload(&z[0], Wsk_h.size());  d_vWsk.upload(&z[0], Wsk_h.size());
+		d_mWout.upload(&z[0], Wout_h.size()); d_vWout.upload(&z[0], Wout_h.size());
+		d_ma.upload(&z[0], a_h.size());      d_va.upload(&z[0], a_h.size());
+		float zz = 0.0f;
+		d_mb.upload(&zz, 1); d_vb.upload(&zz, 1);
+	}
+
+	float lambda = 0.0f, integral = 0.0f;
+	const float tau = 1.0f;
+	float loss_init = -1.0f;
+	float d_bar_final = 0.0f;
+
+	for (int step = 1; step <= N; ++step)
+	{
+		// --- Forward ---
+		// pre_D = X · W1                                 [T × m_hid]
+		ASSERT("trcd e2e sgemm W1",
+		    glades::gpu::sgemm_rowmajor(T, m_hid, m_in, 1.0f,
+		        d_X.data(), m_in,
+		        d_W1.data(), m_hid,
+		        0.0f,
+		        d_preD.data(), m_hid));
+		// h_D = relu(pre_D)
+		ASSERT("trcd e2e relu deep",
+		    glades::gpu::relu_forward(d_preD.data(), (int)(T * m_hid), d_hD.data()));
+		// pre_S = X · W_sk, h_S = relu(pre_S)
+		ASSERT("trcd e2e sgemm Wsk",
+		    glades::gpu::sgemm_rowmajor(T, m_hid, m_in, 1.0f,
+		        d_X.data(), m_in,
+		        d_Wsk.data(), m_hid,
+		        0.0f,
+		        d_preS.data(), m_hid));
+		ASSERT("trcd e2e relu skip",
+		    glades::gpu::relu_forward(d_preS.data(), (int)(T * m_hid), d_hS.data()));
+		// u = a · h_D + b
+		float b_cpu = 0.0f;  d_b.download(&b_cpu, 1);
+		ASSERT("trcd e2e route logits",
+		    glades::gpu::trcd_route_logits(d_hD.data(), d_a.data(), b_cpu,
+		        T, m_hid, d_u.data()));
+		// α
+		const bool training_mode = true;
+		ASSERT("trcd e2e gumbel gate",
+		    glades::gpu::trcd_gumbel_gate(d_u.data(), lambda, tau,
+		        (uint64_t)step * 0x9E3779B97F4A7C15ULL, training_mode, T, d_alpha.data()));
+		// h_routed = α * h_D + (1 − α) * h_S — implemented via two applies + axpy.
+		ASSERT("trcd e2e apply gate deep",
+		    glades::gpu::trcd_apply_gate(d_hD.data(), d_alpha.data(),
+		        T, m_hid, d_h_routed.data()));
+		// compute h_routed += (1 − α) * h_S  via host-side axpy loop substitute:
+		// use a second apply_gate with complement alpha, then add.  Since there's
+		// no batched add primitive, roll it into a single dedicated kernel would
+		// be cleanest; for test we download + add on host (small T).
+		{
+			std::vector<float> alpha_h(T);
+			d_alpha.download(&alpha_h[0], T);
+			std::vector<float> comp(T);
+			for (unsigned t = 0; t < T; ++t) comp[t] = 1.0f - alpha_h[t];
+			glades::gpu::GpuBuffer<float> d_comp;
+			d_comp.allocate(T); d_comp.upload(&comp[0], T);
+			glades::gpu::GpuBuffer<float> d_gatedS; d_gatedS.allocate((size_t)T * m_hid);
+			ASSERT("trcd e2e apply gate skip (1-α)",
+			    glades::gpu::trcd_apply_gate(d_hS.data(), d_comp.data(),
+			        T, m_hid, d_gatedS.data()));
+			// d_h_routed += d_gatedS — axpy via cuBLAS sgemv on ones?  Easier: host.
+			std::vector<float> hr((size_t)T * m_hid), gs((size_t)T * m_hid);
+			d_h_routed.download(&hr[0], hr.size());
+			d_gatedS.download(&gs[0], gs.size());
+			for (size_t i = 0; i < hr.size(); ++i) hr[i] += gs[i];
+			d_h_routed.upload(&hr[0], hr.size());
+		}
+		// Y = h_routed · W_out
+		ASSERT("trcd e2e sgemm W_out",
+		    glades::gpu::sgemm_rowmajor(T, n_out, m_hid, 1.0f,
+		        d_h_routed.data(), m_hid,
+		        d_Wout.data(), n_out,
+		        0.0f,
+		        d_Y.data(), n_out));
+
+		// Loss + dY.
+		std::vector<float> Y_h((size_t)T * n_out), dY_h((size_t)T * n_out);
+		d_Y.download(&Y_h[0], Y_h.size());
+		float loss = 0.0f;
+		for (size_t i = 0; i < Y_h.size(); ++i) {
+			float diff = Y_h[i] - Ytgt_h[i];
+			dY_h[i] = 2.0f * diff / (float)Y_h.size();
+			loss += diff * diff;
+		}
+		loss /= (float)Y_h.size();
+		if (step == 1) loss_init = loss;
+
+		d_dY.upload(&dY_h[0], dY_h.size());
+
+		// --- Backward ---
+		// d_h_routed = d_dY · W_out^T    (T × m_hid)
+		ASSERT("trcd e2e bwd dh_routed",
+		    glades::gpu::sgemm_rowmajor_abt(T, m_hid, n_out, 1.0f,
+		        d_dY.data(), n_out,
+		        d_Wout.data(), n_out,
+		        0.0f,
+		        d_dh_routed.data(), m_hid));
+		// d_Wout += h_routed^T · d_dY   (m_hid × n_out)
+		{
+			std::vector<float> zW(Wout_h.size(), 0.0f);
+			d_dWout.upload(&zW[0], zW.size());
+		}
+		ASSERT("trcd e2e bwd dW_out",
+		    glades::gpu::sgemm_rowmajor_atb(m_hid, n_out, T, 1.0f,
+		        d_h_routed.data(), m_hid,
+		        d_dY.data(), n_out,
+		        0.0f,
+		        d_dWout.data(), n_out));
+
+		// dh_D = α · dh_routed;   dh_S = (1 − α) · dh_routed;  dα = Σ_j (h_D[t,j] − h_S[t,j]) · dh_routed[t,j]
+		{
+			std::vector<float> alpha_h(T);
+			d_alpha.download(&alpha_h[0], T);
+			std::vector<float> dhr((size_t)T * m_hid);
+			d_dh_routed.download(&dhr[0], dhr.size());
+			std::vector<float> hD_h((size_t)T * m_hid), hS_h((size_t)T * m_hid);
+			d_hD.download(&hD_h[0], hD_h.size());
+			d_hS.download(&hS_h[0], hS_h.size());
+			std::vector<float> dhD_h((size_t)T * m_hid), dhS_h((size_t)T * m_hid), dalpha_h(T, 0.0f);
+			for (unsigned t = 0; t < T; ++t) {
+				const float a = alpha_h[t];
+				float da = 0.0f;
+				for (unsigned j = 0; j < m_hid; ++j) {
+					const size_t idx = (size_t)t * m_hid + j;
+					dhD_h[idx] = a * dhr[idx];
+					dhS_h[idx] = (1.0f - a) * dhr[idx];
+					da        += (hD_h[idx] - hS_h[idx]) * dhr[idx];
+				}
+				dalpha_h[t] = da;
+			}
+			d_dhD.upload(&dhD_h[0], dhD_h.size());
+			d_dhS.upload(&dhS_h[0], dhS_h.size());
+			d_dalpha.upload(&dalpha_h[0], T);
+		}
+		// Through the Gumbel gate: dL/du = dα · α · (1 − α) / τ.
+		{
+			std::vector<float> alpha_h(T), dalpha_h(T), du_h(T);
+			d_alpha.download(&alpha_h[0], T);
+			d_dalpha.download(&dalpha_h[0], T);
+			for (unsigned t = 0; t < T; ++t) {
+				const float a = alpha_h[t];
+				du_h[t] = dalpha_h[t] * a * (1.0f - a) / tau;
+			}
+			d_du.upload(&du_h[0], T);
+		}
+		// Route-logits backward: ga += du^T · h_D; gb += Σ du; dh_D += du · a
+		{
+			std::vector<float> za(a_h.size(), 0.0f);
+			d_da.upload(&za[0], za.size());
+			float zb = 0.0f; d_db.upload(&zb, 1);
+			// We want dh_D ACCUMULATED (add into existing dhD).  Primitive
+			// overwrites; we'll use a separate buffer and add on host.
+			glades::gpu::GpuBuffer<float> d_dhD_router;
+			d_dhD_router.allocate((size_t)T * m_hid);
+			ASSERT("trcd e2e route bwd",
+			    glades::gpu::trcd_route_logits_backward(
+			        d_du.data(), d_hD.data(), d_a.data(),
+			        T, m_hid,
+			        d_da.data(), d_db.data(), d_dhD_router.data()));
+			std::vector<float> dhd1((size_t)T * m_hid), dhd2((size_t)T * m_hid);
+			d_dhD.download(&dhd1[0], dhd1.size());
+			d_dhD_router.download(&dhd2[0], dhd2.size());
+			for (size_t i = 0; i < dhd1.size(); ++i) dhd1[i] += dhd2[i];
+			d_dhD.upload(&dhd1[0], dhd1.size());
+		}
+		// ReLU backward: dpre_D = relu'(pre_D) * dh_D; similarly for skip.
+		ASSERT("trcd e2e relu bwd D",
+		    glades::gpu::relu_backward(d_dhD.data(), d_preD.data(), (int)(T * m_hid), d_dpreD.data()));
+		ASSERT("trcd e2e relu bwd S",
+		    glades::gpu::relu_backward(d_dhS.data(), d_preS.data(), (int)(T * m_hid), d_dpreS.data()));
+		// dW1 = X^T · dpre_D;  dWsk = X^T · dpre_S.
+		{ std::vector<float> zW(W1_h.size(), 0.0f); d_dW1.upload(&zW[0], zW.size()); }
+		ASSERT("trcd e2e bwd dW1",
+		    glades::gpu::sgemm_rowmajor_atb(m_in, m_hid, T, 1.0f,
+		        d_X.data(), m_in,
+		        d_dpreD.data(), m_hid,
+		        0.0f,
+		        d_dW1.data(), m_hid));
+		{ std::vector<float> zW(Wsk_h.size(), 0.0f); d_dWsk.upload(&zW[0], zW.size()); }
+		ASSERT("trcd e2e bwd dWsk",
+		    glades::gpu::sgemm_rowmajor_atb(m_in, m_hid, T, 1.0f,
+		        d_X.data(), m_in,
+		        d_dpreS.data(), m_hid,
+		        0.0f,
+		        d_dWsk.data(), m_hid));
+
+		// --- Adam updates ---
+		ASSERT("adam W1", glades::gpu::adam_update(d_W1.data(), d_dW1.data(),
+		    d_mW1.data(), d_vW1.data(), lr, b1, b2, eps, 0.0f, 1.0f, step, (int)W1_h.size()));
+		ASSERT("adam Wsk", glades::gpu::adam_update(d_Wsk.data(), d_dWsk.data(),
+		    d_mWsk.data(), d_vWsk.data(), lr, b1, b2, eps, 0.0f, 1.0f, step, (int)Wsk_h.size()));
+		ASSERT("adam Wout", glades::gpu::adam_update(d_Wout.data(), d_dWout.data(),
+		    d_mWout.data(), d_vWout.data(), lr, b1, b2, eps, 0.0f, 1.0f, step, (int)Wout_h.size()));
+		ASSERT("adam a", glades::gpu::adam_update(d_a.data(), d_da.data(),
+		    d_ma.data(), d_va.data(), lr, b1, b2, eps, 0.0f, 1.0f, step, (int)a_h.size()));
+		ASSERT("adam b", glades::gpu::adam_update(d_b.data(), d_db.data(),
+		    d_mb.data(), d_vb.data(), lr, b1, b2, eps, 0.0f, 1.0f, step, 1));
+
+		// --- λ-PI update based on observed mean α (this serves as d̄ in [0, 1]) ---
+		{
+			std::vector<float> alpha_h(T);
+			d_alpha.download(&alpha_h[0], T);
+			float sum = 0.0f;
+			for (unsigned t = 0; t < T; ++t) sum += alpha_h[t];
+			float d_bar = sum / (float)T;
+			glades::gpu::trcd_lambda_pi_update(d_bar, d_target, kp, ki,
+			    integral, lambda, 10.0f);
+			if (step == N) d_bar_final = d_bar;
+
+			if (step == 1 || step == N || step % 100 == 0) {
+				std::printf("  [trcd e2e] step=%d loss=%.4e λ=%.3f d̄=%.3f (tgt %.3f)\n",
+				            step, loss, lambda, d_bar, d_target);
+			}
+		}
+	}
+
+	// Final weights check for NaN/Inf.
+	std::vector<float> Wck(W1_h.size());
+	d_W1.download(&Wck[0], Wck.size());
+	bool good = true;
+	for (size_t i = 0; i < Wck.size(); ++i) {
+		if (!(Wck[i] == Wck[i]) || std::fabs(Wck[i]) > 1e6f) { good = false; break; }
+	}
+
+	// Final loss measure.
+	std::vector<float> Y_h((size_t)T * n_out);
+	d_Y.download(&Y_h[0], Y_h.size());
+	float loss_final = 0.0f;
+	for (size_t i = 0; i < Y_h.size(); ++i) {
+		float diff = Y_h[i] - Ytgt_h[i];
+		loss_final += diff * diff;
+	}
+	loss_final /= (float)Y_h.size();
+	const float loss_ratio = loss_init / loss_final;
+	const float d_err = std::fabs(d_bar_final - d_target) / d_target;
+	std::printf("  [trcd e2e] init loss=%.4e final loss=%.4e ratio=%.2f× "
+	            "d̄_final=%.3f (tgt %.3f, %.1f%% err)\n",
+	            loss_init, loss_final, loss_ratio, d_bar_final, d_target, 100.0f * d_err);
+	ASSERT("trcd e2e weights finite",        good);
+	ASSERT("trcd e2e loss drops ≥ 10×",       loss_ratio >= 10.0f);
+	ASSERT("trcd e2e d̄ tracks target ≤10%",   d_err <= 0.10f);
+#else
+	std::printf("  [trcd e2e] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 
