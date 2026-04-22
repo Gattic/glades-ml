@@ -7376,6 +7376,145 @@ void CHIRONMfioDescentTest()
 #endif
 }
 
+// CHIRONMfioVsAdamBenchmark -------------------------------------------------
+// Paradigm shift #11, Phase 1b: head-to-head comparison of MFIO (zero
+// per-param optimizer state) against Adam (int8-packed or FP32 — here
+// plain FP32 via the existing adam_update primitive) on the same
+// linear-regression target.  Both optimizers start from the same init
+// and see the same (X, Ytgt) stream.  Reports final-loss ratio and
+// steps-to-target comparison.
+//
+// Goal: confirm MFIO's descent rate is within the 2-3× worst-case band
+// stated in the design doc.  If MFIO lands well inside that band, it
+// is a viable replacement for Adam at the Zero-state boundary;
+// otherwise the design doc's Candidate C (PRA with block-shared
+// moments) becomes the fallback.
+void CHIRONMfioVsAdamBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mfio vs adam] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 32;
+	const unsigned int m = 24, n = 16;
+	const int   N   = 100;
+	const float lr  = 1e-2f;
+	const float b1  = 0.9f;
+	const float b2  = 0.999f;
+	const float eps = 1e-8f;
+
+	LCG rng(202604238u);
+	std::vector<float> W_star_h((size_t)m * n), X_h((size_t)T * m), W0_h((size_t)m * n);
+	for (size_t i = 0; i < W_star_h.size(); ++i) W_star_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < X_h.size(); ++i)      X_h[i]      = 0.4f * rng.next_unit();
+	for (size_t i = 0; i < W0_h.size(); ++i)     W0_h[i]     = 0.05f * rng.next_unit();
+
+	// Shared target: Ytgt = X · W_star.
+	glades::gpu::GpuBuffer<float> d_X, d_Wstar, d_Ytgt;
+	d_X.allocate(X_h.size());            d_X.upload(&X_h[0], X_h.size());
+	d_Wstar.allocate(W_star_h.size());   d_Wstar.upload(&W_star_h[0], W_star_h.size());
+	d_Ytgt.allocate((size_t)T * n);
+	glades::gpu::sgemm_rowmajor(T, n, m, 1.0f,
+	                            d_X.data(), m,
+	                            d_Wstar.data(), n,
+	                            0.0f, d_Ytgt.data(), n);
+	std::vector<float> Ytgt((size_t)T * n);
+	d_Ytgt.download(&Ytgt[0], Ytgt.size());
+
+	// Two sequential runs: MFIO first, then Adam, both from the same
+	// init W0_h.  C++98 — no lambda; inline both loops.
+	float mfio_first = 0, mfio_last = 0, adam_first = 0, adam_last = 0;
+
+	for (int pass = 0; pass < 2; ++pass)
+	{
+		const bool use_mfio = (pass == 0);
+		glades::gpu::GpuBuffer<float> d_W, d_Y, d_dY, d_dW, d_sigma, d_mA, d_vA;
+		d_W.allocate(W0_h.size());  d_W.upload(&W0_h[0], W0_h.size());
+		d_Y.allocate((size_t)T * n);
+		d_dY.allocate((size_t)T * n);
+		d_dW.allocate(W0_h.size());
+		d_sigma.allocate(1);
+		d_mA.allocate(W0_h.size());
+		d_vA.allocate(W0_h.size());
+		std::vector<float> z_moments(W0_h.size(), 0.0f);
+		d_mA.upload(&z_moments[0], z_moments.size());
+		d_vA.upload(&z_moments[0], z_moments.size());
+
+		std::vector<float> Y((size_t)T * n), dY((size_t)T * n);
+		float loss_first = -1.0f, loss_last = -1.0f;
+		for (int step = 1; step <= N; ++step)
+		{
+			glades::gpu::sgemm_rowmajor(T, n, m, 1.0f,
+			                            d_X.data(), m,
+			                            d_W.data(), n,
+			                            0.0f, d_Y.data(), n);
+			d_Y.download(&Y[0], Y.size());
+			float loss = 0.0f;
+			for (size_t i = 0; i < Y.size(); ++i)
+			{
+				const float d = Y[i] - Ytgt[i];
+				loss += d * d;
+				dY[i] = (2.0f / float(Y.size())) * d;
+			}
+			loss /= float(Y.size());
+			if (step == 1) loss_first = loss;
+			loss_last = loss;
+			d_dY.upload(&dY[0], dY.size());
+
+			glades::gpu::sgemm_rowmajor_atb(m, n, T, 1.0f,
+			                                d_X.data(), m,
+			                                d_dY.data(), n,
+			                                0.0f, d_dW.data(), n);
+			if (use_mfio)
+			{
+				glades::gpu::mfio_compute_sigma(
+				    d_X.data(), d_dY.data(),
+				    T, m, n, 1.0f, eps, d_sigma.data());
+				glades::gpu::mfio_update(
+				    d_W.data(), d_dW.data(), d_sigma.data(),
+				    lr, 0.0f, (int)W0_h.size());
+			}
+			else
+			{
+				glades::gpu::adam_update(
+				    d_W.data(), d_dW.data(),
+				    d_mA.data(), d_vA.data(),
+				    lr, b1, b2, eps,
+				    0.0f, 1.0f,
+				    step, (int)W0_h.size());
+			}
+		}
+		const char* name = use_mfio ? "MFIO" : "Adam";
+		std::printf("  %s: loss %.4e -> %.4e (%.2fx reduction) over %d steps\n",
+		            name, loss_first, loss_last,
+		            loss_first / loss_last, N);
+		if (use_mfio) { mfio_first = loss_first; mfio_last = loss_last; }
+		else          { adam_first = loss_first; adam_last = loss_last; }
+	}
+
+	const float mfio_ratio = mfio_first / mfio_last;
+	const float adam_ratio = adam_first / adam_last;
+	// Log-scale descent rate is the meaningful convergence metric (Adam
+	// vs MFIO after N steps is L_0 · exp(-r · N); compare exponents).
+	const float mfio_log_rate = std::log(mfio_ratio);
+	const float adam_log_rate = std::log(adam_ratio);
+	const float log_efficiency = mfio_log_rate / adam_log_rate;
+	std::printf("  MFIO/Adam: raw ratio %.3fx, LOG-descent-rate efficiency %.1f%%\n",
+	            mfio_ratio / adam_ratio, 100.0f * log_efficiency);
+	std::printf("             (MFIO %.1fx vs Adam %.1fx over %d steps; "
+	            "MFIO needs ~%.1fx more steps to match Adam)\n",
+	            mfio_ratio, adam_ratio, N, 1.0f / log_efficiency);
+
+	ASSERT("MFIO log-descent-rate ≥ 60% of Adam's on linear regression",
+	       log_efficiency >= 0.6f);
+	ASSERT("MFIO final loss < MFIO initial loss", mfio_last < mfio_first);
+#else
+	std::printf("  [mfio vs adam] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -7498,6 +7637,7 @@ void CHIRONUnitTest()
 	CHIRONMpotAdamDescentTest();
 	CHIRONMpotStiefelCompositionBenchmark();
 	CHIRONMfioDescentTest();
+	CHIRONMfioVsAdamBenchmark();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
