@@ -34,6 +34,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_dfa.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_trcd.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_lcp.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_ibgrad.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -9423,6 +9424,7 @@ void CHIRONUnitTest()
 	CHIRONLcpDeltaParityTest();
 	CHIRONLcpEndToEndDetailCorrectionTest();
 	CHIRONLcpRoutingThroughputBenchmark();
+	CHIRONIbgradProjectUnprojectParityTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
@@ -12026,6 +12028,147 @@ void CHIRONLcpDeltaParityTest()
 	// when gather+scatter+delta cascade is composed.
 #else
 	std::printf("  [lcp delta] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONIbgradProjectUnprojectParityTest -----------------------------------
+// Paradigm shift #19 Phase 1: validate P^T · g and P · y against CPU
+// reference.  Also validates init produces a P whose rows have variance
+// ≈ 1/N (norm of each row ≈ √r/N).
+void CHIRONIbgradProjectUnprojectParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ibgrad project] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int N = 512;
+	const unsigned int r = 32;
+	LCG rng(202604232u);
+
+	// Init P from fixed seed and verify it's approximately in ℝ^{N × r} with
+	// entries ~ 𝒩(0, 1/N).
+	glades::gpu::GpuBuffer<float> d_P;
+	d_P.allocate((size_t)N * r);
+	ASSERT("ibgrad_init_projection",
+	    glades::gpu::ibgrad_init_projection(d_P.data(), N, r, 0xFEDCBA9876543210ULL));
+	glades::gpu::synchronizeCheck("ibgrad_init_projection");
+
+	std::vector<float> P_h((size_t)N * r);
+	d_P.download(&P_h[0], P_h.size());
+
+	// Empirical variance should be ≈ 1/N.
+	double mean = 0.0, m2 = 0.0;
+	for (size_t i = 0; i < P_h.size(); ++i) mean += P_h[i];
+	mean /= (double)P_h.size();
+	for (size_t i = 0; i < P_h.size(); ++i) {
+		double diff = P_h[i] - mean;
+		m2 += diff * diff;
+	}
+	const double var = m2 / (double)P_h.size();
+	const double expected_var = 1.0 / (double)N;
+	const double var_ratio = var / expected_var;
+	std::printf("  [ibgrad init] N=%u r=%u empirical var=%.3e expected=%.3e (ratio=%.2f)\n",
+	            N, r, var, expected_var, var_ratio);
+	ASSERT("ibgrad init var within 2× of 1/N", var_ratio > 0.5 && var_ratio < 2.0);
+
+	// Gradient with known structure.
+	std::vector<float> g_h(N);
+	for (unsigned int i = 0; i < N; ++i) g_h[i] = 0.5f * rng.next_unit();
+
+	// Reference Pᵀ g: y[j] = Σ_i P[i, j] · g[i].
+	std::vector<float> y_ref(r, 0.0f);
+	for (unsigned int j = 0; j < r; ++j) {
+		float s = 0.0f;
+		for (unsigned int i = 0; i < N; ++i)
+			s += P_h[(size_t)i * r + j] * g_h[i];
+		y_ref[j] = s;
+	}
+
+	glades::gpu::GpuBuffer<float> d_g, d_y, d_upd, d_full;
+	d_g.allocate(N);  d_g.upload(&g_h[0], N);
+	d_y.allocate(r);
+	ASSERT("ibgrad_project",
+	    glades::gpu::ibgrad_project(d_P.data(), d_g.data(), N, r, d_y.data()));
+	glades::gpu::synchronizeCheck("ibgrad_project");
+
+	std::vector<float> y_gpu(r);
+	d_y.download(&y_gpu[0], r);
+	float proj_err = 0.0f;
+	for (unsigned int j = 0; j < r; ++j) {
+		float e = std::fabs(y_gpu[j] - y_ref[j]);
+		if (e > proj_err) proj_err = e;
+	}
+	std::printf("  [ibgrad project] y = Pᵀg max_err = %.3e\n", proj_err);
+	ASSERT("ibgrad project < 1e-4", proj_err < 1e-4f);
+
+	// Unproject: P · y should reconstruct within the column space of P.
+	d_upd.allocate(r);  d_upd.upload(&y_gpu[0], r);  // use y as the "update"
+	d_full.allocate(N);
+	ASSERT("ibgrad_unproject",
+	    glades::gpu::ibgrad_unproject(d_P.data(), d_upd.data(), N, r, d_full.data()));
+	glades::gpu::synchronizeCheck("ibgrad_unproject");
+
+	std::vector<float> full_gpu(N), full_ref(N, 0.0f);
+	d_full.download(&full_gpu[0], N);
+	for (unsigned int i = 0; i < N; ++i) {
+		float s = 0.0f;
+		for (unsigned int j = 0; j < r; ++j)
+			s += P_h[(size_t)i * r + j] * y_gpu[j];
+		full_ref[i] = s;
+	}
+	float unproj_err = 0.0f;
+	for (unsigned int i = 0; i < N; ++i) {
+		float e = std::fabs(full_gpu[i] - full_ref[i]);
+		if (e > unproj_err) unproj_err = e;
+	}
+	std::printf("  [ibgrad unproject] update = P·y max_err = %.3e\n", unproj_err);
+	ASSERT("ibgrad unproject < 1e-4", unproj_err < 1e-4f);
+
+	// Oja rank-1 update: P += eta · g · y^T
+	const float eta = 0.01f;
+	ASSERT("ibgrad_oja_rank1_update",
+	    glades::gpu::ibgrad_oja_rank1_update(d_P.data(), d_g.data(), d_y.data(),
+	        N, r, eta));
+	glades::gpu::synchronizeCheck("ibgrad_oja_rank1_update");
+
+	std::vector<float> P_after((size_t)N * r);
+	d_P.download(&P_after[0], P_after.size());
+
+	// Verify the update: expected P_new[i, j] = P_old[i, j] + eta · g[i] · y[j].
+	float oja_err = 0.0f;
+	for (unsigned int i = 0; i < N; ++i) {
+		for (unsigned int j = 0; j < r; ++j) {
+			const size_t idx = (size_t)i * r + j;
+			const float expected = P_h[idx] + eta * g_h[i] * y_gpu[j];
+			const float e = std::fabs(P_after[idx] - expected);
+			if (e > oja_err) oja_err = e;
+		}
+	}
+	std::printf("  [ibgrad oja-update] rank-1 update max_err = %.3e\n", oja_err);
+	ASSERT("ibgrad oja-update < 1e-5", oja_err < 1e-5f);
+
+	// Sanity: after one Oja step, the top singular vector of P should be
+	// better aligned with g than a random rank-r matrix would be.  A proxy:
+	// ‖Pᵀg‖² should have grown (modest) after the update.
+	glades::gpu::GpuBuffer<float> d_y2;
+	d_y2.allocate(r);
+	ASSERT("ibgrad_project after oja",
+	    glades::gpu::ibgrad_project(d_P.data(), d_g.data(), N, r, d_y2.data()));
+	std::vector<float> y2_gpu(r);
+	d_y2.download(&y2_gpu[0], r);
+
+	double norm_before = 0.0, norm_after = 0.0;
+	for (unsigned int j = 0; j < r; ++j) {
+		norm_before += y_gpu[j]  * y_gpu[j];
+		norm_after  += y2_gpu[j] * y2_gpu[j];
+	}
+	std::printf("  [ibgrad oja-sanity] ‖Pᵀg‖² before=%.4e after=%.4e (ratio=%.3f)\n",
+	            norm_before, norm_after, norm_after / norm_before);
+	ASSERT("one Oja step grows ‖Pᵀg‖²", norm_after > norm_before);
+#else
+	std::printf("  [ibgrad project] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 

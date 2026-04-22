@@ -62,6 +62,7 @@ void CHIRONLcpGatherScatterRoundtripTest();
 void CHIRONLcpDeltaParityTest();
 void CHIRONLcpEndToEndDetailCorrectionTest();
 void CHIRONLcpRoutingThroughputBenchmark();
+void CHIRONIbgradProjectUnprojectParityTest();
 void CHIRONTrcdRoutingThroughputBenchmark();
 void CHIRONTrcdEndToEndConvergenceTest();
 
