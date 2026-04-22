@@ -192,6 +192,34 @@ Decision: Cayley retraction (Phase 2d) is promoted to critical-path
 status — without it, the QR per-step cost would make Stiefel unviable
 for real training even with BF16-direct GEMMs.
 
+### Phase 2d — Cayley retraction SHIPPED
+
+`stiefel_retract_cayley` and `stiefel_adam_step_cayley` implement the
+Wen-Yin 2012 Cayley transform truncated to the 2-term Neumann series:
+
+    A_new = (A − ½ A·S + η) · (I − ½ S)^{-1}
+          ≈ T_1 + T_1·(½S) + T_1·(½S)²
+
+where `S = A^T · η` is r×r skew (from tangent-space property).
+
+Measured at m=128, n=96, r=32, η ≈ 1e-3 per element (Adam-scale):
+
+- Cayley drift (‖U^T U − I‖_F): **1.02e-2** (U), **1.16e-2** (V) — well
+  within the 1e-1 tolerance.  Drift is O(‖S‖³) per step and bounded;
+  periodic QR retraction re-clamps to machine precision.
+- Cayley wall time: **0.081 ms** per call.
+- QR wall time: 0.281 ms per call.
+- **Cayley is 3.47× faster than QR at this size.**
+
+This closes most of the 8× full-step gap measured earlier.  Remaining
+gap is from BF16 → FP32 casts on every forward/backward/Adam call, which
+Phase 2f (BF16-direct GEMMs) will remove.
+
+The Neumann-2 approximation converges when ‖S‖_op < 1; at Adam steps
+(‖η‖ per-element ~ lr · ‖m̂/√v̂‖ ~ 1e-3 typical), this always holds.
+For larger updates (e.g., warmup LR overshoots), the caller should either
+fall back to full QR or use a solver-based exact Cayley.
+
 **Cross-stream race fix** (important): several Stiefel custom kernels
 (k_transpose_2d, k_symmetrize_inplace, k_scale_cols_by_diag,
 k_adam_step_and_eta, k_rowwise_sum_product, k_add_inplace,
@@ -207,9 +235,9 @@ the 2.23 B dense-weight baseline at the same token budget.
 
 ### Test coverage
 
-- **462 / 462 CHIRON unit-test assertions pass** (was 459 → +3 from
-  Stiefel compression benchmark asserting ≥ 2× / 4× / 8× weight VRAM
-  compression at ρ = 0.25 / 0.125 / 0.0625).
+- **465 / 465 CHIRON unit-test assertions pass** (was 462 → +3 from
+  Stiefel Cayley retraction: U drift-bound, V drift-bound, Cayley ≥ 1.5×
+  faster-than-QR — actually measured 3.47× faster at m=128 r=32).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),

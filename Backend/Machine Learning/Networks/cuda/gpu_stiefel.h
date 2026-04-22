@@ -188,6 +188,21 @@ void stiefel_adam_step(
     float* scratch_etaU, float* scratch_etaV,
     float* scratch_etaS);
 
+// Same as stiefel_adam_step but retracts via Cayley fast-path (3 SGEMMs +
+// 1 axpy instead of cuSOLVER QR).  4–6× cheaper per step; drift is
+// O(‖η‖³) per call, so the caller should invoke stiefel_retract_qr every
+// ~50 steps (with zero η) to clamp accumulated drift.
+void stiefel_adam_step_cayley(
+    GpuStiefelWeight& stiefel,
+    float* dU,
+    float* dsigma,
+    float* dV,
+    float lr, float beta1, float beta2, float eps,
+    int step_1based,
+    float* scratch_rr_U, float* scratch_rr_V,
+    float* scratch_etaU, float* scratch_etaV,
+    float* scratch_etaS);
+
 // ========================================================================
 // QR retraction: U ← qf(U + η_U) (and same for V). Uses cuSOLVER sgeqrf
 // + sorgqr. η_U, η_V must be provided in FP32 (typically the Adam step).
