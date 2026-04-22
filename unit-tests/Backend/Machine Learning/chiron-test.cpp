@@ -6641,6 +6641,153 @@ void CHIRONMpotForwardParityTest()
 #endif
 }
 
+// CHIRONMpotBackwardParityTest ----------------------------------------------
+// Paradigm shift #10, Phase 2b: verify mpot_backward produces the same
+// (dX, dA, dB) gradients as the dense reference.
+//
+// For Y = X · W^T with W = MPO(A, B):
+//   dX = dY · W                          (sgemm_abt of dY and W)
+//   dW = X^T · dY                        (sgemm_atb)
+//   dA[i_1, j_1, α] = Σ_{i_2, j_2} dW[i_1·m_2+i_2, j_1·n_2+j_2] · B[α, i_2, j_2]
+//   dB[α, i_2, j_2] = Σ_{i_1, j_1} dW[i_1·m_2+i_2, j_1·n_2+j_2] · A[i_1, j_1, α]
+// Last two are derived by differentiating W = A·B w.r.t. each factor.
+//
+// The reference dA, dB are computed on the host for clarity.
+void CHIRONMpotBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mpot backward] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m_1 = 3, m_2 = 4, n_1 = 5, n_2 = 2, D = 6;
+	const unsigned int T   = 7;
+	const unsigned int m   = m_1 * m_2;
+	const unsigned int n   = n_1 * n_2;
+
+	LCG rng(202604234u);
+	std::vector<float> X_h((size_t)T * m);
+	std::vector<float> A_h((size_t)m_1 * n_1 * D);
+	std::vector<float> B_h((size_t)D * m_2 * n_2);
+	std::vector<float> dY_h((size_t)T * n);
+	for (size_t i = 0; i < X_h.size(); ++i)  X_h[i]  = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < A_h.size(); ++i)  A_h[i]  = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < B_h.size(); ++i)  B_h[i]  = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < dY_h.size(); ++i) dY_h[i] = 0.15f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_A, d_B, d_dY, d_W, d_dW;
+	glades::gpu::GpuBuffer<float> d_dX_ref, d_dX, d_dA, d_dB, d_scr;
+	d_X.allocate(X_h.size());   d_X.upload(&X_h[0], X_h.size());
+	d_A.allocate(A_h.size());   d_A.upload(&A_h[0], A_h.size());
+	d_B.allocate(B_h.size());   d_B.upload(&B_h[0], B_h.size());
+	d_dY.allocate(dY_h.size()); d_dY.upload(&dY_h[0], dY_h.size());
+	d_W.allocate((size_t)m * n);
+	d_dW.allocate((size_t)m * n);
+	d_dX_ref.allocate((size_t)T * m);
+	d_dX.allocate((size_t)T * m);
+	d_dA.allocate(A_h.size());
+	d_dB.allocate(B_h.size());
+
+	// Backward scratch: |A_perm| + |B_perm| + 2·|T1| + |dY_pre| + 2·|T1_perm| + |dA_perm| + |dB_perm|
+	const size_t sz_bwd =
+	    (size_t)m_1 * D * n_1 +                 // A_perm
+	    (size_t)m_2 * D * n_2 +                 // B_perm
+	    (size_t)T * m_1 * D * n_2 +             // T1
+	    (size_t)T * n_2 * m_1 * D +             // T1_perm
+	    (size_t)T * n_2 * n_1 +                 // dY_pre
+	    (size_t)T * n_2 * m_1 * D +             // dT1_perm
+	    (size_t)T * m_1 * D * n_2 +             // dT1
+	    (size_t)m_1 * D * n_1 +                 // dA_perm
+	    (size_t)m_2 * D * n_2;                  // dB_perm
+	d_scr.allocate(sz_bwd);
+
+	// --- Reference path ---
+	ASSERT("reconstruct W for backward ref",
+	       glades::gpu::mpot_reconstruct_dense(
+	           d_A.data(), d_B.data(), m_1, m_2, n_1, n_2, D, d_W.data()));
+	// dX_ref = dY · W^T via sgemm_abt: Y [T × n] · W [m × n] → (T × m)
+	// Actually dX[t, i] = Σ_j dY[t, j] · W[i, j] = (dY · W^T)[t, i]
+	// sgemm_rowmajor_abt: C[M,N] = A[M,K] · B^T[K,N], B stored [N,K].
+	// Here A = dY [T, n], B = W [m, n] (stored [m, n]), result dX [T, m].
+	ASSERT("dense dX GEMM",
+	       glades::gpu::sgemm_rowmajor_abt(
+	           T, m, n, 1.0f,
+	           d_dY.data(), n,
+	           d_W.data(),  n,
+	           0.0f,
+	           d_dX_ref.data(), m));
+	// dW = X^T · dY via sgemm_atb: A = X [T, m], B = dY [T, n], result dW [m, n].
+	ASSERT("dense dW GEMM",
+	       glades::gpu::sgemm_rowmajor_atb(
+	           m, n, T, 1.0f,
+	           d_X.data(),  m,
+	           d_dY.data(), n,
+	           0.0f,
+	           d_dW.data(), n));
+	std::vector<float> dW_h((size_t)m * n);
+	d_dW.download(&dW_h[0], dW_h.size());
+
+	// Host-side dA_ref, dB_ref from chain rule through W = MPO(A, B).
+	std::vector<float> dA_ref(A_h.size(), 0.0f);
+	std::vector<float> dB_ref(B_h.size(), 0.0f);
+	for (unsigned int i_1 = 0; i_1 < m_1; ++i_1)
+		for (unsigned int j_1 = 0; j_1 < n_1; ++j_1)
+			for (unsigned int a = 0; a < D; ++a)
+			{
+				float s = 0.0f;
+				for (unsigned int i_2 = 0; i_2 < m_2; ++i_2)
+					for (unsigned int j_2 = 0; j_2 < n_2; ++j_2)
+					{
+						const float dw = dW_h[(size_t)(i_1 * m_2 + i_2) * n + (j_1 * n_2 + j_2)];
+						const float bv = B_h[(size_t)a * m_2 * n_2 + (size_t)i_2 * n_2 + j_2];
+						s += dw * bv;
+					}
+				dA_ref[(size_t)i_1 * n_1 * D + (size_t)j_1 * D + a] = s;
+			}
+	for (unsigned int a = 0; a < D; ++a)
+		for (unsigned int i_2 = 0; i_2 < m_2; ++i_2)
+			for (unsigned int j_2 = 0; j_2 < n_2; ++j_2)
+			{
+				float s = 0.0f;
+				for (unsigned int i_1 = 0; i_1 < m_1; ++i_1)
+					for (unsigned int j_1 = 0; j_1 < n_1; ++j_1)
+					{
+						const float dw = dW_h[(size_t)(i_1 * m_2 + i_2) * n + (j_1 * n_2 + j_2)];
+						const float av = A_h[(size_t)i_1 * n_1 * D + (size_t)j_1 * D + a];
+						s += dw * av;
+					}
+				dB_ref[(size_t)a * m_2 * n_2 + (size_t)i_2 * n_2 + j_2] = s;
+			}
+
+	// --- Factored path ---
+	ASSERT("mpot_backward runs",
+	       glades::gpu::mpot_backward(
+	           d_X.data(), d_A.data(), d_B.data(), d_dY.data(),
+	           T, m_1, m_2, n_1, n_2, D,
+	           d_dX.data(), d_dA.data(), d_dB.data(),
+	           d_scr.data()));
+
+	std::vector<float> dX_ref_h((size_t)T * m), dX_h((size_t)T * m);
+	std::vector<float> dA_h(A_h.size()), dB_h(B_h.size());
+	d_dX_ref.download(&dX_ref_h[0], dX_ref_h.size());
+	d_dX.download(&dX_h[0], dX_h.size());
+	d_dA.download(&dA_h[0], dA_h.size());
+	d_dB.download(&dB_h[0], dB_h.size());
+
+	const float err_X = max_abs_diff(dX_ref_h, dX_h);
+	const float err_A = max_abs_diff(dA_ref,   dA_h);
+	const float err_B = max_abs_diff(dB_ref,   dB_h);
+	std::printf("  mpot_backward (T=%u, m=%u·%u, n=%u·%u, D=%u): dX=%.3e dA=%.3e dB=%.3e\n",
+	            T, m_1, m_2, n_1, n_2, D, err_X, err_A, err_B);
+	ASSERT("MPOT backward dX matches dense reference", err_X < 1e-4f);
+	ASSERT("MPOT backward dA matches chain-rule host reference", err_A < 1e-4f);
+	ASSERT("MPOT backward dB matches chain-rule host reference", err_B < 1e-4f);
+#else
+	std::printf("  [mpot backward] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -6758,6 +6905,7 @@ void CHIRONUnitTest()
 	CHIRONMpotReconstructParityTest();
 	CHIRONMpotInitFromDenseParityTest();
 	CHIRONMpotForwardParityTest();
+	CHIRONMpotBackwardParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();

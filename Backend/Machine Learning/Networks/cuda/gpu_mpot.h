@@ -136,6 +136,56 @@ bool mpot_forward(const float* X,
                   float* Y,
                   float* scratch);
 
+// ========================================================================
+// mpot_backward — gradients through the factored forward  Y = X · W^T
+// back to (X, A, B) without materializing the dense W.
+//
+// Inputs:
+//   X    [T × m]              forward input (m = m_1·m_2)
+//   A    [m_1 · n_1 · D]      forward MPO factor
+//   B    [D · m_2 · n_2]      forward MPO factor
+//   dY   [T × n]              upstream gradient (n = n_1·n_2)
+//   T, m_1, m_2, n_1, n_2, D  dims
+// Outputs:
+//   dX   [T × m]
+//   dA   [m_1 · n_1 · D]
+//   dB   [D · m_2 · n_2]
+//
+// Chain rule through the forward's two GEMMs (GEMM2: Y_pre = T1_perm ·
+// A_perm; GEMM1: T1 = X · B_perm) yields:
+//
+//   dT1_perm = dY_pre · A_perm^T
+//   dA_perm  = T1_perm^T · dY_pre
+//   dT1      = permute⁻¹(dT1_perm)
+//   dX       = dT1 · B_perm^T
+//   dB_perm  = X^T · dT1
+//   dA       = permute⁻¹(dA_perm)
+//   dB       = permute⁻¹(dB_perm)
+//
+// The four permutation inverses reuse the same kernels as the forward
+// with the source/destination layouts swapped.
+//
+// Self-contained: recomputes A_perm, B_perm, T1, T1_perm, dY_pre from
+// (X, A, B, dY) rather than taking forward-path state.  Slightly
+// redundant but keeps the API clean; a future phase can expose a
+// shared-state variant for inner training loops.
+//
+// Scratch requirement (caller-allocated):
+//   |A_perm| + |B_perm| + |T1| + |T1_perm| + |dY_pre|
+// + |dT1_perm| + |dT1| + |dA_perm| + |dB_perm|
+// = 3·m_1·D·n_1 + 3·m_2·D·n_2 + 2·T·m_1·D·n_2 + 2·T·n_1·n_2·0  — roughly
+// = 3·|A| + 3·|B| + 2·|T1| + |Y|.
+// ========================================================================
+bool mpot_backward(const float* X,
+                   const float* A, const float* B,
+                   const float* dY,
+                   unsigned int T,
+                   unsigned int m_1, unsigned int m_2,
+                   unsigned int n_1, unsigned int n_2,
+                   unsigned int D,
+                   float* dX, float* dA, float* dB,
+                   float* scratch);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -154,6 +204,12 @@ inline bool mpot_forward(const float*, const float*, const float*,
                          unsigned int, unsigned int,
                          unsigned int, unsigned int,
                          unsigned int, float*, float*) { return false; }
+inline bool mpot_backward(const float*, const float*, const float*, const float*,
+                          unsigned int,
+                          unsigned int, unsigned int,
+                          unsigned int, unsigned int,
+                          unsigned int,
+                          float*, float*, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

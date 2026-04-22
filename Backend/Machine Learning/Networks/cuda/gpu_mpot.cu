@@ -180,6 +180,53 @@ __global__ void k_mpot_perm_T1_T_m1_D_n2__to__T_n2_m1_D(
 	    T1[((size_t)t * m_1 + i_1) * (D * n_2) + (size_t)alpha * n_2 + j_2];
 }
 
+// Inverse permutations (used by mpot_backward).
+
+// A_perm (m_1, D, n_1) → A (m_1, n_1, D)
+__global__ void k_mpot_perm_A_inv_m1_D_n1__to__m1_n1_D(
+    const float* __restrict__ A_perm,
+    unsigned int m_1, unsigned int n_1, unsigned int D,
+    float* __restrict__ A)
+{
+	const unsigned int i_1   = blockIdx.z;
+	const unsigned int j_1   = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int alpha = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i_1 >= m_1 || j_1 >= n_1 || alpha >= D) return;
+	A[(size_t)i_1 * n_1 * D + (size_t)j_1 * D + alpha] =
+	    A_perm[(size_t)i_1 * D * n_1 + (size_t)alpha * n_1 + j_1];
+}
+
+// B_perm (m_2, D, n_2) → B (D, m_2, n_2)
+__global__ void k_mpot_perm_B_inv_m2_D_n2__to__D_m2_n2(
+    const float* __restrict__ B_perm,
+    unsigned int D, unsigned int m_2, unsigned int n_2,
+    float* __restrict__ B)
+{
+	const unsigned int alpha = blockIdx.z;
+	const unsigned int i_2   = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j_2   = blockIdx.x * blockDim.x + threadIdx.x;
+	if (alpha >= D || i_2 >= m_2 || j_2 >= n_2) return;
+	B[(size_t)alpha * m_2 * n_2 + (size_t)i_2 * n_2 + j_2] =
+	    B_perm[(size_t)i_2 * D * n_2 + (size_t)alpha * n_2 + j_2];
+}
+
+// T1_perm (T, n_2, m_1, D) → T1 (T, m_1, D, n_2)
+__global__ void k_mpot_perm_T1_inv_T_n2_m1_D__to__T_m1_D_n2(
+    const float* __restrict__ T1_perm,
+    unsigned int T, unsigned int m_1, unsigned int D, unsigned int n_2,
+    float* __restrict__ T1)
+{
+	const unsigned int tj = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int ia = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tj >= T * n_2 || ia >= m_1 * D) return;
+	const unsigned int t   = tj / n_2;
+	const unsigned int j_2 = tj % n_2;
+	const unsigned int i_1 = ia / D;
+	const unsigned int alpha = ia % D;
+	T1[((size_t)t * m_1 + i_1) * (D * n_2) + (size_t)alpha * n_2 + j_2] =
+	    T1_perm[((size_t)t * n_2 + j_2) * (m_1 * D) + (size_t)i_1 * D + alpha];
+}
+
 // Permute Y_pre (T, n_2, n_1) → Y (T, n_1, n_2).
 __global__ void k_mpot_perm_Y_T_n2_n1__to__T_n1_n2(
     const float* __restrict__ Y_pre,
@@ -487,6 +534,166 @@ bool mpot_forward(const float* X,
 		          T);
 		k_mpot_perm_Y_T_n2_n1__to__T_n1_n2<<<grid, block, 0, computeStream()>>>(
 		    Y_pre, T, n_1, n_2, Y);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	return true;
+}
+
+// ========================================================================
+// mpot_backward — see gpu_mpot.h for the chain-rule derivation.
+// ========================================================================
+bool mpot_backward(const float* X,
+                   const float* A, const float* B,
+                   const float* dY,
+                   unsigned int T,
+                   unsigned int m_1, unsigned int m_2,
+                   unsigned int n_1, unsigned int n_2,
+                   unsigned int D,
+                   float* dX, float* dA, float* dB,
+                   float* scratch)
+{
+	if (X == nullptr || A == nullptr || B == nullptr || dY == nullptr)
+		return false;
+	if (dX == nullptr || dA == nullptr || dB == nullptr || scratch == nullptr)
+		return false;
+	if (T == 0u || m_1 == 0u || m_2 == 0u || n_1 == 0u || n_2 == 0u || D == 0u)
+		return false;
+
+	// Scratch layout (all floats):
+	size_t off = 0;
+	float* A_perm     = scratch + off; off += (size_t)m_1 * D * n_1;
+	float* B_perm     = scratch + off; off += (size_t)m_2 * D * n_2;
+	float* T1         = scratch + off; off += (size_t)T * m_1 * D * n_2;
+	float* T1_perm    = scratch + off; off += (size_t)T * n_2 * m_1 * D;
+	float* dY_pre     = scratch + off; off += (size_t)T * n_2 * n_1;
+	float* dT1_perm   = scratch + off; off += (size_t)T * n_2 * m_1 * D;
+	float* dT1        = scratch + off; off += (size_t)T * m_1 * D * n_2;
+	float* dA_perm    = scratch + off; off += (size_t)m_1 * D * n_1;
+	float* dB_perm    = scratch + off; off += (size_t)m_2 * D * n_2;
+	(void)off;
+
+	// --- Forward recomputation of intermediate buffers (self-contained) ---
+
+	// A_perm
+	{
+		dim3 block(16, 8, 1);
+		dim3 grid((n_1 + block.x - 1u) / block.x,
+		          (D + block.y - 1u) / block.y,
+		          m_1);
+		k_mpot_perm_A_m1_n1_D__to__m1_D_n1<<<grid, block, 0, computeStream()>>>(
+		    A, m_1, n_1, D, A_perm);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// B_perm
+	{
+		dim3 block(16, 8, 1);
+		dim3 grid((n_2 + block.x - 1u) / block.x,
+		          (m_2 + block.y - 1u) / block.y,
+		          D);
+		k_mpot_perm_B_D_m2_n2__to__m2_D_n2<<<grid, block, 0, computeStream()>>>(
+		    B, D, m_2, n_2, B_perm);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// T1 = X · B_perm
+	const int Tm1 = static_cast<int>(T) * static_cast<int>(m_1);
+	const int Dn2 = static_cast<int>(D) * static_cast<int>(n_2);
+	if (!sgemm_rowmajor(Tm1, Dn2, static_cast<int>(m_2),
+	                    1.0f,
+	                    X,       static_cast<int>(m_2),
+	                    B_perm,  Dn2,
+	                    0.0f,
+	                    T1,      Dn2))
+		return false;
+	// T1 → T1_perm
+	{
+		dim3 block(16, 16, 1);
+		dim3 grid((m_1 * D + block.x - 1u) / block.x,
+		          (T * n_2 + block.y - 1u) / block.y,
+		          1);
+		k_mpot_perm_T1_T_m1_D_n2__to__T_n2_m1_D<<<grid, block, 0, computeStream()>>>(
+		    T1, T, m_1, D, n_2, T1_perm);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// dY is (T, n_1, n_2); un-permute back to dY_pre (T, n_2, n_1) —
+	// same swap direction as the forward Y_pre → Y kernel, re-used with
+	// n_1 and n_2 arguments swapped.
+	{
+		dim3 block(16, 16, 1);
+		dim3 grid((n_1 + block.x - 1u) / block.x,
+		          (n_2 + block.y - 1u) / block.y,
+		          T);
+		k_mpot_perm_Y_T_n2_n1__to__T_n1_n2<<<grid, block, 0, computeStream()>>>(
+		    dY, T, n_2, n_1, dY_pre);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// --- GEMM 2 backward  (forward: Y_pre = T1_perm · A_perm) ---
+	// dA_perm = T1_perm^T · dY_pre  (shape (m_1·D, n_1))
+	const int Tn2 = static_cast<int>(T) * static_cast<int>(n_2);
+	const int m1D = static_cast<int>(m_1) * static_cast<int>(D);
+	if (!sgemm_rowmajor_atb(m1D, static_cast<int>(n_1), Tn2,
+	                        1.0f,
+	                        T1_perm, m1D,
+	                        dY_pre,  static_cast<int>(n_1),
+	                        0.0f,
+	                        dA_perm, static_cast<int>(n_1)))
+		return false;
+	// dT1_perm = dY_pre · A_perm^T  (shape (T·n_2, m_1·D))
+	if (!sgemm_rowmajor_abt(Tn2, m1D, static_cast<int>(n_1),
+	                        1.0f,
+	                        dY_pre,  static_cast<int>(n_1),
+	                        A_perm,  static_cast<int>(n_1),
+	                        0.0f,
+	                        dT1_perm, m1D))
+		return false;
+
+	// --- GEMM 1 backward  (forward: T1 = X · B_perm) ---
+	// dT1 = un-permute(dT1_perm)  (T, m_1, D, n_2)
+	{
+		dim3 block(16, 16, 1);
+		dim3 grid((m_1 * D + block.x - 1u) / block.x,
+		          (T * n_2 + block.y - 1u) / block.y,
+		          1);
+		k_mpot_perm_T1_inv_T_n2_m1_D__to__T_m1_D_n2<<<grid, block, 0, computeStream()>>>(
+		    dT1_perm, T, m_1, D, n_2, dT1);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// dX = dT1 · B_perm^T  (shape (T·m_1, m_2))
+	if (!sgemm_rowmajor_abt(Tm1, static_cast<int>(m_2), Dn2,
+	                        1.0f,
+	                        dT1,     Dn2,
+	                        B_perm,  Dn2,
+	                        0.0f,
+	                        dX,      static_cast<int>(m_2)))
+		return false;
+	// dB_perm = X^T · dT1  (shape (m_2, D·n_2))
+	if (!sgemm_rowmajor_atb(static_cast<int>(m_2), Dn2, Tm1,
+	                        1.0f,
+	                        X,       static_cast<int>(m_2),
+	                        dT1,     Dn2,
+	                        0.0f,
+	                        dB_perm, Dn2))
+		return false;
+
+	// Un-permute dA_perm and dB_perm to their native layouts.
+	{
+		dim3 block(16, 8, 1);
+		dim3 grid((D + block.x - 1u) / block.x,
+		          (n_1 + block.y - 1u) / block.y,
+		          m_1);
+		k_mpot_perm_A_inv_m1_D_n1__to__m1_n1_D<<<grid, block, 0, computeStream()>>>(
+		    dA_perm, m_1, n_1, D, dA);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	{
+		dim3 block(16, 8, 1);
+		dim3 grid((n_2 + block.x - 1u) / block.x,
+		          (m_2 + block.y - 1u) / block.y,
+		          D);
+		k_mpot_perm_B_inv_m2_D_n2__to__D_m2_n2<<<grid, block, 0, computeStream()>>>(
+		    dB_perm, D, m_2, n_2, dB);
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
 
