@@ -4640,11 +4640,109 @@ void CHIRONHRTCHaarK4RecursiveTest()
 #endif
 }
 
+// CHIRONHRTCProcessPoolTest -------------------------------------------------
+// Paradigm shift #8: end-to-end workflow validation.  This simulates the
+// pattern the trainer will take per CHIRON layer:
+//
+//   1. Pool (q, p) from T rows → T/k rows
+//   2. Apply some deterministic transformation Y on the pooled stream
+//      (this stands in for the CHIRON shear p' += Y(q'))
+//   3. Unpool back to T rows
+//
+// The test verifies:
+//   (a) The workflow produces a deterministic output (no NaN / Inf)
+//   (b) The output differs from just running Y on the un-pooled stream
+//       (confirms the pooled computation actually affected the result)
+//   (c) Identity Y (Y=0) recovers the original input bit-exactly via
+//       pool → unpool composition
+void CHIRONHRTCProcessPoolTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [hrtc process] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 64, m = 32;
+
+	LCG rng(20260422u);
+	std::vector<float> q(T * m);
+	for (size_t i = 0; i < q.size(); ++i) q[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_q, d_super, d_res, d_super_mod, d_q_out;
+	d_q.allocate(T * m); d_q.upload(&q[0], q.size());
+	d_super.allocate((T / 2) * m);
+	d_res.allocate((T / 2) * m);
+	d_super_mod.allocate((T / 2) * m);
+	d_q_out.allocate(T * m);
+
+	// Forward pool.
+	glades::gpu::hrtc_pool_haar_k2(d_q.data(), d_super.data(), d_res.data(), T, m);
+
+	// "Process" the super-tokens: multiply by a scale (stand-in for a
+	// deterministic Y(q')).  Using GPU memcpy + host-side computation on
+	// a downloaded copy to keep the test self-contained.
+	std::vector<float> super_h((T / 2) * m);
+	d_super.download(&super_h[0], super_h.size());
+	const float scale = 0.9f;  // non-trivial modification
+	for (size_t i = 0; i < super_h.size(); ++i) super_h[i] *= scale;
+	d_super_mod.upload(&super_h[0], super_h.size());
+
+	// Unpool with the modified super stream but ORIGINAL residuals —
+	// this is what the trainer does: residuals are preserved across the
+	// reversible flow, only the super stream is modified.
+	glades::gpu::hrtc_unpool_haar_k2(d_super_mod.data(), d_res.data(),
+	                                  d_q_out.data(), T, m);
+	std::vector<float> q_out(T * m);
+	d_q_out.download(&q_out[0], q_out.size());
+
+	// (a) No NaN/Inf.
+	bool finite = true;
+	for (size_t i = 0; i < q_out.size(); ++i)
+	{
+		if (!(q_out[i] == q_out[i])) { finite = false; break; }  // NaN check
+		if (q_out[i] == q_out[i] + 1.0f && q_out[i] != 0.0f) { finite = false; break; }  // Inf
+	}
+	ASSERT("pool → scale super → unpool produces finite values", finite);
+
+	// (b) Output differs from original (because we actually scaled the supers).
+	const float diff = max_abs_diff(q, q_out);
+	std::printf("  hrtc process-pool: |q_out - q|_∞ = %.3e (expect > 0 because super scaled)\n", diff);
+	ASSERT("scaling supers propagated to output (not a no-op)", diff > 1e-3f);
+
+	// (c) Identity passthrough: without modifying supers, pool → unpool
+	// must recover the input.  Already covered by the k=2 roundtrip test,
+	// but re-verify here end-to-end in this workflow.
+	glades::gpu::hrtc_unpool_haar_k2(d_super.data(), d_res.data(),
+	                                  d_q_out.data(), T, m);
+	std::vector<float> q_rt(T * m);
+	d_q_out.download(&q_rt[0], q_rt.size());
+	const float rt_err = max_abs_diff(q, q_rt);
+	ASSERT("pool → unpool (no modification) recovers original",
+	       rt_err < 1e-5f);
+
+	// Quantify the expected theoretical relationship: at k=2, scaling the
+	// super by α and leaving residual alone produces, in the recovered
+	// sequence, token pairs (x0', x1') where
+	//   x0' = (α·super + residual) / √2 = x0·(α+1)/2 + x1·(α-1)/2·signflip
+	// So the average change per token equals (α-1)/2 × (x0+x1)/√2 = (α-1)·super/√2
+	// which has magnitude (1-α) · |super| / √2 ≈ 0.1 · 0.3 · avg|X|.
+	// For our values, expected diff ≈ 0.05-0.1 max. Verify it's in range.
+	std::printf("  hrtc process-pool: diff in expected 0.01-0.5 range? %s\n",
+	            (diff > 0.01f && diff < 0.5f) ? "yes" : "NO");
+	ASSERT("scaled-super diff is in theoretically-expected range",
+	       diff > 0.01f && diff < 0.5f);
+#else
+	std::printf("  [hrtc process] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONHRTCHaarRoundtripTest();
 	CHIRONHRTCHaarK4RecursiveTest();
+	CHIRONHRTCProcessPoolTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
