@@ -79,6 +79,18 @@ $$
 - Realistic at 20% realization: **56×**.
 - Single-stack demonstration of "magnitudes less memory AND magnitudes faster."
 
+**Composability validation** (2026-04-22): LCP × IBGRAD tested on a single
+MLP (`CHIRONLcpIbgradCompositionTest`):
+- T=32, d_in=8, d_out=8, N=64, r_ib=16, 150 Adam steps
+- n_reps = 7/32 (LCP actively clustering)
+- Loss: 3.64e-2 → 1.57e-2 (**2.32× ratio**)
+- P orthonormal at 2.38e-7
+- Both mechanisms active simultaneously; neither disables the other
+
+The compound reaches a plateau bounded by LCP's cluster-variance floor
+(simplified test, no detail network).  With a detail network the plateau
+lifts — estimated 20-50× compound is next-iteration work.
+
 ---
 
 ## 4. Five Ralph-loop empirical surprises
