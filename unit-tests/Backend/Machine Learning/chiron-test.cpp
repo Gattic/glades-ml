@@ -7725,6 +7725,238 @@ void CHIRONMfioNonlinearMLPTest()
 #endif
 }
 
+// CHIRONMfioDeeperMLPTest ---------------------------------------------------
+// Paradigm shift #11, Phase 1d: push MFIO through a 4-layer ReLU MLP to
+// check whether the 102% MFIO-vs-Adam efficiency on 2 layers survives
+// depth.  Deep MLPs are harder for momentum-free optimizers — the
+// compounding curvature makes per-param (v) preconditioning more
+// valuable.  If MFIO still matches Adam at L=4, the case for MFIO on
+// LLM-scale transformers strengthens substantially.
+//
+// Architecture:  x → W1·ReLU → W2·ReLU → W3·ReLU → W4 → y      (4 layers)
+// Target:        sigmoid-nonlinear cascade (so MLP must actually learn)
+void CHIRONMfioDeeperMLPTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mfio deep-mlp] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T     = 64;
+	const unsigned int d[5]  = {24, 32, 32, 32, 16};   // 4 layers
+	const int   N            = 200;
+	const float lr           = 3e-3f;
+	const float b1           = 0.9f;
+	const float b2           = 0.999f;
+	const float eps          = 1e-8f;
+
+	LCG rng(202604240u);
+
+	// Ground-truth weights (one per layer) + student init.
+	std::vector<std::vector<float> > Ws_h(4), W0_h(4);
+	for (int l = 0; l < 4; ++l)
+	{
+		Ws_h[l].resize((size_t)d[l] * d[l+1]);
+		W0_h[l].resize((size_t)d[l] * d[l+1]);
+		for (size_t i = 0; i < Ws_h[l].size(); ++i) Ws_h[l][i] = 0.25f * rng.next_unit();
+		for (size_t i = 0; i < W0_h[l].size(); ++i) W0_h[l][i] = 0.06f * rng.next_unit();
+	}
+
+	std::vector<float> X_h((size_t)T * d[0]);
+	for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.4f * rng.next_unit();
+
+	// Build Y_tgt on host — forward through sigmoid-nonlinear teacher.
+	std::vector<float> Ytgt_h((size_t)T * d[4]);
+	{
+		std::vector<float> cur((size_t)T * d[0]);
+		for (size_t i = 0; i < cur.size(); ++i) cur[i] = X_h[i];
+		for (int l = 0; l < 4; ++l)
+		{
+			std::vector<float> nxt((size_t)T * d[l+1], 0.0f);
+			for (unsigned t = 0; t < T; ++t)
+				for (unsigned j = 0; j < d[l+1]; ++j)
+				{
+					float s = 0.0f;
+					for (unsigned k = 0; k < d[l]; ++k)
+						s += cur[(size_t)t * d[l] + k] * Ws_h[l][(size_t)k * d[l+1] + j];
+					nxt[(size_t)t * d[l+1] + j] = (l < 3) ? (1.0f / (1.0f + std::exp(-s))) : s;
+				}
+			cur.swap(nxt);
+		}
+		for (size_t i = 0; i < Ytgt_h.size(); ++i) Ytgt_h[i] = cur[i];
+	}
+
+	glades::gpu::GpuBuffer<float> d_X, d_Ytgt;
+	d_X.allocate(X_h.size());     d_X.upload(&X_h[0], X_h.size());
+	d_Ytgt.allocate(Ytgt_h.size());d_Ytgt.upload(&Ytgt_h[0], Ytgt_h.size());
+
+	float mfio_first = 0, mfio_last = 0, adam_first = 0, adam_last = 0;
+	for (int pass = 0; pass < 2; ++pass)
+	{
+		const bool use_mfio = (pass == 0);
+
+		std::vector<glades::gpu::GpuBuffer<float>*> d_W(4), d_dW(4),
+		    d_H_pre(4), d_H(4), d_dH(4), d_dH_pre(4),
+		    d_sigma(4), d_mA(4), d_vA(4);
+		for (int l = 0; l < 4; ++l)
+		{
+			d_W[l]     = new glades::gpu::GpuBuffer<float>();  d_W[l]->allocate(W0_h[l].size());     d_W[l]->upload(&W0_h[l][0], W0_h[l].size());
+			d_dW[l]    = new glades::gpu::GpuBuffer<float>();  d_dW[l]->allocate(W0_h[l].size());
+			d_H_pre[l] = new glades::gpu::GpuBuffer<float>();  d_H_pre[l]->allocate((size_t)T * d[l+1]);
+			d_H[l]     = new glades::gpu::GpuBuffer<float>();  d_H[l]->allocate((size_t)T * d[l+1]);
+			d_dH[l]    = new glades::gpu::GpuBuffer<float>();  d_dH[l]->allocate((size_t)T * d[l+1]);
+			d_dH_pre[l]= new glades::gpu::GpuBuffer<float>();  d_dH_pre[l]->allocate((size_t)T * d[l+1]);
+			d_sigma[l] = new glades::gpu::GpuBuffer<float>();  d_sigma[l]->allocate(1);
+			d_mA[l]    = new glades::gpu::GpuBuffer<float>();  d_mA[l]->allocate(W0_h[l].size());
+			d_vA[l]    = new glades::gpu::GpuBuffer<float>();  d_vA[l]->allocate(W0_h[l].size());
+			std::vector<float> z(W0_h[l].size(), 0.0f);
+			d_mA[l]->upload(&z[0], z.size());
+			d_vA[l]->upload(&z[0], z.size());
+		}
+
+		std::vector<float> Y((size_t)T * d[4]), dY((size_t)T * d[4]);
+		float loss_first = -1.0f, loss_last = -1.0f;
+		for (int step = 1; step <= N; ++step)
+		{
+			// Forward through 4 layers.  ReLU on layers 0..2 (not layer 3).
+			const float* cur = d_X.data();
+			unsigned cur_d = d[0];
+			for (int l = 0; l < 4; ++l)
+			{
+				glades::gpu::sgemm_rowmajor(T, d[l+1], cur_d, 1.0f,
+				                            cur, cur_d,
+				                            d_W[l]->data(), d[l+1],
+				                            0.0f,
+				                            d_H_pre[l]->data(), d[l+1]);
+				if (l < 3)
+					glades::gpu::relu_forward(d_H_pre[l]->data(),
+					                          (int)((size_t)T * d[l+1]),
+					                          d_H[l]->data());
+				else
+					cudaMemcpyAsync(d_H[l]->data(), d_H_pre[l]->data(),
+					                (size_t)T * d[l+1] * sizeof(float),
+					                cudaMemcpyDeviceToDevice,
+					                glades::gpu::computeStream());
+				cur   = d_H[l]->data();
+				cur_d = d[l+1];
+			}
+			d_H[3]->download(&Y[0], Y.size());
+			float loss = 0.0f;
+			for (size_t i = 0; i < Y.size(); ++i)
+			{
+				const float d_v = Y[i] - Ytgt_h[i];
+				loss += d_v * d_v;
+				dY[i] = (2.0f / float(Y.size())) * d_v;
+			}
+			loss /= float(Y.size());
+			if (step == 1) loss_first = loss;
+			loss_last = loss;
+			d_dH[3]->upload(&dY[0], dY.size());
+
+			// Backward — dH[l] is already set for the top layer.  For inner
+			// layers apply ReLU mask.  dW[l] = input_of_layer_l^T · dH_pre[l]
+			for (int l = 3; l >= 0; --l)
+			{
+				const float* dH_pre;
+				if (l < 3)
+				{
+					glades::gpu::relu_backward(d_dH[l]->data(),
+					                           d_H_pre[l]->data(),
+					                           (int)((size_t)T * d[l+1]),
+					                           d_dH_pre[l]->data());
+					dH_pre = d_dH_pre[l]->data();
+				}
+				else
+				{
+					// no ReLU on layer 3 — just copy.
+					cudaMemcpyAsync(d_dH_pre[l]->data(), d_dH[l]->data(),
+					                (size_t)T * d[l+1] * sizeof(float),
+					                cudaMemcpyDeviceToDevice,
+					                glades::gpu::computeStream());
+					dH_pre = d_dH_pre[l]->data();
+				}
+				const float* input_l = (l == 0) ? d_X.data() : d_H[l-1]->data();
+				const unsigned in_d  = d[l];
+				// dW[l] = input^T · dH_pre
+				glades::gpu::sgemm_rowmajor_atb(in_d, d[l+1], T, 1.0f,
+				                                input_l, in_d,
+				                                dH_pre, d[l+1],
+				                                0.0f,
+				                                d_dW[l]->data(), d[l+1]);
+				if (l > 0)
+				{
+					// dH[l-1] = dH_pre · W[l]^T
+					glades::gpu::sgemm_rowmajor_abt(T, in_d, d[l+1], 1.0f,
+					                                dH_pre, d[l+1],
+					                                d_W[l]->data(), d[l+1],
+					                                0.0f,
+					                                d_dH[l-1]->data(), in_d);
+				}
+			}
+
+			// Optimizer step.
+			for (int l = 0; l < 4; ++l)
+			{
+				const float* input_l = (l == 0) ? d_X.data() : d_H[l-1]->data();
+				const unsigned in_d  = d[l];
+				if (use_mfio)
+				{
+					glades::gpu::mfio_compute_sigma(
+					    input_l, d_dH_pre[l]->data(),
+					    T, in_d, d[l+1],
+					    1.0f, eps, d_sigma[l]->data());
+					glades::gpu::mfio_update(
+					    d_W[l]->data(), d_dW[l]->data(), d_sigma[l]->data(),
+					    lr, 0.0f, (int)W0_h[l].size());
+				}
+				else
+				{
+					glades::gpu::adam_update(
+					    d_W[l]->data(), d_dW[l]->data(),
+					    d_mA[l]->data(), d_vA[l]->data(),
+					    lr, b1, b2, eps, 0.0f, 1.0f,
+					    step, (int)W0_h[l].size());
+				}
+			}
+		}
+		const char* name = use_mfio ? "MFIO" : "Adam";
+		std::printf("  [deep-mlp L=4] %s: loss %.4e -> %.4e (%.2fx reduction) over %d steps\n",
+		            name, loss_first, loss_last,
+		            loss_first / loss_last, N);
+		if (use_mfio) { mfio_first = loss_first; mfio_last = loss_last; }
+		else          { adam_first = loss_first; adam_last = loss_last; }
+
+		for (int l = 0; l < 4; ++l)
+		{
+			delete d_W[l]; delete d_dW[l]; delete d_H_pre[l]; delete d_H[l];
+			delete d_dH[l]; delete d_dH_pre[l]; delete d_sigma[l];
+			delete d_mA[l]; delete d_vA[l];
+		}
+	}
+
+	const float mfio_ratio = mfio_first / mfio_last;
+	const float adam_ratio = adam_first / adam_last;
+	const float log_eff = std::log(mfio_ratio) / std::log(adam_ratio);
+	std::printf("  [deep-mlp L=4] MFIO/Adam log-descent efficiency: %.1f%% "
+	            "(MFIO %.1fx vs Adam %.1fx)\n",
+	            100.0f * log_eff, mfio_ratio, adam_ratio);
+
+	ASSERT("MFIO reduces loss on 4-layer MLP", mfio_last < mfio_first);
+	// Honest depth trend observed: MFIO is 80.9% of Adam at L=1, 102% at
+	// L=2, 38.4% at L=4.  Per-layer σ is a progressively coarser
+	// preconditioner vs Adam's per-param v as depth grows.  A 30%
+	// threshold still catches gross regression while admitting the
+	// depth-limitation honestly.  Improving MFIO at depth is a research
+	// direction for future iterations (per-weight σ, momentum via
+	// trajectory, etc.).
+	ASSERT("MFIO deep-MLP log-descent ≥ 30% of Adam (depth-limited)",
+	       log_eff >= 0.3f);
+#else
+	std::printf("  [mfio deep-mlp] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -7849,6 +8081,7 @@ void CHIRONUnitTest()
 	CHIRONMfioDescentTest();
 	CHIRONMfioVsAdamBenchmark();
 	CHIRONMfioNonlinearMLPTest();
+	CHIRONMfioDeeperMLPTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
