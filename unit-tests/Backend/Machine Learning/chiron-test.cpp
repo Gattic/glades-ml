@@ -6510,6 +6510,137 @@ void CHIRONMpotInitFromDenseParityTest()
 #endif
 }
 
+// CHIRONMpotForwardParityTest -----------------------------------------------
+// Paradigm shift #10, Phase 2a: verify mpot_forward (factored two-GEMM
+// path) matches the dense reference  Y = X · W^T  where W is
+// reconstructed from (A, B) as a parity anchor.  Production MPOT never
+// touches the dense W; the test is the only place it should appear.
+void CHIRONMpotForwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mpot forward] no CUDA device — skipped\n");
+		return;
+	}
+
+	// Small square-ish shape for easy debugging, random (A, B), random X.
+	const unsigned int m_1 = 3, m_2 = 4, n_1 = 5, n_2 = 2, D = 6;
+	const unsigned int T   = 7;
+	const unsigned int m   = m_1 * m_2;   // 12
+	const unsigned int n   = n_1 * n_2;   // 10
+
+	LCG rng(202604233u);
+	std::vector<float> X_h((size_t)T * m);
+	std::vector<float> A_h((size_t)m_1 * n_1 * D);
+	std::vector<float> B_h((size_t)D * m_2 * n_2);
+	for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < A_h.size(); ++i) A_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < B_h.size(); ++i) B_h[i] = 0.2f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_A, d_B, d_W, d_Y_ref, d_Y_factored, d_scratch;
+	d_X.allocate((size_t)T * m);           d_X.upload(&X_h[0], X_h.size());
+	d_A.allocate(A_h.size());              d_A.upload(&A_h[0], A_h.size());
+	d_B.allocate(B_h.size());              d_B.upload(&B_h[0], B_h.size());
+	d_W.allocate((size_t)m * n);
+	d_Y_ref.allocate((size_t)T * n);
+	d_Y_factored.allocate((size_t)T * n);
+
+	// Forward scratch: A_perm + B_perm + T1 + T1_perm + Y_pre.
+	const size_t sz_scratch =
+	    (size_t)m_1 * D * n_1 +     // A_perm
+	    (size_t)m_2 * D * n_2 +     // B_perm
+	    (size_t)T * m_1 * D * n_2 + // T1
+	    (size_t)T * n_2 * m_1 * D + // T1_perm
+	    (size_t)T * n_1 * n_2;      // Y_pre
+	d_scratch.allocate(sz_scratch);
+
+	// Reference: reconstruct W, then Y_ref = X · W^T via sgemm_abt.
+	ASSERT("reconstruct dense W for mpot forward parity",
+	       glades::gpu::mpot_reconstruct_dense(
+	           d_A.data(), d_B.data(), m_1, m_2, n_1, n_2, D, d_W.data()));
+	// Y [T × n] = X [T × m] · W [m × n]... wait, we want Y = X · W^T where
+	// W has shape (m, n).  W^T is (n, m).  Y[t, j] = Σ_k X[t, k] · W[k, j]
+	// = (X · W)[t, j].  So actually we want Y = X · W here because our
+	// MPO reconstructs W with row = input index (i ↔ m), col = output
+	// index (j ↔ n).  Standard sgemm_rowmajor works.
+	ASSERT("dense reference GEMM Y = X · W",
+	       glades::gpu::sgemm_rowmajor(
+	           T, n, m, 1.0f,
+	           d_X.data(), m,
+	           d_W.data(), n,
+	           0.0f,
+	           d_Y_ref.data(), n));
+
+	// Factored: mpot_forward directly from (X, A, B).
+	ASSERT("mpot_forward (factored path) runs",
+	       glades::gpu::mpot_forward(
+	           d_X.data(), d_A.data(), d_B.data(),
+	           T, m_1, m_2, n_1, n_2, D,
+	           d_Y_factored.data(), d_scratch.data()));
+
+	std::vector<float> Y_ref((size_t)T * n), Y_fac((size_t)T * n);
+	d_Y_ref.download(&Y_ref[0], Y_ref.size());
+	d_Y_factored.download(&Y_fac[0], Y_fac.size());
+	const float err = max_abs_diff(Y_ref, Y_fac);
+	std::printf("  mpot_forward factored vs dense (T=%u, m=%u·%u, n=%u·%u, D=%u): max_err = %.3e\n",
+	            T, m_1, m_2, n_1, n_2, D, err);
+	ASSERT("MPOT factored forward matches dense reference",
+	       err < 1e-4f);
+
+	// A second shape (different m_l, n_l, D) to guard against index bugs
+	// that a single shape might hide.
+	{
+		const unsigned int m1b = 2, m2b = 5, n1b = 3, n2b = 4, Db = 7;
+		const unsigned int Tb  = 5;
+		const unsigned int mb  = m1b * m2b;    // 10
+		const unsigned int nb  = n1b * n2b;    // 12
+
+		std::vector<float> Xh((size_t)Tb * mb);
+		std::vector<float> Ah((size_t)m1b * n1b * Db);
+		std::vector<float> Bh((size_t)Db * m2b * n2b);
+		for (size_t i = 0; i < Xh.size(); ++i) Xh[i] = 0.2f * rng.next_unit();
+		for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = 0.2f * rng.next_unit();
+		for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = 0.2f * rng.next_unit();
+
+		glades::gpu::GpuBuffer<float> dX2, dA2, dB2, dW2, dYr, dYf, ds2;
+		dX2.allocate(Xh.size());   dX2.upload(&Xh[0], Xh.size());
+		dA2.allocate(Ah.size());   dA2.upload(&Ah[0], Ah.size());
+		dB2.allocate(Bh.size());   dB2.upload(&Bh[0], Bh.size());
+		dW2.allocate((size_t)mb * nb);
+		dYr.allocate((size_t)Tb * nb);
+		dYf.allocate((size_t)Tb * nb);
+		const size_t sz2 = (size_t)m1b * Db * n1b + (size_t)m2b * Db * n2b
+		                 + (size_t)Tb * m1b * Db * n2b
+		                 + (size_t)Tb * n2b * m1b * Db
+		                 + (size_t)Tb * n1b * n2b;
+		ds2.allocate(sz2);
+
+		ASSERT("shape-B reconstruct runs",
+		       glades::gpu::mpot_reconstruct_dense(
+		           dA2.data(), dB2.data(), m1b, m2b, n1b, n2b, Db, dW2.data()));
+		ASSERT("shape-B dense GEMM runs",
+		       glades::gpu::sgemm_rowmajor(
+		           Tb, nb, mb, 1.0f,
+		           dX2.data(), mb, dW2.data(), nb, 0.0f, dYr.data(), nb));
+		ASSERT("shape-B mpot_forward runs",
+		       glades::gpu::mpot_forward(
+		           dX2.data(), dA2.data(), dB2.data(),
+		           Tb, m1b, m2b, n1b, n2b, Db,
+		           dYf.data(), ds2.data()));
+		std::vector<float> Yr((size_t)Tb * nb), Yf((size_t)Tb * nb);
+		dYr.download(&Yr[0], Yr.size());
+		dYf.download(&Yf[0], Yf.size());
+		const float e2 = max_abs_diff(Yr, Yf);
+		std::printf("  mpot_forward shape-B (T=%u, m=%u·%u, n=%u·%u, D=%u): max_err = %.3e\n",
+		            Tb, m1b, m2b, n1b, n2b, Db, e2);
+		ASSERT("MPOT factored forward matches dense on shape B", e2 < 1e-4f);
+	}
+#else
+	std::printf("  [mpot forward] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -6626,6 +6757,7 @@ void CHIRONUnitTest()
 	CHIRONChunkedCrossEntropyBenchmark();
 	CHIRONMpotReconstructParityTest();
 	CHIRONMpotInitFromDenseParityTest();
+	CHIRONMpotForwardParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();

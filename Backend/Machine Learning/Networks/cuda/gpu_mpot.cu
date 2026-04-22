@@ -3,6 +3,7 @@
 
 #include "gpu_mpot.h"
 #include "gpu_device.h"
+#include "gpu_blas.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -125,6 +126,72 @@ __global__ void k_mpot_scatter_A(const float* __restrict__ U_full_rm,
 	// A[i_1, j_1, α] at row-major offset i_1*n_1*D + j_1*D + α.
 	A[(size_t)i_1 * n_1 * D + (size_t)j_1 * D + a] =
 	    U_full_rm[(size_t)p * P_ld + a] * sqs;
+}
+
+// Permute B from (D, m_2, n_2) row-major to (m_2, D, n_2) row-major.
+// Needed so that X [T·m_1, m_2] · B_perm [m_2, D·n_2] is a standard
+// matrix multiply producing T1 [T·m_1, D·n_2].
+__global__ void k_mpot_perm_B_D_m2_n2__to__m2_D_n2(
+    const float* __restrict__ B,
+    unsigned int D, unsigned int m_2, unsigned int n_2,
+    float* __restrict__ B_perm)
+{
+	const unsigned int alpha = blockIdx.z;
+	const unsigned int i_2   = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j_2   = blockIdx.x * blockDim.x + threadIdx.x;
+	if (alpha >= D || i_2 >= m_2 || j_2 >= n_2) return;
+	B_perm[(size_t)i_2 * D * n_2 + (size_t)alpha * n_2 + j_2] =
+	    B[(size_t)alpha * m_2 * n_2 + (size_t)i_2 * n_2 + j_2];
+}
+
+// Permute A from (m_1, n_1, D) row-major to (m_1, D, n_1) row-major.
+// Needed so that T1_perm [T·n_2, m_1·D] · A_perm [m_1·D, n_1] is a
+// standard matrix multiply producing Y_pre [T·n_2, n_1].
+__global__ void k_mpot_perm_A_m1_n1_D__to__m1_D_n1(
+    const float* __restrict__ A,
+    unsigned int m_1, unsigned int n_1, unsigned int D,
+    float* __restrict__ A_perm)
+{
+	const unsigned int i_1   = blockIdx.z;
+	const unsigned int alpha = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j_1   = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i_1 >= m_1 || alpha >= D || j_1 >= n_1) return;
+	A_perm[(size_t)i_1 * D * n_1 + (size_t)alpha * n_1 + j_1] =
+	    A[(size_t)i_1 * n_1 * D + (size_t)j_1 * D + alpha];
+}
+
+// Permute T1 from (T, m_1, D, n_2) row-major to (T, n_2, m_1, D) row-major.
+// One thread per output element, iterate the outer batch t over blockIdx.z.
+__global__ void k_mpot_perm_T1_T_m1_D_n2__to__T_n2_m1_D(
+    const float* __restrict__ T1,
+    unsigned int T, unsigned int m_1, unsigned int D, unsigned int n_2,
+    float* __restrict__ T1_perm)
+{
+	// Flatten (t, j_2) in y; (i_1, α) in x.
+	const unsigned int tj = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int ia = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tj >= T * n_2 || ia >= m_1 * D) return;
+	const unsigned int t   = tj / n_2;
+	const unsigned int j_2 = tj % n_2;
+	const unsigned int i_1 = ia / D;
+	const unsigned int alpha = ia % D;
+	// T1[t, i_1, α, j_2]  → T1_perm[t, j_2, i_1, α]
+	T1_perm[((size_t)t * n_2 + j_2) * (m_1 * D) + (size_t)i_1 * D + alpha] =
+	    T1[((size_t)t * m_1 + i_1) * (D * n_2) + (size_t)alpha * n_2 + j_2];
+}
+
+// Permute Y_pre (T, n_2, n_1) → Y (T, n_1, n_2).
+__global__ void k_mpot_perm_Y_T_n2_n1__to__T_n1_n2(
+    const float* __restrict__ Y_pre,
+    unsigned int T, unsigned int n_1, unsigned int n_2,
+    float* __restrict__ Y)
+{
+	const unsigned int t   = blockIdx.z;
+	const unsigned int j_1 = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j_2 = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T || j_1 >= n_1 || j_2 >= n_2) return;
+	Y[((size_t)t * n_1 + j_1) * n_2 + j_2] =
+	    Y_pre[((size_t)t * n_2 + j_2) * n_1 + j_1];
 }
 
 // Scatter the first D right singular vectors V_rm [Q × D] into B:
@@ -318,6 +385,108 @@ bool mpot_init_from_dense(const float* W,
 		          (Q + block.y - 1u) / block.y);
 		k_mpot_scatter_B<<<grid, block, 0, computeStream()>>>(
 		    V_rm, Q, Sigma, m_2, n_2, D, B);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	return true;
+}
+
+// ========================================================================
+// mpot_forward — see gpu_mpot.h for the algorithm.
+// ========================================================================
+bool mpot_forward(const float* X,
+                  const float* A, const float* B,
+                  unsigned int T,
+                  unsigned int m_1, unsigned int m_2,
+                  unsigned int n_1, unsigned int n_2,
+                  unsigned int D,
+                  float* Y,
+                  float* scratch)
+{
+	if (X == nullptr || A == nullptr || B == nullptr || Y == nullptr || scratch == nullptr)
+		return false;
+	if (T == 0u || m_1 == 0u || m_2 == 0u || n_1 == 0u || n_2 == 0u || D == 0u)
+		return false;
+
+	// Scratch layout:
+	//   A_perm      [m_1 · D · n_1]        (A permuted)
+	//   B_perm      [m_2 · D · n_2]        (B permuted)
+	//   T1          [T · m_1 · D · n_2]
+	//   T1_perm     [T · n_2 · m_1 · D]    (same size as T1)
+	//   Y_pre       [T · n_2 · n_1]        (same size as Y)
+	size_t off = 0;
+	float* A_perm   = scratch + off; off += (size_t)m_1 * D * n_1;
+	float* B_perm   = scratch + off; off += (size_t)m_2 * D * n_2;
+	float* T1       = scratch + off; off += (size_t)T * m_1 * D * n_2;
+	float* T1_perm  = scratch + off; off += (size_t)T * n_2 * m_1 * D;
+	float* Y_pre    = scratch + off; off += (size_t)T * n_1 * n_2;
+	(void)off;
+
+	// (1) Permute B  (D, m_2, n_2)  →  B_perm (m_2, D, n_2)
+	{
+		dim3 block(16, 8, 1);
+		dim3 grid((n_2 + block.x - 1u) / block.x,
+		          (m_2 + block.y - 1u) / block.y,
+		          D);
+		k_mpot_perm_B_D_m2_n2__to__m2_D_n2<<<grid, block, 0, computeStream()>>>(
+		    B, D, m_2, n_2, B_perm);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (2) Permute A  (m_1, n_1, D)  →  A_perm (m_1, D, n_1)
+	{
+		dim3 block(16, 8, 1);
+		dim3 grid((n_1 + block.x - 1u) / block.x,
+		          (D + block.y - 1u) / block.y,
+		          m_1);
+		k_mpot_perm_A_m1_n1_D__to__m1_D_n1<<<grid, block, 0, computeStream()>>>(
+		    A, m_1, n_1, D, A_perm);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (3) GEMM:  X [T·m_1, m_2]  ·  B_perm [m_2, D·n_2]  →  T1 [T·m_1, D·n_2]
+	// X is stored as (T, m_1, m_2) row-major ≡ (T·m_1, m_2) row-major with
+	// the same memory layout — no permutation needed.
+	const int Tm1 = static_cast<int>(T) * static_cast<int>(m_1);
+	const int Dn2 = static_cast<int>(D) * static_cast<int>(n_2);
+	if (!sgemm_rowmajor(Tm1, Dn2, static_cast<int>(m_2),
+	                    1.0f,
+	                    X,       static_cast<int>(m_2),
+	                    B_perm,  Dn2,
+	                    0.0f,
+	                    T1,      Dn2))
+		return false;
+
+	// (4) Permute T1  (T, m_1, D, n_2)  →  T1_perm (T, n_2, m_1, D)
+	{
+		dim3 block(16, 16, 1);
+		dim3 grid((m_1 * D + block.x - 1u) / block.x,
+		          (T * n_2 + block.y - 1u) / block.y,
+		          1);
+		k_mpot_perm_T1_T_m1_D_n2__to__T_n2_m1_D<<<grid, block, 0, computeStream()>>>(
+		    T1, T, m_1, D, n_2, T1_perm);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (5) GEMM:  T1_perm [T·n_2, m_1·D]  ·  A_perm [m_1·D, n_1]  →  Y_pre [T·n_2, n_1]
+	const int Tn2 = static_cast<int>(T) * static_cast<int>(n_2);
+	const int m1D = static_cast<int>(m_1) * static_cast<int>(D);
+	if (!sgemm_rowmajor(Tn2, static_cast<int>(n_1), m1D,
+	                    1.0f,
+	                    T1_perm, m1D,
+	                    A_perm,  static_cast<int>(n_1),
+	                    0.0f,
+	                    Y_pre,   static_cast<int>(n_1)))
+		return false;
+
+	// (6) Permute Y_pre (T, n_2, n_1)  →  Y (T, n_1, n_2)
+	{
+		dim3 block(16, 16, 1);
+		dim3 grid((n_2 + block.x - 1u) / block.x,
+		          (n_1 + block.y - 1u) / block.y,
+		          T);
+		k_mpot_perm_Y_T_n2_n1__to__T_n1_n2<<<grid, block, 0, computeStream()>>>(
+		    Y_pre, T, n_1, n_2, Y);
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
 

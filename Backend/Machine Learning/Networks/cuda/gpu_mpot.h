@@ -90,6 +90,52 @@ bool mpot_init_from_dense(const float* W,
                           float* A, float* B,
                           float* scratch);
 
+// ========================================================================
+// mpot_forward — compute  Y = X · W^T  where W is stored in factored
+// MPO form (A, B) — WITHOUT materializing the dense W.
+//
+// Inputs:
+//   X   [T × m]              row-major, m = m_1·m_2
+//   A   [m_1 · n_1 · D]      row-major MPO factor
+//   B   [D · m_2 · n_2]      row-major MPO factor
+//   T                         batch / token count
+//   m_1, m_2, n_1, n_2, D    factorization dims + bond
+// Output:
+//   Y   [T × n]              row-major, n = n_1·n_2
+//
+// Algorithm (two-GEMM chain; see research/PARADIGM_SHIFT_10_DESIGN.md):
+//
+//   (1) Permute B from (D, m_2, n_2) row-major to (m_2, D, n_2) so that
+//       X · B_perm is a standard matrix multiply.
+//   (2) Permute A from (m_1, n_1, D) row-major to (m_1, D, n_1).
+//   (3) GEMM: X [T·m_1, m_2] · B_perm [m_2, D·n_2]  →  T1 [T·m_1, D·n_2]
+//       equivalent to  T1[t, i_1, α, j_2] = Σ_{i_2} X[t, i_1, i_2] · B[α, i_2, j_2].
+//   (4) Permute T1 from (T, m_1, D, n_2) to (T, n_2, m_1, D).
+//   (5) GEMM: T1_perm [T·n_2, m_1·D] · A_perm [m_1·D, n_1]  →  Y_pre [T·n_2, n_1]
+//       equivalent to  Y_pre[t, j_2, j_1] = Σ_{i_1, α} T1[t, i_1, α, j_2] · A[i_1, j_1, α].
+//   (6) Permute Y_pre (T, n_2, n_1) → Y (T, n_1, n_2).
+//
+// Cost: 2 GEMMs of shape (T · (m+n)^{1/2}) × D × (m·n)^{1/2} + 3 light
+// permutations.  For square factoring (m_1=m_2=√m, n_1=n_2=√n), total
+// FLOPs ≈ T · D · (m · n)^{1/2} · (√m + √n) vs T · m · n for dense —
+// a 2.8× theoretical speedup at m=n=2048, D=16 (see design doc).
+//
+// Scratch requirement (caller-allocated):
+//   m_1·n_1·D               (A_perm — same size as A)
+// + D·m_2·n_2               (B_perm — same size as B)
+// + T·m_1·D·n_2             (T1)
+// + T·n_2·m_1·D             (T1_perm — same size as T1)
+// + T·n_1·n_2               (Y_pre — same size as Y)
+// ========================================================================
+bool mpot_forward(const float* X,
+                  const float* A, const float* B,
+                  unsigned int T,
+                  unsigned int m_1, unsigned int m_2,
+                  unsigned int n_1, unsigned int n_2,
+                  unsigned int D,
+                  float* Y,
+                  float* scratch);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -103,6 +149,11 @@ inline bool mpot_init_from_dense(const float*,
                                  unsigned int, unsigned int,
                                  unsigned int,
                                  float*, float*, float*) { return false; }
+inline bool mpot_forward(const float*, const float*, const float*,
+                         unsigned int,
+                         unsigned int, unsigned int,
+                         unsigned int, unsigned int,
+                         unsigned int, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 
