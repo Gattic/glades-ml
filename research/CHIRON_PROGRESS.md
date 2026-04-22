@@ -47,7 +47,7 @@ for the full root-cause analysis including nsys profile breakdown.
 | 12 | **DFA — Direct Feedback Alignment (PHASE 1-2 SHIPPED, SURPRISING)** | backprop pass (time) | **ZERO backprop needed**; per-step descent rate ROBUST across L=2,4,8 (0.024 log/step — contradicts prior art's L>10 cliff); efficiency vs backprop: 100% at L=2, 28% at L=8 (backprop benefits from depth more); **MFIO×DFA composition 39.1% beats MFIO+backprop's 32.6%** | `dfa_init_random_matrix` + `dfa_project_error` primitives; 4 parity tests (L=2, L=4, L=8, MFIO×DFA composition); Adam+DFA pairing pushes the DFA depth frontier past prior SGD-era art |
 | +  | **Flash attention** (non-materialized softmax) | long-context memory | eliminates O(nH·T²) scratch; unlocks T=16384 where tiled OOMs | `CHIRONFlashShear{,Backward}Bf16ParityTest` both max_err ≈ 1e-5 |
 
-### Three Ralph-loop empirical surprises (2026-04-22)
+### Four Ralph-loop empirical surprises (2026-04-22)
 
 Paradigm shifts where the research-framework-design skill's systematic
 exploration produced empirical results exceeding theoretical expectations:
@@ -65,6 +65,13 @@ exploration produced empirical results exceeding theoretical expectations:
    zero-backprop is STRONGER than MFIO alone (39.1% vs 32.6% efficiency
    vs Adam+backprop).  DFA's random projection acts as implicit
    regularizer on MFIO's layer-scalar σ.  Shifts compose positively.
+4. **DFA at L=16 converges while backprop is STUCK** — 16-layer vanilla
+   ReLU MLP without residuals/LN: DFA+Adam reaches 1495× loss reduction,
+   Adam+backprop is completely stuck at 1.00× (gradient vanishing through
+   ReLU chain).  DFA's random-projection backward is structurally
+   IMMUNE to gradient-vanishing since it doesn't chain gradients across
+   layers.  In pathological deep-vanilla regimes DFA is strictly better
+   than backprop, not a compromise.
 
 ### Training-scale ceilings on a single 16 GB consumer GPU (RTX 4080 SUPER)
 
