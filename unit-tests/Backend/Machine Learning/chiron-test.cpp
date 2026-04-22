@@ -7515,6 +7515,216 @@ void CHIRONMfioVsAdamBenchmark()
 #endif
 }
 
+// CHIRONMfioNonlinearMLPTest ------------------------------------------------
+// Paradigm shift #11, Phase 1c: MFIO on a nonlinear 2-layer MLP.
+// Linear regression (CHIRONMfioDescentTest) shows MFIO converges on
+// a convex-quadratic target — necessary but not sufficient.  This
+// test drives MFIO through a ReLU-gated MLP fitting a nonlinear
+// target and compares head-to-head with Adam.
+//
+// Architecture:  y = W2 · ReLU(W1 · x)     (row-major, batched over T)
+// Target:        y* = W2_tgt · sigmoid(W1_tgt · x)   (mild nonlinearity)
+// Loss:          MSE
+//
+// Expectation: MFIO converges with log-descent rate ≥ 50% of Adam's
+// (nonlinear landscapes are harder for preconditioner-free methods;
+// relax from the 60% threshold used on linear regression).
+void CHIRONMfioNonlinearMLPTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mfio mlp] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T      = 64;
+	const unsigned int m_in   = 24;
+	const unsigned int m_hid  = 32;
+	const unsigned int n_out  = 16;
+	const int   N             = 150;
+	const float lr            = 5e-3f;
+	const float b1            = 0.9f;
+	const float b2            = 0.999f;
+	const float eps           = 1e-8f;
+
+	LCG rng(202604239u);
+	// Ground-truth weights (slight scale to avoid saturation).
+	std::vector<float> W1s_h((size_t)m_in  * m_hid);
+	std::vector<float> W2s_h((size_t)m_hid * n_out);
+	std::vector<float> X_h((size_t)T * m_in);
+	std::vector<float> W10_h((size_t)m_in  * m_hid);
+	std::vector<float> W20_h((size_t)m_hid * n_out);
+	for (size_t i = 0; i < W1s_h.size(); ++i) W1s_h[i] = 0.3f  * rng.next_unit();
+	for (size_t i = 0; i < W2s_h.size(); ++i) W2s_h[i] = 0.3f  * rng.next_unit();
+	for (size_t i = 0; i < X_h.size(); ++i)   X_h[i]   = 0.5f  * rng.next_unit();
+	for (size_t i = 0; i < W10_h.size(); ++i) W10_h[i] = 0.08f * rng.next_unit();
+	for (size_t i = 0; i < W20_h.size(); ++i) W20_h[i] = 0.08f * rng.next_unit();
+
+	// Build Y_tgt on host using sigmoid(W1·X) · W2^T (different from
+	// ReLU so the student MLP must actually learn — not a trivial fit).
+	std::vector<float> Ytgt_h((size_t)T * n_out);
+	{
+		std::vector<float> h((size_t)T * m_hid);
+		for (unsigned t = 0; t < T; ++t)
+			for (unsigned j = 0; j < m_hid; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < m_in; ++k)
+					s += X_h[(size_t)t * m_in + k] * W1s_h[(size_t)k * m_hid + j];
+				h[(size_t)t * m_hid + j] = 1.0f / (1.0f + std::exp(-s));
+			}
+		for (unsigned t = 0; t < T; ++t)
+			for (unsigned j = 0; j < n_out; ++j)
+			{
+				float s = 0.0f;
+				for (unsigned k = 0; k < m_hid; ++k)
+					s += h[(size_t)t * m_hid + k] * W2s_h[(size_t)k * n_out + j];
+				Ytgt_h[(size_t)t * n_out + j] = s;
+			}
+	}
+
+	glades::gpu::GpuBuffer<float> d_X, d_Ytgt;
+	d_X.allocate(X_h.size());     d_X.upload(&X_h[0], X_h.size());
+	d_Ytgt.allocate(Ytgt_h.size());d_Ytgt.upload(&Ytgt_h[0], Ytgt_h.size());
+
+	float mfio_first = 0, mfio_last = 0, adam_first = 0, adam_last = 0;
+	for (int pass = 0; pass < 2; ++pass)
+	{
+		const bool use_mfio = (pass == 0);
+
+		glades::gpu::GpuBuffer<float> d_W1, d_W2, d_H_pre, d_H, d_Y,
+		                              d_dY, d_dH, d_dH_pre,
+		                              d_dW1, d_dW2, d_sigma1, d_sigma2,
+		                              d_m1, d_v1, d_m2, d_v2;
+		d_W1.allocate(W10_h.size()); d_W1.upload(&W10_h[0], W10_h.size());
+		d_W2.allocate(W20_h.size()); d_W2.upload(&W20_h[0], W20_h.size());
+		d_H_pre.allocate((size_t)T * m_hid);
+		d_H.allocate((size_t)T * m_hid);
+		d_Y.allocate((size_t)T * n_out);
+		d_dY.allocate((size_t)T * n_out);
+		d_dH.allocate((size_t)T * m_hid);
+		d_dH_pre.allocate((size_t)T * m_hid);
+		d_dW1.allocate(W10_h.size());
+		d_dW2.allocate(W20_h.size());
+		d_sigma1.allocate(1);
+		d_sigma2.allocate(1);
+		d_m1.allocate(W10_h.size()); d_v1.allocate(W10_h.size());
+		d_m2.allocate(W20_h.size()); d_v2.allocate(W20_h.size());
+		std::vector<float> z1(W10_h.size(), 0.0f);
+		std::vector<float> z2(W20_h.size(), 0.0f);
+		d_m1.upload(&z1[0], z1.size()); d_v1.upload(&z1[0], z1.size());
+		d_m2.upload(&z2[0], z2.size()); d_v2.upload(&z2[0], z2.size());
+
+		std::vector<float> Y((size_t)T * n_out);
+		std::vector<float> Ytgt_local(Ytgt_h);
+		std::vector<float> dY((size_t)T * n_out);
+		float loss_first = -1.0f, loss_last = -1.0f;
+
+		for (int step = 1; step <= N; ++step)
+		{
+			// Forward H_pre = X · W1
+			glades::gpu::sgemm_rowmajor(T, m_hid, m_in, 1.0f,
+			                            d_X.data(), m_in,
+			                            d_W1.data(), m_hid,
+			                            0.0f,
+			                            d_H_pre.data(), m_hid);
+			// H = ReLU(H_pre)
+			glades::gpu::relu_forward(d_H_pre.data(), (int)((size_t)T * m_hid),
+			                          d_H.data());
+			// Y = H · W2
+			glades::gpu::sgemm_rowmajor(T, n_out, m_hid, 1.0f,
+			                            d_H.data(), m_hid,
+			                            d_W2.data(), n_out,
+			                            0.0f,
+			                            d_Y.data(), n_out);
+			d_Y.download(&Y[0], Y.size());
+			float loss = 0.0f;
+			for (size_t i = 0; i < Y.size(); ++i)
+			{
+				const float d = Y[i] - Ytgt_local[i];
+				loss += d * d;
+				dY[i] = (2.0f / float(Y.size())) * d;
+			}
+			loss /= float(Y.size());
+			if (step == 1) loss_first = loss;
+			loss_last = loss;
+			d_dY.upload(&dY[0], dY.size());
+
+			// Backward: dW2 = H^T · dY
+			glades::gpu::sgemm_rowmajor_atb(m_hid, n_out, T, 1.0f,
+			                                d_H.data(), m_hid,
+			                                d_dY.data(), n_out,
+			                                0.0f,
+			                                d_dW2.data(), n_out);
+			// dH = dY · W2^T
+			glades::gpu::sgemm_rowmajor_abt(T, m_hid, n_out, 1.0f,
+			                                d_dY.data(), n_out,
+			                                d_W2.data(), n_out,
+			                                0.0f,
+			                                d_dH.data(), m_hid);
+			// dH_pre = dH * (H_pre > 0)
+			glades::gpu::relu_backward(d_dH.data(), d_H_pre.data(),
+			                           (int)((size_t)T * m_hid),
+			                           d_dH_pre.data());
+			// dW1 = X^T · dH_pre
+			glades::gpu::sgemm_rowmajor_atb(m_in, m_hid, T, 1.0f,
+			                                d_X.data(), m_in,
+			                                d_dH_pre.data(), m_hid,
+			                                0.0f,
+			                                d_dW1.data(), m_hid);
+
+			if (use_mfio)
+			{
+				glades::gpu::mfio_compute_sigma(
+				    d_H.data(), d_dY.data(), T, m_hid, n_out,
+				    1.0f, eps, d_sigma2.data());
+				glades::gpu::mfio_update(
+				    d_W2.data(), d_dW2.data(), d_sigma2.data(),
+				    lr, 0.0f, (int)W20_h.size());
+				glades::gpu::mfio_compute_sigma(
+				    d_X.data(), d_dH_pre.data(), T, m_in, m_hid,
+				    1.0f, eps, d_sigma1.data());
+				glades::gpu::mfio_update(
+				    d_W1.data(), d_dW1.data(), d_sigma1.data(),
+				    lr, 0.0f, (int)W10_h.size());
+			}
+			else
+			{
+				glades::gpu::adam_update(
+				    d_W2.data(), d_dW2.data(),
+				    d_m2.data(), d_v2.data(),
+				    lr, b1, b2, eps, 0.0f, 1.0f,
+				    step, (int)W20_h.size());
+				glades::gpu::adam_update(
+				    d_W1.data(), d_dW1.data(),
+				    d_m1.data(), d_v1.data(),
+				    lr, b1, b2, eps, 0.0f, 1.0f,
+				    step, (int)W10_h.size());
+			}
+		}
+		const char* name = use_mfio ? "MFIO" : "Adam";
+		std::printf("  [mlp] %s: loss %.4e -> %.4e (%.2fx reduction) over %d steps\n",
+		            name, loss_first, loss_last,
+		            loss_first / loss_last, N);
+		if (use_mfio) { mfio_first = loss_first; mfio_last = loss_last; }
+		else          { adam_first = loss_first; adam_last = loss_last; }
+	}
+
+	const float mfio_ratio = mfio_first / mfio_last;
+	const float adam_ratio = adam_first / adam_last;
+	const float mfio_log   = std::log(mfio_ratio);
+	const float adam_log   = std::log(adam_ratio);
+	const float log_eff    = mfio_log / adam_log;
+	std::printf("  [mlp] MFIO/Adam log-descent efficiency: %.1f%% (MFIO %.1fx vs Adam %.1fx)\n",
+	            100.0f * log_eff, mfio_ratio, adam_ratio);
+
+	ASSERT("MFIO reduces MLP loss", mfio_last < mfio_first);
+	ASSERT("MFIO MLP log-descent ≥ 50% of Adam", log_eff >= 0.5f);
+#else
+	std::printf("  [mfio mlp] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -7638,6 +7848,7 @@ void CHIRONUnitTest()
 	CHIRONMpotStiefelCompositionBenchmark();
 	CHIRONMfioDescentTest();
 	CHIRONMfioVsAdamBenchmark();
+	CHIRONMfioNonlinearMLPTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
