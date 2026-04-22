@@ -12433,8 +12433,31 @@ void CHIRONIbgradEndToEndConvergenceTest()
 			        d_P.data(), d_residual.data(), d_y.data(), N, r, eta_oja));
 		}
 
-		// Every K steps: QR reorthogonalize.
+		// Phase 4 audit + refresh: every K_qr steps, check how much of the
+		// gradient P captures.  If captured_frac < threshold, replace P's
+		// first column with g/‖g‖ (a "load-bearing" direction) before QR.
+		// This is the F2 mitigation shown to be structurally required.
 		if (step % K_qr == 0) {
+			// Compute captured_frac = ‖Pᵀg‖² / ‖g‖² on host.
+			std::vector<float> g_now(N), y_now(r);
+			d_g.download(&g_now[0], N);
+			d_y.download(&y_now[0], r);
+			double g_norm_sq = 0.0, y_norm_sq = 0.0;
+			for (unsigned int i = 0; i < N; ++i) g_norm_sq += (double)g_now[i] * g_now[i];
+			for (unsigned int j = 0; j < r; ++j) y_norm_sq += (double)y_now[j] * y_now[j];
+			const double captured = (g_norm_sq > 1e-20) ? (y_norm_sq / g_norm_sq) : 1.0;
+			const double threshold = 0.50;  // refresh if < 50% captured
+
+			if (captured < threshold) {
+				// Replace column 0 with g/‖g‖.
+				std::vector<float> P_host((size_t)N * r);
+				d_P.download(&P_host[0], P_host.size());
+				const float g_norm = (float)std::sqrt(g_norm_sq);
+				for (unsigned int i = 0; i < N; ++i) {
+					P_host[(size_t)i * r + 0] = g_now[i] / (g_norm + 1e-8f);
+				}
+				d_P.upload(&P_host[0], P_host.size());
+			}
 			ASSERT("ibgrad_qr_reorthogonalize", glades::gpu::ibgrad_qr_reorthogonalize(
 			    d_P.data(), N, r));
 		}
