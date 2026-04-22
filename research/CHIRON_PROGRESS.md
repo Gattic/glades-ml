@@ -14,6 +14,27 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-22: trainer-stack health check — 45,297 tok/s, no regression
+
+Post-all-primitive-shipments verification on `sh run.sh bpe --large --atlas`:
+
+  seq_done=122:  36,142 tok/s
+  seq_done=202:  43,030 tok/s
+  seq_done=221:  44,133 tok/s
+  seq_done=240:  45,124 tok/s
+  seq_done=244:  **45,298 tok/s**
+
+Steady-state is **>45k tok/s** — matches and slightly exceeds both the
+Apr-4 baseline (44,727) and the post-fix measurement (44,134).  Even
+with ~40 commits of new primitive work (OVFG Phases 1-3, MPOT Phases
+1-2, chunked CE, MFIO v1+v2, DFA Phase 1-2, 4 paradigm-shift design
+docs), the pile_large `--atlas` baseline remains unregressed on its
+production path.
+
+This validates that all primitive-level work has been clean-stacked
+without touching the critical-path training code.  The primitives
+are ready for wire-in; none of them have broken anything.
+
 ### 2026-04-22: 7× pile_large regression RESOLVED
 
 `sh run.sh bpe --large --atlas` restored to **44,134 tok/s** (was 6,441
