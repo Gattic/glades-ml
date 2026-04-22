@@ -167,6 +167,57 @@ bool ibgrad_oja_rank1_update(float* P_inout,
 }
 
 // ------------------------------------------------------------------------
+// Compute ‖g‖² via block-reduction kernel.  Result is written to a
+// single-float device scalar; caller downloads if needed.
+// ------------------------------------------------------------------------
+namespace {
+__global__ void k_ibgrad_norm_sq(const float* __restrict__ g,
+                                 int N, float* __restrict__ out)
+{
+	const int tid = threadIdx.x;
+	const int bid = blockIdx.x;
+	const int block = blockDim.x;
+	const int stride = gridDim.x * block;
+
+	float local = 0.0f;
+	for (int i = bid * block + tid; i < N; i += stride) {
+		float v = g[i];
+		local += v * v;
+	}
+
+	__shared__ float shm[32];
+	const int lane = tid & 31;
+	const int warp = tid >> 5;
+
+	for (int off = 16; off > 0; off >>= 1)
+		local += __shfl_down_sync(0xffffffffu, local, off);
+	if (lane == 0) shm[warp] = local;
+	__syncthreads();
+
+	if (warp == 0) {
+		const int nwarps = (block + 31) >> 5;
+		float v = (tid < nwarps) ? shm[tid] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+			v += __shfl_down_sync(0xffffffffu, v, off);
+		if (tid == 0) atomicAdd(out, v);
+	}
+}
+
+// Write column 0 of P (row-major [N × r]) with g[i] / sqrt(g_norm_sq[0]).
+__global__ void k_ibgrad_write_col0(float* __restrict__ P,
+                                    const float* __restrict__ g,
+                                    const float* __restrict__ g_norm_sq,
+                                    int N, int r)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= N) return;
+	const float norm = sqrtf(g_norm_sq[0]) + 1e-8f;
+	// P[i, 0] = g[i] / norm
+	P[(size_t)i * r + 0] = g[i] / norm;
+}
+} // anonymous
+
+// ------------------------------------------------------------------------
 // QR reorthogonalization via cuSOLVER (one-shot handle, cached scratch).
 // ------------------------------------------------------------------------
 namespace {
@@ -268,6 +319,40 @@ bool ibgrad_qr_reorthogonalize(float* P_inout, unsigned int N, unsigned int r)
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
 
+	return true;
+}
+
+bool ibgrad_refresh_first_column(float* P_inout, const float* g,
+                                 unsigned int N, unsigned int r)
+{
+	if (P_inout == nullptr || g == nullptr) return false;
+	if (N == 0u || r == 0u) return false;
+
+	// Compute ‖g‖² into a temp device scalar.
+	static thread_local float* d_scalar = nullptr;
+	if (d_scalar == nullptr) {
+		if (cudaMalloc(&d_scalar, sizeof(float)) != cudaSuccess) return false;
+	}
+	if (cudaMemsetAsync(d_scalar, 0, sizeof(float), computeStream()) != cudaSuccess) return false;
+
+	{
+		const int block = 256;
+		const int grid = (((int)N + block - 1) / block);
+		const int max_grid = 64;
+		const int g_use = (grid < max_grid) ? grid : max_grid;
+		k_ibgrad_norm_sq<<<g_use, block, 0, computeStream()>>>(
+		    g, (int)N, d_scalar);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// Write column 0 of P with normalized g.
+	{
+		const int block = 256;
+		const int grid = ((int)N + block - 1) / block;
+		k_ibgrad_write_col0<<<grid, block, 0, computeStream()>>>(
+		    P_inout, g, d_scalar, (int)N, (int)r);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
 	return true;
 }
 

@@ -104,6 +104,28 @@ bool ibgrad_oja_rank1_update(float* P_inout,
 bool ibgrad_qr_reorthogonalize(float* P_inout,
                                unsigned int N, unsigned int r);
 
+// ========================================================================
+// ibgrad_refresh_first_column — Phase 4 audit mechanism.  Replaces
+// column 0 of P with g / ‖g‖ (the current gradient direction,
+// normalized).  The caller should subsequently call
+// ibgrad_qr_reorthogonalize so the remaining r−1 columns stay orthonormal
+// while column 0 becomes exactly g-aligned.
+//
+// This is the F2-mitigation primitive.  Empirically the plateau without
+// this primitive is ~1.46× loss ratio; with it, ~241× — a 165×
+// multiplier on useful loss reduction.  See
+// `CHIRONIbgradEndToEndConvergenceTest` and commit 6b49cd53b.
+//
+// Usage: call every K_audit steps when the captured fraction
+// ‖Pᵀg‖² / ‖g‖² drops below a threshold (typical 0.5).
+//
+//   P_inout    [N × r]         row-major; column 0 is overwritten
+//   g          [N]             current gradient
+//   N, r       dimensions
+// ========================================================================
+bool ibgrad_refresh_first_column(float* P_inout, const float* g,
+                                 unsigned int N, unsigned int r);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -117,6 +139,8 @@ inline bool ibgrad_unproject(const float*, const float*,
 inline bool ibgrad_oja_rank1_update(float*, const float*, const float*,
                                     unsigned int, unsigned int, float) { return false; }
 inline bool ibgrad_qr_reorthogonalize(float*, unsigned int, unsigned int) { return false; }
+inline bool ibgrad_refresh_first_column(float*, const float*,
+                                        unsigned int, unsigned int) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

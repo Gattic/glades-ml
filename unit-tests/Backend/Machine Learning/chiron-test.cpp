@@ -12449,14 +12449,10 @@ void CHIRONIbgradEndToEndConvergenceTest()
 			const double threshold = 0.50;  // refresh if < 50% captured
 
 			if (captured < threshold) {
-				// Replace column 0 with g/‖g‖.
-				std::vector<float> P_host((size_t)N * r);
-				d_P.download(&P_host[0], P_host.size());
-				const float g_norm = (float)std::sqrt(g_norm_sq);
-				for (unsigned int i = 0; i < N; ++i) {
-					P_host[(size_t)i * r + 0] = g_now[i] / (g_norm + 1e-8f);
-				}
-				d_P.upload(&P_host[0], P_host.size());
+				// Use the dedicated Phase-4 primitive (entirely GPU-side).
+				ASSERT("ibgrad_refresh_first_column",
+				    glades::gpu::ibgrad_refresh_first_column(
+				        d_P.data(), d_g.data(), N, r));
 			}
 			ASSERT("ibgrad_qr_reorthogonalize", glades::gpu::ibgrad_qr_reorthogonalize(
 			    d_P.data(), N, r));
