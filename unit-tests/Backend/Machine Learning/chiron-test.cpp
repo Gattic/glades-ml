@@ -5068,6 +5068,118 @@ void CHIRONOvfgFirstMomentAppendParityTest()
 #endif
 }
 
+// CHIRONOvfgStiefelTangentGradParityTest ------------------------------------
+// Paradigm shift #9, Phase 3 — the PAYOFF CLAUSE.  Verifies that the
+// factored OVFG Stiefel tangent grad primitive produces the same
+// (dU, dΣ, dV) as the reference stiefel_dense_grad_to_tangent WITHOUT
+// ever materializing dW.  This is the composition proof point for
+// paradigm shift #9 × #7: both weight and gradient side stay compressed.
+void CHIRONOvfgStiefelTangentGradParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg stiefel] no CUDA device — skipped\n");
+		return;
+	}
+
+	// m, n, rho similar to CHIRONStiefelDenseGradParityTest.  r = T slot
+	// of an OVFG factored gradient is the "microbatch · seq_len"-equivalent
+	// rank.  We test r < min(m, n) so storage compresses, and also r > rho
+	// (our usual regime: gradient rank ≥ Stiefel rank).
+	const unsigned int m = 32, n = 40, rho = 10, r = 16;
+
+	LCG rng(202604225u);
+	std::vector<float> U(m * rho), V(n * rho), sigma(rho);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, rho);
+	gram_schmidt_cols(V, n, rho);
+	for (size_t i = 0; i < sigma.size(); ++i)
+		sigma[i] = 0.5f + std::abs(rng.next_unit());
+
+	std::vector<uint16_t> U_bf, V_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, rho);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma[0], sigma.size());
+
+	// OVFG factored gradient (L, R).  Construct random, then materialize
+	// dW_dense = L · R^T for the reference path.
+	std::vector<float> L_h(m * r), R_h(n * r);
+	for (size_t i = 0; i < L_h.size(); ++i) L_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < R_h.size(); ++i) R_h[i] = 0.2f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_L, d_R, d_dW;
+	glades::gpu::GpuBuffer<float> d_dU_ref, d_dSigma_ref, d_dV_ref;
+	glades::gpu::GpuBuffer<float> d_dU_ovfg, d_dSigma_ovfg, d_dV_ovfg;
+	glades::gpu::GpuBuffer<float> d_scratch_mr, d_rrU, d_rrV, d_scratch_ovfg;
+	d_L.allocate(m * r); d_L.upload(&L_h[0], L_h.size());
+	d_R.allocate(n * r); d_R.upload(&R_h[0], R_h.size());
+	d_dW.allocate(m * n);
+	d_dU_ref.allocate(m * rho);   d_dSigma_ref.allocate(rho);   d_dV_ref.allocate(n * rho);
+	d_dU_ovfg.allocate(m * rho);  d_dSigma_ovfg.allocate(rho);  d_dV_ovfg.allocate(n * rho);
+	// scratch for stiefel_dense_grad_to_tangent: max(m*rho, rho*n)
+	d_scratch_mr.allocate(size_t(rho) * n > size_t(m) * rho
+	                         ? size_t(rho) * n : size_t(m) * rho);
+	d_rrU.allocate(rho * rho);
+	d_rrV.allocate(rho * rho);
+	// scratch for OVFG primitive: 2*rho*r + 2*rho*rho
+	d_scratch_ovfg.allocate(2u * rho * r + 2u * rho * rho);
+
+	// --- Reference path: materialize dW, then dense tangent grad ---
+	ASSERT("parity helper materializes dW = L · R^T",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_L.data(), d_R.data(), m, n, r, d_dW.data()));
+	glades::gpu::stiefel_dense_grad_to_tangent(
+	    sw, d_dW.data(),
+	    d_dU_ref.data(), d_dSigma_ref.data(), d_dV_ref.data(),
+	    d_scratch_mr.data(), d_rrU.data(), d_rrV.data());
+
+	// --- OVFG path: factored (L, R) directly, no dW ever formed ---
+	ASSERT("ovfg_stiefel_tangent_grad runs",
+	       glades::gpu::ovfg_stiefel_tangent_grad(
+	           sw, d_L.data(), d_R.data(), r,
+	           d_dU_ovfg.data(), d_dSigma_ovfg.data(), d_dV_ovfg.data(),
+	           d_scratch_ovfg.data()));
+
+	// --- Compare ---
+	std::vector<float> dU_ref(m * rho), dV_ref(n * rho), dS_ref(rho);
+	std::vector<float> dU_ovfg(m * rho), dV_ovfg(n * rho), dS_ovfg(rho);
+	d_dU_ref.download(&dU_ref[0], dU_ref.size());
+	d_dV_ref.download(&dV_ref[0], dV_ref.size());
+	d_dSigma_ref.download(&dS_ref[0], dS_ref.size());
+	d_dU_ovfg.download(&dU_ovfg[0], dU_ovfg.size());
+	d_dV_ovfg.download(&dV_ovfg[0], dV_ovfg.size());
+	d_dSigma_ovfg.download(&dS_ovfg[0], dS_ovfg.size());
+
+	const float err_U = max_abs_diff(dU_ref, dU_ovfg);
+	const float err_V = max_abs_diff(dV_ref, dV_ovfg);
+	const float err_S = max_abs_diff(dS_ref, dS_ovfg);
+
+	std::printf("  ovfg stiefel parity: dU=%.3e dV=%.3e dΣ=%.3e\n",
+	            err_U, err_V, err_S);
+	// Bound: two paths traverse different GEMM sequences (dense dW vs.
+	// factor-chained), so round-off differs.  The bound is wider than
+	// the simpler OVFG parity tests because we accumulate GEMMs over BF16
+	// U, V.  5e-3 mirrors CHIRONStiefelDenseGradParityTest's tolerance.
+	ASSERT("OVFG stiefel tangent grad matches dense ref — dU",
+	       err_U < 5e-3f);
+	ASSERT("OVFG stiefel tangent grad matches dense ref — dV",
+	       err_V < 5e-3f);
+	ASSERT("OVFG stiefel tangent grad matches dense ref — dΣ",
+	       err_S < 5e-3f);
+
+	sw.release();
+#else
+	std::printf("  [ovfg stiefel] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -5078,6 +5190,7 @@ void CHIRONUnitTest()
 	CHIRONOvfgDenseUpdateParityTest();
 	CHIRONOvfgAdafactorMomentsParityTest();
 	CHIRONOvfgFirstMomentAppendParityTest();
+	CHIRONOvfgStiefelTangentGradParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();

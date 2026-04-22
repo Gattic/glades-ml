@@ -159,6 +159,14 @@ bool GpuStiefelWeight::allocated() const
 	return U.allocated() && sigma.allocated() && V.allocated() && r > 0;
 }
 
+// Public thin wrapper around the file-local refresh impl.  Used by external
+// modules (e.g., gpu_ovfg Phase 3) that consume the FP32 cache directly.
+void stiefel_refresh_fp32_cache(const GpuStiefelWeight& s)
+{
+	GpuStiefelWeight& sref = const_cast<GpuStiefelWeight&>(s);
+	stiefel_refresh_fp32_cache_impl(sref);
+}
+
 // ===========================================================================
 // stiefel_reconstruct_dense — materialize W = U · diag(Σ) · V^T for parity.
 // ===========================================================================

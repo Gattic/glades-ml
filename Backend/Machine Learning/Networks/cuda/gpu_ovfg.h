@@ -30,6 +30,7 @@
 #pragma once
 
 #include "gpu_buffer.h"
+#include "gpu_stiefel.h"
 #include <cstddef>
 #include <stdint.h>
 
@@ -184,6 +185,47 @@ bool ovfg_first_moment_append(const float* L, const float* R,
                               float beta1,
                               float* L_new, float* R_new);
 
+// ========================================================================
+// ovfg_stiefel_tangent_grad — Phase 3 payoff clause.
+//
+// Produces the SAME Stiefel tangent-projected gradient triple
+// (dU, dΣ, dV) that stiefel_dense_grad_to_tangent produces for a given
+// dense dW, but taking the OVFG factored form (L, R, r) as input so
+// that dW = L · R^T is NEVER materialized.
+//
+// Closed-form derivation.  With U ∈ St(m,ρ), V ∈ St(n,ρ), Σ ∈ R^ρ and
+// dW = L · R^T:
+//
+//   Let A = U^T · L   ∈ R^{ρ × r}
+//       B = V^T · R   ∈ R^{ρ × r}
+//
+//   dU_raw = (dW · V) · diag(Σ)     = (L · B^T) · diag(Σ)
+//   dV_raw = (dW^T · U) · diag(Σ)   = (R · A^T) · diag(Σ)
+//   dΣ[i]  = diag(U^T · dW · V)[i]  = Σ_k A[i,k] · B[i,k]
+//
+// Then dU_raw and dV_raw are tangent-projected by
+// stiefel_tangent_project_grad to produce the final dU, dV in place.
+//
+// Cost: two ρ×r GEMMs (A, B) + two m×ρ and n×ρ GEMMs (dU_raw, dV_raw) +
+//   one diag kernel + two Σ column-scales + the tangent-projection step.
+// Total O(ρ r (m + n) + ρ² (m + n) + ρ r ρ)  — no m×n tensor ever formed.
+//
+// Composes multiplicatively with Stiefel (shift #7): when ρ < min(m,n)
+// and r < min(m,n), both dimensions compress, so gradient state scales
+// like (m+n)·max(ρ, r) instead of m·n.  At ρ=0.25·min(m,n) and r=T=1024
+// on pile_large this is ~17× compression vs. dense-dW Adam.
+//
+// Scratch requirement:
+//   2·ρ·r  floats (for A, B) +
+//   2·ρ·ρ  floats (scratch_rr, scratch_rr2 for tangent projection)
+// = 2·ρ·(r + ρ)  floats total, supplied in ONE packed buffer.
+// ========================================================================
+bool ovfg_stiefel_tangent_grad(const GpuStiefelWeight& s,
+                               const float* L, const float* R,
+                               unsigned int r,
+                               float* dU, float* dSigma, float* dV,
+                               float* scratch);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -209,6 +251,10 @@ inline bool ovfg_first_moment_append(const float*, const float*, unsigned int,
                                      const float*, const float*, unsigned int,
                                      unsigned int, unsigned int,
                                      float, float*, float*) { return false; }
+struct GpuStiefelWeight;
+inline bool ovfg_stiefel_tangent_grad(const GpuStiefelWeight&,
+                                      const float*, const float*, unsigned int,
+                                      float*, float*, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

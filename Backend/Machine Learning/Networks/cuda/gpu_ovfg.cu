@@ -4,6 +4,7 @@
 #include "gpu_ovfg.h"
 #include "gpu_blas.h"
 #include "gpu_device.h"
+#include "gpu_stiefel.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -125,6 +126,22 @@ __global__ void k_scaled_copy_into_columns(const float* __restrict__ src,
 	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= rows || j >= cols_src) return;
 	dst[(size_t)i * cols_out + (col_off + j)] = alpha * src[(size_t)i * cols_src + j];
+}
+
+// ========================================================================
+// Column-broadcast scale: out[i, j] = in[i, j] * sigma[j].
+// Used for dU_raw ← dU_raw · diag(Σ), same layout as Stiefel's
+// k_scale_cols_by_diag.  One 2D grid (rows × ceil(cols/block)).
+// ========================================================================
+__global__ void k_ovfg_scale_cols_by_diag(float* __restrict__ M,
+                                          const float* __restrict__ sigma,
+                                          unsigned int rows,
+                                          unsigned int cols)
+{
+	const unsigned int i = blockIdx.x;
+	const unsigned int j = blockIdx.y * blockDim.x + threadIdx.x;
+	if (i >= rows || j >= cols) return;
+	M[(size_t)i * cols + j] *= sigma[j];
 }
 
 } // anonymous namespace
@@ -346,6 +363,113 @@ bool ovfg_first_moment_append(const float* L, const float* R,
 		    R_acc, n, r_acc, /*col_off=*/r, r_total, s2, R_new);
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
+
+	return true;
+}
+
+// ========================================================================
+// ovfg_stiefel_tangent_grad — Phase 3 payoff.
+// Derivation is documented in gpu_ovfg.h.
+// ========================================================================
+bool ovfg_stiefel_tangent_grad(const GpuStiefelWeight& s,
+                               const float* L, const float* R,
+                               unsigned int r,
+                               float* dU, float* dSigma, float* dV,
+                               float* scratch)
+{
+	if (!s.allocated()) return false;
+	if (L == nullptr || R == nullptr || scratch == nullptr) return false;
+	if (dU == nullptr || dSigma == nullptr || dV == nullptr) return false;
+	if (r == 0u) return false;
+
+	// Refresh U, V FP32 cache — OVFG is an entry-point primitive like
+	// stiefel_dense_grad_to_tangent.
+	stiefel_refresh_fp32_cache(s);
+
+	const unsigned int m   = s.m;
+	const unsigned int n   = s.n;
+	const unsigned int rho = s.r;                      // Stiefel rank
+	const float* U_f32 = s.U_f32_cache.data();
+	const float* V_f32 = s.V_f32_cache.data();
+	const float* sig   = s.sigma.data();
+
+	// Scratch layout:
+	//   A           [rho × r]
+	//   B           [rho × r]
+	//   scratch_rr  [rho × rho]   (first  tangent-projection workspace)
+	//   scratch_rr2 [rho × rho]   (second tangent-projection workspace)
+	float* A           = scratch;
+	float* B           = A           + (size_t)rho * r;
+	float* scratch_rr  = B           + (size_t)rho * r;
+	float* scratch_rr2 = scratch_rr  + (size_t)rho * rho;
+
+	// (1) A = U^T · L       [rho × r]  via sgemm_rowmajor_atb (M=rho, N=r, K=m)
+	if (!sgemm_rowmajor_atb(static_cast<int>(rho), static_cast<int>(r), static_cast<int>(m),
+	                        1.0f,
+	                        U_f32, static_cast<int>(rho),
+	                        L,     static_cast<int>(r),
+	                        0.0f,
+	                        A,     static_cast<int>(r)))
+		return false;
+
+	// (2) B = V^T · R       [rho × r]
+	if (!sgemm_rowmajor_atb(static_cast<int>(rho), static_cast<int>(r), static_cast<int>(n),
+	                        1.0f,
+	                        V_f32, static_cast<int>(rho),
+	                        R,     static_cast<int>(r),
+	                        0.0f,
+	                        B,     static_cast<int>(r)))
+		return false;
+
+	// (3) dΣ[i] = Σ_k A[i,k] · B[i,k].  Reuse the row-dot kernel with
+	//     beta2 = 0 so it produces the raw dot (no EMA blend).
+	{
+		const unsigned int block = 128;
+		const unsigned int nwarps = (block + 31u) >> 5;
+		const size_t smemBytes = nwarps * sizeof(float);
+		k_ovfg_adafactor_row_update<<<rho, block, smemBytes, computeStream()>>>(
+		    A, B, rho, r, 0.0f, dSigma);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (4) dU_raw = L · B^T       [m × rho]  via sgemm_abt (M=m, N=rho, K=r).
+	if (!sgemm_rowmajor_abt(static_cast<int>(m), static_cast<int>(rho), static_cast<int>(r),
+	                        1.0f,
+	                        L, static_cast<int>(r),
+	                        B, static_cast<int>(r),
+	                        0.0f,
+	                        dU, static_cast<int>(rho)))
+		return false;
+	// dU_raw ← dU_raw · diag(Σ)   (column-broadcast scale)
+	{
+		dim3 block(64);
+		dim3 grid(m, (rho + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(
+		    dU, sig, m, rho);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (5) dV_raw = R · A^T       [n × rho]  via sgemm_abt (M=n, N=rho, K=r).
+	if (!sgemm_rowmajor_abt(static_cast<int>(n), static_cast<int>(rho), static_cast<int>(r),
+	                        1.0f,
+	                        R, static_cast<int>(r),
+	                        A, static_cast<int>(r),
+	                        0.0f,
+	                        dV, static_cast<int>(rho)))
+		return false;
+	// dV_raw ← dV_raw · diag(Σ)
+	{
+		dim3 block(64);
+		dim3 grid(n, (rho + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(
+		    dV, sig, n, rho);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (6) Finish the Stiefel tangent projection: dU, dV → proj(dU, dV).
+	// This is exactly the step that stiefel_dense_grad_to_tangent calls
+	// at its tail; reusing it guarantees byte-identical outputs.
+	stiefel_tangent_project_grad(s, dU, dV, scratch_rr, scratch_rr2);
 
 	return true;
 }

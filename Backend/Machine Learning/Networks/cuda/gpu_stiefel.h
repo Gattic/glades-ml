@@ -145,6 +145,14 @@ void stiefel_backward_unconstrained(
     unsigned int B);
 
 // ========================================================================
+// Refresh the FP32 U, V cache if stale.  Entry-point primitives in other
+// modules that consume s.U_f32_cache / s.V_f32_cache (e.g., OVFG Phase 3
+// Stiefel coupling) must call this once before the first cache read.
+// No-op if the cache is already current.
+// ========================================================================
+void stiefel_refresh_fp32_cache(const GpuStiefelWeight& s);
+
+// ========================================================================
 // Tangent-space projection of raw grad_U, grad_V onto the tangent space
 // of the Stiefel factors. Canonical metric:
 //   proj_U(G_U) = (I − U U^T) G_U + U · skew(U^T G_U)
