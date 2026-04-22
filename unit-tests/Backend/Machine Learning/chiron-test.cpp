@@ -32,6 +32,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_mpot.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_mfio.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_dfa.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_trcd.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -9411,6 +9412,11 @@ void CHIRONUnitTest()
 	CHIRONDfaL8Test();
 	CHIRONDfaMfioCompositionTest();
 	CHIRONDfaL16Test();
+	CHIRONTrcdRouteLogitsParityTest();
+	CHIRONTrcdRouteLogitsBackwardParityTest();
+	CHIRONTrcdGumbelGateEvalTest();
+	CHIRONTrcdApplyGateParityTest();
+	CHIRONTrcdLambdaPiControllerTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
@@ -11452,3 +11458,322 @@ void CHIRONProductionScaleMemoryTest()
 	std::printf("  [CHIRON prod-scale mem] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
+
+// CHIRONTrcdRouteLogitsParityTest -------------------------------------------
+// Paradigm shift #13, Phase 1: validate the per-token routing logit
+// primitive.  Reference CPU: u[t] = a · h[t, :] + b for every token t.
+void CHIRONTrcdRouteLogitsParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [trcd route-logits] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 128;
+	const unsigned int d = 512;
+	LCG rng(202604221u);
+
+	std::vector<float> h_host((size_t)T * d), a_host(d);
+	for (size_t i = 0; i < h_host.size(); ++i) h_host[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < a_host.size(); ++i) a_host[i] = 0.2f * rng.next_unit();
+	const float b = 0.17f;
+
+	std::vector<float> u_ref(T, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		float s = 0.0f;
+		for (unsigned int j = 0; j < d; ++j)
+			s += h_host[(size_t)t * d + j] * a_host[j];
+		u_ref[t] = s + b;
+	}
+
+	glades::gpu::GpuBuffer<float> d_h, d_a, d_u;
+	d_h.allocate(h_host.size()); d_h.upload(&h_host[0], h_host.size());
+	d_a.allocate(a_host.size()); d_a.upload(&a_host[0], a_host.size());
+	d_u.allocate(T);
+
+	ASSERT("trcd_route_logits call",
+	    glades::gpu::trcd_route_logits(d_h.data(), d_a.data(), b, T, d, d_u.data()));
+	glades::gpu::synchronizeCheck("trcd_route_logits");
+
+	std::vector<float> u_gpu(T);
+	d_u.download(&u_gpu[0], T);
+
+	float max_err = 0.0f;
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		float e = std::fabs(u_gpu[t] - u_ref[t]);
+		if (e > max_err) max_err = e;
+	}
+	std::printf("  [trcd route-logits parity] T=%u d=%u max_err=%.3e\n", T, d, max_err);
+	ASSERT("trcd_route_logits parity < 1e-4", max_err < 1e-4f);
+#else
+	std::printf("  [trcd route-logits] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONTrcdRouteLogitsBackwardParityTest -----------------------------------
+// Validates trcd_route_logits_backward against CPU reference.
+void CHIRONTrcdRouteLogitsBackwardParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [trcd route-logits bwd] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 64;
+	const unsigned int d = 256;
+	LCG rng(202604222u);
+
+	std::vector<float> h_host((size_t)T * d), a_host(d), dU_host(T);
+	for (size_t i = 0; i < h_host.size(); ++i) h_host[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < a_host.size(); ++i) a_host[i] = 0.25f * rng.next_unit();
+	for (size_t i = 0; i < dU_host.size(); ++i) dU_host[i] = 0.5f * rng.next_unit();
+
+	// CPU reference.
+	std::vector<float> gA_ref(d, 0.0f);
+	float gB_ref = 0.0f;
+	std::vector<float> dh_ref((size_t)T * d, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		gB_ref += dU_host[t];
+		for (unsigned int j = 0; j < d; ++j)
+		{
+			gA_ref[j] += dU_host[t] * h_host[(size_t)t * d + j];
+			dh_ref[(size_t)t * d + j] = dU_host[t] * a_host[j];
+		}
+	}
+
+	glades::gpu::GpuBuffer<float> d_h, d_a, d_dU, d_gA, d_gB, d_dh;
+	d_h.allocate(h_host.size());  d_h.upload(&h_host[0], h_host.size());
+	d_a.allocate(a_host.size());  d_a.upload(&a_host[0], a_host.size());
+	d_dU.allocate(T);             d_dU.upload(&dU_host[0], T);
+	d_gA.allocate(d);             { std::vector<float> z(d, 0.0f); d_gA.upload(&z[0], d); }
+	d_gB.allocate(1);             { float zz = 0.0f; d_gB.upload(&zz, 1); }
+	d_dh.allocate((size_t)T * d);
+
+	ASSERT("trcd_route_logits_backward call",
+	    glades::gpu::trcd_route_logits_backward(
+	        d_dU.data(), d_h.data(), d_a.data(),
+	        T, d, d_gA.data(), d_gB.data(), d_dh.data()));
+	glades::gpu::synchronizeCheck("trcd_route_logits_backward");
+
+	std::vector<float> gA_gpu(d), dh_gpu((size_t)T * d);
+	float gB_gpu = 0.0f;
+	d_gA.download(&gA_gpu[0], d);
+	d_gB.download(&gB_gpu, 1);
+	d_dh.download(&dh_gpu[0], (size_t)T * d);
+
+	float gA_err = 0.0f, dh_err = 0.0f;
+	for (unsigned int j = 0; j < d; ++j)
+	{
+		float e = std::fabs(gA_gpu[j] - gA_ref[j]);
+		if (e > gA_err) gA_err = e;
+	}
+	for (size_t i = 0; i < dh_ref.size(); ++i)
+	{
+		float e = std::fabs(dh_gpu[i] - dh_ref[i]);
+		if (e > dh_err) dh_err = e;
+	}
+	float gB_err = std::fabs(gB_gpu - gB_ref);
+	std::printf("  [trcd route-logits bwd] T=%u d=%u gA_err=%.3e gB_err=%.3e dh_err=%.3e\n",
+	            T, d, gA_err, gB_err, dh_err);
+	ASSERT("trcd_route_logits_backward gA < 1e-4", gA_err < 1e-4f);
+	ASSERT("trcd_route_logits_backward gB < 1e-4", gB_err < 1e-4f);
+	ASSERT("trcd_route_logits_backward dh < 1e-4", dh_err < 1e-4f);
+#else
+	std::printf("  [trcd route-logits bwd] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONTrcdGumbelGateEvalTest ---------------------------------------------
+// Eval-mode (training=false) gate must be deterministic: α = 1 iff u > λ.
+// Training-mode must produce α ∈ [0, 1] stochastically for each token.
+void CHIRONTrcdGumbelGateEvalTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [trcd gumbel gate] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 256;
+	LCG rng(202604223u);
+
+	std::vector<float> u_host(T);
+	for (unsigned int t = 0; t < T; ++t) u_host[t] = 2.0f * rng.next_unit();
+	const float lambda = 0.0f;
+	const float tau    = 1.0f;
+
+	glades::gpu::GpuBuffer<float> d_u, d_alpha;
+	d_u.allocate(T); d_u.upload(&u_host[0], T);
+	d_alpha.allocate(T);
+
+	// Eval: hard threshold.
+	ASSERT("trcd_gumbel_gate eval",
+	    glades::gpu::trcd_gumbel_gate(d_u.data(), lambda, tau, 0ULL, false, T, d_alpha.data()));
+	glades::gpu::synchronizeCheck("trcd_gumbel_gate eval");
+
+	std::vector<float> alpha_eval(T);
+	d_alpha.download(&alpha_eval[0], T);
+
+	int nContinue = 0;
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		float a = alpha_eval[t];
+		ASSERT("trcd gate eval ∈ {0, 1}", a == 0.0f || a == 1.0f);
+		ASSERT("trcd gate eval matches u > λ",
+		       (u_host[t] > lambda) == (a == 1.0f));
+		if (a > 0.5f) ++nContinue;
+	}
+	std::printf("  [trcd gate eval] T=%u continued=%d (~%d expected for u ~ U(-1, 1))\n",
+	            T, nContinue, (int)T / 2);
+
+	// Training: soft, ∈ [0, 1].
+	ASSERT("trcd_gumbel_gate training",
+	    glades::gpu::trcd_gumbel_gate(d_u.data(), lambda, tau, 0xDEADBEEFULL, true, T, d_alpha.data()));
+	glades::gpu::synchronizeCheck("trcd_gumbel_gate training");
+
+	std::vector<float> alpha_train(T);
+	d_alpha.download(&alpha_train[0], T);
+
+	int nSoft = 0;
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		float a = alpha_train[t];
+		ASSERT("trcd gate training ∈ [0, 1]", a >= 0.0f && a <= 1.0f);
+		if (a > 0.01f && a < 0.99f) ++nSoft;
+	}
+	std::printf("  [trcd gate training] T=%u soft (0.01<α<0.99)=%d\n", T, nSoft);
+	ASSERT("trcd gate training produces some soft values", nSoft > 10);
+#else
+	std::printf("  [trcd gumbel gate] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONTrcdApplyGateParityTest --------------------------------------------
+// Forward: h_out[t, :] = α[t] * h_in[t, :].
+// Backward: dh_in[t, :] = α[t] * dh_out[t, :]; dα[t] = h_in · dh_out.
+void CHIRONTrcdApplyGateParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [trcd apply-gate] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 96;
+	const unsigned int d = 384;
+	LCG rng(202604224u);
+
+	std::vector<float> h_host((size_t)T * d), alpha_host(T), dh_out_host((size_t)T * d);
+	for (size_t i = 0; i < h_host.size(); ++i)      h_host[i]      = 0.3f * rng.next_unit();
+	for (unsigned int t = 0; t < T; ++t)            alpha_host[t]  = 0.5f * (rng.next_unit() + 1.0f);
+	for (size_t i = 0; i < dh_out_host.size(); ++i) dh_out_host[i] = 0.4f * rng.next_unit();
+
+	// CPU reference forward and backward.
+	std::vector<float> h_out_ref((size_t)T * d), dh_in_ref((size_t)T * d), dalpha_ref(T, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float s = alpha_host[t];
+		for (unsigned int j = 0; j < d; ++j)
+		{
+			const size_t idx = (size_t)t * d + j;
+			h_out_ref[idx]  = s * h_host[idx];
+			dh_in_ref[idx]  = s * dh_out_host[idx];
+			dalpha_ref[t]  += h_host[idx] * dh_out_host[idx];
+		}
+	}
+
+	glades::gpu::GpuBuffer<float> d_h, d_alpha, d_hout, d_dhout, d_dhin, d_dalpha;
+	d_h.allocate(h_host.size());            d_h.upload(&h_host[0], h_host.size());
+	d_alpha.allocate(T);                    d_alpha.upload(&alpha_host[0], T);
+	d_hout.allocate(h_host.size());
+	d_dhout.allocate(dh_out_host.size());   d_dhout.upload(&dh_out_host[0], dh_out_host.size());
+	d_dhin.allocate(h_host.size());
+	d_dalpha.allocate(T);
+
+	ASSERT("trcd_apply_gate call",
+	    glades::gpu::trcd_apply_gate(d_h.data(), d_alpha.data(), T, d, d_hout.data()));
+	ASSERT("trcd_apply_gate_backward call",
+	    glades::gpu::trcd_apply_gate_backward(
+	        d_dhout.data(), d_h.data(), d_alpha.data(),
+	        T, d, d_dhin.data(), d_dalpha.data()));
+	glades::gpu::synchronizeCheck("trcd_apply_gate");
+
+	std::vector<float> hout_gpu((size_t)T * d), dhin_gpu((size_t)T * d), dalpha_gpu(T);
+	d_hout.download(&hout_gpu[0], hout_gpu.size());
+	d_dhin.download(&dhin_gpu[0], dhin_gpu.size());
+	d_dalpha.download(&dalpha_gpu[0], T);
+
+	float fwd_err = 0.0f, bwd_err = 0.0f, da_err = 0.0f;
+	for (size_t i = 0; i < h_out_ref.size(); ++i)
+	{
+		float e1 = std::fabs(hout_gpu[i] - h_out_ref[i]);
+		float e2 = std::fabs(dhin_gpu[i] - dh_in_ref[i]);
+		if (e1 > fwd_err) fwd_err = e1;
+		if (e2 > bwd_err) bwd_err = e2;
+	}
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		float e = std::fabs(dalpha_gpu[t] - dalpha_ref[t]);
+		if (e > da_err) da_err = e;
+	}
+	std::printf("  [trcd apply-gate] T=%u d=%u fwd_err=%.3e dh_err=%.3e dα_err=%.3e\n",
+	            T, d, fwd_err, bwd_err, da_err);
+	ASSERT("apply_gate fwd < 1e-5", fwd_err < 1e-5f);
+	ASSERT("apply_gate dh  < 1e-5", bwd_err < 1e-5f);
+	ASSERT("apply_gate dα  < 1e-4", da_err < 1e-4f);
+#else
+	std::printf("  [trcd apply-gate] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONTrcdLambdaPiControllerTest -----------------------------------------
+// PI controller on λ must drive observed mean depth to target.  We
+// simulate: λ controls a monotone ratio (higher λ → lower depth), step
+// the controller with synthetic observations, and assert the closed-loop
+// reaches budget within 100 iterations at 5% relative error.
+void CHIRONTrcdLambdaPiControllerTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	const float d_target = 12.0f;
+	const float kp = 0.10f;
+	const float ki = 0.01f;
+	float lambda = 0.0f;
+	float integral = 0.0f;
+
+	// Simulated plant: d̄_obs = clamp(L - k · λ, 1, L), with L=24 and k=1.5
+	// (i.e. each unit of λ reduces mean depth by 1.5).
+	const float L = 24.0f;
+	const float k_plant = 1.5f;
+
+	int steps = 0;
+	const int max_steps = 400;
+	for (; steps < max_steps; ++steps)
+	{
+		float d_obs = L - k_plant * lambda;
+		if (d_obs < 1.0f) d_obs = 1.0f;
+		if (d_obs > L)    d_obs = L;
+		glades::gpu::trcd_lambda_pi_update(d_obs, d_target, kp, ki, integral, lambda, L);
+
+		const float err = std::fabs(d_obs - d_target) / d_target;
+		if (err < 0.05f && steps > 20) break;
+	}
+	std::printf("  [trcd λ-PI] converged to λ=%.3f in %d steps (target d̄=%.1f, plant k=%.2f)\n",
+	            lambda, steps, d_target, k_plant);
+
+	float d_final = L - k_plant * lambda;
+	if (d_final < 1.0f) d_final = 1.0f;
+	if (d_final > L)    d_final = L;
+	const float rel_err = std::fabs(d_final - d_target) / d_target;
+	ASSERT("λ-PI converges (steps < 200)", steps < 200);
+	ASSERT("λ-PI closes within 5% of target", rel_err < 0.05f);
+	ASSERT("λ-PI stays bounded [0, L]", lambda >= 0.0f && lambda <= L);
+#else
+	std::printf("  [trcd λ-PI] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+

@@ -52,6 +52,11 @@ void CHIRONFlashShearBackwardBf16ParityTest();
 void CHIRONBf16WeightProjectionParityTest();
 void CHIRONBf16WeightBackwardParityTest();
 void CHIRONLocalAttentionFullWindowParityTest();
+void CHIRONTrcdRouteLogitsParityTest();
+void CHIRONTrcdRouteLogitsBackwardParityTest();
+void CHIRONTrcdGumbelGateEvalTest();
+void CHIRONTrcdApplyGateParityTest();
+void CHIRONTrcdLambdaPiControllerTest();
 
 // Aggregate entry point, wired into unit-tests/main.cpp.
 void CHIRONUnitTest();
