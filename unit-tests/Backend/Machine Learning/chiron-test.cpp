@@ -28,6 +28,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_stiefel.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_hrtc.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_ovfg.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -4737,12 +4738,177 @@ void CHIRONHRTCProcessPoolTest()
 #endif
 }
 
+// CHIRONOvfgFactoredGradParityTest ------------------------------------------
+// Paradigm shift #9, Phase 1: verify the factored gradient path
+//     dW = A^T · D                                         (dense reference)
+//       vs
+//     (L, R) = (A^T, D^T),  dW = L · R^T                   (OVFG factored)
+// produces bit-identical results up to SGEMM round-off.  This is the core
+// identity OVFG exploits — rank(dW) ≤ T — and its parity test is the
+// foundation everything in Phase 2+ builds on.
+void CHIRONOvfgFactoredGradParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg parity] no CUDA device — skipped\n");
+		return;
+	}
+
+	// Modest dims — we want a fast test that still exercises the full
+	// GEMM path.  T < min(m, n) so the factor (L, R) storage is strictly
+	// less than dense G_dense — this is the OVFG compression regime.
+	const unsigned int T = 64;
+	const unsigned int m = 96;
+	const unsigned int n = 128;
+
+	LCG rng(202604221u);
+	std::vector<float> A_h(T * m), D_h(T * n);
+	for (size_t i = 0; i < A_h.size(); ++i) A_h[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < D_h.size(); ++i) D_h[i] = 0.25f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_A, d_D, d_L, d_R, d_G_dense, d_G_factored;
+	d_A.allocate(T * m);  d_A.upload(&A_h[0], A_h.size());
+	d_D.allocate(T * n);  d_D.upload(&D_h[0], D_h.size());
+	d_L.allocate(m * T);
+	d_R.allocate(n * T);
+	d_G_dense.allocate(m * n);
+	d_G_factored.allocate(m * n);
+
+	// Dense reference: G_dense = A^T · D via the standard backward-path
+	// GEMM (sgemm_rowmajor_atb).  A is [T, m] → A^T is [m, T]; D is
+	// [T, n]; result [m, n] with M=m, N=n, K=T.
+	ASSERT("dense reference GEMM runs",
+	       glades::gpu::sgemm_rowmajor_atb(
+	           static_cast<int>(m), static_cast<int>(n), static_cast<int>(T),
+	           1.0f,
+	           d_A.data(), static_cast<int>(m),
+	           d_D.data(), static_cast<int>(n),
+	           0.0f,
+	           d_G_dense.data(), static_cast<int>(n)));
+
+	// OVFG path: factor then reconstruct.
+	ASSERT("ovfg_factored_grad_from_activation runs",
+	       glades::gpu::ovfg_factored_grad_from_activation(
+	           d_A.data(), d_D.data(),
+	           T, m, n,
+	           d_L.data(), d_R.data()));
+	ASSERT("ovfg_compute_dense_from_factors runs",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_L.data(), d_R.data(),
+	           m, n, T,
+	           d_G_factored.data()));
+
+	std::vector<float> G_dense(m * n), G_factored(m * n);
+	d_G_dense.download(&G_dense[0], G_dense.size());
+	d_G_factored.download(&G_factored[0], G_factored.size());
+	const float err = max_abs_diff(G_dense, G_factored);
+	std::printf("  ovfg (A^T·D) vs (A^T · D^T)^T via factored max_err = %.3e\n", err);
+	ASSERT("OVFG factored gradient parity: dense ≈ L·R^T",
+	       err < 5e-4f);  // TF32-tensor-core accumulation noise floor
+
+	// Sanity: the factor L is literally A^T, and R is literally D^T.
+	std::vector<float> L_h(m * T), R_h(n * T);
+	d_L.download(&L_h[0], L_h.size());
+	d_R.download(&R_h[0], R_h.size());
+	float L_err = 0.0f, R_err = 0.0f;
+	for (unsigned int i = 0; i < m; ++i)
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const float e = std::fabs(L_h[i * T + t] - A_h[t * m + i]);
+			if (e > L_err) L_err = e;
+		}
+	for (unsigned int j = 0; j < n; ++j)
+		for (unsigned int t = 0; t < T; ++t)
+		{
+			const float e = std::fabs(R_h[j * T + t] - D_h[t * n + j]);
+			if (e > R_err) R_err = e;
+		}
+	std::printf("  ovfg L = A^T  max_err = %.3e, R = D^T  max_err = %.3e\n",
+	            L_err, R_err);
+	ASSERT("OVFG L is bit-exact A^T transpose", L_err < 1e-7f);
+	ASSERT("OVFG R is bit-exact D^T transpose", R_err < 1e-7f);
+#else
+	std::printf("  [ovfg parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONOvfgDenseUpdateParityTest -------------------------------------------
+// Paradigm shift #9, Phase 1: verify that applying a factored update
+//     W ← W − η · L · R^T
+// via ovfg_apply_update_dense matches the naive dense path
+//     W ← W − η · G          (G = L · R^T reconstructed first)
+// within SGEMM round-off.  This is the fallback path for dense weights
+// (LayerNorm γ/β, unprojected linears) in Phase 2.
+void CHIRONOvfgDenseUpdateParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg dense-update] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int m = 64, n = 80, r = 24;
+	const float eta = 3e-4f;
+
+	LCG rng(202604222u);
+	std::vector<float> L_h(m * r), R_h(n * r), W_h(m * n);
+	for (size_t i = 0; i < L_h.size(); ++i) L_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < R_h.size(); ++i) R_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < W_h.size(); ++i) W_h[i] = 0.1f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_L, d_R, d_W_ref, d_W_ovfg, d_G;
+	d_L.allocate(m * r);  d_L.upload(&L_h[0], L_h.size());
+	d_R.allocate(n * r);  d_R.upload(&R_h[0], R_h.size());
+	d_W_ref.allocate(m * n);  d_W_ref.upload(&W_h[0], W_h.size());
+	d_W_ovfg.allocate(m * n); d_W_ovfg.upload(&W_h[0], W_h.size());
+	d_G.allocate(m * n);
+
+	// Reference: reconstruct G = L · R^T, then W -= eta · G via an axpy-GEMM.
+	// We use a single sgemm_rowmajor_abt with beta=1 to perform the same
+	// rank-r update as a proper SGEMM; this is the dense-weight baseline
+	// pre-OVFG and exactly mirrors what today's Adam path does when it
+	// has a dense G in hand.
+	ASSERT("ovfg_compute_dense_from_factors (ref path) runs",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_L.data(), d_R.data(), m, n, r, d_G.data()));
+
+	// Dense update: W -= eta · G.  Express as a GEMM so both paths use
+	// the same TF32 accumulation.  Use ABT with B = Identity (n × n)?  No,
+	// simpler to just do it by axpy semantics via a custom 1-SGEMM trick:
+	// W = W - eta · G is NOT a GEMM, so we do it on host for the reference.
+	std::vector<float> G_h(m * n);
+	d_G.download(&G_h[0], G_h.size());
+	std::vector<float> W_ref(W_h);
+	for (size_t i = 0; i < W_ref.size(); ++i)
+		W_ref[i] -= eta * G_h[i];
+
+	// OVFG fused: W -= eta · L · R^T in a single SGEMM.
+	ASSERT("ovfg_apply_update_dense runs",
+	       glades::gpu::ovfg_apply_update_dense(
+	           d_L.data(), d_R.data(), m, n, r, eta,
+	           d_W_ovfg.data()));
+
+	std::vector<float> W_ovfg(m * n);
+	d_W_ovfg.download(&W_ovfg[0], W_ovfg.size());
+	const float err = max_abs_diff(W_ref, W_ovfg);
+	std::printf("  ovfg dense-update vs host-ref max_err = %.3e\n", err);
+	ASSERT("OVFG dense-update parity with host reference",
+	       err < 5e-4f);  // TF32 tensor-core accumulation vs FP32 host
+#else
+	std::printf("  [ovfg dense-update] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONHRTCHaarRoundtripTest();
 	CHIRONHRTCHaarK4RecursiveTest();
 	CHIRONHRTCProcessPoolTest();
+	CHIRONOvfgFactoredGradParityTest();
+	CHIRONOvfgDenseUpdateParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();

@@ -16,6 +16,7 @@ set(GLADES_CUDA_SOURCES
 	gpu_chiron.cu
 	gpu_stiefel.cu
 	gpu_hrtc.cu
+	gpu_ovfg.cu
 	gpu_transformer_state.cu
 	gpu_dff_state.cu
 	gpu_rnn_state.cu

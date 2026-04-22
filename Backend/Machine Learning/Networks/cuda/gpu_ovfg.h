@@ -1,0 +1,150 @@
+// GPU primitives for Operator-Valued Factored Gradient (OVFG) — paradigm
+// shift #9.  See research/PARADIGM_SHIFT_9_CANDIDATE_C_OVFG.md for the
+// framework and research/PARADIGM_SHIFT_9_SELECTION.md for the rationale.
+//
+// Core observation: for every weight matrix W ∈ R^{m×n} in a transformer,
+// the gradient produced by one microbatch is exactly
+//     G = A^T · D,    A ∈ R^{T×m}   (input activations)
+//                     D ∈ R^{T×n}   (upstream gradient)
+// so rank(G) ≤ T.  OVFG never materializes G as a dense m×n tensor; it
+// stores the pair (A, D) and pushes that pair all the way through Adam
+// and into the weight update.
+//
+// Composes with shift #7 (Stiefel × Σ): the Stiefel tangent-space grads
+// dU, dΣ, dV can be computed directly from (A, D, U, Σ, V) factors via
+// two r×ρ GEMMs, never forming the dense dW.  Projected memory
+// compression when composed: 17× on {grad, optimizer state} at pile_large
+// 2.23 B settings (ρ=0.25, r=256).
+//
+// Composes with shift #8 (HRTC): the T axis of A and D is exactly the
+// axis HRTC compresses, so post-HRTC factor sizes are (T/k)·(m+n).
+//
+// BF16 interop: L, R factors stored BF16; reduction accumulators stay
+// FP32 (RᵀR, LᵀL, etc.) to match BF16-Adam noise floor.
+//
+// Phase 1 (this file): low-level primitive kernels — store factors,
+// append to factored moments, apply dense update as fallback.
+// Phase 2: RSVD-based rank truncation, Adafactor row/col 2nd moment.
+// Phase 3: Stiefel coupling (closed-form dU/dΣ/dV from factor pairs).
+// Phase 4: HRTC composition + end-to-end validation.
+#pragma once
+
+#include "gpu_buffer.h"
+#include <cstddef>
+#include <stdint.h>
+
+namespace shmea { class GLogger; }
+
+namespace glades {
+
+#ifdef GLADES_HAVE_CUDA
+
+namespace gpu {
+
+// ========================================================================
+// OvfgFactoredGrad
+//
+// Per-weight-matrix OVFG state on GPU.  The "dense" gradient dW ∈ R^{m×n}
+// is represented as the factored pair (L, R) with L ∈ R^{m×r}, R ∈ R^{n×r}
+// such that dW ≈ L · R^T.  Accumulation, Adam first moment, and the
+// dense-W update path all operate on (L, R) directly.
+// ========================================================================
+struct OvfgFactoredGrad
+{
+	unsigned int m;       // weight-matrix rows
+	unsigned int n;       // weight-matrix cols
+	unsigned int T;       // sequence length that produced the factors
+	unsigned int r;       // current rank of the factorization (≤ min(T,m,n))
+	unsigned int r_max;   // hard cap on rank (truncation target)
+
+	// Factored moment storage (BF16 in production; FP32 here for Phase 1
+	// parity validation — will shrink in Phase 2 after tests pass).
+	GpuBuffer<float> L;   // [m * r_max]  first-moment left factor
+	GpuBuffer<float> R;   // [n * r_max]  first-moment right factor
+
+	// Adafactor row/col for second moment — stored FP32.  Populated in
+	// Phase 2.
+	GpuBuffer<float> c;   // [m]
+	GpuBuffer<float> d;   // [n]
+
+	OvfgFactoredGrad()
+	    : m(0), n(0), T(0), r(0), r_max(0)
+	{}
+};
+
+// ========================================================================
+// ovfg_compute_dense_from_factors
+//
+// Reference / parity helper.  Reconstructs the dense gradient
+//     G = L · R^T         shape [m × n]
+// from its factored representation using cuBLAS SGEMM.
+//
+// Use for unit tests only — the whole point of OVFG is to AVOID this
+// materialization in production.
+// ========================================================================
+bool ovfg_compute_dense_from_factors(const float* L, const float* R,
+                                     unsigned int m, unsigned int n,
+                                     unsigned int r,
+                                     float* G_out);
+
+// ========================================================================
+// ovfg_factored_grad_from_activation
+//
+// Given the pre-weight activation A [T × m] and upstream gradient
+// D [T × n], produce the rank-T factored representation of the gradient
+//     G = A^T · D ∈ R^{m × n}
+// as the pair (L, R) with L = A^T ∈ R^{m × T}, R = D ∈ R^{n × T} (after
+// transpose swap).  Storage is a trivial copy + transpose — the "factoring"
+// is simply recognizing that the outer-product structure already exists
+// in the backward-pass inputs.
+//
+// The caller must have allocated L [m × T] and R [n × T].  T becomes the
+// rank of the resulting factored grad (pre-truncation).
+//
+// Row-major throughout.  Cost: two D2D copy kernels, no SGEMM.
+// ========================================================================
+bool ovfg_factored_grad_from_activation(const float* A, const float* D,
+                                        unsigned int T,
+                                        unsigned int m, unsigned int n,
+                                        float* L_out, float* R_out);
+
+// ========================================================================
+// ovfg_apply_update_dense
+//
+// Phase 1 fallback path: apply the factored Adam update to a dense weight
+// matrix W by materializing the rank-r update via one SGEMM.
+//
+//     W ← W − η · L · R^T
+//
+// For use when the weight matrix is *not* itself factored (LayerNorm γ,
+// β, residual linears).  Production path for Stiefel-factored weights
+// will skip this and go through ovfg_stiefel_tangent_grad (Phase 3).
+// ========================================================================
+bool ovfg_apply_update_dense(const float* L, const float* R,
+                             unsigned int m, unsigned int n,
+                             unsigned int r,
+                             float eta,
+                             float* W);
+
+} // namespace gpu
+
+#else // !GLADES_HAVE_CUDA
+
+struct OvfgFactoredGrad {
+	unsigned int m; unsigned int n; unsigned int T;
+	unsigned int r; unsigned int r_max;
+};
+
+inline bool ovfg_compute_dense_from_factors(const float*, const float*,
+                                            unsigned int, unsigned int,
+                                            unsigned int, float*) { return false; }
+inline bool ovfg_factored_grad_from_activation(const float*, const float*,
+                                               unsigned int, unsigned int, unsigned int,
+                                               float*, float*) { return false; }
+inline bool ovfg_apply_update_dense(const float*, const float*,
+                                    unsigned int, unsigned int, unsigned int,
+                                    float, float*) { return false; }
+
+#endif // GLADES_HAVE_CUDA
+
+} // namespace glades
