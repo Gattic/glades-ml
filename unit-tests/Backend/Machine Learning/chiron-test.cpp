@@ -4901,6 +4901,173 @@ void CHIRONOvfgDenseUpdateParityTest()
 #endif
 }
 
+// CHIRONOvfgAdafactorMomentsParityTest --------------------------------------
+// Paradigm shift #9, Phase 2: verify the factored Adafactor row/col
+// second-moment kernel matches the naive element-wise reference
+//     c_new[i] = β2 c[i] + (1-β2) Σ_j G[i,j]²
+//     d_new[j] = β2 d[j] + (1-β2) Σ_i G[i,j]²
+// where G = L · R^T is computed only as a parity reference.  The OVFG
+// path never materializes G.
+void CHIRONOvfgAdafactorMomentsParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg adafactor] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int m = 96, n = 128, r = 24;
+	const float beta2 = 0.999f;
+
+	LCG rng(202604223u);
+	std::vector<float> L_h(m * r), R_h(n * r), c_h(m, 0.0f), d_h(n, 0.0f);
+	for (size_t i = 0; i < L_h.size(); ++i) L_h[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < R_h.size(); ++i) R_h[i] = 0.3f * rng.next_unit();
+	// Seed non-zero initial moments so the β2 blend is actually exercised.
+	for (unsigned int i = 0; i < m; ++i) c_h[i] = 0.1f + 0.05f * rng.next_unit();
+	for (unsigned int j = 0; j < n; ++j) d_h[j] = 0.1f + 0.05f * rng.next_unit();
+
+	// Reconstruct G on device via the parity helper to generate the
+	// ground-truth reference on the host.
+	glades::gpu::GpuBuffer<float> d_L, d_R, d_G, d_c_ref, d_d_ref, d_c_ovfg, d_d_ovfg;
+	glades::gpu::GpuBuffer<float> d_scratch;
+	d_L.allocate(m * r);  d_L.upload(&L_h[0], L_h.size());
+	d_R.allocate(n * r);  d_R.upload(&R_h[0], R_h.size());
+	d_G.allocate(m * n);
+	d_c_ref.allocate(m);  d_c_ref.upload(&c_h[0], c_h.size());
+	d_d_ref.allocate(n);  d_d_ref.upload(&d_h[0], d_h.size());
+	d_c_ovfg.allocate(m); d_c_ovfg.upload(&c_h[0], c_h.size());
+	d_d_ovfg.allocate(n); d_d_ovfg.upload(&d_h[0], d_h.size());
+	// scratch: r*r + max(m,n)*r
+	const unsigned int scratch_sz = r * r + (m > n ? m : n) * r;
+	d_scratch.allocate(scratch_sz);
+
+	// Reference path: materialize G then compute row/col squared sums on host.
+	ASSERT("parity helper produces dense G",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_L.data(), d_R.data(), m, n, r, d_G.data()));
+	std::vector<float> G_h(m * n);
+	d_G.download(&G_h[0], G_h.size());
+	std::vector<float> c_ref(c_h), d_ref(d_h);
+	for (unsigned int i = 0; i < m; ++i)
+	{
+		float s = 0.0f;
+		for (unsigned int j = 0; j < n; ++j)
+			s += G_h[i * n + j] * G_h[i * n + j];
+		c_ref[i] = beta2 * c_ref[i] + (1.0f - beta2) * s;
+	}
+	for (unsigned int j = 0; j < n; ++j)
+	{
+		float s = 0.0f;
+		for (unsigned int i = 0; i < m; ++i)
+			s += G_h[i * n + j] * G_h[i * n + j];
+		d_ref[j] = beta2 * d_ref[j] + (1.0f - beta2) * s;
+	}
+
+	// OVFG path.
+	ASSERT("ovfg_adafactor_moments runs",
+	       glades::gpu::ovfg_adafactor_moments(
+	           d_L.data(), d_R.data(), m, n, r,
+	           beta2, d_c_ovfg.data(), d_d_ovfg.data(), d_scratch.data()));
+	std::vector<float> c_ovfg(m), d_ovfg(n);
+	d_c_ovfg.download(&c_ovfg[0], c_ovfg.size());
+	d_d_ovfg.download(&d_ovfg[0], d_ovfg.size());
+
+	const float c_err = max_abs_diff(c_ref, c_ovfg);
+	const float d_err = max_abs_diff(d_ref, d_ovfg);
+	std::printf("  ovfg adafactor c-row max_err = %.3e, d-col max_err = %.3e\n",
+	            c_err, d_err);
+	ASSERT("OVFG adafactor row-sum parity with host reference",
+	       c_err < 5e-4f);
+	ASSERT("OVFG adafactor col-sum parity with host reference",
+	       d_err < 5e-4f);
+#else
+	std::printf("  [ovfg adafactor] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONOvfgFirstMomentAppendParityTest -------------------------------------
+// Paradigm shift #9, Phase 2: verify scaled-append first-moment update
+//     L_new = [√β1 L | √(1-β1) L_acc],  R_new = [√β1 R | √(1-β1) R_acc]
+// reconstructs the correct Adam first-moment update
+//     M_new = β1 · M + (1-β1) · G_acc     (M = L R^T, G_acc = L_acc R_acc^T)
+// via the expected rank-doubling concatenation.
+void CHIRONOvfgFirstMomentAppendParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg m-append] no CUDA device — skipped\n");
+		return;
+	}
+
+	const unsigned int m = 48, n = 64, r = 8, r_acc = 12;
+	const float beta1 = 0.9f;
+	const unsigned int r_total = r + r_acc;
+
+	LCG rng(202604224u);
+	std::vector<float> L_h(m * r), R_h(n * r);
+	std::vector<float> La_h(m * r_acc), Ra_h(n * r_acc);
+	for (size_t i = 0; i < L_h.size(); ++i)  L_h[i]  = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < R_h.size(); ++i)  R_h[i]  = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < La_h.size(); ++i) La_h[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < Ra_h.size(); ++i) Ra_h[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_L, d_R, d_La, d_Ra, d_Ln, d_Rn;
+	glades::gpu::GpuBuffer<float> d_M_ref, d_M_ovfg;
+	d_L.allocate(m * r);        d_L.upload(&L_h[0], L_h.size());
+	d_R.allocate(n * r);        d_R.upload(&R_h[0], R_h.size());
+	d_La.allocate(m * r_acc);   d_La.upload(&La_h[0], La_h.size());
+	d_Ra.allocate(n * r_acc);   d_Ra.upload(&Ra_h[0], Ra_h.size());
+	d_Ln.allocate(m * r_total);
+	d_Rn.allocate(n * r_total);
+	d_M_ref.allocate(m * n);
+	d_M_ovfg.allocate(m * n);
+
+	// OVFG append path.
+	ASSERT("ovfg_first_moment_append runs",
+	       glades::gpu::ovfg_first_moment_append(
+	           d_L.data(), d_R.data(), r,
+	           d_La.data(), d_Ra.data(), r_acc,
+	           m, n, beta1,
+	           d_Ln.data(), d_Rn.data()));
+
+	// Reconstruct M_ovfg = L_new · R_new^T via the parity helper.
+	ASSERT("reconstruct M_ovfg from appended factors",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_Ln.data(), d_Rn.data(), m, n, r_total, d_M_ovfg.data()));
+
+	// Reference M_ref = β1·(L·R^T) + (1-β1)·(L_acc·R_acc^T).
+	glades::gpu::GpuBuffer<float> d_tmp;
+	d_tmp.allocate(m * n);
+	ASSERT("ref: L·R^T to tmp",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_L.data(), d_R.data(), m, n, r, d_tmp.data()));
+	// Start M_ref = β1 · tmp.  Use sgemm_rowmajor_abt with R=identity? Too
+	// much indirection.  Just download to host and do it element-wise.
+	std::vector<float> tmp_h(m * n);
+	d_tmp.download(&tmp_h[0], tmp_h.size());
+	ASSERT("ref: L_acc·R_acc^T to tmp",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_La.data(), d_Ra.data(), m, n, r_acc, d_tmp.data()));
+	std::vector<float> tmp_acc_h(m * n);
+	d_tmp.download(&tmp_acc_h[0], tmp_acc_h.size());
+	std::vector<float> M_ref(m * n);
+	for (size_t i = 0; i < M_ref.size(); ++i)
+		M_ref[i] = beta1 * tmp_h[i] + (1.0f - beta1) * tmp_acc_h[i];
+
+	std::vector<float> M_ovfg(m * n);
+	d_M_ovfg.download(&M_ovfg[0], M_ovfg.size());
+	const float err = max_abs_diff(M_ref, M_ovfg);
+	std::printf("  ovfg first-moment-append reconstruction max_err = %.3e\n", err);
+	ASSERT("OVFG first-moment-append produces β1·M + (1-β1)·G_acc",
+	       err < 5e-4f);
+#else
+	std::printf("  [ovfg m-append] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -4909,6 +5076,8 @@ void CHIRONUnitTest()
 	CHIRONHRTCProcessPoolTest();
 	CHIRONOvfgFactoredGradParityTest();
 	CHIRONOvfgDenseUpdateParityTest();
+	CHIRONOvfgAdafactorMomentsParityTest();
+	CHIRONOvfgFirstMomentAppendParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();

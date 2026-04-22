@@ -126,6 +126,64 @@ bool ovfg_apply_update_dense(const float* L, const float* R,
                              float eta,
                              float* W);
 
+// ========================================================================
+// ovfg_adafactor_moments
+//
+// Computes the Adafactor-style row/col second-moment updates from the
+// factored gradient G = L · R^T WITHOUT ever materializing G.
+//
+// Naive reference:
+//     c[i] ← β2 · c[i] + (1-β2) · Σ_j G[i,j]²
+//     d[j] ← β2 · d[j] + (1-β2) · Σ_i G[i,j]²
+//
+// Factored closed form (the OVFG payoff clause):
+//     Σ_j G[i,j]² = diag(G G^T)[i] = diag(L · (R^T R) · L^T)[i]
+//                 = Σ_k (L · S)[i,k] · L[i,k]     with S = R^T R
+//     Σ_i G[i,j]² = diag(G^T G)[j] = diag(R · (L^T L) · R^T)[j]
+//                 = Σ_k (R · P)[j,k] · R[j,k]     with P = L^T L
+//
+// Cost: 2 r×r Grams + 2 (m or n) × r SGEMMs + 2 row-dot kernels.
+//       O((m + n) r² + r³) — no m×n materialization.
+//
+// Scratch requirement: the caller must supply a scratch buffer of size
+//       max(m*r, n*r) + r*r  floats
+// to hold the intermediate L·S, R·P, and S, P tensors.  Reusing a single
+// buffer across calls is fine (kernels synchronize on computeStream()).
+// ========================================================================
+bool ovfg_adafactor_moments(const float* L, const float* R,
+                            unsigned int m, unsigned int n,
+                            unsigned int r,
+                            float beta2,
+                            float* c, float* d,
+                            float* scratch);
+
+// ========================================================================
+// ovfg_first_moment_append
+//
+// Scaled-concatenation implementation of the factored Adam first-moment
+// update:
+//     M_new = β1 · M + (1-β1) · G_acc
+// With M = L R^T and G_acc = L_acc R_acc^T, we have
+//     M_new = L_new R_new^T
+// where
+//     L_new = [√β1 · L  |  √(1-β1) · L_acc]    shape [m × (r + r_acc)]
+//     R_new = [√β1 · R  |  √(1-β1) · R_acc]    shape [n × (r + r_acc)]
+//
+// This is pure copy + scale: no SGEMM, no truncation.  Rank grows by
+// r_acc per call; Phase 2b will add an ovfg_rsvd_truncate pass to
+// re-cap the rank after append.
+//
+// The caller owns L_new and R_new storage.  r + r_acc must not exceed
+// the L_new / R_new column capacity.
+// ========================================================================
+bool ovfg_first_moment_append(const float* L, const float* R,
+                              unsigned int r,
+                              const float* L_acc, const float* R_acc,
+                              unsigned int r_acc,
+                              unsigned int m, unsigned int n,
+                              float beta1,
+                              float* L_new, float* R_new);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -144,6 +202,13 @@ inline bool ovfg_factored_grad_from_activation(const float*, const float*,
 inline bool ovfg_apply_update_dense(const float*, const float*,
                                     unsigned int, unsigned int, unsigned int,
                                     float, float*) { return false; }
+inline bool ovfg_adafactor_moments(const float*, const float*,
+                                   unsigned int, unsigned int, unsigned int,
+                                   float, float*, float*, float*) { return false; }
+inline bool ovfg_first_moment_append(const float*, const float*, unsigned int,
+                                     const float*, const float*, unsigned int,
+                                     unsigned int, unsigned int,
+                                     float, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 
