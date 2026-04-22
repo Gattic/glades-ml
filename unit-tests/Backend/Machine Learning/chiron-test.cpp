@@ -5180,6 +5180,205 @@ void CHIRONOvfgStiefelTangentGradParityTest()
 #endif
 }
 
+// CHIRONOvfgCompressionBenchmark --------------------------------------------
+// Paradigm shift #9, Phase 4a: empirical memory & throughput benchmark.
+//
+// Reports, for four representative pile_large-ish transformer layers,
+// the VRAM cost of:
+//   (a) Dense Adam state   = dW[m*n] + m[m*n] + v[m*n]
+//       at int8 Adam (shift #3) + BF16 grads (shift #4) — current best.
+//   (b) OVFG state         = L[m*r] + R[n*r] + c[m] + d[n]
+//       at BF16 factors (production target).
+// plus the compression ratio and speedup of ovfg_stiefel_tangent_grad
+// vs the dense dW materialization + stiefel_dense_grad_to_tangent path.
+//
+// Asserts the compression ratio meets the selection-doc claim of ≥ 4×
+// at r = 256 on pile_large-sized layers.
+void CHIRONOvfgCompressionBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg bench] no CUDA device — skipped\n");
+		return;
+	}
+
+	std::printf("\n  === OVFG compression benchmark ===\n");
+	std::printf("  %-24s  %6s %6s %5s  %10s %10s %9s\n",
+	            "layer", "m", "n", "r",
+	            "dense MB", "ovfg MB", "compress");
+
+	// Four representative pile_large layers at d_model = 2048 (24-layer).
+	// T = microbatch*seq = 1024 (r = T for OVFG factored form).
+	struct LayerShape { const char* name; unsigned m, n; };
+	const LayerShape layers[] = {
+	    {"attn QKV (m→3·m)",    2048u, 6144u},
+	    {"attn O (m→m)",        2048u, 2048u},
+	    {"MLP up (m→4m)",       2048u, 8192u},
+	    {"MLP down (4m→m)",     8192u, 2048u},
+	};
+	const unsigned int r = 256u;   // OVFG rank cap = T at microbatch·T for 1024
+	const int nlayers = 4;
+
+	double total_dense_mb = 0.0;
+	double total_ovfg_mb  = 0.0;
+	for (int k = 0; k < nlayers; ++k)
+	{
+		const unsigned int m = layers[k].m;
+		const unsigned int n = layers[k].n;
+
+		// Dense Adam state (the "current best": int8 m + u8 v + BF16 grad).
+		//   m_buffer  : m*n * 1 byte
+		//   v_buffer  : m*n * 1 byte
+		//   dW        : m*n * 2 bytes (BF16)
+		const double dense_bytes = double(m) * double(n) * (1.0 + 1.0 + 2.0);
+
+		// OVFG state (production: BF16 factors + FP32 scalar diagonals).
+		//   L  : m*r * 2 bytes
+		//   R  : n*r * 2 bytes
+		//   c  : m   * 4 bytes
+		//   d  : n   * 4 bytes
+		const double ovfg_bytes =
+		    double(m) * double(r) * 2.0 +
+		    double(n) * double(r) * 2.0 +
+		    double(m) * 4.0 +
+		    double(n) * 4.0;
+		const double compress = dense_bytes / ovfg_bytes;
+
+		const double dense_mb = dense_bytes / (1024.0 * 1024.0);
+		const double ovfg_mb  = ovfg_bytes  / (1024.0 * 1024.0);
+		total_dense_mb += dense_mb;
+		total_ovfg_mb  += ovfg_mb;
+		std::printf("  %-24s  %6u %6u %5u  %8.2f MB %8.2f MB %7.2fx\n",
+		            layers[k].name, m, n, r, dense_mb, ovfg_mb, compress);
+	}
+	const double total_compress = total_dense_mb / total_ovfg_mb;
+	std::printf("  %-24s  %6s %6s %5s  %8.2f MB %8.2f MB %7.2fx\n",
+	            "TOTAL (per-layer agg)", "", "", "",
+	            total_dense_mb, total_ovfg_mb, total_compress);
+
+	// Per the selection doc, at r=256 on pile_large shapes we project 6×
+	// per-layer and ~17× when composed with Stiefel.  Here we measure
+	// only the OVFG piece (no Stiefel yet).  The ≥ 4× floor is safely
+	// below the projection and accommodates the skewed MLP-down shape
+	// where r/m is smaller.
+	ASSERT("OVFG total compression ≥ 4× across representative pile_large layers",
+	       total_compress >= 4.0);
+
+	// ---- Throughput comparison: factored vs dense Stiefel tangent grad ----
+	// Use a realistic shape where the cost is measurable (small enough that
+	// even 30 iters finish quickly, large enough that the GEMMs dominate
+	// launch overhead).
+	const unsigned int m_bench = 512;
+	const unsigned int n_bench = 512;
+	const unsigned int rho_bench = 128;   // Stiefel ρ = 0.25
+	const unsigned int r_bench = 128;     // OVFG rank cap
+	const int iters = 30;
+
+	LCG rng_b(42u);
+	std::vector<float> U_b(m_bench * rho_bench), V_b(n_bench * rho_bench),
+	                   sig_b(rho_bench);
+	for (size_t i = 0; i < U_b.size(); ++i) U_b[i] = rng_b.next_unit();
+	for (size_t i = 0; i < V_b.size(); ++i) V_b[i] = rng_b.next_unit();
+	gram_schmidt_cols(U_b, m_bench, rho_bench);
+	gram_schmidt_cols(V_b, n_bench, rho_bench);
+	for (size_t i = 0; i < sig_b.size(); ++i)
+		sig_b[i] = 0.5f + std::abs(rng_b.next_unit());
+	std::vector<uint16_t> U_bf_b, V_bf_b;
+	fp32_to_bf16_rne(U_b, U_bf_b);
+	fp32_to_bf16_rne(V_b, V_bf_b);
+
+	glades::gpu::GpuStiefelWeight sw_b;
+	sw_b.allocate(m_bench, n_bench, rho_bench);
+	sw_b.U.upload(&U_bf_b[0], U_bf_b.size());
+	sw_b.V.upload(&V_bf_b[0], V_bf_b.size());
+	sw_b.sigma.upload(&sig_b[0], sig_b.size());
+
+	std::vector<float> L_b(m_bench * r_bench), R_b(n_bench * r_bench);
+	for (size_t i = 0; i < L_b.size(); ++i) L_b[i] = 0.2f * rng_b.next_unit();
+	for (size_t i = 0; i < R_b.size(); ++i) R_b[i] = 0.2f * rng_b.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_L_b, d_R_b, d_dW_b;
+	glades::gpu::GpuBuffer<float> d_dU_b, d_dS_b, d_dV_b;
+	glades::gpu::GpuBuffer<float> d_scr_mr, d_rrU, d_rrV, d_scr_ovfg;
+	d_L_b.allocate(m_bench * r_bench);  d_L_b.upload(&L_b[0], L_b.size());
+	d_R_b.allocate(n_bench * r_bench);  d_R_b.upload(&R_b[0], R_b.size());
+	d_dW_b.allocate(m_bench * n_bench);
+	d_dU_b.allocate(m_bench * rho_bench);
+	d_dS_b.allocate(rho_bench);
+	d_dV_b.allocate(n_bench * rho_bench);
+	d_scr_mr.allocate(size_t(rho_bench) * n_bench > size_t(m_bench) * rho_bench
+	                      ? size_t(rho_bench) * n_bench
+	                      : size_t(m_bench) * rho_bench);
+	d_rrU.allocate(rho_bench * rho_bench);
+	d_rrV.allocate(rho_bench * rho_bench);
+	d_scr_ovfg.allocate(2u * rho_bench * r_bench + 2u * rho_bench * rho_bench);
+
+	// Warmup.
+	for (int i = 0; i < 5; ++i)
+	{
+		glades::gpu::ovfg_compute_dense_from_factors(
+		    d_L_b.data(), d_R_b.data(), m_bench, n_bench, r_bench, d_dW_b.data());
+		glades::gpu::stiefel_dense_grad_to_tangent(
+		    sw_b, d_dW_b.data(),
+		    d_dU_b.data(), d_dS_b.data(), d_dV_b.data(),
+		    d_scr_mr.data(), d_rrU.data(), d_rrV.data());
+	}
+	cudaDeviceSynchronize();
+
+	cudaEvent_t ev0, ev1;
+	cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+
+	// Path A: dense (materialize dW + dense tangent grad).
+	cudaEventRecord(ev0);
+	for (int i = 0; i < iters; ++i)
+	{
+		glades::gpu::ovfg_compute_dense_from_factors(
+		    d_L_b.data(), d_R_b.data(), m_bench, n_bench, r_bench, d_dW_b.data());
+		glades::gpu::stiefel_dense_grad_to_tangent(
+		    sw_b, d_dW_b.data(),
+		    d_dU_b.data(), d_dS_b.data(), d_dV_b.data(),
+		    d_scr_mr.data(), d_rrU.data(), d_rrV.data());
+	}
+	cudaDeviceSynchronize();
+	cudaEventRecord(ev1);
+	cudaEventSynchronize(ev1);
+	float ms_dense = 0.0f;
+	cudaEventElapsedTime(&ms_dense, ev0, ev1);
+	ms_dense /= float(iters);
+
+	// Path B: OVFG factored.
+	for (int i = 0; i < 5; ++i)
+	{
+		glades::gpu::ovfg_stiefel_tangent_grad(
+		    sw_b, d_L_b.data(), d_R_b.data(), r_bench,
+		    d_dU_b.data(), d_dS_b.data(), d_dV_b.data(), d_scr_ovfg.data());
+	}
+	cudaDeviceSynchronize();
+	cudaEventRecord(ev0);
+	for (int i = 0; i < iters; ++i)
+	{
+		glades::gpu::ovfg_stiefel_tangent_grad(
+		    sw_b, d_L_b.data(), d_R_b.data(), r_bench,
+		    d_dU_b.data(), d_dS_b.data(), d_dV_b.data(), d_scr_ovfg.data());
+	}
+	cudaDeviceSynchronize();
+	cudaEventRecord(ev1);
+	cudaEventSynchronize(ev1);
+	float ms_ovfg = 0.0f;
+	cudaEventElapsedTime(&ms_ovfg, ev0, ev1);
+	ms_ovfg /= float(iters);
+	cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+
+	const float speedup = ms_dense / ms_ovfg;
+	std::printf("  bench [m=%u n=%u ρ=%u r=%u]: dense %.3f ms  OVFG %.3f ms  speedup=%.2fx\n",
+	            m_bench, n_bench, rho_bench, r_bench, ms_dense, ms_ovfg, speedup);
+	sw_b.release();
+#else
+	std::printf("  [ovfg bench] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -5191,6 +5390,7 @@ void CHIRONUnitTest()
 	CHIRONOvfgAdafactorMomentsParityTest();
 	CHIRONOvfgFirstMomentAppendParityTest();
 	CHIRONOvfgStiefelTangentGradParityTest();
+	CHIRONOvfgCompressionBenchmark();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
