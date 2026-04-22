@@ -9427,6 +9427,7 @@ void CHIRONUnitTest()
 	CHIRONIbgradProjectUnprojectParityTest();
 	CHIRONIbgradQrReorthogonalizeTest();
 	CHIRONIbgradEndToEndConvergenceTest();
+	CHIRONLcpIbgradCompositionTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
@@ -12496,6 +12497,253 @@ void CHIRONIbgradEndToEndConvergenceTest()
 	ASSERT("ibgrad e2e P orthonormal ≤1e-2 after Oja drift", final_ortho_err <= 1e-2f);
 #else
 	std::printf("  [ibgrad e2e] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONLcpIbgradCompositionTest --------------------------------------------
+// COMPOUND validation: LCP (paradigm #16) × IBGRAD (paradigm #19) on the
+// same model.  The 282× compound claim requires these mechanisms to not
+// interfere with each other.  This test validates the specific case of
+// both active simultaneously.
+//
+// Setup:
+//   Linear regression Y = X · W_main_tgt,  T tokens, d_in=8, d_out=8 (N=64)
+//   Forward:
+//     cluster = LSH(X)
+//     Y_rep   = X_rep · W_main      (only M reps forward)
+//     Y       = scatter(Y_rep, cluster)   (LCP cluster-pool approximation)
+//   Loss: MSE(Y, Y_tgt)
+//   Backward (respecting LCP):
+//     dY_scatter = 2 (Y − Y_tgt) / size
+//     dY_rep[m]  = sum over tokens in cluster m of dY_scatter[t]
+//     g_main     = X_rep^T · dY_rep       (rep-aware gradient, N-dim flat)
+//   IBGRAD subspace Adam on W_main:
+//     y = P^T g_main
+//     (m_sub, v_sub) Adam update
+//     θ ← θ − P · update_sub
+//   Audit every K_qr steps: refresh + QR.
+//
+// Assertions: loss decreases (ratio ≥ 2×); P stays orthonormal; no NaN.
+void CHIRONLcpIbgradCompositionTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [lcp×ibgrad] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T        = 32;
+	const unsigned int d_in     = 8;
+	const unsigned int d_out    = 8;
+	const unsigned int N        = d_in * d_out;  // 64
+	const unsigned int r_ib     = 16;            // IBGRAD subspace rank
+	const unsigned int K_hash   = 4;             // LCP LSH bits (16 buckets max)
+	const int          N_steps  = 150;
+	const int          K_qr     = 20;
+	const float        lr_adam  = 5e-2f;
+	const float        eta_oja  = 5e-3f;
+	const float        b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+
+	LCG rng(202604235u);
+	std::vector<float> X_h((size_t)T * d_in), Wtgt_h((size_t)d_in * d_out), W_h((size_t)d_in * d_out);
+	// Structured X: groups of 4 tokens share a template (LCP can cluster).
+	for (unsigned int t = 0; t < T; t += 4u) {
+		std::vector<float> tmpl(d_in);
+		for (unsigned int j = 0; j < d_in; ++j) tmpl[j] = 0.5f * rng.next_unit();
+		for (unsigned int k = 0; k < 4u && (t + k) < T; ++k)
+			for (unsigned int j = 0; j < d_in; ++j)
+				X_h[(size_t)(t + k) * d_in + j] = tmpl[j] + 0.05f * rng.next_unit();
+	}
+	for (size_t i = 0; i < Wtgt_h.size(); ++i) Wtgt_h[i] = 0.4f * rng.next_unit();
+	for (size_t i = 0; i < W_h.size();    ++i) W_h[i]    = 0.05f * rng.next_unit();
+
+	// Y_tgt = X · W_tgt (dense, per-token).
+	std::vector<float> Ytgt_h((size_t)T * d_out);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d_out; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d_in; ++k)
+				s += X_h[(size_t)t * d_in + k] * Wtgt_h[(size_t)k * d_out + j];
+			Ytgt_h[(size_t)t * d_out + j] = s;
+		}
+
+	// Allocations.
+	glades::gpu::GpuBuffer<float> d_X, d_Ytgt, d_W, d_R_lsh, d_Xrep, d_Y_rep, d_Y;
+	glades::gpu::GpuBuffer<float> d_dY, d_dY_rep, d_g, d_P, d_y_sub, d_update_sub;
+	glades::gpu::GpuBuffer<float> d_m_sub, d_v_sub;
+	glades::gpu::GpuBuffer<unsigned int> d_buckets, d_repidx, d_cluster;
+	const unsigned int M_max = T;
+	d_X.allocate((size_t)T * d_in);      d_X.upload(&X_h[0], X_h.size());
+	d_Ytgt.allocate((size_t)T * d_out);  d_Ytgt.upload(&Ytgt_h[0], Ytgt_h.size());
+	d_W.allocate(W_h.size());            d_W.upload(&W_h[0], W_h.size());
+	d_R_lsh.allocate((size_t)d_in * K_hash);
+	d_Xrep.allocate((size_t)M_max * d_in);
+	d_Y_rep.allocate((size_t)M_max * d_out);
+	d_Y.allocate((size_t)T * d_out);
+	d_dY.allocate((size_t)T * d_out);
+	d_dY_rep.allocate((size_t)M_max * d_out);
+	d_g.allocate(N);
+	d_P.allocate((size_t)N * r_ib);
+	d_y_sub.allocate(r_ib);
+	d_update_sub.allocate(r_ib);
+	d_m_sub.allocate(r_ib);
+	d_v_sub.allocate(r_ib);
+	d_buckets.allocate(T);
+	d_repidx.allocate(M_max);
+	d_cluster.allocate(T);
+	{
+		std::vector<float> z(r_ib, 0.0f);
+		d_m_sub.upload(&z[0], r_ib);
+		d_v_sub.upload(&z[0], r_ib);
+	}
+
+	// LSH once; cluster assignment fixed for this test (X doesn't change).
+	ASSERT("lsh init",
+	    glades::gpu::lcp_lsh_init_matrix(d_R_lsh.data(), d_in, K_hash, 0xBEEFULL));
+	ASSERT("lsh project",
+	    glades::gpu::lcp_lsh_project(d_X.data(), d_R_lsh.data(), T, d_in, K_hash,
+	        d_buckets.data()));
+	int n_reps = 0;
+	ASSERT("bucket first index",
+	    glades::gpu::lcp_bucket_first_index(d_buckets.data(), T, M_max,
+	        d_repidx.data(), &n_reps, d_cluster.data()));
+	ASSERT("gather reps",
+	    glades::gpu::lcp_gather(d_X.data(), d_repidx.data(),
+	        (unsigned int)n_reps, d_in, d_Xrep.data()));
+
+	// IBGRAD init.
+	ASSERT("ibgrad init", glades::gpu::ibgrad_init_projection(
+	    d_P.data(), N, r_ib, 0x1234567890ABCDEFULL));
+	ASSERT("ibgrad initial QR", glades::gpu::ibgrad_qr_reorthogonalize(
+	    d_P.data(), N, r_ib));
+
+	float loss_init = -1.0f, loss_final = 0.0f;
+
+	for (int step = 1; step <= N_steps; ++step) {
+		// Forward Y_rep = X_rep · W.
+		ASSERT("Y_rep fwd", glades::gpu::sgemm_rowmajor(
+		    (unsigned int)n_reps, d_out, d_in, 1.0f,
+		    d_Xrep.data(), d_in,
+		    d_W.data(), d_out,
+		    0.0f,
+		    d_Y_rep.data(), d_out));
+
+		// Scatter Y = cluster-scatter(Y_rep).
+		ASSERT("Y scatter", glades::gpu::lcp_scatter(
+		    d_Y_rep.data(), d_cluster.data(), T, d_out, d_Y.data()));
+
+		// Loss + dY on host.
+		std::vector<float> Y_h_now((size_t)T * d_out), dY_h((size_t)T * d_out);
+		d_Y.download(&Y_h_now[0], Y_h_now.size());
+		float loss = 0.0f;
+		const float inv_N = 1.0f / (float)Y_h_now.size();
+		for (size_t i = 0; i < Y_h_now.size(); ++i) {
+			float dv = Y_h_now[i] - Ytgt_h[i];
+			dY_h[i] = 2.0f * inv_N * dv;
+			loss  += dv * dv * inv_N;
+		}
+		if (step == 1) loss_init = loss;
+
+		d_dY.upload(&dY_h[0], dY_h.size());
+
+		// Backward: dY_rep[m, j] = sum over tokens in cluster m of dY[t, j].
+		ASSERT("dY rep accumulate",
+		    glades::gpu::lcp_scatter_backward(
+		        d_dY.data(), d_cluster.data(),
+		        T, d_out, (unsigned int)n_reps, false,
+		        d_dY_rep.data()));
+
+		// g_main = X_rep^T · dY_rep  (N-dim flat, shape [d_in × d_out]).
+		ASSERT("g_main = X_rep^T · dY_rep",
+		    glades::gpu::sgemm_rowmajor_atb(d_in, d_out, (unsigned int)n_reps, 1.0f,
+		        d_Xrep.data(), d_in,
+		        d_dY_rep.data(), d_out,
+		        0.0f,
+		        d_g.data(), d_out));
+
+		// IBGRAD: project, subspace Adam, unproject.
+		ASSERT("ibgrad project",
+		    glades::gpu::ibgrad_project(d_P.data(), d_g.data(), N, r_ib, d_y_sub.data()));
+
+		// Subspace Adam on host (r_ib=16 is tiny).
+		std::vector<float> y_h(r_ib), m_h(r_ib), v_h(r_ib), upd_h(r_ib);
+		d_y_sub.download(&y_h[0], r_ib);
+		d_m_sub.download(&m_h[0], r_ib);
+		d_v_sub.download(&v_h[0], r_ib);
+		const float bc1 = 1.0f - std::pow(b1, (float)step);
+		const float bc2 = 1.0f - std::pow(b2, (float)step);
+		for (unsigned int j = 0; j < r_ib; ++j) {
+			m_h[j] = b1 * m_h[j] + (1.0f - b1) * y_h[j];
+			v_h[j] = b2 * v_h[j] + (1.0f - b2) * y_h[j] * y_h[j];
+			const float m_hat = m_h[j] / bc1;
+			const float v_hat = v_h[j] / bc2;
+			upd_h[j] = lr_adam * m_hat / (std::sqrt(v_hat) + eps);
+		}
+		d_m_sub.upload(&m_h[0], r_ib);
+		d_v_sub.upload(&v_h[0], r_ib);
+		d_update_sub.upload(&upd_h[0], r_ib);
+
+		// Unproject: update_full = P · update_sub; θ ← θ − update_full.
+		glades::gpu::GpuBuffer<float> d_update_full;
+		d_update_full.allocate(N);
+		ASSERT("ibgrad unproject", glades::gpu::ibgrad_unproject(
+		    d_P.data(), d_update_sub.data(), N, r_ib, d_update_full.data()));
+		std::vector<float> upd_full_h(N), W_h_dev(N);
+		d_update_full.download(&upd_full_h[0], N);
+		d_W.download(&W_h_dev[0], N);
+		for (unsigned int i = 0; i < N; ++i) W_h_dev[i] -= upd_full_h[i];
+		d_W.upload(&W_h_dev[0], N);
+
+		// Oja streaming PCA.
+		ASSERT("ibgrad oja", glades::gpu::ibgrad_oja_rank1_update(
+		    d_P.data(), d_g.data(), d_y_sub.data(), N, r_ib, eta_oja));
+
+		// Phase-4 audit + QR every K_qr steps.
+		if (step % K_qr == 0) {
+			std::vector<float> g_h_now(N), y_now(r_ib);
+			d_g.download(&g_h_now[0], N);
+			d_y_sub.download(&y_now[0], r_ib);
+			double g_sq = 0.0, y_sq = 0.0;
+			for (unsigned int i = 0; i < N;    ++i) g_sq += g_h_now[i] * g_h_now[i];
+			for (unsigned int j = 0; j < r_ib; ++j) y_sq += y_now[j]   * y_now[j];
+			const double captured = (g_sq > 1e-20) ? (y_sq / g_sq) : 1.0;
+			if (captured < 0.5) {
+				ASSERT("ibgrad refresh", glades::gpu::ibgrad_refresh_first_column(
+				    d_P.data(), d_g.data(), N, r_ib));
+			}
+			ASSERT("ibgrad QR", glades::gpu::ibgrad_qr_reorthogonalize(
+			    d_P.data(), N, r_ib));
+		}
+
+		if (step == 1 || step == N_steps || step % 50 == 0) {
+			std::printf("  [lcp×ibgrad] step=%d loss=%.4e\n", step, loss);
+		}
+		if (step == N_steps) loss_final = loss;
+	}
+
+	// Post-training P orthonormal check.
+	std::vector<float> P_end((size_t)N * r_ib);
+	d_P.download(&P_end[0], P_end.size());
+	float ortho_err = 0.0f;
+	for (unsigned int j1 = 0; j1 < r_ib; ++j1) {
+		for (unsigned int j2 = 0; j2 < r_ib; ++j2) {
+			float s = 0.0f;
+			for (unsigned int i = 0; i < N; ++i)
+				s += P_end[(size_t)i * r_ib + j1] * P_end[(size_t)i * r_ib + j2];
+			float expected = (j1 == j2) ? 1.0f : 0.0f;
+			float e = std::fabs(s - expected);
+			if (e > ortho_err) ortho_err = e;
+		}
+	}
+	const float loss_ratio = loss_init / loss_final;
+	std::printf("  [lcp×ibgrad] N=%u r_ib=%u n_reps=%d: init=%.3e final=%.3e "
+	            "ratio=%.2fx ‖PᵀP − I‖=%.3e\n",
+	            N, r_ib, n_reps, loss_init, loss_final, loss_ratio, ortho_err);
+	ASSERT("lcp×ibgrad weights finite", loss_final == loss_final && loss_final < 1e6f);
+	ASSERT("lcp×ibgrad loss drops ≥ 2x",       loss_ratio >= 2.0f);
+	ASSERT("lcp×ibgrad P orthonormal ≤ 1e-3", ortho_err <= 1e-3f);
+#else
+	std::printf("  [lcp×ibgrad] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 
