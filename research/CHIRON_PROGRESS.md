@@ -9,10 +9,25 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 
 ---
 
-## MILESTONE SUMMARY (as of 2026-04-21)
+## MILESTONE SUMMARY (as of 2026-04-22)
 
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
+
+### 2026-04-22: 7× pile_large regression RESOLVED
+
+`sh run.sh bpe --large --atlas` restored to **44,134 tok/s** (was 6,441
+tok/s after eecdb97c1 regression; pre-regression baseline 44,727 tok/s).
+Within 1.3% of the Apr-4 baseline.  Root cause: the new
+`collect_token_lm_metrics` function in eecdb97c1 launched its kernel
+with `<<<1, 256>>>` — a single thread block processing all T·V = 65M
+elements serially.  Fix: route through existing parallelized
+`cross_entropy_nll_loss` + `argmax_count_matches` kernels (commit
+c93ef64fe).  A/B benchmark (pile_large, T=2048, d=1024, L=24, nH=16,
+V=32000, atlas optimizer, minibatch=20) confirms full recovery with
+zero memory/correctness cost — both replacement kernels were already in
+the codebase pre-regression.  See `memory/perf_regression_apr16.md`
+for the full root-cause analysis including nsys profile breakdown.
 
 ### The seven paradigm shifts, stacked on CHIRON
 
