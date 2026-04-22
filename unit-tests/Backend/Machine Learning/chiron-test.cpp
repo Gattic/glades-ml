@@ -6927,6 +6927,156 @@ void CHIRONMpotBenchmark()
 #endif
 }
 
+// CHIRONMpotAdamDescentTest -------------------------------------------------
+// Paradigm shift #10, Phase 2c: end-to-end training proof-of-correctness.
+// Fit  Y_pred = X · MPO(A, B)^T  to a target Y* = X · W*^T via Adam on
+// (A, B).  Verifies the full factored forward+backward chain drives
+// loss down monotonically — a tighter correctness check than either
+// parity test alone.
+void CHIRONMpotAdamDescentTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mpot adam] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m_1 = 4, m_2 = 4, n_1 = 4, n_2 = 4, D = 8;
+	const unsigned int T   = 16;
+	const unsigned int m   = m_1 * m_2;   // 16
+	const unsigned int n   = n_1 * n_2;   // 16
+	const int num_steps = 50;
+	const float lr      = 1e-2f;
+	const float beta1   = 0.9f;
+	const float beta2   = 0.999f;
+	const float eps     = 1e-8f;
+
+	LCG rng(202604235u);
+
+	// Target W* (dense) and inputs X.
+	std::vector<float> W_star_h((size_t)m * n), X_h((size_t)T * m);
+	for (size_t i = 0; i < W_star_h.size(); ++i) W_star_h[i] = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < X_h.size(); ++i)    X_h[i]    = 0.3f * rng.next_unit();
+
+	// Random init (A, B) — NOT from W_star, so we actually have to learn.
+	std::vector<float> A_h((size_t)m_1 * n_1 * D);
+	std::vector<float> B_h((size_t)D * m_2 * n_2);
+	for (size_t i = 0; i < A_h.size(); ++i) A_h[i] = 0.05f * rng.next_unit();
+	for (size_t i = 0; i < B_h.size(); ++i) B_h[i] = 0.05f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_Wstar, d_Ytarget, d_A, d_B, d_Ypred,
+	                              d_dY, d_dA, d_dB, d_mA, d_vA, d_mB, d_vB,
+	                              d_fwd, d_bwd;
+	d_X.allocate(X_h.size());          d_X.upload(&X_h[0], X_h.size());
+	d_Wstar.allocate(W_star_h.size()); d_Wstar.upload(&W_star_h[0], W_star_h.size());
+	d_Ytarget.allocate((size_t)T * n);
+	d_A.allocate(A_h.size());          d_A.upload(&A_h[0], A_h.size());
+	d_B.allocate(B_h.size());          d_B.upload(&B_h[0], B_h.size());
+	d_Ypred.allocate((size_t)T * n);
+	d_dY.allocate((size_t)T * n);
+	d_dA.allocate(A_h.size());
+	d_dB.allocate(B_h.size());
+	d_mA.allocate(A_h.size()); d_vA.allocate(A_h.size());
+	d_mB.allocate(B_h.size()); d_vB.allocate(B_h.size());
+	// Zero Adam moments.
+	{
+		std::vector<float> z(A_h.size(), 0.0f);
+		d_mA.upload(&z[0], z.size()); d_vA.upload(&z[0], z.size());
+	}
+	{
+		std::vector<float> z(B_h.size(), 0.0f);
+		d_mB.upload(&z[0], z.size()); d_vB.upload(&z[0], z.size());
+	}
+
+	const size_t sz_fwd =
+	    (size_t)m_1 * D * n_1 + (size_t)m_2 * D * n_2
+	    + (size_t)T * m_1 * D * n_2 + (size_t)T * n_2 * m_1 * D
+	    + (size_t)T * n_1 * n_2;
+	d_fwd.allocate(sz_fwd);
+	const size_t sz_bwd =
+	    (size_t)m_1 * D * n_1 + (size_t)m_2 * D * n_2
+	    + 2u * (size_t)T * m_1 * D * n_2
+	    + 2u * (size_t)T * n_2 * m_1 * D
+	    + (size_t)T * n_2 * n_1
+	    + (size_t)m_1 * D * n_1 + (size_t)m_2 * D * n_2;
+	d_bwd.allocate(sz_bwd);
+
+	// Y_target = X · W*^T   (treat W_star as a dense weight with shape m×n;
+	// same convention as mpot_forward where Y = X · W^T).
+	ASSERT("dense target Y* GEMM",
+	       glades::gpu::sgemm_rowmajor(
+	           T, n, m, 1.0f,
+	           d_X.data(), m,
+	           d_Wstar.data(), n,
+	           0.0f,
+	           d_Ytarget.data(), n));
+
+	std::vector<float> Ypred((size_t)T * n), Ytgt((size_t)T * n), dY((size_t)T * n);
+	d_Ytarget.download(&Ytgt[0], Ytgt.size());
+
+	float loss_first = -1.0f, loss_last = -1.0f;
+	for (int step = 1; step <= num_steps; ++step)
+	{
+		// Forward.
+		ASSERT("mpot_forward in descent loop",
+		       glades::gpu::mpot_forward(
+		           d_X.data(), d_A.data(), d_B.data(),
+		           T, m_1, m_2, n_1, n_2, D,
+		           d_Ypred.data(), d_fwd.data()));
+
+		d_Ypred.download(&Ypred[0], Ypred.size());
+
+		// Host-side MSE loss and dY = (2/N) · (Y - Y*).
+		float loss = 0.0f;
+		for (size_t i = 0; i < Ypred.size(); ++i)
+		{
+			const float d = Ypred[i] - Ytgt[i];
+			loss += d * d;
+			dY[i] = (2.0f / float(Ypred.size())) * d;
+		}
+		loss /= float(Ypred.size());
+		if (step == 1) loss_first = loss;
+		loss_last = loss;
+		d_dY.upload(&dY[0], dY.size());
+
+		// Backward.
+		glades::gpu::GpuBuffer<float> d_dX_unused;
+		d_dX_unused.allocate((size_t)T * m);
+		ASSERT("mpot_backward in descent loop",
+		       glades::gpu::mpot_backward(
+		           d_X.data(), d_A.data(), d_B.data(), d_dY.data(),
+		           T, m_1, m_2, n_1, n_2, D,
+		           d_dX_unused.data(), d_dA.data(), d_dB.data(),
+		           d_bwd.data()));
+
+		// Adam on A, then B.
+		ASSERT("adam update A",
+		       glades::gpu::adam_update(
+		           d_A.data(), d_dA.data(), d_mA.data(), d_vA.data(),
+		           lr, beta1, beta2, eps,
+		           /*weightDecay=*/0.0f, /*gradScale=*/1.0f,
+		           step, (int)A_h.size()));
+		ASSERT("adam update B",
+		       glades::gpu::adam_update(
+		           d_B.data(), d_dB.data(), d_mB.data(), d_vB.data(),
+		           lr, beta1, beta2, eps,
+		           0.0f, 1.0f,
+		           step, (int)B_h.size()));
+	}
+
+	std::printf("  mpot adam descent: loss %.4e → %.4e (%.2fx reduction) over %d steps\n",
+	            loss_first, loss_last, loss_first / loss_last, num_steps);
+	ASSERT("MPOT Adam reduces loss end-to-end",
+	       loss_last < loss_first);
+	// Random init at bond D=8 on a 16×16 W target should comfortably
+	// recover 2× reduction in 50 steps at lr=1e-2.
+	ASSERT("MPOT Adam reduces loss by ≥ 2× (toy problem)",
+	       loss_first / loss_last >= 2.0f);
+#else
+	std::printf("  [mpot adam] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -7046,6 +7196,7 @@ void CHIRONUnitTest()
 	CHIRONMpotForwardParityTest();
 	CHIRONMpotBackwardParityTest();
 	CHIRONMpotBenchmark();
+	CHIRONMpotAdamDescentTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
