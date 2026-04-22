@@ -6788,6 +6788,145 @@ void CHIRONMpotBackwardParityTest()
 #endif
 }
 
+// CHIRONMpotBenchmark --------------------------------------------------------
+// Paradigm shift #10 benchmark — measures
+//   (a) WEIGHT STORAGE compression:  MPO (A, B) size vs dense W size
+//       at several bond dims D.  This is the headline memory-savings
+//       claim.  Expected: ~32× at (1024×1024, D=16); ~65× at (2048×2048, D=16).
+//   (b) FORWARD THROUGHPUT:  mpot_forward vs dense sgemm_rowmajor for
+//       Y = X · W^T.  Includes the 3 permutation kernels and 2 cuBLAS
+//       GEMMs of the factored path.  Reports honest ms/iter + ratio.
+//
+// Asserts compression ≥ 32× at the (1024×1024, D=16) shape (the
+// design-doc projection); speed is reported without assertion because
+// it depends strongly on the permutation kernel launch overhead at
+// each problem size.
+void CHIRONMpotBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mpot bench] no CUDA device — skipped\n");
+		return;
+	}
+	std::printf("\n  === MPOT memory + forward-throughput benchmark ===\n");
+	std::printf("  %-8s %-8s %-5s %-4s  %10s %10s %7s  %8s %8s %7s\n",
+	            "m", "n", "T", "D",
+	            "dense MB", "mpo MB", "mem×",
+	            "dense ms", "mpo ms", "speed×");
+
+	struct Shape { unsigned m; unsigned n; unsigned T; unsigned D;
+	               unsigned m1, m2, n1, n2; };
+	// Representative transformer-layer shapes.  m_l, n_l are chosen so
+	// that m_1·m_2 = m and n_1·n_2 = n and each factor is close to √m,
+	// √n (balanced factoring for best GEMM shapes).
+	const Shape shapes[] = {
+	    //  m      n      T    D    m1 m2   n1 n2
+	    {  512,  512,  128,  8,   16, 32,  16, 32},
+	    { 1024, 1024,  256,  8,   32, 32,  32, 32},
+	    { 1024, 1024,  256, 16,   32, 32,  32, 32},
+	    { 2048, 2048,  256, 16,   32, 64,  32, 64},
+	};
+
+	const int iters = 10;
+	for (int k = 0; k < 4; ++k)
+	{
+		const unsigned m   = shapes[k].m;
+		const unsigned n   = shapes[k].n;
+		const unsigned T   = shapes[k].T;
+		const unsigned D   = shapes[k].D;
+		const unsigned m_1 = shapes[k].m1, m_2 = shapes[k].m2;
+		const unsigned n_1 = shapes[k].n1, n_2 = shapes[k].n2;
+
+		LCG rng(42u + k);
+		std::vector<float> X_h((size_t)T * m);
+		std::vector<float> A_h((size_t)m_1 * n_1 * D);
+		std::vector<float> B_h((size_t)D * m_2 * n_2);
+		std::vector<float> W_h((size_t)m * n);
+		for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.1f * rng.next_unit();
+		for (size_t i = 0; i < A_h.size(); ++i) A_h[i] = 0.1f * rng.next_unit();
+		for (size_t i = 0; i < B_h.size(); ++i) B_h[i] = 0.1f * rng.next_unit();
+		for (size_t i = 0; i < W_h.size(); ++i) W_h[i] = 0.1f * rng.next_unit();
+
+		glades::gpu::GpuBuffer<float> d_X, d_A, d_B, d_W, d_Y_dense,
+		                              d_Y_mpo, d_scratch;
+		d_X.allocate(X_h.size());   d_X.upload(&X_h[0], X_h.size());
+		d_A.allocate(A_h.size());   d_A.upload(&A_h[0], A_h.size());
+		d_B.allocate(B_h.size());   d_B.upload(&B_h[0], B_h.size());
+		d_W.allocate(W_h.size());   d_W.upload(&W_h[0], W_h.size());
+		d_Y_dense.allocate((size_t)T * n);
+		d_Y_mpo.allocate((size_t)T * n);
+		const size_t sz_scratch =
+		    (size_t)m_1 * D * n_1 + (size_t)m_2 * D * n_2
+		    + (size_t)T * m_1 * D * n_2 * 2u
+		    + (size_t)T * n_1 * n_2;
+		d_scratch.allocate(sz_scratch);
+
+		// Warmup.
+		for (int i = 0; i < 3; ++i)
+		{
+			glades::gpu::sgemm_rowmajor(T, n, m, 1.0f,
+			                            d_X.data(), m,
+			                            d_W.data(), n,
+			                            0.0f,
+			                            d_Y_dense.data(), n);
+			glades::gpu::mpot_forward(d_X.data(), d_A.data(), d_B.data(),
+			                          T, m_1, m_2, n_1, n_2, D,
+			                          d_Y_mpo.data(), d_scratch.data());
+		}
+		cudaDeviceSynchronize();
+
+		cudaEvent_t ev0, ev1;
+		cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+
+		// Dense timing.
+		cudaEventRecord(ev0);
+		for (int i = 0; i < iters; ++i)
+			glades::gpu::sgemm_rowmajor(T, n, m, 1.0f,
+			                            d_X.data(), m,
+			                            d_W.data(), n,
+			                            0.0f,
+			                            d_Y_dense.data(), n);
+		cudaDeviceSynchronize();
+		cudaEventRecord(ev1);
+		cudaEventSynchronize(ev1);
+		float ms_dense = 0.0f;
+		cudaEventElapsedTime(&ms_dense, ev0, ev1);
+		ms_dense /= float(iters);
+
+		// MPOT timing.
+		cudaEventRecord(ev0);
+		for (int i = 0; i < iters; ++i)
+			glades::gpu::mpot_forward(d_X.data(), d_A.data(), d_B.data(),
+			                          T, m_1, m_2, n_1, n_2, D,
+			                          d_Y_mpo.data(), d_scratch.data());
+		cudaDeviceSynchronize();
+		cudaEventRecord(ev1);
+		cudaEventSynchronize(ev1);
+		float ms_mpo = 0.0f;
+		cudaEventElapsedTime(&ms_mpo, ev0, ev1);
+		ms_mpo /= float(iters);
+		cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+
+		const double mb_dense = double(m) * double(n) * 4.0 / 1048576.0;
+		const double mb_mpo   = (double(m_1) * n_1 * D + double(D) * m_2 * n_2) * 4.0 / 1048576.0;
+		const double mem_ratio = mb_dense / mb_mpo;
+		const double speed_ratio = ms_dense / ms_mpo;
+		std::printf("  %-8u %-8u %-5u %-4u  %7.2fMB %7.2fMB %6.2fx  %7.3fms %7.3fms %5.2fx\n",
+		            m, n, T, D, mb_dense, mb_mpo, mem_ratio,
+		            ms_dense, ms_mpo, speed_ratio);
+
+		if (m == 1024 && n == 1024 && D == 16)
+		{
+			ASSERT("MPOT weight compression ≥ 32× at (1024×1024, D=16)",
+			       mem_ratio >= 32.0);
+		}
+	}
+#else
+	std::printf("  [mpot bench] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -6906,6 +7045,7 @@ void CHIRONUnitTest()
 	CHIRONMpotInitFromDenseParityTest();
 	CHIRONMpotForwardParityTest();
 	CHIRONMpotBackwardParityTest();
+	CHIRONMpotBenchmark();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
