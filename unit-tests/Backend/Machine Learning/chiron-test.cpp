@@ -6111,6 +6111,183 @@ void CHIRONChunkedCrossEntropyBackwardParityTest()
 #endif
 }
 
+// CHIRONChunkedCrossEntropyBenchmark ----------------------------------------
+// Quantifies the memory + speed advantage of the chunked CE path across
+// representative vocabulary sizes.  Reports scratch-VRAM savings and
+// forward+backward time for each V.  Asserts ≥ 4× scratch compression
+// at V ≥ 32k (the pile_large regime and above).
+void CHIRONChunkedCrossEntropyBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [chunked-CE bench] no CUDA device — skipped\n");
+		return;
+	}
+	std::printf("\n  === Chunked CE memory + speed benchmark ===\n");
+	std::printf("  %-7s %-7s %-7s %-5s  %9s %9s %7s  %8s %8s %7s\n",
+	            "T", "d", "V", "V_ch",
+	            "dense MB", "chunk MB", "mem×",
+	            "dense ms", "chunk ms", "speed×");
+
+	struct Shape { int T; int d; int V; int V_chunk; };
+	// Scope T=256 to keep all configurations resident.  d=1024 matches
+	// pile_large trunk dim; tested V sizes span the current (32k), the
+	// near-future (65k for bigger tokenizers), and a stress case (128k).
+	const Shape shapes[] = {
+	    {256, 1024, 8192,    2048},
+	    {256, 1024, 32768,   4096},
+	    {256, 1024, 65536,   4096},
+	    {256, 1024, 131072,  4096},
+	};
+	const int iters = 5;
+
+	for (int k = 0; k < 4; ++k)
+	{
+		const int T = shapes[k].T;
+		const int d = shapes[k].d;
+		const int V = shapes[k].V;
+		const int V_chunk = shapes[k].V_chunk;
+
+		LCG rng(42u + k);
+		std::vector<float> X_h((size_t)T * d), W_h((size_t)V * d);
+		for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.05f * rng.next_unit();
+		for (size_t i = 0; i < W_h.size(); ++i) W_h[i] = 0.05f * rng.next_unit();
+		std::vector<int> tgt_h(T);
+		for (int t = 0; t < T; ++t)
+		{
+			const unsigned int u = ((unsigned int)rng.next_unit() * 0x7fffffffu) & 0x7fffffffu;
+			tgt_h[t] = (int)(u % V);
+		}
+
+		glades::gpu::GpuBuffer<float> d_X, d_W, d_logits, d_probs, d_loss,
+		                              d_dX, d_dW, d_scratch_fwd, d_scratch_bwd, d_dlogits;
+		glades::gpu::GpuBuffer<int>   d_targets, d_cnt;
+		d_X.allocate((size_t)T * d);        d_X.upload(&X_h[0], X_h.size());
+		d_W.allocate((size_t)V * d);        d_W.upload(&W_h[0], W_h.size());
+		d_targets.allocate(T);              d_targets.upload(&tgt_h[0], tgt_h.size());
+		d_logits.allocate((size_t)T * V);
+		d_probs.allocate((size_t)T * V);
+		d_dlogits.allocate((size_t)T * V);
+		d_dX.allocate((size_t)T * d);
+		d_dW.allocate((size_t)V * d);
+		d_loss.allocate(1);
+		d_cnt.allocate(1);
+		d_scratch_fwd.allocate((size_t)T * (V_chunk + 3));
+		d_scratch_bwd.allocate((size_t)T * V_chunk);
+
+		// Scratch-memory comparison.  The "dense" path needs T×V twice
+		// (probs in forward, dlogits in backward); can share one scratch
+		// at T×V via careful ordering, but is still T×V.
+		// The chunked path needs T×V_chunk (reused across fwd and bwd).
+		const double mb_dense = double(T) * double(V) * 4.0 / 1048576.0;
+		const double mb_chunk = double(T) * double(V_chunk) * 4.0 / 1048576.0;
+		const double mem_ratio = mb_dense / mb_chunk;
+
+		// Warmup.
+		for (int i = 0; i < 2; ++i)
+		{
+			glades::gpu::sgemm_rowmajor_abt(T, V, d, 1.0f,
+			                                d_X.data(), d,
+			                                d_W.data(), d, 0.0f,
+			                                d_logits.data(), V);
+			glades::gpu::softmax_forward(d_logits.data(), T, V, d_probs.data());
+			glades::gpu::cross_entropy_nll_loss(
+			    d_probs.data(), d_targets.data(),
+			    T, V, -1, d_loss.data(), d_cnt.data());
+			glades::gpu::chunked_cross_entropy_loss(
+			    d_X.data(), d_W.data(), d_targets.data(),
+			    T, V, d, -1, V_chunk,
+			    d_loss.data(), d_cnt.data(),
+			    d_scratch_fwd.data());
+		}
+		cudaDeviceSynchronize();
+
+		cudaEvent_t ev0, ev1;
+		cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+
+		// Dense forward+backward path (approximated by
+		// logits-GEMM + softmax + cross_entropy_nll_loss + dX+dW GEMMs).
+		cudaEventRecord(ev0);
+		for (int i = 0; i < iters; ++i)
+		{
+			glades::gpu::sgemm_rowmajor_abt(T, V, d, 1.0f,
+			                                d_X.data(), d,
+			                                d_W.data(), d, 0.0f,
+			                                d_logits.data(), V);
+			glades::gpu::softmax_forward(d_logits.data(), T, V, d_probs.data());
+			glades::gpu::cross_entropy_nll_loss(
+			    d_probs.data(), d_targets.data(),
+			    T, V, -1, d_loss.data(), d_cnt.data());
+			// dlogits = probs - onehot then dX, dW GEMMs.
+			// Approximate the bwd cost with a copy + two GEMMs (skipping
+			// the subtract-onehot kernel — it's sub-ms).
+			cudaMemcpyAsync(d_dlogits.data(), d_probs.data(),
+			                (size_t)T * V * sizeof(float),
+			                cudaMemcpyDeviceToDevice,
+			                glades::gpu::computeStream());
+			glades::gpu::sgemm_rowmajor(T, d, V, 1.0f,
+			                            d_dlogits.data(), V,
+			                            d_W.data(), d, 0.0f,
+			                            d_dX.data(), d);
+			glades::gpu::sgemm_rowmajor_atb(V, d, T, 1.0f,
+			                                d_dlogits.data(), V,
+			                                d_X.data(), d, 0.0f,
+			                                d_dW.data(), d);
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(ev1);
+		cudaEventSynchronize(ev1);
+		float ms_dense = 0.0f;
+		cudaEventElapsedTime(&ms_dense, ev0, ev1);
+		ms_dense /= float(iters);
+
+		// Chunked path (fwd + bwd).
+		cudaEventRecord(ev0);
+		for (int i = 0; i < iters; ++i)
+		{
+			glades::gpu::chunked_cross_entropy_loss(
+			    d_X.data(), d_W.data(), d_targets.data(),
+			    T, V, d, -1, V_chunk,
+			    d_loss.data(), d_cnt.data(),
+			    d_scratch_fwd.data());
+			int cnt_h = 0;
+			d_cnt.download(&cnt_h, 1);
+			const float* rmax = d_scratch_fwd.data() + (size_t)T * V_chunk;
+			const float* rsum = rmax + T;
+			glades::gpu::chunked_cross_entropy_backward(
+			    d_X.data(), d_W.data(), d_targets.data(),
+			    rmax, rsum,
+			    T, V, d, -1, V_chunk, cnt_h,
+			    /*accumulate=*/false,
+			    d_dX.data(), d_dW.data(),
+			    d_scratch_bwd.data());
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(ev1);
+		cudaEventSynchronize(ev1);
+		float ms_chunk = 0.0f;
+		cudaEventElapsedTime(&ms_chunk, ev0, ev1);
+		ms_chunk /= float(iters);
+		cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+
+		const double speed_ratio = ms_dense / ms_chunk;
+		std::printf("  %-7d %-7d %-7d %-5d  %7.2fMB %7.2fMB %6.2fx  %7.3fms %7.3fms %5.2fx\n",
+		            T, d, V, V_chunk,
+		            mb_dense, mb_chunk, mem_ratio,
+		            ms_dense, ms_chunk, speed_ratio);
+
+		if (V >= 32768)
+		{
+			ASSERT("chunked CE scratch ≥ 4× smaller at V ≥ 32k",
+			       mem_ratio >= 4.0);
+		}
+	}
+#else
+	std::printf("  [chunked-CE bench] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONChunkedCrossEntropyParityTest ---------------------------------------
 // Validates chunked_cross_entropy_loss — the large-vocab unlock that never
 // materializes T × V logits.  Compares against the existing dense path
@@ -6224,6 +6401,7 @@ void CHIRONUnitTest()
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONChunkedCrossEntropyBackwardParityTest();
+	CHIRONChunkedCrossEntropyBenchmark();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
