@@ -8,6 +8,7 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
 #include <cmath>
 #include <cstdio>
 
@@ -50,6 +51,36 @@ __global__ void k_ibgrad_init(float* __restrict__ P,
 
 	P[i0] = z0;
 	if (i0 + 1 < n_elems) P[i0 + 1] = z1;
+}
+
+// ------------------------------------------------------------------------
+// Row-major [N × r]  →  column-major [N × r]  (same as row-major [r × N]
+// read as column-major [N × r]).  We need this for cuSOLVER which expects
+// column-major input.
+// ------------------------------------------------------------------------
+__global__ void k_transpose_rowmajor_to_colmajor(const float* __restrict__ in,
+                                                 float* __restrict__ out,
+                                                 int rows, int cols)
+{
+	const int j = blockIdx.x * blockDim.x + threadIdx.x;  // col (0..cols)
+	const int i = blockIdx.y * blockDim.y + threadIdx.y;  // row (0..rows)
+	if (i >= rows || j >= cols) return;
+	// Row-major in: in[i, j] = in[i*cols + j]
+	// Column-major out of shape [rows × cols]: out[i + j*rows]
+	out[i + (size_t)j * rows] = in[(size_t)i * cols + j];
+}
+
+// ------------------------------------------------------------------------
+// Reverse transpose: column-major [N × r]  →  row-major [N × r].
+// ------------------------------------------------------------------------
+__global__ void k_transpose_colmajor_to_rowmajor(const float* __restrict__ in,
+                                                 float* __restrict__ out,
+                                                 int rows, int cols)
+{
+	const int j = blockIdx.x * blockDim.x + threadIdx.x;
+	const int i = blockIdx.y * blockDim.y + threadIdx.y;
+	if (i >= rows || j >= cols) return;
+	out[(size_t)i * cols + j] = in[i + (size_t)j * rows];
 }
 
 // ------------------------------------------------------------------------
@@ -133,6 +164,111 @@ bool ibgrad_oja_rank1_update(float* P_inout,
 	k_ibgrad_rank1_update<<<(int)N, block, 0, computeStream()>>>(
 	    P_inout, g, y, (int)N, (int)r, eta);
 	return cudaGetLastError() == cudaSuccess;
+}
+
+// ------------------------------------------------------------------------
+// QR reorthogonalization via cuSOLVER (one-shot handle, cached scratch).
+// ------------------------------------------------------------------------
+namespace {
+static cusolverDnHandle_t g_ibgradSolver = nullptr;
+static bool g_ibgradSolverReady = false;
+static float* g_ibgradQrWork = nullptr;
+static size_t g_ibgradQrWorkCap = 0;
+static int*   g_ibgradInfo = nullptr;
+static float* g_ibgradColScratch = nullptr;
+static size_t g_ibgradColScratchCap = 0;
+static float* g_ibgradTau = nullptr;
+static size_t g_ibgradTauCap = 0;
+
+static bool ibgrad_solver_init()
+{
+	if (!g_ibgradSolverReady) {
+		if (cusolverDnCreate(&g_ibgradSolver) != CUSOLVER_STATUS_SUCCESS) return false;
+		g_ibgradSolverReady = true;
+	}
+	cusolverDnSetStream(g_ibgradSolver, computeStream());
+	if (g_ibgradInfo == nullptr) {
+		if (cudaMalloc(&g_ibgradInfo, sizeof(int)) != cudaSuccess) return false;
+	}
+	return true;
+}
+} // anonymous
+
+bool ibgrad_qr_reorthogonalize(float* P_inout, unsigned int N, unsigned int r)
+{
+	if (P_inout == nullptr) return false;
+	if (N == 0u || r == 0u || r > N) return false;
+	if (!ibgrad_solver_init()) return false;
+
+	const size_t sz = (size_t)N * r;
+
+	// Scratch for column-major P.
+	if (sz > g_ibgradColScratchCap) {
+		if (g_ibgradColScratch) cudaFree(g_ibgradColScratch);
+		if (cudaMalloc(&g_ibgradColScratch, sz * sizeof(float)) != cudaSuccess) return false;
+		g_ibgradColScratchCap = sz;
+	}
+	if ((size_t)r > g_ibgradTauCap) {
+		if (g_ibgradTau) cudaFree(g_ibgradTau);
+		if (cudaMalloc(&g_ibgradTau, r * sizeof(float)) != cudaSuccess) return false;
+		g_ibgradTauCap = r;
+	}
+
+	// 1. Row-major → column-major.
+	{
+		dim3 block(16, 16);
+		dim3 grid((r + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+		k_transpose_rowmajor_to_colmajor<<<grid, block, 0, computeStream()>>>(
+		    P_inout, g_ibgradColScratch, (int)N, (int)r);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// 2. Query + allocate workspace.
+	int lwork_geqrf = 0, lwork_orgqr = 0;
+	if (cusolverDnSgeqrf_bufferSize(g_ibgradSolver, N, r,
+	                                g_ibgradColScratch, N, &lwork_geqrf)
+	    != CUSOLVER_STATUS_SUCCESS) return false;
+	if (cusolverDnSorgqr_bufferSize(g_ibgradSolver, N, r, r,
+	                                g_ibgradColScratch, N, g_ibgradTau, &lwork_orgqr)
+	    != CUSOLVER_STATUS_SUCCESS) return false;
+	const int lwork = (lwork_geqrf > lwork_orgqr) ? lwork_geqrf : lwork_orgqr;
+	if ((size_t)lwork > g_ibgradQrWorkCap) {
+		if (g_ibgradQrWork) cudaFree(g_ibgradQrWork);
+		if (cudaMalloc(&g_ibgradQrWork, lwork * sizeof(float)) != cudaSuccess) return false;
+		g_ibgradQrWorkCap = lwork;
+	}
+
+	// 3. sgeqrf.
+	if (cusolverDnSgeqrf(g_ibgradSolver, N, r, g_ibgradColScratch, N, g_ibgradTau,
+	                     g_ibgradQrWork, lwork, g_ibgradInfo)
+	    != CUSOLVER_STATUS_SUCCESS) return false;
+	int host_info = 0;
+	cudaMemcpy(&host_info, g_ibgradInfo, sizeof(int), cudaMemcpyDeviceToHost);
+	if (host_info != 0) {
+		fprintf(stderr, "[ibgrad-qr] sgeqrf info=%d N=%u r=%u\n", host_info, N, r);
+		return false;
+	}
+
+	// 4. Form Q explicitly via sorgqr.
+	if (cusolverDnSorgqr(g_ibgradSolver, N, r, r, g_ibgradColScratch, N, g_ibgradTau,
+	                     g_ibgradQrWork, lwork, g_ibgradInfo)
+	    != CUSOLVER_STATUS_SUCCESS) return false;
+	cudaMemcpy(&host_info, g_ibgradInfo, sizeof(int), cudaMemcpyDeviceToHost);
+	if (host_info != 0) {
+		fprintf(stderr, "[ibgrad-qr] sorgqr info=%d N=%u r=%u\n", host_info, N, r);
+		return false;
+	}
+
+	// 5. Column-major → row-major back into P.
+	{
+		dim3 block(16, 16);
+		dim3 grid((r + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+		k_transpose_colmajor_to_rowmajor<<<grid, block, 0, computeStream()>>>(
+		    g_ibgradColScratch, P_inout, (int)N, (int)r);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	return true;
 }
 
 } // namespace gpu

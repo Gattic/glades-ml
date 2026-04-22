@@ -91,6 +91,19 @@ bool ibgrad_oja_rank1_update(float* P_inout,
                              unsigned int N, unsigned int r,
                              float eta);
 
+// ========================================================================
+// ibgrad_qr_reorthogonalize — in-place thin QR of P, replacing P with its
+// Q factor.  Call every K=100-200 Oja updates to cancel the drift that
+// the correction-free Oja rule accumulates.
+//
+//   P_inout    [N × r]         row-major; overwritten by Q (orthonormal columns)
+//   N, r       dimensions      r ≤ N
+//
+// Uses cuSOLVER sgeqrf + sorgqr via a scratch column-major transpose.
+// ========================================================================
+bool ibgrad_qr_reorthogonalize(float* P_inout,
+                               unsigned int N, unsigned int r);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -103,6 +116,7 @@ inline bool ibgrad_unproject(const float*, const float*,
                              unsigned int, unsigned int, float*) { return false; }
 inline bool ibgrad_oja_rank1_update(float*, const float*, const float*,
                                     unsigned int, unsigned int, float) { return false; }
+inline bool ibgrad_qr_reorthogonalize(float*, unsigned int, unsigned int) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

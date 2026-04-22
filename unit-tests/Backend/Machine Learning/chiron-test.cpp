@@ -9425,6 +9425,7 @@ void CHIRONUnitTest()
 	CHIRONLcpEndToEndDetailCorrectionTest();
 	CHIRONLcpRoutingThroughputBenchmark();
 	CHIRONIbgradProjectUnprojectParityTest();
+	CHIRONIbgradQrReorthogonalizeTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
@@ -12169,6 +12170,90 @@ void CHIRONIbgradProjectUnprojectParityTest()
 	ASSERT("one Oja step grows ‖Pᵀg‖²", norm_after > norm_before);
 #else
 	std::printf("  [ibgrad project] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONIbgradQrReorthogonalizeTest -----------------------------------------
+// Paradigm shift #19 Phase 2: validate the QR re-orthogonalization
+// primitive.  After QR, P should satisfy Pᵀ · P = I_r to machine
+// precision.  We also verify Q's column space equals P's column space.
+void CHIRONIbgradQrReorthogonalizeTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ibgrad qr] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int N = 256;
+	const unsigned int r = 16;
+	LCG rng(202604233u);
+
+	glades::gpu::GpuBuffer<float> d_P, d_P_orig;
+	d_P.allocate((size_t)N * r);
+	d_P_orig.allocate((size_t)N * r);
+
+	// Init with uniform random entries (NOT Gaussian 1/N — want a matrix
+	// that definitely needs reorthogonalization).
+	std::vector<float> P_h((size_t)N * r);
+	for (size_t i = 0; i < P_h.size(); ++i) P_h[i] = rng.next_unit();
+	d_P.upload(&P_h[0], P_h.size());
+	d_P_orig.upload(&P_h[0], P_h.size());
+
+	// Run QR.
+	ASSERT("ibgrad_qr_reorthogonalize",
+	    glades::gpu::ibgrad_qr_reorthogonalize(d_P.data(), N, r));
+	glades::gpu::synchronizeCheck("ibgrad_qr_reorthogonalize");
+
+	std::vector<float> P_after((size_t)N * r);
+	d_P.download(&P_after[0], P_after.size());
+
+	// Verify Qᵀ · Q = I_r.
+	float ortho_err = 0.0f;
+	for (unsigned int j1 = 0; j1 < r; ++j1) {
+		for (unsigned int j2 = 0; j2 < r; ++j2) {
+			float s = 0.0f;
+			for (unsigned int i = 0; i < N; ++i)
+				s += P_after[(size_t)i * r + j1] * P_after[(size_t)i * r + j2];
+			const float expected = (j1 == j2) ? 1.0f : 0.0f;
+			const float e = std::fabs(s - expected);
+			if (e > ortho_err) ortho_err = e;
+		}
+	}
+	std::printf("  [ibgrad qr] N=%u r=%u ‖QᵀQ − I‖_∞ = %.3e\n", N, r, ortho_err);
+	ASSERT("ibgrad qr orthonormal < 1e-4", ortho_err < 1e-4f);
+
+	// Verify column space: for every original column j, the projection onto
+	// the new Q should match the original to within floating-point error —
+	// i.e., Q · (Qᵀ · P_orig[:, j]) == P_orig[:, j] (since P_orig's columns
+	// are in the span of P_orig's columns, which Q spans).
+	// Simpler check: rank preserved.  The 2-norm of each original column
+	// projected onto Q should equal its original 2-norm.
+	float rank_err = 0.0f;
+	for (unsigned int j = 0; j < r; ++j) {
+		float norm_sq = 0.0f;
+		for (unsigned int i = 0; i < N; ++i) {
+			const float v = P_h[(size_t)i * r + j];
+			norm_sq += v * v;
+		}
+		// Projection onto Q: Qᵀ · col_j, then 2-norm.
+		std::vector<float> Qtv(r, 0.0f);
+		for (unsigned int j2 = 0; j2 < r; ++j2) {
+			float s = 0.0f;
+			for (unsigned int i = 0; i < N; ++i)
+				s += P_after[(size_t)i * r + j2] * P_h[(size_t)i * r + j];
+			Qtv[j2] = s;
+		}
+		float proj_norm_sq = 0.0f;
+		for (unsigned int j2 = 0; j2 < r; ++j2)
+			proj_norm_sq += Qtv[j2] * Qtv[j2];
+		const float e = std::fabs(proj_norm_sq - norm_sq);
+		if (e > rank_err) rank_err = e;
+	}
+	std::printf("  [ibgrad qr] column-space preservation max_err = %.3e\n", rank_err);
+	ASSERT("ibgrad qr column-space preserved < 1e-3", rank_err < 1e-3f);
+#else
+	std::printf("  [ibgrad qr] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 
