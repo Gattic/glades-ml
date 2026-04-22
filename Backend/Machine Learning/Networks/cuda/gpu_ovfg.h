@@ -281,6 +281,32 @@ bool ovfg_truncate_factors(const float* L, const float* R,
                            float* L_out, float* R_out,
                            float* scratch);
 
+// ========================================================================
+// ovfg_truncate_factors_qr — PHASE 2c efficient factored truncation.
+//
+// Same API as ovfg_truncate_factors but NEVER materializes the dense
+// m×n matrix.  Algorithm (textbook factored low-rank truncation):
+//
+//   (1) Thin QR of L = Q_L · R_L        (m × r_in) = (m × r_in)(r_in × r_in)
+//   (2) Thin QR of R = Q_R · R_R
+//   (3) K = R_L · R_R^T                  (r_in × r_in  — SMALL)
+//   (4) SVD K = Û · Σ · V̂^T             (all r_in × r_in)
+//   (5) L_out = Q_L · Û[:, :r_out] · diag(√Σ[:r_out])
+//       R_out = Q_R · V̂[:, :r_out] · diag(√Σ[:r_out])
+//
+// Correctness: L_out · R_out^T = Q_L · Û Σ V̂^T · Q_R^T = Q_L · K · Q_R^T
+//              = Q_L · R_L · R_R^T · Q_R^T = L · R^T     (when r_out = r_in)
+// Best rank-r_out approximation by Eckart–Young.
+//
+// Cost: O((m+n) · r_in² + r_in³), strictly better than 2b's O(m·n·min(m,n)).
+// Scratch requirement: 2·(m+n)·r_in + 7·r_in² + 3·r_in floats.
+// ========================================================================
+bool ovfg_truncate_factors_qr(const float* L, const float* R,
+                              unsigned int m, unsigned int n,
+                              unsigned int r_in, unsigned int r_out,
+                              float* L_out, float* R_out,
+                              float* scratch);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -317,6 +343,10 @@ inline bool ovfg_truncate_factors(const float*, const float*,
                                   unsigned int, unsigned int,
                                   unsigned int, unsigned int,
                                   float*, float*, float*) { return false; }
+inline bool ovfg_truncate_factors_qr(const float*, const float*,
+                                     unsigned int, unsigned int,
+                                     unsigned int, unsigned int,
+                                     float*, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

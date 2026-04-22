@@ -5388,6 +5388,108 @@ void CHIRONOvfgTruncateFactorsParityTest()
 #endif
 }
 
+// CHIRONOvfgTruncateFactorsQrParityTest -------------------------------------
+// Paradigm shift #9, Phase 2c: the factored QR + small-SVD truncation
+// path must produce the SAME best rank-r_out approximation as the
+// Phase 2b dense-SVD path, but never materializes m×n.
+void CHIRONOvfgTruncateFactorsQrParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ovfg truncate-qr] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m = 40, n = 32, r_in = 16;
+
+	LCG rng(202604228u);
+	std::vector<float> L_h(m * r_in), R_h(n * r_in);
+	for (size_t i = 0; i < L_h.size(); ++i) L_h[i] = 0.25f * rng.next_unit();
+	for (size_t i = 0; i < R_h.size(); ++i) R_h[i] = 0.25f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_L, d_R;
+	d_L.allocate(m * r_in); d_L.upload(&L_h[0], L_h.size());
+	d_R.allocate(n * r_in); d_R.upload(&R_h[0], R_h.size());
+
+	// Sanity case first: r_out = r_in = 16 (no truncation).  Both paths
+	// must recover L·R^T exactly up to SVD round-off.
+	{
+		const unsigned int r_full = r_in;
+		glades::gpu::GpuBuffer<float> d_Lo_qr, d_Ro_qr, d_scr_qr, d_Morig, d_Mrec;
+		d_Lo_qr.allocate(m * r_full);
+		d_Ro_qr.allocate(n * r_full);
+		d_scr_qr.allocate(2u * (m + n) * r_full + 7u * r_full * r_full + 3u * r_full);
+		d_Morig.allocate(m * n);
+		d_Mrec.allocate(m * n);
+
+		ASSERT("ovfg_compute_dense_from_factors produces M for qr sanity",
+		       glades::gpu::ovfg_compute_dense_from_factors(
+		           d_L.data(), d_R.data(), m, n, r_in, d_Morig.data()));
+		ASSERT("ovfg_truncate_factors_qr at r_out = r_in runs",
+		       glades::gpu::ovfg_truncate_factors_qr(
+		           d_L.data(), d_R.data(), m, n, r_in, r_full,
+		           d_Lo_qr.data(), d_Ro_qr.data(), d_scr_qr.data()));
+		ASSERT("reconstruct from qr factors",
+		       glades::gpu::ovfg_compute_dense_from_factors(
+		           d_Lo_qr.data(), d_Ro_qr.data(), m, n, r_full, d_Mrec.data()));
+		std::vector<float> Mo(m * n), Mr(m * n);
+		d_Morig.download(&Mo[0], Mo.size());
+		d_Mrec.download(&Mr[0], Mr.size());
+		const float sanity_err = max_abs_diff(Mo, Mr);
+		std::printf("  ovfg truncate-qr at r_out = r_in = %u: max_err = %.3e\n",
+		            r_full, sanity_err);
+		ASSERT("OVFG truncate-qr at r_out=r_in recovers M",
+		       sanity_err < 1e-3f);
+	}
+
+	// Two truncations: same r_in = 16, r_out = 8.  Compare reconstructions.
+	const unsigned int r_out = 8;
+
+	// Path A (Phase 2b dense-SVD)
+	const unsigned int k_full = m < n ? m : n;
+	glades::gpu::GpuBuffer<float> d_Lo_A, d_Ro_A, d_scr_A;
+	d_Lo_A.allocate(m * r_out); d_Ro_A.allocate(n * r_out);
+	d_scr_A.allocate(2u * m * n + 2u * m * m + n * n + k_full);
+	ASSERT("ovfg_truncate_factors (2b) runs",
+	       glades::gpu::ovfg_truncate_factors(
+	           d_L.data(), d_R.data(), m, n, r_in, r_out,
+	           d_Lo_A.data(), d_Ro_A.data(), d_scr_A.data()));
+
+	// Path B (Phase 2c factored QR+SVD)
+	glades::gpu::GpuBuffer<float> d_Lo_B, d_Ro_B, d_scr_B;
+	d_Lo_B.allocate(m * r_out); d_Ro_B.allocate(n * r_out);
+	d_scr_B.allocate(2u * (m + n) * r_in + 7u * r_in * r_in + 3u * r_in);
+	ASSERT("ovfg_truncate_factors_qr (2c) runs",
+	       glades::gpu::ovfg_truncate_factors_qr(
+	           d_L.data(), d_R.data(), m, n, r_in, r_out,
+	           d_Lo_B.data(), d_Ro_B.data(), d_scr_B.data()));
+
+	// Both produce a rank-r_out approximation of M = L·R^T.  The
+	// approximations themselves may differ (sign conventions on
+	// singular vectors), but their reconstruction L_out · R_out^T
+	// must match to SVD round-off.
+	glades::gpu::GpuBuffer<float> d_Mrec_A, d_Mrec_B;
+	d_Mrec_A.allocate(m * n); d_Mrec_B.allocate(m * n);
+	ASSERT("reconstruct M from 2b factors",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_Lo_A.data(), d_Ro_A.data(), m, n, r_out, d_Mrec_A.data()));
+	ASSERT("reconstruct M from 2c factors",
+	       glades::gpu::ovfg_compute_dense_from_factors(
+	           d_Lo_B.data(), d_Ro_B.data(), m, n, r_out, d_Mrec_B.data()));
+	std::vector<float> Mrec_A(m * n), Mrec_B(m * n);
+	d_Mrec_A.download(&Mrec_A[0], Mrec_A.size());
+	d_Mrec_B.download(&Mrec_B[0], Mrec_B.size());
+	const float err = max_abs_diff(Mrec_A, Mrec_B);
+	std::printf("  ovfg truncate QR (2c) vs dense-SVD (2b) max_err = %.3e\n", err);
+	// Tolerance: both paths do full SVDs internally; different
+	// orderings of GEMMs + sign conventions contribute O(u·r_in) noise.
+	ASSERT("OVFG truncate 2c reconstruction matches 2b within SVD tolerance",
+	       err < 5e-4f);
+#else
+	std::printf("  [ovfg truncate-qr] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONOvfgCompressionBenchmark --------------------------------------------
 // Paradigm shift #9, Phase 4a: empirical memory & throughput benchmark.
 //
@@ -5760,6 +5862,7 @@ void CHIRONUnitTest()
 	CHIRONOvfgStiefelTangentGradParityTest();
 	CHIRONOvfgStiefelUnconstrainedGradParityTest();
 	CHIRONOvfgTruncateFactorsParityTest();
+	CHIRONOvfgTruncateFactorsQrParityTest();
 	CHIRONOvfgCompressionBenchmark();
 	CHIRONOvfgStiefelAdamDescentTest();
 	CHIRONStiefelIdentityRecoveryTest();

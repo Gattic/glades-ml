@@ -183,6 +183,30 @@ __global__ void k_ovfg_copy_first_cols(const float* __restrict__ src,
 	dst[(size_t)i * r_out + j] = src[(size_t)i * r_in + j];
 }
 
+// ========================================================================
+// Extract the upper r × r triangle of a [rows × r] column-major matrix
+// (as produced by cusolverDnSgeqrf, where the factor R occupies the
+// upper triangle of A_col with Householder reflectors below the diag).
+// Writes R as a row-major [r × r] matrix with strictly-below-diagonal
+// entries zeroed.
+//
+// Critical: A_col has column-major LEADING DIMENSION = rows (not r),
+// so the column-major offset of element (i, j) with i in [0, r), j in
+// [0, r) is j*rows + i.
+// ========================================================================
+__global__ void k_ovfg_extract_upper_triangle_colmajor_to_rowmajor(
+    const float* __restrict__ A_col,
+    unsigned int rows,
+    float* __restrict__ R_row,
+    unsigned int r)
+{
+	const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; // row
+	const unsigned int j = blockIdx.y * blockDim.x + threadIdx.y; // col
+	if (i >= r || j >= r) return;
+	float v = (j >= i) ? A_col[(size_t)j * rows + i] : 0.0f;
+	R_row[(size_t)i * r + j] = v;
+}
+
 } // anonymous namespace
 
 // ========================================================================
@@ -805,6 +829,277 @@ bool ovfg_truncate_factors(const float* L, const float* R,
 		    R_out, Sigma, n, r_out, R_out);
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
+
+	return true;
+}
+
+// ========================================================================
+// Thin QR factorization helper for OVFG.  Given a row-major [rows × r]
+// matrix A, writes:
+//   Q_row   [rows × r] row-major — orthonormal columns of A's column span
+//   R_row   [r × r]    row-major — upper-triangular factor
+// via cuSOLVER's geqrf + orgqr path (column-major internally).
+//
+// Workspace pointers (all caller-owned):
+//   A_col      [rows × r]  — column-major staging (overwritten)
+//   tau        [r]          — Householder scalars
+//   qr_work    [qr_lwork]   — cuSOLVER workspace
+//   slot       0 or 1       — selects info pointer (prevents contention)
+//
+// Returns false on cuSOLVER failure or OOM.
+// ========================================================================
+namespace {
+int*  g_ovfgQrInfo[2] = {nullptr, nullptr};
+float* g_ovfgQrWork[2] = {nullptr, nullptr};
+size_t g_ovfgQrWorkCap[2] = {0, 0};
+
+bool ovfg_thin_qr(const float* A_row, unsigned int rows, unsigned int r,
+                  float* Q_row, float* R_row,
+                  float* A_col, float* tau,
+                  int slot)
+{
+	if (!ovfg_solver_init()) return false;
+	if (slot < 0 || slot > 1) return false;
+	if (g_ovfgQrInfo[slot] == nullptr)
+	{
+		if (cudaMalloc(&g_ovfgQrInfo[slot], sizeof(int)) != cudaSuccess)
+			return false;
+	}
+
+	// Row-major [rows × r] → column-major [rows × r].
+	// Column-major (rows, r) leading-dim rows has element (i, j) at j*rows+i;
+	// row-major (rows, r) has element (i, j) at i*r+j.  So we need a
+	// row-major ↔ column-major transpose, which k_transpose_2d handles.
+	{
+		dim3 block(32, 32);
+		dim3 grid((r + 31u) / 32u, (rows + 31u) / 32u);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(A_row, A_col, rows, r);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// Query workspace.
+	int lwork_geqrf = 0, lwork_orgqr = 0;
+	if (cusolverDnSgeqrf_bufferSize(g_ovfgSolver, rows, r, A_col, rows, &lwork_geqrf)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	if (cusolverDnSorgqr_bufferSize(g_ovfgSolver, rows, r, r, A_col, rows, tau, &lwork_orgqr)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	const int lwork = lwork_geqrf > lwork_orgqr ? lwork_geqrf : lwork_orgqr;
+	if (static_cast<size_t>(lwork) > g_ovfgQrWorkCap[slot])
+	{
+		if (g_ovfgQrWork[slot]) cudaFree(g_ovfgQrWork[slot]);
+		if (cudaMalloc(&g_ovfgQrWork[slot], lwork * sizeof(float)) != cudaSuccess)
+			return false;
+		g_ovfgQrWorkCap[slot] = lwork;
+	}
+
+	// QR.  After this, A_col upper-triangle has R and below-diagonal
+	// has Householder reflectors; tau has scalars.
+	cusolverStatus_t st = cusolverDnSgeqrf(g_ovfgSolver, rows, r, A_col, rows, tau,
+	                                       g_ovfgQrWork[slot], lwork, g_ovfgQrInfo[slot]);
+	if (st != CUSOLVER_STATUS_SUCCESS) return false;
+	int host_info = 0;
+	cudaMemcpyAsync(&host_info, g_ovfgQrInfo[slot], sizeof(int),
+	                cudaMemcpyDeviceToHost, computeStream());
+	cudaStreamSynchronize(computeStream());
+	if (host_info != 0) return false;
+
+	// Extract R (upper triangle, col-major → row-major).
+	{
+		dim3 block(16, 16);
+		dim3 grid((r + 15u) / 16u, (r + 15u) / 16u);
+		k_ovfg_extract_upper_triangle_colmajor_to_rowmajor<<<grid, block, 0, computeStream()>>>(
+		    A_col, rows, R_row, r);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// Build Q explicitly from Householder representation.
+	st = cusolverDnSorgqr(g_ovfgSolver, rows, r, r, A_col, rows, tau,
+	                      g_ovfgQrWork[slot], lwork, g_ovfgQrInfo[slot]);
+	if (st != CUSOLVER_STATUS_SUCCESS) return false;
+	cudaMemcpyAsync(&host_info, g_ovfgQrInfo[slot], sizeof(int),
+	                cudaMemcpyDeviceToHost, computeStream());
+	cudaStreamSynchronize(computeStream());
+	if (host_info != 0) return false;
+
+	// A_col now holds Q in column-major [rows × r].  Transpose to row-major.
+	{
+		dim3 block(32, 32);
+		dim3 grid((rows + 31u) / 32u, (r + 31u) / 32u);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(A_col, Q_row, r, rows);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	return true;
+}
+} // anonymous namespace
+
+// ========================================================================
+// ovfg_truncate_factors_qr — PHASE 2c efficient truncation (no m×n ever).
+// See gpu_ovfg.h for the algorithm sketch; implementation below.
+//
+// Scratch layout (floats):
+//   Q_L            [m × r_in]
+//   Q_R            [n × r_in]
+//   R_L            [r_in × r_in]  (row-major)
+//   R_R            [r_in × r_in]  (row-major)
+//   K              [r_in × r_in]  (row-major, R_L · R_R^T)
+//   K_col          [r_in × r_in]  (column-major staging for SVD)
+//   U_K_col        [r_in × r_in]  (SVD out, col-major)
+//   VT_K_col       [r_in × r_in]  (SVD out, col-major = V_K row-major)
+//   Sigma_K        [r_in]
+//   U_K_row_full   [r_in × r_in]  (row-major transpose of U_K_col)
+//   A_col_L        [m × r_in]     (QR scratch, shared with A_col_R via slot)
+//   A_col_R        [n × r_in]
+//   tau_L          [r_in]
+//   tau_R          [r_in]
+// Total: 2(m+n)r_in + 5 r_in² + 3 r_in.
+// ========================================================================
+bool ovfg_truncate_factors_qr(const float* L, const float* R,
+                              unsigned int m, unsigned int n,
+                              unsigned int r_in, unsigned int r_out,
+                              float* L_out, float* R_out,
+                              float* scratch)
+{
+	if (L == nullptr || R == nullptr || L_out == nullptr || R_out == nullptr)
+		return false;
+	if (scratch == nullptr) return false;
+	if (m == 0u || n == 0u || r_in == 0u || r_out == 0u) return false;
+	if (r_out > r_in) return false;
+	if (r_in > m || r_in > n) return false;  // thin QR requires r_in ≤ min(m,n)
+	if (!ovfg_solver_init()) return false;
+
+	const size_t r2 = (size_t)r_in * r_in;
+	size_t off = 0;
+	float* Q_L          = scratch + off; off += (size_t)m * r_in;
+	float* Q_R          = scratch + off; off += (size_t)n * r_in;
+	float* R_L          = scratch + off; off += r2;
+	float* R_R          = scratch + off; off += r2;
+	float* K            = scratch + off; off += r2;
+	float* K_col        = scratch + off; off += r2;
+	float* U_K_col      = scratch + off; off += r2;
+	float* VT_K_col     = scratch + off; off += r2;
+	float* Sigma_K      = scratch + off; off += r_in;
+	float* U_K_row_full = scratch + off; off += r2;
+	float* A_col_L      = scratch + off; off += (size_t)m * r_in;
+	float* A_col_R      = scratch + off; off += (size_t)n * r_in;
+	float* tau_L        = scratch + off; off += r_in;
+	float* tau_R        = scratch + off; off += r_in;
+	(void)off;
+
+	// (1) Thin QR of L.
+	if (!ovfg_thin_qr(L, m, r_in, Q_L, R_L, A_col_L, tau_L, /*slot=*/0))
+		return false;
+	// (2) Thin QR of R.
+	if (!ovfg_thin_qr(R, n, r_in, Q_R, R_R, A_col_R, tau_R, /*slot=*/1))
+		return false;
+
+	// (3) K = R_L · R_R^T   [r_in × r_in]
+	if (!sgemm_rowmajor_abt(static_cast<int>(r_in), static_cast<int>(r_in), static_cast<int>(r_in),
+	                        1.0f,
+	                        R_L, static_cast<int>(r_in),
+	                        R_R, static_cast<int>(r_in),
+	                        0.0f,
+	                        K, static_cast<int>(r_in)))
+		return false;
+
+	// (4) SVD of small K.  Transpose to column-major, cusolverDnSgesvd.
+	{
+		dim3 block(32, 32);
+		dim3 grid((r_in + 31u) / 32u, (r_in + 31u) / 32u);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(K, K_col, r_in, r_in);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	int lwork = 0;
+	if (cusolverDnSgesvd_bufferSize(g_ovfgSolver, r_in, r_in, &lwork)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	static thread_local float* svd_work_qr = nullptr;
+	static thread_local size_t svd_work_qr_cap = 0;
+	if (static_cast<size_t>(lwork) > svd_work_qr_cap)
+	{
+		if (svd_work_qr) cudaFree(svd_work_qr);
+		if (cudaMalloc(&svd_work_qr, lwork * sizeof(float)) != cudaSuccess)
+			return false;
+		svd_work_qr_cap = lwork;
+	}
+	cusolverStatus_t st = cusolverDnSgesvd(
+	    g_ovfgSolver, 'A', 'A', r_in, r_in, K_col, r_in,
+	    Sigma_K, U_K_col, r_in, VT_K_col, r_in,
+	    svd_work_qr, lwork, nullptr, g_ovfgInfo);
+	if (st != CUSOLVER_STATUS_SUCCESS) return false;
+	int host_info = 0;
+	cudaMemcpyAsync(&host_info, g_ovfgInfo, sizeof(int),
+	                cudaMemcpyDeviceToHost, computeStream());
+	cudaStreamSynchronize(computeStream());
+	if (host_info != 0) return false;
+
+	// (5) Transpose U_K_col (col-major [r_in × r_in] = U_K^T row-major) to
+	// U_K_row_full (row-major U_K).
+	{
+		dim3 block(32, 32);
+		dim3 grid((r_in + 31u) / 32u, (r_in + 31u) / 32u);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(U_K_col, U_K_row_full, r_in, r_in);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// VT_K_col reinterpreted row-major = V_K row-major (as in the 2b path).
+	float* V_K_row_full = VT_K_col;
+
+	// (6) Form truncated factors directly into L_out and R_out:
+	//   L_out = Q_L · (U_K[:, :r_out] · diag(√Σ[:r_out]))
+	//   R_out = Q_R · (V_K[:, :r_out] · diag(√Σ[:r_out]))
+	//
+	// We need intermediate (r_in × r_out) scaled matrices.  Reuse R_L
+	// and R_R buffers (no longer needed after K was formed).
+	float* U_K_trunc = R_L;   // [r_in × r_out], reuse r_in² scratch
+	float* V_K_trunc = R_R;
+	// Copy first r_out columns, then scale.
+	{
+		dim3 block(64);
+		dim3 grid(r_in, (r_out + block.x - 1u) / block.x);
+		k_ovfg_copy_first_cols<<<grid, block, 0, computeStream()>>>(
+		    U_K_row_full, r_in, r_in, r_out, U_K_trunc);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	{
+		dim3 block(64);
+		dim3 grid(r_in, (r_out + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_sqrt_diag_copy<<<grid, block, 0, computeStream()>>>(
+		    U_K_trunc, Sigma_K, r_in, r_out, U_K_trunc);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	{
+		dim3 block(64);
+		dim3 grid(r_in, (r_out + block.x - 1u) / block.x);
+		k_ovfg_copy_first_cols<<<grid, block, 0, computeStream()>>>(
+		    V_K_row_full, r_in, r_in, r_out, V_K_trunc);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	{
+		dim3 block(64);
+		dim3 grid(r_in, (r_out + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_sqrt_diag_copy<<<grid, block, 0, computeStream()>>>(
+		    V_K_trunc, Sigma_K, r_in, r_out, V_K_trunc);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// L_out = Q_L · U_K_trunc:  (m × r_in) · (r_in × r_out) → (m × r_out).
+	if (!sgemm_rowmajor(static_cast<int>(m), static_cast<int>(r_out), static_cast<int>(r_in),
+	                    1.0f,
+	                    Q_L,       static_cast<int>(r_in),
+	                    U_K_trunc, static_cast<int>(r_out),
+	                    0.0f,
+	                    L_out,     static_cast<int>(r_out)))
+		return false;
+	// R_out = Q_R · V_K_trunc:  (n × r_in) · (r_in × r_out) → (n × r_out).
+	if (!sgemm_rowmajor(static_cast<int>(n), static_cast<int>(r_out), static_cast<int>(r_in),
+	                    1.0f,
+	                    Q_R,       static_cast<int>(r_in),
+	                    V_K_trunc, static_cast<int>(r_out),
+	                    0.0f,
+	                    R_out,     static_cast<int>(r_out)))
+		return false;
 
 	return true;
 }
