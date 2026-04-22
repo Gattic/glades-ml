@@ -78,7 +78,7 @@ __global__ void k_stiefel_reconstruct(const uint16_t* U, const float* sigma,
 // GpuStiefelWeight lifecycle
 // ===========================================================================
 
-GpuStiefelWeight::GpuStiefelWeight() : m(0), n(0), r(0) {}
+GpuStiefelWeight::GpuStiefelWeight() : m(0), n(0), r(0), param_version(0), cache_version(0) {}
 
 void GpuStiefelWeight::allocate(unsigned int m_, unsigned int n_, unsigned int r_)
 {
@@ -110,6 +110,12 @@ void GpuStiefelWeight::allocate(unsigned int m_, unsigned int n_, unsigned int r
 	qr_tau_V.allocate(r);
 
 	orthogonality_drift.allocate(1);
+
+	// FP32 cache of U, V (Phase 2f) — lazily populated on first forward.
+	U_f32_cache.allocate(size_t(m) * r);
+	V_f32_cache.allocate(size_t(n) * r);
+	param_version = 1;  // U/V have fresh (uploaded) values
+	cache_version = 0;  // cache is stale — will refresh on first fwd/bwd
 }
 
 void GpuStiefelWeight::release()
@@ -127,7 +133,24 @@ void GpuStiefelWeight::release()
 	qr_tau_V.free();
 	qr_work.free();
 	orthogonality_drift.free();
+	U_f32_cache.free();
+	V_f32_cache.free();
 	m = n = r = 0;
+	param_version = cache_version = 0;
+}
+
+// Refresh FP32 cache if stale.  Called by forward/backward before any GEMM
+// that needs FP32 U, V.
+static void stiefel_refresh_fp32_cache_impl(GpuStiefelWeight& s)
+{
+	if (s.cache_version != s.param_version)
+	{
+		cast_bf16_to_f32(s.U.data(), s.U_f32_cache.data(),
+		                 size_t(s.m) * s.r);
+		cast_bf16_to_f32(s.V.data(), s.V_f32_cache.data(),
+		                 size_t(s.n) * s.r);
+		s.cache_version = s.param_version;
+	}
 }
 
 bool GpuStiefelWeight::allocated() const
@@ -178,26 +201,18 @@ void stiefel_forward(const void* X, bool x_bf16,
 	}
 
 	const float* Xf = static_cast<const float*>(X);
-	const uint16_t* Ubf = s.U.data();
-	const uint16_t* Vbf = s.V.data();
 	const float*    sig = s.sigma.data();
 
-	// Step 1: T1 = X · V. V is BF16; stage to FP32 via cast first.
-	// (Next iteration: replace with BF16-input GEMM via sgemm_rowmajor_bf16.)
-	static thread_local float* V_f32 = nullptr;
-	static thread_local size_t V_f32_cap = 0;
-	size_t V_size = size_t(s.n) * s.r;
-	if (V_size > V_f32_cap)
-	{
-		if (V_f32) cudaFree(V_f32);
-		if (cudaMalloc(&V_f32, V_size * sizeof(float)) != cudaSuccess)
-		{
-			V_f32 = nullptr; V_f32_cap = 0; return;
-		}
-		V_f32_cap = V_size;
-	}
-	cast_bf16_to_f32(Vbf, V_f32, V_size);
+	// Phase 2f: refresh the persistent FP32 cache of U, V once per training
+	// step (not once per call).  cache_version == param_version after
+	// refresh; subsequent calls (backward, next step's forward) skip the
+	// cast entirely if nothing has changed.
+	GpuStiefelWeight& sref = const_cast<GpuStiefelWeight&>(s);
+	stiefel_refresh_fp32_cache_impl(sref);
+	const float* U_f32 = s.U_f32_cache.data();
+	const float* V_f32 = s.V_f32_cache.data();
 
+	// Step 1: T1 = X · V  [B × r]
 	if (!sgemm_rowmajor(B, s.r, s.n, 1.0f, Xf, s.n, V_f32, s.r,
 	                    0.0f, scratch1, s.r))
 		return;
@@ -210,22 +225,7 @@ void stiefel_forward(const void* X, bool x_bf16,
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
-	// Step 3: Y = T1 · U^T.  U is [m,r] row-major, so U^T is accessed via the
-	// abt variant: C[B,m] = A[B,r] · B^T[m,r] where B is U.
-	static thread_local float* U_f32 = nullptr;
-	static thread_local size_t U_f32_cap = 0;
-	size_t U_size = size_t(s.m) * s.r;
-	if (U_size > U_f32_cap)
-	{
-		if (U_f32) cudaFree(U_f32);
-		if (cudaMalloc(&U_f32, U_size * sizeof(float)) != cudaSuccess)
-		{
-			U_f32 = nullptr; U_f32_cap = 0; return;
-		}
-		U_f32_cap = U_size;
-	}
-	cast_bf16_to_f32(Ubf, U_f32, U_size);
-
+	// Step 3: Y = T1 · U^T  [B × m]
 	if (!sgemm_rowmajor_abt(B, s.m, s.r, 1.0f, scratch1, s.r, U_f32, s.r,
 	                        0.0f, Y, s.m))
 		return;
@@ -276,38 +276,19 @@ void stiefel_backward_unconstrained(
 		return;
 
 	const float* Xf = static_cast<const float*>(X);
-	const uint16_t* Ubf = s.U.data();
-	const uint16_t* Vbf = s.V.data();
 	const float*    sig = s.sigma.data();
 
-	// FP32 staging of U, V. (Same thread-local caches as the forward path.)
-	static thread_local float* U_f32 = nullptr;
-	static thread_local size_t U_f32_cap = 0;
-	static thread_local float* V_f32 = nullptr;
-	static thread_local size_t V_f32_cap = 0;
-	size_t U_size = size_t(s.m) * s.r;
-	size_t V_size = size_t(s.n) * s.r;
-	if (U_size > U_f32_cap)
-	{
-		if (U_f32) cudaFree(U_f32);
-		if (cudaMalloc(&U_f32, U_size * sizeof(float)) != cudaSuccess) return;
-		U_f32_cap = U_size;
-	}
-	if (V_size > V_f32_cap)
-	{
-		if (V_f32) cudaFree(V_f32);
-		if (cudaMalloc(&V_f32, V_size * sizeof(float)) != cudaSuccess) return;
-		V_f32_cap = V_size;
-	}
-	cast_bf16_to_f32(Ubf, U_f32, U_size);
-	cast_bf16_to_f32(Vbf, V_f32, V_size);
+	// Phase 2f: read U, V from the persistent FP32 cache.  Refresh if stale.
+	GpuStiefelWeight& sref = const_cast<GpuStiefelWeight&>(s);
+	stiefel_refresh_fp32_cache_impl(sref);
+	const float* U_f32 = s.U_f32_cache.data();
+	const float* V_f32 = s.V_f32_cache.data();
 
-	// --- Compute T3 = X · V · diag(Σ)  [B × r] into a scratch buffer.
-	// We re-use scratch_Br for this, since it is also [B × r]. Callers need
-	// two [B × r] scratches if they want to keep T1 around; we allocate a
-	// second thread-local buffer for T1.
+	// Scratches for T1 and the X·V re-compute needed for dΣ.
 	static thread_local float* T1_cache = nullptr;
 	static thread_local size_t T1_cap = 0;
+	static thread_local float* XV_cache = nullptr;
+	static thread_local size_t XV_cap = 0;
 	size_t T1_size = size_t(B) * s.r;
 	if (T1_size > T1_cap)
 	{
@@ -315,7 +296,15 @@ void stiefel_backward_unconstrained(
 		if (cudaMalloc(&T1_cache, T1_size * sizeof(float)) != cudaSuccess) return;
 		T1_cap = T1_size;
 	}
-	float* T3 = scratch_Br;  // [B × r]
+	if (T1_size > XV_cap)
+	{
+		if (XV_cache) cudaFree(XV_cache);
+		if (cudaMalloc(&XV_cache, T1_size * sizeof(float)) != cudaSuccess) return;
+		XV_cap = T1_size;
+	}
+
+	// --- T3 = X · V · diag(Σ)  [B × r] into scratch_Br.
+	float* T3 = scratch_Br;
 	if (!sgemm_rowmajor(B, s.r, s.n, 1.0f, Xf, s.n, V_f32, s.r,
 	                    0.0f, T3, s.r))
 		return;
@@ -326,24 +315,13 @@ void stiefel_backward_unconstrained(
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
-	// --- T1 = dY · U  [B × r]  (abt: dY [B,m], U [m,r])
+	// --- T1 = dY · U  [B × r]  (abt)
 	float* T1 = T1_cache;
 	if (!sgemm_rowmajor(B, s.r, s.m, 1.0f, dY, s.m, U_f32, s.r,
 	                    0.0f, T1, s.r))
 		return;
 
-	// --- dΣ[k] = Σ_b T1[b,k] * T3_preScale[b,k]  — but T3 already has Σ applied.
-	// dΣ[k] = Σ_b T1[b,k] * (X·V)[b,k], so we need (X·V) = T3 / Σ. Simpler:
-	// recompute (X·V) into T1_cache-like buffer; we actually already have
-	// T1 = dY·U, so we need a separate buffer. Use a third thread-local.
-	static thread_local float* XV_cache = nullptr;
-	static thread_local size_t XV_cap = 0;
-	if (T1_size > XV_cap)
-	{
-		if (XV_cache) cudaFree(XV_cache);
-		if (cudaMalloc(&XV_cache, T1_size * sizeof(float)) != cudaSuccess) return;
-		XV_cap = T1_size;
-	}
+	// --- dΣ[k] = Σ_b T1[b,k] * (X·V)[b,k]. Recompute X·V into XV_cache.
 	if (!sgemm_rowmajor(B, s.r, s.n, 1.0f, Xf, s.n, V_f32, s.r,
 	                    0.0f, XV_cache, s.r))
 		return;
@@ -354,7 +332,7 @@ void stiefel_backward_unconstrained(
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
-	// --- T1 <- T1 · diag(Σ)  in place
+	// --- T1 ← T1 · diag(Σ)  in place
 	{
 		dim3 block(64);
 		dim3 grid(B, (s.r + block.x - 1) / block.x);
@@ -362,12 +340,12 @@ void stiefel_backward_unconstrained(
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
-	// --- dV = X^T · T1  [n × r]  (atb: X [B,n], T1 [B,r])
+	// --- dV = X^T · T1
 	if (!sgemm_rowmajor_atb(s.n, s.r, B, 1.0f, Xf, s.n, T1, s.r,
 	                        0.0f, dV, s.r))
 		return;
 
-	// --- dX (optional) = T1 · V^T  [B × n]  (abt: T1 [B,r], V [n,r])
+	// --- dX (optional) = T1 · V^T
 	if (dX != nullptr)
 	{
 		if (!sgemm_rowmajor_abt(B, s.n, s.r, 1.0f, T1, s.r, V_f32, s.r,
@@ -375,7 +353,7 @@ void stiefel_backward_unconstrained(
 			return;
 	}
 
-	// --- dU = dY^T · T3  [m × r]  (atb: dY [B,m], T3 [B,r])
+	// --- dU = dY^T · T3
 	if (!sgemm_rowmajor_atb(s.m, s.r, B, 1.0f, dY, s.m, T3, s.r,
 	                        0.0f, dU, s.r))
 		return;
@@ -669,6 +647,7 @@ void stiefel_retract_qr(GpuStiefelWeight& s,
 		k_sigma_fisher_rao<<<grid, block, 0, computeStream()>>>(s.sigma.data(), eta_sigma, s.r);
 		cudaGetLastError();
 	}
+	s.param_version++;  // invalidate FP32 cache — next forward refreshes it
 }
 
 // ===========================================================================
@@ -841,6 +820,7 @@ void stiefel_retract_cayley(GpuStiefelWeight& s,
 		    s.sigma.data(), eta_sigma, s.r);
 		cudaGetLastError();
 	}
+	s.param_version++;  // invalidate FP32 cache
 }
 
 // ===========================================================================

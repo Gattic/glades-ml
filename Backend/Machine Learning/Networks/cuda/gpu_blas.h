@@ -110,6 +110,12 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
                              float beta,
                              float* C, int ldc);
 
+// NOTE: Mixed-precision FP32×BF16→FP32 wrappers were explored for Phase 2f
+// but cuBLAS (through at least CUDA 12.x) doesn't support mixed input types
+// to cublasGemmEx — both A and B must match.  Stiefel Phase 2f instead
+// uses an FP32 cache on GpuStiefelWeight that is refreshed once per
+// Adam step at retraction time (see gpu_stiefel.cu).
+
 // Batched-strided BF16 GEMMs (attention path). Inputs are BF16 bit
 // patterns (unsigned short); output is FP32. Uses BF16 tensor cores
 // via cublasGemmStridedBatchedEx + CUBLAS_COMPUTE_32F_FAST_16BF, giving

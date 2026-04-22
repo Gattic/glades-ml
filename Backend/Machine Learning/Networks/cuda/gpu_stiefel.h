@@ -67,6 +67,14 @@ struct GpuStiefelWeight
 	GpuBuffer<float>    sigma;  // [r]     FP32 (positive orthant)
 	GpuBuffer<uint16_t> V;      // [n * r] BF16
 
+	// FP32 cache of U, V.  Populated lazily by stiefel_forward/backward and
+	// invalidated by retraction.  Phase 2f: cast once per Adam step instead
+	// of once per call, saving ~4× cast overhead in the fwd+bwd+Adam path.
+	GpuBuffer<float>    U_f32_cache;
+	GpuBuffer<float>    V_f32_cache;
+	unsigned long long  param_version;     // bumped on each retraction
+	unsigned long long  cache_version;     // last version the cache reflects
+
 	// Riemannian Adam moments. Phase 2e ships these as FP32 for ease of
 	// validation; Phase 2f will compress to int8/uint8 packed.
 	GpuBuffer<float>   m_U;     // [m * r]

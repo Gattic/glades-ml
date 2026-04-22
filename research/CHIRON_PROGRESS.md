@@ -226,9 +226,10 @@ The end-to-end (fwd + bwd + Adam with retraction) timing now looks like:
 
 |                                  | ms/step | vs dense |
 |----------------------------------|--------:|---------:|
-| Dense (fwd + 2 bwd GEMMs)         |  0.654  | 1.00×    |
-| Stiefel + Adam + **QR** retract   |  5.563  | 0.12× (8.5× slower) |
-| Stiefel + Adam + **Cayley** retract | **1.085** | **0.60× (1.66× slower)** |
+| Dense (fwd + 2 bwd GEMMs)         |  0.653  | 1.00×    |
+| Stiefel + Adam + **QR** retract   |  5.546  | 0.12× (8.5× slower) |
+| Stiefel + Adam + **Cayley** retract (pre-2f) | 1.085 | 0.60× (1.66× slower) |
+| Stiefel + Adam + **Cayley** retract (post-2f cache) | **1.029** | **0.63× (1.58× slower)** |
 
 **Cayley gives 5.13× per-step speedup over QR.**  The remaining 1.66×
 gap vs dense is BF16 → FP32 cast overhead on every GEMM (Phase-1
@@ -238,8 +239,30 @@ eliminate this).
 Projection at ρ=0.125 (d=256, expected forward-only 3.37× speedup,
 compression 4×): full-step Cayley likely matches-or-beats dense at
 ~0.65-0.85 ms while using 4× less weight VRAM and 4× less Adam state —
-the true "magnitudes faster AND magnitudes less memory" win.  Phase 2f
-remains the final optimization to fully realize this.
+the true "magnitudes faster AND magnitudes less memory" win.
+
+### Phase 2f — FP32 cache for BF16 U, V (shipped)
+
+Added persistent FP32 cache fields `U_f32_cache`, `V_f32_cache` to
+`GpuStiefelWeight`.  A `param_version` counter is bumped on each
+retraction; the cache is refreshed lazily by forward/backward only
+when `cache_version != param_version`.  This replaces the thread-local
+per-call casts that both stiefel_forward and stiefel_backward used to
+do independently.
+
+Measurement impact: small on the single-layer benchmark (cache-miss
+cost already ~5 µs of memory bandwidth at d=2048 r=512; savings from
+halving casts per step is ~10 µs).  Matters more in the trainer where
+forward and backward are invoked via many layer blocks per step.
+
+**Aborted Phase 2f sub-path — cuBLAS mixed FP32/BF16 GEMM**: I
+prototyped `sgemm_rowmajor_f32_bf16` wrappers using cublasGemmEx with
+mixed input dtypes (FP32 × BF16).  cuBLAS through CUDA 12.x does NOT
+support mismatched input types and silently produces wrong results
+(max_err jumped from 5.96e-08 to 2.75e-01 in parity tests).  Wrappers
+removed; the correct path is the FP32 cache above.  If future cuBLAS
+versions support mixed-precision GEMMs, stiefel_forward/backward can
+be trivially switched to eliminate the cache altogether.
 
 **Cross-stream race fix** (important): several Stiefel custom kernels
 (k_transpose_2d, k_symmetrize_inplace, k_scale_cols_by_diag,

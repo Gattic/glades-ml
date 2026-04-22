@@ -950,6 +950,12 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
 	                        "cublasGemmEx(BF16,ABT)");
 }
 
+// Phase 2f exploration: mixed-precision FP32×BF16 GEMM wrappers were
+// prototyped here but cublasGemmEx (through CUDA 12.x) does not accept
+// mismatched input dtypes for matrix multiply.  Silent correctness failures
+// result — removed.  Stiefel Phase 2f uses a persistent FP32 cache on the
+// GpuStiefelWeight struct instead, refreshed once per Adam step.
+
 // === Batched-strided BF16 GEMMs (attention path) ===
 //
 // Mirrors the FP32 batched-strided variants but uses
