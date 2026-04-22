@@ -4574,10 +4574,77 @@ void CHIRONHRTCHaarRoundtripTest()
 #endif
 }
 
+// CHIRONHRTCHaarK4RecursiveTest ---------------------------------------------
+// Paradigm shift #8: verify that k=4 compression works by stacking two
+// levels of the k=2 Haar primitive.  This is the path the trainer will
+// take for aggressive context extension (k ∈ {4, 8} for T=16384+).
+//
+// Forward:
+//   level-1: X[T,m] → s1[T/2,m], r1[T/2,m]
+//   level-2: s1 → s2[T/4,m], r2[T/4,m]
+//   final:  super = s2 (T/4 super-tokens), residuals = (r1, r2)
+//
+// Backward (inverse):
+//   level-2 inverse: (s2, r2) → s1
+//   level-1 inverse: (s1, r1) → X
+void CHIRONHRTCHaarK4RecursiveTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [hrtc k=4] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 128, m = 64;  // T divisible by 4
+
+	LCG rng(20260422u);
+	std::vector<float> X(T * m), Xrt(T * m);
+	for (size_t i = 0; i < X.size(); ++i) X[i] = 0.25f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_s1, d_r1, d_s2, d_r2, d_Xrt;
+	d_X.allocate(T * m);
+	d_s1.allocate((T / 2) * m); d_r1.allocate((T / 2) * m);
+	d_s2.allocate((T / 4) * m); d_r2.allocate((T / 4) * m);
+	d_Xrt.allocate(T * m);
+
+	d_X.upload(&X[0], X.size());
+
+	// Forward: two levels of Haar.
+	ASSERT("hrtc k=4 level-1 pool",
+	       glades::gpu::hrtc_pool_haar_k2(d_X.data(), d_s1.data(), d_r1.data(), T, m));
+	ASSERT("hrtc k=4 level-2 pool",
+	       glades::gpu::hrtc_pool_haar_k2(d_s1.data(), d_s2.data(), d_r2.data(), T / 2, m));
+
+	// Inverse: reverse order.
+	ASSERT("hrtc k=4 level-2 unpool",
+	       glades::gpu::hrtc_unpool_haar_k2(d_s2.data(), d_r2.data(), d_s1.data(), T / 2, m));
+	ASSERT("hrtc k=4 level-1 unpool",
+	       glades::gpu::hrtc_unpool_haar_k2(d_s1.data(), d_r1.data(), d_Xrt.data(), T, m));
+
+	d_Xrt.download(&Xrt[0], Xrt.size());
+	const float err = max_abs_diff(X, Xrt);
+	std::printf("  hrtc Haar k=4 (recursive) roundtrip max_err = %.3e\n", err);
+	// Two levels accumulate ~2× the FP32 error of one, still << BF16 ULP.
+	ASSERT("Haar k=4 recursive roundtrip recovers original",
+	       err < 5e-5f);
+
+	// Byte-budget sanity: at k=4 the super-stream is T/4 × m while
+	// residuals are (T/2 + T/4) × m = 3T/4 × m.  Total storage = T × m,
+	// same as original — Haar is orthonormal and information-preserving.
+	// The win is that super (T/4 × m) is the only stream processed through
+	// the deep middle of the stack; residuals sit in scratch.
+	std::printf("  hrtc k=4 storage: super=%u×m, residuals=%u×m (total %u×m == T×m)\n",
+	            T / 4u, T / 2u + T / 4u, T / 4u + T / 2u + T / 4u);
+#else
+	std::printf("  [hrtc k=4] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
 	CHIRONHRTCHaarRoundtripTest();
+	CHIRONHRTCHaarK4RecursiveTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();
