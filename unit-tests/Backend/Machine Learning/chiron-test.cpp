@@ -5967,6 +5967,100 @@ void CHIRONOvfgStiefelAdamDescentTest()
 #endif
 }
 
+// CHIRONChunkedCrossEntropyParityTest ---------------------------------------
+// Validates chunked_cross_entropy_loss — the large-vocab unlock that never
+// materializes T × V logits.  Compares against the existing dense path
+// (compute logits dense → softmax → cross_entropy_nll_loss) across three
+// chunk sizes including V_chunk = V (degenerate single-chunk case) and
+// V_chunk << V (typical streaming).
+void CHIRONChunkedCrossEntropyParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [chunked-CE] no CUDA device — skipped\n");
+		return;
+	}
+	// Test at V > max chunk size (256) to exercise multi-chunk streaming.
+	const int T = 37;
+	const int d = 64;
+	const int V = 1024;
+	const int padToken = -1;
+
+	LCG rng(202604229u);
+	std::vector<float> X_h(T * d), W_h(V * d);
+	for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.15f * rng.next_unit();
+	for (size_t i = 0; i < W_h.size(); ++i) W_h[i] = 0.15f * rng.next_unit();
+	std::vector<int> tgt_h(T);
+	for (int t = 0; t < T; ++t)
+	{
+		const unsigned int u = ((unsigned int)rng.next_unit() * 0x7fffffffu) & 0x7fffffffu;
+		tgt_h[t] = (int)(u % V);
+	}
+
+	glades::gpu::GpuBuffer<float> d_X, d_W, d_logits, d_probs, d_loss_ref,
+	                              d_loss_chunked, d_scratch;
+	glades::gpu::GpuBuffer<int>   d_targets, d_cnt_ref, d_cnt_chunked;
+	d_X.allocate(T * d);            d_X.upload(&X_h[0], X_h.size());
+	d_W.allocate(V * d);            d_W.upload(&W_h[0], W_h.size());
+	d_targets.allocate(T);          d_targets.upload(&tgt_h[0], tgt_h.size());
+	d_logits.allocate(T * V);
+	d_probs.allocate(T * V);
+	d_loss_ref.allocate(1);
+	d_loss_chunked.allocate(1);
+	d_cnt_ref.allocate(1);
+	d_cnt_chunked.allocate(1);
+
+	// ---- Reference: dense logits → softmax → cross_entropy_nll_loss ----
+	ASSERT("dense logits GEMM (reference path)",
+	       glades::gpu::sgemm_rowmajor_abt(T, V, d, 1.0f,
+	                                       d_X.data(), d,
+	                                       d_W.data(), d,
+	                                       0.0f,
+	                                       d_logits.data(), V));
+	ASSERT("softmax_forward (reference path)",
+	       glades::gpu::softmax_forward(d_logits.data(), T, V, d_probs.data()));
+	ASSERT("cross_entropy_nll_loss (reference path)",
+	       glades::gpu::cross_entropy_nll_loss(
+	           d_probs.data(), d_targets.data(),
+	           T, V, padToken,
+	           d_loss_ref.data(), d_cnt_ref.data()));
+	float loss_ref_h = 0.0f;
+	int   cnt_ref_h  = 0;
+	d_loss_ref.download(&loss_ref_h, 1);
+	d_cnt_ref.download(&cnt_ref_h, 1);
+
+	// ---- Chunked path: three chunk sizes, each must match reference ----
+	const int chunks[] = {V, 256, 64};   // single chunk; mid; tiny
+	for (int ck = 0; ck < 3; ++ck)
+	{
+		const int V_chunk = chunks[ck];
+		// scratch size: T * (V_chunk + 3)
+		d_scratch.allocate(T * (V_chunk + 3));
+		ASSERT("chunked_cross_entropy_loss runs",
+		       glades::gpu::chunked_cross_entropy_loss(
+		           d_X.data(), d_W.data(), d_targets.data(),
+		           T, V, d, padToken, V_chunk,
+		           d_loss_chunked.data(), d_cnt_chunked.data(),
+		           d_scratch.data()));
+		float loss_ch_h = 0.0f;
+		int   cnt_ch_h  = 0;
+		d_loss_chunked.download(&loss_ch_h, 1);
+		d_cnt_chunked.download(&cnt_ch_h, 1);
+
+		const float err = std::fabs(loss_ref_h - loss_ch_h);
+		std::printf("  chunked-CE V_chunk=%4d loss ref=%.6f chunked=%.6f  err=%.3e  cnt ref=%d chunked=%d\n",
+		            V_chunk, loss_ref_h, loss_ch_h, err, cnt_ref_h, cnt_ch_h);
+		ASSERT("chunked loss matches dense reference within tolerance",
+		       err < 1e-3f);
+		ASSERT("chunked valid count matches dense reference",
+		       cnt_ref_h == cnt_ch_h);
+	}
+#else
+	std::printf("  [chunked-CE] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -5984,6 +6078,7 @@ void CHIRONUnitTest()
 	CHIRONOvfgCompressionBenchmark();
 	CHIRONOvfgTruncateBenchmark();
 	CHIRONOvfgStiefelAdamDescentTest();
+	CHIRONChunkedCrossEntropyParityTest();
 	CHIRONStiefelIdentityRecoveryTest();
 	CHIRONStiefelBackwardFiniteDiffTest();
 	CHIRONStiefelTangentProjectionTest();

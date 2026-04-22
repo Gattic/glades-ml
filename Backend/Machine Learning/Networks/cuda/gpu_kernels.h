@@ -343,6 +343,46 @@ bool argmax_count_matches(const float* probs, const int* targets,
                           int* correct_count, int* valid_count);
 
 // ---------------------------------------------------------------------------
+// Chunked cross-entropy loss — never materializes the dense T × V logits
+// or probs tensor.  Unlocks large-vocab training (V >= 65k).
+//
+// Inputs:
+//   X          [T × d]       row-major activations (last layer output).
+//   W_lm       [V × d]       row-major LM-head weight (W_lm[v] is row v).
+//   targets    [T]           target token IDs.
+//   T, V, d                  dimensions.
+//   padToken                 skip rows where targets[t] == padToken (< 0 → no skip).
+//   V_chunk_size             columns of W_lm processed per chunk.  At typical
+//                            configs V_chunk = 4096 gives T × 4096 logits
+//                            scratch (e.g., 32 MB at T=2048).  V_chunk = V
+//                            degenerates to the dense path.
+//
+// Algorithm (streaming log-sum-exp):
+//   running_max[t]  = -inf;  running_sum[t] = 0;  target_logit[t] = NaN
+//   for chunk_start = 0; chunk_start < V; chunk_start += V_chunk_size:
+//     compute logits_chunk [T × V_ch] = X · W_lm[chunk_start:chunk_end, :]^T
+//     update running_max, running_sum in a single kernel pass
+//     if target[t] falls in this chunk: capture target_logit[t]
+//   lse[t]  = log(running_sum[t]) + running_max[t]
+//   loss[t] = lse[t] - target_logit[t]
+//   sum valid losses → loss_sum, count valid → valid_count
+//
+// Scratch buffer layout (must be caller-allocated; contents clobbered):
+//   logits_chunk [T × V_chunk_size]      floats
+//   running_max  [T]                      floats
+//   running_sum  [T]                      floats
+//   target_logit [T]                      floats
+// Total floats: T · (V_chunk_size + 3).
+//
+// Outputs loss_sum, valid_count are device scalars, zeroed internally.
+bool chunked_cross_entropy_loss(const float* X, const float* W_lm,
+                                const int* targets,
+                                int T, int V, int d, int padToken,
+                                int V_chunk_size,
+                                float* loss_sum, int* valid_count,
+                                float* scratch);
+
+// ---------------------------------------------------------------------------
 // Batch zero: zero multiple GPU buffers with a single kernel launch
 // ---------------------------------------------------------------------------
 
@@ -481,6 +521,9 @@ inline bool causal_mask_softmax_inplace(float*, int, int) { return false; }
 inline bool softmax_backward_attn(const float*, const float*, int, int, float, float*) { return false; }
 inline bool cross_entropy_nll_loss(const float*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, int*) { return false; }
+inline bool chunked_cross_entropy_loss(const float*, const float*, const int*,
+                                       int, int, int, int, int,
+                                       float*, int*, float*) { return false; }
 
 inline bool kv_attention_incremental(const float*, const float*, const float*, float*, const unsigned char*, int, int, int, int, int, int, float, float*) { return false; }
 

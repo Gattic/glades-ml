@@ -8,6 +8,7 @@
 
 #include "gpu_kernels.h"
 #include "gpu_device.h"
+#include "gpu_blas.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -1955,6 +1956,257 @@ bool argmax_count_matches(const float* probs, const int* targets,
     argmax_count_kernel<<<grid, block, smemBytes, computeStream()>>>(
         probs, targets, T, vocabSize, padToken, correct_count, valid_count);
     GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
+//  15f. Chunked cross-entropy loss (large-vocab unlock, no T × V scratch)
+// ===========================================================================
+//
+// Streaming log-sum-exp over vocab chunks.  See gpu_kernels.h for full API.
+
+namespace {
+
+// Initialize per-row streaming state: running_max = -inf, running_sum = 0,
+// target_logit = NaN (sentinel for "target not yet observed").
+__global__ void k_cce_init_state(float* __restrict__ running_max,
+                                 float* __restrict__ running_sum,
+                                 float* __restrict__ target_logit,
+                                 int T)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    running_max[t]  = -INFINITY;
+    running_sum[t]  = 0.0f;
+    // NaN sentinel: a target that never appears in any chunk means
+    // targets[t] < 0 or >= V (invalid / pad — skipped in the final reduce).
+    target_logit[t] = nanf("");
+}
+
+// Per-chunk streaming update.  One thread block per row of logits_chunk.
+// Computes chunk_max[t] and chunk_sum[t] = Σ_v exp(logits[t, v] - chunk_max),
+// then merges with the running_max, running_sum via the log-sum-exp rule:
+//     new_max = max(running_max, chunk_max)
+//     new_sum = running_sum · exp(running_max - new_max)
+//             + chunk_sum   · exp(chunk_max  - new_max)
+//
+// Additionally: if the target token for row t falls inside this chunk,
+// capture target_logit[t] = logits_chunk[t, target[t] - chunk_start].
+__global__ void k_cce_chunk_update(const float* __restrict__ logits_chunk,
+                                   const int* __restrict__ targets,
+                                   int T, int V_ch, int chunk_start, int chunk_end,
+                                   int padToken,
+                                   float* __restrict__ running_max,
+                                   float* __restrict__ running_sum,
+                                   float* __restrict__ target_logit)
+{
+    extern __shared__ float smem[];
+    const int t   = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (t >= T) return;
+
+    const float* row = logits_chunk + (size_t)t * V_ch;
+
+    // Per-thread local max + sum-exp contribution.
+    float local_max = -INFINITY;
+    for (int v = tid; v < V_ch; v += blockDim.x)
+    {
+        const float x = row[v];
+        if (x > local_max) local_max = x;
+    }
+    // Block reduce for max via shared memory + warp shuffle.
+    const int lane  = tid & 31;
+    const int warp  = tid >> 5;
+    for (int off = 16; off > 0; off >>= 1)
+    {
+        const float o = __shfl_xor_sync(0xffffffffu, local_max, off);
+        if (o > local_max) local_max = o;
+    }
+    if (lane == 0) smem[warp] = local_max;
+    __syncthreads();
+    const int nwarps = (blockDim.x + 31) >> 5;
+    float chunk_max = -INFINITY;
+    if (warp == 0)
+    {
+        float v = (tid < nwarps) ? smem[tid] : -INFINITY;
+        for (int off = 16; off > 0; off >>= 1)
+        {
+            const float o = __shfl_xor_sync(0xffffffffu, v, off);
+            if (o > v) v = o;
+        }
+        if (tid == 0) smem[0] = v;
+    }
+    __syncthreads();
+    chunk_max = smem[0];
+
+    // Second pass: sum_exp(logits - chunk_max).
+    float local_sum = 0.0f;
+    for (int v = tid; v < V_ch; v += blockDim.x)
+        local_sum += expf(row[v] - chunk_max);
+    // Block reduce sum.
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_xor_sync(0xffffffffu, local_sum, off);
+    if (lane == 0) smem[warp] = local_sum;
+    __syncthreads();
+    if (warp == 0)
+    {
+        float v = (tid < nwarps) ? smem[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_xor_sync(0xffffffffu, v, off);
+        if (tid == 0) smem[1] = v;
+    }
+    __syncthreads();
+    const float chunk_sum = smem[1];
+
+    // Thread 0 merges with running state and captures target if in chunk.
+    if (tid == 0)
+    {
+        const float rm = running_max[t];
+        const float rs = running_sum[t];
+        const float new_max = rm > chunk_max ? rm : chunk_max;
+        // If both rm and chunk_max are -inf, new_max is -inf — safe because
+        // exp(-inf - -inf) = exp(NaN) issue is avoided by the isinf guard.
+        float new_sum;
+        if (isinf(new_max) && new_max < 0.0f)
+            new_sum = 0.0f;
+        else
+            new_sum = rs * expf(rm - new_max) + chunk_sum * expf(chunk_max - new_max);
+        running_max[t] = new_max;
+        running_sum[t] = new_sum;
+
+        const int tgt = targets[t];
+        if (padToken >= 0 && tgt == padToken) return;
+        if (tgt < chunk_start || tgt >= chunk_end) return;
+        target_logit[t] = row[tgt - chunk_start];
+    }
+}
+
+// Final reduction: per-row loss[t] = log(running_sum[t]) + running_max[t]
+//                                    - target_logit[t]
+// Accumulate into loss_sum, and count valid rows into valid_count.
+__global__ void k_cce_finalize(const float* __restrict__ running_max,
+                               const float* __restrict__ running_sum,
+                               const float* __restrict__ target_logit,
+                               const int* __restrict__ targets,
+                               int T, int padToken,
+                               float* __restrict__ loss_sum,
+                               int* __restrict__ valid_count)
+{
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+
+    float local_loss = 0.0f;
+    int local_valid  = 0;
+    for (int t = tid; t < T; t += blockDim.x)
+    {
+        const int tgt = targets[t];
+        if (padToken >= 0 && tgt == padToken) continue;
+        if (!isfinite(target_logit[t])) continue;  // pad or out-of-range
+        const float lse = logf(running_sum[t]) + running_max[t];
+        local_loss += (lse - target_logit[t]);
+        ++local_valid;
+    }
+    // Reduce via warp shuffle + shared.
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    for (int off = 16; off > 0; off >>= 1)
+        local_loss += __shfl_xor_sync(0xffffffffu, local_loss, off);
+    if (lane == 0) smem[warp] = local_loss;
+    __syncthreads();
+    const int nwarps = (blockDim.x + 31) >> 5;
+    if (warp == 0)
+    {
+        float v = (tid < nwarps) ? smem[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_xor_sync(0xffffffffu, v, off);
+        if (tid == 0) atomicAdd(loss_sum, v);
+    }
+    __syncthreads();
+    // Count reduce.
+    float vF = (float)local_valid;
+    for (int off = 16; off > 0; off >>= 1)
+        vF += __shfl_xor_sync(0xffffffffu, vF, off);
+    if (lane == 0) smem[warp] = vF;
+    __syncthreads();
+    if (warp == 0)
+    {
+        float v = (tid < nwarps) ? smem[tid] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_xor_sync(0xffffffffu, v, off);
+        if (tid == 0) atomicAdd(valid_count, (int)v);
+    }
+}
+
+} // anonymous namespace
+
+bool chunked_cross_entropy_loss(const float* X, const float* W_lm,
+                                const int* targets,
+                                int T, int V, int d, int padToken,
+                                int V_chunk_size,
+                                float* loss_sum, int* valid_count,
+                                float* scratch)
+{
+    if (X == nullptr || W_lm == nullptr || targets == nullptr) return false;
+    if (loss_sum == nullptr || valid_count == nullptr || scratch == nullptr) return false;
+    if (T <= 0 || V <= 0 || d <= 0 || V_chunk_size <= 0) return false;
+
+    float* logits_chunk = scratch;
+    float* running_max  = scratch + (size_t)T * V_chunk_size;
+    float* running_sum  = running_max + T;
+    float* target_logit = running_sum + T;
+
+    GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, sizeof(float)));
+    GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+
+    {
+        const int block = 256;
+        const int grid  = (T + block - 1) / block;
+        k_cce_init_state<<<grid, block, 0, computeStream()>>>(
+            running_max, running_sum, target_logit, T);
+        GLADES_CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Process V in chunks.
+    for (int cs = 0; cs < V; cs += V_chunk_size)
+    {
+        const int ce   = (cs + V_chunk_size < V) ? (cs + V_chunk_size) : V;
+        const int V_ch = ce - cs;
+
+        // logits_chunk [T × V_ch] = X [T × d] · W_lm[cs:ce, :]^T  [V_ch × d]^T
+        // sgemm_rowmajor_abt: C[M,N] = A[M,K] · B^T[K,N], B stored as [N,K].
+        // Here A=X [T,d], B=W_lm_chunk [V_ch, d], result logits_chunk [T, V_ch].
+        if (!sgemm_rowmajor_abt(T, V_ch, d,
+                                1.0f,
+                                X,                           d,
+                                W_lm + (size_t)cs * d,       d,
+                                0.0f,
+                                logits_chunk,                V_ch))
+            return false;
+
+        // Stream update: running max/sum + capture target_logit.
+        {
+            const int block  = 128;
+            const int nwarps = (block + 31) >> 5;
+            const size_t smemBytes = (nwarps + 2) * sizeof(float);
+            k_cce_chunk_update<<<T, block, smemBytes, computeStream()>>>(
+                logits_chunk, targets,
+                T, V_ch, cs, ce, padToken,
+                running_max, running_sum, target_logit);
+            GLADES_CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
+    // Final loss reduction.
+    {
+        const int block  = 256;
+        const int nwarps = (block + 31) >> 5;
+        const size_t smemBytes = (nwarps + 1) * sizeof(float);
+        k_cce_finalize<<<1, block, smemBytes, computeStream()>>>(
+            running_max, running_sum, target_logit, targets,
+            T, padToken, loss_sum, valid_count);
+        GLADES_CUDA_CHECK(cudaGetLastError());
+    }
+
     return true;
 }
 
