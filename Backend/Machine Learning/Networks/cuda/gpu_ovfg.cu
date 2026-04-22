@@ -5,6 +5,7 @@
 #include "gpu_blas.h"
 #include "gpu_device.h"
 #include "gpu_stiefel.h"
+#include <cusolverDn.h>
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -142,6 +143,44 @@ __global__ void k_ovfg_scale_cols_by_diag(float* __restrict__ M,
 	const unsigned int j = blockIdx.y * blockDim.x + threadIdx.x;
 	if (i >= rows || j >= cols) return;
 	M[(size_t)i * cols + j] *= sigma[j];
+}
+
+// ========================================================================
+// Column-broadcast scaled copy with sqrt: dst[i, j] = src[i, j] * √diag[j].
+// Both src and dst are row-major (rows × cols).  Used to assemble
+// L_out = U_col · diag(√Σ) and R_out = V_col · diag(√Σ) in the
+// truncate_factors path.
+// ========================================================================
+__global__ void k_ovfg_scale_cols_by_sqrt_diag_copy(
+    const float* __restrict__ src,
+    const float* __restrict__ diag,
+    unsigned int rows,
+    unsigned int cols,
+    float* __restrict__ dst)
+{
+	const unsigned int i = blockIdx.x;
+	const unsigned int j = blockIdx.y * blockDim.x + threadIdx.x;
+	if (i >= rows || j >= cols) return;
+	const float d = diag[j];
+	const float s = d > 0.0f ? sqrtf(d) : 0.0f;
+	dst[(size_t)i * cols + j] = src[(size_t)i * cols + j] * s;
+}
+
+// ========================================================================
+// Extract the first `r_out` columns from a row-major (rows × r_in)
+// matrix into a (rows × r_out) row-major matrix.  Used to truncate U_K
+// / V_K after SVD.
+// ========================================================================
+__global__ void k_ovfg_copy_first_cols(const float* __restrict__ src,
+                                       unsigned int rows,
+                                       unsigned int r_in,
+                                       unsigned int r_out,
+                                       float* __restrict__ dst)
+{
+	const unsigned int i = blockIdx.x;
+	const unsigned int j = blockIdx.y * blockDim.x + threadIdx.x;
+	if (i >= rows || j >= r_out) return;
+	dst[(size_t)i * r_out + j] = src[(size_t)i * r_in + j];
 }
 
 } // anonymous namespace
@@ -559,6 +598,214 @@ bool ovfg_stiefel_unconstrained_grad(const GpuStiefelWeight& s,
 	}
 
 	// No tangent projection — caller (typically stiefel_adam_step) applies.
+	return true;
+}
+
+// ========================================================================
+// File-local cuSOLVER state for OVFG.  Kept separate from Stiefel's
+// solver workspace so the two modules don't contend for cached
+// allocations during concurrent backward passes.
+// ========================================================================
+namespace {
+cusolverDnHandle_t g_ovfgSolver = nullptr;
+bool g_ovfgSolverReady = false;
+int* g_ovfgInfo = nullptr;
+
+bool ovfg_solver_init()
+{
+	if (!g_ovfgSolverReady)
+	{
+		if (cusolverDnCreate(&g_ovfgSolver) != CUSOLVER_STATUS_SUCCESS)
+			return false;
+		g_ovfgSolverReady = true;
+	}
+	cusolverDnSetStream(g_ovfgSolver, computeStream());
+	if (g_ovfgInfo == nullptr)
+	{
+		if (cudaMalloc(&g_ovfgInfo, sizeof(int)) != cudaSuccess) return false;
+	}
+	return true;
+}
+} // anonymous namespace
+
+// ========================================================================
+// ovfg_truncate_factors — PHASE 2b naive dense-SVD path.
+//
+// See gpu_ovfg.h for full API + rationale.  Current implementation:
+//
+//   (1) Materialize G = L · R^T  (m × n, row-major).  This is the
+//       costly step that Phase 2c will eliminate.
+//   (2) Transpose G to column-major (cuSOLVER convention).
+//   (3) cusolverDnSgesvd(G_col) → U_col (m × m), Σ (min(m,n)), V^T_col (n × n).
+//   (4) Transpose U_col → U (m × m, row-major).  V is obtained by
+//       transposing V^T_col once (VT_col is [n × n] col-major = [n × n]
+//       row-major of V itself, no transpose needed).
+//   (5) Truncate: take top r_out columns of U and of V; take first r_out
+//       entries of Σ.
+//   (6) L_out = U_trunc · diag(√Σ_trunc)     (m × r_out)
+//       R_out = V_trunc · diag(√Σ_trunc)     (n × r_out)
+//       ⇒ L_out · R_out^T = U Σ V^T restricted to top r_out = best
+//       rank-r_out approximation of G by Eckart–Young.
+// ========================================================================
+bool ovfg_truncate_factors(const float* L, const float* R,
+                           unsigned int m, unsigned int n,
+                           unsigned int r_in, unsigned int r_out,
+                           float* L_out, float* R_out,
+                           float* scratch)
+{
+	if (L == nullptr || R == nullptr || L_out == nullptr || R_out == nullptr)
+		return false;
+	if (scratch == nullptr) return false;
+	if (m == 0u || n == 0u || r_in == 0u || r_out == 0u) return false;
+	if (r_out > r_in) return false;
+	if (!ovfg_solver_init()) return false;
+
+	const unsigned int k_full = m < n ? m : n;
+	if (r_out > k_full) return false;
+
+	// Scratch layout (row-major unless noted):
+	//   G       [m × n]
+	//   G_col   [m × n] column-major (staging for SVD)
+	//   U_col   [m × m] column-major (SVD output)
+	//   Sigma   [k_full]
+	//   VT_col  [n × n] column-major (= V row-major)
+	//   U_rm    [m × m] row-major staging for truncation copy
+	const size_t off_G     = 0;
+	const size_t off_G_col = off_G   + (size_t)m * n;
+	const size_t off_U_col = off_G_col + (size_t)m * n;
+	const size_t off_Sigma = off_U_col + (size_t)m * m;
+	const size_t off_VT    = off_Sigma + k_full;
+	const size_t off_U_rm  = off_VT    + (size_t)n * n;
+
+	float* G      = scratch + off_G;
+	float* G_col  = scratch + off_G_col;
+	float* U_col  = scratch + off_U_col;
+	float* Sigma  = scratch + off_Sigma;
+	float* VT_col = scratch + off_VT;
+	float* U_rm   = scratch + off_U_rm;
+
+	// (1) G = L · R^T using the existing parity helper.
+	if (!ovfg_compute_dense_from_factors(L, R, m, n, r_in, G))
+		return false;
+
+	// (2) Transpose G (row-major [m × n]) to column-major [m × n] for cuSOLVER.
+	// Column-major [m × n] with leading-dim m is the row-major transpose.
+	{
+		dim3 block(32, 32);
+		dim3 grid((n + 31u) / 32u, (m + 31u) / 32u);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(G, G_col, m, n);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// (3) Query SVD workspace.
+	int lwork = 0;
+	if (cusolverDnSgesvd_bufferSize(g_ovfgSolver, m, n, &lwork)
+	    != CUSOLVER_STATUS_SUCCESS)
+		return false;
+	static thread_local float* svd_work = nullptr;
+	static thread_local size_t svd_work_cap = 0;
+	if (static_cast<size_t>(lwork) > svd_work_cap)
+	{
+		if (svd_work) cudaFree(svd_work);
+		if (cudaMalloc(&svd_work, lwork * sizeof(float)) != cudaSuccess)
+			return false;
+		svd_work_cap = lwork;
+	}
+
+	// (4) Full SVD (jobu='A', jobvt='A' → full m×m U and n×n V^T).
+	cusolverStatus_t st = cusolverDnSgesvd(
+	    g_ovfgSolver, 'A', 'A', m, n, G_col, m,
+	    Sigma, U_col, m, VT_col, n,
+	    svd_work, lwork, nullptr, g_ovfgInfo);
+	if (st != CUSOLVER_STATUS_SUCCESS) return false;
+	int host_info = 0;
+	cudaMemcpyAsync(&host_info, g_ovfgInfo, sizeof(int),
+	                cudaMemcpyDeviceToHost, computeStream());
+	cudaStreamSynchronize(computeStream());
+	if (host_info != 0) return false;
+
+	// (5) Transpose U_col ([m × m] col-major = [m × m] row-major of U^T)
+	// to U_rm (row-major U).
+	// Actually: column-major element U_col[j * m + i] stores U[i, j] in the
+	// mathematical sense (cuSOLVER's U with left singular vectors as cols).
+	// In row-major layout, U[i, j] = U_col[j * m + i].  So the row-major
+	// U has the same bytes but differently-indexed.  We just need to
+	// "transpose" col-major to row-major — which is a plain transpose of
+	// the (m × m) buffer.
+	{
+		dim3 block(32, 32);
+		dim3 grid((m + 31u) / 32u, (m + 31u) / 32u);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(U_col, U_rm, m, m);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// VT_col is column-major [n × n], i.e., row-major V^T has element
+	// V^T[i, j] = VT_col[j * n + i].  We want V (row-major, [n × n]),
+	// which equals (V^T)^T, i.e., V[i, j] = V^T[j, i] = VT_col[i * n + j].
+	// That means VT_col reinterpreted as row-major IS V row-major already.
+	// No transpose needed — we can use VT_col directly as V_rm.
+	float* V_rm = VT_col;
+
+	// (6) Truncate to first r_out columns of U_rm (m × r_out) and first
+	// r_out columns of V_rm (n × r_out); then scale by √Σ.
+	// U_rm is (m × m); copy columns [0, r_out) into L_out (m × r_out)
+	// first, then scale by √Σ in place (writing into L_out).
+	// We use two kernels: copy_first_cols → scale_cols_by_sqrt_diag_copy.
+	// Simpler: one fused kernel that reads U_rm and writes L_out scaled.
+	{
+		dim3 block(64);
+		dim3 grid(m, (r_out + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_sqrt_diag_copy<<<grid, block, 0, computeStream()>>>(
+		    U_rm, Sigma, m, r_out, L_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// But we need the first r_out cols of U_rm (which is m × m).  The
+	// kernel above reads U_rm[i, j] at offset i*m + j, but we want the
+	// (m × r_out) strided read i*m + j for j < r_out.  The kernel uses
+	// "cols" for the dst (r_out), but for src reads cols = r_out too.
+	// That's WRONG — we'd read the wrong elements.  Fix by copying first.
+	// Actually re-examining: the kernel does
+	//     dst[i * cols + j] = src[i * cols + j] * √diag[j]
+	// With cols = r_out and src = U_rm (m × m), that reads U_rm[i * r_out + j],
+	// which for j < r_out is NOT the first r_out columns of U_rm (it would
+	// be the first r_out of row i in a r_out-wide layout, not m-wide).
+	// The right answer: first copy-compact U_rm[:, :r_out] into a temp,
+	// then scale.  Let's do that cleanly with k_ovfg_copy_first_cols.
+
+	// Redo: overwrite L_out with a compact copy of U_rm[:, :r_out].
+	{
+		dim3 block(64);
+		dim3 grid(m, (r_out + block.x - 1u) / block.x);
+		k_ovfg_copy_first_cols<<<grid, block, 0, computeStream()>>>(
+		    U_rm, m, m, r_out, L_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// Now L_out has shape (m × r_out) and contains U[:, :r_out].
+	// Scale columns by √Σ in place (src = dst = L_out, cols = r_out).
+	{
+		dim3 block(64);
+		dim3 grid(m, (r_out + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_sqrt_diag_copy<<<grid, block, 0, computeStream()>>>(
+		    L_out, Sigma, m, r_out, L_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
+	// Same for R_out = V[:, :r_out] · diag(√Σ).
+	{
+		dim3 block(64);
+		dim3 grid(n, (r_out + block.x - 1u) / block.x);
+		k_ovfg_copy_first_cols<<<grid, block, 0, computeStream()>>>(
+		    V_rm, n, n, r_out, R_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	{
+		dim3 block(64);
+		dim3 grid(n, (r_out + block.x - 1u) / block.x);
+		k_ovfg_scale_cols_by_sqrt_diag_copy<<<grid, block, 0, computeStream()>>>(
+		    R_out, Sigma, n, r_out, R_out);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+
 	return true;
 }
 

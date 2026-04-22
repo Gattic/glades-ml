@@ -248,6 +248,39 @@ bool ovfg_stiefel_unconstrained_grad(const GpuStiefelWeight& s,
                                      float* dU, float* dSigma, float* dV,
                                      float* scratch);
 
+// ========================================================================
+// ovfg_truncate_factors — rank truncation of a factored matrix.
+//
+// Given M = L · R^T with L ∈ R^{m × r_in}, R ∈ R^{n × r_in}, produce the
+// best rank-r_out approximation
+//     M ≈ L_out · R_out^T,    L_out ∈ R^{m × r_out}, R_out ∈ R^{n × r_out},
+// with r_out ≤ r_in, by truncated SVD of M (Eckart–Young optimality).
+//
+// **Usage context.**  After each call to ovfg_first_moment_append the
+// factored Adam first moment gains r_acc extra columns.  Without
+// periodic truncation, rank doubles per step and saturates min(m,n)
+// quickly.  ovfg_truncate_factors caps rank back to r_max, preserving
+// the dominant singular components of the moment.
+//
+// **Implementation.**  Phase 2b uses the naive dense-SVD path:
+//     1. Reconstruct G = L · R^T  (m × n, materialized — defeats OVFG's
+//        memory point for this step).
+//     2. Full SVD of G via cusolverDnSgesvd.
+//     3. Truncate to top r_out, split √Σ equally into L_out, R_out.
+// This is CORRECT but not memory-efficient — the factored-QR + small-SVD
+// replacement (Phase 2c) avoids the m×n materialization entirely.
+// Current path is suitable for periodic (every-k-steps) truncation
+// where the dense-SVD overhead amortizes across steps.
+//
+// Scratch requirement: max(m*n, 2*m*m + 2*n*n + min(m,n)) floats.
+// Caller supplies one buffer of that size.
+// ========================================================================
+bool ovfg_truncate_factors(const float* L, const float* R,
+                           unsigned int m, unsigned int n,
+                           unsigned int r_in, unsigned int r_out,
+                           float* L_out, float* R_out,
+                           float* scratch);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -280,6 +313,10 @@ inline bool ovfg_stiefel_tangent_grad(const GpuStiefelWeight&,
 inline bool ovfg_stiefel_unconstrained_grad(const GpuStiefelWeight&,
                                             const float*, const float*, unsigned int,
                                             float*, float*, float*, float*) { return false; }
+inline bool ovfg_truncate_factors(const float*, const float*,
+                                  unsigned int, unsigned int,
+                                  unsigned int, unsigned int,
+                                  float*, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 
