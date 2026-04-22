@@ -9422,6 +9422,7 @@ void CHIRONUnitTest()
 	CHIRONLcpGatherScatterRoundtripTest();
 	CHIRONLcpDeltaParityTest();
 	CHIRONLcpEndToEndDetailCorrectionTest();
+	CHIRONLcpRoutingThroughputBenchmark();
 	CHIRONTrcdRoutingThroughputBenchmark();
 	CHIRONTrcdEndToEndConvergenceTest();
 	CHIRONStiefelIdentityRecoveryTest();
@@ -12025,6 +12026,94 @@ void CHIRONLcpDeltaParityTest()
 	// when gather+scatter+delta cascade is composed.
 #else
 	std::printf("  [lcp delta] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONLcpRoutingThroughputBenchmark ---------------------------------------
+// Paradigm shift #16 Phase 3 prep: measure LCP routing overhead at
+// pile_large-scale dims.  Parallels CHIRONTrcdRoutingThroughputBenchmark.
+//
+// Cycle = lsh_project + bucket_first_index + gather + delta + scatter +
+//         scatter_backward.  Reports wall-clock per cycle + break-even
+// against the ~8-ms transformer-block cost.
+void CHIRONLcpRoutingThroughputBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [lcp throughput bench] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 2048;
+	const unsigned int d = 1024;
+	const unsigned int K = 8;       // 2^8 = 256 potential buckets
+	const unsigned int M_max = 512; // target n_reps ≈ T/4
+	const int warmup = 10;
+	const int iters  = 50;
+
+	LCG rng(202604231u);
+	std::vector<float> h_host((size_t)T * d);
+	for (size_t i = 0; i < h_host.size(); ++i) h_host[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_h, d_R, d_reps, d_delta, d_out, d_dh;
+	glades::gpu::GpuBuffer<unsigned int> d_buckets, d_repidx, d_cluster;
+	d_h.allocate(h_host.size()); d_h.upload(&h_host[0], h_host.size());
+	d_R.allocate((size_t)d * K);
+	d_reps.allocate((size_t)M_max * d);
+	d_delta.allocate(h_host.size());
+	d_out.allocate(h_host.size());
+	d_dh.allocate((size_t)M_max * d);
+	d_buckets.allocate(T);
+	d_repidx.allocate(M_max);
+	d_cluster.allocate(T);
+
+	ASSERT("lsh init",
+	    glades::gpu::lcp_lsh_init_matrix(d_R.data(), d, K, 0x42ULL));
+
+	// Warmup.
+	for (int w = 0; w < warmup; ++w) {
+		glades::gpu::lcp_lsh_project(d_h.data(), d_R.data(), T, d, K, d_buckets.data());
+		int n_reps = 0;
+		glades::gpu::lcp_bucket_first_index(d_buckets.data(), T, M_max,
+		    d_repidx.data(), &n_reps, d_cluster.data());
+		glades::gpu::lcp_gather(d_h.data(), d_repidx.data(),
+		    (unsigned int)n_reps, d, d_reps.data());
+		glades::gpu::lcp_compute_delta(d_h.data(), d_reps.data(), d_cluster.data(),
+		    T, d, d_delta.data());
+		glades::gpu::lcp_scatter(d_reps.data(), d_cluster.data(), T, d, d_out.data());
+		glades::gpu::lcp_scatter_backward(d_h.data(), d_cluster.data(),
+		    T, d, (unsigned int)n_reps, false, d_dh.data());
+	}
+	glades::gpu::synchronizeCheck("lcp bench warmup");
+
+	const double t0 = wall_ms_chiron();
+	int last_n_reps = 0;
+	for (int i = 0; i < iters; ++i) {
+		glades::gpu::lcp_lsh_project(d_h.data(), d_R.data(), T, d, K, d_buckets.data());
+		int n_reps = 0;
+		glades::gpu::lcp_bucket_first_index(d_buckets.data(), T, M_max,
+		    d_repidx.data(), &n_reps, d_cluster.data());
+		last_n_reps = n_reps;
+		glades::gpu::lcp_gather(d_h.data(), d_repidx.data(),
+		    (unsigned int)n_reps, d, d_reps.data());
+		glades::gpu::lcp_compute_delta(d_h.data(), d_reps.data(), d_cluster.data(),
+		    T, d, d_delta.data());
+		glades::gpu::lcp_scatter(d_reps.data(), d_cluster.data(), T, d, d_out.data());
+		glades::gpu::lcp_scatter_backward(d_h.data(), d_cluster.data(),
+		    T, d, (unsigned int)n_reps, false, d_dh.data());
+	}
+	glades::gpu::synchronizeCheck("lcp bench hot");
+	const double t_hot = wall_ms_chiron() - t0;
+	const double per_cycle = t_hot / (double)iters;
+
+	const double block_ms_est = 8.0;  // approx pile_large block forward+backward
+	const double break_even_blocks = per_cycle / block_ms_est;
+	std::printf("  [lcp throughput bench] T=%u d=%u K=%u n_reps=%d: %d cycles in %.2f ms "
+	            "(%.4f ms/cycle; break-even %.3f%% of one 8-ms block)\n",
+	            T, d, K, last_n_reps, iters, t_hot, per_cycle, break_even_blocks * 100.0);
+	ASSERT("lcp routing cost per cycle < 5 ms", per_cycle < 5.0);
+#else
+	std::printf("  [lcp throughput bench] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 
