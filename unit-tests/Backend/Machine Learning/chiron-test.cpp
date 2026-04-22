@@ -4236,6 +4236,114 @@ void CHIRONStiefelSvdInitTest()
 #endif
 }
 
+// CHIRONStiefelDenseGradParityTest ------------------------------------------
+// Validates stiefel_dense_grad_to_tangent against stiefel_backward_unconstrained
+// + manual tangent projection: both paths should produce the same
+// tangent-projected gradients (dU, dΣ, dV).
+//
+// Path A (factored backward):
+//     stiefel_backward_unconstrained(dY, X, sw)            → (dU_A, dΣ_A, dV_A)
+//     stiefel_tangent_project_grad(sw, dU_A, dV_A)          → tangent-projected
+//
+// Path B (dense backward bridge):
+//     dW_dense = dY^T · X                                    (compute manually)
+//     stiefel_dense_grad_to_tangent(sw, dW_dense, ...)      → (dU_B, dΣ_B, dV_B)
+//
+// Both paths should match within BF16 + FP32 precision (~1e-3).
+void CHIRONStiefelDenseGradParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel dense-grad parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int m = 24, n = 18, r = 8, B = 12;
+
+	LCG rng(20260421u);
+	std::vector<float> U(m * r), V(n * r), sigma(r), X(B * n), dY(B * m);
+	for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+	gram_schmidt_cols(U, m, r);
+	gram_schmidt_cols(V, n, r);
+	for (size_t i = 0; i < sigma.size(); ++i) sigma[i] = 0.5f + std::abs(rng.next_unit());
+	for (size_t i = 0; i < X.size(); ++i) X[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < dY.size(); ++i) dY[i] = 0.1f * rng.next_unit();
+
+	std::vector<uint16_t> U_bf, V_bf;
+	fp32_to_bf16_rne(U, U_bf);
+	fp32_to_bf16_rne(V, V_bf);
+
+	glades::gpu::GpuStiefelWeight sw;
+	sw.allocate(m, n, r);
+	sw.U.upload(&U_bf[0], U_bf.size());
+	sw.V.upload(&V_bf[0], V_bf.size());
+	sw.sigma.upload(&sigma[0], sigma.size());
+
+	glades::gpu::GpuBuffer<float> d_X, d_dY, d_dW, d_scratchBr,
+	    d_dU_A, d_dV_A, d_dS_A, d_dU_B, d_dV_B, d_dS_B,
+	    d_rrU, d_rrV, d_scratch_mr;
+	d_X.allocate(B * n); d_X.upload(&X[0], X.size());
+	d_dY.allocate(B * m); d_dY.upload(&dY[0], dY.size());
+	d_dW.allocate(m * n);
+	d_scratchBr.allocate(B * r);
+	d_dU_A.allocate(m * r);  d_dV_A.allocate(n * r);  d_dS_A.allocate(r);
+	d_dU_B.allocate(m * r);  d_dV_B.allocate(n * r);  d_dS_B.allocate(r);
+	d_rrU.allocate(r * r);   d_rrV.allocate(r * r);
+	// scratch_mr for dense_grad_to_tangent must be max(m*r, r*n) — here r*n > m*r.
+	d_scratch_mr.allocate(size_t(r) * n > size_t(m) * r ? size_t(r) * n : size_t(m) * r);
+
+	// --- Path A: factored backward + manual tangent projection ---
+	glades::gpu::stiefel_backward_unconstrained(
+	    d_dY.data(), d_X.data(), false, sw, (float*)0,
+	    d_dU_A.data(), d_dS_A.data(), d_dV_A.data(),
+	    d_scratchBr.data(), B);
+	glades::gpu::stiefel_tangent_project_grad(
+	    sw, d_dU_A.data(), d_dV_A.data(), d_rrU.data(), d_rrV.data());
+
+	// --- Path B: compute dW_dense = dY^T · X then project ---
+	// dW[m, n] = dY^T [m, B] · X [B, n]
+	if (!glades::gpu::sgemm_rowmajor_atb(m, n, B, 1.0f, d_dY.data(), m,
+	                                     d_X.data(), n, 0.0f, d_dW.data(), n))
+	{
+		ASSERT("dW_dense GEMM", false);
+		sw.release();
+		return;
+	}
+	glades::gpu::stiefel_dense_grad_to_tangent(
+	    sw, d_dW.data(),
+	    d_dU_B.data(), d_dS_B.data(), d_dV_B.data(),
+	    d_scratch_mr.data(), d_rrU.data(), d_rrV.data());
+
+	// --- Compare ---
+	std::vector<float> dU_A(m * r), dV_A(n * r), dS_A(r),
+	                   dU_B(m * r), dV_B(n * r), dS_B(r);
+	d_dU_A.download(&dU_A[0], dU_A.size());
+	d_dV_A.download(&dV_A[0], dV_A.size());
+	d_dS_A.download(&dS_A[0], dS_A.size());
+	d_dU_B.download(&dU_B[0], dU_B.size());
+	d_dV_B.download(&dV_B[0], dV_B.size());
+	d_dS_B.download(&dS_B[0], dS_B.size());
+
+	const float err_U = max_abs_diff(dU_A, dU_B);
+	const float err_V = max_abs_diff(dV_A, dV_B);
+	const float err_S = max_abs_diff(dS_A, dS_B);
+
+	std::printf("  stiefel dense-grad parity: dU=%.3e dV=%.3e dΣ=%.3e\n",
+	            err_U, err_V, err_S);
+	ASSERT("dense_grad_to_tangent dU matches factored backward",
+	       err_U < 5e-3f);
+	ASSERT("dense_grad_to_tangent dV matches factored backward",
+	       err_V < 5e-3f);
+	ASSERT("dense_grad_to_tangent dΣ matches factored backward",
+	       err_S < 5e-3f);
+
+	sw.release();
+#else
+	std::printf("  [stiefel dense-grad parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -4244,6 +4352,7 @@ void CHIRONUnitTest()
 	CHIRONStiefelTangentProjectionTest();
 	CHIRONStiefelQRRetractionTest();
 	CHIRONStiefelSvdInitTest();
+	CHIRONStiefelDenseGradParityTest();
 	CHIRONStiefelAdamDescentTest();
 	CHIRONStiefelCayleyRetractionTest();
 	CHIRONStiefelLargeScaleTrainingTest();
