@@ -146,7 +146,7 @@ void stiefel_reconstruct_dense(const GpuStiefelWeight& s, float* W_dense)
 	dim3 block(16, 16);
 	dim3 grid((s.n + block.x - 1) / block.x, (s.m + block.y - 1) / block.y);
 
-	k_stiefel_reconstruct<<<grid, block>>>(s.U.data(), s.sigma.data(),
+	k_stiefel_reconstruct<<<grid, block, 0, computeStream()>>>(s.U.data(), s.sigma.data(),
 	                                       s.V.data(), W_dense,
 	                                       s.m, s.n, s.r);
 	GLADES_CUDA_CHECK(cudaGetLastError());
@@ -206,7 +206,7 @@ void stiefel_forward(const void* X, bool x_bf16,
 	{
 		dim3 block(64);
 		dim3 grid(B, (s.r + block.x - 1) / block.x);
-		k_scale_cols_by_diag<<<grid, block>>>(scratch1, sig, B, s.r);
+		k_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(scratch1, sig, B, s.r);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
@@ -322,7 +322,7 @@ void stiefel_backward_unconstrained(
 	{
 		dim3 block(64);
 		dim3 grid(B, (s.r + block.x - 1) / block.x);
-		k_scale_cols_by_diag<<<grid, block>>>(T3, sig, B, s.r);
+		k_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(T3, sig, B, s.r);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
@@ -350,7 +350,7 @@ void stiefel_backward_unconstrained(
 	{
 		dim3 block(64);
 		dim3 grid((s.r + block.x - 1) / block.x);
-		k_rowwise_sum_product<<<grid, block>>>(T1, XV_cache, dsigma, B, s.r);
+		k_rowwise_sum_product<<<grid, block, 0, computeStream()>>>(T1, XV_cache, dsigma, B, s.r);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
@@ -358,7 +358,7 @@ void stiefel_backward_unconstrained(
 	{
 		dim3 block(64);
 		dim3 grid(B, (s.r + block.x - 1) / block.x);
-		k_scale_cols_by_diag<<<grid, block>>>(T1, sig, B, s.r);
+		k_scale_cols_by_diag<<<grid, block, 0, computeStream()>>>(T1, sig, B, s.r);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
 
@@ -435,7 +435,7 @@ static void stiefel_project_one(const uint16_t* A_bf, unsigned int rows,
 	{
 		dim3 block(16, 16);
 		dim3 grid((r + block.x - 1) / block.x, (r + block.y - 1) / block.y);
-		k_symmetrize_inplace<<<grid, block>>>(scratch_rr, r);
+		k_symmetrize_inplace<<<grid, block, 0, computeStream()>>>(scratch_rr, r);
 		cudaGetLastError();
 	}
 
@@ -570,7 +570,7 @@ static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
 		const size_t n = sz;
 		dim3 block(256);
 		dim3 grid((n + block.x - 1) / block.x);
-		k_add_inplace<<<grid, block>>>(A_f32, eta, n);
+		k_add_inplace<<<grid, block, 0, computeStream()>>>(A_f32, eta, n);
 		cudaGetLastError();
 	}
 
@@ -579,7 +579,7 @@ static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
 	{
 		dim3 block(16, 16);
 		dim3 grid((r + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
-		k_transpose_2d<<<grid, block>>>(A_f32, A_col, rows, r);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(A_f32, A_col, rows, r);
 		cudaGetLastError();
 	}
 
@@ -645,7 +645,7 @@ static bool stiefel_qr_retract_one(uint16_t* A_bf, float* tau,
 		dim3 grid((rows + block.x - 1) / block.x, (r + block.y - 1) / block.y);
 		// A_col is column-major [rows × r] = row-major [r × rows]; transpose
 		// back into A_f32 row-major [rows × r].
-		k_transpose_2d<<<grid, block>>>(A_col, A_f32, r, rows);
+		k_transpose_2d<<<grid, block, 0, computeStream()>>>(A_col, A_f32, r, rows);
 		cudaGetLastError();
 	}
 	cast_f32_to_bf16(A_f32, A_bf, sz);
@@ -666,7 +666,7 @@ void stiefel_retract_qr(GpuStiefelWeight& s,
 	{
 		dim3 block(64);
 		dim3 grid((s.r + block.x - 1) / block.x);
-		k_sigma_fisher_rao<<<grid, block>>>(s.sigma.data(), eta_sigma, s.r);
+		k_sigma_fisher_rao<<<grid, block, 0, computeStream()>>>(s.sigma.data(), eta_sigma, s.r);
 		cudaGetLastError();
 	}
 }
@@ -738,7 +738,7 @@ void stiefel_adam_step(GpuStiefelWeight& s,
 		dim3 block(256);
 		const size_t nU = size_t(s.m) * s.r;
 		dim3 grid((nU + block.x - 1) / block.x);
-		k_adam_step_and_eta<<<grid, block>>>(dU, s.m_U.data(), s.v_U.data(),
+		k_adam_step_and_eta<<<grid, block, 0, computeStream()>>>(dU, s.m_U.data(), s.v_U.data(),
 		                                     scratch_etaU, lr, beta1, beta2,
 		                                     eps, bc1, bc2, nU);
 	}
@@ -746,14 +746,14 @@ void stiefel_adam_step(GpuStiefelWeight& s,
 		dim3 block(256);
 		const size_t nV = size_t(s.n) * s.r;
 		dim3 grid((nV + block.x - 1) / block.x);
-		k_adam_step_and_eta<<<grid, block>>>(dV, s.m_V.data(), s.v_V.data(),
+		k_adam_step_and_eta<<<grid, block, 0, computeStream()>>>(dV, s.m_V.data(), s.v_V.data(),
 		                                     scratch_etaV, lr, beta1, beta2,
 		                                     eps, bc1, bc2, nV);
 	}
 	{
 		dim3 block(64);
 		dim3 grid((s.r + block.x - 1) / block.x);
-		k_adam_step_and_eta<<<grid, block>>>(dsigma, s.m_sigma.data(),
+		k_adam_step_and_eta<<<grid, block, 0, computeStream()>>>(dsigma, s.m_sigma.data(),
 		                                     s.v_sigma.data(),
 		                                     scratch_etaS, lr, beta1, beta2,
 		                                     eps, bc1, bc2, s.r);

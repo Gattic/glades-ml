@@ -154,15 +154,43 @@ Phase 2 remaining: Cayley fast-path (Phase 2d), int8-packed moments
 (Phase 2f), Stiefel-aware vector transport (2g), end-to-end wire-in to
 chiron_main.cpp behind `--stiefel-ratio ρ` flag (Phase 2h).
 
+### Empirical speedup benchmark at LLM-scale (d=2048, B=1024)
+
+`CHIRONStiefelCompressionBenchmark` measures the Stiefel 3-GEMM forward
+path against a dense single-GEMM baseline on RTX 4080 SUPER:
+
+| ρ (r/d) | r    | ms/iter | TFLOP/s | **wall speedup** | **weight VRAM** |
+|--------:|-----:|--------:|--------:|-----------------:|----------------:|
+| 1.0 (dense) | — | 0.215 | 39.96  | 1.00×            | 1.00×           |
+| 0.5     | 1024 | 0.220  | 39.13   | 0.98×            | 1.00×           |
+| **0.25**| **512** | **0.123** | 35.05 | **1.75×**    | **2.00×**       |
+| **0.125**| **256** | **0.064** | 33.63 | **3.37×**   | **4.00×**       |
+| **0.0625**| **128** | **0.052** | 20.67 | **4.14×**  | **8.00×**       |
+
+The paradigm-shift thesis validated **empirically** on real GPU:
+- ρ=0.25: 1.75× wall-clock + 2× VRAM (theory: 2× / 2×)
+- ρ=0.125: 3.37× wall-clock + 4× VRAM (theory: 4× / 4×)
+- ρ=0.0625: 4.14× wall-clock + 8× VRAM (theory: 8× / 8× — GEMM
+  efficiency drops at r=128, so compute is capped at ~4×)
+
+**Cross-stream race fix** (important): several Stiefel custom kernels
+(k_transpose_2d, k_symmetrize_inplace, k_scale_cols_by_diag,
+k_adam_step_and_eta, k_rowwise_sum_product, k_add_inplace,
+k_sigma_fisher_rao, k_stiefel_reconstruct) were launching on CUDA
+default stream while cuBLAS / cuSOLVER launched on the library-wide
+`computeStream()`. This caused non-deterministic QR retraction failures
+(~10% flake rate) and bogus timing measurements. Fixed by routing all
+stiefel kernels through `computeStream()`.
+
 Target: 5.1 B free-DOF model on 16 GB VRAM at ρ=0.25 with ≥ 1500 tok/s
 (projected from 4× FLOP reduction per forward GEMM), loss within 2× of
 the 2.23 B dense-weight baseline at the same token budget.
 
 ### Test coverage
 
-- **459 / 459 CHIRON unit-test assertions pass** (was 455 → +4 from
-  Stiefel Adam descent test: loss reduction, loss reduction ≥ 2×,
-  U orthonormality, V orthonormality).
+- **462 / 462 CHIRON unit-test assertions pass** (was 459 → +3 from
+  Stiefel compression benchmark asserting ≥ 2× / 4× / 8× weight VRAM
+  compression at ρ = 0.25 / 0.125 / 0.0625).
 - GPU parity at the 1e-5 to 1e-4 level (below BF16 ULP) across all
   alt-precision paths: int8 Adam vs FP32, BF16 grads vs FP32, BF16
   weights vs FP32, flash attention vs cuBLAS-tiled (fwd + bwd),

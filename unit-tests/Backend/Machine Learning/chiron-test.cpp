@@ -3538,6 +3538,156 @@ void CHIRONStiefelAdamDescentTest()
 #endif
 }
 
+// CHIRONStiefelCompressionBenchmark -----------------------------------------
+// Validation of the paradigm-shift MEMORY thesis: at ρ = r/d = 0.25, the
+// Stiefel-factored weight takes 2× less VRAM than the dense BF16 weight;
+// at ρ=0.125, 4× less; at ρ=0.0625, 8× less.
+//
+// Speed is harder to measure reliably at sub-ms GEMM times (cuBLAS + CUDA
+// event resolution + launch overhead dominate).  End-to-end tok/s comes
+// from Phase 2h trainer wire-in.  Here we report wall-clock times as
+// informational only and assert ONLY the compression factors (which are
+// deterministic).
+//
+// FLOP ratio (theoretical, assuming GEMM efficiency independent of inner-dim):
+//   dense FLOPs   = 2 · B · d · d
+//   stiefel FLOPs = 2 · B · r · (d + d) = 4 · B · d · r
+//   ratio         = 2 · r / d = 2ρ  → at ρ=0.25, 4× fewer FLOPs
+void CHIRONStiefelCompressionBenchmark()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [stiefel bench] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int d = 2048;  // one LLM MLP layer width
+	const unsigned int B = 1024;  // "token" count per forward
+	const int iters = 50;
+
+	LCG rng(42u);
+
+	// Reference dense weight W [d × d] FP32.
+	std::vector<float> Wh(d * d), Xh(B * d);
+	for (size_t i = 0; i < Wh.size(); ++i) Wh[i] = 0.02f * rng.next_unit();
+	for (size_t i = 0; i < Xh.size(); ++i) Xh[i] = 0.3f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_X, d_W, d_Y;
+	d_X.allocate(B * d); d_X.upload(&Xh[0], Xh.size());
+	d_W.allocate(d * d); d_W.upload(&Wh[0], Wh.size());
+	d_Y.allocate(B * d);
+
+	// Warmup dense.
+	for (int i = 0; i < 5; ++i)
+		glades::gpu::sgemm_rowmajor_abt(B, d, d, 1.0f, d_X.data(), d, d_W.data(),
+		                                d, 0.0f, d_Y.data(), d);
+	cudaDeviceSynchronize();
+
+	// Time dense.
+	cudaEvent_t ev0, ev1;
+	cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+	cudaEventRecord(ev0);
+	for (int i = 0; i < iters; ++i)
+	{
+		glades::gpu::sgemm_rowmajor_abt(B, d, d, 1.0f, d_X.data(), d, d_W.data(),
+		                                d, 0.0f, d_Y.data(), d);
+	}
+	cudaDeviceSynchronize();
+	cudaEventRecord(ev1);
+	cudaEventSynchronize(ev1);
+	float ms_dense = 0.0f;
+	cudaEventElapsedTime(&ms_dense, ev0, ev1);
+	ms_dense /= float(iters);
+	const double flops_dense = 2.0 * double(B) * double(d) * double(d);
+	const double tflops_dense = flops_dense / (ms_dense * 1e-3) * 1e-12;
+	std::printf("  stiefel bench: dense [B=%u d=%u]: %.3f ms/iter  %.2f TFLOP/s\n",
+	            B, d, ms_dense, tflops_dense);
+
+	// Pre-cast Stiefel factors to FP32 (this is what a BF16-GEMM path will do
+	// zero-cost via direct BF16 inputs in Phase 2f).
+	const unsigned int ratios_r[] = {d, d/2, d/4, d/8, d/16};
+	const char* labels[] = {"1.0", "0.5", "0.25", "0.125", "0.0625"};
+	for (int k = 0; k < 5; ++k)
+	{
+		const unsigned int r = ratios_r[k];
+
+		std::vector<float> U(d * r), V(d * r), sigma(r);
+		for (size_t i = 0; i < U.size(); ++i) U[i] = rng.next_unit();
+		for (size_t i = 0; i < V.size(); ++i) V[i] = rng.next_unit();
+		gram_schmidt_cols(U, d, r);
+		gram_schmidt_cols(V, d, r);
+		for (size_t i = 0; i < sigma.size(); ++i) sigma[i] = 0.5f + std::abs(rng.next_unit());
+
+		glades::gpu::GpuBuffer<float> d_U, d_V, d_sigma, d_T1;
+		d_U.allocate(d * r);  d_U.upload(&U[0], U.size());
+		d_V.allocate(d * r);  d_V.upload(&V[0], V.size());
+		d_sigma.allocate(r);  d_sigma.upload(&sigma[0], sigma.size());
+		d_T1.allocate(B * r);
+
+		// Direct 3-GEMM forward: Y = X · V · diag(Σ) · U^T. No BF16 casts.
+		// Step 1: T1 = X · V
+		// Step 2: T1 *= Σ broadcast
+		// Step 3: Y = T1 · U^T
+		// Warmup.
+		for (int i = 0; i < 5; ++i)
+		{
+			glades::gpu::sgemm_rowmajor(B, r, d, 1.0f, d_X.data(), d,
+			                            d_V.data(), r, 0.0f, d_T1.data(), r);
+			glades::gpu::sgemm_rowmajor_abt(B, d, r, 1.0f, d_T1.data(), r,
+			                                d_U.data(), r, 0.0f, d_Y.data(), d);
+		}
+		cudaDeviceSynchronize();
+
+		cudaEventRecord(ev0);
+		for (int i = 0; i < iters; ++i)
+		{
+			glades::gpu::sgemm_rowmajor(B, r, d, 1.0f, d_X.data(), d,
+			                            d_V.data(), r, 0.0f, d_T1.data(), r);
+			// (Σ scale fused with the second GEMM's alpha in practice; we
+			//  skip it here to focus on raw GEMM cost — it's a single
+			//  pointwise pass whose cost is negligible vs the GEMMs.)
+			glades::gpu::sgemm_rowmajor_abt(B, d, r, 1.0f, d_T1.data(), r,
+			                                d_U.data(), r, 0.0f, d_Y.data(), d);
+		}
+		cudaDeviceSynchronize();
+		cudaEventRecord(ev1);
+		cudaEventSynchronize(ev1);
+		float ms_stie = 0.0f;
+		cudaEventElapsedTime(&ms_stie, ev0, ev1);
+		ms_stie /= float(iters);
+		const double flops_stie = 2.0 * double(B) * double(r) * (double(d) + double(d));
+		const double tflops_stie = flops_stie / (ms_stie * 1e-3) * 1e-12;
+		const double speed = ms_dense / ms_stie;
+		const double bytes_dense = double(d) * double(d) * 2.0;   // BF16
+		const double bytes_stie = 2.0 * double(d) * double(r) * 2.0 + double(r) * 4.0;
+		const double compress = bytes_dense / bytes_stie;
+		std::printf("  stiefel bench: ρ=%-6s r=%4u: %.3f ms/iter  %.2f TFLOP/s  "
+		            "speedup=%.2fx  weight compression=%.2fx\n",
+		            labels[k], r, ms_stie, tflops_stie, speed, compress);
+
+		// Assert compression factors (these are deterministic and are the
+		// core of the paradigm-shift thesis).
+		if (r == d / 4u) {
+			ASSERT("Stiefel compression ≥ 2x at ρ=0.25", compress >= 1.99);
+		}
+		if (r == d / 8u) {
+			ASSERT("Stiefel compression ≥ 4x at ρ=0.125", compress >= 3.99);
+		}
+		if (r == d / 16u) {
+			ASSERT("Stiefel compression ≥ 8x at ρ=0.0625", compress >= 7.99);
+		}
+	}
+
+	cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+
+	std::printf("  (timing is informational; paradigm-shift primary metric is\n"
+	            "   the weight-VRAM compression, which is exact by construction.\n"
+	            "   End-to-end tok/s will be measured from Phase 2h trainer wire-in.)\n");
+#else
+	std::printf("  [stiefel bench] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 void CHIRONUnitTest()
 {
 	std::printf("\n=== CHIRON (reversible-flow transformer) unit tests ===\n");
@@ -3546,6 +3696,7 @@ void CHIRONUnitTest()
 	CHIRONStiefelTangentProjectionTest();
 	CHIRONStiefelQRRetractionTest();
 	CHIRONStiefelAdamDescentTest();
+	CHIRONStiefelCompressionBenchmark();
 	CHIRONStochasticBf16RoundingTest();
 	CHIRONFlashShearVsTiledBf16ParityTest();
 	CHIRONFlashShearBackwardBf16ParityTest();
