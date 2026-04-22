@@ -476,12 +476,21 @@ __global__ void k_sigma_fisher_rao(float* sigma, const float* eta,
 {
 	unsigned int k = blockIdx.x * blockDim.x + threadIdx.x;
 	if (k >= r) return;
-	const float sig = sigma[k];
-	const float exp_arg = eta[k] / (sig + 1e-12f);
-	// Clip extremely large exponents to keep Σ bounded during large updates.
+	// Σ-floor: if Σ collapses near zero, exp(η/Σ) overflows catastrophically.
+	// Clamp Σ to [1e-3, 1e3] so the Fisher-Rao step always has a
+	// well-conditioned denominator.  Observed during Stiefel-Adam training
+	// at lr ≥ 3e-3 — see CHIRON_PROGRESS.md Phase 2g finding.
+	float sig = sigma[k];
+	if (sig < 1e-3f) sig = 1e-3f;
+	if (sig > 1e3f)  sig = 1e3f;
+	const float exp_arg = eta[k] / sig;
 	const float capped = (exp_arg > 10.0f) ? 10.0f :
 	                     (exp_arg < -10.0f ? -10.0f : exp_arg);
-	sigma[k] = sig * expf(capped);
+	float new_sig = sig * expf(capped);
+	// Re-clamp after update for stability.
+	if (new_sig < 1e-3f) new_sig = 1e-3f;
+	if (new_sig > 1e3f)  new_sig = 1e3f;
+	sigma[k] = new_sig;
 }
 
 static cusolverDnHandle_t g_stiefelSolver = 0;

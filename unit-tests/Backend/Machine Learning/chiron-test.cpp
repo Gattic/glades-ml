@@ -4027,7 +4027,12 @@ void CHIRONStiefelLargeScaleTrainingTest()
 	}
 	const unsigned int m = 1024, n = 1024, r = 256, B = 256;   // ρ=0.25
 	const int num_steps = 100;
-	const float lr = 3e-4f;  // reduced from 3e-3 — Σ instability at higher LR
+	// lr=3e-4: with Σ floor in k_sigma_fisher_rao, Σ stays bounded even if
+	// η/Σ is large; but U and V themselves can still diverge at lr ≥ 3e-3
+	// on the 2-term Cayley Neumann series (drift O(‖η‖³) per step grows
+	// super-linearly with lr).  lr=3e-4 is the stable regime for ρ=0.25
+	// with the current Cayley implementation.
+	const float lr = 3e-4f;
 
 	LCG rng(20260421u);
 
