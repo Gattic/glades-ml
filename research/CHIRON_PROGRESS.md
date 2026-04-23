@@ -14,6 +14,18 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: ATC-Δ Phase 1 primitives shipped (paradigm shift #26)
+
+Three GPU primitives + parity tests for the newly-designed cross-step
+Taylor forward compression shift:
+
+- `atcd_drift_norm`: fused ‖Δh‖_F/‖h‖_F reduction.  Parity err 9.3e-10.
+- `atcd_cache_refresh`: h, z copy + σ'(z) for GELU/SiLU.  Parity err 1.2e-7.
+- `atcd_taylor_weight_delta`: two thin GEMMs + σ' mask.  Parity err 7.5e-9.
+
+Phase 2 next: streaming rSVD append for the (U, V) factor update.
+Phase 3: trainer wire-in behind `--atc-delta`.
+
 ### 2026-04-23: First trainer-level COMPOUND optimizer — MFIO × WIP shipped
 
 `--mfio 2 --wip-K 4` activates MFIO on Wq/Wk/Wv AND WIP on Wo
