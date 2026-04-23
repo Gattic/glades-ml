@@ -58,29 +58,38 @@ __global__ void k_ibgrad_init(float* __restrict__ P,
 // read as column-major [N × r]).  We need this for cuSOLVER which expects
 // column-major input.
 // ------------------------------------------------------------------------
+// 1D grid linearization — avoids the 65535 gridDim.y limit at N > 1M.
+// Each thread handles one element via linear index idx = i*cols + j.
 __global__ void k_transpose_rowmajor_to_colmajor(const float* __restrict__ in,
                                                  float* __restrict__ out,
                                                  int rows, int cols)
 {
-	const int j = blockIdx.x * blockDim.x + threadIdx.x;  // col (0..cols)
-	const int i = blockIdx.y * blockDim.y + threadIdx.y;  // row (0..rows)
-	if (i >= rows || j >= cols) return;
-	// Row-major in: in[i, j] = in[i*cols + j]
-	// Column-major out of shape [rows × cols]: out[i + j*rows]
-	out[i + (size_t)j * rows] = in[(size_t)i * cols + j];
+	const size_t n = (size_t)rows * cols;
+	for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < n;
+	     idx += (size_t)gridDim.x * blockDim.x)
+	{
+		const int i = (int)(idx / cols);
+		const int j = (int)(idx % cols);
+		// Row-major in:  in[i*cols + j]
+		// Column-major out of shape [rows × cols]: out[i + j*rows]
+		out[i + (size_t)j * rows] = in[(size_t)i * cols + j];
+	}
 }
 
-// ------------------------------------------------------------------------
-// Reverse transpose: column-major [N × r]  →  row-major [N × r].
-// ------------------------------------------------------------------------
 __global__ void k_transpose_colmajor_to_rowmajor(const float* __restrict__ in,
                                                  float* __restrict__ out,
                                                  int rows, int cols)
 {
-	const int j = blockIdx.x * blockDim.x + threadIdx.x;
-	const int i = blockIdx.y * blockDim.y + threadIdx.y;
-	if (i >= rows || j >= cols) return;
-	out[(size_t)i * cols + j] = in[i + (size_t)j * rows];
+	const size_t n = (size_t)rows * cols;
+	for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	     idx < n;
+	     idx += (size_t)gridDim.x * blockDim.x)
+	{
+		const int i = (int)(idx / cols);
+		const int j = (int)(idx % cols);
+		out[(size_t)i * cols + j] = in[i + (size_t)j * rows];
+	}
 }
 
 // ------------------------------------------------------------------------
@@ -265,11 +274,14 @@ bool ibgrad_qr_reorthogonalize(float* P_inout, unsigned int N, unsigned int r)
 		g_ibgradTauCap = r;
 	}
 
-	// 1. Row-major → column-major.
+	// 1. Row-major → column-major (1D grid linearization, handles N > 1M).
 	{
-		dim3 block(16, 16);
-		dim3 grid((r + block.x - 1) / block.x, (N + block.y - 1) / block.y);
-		k_transpose_rowmajor_to_colmajor<<<grid, block, 0, computeStream()>>>(
+		const int block = 256;
+		const size_t n_elems = (size_t)N * r;
+		// Clamp grid to 65535 blocks; kernel loops to cover N·r elements.
+		size_t grid_sz = (n_elems + block - 1) / (size_t)block;
+		if (grid_sz > 65535u) grid_sz = 65535u;
+		k_transpose_rowmajor_to_colmajor<<<(int)grid_sz, block, 0, computeStream()>>>(
 		    P_inout, g_ibgradColScratch, (int)N, (int)r);
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
@@ -310,11 +322,13 @@ bool ibgrad_qr_reorthogonalize(float* P_inout, unsigned int N, unsigned int r)
 		return false;
 	}
 
-	// 5. Column-major → row-major back into P.
+	// 5. Column-major → row-major back into P (1D grid linearization).
 	{
-		dim3 block(16, 16);
-		dim3 grid((r + block.x - 1) / block.x, (N + block.y - 1) / block.y);
-		k_transpose_colmajor_to_rowmajor<<<grid, block, 0, computeStream()>>>(
+		const int block = 256;
+		const size_t n_elems = (size_t)N * r;
+		size_t grid_sz = (n_elems + block - 1) / (size_t)block;
+		if (grid_sz > 65535u) grid_sz = 65535u;
+		k_transpose_colmajor_to_rowmajor<<<(int)grid_sz, block, 0, computeStream()>>>(
 		    g_ibgradColScratch, P_inout, (int)N, (int)r);
 		if (cudaGetLastError() != cudaSuccess) return false;
 	}
