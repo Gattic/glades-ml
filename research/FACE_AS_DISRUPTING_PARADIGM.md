@@ -121,6 +121,26 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.11 β_row tuning is scale-dependent — REVERSES at 500M (2026-04-23)
+
+Completed the tuned-recipe scaling matrix at 500M × 1000 steps:
+
+  Scale (1000 steps)   β=0.98 EMA    β=0.999 EMA    Δ (β=0.999 − β=0.98)
+  66M (1500 steps)     8.183         7.141          **+1.04 nat BETTER**
+  234M (1500 steps)    8.336         8.058          **+0.27 nat BETTER**
+  **500M (1000 steps)  9.759         9.839          −0.08 nat WORSE**
+
+The tuning improvement is SCALE-DEPENDENT with a sign-flip around
+~500M.  At small scales (66M), longer row EMA (β_row=0.999) helps by
+providing indefinite averaging of rare-token stats.  At large scales,
+the baseline β_row=0.98 already provides enough stability — further
+slowing doesn't help and may slightly hurt (more lag, less adaptation).
+
+Revised production recommendation:
+  Small (<150M):        --face-beta-row 0.999    (significant gain)
+  Medium (150-500M):    --face-beta-row 0.99     (compromise, safer)
+  Large (≥500M):        --face-beta-row 0.98     (default — 0.999 regresses)
+
 ### 3.10 β_row=0.999 validation at 234M (2026-04-23)
 
 Validated the β_row=0.999 tuning finding at 234M × 1500 steps:
