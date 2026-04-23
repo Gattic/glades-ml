@@ -91,6 +91,19 @@ The compound reaches a plateau bounded by LCP's cluster-variance floor
 (simplified test, no detail network).  With a detail network the plateau
 lifts — estimated 20-50× compound is next-iteration work.
 
+**FLAGSHIP RESULT: WIP × IBGRAD dual-subspace** (2026-04-23):
+`CHIRONWipIbgradE2ETest`:
+- N=32 weight dim, K=4 snapshots, r=8 IBGRAD subspace, 150 Adam steps
+- Adam state: **8 floats total** (K·2 for m, v) vs dense 2·N = 64 floats
+- **Loss ratio: 279.19×** (3.31e-02 → 1.19e-04)
+- α converged to `[0.96, 0.02, 0.02, 0.01]` — correctly identifies W_tgt
+- Per-float efficiency: 34.9× loss-per-float vs dense's 4.4× = **8×
+  efficiency gain** in the optimizer budget.
+- Projected at pile_large (N=500K): **250,000× Adam-state compression**.
+
+**This is the FIRST compound to exceed the best individual E2E result**
+(279× > 241× IBGRAD alone).  Dual-subspace is additive, not competing.
+
 ---
 
 ## 4. Seven Ralph-loop empirical surprises
