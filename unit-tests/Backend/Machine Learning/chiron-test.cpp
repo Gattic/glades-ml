@@ -9430,6 +9430,7 @@ void CHIRONUnitTest()
 	CHIRONIbgradThroughputBenchmark();
 	CHIRONIbgradEndToEndConvergenceTest();
 	CHIRONWipIbgradMathParityTest();
+	CHIRONWipIbgradE2ETest();
 	CHIRONLcpIbgradCompositionTest();
 	CHIRONEdtEnergyDistilledTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
@@ -12934,6 +12935,166 @@ void CHIRONEdtEnergyDistilledTest()
 	ASSERT("edt does not totally diverge (ratio ≥ 0.3)", ratio >= 0.3f);
 #else
 	std::printf("  [edt] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONWipIbgradE2ETest ----------------------------------------------------
+// Phase 2 of WIP × IBGRAD dual-subspace: E2E MLP convergence test.
+// Train ONLY α ∈ ℝ^K via Adam, with θ(α) = Σ softmax(α)_k · W_k.
+// Optimizer-state count per weight matrix: just K=4 floats for α's Adam
+// state (vs 2·N for dense Adam).
+//
+// Snapshots W_k are constructed to span the optimal W_tgt: each snapshot
+// is W_tgt + small Gaussian noise.  The simplex centroid should land
+// near W_tgt, and α-Adam refines it.
+//
+// Target: loss_init / loss_final ≥ 2× in 150 steps.
+void CHIRONWipIbgradE2ETest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [wip×ibgrad e2e] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T       = 32;
+	const unsigned int d_in    = 8;
+	const unsigned int d_out   = 4;
+	const unsigned int N       = d_in * d_out;   // 32 flattened weight dim
+	const unsigned int K       = 4;              // snapshot count
+	const unsigned int r       = 8;              // IBGRAD subspace rank
+	const int          N_steps = 150;
+	const float        lr      = 5e-2f;
+	const float        b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+
+	LCG rng(202604243u);
+
+	std::vector<float> Wtgt(N), X_h((size_t)T * d_in), Ytgt_h((size_t)T * d_out);
+	for (unsigned int i = 0; i < N;          ++i) Wtgt[i]   = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < X_h.size();       ++i) X_h[i]    = 0.5f * rng.next_unit();
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d_out; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d_in; ++k)
+				s += X_h[(size_t)t * d_in + k] * Wtgt[(size_t)k * d_out + j];
+			Ytgt_h[(size_t)t * d_out + j] = s;
+		}
+
+	// K snapshots chosen so that only ONE approximates W_tgt (and the
+	// others are random noise): W_0 = W_tgt, W_1..W_3 = random.  Uniform α
+	// gives 1/4·W_tgt + noise (high loss); α → [1, 0, 0, 0] is optimal.
+	std::vector<std::vector<float> > W_pool(K, std::vector<float>(N));
+	for (unsigned int i = 0; i < N; ++i) W_pool[0][i] = Wtgt[i];
+	for (unsigned int k = 1; k < K; ++k)
+		for (unsigned int i = 0; i < N; ++i)
+			W_pool[k][i] = 0.5f * rng.next_unit();  // random, uncorrelated
+
+	std::vector<float> alpha(K, 0.0f), alpha_m(K, 0.0f), alpha_v(K, 0.0f);
+
+	glades::gpu::GpuBuffer<float> d_X, d_theta, d_Y, d_dY, d_g, d_P, d_y_sub;
+	d_X.allocate(X_h.size()); d_X.upload(&X_h[0], X_h.size());
+	d_theta.allocate(N);
+	d_Y.allocate((size_t)T * d_out);
+	d_dY.allocate((size_t)T * d_out);
+	d_g.allocate(N);
+	d_P.allocate((size_t)N * r);
+	d_y_sub.allocate(r);
+
+	ASSERT("init P", glades::gpu::ibgrad_init_projection(d_P.data(), N, r, 0xABCD1234ULL));
+	ASSERT("init QR", glades::gpu::ibgrad_qr_reorthogonalize(d_P.data(), N, r));
+
+	float loss_init = -1.0f, loss_final = 0.0f;
+
+	for (int step = 1; step <= N_steps; ++step) {
+		std::vector<float> alpha_sm(K);
+		float amx = alpha[0];
+		for (unsigned int k = 1; k < K; ++k) if (alpha[k] > amx) amx = alpha[k];
+		float Zs = 0.0f;
+		for (unsigned int k = 0; k < K; ++k) { alpha_sm[k] = std::exp(alpha[k] - amx); Zs += alpha_sm[k]; }
+		for (unsigned int k = 0; k < K; ++k) alpha_sm[k] /= Zs;
+
+		std::vector<float> theta(N, 0.0f);
+		for (unsigned int k = 0; k < K; ++k)
+			for (unsigned int i = 0; i < N; ++i)
+				theta[i] += alpha_sm[k] * W_pool[k][i];
+		d_theta.upload(&theta[0], N);
+
+		ASSERT("fwd", glades::gpu::sgemm_rowmajor(T, d_out, d_in, 1.0f,
+		    d_X.data(), d_in,  d_theta.data(), d_out,  0.0f,  d_Y.data(), d_out));
+
+		std::vector<float> Yh((size_t)T * d_out), dYh((size_t)T * d_out);
+		d_Y.download(&Yh[0], Yh.size());
+		float loss = 0.0f;
+		const float inv_N = 1.0f / (float)Yh.size();
+		for (size_t i = 0; i < Yh.size(); ++i) {
+			float dv = Yh[i] - Ytgt_h[i];
+			dYh[i] = 2.0f * inv_N * dv;
+			loss  += dv * dv * inv_N;
+		}
+		if (step == 1) loss_init = loss;
+
+		d_dY.upload(&dYh[0], dYh.size());
+		ASSERT("bwd g", glades::gpu::sgemm_rowmajor_atb(d_in, d_out, T, 1.0f,
+		    d_X.data(), d_in,  d_dY.data(), d_out,  0.0f,  d_g.data(), d_out));
+
+		if (step == 1 || step % 20 == 0) {
+			ASSERT("refresh col0", glades::gpu::ibgrad_refresh_first_column(
+			    d_P.data(), d_g.data(), N, r));
+			ASSERT("QR", glades::gpu::ibgrad_qr_reorthogonalize(d_P.data(), N, r));
+		}
+		ASSERT("project g", glades::gpu::ibgrad_project(
+		    d_P.data(), d_g.data(), N, r, d_y_sub.data()));
+		std::vector<float> y(r);
+		d_y_sub.download(&y[0], r);
+
+		std::vector<std::vector<float> > z_pool(K, std::vector<float>(r));
+		for (unsigned int k = 0; k < K; ++k) {
+			glades::gpu::GpuBuffer<float> d_Wk, d_zk;
+			d_Wk.allocate(N); d_Wk.upload(&W_pool[k][0], N);
+			d_zk.allocate(r);
+			ASSERT("project Wk", glades::gpu::ibgrad_project(
+			    d_P.data(), d_Wk.data(), N, r, d_zk.data()));
+			d_zk.download(&z_pool[k][0], r);
+		}
+		std::vector<float> z_theta(r, 0.0f);
+		for (unsigned int j = 0; j < r; ++j)
+			for (unsigned int k = 0; k < K; ++k)
+				z_theta[j] += alpha_sm[k] * z_pool[k][j];
+
+		float zty = 0.0f;
+		for (unsigned int j = 0; j < r; ++j) zty += z_theta[j] * y[j];
+		std::vector<float> g_alpha(K);
+		for (unsigned int k = 0; k < K; ++k) {
+			float zky = 0.0f;
+			for (unsigned int j = 0; j < r; ++j) zky += z_pool[k][j] * y[j];
+			g_alpha[k] = alpha_sm[k] * (zky - zty);
+		}
+
+		const float bc1 = 1.0f - std::pow(b1, (float)step);
+		const float bc2 = 1.0f - std::pow(b2, (float)step);
+		for (unsigned int k = 0; k < K; ++k) {
+			alpha_m[k] = b1 * alpha_m[k] + (1.0f - b1) * g_alpha[k];
+			alpha_v[k] = b2 * alpha_v[k] + (1.0f - b2) * g_alpha[k] * g_alpha[k];
+			const float m_hat = alpha_m[k] / bc1;
+			const float v_hat = alpha_v[k] / bc2;
+			alpha[k] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+		}
+
+		if (step == 1 || step == N_steps || step % 50 == 0) {
+			std::printf("  [wip×ibgrad e2e] step=%d loss=%.4e α=[%.2f %.2f %.2f %.2f]\n",
+			            step, loss, alpha_sm[0], alpha_sm[1], alpha_sm[2], alpha_sm[3]);
+		}
+		if (step == N_steps) loss_final = loss;
+	}
+
+	const float loss_ratio = loss_init / loss_final;
+	std::printf("  [wip×ibgrad e2e] N=%u K=%u r=%u (Adam state = %u floats): "
+	            "init=%.4e final=%.4e ratio=%.2fx\n",
+	            N, K, r, K * 2, loss_init, loss_final, loss_ratio);
+	ASSERT("wip×ibgrad e2e weights finite", loss_final == loss_final && loss_final < 1e6f);
+	ASSERT("wip×ibgrad e2e loss drops ≥ 2x", loss_ratio >= 2.0f);
+#else
+	std::printf("  [wip×ibgrad e2e] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 
