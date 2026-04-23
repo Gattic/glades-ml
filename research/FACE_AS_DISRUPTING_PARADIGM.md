@@ -121,6 +121,26 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.12 Tuned-compound validation at 66M × 2500 (iter 101)
+
+Validated the full tuned production recipe (3-shift compound + β_row
+tuning):
+
+  Config @ 66M × 2500 steps        EMA       Δ vs dense
+  Dense Adam (iter 79)             8.805     —
+  FACE-alone β=0.98 (iter 79)      8.381     −0.42 nat
+  **3-shift compound β=0.999       7.826     −0.98 nat**
+
+The `--face-beta-row 0.999` tuning stacks cleanly with `--mfio 2
+--wip-K 4`.  Compound advantage at 66M × 2500 is now 2.3× the
+un-tuned compound's advantage (0.98 vs 0.42 nat).
+
+Production recipe (at 66M × 2500 steps, pile-bpe):
+  --mfio 2 --wip-K 4 --face 1 --face-beta-row 0.999
+  → 0.98 nat advantage over dense Adam
+  → identical throughput (17,199 tok/s)
+  → 603× memory compression on attn+embed Adam state
+
 ### 3.11 β_row tuning is scale-dependent — REVERSES at 500M (2026-04-23)
 
 Completed the tuned-recipe scaling matrix at 500M × 1000 steps:
