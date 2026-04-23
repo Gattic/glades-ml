@@ -9,10 +9,35 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 
 ---
 
-## MILESTONE SUMMARY (as of 2026-04-22)
+## MILESTONE SUMMARY (as of 2026-04-23)
 
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
+
+### 2026-04-23: MFIO v2 Phase 2 trainer wire-in — 3rd shift wired in
+
+MFIO v2 (paradigm shift #11) is now active via `--mfio 1`.  Joins
+IBGRAD (#19) and WIP (#22) as the third full trainer wire-in.
+
+Smoke + convergence validation on pretokenized pile (L=8, m=128,
+dModel=256, T=512, V=32000):
+- 100-step smoke: 124,457 tok/s (loss 10.40 → 10.39)
+- 500-step convergence: 93,000 tok/s sustained, loss 10.40 → 9.92
+  (best 9.74 @ step 498).  Matches WIP Phase 3D's 500-step convergence.
+- State compression: 170.7× smaller Wo Adam state (12 KB vs 2 MB at
+  L=8).  At pile_large (m=512, dModel=1024, L=24): 96 MB → 216 KB
+  (455× compression, just on Wo).
+
+Technical: new primitive `mfio_compute_rowcol_norms_from_grad(g, d_in,
+d_out, zn, dn)` computes row/col L2² directly from the weight
+gradient — NO activation state needed.  Normalization by ‖g‖_F² is
+essential to recover 1/|g| scaling (Adafactor's trick).
+
+Trade-offs in the optimizer-axis stack:
+- MFIO: 170× state, 93k tok/s, drop-in replacement, no cadence.
+- WIP × IBGRAD: 250,000× compression (flagship), 86k tok/s.
+- All three are now mutually exclusive on Wo; the next-iteration
+  research question is which NON-Wo matrix (Wq/Wk/Wv) each applies to.
 
 ### 2026-04-23: WIP Phase 3D @ pile_large scale — 97% of dense throughput
 

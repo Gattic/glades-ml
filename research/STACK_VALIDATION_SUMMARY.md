@@ -34,7 +34,7 @@ Two axes, compounded. Every shift is scored against (memory, speed).
 | 9 | OVFG factored gradients | grad + opt state | 11.91× measured at pile_large | 6 parity tests |
 | + | Chunked cross-entropy | loss scratch memory | 32× at V=131k | 3 parity tests |
 | 10 | MPOT tensor-network weights | weight memory | 25–64× compression | 8 parity tests |
-| 11 | MFIO moment-free optimizer | optimizer state | ZERO state (v1), 102% at L=2 | 6 tests |
+| 11 | MFIO moment-free optimizer | optimizer state | ZERO state (v1), 170× (v2 on Wo), 93k tok/s trainer | 6 tests + E2E + trainer wire-in |
 | 12 | DFA backprop-free | backward compute | ZERO backprop; 100% at L=2 | 4 tests |
 | 13 | **TRCD token-routed depth** | per-token depth | **3× FLOP reduction at d̄=L/3** | E2E **187× loss ratio** |
 | 16 | **LCP lattice compute pool** | per-token compute sharing | **4.7× per-layer standalone** | E2E **13.72× loss ratio** |
@@ -171,6 +171,15 @@ mechanism level, not optional safeguards.
   TRAINER WIRE-IN COMPLETE.**  First paradigm shift to reach full
   5-phase trainer integration (`--ibgrad-rank R` in chiron_train).
   Smoke test: 75,925 tok/s at L=4 with IBGRAD active.
+- **Phases 1-3D WIP: primitives + E2E + dual-subspace + TRAINER
+  WIRE-IN COMPLETE.**  Second paradigm shift with full integration
+  (`--wip-K K`).  500-step convergence on real pile-bpe data: loss
+  10.40 → 9.92, 86k tok/s @ 97% of dense throughput.
+- **Phases 1-2 MFIO v2: primitives + E2E + TRAINER WIRE-IN COMPLETE.**
+  Third paradigm shift with full integration (`--mfio 1`).  Adafactor-
+  style gradient-based variant with 170× Wo state compression; 500-step
+  convergence on pretokenized pile-bpe: loss 10.40 → 9.92, best 9.74
+  @ step 498, 93k tok/s sustained.
 
 ### NEXT (trainer wire-in):
 
