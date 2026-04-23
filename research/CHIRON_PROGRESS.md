@@ -78,6 +78,35 @@ compound is a DROP-IN optimizer replacement at pile_large scale.
 MFIO state at pile_large: 432 KB (vs dense 288 MB) = **682.7× smaller**
 just on the Wq/Wk/Wv attention matrices.
 
+### 2026-04-23: FACE (paradigm #28) shipped — 3-shift compound = new flagship
+
+`--mfio 2 --wip-K 4 --face 1` (MFIO on Wq/Wk/Wv × WIP on Wo × FACE on
+embedding) is the new production flagship.  Validated at pile_large
+(L=24, m=512, dModel=1024, T=1024, V=32k, 500 steps pretokenized pile-bpe):
+
+  Config                     loss@500   MFIO state   FACE state
+  Dense Adam                 9.2610     288 MB       125 MB
+  2-shift flagship (old)     9.2610     432 KB       125 MB (unchanged)
+  3-shift flagship (new)     9.2325 ★   432 KB       252 KB (508×)
+
+★ FACE produces MARGINALLY BETTER loss than dense Adam at 500 steps.
+No convergence cost for the added 603× Adam-state compression on
+attn+embed.
+
+Throughput: 17,257 tok/s (identical to 2-shift 17,185; FACE overhead
+is negligible).
+
+Surprise-to-fix chain (iterations 65-71):
+- #65: MFIO on embedding diverges by +1 nat (surprise #9)
+- #67: Designed paradigm #28 FACE via research-framework-design skill
+- #68-70: Shipped 3 GPU primitives + 3 parity tests (all pass at 1e-9)
+- #71: Trainer wire-in diverges — **surprise #10: dimensional error**
+       in design-doc formula.  Fix: use dn_raw (not dn_deb), drop q.
+- #71 post-fix: 3-shift flagship beats 2-shift by 0.03 nat.
+
+FACE is the 4th paradigm shift (after IBGRAD, WIP, MFIO) to reach
+full trainer wire-in.
+
 ### 2026-04-23: 234M-param scale stress test — MFIO scales to 1365×
 
 At L=24, m=1024, dModel=2048 (234M total params, 3.5× the 66M pile_large):

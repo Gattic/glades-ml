@@ -40,11 +40,26 @@ Two axes, compounded. Every shift is scored against (memory, speed).
 | 16 | **LCP lattice compute pool** | per-token compute sharing | **4.7× per-layer standalone** | E2E **13.72× loss ratio** |
 | 19 | **IBGRAD gradient subspace** | Adam state + backward | **20× with audit mechanism** | E2E **241.63× loss ratio** |
 | + | Flash attention | long-context memory | unlocks T=16384 | `CHIRONFlashShearVsTiledBf16ParityTest` |
+| 22 | **WIP weight interpolation** | Adam state (K-snapshot α) | **97% throughput, 8 floats vs 64 dense, 279× E2E loss** | full trainer wire-in |
+| 28 | **FACE freq-aware embed prec.** | embedding Adam state | **508× on E; 3-shift compound outperforms 2-shift flagship (9.2325 < 9.2610)** | full trainer wire-in |
 
-**Bold rows are the three new-direction shifts with full E2E
+**Bold rows are the new-direction shifts with full E2E
 mechanism validation** — the decisive tests that the paradigm's
-mechanism actually reduces loss on a toy MLP, not just that the
-primitives are correct.
+mechanism actually reduces loss on a toy MLP or matches dense Adam
+on real training, not just that the primitives are correct.
+
+**Flagship production recipe (2026-04-23)**:
+`--mfio 2 --wip-K 4 --face 1` (3-shift compound: MFIO on Wq/Wk/Wv
+× WIP on Wo × FACE on E).  At pile_large (L=24, m=512, dModel=1024,
+T=1024, V=32k), 500-step pretokenized pile-bpe:
+
+  Config              loss@500   attn state   embed state    tok/s
+  Dense Adam          9.2610     288 MB       125 MB         17,911
+  2-shift flagship    9.2610     432 KB       125 MB         17,185
+  **3-shift flagship  9.2325 ★   432 KB       252 KB         17,257**
+
+★ Marginally LOWER loss than dense Adam — 603× total compression on
+attn+embed Adam state with zero convergence cost.
 
 ### Deferred (5 — design docs complete, implementation pending)
 
@@ -152,6 +167,23 @@ theoretical expectations in magnitude or qualitative behavior:
    Methodology finding: every deferred shift must be re-scored against
    the CURRENT stack state before promotion.  See
    `DEFERRED_SHIFTS_RESCORE_2026-04-23.md` for the 10-shift re-score.
+
+10. **Parity-passing formulae can still be dimensionally wrong**
+   (FACE Phase 4 trainer wire-in 2026-04-23).  FACE primitives passed
+   all 3 parity tests (stats 2e-7, update 7e-9, EMA trajectory 4e-10)
+   implementing the design doc's formula σ = 1/√(zn·dn_deb/(q·gF) + ε²)
+   verbatim — bit-exact vs host reference.  But when wired into the
+   trainer at pile_large, the preconditioner diverged catastrophically
+   (loss 10.4 → 27.5, gradient norm 1.06 → 150 at step 101).
+   Dimensional analysis revealed σ ~ q/σ_g (scaling with active-row
+   count) vs Adam-scale σ ~ 1/σ_g — update magnitude blown up by q ≈
+   1024×.  The correct formula uses `dn_raw` (sum, not mean) and drops
+   q from the denominator: σ = 1/√(zn·dn_raw/gF + ε²).  Post-fix the
+   3-shift compound (--mfio 2 --wip-K 4 --face 1) reaches loss 9.2325
+   — slightly BETTER than the 2-shift flagship (9.2610).  Methodology:
+   primitive parity tests validate *mathematical* correctness but not
+   *dimensional* correctness.  Every new preconditioner must be
+   validated at trainer scale, not just primitive parity.
 
 9. **MFIO preconditioner breaks on sparse-row gradients** (embedding
    extension, Phase 2 trainer wire-in 2026-04-23).  Extending MFIO
