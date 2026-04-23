@@ -93,7 +93,7 @@ lifts — estimated 20-50× compound is next-iteration work.
 
 ---
 
-## 4. Five Ralph-loop empirical surprises
+## 4. Seven Ralph-loop empirical surprises
 
 The paradigm-shift research produced 5 empirical results that exceeded
 theoretical expectations in magnitude or qualitative behavior:
@@ -131,6 +131,15 @@ theoretical expectations in magnitude or qualitative behavior:
    load-bearing rather than safeguard — a pattern now consistent
    across #19 IBGRAD and #23 EDT.
 
+7. **Paradigm-shift valuations are stack-dependent** (shift #19
+   Phase 5).  IBGRAD's scale test at L=8 revealed it is NET-NEGATIVE
+   on memory against int8 Adam (shift #3 shipped earlier).  Original
+   design-time comparison was against FP32 Adam baseline (+10× memory
+   win); re-scored against current stack: net negative +190 MB VRAM.
+   Methodology finding: every deferred shift must be re-scored against
+   the CURRENT stack state before promotion.  See
+   `DEFERRED_SHIFTS_RESCORE_2026-04-23.md` for the 10-shift re-score.
+
 The common thread: the research-framework-design skill's systematic
 failure-mode analysis produced mitigations that are load-bearing at the
 mechanism level, not optional safeguards.
@@ -145,7 +154,10 @@ mechanism level, not optional safeguards.
   (0.032 ms/cycle at pile_large).
 - Phases 1-2 LCP: primitives + delta + E2E + throughput benchmark
   (0.162 ms/cycle at pile_large).
-- Phases 1-4 IBGRAD: primitives + QR + E2E + audit mechanism.
+- **Phases 1-5 IBGRAD: primitives + QR + E2E + audit mechanism +
+  TRAINER WIRE-IN COMPLETE.**  First paradigm shift to reach full
+  5-phase trainer integration (`--ibgrad-rank R` in chiron_train).
+  Smoke test: 75,925 tok/s at L=4 with IBGRAD active.
 
 ### NEXT (trainer wire-in):
 
