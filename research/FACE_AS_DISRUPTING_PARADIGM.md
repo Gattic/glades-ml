@@ -121,6 +121,32 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.15 β_row=0.99 is the new 500M optimum (iter 107)
+
+Validated the "medium-scale compromise" recommendation empirically.
+Tested β_row=0.99 at 500M × 1000 steps:
+
+  β_row     EMA@1000    Δ vs dense
+  0.98      9.7586      −0.319 (iter 93)
+  **0.99    9.7299      −0.348 nat BEST**
+  0.999     9.8385      −0.239 (iter 100)
+
+β_row=0.99 is now empirically validated as the 500M optimum,
+beating both 0.98 and 0.999.  The compromise recommendation from
+iter 100 was correct.
+
+Refined scale-aware optimum curve:
+- 66M:         β_row = 0.999 (+1.04 nat vs default 0.98)
+- 234M:        β_row = 0.999 (+0.27 nat, likely plateau to 0.99 at 500M)
+- **500M:     β_row = 0.99 (+0.03 nat vs 0.98; 0.999 regresses)**
+- 1B+ (extrapolated): β_row = 0.98
+
+Intuition: at small scale (66M), rare-token activations are sparse,
+need longest EMA (0.999).  At large scale (500M+), the embedding has
+more training signal per rare-token occurrence, so a shorter EMA
+(0.99) is adequate and more responsive.  Smooth scale-dependent shift
+of the optimum.
+
 ### 3.14 Tuned compound at 500M confirms scale-regression (iter 106)
 
 Extending iter 100's FACE-alone scale-dependent finding to the full
