@@ -35,6 +35,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_trcd.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_lcp.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_ibgrad.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_atcd.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -8431,6 +8432,180 @@ void CHIRONMfioV2FromGradConvergenceTest()
 #endif
 }
 
+// CHIRONAtcdDriftNormParityTest ---------------------------------------------
+// Paradigm shift #26 Phase 1: validate atcd_drift_norm against host
+// reference.  Computes ratio = ‖Δh‖_F / (‖h_cache‖_F + ε_denom).
+// Single-block reduction kernel; assert max_err < 1e-4 on 256 × 128 tensor.
+void CHIRONAtcdDriftNormParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [atcd drift-norm parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 256, d = 128;
+	LCG rng(202604260u);
+	std::vector<float> Δh_h((size_t)T * d), h_h((size_t)T * d);
+	for (size_t i = 0; i < Δh_h.size(); ++i) Δh_h[i] = 0.001f * rng.next_unit();
+	for (size_t i = 0; i < h_h.size();  ++i) h_h[i]  = 0.5f * rng.next_unit();
+
+	float s_Δ = 0.0f, s_h = 0.0f;
+	for (size_t i = 0; i < Δh_h.size(); ++i) { s_Δ += Δh_h[i] * Δh_h[i]; s_h += h_h[i] * h_h[i]; }
+	const float host_ratio = std::sqrt(s_Δ) / (std::sqrt(s_h) + 1e-12f);
+
+	glades::gpu::GpuBuffer<float> d_Δh, d_h, d_ratio;
+	d_Δh.allocate(Δh_h.size());  d_Δh.upload(&Δh_h[0], Δh_h.size());
+	d_h.allocate(h_h.size());    d_h.upload(&h_h[0],  h_h.size());
+	d_ratio.allocate(1);
+
+	const bool ok = glades::gpu::atcd_drift_norm(
+	    d_Δh.data(), d_h.data(), T, d, 1e-12f, d_ratio.data());
+	ASSERT("atcd_drift_norm returns true", ok);
+
+	float gpu_ratio = 0.0f;
+	d_ratio.download(&gpu_ratio, 1);
+	const float err = std::fabs(gpu_ratio - host_ratio);
+	std::printf("  [atcd drift-norm parity] T=%u d=%u host=%.6e gpu=%.6e err=%.3e\n",
+	            T, d, host_ratio, gpu_ratio, err);
+	ASSERT("drift norm vs host < 1e-4", err < 1e-4f);
+#else
+	std::printf("  [atcd drift-norm parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONAtcdCacheRefreshParityTest ------------------------------------------
+// Phase 1 validation of atcd_cache_refresh: copies h_full → h_cache,
+// z_full → z_cache, and computes σ'(z) for GELU (tanh approx) and SiLU.
+// Host reference implements the same formulas and compares.
+void CHIRONAtcdCacheRefreshParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [atcd cache-refresh parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 64, d = 32;
+	LCG rng(202604261u);
+	std::vector<float> h_full((size_t)T * d), z_full((size_t)T * d);
+	for (size_t i = 0; i < h_full.size(); ++i) h_full[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < z_full.size(); ++i) z_full[i] = 0.8f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_h_full, d_z_full, d_h_cache, d_z_cache, d_sp;
+	d_h_full.allocate(h_full.size());  d_h_full.upload(&h_full[0], h_full.size());
+	d_z_full.allocate(z_full.size());  d_z_full.upload(&z_full[0], z_full.size());
+	d_h_cache.allocate(h_full.size());
+	d_z_cache.allocate(z_full.size());
+	d_sp.allocate(z_full.size());
+
+	// Test GELU (activation_kind = 0).
+	const bool ok_gelu = glades::gpu::atcd_cache_refresh(
+	    d_h_full.data(), d_z_full.data(),
+	    d_h_cache.data(), d_z_cache.data(), d_sp.data(),
+	    T, d, 0);
+	ASSERT("atcd_cache_refresh GELU returns true", ok_gelu);
+
+	std::vector<float> h_c(h_full.size()), z_c(z_full.size()), sp(z_full.size());
+	d_h_cache.download(&h_c[0], h_c.size());
+	d_z_cache.download(&z_c[0], z_c.size());
+	d_sp.download(&sp[0], sp.size());
+	// h_cache, z_cache should be exact copies.
+	float err_copy = std::max(max_abs_diff(h_full, h_c), max_abs_diff(z_full, z_c));
+	// σ' (GELU tanh approx derivative) — replicate host formula.
+	std::vector<float> sp_ref(z_full.size());
+	for (size_t i = 0; i < z_full.size(); ++i) {
+		const float z = z_full[i];
+		const float k0 = 0.7978845608028654f;
+		const float k1 = 0.044715f;
+		const float u  = k0 * (z + k1 * z * z * z);
+		const float tanh_u = std::tanh(u);
+		const float du_dz  = k0 * (1.0f + 3.0f * k1 * z * z);
+		const float dtanh_du = 1.0f - tanh_u * tanh_u;
+		sp_ref[i] = 0.5f * (1.0f + tanh_u) + 0.5f * z * dtanh_du * du_dz;
+	}
+	float err_sp = max_abs_diff(sp, sp_ref);
+	std::printf("  [atcd cache-refresh parity] GELU T=%u d=%u copy_err=%.3e sp_err=%.3e\n",
+	            T, d, err_copy, err_sp);
+	ASSERT("cache copy exact", err_copy == 0.0f);
+	ASSERT("σ'(GELU) vs host < 1e-5", err_sp < 1e-5f);
+#else
+	std::printf("  [atcd cache-refresh parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONAtcdTaylorWeightDeltaParityTest -------------------------------------
+// Phase 1 validation of atcd_taylor_weight_delta: computes
+//     Δh = σ' ⊙ ((U V^T) · h_cache)
+// via two thin GEMMs (no explicit U V^T).  Host reference materializes
+// U V^T, multiplies with h_cache, then applies σ' mask.
+void CHIRONAtcdTaylorWeightDeltaParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [atcd taylor-wd parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 32, d_in = 64, d_out = 48, r = 8;
+	LCG rng(202604262u);
+	std::vector<float> U((size_t)d_out * r), V((size_t)d_in * r);
+	std::vector<float> h_cache((size_t)T * d_in);
+	std::vector<float> sp((size_t)T * d_out);
+	for (size_t i = 0; i < U.size(); ++i)       U[i]       = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < V.size(); ++i)       V[i]       = 0.1f * rng.next_unit();
+	for (size_t i = 0; i < h_cache.size(); ++i) h_cache[i] = 0.4f * rng.next_unit();
+	for (size_t i = 0; i < sp.size(); ++i)      sp[i]      = 0.5f + 0.2f * rng.next_unit();
+
+	// Host reference: Δz = h_cache · V · U^T, Δh = sp ⊙ Δz.
+	std::vector<float> tmp_r((size_t)T * r, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < r; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d_in; ++k)
+				s += h_cache[(size_t)t * d_in + k] * V[(size_t)k * r + j];
+			tmp_r[(size_t)t * r + j] = s;
+		}
+	std::vector<float> Δz((size_t)T * d_out, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d_out; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < r; ++k)
+				s += tmp_r[(size_t)t * r + k] * U[(size_t)j * r + k];
+			Δz[(size_t)t * d_out + j] = s;
+		}
+	std::vector<float> Δh_ref((size_t)T * d_out);
+	for (size_t i = 0; i < Δh_ref.size(); ++i)
+		Δh_ref[i] = sp[i] * Δz[i];
+
+	glades::gpu::GpuBuffer<float> d_U, d_V, d_h_cache, d_sp, d_scratch, d_Δh;
+	d_U.allocate(U.size());       d_U.upload(&U[0], U.size());
+	d_V.allocate(V.size());       d_V.upload(&V[0], V.size());
+	d_h_cache.allocate(h_cache.size()); d_h_cache.upload(&h_cache[0], h_cache.size());
+	d_sp.allocate(sp.size());     d_sp.upload(&sp[0], sp.size());
+	d_scratch.allocate((size_t)T * std::max(d_out, r));
+	d_Δh.allocate((size_t)T * d_out);
+
+	const bool ok = glades::gpu::atcd_taylor_weight_delta(
+	    d_U.data(), d_V.data(), d_h_cache.data(), d_sp.data(),
+	    T, d_in, d_out, r,
+	    d_scratch.data(), d_Δh.data());
+	ASSERT("atcd_taylor_weight_delta returns true", ok);
+
+	std::vector<float> Δh_gpu((size_t)T * d_out);
+	d_Δh.download(&Δh_gpu[0], Δh_gpu.size());
+	float err = max_abs_diff(Δh_ref, Δh_gpu);
+	float norm = 0.0f;
+	for (size_t i = 0; i < Δh_ref.size(); ++i) norm = std::max(norm, std::fabs(Δh_ref[i]));
+	std::printf("  [atcd taylor-wd parity] T=%u d_in=%u d_out=%u r=%u "
+	            "max_err=%.3e norm=%.3e rel=%.3e\n",
+	            T, d_in, d_out, r, err, norm, err / (norm + 1e-12f));
+	ASSERT("Δh vs host < 1e-4", err < 1e-4f);
+#else
+	std::printf("  [atcd taylor-wd parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -9658,6 +9833,9 @@ void CHIRONUnitTest()
 	CHIRONMfioV2DeepMLPTest();
 	CHIRONMfioV2FromGradParityTest();
 	CHIRONMfioV2FromGradConvergenceTest();
+	CHIRONAtcdDriftNormParityTest();
+	CHIRONAtcdCacheRefreshParityTest();
+	CHIRONAtcdTaylorWeightDeltaParityTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();

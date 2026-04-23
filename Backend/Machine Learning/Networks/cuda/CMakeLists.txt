@@ -23,6 +23,7 @@ set(GLADES_CUDA_SOURCES
 	gpu_trcd.cu
 	gpu_lcp.cu
 	gpu_ibgrad.cu
+	gpu_atcd.cu
 	gpu_transformer_state.cu
 	gpu_dff_state.cu
 	gpu_rnn_state.cu
