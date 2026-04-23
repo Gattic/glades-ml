@@ -171,6 +171,34 @@ gates before a claim is declared validated:
 - Throughput cost quantified against baseline.
 - Memory/convergence claims validated at target scale, not just toy.
 
+### Gate 0 — cheap hypothesis probe (added 2026-04-23)
+
+**Before designing/implementing a new shift, run a 1-iteration
+hypothesis probe** that tests the shift's PREMISE, not its mechanism.
+
+Examples from iterations 85-88:
+- #32 NESR: Langevin theory predicts escape from minima.  Cheapest
+  probe: just run noise+FACE at small T for 5000 steps and measure.
+  Answer: NESR hurts FACE.  Pre-rejected.
+- #34 ZEN: multi-timescale EMA premised on β_col sensitivity.
+  Cheapest probe: 3-point β sweep at 500 steps.  Answer: FACE
+  is β-insensitive.  Pre-rejected.
+- #29 VOCAB: pruning premised on Zipfian vocab tail.  Cheapest
+  probe: count token frequencies in pretokenized sample.
+  Answer: at V=32k BPE, 99% of tokens are used.  Pre-rejected.
+
+Pattern: many paradigm-shift designs have an implicit assumption
+that can be checked for 1-5 minutes of runtime BEFORE committing to
+implementation.  Gate 0 catches bad candidates cheaply.  Three
+rejections in three iterations (85-88) saved ~3 implementation
+iterations.
+
+**Checklist for Gate 0**:
+1. What assumption does this shift rest on?  (e.g., "vocab is sparse")
+2. Can I measure that assumption with existing tools/primitives?
+3. What's the pass/fail criterion before running the probe?
+4. If probe passes, proceed to Gate 1; if fails, document and DEFER.
+
 ---
 
 ## Current research-program status (as of 2026-04-23)

@@ -33,7 +33,27 @@ convergence-axis shifts are the highest-value target.
 
 ## Candidate axes (prioritized by estimated research payoff)
 
-### #29 candidate: VOCAB — learned vocabulary pruning (convergence × memory)
+### #29 — VOCAB: PRE-REJECTED at V=32k by token-frequency probe (2026-04-23)
+
+Iteration 88 ran the cheap hypothesis-probe: measure unique-token
+frequency in 25M-token pretokenized pile-bpe sample.
+
+Result: at V=32,000, the BPE vocabulary is NOT significantly
+truncatable:
+- 98.9% of tokens appear ≥1 time in a 25M sample
+- Only 1.1% NEVER seen (351 tokens)
+- Only 6.9% have <100 occurrences
+- Top 51% of V accounts for 90% of occurrences (mild Zipf)
+
+VOCAB's projected "2× vocab reduction" is NOT achievable without
+≥10% training-signal loss at this vocab size.  The BPE encoder
+already did most of the prune-rare-tokens work at tokenization.
+
+**Status**: DEPRIORITIZED at V=32k.  May be viable at V≥131k
+(character-level or larger BPE) where the Zipf tail is longer.
+Would need re-probing at that scale.
+
+### #29 candidate: VOCAB — learned vocabulary pruning (ORIGINAL DESIGN)
 
 **Observation**: under Zipfian token distributions, bottom-50% of the
 vocabulary contributes <5% of gradient signal but 50% of the embedding
