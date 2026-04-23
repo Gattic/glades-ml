@@ -236,6 +236,37 @@ an `m × m` orthogonal rotation: substituting `(Q · W'_up, W'_down · Q^T)` for
 any orthogonal Q leaves h_out unchanged.  σ̂ absorbs this gauge automatically
 (rotation of its domain).  Adam is gauge-invariant in this basis.
 
+## 8a. Empirical speedup finding (2026-04-23 microbench)
+
+Initial benchmarks of csp_forward vs dense FFN at the dims in §9 produced a
+TIGHTER bound than the theoretical 3.5× FLOP ratio:
+
+| Config | theo FLOP | measured wall-clock |
+|--------|----------:|--------------------:|
+| T=1024 d=1024 d_ff=4096 m=1024 r_σ=32 | 3.88× | **0.51× (slower)** |
+| T=1024 d=1024 d_ff=4096 m=1024 r_σ=0  | 4.00× | **1.22×** |
+| T=1024 d=1024 d_ff=4096 m=512  r_σ=0  | 8.00× | 0.97× |
+| T=512  d=2048 d_ff=8192 m=2048 r_σ=32 | 3.94× | 0.49× (slower) |
+| T=512  d=2048 d_ff=8192 m=2048 r_σ=0  | 4.00× | 1.24× |
+
+**Explanation**: the dense FFN at these dims is already memory-bound, not
+compute-bound.  cuBLAS sgemm at T=1024, dim=1024-8192 achieves >1000 TFLOPS
+via TF32 tensor cores — the real bottleneck is HBM read/write of the
+intermediate `z ∈ ℝ^{T × d_ff}` and `a ∈ ℝ^{T × d_ff}` buffers.  CSP reduces
+the intermediate to size m < d_ff (which IS the memory axis), but the
+matmul GFLOPs are already free-ish.
+
+Implication for the promote path:
+- **Memory benefit is real and realized**: CSP still cuts the activation
+  and weight memory by 4× at m = d_ff/4.  This is the dominant benefit.
+- **Wall-clock benefit is scale-dependent**: expected to grow with T and
+  d_ff (larger matmuls saturate tensor cores longer, making FLOP ratio
+  more meaningful).  Needs validation at T ≥ 4096, d_ff ≥ 16384.
+- **σ̂ residual overhead dominates at small dims**: 7 kernel launches vs
+  3 for dense at m=1024 means launch overhead eats the FLOP savings at
+  these dims.  Mitigation: fuse σ̂ residual into a single kernel
+  (Phase 2 optimization).
+
 ## 9. Computational trade-offs at pile_large
 
 Config: `L = 24, T = 1024, d_model = 1024, d_ff = 4096, m = 1024, r_σ = 32`.

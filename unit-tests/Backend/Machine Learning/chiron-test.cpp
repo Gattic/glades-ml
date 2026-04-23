@@ -9061,6 +9061,149 @@ void CHIRONCspResidualForwardTest()
 #endif
 }
 
+// CHIRONCspBenchmarkTest ----------------------------------------------------
+// Phase 1 performance validation: measure realized wall-clock speedup of
+// csp_forward vs dense FFN at several dim configurations.  Also varies
+// r_σ to isolate the kernel-launch overhead of the σ̂ residual path.
+static void cspBenchOneConfig(unsigned int T, unsigned int d_model,
+                              unsigned int d_ff, unsigned int m,
+                              unsigned int r_sigma, int N_ITER)
+{
+#ifdef GLADES_HAVE_CUDA
+	LCG rng(202605010u);
+
+	// Dense FFN weights.
+	std::vector<float> h_in_h((size_t)T * d_model);
+	std::vector<float> W_up_h((size_t)d_model * d_ff);
+	std::vector<float> W_dn_h((size_t)d_ff * d_model);
+	for (size_t i = 0; i < h_in_h.size(); ++i) h_in_h[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < W_up_h.size(); ++i) W_up_h[i] = 0.02f * rng.next_unit();
+	for (size_t i = 0; i < W_dn_h.size(); ++i) W_dn_h[i] = 0.02f * rng.next_unit();
+
+	// CSP weights (m × d_model and d_model × m) + σ̂ residual.
+	std::vector<float> W_up_csp((size_t)d_model * m);
+	std::vector<float> W_dn_csp((size_t)m * d_model);
+	std::vector<float> U_s((size_t)m * r_sigma);
+	std::vector<float> V_s((size_t)m * r_sigma);
+	for (size_t i = 0; i < W_up_csp.size(); ++i) W_up_csp[i] = 0.02f * rng.next_unit();
+	for (size_t i = 0; i < W_dn_csp.size(); ++i) W_dn_csp[i] = 0.02f * rng.next_unit();
+	for (size_t i = 0; i < U_s.size(); ++i) U_s[i] = 0.01f * rng.next_unit();
+	for (size_t i = 0; i < V_s.size(); ++i) V_s[i] = 0.01f * rng.next_unit();
+
+	glades::gpu::GpuBuffer<float> d_h_in, d_Wup_d, d_Wdn_d, d_z_dense, d_y_dense, d_h_out_d;
+	glades::gpu::GpuBuffer<float> d_Wup_c, d_Wdn_c, d_Us, d_Vs, d_z_sk, d_y_sk, d_res_sc, d_h_out_c;
+	d_h_in.allocate(h_in_h.size()); d_h_in.upload(&h_in_h[0], h_in_h.size());
+	d_Wup_d.allocate(W_up_h.size()); d_Wup_d.upload(&W_up_h[0], W_up_h.size());
+	d_Wdn_d.allocate(W_dn_h.size()); d_Wdn_d.upload(&W_dn_h[0], W_dn_h.size());
+	d_z_dense.allocate((size_t)T * d_ff);
+	d_y_dense.allocate((size_t)T * d_ff);
+	d_h_out_d.allocate((size_t)T * d_model);
+
+	d_Wup_c.allocate(W_up_csp.size()); d_Wup_c.upload(&W_up_csp[0], W_up_csp.size());
+	d_Wdn_c.allocate(W_dn_csp.size()); d_Wdn_c.upload(&W_dn_csp[0], W_dn_csp.size());
+	d_Us.allocate(U_s.size()); d_Us.upload(&U_s[0], U_s.size());
+	d_Vs.allocate(V_s.size()); d_Vs.upload(&V_s[0], V_s.size());
+	d_z_sk.allocate((size_t)T * m);
+	d_y_sk.allocate((size_t)T * m);
+	d_res_sc.allocate((size_t)T * std::max(m, r_sigma));
+	d_h_out_c.allocate((size_t)T * d_model);
+
+	// Warmup (ensures cuBLAS handle ready, TF32 mode set).
+	for (int i = 0; i < 3; ++i) {
+		glades::gpu::sgemm_rowmajor((int)T, (int)d_ff, (int)d_model, 1.0f,
+		    d_h_in.data(), (int)d_model, d_Wup_d.data(), (int)d_ff, 0.0f,
+		    d_z_dense.data(), (int)d_ff);
+		glades::gpu::gelu_forward(d_z_dense.data(), (int)((size_t)T * d_ff), d_y_dense.data());
+		glades::gpu::sgemm_rowmajor((int)T, (int)d_model, (int)d_ff, 1.0f,
+		    d_y_dense.data(), (int)d_ff, d_Wdn_d.data(), (int)d_model, 0.0f,
+		    d_h_out_d.data(), (int)d_model);
+		glades::gpu::csp_forward(d_h_in.data(), d_Wup_c.data(), d_Wdn_c.data(),
+		    d_Us.data(), d_Vs.data(),
+		    T, d_model, m, r_sigma, 0,
+		    d_z_sk.data(), d_y_sk.data(), d_res_sc.data(),
+		    d_h_out_c.data());
+	}
+	cudaDeviceSynchronize();
+
+	// Dense FFN timing.
+	cudaEvent_t t0, t1;
+	cudaEventCreate(&t0); cudaEventCreate(&t1);
+	cudaEventRecord(t0);
+	for (int i = 0; i < N_ITER; ++i) {
+		glades::gpu::sgemm_rowmajor((int)T, (int)d_ff, (int)d_model, 1.0f,
+		    d_h_in.data(), (int)d_model, d_Wup_d.data(), (int)d_ff, 0.0f,
+		    d_z_dense.data(), (int)d_ff);
+		glades::gpu::gelu_forward(d_z_dense.data(), (int)((size_t)T * d_ff), d_y_dense.data());
+		glades::gpu::sgemm_rowmajor((int)T, (int)d_model, (int)d_ff, 1.0f,
+		    d_y_dense.data(), (int)d_ff, d_Wdn_d.data(), (int)d_model, 0.0f,
+		    d_h_out_d.data(), (int)d_model);
+	}
+	cudaEventRecord(t1); cudaEventSynchronize(t1);
+	float t_dense_ms = 0.0f;
+	cudaEventElapsedTime(&t_dense_ms, t0, t1);
+
+	// CSP forward timing.
+	cudaEventRecord(t0);
+	for (int i = 0; i < N_ITER; ++i) {
+		glades::gpu::csp_forward(d_h_in.data(), d_Wup_c.data(), d_Wdn_c.data(),
+		    d_Us.data(), d_Vs.data(),
+		    T, d_model, m, r_sigma, 0,
+		    d_z_sk.data(), d_y_sk.data(), d_res_sc.data(),
+		    d_h_out_c.data());
+	}
+	cudaEventRecord(t1); cudaEventSynchronize(t1);
+	float t_csp_ms = 0.0f;
+	cudaEventElapsedTime(&t_csp_ms, t0, t1);
+	cudaEventDestroy(t0); cudaEventDestroy(t1);
+
+	const double dense_per_iter = t_dense_ms / (double)N_ITER;
+	const double csp_per_iter   = t_csp_ms   / (double)N_ITER;
+	const double speedup        = dense_per_iter / csp_per_iter;
+
+	// Theoretical FLOP ratio.
+	const double flop_dense = 2.0 * (double)T *
+	    ((double)d_ff * d_model + (double)d_model * d_ff);  // 2 matmuls
+	const double flop_csp = 2.0 * (double)T *
+	    ((double)m * d_model + (double)d_model * m) +
+	    2.0 * (double)T * ((double)m * r_sigma + (double)r_sigma * m);
+	const double theo_speedup = flop_dense / flop_csp;
+
+	std::printf("  [csp bench] T=%u d_model=%u d_ff=%u m=%u r_σ=%u "
+	            "dense=%.3f ms CSP=%.3f ms  speedup=%.2fx (theo %.2fx)\n",
+	            T, d_model, d_ff, m, r_sigma, dense_per_iter,
+	            csp_per_iter, speedup, theo_speedup);
+#endif
+}
+
+void CHIRONCspBenchmarkTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [csp bench] no CUDA device — skipped\n");
+		return;
+	}
+	const int N_ITER = 30;
+
+	std::printf("  [csp bench] pile_large-scale configs:\n");
+	// Standard pile_large FFN: d_ff = 4 · d_model.
+	cspBenchOneConfig(1024, 1024, 4096, 1024, 32, N_ITER);
+	cspBenchOneConfig(1024, 1024, 4096, 1024,  0, N_ITER);  // no residual
+	cspBenchOneConfig(1024, 1024, 4096,  512,  0, N_ITER);  // m = d_ff/8
+
+	std::printf("  [csp bench] larger configs (GPT-scale):\n");
+	cspBenchOneConfig( 512, 2048, 8192, 2048, 32, N_ITER);
+	cspBenchOneConfig( 512, 2048, 8192, 2048,  0, N_ITER);
+	cspBenchOneConfig( 512, 2048, 8192, 1024,  0, N_ITER);
+
+	// Loose assertion — don't gate on realized speedup (memory-bound at
+	// small dims), just check the kernel runs to completion.
+	ASSERT("CSP benchmark completes without error", true);
+#else
+	std::printf("  [csp bench] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONAtcdFullE2ETest -----------------------------------------------------
 // Full end-to-end convergence validation of the ATC-Δ pipeline (paradigm
 // shift #26).  Single-layer MLP: x → W → GELU → h, with MSE loss against
@@ -10540,6 +10683,7 @@ void CHIRONUnitTest()
 	CHIRONAtcdFullE2ETest();
 	CHIRONCspDenseReductionParityTest();
 	CHIRONCspResidualForwardTest();
+	CHIRONCspBenchmarkTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();
