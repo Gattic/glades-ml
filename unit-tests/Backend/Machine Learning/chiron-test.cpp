@@ -12646,10 +12646,13 @@ void CHIRONEdtEnergyDistilledTest()
 				d_energy.download(&e_raw[0], T);
 				// softplus + small floor for stability
 				for (unsigned int t = 0; t < T; ++t) {
-					// softplus = log(1+exp(x)), stable version
+					// softplus + floor + CLAMP to prevent F2 noise amplification
+					// (empirical mitigation: cap dynamic range at 4× so no
+					// single token can dominate or be erased).
 					float x_val = e_raw[t];
 					float sp = (x_val > 20.0f) ? x_val : std::log(1.0f + std::exp(x_val));
-					sp += 0.01f;
+					sp += 0.5f;  // larger floor
+					if (sp > 2.0f) sp = 2.0f;  // upper cap
 					e_t[t] = sp;
 				}
 			}
