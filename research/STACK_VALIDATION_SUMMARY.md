@@ -153,9 +153,26 @@ theoretical expectations in magnitude or qualitative behavior:
    the CURRENT stack state before promotion.  See
    `DEFERRED_SHIFTS_RESCORE_2026-04-23.md` for the 10-shift re-score.
 
+8. **Theoretical FLOP reduction ≠ realized wall-clock speedup**
+   (shift #27 CSP Phase 1 bench).  CSP's 3.88× theoretical FLOP ratio
+   at pile_large dims (T=1024, d_model=1024, d_ff=4096, m=1024)
+   produced only 1.22× wall-clock speedup.  Hypothesis that larger
+   dims would close the gap was REJECTED: tested at T=4096, d_ff=8192
+   — speedup ceiling remained 1.22×.  Root cause: dense FFN weight
+   matrices fit in RTX 4080 SUPER's 64 MB L2 cache at all tested
+   sub-pile_large dims, making the path launch-bound rather than
+   HBM-bound.  Implication: for current-scale hardware, **memory-axis
+   paradigm shifts deliver their magnitude-level claims reliably**, but
+   **forward-compute-axis shifts need additional infrastructure (kernel
+   fusion, larger-than-L2 configs) to close the theory/measured gap**.
+   This reframes CSP as a MEMORY paradigm-shift-first (4× activation +
+   weight reduction, unconditional) with forward compute as a
+   secondary benefit.  See PARADIGM_SHIFT_27_DESIGN.md §8a-8b.
+
 The common thread: the research-framework-design skill's systematic
 failure-mode analysis produced mitigations that are load-bearing at the
-mechanism level, not optional safeguards.
+mechanism level, not optional safeguards.  Eight empirical surprises to
+date, all non-obvious from design-time analysis alone.
 
 ---
 
