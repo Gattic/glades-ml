@@ -14,17 +14,23 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
-### 2026-04-23: ATC-Δ Phase 1 primitives shipped (paradigm shift #26)
+### 2026-04-23: ATC-Δ Phases 1 + 1.5 + 2 shipped (paradigm shift #26)
 
-Three GPU primitives + parity tests for the newly-designed cross-step
-Taylor forward compression shift:
+Four GPU primitives + five parity tests for the cross-step Taylor
+forward compression shift:
 
 - `atcd_drift_norm`: fused ‖Δh‖_F/‖h‖_F reduction.  Parity err 9.3e-10.
 - `atcd_cache_refresh`: h, z copy + σ'(z) for GELU/SiLU.  Parity err 1.2e-7.
 - `atcd_taylor_weight_delta`: two thin GEMMs + σ' mask.  Parity err 7.5e-9.
+- **Phase 1.5 E2E Taylor accuracy** on 2-layer GELU MLP with rank-1 ΔW:
+  bit-exact vs host Taylor (8.7e-11); true-nonlinear residual 4.9e-7 abs
+  (1.44e-3 relative) — matches design doc §8.1 O(‖ΔW‖²) bound.
+- **Phase 2** `atcd_extract_rank1_power`: top-1 SVD of dense ΔW via power
+  iteration (3 iters).  Parity: σ_true=5.00 → σ_gpu=4.99 (0.23% error);
+  u, v recovered within 1.3% on a rank-1 + 1% noise matrix.
 
-Phase 2 next: streaming rSVD append for the (U, V) factor update.
-Phase 3: trainer wire-in behind `--atc-delta`.
+Next: Phase 3 trainer wire-in behind `--atc-delta` — compose all
+primitives in chiron_train's adam_step + forward path.
 
 ### 2026-04-23: First trainer-level COMPOUND optimizer — MFIO × WIP shipped
 
