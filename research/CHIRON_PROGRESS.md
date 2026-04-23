@@ -78,6 +78,37 @@ compound is a DROP-IN optimizer replacement at pile_large scale.
 MFIO state at pile_large: 432 KB (vs dense 288 MB) = **682.7× smaller**
 just on the Wq/Wk/Wv attention matrices.
 
+### 2026-04-23: 234M-param scale stress test — MFIO scales to 1365×
+
+At L=24, m=1024, dModel=2048 (234M total params, 3.5× the 66M pile_large):
+
+  Config                        VRAM      tok/s   MFIO state
+  Dense Adam                    4.63 GB   7210    (1152 MB Wq/Wk/Wv Adam)
+  --mfio 2 --wip-K 4            5.38 GB   7203    864 KB (1365× smaller)
+
+Convergence at step 10: identical loss (10.4464 both).
+
+But note: VRAM compound (+750 MB) EXCEEDS dense here.  Why?
+- WIP snapshot pool at K=4 × L=24 × Wo (8 MB each) = 750 MB
+- MFIO saves 1151 MB on Wq/Wk/Wv Adam → net +400 MB
+- WIP pool cost dominates at this config
+
+Configuration implication: at 234M scale, the flagship is more
+valuable when K=2 (cuts pool to 375 MB) OR when composed with
+MPOT-compressed snapshots (25× pool compression).  At pile_large
+(66M) the pool was only 188 MB — smaller than the 288 MB MFIO saved
+→ net positive.
+
+MFIO's compression ratio SCALES WITH MODEL SIZE:
+- 66M params (pile_large): 288 MB → 432 KB = 682×
+- 234M params (this run):   1152 MB → 864 KB = **1365×**
+
+This is exact doubling: MFIO state grows linearly with L+d, while
+dense Adam grows quadratically (d_in × d_out × 2 for m, v).  So
+MFIO's advantage grows as d² / (d_in + d_out) ≈ d / 2 at square
+matrices.  Projection to 30B params: ~10,000× MFIO compression on
+attention Adam state.
+
 ### 2026-04-23: 500-step compound run — bit-exact trajectory
 
 Extended the same pile_large config to 500 steps on pretokenized
