@@ -82,12 +82,21 @@ monotonically with hidden size m.
 
 | Horizon | Dense EMA | FACE EMA | Δ |
 |---------|----------:|---------:|:-:|
-| 500 steps | 10.0922 | 9.7965 | **−0.30 nat** |
+| 250 steps | 9.6790 | 8.6656 | **−1.01** |
+| 500 steps | 10.0922 | 9.7965 | −0.30 |
+| 750 steps | 9.8921 | 9.6408 | −0.25 |
 | 1000 steps | 9.7822 | 9.7386 | −0.04 (narrowest) |
-| 1500 steps | 9.4427 | 8.3356 | **−1.11 nat** |
+| 1250 steps | 10.0288 | 9.5822 | −0.45 |
+| 1500 steps | 9.4427 | 8.3356 | **−1.11** |
+| 1750 steps | 9.9173 | 9.2697 | −0.65 |
+| 2000 steps | 10.0740 | 9.8610 | −0.21 |
+| 2250 steps | 9.9527 | 9.0300 | **−0.92** |
+| 2500 steps | 9.9409 | 9.3921 | −0.55 |
 
-Short-horizon measurements are noisy (batch oscillations); long-horizon
-measurements reveal sustained ~1 nat advantage.
+**FACE consistently leads dense Adam across the full 2500-step horizon.**
+Advantage oscillates in 0.2-1.1 nat range, averaging ~0.55 nat over steps
+500-2500.  No plateau or reversal observed.  Short-horizon (≤500 step)
+samples undersample the oscillation and misrepresent the signal.
 
 ### 3.3 Throughput
 
