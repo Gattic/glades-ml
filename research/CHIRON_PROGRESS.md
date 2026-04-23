@@ -47,7 +47,7 @@ Approximately log-linear growth — no saturation observed.
 - `research/STACK_VALIDATION_SUMMARY.md` — top-level shift status
 - `research/PARADIGM_SHIFT_{26,27,28}_DESIGN.md` — full design docs for ATC-Δ, CSP, FACE
 
-### Paradigm shift shipping status (4 in-trainer, 14 designed)
+### Paradigm shift shipping status (4 in-trainer, 15 designed)
 | # | Shift | Phase | Axis |
 |---|-------|:-:|------|
 | 11 | MFIO (Wq/Wk/Wv) | **trainer** | memory only |
@@ -56,6 +56,7 @@ Approximately log-linear growth — no saturation observed.
 | **28** | **FACE (embedding)** | **trainer** | **memory + CONVERGENCE** |
 | 26 | ATC-Δ (cross-step Taylor) | primitives | forward speedup (Phase 3 pending) |
 | 27 | CSP (FFN compression) | primitives | forward speedup (Phase 3 pending) |
+| 35 | SPAREC (FFN backward sparsity) | design | backward speedup (3–5× projected) |
 
 ### Research-program-level findings
 1. Paradigm shifts cluster into 3 types: memory-only, convergence, compound.

@@ -336,6 +336,24 @@ should either:
 Current session state: FACE is the research output.  Further
 paradigm shifts would need fundamentally new mechanism innovations.
 
+### Paradigm shift #35 — SPAREC (iter 110, 2026-04-23)
+
+**Axis: FFN backward-pass activation sparsity** — the last unattacked
+compute axis. 3-candidate parallel protocol:
+- A: **SPAREC** — hard threshold on σ'(x), zero bias, zero state. [SELECTED]
+- B: RAZOR — JL random projection, unbiased, 3% variance (deferred)
+- C: GATE-BACK — learned mask, needs ϕ + aux BCE (deferred)
+
+SPAREC selected for:
+- 0.15% provable relative-gradient error bound (below Adam noise)
+- Zero new optimizer state (composes with MFIO × WIP × FACE)
+- Exact when σ'=0 (GELU x ≪ 0 regime)
+- Phase-1 doable with cuBLAS SGEMM + one custom mask kernel
+
+Projected: 3-5× FFN backward speedup, composable with full stack.
+Full design: `PARADIGM_SHIFT_35_DESIGN.md`.
+Candidates: `PARADIGM_SHIFT_35_CANDIDATE_{A,B,C}_*.md`.
+
 ### Recommended next iteration (ORIGINAL 2026-04-23, pre-rejections)
 
 ### Recommended next iteration (ORIGINAL 2026-04-23, pre-NESR)
@@ -376,5 +394,5 @@ pending trainer wire-in).  Paradigm shifts #32 and #34 keep momentum on
 the optimizer axis; #33 would target the forward axis once ATC-Δ is
 shipped.
 
-Paradigm-design count after listing these: **34** candidates (14
-shipped/wired, 14 designed, 6 candidate-space-only).
+Paradigm-design count after listing these: **35** candidates (14
+shipped/wired, 15 designed including #35 SPAREC, 6 candidate-space-only).
