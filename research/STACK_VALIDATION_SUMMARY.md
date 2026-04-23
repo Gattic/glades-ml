@@ -122,6 +122,15 @@ theoretical expectations in magnitude or qualitative behavior:
    The plateau is η-invariant (100× Oja-rate variation produces
    same plateau), confirming structural (not tuning) origin.
 
+6. **EDT F2 noise-amplification is dominant** (shift #23).  The naive
+   joint-minimization formulation of EDT REGRESSES the baseline on
+   noisy data (ratio 0.66× vs uniform weighting).  Both sign conventions
+   fail: descent down-weights hard tokens; ascent amplifies noise.
+   The design doc's F2 mitigation (gradient-magnitude term) is
+   required.  Second instance of design-doc F-mode analysis being
+   load-bearing rather than safeguard — a pattern now consistent
+   across #19 IBGRAD and #23 EDT.
+
 The common thread: the research-framework-design skill's systematic
 failure-mode analysis produced mitigations that are load-bearing at the
 mechanism level, not optional safeguards.
