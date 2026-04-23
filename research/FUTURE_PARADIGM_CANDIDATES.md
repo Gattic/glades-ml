@@ -123,7 +123,29 @@ reducer but a sampling-space smoother.
 
 ---
 
-### #32 candidate: NESR — noise-equilibrium stochastic resonance
+### #32 — NESR (Langevin-Adam): EMPIRICALLY REJECTED (2026-04-23)
+
+Shipped as Phase 1 in iteration 85; long-horizon tested in iteration 86
+at 66M × 5000 steps.  RESULT: NESR hurts convergence when composed
+with FACE at every horizon checkpoint:
+
+  Step   FACE only    FACE + NESR    Penalty
+  500     9.263        9.336         +0.07
+  2000    8.631        8.925         +0.29
+  3000    8.421        8.888         +0.47
+  5000    7.755        8.127         +0.37 nat
+
+The Langevin "escape shallow minima" hypothesis does NOT validate at
+these scales.  FACE's implicit Zipfian regularization appears
+sufficient; additional Gaussian noise adds pure variance.
+
+**Status**: deferred candidate.  DO NOT promote without substantial
+reformulation.  Potential reformulations (not yet explored):
+- Noise ONLY on parameters with low |gradient| (stuck params)
+- Warmup-only noise (first 100-500 steps) to escape poor init
+- Noise on ATTENTION only (where FACE doesn't reach)
+
+### #32 candidate: NESR — noise-equilibrium stochastic resonance (ORIGINAL DESIGN — superseded by the REJECTED finding above)
 
 **Observation**: small amounts of noise in the weight update can help
 escape shallow local minima.  Adam's implicit noise (via stochastic
@@ -224,12 +246,23 @@ For the next iteration's paradigm shift design:
 6. **#33 RAND** (random-feature attention): known tradeoff; defer until
    flash attention memory becomes a bottleneck.
 
-### Recommended next iteration
+### Recommended next iteration (2026-04-23 update, post-NESR)
+With #32 NESR empirically rejected, prioritize one of:
+- **#29 VOCAB** — vocabulary pruning (bounded implementation, unique axis)
+- **#34 ZEN** — multi-rank FACE (directly extends the validated winner)
+- **#30 TRAJ** — trajectory-predictive Adam (requires more design work)
+
+ZEN likely has the highest impact-per-iteration ratio — it extends an
+already-validated mechanism, so the prior probability of success is
+high.  TRAJ is the most novel but riskiest.
+
+### Recommended next iteration (ORIGINAL 2026-04-23, pre-NESR)
 Design and ship **paradigm shift #32 NESR** (Langevin-Adam):
 - 1-line kernel modification
 - Empirically validatable in a single iteration (500-step run)
 - Minimal risk of divergence
 - Tests whether controlled noise helps beyond FACE's implicit regularization
+- **RESULT: rejected (see §32 entry above)**
 
 ---
 
