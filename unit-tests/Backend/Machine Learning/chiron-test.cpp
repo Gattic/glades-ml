@@ -9204,6 +9204,15 @@ void CHIRONCspBenchmarkTest()
 	cspBenchOneConfig(4096, 1024, 4096, 1024,  0, 20);
 	cspBenchOneConfig(4096, 1024, 8192, 2048,  0, 20);
 
+	// HBM-bound configs: weight matrix > L2 cache (64 MB on RTX 4080 SUPER).
+	// Tests whether CSP speedup activates when the dense path can no longer
+	// stream weights from L2 cache on warm iterations.
+	std::printf("  [csp bench] HBM-bound configs (weights > L2):\n");
+	//  d_ff = 16384, d_model = 4096: weight = 256 MB per matrix > L2.
+	cspBenchOneConfig( 512, 4096, 16384, 4096,  0, 10);
+	cspBenchOneConfig( 512, 4096, 16384, 2048,  0, 10);
+	cspBenchOneConfig(1024, 2048, 16384, 4096,  0, 10);
+
 	// Loose assertion — don't gate on realized speedup (memory-bound at
 	// small dims), just check the kernel runs to completion.
 	ASSERT("CSP benchmark completes without error", true);
