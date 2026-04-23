@@ -9639,6 +9639,129 @@ void CHIRONFaceApplyUpdateParityTest()
 #endif
 }
 
+// CHIRONFaceEmaTrajectoryParityTest -----------------------------------------
+// Phase 3 validation of FACE EMA updates.  Simulates N=10 training steps
+// where a different subset of rows is active each step.  Runs the full
+// FACE EMA chain on GPU (compute_sparse_stats + update_emas) and compares
+// the final (zn_bar, dn_bar, q_hat, gF_hat) state against a host-computed
+// reference trajectory.  Validates the CONDITIONAL row EMA logic (inactive
+// rows preserve state) which is the key sparsity-invariance property.
+void CHIRONFaceEmaTrajectoryParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [face ema trajectory] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int V = 64, m = 16;
+	const int N_STEPS = 10;
+	const float beta_row = 0.9f;
+	const float beta_col = 0.95f;
+	LCG rng(202605210u);
+
+	// Device state (init to zero).
+	glades::gpu::GpuBuffer<float> d_zn_bar, d_dn_bar, d_q_hat, d_gF_hat;
+	d_zn_bar.allocate(V);  d_zn_bar.zero();
+	d_dn_bar.allocate(m);  d_dn_bar.zero();
+	d_q_hat.allocate(1);   d_q_hat.zero();
+	d_gF_hat.allocate(1);  d_gF_hat.zero();
+
+	// Per-step stats buffers (GPU scratch).
+	glades::gpu::GpuBuffer<float> d_g, d_zn_new, d_dn_raw, d_q, d_gF;
+	d_g.allocate((size_t)V * m);
+	d_zn_new.allocate(V);
+	d_dn_raw.allocate(m);
+	d_q.allocate(1);
+	d_gF.allocate(1);
+
+	// Host reference state.
+	std::vector<float> zn_bar_h(V, 0.0f), dn_bar_h(m, 0.0f);
+	float q_hat_h = 0.0f, gF_hat_h = 0.0f;
+
+	for (int step = 0; step < N_STEPS; ++step)
+	{
+		// Pick a DIFFERENT random subset of active rows each step.
+		std::vector<float> g_h((size_t)V * m, 0.0f);
+		std::vector<int> active_rows;
+		for (unsigned int i = 0; i < V; ++i) {
+			const float u = (rng.next_unit() + 1.0f) * 0.5f;
+			if (u < 0.3f) {  // ~30% active each step
+				active_rows.push_back((int)i);
+				for (unsigned int j = 0; j < m; ++j)
+					g_h[(size_t)i * m + j] = 0.2f * rng.next_unit();
+			}
+		}
+
+		// Host: compute fresh stats.
+		std::vector<float> zn_new_h(V, 0.0f), dn_raw_h(m, 0.0f);
+		float gF_h = 0.0f;
+		for (unsigned int i = 0; i < V; ++i) {
+			float rs = 0.0f;
+			for (unsigned int j = 0; j < m; ++j) {
+				const float v = g_h[(size_t)i * m + j];
+				rs += v * v;
+				dn_raw_h[j] += v * v;
+			}
+			zn_new_h[i] = rs;
+			gF_h += rs;
+		}
+		const float q_h = (float)active_rows.size();
+
+		// Host: apply EMAs.
+		for (unsigned int i = 0; i < V; ++i) {
+			if (zn_new_h[i] > 0.0f) {
+				zn_bar_h[i] = beta_row * zn_bar_h[i] + (1.0f - beta_row) * zn_new_h[i];
+			}
+		}
+		const float qs = (q_h > 1.0f) ? q_h : 1.0f;
+		for (unsigned int j = 0; j < m; ++j) {
+			const float dn_deb = dn_raw_h[j] / qs;
+			dn_bar_h[j] = beta_col * dn_bar_h[j] + (1.0f - beta_col) * dn_deb;
+		}
+		q_hat_h  = beta_col * q_hat_h  + (1.0f - beta_col) * q_h;
+		gF_hat_h = beta_col * gF_hat_h + (1.0f - beta_col) * gF_h;
+
+		// GPU: compute stats + update EMAs.
+		d_g.upload(&g_h[0], g_h.size());
+		glades::gpu::face_compute_sparse_stats(
+		    d_g.data(), V, m, d_zn_new.data(), d_dn_raw.data(),
+		    d_q.data(), d_gF.data());
+		const bool ok = glades::gpu::face_update_emas(
+		    d_zn_bar.data(), d_dn_bar.data(), d_q_hat.data(), d_gF_hat.data(),
+		    d_zn_new.data(), d_dn_raw.data(), d_q.data(), d_gF.data(),
+		    V, m, beta_row, beta_col);
+		ASSERT("face_update_emas returns true", ok);
+	}
+
+	// Download final state, compare.
+	std::vector<float> zn_gpu(V), dn_gpu(m);
+	float q_gpu = 0.0f, gF_gpu = 0.0f;
+	d_zn_bar.download(&zn_gpu[0], V);
+	d_dn_bar.download(&dn_gpu[0], m);
+	d_q_hat.download(&q_gpu, 1);
+	d_gF_hat.download(&gF_gpu, 1);
+
+	float err_zn = 0.0f, err_dn = 0.0f;
+	for (unsigned int i = 0; i < V; ++i)
+		err_zn = std::max(err_zn, std::fabs(zn_gpu[i] - zn_bar_h[i]));
+	for (unsigned int j = 0; j < m; ++j)
+		err_dn = std::max(err_dn, std::fabs(dn_gpu[j] - dn_bar_h[j]));
+	const float err_q  = std::fabs(q_gpu  - q_hat_h);
+	const float err_gF = std::fabs(gF_gpu - gF_hat_h);
+
+	std::printf("  [face ema trajectory] V=%u m=%u N=%d β_row=%.2f β_col=%.2f "
+	            "err_zn=%.3e err_dn=%.3e err_q=%.3e err_gF=%.3e\n",
+	            V, m, N_STEPS, beta_row, beta_col, err_zn, err_dn, err_q, err_gF);
+	ASSERT("FACE zn_bar trajectory < 1e-5",  err_zn < 1e-5f);
+	ASSERT("FACE dn_bar trajectory < 1e-5",  err_dn < 1e-5f);
+	ASSERT("FACE q_hat trajectory < 1e-4",   err_q < 1e-4f);
+	ASSERT("FACE gF_hat trajectory < 1e-3",  err_gF < 1e-3f);
+#else
+	std::printf("  [face ema trajectory] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -10877,6 +11000,7 @@ void CHIRONUnitTest()
 	CHIRONCspBenchmarkTest();
 	CHIRONFaceSparseStatsParityTest();
 	CHIRONFaceApplyUpdateParityTest();
+	CHIRONFaceEmaTrajectoryParityTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();

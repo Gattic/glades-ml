@@ -113,6 +113,71 @@ __global__ void k_face_sum_vec(const float* __restrict__ in,
 
 } // anonymous namespace
 
+// EMA update kernels.  One thread per element; conditional update for rows
+// (skip inactive), unconditional for cols and scalars.
+__global__ void k_face_ema_rows(float* __restrict__ zn_bar,
+                                const float* __restrict__ zn_new,
+                                unsigned int V, float beta_row)
+{
+	const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= V) return;
+	const float zn_i = zn_new[i];
+	if (zn_i > 0.0f) {
+		zn_bar[i] = beta_row * zn_bar[i] + (1.0f - beta_row) * zn_i;
+	}
+	// else: row inactive this step; preserve prior zn_bar[i].
+}
+
+__global__ void k_face_ema_cols(float* __restrict__ dn_bar,
+                                const float* __restrict__ dn_raw,
+                                const float* __restrict__ q,
+                                unsigned int m, float beta_col)
+{
+	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (j >= m) return;
+	const float qv = *q;
+	const float qs = (qv > 1.0f) ? qv : 1.0f;
+	const float dn_deb = dn_raw[j] / qs;
+	dn_bar[j] = beta_col * dn_bar[j] + (1.0f - beta_col) * dn_deb;
+}
+
+__global__ void k_face_ema_scalars(float* __restrict__ q_hat,
+                                   float* __restrict__ gF_hat,
+                                   const float* __restrict__ q,
+                                   const float* __restrict__ gF,
+                                   float beta_col)
+{
+	if (threadIdx.x != 0 || blockIdx.x != 0) return;
+	*q_hat  = beta_col * (*q_hat)  + (1.0f - beta_col) * (*q);
+	*gF_hat = beta_col * (*gF_hat) + (1.0f - beta_col) * (*gF);
+}
+
+bool face_update_emas(float* zn_bar, float* dn_bar,
+                      float* q_hat, float* gF_hat,
+                      const float* zn_new, const float* dn_raw,
+                      const float* q, const float* gF,
+                      unsigned int V, unsigned int m,
+                      float beta_row, float beta_col)
+{
+	if (zn_bar == nullptr || dn_bar == nullptr || q_hat == nullptr || gF_hat == nullptr)
+		return false;
+	if (zn_new == nullptr || dn_raw == nullptr || q == nullptr || gF == nullptr)
+		return false;
+	if (V == 0u || m == 0u) return false;
+
+	const int block = 256;
+	const int grid_V = (int)((V + (unsigned)block - 1u) / (unsigned)block);
+	const int grid_m = (int)((m + (unsigned)block - 1u) / (unsigned)block);
+
+	k_face_ema_rows<<<grid_V, block, 0, computeStream()>>>(
+	    zn_bar, zn_new, V, beta_row);
+	k_face_ema_cols<<<grid_m, block, 0, computeStream()>>>(
+	    dn_bar, dn_raw, q, m, beta_col);
+	k_face_ema_scalars<<<1, 1, 0, computeStream()>>>(
+	    q_hat, gF_hat, q, gF, beta_col);
+	return cudaGetLastError() == cudaSuccess;
+}
+
 // Preconditioned update kernel: one thread per (i, j) pair.  Because g is
 // zero on inactive rows, the multiplicative update naturally zeros there.
 __global__ void k_face_apply_update(float* __restrict__ theta,

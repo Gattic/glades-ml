@@ -103,6 +103,52 @@ bool face_apply_preconditioned_update(float* theta,
                                       unsigned int V, unsigned int m,
                                       float lr, float eps);
 
+// ========================================================================
+// face_update_emas — update the four FACE EMA state components after a
+// fresh stats computation.
+//
+// Row EMA is CONDITIONAL: zn̄[i] only updates if row i was active in the
+// current batch (i.e. zn_new[i] > 0).  Inactive rows preserve their prior
+// zn̄ — this is what lets FACE behave correctly under Zipfian token
+// frequencies where rare tokens see stale but valid stats.
+//
+//   zn̄[i]    ← β_row · zn̄[i] + (1−β_row) · zn_new[i]    if zn_new[i] > 0
+//   zn̄[i]    ← zn̄[i]                                    if zn_new[i] == 0
+//
+// Column EMA is UNCONDITIONAL (applied to all m columns every step) on
+// the frequency-debiased column norm:
+//
+//   dn̄[j]    ← β_col · dn̄[j] + (1−β_col) · (dn_raw[j] / max(q, 1))
+//
+// Scalar EMAs are in-place:
+//
+//   q̂        ← β_col · q̂ + (1−β_col) · q
+//   gF̄       ← β_col · gF̄ + (1−β_col) · gF
+//
+// All EMAs share no dependencies — kernels launch in parallel on the
+// compute stream.
+//
+// Inputs:
+//   zn_new   [V]     FP32 — fresh row norms from face_compute_sparse_stats
+//   dn_raw   [m]     FP32 — fresh column norms from face_compute_sparse_stats
+//   q                device scalar — active-row count this step
+//   gF               device scalar — ‖g‖_F² this step
+//   V, m             dims
+//   beta_row         row EMA decay (typical 0.98)
+//   beta_col         col+scalar EMA decay (typical 0.95)
+// In/out (device FP32 state):
+//   zn_bar   [V]
+//   dn_bar   [m]
+//   q_hat    scalar
+//   gF_hat   scalar
+// ========================================================================
+bool face_update_emas(float* zn_bar, float* dn_bar,
+                      float* q_hat, float* gF_hat,
+                      const float* zn_new, const float* dn_raw,
+                      const float* q, const float* gF,
+                      unsigned int V, unsigned int m,
+                      float beta_row, float beta_col);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -115,6 +161,11 @@ inline bool face_apply_preconditioned_update(float*, const float*,
                                              const float*, const float*,
                                              unsigned int, unsigned int,
                                              float, float) { return false; }
+inline bool face_update_emas(float*, float*, float*, float*,
+                             const float*, const float*,
+                             const float*, const float*,
+                             unsigned int, unsigned int,
+                             float, float) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 
