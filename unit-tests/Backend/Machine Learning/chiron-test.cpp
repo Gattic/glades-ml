@@ -9196,6 +9196,14 @@ void CHIRONCspBenchmarkTest()
 	cspBenchOneConfig( 512, 2048, 8192, 2048,  0, N_ITER);
 	cspBenchOneConfig( 512, 2048, 8192, 1024,  0, N_ITER);
 
+	// Stretch configs: longer T, 4x d_ff.  Tests whether matmul size
+	// starts saturating tensor cores enough that FLOP reduction matters.
+	std::printf("  [csp bench] stretch configs (longer T + wider d_ff):\n");
+	cspBenchOneConfig(2048, 1024, 4096, 1024,  0, 20);
+	cspBenchOneConfig(2048, 2048, 8192, 2048,  0, 20);
+	cspBenchOneConfig(4096, 1024, 4096, 1024,  0, 20);
+	cspBenchOneConfig(4096, 1024, 8192, 2048,  0, 20);
+
 	// Loose assertion — don't gate on realized speedup (memory-bound at
 	// small dims), just check the kernel runs to completion.
 	ASSERT("CSP benchmark completes without error", true);
