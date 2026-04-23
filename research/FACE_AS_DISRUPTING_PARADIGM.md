@@ -121,6 +121,31 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.8 β_row tuning — default 0.98 is SUBOPTIMAL; 0.995 adds 0.8 nat (2026-04-23)
+
+Iteration 97 swept β_row ∈ {0.95, 0.98, 0.995} at 66M × 500-1500 steps:
+
+  β_row     EMA@250   EMA@500   EMA@1500
+  0.95      8.810     9.413     —
+  0.98      8.423     9.263     8.183  (design-doc default)
+  **0.995   7.602     9.071     7.389  (BEST)**
+
+β_row=0.995 gives 0.82 nat better loss at step 250 and 0.79 nat at
+step 1500 vs the default 0.98.
+
+Unlike β_col (iter 87: insensitive across 10× range), β_row has a
+clear optimum at the slow-decay end.  Longer row EMA = more averaging
+of per-row squared norms across rare-token activations = more stable
+Zipfian regularization.
+
+Production recipe refinement:
+  PREVIOUS: --mfio 2 --wip-K 4 --face 1
+  REFINED:  --mfio 2 --wip-K 4 --face 1 --face-beta-row 0.995
+
+The 0.995 adds an additional 0.8 nat on top of FACE's baseline
+advantage — the cumulative effect vs dense Adam at 1500 steps on 66M
+is now roughly 1.5 nat.
+
 ### 3.7 🎯 MECHANISM VALIDATED — Zipf hypothesis confirmed (2026-04-23)
 
 The decisive experiment that validates FACE's mechanism.  Compared
