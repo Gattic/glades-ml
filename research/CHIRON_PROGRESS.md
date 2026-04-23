@@ -14,6 +14,33 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: IBGRAD Phase 5 scale comparison — 7th empirical surprise
+
+Post-Phase 5 wire-in head-to-head at L=8, m=256, Wo=512×256, 20 steps:
+
+  Dense Adam:    66,917 tok/s, 1.19 GB VRAM
+  IBGRAD r=32:   62,618 tok/s, 1.38 GB VRAM
+  Delta:         -6.4% throughput, +190 MB VRAM
+
+**EMPIRICAL FINDING**: IBGRAD is currently NET-NEGATIVE at this scale.
+The P matrix (N×r×4B) exceeds the dense-Adam-state savings because
+int8 Adam (shift #3) has already compressed Adam state to 2 bytes/param.
+
+At pile_large (Wo = 1024×512 = 524k params × 24 layers):
+  - dense int8 Adam state:    ~24 MB total
+  - IBGRAD r=32 P-matrix total: ~1.5 GB (60× LARGER)
+
+IBGRAD's REAL benefit is BACKWARD-GEMM reduction (g projected to r-dim
+BEFORE the Adam-update compute), which the current Phase-5C wire-in
+does NOT realize (backward produces dense dWo first, then projects).
+
+7th Ralph-loop empirical surprise: paradigm shift valuations depend on
+what OTHER shifts have already shipped.  IBGRAD was designed against
+FP32 Adam baseline; int8 Adam (shift #3) shipped first and invalidated
+the Adam-state-savings claim.  Research-pipeline insight: re-score
+deferred shifts against the CURRENT state of the stack, not against
+their original designed baselines.
+
 ### 2026-04-23: chiron_train standalone trainer health check
 
 End-to-end smoke test of `glades_chiron_train` (standalone CHIRON
