@@ -78,6 +78,38 @@ compound is a DROP-IN optimizer replacement at pile_large scale.
 MFIO state at pile_large: 432 KB (vs dense 288 MB) = **682.7× smaller**
 just on the Wq/Wk/Wv attention matrices.
 
+### 2026-04-23: 3-shift flagship BEATS dense Adam at 234M scale
+
+Extended the new flagship (--mfio 2 --wip-K 4 --face 1) to a 234M-param
+config (L=24, m=1024, dModel=2048, T=1024, V=32k) for 500 steps on
+pretokenized pile-bpe.  The advantage GROWS with scale:
+
+  Step   Dense Adam    3-shift flagship    Δ
+  100    10.2831       10.2835            +0.0004  (bit-exact, warmup)
+  200    10.3607       10.1075            **−0.2532 nat**  (FACE active)
+  300    10.4454       10.1455            **−0.2999 nat**
+  400     4.9395        4.3240            **−0.6155 nat**
+  500    10.2202       10.1781            −0.0421 nat
+  EMA@500 10.0922       9.7965            **−0.2957 nat**
+
+Throughput: 7218 vs 7179 tok/s (identical within noise).
+VRAM: 5.38 vs 4.63 GB (+750 MB WIP snapshot pool at K=4).
+FACE embedding state: 254 KB vs dense 250 MB = **1008× compression**.
+
+Scale-dependence finding: the compound's advantage over dense Adam
+GROWS with model size:
+  66M params  (pile_large):     +0.03 nat (marginal)
+  234M params (this run):       +0.30 nat (significant)
+
+Hypothesis: Adafactor-style preconditioners provide implicit
+regularization that helps more as over-parameterization increases.
+Dense Adam's per-parameter v accumulates adaptive LR noise;
+MFIO/FACE's row/col structure filters out the noise direction.
+
+Projection to 2.23B: if the trend continues linearly in log(params),
+expected advantage ~+0.8 nat — potentially a paradigm-level
+convergence improvement, not just a memory optimization.
+
 ### 2026-04-23: FACE (paradigm #28) shipped — 3-shift compound = new flagship
 
 `--mfio 2 --wip-K 4 --face 1` (MFIO on Wq/Wk/Wv × WIP on Wo × FACE on

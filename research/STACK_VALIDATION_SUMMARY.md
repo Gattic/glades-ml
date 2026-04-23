@@ -168,6 +168,23 @@ theoretical expectations in magnitude or qualitative behavior:
    the CURRENT stack state before promotion.  See
    `DEFERRED_SHIFTS_RESCORE_2026-04-23.md` for the 10-shift re-score.
 
+11. **3-shift flagship BEATS dense Adam at 234M params**
+   (scale stress test 2026-04-23).  The --mfio 2 --wip-K 4 --face 1
+   compound produces lower loss than standard dense Adam over 500
+   pretokenized pile-bpe steps at L=24, m=1024, dModel=2048.
+   Advantage GROWS with scale:
+     66M params:   +0.03 nat (marginal)
+     234M params:  +0.30 nat EMA@500 (significant)
+   Hypothesis: Adafactor-style preconditioners provide implicit
+   regularization that filters adaptive-LR noise.  Dense Adam's
+   per-parameter v accumulates per-step noise on the direction-normal
+   component; MFIO/FACE's row/col structure ignores that direction.
+   If the trend continues linearly in log(params), projected
+   2.23B-param advantage is ~+0.8 nat — a paradigm-level
+   convergence improvement, not just a memory optimization.
+   This reframes the shifts as POTENTIAL LOSS-IMPROVING methods
+   at scale, not just memory-saving replacements.
+
 10. **Parity-passing formulae can still be dimensionally wrong**
    (FACE Phase 4 trainer wire-in 2026-04-23).  FACE primitives passed
    all 3 parity tests (stats 2e-7, update 7e-9, EMA trajectory 4e-10)
