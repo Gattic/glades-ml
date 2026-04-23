@@ -121,6 +121,32 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.6 500M × 1000 steps — peak advantage is scale-invariant (2026-04-23)
+
+Filled the missing gap in the scaling matrix.  500M × 1000 steps run:
+
+  Step   Dense EMA   FACE EMA    Δ
+  200    10.3405     10.0930    −0.25
+  300     9.7743      8.6477    **−1.13** (PEAK)
+  500    10.0375      9.7069    −0.33
+  800     9.9972      9.2523    −0.74
+  1000   10.0775      9.7586    −0.32
+
+Peak advantage at 500M = −1.13 nat @ step 300.  Compare to peaks at
+other scales:
+  66M peak:   −1.12 @ step 1500
+  234M peak:  −1.11 @ step 1500
+  500M peak:  **−1.13 @ step 300**
+
+Peak is remarkably SCALE-INVARIANT at ~1.13 nat.  The STEP at which
+the peak occurs VARIES (300 at 500M vs 1500 at smaller scales) —
+larger models may reach the peak sooner (fewer steps to traverse
+the representation-formation regime).
+
+1000-step advantage at 500M = 0.32 nat, matching the 500-step value
+(0.33).  Flat in this range — likely needs 2500+ steps to see the
+horizon-growth pattern observed at 66M.
+
 ### 3.5 5000-step horizon at 66M — advantage continues growing (2026-04-23)
 
 Extended the 66M FACE validation from 2500 to 5000 steps.  The
