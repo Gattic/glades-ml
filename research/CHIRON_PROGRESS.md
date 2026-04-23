@@ -14,6 +14,25 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: WIP Phase 3D GPU-native — 91% of dense throughput
+
+Refactor: Wo_snapshot_pool[l][k] (K separate N-vectors) → single
+contiguous Wo_snapshot_stack[l] (K·N_Wo row-major).  Enables sgemv
+for both dots = stack·dθ and θ = α_sm·stack.
+
+Head-to-head at L=8, m=128, seq_len=512, 50 steps:
+
+                              tok/s     % of dense    Loss@50
+  Dense Adam                  94,408    100%          10.3846
+  WIP Phase 3C (host math)    47,893     49%          10.3844
+  WIP Phase 3D (GPU sgemv)    85,963     91%          10.3845  ★
+
+**1.79× speedup** from Phase 3C → 3D refactor.  Adam state
+compression unchanged at 1300× (768 B total vs 1 MB/layer dense).
+
+Per-step WIP overhead: from ~200 μs (host) to ~5 μs (GPU) = 40×.
+Dense path remains ~100 μs/step.
+
 ### 2026-04-23: WIP Phase 3C scale benchmark — 49% throughput @ L=8, K=8
 
 Head-to-head at L=8, m=128, dModel=128, seq_len=512, 50 steps:
