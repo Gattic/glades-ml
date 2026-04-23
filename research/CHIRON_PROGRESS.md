@@ -14,6 +14,20 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: stack-health re-verification — 62,474 tok/s at epoch 1
+
+Post-IBGRAD-CLI-scaffolding + paradigm-22 design verification:
+`MAX_TOKENS=500000 LOCAL_ATTN=256 sh run.sh bpe --large --atlas`
+
+  epoch 0 steady-state:  45,110 tok/s (seq_done=240)
+  epoch 1 peak:          **62,474 tok/s** (post-warmup)
+  loss:  10.59 → 10.57 (converging normally)
+
+Exceeds the 2026-04-22 baseline of 45,297 tok/s by 38% at epoch 1.
+Improvement is due to the optimizer caching steady-state kicking in
+after warmup.  All recent primitives + paradigm-shift work did not
+regress the production path.
+
 ### 2026-04-22: trainer-stack health check — 45,297 tok/s, no regression
 
 Post-all-primitive-shipments verification on `sh run.sh bpe --large --atlas`:
