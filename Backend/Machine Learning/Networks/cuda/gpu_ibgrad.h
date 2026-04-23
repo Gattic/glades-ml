@@ -126,6 +126,31 @@ bool ibgrad_qr_reorthogonalize(float* P_inout,
 bool ibgrad_refresh_first_column(float* P_inout, const float* g,
                                  unsigned int N, unsigned int r);
 
+// ========================================================================
+// ibgrad_apply_update — θ ← θ + alpha · update.  Simple axpy.
+// Used to apply the unprojected subspace-Adam update to a weight matrix.
+//
+//   theta_inout  [N]             in-place weights
+//   update       [N]             update vector (typically P · update_sub)
+//   alpha        scalar          scale (−1.0f for Adam descent)
+//   N            dimensions
+// ========================================================================
+bool ibgrad_apply_update(float* theta_inout, const float* update,
+                         float alpha, unsigned int N);
+
+// ========================================================================
+// ibgrad_captured_fraction — compute ‖P^T g‖² / ‖g‖² (fraction of g
+// captured by P's span).  Output is a single device scalar.
+//
+//   P            [N × r]         projection
+//   g            [N]             gradient
+//   N, r         dimensions
+//   frac_out     device float*   written to (single scalar)
+// ========================================================================
+bool ibgrad_captured_fraction(const float* P, const float* g,
+                              unsigned int N, unsigned int r,
+                              float* frac_out);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -141,6 +166,9 @@ inline bool ibgrad_oja_rank1_update(float*, const float*, const float*,
 inline bool ibgrad_qr_reorthogonalize(float*, unsigned int, unsigned int) { return false; }
 inline bool ibgrad_refresh_first_column(float*, const float*,
                                         unsigned int, unsigned int) { return false; }
+inline bool ibgrad_apply_update(float*, const float*, float, unsigned int) { return false; }
+inline bool ibgrad_captured_fraction(const float*, const float*,
+                                     unsigned int, unsigned int, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

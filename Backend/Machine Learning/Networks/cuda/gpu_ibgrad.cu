@@ -336,6 +336,94 @@ bool ibgrad_qr_reorthogonalize(float* P_inout, unsigned int N, unsigned int r)
 	return true;
 }
 
+// ------------------------------------------------------------------------
+// Simple axpy: θ[i] += alpha · update[i].  1D grid, stride-loop for
+// arbitrary N (handles pile_large attention-matrix scale).
+// ------------------------------------------------------------------------
+namespace {
+__global__ void k_ibgrad_axpy(float* __restrict__ theta,
+                              const float* __restrict__ update,
+                              float alpha, int N)
+{
+	const int stride = gridDim.x * blockDim.x;
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += stride) {
+		theta[i] += alpha * update[i];
+	}
+}
+} // anonymous
+
+bool ibgrad_apply_update(float* theta_inout, const float* update,
+                         float alpha, unsigned int N)
+{
+	if (theta_inout == nullptr || update == nullptr) return false;
+	if (N == 0u) return false;
+	const int block = 256;
+	size_t grid_sz = ((size_t)N + block - 1) / (size_t)block;
+	if (grid_sz > 65535u) grid_sz = 65535u;
+	k_ibgrad_axpy<<<(int)grid_sz, block, 0, computeStream()>>>(
+	    theta_inout, update, alpha, (int)N);
+	return cudaGetLastError() == cudaSuccess;
+}
+
+bool ibgrad_captured_fraction(const float* P, const float* g,
+                              unsigned int N, unsigned int r,
+                              float* frac_out)
+{
+	if (P == nullptr || g == nullptr || frac_out == nullptr) return false;
+	if (N == 0u || r == 0u) return false;
+
+	// Compute y = P^T g (r-dim) into a scratch, then ‖y‖² and ‖g‖²
+	// via the existing norm_sq kernel.  frac_out = ‖y‖² / ‖g‖².
+	static thread_local float* d_y_scratch = nullptr;
+	static thread_local size_t d_y_cap = 0;
+	if ((size_t)r > d_y_cap) {
+		if (d_y_scratch) cudaFree(d_y_scratch);
+		if (cudaMalloc(&d_y_scratch, r * sizeof(float)) != cudaSuccess) return false;
+		d_y_cap = r;
+	}
+	static thread_local float* d_scalars = nullptr;
+	if (d_scalars == nullptr) {
+		if (cudaMalloc(&d_scalars, 2 * sizeof(float)) != cudaSuccess) return false;
+	}
+
+	// 1. y = P^T g
+	if (!ibgrad_project(P, g, N, r, d_y_scratch)) return false;
+
+	// 2. zero the 2-scalar accumulator
+	if (cudaMemsetAsync(d_scalars, 0, 2 * sizeof(float), computeStream()) != cudaSuccess)
+		return false;
+
+	// 3. ‖y‖² → d_scalars[0]
+	{
+		const int block = 256;
+		const int grid  = 1;  // r is small (≤ 256)
+		k_ibgrad_norm_sq<<<grid, block, 0, computeStream()>>>(
+		    d_y_scratch, (int)r, d_scalars);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// 4. ‖g‖² → d_scalars[1]
+	{
+		const int block = 256;
+		int grid = ((int)N + block - 1) / block;
+		if (grid > 64) grid = 64;
+		k_ibgrad_norm_sq<<<grid, block, 0, computeStream()>>>(
+		    g, (int)N, d_scalars + 1);
+		if (cudaGetLastError() != cudaSuccess) return false;
+	}
+	// 5. frac = d_scalars[0] / d_scalars[1] — do on host (2 floats).
+	float host_scalars[2];
+	cudaMemcpyAsync(host_scalars, d_scalars, 2 * sizeof(float),
+	                cudaMemcpyDeviceToHost, computeStream());
+	cudaStreamSynchronize(computeStream());
+	const float frac = (host_scalars[1] > 1e-20f)
+	                   ? host_scalars[0] / host_scalars[1]
+	                   : 1.0f;
+	cudaMemcpyAsync(frac_out, &frac, sizeof(float),
+	                cudaMemcpyHostToDevice, computeStream());
+	cudaStreamSynchronize(computeStream());
+	return true;
+}
+
 bool ibgrad_refresh_first_column(float* P_inout, const float* g,
                                  unsigned int N, unsigned int r)
 {
