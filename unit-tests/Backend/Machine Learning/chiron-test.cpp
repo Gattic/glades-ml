@@ -9618,9 +9618,15 @@ void CHIRONFaceApplyUpdateParityTest()
 		if (zn_h[i] > 0.0f) q_h += 1.0f;
 
 	std::vector<float> theta_ref = theta_h;
+	// Reference formula matches the iteration-71 dimensional-fix form:
+	//   σ = 1/√(zn · dn_raw / gF + ε²)  — drops q from denominator,
+	//   uses dn_raw (sum over active) not dn_deb (mean).
+	// See research/PARADIGM_SHIFT_28_DESIGN.md §3 + fix in iter 71
+	// commit cc58cadc1.
+	(void)q_h;  // q_hat is tracked but unused in the dimensional-fix form.
 	for (unsigned int i = 0; i < V; ++i)
 		for (unsigned int j = 0; j < m; ++j) {
-			const float s   = (zn_h[i] * dn_h[j]) / (q_h * gF_h + 1e-20f);
+			const float s   = (zn_h[i] * dn_h[j]) / (gF_h + 1e-20f);
 			const float sig = 1.0f / std::sqrt(s + eps * eps);
 			const size_t off = (size_t)i * m + j;
 			theta_ref[off] -= lr * sig * g_h[off];
@@ -9714,10 +9720,11 @@ void CHIRONFaceEmaTrajectoryParityTest()
 				zn_bar_h[i] = beta_row * zn_bar_h[i] + (1.0f - beta_row) * zn_new_h[i];
 			}
 		}
-		const float qs = (q_h > 1.0f) ? q_h : 1.0f;
+		// Dimensional-fix form (iteration 71, commit cc58cadc1):
+		// dn_bar EMA stores dn_raw directly (no /q).
+		(void)q_h;
 		for (unsigned int j = 0; j < m; ++j) {
-			const float dn_deb = dn_raw_h[j] / qs;
-			dn_bar_h[j] = beta_col * dn_bar_h[j] + (1.0f - beta_col) * dn_deb;
+			dn_bar_h[j] = beta_col * dn_bar_h[j] + (1.0f - beta_col) * dn_raw_h[j];
 		}
 		q_hat_h  = beta_col * q_hat_h  + (1.0f - beta_col) * q_h;
 		gF_hat_h = beta_col * gF_hat_h + (1.0f - beta_col) * gF_h;
