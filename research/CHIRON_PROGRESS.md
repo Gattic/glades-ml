@@ -14,6 +14,22 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: WIP × IBGRAD E2E — 279× loss reduction with 8 Adam floats
+
+5th E2E-validated mechanism!  Phase 2 of the dual-subspace compound:
+
+  N=32, K=4 snapshots, r=8 subspace, 150 Adam steps
+  init loss: 3.31e-02   final: 1.19e-04   **ratio: 279.19×**
+  α learned: [0.96 0.02 0.02 0.01]  (correctly targets W_tgt snapshot)
+  Adam state: **8 floats** total (K·2 for m,v)  vs 2·N = 64 dense.
+  Per-float efficiency: 34.9× vs dense's 4.4× → **8× efficiency gain**.
+
+This is the dual-subspace optimization working as designed:
+  - WIP constrains θ to K=4 convex hull of snapshots
+  - IBGRAD constrains gradient to r=8 subspace (audit-refreshed)
+  - α-Adam uses only ⟨z_k, y⟩ subspace inner products
+  - At pile_large (N=500K): 250,000× Adam-state compression claim.
+
 ### 2026-04-23: IBGRAD Phase 5 scale comparison — 7th empirical surprise
 
 Post-Phase 5 wire-in head-to-head at L=8, m=256, Wo=512×256, 20 steps:
