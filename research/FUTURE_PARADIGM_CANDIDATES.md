@@ -83,7 +83,29 @@ un-freeze threshold has hysteresis.
 
 ---
 
-### #30 candidate: TRAJ — trajectory-predictive Adam (convergence)
+### #30 — TRAJ: PRE-REJECTED via gradient autocorrelation probe (2026-04-23)
+
+Iteration 92 ran the cheap hypothesis-probe on existing training logs.
+TRAJ's premise: Adam m/v have cross-step predictability amenable to
+AR(k) modeling.  Probe proxy: gradient-norm lag-1 autocorrelation
+across 31 consecutive logged steps at 66M FACE training.
+
+Result:
+  Mean ||g||:                       1.629
+  Std ||g||:                        0.710 (coefficient of variation 43.6%)
+  Lag-1 autocorrelation:           −0.087  (essentially zero)
+  Mean |Δ||g|| / ||g|||:            36.2%
+  Max |Δ||g|| / ||g||| (one spike): 292.9%
+
+The aggregate gradient norm has ZERO cross-step predictability —
+actually slightly anticorrelated.  Per-parameter m, v will be even
+less predictable (scale-invariant form of the same noise).
+
+**TRAJ PRE-REJECTED.**  Adam state is not cross-step-predictable at
+the observed training dynamics.  An AR(k) predictor with k≤2 would
+capture no signal.
+
+### #30 candidate: TRAJ — trajectory-predictive Adam (convergence) (ORIGINAL DESIGN — superseded)
 
 **Observation**: Adam's m, v are EMAs over steps.  Given observed m_t,
 v_t at steps 1..t, the values at step t+1 are PREDICTABLE via a short
@@ -291,15 +313,30 @@ For the next iteration's paradigm shift design:
 6. **#33 RAND** (random-feature attention): known tradeoff; defer until
    flash attention memory becomes a bottleneck.
 
-### Recommended next iteration (2026-04-23 update, post-NESR)
-With #32 NESR empirically rejected, prioritize one of:
-- **#29 VOCAB** — vocabulary pruning (bounded implementation, unique axis)
-- **#34 ZEN** — multi-rank FACE (directly extends the validated winner)
-- **#30 TRAJ** — trajectory-predictive Adam (requires more design work)
+### Recommended next iteration (2026-04-23 update, post-all-rejections)
 
-ZEN likely has the highest impact-per-iteration ratio — it extends an
-already-validated mechanism, so the prior probability of success is
-high.  TRAJ is the most novel but riskiest.
+**All post-FACE candidates (NESR, ZEN, VOCAB, TRAJ) empirically
+rejected via Gate-0 probes in iterations 85-92.**  This is a
+significant research finding: the Ralph-loop's current design space
+has been pruned to:
+- FACE — validated, disrupting
+- Memory-only shifts — already saturated (MFIO, WIP, IBGRAD shipped)
+- Forward-compute shifts — Phase 3 wire-in pending (ATC-Δ, CSP)
+
+The local maximum of "small paradigm-shift candidates" around FACE
+is reached.  To find another disrupting shift, the next iteration
+should either:
+1. Investigate FACE's mechanism more deeply (synthetic uniform-
+   frequency test — validates Zipf hypothesis, may reveal refinement).
+2. Pursue forward-compute wire-ins (ATC-Δ Phase 3, CSP Phase 3 — big
+   engineering work, 7× projected speedup).
+3. Design a NEW paradigm shift on an axis not yet attacked (requires
+   true research insight, not incremental-design work).
+
+Current session state: FACE is the research output.  Further
+paradigm shifts would need fundamentally new mechanism innovations.
+
+### Recommended next iteration (ORIGINAL 2026-04-23, pre-rejections)
 
 ### Recommended next iteration (ORIGINAL 2026-04-23, pre-NESR)
 Design and ship **paradigm shift #32 NESR** (Langevin-Adam):
