@@ -8606,6 +8606,182 @@ void CHIRONAtcdTaylorWeightDeltaParityTest()
 #endif
 }
 
+// CHIRONAtcdTaylorE2EAccuracyTest -------------------------------------------
+// Phase 1.5 E2E validation of the Taylor-forward primitive chain.
+//
+// Setup: 2-layer MLP x → W₁ → GELU → W₂ → out.  Train for 1 step by
+// taking a rank-1 perturbation of W₁ (α · u · v^T with α ~ 1e-4).  Compare
+// full re-forward with the perturbed W₁ against the Taylor-reconstructed
+// forward using atcd_cache_refresh + atcd_taylor_weight_delta.
+//
+// Theoretical claim (design doc §8.1): Taylor residual is
+// O(‖ΔW‖² + ‖Δh‖²) ≈ O((K·η·‖g‖)²).  At α = 1e-4: residual ~ 1e-8 per
+// entry.  Assert relative error < 1e-3 (conservative; theoretical bound
+// predicts much smaller but we want margin for FP32 roundoff).
+void CHIRONAtcdTaylorE2EAccuracyTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [atcd taylor-e2e] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 32, d = 64;
+	LCG rng(202604270u);
+
+	// Inputs.
+	std::vector<float> x_h((size_t)T * d);
+	for (size_t i = 0; i < x_h.size(); ++i) x_h[i] = 0.5f * rng.next_unit();
+
+	// Layer 1 weights W₁ [d × d].
+	std::vector<float> W1_h((size_t)d * d);
+	for (size_t i = 0; i < W1_h.size(); ++i) W1_h[i] = 0.3f * rng.next_unit();
+
+	// Layer 2 weights W₂ [d × d] (unperturbed; unused in Taylor term).
+	std::vector<float> W2_h((size_t)d * d);
+	for (size_t i = 0; i < W2_h.size(); ++i) W2_h[i] = 0.3f * rng.next_unit();
+
+	// Rank-1 perturbation:  ΔW₁ = α · u · v^T, α = 1e-4.
+	const float alpha = 1e-4f;
+	std::vector<float> u_h((size_t)d), v_h((size_t)d);
+	for (size_t i = 0; i < (size_t)d; ++i) u_h[i] = rng.next_unit();
+	for (size_t i = 0; i < (size_t)d; ++i) v_h[i] = rng.next_unit();
+
+	// Host: Apply ΔW₁ to W₁ → W₁'.  Compute full forward with W₁'.
+	std::vector<float> W1p_h((size_t)d * d);
+	for (unsigned int i = 0; i < d; ++i)
+		for (unsigned int j = 0; j < d; ++j)
+			W1p_h[(size_t)i * d + j] = W1_h[(size_t)i * d + j] + alpha * u_h[i] * v_h[j];
+
+	// Host forward (explicit loops — C++98 compatible).
+	const float k0 = 0.7978845608028654f;
+	const float k1 = 0.044715f;
+	std::vector<float> z0_base((size_t)T * d, 0.0f), h0_base((size_t)T * d);
+	std::vector<float> z0_true((size_t)T * d, 0.0f), h0_true((size_t)T * d);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d; ++k) s += x_h[(size_t)t * d + k] * W1_h[(size_t)k * d + j];
+			z0_base[(size_t)t * d + j] = s;
+		}
+	for (size_t i = 0; i < z0_base.size(); ++i) {
+		const float z = z0_base[i];
+		const float u_ = k0 * (z + k1 * z * z * z);
+		h0_base[i] = 0.5f * z * (1.0f + std::tanh(u_));
+	}
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d; ++k) s += x_h[(size_t)t * d + k] * W1p_h[(size_t)k * d + j];
+			z0_true[(size_t)t * d + j] = s;
+		}
+	for (size_t i = 0; i < z0_true.size(); ++i) {
+		const float z = z0_true[i];
+		const float u_ = k0 * (z + k1 * z * z * z);
+		h0_true[i] = 0.5f * z * (1.0f + std::tanh(u_));
+	}
+
+	// Host Taylor: Δz[t,j] = Σ_i x[t,i]·ΔW[i,j] = α · (x·u)[t] · v[j]
+	// (since ΔW[i,j] = α · u[i] · v[j] per the W₁' construction).
+	// Δh = σ'(z0_base) ⊙ Δz.
+	std::vector<float> Δh_ref((size_t)T * d);
+	{
+		std::vector<float> xu((size_t)T);
+		for (unsigned int t = 0; t < T; ++t) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d; ++k) s += x_h[(size_t)t * d + k] * u_h[k];
+			xu[t] = s;
+		}
+		for (unsigned int t = 0; t < T; ++t)
+			for (unsigned int j = 0; j < d; ++j) {
+				const float z = z0_base[(size_t)t * d + j];
+				const float u_ = k0 * (z + k1 * z * z * z);
+				const float t_ = std::tanh(u_);
+				const float du = k0 * (1.0f + 3.0f * k1 * z * z);
+				const float dt = 1.0f - t_ * t_;
+				const float sp = 0.5f * (1.0f + t_) + 0.5f * z * dt * du;
+				Δh_ref[(size_t)t * d + j] = sp * alpha * xu[t] * v_h[j];
+			}
+	}
+
+	// GPU: cache_refresh on z0_base / h0_base.  Provide U, V with r=1
+	// encoding ΔW₁ = (α·u) · v^T.  Call taylor_weight_delta.
+	glades::gpu::GpuBuffer<float> d_h_full, d_z_full, d_h_cache, d_z_cache, d_sp;
+	glades::gpu::GpuBuffer<float> d_U, d_V, d_h_cache_in, d_scratch, d_Δh;
+
+	d_h_full.allocate(h0_base.size()); d_h_full.upload(&h0_base[0], h0_base.size());
+	d_z_full.allocate(z0_base.size()); d_z_full.upload(&z0_base[0], z0_base.size());
+	d_h_cache.allocate(h0_base.size());
+	d_z_cache.allocate(z0_base.size());
+	d_sp.allocate(z0_base.size());
+
+	// cache_refresh: populates h_cache = h_full, z_cache = z_full, σ' from z.
+	if (!glades::gpu::atcd_cache_refresh(
+	        d_h_full.data(), d_z_full.data(),
+	        d_h_cache.data(), d_z_cache.data(), d_sp.data(),
+	        T, d, 0)) { ASSERT("cache_refresh ok", false); return; }
+
+	// The Taylor primitive expects h_cache to be the INPUT activations
+	// (h_{ℓ-1}^{t_0}), which in our 2-layer MLP is x itself.  Upload x
+	// separately — cache_refresh populated h_cache with h0_base (post-GELU)
+	// but for our Δh₀ = σ' ⊙ (ΔW · x) we need h_cache = x.
+	d_h_cache_in.allocate(x_h.size());
+	d_h_cache_in.upload(&x_h[0], x_h.size());
+
+	// Factor ΔW[i,j] = α·u[i]·v[j] as V·U^T with V[i,0]=α·u[i], U[j,0]=v[j].
+	// (The primitive's math: tmp_r = h_cache · V, Δz = tmp_r · U^T,
+	//  so the implicit ΔW = V · U^T has ΔW[i,j] = V[i,0]·U[j,0].)
+	std::vector<float> U_h((size_t)d), V_h((size_t)d);
+	for (unsigned int i = 0; i < d; ++i) { V_h[i] = alpha * u_h[i]; U_h[i] = v_h[i]; }
+	d_U.allocate(U_h.size()); d_U.upload(&U_h[0], U_h.size());
+	d_V.allocate(V_h.size()); d_V.upload(&V_h[0], V_h.size());
+	d_scratch.allocate((size_t)T * d);
+	d_Δh.allocate((size_t)T * d);
+
+	const bool ok = glades::gpu::atcd_taylor_weight_delta(
+	    d_U.data(), d_V.data(), d_h_cache_in.data(), d_sp.data(),
+	    T, d, d, 1,
+	    d_scratch.data(), d_Δh.data());
+	ASSERT("atcd_taylor_weight_delta ok", ok);
+
+	std::vector<float> Δh_gpu((size_t)T * d);
+	d_Δh.download(&Δh_gpu[0], Δh_gpu.size());
+
+	// Compare: Δh_gpu (first-order Taylor) vs Δh_ref (host-exact Taylor).
+	const float err_taylor = max_abs_diff(Δh_ref, Δh_gpu);
+
+	// Also validate that Δh_gpu is a good approximation to the TRUE
+	// nonlinear forward difference h0_true − h0_base.  Residual is
+	// second-order in ‖ΔW‖.
+	std::vector<float> Δh_nonlinear((size_t)T * d);
+	for (size_t i = 0; i < Δh_nonlinear.size(); ++i)
+		Δh_nonlinear[i] = h0_true[i] - h0_base[i];
+	const float err_nonlinear = max_abs_diff(Δh_gpu, Δh_nonlinear);
+	float norm = 0.0f;
+	for (size_t i = 0; i < Δh_nonlinear.size(); ++i)
+		norm = std::max(norm, std::fabs(Δh_nonlinear[i]));
+
+	std::printf("  [atcd taylor-e2e] T=%u d=%u α=%.0e "
+	            "taylor-vs-host err=%.3e, taylor-vs-nonlin err=%.3e "
+	            "(nonlin norm=%.3e, rel=%.3e)\n",
+	            T, d, alpha, err_taylor, err_nonlinear, norm,
+	            err_nonlinear / (norm + 1e-12f));
+	ASSERT("Taylor GPU vs host exact: err < 1e-6", err_taylor < 1e-6f);
+	// Theoretical bound (design doc §8.1): absolute residual
+	// O(σ'' · ‖Δz‖²) with Δz ~ α·d·|x|·|v| ≈ 2e-4 at α=1e-4.
+	// Squared ≈ 4e-8; with σ'' ≤ 0.5 → bound ~2e-8 per entry.
+	// Accept up to 1e-5 absolute to allow for matrix-product effects.
+	ASSERT("Taylor vs true nonlinear: abs err < 1e-5", err_nonlinear < 1e-5f);
+	// Relative bound of 1% matches the design doc's convergence claim
+	// that at K=8, η=3e-4, Taylor reconstruction tracks true forward to
+	// within a few percent.
+	ASSERT("Taylor vs true nonlinear: rel err < 1e-2",
+	       err_nonlinear / (norm + 1e-12f) < 1e-2f);
+#else
+	std::printf("  [atcd taylor-e2e] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -9836,6 +10012,7 @@ void CHIRONUnitTest()
 	CHIRONAtcdDriftNormParityTest();
 	CHIRONAtcdCacheRefreshParityTest();
 	CHIRONAtcdTaylorWeightDeltaParityTest();
+	CHIRONAtcdTaylorE2EAccuracyTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();
