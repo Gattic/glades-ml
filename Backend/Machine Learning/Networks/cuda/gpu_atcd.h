@@ -118,6 +118,40 @@ bool atcd_cache_refresh(const float* h_full, const float* z_full,
                         unsigned int T, unsigned int d,
                         int activation_kind);
 
+// ========================================================================
+// atcd_extract_rank1_power — top-1 SVD of ΔW via power iteration.
+//
+// Given a dense weight-update matrix ΔW ∈ ℝ^{d_in × d_out} (row-major),
+// extract the dominant singular triple (σ, u, v) such that
+//     ΔW ≈ σ · v · u^T           (outer product, as used by ATC-Δ factor)
+// where u ∈ ℝ^{d_out}, v ∈ ℝ^{d_in}, both unit-norm; σ ∈ ℝ_{≥0}.
+//
+// Power iteration: init v randomly (or with prior v); iterate
+//   u ← ΔW^T v / ‖·‖;  v ← ΔW u / ‖·‖
+// for n_iters steps.  Converges to the top singular pair at rate
+// σ_2/σ_1 per iter; typically 2-3 iters suffice for dominant extraction.
+//
+// Inputs:
+//   dW            [d_in × d_out]  row-major FP32
+//   d_in, d_out                   dims
+//   n_iters                       number of power iterations (typical 3)
+//   v_init        [d_in]          initial vector (may be NULL → use ones)
+// Outputs:
+//   u_out         [d_out]          dominant right singular vector (unit norm)
+//   v_out         [d_in]           dominant left singular vector (unit norm)
+//   sigma_out                      device scalar: σ = ‖ΔW·v‖ at convergence
+//
+// The factor for ATC-Δ is then V[:, slot] = v_out, U[:, slot] = σ · u_out.
+//
+// Cost: (2 · n_iters + 1) · d_in · d_out ≈ 7·d² at n_iters=3.  At d=1024
+// that's 7 MFLOPs per layer per step — 0.15% of forward baseline 4 GFLOPs.
+// ========================================================================
+bool atcd_extract_rank1_power(const float* dW,
+                              unsigned int d_in, unsigned int d_out,
+                              int n_iters,
+                              const float* v_init,
+                              float* u_out, float* v_out, float* sigma_out);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -133,6 +167,10 @@ inline bool atcd_taylor_weight_delta(const float*, const float*,
 inline bool atcd_cache_refresh(const float*, const float*,
                                float*, float*, float*,
                                unsigned int, unsigned int, int) { return false; }
+inline bool atcd_extract_rank1_power(const float*,
+                                     unsigned int, unsigned int,
+                                     int, const float*,
+                                     float*, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

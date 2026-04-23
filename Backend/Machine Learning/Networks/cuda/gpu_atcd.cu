@@ -187,6 +187,146 @@ bool atcd_cache_refresh(const float* h_full, const float* z_full,
 	return cudaGetLastError() == cudaSuccess;
 }
 
+// ========================================================================
+// Small utility kernels for power iteration: normalize a vector in place
+// (returns its norm) and a matrix-vector multiply (row-major) used by
+// both the forward (ΔW · v) and backward (ΔW^T · u) directions.
+// ========================================================================
+namespace {
+
+__global__ void k_vec_sum_of_squares(const float* __restrict__ x,
+                                     unsigned int n,
+                                     float* __restrict__ sum2_out)
+{
+	extern __shared__ float smem[];
+	const int tid = threadIdx.x;
+	const int bs  = blockDim.x;
+	float acc = 0.0f;
+	for (unsigned int i = tid; i < n; i += bs) {
+		const float v = x[i];
+		acc += v * v;
+	}
+	for (int off = 16; off > 0; off >>= 1)
+		acc += __shfl_xor_sync(0xffffffffu, acc, off);
+	const int lane = tid & 31;
+	const int warp = tid >> 5;
+	const int nw   = (bs + 31) >> 5;
+	if (lane == 0) smem[warp] = acc;
+	__syncthreads();
+	if (warp == 0) {
+		float v = (tid < nw) ? smem[tid] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+			v += __shfl_xor_sync(0xffffffffu, v, off);
+		if (tid == 0) *sum2_out = v;
+	}
+}
+
+__global__ void k_vec_scale_inv_sqrt(float* __restrict__ x,
+                                     unsigned int n,
+                                     const float* __restrict__ sum2)
+{
+	const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float s = *sum2;
+	const float inv_norm = 1.0f / (sqrtf(s) + 1e-20f);
+	x[i] = x[i] * inv_norm;
+}
+
+__global__ void k_vec_fill_const(float* __restrict__ x,
+                                 unsigned int n, float val)
+{
+	const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	x[i] = val;
+}
+
+__global__ void k_write_sqrt(const float* __restrict__ in, float* __restrict__ out)
+{
+	if (threadIdx.x == 0 && blockIdx.x == 0) *out = sqrtf(*in);
+}
+
+} // anonymous namespace
+
+bool atcd_extract_rank1_power(const float* dW,
+                              unsigned int d_in, unsigned int d_out,
+                              int n_iters,
+                              const float* v_init,
+                              float* u_out, float* v_out, float* sigma_out)
+{
+	if (dW == nullptr || u_out == nullptr || v_out == nullptr || sigma_out == nullptr)
+		return false;
+	if (d_in == 0u || d_out == 0u || n_iters <= 0) return false;
+
+	const int block = 256;
+
+	// Step 1: initialize v_out (d_in) — either from v_init or uniform 1/√d_in.
+	if (v_init != nullptr) {
+		cudaMemcpyAsync(v_out, v_init, d_in * sizeof(float),
+		                cudaMemcpyDeviceToDevice, computeStream());
+	} else {
+		const int grid = (int)((d_in + (unsigned)block - 1u) / (unsigned)block);
+		k_vec_fill_const<<<grid, block, 0, computeStream()>>>(
+		    v_out, d_in, 1.0f / sqrtf((float)d_in));
+	}
+
+	// Scratch for norm reductions (one float).
+	float* d_scratch_norm = nullptr;
+	cudaMalloc(&d_scratch_norm, sizeof(float));
+	if (d_scratch_norm == nullptr) return false;
+
+	// Power iteration.  dW is row-major [d_in × d_out], so:
+	//   u = dW^T · v  is a GEMV with A^T v: treat dW as [d_in × d_out]
+	//       u[j] = Σ_i dW[i,j] · v[i]  for j ∈ [0, d_out)
+	//   v = dW · u  is GEMV with A u:
+	//       v[i] = Σ_j dW[i,j] · u[j]  for i ∈ [0, d_in)
+	//
+	// Use sgemm_rowmajor for these as T=1 matmuls.
+	//   u[d_out × 1] = dW^T[d_out × d_in] · v[d_in × 1]
+	//     sgemm_rowmajor_atb(M=d_out, N=1, K=d_in, 1, dW, d_out, v, 1, 0, u, 1)
+	//   v[d_in × 1]  = dW[d_in × d_out] · u[d_out × 1]
+	//     sgemm_rowmajor(M=d_in, N=1, K=d_out, 1, dW, d_out, u, 1, 0, v, 1)
+	const int grid_u = (int)((d_out + (unsigned)block - 1u) / (unsigned)block);
+	const int grid_v = (int)((d_in  + (unsigned)block - 1u) / (unsigned)block);
+	const int nwarps = (block + 31) >> 5;
+	const size_t smemBytes = nwarps * sizeof(float);
+
+	for (int it = 0; it < n_iters; ++it)
+	{
+		// u = dW^T · v
+		if (!sgemm_rowmajor_atb((int)d_out, 1, (int)d_in,
+		                        1.0f, dW, (int)d_out, v_out, 1,
+		                        0.0f, u_out, 1)) {
+			cudaFree(d_scratch_norm); return false;
+		}
+		// normalize u
+		k_vec_sum_of_squares<<<1, block, smemBytes, computeStream()>>>(
+		    u_out, d_out, d_scratch_norm);
+		k_vec_scale_inv_sqrt<<<grid_u, block, 0, computeStream()>>>(
+		    u_out, d_out, d_scratch_norm);
+
+		// v = dW · u
+		if (!sgemm_rowmajor((int)d_in, 1, (int)d_out,
+		                    1.0f, dW, (int)d_out, u_out, 1,
+		                    0.0f, v_out, 1)) {
+			cudaFree(d_scratch_norm); return false;
+		}
+
+		// On the last iteration, compute σ = ‖v‖ before normalizing
+		// (so we can write σ = sqrt(Σ v²) to sigma_out, then re-normalize).
+		k_vec_sum_of_squares<<<1, block, smemBytes, computeStream()>>>(
+		    v_out, d_in, d_scratch_norm);
+		if (it == n_iters - 1) {
+			k_write_sqrt<<<1, 1, 0, computeStream()>>>(
+			    d_scratch_norm, sigma_out);
+		}
+		k_vec_scale_inv_sqrt<<<grid_v, block, 0, computeStream()>>>(
+		    v_out, d_in, d_scratch_norm);
+	}
+
+	cudaFree(d_scratch_norm);
+	return cudaGetLastError() == cudaSuccess;
+}
+
 bool atcd_taylor_weight_delta(const float* U, const float* V,
                               const float* h_cache,
                               const float* sigma_prime,

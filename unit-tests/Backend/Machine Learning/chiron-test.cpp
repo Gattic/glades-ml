@@ -8606,6 +8606,85 @@ void CHIRONAtcdTaylorWeightDeltaParityTest()
 #endif
 }
 
+// CHIRONAtcdRank1PowerParityTest --------------------------------------------
+// Phase 2 primitive: validate atcd_extract_rank1_power on a matrix
+// with a KNOWN dominant rank-1 direction.  Construct ΔW = σ_true · v_true · u_true^T
+// plus small noise; check that power iteration recovers σ_true, u_true, v_true.
+void CHIRONAtcdRank1PowerParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [atcd rank1-power] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int d_in = 64, d_out = 48;
+	const float sigma_true = 5.0f;
+	LCG rng(202604280u);
+
+	// Build unit-norm u, v.
+	std::vector<float> u_ref((size_t)d_out), v_ref((size_t)d_in);
+	for (size_t i = 0; i < d_out; ++i) u_ref[i] = rng.next_unit();
+	for (size_t i = 0; i < d_in;  ++i) v_ref[i] = rng.next_unit();
+	float n_u = 0.0f, n_v = 0.0f;
+	for (size_t i = 0; i < d_out; ++i) n_u += u_ref[i] * u_ref[i];
+	for (size_t i = 0; i < d_in;  ++i) n_v += v_ref[i] * v_ref[i];
+	n_u = std::sqrt(n_u); n_v = std::sqrt(n_v);
+	for (size_t i = 0; i < d_out; ++i) u_ref[i] /= n_u;
+	for (size_t i = 0; i < d_in;  ++i) v_ref[i] /= n_v;
+
+	// ΔW[i, j] = σ · v[i] · u[j] + small noise (≤1% of σ).
+	std::vector<float> dW_h((size_t)d_in * d_out);
+	for (unsigned int i = 0; i < d_in; ++i)
+		for (unsigned int j = 0; j < d_out; ++j) {
+			const float base = sigma_true * v_ref[i] * u_ref[j];
+			const float noise = 0.01f * sigma_true * rng.next_unit();
+			dW_h[(size_t)i * d_out + j] = base + noise;
+		}
+
+	glades::gpu::GpuBuffer<float> d_dW, d_u, d_v, d_sigma;
+	d_dW.allocate(dW_h.size());   d_dW.upload(&dW_h[0], dW_h.size());
+	d_u.allocate(d_out);
+	d_v.allocate(d_in);
+	d_sigma.allocate(1);
+
+	const bool ok = glades::gpu::atcd_extract_rank1_power(
+	    d_dW.data(), d_in, d_out, 3, NULL,
+	    d_u.data(), d_v.data(), d_sigma.data());
+	ASSERT("atcd_extract_rank1_power ok", ok);
+
+	std::vector<float> u_gpu((size_t)d_out), v_gpu((size_t)d_in);
+	float sigma_gpu = 0.0f;
+	d_u.download(&u_gpu[0], d_out);
+	d_v.download(&v_gpu[0], d_in);
+	d_sigma.download(&sigma_gpu, 1);
+
+	// Power iteration recovers ±u, ±v (sign ambiguity).  Align by checking
+	// sign of u·u_ref and flipping both u and v if negative.
+	float dot_u = 0.0f;
+	for (size_t i = 0; i < d_out; ++i) dot_u += u_gpu[i] * u_ref[i];
+	if (dot_u < 0.0f) {
+		for (size_t i = 0; i < d_out; ++i) u_gpu[i] = -u_gpu[i];
+		for (size_t i = 0; i < d_in;  ++i) v_gpu[i] = -v_gpu[i];
+	}
+
+	float err_u = 0.0f, err_v = 0.0f;
+	for (size_t i = 0; i < d_out; ++i) err_u = std::max(err_u, std::fabs(u_gpu[i] - u_ref[i]));
+	for (size_t i = 0; i < d_in;  ++i) err_v = std::max(err_v, std::fabs(v_gpu[i] - v_ref[i]));
+	const float err_sigma = std::fabs(sigma_gpu - sigma_true);
+
+	std::printf("  [atcd rank1-power] d_in=%u d_out=%u σ_true=%.2f σ_gpu=%.4f "
+	            "err_σ=%.3e err_u=%.3e err_v=%.3e\n",
+	            d_in, d_out, sigma_true, sigma_gpu, err_sigma, err_u, err_v);
+	// With 1% noise and 3 power iters: σ within 5% of true, u/v within 5%.
+	ASSERT("σ recovered within 10%", err_sigma / sigma_true < 0.1f);
+	ASSERT("u recovered within 5%", err_u < 0.05f);
+	ASSERT("v recovered within 5%", err_v < 0.05f);
+#else
+	std::printf("  [atcd rank1-power] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONAtcdTaylorE2EAccuracyTest -------------------------------------------
 // Phase 1.5 E2E validation of the Taylor-forward primitive chain.
 //
@@ -10012,6 +10091,7 @@ void CHIRONUnitTest()
 	CHIRONAtcdDriftNormParityTest();
 	CHIRONAtcdCacheRefreshParityTest();
 	CHIRONAtcdTaylorWeightDeltaParityTest();
+	CHIRONAtcdRank1PowerParityTest();
 	CHIRONAtcdTaylorE2EAccuracyTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
