@@ -14,6 +14,22 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: chiron_train standalone trainer health check
+
+End-to-end smoke test of `glades_chiron_train` (standalone CHIRON
+trainer, separate binary from `glades_pile_train`):
+`--pretokenized --data-dir pretok-data/ --seq-len 512 --m 128 --layers 4
+ --heads 4 --vocab 32000 --max-steps 20`
+
+Result:
+  4.62M params, ~0.82 GB VRAM (94.7% free)
+  **120,000 tok/s** at small config, stable
+  All 3 preview flags verified (trcd, lcp, ibgrad) producing expected
+    projected-speedup tables.
+
+Both trainer binaries confirmed healthy after 25 iterations of
+primitive / paradigm-shift / scaffolding work.
+
 ### 2026-04-23: stack-health re-verification — 62,474 tok/s at epoch 1
 
 Post-IBGRAD-CLI-scaffolding + paradigm-22 design verification:
