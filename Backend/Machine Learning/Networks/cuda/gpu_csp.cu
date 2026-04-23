@@ -15,20 +15,8 @@
 namespace glades {
 namespace gpu {
 
-namespace {
-
-// Elementwise add: out = a + b (same size n).
-__global__ void k_csp_add(const float* __restrict__ a,
-                          const float* __restrict__ b,
-                          float* __restrict__ out,
-                          unsigned int n)
-{
-	const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= n) return;
-	out[i] = a[i] + b[i];
-}
-
-} // anonymous namespace
+// (k_csp_add was removed in the Phase 1b fusion — sgemm_rowmajor_abt with
+// beta=1.0f now folds the residual add into the matmul epilogue.)
 
 bool csp_forward(const float* h_in,
                  const float* W_up, const float* W_down,
@@ -73,8 +61,13 @@ bool csp_forward(const float* h_in,
 	// Step 2b: residual term, only if r_sigma > 0.
 	//   tmp_r [T × r_sigma] = z_sketch [T × m] · V_sigma [m × r_sigma]
 	//   σ_hidden(tmp_r) (GELU elementwise as a sensible default)
-	//   y_res [T × m] = tmp_r · U_sigma^T   (U_sigma has shape m × r_sigma)
-	//   y = y_base + y_res
+	//   y [T × m] += tmp_r · U_sigma^T   (via sgemm_abt with beta=1)
+	//
+	// OPTIMIZATION (fused accumulate): instead of a separate add kernel,
+	// sgemm_rowmajor_abt with beta=1.0f fuses the residual accumulation
+	// into the matmul epilogue.  Saves 1 kernel launch per forward.
+	// This was surfaced by benchmark finding #8 (launch-bound regime at
+	// L2-resident dims) — see STACK_VALIDATION_SUMMARY.md.
 	if (r_sigma > 0u) {
 		// Use y_res_scratch first T·r_σ entries as tmp_r.
 		if (!sgemm_rowmajor((int)T, (int)r_sigma, (int)m, 1.0f,
@@ -85,22 +78,13 @@ bool csp_forward(const float* h_in,
 		// Apply GELU to the hidden residual.
 		const unsigned int Tr = T * r_sigma;
 		if (!gelu_forward(y_res_scratch, (int)Tr, y_res_scratch)) return false;
-		// y_res_out [T × m] = y_res_scratch [T × r_sigma] · U_sigma^T [r_sigma × m]
-		//   sgemm_rowmajor_abt: C = A · B^T where A=tmp_r [T×r], B=U_sigma [m×r]
-		// We use z_sketch_scratch as the y_res output buffer (it's no longer
-		// needed past step 1; it's free).  Contract: after this call,
-		// z_sketch_scratch holds y_res.
+		// y [T × m] += tmp_r [T × r_sigma] · U_sigma^T [r_sigma × m]
+		// (beta=1 accumulates directly into y_scratch).
 		if (!sgemm_rowmajor_abt((int)T, (int)m, (int)r_sigma, 1.0f,
 		                        y_res_scratch, (int)r_sigma,
 		                        U_sigma, (int)r_sigma,
-		                        0.0f,
-		                        z_sketch_scratch, (int)m)) return false;
-		// y = y_base + y_res (in-place into y_scratch).
-		const int block = 256;
-		const int grid = (int)((Tm + (unsigned)block - 1u) / (unsigned)block);
-		k_csp_add<<<grid, block, 0, computeStream()>>>(
-		    y_scratch, z_sketch_scratch, y_scratch, Tm);
-		if (cudaGetLastError() != cudaSuccess) return false;
+		                        1.0f,        // beta=1: y += alpha · (tmp_r · U^T)
+		                        y_scratch, (int)m)) return false;
 	}
 
 	// Step 3: h_out [T × d_model] = y [T × m] · W_down [m × d_model]
