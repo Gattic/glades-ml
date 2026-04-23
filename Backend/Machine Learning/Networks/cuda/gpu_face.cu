@@ -135,10 +135,12 @@ __global__ void k_face_ema_cols(float* __restrict__ dn_bar,
 {
 	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
 	if (j >= m) return;
-	const float qv = *q;
-	const float qs = (qv > 1.0f) ? qv : 1.0f;
-	const float dn_deb = dn_raw[j] / qs;
-	dn_bar[j] = beta_col * dn_bar[j] + (1.0f - beta_col) * dn_deb;
+	(void)q;
+	// FACE Phase 4 dimensional correction (vs design doc §3): store dn_raw
+	// directly in the EMA (no frequency-debias division).  Combined with the
+	// q-less apply kernel below, this yields σ = 1/√(zn·dn_raw/gF + ε²) —
+	// scales as 1/σ_g like dense MFIO, not V/σ_g as the q-scaled formula.
+	dn_bar[j] = beta_col * dn_bar[j] + (1.0f - beta_col) * dn_raw[j];
 }
 
 __global__ void k_face_ema_scalars(float* __restrict__ q_hat,
@@ -193,12 +195,14 @@ __global__ void k_face_apply_update(float* __restrict__ theta,
 	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= V || j >= m) return;
 
-	// Denominator = zn̄[i] · dn̄[j] / (q̂ · gF̄).
+	// FACE preconditioner (dimensionally-correct form — see gpu_face.cu
+	// comment on k_face_ema_cols).  s = zn·dn_raw / gF, giving σ ~ 1/σ_g
+	// like dense MFIO.  q_hat is unused in this form (tracked for diagnostics).
 	const float zn = zn_bar[i];
 	const float dn = dn_bar[j];
-	const float q  = *q_hat;
 	const float gF = *gF_hat;
-	const float den = (q * gF) + 1e-20f;        // avoid /0 during warmup
+	(void)q_hat;
+	const float den = gF + 1e-20f;
 	const float s   = (zn * dn) / den;
 	const float sigma = 1.0f / (sqrtf(s + eps_sq));
 	const size_t off = (size_t)i * m + j;
