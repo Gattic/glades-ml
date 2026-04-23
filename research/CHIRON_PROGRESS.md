@@ -14,6 +14,24 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: WIP Phase 3C — full trainer wire-in live in chiron_train
+
+Paradigm shift #22 now the SECOND shift to reach full 5-phase trainer
+integration (after #19 IBGRAD).  Live smoke test at L=4, K=4:
+  loss: 10.42 → 10.39 over 30 steps (normal decrease)
+  tok/s: 68,000 with WIP active (vs 83k dense baseline)
+  α Adam state: 192 bytes total vs 65 KB dense Adam per layer
+  Phases shipped: CLI (eef13f2), state (049c22b), adam_step (1df4393).
+
+Per-layer sequence runs at every step:
+  1. σ = softmax(α)
+  2. Download dθ = dWo
+  3. Compute K+1 dots (K × ⟨W_k, dθ⟩ + ⟨θ, dθ⟩)
+  4. g_α_k = σ_k · (⟨W_k, dθ⟩ − ⟨θ, dθ⟩)
+  5. Adam on α (host, K floats)
+  6. Re-materialize θ = Σ σ(α_new)·W_k → Wo[l]
+  7. Every N_refresh: promote θ → oldest W_k
+
 ### 2026-04-23: WIP × IBGRAD E2E — 279× loss reduction with 8 Adam floats
 
 5th E2E-validated mechanism!  Phase 2 of the dual-subspace compound:
