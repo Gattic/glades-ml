@@ -66,6 +66,43 @@ bool face_compute_sparse_stats(const float* g,
                                float* q_out,
                                float* gF_out);
 
+// ========================================================================
+// face_apply_preconditioned_update — σ-scaled weight update.
+//
+// Given the EMA-smoothed state (zn̄, dn̄, q̂, gF̄), apply the FACE update
+// to theta:
+//
+//     σ_{ij} = 1 / √( zn̄[i] · dn̄[j] / (q̂ · gF̄) + ε² )
+//     θ[i,j] ← θ[i,j] − η · σ_{ij} · g[i,j]
+//
+// Because g is zero on inactive rows (the sparse-per-row invariant of
+// embedding gradients), the update is naturally masked — no explicit
+// active-row list is needed.  This is the core design property that makes
+// FACE sparsity-invariant.
+//
+// Inputs:
+//   g           [V × m]   row-major FP32 gradient (sparse per row)
+//   zn_bar      [V]        EMA of row squared norms
+//   dn_bar      [m]        EMA of frequency-debiased column norms
+//   q_hat                  scalar EMA of active-row count (device)
+//   gF_hat                 scalar EMA of Frobenius² (device)
+//   V, m                   dims
+//   lr                     learning rate
+//   eps                    numerical floor on σ denominator
+// In/out:
+//   theta       [V × m]   row-major FP32 weights (in-place update)
+//
+// Cost: O(V · m) elementwise; one kernel launch.
+// ========================================================================
+bool face_apply_preconditioned_update(float* theta,
+                                      const float* g,
+                                      const float* zn_bar,
+                                      const float* dn_bar,
+                                      const float* q_hat,
+                                      const float* gF_hat,
+                                      unsigned int V, unsigned int m,
+                                      float lr, float eps);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -73,6 +110,11 @@ bool face_compute_sparse_stats(const float* g,
 inline bool face_compute_sparse_stats(const float*,
                                       unsigned int, unsigned int,
                                       float*, float*, float*, float*) { return false; }
+inline bool face_apply_preconditioned_update(float*, const float*,
+                                             const float*, const float*,
+                                             const float*, const float*,
+                                             unsigned int, unsigned int,
+                                             float, float) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

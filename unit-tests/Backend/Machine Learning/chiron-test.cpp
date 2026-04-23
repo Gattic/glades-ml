@@ -9550,6 +9550,95 @@ void CHIRONFaceSparseStatsParityTest()
 #endif
 }
 
+// CHIRONFaceApplyUpdateParityTest -------------------------------------------
+// Phase 2 validation of paradigm shift #28 (FACE): full preconditioned
+// update.  Chain face_compute_sparse_stats → face_apply_preconditioned_update
+// and compare against a host reference that implements the same formula:
+//   σ_{ij} = 1/√(zn[i]·dn[j]/(q·gF) + ε²)
+//   θ[i,j] ← θ[i,j] − η · σ · g[i,j]
+void CHIRONFaceApplyUpdateParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [face update parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int V = 128, m = 32;
+	const int ACTIVE_EVERY = 4;  // 25% active
+	const float lr  = 1e-3f;
+	const float eps = 1e-8f;
+	LCG rng(202605201u);
+
+	// Build sparse g.
+	std::vector<float> g_h((size_t)V * m, 0.0f);
+	for (unsigned int i = 0; i < V; ++i)
+		if ((int)i % ACTIVE_EVERY == 0)
+			for (unsigned int j = 0; j < m; ++j)
+				g_h[(size_t)i * m + j] = 0.3f * rng.next_unit();
+
+	// Initial weights.
+	std::vector<float> theta_h((size_t)V * m);
+	for (size_t i = 0; i < theta_h.size(); ++i)
+		theta_h[i] = 0.1f * rng.next_unit();
+
+	// --- GPU path ---
+	glades::gpu::GpuBuffer<float> d_g, d_theta, d_zn, d_dn, d_q, d_gF;
+	d_g.allocate(g_h.size());    d_g.upload(&g_h[0], g_h.size());
+	d_theta.allocate(theta_h.size());
+	d_theta.upload(&theta_h[0], theta_h.size());
+	d_zn.allocate(V);
+	d_dn.allocate(m);
+	d_q.allocate(1);
+	d_gF.allocate(1);
+
+	glades::gpu::face_compute_sparse_stats(
+	    d_g.data(), V, m, d_zn.data(), d_dn.data(), d_q.data(), d_gF.data());
+	const bool ok = glades::gpu::face_apply_preconditioned_update(
+	    d_theta.data(), d_g.data(),
+	    d_zn.data(), d_dn.data(), d_q.data(), d_gF.data(),
+	    V, m, lr, eps);
+	ASSERT("face_apply_preconditioned_update returns true", ok);
+
+	std::vector<float> theta_gpu((size_t)V * m);
+	d_theta.download(&theta_gpu[0], theta_gpu.size());
+
+	// --- Host reference ---
+	std::vector<float> zn_h(V, 0.0f), dn_h(m, 0.0f);
+	float gF_h = 0.0f;
+	for (unsigned int i = 0; i < V; ++i)
+		for (unsigned int j = 0; j < m; ++j) {
+			const float v = g_h[(size_t)i * m + j];
+			zn_h[i] += v * v;
+			dn_h[j] += v * v;
+			gF_h    += v * v;
+		}
+	float q_h = 0.0f;
+	for (unsigned int i = 0; i < V; ++i)
+		if (zn_h[i] > 0.0f) q_h += 1.0f;
+
+	std::vector<float> theta_ref = theta_h;
+	for (unsigned int i = 0; i < V; ++i)
+		for (unsigned int j = 0; j < m; ++j) {
+			const float s   = (zn_h[i] * dn_h[j]) / (q_h * gF_h + 1e-20f);
+			const float sig = 1.0f / std::sqrt(s + eps * eps);
+			const size_t off = (size_t)i * m + j;
+			theta_ref[off] -= lr * sig * g_h[off];
+		}
+
+	const float err = max_abs_diff(theta_ref, theta_gpu);
+	float norm = 0.0f;
+	for (size_t i = 0; i < theta_ref.size(); ++i)
+		norm = std::max(norm, std::fabs(theta_ref[i]));
+	std::printf("  [face update parity] V=%u m=%u active=%d lr=%.0e "
+	            "max_err=%.3e norm=%.3e rel=%.3e\n",
+	            V, m, (int)q_h, lr, err, norm, err / (norm + 1e-12f));
+	ASSERT("FACE update vs host ref < 1e-4", err < 1e-4f);
+#else
+	std::printf("  [face update parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -10787,6 +10876,7 @@ void CHIRONUnitTest()
 	CHIRONCspResidualForwardTest();
 	CHIRONCspBenchmarkTest();
 	CHIRONFaceSparseStatsParityTest();
+	CHIRONFaceApplyUpdateParityTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();

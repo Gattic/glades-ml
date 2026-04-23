@@ -113,6 +113,56 @@ __global__ void k_face_sum_vec(const float* __restrict__ in,
 
 } // anonymous namespace
 
+// Preconditioned update kernel: one thread per (i, j) pair.  Because g is
+// zero on inactive rows, the multiplicative update naturally zeros there.
+__global__ void k_face_apply_update(float* __restrict__ theta,
+                                    const float* __restrict__ g,
+                                    const float* __restrict__ zn_bar,
+                                    const float* __restrict__ dn_bar,
+                                    const float* __restrict__ q_hat,
+                                    const float* __restrict__ gF_hat,
+                                    unsigned int V, unsigned int m,
+                                    float lr, float eps_sq)
+{
+	const unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+	const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= V || j >= m) return;
+
+	// Denominator = zn̄[i] · dn̄[j] / (q̂ · gF̄).
+	const float zn = zn_bar[i];
+	const float dn = dn_bar[j];
+	const float q  = *q_hat;
+	const float gF = *gF_hat;
+	const float den = (q * gF) + 1e-20f;        // avoid /0 during warmup
+	const float s   = (zn * dn) / den;
+	const float sigma = 1.0f / (sqrtf(s + eps_sq));
+	const size_t off = (size_t)i * m + j;
+	theta[off] -= lr * sigma * g[off];
+}
+
+bool face_apply_preconditioned_update(float* theta,
+                                      const float* g,
+                                      const float* zn_bar,
+                                      const float* dn_bar,
+                                      const float* q_hat,
+                                      const float* gF_hat,
+                                      unsigned int V, unsigned int m,
+                                      float lr, float eps)
+{
+	if (theta == nullptr || g == nullptr) return false;
+	if (zn_bar == nullptr || dn_bar == nullptr) return false;
+	if (q_hat == nullptr || gF_hat == nullptr) return false;
+	if (V == 0u || m == 0u) return false;
+
+	dim3 block(32, 8);
+	dim3 grid((m + block.x - 1u) / block.x,
+	          (V + block.y - 1u) / block.y);
+	const float eps_sq = eps * eps;
+	k_face_apply_update<<<grid, block, 0, computeStream()>>>(
+	    theta, g, zn_bar, dn_bar, q_hat, gF_hat, V, m, lr, eps_sq);
+	return cudaGetLastError() == cudaSuccess;
+}
+
 bool face_compute_sparse_stats(const float* g,
                                unsigned int V, unsigned int m,
                                float* zn_out,
