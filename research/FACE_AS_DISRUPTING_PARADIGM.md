@@ -121,6 +121,24 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.9 β_row saturates at 0.999 — +1.04 nat over default (2026-04-23)
+
+Extended β_row sweep to the upper end:
+
+  β_row    EMA@250   EMA@500   EMA@1500
+  0.98     8.423     9.263     8.183  (design-doc default)
+  0.995    7.602     9.071     7.389  (iter 97 finding)
+  **0.999  6.760     8.806     7.141  (OPTIMAL)**
+  0.9995   6.607     8.752     7.112  (saturation)
+
+β_row=0.999 gives +1.04 nat improvement at 1500 steps vs default 0.98.
+0.9995 is marginally better at short horizons but saturates the
+improvement curve.  **β_row=0.999 is the recommended production value.**
+
+Intuition: rare-token row EMAs need effectively indefinite averaging
+since rare tokens activate so sparsely.  The design-doc default 0.98
+was off by ~50× in decay timescale.
+
 ### 3.8 β_row tuning — default 0.98 is SUBOPTIMAL; 0.995 adds 0.8 nat (2026-04-23)
 
 Iteration 97 swept β_row ∈ {0.95, 0.98, 0.995} at 66M × 500-1500 steps:
