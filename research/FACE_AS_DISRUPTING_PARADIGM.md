@@ -121,6 +121,28 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.10 β_row=0.999 validation at 234M (2026-04-23)
+
+Validated the β_row=0.999 tuning finding at 234M × 1500 steps:
+
+  Config                         EMA@1500   Δ vs dense
+  Dense Adam (iter 76)           9.4427     —
+  FACE @ β_row=0.98  (iter 76)   8.3356     −1.11 nat
+  **FACE @ β_row=0.999 (NEW)     8.0579     −1.38 nat**
+
+Improvement from β_row tuning at 234M: +0.28 nat (smaller than the
++1.04 nat at 66M).  Diminishing returns with scale — larger
+embeddings have more tokens with "moderate" frequency (between the
+extremes that β_row targets), so the distributional benefit narrows.
+
+Total FACE advantage over dense Adam at 234M × 1500 with tuned recipe:
+**1.38 nat**.  This is the strongest single-point result of the
+session.
+
+Refined-recipe scaling:
+  66M × 1500:   FACE@0.999 advantage = 1.74 nat (0.70 baseline + 1.04 tuning)
+  234M × 1500:  FACE@0.999 advantage = 1.38 nat (1.11 baseline + 0.27 tuning)
+
 ### 3.9 β_row saturates at 0.999 — +1.04 nat over default (2026-04-23)
 
 Extended β_row sweep to the upper end:
