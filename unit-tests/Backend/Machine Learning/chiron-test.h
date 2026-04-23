@@ -64,6 +64,7 @@ void CHIRONLcpEndToEndDetailCorrectionTest();
 void CHIRONLcpRoutingThroughputBenchmark();
 void CHIRONIbgradProjectUnprojectParityTest();
 void CHIRONIbgradQrReorthogonalizeTest();
+void CHIRONIbgradThroughputBenchmark();
 void CHIRONIbgradEndToEndConvergenceTest();
 void CHIRONLcpIbgradCompositionTest();
 void CHIRONEdtEnergyDistilledTest();
