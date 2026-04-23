@@ -121,6 +121,25 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.14 Tuned compound at 500M confirms scale-regression (iter 106)
+
+Extending iter 100's FACE-alone scale-dependent finding to the full
+3-shift compound.  At 500M × 1000 steps:
+
+  Config                              EMA@1000   Δ vs dense
+  Dense Adam (iter 93)                10.0775    —
+  FACE-alone β=0.98  (iter 93)        9.7586     −0.32 (best)
+  FACE-alone β=0.999 (iter 100)       9.8385     −0.24
+  3-shift compound β=0.999 (NEW)      9.8556     −0.22
+
+The compound form does NOT recover the β=0.999 regression at 500M.
+MFIO + WIP provide memory savings but no convergence benefit; β=0.999
+still hurts by ~0.08-0.10 nat vs β=0.98 at this scale.
+
+Confirmed production-recipe split:
+- Small models (<150M): `--face 1 --face-beta-row 0.999` (or compound)
+- Large models (≥500M): `--face 1 --face-beta-row 0.98` (default)
+
 ### 3.13 Tuned compound at 5000 steps — 1.70 nat advantage (iter 102)
 
 Extended the tuned-compound validation from 2500 to 5000 steps at 66M:
