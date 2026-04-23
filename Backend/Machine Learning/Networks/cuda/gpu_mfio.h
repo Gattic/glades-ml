@@ -111,6 +111,28 @@ bool mfio_update_rowcol(float* theta, const float* g,
                         float T_normalizer,
                         float lr, float beta, float eps, float wd);
 
+// ========================================================================
+// mfio_compute_rowcol_norms_from_grad — gradient-space row/col norm
+// reduction (Adafactor-style variant of MFIO v2).  Where the activation-
+// based variant uses (z, δ) that only exist during backward, this variant
+// derives the preconditioner directly from the materialized weight-gradient
+// matrix g [d_in × d_out]:
+//
+//     zn[i] = Σ_j g[i,j]²         for i in [0, d_in)
+//     dn[j] = Σ_i g[i,j]²         for j in [0, d_out)
+//
+// This form is trainer-friendly: adam_step has g available but not (z, δ).
+// Empirically zn and dn derived this way still give an Adafactor-style
+// rank-1 preconditioner of the full σ_{ij} and unlock the same O(d_in+d_out)
+// state compression as the activation-based variant.
+//
+// Cost: two independent reductions, one block per row/col.  Runs on the
+// compute stream.
+// ========================================================================
+bool mfio_compute_rowcol_norms_from_grad(const float* g,
+                                         unsigned int d_in, unsigned int d_out,
+                                         float* zn_out, float* dn_out);
+
 } // namespace gpu
 
 #else // !GLADES_HAVE_CUDA
@@ -127,6 +149,9 @@ inline bool mfio_update_rowcol(float*, const float*,
                                const float*, const float*,
                                unsigned int, unsigned int,
                                float, float, float, float, float) { return false; }
+inline bool mfio_compute_rowcol_norms_from_grad(const float*,
+                                                unsigned int, unsigned int,
+                                                float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

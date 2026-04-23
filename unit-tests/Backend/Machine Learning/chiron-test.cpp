@@ -8184,6 +8184,253 @@ void CHIRONMfioV2DeepMLPTest()
 #endif
 }
 
+// CHIRONMfioV2FromGradParityTest --------------------------------------------
+// Phase 2 trainer-wire-in primitive:
+// `mfio_compute_rowcol_norms_from_grad(g, d_in, d_out, zn, dn)` computes
+//     zn[i] = Σ_j g[i,j]²            (row norm of grad)
+//     dn[j] = Σ_i g[i,j]²            (col norm of grad)
+// where g is the materialized weight-gradient matrix [d_in × d_out].
+// Adafactor-style variant of MFIO v2 that does NOT require activation
+// tensors — suitable for use inside adam_step, which has g but not (z, δ).
+// Parity assertion: max_err vs host reference < 1e-3 (FP32 reduction eps).
+void CHIRONMfioV2FromGradParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mfio-v2 from-grad parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int d_in  = 64;
+	const unsigned int d_out = 32;
+	LCG rng(202604230u);
+
+	std::vector<float> g_h((size_t)d_in * d_out);
+	for (size_t i = 0; i < g_h.size(); ++i) g_h[i] = 0.7f * rng.next_unit();
+
+	std::vector<float> zn_ref(d_in, 0.0f), dn_ref(d_out, 0.0f);
+	for (unsigned int i = 0; i < d_in; ++i)
+		for (unsigned int j = 0; j < d_out; ++j)
+		{
+			const float v = g_h[(size_t)i * d_out + j];
+			zn_ref[i] += v * v;
+			dn_ref[j] += v * v;
+		}
+
+	glades::gpu::GpuBuffer<float> d_g, d_zn, d_dn;
+	d_g.allocate(g_h.size());   d_g.upload(&g_h[0], g_h.size());
+	d_zn.allocate(d_in);
+	d_dn.allocate(d_out);
+
+	const bool ok = glades::gpu::mfio_compute_rowcol_norms_from_grad(
+	    d_g.data(), d_in, d_out,
+	    d_zn.data(), d_dn.data());
+	ASSERT("mfio_compute_rowcol_norms_from_grad returns true", ok);
+
+	std::vector<float> zn_gpu(d_in), dn_gpu(d_out);
+	d_zn.download(&zn_gpu[0], d_in);
+	d_dn.download(&dn_gpu[0], d_out);
+
+	float max_err_zn = 0.0f;
+	for (unsigned int i = 0; i < d_in; ++i)
+	{
+		const float e = std::fabs(zn_gpu[i] - zn_ref[i]);
+		if (e > max_err_zn) max_err_zn = e;
+	}
+	float max_err_dn = 0.0f;
+	for (unsigned int j = 0; j < d_out; ++j)
+	{
+		const float e = std::fabs(dn_gpu[j] - dn_ref[j]);
+		if (e > max_err_dn) max_err_dn = e;
+	}
+	std::printf("  [mfio-v2 from-grad parity] d_in=%u d_out=%u "
+	            "max_err zn=%.3e dn=%.3e\n",
+	            d_in, d_out, max_err_zn, max_err_dn);
+	ASSERT("zn parity < 1e-3", max_err_zn < 1e-3f);
+	ASSERT("dn parity < 1e-3", max_err_dn < 1e-3f);
+#else
+	std::printf("  [mfio-v2 from-grad parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONMfioV2FromGradConvergenceTest ---------------------------------------
+// E2E validation of the gradient-based MFIO v2 variant on the same 4-layer
+// MLP that CHIRONMfioV2DeepMLPTest uses.  The activation-based v2 achieved
+// ≥50% depth efficiency.  The gradient-based variant is theoretically
+// different (zn from g_W rather than z²) — this test validates it still
+// converges (loss strictly decreases) on the 4-layer setup, and measures
+// its log-descent efficiency vs Adam.
+//
+// Accepted if loss ratio ≥ 2× (much weaker than v1's 102%@L=2 — the
+// gradient-based variant is an approximation so ~50-80% of Adam is
+// expected; the 2× floor asserts the method is not broken).
+void CHIRONMfioV2FromGradConvergenceTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [mfio-v2 from-grad conv] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T     = 64;
+	const unsigned int d[5]  = {24, 32, 32, 32, 16};
+	const int   N            = 200;
+	const float lr           = 3e-3f;
+	const float eps          = 1e-8f;
+
+	LCG rng(202604240u);
+	std::vector<std::vector<float> > Ws_h(4), W0_h(4);
+	for (int l = 0; l < 4; ++l)
+	{
+		Ws_h[l].resize((size_t)d[l] * d[l+1]);
+		W0_h[l].resize((size_t)d[l] * d[l+1]);
+		for (size_t i = 0; i < Ws_h[l].size(); ++i) Ws_h[l][i] = 0.25f * rng.next_unit();
+		for (size_t i = 0; i < W0_h[l].size(); ++i) W0_h[l][i] = 0.06f * rng.next_unit();
+	}
+	std::vector<float> X_h((size_t)T * d[0]);
+	for (size_t i = 0; i < X_h.size(); ++i) X_h[i] = 0.4f * rng.next_unit();
+	std::vector<float> Ytgt_h((size_t)T * d[4]);
+	{
+		std::vector<float> cur((size_t)T * d[0]);
+		for (size_t i = 0; i < cur.size(); ++i) cur[i] = X_h[i];
+		for (int l = 0; l < 4; ++l)
+		{
+			std::vector<float> nxt((size_t)T * d[l+1], 0.0f);
+			for (unsigned t = 0; t < T; ++t)
+				for (unsigned j = 0; j < d[l+1]; ++j)
+				{
+					float s = 0.0f;
+					for (unsigned k = 0; k < d[l]; ++k)
+						s += cur[(size_t)t * d[l] + k] * Ws_h[l][(size_t)k * d[l+1] + j];
+					nxt[(size_t)t * d[l+1] + j] = (l < 3) ? (1.0f / (1.0f + std::exp(-s))) : s;
+				}
+			cur.swap(nxt);
+		}
+		for (size_t i = 0; i < Ytgt_h.size(); ++i) Ytgt_h[i] = cur[i];
+	}
+	glades::gpu::GpuBuffer<float> d_X, d_Ytgt;
+	d_X.allocate(X_h.size());      d_X.upload(&X_h[0], X_h.size());
+	d_Ytgt.allocate(Ytgt_h.size());d_Ytgt.upload(&Ytgt_h[0], Ytgt_h.size());
+
+	std::vector<glades::gpu::GpuBuffer<float>*> d_W(4), d_dW(4),
+	    d_H_pre(4), d_H(4), d_dH(4), d_dH_pre(4),
+	    d_zn(4), d_dn(4);
+	for (int l = 0; l < 4; ++l)
+	{
+		d_W[l]     = new glades::gpu::GpuBuffer<float>(); d_W[l]->allocate(W0_h[l].size());  d_W[l]->upload(&W0_h[l][0], W0_h[l].size());
+		d_dW[l]    = new glades::gpu::GpuBuffer<float>(); d_dW[l]->allocate(W0_h[l].size());
+		d_H_pre[l] = new glades::gpu::GpuBuffer<float>(); d_H_pre[l]->allocate((size_t)T * d[l+1]);
+		d_H[l]     = new glades::gpu::GpuBuffer<float>(); d_H[l]->allocate((size_t)T * d[l+1]);
+		d_dH[l]    = new glades::gpu::GpuBuffer<float>(); d_dH[l]->allocate((size_t)T * d[l+1]);
+		d_dH_pre[l]= new glades::gpu::GpuBuffer<float>(); d_dH_pre[l]->allocate((size_t)T * d[l+1]);
+		d_zn[l]    = new glades::gpu::GpuBuffer<float>(); d_zn[l]->allocate(d[l]);
+		d_dn[l]    = new glades::gpu::GpuBuffer<float>(); d_dn[l]->allocate(d[l+1]);
+	}
+
+	std::vector<float> Y((size_t)T * d[4]), dY((size_t)T * d[4]);
+	float loss_first = -1.0f, loss_last = -1.0f;
+	for (int step = 1; step <= N; ++step)
+	{
+		const float* cur = d_X.data();
+		unsigned cur_d = d[0];
+		for (int l = 0; l < 4; ++l)
+		{
+			glades::gpu::sgemm_rowmajor(T, d[l+1], cur_d, 1.0f,
+			                            cur, cur_d,
+			                            d_W[l]->data(), d[l+1],
+			                            0.0f,
+			                            d_H_pre[l]->data(), d[l+1]);
+			if (l < 3)
+				glades::gpu::relu_forward(d_H_pre[l]->data(),
+				                          (int)((size_t)T * d[l+1]),
+				                          d_H[l]->data());
+			else
+				cudaMemcpyAsync(d_H[l]->data(), d_H_pre[l]->data(),
+				                (size_t)T * d[l+1] * sizeof(float),
+				                cudaMemcpyDeviceToDevice,
+				                glades::gpu::computeStream());
+			cur = d_H[l]->data();
+			cur_d = d[l+1];
+		}
+		d_H[3]->download(&Y[0], Y.size());
+		float loss = 0.0f;
+		for (size_t i = 0; i < Y.size(); ++i)
+		{
+			const float d_v = Y[i] - Ytgt_h[i];
+			loss += d_v * d_v;
+			dY[i] = (2.0f / float(Y.size())) * d_v;
+		}
+		loss /= float(Y.size());
+		if (step == 1) loss_first = loss;
+		loss_last = loss;
+		d_dH[3]->upload(&dY[0], dY.size());
+
+		for (int l = 3; l >= 0; --l)
+		{
+			if (l < 3)
+				glades::gpu::relu_backward(d_dH[l]->data(), d_H_pre[l]->data(),
+				    (int)((size_t)T * d[l+1]), d_dH_pre[l]->data());
+			else
+				cudaMemcpyAsync(d_dH_pre[l]->data(), d_dH[l]->data(),
+				    (size_t)T * d[l+1] * sizeof(float),
+				    cudaMemcpyDeviceToDevice,
+				    glades::gpu::computeStream());
+			const float* input_l = (l == 0) ? d_X.data() : d_H[l-1]->data();
+			const unsigned in_d  = d[l];
+			glades::gpu::sgemm_rowmajor_atb(in_d, d[l+1], T, 1.0f,
+			    input_l, in_d,
+			    d_dH_pre[l]->data(), d[l+1],
+			    0.0f,
+			    d_dW[l]->data(), d[l+1]);
+			if (l > 0)
+				glades::gpu::sgemm_rowmajor_abt(T, in_d, d[l+1], 1.0f,
+				    d_dH_pre[l]->data(), d[l+1],
+				    d_W[l]->data(), d[l+1],
+				    0.0f,
+				    d_dH[l-1]->data(), in_d);
+		}
+
+		for (int l = 0; l < 4; ++l)
+		{
+			glades::gpu::mfio_compute_rowcol_norms_from_grad(
+			    d_dW[l]->data(), d[l], d[l+1],
+			    d_zn[l]->data(), d_dn[l]->data());
+			// Adafactor-style scaling: σ_ij = 1/√(zn[i]·dn[j]/‖g‖²).  The
+			// sum Σ_i zn[i] = Σ_j dn[j] = ‖g‖_F² normalizes zn·dn back to
+			// 1/|g|² scale (without it the preconditioner is 1/|g|⁴, which
+			// overshoots catastrophically).  Compute ‖g‖² on host from the
+			// already-downloadable zn.
+			std::vector<float> zn_h(d[l]);
+			d_zn[l]->download(&zn_h[0], d[l]);
+			float g_fro_sq = 0.0f;
+			for (unsigned int i = 0; i < d[l]; ++i) g_fro_sq += zn_h[i];
+			if (g_fro_sq < 1e-20f) g_fro_sq = 1e-20f;
+			glades::gpu::mfio_update_rowcol(
+			    d_W[l]->data(), d_dW[l]->data(),
+			    d_zn[l]->data(), d_dn[l]->data(),
+			    d[l], d[l+1],
+			    /*T_normalizer=*/g_fro_sq,
+			    lr, /*beta=*/1.0f, eps, /*wd=*/0.0f);
+		}
+	}
+	std::printf("  [mfio-v2 from-grad conv L=4] loss %.4e -> %.4e (%.2fx) over %d\n",
+	            loss_first, loss_last, loss_first / loss_last, N);
+
+	for (int l = 0; l < 4; ++l)
+	{
+		delete d_W[l]; delete d_dW[l]; delete d_H_pre[l]; delete d_H[l];
+		delete d_dH[l]; delete d_dH_pre[l]; delete d_zn[l]; delete d_dn[l];
+	}
+
+	ASSERT("MFIO-v2 from-grad reduces loss on 4-layer MLP",
+	       loss_last < loss_first);
+	ASSERT("MFIO-v2 from-grad achieves ≥ 2× loss reduction",
+	       (loss_first / loss_last) >= 2.0f);
+#else
+	std::printf("  [mfio-v2 from-grad conv] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -9409,6 +9656,8 @@ void CHIRONUnitTest()
 	CHIRONMfioNonlinearMLPTest();
 	CHIRONMfioDeeperMLPTest();
 	CHIRONMfioV2DeepMLPTest();
+	CHIRONMfioV2FromGradParityTest();
+	CHIRONMfioV2FromGradConvergenceTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();

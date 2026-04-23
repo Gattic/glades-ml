@@ -226,6 +226,72 @@ bool mfio_update_rowcol(float* theta, const float* g,
 	return cudaGetLastError() == cudaSuccess;
 }
 
+// ========================================================================
+// Gradient-space row/col norm reduction.  g is [d_in × d_out] row-major.
+//
+//   zn[i] = Σ_j g[i,j]²        (row reduction, one block per row)
+//   dn[j] = Σ_i g[i,j]²        (col reduction, one block per col — reuses
+//                               k_mfio_col_sqsum treating (d_in, d_out) as
+//                               its (T, d) args).
+// ========================================================================
+namespace {
+
+__global__ void k_mfio_row_sqsum(const float* __restrict__ X,
+                                 unsigned int d_in, unsigned int d_out,
+                                 float* __restrict__ out)
+{
+	extern __shared__ float smem[];
+	const unsigned int row = blockIdx.x;
+	const unsigned int tid = threadIdx.x;
+	if (row >= d_in) return;
+
+	float partial = 0.0f;
+	const float* rp = X + (size_t)row * d_out;
+	for (unsigned int j = tid; j < d_out; j += blockDim.x)
+	{
+		const float v = rp[j];
+		partial += v * v;
+	}
+	// warp reduce
+	for (int off = 16; off > 0; off >>= 1)
+		partial += __shfl_xor_sync(0xffffffffu, partial, off);
+	const int lane = tid & 31;
+	const int warp = tid >> 5;
+	if (lane == 0) smem[warp] = partial;
+	__syncthreads();
+	if (warp == 0)
+	{
+		const int nwarps = (blockDim.x + 31) >> 5;
+		float v = (tid < nwarps) ? smem[tid] : 0.0f;
+		for (int off = 16; off > 0; off >>= 1)
+			v += __shfl_xor_sync(0xffffffffu, v, off);
+		if (tid == 0) out[row] = v;
+	}
+}
+
+} // anonymous namespace
+
+bool mfio_compute_rowcol_norms_from_grad(const float* g,
+                                         unsigned int d_in, unsigned int d_out,
+                                         float* zn_out, float* dn_out)
+{
+	if (g == nullptr || zn_out == nullptr || dn_out == nullptr) return false;
+	if (d_in == 0u || d_out == 0u) return false;
+
+	const int block = 256;
+	const int nwarps = (block + 31) >> 5;
+	const size_t smemBytes = nwarps * sizeof(float);
+	// zn[i] = Σ_j g[i,j]²  — one block per row.
+	k_mfio_row_sqsum<<<d_in, block, smemBytes, computeStream()>>>(
+	    g, d_in, d_out, zn_out);
+	if (cudaGetLastError() != cudaSuccess) return false;
+	// dn[j] = Σ_i g[i,j]²  — one block per col; reuse k_mfio_col_sqsum
+	// with T=d_in, d=d_out (it strides rows and reduces per-column).
+	k_mfio_col_sqsum<<<d_out, block, smemBytes, computeStream()>>>(
+	    g, d_in, d_out, dn_out);
+	return cudaGetLastError() == cudaSuccess;
+}
+
 } // namespace gpu
 } // namespace glades
 
