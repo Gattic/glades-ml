@@ -36,6 +36,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_lcp.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_ibgrad.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_atcd.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_csp.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -8861,6 +8862,205 @@ void CHIRONAtcdTaylorE2EAccuracyTest()
 #endif
 }
 
+// CHIRONCspDenseReductionParityTest -----------------------------------------
+// Phase 1 validation of paradigm shift #27 (CSP).  When r_σ = 0 (no residual
+// σ̂ term) and m = d_ff, CSP's three-GEMM forward reduces EXACTLY to a dense
+// FFN: csp_forward(h_in, W_up, W_down, NULL, NULL, ...) ≡
+//     h_out = GELU(h_in · W_up) · W_down.
+// Assert max_err < 1e-4 vs host reference.
+void CHIRONCspDenseReductionParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [csp dense-reduction parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 16, d_model = 32, m = 128, d_ff = 128;  // m = d_ff
+	(void)d_ff;
+	LCG rng(202604300u);
+
+	std::vector<float> h_in_h((size_t)T * d_model);
+	for (size_t i = 0; i < h_in_h.size(); ++i) h_in_h[i] = 0.4f * rng.next_unit();
+	std::vector<float> W_up_h((size_t)d_model * m);
+	std::vector<float> W_dn_h((size_t)m * d_model);
+	for (size_t i = 0; i < W_up_h.size(); ++i) W_up_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < W_dn_h.size(); ++i) W_dn_h[i] = 0.2f * rng.next_unit();
+
+	// Host reference: GELU(h_in · W_up) · W_down.
+	const float k0 = 0.7978845608028654f;
+	const float k1 = 0.044715f;
+	std::vector<float> z_ref((size_t)T * m, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < m; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d_model; ++k)
+				s += h_in_h[(size_t)t * d_model + k] * W_up_h[(size_t)k * m + j];
+			z_ref[(size_t)t * m + j] = s;
+		}
+	std::vector<float> y_ref = z_ref;
+	for (size_t i = 0; i < y_ref.size(); ++i) {
+		const float z = y_ref[i];
+		const float u_ = k0 * (z + k1 * z * z * z);
+		y_ref[i] = 0.5f * z * (1.0f + std::tanh(u_));
+	}
+	std::vector<float> h_out_ref((size_t)T * d_model, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d_model; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				s += y_ref[(size_t)t * m + k] * W_dn_h[(size_t)k * d_model + j];
+			h_out_ref[(size_t)t * d_model + j] = s;
+		}
+
+	// GPU: call csp_forward with r_sigma = 0 (no residual).
+	glades::gpu::GpuBuffer<float> d_h_in, d_Wup, d_Wdn;
+	glades::gpu::GpuBuffer<float> d_z_sk, d_y, d_h_out;
+	d_h_in.allocate(h_in_h.size());  d_h_in.upload(&h_in_h[0], h_in_h.size());
+	d_Wup.allocate(W_up_h.size());   d_Wup.upload(&W_up_h[0], W_up_h.size());
+	d_Wdn.allocate(W_dn_h.size());   d_Wdn.upload(&W_dn_h[0], W_dn_h.size());
+	d_z_sk.allocate((size_t)T * m);
+	d_y.allocate((size_t)T * m);
+	d_h_out.allocate((size_t)T * d_model);
+
+	const bool ok = glades::gpu::csp_forward(
+	    d_h_in.data(), d_Wup.data(), d_Wdn.data(),
+	    NULL, NULL,
+	    T, d_model, m, 0,      // r_sigma = 0
+	    0,                      // GELU
+	    d_z_sk.data(), d_y.data(), NULL,
+	    d_h_out.data());
+	ASSERT("csp_forward returns true at r_sigma=0", ok);
+
+	std::vector<float> h_out_gpu((size_t)T * d_model);
+	d_h_out.download(&h_out_gpu[0], h_out_gpu.size());
+	const float err = max_abs_diff(h_out_ref, h_out_gpu);
+	float norm = 0.0f;
+	for (size_t i = 0; i < h_out_ref.size(); ++i)
+		norm = std::max(norm, std::fabs(h_out_ref[i]));
+	std::printf("  [csp dense-reduction parity] T=%u d_model=%u m=%u r_σ=0 "
+	            "max_err=%.3e norm=%.3e rel=%.3e\n",
+	            T, d_model, m, err, norm, err / (norm + 1e-12f));
+	ASSERT("CSP (r_σ=0, m=d_ff) matches dense FFN < 1e-4", err < 1e-4f);
+#else
+	std::printf("  [csp dense-reduction parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONCspResidualForwardTest ----------------------------------------------
+// Phase 1 validation of the σ̂ residual path: run csp_forward with r_σ > 0
+// (with nonzero U_σ, V_σ) and check that it produces a different result
+// than the r_σ = 0 baseline, AND matches a host reference that explicitly
+// computes σ_base + U_σ · GELU(V_σ^T · z).
+void CHIRONCspResidualForwardTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [csp residual] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 16, d_model = 32, m = 64, r_sigma = 8;
+	LCG rng(202604301u);
+
+	std::vector<float> h_in_h((size_t)T * d_model);
+	std::vector<float> W_up_h((size_t)d_model * m);
+	std::vector<float> W_dn_h((size_t)m * d_model);
+	std::vector<float> U_s_h((size_t)m * r_sigma);
+	std::vector<float> V_s_h((size_t)m * r_sigma);
+	for (size_t i = 0; i < h_in_h.size(); ++i) h_in_h[i] = 0.4f * rng.next_unit();
+	for (size_t i = 0; i < W_up_h.size(); ++i) W_up_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < W_dn_h.size(); ++i) W_dn_h[i] = 0.2f * rng.next_unit();
+	for (size_t i = 0; i < U_s_h.size(); ++i) U_s_h[i]   = 0.05f * rng.next_unit();
+	for (size_t i = 0; i < V_s_h.size(); ++i) V_s_h[i]   = 0.05f * rng.next_unit();
+
+	// Host ref forward.
+	const float k0 = 0.7978845608028654f;
+	const float k1 = 0.044715f;
+	std::vector<float> z_h((size_t)T * m, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < m; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d_model; ++k)
+				s += h_in_h[(size_t)t * d_model + k] * W_up_h[(size_t)k * m + j];
+			z_h[(size_t)t * m + j] = s;
+		}
+	// y_base = GELU(z)
+	std::vector<float> y_h((size_t)T * m);
+	for (size_t i = 0; i < z_h.size(); ++i) {
+		const float z = z_h[i];
+		const float u_ = k0 * (z + k1 * z * z * z);
+		y_h[i] = 0.5f * z * (1.0f + std::tanh(u_));
+	}
+	// residual: tmp_r [T × r_σ] = z · V_σ ; GELU(tmp_r); then × U_σ^T
+	std::vector<float> tmp_r((size_t)T * r_sigma, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < r_sigma; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				s += z_h[(size_t)t * m + k] * V_s_h[(size_t)k * r_sigma + j];
+			tmp_r[(size_t)t * r_sigma + j] = s;
+		}
+	for (size_t i = 0; i < tmp_r.size(); ++i) {
+		const float z = tmp_r[i];
+		const float u_ = k0 * (z + k1 * z * z * z);
+		tmp_r[i] = 0.5f * z * (1.0f + std::tanh(u_));
+	}
+	std::vector<float> y_res((size_t)T * m, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < m; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < r_sigma; ++k)
+				s += tmp_r[(size_t)t * r_sigma + k] * U_s_h[(size_t)j * r_sigma + k];
+			y_res[(size_t)t * m + j] = s;
+		}
+	for (size_t i = 0; i < y_h.size(); ++i) y_h[i] += y_res[i];
+	// h_out = y · W_down
+	std::vector<float> h_out_ref((size_t)T * d_model, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d_model; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < m; ++k)
+				s += y_h[(size_t)t * m + k] * W_dn_h[(size_t)k * d_model + j];
+			h_out_ref[(size_t)t * d_model + j] = s;
+		}
+
+	glades::gpu::GpuBuffer<float> d_h_in, d_Wup, d_Wdn, d_Us, d_Vs;
+	glades::gpu::GpuBuffer<float> d_z_sk, d_y, d_res_sc, d_h_out;
+	d_h_in.allocate(h_in_h.size());  d_h_in.upload(&h_in_h[0], h_in_h.size());
+	d_Wup.allocate(W_up_h.size());   d_Wup.upload(&W_up_h[0], W_up_h.size());
+	d_Wdn.allocate(W_dn_h.size());   d_Wdn.upload(&W_dn_h[0], W_dn_h.size());
+	d_Us.allocate(U_s_h.size());     d_Us.upload(&U_s_h[0], U_s_h.size());
+	d_Vs.allocate(V_s_h.size());     d_Vs.upload(&V_s_h[0], V_s_h.size());
+	d_z_sk.allocate((size_t)T * m);
+	d_y.allocate((size_t)T * m);
+	d_res_sc.allocate((size_t)T * std::max(m, r_sigma));
+	d_h_out.allocate((size_t)T * d_model);
+
+	const bool ok = glades::gpu::csp_forward(
+	    d_h_in.data(), d_Wup.data(), d_Wdn.data(),
+	    d_Us.data(), d_Vs.data(),
+	    T, d_model, m, r_sigma,
+	    0,  // GELU base
+	    d_z_sk.data(), d_y.data(), d_res_sc.data(),
+	    d_h_out.data());
+	ASSERT("csp_forward with residual returns true", ok);
+
+	std::vector<float> h_out_gpu((size_t)T * d_model);
+	d_h_out.download(&h_out_gpu[0], h_out_gpu.size());
+	const float err = max_abs_diff(h_out_ref, h_out_gpu);
+	float norm = 0.0f;
+	for (size_t i = 0; i < h_out_ref.size(); ++i)
+		norm = std::max(norm, std::fabs(h_out_ref[i]));
+	std::printf("  [csp residual] T=%u d_model=%u m=%u r_σ=%u "
+	            "max_err=%.3e norm=%.3e rel=%.3e\n",
+	            T, d_model, m, r_sigma, err, norm, err / (norm + 1e-12f));
+	ASSERT("CSP with σ̂ residual matches host ref < 1e-4", err < 1e-4f);
+#else
+	std::printf("  [csp residual] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONAtcdFullE2ETest -----------------------------------------------------
 // Full end-to-end convergence validation of the ATC-Δ pipeline (paradigm
 // shift #26).  Single-layer MLP: x → W → GELU → h, with MSE loss against
@@ -10338,6 +10538,8 @@ void CHIRONUnitTest()
 	CHIRONAtcdRank1PowerParityTest();
 	CHIRONAtcdTaylorE2EAccuracyTest();
 	CHIRONAtcdFullE2ETest();
+	CHIRONCspDenseReductionParityTest();
+	CHIRONCspResidualForwardTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();
