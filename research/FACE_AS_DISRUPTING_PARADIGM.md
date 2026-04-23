@@ -121,6 +121,72 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.17 234M × 2500 × β=0.999 — β_row tuning still wins at 234M long-horizon (iter 109)
+
+Extended the 234M × 1500 × β=0.999 finding (iter 99: -1.38 nat) to the
+2500-step horizon.  Reproduced with the same seed 1337 and config
+(T=1024, m=1024, L=24, nH=16, dH=128, V=32k).
+
+  Config                              EMA@2500  Δ vs dense
+  Dense Adam (iter 78)                9.9409    —
+  FACE β=0.98 (iter 78)               9.3921    −0.55
+  **FACE β=0.999 (iter 109 repro)    8.9709    −0.97 nat**
+
+β_row=0.999 tuning adds **+0.42 nat extra** advantage at 234M × 2500
+over the β=0.98 default.  Compared to iter 99's 234M × 1500 × β=0.999
+result of EMA 8.0579 (-1.38 nat), the advantage has narrowed by 0.41
+nat — the β=0.999 benefit PEAKS around step 1500 at 234M and gradually
+decays at longer horizons (consistent with the oscillation pattern
+noted in §3.4).
+
+Throughput: 7179 tok/s at 234M × β=0.999 (matches baseline).
+
+Scale-aware β_row recipe — full validated matrix:
+  Scale   Horizon    β_row     Δ vs dense   Status
+  66M     2500       0.999     -0.98 (compound)  validated
+  66M     5000       0.999     -1.70 (compound)  validated (peak)
+  234M    1500       0.999     -1.38        validated
+  **234M  2500       0.999    -0.97**       validated (iter 109)
+  500M    1000       0.99      -0.35        validated
+  **500M  2500       0.99      -0.67**      validated (iter 108)
+
+### 3.16 500M × 2500 × β=0.99 — new 500M optimum holds at long horizon (iter 108)
+
+Extended the iter 107 finding (β=0.99 is 500M optimum at 1000 steps) to
+the 2500-step horizon.  Fresh dense baseline + FACE β=0.99 runs, same
+seed 1337, same config (T=1024, m=1536, L=24, nH=24, dH=128, V=32k).
+
+Full 500M × 2500 trajectory comparison:
+
+  Step    Dense EMA    FACE β=0.99 EMA    Δ
+  1       10.5760      10.5760            0.00 (identical init)
+  250      9.4129       7.9836           **−1.43**
+  500     10.0375       9.6820           −0.36
+  750      9.9069       9.5776           −0.33
+  1000    10.0775       9.7299           −0.35 (matches iter 107 at 1000)
+  1250    10.0704       9.4301           −0.64
+  1500     9.2687       8.1845           **−1.09**
+  1750     9.9329       9.1358           −0.80
+  2000    10.1285       9.9005           −0.23
+  2250     9.9886       9.4149           −0.57
+  **2500   9.9752       9.3093           −0.67**
+
+**Sustained 0.67 nat advantage at 500M × 2500 steps** — the new 500M
+optimum β=0.99 holds and grows beyond the iter 107 1000-step checkpoint.
+Advantage oscillates in a 0.23-1.43 nat band; never reverses.  Mean
+advantage across 10 checkpoints (excluding step 1): -0.647 nat.
+
+Throughput identical: both runs at 3928-3938 tok/s.
+
+Implication: the scale-aware β_row recipe is VALIDATED at long
+horizons:
+- 66M × 5000: β=0.999 → -1.70 nat (tuned compound)
+- 234M × 2500: β=0.999 → -0.97 nat (iter 109 below)
+- **500M × 2500: β=0.99 → -0.67 nat (NEW)**
+
+The 500M regime benefits less from β tuning (0.99 vs 0.98 default is
+the right call), but the absolute FACE advantage persists at scale.
+
 ### 3.15 β_row=0.99 is the new 500M optimum (iter 107)
 
 Validated the "medium-scale compromise" recommendation empirically.

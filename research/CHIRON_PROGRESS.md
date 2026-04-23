@@ -32,10 +32,10 @@ Delivers on both research-brief axes simultaneously.
 | Mechanism | Zipfian regularizer | **Empirically validated** (uniform corpus) |
 | Throughput | (compound overhead) | 17,195 vs 17,860 tok/s (identical within noise) |
 
-**Scale-dependent tuning** (iter 100):
-- Small (<150M): `--face-beta-row 0.999` (gain +1.04 nat)
-- Medium (150-500M): `--face-beta-row 0.99` (compromise)
-- Large (≥500M): `--face-beta-row 0.98` (default — 0.999 regresses)
+**Scale-dependent tuning** (iter 100 + iter 107-108 validation):
+- Small (<150M): `--face-beta-row 0.999` (gain +1.04 nat at 66M × 1500)
+- Medium (150-500M): `--face-beta-row 0.99` (validated at 500M × 2500: -0.67 nat)
+- Large (≥1B, untested): `--face-beta-row 0.98` (default — β=0.999 regresses at 500M)
 
 **Horizon scaling** of tuned compound at 66M:
 500 steps → 0.30 · 1500 → 1.04 · 2500 → 0.98 · **5000 → 1.70 nat**

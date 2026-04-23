@@ -59,16 +59,19 @@ effective learning rate.
 
 **Empirical evidence**:
 
-| Scale | Horizon | Δ EMA loss | Memory compression |
-|:-----:|:-------:|:---------:|:------------------:|
-| 66M   | 500 steps    | −0.12 nat  | 1008× |
-| 66M   | 1500 steps   | −0.70 nat  | 1008× |
-| 66M   | 2500 steps   | −0.42 nat  | 1008× |
-| 66M   | **5000 steps** | **−0.81 nat** | 1008× |
-| 234M  | 500 steps    | −0.30 nat  | 1008× |
-| 234M  | 1500 steps   | −1.11 nat  | 1008× |
-| 234M  | 2500 steps   | −0.55 nat  | 1008× |
-| 500M  | 500 steps    | −0.33 nat  | 1570× |
+| Scale | Horizon | Config | Δ EMA loss | Memory compression |
+|:-----:|:-------:|:------:|:---------:|:------------------:|
+| 66M   | 500 steps    | β=0.98 | −0.12 nat  | 1008× |
+| 66M   | 1500 steps   | β=0.98 | −0.70 nat  | 1008× |
+| 66M   | 2500 steps   | β=0.98 | −0.42 nat  | 1008× |
+| 66M   | **5000 steps** | β=0.98 | **−0.81 nat** | 1008× |
+| 234M  | 500 steps    | β=0.98 | −0.30 nat  | 1008× |
+| 234M  | 1500 steps   | β=0.98 | −1.11 nat  | 1008× |
+| 234M  | 2500 steps   | β=0.98 | −0.55 nat  | 1008× |
+| **234M** | **2500 steps** | **β=0.999** | **−0.97 nat** (iter 109) | 1008× |
+| 500M  | 500 steps    | β=0.98 | −0.33 nat  | 1570× |
+| 500M  | 1000 steps   | β=0.99 | **−0.35 nat** | 1570× |
+| **500M** | **2500 steps** | **β=0.99** | **−0.67 nat** (iter 108) | 1570× |
 
 Oscillatory band 0.1-1.1 nat at any given checkpoint; the OVERALL
 TREND is sustained FACE lead that grows with horizon.
