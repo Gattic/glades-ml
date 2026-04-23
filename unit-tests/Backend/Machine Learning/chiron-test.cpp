@@ -8861,6 +8861,250 @@ void CHIRONAtcdTaylorE2EAccuracyTest()
 #endif
 }
 
+// CHIRONAtcdFullE2ETest -----------------------------------------------------
+// Full end-to-end convergence validation of the ATC-Δ pipeline (paradigm
+// shift #26).  Single-layer MLP: x → W → GELU → h, with MSE loss against
+// a known target.  Two training modes, same init + same data + same Adam
+// seed, compared at final loss:
+//
+//   (baseline) full forward every step, Adam on W
+//   (atc)      refresh cache at k_ℓ=0, Taylor-forward for k_ℓ∈[1,K),
+//              rank-1 power iteration factors dW each step, appended
+//              to slot k_ℓ of (U, V) ring buffer
+//
+// Stitches together Phase 1 primitives (atcd_cache_refresh,
+// atcd_taylor_weight_delta) with Phase 2 (atcd_extract_rank1_power) —
+// the full ATC-Δ pipeline minus the trainer integration harness.
+//
+// Success criterion: loss_atc ≤ 1.5 × loss_baseline at end of training.
+// At K=4, r=4, 80 steps, 20 refreshes, Taylor residual is well within
+// the design doc's O(‖ΔW‖²) bound — ATC should track baseline tightly.
+void CHIRONAtcdFullE2ETest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [atcd full-e2e] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 32, d = 32;
+	const int   N_steps = 200;
+	const int   K       = 4;     // refresh period
+	const int   r       = K;     // factor rank = K slots
+	const float lr      = 2e-1f; // SGD needs larger LR than Adam
+	const float b1      = 0.9f;
+	const float b2      = 0.999f;
+	const float eps_a   = 1e-8f;
+	LCG rng(202604290u);
+
+	// Target weights + inputs (identical for both baseline and ATC).
+	std::vector<float> W_tgt_h((size_t)d * d), W_init_h((size_t)d * d);
+	for (size_t i = 0; i < W_tgt_h.size();  ++i) W_tgt_h[i]  = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < W_init_h.size(); ++i) W_init_h[i] = 0.1f * rng.next_unit();
+	std::vector<float> x_h((size_t)T * d);
+	for (size_t i = 0; i < x_h.size(); ++i) x_h[i] = 0.4f * rng.next_unit();
+
+	// Compute target h via σ(W_tgt · x) on host.
+	const float k0 = 0.7978845608028654f;
+	const float k1 = 0.044715f;
+	std::vector<float> y_tgt_h((size_t)T * d);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < d; ++j) {
+			float s = 0.0f;
+			for (unsigned int k = 0; k < d; ++k) s += x_h[(size_t)t * d + k] * W_tgt_h[(size_t)k * d + j];
+			const float u_ = k0 * (s + k1 * s * s * s);
+			y_tgt_h[(size_t)t * d + j] = 0.5f * s * (1.0f + std::tanh(u_));
+		}
+
+	float base_first = 0, base_last = 0, atc_first = 0, atc_last = 0;
+	for (int pass = 0; pass < 2; ++pass)
+	{
+		const bool use_atcd = (pass == 1);
+		float first_loss = 0.0f, last_loss = 0.0f;
+		glades::gpu::GpuBuffer<float> d_W, d_dW, d_x, d_y_tgt;
+		glades::gpu::GpuBuffer<float> d_z, d_h;        // full forward buffers
+		glades::gpu::GpuBuffer<float> d_dh, d_dz;      // backward
+		glades::gpu::GpuBuffer<float> d_m, d_v;        // Adam state
+		glades::gpu::GpuBuffer<float> d_h_cache, d_z_cache, d_sp_cache;
+		glades::gpu::GpuBuffer<float> d_U, d_V, d_u_new, d_v_new, d_sigma_new;
+		glades::gpu::GpuBuffer<float> d_delta_h, d_scratch;
+		d_W.allocate(W_init_h.size());   d_W.upload(&W_init_h[0], W_init_h.size());
+		d_dW.allocate(W_init_h.size());
+		d_x.allocate(x_h.size());        d_x.upload(&x_h[0], x_h.size());
+		d_y_tgt.allocate(y_tgt_h.size()); d_y_tgt.upload(&y_tgt_h[0], y_tgt_h.size());
+		d_z.allocate((size_t)T * d);
+		d_h.allocate((size_t)T * d);
+		d_dh.allocate((size_t)T * d);
+		d_dz.allocate((size_t)T * d);
+		d_m.allocate(W_init_h.size());   { std::vector<float> z(W_init_h.size(), 0.0f); d_m.upload(&z[0], z.size()); }
+		d_v.allocate(W_init_h.size());   { std::vector<float> z(W_init_h.size(), 0.0f); d_v.upload(&z[0], z.size()); }
+
+		if (use_atcd) {
+			d_h_cache.allocate((size_t)T * d);
+			d_z_cache.allocate((size_t)T * d);
+			d_sp_cache.allocate((size_t)T * d);
+			d_U.allocate((size_t)d * r);   { std::vector<float> z((size_t)d*r, 0.0f); d_U.upload(&z[0], z.size()); }
+			d_V.allocate((size_t)d * r);   { std::vector<float> z((size_t)d*r, 0.0f); d_V.upload(&z[0], z.size()); }
+			d_u_new.allocate(d);
+			d_v_new.allocate(d);
+			d_sigma_new.allocate(1);
+			d_delta_h.allocate((size_t)T * d);
+			d_scratch.allocate((size_t)T * d);
+		}
+
+		std::vector<float> Y((size_t)T * d), dY((size_t)T * d);
+		int k_l = 0;
+		first_loss = 0.0f;
+		last_loss = 0.0f;
+
+		for (int step = 1; step <= N_steps; ++step)
+		{
+			// FORWARD
+			if (!use_atcd || k_l == 0) {
+				// Full forward + cache at refresh.
+				glades::gpu::sgemm_rowmajor((int)T, (int)d, (int)d, 1.0f,
+				    d_x.data(), (int)d, d_W.data(), (int)d, 0.0f,
+				    d_z.data(), (int)d);
+				glades::gpu::gelu_forward(d_z.data(), (int)((size_t)T * d), d_h.data());
+				if (use_atcd) {
+					// Cache h, z, σ'(z).
+					glades::gpu::atcd_cache_refresh(
+					    d_h.data(), d_z.data(),
+					    d_h_cache.data(), d_z_cache.data(), d_sp_cache.data(),
+					    T, d, /*GELU=*/0);
+					// Zero the (U, V) factor.
+					std::vector<float> zero_buf((size_t)d * r, 0.0f);
+					d_U.upload(&zero_buf[0], zero_buf.size());
+					d_V.upload(&zero_buf[0], zero_buf.size());
+				}
+			} else {
+				// Taylor forward: Δh = σ'_cache ⊙ ((V·U^T) · x_cache).
+				// We use the cached x is actually the global d_x (input unchanged).
+				glades::gpu::atcd_taylor_weight_delta(
+				    d_U.data(), d_V.data(), d_x.data(), d_sp_cache.data(),
+				    T, d, d, r,
+				    d_scratch.data(), d_delta_h.data());
+				// h = h_cache + Δh via sgemm? simpler: launch a small add.
+				// Use cudaMemcpy + in-place axpy via existing kernel if available.
+				// For simplicity, compute h on the host: download h_cache and delta_h, add, upload.
+				std::vector<float> hc((size_t)T * d), dh((size_t)T * d);
+				d_h_cache.download(&hc[0], hc.size());
+				d_delta_h.download(&dh[0], dh.size());
+				for (size_t i = 0; i < hc.size(); ++i) hc[i] += dh[i];
+				d_h.upload(&hc[0], hc.size());
+			}
+
+			// Loss + gradient of loss w.r.t. h (MSE).
+			d_h.download(&Y[0], Y.size());
+			float loss = 0.0f;
+			for (size_t i = 0; i < Y.size(); ++i) {
+				const float err = Y[i] - y_tgt_h[i];
+				loss += err * err;
+				dY[i] = (2.0f / (float)Y.size()) * err;
+			}
+			loss /= (float)Y.size();
+			if (step == 1) first_loss = loss;
+			last_loss = loss;
+			d_dh.upload(&dY[0], dY.size());
+
+			// BACKWARD: δz = δh ⊙ σ'(z).  For ATC, reuse σ'_cache.
+			// For baseline, recompute σ'(z) inline — but we can reuse the
+			// gelu derivative on host for simplicity, since correctness of
+			// the comparison depends on SAME backward rule in both modes.
+			// Simplest: use σ'(z) by computing on host each step.
+			std::vector<float> z_h_vec((size_t)T * d), sp_h((size_t)T * d);
+			if (use_atcd) {
+				// σ'_cache already matches our forward-cache convention.
+				d_sp_cache.download(&sp_h[0], sp_h.size());
+			} else {
+				d_z.download(&z_h_vec[0], z_h_vec.size());
+				for (size_t i = 0; i < z_h_vec.size(); ++i) {
+					const float z = z_h_vec[i];
+					const float u_ = k0 * (z + k1 * z * z * z);
+					const float t_ = std::tanh(u_);
+					const float du = k0 * (1.0f + 3.0f * k1 * z * z);
+					const float dt = 1.0f - t_ * t_;
+					sp_h[i] = 0.5f * (1.0f + t_) + 0.5f * z * dt * du;
+				}
+			}
+			std::vector<float> dz((size_t)T * d);
+			for (size_t i = 0; i < dz.size(); ++i) dz[i] = dY[i] * sp_h[i];
+			d_dz.upload(&dz[0], dz.size());
+			// dW = x^T · δz  (row-major [d × d])
+			glades::gpu::sgemm_rowmajor_atb((int)d, (int)d, (int)T, 1.0f,
+			    d_x.data(), (int)d, d_dz.data(), (int)d, 0.0f,
+			    d_dW.data(), (int)d);
+
+			// Phase 2: extract rank-1 from dW, append to slot k_l.
+			if (use_atcd) {
+				glades::gpu::atcd_extract_rank1_power(
+				    d_dW.data(), d, d, 3, NULL,
+				    d_u_new.data(), d_v_new.data(), d_sigma_new.data());
+				// Write U[:, k_l] = -lr · σ · u_new; V[:, k_l] = v_new.
+				// (U V^T factors the CUMULATIVE Adam update; we're approximating
+				//  as a ring buffer of per-step rank-1 Adam-proxy updates.
+				//  Adam update ≈ -lr · dW for early training; use dW's rank-1
+				//  scaled by -lr as the per-step proxy.)
+				// Download σ · u to scale it on host before writing column.
+				std::vector<float> u_h_vec((size_t)d), v_h_vec((size_t)d);
+				float sig = 0.0f;
+				d_u_new.download(&u_h_vec[0], d);
+				d_v_new.download(&v_h_vec[0], d);
+				d_sigma_new.download(&sig, 1);
+				// V has shape [d × r] row-major, column slot k_l at
+				// V[i*r + k_l] for i=0..d-1.
+				std::vector<float> V_h_buf((size_t)d * r), U_h_buf((size_t)d * r);
+				d_V.download(&V_h_buf[0], V_h_buf.size());
+				d_U.download(&U_h_buf[0], U_h_buf.size());
+				for (unsigned int i = 0; i < d; ++i)
+					V_h_buf[(size_t)i * r + k_l] = -lr * sig * u_h_vec[i];
+				for (unsigned int j = 0; j < d; ++j)
+					U_h_buf[(size_t)j * r + k_l] = v_h_vec[j];
+				d_V.upload(&V_h_buf[0], V_h_buf.size());
+				d_U.upload(&U_h_buf[0], U_h_buf.size());
+			}
+
+			// SGD step on W (both baseline and ATC use the same rule).
+			// We use SGD rather than Adam so the rank-1 factor
+			// V[:, k_l]·U[:, k_l]^T = -lr · σ · u · v^T faithfully
+			// represents the actual per-step weight change — Adam's
+			// preconditioned update would require downloading W before/
+			// after each step to recover ΔW_step.
+			std::vector<float> W_h_vec((size_t)d * d), dW_h_vec((size_t)d * d);
+			d_W.download(&W_h_vec[0], W_h_vec.size());
+			d_dW.download(&dW_h_vec[0], dW_h_vec.size());
+			for (size_t i = 0; i < W_h_vec.size(); ++i)
+				W_h_vec[i] -= lr * dW_h_vec[i];
+			d_W.upload(&W_h_vec[0], W_h_vec.size());
+
+			// Advance ATC refresh counter.
+			if (use_atcd) {
+				k_l += 1;
+				if (k_l >= K) k_l = 0;
+			}
+		}
+		if (pass == 0) { base_first = first_loss; base_last = last_loss; }
+		else           { atc_first  = first_loss; atc_last  = last_loss; }
+	}
+
+	std::printf("  [atcd full-e2e] T=%u d=%u K=%d r=%d steps=%d\n",
+	            T, d, K, r, N_steps);
+	std::printf("  [atcd full-e2e] baseline: loss %.4e → %.4e (%.2fx)\n",
+	            base_first, base_last, base_first / base_last);
+	std::printf("  [atcd full-e2e] atc-Δ  : loss %.4e → %.4e (%.2fx)\n",
+	            atc_first, atc_last, atc_first / atc_last);
+	std::printf("  [atcd full-e2e] atc/baseline final-loss ratio: %.3f\n",
+	            atc_last / base_last);
+
+	ASSERT("ATC reduces loss from init",    atc_last < atc_first);
+	// Loss should stay within 1.5x of baseline — Taylor approximation
+	// error grows across refresh period but refresh resets it.
+	ASSERT("ATC final-loss ≤ 1.5x baseline", atc_last / base_last < 1.5f);
+#else
+	std::printf("  [atcd full-e2e] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -10093,6 +10337,7 @@ void CHIRONUnitTest()
 	CHIRONAtcdTaylorWeightDeltaParityTest();
 	CHIRONAtcdRank1PowerParityTest();
 	CHIRONAtcdTaylorE2EAccuracyTest();
+	CHIRONAtcdFullE2ETest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();
