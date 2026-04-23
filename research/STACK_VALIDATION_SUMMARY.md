@@ -153,6 +153,23 @@ theoretical expectations in magnitude or qualitative behavior:
    the CURRENT stack state before promotion.  See
    `DEFERRED_SHIFTS_RESCORE_2026-04-23.md` for the 10-shift re-score.
 
+9. **MFIO preconditioner breaks on sparse-row gradients** (embedding
+   extension, Phase 2 trainer wire-in 2026-04-23).  Extending MFIO
+   to the embedding matrix E [V × m] via --mfio-e flag produces
+   1008× state compression (125 MB → 127 KB) as predicted, but
+   DEGRADES convergence vs the 2-shift flagship:
+     2-shift (--mfio 2 --wip-K 4):   loss@500 = 9.2610
+     3-shift (+ --mfio-e 1):          loss@500 = 10.2835 (+1 nat)
+   Root cause: MFIO's Adafactor-style row/col norm assumes DENSE
+   gradients per matrix.  Embedding gradients are SPARSE per-row
+   (only active tokens update), so the column-norm dn[j] = Σ_i
+   g[i,j]² is dominated by a few rows, producing an unbalanced
+   preconditioner that mismatches Adam's actual step.  The
+   flagship 2-shift works because attn matrices have dense
+   gradients at every position.  Methodology finding: every
+   paradigm shift must be re-validated per-matrix-type before
+   extension; no transitive extension across matrix classes.
+
 8. **Theoretical FLOP reduction ≠ realized wall-clock speedup**
    (shift #27 CSP Phase 1 bench).  CSP's 3.88× theoretical FLOP ratio
    at pile_large dims (T=1024, d_model=1024, d_ff=4096, m=1024)
