@@ -88,22 +88,43 @@ Paradigm-shift taxonomy established:
   improves loss.
 - **Compound**: memory × convergence, multiplicatively stackable.
 
-### 1.3 Production flagship recipe
+### 1.3 Production flagship recipe (iter 100 scale-aware refinement)
 
 ```
 ./build/glades_chiron_train \
-   --mfio 2 --wip-K 4 --face 1 \
+   --mfio 2 --wip-K 4 --face 1 --face-beta-row <scale-dep> \
    [usual training args]
 ```
 
+Scale-dependent β_row (iter 100):
+- Small (<150M):       `--face-beta-row 0.999` (gain +1.04 nat)
+- Medium (150-500M):   `--face-beta-row 0.99` (compromise)
+- Large (≥500M):       `--face-beta-row 0.98` (default — 0.999 regresses)
+
 Stacks three orthogonal shifts:
 - MFIO on Wq/Wk/Wv: 682× attention Adam state compression
-- WIP on Wo: K-snapshot α-Adam (factor-multiplicative with refresh cadence)
-- FACE on embedding: 1008× embedding Adam state compression
-  + 0.4-0.81 nat convergence advantage
+- WIP on Wo: K-snapshot α-Adam
+- FACE on embedding: 1008× embedding Adam state + Zipfian regularizer
 
-Validated at 66M and 234M scales, 500-2500 step horizons, zero
-throughput cost vs dense Adam.
+### 1.4 Peak empirical advantage (iter 102) — tuned compound at 5000 steps
+
+Strongest real-training result of the session:
+
+  Config @ 66M × 5000 pile-bpe steps   EMA@5000   Δ vs dense
+  Dense Adam                           8.566      —
+  FACE-alone β=0.98                    7.755      −0.81 nat
+  **Tuned compound β=0.999            6.871      −1.70 nat**
+
+2.1× the un-tuned FACE-alone advantage at the same horizon.  Horizon
+scaling of tuned compound at 66M is approximately log-linear:
+
+  500 steps:   0.30 nat
+  1500 steps:  1.04 nat
+  2500 steps:  0.98 nat
+  **5000 steps: 1.70 nat**
+
+No saturation observed.  Validated at 66M and 234M scales, 500-5000
+step horizons, zero throughput cost vs dense Adam.
 
 ---
 
