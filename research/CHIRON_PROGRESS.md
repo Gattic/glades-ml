@@ -35,7 +35,7 @@ Delivers on both research-brief axes simultaneously.
 **Scale-dependent tuning** (iter 100 + iter 107-108 validation):
 - Small (<150M): `--face-beta-row 0.999` (gain +1.04 nat at 66M × 1500)
 - Medium (150-500M): `--face-beta-row 0.99` (validated at 500M × 2500: -0.67 nat)
-- Large (≥1B, untested): `--face-beta-row 0.98` (default — β=0.999 regresses at 500M)
+- Large (≥1B): `--face-beta-row 0.98` (validated at 955M × 1000: -0.33 nat; iter 111)
 
 **Horizon scaling** of tuned compound at 66M:
 500 steps → 0.30 · 1500 → 1.04 · 2500 → 0.98 · **5000 → 1.70 nat**
