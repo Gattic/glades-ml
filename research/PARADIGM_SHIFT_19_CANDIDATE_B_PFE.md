@@ -189,87 +189,48 @@ input.  Both failure modes of the simpler statistics are covered.
 
 ### 5.1 Step-count arithmetic
 
-Run PFE for N wall-clock steps.  (1 − ρ)·N are calibration steps;
-ρ·N are mirror steps.  θ receives (1 − ρ)·N gradient updates (pure
-skip) or N-with-conservative-η updates (synthesized-θ).
+Run N wall-clock steps.  (1 − ρ)·N are CAL (cost ≈ 1.02·F_full each),
+ρ·N are MIR (cost ≈ 0.012·F_full).  Total wall-clock:
 
-**Pure skip.**  Per-step wall-clock: on CAL, full-forward cost F_full
-plus mirror cost F_mir ≈ 0.012·F_full plus KD gradient ≈ 1.02·F_full.
-On MIR, F_mir ≈ 0.012·F_full.  Total wall clock:
+    T_PFE = N·(1.02 − 1.008·ρ)·F_full.
 
-    T_PFE  =  N · ((1 − ρ)·1.02 + ρ·0.012) · F_full
-           ≈  N · (1.02 − ρ·1.008) · F_full.
-
-At ρ = 0.7: T_PFE ≈ 0.315 · N · F_full — **3.2× wall-clock reduction**.
-At ρ = 0.8: 2.6× wall-clock * but* only 0.2·N θ updates.
+At ρ = 0.7 → 0.315·N·F_full (**3.2× wall-clock reduction**); at
+ρ = 0.8 → 2.6× speedup but only 0.2·N θ updates.
 
 ### 5.2 Loss reduction per update
 
-Assume a convex neighborhood where per-update loss drop is ΔL ≈ η · g².
-Total loss drop over N wall-clock units compared to dense baseline:
+Per-update loss drop ΔL ≈ η·g² in a convex neighborhood.  Loss
+reduction per wall-clock T compared to dense:
 
-    ΔL_dense(T) = N_dense · ΔL  where N_dense = T / F_full.
-    ΔL_PFE(T)   = (1 − ρ)·N_PFE · ΔL     (pure skip)
-                = (1 − ρ) · (T / ((1 − ρ)·1.02 + ρ·0.012)·F_full) · ΔL.
+    Q(ρ) = (1 − ρ) / (1.02 − 1.008·ρ),
+    dQ/dρ = −0.012 / (1.02 − 1.008ρ)² < 0.
 
-Let Q(ρ) = (1 − ρ) / ((1 − ρ)·1.02 + ρ·0.012) = (1 − ρ) /
-(1.02 − 1.008·ρ).  Optimal ρ maximizes Q(ρ) under the constraint
-D_k ≤ D_target (drift bound).
-
-    dQ/dρ  =  [ −(1.02 − 1.008ρ) + 1.008·(1 − ρ) ] / (1.02 − 1.008ρ)²
-          =  [ −1.02 + 1.008ρ + 1.008 − 1.008ρ ] / (...)²
-          =  −0.012 / (1.02 − 1.008ρ)²  <  0.
-
-Q decreases in ρ *monotonically* — which means at identical per-step
-loss drop, skipping is never a net win in the pure-skip regime.  The
-savings are purely in the wall-clock/memory axes; **loss-per-update
-quality is strictly degraded** unless the synthesized-θ or some other
-compensatory mechanism recovers gradient signal on mirror steps.  This
-is the *critical* finding: PFE-pure-skip is a **wall-clock-vs-NLL
-trade**, never a pure speedup.
+Q decreases monotonically in ρ — **pure-skip PFE is strictly worse
+per wall-clock on loss-per-update than dense training**, unless a
+compensatory mechanism recovers gradient signal on MIR steps.
 
 ### 5.3 Synthesized-θ update shifts the curve
 
-Denote by κ ∈ [0,1] the *effective gradient quality* of an R-synthesized
-update (κ = 1 means as good as true backprop, κ = 0 means a no-op).
-Then ΔL_PFE(T) includes an extra ρ·N_PFE·κ·ΔL:
+Let κ ∈ [0,1] be the effective gradient quality of an R-synthesized
+update.  The corrected quality factor is
 
-    Q_R(ρ, κ)  =  (1 − ρ + ρ·κ) / (1.02 − 1.008·ρ).
+    Q_R(ρ, κ) = (1 − ρ + ρ·κ) / (1.02 − 1.008·ρ).
 
-    dQ_R/dρ  =  [(κ − 1)(1.02 − 1.008ρ) + 1.008(1 − ρ + ρκ)] / (...)².
+Q_R is constant in ρ iff κ ≈ 0.988; otherwise the optimum is
+bang-bang: ρ* = 0 for κ < 0.988, ρ* = 1 for κ > 0.988.  DFA (#12)
+reports 60–90% recovery on similar networks, so realistic κ ∈ [0.8,
+0.95] → ρ* = 0 is NLL-optimal.
 
-Set numerator = 0:
-    (κ − 1)(1.02) + 1.008 + ρ·[−(κ − 1)·1.008·(−1) + 1.008·(κ − 1)] = 0.
-
-After simplification (the ρ-terms cancel for linear Q_R):
-
-    Q_R is constant in ρ iff κ = 1 − 0.012/1.008 ≈ 0.988.
-
-For κ < 0.988, Q_R is decreasing in ρ → ρ* = 0 (never mirror).
-For κ > 0.988, Q_R is increasing in ρ → ρ* = 1 (always mirror).
-
-This is a **bang-bang optimum**: PFE is either a full win or a full
-loss depending on whether R can recover 98.8% of the true gradient's
-signal.  DFA experiments (#12) report 60–90% recovery on
-similar-scale networks.  The regime κ ∈ [0.8, 0.95] is realistic; in
-this regime pure-skip (ρ = 0) beats synthesized-θ per loss-per-update.
-
-**Conclusion.**  The *wall-clock-minimizing* schedule is not the
-*NLL-minimizing* schedule.  PFE should be deployed as a
-*speedup-at-some-NLL-cost* lever, with ρ chosen to match the
-operator's compute budget, **not as an always-on training replacement**.
+**Conclusion.**  The wall-clock-minimizing schedule is not the
+NLL-minimizing schedule.  PFE is a *speedup-at-NLL-cost* lever, not
+an always-on replacement.
 
 ### 5.4 Operational ρ policy
 
-Given the above analysis:
-
-- During warm-up (first ~5000 steps): ρ = 0.0 (pure dense).  Mirror is
-  too cold to be trusted.
-- After warm-up: ρ ramped from 0.0 to ρ_target over 10000 steps.  The
-  λ_d drift controller keeps D_k ≤ D_target throughout.
-- ρ_target is a budget knob, not a quality knob.  Typical values: 0.3
-  (conservative, ≈1.4× speed), 0.5 (moderate, ≈1.9× speed), 0.7
-  (aggressive, ≈3.2× speed with measurable NLL regression).
+Warm-up (~5k steps): ρ = 0.  Then ρ ramps 0 → ρ_target over 10k
+steps while λ_d holds D_k ≤ D_target.  ρ_target is a budget knob,
+not a quality knob: 0.3 (~1.4× speed), 0.5 (~1.9×), 0.7 (~3.2× with
+NLL regression).
 
 ---
 
