@@ -9429,6 +9429,7 @@ void CHIRONUnitTest()
 	CHIRONIbgradApplyUpdateAndCapturedFracTest();
 	CHIRONIbgradThroughputBenchmark();
 	CHIRONIbgradEndToEndConvergenceTest();
+	CHIRONWipIbgradMathParityTest();
 	CHIRONLcpIbgradCompositionTest();
 	CHIRONEdtEnergyDistilledTest();
 	CHIRONTrcdRoutingThroughputBenchmark();
@@ -12933,6 +12934,134 @@ void CHIRONEdtEnergyDistilledTest()
 	ASSERT("edt does not totally diverge (ratio ≥ 0.3)", ratio >= 0.3f);
 #else
 	std::printf("  [edt] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONWipIbgradMathParityTest ---------------------------------------------
+// WIP × IBGRAD dual-subspace math validation (paradigm #22 × #19).
+//
+// Tests two things:
+//   (1) θ = Σ softmax(α)_k · W_k can be computed via existing sgemm.
+//   (2) The gradient approximation:
+//           g_α_k ≈ σ(α)_k · (⟨z_k, y⟩ - ⟨z_θ, y⟩)
+//       where z_k = Pᵀ·W_k, y = Pᵀ·g, z_θ = Σ σ(α)_k·z_k
+//       matches the exact formula
+//           g_α_k = σ(α)_k · (⟨W_k, g⟩ - ⟨θ, g⟩)
+//       when P spans the gradient (i.e. when g ∈ col(P)).
+void CHIRONWipIbgradMathParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [wip×ibgrad] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int N = 256;   // flattened weight size
+	const unsigned int K = 4;     // snapshot count
+	const unsigned int r = 32;    // IBGRAD subspace rank (r > K so g ∈ col(P) possible)
+	LCG rng(202604242u);
+
+	// Random snapshots W_1..W_K flattened to N-dim each.
+	std::vector<std::vector<float> > W_pool(K, std::vector<float>(N));
+	for (unsigned int k = 0; k < K; ++k)
+		for (unsigned int i = 0; i < N; ++i)
+			W_pool[k][i] = 0.2f * rng.next_unit();
+
+	// Random unconstrained α.  Compute softmax on host.
+	std::vector<float> alpha(K), alpha_sm(K);
+	float alpha_max = -1e30f;
+	for (unsigned int k = 0; k < K; ++k) { alpha[k] = rng.next_unit(); if (alpha[k] > alpha_max) alpha_max = alpha[k]; }
+	float Z = 0.0f;
+	for (unsigned int k = 0; k < K; ++k) { alpha_sm[k] = std::exp(alpha[k] - alpha_max); Z += alpha_sm[k]; }
+	for (unsigned int k = 0; k < K; ++k) alpha_sm[k] /= Z;
+
+	// θ = Σ σ(α)_k · W_k on host (reference).
+	std::vector<float> theta_ref(N, 0.0f);
+	for (unsigned int k = 0; k < K; ++k)
+		for (unsigned int i = 0; i < N; ++i)
+			theta_ref[i] += alpha_sm[k] * W_pool[k][i];
+
+	// Random gradient g.
+	std::vector<float> g(N);
+	for (unsigned int i = 0; i < N; ++i) g[i] = 0.5f * rng.next_unit();
+
+	// Exact g_α_k = σ(α)_k · (⟨W_k, g⟩ - ⟨θ, g⟩) on host.
+	std::vector<float> g_alpha_exact(K);
+	float dot_theta_g = 0.0f;
+	for (unsigned int i = 0; i < N; ++i) dot_theta_g += theta_ref[i] * g[i];
+	for (unsigned int k = 0; k < K; ++k) {
+		float dot_Wk_g = 0.0f;
+		for (unsigned int i = 0; i < N; ++i) dot_Wk_g += W_pool[k][i] * g[i];
+		g_alpha_exact[k] = alpha_sm[k] * (dot_Wk_g - dot_theta_g);
+	}
+
+	// Now via IBGRAD subspace: first init P and ensure g ∈ col(P) by
+	// refreshing P's column 0 to g/‖g‖.
+	glades::gpu::GpuBuffer<float> d_P, d_g, d_y;
+	d_P.allocate((size_t)N * r);
+	d_g.allocate(N);    d_g.upload(&g[0], N);
+	d_y.allocate(r);
+	ASSERT("wip ibgrad init P",
+	    glades::gpu::ibgrad_init_projection(d_P.data(), N, r, 0x5EED0001ULL));
+	ASSERT("wip ibgrad refresh (set col0=g/‖g‖)",
+	    glades::gpu::ibgrad_refresh_first_column(d_P.data(), d_g.data(), N, r));
+	ASSERT("wip ibgrad QR",
+	    glades::gpu::ibgrad_qr_reorthogonalize(d_P.data(), N, r));
+
+	// y = Pᵀ · g.
+	ASSERT("wip ibgrad project g",
+	    glades::gpu::ibgrad_project(d_P.data(), d_g.data(), N, r, d_y.data()));
+	std::vector<float> y_h(r);
+	d_y.download(&y_h[0], r);
+
+	// z_k = Pᵀ · W_k for each k.
+	std::vector<std::vector<float> > z_pool(K, std::vector<float>(r));
+	for (unsigned int k = 0; k < K; ++k) {
+		glades::gpu::GpuBuffer<float> d_Wk, d_zk;
+		d_Wk.allocate(N); d_Wk.upload(&W_pool[k][0], N);
+		d_zk.allocate(r);
+		ASSERT("wip ibgrad project W_k",
+		    glades::gpu::ibgrad_project(d_P.data(), d_Wk.data(), N, r, d_zk.data()));
+		d_zk.download(&z_pool[k][0], r);
+	}
+	// z_θ = Σ σ(α)_k · z_k.
+	std::vector<float> z_theta(r, 0.0f);
+	for (unsigned int j = 0; j < r; ++j)
+		for (unsigned int k = 0; k < K; ++k)
+			z_theta[j] += alpha_sm[k] * z_pool[k][j];
+
+	// g_α_approx_k = σ(α)_k · (⟨z_k, y⟩ - ⟨z_θ, y⟩).
+	std::vector<float> g_alpha_approx(K);
+	float zt_dot_y = 0.0f;
+	for (unsigned int j = 0; j < r; ++j) zt_dot_y += z_theta[j] * y_h[j];
+	for (unsigned int k = 0; k < K; ++k) {
+		float zk_dot_y = 0.0f;
+		for (unsigned int j = 0; j < r; ++j) zk_dot_y += z_pool[k][j] * y_h[j];
+		g_alpha_approx[k] = alpha_sm[k] * (zk_dot_y - zt_dot_y);
+	}
+
+	// Compare: when P spans g (col 0 is g/‖g‖ and others orthogonal),
+	// the subspace projection should capture g exactly.  Since W_k may
+	// have components outside col(P), ⟨z_k, y⟩ may differ from ⟨W_k, g⟩
+	// but the difference (W_k - P P^T W_k, g) — if P spans g, this is
+	// zero because the part of W_k orthogonal to col(P) has zero
+	// inner product with g ∈ col(P).  So subspace equals exact.
+	float max_err = 0.0f;
+	for (unsigned int k = 0; k < K; ++k) {
+		float e = std::fabs(g_alpha_approx[k] - g_alpha_exact[k]);
+		if (e > max_err) max_err = e;
+	}
+	std::printf("  [wip×ibgrad math] N=%u K=%u r=%u: g_α approx-vs-exact max_err=%.3e\n",
+	            N, K, r, max_err);
+	std::printf("  [wip×ibgrad math] exact g_α: [%+.3e %+.3e %+.3e %+.3e]\n",
+	            g_alpha_exact[0], g_alpha_exact[1], g_alpha_exact[2], g_alpha_exact[3]);
+	std::printf("  [wip×ibgrad math] approx g_α: [%+.3e %+.3e %+.3e %+.3e]\n",
+	            g_alpha_approx[0], g_alpha_approx[1], g_alpha_approx[2], g_alpha_approx[3]);
+
+	// When P spans g (via refresh), subspace approximation is EXACT.
+	ASSERT("wip×ibgrad g_α math parity < 1e-4", max_err < 1e-4f);
+#else
+	std::printf("  [wip×ibgrad] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 

@@ -67,6 +67,7 @@ void CHIRONIbgradQrReorthogonalizeTest();
 void CHIRONIbgradApplyUpdateAndCapturedFracTest();
 void CHIRONIbgradThroughputBenchmark();
 void CHIRONIbgradEndToEndConvergenceTest();
+void CHIRONWipIbgradMathParityTest();
 void CHIRONLcpIbgradCompositionTest();
 void CHIRONEdtEnergyDistilledTest();
 void CHIRONTrcdRoutingThroughputBenchmark();
