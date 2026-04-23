@@ -121,6 +121,25 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.4 Compound-ablation confirmation at 66M/2500 (2026-04-23)
+
+The iteration-74 ablation was done at 500 steps.  Confirming at 2500
+steps, same seed, same data:
+
+  Config              EMA@2500    Δ vs dense
+  Dense Adam          8.8050      —
+  --face 1 only       8.3805      −0.425 nat
+  3-shift compound    8.3786      −0.427 nat
+
+Compound matches FACE-alone to within 0.002 nat.  The iteration-74
+finding (FACE is sole convergence driver) HOLDS at long horizon:
+
+  Memory-only shifts:    MFIO-attn, WIP-Wo
+    Contribution: 600× attn+embed Adam state compression, 0.0 nat.
+  Convergence shift:     FACE
+    Contribution: 1008× embed Adam state compression, 0.4+ nat.
+  Flagship = memory × convergence, multiplicatively stackable.
+
 ### 3.3 Throughput
 
 Identical to dense Adam at every tested scale:
