@@ -9426,6 +9426,7 @@ void CHIRONUnitTest()
 	CHIRONLcpRoutingThroughputBenchmark();
 	CHIRONIbgradProjectUnprojectParityTest();
 	CHIRONIbgradQrReorthogonalizeTest();
+	CHIRONIbgradApplyUpdateAndCapturedFracTest();
 	CHIRONIbgradThroughputBenchmark();
 	CHIRONIbgradEndToEndConvergenceTest();
 	CHIRONLcpIbgradCompositionTest();
@@ -12258,6 +12259,73 @@ void CHIRONIbgradQrReorthogonalizeTest()
 	ASSERT("ibgrad qr column-space preserved < 1e-3", rank_err < 1e-3f);
 #else
 	std::printf("  [ibgrad qr] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONIbgradApplyUpdateAndCapturedFracTest --------------------------------
+// Phase 5A primitives: ibgrad_apply_update + ibgrad_captured_fraction.
+void CHIRONIbgradApplyUpdateAndCapturedFracTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [ibgrad phase5a] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int N = 256;
+	const unsigned int r = 16;
+	LCG rng(202604241u);
+
+	// apply_update: θ += α · update
+	{
+		std::vector<float> theta_h(N), update_h(N);
+		for (unsigned int i = 0; i < N; ++i) theta_h[i]  = 0.3f * rng.next_unit();
+		for (unsigned int i = 0; i < N; ++i) update_h[i] = 0.4f * rng.next_unit();
+		const float alpha = -0.7f;
+		std::vector<float> ref(N);
+		for (unsigned int i = 0; i < N; ++i) ref[i] = theta_h[i] + alpha * update_h[i];
+
+		glades::gpu::GpuBuffer<float> d_theta, d_update;
+		d_theta.allocate(N);   d_theta.upload(&theta_h[0], N);
+		d_update.allocate(N);  d_update.upload(&update_h[0], N);
+		ASSERT("ibgrad_apply_update",
+		    glades::gpu::ibgrad_apply_update(d_theta.data(), d_update.data(), alpha, N));
+		std::vector<float> theta_gpu(N);
+		d_theta.download(&theta_gpu[0], N);
+		float max_err = 0.0f;
+		for (unsigned int i = 0; i < N; ++i) {
+			float e = std::fabs(theta_gpu[i] - ref[i]);
+			if (e > max_err) max_err = e;
+		}
+		std::printf("  [ibgrad apply_update] N=%u α=%.2f max_err=%.3e\n", N, alpha, max_err);
+		ASSERT("ibgrad_apply_update < 1e-5", max_err < 1e-5f);
+	}
+
+	// captured_fraction: ‖P^T g‖² / ‖g‖².  Construct P with FIRST column
+	// = g/‖g‖ so captured_frac should be ≈ 1.0.
+	{
+		std::vector<float> g_h(N);
+		for (unsigned int i = 0; i < N; ++i) g_h[i] = 0.5f * rng.next_unit();
+		float g_norm_sq = 0.0f;
+		for (unsigned int i = 0; i < N; ++i) g_norm_sq += g_h[i] * g_h[i];
+		const float g_norm = std::sqrt(g_norm_sq);
+
+		// P's first column = g/‖g‖; rest = 0.
+		std::vector<float> P_h((size_t)N * r, 0.0f);
+		for (unsigned int i = 0; i < N; ++i) P_h[(size_t)i * r + 0] = g_h[i] / g_norm;
+		glades::gpu::GpuBuffer<float> d_P, d_g, d_frac;
+		d_P.allocate((size_t)N * r);  d_P.upload(&P_h[0], P_h.size());
+		d_g.allocate(N);              d_g.upload(&g_h[0], N);
+		d_frac.allocate(1);
+		ASSERT("ibgrad_captured_fraction",
+		    glades::gpu::ibgrad_captured_fraction(d_P.data(), d_g.data(), N, r, d_frac.data()));
+		float frac = 0.0f;
+		d_frac.download(&frac, 1);
+		std::printf("  [ibgrad captured_fraction] P col-0 = g/‖g‖: frac=%.6f (expected ~1.0)\n", frac);
+		ASSERT("captured_fraction = 1.0 when P spans g", frac >= 0.98f);
+	}
+#else
+	std::printf("  [ibgrad phase5a] GLADES_HAVE_CUDA not defined — skipped\n");
 #endif
 }
 
