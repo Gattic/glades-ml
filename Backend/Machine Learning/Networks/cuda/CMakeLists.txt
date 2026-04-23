@@ -25,6 +25,7 @@ set(GLADES_CUDA_SOURCES
 	gpu_ibgrad.cu
 	gpu_atcd.cu
 	gpu_csp.cu
+	gpu_face.cu
 	gpu_transformer_state.cu
 	gpu_dff_state.cu
 	gpu_rnn_state.cu

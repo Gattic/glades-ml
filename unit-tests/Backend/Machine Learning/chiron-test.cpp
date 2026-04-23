@@ -37,6 +37,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_ibgrad.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_atcd.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_csp.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_face.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -9465,6 +9466,90 @@ void CHIRONAtcdFullE2ETest()
 #endif
 }
 
+// CHIRONFaceSparseStatsParityTest -------------------------------------------
+// Phase 1 validation of paradigm shift #28 (FACE).  Given a sparse-per-row
+// gradient g [V × m] where only a fraction of rows are nonzero, the
+// face_compute_sparse_stats primitive should produce:
+//   zn[i]    = ‖g[i, :]‖²            (V values; 0 for inactive rows)
+//   dn_raw[j]= Σ_i g[i, j]²           (m values)
+//   q        = count of active rows
+//   gF       = ‖g‖_F²
+// Construct g with a known 25% sparsity pattern; compare to host reference.
+void CHIRONFaceSparseStatsParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [face stats parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int V = 128, m = 32;
+	const int ACTIVE_EVERY = 4;  // 25% of rows active
+	LCG rng(202605200u);
+
+	// Build g: every 4th row is active, all others are zero.
+	std::vector<float> g_h((size_t)V * m, 0.0f);
+	int q_ref = 0;
+	for (unsigned int i = 0; i < V; ++i) {
+		if ((int)i % ACTIVE_EVERY == 0) {
+			++q_ref;
+			for (unsigned int j = 0; j < m; ++j)
+				g_h[(size_t)i * m + j] = 0.3f * rng.next_unit();
+		}
+	}
+
+	// Host reference stats.
+	std::vector<float> zn_ref(V, 0.0f), dn_ref(m, 0.0f);
+	float gF_ref = 0.0f;
+	for (unsigned int i = 0; i < V; ++i) {
+		float rs = 0.0f;
+		for (unsigned int j = 0; j < m; ++j) {
+			const float v = g_h[(size_t)i * m + j];
+			rs += v * v;
+			dn_ref[j] += v * v;
+		}
+		zn_ref[i] = rs;
+		gF_ref += rs;
+	}
+
+	glades::gpu::GpuBuffer<float> d_g, d_zn, d_dn, d_q, d_gF;
+	d_g.allocate(g_h.size());  d_g.upload(&g_h[0], g_h.size());
+	d_zn.allocate(V);
+	d_dn.allocate(m);
+	d_q.allocate(1);
+	d_gF.allocate(1);
+
+	const bool ok = glades::gpu::face_compute_sparse_stats(
+	    d_g.data(), V, m, d_zn.data(), d_dn.data(), d_q.data(), d_gF.data());
+	ASSERT("face_compute_sparse_stats returns true", ok);
+
+	std::vector<float> zn_gpu(V), dn_gpu(m);
+	float q_gpu = 0.0f, gF_gpu = 0.0f;
+	d_zn.download(&zn_gpu[0], V);
+	d_dn.download(&dn_gpu[0], m);
+	d_q.download(&q_gpu, 1);
+	d_gF.download(&gF_gpu, 1);
+
+	float err_zn = 0.0f, err_dn = 0.0f;
+	for (unsigned int i = 0; i < V; ++i)
+		err_zn = std::max(err_zn, std::fabs(zn_gpu[i] - zn_ref[i]));
+	for (unsigned int j = 0; j < m; ++j)
+		err_dn = std::max(err_dn, std::fabs(dn_gpu[j] - dn_ref[j]));
+	const float err_gF = std::fabs(gF_gpu - gF_ref);
+	const float err_q  = std::fabs(q_gpu - (float)q_ref);
+
+	std::printf("  [face stats parity] V=%u m=%u active=%d q_gpu=%.0f q_ref=%d "
+	            "err_zn=%.3e err_dn=%.3e err_gF=%.3e err_q=%.1f\n",
+	            V, m, q_ref, q_gpu, q_ref, err_zn, err_dn, err_gF, err_q);
+	ASSERT("face zn parity < 1e-4", err_zn < 1e-4f);
+	ASSERT("face dn parity < 1e-4", err_dn < 1e-4f);
+	ASSERT("face gF parity < 1e-3", err_gF < 1e-3f);
+	ASSERT("face q count exact",    err_q < 0.5f);
+#else
+	std::printf("  [face stats parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -10701,6 +10786,7 @@ void CHIRONUnitTest()
 	CHIRONCspDenseReductionParityTest();
 	CHIRONCspResidualForwardTest();
 	CHIRONCspBenchmarkTest();
+	CHIRONFaceSparseStatsParityTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();
