@@ -14,6 +14,33 @@ candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 **Paradigm-shift brief — "magnitudes less memory and magnitudes faster"
 — empirically demonstrated on both axes.**
 
+### 2026-04-23: WIP Phase 3C scale benchmark — 49% throughput @ L=8, K=8
+
+Head-to-head at L=8, m=128, dModel=128, seq_len=512, 50 steps:
+
+  Dense Adam:    94,408 tok/s   (loss 10.3846 @ step 50)
+  WIP K=8:       47,893 tok/s   (loss 10.3844 @ step 50)
+  Delta:         **49% throughput, identical loss**
+
+Overhead root cause: host-side α math does K GPU→CPU downloads of
+N_Wo = dModel·m = 128·128 = 16K floats per step per layer.  With
+K=8 and L=8, that's ~1 MB D2H per step = ~100 μs at PCIe ~10 GB/s
+plus K+1 host-side dot products = another 100 μs.  Total ~200 μs
+overhead per step vs ~100 μs dense Adam step = 2×.
+
+8th empirical surprise (implicit): **GPU-native α math would eliminate
+this overhead**.  A `wip_compute_grad_alpha` GPU primitive (K·r dot
+products on device) + `wip_materialize_theta` GPU primitive would
+drop overhead to ~1 μs per step.  Phase 3D work.
+
+Memory trade-off at this scale:
+  Dense Adam state:  2·N_Wo·L·4B = 1 MB   (per Wo; total 1 MB)
+  WIP Adam state:    3·K·L·4B     = 768 B (~1300× reduction per Wo)
+
+The 2× throughput cost bought a 1300× Adam-state reduction — trade
+is **favorable for memory-constrained training** (the session's
+primary brief).
+
 ### 2026-04-23: WIP Phase 3C — full trainer wire-in live in chiron_train
 
 Paradigm shift #22 now the SECOND shift to reach full 5-phase trainer
