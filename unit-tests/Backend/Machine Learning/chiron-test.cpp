@@ -38,6 +38,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_atcd.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_csp.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_face.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_sparec.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -9769,6 +9770,151 @@ void CHIRONFaceEmaTrajectoryParityTest()
 #endif
 }
 
+// CHIRONSparecMaskParityTest ------------------------------------------------
+// Phase 1a validation of paradigm shift #35 (SPAREC).  Given a random
+// σ'_cache tensor [T × d_ff] and a threshold τ, sparec_compute_active_mask
+// should produce (mask_packed, active_idx, k_per_tok, ρ_observed) matching
+// host reference.
+void CHIRONSparecMaskParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [sparec mask parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 16, d_ff = 256;
+	const float tau = 0.1f;
+	LCG rng(202604240u);
+
+	// Build a σ'_cache with a mix of above- and below-threshold values
+	// simulating post-GELU derivative distribution.
+	std::vector<float> sp_h((size_t)T * d_ff);
+	for (size_t i = 0; i < sp_h.size(); ++i) {
+		// 40% of entries in [-0.5, -0.05] (small magnitude, below τ=0.1)
+		// 60% of entries in [0.1, 1.0] (above τ)
+		const float u = rng.next_unit();
+		sp_h[i] = (u < 0.4f) ? -0.05f - 0.4f * rng.next_unit()
+		                      : 0.1f + 0.9f * rng.next_unit();
+	}
+
+	// Host reference.
+	const unsigned int words_per_tok = (d_ff + 31u) / 32u;
+	std::vector<unsigned int> mask_ref((size_t)T * words_per_tok, 0u);
+	std::vector<unsigned int> idx_ref((size_t)T * d_ff, 0u);
+	std::vector<unsigned int> k_ref(T, 0u);
+	unsigned int total_active_ref = 0;
+	for (unsigned int t = 0; t < T; ++t) {
+		unsigned int w = 0;
+		for (unsigned int i = 0; i < d_ff; ++i) {
+			if (std::fabs(sp_h[(size_t)t * d_ff + i]) > tau) {
+				mask_ref[(size_t)t * words_per_tok + (i >> 5)] |= (1u << (i & 31));
+				idx_ref[(size_t)t * d_ff + w++] = i;
+			}
+		}
+		k_ref[t] = w;
+		total_active_ref += w;
+	}
+	const float rho_ref = 1.0f - (float)total_active_ref / ((float)T * (float)d_ff);
+
+	// GPU path.
+	glades::gpu::GpuBuffer<float> d_sp;
+	glades::gpu::GpuBuffer<unsigned int> d_mask, d_idx, d_k;
+	glades::gpu::GpuBuffer<float> d_rho;
+	d_sp.allocate(sp_h.size());     d_sp.upload(&sp_h[0], sp_h.size());
+	d_mask.allocate((size_t)T * words_per_tok);
+	d_idx.allocate((size_t)T * d_ff);
+	d_k.allocate(T);
+	d_rho.allocate(1);
+
+	const bool ok = glades::gpu::sparec_compute_active_mask(
+	    d_sp.data(), T, d_ff, tau,
+	    d_mask.data(), d_idx.data(), d_k.data(), d_rho.data());
+	ASSERT("sparec_compute_active_mask returns true", ok);
+
+	std::vector<unsigned int> mask_gpu((size_t)T * words_per_tok),
+	                          idx_gpu((size_t)T * d_ff), k_gpu(T);
+	float rho_gpu = 0.0f;
+	d_mask.download(&mask_gpu[0], mask_gpu.size());
+	d_idx.download(&idx_gpu[0],   idx_gpu.size());
+	d_k.download(&k_gpu[0],       T);
+	d_rho.download(&rho_gpu, 1);
+
+	// Compare.
+	unsigned int err_mask = 0, err_idx = 0, err_k = 0;
+	for (size_t i = 0; i < mask_gpu.size(); ++i)
+		if (mask_gpu[i] != mask_ref[i]) ++err_mask;
+	for (unsigned int t = 0; t < T; ++t) {
+		if (k_gpu[t] != k_ref[t]) ++err_k;
+		for (unsigned int j = 0; j < k_ref[t]; ++j) {
+			if (idx_gpu[(size_t)t * d_ff + j] != idx_ref[(size_t)t * d_ff + j])
+				++err_idx;
+		}
+	}
+	const float err_rho = std::fabs(rho_gpu - rho_ref);
+
+	std::printf("  [sparec mask parity] T=%u d_ff=%u τ=%.2f ρ_ref=%.3f ρ_gpu=%.3f "
+	            "err_mask=%u err_idx=%u err_k=%u err_rho=%.2e\n",
+	            T, d_ff, tau, rho_ref, rho_gpu, err_mask, err_idx, err_k, err_rho);
+	ASSERT("sparec mask bits exact",       err_mask == 0);
+	ASSERT("sparec active_idx exact",      err_idx == 0);
+	ASSERT("sparec k_per_tok exact",       err_k == 0);
+	ASSERT("sparec rho_observed < 1e-6",   err_rho < 1e-6f);
+#else
+	std::printf("  [sparec mask parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
+// CHIRONSparecThresholdControllerTest ---------------------------------------
+// Phase 1a validation of the integral controller on τ.  Start with τ=0.01,
+// rho_ema=0, rho_target=0.80, drive 20 steps with rho_new=0.80 fixed.  τ
+// should stay near its initial value (zero integral error).  Then drive 20
+// steps with rho_new=0.50; τ should increase to tighten sparsity.
+void CHIRONSparecThresholdControllerTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [sparec threshold] no CUDA device — skipped\n");
+		return;
+	}
+	const float rho_target = 0.80f, eta_tau = 0.05f;
+	const float tau_min = 1e-4f, tau_max = 0.5f, beta_rho = 0.9f;
+
+	glades::gpu::GpuBuffer<float> d_tau, d_rho_ema, d_rho_new;
+	d_tau.allocate(1);      { float v = 0.01f; d_tau.upload(&v, 1); }
+	d_rho_ema.allocate(1);  { float v = 0.0f;  d_rho_ema.upload(&v, 1); }
+	d_rho_new.allocate(1);
+
+	// Phase 1: feed rho_new = 0.80 × 20 steps.  Expect τ to stabilize near 0.01.
+	for (int s = 0; s < 20; ++s) {
+		float v = 0.80f; d_rho_new.upload(&v, 1);
+		glades::gpu::sparec_update_threshold(
+		    d_tau.data(), d_rho_ema.data(), d_rho_new.data(),
+		    rho_target, eta_tau, tau_min, tau_max, beta_rho);
+	}
+	float tau_phase1 = 0.0f; d_tau.download(&tau_phase1, 1);
+
+	// Phase 2: feed rho_new = 0.50 (undersparse) × 20 steps.  τ should rise.
+	for (int s = 0; s < 20; ++s) {
+		float v = 0.50f; d_rho_new.upload(&v, 1);
+		glades::gpu::sparec_update_threshold(
+		    d_tau.data(), d_rho_ema.data(), d_rho_new.data(),
+		    rho_target, eta_tau, tau_min, tau_max, beta_rho);
+	}
+	float tau_phase2 = 0.0f; d_tau.download(&tau_phase2, 1);
+
+	std::printf("  [sparec threshold] τ_phase1=%.5f (init 0.01, expected ~0.01) "
+	            "τ_phase2=%.5f (expected > τ_phase1)\n",
+	            tau_phase1, tau_phase2);
+	ASSERT("τ stable when ρ matches target", std::fabs(tau_phase1 - 0.01f) < 0.005f);
+	ASSERT("τ rises when ρ below target",    tau_phase2 > tau_phase1);
+	ASSERT("τ stays within clip bounds",     tau_phase2 <= tau_max);
+#else
+	std::printf("  [sparec threshold] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -11008,6 +11154,8 @@ void CHIRONUnitTest()
 	CHIRONFaceSparseStatsParityTest();
 	CHIRONFaceApplyUpdateParityTest();
 	CHIRONFaceEmaTrajectoryParityTest();
+	CHIRONSparecMaskParityTest();
+	CHIRONSparecThresholdControllerTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();

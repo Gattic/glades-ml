@@ -57,7 +57,8 @@ __global__ void k_sparec_mask_token(const float* __restrict__ sigma_prime_cache,
 		if (tid < off) smem[tid] += smem[tid + off];
 		__syncthreads();
 	}
-	const unsigned int k_t = smem[0];
+	(void)smem;  // k_t = smem[0] (block-reduced active count, unused since
+	             // thread-0 writes serially below and also writes k_per_tok[t]).
 	__syncthreads();
 
 	// Pass 2: write mask bits and active indices with scan-based output.
