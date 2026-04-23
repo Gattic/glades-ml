@@ -198,7 +198,32 @@ curve unclear.
 
 ---
 
-### #34 candidate: ZEN — zero-overhead embedding normalization
+### #34 — ZEN (multi-rank FACE): DEPRIORITIZED by β sensitivity sweep (2026-04-23)
+
+Iteration 87 ran a β_col sweep BEFORE implementing ZEN.  The hypothesis
+was that multi-timescale EMA would help by capturing both fast and
+slow gradient dynamics.  Test: run FACE at β_col ∈ {0.90, 0.95, 0.99}
+for 500 steps at 66M.
+
+Result: ALL three β values produce nearly identical convergence:
+
+  β_col    EMA@250   EMA@500
+  0.90     8.4316    9.2529
+  0.95     8.4229    9.2628   (production default)
+  0.99     8.3997    9.2525
+
+Within 0.02 nat across a 10× range of timescale — FACE is empirically
+INSENSITIVE to β_col.  This pre-rejects the multi-timescale ZEN
+motivation: a single well-chosen β already captures the near-optimum.
+
+**Status**: DEPRIORITIZED.  ZEN implementation deferred indefinitely;
+would require a genuinely novel mechanism (not just dual-timescale)
+to move the needle.
+
+Saved ~1 iteration of ZEN implementation by running this
+hypothesis-probe first — a methodology win.
+
+### #34 candidate: ZEN — zero-overhead embedding normalization (ORIGINAL DESIGN)
 
 **Observation**: FACE achieves 1008× memory compression and 0.81 nat
 convergence gain.  Can we push further with MORE complex preconditioners
