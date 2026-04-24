@@ -333,6 +333,38 @@ measurable property of trained attention (Gini of per-position popularity).
 - Unit test `CHIRONKvfaceProbeParityTest` validates kernel bit-parity
   against host reference (pop_err 2.98e-07, gini_err 2.98e-08) and
   confirms Zipf vs uniform-causal separation.
+- `chiron_train --probe-attn-gini` flag: measures last-layer Gini
+  every `--log-every` steps, logs mean/min/max per nHeads.
+
+**Preliminary Gate-0 result (iter 121):**
+41M × 2500 steps, T=1024, L=12, nH=8, tiled attention:
+
+| Step | Loss (EMA) | Gini mean | Gini min | Gini max | Valid |
+|-----:|:----------:|:---------:|:--------:|:--------:|:-----:|
+|    0 | 10.400     | 0.4995    | 0.4994   | 0.4998   | 8/8   |
+|  250 | 9.712      | 0.4995    | 0.4995   | 0.4995   | 8/8   |
+|  500 | 9.550      | 0.4995    | 0.4995   | 0.4995   | 8/8   |
+| 1000 | 9.252      | 0.4995    | 0.4995   | 0.4995   | 8/8   |
+| 2500 | 8.775      | 0.4995    | 0.4995   | 0.4996   | 8/8   |
+
+**Interpretation.** The LAST layer's per-head Gini stays identically
+at the causal-mask baseline (0.4995) over a 1.6-nat loss improvement.
+This is a MARGINAL Gate-0 result:
+- Memory compression mechanism: triggered (any G > 0 suffices) ✓
+- Convergence mechanism: premise not validated — learned Zipfian
+  attention does NOT emerge at this scale in the LAST layer ✗
+
+**Caveats.** (1) Only the last layer probed. Induction heads
+typically emerge in EARLIER/MIDDLE layers; a per-layer probe may
+reveal heterogeneous structure. (2) 41M is small. At 500M+ scale
+the last-layer attention may develop richer structure. (3) 2500 steps
+is short-horizon; long-horizon 10k+ steps may show divergence.
+
+**Revised path forward.** Expand the probe to measure ALL layers
+(not just last). If any layer shows G > 0.55, KV-FACE's convergence
+premise holds for at least that layer. If all layers stay at 0.500,
+pursue the memory-only variant of KV-FACE (compression without
+convergence claim).
 
 If passed Gate-0, 3-gate validation follows:
 1. Primitive parity (≤ 1e-4 error vs host)
