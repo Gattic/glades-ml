@@ -6,6 +6,7 @@
 
 #include "gpu_sparec.h"
 #include "gpu_device.h"
+#include "gpu_blas.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -189,11 +190,10 @@ bool sparec_update_threshold(float* tau,
 }
 
 // ========================================================================
-// Phase 1b stub: sparec_backward_gathered returns false for now.  Phase 2
-// will implement the gather + cuBLAS SGEMM path.  For Phase 1a the trainer
-// should route FFN backward through the existing dense path when SPAREC
-// is active — this lets the mask kernel run, τ controller tune, and
-// sparsity stats accumulate, WITHOUT the gathered-sparse GEMM speedup.
+// Phase 2 stub: sparec_backward_gathered returns false for now.  The
+// gather + compacted-SGEMM path that actually delivers the 3-5× backward
+// FLOP reduction will go here.  Phase 1b (below) uses the masked-dense
+// path which is correct but gives no speedup.
 // ========================================================================
 bool sparec_backward_gathered(const float* grad_sigma,
                               const float* sigma_prime_cache,
@@ -210,9 +210,84 @@ bool sparec_backward_gathered(const float* grad_sigma,
 	(void)active_idx; (void)k_per_tok;
 	(void)T; (void)d_ff; (void)d_model;
 	(void)grad_W_up; (void)grad_h_in;
-	// Phase 1a: not implemented.  Returns false so trainer falls back to
-	// dense backward — correctness preserved, speedup deferred to Phase 2.
+	// Phase 2: not implemented.
 	return false;
+}
+
+// ========================================================================
+// k_sparec_apply_mask_to_grad: elementwise
+//     grad_x[t,i] = mask[t,i] ? (σ'_cache[t,i] * grad_sigma[t,i]) : 0
+// Mask is stored as packed bits: mask[t,i] = (mask_packed[t*words + (i>>5)] >> (i & 31)) & 1.
+// ========================================================================
+__global__ void k_sparec_apply_mask_to_grad(const float* __restrict__ grad_sigma,
+                                            const float* __restrict__ sigma_prime,
+                                            const unsigned int* __restrict__ mask_packed,
+                                            unsigned int T, unsigned int d_ff,
+                                            float* __restrict__ grad_x_out)
+{
+	const unsigned int t = blockIdx.y;
+	const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T || i >= d_ff) return;
+
+	const unsigned int words_per_tok = (d_ff + 31u) / 32u;
+	const unsigned int w = i >> 5;
+	const unsigned int b = i & 31u;
+	const unsigned int bit = (mask_packed[(size_t)t * words_per_tok + w] >> b) & 1u;
+
+	const size_t off = (size_t)t * d_ff + i;
+	grad_x_out[off] = bit ? (sigma_prime[off] * grad_sigma[off]) : 0.0f;
+}
+
+bool sparec_backward_masked(const float* grad_sigma,
+                            const float* sigma_prime_cache,
+                            const unsigned int* mask_packed,
+                            const float* h_in,
+                            const float* W_up,
+                            unsigned int T, unsigned int d_ff,
+                            unsigned int d_model,
+                            float* grad_x_scratch,
+                            float* grad_W_up,
+                            float* grad_h_in)
+{
+	if (!grad_sigma || !sigma_prime_cache || !mask_packed || !h_in || !W_up
+	    || !grad_x_scratch || !grad_W_up || !grad_h_in) return false;
+	if (T == 0 || d_ff == 0 || d_model == 0) return false;
+
+	// Step 1: build grad_x = mask · σ' · grad_σ.
+	const unsigned int block = 256;
+	const dim3 grid((d_ff + block - 1) / block, T);
+	k_sparec_apply_mask_to_grad<<<grid, block, 0, computeStream()>>>(
+	    grad_sigma, sigma_prime_cache, mask_packed, T, d_ff, grad_x_scratch);
+
+	// Step 2: grad_W_up[d_ff × d_model] += grad_x_scratch^T[d_ff × T] @ h_in[T × d_model]
+	// sgemm_rowmajor_atb: M=d_ff, N=d_model, K=T.
+	//   A stored as [K × M] row-major = [T × d_ff] → grad_x_scratch, lda=d_ff.
+	//   B as [K × N] row-major = [T × d_model] → h_in, ldb=d_model.
+	//   C = [M × N] = [d_ff × d_model] → grad_W_up, ldc=d_model.
+	if (!sgemm_rowmajor_atb((int)d_ff, (int)d_model, (int)T,
+	                        1.0f,
+	                        grad_x_scratch, (int)d_ff,
+	                        h_in, (int)d_model,
+	                        1.0f,
+	                        grad_W_up, (int)d_model)) return false;
+
+	// Step 3: grad_h_in[T × d_model] = grad_x_scratch[T × d_ff] @ W_up[d_ff × d_model]
+	// sgemm_rowmajor: M=T, N=d_model, K=d_ff.
+	if (!sgemm_rowmajor((int)T, (int)d_model, (int)d_ff,
+	                    1.0f,
+	                    grad_x_scratch, (int)d_ff,
+	                    W_up, (int)d_model,
+	                    0.0f,
+	                    grad_h_in, (int)d_model)) return false;
+
+	cudaStreamSynchronize(computeStream());
+	const cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		std::printf("[sparec] backward_masked CUDA error: %s\n",
+		            cudaGetErrorString(err));
+		return false;
+	}
+	return true;
 }
 
 // ========================================================================

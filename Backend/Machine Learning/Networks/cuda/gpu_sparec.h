@@ -136,6 +136,46 @@ bool sparec_backward_gathered(const float* grad_sigma,
                               float* grad_h_in);
 
 // ========================================================================
+// sparec_backward_masked — masked-dense backward (Phase 1b default).
+//
+// Correctness-first implementation: computes grad_x = mask · σ'(x) · grad_σ
+// elementwise, then runs the two standard dense SGEMMs on it.  Rows and
+// columns with mask=0 contribute exactly zero to the output but are still
+// multiplied through the GEMM (no FLOP savings).  Serves as the parity
+// baseline for the gathered-sparse path that will ship in Phase 2.
+//
+// At τ=1e-6 (mask ≈ all-ones for any σ'-magnitude > 1e-6) this is the
+// exact dense backward, suitable for parity validation.
+//
+// Inputs:
+//   grad_sigma         [T × d_ff]   ∂L/∂σ(x), upstream dense
+//   sigma_prime_cache  [T × d_ff]   σ'(x) from forward
+//   mask_packed        [T × ⌈d_ff/32⌉]   packed bits from sparec_compute_active_mask
+//   h_in               [T × d_model]
+//   W_up               [d_ff × d_model]
+//   T, d_ff, d_model                dims
+// Scratch:
+//   grad_x_scratch     [T × d_ff]   workspace for mask · σ' · grad_σ
+// Output / in-out:
+//   grad_W_up          [d_ff × d_model]   accumulated (beta=1)
+//   grad_h_in          [T × d_model]      written (beta=0)
+//
+// Cost: O(T·d_ff) mask kernel + 2 × O(T·d_ff·d_model) SGEMMs.  Same FLOP
+// count as dense; no speedup.  Phase 2 replaces this with gathered-SGEMM
+// for actual 3-5× backward FLOP reduction.
+// ========================================================================
+bool sparec_backward_masked(const float* grad_sigma,
+                            const float* sigma_prime_cache,
+                            const unsigned int* mask_packed,
+                            const float* h_in,
+                            const float* W_up,
+                            unsigned int T, unsigned int d_ff,
+                            unsigned int d_model,
+                            float* grad_x_scratch,
+                            float* grad_W_up,
+                            float* grad_h_in);
+
+// ========================================================================
 // sparec_backward_dense_reference — host-side reference implementation
 // of the dense backward (τ=0 equivalent) for parity tests.  Not called
 // during training; exists only so the unit test can compare
@@ -166,6 +206,11 @@ inline bool sparec_backward_gathered(const float*, const float*, const float*,
                                      const unsigned int*,
                                      unsigned int, unsigned int, unsigned int,
                                      float*, float*) { return false; }
+inline bool sparec_backward_masked(const float*, const float*,
+                                   const unsigned int*,
+                                   const float*, const float*,
+                                   unsigned int, unsigned int, unsigned int,
+                                   float*, float*, float*) { return false; }
 
 #endif // GLADES_HAVE_CUDA
 

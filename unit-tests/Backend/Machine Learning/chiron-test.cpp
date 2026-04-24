@@ -9865,6 +9865,98 @@ void CHIRONSparecMaskParityTest()
 #endif
 }
 
+// CHIRONSparecBackwardMaskedParityTest --------------------------------------
+// Phase 1b validation: at τ=1e-6 (mask ≈ all-ones for typical σ'), the
+// masked-dense backward must match the exact dense FFN backward within
+// 1e-4 max abs diff.  Tests both grad_W_up and grad_h_in outputs.
+void CHIRONSparecBackwardMaskedParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [sparec backward masked] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int T = 8, d_model = 32, d_ff = 128;
+	const float tau = 1e-6f;
+	LCG rng(202604250u);
+
+	// Random grad_sigma, sigma_prime (all above 1e-4 → all active at τ=1e-6),
+	// h_in, W_up.
+	std::vector<float> gs_h((size_t)T * d_ff);
+	std::vector<float> sp_h((size_t)T * d_ff);
+	std::vector<float> hi_h((size_t)T * d_model);
+	std::vector<float> wu_h((size_t)d_ff * d_model);
+	for (size_t i = 0; i < gs_h.size(); ++i) gs_h[i] = 0.3f * rng.next_unit();
+	for (size_t i = 0; i < sp_h.size(); ++i) sp_h[i] = 0.1f + 0.8f * rng.next_unit();
+	for (size_t i = 0; i < hi_h.size(); ++i) hi_h[i] = 0.4f * rng.next_unit();
+	for (size_t i = 0; i < wu_h.size(); ++i) wu_h[i] = 0.2f * rng.next_unit();
+
+	// Host reference (dense backward).
+	std::vector<float> gW_ref((size_t)d_ff * d_model, 0.0f);
+	std::vector<float> gh_ref((size_t)T * d_model, 0.0f);
+	glades::gpu::sparec_backward_dense_reference_cpu(
+	    &gs_h[0], &sp_h[0], &hi_h[0], &wu_h[0],
+	    T, d_ff, d_model, &gW_ref[0], &gh_ref[0]);
+
+	// GPU path: compute mask with τ=1e-6, then run backward_masked.
+	glades::gpu::GpuBuffer<float> d_gs, d_sp, d_hi, d_wu, d_gx_scratch, d_gW, d_gh;
+	glades::gpu::GpuBuffer<unsigned int> d_mask, d_idx, d_k;
+	glades::gpu::GpuBuffer<float> d_rho;
+	const unsigned int words_per_tok = (d_ff + 31u) / 32u;
+	d_gs.allocate(gs_h.size());   d_gs.upload(&gs_h[0], gs_h.size());
+	d_sp.allocate(sp_h.size());   d_sp.upload(&sp_h[0], sp_h.size());
+	d_hi.allocate(hi_h.size());   d_hi.upload(&hi_h[0], hi_h.size());
+	d_wu.allocate(wu_h.size());   d_wu.upload(&wu_h[0], wu_h.size());
+	d_gx_scratch.allocate((size_t)T * d_ff);
+	d_gW.allocate((size_t)d_ff * d_model);
+	{ std::vector<float> zeros_gW((size_t)d_ff * d_model, 0.0f);
+	  d_gW.upload(&zeros_gW[0], zeros_gW.size()); }
+	d_gh.allocate((size_t)T * d_model);
+	d_mask.allocate((size_t)T * words_per_tok);
+	d_idx.allocate((size_t)T * d_ff);
+	d_k.allocate(T);
+	d_rho.allocate(1);
+
+	const bool m_ok = glades::gpu::sparec_compute_active_mask(
+	    d_sp.data(), T, d_ff, tau,
+	    d_mask.data(), d_idx.data(), d_k.data(), d_rho.data());
+	ASSERT("sparec_compute_active_mask at τ=1e-6 returns true", m_ok);
+
+	const bool ok = glades::gpu::sparec_backward_masked(
+	    d_gs.data(), d_sp.data(), d_mask.data(),
+	    d_hi.data(), d_wu.data(),
+	    T, d_ff, d_model,
+	    d_gx_scratch.data(), d_gW.data(), d_gh.data());
+	ASSERT("sparec_backward_masked returns true", ok);
+
+	std::vector<float> gW_gpu((size_t)d_ff * d_model), gh_gpu((size_t)T * d_model);
+	d_gW.download(&gW_gpu[0], gW_gpu.size());
+	d_gh.download(&gh_gpu[0], gh_gpu.size());
+
+	float err_gW = 0.0f, err_gh = 0.0f;
+	for (size_t i = 0; i < gW_ref.size(); ++i)
+		err_gW = std::max(err_gW, std::fabs(gW_gpu[i] - gW_ref[i]));
+	for (size_t i = 0; i < gh_ref.size(); ++i)
+		err_gh = std::max(err_gh, std::fabs(gh_gpu[i] - gh_ref[i]));
+	float norm_gW = 0.0f, norm_gh = 0.0f;
+	for (size_t i = 0; i < gW_ref.size(); ++i)
+		norm_gW = std::max(norm_gW, std::fabs(gW_ref[i]));
+	for (size_t i = 0; i < gh_ref.size(); ++i)
+		norm_gh = std::max(norm_gh, std::fabs(gh_ref[i]));
+
+	std::printf("  [sparec backward masked] T=%u d_ff=%u d_model=%u τ=%.1e "
+	            "err_gW=%.3e norm_gW=%.3e rel=%.3e err_gh=%.3e rel=%.3e\n",
+	            T, d_ff, d_model, tau,
+	            err_gW, norm_gW, err_gW / (norm_gW + 1e-12f),
+	            err_gh, err_gh / (norm_gh + 1e-12f));
+	ASSERT("sparec_backward_masked grad_W_up < 1e-3 at τ=1e-6", err_gW < 1e-3f);
+	ASSERT("sparec_backward_masked grad_h_in < 1e-3 at τ=1e-6", err_gh < 1e-3f);
+#else
+	std::printf("  [sparec backward masked] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONSparecThresholdControllerTest ---------------------------------------
 // Phase 1a validation of the integral controller on τ.  Start with τ=0.01,
 // rho_ema=0, rho_target=0.80, drive 20 steps with rho_new=0.80 fixed.  τ
@@ -11155,6 +11247,7 @@ void CHIRONUnitTest()
 	CHIRONFaceApplyUpdateParityTest();
 	CHIRONFaceEmaTrajectoryParityTest();
 	CHIRONSparecMaskParityTest();
+	CHIRONSparecBackwardMaskedParityTest();
 	CHIRONSparecThresholdControllerTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
