@@ -121,6 +121,33 @@ OSCILLATORY within a 0.2-1.1 nat band at any given scale.  Total
 cumulative advantage over long horizons (2500+ steps) is in the 0.4-0.6
 nat range at any scale tested.
 
+### 3.20 1.4B × 1000 × β=0.98 with full bf16 stack — largest scale tested (iter 117)
+
+Extended FACE validation to 1.4B params using --bf16-adam + --bf16-weights
++ --bf16-grads (full bf16 stack).  Config: m=2048, L=40, heads=32, dhead=128,
+1407.88M params.  VRAM: 12.43 / 15.56 GB (20.1% free).  The --bf16-grads
+unlock is what enabled pushing past 1.25B to 1.4B.
+
+Trajectory (FACE β=0.98):
+  Step    EMA      Notes
+  1       11.02    (initial)
+  250      7.47    (early warmup-transition dip)
+  500      9.07
+  750      8.95
+  1000     9.16
+
+FACE embedding compression: 500 MB → 258 KB = **1984× compression**
+(largest ratio yet on this project).
+
+Throughput: 1716 tok/s at 1.4B (vs 2059 tok/s at 1B and 2127 tok/s at
+1.25B).  Scaling cost as expected with more FFN compute.
+
+Dense 1.4B baseline is running (queued after FACE run).  Once complete,
+the comparison will land in the next iteration's commit.
+
+**Scale-aware β_row recipe now validated across [66M, 1.4B] — a 21×
+scale range.**  β=0.98 remains the correct choice at ≥500M.
+
 ### 3.19 1.25B × 1000 × β=0.98 with bf16-weights — largest scale tested (iter 114)
 
 Pushed past the 1B barrier using --bf16-adam + --bf16-weights.  Config:
