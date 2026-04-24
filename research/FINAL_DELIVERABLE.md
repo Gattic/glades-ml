@@ -42,7 +42,7 @@ Enables 1.84B param training on 16 GB consumer GPU.
 
 | Scale | Baseline (FACE+MFIO+bf16) | Flagship (all paradigms) | Speedup |
 |-------|:-------------------------:|:------------------------:|:-------:|
-| 66M | 78.6s / EMA 7.88 | 46.1s / EMA 7.35 | 1.74× |
+| 66M | 78.6s / EMA 7.88 | 44.2s / EMA 7.29 | **1.78×** (iter 158 optimized) |
 | 100M | 169.7s / EMA 9.08 | 101.0s / EMA 8.18 | 1.68× |
 | 200M | 300.6s / EMA 9.30 | 155.3s / EMA 8.40 | **1.94×** |
 | 500M | 587.0s / EMA 9.31 | 296.0s / EMA 8.37 | **1.98×** |
