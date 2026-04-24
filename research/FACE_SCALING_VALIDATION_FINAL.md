@@ -46,6 +46,7 @@ All validated on real pretokenized pile-bpe training data (not synthetic), using
 | **1.84B × 500** | **bf16-a+w+g + MFIO** (long-horizon validation) | **0.98** | (best loss 3.84@395) | **same** | **123** | **yes** (ceiling VALIDATED) |
 | **1.84B × 2500** | **bf16-a+w+g + MFIO** (full-horizon) | **0.98** | (EMA 9.36 @ 2500, 26min wall) | **same** | **126** | **yes** (CONVERGENCE PROVEN) |
 | **1.84B × 2500** | **+ SLC (paradigm #38) schedule 256→512→1024** | **0.98** | **(EMA 8.41, 17.5min wall: 1.50× faster AND −0.95 nat better)** | **same** | **130** | **yes** (SLC DOUBLE-WIN AT CEILING) |
+| **1.84B × 2500** | **+ SLC + RLG L=16→32→53 (FLAGSHIP)** | **0.98** | **(EMA 8.41, 13.5min wall: 1.96× faster AND −0.95 nat better)** | **same** | **142** | **yes** (FULL STACK at CEILING) |
 
 **27× scale range validated** (66M to 1.84B).
 
