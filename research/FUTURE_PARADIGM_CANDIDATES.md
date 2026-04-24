@@ -336,7 +336,55 @@ should either:
 Current session state: FACE is the research output.  Further
 paradigm shifts would need fundamentally new mechanism innovations.
 
-### Paradigm shift #35 — SPAREC (iter 110, 2026-04-23)
+### Paradigm-shift candidate status update (iter 125, 2026-04-23)
+
+After extensive Gate-0 empirical testing in iterations 121-124:
+
+| Shift | Axis | Gate-0 Status | Decision |
+|-------|------|---------------|----------|
+| #36 KV-FACE | Attention popularity | REJECTED iter 122 — Gini = 0.500 baseline, no learned Zipfian | Do not implement |
+| #37 HUTCH-DIAG | Hessian diagonal | MARGINAL iter 124 — ρ(N=16) = 0.38 < 0.6 bar | Test Option #37-A temporal-averaging rescue |
+| #35 SPAREC | FFN backward sparsity | PASSED Phase 1 iter 112 | Phase 2 engineering pending |
+| TAIL-CE | V-dim softmax compute | Not yet tested | Valid at V ≥ 128k only |
+
+**Key research lesson from KV-FACE rejection (iter 122):**
+- Causal masking produces structural popularity Gini = 0.500 independent of training
+- Trained attention does NOT develop Zipfian concentration at 41M × 2500 steps scale
+- Some layers develop MORE uniform patterns (diagonal / window attention → Gini < 0.500)
+- "Induction head" heads (high concentration) did not appear
+
+**Key research lesson from HUTCH-DIAG marginal (iter 124):**
+- Single-probe Hutchinson has too much variance (ρ ~ 0.15 at N=1)
+- Reaching ρ ≥ 0.6 requires N ≥ 64 probes → significant overhead
+- Temporal averaging (β = 0.9999 over 10k steps) could rescue via effective N ≈ 10k
+- Needs empirical test vs Adam's v_t on real CHIRON training
+
+### Fresh axis hypotheses for future iterations
+
+**Sequence-length curriculum (SLC).** T² attention cost dominates at T ≥ 1024.
+Schedule: T=256 (first 1000 steps) → T=512 (next 1000) → T=1024 (last 500).
+Attention FLOPs: 0.5·256² + 0.3·512² + 0.2·1024² = 33k + 79k + 210k = 322k per step
+vs baseline T=1024 throughout: 1048k per step.  **3.25× attention speedup.**
+End-to-end: ~1.5× (attention is ~40% of step compute).
+Gate-0: cheap — run side-by-side at 66M × 2500 and compare wall-clock to loss threshold.
+
+**Sign-Adam with bias-correction.** Replace m_t with sign(m_t) (1-bit).  Memory
+32× savings on m.  Known related work: Lion (2023) — but Lion uses EMA-of-signs,
+not sign-of-EMA.  A cleaner formulation: m_t = EMA(g_t), update = lr · sign(m_t) / √v_t.
+1.84B save: m is 7 GB fp32; sign-packed is 220 MB = 32× reduction.  Gate-0:
+validate on 66M × 500 steps for convergence parity.
+
+**Parameter-importance sparse training (IST).** Mask 90% of params as "frozen"
+at each step based on saliency |g · θ|.  Only update top-10% each step.  Adam
+state only for top-10% rolling window → 10× memory savings on Adam.  Known
+territory (FISH sparse training), but a RALPH-LOOP test would quantify the
+specific trade-off at LLM scale.
+
+**Attention-probability sparse activation.** After softmax, identify top-k
+keys per query (k=128 at T=1024 keeps ~99% mass).  Skip value aggregation
+from excluded keys during backward.  Memory savings: attention backward
+scratch size O(T·k) vs O(T²).  Speed: O(T·k·d_head) vs O(T²·d_head).
+At T=1024, k=128: 8× attention backward speedup.
 
 **Axis: FFN backward-pass activation sparsity** — the last unattacked
 compute axis. 3-candidate parallel protocol:
