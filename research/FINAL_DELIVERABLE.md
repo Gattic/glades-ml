@@ -120,7 +120,12 @@ parity. Research claims are now framed by the relevant metric.
 
 ---
 
-## 5. Tuning guide
+## 5. Tuning guide (iter 149-156 empirical sweeps)
+
+**All three paradigm tuning parameters have been swept to empirical
+optima. Tuning dimensions are orthogonal — each can be tuned
+independently without cross-interference.**
+
 
 ### β (FACE preconditioner decay)
 
@@ -129,14 +134,24 @@ parity. Research claims are now framed by the relevant metric.
 
 ### T schedule (SLC)
 
-- 40/20/40 split across T=256/T=512/T=1024 is empirically optimal (iter 131 sweep)
-- At long horizons: stretch T=256 phase, stagger transitions
+- 40/20/40 split across T=256/T=512/T=1024 is empirically optimal
+  (confirmed via iter 131 + 149 + 156 sweeps)
+- T_min = 256 is the floor (T=64, T=128 tested and slower per-wall-clock
+  per nat-reduction)
+- T=512 transition phase is essential (skipping hurts 0.5+ nat)
+- At long horizons (≥5000 steps): use staggered transitions (iter 147)
+  and β=0.99 (iter 144 horizon-safety fix)
 
 ### L schedule (RLG)
 
-- Start at L_max / 4 or L_max / 8
-- Three stages: L_init → L_init·2 → L_max
+- **L_init = max(L_max / 6, 4)** — empirically optimum (iter 152-155)
+- Three stages: L_init → L_max/2 → L_max
+- Transition points: L_init@0, L_max/2@0.32·steps, L_max@0.64·steps
+- L_init floor at 4 (below that, GPU underutilization + transition overhead)
 - Transitions should be STAGGERED from T-schedule transitions
+- At L_max=12 (66M): L=4 best (tested 1,2,4,6,8)
+- At L_max=24 (500M): L=4 best (tested 1,2,4,8)
+- At L_max=53 (1.84B): L=8 best (tested 4,8,16)
 
 ---
 
