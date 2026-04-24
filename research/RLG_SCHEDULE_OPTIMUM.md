@@ -72,6 +72,20 @@ Tighter rule of thumb: **L_init = max(L_max / 6, 4)**.
 At 500M (L_max=24): L_init=4 gives 2.15× total speedup.
 At 1.84B (L_max=53): L_init=8 gives 2.14× total speedup.
 
+### Floor validation at 500M (iter 155)
+
+Tested L_init ∈ {1, 2, 4, 8} at 500M × 2500:
+
+| L_init | Wall | EMA | Marginal vs L=8 |
+|:------:|:----:|:---:|:---------------:|
+| 8 | 296.0s | 8.37 | 1.00× |
+| 4 | 273.3s | 8.37 | 1.08× |
+| 2 | 270.8s | 8.38 | 1.093× (+0.9% over L=4) |
+| 1 | 271.1s | 8.37 | 1.092× (no improvement) |
+
+**L_init ≤ 4 reaches the floor.** Going L=1 or L=2 adds transitions
+without meaningful compute savings. L=4 is the practical floor.
+
 ## 6. Total Ralph-loop flagship stack (updated)
 
 | Paradigm | Delivery |
