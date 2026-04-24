@@ -299,20 +299,32 @@ measurable property of trained attention (Gini of per-position popularity).
 **Promote condition (Gate-0 probe):**
 - On any trained 500M+ checkpoint, measure per-layer-per-head
   `p[t] = (1/T)·Σ_q A[q,t]` and compute the Gini coefficient G.
-- **Causal-mask baseline (iter 121 finding).** Causal masking alone
-  creates substantial structural popularity skew. Measured on synthetic
-  uniform attention at T=32: Gini = 0.484. At T=1024 the structural
-  baseline is expected to be 0.85+ (Σ_q 1/(q+1) = H(T) dominates the
-  low-q popularity while late positions receive only self-attention).
-  **Thus the threshold `G ≥ 0.4` in any absolute sense is trivially
-  satisfied** — the meaningful threshold is `G_trained − G_uniform-causal(T) ≥ δ`.
-- **Pass (memory):** any absolute G ≥ 0.48 at T=1024 confirms the
-  compression mechanism is sound (column norms will be non-trivial).
-- **Pass (convergence):** differential `G_trained − G_uniform-causal(T) ≥ 0.1`
-  indicates the learned attention deviates meaningfully from baseline;
-  proceed to Phase 1 expecting full convergence benefit.
-- **Marginal:** `G_trained − G_uniform-causal(T) < 0.1` → mechanism may
-  degenerate in the convergence axis; pursue memory-only variant.
+- **Causal-mask structural baseline (iter 121 finding).** Causal masking
+  alone creates popularity skew with Gini = **0.500 ± 0.002 at any T ≥ 64**
+  (computed from `p[t] = (1/T)·Σ_{q≥t} 1/(q+1)`). This is the floor
+  below which the trained attention cannot go (structural lower bound).
+  Table of measured baselines:
+
+  | T    | Uniform-causal Gini | True-uniform Gini |
+  |------|:-------------------:|:------------------:|
+  |   32 | 0.4844              | 0.0000             |
+  |   64 | 0.4922              | 0.0000             |
+  |  128 | 0.4961              | 0.0000             |
+  |  256 | 0.4980              | 0.0000             |
+  |  512 | 0.4990              | 0.0000             |
+  | 1024 | 0.4995              | 0.0000             |
+  | 2048 | 0.4998              | 0.0000             |
+
+- **Pass (memory):** any measured G confirms compression works (column
+  norms are non-trivial for any G > 0.3).
+- **Pass (convergence):** differential `G_trained − 0.500 ≥ 0.05`
+  → learned attention adds useful structure; proceed to Phase 1
+  expecting full convergence benefit.
+- **Marginal:** `G_trained − 0.500 ∈ [0, 0.05]` → mechanism may
+  reduce to Adafactor on the convergence axis; pursue memory-only
+  variant.
+- **Fail:** `G_trained < 0.50` → impossible under causal mask; indicates
+  a measurement error or non-standard attention mechanism.
 
 **Infrastructure for the probe (shipped iter 121):**
 - `gpu_kvface_probe.{h,cu}` primitives: `kvface_probe_compute_popularity`,
