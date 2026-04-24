@@ -41,8 +41,15 @@ All validated on real pretokenized pile-bpe training data (not synthetic), using
 | 1B × 1000   | bf16-adam    | 0.98   | −0.33 nat | 1500×              | 111 | no       |
 | 1.25B × 1000| bf16-a+w     | 0.98   | −0.32 nat | 1743×              | 114 | no       |
 | **1.4B × 1000** | **bf16-a+w+g**   | **0.98**   | **−0.23 nat** | **1984×**              | **118** | **no**       |
+| **1.81B × 3**   | **bf16-a+w+g** (FACE only)  | **0.98** | (smoke)   | **1984×**  | **122** | **no** (ceiling) |
+| **1.84B × 3**   | **bf16-a+w+g + MFIO** (no WIP) | **0.98** | (smoke)   | **2731× attn + 1984× emb** | **122** | **yes** (peak ceiling) |
 
-**21× scale range validated** (66M to 1.4B).
+**27× scale range validated** (66M to 1.84B).
+
+**Ceiling (iter 122)**: maximum-scale configurations on the 16 GB 4080 SUPER:
+- FACE-only + bf16 stack: **1.81B params** (m=2048, L=52, 15.27 GB used)
+- MFIO + FACE + bf16 stack: **1.84B params** (m=2048, L=53, 15.53 GB used) — current peak
+- Beyond L=54 or L=56 OOMs even with MFIO.  Further scale requires gradient checkpointing or CPU-offload Adam.
 
 ## 3. Mechanism empirically dissociated
 
