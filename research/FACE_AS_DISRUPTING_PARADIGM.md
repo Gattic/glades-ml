@@ -142,8 +142,17 @@ FACE embedding compression: 500 MB → 258 KB = **1984× compression**
 Throughput: 1716 tok/s at 1.4B (vs 2059 tok/s at 1B and 2127 tok/s at
 1.25B).  Scaling cost as expected with more FFN compute.
 
-Dense 1.4B baseline is running (queued after FACE run).  Once complete,
-the comparison will land in the next iteration's commit.
+**Full dense vs FACE comparison (iter 118 complete)**:
+
+  Step     Dense     FACE β=0.98   Δ
+  1        11.02     11.02          0.00 (identical init)
+  250       9.19      7.47         **−1.72** (peak early dip)
+  500       9.52      9.07         −0.45
+  750       9.31      8.95         −0.36
+  1000      9.40      9.16         **−0.23**
+
+  **Dense EMA@1000 = 9.3953, FACE EMA@1000 = 9.1617 → -0.23 nat
+  sustained advantage at 1.4B scale.**
 
 **Scale-aware β_row recipe now validated across [66M, 1.4B] — a 21×
 scale range.**  β=0.98 remains the correct choice at ≥500M.

@@ -74,7 +74,7 @@ effective learning rate.
 | **500M** | **2500 steps** | **β=0.99** | **−0.67 nat** (iter 108) | 1570× |
 | **1B** | **1000 steps** | **β=0.98** | **−0.33 nat** (iter 111, bf16-adam) | 1500× |
 | **1.25B** | **1000 steps** | **β=0.98** | **−0.32 nat** (iter 114, bf16-adam+weights) | 1743× |
-| **1.4B** | **1000 steps** | **β=0.98** | TBD (iter 117, full bf16 stack) — FACE EMA 9.16 | 1984× |
+| **1.4B** | **1000 steps** | **β=0.98** | **−0.23 nat** (iter 118, full bf16 stack) | 1984× |
 
 Oscillatory band 0.1-1.1 nat at any given checkpoint; the OVERALL
 TREND is sustained FACE lead that grows with horizon.
