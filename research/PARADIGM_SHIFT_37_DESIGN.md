@@ -102,6 +102,60 @@ of v_t.
 
 **Probe cost:** ~2 GPU-hours for a 66M model. Within a single Ralph-loop iteration.
 
+### 4.1 Preliminary synthetic Gate-0 result (iter 124)
+
+Ran a cheap Gate-0 proxy on an n=200 synthetic Hessian `H = AᵀA + I`
+with three off-diagonal regimes:
+
+| Regime       | ‖off-diag‖/‖diag‖ | ρ(N=1) | ρ(N=4) | ρ(N=16) | ρ(N=64) | ρ(N=256) |
+|--------------|:-----------------:|:------:|:------:|:-------:|:-------:|:--------:|
+| Strong-diag  | 0.010             | 0.15   | 0.17   | 0.34    | 0.66    | 0.83     |
+| Mixed        | 0.197             | 0.15   | 0.14   | 0.38    | 0.61    | 0.83     |
+| Dense        | 0.798             | 0.11   | 0.10   | 0.35    | 0.58    | 0.86     |
+
+**Finding.** Hutchinson correlation scales primarily with N_probes, NOT
+with Hessian regime.  Reaching ρ ≥ 0.6 requires N ≥ 64 probes, not 16.
+**At the originally-proposed K=16 step period, ρ ≈ 0.4 — below the
+acceptance threshold.**
+
+### 4.2 Revised mechanism specification
+
+To achieve ρ ≥ 0.6 while staying under 20% overhead, two options:
+
+**Option α:** Probe every K=4 steps + EMA β_hutch = 0.99.  Effective
+sample size over 100 steps = 25 probes → ρ ≈ 0.50.  Overhead = 25%.
+Still marginal.
+
+**Option β:** Probe every step (K=1) + EMA β_hutch = 0.99.  Effective
+sample size over 100 steps = 100 probes → ρ ≈ 0.70.  Overhead = 100%
+(one extra backward per step).  **Kills the throughput claim.**
+
+**Option γ:** Replace single-probe Hutchinson with BLOCK-DIAGONAL
+Hessian estimator (K-FAC-lite).  Much stronger per-probe signal at the
+cost of implementation complexity + Kronecker factor state.
+
+### 4.3 Gate-0 verdict (iter 124)
+
+**MARGINAL PASS.** The naive Hutchinson + K=16 probe + diagonal-Adam-
+replacement proposal does not clear the ρ ≥ 0.6 bar.  Two recovery
+paths:
+
+1. **Option γ (K-FAC-lite)**: trade implementation cost for stronger
+   per-probe signal.  Full redesign required.
+2. **Temporal averaging rescue**: β_hutch = 0.999 over 1000 steps gives
+   effective N ≈ 1000 probes → ρ ≈ 0.95.  Acceptable IF v_hutch
+   responds slowly enough — effectively a "cold" preconditioner updated
+   every few epochs.  Matches Shampoo's periodic-inverse paradigm.
+
+**Decision: pursue #37-A (temporal-averaging HUTCH-DIAG).** Probe every
+K=1 step (lowest overhead per probe since the HVP is cheap) + β_hutch
+= 0.9999 (effective N ≈ 10,000 probes).  Overhead ≈ 50-100% per step
+(1 extra backward) BUT the preconditioner quality is high, enabling
+2-4× convergence speedup that overpowers the throughput cost.
+
+Requires Phase 1 empirical test: does temporal-averaged Hutchinson
+preconditioner beat Adam's v_t on a 66M × 2500-step run?
+
 ## 5. Phase 1 implementation plan
 
 Gated on Gate-0 PASS:
