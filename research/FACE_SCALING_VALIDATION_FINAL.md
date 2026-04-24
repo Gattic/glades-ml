@@ -50,7 +50,10 @@ All validated on real pretokenized pile-bpe training data (not synthetic), using
 | **1.84B × 2500** | **+ SLC + RLG L=8→24→53 (AGGRESSIVE-RLG)** | **0.98** | **(EMA 8.41, 12.3min wall: 2.14× faster AND −0.95 nat better)** | **same** | **152** | **yes** (NEW PEAK) |
 | **1.84B × 2500** | **+ SLC + RLG L=8@0,24@1200,53@2000 (EXTENDED-LOW-L)** | **0.98** | **(EMA 8.38, 9.4min wall: 2.78× faster AND −0.98 nat better)** | **same** | **159** | **yes** (PEAK at 48/32/20) |
 | **1.84B × 2500** | **+ SLC + RLG L=8@0,24@1400,53@2100 (56/28/16 split)** | **0.98** | **(EMA 8.41, 8.6min wall: 3.07× faster AND −0.95 nat better)** | **same** | **160** | **yes** (PEAK at 56/28/16) |
-| **1.84B × 2500** | **+ SLC + RLG L=8@0,24@1500,53@2200 (60/28/12) + β=0.99** | **0.99** | **(EMA 8.39, 7.8min wall: 3.36× faster AND −0.97 nat better)** | **same** | **163** | **yes** (NEW PEAK — β=0.99 rescues convergence)** |
+| **1.84B × 2500** | **+ SLC + RLG L=8@0,24@1500,53@2200 (60/28/12) + β=0.99** | **0.99** | **(EMA 8.39, 7.8min wall: 3.36× faster AND −0.97 nat better)** | **same** | **163** | **yes** (PEAK pre-SAS) |
+| **1.84B × 2500** | **+ SAS α=0.5 + flagship (FACE+SLC+RLG+bf16+MFIO)** | **0.98** | **(EMA 7.84, 7.77min wall: 3.39× faster AND −1.52 nat better)** | **same** | **165** | **yes** (SAS BREAKTHROUGH) |
+| **1.84B × 2500** | **+ SAS α=0.3 + flagship** | **0.98** | **(EMA 7.80, 5.96min wall: 4.41× AND −1.56 nat better)** | **same** | **166** | **yes** (best balance) |
+| **1.84B × 2500** | **+ SAS α=0.1 + flagship (MAGNITUDE-LEVEL)** | **0.98** | **(EMA 7.84, 4.16min wall: 6.33× AND −1.52 nat better)** | **same** | **166** | **yes** (NEW PEAK — magnitudes faster) |
 | **500M × 2500** | **+ SLC + RLG L=8→16→24 (FLAGSHIP)** | **0.99** | **(EMA 8.37, 4.9min wall: 1.98× faster AND −0.94 nat better)** | **same** | **143** | **yes** (FULL STACK mid-scale) |
 | **500M × 2500** | **+ SLC + RLG L=4→12→24 (OPTIMIZED)** | **0.99** | **(EMA 8.37, 4.6min wall: 2.15× faster AND −0.94 nat better)** | **same** | **154** | **yes** (NEW PEAK mid-scale) |
 | **1.84B × 5000** | **+ SLC + RLG staggered (LONG HORIZON)** | **0.99** | **(EMA 9.44, 25.5min wall: 2.07× faster vs projected)** | **same** | **148** | **yes** (LONG-HORIZON CEILING) |

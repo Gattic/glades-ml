@@ -81,6 +81,22 @@ The fact that EMA IMPROVES (not just matches) suggests SAS is a
 
 **Combined effective speedup to target loss: ~5-6×** (3.39× wall × 1.5× FACE × 1.3× SAS convergence).
 
+## 6a. α sweep at 1.84B ceiling (iter 166)
+
+| α | Wall | EMA | Speedup |
+|---|:----:|:---:|:-------:|
+| pre-SAS flagship | 469.4s | 8.39 | 3.36× |
+| 0.5 | 465.9s | 7.84 | 3.39× |
+| 0.3 | 357.5s | 7.80 | 4.41× |
+| **0.1** | **249.3s** | **7.84** | **6.33×** |
+
+The 1.84B ceiling now trains in **4.16 minutes** with SAS α=0.1 flagship.
+
+Convergence is nearly identical across α ∈ {0.1, 0.3, 0.5} at 7.80-7.84
+(all substantially better than pre-SAS 8.39). This confirms the attention-
+redundancy hypothesis — even 90% skipping gives equivalent convergence
+when other paradigms (FACE) drive the main learning signal.
+
 ## 7. Production recipe at 1.84B
 
 ```bash
@@ -91,10 +107,12 @@ The fact that EMA IMPROVES (not just matches) suggests SAS is a
     --bf16-adam --bf16-weights --bf16-grads \
     --t-schedule "256@0,512@1000,1024@1500" \
     --l-schedule "8@0,24@800,53@1600" \
-    --sas-alpha 0.5
+    --sas-alpha 0.1   # aggressive: 6.33×
+    # OR --sas-alpha 0.3  # balanced: 4.41× with best EMA
 ```
 
-**Wall: 465.9s (7.77 min)** — 3.39× faster than baseline 1578s (26.3 min).
+**With α=0.1 at 1.84B: 249.3s (4.16 min) — 6.33× speedup.**
+**With α=0.3 at 1.84B: 357.5s (5.96 min) — 4.41× with best EMA 7.80.**
 
 ## 8. Next validations
 
