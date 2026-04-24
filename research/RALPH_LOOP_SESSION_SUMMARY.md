@@ -1,7 +1,8 @@
 # Ralph-Loop Session Summary — Glades Disrupting Paradigm Stack
 
 **Date:** 2026-04-24 (Ralph-loop iter 137)
-**Session span:** iter 75-137 (~62 iterations, 2026-04-22 to 2026-04-24)
+**Session span:** iter 75-145 (~70 iterations, 2026-04-22 to 2026-04-24)
+**Last updated:** iter 145 (regression check + 3rd disrupting paradigm)
 **Brief:** "train extremely large LLMs with magnitudes of less memory and
 magnitudes faster"
 
@@ -9,7 +10,7 @@ magnitudes faster"
 
 ## 1. Executive summary
 
-The Ralph-loop research program delivered **two validated disrupting paradigm
+The Ralph-loop research program delivered **three validated disrupting paradigm
 shifts** that compose multiplicatively with the existing Glades ML stack:
 
 - **FACE (paradigm #28)** — Zipfian-frequency preconditioner for embedding
@@ -19,6 +20,13 @@ shifts** that compose multiplicatively with the existing Glades ML stack:
 - **SLC (paradigm #38)** — Sequence-length curriculum. Short-T warmup
   + long-T refinement via `--t-schedule` flag. Delivers 1.50-1.68×
   wall-clock speedup. Validated at 66M, 100M, 500M, 1.84B.
+
+- **RLG (paradigm #39)** — Reversible layer growth via Wo=0 identity
+  insertion (CHIRON-specific mechanism). Delivers 1.03-1.30× marginal
+  wall-clock speedup over SLC. Validated at 66M, 500M, 1.84B.
+
+**Full flagship stack at 1.84B × 2500 (iter 142):** 1578s baseline → 807s =
+**1.96× wall-clock speedup** at EMA 8.41 on 16 GB consumer GPU.
 
 **Combined stack at 1.84B on 16 GB RTX 4080 SUPER:**
 - Memory: ~4000× Adam state compression (FACE + MFIO + bf16)
