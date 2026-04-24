@@ -42,11 +42,13 @@ Enables 1.84B param training on 16 GB consumer GPU.
 
 | Scale | Baseline (FACE+MFIO+bf16) | Flagship (all paradigms) | Speedup |
 |-------|:-------------------------:|:------------------------:|:-------:|
-| 66M | 78.6s / EMA 7.88 | 44.2s / EMA 7.29 | **1.78×** (iter 158 optimized) |
-| 100M | 169.7s / EMA 9.08 | 101.0s / EMA 8.18 | 1.68× |
-| 200M | 300.6s / EMA 9.30 | 155.3s / EMA 8.40 | **1.94×** |
-| 500M | 587.0s / EMA 9.31 | 296.0s / EMA 8.37 | **1.98×** |
-| 1.84B | 1578.0s / EMA 9.36 | 807.1s / EMA 8.41 | **1.96×** |
+| 66M | 78.6s / EMA 7.88 | 32.9s / EMA 7.49 | **2.39×** |
+| 100M | 169.7s / EMA 9.08 | 63.6s / EMA 7.80 | **2.67×** |
+| 200M | 300.6s / EMA 9.30 | 109.4s / EMA 8.31 | **2.75×** |
+| 500M | 587.0s / EMA 9.31 | 200.2s / EMA 8.37 | **2.93×** |
+| 1.84B | 1578.0s / EMA 9.36 | 513.2s / EMA 8.41 | **3.07×** |
+
+All scales use the iter 160-161 optimized 56/28/16 L-schedule recipe.
 
 **Validated scale range:** 66M → 1.84B (27×) on single 16 GB GPU across 5 data points.
 Flagship speedup is **consistent 1.68-1.98× across 28× scale range** — robust scaling.
