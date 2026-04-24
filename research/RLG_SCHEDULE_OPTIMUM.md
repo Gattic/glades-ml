@@ -56,13 +56,21 @@ not a convergence-axis paradigm.
 
 ## 5. Scale-dependent L_init recommendation
 
-From cross-scale RLG sweeps:
-- L_max=12 (66M): L_init=6 (ratio 2), best schedule doesn't yield big marginal
-- L_max=24 (500M): L_init=8 (ratio 3), 1.21× marginal
-- L_max=53 (1.84B): L_init=8 (ratio 6.6), 1.30× marginal
+From cross-scale RLG sweeps (updated iter 154):
 
-**General recipe:** L_init ≈ max(L_max/6, 8). Minimum L=8 to avoid
-GPU under-utilization.
+| L_max | Scale | Optimal L_init | Marginal speedup |
+|-------|-------|:--------------:|:----------------:|
+| 12 | 66M | 6 | 1.06× |
+| 24 | 500M | **4** (iter 154) | **1.40×** (previously 1.21× at L=8) |
+| 53 | 1.84B | **8** (iter 152) | **1.30×** (previously 1.06× at L=16) |
+
+**Revised general recipe:** L_init ≈ L_max / 6, rounded to nearest
+small integer (min L=4 to keep GPU utilization reasonable).
+
+Tighter rule of thumb: **L_init = max(L_max / 6, 4)**.
+
+At 500M (L_max=24): L_init=4 gives 2.15× total speedup.
+At 1.84B (L_max=53): L_init=8 gives 2.14× total speedup.
 
 ## 6. Total Ralph-loop flagship stack (updated)
 
