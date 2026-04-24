@@ -44,6 +44,7 @@ All validated on real pretokenized pile-bpe training data (not synthetic), using
 | **1.81B × 3**   | **bf16-a+w+g** (FACE only)  | **0.98** | (smoke)   | **1984×**  | **122** | **no** (ceiling) |
 | **1.84B × 3**   | **bf16-a+w+g + MFIO** (no WIP) | **0.98** | (smoke)   | **2731× attn + 1984× emb** | **122** | **yes** (peak ceiling) |
 | **1.84B × 500** | **bf16-a+w+g + MFIO** (long-horizon validation) | **0.98** | (best loss 3.84@395) | **same** | **123** | **yes** (ceiling VALIDATED) |
+| **1.84B × 2500** | **bf16-a+w+g + MFIO** (full-horizon) | **0.98** | (EMA 9.36 @ 2500, 26min wall) | **same** | **126** | **yes** (CONVERGENCE PROVEN) |
 
 **27× scale range validated** (66M to 1.84B).
 
