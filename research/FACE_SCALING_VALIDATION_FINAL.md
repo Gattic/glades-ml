@@ -48,7 +48,8 @@ All validated on real pretokenized pile-bpe training data (not synthetic), using
 | **1.84B × 2500** | **+ SLC (paradigm #38) schedule 256→512→1024** | **0.98** | **(EMA 8.41, 17.5min wall: 1.50× faster AND −0.95 nat better)** | **same** | **130** | **yes** (SLC DOUBLE-WIN AT CEILING) |
 | **1.84B × 2500** | **+ SLC + RLG L=16→32→53 (FLAGSHIP)** | **0.98** | **(EMA 8.41, 13.5min wall: 1.96× faster AND −0.95 nat better)** | **same** | **142** | **yes** (FULL STACK at CEILING) |
 | **1.84B × 2500** | **+ SLC + RLG L=8→24→53 (AGGRESSIVE-RLG)** | **0.98** | **(EMA 8.41, 12.3min wall: 2.14× faster AND −0.95 nat better)** | **same** | **152** | **yes** (NEW PEAK) |
-| **1.84B × 2500** | **+ SLC + RLG L=8@0,24@1200,53@2000 (EXTENDED-LOW-L)** | **0.98** | **(EMA 8.38, 9.4min wall: 2.78× faster AND −0.98 nat better)** | **same** | **159** | **yes** (NEW PEAK — 30% wall in L=8 extended) |
+| **1.84B × 2500** | **+ SLC + RLG L=8@0,24@1200,53@2000 (EXTENDED-LOW-L)** | **0.98** | **(EMA 8.38, 9.4min wall: 2.78× faster AND −0.98 nat better)** | **same** | **159** | **yes** (PEAK at 48/32/20) |
+| **1.84B × 2500** | **+ SLC + RLG L=8@0,24@1400,53@2100 (56/28/16 split)** | **0.98** | **(EMA 8.41, 8.6min wall: 3.07× faster AND −0.95 nat better)** | **same** | **160** | **yes** (NEW PEAK at 56/28/16) |
 | **500M × 2500** | **+ SLC + RLG L=8→16→24 (FLAGSHIP)** | **0.99** | **(EMA 8.37, 4.9min wall: 1.98× faster AND −0.94 nat better)** | **same** | **143** | **yes** (FULL STACK mid-scale) |
 | **500M × 2500** | **+ SLC + RLG L=4→12→24 (OPTIMIZED)** | **0.99** | **(EMA 8.37, 4.6min wall: 2.15× faster AND −0.94 nat better)** | **same** | **154** | **yes** (NEW PEAK mid-scale) |
 | **1.84B × 5000** | **+ SLC + RLG staggered (LONG HORIZON)** | **0.99** | **(EMA 9.44, 25.5min wall: 2.07× faster vs projected)** | **same** | **148** | **yes** (LONG-HORIZON CEILING) |
