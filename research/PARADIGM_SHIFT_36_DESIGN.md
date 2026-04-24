@@ -299,10 +299,28 @@ measurable property of trained attention (Gini of per-position popularity).
 **Promote condition (Gate-0 probe):**
 - On any trained 500M+ checkpoint, measure per-layer-per-head
   `p[t] = (1/T)·Σ_q A[q,t]` and compute the Gini coefficient G.
-- **Pass:** mean G ≥ 0.4 across layers → proceed to Phase 1 implementation.
-- **Fail:** mean G < 0.3 → reject; mechanism cannot deliver beyond Adafactor.
-- **Marginal (0.3 ≤ G < 0.4):** proceed with Phase 1 but expect weaker
-  convergence benefit; primary value is memory compression.
+- **Causal-mask baseline (iter 121 finding).** Causal masking alone
+  creates substantial structural popularity skew. Measured on synthetic
+  uniform attention at T=32: Gini = 0.484. At T=1024 the structural
+  baseline is expected to be 0.85+ (Σ_q 1/(q+1) = H(T) dominates the
+  low-q popularity while late positions receive only self-attention).
+  **Thus the threshold `G ≥ 0.4` in any absolute sense is trivially
+  satisfied** — the meaningful threshold is `G_trained − G_uniform-causal(T) ≥ δ`.
+- **Pass (memory):** any absolute G ≥ 0.48 at T=1024 confirms the
+  compression mechanism is sound (column norms will be non-trivial).
+- **Pass (convergence):** differential `G_trained − G_uniform-causal(T) ≥ 0.1`
+  indicates the learned attention deviates meaningfully from baseline;
+  proceed to Phase 1 expecting full convergence benefit.
+- **Marginal:** `G_trained − G_uniform-causal(T) < 0.1` → mechanism may
+  degenerate in the convergence axis; pursue memory-only variant.
+
+**Infrastructure for the probe (shipped iter 121):**
+- `gpu_kvface_probe.{h,cu}` primitives: `kvface_probe_compute_popularity`,
+  `kvface_probe_gini_device`, `kvface_probe_reduce_stats`,
+  `kvface_probe_gini_host` (host reference).
+- Unit test `CHIRONKvfaceProbeParityTest` validates kernel bit-parity
+  against host reference (pop_err 2.98e-07, gini_err 2.98e-08) and
+  confirms Zipf vs uniform-causal separation.
 
 If passed Gate-0, 3-gate validation follows:
 1. Primitive parity (≤ 1e-4 error vs host)

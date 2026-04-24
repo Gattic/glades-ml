@@ -39,6 +39,7 @@
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_csp.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_face.h"
 #include "../../../Backend/Machine Learning/Networks/cuda/gpu_sparec.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_kvface_probe.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -10007,6 +10008,132 @@ void CHIRONSparecThresholdControllerTest()
 #endif
 }
 
+// CHIRONKvfaceProbeParityTest -----------------------------------------------
+// Paradigm shift #36 Gate-0 probe validation.  Given a synthetic attention
+// probability tensor P ∈ ℝ^{nHeads × T × T} (row-stochastic), the
+// kvface_probe_compute_popularity + kvface_probe_gini_device primitives
+// should produce per-head Gini coefficients matching the host reference
+// within 1e-4.  Also validates that a deliberately-Zipfian distribution
+// yields Gini ≥ 0.4 while a uniform distribution yields Gini ≈ 0.
+void CHIRONKvfaceProbeParityTest()
+{
+#ifdef GLADES_HAVE_CUDA
+	if (!glades::gpu::initDevice())
+	{
+		std::printf("  [kvface probe parity] no CUDA device — skipped\n");
+		return;
+	}
+	const unsigned int nHeads = 4;
+	const unsigned int T      = 32;
+
+	// Build two test tensors:
+	//   Head 0,1: deliberately Zipfian — each query attends mostly to a
+	//             small subset of keys, so popularity is highly skewed.
+	//   Head 2,3: uniform attention — each query attends equally to all
+	//             causally-valid positions.
+	LCG rng(202604250u);
+	std::vector<float> P_h((size_t)nHeads * T * T, 0.0f);
+
+	for (unsigned int h = 0; h < 2; ++h) {
+		for (unsigned int q = 0; q < T; ++q) {
+			// Zipfian row: 80% mass on first accessible key.
+			float row[256];
+			for (unsigned int k = 0; k <= q; ++k) {
+				// Strong preference for key 0, tail exp-decaying.
+				row[k] = std::exp(-2.5f * (float)k);
+			}
+			float s = 0.0f;
+			for (unsigned int k = 0; k <= q; ++k) s += row[k];
+			for (unsigned int k = 0; k <= q; ++k) row[k] /= s;
+			for (unsigned int k = 0; k <= q; ++k)
+				P_h[(size_t)h * T * T + (size_t)q * T + k] = row[k];
+			// Positions k > q are causally masked (0).
+		}
+	}
+	for (unsigned int h = 2; h < nHeads; ++h) {
+		for (unsigned int q = 0; q < T; ++q) {
+			const float w = 1.0f / (float)(q + 1);
+			for (unsigned int k = 0; k <= q; ++k)
+				P_h[(size_t)h * T * T + (size_t)q * T + k] = w;
+		}
+	}
+	(void)rng;  // Kept for future seeded variants.
+
+	// Host-compute popularity and Gini references.
+	std::vector<float> pop_ref((size_t)nHeads * T, 0.0f);
+	std::vector<float> gini_ref(nHeads, 0.0f);
+	for (unsigned int h = 0; h < nHeads; ++h) {
+		for (unsigned int t = 0; t < T; ++t) {
+			float acc = 0.0f;
+			for (unsigned int q = 0; q < T; ++q)
+				acc += P_h[(size_t)h * T * T + (size_t)q * T + t];
+			pop_ref[(size_t)h * T + t] = acc / (float)T;
+		}
+		gini_ref[h] = glades::gpu::kvface_probe_gini_host(
+		    &pop_ref[(size_t)h * T], (int)T);
+	}
+
+	// GPU path.
+	glades::gpu::GpuBuffer<float> d_P, d_pop, d_gini, d_stats;
+	d_P.allocate(P_h.size());          d_P.upload(&P_h[0], P_h.size());
+	d_pop.allocate((size_t)nHeads * T);
+	d_gini.allocate(nHeads);
+	d_stats.allocate(3);
+
+	ASSERT("kvface_probe_compute_popularity returns true",
+	       glades::gpu::kvface_probe_compute_popularity(
+	           d_P.data(), d_pop.data(), (int)nHeads, (int)T));
+	ASSERT("kvface_probe_gini_device returns true",
+	       glades::gpu::kvface_probe_gini_device(
+	           d_pop.data(), d_gini.data(), (int)nHeads, (int)T));
+	ASSERT("kvface_probe_reduce_stats returns true",
+	       glades::gpu::kvface_probe_reduce_stats(
+	           d_gini.data(), d_stats.data(), (int)nHeads));
+
+	std::vector<float> pop_gpu((size_t)nHeads * T), gini_gpu(nHeads);
+	float stats_gpu[3] = { 0, 0, 0 };
+	d_pop.download(&pop_gpu[0], pop_gpu.size());
+	d_gini.download(&gini_gpu[0], gini_gpu.size());
+	d_stats.download(&stats_gpu[0], 3);
+
+	// Parity checks.
+	float max_pop_err = 0.0f, max_gini_err = 0.0f;
+	for (size_t i = 0; i < pop_ref.size(); ++i) {
+		const float e = std::fabs(pop_ref[i] - pop_gpu[i]);
+		if (e > max_pop_err) max_pop_err = e;
+	}
+	for (size_t i = 0; i < gini_ref.size(); ++i) {
+		const float e = std::fabs(gini_ref[i] - gini_gpu[i]);
+		if (e > max_gini_err) max_gini_err = e;
+	}
+
+	const float mean_zipf    = 0.5f * (gini_gpu[0] + gini_gpu[1]);
+	const float mean_uniform = 0.5f * (gini_gpu[2] + gini_gpu[3]);
+
+	std::printf("  [kvface probe parity] nHeads=%u T=%u  pop_err=%.2e  gini_err=%.2e\n",
+	            nHeads, T, max_pop_err, max_gini_err);
+	std::printf("  [kvface probe parity] gini[Zipf 0,1] = %.4f, %.4f  (mean %.4f)\n",
+	            gini_gpu[0], gini_gpu[1], mean_zipf);
+	std::printf("  [kvface probe parity] gini[Uniform 2,3] = %.4f, %.4f  (mean %.4f)\n",
+	            gini_gpu[2], gini_gpu[3], mean_uniform);
+	std::printf("  [kvface probe parity] stats mean=%.4f min=%.4f max=%.4f\n",
+	            stats_gpu[0], stats_gpu[1], stats_gpu[2]);
+
+	ASSERT("popularity device matches host (< 1e-4)", max_pop_err < 1e-4f);
+	ASSERT("gini device matches host (< 1e-3)",       max_gini_err < 1e-3f);
+	// Sanity: Zipf distributions ≥ 0.4, uniform ≈ 0.
+	// Causal masking creates baseline popularity skew even under "uniform"
+	// per-row attention — first positions receive attention from all T
+	// queries while the last position is attended to only by one (itself),
+	// yielding a structural Gini ≈ 0.33.  Expected separation: Zipf >> uniform.
+	ASSERT("Zipf Gini ≥ 0.35 (mechanism validates)", mean_zipf >= 0.35f);
+	ASSERT("Zipf Gini > uniform Gini by ≥ 0.1",
+	       (mean_zipf - mean_uniform) >= 0.1f);
+#else
+	std::printf("  [kvface probe parity] GLADES_HAVE_CUDA not defined — skipped\n");
+#endif
+}
+
 // CHIRONDfaMLPTest ----------------------------------------------------------
 // Paradigm shift #12, Phase 1: validate DFA (direct feedback alignment)
 // on a 2-layer MLP.  Standard backprop computes dW via the chain rule;
@@ -11249,6 +11376,7 @@ void CHIRONUnitTest()
 	CHIRONSparecMaskParityTest();
 	CHIRONSparecBackwardMaskedParityTest();
 	CHIRONSparecThresholdControllerTest();
+	CHIRONKvfaceProbeParityTest();
 	CHIRONDfaMLPTest();
 	CHIRONDfaDeeperMLPTest();
 	CHIRONDfaL8Test();

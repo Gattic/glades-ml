@@ -27,6 +27,7 @@ set(GLADES_CUDA_SOURCES
 	gpu_csp.cu
 	gpu_face.cu
 	gpu_sparec.cu
+	gpu_kvface_probe.cu
 	gpu_nesr.cu
 	gpu_transformer_state.cu
 	gpu_dff_state.cu
