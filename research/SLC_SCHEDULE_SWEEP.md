@@ -78,7 +78,25 @@ The 3-stage 40/20/40 split works because:
 The 40% T=256 is the sweet spot — shorter wastes warmup benefit,
 longer (schedule E) forgoes the T=512 transition signal.
 
-## 6. Aggressive short-T sweep (iter 149 update)
+## 6. Combined T+L schedule sweep (iter 156)
+
+Tested interaction between T and L schedules at 66M × 2500 with L=4→8→12:
+
+| T schedule | Wall | EMA |
+|------------|:----:|:---:|
+| 256@0,512@500,1024@1000 (short T=256) | 55.2s | 8.13 |
+| 256@0,512@800,1024@1500 (medium T=256) | 45.5s | 8.01 |
+| **256@0,512@1000,1024@1500 (standard)** | **44.8s** | **7.33** |
+
+**Shorter T=256 phase makes things SLOWER** because the expensive
+T=1024 phase takes a larger fraction of the remaining schedule. The
+standard 40/20/40 T split is optimal EVEN WHEN L is aggressively
+curriculumed.
+
+T and L schedules interact cleanly — changing L_init doesn't shift
+the optimal T_schedule shape.
+
+## 7. Aggressive short-T sweep (iter 149 update)
 
 Extended sweep tested more aggressive start values:
 
