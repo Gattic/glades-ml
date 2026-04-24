@@ -78,7 +78,25 @@ The 3-stage 40/20/40 split works because:
 The 40% T=256 is the sweet spot — shorter wastes warmup benefit,
 longer (schedule E) forgoes the T=512 transition signal.
 
-## 6. Open questions
+## 6. Aggressive short-T sweep (iter 149 update)
+
+Extended sweep tested more aggressive start values:
+
+| Schedule | Wall | EMA | Nat-reduction/s |
+|----------|:----:|:---:|:---------------:|
+| 64@0,128@300,256@700,512@1300,1024@1900 | 37.9s | 8.56 | 0.0486 |
+| 128@0,256@800,512@1300,1024@1800 | 39.8s | 8.19 | 0.0555 |
+| **256@0,512@1000,1024@1500 (standard)** | **47.7s** | **7.42** | **0.0625** |
+
+Standard 40/20/40 schedule has the BEST per-wall-clock nat-reduction
+rate (0.0625 nat/s). More aggressive schedules finish faster in absolute
+wall-clock but deliver LESS total learning per second of compute.
+
+**Conclusion:** standard 256→512→1024 schedule remains empirically
+optimal. Further aggression doesn't help on either wall-clock or
+per-token metric.
+
+## 7. Open questions
 
 - **Does the optimum shift at different model sizes?** At 1.84B, the
   standard schedule already works (iter 130). Optimal may be scale-dependent.
