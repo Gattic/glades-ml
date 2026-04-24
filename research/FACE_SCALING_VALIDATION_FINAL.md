@@ -37,6 +37,7 @@ All validated on real pretokenized pile-bpe training data (not synthetic), using
 | 500M × 1000 | base         | 0.98   | −0.32 nat | 1570×              | 93  | no       |
 | 500M × 1000 | tuned        | 0.99   | −0.35 nat | 1570×              | 107 | no       |
 | 500M × 2500 | tuned        | 0.99   | −0.67 nat | 1570×              | 108 | no       |
+| **500M × 2500** | **tuned+bf16-all** | **0.99** | **−0.67 nat** | **1570×** | **120** | **bf16-invariance** |
 | 1B × 1000   | bf16-adam    | 0.98   | −0.33 nat | 1500×              | 111 | no       |
 | 1.25B × 1000| bf16-a+w     | 0.98   | −0.32 nat | 1743×              | 114 | no       |
 | **1.4B × 1000** | **bf16-a+w+g**   | **0.98**   | **−0.23 nat** | **1984×**              | **118** | **no**       |
@@ -94,6 +95,15 @@ Drops MFIO+WIP (insufficient memory headroom).  Memory unlock is the full bf16 s
 | **FACE** | **all scales** | embedding state compression, orthogonal to all above |
 
 FACE's compression is **scale-invariant relative to embedding size**: ratio = m/2 for V ≫ m.  At 1.4B with m=2048: 500 MB → 258 KB = 1984× compression.
+
+**bf16-invariance (iter 120, 2026-04-23):** The 500M × 2500 × β=0.99
+run was repeated with the full bf16 stack (--bf16-adam --bf16-weights
+--bf16-grads), providing a direct "compression does not change
+convergence" test. FACE EMA@2500 = 9.3093 vs fp32-grads iter 108's
+9.3093; Dense EMA@2500 = 9.9759 vs fp32-grads iter 108's 9.9752.
+The FACE − Dense Δ is exactly −0.67 nat in both memory regimes.  This
+confirms FACE's advantage is structurally invariant under the bf16
+unlock — the mechanism survives precision compression.
 
 ## 7. Throughput parity
 
