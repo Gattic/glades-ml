@@ -18,6 +18,8 @@ Previous flagship at 1.84B used schedule `L=8@0,L=24@800,L=53@1600` with
 | L=8@0,L=24@1300,L=53@2050 (iter 160, 52/30/18) | 540.2s | 8.39 | 2.92× |
 | **L=8@0,L=24@1400,L=53@2100 (iter 160, 56/28/16)** | **513.2s** | **8.41** | **3.07×** ← NEW PEAK |
 | L=8@0,L=24@1500,L=53@2200 (60/28/12) | 469.4s | 8.48 | 3.36× (+0.07 nat EMA cost) |
+| **L=8@0,L=24@1500,L=53@2200 (60/28/12) at 500M** | **185.6s** | **8.43** | **3.16×** (+0.06 nat cost) |
+| L=8@0,L=24@1625,L=53@2325 (65/28/7 too extreme) | 162.4s (500M) | 8.78 | 3.62× but +0.41 nat DEGRADED |
 | L=8@0,L=24@1500,L=53@2200 + stretched T (iter 159) | 395.2s | 9.77 | 3.99× (EMA DEGRADED) |
 
 **The iter 159 schedule achieves 2.78× speedup with IDENTICAL convergence**

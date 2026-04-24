@@ -50,6 +50,15 @@ Enables 1.84B param training on 16 GB consumer GPU.
 
 All scales use the iter 160-161 optimized 56/28/16 L-schedule recipe.
 
+**Pareto-aggressive option (iter 162):** 60/28/12 schedule delivers
+~10% more speedup at +0.06 nat EMA cost:
+- 500M with 60/28/12: 185.6s / EMA 8.43 = 3.16×
+- 1.84B with 60/28/12: 469.4s / EMA 8.48 = 3.36×
+
+Use 60/28/12 when throughput matters more than marginal convergence;
+use 56/28/16 for conservative delivery. Going beyond (65/28/7) degrades
+EMA by 0.4+ nat — too aggressive, not recommended.
+
 **Validated scale range:** 66M → 1.84B (27×) on single 16 GB GPU across 5 data points.
 Flagship speedup is **consistent 1.68-1.98× across 28× scale range** — robust scaling.
 
