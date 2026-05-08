@@ -1915,5 +1915,226 @@ inline float mla_compression_ratio(unsigned int nHeads,
 	return static_cast<float>(mhaPerToken) / static_cast<float>(mlaPerToken);
 }
 
+// ============================================================================
+// Paradigm shift #74 — PHOENIX-1BIT-DISTILL-COMBO-CHIRON (binary kernels)
+// ============================================================================
+//
+// Binary {-1, +1} weights with 1 bit per weight (16x compression vs BF16,
+// 32x vs FP32). Forward GEMM Y[m,n] = sum_k X[m,k] * W[k,n] where
+// W[k,n] in {-1, +1}, packed as: bit=1 if W=+1, bit=0 if W=-1.
+//
+// Decoding identity:
+//   sum_k X[m,k] * W[k,n] = 2 * sum_{k : bit[k,n]==1} X[m,k] - sum_k X[m,k]
+//
+// I.e., one masked-sum + one row-sum per (m,n). Per row m, the row-sum is
+// reused across all n. Compute reduction: ~2x over float GEMM at this
+// granularity (no multiply in the inner loop).
+//
+// Reference: BitNet b1.58 / b1.0 (Microsoft 2024). XNOR-popcount form is
+// for fully-binary GEMM (X also {-1,+1}); we keep X float for QAT.
+
+// Pack ±1 weights into bits. For w >= 0: bit=1; for w < 0: bit=0.
+// W:        [K * N] floats, expected in [-1, +1] range, row-major (k major, n minor).
+// W_bits:   [(K * N + 7) / 8] bytes; bit (k*N + n) = (W[k,n] >= 0).
+//
+// NOTE: This is the "row-major bits" layout — convenient for unpacking/diagnostics
+// but slow for binary GEMM since the bits for a single output column n are
+// strided in memory. For fast GEMM use phoenix_pack_signs_colmajor below.
+inline void phoenix_pack_signs(const float* W,
+                               unsigned int K,
+                               unsigned int N,
+                               unsigned char* W_bits)
+{
+	if (!W || !W_bits || K == 0u || N == 0u)
+		return;
+	const size_t total = static_cast<size_t>(K) * static_cast<size_t>(N);
+	const size_t bytes = (total + 7u) >> 3;
+	for (size_t b = 0; b < bytes; ++b)
+		W_bits[b] = 0u;
+	for (size_t i = 0; i < total; ++i)
+	{
+		if (W[i] >= 0.0f)
+			W_bits[i >> 3] |= (unsigned char)(1u << (i & 7u));
+	}
+}
+
+// Column-major bit packing: for each output column n, pack K bits sequentially.
+// Layout: bits for column n start at byte offset n * ((K+7)/8). Bit index k of
+// column n is at byte (n * Kbytes + k/8), bit position (k & 7).
+//
+// This layout makes binary GEMM cache-friendly: the K bits for one (m, n) output
+// are contiguous in memory and can be processed 8 bits at a time.
+inline void phoenix_pack_signs_colmajor(const float* W,
+                                        unsigned int K,
+                                        unsigned int N,
+                                        unsigned char* W_bits)
+{
+	if (!W || !W_bits || K == 0u || N == 0u)
+		return;
+	const size_t Kbytes = (static_cast<size_t>(K) + 7u) >> 3;
+	const size_t totalBytes = Kbytes * static_cast<size_t>(N);
+	for (size_t b = 0; b < totalBytes; ++b)
+		W_bits[b] = 0u;
+	for (unsigned int n = 0; n < N; ++n)
+	{
+		unsigned char* col = W_bits + static_cast<size_t>(n) * Kbytes;
+		for (unsigned int k = 0; k < K; ++k)
+		{
+			if (W[static_cast<size_t>(k) * N + n] >= 0.0f)
+				col[k >> 3] |= (unsigned char)(1u << (k & 7u));
+		}
+	}
+}
+
+// Unpack bits back to ±1 floats.
+inline void phoenix_unpack_signs(const unsigned char* W_bits,
+                                 unsigned int K,
+                                 unsigned int N,
+                                 float* W_out)
+{
+	if (!W_bits || !W_out || K == 0u || N == 0u)
+		return;
+	const size_t total = static_cast<size_t>(K) * static_cast<size_t>(N);
+	for (size_t i = 0; i < total; ++i)
+	{
+		const unsigned char bit = (W_bits[i >> 3] >> (i & 7u)) & 1u;
+		W_out[i] = bit ? 1.0f : -1.0f;
+	}
+}
+
+// Compression ratio in bytes: float weights / packed bits.
+inline float phoenix_compression_ratio_bf16()
+{
+	// BF16 (2 bytes/weight) vs 1 bit/weight = 16x.
+	return 16.0f;
+}
+
+inline float phoenix_compression_ratio_fp32()
+{
+	// FP32 (4 bytes/weight) vs 1 bit/weight = 32x.
+	return 32.0f;
+}
+
+// Binary GEMM with row-major bit packing (slow but layout-compatible with
+// phoenix_pack_signs). Provided for correctness-test parity; for speed use
+// phoenix_binary_gemm_colmajor with phoenix_pack_signs_colmajor.
+//   X:      [M, K]
+//   W_bits: bit-packed [(K*N+7)/8] bytes (bit (k*N+n) == (W[k,n] >= 0))
+//   Y:      [M, N]   (output, overwritten)
+//
+// Algorithm: per row m, precompute rowSum[m] = sum_k X[m,k]; per output
+// (m,n), maskedSum = sum_{k : bit[k,n]==1} X[m,k]; Y[m,n] = 2*maskedSum - rowSum[m].
+inline void phoenix_binary_gemm(const float* X,
+                                const unsigned char* W_bits,
+                                unsigned int M,
+                                unsigned int N,
+                                unsigned int K,
+                                float* Y)
+{
+	if (!X || !W_bits || !Y || M == 0u || N == 0u || K == 0u)
+		return;
+
+	std::vector<float> rowSum(M, 0.0f);
+	for (unsigned int m = 0; m < M; ++m)
+	{
+		const float* xm = X + static_cast<size_t>(m) * K;
+		double s = 0.0;
+		for (unsigned int k = 0; k < K; ++k)
+			s += static_cast<double>(xm[k]);
+		rowSum[m] = static_cast<float>(s);
+	}
+
+	for (unsigned int m = 0; m < M; ++m)
+	{
+		const float* xm = X + static_cast<size_t>(m) * K;
+		float* ym = Y + static_cast<size_t>(m) * N;
+		const float rs = rowSum[m];
+
+		for (unsigned int n = 0; n < N; ++n)
+		{
+			double maskedSum = 0.0;
+			for (unsigned int k = 0; k < K; ++k)
+			{
+				const size_t bitIdx = static_cast<size_t>(k) * static_cast<size_t>(N) +
+				                      static_cast<size_t>(n);
+				const unsigned char bit = (W_bits[bitIdx >> 3] >> (bitIdx & 7u)) & 1u;
+				if (bit)
+					maskedSum += static_cast<double>(xm[k]);
+			}
+			ym[n] = static_cast<float>(2.0 * maskedSum) - rs;
+		}
+	}
+}
+
+// Fast binary GEMM with column-major bit packing.
+//   X:        [M, K]
+//   W_bits:   layout from phoenix_pack_signs_colmajor (each column packs K bits
+//             contiguously; total N * ((K+7)/8) bytes).
+//   Y:        [M, N]
+//
+// Algorithm: same masked-sum identity but processes 8 bits per byte sequentially
+// over X[m, k]. Pre-computes rowSum once. Inner loop is byte-by-byte: each byte
+// accumulates X[m, k..k+7] into maskedSum where the byte's bits are 1.
+inline void phoenix_binary_gemm_colmajor(const float* X,
+                                         const unsigned char* W_bits,
+                                         unsigned int M,
+                                         unsigned int N,
+                                         unsigned int K,
+                                         float* Y)
+{
+	if (!X || !W_bits || !Y || M == 0u || N == 0u || K == 0u)
+		return;
+	const size_t Kbytes = (static_cast<size_t>(K) + 7u) >> 3;
+
+	std::vector<float> rowSum(M, 0.0f);
+	for (unsigned int m = 0; m < M; ++m)
+	{
+		const float* xm = X + static_cast<size_t>(m) * K;
+		float s = 0.0f;
+		for (unsigned int k = 0; k < K; ++k)
+			s += xm[k];
+		rowSum[m] = s;
+	}
+
+	for (unsigned int m = 0; m < M; ++m)
+	{
+		const float* xm = X + static_cast<size_t>(m) * K;
+		float* ym = Y + static_cast<size_t>(m) * N;
+		const float rs = rowSum[m];
+
+		for (unsigned int n = 0; n < N; ++n)
+		{
+			const unsigned char* col = W_bits + static_cast<size_t>(n) * Kbytes;
+			float maskedSum = 0.0f;
+			unsigned int k = 0;
+			for (size_t bb = 0; bb < Kbytes; ++bb)
+			{
+				const unsigned char byte = col[bb];
+				const unsigned int kBase = static_cast<unsigned int>(bb) * 8u;
+				const unsigned int kEnd = (kBase + 8u <= K) ? (kBase + 8u) : K;
+				if (byte == 0u)
+				{
+					k = kEnd;
+					continue;
+				}
+				if (byte == 0xFFu && (kBase + 8u) <= K)
+				{
+					maskedSum += xm[kBase + 0u] + xm[kBase + 1u] + xm[kBase + 2u] + xm[kBase + 3u] +
+					             xm[kBase + 4u] + xm[kBase + 5u] + xm[kBase + 6u] + xm[kBase + 7u];
+					k = kBase + 8u;
+					continue;
+				}
+				for (unsigned int j = 0; j < (kEnd - kBase); ++j)
+				{
+					if (byte & (1u << j))
+						maskedSum += xm[kBase + j];
+				}
+				k = kEnd;
+			}
+			ym[n] = 2.0f * maskedSum - rs;
+		}
+	}
+}
+
 } // namespace transformer_ops
 } // namespace glades

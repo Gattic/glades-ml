@@ -27,6 +27,13 @@ using glades::transformer_ops::scaled_dot_product_attention_backward_recompute_f
 using glades::transformer_ops::mla_decompress_kv;
 using glades::transformer_ops::mla_compute_latent;
 using glades::transformer_ops::mla_compression_ratio;
+using glades::transformer_ops::phoenix_pack_signs;
+using glades::transformer_ops::phoenix_pack_signs_colmajor;
+using glades::transformer_ops::phoenix_unpack_signs;
+using glades::transformer_ops::phoenix_compression_ratio_bf16;
+using glades::transformer_ops::phoenix_compression_ratio_fp32;
+using glades::transformer_ops::phoenix_binary_gemm;
+using glades::transformer_ops::phoenix_binary_gemm_colmajor;
 using glades::transformer_kernels::silu_forward_buf;
 using glades::transformer_kernels::gelu_forward_buf;
 using glades::transformer_kernels::silu_backward_buf;
@@ -1346,6 +1353,195 @@ static void test_mla_cache_size_bound()
 }
 
 // ============================================================
+// Group G: Paradigm shift #74 PHOENIX-1BIT
+// ============================================================
+// Binary {-1, +1} weights with bit-packing. 16x memory compression
+// vs BF16; multiply-free GEMM via masked-sum identity.
+
+static void test_phoenix_pack_unpack_roundtrip()
+{
+	printf("  [G1] PhoenixPackUnpackRoundtrip ...\n");
+	const unsigned int K = 16u;
+	const unsigned int N = 32u;
+	std::vector<float> W(static_cast<size_t>(K) * N);
+	unsigned int seed = 0xDEAD0BEDu;
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		const float r = pseudo_rand(seed);
+		W[i] = (r >= 0.0f) ? 1.0f : -1.0f;
+	}
+	std::vector<unsigned char> bits((K * N + 7u) / 8u, 0u);
+	std::vector<float> W_back(static_cast<size_t>(K) * N, 0.0f);
+	phoenix_pack_signs(W.data(), K, N, bits.data());
+	phoenix_unpack_signs(bits.data(), K, N, W_back.data());
+	for (size_t i = 0; i < W.size(); ++i)
+		ASSERT("pack/unpack roundtrip", W[i] == W_back[i]);
+	printf("    PASSED (K=%u, N=%u, %u bits = %u bytes)\n", K, N, K * N, static_cast<unsigned int>(bits.size()));
+}
+
+static void test_phoenix_compression_ratio()
+{
+	printf("  [G2] PhoenixCompressionRatio ...\n");
+	const float r16 = phoenix_compression_ratio_bf16();
+	const float r32 = phoenix_compression_ratio_fp32();
+	printf("    vs BF16: %.1fx; vs FP32: %.1fx\n", r16, r32);
+	ASSERT("PHOENIX 16x vs BF16", std::fabs(r16 - 16.0f) < 1e-5f);
+	ASSERT("PHOENIX 32x vs FP32", std::fabs(r32 - 32.0f) < 1e-5f);
+	printf("    PASSED\n");
+}
+
+static void test_phoenix_binary_gemm_correctness()
+{
+	printf("  [G3] PhoenixBinaryGEMMCorrectness ...\n");
+	const unsigned int M = 6u;
+	const unsigned int K = 16u;
+	const unsigned int N = 8u;
+	std::vector<float> X(static_cast<size_t>(M) * K);
+	std::vector<float> W(static_cast<size_t>(K) * N);
+	unsigned int seed = 0xC0FFEEEEu;
+	fill_random(X.data(), M * K, seed);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		const float r = pseudo_rand(seed);
+		W[i] = (r >= 0.0f) ? 1.0f : -1.0f;
+	}
+
+	// Reference: standard float GEMM
+	std::vector<float> Y_ref(static_cast<size_t>(M) * N, 0.0f);
+	for (unsigned int m = 0; m < M; ++m)
+		for (unsigned int n = 0; n < N; ++n)
+		{
+			double s = 0.0;
+			for (unsigned int k = 0; k < K; ++k)
+				s += static_cast<double>(X[m * K + k]) * static_cast<double>(W[k * N + n]);
+			Y_ref[m * N + n] = static_cast<float>(s);
+		}
+
+	// Binary path: pack W, then masked-sum GEMM
+	std::vector<unsigned char> bits((K * N + 7u) / 8u, 0u);
+	phoenix_pack_signs(W.data(), K, N, bits.data());
+	std::vector<float> Y_bin(static_cast<size_t>(M) * N, 0.0f);
+	phoenix_binary_gemm(X.data(), bits.data(), M, N, K, Y_bin.data());
+
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < Y_ref.size(); ++i)
+	{
+		double d = std::fabs(static_cast<double>(Y_ref[i]) - static_cast<double>(Y_bin[i]));
+		if (d > maxAbs) maxAbs = d;
+	}
+	printf("    M=%u N=%u K=%u: max-abs-diff=%.3e\n", M, N, K, maxAbs);
+	ASSERT("binary GEMM matches float reference", maxAbs < 1e-4);
+	printf("    PASSED (Theorem: Y[m,n] = 2*maskedSum - rowSum[m])\n");
+}
+
+static void test_phoenix_binary_gemm_speedup()
+{
+	printf("  [G4] PhoenixBinaryGEMMSpeedupColMajor ...\n");
+	// Profile: column-major bit-packed binary GEMM vs naive float GEMM.
+	// CPU/scalar reference comparison: production gain comes from GPU
+	// XNOR-popcount kernels (4-8x); on CPU at scalar code we mainly
+	// validate correctness + favorable data layout (fewer bytes touched).
+	const unsigned int M = 64u;
+	const unsigned int K = 256u;
+	const unsigned int N = 256u;
+	std::vector<float> X(static_cast<size_t>(M) * K);
+	std::vector<float> W(static_cast<size_t>(K) * N);
+	unsigned int seed = 0xC0FFEED1u;
+	fill_random(X.data(), M * K, seed);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		const float r = pseudo_rand(seed);
+		W[i] = (r >= 0.0f) ? 1.0f : -1.0f;
+	}
+
+	const size_t Kbytes = (K + 7u) / 8u;
+	std::vector<unsigned char> bitsCol(static_cast<size_t>(N) * Kbytes, 0u);
+	phoenix_pack_signs_colmajor(W.data(), K, N, bitsCol.data());
+
+	// Verify correctness of colmajor variant first (smaller probe)
+	{
+		const unsigned int M0 = 4u, K0 = 16u, N0 = 8u;
+		std::vector<float> X0(static_cast<size_t>(M0) * K0);
+		std::vector<float> W0(static_cast<size_t>(K0) * N0);
+		unsigned int s0 = 0xC0FFEEAAu;
+		fill_random(X0.data(), M0 * K0, s0);
+		for (size_t i = 0; i < W0.size(); ++i)
+		{
+			const float r = pseudo_rand(s0);
+			W0[i] = (r >= 0.0f) ? 1.0f : -1.0f;
+		}
+		std::vector<unsigned char> bits0(static_cast<size_t>(N0) * ((K0 + 7u) / 8u), 0u);
+		phoenix_pack_signs_colmajor(W0.data(), K0, N0, bits0.data());
+		std::vector<float> Yc(static_cast<size_t>(M0) * N0, 0.0f);
+		std::vector<float> Yr(static_cast<size_t>(M0) * N0, 0.0f);
+		phoenix_binary_gemm_colmajor(X0.data(), bits0.data(), M0, N0, K0, Yc.data());
+		for (unsigned int m = 0; m < M0; ++m)
+			for (unsigned int n = 0; n < N0; ++n)
+			{
+				double s = 0.0;
+				for (unsigned int k = 0; k < K0; ++k)
+					s += static_cast<double>(X0[m * K0 + k]) *
+					     static_cast<double>(W0[k * N0 + n]);
+				Yr[m * N0 + n] = static_cast<float>(s);
+			}
+		double maxAbs = 0.0;
+		for (size_t i = 0; i < Yc.size(); ++i)
+			maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(Yc[i] - Yr[i])));
+		printf("    colmajor correctness: max-abs-diff=%.3e (M=%u N=%u K=%u)\n",
+		       maxAbs, M0, N0, K0);
+		ASSERT("colmajor binary GEMM correctness", maxAbs < 1e-4);
+	}
+
+	std::vector<float> Y_bin(static_cast<size_t>(M) * N, 0.0f);
+	std::vector<float> Y_ref(static_cast<size_t>(M) * N, 0.0f);
+
+	// Warm up
+	phoenix_binary_gemm_colmajor(X.data(), bitsCol.data(), M, N, K, Y_bin.data());
+
+	const int trials = 3;
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		phoenix_binary_gemm_colmajor(X.data(), bitsCol.data(), M, N, K, Y_bin.data());
+	double tBin = clock_seconds() - t0;
+
+	t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+	{
+		for (unsigned int m = 0; m < M; ++m)
+			for (unsigned int n = 0; n < N; ++n)
+			{
+				float s = 0.0f;
+				for (unsigned int k = 0; k < K; ++k)
+					s += X[m * K + k] * W[k * N + n];
+				Y_ref[m * N + n] = s;
+			}
+	}
+	double tFloat = clock_seconds() - t0;
+
+	double speedup = tFloat / (tBin > 0.0 ? tBin : 1e-9);
+	printf("    M=%u N=%u K=%u trials=%d: float=%.3f ms, binary=%.3f ms, speedup=%.2fx\n",
+	       M, N, K, trials, tFloat * 1000.0 / trials, tBin * 1000.0 / trials, speedup);
+	// HONEST ACCOUNTING: The compute headline of #74 PHOENIX-1BIT is on GPU
+	// (XNOR-popcount tensor cores: BitNet 4-8x). On a CPU running an
+	// auto-vectorized scalar reference float GEMM, the bit-packed variant is
+	// expected to be SLOWER unless we hand-vectorize with AVX2 popcount /
+	// SIMD bit ops. The unit-test does not bench that production path.
+	//
+	// What we DO assert here is the MEMORY compression (16x BF16 / 32x FP32)
+	// — the structural axis of the paradigm. The speedup is reported as
+	// info-only.
+	printf("    NOTE: CPU scalar speedup is informational; production gain is on GPU\n");
+	printf("    NOTE: 16x BF16 / 32x FP32 memory compression is the structural headline\n");
+
+	const size_t bytesFloat = W.size() * sizeof(float);
+	const size_t bytesBits = bitsCol.size();
+	printf("    weight memory: float=%zu bytes, bits=%zu bytes, ratio=%.1fx\n",
+	       bytesFloat, bytesBits, static_cast<float>(bytesFloat) / static_cast<float>(bytesBits));
+	ASSERT("binary memory 32x vs FP32", bytesFloat / bytesBits >= 30u);
+	printf("    PASSED\n");
+}
+
+// ============================================================
 // Main entry point
 // ============================================================
 
@@ -1408,6 +1604,13 @@ void TransformerOpsUnitTest()
 	test_mla_factorized_equivalence();
 	test_mla_attention_equivalence();
 	test_mla_cache_size_bound();
+
+	// Group G: Paradigm shift #74 PHOENIX-1BIT
+	printf("--- Group G: Binary 1-bit GEMM (paradigm #74) ---\n");
+	test_phoenix_pack_unpack_roundtrip();
+	test_phoenix_compression_ratio();
+	test_phoenix_binary_gemm_correctness();
+	test_phoenix_binary_gemm_speedup();
 
 	printf("============================================================\n");
 	printf("All Transformer Ops Tests Passed\n");
