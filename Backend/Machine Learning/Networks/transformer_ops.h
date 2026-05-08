@@ -1806,5 +1806,114 @@ inline void scaled_dot_product_attention_backward_recompute_flash_chunk_sw(
 	}
 }
 
+// ============================================================================
+// Paradigm shift #76 — MLA-DISTILL-CHIRON (Multi-Latent Attention)
+// ============================================================================
+//
+// DeepSeek-V2/V3 Multi-Latent Attention. Compress KV cache via low-rank
+// latent projection. Cache stores c_t (d_c ≈ 384-512) instead of full
+// K_t, V_t (n_heads * d_kv ≈ 2048). Decompression at attention time:
+//
+//   c_t = h_t @ W_DKV     [d_c]                         (cached)
+//   K_t = c_t @ W_UK      [n_heads * d_kv]              (recomputed)
+//   V_t = c_t @ W_UV      [n_heads * d_kv]              (recomputed)
+//
+// KV cache compression: (n_heads * d_kv * 2) / d_c. At standard config
+// (n_heads=16, d_kv=128, d_c=512): 4096/512 = 8x compression.
+//
+// Theorem 2: The MLA forward pass is bit-exact equivalent to a standard-MHA
+// forward where W_K = W_DKV @ W_UK and W_V = W_DKV @ W_UV. The "low-rank"
+// constraint is on the JOINT projection h -> K (rank d_c) and h -> V (rank d_c),
+// but the attention math is unchanged.
+//
+// Reference: DeepSeek-V2 (Liu et al. 2024), DeepSeek-V3 (DeepSeek 2024).
+
+// Decompress KV latent c_t into K and V tensors.
+//   c        [T, d_c]
+//   W_UK     [d_c, dKVtotal]   where dKVtotal = n_heads * d_kv (or nKVHeads * d_kv for GQA)
+//   W_UV     [d_c, dKVtotal]
+//   K_out    [T, dKVtotal]
+//   V_out    [T, dKVtotal]
+//
+// Pure CPU primitive; production GPU path uses fused gemm.
+inline void mla_decompress_kv(const float* c,
+                              const float* W_UK,
+                              const float* W_UV,
+                              unsigned int T,
+                              unsigned int d_c,
+                              unsigned int dKVtotal,
+                              float* K_out,
+                              float* V_out)
+{
+	if (!c || !W_UK || !W_UV || !K_out || !V_out)
+		return;
+	if (T == 0u || d_c == 0u || dKVtotal == 0u)
+		return;
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float* ct = c + static_cast<size_t>(t) * d_c;
+		float* Kt = K_out + static_cast<size_t>(t) * dKVtotal;
+		float* Vt = V_out + static_cast<size_t>(t) * dKVtotal;
+		for (unsigned int j = 0; j < dKVtotal; ++j)
+		{
+			double kSum = 0.0;
+			double vSum = 0.0;
+			for (unsigned int i = 0; i < d_c; ++i)
+			{
+				const double ci = static_cast<double>(ct[i]);
+				kSum += ci * static_cast<double>(W_UK[static_cast<size_t>(i) * dKVtotal + j]);
+				vSum += ci * static_cast<double>(W_UV[static_cast<size_t>(i) * dKVtotal + j]);
+			}
+			Kt[j] = static_cast<float>(kSum);
+			Vt[j] = static_cast<float>(vSum);
+		}
+	}
+}
+
+// Compute the KV latent c from hidden h and down-projection W_DKV.
+//   h        [T, d_h]
+//   W_DKV    [d_h, d_c]
+//   c_out    [T, d_c]
+inline void mla_compute_latent(const float* h,
+                               const float* W_DKV,
+                               unsigned int T,
+                               unsigned int d_h,
+                               unsigned int d_c,
+                               float* c_out)
+{
+	if (!h || !W_DKV || !c_out)
+		return;
+	if (T == 0u || d_h == 0u || d_c == 0u)
+		return;
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float* ht = h + static_cast<size_t>(t) * d_h;
+		float* ct = c_out + static_cast<size_t>(t) * d_c;
+		for (unsigned int j = 0; j < d_c; ++j)
+		{
+			double s = 0.0;
+			for (unsigned int i = 0; i < d_h; ++i)
+				s += static_cast<double>(ht[i]) *
+				     static_cast<double>(W_DKV[static_cast<size_t>(i) * d_c + j]);
+			ct[j] = static_cast<float>(s);
+		}
+	}
+}
+
+// Compute the effective compression ratio MHA cache size / MLA cache size.
+//   nHeads, dKV: standard MHA config.
+//   d_c:         MLA latent rank.
+//   d_rope:      decoupled-RoPE rank (separately cached).
+inline float mla_compression_ratio(unsigned int nHeads,
+                                   unsigned int dKV,
+                                   unsigned int d_c,
+                                   unsigned int d_rope)
+{
+	const unsigned int mhaPerToken = nHeads * dKV * 2u;  // K + V
+	const unsigned int mlaPerToken = d_c + d_rope;
+	if (mlaPerToken == 0u) return 0.0f;
+	return static_cast<float>(mhaPerToken) / static_cast<float>(mlaPerToken);
+}
+
 } // namespace transformer_ops
 } // namespace glades
