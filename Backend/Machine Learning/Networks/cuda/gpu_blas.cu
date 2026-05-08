@@ -13,6 +13,8 @@ namespace gpu {
 namespace {
 static cublasHandle_t g_handle = 0;
 static bool g_initialized = false;
+// iter 180: when false, all wrappers below select CUBLAS_DEFAULT_MATH (no TF32).
+static bool g_tf32_enabled = true;
 static float* g_deviceOne = 0;
 
 static bool sgemm_rowmajor_impl(cublasMath_t mathMode,
@@ -140,6 +142,23 @@ static bool sgemm_batched_pointer_impl(cublasMath_t mathMode,
 }
 } // namespace
 
+// iter 180: public TF32 toggle.  __attribute__((used,visibility("default")))
+// forces the linker to keep these in libglades.so even though no other
+// glades-ml TU references them — the trainer is the only consumer.
+__attribute__((used, visibility("default")))
+void set_tf32_enabled(bool enabled)
+{
+	g_tf32_enabled = enabled;
+	if (g_initialized && g_handle)
+	{
+		cublasSetMathMode(g_handle, enabled ? CUBLAS_TF32_TENSOR_OP_MATH
+		                                     : CUBLAS_DEFAULT_MATH);
+	}
+}
+
+__attribute__((used, visibility("default")))
+bool get_tf32_enabled() { return g_tf32_enabled; }
+
 bool blasInit()
 {
 	if (g_initialized)
@@ -157,6 +176,9 @@ bool blasInit()
 	{
 		cublasSetMathMode(g_handle, CUBLAS_TF32_TENSOR_OP_MATH);
 	}
+	// Honor any prior set_tf32_enabled(false) call.  No-op if g_tf32_enabled is true.
+	if (!g_tf32_enabled)
+		cublasSetMathMode(g_handle, CUBLAS_DEFAULT_MATH);
 	float hostOne = 1.0f;
 	cudaError_t e = cudaMalloc(&g_deviceOne, sizeof(float));
 	if (e != cudaSuccess)
@@ -214,7 +236,7 @@ bool sgemm_rowmajor(int M, int N, int K,
                      float beta,
                      float* C, int ldc)
 {
-	return sgemm_rowmajor_impl(computeCapabilityMajor() >= 8 ? CUBLAS_TF32_TENSOR_OP_MATH
+	return sgemm_rowmajor_impl((g_tf32_enabled && computeCapabilityMajor() >= 8) ? CUBLAS_TF32_TENSOR_OP_MATH
 	                                                        : CUBLAS_DEFAULT_MATH,
 	                           CUBLAS_OP_N, CUBLAS_OP_N,
 	                           M, N, K,
@@ -253,7 +275,7 @@ bool sgemm_rowmajor_atb(int M, int N, int K,
                           float beta,
                           float* C, int ldc)
 {
-	return sgemm_rowmajor_impl(computeCapabilityMajor() >= 8 ? CUBLAS_TF32_TENSOR_OP_MATH
+	return sgemm_rowmajor_impl((g_tf32_enabled && computeCapabilityMajor() >= 8) ? CUBLAS_TF32_TENSOR_OP_MATH
 	                                                        : CUBLAS_DEFAULT_MATH,
 	                           CUBLAS_OP_N, CUBLAS_OP_T,
 	                           M, N, K,
@@ -328,7 +350,7 @@ bool sgemm_rowmajor_abt(int M, int N, int K,
                           float beta,
                           float* C, int ldc)
 {
-	return sgemm_rowmajor_impl(computeCapabilityMajor() >= 8 ? CUBLAS_TF32_TENSOR_OP_MATH
+	return sgemm_rowmajor_impl((g_tf32_enabled && computeCapabilityMajor() >= 8) ? CUBLAS_TF32_TENSOR_OP_MATH
 	                                                        : CUBLAS_DEFAULT_MATH,
 	                           CUBLAS_OP_T, CUBLAS_OP_N,
 	                           M, N, K,
@@ -630,7 +652,7 @@ bool sgemm_batched_pointer_atb(int M, int N, int K,
                                float** Carray, int ldc,
                                int batchCount)
 {
-	return sgemm_batched_pointer_impl(computeCapabilityMajor() >= 8 ? CUBLAS_TF32_TENSOR_OP_MATH
+	return sgemm_batched_pointer_impl((g_tf32_enabled && computeCapabilityMajor() >= 8) ? CUBLAS_TF32_TENSOR_OP_MATH
 	                                                                : CUBLAS_DEFAULT_MATH,
 	                                  CUBLAS_OP_N, CUBLAS_OP_T,
 	                                  M, N, K,
@@ -651,7 +673,7 @@ bool sgemm_batched_pointer_abt(int M, int N, int K,
                                float** Carray, int ldc,
                                int batchCount)
 {
-	return sgemm_batched_pointer_impl(computeCapabilityMajor() >= 8 ? CUBLAS_TF32_TENSOR_OP_MATH
+	return sgemm_batched_pointer_impl((g_tf32_enabled && computeCapabilityMajor() >= 8) ? CUBLAS_TF32_TENSOR_OP_MATH
 	                                                                : CUBLAS_DEFAULT_MATH,
 	                                  CUBLAS_OP_T, CUBLAS_OP_N,
 	                                  M, N, K,

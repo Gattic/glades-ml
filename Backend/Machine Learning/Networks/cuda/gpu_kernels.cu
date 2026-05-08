@@ -1105,6 +1105,38 @@ __global__ void adam_update_kernel(float* __restrict__ param,
 	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
 }
 
+// iter 181 — ASTRA paradigm #41 (Gate-0, m=1 stateless v).
+// Replaces Adam's persistent v EMA with the within-step gradient
+// magnitude v_t = g_t² + eps².  Persistent state collapses to momentum
+// `m` only (no `v`, no Kahan `c`).  Premise test: does removing the
+// long-horizon v EMA preserve convergence at small scale?
+__global__ void astra_update_kernel(float* __restrict__ param,
+                                    const float* __restrict__ grad,
+                                    float* __restrict__ m,
+                                    float lr, float beta1,
+                                    float eps, float weightDecay,
+                                    float gradScale,
+                                    int step, int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	float g = grad[idx] * gradScale;
+
+	if (weightDecay != 0.0f)
+		param[idx] -= lr * weightDecay * param[idx];
+
+	float m_new = beta1 * m[idx] + (1.0f - beta1) * g;
+	m[idx] = m_new;
+
+	float bc1 = 1.0f - powf(beta1, (float)step);
+	float m_hat = m_new / bc1;
+
+	// ASTRA: stateless v from instantaneous g², no EMA.
+	float v_inst = g * g;
+	param[idx] -= lr * m_hat / (sqrtf(v_inst) + eps);
+}
+
 } // anonymous namespace
 
 bool adam_update(float* param, const float* grad, float* m, float* v,
@@ -1115,6 +1147,18 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 	int grid = (n + kBlockElem - 1) / kBlockElem;
 	adam_update_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
 		param, grad, m, v, lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool astra_update(float* param, const float* grad, float* m,
+                  float lr, float beta1, float eps,
+                  float weightDecay, float gradScale, int step, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	astra_update_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+		param, grad, m, lr, beta1, eps, weightDecay, gradScale, step, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1155,6 +1199,7 @@ __global__ void adam_update_bf16_state_kernel(
     const float* __restrict__ grad,
     uint16_t* __restrict__ m_bf16,
     uint16_t* __restrict__ v_bf16,
+    uint16_t* __restrict__ c_bf16,   // iter 171: Kahan compensation for v (nullable)
     float lr, float beta1, float beta2,
     float eps, float weightDecay,
     float gradScale,
@@ -1174,11 +1219,40 @@ __global__ void adam_update_bf16_state_kernel(
 	const float v_old = bf16_load_as_f32(v_bf16[idx]);
 
 	const float m_new = beta1 * m_old + (1.0f - beta1) * g;
-	const float v_new = beta2 * v_old + (1.0f - beta2) * g * g;
+
+	// iter 171: Kahan-compensated v update.  Without compensation, BF16 v
+	// silently loses contributions when (1-β₂)·g² « β₂·v_old (β₂=0.999
+	// already shrinks the contribution 1000×; BF16's 3-digit mantissa
+	// rounds the sum down to β₂·v_old).  Over 100k+ steps v drifts low,
+	// Adam's m/√v becomes too large, weights overshoot.  Mid-Phase-C
+	// divergence at 1.84B × 650k run-3 (2026-04-26) — see surprise #17.
+	//
+	// Compensation: track the bits truncated when storing v as BF16
+	// last step, re-apply them this step.  Memory cost: +1 BF16/param.
+	float v_new;
+	uint16_t v_new_bf16_packed;
+	if (c_bf16 != nullptr)
+	{
+		const float c_old = bf16_load_as_f32(c_bf16[idx]);
+		const float v_decay = beta2 * v_old;
+		const float input = (1.0f - beta2) * g * g + c_old;
+		const float v_full = v_decay + input;
+		v_new_bf16_packed = bf16_store_from_f32(v_full);
+		const float v_stored = bf16_load_as_f32(v_new_bf16_packed);
+		// Residual = full-precision sum minus what BF16 actually stored.
+		// Carries forward into next step's update.
+		c_bf16[idx] = bf16_store_from_f32(v_full - v_stored);
+		v_new = v_stored;
+	}
+	else
+	{
+		v_new = beta2 * v_old + (1.0f - beta2) * g * g;
+		v_new_bf16_packed = bf16_store_from_f32(v_new);
+	}
 
 	// Store back as BF16 (round-to-nearest-even).
 	m_bf16[idx] = bf16_store_from_f32(m_new);
-	v_bf16[idx] = bf16_store_from_f32(v_new);
+	v_bf16[idx] = v_new_bf16_packed;
 
 	// Bias correction (matches FP32 adam_update_kernel).
 	const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
@@ -1200,7 +1274,26 @@ bool adam_update_bf16_state(float* param, const float* grad,
 	if (n <= 0) return true;
 	const int grid = (n + kBlockElem - 1) / kBlockElem;
 	adam_update_bf16_state_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
-	    param, grad, m_bf16, v_bf16,
+	    param, grad, m_bf16, v_bf16, /*c_bf16=*/nullptr,
+	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 171: Kahan-compensated variant — same kernel, c_bf16 buffer carries
+// the truncation residual from each step's v update into the next step.
+// See adam_update_bf16_state_kernel for mechanism.
+bool adam_update_bf16_kahan_state(float* param, const float* grad,
+                                   uint16_t* m_bf16, uint16_t* v_bf16,
+                                   uint16_t* c_bf16,
+                                   float lr, float beta1, float beta2, float eps,
+                                   float weightDecay, float gradScale,
+                                   int step, int n)
+{
+	if (n <= 0) return true;
+	const int grid = (n + kBlockElem - 1) / kBlockElem;
+	adam_update_bf16_state_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    param, grad, m_bf16, v_bf16, c_bf16,
 	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;

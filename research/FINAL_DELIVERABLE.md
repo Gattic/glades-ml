@@ -1,6 +1,6 @@
 # Glades Ralph-Loop Research Program — Final Deliverable
 
-**Date:** 2026-04-24 (session iter 75-148)
+**Date:** 2026-04-24 (session iter 75-148); **extended 2026-05-08 (iter 169-184)**
 **Brief:** "train extremely large LLMs with magnitudes of less memory and
 magnitudes faster" on 16 GB RTX 4080 SUPER consumer GPU.
 **Status:** Delivered. Three disrupting paradigm shifts shipped and validated.
@@ -240,3 +240,46 @@ The Ralph-loop research program satisfies the brief with empirical
 rigor and engineering discipline, delivering three independently-
 validated disrupting paradigm shifts that compose cleanly at the
 hardware's practical scale ceiling.
+
+---
+
+## 10. Extension: 1.84B end-to-end campaign (Apr 24 → May 8, 2026)
+
+After the iter-148 deliverable above, an end-to-end 1.84B × 650k training
+campaign exposed four additional surprises (#15–#18) and produced the
+first successfully-trained 1.84B CHIRON checkpoint. Full narrative in
+`RUN_CAMPAIGN_1.84B_2026-04-24_TO_05-08.md`.
+
+### Surprises (catalogued #15–#18)
+
+- **#15** — SAS+SLC compound shock at co-located transitions  → fixed iter-169
+- **#16** — α=1.0 + L=53 + bf16 NaN at scale  → fixed iter-170 (cap α=0.7)
+- **#17** — Mid-phase bf16 v drift  → fixed iter-171 Kahan-v
+- **#18** — CHRF resume drift  → fixed iter-182 + iter-184 (validated 18.33-nat improvement)
+
+### New iter-* patches (iter-169 → iter-184)
+
+| Range | Theme |
+|---|---|
+| 169-170 | Transition-warmup hooks + NaN guard + α-cap + auto-stagger |
+| 171-172 | Kahan-compensated bf16 Adam + memory-savings (Tier-1+2a, 5.3 GB freed at 1.84B) |
+| 173-175 | EMA divergence detector iterations (ultimately removed, false-positive prone) |
+| 176 | CHRF full-state checkpoint format (Adam + Kahan + FACE + step + cfg) + auto-detect on load + self-test |
+| 177 | `--fp32-attn` (TF32 attention path, sufficient at 1.84B) |
+| 178 | 5000-step LR mini-warmup (10× longer; absorbs L=26→53 transition) |
+| 180 | `--fp32-attn-strict` (full FP32 SGEMM, engineered but not needed in practice) |
+| 181 | `--continue` flag + auto-resume CHRF magic recognition |
+| 182 | Post-resume LR mini-warmup hook (iter-178 fires for first 5k steps after every resume) |
+| 184 | Cosine LR decay (`--lr-decay`, auto-on for `--continue`) |
+
+### Deliverable: trained 1.84B model
+
+`database/checkpoints/chiron_1.84B/chiron_1.84B.ckpt.final` (run-11, step 1,300,000, ~1.06 B tokens trained, EMA ~9.4) — the first successful 1.84B trained CHIRON checkpoint.
+
+### Empirical reality check
+
+- Training pipeline: **fully validated at 1.84B/L=53/T=1024/bf16**, stable through 1.06 B tokens across two clean runs (run-9 + run-11).
+- Output quality: **3% of Chinchilla-optimal**. Model produces gibberish — token budget, not pipeline issue.
+- Coherent-text training requires ~10-30 B tokens (~50-150 days at 1.6 steps/s). Not a code problem; a hardware-budget problem.
+
+The campaign closed with a fortified, reproducible recipe (`sh run.sh chiron --scale 1.84B --steps N --kahan-v --save-full --fp32-attn [--continue]`) that future sessions can extend or fork.

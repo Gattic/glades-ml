@@ -135,6 +135,16 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
                  float weightDecay, float gradScale, int step, int n);
 
+// iter 181 — ASTRA paradigm #41 Gate-0 (m=1 stateless v).
+// Replaces Adam's persistent v EMA with the within-step instantaneous
+// magnitude v_t = g_t².  Persistent state collapses to momentum m only —
+// no v, no Kahan c.  At m=1 this is the limiting case; the full framework
+// uses microbatch variance v_t = (1/m) Σ_i (g_t^{(i)})² with m≥4.
+// Memory at 1.84B: ~7.4 GB freed vs Adam-bf16, ~14.7 GB freed vs Adam-fp32.
+bool astra_update(float* param, const float* grad, float* m,
+                  float lr, float beta1, float eps,
+                  float weightDecay, float gradScale, int step, int n);
+
 // Adam with BF16-packed optimizer state (m, v as uint16_t BF16 views).
 // Loads are lossless-upcast to FP32, compute is FP32, stores are
 // round-to-nearest-even FP32 -> BF16. Weights + grads stay FP32.
@@ -145,6 +155,19 @@ bool adam_update_bf16_state(float* param, const float* grad,
                             float lr, float beta1, float beta2, float eps,
                             float weightDecay, float gradScale,
                             int step, int n);
+
+// iter 171: Kahan-compensated BF16 Adam.  Adds one extra BF16 buffer per
+// param (c_bf16) that carries the truncation residual of v's BF16 store
+// into the next step's update.  Eliminates the slow "bf16 v underestimate"
+// drift that destabilized 1.84B × 650k run-3 mid-Phase-C (surprise #17).
+// Memory cost: +1 BF16 / parameter (= 50% more Adam VRAM than plain bf16).
+// Math is unchanged from adam_update_bf16_state up to the recovered low bits.
+bool adam_update_bf16_kahan_state(float* param, const float* grad,
+                                   uint16_t* m_bf16, uint16_t* v_bf16,
+                                   uint16_t* c_bf16,
+                                   float lr, float beta1, float beta2, float eps,
+                                   float weightDecay, float gradScale,
+                                   int step, int n);
 
 // Adam with int8-packed optimizer state (block-wise absmax scale).
 // Asymmetric: m as signed int8 [-127, 127] scaled by absmax/127;
@@ -586,6 +609,12 @@ inline int adam_int8_scale_count(int n) { return (n + 255) / 256; }
 inline bool adam_update_bf16_state(float*, const float*, uint16_t*, uint16_t*,
                                    float, float, float, float, float, float,
                                    int, int) { return false; }
+inline bool adam_update_bf16_kahan_state(float*, const float*, uint16_t*, uint16_t*,
+                                          uint16_t*, float, float, float, float, float, float,
+                                          int, int) { return false; }
+inline bool astra_update(float*, const float*, float*,
+                          float, float, float, float, float,
+                          int, int) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}

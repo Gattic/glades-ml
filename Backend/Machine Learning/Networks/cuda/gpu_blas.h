@@ -27,6 +27,14 @@ bool sgemm_rowmajor(int M, int N, int K,
                      float beta,
                      float* C, int ldc);
 
+// iter 180: global runtime toggle for TF32 tensor-core SGEMM.  When disabled
+// (via set_tf32_enabled(false)), all SGEMM wrappers fall through to
+// CUBLAS_DEFAULT_MATH (true FP32 accumulation, 23-bit mantissa).  Used by
+// the trainer's --fp32-attn-strict flag to remove all bf16/TF32 precision
+// concerns when L-transition stability is the bottleneck.  Default: true.
+void set_tf32_enabled(bool enabled);
+bool get_tf32_enabled();
+
 // Exact row-major SGEMM using default cuBLAS math mode.
 // This avoids TF32 tensor-core contraction on Ampere+ for parity-sensitive paths.
 bool sgemm_rowmajor_exact(int M, int N, int K,
@@ -295,6 +303,8 @@ inline bool sgemm_rowmajor_abt_exact(int, int, int, float, const float*, int, co
 inline bool sgemm_rowmajor_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
+inline void set_tf32_enabled(bool) {}
+inline bool get_tf32_enabled() { return false; }
 inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, float, float*) { return false; }
 inline bool sgemm_batched_strided(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
 inline bool sgemm_batched_strided_abt(int, int, int, float, const float*, int, long long int, const float*, int, long long int, float, float*, int, long long int, int) { return false; }
