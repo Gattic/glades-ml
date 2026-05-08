@@ -921,7 +921,7 @@ static void test_training_optimizer_gate_and_eval_contract()
 	assert_status_error(trainSt,
 	                    glades::NNetworkStatus::INVALID_ARGUMENT,
 	                    "SGDHelper_TRANSFORMER: ",
-	                    "requires optimizer=ADAMW or ATLAS");
+	                    "requires optimizer=ADAMW, ATLAS, VESTA, or HELIOS");
 	ASSERT("optimizer-gated train should not emit epoch metrics", !trainCb.sawEpoch);
 
 	printf("    PASSED\n");
