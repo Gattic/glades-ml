@@ -19,6 +19,11 @@ using glades::transformer_ops::scaled_dot_product_attention_forward;
 using glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided;
 using glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided;
 using glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_chunk;
+using glades::transformer_ops::sw_key_allowed;
+using glades::transformer_ops::sw_visited_count;
+using glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided_sw;
+using glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided_sw;
+using glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_chunk_sw;
 using glades::transformer_kernels::silu_forward_buf;
 using glades::transformer_kernels::gelu_forward_buf;
 using glades::transformer_kernels::silu_backward_buf;
@@ -739,6 +744,412 @@ static void test_flash_chunk_gradient_finite_diff()
 }
 
 // ============================================================
+// Group E: Paradigm shift #78 ATTENTION-SINK-DISTILL-CHIRON
+// ============================================================
+// Probe per #103 spec — verify mechanism + cache plateau + gradient
+// correctness + throughput. Quality (NLL drift at LLM scale) is
+// verified by chiron_train; here we cover structural correctness.
+
+#include <ctime>
+
+static double clock_seconds()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+}
+
+static void test_sw_key_allowed_semantics()
+{
+	printf("  [E1] SinkWindowKeyAllowedSemantics ...\n");
+	// disabled => always allowed
+	ASSERT("sw disabled allows u=0", sw_key_allowed(100u, 0u, 0u, 0u, NULL));
+	ASSERT("sw disabled allows u=99", sw_key_allowed(100u, 99u, 0u, 0u, NULL));
+	// sink only (S=4, W=0): u<4 allowed; else not
+	ASSERT("sink u=0 allowed", sw_key_allowed(100u, 0u, 4u, 0u, NULL));
+	ASSERT("sink u=3 allowed", sw_key_allowed(100u, 3u, 4u, 0u, NULL));
+	ASSERT("sink u=4 not allowed", !sw_key_allowed(100u, 4u, 4u, 0u, NULL));
+	// window only (S=0, W=8) at t=100: u in (92, 100] allowed
+	ASSERT("window u=92 not allowed (t-u==8)", !sw_key_allowed(100u, 92u, 0u, 8u, NULL));
+	ASSERT("window u=93 allowed (t-u==7)", sw_key_allowed(100u, 93u, 0u, 8u, NULL));
+	ASSERT("window u=100 allowed (t-u==0)", sw_key_allowed(100u, 100u, 0u, 8u, NULL));
+	// sink+window (S=4, W=8) at t=100: u<4 OR u>92
+	ASSERT("sink+win u=0 allowed", sw_key_allowed(100u, 0u, 4u, 8u, NULL));
+	ASSERT("sink+win u=3 allowed", sw_key_allowed(100u, 3u, 4u, 8u, NULL));
+	ASSERT("sink+win u=4 not allowed", !sw_key_allowed(100u, 4u, 4u, 8u, NULL));
+	ASSERT("sink+win u=50 not allowed", !sw_key_allowed(100u, 50u, 4u, 8u, NULL));
+	ASSERT("sink+win u=93 allowed", sw_key_allowed(100u, 93u, 4u, 8u, NULL));
+	ASSERT("sink+win u=100 allowed", sw_key_allowed(100u, 100u, 4u, 8u, NULL));
+	// keyAllowed override
+	unsigned char ka[8] = {1u,1u,1u,1u,1u,1u,1u,0u};
+	ASSERT("sink+win keyAllowed=0 not allowed", !sw_key_allowed(7u, 7u, 4u, 8u, ka));
+	printf("    PASSED\n");
+}
+
+static void test_sw_visited_count_plateau()
+{
+	printf("  [E2] SinkWindowVisitedCountPlateau ...\n");
+	// At sink=4, window=64: as T grows, the count of visited keys per row
+	// at large t plateaus at S + W = 68.
+	const unsigned int S = 4u;
+	const unsigned int W = 64u;
+	const unsigned int T = 1024u;
+	for (unsigned int t = 0u; t < T; ++t)
+	{
+		unsigned int n = sw_visited_count(t, T, true /*causal*/, S, W, NULL);
+		// For t < S+W (early): n is bounded by t+1 (all causal positions allowed because of overlap).
+		// For t >= S+W-1: n exactly equals S + W (plateau).
+		if (t + 1u <= S + W)
+		{
+			ASSERT("early t bounded by t+1", n == t + 1u);
+		}
+		else
+		{
+			ASSERT("plateau at S+W after warmup", n == S + W);
+		}
+	}
+	printf("    PASSED (cache plateau at S+W=%u for T=%u)\n", S + W, T);
+}
+
+static void test_sw_forward_degenerate_full_attention()
+{
+	printf("  [E3] SinkWindowForwardDegenerateMatchesFullAttention ...\n");
+	// When sinkCount >= T, every key is a sink => same as full attention.
+	const unsigned int T = 8u;
+	const unsigned int dK = 4u;
+	const unsigned int dV = 4u;
+	std::vector<float> Q(static_cast<size_t>(T) * dK);
+	std::vector<float> K(static_cast<size_t>(T) * dK);
+	std::vector<float> V(static_cast<size_t>(T) * dV);
+	unsigned int seed = 0xC0FFEEu;
+	fill_random(Q.data(), T * dK, seed);
+	fill_random(K.data(), T * dK, seed);
+	fill_random(V.data(), T * dV, seed);
+
+	std::vector<float> Ofull(static_cast<size_t>(T) * dV, 0.0f);
+	std::vector<float> Osw(static_cast<size_t>(T) * dV, 0.0f);
+
+	scaled_dot_product_attention_forward_flash_strided(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    T, dK, dV, true, Ofull.data(), dV, NULL);
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    T, dK, dV, true, T /*S>=T*/, 0u, Osw.data(), dV, NULL);
+
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < Ofull.size(); ++i)
+	{
+		double d = std::fabs(static_cast<double>(Ofull[i]) - static_cast<double>(Osw[i]));
+		if (d > maxAbs) maxAbs = d;
+	}
+	printf("    max |Ofull - Osw|=%.3e (degenerate sinkCount=T)\n", maxAbs);
+	ASSERT("sw forward S=T parity with full", maxAbs < 1e-5);
+
+	// And: sinkCount=0, windowSize=T also matches.
+	std::fill(Osw.begin(), Osw.end(), 0.0f);
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    T, dK, dV, true, 0u, T /*W>=T*/, Osw.data(), dV, NULL);
+	maxAbs = 0.0;
+	for (size_t i = 0; i < Ofull.size(); ++i)
+	{
+		double d = std::fabs(static_cast<double>(Ofull[i]) - static_cast<double>(Osw[i]));
+		if (d > maxAbs) maxAbs = d;
+	}
+	printf("    max |Ofull - Osw|=%.3e (degenerate windowSize=T)\n", maxAbs);
+	ASSERT("sw forward W=T parity with full", maxAbs < 1e-5);
+	printf("    PASSED\n");
+}
+
+static void test_sw_forward_mask_applied()
+{
+	printf("  [E4] SinkWindowForwardMaskApplied ...\n");
+	// At long T relative to S+W, the output at a late row should depend
+	// only on sinks and recent window — verify by changing K/V at out-of-range
+	// positions and checking the output is unchanged.
+	const unsigned int T = 64u;
+	const unsigned int dK = 4u;
+	const unsigned int dV = 4u;
+	const unsigned int S = 4u;
+	const unsigned int W = 8u;
+	std::vector<float> Q(static_cast<size_t>(T) * dK);
+	std::vector<float> K(static_cast<size_t>(T) * dK);
+	std::vector<float> V(static_cast<size_t>(T) * dV);
+	unsigned int seed = 0xBADF00Du;
+	fill_random(Q.data(), T * dK, seed);
+	fill_random(K.data(), T * dK, seed);
+	fill_random(V.data(), T * dV, seed);
+
+	std::vector<float> O1(static_cast<size_t>(T) * dV, 0.0f);
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    T, dK, dV, true, S, W, O1.data(), dV, NULL);
+
+	// Perturb K and V at u=20 (which is between S=4 and t-W=63-8=55 at last row,
+	// i.e., out of range for query t=63).
+	const unsigned int uPerturb = 20u;
+	for (unsigned int k = 0; k < dK; ++k)
+		K[static_cast<size_t>(uPerturb) * dK + k] += 100.0f;
+	for (unsigned int dv = 0; dv < dV; ++dv)
+		V[static_cast<size_t>(uPerturb) * dV + dv] += 100.0f;
+
+	std::vector<float> O2(static_cast<size_t>(T) * dV, 0.0f);
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    T, dK, dV, true, S, W, O2.data(), dV, NULL);
+
+	// Last row (t=T-1=63) should be unchanged.
+	const size_t tLastOff = static_cast<size_t>(T - 1u) * dV;
+	double maxAbsLast = 0.0;
+	for (unsigned int dv = 0; dv < dV; ++dv)
+	{
+		double d = std::fabs(static_cast<double>(O1[tLastOff + dv]) - static_cast<double>(O2[tLastOff + dv]));
+		if (d > maxAbsLast) maxAbsLast = d;
+	}
+	// Earlier rows (those whose window includes uPerturb) MUST differ — sanity check.
+	double maxAbsEarly = 0.0;
+	for (unsigned int t = 21u; t < 28u; ++t)
+	{
+		const size_t off = static_cast<size_t>(t) * dV;
+		for (unsigned int dv = 0; dv < dV; ++dv)
+		{
+			double d = std::fabs(static_cast<double>(O1[off + dv]) - static_cast<double>(O2[off + dv]));
+			if (d > maxAbsEarly) maxAbsEarly = d;
+		}
+	}
+	printf("    last-row max-abs-diff=%.3e (must be ~0); affected-window diff=%.3e (must be > 0)\n", maxAbsLast, maxAbsEarly);
+	ASSERT("sw mask: last row unaffected by out-of-window K/V perturbation", maxAbsLast < 1e-5);
+	ASSERT("sw mask: in-window rows respond to K/V perturbation", maxAbsEarly > 1e-3);
+	printf("    PASSED\n");
+}
+
+static void test_sw_backward_finite_diff()
+{
+	printf("  [E5] SinkWindowBackwardGradientFiniteDiff ...\n");
+	const unsigned int T = 16u;
+	const unsigned int dK = 4u;
+	const unsigned int dV = 4u;
+	const unsigned int S = 2u;
+	const unsigned int W = 4u;
+	std::vector<float> Q(static_cast<size_t>(T) * dK);
+	std::vector<float> K(static_cast<size_t>(T) * dK);
+	std::vector<float> V(static_cast<size_t>(T) * dV);
+	unsigned int seed = 0xDEADBEEFu;
+	fill_random(Q.data(), T * dK, seed);
+	fill_random(K.data(), T * dK, seed);
+	fill_random(V.data(), T * dV, seed);
+
+	// dO = ones (loss = sum of all O entries)
+	std::vector<float> dO(static_cast<size_t>(T) * dV, 1.0f);
+	std::vector<float> dQ(Q.size(), 0.0f);
+	std::vector<float> dK_(K.size(), 0.0f);
+	std::vector<float> dV_(V.size(), 0.0f);
+
+	scaled_dot_product_attention_backward_recompute_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    dO.data(), dV, T, dK, dV, true, S, W,
+	    dQ.data(), dK, dK_.data(), dK, dV_.data(), dV, NULL);
+
+	// Check dQ at t=8, k=0 via finite-diff on sum-of-O loss.
+	const unsigned int tCheck = 8u;
+	const unsigned int kCheck = 0u;
+	const float epsfd = 1e-3f;
+	const size_t qIdx = static_cast<size_t>(tCheck) * dK + kCheck;
+	const float origQ = Q[qIdx];
+
+	std::vector<float> Oplus(static_cast<size_t>(T) * dV, 0.0f);
+	std::vector<float> Ominus(static_cast<size_t>(T) * dV, 0.0f);
+	Q[qIdx] = origQ + epsfd;
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV, T, dK, dV, true, S, W, Oplus.data(), dV, NULL);
+	Q[qIdx] = origQ - epsfd;
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV, T, dK, dV, true, S, W, Ominus.data(), dV, NULL);
+	Q[qIdx] = origQ;
+
+	double sumPlus = 0.0;
+	double sumMinus = 0.0;
+	for (size_t i = 0; i < Oplus.size(); ++i) sumPlus += Oplus[i];
+	for (size_t i = 0; i < Ominus.size(); ++i) sumMinus += Ominus[i];
+	double numerical = (sumPlus - sumMinus) / (2.0 * static_cast<double>(epsfd));
+	double analytical = static_cast<double>(dQ[qIdx]);
+
+	double absA = std::fabs(analytical);
+	double absN = std::fabs(numerical);
+	double denom = (absA > absN) ? absA : absN;
+	if (denom < 1e-7) denom = 1e-7;
+	double relErr = std::fabs(analytical - numerical) / denom;
+	printf("    analytical dQ[t=%u][k=%u]=%.6e, numerical=%.6e, relErr=%.3e\n",
+	       tCheck, kCheck, analytical, numerical, relErr);
+	ASSERT("sw backward dQ finite-diff", relErr < 5e-2);
+	printf("    PASSED\n");
+}
+
+static void test_sw_throughput_speedup()
+{
+	printf("  [E6] SinkWindowThroughputSpeedup ...\n");
+	// Profile: full vs sink+window forward at moderate T on CPU.
+	// The speedup target per #78 design: 5.85× at T=2052, W=2048, S=4.
+	// We test at a smaller T (since CPU only) — expect at least
+	// 1.5× speedup at T=512, S=4, W=64 (T/(S+W) ≈ 7.5× theoretical).
+	const unsigned int T = 512u;
+	const unsigned int dK = 32u;
+	const unsigned int dV = 32u;
+	const unsigned int S = 4u;
+	const unsigned int W = 64u;
+	std::vector<float> Q(static_cast<size_t>(T) * dK);
+	std::vector<float> K(static_cast<size_t>(T) * dK);
+	std::vector<float> V(static_cast<size_t>(T) * dV);
+	unsigned int seed = 0xCAFEBABEu;
+	fill_random(Q.data(), T * dK, seed);
+	fill_random(K.data(), T * dK, seed);
+	fill_random(V.data(), T * dV, seed);
+
+	std::vector<float> Ofull(static_cast<size_t>(T) * dV, 0.0f);
+	std::vector<float> Osw(static_cast<size_t>(T) * dV, 0.0f);
+
+	const int trials = 5;
+	// Warm up
+	scaled_dot_product_attention_forward_flash_strided(
+	    Q.data(), dK, K.data(), dK, V.data(), dV, T, dK, dV, true, Ofull.data(), dV, NULL);
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV, T, dK, dV, true, S, W, Osw.data(), dV, NULL);
+
+	double tFull = 0.0;
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+	{
+		scaled_dot_product_attention_forward_flash_strided(
+		    Q.data(), dK, K.data(), dK, V.data(), dV, T, dK, dV, true, Ofull.data(), dV, NULL);
+	}
+	tFull = clock_seconds() - t0;
+
+	double tSW = 0.0;
+	t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+	{
+		scaled_dot_product_attention_forward_flash_strided_sw(
+		    Q.data(), dK, K.data(), dK, V.data(), dV, T, dK, dV, true, S, W, Osw.data(), dV, NULL);
+	}
+	tSW = clock_seconds() - t0;
+
+	double speedup = tFull / (tSW > 0.0 ? tSW : 1e-9);
+	printf("    T=%u dK=%u S=%u W=%u trials=%d: full=%.3f ms, sw=%.3f ms, speedup=%.2fx\n",
+	       T, dK, S, W, trials,
+	       tFull * 1000.0 / trials, tSW * 1000.0 / trials, speedup);
+	// Theoretical lower bound is ~T/(S+W) * pessimism factor.
+	// For T=512, S=4, W=64: theoretical ≈ 7.5×; we'll require >= 1.5× to allow noise.
+	ASSERT("sw forward provides measurable speedup at T=512, S+W=68", speedup >= 1.5);
+	printf("    PASSED (theoretical ~%.1fx; observed %.2fx)\n",
+	       static_cast<double>(T) / static_cast<double>(S + W), speedup);
+
+	// Profile sweep across T to show how speedup scales (info-only).
+	printf("    [profile sweep] sink+window vs full attention (S=4, W=64, dK=dV=32, trials=3):\n");
+	const unsigned int Tsweep[] = {256u, 1024u, 2048u, 4096u};
+	const unsigned int nSweep = sizeof(Tsweep) / sizeof(Tsweep[0]);
+	for (unsigned int si = 0; si < nSweep; ++si)
+	{
+		const unsigned int Tt = Tsweep[si];
+		std::vector<float> Qt(static_cast<size_t>(Tt) * dK);
+		std::vector<float> Kt(static_cast<size_t>(Tt) * dK);
+		std::vector<float> Vt(static_cast<size_t>(Tt) * dV);
+		std::vector<float> Ot(static_cast<size_t>(Tt) * dV, 0.0f);
+		unsigned int sweepSeed = 0xFEEDD00Du;
+		fill_random(Qt.data(), Tt * dK, sweepSeed);
+		fill_random(Kt.data(), Tt * dK, sweepSeed);
+		fill_random(Vt.data(), Tt * dV, sweepSeed);
+
+		const int trials_s = 3;
+		double t0s = clock_seconds();
+		for (int i = 0; i < trials_s; ++i)
+		{
+			scaled_dot_product_attention_forward_flash_strided(
+			    Qt.data(), dK, Kt.data(), dK, Vt.data(), dV,
+			    Tt, dK, dV, true, Ot.data(), dV, NULL);
+		}
+		double tFs = clock_seconds() - t0s;
+		t0s = clock_seconds();
+		for (int i = 0; i < trials_s; ++i)
+		{
+			scaled_dot_product_attention_forward_flash_strided_sw(
+			    Qt.data(), dK, Kt.data(), dK, Vt.data(), dV,
+			    Tt, dK, dV, true, S, W, Ot.data(), dV, NULL);
+		}
+		double tWs = clock_seconds() - t0s;
+		double sp = tFs / (tWs > 0.0 ? tWs : 1e-9);
+		printf("      T=%5u: full=%7.2f ms, sw=%6.2f ms, speedup=%5.2fx (theoretical %.1fx)\n",
+		       Tt, tFs * 1000.0 / trials_s, tWs * 1000.0 / trials_s, sp,
+		       static_cast<double>(Tt) / static_cast<double>(S + W));
+	}
+}
+
+static void test_sw_chunk_matches_full_sw()
+{
+	printf("  [E7] SinkWindowChunkMatchesFullSinkWindow ...\n");
+	const unsigned int T = 32u;
+	const unsigned int dK = 4u;
+	const unsigned int dV = 4u;
+	const unsigned int S = 2u;
+	const unsigned int W = 8u;
+	std::vector<float> Q(static_cast<size_t>(T) * dK);
+	std::vector<float> K(static_cast<size_t>(T) * dK);
+	std::vector<float> V(static_cast<size_t>(T) * dV);
+	unsigned int seed = 0x1337u;
+	fill_random(Q.data(), T * dK, seed);
+	fill_random(K.data(), T * dK, seed);
+	fill_random(V.data(), T * dV, seed);
+
+	std::vector<float> dO(static_cast<size_t>(T) * dV, 1.0f);
+
+	// Full backward (sw)
+	std::vector<float> dQa(Q.size(), 0.0f);
+	std::vector<float> dKa(K.size(), 0.0f);
+	std::vector<float> dVa(V.size(), 0.0f);
+	scaled_dot_product_attention_backward_recompute_flash_strided_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    dO.data(), dV, T, dK, dV, true, S, W,
+	    dQa.data(), dK, dKa.data(), dK, dVa.data(), dV, NULL);
+
+	// Chunked: two halves, into local dK/dV buffers, then summed.
+	std::vector<float> dQb(Q.size(), 0.0f);
+	std::vector<float> dKlocal1(K.size(), 0.0f);
+	std::vector<float> dVlocal1(V.size(), 0.0f);
+	std::vector<float> dKlocal2(K.size(), 0.0f);
+	std::vector<float> dVlocal2(V.size(), 0.0f);
+	scaled_dot_product_attention_backward_recompute_flash_chunk_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    dO.data(), dV, 0u, T / 2u,
+	    T, dK, dV, true, S, W,
+	    dQb.data(), dK, dKlocal1.data(), dVlocal1.data(), NULL);
+	scaled_dot_product_attention_backward_recompute_flash_chunk_sw(
+	    Q.data(), dK, K.data(), dK, V.data(), dV,
+	    dO.data(), dV, T / 2u, T,
+	    T, dK, dV, true, S, W,
+	    dQb.data(), dK, dKlocal2.data(), dVlocal2.data(), NULL);
+
+	// Sum chunks for dK/dV comparison.
+	std::vector<float> dKb(K.size(), 0.0f);
+	std::vector<float> dVb(V.size(), 0.0f);
+	for (size_t i = 0; i < dKb.size(); ++i)
+		dKb[i] = dKlocal1[i] + dKlocal2[i];
+	for (size_t i = 0; i < dVb.size(); ++i)
+		dVb[i] = dVlocal1[i] + dVlocal2[i];
+
+	double maxQ = 0.0, maxK = 0.0, maxV = 0.0;
+	for (size_t i = 0; i < dQa.size(); ++i)
+		maxQ = std::max(maxQ, std::fabs(static_cast<double>(dQa[i] - dQb[i])));
+	for (size_t i = 0; i < dKa.size(); ++i)
+		maxK = std::max(maxK, std::fabs(static_cast<double>(dKa[i] - dKb[i])));
+	for (size_t i = 0; i < dVa.size(); ++i)
+		maxV = std::max(maxV, std::fabs(static_cast<double>(dVa[i] - dVb[i])));
+	printf("    max |dQ_full - dQ_chunk|=%.3e, dK=%.3e, dV=%.3e\n", maxQ, maxK, maxV);
+	ASSERT("sw chunk dQ parity with full", maxQ < 1e-5);
+	ASSERT("sw chunk dK parity with full", maxK < 1e-5);
+	ASSERT("sw chunk dV parity with full", maxV < 1e-5);
+	printf("    PASSED\n");
+}
+
+// ============================================================
 // Main entry point
 // ============================================================
 
@@ -784,6 +1195,16 @@ void TransformerOpsUnitTest()
 	test_flash_chunk_two_halves_match_full();
 	test_flash_chunk_do_zero();
 	test_flash_chunk_gradient_finite_diff();
+
+	// Group E: Paradigm shift #78 ATTENTION-SINK-DISTILL-CHIRON
+	printf("--- Group E: Attention-Sink + Sliding Window (paradigm #78) ---\n");
+	test_sw_key_allowed_semantics();
+	test_sw_visited_count_plateau();
+	test_sw_forward_degenerate_full_attention();
+	test_sw_forward_mask_applied();
+	test_sw_backward_finite_diff();
+	test_sw_throughput_speedup();
+	test_sw_chunk_matches_full_sw();
 
 	printf("============================================================\n");
 	printf("All Transformer Ops Tests Passed\n");

@@ -7679,18 +7679,27 @@ void glades::NNetwork::transformerCpuForwardPass(const TransformerEpochCfg& cfg,
 				actx.nHeads = nHeads; actx.nKVHeads = nKVHeads; actx.T = T;
 				actx.groupSize = groupSize; actx.causal = causal;
 				actx.keyAllowed = keyAllowed.empty() ? NULL : &keyAllowed[0];
+				actx.sinkCount = trainingConfig.transformer.attnSinkCount > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.attnSinkCount) : 0u;
+				actx.windowSize = trainingConfig.transformer.localAttnWindow > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.localAttnWindow) : 0u;
 				pool.parallel_for(nHeads, attn_fwd_body, &actx);
 			}
 			else
 			{
+				const unsigned int sinkCount_fb = trainingConfig.transformer.attnSinkCount > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.attnSinkCount) : 0u;
+				const unsigned int windowSize_fb = trainingConfig.transformer.localAttnWindow > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.localAttnWindow) : 0u;
 				for (unsigned int h = 0; h < nHeads; ++h)
 				{
 					const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
-					glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided(
+					glades::transformer_ops::scaled_dot_product_attention_forward_flash_strided_sw(
 					    Q + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
 					    K + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
 					    V + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
 					    T, dHead, dHead, causal,
+					    sinkCount_fb, windowSize_fb,
 					    attnConcat + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
 					    keyAllowed.empty() ? NULL : &keyAllowed[0]);
 				}
@@ -8846,6 +8855,10 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 					if (nChunksPerHead > 4u) nChunksPerHead = 4u;
 				}
 
+				const unsigned int sinkCount_bw = trainingConfig.transformer.attnSinkCount > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.attnSinkCount) : 0u;
+				const unsigned int windowSize_bw = trainingConfig.transformer.localAttnWindow > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.localAttnWindow) : 0u;
 				if (nChunksPerHead <= 1u)
 				{
 					AttnBwdCtx actx;
@@ -8858,6 +8871,7 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 					actx.causal = causal; actx.keyAllowed = NULL;
 					actx.nChunksPerHead = 1u; actx.totalItems = nKVHeads;
 					actx.dKVscratch = NULL;
+					actx.sinkCount = sinkCount_bw; actx.windowSize = windowSize_bw;
 					pool.parallel_for(nKVHeads, attn_bwd_body, &actx);
 				}
 				else
@@ -8879,6 +8893,7 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 					actx.causal = causal; actx.keyAllowed = NULL;
 					actx.nChunksPerHead = nChunksPerHead; actx.totalItems = totalItems;
 					actx.dKVscratch = &transformerScratch.dKVscratch[0];
+					actx.sinkCount = sinkCount_bw; actx.windowSize = windowSize_bw;
 					pool.parallel_for(totalItems, attn_bwd_body, &actx);
 
 					AttnBwdReduceCtx rctx;
@@ -8892,15 +8907,20 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 			}
 			else
 			{
+				const unsigned int sinkCount_fb = trainingConfig.transformer.attnSinkCount > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.attnSinkCount) : 0u;
+				const unsigned int windowSize_fb = trainingConfig.transformer.localAttnWindow > 0
+				    ? static_cast<unsigned int>(trainingConfig.transformer.localAttnWindow) : 0u;
 				for (unsigned int h = 0; h < nHeads; ++h)
 				{
 					const unsigned int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0u ? (h / groupSize) : 0u);
-					glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided(
+					glades::transformer_ops::scaled_dot_product_attention_backward_recompute_flash_strided_sw(
 					    Qfull + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
 					    Kfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
 					    Vfull + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
 					    dAttnConcat.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
 					    T, dHead, dHead, causal,
+					    sinkCount_fb, windowSize_fb,
 					    dQfull.data() + static_cast<size_t>(h) * static_cast<size_t>(dHead), dModel,
 					    dKfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,
 					    dVfull.data() + static_cast<size_t>(kvHead) * static_cast<size_t>(dHead), dModelKV,

@@ -167,6 +167,18 @@ struct TransformerRunConfig
 	// `--local-attn` benchmarks (5.2-38.1× speedup at T=2k-16k).
 	int localAttnWindow;
 
+	// Attention-sink count (paradigm shift #78 ATTENTION-SINK-DISTILL-CHIRON).
+	// If > 0, the first `attnSinkCount` positions are always allowed in
+	// attention regardless of sliding-window restriction. Composes with
+	// localAttnWindow (W) to give StreamingLLM-style infinite-context
+	// attention: keys are allowed iff (u < S) OR (u + W > t), with causal
+	// restriction u <= t. KV cache is bounded at S+W positions independent
+	// of total context length T. Default 0 = disabled.
+	// Reference: Xiao et al. 2023 "Efficient Streaming Language Models with
+	// Attention Sinks". Production-validated by vLLM, lmdeploy, llama.cpp,
+	// MLC-LLM, TGI.
+	int attnSinkCount;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -191,7 +203,8 @@ struct TransformerRunConfig
 	      ffnActivation(FFN_RELU),
 	      embeddingDropoutRate(0.0f),
 	      residualDropoutRate(0.0f),
-	      localAttnWindow(0)
+	      localAttnWindow(0),
+	      attnSinkCount(0)
 	{
 	}
 };

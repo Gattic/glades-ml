@@ -1452,5 +1452,359 @@ inline void scaled_dot_product_attention_backward_recompute_strided(const float*
 	}
 }
 
+// ============================================================================
+// Paradigm shift #78 — ATTENTION-SINK-DISTILL-CHIRON (StreamingLLM-style)
+// ============================================================================
+//
+// Sink+window attention. For each query position t and key position u
+// (with causal restriction u <= t), key u is allowed iff:
+//
+//   (sinkCount == 0 AND windowSize == 0)  // both disabled => full causal
+//   OR  u < sinkCount                     // sink (always allowed)
+//   OR  (windowSize > 0 AND u + windowSize > t)  // within sliding window
+//
+// At t large with windowSize=W and sinkCount=S: visited keys = S + W (constant).
+// KV cache for this query references (S + W) entries, INDEPENDENT of T.
+//
+// Reference: Xiao et al. 2023, "Efficient Streaming Language Models with
+// Attention Sinks" (StreamingLLM). vLLM/lmdeploy/llama.cpp/MLC-LLM/TGI all
+// ship native attention-sink in their inference paths.
+
+inline bool sw_key_allowed(unsigned int t,
+                           unsigned int u,
+                           unsigned int sinkCount,
+                           unsigned int windowSize,
+                           const unsigned char* keyAllowed)
+{
+	if (keyAllowed && keyAllowed[u] == 0u)
+		return false;
+	if (sinkCount == 0u && windowSize == 0u)
+		return true;
+	if (u < sinkCount)
+		return true;
+	if (windowSize > 0u && (u + windowSize) > t)
+		return true;
+	return false;
+}
+
+inline unsigned int sw_visited_count(unsigned int t,
+                                     unsigned int T,
+                                     bool causal,
+                                     unsigned int sinkCount,
+                                     unsigned int windowSize,
+                                     const unsigned char* keyAllowed)
+{
+	const unsigned int maxU = causal ? t : (T - 1u);
+	unsigned int n = 0u;
+	for (unsigned int u = 0; u <= maxU && u < T; ++u)
+	{
+		if (sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+			++n;
+	}
+	return n;
+}
+
+inline void scaled_dot_product_attention_forward_flash_strided_sw(const float* Qbase,
+                                                                  unsigned int qStride,
+                                                                  const float* Kbase,
+                                                                  unsigned int kStride,
+                                                                  const float* Vbase,
+                                                                  unsigned int vStride,
+                                                                  unsigned int T,
+                                                                  unsigned int dK,
+                                                                  unsigned int dV,
+                                                                  bool causal,
+                                                                  unsigned int sinkCount,
+                                                                  unsigned int windowSize,
+                                                                  float* Obase,
+                                                                  unsigned int oStride,
+                                                                  const unsigned char* keyAllowed)
+{
+	if (sinkCount == 0u && windowSize == 0u)
+	{
+		scaled_dot_product_attention_forward_flash_strided(Qbase, qStride, Kbase, kStride, Vbase, vStride,
+		                                                   T, dK, dV, causal, Obase, oStride, keyAllowed);
+		return;
+	}
+	if (!Qbase || !Kbase || !Vbase || !Obase)
+		return;
+	if (T == 0u || dK == 0u || dV == 0u)
+		return;
+
+	const float invSqrt = 1.0f / static_cast<float>(sqrt(static_cast<double>(dK)));
+
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float* qt = Qbase + static_cast<size_t>(t) * static_cast<size_t>(qStride);
+		float* ot = Obase + static_cast<size_t>(t) * static_cast<size_t>(oStride);
+		for (unsigned int dv = 0; dv < dV; ++dv)
+			ot[dv] = 0.0f;
+
+		const unsigned int maxU = causal ? t : (T - 1u);
+
+		float m = -1e30f;
+		double l = 0.0;
+		bool any = false;
+
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (!sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+				continue;
+#if defined(__SSE2__)
+			if ((u & 31u) == 0u && (u + 32u) <= maxU)
+			{
+				const float* kpf = Kbase + static_cast<size_t>(u + 32u) * static_cast<size_t>(kStride);
+				_mm_prefetch(reinterpret_cast<const char*>(kpf), _MM_HINT_T0);
+			}
+#endif
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
+			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
+
+			if (!any)
+			{
+				any = true;
+				m = s;
+				l = 1.0;
+				const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
+				for (unsigned int dv = 0; dv < dV; ++dv)
+					ot[dv] = vu[dv];
+				continue;
+			}
+
+			const float newM = (s > m) ? s : m;
+			const float alpha = expf(m - newM);
+			const float beta = expf(s - newM);
+			l = l * static_cast<double>(alpha) + static_cast<double>(beta);
+			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
+			for (unsigned int dv = 0; dv < dV; ++dv)
+				ot[dv] = (ot[dv] * alpha) + (beta * vu[dv]);
+			m = newM;
+		}
+
+		if (!any || !(l > 0.0))
+			continue;
+
+		const float invL = static_cast<float>(1.0 / l);
+		for (unsigned int dv = 0; dv < dV; ++dv)
+			ot[dv] *= invL;
+	}
+}
+
+inline void scaled_dot_product_attention_backward_recompute_flash_strided_sw(const float* Qbase,
+                                                                             unsigned int qStride,
+                                                                             const float* Kbase,
+                                                                             unsigned int kStride,
+                                                                             const float* Vbase,
+                                                                             unsigned int vStride,
+                                                                             const float* dObase,
+                                                                             unsigned int dOStride,
+                                                                             unsigned int T,
+                                                                             unsigned int dK,
+                                                                             unsigned int dV,
+                                                                             bool causal,
+                                                                             unsigned int sinkCount,
+                                                                             unsigned int windowSize,
+                                                                             float* dQbase,
+                                                                             unsigned int dQStride,
+                                                                             float* dKbase,
+                                                                             unsigned int dKStride,
+                                                                             float* dVbase,
+                                                                             unsigned int dVStride,
+                                                                             const unsigned char* keyAllowed)
+{
+	if (sinkCount == 0u && windowSize == 0u)
+	{
+		scaled_dot_product_attention_backward_recompute_flash_strided(Qbase, qStride, Kbase, kStride, Vbase, vStride,
+		                                                              dObase, dOStride, T, dK, dV, causal,
+		                                                              dQbase, dQStride, dKbase, dKStride, dVbase, dVStride,
+		                                                              keyAllowed);
+		return;
+	}
+	if (!Qbase || !Kbase || !Vbase || !dObase || !dQbase || !dKbase || !dVbase)
+		return;
+	if (T == 0u || dK == 0u || dV == 0u)
+		return;
+
+	const float invSqrt = 1.0f / static_cast<float>(sqrt(static_cast<double>(dK)));
+
+	std::vector<float> sCache(T);
+	std::vector<float> pCache(T);
+	std::vector<float> dPCache(T);
+
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float* qt = Qbase + static_cast<size_t>(t) * static_cast<size_t>(qStride);
+		const float* dOt = dObase + static_cast<size_t>(t) * static_cast<size_t>(dOStride);
+		float* dQt = dQbase + static_cast<size_t>(t) * static_cast<size_t>(dQStride);
+
+		const unsigned int maxU = causal ? t : (T - 1u);
+
+		float m = -1e30f;
+		double l = 0.0;
+		bool any = false;
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (!sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+			{
+				sCache[u] = -1e30f;
+				continue;
+			}
+#if defined(__SSE2__)
+			if ((u & 31u) == 0u && (u + 32u) <= maxU)
+			{
+				const float* kpf = Kbase + static_cast<size_t>(u + 32u) * static_cast<size_t>(kStride);
+				_mm_prefetch(reinterpret_cast<const char*>(kpf), _MM_HINT_T0);
+			}
+#endif
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
+			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
+			sCache[u] = s;
+
+			if (!any) { any = true; m = s; l = 1.0; continue; }
+			const float newM = (s > m) ? s : m;
+			const float alpha = expf(m - newM);
+			const float beta = expf(s - newM);
+			l = l * static_cast<double>(alpha) + static_cast<double>(beta);
+			m = newM;
+		}
+		if (!any || !(l > 0.0))
+			continue;
+		const double invL = 1.0 / l;
+
+		double rowDot = 0.0;
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (!sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+			{
+				pCache[u] = 0.0f;
+				dPCache[u] = 0.0f;
+				continue;
+			}
+			const float pf = static_cast<float>(static_cast<double>(expf(sCache[u] - m)) * invL);
+			pCache[u] = pf;
+			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
+			const float dP = glades::transformer_kernels::dot_f32(dOt, vu, dV);
+			dPCache[u] = dP;
+			rowDot += static_cast<double>(pf) * static_cast<double>(dP);
+			float* dVu = dVbase + static_cast<size_t>(u) * static_cast<size_t>(dVStride);
+			glades::transformer_kernels::axpy_f32(dVu, dOt, pf, dV);
+		}
+
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (!sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+				continue;
+			const float pf = pCache[u];
+			if (pf == 0.0f) continue;
+			const float ds = attention_score_grad(pf, dPCache[u], rowDot, invSqrt);
+			if (ds == 0.0f) continue;
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
+			float* dKu = dKbase + static_cast<size_t>(u) * static_cast<size_t>(dKStride);
+			glades::transformer_kernels::axpy_f32(dQt, ku, ds, dK);
+			glades::transformer_kernels::axpy_f32(dKu, qt, ds, dK);
+		}
+	}
+}
+
+inline void scaled_dot_product_attention_backward_recompute_flash_chunk_sw(
+    const float* Qbase, unsigned int qStride,
+    const float* Kbase, unsigned int kStride,
+    const float* Vbase, unsigned int vStride,
+    const float* dObase, unsigned int dOStride,
+    unsigned int tBegin, unsigned int tEnd,
+    unsigned int T, unsigned int dK, unsigned int dV,
+    bool causal,
+    unsigned int sinkCount,
+    unsigned int windowSize,
+    float* dQbase, unsigned int dQStride,
+    float* dKlocal, float* dVlocal,
+    const unsigned char* keyAllowed)
+{
+	if (sinkCount == 0u && windowSize == 0u)
+	{
+		scaled_dot_product_attention_backward_recompute_flash_chunk(Qbase, qStride, Kbase, kStride, Vbase, vStride,
+		                                                            dObase, dOStride, tBegin, tEnd,
+		                                                            T, dK, dV, causal, dQbase, dQStride,
+		                                                            dKlocal, dVlocal, keyAllowed);
+		return;
+	}
+	if (!Qbase || !Kbase || !Vbase || !dObase || !dQbase || !dKlocal || !dVlocal)
+		return;
+	if (T == 0u || dK == 0u || dV == 0u || tBegin >= tEnd)
+		return;
+
+	const float invSqrt = 1.0f / static_cast<float>(sqrt(static_cast<double>(dK)));
+
+	std::vector<float> sCache(T);
+	std::vector<float> pCache(T);
+	std::vector<float> dPCache(T);
+
+	for (unsigned int t = tBegin; t < tEnd; ++t)
+	{
+		const float* qt = Qbase + static_cast<size_t>(t) * static_cast<size_t>(qStride);
+		const float* dOt = dObase + static_cast<size_t>(t) * static_cast<size_t>(dOStride);
+		float* dQt = dQbase + static_cast<size_t>(t) * static_cast<size_t>(dQStride);
+
+		const unsigned int maxU = attention_row_max_u(T, t, causal);
+
+		float m = -1e30f;
+		double l = 0.0;
+		bool any = false;
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (!sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+			{
+				sCache[u] = -1e30f;
+				continue;
+			}
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
+			const float s = glades::transformer_kernels::dot_f32(qt, ku, dK) * invSqrt;
+			sCache[u] = s;
+			if (!any) { any = true; m = s; l = 1.0; continue; }
+			const float newM = (s > m) ? s : m;
+			const float alpha = expf(m - newM);
+			const float beta = expf(s - newM);
+			l = l * static_cast<double>(alpha) + static_cast<double>(beta);
+			m = newM;
+		}
+		if (!any || !(l > 0.0))
+			continue;
+		const double invL = 1.0 / l;
+
+		double rowDot = 0.0;
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (!sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+			{
+				pCache[u] = 0.0f;
+				dPCache[u] = 0.0f;
+				continue;
+			}
+			const float pf = static_cast<float>(static_cast<double>(expf(sCache[u] - m)) * invL);
+			pCache[u] = pf;
+			const float* vu = Vbase + static_cast<size_t>(u) * static_cast<size_t>(vStride);
+			const float dP = glades::transformer_kernels::dot_f32(dOt, vu, dV);
+			dPCache[u] = dP;
+			rowDot += static_cast<double>(pf) * static_cast<double>(dP);
+			float* dVu = dVlocal + static_cast<size_t>(u) * static_cast<size_t>(dV);
+			glades::transformer_kernels::axpy_f32(dVu, dOt, pf, dV);
+		}
+
+		for (unsigned int u = 0; u <= maxU; ++u)
+		{
+			if (!sw_key_allowed(t, u, sinkCount, windowSize, keyAllowed))
+				continue;
+			const float pf = pCache[u];
+			if (pf == 0.0f) continue;
+			const float ds = attention_score_grad(pf, dPCache[u], rowDot, invSqrt);
+			if (ds == 0.0f) continue;
+			const float* ku = Kbase + static_cast<size_t>(u) * static_cast<size_t>(kStride);
+			float* dKu = dKlocal + static_cast<size_t>(u) * static_cast<size_t>(dK);
+			glades::transformer_kernels::axpy_f32(dQt, ku, ds, dK);
+			glades::transformer_kernels::axpy_f32(dKu, qt, ds, dK);
+		}
+	}
+}
+
 } // namespace transformer_ops
 } // namespace glades
