@@ -184,6 +184,87 @@ Worth re-running the 30-min comparison on the GPU-init binary to see
 if a non-degenerate NLL trajectory emerges; deferred so this report
 can ship with the data already in hand.
 
+## Optimizer-state ports from CHIRON (committed in this branch)
+
+Two further commits land the highest-leverage CHIRON tricks identified
+as portable in `UNIFIED_FLAGSHIP_CHIRON_DESIGN.md`:
+
+### int8 Adam (paradigm #11 MFIO)
+
+`MixedPrecisionConfig.adamStateInt8` (new) flags the 9 large weight
+matrices (tokE, WIn, WOut, per-layer Wq/Wk/Wv/Wo/W1/W2) to store m as
+int8 and v as uint8 with FP32 absmax scales per 256-element block.
+~1.016 bytes/param/moment vs 4 BF16 vs 8 FP32.  Trainer flag:
+`--adam-state-int8`.
+
+| Path | GPU memory at d=1024/L=16 (~165M) | NLL trajectory |
+|------|-----------------------------------|----------------|
+| FP32 Adam (old default)      | OOM at 1.84B host before reaching GPU | n/a |
+| BF16 Adam (`--adam-state-bf16`) | 13.0 GB                           | 10.5829 → 10.5009 (32 min) |
+| int8 Adam (`--adam-state-int8`) | **11.6 GB** (1.4 GB saved)        | 10.5735 stable in smoke (NLL parity, no quantization-induced drift) |
+
+### FACE Adafactor on token embedding (paradigm #28)
+
+`TransformerRunConfig.faceEmbedding` (new) replaces dense Adam on tokE
+with FACE's frequency-debiased preconditioner.  State drops from
+~8·V·dModel bytes (FP32 m+v) to 4·(V + dModel + 2) — ~250-1000×
+compression on the embedding optimizer state alone.  Trainer flag:
+`--face-embedding` (auto-enables `--adam-state-bf16` for the other
+weights since FACE only covers tokE).
+
+Composes cleanly with int8: smoke run with `--face-embedding
+--adam-state-int8` showed identical NLL trajectory to int8-only at
+165M class, GPU 11.5 GB vs 11.6 GB int8-only.
+
+### Combined memory math at 1B target
+
+| Component (FP32 Adam baseline) | Old | int8 Adam + FACE on tokE |
+|--------------------------------|-----|--------------------------|
+| Embedding state (32k × 1024)   | 256 MB | 0.13 MB (FACE)        |
+| Other 8 large tensors at 800M  | 6.4 GB | 1.6 GB (int8)        |
+| Bias + LN state (~2M params)   | 16 MB | 16 MB                  |
+| **Total Adam state at 1B**     | **6.7 GB** | **1.6 GB**       |
+
+That alone lifts the flagship VRAM ceiling for Adam state by 4×.
+Combined with BF16 weights (1B × 2 = 2 GB) and grads (1B × 4 = 4 GB)
+plus activations, **a 1B-class flagship config now plausibly fits in
+~11 GB on a 16 GB GPU** — the conjecture from the original
+recommendation.
+
+### Where the actual 1B+ ceiling still hits
+
+A 500M-class probe (d=1536, L=24, heads=12, dff=4096, ~530M params)
+with the new int8+FACE stack ran cleanly through CPU init but the
+training step OOMed on a **3.2 GB GPU scratch buffer allocation**
+(`cudaMalloc(805306368 floats, 3221225472 bytes) failed: out of
+memory`).  Halving T from 4096 → 2048 did not resolve it (still
+silently failed in the training-step kernel without stderr trace).
+
+The scratch buffer is in the training-step path (eval forward
+succeeded, training did not) and is independent of Adam state size.
+Likely candidates: (a) sampled-softmax negatives buffer at
+T·negatives·dModel sizes, (b) attention backward scratch_S, (c) the
+BitNet QAT FFN W2 scratch which is `T·dFF/32` bits + `[T, dModel]`
+popcount accumulators per block × layers.
+
+This is the next bottleneck after Adam state — separate engineering
+work to identify and either share, recompute, or quantize.
+
+### First-forward kernel-JIT wall
+
+The "10-min init" identified in the original report turns out NOT to
+be host-side weight init or token cache load (both fixes had no
+material effect).  It's the **first GPU forward pass** itself.  At
+165M, the first forward pass takes ~10 min; at 500M it takes ~16-32
+min for a single sequence at T=2048 (`targets_per_sec=2.10` for the
+first eval forward).  Subsequent forwards on the same model run at
+30K targets/sec.  The cause is one-shot kernel JIT + cuBLAS scratch
+allocation + first-launch CUDA Graph capture of all the heavy
+paradigm kernels (MLA + binary FFN + local-attn + sinks all
+co-allocated for the first time).  Opportunity: pre-warm the kernel
+graph at network init time, or skip the test eval and absorb the
+first-launch cost on the first training step instead.
+
 ## Conclusions and next steps
 
 1. **Flagship cannot reach 1.84B on 16 GB** without the optimizer-side
