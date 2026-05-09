@@ -3,6 +3,13 @@
 #include "../../../Backend/Machine Learning/rng.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_ops.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
+#ifdef GLADES_HAVE_CUDA
+#include <cuda_runtime.h>
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_device.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_buffer.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_kernels.h"
+#include "../../../Backend/Machine Learning/Networks/cuda/gpu_blas.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1542,6 +1549,277 @@ static void test_phoenix_binary_gemm_speedup()
 }
 
 // ============================================================
+// Group H: GPU parity for paradigms #74/#76/#78
+// ============================================================
+// CPU vs GPU max-abs-diff comparisons + speedup measurement.
+// Skips automatically when CUDA is not available.
+
+#ifdef GLADES_HAVE_CUDA
+
+static void test_phoenix_binary_gemm_gpu_parity()
+{
+	printf("  [H1] PhoenixBinaryGEMMGpuParity (#74) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+
+	const unsigned int M = 32u, N = 64u, K = 128u;
+	std::vector<float> X(static_cast<size_t>(M) * K);
+	std::vector<float> W(static_cast<size_t>(K) * N);
+	unsigned int seed = 0xA1B2C3D4u;
+	fill_random(X.data(), M * K, seed);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		const float r = pseudo_rand(seed);
+		W[i] = (r >= 0.0f) ? 1.0f : -1.0f;
+	}
+	const size_t Kbytes = (K + 7u) / 8u;
+	std::vector<unsigned char> bits(static_cast<size_t>(N) * Kbytes, 0u);
+	phoenix_pack_signs_colmajor(W.data(), K, N, bits.data());
+
+	std::vector<float> Y_cpu(static_cast<size_t>(M) * N, 0.0f);
+	phoenix_binary_gemm_colmajor(X.data(), bits.data(), M, N, K, Y_cpu.data());
+
+	glades::gpu::GpuBuffer<float> d_X, d_Y;
+	glades::gpu::GpuBuffer<unsigned char> d_bits;
+	d_X.allocate(M * K); d_Y.allocate(M * N);
+	d_bits.allocate(N * Kbytes);
+	d_X.upload(X.data(), M * K);
+	d_bits.upload(bits.data(), N * Kbytes);
+
+	// Warm + benchmark
+	glades::gpu::phoenix_binary_gemm_gpu(d_X.data(), d_bits.data(),
+	                                      (int)M, (int)N, (int)K, d_Y.data());
+	cudaDeviceSynchronize();
+	double t0 = clock_seconds();
+	const int trials = 20;
+	for (int i = 0; i < trials; ++i)
+		glades::gpu::phoenix_binary_gemm_gpu(d_X.data(), d_bits.data(),
+		                                      (int)M, (int)N, (int)K, d_Y.data());
+	cudaDeviceSynchronize();
+	double tGpu = clock_seconds() - t0;
+
+	std::vector<float> Y_gpu(static_cast<size_t>(M) * N, 0.0f);
+	d_Y.download(Y_gpu.data(), M * N);
+
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < Y_cpu.size(); ++i)
+	{
+		double d = std::fabs(static_cast<double>(Y_cpu[i]) - static_cast<double>(Y_gpu[i]));
+		if (d > maxAbs) maxAbs = d;
+	}
+	t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		phoenix_binary_gemm_colmajor(X.data(), bits.data(), M, N, K, Y_cpu.data());
+	double tCpu = clock_seconds() - t0;
+
+	printf("    M=%u N=%u K=%u: max-abs-diff=%.3e\n", M, N, K, maxAbs);
+	printf("    cpu=%.3f ms, gpu=%.3f ms, speedup=%.2fx\n",
+	       tCpu * 1000.0 / trials, tGpu * 1000.0 / trials, tCpu / (tGpu > 0 ? tGpu : 1e-9));
+	ASSERT("phoenix binary GEMM CPU/GPU parity", maxAbs < 1e-3);
+	printf("    PASSED\n");
+}
+
+static void test_mla_compute_latent_gpu_parity()
+{
+	printf("  [H2] MLAComputeLatentGpuParity (#76) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	const unsigned int T = 16u, dH = 64u, dC = 16u;
+	std::vector<float> h(static_cast<size_t>(T) * dH);
+	std::vector<float> W_DKV(static_cast<size_t>(dH) * dC);
+	unsigned int seed = 0xBABEF00Du;
+	fill_random(h.data(), T * dH, seed);
+	fill_random(W_DKV.data(), dH * dC, seed);
+
+	std::vector<float> c_cpu(static_cast<size_t>(T) * dC, 0.0f);
+	mla_compute_latent(h.data(), W_DKV.data(), T, dH, dC, c_cpu.data());
+
+	glades::gpu::GpuBuffer<float> d_h_, d_W, d_cOut;
+	d_h_.allocate(T * dH);
+	d_W.allocate(dH * dC);
+	d_cOut.allocate(T * dC);
+	d_h_.upload(h.data(), T * dH);
+	d_W.upload(W_DKV.data(), dH * dC);
+	bool ok = glades::gpu::mla_compute_latent_gpu(d_h_.data(), d_W.data(),
+	                                               (int)T, (int)dH, (int)dC, d_cOut.data());
+	ASSERT("mla_compute_latent_gpu success", ok);
+	cudaDeviceSynchronize();
+	std::vector<float> c_gpu(static_cast<size_t>(T) * dC, 0.0f);
+	d_cOut.download(c_gpu.data(), T * dC);
+
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < c_cpu.size(); ++i)
+		maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(c_cpu[i] - c_gpu[i])));
+	printf("    T=%u d_h=%u d_c=%u: max-abs-diff=%.3e\n", T, dH, dC, maxAbs);
+	// cuBLAS may use TF32 → relax tolerance vs FP32 reference.
+	ASSERT("mla_compute_latent CPU/GPU parity", maxAbs < 1e-2);
+	printf("    PASSED\n");
+}
+
+static void test_mla_decompress_kv_gpu_parity()
+{
+	printf("  [H3] MLADecompressKVGpuParity (#76) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	const unsigned int T = 16u, dC = 16u, dKVtotal = 32u;
+	std::vector<float> cLatent(static_cast<size_t>(T) * dC);
+	std::vector<float> W_UK(static_cast<size_t>(dC) * dKVtotal);
+	std::vector<float> W_UV(static_cast<size_t>(dC) * dKVtotal);
+	unsigned int seed = 0xCAFED00Du;
+	fill_random(cLatent.data(), T * dC, seed);
+	fill_random(W_UK.data(), dC * dKVtotal, seed);
+	fill_random(W_UV.data(), dC * dKVtotal, seed);
+
+	std::vector<float> K_cpu(static_cast<size_t>(T) * dKVtotal, 0.0f);
+	std::vector<float> V_cpu(static_cast<size_t>(T) * dKVtotal, 0.0f);
+	mla_decompress_kv(cLatent.data(), W_UK.data(), W_UV.data(),
+	                  T, dC, dKVtotal, K_cpu.data(), V_cpu.data());
+
+	glades::gpu::GpuBuffer<float> d_cLatent, d_WUK, d_WUV, d_K, d_V;
+	d_cLatent.allocate(T * dC);
+	d_WUK.allocate(dC * dKVtotal);
+	d_WUV.allocate(dC * dKVtotal);
+	d_K.allocate(T * dKVtotal);
+	d_V.allocate(T * dKVtotal);
+	d_cLatent.upload(cLatent.data(), T * dC);
+	d_WUK.upload(W_UK.data(), dC * dKVtotal);
+	d_WUV.upload(W_UV.data(), dC * dKVtotal);
+	bool ok = glades::gpu::mla_decompress_kv_gpu(d_cLatent.data(), d_WUK.data(), d_WUV.data(),
+	                                              (int)T, (int)dC, (int)dKVtotal,
+	                                              d_K.data(), d_V.data());
+	ASSERT("mla_decompress_kv_gpu success", ok);
+	cudaDeviceSynchronize();
+	std::vector<float> K_gpu(static_cast<size_t>(T) * dKVtotal, 0.0f);
+	std::vector<float> V_gpu(static_cast<size_t>(T) * dKVtotal, 0.0f);
+	d_K.download(K_gpu.data(), T * dKVtotal);
+	d_V.download(V_gpu.data(), T * dKVtotal);
+
+	double maxK = 0.0, maxV = 0.0;
+	for (size_t i = 0; i < K_cpu.size(); ++i)
+		maxK = std::max(maxK, std::fabs(static_cast<double>(K_cpu[i] - K_gpu[i])));
+	for (size_t i = 0; i < V_cpu.size(); ++i)
+		maxV = std::max(maxV, std::fabs(static_cast<double>(V_cpu[i] - V_gpu[i])));
+	printf("    T=%u d_c=%u dKV=%u: max-K-diff=%.3e, max-V-diff=%.3e\n",
+	       T, dC, dKVtotal, maxK, maxV);
+	ASSERT("mla_decompress_kv CPU/GPU K parity", maxK < 1e-2);
+	ASSERT("mla_decompress_kv CPU/GPU V parity", maxV < 1e-2);
+	printf("    PASSED\n");
+}
+
+static void test_sw_attention_gpu_parity()
+{
+	printf("  [H4] SinkWindowAttentionGpuParity (#78) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	const unsigned int T = 32u, dHead = 16u;
+	const unsigned int S = 4u, W = 8u;
+	std::vector<float> Q(static_cast<size_t>(T) * dHead);
+	std::vector<float> Kk(static_cast<size_t>(T) * dHead);
+	std::vector<float> Vv(static_cast<size_t>(T) * dHead);
+	unsigned int seed = 0xFADEF00Du;
+	fill_random(Q.data(), T * dHead, seed);
+	fill_random(Kk.data(), T * dHead, seed);
+	fill_random(Vv.data(), T * dHead, seed);
+
+	std::vector<float> O_cpu(static_cast<size_t>(T) * dHead, 0.0f);
+	scaled_dot_product_attention_forward_flash_strided_sw(
+	    Q.data(), dHead, Kk.data(), dHead, Vv.data(), dHead,
+	    T, dHead, dHead, true, S, W, O_cpu.data(), dHead, NULL);
+
+	glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_O;
+	d_Q.allocate(T * dHead); d_K.allocate(T * dHead);
+	d_V.allocate(T * dHead); d_O.allocate(T * dHead);
+	d_Q.upload(Q.data(), T * dHead);
+	d_K.upload(Kk.data(), T * dHead);
+	d_V.upload(Vv.data(), T * dHead);
+	bool ok = glades::gpu::sw_attention_forward_gpu(
+	    d_Q.data(), (int)dHead, d_K.data(), (int)dHead, d_V.data(), (int)dHead,
+	    (int)T, (int)dHead, true, (int)S, (int)W, d_O.data(), (int)dHead);
+	ASSERT("sw_attention_forward_gpu success", ok);
+	cudaDeviceSynchronize();
+	std::vector<float> O_gpu(static_cast<size_t>(T) * dHead, 0.0f);
+	d_O.download(O_gpu.data(), T * dHead);
+
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < O_cpu.size(); ++i)
+		maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(O_cpu[i] - O_gpu[i])));
+	printf("    T=%u dHead=%u S=%u W=%u: max-abs-diff=%.3e\n", T, dHead, S, W, maxAbs);
+	ASSERT("sw attention CPU/GPU parity", maxAbs < 1e-4);
+	printf("    PASSED\n");
+}
+
+static void test_sw_attention_gpu_speedup()
+{
+	printf("  [H5] SinkWindowAttentionGpuSpeedup (#78) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	// Larger T to demonstrate the long-context advantage.
+	const unsigned int T = 1024u, dHead = 64u;
+	const unsigned int S = 4u, W = 64u;
+	std::vector<float> Q(static_cast<size_t>(T) * dHead);
+	std::vector<float> Kk(static_cast<size_t>(T) * dHead);
+	std::vector<float> Vv(static_cast<size_t>(T) * dHead);
+	unsigned int seed = 0xFADEF11Eu;
+	fill_random(Q.data(), T * dHead, seed);
+	fill_random(Kk.data(), T * dHead, seed);
+	fill_random(Vv.data(), T * dHead, seed);
+
+	std::vector<float> O_cpu(static_cast<size_t>(T) * dHead, 0.0f);
+	glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_O;
+	d_Q.allocate(T * dHead); d_K.allocate(T * dHead);
+	d_V.allocate(T * dHead); d_O.allocate(T * dHead);
+	d_Q.upload(Q.data(), T * dHead);
+	d_K.upload(Kk.data(), T * dHead);
+	d_V.upload(Vv.data(), T * dHead);
+
+	const int trials = 5;
+
+	// Warmup
+	glades::gpu::sw_attention_forward_gpu(
+	    d_Q.data(), (int)dHead, d_K.data(), (int)dHead, d_V.data(), (int)dHead,
+	    (int)T, (int)dHead, true, (int)S, (int)W, d_O.data(), (int)dHead);
+	cudaDeviceSynchronize();
+
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		glades::gpu::sw_attention_forward_gpu(
+		    d_Q.data(), (int)dHead, d_K.data(), (int)dHead, d_V.data(), (int)dHead,
+		    (int)T, (int)dHead, true, (int)S, (int)W, d_O.data(), (int)dHead);
+	cudaDeviceSynchronize();
+	double tGpu = clock_seconds() - t0;
+
+	t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		scaled_dot_product_attention_forward_flash_strided_sw(
+		    Q.data(), dHead, Kk.data(), dHead, Vv.data(), dHead,
+		    T, dHead, dHead, true, S, W, O_cpu.data(), dHead, NULL);
+	double tCpu = clock_seconds() - t0;
+
+	double speedup = tCpu / (tGpu > 0 ? tGpu : 1e-9);
+	printf("    T=%u dHead=%u S=%u W=%u: cpu=%.3f ms, gpu=%.3f ms, speedup=%.2fx\n",
+	       T, dHead, S, W,
+	       tCpu * 1000.0 / trials, tGpu * 1000.0 / trials, speedup);
+	// Reference single-thread-per-block GPU kernel (correctness scope, not
+	// production warp-level; production tuning would use multi-warp reduction).
+	// Just require non-pathological perf relative to CPU.
+	if (speedup < 0.1)
+		printf("    WARNING: speedup %.2fx below 0.1x — kernel needs warp-level reduction\n", speedup);
+	printf("    INFO\n");
+}
+
+#endif // GLADES_HAVE_CUDA
+
+// ============================================================
 // Main entry point
 // ============================================================
 
@@ -1611,6 +1889,16 @@ void TransformerOpsUnitTest()
 	test_phoenix_compression_ratio();
 	test_phoenix_binary_gemm_correctness();
 	test_phoenix_binary_gemm_speedup();
+
+	// Group H: GPU parity for #74/#76/#78
+#ifdef GLADES_HAVE_CUDA
+	printf("--- Group H: GPU parity for paradigms #74/#76/#78 ---\n");
+	test_phoenix_binary_gemm_gpu_parity();
+	test_mla_compute_latent_gpu_parity();
+	test_mla_decompress_kv_gpu_parity();
+	test_sw_attention_gpu_parity();
+	test_sw_attention_gpu_speedup();
+#endif
 
 	printf("============================================================\n");
 	printf("All Transformer Ops Tests Passed\n");

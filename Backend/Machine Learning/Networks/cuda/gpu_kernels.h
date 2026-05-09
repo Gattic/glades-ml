@@ -290,6 +290,38 @@ bool flash_attention_multihead_backward_bf16(
     bool causal,
     float* dQ, float* dK_out, float* dV_out);
 
+// ---------------------------------------------------------------------------
+// Paradigm-shift GPU kernels (impl(paradigm-74/76/78))
+// ---------------------------------------------------------------------------
+
+// #74 PHOENIX-1BIT binary GEMM. Y[M,N] = X[M,K] @ unpack(W_bits) where
+// W_bits is column-major bit packed (per phoenix_pack_signs_colmajor).
+// All pointers are device pointers. Reference (correctness) kernel; not
+// production-tuned.
+bool phoenix_binary_gemm_gpu(const float* X,
+                              const unsigned char* W_bits,
+                              int M, int N, int K,
+                              float* Y);
+
+// #76 MLA latent compression: c = h @ W_DKV via cuBLAS sgemm.
+bool mla_compute_latent_gpu(const float* h, const float* W_DKV,
+                             int T, int d_h, int d_c, float* c_out);
+
+// #76 MLA KV decompression: K = c @ W_UK, V = c @ W_UV via cuBLAS.
+bool mla_decompress_kv_gpu(const float* c,
+                            const float* W_UK, const float* W_UV,
+                            int T, int d_c, int dKVtotal,
+                            float* K_out, float* V_out);
+
+// #78 ATTENTION-SINK forward (single-head FP32 reference). One block per
+// query position; inner thread reduces over keys with sink+window mask.
+bool sw_attention_forward_gpu(const float* Q, int qStride,
+                               const float* K, int kStride,
+                               const float* V, int vStride,
+                               int T, int dHead, bool causal,
+                               int sinkCount, int windowSize,
+                               float* O, int oStride);
+
 // Backward for packed multi-head/GQA flash-style attention.
 // dQ is written per query head; dK/dV are accumulated per KV head.
 bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
@@ -615,6 +647,16 @@ inline bool adam_update_bf16_kahan_state(float*, const float*, uint16_t*, uint16
 inline bool astra_update(float*, const float*, float*,
                           float, float, float, float, float,
                           int, int) { return false; }
+
+inline bool phoenix_binary_gemm_gpu(const float*, const unsigned char*,
+                                     int, int, int, float*) { return false; }
+inline bool mla_compute_latent_gpu(const float*, const float*,
+                                    int, int, int, float*) { return false; }
+inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,
+                                   int, int, int, float*, float*) { return false; }
+inline bool sw_attention_forward_gpu(const float*, int, const float*, int,
+                                      const float*, int, int, int, bool,
+                                      int, int, float*, int) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}

@@ -2106,30 +2106,21 @@ inline void phoenix_binary_gemm_colmajor(const float* X,
 		{
 			const unsigned char* col = W_bits + static_cast<size_t>(n) * Kbytes;
 			float maskedSum = 0.0f;
-			unsigned int k = 0;
 			for (size_t bb = 0; bb < Kbytes; ++bb)
 			{
 				const unsigned char byte = col[bb];
 				const unsigned int kBase = static_cast<unsigned int>(bb) * 8u;
 				const unsigned int kEnd = (kBase + 8u <= K) ? (kBase + 8u) : K;
-				if (byte == 0u)
-				{
-					k = kEnd;
-					continue;
-				}
+				if (byte == 0u) continue;
 				if (byte == 0xFFu && (kBase + 8u) <= K)
 				{
 					maskedSum += xm[kBase + 0u] + xm[kBase + 1u] + xm[kBase + 2u] + xm[kBase + 3u] +
 					             xm[kBase + 4u] + xm[kBase + 5u] + xm[kBase + 6u] + xm[kBase + 7u];
-					k = kBase + 8u;
 					continue;
 				}
 				for (unsigned int j = 0; j < (kEnd - kBase); ++j)
-				{
 					if (byte & (1u << j))
 						maskedSum += xm[kBase + j];
-				}
-				k = kEnd;
 			}
 			ym[n] = 2.0f * maskedSum - rs;
 		}
