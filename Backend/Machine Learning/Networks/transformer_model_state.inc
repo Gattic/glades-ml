@@ -99,6 +99,18 @@
 			std::vector<float> v2Bq, v2Bk, v2Bv, v2Bo;
 			std::vector<float> gBq, gBk, gBv, gBo;
 
+			// Paradigm shift #76 MLA latent projections (allocated only when
+			// trainingConfig.transformer.mlaLatentDim > 0; otherwise empty).
+			//   Wdkv: [dModel, dC]      down-projection h -> c
+			//   Wuk:  [dC, dModelKV]    up-projection c -> K
+			//   Wuv:  [dC, dModelKV]    up-projection c -> V
+			// When MLA is active, the standard Wk/Wv tensors are not used in
+			// the attention forward; the MLA forward replaces them.
+			std::vector<float> Wdkv, Wuk, Wuv;
+			std::vector<float> vWdkv, vWuk, vWuv;
+			std::vector<float> v2Wdkv, v2Wuk, v2Wuv;
+			std::vector<float> gWdkv, gWuk, gWuv;
+
 			// Pre-LN 2
 			std::vector<float> ln2Gamma; // [dModel]
 			std::vector<float> ln2Beta;  // [dModel]

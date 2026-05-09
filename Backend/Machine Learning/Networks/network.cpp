@@ -2673,6 +2673,26 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			b.gWk.assign(mkv, 0.0f);
 			b.gWv.assign(mkv, 0.0f);
 			b.gWo.assign(mm, 0.0f);
+
+			// Paradigm shift #76 MLA latent projections.
+			const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+			if (mlaDc > 0) {
+				const size_t dC = (size_t)mlaDc;
+				const size_t wDkv = (size_t)dModel * dC;
+				const size_t wUk  = dC * (size_t)dModelKV;
+				const size_t wUv  = dC * (size_t)dModelKV;
+				b.Wdkv.assign(wDkv, 0.0f);
+				b.Wuk.assign(wUk, 0.0f);
+				b.Wuv.assign(wUv, 0.0f);
+				if (needAdamMoments) {
+					b.vWdkv.assign(wDkv, 0.0f); b.vWuk.assign(wUk, 0.0f); b.vWuv.assign(wUv, 0.0f);
+					b.v2Wdkv.assign(wDkv, 0.0f); b.v2Wuk.assign(wUk, 0.0f); b.v2Wuv.assign(wUv, 0.0f);
+				}
+				b.gWdkv.assign(wDkv, 0.0f);
+				b.gWuk.assign(wUk, 0.0f);
+				b.gWuv.assign(wUv, 0.0f);
+			}
+
 			b.bq.assign(dModel, 0.0f);
 			b.bk.assign(dModelKV, 0.0f);
 			b.bv.assign(dModelKV, 0.0f);
@@ -2725,6 +2745,13 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			InitGlorot::run(rngEngine, b.Wo, dModel, dModel);
 			InitGlorot::run(rngEngine, b.W1, dModel, ff1Width);
 			InitGlorot::run(rngEngine, b.W2, dFF, dModel);
+			// Paradigm shift #76 MLA initialization (when active).
+			if (!b.Wdkv.empty()) {
+				const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+				InitGlorot::run(rngEngine, b.Wdkv, dModel, mlaDc);
+				InitGlorot::run(rngEngine, b.Wuk, mlaDc, dModelKV);
+				InitGlorot::run(rngEngine, b.Wuv, mlaDc, dModelKV);
+			}
 		}
 
 		// DDP: broadcast weights from rank 0 so all workers start with identical parameters.

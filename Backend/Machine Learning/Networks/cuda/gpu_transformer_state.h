@@ -186,6 +186,15 @@ struct GpuTransformerWeights
 		GpuBuffer<float> v2Wq, v2Wk, v2Wv, v2Wo;
 		GpuBuffer<float> gWq, gWk, gWv, gWo;
 		GpuBuffer<uint16_t> WqLowp, WkLowp, WvLowp, WoLowp;
+		// Paradigm shift #76 MLA latent projections (allocated only when
+		// trainingConfig.transformer.mlaLatentDim > 0).
+		// Wdkv: [dModel, dC] ; Wuk: [dC, dModelKV] ; Wuv: [dC, dModelKV]
+		GpuBuffer<float> Wdkv, Wuk, Wuv;
+		GpuBuffer<float> vWdkv, vWuk, vWuv;
+		GpuBuffer<float> v2Wdkv, v2Wuk, v2Wuv;
+		GpuBuffer<float> gWdkv, gWuk, gWuv;
+		// MLA forward scratch: c[T, dC] cached across forward+backward.
+		GpuBuffer<float> mlaC, mlaDc;
 		// BF16 Adam state (used when adamStateBf16=true, saves ~2x VRAM).
 		GpuBuffer<uint16_t> vWq_bf16, vWk_bf16, vWv_bf16, vWo_bf16;
 		GpuBuffer<uint16_t> v2Wq_bf16, v2Wk_bf16, v2Wv_bf16, v2Wo_bf16;
