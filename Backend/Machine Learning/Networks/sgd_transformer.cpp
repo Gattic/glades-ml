@@ -10836,6 +10836,37 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    static_cast<int>(T), static_cast<int>(dModel),
 			    1.0f, gb.gBq.data());
 
+			// Paradigm shift #76 MLA backward: when active, replace W_K and
+			// W_V backward gemms with the latent-path chain rule.
+			const int mlaDcBwd = trainingConfig.transformer.mlaLatentDim;
+			if (mlaDcBwd > 0 && gb.Wdkv.allocated())
+			{
+				// dX1 + dWdkv + dWuk + dWuv via single chain-rule call.
+				// c was computed during forward and cached in gb.mlaC.
+				// Allocate dc scratch if needed.
+				const size_t dcBytes = static_cast<size_t>(T) * static_cast<size_t>(mlaDcBwd);
+				if (gb.mlaDc.size() < dcBytes) gb.mlaDc.allocate(dcBytes);
+				gpu::mla_attention_backward_gpu(
+				    x1_l, gb.mlaC.data(),
+				    gpuTransformerScratch->dKfull.data(),
+				    gpuTransformerScratch->dVfull.data(),
+				    gb.Wdkv.data(), gb.Wuk.data(), gb.Wuv.data(),
+				    static_cast<int>(T), static_cast<int>(dModel), mlaDcBwd, static_cast<int>(dModelKV),
+				    gpuTransformerScratch->dX1.data(),
+				    gb.gWdkv.data(), gb.gWuk.data(), gb.gWuv.data(),
+				    gb.mlaDc.data());
+				// Bias gradients still applicable
+				gpu::reduce_rows_sum(
+				    gpuTransformerScratch->dKfull.data(),
+				    static_cast<int>(T), static_cast<int>(dModelKV),
+				    1.0f, gb.gBk.data());
+				gpu::reduce_rows_sum(
+				    gpuTransformerScratch->dVfull.data(),
+				    static_cast<int>(T), static_cast<int>(dModelKV),
+				    1.0f, gb.gBv.data());
+			}
+			else
+			{
 			// K: accumulate dK * Wk^T directly into dX1 (beta=1.0)
 			gpu_gemm_mp(bf16Wk,
 			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModelKV), 1.0f,
@@ -10881,6 +10912,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->dVfull.data(),
 			    static_cast<int>(T), static_cast<int>(dModelKV),
 			    1.0f, gb.gBv.data());
+			}
 
 			// --- LN1 backward ---
 			const float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
@@ -11760,7 +11792,9 @@ if (ad_.valid) { \
 			// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
 			if (!gpuTransformerWeights->adamPtrsUploaded)
 			{
-				const int maxAdamGroups = 6 + 16 * static_cast<int>(nLayers);
+				// 6 base + 16 per layer (standard) + 3 per layer (#76 MLA when active).
+				const int mlaExtraPerLayer = (trainingConfig.transformer.mlaLatentDim > 0) ? 3 : 0;
+				const int maxAdamGroups = 6 + (16 + mlaExtraPerLayer) * static_cast<int>(nLayers);
 				std::vector<float*> hParams(static_cast<size_t>(maxAdamGroups), static_cast<float*>(NULL));
 				std::vector<float*> hGrads(static_cast<size_t>(maxAdamGroups), static_cast<float*>(NULL));
 				std::vector<float*> hMs(static_cast<size_t>(maxAdamGroups), static_cast<float*>(NULL));
@@ -11838,6 +11872,12 @@ if (ad_.valid) { \
 						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()), lrBase, wdBase);
 						GLADES_ADD_ADAM_GROUP_SAFE(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()), lrBase, wdBase);
 						GLADES_ADD_ADAM_GROUP_SAFE(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()), lrBase, wdBase);
+						// Paradigm shift #76 MLA Adam updates (when active).
+						if (gb.Wdkv.allocated() && gb.vWdkv.allocated()) {
+							GLADES_ADD_ADAM_GROUP_SAFE(gb.Wdkv.data(), gb.gWdkv.data(), gb.vWdkv.data(), gb.v2Wdkv.data(), static_cast<int>(gb.Wdkv.size()), lrBase, wdBase);
+							GLADES_ADD_ADAM_GROUP_SAFE(gb.Wuk.data(),  gb.gWuk.data(),  gb.vWuk.data(),  gb.v2Wuk.data(),  static_cast<int>(gb.Wuk.size()),  lrBase, wdBase);
+							GLADES_ADD_ADAM_GROUP_SAFE(gb.Wuv.data(),  gb.gWuv.data(),  gb.vWuv.data(),  gb.v2Wuv.data(),  static_cast<int>(gb.Wuv.size()),  lrBase, wdBase);
+						}
 					}
 					GLADES_ADD_ADAM_GROUP_SAFE(gb.bq.data(), gb.gBq.data(), gb.mBq.data(), gb.v2Bq.data(), static_cast<int>(gb.bq.size()), lrBase, 0.0f);
 					GLADES_ADD_ADAM_GROUP_SAFE(gb.bk.data(), gb.gBk.data(), gb.mBk.data(), gb.v2Bk.data(), static_cast<int>(gb.bk.size()), lrBase, 0.0f);
