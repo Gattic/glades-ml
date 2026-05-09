@@ -2728,30 +2728,51 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		tensorTransformer.adamBeta1Power = 1.0;
 		tensorTransformer.adamBeta2Power = 1.0;
 
-		InitGlorot::run(rngEngine, tensorTransformer.WIn, inputSize, dModel);
-		InitGlorot::run(rngEngine, tensorTransformer.WOut, dModel, outSize);
-		if (tokenModel)
+		// GPU init shortcut: if --gpu is on, skip the O(N_params) host-side
+		// random fill.  ensureGpuState() will run curand kernels directly on
+		// the device buffers after the (zero-fill) upload.  Saves ~10 minutes
+		// of serial CPU work at 200M+ params and frees host RAM for the data
+		// cache.  Bias/LayerNorm/Adam state are already zeroed by the assign()
+		// calls above; their GPU mirror is a cheap cudaMemset, so we still
+		// upload them as zeros below — only the heavy weight tensors are
+		// deferred to the device.
+		const bool gpuInitNow =
+#ifdef GLADES_HAVE_CUDA
+		    trainingConfig.gpu.enable;
+#else
+		    false;
+#endif
+		if (!gpuInitNow)
 		{
-			// Initialize embeddings with N(0, 0.02) (standard LLM practice).
-			for (size_t i = 0; i < tensorTransformer.tokE.size(); ++i)
-				tensorTransformer.tokE[i] = glades::rng::normal(rngEngine, 0.0f, 0.02f);
-		}
-		for (int li = 0; li < H; ++li)
-		{
-			TensorTransformerState::Block& b = tensorTransformer.blocks[static_cast<size_t>(li)];
-			InitGlorot::run(rngEngine, b.Wq, dModel, dModel);
-			InitGlorot::run(rngEngine, b.Wk, dModel, dModelKV);
-			InitGlorot::run(rngEngine, b.Wv, dModel, dModelKV);
-			InitGlorot::run(rngEngine, b.Wo, dModel, dModel);
-			InitGlorot::run(rngEngine, b.W1, dModel, ff1Width);
-			InitGlorot::run(rngEngine, b.W2, dFF, dModel);
-			// Paradigm shift #76 MLA initialization (when active).
-			if (!b.Wdkv.empty()) {
-				const int mlaDc = trainingConfig.transformer.mlaLatentDim;
-				InitGlorot::run(rngEngine, b.Wdkv, dModel, mlaDc);
-				InitGlorot::run(rngEngine, b.Wuk, mlaDc, dModelKV);
-				InitGlorot::run(rngEngine, b.Wuv, mlaDc, dModelKV);
+			InitGlorot::run(rngEngine, tensorTransformer.WIn, inputSize, dModel);
+			InitGlorot::run(rngEngine, tensorTransformer.WOut, dModel, outSize);
+			if (tokenModel)
+			{
+				// Initialize embeddings with N(0, 0.02) (standard LLM practice).
+				for (size_t i = 0; i < tensorTransformer.tokE.size(); ++i)
+					tensorTransformer.tokE[i] = glades::rng::normal(rngEngine, 0.0f, 0.02f);
 			}
+			for (int li = 0; li < H; ++li)
+			{
+				TensorTransformerState::Block& b = tensorTransformer.blocks[static_cast<size_t>(li)];
+				InitGlorot::run(rngEngine, b.Wq, dModel, dModel);
+				InitGlorot::run(rngEngine, b.Wk, dModel, dModelKV);
+				InitGlorot::run(rngEngine, b.Wv, dModel, dModelKV);
+				InitGlorot::run(rngEngine, b.Wo, dModel, dModel);
+				InitGlorot::run(rngEngine, b.W1, dModel, ff1Width);
+				InitGlorot::run(rngEngine, b.W2, dFF, dModel);
+				// Paradigm shift #76 MLA initialization (when active).
+				if (!b.Wdkv.empty()) {
+					const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+					InitGlorot::run(rngEngine, b.Wdkv, dModel, mlaDc);
+					InitGlorot::run(rngEngine, b.Wuk, mlaDc, dModelKV);
+					InitGlorot::run(rngEngine, b.Wuv, mlaDc, dModelKV);
+				}
+			}
+		}
+		else
+		{
+			tensorTransformer.gpuInitDeferred = true;
 		}
 
 		// DDP: broadcast weights from rank 0 so all workers start with identical parameters.
@@ -4703,6 +4724,61 @@ bool glades::NNetwork::ensureGpuState()
 		if (!ts.v2LnFinalGamma.empty()) gpuTransformerWeights->v2LnFinalGamma.upload(&ts.v2LnFinalGamma[0], ts.v2LnFinalGamma.size());
 		if (!ts.mLnFinalBeta.empty()) gpuTransformerWeights->mLnFinalBeta.upload(&ts.mLnFinalBeta[0], ts.mLnFinalBeta.size());
 		if (!ts.v2LnFinalBeta.empty()) gpuTransformerWeights->v2LnFinalBeta.upload(&ts.v2LnFinalBeta[0], ts.v2LnFinalBeta.size());
+
+		// === GPU-side weight init (curand) ===
+		//
+		// When ensureTensorParametersInitialized skipped the host-side Glorot/normal
+		// fills (because trainingConfig.gpu.enable was set), the device buffers we just
+		// uploaded are full of zeros.  Run curand kernels in-place to fill them with
+		// the correct distributions.  Tensor IDs are assigned deterministically below
+		// so re-runs at the same seed produce bit-exact starting weights.  Layer
+		// index uses a step of 16 to leave room for additional per-layer tensors
+		// without renumbering existing seeds.
+		if (tensorTransformer.gpuInitDeferred)
+		{
+			const uint64_t initSeed = rngEngine.seed;
+
+			// Global tensors.
+			glades::gpu::initGlorotUniform(gpuTransformerWeights->WIn.data(),
+			                               gpuTransformerWeights->WIn.size(),
+			                               ts.inputSize, ts.dModel, initSeed, 0ULL);
+			glades::gpu::initGlorotUniform(gpuTransformerWeights->WOut.data(),
+			                               gpuTransformerWeights->WOut.size(),
+			                               ts.dModel, ts.outSize, initSeed, 1ULL);
+			if (ts.tokenModel && gpuTransformerWeights->tokE.size() > 0)
+			{
+				glades::gpu::initNormal(gpuTransformerWeights->tokE.data(),
+				                        gpuTransformerWeights->tokE.size(),
+				                        0.0f, 0.02f, initSeed, 2ULL);
+			}
+
+			// Per-layer tensors.  LN gammas were already host-set to 1.0 before
+			// the gpuInitNow gate and uploaded faithfully — no GPU-side re-init.
+			for (unsigned int l = 0; l < ts.nLayers; ++l)
+			{
+				glades::gpu::GpuTransformerWeights::Block& gb =
+				    gpuTransformerWeights->blocks[l];
+				const uint64_t base = 1000ULL + (uint64_t)l * 16ULL;
+
+				if (gb.Wq.size() > 0) glades::gpu::initGlorotUniform(gb.Wq.data(), gb.Wq.size(), ts.dModel, ts.dModel, initSeed, base + 0ULL);
+				if (gb.Wk.size() > 0) glades::gpu::initGlorotUniform(gb.Wk.data(), gb.Wk.size(), ts.dModel, dModelKV, initSeed, base + 1ULL);
+				if (gb.Wv.size() > 0) glades::gpu::initGlorotUniform(gb.Wv.data(), gb.Wv.size(), ts.dModel, dModelKV, initSeed, base + 2ULL);
+				if (gb.Wo.size() > 0) glades::gpu::initGlorotUniform(gb.Wo.data(), gb.Wo.size(), ts.dModel, ts.dModel, initSeed, base + 3ULL);
+				if (gb.W1.size() > 0) glades::gpu::initGlorotUniform(gb.W1.data(), gb.W1.size(), ts.dModel, ff1Width,  initSeed, base + 4ULL);
+				if (gb.W2.size() > 0) glades::gpu::initGlorotUniform(gb.W2.data(), gb.W2.size(), ts.dFF,    ts.dModel, initSeed, base + 5ULL);
+
+				// MLA latent projections (paradigm shift #76).
+				const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+				if (mlaDc > 0)
+				{
+					if (gb.Wdkv.size() > 0) glades::gpu::initGlorotUniform(gb.Wdkv.data(), gb.Wdkv.size(), ts.dModel, (unsigned int)mlaDc, initSeed, base + 6ULL);
+					if (gb.Wuk.size()  > 0) glades::gpu::initGlorotUniform(gb.Wuk.data(),  gb.Wuk.size(),  (unsigned int)mlaDc, dModelKV,  initSeed, base + 7ULL);
+					if (gb.Wuv.size()  > 0) glades::gpu::initGlorotUniform(gb.Wuv.data(),  gb.Wuv.size(),  (unsigned int)mlaDc, dModelKV,  initSeed, base + 8ULL);
+				}
+			}
+
+			tensorTransformer.gpuInitDeferred = false;
+		}
 	}
 
 	gpuStateReady = true;

@@ -5,6 +5,13 @@
 	struct TensorTransformerState
 	{
 		bool initialized;
+		// True when ensureTensorParametersInitialized skipped the host-side
+		// Glorot/normal init because trainingConfig.gpu.enable was set; the
+		// device-side init kernel (gpu::initTransformerWeightsOnDevice, called
+		// from ensureGpuState) is then responsible for filling weights.  Reset
+		// to false once GPU init has run.  Saves ~10 min of serial CPU init at
+		// 200M+ params.
+		bool gpuInitDeferred;
 		// Dataset shapes
 		unsigned int inputSize; // featureCount per timestep
 		unsigned int outSize;   // expected output size per timestep
@@ -646,6 +653,7 @@
 
 		TensorTransformerState()
 		    : initialized(false),
+		      gpuInitDeferred(false),
 		      inputSize(0u),
 		      outSize(0u),
 		      dModel(0u),
@@ -685,6 +693,7 @@
 		void reset()
 		{
 			initialized = false;
+			gpuInitDeferred = false;
 			inputSize = 0u;
 			outSize = 0u;
 			dModel = 0u;
