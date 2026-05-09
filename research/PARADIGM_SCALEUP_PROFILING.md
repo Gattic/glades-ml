@@ -47,12 +47,71 @@ consistent with the smaller working set (MLA latent vs full K/V cache,
 binary FFN vs float weights), even though most of the GPU compute is
 identical.
 
-## nsys availability
+## nsys traces (resolved)
 
-The Nsight Systems CLI on this install (`2022.4.2.50-32196742v0`) is
-missing the importer binary — `.qdstrm` files are produced but cannot be
-imported into a viewable report. Switching to GPU-side profiling via
-the existing test harness (Group BENCH in transformer-ops-test.cpp).
+Initially the nsys CLI on this system reported "importer binary missing"
+when finalising `.qdstrm` files. The importer is at
+`/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter` — running it
+manually after `nsys profile`:
+
+```bash
+nsys profile --trace=cuda --output=trace.run ./glades_pile_train ...
+/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter \
+    -i trace.run.qdstrm -o trace.run.nsys-rep
+nsys stats trace.run.nsys-rep
+```
+
+Top kernels in baseline trace (T=1024 dmodel=384 layers=4 heads=6 dff=1024
+5K tokens, 1,931 kernel launches over ~13 ms total GPU time):
+
+| % | Total ns | Kernel |
+|---|---|---|
+| 50.2 | 78.86 ms | flash_attention_bwd_multiq_kernel_bf16 |
+| 10.0 | 15.71 ms | flash_attention_bwd_multiq_kernel_bf16 (different shape) |
+|  9.3 | 14.64 ms | adam_update_batch_kernel |
+|  5.4 |  8.44 ms | argmax_count_kernel |
+|  2.4 |  3.74 ms | reduce_rows_sum_kernel |
+|  2.1 |  3.31 ms | zero_multi_buffers_kernel |
+|  1.5 |  2.39 ms | k_cast_f32_to_bf16 |
+|  1.5 |  1.82 ms | causal_mask_softmax_kernel |
+|  1.0 |  1.58 ms | cutlass_80_tensorop_s16816gemm_bf16_128x128_32x4_tn_align8 |
+|  ... |  ... | (other kernels each <1%) |
+
+**Key finding from the nsys trace**: attention backward (60% of GPU
+time) is the dominant cost at this configuration. This validates the
+priority of #78 ATTENTION-SINK (sliding-window attention) for training
+throughput.
+
+GPU memory ops summary (size-weighted):
+- `cudaMemcpy HtoD`: 233 MB total / 239 ops (avg 0.98 MB) — weight upload
+- `cudaMemcpy DtoH`: 78 MB total / 73 ops — gradient/loss downloads
+- `cudaMemset`: 61 MB total / 75 ops — buffer clears
+
+## Stacked-config trace finding: cuBLAS execution failure on MLA backward
+
+When tracing the stacked config (`--mla-dc 192 --binary-ffn`) at
+T=1024 dmodel=384 layers=4, the trainer reports a recurring
+`cublasSgemm(ATB) failed: 7 (M=192 N=384 K=1024)` error during MLA
+backward. The exact (non-TF32) variant fails the same way, ruling out
+math-mode alignment issues. The error is consistent across iterations
+and at multiple K values (905, 1024).
+
+The standard W_K backward at the same shapes succeeds because it
+routes through the BF16 path (`sgemm_rowmajor_atb_bf16` via
+`gpu_gemm_atb_mp` with --mp). The FP32 `sgemm_rowmajor_atb` appears to
+have a latent issue that no production code path was previously
+exercising (since --mp routes everything through bf16).
+
+Workaround scoped (committed in `9bd2d9efe`): switch to exact (non-TF32)
+variant + cudaGetLastError clear at function entry. Did not resolve
+the underlying issue but hardened against state pollution from prior
+failures. A proper fix routes MLA backward through the bf16 path
+(cast c/dK/dV to BF16 first); estimated 1 day of careful engineering.
+
+Training still proceeds without crash because the cuBLAS error is
+non-fatal — the failed sgemm produces zero gradients on the MLA tensors
+for that iteration (Wq, Wo, W1, W2 still update normally). At smaller T
+(T=512 verified) the MLA backward succeeds and the full Adam path runs.
 
 ## GPU kernel breakdown (steady-state)
 
