@@ -146,6 +146,15 @@ struct GpuTransformerWeights
 	GpuBuffer<float>   faceDnRaw;    // [dModel] scratch
 	GpuBuffer<float>   faceQStep;    // 1 element scratch
 	GpuBuffer<float>   faceGFStep;   // 1 element scratch
+	// BF16 grad mirror — used when MixedPrecisionConfig::gradStorageBf16
+	// is true.  Persistent grad accumulator at half the memory of FP32
+	// grads.  Backward GEMMs still write FP32 (into a scratch buffer in
+	// GpuTransformerScratch), but the persistent storage between Adam
+	// steps is BF16.  Adam reads BF16 directly (adam_update_*_bf16grad
+	// kernel variants).
+	GpuBuffer<uint16_t> gTokE_bf16;
+	GpuBuffer<uint16_t> gWIn_bf16;
+	GpuBuffer<uint16_t> gWOut_bf16;
 
 	// LM head bias: [vocabSize]
 	GpuBuffer<float> lmBias;
@@ -254,6 +263,10 @@ struct GpuTransformerWeights
 		GpuBuffer<uint8_t> v2Wq_int8, v2Wk_int8, v2Wv_int8, v2Wo_int8;
 		GpuBuffer<float>   vWqScale, vWkScale, vWvScale, vWoScale;
 		GpuBuffer<float>   v2WqScale, v2WkScale, v2WvScale, v2WoScale;
+		// BF16 grad mirrors — used when gradStorageBf16=true.  See
+		// GpuTransformerWeights::gTokE_bf16 for mechanism.
+		GpuBuffer<uint16_t> gWq_bf16, gWk_bf16, gWv_bf16, gWo_bf16;
+		GpuBuffer<uint16_t> gWdkv_bf16, gWuk_bf16, gWuv_bf16;
 		GpuBuffer<float> bq, bk, bv, bo;     // [dModel] or [dModelKV]
 		GpuBuffer<float> mBq, mBk, mBv, mBo;
 		GpuBuffer<float> v2Bq, v2Bk, v2Bv, v2Bo;
@@ -279,6 +292,8 @@ struct GpuTransformerWeights
 		GpuBuffer<uint8_t> v2W1_int8, v2W2_int8;
 		GpuBuffer<float>   vW1Scale, vW2Scale;
 		GpuBuffer<float>   v2W1Scale, v2W2Scale;
+		// BF16 grad mirrors for FFN weights.
+		GpuBuffer<uint16_t> gW1_bf16, gW2_bf16;
 		GpuBuffer<float> gW1, gW2;
 		GpuBuffer<uint16_t> W1Lowp, W2Lowp;
 		GpuBuffer<float> b1, b2;     // [dFF or 2*dFF], [dModel]
@@ -422,7 +437,8 @@ struct GpuTransformerWeights
 	              bool adamStateBf16 = false,
 	              int mlaLatentDim = 0,
 	              bool adamStateInt8 = false,
-	              bool faceEmbedding = false);
+	              bool faceEmbedding = false,
+	              bool gradStorageBf16 = false);
 
 	// Free all GPU memory.
 	void free();

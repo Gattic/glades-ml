@@ -83,8 +83,12 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
                                       bool adamStateBf16,
                                       int mlaLatentDim,
                                       bool adamStateInt8,
-                                      bool faceEmbedding)
+                                      bool faceEmbedding,
+                                      bool gradStorageBf16)
 {
+	(void)gradStorageBf16;  // bf16 grad buffers are header-declared but
+	                        // allocation flow not yet wired (todo: see
+	                        // research/BF16_GRADS_PLAN.md).
 	free();
 	// int8 wins over bf16 if both flags accidentally set (it's the more
 	// aggressive compression — see MixedPrecisionConfig comments).

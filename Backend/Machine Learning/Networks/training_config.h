@@ -1648,6 +1648,16 @@ struct MixedPrecisionConfig
 	// when both are set; int8 wins (it's the more aggressive compression).
 	bool adamStateInt8;
 
+	// Store gradients as BF16 instead of FP32.  Halves grad-buffer VRAM
+	// (~3.7 GB savings at 1.84B).  Mechanism: each backward GEMM writes
+	// into a shared scratch FP32 buffer (sized to the widest weight tensor),
+	// then bf16_accum_axpy commits the result into the persistent BF16 grad
+	// buffer with stochastic-rounding-equivalent rebanding.  Adam reads the
+	// BF16 grad directly (uses adam_update_*_bf16grad kernels).  Required
+	// alongside adamStateBf16 or adamStateInt8 to fit 1.84B-class on a 16 GB
+	// GPU.  Ported from CHIRON's BF16-grads path (paradigm-stack at ≥500M).
+	bool gradStorageBf16;
+
 	// Loss scaling:
 	// - If enable==true and useLossScaling==true, backprop deltas are multiplied by lossScale
 	//   and the optimizer divides gradients by lossScale before applying updates.
@@ -1667,6 +1677,7 @@ struct MixedPrecisionConfig
 	      weightDType(WEIGHT_F16),
 	      adamStateBf16(false),
 	      adamStateInt8(false),
+	      gradStorageBf16(false),
 	      useLossScaling(true),
 	      dynamicLossScaling(true),
 	      lossScaleInit(1024.0f),
