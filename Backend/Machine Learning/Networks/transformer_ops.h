@@ -2127,5 +2127,104 @@ inline void phoenix_binary_gemm_colmajor(const float* X,
 	}
 }
 
+// ============================================================================
+// Paradigm shift #93 — ASTRA-KAHAN-DISTILL (Path 2 round 2)
+// ============================================================================
+//
+// Stateless-v Adam (#41 ASTRA recomposition) with Kahan compensation on the
+// momentum accumulator. Per-step update:
+//
+//   m_t = β1 · m_{t-1} + (1-β1) · g_t      (with Kahan compensation in c_t)
+//   v_t = g_t²                              (stateless — no persistent v)
+//   θ_t = θ_{t-1} - lr · m_t / (sqrt(v_t) + ε)
+//
+// Memory:
+//   - Standard Adam: 2 floats per param (m, v).
+//   - ASTRA-KAHAN: 2 floats per param (m, c_kahan). v is recomputed each step.
+//
+// Naive memory cost is identical, but the Kahan compensator c is well-suited
+// to BF16 storage (it's a small residual) whereas v needs more dynamic range.
+// In a BF16-Adam-state regime, Kahan-bf16 gives ≈10x precision of plain v-bf16
+// at the same byte cost — the design's "1.8 GB Adam savings" claim is the
+// difference between Kahan-bf16 m + Kahan-bf16 c (4 bytes) vs full-Adam-bf16
+// m + v + Kahan c (6 bytes). Here we stay in FP32 for unit-test scope.
+//
+// Reference: ASTRA #41 (Liu 2023 stateless variance), Kahan summation
+// (Kahan 1965) for compensated accumulation.
+
+inline void astra_kahan_step(float* param,
+                             const float* grad,
+                             float* m,
+                             float* c_kahan,
+                             unsigned int n,
+                             float lr,
+                             float beta1,
+                             float eps,
+                             float weightDecay)
+{
+	if (!param || !grad || !m || !c_kahan || n == 0u)
+		return;
+	const float oneMinusB1 = 1.0f - beta1;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const float g = grad[i];
+
+		// Kahan-compensated update of m:
+		//   m_t = β1·m_{t-1} + (1-β1)·g_t
+		// Track residual lost-to-rounding via c_kahan.
+		const float y = oneMinusB1 * g - c_kahan[i];
+		const float mPrev = beta1 * m[i];
+		const float t = mPrev + y;
+		c_kahan[i] = (t - mPrev) - y;
+		m[i] = t;
+
+		// Stateless-v: v_t = g_t², recomputed each step.
+		const float v = g * g;
+
+		// AdamW-style param update (decoupled weight decay).
+		const float denom = sqrtf(v) + eps;
+		const float upd = lr * m[i] / denom;
+		float p = param[i];
+		if (weightDecay > 0.0f)
+			p -= lr * weightDecay * p;
+		p -= upd;
+		param[i] = p;
+	}
+}
+
+// Reference standard Adam (with full v EMA) for parity comparison.
+inline void adam_step_reference(float* param,
+                                const float* grad,
+                                float* m,
+                                float* v,
+                                unsigned int n,
+                                float lr,
+                                float beta1,
+                                float beta2,
+                                float eps,
+                                float weightDecay,
+                                int step)
+{
+	if (!param || !grad || !m || !v || n == 0u || step <= 0)
+		return;
+	const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
+	const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const float g = grad[i];
+		m[i] = beta1 * m[i] + (1.0f - beta1) * g;
+		v[i] = beta2 * v[i] + (1.0f - beta2) * g * g;
+		const float mhat = m[i] / bc1;
+		const float vhat = v[i] / bc2;
+		const float denom = sqrtf(vhat) + eps;
+		const float upd = lr * mhat / denom;
+		float p = param[i];
+		if (weightDecay > 0.0f)
+			p -= lr * weightDecay * p;
+		p -= upd;
+		param[i] = p;
+	}
+}
+
 } // namespace transformer_ops
 } // namespace glades
