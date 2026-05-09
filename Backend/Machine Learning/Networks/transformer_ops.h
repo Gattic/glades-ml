@@ -2295,5 +2295,101 @@ inline float neural_cache_compression_ratio(unsigned int nHeads,
 	return static_cast<float>(mhaPerToken) / static_cast<float>(d_c);
 }
 
+// ============================================================================
+// Paradigm shift #77 — MOEFICATION-DISTILL-CHIRON (Path 2 round 5)
+// ============================================================================
+//
+// Post-hoc Mixture-of-Experts: route per-token to top-k of E experts via
+// router softmax, then compute weighted sum of selected experts' outputs.
+// Per #77 design: typical config E=8, k=2 (active ratio = 0.25).
+//
+// Headline: 256B effective parameters at ~25% of #74-dense compute.
+// (Mixtral 8x22B ≈ 141B params, ~39B active.)
+
+// Top-k selection: writes top-k indices into out_indices and corresponding
+// renormalized softmax weights into out_weights. Indices are in original
+// router-logit positions; weights sum to 1 over the top-k subset.
+//
+//   logits:  [E]
+//   k:       number of experts to keep (1 ≤ k ≤ E)
+inline void moe_topk_router(const float* logits,
+                            unsigned int E,
+                            unsigned int k,
+                            unsigned int* out_indices,
+                            float* out_weights)
+{
+	if (!logits || !out_indices || !out_weights || E == 0u || k == 0u || k > E)
+		return;
+
+	// O(k * E) selection: simple but correct for E small (typical E=8).
+	std::vector<bool> taken(E, false);
+	for (unsigned int i = 0; i < k; ++i)
+	{
+		unsigned int best = E;
+		float bestv = -1e30f;
+		for (unsigned int e = 0; e < E; ++e)
+		{
+			if (taken[e]) continue;
+			if (logits[e] > bestv) { bestv = logits[e]; best = e; }
+		}
+		out_indices[i] = best;
+		taken[best] = true;
+	}
+
+	// Softmax over the selected k logits (renormalize within top-k).
+	float maxL = logits[out_indices[0]];
+	for (unsigned int i = 1; i < k; ++i)
+		if (logits[out_indices[i]] > maxL) maxL = logits[out_indices[i]];
+	double sum = 0.0;
+	for (unsigned int i = 0; i < k; ++i)
+	{
+		const double e = exp(static_cast<double>(logits[out_indices[i]] - maxL));
+		out_weights[i] = static_cast<float>(e);
+		sum += e;
+	}
+	if (sum <= 0.0) return;
+	const float inv = static_cast<float>(1.0 / sum);
+	for (unsigned int i = 0; i < k; ++i) out_weights[i] *= inv;
+}
+
+// Compute the active-parameters fraction for top-k of E gating.
+inline float moe_active_fraction(unsigned int E, unsigned int k)
+{
+	if (E == 0u) return 0.0f;
+	return static_cast<float>(k) / static_cast<float>(E);
+}
+
+// Sparse mixture forward: given pre-computed expert outputs (one per expert,
+// each [d_out]) and the top-k routing decision, write the weighted sum.
+//
+//   expert_outputs: [E * d_out]
+//   indices:        [k]      from moe_topk_router
+//   weights:        [k]      from moe_topk_router
+//   y_out:          [d_out]  overwritten with Σ_{i in topk} w_i · expert_i(x)
+//
+// In production the K experts beyond the top-k would NOT be evaluated; the
+// caller is responsible for that compute saving. This function just sums.
+inline void moe_combine_topk_outputs(const float* expert_outputs,
+                                     unsigned int E,
+                                     unsigned int d_out,
+                                     const unsigned int* indices,
+                                     const float* weights,
+                                     unsigned int k,
+                                     float* y_out)
+{
+	if (!expert_outputs || !indices || !weights || !y_out || E == 0u || d_out == 0u || k == 0u)
+		return;
+	for (unsigned int d = 0; d < d_out; ++d) y_out[d] = 0.0f;
+	for (unsigned int i = 0; i < k; ++i)
+	{
+		const unsigned int e = indices[i];
+		if (e >= E) continue;
+		const float w = weights[i];
+		const float* ex = expert_outputs + static_cast<size_t>(e) * d_out;
+		for (unsigned int d = 0; d < d_out; ++d)
+			y_out[d] += w * ex[d];
+	}
+}
+
 } // namespace transformer_ops
 } // namespace glades

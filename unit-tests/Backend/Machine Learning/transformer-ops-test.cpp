@@ -45,6 +45,9 @@ using glades::transformer_ops::astra_kahan_step;
 using glades::transformer_ops::adam_step_reference;
 using glades::transformer_ops::neural_compress_2layer;
 using glades::transformer_ops::neural_cache_compression_ratio;
+using glades::transformer_ops::moe_topk_router;
+using glades::transformer_ops::moe_active_fraction;
+using glades::transformer_ops::moe_combine_topk_outputs;
 using glades::transformer_kernels::silu_forward_buf;
 using glades::transformer_kernels::gelu_forward_buf;
 using glades::transformer_kernels::silu_backward_buf;
@@ -1850,6 +1853,114 @@ static void test_neural_compress_reconstruction_via_decompress()
 }
 
 // ============================================================
+// Group K: Paradigm shift #77 MOEFICATION
+// ============================================================
+// Top-k MoE routing primitives. Default E=8 k=2 → 25% active.
+
+static void test_moe_topk_correctness()
+{
+	printf("  [K1] MoETopKSelectsHighestLogits ...\n");
+	const unsigned int E = 8u;
+	const unsigned int k = 2u;
+	float logits[8] = {0.1f, 2.5f, 0.3f, 1.8f, 0.0f, -0.5f, 0.7f, 1.0f};  // sorted: 1, 3, 7, 6, 2, 0, 4, 5
+	unsigned int idx[2] = {0u, 0u};
+	float w[2] = {0.0f, 0.0f};
+	moe_topk_router(logits, E, k, idx, w);
+	printf("    selected experts: [%u, %u] (expect {1, 3})\n", idx[0], idx[1]);
+	ASSERT("top-1 = expert 1 (highest logit)", idx[0] == 1u);
+	ASSERT("top-2 = expert 3 (second highest)", idx[1] == 3u);
+	double sum = static_cast<double>(w[0]) + static_cast<double>(w[1]);
+	printf("    weights: [%.4f, %.4f] sum=%.4f (must = 1)\n", w[0], w[1], sum);
+	ASSERT("top-k weights sum to 1", std::fabs(sum - 1.0) < 1e-5);
+	ASSERT("top-1 weight > top-2 weight", w[0] > w[1]);
+	printf("    PASSED\n");
+}
+
+static void test_moe_active_fraction()
+{
+	printf("  [K2] MoEActiveFraction ...\n");
+	float f1 = moe_active_fraction(8u, 2u);  // 0.25
+	float f2 = moe_active_fraction(256u, 8u); // 0.03125 (DeepSeek-V3 style)
+	float f3 = moe_active_fraction(8u, 8u);   // 1.0 (dense)
+	printf("    E=8 k=2: %.4f (Mixtral-style, expect 0.25)\n", f1);
+	printf("    E=256 k=8: %.4f (DeepSeek-V3-style, expect 0.0312)\n", f2);
+	printf("    E=8 k=8: %.4f (degenerate dense, expect 1.0)\n", f3);
+	ASSERT("E=8 k=2 active = 0.25", std::fabs(f1 - 0.25f) < 1e-5f);
+	ASSERT("E=256 k=8 active ≈ 0.031", std::fabs(f2 - 0.03125f) < 1e-5f);
+	ASSERT("E=k recovers dense", std::fabs(f3 - 1.0f) < 1e-5f);
+	printf("    PASSED\n");
+}
+
+static void test_moe_combine_correctness()
+{
+	printf("  [K3] MoECombineTopKOutputs ...\n");
+	const unsigned int E = 4u;
+	const unsigned int k = 2u;
+	const unsigned int d_out = 3u;
+	// expert outputs: each row is one expert's output vector
+	float experts[4 * 3] = {
+	    1.0f, 2.0f, 3.0f,
+	    4.0f, 5.0f, 6.0f,
+	    7.0f, 8.0f, 9.0f,
+	    10.0f, 11.0f, 12.0f
+	};
+	unsigned int idx[2] = {0u, 2u};  // pick experts 0 and 2
+	float w[2] = {0.6f, 0.4f};
+	float y[3] = {0.0f, 0.0f, 0.0f};
+	moe_combine_topk_outputs(experts, E, d_out, idx, w, k, y);
+	// Expected: 0.6 * [1,2,3] + 0.4 * [7,8,9] = [3.4, 4.4, 5.4]
+	const float exp_y[3] = {3.4f, 4.4f, 5.4f};
+	for (unsigned int d = 0; d < d_out; ++d)
+	{
+		printf("    y[%u]=%.3f (expect %.3f)\n", d, y[d], exp_y[d]);
+		ASSERT("combine arithmetic", std::fabs(y[d] - exp_y[d]) < 1e-5f);
+	}
+	printf("    PASSED\n");
+}
+
+static void test_moe_dense_recovery()
+{
+	printf("  [K4] MoEDenseRecoveryAtKEqualsE ...\n");
+	// At k=E, top-k selection should pick all experts; the weighted combine
+	// becomes a softmax-weighted sum (all experts contribute).
+	const unsigned int E = 4u;
+	const unsigned int k = 4u;
+	float logits[4] = {0.5f, 1.0f, 0.0f, -0.5f};
+	std::vector<unsigned int> idx(k, 0u);
+	std::vector<float> w(k, 0.0f);
+	moe_topk_router(logits, E, k, idx.data(), w.data());
+	double sum = 0.0;
+	for (unsigned int i = 0; i < k; ++i) sum += w[i];
+	printf("    k=E=4: weight sum=%.4f (must be 1); all experts selected\n", sum);
+	ASSERT("k=E weights sum to 1", std::fabs(sum - 1.0) < 1e-5);
+
+	// Reference softmax over all logits
+	float maxL = logits[0];
+	for (unsigned int i = 1; i < E; ++i) if (logits[i] > maxL) maxL = logits[i];
+	double s = 0.0;
+	std::vector<float> p_ref(E, 0.0f);
+	for (unsigned int i = 0; i < E; ++i)
+	{
+		const double e = exp(static_cast<double>(logits[i] - maxL));
+		p_ref[i] = static_cast<float>(e);
+		s += e;
+	}
+	for (unsigned int i = 0; i < E; ++i) p_ref[i] /= static_cast<float>(s);
+
+	// Compare moe weights at indices to softmax probabilities
+	double maxAbs = 0.0;
+	for (unsigned int i = 0; i < k; ++i)
+	{
+		double diff = std::fabs(static_cast<double>(w[i]) -
+		                        static_cast<double>(p_ref[idx[i]]));
+		if (diff > maxAbs) maxAbs = diff;
+	}
+	printf("    max |moe_w - softmax_ref| = %.3e\n", maxAbs);
+	ASSERT("k=E recovers softmax over all experts", maxAbs < 1e-5);
+	printf("    PASSED\n");
+}
+
+// ============================================================
 // Group H: GPU parity for paradigms #74/#76/#78
 // ============================================================
 // CPU vs GPU max-abs-diff comparisons + speedup measurement.
@@ -2273,6 +2384,13 @@ void TransformerOpsUnitTest()
 	test_neural_compress_forward_correctness();
 	test_neural_compress_determinism();
 	test_neural_compress_reconstruction_via_decompress();
+
+	// Group K: Paradigm shift #77 MOEFICATION
+	printf("--- Group K: MoE top-k routing (paradigm #77) ---\n");
+	test_moe_topk_correctness();
+	test_moe_active_fraction();
+	test_moe_combine_correctness();
+	test_moe_dense_recovery();
 
 	// Group H: GPU parity for #74/#76/#78
 #ifdef GLADES_HAVE_CUDA
