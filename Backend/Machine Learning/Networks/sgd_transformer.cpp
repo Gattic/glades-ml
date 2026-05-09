@@ -9395,8 +9395,13 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 			    static_cast<size_t>(T) * dModelKV);
 			// Local-window attention (paradigm shift #6 port to main transformer).
 			// When localAttnWindow > 0, use the O(T·W) variant.
+			// Paradigm #78 ATTENTION-SINK: when attnSinkCount > 0, force the
+			// local kernel even at full window so the first sinkCount keys are
+			// always retained.
 			const int localW = trainingConfig.transformer.localAttnWindow;
-			if (localW > 0 && localW < static_cast<int>(T)) {
+			const int sinkS = trainingConfig.transformer.attnSinkCount > 0
+			    ? trainingConfig.transformer.attnSinkCount : 0;
+			if ((localW > 0 && localW < static_cast<int>(T)) || sinkS > 0) {
 				gpu::flash_attention_multihead_forward_bf16_local(
 				    gpuTransformerScratch->qLowp.data(),
 				    gpuTransformerScratch->kLowp.data(),
@@ -9404,7 +9409,7 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 				    static_cast<int>(T), static_cast<int>(nHeads),
 				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
 				    static_cast<int>(dModel), static_cast<int>(dModelKV),
-				    causal, localW, attnConcat_l);
+				    causal, localW, attnConcat_l, sinkS);
 			} else {
 				gpu::flash_attention_multihead_forward_bf16(
 				    gpuTransformerScratch->qLowp.data(),
@@ -9958,7 +9963,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (!bf16_attn_done)
 				{
 				const int localW_tr = trainingConfig.transformer.localAttnWindow;
-				if (localW_tr > 0 && localW_tr < static_cast<int>(T)) {
+				const int sinkS_tr = trainingConfig.transformer.attnSinkCount > 0
+				    ? trainingConfig.transformer.attnSinkCount : 0;
+				if ((localW_tr > 0 && localW_tr < static_cast<int>(T)) || sinkS_tr > 0) {
 				gpu::flash_attention_multihead_forward_bf16_local(
 				    gpuTransformerScratch->qLowp.data(),
 				    gpuTransformerScratch->kLowp.data(),
@@ -9971,7 +9978,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    static_cast<int>(dModelKV),
 				    causal,
 				    localW_tr,
-				    attnConcat_l);
+				    attnConcat_l,
+				    sinkS_tr);
 				} else {
 				gpu::flash_attention_multihead_forward_bf16(
 				    gpuTransformerScratch->qLowp.data(),
@@ -10664,8 +10672,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				// kernel launch failure (e.g., shape exceeds the
 				// multi-query shmem budget on this device).
 				// Local-window attention backward (paradigm shift #6 port).
+				// Paradigm #78: also dispatched when attnSinkCount > 0.
 				const int localW_bw = trainingConfig.transformer.localAttnWindow;
-				if (localW_bw > 0 && localW_bw < static_cast<int>(T)) {
+				const int sinkS_bw = trainingConfig.transformer.attnSinkCount > 0
+				    ? trainingConfig.transformer.attnSinkCount : 0;
+				if ((localW_bw > 0 && localW_bw < static_cast<int>(T)) || sinkS_bw > 0) {
 				attnBwdDone = gpu::flash_attention_multihead_backward_bf16_local(
 				    gpuTransformerScratch->qLowp.data(),
 				    gpuTransformerScratch->kLowp.data(),
@@ -10682,7 +10693,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    localW_bw,
 				    gpuTransformerScratch->dQfull.data(),
 				    gpuTransformerScratch->dKfull.data(),
-				    gpuTransformerScratch->dVfull.data());
+				    gpuTransformerScratch->dVfull.data(),
+				    sinkS_bw);
 				} else {
 				attnBwdDone = gpu::flash_attention_multihead_backward_bf16(
 				    gpuTransformerScratch->qLowp.data(),

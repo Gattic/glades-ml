@@ -3236,6 +3236,7 @@ __global__ void flash_attention_fwd_local_kernel_bf16(
     int T, int nHeads, int nKVHeads,
     int dHead, int dModel, int dModelKV,
     int causal, int windowSize,
+    int sinkCount,
     int flashTile,
     float* __restrict__ O)
 {
@@ -3285,7 +3286,13 @@ __global__ void flash_attention_fwd_local_kernel_bf16(
 	const int qBlockStart = qBlock * QROWS;
 	const int qBlockEnd = qBlockStart + QROWS - 1;  // inclusive
 	const int qBlockEndCap = (qBlockEnd < T - 1) ? qBlockEnd : (T - 1);
-	const int blockKLo = (windowSize > 0 && qBlockStart > windowSize) ? (qBlockStart - windowSize) : 0;
+	// Paradigm #78 ATTENTION-SINK: when sinkCount > 0, the first sinkCount
+	// keys are always allowed regardless of window. Block-level kLo collapses
+	// to 0 to ensure those tiles are loaded; per-row check below distinguishes
+	// sink keys from window keys.
+	const int blockKLo = (sinkCount > 0)
+	    ? 0
+	    : ((windowSize > 0 && qBlockStart > windowSize) ? (qBlockStart - windowSize) : 0);
 	const int blockKHi_raw = causal
 	    ? (qBlockEndCap + 1)
 	    : (windowSize > 0 ? (qBlockEndCap + windowSize + 1) : T);
@@ -3314,10 +3321,9 @@ __global__ void flash_attention_fwd_local_kernel_bf16(
 		if (myRowActive) {
 			for (int j = 0; j < tileLen; ++j) {
 				const int kIdx = kStart + j;
-				// Skip if outside this row's window — each row has its own
-				// window bounds (kLo_row, kHi_row) narrower than the block-
-				// level (blockKLo, blockKHi).
-				if (kIdx < kLo_row) continue;
+				// Skip if outside this row's window AND outside the sink range.
+				// Sinks: first `sinkCount` keys always allowed.
+				if (kIdx < kLo_row && kIdx >= sinkCount) continue;
 				if (kIdx >= kHi_row) break;   // sorted order; no more valid
 
 				float partial = 0.0f;
@@ -3515,6 +3521,7 @@ __global__ void flash_attention_bwd_local_kernel_bf16(
     int T, int nHeads, int nKVHeads,
     int dHead, int dModel, int dModelKV,
     int causal, int windowSize,
+    int sinkCount,
     int flashTile,
     float* __restrict__ dQ,
     float* __restrict__ dK_out,
@@ -3562,7 +3569,11 @@ __global__ void flash_attention_bwd_local_kernel_bf16(
 	const int qBlockStart = qBlock * QROWS;
 	const int qBlockEnd = qBlockStart + QROWS - 1;
 	const int qBlockEndCap = (qBlockEnd < T - 1) ? qBlockEnd : (T - 1);
-	const int blockKLo = (windowSize > 0 && qBlockStart > windowSize) ? (qBlockStart - windowSize) : 0;
+	// Paradigm #78 sinks: same logic as forward — when sinkCount > 0, expand
+	// block-level kLo to 0 so sink tiles are loaded; per-row check distinguishes.
+	const int blockKLo = (sinkCount > 0)
+	    ? 0
+	    : ((windowSize > 0 && qBlockStart > windowSize) ? (qBlockStart - windowSize) : 0);
 	const int blockKHi_raw = causal
 	    ? (qBlockEndCap + 1)
 	    : (windowSize > 0 ? (qBlockEndCap + windowSize + 1) : T);
@@ -3590,7 +3601,7 @@ __global__ void flash_attention_bwd_local_kernel_bf16(
 		if (myRowActive) {
 			for (int j = 0; j < tileLen; ++j) {
 				const int kIdx = kStart + j;
-				if (kIdx < kLo_row) continue;
+				if (kIdx < kLo_row && kIdx >= sinkCount) continue;
 				if (kIdx >= kHi_row) break;
 				float partial = 0.0f;
 				for (int d = laneId; d < dHead; d += 32)
@@ -3639,7 +3650,7 @@ __global__ void flash_attention_bwd_local_kernel_bf16(
 		if (myRowActive) {
 			for (int j = 0; j < tileLen; ++j) {
 				const int kIdx = kStart + j;
-				if (kIdx < kLo_row) continue;
+				if (kIdx < kLo_row && kIdx >= sinkCount) continue;
 				if (kIdx >= kHi_row) break;
 
 				float partialQK = 0.0f;
@@ -3673,17 +3684,20 @@ __global__ void flash_attention_bwd_local_kernel_bf16(
 
 // Local-window BF16 flash attention backward wrapper.  windowSize <= 0 or
 // >= T falls back to the full backward.
+// Paradigm #78: sinkCount > 0 forces the local-window path so sinks are
+// always preserved even when windowSize >= T degenerate.
 bool flash_attention_multihead_backward_bf16_local(
     const uint16_t* Q, const uint16_t* K, const uint16_t* V,
     const float* O, const float* dO,
     int T, int nHeads, int nKVHeads,
     int dHead, int dModel, int dModelKV,
     bool causal, int windowSize,
-    float* dQ, float* dK_out, float* dV_out)
+    float* dQ, float* dK_out, float* dV_out,
+    int sinkCount)
 {
 	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
 		return true;
-	if (windowSize <= 0 || windowSize >= T) {
+	if ((windowSize <= 0 || windowSize >= T) && sinkCount <= 0) {
 		return flash_attention_multihead_backward_bf16(
 		    Q, K, V, O, dO,
 		    T, nHeads, nKVHeads, dHead, dModel, dModelKV,
@@ -3715,7 +3729,7 @@ bool flash_attention_multihead_backward_bf16_local(
 	flash_attention_bwd_local_kernel_bf16<kFlashQRows><<<grid, block, smemBytes, computeStream()>>>(
 	    Q, K, V, O, dO,
 	    T, nHeads, nKVHeads, dHead, dModel, dModelKV,
-	    causal ? 1 : 0, windowSize, flashTile, dQ, dK_out, dV_out);
+	    causal ? 1 : 0, windowSize, sinkCount, flashTile, dQ, dK_out, dV_out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -3801,16 +3815,18 @@ bool flash_attention_multihead_forward_bf16(const uint16_t* Q, const uint16_t* K
 
 // Local-window BF16 flash attention forward wrapper.  windowSize <= 0 falls
 // back to full attention via flash_attention_multihead_forward_bf16.
+// Paradigm #78: sinkCount > 0 forces the local-window kernel even if window
+// is degenerate, so that the first `sinkCount` keys are always retained.
 bool flash_attention_multihead_forward_bf16_local(const uint16_t* Q, const uint16_t* K,
                                                    const uint16_t* V,
                                                    int T, int nHeads, int nKVHeads,
                                                    int dHead, int dModel, int dModelKV,
                                                    bool causal, int windowSize,
-                                                   float* O)
+                                                   float* O, int sinkCount)
 {
 	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
 		return true;
-	if (windowSize <= 0 || windowSize >= T) {
+	if ((windowSize <= 0 || windowSize >= T) && sinkCount <= 0) {
 		return flash_attention_multihead_forward_bf16(
 		    Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal, O);
 	}
@@ -3836,7 +3852,7 @@ bool flash_attention_multihead_forward_bf16_local(const uint16_t* Q, const uint1
 	const size_t smemBytes = static_cast<size_t>(flashTile) * static_cast<size_t>(2 * dHead) * sizeof(float) + sOBytes;
 	flash_attention_fwd_local_kernel_bf16<kFlashQRows><<<grid, block, smemBytes, computeStream()>>>(
 	    Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV,
-	    causal ? 1 : 0, windowSize, flashTile, O);
+	    causal ? 1 : 0, windowSize, sinkCount, flashTile, O);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

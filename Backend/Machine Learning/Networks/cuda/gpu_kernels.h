@@ -260,23 +260,26 @@ bool flash_attention_multihead_forward_bf16(const uint16_t* Q, const uint16_t* K
 // from O(T·T·dH) to O(T·W·dH), a 10-100× reduction at long context.
 // windowSize <= 0 or >= T falls back to full attention.
 // See research/SUBQUADRATIC_ATTENTION_DESIGN.md.
+// Paradigm #78 ATTENTION-SINK: passing sinkCount > 0 makes the first
+// `sinkCount` keys always allowed regardless of window. Default 0 preserves
+// existing call sites.
 bool flash_attention_multihead_forward_bf16_local(const uint16_t* Q, const uint16_t* K,
                                                    const uint16_t* V,
                                                    int T, int nHeads, int nKVHeads,
                                                    int dHead, int dModel, int dModelKV,
                                                    bool causal, int windowSize,
-                                                   float* O);
+                                                   float* O, int sinkCount = 0);
 
 // Local-window BF16 flash attention backward.  Same windowing rules as the
 // forward kernel; dK, dV accumulated via atomicAdd only on in-window keys.
-// windowSize <= 0 or >= T falls back to the full backward.
+// windowSize <= 0 or >= T falls back to the full backward (unless sinkCount>0).
 bool flash_attention_multihead_backward_bf16_local(
     const uint16_t* Q, const uint16_t* K, const uint16_t* V,
     const float* O, const float* dO,
     int T, int nHeads, int nKVHeads,
     int dHead, int dModel, int dModelKV,
     bool causal, int windowSize,
-    float* dQ, float* dK_out, float* dV_out);
+    float* dQ, float* dK_out, float* dV_out, int sinkCount = 0);
 
 // BF16-input backward variant. Q/K/V BF16; O/dO/dQ/dK/dV FP32 (each loaded
 // or written once so the traffic savings are negligible there). Returns
@@ -618,8 +621,8 @@ inline bool flash_attention_forward(const float*, const float*, const float*, in
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
 inline bool flash_attention_multihead_forward(const float*, const float*, const float*, int, int, int, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_multihead_forward_bf16(const unsigned short*, const unsigned short*, const unsigned short*, int, int, int, int, int, int, bool, float*) { return false; }
-inline bool flash_attention_multihead_forward_bf16_local(const unsigned short*, const unsigned short*, const unsigned short*, int, int, int, int, int, int, bool, int, float*) { return false; }
-inline bool flash_attention_multihead_backward_bf16_local(const unsigned short*, const unsigned short*, const unsigned short*, const float*, const float*, int, int, int, int, int, int, bool, int, float*, float*, float*) { return false; }
+inline bool flash_attention_multihead_forward_bf16_local(const unsigned short*, const unsigned short*, const unsigned short*, int, int, int, int, int, int, bool, int, float*, int = 0) { return false; }
+inline bool flash_attention_multihead_backward_bf16_local(const unsigned short*, const unsigned short*, const unsigned short*, const float*, const float*, int, int, int, int, int, int, bool, int, float*, float*, float*, int = 0) { return false; }
 inline bool flash_attention_multihead_backward_bf16(const unsigned short*, const unsigned short*, const unsigned short*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 inline bool flash_attention_multihead_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 
