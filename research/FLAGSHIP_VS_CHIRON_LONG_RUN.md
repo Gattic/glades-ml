@@ -284,6 +284,47 @@ The activation stash (10× `L × T × dModel` buffers, 2.5 GB at 165M,
 scales as `L × T × dModel`) is the next-largest target.  Gradient
 checkpointing would cut this by `~sqrt(L)` ≈ 4× at L=16.
 
+### 500M-class with --ffn-mlp: next ceiling identified
+
+After landing `--ffn-mlp` (drops the SwiGLU `ff1` from 3.07 GB → 1.6 GB
+at the 500M target), a fresh probe at d=1536/L=24/dFF=4096/T=4096 ran
+through 25 min of init + first eval (GPU peak 15,615 MB / 15,936) and
+hit a different OOM on the **first training step**:
+
+```
+cudaMalloc(150994944 floats, 603979776 bytes) failed: out of memory
+```
+
+That's `L × T × dModel = 24 × 4096 × 1536 = 150M floats = 604 MB` — one
+of the 10 activation-stash buffers (`x1`, `Q`, `attnConcat`, `attnOut`,
+`hAfterAttn`, `x2`, `ffOut`, `hAfterFF`, plus fwd/bwd) listed above.
+GPU was at 98% capacity from prior allocations; the next 600 MB
+allocation tipped it over.
+
+The activation stash is the next bottleneck after the SwiGLU `ff1`.
+At 500M the stash totals `10 × 24 × 4096 × 1536 × 4 bytes = ~6.3 GB`,
+which crowds out everything else on a 16 GB card.
+
+**Three paths to 500M+ training on 16 GB**, in increasing order of
+engineering cost:
+
+1. **Halve T from 4096 to 2048** (one-line). Cuts the stash to ~3 GB.
+   500M class likely fits at T=2048 with the current stack. Cost: half
+   the per-step useful sequence length.
+2. **Gradient checkpointing on the per-layer activation buffers** (~2-3
+   weeks). Recompute `Q, K, V, attnConcat, attnOut, ff1, ff1Act`
+   on the backward pass instead of storing all L copies. Memory drops
+   `~sqrt(L)` ≈ 4× at L=24. Compute cost: ~1.3-1.5× per step. Net wall
+   savings vs the OOM regime: positive.
+3. **CHIRON-style reversibility on a subset of layers** (months). The
+   architectural unification path described in
+   `UNIFIED_FLAGSHIP_CHIRON_DESIGN.md`. Drops activation memory from
+   `O(L)` to `O(L_S)` where L_S is the small number of non-reversible
+   "edge" layers.
+
+Option 1 is what to try next if you want the 500M comparison number
+this week.  Options 2 and 3 are the structural paths to 1B+.
+
 ### First-forward kernel-JIT wall
 
 The "10-min init" identified in the original report turns out NOT to
