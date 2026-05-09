@@ -4687,6 +4687,181 @@ bool sw_attention_forward_gpu(const float* Q, int qStride,
 	return true;
 }
 
+// ---------- #78 sink+window attention backward (FP32, single-head) -----
+// Recompute-style backward (mirrors CPU
+// scaled_dot_product_attention_backward_recompute_flash_strided_sw).
+// One block per query; all dQ writes are local to that block. dK/dV writes
+// across queries use atomicAdd.
+__global__ void sw_attention_backward_kernel(const float* __restrict__ Q,
+                                             int qStride,
+                                             const float* __restrict__ K,
+                                             int kStride,
+                                             const float* __restrict__ V,
+                                             int vStride,
+                                             const float* __restrict__ dO,
+                                             int dOStride,
+                                             int T, int dHead,
+                                             int causal,
+                                             int sinkCount,
+                                             int windowSize,
+                                             float invSqrt,
+                                             float* __restrict__ dQ,
+                                             int dQStride,
+                                             float* __restrict__ dK_out,
+                                             int dKStride,
+                                             float* __restrict__ dV_out,
+                                             int dVStride)
+{
+	const int t = blockIdx.x;
+	if (t >= T) return;
+	const int tid = threadIdx.x;
+	const unsigned mask = 0xFFFFFFFFu;
+
+	const float* qt = Q + (size_t)t * qStride;
+	const float* dOt = dO + (size_t)t * dOStride;
+	float* dQt = dQ + (size_t)t * dQStride;
+	const int maxU = causal ? t : (T - 1);
+
+	// Pass 1: compute online softmax (m, l) over allowed keys (warp-parallel
+	// dot product); cache scores via single-thread state.  Full caching of
+	// per-key scores in shared memory would be ideal but T may exceed shmem;
+	// we just pass over keys twice (recompute in pass 2/3).
+	float m_state = -1e30f;
+	float l_state = 0.0f;
+	bool any = false;
+
+	for (int u = 0; u <= maxU; ++u)
+	{
+		bool allowed = (sinkCount == 0 && windowSize == 0)
+		                  || (u < sinkCount)
+		                  || (windowSize > 0 && u + windowSize > t);
+		if (!allowed) continue;
+
+		const float* ku = K + (size_t)u * kStride;
+		float partial = 0.0f;
+		for (int d = tid; d < dHead; d += 32)
+			partial += qt[d] * ku[d];
+		for (int off = 16; off > 0; off >>= 1)
+			partial += __shfl_xor_sync(mask, partial, off);
+		const float s = partial * invSqrt;
+
+		if (!any) { any = true; m_state = s; l_state = 1.0f; continue; }
+		const float newM = (s > m_state) ? s : m_state;
+		const float alpha = expf(m_state - newM);
+		const float beta = expf(s - newM);
+		l_state = l_state * alpha + beta;
+		m_state = newM;
+	}
+	if (!any || !(l_state > 0.0f)) return;
+	const float inv_l = 1.0f / l_state;
+
+	// Pass 2: compute rowDot = sum_u p_u * dP_u and accumulate dV.
+	// We recompute s and p per key.
+	float rowDot_partial = 0.0f;
+	for (int u = 0; u <= maxU; ++u)
+	{
+		bool allowed = (sinkCount == 0 && windowSize == 0)
+		                  || (u < sinkCount)
+		                  || (windowSize > 0 && u + windowSize > t);
+		if (!allowed) continue;
+
+		const float* ku = K + (size_t)u * kStride;
+		const float* vu = V + (size_t)u * vStride;
+
+		// Recompute s
+		float partial = 0.0f;
+		for (int d = tid; d < dHead; d += 32)
+			partial += qt[d] * ku[d];
+		for (int off = 16; off > 0; off >>= 1)
+			partial += __shfl_xor_sync(mask, partial, off);
+		const float s = partial * invSqrt;
+		const float pf = expf(s - m_state) * inv_l;
+
+		// dP = dot(dOt, vu)
+		float dP_part = 0.0f;
+		for (int d = tid; d < dHead; d += 32)
+			dP_part += dOt[d] * vu[d];
+		for (int off = 16; off > 0; off >>= 1)
+			dP_part += __shfl_xor_sync(mask, dP_part, off);
+		// dP_part now in all lanes.
+
+		// rowDot accumulator (only thread 0 holds the running sum; we add
+		// pf*dP, broadcast not needed since dP_part is the same across lanes).
+		if (tid == 0) rowDot_partial += pf * dP_part;
+
+		// dV[u] += pf * dOt; atomic per-lane elementwise.
+		for (int d = tid; d < dHead; d += 32)
+		{
+			float* dVu = dV_out + (size_t)u * dVStride + d;
+			atomicAdd(dVu, pf * dOt[d]);
+		}
+	}
+	float rowDot = __shfl_sync(mask, rowDot_partial, 0);
+
+	// Pass 3: compute ds_u = pf * (dP_u - rowDot) * invSqrt, then accumulate
+	// dQ[t] += ds * ku and dK[u] += ds * qt.
+	for (int u = 0; u <= maxU; ++u)
+	{
+		bool allowed = (sinkCount == 0 && windowSize == 0)
+		                  || (u < sinkCount)
+		                  || (windowSize > 0 && u + windowSize > t);
+		if (!allowed) continue;
+
+		const float* ku = K + (size_t)u * kStride;
+		const float* vu = V + (size_t)u * vStride;
+
+		// Recompute s, pf
+		float partial = 0.0f;
+		for (int d = tid; d < dHead; d += 32)
+			partial += qt[d] * ku[d];
+		for (int off = 16; off > 0; off >>= 1)
+			partial += __shfl_xor_sync(mask, partial, off);
+		const float s = partial * invSqrt;
+		const float pf = expf(s - m_state) * inv_l;
+
+		// Recompute dP
+		float dP_part = 0.0f;
+		for (int d = tid; d < dHead; d += 32)
+			dP_part += dOt[d] * vu[d];
+		for (int off = 16; off > 0; off >>= 1)
+			dP_part += __shfl_xor_sync(mask, dP_part, off);
+		const float ds = pf * (dP_part - rowDot) * invSqrt;
+		if (ds == 0.0f) continue;
+
+		// dQ[t] += ds * ku  (each lane contributes its slice)
+		for (int d = tid; d < dHead; d += 32)
+			atomicAdd(&dQt[d], ds * ku[d]);
+		// dK[u] += ds * qt
+		float* dKu = dK_out + (size_t)u * dKStride;
+		for (int d = tid; d < dHead; d += 32)
+			atomicAdd(&dKu[d], ds * qt[d]);
+	}
+}
+
+// #78 backward wrapper.
+bool sw_attention_backward_gpu(const float* Q, int qStride,
+                                const float* K, int kStride,
+                                const float* V, int vStride,
+                                const float* dO, int dOStride,
+                                int T, int dHead, bool causal,
+                                int sinkCount, int windowSize,
+                                float* dQ, int dQStride,
+                                float* dK_out, int dKStride,
+                                float* dV_out, int dVStride)
+{
+	if (T <= 0 || dHead <= 0) return true;
+	// Caller is expected to zero dQ/dK/dV (atomicAdd accumulation semantics).
+	const float invSqrt = 1.0f / sqrtf((float)dHead);
+	const dim3 grid((unsigned int)T, 1u, 1u);
+	const dim3 block(32u, 1u, 1u);
+	sw_attention_backward_kernel<<<grid, block, 0, computeStream()>>>(
+	    Q, qStride, K, kStride, V, vStride, dO, dOStride, T, dHead,
+	    causal ? 1 : 0, sinkCount, windowSize, invSqrt,
+	    dQ, dQStride, dK_out, dKStride, dV_out, dVStride);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // #76 wrappers — both are matrix multiplies; reuse cuBLAS sgemm_rowmajor.
 // c[T, d_c] = h[T, d_h] @ W_DKV[d_h, d_c]
 bool mla_compute_latent_gpu(const float* h, const float* W_DKV,

@@ -1756,6 +1756,75 @@ static void test_sw_attention_gpu_parity()
 	printf("    PASSED\n");
 }
 
+static void test_sw_attention_backward_gpu_parity()
+{
+	printf("  [H6] SinkWindowAttentionBackwardGpuParity (#78) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	const unsigned int T = 32u, dHead = 16u;
+	const unsigned int S = 4u, W = 8u;
+	std::vector<float> Q(static_cast<size_t>(T) * dHead);
+	std::vector<float> Kk(static_cast<size_t>(T) * dHead);
+	std::vector<float> Vv(static_cast<size_t>(T) * dHead);
+	std::vector<float> dO(static_cast<size_t>(T) * dHead);
+	unsigned int seed = 0xBE57E54Du;
+	fill_random(Q.data(), T * dHead, seed);
+	fill_random(Kk.data(), T * dHead, seed);
+	fill_random(Vv.data(), T * dHead, seed);
+	fill_random(dO.data(), T * dHead, seed);
+
+	// CPU reference
+	std::vector<float> dQ_cpu(Q.size(), 0.0f);
+	std::vector<float> dK_cpu(Kk.size(), 0.0f);
+	std::vector<float> dV_cpu(Vv.size(), 0.0f);
+	scaled_dot_product_attention_backward_recompute_flash_strided_sw(
+	    Q.data(), dHead, Kk.data(), dHead, Vv.data(), dHead,
+	    dO.data(), dHead, T, dHead, dHead, true, S, W,
+	    dQ_cpu.data(), dHead, dK_cpu.data(), dHead, dV_cpu.data(), dHead, NULL);
+
+	// GPU
+	glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_dO, d_dQ, d_dK, d_dV;
+	d_Q.allocate(Q.size()); d_K.allocate(Kk.size()); d_V.allocate(Vv.size());
+	d_dO.allocate(dO.size());
+	d_dQ.allocate(Q.size()); d_dK.allocate(Kk.size()); d_dV.allocate(Vv.size());
+	d_Q.upload(Q.data(), Q.size());
+	d_K.upload(Kk.data(), Kk.size());
+	d_V.upload(Vv.data(), Vv.size());
+	d_dO.upload(dO.data(), dO.size());
+	d_dQ.zero(); d_dK.zero(); d_dV.zero();
+
+	bool ok = glades::gpu::sw_attention_backward_gpu(
+	    d_Q.data(), (int)dHead, d_K.data(), (int)dHead, d_V.data(), (int)dHead,
+	    d_dO.data(), (int)dHead, (int)T, (int)dHead, true, (int)S, (int)W,
+	    d_dQ.data(), (int)dHead, d_dK.data(), (int)dHead, d_dV.data(), (int)dHead);
+	ASSERT("sw_attention_backward_gpu success", ok);
+	cudaDeviceSynchronize();
+
+	std::vector<float> dQ_gpu(Q.size(), 0.0f);
+	std::vector<float> dK_gpu(Kk.size(), 0.0f);
+	std::vector<float> dV_gpu(Vv.size(), 0.0f);
+	d_dQ.download(dQ_gpu.data(), Q.size());
+	d_dK.download(dK_gpu.data(), Kk.size());
+	d_dV.download(dV_gpu.data(), Vv.size());
+
+	double maxQ = 0.0, maxK = 0.0, maxV = 0.0;
+	for (size_t i = 0; i < dQ_cpu.size(); ++i)
+		maxQ = std::max(maxQ, std::fabs(static_cast<double>(dQ_cpu[i] - dQ_gpu[i])));
+	for (size_t i = 0; i < dK_cpu.size(); ++i)
+		maxK = std::max(maxK, std::fabs(static_cast<double>(dK_cpu[i] - dK_gpu[i])));
+	for (size_t i = 0; i < dV_cpu.size(); ++i)
+		maxV = std::max(maxV, std::fabs(static_cast<double>(dV_cpu[i] - dV_gpu[i])));
+	printf("    T=%u dHead=%u S=%u W=%u: dQ-max=%.3e, dK-max=%.3e, dV-max=%.3e\n",
+	       T, dHead, S, W, maxQ, maxK, maxV);
+	// Atomic accumulation can cause minor reordering; allow slightly larger tol.
+	ASSERT("sw backward dQ CPU/GPU parity", maxQ < 1e-4);
+	ASSERT("sw backward dK CPU/GPU parity", maxK < 1e-4);
+	ASSERT("sw backward dV CPU/GPU parity", maxV < 1e-4);
+	printf("    PASSED\n");
+}
+
 static void test_sw_attention_gpu_speedup()
 {
 	printf("  [H5] SinkWindowAttentionGpuSpeedup (#78) ...\n");
@@ -1897,6 +1966,7 @@ void TransformerOpsUnitTest()
 	test_mla_compute_latent_gpu_parity();
 	test_mla_decompress_kv_gpu_parity();
 	test_sw_attention_gpu_parity();
+	test_sw_attention_backward_gpu_parity();
 	test_sw_attention_gpu_speedup();
 #endif
 

@@ -322,6 +322,18 @@ bool sw_attention_forward_gpu(const float* Q, int qStride,
                                int sinkCount, int windowSize,
                                float* O, int oStride);
 
+// #78 ATTENTION-SINK backward (recompute, FP32, single-head). Caller
+// must zero dQ/dK_out/dV_out — kernel uses atomicAdd accumulation.
+bool sw_attention_backward_gpu(const float* Q, int qStride,
+                                const float* K, int kStride,
+                                const float* V, int vStride,
+                                const float* dO, int dOStride,
+                                int T, int dHead, bool causal,
+                                int sinkCount, int windowSize,
+                                float* dQ, int dQStride,
+                                float* dK_out, int dKStride,
+                                float* dV_out, int dVStride);
+
 // Backward for packed multi-head/GQA flash-style attention.
 // dQ is written per query head; dK/dV are accumulated per KV head.
 bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
@@ -657,6 +669,10 @@ inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,
 inline bool sw_attention_forward_gpu(const float*, int, const float*, int,
                                       const float*, int, int, int, bool,
                                       int, int, float*, int) { return false; }
+inline bool sw_attention_backward_gpu(const float*, int, const float*, int,
+                                       const float*, int, const float*, int,
+                                       int, int, bool, int, int,
+                                       float*, int, float*, int, float*, int) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}
