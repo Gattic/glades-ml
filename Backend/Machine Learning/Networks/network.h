@@ -56,6 +56,7 @@
 #include "cuda/gpu_rnn_state.h"
 #include "cuda/gpu_cnn_state.h"
 #include "cuda/gpu_init.h"
+#include "cuda/gpu_face.h"
 #endif
 
 // Concurrency primitives:

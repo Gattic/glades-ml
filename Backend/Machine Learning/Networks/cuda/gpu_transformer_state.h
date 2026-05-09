@@ -132,6 +132,20 @@ struct GpuTransformerWeights
 	GpuBuffer<uint8_t> v2TokE_int8;
 	GpuBuffer<float>   vTokEScale;
 	GpuBuffer<float>   v2TokEScale;
+	// FACE Adafactor state — used when TransformerRunConfig::faceEmbedding
+	// is true.  Replaces dense Adam on tokE entirely with the frequency-
+	// debiased preconditioner from paradigm shift #28.  Persistent state:
+	// faceZnBar [V] row-norm EMA, faceDnBar [dModel] col-norm EMA, plus
+	// 2 device scalars (faceQHat, faceGFHat).  Per-step scratch reuses
+	// faceZnNew/faceDnRaw/faceQStep/faceGFStep so we don't churn on alloc.
+	GpuBuffer<float>   faceZnBar;
+	GpuBuffer<float>   faceDnBar;
+	GpuBuffer<float>   faceQHat;     // 1 element
+	GpuBuffer<float>   faceGFHat;    // 1 element
+	GpuBuffer<float>   faceZnNew;    // [V] scratch
+	GpuBuffer<float>   faceDnRaw;    // [dModel] scratch
+	GpuBuffer<float>   faceQStep;    // 1 element scratch
+	GpuBuffer<float>   faceGFStep;   // 1 element scratch
 
 	// LM head bias: [vocabSize]
 	GpuBuffer<float> lmBias;
@@ -407,7 +421,8 @@ struct GpuTransformerWeights
 	              bool skipAdamBufs = false,
 	              bool adamStateBf16 = false,
 	              int mlaLatentDim = 0,
-	              bool adamStateInt8 = false);
+	              bool adamStateInt8 = false,
+	              bool faceEmbedding = false);
 
 	// Free all GPU memory.
 	void free();

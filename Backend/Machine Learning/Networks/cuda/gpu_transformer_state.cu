@@ -82,13 +82,18 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
                                       bool skipAdamBufs,
                                       bool adamStateBf16,
                                       int mlaLatentDim,
-                                      bool adamStateInt8)
+                                      bool adamStateInt8,
+                                      bool faceEmbedding)
 {
 	free();
 	// int8 wins over bf16 if both flags accidentally set (it's the more
 	// aggressive compression — see MixedPrecisionConfig comments).
 	const bool useInt8    = adamStateInt8 && !skipAdamBufs;
 	const bool useBf16    = adamStateBf16 && !skipAdamBufs && !useInt8;
+	// FACE on tokE replaces ALL dense Adam state on the embedding (m, v
+	// in any precision).  When tm && faceEmbedding, allocate FACE state
+	// instead of vTokE/v2TokE/vTokE_bf16/etc.
+	const bool useFaceTokE = faceEmbedding && tm && !skipAdamBufs;
 	const bool allocFpMV  = !skipAdamBufs && !useBf16 && !useInt8;
 	const bool allocBfMV  = useBf16;
 	const bool allocI8MV  = useInt8;
@@ -117,16 +122,33 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	if (tokenModel)
 	{
 		if (!allocBuf(tokE, (size_t)vs * dm)) return false;
-		if (allocFpMV && !allocBuf(vTokE, (size_t)vs * dm)) return false;
-		if (allocFpMV && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
-		if (allocBfMV && !allocBuf(vTokE_bf16, (size_t)vs * dm)) return false;
-		if (allocBfMV && !allocBuf(v2TokE_bf16, (size_t)vs * dm)) return false;
-		if (allocI8MV) {
+		// FACE replaces all dense Adam state on tokE — skip the m/v allocations
+		// in that case and instead allocate FACE state.  The dispatch in
+		// sgd_transformer.cpp picks FACE over int8/bf16/FP32 when faceEmbedding
+		// is set.
+		const bool tokE_fp_mv = allocFpMV && !useFaceTokE;
+		const bool tokE_bf_mv = allocBfMV && !useFaceTokE;
+		const bool tokE_i8_mv = allocI8MV && !useFaceTokE;
+		if (tokE_fp_mv && !allocBuf(vTokE, (size_t)vs * dm)) return false;
+		if (tokE_fp_mv && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
+		if (tokE_bf_mv && !allocBuf(vTokE_bf16, (size_t)vs * dm)) return false;
+		if (tokE_bf_mv && !allocBuf(v2TokE_bf16, (size_t)vs * dm)) return false;
+		if (tokE_i8_mv) {
 			const size_t n_ = (size_t)vs * dm;
 			if (!allocBuf(vTokE_int8,   n_))               return false;
 			if (!allocBuf(v2TokE_int8,  n_))               return false;
 			if (!allocBuf(vTokEScale,   I8_SCALE_N(n_)))   return false;
 			if (!allocBuf(v2TokEScale,  I8_SCALE_N(n_)))   return false;
+		}
+		if (useFaceTokE) {
+			if (!allocBuf(faceZnBar,  (size_t)vs))  return false;
+			if (!allocBuf(faceDnBar,  (size_t)dm))  return false;
+			if (!allocBuf(faceQHat,   (size_t)1))   return false;
+			if (!allocBuf(faceGFHat,  (size_t)1))   return false;
+			if (!allocBuf(faceZnNew,  (size_t)vs))  return false;
+			if (!allocBuf(faceDnRaw,  (size_t)dm))  return false;
+			if (!allocBuf(faceQStep,  (size_t)1))   return false;
+			if (!allocBuf(faceGFStep, (size_t)1))   return false;
 		}
 		if (!allocBuf(gTokE, (size_t)vs * dm)) return false;
 		if (!allocBuf(lmBias, vs)) return false;

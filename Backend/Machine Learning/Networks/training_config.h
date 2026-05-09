@@ -194,6 +194,22 @@ struct TransformerRunConfig
 	// K, V (T × n_heads × d_kv × 2). Default 0 = standard MHA.
 	int mlaLatentDim;
 
+	// FACE Adafactor on the token embedding (paradigm shift #28).  When true,
+	// the tokE [V × dModel] table is updated via a frequency-debiased,
+	// row/col-normalized preconditioner instead of dense Adam.  State drops
+	// from ~8·V·dModel bytes (FP32 m+v) to 4·(V + dModel + 2) bytes
+	// (zn̄, dn̄, q̂, gF̄ all FP32 scalars/vectors) — typically ~250-1000×
+	// compression on the embedding optimizer state.  Default false.
+	bool faceEmbedding;
+	// FACE EMA decays.  betaRow=0.98 keeps inactive (rare) tokens'
+	// per-row stats stable; betaCol=0.95 lets column/scalar EMAs adapt
+	// faster.  Defaults match CHIRON's FACE preset.
+	float faceBetaRow;
+	float faceBetaCol;
+	// Numerical floor on the FACE preconditioner denominator.  Default
+	// 1e-8 (matches paradigm-28 design).
+	float faceEps;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -221,7 +237,11 @@ struct TransformerRunConfig
 	      localAttnWindow(0),
 	      attnSinkCount(0),
 	      binaryFFN(false),
-	      mlaLatentDim(0)
+	      mlaLatentDim(0),
+	      faceEmbedding(false),
+	      faceBetaRow(0.98f),
+	      faceBetaCol(0.95f),
+	      faceEps(1e-8f)
 	{
 	}
 };

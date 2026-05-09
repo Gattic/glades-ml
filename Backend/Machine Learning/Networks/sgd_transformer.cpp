@@ -11884,13 +11884,26 @@ if (ad_.valid) { \
 			// the batched FP32 path (their total size is < 1% of the model).
 			const bool useInt8AdamState =
 			    trainingConfig.mixedPrecision.adamStateInt8;
+			// FACE Adafactor on the embedding (paradigm #28).  When set, the
+			// tokE update path replaces dense Adam (m/v) with the FACE
+			// preconditioner — but the OTHER 8 large weight tensors still
+			// need a quantized per-matrix dispatch (see allocate logic in
+			// gpu_transformer_state.cu, which only allocates bf16/int8
+			// buffers for those when bf16/int8 flag is set).  Therefore
+			// FACE alone is not a valid configuration for tokenLM mode;
+			// the trainer should pass at least one of --adam-state-bf16
+			// or --adam-state-int8 alongside --face-embedding.
+			const bool useFaceEmbedding =
+			    trainingConfig.transformer.faceEmbedding;
 			// int8 path takes precedence over bf16 if both flags are set; the
 			// per-matrix dispatch below picks one or the other.  When int8 is
 			// active we still treat "useBf16AdamState" as true for the
 			// "exclude these tensors from the batched FP32 path" decision —
 			// they have no FP32 m/v buffers in either case.
 			const bool useBf16AdamState =
-			    trainingConfig.mixedPrecision.adamStateBf16 || useInt8AdamState;
+			    trainingConfig.mixedPrecision.adamStateBf16
+			    || useInt8AdamState
+			    || useFaceEmbedding;
 
 			// Build device pointer arrays on first step (pointers are fixed after GPU alloc).
 			if (!gpuTransformerWeights->adamPtrsUploaded)
@@ -12314,7 +12327,49 @@ if (ad_.valid) { \
 				{
 					const float lr0Base = skeleton->getLearningRate(0u);
 					const float wd0 = skeleton->getWeightDecay2(0u);
-					if (useInt8AdamState) {
+					// FACE Adafactor takes precedence over int8/bf16 dense Adam
+					// on the embedding when faceEmbedding is set.  State is
+					// orders-of-magnitude smaller; update is sparsity-invariant.
+					if (trainingConfig.transformer.faceEmbedding
+					    && gpuTransformerWeights->faceZnBar.allocated()) {
+						const unsigned int V = (unsigned int)tensorTransformer.vocabSize;
+						const unsigned int m = (unsigned int)tensorTransformer.dModel;
+						const float bRow = trainingConfig.transformer.faceBetaRow;
+						const float bCol = trainingConfig.transformer.faceBetaCol;
+						const float fEps = trainingConfig.transformer.faceEps;
+						const float lrEff = lr0Base * bigLrScale;
+						// 1) compute fresh stats from gTokE
+						gpu::face_compute_sparse_stats(
+						    gpuTransformerWeights->gTokE.data(), V, m,
+						    gpuTransformerWeights->faceZnNew.data(),
+						    gpuTransformerWeights->faceDnRaw.data(),
+						    gpuTransformerWeights->faceQStep.data(),
+						    gpuTransformerWeights->faceGFStep.data());
+						// 2) blend into EMAs
+						gpu::face_update_emas(
+						    gpuTransformerWeights->faceZnBar.data(),
+						    gpuTransformerWeights->faceDnBar.data(),
+						    gpuTransformerWeights->faceQHat.data(),
+						    gpuTransformerWeights->faceGFHat.data(),
+						    gpuTransformerWeights->faceZnNew.data(),
+						    gpuTransformerWeights->faceDnRaw.data(),
+						    gpuTransformerWeights->faceQStep.data(),
+						    gpuTransformerWeights->faceGFStep.data(),
+						    V, m, bRow, bCol);
+						// 3) apply preconditioned update — skip on step 0
+						//    where q̂, gF̄ are still zero from cudaMemset; the
+						//    blend above seeds them so step 1 uses real values.
+						if (stepInt > 0) {
+							gpu::face_apply_preconditioned_update(
+							    gpuTransformerWeights->tokE.data(),
+							    gpuTransformerWeights->gTokE.data(),
+							    gpuTransformerWeights->faceZnBar.data(),
+							    gpuTransformerWeights->faceDnBar.data(),
+							    gpuTransformerWeights->faceQHat.data(),
+							    gpuTransformerWeights->faceGFHat.data(),
+							    V, m, lrEff, fEps);
+						}
+					} else if (useInt8AdamState) {
 						GLADES_INT8_ADAM_BIG(gpuTransformerWeights->tokE,
 						                     gpuTransformerWeights->gTokE,
 						                     gpuTransformerWeights->vTokE_int8,
