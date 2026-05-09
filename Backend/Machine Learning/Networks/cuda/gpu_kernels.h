@@ -325,6 +325,22 @@ bool binarize_to_bf16_signs(const float* W, uint16_t* W_bf16, size_t n);
 bool wmma_b1_gemm(const unsigned int* A_bits, const unsigned int* B_bits,
                    int M, int N, int K_bits, int* C);
 
+// (b) Full BitNet b1.0 binary inference helpers (paradigm #74 inference path).
+// Quantize X[M,K] (float) → X_bits + alpha[M] (per-row mean(|x|) scale).
+// K must be a multiple of 32.
+bool quantize_x_to_b1_with_scale(const float* X, int M, int K,
+                                 unsigned int* X_bits, float* alpha);
+
+// Full BitNet forward: Y[M,N] = alpha_x[m] * alpha_w[n] * (K_bits - 2*popcount(X_bits ⊕ W_bits))
+// C_pop_scratch must be M*N int32 device memory; reused across calls.
+bool bitnet_b1_forward(const unsigned int* X_bits,
+                       const unsigned int* W_bits,
+                       const float* alpha_x,
+                       const float* alpha_w,
+                       int* C_pop_scratch,
+                       int M, int N, int K_bits,
+                       float* Y);
+
 // #76 MLA latent compression: c = h @ W_DKV via cuBLAS sgemm.
 bool mla_compute_latent_gpu(const float* h, const float* W_DKV,
                              int T, int d_h, int d_c, float* c_out);
@@ -689,6 +705,11 @@ inline bool binary_gemm_abt_from_float(const float*, const float*,
 inline bool binarize_to_bf16_signs(const float*, unsigned short*, size_t) { return false; }
 inline bool wmma_b1_gemm(const unsigned int*, const unsigned int*,
                           int, int, int, int*) { return false; }
+inline bool quantize_x_to_b1_with_scale(const float*, int, int,
+                                         unsigned int*, float*) { return false; }
+inline bool bitnet_b1_forward(const unsigned int*, const unsigned int*,
+                               const float*, const float*, int*,
+                               int, int, int, float*) { return false; }
 inline bool mla_compute_latent_gpu(const float*, const float*,
                                     int, int, int, float*) { return false; }
 inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,

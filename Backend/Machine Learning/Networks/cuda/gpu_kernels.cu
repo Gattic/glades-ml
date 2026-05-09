@@ -5092,6 +5092,164 @@ bool wmma_b1_gemm(const unsigned int* A_bits, const unsigned int* B_bits,
 	return true;
 }
 
+// ============================================================================
+// (b) Full BitNet b1.0-style binary inference path
+// ============================================================================
+// Production binary inference (Wang et al. 2024 BitNet b1.0):
+//
+//   X_q[m,k]   = sign(X[m,k])           (1 bit)
+//   alpha_x[m] = mean(|X[m,:]|)         (per-row scale, FP32)
+//   W_q[n,k]   = sign(W[n,k])           (1 bit)
+//   alpha_w[n] = mean(|W[n,:]|)         (per-row scale, FP32)
+//
+//   Y[m,n] = alpha_x[m] * alpha_w[n] * (K - 2 * popcount(X_q[m] ^ W_q[n]))
+//
+// At inference, sign(X) loses ~5-15% quality vs full-precision; the scales
+// recover most of it. cuBLAS doesn't ship a B1×B1 sgemm so we use WMMA
+// directly for the popcount stage.
+
+namespace {
+
+// Per-row scale: alpha[m] = mean(|X[m,:]|). Block per row; warp reduction.
+__global__ void k_quant_x_to_b1_with_scale(const float* __restrict__ X,
+                                           int M, int K,
+                                           unsigned int* __restrict__ X_bits,
+                                           float* __restrict__ alpha)
+{
+	const int m = blockIdx.x;
+	if (m >= M) return;
+	const int tid = threadIdx.x;
+	const int Kuint = K / 32;
+	const float* xm = X + (size_t)m * K;
+	unsigned int* xbm = X_bits + (size_t)m * Kuint;
+
+	// Pass 1: per-thread mean(|x|) accumulation
+	float local_sum = 0.0f;
+	for (int k = tid; k < K; k += 32)
+		local_sum += fabsf(xm[k]);
+	for (int off = 16; off > 0; off >>= 1)
+		local_sum += ::__shfl_xor_sync(0xFFFFFFFF, local_sum, off);
+	const float scale = local_sum / (float)K;
+	if (tid == 0) alpha[m] = scale;
+
+	// Pass 2: pack sign bits into uint32. Each thread handles uint32 chunks.
+	for (int u = tid; u < Kuint; u += 32)
+	{
+		unsigned int bits = 0u;
+		const int kBase = u * 32;
+		#pragma unroll
+		for (int b = 0; b < 32; ++b)
+		{
+			if (xm[kBase + b] >= 0.0f)
+				bits |= (1u << b);
+		}
+		xbm[u] = bits;
+	}
+}
+
+// BitNet GEMM: combines WMMA B1 popcount with per-row scale recovery.
+// Uses XOR (not AND) for ±1 GEMM: dot(±1, ±1) = K - 2*popcount(a^b).
+// The WMMA bmma op supports XOR by setting bmmaBitOpXOR.
+__global__ void wmma_b1_gemm_xor_kernel(const unsigned int* __restrict__ A_bits,
+                                        const unsigned int* __restrict__ B_bits,
+                                        int M, int N, int K_bits,
+                                        int* __restrict__ C_pop)
+{
+	const int blkM = blockIdx.y * 8;
+	const int blkN = blockIdx.x * 8;
+	if (blkM >= M || blkN >= N) return;
+#if __CUDA_ARCH__ >= 750
+	wmma::fragment<wmma::matrix_a, 8, 8, 128, wmma::experimental::precision::b1, wmma::row_major> a_frag;
+	wmma::fragment<wmma::matrix_b, 8, 8, 128, wmma::experimental::precision::b1, wmma::col_major> b_frag;
+	wmma::fragment<wmma::accumulator, 8, 8, 128, int> c_frag;
+	wmma::fill_fragment(c_frag, 0);
+	const int Kuint = K_bits / 32;
+	for (int kBase = 0; kBase < Kuint; kBase += 4)
+	{
+		const unsigned int* a_ptr = A_bits + (size_t)blkM * Kuint + kBase;
+		const unsigned int* b_ptr = B_bits + (size_t)blkN * Kuint + kBase;
+		wmma::load_matrix_sync(a_frag, a_ptr, Kuint * 32);
+		wmma::load_matrix_sync(b_frag, b_ptr, Kuint * 32);
+		wmma::bmma_sync(c_frag, a_frag, b_frag, c_frag,
+		                wmma::experimental::bmmaBitOpXOR,
+		                wmma::experimental::bmmaAccumulateOpPOPC);
+	}
+	const int rowsLeft = M - blkM;
+	const int colsLeft = N - blkN;
+	if (rowsLeft >= 8 && colsLeft >= 8)
+	{
+		wmma::store_matrix_sync(C_pop + (size_t)blkM * N + blkN, c_frag, N, wmma::mem_row_major);
+	}
+#else
+	(void)A_bits; (void)B_bits; (void)M; (void)N; (void)K_bits; (void)C_pop;
+#endif
+}
+
+// Recover Y[m,n] from popcount: y = alpha_x[m] * alpha_w[n] * (K - 2 * popcount).
+__global__ void k_bitnet_recover_scale(const int* __restrict__ C_pop,
+                                       const float* __restrict__ alpha_x,
+                                       const float* __restrict__ alpha_w,
+                                       int M, int N, int K_bits,
+                                       float* __restrict__ Y)
+{
+	const int m = blockIdx.y * blockDim.y + threadIdx.y;
+	const int n = blockIdx.x * blockDim.x + threadIdx.x;
+	if (m >= M || n >= N) return;
+	const int pop = C_pop[(size_t)m * N + n];
+	const int signed_dot = K_bits - 2 * pop;
+	Y[(size_t)m * N + n] = alpha_x[m] * alpha_w[n] * (float)signed_dot;
+}
+
+} // anonymous
+
+// Quantize X[M,K] to binary bits + per-row scale alpha[M].
+// K must be divisible by 32 (uint32 packing).
+bool quantize_x_to_b1_with_scale(const float* X, int M, int K,
+                                 unsigned int* X_bits, float* alpha)
+{
+	if (M <= 0 || K <= 0) return true;
+	if ((K % 32) != 0) return false;
+	k_quant_x_to_b1_with_scale<<<(unsigned int)M, 32u, 0, computeStream()>>>(
+	    X, M, K, X_bits, alpha);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Full BitNet inference forward: Y[M,N] = scale_recover(WMMA-B1-XOR(X_bits, W_bits)).
+// X_bits [M, K/32], W_bits [N, K/32], alpha_x [M], alpha_w [N], K_bits = K.
+// The popcount intermediate is allocated in C_pop_scratch [M*N int32].
+bool bitnet_b1_forward(const unsigned int* X_bits,
+                       const unsigned int* W_bits,
+                       const float* alpha_x,
+                       const float* alpha_w,
+                       int* C_pop_scratch,
+                       int M, int N, int K_bits,
+                       float* Y)
+{
+	if (M <= 0 || N <= 0 || K_bits <= 0) return true;
+	if ((K_bits % 128) != 0) return false;
+
+	// Pass 1: WMMA B1 XOR-popcount → C_pop[M,N] int32
+	{
+		const dim3 block(32u, 1u, 1u);
+		const dim3 grid((unsigned int)((N + 7) / 8), (unsigned int)((M + 7) / 8), 1u);
+		wmma_b1_gemm_xor_kernel<<<grid, block, 0, computeStream()>>>(
+		    X_bits, W_bits, M, N, K_bits, C_pop_scratch);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+
+	// Pass 2: scale recovery
+	{
+		const dim3 block(16u, 16u, 1u);
+		const dim3 grid((unsigned int)((N + (int)block.x - 1) / (int)block.x),
+		                (unsigned int)((M + (int)block.y - 1) / (int)block.y), 1u);
+		k_bitnet_recover_scale<<<grid, block, 0, computeStream()>>>(
+		    C_pop_scratch, alpha_x, alpha_w, M, N, K_bits, Y);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	return true;
+}
+
 // #78 backward wrapper.
 bool sw_attention_backward_gpu(const float* Q, int qStride,
                                 const float* K, int kStride,

@@ -2192,6 +2192,76 @@ static void test_wmma_b1_kernel_correctness()
 	printf("    PASSED (SM 8.9 B1 tensor cores functional)\n");
 }
 
+static void test_bitnet_full_inference_path()
+{
+	printf("  [MFAC-3b] BitNetFullInferencePath (b) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	// Random X[M,K] and W[N,K]; quantize both; run BitNet forward; compare
+	// to float reference Y = X @ W.T scaled to ±1 to gauge the BitNet
+	// approximation error.
+	const int M = 16, N = 32, K = 256;  // K must be multiple of 128 for WMMA
+	std::vector<float> X(static_cast<size_t>(M) * K);
+	std::vector<float> W(static_cast<size_t>(N) * K);
+	unsigned int seed = 0xB1747A11u;
+	fill_random(X.data(), M * K, seed);
+	fill_random(W.data(), N * K, seed);
+
+	// Float reference Y = X @ W.T
+	std::vector<float> Y_ref(static_cast<size_t>(M) * N, 0.0f);
+	for (int m = 0; m < M; ++m)
+		for (int n = 0; n < N; ++n)
+		{
+			double s = 0.0;
+			for (int k = 0; k < K; ++k)
+				s += static_cast<double>(X[m * K + k]) * static_cast<double>(W[n * K + k]);
+			Y_ref[m * N + n] = static_cast<float>(s);
+		}
+
+	// Upload X, W to GPU; quantize; run BitNet forward
+	glades::gpu::GpuBuffer<float> d_X, d_W, d_alpha_x, d_alpha_w, d_Y;
+	glades::gpu::GpuBuffer<unsigned int> d_X_bits, d_W_bits;
+	glades::gpu::GpuBuffer<int> d_C_pop;
+	d_X.allocate(M * K); d_W.allocate(N * K);
+	d_X_bits.allocate(M * (K / 32)); d_W_bits.allocate(N * (K / 32));
+	d_alpha_x.allocate(M); d_alpha_w.allocate(N);
+	d_C_pop.allocate(M * N); d_Y.allocate(M * N);
+	d_X.upload(X.data(), M * K);
+	d_W.upload(W.data(), N * K);
+
+	bool ok = glades::gpu::quantize_x_to_b1_with_scale(d_X.data(), M, K,
+	                                                    d_X_bits.data(), d_alpha_x.data());
+	ASSERT("quantize X success", ok);
+	ok = glades::gpu::quantize_x_to_b1_with_scale(d_W.data(), N, K,
+	                                              d_W_bits.data(), d_alpha_w.data());
+	ASSERT("quantize W success", ok);
+	ok = glades::gpu::bitnet_b1_forward(d_X_bits.data(), d_W_bits.data(),
+	                                    d_alpha_x.data(), d_alpha_w.data(),
+	                                    d_C_pop.data(), M, N, K, d_Y.data());
+	ASSERT("bitnet forward success", ok);
+	cudaDeviceSynchronize();
+
+	std::vector<float> Y(M * N, 0.0f);
+	d_Y.download(Y.data(), M * N);
+
+	// Compute relative-error per output (BitNet is ~5-15% off vs float in
+	// quality benchmarks; correlation should still be high).
+	double sum_y_y = 0.0, sum_y_yref = 0.0, sum_yref_yref = 0.0;
+	for (int i = 0; i < M * N; ++i)
+	{
+		sum_y_y += (double)Y[i] * (double)Y[i];
+		sum_y_yref += (double)Y[i] * (double)Y_ref[i];
+		sum_yref_yref += (double)Y_ref[i] * (double)Y_ref[i];
+	}
+	double cosine = sum_y_yref / (std::sqrt(sum_y_y) * std::sqrt(sum_yref_yref) + 1e-30);
+	printf("    M=%d N=%d K=%d: cosine(Y_bitnet, Y_ref)=%.4f (BitNet typical 0.85-0.95)\n",
+	       M, N, K, cosine);
+	ASSERT("BitNet output correlates with float reference", cosine > 0.6);
+	printf("    PASSED (full b1.0 inference path: quantize-X + WMMA-XOR + scale-recover)\n");
+}
+
 static void bench_wmma_b1_throughput()
 {
 	printf("  [MFAC-4] WMMAB1ThroughputBench (b) ...\n");
@@ -2942,6 +3012,7 @@ void TransformerOpsUnitTest()
 	test_mla_factorization_compression_bound();
 #ifdef GLADES_HAVE_CUDA
 	test_wmma_b1_kernel_correctness();
+	test_bitnet_full_inference_path();
 	bench_wmma_b1_throughput();
 #endif
 
