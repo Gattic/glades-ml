@@ -308,10 +308,14 @@ bool phoenix_binary_gemm_gpu(const float* X,
 
 // #74 PHOENIX-1BIT FFN-side helper: Y[M,N] = X[M,K] @ sign(W[N,K]).T
 // Operates on float weights in-place via on-the-fly sign extraction.
-// Mirrors gpu_gemm_abt_mp's interface; for training-time integration where
-// we keep the float master weights and want to skip the multiply.
+// Tiled (BM=BN=BK=32) shared-memory kernel for M,N >= 32; naive scalar
+// fallback otherwise.
 bool binary_gemm_abt_from_float(const float* X, const float* W,
                                 int M, int N, int K, float* Y);
+
+// #74 BF16 fast path: cast sign(W) to BF16 ±1.0 in W_bf16 (n elements).
+// Pair with cuBLAS bf16 sgemm via gpu_gemm_abt_mp for tensor-core throughput.
+bool binarize_to_bf16_signs(const float* W, uint16_t* W_bf16, size_t n);
 
 // #76 MLA latent compression: c = h @ W_DKV via cuBLAS sgemm.
 bool mla_compute_latent_gpu(const float* h, const float* W_DKV,
@@ -674,6 +678,7 @@ inline bool phoenix_binary_gemm_gpu(const float*, const unsigned char*,
                                      int, int, int, float*) { return false; }
 inline bool binary_gemm_abt_from_float(const float*, const float*,
                                         int, int, int, float*) { return false; }
+inline bool binarize_to_bf16_signs(const float*, unsigned short*, size_t) { return false; }
 inline bool mla_compute_latent_gpu(const float*, const float*,
                                     int, int, int, float*) { return false; }
 inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,

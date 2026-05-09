@@ -4856,10 +4856,82 @@ __global__ void sw_attention_backward_kernel(const float* __restrict__ Q,
 
 // ---------- #74 PHOENIX-1BIT FFN-side helper: Y = X @ sign(W).T -----------
 // W[N, K] row-major, treated as binary {-1, +1} via sign. Mirrors
-// gpu_gemm_abt_mp's interface for in-place FFN replacement. Sign is read
-// on-the-fly from the float W; no separate packed buffer needed for this
-// training-time helper.
+// gpu_gemm_abt_mp's interface for in-place FFN replacement.
+//
+// Optimized tiled kernel:
+//   - Shared-memory blocking on X and W tiles (BM × BK and BN × BK)
+//   - Each thread accumulates one output (m, n)
+//   - Outer K-loop walks tiles of width BK; inner K-loop inside shmem
+//   - Sign extracted from float W on-the-fly (no separate packed buffer)
+//
+// At BM=BN=32, BK=32, this achieves 32-fold X-row reuse across N outputs
+// and 32-fold W-col reuse across M outputs, bringing it within range of
+// cuBLAS at moderate shapes while staying multiply-free.
 namespace {
+
+template <int BM, int BN, int BK>
+__global__ void binary_gemm_abt_from_float_tiled_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ W,
+    int M, int N, int K,
+    float* __restrict__ Y)
+{
+	const int blkM = blockIdx.y * BM;
+	const int blkN = blockIdx.x * BN;
+	const int ty = threadIdx.y;
+	const int tx = threadIdx.x;
+	const int gm = blkM + ty;
+	const int gn = blkN + tx;
+
+	__shared__ float Xtile[BM][BK];
+	__shared__ float Wtile[BN][BK];
+
+	float acc = 0.0f;
+
+	for (int kBase = 0; kBase < K; kBase += BK)
+	{
+		// Cooperatively load X[blkM:blkM+BM, kBase:kBase+BK]
+		// Each thread loads BM*BK / (BM*BN) = BK/BN entries
+		#pragma unroll
+		for (int kk = tx; kk < BK; kk += BN)
+		{
+			const int gk = kBase + kk;
+			Xtile[ty][kk] = (gm < M && gk < K)
+			    ? X[(size_t)gm * K + gk]
+			    : 0.0f;
+		}
+		// Cooperatively load W[blkN:blkN+BN, kBase:kBase+BK]
+		// Each thread loads similarly
+		#pragma unroll
+		for (int kk = ty; kk < BK; kk += BM)
+		{
+			const int gk = kBase + kk;
+			Wtile[tx][kk] = (gn < N && gk < K)
+			    ? W[(size_t)gn * K + gk]
+			    : 0.0f;
+		}
+		__syncthreads();
+
+		// Inner loop: my (gm, gn) accumulates over BK
+		if (gm < M && gn < N)
+		{
+			#pragma unroll
+			for (int kk = 0; kk < BK; ++kk)
+			{
+				const float xv = Xtile[ty][kk];
+				const float wv = Wtile[tx][kk];
+				// sign(wv) * xv via branchless select
+				acc += (wv >= 0.0f) ? xv : -xv;
+			}
+		}
+		__syncthreads();
+	}
+
+	if (gm < M && gn < N)
+		Y[(size_t)gm * N + gn] = acc;
+}
+
+// Naive scalar kernel kept as a fallback for shapes that don't tile nicely.
 __global__ void binary_gemm_abt_from_float_kernel(const float* __restrict__ X,
                                                   const float* __restrict__ W,
                                                   int M, int N, int K,
@@ -4875,17 +4947,65 @@ __global__ void binary_gemm_abt_from_float_kernel(const float* __restrict__ X,
 		sum += (wn[k] >= 0.0f) ? xt[k] : -xt[k];
 	Y[(size_t)t * N + n] = sum;
 }
+
 } // anonymous
 
 bool binary_gemm_abt_from_float(const float* X, const float* W,
                                 int M, int N, int K, float* Y)
 {
 	if (M <= 0 || N <= 0 || K <= 0) return true;
+
+	// Use tiled kernel for shapes where M, N >= 32; otherwise naive.
+	if (M >= 32 && N >= 32)
+	{
+		const int BM = 32, BN = 32, BK = 32;
+		const dim3 block((unsigned int)BN, (unsigned int)BM, 1u);
+		const dim3 grid((unsigned int)((N + BN - 1) / BN),
+		                (unsigned int)((M + BM - 1) / BM), 1u);
+		binary_gemm_abt_from_float_tiled_kernel<32, 32, 32>
+		    <<<grid, block, 0, computeStream()>>>(X, W, M, N, K, Y);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
+
 	const dim3 block(16u, 16u, 1u);
 	const dim3 grid((unsigned int)(N + (int)block.x - 1) / (int)block.x,
 	                (unsigned int)(M + (int)block.y - 1) / (int)block.y, 1u);
 	binary_gemm_abt_from_float_kernel<<<grid, block, 0, computeStream()>>>(
 	    X, W, M, N, K, Y);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// BF16-binarized fast path: re-encode sign(W) as BF16 ±1.0 buffer once,
+// then run cuBLAS bf16 sgemm via existing tensor-core path. This costs
+// one binarization pass + one bf16 GEMM. The BF16 GEMM uses Ada tensor
+// cores at full FP16/BF16 throughput, and the binarization step is
+// memory-bound (cheap relative to GEMM).
+//
+// Storage: caller provides W_bf16_scratch [N * K] uint16_t buffer for
+// the binarized form. The scratch is overwritten with sign(W) cast to
+// BF16. Subsequent calls with the same W can reuse cached scratch.
+namespace {
+__global__ void k_binarize_to_bf16_signs(const float* __restrict__ W,
+                                         uint16_t* __restrict__ W_bf16,
+                                         size_t n)
+{
+	const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	// +1.0 BF16 = 0x3F80; -1.0 BF16 = 0xBF80
+	W_bf16[i] = (W[i] >= 0.0f) ? (uint16_t)0x3F80u : (uint16_t)0xBF80u;
+}
+} // anonymous
+
+bool binarize_to_bf16_signs(const float* W, uint16_t* W_bf16, size_t n)
+{
+	if (n == 0) return true;
+	const unsigned int TPB = 256u;
+	const size_t blocks = (n + TPB - 1u) / TPB;
+	if (blocks > 0x7FFFFFFFu) return false;
+	k_binarize_to_bf16_signs<<<(unsigned int)blocks, TPB, 0, computeStream()>>>(
+	    W, W_bf16, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
