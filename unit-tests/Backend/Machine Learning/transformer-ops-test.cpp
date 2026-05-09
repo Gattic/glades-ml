@@ -2064,6 +2064,277 @@ static void test_phoenix158_vs_phoenix1bit_storage()
 }
 
 // ============================================================
+// Group BENCH: Phase-B paradigm benchmarks at realistic shapes
+// ============================================================
+// Production-class shape sweep showing how each paradigm contributes
+// when training a large LLM on a single GPU. CPU benchmarks for
+// primitives that don't have GPU kernels yet (#73/#77/#93/#99); GPU
+// benchmarks for the others through Group H.
+
+#ifdef GLADES_HAVE_CUDA
+
+static void bench_paradigm_phoenix1bit_gpu_realistic()
+{
+	printf("  [BENCH-1] Phoenix1Bit GPU at FFN-realistic shape (#74) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	// Production-class FFN: dmodel=768, dFF=2048, M=512 tokens
+	const unsigned int M = 512u, K = 768u, N = 2048u;
+	std::vector<float> X(static_cast<size_t>(M) * K);
+	std::vector<float> W(static_cast<size_t>(K) * N);
+	unsigned int seed = 0xFFAA0001u;
+	fill_random(X.data(), M * K, seed);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		const float r = pseudo_rand(seed);
+		W[i] = (r >= 0.0f) ? 1.0f : -1.0f;
+	}
+	const size_t Kbytes = (K + 7u) / 8u;
+	std::vector<unsigned char> bits(static_cast<size_t>(N) * Kbytes, 0u);
+	phoenix_pack_signs_colmajor(W.data(), K, N, bits.data());
+
+	glades::gpu::GpuBuffer<float> d_X, d_Y;
+	glades::gpu::GpuBuffer<unsigned char> d_bits;
+	d_X.allocate(M * K); d_Y.allocate(M * N); d_bits.allocate(N * Kbytes);
+	d_X.upload(X.data(), M * K);
+	d_bits.upload(bits.data(), N * Kbytes);
+
+	const int trials = 30;
+	glades::gpu::phoenix_binary_gemm_gpu(d_X.data(), d_bits.data(), (int)M, (int)N, (int)K, d_Y.data());
+	cudaDeviceSynchronize();
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		glades::gpu::phoenix_binary_gemm_gpu(d_X.data(), d_bits.data(), (int)M, (int)N, (int)K, d_Y.data());
+	cudaDeviceSynchronize();
+	double tBin = clock_seconds() - t0;
+
+	const size_t bytes_fp32 = W.size() * sizeof(float);
+	const size_t bytes_bits = bits.size();
+	printf("    M=%u K=%u N=%u: %.3f ms/iter (binary GPU)\n",
+	       M, K, N, tBin * 1000.0 / trials);
+	printf("    weight memory: FP32=%.2f MB, binary=%.2f MB (%.1fx compression)\n",
+	       (double)bytes_fp32 / 1.048576e6, (double)bytes_bits / 1.048576e6,
+	       (double)bytes_fp32 / bytes_bits);
+}
+
+static void bench_paradigm_mla_gpu_realistic()
+{
+	printf("  [BENCH-2] MLA GPU at production shape (#76) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	const unsigned int T = 2048u;
+	const unsigned int dH = 768u;
+	const unsigned int dC = 384u;     // MLA conservative
+	const unsigned int dKVtotal = 768u; // n_heads * d_kv
+	std::vector<float> h(static_cast<size_t>(T) * dH);
+	std::vector<float> W_DKV(static_cast<size_t>(dH) * dC);
+	std::vector<float> W_UK(static_cast<size_t>(dC) * dKVtotal);
+	std::vector<float> W_UV(static_cast<size_t>(dC) * dKVtotal);
+	unsigned int seed = 0xFFAA0002u;
+	fill_random(h.data(), T * dH, seed);
+	fill_random(W_DKV.data(), dH * dC, seed);
+	fill_random(W_UK.data(), dC * dKVtotal, seed);
+	fill_random(W_UV.data(), dC * dKVtotal, seed);
+
+	glades::gpu::GpuBuffer<float> d_h, d_DKV, d_UK, d_UV, d_c, d_K, d_V;
+	d_h.allocate(T * dH); d_DKV.allocate(dH * dC);
+	d_UK.allocate(dC * dKVtotal); d_UV.allocate(dC * dKVtotal);
+	d_c.allocate(T * dC);
+	d_K.allocate(T * dKVtotal); d_V.allocate(T * dKVtotal);
+	d_h.upload(h.data(), T * dH);
+	d_DKV.upload(W_DKV.data(), dH * dC);
+	d_UK.upload(W_UK.data(), dC * dKVtotal);
+	d_UV.upload(W_UV.data(), dC * dKVtotal);
+
+	const int trials = 30;
+	// Warm up
+	glades::gpu::mla_compute_latent_gpu(d_h.data(), d_DKV.data(), (int)T, (int)dH, (int)dC, d_c.data());
+	glades::gpu::mla_decompress_kv_gpu(d_c.data(), d_UK.data(), d_UV.data(),
+	                                    (int)T, (int)dC, (int)dKVtotal, d_K.data(), d_V.data());
+	cudaDeviceSynchronize();
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+	{
+		glades::gpu::mla_compute_latent_gpu(d_h.data(), d_DKV.data(), (int)T, (int)dH, (int)dC, d_c.data());
+		glades::gpu::mla_decompress_kv_gpu(d_c.data(), d_UK.data(), d_UV.data(),
+		                                    (int)T, (int)dC, (int)dKVtotal, d_K.data(), d_V.data());
+	}
+	cudaDeviceSynchronize();
+	double tMla = clock_seconds() - t0;
+
+	// MHA reference: standard linear projections (just the cuBLAS gemm call)
+	std::vector<float> W_K_full(static_cast<size_t>(dH) * dKVtotal);
+	std::vector<float> W_V_full(static_cast<size_t>(dH) * dKVtotal);
+	fill_random(W_K_full.data(), dH * dKVtotal, seed);
+	fill_random(W_V_full.data(), dH * dKVtotal, seed);
+	glades::gpu::GpuBuffer<float> d_WK, d_WV;
+	d_WK.allocate(dH * dKVtotal); d_WV.allocate(dH * dKVtotal);
+	d_WK.upload(W_K_full.data(), dH * dKVtotal); d_WV.upload(W_V_full.data(), dH * dKVtotal);
+
+	cudaDeviceSynchronize();
+	t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+	{
+		glades::gpu::sgemm_rowmajor((int)T, (int)dKVtotal, (int)dH, 1.0f,
+		                             d_h.data(), (int)dH, d_WK.data(), (int)dKVtotal,
+		                             0.0f, d_K.data(), (int)dKVtotal);
+		glades::gpu::sgemm_rowmajor((int)T, (int)dKVtotal, (int)dH, 1.0f,
+		                             d_h.data(), (int)dH, d_WV.data(), (int)dKVtotal,
+		                             0.0f, d_V.data(), (int)dKVtotal);
+	}
+	cudaDeviceSynchronize();
+	double tMha = clock_seconds() - t0;
+
+	const float kv_per_token_mha = static_cast<float>(2 * dKVtotal * 4);  // K + V FP32
+	const float kv_per_token_mla = static_cast<float>(dC * 4);            // c FP32
+	printf("    T=%u dH=%u dC=%u dKVtot=%u trials=%d:\n", T, dH, dC, dKVtotal, trials);
+	printf("    MHA (gemm K + gemm V): %.3f ms/iter\n", tMha * 1000.0 / trials);
+	printf("    MLA (compute + decompress): %.3f ms/iter\n", tMla * 1000.0 / trials);
+	printf("    KV cache per token: MHA=%.0f B / MLA=%.0f B (%.2fx compression)\n",
+	       kv_per_token_mha, kv_per_token_mla, kv_per_token_mha / kv_per_token_mla);
+}
+
+static void bench_paradigm_attention_sink_gpu_realistic()
+{
+	printf("  [BENCH-3] Attention-Sink GPU at production T (#78) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	// Sweep T to show how speedup scales
+	const unsigned int dHead = 64u;
+	const unsigned int S = 4u, W = 256u;
+	const unsigned int Tsweep[] = {2048u, 4096u, 8192u};
+	const int trials = 10;
+	for (unsigned int si = 0; si < 3; ++si)
+	{
+		const unsigned int T = Tsweep[si];
+		std::vector<float> Q(static_cast<size_t>(T) * dHead);
+		std::vector<float> Kk(static_cast<size_t>(T) * dHead);
+		std::vector<float> Vv(static_cast<size_t>(T) * dHead);
+		unsigned int seed = 0xFFAA0003u;
+		fill_random(Q.data(), T * dHead, seed);
+		fill_random(Kk.data(), T * dHead, seed);
+		fill_random(Vv.data(), T * dHead, seed);
+
+		glades::gpu::GpuBuffer<float> d_Q, d_K, d_V, d_O;
+		d_Q.allocate(T * dHead); d_K.allocate(T * dHead);
+		d_V.allocate(T * dHead); d_O.allocate(T * dHead);
+		d_Q.upload(Q.data(), T * dHead);
+		d_K.upload(Kk.data(), T * dHead);
+		d_V.upload(Vv.data(), T * dHead);
+
+		// FP32 single-head reference kernel only — production BF16 path benched in glades_pile_train
+		glades::gpu::sw_attention_forward_gpu(d_Q.data(), (int)dHead, d_K.data(), (int)dHead, d_V.data(), (int)dHead,
+		                                       (int)T, (int)dHead, true, 0, 0, d_O.data(), (int)dHead);
+		cudaDeviceSynchronize();
+		double t0 = clock_seconds();
+		for (int i = 0; i < trials; ++i)
+			glades::gpu::sw_attention_forward_gpu(d_Q.data(), (int)dHead, d_K.data(), (int)dHead, d_V.data(), (int)dHead,
+			                                       (int)T, (int)dHead, true, 0, 0, d_O.data(), (int)dHead);
+		cudaDeviceSynchronize();
+		double tFull = clock_seconds() - t0;
+
+		t0 = clock_seconds();
+		for (int i = 0; i < trials; ++i)
+			glades::gpu::sw_attention_forward_gpu(d_Q.data(), (int)dHead, d_K.data(), (int)dHead, d_V.data(), (int)dHead,
+			                                       (int)T, (int)dHead, true, (int)S, (int)W, d_O.data(), (int)dHead);
+		cudaDeviceSynchronize();
+		double tSw = clock_seconds() - t0;
+
+		double speedup = tFull / (tSw > 0 ? tSw : 1e-9);
+		const double theoretical = static_cast<double>(T) / static_cast<double>(S + W);
+		printf("    T=%u dHead=%u S=%u W=%u: full=%.3f ms, sw=%.3f ms, speedup=%.2fx (theoretical %.1fx)\n",
+		       T, dHead, S, W, tFull * 1000.0 / trials, tSw * 1000.0 / trials, speedup, theoretical);
+	}
+}
+
+#endif // GLADES_HAVE_CUDA
+
+static void bench_paradigm_moe_routing_realistic()
+{
+	printf("  [BENCH-4] MoE top-k routing CPU overhead (#77) ...\n");
+	const unsigned int E = 8u, k = 2u;
+	const unsigned int trials = 100000u;
+	std::vector<float> logits(E);
+	unsigned int seed = 0xFFAA0004u;
+	fill_random(logits.data(), E, seed);
+	std::vector<unsigned int> idx(k);
+	std::vector<float> w(k);
+
+	double t0 = clock_seconds();
+	for (unsigned int i = 0; i < trials; ++i)
+		moe_topk_router(logits.data(), E, k, idx.data(), w.data());
+	double tRoute = clock_seconds() - t0;
+	const double active = static_cast<double>(k) / static_cast<double>(E);
+	printf("    E=%u k=%u top-k routing: %.3f ns/decision; active fraction=%.3f → %.1fx FFN compute reduction\n",
+	       E, k, tRoute * 1e9 / trials, active, 1.0 / active);
+}
+
+static void bench_paradigm_astra_kahan_realistic()
+{
+	printf("  [BENCH-5] ASTRA-KAHAN optimizer step throughput (#93) ...\n");
+	const unsigned int n = 1u << 20;  // 1M params
+	std::vector<float> param(n, 0.5f);
+	std::vector<float> grad(n, 0.001f);
+	std::vector<float> m(n, 0.0f);
+	std::vector<float> c(n, 0.0f);
+	std::vector<float> v(n, 0.0f);  // for adam reference
+	const int trials = 20;
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		astra_kahan_step(param.data(), grad.data(), m.data(), c.data(), n,
+		                  1e-4f, 0.9f, 1e-8f, 0.0f);
+	double tKahan = clock_seconds() - t0;
+	t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		adam_step_reference(param.data(), grad.data(), m.data(), v.data(), n,
+		                    1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, i + 1);
+	double tAdam = clock_seconds() - t0;
+	printf("    n=%u trials=%d: ASTRA-KAHAN=%.2f ms, Adam=%.2f ms (~%.2fx)\n",
+	       n, trials, tKahan * 1000.0 / trials, tAdam * 1000.0 / trials,
+	       tAdam / tKahan);
+	const size_t bytes_kahan = 2u * n * sizeof(float);  // m + c
+	const size_t bytes_adam = 2u * n * sizeof(float);   // m + v
+	printf("    optimizer state: ASTRA-KAHAN=%.1f MB, Adam=%.1f MB (parity at FP32)\n",
+	       (double)bytes_kahan / 1.048576e6, (double)bytes_adam / 1.048576e6);
+}
+
+static void bench_paradigm_neural_cache_realistic()
+{
+	printf("  [BENCH-6] Neural cache compressor cost (#99) ...\n");
+	const unsigned int T = 1024u;
+	const unsigned int d_in = 768u;
+	const unsigned int d_hidden = 768u;
+	const unsigned int d_out = 256u;  // #99 target d_c
+	std::vector<float> h(static_cast<size_t>(T) * d_in);
+	std::vector<float> W1(static_cast<size_t>(d_in) * d_hidden, 0.01f);
+	std::vector<float> b1(d_hidden, 0.0f);
+	std::vector<float> W2(static_cast<size_t>(d_hidden) * d_out, 0.01f);
+	std::vector<float> b2(d_out, 0.0f);
+	unsigned int seed = 0xFFAA0005u;
+	fill_random(h.data(), T * d_in, seed);
+	std::vector<float> c(static_cast<size_t>(T) * d_out, 0.0f);
+	const int trials = 5;
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		neural_compress_2layer(h.data(), W1.data(), b1.data(), W2.data(), b2.data(),
+		                        T, d_in, d_hidden, d_out, c.data());
+	double tNeural = clock_seconds() - t0;
+	printf("    T=%u d_in=%u d_h=%u d_c=%u: %.2f ms/iter (CPU reference)\n",
+	       T, d_in, d_hidden, d_out, tNeural * 1000.0 / trials);
+	printf("    KV cache @ T=%u: MHA=%.1f MB / MLA d_c=384=%.1f MB / #99 d_c=256=%.1f MB\n",
+	       T,
+	       (double)(T * 2 * d_in * 4) / 1.048576e6,    // n_heads * d_kv ≈ d_in
+	       (double)(T * (384 + 64) * 4) / 1.048576e6,
+	       (double)(T * (d_out + 64) * 4) / 1.048576e6);
+}
+
+// ============================================================
 // Group H: GPU parity for paradigms #74/#76/#78
 // ============================================================
 // CPU vs GPU max-abs-diff comparisons + speedup measurement.
@@ -2501,6 +2772,17 @@ void TransformerOpsUnitTest()
 	test_phoenix158_compression_ratio();
 	test_phoenix158_ternary_gemm_correctness();
 	test_phoenix158_vs_phoenix1bit_storage();
+
+	// Group BENCH: Phase-B per-paradigm benchmarks at realistic shapes
+	printf("--- Group BENCH: Per-paradigm benchmarks at realistic shapes ---\n");
+#ifdef GLADES_HAVE_CUDA
+	bench_paradigm_phoenix1bit_gpu_realistic();
+	bench_paradigm_mla_gpu_realistic();
+	bench_paradigm_attention_sink_gpu_realistic();
+#endif
+	bench_paradigm_moe_routing_realistic();
+	bench_paradigm_astra_kahan_realistic();
+	bench_paradigm_neural_cache_realistic();
 
 	// Group H: GPU parity for #74/#76/#78
 #ifdef GLADES_HAVE_CUDA
