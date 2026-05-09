@@ -2226,5 +2226,74 @@ inline void adam_step_reference(float* param,
 	}
 }
 
+// ============================================================================
+// Paradigm shift #99 — NEURAL-CACHE-COMPRESSION (Path 2 round 3)
+// ============================================================================
+//
+// Extends #76 MLA's linear W_DKV projection with a 2-layer MLP:
+//
+//   c_t^KV = MLP_compress(h_t)
+//          = (GELU(h_t · W_dc1 + b_dc1)) · W_dc2 + b_dc2
+//   K_t    = MLP_decompress_K(c_t^KV)
+//          = (GELU(c_t^KV · W_uk1 + b_uk1)) · W_uk2 + b_uk2
+//   V_t    = MLP_decompress_V(c_t^KV)
+//          = (GELU(c_t^KV · W_uv1 + b_uv1)) · W_uv2 + b_uv2
+//
+// Headline: target d_c=256 (vs MLA's 384 = ~1.5× more aggressive compression).
+// Bijectivity preservation: c → K, V is deterministic; same hash → same K, V.
+
+inline void neural_compress_2layer(const float* h,
+                                   const float* W1, const float* b1,
+                                   const float* W2, const float* b2,
+                                   unsigned int T,
+                                   unsigned int d_in,
+                                   unsigned int d_hidden,
+                                   unsigned int d_out,
+                                   float* c_out)
+{
+	if (!h || !W1 || !W2 || !c_out) return;
+	if (T == 0u || d_in == 0u || d_hidden == 0u || d_out == 0u) return;
+
+	std::vector<float> hidden(static_cast<size_t>(T) * d_hidden);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		const float* ht = h + static_cast<size_t>(t) * d_in;
+		float* hidT = &hidden[static_cast<size_t>(t) * d_hidden];
+		for (unsigned int j = 0; j < d_hidden; ++j)
+		{
+			double s = 0.0;
+			for (unsigned int i = 0; i < d_in; ++i)
+				s += static_cast<double>(ht[i]) *
+				     static_cast<double>(W1[static_cast<size_t>(i) * d_hidden + j]);
+			float pre = static_cast<float>(s);
+			if (b1) pre += b1[j];
+			hidT[j] = gelu(pre);
+		}
+		float* ct = c_out + static_cast<size_t>(t) * d_out;
+		for (unsigned int k = 0; k < d_out; ++k)
+		{
+			double s = 0.0;
+			for (unsigned int j = 0; j < d_hidden; ++j)
+				s += static_cast<double>(hidT[j]) *
+				     static_cast<double>(W2[static_cast<size_t>(j) * d_out + k]);
+			float v = static_cast<float>(s);
+			if (b2) v += b2[k];
+			ct[k] = v;
+		}
+	}
+}
+
+// Determines effective compression ratio for #99 vs MHA baseline.
+//   nHeads, dKV : standard MHA config
+//   d_c         : neural-compressor bottleneck output dim
+inline float neural_cache_compression_ratio(unsigned int nHeads,
+                                            unsigned int dKV,
+                                            unsigned int d_c)
+{
+	if (d_c == 0u) return 0.0f;
+	const unsigned int mhaPerToken = nHeads * dKV * 2u;  // K + V floats per token
+	return static_cast<float>(mhaPerToken) / static_cast<float>(d_c);
+}
+
 } // namespace transformer_ops
 } // namespace glades

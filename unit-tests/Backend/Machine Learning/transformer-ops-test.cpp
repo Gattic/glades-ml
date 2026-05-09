@@ -43,6 +43,8 @@ using glades::transformer_ops::phoenix_binary_gemm;
 using glades::transformer_ops::phoenix_binary_gemm_colmajor;
 using glades::transformer_ops::astra_kahan_step;
 using glades::transformer_ops::adam_step_reference;
+using glades::transformer_ops::neural_compress_2layer;
+using glades::transformer_ops::neural_cache_compression_ratio;
 using glades::transformer_kernels::silu_forward_buf;
 using glades::transformer_kernels::gelu_forward_buf;
 using glades::transformer_kernels::silu_backward_buf;
@@ -1689,6 +1691,165 @@ static void test_astra_kahan_compensator_recovers_residual()
 }
 
 // ============================================================
+// Group J: Paradigm shift #99 NEURAL-CACHE-COMPRESSION
+// ============================================================
+// 2-layer MLP compressor extending #76 MLA's linear projection.
+
+static void test_neural_compress_compression_ratio()
+{
+	printf("  [J1] NeuralCacheCompressionRatioVsMLA ...\n");
+	// MHA: nHeads=16, dKV=128, mhaPerToken=4096
+	//   d_c=384 (MLA conservative)  -> 4096/384 = 10.67x
+	//   d_c=256 (#99 target)        -> 4096/256 = 16x
+	//   d_c=512 (MLA pessimistic)   -> 4096/512 = 8x
+	float r1 = neural_cache_compression_ratio(16u, 128u, 384u);
+	float r2 = neural_cache_compression_ratio(16u, 128u, 256u);
+	float r3 = neural_cache_compression_ratio(16u, 128u, 512u);
+	printf("    d_c=384: %.3fx  d_c=256: %.3fx  d_c=512: %.3fx\n", r1, r2, r3);
+	ASSERT("d_c=384 ~10.67x", std::fabs(r1 - 10.667f) < 0.05f);
+	ASSERT("d_c=256 ~16x (#99 target)", std::fabs(r2 - 16.0f) < 0.05f);
+	ASSERT("d_c=512 ~8x", std::fabs(r3 - 8.0f) < 0.05f);
+	printf("    PASSED (#99 target d_c=256 = 16x; MLA baseline d_c=384 = 10.67x = 1.5x more aggressive)\n");
+}
+
+static void test_neural_compress_forward_correctness()
+{
+	printf("  [J2] NeuralCompressForwardCorrectness ...\n");
+	// Verify forward computes (GELU(h W1 + b1)) W2 + b2 correctly.
+	const unsigned int T = 4u;
+	const unsigned int d_in = 6u;
+	const unsigned int d_hidden = 8u;
+	const unsigned int d_out = 4u;
+	std::vector<float> h(static_cast<size_t>(T) * d_in);
+	std::vector<float> W1(static_cast<size_t>(d_in) * d_hidden);
+	std::vector<float> b1(d_hidden, 0.0f);
+	std::vector<float> W2(static_cast<size_t>(d_hidden) * d_out);
+	std::vector<float> b2(d_out, 0.0f);
+	unsigned int seed = 0xCAB1E7Eu;
+	fill_random(h.data(), T * d_in, seed);
+	fill_random(W1.data(), d_in * d_hidden, seed);
+	fill_random(b1.data(), d_hidden, seed);
+	fill_random(W2.data(), d_hidden * d_out, seed);
+	fill_random(b2.data(), d_out, seed);
+
+	std::vector<float> c_out(static_cast<size_t>(T) * d_out, 0.0f);
+	neural_compress_2layer(h.data(), W1.data(), b1.data(),
+	                       W2.data(), b2.data(),
+	                       T, d_in, d_hidden, d_out, c_out.data());
+
+	// Reference: explicit matmul + GELU
+	std::vector<float> ref(static_cast<size_t>(T) * d_out, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+	{
+		std::vector<float> hidden(d_hidden, 0.0f);
+		for (unsigned int j = 0; j < d_hidden; ++j)
+		{
+			double s = 0.0;
+			for (unsigned int i = 0; i < d_in; ++i)
+				s += static_cast<double>(h[t * d_in + i]) *
+				     static_cast<double>(W1[i * d_hidden + j]);
+			hidden[j] = glades::transformer_ops::gelu(static_cast<float>(s) + b1[j]);
+		}
+		for (unsigned int k = 0; k < d_out; ++k)
+		{
+			double s = 0.0;
+			for (unsigned int j = 0; j < d_hidden; ++j)
+				s += static_cast<double>(hidden[j]) *
+				     static_cast<double>(W2[j * d_out + k]);
+			ref[t * d_out + k] = static_cast<float>(s) + b2[k];
+		}
+	}
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < ref.size(); ++i)
+		maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(c_out[i] - ref[i])));
+	printf("    T=%u d_in=%u d_h=%u d_out=%u: max-abs-diff=%.3e\n",
+	       T, d_in, d_hidden, d_out, maxAbs);
+	ASSERT("neural compress matches explicit reference", maxAbs < 1e-5);
+	printf("    PASSED\n");
+}
+
+static void test_neural_compress_determinism()
+{
+	printf("  [J3] NeuralCompressDeterminism ...\n");
+	// Bijectivity prerequisite: same input → same output.
+	const unsigned int T = 8u;
+	const unsigned int d_in = 16u;
+	const unsigned int d_hidden = 12u;
+	const unsigned int d_out = 6u;
+	std::vector<float> h(static_cast<size_t>(T) * d_in);
+	std::vector<float> W1(static_cast<size_t>(d_in) * d_hidden);
+	std::vector<float> b1(d_hidden, 0.0f);
+	std::vector<float> W2(static_cast<size_t>(d_hidden) * d_out);
+	std::vector<float> b2(d_out, 0.0f);
+	unsigned int seed = 0xDE7E2u;
+	fill_random(h.data(), T * d_in, seed);
+	fill_random(W1.data(), d_in * d_hidden, seed);
+	fill_random(W2.data(), d_hidden * d_out, seed);
+
+	std::vector<float> a(static_cast<size_t>(T) * d_out, 0.0f);
+	std::vector<float> b(static_cast<size_t>(T) * d_out, 0.0f);
+	neural_compress_2layer(h.data(), W1.data(), b1.data(),
+	                       W2.data(), b2.data(),
+	                       T, d_in, d_hidden, d_out, a.data());
+	neural_compress_2layer(h.data(), W1.data(), b1.data(),
+	                       W2.data(), b2.data(),
+	                       T, d_in, d_hidden, d_out, b.data());
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < a.size(); ++i)
+		maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(a[i] - b[i])));
+	printf("    same input two passes: max-abs-diff=%.3e (must be 0)\n", maxAbs);
+	ASSERT("neural compress is deterministic", maxAbs == 0.0);
+	printf("    PASSED\n");
+}
+
+static void test_neural_compress_reconstruction_via_decompress()
+{
+	printf("  [J4] NeuralCompressReconstructionRoundTrip ...\n");
+	// End-to-end: h -> c -> K_recon.  Test compose with a decompress MLP.
+	// Use small d_in=8, hidden=16, d_c=4 for compress; then d_c -> hidden=16 ->
+	// dKV=8 for decompress.  Random weights — we don't test reconstruction
+	// quality (that needs training); we verify the chain runs without NaN.
+	const unsigned int T = 8u;
+	const unsigned int d_h = 8u;
+	const unsigned int d_c_hid = 16u;
+	const unsigned int d_c = 4u;
+	const unsigned int d_uk_hid = 16u;
+	const unsigned int dKV = 8u;
+	std::vector<float> h(static_cast<size_t>(T) * d_h);
+	std::vector<float> Wdc1(static_cast<size_t>(d_h) * d_c_hid);
+	std::vector<float> bdc1(d_c_hid, 0.0f);
+	std::vector<float> Wdc2(static_cast<size_t>(d_c_hid) * d_c);
+	std::vector<float> bdc2(d_c, 0.0f);
+	std::vector<float> Wuk1(static_cast<size_t>(d_c) * d_uk_hid);
+	std::vector<float> buk1(d_uk_hid, 0.0f);
+	std::vector<float> Wuk2(static_cast<size_t>(d_uk_hid) * dKV);
+	std::vector<float> buk2(dKV, 0.0f);
+	unsigned int seed = 0xC0DECAFEu;
+	fill_random(h.data(), T * d_h, seed);
+	fill_random(Wdc1.data(), d_h * d_c_hid, seed);
+	fill_random(Wdc2.data(), d_c_hid * d_c, seed);
+	fill_random(Wuk1.data(), d_c * d_uk_hid, seed);
+	fill_random(Wuk2.data(), d_uk_hid * dKV, seed);
+
+	std::vector<float> c_lat(static_cast<size_t>(T) * d_c, 0.0f);
+	std::vector<float> K_recon(static_cast<size_t>(T) * dKV, 0.0f);
+	neural_compress_2layer(h.data(), Wdc1.data(), bdc1.data(),
+	                       Wdc2.data(), bdc2.data(),
+	                       T, d_h, d_c_hid, d_c, c_lat.data());
+	neural_compress_2layer(c_lat.data(), Wuk1.data(), buk1.data(),
+	                       Wuk2.data(), buk2.data(),
+	                       T, d_c, d_uk_hid, dKV, K_recon.data());
+
+	bool allFinite = true;
+	for (size_t i = 0; i < K_recon.size(); ++i)
+		if (!is_finite_val(K_recon[i])) { allFinite = false; break; }
+	printf("    compress(h) -> c -> decompress(c) -> K_recon: %u floats, all finite? %s\n",
+	       static_cast<unsigned int>(K_recon.size()), allFinite ? "yes" : "no");
+	ASSERT("neural compress + decompress chain finite", allFinite);
+	printf("    PASSED (mechanism plumbing verified; reconstruction quality requires training)\n");
+}
+
+// ============================================================
 // Group H: GPU parity for paradigms #74/#76/#78
 // ============================================================
 // CPU vs GPU max-abs-diff comparisons + speedup measurement.
@@ -2105,6 +2266,13 @@ void TransformerOpsUnitTest()
 	test_astra_kahan_noisy_convergence();
 	test_astra_kahan_memory_vs_adam();
 	test_astra_kahan_compensator_recovers_residual();
+
+	// Group J: Paradigm shift #99 NEURAL-CACHE-COMPRESSION
+	printf("--- Group J: Neural KV compression (paradigm #99) ---\n");
+	test_neural_compress_compression_ratio();
+	test_neural_compress_forward_correctness();
+	test_neural_compress_determinism();
+	test_neural_compress_reconstruction_via_decompress();
 
 	// Group H: GPU parity for #74/#76/#78
 #ifdef GLADES_HAVE_CUDA
