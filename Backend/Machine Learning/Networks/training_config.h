@@ -179,6 +179,21 @@ struct TransformerRunConfig
 	// MLC-LLM, TGI.
 	int attnSinkCount;
 
+	// Binary FFN forward (paradigm shift #74 PHOENIX-1BIT-DISTILL-COMBO).
+	// When true, the FFN W2 (output) projection is computed as Y = X @
+	// sign(W2).T via an on-the-fly binary kernel — no multiplies on the
+	// hot path. Float master weights are still kept for backward (STE)
+	// and Adam updates; the speedup is FLOP-side only at training time.
+	// At inference the float weights can be dropped. Default false.
+	bool binaryFFN;
+
+	// MLA latent rank (paradigm shift #76 MLA-DISTILL-CHIRON). When > 0,
+	// switch the K/V projections from standard MHA W_K, W_V to a low-rank
+	// latent: K = h @ W_DKV @ W_UK ; V = h @ W_DKV @ W_UV with latent
+	// dimension d_c = mlaLatentDim. Cache stores c (T × d_c) instead of
+	// K, V (T × n_heads × d_kv × 2). Default 0 = standard MHA.
+	int mlaLatentDim;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -204,7 +219,9 @@ struct TransformerRunConfig
 	      embeddingDropoutRate(0.0f),
 	      residualDropoutRate(0.0f),
 	      localAttnWindow(0),
-	      attnSinkCount(0)
+	      attnSinkCount(0),
+	      binaryFFN(false),
+	      mlaLatentDim(0)
 	{
 	}
 };

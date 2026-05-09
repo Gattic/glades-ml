@@ -9512,12 +9512,26 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		else
 			gpu::relu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
 
-		if (!gpu_gemm_abt_mp(bf16W2,
-		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF), 1.0f,
-		    ff1Act_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
-		    gb.W2.data(), gb.W2Lowp.data(), static_cast<int>(dFF),
-		    0.0f, ffOut_l, static_cast<int>(dModel)))
-			return false;
+		// Paradigm #74 PHOENIX-1BIT: binary W2 projection (Y = X @ sign(W2).T).
+		// Float master weights still drive backward via STE.
+		const bool useBinaryFFN = trainingConfig.transformer.binaryFFN;
+		if (useBinaryFFN)
+		{
+			if (!gpu::binary_gemm_abt_from_float(
+			        ff1Act_l, gb.W2.data(),
+			        static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+			        ffOut_l))
+				return false;
+		}
+		else
+		{
+			if (!gpu_gemm_abt_mp(bf16W2,
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF), 1.0f,
+			    ff1Act_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
+			    gb.W2.data(), gb.W2Lowp.data(), static_cast<int>(dFF),
+			    0.0f, ffOut_l, static_cast<int>(dModel)))
+				return false;
+		}
 		gpu::add_bias(ffOut_l, gb.b2.data(),
 		              static_cast<int>(T), static_cast<int>(dModel));
 

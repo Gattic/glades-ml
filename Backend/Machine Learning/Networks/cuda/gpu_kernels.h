@@ -306,6 +306,13 @@ bool phoenix_binary_gemm_gpu(const float* X,
                               int M, int N, int K,
                               float* Y);
 
+// #74 PHOENIX-1BIT FFN-side helper: Y[M,N] = X[M,K] @ sign(W[N,K]).T
+// Operates on float weights in-place via on-the-fly sign extraction.
+// Mirrors gpu_gemm_abt_mp's interface; for training-time integration where
+// we keep the float master weights and want to skip the multiply.
+bool binary_gemm_abt_from_float(const float* X, const float* W,
+                                int M, int N, int K, float* Y);
+
 // #76 MLA latent compression: c = h @ W_DKV via cuBLAS sgemm.
 bool mla_compute_latent_gpu(const float* h, const float* W_DKV,
                              int T, int d_h, int d_c, float* c_out);
@@ -665,6 +672,8 @@ inline bool astra_update(float*, const float*, float*,
 
 inline bool phoenix_binary_gemm_gpu(const float*, const unsigned char*,
                                      int, int, int, float*) { return false; }
+inline bool binary_gemm_abt_from_float(const float*, const float*,
+                                        int, int, int, float*) { return false; }
 inline bool mla_compute_latent_gpu(const float*, const float*,
                                     int, int, int, float*) { return false; }
 inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,

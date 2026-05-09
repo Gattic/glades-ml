@@ -4854,6 +4854,42 @@ __global__ void sw_attention_backward_kernel(const float* __restrict__ Q,
 	}
 }
 
+// ---------- #74 PHOENIX-1BIT FFN-side helper: Y = X @ sign(W).T -----------
+// W[N, K] row-major, treated as binary {-1, +1} via sign. Mirrors
+// gpu_gemm_abt_mp's interface for in-place FFN replacement. Sign is read
+// on-the-fly from the float W; no separate packed buffer needed for this
+// training-time helper.
+namespace {
+__global__ void binary_gemm_abt_from_float_kernel(const float* __restrict__ X,
+                                                  const float* __restrict__ W,
+                                                  int M, int N, int K,
+                                                  float* __restrict__ Y)
+{
+	const int t = blockIdx.y * blockDim.y + threadIdx.y;
+	const int n = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= M || n >= N) return;
+	const float* xt = X + (size_t)t * K;
+	const float* wn = W + (size_t)n * K;
+	float sum = 0.0f;
+	for (int k = 0; k < K; ++k)
+		sum += (wn[k] >= 0.0f) ? xt[k] : -xt[k];
+	Y[(size_t)t * N + n] = sum;
+}
+} // anonymous
+
+bool binary_gemm_abt_from_float(const float* X, const float* W,
+                                int M, int N, int K, float* Y)
+{
+	if (M <= 0 || N <= 0 || K <= 0) return true;
+	const dim3 block(16u, 16u, 1u);
+	const dim3 grid((unsigned int)(N + (int)block.x - 1) / (int)block.x,
+	                (unsigned int)(M + (int)block.y - 1) / (int)block.y, 1u);
+	binary_gemm_abt_from_float_kernel<<<grid, block, 0, computeStream()>>>(
+	    X, W, M, N, K, Y);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // #78 backward wrapper.
 bool sw_attention_backward_gpu(const float* Q, int qStride,
                                 const float* K, int kStride,
