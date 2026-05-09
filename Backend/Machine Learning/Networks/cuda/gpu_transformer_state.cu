@@ -261,7 +261,11 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	// Allocate batched Adam device arrays shared by AdamW-like backbones.
 	// ECHO-specific batched observe / metric metadata is allocated lazily when
 	// the fused ECHO path is actually active.
-	int maxGroups = 6 + 16 * static_cast<int>(nl);
+	// Match sgd_transformer.cpp's maxAdamGroups: base 6 + 16 per layer + 3
+	// per layer when MLA is active. Without MLA, the +3 is unused but
+	// over-allocating a few pointer slots is harmless.
+	const int adamPerLayer = 16 + (mlaLatentDim > 0 ? 3 : 0);
+	int maxGroups = 6 + adamPerLayer * static_cast<int>(nl);
 	cudaError_t e;
 	echoObserveCapacity = 0;
 	echoObserveEntryCount = 0;

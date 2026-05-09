@@ -195,6 +195,10 @@ struct GpuTransformerWeights
 		GpuBuffer<float> gWdkv, gWuk, gWuv;
 		// MLA forward scratch: c[T, dC] cached across forward+backward.
 		GpuBuffer<float> mlaC, mlaDc;
+		// MLA backward BF16 staging (avoids aliasing the per-step
+		// activationLowp/activationLowp2 buffers which other paths use).
+		GpuBuffer<unsigned short> mlaBf16ScratchA;
+		GpuBuffer<unsigned short> mlaBf16ScratchB;
 
 		// Paradigm shift #74 BitNet QAT FFN W2 scratch (lazy-allocated when
 		// trainingConfig.transformer.binaryFFN && WMMA B1 path is taken).

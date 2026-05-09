@@ -5382,53 +5382,101 @@ bool mla_attention_backward_gpu(const float* h,
                                  float* dW_DKV,      // [dHidden * dC]
                                  float* dW_UK,       // [dC * dKVtotal]
                                  float* dW_UV,       // [dC * dKVtotal]
-                                 float* dc_scratch)  // [T * dC]
+                                 float* dc_scratch,  // [T * dC]
+                                 unsigned short* bf16_scratch_A,
+                                 unsigned short* bf16_scratch_B)
 {
 	if (T <= 0 || dHidden <= 0 || dC <= 0 || dKVtotal <= 0) return true;
 
-	// Clear any sticky CUDA error from a prior kernel — cuBLAS surfaces
-	// upstream failures as STATUS_EXECUTION_FAILED, masking the real cause.
+	// PERMANENT FIX: route through the BF16 atb path that the standard W_K
+	// backward uses (gpu_gemm_atb_mp's useBf16=true branch). The FP32
+	// sgemm_rowmajor_atb path has a latent cuBLAS issue at certain shapes
+	// (M=192 N=384 K=1024 reproducibly fails with STATUS_EXECUTION_FAILED).
+	// The bf16 path uses cublasGemmEx with explicit bf16 input typing, which
+	// avoids the failure. Output stays FP32 in C; precision impact is
+	// negligible (bf16 inputs match the rest of the trainer in --mp mode).
+	//
+	// Caller must pass two bf16 scratch buffers (sized for the largest
+	// operand: max(T*dHidden, T*dKVtotal, dHidden*dC, dC*dKVtotal)).
+	{
+		cudaError_t pre = cudaDeviceSynchronize();
+		if (pre != cudaSuccess) {
+			fprintf(stderr, "[mla_bwd] PRE-call error: %d (%s)\n", (int)pre, cudaGetErrorString(pre));
+			return false;
+		}
+	}
 	(void)cudaGetLastError();
 
-	// Use the exact (non-TF32) variants — TF32 paths have stricter alignment
-	// requirements that can fail at certain shapes, and we'd rather pay the
-	// small precision cost than have cuBLAS error 7 silently zero gradients.
+#define MLA_BWD_CHECK(label) do { \
+	cudaError_t e = cudaDeviceSynchronize(); \
+	if (e != cudaSuccess) { \
+		fprintf(stderr, "[mla_bwd] %s err=%d (%s) T=%d dH=%d dC=%d dKVtot=%d\n", \
+		        label, (int)e, cudaGetErrorString(e), T, dHidden, dC, dKVtotal); \
+		return false; \
+	} \
+} while (0)
 
 	// dW_UK[dC, dKVtotal] = c^T[dC, T] @ dK[T, dKVtotal]
-	if (!sgemm_rowmajor_atb_exact(dC, dKVtotal, T, 1.0f,
-	                               c_cached, dC,
-	                               dK, dKVtotal,
-	                               0.0f, dW_UK, dKVtotal))
-		return false;
+	if (!cast_f32_to_bf16(c_cached, bf16_scratch_A, (size_t)T * dC)) return false;
+	MLA_BWD_CHECK("cast_c");
+	if (!cast_f32_to_bf16(dK,       bf16_scratch_B, (size_t)T * dKVtotal)) return false;
+	MLA_BWD_CHECK("cast_dK");
+	if (!sgemm_rowmajor_atb_bf16(dC, dKVtotal, T, 1.0f,
+	                              bf16_scratch_A, dC,
+	                              bf16_scratch_B, dKVtotal,
+	                              0.0f, dW_UK, dKVtotal)) return false;
+	MLA_BWD_CHECK("gemm_dW_UK");
+
 	// dW_UV[dC, dKVtotal] = c^T @ dV
-	if (!sgemm_rowmajor_atb_exact(dC, dKVtotal, T, 1.0f,
-	                               c_cached, dC,
-	                               dV, dKVtotal,
-	                               0.0f, dW_UV, dKVtotal))
+	// (c is still in bf16_scratch_A from above)
+	if (!cast_f32_to_bf16(dV,       bf16_scratch_B, (size_t)T * dKVtotal)) return false;
+	if (!sgemm_rowmajor_atb_bf16(dC, dKVtotal, T, 1.0f,
+	                              bf16_scratch_A, dC,
+	                              bf16_scratch_B, dKVtotal,
+	                              0.0f, dW_UV, dKVtotal))
 		return false;
+
 	// dc[T, dC] = dK[T, dKVtotal] @ W_UK^T[dKVtotal, dC] + dV @ W_UV^T
-	if (!sgemm_rowmajor_abt_exact(T, dC, dKVtotal, 1.0f,
-	                               dK, dKVtotal,
-	                               W_UK, dKVtotal,
-	                               0.0f, dc_scratch, dC))
+	if (!cast_f32_to_bf16(dK,   bf16_scratch_A, (size_t)T * dKVtotal)) return false;
+	if (!cast_f32_to_bf16(W_UK, bf16_scratch_B, (size_t)dC * dKVtotal)) return false;
+	if (!sgemm_rowmajor_abt_bf16(T, dC, dKVtotal, 1.0f,
+	                              bf16_scratch_A, dKVtotal,
+	                              bf16_scratch_B, dKVtotal,
+	                              0.0f, dc_scratch, dC))
 		return false;
-	if (!sgemm_rowmajor_abt_exact(T, dC, dKVtotal, 1.0f,
-	                               dV, dKVtotal,
-	                               W_UV, dKVtotal,
-	                               1.0f, dc_scratch, dC))
+	if (!cast_f32_to_bf16(dV,   bf16_scratch_A, (size_t)T * dKVtotal)) return false;
+	if (!cast_f32_to_bf16(W_UV, bf16_scratch_B, (size_t)dC * dKVtotal)) return false;
+	if (!sgemm_rowmajor_abt_bf16(T, dC, dKVtotal, 1.0f,
+	                              bf16_scratch_A, dKVtotal,
+	                              bf16_scratch_B, dKVtotal,
+	                              1.0f, dc_scratch, dC))
 		return false;
+
 	// dW_DKV[dHidden, dC] = h^T[dHidden, T] @ dc[T, dC]
-	if (!sgemm_rowmajor_atb_exact(dHidden, dC, T, 1.0f,
-	                               h, dHidden,
-	                               dc_scratch, dC,
-	                               0.0f, dW_DKV, dC))
+	if (!cast_f32_to_bf16(h,           bf16_scratch_A, (size_t)T * dHidden)) return false;
+	if (!cast_f32_to_bf16(dc_scratch,  bf16_scratch_B, (size_t)T * dC)) return false;
+	if (!sgemm_rowmajor_atb_bf16(dHidden, dC, T, 1.0f,
+	                              bf16_scratch_A, dHidden,
+	                              bf16_scratch_B, dC,
+	                              0.0f, dW_DKV, dC))
 		return false;
+
 	// dh[T, dHidden] += dc[T, dC] @ W_DKV^T[dC, dHidden]
-	if (!sgemm_rowmajor_abt_exact(T, dHidden, dC, 1.0f,
-	                               dc_scratch, dC,
-	                               W_DKV, dC,
-	                               1.0f, dh_accum, dHidden))
+	if (!cast_f32_to_bf16(dc_scratch, bf16_scratch_A, (size_t)T * dC)) return false;
+	if (!cast_f32_to_bf16(W_DKV,      bf16_scratch_B, (size_t)dHidden * dC)) return false;
+	if (!sgemm_rowmajor_abt_bf16(T, dHidden, dC, 1.0f,
+	                              bf16_scratch_A, dC,
+	                              bf16_scratch_B, dC,
+	                              1.0f, dh_accum, dHidden))
 		return false;
+
+	// DEBUG: surface any GPU error before returning
+	cudaError_t err = cudaDeviceSynchronize();
+	if (err != cudaSuccess) {
+		fprintf(stderr, "[mla_bwd] cudaDeviceSynchronize err=%d (%s) T=%d dH=%d dC=%d dKVtot=%d\n",
+		        (int)err, cudaGetErrorString(err), T, dHidden, dC, dKVtotal);
+		return false;
+	}
 	return true;
 }
 

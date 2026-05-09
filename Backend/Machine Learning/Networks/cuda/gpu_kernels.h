@@ -377,7 +377,10 @@ bool mla_attention_forward_gpu(const float* h,
                                 float* V_out);
 
 // (a) Full MLA backward — produces dh (accumulated), dW_DKV, dW_UK, dW_UV.
-// c_cached should be the c from forward; dc_scratch is workspace.
+// c_cached should be the c from forward; dc_scratch is FP32 workspace [T*dC].
+// bf16_scratch_A and bf16_scratch_B must each be sized for the largest
+// operand: max(T*dHidden, T*dKVtotal, T*dC, dHidden*dC, dC*dKVtotal).
+// Routes through cuBLAS BF16 atb/abt path to avoid the FP32 atb cuBLAS bug.
 bool mla_attention_backward_gpu(const float* h,
                                  const float* c_cached,
                                  const float* dK,
@@ -390,7 +393,9 @@ bool mla_attention_backward_gpu(const float* h,
                                  float* dW_DKV,
                                  float* dW_UK,
                                  float* dW_UV,
-                                 float* dc_scratch);
+                                 float* dc_scratch,
+                                 unsigned short* bf16_scratch_A,
+                                 unsigned short* bf16_scratch_B);
 
 // #78 ATTENTION-SINK forward (single-head FP32 reference). One block per
 // query position; inner thread reduces over keys with sink+window mask.
@@ -763,7 +768,8 @@ inline bool mla_attention_forward_gpu(const float*, const float*, const float*, 
 inline bool mla_attention_backward_gpu(const float*, const float*, const float*, const float*,
                                         const float*, const float*, const float*,
                                         int, int, int, int,
-                                        float*, float*, float*, float*, float*) { return false; }
+                                        float*, float*, float*, float*, float*,
+                                        unsigned short*, unsigned short*) { return false; }
 inline bool sw_attention_forward_gpu(const float*, int, const float*, int,
                                       const float*, int, int, int, bool,
                                       int, int, float*, int) { return false; }

@@ -9973,19 +9973,40 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    0.0f, Q_l, static_cast<int>(dModel));
 			gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
 
-			gpu_gemm_abt_mp(bf16Wk,
-			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
-			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-			    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
-			    0.0f, K_l, static_cast<int>(dModelKV));
-			gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+			// Paradigm shift #76 MLA dispatch (training path): when
+			// mlaLatentDim > 0, replace the standard W_K, W_V projections
+			// with the low-rank latent path:
+			//   c = x1 @ Wdkv ; K = c @ Wuk ; V = c @ Wuv
+			// Mirrors the dispatch in transformerGpuRunForwardOnly.
+			{
+			const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+			if (mlaDc > 0 && gb.Wdkv.allocated()) {
+				const size_t cBytes = static_cast<size_t>(T) * static_cast<size_t>(mlaDc);
+				if (gb.mlaC.size() < cBytes) gb.mlaC.allocate(cBytes);
+				if (!gpu::mla_attention_forward_gpu(
+				        x1_l, gb.Wdkv.data(), gb.Wuk.data(), gb.Wuv.data(),
+				        static_cast<int>(T), static_cast<int>(dModel), mlaDc,
+				        static_cast<int>(dModelKV),
+				        gb.mlaC.data(), K_l, V_l))
+					return;
+				gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+				gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+			} else {
+				gpu_gemm_abt_mp(bf16Wk,
+				    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+				    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+				    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
+				    0.0f, K_l, static_cast<int>(dModelKV));
+				gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
 
-			gpu_gemm_abt_mp(bf16Wv,
-			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
-			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-			    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
-			    0.0f, V_l, static_cast<int>(dModelKV));
-			gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+				gpu_gemm_abt_mp(bf16Wv,
+				    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+				    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+				    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
+				    0.0f, V_l, static_cast<int>(dModelKV));
+				gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+			}
+			}
 
 			// RoPE (if enabled) — fused Q+K in single kernel launch
 			if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
@@ -10906,9 +10927,19 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			{
 				// dX1 + dWdkv + dWuk + dWuv via single chain-rule call.
 				// c was computed during forward and cached in gb.mlaC.
-				// Allocate dc scratch if needed.
+				// Allocate dc scratch + dedicated BF16 staging buffers.
 				const size_t dcBytes = static_cast<size_t>(T) * static_cast<size_t>(mlaDcBwd);
 				if (gb.mlaDc.size() < dcBytes) gb.mlaDc.allocate(dcBytes);
+				// Sizing: max of all operand shapes used in the bf16 path —
+				// T*dHidden, T*dKVtotal, T*dC, dHidden*dC, dC*dKVtotal.
+				const size_t bf16Need =
+				    std::max((size_t)T * dModel,
+				    std::max((size_t)T * dModelKV,
+				    std::max((size_t)T * mlaDcBwd,
+				    std::max((size_t)dModel * mlaDcBwd,
+				             (size_t)mlaDcBwd * dModelKV))));
+				if (gb.mlaBf16ScratchA.size() < bf16Need) gb.mlaBf16ScratchA.allocate(bf16Need);
+				if (gb.mlaBf16ScratchB.size() < bf16Need) gb.mlaBf16ScratchB.allocate(bf16Need);
 				gpu::mla_attention_backward_gpu(
 				    x1_l, gb.mlaC.data(),
 				    gpuTransformerScratch->dKfull.data(),
@@ -10917,7 +10948,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    static_cast<int>(T), static_cast<int>(dModel), mlaDcBwd, static_cast<int>(dModelKV),
 				    gpuTransformerScratch->dX1.data(),
 				    gb.gWdkv.data(), gb.gWuk.data(), gb.gWuv.data(),
-				    gb.mlaDc.data());
+				    gb.mlaDc.data(),
+				    gb.mlaBf16ScratchA.data(),
+				    gb.mlaBf16ScratchB.data());
 				// Bias gradients still applicable
 				gpu::reduce_rows_sum(
 				    gpuTransformerScratch->dKfull.data(),
