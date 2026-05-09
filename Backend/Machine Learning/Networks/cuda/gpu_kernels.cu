@@ -5344,6 +5344,29 @@ bool mla_attention_forward_gpu(const float* h,
 	return true;
 }
 
+// 2D transpose: out[N, M] = in[M, N]^T. One thread per element.
+namespace {
+__global__ void k_transpose_2d(const float* __restrict__ in,
+                               int M, int N,
+                               float* __restrict__ out)
+{
+	const int n = blockIdx.x * blockDim.x + threadIdx.x;
+	const int m = blockIdx.y * blockDim.y + threadIdx.y;
+	if (m >= M || n >= N) return;
+	out[(size_t)n * M + m] = in[(size_t)m * N + n];
+}
+} // anonymous
+
+bool transpose_2d(const float* in, int M, int N, float* out)
+{
+	if (M <= 0 || N <= 0) return true;
+	const dim3 block(16u, 16u, 1u);
+	const dim3 grid((unsigned)((N + 15) / 16), (unsigned)((M + 15) / 16), 1u);
+	k_transpose_2d<<<grid, block, 0, computeStream()>>>(in, M, N, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // Backward through MLA latent: given dK, dV, h, the factored weights and c
 // (cached from forward), produce dh, dW_DKV, dW_UK, dW_UV.
 // All five gradients via cuBLAS chain rule:
@@ -5363,40 +5386,48 @@ bool mla_attention_backward_gpu(const float* h,
 {
 	if (T <= 0 || dHidden <= 0 || dC <= 0 || dKVtotal <= 0) return true;
 
+	// Clear any sticky CUDA error from a prior kernel — cuBLAS surfaces
+	// upstream failures as STATUS_EXECUTION_FAILED, masking the real cause.
+	(void)cudaGetLastError();
+
+	// Use the exact (non-TF32) variants — TF32 paths have stricter alignment
+	// requirements that can fail at certain shapes, and we'd rather pay the
+	// small precision cost than have cuBLAS error 7 silently zero gradients.
+
 	// dW_UK[dC, dKVtotal] = c^T[dC, T] @ dK[T, dKVtotal]
-	if (!sgemm_rowmajor_atb(dC, dKVtotal, T, 1.0f,
-	                         c_cached, dC,
-	                         dK, dKVtotal,
-	                         0.0f, dW_UK, dKVtotal))
+	if (!sgemm_rowmajor_atb_exact(dC, dKVtotal, T, 1.0f,
+	                               c_cached, dC,
+	                               dK, dKVtotal,
+	                               0.0f, dW_UK, dKVtotal))
 		return false;
 	// dW_UV[dC, dKVtotal] = c^T @ dV
-	if (!sgemm_rowmajor_atb(dC, dKVtotal, T, 1.0f,
-	                         c_cached, dC,
-	                         dV, dKVtotal,
-	                         0.0f, dW_UV, dKVtotal))
+	if (!sgemm_rowmajor_atb_exact(dC, dKVtotal, T, 1.0f,
+	                               c_cached, dC,
+	                               dV, dKVtotal,
+	                               0.0f, dW_UV, dKVtotal))
 		return false;
 	// dc[T, dC] = dK[T, dKVtotal] @ W_UK^T[dKVtotal, dC] + dV @ W_UV^T
-	if (!sgemm_rowmajor_abt(T, dC, dKVtotal, 1.0f,
-	                         dK, dKVtotal,
-	                         W_UK, dKVtotal,
-	                         0.0f, dc_scratch, dC))
+	if (!sgemm_rowmajor_abt_exact(T, dC, dKVtotal, 1.0f,
+	                               dK, dKVtotal,
+	                               W_UK, dKVtotal,
+	                               0.0f, dc_scratch, dC))
 		return false;
-	if (!sgemm_rowmajor_abt(T, dC, dKVtotal, 1.0f,
-	                         dV, dKVtotal,
-	                         W_UV, dKVtotal,
-	                         1.0f, dc_scratch, dC))
+	if (!sgemm_rowmajor_abt_exact(T, dC, dKVtotal, 1.0f,
+	                               dV, dKVtotal,
+	                               W_UV, dKVtotal,
+	                               1.0f, dc_scratch, dC))
 		return false;
 	// dW_DKV[dHidden, dC] = h^T[dHidden, T] @ dc[T, dC]
-	if (!sgemm_rowmajor_atb(dHidden, dC, T, 1.0f,
-	                         h, dHidden,
-	                         dc_scratch, dC,
-	                         0.0f, dW_DKV, dC))
+	if (!sgemm_rowmajor_atb_exact(dHidden, dC, T, 1.0f,
+	                               h, dHidden,
+	                               dc_scratch, dC,
+	                               0.0f, dW_DKV, dC))
 		return false;
 	// dh[T, dHidden] += dc[T, dC] @ W_DKV^T[dC, dHidden]
-	if (!sgemm_rowmajor_abt(T, dHidden, dC, 1.0f,
-	                         dc_scratch, dC,
-	                         W_DKV, dC,
-	                         1.0f, dh_accum, dHidden))
+	if (!sgemm_rowmajor_abt_exact(T, dHidden, dC, 1.0f,
+	                               dc_scratch, dC,
+	                               W_DKV, dC,
+	                               1.0f, dh_accum, dHidden))
 		return false;
 	return true;
 }
