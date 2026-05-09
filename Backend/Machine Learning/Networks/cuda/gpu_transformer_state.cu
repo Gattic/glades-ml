@@ -66,7 +66,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
                                       unsigned int vs, unsigned int is, unsigned int os,
                                       unsigned int ffk, bool tm, bool te,
                                       bool skipAdamBufs,
-                                      bool adamStateBf16)
+                                      bool adamStateBf16,
+                                      int mlaLatentDim)
 {
 	free();
 	const bool allocFpMV  = !skipAdamBufs && !adamStateBf16;
@@ -184,6 +185,28 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.gWo, (size_t)dm * dm)) return false;
+
+		// Paradigm shift #76 MLA latent projections (allocated when mlaLatentDim > 0).
+		if (mlaLatentDim > 0) {
+			const size_t dC = (size_t)mlaLatentDim;
+			if (!allocBuf(b.Wdkv, (size_t)dm * dC)) return false;
+			if (!allocBuf(b.Wuk,  dC * (size_t)dModelKV)) return false;
+			if (!allocBuf(b.Wuv,  dC * (size_t)dModelKV)) return false;
+			if (allocFpMV) {
+				if (!allocBuf(b.vWdkv,  (size_t)dm * dC)) return false;
+				if (!allocBuf(b.vWuk,   dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.vWuv,   dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.v2Wdkv, (size_t)dm * dC)) return false;
+				if (!allocBuf(b.v2Wuk,  dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.v2Wuv,  dC * (size_t)dModelKV)) return false;
+			}
+			if (!allocBuf(b.gWdkv, (size_t)dm * dC)) return false;
+			if (!allocBuf(b.gWuk,  dC * (size_t)dModelKV)) return false;
+			if (!allocBuf(b.gWuv,  dC * (size_t)dModelKV)) return false;
+			// Forward scratch sized per batch — actual size T*dC depends on
+			// runtime T; allocate at upper bound T_max via gpuTransformerScratch
+			// instead. Mark these as zero-allocated here.
+		}
 
 		if (!allocBuf(b.bq, dm)) return false;
 		if (!allocBuf(b.bk, dModelKV)) return false;
@@ -721,7 +744,9 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
                                     const float* bq, const float* bk, const float* bv, const float* bo,
                                     const float* ln2Gamma, const float* ln2Beta,
                                     const float* W1, const float* W2,
-                                    const float* b1, const float* b2)
+                                    const float* b1, const float* b2,
+                                    int mlaLatentDim,
+                                    const float* Wdkv, const float* Wuk, const float* Wuv)
 {
 	const size_t dm = static_cast<size_t>(dModel);
 	const size_t dmkv = static_cast<size_t>(dModelKV);
@@ -744,6 +769,14 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
 	if (!b.W2.upload(W2, dm * df)) return false;
 	if (!b.b1.upload(b1, f1w)) return false;
 	if (!b.b2.upload(b2, dm)) return false;
+
+	// Paradigm #76 MLA: upload latent projections if active.
+	if (mlaLatentDim > 0 && Wdkv && Wuk && Wuv) {
+		const size_t dC = (size_t)mlaLatentDim;
+		if (!b.Wdkv.upload(Wdkv, dm * dC)) return false;
+		if (!b.Wuk.upload(Wuk,   dC * dmkv)) return false;
+		if (!b.Wuv.upload(Wuv,   dC * dmkv)) return false;
+	}
 
 	return true;
 }

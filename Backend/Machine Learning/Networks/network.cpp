@@ -4587,7 +4587,8 @@ bool glades::NNetwork::ensureGpuState()
 			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
 			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
 			                                      ts.outSize, ts.ffnKind, ts.tokenModel,
-			                                      ts.tieEmbeddings, skipAdam, useBf16State))
+			                                      ts.tieEmbeddings, skipAdam, useBf16State,
+			                                      trainingConfig.transformer.mlaLatentDim))
 			{
 				return false;
 			}
@@ -4625,7 +4626,11 @@ bool glades::NNetwork::ensureGpuState()
 			                                   cb.W1.empty() ? NULL : &cb.W1[0],
 			                                   cb.W2.empty() ? NULL : &cb.W2[0],
 			                                   cb.b1.empty() ? NULL : &cb.b1[0],
-			                                   cb.b2.empty() ? NULL : &cb.b2[0]);
+			                                   cb.b2.empty() ? NULL : &cb.b2[0],
+			                                   trainingConfig.transformer.mlaLatentDim,
+			                                   cb.Wdkv.empty() ? NULL : &cb.Wdkv[0],
+			                                   cb.Wuk.empty()  ? NULL : &cb.Wuk[0],
+			                                   cb.Wuv.empty()  ? NULL : &cb.Wuv[0]);
 		}
 
 		// Upload optimizer state (Adam m1/m2) for each weight tensor

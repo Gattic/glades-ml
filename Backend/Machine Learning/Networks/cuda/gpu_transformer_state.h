@@ -359,7 +359,8 @@ struct GpuTransformerWeights
 	              unsigned int vocabSize, unsigned int inputSize, unsigned int outSize,
 	              unsigned int ffnKind, bool tokenModel, bool tieEmbeddings,
 	              bool skipAdamBufs = false,
-	              bool adamStateBf16 = false);
+	              bool adamStateBf16 = false,
+	              int mlaLatentDim = 0);
 
 	// Free all GPU memory.
 	void free();
@@ -537,7 +538,12 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,
                                     const float* bq, const float* bk, const float* bv, const float* bo,
                                     const float* ln2Gamma, const float* ln2Beta,
                                     const float* W1, const float* W2,
-                                    const float* b1, const float* b2);
+                                    const float* b1, const float* b2,
+                                    // Paradigm shift #76 MLA — pass NULL when not active.
+                                    int mlaLatentDim = 0,
+                                    const float* Wdkv = NULL,
+                                    const float* Wuk  = NULL,
+                                    const float* Wuv  = NULL);
 
 bool uploadTransformerTokenIds(GpuTransformerScratch& scratch,
                                const int* tokenIds, size_t count);

@@ -9356,21 +9356,39 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 			return false;
 		gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
 
-		if (!gpu_gemm_abt_mp(bf16Wk,
-		    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
-		    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-		    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
-		    0.0f, K_l, static_cast<int>(dModelKV)))
-			return false;
-		gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+		// Paradigm shift #76 MLA dispatch: when mlaLatentDim > 0, replace the
+		// standard W_K, W_V projections with the low-rank latent path:
+		//   c = x1 @ Wdkv  ;  K = c @ Wuk  ;  V = c @ Wuv
+		// Otherwise fall through to the standard MHA gemm.
+		const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+		if (mlaDc > 0 && gb.Wdkv.allocated()) {
+			// Allocate / size the per-step c scratch (size T * dC).
+			const size_t cBytes = static_cast<size_t>(T) * static_cast<size_t>(mlaDc);
+			if (gb.mlaC.size() < cBytes) gb.mlaC.allocate(cBytes);
+			if (!gpu::mla_attention_forward_gpu(
+			        x1_l, gb.Wdkv.data(), gb.Wuk.data(), gb.Wuv.data(),
+			        static_cast<int>(T), static_cast<int>(dModel), mlaDc, static_cast<int>(dModelKV),
+			        gb.mlaC.data(), K_l, V_l))
+				return false;
+			gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+			gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+		} else {
+			if (!gpu_gemm_abt_mp(bf16Wk,
+			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
+			    0.0f, K_l, static_cast<int>(dModelKV)))
+				return false;
+			gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
 
-		if (!gpu_gemm_abt_mp(bf16Wv,
-		    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
-		    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-		    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
-		    0.0f, V_l, static_cast<int>(dModelKV)))
-			return false;
-		gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+			if (!gpu_gemm_abt_mp(bf16Wv,
+			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
+			    0.0f, V_l, static_cast<int>(dModelKV)))
+				return false;
+			gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+		}
 
 		if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
 		{
