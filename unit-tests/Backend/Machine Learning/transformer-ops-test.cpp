@@ -2183,6 +2183,7 @@ static void test_mla_full_forward_backward_gpu()
 
 	glades::gpu::GpuBuffer<float> d_h, d_DKV, d_UK, d_UV, d_c, d_K, d_V,
 	                              d_dK, d_dV, d_dh, d_dDKV, d_dUK, d_dUV, d_dc;
+	glades::gpu::GpuBuffer<unsigned short> d_bf16A, d_bf16B;
 	d_h.allocate(T * dH);
 	d_DKV.allocate(dH * dC); d_UK.allocate(dC * dKVtot); d_UV.allocate(dC * dKVtot);
 	d_c.allocate(T * dC); d_K.allocate(T * dKVtot); d_V.allocate(T * dKVtot);
@@ -2190,6 +2191,15 @@ static void test_mla_full_forward_backward_gpu()
 	d_dh.allocate(T * dH); d_dDKV.allocate(dH * dC);
 	d_dUK.allocate(dC * dKVtot); d_dUV.allocate(dC * dKVtot);
 	d_dc.allocate(T * dC);
+	{
+		size_t bf16Need = (size_t)T * dH;
+		if ((size_t)T * dKVtot > bf16Need) bf16Need = (size_t)T * dKVtot;
+		if ((size_t)T * dC     > bf16Need) bf16Need = (size_t)T * dC;
+		if ((size_t)dH * dC    > bf16Need) bf16Need = (size_t)dH * dC;
+		if ((size_t)dC * dKVtot > bf16Need) bf16Need = (size_t)dC * dKVtot;
+		d_bf16A.allocate(bf16Need);
+		d_bf16B.allocate(bf16Need);
+	}
 	d_h.upload(h.data(), T * dH);
 	d_DKV.upload(W_DKV.data(), dH * dC);
 	d_UK.upload(W_UK.data(), dC * dKVtot);
@@ -2211,7 +2221,8 @@ static void test_mla_full_forward_backward_gpu()
 	    d_DKV.data(), d_UK.data(), d_UV.data(),
 	    T, dH, dC, dKVtot,
 	    d_dh.data(), d_dDKV.data(), d_dUK.data(), d_dUV.data(),
-	    d_dc.data());
+	    d_dc.data(),
+	    d_bf16A.data(), d_bf16B.data());
 	ASSERT("mla_attention_backward_gpu ok", ok);
 	cudaDeviceSynchronize();
 
