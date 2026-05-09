@@ -505,5 +505,106 @@ inline unsigned int speculative_verify_K(const float* p_main,
 	return nAcceptedOut + 1u;
 }
 
+// ============================================================================
+// Paradigm shift #97 — DRAFT-VERIFIER-CO-LEARN-DISTILL primitives
+// ============================================================================
+//
+// Builds on #75 SPECULATIVE-DECODING: at each rejected draft token, log the
+// triple (context, draft_distribution, main_distribution); after accumulating
+// rejections, fine-tune the draft via co-learning loss:
+//
+//   L = α · CE(draft, main_argmax) + (1-α) · τ² · KL(draft_τ || main_τ)
+//
+// where τ = temperature, draft_τ = softmax(draft_logits / τ), and similarly
+// for main_τ. Each co-learning round reduces TVD(p_draft, p_main); per #75
+// Theorem 3, this raises acceptance rate.
+
+inline void softmax_with_temperature(const float* logits,
+                                     unsigned int vocab,
+                                     float tau,
+                                     float* probsOut)
+{
+	if (!logits || !probsOut || vocab == 0u) return;
+	const float invTau = 1.0f / (tau > 0.0f ? tau : 1e-6f);
+	float maxL = logits[0] * invTau;
+	for (unsigned int i = 1; i < vocab; ++i)
+		if (logits[i] * invTau > maxL) maxL = logits[i] * invTau;
+	double sum = 0.0;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		const double e = exp(static_cast<double>(logits[i] * invTau - maxL));
+		probsOut[i] = static_cast<float>(e);
+		sum += e;
+	}
+	if (sum <= 0.0) return;
+	const float inv = static_cast<float>(1.0 / sum);
+	for (unsigned int i = 0; i < vocab; ++i)
+		probsOut[i] *= inv;
+}
+
+// KL(p || q) = sum_i p_i log(p_i / q_i)
+inline float kl_divergence(const float* p, const float* q,
+                           unsigned int vocab,
+                           float qFloor = 1e-10f)
+{
+	if (!p || !q || vocab == 0u) return 0.0f;
+	double s = 0.0;
+	for (unsigned int i = 0; i < vocab; ++i)
+	{
+		if (p[i] <= 0.0f) continue;
+		float qi = q[i];
+		if (qi < qFloor) qi = qFloor;
+		s += static_cast<double>(p[i]) *
+		     log(static_cast<double>(p[i]) / static_cast<double>(qi));
+	}
+	return static_cast<float>(s);
+}
+
+// Cross-entropy CE(target_token, draft_distribution) = -log p_draft[target_token]
+inline float cross_entropy_at_token(const float* p_draft,
+                                    unsigned int target_token,
+                                    unsigned int vocab,
+                                    float floor = 1e-10f)
+{
+	if (!p_draft || target_token >= vocab) return 0.0f;
+	float p = p_draft[target_token];
+	if (p < floor) p = floor;
+	return -static_cast<float>(log(static_cast<double>(p)));
+}
+
+// argmax of a distribution
+inline unsigned int argmax_token(const float* p, unsigned int vocab)
+{
+	if (!p || vocab == 0u) return 0u;
+	unsigned int best = 0u;
+	float bestv = p[0];
+	for (unsigned int i = 1; i < vocab; ++i)
+		if (p[i] > bestv) { bestv = p[i]; best = i; }
+	return best;
+}
+
+// Combined co-learning loss for one rejection site.
+//   p_draft_at_tau:  softmax(draft_logits / tau)
+//   p_main_at_tau:   softmax(main_logits / tau)
+//   p_draft_at_one:  softmax(draft_logits) (used for CE term)
+//   p_main_at_one:   softmax(main_logits)  (target_token = argmax(p_main_at_one))
+//   alpha:           CE-vs-KL blend (α=0.3 typical, per #56 SUPER-DISTILL)
+//   tau:             temperature
+//
+// Returns scalar loss = α · CE + (1-α) · τ² · KL.
+inline float co_learn_loss(const float* p_draft_at_tau,
+                           const float* p_main_at_tau,
+                           const float* p_draft_at_one,
+                           const float* p_main_at_one,
+                           unsigned int vocab,
+                           float alpha,
+                           float tau)
+{
+	const unsigned int target = argmax_token(p_main_at_one, vocab);
+	const float ce = cross_entropy_at_token(p_draft_at_one, target, vocab);
+	const float kl = kl_divergence(p_main_at_tau, p_draft_at_tau, vocab);
+	return alpha * ce + (1.0f - alpha) * tau * tau * kl;
+}
+
 } // namespace sampling
 } // namespace glades

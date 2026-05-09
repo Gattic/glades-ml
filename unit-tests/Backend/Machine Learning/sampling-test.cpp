@@ -464,6 +464,175 @@ void SamplingUnitTest()
 		printf("  speedup formula matches Leviathan 2023 Theorem 2\n");
 	}
 
+	// ============================================================
+	// Group COLEARN: Paradigm shift #97 DRAFT-VERIFIER-CO-LEARN
+	// ============================================================
+	// Co-learning loss primitives extending #75. Verifies temperature
+	// softmax, KL, CE, argmax, and the combined loss.
+
+	// --- Test COLEARN-1: temperature softmax ---
+	{
+		printf("-----------------------------------\n");
+		printf("[COLEARN-1] TemperatureSoftmaxBasic\n");
+		printf("-----------------------------------\n");
+		const unsigned int vocab = 4u;
+		float logits[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+		std::vector<float> p1(vocab, 0.0f);
+		std::vector<float> p2(vocab, 0.0f);
+		glades::sampling::softmax_with_temperature(logits, vocab, 1.0f, p1.data());
+		glades::sampling::softmax_with_temperature(logits, vocab, 100.0f, p2.data());
+		double sum1 = 0.0, sum2 = 0.0;
+		for (unsigned int i = 0; i < vocab; ++i) { sum1 += p1[i]; sum2 += p2[i]; }
+		printf("  τ=1.0:   probs = [%.3f, %.3f, %.3f, %.3f]  sum=%.4f\n",
+		       p1[0], p1[1], p1[2], p1[3], sum1);
+		printf("  τ=100:   probs = [%.3f, %.3f, %.3f, %.3f]  sum=%.4f (high τ → flat)\n",
+		       p2[0], p2[1], p2[2], p2[3], sum2);
+		ASSERT("τ=1 sums to 1", std::fabs(sum1 - 1.0) < 1e-5);
+		ASSERT("τ=100 sums to 1", std::fabs(sum2 - 1.0) < 1e-5);
+		// Higher τ → flatter distribution (closer to uniform 0.25)
+		const float spread1 = p1[3] - p1[0];
+		const float spread2 = p2[3] - p2[0];
+		ASSERT("higher τ flattens", spread2 < spread1);
+		printf("  spread τ=1 = %.4f vs τ=100 = %.4f\n", spread1, spread2);
+	}
+
+	// --- Test COLEARN-2: KL identity ---
+	{
+		printf("-----------------------------------\n");
+		printf("[COLEARN-2] KLIdentityAndAsymmetry\n");
+		printf("-----------------------------------\n");
+		std::vector<float> p(4, 0.25f);
+		float kl_pp = glades::sampling::kl_divergence(p.data(), p.data(), 4);
+		printf("  KL(p,p)=%.6f (must be 0)\n", kl_pp);
+		ASSERT("KL(p,p) == 0", std::fabs(kl_pp) < 1e-5);
+
+		float p1[4] = {0.50f, 0.30f, 0.10f, 0.10f};
+		float p2[4] = {0.10f, 0.20f, 0.30f, 0.40f};
+		float kl_12 = glades::sampling::kl_divergence(p1, p2, 4);
+		float kl_21 = glades::sampling::kl_divergence(p2, p1, 4);
+		printf("  KL(p1,p2)=%.4f vs KL(p2,p1)=%.4f (asymmetric, both > 0)\n", kl_12, kl_21);
+		ASSERT("KL(p1,p2) > 0 for distinct dists", kl_12 > 0.01f);
+		ASSERT("KL(p2,p1) > 0 for distinct dists", kl_21 > 0.01f);
+		ASSERT("KL is asymmetric in general", std::fabs(kl_12 - kl_21) > 1e-4f);
+	}
+
+	// --- Test COLEARN-3: CE matches argmax target ---
+	{
+		printf("-----------------------------------\n");
+		printf("[COLEARN-3] CrossEntropyAtArgmaxTarget\n");
+		printf("-----------------------------------\n");
+		float logits[4] = {0.0f, 1.0f, 5.0f, 0.0f};  // peaked on idx 2
+		std::vector<float> p(4, 0.0f);
+		glades::sampling::softmax_with_temperature(logits, 4, 1.0f, p.data());
+		const unsigned int argmaxIdx = glades::sampling::argmax_token(p.data(), 4);
+		ASSERT("argmax of peaked dist", argmaxIdx == 2u);
+		// CE evaluated at argmax should be small (high prob at target)
+		const float ce_at_argmax = glades::sampling::cross_entropy_at_token(p.data(), argmaxIdx, 4);
+		// CE at uniform: -log(0.25) ≈ 1.386
+		const float ce_uniform = -std::log(0.25f);
+		printf("  CE at argmax token: %.4f (must be < CE_uniform=%.4f)\n",
+		       ce_at_argmax, ce_uniform);
+		ASSERT("CE at argmax < uniform", ce_at_argmax < ce_uniform);
+	}
+
+	// --- Test COLEARN-4: TVD shrinks under co-learning gradient (acceptance rate climbs) ---
+	{
+		printf("-----------------------------------\n");
+		printf("[COLEARN-4] TVDShrinksUnderCoLearningGradient\n");
+		printf("-----------------------------------\n");
+		// Simulate: draft starts far from main; we apply a "gradient" step
+		// that shrinks the gap. The co-learning loss should decrease, and
+		// TVD should decrease (so acceptance rate increases per #75 Theorem 3).
+		const unsigned int vocab = 8u;
+		std::vector<float> p_draft(vocab, 0.0f);
+		std::vector<float> p_main(vocab, 0.0f);
+		// p_main: peaked on first half
+		for (unsigned int i = 0; i < vocab; ++i)
+			p_main[i] = (i < vocab/2) ? 0.18f : 0.07f;
+		// renormalize
+		{
+			double s = 0.0;
+			for (unsigned int i = 0; i < vocab; ++i) s += p_main[i];
+			for (unsigned int i = 0; i < vocab; ++i) p_main[i] /= static_cast<float>(s);
+		}
+		// p_draft: peaked on second half (deliberately mismatched)
+		for (unsigned int i = 0; i < vocab; ++i)
+			p_draft[i] = (i >= vocab/2) ? 0.18f : 0.07f;
+		{
+			double s = 0.0;
+			for (unsigned int i = 0; i < vocab; ++i) s += p_draft[i];
+			for (unsigned int i = 0; i < vocab; ++i) p_draft[i] /= static_cast<float>(s);
+		}
+
+		// Initial TVD and KL
+		float tvd0 = glades::sampling::spec_total_variation_distance(p_main.data(), p_draft.data(), vocab);
+		float kl0 = glades::sampling::kl_divergence(p_main.data(), p_draft.data(), vocab);
+		printf("  initial: TVD=%.4f, KL=%.4f, α_bound=%.4f\n",
+		       tvd0, kl0, 1.0f - tvd0);
+
+		// Simulate one "co-learning step": move p_draft toward p_main by a fraction.
+		// (In real training this would be a gradient step on draft logits with
+		//  the co-learn loss; here we apply a lerp directly to verify the
+		//  acceptance-rate lower bound increases as TVD decreases.)
+		const float blend = 0.5f;  // 50% interpolation toward main
+		std::vector<float> p_draft_after(vocab, 0.0f);
+		for (unsigned int i = 0; i < vocab; ++i)
+			p_draft_after[i] = blend * p_main[i] + (1.0f - blend) * p_draft[i];
+
+		float tvd1 = glades::sampling::spec_total_variation_distance(p_main.data(), p_draft_after.data(), vocab);
+		float kl1 = glades::sampling::kl_divergence(p_main.data(), p_draft_after.data(), vocab);
+		printf("  after co-learn: TVD=%.4f, KL=%.4f, α_bound=%.4f\n",
+		       tvd1, kl1, 1.0f - tvd1);
+		ASSERT("TVD decreases under co-learn", tvd1 < tvd0);
+		ASSERT("KL decreases under co-learn", kl1 < kl0);
+		ASSERT("α_bound increases under co-learn", (1.0f - tvd1) > (1.0f - tvd0));
+		const float deltaAccept = (1.0f - tvd1) - (1.0f - tvd0);
+		printf("  Δα_bound = +%.4f after one 50%% blend step\n", deltaAccept);
+	}
+
+	// --- Test COLEARN-5: combined co-learn loss is non-negative and decreases ---
+	{
+		printf("-----------------------------------\n");
+		printf("[COLEARN-5] CoLearnLossNonNegativeAndDecreasing\n");
+		printf("-----------------------------------\n");
+		const unsigned int vocab = 8u;
+		std::vector<float> draft_logits(vocab), main_logits(vocab);
+		unsigned int seed = 0xC01EAA01u;
+		for (unsigned int i = 0; i < vocab; ++i)
+		{
+			// pseudo-random deterministic logits
+			seed = seed * 1103515245u + 12345u;
+			draft_logits[i] = ((seed >> 16) & 0xFF) / 255.0f - 0.5f;
+			seed = seed * 1103515245u + 12345u;
+			main_logits[i] = ((seed >> 16) & 0xFF) / 255.0f + 0.5f;
+		}
+
+		std::vector<float> pd_tau(vocab), pm_tau(vocab), pd_one(vocab), pm_one(vocab);
+		const float alpha = 0.3f;
+		const float tau = 2.0f;
+		glades::sampling::softmax_with_temperature(draft_logits.data(), vocab, tau, pd_tau.data());
+		glades::sampling::softmax_with_temperature(main_logits.data(), vocab, tau, pm_tau.data());
+		glades::sampling::softmax_with_temperature(draft_logits.data(), vocab, 1.0f, pd_one.data());
+		glades::sampling::softmax_with_temperature(main_logits.data(), vocab, 1.0f, pm_one.data());
+
+		float loss_before = glades::sampling::co_learn_loss(
+		    pd_tau.data(), pm_tau.data(), pd_one.data(), pm_one.data(),
+		    vocab, alpha, tau);
+		printf("  initial co-learn loss = %.4f (must be >= 0)\n", loss_before);
+		ASSERT("co-learn loss non-negative", loss_before >= 0.0f);
+
+		// Move draft toward main and recompute
+		for (unsigned int i = 0; i < vocab; ++i)
+			draft_logits[i] = 0.5f * draft_logits[i] + 0.5f * main_logits[i];
+		glades::sampling::softmax_with_temperature(draft_logits.data(), vocab, tau, pd_tau.data());
+		glades::sampling::softmax_with_temperature(draft_logits.data(), vocab, 1.0f, pd_one.data());
+		float loss_after = glades::sampling::co_learn_loss(
+		    pd_tau.data(), pm_tau.data(), pd_one.data(), pm_one.data(),
+		    vocab, alpha, tau);
+		printf("  after move:       loss = %.4f (must be < initial)\n", loss_after);
+		ASSERT("co-learn loss decreases as draft → main", loss_after < loss_before);
+	}
+
 	printf("============================================================\n");
 	printf("All Sampling Tests Passed\n");
 	printf("============================================================\n");
