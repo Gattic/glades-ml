@@ -231,24 +231,58 @@ plus activations, **a 1B-class flagship config now plausibly fits in
 ~11 GB on a 16 GB GPU** — the conjecture from the original
 recommendation.
 
-### Where the actual 1B+ ceiling still hits
+### Where the actual 1B+ ceiling hits — and the fix
 
 A 500M-class probe (d=1536, L=24, heads=12, dff=4096, ~530M params)
 with the new int8+FACE stack ran cleanly through CPU init but the
 training step OOMed on a **3.2 GB GPU scratch buffer allocation**
 (`cudaMalloc(805306368 floats, 3221225472 bytes) failed: out of
-memory`).  Halving T from 4096 → 2048 did not resolve it (still
-silently failed in the training-step kernel without stderr trace).
+memory`).
 
-The scratch buffer is in the training-step path (eval forward
-succeeded, training did not) and is independent of Adam state size.
-Likely candidates: (a) sampled-softmax negatives buffer at
-T·negatives·dModel sizes, (b) attention backward scratch_S, (c) the
-BitNet QAT FFN W2 scratch which is `T·dFF/32` bits + `[T, dModel]`
-popcount accumulators per block × layers.
+**Root cause identified** (via `GLADES_LOG_GPU_ALLOC=1` instrumentation
+added to `gpu_buffer.cu` in this branch).  At 165M-class the largest
+single GPU allocation is **1408 MB** for `GpuTransformerScratch::ff1`,
+sized `nLayers × T × ff1Width`.  The trainer hardcodes
+`ffnKind = FFN_SWIGLU` (line 907 of `glades-trainer/trainer/main.cpp`)
+which sets `ff1Width = 2 × dFF`.  At 500M scale (L=24, T=4096,
+dFF=4096) this becomes `24 × 4096 × 8192 = 805,306,368 floats ≈ 3.07 GB`
+— exactly the failed allocation.
 
-This is the next bottleneck after Adam state — separate engineering
-work to identify and either share, recompute, or quantize.
+**Fix shipped:** `--ffn-mlp` trainer flag overrides the SwiGLU default
+back to `FFN_MLP`, which makes `ff1Width = dFF` instead.  At 500M:
+`24 × 4096 × 4096 = 402M floats = 1.6 GB` — fits comfortably alongside
+the rest of the scratch.  Trade: SwiGLU is a slightly better activation
+than ReLU/GELU on convergence-per-step, so dropping it costs maybe
+0.05 nat over a long run.  At the current 16 GB GPU ceiling, the cost
+is acceptable to unlock 500M+ training.
+
+This is in addition to the int8 Adam + FACE wins above.  Stack at
+500M:
+- Adam state (int8 + FACE on tokE): ~1.6 GB
+- BF16 weights: 1 GB
+- FP32 grads: 2 GB
+- ff1 scratch (MLP mode): 1.6 GB
+- Other scratch + working buffers: ~3 GB
+- **Total: ~9 GB / 16 GB at 500M**
+
+500M-class flagship + this stack is now plausible.  A more permanent
+fix would be to gradient-checkpoint the FFN intermediate (recompute
+`ff1` on backward instead of storing all L layers), which would unlock
+1B+ at the same VRAM budget without dropping SwiGLU.
+
+### Other large allocations (165M-class, observed)
+
+| Size | Buffer | Formula |
+|---|---|---|
+| 1408 MB | `ff1` (SwiGLU) | L × T × 2·dFF |
+| 704 MB | `ff1Act` | L × T × dFF |
+| 512 MB | (one of the BF16 staging) | T × max(...) × 2 |
+| 500 MB ×3 | `logits`, `probs`, `dLogits` | T × vocabSize |
+| 256 MB ×10 | `x1, Q, attnConcat, attnOut, hAfterAttn, x2, ffOut, hAfterFF` (both FFN kinds), and fwd/bwd | L × T × dModel |
+
+The activation stash (10× `L × T × dModel` buffers, 2.5 GB at 165M,
+scales as `L × T × dModel`) is the next-largest target.  Gradient
+checkpointing would cut this by `~sqrt(L)` ≈ 4× at L=16.
 
 ### First-forward kernel-JIT wall
 

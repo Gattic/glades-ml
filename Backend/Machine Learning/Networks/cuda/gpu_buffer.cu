@@ -50,6 +50,17 @@ bool GpuBuffer<float>::allocate(size_t count)
 	if (count == 0)
 		return true;
 
+	// Diagnostic: when GLADES_LOG_GPU_ALLOC=1, print every >50M-float
+	// (200 MB) cudaMalloc as it happens.  Useful for tracing which scratch
+	// buffer is the binding constraint at the next param-ceiling lift.
+	{
+		static int s_log = -1;
+		if (s_log < 0) { const char* e = getenv("GLADES_LOG_GPU_ALLOC"); s_log = (e && *e == '1') ? 1 : 0; }
+		if (s_log && count > 50ULL * 1024ULL * 1024ULL)
+			fprintf(stderr, "[glades-cuda-alloc] %zu floats (%.2f MB)\n",
+			        count, (double)(count * sizeof(float)) / (1024.0 * 1024.0));
+	}
+
 	cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&d_ptr), count * sizeof(float));
 	if (err != cudaSuccess)
 	{
