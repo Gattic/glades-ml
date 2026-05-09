@@ -48,6 +48,12 @@ using glades::transformer_ops::neural_cache_compression_ratio;
 using glades::transformer_ops::moe_topk_router;
 using glades::transformer_ops::moe_active_fraction;
 using glades::transformer_ops::moe_combine_topk_outputs;
+using glades::transformer_ops::phoenix158_pack_ternary;
+using glades::transformer_ops::phoenix158_unpack_ternary;
+using glades::transformer_ops::phoenix158_ternary_gemm;
+using glades::transformer_ops::phoenix158_compression_ratio_fp32;
+using glades::transformer_ops::phoenix158_compression_ratio_bf16;
+using glades::transformer_ops::phoenix158_zero_fraction;
 using glades::transformer_kernels::silu_forward_buf;
 using glades::transformer_kernels::gelu_forward_buf;
 using glades::transformer_kernels::silu_backward_buf;
@@ -1961,6 +1967,103 @@ static void test_moe_dense_recovery()
 }
 
 // ============================================================
+// Group L: Paradigm shift #73 PHOENIX-1.58BIT (ternary)
+// ============================================================
+// Ternary {-1, 0, +1} weights at 2 bits/weight (16x vs FP32, 8x vs BF16).
+
+static void test_phoenix158_pack_unpack_roundtrip()
+{
+	printf("  [L1] Phoenix158TernaryPackUnpack ...\n");
+	const unsigned int n = 13u;  // odd, exercises padding
+	float W[13] = {1.0f, 0.0f, -1.0f, 0.5f, -0.5f, 0.001f, -0.001f,
+	               1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f};
+	unsigned char packed[(13 + 3) / 4] = {0u, 0u, 0u, 0u};
+	float W_back[13] = {0};
+	phoenix158_pack_ternary(W, n, packed, 0.01f);
+	phoenix158_unpack_ternary(packed, n, W_back);
+	// Expected: snap to ternary
+	float expected[13] = {1.0f, 0.0f, -1.0f, 1.0f, -1.0f, 0.0f, 0.0f,
+	                      1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f};
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		ASSERT("ternary pack/unpack round trip", W_back[i] == expected[i]);
+	}
+	printf("    PASSED (n=%u, %u bytes)\n", n, (unsigned int)sizeof(packed));
+}
+
+static void test_phoenix158_compression_ratio()
+{
+	printf("  [L2] Phoenix158CompressionRatio ...\n");
+	float r32 = phoenix158_compression_ratio_fp32();
+	float r16 = phoenix158_compression_ratio_bf16();
+	printf("    vs FP32: %.1fx; vs BF16: %.1fx\n", r32, r16);
+	ASSERT("16x vs FP32", std::fabs(r32 - 16.0f) < 1e-5f);
+	ASSERT("8x vs BF16", std::fabs(r16 - 8.0f) < 1e-5f);
+	printf("    PASSED\n");
+}
+
+static void test_phoenix158_ternary_gemm_correctness()
+{
+	printf("  [L3] Phoenix158TernaryGEMMCorrectness ...\n");
+	const unsigned int M = 4u, N = 6u, K = 12u;
+	std::vector<float> X(static_cast<size_t>(M) * K);
+	std::vector<float> W(static_cast<size_t>(K) * N);
+	unsigned int seed = 0xBA5E5EEDu;
+	fill_random(X.data(), M * K, seed);
+	for (size_t i = 0; i < W.size(); ++i)
+	{
+		const float r = pseudo_rand(seed);
+		// Three-bucket: ~1/3 each
+		if (r > 0.33f) W[i] = 1.0f;
+		else if (r < -0.33f) W[i] = -1.0f;
+		else W[i] = 0.0f;
+	}
+
+	std::vector<unsigned char> packed((K * N + 3u) / 4u, 0u);
+	phoenix158_pack_ternary(W.data(), K * N, packed.data(), 0.5f);
+
+	std::vector<float> Y_ref(static_cast<size_t>(M) * N, 0.0f);
+	for (unsigned int m = 0; m < M; ++m)
+		for (unsigned int n = 0; n < N; ++n)
+		{
+			double s = 0.0;
+			for (unsigned int k = 0; k < K; ++k)
+				s += static_cast<double>(X[m * K + k]) * static_cast<double>(W[k * N + n]);
+			Y_ref[m * N + n] = static_cast<float>(s);
+		}
+
+	std::vector<float> Y_tern(static_cast<size_t>(M) * N, 0.0f);
+	phoenix158_ternary_gemm(X.data(), packed.data(), M, N, K, Y_tern.data());
+
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < Y_ref.size(); ++i)
+		maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(Y_ref[i] - Y_tern[i])));
+	printf("    M=%u N=%u K=%u: max-abs-diff=%.3e\n", M, N, K, maxAbs);
+	ASSERT("ternary GEMM matches reference", maxAbs < 1e-4);
+
+	float zeroFrac = phoenix158_zero_fraction(packed.data(), K * N);
+	printf("    zero fraction = %.3f (random ~1/3 = 0.333)\n", zeroFrac);
+	ASSERT("ternary has nonzero zero fraction", zeroFrac > 0.05f);
+	printf("    PASSED\n");
+}
+
+static void test_phoenix158_vs_phoenix1bit_storage()
+{
+	printf("  [L4] Phoenix158VsPhoenix1BitStorage ...\n");
+	const unsigned int n = 4096u;
+	const size_t bytes_158 = (n + 3u) / 4u;       // 2 bits per weight
+	const size_t bytes_1bit = (n + 7u) / 8u;      // 1 bit per weight
+	const size_t bytes_fp32 = n * sizeof(float);  // 32 bits per weight
+	printf("    n=%u: 1-bit=%zuB, 1.58-bit=%zuB, FP32=%zuB\n",
+	       n, bytes_1bit, bytes_158, bytes_fp32);
+	printf("    1.58-bit is %.2fx vs 1-bit (price of allowing zero) and %.1fx vs FP32\n",
+	       (double)bytes_158 / bytes_1bit, (double)bytes_fp32 / bytes_158);
+	ASSERT("1.58-bit ~2x bytes vs 1-bit", bytes_158 == 2u * bytes_1bit);
+	ASSERT("1.58-bit 16x vs FP32", bytes_fp32 / bytes_158 == 16u);
+	printf("    PASSED (zero coding adds 2x storage cost over pure binary)\n");
+}
+
+// ============================================================
 // Group H: GPU parity for paradigms #74/#76/#78
 // ============================================================
 // CPU vs GPU max-abs-diff comparisons + speedup measurement.
@@ -2391,6 +2494,13 @@ void TransformerOpsUnitTest()
 	test_moe_active_fraction();
 	test_moe_combine_correctness();
 	test_moe_dense_recovery();
+
+	// Group L: Paradigm shift #73 PHOENIX-1.58BIT (ternary)
+	printf("--- Group L: Ternary 1.58-bit GEMM (paradigm #73) ---\n");
+	test_phoenix158_pack_unpack_roundtrip();
+	test_phoenix158_compression_ratio();
+	test_phoenix158_ternary_gemm_correctness();
+	test_phoenix158_vs_phoenix1bit_storage();
 
 	// Group H: GPU parity for #74/#76/#78
 #ifdef GLADES_HAVE_CUDA

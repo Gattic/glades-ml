@@ -2391,5 +2391,109 @@ inline void moe_combine_topk_outputs(const float* expert_outputs,
 	}
 }
 
+// ============================================================================
+// Paradigm shift #73 — PHOENIX-1.58BIT (ternary weights, BitNet b1.58)
+// ============================================================================
+//
+// Ternary {-1, 0, +1} weights at 1.58 bits per weight (log₂ 3). Two bits per
+// weight in storage (with 1 bit padding) gives 16x compression vs FP32 on
+// average. The intermediate "0" value provides sparsity not present in #74's
+// binary {-1, +1}.
+//
+// Storage: 2 bits per weight, packed 4 weights per byte:
+//   00 → 0
+//   01 → +1
+//   10 → -1
+//   11 → reserved (unused)
+
+inline void phoenix158_pack_ternary(const float* W,
+                                    unsigned int n,
+                                    unsigned char* out_2bit,
+                                    float zero_threshold = 0.01f)
+{
+	if (!W || !out_2bit || n == 0u) return;
+	const size_t bytes = (n + 3u) / 4u;
+	for (size_t b = 0; b < bytes; ++b) out_2bit[b] = 0u;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		unsigned char code = 0u;
+		if (W[i] > zero_threshold) code = 1u;       // +1
+		else if (W[i] < -zero_threshold) code = 2u; // -1
+		// else 0 (encoded as 00)
+		out_2bit[i >> 2] |= (unsigned char)(code << ((i & 3u) << 1u));
+	}
+}
+
+inline void phoenix158_unpack_ternary(const unsigned char* in_2bit,
+                                      unsigned int n,
+                                      float* W_out)
+{
+	if (!in_2bit || !W_out || n == 0u) return;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const unsigned char code = (in_2bit[i >> 2] >> ((i & 3u) << 1u)) & 3u;
+		if (code == 1u) W_out[i] = 1.0f;
+		else if (code == 2u) W_out[i] = -1.0f;
+		else W_out[i] = 0.0f;
+	}
+}
+
+// Compression ratio for #73 vs FP32 (1.58 bits per weight in entropy; 2 bits
+// in our packed storage, so the practical ratio is 32/2 = 16x).
+inline float phoenix158_compression_ratio_fp32()
+{
+	return 16.0f;  // 32 bits FP32 / 2 bits packed
+}
+
+inline float phoenix158_compression_ratio_bf16()
+{
+	return 8.0f;   // 16 bits BF16 / 2 bits packed
+}
+
+// Ternary GEMM: Y = X · W_ternary. Per-output algorithm:
+//   y[m,n] = Σ_{k : W[k,n] = +1} X[m,k] - Σ_{k : W[k,n] = -1} X[m,k]
+// Zero-coded weights skip naturally (no contribution).
+inline void phoenix158_ternary_gemm(const float* X,
+                                    const unsigned char* W_2bit,
+                                    unsigned int M,
+                                    unsigned int N,
+                                    unsigned int K,
+                                    float* Y)
+{
+	if (!X || !W_2bit || !Y || M == 0u || N == 0u || K == 0u) return;
+	for (unsigned int m = 0; m < M; ++m)
+	{
+		const float* xm = X + static_cast<size_t>(m) * K;
+		float* ym = Y + static_cast<size_t>(m) * N;
+		for (unsigned int n = 0; n < N; ++n)
+		{
+			float pos = 0.0f;
+			float neg = 0.0f;
+			for (unsigned int k = 0; k < K; ++k)
+			{
+				const size_t bitIdx = static_cast<size_t>(k) * static_cast<size_t>(N) +
+				                      static_cast<size_t>(n);
+				const unsigned char code = (W_2bit[bitIdx >> 2] >> ((bitIdx & 3u) << 1u)) & 3u;
+				if (code == 1u) pos += xm[k];
+				else if (code == 2u) neg += xm[k];
+			}
+			ym[n] = pos - neg;
+		}
+	}
+}
+
+// Ternary sparsity: count zero-weight fraction (not just nominal "skip").
+inline float phoenix158_zero_fraction(const unsigned char* W_2bit, unsigned int n)
+{
+	if (!W_2bit || n == 0u) return 0.0f;
+	unsigned int zeros = 0u;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const unsigned char code = (W_2bit[i >> 2] >> ((i & 3u) << 1u)) & 3u;
+		if (code == 0u) ++zeros;
+	}
+	return static_cast<float>(zeros) / static_cast<float>(n);
+}
+
 } // namespace transformer_ops
 } // namespace glades
