@@ -12298,11 +12298,50 @@ if (ad_.valid) { \
 			// When adamStateBf16 or adamStateInt8 is enabled, the 9 large
 			// weight matrices were excluded from the batched Adam above. Run
 			// per-matrix Adam for each.  Math is identical up to the
-			// quantization noise on the m, v EMAs; weight + grad remain FP32.
+			// quantization noise on the m, v EMAs; weight + grad remain FP32
+			// (or BF16 when MixedPrecisionConfig::gradStorageBf16 is set —
+			// the cast pass below mirrors each FP32 grad to its BF16 buffer
+			// just before dispatch, then the bf16grad Adam variants read
+			// from the BF16 mirror).
+			const bool useBf16Grads_ = trainingConfig.mixedPrecision.gradStorageBf16;
 			if (useBf16AdamState)
 			{
 				const float bigLrScale = lrScheduleMultiplier * gpuExtraLRMult;
 				const float gradScaleEff = invBatch * gradScale;
+
+				// Cast every FP32 grad to its BF16 mirror once per Adam step
+				// when bf16-grad mode is active.  Persistent FP32 grads still
+				// exist (kept for grad-norm + clip + this cast); freeing them
+				// is the next phase of memory work — see
+				// research/PATH_TO_1.84B_FLAGSHIP.md §1.
+				if (useBf16Grads_)
+				{
+					if (tokenLM)
+					{
+						gpu::cast_f32_to_bf16(gpuTransformerWeights->gTokE.data(),
+						                     gpuTransformerWeights->gTokE_bf16.data(),
+						                     gpuTransformerWeights->gTokE.size());
+					}
+					else
+					{
+						gpu::cast_f32_to_bf16(gpuTransformerWeights->gWIn.data(),
+						                     gpuTransformerWeights->gWIn_bf16.data(),
+						                     gpuTransformerWeights->gWIn.size());
+						gpu::cast_f32_to_bf16(gpuTransformerWeights->gWOut.data(),
+						                     gpuTransformerWeights->gWOut_bf16.data(),
+						                     gpuTransformerWeights->gWOut.size());
+					}
+					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					{
+						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+						gpu::cast_f32_to_bf16(gb.gWq.data(), gb.gWq_bf16.data(), gb.gWq.size());
+						gpu::cast_f32_to_bf16(gb.gWk.data(), gb.gWk_bf16.data(), gb.gWk.size());
+						gpu::cast_f32_to_bf16(gb.gWv.data(), gb.gWv_bf16.data(), gb.gWv.size());
+						gpu::cast_f32_to_bf16(gb.gWo.data(), gb.gWo_bf16.data(), gb.gWo.size());
+						gpu::cast_f32_to_bf16(gb.gW1.data(), gb.gW1_bf16.data(), gb.gW1.size());
+						gpu::cast_f32_to_bf16(gb.gW2.data(), gb.gW2_bf16.data(), gb.gW2.size());
+					}
+				}
 #define GLADES_BF16_ADAM_BIG(W, gW, vBf, v2Bf, baseLr_, wd_) do { \
 	const int sz_ = static_cast<int>((W).size()); \
 	if (sz_ > 0 && (vBf).allocated() && (v2Bf).allocated()) { \
@@ -12318,6 +12357,26 @@ if (ad_.valid) { \
 		gpu::adam_update_int8_state((W).data(), (gW).data(), \
 		    (vI8).data(), (v2I8).data(), \
 		    (vSc).data(), (v2Sc).data(), \
+		    (baseLr_) * bigLrScale, beta1, beta2, adamEps, \
+		    (wd_), gradScaleEff, stepInt, sz_); \
+	} \
+} while (0)
+#define GLADES_BF16_ADAM_BIG_BF16GRAD(W, gWb16, vBf, v2Bf, baseLr_, wd_) do { \
+	const int sz_ = static_cast<int>((W).size()); \
+	if (sz_ > 0 && (vBf).allocated() && (v2Bf).allocated() && (gWb16).allocated()) { \
+		gpu::adam_update_bf16_state_bf16grad((W).data(), (gWb16).data(), \
+		    (vBf).data(), (v2Bf).data(), \
+		    (baseLr_) * bigLrScale, beta1, beta2, adamEps, \
+		    (wd_), gradScaleEff, stepInt, sz_); \
+	} \
+} while (0)
+#define GLADES_INT8_ADAM_BIG_BF16GRAD(W, gWb16, vI8, v2I8, vSc, v2Sc, baseLr_, wd_) do { \
+	const int sz_ = static_cast<int>((W).size()); \
+	if (sz_ > 0 && (vI8).allocated() && (v2I8).allocated() && (gWb16).allocated()) { \
+		gpu::adam_update_int8_state_bf16grad((W).data(), (gWb16).data(), \
+		    (vI8).data(), (v2I8).data(), \
+		    (vSc).data(), (v2Sc).data(), \
+		    gpuTransformerScratch->gradScratchFp32.data(), \
 		    (baseLr_) * bigLrScale, beta1, beta2, adamEps, \
 		    (wd_), gradScaleEff, stepInt, sz_); \
 	} \
@@ -12369,6 +12428,14 @@ if (ad_.valid) { \
 							    gpuTransformerWeights->faceGFHat.data(),
 							    V, m, lrEff, fEps);
 						}
+					} else if (useInt8AdamState && useBf16Grads_) {
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gpuTransformerWeights->tokE,
+						                              gpuTransformerWeights->gTokE_bf16,
+						                              gpuTransformerWeights->vTokE_int8,
+						                              gpuTransformerWeights->v2TokE_int8,
+						                              gpuTransformerWeights->vTokEScale,
+						                              gpuTransformerWeights->v2TokEScale,
+						                              lr0Base, wd0);
 					} else if (useInt8AdamState) {
 						GLADES_INT8_ADAM_BIG(gpuTransformerWeights->tokE,
 						                     gpuTransformerWeights->gTokE,
@@ -12377,6 +12444,12 @@ if (ad_.valid) { \
 						                     gpuTransformerWeights->vTokEScale,
 						                     gpuTransformerWeights->v2TokEScale,
 						                     lr0Base, wd0);
+					} else if (useBf16Grads_) {
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gpuTransformerWeights->tokE,
+						                              gpuTransformerWeights->gTokE_bf16,
+						                              gpuTransformerWeights->vTokE_bf16,
+						                              gpuTransformerWeights->v2TokE_bf16,
+						                              lr0Base, wd0);
 					} else {
 						GLADES_BF16_ADAM_BIG(gpuTransformerWeights->tokE,
 						                     gpuTransformerWeights->gTokE,
@@ -12389,7 +12462,15 @@ if (ad_.valid) { \
 				{
 					const float lr0Base = skeleton->getLearningRate(0u);
 					const float wd0 = skeleton->getWeightDecay2(0u);
-					if (useInt8AdamState) {
+					if (useInt8AdamState && useBf16Grads_) {
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gpuTransformerWeights->WIn,
+						                              gpuTransformerWeights->gWIn_bf16,
+						                              gpuTransformerWeights->vWIn_int8,
+						                              gpuTransformerWeights->v2WIn_int8,
+						                              gpuTransformerWeights->vWInScale,
+						                              gpuTransformerWeights->v2WInScale,
+						                              lr0Base, wd0);
+					} else if (useInt8AdamState) {
 						GLADES_INT8_ADAM_BIG(gpuTransformerWeights->WIn,
 						                     gpuTransformerWeights->gWIn,
 						                     gpuTransformerWeights->vWIn_int8,
@@ -12397,6 +12478,12 @@ if (ad_.valid) { \
 						                     gpuTransformerWeights->vWInScale,
 						                     gpuTransformerWeights->v2WInScale,
 						                     lr0Base, wd0);
+					} else if (useBf16Grads_) {
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gpuTransformerWeights->WIn,
+						                              gpuTransformerWeights->gWIn_bf16,
+						                              gpuTransformerWeights->vWIn_bf16,
+						                              gpuTransformerWeights->v2WIn_bf16,
+						                              lr0Base, wd0);
 					} else {
 						GLADES_BF16_ADAM_BIG(gpuTransformerWeights->WIn,
 						                     gpuTransformerWeights->gWIn,
@@ -12406,7 +12493,15 @@ if (ad_.valid) { \
 					}
 					const float lrOutBase = skeleton->getLearningRate(nLayers);
 					const float wdOut = skeleton->getWeightDecay2(nLayers);
-					if (useInt8AdamState) {
+					if (useInt8AdamState && useBf16Grads_) {
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gpuTransformerWeights->WOut,
+						                              gpuTransformerWeights->gWOut_bf16,
+						                              gpuTransformerWeights->vWOut_int8,
+						                              gpuTransformerWeights->v2WOut_int8,
+						                              gpuTransformerWeights->vWOutScale,
+						                              gpuTransformerWeights->v2WOutScale,
+						                              lrOutBase, wdOut);
+					} else if (useInt8AdamState) {
 						GLADES_INT8_ADAM_BIG(gpuTransformerWeights->WOut,
 						                     gpuTransformerWeights->gWOut,
 						                     gpuTransformerWeights->vWOut_int8,
@@ -12414,6 +12509,12 @@ if (ad_.valid) { \
 						                     gpuTransformerWeights->vWOutScale,
 						                     gpuTransformerWeights->v2WOutScale,
 						                     lrOutBase, wdOut);
+					} else if (useBf16Grads_) {
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gpuTransformerWeights->WOut,
+						                              gpuTransformerWeights->gWOut_bf16,
+						                              gpuTransformerWeights->vWOut_bf16,
+						                              gpuTransformerWeights->v2WOut_bf16,
+						                              lrOutBase, wdOut);
 					} else {
 						GLADES_BF16_ADAM_BIG(gpuTransformerWeights->WOut,
 						                     gpuTransformerWeights->gWOut,
@@ -12427,13 +12528,27 @@ if (ad_.valid) { \
 					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
 					const float lrBase = skeleton->getLearningRate(bli + 1u);
 					const float wdBase = skeleton->getWeightDecay2(bli + 1u);
-					if (useInt8AdamState) {
+					if (useInt8AdamState && useBf16Grads_) {
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wq, gb.gWq_bf16, gb.vWq_int8, gb.v2Wq_int8, gb.vWqScale, gb.v2WqScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wk, gb.gWk_bf16, gb.vWk_int8, gb.v2Wk_int8, gb.vWkScale, gb.v2WkScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wv, gb.gWv_bf16, gb.vWv_int8, gb.v2Wv_int8, gb.vWvScale, gb.v2WvScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wo, gb.gWo_bf16, gb.vWo_int8, gb.v2Wo_int8, gb.vWoScale, gb.v2WoScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.W1, gb.gW1_bf16, gb.vW1_int8, gb.v2W1_int8, gb.vW1Scale, gb.v2W1Scale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.W2, gb.gW2_bf16, gb.vW2_int8, gb.v2W2_int8, gb.vW2Scale, gb.v2W2Scale, lrBase, wdBase);
+					} else if (useInt8AdamState) {
 						GLADES_INT8_ADAM_BIG(gb.Wq, gb.gWq, gb.vWq_int8, gb.v2Wq_int8, gb.vWqScale, gb.v2WqScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG(gb.Wk, gb.gWk, gb.vWk_int8, gb.v2Wk_int8, gb.vWkScale, gb.v2WkScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG(gb.Wv, gb.gWv, gb.vWv_int8, gb.v2Wv_int8, gb.vWvScale, gb.v2WvScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG(gb.Wo, gb.gWo, gb.vWo_int8, gb.v2Wo_int8, gb.vWoScale, gb.v2WoScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG(gb.W1, gb.gW1, gb.vW1_int8, gb.v2W1_int8, gb.vW1Scale, gb.v2W1Scale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG(gb.W2, gb.gW2, gb.vW2_int8, gb.v2W2_int8, gb.vW2Scale, gb.v2W2Scale, lrBase, wdBase);
+					} else if (useBf16Grads_) {
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.Wq, gb.gWq_bf16, gb.vWq_bf16, gb.v2Wq_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.Wk, gb.gWk_bf16, gb.vWk_bf16, gb.v2Wk_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.Wv, gb.gWv_bf16, gb.vWv_bf16, gb.v2Wv_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.Wo, gb.gWo_bf16, gb.vWo_bf16, gb.v2Wo_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.W1, gb.gW1_bf16, gb.vW1_bf16, gb.v2W1_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.W2, gb.gW2_bf16, gb.vW2_bf16, gb.v2W2_bf16, lrBase, wdBase);
 					} else {
 						GLADES_BF16_ADAM_BIG(gb.Wq, gb.gWq, gb.vWq_bf16, gb.v2Wq_bf16, lrBase, wdBase);
 						GLADES_BF16_ADAM_BIG(gb.Wk, gb.gWk, gb.vWk_bf16, gb.v2Wk_bf16, lrBase, wdBase);
@@ -12447,6 +12562,8 @@ if (ad_.valid) { \
 				// training loop's clearGrads; no explicit zeroing needed here.
 #undef GLADES_BF16_ADAM_BIG
 #undef GLADES_INT8_ADAM_BIG
+#undef GLADES_BF16_ADAM_BIG_BF16GRAD
+#undef GLADES_INT8_ADAM_BIG_BF16GRAD
 			}
 				if (gpuUseGeode)
 				{

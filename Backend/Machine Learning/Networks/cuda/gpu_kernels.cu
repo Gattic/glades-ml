@@ -1300,6 +1300,84 @@ bool adam_update_bf16_kahan_state(float* param, const float* grad,
 }
 
 // ---------------------------------------------------------------------------
+// BF16-grad variants — same Adam math as above but read the gradient from a
+// BF16 buffer instead of FP32.  Used when MixedPrecisionConfig::gradStorageBf16
+// is true (paradigm-stack at ≥500M); halves grad-buffer VRAM at the cost of
+// BF16's 7-bit mantissa quantization noise on each Adam step (averaged out
+// by the EMA in m, v).
+// ---------------------------------------------------------------------------
+namespace {
+__global__ void adam_update_bf16_state_bf16grad_kernel(
+    float* __restrict__ param,
+    const uint16_t* __restrict__ grad_bf16,
+    uint16_t* __restrict__ m_bf16,
+    uint16_t* __restrict__ v_bf16,
+    uint16_t* __restrict__ c_bf16,   // Kahan compensation (nullable)
+    float lr, float beta1, float beta2,
+    float eps, float weightDecay,
+    float gradScale,
+    int step, int n)
+{
+	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	const float g = bf16_load_as_f32(grad_bf16[idx]) * gradScale;
+
+	if (weightDecay != 0.0f)
+		param[idx] -= lr * weightDecay * param[idx];
+
+	const float m_old = bf16_load_as_f32(m_bf16[idx]);
+	const float v_old = bf16_load_as_f32(v_bf16[idx]);
+
+	const float m_new = beta1 * m_old + (1.0f - beta1) * g;
+
+	float v_new;
+	uint16_t v_new_bf16_packed;
+	if (c_bf16 != nullptr)
+	{
+		const float c_old = bf16_load_as_f32(c_bf16[idx]);
+		const float v_decay = beta2 * v_old;
+		const float input = (1.0f - beta2) * g * g + c_old;
+		const float v_full = v_decay + input;
+		v_new_bf16_packed = bf16_store_from_f32(v_full);
+		const float v_stored = bf16_load_as_f32(v_new_bf16_packed);
+		c_bf16[idx] = bf16_store_from_f32(v_full - v_stored);
+		v_new = v_stored;
+	}
+	else
+	{
+		v_new = beta2 * v_old + (1.0f - beta2) * g * g;
+		v_new_bf16_packed = bf16_store_from_f32(v_new);
+	}
+
+	m_bf16[idx] = bf16_store_from_f32(m_new);
+	v_bf16[idx] = v_new_bf16_packed;
+
+	const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
+	const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
+	const float m_hat = m_new / bc1;
+	const float v_hat = v_new / bc2;
+
+	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+}
+}  // anonymous namespace
+
+bool adam_update_bf16_state_bf16grad(float* param, const uint16_t* grad_bf16,
+                                      uint16_t* m_bf16, uint16_t* v_bf16,
+                                      float lr, float beta1, float beta2, float eps,
+                                      float weightDecay, float gradScale,
+                                      int step, int n)
+{
+	if (n <= 0) return true;
+	const int grid = (n + kBlockElem - 1) / kBlockElem;
+	adam_update_bf16_state_bf16grad_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    param, grad_bf16, m_bf16, v_bf16, /*c_bf16=*/nullptr,
+	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Adam with int8-packed optimizer state (block-wise scale).
 // ---------------------------------------------------------------------------
 // Each block of ADAM_INT8_BS parameters stores one FP32 absmax scale plus
@@ -1497,6 +1575,27 @@ bool adam_update_int8_state(float* param, const float* grad,
 	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n, numBlocks);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
+}
+
+// BF16-grad variant: caller provides a scratch FP32 buffer (size >= n).
+// Casts BF16 → FP32 once into the scratch, then dispatches the existing
+// int8 kernel.  Avoids the ~150-LOC duplication of the int8 kernel itself.
+// Compute cost: one extra cast pass; bandwidth-bound so usually free
+// alongside the Adam step which is also bandwidth-bound.
+bool adam_update_int8_state_bf16grad(float* param, const uint16_t* grad_bf16,
+                                      int8_t* m_int8, uint8_t* v_uint8,
+                                      float* m_scale, float* v_scale,
+                                      float* scratch_fp32,
+                                      float lr, float beta1, float beta2, float eps,
+                                      float weightDecay, float gradScale,
+                                      int step, int n)
+{
+	if (n <= 0) return true;
+	if (scratch_fp32 == 0 || grad_bf16 == 0) return false;
+	if (!cast_bf16_to_f32(grad_bf16, scratch_fp32, (size_t)n)) return false;
+	return adam_update_int8_state(param, scratch_fp32, m_int8, v_uint8,
+	                              m_scale, v_scale, lr, beta1, beta2, eps,
+	                              weightDecay, gradScale, step, n);
 }
 
 // Number of scale blocks (one FP32 scale per block of ADAM_INT8_BS params).

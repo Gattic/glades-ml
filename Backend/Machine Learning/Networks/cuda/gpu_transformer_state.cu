@@ -86,9 +86,6 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
                                       bool faceEmbedding,
                                       bool gradStorageBf16)
 {
-	(void)gradStorageBf16;  // bf16 grad buffers are header-declared but
-	                        // allocation flow not yet wired (todo: see
-	                        // research/BF16_GRADS_PLAN.md).
 	free();
 	// int8 wins over bf16 if both flags accidentally set (it's the more
 	// aggressive compression — see MixedPrecisionConfig comments).
@@ -98,6 +95,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	// in any precision).  When tm && faceEmbedding, allocate FACE state
 	// instead of vTokE/v2TokE/vTokE_bf16/etc.
 	const bool useFaceTokE = faceEmbedding && tm && !skipAdamBufs;
+	const bool useBf16Grads = gradStorageBf16 && !skipAdamBufs;
 	const bool allocFpMV  = !skipAdamBufs && !useBf16 && !useInt8;
 	const bool allocBfMV  = useBf16;
 	const bool allocI8MV  = useInt8;
@@ -155,6 +153,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(faceGFStep, (size_t)1))   return false;
 		}
 		if (!allocBuf(gTokE, (size_t)vs * dm)) return false;
+		if (useBf16Grads && !allocBuf(gTokE_bf16, (size_t)vs * dm)) return false;
 		if (!allocBuf(lmBias, vs)) return false;
 		if (!skipAdamBufs && !allocBuf(mLmBias, vs)) return false;
 		if (!skipAdamBufs && !allocBuf(v2LmBias, vs)) return false;
@@ -177,6 +176,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(v2WInScale,  I8_SCALE_N(n_)))   return false;
 		}
 		if (!allocBuf(gWIn, (size_t)dm * is)) return false;
+		if (useBf16Grads && !allocBuf(gWIn_bf16, (size_t)dm * is)) return false;
 		if (!allocBuf(bIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(mBIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(v2BIn, dm)) return false;
@@ -199,6 +199,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(v2WOutScale,  I8_SCALE_N(n_)))   return false;
 		}
 		if (!allocBuf(gWOut, (size_t)os * dm)) return false;
+		if (useBf16Grads && !allocBuf(gWOut_bf16, (size_t)os * dm)) return false;
 		if (!allocBuf(bOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(mBOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(v2BOut, os)) return false;
@@ -278,6 +279,12 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.gWo, (size_t)dm * dm)) return false;
+		if (useBf16Grads) {
+			if (!allocBuf(b.gWq_bf16, (size_t)dm * dm)) return false;
+			if (!allocBuf(b.gWk_bf16, (size_t)dm * dModelKV)) return false;
+			if (!allocBuf(b.gWv_bf16, (size_t)dm * dModelKV)) return false;
+			if (!allocBuf(b.gWo_bf16, (size_t)dm * dm)) return false;
+		}
 
 		// Paradigm shift #76 MLA latent projections (allocated when mlaLatentDim > 0).
 		if (mlaLatentDim > 0) {
@@ -296,6 +303,11 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(b.gWdkv, (size_t)dm * dC)) return false;
 			if (!allocBuf(b.gWuk,  dC * (size_t)dModelKV)) return false;
 			if (!allocBuf(b.gWuv,  dC * (size_t)dModelKV)) return false;
+			if (useBf16Grads) {
+				if (!allocBuf(b.gWdkv_bf16, (size_t)dm * dC)) return false;
+				if (!allocBuf(b.gWuk_bf16,  dC * (size_t)dModelKV)) return false;
+				if (!allocBuf(b.gWuv_bf16,  dC * (size_t)dModelKV)) return false;
+			}
 			// Forward scratch sized per batch — actual size T*dC depends on
 			// runtime T; allocate at upper bound T_max via gpuTransformerScratch
 			// instead. Mark these as zero-allocated here.
@@ -353,6 +365,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		}
 		if (!allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
 		if (!allocBuf(b.gW2, (size_t)dm * df)) return false;
+		if (useBf16Grads) {
+			if (!allocBuf(b.gW1_bf16, (size_t)ff1Width * dm)) return false;
+			if (!allocBuf(b.gW2_bf16, (size_t)dm * df)) return false;
+		}
 		if (!allocBuf(b.b1, ff1Width)) return false;
 		if (!allocBuf(b.b2, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(b.mB1, ff1Width)) return false;
@@ -721,6 +737,20 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	if (!correctCount.allocate(1)) return false;
 	if (!validCount.allocate(1)) return false;
 	if (!lossPack.allocate(4)) return false;
+
+	// Shared FP32 grad-write scratch.  Sized to the widest weight tensor
+	// across the model so any single backward GEMM can write here with
+	// beta=0; bf16_accum_axpy then commits the result to the persistent
+	// BF16 grad buffer (when MixedPrecisionConfig::gradStorageBf16=true).
+	// Always allocated — it's ≤260 MB at 1.84B and simplifies the dispatch.
+	{
+		size_t widestWeight = sdm * sdm;                          // Wq, Wo
+		if (sdm * sdmkv > widestWeight) widestWeight = sdm * sdmkv;  // Wk, Wv
+		if (sf1w * sdm > widestWeight) widestWeight = sf1w * sdm;    // W1
+		if (sdm * sdf  > widestWeight) widestWeight = sdm * sdf;     // W2
+		if (sos * sdm > widestWeight) widestWeight = sos * sdm;      // tokE / WOut
+		if (!gradScratchFp32.allocate(widestWeight)) return false;
+	}
 
 	// Persistent device arrays for batch-zeroing dK/dV.
 	{

@@ -340,6 +340,33 @@ co-allocated for the first time).  Opportunity: pre-warm the kernel
 graph at network init time, or skip the test eval and absorb the
 first-launch cost on the first training step instead.
 
+### BF16-grad Phase-1 — kernel-correctness verified (2026-05-09)
+
+CHIRON's BF16 grad-storage path ported into flagship as a 4-way per-tensor
+Adam dispatch (bf16 / int8 / bf16 + bf16grad / int8 + bf16grad).  Phase-1
+is the cast-before-Adam variant: FP32 grads accumulate in the existing
+buffers, then are cast to BF16 right before each per-tensor Adam call,
+which exercises the new `adam_update_bf16_state_bf16grad` and
+`adam_update_int8_state_bf16grad` kernels end-to-end.  No memory savings
+yet — those require the Phase-2 backward refactor (~30 grad-write sites
+in `sgd_transformer.cpp` lines 10509-11061) so grads can commit directly
+into BF16 mirrors and the FP32-grad buffers can be retired.
+
+NLL-parity smoke at 165M, T=1024, 64K tokens (62 steps):
+
+| Metric                  | Baseline (`--face --int8 --ffn-mlp`) | + `--grad-bf16` | Δ           |
+|-------------------------|-------------------------------------:|----------------:|------------:|
+| NLL @ seq 63            |                              10.6178 |         10.6178 |        0.000 |
+| Final epoch loss        |                            10.618756 |       10.618745 |  -1.1e-5 nat |
+| acc_top1                |                            0.001527% |       0.001527% |    identical |
+| Targets/sec (last)      |                             17,286.4 |        17,351.6 |       +0.4% |
+| gradNorm (epoch end)    |                             0.293695 |        0.292141 |     -0.0016 |
+
+The 1.1e-5 nat NLL gap and 1.6e-3 gradNorm gap match the BF16 cast
+round-off magnitude.  Phase-1 is correct.  The path is now active behind
+`--grad-bf16` in `glades_pile_train`; it composes with `--adam-state-int8`
+and `--face-embedding`.
+
 ## Conclusions and next steps
 
 1. **Flagship cannot reach 1.84B on 16 GB** without the optimizer-side

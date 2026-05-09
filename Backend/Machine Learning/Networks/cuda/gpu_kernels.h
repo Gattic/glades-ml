@@ -189,6 +189,24 @@ bool adam_update_int8_state(float* param, const float* grad,
                              float weightDecay, float gradScale,
                              int step, int n);
 
+// BF16-grad variants of the above two: read gradient from a BF16 buffer
+// instead of FP32.  Used when MixedPrecisionConfig::gradStorageBf16 is
+// true (the persistent grad accumulator is BF16, halving its VRAM cost).
+// adam_update_int8_state_bf16grad takes a scratch FP32 buffer (size >= n)
+// for the bf16->fp32 cast pass; the BF16-Adam variant decodes inline.
+bool adam_update_bf16_state_bf16grad(float* param, const uint16_t* grad_bf16,
+                                      uint16_t* m_bf16, uint16_t* v_bf16,
+                                      float lr, float beta1, float beta2, float eps,
+                                      float weightDecay, float gradScale,
+                                      int step, int n);
+bool adam_update_int8_state_bf16grad(float* param, const uint16_t* grad_bf16,
+                                      int8_t* m_int8, uint8_t* v_uint8,
+                                      float* m_scale, float* v_scale,
+                                      float* scratch_fp32,
+                                      float lr, float beta1, float beta2, float eps,
+                                      float weightDecay, float gradScale,
+                                      int step, int n);
+
 // Returns the number of FP32 scale entries required for int8 Adam state
 // given a parameter count n.
 int adam_int8_scale_count(int n);
@@ -740,6 +758,13 @@ inline bool adam_update_bf16_state(float*, const float*, uint16_t*, uint16_t*,
 inline bool adam_update_bf16_kahan_state(float*, const float*, uint16_t*, uint16_t*,
                                           uint16_t*, float, float, float, float, float, float,
                                           int, int) { return false; }
+inline bool adam_update_bf16_state_bf16grad(float*, const uint16_t*, uint16_t*, uint16_t*,
+                                             float, float, float, float, float, float,
+                                             int, int) { return false; }
+inline bool adam_update_int8_state_bf16grad(float*, const uint16_t*, int8_t*, uint8_t*,
+                                             float*, float*, float*,
+                                             float, float, float, float, float, float,
+                                             int, int) { return false; }
 inline bool astra_update(float*, const float*, float*,
                           float, float, float, float, float,
                           int, int) { return false; }

@@ -570,6 +570,14 @@ struct GpuTransformerScratch
 	float** d_dKdVZeroPtrs;  // device array of 2 float*
 	int*    d_dKdVZeroSizes; // device array of 2 ints
 
+	// Shared FP32 grad-write scratch (used when MixedPrecisionConfig::
+	// gradStorageBf16 is true).  Sized to the widest weight tensor on
+	// allocate (max(V·dModel, dFF·dModel, dModel·dModel)).  Each backward
+	// GEMM writes into this scratch with beta=0 (overwrite); afterward
+	// bf16_accum_axpy commits the result into the persistent BF16 grad
+	// buffer.  Allocated empty when gradStorageBf16=false.
+	GpuBuffer<float> gradScratchFp32;
+
 	GpuTransformerScratch();
 	~GpuTransformerScratch();
 
