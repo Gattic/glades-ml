@@ -693,5 +693,113 @@ inline float max_class_routing_fraction(const unsigned int* histogram,
 	return static_cast<float>(maxCount) / static_cast<float>(total_samples);
 }
 
+// ============================================================================
+// Paradigm shift #69 — REASONING-DISTILL-CHIRON primitives
+// ============================================================================
+//
+// Reasoning-trace capture + amortized distillation. Per #69 design:
+//   - Teacher (DeepSeek-R1 / o1 / Claude-extended-thinking) emits reasoning
+//     chain `<THINK>...</THINK>` followed by answer.
+//   - Student trained on full sequence with KL-CE blended loss; weighting
+//     can differ between reasoning and answer regions.
+//   - Top-K teacher logit caching to bound storage at scale.
+
+// Compute a 0/1 region mask: 1 inside [think_open, think_close] (inclusive),
+// 0 outside. Handles nested or unmatched delimiters by treating each
+// think_open as toggling-into and think_close as toggling-out-of region.
+inline void region_mask_from_special_tokens(const unsigned int* token_ids,
+                                            unsigned int n,
+                                            unsigned int think_open,
+                                            unsigned int think_close,
+                                            unsigned char* mask_out)
+{
+	if (!token_ids || !mask_out || n == 0u) return;
+	bool inRegion = false;
+	for (unsigned int i = 0; i < n; ++i)
+	{
+		const unsigned int tok = token_ids[i];
+		if (tok == think_open)
+		{
+			inRegion = true;
+			mask_out[i] = 1u;  // include the open delimiter
+		}
+		else if (tok == think_close)
+		{
+			mask_out[i] = inRegion ? 1u : 0u;  // include close if in region
+			inRegion = false;
+		}
+		else
+		{
+			mask_out[i] = inRegion ? 1u : 0u;
+		}
+	}
+}
+
+// Region-weighted loss: scalar = Σ_t (w_in if region[t] else w_out) · per_token_loss[t]
+// Returns a tuple via two scalars: total_weight (for normalization), and weighted_sum.
+inline float region_weighted_loss(const float* per_token_loss,
+                                  const unsigned char* region_mask,
+                                  unsigned int n,
+                                  float weight_in_region,
+                                  float weight_out_region,
+                                  float* total_weight_out)
+{
+	if (!per_token_loss || !region_mask || n == 0u)
+	{
+		if (total_weight_out) *total_weight_out = 0.0f;
+		return 0.0f;
+	}
+	double s = 0.0;
+	double tw = 0.0;
+	for (unsigned int t = 0; t < n; ++t)
+	{
+		const float w = region_mask[t] ? weight_in_region : weight_out_region;
+		s += static_cast<double>(w) * static_cast<double>(per_token_loss[t]);
+		tw += static_cast<double>(w);
+	}
+	if (total_weight_out) *total_weight_out = static_cast<float>(tw);
+	return static_cast<float>(s);
+}
+
+// Top-K logit cache: select the K largest logits and their indices in
+// out_indices[K] / out_values[K]. For #69's storage-bounded distillation
+// (cache only top-K=16 or 64 per token to bound TB-scale corpus storage).
+inline void top_k_logits(const float* logits,
+                         unsigned int vocab,
+                         unsigned int K,
+                         unsigned int* out_indices,
+                         float* out_values)
+{
+	if (!logits || !out_indices || !out_values || vocab == 0u || K == 0u || K > vocab)
+		return;
+	// O(K * vocab) selection. For unit-test correctness only; production
+	// would use partial sort or min-heap.
+	std::vector<bool> taken(vocab, false);
+	for (unsigned int i = 0; i < K; ++i)
+	{
+		unsigned int best = vocab;
+		float bestv = -1e30f;
+		for (unsigned int v = 0; v < vocab; ++v)
+		{
+			if (taken[v]) continue;
+			if (logits[v] > bestv) { bestv = logits[v]; best = v; }
+		}
+		out_indices[i] = best;
+		out_values[i] = bestv;
+		taken[best] = true;
+	}
+}
+
+// Storage saving fraction for top-K caching vs full vocab logits.
+inline float top_k_storage_fraction(unsigned int vocab, unsigned int K)
+{
+	if (vocab == 0u) return 0.0f;
+	// Each top-K entry uses 4 bytes (int index) + 2 bytes (BF16 value).
+	// Full vocab uses 2 bytes (BF16) per token.
+	const float topKBytes = 6.0f * static_cast<float>(K);
+	const float fullBytes = 2.0f * static_cast<float>(vocab);
+	return topKBytes / fullBytes;
+}
+
 } // namespace sampling
 } // namespace glades

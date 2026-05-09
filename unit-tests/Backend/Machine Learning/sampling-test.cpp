@@ -814,6 +814,92 @@ void SamplingUnitTest()
 		ASSERT("collapse detected", frac_collapse >= 0.80f);
 	}
 
+	// ============================================================
+	// Group REASON: Paradigm shift #69 REASONING-DISTILL
+	// ============================================================
+	// Reasoning-trace primitives: special-token region masking,
+	// per-region weighted loss, top-K logit caching for storage.
+
+	// --- Test REASON-1: region mask from <THINK>...</THINK> tokens ---
+	{
+		printf("-----------------------------------\n");
+		printf("[REASON-1] RegionMaskFromSpecialTokens\n");
+		printf("-----------------------------------\n");
+		// Sequence: 99 100(open) 1 2 3 101(close) 99 99
+		const unsigned int n = 8u;
+		unsigned int toks[8] = {99u, 100u, 1u, 2u, 3u, 101u, 99u, 99u};
+		const unsigned int THINK_OPEN = 100u;
+		const unsigned int THINK_CLOSE = 101u;
+		unsigned char mask[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+		glades::sampling::region_mask_from_special_tokens(toks, n, THINK_OPEN, THINK_CLOSE, mask);
+		// Expected: [0, 1, 1, 1, 1, 1, 0, 0]  (open through close inclusive)
+		const unsigned char expected[8] = {0u, 1u, 1u, 1u, 1u, 1u, 0u, 0u};
+		bool ok = true;
+		for (unsigned int i = 0; i < n; ++i)
+		{
+			printf("  tok[%u]=%u → mask=%u (expect %u)\n", i, toks[i], mask[i], expected[i]);
+			if (mask[i] != expected[i]) ok = false;
+		}
+		ASSERT("region mask matches expected", ok);
+	}
+
+	// --- Test REASON-2: region-weighted loss ---
+	{
+		printf("-----------------------------------\n");
+		printf("[REASON-2] RegionWeightedLoss\n");
+		printf("-----------------------------------\n");
+		// 8 tokens, last 4 in reasoning region.
+		float loss[8] = {1.0f, 1.0f, 1.0f, 1.0f, 2.0f, 2.0f, 2.0f, 2.0f};
+		unsigned char mask[8] = {0u, 0u, 0u, 0u, 1u, 1u, 1u, 1u};
+		float total_w = 0.0f;
+		// Equal weighting → sum = 4*1 + 4*2 = 12
+		float s_eq = glades::sampling::region_weighted_loss(loss, mask, 8u, 1.0f, 1.0f, &total_w);
+		printf("  equal weighting (1, 1): sum=%.2f total_w=%.2f (expect 12 / 8)\n", s_eq, total_w);
+		ASSERT("equal sum = 12", std::fabs(s_eq - 12.0f) < 1e-5f);
+		ASSERT("equal total_w = 8", std::fabs(total_w - 8.0f) < 1e-5f);
+
+		// In-region weighted 3x: sum = 4*1*1 + 4*2*3 = 4 + 24 = 28
+		float s_w = glades::sampling::region_weighted_loss(loss, mask, 8u, 3.0f, 1.0f, &total_w);
+		printf("  in=3, out=1: sum=%.2f total_w=%.2f (expect 28 / 16)\n", s_w, total_w);
+		ASSERT("weighted sum = 28", std::fabs(s_w - 28.0f) < 1e-5f);
+	}
+
+	// --- Test REASON-3: top-K logit caching ---
+	{
+		printf("-----------------------------------\n");
+		printf("[REASON-3] TopKLogitsCache\n");
+		printf("-----------------------------------\n");
+		const unsigned int vocab = 10u;
+		float logits[10] = {0.1f, 5.0f, 0.3f, 4.0f, 0.5f, 4.5f, 0.7f, 0.2f, 0.4f, 0.6f};
+		// Sorted: idx 1(5.0), 5(4.5), 3(4.0), 6(0.7), 9(0.6), 4(0.5), 8(0.4), 2(0.3), 7(0.2), 0(0.1)
+		const unsigned int K = 3u;
+		unsigned int idx[3];
+		float vals[3];
+		glades::sampling::top_k_logits(logits, vocab, K, idx, vals);
+		printf("  top-3: indices=[%u, %u, %u], values=[%.1f, %.1f, %.1f]\n",
+		       idx[0], idx[1], idx[2], vals[0], vals[1], vals[2]);
+		ASSERT("top-1 is index 1 (value 5.0)", idx[0] == 1u);
+		ASSERT("top-2 is index 5 (value 4.5)", idx[1] == 5u);
+		ASSERT("top-3 is index 3 (value 4.0)", idx[2] == 3u);
+		ASSERT("values match", vals[0] == 5.0f && vals[1] == 4.5f && vals[2] == 4.0f);
+	}
+
+	// --- Test REASON-4: storage saving from top-K caching ---
+	{
+		printf("-----------------------------------\n");
+		printf("[REASON-4] TopKStorageSaving\n");
+		printf("-----------------------------------\n");
+		// Per #69 design: vocab=128K, top-K=64 → ~6×64 / 2×128K = 384 / 256K ≈ 0.0015
+		const unsigned int vocab = 131072u;  // 128K
+		float frac64 = glades::sampling::top_k_storage_fraction(vocab, 64u);
+		float frac16 = glades::sampling::top_k_storage_fraction(vocab, 16u);
+		printf("  vocab=128K top-64: %.6f (expect ~0.0015)\n", frac64);
+		printf("  vocab=128K top-16: %.6f (expect ~0.00037)\n", frac16);
+		ASSERT("top-64 is small fraction", frac64 < 0.01f);
+		ASSERT("top-16 is even smaller", frac16 < frac64);
+		printf("  → 64-TB → ~96 GB at top-64; ~24 GB at top-16 for 500B-token corpus\n");
+	}
+
 	printf("============================================================\n");
 	printf("All Sampling Tests Passed\n");
 	printf("============================================================\n");
