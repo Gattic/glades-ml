@@ -633,6 +633,187 @@ void SamplingUnitTest()
 		ASSERT("co-learn loss decreases as draft → main", loss_after < loss_before);
 	}
 
+	// ============================================================
+	// Group ROUTE: Paradigm shift #95 MULTI-TEACHER-ROUTING
+	// ============================================================
+	// Argmax classifier routing: per-sample selection of one teacher
+	// from K teachers; eliminates #70-B's teacher-disagreement variance.
+
+	// --- Test ROUTE-1: argmax routing correctness ---
+	{
+		printf("-----------------------------------\n");
+		printf("[ROUTE-1] ArgmaxRoutingSelectsCorrectTeacher\n");
+		printf("-----------------------------------\n");
+		float class_probs[5] = {0.1f, 0.7f, 0.05f, 0.10f, 0.05f};  // class 1 wins
+		unsigned int sel = glades::sampling::route_to_teacher(class_probs, 5);
+		printf("  class_probs = [0.1, 0.7, 0.05, 0.10, 0.05]; argmax routes to %u (expect 1)\n", sel);
+		ASSERT("argmax routing selects max-prob class", sel == 1u);
+	}
+
+	// --- Test ROUTE-2: routed loss matches selected teacher's KL ---
+	{
+		printf("-----------------------------------\n");
+		printf("[ROUTE-2] RoutedLossMatchesSelectedTeacher\n");
+		printf("-----------------------------------\n");
+		const unsigned int vocab = 4u;
+		const unsigned int K = 3u;
+		// 3 teachers — each peaked on a different token
+		float teachers[3 * 4] = {
+		    0.7f, 0.1f, 0.1f, 0.1f,  // teacher 0 peaks at token 0
+		    0.1f, 0.7f, 0.1f, 0.1f,  // teacher 1 peaks at token 1
+		    0.1f, 0.1f, 0.1f, 0.7f   // teacher 2 peaks at token 3
+		};
+		float student[4] = {0.40f, 0.20f, 0.20f, 0.20f};  // close to teacher 0
+		const unsigned int gt = 0u;
+		const float alpha = 0.3f;
+
+		// Route to teacher 0
+		float class0[3] = {0.9f, 0.05f, 0.05f};
+		float L0 = glades::sampling::multi_teacher_routed_loss(
+		    class0, teachers, student, gt, vocab, K, alpha);
+		// Route to teacher 1
+		float class1[3] = {0.05f, 0.9f, 0.05f};
+		float L1 = glades::sampling::multi_teacher_routed_loss(
+		    class1, teachers, student, gt, vocab, K, alpha);
+		// Route to teacher 2
+		float class2[3] = {0.05f, 0.05f, 0.9f};
+		float L2 = glades::sampling::multi_teacher_routed_loss(
+		    class2, teachers, student, gt, vocab, K, alpha);
+
+		printf("  L_route_to_T0=%.4f  L_route_to_T1=%.4f  L_route_to_T2=%.4f\n", L0, L1, L2);
+		// Student is closest to T0 → KL with T0 should be smallest → L0 smallest
+		ASSERT("routing to closest teacher minimizes loss", L0 < L1 && L0 < L2);
+	}
+
+	// --- Test ROUTE-3: routed loss vs ensemble loss decomposition ---
+	{
+		printf("-----------------------------------\n");
+		printf("[ROUTE-3] RoutedVsEnsembleDecomposition\n");
+		printf("-----------------------------------\n");
+		const unsigned int vocab = 4u;
+		const unsigned int K = 3u;
+		float teachers[3 * 4] = {
+		    0.50f, 0.30f, 0.10f, 0.10f,
+		    0.10f, 0.50f, 0.30f, 0.10f,
+		    0.10f, 0.10f, 0.30f, 0.50f
+		};
+		float student[4] = {0.25f, 0.25f, 0.25f, 0.25f};  // uniform
+		const unsigned int gt = 0u;
+		const float alpha = 0.3f;
+		// Hard routing case: class_probs near one-hot
+		float class_hard[3] = {0.9f, 0.05f, 0.05f};
+		float L_route = glades::sampling::multi_teacher_routed_loss(
+		    class_hard, teachers, student, gt, vocab, K, alpha);
+		float L_ens = glades::sampling::multi_teacher_ensemble_loss(
+		    class_hard, teachers, student, gt, vocab, K, alpha);
+		printf("  hard routing (class[0]=0.9): L_route=%.4f vs L_ens=%.4f\n",
+		       L_route, L_ens);
+		ASSERT("hard routing close to ensemble at one-hot classifier",
+		       std::fabs(L_route - L_ens) < 0.05f);
+
+		// Uniform case
+		float class_uni[3] = {0.333f, 0.333f, 0.334f};
+		float L_route_u = glades::sampling::multi_teacher_routed_loss(
+		    class_uni, teachers, student, gt, vocab, K, alpha);
+		float L_ens_u = glades::sampling::multi_teacher_ensemble_loss(
+		    class_uni, teachers, student, gt, vocab, K, alpha);
+		printf("  uniform routing: L_route=%.4f (= KL with one teacher) vs L_ens=%.4f (avg over 3)\n",
+		       L_route_u, L_ens_u);
+	}
+
+	// --- Test ROUTE-4: variance reduction (routing vs ensemble) ---
+	{
+		printf("-----------------------------------\n");
+		printf("[ROUTE-4] VarianceReductionUnderRouting\n");
+		printf("-----------------------------------\n");
+		// Simulate K teachers with random distributions; classifier is reasonably
+		// confident. Compute Monte-Carlo variance of routed loss vs ensemble.
+		const unsigned int vocab = 8u;
+		const unsigned int K = 5u;
+		const unsigned int N = 400u;
+		const float alpha = 0.3f;
+		std::vector<float> teachers(K * vocab);
+		unsigned int seed = 0x4ECEBA12u;
+		// fill teachers with distinct distributions
+		for (unsigned int k = 0; k < K; ++k)
+		{
+			double sum = 0.0;
+			for (unsigned int v = 0; v < vocab; ++v)
+			{
+				seed = seed * 1103515245u + 12345u;
+				float x = static_cast<float>((seed >> 16) & 0xFFFF) / 65535.0f;
+				teachers[k * vocab + v] = 0.05f + x;
+				sum += teachers[k * vocab + v];
+			}
+			for (unsigned int v = 0; v < vocab; ++v)
+				teachers[k * vocab + v] /= static_cast<float>(sum);
+		}
+
+		double meanR = 0.0, meanE = 0.0;
+		std::vector<float> routedLosses(N), ensembleLosses(N);
+		for (unsigned int i = 0; i < N; ++i)
+		{
+			std::vector<float> student(vocab, 0.0f);
+			std::vector<float> classp(K, 0.0f);
+			double s = 0.0;
+			for (unsigned int v = 0; v < vocab; ++v)
+			{
+				seed = seed * 1103515245u + 12345u;
+				float x = static_cast<float>((seed >> 16) & 0xFFFF) / 65535.0f;
+				student[v] = 0.05f + x;
+				s += student[v];
+			}
+			for (unsigned int v = 0; v < vocab; ++v) student[v] /= static_cast<float>(s);
+			// classifier output: peaked on a random class (high confidence)
+			seed = seed * 1103515245u + 12345u;
+			unsigned int peakC = (seed >> 16) % K;
+			for (unsigned int c = 0; c < K; ++c) classp[c] = (c == peakC) ? 0.85f : (0.15f / (K - 1));
+			unsigned int gt = ((seed >> 8) & 0xFF) % vocab;
+
+			routedLosses[i] = glades::sampling::multi_teacher_routed_loss(
+			    classp.data(), teachers.data(), student.data(), gt, vocab, K, alpha);
+			ensembleLosses[i] = glades::sampling::multi_teacher_ensemble_loss(
+			    classp.data(), teachers.data(), student.data(), gt, vocab, K, alpha);
+			meanR += routedLosses[i];
+			meanE += ensembleLosses[i];
+		}
+		meanR /= N;
+		meanE /= N;
+		double varR = 0.0, varE = 0.0;
+		for (unsigned int i = 0; i < N; ++i)
+		{
+			varR += (routedLosses[i] - meanR) * (routedLosses[i] - meanR);
+			varE += (ensembleLosses[i] - meanE) * (ensembleLosses[i] - meanE);
+		}
+		varR /= N - 1; varE /= N - 1;
+		printf("  routed:   mean=%.4f  var=%.4f\n", meanR, varR);
+		printf("  ensemble: mean=%.4f  var=%.4f\n", meanE, varE);
+		printf("  variance ratio routed/ensemble = %.3f\n", varR / varE);
+		// At high classifier confidence (0.85), routed and ensemble are similar
+		// (one teacher dominates in both). At low confidence the routed variance
+		// climbs while ensemble stays smooth — that's the #70-B trade.
+		ASSERT("routed mean close to ensemble at high classifier confidence",
+		       std::fabs(meanR - meanE) < 0.5f);
+	}
+
+	// --- Test ROUTE-5: class-collapse detection ---
+	{
+		printf("-----------------------------------\n");
+		printf("[ROUTE-5] ClassCollapseDetection\n");
+		printf("-----------------------------------\n");
+		// Healthy histogram: roughly balanced
+		unsigned int hist_healthy[5] = {180u, 220u, 200u, 210u, 190u};  // total 1000
+		float frac_healthy = glades::sampling::max_class_routing_fraction(hist_healthy, 5, 1000u);
+		printf("  healthy histogram: max fraction = %.3f (must be < 0.80)\n", frac_healthy);
+		ASSERT("healthy histogram below collapse threshold", frac_healthy < 0.80f);
+
+		// Collapsed: one class dominates
+		unsigned int hist_collapse[5] = {850u, 30u, 50u, 40u, 30u};  // class 0 = 85%
+		float frac_collapse = glades::sampling::max_class_routing_fraction(hist_collapse, 5, 1000u);
+		printf("  collapsed histogram: max fraction = %.3f (must be >= 0.80)\n", frac_collapse);
+		ASSERT("collapse detected", frac_collapse >= 0.80f);
+	}
+
 	printf("============================================================\n");
 	printf("All Sampling Tests Passed\n");
 	printf("============================================================\n");

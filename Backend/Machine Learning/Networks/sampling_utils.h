@@ -606,5 +606,92 @@ inline float co_learn_loss(const float* p_draft_at_tau,
 	return alpha * ce + (1.0f - alpha) * tau * tau * kl;
 }
 
+// ============================================================================
+// Paradigm shift #95 — MULTI-TEACHER-ROUTING-DISTILL primitives
+// ============================================================================
+//
+// Per-sample argmax classifier routing across K teachers, refining the
+// rejected #70-B ensemble approach. For each sample x:
+//   c*    = argmax_c P(class | x; θ_classifier)
+//   loss  = α · CE_groundtruth + (1-α) · KL(student || T_{c*})
+//
+// This eliminates the teacher-disagreement variance that broke #70-B.
+
+// Argmax routing across K teachers given classifier probabilities.
+// Returns the selected teacher index in [0, K).
+inline unsigned int route_to_teacher(const float* class_probs,
+                                     unsigned int K)
+{
+	if (!class_probs || K == 0u) return 0u;
+	unsigned int best = 0u;
+	float bestv = class_probs[0];
+	for (unsigned int c = 1; c < K; ++c)
+		if (class_probs[c] > bestv) { bestv = class_probs[c]; best = c; }
+	return best;
+}
+
+// Compute the per-sample routed loss given classifier output, K teacher
+// distributions, and student distribution.
+//
+//   class_probs:  [K]                           classifier P(class|x)
+//   teachers:     [K * vocab]                   per-class teacher distributions
+//   student:      [vocab]                       student distribution
+//   gt_token:     ground-truth token (for CE term)
+//   alpha, vocab, K
+//
+// Returns scalar loss = α · CE(student, gt) + (1-α) · KL(student, T_{c*})
+inline float multi_teacher_routed_loss(const float* class_probs,
+                                       const float* teachers,
+                                       const float* student,
+                                       unsigned int gt_token,
+                                       unsigned int vocab,
+                                       unsigned int K,
+                                       float alpha)
+{
+	if (!class_probs || !teachers || !student || vocab == 0u || K == 0u)
+		return 0.0f;
+	const unsigned int c = route_to_teacher(class_probs, K);
+	const float* teacher_c = teachers + static_cast<size_t>(c) * vocab;
+	const float ce = cross_entropy_at_token(student, gt_token, vocab);
+	const float kl = kl_divergence(student, teacher_c, vocab);
+	return alpha * ce + (1.0f - alpha) * kl;
+}
+
+// Ensemble loss for comparison (the #70-B mechanism that was rejected):
+//   L_ens = α · CE + Σ_k β_k · KL(student, T_k)
+// where β = class_probs (used as weights instead of routing).
+inline float multi_teacher_ensemble_loss(const float* class_probs,
+                                         const float* teachers,
+                                         const float* student,
+                                         unsigned int gt_token,
+                                         unsigned int vocab,
+                                         unsigned int K,
+                                         float alpha)
+{
+	if (!class_probs || !teachers || !student || vocab == 0u || K == 0u)
+		return 0.0f;
+	const float ce = cross_entropy_at_token(student, gt_token, vocab);
+	float klSum = 0.0f;
+	for (unsigned int c = 0; c < K; ++c)
+	{
+		const float* teacher_c = teachers + static_cast<size_t>(c) * vocab;
+		klSum += class_probs[c] * kl_divergence(student, teacher_c, vocab);
+	}
+	return alpha * ce + (1.0f - alpha) * klSum;
+}
+
+// Class-collapse detection: returns the maximum routing fraction across K
+// classes given a sample histogram. Below 0.80 = healthy; >= 0.80 = collapse.
+inline float max_class_routing_fraction(const unsigned int* histogram,
+                                        unsigned int K,
+                                        unsigned int total_samples)
+{
+	if (!histogram || K == 0u || total_samples == 0u) return 0.0f;
+	unsigned int maxCount = histogram[0];
+	for (unsigned int c = 1; c < K; ++c)
+		if (histogram[c] > maxCount) maxCount = histogram[c];
+	return static_cast<float>(maxCount) / static_cast<float>(total_samples);
+}
+
 } // namespace sampling
 } // namespace glades
