@@ -9513,12 +9513,49 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		float* ffOut_l = gpuTransformerScratch->ffOut.data()
 		                 + static_cast<size_t>(li) * T * dModel;
 
-		if (!gpu_gemm_abt_mp(bf16W1,
-		    static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel), 1.0f,
-		    x2_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-		    gb.W1.data(), gb.W1Lowp.data(), static_cast<int>(dModel),
-		    0.0f, ff1_l, static_cast<int>(ff1Width)))
-			return false;
+		// Paradigm #74 PHOENIX-1BIT W1 projection: Y = X @ sign(W1).T
+		// (mirrors W2 path). When dModel%128==0, use full BitNet QAT via
+		// WMMA B1 with per-row scales; otherwise tiled X(float)@sign(W).
+		const bool useBinaryFFNW1 = trainingConfig.transformer.binaryFFN;
+		if (useBinaryFFNW1)
+		{
+			const bool useBitNetW1 = (dModel % 128u) == 0u;
+			if (useBitNetW1)
+			{
+				const size_t xBits = static_cast<size_t>(T) * (dModel / 32u);
+				const size_t wBits = static_cast<size_t>(ff1Width) * (dModel / 32u);
+				if (gb.bitnetXBitsW1.size() < xBits) gb.bitnetXBitsW1.allocate(xBits);
+				if (gb.bitnetWBitsW1.size() < wBits) gb.bitnetWBitsW1.allocate(wBits);
+				if (gb.bitnetAlphaXW1.size() < T) gb.bitnetAlphaXW1.allocate(T);
+				if (gb.bitnetAlphaWW1.size() < ff1Width) gb.bitnetAlphaWW1.allocate(ff1Width);
+				const size_t cPop = static_cast<size_t>(T) * ff1Width;
+				if (gb.bitnetCPopW1.size() < cPop) gb.bitnetCPopW1.allocate(cPop);
+				if (!gpu::bitnet_ffn_forward_gpu(
+				        x2_l, gb.W1.data(),
+				        static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
+				        gb.bitnetXBitsW1.data(), gb.bitnetWBitsW1.data(),
+				        gb.bitnetAlphaXW1.data(), gb.bitnetAlphaWW1.data(),
+				        gb.bitnetCPopW1.data(), ff1_l))
+					return false;
+			}
+			else
+			{
+				if (!gpu::binary_gemm_abt_from_float(
+				        x2_l, gb.W1.data(),
+				        static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
+				        ff1_l))
+					return false;
+			}
+		}
+		else
+		{
+			if (!gpu_gemm_abt_mp(bf16W1,
+			    static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel), 1.0f,
+			    x2_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.W1.data(), gb.W1Lowp.data(), static_cast<int>(dModel),
+			    0.0f, ff1_l, static_cast<int>(ff1Width)))
+				return false;
+		}
 		gpu::add_bias(ff1_l, gb.b1.data(),
 		              static_cast<int>(T), static_cast<int>(ff1Width));
 

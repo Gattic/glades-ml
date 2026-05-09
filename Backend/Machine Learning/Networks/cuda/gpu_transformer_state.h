@@ -198,11 +198,20 @@ struct GpuTransformerWeights
 
 		// Paradigm shift #74 BitNet QAT FFN W2 scratch (lazy-allocated when
 		// trainingConfig.transformer.binaryFFN && WMMA B1 path is taken).
+		// W2: [dModel, dFF] applied as Y = X[T,dFF] @ W2.T -> [T, dModel]
 		GpuBuffer<unsigned int> bitnetXBits;   // [T * dFF / 32]
 		GpuBuffer<unsigned int> bitnetWBits;   // [dModel * dFF / 32]
 		GpuBuffer<float>        bitnetAlphaX;  // [T]
 		GpuBuffer<float>        bitnetAlphaW;  // [dModel]
 		GpuBuffer<int>          bitnetCPop;    // [T * dModel]
+
+		// W1 BitNet scratch: W1 [ff1Width, dModel] applied as Y = X[T,dModel]
+		// @ W1.T -> [T, ff1Width]. Lazy-allocated alongside W2 path.
+		GpuBuffer<unsigned int> bitnetXBitsW1;   // [T * dModel / 32]
+		GpuBuffer<unsigned int> bitnetWBitsW1;   // [ff1Width * dModel / 32]
+		GpuBuffer<float>        bitnetAlphaXW1;  // [T]
+		GpuBuffer<float>        bitnetAlphaWW1;  // [ff1Width]
+		GpuBuffer<int>          bitnetCPopW1;    // [T * ff1Width]
 		// BF16 Adam state (used when adamStateBf16=true, saves ~2x VRAM).
 		GpuBuffer<uint16_t> vWq_bf16, vWk_bf16, vWv_bf16, vWo_bf16;
 		GpuBuffer<uint16_t> v2Wq_bf16, v2Wk_bf16, v2Wv_bf16, v2Wo_bf16;
