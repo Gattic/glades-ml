@@ -4411,6 +4411,40 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator)
 	return true;
 }
 
+namespace {
+
+__global__ void sum_sq_bf16_kernel(const uint16_t* __restrict__ data, int n,
+                                    float* __restrict__ acc)
+{
+	extern __shared__ float smem[];
+	float localSum = 0.0f;
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+	     i += gridDim.x * blockDim.x)
+	{
+		union { uint32_t u; float f; } uv;
+		uv.u = static_cast<uint32_t>(data[i]) << 16;
+		float v = uv.f;
+		localSum += v * v;
+	}
+	float sum = blockReduceSum(localSum, smem);
+	if (threadIdx.x == 0)
+		atomicAdd(acc, sum);
+}
+
+} // anonymous namespace
+
+bool sum_squared_accumulate_bf16(const uint16_t* data, int n, float* d_accumulator)
+{
+	if (n <= 0) return true;
+	int block = 256;
+	int grid = (n + block - 1) / block;
+	if (grid > 256) grid = 256;
+	int smemBytes = ((block / 32) + 1) * sizeof(float);
+	sum_sq_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(data, n, d_accumulator);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // ===========================================================================
 // BF16 / FP32 cast kernels — foundation for mixed-precision training.
 //

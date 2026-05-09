@@ -625,6 +625,12 @@ bool collect_token_lm_metrics(const float* probs, const int* targets,
 // Multiple calls accumulate across different buffers.
 bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
 
+// BF16-input variant of sum_squared_accumulate.  Decodes each element as bf16->f32
+// (zero-extend low 16 bits) and accumulates v*v into d_accumulator.  Used for the
+// global grad-norm pass under BF16-grad Phase-2 where the FP32 grad buffers have
+// been retired and only the BF16 mirrors are live.
+bool sum_squared_accumulate_bf16(const uint16_t* data, int n, float* d_accumulator);
+
 // BF16 ↔ FP32 element-wise casts. Operates element-wise on GPU buffers.
 // `n` is the number of elements (not bytes). Designed as primitives for
 // mixed-precision training: store a weight matrix as BF16 on the GPU (half
@@ -744,6 +750,7 @@ inline bool zero_buffers_batch(float**, const int*, int) { return false; }
 inline bool pack_loss_scalars(const float*, const int*, const int*, const int*, int*) { return false; }
 
 inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
+inline bool sum_squared_accumulate_bf16(const uint16_t*, int, float*) { return false; }
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
 inline bool cast_f32_to_bf16_stochastic(const float*, uint16_t*, size_t, uint32_t, uint32_t) { return false; }
