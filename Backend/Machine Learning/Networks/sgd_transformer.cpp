@@ -9532,14 +9532,40 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 
 		// Paradigm #74 PHOENIX-1BIT: binary W2 projection (Y = X @ sign(W2).T).
 		// Float master weights still drive backward via STE.
+		// When K=dFF is a multiple of 128, route through full BitNet QAT
+		// path (quantize-X + WMMA-XOR + scale-recover); otherwise fall back
+		// to the tiled X(float) @ sign(W) kernel.
 		const bool useBinaryFFN = trainingConfig.transformer.binaryFFN;
 		if (useBinaryFFN)
 		{
-			if (!gpu::binary_gemm_abt_from_float(
-			        ff1Act_l, gb.W2.data(),
-			        static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
-			        ffOut_l))
-				return false;
+			const bool useBitNet = (dFF % 128u) == 0u;
+			if (useBitNet)
+			{
+				// Lazy-allocate scratch buffers
+				const size_t xBits = static_cast<size_t>(T) * (dFF / 32u);
+				const size_t wBits = static_cast<size_t>(dModel) * (dFF / 32u);
+				if (gb.bitnetXBits.size() < xBits) gb.bitnetXBits.allocate(xBits);
+				if (gb.bitnetWBits.size() < wBits) gb.bitnetWBits.allocate(wBits);
+				if (gb.bitnetAlphaX.size() < T) gb.bitnetAlphaX.allocate(T);
+				if (gb.bitnetAlphaW.size() < dModel) gb.bitnetAlphaW.allocate(dModel);
+				const size_t cPop = static_cast<size_t>(T) * dModel;
+				if (gb.bitnetCPop.size() < cPop) gb.bitnetCPop.allocate(cPop);
+				if (!gpu::bitnet_ffn_forward_gpu(
+				        ff1Act_l, gb.W2.data(),
+				        static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+				        gb.bitnetXBits.data(), gb.bitnetWBits.data(),
+				        gb.bitnetAlphaX.data(), gb.bitnetAlphaW.data(),
+				        gb.bitnetCPop.data(), ffOut_l))
+					return false;
+			}
+			else
+			{
+				if (!gpu::binary_gemm_abt_from_float(
+				        ff1Act_l, gb.W2.data(),
+				        static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+				        ffOut_l))
+					return false;
+			}
 		}
 		else
 		{

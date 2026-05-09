@@ -341,6 +341,20 @@ bool bitnet_b1_forward(const unsigned int* X_bits,
                        int M, int N, int K_bits,
                        float* Y);
 
+// (b) Full BitNet QAT FFN forward primitive: takes float X, float W;
+// quantizes both with per-row scales; runs WMMA B1 XOR-popcount; recovers
+// the scaled result into Y. Backward via STE goes through standard cuBLAS
+// sgemm on float X and float W (caller's responsibility).
+// Scratch buffers must be allocated by caller; K must be multiple of 128.
+bool bitnet_ffn_forward_gpu(const float* X, const float* W,
+                            int M, int N, int K,
+                            unsigned int* X_bits_scratch,
+                            unsigned int* W_bits_scratch,
+                            float* alpha_x_scratch,
+                            float* alpha_w_scratch,
+                            int* C_pop_scratch,
+                            float* Y);
+
 // #76 MLA latent compression: c = h @ W_DKV via cuBLAS sgemm.
 bool mla_compute_latent_gpu(const float* h, const float* W_DKV,
                              int T, int d_h, int d_c, float* c_out);
@@ -737,6 +751,9 @@ inline bool quantize_x_to_b1_with_scale(const float*, int, int,
 inline bool bitnet_b1_forward(const unsigned int*, const unsigned int*,
                                const float*, const float*, int*,
                                int, int, int, float*) { return false; }
+inline bool bitnet_ffn_forward_gpu(const float*, const float*, int, int, int,
+                                    unsigned int*, unsigned int*, float*, float*, int*,
+                                    float*) { return false; }
 inline bool mla_compute_latent_gpu(const float*, const float*,
                                     int, int, int, float*) { return false; }
 inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,

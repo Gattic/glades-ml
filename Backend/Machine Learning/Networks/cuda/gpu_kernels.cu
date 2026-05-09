@@ -5215,6 +5215,36 @@ bool quantize_x_to_b1_with_scale(const float* X, int M, int K,
 	return true;
 }
 
+// Single-call BitNet QAT FFN forward: takes float X, float W; allocates
+// internal binary + scale scratch (or reuses passed scratch); runs the full
+// quantize-X + WMMA-XOR + scale-recover pipeline. Caller passes scratch
+// buffers sized appropriately:
+//   X_bits_scratch  [M * (K/32)]   uint32
+//   W_bits_scratch  [N * (K/32)]   uint32
+//   alpha_x_scratch [M]            float
+//   alpha_w_scratch [N]            float
+//   C_pop_scratch   [M * N]        int32
+// K must be a multiple of 128 (WMMA B1 fragment shape).
+bool bitnet_ffn_forward_gpu(const float* X, const float* W,
+                            int M, int N, int K,
+                            unsigned int* X_bits_scratch,
+                            unsigned int* W_bits_scratch,
+                            float* alpha_x_scratch,
+                            float* alpha_w_scratch,
+                            int* C_pop_scratch,
+                            float* Y)
+{
+	if (M <= 0 || N <= 0 || K <= 0) return true;
+	if ((K % 128) != 0) return false;
+	if (!quantize_x_to_b1_with_scale(X, M, K, X_bits_scratch, alpha_x_scratch))
+		return false;
+	if (!quantize_x_to_b1_with_scale(W, N, K, W_bits_scratch, alpha_w_scratch))
+		return false;
+	return bitnet_b1_forward(X_bits_scratch, W_bits_scratch,
+	                          alpha_x_scratch, alpha_w_scratch,
+	                          C_pop_scratch, M, N, K, Y);
+}
+
 // Full BitNet inference forward: Y[M,N] = scale_recover(WMMA-B1-XOR(X_bits, W_bits)).
 // X_bits [M, K/32], W_bits [N, K/32], alpha_x [M], alpha_w [N], K_bits = K.
 // The popcount intermediate is allocated in C_pop_scratch [M*N int32].
