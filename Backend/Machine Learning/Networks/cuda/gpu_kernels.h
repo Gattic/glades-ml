@@ -351,6 +351,33 @@ bool mla_decompress_kv_gpu(const float* c,
                             int T, int d_c, int dKVtotal,
                             float* K_out, float* V_out);
 
+// (a) Full MLA forward — single trainer-ready entry point.
+// h[T, dHidden] -> c_scratch[T, dC] -> K_out, V_out [T, dKVtotal] each.
+bool mla_attention_forward_gpu(const float* h,
+                                const float* W_DKV,
+                                const float* W_UK,
+                                const float* W_UV,
+                                int T, int dHidden, int dC, int dKVtotal,
+                                float* c_scratch,
+                                float* K_out,
+                                float* V_out);
+
+// (a) Full MLA backward — produces dh (accumulated), dW_DKV, dW_UK, dW_UV.
+// c_cached should be the c from forward; dc_scratch is workspace.
+bool mla_attention_backward_gpu(const float* h,
+                                 const float* c_cached,
+                                 const float* dK,
+                                 const float* dV,
+                                 const float* W_DKV,
+                                 const float* W_UK,
+                                 const float* W_UV,
+                                 int T, int dHidden, int dC, int dKVtotal,
+                                 float* dh_accum,
+                                 float* dW_DKV,
+                                 float* dW_UK,
+                                 float* dW_UV,
+                                 float* dc_scratch);
+
 // #78 ATTENTION-SINK forward (single-head FP32 reference). One block per
 // query position; inner thread reduces over keys with sink+window mask.
 bool sw_attention_forward_gpu(const float* Q, int qStride,
@@ -714,6 +741,12 @@ inline bool mla_compute_latent_gpu(const float*, const float*,
                                     int, int, int, float*) { return false; }
 inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,
                                    int, int, int, float*, float*) { return false; }
+inline bool mla_attention_forward_gpu(const float*, const float*, const float*, const float*,
+                                       int, int, int, int, float*, float*, float*) { return false; }
+inline bool mla_attention_backward_gpu(const float*, const float*, const float*, const float*,
+                                        const float*, const float*, const float*,
+                                        int, int, int, int,
+                                        float*, float*, float*, float*, float*) { return false; }
 inline bool sw_attention_forward_gpu(const float*, int, const float*, int,
                                       const float*, int, int, int, bool,
                                       int, int, float*, int) { return false; }

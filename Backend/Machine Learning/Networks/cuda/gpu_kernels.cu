@@ -5274,6 +5274,103 @@ bool sw_attention_backward_gpu(const float* Q, int qStride,
 	return true;
 }
 
+// ============================================================================
+// (a) Full MLA forward (paradigm #76 trainer-dispatch primitive)
+// ============================================================================
+//
+// Single-call helper that combines compute_latent + decompress_kv into one
+// trainer-ready primitive. When wired into sgd_transformer.cpp's GPU
+// attention path under `mlaLatentDim > 0`, this replaces the standard
+// per-head K, V projection with the low-rank latent path.
+//
+//   Standard MHA:  K = h @ W_K   (T, dKV);   V = h @ W_V   (T, dKV)
+//   #76 MLA:       c = h @ W_DKV (T, d_c);   K = c @ W_UK; V = c @ W_UV
+//
+// At training time the gradient chain rule is:
+//   dW_UK = c^T @ dK;   dW_UV = c^T @ dV
+//   dc    = dK @ W_UK^T + dV @ W_UV^T
+//   dW_DKV = h^T @ dc;  dh += dc @ W_DKV^T
+// All five gradients are standard cuBLAS sgemm calls (no custom kernel).
+//
+// Cache memory at inference: with KV cache storing c instead of K, V, the
+// per-token cache size drops from 2*dKV to d_c (4× compression at d_c =
+// dKV/2; up to 8× at d_c = dKV/4).
+
+bool mla_attention_forward_gpu(const float* h,
+                                const float* W_DKV,
+                                const float* W_UK,
+                                const float* W_UV,
+                                int T, int dHidden, int dC, int dKVtotal,
+                                float* c_scratch,
+                                float* K_out,
+                                float* V_out)
+{
+	if (T <= 0 || dHidden <= 0 || dC <= 0 || dKVtotal <= 0) return true;
+	if (!mla_compute_latent_gpu(h, W_DKV, T, dHidden, dC, c_scratch))
+		return false;
+	if (!mla_decompress_kv_gpu(c_scratch, W_UK, W_UV, T, dC, dKVtotal,
+	                            K_out, V_out))
+		return false;
+	return true;
+}
+
+// Backward through MLA latent: given dK, dV, h, the factored weights and c
+// (cached from forward), produce dh, dW_DKV, dW_UK, dW_UV.
+// All five gradients via cuBLAS chain rule:
+bool mla_attention_backward_gpu(const float* h,
+                                 const float* c_cached,
+                                 const float* dK,
+                                 const float* dV,
+                                 const float* W_DKV,
+                                 const float* W_UK,
+                                 const float* W_UV,
+                                 int T, int dHidden, int dC, int dKVtotal,
+                                 float* dh_accum,    // [T * dHidden] add to existing
+                                 float* dW_DKV,      // [dHidden * dC]
+                                 float* dW_UK,       // [dC * dKVtotal]
+                                 float* dW_UV,       // [dC * dKVtotal]
+                                 float* dc_scratch)  // [T * dC]
+{
+	if (T <= 0 || dHidden <= 0 || dC <= 0 || dKVtotal <= 0) return true;
+
+	// dW_UK[dC, dKVtotal] = c^T[dC, T] @ dK[T, dKVtotal]
+	if (!sgemm_rowmajor_atb(dC, dKVtotal, T, 1.0f,
+	                         c_cached, dC,
+	                         dK, dKVtotal,
+	                         0.0f, dW_UK, dKVtotal))
+		return false;
+	// dW_UV[dC, dKVtotal] = c^T @ dV
+	if (!sgemm_rowmajor_atb(dC, dKVtotal, T, 1.0f,
+	                         c_cached, dC,
+	                         dV, dKVtotal,
+	                         0.0f, dW_UV, dKVtotal))
+		return false;
+	// dc[T, dC] = dK[T, dKVtotal] @ W_UK^T[dKVtotal, dC] + dV @ W_UV^T
+	if (!sgemm_rowmajor_abt(T, dC, dKVtotal, 1.0f,
+	                         dK, dKVtotal,
+	                         W_UK, dKVtotal,
+	                         0.0f, dc_scratch, dC))
+		return false;
+	if (!sgemm_rowmajor_abt(T, dC, dKVtotal, 1.0f,
+	                         dV, dKVtotal,
+	                         W_UV, dKVtotal,
+	                         1.0f, dc_scratch, dC))
+		return false;
+	// dW_DKV[dHidden, dC] = h^T[dHidden, T] @ dc[T, dC]
+	if (!sgemm_rowmajor_atb(dHidden, dC, T, 1.0f,
+	                         h, dHidden,
+	                         dc_scratch, dC,
+	                         0.0f, dW_DKV, dC))
+		return false;
+	// dh[T, dHidden] += dc[T, dC] @ W_DKV^T[dC, dHidden]
+	if (!sgemm_rowmajor_abt(T, dHidden, dC, 1.0f,
+	                         dc_scratch, dC,
+	                         W_DKV, dC,
+	                         1.0f, dh_accum, dHidden))
+		return false;
+	return true;
+}
+
 // #76 wrappers — both are matrix multiplies; reuse cuBLAS sgemm_rowmajor.
 // c[T, d_c] = h[T, d_h] @ W_DKV[d_h, d_c]
 bool mla_compute_latent_gpu(const float* h, const float* W_DKV,
