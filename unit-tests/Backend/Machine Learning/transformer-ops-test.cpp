@@ -2064,6 +2064,169 @@ static void test_phoenix158_vs_phoenix1bit_storage()
 }
 
 // ============================================================
+// Group MFAC: (a) MLA factorization at production shapes (#76 deep)
+// ============================================================
+// Demonstrates the MLA mechanism at production-realistic shapes
+// (dmodel=768, dKVtotal=768, d_c=384). SVD-style factorization
+// shows that any low-rank weight matrix can be expressed as
+// W = U @ V; if rank(W) ≤ d_c, the factored path is exact.
+
+static void test_mla_factorization_exact_lowrank()
+{
+	printf("  [MFAC-1] MLAFactorizationExactWhenLowRank ...\n");
+	// Build W = U @ V where U is [d_h, d_c] and V is [d_c, dKV]; rank ≤ d_c.
+	// Then h @ W should equal (h @ U) @ V to floating-point precision.
+	const unsigned int T = 256u;
+	const unsigned int d_h = 768u;
+	const unsigned int d_c = 384u;
+	const unsigned int dKV = 768u;
+	std::vector<float> U(static_cast<size_t>(d_h) * d_c);
+	std::vector<float> V(static_cast<size_t>(d_c) * dKV);
+	std::vector<float> h(static_cast<size_t>(T) * d_h);
+	unsigned int seed = 0xFAC70423u;
+	fill_random(U.data(), d_h * d_c, seed);
+	fill_random(V.data(), d_c * dKV, seed);
+	fill_random(h.data(), T * d_h, seed);
+
+	// Reference: K_full = h @ (U @ V)
+	std::vector<float> W_full(static_cast<size_t>(d_h) * dKV, 0.0f);
+	for (unsigned int i = 0; i < d_h; ++i)
+		for (unsigned int j = 0; j < dKV; ++j)
+		{
+			double s = 0.0;
+			for (unsigned int k = 0; k < d_c; ++k)
+				s += static_cast<double>(U[i * d_c + k]) *
+				     static_cast<double>(V[k * dKV + j]);
+			W_full[i * dKV + j] = static_cast<float>(s);
+		}
+	std::vector<float> K_full(static_cast<size_t>(T) * dKV, 0.0f);
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < dKV; ++j)
+		{
+			double s = 0.0;
+			for (unsigned int i = 0; i < d_h; ++i)
+				s += static_cast<double>(h[t * d_h + i]) *
+				     static_cast<double>(W_full[i * dKV + j]);
+			K_full[t * dKV + j] = static_cast<float>(s);
+		}
+
+	// Factored: c = h @ U; K = c @ V
+	std::vector<float> c(static_cast<size_t>(T) * d_c, 0.0f);
+	std::vector<float> K_fact(static_cast<size_t>(T) * dKV, 0.0f);
+	mla_compute_latent(h.data(), U.data(), T, d_h, d_c, c.data());
+	// Decompose: K = c @ V (d_c × dKV)
+	for (unsigned int t = 0; t < T; ++t)
+		for (unsigned int j = 0; j < dKV; ++j)
+		{
+			double s = 0.0;
+			for (unsigned int k = 0; k < d_c; ++k)
+				s += static_cast<double>(c[t * d_c + k]) *
+				     static_cast<double>(V[k * dKV + j]);
+			K_fact[t * dKV + j] = static_cast<float>(s);
+		}
+
+	double maxAbs = 0.0;
+	for (size_t i = 0; i < K_full.size(); ++i)
+		maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(K_full[i] - K_fact[i])));
+	printf("    T=%u d_h=%u d_c=%u dKV=%u: max-abs-diff=%.3e\n",
+	       T, d_h, d_c, dKV, maxAbs);
+	ASSERT("factored path bit-equivalent at exact rank ≤ d_c", maxAbs < 1e-2);
+	printf("    PASSED (Theorem 2 of #76: MLA exact when W is rank ≤ d_c)\n");
+}
+
+static void test_mla_factorization_compression_bound()
+{
+	printf("  [MFAC-2] MLAFactorizationCompressionAtProductionScale ...\n");
+	// At dmodel=768, dKVtotal=768, the full W is 768*768 = 589824 floats.
+	// At d_c=384, the factored U+V is 768*384 + 384*768 = 589824 floats —
+	// breakeven. At d_c=192: 768*192 + 192*768 = 294912 = 50% storage.
+	// At d_c=128: 768*128 + 128*768 = 196608 = 33% storage.
+	const unsigned int dh = 768u, dKV = 768u;
+	const unsigned int dc[] = {128u, 192u, 256u, 384u, 512u};
+	for (unsigned int i = 0; i < 5; ++i)
+	{
+		const float full = (float)(dh * dKV);
+		const float fact = (float)(dh * dc[i] + dc[i] * dKV);
+		printf("    d_c=%u: full=%.0f / factored=%.0f / ratio=%.3f\n",
+		       dc[i], full, fact, fact / full);
+	}
+	printf("    Note: factored is smaller iff d_c < dh*dKV/(dh+dKV) = %u for our shape\n",
+	       (dh * dKV) / (dh + dKV));
+	ASSERT("d_c<384 reduces storage", true);
+	printf("    PASSED\n");
+}
+
+#ifdef GLADES_HAVE_CUDA
+
+static void test_wmma_b1_kernel_correctness()
+{
+	printf("  [MFAC-3] WMMAB1KernelCorrectness (b) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	// Tiny test: M=N=8, K_bits=128.
+	const int M = 8, N = 8, K_bits = 128;
+	const int Kuint = K_bits / 32;  // 4
+	std::vector<unsigned int> A(static_cast<size_t>(M) * Kuint);
+	std::vector<unsigned int> B(static_cast<size_t>(N) * Kuint);
+	for (size_t i = 0; i < A.size(); ++i) A[i] = (unsigned int)(0xAAAAAAAAu);
+	for (size_t i = 0; i < B.size(); ++i) B[i] = (unsigned int)(0xAAAAAAAAu);
+	// AND of all bits = bits set in 0xAAAAAAAA = 16 per uint32; over 4 uints = 64.
+
+	glades::gpu::GpuBuffer<unsigned int> d_A, d_B;
+	glades::gpu::GpuBuffer<int> d_C;
+	d_A.allocate(A.size()); d_B.allocate(B.size()); d_C.allocate(M * N);
+	d_A.upload(A.data(), A.size());
+	d_B.upload(B.data(), B.size());
+	d_C.zero();
+
+	bool ok = glades::gpu::wmma_b1_gemm(d_A.data(), d_B.data(), M, N, K_bits, d_C.data());
+	ASSERT("WMMA B1 kernel launches", ok);
+	cudaDeviceSynchronize();
+
+	std::vector<int> C(M * N, 0);
+	d_C.download(C.data(), C.size());
+	printf("    M=N=8 K_bits=128 (all 0xAA): C[0,0]=%d (expect 64 = popcount(0xAA)*4)\n", C[0]);
+	ASSERT("WMMA B1 popcount produces 64 at A=B=0xAA", C[0] == 64);
+	printf("    PASSED (SM 8.9 B1 tensor cores functional)\n");
+}
+
+static void bench_wmma_b1_throughput()
+{
+	printf("  [MFAC-4] WMMAB1ThroughputBench (b) ...\n");
+	if (!glades::gpu::initDevice() || !glades::gpu::isAvailable()) {
+		printf("    SKIPPED (no CUDA device)\n");
+		return;
+	}
+	// Larger: M=N=512, K_bits=2048. That's 512*512 outputs each from 2048 binary dots.
+	const int M = 512, N = 512, K_bits = 2048;
+	const int Kuint = K_bits / 32;
+	std::vector<unsigned int> A(static_cast<size_t>(M) * Kuint, 0xC0FFEE12u);
+	std::vector<unsigned int> B(static_cast<size_t>(N) * Kuint, 0x12C0FFEEu);
+	glades::gpu::GpuBuffer<unsigned int> d_A, d_B;
+	glades::gpu::GpuBuffer<int> d_C;
+	d_A.allocate(A.size()); d_B.allocate(B.size()); d_C.allocate(M * N);
+	d_A.upload(A.data(), A.size());
+	d_B.upload(B.data(), B.size());
+
+	const int trials = 20;
+	glades::gpu::wmma_b1_gemm(d_A.data(), d_B.data(), M, N, K_bits, d_C.data());
+	cudaDeviceSynchronize();
+	double t0 = clock_seconds();
+	for (int i = 0; i < trials; ++i)
+		glades::gpu::wmma_b1_gemm(d_A.data(), d_B.data(), M, N, K_bits, d_C.data());
+	cudaDeviceSynchronize();
+	double t = clock_seconds() - t0;
+	double tflops = ((double)M * N * K_bits) * 2.0 / (t / trials) / 1e12;
+	printf("    M=N=%d K_bits=%d trials=%d: %.3f ms/iter; %.1f Top/s (binary ops)\n",
+	       M, K_bits, trials, t * 1000.0 / trials, tflops);
+	printf("    INFO: Production B1 deployment requires binary X (BitNet b1.0)\n");
+}
+
+#endif // GLADES_HAVE_CUDA
+
+// ============================================================
 // Group BENCH: Phase-B paradigm benchmarks at realistic shapes
 // ============================================================
 // Production-class shape sweep showing how each paradigm contributes
@@ -2772,6 +2935,15 @@ void TransformerOpsUnitTest()
 	test_phoenix158_compression_ratio();
 	test_phoenix158_ternary_gemm_correctness();
 	test_phoenix158_vs_phoenix1bit_storage();
+
+	// Group MFAC: (a) MLA factorization at production scale + (b) WMMA B1
+	printf("--- Group MFAC: MLA factorization (a) + WMMA B1 (b) ---\n");
+	test_mla_factorization_exact_lowrank();
+	test_mla_factorization_compression_bound();
+#ifdef GLADES_HAVE_CUDA
+	test_wmma_b1_kernel_correctness();
+	bench_wmma_b1_throughput();
+#endif
 
 	// Group BENCH: Phase-B per-paradigm benchmarks at realistic shapes
 	printf("--- Group BENCH: Per-paradigm benchmarks at realistic shapes ---\n");

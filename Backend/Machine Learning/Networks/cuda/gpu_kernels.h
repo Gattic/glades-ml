@@ -317,6 +317,14 @@ bool binary_gemm_abt_from_float(const float* X, const float* W,
 // Pair with cuBLAS bf16 sgemm via gpu_gemm_abt_mp for tensor-core throughput.
 bool binarize_to_bf16_signs(const float* W, uint16_t* W_bf16, size_t n);
 
+// (b) WMMA B1 tensor-core binary GEMM (SM 7.5+, including Ada SM 8.9).
+// C[M,N] (int32) = popcount( A_bits[M,K] AND B_bits[N,K] ) over K bits.
+// K_bits must be a multiple of 128. To recover ±1 GEMM:
+//   signed_dot = K_bits - 2 * popcount(A ^ B)
+// Production deployment requires binarizing both operands (BitNet b1.0 style).
+bool wmma_b1_gemm(const unsigned int* A_bits, const unsigned int* B_bits,
+                   int M, int N, int K_bits, int* C);
+
 // #76 MLA latent compression: c = h @ W_DKV via cuBLAS sgemm.
 bool mla_compute_latent_gpu(const float* h, const float* W_DKV,
                              int T, int d_h, int d_c, float* c_out);
@@ -679,6 +687,8 @@ inline bool phoenix_binary_gemm_gpu(const float*, const unsigned char*,
 inline bool binary_gemm_abt_from_float(const float*, const float*,
                                         int, int, int, float*) { return false; }
 inline bool binarize_to_bf16_signs(const float*, unsigned short*, size_t) { return false; }
+inline bool wmma_b1_gemm(const unsigned int*, const unsigned int*,
+                          int, int, int, int*) { return false; }
 inline bool mla_compute_latent_gpu(const float*, const float*,
                                     int, int, int, float*) { return false; }
 inline bool mla_decompress_kv_gpu(const float*, const float*, const float*,

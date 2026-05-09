@@ -5010,6 +5010,88 @@ bool binarize_to_bf16_signs(const float* W, uint16_t* W_bf16, size_t n)
 	return true;
 }
 
+// ============================================================================
+// (b) WMMA B1 tensor-core binary GEMM (Recommendation 2 deep path)
+// ============================================================================
+//
+// SM 7.5+ exposes B1 (sub-byte 1-bit) tensor cores via the WMMA C++ API.
+// Fragment shape: 8 × 8 × 128. Operation: XOR-popcount accumulation into INT32.
+//
+// Inputs (device pointers):
+//   A_bits: M × K bits, row-major; K must be divisible by 128.
+//   B_bits: N × K bits, row-major; K must be divisible by 128.
+//
+// Output:
+//   C: M × N int32, with c[m,n] = popcount( ~(A[m] ^ B[n]) ) over K bits.
+//   To convert XOR-popcount to ±1 GEMM:
+//     binary_dot(a, b) = K - 2 * popcount(a ^ b)
+//   So we can compute the standard ±1 dot product:  signed = K - 2 * c.
+//
+// This kernel is a CORRECTNESS demonstration — it shows the WMMA B1 path works
+// on Ada (SM 8.9). It is NOT yet wired into the trainer because the trainer's
+// activations are FP32/BF16, not 1-bit. Production B1 binary GEMM at training
+// time requires also binarizing X (BitNet b1.0 style).
+
+#include <mma.h>
+
+namespace {
+using namespace nvcuda;
+
+// One block computes a 8×8 output tile via single-warp WMMA fragment.
+__global__ void wmma_b1_gemm_kernel(const unsigned int* __restrict__ A_bits,
+                                    const unsigned int* __restrict__ B_bits,
+                                    int M, int N, int K_bits,
+                                    int* __restrict__ C)
+{
+	const int blkM = blockIdx.y * 8;
+	const int blkN = blockIdx.x * 8;
+	if (blkM >= M || blkN >= N) return;
+
+#if __CUDA_ARCH__ >= 750
+	wmma::fragment<wmma::matrix_a, 8, 8, 128, wmma::experimental::precision::b1, wmma::row_major> a_frag;
+	wmma::fragment<wmma::matrix_b, 8, 8, 128, wmma::experimental::precision::b1, wmma::col_major> b_frag;
+	wmma::fragment<wmma::accumulator, 8, 8, 128, int> c_frag;
+	wmma::fill_fragment(c_frag, 0);
+
+	const int Kuint = K_bits / 32;
+	for (int kBase = 0; kBase < Kuint; kBase += 4)
+	{
+		const unsigned int* a_ptr = A_bits + (size_t)blkM * Kuint + kBase;
+		const unsigned int* b_ptr = B_bits + (size_t)blkN * Kuint + kBase;
+		wmma::load_matrix_sync(a_frag, a_ptr, Kuint * 32);
+		wmma::load_matrix_sync(b_frag, b_ptr, Kuint * 32);
+		wmma::bmma_sync(c_frag, a_frag, b_frag, c_frag,
+		                wmma::experimental::bmmaBitOpAND,
+		                wmma::experimental::bmmaAccumulateOpPOPC);
+	}
+
+	// Store result (8×8 row-major)
+	const int rowsLeft = M - blkM;
+	const int colsLeft = N - blkN;
+	if (rowsLeft >= 8 && colsLeft >= 8)
+	{
+		wmma::store_matrix_sync(C + (size_t)blkM * N + blkN, c_frag, N, wmma::mem_row_major);
+	}
+#else
+	(void)A_bits; (void)B_bits; (void)M; (void)N; (void)K_bits; (void)C;
+#endif
+}
+} // anonymous
+
+// WMMA B1 binary GEMM: C[M,N] = popcount(A_bits[M,K] AND B_bits[N,K]) over K bits.
+// K_bits must be divisible by 128.
+bool wmma_b1_gemm(const unsigned int* A_bits, const unsigned int* B_bits,
+                   int M, int N, int K_bits, int* C)
+{
+	if (M <= 0 || N <= 0 || K_bits <= 0) return true;
+	if ((K_bits % 128) != 0) return false;
+	const dim3 block(32u, 1u, 1u);  // single warp per block
+	const dim3 grid((unsigned int)((N + 7) / 8), (unsigned int)((M + 7) / 8), 1u);
+	wmma_b1_gemm_kernel<<<grid, block, 0, computeStream()>>>(A_bits, B_bits, M, N, K_bits, C);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 // #78 backward wrapper.
 bool sw_attention_backward_gpu(const float* Q, int qStride,
                                 const float* K, int kStride,
