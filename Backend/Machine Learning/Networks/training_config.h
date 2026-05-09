@@ -1618,6 +1618,16 @@ struct MixedPrecisionConfig
 	// Requires GPU; takes the non-batched Adam path.
 	bool adamStateBf16;
 
+	// Store AdamW optimizer state (m as int8, v as uint8) with per-256-element
+	// FP32 absmax scales.  ~1.016 bytes/param/moment vs. 4 bytes FP32 (4× drop)
+	// or 2 bytes BF16 (~2× drop).  Mechanism: dequant on read with
+	// (val/127 or val/255) * scale, EMA in FP32, requantize on write via
+	// block-wide absmax reduction.  v uses unsigned [0,255] — doubles
+	// precision near zero where 1/√v matters most.  Ported from CHIRON
+	// (paradigm #11 MFIO mechanism).  Mutually exclusive with adamStateBf16
+	// when both are set; int8 wins (it's the more aggressive compression).
+	bool adamStateInt8;
+
 	// Loss scaling:
 	// - If enable==true and useLossScaling==true, backprop deltas are multiplied by lossScale
 	//   and the optimizer divides gradients by lossScale before applying updates.
@@ -1636,6 +1646,7 @@ struct MixedPrecisionConfig
 	    : enable(false),
 	      weightDType(WEIGHT_F16),
 	      adamStateBf16(false),
+	      adamStateInt8(false),
 	      useLossScaling(true),
 	      dynamicLossScaling(true),
 	      lossScaleInit(1024.0f),

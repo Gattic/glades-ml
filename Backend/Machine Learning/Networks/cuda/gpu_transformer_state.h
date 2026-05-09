@@ -120,10 +120,18 @@ struct GpuTransformerWeights
 	// optimizer step (ensureGpuLowpMirrors). Empty when mixed precision is off.
 	GpuBuffer<uint16_t> tokELowp;
 	// BF16 Adam state (m1, m2) — used when MixedPrecisionConfig::adamStateBf16
-	// is true. Exactly one of {vTokE, vTokE_bf16} and {v2TokE, v2TokE_bf16}
-	// is allocated at a time to save VRAM; allocate() picks based on config.
+	// is true. Exactly one of {vTokE, vTokE_bf16, vTokE_int8} (and corresponding
+	// v2) is allocated at a time to save VRAM; allocate() picks based on config.
 	GpuBuffer<uint16_t> vTokE_bf16;
 	GpuBuffer<uint16_t> v2TokE_bf16;
+	// int8 Adam state — used when MixedPrecisionConfig::adamStateInt8 is true.
+	// Storage: m as int8 [N], v as uint8 [N], plus FP32 absmax scales per
+	// 256-element block (ceil(N/256) entries each).  ~1.016 bytes/param/moment
+	// vs 2 bytes BF16 vs 4 bytes FP32.  Ported from CHIRON paradigm #11 MFIO.
+	GpuBuffer<int8_t>  vTokE_int8;
+	GpuBuffer<uint8_t> v2TokE_int8;
+	GpuBuffer<float>   vTokEScale;
+	GpuBuffer<float>   v2TokEScale;
 
 	// LM head bias: [vocabSize]
 	GpuBuffer<float> lmBias;
@@ -139,6 +147,10 @@ struct GpuTransformerWeights
 	GpuBuffer<uint16_t> WInLowp;
 	GpuBuffer<uint16_t> vWIn_bf16;
 	GpuBuffer<uint16_t> v2WIn_bf16;
+	GpuBuffer<int8_t>   vWIn_int8;
+	GpuBuffer<uint8_t>  v2WIn_int8;
+	GpuBuffer<float>    vWInScale;
+	GpuBuffer<float>    v2WInScale;
 	GpuBuffer<float> bIn;    // [dModel]
 	GpuBuffer<float> mBIn;
 	GpuBuffer<float> v2BIn;
@@ -152,6 +164,10 @@ struct GpuTransformerWeights
 	GpuBuffer<uint16_t> WOutLowp;
 	GpuBuffer<uint16_t> vWOut_bf16;
 	GpuBuffer<uint16_t> v2WOut_bf16;
+	GpuBuffer<int8_t>   vWOut_int8;
+	GpuBuffer<uint8_t>  v2WOut_int8;
+	GpuBuffer<float>    vWOutScale;
+	GpuBuffer<float>    v2WOutScale;
 	GpuBuffer<float> bOut;   // [outSize]
 	GpuBuffer<float> mBOut;
 	GpuBuffer<float> v2BOut;
@@ -219,6 +235,11 @@ struct GpuTransformerWeights
 		// BF16 Adam state (used when adamStateBf16=true, saves ~2x VRAM).
 		GpuBuffer<uint16_t> vWq_bf16, vWk_bf16, vWv_bf16, vWo_bf16;
 		GpuBuffer<uint16_t> v2Wq_bf16, v2Wk_bf16, v2Wv_bf16, v2Wo_bf16;
+		// int8 Adam state (used when adamStateInt8=true, saves ~4x VRAM vs FP32).
+		GpuBuffer<int8_t>  vWq_int8, vWk_int8, vWv_int8, vWo_int8;
+		GpuBuffer<uint8_t> v2Wq_int8, v2Wk_int8, v2Wv_int8, v2Wo_int8;
+		GpuBuffer<float>   vWqScale, vWkScale, vWvScale, vWoScale;
+		GpuBuffer<float>   v2WqScale, v2WkScale, v2WvScale, v2WoScale;
 		GpuBuffer<float> bq, bk, bv, bo;     // [dModel] or [dModelKV]
 		GpuBuffer<float> mBq, mBk, mBv, mBo;
 		GpuBuffer<float> v2Bq, v2Bk, v2Bv, v2Bo;
@@ -240,6 +261,10 @@ struct GpuTransformerWeights
 		GpuBuffer<float> v2W1, v2W2;
 		GpuBuffer<uint16_t> vW1_bf16, vW2_bf16;
 		GpuBuffer<uint16_t> v2W1_bf16, v2W2_bf16;
+		GpuBuffer<int8_t>  vW1_int8, vW2_int8;
+		GpuBuffer<uint8_t> v2W1_int8, v2W2_int8;
+		GpuBuffer<float>   vW1Scale, vW2Scale;
+		GpuBuffer<float>   v2W1Scale, v2W2Scale;
 		GpuBuffer<float> gW1, gW2;
 		GpuBuffer<uint16_t> W1Lowp, W2Lowp;
 		GpuBuffer<float> b1, b2;     // [dFF or 2*dFF], [dModel]
@@ -381,7 +406,8 @@ struct GpuTransformerWeights
 	              unsigned int ffnKind, bool tokenModel, bool tieEmbeddings,
 	              bool skipAdamBufs = false,
 	              bool adamStateBf16 = false,
-	              int mlaLatentDim = 0);
+	              int mlaLatentDim = 0,
+	              bool adamStateInt8 = false);
 
 	// Free all GPU memory.
 	void free();

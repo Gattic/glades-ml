@@ -61,17 +61,41 @@ static bool allocBuf(GpuBuffer<uint16_t>& buf, size_t n)
 	return buf.allocate(n);
 }
 
+static bool allocBuf(GpuBuffer<int8_t>& buf, size_t n)
+{
+	if (n == 0)
+		return true;
+	return buf.allocate(n);
+}
+
+static bool allocBuf(GpuBuffer<uint8_t>& buf, size_t n)
+{
+	if (n == 0)
+		return true;
+	return buf.allocate(n);
+}
+
 bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned int nh,
                                       unsigned int nkvh, unsigned int nl,
                                       unsigned int vs, unsigned int is, unsigned int os,
                                       unsigned int ffk, bool tm, bool te,
                                       bool skipAdamBufs,
                                       bool adamStateBf16,
-                                      int mlaLatentDim)
+                                      int mlaLatentDim,
+                                      bool adamStateInt8)
 {
 	free();
-	const bool allocFpMV  = !skipAdamBufs && !adamStateBf16;
-	const bool allocBfMV  = !skipAdamBufs &&  adamStateBf16;
+	// int8 wins over bf16 if both flags accidentally set (it's the more
+	// aggressive compression — see MixedPrecisionConfig comments).
+	const bool useInt8    = adamStateInt8 && !skipAdamBufs;
+	const bool useBf16    = adamStateBf16 && !skipAdamBufs && !useInt8;
+	const bool allocFpMV  = !skipAdamBufs && !useBf16 && !useInt8;
+	const bool allocBfMV  = useBf16;
+	const bool allocI8MV  = useInt8;
+	// Per-256-element absmax-scale array length (matches ADAM_INT8_BS in the
+	// kernel).  Kept inline here so this header doesn't need to reach into
+	// gpu_kernels.h for the constant.
+	#define I8_SCALE_N(n_) (((n_) + 255UL) >> 8)
 
 	dModel = dm;
 	dFF = df;
@@ -97,6 +121,13 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (allocFpMV && !allocBuf(v2TokE, (size_t)vs * dm)) return false;
 		if (allocBfMV && !allocBuf(vTokE_bf16, (size_t)vs * dm)) return false;
 		if (allocBfMV && !allocBuf(v2TokE_bf16, (size_t)vs * dm)) return false;
+		if (allocI8MV) {
+			const size_t n_ = (size_t)vs * dm;
+			if (!allocBuf(vTokE_int8,   n_))               return false;
+			if (!allocBuf(v2TokE_int8,  n_))               return false;
+			if (!allocBuf(vTokEScale,   I8_SCALE_N(n_)))   return false;
+			if (!allocBuf(v2TokEScale,  I8_SCALE_N(n_)))   return false;
+		}
 		if (!allocBuf(gTokE, (size_t)vs * dm)) return false;
 		if (!allocBuf(lmBias, vs)) return false;
 		if (!skipAdamBufs && !allocBuf(mLmBias, vs)) return false;
@@ -112,6 +143,13 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (allocFpMV && !allocBuf(v2WIn, (size_t)dm * is)) return false;
 		if (allocBfMV && !allocBuf(vWIn_bf16, (size_t)dm * is)) return false;
 		if (allocBfMV && !allocBuf(v2WIn_bf16, (size_t)dm * is)) return false;
+		if (allocI8MV) {
+			const size_t n_ = (size_t)dm * is;
+			if (!allocBuf(vWIn_int8,   n_))               return false;
+			if (!allocBuf(v2WIn_int8,  n_))               return false;
+			if (!allocBuf(vWInScale,   I8_SCALE_N(n_)))   return false;
+			if (!allocBuf(v2WInScale,  I8_SCALE_N(n_)))   return false;
+		}
 		if (!allocBuf(gWIn, (size_t)dm * is)) return false;
 		if (!allocBuf(bIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(mBIn, dm)) return false;
@@ -127,6 +165,13 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (allocFpMV && !allocBuf(v2WOut, (size_t)os * dm)) return false;
 		if (allocBfMV && !allocBuf(vWOut_bf16, (size_t)os * dm)) return false;
 		if (allocBfMV && !allocBuf(v2WOut_bf16, (size_t)os * dm)) return false;
+		if (allocI8MV) {
+			const size_t n_ = (size_t)os * dm;
+			if (!allocBuf(vWOut_int8,   n_))               return false;
+			if (!allocBuf(v2WOut_int8,  n_))               return false;
+			if (!allocBuf(vWOutScale,   I8_SCALE_N(n_)))   return false;
+			if (!allocBuf(v2WOutScale,  I8_SCALE_N(n_)))   return false;
+		}
 		if (!allocBuf(gWOut, (size_t)os * dm)) return false;
 		if (!allocBuf(bOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(mBOut, os)) return false;
@@ -181,6 +226,28 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (allocBfMV && !allocBuf(b.v2Wk_bf16, (size_t)dm * dModelKV)) return false;
 		if (allocBfMV && !allocBuf(b.v2Wv_bf16, (size_t)dm * dModelKV)) return false;
 		if (allocBfMV && !allocBuf(b.v2Wo_bf16, (size_t)dm * dm)) return false;
+		if (allocI8MV) {
+			const size_t nQ = (size_t)dm * dm;
+			const size_t nK = (size_t)dm * dModelKV;
+			const size_t nV = (size_t)dm * dModelKV;
+			const size_t nO = (size_t)dm * dm;
+			if (!allocBuf(b.vWq_int8,   nQ))             return false;
+			if (!allocBuf(b.vWk_int8,   nK))             return false;
+			if (!allocBuf(b.vWv_int8,   nV))             return false;
+			if (!allocBuf(b.vWo_int8,   nO))             return false;
+			if (!allocBuf(b.v2Wq_int8,  nQ))             return false;
+			if (!allocBuf(b.v2Wk_int8,  nK))             return false;
+			if (!allocBuf(b.v2Wv_int8,  nV))             return false;
+			if (!allocBuf(b.v2Wo_int8,  nO))             return false;
+			if (!allocBuf(b.vWqScale,   I8_SCALE_N(nQ))) return false;
+			if (!allocBuf(b.vWkScale,   I8_SCALE_N(nK))) return false;
+			if (!allocBuf(b.vWvScale,   I8_SCALE_N(nV))) return false;
+			if (!allocBuf(b.vWoScale,   I8_SCALE_N(nO))) return false;
+			if (!allocBuf(b.v2WqScale,  I8_SCALE_N(nQ))) return false;
+			if (!allocBuf(b.v2WkScale,  I8_SCALE_N(nK))) return false;
+			if (!allocBuf(b.v2WvScale,  I8_SCALE_N(nV))) return false;
+			if (!allocBuf(b.v2WoScale,  I8_SCALE_N(nO))) return false;
+		}
 		if (!allocBuf(b.gWq, (size_t)dm * dm)) return false;
 		if (!allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
@@ -246,6 +313,18 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (allocBfMV && !allocBuf(b.vW2_bf16, (size_t)dm * df)) return false;
 		if (allocBfMV && !allocBuf(b.v2W1_bf16, (size_t)ff1Width * dm)) return false;
 		if (allocBfMV && !allocBuf(b.v2W2_bf16, (size_t)dm * df)) return false;
+		if (allocI8MV) {
+			const size_t n1 = (size_t)ff1Width * dm;
+			const size_t n2 = (size_t)dm * df;
+			if (!allocBuf(b.vW1_int8,   n1))             return false;
+			if (!allocBuf(b.vW2_int8,   n2))             return false;
+			if (!allocBuf(b.v2W1_int8,  n1))             return false;
+			if (!allocBuf(b.v2W2_int8,  n2))             return false;
+			if (!allocBuf(b.vW1Scale,   I8_SCALE_N(n1))) return false;
+			if (!allocBuf(b.vW2Scale,   I8_SCALE_N(n2))) return false;
+			if (!allocBuf(b.v2W1Scale,  I8_SCALE_N(n1))) return false;
+			if (!allocBuf(b.v2W2Scale,  I8_SCALE_N(n2))) return false;
+		}
 		if (!allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
 		if (!allocBuf(b.gW2, (size_t)dm * df)) return false;
 		if (!allocBuf(b.b1, ff1Width)) return false;
