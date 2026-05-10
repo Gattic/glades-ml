@@ -10133,6 +10133,19 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			storeRunningFlag(false);
 			return;
 		}
+		// bf16-weights mode: now that the bf16 mirrors are populated, free the
+		// FP32 weight masters to recover ~3.7 GB at 1.84B.  Guarded against
+		// paradigm-#74 binary FFN (which reads gb.W1/W2 FP32 directly), atlas
+		// optimizer (which reads gb.Wq/etc FP32 in atlas_gpu_update), and
+		// MLA (Wdkv/Wuk/Wuv reads remain FP32 — those are NOT freed by
+		// freeFp32Masters).  In Stage 7c default usage this means
+		// `--bf16-weights` without `--binary-ffn` and with Adam (not atlas).
+		if (trainingConfig.mixedPrecision.weightStorageBf16
+		    && !trainingConfig.transformer.binaryFFN
+		    && trainingConfig.optimizer.type != glades::OptimizerConfig::ATLAS)
+		{
+			gpuTransformerWeights->freeFp32Masters();
+		}
 	}
 
 	TransformerGpuPerfBreakdown* gpuPerf =

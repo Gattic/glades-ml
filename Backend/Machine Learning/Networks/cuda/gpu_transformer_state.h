@@ -462,6 +462,19 @@ struct GpuTransformerWeights
 	// after every optimizer step while mixed precision is enabled.
 	// Returns false if any device allocation or cast kernel dispatch fails.
 	bool ensureLowpMirrors();
+
+	// bf16-weights mode: free the FP32 weight masters AFTER the bf16 mirrors
+	// have been populated by the first ensureLowpMirrors call.  Steady-state
+	// memory savings: ~3.7 GB at 1.84B (per-block Wq/Wk/Wv/Wo/W1/W2 + WIn +
+	// WOut + tokE).  No-op when lowpIsCanonical=false (the flag set by
+	// allocate() when weightStorageBf16=true).  Safe to call repeatedly:
+	// idempotent (frees already-freed buffers as no-op).
+	//
+	// Caller MUST guarantee the FP32 masters are no longer needed at any
+	// downstream call site.  Currently safe call sites are post-init in
+	// transformerGpuTrainEpoch under the recipe (--bf16-weights without
+	// --binary-ffn / without atlas).  See site comment for the guards.
+	void freeFp32Masters();
 };
 
 // GPU-resident forward/backward scratch buffers for transformer training.

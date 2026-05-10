@@ -147,7 +147,11 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF; // SwiGLU vs MLP
 
-	// Token embedding
+	// Token embedding.  FP32 master always allocated here so
+	// uploadTransformerWeights can write into it; freed AFTER the first
+	// ensureLowpMirrors cast when useBf16Weights_=true (see freeFp32Masters
+	// below).  Forward gather/GEMM checks gb.tokE.size() to route through
+	// the bf16 mirror once the master is freed.
 	if (tokenModel)
 	{
 		if (!allocBuf(tokE, (size_t)vs * dm)) return false;
@@ -187,7 +191,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(gLmBias, vs)) return false;
 	}
 
-	// Input projection
+	// Input projection.  FP32 master allocated for upload; freed by
+	// freeFp32Masters when useBf16Weights_=true.
 	if (!tokenModel)
 	{
 		if (!allocBuf(WIn, (size_t)dm * is)) return false;
@@ -210,7 +215,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(gBIn, dm)) return false;
 	}
 
-	// Output projection
+	// Output projection.  FP32 master allocated for upload; freed by
+	// freeFp32Masters when useBf16Weights_=true.
 	if (!tokenModel)
 	{
 		if (!allocBuf(WOut, (size_t)os * dm)) return false;
@@ -259,7 +265,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gLn1Gamma, dm)) return false;
 		if (!allocBuf(b.gLn1Beta, dm)) return false;
 
-		// QKV+O projections
+		// QKV+O projections.  FP32 master allocated for upload; freed by
+		// freeFp32Masters when useBf16Weights_=true.
 		if (!allocBuf(b.Wq, (size_t)dm * dm)) return false;
 		if (!allocBuf(b.Wk, (size_t)dm * dModelKV)) return false;
 		if (!allocBuf(b.Wv, (size_t)dm * dModelKV)) return false;
@@ -367,7 +374,11 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		if (!allocBuf(b.gLn2Gamma, dm)) return false;
 		if (!allocBuf(b.gLn2Beta, dm)) return false;
 
-		// FFN
+		// FFN.  FP32 master allocated for upload; freed by freeFp32Masters
+		// when useBf16Weights_=true.  IMPORTANT: if paradigm-#74 binary FFN is
+		// enabled, the forward pass reads gb.W1/W2 FP32 master directly
+		// (sign() discretization) — incompatible with retire.  See the
+		// freeFp32Masters site in sgd_transformer for the binaryFFN guard.
 		if (!allocBuf(b.W1, (size_t)ff1Width * dm)) return false;
 		if (!allocBuf(b.W2, (size_t)dm * df)) return false;
 		if (allocFpMV && !allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
@@ -627,6 +638,32 @@ bool GpuTransformerWeights::ensureLowpMirrors()
 	// lowpDType is set by the caller (sgd_transformer) based on
 	// TrainingConfig.mixedPrecision.weightDType; only BF16 is supported here.
 	return true;
+}
+
+void GpuTransformerWeights::freeFp32Masters()
+{
+	if (!initialized) return;
+	if (!lowpIsCanonical) return;  // not in bf16-weights canonical mode
+	if (!lowpReady) return;        // mirrors not yet built — refuse to free
+
+	// Free FP32 master buffers whose forward path now reads from the bf16
+	// mirror.  GpuBuffer::free() is idempotent — safe if already freed.
+	if (tokenModel) tokE.free();
+	WIn.free();
+	WOut.free();
+	for (unsigned int li = 0; li < nLayers; ++li)
+	{
+		Block& b = blocks[li];
+		b.Wq.free();
+		b.Wk.free();
+		b.Wv.free();
+		b.Wo.free();
+		b.W1.free();
+		b.W2.free();
+	}
+	// MLA tensors (Wdkv/Wuk/Wuv) NOT freed — paradigm-#76 mla_attention_forward_gpu
+	// reads them as FP32 directly.  Adding bf16 dispatch is future Stage 7d.
+	// LN/bias tensors NOT freed — small absolute size, no bf16 dispatch.
 }
 
 // ---- GpuTransformerScratch ----
