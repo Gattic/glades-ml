@@ -945,3 +945,87 @@ plenty of headroom).  At 1.84B, scaling factor ~9× → ~30 GB without
 savings, ~12-15 GB with savings.  Fitting in 16 GB without
 `--grad-checkpoint` is plausible IF FP32 master is actually retired
 (saves ~3.7 GB).
+
+---
+
+## 2026-05-10 update — Stage 7 retire SHIPPED + 770M validation
+
+### Stage 7 commit chain
+
+- **7a** (339c0753f): `embedding_gather_bf16` kernel + dispatch.
+- **7c** (4db56f9a1): `freeFp32Masters()` runs post-init under
+  `--bf16-weights` (gated against binary-FFN/atlas).
+- **7c-followup** (7c6224796): bf16-aware weight download for the
+  sync-to-CPU and checkpoint-save paths.
+
+### Two findings on this iteration
+
+**1. 770M trains successfully with retire active (no checkpoint).**
+
+| Config (770M, dmodel=2048, L=24, dff=4096, T=512)            | tok/s | NLL final |
+|--------------------------------------------------------------|------:|----------:|
+| `--bf16-weights --adam-state-int8` (post-Stage-7 retire)     | 2301  | 10.7778   |
+
+Tokens·params/sec = 770M × 2301 = **1.77 × 10¹²**.
+
+Comparison vs CHIRON 1.84B headline (3.06 × 10¹² from prior):
+flagship-770M runs at 58% of CHIRON-1.84B tokens·params/sec — but at
+less than half the parameters.  The actual head-to-head requires the
+1.84B run.
+
+**2. The 1.84B run is blocked by the CPU-side `net.test()`
+initializer.**
+
+Two attempted launches today both stalled at >30 min of pure CPU
+init time (52 GB host RSS, 100% single-thread CPU, 0% GPU util).
+The bottleneck is single-threaded: even with `--test-tokens 1`, the
+init scales super-linearly with model size.  At 770M init takes
+seconds; at 1.84B it takes >>30 min (we never reached first NLL).
+
+**Root cause TBD** but suspected `net.test()`'s sequence-1 forward
+runs CPU even though tensors are GPU-resident — the prior fix
+"--test-tokens 1" only reduced token count, not the per-layer init
+cost.  Future Stage 8: profile and skip/parallelize the offending
+init code.
+
+### Disk-full caveat (host system)
+
+The 770M smoke's checkpoint save fails with
+"failed while writing shard data" — but that's because `/dev/sda2`
+is **at 100% capacity** (1.7 TB used / 1.8 TB), not because of any
+code path.  Training itself succeeds; only the post-train save is
+affected.  Out of scope for the flagship-vs-CHIRON work.
+
+### Cumulative pivot status
+
+- ✓ Memory-savings stack works without checkpoint (FASTER than
+  baseline at 213M, +7.0%).
+- ✓ FP32 master retire works (+0.7% additional, 213M).
+- ✓ bf16-aware sync/download path works (770M end-to-end success).
+- ✗ 1.84B head-to-head still blocked on CPU init bottleneck.
+- ✓ Memory parity prerequisite established (rationale for retire);
+  next priority per pivot reframe is a SPEED paradigm.
+
+### Recommended next-iteration work
+
+Given the 1.84B init blocker, two parallel paths:
+
+**Path A (unblock 1.84B):** Profile and fix the slow CPU
+`net.test()` initializer.  May involve:
+- Skip init test entirely under a flag (`--no-init-test`)
+- Parallelize the per-layer init (currently single-threaded)
+- Move init forward to GPU completely (CPU only orchestrates)
+
+**Path B (start a speed/NLL paradigm at smaller scale):**
+- **NIMBUS (#52)** — async CPU Adam pipelined with GPU forward.
+  ~750 LOC, 3 weeks engineering.  Pure compute speedup ~1.33× at
+  1.84B.  Composes with everything.
+- **SOPHIA (#55)** — second-order optimizer with Hutchinson
+  Hessian.  ~600 LOC, 3 weeks.  2× steps reduction to fixed final
+  NLL (NLL improvement at fixed compute).
+- Either can be validated at 213M-770M and projected to 1.84B once
+  the init blocker is resolved.
+
+Path B is the user's directional priority (speed/NLL via paradigms)
+and produces measurable signal at smaller scales without waiting on
+Path A.
