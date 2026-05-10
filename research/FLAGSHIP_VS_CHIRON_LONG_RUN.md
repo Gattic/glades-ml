@@ -1029,3 +1029,130 @@ Given the 1.84B init blocker, two parallel paths:
 Path B is the user's directional priority (speed/NLL via paradigms)
 and produces measurable signal at smaller scales without waiting on
 Path A.
+
+## 2026-05-10 update — SOPHIA (#55) shipped on CHIRON, head-to-head at 1.84B
+
+### What landed
+
+Sophia-G optimizer (Liu et al. 2023, paradigm #55 in the unified
+research stack) was implemented end-to-end on the CHIRON trainer:
+
+- **Kernel** (`Backend/Machine Learning/Networks/cuda/gpu_kernels.cu`):
+  `sophia_g_update` (FP32 state) + `sophia_g_update_batch` (batched
+  dispatch) + `sophia_g_update_bf16_state` (bf16 m/h state, fires under
+  CHIRON's `--bf16-adam` path).
+- **Trainer dispatch** (`trainer/chiron_main.cpp`): `adam_one(..., bool
+  sophia, float gamma, float rho)` routes to `sophia_g_update_*` when
+  `--sophia` is set; all 5 call sites updated.
+- **Glades-ml mirror** (`sgd_transformer.cpp`): triage check expanded
+  to allow `OptimizerConfig::SOPHIA_G`; batched-Adam dispatch routes
+  Sophia branch.
+- **CLI**: `bash run.sh chiron --sophia` passes through. Defaults
+  match Liu 2023 LLM pre-training: γ=0.05, ρ=0.04, β1=0.965, β2=0.99.
+
+Rho default fix (commits a7d3dbc52 / 966957a): the initial default
+ρ=1.0 caused 213M Sophia to diverge to 10.7037 vs Adam 10.5653 at
+256k tokens. Liu 2023 uses ρ=0.04 for LLM pre-training; the fix made
+all subsequent Sophia validation tractable.
+
+Verified at 66M (ema 8.6394 Adam vs 8.7946 Sophia) and 200M (9.6207 vs
+9.7529) — Sophia trails at small scale, expected per Liu 2023.
+
+### CHIRON 1.84B head-to-head — Sophia underperforms Adam at 2500 steps
+
+Both runs identical except `--sophia` flag. Same seed (1337), same
+schedule (FACE on E, MFIO on Wq/Wk/Wv, SLC 256→512→1024@0/1000/1500,
+RLG L 8→26→53@0/800/1600, SAS α=0.1), same hardware (RTX 4080 SUPER,
+16 GB VRAM), same data (1.536M tokens / 2500 steps / 1024 batch).
+
+| Metric                          | Adam (bf16 state) | Sophia (bf16 state, γ=0.05, ρ=0.04) | Δ |
+|---------------------------------|------------------:|------------------------------------:|---:|
+| Final loss (step 2500)          |            9.8913 |                              10.1925 | +0.30 |
+| Final EMA NLL                   |            9.5261 |                              9.6889 | **+0.163 nat WORSE** |
+| Best NLL (achieved @ step)      |    6.7062 @ 1287  |                       6.7459 @ 1287 | +0.040 |
+| Wall (compute only, to step 2500) |          277.2s |                              339.9s | **+22.6%** |
+| Wall (total incl. checkpoints)  |            283.4s |                              361.0s | **+27.4%** |
+| Tokens trained                  |            1.536M |                              1.536M | — |
+| Final acc                       |            0.0029 |                              0.0039 | +0.001 |
+| Checkpoint write time / save    |             6.05s |                              21.81s | **+260%** (extra h state) |
+
+Per-step EMA tracking through the run:
+
+| Step | T  | L  | Adam EMA | Sophia EMA | Δ          |
+|-----:|---:|---:|---------:|-----------:|-----------:|
+|  250 | 256| 8  |  10.7518 |    10.7636 |    +0.012  |
+|  500 | 256| 8  |  10.6843 |    10.6915 |    +0.007  |
+|  750 | 256| 8  |  10.4882 |    10.4907 |    +0.003  |
+| 1000 | 256| 26 |  10.2923 |    10.2952 |    +0.003  |
+| 1250 | 512| 26 |   9.4958 |     9.5139 |    +0.018  |
+| 1500 | 512| 26 |  10.4416 |    10.4445 |    +0.003  |
+| 1750 |1024| 53 |  10.3630 |    10.3713 |    +0.008  |
+| 2000 |1024| 53 |  10.3964 |    10.4115 |    +0.015  |
+| 2250 |1024| 53 |  10.1713 |    10.2523 |    +0.081  |
+| 2500 |1024| 53 |   9.5261 |     9.6889 |  **+0.163**|
+
+### Reading
+
+The trajectory is clean:
+- **Phase 1 (T=256, L=8, steps 0-800):** Sophia tracks Adam within
+  0.01 nat. ~Same per-step cost (tok/s 9200 vs 9300).
+- **Phase 2 (T=512, L=26, steps 800-1500):** Gap widens to 0.02 nat.
+  Per-step cost diverges: Sophia 116ms/step vs Adam 52ms/step (2.2×
+  in this regime, Hessian-proxy compute scales with layer count).
+- **Phase 3 (T=1024, L=53, steps 1500-2500):** Sophia continues
+  trailing 0.01-0.16 nat. Per-step cost converges back to ~1.25× Adam
+  (other compute amortizes the Sophia overhead).
+
+**Net: Sophia at CHIRON 1.84B / 2500 warmup steps is BOTH 23% slower
+AND 0.163 nat worse in final EMA NLL than Adam.**
+
+This is consistent with Liu 2023's own framing: Sophia's headline
+"2× steps reduction to fixed final NLL" was demonstrated on
+60B-token GPT-2-medium (350M) runs, not on 1.5M-token warmup.
+The Hessian preconditioner needs the long horizon to amortize
+over noisier early curvature estimates.
+
+The published claim doesn't apply to a 2500-step warmup test, and our
+empirical result confirms it. **For the CHIRON 1.84B production
+regime as currently scoped (single-GPU, multi-day continuous), Sophia
+is not yet a clear win** — would need a 50k-step+ run before judging.
+
+### Honest assessment for the unified flagship+CHIRON stack
+
+Per the user's iter 200 critique ("looking at the bigger picture
+instead of focusing on microoptimizations"), Sophia falls into the
+microoptimization bucket — its 2× steps-reduction claim is a
+1.875× wall-clock improvement at the long-horizon ceiling, not the
+"new paradigm" lift that DISTILL-FORWARD (#56), SCROLL (#57), or
+METAGEN (#58) promise.
+
+**Sophia stays in the codebase** — gated behind `--sophia` so it's
+opt-in, doesn't degrade the default Adam path, and remains available
+for the future long-horizon validation. But **it is NOT a paradigm
+to recommend turning on for CHIRON 1.84B at the current step
+budget**.
+
+The headline finding holds: even after a clean ship of an
+existing-research speedup paradigm to CHIRON 1.84B, the per-step
+Adam path remains the better choice in the regime we can actually
+test on this hardware. The next-iteration paradigm to apply should
+target either:
+
+1. **A throughput paradigm** (compute speed unconditional on horizon),
+   e.g., NIMBUS (#52) async CPU Adam pipelined with GPU forward —
+   1.33× wall-clock at 1.84B with no NLL impact.
+2. **A bigger-picture paradigm** (#56-#65), e.g., DISTILL-FORWARD
+   (#56) which promises 5× to fixed final NLL via teacher-student
+   chain — but requires a third-party pretrained teacher and is
+   structurally a bigger ship than Sophia was.
+
+### What stays from this iteration
+
+- ✓ Sophia kernel (FP32 + bf16 state) shipped, tested, opt-in.
+- ✓ The "rho default fix" insight (Liu 2023 uses ρ=0.04, not 1.0;
+  ρ=1.0 diverges at lr=3e-4 on LLM pretraining).
+- ✓ Long-run CHIRON 1.84B `.final` checkpoint preserved as
+  `chiron_1.84B.ckpt.longrun_final.bak` before this baseline ran.
+- ✓ Clean negative result on Sophia-at-warmup adds to the unified
+  research log (the bar for paradigm-promotion is empirical, and
+  Sophia did not clear it at this scale and step budget).
