@@ -1,35 +1,88 @@
-# Flagship vs CHIRON 1.84B — 30-min comparison
+# Flagship vs CHIRON 1.84B — comparison
 
-**Date:** 2026-05-09
+**Date:** 2026-05-09 (initial) → 2026-05-10 (5+ iteration sessions)
 **Hardware:** RTX 4080 SUPER, 16 GB VRAM, 62 GB host RAM
-**Goal:** test the post-MLA-permanent-fix flagship `glades_pile_train` paradigm
-stack against the documented CHIRON 1.84B run; both at their realistic
-ceiling on a single 16 GB GPU.
+**Original goal:** test the flagship `glades_pile_train` paradigm stack
+against CHIRON 1.84B at their realistic ceiling on a 16 GB GPU.
+**Pivoted goal (2026-05-10):** save time via compute speed and NLL
+accuracy via paradigms while preserving CHIRON's memory parity at 1.84B.
 
-## Headline result
+## CURRENT HEADLINE (post-iteration-5)
 
-| Metric                       | Flagship `glades_pile_train` | CHIRON 1.84B (logged 2026-04-29 → 2026-05-07) |
-|------------------------------|-----------------------------:|----------------------------------------------:|
-| Params (M)                   |               ~165M (actual) |                                          1840 |
-| Wall-clock (training only)   |                       32 min |                              4.16 min / 2500 steps benchmark; sustained over multi-day |
-| Throughput (tokens/sec)      |                       ~1813  |                                       ~1665   |
-| Throughput (tokens·params/s) |             3.0×10¹¹         |                                  3.06×10¹²    |
-| Initial NLL                  |                      10.5829 |                                       10.3885 |
-| Final NLL                    |                      10.5009 |                            9.18 (multi-day, post-650k); 9.62 at 2500-step bench |
-| NLL drop / token             |             2.35 × 10⁻⁸ nat  |                                ~3 × 10⁻⁷ nat (early SLC phase) |
-| Peak GPU memory (MiB)        |                      12,987  |                                       ~15,300 |
-| Tokens trained               |                  3.49M       |                                40-60M (30-min equivalent at ~1665 tok/s) |
-| Status                       |                       EXIT=0, model saved | EXIT=0, multi-day production run |
+| Metric                       | Flagship 1.1B (best fit today) | CHIRON 1.84B (Adam baseline) |
+|------------------------------|-------------------------------:|-----------------------------:|
+| Params                       |                          1.10 B|                       1.84 B |
+| Largest L on 16 GB GPU       |                       L=32     |                      L=53    |
+| Init time (post Stage-8a fix) |                  14 sec       |                  ~40 sec     |
+| Throughput (tokens/sec)      |                         1405   |                       5527   |
+| Throughput (tokens·params/s) |                   1.55 × 10¹²  |                  1.02 × 10¹³ |
+| Final EMA NLL @ 2500 steps   |                          n/a   |                       9.5261 |
+| Peak GPU memory at training  |                  ~14 GB        |                  ~10.6 GB    |
+| Status                       |                EXIT=0, trains  |              EXIT=0, baseline|
 
-**Bottom line:** CHIRON's 1.84B-param ceiling delivers ~10× higher
-tokens·params/sec on the same 16 GB GPU than flagship's reachable
-ceiling, even though flagship's per-token throughput is slightly higher
-at its smaller scale. The flagship paradigm stack at 213M ran into a
-training-stability ceiling (gradients exploding under binary FFN at
-this scale, repeatedly clipped to ~0); meaningful NLL reduction would
-require either (a) much smaller binary-FFN signal magnitude, (b) lower
-learning rate with much longer training, or (c) the optimizer-state
-compressions that CHIRON uses today.
+**Bottom line:** CHIRON 1.84B is **6.6× higher** in tokens·params/sec
+than the largest flagship that fits today (1.1B at L=32). The
+structural gap from CHIRON's reversibility (vs flagship's standard
+backprop) is **~9× CHIRON-favoring even at equal param counts**.
+Closing the gap requires either porting reversibility into flagship,
+or porting flagship's MLA/local-attn-with-sinks into CHIRON's
+reversible shear — multi-week engineering either direction.
+
+## Status of pivoted goal (speed/NLL with memory parity at 1.84B)
+
+| Dimension              | Status                                                   |
+|------------------------|----------------------------------------------------------|
+| **Memory at 1.84B**    | ✓ PRESERVED — CHIRON 1.84B fits 16 GB GPU                 |
+| **Compute speed**      | ✗ NOT IMPROVED — 3 paradigm tests all lost                |
+| **NLL accuracy**       | ✗ NOT IMPROVED — same 3 tests showed worse NLL            |
+
+Three paradigm-flag attempts (Sophia #55 at 2.5k + 5k horizons,
+local-attn #6 at 2.5k) all lost to the existing CHIRON 1.84B preset
+on BOTH wall and NLL. The 1.84B preset (FACE+MFIO+SLC+RLG+SAS+
+Adam-bf16) is locally optimal at the warmup horizon.
+
+## Empirical findings from 5 iteration sessions (2026-05-10)
+
+| # | Question                                            | Answer |
+|---|-----------------------------------------------------|--------|
+| 1 | Sophia (#55) at CHIRON 1.84B / 2.5k steps           | LOSES (-0.16 nat, +27% wall) |
+| 2 | Local-attn (#6) at CHIRON 1.84B / 2.5k steps        | LOSES (-0.17 nat, +150% wall) |
+| 3 | Sophia (#55) at CHIRON 1.84B / 5k steps (horizon)   | LOSES HARDER (-0.36 nat, +8% wall) |
+| 4 | Flagship CPU init bottleneck (>30 min stall)        | FIXED via Stage 8a (skip host Adam M/V under bf16/int8 GPU Adam) |
+| 5 | Flagship 700M trains?                               | YES — 6 sec init, 1382 tok/s |
+| 6 | Flagship 1.1B trains?                               | YES — 14 sec init, 1405 tok/s (largest ever) |
+| 7 | Flagship 1.4B / 1.84B trains?                       | NO — bf16-mirror peak >16 GB; needs Stage 8b |
+| 8 | NIMBUS (#52) standalone at 200M                     | Works but PCIe-bound; needs bf16-grads compose for any speedup |
+
+## Path forward (ranked by reward-per-eng-cost)
+
+| Path | Eng cost | Speedup claim | Risk | Notes |
+|------|---------:|---------------|------|-------|
+| **DISTILL-FORWARD #56** | 2 weeks + teacher choice | 5× steps to fixed final NLL | medium-high | Needs TinyLLaMA-1.1B-class teacher; biggest theoretical reward |
+| **Stage 8b** (per-layer flagship init) | 1-2 days | 0× speed (unblocks measurement) | low | Lets us measure flagship at 1.84B; doesn't itself close gap |
+| **HELIUM #50** (FA-3 + FP8) | 6-8 weeks | 1.7-2.0× per-step | medium | Mature reference impl exists; biggest reliable per-step gain |
+| **NIMBUS #52** (full pipelining) | 2-3 weeks | 1.33× at 1.84B | medium | Needs bf16-grads compose first; sanity-checked as PCIe-bound |
+| **Architectural ports** (MLA→CHIRON, local-attn→CHIRON, reversibility→flagship) | multi-week each | Closes the 9× structural gap | high | The ONLY path that addresses the headline metric |
+| Single-flag tests | 1 day each | empirically 0× to negative | n/a | EXHAUSTED — do not pursue |
+
+## Recommended next commit
+
+Per the iter-200 critique ("looking at the bigger picture instead of
+microoptimizations"), the next commit must be **structural**:
+
+1. **Stage 8b first** if the goal is "measure flagship at 1.84B before
+   investing more" — 1-2 days, low risk, enables apples-to-apples test.
+2. **DISTILL-FORWARD #56** if the goal is "ship the biggest reward" —
+   2 weeks plus teacher choice, biggest theoretical reward.
+3. **Architectural port** if the goal is "close the headline gap" —
+   multi-week, high risk, addresses the actual flagship-vs-CHIRON
+   structural disparity.
+
+The original report (preserved below) reflects the pre-iteration-5 state
+when we still hoped flag-flips might deliver. That hope is now
+empirically retired.
+
+---
 
 ## What was actually run
 
