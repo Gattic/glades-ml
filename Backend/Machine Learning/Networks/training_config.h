@@ -1668,6 +1668,14 @@ struct MixedPrecisionConfig
 	// retiring those allocations is a follow-on memory-cleanup task.
 	bool gradStorageBf16Phase2;
 
+	// CHIRON-style BF16 weight storage: per-block weights (Wq/Wk/Wv/Wo/W1/W2)
+	// + tokE + WIn + WOut persist as BF16 on GPU (no FP32 master).  Adam reads
+	// BF16 → casts to one shared FP32 scratch → applies update → casts back to
+	// BF16 with stochastic rounding.  Saves another ~50% on weight VRAM (~3.7
+	// GB at 1.84B) on top of the bf16-grad savings.  Forward already uses BF16
+	// mirrors via gpu_gemm_mp, so no forward-side change is needed.
+	bool weightStorageBf16;
+
 	// Loss scaling:
 	// - If enable==true and useLossScaling==true, backprop deltas are multiplied by lossScale
 	//   and the optimizer divides gradients by lossScale before applying updates.
@@ -1689,6 +1697,7 @@ struct MixedPrecisionConfig
 	      adamStateInt8(false),
 	      gradStorageBf16(false),
 	      gradStorageBf16Phase2(false),
+	      weightStorageBf16(false),
 	      useLossScaling(true),
 	      dynamicLossScaling(true),
 	      lossScaleInit(1024.0f),
