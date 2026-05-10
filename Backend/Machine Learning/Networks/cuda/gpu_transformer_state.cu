@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace glades {
@@ -97,19 +98,29 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	// instead of vTokE/v2TokE/vTokE_bf16/etc.
 	const bool useFaceTokE = faceEmbedding && tm && !skipAdamBufs;
 	const bool useBf16Grads = gradStorageBf16 && !skipAdamBufs;
-	// Phase-2: per-block W{q,k,v,o,1,2}, gWIn, gWOut FP32 grad buffers are
-	// retired (backward writes scratch+commit-bf16 directly).  Bias grads
-	// and gTokE keep their FP32 allocs (gTokE goes through Phase-1 cast
-	// path due to the bf16-scatter precision issue).
-	//
-	// 2026-05-09: alloc-gating disabled.  Smoke test with skipFp32GradBig=true
-	// produced +200 mnat NLL drift vs Phase-2 (with FP32 allocated).  Some
-	// read site of FP32 grads was missed in the audit; until isolated, keep
-	// the FP32 allocs alive (Phase-2 still works correctly with both buffers
-	// allocated; just no memory savings on those tensors yet).
 	const bool useBf16GradsPh2 = gradStorageBf16Phase2 && useBf16Grads;
-	(void)useBf16GradsPh2;
-	const bool skipFp32GradBig = false;  // disabled — see comment
+	// Bisect mode: GLADES_BF16_PH2_RETIRE selects which tensors get their
+	// FP32 grad alloc skipped:
+	//   "all" — all of W{q,k,v,o,1,2} + WIn + WOut
+	//   "w2"  — only gW2 (biggest single per-block tensor)
+	//   "w1"  — only gW1
+	//   "wq"  — only gWq, etc.
+	//   "wo"  — only gWo
+	//   "wk"  — only gWk
+	//   "wv"  — only gWv
+	//   "win" — only gWIn
+	//   "wout"— only gWOut
+	//   unset / "off" — keep all FP32 allocs alive (default: safe, no savings)
+	const char* phase2Mode_env = useBf16GradsPh2 ? std::getenv("GLADES_BF16_PH2_RETIRE") : NULL;
+	const bool ph2RetireAll = phase2Mode_env && !std::strcmp(phase2Mode_env, "all");
+	const bool ph2RetireW2  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "w2"));
+	const bool ph2RetireW1  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "w1"));
+	const bool ph2RetireWq  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wq"));
+	const bool ph2RetireWk  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wk"));
+	const bool ph2RetireWv  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wv"));
+	const bool ph2RetireWo  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wo"));
+	const bool ph2RetireWIn = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "win"));
+	const bool ph2RetireWOut= ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wout"));
 	const bool allocFpMV  = !skipAdamBufs && !useBf16 && !useInt8;
 	const bool allocBfMV  = useBf16;
 	const bool allocI8MV  = useInt8;
@@ -189,7 +200,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(vWInScale,   I8_SCALE_N(n_)))   return false;
 			if (!allocBuf(v2WInScale,  I8_SCALE_N(n_)))   return false;
 		}
-		if (!skipFp32GradBig && !allocBuf(gWIn, (size_t)dm * is)) return false;
+		if (!ph2RetireWIn && !allocBuf(gWIn, (size_t)dm * is)) return false;
 		if (useBf16Grads && !allocBuf(gWIn_bf16, (size_t)dm * is)) return false;
 		if (!allocBuf(bIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(mBIn, dm)) return false;
@@ -212,7 +223,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(vWOutScale,   I8_SCALE_N(n_)))   return false;
 			if (!allocBuf(v2WOutScale,  I8_SCALE_N(n_)))   return false;
 		}
-		if (!skipFp32GradBig && !allocBuf(gWOut, (size_t)os * dm)) return false;
+		if (!ph2RetireWOut && !allocBuf(gWOut, (size_t)os * dm)) return false;
 		if (useBf16Grads && !allocBuf(gWOut_bf16, (size_t)os * dm)) return false;
 		if (!allocBuf(bOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(mBOut, os)) return false;
@@ -289,10 +300,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(b.v2WvScale,  I8_SCALE_N(nV))) return false;
 			if (!allocBuf(b.v2WoScale,  I8_SCALE_N(nO))) return false;
 		}
-		if (!skipFp32GradBig && !allocBuf(b.gWq, (size_t)dm * dm)) return false;
-		if (!skipFp32GradBig && !allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
-		if (!skipFp32GradBig && !allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
-		if (!skipFp32GradBig && !allocBuf(b.gWo, (size_t)dm * dm)) return false;
+		if (!ph2RetireWq && !allocBuf(b.gWq, (size_t)dm * dm)) return false;
+		if (!ph2RetireWk && !allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
+		if (!ph2RetireWv && !allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
+		if (!ph2RetireWo && !allocBuf(b.gWo, (size_t)dm * dm)) return false;
 		if (useBf16Grads) {
 			if (!allocBuf(b.gWq_bf16, (size_t)dm * dm)) return false;
 			if (!allocBuf(b.gWk_bf16, (size_t)dm * dModelKV)) return false;
@@ -377,8 +388,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(b.v2W1Scale,  I8_SCALE_N(n1))) return false;
 			if (!allocBuf(b.v2W2Scale,  I8_SCALE_N(n2))) return false;
 		}
-		if (!skipFp32GradBig && !allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
-		if (!skipFp32GradBig && !allocBuf(b.gW2, (size_t)dm * df)) return false;
+		if (!ph2RetireW1 && !allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
+		if (!ph2RetireW2 && !allocBuf(b.gW2, (size_t)dm * df)) return false;
 		if (useBf16Grads) {
 			if (!allocBuf(b.gW1_bf16, (size_t)ff1Width * dm)) return false;
 			if (!allocBuf(b.gW2_bf16, (size_t)dm * df)) return false;
