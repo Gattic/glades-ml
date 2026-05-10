@@ -952,6 +952,36 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
 	return true;
 }
 
+// Helper: download a possibly-retired FP32 master into a host buffer.
+// When the FP32 master is alive (master.size() > 0) → direct download.
+// When retired (master freed for memory) but the bf16 mirror is canonical
+// (mirror.size() > 0) → download bf16 mirror to a temporary host buffer
+// and cast bf16→FP32 element-wise on host.  Returns true on success.
+static bool downloadFpOrBf16Master(const GpuBuffer<float>& master,
+                                    const GpuBuffer<uint16_t>& mirror,
+                                    float* dst, size_t dstSize)
+{
+	if (master.size() > 0)
+	{
+		return master.download(dst, dstSize);
+	}
+	if (mirror.size() == 0)
+	{
+		// Neither alive — leave host buffer untouched (init values stale).
+		return true;
+	}
+	// bf16-canonical path: download mirror to host bf16 staging, cast on host.
+	std::vector<uint16_t> staging(dstSize);
+	if (!mirror.download(staging.data(), dstSize)) return false;
+	for (size_t i = 0; i < dstSize; ++i)
+	{
+		union { uint32_t u; float f; } uv;
+		uv.u = static_cast<uint32_t>(staging[i]) << 16;
+		dst[i] = uv.f;
+	}
+	return true;
+}
+
 bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
                                  float* tokE, size_t tokESize,
                                  float* WIn, size_t WInSize,
@@ -967,11 +997,11 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
 
 	if (gpu.tokenModel && tokE && tokESize > 0)
 	{
-		if (!gpu.tokE.download(tokE, tokESize)) return false;
+		if (!downloadFpOrBf16Master(gpu.tokE, gpu.tokELowp, tokE, tokESize)) return false;
 	}
 	if (!gpu.tokenModel && WIn && WInSize > 0)
 	{
-		if (!gpu.WIn.download(WIn, WInSize)) return false;
+		if (!downloadFpOrBf16Master(gpu.WIn, gpu.WInLowp, WIn, WInSize)) return false;
 	}
 	if (!gpu.tokenModel && bIn && bInSize > 0)
 	{
@@ -979,7 +1009,7 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
 	}
 	if (!gpu.tokenModel && WOut && WOutSize > 0)
 	{
-		if (!gpu.WOut.download(WOut, WOutSize)) return false;
+		if (!downloadFpOrBf16Master(gpu.WOut, gpu.WOutLowp, WOut, WOutSize)) return false;
 	}
 	if (!gpu.tokenModel && bOut && bOutSize > 0)
 	{
@@ -1080,6 +1110,32 @@ static bool download_host_buffer(const GpuBuffer<float>& src,
 	return src.download(dst.data, dst.size);
 }
 
+// bf16-mirror-aware variant: when the FP32 master is retired (freeFp32Masters)
+// the bf16 mirror is the canonical store; download the mirror into a host
+// staging buffer and cast bf16→FP32 element-wise.  When master is alive,
+// behaves identically to download_host_buffer.
+static bool download_host_buffer_bf16_aware(const GpuBuffer<float>& master,
+                                             const GpuBuffer<uint16_t>& mirror,
+                                             const HostFloatBufferView& dst)
+{
+	if (dst.size == 0u)
+		return true;
+	if (!dst.data) return false;
+	if (master.allocated() && master.size() >= dst.size)
+		return master.download(dst.data, dst.size);
+	if (!mirror.allocated() || mirror.size() < dst.size)
+		return false;
+	std::vector<uint16_t> staging(dst.size);
+	if (!mirror.download(staging.data(), dst.size)) return false;
+	for (size_t i = 0; i < dst.size; ++i)
+	{
+		union { uint32_t u; float f; } uv;
+		uv.u = static_cast<uint32_t>(staging[i]) << 16;
+		dst.data[i] = uv.f;
+	}
+	return true;
+}
+
 bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
                                       const TransformerHostWeightsView& host)
 {
@@ -1105,12 +1161,14 @@ bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
 	{
 		const GpuTransformerWeights::Block& gb = gpu.blocks[l];
 		const TransformerHostBlockWeightsView& hb = host.blocks[l];
-		if (!download_host_buffer(gb.Wq, hb.Wq)) return false;
-		if (!download_host_buffer(gb.Wk, hb.Wk)) return false;
-		if (!download_host_buffer(gb.Wv, hb.Wv)) return false;
-		if (!download_host_buffer(gb.Wo, hb.Wo)) return false;
-		if (!download_host_buffer(gb.W1, hb.W1)) return false;
-		if (!download_host_buffer(gb.W2, hb.W2)) return false;
+		// bf16-aware: route through the bf16 mirror when the FP32 master
+		// has been retired by freeFp32Masters() (--bf16-weights mode).
+		if (!download_host_buffer_bf16_aware(gb.Wq, gb.WqLowp, hb.Wq)) return false;
+		if (!download_host_buffer_bf16_aware(gb.Wk, gb.WkLowp, hb.Wk)) return false;
+		if (!download_host_buffer_bf16_aware(gb.Wv, gb.WvLowp, hb.Wv)) return false;
+		if (!download_host_buffer_bf16_aware(gb.Wo, gb.WoLowp, hb.Wo)) return false;
+		if (!download_host_buffer_bf16_aware(gb.W1, gb.W1Lowp, hb.W1)) return false;
+		if (!download_host_buffer_bf16_aware(gb.W2, gb.W2Lowp, hb.W2)) return false;
 		if (!download_host_buffer(gb.bq, hb.bq)) return false;
 		if (!download_host_buffer(gb.bk, hb.bk)) return false;
 		if (!download_host_buffer(gb.bv, hb.bv)) return false;
