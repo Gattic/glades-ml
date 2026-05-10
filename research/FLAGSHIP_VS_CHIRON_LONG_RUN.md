@@ -574,3 +574,104 @@ cd /home/robert/dev/glades-trainer
 bash run.sh chiron --scale 1.84B --steps 5000 \
     --sas-schedule "0.3@0,0.5@2300,0.7@3700"
 ```
+
+---
+
+## 2026-05-10 update — Option B (activation gradient checkpointing) Stage 1+2
+
+Per the prior recommendation and explicit "Proceed with Option A in full
+then Option B in full", Option A (bf16-weights infrastructure) shipped
+2026-05-09 with the stochastic-rounding-floor caveat documented. Today's
+iteration begins Option B.
+
+### Stage 1 — scratch-buffer foundation (commit `406def3f0`)
+
+- `MixedPrecisionConfig::activationCheckpoint` flag added (default
+  `false` — behavior identical when off).
+- `GpuTransformerScratch::slotsPerLayer` (= `⌈√nLayers⌉` when on,
+  `nLayers` when off) and `nCheckpoints` (= `⌈nLayers/slotsPerLayer⌉ - 1`
+  when on, `0` when off).
+- `GpuTransformerScratch::checkpoints` device buffer
+  `[nCheckpoints, T, dModel]` for hAfterFF segment-boundary stash.
+- `GpuTransformerScratch::allocate(activationCheckpoint=false)` parameter
+  added; per-layer activation buffers (x1/Q/K/V/attnConcat/attnOut/
+  hAfterAttn/x2/ff1/ff1Act/ffOut/hAfterFF + LN stats) sized to
+  `slotsPerLayer` instead of `nLayers` when checkpointing is active.
+- `TransformerGpuScratchConfig::activationCheckpoint` plumbed through
+  `ensureTransformerScratch` + `ensureTransformerGpuTrainingScratch` (reads
+  from `trainingConfig.mixedPrecision.activationCheckpoint`).
+- `ensureTransformerScratch` detects slot-count mismatch and re-allocates
+  the scratch on the fly.
+
+Memory accounting at 1.84B (`L=48`, `T=512`, `dModel=2048`, `dFF=8192`,
+`ff1Width=16384`):
+
+- Per-layer activations: ~88 MB per slot.
+- Full stash (current): 48 × 88 MB = **4.2 GB**.
+- After Stage 4 with `K=⌈√48⌉=7`: 7 × 88 MB scratch + 6 × 4 MB ckpt =
+  **0.64 GB**.
+- Memory savings: **~3.6 GB at ~33% extra compute** (one extra forward
+  per backward step).
+
+### Stage 2 — modulo refactor (commit `2240f074c`)
+
+All 36 per-layer indexing sites in `transformerGpuRunForwardOnly`
+(forward-only path), the training forward loop, and the training
+backward loop refactored to use cyclic-slot addressing:
+
+```
+slot     = li % slotsPerLayer
+prevSlot = (li - 1) % slotsPerLayer
+```
+
+When `activationCheckpoint = false` (default), `slotsPerLayer == nLayers`
+and the modulo collapses to identity — bit-for-bit identical to the prior
+behavior. Forward also adds the checkpoint-save copy
+(`device_memcpy_d2d`) at every Kth layer boundary.
+
+### What Stage 2 alone does NOT yet do — deferred to Stage 3+
+
+The backward loop still walks layers in reverse top-to-bottom, reading
+the cyclic slots directly. When `activationCheckpoint = true`, the slots
+contain only the LAST K layers (from the initial forward pass). Once
+backward walks past the last segment boundary, it would read STALE slots
+and produce wrong gradients. So **the flag is wired but turning it on at
+this stage will silently produce wrong grads.**
+
+The remaining work to make activation checkpointing actually correct
+when the flag is on:
+
+1. **Stage 3** — refactor the per-layer forward body into a callable
+   member function (or `ForwardLayerCfg` struct + member function), so
+   that the backward path can re-invoke it per segment without
+   duplicating the ~330-line forward layer body.
+2. **Stage 4** — refactor the backward loop to outer-loop over segments
+   (high to low). Before each segment's backward, copy
+   `checkpoints[c-1]` into the appropriate slot then call the
+   per-layer forward function for layers `[c*K, min((c+1)*K, nLayers)-1]`.
+   Then the existing backward layer body runs over those layers in
+   reverse, reading from the freshly populated slots.
+3. **Stage 5** — `--grad-checkpoint` trainer flag + 165M parity smoke
+   (compare against bf16-grad baseline at 50-step horizon; expect
+   bit-identical or within deterministic-recompute drift, ~1e-7 nat).
+4. **Stage 6** — final 1.84B head-to-head with both
+   `--grad-bf16-phase2` and `--grad-checkpoint` enabled, measuring
+   peak VRAM (target: < 13 GB at 1.84B, vs current 15.9 GB) and NLL
+   trajectory vs CHIRON.
+
+### Status of pending Option-A and parallel work
+
+- **bf16-weights memory savings (Option A.b)** still deferred:
+  infrastructure shipped but FP32 master weights are still allocated.
+  Gating the FP32 master alloc requires fixing the FP32-master readers
+  in embedding_gather, paradigm-#74 binary-FFN (W1/W2 sign), and
+  atlas_gpu_update — multi-day work.
+- **`--cpu-adam` port** (Task #18) not started.  ~2 GB savings at
+  1.84B; conceptually simpler than activation checkpointing.
+
+### What flagship currently produces
+
+No flagship process is running.  The post-Stage-2 binary builds clean
+and the default-flag path is unchanged from 2026-05-09's bf16-weights
+baseline.  Smoke tests on the new modulo path can be run any time, but
+they verify only the no-op case until Stage 4 lands.
