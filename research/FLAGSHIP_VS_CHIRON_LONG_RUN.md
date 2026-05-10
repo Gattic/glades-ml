@@ -412,6 +412,47 @@ Phase-2 is operating correctly.  Δ = +1.1e-4 nat matches Phase-1's
 round-off floor; throughput cost is 0.8% (the extra `bf16_accum_axpy`
 launches per backward GEMM).
 
+### CPU init bottleneck identified + fixed (2026-05-10)
+
+The previously-mysterious "CPU init takes hours at 1.84B" was diagnosed via
+`perf record` of the running process: **98.8% of CPU time was in
+`linear_forward_maybe_lowp`** — a CPU FP32 forward pass run by the
+`net.test()` initializer at trainer startup (line 969 of
+`glades-trainer/trainer/main.cpp`).  The initializer was sized at
+`--test-tokens 4096` (default) which at 770M CPU forward speed of
+2.55 tokens/sec = 27 minutes.  At 1.84B it would have been ~100 minutes.
+
+Workaround: launch with `--test-tokens 1`.  At 770M, init time drops from
+27 min to **3 sec** (90× speedup).
+
+Recipe for any flagship run from now on: add `--test-tokens 1` unless the
+caller has a specific reason to run a CPU eval at startup.
+
+### 1.84B fit attempt with current Phase-2 stack (2026-05-10)
+
+After the CPU-init fix, 1.84B reached GPU allocation in ~2 min and **OOM'd
+at GPU alloc**.  Failed cudaMalloc was 46 MB (an unallocated per-block
+W2-shape tensor) with 15.9 GB already in use out of 16 GB available.
+
+Memory math at 1.84B (m=2048, L=53, dFF=5632, V=32000, ~2.13B params):
+
+| Component                          |   GB   |
+|------------------------------------|-------:|
+| Weights FP32 master (per-block + globals)   |  8.3 |
+| BF16 mirrors (Lowp)                 |  4.2 |
+| Adam state (int8 m + uint8 v)        |  2.1 |
+| Grads BF16 (Phase-2 retired)        |  1.0 |
+| Activation stash FP32 (53 layers × T × dModel × ~12 scratches) |  5.3 |
+| Other scratch / dH / dLogits / sundry |  ~1.0 |
+| **Total estimated**                 | **~22 GB** |
+
+→ ~6 GB over the 16 GB budget.  Need either:
+- **BF16 weight storage** (CHIRON `--bf16-weights`): drop FP32 master, save ~4 GB
+- **Activation gradient checkpointing**: sqrt(L) scheme, save ~4 GB
+- Both stacked: ~14 GB total → fits with headroom
+
+Continuing with **CHIRON `--bf16-weights` port** (task #17) as next step.
+
 ### BF16-grad Phase-2 retire-FP32 — bug fixed, memory savings UNLOCKED (2026-05-10)
 
 The earlier alloc-retire regression was traced to a **size-arg bug**: bf16
