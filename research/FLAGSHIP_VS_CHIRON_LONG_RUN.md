@@ -7,18 +7,28 @@ against CHIRON 1.84B at their realistic ceiling on a 16 GB GPU.
 **Pivoted goal (2026-05-10):** save time via compute speed and NLL
 accuracy via paradigms while preserving CHIRON's memory parity at 1.84B.
 
-## CURRENT HEADLINE (post-iteration-5)
+## CURRENT HEADLINE (post-iteration-6, after Stage 8b retire)
 
-| Metric                       | Flagship 1.1B (best fit today) | CHIRON 1.84B (Adam baseline) |
+| Metric                       | Flagship 1.4B (best fit today) | CHIRON 1.84B (Adam baseline) |
 |------------------------------|-------------------------------:|-----------------------------:|
-| Params                       |                          1.10 B|                       1.84 B |
-| Largest L on 16 GB GPU       |                       L=32     |                      L=53    |
-| Init time (post Stage-8a fix) |                  14 sec       |                  ~40 sec     |
-| Throughput (tokens/sec)      |                         1405   |                       5527   |
-| Throughput (tokens·params/s) |                   1.55 × 10¹²  |                  1.02 × 10¹³ |
+| Params                       |                          1.40 B|                       1.84 B |
+| Largest L on 16 GB GPU       |                       L=40     |                      L=53    |
+| Init time                    |                  11 sec        |                  ~40 sec     |
+| Throughput (tokens/sec)      |                         1145   |                       5527   |
+| Throughput (tokens·params/s) |                   1.60 × 10¹²  |                  1.02 × 10¹³ |
 | Final EMA NLL @ 2500 steps   |                          n/a   |                       9.5261 |
-| Peak GPU memory at training  |                  ~14 GB        |                  ~10.6 GB    |
+| Peak GPU memory at training  |                  ~15 GB        |                  ~10.6 GB    |
 | Status                       |                EXIT=0, trains  |              EXIT=0, baseline|
+
+Stage 8b retire (commit `581ff5d34`) moved the flagship ceiling from
+1.1B (L=32) to 1.4B (L=40) — a 27% param-count jump — by retiring each
+FP32 weight master immediately after its bf16 cast in `ensureLowpMirrors`,
+rather than holding all masters + mirrors simultaneously then bulk-freeing.
+
+Pushing further to L=48 / 1.65B and L=53 / 1.84B requires the deeper
+Stage 8b: skip FP32 master allocation in `GpuTransformerWeights::allocate()`
+itself when bf16-canonical, and route uploads through a shared staging
+buffer. Estimated 1-2 days additional engineering.
 
 **Bottom line:** CHIRON 1.84B is **6.6× higher** in tokens·params/sec
 than the largest flagship that fits today (1.1B at L=32). The
