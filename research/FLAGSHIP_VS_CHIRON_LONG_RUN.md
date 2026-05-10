@@ -90,6 +90,45 @@ CHIRON's stability paradigms:
 Estimated 1-2 weeks engineering for the curriculum port. This is the
 only path to a fair 1.84B head-to-head with current flagship paradigms.
 
+### Three-config stability sweep — curriculum REQUIRED, confirmed
+
+Tested three flagship 1.84B configs trying to find a stable lr-only
+sweet spot WITHOUT porting curriculum:
+
+| Config       | lr     | warmup | grad-clip | Result @ step 1000-1255              |
+|--------------|-------:|-------:|----------:|--------------------------------------|
+| Aggressive   | 3e-4   |   100  |    1.0    | NaN at step ~900                     |
+| Mid          | 2e-4   |  1000  |    0.3    | Alive but nll degrading 10.27→10.37  |
+| Safe         | 1e-4   |   500  |    0.5    | Stagnant (||g||=3.7e9, scale=1e-10)  |
+
+Aggressive diverges. Safe is stuck in clip-stagnation. Mid is
+borderline — alive but trajectory drifts the wrong way.
+
+**Definitive empirical conclusion**: flagship's standard backbone at
+1.84B / Pile cannot be stably trained at any single fixed lr without
+curriculum. SLC (sequence-length curriculum) is load-bearing — it
+keeps gradient norms bounded by training the model on shorter
+sequences first, where attention covariance is well-conditioned, then
+extending to longer T after the model has converged on initial
+representations.
+
+### Recommended forward direction — port SLC + RLG
+
+The next concrete commit must port flagship-side equivalents of
+CHIRON's stability paradigms, in priority order:
+
+1. **SLC** (T schedule via mid-run `--seq-len` change) — ~200-400 LOC
+   in flagship trainer (network.cpp + main.cpp arg parsing).
+2. **RLG** (L schedule via layer-wise insertion) — ~400-600 LOC,
+   harder because it requires Wo=0 identity initialization for new
+   layers and dynamic forward/backward dispatch.
+3. **Per-transition lr-warmup** — both above need an LR warmup
+   re-trigger after each schedule transition to avoid post-transition
+   gradient spikes.
+
+Estimated 2-3 weeks engineering total. After SLC is ported, retry
+the head-to-head; if SLC alone stabilizes the run, RLG can be deferred.
+
 **Bottom line:** CHIRON 1.84B is **6.6× higher** in tokens·params/sec
 than the largest flagship that fits today (1.1B at L=32). The
 structural gap from CHIRON's reversibility (vs flagship's standard
