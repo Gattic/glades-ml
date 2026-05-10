@@ -9318,18 +9318,27 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 	}
 
 	// Per-layer transformer blocks.
+	const unsigned int slotsPerLayerFwdOnly = gpuTransformerScratch->slotsPerLayer
+	    ? gpuTransformerScratch->slotsPerLayer : nLayers;
 	for (unsigned int li = 0; li < nLayers; ++li)
 	{
 		gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
-		const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+		// Activation-checkpoint: per-layer activations live in cyclic slots
+		// (slot = li % K).  When checkpointing is off, slotsPerLayer == nLayers
+		// and modulo collapses to identity.
+		const size_t slot = static_cast<size_t>(li % slotsPerLayerFwdOnly);
+		const size_t prevSlot = (li > 0u)
+		    ? static_cast<size_t>((li - 1u) % slotsPerLayerFwdOnly)
+		    : 0u;
+		const size_t layerOff = slot * static_cast<size_t>(T);
 
 		const float* layerIn = (li == 0)
 		    ? gpuTransformerScratch->h.data()
 		    : (gpuTransformerScratch->hAfterFF.data()
-		       + static_cast<size_t>(li - 1) * T * dModel);
+		       + prevSlot * T * dModel);
 
 		float* x1_l = gpuTransformerScratch->x1.data()
-		              + static_cast<size_t>(li) * T * dModel;
+		              + slot * T * dModel;
 		float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
 		float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
 
@@ -9343,11 +9352,11 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 			                       x1_l, ln1Mean_l, ln1InvStd_l);
 
 		float* Q_l = gpuTransformerScratch->Q.data()
-		             + static_cast<size_t>(li) * T * dModel;
+		             + slot * T * dModel;
 		float* K_l = gpuTransformerScratch->K.data()
-		             + static_cast<size_t>(li) * T * dModelKV;
+		             + slot * T * dModelKV;
 		float* V_l = gpuTransformerScratch->V.data()
-		             + static_cast<size_t>(li) * T * dModelKV;
+		             + slot * T * dModelKV;
 
 		if (!gpu_gemm_abt_mp(bf16Wq,
 		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
@@ -9403,7 +9412,7 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		}
 
 		float* attnConcat_l = gpuTransformerScratch->attnConcat.data()
-		                      + static_cast<size_t>(li) * T * dModel;
+		                      + slot * T * dModel;
 		if (useBf16)
 		{
 			glades::gpu::cast_f32_to_bf16(Q_l, gpuTransformerScratch->qLowp.data(),
@@ -9477,7 +9486,7 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		}
 
 		float* attnOut_l = gpuTransformerScratch->attnOut.data()
-		                   + static_cast<size_t>(li) * T * dModel;
+		                   + slot * T * dModel;
 		if (!gpu_gemm_abt_mp(bf16Wo,
 		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
 		    attnConcat_l, gpuTransformerScratch->activationLowp.data(),
@@ -9489,12 +9498,12 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		              static_cast<int>(T), static_cast<int>(dModel));
 
 		float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data()
-		                      + static_cast<size_t>(li) * T * dModel;
+		                      + slot * T * dModel;
 		gpu::add_two(hAfterAttn_l, layerIn, attnOut_l,
 		             static_cast<int>(T * dModel));
 
 		float* x2_l = gpuTransformerScratch->x2.data()
-		              + static_cast<size_t>(li) * T * dModel;
+		              + slot * T * dModel;
 		float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
 		float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
 
@@ -9508,11 +9517,11 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 			                       x2_l, ln2Mean_l, ln2InvStd_l);
 
 		float* ff1_l = gpuTransformerScratch->ff1.data()
-		               + static_cast<size_t>(li) * T * ff1Width;
+		               + slot * T * ff1Width;
 		float* ff1Act_l = gpuTransformerScratch->ff1Act.data()
-		                  + static_cast<size_t>(li) * T * dFF;
+		                  + slot * T * dFF;
 		float* ffOut_l = gpuTransformerScratch->ffOut.data()
-		                 + static_cast<size_t>(li) * T * dModel;
+		                 + slot * T * dModel;
 
 		// Paradigm #74 PHOENIX-1BIT W1 projection: Y = X @ sign(W1).T
 		// (mirrors W2 path). When dModel%128==0, use full BitNet QAT via
@@ -9618,14 +9627,16 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 		              static_cast<int>(T), static_cast<int>(dModel));
 
 		float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data()
-		                    + static_cast<size_t>(li) * T * dModel;
+		                    + slot * T * dModel;
 		gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l,
 		             static_cast<int>(T * dModel));
 	}
 
-	// Final LayerNorm.
+	// Final LayerNorm.  In activation-checkpoint mode the last layer's hAfterFF
+	// lives in slot ((nLayers - 1) % slotsPerLayer); otherwise modulo collapses
+	// to (nLayers - 1).
 	const float* finalH = gpuTransformerScratch->hAfterFF.data()
-	                      + static_cast<size_t>(nLayers - 1) * T * dModel;
+	                      + static_cast<size_t>((nLayers - 1) % slotsPerLayerFwdOnly) * T * dModel;
 	float* hPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
 	if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
 		gpu::rmsnorm_forward(finalH, gpuTransformerWeights->lnFinalGamma.data(),
@@ -9935,16 +9946,25 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		}
 
 		// Per-layer transformer blocks.
+		const unsigned int slotsPerLayerFwd = gpuTransformerScratch->slotsPerLayer
+		    ? gpuTransformerScratch->slotsPerLayer : nLayers;
 		for (unsigned int li = 0; li < nLayers; ++li)
 		{
 			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
-			const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+			// Activation-checkpoint: per-layer activations live in cyclic slots
+			// (slot = li % K).  When checkpointing is off, slotsPerLayer == nLayers
+			// and modulo collapses to identity.
+			const size_t slot = static_cast<size_t>(li % slotsPerLayerFwd);
+			const size_t prevSlot = (li > 0u)
+			    ? static_cast<size_t>((li - 1u) % slotsPerLayerFwd)
+			    : 0u;
+			const size_t layerOff = slot * static_cast<size_t>(T);
 
 			// Input to this layer is h (or hAfterFF from previous layer).
 			const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
-			                                 : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
+			                                 : (gpuTransformerScratch->hAfterFF.data() + prevSlot * T * dModel);
 
-			float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
+			float* x1_l = gpuTransformerScratch->x1.data() + slot * T * dModel;
 			float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
 			float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
 
@@ -9963,9 +9983,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			// QKV projections
-			float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
-			float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
-			float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
+			float* Q_l = gpuTransformerScratch->Q.data() + slot * T * dModel;
+			float* K_l = gpuTransformerScratch->K.data() + slot * T * dModelKV;
+			float* V_l = gpuTransformerScratch->V.data() + slot * T * dModelKV;
 
 			gpu_gemm_abt_mp(bf16Wq,
 			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
@@ -10024,7 +10044,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			// Flash-style packed multi-head attention without materializing T*T scores/probs.
-			float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
+			float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + slot * T * dModel;
 			if (useBf16)
 			{
 				// Cast Q/K/V to BF16 scratches and invoke the BF16 flash
@@ -10201,7 +10221,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			// Wo projection
-			float* attnOut_l = gpuTransformerScratch->attnOut.data() + static_cast<size_t>(li) * T * dModel;
+			float* attnOut_l = gpuTransformerScratch->attnOut.data() + slot * T * dModel;
 			gpu_gemm_abt_mp(bf16Wo,
 			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
 			    attnConcat_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
@@ -10210,11 +10230,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			gpu::add_bias(attnOut_l, gb.bo.data(), static_cast<int>(T), static_cast<int>(dModel));
 
 			// Residual 1: hAfterAttn = layerIn + attnOut
-			float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
+			float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + slot * T * dModel;
 			gpu::add_two(hAfterAttn_l, layerIn, attnOut_l, static_cast<int>(T * dModel));
 
 			// Pre-LN 2
-			float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
+			float* x2_l = gpuTransformerScratch->x2.data() + slot * T * dModel;
 			float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
 			float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
 
@@ -10232,9 +10252,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			}
 
 			// FFN
-			float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
-			float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
-			float* ffOut_l = gpuTransformerScratch->ffOut.data() + static_cast<size_t>(li) * T * dModel;
+			float* ff1_l = gpuTransformerScratch->ff1.data() + slot * T * ff1Width;
+			float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + slot * T * dFF;
+			float* ffOut_l = gpuTransformerScratch->ffOut.data() + slot * T * dModel;
 
 			// FF1: x2 * W1^T + b1
 			gpu_gemm_abt_mp(bf16W1,
@@ -10267,12 +10287,33 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			gpu::add_bias(ffOut_l, gb.b2.data(), static_cast<int>(T), static_cast<int>(dModel));
 
 			// Residual 2: hAfterFF = hAfterAttn + ffOut
-			float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li) * T * dModel;
+			float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + slot * T * dModel;
 			gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l, static_cast<int>(T * dModel));
+
+			// Activation-checkpoint: stash hAfterFF at every Kth layer boundary
+			// (except the very last layer, whose output feeds final LN directly).
+			// checkpoints[c] holds the input to segment c+1 = hAfterFF after layer
+			// (c+1)*K - 1.  Skipped when checkpointing is off (nCheckpoints==0).
+			if (gpuTransformerScratch->nCheckpoints > 0u
+			    && ((li + 1u) % slotsPerLayerFwd) == 0u
+			    && (li + 1u) < nLayers)
+			{
+				const unsigned int ckptIdx = (li + 1u) / slotsPerLayerFwd - 1u;
+				if (ckptIdx < gpuTransformerScratch->nCheckpoints)
+				{
+					gpu::device_memcpy_d2d(
+					    gpuTransformerScratch->checkpoints.data()
+					        + static_cast<size_t>(ckptIdx) * T * dModel,
+					    hAfterFF_l,
+					    static_cast<size_t>(T) * dModel * sizeof(float));
+				}
+			}
 		}
 
-		// Final LayerNorm
-		const float* finalH = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(nLayers - 1) * T * dModel;
+		// Final LayerNorm.  In activation-checkpoint mode the last layer's
+		// hAfterFF lives in slot ((nLayers - 1) % slotsPerLayer); otherwise
+		// modulo collapses to (nLayers - 1).
+		const float* finalH = gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>((nLayers - 1) % slotsPerLayerFwd) * T * dModel;
 		float* hPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
 		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
 		{
@@ -10450,9 +10491,13 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		const bool useBf16GradsPh2_ = trainingConfig.mixedPrecision.gradStorageBf16Phase2;
 		glades::gpu::ScopedPerfTimerMs gpuBackwardStage(gpuPerf ? &gpuPerf->msBackward : NULL);
 
-		// Compute dLogits on GPU.
+		// Compute dLogits on GPU.  In activation-checkpoint mode the last layer's
+		// hAfterFF lives in slot ((nLayers-1) % slotsPerLayer); else modulo
+		// collapses to (nLayers-1).
+		const unsigned int slotsPerLayerBwdFinal = gpuTransformerScratch->slotsPerLayer
+		    ? gpuTransformerScratch->slotsPerLayer : nLayers;
 		const float* bwdFinalH = gpuTransformerScratch->hAfterFF.data() +
-		    static_cast<size_t>(nLayers - 1) * T * dModel;
+		    static_cast<size_t>((nLayers - 1) % slotsPerLayerBwdFinal) * T * dModel;
 		const float* bwdPostFinalLN = gpuTransformerScratch->hPostFinalLN.data();
 
 #define GLADES_ECHO_GPU_OBSERVE(enabled_, state_, rowObs_, colObs_, samples_, rows_, cols_) do { \
@@ -10628,19 +10673,30 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		const unsigned int ropeHalfDim = fwdRopeHalfDim;
 
 		// Backprop through blocks (reverse order).
+		const unsigned int slotsPerLayerBwd = gpuTransformerScratch->slotsPerLayer
+		    ? gpuTransformerScratch->slotsPerLayer : nLayers;
 		for (int li = static_cast<int>(nLayers) - 1; li >= 0; --li)
 		{
 			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
-			const size_t layerOff = static_cast<size_t>(li) * static_cast<size_t>(T);
+			// Activation-checkpoint: per-layer activations live in cyclic slots.
+			// When checkpointing is off, slotsPerLayer == nLayers and modulo
+			// collapses to identity.  When on, Stage 4 will recompute the segment
+			// before reading these slots; for Stage 2 the modulo is correct only
+			// when nLayers == slotsPerLayer (default off).
+			const size_t slot = static_cast<size_t>(static_cast<unsigned int>(li) % slotsPerLayerBwd);
+			const size_t prevSlot = (li > 0)
+			    ? static_cast<size_t>(static_cast<unsigned int>(li - 1) % slotsPerLayerBwd)
+			    : 0u;
+			const size_t layerOff = slot * static_cast<size_t>(T);
 
 			const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
-			    : (gpuTransformerScratch->hAfterFF.data() + static_cast<size_t>(li - 1) * T * dModel);
-			const float* x1_l = gpuTransformerScratch->x1.data() + static_cast<size_t>(li) * T * dModel;
-			const float* x2_l = gpuTransformerScratch->x2.data() + static_cast<size_t>(li) * T * dModel;
-			const float* ff1_l = gpuTransformerScratch->ff1.data() + static_cast<size_t>(li) * T * ff1Width;
-			const float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + static_cast<size_t>(li) * T * dModel;
-			const float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + static_cast<size_t>(li) * T * dModel;
-			const float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + static_cast<size_t>(li) * T * dFF;
+			    : (gpuTransformerScratch->hAfterFF.data() + prevSlot * T * dModel);
+			const float* x1_l = gpuTransformerScratch->x1.data() + slot * T * dModel;
+			const float* x2_l = gpuTransformerScratch->x2.data() + slot * T * dModel;
+			const float* ff1_l = gpuTransformerScratch->ff1.data() + slot * T * ff1Width;
+			const float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + slot * T * dModel;
+			const float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + slot * T * dModel;
+			const float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + slot * T * dFF;
 
 			// dH is gradient w.r.t. hAfterFF[li].
 			// Residual: hAfterFF = hAfterAttn + ffOut => dFFOut = dH, dHAfterAttn (residual) = dH.
@@ -10833,9 +10889,9 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    1.0f, gb.gBo.data());
 
 			// --- Attention backward (flash-style recompute) ---
-			float* Q_l = gpuTransformerScratch->Q.data() + static_cast<size_t>(li) * T * dModel;
-			float* K_l = gpuTransformerScratch->K.data() + static_cast<size_t>(li) * T * dModelKV;
-			float* V_l = gpuTransformerScratch->V.data() + static_cast<size_t>(li) * T * dModelKV;
+			float* Q_l = gpuTransformerScratch->Q.data() + slot * T * dModel;
+			float* K_l = gpuTransformerScratch->K.data() + slot * T * dModelKV;
+			float* V_l = gpuTransformerScratch->V.data() + slot * T * dModelKV;
 
 			// Zero dK/dV (dQ is overwritten per-head, but dK/dV accumulate for GQA).
 			gpu::zero_buffers_batch(gpuTransformerScratch->d_dKdVZeroPtrs,
