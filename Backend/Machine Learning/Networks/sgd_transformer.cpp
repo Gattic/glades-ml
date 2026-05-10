@@ -9291,12 +9291,27 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 	// Embedding / input projection.
 	if (tokenLM)
 	{
-		gpu::embedding_gather(
-		    gpuTransformerWeights->tokE.data(),
-		    gpuTransformerScratch->tokenIds.data(),
-		    static_cast<int>(T), static_cast<int>(vocabSize),
-		    static_cast<int>(dModel),
-		    gpuTransformerScratch->h.data());
+		// bf16-weights master-retire path: route through bf16 mirror gather
+		// when FP32 tokE is retired.
+		if (gpuTransformerWeights->tokE.size() == 0
+		    && gpuTransformerWeights->tokELowp.allocated())
+		{
+			gpu::embedding_gather_bf16(
+			    gpuTransformerWeights->tokELowp.data(),
+			    gpuTransformerScratch->tokenIds.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize),
+			    static_cast<int>(dModel),
+			    gpuTransformerScratch->h.data());
+		}
+		else
+		{
+			gpu::embedding_gather(
+			    gpuTransformerWeights->tokE.data(),
+			    gpuTransformerScratch->tokenIds.data(),
+			    static_cast<int>(T), static_cast<int>(vocabSize),
+			    static_cast<int>(dModel),
+			    gpuTransformerScratch->h.data());
+		}
 	}
 	else
 	{
@@ -10200,13 +10215,30 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			gpu::recordEvent(gpuTransferReadyEvent, gpu::transferStream());
 			gpu::streamWaitEvent(gpu::computeStream(), gpuTransferReadyEvent);
 
-			// Forward: embedding gather
-			gpu::embedding_gather(
-			    gpuTransformerWeights->tokE.data(),
-			    gpuTransformerScratch->tokenIds.data(),
-			    static_cast<int>(T), static_cast<int>(vocabSize),
-			    static_cast<int>(dModel),
-			    gpuTransformerScratch->h.data());
+			// Forward: embedding gather.  Under bf16-weights mode the FP32
+			// master may be retired (gb.tokE.size() == 0) and the canonical
+			// store is the bf16 mirror tokELowp; route through the bf16
+			// gather variant.  When FP32 master is alive (default), prefer
+			// the FP32 path for bit-exact behavior with the prior code.
+			if (gpuTransformerWeights->tokE.size() == 0
+			    && gpuTransformerWeights->tokELowp.allocated())
+			{
+				gpu::embedding_gather_bf16(
+				    gpuTransformerWeights->tokELowp.data(),
+				    gpuTransformerScratch->tokenIds.data(),
+				    static_cast<int>(T), static_cast<int>(vocabSize),
+				    static_cast<int>(dModel),
+				    gpuTransformerScratch->h.data());
+			}
+			else
+			{
+				gpu::embedding_gather(
+				    gpuTransformerWeights->tokE.data(),
+				    gpuTransformerScratch->tokenIds.data(),
+				    static_cast<int>(T), static_cast<int>(vocabSize),
+				    static_cast<int>(dModel),
+				    gpuTransformerScratch->h.data());
+			}
 		}
 		else
 		{

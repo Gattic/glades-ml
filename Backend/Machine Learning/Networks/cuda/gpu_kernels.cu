@@ -1026,6 +1026,33 @@ __global__ void embedding_gather_kernel(const float* __restrict__ E,
 		out[idx] = 0.0f;
 }
 
+// BF16 variant: gather from a bf16 embedding table and write FP32 output.
+// Used when bf16-weights mode retires the FP32 master so tokE only exists
+// as the bf16 mirror.  Output stays FP32 because downstream activation
+// path (h, x1, etc.) is FP32.
+__global__ void embedding_gather_bf16_kernel(const uint16_t* __restrict__ E_bf16,
+                                              const int* __restrict__ tokenIds,
+                                              int T, int vocabSize, int dModel,
+                                              float* __restrict__ out)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= T * dModel) return;
+	int t = idx / dModel;
+	int d = idx % dModel;
+	int tok = tokenIds[t];
+	if (tok >= 0 && tok < vocabSize)
+	{
+		// Decode BF16 to FP32: zero-extend then shift left 16 bits.
+		union { uint32_t u; float f; } uv;
+		uv.u = static_cast<uint32_t>(E_bf16[(size_t)tok * dModel + d]) << 16;
+		out[idx] = uv.f;
+	}
+	else
+	{
+		out[idx] = 0.0f;
+	}
+}
+
 __global__ void embedding_scatter_add_kernel(float* __restrict__ dE,
                                              const int* __restrict__ tokenIds,
                                              const float* __restrict__ dout,
@@ -1110,6 +1137,18 @@ bool embedding_gather(const float* E, const int* tokenIds,
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
 	embedding_gather_kernel<<<grid, kBlockElem, 0, computeStream()>>>(E, tokenIds, T, vocabSize, dModel, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool embedding_gather_bf16(const uint16_t* E_bf16, const int* tokenIds,
+                            int T, int vocabSize, int dModel, float* out)
+{
+	if (T <= 0 || dModel <= 0) return true;
+	int total = T * dModel;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	embedding_gather_bf16_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    E_bf16, tokenIds, T, vocabSize, dModel, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

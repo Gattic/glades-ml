@@ -119,6 +119,12 @@ bool scale_array(float* x, float scale, int n);
 // Forward: out[T, dModel] = E[tokenIds[T], :].
 bool embedding_gather(const float* E, const int* tokenIds,
                       int T, int vocabSize, int dModel, float* out);
+// BF16-master variant: gather from a bf16 embedding table.  Used when
+// MixedPrecisionConfig::weightStorageBf16 is true and the FP32 master is
+// retired (only the bf16 mirror remains).  Output stays FP32 because the
+// downstream activation path is FP32.
+bool embedding_gather_bf16(const uint16_t* E_bf16, const int* tokenIds,
+                            int T, int vocabSize, int dModel, float* out);
 
 // Backward: dE[tokenIds[T], :] += dout[T, dModel].
 bool embedding_scatter_add(float* dE, const int* tokenIds,
@@ -745,6 +751,7 @@ inline bool axpy(float, const float*, float*, int) { return false; }
 inline bool scale_array(float*, float, int) { return false; }
 
 inline bool embedding_gather(const float*, const int*, int, int, int, float*) { return false; }
+inline bool embedding_gather_bf16(const uint16_t*, const int*, int, int, int, float*) { return false; }
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
 
