@@ -1516,3 +1516,56 @@ Stage 8b is the path that delivers the user's "combine flagship
 and CHIRON" directive — without it, flagship-side wins (MLA #76,
 local-attn-with-sinks #78, GPU init port) cannot be measured at
 the 1.84B target scale.
+
+### 700M validation — init fix proven at scale
+
+Same config as the 1.84B attempt but with L=24 instead of L=53
+(~700M params at d=2048/dFF=5632/T=256/bf16-weights+int8-Adam+
+grad-checkpoint):
+
+| Metric                   | Value                                |
+|--------------------------|--------------------------------------|
+| Init time                | ~6 seconds (vs >30 min pre-fix)     |
+| First train step         | step 18 / nll=10.558 / 1091 tok/s   |
+| After 100 steps          | nll=10.265                          |
+| After 189 steps          | nll=10.135 (-0.42 nat in ~4 min)    |
+| Steady-state throughput  | ~1382 tok/s                         |
+| Tokens·params/sec        | 9.7 × 10¹¹                          |
+
+Compare to CHIRON 1.84B (Adam baseline 2.5k steps, prior section):
+- CHIRON: 5530 tok/s × 1.84B params = 1.02 × 10¹³ tokens·params/sec
+- Flagship 700M: 1382 tok/s × 0.7B params = 9.7 × 10¹¹ tokens·params/sec
+
+CHIRON is **10× higher** in tokens·params/sec, even with all the
+flagship infrastructure now working. This is the structural
+flagship-vs-CHIRON gap at the 16 GB GPU ceiling: CHIRON's
+reversibility lets it scale to 1.84B while flagship caps at ~700M
+with the current FP32-master init scheme.
+
+**Stage 8a's contribution**: flagship at 700M now trains correctly
+end-to-end. The init bottleneck that blocked any scale >250M is
+gone. Path to head-to-head at 1.84B: Stage 8b (per-layer streaming
+init in `gpu_transformer_state.cu`).
+
+### Flagship-vs-CHIRON status snapshot — end of iteration
+
+| Capability                          | Flagship           | CHIRON 1.84B  |
+|-------------------------------------|--------------------|---------------|
+| Reaches 1.84B scale on 16 GB        | NO (Stage 8b)     | YES           |
+| Init time at 700M class             | 6 sec (post-fix)  | n/a           |
+| Init time at 1.84B class            | n/a (Stage 8b)    | ~40 sec       |
+| Adam state                           | int8 ✓            | int8 ✓        |
+| BF16 weights / grads                 | ✓ ✓              | ✓ ✓           |
+| Reversibility                        | NO                | YES           |
+| FACE on embedding                    | available         | ✓ (on by default) |
+| Activation gradient checkpointing    | ✓ (Task #12)      | n/a (reversibility instead) |
+| MLA latent-KV                        | ✓                 | NO            |
+| Local-attn with sinks                | ✓                 | basic local-attn only |
+| Binary FFN                           | available (diverges at scale) | NO |
+| Tokens·params/sec @ realistic max    | 9.7 × 10¹¹ (700M) | 1.02 × 10¹³ (1.84B) |
+
+The unified flagship+CHIRON design (per
+`UNIFIED_FLAGSHIP_CHIRON_DESIGN.md`) wants ALL the ✓ from both
+columns. Currently neither side has the union. Stage 8b unblocks
+flagship to 1.84B; CHIRON still needs MLA/local-attn-sinks ports
+to reach the union.
