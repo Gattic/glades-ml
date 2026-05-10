@@ -2041,6 +2041,25 @@ private:
 	                                  bool bf16W2, bool bf16Head,
 	                                  int ropeDimOverride,
 	                                  void* gpuPerfOpaque);
+
+	// Activation-checkpoint helper.  Re-runs the per-layer forward body for
+	// layers in [segStart, segEnd) (exclusive end), populating the cyclic
+	// activation slots so the backward path can read them.  When
+	// segmentInputOverride is non-NULL it is used as the input to layer
+	// segStart (e.g. a checkpoint hAfterFF copy); otherwise the standard
+	// layerIn formula `(li == 0) ? h : hAfterFF[prevSlot]` is used.  Same
+	// kernel sequence as transformerGpuRunForwardOnly's layer loop, minus
+	// embedding/final-LN/output-head — those are handled once per step in
+	// the train epoch and don't need recomputing.
+	bool transformerGpuLayerRangeForward(
+	    const TransformerEpochCfg& cfg,
+	    unsigned int T,
+	    unsigned int segStart, unsigned int segEnd,
+	    const float* segmentInputOverride,
+	    bool useBf16, bool useRope,
+	    bool bf16Wq, bool bf16Wk, bool bf16Wv,
+	    bool bf16Wo, bool bf16W1, bool bf16W2,
+	    int ropeDimOverride);
 #endif
 
 

@@ -9691,6 +9691,331 @@ bool glades::NNetwork::transformerGpuRunForwardOnly(
 	return true;
 }
 
+// Activation-checkpoint helper.  Re-runs the per-layer forward body for layers
+// in [segStart, segEnd), populating cyclic activation slots (slot = li % K)
+// so that the backward path can read them.  Mirrors the kernel sequence in
+// transformerGpuRunForwardOnly's layer loop, minus embedding/final-LN/output-
+// head — those are handled once per step in the train epoch and don't need
+// recomputing.  When segmentInputOverride is non-NULL it is used as the input
+// to the FIRST recomputed layer (segStart); subsequent layers in the segment
+// read from the just-written cyclic slots.
+bool glades::NNetwork::transformerGpuLayerRangeForward(
+    const TransformerEpochCfg& cfg,
+    unsigned int T,
+    unsigned int segStart, unsigned int segEnd,
+    const float* segmentInputOverride,
+    bool useBf16, bool useRope,
+    bool bf16Wq, bool bf16Wk, bool bf16Wv,
+    bool bf16Wo, bool bf16W1, bool bf16W2,
+    int ropeDimOverride)
+{
+	if (!gpuTransformerWeights || !gpuTransformerScratch) return false;
+	if (T == 0u) return false;
+	if (segEnd <= segStart) return true;
+
+	const unsigned int dModel = cfg.dModel;
+	const unsigned int dFF = cfg.dFF;
+	const unsigned int nHeads = cfg.nHeads;
+	const unsigned int nKVHeads = cfg.nKVHeads > 0u ? cfg.nKVHeads : cfg.nHeads;
+	const unsigned int nLayers = cfg.nLayers;
+	const unsigned int dHead = dModel / nHeads;
+	const unsigned int dModelKV = nKVHeads * dHead;
+	const unsigned int ffnKind = static_cast<unsigned int>(cfg.ffnKind);
+	const unsigned int ff1Width = (ffnKind == 1u) ? (2u * dFF) : dFF;
+	const bool causal = cfg.causal;
+	const int normType = cfg.normType;
+	const int ffnAct = cfg.ffnAct;
+	const float lnEps = cfg.lnEps;
+
+	const unsigned int slotsPerLayer = gpuTransformerScratch->slotsPerLayer
+	    ? gpuTransformerScratch->slotsPerLayer : nLayers;
+	if (segEnd > nLayers) return false;
+
+	for (unsigned int li = segStart; li < segEnd; ++li)
+	{
+		gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
+		const size_t slot = static_cast<size_t>(li % slotsPerLayer);
+		const size_t prevSlot = (li > 0u)
+		    ? static_cast<size_t>((li - 1u) % slotsPerLayer)
+		    : 0u;
+		const size_t layerOff = slot * static_cast<size_t>(T);
+
+		// First recomputed layer in the segment uses the override (a
+		// hAfterFF checkpoint copy).  Subsequent layers read from the
+		// just-populated cyclic slots.
+		const float* layerIn;
+		if (li == segStart && segmentInputOverride)
+			layerIn = segmentInputOverride;
+		else if (li == 0)
+			layerIn = gpuTransformerScratch->h.data();
+		else
+			layerIn = gpuTransformerScratch->hAfterFF.data()
+			          + prevSlot * T * dModel;
+
+		float* x1_l = gpuTransformerScratch->x1.data() + slot * T * dModel;
+		float* ln1Mean_l = gpuTransformerScratch->ln1Mean.data() + layerOff;
+		float* ln1InvStd_l = gpuTransformerScratch->ln1InvStd.data() + layerOff;
+
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			gpu::rmsnorm_forward(layerIn, gb.ln1Gamma.data(), lnEps,
+			                     static_cast<int>(T), static_cast<int>(dModel),
+			                     x1_l, ln1InvStd_l);
+		else
+			gpu::layernorm_forward(layerIn, gb.ln1Gamma.data(), gb.ln1Beta.data(),
+			                       lnEps, static_cast<int>(T), static_cast<int>(dModel),
+			                       x1_l, ln1Mean_l, ln1InvStd_l);
+
+		float* Q_l = gpuTransformerScratch->Q.data() + slot * T * dModel;
+		float* K_l = gpuTransformerScratch->K.data() + slot * T * dModelKV;
+		float* V_l = gpuTransformerScratch->V.data() + slot * T * dModelKV;
+
+		if (!gpu_gemm_abt_mp(bf16Wq,
+		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
+		    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+		    gb.Wq.data(), gb.WqLowp.data(), static_cast<int>(dModel),
+		    0.0f, Q_l, static_cast<int>(dModel)))
+			return false;
+		gpu::add_bias(Q_l, gb.bq.data(), static_cast<int>(T), static_cast<int>(dModel));
+
+		const int mlaDc = trainingConfig.transformer.mlaLatentDim;
+		if (mlaDc > 0 && gb.Wdkv.allocated()) {
+			const size_t cBytes = static_cast<size_t>(T) * static_cast<size_t>(mlaDc);
+			if (gb.mlaC.size() < cBytes) gb.mlaC.allocate(cBytes);
+			if (!gpu::mla_attention_forward_gpu(
+			        x1_l, gb.Wdkv.data(), gb.Wuk.data(), gb.Wuv.data(),
+			        static_cast<int>(T), static_cast<int>(dModel), mlaDc, static_cast<int>(dModelKV),
+			        gb.mlaC.data(), K_l, V_l))
+				return false;
+			gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+			gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+		} else {
+			if (!gpu_gemm_abt_mp(bf16Wk,
+			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
+			    0.0f, K_l, static_cast<int>(dModelKV)))
+				return false;
+			gpu::add_bias(K_l, gb.bk.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+
+			if (!gpu_gemm_abt_mp(bf16Wv,
+			    static_cast<int>(T), static_cast<int>(dModelKV), static_cast<int>(dModel), 1.0f,
+			    x1_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
+			    0.0f, V_l, static_cast<int>(dModelKV)))
+				return false;
+			gpu::add_bias(V_l, gb.bv.data(), static_cast<int>(T), static_cast<int>(dModelKV));
+		}
+
+		if (useRope && !transformerPosEncCache.ropeInvFreq.empty())
+		{
+			const unsigned int rd =
+			    (ropeDimOverride > 0 && static_cast<unsigned int>(ropeDimOverride) < dHead)
+			    ? static_cast<unsigned int>(ropeDimOverride) : dHead;
+			gpu::rope_apply_qk(Q_l, K_l, gpuTransformerScratch->gpuInvFreq.data(),
+			                   static_cast<int>(T), static_cast<int>(nHeads),
+			                   static_cast<int>(nKVHeads), static_cast<int>(dHead),
+			                   static_cast<int>(rd / 2u));
+		}
+
+		float* attnConcat_l = gpuTransformerScratch->attnConcat.data() + slot * T * dModel;
+		if (useBf16)
+		{
+			glades::gpu::cast_f32_to_bf16(Q_l, gpuTransformerScratch->qLowp.data(),
+			    static_cast<size_t>(T) * dModel);
+			glades::gpu::cast_f32_to_bf16(K_l, gpuTransformerScratch->kLowp.data(),
+			    static_cast<size_t>(T) * dModelKV);
+			glades::gpu::cast_f32_to_bf16(V_l, gpuTransformerScratch->vLowp.data(),
+			    static_cast<size_t>(T) * dModelKV);
+			const int localW = trainingConfig.transformer.localAttnWindow;
+			const int sinkS = trainingConfig.transformer.attnSinkCount > 0
+			    ? trainingConfig.transformer.attnSinkCount : 0;
+			if ((localW > 0 && localW < static_cast<int>(T)) || sinkS > 0) {
+				gpu::flash_attention_multihead_forward_bf16_local(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    static_cast<int>(T), static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+				    static_cast<int>(dModel), static_cast<int>(dModelKV),
+				    causal, localW, attnConcat_l, sinkS);
+			} else {
+				gpu::flash_attention_multihead_forward_bf16(
+				    gpuTransformerScratch->qLowp.data(),
+				    gpuTransformerScratch->kLowp.data(),
+				    gpuTransformerScratch->vLowp.data(),
+				    static_cast<int>(T), static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+				    static_cast<int>(dModel), static_cast<int>(dModelKV),
+				    causal, attnConcat_l);
+			}
+		}
+		else
+		{
+			const bool chiron_fast_eval = (nHeads == nKVHeads);
+			if (chiron_fast_eval)
+			{
+				const size_t scoresNeeded = static_cast<size_t>(nHeads) * T * T;
+				if (gpuTransformerScratch->attnScoresScratch.size() < scoresNeeded)
+					gpuTransformerScratch->attnScoresScratch.allocate(scoresNeeded);
+				if (gpuTransformerScratch->attnScoresScratch.size() >= scoresNeeded)
+				{
+					gpu::flash_attention_cublas_tiled(Q_l, K_l, V_l,
+					    static_cast<int>(T), static_cast<int>(nHeads),
+					    static_cast<int>(dHead), static_cast<int>(dModel),
+					    causal, attnConcat_l,
+					    gpuTransformerScratch->attnScoresScratch.data());
+				}
+				else
+				{
+					gpu::flash_attention_multihead_forward(Q_l, K_l, V_l,
+					    static_cast<int>(T), static_cast<int>(nHeads),
+					    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+					    static_cast<int>(dModel), static_cast<int>(dModelKV),
+					    causal, attnConcat_l);
+				}
+			}
+			else
+			{
+				gpu::flash_attention_multihead_forward(Q_l, K_l, V_l,
+				    static_cast<int>(T), static_cast<int>(nHeads),
+				    static_cast<int>(nKVHeads), static_cast<int>(dHead),
+				    static_cast<int>(dModel), static_cast<int>(dModelKV),
+				    causal, attnConcat_l);
+			}
+		}
+
+		float* attnOut_l = gpuTransformerScratch->attnOut.data() + slot * T * dModel;
+		if (!gpu_gemm_abt_mp(bf16Wo,
+		    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dModel), 1.0f,
+		    attnConcat_l, gpuTransformerScratch->activationLowp.data(),
+		    static_cast<int>(dModel),
+		    gb.Wo.data(), gb.WoLowp.data(), static_cast<int>(dModel),
+		    0.0f, attnOut_l, static_cast<int>(dModel)))
+			return false;
+		gpu::add_bias(attnOut_l, gb.bo.data(),
+		              static_cast<int>(T), static_cast<int>(dModel));
+
+		float* hAfterAttn_l = gpuTransformerScratch->hAfterAttn.data() + slot * T * dModel;
+		gpu::add_two(hAfterAttn_l, layerIn, attnOut_l,
+		             static_cast<int>(T * dModel));
+
+		float* x2_l = gpuTransformerScratch->x2.data() + slot * T * dModel;
+		float* ln2Mean_l = gpuTransformerScratch->ln2Mean.data() + layerOff;
+		float* ln2InvStd_l = gpuTransformerScratch->ln2InvStd.data() + layerOff;
+
+		if (normType == static_cast<int>(glades::TransformerRunConfig::NORM_RMSNORM))
+			gpu::rmsnorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), lnEps,
+			                     static_cast<int>(T), static_cast<int>(dModel),
+			                     x2_l, ln2InvStd_l);
+		else
+			gpu::layernorm_forward(hAfterAttn_l, gb.ln2Gamma.data(), gb.ln2Beta.data(),
+			                       lnEps, static_cast<int>(T), static_cast<int>(dModel),
+			                       x2_l, ln2Mean_l, ln2InvStd_l);
+
+		float* ff1_l = gpuTransformerScratch->ff1.data() + slot * T * ff1Width;
+		float* ff1Act_l = gpuTransformerScratch->ff1Act.data() + slot * T * dFF;
+		float* ffOut_l = gpuTransformerScratch->ffOut.data() + slot * T * dModel;
+
+		const bool useBinaryFFNW1 = trainingConfig.transformer.binaryFFN;
+		if (useBinaryFFNW1)
+		{
+			const bool useBitNetW1 = (dModel % 128u) == 0u;
+			if (useBitNetW1)
+			{
+				const size_t xBits = static_cast<size_t>(T) * (dModel / 32u);
+				const size_t wBits = static_cast<size_t>(ff1Width) * (dModel / 32u);
+				if (gb.bitnetXBitsW1.size() < xBits) gb.bitnetXBitsW1.allocate(xBits);
+				if (gb.bitnetWBitsW1.size() < wBits) gb.bitnetWBitsW1.allocate(wBits);
+				if (gb.bitnetAlphaXW1.size() < T) gb.bitnetAlphaXW1.allocate(T);
+				if (gb.bitnetAlphaWW1.size() < ff1Width) gb.bitnetAlphaWW1.allocate(ff1Width);
+				const size_t cPop = static_cast<size_t>(T) * ff1Width;
+				if (gb.bitnetCPopW1.size() < cPop) gb.bitnetCPopW1.allocate(cPop);
+				if (!gpu::bitnet_ffn_forward_gpu(
+				        x2_l, gb.W1.data(),
+				        static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
+				        gb.bitnetXBitsW1.data(), gb.bitnetWBitsW1.data(),
+				        gb.bitnetAlphaXW1.data(), gb.bitnetAlphaWW1.data(),
+				        gb.bitnetCPopW1.data(), ff1_l))
+					return false;
+			}
+			else
+			{
+				if (!gpu::binary_gemm_abt_from_float(
+				        x2_l, gb.W1.data(),
+				        static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel),
+				        ff1_l))
+					return false;
+			}
+		}
+		else
+		{
+			if (!gpu_gemm_abt_mp(bf16W1,
+			    static_cast<int>(T), static_cast<int>(ff1Width), static_cast<int>(dModel), 1.0f,
+			    x2_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+			    gb.W1.data(), gb.W1Lowp.data(), static_cast<int>(dModel),
+			    0.0f, ff1_l, static_cast<int>(ff1Width)))
+				return false;
+		}
+		gpu::add_bias(ff1_l, gb.b1.data(),
+		              static_cast<int>(T), static_cast<int>(ff1Width));
+
+		if (ffnKind == 1u)
+			gpu::swiglu_forward(ff1_l, static_cast<int>(T), static_cast<int>(dFF), ff1Act_l);
+		else if (ffnAct == static_cast<int>(glades::TransformerRunConfig::FFN_GELU))
+			gpu::gelu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+		else
+			gpu::relu_forward(ff1_l, static_cast<int>(T * dFF), ff1Act_l);
+
+		const bool useBinaryFFN = trainingConfig.transformer.binaryFFN;
+		if (useBinaryFFN)
+		{
+			const bool useBitNet = (dFF % 128u) == 0u;
+			if (useBitNet)
+			{
+				const size_t xBits = static_cast<size_t>(T) * (dFF / 32u);
+				const size_t wBits = static_cast<size_t>(dModel) * (dFF / 32u);
+				if (gb.bitnetXBits.size() < xBits) gb.bitnetXBits.allocate(xBits);
+				if (gb.bitnetWBits.size() < wBits) gb.bitnetWBits.allocate(wBits);
+				if (gb.bitnetAlphaX.size() < T) gb.bitnetAlphaX.allocate(T);
+				if (gb.bitnetAlphaW.size() < dModel) gb.bitnetAlphaW.allocate(dModel);
+				const size_t cPop = static_cast<size_t>(T) * dModel;
+				if (gb.bitnetCPop.size() < cPop) gb.bitnetCPop.allocate(cPop);
+				if (!gpu::bitnet_ffn_forward_gpu(
+				        ff1Act_l, gb.W2.data(),
+				        static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+				        gb.bitnetXBits.data(), gb.bitnetWBits.data(),
+				        gb.bitnetAlphaX.data(), gb.bitnetAlphaW.data(),
+				        gb.bitnetCPop.data(), ffOut_l))
+					return false;
+			}
+			else
+			{
+				if (!gpu::binary_gemm_abt_from_float(
+				        ff1Act_l, gb.W2.data(),
+				        static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF),
+				        ffOut_l))
+					return false;
+			}
+		}
+		else
+		{
+			if (!gpu_gemm_abt_mp(bf16W2,
+			    static_cast<int>(T), static_cast<int>(dModel), static_cast<int>(dFF), 1.0f,
+			    ff1Act_l, gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
+			    gb.W2.data(), gb.W2Lowp.data(), static_cast<int>(dFF),
+			    0.0f, ffOut_l, static_cast<int>(dModel)))
+				return false;
+		}
+		gpu::add_bias(ffOut_l, gb.b2.data(),
+		              static_cast<int>(T), static_cast<int>(dModel));
+
+		float* hAfterFF_l = gpuTransformerScratch->hAfterFF.data() + slot * T * dModel;
+		gpu::add_two(hAfterFF_l, hAfterAttn_l, ffOut_l,
+		             static_cast<int>(T * dModel));
+	}
+	return true;
+}
+
 #endif // GLADES_HAVE_CUDA
 
 void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
