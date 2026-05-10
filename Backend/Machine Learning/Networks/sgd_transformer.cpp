@@ -10998,24 +10998,85 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		const unsigned int ropeHalfDim = fwdRopeHalfDim;
 
 		// Backprop through blocks (reverse order).
+		// Activation gradient checkpointing (sqrt-L scheme): walk segments
+		// from the highest down to 0.  After the initial forward pass the
+		// cyclic activation slots contain only the LAST segment's layers
+		// (the rest were overwritten as forward marched through the layers).
+		// For each non-last segment we re-run the per-layer forward body
+		// starting from the saved checkpoint (or the embedding output `h`
+		// for segment 0), repopulating the slots before the inner reverse
+		// backward sweep reads them.  When activationCheckpoint is off,
+		// slotsPerLayer == nLayers, nSegments == 1, and the recompute path
+		// is skipped — bit-for-bit identical to the prior single-loop form.
 		const unsigned int slotsPerLayerBwd = gpuTransformerScratch->slotsPerLayer
 		    ? gpuTransformerScratch->slotsPerLayer : nLayers;
-		for (int li = static_cast<int>(nLayers) - 1; li >= 0; --li)
+		const unsigned int nSegmentsBwd = (slotsPerLayerBwd >= nLayers)
+		    ? 1u
+		    : ((nLayers + slotsPerLayerBwd - 1u) / slotsPerLayerBwd);
+		for (int seg = static_cast<int>(nSegmentsBwd) - 1; seg >= 0; --seg)
+		{
+			const unsigned int segStart = static_cast<unsigned int>(seg) * slotsPerLayerBwd;
+			unsigned int segEndU = static_cast<unsigned int>(seg + 1) * slotsPerLayerBwd;
+			if (segEndU > nLayers) segEndU = nLayers;
+			const unsigned int segEnd = segEndU;
+
+			// Recompute this segment's forward unless its slots are already
+			// populated by the most recent forward pass (the LAST segment).
+			if (seg < static_cast<int>(nSegmentsBwd) - 1)
+			{
+				const float* segIn;
+				if (seg == 0)
+				{
+					segIn = gpuTransformerScratch->h.data();
+				}
+				else
+				{
+					segIn = gpuTransformerScratch->checkpoints.data()
+					    + static_cast<size_t>(seg - 1) * T * dModel;
+				}
+				if (!transformerGpuLayerRangeForward(cfg, T, segStart, segEnd, segIn,
+				                                     useBf16, useRope,
+				                                     bf16Wq, bf16Wk, bf16Wv,
+				                                     bf16Wo, bf16W1, bf16W2,
+				                                     ropeDimOverride))
+				{
+					lastStatus = NNetworkStatus(NNetworkStatus::INTERNAL_ERROR,
+					    "transformerGpuTrainEpoch: activation-checkpoint segment recompute failed");
+					storeRunningFlag(false);
+					return;
+				}
+			}
+
+		for (int li = static_cast<int>(segEnd) - 1; li >= static_cast<int>(segStart); --li)
 		{
 			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[li];
 			// Activation-checkpoint: per-layer activations live in cyclic slots.
 			// When checkpointing is off, slotsPerLayer == nLayers and modulo
-			// collapses to identity.  When on, Stage 4 will recompute the segment
-			// before reading these slots; for Stage 2 the modulo is correct only
-			// when nLayers == slotsPerLayer (default off).
+			// collapses to identity.  Otherwise the slots were just freshly
+			// repopulated by the segment-recompute call above (or are the
+			// initial forward's last-segment leftovers when seg == nSegments-1).
 			const size_t slot = static_cast<size_t>(static_cast<unsigned int>(li) % slotsPerLayerBwd);
 			const size_t prevSlot = (li > 0)
 			    ? static_cast<size_t>(static_cast<unsigned int>(li - 1) % slotsPerLayerBwd)
 			    : 0u;
 			const size_t layerOff = slot * static_cast<size_t>(T);
 
-			const float* layerIn = (li == 0) ? gpuTransformerScratch->h.data()
-			    : (gpuTransformerScratch->hAfterFF.data() + prevSlot * T * dModel);
+			// layerIn = input to forward layer li.  Three cases:
+			//   (1) li == 0: embedding output `h`.
+			//   (2) li == segStart and seg > 0 (activation-checkpoint mode):
+			//       the slot at prevSlot DOES NOT hold hAfterFF[li-1] — it
+			//       holds either the recomputed segment's last layer (if
+			//       this segment overlapped K-1 slot) or stale data.  Use
+			//       the saved checkpoint[seg-1] instead.
+			//   (3) Otherwise: cyclic-slot read.
+			const float* layerIn;
+			if (li == 0)
+				layerIn = gpuTransformerScratch->h.data();
+			else if (li == static_cast<int>(segStart) && seg > 0)
+				layerIn = gpuTransformerScratch->checkpoints.data()
+				    + static_cast<size_t>(seg - 1) * T * dModel;
+			else
+				layerIn = gpuTransformerScratch->hAfterFF.data() + prevSlot * T * dModel;
 			const float* x1_l = gpuTransformerScratch->x1.data() + slot * T * dModel;
 			const float* x2_l = gpuTransformerScratch->x2.data() + slot * T * dModel;
 			const float* ff1_l = gpuTransformerScratch->ff1.data() + slot * T * ff1Width;
@@ -11513,7 +11574,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->dH2.data(),
 			    gpuTransformerScratch->dHInFromLN.data(),
 			    static_cast<int>(T * dModel));
-		} // layers backward
+		} // layers backward (within segment)
+		} // activation-checkpoint segments backward
 
 		// Backprop through input embedding/projection.
 		if (tokenLM)
