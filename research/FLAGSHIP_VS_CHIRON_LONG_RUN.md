@@ -1569,3 +1569,85 @@ The unified flagship+CHIRON design (per
 columns. Currently neither side has the union. Stage 8b unblocks
 flagship to 1.84B; CHIRON still needs MLA/local-attn-sinks ports
 to reach the union.
+
+## 2026-05-10 update — NIMBUS (#52) step 1 sanity check
+
+### What was tested
+
+To validate the foundation for NIMBUS async optimizer pipelining
+(paradigm #52, claimed 1.33× wall reduction at 1.84B), I ran the
+existing CHIRON `--cpu-adam` path standalone at 200M scale (250
+steps, no bf16 compose):
+
+| Phase | tok/s    | Notes                                     |
+|-------|---------:|-------------------------------------------|
+| T=256 / L=4   |     451 → 581 | warmup, single-thread CPU adam dominates  |
+| T=512 / L=10  |          980 | optimizer overhead amortizing             |
+| T=1024 / L=20 |         1638 | best throughput, still PCIe-bound          |
+
+### Reading
+
+`--cpu-adam` works correctly (NLL trajectory normal, ema=10.4391
+final). But at 200M the path is **~10× slower** than GPU-adam
+baseline (CHIRON 200M GPU-adam typical: ~3000 tok/s; cpu-adam
+peak: 1638 tok/s).
+
+The slowdown is structural — every step transfers FP32 grads + FP32
+master + m + v across PCIe. At 200M params × 4 bytes × 4 tensors =
+3.2 GB per step over PCIe 4.0 (16 GB/s) = 200ms PCIe latency, vs
+~30ms GPU compute. The optimizer phase becomes the hot path.
+
+### Implication for NIMBUS at 1.84B
+
+The NIMBUS design claims 1.33× speedup at 1.84B. This requires:
+1. **bf16-grad compose** (currently incompatible with `--cpu-adam`
+   per the rejection at `chiron_main.cpp:693-705`). Halving the
+   D2H transfer to 1.84B × 2 bytes = 3.7 GB.
+2. **Dual-stream pipelining** (the actual NIMBUS contribution).
+   GPU forward of step N+1 overlaps with CPU Adam of step N.
+
+Without (1), the cpu-adam path at 1.84B would push step time from
+~185ms → ~660ms (PCIe-dominated) → cpu-adam would be SLOWER than
+GPU adam, not faster.
+
+The compose work for (1) is ~200-300 LOC across:
+- `cpu_adam_download_grad_async` — add bf16 staging cast path
+- `cpu_adam_upload_param_async` — add bf16 staging cast path
+- One shared GPU FP32 staging buffer (250 MB at 1.84B)
+- Remove rejection gates
+
+Then (2) pipelining is another ~250-450 LOC for dual-stream events
++ stream synchronization at the boundary.
+
+**Total NIMBUS step 1+2+3: ~700-900 LOC over 2-3 weeks**, not a
+single-iteration ship.
+
+### Reframed recommendations
+
+After the empirical signal from this iteration, the relative
+ordering of paradigms-to-ship-next changes:
+
+| Paradigm | Eng cost | Speedup claim | Bottleneck for our config |
+|----------|---------:|---------------|---------------------------|
+| **NIMBUS #52** | 2-3 weeks | 1.33× at 1.84B | PCIe-bound; needs bf16 compose first |
+| **HELIUM #50** (FA-3 + FP8) | 6-8 weeks | 1.7-2.0× at 1.84B | Proven; mature reference impl exists |
+| **DISTILL-FORWARD #56** | 2 weeks + teacher choice | 5× steps to fixed final NLL | Highest reward; needs teacher (TinyLLaMA-1.1B?) |
+| **Stage 8b** (flagship init) | 1-2 days | 0× speed (unblocks measurement) | Smallest commit, structural unblock |
+
+**Reordered top recommendation**: 
+
+1. **Stage 8b first** (1-2 days) — unblocks the actual flagship
+   1.84B vs CHIRON 1.84B head-to-head. Measurement before more
+   investment.
+2. **Then DISTILL-FORWARD** (2 weeks if teacher chosen) — biggest
+   theoretical reward, fits within our memory budget, doesn't
+   touch the optimizer compose problem.
+3. **NIMBUS** stays viable but moves down the queue — its 1.33×
+   gain costs the same eng time as DISTILL-FORWARD's 5× claim.
+4. **HELIUM** for the long-term compute-axis push if both above
+   ship.
+
+This iteration's contribution: empirical evidence that NIMBUS at
+our scale needs the bf16 compose prerequisite before any speedup
+signal materializes — a real pre-flight check that prevents
+multi-week investment in a path that wouldn't deliver.
