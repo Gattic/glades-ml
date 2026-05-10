@@ -603,8 +603,16 @@ bool GpuTransformerWeights::ensureLowpMirrors()
 	// init weights; later calls short-circuit.
 	if (lowpIsCanonical && lowpReady) return true;
 
-	// For each master -> mirror pair, allocate the mirror if empty and cast.
-	// Helper captures the shape from the master buffer's allocated size.
+	// Stage 8b: under lowpIsCanonical, retire each master IMMEDIATELY after
+	// its cast — instead of waiting for freeFp32Masters() at end-of-init.
+	// This caps peak GPU at ~mirror_size additional per-tensor (vs pre-Stage-8b
+	// which held ALL FP32 masters + ALL bf16 mirrors simultaneously, peaking
+	// at ~12 GB at 1.84B/L=53).  Lets flagship 1.84B-class fit on a 16 GB GPU.
+	const bool retireEager = lowpIsCanonical;
+
+	// For each master -> mirror pair, allocate the mirror if empty, cast, and
+	// (when retireEager) free the master.  Helper captures the shape from the
+	// master buffer's allocated size.
 #define GLADES_LOWP_ENSURE(master, mirror)                                 \
 	do {                                                                   \
 		const size_t n_ = (master).size();                                 \
@@ -614,6 +622,7 @@ bool GpuTransformerWeights::ensureLowpMirrors()
 		}                                                                  \
 		if (!cast_f32_to_bf16((master).data(), (mirror).data(), n_))       \
 			return false;                                                  \
+		if (retireEager) (master).free();                                  \
 	} while (0)
 
 	if (tokenModel)
