@@ -579,6 +579,15 @@ struct GpuTransformerScratch
 	// buffer.  Allocated empty when gradStorageBf16=false.
 	GpuBuffer<float> gradScratchFp32;
 
+	// Shared FP32 weight scratch (allocated only when weightStorageBf16 is true).
+	// Sized to widest weight tensor (same as gradScratchFp32).  Per Adam tensor
+	// step: cast bf16 weight (Lowp) → weightScratchFp32 → existing FP32 Adam
+	// kernel modifies in place → cast back to bf16 (Lowp) with stochastic
+	// rounding.  Reused across all weight tensors within a step (sequential).
+	// Cost ~256 MB at 1.84B (V·d max) in exchange for retiring all FP32
+	// weight masters (~8 GB at 1.84B).
+	GpuBuffer<float> weightScratchFp32;
+
 	GpuTransformerScratch();
 	~GpuTransformerScratch();
 

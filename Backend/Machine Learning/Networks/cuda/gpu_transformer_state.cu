@@ -771,6 +771,15 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 		if (sdm * sdf  > widestWeight) widestWeight = sdm * sdf;     // W2
 		if (sos * sdm > widestWeight) widestWeight = sos * sdm;      // tokE / WOut
 		if (!gradScratchFp32.allocate(widestWeight)) return false;
+
+		// Same shape; allocated only when weightStorageBf16 mode is on (caller
+		// can re-allocate later via ensureWeightScratchFp32).  Initial alloc
+		// here because it's tied to the model shape; caller toggles it on by
+		// re-calling allocate() with the right config.
+		// (Allocated unconditionally; 260 MB at 1.84B is small relative to
+		// what we save by retiring FP32 weight masters, and the caller may
+		// not have known weightStorageBf16 at scratch-allocate time.)
+		if (!weightScratchFp32.allocate(widestWeight)) return false;
 	}
 
 	// Persistent device arrays for batch-zeroing dK/dV.
