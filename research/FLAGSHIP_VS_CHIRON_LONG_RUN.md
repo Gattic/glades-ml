@@ -846,3 +846,102 @@ Should fit comfortably with substantial margin.
 
 Monitoring run via Monitor tool; results will be appended once the
 training reports first NLL or fails.
+
+---
+
+## 2026-05-10 update — pivot to speed/NLL goal + 213M speed measurements
+
+### Strategic reframe
+
+The flagship-vs-CHIRON goal has been reframed (user direction):
+
+> Originally the benefit of CHIRON's 1.84B run was all of the memory it
+> saved.  Now our goal is to save time via compute speed and NLL accuracy
+> via our new paradigms WITHOUT compromising on memory.
+
+Memory parity at 1.84B is now a PREREQUISITE, not the headline.  The
+value-add is **tokens·params/sec to fixed final NLL** vs CHIRON.
+
+### 1.84B run killed at 16 min CPU init
+
+The Stage 6 background run (PID 897161) was killed at 16 min while
+still in CPU `net.test()` initializer.  At 1.84B, the single-threaded
+init scales with model size and takes >>30 min even with `--test-tokens
+1`.  Resources freed: 60 GB host RAM, GPU memory.  Re-launch deferred
+until either (a) FP32 master retire makes init cheaper or (b) we find
+a parallel-init path.
+
+### 213M three-way speed measurement (16384 tokens, 16 sequences)
+
+| Config                                       | tok/s  | Δ vs baseline | NLL      |
+|----------------------------------------------|-------:|---------------|----------|
+| Baseline (no savings flags)                  | 8541   | —             | 10.5900  |
+| `--bf16-weights --adam-state-int8` (no ckpt) | 9138   | **+7.0%**     | 10.5904  |
+| `... --grad-checkpoint` (full stack)         | 6959   | **-18.5%**    | 10.5901  |
+
+**Two key findings:**
+
+1. **The non-checkpoint memory-savings stack is FASTER than baseline**
+   (+7%) — bf16 weight GEMMs use Ada tensor cores at higher throughput,
+   and int8 Adam state reduces optimizer-step memory bandwidth.
+2. **Activation checkpointing costs ~24% throughput at 213M**
+   (9138 → 6959).  At 1.84B with K=⌈√48⌉=7, the cost will be similar
+   or worse.
+
+### Implication for 1.84B headline
+
+Currently flagship-1.84B fits in 16 GB ONLY with `--grad-checkpoint`.
+The 24% throughput tax invalidates a fair speed comparison vs CHIRON.
+To get back to a speed-honest 1.84B:
+
+**Highest-value next move:** retire the FP32 weight master
+(`--bf16-weights` infrastructure exists but the FP32 master is still
+allocated, wasting ~3.7 GB at 1.84B).  Retiring the master would let
+1.84B fit WITHOUT `--grad-checkpoint`, recovering the 24% throughput
+plus the 7% bf16-weight bonus.
+
+### FP32 master readers blocking the retire
+
+Three call sites read `gb.W{1,2}.data()` / `tokE.data()` directly
+(not via the bf16-mirror dispatch):
+
+1. **`embedding_gather`** (gpu_kernels.cu:1011, 1105) — gathers token
+   embeddings from `tokE` FP32 master.  Used in 3 places in
+   sgd_transformer.cpp (training forward, forward-only, generation).
+   Fix: add `embedding_gather_bf16` variant that gathers from `tokELowp`.
+2. **Paradigm-#74 binary-FFN W1/W2 sign()** (sgd_transformer.cpp ~9544
+   / 9554 / 9601 / 9611 / 9934 / 9944 / 9984 / 9994) — calls
+   `bitnet_ffn_forward_gpu` and `binary_gemm_abt_from_float` which
+   take `gb.W1.data()` / `gb.W2.data()` (FP32) and apply `sign()` to
+   compute the binarized product.  Sign bit IS exactly preserved in
+   bf16, so an `_bf16` variant that reads from `gb.W{1,2}Lowp` is
+   straightforward.  Existing `binarize_to_bf16_signs` (line 5261)
+   already has the right shape.
+3. **Atlas/Echo paths** — only fires under Atlas configurations
+   (paradigm #X.X).  Not relevant for the flagship 1.84B head-to-head
+   recipe (which uses plain Adam).  Defer.
+
+### Updated work plan (post-pivot)
+
+1. **Stage 7 (NEW priority): retire FP32 weight master** —
+   - 7a. Add `embedding_gather_bf16` kernel + dispatch
+   - 7b. Add `binary_gemm_abt_from_float_bf16` + `bitnet_ffn_forward_bf16` variants + dispatch
+   - 7c. Gate `gb.W{1,2}.allocate(...)` and `tokE.allocate(...)` on
+     `!useWeightStorageBf16` in `GpuTransformerWeights::allocate`
+   - 7d. Re-test 213M smoke for parity (expect NLL within 1e-3 nat)
+   - 7e. Re-launch 1.84B WITHOUT `--grad-checkpoint`, measure speed +
+     NLL trajectory + peak VRAM
+2. **Stage 8 (parallel): start a SPEED paradigm** — NIMBUS (#52) is the
+   smallest engineering at ~750 LOC for ~1.33× per-step speedup, and
+   the design is already complete.  Or SOPHIA (#55) for 2× steps to
+   fixed final NLL at ~600 LOC.
+3. **Stage 9: 1.84B head-to-head with no checkpoint + speed paradigm**
+   — the actual headline experiment.
+
+### What memory-fit at 213M tells us about 1.84B
+
+VRAM with `--bf16-weights --adam-state-int8` at 213M = ~3-4 GB (small,
+plenty of headroom).  At 1.84B, scaling factor ~9× → ~30 GB without
+savings, ~12-15 GB with savings.  Fitting in 16 GB without
+`--grad-checkpoint` is plausible IF FP32 master is actually retired
+(saves ~3.7 GB).
