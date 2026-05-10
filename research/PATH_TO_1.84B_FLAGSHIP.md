@@ -68,6 +68,29 @@ T=1024, 64K tokens, `--face-embedding --adam-state-int8 --ffn-mlp` ± `--grad-bf
 
 Δ matches BF16 cast round-off magnitude.  Phase-1 dispatch path verified end-to-end.
 
+### Phase-2 status (2026-05-09 → 2026-05-10)
+
+Phase-2 backward refactor for the 6 per-block weight grads + gWIn + gWOut
+is shipped (commits `573d63b7b`, `a8c8b3b7b`).  165M smoke parity at +1.1e-4
+nat (BF16 round-off floor).  Phase-3 v2 explored extending Phase-2 to gTokE
+via an `embedding_scatter_add_bf16` kernel (atomicCAS-on-uint32); rejected
+empirically at -58 mnat NLL drift due to bf16 round-off accumulation in
+per-element atomic adds (verifiable in `research/runs/grad_bf16_ph3/ph3.log`).
+
+**Phase-2 alloc-retire infrastructure landed (`bd85b3e7f`, `dd09b2d30`) but
+disabled by safety guard.**  When the FP32 alloc for ANY per-block tensor
+is retired (via `GLADES_BF16_PH2_RETIRE` env var), 165M smoke drifts -9 to
++200 mnat from baseline.  Per-tensor bisect confirms the missed reader is
+SYSTEMIC, not tensor-specific.  `d_adamGrads` pointer table verified clean
+(big tensors excluded when `useBf16AdamState=true`).  Investigation pending —
+likely candidates: a sync / download / serialization path that walks ALL
+FP32 grad buffers without phase-2 awareness.
+
+Until the missed reader is identified, Phase-2 runs with FP32 grads still
+allocated alongside BF16 mirrors.  This means memory cost is currently
+**worse** than Phase-1 (FP32 grads + BF16 mirrors, vs Phase-1's FP32 grads
+alone).  The projected -3.65 GB at 1.84B is unrealized.
+
 ### What's not yet wired (Phase-2 — actual memory savings)
 
 Phase-1 ships the kernel-correctness path: backward still writes FP32 grads, then
