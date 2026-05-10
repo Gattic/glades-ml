@@ -12439,6 +12439,13 @@ if (ad_.valid) { \
 			// just before dispatch, then the bf16grad Adam variants read
 			// from the BF16 mirror).
 			const bool useBf16Grads_ = trainingConfig.mixedPrecision.gradStorageBf16;
+			const bool useBf16Weights_ = trainingConfig.mixedPrecision.weightStorageBf16
+			    && useBf16AdamState && useBf16Grads_;
+			// Stochastic-rounding seed for bf16-weights Adam.  Combines model
+			// pointer + per-tensor step counter so per-(model,step,tensor)
+			// noise is deterministic.
+			const uint32_t bf16WeightSrSeed = 0xC0FFEE42u
+			    ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(gpuTransformerWeights) >> 4);
 			if (useBf16AdamState)
 			{
 				const float bigLrScale = lrScheduleMultiplier * gpuExtraLRMult;
@@ -12528,6 +12535,35 @@ if (ad_.valid) { \
 		    gpuTransformerScratch->gradScratchFp32.data(), \
 		    (baseLr_) * bigLrScale, beta1, beta2, adamEps, \
 		    (wd_), gradScaleEff, stepInt, sz_); \
+	} \
+} while (0)
+/* BF16-WEIGHT variants: param IS the bf16 mirror; weight scratch holds
+ * the per-step FP32 working copy.  Caller provides Wb16 (bf16 mirror,
+ * canonical) instead of FP32 W.  Size taken from Wb16. */
+#define GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(Wb16, gWb16, vBf, v2Bf, baseLr_, wd_) do { \
+	const int sz_ = static_cast<int>((Wb16).size()); \
+	if (sz_ > 0 && (vBf).allocated() && (v2Bf).allocated() && (gWb16).allocated() && (Wb16).allocated()) { \
+		gpu::adam_update_bf16_state_bf16grad_bf16w((Wb16).data(), \
+		    gpuTransformerScratch->weightScratchFp32.data(), \
+		    (gWb16).data(), \
+		    (vBf).data(), (v2Bf).data(), \
+		    (baseLr_) * bigLrScale, beta1, beta2, adamEps, \
+		    (wd_), gradScaleEff, stepInt, sz_, \
+		    bf16WeightSrSeed, static_cast<uint32_t>(stepInt)); \
+	} \
+} while (0)
+#define GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(Wb16, gWb16, vI8, v2I8, vSc, v2Sc, baseLr_, wd_) do { \
+	const int sz_ = static_cast<int>((Wb16).size()); \
+	if (sz_ > 0 && (vI8).allocated() && (v2I8).allocated() && (gWb16).allocated() && (Wb16).allocated()) { \
+		gpu::adam_update_int8_state_bf16grad_bf16w((Wb16).data(), \
+		    gpuTransformerScratch->weightScratchFp32.data(), \
+		    (gWb16).data(), \
+		    (vI8).data(), (v2I8).data(), \
+		    (vSc).data(), (v2Sc).data(), \
+		    gpuTransformerScratch->gradScratchFp32.data(), \
+		    (baseLr_) * bigLrScale, beta1, beta2, adamEps, \
+		    (wd_), gradScaleEff, stepInt, sz_, \
+		    bf16WeightSrSeed, static_cast<uint32_t>(stepInt)); \
 	} \
 } while (0)
 
@@ -12677,7 +12713,21 @@ if (ad_.valid) { \
 					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
 					const float lrBase = skeleton->getLearningRate(bli + 1u);
 					const float wdBase = skeleton->getWeightDecay2(bli + 1u);
-					if (useInt8AdamState && useBf16Grads_) {
+					if (useBf16Weights_ && useInt8AdamState) {
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.WqLowp, gb.gWq_bf16, gb.vWq_int8, gb.v2Wq_int8, gb.vWqScale, gb.v2WqScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.WkLowp, gb.gWk_bf16, gb.vWk_int8, gb.v2Wk_int8, gb.vWkScale, gb.v2WkScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.WvLowp, gb.gWv_bf16, gb.vWv_int8, gb.v2Wv_int8, gb.vWvScale, gb.v2WvScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.WoLowp, gb.gWo_bf16, gb.vWo_int8, gb.v2Wo_int8, gb.vWoScale, gb.v2WoScale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.W1Lowp, gb.gW1_bf16, gb.vW1_int8, gb.v2W1_int8, gb.vW1Scale, gb.v2W1Scale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.W2Lowp, gb.gW2_bf16, gb.vW2_int8, gb.v2W2_int8, gb.vW2Scale, gb.v2W2Scale, lrBase, wdBase);
+					} else if (useBf16Weights_) {
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WqLowp, gb.gWq_bf16, gb.vWq_bf16, gb.v2Wq_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WkLowp, gb.gWk_bf16, gb.vWk_bf16, gb.v2Wk_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WvLowp, gb.gWv_bf16, gb.vWv_bf16, gb.v2Wv_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WoLowp, gb.gWo_bf16, gb.vWo_bf16, gb.v2Wo_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.W1Lowp, gb.gW1_bf16, gb.vW1_bf16, gb.v2W1_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.W2Lowp, gb.gW2_bf16, gb.vW2_bf16, gb.v2W2_bf16, lrBase, wdBase);
+					} else if (useInt8AdamState && useBf16Grads_) {
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wq, gb.gWq_bf16, gb.vWq_int8, gb.v2Wq_int8, gb.vWqScale, gb.v2WqScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wk, gb.gWk_bf16, gb.vWk_int8, gb.v2Wk_int8, gb.vWkScale, gb.v2WkScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wv, gb.gWv_bf16, gb.vWv_int8, gb.v2Wv_int8, gb.vWvScale, gb.v2WvScale, lrBase, wdBase);
