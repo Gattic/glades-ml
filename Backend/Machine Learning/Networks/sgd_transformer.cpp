@@ -12541,11 +12541,13 @@ if (ad_.valid) { \
 					const float lr0Base = skeleton->getLearningRate(0u);
 					const float wd0 = skeleton->getWeightDecay2(0u);
 					if (!useBf16AdamState)
+						// Same Phase-2-retire null-pointer guard: gate on FP32 grad
+						// size, not weight size.
 						GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WIn.data(),
 						                           gpuTransformerWeights->gWIn.data(),
 						                           gpuTransformerWeights->vWIn.data(),
 						                           gpuTransformerWeights->v2WIn.data(),
-						                           static_cast<int>(gpuTransformerWeights->WIn.size()),
+						                           static_cast<int>(gpuTransformerWeights->gWIn.size()),
 						                           lr0Base, wd0);
 					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->bIn.data(),
 					                           gpuTransformerWeights->gBIn.data(),
@@ -12561,12 +12563,21 @@ if (ad_.valid) { \
 					const float wdBase = skeleton->getWeightDecay2(bli + 1u);
 					if (!useBf16AdamState)
 					{
-						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.Wq.size()), lrBase, wdBase);
-						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.Wk.size()), lrBase, wdBase);
-						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.Wv.size()), lrBase, wdBase);
-						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.Wo.size()), lrBase, wdBase);
-						GLADES_ADD_ADAM_GROUP_SAFE(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.W1.size()), lrBase, wdBase);
-						GLADES_ADD_ADAM_GROUP_SAFE(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.W2.size()), lrBase, wdBase);
+						// Gate group registration on the FP32 GRAD buffer's size,
+						// not the weight's: under Phase-2 retire, gb.gW*.size() == 0
+						// (FP32 grad buffer not allocated, gb.gW*.data() == NULL),
+						// while gb.W*.size() stays positive.  Using Wq.size() here
+						// would register a group with a NULL grad pointer, causing
+						// the batched Adam kernel to dereference NULL.  When Phase-2
+						// retire is on, the per-tensor bf16-grad Adam dispatch at
+						// line ~13226 (GLADES_BF16_ADAM_BIG_BF16GRAD) handles these
+						// tensors via gb.gW*_bf16 instead.
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wq.data(), gb.gWq.data(), gb.vWq.data(), gb.v2Wq.data(), static_cast<int>(gb.gWq.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wk.data(), gb.gWk.data(), gb.vWk.data(), gb.v2Wk.data(), static_cast<int>(gb.gWk.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wv.data(), gb.gWv.data(), gb.vWv.data(), gb.v2Wv.data(), static_cast<int>(gb.gWv.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.Wo.data(), gb.gWo.data(), gb.vWo.data(), gb.v2Wo.data(), static_cast<int>(gb.gWo.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.W1.data(), gb.gW1.data(), gb.vW1.data(), gb.v2W1.data(), static_cast<int>(gb.gW1.size()), lrBase, wdBase);
+						GLADES_ADD_ADAM_GROUP_SAFE(gb.W2.data(), gb.gW2.data(), gb.vW2.data(), gb.v2W2.data(), static_cast<int>(gb.gW2.size()), lrBase, wdBase);
 						// Paradigm shift #76 MLA Adam updates (when active).
 						if (gb.Wdkv.allocated() && gb.vWdkv.allocated()) {
 							GLADES_ADD_ADAM_GROUP_SAFE(gb.Wdkv.data(), gb.gWdkv.data(), gb.vWdkv.data(), gb.v2Wdkv.data(), static_cast<int>(gb.Wdkv.size()), lrBase, wdBase);
@@ -12604,11 +12615,12 @@ if (ad_.valid) { \
 					const float lrOutBase = skeleton->getLearningRate(nLayers);
 					const float wdOut = skeleton->getWeightDecay2(nLayers);
 					if (!useBf16AdamState)
+						// Phase-2-retire null-pointer guard: gate on FP32 grad size.
 						GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->WOut.data(),
 						                           gpuTransformerWeights->gWOut.data(),
 						                           gpuTransformerWeights->vWOut.data(),
 						                           gpuTransformerWeights->v2WOut.data(),
-						                           static_cast<int>(gpuTransformerWeights->WOut.size()),
+						                           static_cast<int>(gpuTransformerWeights->gWOut.size()),
 						                           lrOutBase, wdOut);
 					GLADES_ADD_ADAM_GROUP_SAFE(gpuTransformerWeights->bOut.data(),
 					                           gpuTransformerWeights->gBOut.data(),
