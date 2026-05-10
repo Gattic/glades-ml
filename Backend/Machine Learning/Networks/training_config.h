@@ -485,7 +485,10 @@ struct OptimizerConfig
 	      adamEps(1e-8f),
 	      adamBiasCorrection(true),
 	      sophiaGamma(0.05f),
-	      sophiaRho(1.0f),
+	      // Sophia paper (Liu 2023) uses rho=0.04 for LLM pre-training.
+	      // ρ=1.0 (initially set per the design doc) caused 14e-2 nat
+	      // divergence at 250 steps in 213M smoke — too aggressive.
+	      sophiaRho(0.04f),
 	      adamGroupwiseEnabled(false),
 	      adamGroupStabilityScale(0.05f),
 	      adamGroupSnrScale(0.05f),
