@@ -17,6 +17,7 @@
 #include "network.h"
 #include "transformer_config.h"
 #include "transformer_public_api.h"
+#include "cuda/gpu_kernels.h"
 #include "Backend/Database/GList.h"
 #include "Backend/Database/GTable.h"
 #include "Backend/Database/GType.h"
@@ -4684,7 +4685,8 @@ bool glades::NNetwork::ensureGpuState()
 			                                   trainingConfig.transformer.mlaLatentDim,
 			                                   cb.Wdkv.empty() ? NULL : &cb.Wdkv[0],
 			                                   cb.Wuk.empty()  ? NULL : &cb.Wuk[0],
-			                                   cb.Wuv.empty()  ? NULL : &cb.Wuv[0]);
+			                                   cb.Wuv.empty()  ? NULL : &cb.Wuv[0],
+			                                   gpuTransformerWeights);
 		}
 
 		// Upload optimizer state (Adam m1/m2) for each weight tensor
@@ -4771,18 +4773,52 @@ bool glades::NNetwork::ensureGpuState()
 		{
 			const uint64_t initSeed = rngEngine.seed;
 
+			// Stage 8b deeper: when canonical bf16-weights, FP32 masters are
+			// not allocated — init goes to the bf16 mirror via the shared
+			// FP32 staging buffer (init → staging → cast → mirror).
+			const bool canonInit = gpuTransformerWeights->lowpIsCanonical;
+			float* const staging = canonInit
+			    ? gpuTransformerWeights->lowpStagingFp32.data() : NULL;
+
+			// Helper lambda — init Glorot to (master if non-empty) OR
+			// (staging + cast to mirror).  Mirror size matches master/staging.
+			#define GLADES_INIT_GLOROT_DISPATCH(masterBuf, mirrorBuf, fanIn, fanOut, seedKey) \
+			do {                                                                 \
+				if ((masterBuf).size() > 0) {                                    \
+					glades::gpu::initGlorotUniform((masterBuf).data(), (masterBuf).size(), \
+					                               (fanIn), (fanOut), initSeed, (seedKey)); \
+				} else if (canonInit && (mirrorBuf).size() > 0 && staging) {      \
+					glades::gpu::initGlorotUniform(staging, (mirrorBuf).size(),  \
+					                               (fanIn), (fanOut), initSeed, (seedKey)); \
+					glades::gpu::cast_f32_to_bf16(staging, (mirrorBuf).data(),    \
+					                              (mirrorBuf).size());           \
+				}                                                                \
+			} while (0)
+			#define GLADES_INIT_NORMAL_DISPATCH(masterBuf, mirrorBuf, mean, sd, seedKey) \
+			do {                                                                 \
+				if ((masterBuf).size() > 0) {                                    \
+					glades::gpu::initNormal((masterBuf).data(), (masterBuf).size(), \
+					                        (mean), (sd), initSeed, (seedKey));  \
+				} else if (canonInit && (mirrorBuf).size() > 0 && staging) {      \
+					glades::gpu::initNormal(staging, (mirrorBuf).size(),         \
+					                        (mean), (sd), initSeed, (seedKey));  \
+					glades::gpu::cast_f32_to_bf16(staging, (mirrorBuf).data(),    \
+					                              (mirrorBuf).size());           \
+				}                                                                \
+			} while (0)
+
 			// Global tensors.
-			glades::gpu::initGlorotUniform(gpuTransformerWeights->WIn.data(),
-			                               gpuTransformerWeights->WIn.size(),
-			                               ts.inputSize, ts.dModel, initSeed, 0ULL);
-			glades::gpu::initGlorotUniform(gpuTransformerWeights->WOut.data(),
-			                               gpuTransformerWeights->WOut.size(),
-			                               ts.dModel, ts.outSize, initSeed, 1ULL);
-			if (ts.tokenModel && gpuTransformerWeights->tokE.size() > 0)
+			GLADES_INIT_GLOROT_DISPATCH(gpuTransformerWeights->WIn,
+			                            gpuTransformerWeights->WInLowp,
+			                            ts.inputSize, ts.dModel, 0ULL);
+			GLADES_INIT_GLOROT_DISPATCH(gpuTransformerWeights->WOut,
+			                            gpuTransformerWeights->WOutLowp,
+			                            ts.dModel, ts.outSize, 1ULL);
+			if (ts.tokenModel)
 			{
-				glades::gpu::initNormal(gpuTransformerWeights->tokE.data(),
-				                        gpuTransformerWeights->tokE.size(),
-				                        0.0f, 0.02f, initSeed, 2ULL);
+				GLADES_INIT_NORMAL_DISPATCH(gpuTransformerWeights->tokE,
+				                            gpuTransformerWeights->tokELowp,
+				                            0.0f, 0.02f, 2ULL);
 			}
 
 			// Per-layer tensors.  LN gammas were already host-set to 1.0 before
@@ -4793,12 +4829,12 @@ bool glades::NNetwork::ensureGpuState()
 				    gpuTransformerWeights->blocks[l];
 				const uint64_t base = 1000ULL + (uint64_t)l * 16ULL;
 
-				if (gb.Wq.size() > 0) glades::gpu::initGlorotUniform(gb.Wq.data(), gb.Wq.size(), ts.dModel, ts.dModel, initSeed, base + 0ULL);
-				if (gb.Wk.size() > 0) glades::gpu::initGlorotUniform(gb.Wk.data(), gb.Wk.size(), ts.dModel, dModelKV, initSeed, base + 1ULL);
-				if (gb.Wv.size() > 0) glades::gpu::initGlorotUniform(gb.Wv.data(), gb.Wv.size(), ts.dModel, dModelKV, initSeed, base + 2ULL);
-				if (gb.Wo.size() > 0) glades::gpu::initGlorotUniform(gb.Wo.data(), gb.Wo.size(), ts.dModel, ts.dModel, initSeed, base + 3ULL);
-				if (gb.W1.size() > 0) glades::gpu::initGlorotUniform(gb.W1.data(), gb.W1.size(), ts.dModel, ff1Width,  initSeed, base + 4ULL);
-				if (gb.W2.size() > 0) glades::gpu::initGlorotUniform(gb.W2.data(), gb.W2.size(), ts.dFF,    ts.dModel, initSeed, base + 5ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wq, gb.WqLowp, ts.dModel, ts.dModel, base + 0ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wk, gb.WkLowp, ts.dModel, dModelKV, base + 1ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wv, gb.WvLowp, ts.dModel, dModelKV, base + 2ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.Wo, gb.WoLowp, ts.dModel, ts.dModel, base + 3ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.W1, gb.W1Lowp, ts.dModel, ff1Width,  base + 4ULL);
+				GLADES_INIT_GLOROT_DISPATCH(gb.W2, gb.W2Lowp, ts.dFF,    ts.dModel, base + 5ULL);
 
 				// MLA latent projections (paradigm shift #76).
 				const int mlaDc = trainingConfig.transformer.mlaLatentDim;
@@ -4808,6 +4844,15 @@ bool glades::NNetwork::ensureGpuState()
 					if (gb.Wuk.size()  > 0) glades::gpu::initGlorotUniform(gb.Wuk.data(),  gb.Wuk.size(),  (unsigned int)mlaDc, dModelKV,  initSeed, base + 7ULL);
 					if (gb.Wuv.size()  > 0) glades::gpu::initGlorotUniform(gb.Wuv.data(),  gb.Wuv.size(),  (unsigned int)mlaDc, dModelKV,  initSeed, base + 8ULL);
 				}
+			}
+			#undef GLADES_INIT_GLOROT_DISPATCH
+			#undef GLADES_INIT_NORMAL_DISPATCH
+
+			// Stage 8b deeper: when canonical, ensureLowpMirrors short-circuits
+			// (mirrors were filled by init+cast above).  Mark lowpReady here
+			// so freeFp32Masters() can no-op cleanly downstream.
+			if (canonInit) {
+				gpuTransformerWeights->lowpReady = true;
 			}
 
 			tensorTransformer.gpuInitDeferred = false;

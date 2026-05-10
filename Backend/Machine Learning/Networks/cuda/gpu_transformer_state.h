@@ -475,6 +475,19 @@ struct GpuTransformerWeights
 	// transformerGpuTrainEpoch under the recipe (--bf16-weights without
 	// --binary-ffn / without atlas).  See site comment for the guards.
 	void freeFp32Masters();
+
+	// Stage 8b deeper refactor: shared FP32 staging buffer used for upload-then-cast
+	// path when weightStorageBf16 is set.  Sized to the largest single weight tensor
+	// at allocate() time (typically tokE = vocabSize × dModel ≈ 250 MB at 1.84B).
+	// uploadFp32MasterAsBf16() routes host FP32 → this staging → bf16 mirror,
+	// avoiding the need to allocate per-tensor FP32 masters that would otherwise
+	// peak the GPU at >16 GB during init at L≥48.
+	GpuBuffer<float> lowpStagingFp32;
+
+	// Upload N host FP32 floats to a bf16 mirror via the lowpStagingFp32 buffer.
+	// dst_bf16 must already be allocated to size n.  Used by the upload path in
+	// network.cpp when lowpIsCanonical=true and the FP32 master is empty.
+	bool uploadFp32MasterAsBf16(uint16_t* dst_bf16, const float* src_host_fp32, size_t n);
 };
 
 // GPU-resident forward/backward scratch buffers for transformer training.
@@ -662,6 +675,10 @@ bool downloadTransformerWeights(const GpuTransformerWeights& gpu,
                                  float* lnFinalBeta, size_t lnFinalBetaSize);
 
 // Upload/download a single block's weights.
+// `parent` is required when bf16-canonical (FP32 masters never allocated):
+// the upload path then routes host FP32 → parent->lowpStagingFp32 → cast →
+// b.W{q,k,v,o,1,2}Lowp.  Legacy callers may pass NULL for parent in non-
+// canonical mode.
 bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,
                                     unsigned int dModel, unsigned int dModelKV,
                                     unsigned int ff1Width, unsigned int dFF,
@@ -675,7 +692,8 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,
                                     int mlaLatentDim = 0,
                                     const float* Wdkv = NULL,
                                     const float* Wuk  = NULL,
-                                    const float* Wuv  = NULL);
+                                    const float* Wuv  = NULL,
+                                    GpuTransformerWeights* parent = NULL);
 
 bool uploadTransformerTokenIds(GpuTransformerScratch& scratch,
                                const int* tokenIds, size_t count);

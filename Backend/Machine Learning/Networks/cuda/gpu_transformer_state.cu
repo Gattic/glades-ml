@@ -1,6 +1,7 @@
 // GPU transformer state implementation.
 #include "gpu_transformer_state.h"
 #include "gpu_kernels.h"
+#include <algorithm>
 #include <cmath>
 
 #ifdef GLADES_HAVE_CUDA
@@ -147,14 +148,43 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	const unsigned int dModelKV = nKVHeads * dHead;
 	const unsigned int ff1Width = (ffnKind == 1) ? (2u * dFF) : dFF; // SwiGLU vs MLP
 
+	// Stage 8b deeper refactor: when bf16 is the canonical weight store,
+	// allocate ONE shared FP32 staging buffer sized to the largest single
+	// weight tensor (typically tokE = vs × dm ≈ 250 MB at 1.84B/V=32k).
+	// uploadFp32MasterAsBf16() routes host FP32 → staging → bf16 mirror,
+	// removing the need to allocate per-tensor FP32 masters during init.
+	// At L=53 d=2048 dFF=5632, this saves ~7.7 GB of init peak (the
+	// FP32 master cost from allocBuf() on Wq/Wk/Wv/Wo/W1/W2 across blocks),
+	// unlocking flagship 1.84B fit on a 16 GB GPU.
+	if (useBf16Weights_)
+	{
+		size_t maxTensor = 0;
+		if (tokenModel) maxTensor = std::max(maxTensor, (size_t)vs * dm);
+		maxTensor = std::max(maxTensor, (size_t)dm * is);  // WIn
+		if (!tieEmbeddings) maxTensor = std::max(maxTensor, (size_t)os * dm);  // WOut
+		// Per-block: max(Wq/Wk/Wv/Wo, W1, W2)
+		maxTensor = std::max(maxTensor, (size_t)dm * dm);             // Wq/Wo
+		maxTensor = std::max(maxTensor, (size_t)dm * dModelKV);       // Wk/Wv
+		maxTensor = std::max(maxTensor, (size_t)ff1Width * dm);       // W1
+		maxTensor = std::max(maxTensor, (size_t)dm * df);             // W2
+		if (!allocBuf(lowpStagingFp32, maxTensor)) return false;
+	}
+
 	// Token embedding.  FP32 master always allocated here so
 	// uploadTransformerWeights can write into it; freed AFTER the first
 	// ensureLowpMirrors cast when useBf16Weights_=true (see freeFp32Masters
 	// below).  Forward gather/GEMM checks gb.tokE.size() to route through
 	// the bf16 mirror once the master is freed.
+	//
+	// Stage 8b deeper refactor: when useBf16Weights_=true, the FP32 master
+	// is NEVER allocated.  Caller's upload path uses lowpStagingFp32 as
+	// transient FP32 staging then casts to the bf16 mirror.  The bf16
+	// mirror itself is pre-allocated here (vs. lazy in ensureLowpMirrors)
+	// so the upload kernel has a fixed destination.
 	if (tokenModel)
 	{
-		if (!allocBuf(tokE, (size_t)vs * dm)) return false;
+		if (!useBf16Weights_ && !allocBuf(tokE, (size_t)vs * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(tokELowp, (size_t)vs * dm)) return false;
 		// FACE replaces all dense Adam state on tokE — skip the m/v allocations
 		// in that case and instead allocate FACE state.  The dispatch in
 		// sgd_transformer.cpp picks FACE over int8/bf16/FP32 when faceEmbedding
@@ -195,7 +225,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	// freeFp32Masters when useBf16Weights_=true.
 	if (!tokenModel)
 	{
-		if (!allocBuf(WIn, (size_t)dm * is)) return false;
+		if (!useBf16Weights_ && !allocBuf(WIn, (size_t)dm * is)) return false;
+		if (useBf16Weights_  && !allocBuf(WInLowp, (size_t)dm * is)) return false;
 		if (allocFpMV && !allocBuf(vWIn, (size_t)dm * is)) return false;
 		if (allocFpMV && !allocBuf(v2WIn, (size_t)dm * is)) return false;
 		if (allocBfMV && !allocBuf(vWIn_bf16, (size_t)dm * is)) return false;
@@ -267,10 +298,17 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 
 		// QKV+O projections.  FP32 master allocated for upload; freed by
 		// freeFp32Masters when useBf16Weights_=true.
-		if (!allocBuf(b.Wq, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.Wk, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.Wv, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.Wo, (size_t)dm * dm)) return false;
+		// Stage 8b deeper: under useBf16Weights_, skip FP32 master entirely
+		// and pre-allocate the bf16 mirror as the canonical store.  The
+		// upload path uses lowpStagingFp32 as transient FP32 staging.
+		if (!useBf16Weights_ && !allocBuf(b.Wq, (size_t)dm * dm)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.Wk, (size_t)dm * dModelKV)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.Wv, (size_t)dm * dModelKV)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.Wo, (size_t)dm * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WqLowp, (size_t)dm * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WkLowp, (size_t)dm * dModelKV)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WvLowp, (size_t)dm * dModelKV)) return false;
+		if (useBf16Weights_  && !allocBuf(b.WoLowp, (size_t)dm * dm)) return false;
 		if (allocFpMV && !allocBuf(b.vWq, (size_t)dm * dm)) return false;
 		if (allocFpMV && !allocBuf(b.vWk, (size_t)dm * dModelKV)) return false;
 		if (allocFpMV && !allocBuf(b.vWv, (size_t)dm * dModelKV)) return false;
@@ -379,8 +417,13 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 		// enabled, the forward pass reads gb.W1/W2 FP32 master directly
 		// (sign() discretization) — incompatible with retire.  See the
 		// freeFp32Masters site in sgd_transformer for the binaryFFN guard.
-		if (!allocBuf(b.W1, (size_t)ff1Width * dm)) return false;
-		if (!allocBuf(b.W2, (size_t)dm * df)) return false;
+		// Stage 8b deeper: skip FP32 master + pre-alloc bf16 mirror under
+		// useBf16Weights_.  Largest tensor pair (~64 MB at 1.84B/L=53/dFF=5632
+		// for W1, half that for W2).
+		if (!useBf16Weights_ && !allocBuf(b.W1, (size_t)ff1Width * dm)) return false;
+		if (!useBf16Weights_ && !allocBuf(b.W2, (size_t)dm * df)) return false;
+		if (useBf16Weights_  && !allocBuf(b.W1Lowp, (size_t)ff1Width * dm)) return false;
+		if (useBf16Weights_  && !allocBuf(b.W2Lowp, (size_t)dm * df)) return false;
 		if (allocFpMV && !allocBuf(b.vW1, (size_t)ff1Width * dm)) return false;
 		if (allocFpMV && !allocBuf(b.vW2, (size_t)dm * df)) return false;
 		if (allocFpMV && !allocBuf(b.v2W1, (size_t)ff1Width * dm)) return false;
@@ -603,11 +646,22 @@ bool GpuTransformerWeights::ensureLowpMirrors()
 	// init weights; later calls short-circuit.
 	if (lowpIsCanonical && lowpReady) return true;
 
+	// Stage 8b deeper refactor: when lowpIsCanonical=true, the FP32
+	// masters were never allocated (allocate() skipped them under
+	// useBf16Weights_=true). The bf16 mirrors were filled directly by
+	// uploadFp32MasterAsBf16() during the upload phase.  This call
+	// short-circuits to lowpReady=true with no work to do.
+	if (lowpIsCanonical)
+	{
+		lowpReady = true;
+		return true;
+	}
+
 	// Stage 8b: under lowpIsCanonical, retire each master IMMEDIATELY after
 	// its cast — instead of waiting for freeFp32Masters() at end-of-init.
-	// This caps peak GPU at ~mirror_size additional per-tensor (vs pre-Stage-8b
-	// which held ALL FP32 masters + ALL bf16 mirrors simultaneously, peaking
-	// at ~12 GB at 1.84B/L=53).  Lets flagship 1.84B-class fit on a 16 GB GPU.
+	// (Retained for the legacy path where FP32 masters DO get allocated;
+	// no-op now under the deeper refactor since lowpIsCanonical short-circuits
+	// above.)
 	const bool retireEager = lowpIsCanonical;
 
 	// For each master -> mirror pair, allocate the mirror if empty, cast, and
@@ -646,6 +700,26 @@ bool GpuTransformerWeights::ensureLowpMirrors()
 	lowpReady = true;
 	// lowpDType is set by the caller (sgd_transformer) based on
 	// TrainingConfig.mixedPrecision.weightDType; only BF16 is supported here.
+	return true;
+}
+
+bool GpuTransformerWeights::uploadFp32MasterAsBf16(uint16_t* dst_bf16,
+                                                    const float* src_host_fp32,
+                                                    size_t n)
+{
+	// Stage 8b deeper refactor: route host FP32 → lowpStagingFp32 → cast
+	// to bf16 mirror, avoiding per-tensor FP32 master allocation.
+	// Caller must ensure dst_bf16 is sized to n (allocated in allocate()).
+	if (!dst_bf16 || !src_host_fp32 || n == 0) return false;
+	if (lowpStagingFp32.size() < n)
+	{
+		std::fprintf(stderr,
+		    "[glades-cuda] uploadFp32MasterAsBf16: staging buffer (%zu) < n (%zu)\n",
+		    lowpStagingFp32.size(), n);
+		return false;
+	}
+	if (!lowpStagingFp32.upload(src_host_fp32, n)) return false;
+	if (!cast_f32_to_bf16(lowpStagingFp32.data(), dst_bf16, n)) return false;
 	return true;
 }
 
@@ -925,13 +999,24 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
 	if (!gpu.initialized)
 		return false;
 
+	// Stage 8b deeper: when canonical (FP32 master never allocated), route
+	// host FP32 → gpu.lowpStagingFp32 → cast → bf16 mirror.
+	const bool canonicalBf16 = gpu.lowpIsCanonical;
 	if (gpu.tokenModel && tokE && tokESize > 0)
 	{
-		if (!gpu.tokE.upload(tokE, tokESize)) return false;
+		if (canonicalBf16) {
+			if (!gpu.uploadFp32MasterAsBf16(gpu.tokELowp.data(), tokE, tokESize)) return false;
+		} else {
+			if (!gpu.tokE.upload(tokE, tokESize)) return false;
+		}
 	}
 	if (!gpu.tokenModel && WIn && WInSize > 0)
 	{
-		if (!gpu.WIn.upload(WIn, WInSize)) return false;
+		if (canonicalBf16) {
+			if (!gpu.uploadFp32MasterAsBf16(gpu.WInLowp.data(), WIn, WInSize)) return false;
+		} else {
+			if (!gpu.WIn.upload(WIn, WInSize)) return false;
+		}
 	}
 	if (!gpu.tokenModel && bIn && bInSize > 0)
 	{
@@ -939,7 +1024,11 @@ bool uploadTransformerWeights(GpuTransformerWeights& gpu,
 	}
 	if (!gpu.tokenModel && WOut && WOutSize > 0)
 	{
-		if (!gpu.WOut.upload(WOut, WOutSize)) return false;
+		if (canonicalBf16) {
+			if (!gpu.uploadFp32MasterAsBf16(gpu.WOutLowp.data(), WOut, WOutSize)) return false;
+		} else {
+			if (!gpu.WOut.upload(WOut, WOutSize)) return false;
+		}
 	}
 	if (!gpu.tokenModel && bOut && bOutSize > 0)
 	{
@@ -1050,7 +1139,8 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
                                     const float* W1, const float* W2,
                                     const float* b1, const float* b2,
                                     int mlaLatentDim,
-                                    const float* Wdkv, const float* Wuk, const float* Wuv)
+                                    const float* Wdkv, const float* Wuk, const float* Wuv,
+                                    GpuTransformerWeights* parent)
 {
 	const size_t dm = static_cast<size_t>(dModel);
 	const size_t dmkv = static_cast<size_t>(dModelKV);
@@ -1059,18 +1149,39 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& b,
 
 	if (!b.ln1Gamma.upload(ln1Gamma, dm)) return false;
 	if (!b.ln1Beta.upload(ln1Beta, dm)) return false;
-	if (!b.Wq.upload(Wq, dm * dm)) return false;
-	if (!b.Wk.upload(Wk, dm * dmkv)) return false;
-	if (!b.Wv.upload(Wv, dm * dmkv)) return false;
-	if (!b.Wo.upload(Wo, dm * dm)) return false;
+	// Stage 8b deeper: when canonical (FP32 master never allocated), route
+	// host FP32 → parent->lowpStagingFp32 → cast → b.W{q,k,v,o}Lowp.
+	const bool canonicalBf16 = (parent != NULL) && parent->lowpIsCanonical;
+	if (canonicalBf16)
+	{
+		if (!parent->uploadFp32MasterAsBf16(b.WqLowp.data(), Wq, dm * dm))     return false;
+		if (!parent->uploadFp32MasterAsBf16(b.WkLowp.data(), Wk, dm * dmkv))   return false;
+		if (!parent->uploadFp32MasterAsBf16(b.WvLowp.data(), Wv, dm * dmkv))   return false;
+		if (!parent->uploadFp32MasterAsBf16(b.WoLowp.data(), Wo, dm * dm))     return false;
+	}
+	else
+	{
+		if (!b.Wq.upload(Wq, dm * dm)) return false;
+		if (!b.Wk.upload(Wk, dm * dmkv)) return false;
+		if (!b.Wv.upload(Wv, dm * dmkv)) return false;
+		if (!b.Wo.upload(Wo, dm * dm)) return false;
+	}
 	if (!b.bq.upload(bq, dm)) return false;
 	if (!b.bk.upload(bk, dmkv)) return false;
 	if (!b.bv.upload(bv, dmkv)) return false;
 	if (!b.bo.upload(bo, dm)) return false;
 	if (!b.ln2Gamma.upload(ln2Gamma, dm)) return false;
 	if (!b.ln2Beta.upload(ln2Beta, dm)) return false;
-	if (!b.W1.upload(W1, f1w * dm)) return false;
-	if (!b.W2.upload(W2, dm * df)) return false;
+	if (canonicalBf16)
+	{
+		if (!parent->uploadFp32MasterAsBf16(b.W1Lowp.data(), W1, f1w * dm)) return false;
+		if (!parent->uploadFp32MasterAsBf16(b.W2Lowp.data(), W2, dm * df))  return false;
+	}
+	else
+	{
+		if (!b.W1.upload(W1, f1w * dm)) return false;
+		if (!b.W2.upload(W2, dm * df)) return false;
+	}
 	if (!b.b1.upload(b1, f1w)) return false;
 	if (!b.b2.upload(b2, dm)) return false;
 
