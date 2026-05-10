@@ -1216,6 +1216,64 @@ __global__ void adam_update_kernel(float* __restrict__ param,
 	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
 }
 
+// SOPHIA-G — paradigm shift #55 (Liu et al. 2023 "Sophia: A Scalable Stochastic
+// Second-order Optimizer for Language Model Pre-training", Sophia-G variant
+// using gradient-squared as a diagonal Hessian proxy in lieu of Hutchinson HVP).
+//
+// Sophia maintains:
+//   m_t = β_1 m_{t-1} + (1-β_1) g_t                           (1st moment, same as Adam)
+//   h_t = β_2 h_{t-1} + (1-β_2) g_t * g_t                     (Hessian proxy, = Adam's v)
+// Update rule:
+//   ratio_t = m_hat_t / max(γ · h_hat_t, ε)
+//   ratio_t = clip(ratio_t, -ρ, ρ)
+//   θ_{t+1} = θ_t - lr · ratio_t  (decoupled weight decay applied separately)
+//
+// Defaults: β_1=0.965, β_2=0.99, γ=0.05, ρ=1.0.  The clip is the key
+// difference from Adam — caps update magnitude in directions where the
+// Hessian is small and the ratio explodes.  Empirical 1.5-2× steps
+// reduction vs Adam in the published paper.
+//
+// Sophia-G uses g² as a coarse Hessian proxy (vs Sophia-H's Hutchinson HVP);
+// loses some of the speedup but no extra forward/backward passes required.
+__global__ void sophia_g_update_kernel(float* __restrict__ param,
+                                        const float* __restrict__ grad,
+                                        float* __restrict__ m,
+                                        float* __restrict__ h,
+                                        float lr, float beta1, float beta2,
+                                        float gamma, float rho, float eps,
+                                        float weightDecay, float gradScale,
+                                        int step, int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	float g = grad[idx] * gradScale;
+
+	// Decoupled weight decay (AdamW-style).
+	if (weightDecay != 0.0f)
+		param[idx] -= lr * weightDecay * param[idx];
+
+	// EMAs: 1st moment (Adam-equiv) and Hessian proxy (= grad² EMA).
+	float m_new = beta1 * m[idx] + (1.0f - beta1) * g;
+	float h_new = beta2 * h[idx] + (1.0f - beta2) * g * g;
+	m[idx] = m_new;
+	h[idx] = h_new;
+
+	// Bias correction.
+	float bc1 = 1.0f - powf(beta1, (float)step);
+	float bc2 = 1.0f - powf(beta2, (float)step);
+	float m_hat = m_new / bc1;
+	float h_hat = h_new / bc2;
+
+	// Sophia ratio: m_hat / max(γ · h_hat, ε), clipped to [-ρ, ρ].
+	float denom = fmaxf(gamma * h_hat, eps);
+	float ratio = m_hat / denom;
+	if (ratio > rho) ratio = rho;
+	else if (ratio < -rho) ratio = -rho;
+
+	param[idx] -= lr * ratio;
+}
+
 // iter 181 — ASTRA paradigm #41 (Gate-0, m=1 stateless v).
 // Replaces Adam's persistent v EMA with the within-step gradient
 // magnitude v_t = g_t² + eps².  Persistent state collapses to momentum
@@ -1249,6 +1307,20 @@ __global__ void astra_update_kernel(float* __restrict__ param,
 }
 
 } // anonymous namespace
+
+bool sophia_g_update(float* param, const float* grad, float* m, float* h,
+                      float lr, float beta1, float beta2,
+                      float gamma, float rho, float eps,
+                      float weightDecay, float gradScale, int step, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	sophia_g_update_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+		param, grad, m, h, lr, beta1, beta2, gamma, rho, eps,
+		weightDecay, gradScale, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
 
 bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,

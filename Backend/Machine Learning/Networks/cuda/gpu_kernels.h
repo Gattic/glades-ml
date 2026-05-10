@@ -148,6 +148,16 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
                  float weightDecay, float gradScale, int step, int n);
 
+// SOPHIA-G — paradigm shift #55 (Liu et al. 2023, Sophia-G variant).
+// Drop-in replacement for adam_update with the Sophia clipped second-order
+// update rule.  Uses g² as a Hessian proxy (no HVP); m/h state same shape as
+// Adam's m/v.  Defaults: beta1=0.965, beta2=0.99, gamma=0.05, rho=1.0.
+// Empirical 1.5-2× steps reduction to fixed final NLL vs Adam.
+bool sophia_g_update(float* param, const float* grad, float* m, float* h,
+                      float lr, float beta1, float beta2,
+                      float gamma, float rho, float eps,
+                      float weightDecay, float gradScale, int step, int n);
+
 // iter 181 — ASTRA paradigm #41 Gate-0 (m=1 stateless v).
 // Replaces Adam's persistent v EMA with the within-step instantaneous
 // magnitude v_t = g_t².  Persistent state collapses to momentum m only —
@@ -756,6 +766,7 @@ inline bool embedding_scatter_add(float*, const int*, const float*, int, int, in
 inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
+inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }
 inline bool adam_update_batch(float**, float**, float**, float**,
                               const float*, const float*, float, const float*,
                               const int*, int,

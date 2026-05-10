@@ -433,16 +433,26 @@ struct OptimizerConfig
 		ADAMW = 1,
 		ATLAS = 2,
 		VESTA = 3,
-		HELIOS = 4
+		HELIOS = 4,
+		// Paradigm shift #55 SOPHIA-G (Liu et al. 2023, gradient-squared variant).
+		// Drop-in Adam variant with clipped second-order update; published
+		// 1.5-2× steps reduction to fixed final NLL.
+		SOPHIA_G = 5
 	};
 
 	Type type;
 
-	// AdamW parameters (used when type==ADAMW).
+	// AdamW parameters (used when type==ADAMW or SOPHIA_G inherits beta1/beta2).
 	float adamBeta1;
 	float adamBeta2;
 	float adamEps;
 	bool adamBiasCorrection;
+
+	// SOPHIA_G parameters (Liu et al. 2023 defaults: gamma=0.05, rho=1.0,
+	// beta1=0.965, beta2=0.99 — the latter two override adamBeta1/adamBeta2
+	// when type==SOPHIA_G).
+	float sophiaGamma;   // denominator scale on Hessian proxy
+	float sophiaRho;     // update clip magnitude
 
 	// Enable groupwise AdamW modulation. This keeps the exact AdamW update law
 	// but multiplies each parameter group's effective step size by a cheap
@@ -474,6 +484,8 @@ struct OptimizerConfig
 	      adamBeta2(0.999f),
 	      adamEps(1e-8f),
 	      adamBiasCorrection(true),
+	      sophiaGamma(0.05f),
+	      sophiaRho(1.0f),
 	      adamGroupwiseEnabled(false),
 	      adamGroupStabilityScale(0.05f),
 	      adamGroupSnrScale(0.05f),
