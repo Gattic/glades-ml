@@ -151,12 +151,21 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 // SOPHIA-G — paradigm shift #55 (Liu et al. 2023, Sophia-G variant).
 // Drop-in replacement for adam_update with the Sophia clipped second-order
 // update rule.  Uses g² as a Hessian proxy (no HVP); m/h state same shape as
-// Adam's m/v.  Defaults: beta1=0.965, beta2=0.99, gamma=0.05, rho=1.0.
+// Adam's m/v.  Defaults: beta1=0.965, beta2=0.99, gamma=0.05, rho=0.04
+// (Liu 2023 paper for LLM pre-training).
 // Empirical 1.5-2× steps reduction to fixed final NLL vs Adam.
 bool sophia_g_update(float* param, const float* grad, float* m, float* h,
                       float lr, float beta1, float beta2,
                       float gamma, float rho, float eps,
                       float weightDecay, float gradScale, int step, int n);
+
+// SOPHIA-G with bf16 m/h state — half the optimizer-state VRAM.
+bool sophia_g_update_bf16_state(float* param, const float* grad,
+                                 uint16_t* m_bf16, uint16_t* h_bf16,
+                                 float lr, float beta1, float beta2,
+                                 float gamma, float rho, float eps,
+                                 float weightDecay, float gradScale,
+                                 int step, int n);
 
 // iter 181 — ASTRA paradigm #41 Gate-0 (m=1 stateless v).
 // Replaces Adam's persistent v EMA with the within-step instantaneous
@@ -780,6 +789,7 @@ inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int,
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool sophia_g_update(float*, const float*, float*, float*, float, float, float, float, float, float, float, float, int, int) { return false; }
+inline bool sophia_g_update_bf16_state(float*, const float*, uint16_t*, uint16_t*, float, float, float, float, float, float, float, float, int, int) { return false; }
 inline bool adam_update_batch(float**, float**, float**, float**,
                               const float*, const float*, float, const float*,
                               const int*, int,

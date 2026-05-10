@@ -1446,6 +1446,49 @@ __global__ void adam_update_bf16_state_kernel(
 	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
 }
 
+// SOPHIA-G with bf16 m/h state.  Same structure as adam_update_bf16_state
+// but with the Sophia clipped second-order rule replacing Adam's m/sqrt(v).
+__global__ void sophia_g_update_bf16_state_kernel(
+    float* __restrict__ param,
+    const float* __restrict__ grad,
+    uint16_t* __restrict__ m_bf16,
+    uint16_t* __restrict__ h_bf16,
+    float lr, float beta1, float beta2,
+    float gamma, float rho, float eps,
+    float weightDecay, float gradScale,
+    int step, int n)
+{
+	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	const float g = grad[idx] * gradScale;
+
+	// Decoupled weight decay (AdamW-style).
+	if (weightDecay != 0.0f)
+		param[idx] -= lr * weightDecay * param[idx];
+
+	const float m_old = bf16_load_as_f32(m_bf16[idx]);
+	const float h_old = bf16_load_as_f32(h_bf16[idx]);
+
+	const float m_new = beta1 * m_old + (1.0f - beta1) * g;
+	const float h_new = beta2 * h_old + (1.0f - beta2) * g * g;
+
+	m_bf16[idx] = bf16_store_from_f32(m_new);
+	h_bf16[idx] = bf16_store_from_f32(h_new);
+
+	const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
+	const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
+	const float m_hat = m_new / bc1;
+	const float h_hat = h_new / bc2;
+
+	const float denom = fmaxf(gamma * h_hat, eps);
+	float ratio = m_hat / denom;
+	if (ratio > rho) ratio = rho;
+	else if (ratio < -rho) ratio = -rho;
+
+	param[idx] -= lr * ratio;
+}
+
 } // anonymous namespace
 
 bool adam_update_bf16_state(float* param, const float* grad,
@@ -1459,6 +1502,23 @@ bool adam_update_bf16_state(float* param, const float* grad,
 	adam_update_bf16_state_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
 	    param, grad, m_bf16, v_bf16, /*c_bf16=*/nullptr,
 	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool sophia_g_update_bf16_state(float* param, const float* grad,
+                                 uint16_t* m_bf16, uint16_t* h_bf16,
+                                 float lr, float beta1, float beta2,
+                                 float gamma, float rho, float eps,
+                                 float weightDecay, float gradScale,
+                                 int step, int n)
+{
+	if (n <= 0) return true;
+	const int grid = (n + kBlockElem - 1) / kBlockElem;
+	sophia_g_update_bf16_state_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+	    param, grad, m_bf16, h_bf16,
+	    lr, beta1, beta2, gamma, rho, eps,
+	    weightDecay, gradScale, step, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
