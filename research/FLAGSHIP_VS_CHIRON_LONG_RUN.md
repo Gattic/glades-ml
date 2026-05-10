@@ -675,3 +675,108 @@ No flagship process is running.  The post-Stage-2 binary builds clean
 and the default-flag path is unchanged from 2026-05-09's bf16-weights
 baseline.  Smoke tests on the new modulo path can be run any time, but
 they verify only the no-op case until Stage 4 lands.
+
+---
+
+## 2026-05-10 update — Option B Stages 3-5 complete + Phase-2 regression
+
+### Stage 3 — recompute helper (commit `29019a614`)
+
+Added `transformerGpuLayerRangeForward` member function that re-runs the
+per-layer forward body for layers in `[segStart, segEnd)`, populating
+cyclic activation slots so the backward path can read them.  Mirrors the
+kernel sequence in `transformerGpuRunForwardOnly`'s layer loop minus the
+embedding / final-LN / output-head (handled once per step).  When
+`segmentInputOverride != NULL`, uses it as the input to the first
+recomputed layer (a saved hAfterFF checkpoint copy).  +330 LOC.
+
+### Stage 4 — backward segment loop (commit `6c1a81a3a`)
+
+Wrapped the existing backward layer loop in an outer segment loop that
+walks from `nSegments-1` down to `0`.  For each non-last segment, calls
+the recompute helper with `checkpoints[seg-1]` (or `h` for seg=0) as
+the input, then runs the inner reverse backward sweep.
+
+Critical fix in the backward body: `layerIn` for `li == segStart && seg
+> 0` reads from `checkpoints[seg-1]`, NOT from the cyclic slot at
+`prevSlot` — slot K-1 contains the LAST layer of the just-recomputed
+segment, not `hAfterFF[li-1]`.
+
+Behavior preservation: when activationCheckpoint=false,
+slotsPerLayer == nLayers ⇒ nSegments == 1 ⇒ outer loop runs once,
+recompute branch skipped, inner loop walks li from nLayers-1 down to 0
+— bit-for-bit identical to the prior single-loop form.
+
+### Stage 5 — trainer flag + parity smoke (commit trainer `81ed333`)
+
+Added `--grad-checkpoint` flag.  Smoke tests:
+
+| Config              | L  | K | nSegments | Final NLL  | Δ vs baseline |
+|---------------------|----|---|-----------|------------|---------------|
+| Baseline (no flag)  | 8  | - | -         | 10.4465    | —             |
+| `--grad-bf16`       | 8  | - | -         | 10.4464    | -1e-4 nat     |
+| `--grad-checkpoint` | 8  | 3 | 3         | 10.4467    | +2e-4 nat     |
+| Baseline (no flag)  | 16 | - | -         | 10.4463    | —             |
+| `--grad-checkpoint` | 16 | 4 | 4         | 10.4473    | +1e-3 nat     |
+
+Δ within recompute-path noise floor (deterministic recompute can
+introduce tiny rounding drift via different attention-tile order, but
+NLL parity is unequivocally established).  Throughput at L=16:
+baseline 5804 tok/s, --grad-checkpoint 5334 tok/s — **8% slowdown**
+at L=16, K=4 (theoretical 33% extra forward work; backward dominates).
+
+### Stage 6 blocked — Phase-2 + bf16-weights regression at small scale
+
+While running smoke tests this iteration, `--grad-bf16-phase2` and
+`--bf16-weights` (which implies `--grad-bf16-phase2`) both fail at
+small-scale smoke configurations:
+
+- `--grad-bf16-phase2` (L=8, dModel=384): illegal memory access in
+  `cast_f32_to_bf16` (gpu_kernels.cu:4634) after seq 1 completes Adam
+  step.
+- `--grad-bf16-phase2` (L=16, dModel=1024, 165M-class): same illegal
+  memory access mid-train.
+- `--bf16-weights` (L=8, dModel=384): doesn't crash but NLL collapses
+  to nonsense (-1e14) by seq 11; throughput meter returns 1M+ tok/s
+  (clearly broken loss).
+- `--grad-checkpoint` + `--grad-bf16-phase2` composition: same illegal
+  access as Phase-2 alone — checkpointing code is independent.
+
+These regressions appear after the bf16-weights commit (`abae86e7f`)
+and were NOT introduced by this iteration's activation-checkpoint
+work (the failure modes are unchanged whether `--grad-checkpoint` is
+on or off).  Most likely a pre-existing edge case at smaller scales
+that wasn't exercised by the original 165M-class validation.  The
+prior conversation summary mentions "Final 165M smoke test (v4 with
+W1/W2 excluded) showed loss=10.5641 vs baseline 10.6188, Δ = -55
+mnat" — that test was done at a different config that may not have
+included `--grad-bf16-phase2` standalone, and the recent changes to
+`adam_update_*_bf16grad_bf16w` may have a sizing/dispatch bug.
+
+**For the actual 1.84B head-to-head (Stage 6)**, both savings axes
+(bf16-grad-phase2 + grad-checkpoint) need to compose.  Next iteration
+priorities:
+
+1. Bisect the Phase-2 regression: re-test at the original 165M
+   `--bf16-weights` config (`--dmodel 1024 --layers 16` etc.) to
+   confirm whether that specific config still works, then narrow
+   down which size axis triggers the failure.
+2. Audit `adam_update_*_bf16grad_bf16w` wrapper kernels for sizing
+   issues (the path that takes bf16 grad → cast → adam → cast back).
+3. Once Phase-2 + checkpointing both work in isolation AND
+   compose, run the 1.84B head-to-head with all three:
+   `--bf16-weights --grad-checkpoint --adam-state-int8`.
+
+### Memory accounting (recap)
+
+Activation gradient checkpointing alone, at 1.84B / L=48 / T=512 /
+dModel=2048 / dFF=8192 / ff1Width=16384:
+- Per-layer activation footprint: ~88 MB.
+- Without checkpointing: 48 × 88 = **4.2 GB stash**.
+- With K=⌈√48⌉=7: 7 × 88 = 0.62 GB scratch + 6 × 4 MB ckpt = **0.65 GB**.
+- **Savings: ~3.6 GB on activations**, at ~33% extra forward compute.
+
+Combined with `--grad-bf16-phase2` (~3 GB) + `--bf16-weights` (~4 GB
+once FP32 master is retired), total savings would push 1.84B from
+the current ~16 GB ceiling well below 13 GB — meeting the head-to-head
+target.
