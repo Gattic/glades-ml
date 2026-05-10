@@ -36,6 +36,60 @@ than flagship's standard backbone. This validates the multi-iteration
 hypothesis that the flagship-vs-CHIRON gap is structural (reversibility),
 not paradigm-stack-related.
 
+### Flagship 1.84B head-to-head — DIVERGED
+
+A 2500-step head-to-head was launched (T=512 fixed, full L=53 from
+step 0, lr=3e-4, warmup=100). Trajectory:
+
+| Step | NLL    | Status |
+|-----:|-------:|--------|
+|   53 | 10.395 | training |
+|  308 | 10.172 | warmup plateau |
+|  517 | 10.089 | descending |
+|  587 | 10.004 | broke 10.0 barrier |
+|  657 | 10.032 | small bounce |
+|  782 | 9.902  | accelerating descent |
+|  ~900| **NaN** | **DIVERGED** |
+| 1000 | NaN    | dead |
+
+The full L=53 / no-curriculum config that flagship can run is not
+*stable* at the 1.84B / Adam-lr=3e-4 / Pile regime. CHIRON's headline
+metrics rely on its SLC (T 256→512→1024) + RLG (L 8→26→53) curriculum
+to keep gradients bounded during early training. Flagship has no
+equivalent: it must run all 53 layers at full T from step 0.
+
+**Empirical finding**: at 1.84B, CHIRON's curriculum isn't just a
+speedup paradigm — it's a **stability requirement**. The same recipe
+(int8-Adam + bf16-weights + grad-checkpoint + ffn-mlp) that runs
+cleanly at flagship 700M and 1.4B diverges at 1.84B without curriculum.
+
+### Implications
+
+1. The flagship 1.84B head-to-head can't be a single fixed-config
+   benchmark — it requires a curriculum equivalent to CHIRON's.
+2. Porting CHIRON's SLC + RLG to the flagship trainer is now the
+   **prerequisite** for any meaningful flagship-vs-CHIRON test at
+   1.84B, not just a speed optimization.
+3. The 6.4× tokens·params/sec gap at 1.84B (from the 47-step smoke)
+   was measured during the warmup/early phase where flagship is
+   still numerically stable. The gap may widen further once both
+   sides reach steady-state on a comparable trajectory.
+
+### Forward direction
+
+The next concrete commit must port flagship-side equivalents of
+CHIRON's stability paradigms:
+
+- **SLC** (T schedule) — implementable by mid-run `--seq-len` change,
+  ~200 LOC in flagship trainer.
+- **RLG** (L schedule) — requires layer-wise insertion + Wo=0
+  identity initialization for new layers, ~400 LOC.
+- **lr warmup-on-transition** — both above need the LR-warmup-on-
+  schedule-step trick to avoid post-transition spike.
+
+Estimated 1-2 weeks engineering for the curriculum port. This is the
+only path to a fair 1.84B head-to-head with current flagship paradigms.
+
 **Bottom line:** CHIRON 1.84B is **6.6× higher** in tokens·params/sec
 than the largest flagship that fits today (1.1B at L=32). The
 structural gap from CHIRON's reversibility (vs flagship's standard
