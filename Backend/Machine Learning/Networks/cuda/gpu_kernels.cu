@@ -1040,6 +1040,66 @@ __global__ void embedding_scatter_add_kernel(float* __restrict__ dE,
 		atomicAdd(&dE[(size_t)tok * dModel + d], dout[idx]);
 }
 
+// BF16 atomic-add via atomicCAS on uint16_t.  Used by Phase-3 BF16-grad path
+// for the embedding-grad scatter-add (gTokE) — directly accumulates each
+// token's dout slice into the persistent BF16 mirror, eliminating both the
+// FP32 grad allocation and the Phase-1 cast pass for gTokE.
+__global__ void embedding_scatter_add_bf16_kernel(uint16_t* __restrict__ dE_bf16,
+                                                  const int* __restrict__ tokenIds,
+                                                  const float* __restrict__ dout,
+                                                  int T, int vocabSize, int dModel)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= T * dModel) return;
+	int t = idx / dModel;
+	int d = idx % dModel;
+	int tok = tokenIds[t];
+	if (tok < 0 || tok >= vocabSize) return;
+
+	const float addend = dout[idx];
+	uint16_t* slot = &dE_bf16[(size_t)tok * dModel + d];
+
+	// Loop until atomicCAS succeeds.  At vocab>=50K and T<=4096 the
+	// expected per-slot contention is tiny (typical T/V ≈ 0.08).
+	uint16_t old = *slot;
+	for (;;)
+	{
+		// Decode old bf16 to f32, add, encode back to bf16 (RNE).
+		union { uint32_t u; float f; } uv;
+		uv.u = static_cast<uint32_t>(old) << 16;
+		const float sum = uv.f + addend;
+		union { float f; uint32_t u; } v;
+		v.f = sum;
+		uint16_t newBf16;
+		if (isnan(sum))
+		{
+			const uint32_t sign = v.u & 0x80000000u;
+			newBf16 = static_cast<uint16_t>(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		}
+		else
+		{
+			const uint32_t lsb = (v.u >> 16) & 1u;
+			const uint32_t roundingBias = 0x7FFFu + lsb;
+			newBf16 = static_cast<uint16_t>((v.u + roundingBias) >> 16);
+		}
+		if (old == newBf16) break;  // addend was zero or got rounded away
+		// atomicCAS works on uint32_t; pack the 16-bit slot into a 32-bit word.
+		uintptr_t slotAddr = reinterpret_cast<uintptr_t>(slot);
+		uint32_t* base32 = reinterpret_cast<uint32_t*>(slotAddr & ~uintptr_t(2));
+		const bool highHalf = (slotAddr & 2u) != 0u;
+		uint32_t fullOld = *base32;
+		uint16_t curOld = highHalf ? (uint16_t)(fullOld >> 16) : (uint16_t)(fullOld & 0xFFFFu);
+		if (curOld != old) { old = curOld; continue; }
+		uint32_t fullNew = highHalf
+		    ? ((fullOld & 0x0000FFFFu) | (static_cast<uint32_t>(newBf16) << 16))
+		    : ((fullOld & 0xFFFF0000u) | static_cast<uint32_t>(newBf16));
+		uint32_t prev = atomicCAS(base32, fullOld, fullNew);
+		if (prev == fullOld) break;
+		// Lost the race; refresh and retry.
+		old = highHalf ? (uint16_t)(prev >> 16) : (uint16_t)(prev & 0xFFFFu);
+	}
+}
+
 } // anonymous namespace
 
 bool embedding_gather(const float* E, const int* tokenIds,
@@ -1062,6 +1122,18 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
 	embedding_scatter_add_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dE, tokenIds, dout, T, vocabSize, dModel);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
+                                const float* dout,
+                                int T, int vocabSize, int dModel)
+{
+	if (T <= 0 || dModel <= 0) return true;
+	int total = T * dModel;
+	int grid = (total + kBlockElem - 1) / kBlockElem;
+	embedding_scatter_add_bf16_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dE_bf16, tokenIds, dout, T, vocabSize, dModel);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

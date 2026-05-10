@@ -10506,10 +10506,14 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
 
 			// gTokE += dLogits^T * hPostFinalLN  [vocabSize, dModel]
-			// Note: Phase-2 (gradStorageBf16Phase2) does NOT route this through
-			// scratch+commit because gTokE has a second writer
-			// (embedding_scatter_add a few hundred lines down) which still
-			// targets FP32.  Phase-2 is currently scoped to per-block weights.
+			// gTokE is a SHARED grad target between the head-tied GEMM here
+			// and the embedding_scatter_add below.  Routing it through
+			// scratch+commit-bf16 directly accumulates the head-tied
+			// contribution into bf16 — but the per-element atomic-bf16-add
+			// in embedding_scatter_add_bf16 introduced a 50+ mnat drift due
+			// to bf16-precision loss across hundreds of per-token adds.  Until
+			// a sparse-FP32-then-cast variant of scatter_add is in place,
+			// gTokE stays on the Phase-1 cast path (FP32 grad -> bf16 mirror).
 			gpu_gemm_atb_mp(bf16Head,
 			    static_cast<int>(vocabSize), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
 			    gpuTransformerScratch->dLogits.data(),
@@ -10560,14 +10564,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
 
 			// gWOut += dLogits^T * hPostFinalLN  [outSize, dModel]
-			// Phase-2 scoped to per-block weights only (see gTokE comment above).
-			gpu_gemm_atb_mp(bf16Head,
-			    static_cast<int>(outSize), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
-			    gpuTransformerScratch->dLogits.data(),
-			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(outSize),
-			    bwdPostFinalLN,
-			    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
-			    1.0f, gpuTransformerWeights->gWOut.data(), static_cast<int>(dModel));
+			{
+				float* gradOut = useBf16GradsPh2_
+				    ? gpuTransformerScratch->gradScratchFp32.data()
+				    : gpuTransformerWeights->gWOut.data();
+				const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+				gpu_gemm_atb_mp(bf16Head,
+				    static_cast<int>(outSize), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
+				    gpuTransformerScratch->dLogits.data(),
+				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(outSize),
+				    bwdPostFinalLN,
+				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
+				    gemmBeta, gradOut, static_cast<int>(dModel));
+				if (useBf16GradsPh2_)
+					gpu::bf16_accum_axpy(gpuTransformerWeights->gWOut_bf16.data(),
+					    gpuTransformerScratch->gradScratchFp32.data(),
+					    1.0f, 1.0f, gpuTransformerWeights->gWOut.size());
+			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_head_matrix(trainingConfig.atlas, outSize, dModel),
 			                        gpuTransformerWeights->echoWOut,
 			                        gpuTransformerScratch->dLogits.data(), bwdPostFinalLN,
@@ -11124,6 +11137,11 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		if (tokenLM)
 		{
 			// gTokE[tokenId[t]] += dH[t] for each timestep.
+			// gTokE stays on the FP32 grad path even under Phase-2 — the
+			// embedding_scatter_add_bf16 kernel exists but per-element bf16
+			// atomic-add accumulates round-off across hundreds of token
+			// updates, producing 50+ mnat NLL drift.  See the head-tied GEMM
+			// site (~line 10509) for the matching rationale.
 			gpu::embedding_scatter_add(
 			    gpuTransformerWeights->gTokE.data(),
 			    gpuTransformerScratch->tokenIds.data(),
@@ -11133,13 +11151,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		else
 		{
 			// gWIn += dH^T * x, gBIn += sum_rows(dH)
-			gpu_gemm_atb_mp(bf16WIn,
-			    static_cast<int>(dModel), static_cast<int>(inputSize), static_cast<int>(T), 1.0f,
-			    gpuTransformerScratch->dH.data(),
-			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-			    gpuTransformerScratch->x.data(),
-			    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(inputSize),
-			    1.0f, gpuTransformerWeights->gWIn.data(), static_cast<int>(inputSize));
+			{
+				float* gradOut = useBf16GradsPh2_
+				    ? gpuTransformerScratch->gradScratchFp32.data()
+				    : gpuTransformerWeights->gWIn.data();
+				const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+				gpu_gemm_atb_mp(bf16WIn,
+				    static_cast<int>(dModel), static_cast<int>(inputSize), static_cast<int>(T), 1.0f,
+				    gpuTransformerScratch->dH.data(),
+				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+				    gpuTransformerScratch->x.data(),
+				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(inputSize),
+				    gemmBeta, gradOut, static_cast<int>(inputSize));
+				if (useBf16GradsPh2_)
+					gpu::bf16_accum_axpy(gpuTransformerWeights->gWIn_bf16.data(),
+					    gpuTransformerScratch->gradScratchFp32.data(),
+					    1.0f, 1.0f, gpuTransformerWeights->gWIn.size());
+			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_input_matrix(trainingConfig.atlas, dModel, inputSize),
 			                        gpuTransformerWeights->echoWIn,
 			                        gpuTransformerScratch->dH.data(), gpuTransformerScratch->x.data(),
@@ -11237,6 +11265,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				// Accumulate sum(g^2) across all gradient buffers.
 				if (tokenLM)
 				{
+					// gTokE stays on FP32 grad path even under Phase-2 (see
+					// the embedding_scatter rationale).
 					gpu::sum_squared_accumulate(gpuTransformerWeights->gTokE.data(),
 					    static_cast<int>(gpuTransformerWeights->gTokE.size()),
 					    gpuTransformerScratch->lossSum.data());
@@ -11246,14 +11276,26 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				}
 				else
 				{
-					gpu::sum_squared_accumulate(gpuTransformerWeights->gWIn.data(),
-					    static_cast<int>(gpuTransformerWeights->gWIn.size()),
-					    gpuTransformerScratch->lossSum.data());
+					if (useBf16GradsPh2_)
+					{
+						gpu::sum_squared_accumulate_bf16(gpuTransformerWeights->gWIn_bf16.data(),
+						    static_cast<int>(gpuTransformerWeights->gWIn.size()),
+						    gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gpuTransformerWeights->gWOut_bf16.data(),
+						    static_cast<int>(gpuTransformerWeights->gWOut.size()),
+						    gpuTransformerScratch->lossSum.data());
+					}
+					else
+					{
+						gpu::sum_squared_accumulate(gpuTransformerWeights->gWIn.data(),
+						    static_cast<int>(gpuTransformerWeights->gWIn.size()),
+						    gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate(gpuTransformerWeights->gWOut.data(),
+						    static_cast<int>(gpuTransformerWeights->gWOut.size()),
+						    gpuTransformerScratch->lossSum.data());
+					}
 					gpu::sum_squared_accumulate(gpuTransformerWeights->gBIn.data(),
 					    static_cast<int>(gpuTransformerWeights->gBIn.size()),
-					    gpuTransformerScratch->lossSum.data());
-					gpu::sum_squared_accumulate(gpuTransformerWeights->gWOut.data(),
-					    static_cast<int>(gpuTransformerWeights->gWOut.size()),
 					    gpuTransformerScratch->lossSum.data());
 					gpu::sum_squared_accumulate(gpuTransformerWeights->gBOut.data(),
 					    static_cast<int>(gpuTransformerWeights->gBOut.size()),
@@ -12408,13 +12450,14 @@ if (ad_.valid) { \
 				// is the next phase of memory work — see
 				// research/PATH_TO_1.84B_FLAGSHIP.md §1.
 				//
-				// Phase-2 (gradStorageBf16Phase2): per-block weight grads are
-				// already committed to BF16 mirrors directly by backward via
-				// scratch+commit; skip those casts here (they would overwrite
-				// the correct Phase-2 values with zeros from the unwritten FP32
-				// grad buffer).  Globals (gTokE, gWIn, gWOut) still go through
-				// FP32 path for now since they have non-GEMM writers
-				// (embedding_scatter_add) that would need their own bf16 variants.
+				// Phase-2 cast scope:
+				//   - per-block weights (Wq/Wk/Wv/Wo/W1/W2): scratch+commit done
+				//     in backward; skip cast here.
+				//   - gWIn, gWOut (single GEMM writer each): scratch+commit done
+				//     in backward; skip cast here.
+				//   - gTokE: stays on FP32 path (per-element bf16 atomic-add
+				//     for the embedding scatter accumulates too much round-off).
+				//     Cast it here under Phase-2 just like Phase-1.
 				const bool useBf16GradsPh2_castSite =
 				    trainingConfig.mixedPrecision.gradStorageBf16Phase2;
 				if (useBf16Grads_)
@@ -12425,7 +12468,7 @@ if (ad_.valid) { \
 						                     gpuTransformerWeights->gTokE_bf16.data(),
 						                     gpuTransformerWeights->gTokE.size());
 					}
-					else
+					else if (!useBf16GradsPh2_castSite)
 					{
 						gpu::cast_f32_to_bf16(gpuTransformerWeights->gWIn.data(),
 						                     gpuTransformerWeights->gWIn_bf16.data(),

@@ -125,6 +125,13 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
                            const float* dout,
                            int T, int vocabSize, int dModel);
 
+// BF16-output variant: dE_bf16[tokenIds[T], :] +=bf16 dout[T, dModel] via
+// atomicCAS-on-uint32 for atomic bf16 add.  Used by Phase-3 BF16-grad path
+// to commit token-embedding grads directly to the bf16 mirror.
+bool embedding_scatter_add_bf16(uint16_t* dE_bf16, const int* tokenIds,
+                                const float* dout,
+                                int T, int vocabSize, int dModel);
+
 // ---------------------------------------------------------------------------
 // Adam optimizer
 // ---------------------------------------------------------------------------
@@ -714,6 +721,7 @@ inline bool scale_array(float*, float, int) { return false; }
 
 inline bool embedding_gather(const float*, const int*, int, int, int, float*) { return false; }
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
+inline bool embedding_scatter_add_bf16(uint16_t*, const int*, const float*, int, int, int) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
 inline bool adam_update_batch(float**, float**, float**, float**,

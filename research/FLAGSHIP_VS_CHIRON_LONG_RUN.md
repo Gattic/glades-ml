@@ -412,16 +412,43 @@ Phase-2 is operating correctly.  Δ = +1.1e-4 nat matches Phase-1's
 round-off floor; throughput cost is 0.8% (the extra `bf16_accum_axpy`
 launches per backward GEMM).
 
-### Phase-2 scope and Phase-3 outlook
+### Phase-3: globals — partial success, gTokE blocked by bf16 round-off (2026-05-09)
 
-Phase-2 currently handles the **6 per-block weights** (Wq/Wk/Wv/Wo/W1/W2)
-in `--grad-bf16-phase2` mode.  At 1.84B these are ~93% of the trainable
-weights.  The 3 global tensors (gTokE/gWIn/gWOut) still need their own
-bf16-emit variants of `embedding_scatter_add` and the LM-head GEMM before
-Phase-2 can cover them — that's Phase-3 work.  After Phase-3 we can drop
-the FP32 grad allocations (the `if (!useBf16Grads)` gate in
-`gpu_transformer_state.cu::allocate()`) and finally bank the projected
-~3.65 GB at 1.84B.
+Phase-3 attempted to extend the scratch+commit path to the 3 global
+tensors (gTokE, gWIn, gWOut).  Two outcomes:
+
+**gWIn and gWOut**: shipped under the same `--grad-bf16-phase2` flag.
+Single GEMM writer per tensor, identical scratch+commit pattern as the
+per-block weights.  In tokenLM mode they're dead code (the dense input
+projection and untied LM head aren't exercised), but the path is tested
+ready for non-tokenLM configs.
+
+**gTokE**: rejected due to bf16 round-off accumulation.  An
+`embedding_scatter_add_bf16` kernel was implemented (atomic-CAS on
+uint32 to atomically RMW a bf16 half-word).  165M smoke with this path
+diverged from baseline by **-58 mnat at step 62** — the model converged
+faster because per-element bf16 atomic adds across hundreds of token
+updates per step systematically rounded small contributions to zero,
+producing biased grads.  The kernel works but the precision floor of
+bf16 is too coarse for sparse-scatter accumulation patterns where many
+small adds compound.  Reverted.  gTokE stays on the Phase-1 cast path
+(FP32 grad → bf16 mirror once per Adam step) — its FP32 alloc remains.
+
+| Variant            | Final loss   | Δ vs baseline | Notes                               |
+|--------------------|-------------:|--------------:|-------------------------------------|
+| Baseline (FP32)    |    10.618756 |       --      |                                     |
+| Phase-1            |    10.618745 |   -1.1e-5 nat | ✓ correct                           |
+| Phase-2            |    10.618868 |   +1.1e-4 nat | ✓ per-block on bf16                 |
+| Phase-3 (bf16-scatter) | 10.560341 |  -58.4 mnat   | ✗ rejected — biased grads           |
+| Phase-3 v2         |    10.618936 |   +1.8e-4 nat | ✓ globals on bf16, gTokE FP32 retained |
+
+After Phase-3 v2, the FP32 grad allocations to retire are:
+- gTokE (V·dModel = 50000·1024 FP32 = 195 MB at this scale; 50000·dModel=… at 1.84B)
+- gLmBias, gBIn, gBOut, per-block bias grads (kept on FP32 — small enough not to matter)
+
+Per-block Wq/Wk/Wv/Wo/W1/W2, gWIn, gWOut FP32 buffers (the bulk) are
+ready for retirement (only the alloc-flow gate at
+`gpu_transformer_state.cu::allocate()` is now needed).
 
 ## Conclusions and next steps
 
