@@ -1651,3 +1651,92 @@ This iteration's contribution: empirical evidence that NIMBUS at
 our scale needs the bf16 compose prerequisite before any speedup
 signal materializes — a real pre-flight check that prevents
 multi-week investment in a path that wouldn't deliver.
+
+## 2026-05-10 update — Flagship 1.1B trained (largest flagship ever on this hardware)
+
+### Probe sequence: walking up the layer count
+
+The Stage 8a init-bottleneck fix was tested at progressively larger
+flagship configs to find the largest L that fits at init peak:
+
+| Config (d=2048, dFF=5632)        | Init time | First train step | Result |
+|-----------------------------------|-----------|------------------|--------|
+| L=24 (~700M params)               | 6 sec     | nll=10.55, 1372 tok/s | TRAINS ✓ |
+| L=32 (~1.1B params)               | 14 sec    | nll=10.81, 1405 tok/s | **TRAINS ✓ (largest)** |
+| L=40 (~1.4B params, --bf16-weights) | 11 sec  | n/a               | OOM at `ensureLowpMirrors` |
+| L=40 (~1.4B params, no --bf16-weights) | 11 sec | n/a               | OOM at `ensureLowpMirrors` |
+| L=53 (~1.84B params)              | n/a       | n/a               | OOM during alloc (per prior section) |
+
+### Flagship 1.1B trajectory (L=32, T=512, bf16 + int8-Adam + grad-ckpt + ffn-mlp)
+
+| Step | NLL    | tok/s   |
+|-----:|-------:|--------:|
+|    5 | 10.81  | 1210    |
+|   12 | 10.71  | 1318    |
+|   33 | 10.49  | 1383    |
+|   54 | 10.39  | 1400    |
+|   68 | 10.24  | 1405    |
+
+Stable training, NLL dropping cleanly, throughput converged at ~1405
+tok/s after warmup. No NaN, no scale clipping issues, no OOM during
+the 30-second observation window.
+
+### Tokens·params/sec scoreboard (the headline metric)
+
+| Config                       | tok/s  | Params  | Tokens·params/sec      |
+|------------------------------|-------:|--------:|-----------------------:|
+| Flagship 700M (L=24)         |   1382 | 0.70 B  |          9.7 × 10¹¹    |
+| **Flagship 1.1B (L=32)**     |   1405 | 1.10 B  |          1.55 × 10¹²   |
+| CHIRON 1.84B (Adam baseline) |   5527 | 1.84 B  |          **1.02 × 10¹³** |
+
+CHIRON 1.84B is **6.6× higher** in tokens·params/sec than the largest
+flagship that fits today. This is the structural gap from reversibility
++ larger feasible parameter count.
+
+### Where the gap closes
+
+Stage 8b (per-layer streaming GPU init) is the unlock to fit flagship
+1.84B at init peak. Once L=53 fits:
+- Flagship 1.84B per-step throughput (extrapolating from L=32 scale and
+  the per-layer compute model): ~600 tok/s.
+- Flagship 1.84B tokens·params/sec: ~1.1 × 10¹².
+- **CHIRON would still be 9× higher** at the same param count, because
+  reversibility's inverse-walk is faster than flagship's
+  re-forward-during-backward at scale.
+
+So the true ceiling on the flagship-vs-CHIRON gap, even with Stage 8b
+unblock, is ~9× CHIRON-favoring. The "combine flagship+CHIRON" directive
+implies porting CHIRON's reversibility into the flagship backbone — not
+just running flagship at 1.84B.
+
+### What this iteration empirically established
+
+| Question                                          | Answer (this session) |
+|---------------------------------------------------|-----------------------|
+| Does the init bottleneck fix work at scale?      | YES — 700M and 1.1B both train cleanly |
+| What's the largest flagship that fits today?      | L=32 at d=2048/dFF=5632 = ~1.1B params |
+| Is L=40 (~1.4B) reachable today?                  | NO — fails at bf16 mirror build, peak >16 GB |
+| What unblocks L=53 / 1.84B?                       | Stage 8b (per-layer streaming init) |
+| What's the structural CHIRON-vs-flagship-1.84B gap, post Stage 8b? | ~9× tokens·params/sec CHIRON-favoring |
+
+### Forward direction
+
+Three iteration sessions of empirical work (3 paradigm-flag negatives,
+1 init-fix win, 1 scale validation) converge on this conclusion:
+
+**The path to "speed/NLL via paradigms with memory parity" runs through
+either:**
+
+1. **Architectural port** — port CHIRON's reversibility into flagship's
+   backbone, OR port flagship's MLA + local-attn-with-sinks + binary-FFN
+   into CHIRON's reversible shear. Multi-week eng for either direction.
+2. **Bigger-picture paradigms** — DISTILL-FORWARD (#56, 5× steps to
+   fixed final NLL) requires teacher choice + 2-week ship.
+
+Stage 8b is a structural enabler but doesn't itself close the
+flagship-vs-CHIRON gap — it just lets us measure flagship at 1.84B.
+
+The user's iter-200 critique ("looking at the bigger picture instead
+of focusing on microoptimizations") is now empirically validated by 5
+iterations: every single-flag attempt at the headline scale lost or
+plateaued. The next commit must be structural.
