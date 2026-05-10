@@ -39,7 +39,7 @@ GpuTransformerWeights::GpuTransformerWeights()
       adamPtrsUploaded(false),
       adamMetricMetaUploaded(false), adamMetricScope(0u),
       matraBatchDescriptorCount(0), matraBatchDescriptorHash(0ULL),
-      lowpReady(false), lowpDType(0)
+      lowpReady(false), lowpDType(0), lowpIsCanonical(false)
 {
 }
 
@@ -86,7 +86,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
                                       bool adamStateInt8,
                                       bool faceEmbedding,
                                       bool gradStorageBf16,
-                                      bool gradStorageBf16Phase2)
+                                      bool gradStorageBf16Phase2,
+                                      bool weightStorageBf16)
 {
 	free();
 	// int8 wins over bf16 if both flags accidentally set (it's the more
@@ -99,6 +100,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	const bool useFaceTokE = faceEmbedding && tm && !skipAdamBufs;
 	const bool useBf16Grads = gradStorageBf16 && !skipAdamBufs;
 	const bool useBf16GradsPh2 = gradStorageBf16Phase2 && useBf16Grads;
+	const bool useBf16Weights_ = weightStorageBf16 && useBf16GradsPh2;
+	// Set the canonical-bf16 flag here so ensureLowpMirrors short-circuits
+	// (mirrors are the canonical store, no FP32 master refresh).
+	lowpIsCanonical = useBf16Weights_;
 	// Phase-2: per-block W{q,k,v,o,1,2}, gWIn, gWOut FP32 grad buffers are
 	// RETIRED (backward writes scratch+commit-bf16 directly).  Bias grads
 	// and gTokE keep their FP32 allocs (gTokE goes through Phase-1 cast
@@ -568,6 +573,7 @@ void GpuTransformerWeights::free()
 	initialized = false;
 	lowpReady = false;
 	lowpDType = 0;
+	lowpIsCanonical = false;
 	// GpuBuffer destructors handle cudaFree automatically.
 }
 
@@ -577,6 +583,13 @@ bool GpuTransformerWeights::ensureLowpMirrors()
 {
 	if (!initialized)
 		return false;
+
+	// BF16-weights mode: *Lowp buffers ARE the canonical weight store.
+	// Subsequent refreshes from FP32 master would overwrite the in-place
+	// Adam updates.  First call (lowpReady=false) still goes through the
+	// cast pass below to seed the mirrors from the just-uploaded FP32
+	// init weights; later calls short-circuit.
+	if (lowpIsCanonical && lowpReady) return true;
 
 	// For each master -> mirror pair, allocate the mirror if empty and cast.
 	// Helper captures the shape from the master buffer's allocated size.

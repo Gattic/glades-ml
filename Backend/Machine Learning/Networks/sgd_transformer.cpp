@@ -12613,6 +12613,11 @@ if (ad_.valid) { \
 							    gpuTransformerWeights->faceGFHat.data(),
 							    V, m, lrEff, fEps);
 						}
+					// Note: tokE EXCLUDED from bf16w dispatch.  embedding_gather
+					// (forward) reads tokE FP32 master directly, no BF16 variant
+					// exists; routing tokE through bf16w would leave the gather
+					// reading stale FP32 weights.  Until embedding_gather_bf16
+					// lands, tokE stays on the FP32-master + cast-pass path.
 					} else if (useInt8AdamState && useBf16Grads_) {
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gpuTransformerWeights->tokE,
 						                              gpuTransformerWeights->gTokE_bf16,
@@ -12647,7 +12652,21 @@ if (ad_.valid) { \
 				{
 					const float lr0Base = skeleton->getLearningRate(0u);
 					const float wd0 = skeleton->getWeightDecay2(0u);
-					if (useInt8AdamState && useBf16Grads_) {
+					if (useBf16Weights_ && useInt8AdamState) {
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gpuTransformerWeights->WInLowp,
+						                                    gpuTransformerWeights->gWIn_bf16,
+						                                    gpuTransformerWeights->vWIn_int8,
+						                                    gpuTransformerWeights->v2WIn_int8,
+						                                    gpuTransformerWeights->vWInScale,
+						                                    gpuTransformerWeights->v2WInScale,
+						                                    lr0Base, wd0);
+					} else if (useBf16Weights_) {
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gpuTransformerWeights->WInLowp,
+						                                    gpuTransformerWeights->gWIn_bf16,
+						                                    gpuTransformerWeights->vWIn_bf16,
+						                                    gpuTransformerWeights->v2WIn_bf16,
+						                                    lr0Base, wd0);
+					} else if (useInt8AdamState && useBf16Grads_) {
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gpuTransformerWeights->WIn,
 						                              gpuTransformerWeights->gWIn_bf16,
 						                              gpuTransformerWeights->vWIn_int8,
@@ -12678,7 +12697,21 @@ if (ad_.valid) { \
 					}
 					const float lrOutBase = skeleton->getLearningRate(nLayers);
 					const float wdOut = skeleton->getWeightDecay2(nLayers);
-					if (useInt8AdamState && useBf16Grads_) {
+					if (useBf16Weights_ && useInt8AdamState) {
+						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gpuTransformerWeights->WOutLowp,
+						                                    gpuTransformerWeights->gWOut_bf16,
+						                                    gpuTransformerWeights->vWOut_int8,
+						                                    gpuTransformerWeights->v2WOut_int8,
+						                                    gpuTransformerWeights->vWOutScale,
+						                                    gpuTransformerWeights->v2WOutScale,
+						                                    lrOutBase, wdOut);
+					} else if (useBf16Weights_) {
+						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gpuTransformerWeights->WOutLowp,
+						                                    gpuTransformerWeights->gWOut_bf16,
+						                                    gpuTransformerWeights->vWOut_bf16,
+						                                    gpuTransformerWeights->v2WOut_bf16,
+						                                    lrOutBase, wdOut);
+					} else if (useInt8AdamState && useBf16Grads_) {
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gpuTransformerWeights->WOut,
 						                              gpuTransformerWeights->gWOut_bf16,
 						                              gpuTransformerWeights->vWOut_int8,
@@ -12718,15 +12751,20 @@ if (ad_.valid) { \
 						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.WkLowp, gb.gWk_bf16, gb.vWk_int8, gb.v2Wk_int8, gb.vWkScale, gb.v2WkScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.WvLowp, gb.gWv_bf16, gb.vWv_int8, gb.v2Wv_int8, gb.vWvScale, gb.v2WvScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.WoLowp, gb.gWo_bf16, gb.vWo_int8, gb.v2Wo_int8, gb.vWoScale, gb.v2WoScale, lrBase, wdBase);
-						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.W1Lowp, gb.gW1_bf16, gb.vW1_int8, gb.v2W1_int8, gb.vW1Scale, gb.v2W1Scale, lrBase, wdBase);
-						GLADES_INT8_ADAM_BIG_BF16GRAD_BF16W(gb.W2Lowp, gb.gW2_bf16, gb.vW2_int8, gb.v2W2_int8, gb.vW2Scale, gb.v2W2Scale, lrBase, wdBase);
+						// W1/W2 EXCLUDED from bf16w — paradigm #74 binary-FFN forward
+						// (sgd_transformer.cpp lines 9534, 9544, 9591, 9601) reads
+						// gb.W1.data()/gb.W2.data() (FP32 master) directly to compute
+						// the sign() discretization.  Stays on Phase-2 (FP32 grads
+						// retired but FP32 weights still alive + cast pass).
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.W1, gb.gW1_bf16, gb.vW1_int8, gb.v2W1_int8, gb.vW1Scale, gb.v2W1Scale, lrBase, wdBase);
+						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.W2, gb.gW2_bf16, gb.vW2_int8, gb.v2W2_int8, gb.vW2Scale, gb.v2W2Scale, lrBase, wdBase);
 					} else if (useBf16Weights_) {
 						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WqLowp, gb.gWq_bf16, gb.vWq_bf16, gb.v2Wq_bf16, lrBase, wdBase);
 						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WkLowp, gb.gWk_bf16, gb.vWk_bf16, gb.v2Wk_bf16, lrBase, wdBase);
 						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WvLowp, gb.gWv_bf16, gb.vWv_bf16, gb.v2Wv_bf16, lrBase, wdBase);
 						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.WoLowp, gb.gWo_bf16, gb.vWo_bf16, gb.v2Wo_bf16, lrBase, wdBase);
-						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.W1Lowp, gb.gW1_bf16, gb.vW1_bf16, gb.v2W1_bf16, lrBase, wdBase);
-						GLADES_BF16_ADAM_BIG_BF16GRAD_BF16W(gb.W2Lowp, gb.gW2_bf16, gb.vW2_bf16, gb.v2W2_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.W1, gb.gW1_bf16, gb.vW1_bf16, gb.v2W1_bf16, lrBase, wdBase);
+						GLADES_BF16_ADAM_BIG_BF16GRAD(gb.W2, gb.gW2_bf16, gb.vW2_bf16, gb.v2W2_bf16, lrBase, wdBase);
 					} else if (useInt8AdamState && useBf16Grads_) {
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wq, gb.gWq_bf16, gb.vWq_int8, gb.v2Wq_int8, gb.vWqScale, gb.v2WqScale, lrBase, wdBase);
 						GLADES_INT8_ADAM_BIG_BF16GRAD(gb.Wk, gb.gWk_bf16, gb.vWk_int8, gb.v2Wk_int8, gb.vWkScale, gb.v2WkScale, lrBase, wdBase);

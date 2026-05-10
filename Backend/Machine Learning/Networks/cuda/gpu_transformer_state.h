@@ -417,6 +417,11 @@ struct GpuTransformerWeights
 	// weights stay FP32 throughout.
 	bool lowpReady;      // true after ensureLowpMirrors has populated all Lowp buffers
 	int  lowpDType;      // glades::transformer_kernels::LOWP_BF16 (others unsupported on GPU for now)
+	// True when MixedPrecisionConfig.weightStorageBf16 is active: the *Lowp
+	// buffers ARE the canonical weight store (no FP32 master).  ensureLowp
+	// Mirrors() must NOT refresh from FP32 master in this mode (would
+	// overwrite the in-place Adam updates).
+	bool lowpIsCanonical;
 
 	GpuTransformerWeights();
 	~GpuTransformerWeights();
@@ -439,7 +444,8 @@ struct GpuTransformerWeights
 	              bool adamStateInt8 = false,
 	              bool faceEmbedding = false,
 	              bool gradStorageBf16 = false,
-	              bool gradStorageBf16Phase2 = false);
+	              bool gradStorageBf16Phase2 = false,
+	              bool weightStorageBf16 = false);
 
 	// Free all GPU memory.
 	void free();
