@@ -412,6 +412,36 @@ Phase-2 is operating correctly.  Δ = +1.1e-4 nat matches Phase-1's
 round-off floor; throughput cost is 0.8% (the extra `bf16_accum_axpy`
 launches per backward GEMM).
 
+### BF16-grad Phase-2 retire-FP32 — bug fixed, memory savings UNLOCKED (2026-05-10)
+
+The earlier alloc-retire regression was traced to a **size-arg bug**: bf16
+sum-sq and bf16_accum_axpy at 11 sites were passing `gWq.size()` (the FP32
+buffer's size — returns 0 when retired) instead of `gWq_bf16.size()` (the
+bf16 mirror's size).  When the FP32 alloc was retired, those calls became
+no-ops, so backward writes to the bf16 mirrors were dropped and the global
+grad-norm pass missed those tensors.  Fix: use the bf16 mirror's size in
+all 11 sites.
+
+After the fix, Phase-2 with `--grad-bf16-phase2` retires the FP32 grad
+allocs by default for: per-block W{q,k,v,o,1,2}, gWIn, gWOut.  165M smoke
+parity (T=1024, 64K tokens, 62 steps):
+
+| Variant                     | Final loss   | Δ vs baseline | gradNorm  | Tok/s |
+|-----------------------------|-------------:|--------------:|----------:|------:|
+| Baseline (FP32 grads)       |    10.618756 |       --      |  0.293695 | 17,286 |
+| Phase-1 (`--grad-bf16`)     |    10.618745 |   -1.1e-5 nat |  0.292141 | 17,352 |
+| Phase-2 (FP32 alive)        |    10.618868 |   +1.1e-4 nat |  0.292942 | 17,142 |
+| **Phase-2 retire-default**  |    10.618853 |   +9.7e-5 nat |  0.291016 | 17,256 |
+
+The retire-default build saves the per-block W{q,k,v,o,1,2} + gWIn + gWOut
+FP32 grad buffers entirely.  Bias grads, gTokE, layernorm grads remain
+FP32.  At 1.84B (m=2048, L=53, dFF=5632) this drops ~3.6-3.7 GB of grad
+allocations — directly enabling the previously-OOM 1.84B configs to fit
+on the 16 GB GPU.
+
+For diagnostic purposes, the `GLADES_BF16_PH2_RETIRE` env var still allows
+per-tensor override (off|w2|w1|wq|wk|wv|wo|win|wout|all).
+
 ### Phase-3: globals — partial success, gTokE blocked by bf16 round-off (2026-05-09)
 
 Phase-3 attempted to extend the scratch+commit path to the 3 global

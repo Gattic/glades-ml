@@ -99,20 +99,16 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	const bool useFaceTokE = faceEmbedding && tm && !skipAdamBufs;
 	const bool useBf16Grads = gradStorageBf16 && !skipAdamBufs;
 	const bool useBf16GradsPh2 = gradStorageBf16Phase2 && useBf16Grads;
-	// Bisect mode: GLADES_BF16_PH2_RETIRE selects which tensors get their
-	// FP32 grad alloc skipped:
-	//   "all" — all of W{q,k,v,o,1,2} + WIn + WOut
-	//   "w2"  — only gW2 (biggest single per-block tensor)
-	//   "w1"  — only gW1
-	//   "wq"  — only gWq, etc.
-	//   "wo"  — only gWo
-	//   "wk"  — only gWk
-	//   "wv"  — only gWv
-	//   "win" — only gWIn
-	//   "wout"— only gWOut
-	//   unset / "off" — keep all FP32 allocs alive (default: safe, no savings)
+	// Phase-2: per-block W{q,k,v,o,1,2}, gWIn, gWOut FP32 grad buffers are
+	// RETIRED (backward writes scratch+commit-bf16 directly).  Bias grads
+	// and gTokE keep their FP32 allocs (gTokE goes through Phase-1 cast
+	// path due to the bf16-scatter precision issue).  All retired by default
+	// in Phase-2; the GLADES_BF16_PH2_RETIRE env var (off|w2|w1|wq|wk|wv|wo|win|wout|all)
+	// remains as a per-tensor diagnostic override for debugging.
 	const char* phase2Mode_env = useBf16GradsPh2 ? std::getenv("GLADES_BF16_PH2_RETIRE") : NULL;
-	const bool ph2RetireAll = phase2Mode_env && !std::strcmp(phase2Mode_env, "all");
+	const bool ph2DiagOff   = phase2Mode_env && !std::strcmp(phase2Mode_env, "off");
+	const bool ph2RetireAll = useBf16GradsPh2 && !ph2DiagOff
+	    && (phase2Mode_env == NULL || !std::strcmp(phase2Mode_env, "all"));
 	const bool ph2RetireW2  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "w2"));
 	const bool ph2RetireW1  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "w1"));
 	const bool ph2RetireWq  = ph2RetireAll || (phase2Mode_env && !std::strcmp(phase2Mode_env, "wq"));

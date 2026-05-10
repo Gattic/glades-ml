@@ -10579,7 +10579,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (useBf16GradsPh2_)
 					gpu::bf16_accum_axpy(gpuTransformerWeights->gWOut_bf16.data(),
 					    gpuTransformerScratch->gradScratchFp32.data(),
-					    1.0f, 1.0f, gpuTransformerWeights->gWOut.size());
+					    1.0f, 1.0f, gpuTransformerWeights->gWOut_bf16.size());
 			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_head_matrix(trainingConfig.atlas, outSize, dModel),
 			                        gpuTransformerWeights->echoWOut,
@@ -10666,7 +10666,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (useBf16GradsPh2_)
 					gpu::bf16_accum_axpy(gb.gW2_bf16.data(),
 					    gpuTransformerScratch->gradScratchFp32.data(),
-					    1.0f, 1.0f, gb.gW2.size());
+					    1.0f, 1.0f, gb.gW2_bf16.size());
 			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dFF),
 			                        gb.echoW2,
@@ -10707,7 +10707,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 					if (useBf16GradsPh2_)
 						gpu::bf16_accum_axpy(gb.gW1_bf16.data(),
 						    gpuTransformerScratch->gradScratchFp32.data(),
-						    1.0f, 1.0f, gb.gW1.size());
+						    1.0f, 1.0f, gb.gW1_bf16.size());
 				}
 				GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, ff1Width, dModel),
 				                        gb.echoW1,
@@ -10757,7 +10757,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 					if (useBf16GradsPh2_)
 						gpu::bf16_accum_axpy(gb.gW1_bf16.data(),
 						    gpuTransformerScratch->gradScratchFp32.data(),
-						    1.0f, 1.0f, gb.gW1.size());
+						    1.0f, 1.0f, gb.gW1_bf16.size());
 				}
 				GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dFF, dModel),
 				                        gb.echoW1,
@@ -10820,7 +10820,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (useBf16GradsPh2_)
 					gpu::bf16_accum_axpy(gb.gWo_bf16.data(),
 					    gpuTransformerScratch->gradScratchFp32.data(),
-					    1.0f, 1.0f, gb.gWo.size());
+					    1.0f, 1.0f, gb.gWo_bf16.size());
 			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dModel),
 			                        gb.echoWo,
@@ -10983,7 +10983,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (useBf16GradsPh2_)
 					gpu::bf16_accum_axpy(gb.gWq_bf16.data(),
 					    gpuTransformerScratch->gradScratchFp32.data(),
-					    1.0f, 1.0f, gb.gWq.size());
+					    1.0f, 1.0f, gb.gWq_bf16.size());
 			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dModel),
 			                        gb.echoWq,
@@ -11059,7 +11059,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (useBf16GradsPh2_)
 					gpu::bf16_accum_axpy(gb.gWk_bf16.data(),
 					    gpuTransformerScratch->gradScratchFp32.data(),
-					    1.0f, 1.0f, gb.gWk.size());
+					    1.0f, 1.0f, gb.gWk_bf16.size());
 			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
 			                        gb.echoWk,
@@ -11092,7 +11092,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (useBf16GradsPh2_)
 					gpu::bf16_accum_axpy(gb.gWv_bf16.data(),
 					    gpuTransformerScratch->gradScratchFp32.data(),
-					    1.0f, 1.0f, gb.gWv.size());
+					    1.0f, 1.0f, gb.gWv_bf16.size());
 			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
 			                        gb.echoWv,
@@ -11166,7 +11166,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				if (useBf16GradsPh2_)
 					gpu::bf16_accum_axpy(gpuTransformerWeights->gWIn_bf16.data(),
 					    gpuTransformerScratch->gradScratchFp32.data(),
-					    1.0f, 1.0f, gpuTransformerWeights->gWIn.size());
+					    1.0f, 1.0f, gpuTransformerWeights->gWIn_bf16.size());
 			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_input_matrix(trainingConfig.atlas, dModel, inputSize),
 			                        gpuTransformerWeights->echoWIn,
@@ -11279,10 +11279,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 					if (useBf16GradsPh2_)
 					{
 						gpu::sum_squared_accumulate_bf16(gpuTransformerWeights->gWIn_bf16.data(),
-						    static_cast<int>(gpuTransformerWeights->gWIn.size()),
+						    static_cast<int>(gpuTransformerWeights->gWIn_bf16.size()),
 						    gpuTransformerScratch->lossSum.data());
 						gpu::sum_squared_accumulate_bf16(gpuTransformerWeights->gWOut_bf16.data(),
-						    static_cast<int>(gpuTransformerWeights->gWOut.size()),
+						    static_cast<int>(gpuTransformerWeights->gWOut_bf16.size()),
 						    gpuTransformerScratch->lossSum.data());
 					}
 					else
@@ -11306,12 +11306,12 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[gli];
 					if (useBf16GradsPh2_)
 					{
-						gpu::sum_squared_accumulate_bf16(gb.gWq_bf16.data(), static_cast<int>(gb.gWq.size()), gpuTransformerScratch->lossSum.data());
-						gpu::sum_squared_accumulate_bf16(gb.gWk_bf16.data(), static_cast<int>(gb.gWk.size()), gpuTransformerScratch->lossSum.data());
-						gpu::sum_squared_accumulate_bf16(gb.gWv_bf16.data(), static_cast<int>(gb.gWv.size()), gpuTransformerScratch->lossSum.data());
-						gpu::sum_squared_accumulate_bf16(gb.gWo_bf16.data(), static_cast<int>(gb.gWo.size()), gpuTransformerScratch->lossSum.data());
-						gpu::sum_squared_accumulate_bf16(gb.gW1_bf16.data(), static_cast<int>(gb.gW1.size()), gpuTransformerScratch->lossSum.data());
-						gpu::sum_squared_accumulate_bf16(gb.gW2_bf16.data(), static_cast<int>(gb.gW2.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gWq_bf16.data(), static_cast<int>(gb.gWq_bf16.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gWk_bf16.data(), static_cast<int>(gb.gWk_bf16.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gWv_bf16.data(), static_cast<int>(gb.gWv_bf16.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gWo_bf16.data(), static_cast<int>(gb.gWo_bf16.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gW1_bf16.data(), static_cast<int>(gb.gW1_bf16.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gW2_bf16.data(), static_cast<int>(gb.gW2_bf16.size()), gpuTransformerScratch->lossSum.data());
 					}
 					else
 					{
