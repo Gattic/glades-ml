@@ -1119,10 +1119,11 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 	if (tokenLM && isTrain && (trainingConfig.optimizer.type != glades::OptimizerConfig::ADAMW)
 	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::ATLAS)
 	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::VESTA)
-	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::HELIOS))
+	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::HELIOS)
+	                       && (trainingConfig.optimizer.type != glades::OptimizerConfig::SOPHIA_G))
 	{
 		lastStatus = NNetworkStatus(NNetworkStatus::INVALID_ARGUMENT,
-		                            "SGDHelper_TRANSFORMER: token LM training requires optimizer=ADAMW, ATLAS, VESTA, or HELIOS for LLM-scale stability");
+		                            "SGDHelper_TRANSFORMER: token LM training requires optimizer=ADAMW, ATLAS, VESTA, HELIOS, or SOPHIA_G for LLM-scale stability");
 		storeRunningFlag(false);
 		return;
 	}
@@ -12907,27 +12908,51 @@ if (ad_.valid) { \
 					dAdamGroupScales = gpuTransformerWeights->d_adamGroupScales;
 				}
 
-				gpu::adam_update_batch(
-				    gpuTransformerWeights->d_adamParams,
-				    gpuTransformerWeights->d_adamGrads,
-				    gpuTransformerWeights->d_adamM,
-				    gpuTransformerWeights->d_adamV,
-				    gpuTransformerWeights->d_adamBaseLr,
-				    gpuTransformerWeights->d_adamWd,
-				    adamLrScale,
-				    dAdamGroupScales,
-				    gpuTransformerWeights->d_adamSizes,
-				    gpuTransformerWeights->adamMaxSize,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamRowMetric : NULL,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamColMetric : NULL,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamRowStructMetric : NULL,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamColStructMetric : NULL,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamPrevMhat : NULL,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricScratch : NULL,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricRows : NULL,
-				    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricCols : NULL,
-				    beta1, beta2, adamEps,
-				    invBatch * gradScale, stepInt, gc);
+				if (trainingConfig.optimizer.type == glades::OptimizerConfig::SOPHIA_G)
+				{
+					// Paradigm shift #55 SOPHIA-G: clipped second-order rule
+					// using g² as Hessian proxy.  Reuses Adam's m/v slots
+					// (h takes v's place).  Per Liu 2023 defaults.
+					gpu::sophia_g_update_batch(
+					    gpuTransformerWeights->d_adamParams,
+					    gpuTransformerWeights->d_adamGrads,
+					    gpuTransformerWeights->d_adamM,
+					    gpuTransformerWeights->d_adamV,   // ← reused as h
+					    gpuTransformerWeights->d_adamBaseLr,
+					    gpuTransformerWeights->d_adamWd,
+					    adamLrScale,
+					    gpuTransformerWeights->d_adamSizes,
+					    gpuTransformerWeights->adamMaxSize,
+					    /*beta1=*/0.965f, /*beta2=*/0.99f,
+					    trainingConfig.optimizer.sophiaGamma,
+					    trainingConfig.optimizer.sophiaRho,
+					    adamEps,
+					    invBatch * gradScale, stepInt, gc);
+				}
+				else
+				{
+					gpu::adam_update_batch(
+					    gpuTransformerWeights->d_adamParams,
+					    gpuTransformerWeights->d_adamGrads,
+					    gpuTransformerWeights->d_adamM,
+					    gpuTransformerWeights->d_adamV,
+					    gpuTransformerWeights->d_adamBaseLr,
+					    gpuTransformerWeights->d_adamWd,
+					    adamLrScale,
+					    dAdamGroupScales,
+					    gpuTransformerWeights->d_adamSizes,
+					    gpuTransformerWeights->adamMaxSize,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamRowMetric : NULL,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamColMetric : NULL,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamRowStructMetric : NULL,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamColStructMetric : NULL,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamPrevMhat : NULL,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricScratch : NULL,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricRows : NULL,
+					    gpuFuseEcho ? gpuTransformerWeights->d_adamMetricCols : NULL,
+					    beta1, beta2, adamEps,
+					    invBatch * gradScale, stepInt, gc);
+				}
 			}
 
 			// --- BF16 / int8 Adam state dispatch (large weight matrices) ---

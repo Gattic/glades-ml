@@ -288,6 +288,19 @@ bool adam_update_batch(float** d_params, float** d_grads,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount);
 
+// SOPHIA-G batched variant — drop-in replacement for adam_update_batch
+// when OptimizerConfig::type == SOPHIA_G.  Reuses the same buffer-of-pointers
+// layout (d_params/d_grads/d_ms/d_hs, where d_hs replaces d_vs).  No ECHO
+// metric scaling.  Uses the Sophia clipped second-order rule:
+//   ratio = clip(m_hat / max(γ · h_hat, ε), -ρ, ρ)
+//   θ ← θ - lr · ratio  (decoupled WD applied separately)
+bool sophia_g_update_batch(float** d_params, float** d_grads,
+                            float** d_ms, float** d_hs,
+                            const float* d_baseLrs, const float* d_wds,
+                            float lrScale, const int* d_sizes, int maxSize,
+                            float beta1, float beta2, float gamma, float rho,
+                            float eps, float gradScale, int step, int groupCount);
+
 // ---------------------------------------------------------------------------
 // Flash attention (simplified single-head)
 // ---------------------------------------------------------------------------
@@ -772,6 +785,10 @@ inline bool adam_update_batch(float**, float**, float**, float**,
                               const int*, int,
                               float**, float**, float**, float**, float**, float**, const int*, const int*,
                               float, float, float, float, int, int) { return false; }
+inline bool sophia_g_update_batch(float**, float**, float**, float**,
+                                   const float*, const float*, float,
+                                   const int*, int,
+                                   float, float, float, float, float, float, int, int) { return false; }
 
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }

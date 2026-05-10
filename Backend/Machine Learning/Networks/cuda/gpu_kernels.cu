@@ -2064,7 +2064,84 @@ __global__ void adam_update_batch_kernel(
 	param[idx] -= lr * stepVal;
 }
 
+// Sophia-G batched variant.  Same buffer-of-pointers layout as
+// adam_update_batch_kernel but with the Sophia clipped second-order rule
+// instead of Adam's m/sqrt(v).  No ECHO metric scaling — meant as an
+// drop-in replacement that preserves the per-group learning rate +
+// weight-decay + bias-correction semantics.  Param 'h' replaces Adam's
+// 'v' (same shape, same buffers reused — gradient-squared EMA).
+__global__ void sophia_g_update_batch_kernel(
+    float** __restrict__ params,
+    float** __restrict__ grads,
+    float** __restrict__ ms,
+    float** __restrict__ hs,
+    const float* __restrict__ baseLrs,
+    const float* __restrict__ wds,
+    float lrScale,
+    const int* __restrict__ sizes,
+    float beta1, float beta2,
+    float gamma, float rho, float eps,
+    float gradScale, int step, int groupCount)
+{
+	int grp = blockIdx.y;
+	if (grp >= groupCount) return;
+
+	int n = sizes[grp];
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= n) return;
+
+	float* param = params[grp];
+	float* grad = grads[grp];
+	float* m_arr = ms[grp];
+	float* h_arr = hs[grp];
+	const float baseLr = baseLrs[grp] * lrScale;
+	float weightDecay = wds[grp];
+
+	float g = grad[idx] * gradScale;
+
+	// Decoupled weight decay (AdamW-style).
+	if (weightDecay != 0.0f)
+		param[idx] -= baseLr * weightDecay * param[idx];
+
+	float m_new = beta1 * m_arr[idx] + (1.0f - beta1) * g;
+	float h_new = beta2 * h_arr[idx] + (1.0f - beta2) * g * g;
+	m_arr[idx] = m_new;
+	h_arr[idx] = h_new;
+
+	float bc1 = 1.0f - powf(beta1, (float)step);
+	float bc2 = 1.0f - powf(beta2, (float)step);
+	float m_hat = m_new / bc1;
+	float h_hat = h_new / bc2;
+
+	float denom = fmaxf(gamma * h_hat, eps);
+	float ratio = m_hat / denom;
+	if (ratio > rho) ratio = rho;
+	else if (ratio < -rho) ratio = -rho;
+
+	param[idx] -= baseLr * ratio;
+	grad[idx] = 0.0f;  // mirror adam_update_batch's grad clear
+}
+
 } // anonymous namespace
+
+bool sophia_g_update_batch(float** d_params, float** d_grads,
+                            float** d_ms, float** d_hs,
+                            const float* d_baseLrs, const float* d_wds,
+                            float lrScale, const int* d_sizes, int maxSize,
+                            float beta1, float beta2, float gamma, float rho,
+                            float eps, float gradScale, int step, int groupCount)
+{
+	if (groupCount <= 0 || maxSize <= 0) return true;
+	dim3 block(kBlockElem, 1, 1);
+	dim3 grid((maxSize + kBlockElem - 1) / kBlockElem, groupCount, 1);
+	sophia_g_update_batch_kernel<<<grid, block, 0, computeStream()>>>(
+	    d_params, d_grads, d_ms, d_hs,
+	    d_baseLrs, d_wds, lrScale, d_sizes,
+	    beta1, beta2, gamma, rho, eps,
+	    gradScale, step, groupCount);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
 
 bool adam_update_batch(float** d_params, float** d_grads,
                        float** d_ms, float** d_vs,
