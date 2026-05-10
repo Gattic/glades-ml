@@ -85,6 +85,20 @@ bool atlas_transformer_needs_adam_moments(const glades::TrainingConfig& training
 	            || trainingConfig.atlas.muonEnabled));
 }
 
+// True when GPU bf16/int8 Adam state is the canonical store and the host-side
+// FP32 m/v vectors are dead weight from init forward.  Skipping their
+// O(N_params) assign() at init avoids the host-RAM thrash that has blocked
+// 1.84B-class flagship training on 62 GB hosts (without this gate, per-layer
+// vWq/v2Wq/vW1/v2W1/etc. sums to ~21 GB at L=53 d=2048 dFF=5632, pushing
+// resident set into swap during the otherwise-quick init phase).
+bool transformer_skip_host_adam_mv(const glades::TrainingConfig& trainingConfig)
+{
+	return trainingConfig.gpu.enable
+	    && trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW
+	    && (trainingConfig.mixedPrecision.adamStateBf16
+	        || trainingConfig.mixedPrecision.adamStateInt8);
+}
+
 void ensure_transformer_moment_buffer(std::vector<float>& buffer, size_t wanted)
 {
 	if (buffer.size() != wanted)
@@ -2506,6 +2520,7 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		const unsigned int ff1Width = modelCfg.ff1Width;
 
 		const bool needAdamMoments = atlas_transformer_needs_adam_moments(trainingConfig);
+		const bool skipHostAdamMV = transformer_skip_host_adam_mv(trainingConfig);
 		const bool mismatch = (!tensorTransformer.initialized) || (tensorTransformer.inputSize != inputSize) || (tensorTransformer.outSize != outSize) ||
 		                      (tensorTransformer.dModel != dModel) || (tensorTransformer.dFF != dFF) || (tensorTransformer.nHeads != nHeads) ||
 		                      (tensorTransformer.nKVHeads != nKVHeads) || (tensorTransformer.ffnKind != ffnKind) ||
@@ -2609,33 +2624,33 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 		{
 			const size_t eN = static_cast<size_t>(vocabSize) * static_cast<size_t>(dModel);
 			tensorTransformer.tokE.assign(eN, 0.0f);
-			if (needAdamMoments) tensorTransformer.vTokE.assign(eN, 0.0f);
-			if (needAdamMoments) tensorTransformer.v2TokE.assign(eN, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vTokE.assign(eN, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2TokE.assign(eN, 0.0f);
 			tensorTransformer.gTokE.assign(eN, 0.0f);
 			tensorTransformer.lmBias.assign(vocabSize, 0.0f);
-			if (needAdamMoments) tensorTransformer.mLmBias.assign(vocabSize, 0.0f);
-			if (needAdamMoments) tensorTransformer.v2LmBias.assign(vocabSize, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLmBias.assign(vocabSize, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LmBias.assign(vocabSize, 0.0f);
 			tensorTransformer.gLmBias.assign(vocabSize, 0.0f);
 		}
 
 		const size_t inW = static_cast<size_t>(dModel) * static_cast<size_t>(inputSize);
 		tensorTransformer.WIn.assign(inW, 0.0f);
-		if (needAdamMoments) tensorTransformer.vWIn.assign(inW, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2WIn.assign(inW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vWIn.assign(inW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2WIn.assign(inW, 0.0f);
 		tensorTransformer.gWIn.assign(inW, 0.0f);
 		tensorTransformer.bIn.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.mBIn.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2BIn.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mBIn.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2BIn.assign(dModel, 0.0f);
 		tensorTransformer.gBIn.assign(dModel, 0.0f);
 
 		const size_t outW = static_cast<size_t>(outSize) * static_cast<size_t>(dModel);
 		tensorTransformer.WOut.assign(outW, 0.0f);
-		if (needAdamMoments) tensorTransformer.vWOut.assign(outW, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2WOut.assign(outW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.vWOut.assign(outW, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2WOut.assign(outW, 0.0f);
 		tensorTransformer.gWOut.assign(outW, 0.0f);
 		tensorTransformer.bOut.assign(outSize, 0.0f);
-		if (needAdamMoments) tensorTransformer.mBOut.assign(outSize, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2BOut.assign(outSize, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mBOut.assign(outSize, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2BOut.assign(outSize, 0.0f);
 		tensorTransformer.gBOut.assign(outSize, 0.0f);
 
 		tensorTransformer.blocks.resize(static_cast<size_t>(H));
@@ -2646,18 +2661,18 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			TensorTransformerState::Block& b = tensorTransformer.blocks[static_cast<size_t>(li)];
 			b.ln1Gamma.assign(dModel, 1.0f);
 			b.ln1Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn1Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln1Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn1Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln1Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn1Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln1Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn1Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln1Beta.assign(dModel, 0.0f);
 			b.gLn1Gamma.assign(dModel, 0.0f);
 			b.gLn1Beta.assign(dModel, 0.0f);
 			b.ln2Gamma.assign(dModel, 1.0f);
 			b.ln2Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn2Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln2Gamma.assign(dModel, 0.0f);
-			if (needAdamMoments) b.mLn2Beta.assign(dModel, 0.0f);
-			if (needAdamMoments) b.v2Ln2Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn2Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln2Gamma.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.mLn2Beta.assign(dModel, 0.0f);
+			if (needAdamMoments && !skipHostAdamMV) b.v2Ln2Beta.assign(dModel, 0.0f);
 			b.gLn2Gamma.assign(dModel, 0.0f);
 			b.gLn2Beta.assign(dModel, 0.0f);
 
@@ -2667,8 +2682,8 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			b.Wk.assign(mkv, 0.0f);
 			b.Wv.assign(mkv, 0.0f);
 			b.Wo.assign(mm, 0.0f);
-			if (needAdamMoments) { b.vWq.assign(mm, 0.0f); b.vWk.assign(mkv, 0.0f); b.vWv.assign(mkv, 0.0f); b.vWo.assign(mm, 0.0f); }
-			if (needAdamMoments) { b.v2Wq.assign(mm, 0.0f); b.v2Wk.assign(mkv, 0.0f); b.v2Wv.assign(mkv, 0.0f); b.v2Wo.assign(mm, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.vWq.assign(mm, 0.0f); b.vWk.assign(mkv, 0.0f); b.vWv.assign(mkv, 0.0f); b.vWo.assign(mm, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2Wq.assign(mm, 0.0f); b.v2Wk.assign(mkv, 0.0f); b.v2Wv.assign(mkv, 0.0f); b.v2Wo.assign(mm, 0.0f); }
 			b.gWq.assign(mm, 0.0f);
 			b.gWk.assign(mkv, 0.0f);
 			b.gWv.assign(mkv, 0.0f);
@@ -2684,7 +2699,7 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 				b.Wdkv.assign(wDkv, 0.0f);
 				b.Wuk.assign(wUk, 0.0f);
 				b.Wuv.assign(wUv, 0.0f);
-				if (needAdamMoments) {
+				if (needAdamMoments && !skipHostAdamMV) {
 					b.vWdkv.assign(wDkv, 0.0f); b.vWuk.assign(wUk, 0.0f); b.vWuv.assign(wUv, 0.0f);
 					b.v2Wdkv.assign(wDkv, 0.0f); b.v2Wuk.assign(wUk, 0.0f); b.v2Wuv.assign(wUv, 0.0f);
 				}
@@ -2697,8 +2712,8 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			b.bk.assign(dModelKV, 0.0f);
 			b.bv.assign(dModelKV, 0.0f);
 			b.bo.assign(dModel, 0.0f);
-			if (needAdamMoments) { b.mBq.assign(dModel, 0.0f); b.mBk.assign(dModelKV, 0.0f); b.mBv.assign(dModelKV, 0.0f); b.mBo.assign(dModel, 0.0f); }
-			if (needAdamMoments) { b.v2Bq.assign(dModel, 0.0f); b.v2Bk.assign(dModelKV, 0.0f); b.v2Bv.assign(dModelKV, 0.0f); b.v2Bo.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.mBq.assign(dModel, 0.0f); b.mBk.assign(dModelKV, 0.0f); b.mBv.assign(dModelKV, 0.0f); b.mBo.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2Bq.assign(dModel, 0.0f); b.v2Bk.assign(dModelKV, 0.0f); b.v2Bv.assign(dModelKV, 0.0f); b.v2Bo.assign(dModel, 0.0f); }
 			b.gBq.assign(dModel, 0.0f);
 			b.gBk.assign(dModelKV, 0.0f);
 			b.gBv.assign(dModelKV, 0.0f);
@@ -2707,22 +2722,22 @@ bool glades::NNetwork::ensureTensorParametersInitialized()
 			const size_t w1 = static_cast<size_t>(ff1Width) * static_cast<size_t>(dModel);
 			const size_t w2 = static_cast<size_t>(dModel) * static_cast<size_t>(dFF);
 			b.W1.assign(w1, 0.0f); b.W2.assign(w2, 0.0f);
-			if (needAdamMoments) { b.vW1.assign(w1, 0.0f); b.vW2.assign(w2, 0.0f); }
-			if (needAdamMoments) { b.v2W1.assign(w1, 0.0f); b.v2W2.assign(w2, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.vW1.assign(w1, 0.0f); b.vW2.assign(w2, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2W1.assign(w1, 0.0f); b.v2W2.assign(w2, 0.0f); }
 			b.gW1.assign(w1, 0.0f); b.gW2.assign(w2, 0.0f);
 			b.b1.assign(ff1Width, 0.0f); b.b2.assign(dModel, 0.0f);
-			if (needAdamMoments) { b.mB1.assign(ff1Width, 0.0f); b.mB2.assign(dModel, 0.0f); }
-			if (needAdamMoments) { b.v2B1.assign(ff1Width, 0.0f); b.v2B2.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.mB1.assign(ff1Width, 0.0f); b.mB2.assign(dModel, 0.0f); }
+			if (needAdamMoments && !skipHostAdamMV) { b.v2B1.assign(ff1Width, 0.0f); b.v2B2.assign(dModel, 0.0f); }
 			b.gB1.assign(ff1Width, 0.0f); b.gB2.assign(dModel, 0.0f);
 		}
 
 		// Final LayerNorm: gamma=1, beta=0, Adam/grad state=0
 		tensorTransformer.lnFinalGamma.assign(dModel, 1.0f);
 		tensorTransformer.lnFinalBeta.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.mLnFinalGamma.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2LnFinalGamma.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.mLnFinalBeta.assign(dModel, 0.0f);
-		if (needAdamMoments) tensorTransformer.v2LnFinalBeta.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLnFinalGamma.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LnFinalGamma.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.mLnFinalBeta.assign(dModel, 0.0f);
+		if (needAdamMoments && !skipHostAdamMV) tensorTransformer.v2LnFinalBeta.assign(dModel, 0.0f);
 		tensorTransformer.gLnFinalGamma.assign(dModel, 0.0f);
 		tensorTransformer.gLnFinalBeta.assign(dModel, 0.0f);
 		tensorTransformer.adamBeta1Power = 1.0;
