@@ -1406,3 +1406,113 @@ The loop's contribution this iteration was decisive negative evidence
 on three single-flag paradigm applications. That **closes the door**
 on Sophia (#55) and local-attn (#6) for the CHIRON 1.84B regime, and
 strengthens the user's iter-200 critique with empirical backing.
+
+## 2026-05-10 update — Stage 8a: flagship 1.84B init bottleneck FIXED
+
+### What was the bottleneck
+
+Two attempts at flagship 1.84B (iter 951 in this report) stalled
+>30 min at single-threaded CPU init.  Profiling via the new
+`GLADES_LOG_GPU_ALLOC=2` env var (commit `275dfe081`) revealed
+the real shape of the issue: at fresh init under
+`--gpu --mp --adam-state-bf16` (or `--adam-state-int8`), the
+host-side per-block FP32 Adam state vectors (`vWq/v2Wq` × 4 attn,
+`vW1/v2W1`, `vW2/v2W2`, plus LN and bias counterparts) were being
+allocated and zero-filled to **~21 GB across 53 layers** even
+though their canonical store lives on GPU as bf16/int8.
+
+On the 62 GB host, the cumulative anonymous RSS during init pushed
+beyond the swap threshold; subsequent vector::assign() calls hit
+swap-thrashed pages, dragging single-thread init from <1 min into
+the >30 min regime that has been blocking the flagship 1.84B
+head-to-head test ever since the BF16 stack landed.
+
+### The fix (commit `08babb576`)
+
+New helper `transformer_skip_host_adam_mv()` in
+`Backend/Machine Learning/Networks/network.cpp` returns true exactly
+when host-side FP32 Adam moments will never be read or written:
+
+```c++
+bool transformer_skip_host_adam_mv(const TrainingConfig& trainingConfig)
+{
+    return trainingConfig.gpu.enable
+        && trainingConfig.optimizer.type == OptimizerConfig::ADAMW
+        && (trainingConfig.mixedPrecision.adamStateBf16
+            || trainingConfig.mixedPrecision.adamStateInt8);
+}
+```
+
+Every `if (needAdamMoments)` site at the per-block + global init code
+paths in network.cpp gains `&& !skipHostAdamMV` as a second gate.
+Grad and weight host vectors are unchanged (still needed for the
+upload-source semantics and Stage 7 weight-master retire).
+
+### Verification
+
+Smoke-tested on flagship 100M (`--gpu --mp --adam-state-bf16
+--dmodel 768 --layers 12 --heads 8 --dff 2048`): init completes
+cleanly, first training step `nll=10.5245`, no NaN or size-mismatch
+on the GPU upload path. CHIRON's separate trainer
+(`chiron_main.cpp` / `GpuTransformerWeights`) is unaffected — its
+own per-block 66M smoke ran to completion at `ema=10.4045` after
+the change.
+
+Then attempted flagship 1.84B (`--dmodel 2048 --layers 53 --heads 16
+--kv-heads 16 --dff 5632 --seq-len 256 --cache-mem-frac 0.05 --mp
+--adam-state-int8 --grad-bf16-phase2 --bf16-weights --ffn-mlp
+--grad-checkpoint --test-tokens 1`):
+
+- **CPU init bottleneck: GONE.** Init starts immediately, no swap-thrash.
+  We sailed past the previous 30-min stall and got into GPU allocation
+  within tens of seconds.
+- **New blocker: GPU peak at init.** 16 MB cudaMalloc fails after 7.7 GB
+  is already allocated. Per the trace, GPU init allocates per-layer FP32
+  weight masters (`W1+W2 = 11.5M+11.5M floats × 53 = 4.6 GB`; `Wq/Wk/Wv/Wo
+  = 4M × 4 × 53 = 3.4 GB`) **all simultaneously resident** during the
+  upload phase, before `freeFp32Masters()` retires them post-init. Combined
+  with bf16 mirrors + int8 Adam state + scratch, GPU peaks above the 16 GB
+  ceiling at init.
+
+### What this changes about the program
+
+- ✓ **Task #13 (1.84B flagship vs CHIRON head-to-head)** is now
+  unblocked from the CPU side. The remaining blocker is GPU peak at
+  init — a structurally different problem.
+- ✗ Stage 8b would need a per-layer init scheme: allocate FP32
+  master for layer N → upload → cast to bf16 mirror → free FP32 →
+  next layer. Currently `GpuTransformerWeights::allocate()` reserves
+  all per-layer buffers in one shot. Estimated work: 1-2 days
+  refactor of the allocate/upload sequence in `gpu_transformer_state.cu`.
+- ✓ The CHIRON 1.84B production path is unaffected by either issue
+  — CHIRON uses its own per-layer alloc cadence in `chiron_main.cpp`
+  that streams init.
+
+### Cumulative iteration findings
+
+After this iteration, the project has decisive empirical findings on
+five questions:
+
+| Question                                              | Answer                                  |
+|-------------------------------------------------------|-----------------------------------------|
+| Sophia (#55) at CHIRON 1.84B / 2.5k steps            | LOSES (-0.16 nat, +27% wall)            |
+| Local-attn (#6) at CHIRON 1.84B / 2.5k steps         | LOSES (-0.17 nat, +150% wall)            |
+| Sophia (#55) at CHIRON 1.84B / 5k steps (horizon)    | LOSES HARDER (-0.36 nat, +8% wall)      |
+| Flagship 1.84B CPU init bottleneck                    | FIXED (host Adam state alloc skipped)   |
+| Flagship 1.84B GPU init OOM                           | NEW BLOCKER (per-layer FP32 masters)    |
+
+The CHIRON-side flag-flip search is exhausted. The flagship-side
+unblock is now structural (GPU peak management at init), not
+algorithmic. Next iteration's choice is between:
+
+1. **Stage 8b** — per-layer GPU init for flagship (1-2 days);
+   unblocks the head-to-head test.
+2. **Pause on flagship** — accept that CHIRON 1.84B is the
+   working production config, focus on validating it against the
+   long-run baseline (NLL=9.18 multi-day) with the current
+   paradigm stack at fixed compute.
+
+Stage 8b is the path that delivers the user's "combine flagship
+and CHIRON" directive — without it, flagship-side wins (MLA #76,
+local-attn-with-sinks #78, GPU init port) cannot be measured at
+the 1.84B target scale.
