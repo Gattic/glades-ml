@@ -438,7 +438,8 @@ struct GpuTransformerWeights
 	              int mlaLatentDim = 0,
 	              bool adamStateInt8 = false,
 	              bool faceEmbedding = false,
-	              bool gradStorageBf16 = false);
+	              bool gradStorageBf16 = false,
+	              bool gradStorageBf16Phase2 = false);
 
 	// Free all GPU memory.
 	void free();

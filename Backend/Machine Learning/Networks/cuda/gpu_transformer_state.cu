@@ -84,7 +84,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
                                       int mlaLatentDim,
                                       bool adamStateInt8,
                                       bool faceEmbedding,
-                                      bool gradStorageBf16)
+                                      bool gradStorageBf16,
+                                      bool gradStorageBf16Phase2)
 {
 	free();
 	// int8 wins over bf16 if both flags accidentally set (it's the more
@@ -96,6 +97,19 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 	// instead of vTokE/v2TokE/vTokE_bf16/etc.
 	const bool useFaceTokE = faceEmbedding && tm && !skipAdamBufs;
 	const bool useBf16Grads = gradStorageBf16 && !skipAdamBufs;
+	// Phase-2: per-block W{q,k,v,o,1,2}, gWIn, gWOut FP32 grad buffers are
+	// retired (backward writes scratch+commit-bf16 directly).  Bias grads
+	// and gTokE keep their FP32 allocs (gTokE goes through Phase-1 cast
+	// path due to the bf16-scatter precision issue).
+	//
+	// 2026-05-09: alloc-gating disabled.  Smoke test with skipFp32GradBig=true
+	// produced +200 mnat NLL drift vs Phase-2 (with FP32 allocated).  Some
+	// read site of FP32 grads was missed in the audit; until isolated, keep
+	// the FP32 allocs alive (Phase-2 still works correctly with both buffers
+	// allocated; just no memory savings on those tensors yet).
+	const bool useBf16GradsPh2 = gradStorageBf16Phase2 && useBf16Grads;
+	(void)useBf16GradsPh2;
+	const bool skipFp32GradBig = false;  // disabled — see comment
 	const bool allocFpMV  = !skipAdamBufs && !useBf16 && !useInt8;
 	const bool allocBfMV  = useBf16;
 	const bool allocI8MV  = useInt8;
@@ -175,7 +189,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(vWInScale,   I8_SCALE_N(n_)))   return false;
 			if (!allocBuf(v2WInScale,  I8_SCALE_N(n_)))   return false;
 		}
-		if (!allocBuf(gWIn, (size_t)dm * is)) return false;
+		if (!skipFp32GradBig && !allocBuf(gWIn, (size_t)dm * is)) return false;
 		if (useBf16Grads && !allocBuf(gWIn_bf16, (size_t)dm * is)) return false;
 		if (!allocBuf(bIn, dm)) return false;
 		if (!skipAdamBufs && !allocBuf(mBIn, dm)) return false;
@@ -198,7 +212,7 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(vWOutScale,   I8_SCALE_N(n_)))   return false;
 			if (!allocBuf(v2WOutScale,  I8_SCALE_N(n_)))   return false;
 		}
-		if (!allocBuf(gWOut, (size_t)os * dm)) return false;
+		if (!skipFp32GradBig && !allocBuf(gWOut, (size_t)os * dm)) return false;
 		if (useBf16Grads && !allocBuf(gWOut_bf16, (size_t)os * dm)) return false;
 		if (!allocBuf(bOut, os)) return false;
 		if (!skipAdamBufs && !allocBuf(mBOut, os)) return false;
@@ -275,10 +289,10 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(b.v2WvScale,  I8_SCALE_N(nV))) return false;
 			if (!allocBuf(b.v2WoScale,  I8_SCALE_N(nO))) return false;
 		}
-		if (!allocBuf(b.gWq, (size_t)dm * dm)) return false;
-		if (!allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
-		if (!allocBuf(b.gWo, (size_t)dm * dm)) return false;
+		if (!skipFp32GradBig && !allocBuf(b.gWq, (size_t)dm * dm)) return false;
+		if (!skipFp32GradBig && !allocBuf(b.gWk, (size_t)dm * dModelKV)) return false;
+		if (!skipFp32GradBig && !allocBuf(b.gWv, (size_t)dm * dModelKV)) return false;
+		if (!skipFp32GradBig && !allocBuf(b.gWo, (size_t)dm * dm)) return false;
 		if (useBf16Grads) {
 			if (!allocBuf(b.gWq_bf16, (size_t)dm * dm)) return false;
 			if (!allocBuf(b.gWk_bf16, (size_t)dm * dModelKV)) return false;
@@ -363,8 +377,8 @@ bool GpuTransformerWeights::allocate(unsigned int dm, unsigned int df, unsigned 
 			if (!allocBuf(b.v2W1Scale,  I8_SCALE_N(n1))) return false;
 			if (!allocBuf(b.v2W2Scale,  I8_SCALE_N(n2))) return false;
 		}
-		if (!allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
-		if (!allocBuf(b.gW2, (size_t)dm * df)) return false;
+		if (!skipFp32GradBig && !allocBuf(b.gW1, (size_t)ff1Width * dm)) return false;
+		if (!skipFp32GradBig && !allocBuf(b.gW2, (size_t)dm * df)) return false;
 		if (useBf16Grads) {
 			if (!allocBuf(b.gW1_bf16, (size_t)ff1Width * dm)) return false;
 			if (!allocBuf(b.gW2_bf16, (size_t)dm * df)) return false;

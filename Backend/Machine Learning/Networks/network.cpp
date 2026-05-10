@@ -4615,12 +4615,16 @@ bool glades::NNetwork::ensureGpuState()
 			const bool useBf16Grads =
 			    trainingConfig.mixedPrecision.gradStorageBf16
 			    && (trainingConfig.optimizer.type == glades::OptimizerConfig::ADAMW);
+			const bool useBf16GradsPh2 =
+			    trainingConfig.mixedPrecision.gradStorageBf16Phase2
+			    && useBf16Grads;
 			if (!gpuTransformerWeights->allocate(ts.dModel, ts.dFF, ts.nHeads, ts.nKVHeads,
 			                                      ts.nLayers, ts.vocabSize, ts.inputSize,
 			                                      ts.outSize, ts.ffnKind, ts.tokenModel,
 			                                      ts.tieEmbeddings, skipAdam, useBf16State,
 			                                      trainingConfig.transformer.mlaLatentDim,
-			                                      useInt8State, useFaceEmb, useBf16Grads))
+			                                      useInt8State, useFaceEmb, useBf16Grads,
+			                                      useBf16GradsPh2))
 			{
 				return false;
 			}
