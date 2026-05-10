@@ -1670,6 +1670,61 @@ bool adam_update_int8_state_bf16grad(float* param, const uint16_t* grad_bf16,
 	                              weightDecay, gradScale, step, n);
 }
 
+// BF16-WEIGHT variants — wrapper kernels for CHIRON-style --bf16-weights mode.
+// param is a bf16 buffer (no FP32 master).  Per Adam step:
+//   1. cast bf16(param) -> weight_scratch_fp32
+//   2. existing adam kernel mutates weight_scratch_fp32 in place
+//   3. cast weight_scratch_fp32 -> bf16(param) with stochastic rounding
+//        (seed = srBaseSeed XOR (srStepIdx * 0x9E3779B1))
+// Caller supplies stochastic-round seed + step counter so per-(model,step,
+// tensor) randomness is deterministic and reproducible.
+
+bool adam_update_bf16_state_bf16grad_bf16w(uint16_t* param_bf16,
+                                            float* weight_scratch_fp32,
+                                            const uint16_t* grad_bf16,
+                                            uint16_t* m_bf16, uint16_t* v_bf16,
+                                            float lr, float beta1, float beta2, float eps,
+                                            float weightDecay, float gradScale,
+                                            int step, int n,
+                                            uint32_t srBaseSeed, uint32_t srStepIdx)
+{
+	if (n <= 0) return true;
+	if (param_bf16 == 0 || weight_scratch_fp32 == 0 || grad_bf16 == 0) return false;
+	if (!cast_bf16_to_f32(param_bf16, weight_scratch_fp32, (size_t)n)) return false;
+	if (!adam_update_bf16_state_bf16grad(weight_scratch_fp32, grad_bf16,
+	                                     m_bf16, v_bf16,
+	                                     lr, beta1, beta2, eps,
+	                                     weightDecay, gradScale, step, n))
+		return false;
+	return cast_f32_to_bf16_stochastic(weight_scratch_fp32, param_bf16, (size_t)n,
+	                                    srBaseSeed, srStepIdx);
+}
+
+bool adam_update_int8_state_bf16grad_bf16w(uint16_t* param_bf16,
+                                            float* weight_scratch_fp32,
+                                            const uint16_t* grad_bf16,
+                                            int8_t* m_int8, uint8_t* v_uint8,
+                                            float* m_scale, float* v_scale,
+                                            float* grad_scratch_fp32,
+                                            float lr, float beta1, float beta2, float eps,
+                                            float weightDecay, float gradScale,
+                                            int step, int n,
+                                            uint32_t srBaseSeed, uint32_t srStepIdx)
+{
+	if (n <= 0) return true;
+	if (param_bf16 == 0 || weight_scratch_fp32 == 0 || grad_bf16 == 0) return false;
+	if (grad_scratch_fp32 == 0) return false;
+	if (!cast_bf16_to_f32(param_bf16, weight_scratch_fp32, (size_t)n)) return false;
+	if (!adam_update_int8_state_bf16grad(weight_scratch_fp32, grad_bf16,
+	                                     m_int8, v_uint8, m_scale, v_scale,
+	                                     grad_scratch_fp32,
+	                                     lr, beta1, beta2, eps,
+	                                     weightDecay, gradScale, step, n))
+		return false;
+	return cast_f32_to_bf16_stochastic(weight_scratch_fp32, param_bf16, (size_t)n,
+	                                    srBaseSeed, srStepIdx);
+}
+
 // Number of scale blocks (one FP32 scale per block of ADAM_INT8_BS params).
 int adam_int8_scale_count(int n)
 {
