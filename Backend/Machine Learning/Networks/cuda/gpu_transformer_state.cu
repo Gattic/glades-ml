@@ -1081,6 +1081,55 @@ bool zeroTransformerGradients(GpuTransformerWeights& gpu)
 	return zero_buffers_batch(d_ptrs, d_sizes, count);
 }
 
+bool zeroTransformerGradientsBf16(GpuTransformerWeights& gpu)
+{
+	if (!gpu.initialized) return false;
+	// Phase-2: zero only the BF16 grad mirrors that exist (allocated when
+	// MixedPrecisionConfig::gradStorageBf16=true).  bf16 element is 2 bytes;
+	// cudaMemset of 0 yields exact bf16 zero (sign=0, exp=0, mant=0).
+	if (gpu.gTokE_bf16.allocated())
+		cudaMemset(gpu.gTokE_bf16.data(), 0,
+		    gpu.gTokE_bf16.size() * sizeof(uint16_t));
+	if (gpu.gWIn_bf16.allocated())
+		cudaMemset(gpu.gWIn_bf16.data(), 0,
+		    gpu.gWIn_bf16.size() * sizeof(uint16_t));
+	if (gpu.gWOut_bf16.allocated())
+		cudaMemset(gpu.gWOut_bf16.data(), 0,
+		    gpu.gWOut_bf16.size() * sizeof(uint16_t));
+	for (unsigned int l = 0; l < gpu.nLayers; ++l)
+	{
+		GpuTransformerWeights::Block& b = gpu.blocks[l];
+		if (b.gWq_bf16.allocated())
+			cudaMemset(b.gWq_bf16.data(), 0,
+			    b.gWq_bf16.size() * sizeof(uint16_t));
+		if (b.gWk_bf16.allocated())
+			cudaMemset(b.gWk_bf16.data(), 0,
+			    b.gWk_bf16.size() * sizeof(uint16_t));
+		if (b.gWv_bf16.allocated())
+			cudaMemset(b.gWv_bf16.data(), 0,
+			    b.gWv_bf16.size() * sizeof(uint16_t));
+		if (b.gWo_bf16.allocated())
+			cudaMemset(b.gWo_bf16.data(), 0,
+			    b.gWo_bf16.size() * sizeof(uint16_t));
+		if (b.gW1_bf16.allocated())
+			cudaMemset(b.gW1_bf16.data(), 0,
+			    b.gW1_bf16.size() * sizeof(uint16_t));
+		if (b.gW2_bf16.allocated())
+			cudaMemset(b.gW2_bf16.data(), 0,
+			    b.gW2_bf16.size() * sizeof(uint16_t));
+		if (b.gWdkv_bf16.allocated())
+			cudaMemset(b.gWdkv_bf16.data(), 0,
+			    b.gWdkv_bf16.size() * sizeof(uint16_t));
+		if (b.gWuk_bf16.allocated())
+			cudaMemset(b.gWuk_bf16.data(), 0,
+			    b.gWuk_bf16.size() * sizeof(uint16_t));
+		if (b.gWuv_bf16.allocated())
+			cudaMemset(b.gWuv_bf16.data(), 0,
+			    b.gWuv_bf16.size() * sizeof(uint16_t));
+	}
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

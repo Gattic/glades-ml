@@ -10439,8 +10439,14 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 		if (seqInBatch == 0u)
 		{
 			gpu::zeroTransformerGradients(*gpuTransformerWeights);
+			// Phase-2: bf16 mirrors are the cumulative grad store, so they
+			// must start each Adam window at zero (bf16_accum_axpy with
+			// beta=1 accumulates into them across micro-batches and layers).
+			if (trainingConfig.mixedPrecision.gradStorageBf16Phase2)
+				gpu::zeroTransformerGradientsBf16(*gpuTransformerWeights);
 			timeStepsInBatch = 0u;
 		}
+		const bool useBf16GradsPh2_ = trainingConfig.mixedPrecision.gradStorageBf16Phase2;
 		glades::gpu::ScopedPerfTimerMs gpuBackwardStage(gpuPerf ? &gpuPerf->msBackward : NULL);
 
 		// Compute dLogits on GPU.
@@ -10500,6 +10506,10 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
 
 			// gTokE += dLogits^T * hPostFinalLN  [vocabSize, dModel]
+			// Note: Phase-2 (gradStorageBf16Phase2) does NOT route this through
+			// scratch+commit because gTokE has a second writer
+			// (embedding_scatter_add a few hundred lines down) which still
+			// targets FP32.  Phase-2 is currently scoped to per-block weights.
 			gpu_gemm_atb_mp(bf16Head,
 			    static_cast<int>(vocabSize), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
 			    gpuTransformerScratch->dLogits.data(),
@@ -10550,6 +10560,7 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    0.0f, gpuTransformerScratch->dH.data(), static_cast<int>(dModel));
 
 			// gWOut += dLogits^T * hPostFinalLN  [outSize, dModel]
+			// Phase-2 scoped to per-block weights only (see gTokE comment above).
 			gpu_gemm_atb_mp(bf16Head,
 			    static_cast<int>(outSize), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
 			    gpuTransformerScratch->dLogits.data(),
@@ -10627,13 +10638,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
 			    gb.W2.data(), gb.W2Lowp.data(), static_cast<int>(dFF),
 			    0.0f, gpuTransformerScratch->dFF1Act.data(), static_cast<int>(dFF));
-			gpu_gemm_atb_mp(bf16W2,
-			    static_cast<int>(dModel), static_cast<int>(dFF), static_cast<int>(T), 1.0f,
-			    gpuTransformerScratch->dH.data(),
-			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-			    ff1Act_l,
-			    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dFF),
-			    1.0f, gb.gW2.data(), static_cast<int>(dFF));
+			{
+				float* gradOut = useBf16GradsPh2_
+				    ? gpuTransformerScratch->gradScratchFp32.data()
+				    : gb.gW2.data();
+				const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+				gpu_gemm_atb_mp(bf16W2,
+				    static_cast<int>(dModel), static_cast<int>(dFF), static_cast<int>(T), 1.0f,
+				    gpuTransformerScratch->dH.data(),
+				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+				    ff1Act_l,
+				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dFF),
+				    gemmBeta, gradOut, static_cast<int>(dFF));
+				if (useBf16GradsPh2_)
+					gpu::bf16_accum_axpy(gb.gW2_bf16.data(),
+					    gpuTransformerScratch->gradScratchFp32.data(),
+					    1.0f, 1.0f, gb.gW2.size());
+			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dFF),
 			                        gb.echoW2,
 			                        gpuTransformerScratch->dH.data(), ff1Act_l,
@@ -10658,13 +10679,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(ff1Width),
 				    gb.W1.data(), gb.W1Lowp.data(), static_cast<int>(dModel),
 				    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
-				gpu_gemm_atb_mp(bf16W1,
-				    static_cast<int>(ff1Width), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
-				    gpuTransformerScratch->dFF1Cat.data(),
-				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(ff1Width),
-				    x2_l,
-				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
-				    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+				{
+					float* gradOut = useBf16GradsPh2_
+					    ? gpuTransformerScratch->gradScratchFp32.data()
+					    : gb.gW1.data();
+					const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+					gpu_gemm_atb_mp(bf16W1,
+					    static_cast<int>(ff1Width), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
+					    gpuTransformerScratch->dFF1Cat.data(),
+					    gpuTransformerScratch->activationLowp.data(), static_cast<int>(ff1Width),
+					    x2_l,
+					    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
+					    gemmBeta, gradOut, static_cast<int>(dModel));
+					if (useBf16GradsPh2_)
+						gpu::bf16_accum_axpy(gb.gW1_bf16.data(),
+						    gpuTransformerScratch->gradScratchFp32.data(),
+						    1.0f, 1.0f, gb.gW1.size());
+				}
 				GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, ff1Width, dModel),
 				                        gb.echoW1,
 				                        gpuTransformerScratch->dFF1Cat.data(), x2_l,
@@ -10698,13 +10729,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
 				    gb.W1.data(), gb.W1Lowp.data(), static_cast<int>(dModel),
 				    0.0f, gpuTransformerScratch->dX2.data(), static_cast<int>(dModel));
-				gpu_gemm_atb_mp(bf16W1,
-				    static_cast<int>(dFF), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
-				    gpuTransformerScratch->dFF1Act.data(),
-				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
-				    x2_l,
-				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
-				    1.0f, gb.gW1.data(), static_cast<int>(dModel));
+				{
+					float* gradOut = useBf16GradsPh2_
+					    ? gpuTransformerScratch->gradScratchFp32.data()
+					    : gb.gW1.data();
+					const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+					gpu_gemm_atb_mp(bf16W1,
+					    static_cast<int>(dFF), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
+					    gpuTransformerScratch->dFF1Act.data(),
+					    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dFF),
+					    x2_l,
+					    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
+					    gemmBeta, gradOut, static_cast<int>(dModel));
+					if (useBf16GradsPh2_)
+						gpu::bf16_accum_axpy(gb.gW1_bf16.data(),
+						    gpuTransformerScratch->gradScratchFp32.data(),
+						    1.0f, 1.0f, gb.gW1.size());
+				}
 				GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dFF, dModel),
 				                        gb.echoW1,
 				                        gpuTransformerScratch->dFF1Act.data(), x2_l,
@@ -10751,13 +10792,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
 			    gb.Wo.data(), gb.WoLowp.data(), static_cast<int>(dModel),
 			    0.0f, gpuTransformerScratch->dAttnConcat.data(), static_cast<int>(dModel));
-			gpu_gemm_atb_mp(bf16Wo,
-			    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
-			    gpuTransformerScratch->dH2.data(),
-			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-			    attnConcat_l,
-			    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
-			    1.0f, gb.gWo.data(), static_cast<int>(dModel));
+			{
+				float* gradOut = useBf16GradsPh2_
+				    ? gpuTransformerScratch->gradScratchFp32.data()
+				    : gb.gWo.data();
+				const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+				gpu_gemm_atb_mp(bf16Wo,
+				    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
+				    gpuTransformerScratch->dH2.data(),
+				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+				    attnConcat_l,
+				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
+				    gemmBeta, gradOut, static_cast<int>(dModel));
+				if (useBf16GradsPh2_)
+					gpu::bf16_accum_axpy(gb.gWo_bf16.data(),
+					    gpuTransformerScratch->gradScratchFp32.data(),
+					    1.0f, 1.0f, gb.gWo.size());
+			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dModel),
 			                        gb.echoWo,
 			                        gpuTransformerScratch->dH2.data(), attnConcat_l,
@@ -10904,13 +10955,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
 			    gb.Wq.data(), gb.WqLowp.data(), static_cast<int>(dModel),
 			    0.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
-			gpu_gemm_atb_mp(bf16Wq,
-			    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
-			    gpuTransformerScratch->dQfull.data(),
-			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
-			    x1_l,
-			    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
-			    1.0f, gb.gWq.data(), static_cast<int>(dModel));
+			{
+				float* gradOut = useBf16GradsPh2_
+				    ? gpuTransformerScratch->gradScratchFp32.data()
+				    : gb.gWq.data();
+				const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+				gpu_gemm_atb_mp(bf16Wq,
+				    static_cast<int>(dModel), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
+				    gpuTransformerScratch->dQfull.data(),
+				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModel),
+				    x1_l,
+				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
+				    gemmBeta, gradOut, static_cast<int>(dModel));
+				if (useBf16GradsPh2_)
+					gpu::bf16_accum_axpy(gb.gWq_bf16.data(),
+					    gpuTransformerScratch->gradScratchFp32.data(),
+					    1.0f, 1.0f, gb.gWq.size());
+			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModel, dModel),
 			                        gb.echoWq,
 			                        gpuTransformerScratch->dQfull.data(), x1_l,
@@ -10970,13 +11031,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModelKV),
 			    gb.Wk.data(), gb.WkLowp.data(), static_cast<int>(dModel),
 			    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
-			gpu_gemm_atb_mp(bf16Wk,
-			    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
-			    gpuTransformerScratch->dKfull.data(),
-			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModelKV),
-			    x1_l,
-			    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
-			    1.0f, gb.gWk.data(), static_cast<int>(dModel));
+			{
+				float* gradOut = useBf16GradsPh2_
+				    ? gpuTransformerScratch->gradScratchFp32.data()
+				    : gb.gWk.data();
+				const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+				gpu_gemm_atb_mp(bf16Wk,
+				    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
+				    gpuTransformerScratch->dKfull.data(),
+				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModelKV),
+				    x1_l,
+				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
+				    gemmBeta, gradOut, static_cast<int>(dModel));
+				if (useBf16GradsPh2_)
+					gpu::bf16_accum_axpy(gb.gWk_bf16.data(),
+					    gpuTransformerScratch->gradScratchFp32.data(),
+					    1.0f, 1.0f, gb.gWk.size());
+			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
 			                        gb.echoWk,
 			                        gpuTransformerScratch->dKfull.data(), x1_l,
@@ -10993,13 +11064,23 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModelKV),
 			    gb.Wv.data(), gb.WvLowp.data(), static_cast<int>(dModel),
 			    1.0f, gpuTransformerScratch->dX1.data(), static_cast<int>(dModel));
-			gpu_gemm_atb_mp(bf16Wv,
-			    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
-			    gpuTransformerScratch->dVfull.data(),
-			    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModelKV),
-			    x1_l,
-			    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
-			    1.0f, gb.gWv.data(), static_cast<int>(dModel));
+			{
+				float* gradOut = useBf16GradsPh2_
+				    ? gpuTransformerScratch->gradScratchFp32.data()
+				    : gb.gWv.data();
+				const float gemmBeta = useBf16GradsPh2_ ? 0.0f : 1.0f;
+				gpu_gemm_atb_mp(bf16Wv,
+				    static_cast<int>(dModelKV), static_cast<int>(dModel), static_cast<int>(T), 1.0f,
+				    gpuTransformerScratch->dVfull.data(),
+				    gpuTransformerScratch->activationLowp.data(), static_cast<int>(dModelKV),
+				    x1_l,
+				    gpuTransformerScratch->activationLowp2.data(), static_cast<int>(dModel),
+				    gemmBeta, gradOut, static_cast<int>(dModel));
+				if (useBf16GradsPh2_)
+					gpu::bf16_accum_axpy(gb.gWv_bf16.data(),
+					    gpuTransformerScratch->gradScratchFp32.data(),
+					    1.0f, 1.0f, gb.gWv.size());
+			}
 			GLADES_ECHO_GPU_OBSERVE(echo_scope_uses_decoder_matrix(trainingConfig.atlas, static_cast<unsigned int>(li), nLayers, dModelKV, dModel),
 			                        gb.echoWv,
 			                        gpuTransformerScratch->dVfull.data(), x1_l,
@@ -11181,12 +11262,24 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				for (unsigned int gli = 0; gli < nLayers; ++gli)
 				{
 					gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[gli];
-					gpu::sum_squared_accumulate(gb.gWq.data(), static_cast<int>(gb.gWq.size()), gpuTransformerScratch->lossSum.data());
-					gpu::sum_squared_accumulate(gb.gWk.data(), static_cast<int>(gb.gWk.size()), gpuTransformerScratch->lossSum.data());
-					gpu::sum_squared_accumulate(gb.gWv.data(), static_cast<int>(gb.gWv.size()), gpuTransformerScratch->lossSum.data());
-					gpu::sum_squared_accumulate(gb.gWo.data(), static_cast<int>(gb.gWo.size()), gpuTransformerScratch->lossSum.data());
-					gpu::sum_squared_accumulate(gb.gW1.data(), static_cast<int>(gb.gW1.size()), gpuTransformerScratch->lossSum.data());
-					gpu::sum_squared_accumulate(gb.gW2.data(), static_cast<int>(gb.gW2.size()), gpuTransformerScratch->lossSum.data());
+					if (useBf16GradsPh2_)
+					{
+						gpu::sum_squared_accumulate_bf16(gb.gWq_bf16.data(), static_cast<int>(gb.gWq.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gWk_bf16.data(), static_cast<int>(gb.gWk.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gWv_bf16.data(), static_cast<int>(gb.gWv.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gWo_bf16.data(), static_cast<int>(gb.gWo.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gW1_bf16.data(), static_cast<int>(gb.gW1.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate_bf16(gb.gW2_bf16.data(), static_cast<int>(gb.gW2.size()), gpuTransformerScratch->lossSum.data());
+					}
+					else
+					{
+						gpu::sum_squared_accumulate(gb.gWq.data(), static_cast<int>(gb.gWq.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate(gb.gWk.data(), static_cast<int>(gb.gWk.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate(gb.gWv.data(), static_cast<int>(gb.gWv.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate(gb.gWo.data(), static_cast<int>(gb.gWo.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate(gb.gW1.data(), static_cast<int>(gb.gW1.size()), gpuTransformerScratch->lossSum.data());
+						gpu::sum_squared_accumulate(gb.gW2.data(), static_cast<int>(gb.gW2.size()), gpuTransformerScratch->lossSum.data());
+					}
 					gpu::sum_squared_accumulate(gb.gBq.data(), static_cast<int>(gb.gBq.size()), gpuTransformerScratch->lossSum.data());
 					gpu::sum_squared_accumulate(gb.gBk.data(), static_cast<int>(gb.gBk.size()), gpuTransformerScratch->lossSum.data());
 					gpu::sum_squared_accumulate(gb.gBv.data(), static_cast<int>(gb.gBv.size()), gpuTransformerScratch->lossSum.data());
@@ -12314,6 +12407,16 @@ if (ad_.valid) { \
 				// exist (kept for grad-norm + clip + this cast); freeing them
 				// is the next phase of memory work — see
 				// research/PATH_TO_1.84B_FLAGSHIP.md §1.
+				//
+				// Phase-2 (gradStorageBf16Phase2): per-block weight grads are
+				// already committed to BF16 mirrors directly by backward via
+				// scratch+commit; skip those casts here (they would overwrite
+				// the correct Phase-2 values with zeros from the unwritten FP32
+				// grad buffer).  Globals (gTokE, gWIn, gWOut) still go through
+				// FP32 path for now since they have non-GEMM writers
+				// (embedding_scatter_add) that would need their own bf16 variants.
+				const bool useBf16GradsPh2_castSite =
+				    trainingConfig.mixedPrecision.gradStorageBf16Phase2;
 				if (useBf16Grads_)
 				{
 					if (tokenLM)
@@ -12331,15 +12434,18 @@ if (ad_.valid) { \
 						                     gpuTransformerWeights->gWOut_bf16.data(),
 						                     gpuTransformerWeights->gWOut.size());
 					}
-					for (unsigned int bli = 0; bli < nLayers; ++bli)
+					if (!useBf16GradsPh2_castSite)
 					{
-						gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
-						gpu::cast_f32_to_bf16(gb.gWq.data(), gb.gWq_bf16.data(), gb.gWq.size());
-						gpu::cast_f32_to_bf16(gb.gWk.data(), gb.gWk_bf16.data(), gb.gWk.size());
-						gpu::cast_f32_to_bf16(gb.gWv.data(), gb.gWv_bf16.data(), gb.gWv.size());
-						gpu::cast_f32_to_bf16(gb.gWo.data(), gb.gWo_bf16.data(), gb.gWo.size());
-						gpu::cast_f32_to_bf16(gb.gW1.data(), gb.gW1_bf16.data(), gb.gW1.size());
-						gpu::cast_f32_to_bf16(gb.gW2.data(), gb.gW2_bf16.data(), gb.gW2.size());
+						for (unsigned int bli = 0; bli < nLayers; ++bli)
+						{
+							gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[bli];
+							gpu::cast_f32_to_bf16(gb.gWq.data(), gb.gWq_bf16.data(), gb.gWq.size());
+							gpu::cast_f32_to_bf16(gb.gWk.data(), gb.gWk_bf16.data(), gb.gWk.size());
+							gpu::cast_f32_to_bf16(gb.gWv.data(), gb.gWv_bf16.data(), gb.gWv.size());
+							gpu::cast_f32_to_bf16(gb.gWo.data(), gb.gWo_bf16.data(), gb.gWo.size());
+							gpu::cast_f32_to_bf16(gb.gW1.data(), gb.gW1_bf16.data(), gb.gW1.size());
+							gpu::cast_f32_to_bf16(gb.gW2.data(), gb.gW2_bf16.data(), gb.gW2.size());
+						}
 					}
 				}
 #define GLADES_BF16_ADAM_BIG(W, gW, vBf, v2Bf, baseLr_, wd_) do { \

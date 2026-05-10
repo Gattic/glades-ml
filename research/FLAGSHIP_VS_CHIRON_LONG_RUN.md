@@ -386,6 +386,43 @@ track tightly.  Phase-1 cleared the validation-plan target (≤ 0.005 nat
 over 1000 steps; observed ≤ 3e-4 over 500 steps with no divergence
 trend).  The path is safe to use on production runs.
 
+### BF16-grad Phase-2 — per-block backward refactor (2026-05-09)
+
+Phase-2 routes the 6 per-block weight-grad backward GEMMs (Wq/Wk/Wv/Wo/W1/W2)
+through one shared FP32 scratch, then `bf16_accum_axpy` commits each result
+into the persistent BF16 mirror.  The Phase-1 cast pass for those tensors
+becomes a no-op; the global tensors (gTokE/gWIn/gWOut) still take the
+Phase-1 cast path because they have non-GEMM writers (e.g.
+`embedding_scatter_add`) that would need their own bf16 variants.
+Grad-norm switches to `sum_squared_accumulate_bf16` for the same 6 tensors.
+BF16 mirrors are zeroed at start of each Adam window via the new
+`zeroTransformerGradientsBf16` helper.
+
+Phase-2 NLL parity (165M, T=1024, 64K tokens, 62 steps,
+`--face-embedding --adam-state-int8 --grad-bf16-phase2 --ffn-mlp`):
+
+| Variant                  | Final epoch loss | NLL @ seq 63 | gradNorm | Tok/s |
+|--------------------------|----------------:|-------------:|---------:|------:|
+| Baseline (FP32 grads)    |       10.618756 |       10.6178 |  0.293695 | 17,286 |
+| `--grad-bf16` (Phase-1)  |       10.618745 |       10.6178 |  0.292141 | 17,352 |
+| `--grad-bf16-phase2`     |       10.618868 |       10.6179 |  0.292942 | 17,142 |
+| Δ Phase-2 vs baseline    |      +1.1e-4 nat |   ≤ 1e-4 nat | -7.5e-4   | -0.8% |
+
+Phase-2 is operating correctly.  Δ = +1.1e-4 nat matches Phase-1's
+round-off floor; throughput cost is 0.8% (the extra `bf16_accum_axpy`
+launches per backward GEMM).
+
+### Phase-2 scope and Phase-3 outlook
+
+Phase-2 currently handles the **6 per-block weights** (Wq/Wk/Wv/Wo/W1/W2)
+in `--grad-bf16-phase2` mode.  At 1.84B these are ~93% of the trainable
+weights.  The 3 global tensors (gTokE/gWIn/gWOut) still need their own
+bf16-emit variants of `embedding_scatter_add` and the LM-head GEMM before
+Phase-2 can cover them — that's Phase-3 work.  After Phase-3 we can drop
+the FP32 grad allocations (the `if (!useBf16Grads)` gate in
+`gpu_transformer_state.cu::allocate()`) and finally bank the projected
+~3.65 GB at 1.84B.
+
 ## Conclusions and next steps
 
 1. **Flagship cannot reach 1.84B on 16 GB** without the optimizer-side

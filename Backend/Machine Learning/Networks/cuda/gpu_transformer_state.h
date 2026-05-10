@@ -643,6 +643,11 @@ bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
 // Zero all gradient buffers on GPU.
 bool zeroTransformerGradients(GpuTransformerWeights& gpu);
 
+// Zero only the BF16 grad mirrors (used in BF16-grad Phase-2: backward
+// commits straight to bf16 with beta=1, so the mirrors must start each
+// Adam step at zero).  No-op if no BF16 mirrors are allocated.
+bool zeroTransformerGradientsBf16(GpuTransformerWeights& gpu);
+
 } // namespace gpu
 } // namespace glades
 

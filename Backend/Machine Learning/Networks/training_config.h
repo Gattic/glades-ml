@@ -1658,6 +1658,16 @@ struct MixedPrecisionConfig
 	// GPU.  Ported from CHIRON's BF16-grads path (paradigm-stack at ≥500M).
 	bool gradStorageBf16;
 
+	// Phase-2 of BF16 grad storage: backward GEMMs commit DIRECTLY to the BF16
+	// mirrors via a single shared FP32 scratch buffer; the Phase-1 cast pass
+	// (FP32 grad -> BF16 mirror) is skipped; grad-norm reads BF16 mirrors.
+	// Implies gradStorageBf16=true.  Mutually exclusive with non-compressed
+	// Adam paths (full Adam batch, atlas/geode/muon) — those still want FP32
+	// grads.  When phase2 active, the FP32 grad buffers are still allocated
+	// (other code paths reference them) but never written to by backward;
+	// retiring those allocations is a follow-on memory-cleanup task.
+	bool gradStorageBf16Phase2;
+
 	// Loss scaling:
 	// - If enable==true and useLossScaling==true, backprop deltas are multiplied by lossScale
 	//   and the optimizer divides gradients by lossScale before applying updates.
@@ -1678,6 +1688,7 @@ struct MixedPrecisionConfig
 	      adamStateBf16(false),
 	      adamStateInt8(false),
 	      gradStorageBf16(false),
+	      gradStorageBf16Phase2(false),
 	      useLossScaling(true),
 	      dynamicLossScaling(true),
 	      lossScaleInit(1024.0f),
