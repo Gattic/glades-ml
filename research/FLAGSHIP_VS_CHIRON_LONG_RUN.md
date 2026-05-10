@@ -780,3 +780,69 @@ Combined with `--grad-bf16-phase2` (~3 GB) + `--bf16-weights` (~4 GB
 once FP32 master is retired), total savings would push 1.84B from
 the current ~16 GB ceiling well below 13 GB — meeting the head-to-head
 target.
+
+---
+
+## 2026-05-10 update — Phase-2 retire fix + Stage 6 launch
+
+### Phase-2 retire null-grad bug FIXED (commit `bb02be510`)
+
+Root cause: the batched FP32 Adam dispatch
+(`transformerGpuTrainEpoch` lines ~12544/12573/12618) used the WEIGHT
+buffer's size to gate group inclusion (`gb.Wq.size()`, `gWIn.size()`,
+`gWOut.size()`) but passed the GRAD buffer's pointer as the grad source
+(`gb.gWq.data()`, `gWIn.data()`, `gWOut.data()`).
+
+Under Phase-2 retire (default for `--grad-bf16-phase2` /
+`--bf16-weights`), the FP32 grad buffers `gb.gW{q,k,v,o,1,2}` + `gWIn`
++ `gWOut` are NOT allocated.  `gb.gWq.size() == 0` and
+`gb.gWq.data() == NULL` — but `gb.Wq.size()` stays positive.  So the
+gate registered an Adam group with NULL grad pointer; the batched
+Adam kernel later dereferenced NULL and triggered illegal memory
+access.  The error surfaced via the next CUDA sync
+(`cast_f32_to_bf16` line 4634) as the misleading
+"failed to download transformer GPU weights" status.
+
+The per-tensor bf16-grad Adam path
+(`GLADES_BF16_ADAM_BIG_BF16GRAD`) is the correct dispatch for these
+tensors under Phase-2 — it reads `gb.gWq_bf16` (always allocated when
+`useBf16Grads`).  The batched FP32 dispatch should simply skip them.
+
+Fix: change the size check to use the GRAD buffer's size (zero when
+retired) instead of the weight's.  When retire is off, sizes match
+and behavior is identical.
+
+Smoke validation (L=8 / dModel=384 / T=256, 16 sequences, 4000 tokens):
+
+| Config                                | Final NLL  | Δ vs baseline |
+|---------------------------------------|-----------:|--------------:|
+| baseline (no flag)                    | 10.4465    | —             |
+| `--grad-bf16-phase2` (BEFORE)         | CRASH      | —             |
+| `--grad-bf16-phase2` (AFTER)          | 10.4468    | +3e-4 nat     |
+| `--grad-bf16-phase2 --grad-checkpoint`| 10.4468    | +3e-4 nat     |
+| `--bf16-weights` (BEFORE)             | NLL → -1e14| —             |
+| `--bf16-weights` (AFTER)              | 10.4469    | +4e-4 nat     |
+
+All four savings configurations now functional; composition verified.
+
+### Stage 6 launched: 1.84B with all savings (background)
+
+Launched 1.84B run with:
+```
+--dmodel 2048 --layers 48 --heads 16 --dff 5632 --seq-len 512
+--bf16-weights         (implies grad-bf16-phase2, FP32 grad+weight master retired)
+--grad-checkpoint       (sqrt-L activation slots; K=⌈√48⌉=7)
+--adam-state-int8       (int8 Adam state — paradigm #11 MFIO port)
+```
+
+Expected savings vs baseline 1.84B:
+- bf16-weights: ~4 GB FP32 weight master retired (per-block + WIn/WOut)
+- grad-bf16-phase2: ~3 GB FP32 grad retired (per-block + WIn/WOut)
+- grad-checkpoint: ~3.6 GB activation slots (4.2 GB → 0.6 GB)
+- adam-state-int8: ~10 GB FP32 Adam state → ~2.5 GB int8
+
+Total potential savings: ~20 GB headroom on top of the 16 GB ceiling.
+Should fit comfortably with substantial margin.
+
+Monitoring run via Monitor tool; results will be appended once the
+training reports first NLL or fails.
