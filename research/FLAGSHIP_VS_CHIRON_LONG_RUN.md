@@ -1156,3 +1156,144 @@ target either:
 - ✓ Clean negative result on Sophia-at-warmup adds to the unified
   research log (the bar for paradigm-promotion is empirical, and
   Sophia did not clear it at this scale and step budget).
+
+## 2026-05-10 update — Local-attention (paradigm shift #6) at CHIRON 1.84B
+
+### What was tried
+
+CHIRON already exposes `--local-attn W` (auto-enables `--flash-attn`)
+implementing local-window attention from paradigm shift #6 (each query
+attends to ±W tokens). The existing CHIRON 1.84B preset runs with
+W=0 (full attention via tiled-bf16 kernel). One-line edit added
+`LOCAL_ATTN` env-var support to the `chiron` mode of `run.sh` (it had
+only been wired into the legacy pile mode).
+
+Per the run.sh comment: "Validated at chiron_train with 5.2-38.1×
+speedup at T=2k-16k and ~identical loss at W>=256." We tested at
+T=1024 (the 1.84B-preset's max T), where the headline claim suggests
+~3-4× attention speedup at W=256.
+
+Identical config to the Adam baseline above, plus `--local-attn 256`.
+
+### Result — slower at every regime, NLL parity early then trails late
+
+| Phase                         | Steps      | Adam wall | Local-attn wall | Slowdown |
+|-------------------------------|------------|----------:|----------------:|---------:|
+| T=256 / L=8                   | 0-1000     |    42.2s  |          75.6s  | **+79%** |
+| T=512 / L=26                  | 1000-1500  |    45.4s  |          95.6s  | +110%    |
+| T=1024 / L=53                 | 1500-2500  |   189.6s  |         515.0s  | **+172%**|
+| **Total** (compute, no ckpt)  | 0-2500     |   277.2s  |         686.2s  | **+148%**|
+| **Total** (incl. ckpts)       | 0-2500     |   283.4s  |         707.1s  | **+150%**|
+| Final EMA NLL                 |            |   9.5261  |         9.6977  | **+0.171 nat** |
+| Best NLL (achieved @ step)    |    1287    |   6.7062  |         6.7060  | -0.0002  |
+
+Per-step EMA tracking — note exact-equality at low steps:
+
+| Step | T  | L  | Adam EMA | Local-attn EMA | Δ          |
+|-----:|---:|---:|---------:|---------------:|-----------:|
+|  250 | 256| 8  |  10.7518 |        10.7517 |   -0.0001  |
+|  500 | 256| 8  |  10.6843 |        10.6831 |   -0.0012  |
+|  750 | 256| 8  |  10.4882 |        10.4882 |    0.0000  |
+| 1000 | 256| 26 |  10.2923 |        10.2922 |   -0.0001  |
+| 1250 | 512| 26 |   9.4958 |         9.4952 |   -0.0006  |
+| 1500 | 512| 26 |  10.4416 |        10.4415 |   -0.0001  |
+| 1750 |1024| 53 |  10.3630 |        10.3651 |   +0.0021  |
+| 2000 |1024| 53 |  10.3964 |        10.4094 |   +0.0130  |
+| 2250 |1024| 53 |  10.1713 |        10.2529 |   +0.0816  |
+| 2500 |1024| 53 |   9.5261 |         9.6977 | **+0.171** |
+
+### Reading
+
+The flash-local kernel matches Adam's tiled-bf16 trajectory exactly
+through T=512 phase, then diverges by 0.17 nat in the T=1024 / L=53
+phase — same divergence pattern as Sophia in the previous experiment.
+Best-NLL @1287 (peak of the convergence curve before the SLC
+transition resets the loss surface) is identical at 6.706, confirming
+the kernel does the same math at single-step granularity.
+
+The wall regression is the headline finding:
+- At T=256 / L=8 (W=256 ≥ T → effectively full attention), flash-local
+  is 79% slower than tiled-bf16 due to per-call setup overhead × 8 layers.
+- At T=512 / L=26 (W=256 = T/2 → 2× theoretical attn savings),
+  flash-local is 110% SLOWER in wall, not 50% faster.
+- At T=1024 / L=53 (W=256 = T/4 → 4× theoretical attn savings),
+  flash-local is 172% SLOWER, not 75% faster.
+
+**The flash-local kernel in this codebase has not been tuned for the
+T≤1024 regime.** The "5.2-38.1× at T=2k-16k" headline applies at
+larger T where the kernel's per-call setup amortizes. At T=1024, the
+optimized tiled-bf16 path wins decisively.
+
+### Cumulative finding from two paradigm-flag-flip experiments
+
+Two consecutive existing-research paradigm applications at CHIRON
+1.84B / 2500-step warmup, both clean negative results:
+
+| Paradigm           | Δ wall vs Adam | Δ EMA NLL vs Adam | Verdict at this regime |
+|--------------------|---------------:|------------------:|------------------------|
+| SOPHIA (#55)       |          +27%  |       +0.163 nat  | both slower AND worse  |
+| Local-attn (#6)    |         +150%  |       +0.171 nat  | dramatically worse on both |
+
+This is informative, not just disappointing. The CHIRON 1.84B preset
+as currently configured (Adam + tiled-bf16 + FACE + MFIO + SLC +
+RLG + SAS) is locally optimal for the 2500-step warmup horizon on a
+16 GB GPU. **Easy paradigm-flag flips don't unlock further speed at
+this regime** — the CHIRON team has already squeezed out the
+single-flag wins.
+
+### Implication for the unified flagship+CHIRON stack
+
+Per the user's iter-200 critique ("looking at the bigger picture
+instead of focusing on microoptimizations"), the empirical evidence
+now agrees: incremental paradigm-flag changes don't move the needle
+at the CHIRON 1.84B / 2500-step regime.
+
+What would actually unlock speed at this regime requires structural
+changes, not flag flips:
+
+1. **Substantially longer training horizon** (50k+ steps) where
+   convergence-rate paradigms like Sophia can amortize their per-step
+   overhead. **One full multi-day run per paradigm** is required to
+   measure the headline effect.
+2. **Substantially longer sequence length** (T=4k-16k) where local-attn
+   and flash-attn variants demonstrably win. Requires re-tuning the
+   1.84B preset for longer T (currently T=1024 max under the SLC
+   schedule).
+3. **Architectural ports between flagship and CHIRON** — flagship's
+   MLA latent-KV (#76) into CHIRON's reversible shear; CHIRON's
+   reversibility into flagship's standard backbone. Multi-week
+   engineering each, not one-loop-iteration patches.
+4. **Bigger-picture data/objective paradigms** (#56-#65, e.g.,
+   DISTILL-FORWARD with a third-party teacher model). Multi-stage
+   setup, not a flag flip.
+
+### What stays from this iteration
+
+- ✓ `--local-attn` available end-to-end in CHIRON's `run.sh`
+  (LOCAL_ATTN=N env var now respected by `chiron` mode).
+- ✓ Empirical confirmation that the flash-local kernel is suboptimal
+  at T≤1024 — flagged for kernel-tuning work if/when long-T training
+  becomes important.
+- ✓ Decisive evidence that single-flag paradigm application is exhausted
+  at the current regime. **Next iteration should target horizon
+  extension, sequence extension, or architectural port — not another
+  flag flip.**
+
+### Recommended next-iteration direction
+
+Given two consecutive negative single-flag experiments and the
+user's "bigger picture" directive, the next loop iteration should:
+
+1. **Horizon-extension test** (1 long-running iteration): Adam vs
+   Sophia at 5000 or 10000 steps to definitively answer whether
+   Sophia's 2× steps-reduction claim ever materializes at our scale.
+   Risk: if even 10k steps is too short, this is wasted compute.
+2. **Sequence-extension test** (1 short iteration): re-bench
+   local-attn at T=4096 (modify the SLC schedule final phase) to
+   verify the run.sh "5.2-38.1×" claim applies to our 1.84B config.
+   If yes, longer-T training is unlocked.
+3. **Architectural port** (multi-week): begin MLA latent-KV port
+   into CHIRON's reversible shear. Highest-leverage but largest work.
+
+Path 2 is the cheapest and gives the most actionable signal — proceed
+with it next iteration.
