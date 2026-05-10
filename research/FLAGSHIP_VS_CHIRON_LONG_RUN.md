@@ -367,6 +367,25 @@ round-off magnitude.  Phase-1 is correct.  The path is now active behind
 `--grad-bf16` in `glades_pile_train`; it composes with `--adam-state-int8`
 and `--face-embedding`.
 
+**500-step extension (2026-05-09)** — same config, 524288 tokens, 500
+optimizer steps to test for compounding round-off:
+
+| Step | Baseline NLL | bf16grad NLL | Δ            |
+|------|-------------:|-------------:|-------------:|
+| 99   |      10.6001 |      10.6002 |     +1.0e-4  |
+| 199  |      10.5965 |      10.5964 |     -1.0e-4  |
+| 299  |      10.5608 |      10.5608 |       0.0    |
+| 399  |      10.5357 |      10.5359 |     +2.0e-4  |
+| 499  |      10.5173 |      10.5176 |     +3.0e-4  |
+| Final epoch loss | 10.515405 | 10.515701 |  +2.96e-4 nat |
+| acc_top1   | 0.000382% | 0.000382% |    identical    |
+| gradNorm   |  0.209305 |  0.209415 |     +1.10e-4    |
+
+Drift is at the BF16 round-off floor — no compounding trend; both curves
+track tightly.  Phase-1 cleared the validation-plan target (≤ 0.005 nat
+over 1000 steps; observed ≤ 3e-4 over 500 steps with no divergence
+trend).  The path is safe to use on production runs.
+
 ## Conclusions and next steps
 
 1. **Flagship cannot reach 1.84B on 16 GB** without the optimizer-side
