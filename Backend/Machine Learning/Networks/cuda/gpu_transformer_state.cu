@@ -1,6 +1,7 @@
 // GPU transformer state implementation.
 #include "gpu_transformer_state.h"
 #include "gpu_kernels.h"
+#include <cmath>
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -634,6 +635,7 @@ GpuTransformerScratch::GpuTransformerScratch()
     : initialized(false),
       T(0), dModel(0), dFF(0), dModelKV(0), nHeads(0), nLayers(0),
       inputSize(0), outSize(0), ff1Width(0),
+      slotsPerLayer(0), nCheckpoints(0),
       d_dKdVZeroPtrs(0), d_dKdVZeroSizes(0)
 {
 }
@@ -651,6 +653,16 @@ bool ensureTransformerScratch(GpuTransformerScratch*& scratch,
 	if (!scratch)
 		return false;
 
+	// Effective slot count expected for this config (used for shape match).
+	unsigned int expectedSlots = cfg.nLayers;
+	if (cfg.activationCheckpoint && cfg.nLayers > 1u)
+	{
+		double k = std::ceil(std::sqrt(static_cast<double>(cfg.nLayers)));
+		unsigned int K = static_cast<unsigned int>(k);
+		if (K < 1u) K = 1u;
+		if (K > cfg.nLayers) K = cfg.nLayers;
+		expectedSlots = K;
+	}
 	const bool shapeMatches =
 	    scratch->initialized &&
 	    scratch->T >= cfg.T &&
@@ -661,18 +673,21 @@ bool ensureTransformerScratch(GpuTransformerScratch*& scratch,
 	    scratch->dModelKV == cfg.dModelKV &&
 	    scratch->nHeads == cfg.nHeads &&
 	    scratch->nLayers == cfg.nLayers &&
-	    scratch->ff1Width == cfg.ff1Width;
+	    scratch->ff1Width == cfg.ff1Width &&
+	    scratch->slotsPerLayer == expectedSlots;
 	if (shapeMatches)
 		return true;
 
 	return scratch->allocate(cfg.T, cfg.inputSize, cfg.outSize,
 	                         cfg.dModel, cfg.dFF, cfg.dModelKV,
-	                         cfg.nHeads, cfg.nLayers, cfg.ff1Width);
+	                         cfg.nHeads, cfg.nLayers, cfg.ff1Width,
+	                         cfg.activationCheckpoint);
 }
 
 bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigned int os,
                                       unsigned int dm, unsigned int df, unsigned int dmkv,
-                                      unsigned int nh, unsigned int nl, unsigned int f1w)
+                                      unsigned int nh, unsigned int nl, unsigned int f1w,
+                                      bool activationCheckpoint)
 {
 	free();
 
@@ -686,6 +701,28 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	nLayers = nl;
 	ff1Width = f1w;
 
+	// Activation gradient checkpointing: shrink per-layer activation scratches
+	// to slotsPerLayer = ⌈√L⌉ slots (cyclic li%K addressing).  When disabled,
+	// slotsPerLayer == nLayers — modulo collapses to identity, behavior
+	// identical to pre-checkpoint allocation.
+	if (activationCheckpoint && nl > 1u)
+	{
+		double k = std::ceil(std::sqrt(static_cast<double>(nl)));
+		unsigned int K = static_cast<unsigned int>(k);
+		if (K < 1u) K = 1u;
+		if (K > nl) K = nl;
+		slotsPerLayer = K;
+		// Number of segments = ⌈nl / K⌉; checkpoints = nSegments - 1 (segment 0
+		// reads from `h`, no checkpoint needed).
+		const unsigned int nSegments = (nl + K - 1u) / K;
+		nCheckpoints = (nSegments > 0u) ? (nSegments - 1u) : 0u;
+	}
+	else
+	{
+		slotsPerLayer = nl;
+		nCheckpoints = 0u;
+	}
+
 	const size_t sT = static_cast<size_t>(T);
 	const size_t sdm = static_cast<size_t>(dm);
 	const size_t sdf = static_cast<size_t>(df);
@@ -694,26 +731,35 @@ bool GpuTransformerScratch::allocate(unsigned int newT, unsigned int is, unsigne
 	const size_t sf1w = static_cast<size_t>(f1w);
 	const size_t sis = static_cast<size_t>(is);
 	const size_t sos = static_cast<size_t>(os);
+	// Per-layer activation slot count (= snl when checkpointing off).
+	const size_t sSlots = static_cast<size_t>(slotsPerLayer);
+	const size_t sCkpt  = static_cast<size_t>(nCheckpoints);
 
 	// Forward
 	if (!x.allocate(sT * sis)) return false;
 	if (!h.allocate(sT * sdm)) return false;
-	if (!ln1Mean.allocate(snl * sT)) return false;
-	if (!ln1InvStd.allocate(snl * sT)) return false;
-	if (!x1.allocate(snl * sT * sdm)) return false;
-	if (!Q.allocate(snl * sT * sdm)) return false;
-	if (!K.allocate(snl * sT * sdmkv)) return false;
-	if (!V.allocate(snl * sT * sdmkv)) return false;
-	if (!attnConcat.allocate(snl * sT * sdm)) return false;
-	if (!attnOut.allocate(snl * sT * sdm)) return false;
-	if (!hAfterAttn.allocate(snl * sT * sdm)) return false;
-	if (!ln2Mean.allocate(snl * sT)) return false;
-	if (!ln2InvStd.allocate(snl * sT)) return false;
-	if (!x2.allocate(snl * sT * sdm)) return false;
-	if (!ff1.allocate(snl * sT * sf1w)) return false;
-	if (!ff1Act.allocate(snl * sT * sdf)) return false;
-	if (!ffOut.allocate(snl * sT * sdm)) return false;
-	if (!hAfterFF.allocate(snl * sT * sdm)) return false;
+	if (!ln1Mean.allocate(sSlots * sT)) return false;
+	if (!ln1InvStd.allocate(sSlots * sT)) return false;
+	if (!x1.allocate(sSlots * sT * sdm)) return false;
+	if (!Q.allocate(sSlots * sT * sdm)) return false;
+	if (!K.allocate(sSlots * sT * sdmkv)) return false;
+	if (!V.allocate(sSlots * sT * sdmkv)) return false;
+	if (!attnConcat.allocate(sSlots * sT * sdm)) return false;
+	if (!attnOut.allocate(sSlots * sT * sdm)) return false;
+	if (!hAfterAttn.allocate(sSlots * sT * sdm)) return false;
+	if (!ln2Mean.allocate(sSlots * sT)) return false;
+	if (!ln2InvStd.allocate(sSlots * sT)) return false;
+	if (!x2.allocate(sSlots * sT * sdm)) return false;
+	if (!ff1.allocate(sSlots * sT * sf1w)) return false;
+	if (!ff1Act.allocate(sSlots * sT * sdf)) return false;
+	if (!ffOut.allocate(sSlots * sT * sdm)) return false;
+	if (!hAfterFF.allocate(sSlots * sT * sdm)) return false;
+	// Activation checkpoints: hAfterFF at every Kth segment boundary.
+	if (sCkpt > 0u)
+	{
+		if (!checkpoints.allocate(sCkpt * sT * sdm)) return false;
+	}
+	(void)snl; // silence unused-when-checkpointing-on if compiler warns
 	if (!hPostFinalLN.allocate(sT * sdm)) return false;
 	if (!lnFinalMean.allocate(sT)) return false;
 	if (!lnFinalInvStd.allocate(sT)) return false;

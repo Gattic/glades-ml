@@ -1676,6 +1676,19 @@ struct MixedPrecisionConfig
 	// mirrors via gpu_gemm_mp, so no forward-side change is needed.
 	bool weightStorageBf16;
 
+	// Activation gradient checkpointing (sqrt-L scheme).  When enabled the
+	// per-layer activation scratches (x1/Q/K/V/attnConcat/attnOut/hAfterAttn/
+	// x2/ff1/ff1Act/ffOut/hAfterFF and LN stats) are sized to K = ⌈√L⌉ slots
+	// instead of L; layer li writes into slot `li % K`.  At checkpoint
+	// boundaries (every K layers) the layer-input residual hAfterFF is copied
+	// into a `checkpoints[c]` buffer.  Backward walks segments from highest
+	// down to 0 — for each segment it re-runs forward starting from the
+	// checkpoint to repopulate the K slots, then runs backward in reverse over
+	// the segment.  Saves ~3.6 GB at 1.84B (4.2 GB stash → 0.55 GB scratch +
+	// checkpoints) at the cost of ~33% extra compute (one extra forward per
+	// step).  Composes with bf16-weights and bf16-grads.
+	bool activationCheckpoint;
+
 	// Loss scaling:
 	// - If enable==true and useLossScaling==true, backprop deltas are multiplied by lossScale
 	//   and the optimizer divides gradients by lossScale before applying updates.
@@ -1698,6 +1711,7 @@ struct MixedPrecisionConfig
 	      gradStorageBf16(false),
 	      gradStorageBf16Phase2(false),
 	      weightStorageBf16(false),
+	      activationCheckpoint(false),
 	      useLossScaling(true),
 	      dynamicLossScaling(true),
 	      lossScaleInit(1024.0f),

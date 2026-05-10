@@ -77,6 +77,7 @@ struct TransformerGpuScratchConfig
 	unsigned int nHeads;
 	unsigned int nLayers;
 	unsigned int ff1Width;
+	bool activationCheckpoint;
 
 	TransformerGpuScratchConfig()
 	    : T(0u),
@@ -87,7 +88,8 @@ struct TransformerGpuScratchConfig
 	      dModelKV(0u),
 	      nHeads(0u),
 	      nLayers(0u),
-	      ff1Width(0u)
+	      ff1Width(0u),
+	      activationCheckpoint(false)
 	{
 	}
 };
@@ -594,12 +596,27 @@ struct GpuTransformerScratch
 	// weight masters (~8 GB at 1.84B).
 	GpuBuffer<float> weightScratchFp32;
 
+	// Activation gradient checkpointing (sqrt-L scheme).  When activationCheckpoint
+	// is requested at allocate(), per-layer scratches (x1/Q/K/V/attnConcat/attnOut/
+	// hAfterAttn/x2/ff1/ff1Act/ffOut/hAfterFF + LN stats) are sized to slotsPerLayer
+	// = ⌈√nLayers⌉ instead of nLayers.  When false, slotsPerLayer == nLayers and the
+	// modulo `li % slotsPerLayer` collapses to `li` — behavior identical.
+	unsigned int slotsPerLayer;
+	// Number of checkpoint boundaries: ⌈nLayers/slotsPerLayer⌉ - 1 (no checkpoint
+	// at the very first layer; layer 0 reads from `h`).  Allocated empty when
+	// activationCheckpoint=false.
+	unsigned int nCheckpoints;
+	// Checkpoint storage: [nCheckpoints, T, dModel].  Holds hAfterFF at layer
+	// boundary (c+1)*slotsPerLayer - 1 — i.e. the input to layer (c+1)*slotsPerLayer.
+	GpuBuffer<float> checkpoints;
+
 	GpuTransformerScratch();
 	~GpuTransformerScratch();
 
 	bool allocate(unsigned int T, unsigned int inputSize, unsigned int outSize,
 	              unsigned int dModel, unsigned int dFF, unsigned int dModelKV,
-	              unsigned int nHeads, unsigned int nLayers, unsigned int ff1Width);
+	              unsigned int nHeads, unsigned int nLayers, unsigned int ff1Width,
+	              bool activationCheckpoint = false);
 	void free();
 };
 

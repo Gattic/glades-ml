@@ -9114,6 +9114,7 @@ bool glades::NNetwork::ensureTransformerGpuTrainingScratch(const TransformerEpoc
 	scratchCfg.nHeads = cfg.nHeads;
 	scratchCfg.nLayers = cfg.nLayers;
 	scratchCfg.ff1Width = cfg.ff1Width;
+	scratchCfg.activationCheckpoint = trainingConfig.mixedPrecision.activationCheckpoint;
 	return glades::gpu::ensureTransformerScratch(gpuTransformerScratch, scratchCfg);
 }
 
