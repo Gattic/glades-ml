@@ -38,45 +38,84 @@ the scratch FP32 buffer; immediately afterward `bf16_accum_axpy`
 commits the result into the persistent BF16 grad buffer.  Adam reads
 the BF16 grad directly via new kernel variants.
 
-### What's committed
+### What's committed (Phase-1 — kernel correctness, no memory savings)
 
-- `MixedPrecisionConfig.gradStorageBf16` (new bool) wired through
-- `GpuTransformerWeights` BF16 grad fields (`gWq_bf16`, `gWk_bf16`,
-  …, `gW1_bf16`, `gW2_bf16`, plus globals `gTokE_bf16`, `gWIn_bf16`,
-  `gWOut_bf16`, plus MLA `gWdkv_bf16`, `gWuk_bf16`, `gWuv_bf16`)
-- `allocate(..., bool gradStorageBf16)` signature wired through
+- `MixedPrecisionConfig.gradStorageBf16` bool wired through (commit `627967b33`)
+- `GpuTransformerWeights` BF16 grad fields + `GpuTransformerScratch.gradScratchFp32`
+- `allocate(..., bool gradStorageBf16)` flow allocates BF16 mirrors + scratch alongside
+  FP32 grads (Phase-1 keeps both)
+- Two new Adam kernel variants that read BF16 grads:
+  - `adam_update_bf16_state_bf16grad`
+  - `adam_update_int8_state_bf16grad` (reuses existing int8 kernel via
+    `cast_bf16_to_f32` to scratch)
+- 4-way per-tensor Adam dispatch in `sgd_transformer.cpp` at tokE, WIn, WOut and
+  per-block Wq/Wk/Wv/Wo/W1/W2 sites: `bf16` / `int8` / `bf16+bf16grad` / `int8+bf16grad`
+- FP32→BF16 cast pass on all 9 large weight grad buffers right before each Adam
+  dispatch when `gradStorageBf16` set (exercises the new bf16grad kernels)
+- Trainer flag `--grad-bf16` (commit `afcf2e6` in glades-trainer)
+- `sum_squared_accumulate_bf16` kernel for the Phase-2 grad-norm pass (commit `e29b03a46`)
 
-### What's not yet wired
+### Phase-1 verification (165M smoke, 2026-05-09)
 
-1. **The allocate flow itself** — when `gradStorageBf16=true`,
-   allocate the BF16 buffers and skip the FP32 grad buffers.  Add a
-   `gradScratchFp32` buffer to `GpuTransformerScratch` sized to the
-   widest weight tensor (`max(V·dModel, dFF·dModel, dModel·dModel)`).
-2. **The backward-pass refactor** — every `gpu_gemm_*(..., 1.0f, gXX.data(), ...)`
-   call site needs to be transformed to:
+T=1024, 64K tokens, `--face-embedding --adam-state-int8 --ffn-mlp` ± `--grad-bf16`:
+
+| Metric            | Baseline    | + `--grad-bf16` | Δ           |
+|-------------------|------------:|----------------:|------------:|
+| NLL @ seq 63      |     10.6178 |         10.6178 |       0.000 |
+| Final epoch loss  |   10.618756 |       10.618745 | -1.1e-5 nat |
+| acc_top1          |   0.001527% |       0.001527% |   identical |
+| Targets/sec       |    17,286.4 |        17,351.6 |       +0.4% |
+
+Δ matches BF16 cast round-off magnitude.  Phase-1 dispatch path verified end-to-end.
+
+### What's not yet wired (Phase-2 — actual memory savings)
+
+Phase-1 ships the kernel-correctness path: backward still writes FP32 grads, then
+casts to BF16 right before Adam.  Peak memory unchanged because FP32 grads remain
+allocated and live across the whole step.  Phase-2 retires the FP32 grad buffers:
+
+1. **Allocate flow when `gradStorageBf16=true`** — allocate the BF16 mirrors but
+   *not* the FP32 grad buffers (currently we allocate both).  Skip the FP32 weight
+   grad allocations in `allocate()` when the flag is set.
+2. **Backward-pass refactor** — every `gpu_gemm_*(..., 1.0f, gXX.data(), ...)` call
+   site (9 distinct large-weight sites: gTokE, gWIn, gWOut, plus per-block
+   gWq/gWk/gWv/gWo/gW1/gW2) is transformed to:
    ```cpp
-   gpu_gemm_*(..., 0.0f, gradScratchFp32.data(), ...);
-   bf16_accum_axpy(gXX_bf16.data(), gradScratchFp32.data(), 1.0f, 1.0f, n);
+   gpu_gemm_*(..., 0.0f, gradScratchFp32.data(), ...);     // overwrite scratch
+   bf16_accum_axpy(gXX_bf16.data(), gradScratchFp32.data(),
+                   /*alpha*/1.0f, /*beta*/firstMicroBatch ? 0.0f : 1.0f, n);
    ```
-   ~30 sites in `sgd_transformer.cpp`.  Mechanical but must be done
-   carefully.  A helper macro can compress each site to ~3 lines.
-3. **New Adam kernel variants** that read BF16 grads:
-   - `adam_update_bf16_state_bf16grad_kernel(param, grad_bf16, m_bf16, v_bf16, ...)`
-   - `adam_update_int8_state_bf16grad_kernel(param, grad_bf16, m_int8, v_uint8, scales, ...)`
-   Same body as the existing kernels but `g = bf16_load_as_f32(grad_bf16[idx]) * gradScale`
-   instead of `g = grad[idx] * gradScale`.
-4. **Dispatch macros** in `sgd_transformer.cpp` extended with bf16-grad
-   variants (`GLADES_BF16_ADAM_BIG_BF16GRAD`, `GLADES_INT8_ADAM_BIG_BF16GRAD`)
-   selected when `gradStorageBf16` is on.
-5. **Trainer flag** `--grad-bf16` plumbing through `cfg.mixedPrecision.gradStorageBf16`.
+   The bf16 mirrors are zeroed at the start of each Adam window; `beta=1` thereafter
+   accumulates correctly across both layer order and micro-batches.
+3. **Grad-norm pass** at lines 11159-11189 switches to `sum_squared_accumulate_bf16`
+   (kernel landed; just needs the call-site swap).
+4. **Drop the Phase-1 cast pass** at line 12317 onward — backward already commits
+   straight to BF16, no cast needed.
+5. **MLA-specific paths** (`gWdkv`, `gWuk`, `gWuv`) — same pattern.
 
-### Validation plan
+### Validation plan (Phase-2)
 
-- 165M smoke: NLL parity vs FP32-grads baseline within 0.01 nat over
-  1000 steps (acceptable BF16 rounding noise).
-- 700M smoke: confirm 3-4 GB GPU memory savings vs FP32 grads.
-- 1B+ run: previously OOM at FP32 grads + activation stash; should now
-  fit if combined with checkpointing (Design 2).
+- 165M smoke: NLL parity vs Phase-1 + FP32-grads baseline within 0.005 nat (Phase-2
+  introduces no NEW round-off vs Phase-1 — both go through bf16 by Adam-time).
+- 700M smoke: confirm 3-4 GB GPU memory savings vs Phase-1 (peak grad footprint
+  drops from 7.36 GB FP32 + 3.68 GB BF16 to 3.68 GB BF16 + 31 MB scratch).
+- 1B-class run: previously OOM at FP32 grads + activation stash; should now fit
+  with Phase-2 alone for inference/forward, but training still needs Design 2
+  (activation checkpointing).
+- 1.84B run: needs Phase-2 + Design 2 stacked.
+
+### Memory delta at 1.84B from Phase-1 → Phase-2
+
+| Component       | FP32 grads (Phase-0) | + BF16 mirrors (Phase-1) | BF16 only (Phase-2) |
+|-----------------|---------------------:|-------------------------:|--------------------:|
+| Weight grads    |              7.36 GB |          7.36 + 3.68 GB |             3.68 GB |
+| Adam scratch    |                    – |                        – |               31 MB |
+| Net cost        |              7.36 GB |                 11.04 GB |             3.71 GB |
+
+Phase-2 saves **3.65 GB** at 1.84B (vs Phase-0) — close to half of what FP32 grads
+cost.  Stacked with int8 Adam state and FACE embedding (already shipped), this
+brings 1.84B inside the budget *for the parameter side*.  Activations remain the
+final blocker → Design 2.
 
 ## Design 2: Activation gradient checkpointing (sqrt(L) scheme)
 
