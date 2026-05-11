@@ -210,6 +210,18 @@ struct TransformerRunConfig
 	// 1e-8 (matches paradigm-28 design).
 	float faceEps;
 
+	// Paradigm shift #39 RLG (Reversible Layer Growth) — port from CHIRON.
+	// When > 0 and < nLayers, the trainer initializes layers
+	// [rlgInitialLayers, nLayers) with Wo = W2 = bo = b2 = 0, making each
+	// such block bit-exact identity to the residual stream at step 0.
+	// The forward pass through these layers contributes zero; gradient
+	// flow at init is therefore equivalent to a smaller L = rlgInitialLayers
+	// model, sidestepping the depth-amplified gradient variance that
+	// breaks deep transformers at 1.84B. The optimizer naturally grows
+	// the inactive layers as ∂loss/∂Wo is non-zero whenever the residual
+	// has non-zero norm. Default 0 = disabled (all layers Glorot-init).
+	int rlgInitialLayers;
+
 	TransformerRunConfig()
 	    : nHeadsOverride(0),
 	      nKVHeadsOverride(0),
@@ -241,7 +253,8 @@ struct TransformerRunConfig
 	      faceEmbedding(false),
 	      faceBetaRow(0.98f),
 	      faceBetaCol(0.95f),
-	      faceEps(1e-8f)
+	      faceEps(1e-8f),
+	      rlgInitialLayers(0)
 	{
 	}
 };

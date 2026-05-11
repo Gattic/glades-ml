@@ -4848,6 +4848,33 @@ bool glades::NNetwork::ensureGpuState()
 			#undef GLADES_INIT_GLOROT_DISPATCH
 			#undef GLADES_INIT_NORMAL_DISPATCH
 
+			// Paradigm shift #39 RLG (Reversible Layer Growth) — zero-init.
+			// After Glorot init, zero Wo (attn out) and W2 (FFN out) for
+			// layers >= rlgInitialLayers. Each such block becomes bit-exact
+			// identity to the residual: x' = x + Wo·attn(LN x) = x + 0 = x;
+			// y = x' + W2·ffn(LN x') = x' + 0 = x'. Gradient flow at init
+			// is equivalent to a smaller L = rlgInitialLayers model,
+			// sidestepping depth-amplified gradient variance at deep L.
+			// Biases bo and b2 are already 0 from host-side assign(0.0f).
+			{
+				const int rlgInitial = trainingConfig.transformer.rlgInitialLayers;
+				if (rlgInitial > 0 && (unsigned int)rlgInitial < ts.nLayers)
+				{
+					for (unsigned int l = (unsigned int)rlgInitial; l < ts.nLayers; ++l)
+					{
+						glades::gpu::GpuTransformerWeights::Block& gb =
+						    gpuTransformerWeights->blocks[l];
+						if (gb.Wo.size() > 0)     gb.Wo.zero();
+						if (gb.WoLowp.size() > 0) gb.WoLowp.zero();
+						if (gb.W2.size() > 0)     gb.W2.zero();
+						if (gb.W2Lowp.size() > 0) gb.W2Lowp.zero();
+					}
+					std::fprintf(stderr, "[rlg] zero-init Wo+W2 for layers [%d, %u) "
+					                     "(initial active L = %d)\n",
+					             rlgInitial, ts.nLayers, rlgInitial);
+				}
+			}
+
 			// Stage 8b deeper: when canonical, ensureLowpMirrors short-circuits
 			// (mirrors were filled by init+cast above).  Mark lowpReady here
 			// so freeFp32Masters() can no-op cleanly downstream.
@@ -4865,6 +4892,52 @@ bool glades::NNetwork::ensureGpuState()
 	(void)0;
 	return false;
 #endif
+}
+
+// Paradigm shift #39 RLG (Reversible Layer Growth) — scheduled re-zeroing.
+// Zero Wo + W2 (output projections) plus their Adam moments for every
+// transformer block in [activeLayers, nLayers).  Each such block becomes
+// bit-exact identity to the residual stream and the optimizer state is
+// cleared, so when the next phase grows activeLayers the regrown layers
+// start fresh.  All edits are applied to the GPU mirrors when GPU is
+// enabled.  Biases bo and b2 are already zero from host-side init.
+void glades::NNetwork::rlgRezeroDeepLayers(unsigned int activeLayers)
+{
+	if (netType != TYPE_TRANSFORMER_ENCODER && netType != TYPE_TRANSFORMER_DECODER)
+		return;
+	if (activeLayers >= tensorTransformer.nLayers)
+		return;
+
+#ifdef GLADES_HAVE_CUDA
+	if (trainingConfig.gpu.enable && gpuTransformerWeights != NULL &&
+	    gpuTransformerWeights->initialized)
+	{
+		for (unsigned int l = activeLayers; l < tensorTransformer.nLayers; ++l)
+		{
+			gpu::GpuTransformerWeights::Block& gb = gpuTransformerWeights->blocks[l];
+			if (gb.Wo.size()    > 0) gb.Wo.zero();
+			if (gb.WoLowp.size()> 0) gb.WoLowp.zero();
+			if (gb.W2.size()    > 0) gb.W2.zero();
+			if (gb.W2Lowp.size()> 0) gb.W2Lowp.zero();
+			// Reset Adam state for the regrown projections so stale
+			// momentum/variance don't fight the fresh identity start.
+			if (gb.vWo.size() > 0) gb.vWo.zero();
+			if (gb.v2Wo.size()> 0) gb.v2Wo.zero();
+			if (gb.vW2.size() > 0) gb.vW2.zero();
+			if (gb.v2W2.size()> 0) gb.v2W2.zero();
+		}
+		std::fprintf(stderr, "[rlg] re-zero Wo+W2+AdamState for layers [%u, %u) "
+		                     "(new active L = %u)\n",
+		             activeLayers, tensorTransformer.nLayers, activeLayers);
+	}
+#else
+	(void)activeLayers;
+#endif
+
+	// Host-side biases bo, b2 are already 0 (assign(N, 0.0f) on init); no
+	// further host work needed.  Host Adam M/V are skipped under bf16+int8
+	// Adam (Stage 8a); when host-resident, the GPU mirrors above already
+	// cleared the canonical copies.
 }
 
 void glades::NNetwork::freeGpuState()

@@ -2235,6 +2235,16 @@ public:
 	{
 		return tensorTransformer.optimizerStep;
 	}
+
+	// Paradigm shift #39 RLG (Reversible Layer Growth) — scheduled
+	// re-zeroing.  Trainer drives this at each --l-schedule transition:
+	// zeros Wo + W2 (and Adam M/V state where present) of transformer
+	// blocks [activeLayers, nLayers), making those blocks bit-exact
+	// identity to the residual.  Stale optimizer state is cleared so
+	// the regrown layers start fresh at every transition.  No-op when
+	// activeLayers >= nLayers or not a transformer network.  Operates
+	// on the GPU mirrors when GPU is enabled.
+	void rlgRezeroDeepLayers(unsigned int activeLayers);
 	void setGlobalGradClipNorm(float clipNorm);
 	float getGlobalGradClipNorm() const { return trainingConfig.globalGradClipNorm; }
 	void setPerElementGradClip(float clipLimit);
