@@ -548,6 +548,135 @@ bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
 }
 
 // ===========================================================================
+//  6b. DISTILL-FORWARD (paradigm shift #56) — KL + CE combined loss
+// ===========================================================================
+//
+// Combined loss L = α · KL(p_T || p_S) + (1 - α) · CE(p_S, target)
+// where p_T is teacher softmax, p_S is student softmax, target is the true
+// next-token id.  The teacher distribution is treated as constant for the
+// backward (frozen teacher).
+//
+// Backward derivation (per-row, single token t):
+//   ∂CE/∂z_v       = p_S[v] - [v == target]
+//   ∂KL/∂z_v       = p_S[v] - p_T[v]   (teacher constant; well-known)
+//   ∂L/∂z_v        = α · (p_S[v] - p_T[v]) + (1 - α) · (p_S[v] - [v==target])
+//                  = p_S[v] - α · p_T[v] - (1 - α) · [v == target]
+//
+// Forward scalar loss (for logging, optional):
+//   CE  = -log p_S[target]
+//   KL  = Σ_v p_T[v] · (log p_T[v] - log p_S[v])
+//   L   = α · KL + (1 - α) · CE
+//
+// Both kernels skip rows whose target is padToken or out-of-range, mirroring
+// the existing cross_entropy_nll_loss semantics.
+
+namespace {
+
+__global__ void distill_combined_backward(const float* __restrict__ probs_student,
+                                          const float* __restrict__ probs_teacher,
+                                          const int*   __restrict__ targets,
+                                          int cols, float alpha,
+                                          float* __restrict__ dlogits)
+{
+	// Grid: rows (one row per timestep).
+	int row    = blockIdx.x;
+	int target = targets[row];
+	const float* pS = probs_student + (size_t)row * cols;
+	const float* pT = probs_teacher + (size_t)row * cols;
+	float*       dR = dlogits        + (size_t)row * cols;
+
+	const float one_minus_alpha = 1.0f - alpha;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float val = pS[i] - alpha * pT[i];
+		if (i == target) val -= one_minus_alpha;
+		dR[i] = val;
+	}
+}
+
+__global__ void distill_combined_loss_kernel(const float* __restrict__ probs_student,
+                                             const float* __restrict__ probs_teacher,
+                                             const int*   __restrict__ targets,
+                                             int T, int vocabSize, int padToken,
+                                             float alpha,
+                                             float* __restrict__ loss_sum,
+                                             int*   __restrict__ valid_count)
+{
+	extern __shared__ float smem[];
+	float localLoss = 0.0f;
+	int   localCnt  = 0;
+
+	for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < T;
+	     t += blockDim.x * gridDim.x)
+	{
+		int tgt = targets[t];
+		if (padToken >= 0 && tgt == padToken) continue;
+		if (tgt < 0 || tgt >= vocabSize) continue;
+
+		const float* pS = probs_student + (size_t)t * vocabSize;
+		const float* pT = probs_teacher + (size_t)t * vocabSize;
+
+		// CE = -log p_S[target] with a tiny floor to avoid log(0).
+		float pStgt = pS[tgt];
+		if (pStgt < 1e-12f) pStgt = 1e-12f;
+		float ce = -logf(pStgt);
+
+		// KL(p_T || p_S) = Σ p_T[v] (log p_T[v] - log p_S[v]).
+		float kl = 0.0f;
+		for (int v = 0; v < vocabSize; ++v) {
+			float pt = pT[v];
+			if (pt <= 0.0f) continue;
+			float ps = pS[v];
+			if (ps < 1e-12f) ps = 1e-12f;
+			kl += pt * (logf(pt) - logf(ps));
+		}
+
+		localLoss += alpha * kl + (1.0f - alpha) * ce;
+		++localCnt;
+	}
+
+	float lossF = blockReduceSum(localLoss, smem);
+	if (threadIdx.x == 0) atomicAdd(loss_sum, lossF);
+	float cntF = (float)localCnt;
+	cntF = blockReduceSum(cntF, smem);
+	if (threadIdx.x == 0) atomicAdd(valid_count, (int)cntF);
+}
+
+} // anonymous namespace
+
+bool distill_combined_bwd(const float* probs_student, const float* probs_teacher,
+                          const int* targets, int rows, int cols, float alpha,
+                          float* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	if (probs_teacher == NULL) return false;
+	int block = rowBlockSize(cols);
+	distill_combined_backward<<<rows, block, 0, computeStream()>>>(
+	    probs_student, probs_teacher, targets, cols, alpha, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool distill_combined_loss(const float* probs_student, const float* probs_teacher,
+                           const int* targets,
+                           int T, int vocabSize, int padToken, float alpha,
+                           float* loss_sum, int* valid_count)
+{
+	if (T <= 0 || vocabSize <= 0) return true;
+	if (probs_teacher == NULL) return false;
+	GLADES_CUDA_CHECK(cudaMemset(loss_sum,    0, sizeof(float)));
+	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	int block = 256;
+	int grid  = 1;
+	if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
+	int smemBytes = (block / 32 + 2) * sizeof(float);
+	distill_combined_loss_kernel<<<grid, block, smemBytes, computeStream()>>>(
+	    probs_student, probs_teacher, targets, T, vocabSize, padToken, alpha,
+	    loss_sum, valid_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  7. GELU (tanh approximation)
 // ===========================================================================
 
@@ -6012,6 +6141,260 @@ bool mla_decompress_kv_gpu(const float* c,
 	if (!sgemm_rowmajor(T, dKVtotal, d_c, 1.0f,
 	                    c, d_c, W_UV, dKVtotal, 0.0f, V_out, dKVtotal))
 		return false;
+	return true;
+}
+
+// ===========================================================================
+//  ORION (paradigm shift #43) — Galerkin model-order reduction primitives.
+// ===========================================================================
+//
+// Block-diagonal-V variant: every parameter tensor has its own basis V of
+// shape [n × r] (BF16 to fit memory).  Each tensor maintains a tiny α (r
+// floats), α_anchor, g_∥ (r), H_∥ (r×r), A_∥ (r) state; the anchor step
+// builds (g_∥, H_∥, A_∥) via FD-HVP and the K-1 reduced steps iterate
+// α on this local quadratic surrogate without touching the model.
+//
+// Kernels in this section:
+//
+//   orion_proj_left      : α += V^⊤ g                      [r += n×r ⨯ n]
+//   orion_lift_add       : θ += V · α                      [n += n×r ⨯ r]
+//   orion_perturb_col    : θ_pert = θ + ε · V[:, k]        [n = n + ε·col_k]
+//   orion_oja_tilt       : V += η · g_⊥ · (V^⊤ g)^⊤        [n×r += outer-r]
+//   orion_grammat_init   : init V columns to random normal then Gram-Schmidt
+//   orion_gs_step        : one inner Gram-Schmidt step (subtract projection)
+//   orion_col_norm_recip : compute 1/||V[:, k]|| (single scalar)
+//   orion_col_scale      : scale V[:, k] by a host-supplied scalar
+//
+// All kernels work with V stored in column-major within [n × r] flat layout:
+// V[i, k] = V_flat[k * n + i].  This makes the column-wise dot products and
+// scales coalesce nicely.
+
+namespace {
+
+// α[k] += Σ_i V[i, k] * g[i]  for k ∈ [0, r).  One block per column.
+__global__ void orion_proj_left_bf16_kernel(const __nv_bfloat16* __restrict__ V,
+                                            const float*         __restrict__ g,
+                                            int n, int r,
+                                            float* __restrict__ alpha)
+{
+	extern __shared__ float smem[];
+	int col = blockIdx.x;
+	if (col >= r) return;
+	const __nv_bfloat16* V_col = V + (size_t)col * n;
+	float acc = 0.0f;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		acc += __bfloat162float(V_col[i]) * g[i];
+	}
+	float total = blockReduceSum(acc, smem);
+	if (threadIdx.x == 0) ::atomicAdd(&alpha[col], total);
+}
+
+// θ[i] += Σ_k V[i, k] * α[k]  for i ∈ [0, n).
+__global__ void orion_lift_add_bf16_kernel(float*               __restrict__ theta,
+                                           const __nv_bfloat16* __restrict__ V,
+                                           const float*         __restrict__ alpha,
+                                           int n, int r)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	float acc = 0.0f;
+	for (int k = 0; k < r; ++k) {
+		acc += __bfloat162float(V[(size_t)k * n + i]) * alpha[k];
+	}
+	theta[i] += acc;
+}
+
+// θ_pert[i] = θ[i] + eps · V[i, col]
+__global__ void orion_perturb_col_bf16_kernel(float*               __restrict__ theta_pert,
+                                              const float*         __restrict__ theta,
+                                              const __nv_bfloat16* __restrict__ V,
+                                              int n, int col, float eps)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const __nv_bfloat16* V_col = V + (size_t)col * n;
+	theta_pert[i] = theta[i] + eps * __bfloat162float(V_col[i]);
+}
+
+// V[i, dst_col] -= alpha * V[i, src_col]   (Gram-Schmidt subtraction).
+__global__ void orion_gs_subtract_bf16_kernel(__nv_bfloat16* __restrict__ V,
+                                              int n, int src_col, int dst_col,
+                                              float alpha)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	__nv_bfloat16* V_dst = V + (size_t)dst_col * n;
+	const __nv_bfloat16* V_src = V + (size_t)src_col * n;
+	float v = __bfloat162float(V_dst[i]) - alpha * __bfloat162float(V_src[i]);
+	V_dst[i] = __float2bfloat16(v);
+}
+
+// Compute ||V[:, col]||² (per-column reduction → single scalar via atomicAdd).
+__global__ void orion_col_normsq_bf16_kernel(const __nv_bfloat16* __restrict__ V,
+                                             int n, int col,
+                                             float* __restrict__ out_normsq)
+{
+	extern __shared__ float smem[];
+	const __nv_bfloat16* V_col = V + (size_t)col * n;
+	float acc = 0.0f;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		float v = __bfloat162float(V_col[i]);
+		acc += v * v;
+	}
+	float total = blockReduceSum(acc, smem);
+	if (threadIdx.x == 0) ::atomicAdd(out_normsq, total);
+}
+
+// V[i, col] *= scale  (used to renormalize after Gram-Schmidt).
+__global__ void orion_col_scale_bf16_kernel(__nv_bfloat16* __restrict__ V,
+                                            int n, int col, float scale)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	__nv_bfloat16* V_col = V + (size_t)col * n;
+	float v = __bfloat162float(V_col[i]) * scale;
+	V_col[i] = __float2bfloat16(v);
+}
+
+// Dot product of two BF16 columns of V → scalar.
+__global__ void orion_col_dot_bf16_kernel(const __nv_bfloat16* __restrict__ V,
+                                          int n, int col_a, int col_b,
+                                          float* __restrict__ out_dot)
+{
+	extern __shared__ float smem[];
+	const __nv_bfloat16* A = V + (size_t)col_a * n;
+	const __nv_bfloat16* B = V + (size_t)col_b * n;
+	float acc = 0.0f;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		acc += __bfloat162float(A[i]) * __bfloat162float(B[i]);
+	}
+	float total = blockReduceSum(acc, smem);
+	if (threadIdx.x == 0) ::atomicAdd(out_dot, total);
+}
+
+// Oja tilt: V[:, k] += eta * (g[i] - V[i,:]·(V^⊤g)) · (V^⊤g)[k]
+// Operating column-major.  g_proj is the host-uploaded r-dim vector V^⊤g.
+__global__ void orion_oja_tilt_bf16_kernel(__nv_bfloat16*       __restrict__ V,
+                                           const float*         __restrict__ g,
+                                           const float*         __restrict__ g_proj,
+                                           int n, int r, float eta)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	// Residual ⊥ V: g_⊥[i] = g[i] - Σ_k V[i,k] · g_proj[k]
+	float Vg = 0.0f;
+	for (int k = 0; k < r; ++k) {
+		Vg += __bfloat162float(V[(size_t)k * n + i]) * g_proj[k];
+	}
+	float gperp_i = g[i] - Vg;
+	// For each column k: V[i, k] += eta * g_⊥[i] * g_proj[k]
+	for (int k = 0; k < r; ++k) {
+		float v = __bfloat162float(V[(size_t)k * n + i]);
+		v += eta * gperp_i * g_proj[k];
+		V[(size_t)k * n + i] = __float2bfloat16(v);
+	}
+}
+
+} // anonymous namespace
+
+bool orion_proj_left(const uint16_t* V, const float* g,
+                     int n, int r, float* alpha_out)
+{
+	if (n <= 0 || r <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(alpha_out, 0, r * sizeof(float), computeStream()));
+	int block = rowBlockSize(n);
+	int smemBytes = (block / 32 + 2) * sizeof(float);
+	orion_proj_left_bf16_kernel<<<r, block, smemBytes, computeStream()>>>(
+	    reinterpret_cast<const __nv_bfloat16*>(V), g, n, r, alpha_out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_lift_add(float* theta, const uint16_t* V,
+                    const float* alpha, int n, int r)
+{
+	if (n <= 0 || r <= 0) return true;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_lift_add_bf16_kernel<<<grid, block, 0, computeStream()>>>(
+	    theta, reinterpret_cast<const __nv_bfloat16*>(V), alpha, n, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_perturb_col(float* theta_pert, const float* theta,
+                       const uint16_t* V, int n, int col, float eps)
+{
+	if (n <= 0) return true;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_perturb_col_bf16_kernel<<<grid, block, 0, computeStream()>>>(
+	    theta_pert, theta, reinterpret_cast<const __nv_bfloat16*>(V), n, col, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_oja_tilt(uint16_t* V, const float* g, const float* g_proj,
+                    int n, int r, float eta)
+{
+	if (n <= 0 || r <= 0) return true;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_oja_tilt_bf16_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(V), g, g_proj, n, r, eta);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Modified Gram-Schmidt re-orthogonalization of V columns IN PLACE.
+// At r ≤ 8 the host-side loop over column pairs is trivially cheap; only
+// the per-pair dot/subtract/norm kernels touch n elements.  Caller supplies
+// two FP32 scratch scalars on device (scratch_dot, scratch_normsq).
+bool orion_gram_schmidt(uint16_t* V, int n, int r,
+                        float* scratch_dot, float* scratch_normsq)
+{
+	__nv_bfloat16* V_bf16 = reinterpret_cast<__nv_bfloat16*>(V);
+	if (n <= 0 || r <= 0) return true;
+	int block = rowBlockSize(n);
+	int smemBytes = (block / 32 + 2) * sizeof(float);
+	int grid_elem = (n + kBlockElem - 1) / kBlockElem;
+
+	for (int k = 0; k < r; ++k)
+	{
+		// Subtract projections onto previous columns.
+		for (int j = 0; j < k; ++j)
+		{
+			GLADES_CUDA_CHECK(cudaMemsetAsync(scratch_dot, 0, sizeof(float),
+			                                   computeStream()));
+			orion_col_dot_bf16_kernel<<<1, block, smemBytes, computeStream()>>>(
+			    V_bf16, n, k, j, scratch_dot);
+			float alpha_h = 0.0f;
+			GLADES_CUDA_CHECK(cudaMemcpyAsync(&alpha_h, scratch_dot,
+			                                   sizeof(float),
+			                                   cudaMemcpyDeviceToHost,
+			                                   computeStream()));
+			GLADES_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+			orion_gs_subtract_bf16_kernel<<<grid_elem, kBlockElem, 0,
+			                                  computeStream()>>>(
+			    V_bf16, n, j, k, alpha_h);
+			GLADES_CUDA_CHECK(cudaGetLastError());
+		}
+		// Renormalize column k.
+		GLADES_CUDA_CHECK(cudaMemsetAsync(scratch_normsq, 0, sizeof(float),
+		                                   computeStream()));
+		orion_col_normsq_bf16_kernel<<<1, block, smemBytes, computeStream()>>>(
+		    V_bf16, n, k, scratch_normsq);
+		float normsq_h = 0.0f;
+		GLADES_CUDA_CHECK(cudaMemcpyAsync(&normsq_h, scratch_normsq,
+		                                   sizeof(float),
+		                                   cudaMemcpyDeviceToHost,
+		                                   computeStream()));
+		GLADES_CUDA_CHECK(cudaStreamSynchronize(computeStream()));
+		float scale = (normsq_h > 1e-12f) ? (1.0f / sqrtf(normsq_h)) : 0.0f;
+		orion_col_scale_bf16_kernel<<<grid_elem, kBlockElem, 0,
+		                                computeStream()>>>(V_bf16, n, k, scale);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
 	return true;
 }
 

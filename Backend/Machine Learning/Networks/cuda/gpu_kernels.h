@@ -52,6 +52,54 @@ bool softmax_forward(const float* x, int rows, int cols, float* out);
 bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
                                int rows, int cols, float* dlogits);
 
+// Paradigm shift #56 DISTILL-FORWARD — combined KL + CE backward:
+//   dlogits = probs_student - alpha · probs_teacher - (1 - alpha) · one_hot(targets)
+// Teacher distribution is frozen (no grad).
+bool distill_combined_bwd(const float* probs_student, const float* probs_teacher,
+                          const int* targets, int rows, int cols, float alpha,
+                          float* dlogits);
+
+// Paradigm shift #56 DISTILL-FORWARD — combined KL + CE scalar loss for logging.
+// L = α · KL(p_T || p_S) + (1 - α) · CE(p_S, target), averaged over valid rows.
+// padToken < 0 disables padding skip; otherwise rows with target == padToken
+// (or out-of-vocab) are skipped.
+bool distill_combined_loss(const float* probs_student, const float* probs_teacher,
+                           const int* targets,
+                           int T, int vocabSize, int padToken, float alpha,
+                           float* loss_sum, int* valid_count);
+
+// ---------------------------------------------------------------------------
+// Paradigm shift #43 ORION — Galerkin model-order reduction primitives.
+// V is stored column-major as a flat [n × r] buffer: V[i, k] = V_flat[k*n + i].
+// V uses BF16 storage exposed as uint16_t in the public API (the .cu side
+// reinterpret-casts to __nv_bfloat16).  All kernels operate on a single
+// parameter tensor of size n with rank-r basis.
+// ---------------------------------------------------------------------------
+
+// α_out[k] := Σ_i V[i, k] · g[i]   (zero-initialized internally).
+bool orion_proj_left(const uint16_t* V, const float* g,
+                     int n, int r, float* alpha_out);
+
+// θ[i] += Σ_k V[i, k] · α[k]
+bool orion_lift_add(float* theta, const uint16_t* V,
+                    const float* alpha, int n, int r);
+
+// θ_pert[i] = θ[i] + eps · V[i, col]   (for FD-HVP).
+bool orion_perturb_col(float* theta_pert, const float* theta,
+                       const uint16_t* V, int n, int col, float eps);
+
+// Oja's tilt: V += η · g_⊥ · (V^⊤g)^⊤  (subspace tilt toward gradient
+// direction not yet in span(V)).  g_proj = V^⊤ g must be pre-computed.
+bool orion_oja_tilt(uint16_t* V, const float* g, const float* g_proj,
+                    int n, int r, float eta);
+
+// Modified Gram-Schmidt orthonormalization of V columns IN PLACE.
+// Caller supplies two single-float device scratches.  At r ≤ 8 the host-side
+// outer loop is negligible; only r(r+1)/2 single-row dot/subtract/normalize
+// kernels touch n.
+bool orion_gram_schmidt(uint16_t* V, int n, int r,
+                        float* scratch_dot, float* scratch_normsq);
+
 // ---------------------------------------------------------------------------
 // Activation functions (element-wise, n elements)
 // ---------------------------------------------------------------------------
@@ -760,6 +808,13 @@ inline bool rmsnorm_backward(const float*, const float*, const float*, const flo
 
 inline bool softmax_forward(const float*, int, int, float*) { return false; }
 inline bool softmax_cross_entropy_bwd(const float*, const int*, int, int, float*) { return false; }
+inline bool distill_combined_bwd(const float*, const float*, const int*, int, int, float, float*) { return false; }
+inline bool distill_combined_loss(const float*, const float*, const int*, int, int, int, float, float*, int*) { return false; }
+inline bool orion_proj_left(const void*, const float*, int, int, float*) { return false; }
+inline bool orion_lift_add(float*, const void*, const float*, int, int) { return false; }
+inline bool orion_perturb_col(float*, const float*, const void*, int, int, float) { return false; }
+inline bool orion_oja_tilt(void*, const float*, const float*, int, int, float) { return false; }
+inline bool orion_gram_schmidt(void*, int, int, float*, float*) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }
 inline bool gelu_backward(const float*, const float*, int, float*) { return false; }
