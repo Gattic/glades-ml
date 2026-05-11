@@ -6398,6 +6398,102 @@ bool orion_gram_schmidt(uint16_t* V, int n, int r,
 	return true;
 }
 
+// ===========================================================================
+//  SCFA (paradigm shift #42) — Spectral Compressed Flow Attention primitives.
+// ===========================================================================
+//
+// SCFA replaces full T-token attention with attention in a k-dim sequence-
+// spectral basis B ∈ ℝ^{T×k} (k ≪ T) + a depthwise causal conv D covering
+// the out-of-spectrum residual.  Forward:
+//
+//   q_compr = B^T q                       (T → k compression)
+//   y_compr = SoftmaxAttn(q_compr ...)    (k-dim attention; existing kernel)
+//   y_∥     = B · y_compr                 (k → T lift)
+//   y_⊥     = D(q - B B^T q)              (depthwise causal conv on residual)
+//   y       = y_∥ + y_⊥
+//
+// This file ships the two SCFA-specific primitives:
+//   scfa_dct_basis_init    — fill B with normalized DCT-II basis (orthonormal)
+//   scfa_depthwise_causal_conv_fwd — y_⊥ = D(x) with causal kernel size 2w+1,
+//     one filter per channel; m channels, T positions, w half-width.
+//
+// The compression/lift steps reuse sgemm_rowmajor (in this same file).
+// Theorem 3 reversibility integration with CHIRON shears is handled at the
+// chiron_main.cpp level; these kernels are paradigm-agnostic linear algebra.
+
+namespace {
+
+// Apply 1-D depthwise causal conv: y[t, c] = Σ_{i=-w..0} K[c, w+i] · x[t+i, c]
+// for t ∈ [0, T), c ∈ [0, m).  Out-of-bounds left taps zero-padded.
+__global__ void scfa_depthwise_causal_conv_fwd_kernel(
+    const float* __restrict__ x,    // [T, m]
+    const float* __restrict__ K,    // [m, w+1]  (only causal half + center)
+    int T, int m, int w,
+    float* __restrict__ y)          // [T, m]
+{
+	int t = blockIdx.y;
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T || c >= m) return;
+
+	float acc = 0.0f;
+	for (int i = 0; i <= w; ++i)
+	{
+		int src = t - i;
+		if (src < 0) break;
+		acc += K[(size_t)c * (size_t)(w + 1) + (size_t)i] *
+		       x[(size_t)src * (size_t)m + (size_t)c];
+	}
+	y[(size_t)t * (size_t)m + (size_t)c] = acc;
+}
+
+} // anonymous namespace
+
+bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
+                                     int T, int m, int w, float* y)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	int block = 256;
+	dim3 grid((m + block - 1) / block, T);
+	scfa_depthwise_causal_conv_fwd_kernel<<<grid, block, 0, computeStream()>>>(
+	    x, K, T, m, w, y);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
+
+// Fill B[T × k] (row-major) with orthonormal DCT-II basis on device.
+__global__ void scfa_dct_basis_init_kernel(float* B_flat, int T, int k)
+{
+	int t = blockIdx.y;
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T || j >= k) return;
+
+	const float invT = 1.0f / (float)T;
+	float alpha = (j == 0) ? sqrtf(invT) : sqrtf(2.0f * invT);
+	const float pi_f = 3.14159265358979323846f;
+	float arg = ((2.0f * (float)t + 1.0f) * (float)j * pi_f) /
+	            (2.0f * (float)T);
+	B_flat[(size_t)t * (size_t)k + (size_t)j] = alpha * cosf(arg);
+}
+
+} // anonymous namespace
+
+// Fill B[T × k] (row-major, B[t, j] = B_flat[t*k + j]) with orthonormal DCT-II
+// basis truncated to k components: B[t, j] = α_j · cos((2t+1)·j·π / (2T)),
+// α_0 = 1/√T, α_{j>0} = √(2/T).  Natural sequence-spectral basis for language
+// data (low-frequency components carry most signal).  Computed on device.
+bool scfa_dct_basis_init(float* B_flat, int T, int k)
+{
+	if (T <= 0 || k <= 0) return true;
+	int block = 256;
+	dim3 grid((k + block - 1) / block, T);
+	scfa_dct_basis_init_kernel<<<grid, block, 0, computeStream()>>>(
+	    B_flat, T, k);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

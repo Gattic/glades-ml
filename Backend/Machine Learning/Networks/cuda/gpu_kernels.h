@@ -101,6 +101,22 @@ bool orion_gram_schmidt(uint16_t* V, int n, int r,
                         float* scratch_dot, float* scratch_normsq);
 
 // ---------------------------------------------------------------------------
+// Paradigm shift #42 SCFA — Spectral Compressed Flow Attention primitives.
+// Compression/lift use existing sgemm_rowmajor (q_compr = B^T q  and
+// y_∥ = B y_compr).  These kernels supply the SCFA-specific operations.
+// ---------------------------------------------------------------------------
+
+// y[t, c] = Σ_{i=0..w} K[c, i] · x[t-i, c]    (causal depthwise 1-D conv).
+// One filter per channel; m channels, T positions, half-width w (kernel size
+// w+1 since we only use the causal half + center tap).  Out-of-bounds is 0.
+bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
+                                     int T, int m, int w, float* y);
+
+// Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
+// to k columns.  Used as the sequence-spectral basis in SCFA.
+bool scfa_dct_basis_init(float* B_flat, int T, int k);
+
+// ---------------------------------------------------------------------------
 // Activation functions (element-wise, n elements)
 // ---------------------------------------------------------------------------
 
@@ -815,6 +831,8 @@ inline bool orion_lift_add(float*, const void*, const float*, int, int) { return
 inline bool orion_perturb_col(float*, const float*, const void*, int, int, float) { return false; }
 inline bool orion_oja_tilt(void*, const float*, const float*, int, int, float) { return false; }
 inline bool orion_gram_schmidt(void*, int, int, float*, float*) { return false; }
+inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*) { return false; }
+inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }
 inline bool gelu_backward(const float*, const float*, int, float*) { return false; }
