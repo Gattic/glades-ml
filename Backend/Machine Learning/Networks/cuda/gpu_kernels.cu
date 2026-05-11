@@ -6462,6 +6462,80 @@ bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
 
 namespace {
 
+// Backward through depthwise causal conv.
+// Forward: y[t, c] = Σ_{i=0..w} K[c, i] · x[t-i, c]
+// Gradients:
+//   dx[t, c] += Σ_{i=0..w, t+i<T} K[c, i] · dy[t+i, c]
+//   dK[c, i] += Σ_{t=i..T-1}    x[t-i, c] · dy[t, c]
+// Caller must zero dx and dK before launch (kernel uses += accumulators).
+
+__global__ void scfa_dwconv_dx_kernel(const float* __restrict__ dy,
+                                      const float* __restrict__ K,
+                                      int T, int m, int w,
+                                      float* __restrict__ dx)
+{
+	int t = blockIdx.y;
+	int c = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T || c >= m) return;
+	float acc = 0.0f;
+	for (int i = 0; i <= w; ++i)
+	{
+		int src = t + i;
+		if (src >= T) break;
+		acc += K[(size_t)c * (size_t)(w + 1) + (size_t)i] *
+		       dy[(size_t)src * (size_t)m + (size_t)c];
+	}
+	dx[(size_t)t * (size_t)m + (size_t)c] += acc;
+}
+
+__global__ void scfa_dwconv_dK_kernel(const float* __restrict__ x,
+                                      const float* __restrict__ dy,
+                                      int T, int m, int w,
+                                      float* __restrict__ dK)
+{
+	// One thread per (c, i) pair; loops t.
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	int c = blockIdx.y;
+	if (c >= m || i > w) return;
+	float acc = 0.0f;
+	for (int t = i; t < T; ++t)
+	{
+		acc += x[(size_t)(t - i) * (size_t)m + (size_t)c] *
+		       dy[(size_t)t * (size_t)m + (size_t)c];
+	}
+	::atomicAdd(&dK[(size_t)c * (size_t)(w + 1) + (size_t)i], acc);
+}
+
+} // anonymous namespace
+
+bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
+                                     const float* dy,
+                                     int T, int m, int w,
+                                     float* dx, float* dK)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	// dx kernel: zero-initialize is the caller's responsibility (kernel +=).
+	{
+		int block = 256;
+		dim3 grid((m + block - 1) / block, T);
+		scfa_dwconv_dx_kernel<<<grid, block, 0, computeStream()>>>(
+		    dy, K, T, m, w, dx);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	// dK kernel: one thread per (c, i) pair.
+	{
+		int wp1 = w + 1;
+		int block = (wp1 < 32) ? wp1 : 32;
+		dim3 grid((wp1 + block - 1) / block, m);
+		scfa_dwconv_dK_kernel<<<grid, block, 0, computeStream()>>>(
+		    x, dy, T, m, w, dK);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	return true;
+}
+
+namespace {
+
 // Fill B[T × k] (row-major) with orthonormal DCT-II basis on device.
 __global__ void scfa_dct_basis_init_kernel(float* B_flat, int T, int k)
 {

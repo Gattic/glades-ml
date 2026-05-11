@@ -112,6 +112,15 @@ bool orion_gram_schmidt(uint16_t* V, int n, int r,
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
                                      int T, int m, int w, float* y);
 
+// Backward through depthwise causal conv.
+//   dx[t, c] += Σ_{i=0..w, t+i<T} K[c, i] · dy[t+i, c]
+//   dK[c, i] += Σ_{t=i..T-1}     x[t-i, c]    · dy[t, c]
+// Caller must zero dx and dK before this call (the kernels accumulate +=).
+bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
+                                     const float* dy,
+                                     int T, int m, int w,
+                                     float* dx, float* dK);
+
 // Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
 // to k columns.  Used as the sequence-spectral basis in SCFA.
 bool scfa_dct_basis_init(float* B_flat, int T, int k);
@@ -832,6 +841,7 @@ inline bool orion_perturb_col(float*, const float*, const void*, int, int, float
 inline bool orion_oja_tilt(void*, const float*, const float*, int, int, float) { return false; }
 inline bool orion_gram_schmidt(void*, int, int, float*, float*) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*) { return false; }
+inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }
