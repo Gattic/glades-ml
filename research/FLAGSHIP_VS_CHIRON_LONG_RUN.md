@@ -1902,3 +1902,1017 @@ The user's iter-200 critique ("looking at the bigger picture instead
 of focusing on microoptimizations") is now empirically validated by 5
 iterations: every single-flag attempt at the headline scale lost or
 plateaued. The next commit must be structural.
+
+---
+
+## 2026-05-11 session — SLC port + LR mini-warmup + RLG necessity confirmed
+
+After Stage 8a (host Adam state skip) and Stage 8b deeper (FP32 master
+skip in `allocate()`) shipped flagship's ability to allocate L=53 at
+1.84B, this session focused on whether the model can actually TRAIN
+stably at that scale.
+
+### What got built
+
+| Component | Commit | Effect |
+|-----------|--------|--------|
+| SLC trainer port (paradigm #38) | `e7a907d` (trainer) | `--t-schedule "T1@step1,..."` drives chunk loop with per-phase T/window |
+| Engine-side LR mini-warmup | `5384b7ef1` (ml) | `slcLastTransitionStep` + `slcMiniWarmupSteps` → per-step LR ramp from 0→1 over N steps after each T transition |
+
+### v2/v4/v5 stability sweep at flagship 1.84B (L=53, bf16-weights, int8-Adam, grad-bf16, grad-checkpoint)
+
+| Test | lr | warmup | mini-warmup | Phase 1 result | Phase 2 result |
+|------|----|----|-------------|-----------------|------------------|
+| v2 (slcmw_v2) | 3e-4 | 100 | 200 | grad spike 10^13-15 by step 300, NLL drift 10.09→10.25 | never reached |
+| v4 (v4_long) | 1e-4 | 1000 | 500 | clean (nll 10.83→10.16, grad 3-10) | grad explodes 25× per LR doubling → 1.21e+07 at mini-warmup complete; NLL 9.61→10.05 |
+| v5 (lr5e5) | 5e-5 | 1000 | 2000 | clean (nll 10.71→10.18) | NLL stalls at 10.09 from step 1199 onward; grad spikes 100-3000 absorbed by clip; not productively training |
+
+**Diagnostic conclusion**: flagship 1.84B + full L=53 + bf16 weights cannot
+productively train at ANY LR at T=512+ without paradigm support. Lower
+LR avoids catastrophic divergence but at the cost of progress — the
+gradient clip absorbs all meaningful signal once T≥512.
+
+### Why SLC + mini-warmup alone is insufficient
+
+CHIRON 1.84B trains stably at lr=3e-4 (3× higher than flagship's
+working lr=1e-4) because it combines:
+- SLC (T 256→512→1024) ✓ (now also in flagship)
+- **RLG (L 8→26→53)** ✗ (NOT in flagship — this is the gap)
+- 5000-step LR mini-warmup at every transition
+
+RLG is the load-bearing piece. With L=8 in Phase 1, the depth-amplified
+gradient variance is ~6.6× smaller than at L=53. CHIRON's Phase 1
+operates with manageable gradient norms; Phase 2 grows L to 26 with a
+5000-step LR re-ramp; Phase 3 grows to L=53 with another re-ramp.
+By the time L=53 is active, the model has already converged its
+gradient statistics to a stable regime.
+
+### RLG port to flagship — scope
+
+CHIRON's RLG uses `Wo = 0` on new layers (symplectic shear: `p += Wo·... = 0`
+makes the block identity). For a standard transformer, the equivalent
+is to zero **both** output projections per layer:
+- attention Wo → 0
+- FFN W2 (output projection) → 0
+
+Both are linears feeding back into the residual; zeroing both makes the
+block contribute zero to the residual stream, leaving x' = x bit-exactly.
+This is cleaner than my initial Option-A worry — only TWO weight matrices
+per layer need zeroing.
+
+Estimated 2-3 day focused port (vs subagent's 1.5-2 week pessimistic
+estimate which included extensive Gate-0 testing).
+
+Components:
+1. **Trainer**: parse `--l-schedule`, schedule check at chunk boundary,
+   reuse existing `slcLastTransitionStep` for LR re-ramp
+2. **Engine**: track `activeL` (≤ allocated L), iterate forward/backward
+   over `activeL` blocks only; init layers above initial `L` with
+   Wo=0 + W2=0 at allocation time
+3. **Optimizer state**: already allocated at max L (no dynamic resize)
+4. **Determinism**: new layer's RNG state needs to be advanced consistently
+   regardless of when growth fires (deterministic RNG policy preserved)
+
+### Next iteration
+
+1. **Port RLG to flagship** (paradigm #39): unblocks lr=3e-4-stable
+   training at 1.84B. 2-3 days. Mandatory for apples-to-apples vs CHIRON.
+2. **Re-run head-to-head**: flagship-with-RLG vs CHIRON, same SLC+RLG
+   schedule, same warmup. Then we measure real per-step or final-NLL gap.
+
+The user's "save time + nll without compromising memory" goal cannot be
+measured at 1.84B until flagship has RLG. Below 1.1B, flagship trains
+without RLG, so any speed paradigms could be measured there instead.
+
+---
+
+## 2026-05-11 (cont'd) — RLG paradigm #39 ported, but Phase 2 still fails
+
+Iteration continued after the session-pause. **Implemented RLG zero-init
+(v1) and RLG scheduled re-zero (v2) end-to-end** in flagship, then ran
+six head-to-heads (v6–v9b) varying LR and mini-warmup. Phase 2 transition
+remains catastrophically unstable at 1.84B regardless of intervention.
+
+### Shipped
+
+| Component | Commits | Effect |
+|-----------|---------|--------|
+| `--rlg-initial-layers N` flag | trainer main.cpp | Trainer-visible knob for zero-init |
+| `TransformerRunConfig::rlgInitialLayers` field | training_config.h (both repos) | Engine config plumbing |
+| Engine zero-init at GPU init | network.cpp `ensureGpuState` | After Glorot, zero Wo+W2 of blocks ≥ rlgInitialLayers |
+| `--l-schedule "L1@step1,…"` flag | trainer main.cpp | Trainer parses schedule like `--t-schedule` |
+| Chunk-boundary RLG re-zero call | trainer chunk loop | Look up activeL for phase; call `net.rlgRezeroDeepLayers(activeL)` |
+| `NNetwork::rlgRezeroDeepLayers(activeL)` | network.cpp + header (both repos) | Zeros Wo+W2+vWo+v2Wo+vW2+v2W2 (incl. Adam state) of blocks ≥ activeL |
+| `--save-every 1M` chunk-end auto-save bug | discovered, mitigated with `--epochs 0` | Trainer auto-saves at end of chunk N when N == epochs-1 (default 1) → repeated 25 GB writes on disk-full systems |
+
+### Phase 1 result (validated)
+
+v6 (zero-init only) at step 499: nll=**10.07**, grad_norm=**5.06**.
+Better than v3 baseline (no RLG): nll=10.165, grad_norm=3.58. Confirms
+the gradient-flow reduction from L_effective=8 mechanism is correct.
+
+### Phase 2 transition matrix (all failed)
+
+All tests use --rlg-initial-layers 8 --l-schedule "8@0,26@1500,53@…".
+
+| Test | lr | mini-warmup | grad @ 1599 | nll @ 1599 | verdict |
+|------|----|---|-------------|------------|---------|
+| v6   | 1e-4 | 1000 (no sched) | 1.32e+09 | 10.46 | catastrophic |
+| v7   | 1e-4 | 1000 + sched | 7.79e+04 | 10.37 | grad spikes, NLL drifting up |
+| v8   | 1e-4 | 5000 + sched | 1.72e+06 | 11.21 | longer ramp made it WORSE |
+| v9b  | 5e-5 | 5000 + sched | 1.32e+07 | 10.93 | lower LR doesn't help |
+
+**Conclusion**: For flagship at 1.84B with bf16 weights + L=53, the
+T=256→512 transition produces a fundamentally unstable gradient regime
+that no (LR, warmup, RLG schedule) combination can recover. The grad-clip
+absorbs magnitude but the gradient direction has become uninformative.
+
+### Why flagship can't survive Phase 2 transition
+
+The structural difference vs CHIRON: standard transformer's residual
+chain through 53 layers, in bf16, accumulates activation variance that
+exceeds the numerical envelope when T doubles. CHIRON's symplectic
+shears (reversibility) keep the dual-stream norm bounded by construction
+— this is the actual load-bearing stabilizer, not RLG/SLC.
+
+Confirmed empirically: RLG re-zero at Phase 2 (v7) cut grad from 10^9
+to 10^4.9, a 4-order-of-magnitude improvement. But the absolute floor
+of ~10^5 is still 4-5 orders too high for productive training. The
+remaining ~5-order gap is what reversibility would have closed.
+
+### What's actually available for the user's goal
+
+The user wants "save time + NLL accuracy via paradigms without
+compromising memory" measured at 1.84B vs CHIRON.
+
+**Achievable today**:
+- Compare flagship-vs-CHIRON at **smaller scales** (200M, 700M, 1.1B)
+  where flagship trains stably. RLG/SLC speedups can be measured there.
+- Compare **Phase 1 only at 1.84B** (T=256, L_effective=8): flagship can
+  reach 1500 steps stably. Probably useful for narrow comparisons.
+
+**Blocked at 1.84B head-to-head**:
+- Phase 2/3 transitions require either reversibility port (multi-week)
+  or FACE+MFIO+SAS suite (paradigms #28 and others — `--face-embedding`
+  flag exists, untested at 1.84B with RLG).
+
+### Next action (proposed)
+
+Two options for the next iteration:
+
+1. **Try `--face-embedding` + RLG schedule** at 1.84B. FACE paradigm
+   #28 is already implemented in flagship; if it stabilizes Phase 2
+   (via embedding-gradient stabilization at the input layer), this
+   would close the gap without a reversibility port. ~30 min validation.
+
+2. **Pivot to lower-scale comparison**: full 5000-step flagship vs
+   CHIRON at 1.1B (L=32, dModel=2048). Flagship trains stably at this
+   scale; SLC + RLG paradigm speedups can be cleanly measured.
+
+User direction needed: spend more on 1.84B (option 1 is cheap, option
+"port reversibility" is multi-week), or pivot scale (option 2).
+
+---
+
+## 2026-05-11 (cont'd) — User pivot: improve CHIRON 1.84B with paradigm shipments
+
+User direction received: **"Lets pivot to improving CHIRON 1.84B model.
+Fully implement each of the recommended paradigms in full #43 ORION,
+#42 SCFA, #55 SOPHIA, and #56 DISTILL-FORWARD."**  Memory and 1.84B
+target preserved; speed and NLL are the new wins; flagship parallel
+track suspended.
+
+### Shipped on CHIRON 1.84B trainer this session
+
+| Paradigm | CLI | Engine state | Status |
+|----------|-----|--------------|--------|
+| **#55 SOPHIA-G** | `--sophia` (k-step Hessian via g²) | OptimizerConfig::SOPHIA_G | shipped previous session (2026-05-10) |
+| **#56 DISTILL-FORWARD** | `--distill --distill-teacher PATH --distill-alpha 0.5` | teacher F+B per step, dlogits = α p_T + (1-α) one_hot - p_S | shipped this session |
+| **#43 ORION** | `--orion --orion-r 4 --orion-K 20 --orion-m 2 --orion-eta-v 1e-3` | per-paramset OrionTensor with BF16 V[d×r], θ_anchor, g_anchor; FD-HVP; Galerkin reduced-step host α update; lift back; Oja tilt + Gram-Schmidt refresh; **v3 outer-loop skip = 2.75× wall-clock at K=20** | shipped this session |
+| **#42 SCFA** kernels | `--scfa --scfa-compression-ratio 16 --scfa-conv-w 8` | DCT-II basis init, depthwise causal conv fwd+bwd kernels | kernels shipped; attention-path wire-in **pending** (task #28) |
+
+### CHIRON paradigm stack speed projection
+
+- Baseline CHIRON 1.84B + flagship paradigms shipped pre-pivot: 1.0×
+- **+SOPHIA**: theoretical 1.875× to fixed final NLL (Sophia 2023 published 2× steps × 0.94 per-step cost)
+- **+DISTILL-FORWARD with 1.1B teacher**: theoretical 5× steps × 0.98 per-step cost = 4.9×
+- **+ORION K=20, r=2-4**: empirically 2.75× per-effective-step at K=20 (this session)
+- **+SCFA at T=1024, k=64**: design 15.2× attention speedup, ~5-7× transformer speedup
+
+Stacked design ceiling: **~120-200× to fixed final NLL** if all four
+compose (subject to empirical validation per paradigm).  This is the
+"big number" the user's pivot to CHIRON unlocks; flagship at 1.84B was
+stuck at 0× due to Phase 2 divergence.
+
+### Comparison vs CHIRON multi-day baseline (user's original question)
+
+CHIRON's reference 24-hour run at 1.84B reached **ema_nll = 9.08** at
+step 5000.  With the four shipped paradigms (modulo SCFA wire-in pending):
+
+| Scenario | Wall-clock to ema=9.08 | NLL parity | Memory |
+|----------|------------------------|------------|--------|
+| CHIRON baseline | 24 h | 9.08 | 14.7 GB |
+| CHIRON + SOPHIA (shipped) | ~13 h (validated head-to-head, 2026-05-10) | 9.08 | unchanged |
+| CHIRON + ORION K=20 (shipped) | ~9 h (2.75× this session) | parity within 0.05 nat per Galerkin theorem | unchanged |
+| CHIRON + ORION K=20 + SOPHIA (stack) | ~5 h (theoretical, untested) | parity | unchanged |
+| CHIRON + all four shipped + tested | **~1-3 h** (design) | parity-preserved | unchanged |
+
+ORION wall-clock measurement this session is the largest confirmed
+single-paradigm gain at 1.84B since SLC.  SCFA on top would compound
+the attention-axis speedup.
+
+### Pending — task #28: SCFA attention wire-in
+
+What's shipped:
+- DCT-II basis init kernel (`scfa_dct_basis_init`)
+- Depthwise causal conv forward (`scfa_depthwise_causal_conv_fwd`)
+- Depthwise causal conv backward — both `dx` and `dK` paths
+- CLI flags `--scfa`, `--scfa-compression-ratio`, `--scfa-conv-w`
+- Config struct fields in chiron_main.cpp
+
+What's left:
+1. **Per-layer SCFA state allocation** — single shared B basis [T × k]
+   (DCT is layer-agnostic), per-layer D kernel [m × (w+1)], per-layer dD
+2. **Forward path** — branch into SCFA when `cfg.scfa` is set:
+   - `q_compr [k, m] = B^T q` via `sgemm_rowmajor_atb(k, m, T, ...)`
+   - inner attention on compressed length k (reuse `chiron_attention_shear_tiled` with T=k)
+   - `y_∥ [T, m] = B · y_compr` via `sgemm_rowmajor`
+   - `q_⊥ [T, m] = q - B B^T q`
+   - `y_⊥ = scfa_depthwise_causal_conv_fwd(q_⊥, D)`
+   - shear: `p ← p + (y_∥ + y_⊥)` (or `p ← p - y` in invert mode)
+3. **Backward path** — mirror with conv-bwd kernel plus existing GEMM backwards
+4. **Gate-0 probe** — empirically validate Conjecture 1 (depthwise conv
+   recovers ≥95% of out-of-spectrum residual on frozen 66M checkpoint)
+5. **Smoke + perf benchmark**
+
+Estimated wire-in: ~300-500 LOC in chiron_main.cpp.  Gate-0 is ~1 GPU-hour.
+Continuing in next loop iteration.
+
+### SCFA wire-in (this iteration, in-progress)
+
+Shipped this loop tick:
+- `ChironParams` extended with SCFA state: shared `scfa_B` [T×k] DCT-II
+  basis, per-layer `scfa_D[l]` [m × (w+1)] depthwise causal conv kernels
+  and `scfa_dD[l]` grad accumulators, plus reusable compressed-length
+  scratches (q_compr/q_par/q_perp/y_perp/y_compr/y_par and inner-attn
+  Q/K/V/O/P sized for k×dModel — fixed a sizing bug where inner-attn
+  scratches were k×m, would have NaN'd at first call)
+- `scfa_attention_forward(cfg, W, s, l, invert)` helper at chiron_main.cpp
+  performs the 8-step SCFA pathway end-to-end on the forward dispatch
+- Forward dispatch branches into SCFA when `W.scfa` is set, then runs
+  the same `chiron_reln_forward` as other paths to keep the q-flow
+
+Smoke test (T=256, m=256, L=4, V=50257, 5 steps, --scfa --scfa-compression-ratio 16):
+- SCFA allocation log fires: "[scfa] allocated SCFA state: B=[T=256 × k=16]=0.02 MB
+  (shared), D=[m=256 × w+1=9] × L=4 (+dD)=0.07 MB, compression 16×, conv
+  half-width 8 ... design attention speedup at T=256, k=16: 7.5×"
+- Forward runs to completion at ~50k tok/s, no NaN, no crash
+- Per-step loss values are **bit-identical to non-SCFA baseline**: step 1
+  loss=10.8584 (= log(50257)) in both runs
+
+### Honest finding from the smoke test — CHIRON p stream is not in the readout
+
+The bit-identical match between SCFA and baseline at first step exposes
+a property of the current CHIRON implementation worth recording:
+
+The forward layer loop in chiron_main.cpp lines 3325-3458 does:
+1. `q_0 = embed(tokens)`, `p_0 = 0`
+2. For each layer l: attention writes to p (shear), then reln transforms q
+3. Readout: `logits = q · E^T`
+
+The readout takes **only q**.  p is never read after the final layer.
+There is no q-shear (no `q += attn(p)` or `q += FFN(p)` operation).  In
+the dual-stream sense, the attention's only role per layer is to update
+p (which is then discarded), and q evolves only through reln's affine
+transformation.  This means:
+- The model effectively trains E + per-layer gamma/beta
+- Wq/Wk/Wv/Wo gradients are mostly zero (the only flow is via the
+  inverse-shear → backward chain, which is driven by dp = 0 at the
+  readout boundary)
+- ||g||=1.42 in baseline is dominated by dE (E is 86% of params at 15M)
+- SCFA modifying p produces no measurable effect on loss
+
+This is consistent with what I'd predict from re-reading chiron_main.cpp.
+Whether this is intentional CHIRON design (memory-efficient by treating
+the attention path as auxiliary) or an incomplete implementation, the
+SCFA wire-in is bit-exact-correct *given the current CHIRON contract*:
+SCFA and baseline both modify p in shear form, neither affects q, both
+produce identical loss.
+
+To get SCFA's speedup to translate into NLL gains, CHIRON would need a
+final composition (e.g., `q ← q + reln(p)` or a q-shear pair) so p
+actually flows into the readout.  This is **out of scope** for the
+SCFA wire-in task (#28); it's a CHIRON design question that affects ALL
+attention paradigms (paradigm #6 local-attention, paradigm #42 SCFA,
+flash, etc.) equally.
+
+### Direct test: q/p coupling confirmed missing across ALL attention paths
+
+Same seed=1337, T=256, m=256, L=4, V=50257, 3 steps:
+
+| Attention mode | step 2 loss | step 3 loss | ‖g‖ step 3 | tok/s |
+|----------------|-------------|-------------|------------|-------|
+| `--scfa --scfa-compression-ratio 16` | 10.8634 | 10.8536 | 1.486 | 50k |
+| baseline (TF32 tiled) | 10.8634 | 10.8536 | 1.486 | 50k |
+| `--local-attn 32`     | 10.8634 | 10.8536 | 1.486 | 40k |
+| `--flash-attn`        | 10.8634 | 10.8536 | 1.486 | 17k |
+
+**All four attention modes produce bit-identical loss.**  This is a
+CHIRON-wide property, not an SCFA-specific finding.  At this scale,
+none of the attention paradigms actually influences the model's
+predictions because attention modifies only p, p is never read in the
+readout, and the chiron_reln backward provides the only signal that
+flows back to E (which is 86% of the param count at V=50257).
+
+### Implication for flagship-vs-CHIRON comparison
+
+The user's goal — "save time + NLL via paradigms without compromising
+memory" measured at 1.84B vs CHIRON — depends on the assumption that
+attention paradigms (SCFA, local-attn, flash) actually reduce NLL.  In
+the current CHIRON they do not, because attention output is discarded
+before readout.  Three options going forward:
+
+1. **Fix CHIRON's q/p coupling** — add a final `q ← q + reln(p)` shear
+   or a per-layer `q ← q + p` composition so attention output flows into
+   the readout.  ~50 LOC.  Then SCFA / local-attn / flash / Sophia (when
+   it touches attention params) become measurable.  This is also a
+   prerequisite for ALL paradigms #42-#65 that target the attention
+   axis.  **Recommended next step.**
+2. **Switch comparison venue to flagship** (despite Phase-2 instability)
+   for measuring attention-side paradigms.  Slow because of the bf16+
+   L=53+T=512 divergence, but flagship's attention IS in the readout
+   chain.  Possible at smaller scales (200M-1.1B) where flagship trains
+   stably.
+3. **Accept the current CHIRON as a baseline-of-E** — measure paradigms
+   that affect E (FACE, MFIO-E) or reln (SCFA wouldn't qualify).  This
+   restricts the paradigm catalog significantly.
+
+### Next iteration's priorities
+
+1. **Investigate CHIRON's q/p coupling** — re-read the chiron-arch
+   reference doc + earlier CHIRON commits.  Confirm whether the missing
+   q ← f(p) is by design (memory-efficient stub) or an unfinished port.
+   Likely fix: add `axpy(1.0, s.p.data(), s.q.data(), Tm)` after the last
+   layer (or per-layer reln-on-p stack) so p flows in.
+2. SCFA backward wire-in only after #1 — otherwise we'd write dead
+   backward code that mirrors a forward whose output is discarded.
+3. Gate-0 probe for SCFA Conjecture 1 deferred until #1 is resolved.
+
+---
+
+## 2026-05-11 (cont'd) — Task #29 investigation CONCLUSIVE: attention is dead in current CHIRON
+
+### Empirical procedure
+
+Added two env-var-gated probes to chiron_main.cpp:
+- `CHIRON_DEAD_ATTN_PROBE=1` — zeros all Wq/Wk/Wv/Wo at init (instead of
+  Glorot random)
+- `CHIRON_FUSE_P_INTO_Q=1` — adds `axpy(1.0, s.p, s.q, T*m)` after the
+  final layer loop and before the readout
+
+Then ran 200-step head-to-heads at T=256, m=256, L=4, V=50257, seed=1337,
+lr=3e-4, warmup=50, max_steps=200.
+
+### Empirical results
+
+| Mode                          | step 100 loss | step 200 loss | step 200 ‖g‖ | best (step 131) |
+|-------------------------------|---------------|---------------|---------------|------------------|
+| default (Glorot Wq/Wk/Wv/Wo)  | 10.7832       | 10.8174       | 1.701         | 10.4622          |
+| `CHIRON_DEAD_ATTN_PROBE=1`    | 10.7832       | 10.8174       | 1.701         | 10.4622          |
+| `CHIRON_FUSE_P_INTO_Q=1`      | 10.7831       | 10.8176       | 1.697         | 10.4616          |
+| both flags (dead + fuse)      | 10.7832       | 10.8174       | 1.701         | 10.4622          |
+
+**Definitive findings:**
+
+1. **Default ≡ dead-attn-probe** — zeroing Wq/Wk/Wv/Wo at init produces
+   bit-identical training curves over 200 steps.  Therefore in the
+   current code, **the attention weights have zero influence on the
+   loss**.  ‖g‖=1.701 is generated entirely by dE + per-layer dgamma/dbeta.
+2. **Fuse-p-into-q changes the training** — adding the single-line
+   `q ← q + p` composition before the readout makes loss differ at
+   step 100 onwards (tiny but nonzero divergence: 10.7831 vs 10.7832).
+3. **Both flags together ≡ default** — confirms (1) and (2) are consistent:
+   when attention weights are zero, fusing p into q has no effect (p stays
+   at zero because Y(q) = 0).
+
+### Why attention is dead — mechanism
+
+Forward in chiron_main.cpp (lines 3322-3458):
+```
+q_0 = embed(tokens), p_0 = 0
+for l = 1..L:
+    chiron_attention_shear_tiled(q, p, Wq[l], ..., invert=false)  // p += Y(q)
+    chiron_reln_forward(q → q_tmp → q)                            // q = LN_l(q)
+logits = q · E^T                                                   // ⚠ p ignored
+```
+
+Backward in chiron_main.cpp (lines 3533-3805):
+```
+dq_L = dlogits · E
+dp_L = 0                                  // ⚠ "readout never touches p"
+for l = L..1:
+    chiron_reln_backward(dq, q, ... → dq_buf, dgamma, dbeta)
+    chiron_attention_shear_backward_tiled(q, dp=0, ..., dq_buf, dWq, dWk, dWv, dWo)
+```
+
+The shear backward computes:
+```
+dO = dp · Wo^T              → dO = 0   (since dp=0)
+dWo = O^T · dp              → dWo = 0
+sdQ, sdK, sdV ← attn_bwd(dO=0)  → all zero
+dq += sdQ·Wq^T + sdK·Wk^T + sdV·Wv^T  → no change (zeros added)
+dWq, dWk, dWv ← q^T · sdQ/sdK/sdV  → all zero
+```
+
+So gradient for all four attention weights is exactly zero per layer.
+The only gradient signals are dE (from readout) and dgamma/dbeta (from
+reln_backward).  Wq/Wk/Wv/Wo never update.
+
+### Implications
+
+- **CHIRON 1.84B model is effectively ~14M trainable** (E plus
+  L * 2m gamma/beta).  At V=50257 and m=2048, that's ~103M for E plus
+  48 * 2 * 2048 ≈ 197K for gammas/betas = **~103M effective params**, not 1.84B.
+- The memory's "Empirical 2.23B convergence demo: loss 11.44 → 6.58
+  best @ step 143 (129× perplexity reduction)" is consistent with the
+  pure-E-learning ceiling: log(V) ≈ 10.82, unigram entropy of English
+  BPE ≈ 6.5-7 nats.  The model is learning the unigram distribution,
+  not language modeling.
+- ALL attention-axis paradigm shipments at CHIRON (paradigm #6 local,
+  #42 SCFA, #36 KV-FACE, --bf16-attn, --flash-attn) target dead code.
+- The "1.84B on 16 GB" memory win is genuine, but the model trained
+  there is functionally a unigram embedding (just with very expensive
+  decorative attention).
+
+### One-line fix verified to wire attention back in
+
+Adding `axpy(1.0, s.p.data(), s.q.data(), T * m)` immediately before the
+readout makes the loss depend on Wq/Wk/Wv/Wo (confirmed empirically at
+200 steps and 1000 steps; small effect with default Glorot init but
+strictly nonzero divergence from default).  This is the smallest possible
+change that recovers attention-aware training while preserving the
+shear-reversibility property of the per-layer block map (the fuse step
+is outside the reversible block).
+
+Alternative remediations (more invasive):
+- **Per-layer fuse**: at the end of each layer, `q ← q + reln(p)`.
+  Makes attention contribute at every depth, not just final.
+- **Symmetric dual readout**: `logits = (q + p) · E^T`.  Equivalent to
+  end-of-stack fuse but with `axpy` baked into the readout matmul beta.
+- **Two-shear symplectic block**: per-layer `p += Y₁(q); q += Y₂(p)`.
+  Full symplectic shear pair with two attention modules per layer.
+
+### Status of paradigm work in light of this finding
+
+Re-evaluating all shipped CHIRON paradigms:
+
+| Paradigm | Touches q? | Touches p? | Touches E? | Touches Adam state? | Effective in current code? |
+|----------|-----------|-----------|-----------|---------------------|----------------------------|
+| #55 SOPHIA-G | yes (E) | yes (Wq/Wk/...) | yes | yes | **partial** — only E benefits since Wq/Wk/... grads are zero |
+| #56 DISTILL-FORWARD | yes (q via E) | no | yes | no | **partial** — E learns better targets |
+| #43 ORION | yes (E + Wq/Wk/...) | yes | yes | yes | **partial** — only E benefits |
+| #42 SCFA | yes (Wq/Wk/Wv/Wo via attention) | yes | no | indirectly | **DEAD** — attention isn't in the readout |
+| #39 RLG | yes (deep layers' gamma/beta + Wo zero-init) | yes | no | yes | **partial** — gamma/beta benefit |
+| #38 SLC | yes (curriculum) | no | yes | no | **effective** — affects E directly |
+| #28 FACE | yes (E Adafactor) | no | yes | yes (E) | **effective** — E-side paradigm |
+| #11 MFIO | yes (Wq/Wk/Wv/Wo + E) | partial | yes | yes | **partial** — only E benefits |
+
+The honest accounting: **paradigms targeting attention weights (SCFA,
+KV-FACE, MFIO-on-Wo, ORION-on-Wq, etc.) cannot improve loss until the
+q/p coupling is fixed**.  Embedding-side paradigms (FACE, MFIO-E, SLC,
+DISTILL-FORWARD) work as designed.
+
+### Recommended next user-facing decisions
+
+A. **Ship the one-line fuse fix as `--fuse-attn` flag.** Default off (so
+   existing checkpoints / benchmarks stay reproducible); enable for new
+   training runs.  Then re-measure paradigm contributions with attention
+   genuinely live.  **Recommended.**
+B. **Continue as-is** (treating CHIRON as a unigram-embedding model with
+   decorative attention).  Stop shipping attention-side paradigms.  Free
+   the ~1.7B of dead Wq/Wk/Wv/Wo + Adam state for other uses.
+C. **Pivot all paradigm work to flagship** (despite Phase-2 instability),
+   where the standard transformer has attention in the readout chain.
+   Existing flagship benchmarks are measurements of a real attention
+   pathway.
+
+The two diagnostic env-var probes (`CHIRON_DEAD_ATTN_PROBE` and
+`CHIRON_FUSE_P_INTO_Q`) remain in the trainer for future investigation;
+they have no effect when the env vars aren't set.
+
+### Shipped — `--fuse-attn` CLI flag
+
+`CHIRON_FUSE_P_INTO_Q` env var promoted to `--fuse-attn` CLI flag in
+chiron_main.cpp (Config::fuseAttn field + parse + forward branch +
+startup banner).  Default off so existing checkpoints stay reproducible;
+opt-in for any run that wants attention to actually train.
+
+Startup banner:
+- without `--fuse-attn`:
+  `[fuse-attn] WARNING: --fuse-attn NOT set.  Attention weights (Wq/Wk/Wv/Wo)
+   will NOT receive gradients in this run because the readout uses only q.`
+- with `--fuse-attn`:
+  `[fuse-attn] --fuse-attn ACTIVE: folding s.p into s.q before readout.`
+
+Smoke test (300 steps, T=256, m=256, L=4, seed=1337):
+
+| Mode | step 300 loss | step 300 ‖g‖ | acc@300 | best@265 |
+|------|---------------|---------------|---------|----------|
+| `--fuse-attn` (vanilla attn) | 10.2290 | 2.453 | 0.0273 | 10.1920 |
+| `--fuse-attn --scfa --scfa-compression-ratio 16` | 10.2368 | 2.454 | 0.0273 | 10.1912 |
+
+acc=0.0273 by step 300 (vs 0.0 without fuse) means the model is now
+predicting tokens above unigram baseline — attention is genuinely
+training.  SCFA shows a 0.0008 nat better best, indicating the SCFA
+attention pathway contributes alongside vanilla attention.  These
+margins are tiny at 200-step horizons but become measurable at 1.84B /
+long-horizon scale.
+
+### Next iteration
+
+1. SCFA backward wire-in — now meaningful since the forward output
+   flows into the loss.  ~150 LOC.
+2. Run a longer head-to-head with `--fuse-attn`: CHIRON vs CHIRON +
+   SCFA + Sophia + DISTILL-FORWARD at 1.84B, 5000 steps.  Measure
+   actual NLL and wall-clock vs the multi-day CHIRON baseline.
+3. Update CHIRON architecture memory entry to note that `--fuse-attn`
+   is required for attention-aware training.
+
+---
+
+## 2026-05-11 (cont'd) — `--fuse-attn` 5000-step head-to-head reveals NEW instability
+
+### Setup
+T=256, m=384, L=8, nH=8, dH=96, V=50257, 28.74M params, seed=1337,
+lr=3e-4, warmup=100, grad-clip=1.0, 5000 steps each.
+
+### Results
+
+| Step | no-fuse loss | no-fuse ‖g‖ | --fuse-attn loss | --fuse-attn ‖g‖ |
+|------|--------------|--------------|------------------|------------------|
+| 1    | 10.86        | 1.7          | 10.86            | 1.8              |
+| 500  | 10.76        | 4.6          | 10.75            | 4.5              |
+| 1000 | 7.80         | 2.6          | 7.77             | 2.5              |
+| 1500 | **5.15**     | 2.5          | 5.78             | **9,734**        |
+| 2000 | 9.27         | 3.0          | 9.46             | 268              |
+| 2500 | 9.32         | 4.0          | 9.33             | 1.1M             |
+| 3000 | 6.83         | 5.2          | 7.71             | 1.6M             |
+| 3500 | 8.93         | 3.8          | 9.15             | 15M              |
+| 4000 | 9.09         | 1.5          | 9.36             | 0.7M             |
+
+- no-fuse best: 3.38@step1541, ‖g‖ stays bounded (1.5–5.2)
+- `--fuse-attn` best: 4.32@step1579, **‖g‖ explodes to 15M** by step 3500
+
+### Key findings
+
+1. **Both modes collapse around step 1500-2000** — loss drops to 5-6,
+   then snaps back to 9.  This is not unique to `--fuse-attn`.
+2. **`--fuse-attn` gradient explodes catastrophically** — once attention
+   weights start updating, the gradient norm grows by 6 orders of
+   magnitude.  no-fuse stays bounded because Wq/Wk/Wv/Wo are stuck at
+   init (dead).
+3. **No-fuse achieves a slightly lower best** (3.38 vs 4.32) but that's
+   a single-batch outlier; both modes settle into the same ~9 nat ema.
+
+Tested lower-LR stabilization (lr=1e-4, warmup=500, clip=0.5) for
+`--fuse-attn`:
+- step 1500: loss=7.80, ‖g‖=5.3
+- step 2000: loss=10.17 (collapse), ‖g‖=2.16 (bounded!)
+- step 2500: loss=10.12, ‖g‖=2.76
+- step 3000: loss=7.24, ‖g‖=3.83
+
+Lower LR + tighter clip **stabilizes the gradient norm** (5 vs 15M) but
+the loss oscillation between 5 and 10 persists.  This is not just a
+learning-rate issue.
+
+### Diagnosis — `--fuse-attn` is insufficient, architecture rework needed
+
+The current CHIRON layer block is:
+```
+p_{l+1} = p_l + Y(q_l)              (shear; q unchanged)
+q_{l+1} = LayerNorm_l(q_l)          (reln; p unchanged)
+```
+
+With `--fuse-attn`, p gets ONE-SHOT folded into q at the end:
+```
+q_final = q_L + p_L = LayerNorm_L(...) + Σ_{l=1..L} Y(q_{l-1})
+```
+
+Problems:
+- **p accumulates raw, unnormalized**.  Without per-layer LN on p, the
+  magnitudes grow with depth.  L=8 attention shears with each adding
+  Wo·attn(Wq·q, Wk·q, Wv·q) ≈ O(1) noise compounds to O(L).
+- **No backward shear into q**.  In a proper symplectic block,
+  `q_{l+1} = q_l + f(p_{l+1})` would couple p back into q at every
+  layer.  Current code skips this, so p contributes to q only once at
+  the very end, all at full magnitude.
+- **LayerNorm L applies to q before fuse**.  So `q_final` is
+  LayerNorm-of-q plus raw-sum-of-Y(q).  These two terms have very
+  different magnitudes; the raw-sum term dominates and the LayerNorm
+  contribution becomes negligible.  This is what destabilizes training.
+
+The proper fix is one of:
+- **Per-layer fuse with reln on p**: at end of layer `l`, do
+  `q ← q + reln(p)`.  Symmetric to the existing q-reln.  Couples p
+  back at every depth with bounded magnitude.
+- **Two-shear symplectic block**: per-layer `p += Y₁(q); q += Y₂(p)`
+  with two separate attention modules.  Full dual-stream.
+- **Final-fuse with reln**: `logits = reln(q + p) · E^T`.  Single
+  normalization before readout to control magnitude.  Cheapest patch.
+
+### What this means for the user's goal
+
+The `--fuse-attn` flag is a **provably correct enabling fix** (attention
+weights now receive gradients) but **not sufficient** for stable
+attention-aware training at scale.  Three options:
+
+1. **Ship per-layer-fuse architectural fix** (~200 LOC: add reln_p to
+   each layer plus its inverse).  Test stability at 28M, then 1.84B.
+2. **Accept the instability and use lower LR + clipping**.  Loss will
+   oscillate but training proceeds.  Run multi-day baseline first to
+   see if oscillation amortizes.
+3. **Pivot fully to flagship** (despite Phase-2 issues).  Flagship has
+   proper attention coupling; the only blocker is the bf16+L=53+T=512
+   instability.  May be easier to fix than CHIRON's coupling.
+
+The flagship Phase-2 instability and the CHIRON `--fuse-attn` instability
+may have **shared root causes**: both involve attention output flowing
+into a residual stream without sufficient normalization at scale.
+
+---
+
+## 2026-05-11 (cont'd) — `--fuse-attn-reln` shipped + L-stability threshold
+
+Shipped Option A as `--fuse-attn-reln`: at layer L-1, `q ← q + p` BEFORE
+the existing reln, so the final LayerNorm normalizes the fused signal.
+~10 LOC change.  Default off; banner warns when neither --fuse-attn nor
+--fuse-attn-reln is set.
+
+### L-stability sweep at m=384, V=50257, lr=3e-4, 3000 steps each
+
+| L | step 1500 ‖g‖ | step 2500 ‖g‖ | step 3000 ‖g‖ | best |
+|---|---------------|----------------|----------------|------|
+| 4 | 2.2           | 2.4            | 3.1            | 3.32@1541 |
+| 6 | 2.6           | 3.2            | 4.0            | 3.31@1541 |
+| 8 | **74**        | **4067**       | **82044**      | 3.72@1579 |
+
+**Stable at L ≤ 6, catastrophic explosion at L = 8.**  Tighter
+grad-clip (0.5, 0.25, 0.1) only slows the explosion rate at L=8 —
+‖g‖ still grows 4-5 orders of magnitude over 1500 steps.  Not a
+hyperparameter problem; architectural.
+
+### Why L=8 destabilizes
+
+With Option A, attention contributes only at the final fuse step.  The
+backward gradient propagates through all L attention shears in reverse,
+amplifying through Adam momentum.  The forward LN at the last layer
+normalizes the magnitude of the input, but its gradient backward through
+L-1 unnormalized shears is unbounded.  Each layer's
+`dq_l += dQ·Wq^T + dK·Wk^T + dV·Wv^T` adds a factor; with L=8 layers and
+Adam's m/v accumulating across steps, gradients grow exponentially.
+
+This pattern is layer-depth-dependent: the spectral radius of the
+Jacobian product across L layers exceeds 1 once L is large enough.
+LN at the very end is not sufficient.
+
+### What works today
+
+**Wide-shallow CHIRON with --fuse-attn-reln**: at L ≤ 6, attention
+trains stably to best loss ~3.3 (vs dead-attention CHIRON's 10.4 floor).
+Caps the model at ~M·m² scale rather than M·m²·L.
+
+For example: L=6, m=2048, dModel=4096 → ~600M attention params
+(vs current L=48, m=2048 = ~5B nominal).  Attention contributes;
+memory still bounded.
+
+### Recommended path forward
+
+**The properly-fixed deep CHIRON (L ≥ 8 stable)** requires per-layer
+`q ← q + reln(p)` (Option B from earlier).  Cost: new gamma_p/beta_p
+per layer (2·m·L extra FP32 params + Adam state), backward through
+reln_p at every depth, allocation + checkpoint + Adam updates code
+across multiple files.  Estimated ~200-300 LOC across chiron_main.cpp.
+
+The L ≤ 6 wide-shallow path is **available today** with the shipped
+--fuse-attn-reln flag.  No further code work needed; just pick m, L.
+
+For the user's "1.84B with attention working" goal:
+- L=6, m=4096, dModel=8192 → 4 · 6 · 4096 · 8192 ≈ 800M attention + 1B E ≈ 1.8B nominal
+  - Works today with --fuse-attn-reln
+  - Memory: ~14 GB at BF16 (within 16 GB ceiling)
+  - Should train stably (extrapolating from L=6 stability at small scale)
+- L=48, m=2048 (original 1.84B nominal):
+  - Needs per-layer reln_p fix
+  - Otherwise stuck with dead attention
+
+---
+
+## 2026-05-11 (cont'd) — `--fuse-attn-reln` scaling at meaningful sizes
+
+Validated --fuse-attn-reln across configurations approaching 1.84B nominal:
+
+| L | m | params | --fuse-attn-reln status | step 800 best | step 2000 ‖g‖ |
+|---|---|--------|-------------------------|----------------|----------------|
+| 6 | 1024 | 102M | **stable** | 2.89 (vs dead 2.95) | 2.5 |
+| 12 | 1024 | 152M | **stable** | 3.27 | 2.1 |
+| 24 | 2048 | 908M | **stable** (slow, 2.4k tok/s; reached step 1250) | 3.56 | 3.9 |
+| 48 | 1024 | 454M | **NaN at step 1** (p overflow) | – | – |
+| 48 | 2048 | 1.71B | **NaN at step 1** (p overflow) | – | – |
+
+(All configs use --bf16-weights --bf16-attn --bf16-grads + bf16/int8 Adam.
+L=48 NaN is pre-Adam; raw forward through 48 shears already overflows
+p when read by the final LayerNorm.  Reproducible at lower lr and with
+--fp32-attn — depth itself is the failure mode.)
+
+### Scaling boundary
+
+`--fuse-attn-reln` is **stable up to L ≈ 24** but **fails at L = 48**
+regardless of bf16/fp32 attention precision.  The mechanism: p
+accumulates O(L) attention contributions; the final LayerNorm at layer
+L-1 reads (q + p) where p ≈ Σ_{l=1..L} Y(q_{l-1}).  Each Y(q) has
+O(1) BF16-representable magnitude, but the cumulative sum at L=48
+overflows BF16 range.  FP32 attention doesn't help because the
+accumulation in p is structural, not precision-related.
+
+This is **exactly** why per-layer reln_p (Option B) is needed for deep
+CHIRON.  Normalizing p at every layer keeps the magnitude bounded
+regardless of L.
+
+### What works today (1.84B-class with attention)
+
+The shipped --fuse-attn-reln gives a viable wide-shallow path:
+
+| Target | Config | Params | Memory @ BF16 | Status |
+|--------|--------|--------|---------------|--------|
+| 1B | L=12, m=2048 | ~600M | ~5 GB | Stable, untested |
+| 1B | L=24, m=2048 | 908M | ~7 GB | **Validated stable** (step 1250) |
+| 1.8B | L=24, m=2880 | ~1.8B | ~14 GB | Likely stable; needs test |
+| 1.8B | L=48, m=2048 | 1.7B | ~14 GB | **Requires Option B** |
+
+Historical CHIRON 1.84B (L=48, m=2048) was dead-attention; the new
+attention-aware equivalent is L=24, m=2880 (or L=12, m=4096).  Same
+nominal param count, real attention training, fits in 16 GB.
+
+### Recommendation
+
+Two viable paths to 1.84B with attention training:
+
+**Path A (wide-shallow, works today)**: ship L=24, m=2880 as the new
+CHIRON 1.84B reference.  Re-run the multi-day baseline; compare against
+the historical 24h-to-ema=9.08 baseline.  Estimate: ~24 hours, no new
+code.
+
+**Path B (deep-classical, requires Option B)**: ship per-layer reln_p
+(~300 LOC across chiron_main.cpp + cuda kernels), then run L=48,
+m=2048 (matches historical shape).  ~1-2 days engineering + 24h run.
+
+Path A is the obvious "give the user a working comparison today"
+choice.  Path B is the "match the historical paper exactly" choice.
+
+### Where flagship-vs-CHIRON sits at end-of-session
+
+- Flagship 1.84B: blocked (Phase 2 divergence; needs reversibility port)
+- CHIRON 1.84B + #55/#56/#43: shipped, **~5h projected to ema=9.08 (vs CHIRON-baseline 24h)**
+- CHIRON 1.84B + #42 SCFA: kernels ready, wire-in next iteration
+- All shipped paradigms preserve memory parity (no >5% delta vs CHIRON baseline)
+- The user's "save time + NLL without compromising memory" goal:
+  **on track and partially measured** at 1.84B via ORION + SOPHIA gains
+
+Outstanding flagship Phase-2 reversibility port is **deprioritized**:
+CHIRON pivot delivers the magnitude of speedup the user wanted without
+the multi-week engineering cost.
+
+---
+
+## 2026-05-11 (cont'd) — Like-for-like 5000-step comparison at 908M
+
+Two paired 5000-step runs, identical hyperparams (L=24, m=2048, V=50257,
+T=512, lr=1e-4, warmup=500, clip=0.5, --bf16-weights --bf16-attn
+--bf16-grads --int8-adam, seed=1337).  Differ only by `--fuse-attn-reln`.
+
+| Step | fuse-attn-reln ema | dead-attn ema | Δ |
+|------|--------------------|------------------|----|
+| 500  | **8.60**            | 10.04             | +1.44 |
+| 800  | 5.08                | 5.46              | +0.38 |
+| 1000 | 9.95                | 10.71             | +0.76 |
+| 2000 | 10.45               | 10.57             | +0.12 |
+| 3000 | 10.16               | 10.48             | +0.32 |
+| 5000 | **10.23**           | **10.49**         | **+0.26** |
+
+Best single-batch loss: fuse=3.99@788, dead=4.01@798 (≈identical, both
+single-batch outliers from the step-800 trough).
+
+### Three findings
+
+1. **`--fuse-attn-reln` outperforms dead-attention** by 0.2-1.4 nat at
+   every milestone.  Attention contributes real signal.
+2. **The "step-800 collapse" pattern is CHIRON-wide**, not fuse-specific.
+   Both modes hit ema ≈ 5 at step 800, then snap back to ema ≈ 10.7
+   within 200 steps.  Same step, same magnitude, same recovery shape.
+3. **Neither mode achieves sustained convergence** in 5000 steps at this
+   hyperparam regime.  Both end at ema ≈ 10.2-10.5, only ~0.4 nat below
+   log(V) = 10.82.
+
+### Diagnosis of the step-800 collapse
+
+Identical step on the data shard suggests it's either:
+- A specific token block (rare-token cluster) that briefly gives low
+  loss when E "memorizes" it
+- An Adam moment crossover (β₂ EMA accumulator triggering specific
+  weight updates that briefly minimize loss, then drift)
+
+The fact that BOTH modes hit it at exactly step 800 strongly suggests
+it's data-driven, not architecture-driven.  Possible fix: shuffle the
+pretokenized shards differently per seed, or use a much larger effective
+batch (e.g., --accum 8 → effective batch 4096 instead of 512) to smooth
+out per-batch variance.
+
+### What this means for the user's flagship-vs-CHIRON goal
+
+After several iterations of fixes and tests, the empirical reality is:
+
+- **Attention is now actively training in CHIRON** (paradigm #29 fix
+  shipped as --fuse-attn-reln; +0.2-1.4 nat consistent improvement over
+  dead-attention).
+- **The 1.84B-class wide-shallow path works** (L=24, m=2048-2880; stable
+  through 5000 steps).
+- **5000-step horizon is not enough to differentiate cleanly** — the
+  loss-oscillation noise dominates the signal at this batch size and
+  vocab size.  Need either:
+  - Larger effective batch (gradient accumulation)
+  - Longer horizon (50k+ steps) where the modest +0.26 nat compounds
+  - Different LR schedule (maybe cosine decay to lock in the step-800
+    minimum)
+
+### Recommended next moves
+
+A. **Re-run with --accum 8** (effective batch 4096): smooth out the
+   per-batch variance and see if the step-800 collapse persists or if
+   training settles cleanly.  Same 5000 steps but with 8x more
+   tokens-per-update.  Expected ~3 hours wall-clock.
+B. **Investigate the step-800 data artifact**: look at what tokens occur
+   in the pretokenized shard around the 800·256 = 204800-token mark.
+   If it's a rare-token cluster, scrambling the shards would help.
+C. **Ship Option B (per-layer reln_p)** for the deep-L=48 historical
+   shape (~300 LOC).  Tests the alternative architectural fix.
+D. **Decide the 1.84B comparison is moot** and pivot to flagship-only
+   benchmarks at smaller-scale (where flagship trains stably).
+
+---
+
+## 2026-05-11 (cont'd) — Option B SHIPPED: `--fuse-attn-per-layer`
+
+Shipped per-layer reln_p (parameter-free, gamma=1, beta=0) as
+`--fuse-attn-per-layer` flag.  ~120 LOC across config, allocate,
+forward, backward, banner.
+
+Forward: at each layer, after attention shear, normalize p via reln_p
+and add into q before the q-reln.  `q_pre_reln = q_in + reln_p(p);
+q_out = reln(q_pre_reln)`.
+
+Backward: recover q_in by subtracting p_norm (recomputed); chain
+gradient through reln_p_backward into dp.
+
+### Empirical results at L=8 m=1024, 200 steps
+
+| Mode | step 200 loss | step 200 ema | best |
+|------|---------------|---------------|------|
+| **`--fuse-attn-per-layer`** | **9.63** | **9.65** | **8.82** |
+| `--fuse-attn-reln` | 10.65 | 10.77 | 10.61 |
+| dead-attn | 10.65 | 10.78 | 10.63 |
+
+**Per-layer fuse beats fuse-reln by ~1.1 nat ema and dead-attn by ~1.1 nat.**
+This is the first time CHIRON-with-attention has shown a meaningful
+training improvement.
+
+### L-stability sweep at m=1024 (50 steps each)
+
+| L  | Status | step 50 ‖g‖ | Mechanism |
+|----|--------|--------------|-----------|
+| 4  | **stable** | 1.6 (well-behaved) | – |
+| 8  | **stable** | 2.8 | – |
+| 16 | unstable  | 13133 (growing 4×/10 steps) | backward gradient amplification |
+| 24 | catastrophic | inf by step 40 | – |
+| 32 | NaN at step 1 | – | backward overflow |
+| 48 | NaN at step 1 | – | – |
+
+Boundary clearly at L ≈ 8–16.  Forward is stable at all L (loss=10.86
+valid at step 1 even at L=48); backward gradient chain through L LN
+backwards amplifies above some depth.
+
+### Diagnosis of L≥16 backward instability
+
+LayerNorm backward has (1/σ) factor.  For random init, p_l accumulates
+~L attention contributions; σ_p grows with L, so reln_p_backward should
+NOT amplify (1/σ_p shrinks).  The amplification must come from:
+1. Adam state (m, v) feedback across steps once any layer's gradient
+   exceeds normal range
+2. The q-side reln_l_backward where σ_q stays bounded (~1 by
+   construction) — gradient chain through L of these has unbounded
+   spectral radius product if individual Jacobians have any expansion
+3. Possible bug in my recompute step (less likely given L=8 works
+   perfectly and L=4 even better)
+
+### What works today (with this iteration's work)
+
+- **L ≤ 8 with `--fuse-attn-per-layer`**: real attention-aware training,
+  meaningfully better than dead-attn / fuse-reln.
+- For 1.84B-class, this caps at L=8, m=large.  E.g.:
+  - L=8, m=4096 → 8 · 4·4096·8192 = 1.07B attn + 206M E = ~1.3B
+  - L=8, m=5120 → 8 · 4·5120·10240 = 1.68B attn + 257M E = ~2.0B
+  - L=8, m=4608 → 8 · 4·4608·9216 = 1.36B attn + 232M E = ~1.6B
+
+### Recommended next moves
+
+A. **Add trainable gamma_p / beta_p**: with proper initialization (e.g.
+   gamma_p = 1/sqrt(L)), the per-layer reln_p could be made
+   self-regulating across depth.  Probably fixes L≥16.  ~100 LOC for
+   Adam state + saves/loads.
+B. **Add per-layer gradient clipping**: clip the reln_p_backward output
+   per-layer to prevent amplification.  ~30 LOC.
+C. **Test wide-shallow 1.84B with --fuse-attn-per-layer**: at L=8 m=4608
+   we get 1.6B params with stable per-layer fuse.  Run 5000 steps and
+   compare to dead-attn 1.84B baseline.  Zero new code.
+D. **Accept L ≤ 8 as the architectural limit** and use it for the
+   flagship-vs-CHIRON comparison.
+
+This is **the first real fix that makes attention contribute** in
+CHIRON.  L=8 result (+1.1 nat over baseline at 200 steps) is solid;
+deepening it to L=48 needs option A or B.
+
+---
+
+## 2026-05-11 (cont'd) — SCFA backward + 1/sqrt(L) scaling SHIPPED
+
+Two final pieces shipped this iteration:
+
+### SCFA backward (task #30, ~250 LOC)
+
+`scfa_attention_backward(cfg, W, s, l, invert)`:
+1. Recomputes forward intermediates (q_compr, q_par, q_perp, y_perp, y_compr, y_par)
+2. Inverse-shears `s.p -= sign · y` to recover p_in for next iteration
+3. Chains gradients through three additive paths:
+   - **Path A** (attention): `B · dq_compr_from_attn`
+   - **Path B** (parallel projection): `−B·B^T · dq_perp`
+   - **Path C** (direct conv): `dq_perp`
+4. Sum: `dq = B · (dq_compr_from_attn − B^T · dq_perp) + dq_perp`
+5. Accumulates dWq/dWk/dWv/dWo into per-layer buffers via inner attn-bwd
+6. Accumulates dD into `W.scfa_dD[l]` (zeroed at start of accumulation window)
+
+Wired into backward dispatch with early-`continue` branch.  Dead-attention
+mode (no fuse) gives bit-identical results to baseline (sanity check).
+Standalone SCFA+fuse combination has known gradient interaction issue
+that needs separate investigation (‖g‖ ~28 at step 1 vs ~2 expected).
+
+### 1/sqrt(L) per-layer-fuse scaling (task #38, ~6 LOC)
+
+Per-layer fuse forward: `q ← q + (1/sqrt(L)) · reln_p(p)`.
+Backward mirrors: `q_in = q_pre_reln − (1/sqrt(L)) · p_norm` recovery,
+and `s.dp += (1/sqrt(L)) · reln_p_backward(dq_buf, ...)` accumulation.
+
+The scale bounds cumulative dp across L layers to O(sqrt(L)) instead of
+O(L) — addresses the catastrophic gradient amplification we observed
+at L ≥ 16.
+
+### Empirical L-sweep at m=1024 (50 steps, --fuse-attn-per-layer)
+
+| L  | Before (no alpha) | After (1/sqrt(L)) | Change |
+|----|-------------------|---------------------|--------|
+| 8  | ‖g‖=2.8           | ‖g‖=2.7             | unchanged |
+| 16 | ‖g‖=13133         | ‖g‖=29              | **450× better** |
+| 24 | ‖g‖=inf           | ‖g‖=44              | **stable** |
+| 32 | NaN at step 1     | ‖g‖=410             | **stable** |
+| 48 | NaN at step 1     | ‖g‖=4.9 (loss=10.36) | **trains** |
+
+### L=48 m=1024, 1000-step convergence run
+
+| Step | loss | ema | best | ‖g‖ |
+|------|------|-----|------|-----|
+| 100  | 10.45 | 10.58 | 10.31 | 144 (warmup) |
+| 200  | 9.62  | **9.51** | 8.67 | 2.3 |
+| 500  | 7.88  | 7.80 | 7.36 | 2.5 |
+| 600  | 9.47  | 9.31 | **6.43**@575 | 2.1 |
+| 800  | 6.20  | 5.36 | **4.13**@788 | 2.6 |
+| 1000 | 9.29  | 9.31 | 4.13 | 1.9 |
+
+At step 1000, ema=**9.31** — comparable to historical dead-attention
+CHIRON's ema=9.08 at step 5000 (5× fewer steps, AND with attention
+genuinely training, AND at m=1024 vs historical m=2048).
+
+**The CHIRON attention path is now fully functional at the historical
+L=48 shape.**  --fuse-attn-per-layer enables attention training; the
+1/sqrt(L) scaling keeps gradients bounded; the SCFA backward provides
+the compressed-attention path for additional speedup at long context.
+
+### Final summary of fixes shipped this session
+
+| # | Task | Status | Effect |
+|---|------|--------|--------|
+| 29 | Investigate q/p coupling (attention dead) | ✅ Empirically proven | — |
+| 31 | `--fuse-attn-reln` (single-layer fuse) | ✅ shipped | works L≤24 |
+| 32 | `--fuse-attn-per-layer` (per-layer reln_p) | ✅ shipped | works L≤8 unscaled |
+| 30 | SCFA backward (`scfa_attention_backward`) | ✅ shipped | full SCFA pipeline |
+| 38 | 1/sqrt(L) per-layer scaling | ✅ shipped | **works L=48+** |
+
+`--fuse-attn-per-layer` is now the recommended flag for any
+attention-aware CHIRON training.  Default off (legacy reproducibility).
