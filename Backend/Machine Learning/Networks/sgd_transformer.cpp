@@ -1250,7 +1250,27 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			const float warmupMult = net.trainingConfig.warmup.multiplier(static_cast<int>(tt.optimizerStep));
 			const float ddpLRScale = (net.trainingConfig.ddp.enable && net.trainingConfig.ddp.linearLRScaling)
 			                       ? static_cast<float>(glades::ddp::worldSize()) : 1.0f;
-			const float extraLRMult = warmupMult * ddpLRScale;
+			// Paradigm shift #38 SLC mini-LR-warmup (port from CHIRON iter-178).
+			// At each T-schedule transition, the trainer marks tt.optimizerStep
+			// via NNetwork::setSLCTransition(); the next slcMiniWarmupSteps
+			// optimizer steps clamp lrMult to a 0→1 linear ramp.  Element-wise
+			// min with warmupMult ensures the global warmup still applies
+			// at run start, and the SLC ramp re-applies on each transition.
+			float slcMult = 1.0f;
+			if (net.trainingConfig.slcLastTransitionStep >= 0 &&
+			    net.trainingConfig.slcMiniWarmupSteps > 0)
+			{
+				const long long since = (long long)tt.optimizerStep -
+				                        net.trainingConfig.slcLastTransitionStep;
+				if (since >= 0 &&
+				    since < (long long)net.trainingConfig.slcMiniWarmupSteps)
+				{
+					slcMult = (float)since /
+					          (float)net.trainingConfig.slcMiniWarmupSteps;
+				}
+			}
+			const float lowestWarmup = (slcMult < warmupMult) ? slcMult : warmupMult;
+			const float extraLRMult = lowestWarmup * ddpLRScale;
 
 			// Optional global grad norm clip (same semantics as other tensor paths).
 			float gradNorm = 0.0f;

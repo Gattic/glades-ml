@@ -2225,6 +2225,16 @@ public:
 	void setLearningRateScheduleCosine(int tMaxEpochs, float minMultiplier);
 	float getLearningRateMultiplier() const { return lrScheduleMultiplier; }
 	void setLrScheduleEpochOffset(int offset) { lrScheduleEpochOffset = offset; }
+
+	// Read-only accessor for the transformer's optimizer step count.
+	// Used by trainers driving paradigm-#38 SLC mini-warmup to mark the
+	// current step as the "last transition" right before a chunk that
+	// changes T.  Returns 0 if the network is not a transformer or hasn't
+	// trained yet.
+	unsigned long long getTransformerOptimizerStep() const
+	{
+		return tensorTransformer.optimizerStep;
+	}
 	void setGlobalGradClipNorm(float clipNorm);
 	float getGlobalGradClipNorm() const { return trainingConfig.globalGradClipNorm; }
 	void setPerElementGradClip(float clipLimit);

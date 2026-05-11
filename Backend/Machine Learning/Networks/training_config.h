@@ -2118,6 +2118,21 @@ struct TrainingConfig
 	// Global grad-norm clipping (0 disables).
 	float globalGradClipNorm;
 
+	// Paradigm shift #38 SLC mini-LR-warmup (port from CHIRON iter-178).
+	// At each T-schedule transition (managed by the trainer), the trainer
+	// calls NNetwork::setSLCTransitionStep(optimizerStep, slcMiniWarmupSteps)
+	// to mark the transition.  The per-step LR multiplier in sgd_transformer
+	// then applies min(warmupMult, (optimizerStep - slcLastTransitionStep) /
+	// slcMiniWarmupSteps) for the first slcMiniWarmupSteps after each
+	// transition.  This linear ramp from 0 to full lr after a T jump lets
+	// the optimizer's m/v EMAs adapt to the new gradient covariance and
+	// prevents the post-transition gradient spike that drove flagship
+	// 1.84B Phase-2 (T=512) to clipped-stagnation in the SLC test.
+	// Default -1 (disabled).  Set to 0 by the trainer at chunk-1 to skip
+	// the warmup before any transition has occurred.
+	long long slcLastTransitionStep;
+	int slcMiniWarmupSteps;
+
 	// Per-element gradient clipping (<= 0 disables).
 	//
 	// Historical engine behavior clipped many intermediate gradients/deltas to +/-10.
@@ -2191,6 +2206,8 @@ struct TrainingConfig
 	    : minibatchSizeOverride(0),
 	      tbpttWindowOverride(0),
 	      globalGradClipNorm(0.0f),
+	      slcLastTransitionStep(-1),
+	      slcMiniWarmupSteps(0),
 	      perElementGradClip(10.0f),
 	      optimizer(),
 	      atlas(),
