@@ -4009,6 +4009,20 @@ optimizer.  The OPTION B DISTILL-FORWARD validation (above) is a sound
 implementation that could in principle be applied to either architecture
 to improve sample efficiency further.
 
+### Token-aligned comparison
+
+| Token milestone | CHIRON A (ema) | Flagship C (nll) | Gap (nat)        |
+|----------------:|---------------:|-----------------:|-----------------:|
+| 1.0 M           |          9.733 |          10.322  | 0.589 (CHIRON ↓) |
+| 2.5 M           |          9.385 |          10.242  | 0.857            |
+| 5.0 M           |          8.668 |     (terminated) |                — |
+| 25.6 M (full A) |          9.135 |     (terminated) |                — |
+
+Gap **widens** with budget: at 1 M tokens CHIRON is 0.59 nat ahead; by
+2.5 M the gap is 0.86 nat; by 5 M (CHIRON's best-ema point) the gap is
+~1.57 nat.  Flagship had already plateaued at 4.86 M tokens (best NLL
+10.24) and would not have closed the gap with more steps.
+
 ### Logs
 
 - `research/runs/2026-05-12-production/vanilla_935M_C.log` (run log)
