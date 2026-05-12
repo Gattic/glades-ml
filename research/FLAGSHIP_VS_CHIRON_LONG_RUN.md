@@ -3873,3 +3873,80 @@ plus a longer student run with the production lr/wd recipe).
 2. Add a CE-only metric column to the per-step log when `--distill-forward` is on, so trajectories can be apples-to-apples compared.
 3. Run a 5×-budget baseline (5000 student steps plain CE) vs a 1×-budget distill (1000 student steps + teacher) — test whether distill catches up to 5× plain at iso-wallclock.
 4. Optionally: amortize the O(T·V) KL forward kernel to log-cadence only (current code runs it every step). Could recover ~10-30% per-step throughput.
+
+## 2026-05-12 — Option C: vanilla flagship 935M baseline (IN PROGRESS)
+
+Goal: same token budget (25.6M = 50000 × 512) as CHIRON 1B Option A,
+matching shape (L=24, dModel=2048), to characterize the vanilla baseline.
+
+### Config (also see `vanilla_935M_C.log`)
+
+| Setting              | Value                              |
+|----------------------|------------------------------------|
+| Model                | flagship transformer-decoder       |
+| L                    | 24                                 |
+| dModel               | 2048                               |
+| dff                  | 5632 (SwiGLU)                      |
+| heads                | 16                                 |
+| V                    | 32000 (matches pretok-data vocab)  |
+| Seq-len              | 512                                |
+| Loss                 | full softmax (NOT sampled)         |
+| LR                   | 1e-4 + cosine to 0.1               |
+| Warmup               | 500                                |
+| Grad clip            | 0.5                                |
+| Weight decay         | 0.01                               |
+| Mixed precision      | BF16 (--mp --mp-dtype bf16)        |
+| Adam state           | int8 (--adam-state-int8)           |
+| Grad accum dtype     | BF16 (--grad-bf16-phase2)          |
+| Weight dtype         | BF16 (--bf16-weights)              |
+| Activation memory    | grad-checkpoint (sqrt-L scheme)    |
+| Seed                 | 1337                               |
+| Total token budget   | 25.6M                              |
+
+### CPU-eval init bottleneck — workaround applied
+
+The previous Option C attempt died from a 1-hour CPU eval at init.
+Investigation found the root cause: `tryRunTransformerGpuEpoch` gates the
+GPU path on `cfg.isTrain` (sgd_transformer.cpp:9108), so RUN_TEST falls
+through to the CPU eval loop at 1.13 targets/sec.  At L=24 m=2048 with
+default `--test-tokens 4096` this is ~1 hour.  Workaround: lowered default
+from 4096 to 1 (commit `ad99f73` in glades-trainer); current init takes
+~9 sec.  Proper GPU eval path is on the TODO list.
+
+### Throughput
+
+Observed: ~1867 targets/sec stable post-warmup.  Projected total:
+~7.6-9 hours at 25.6M token budget.  CHIRON 1B (Option A) ran 2424 tok/s
+for 2.8 hours over the same budget — flagship is ~2.7× slower for the
+matched-budget run, consistent with the iter-7 measurement
+(1.59 × 10¹² vs 1.02 × 10¹³ tokens·params/sec).
+
+### Vocab caveat
+
+Flagship runs at V=32000 (matches the pretokenized data vocab), CHIRON
+Option A ran at V=50257.  Direct NLL comparison is not bit-exact-fair
+because log(V) baselines differ:
+
+| V       | log(V)   | Notes                                              |
+|---------|---------:|----------------------------------------------------|
+| 32 000  |  10.3735 | Initial-step floor for flagship full-softmax CE.   |
+| 50 257  |  10.8246 | Initial-step floor for CHIRON CE.                  |
+
+For "fairly equivalent NLL," scale CHIRON NLL by log(32k)/log(50k) ≈ 0.958:
+CHIRON ema=9.13 → flagship-equivalent target ~8.74.  Flagship needs to
+reach NLL < 8.74 to claim parity with CHIRON Option A on this token budget.
+
+### Final results (TO BE FILLED IN ON RUN COMPLETION)
+
+| Metric                         | Value |
+|--------------------------------|------:|
+| Final NLL @ step 50000         |   TBD |
+| Best NLL during run            |   TBD |
+| Wall (sec)                     |   TBD |
+| Throughput (targets/sec)       |   TBD |
+| NLL parity with CHIRON 9.13?   |   TBD |
+
+### Logs
+
+- `research/runs/2026-05-12-production/vanilla_935M_C.log`
+- Comparison script: `research/runs/2026-05-12-production/compare_A_vs_C.sh`
