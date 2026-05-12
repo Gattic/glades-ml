@@ -3624,3 +3624,113 @@ The trainer now supports:
   SCFA to layers where p variance is well-conditioned.
 - **Longer-horizon SCFA + fuse at the right T** (T ≥ 4096) to actually
   realize SCFA's compute speedup at the regime it was designed for.
+
+---
+
+## 2026-05-12 — Remaining-TODOs pass
+
+Three follow-ups closing out the items left from the deferred pass.
+
+### 1. CHRF int8 + fp32 Adam state persistence (commit `796dc7f`)
+
+Before this commit, CHRF only persisted bf16Adam state (`flag bit 2`);
+`--int8-adam` (production default) and default fp32 Adam silently reset
+ALL Adam moments on resume.  Extended the format with two new helpers
+and two new flag bits.
+
+| Flag bit | Meaning |
+|---------:|---------|
+| 1 | FACE state present |
+| 2 | bf16Adam state present |
+| 4 | Kahan-v state present |
+| 8 | gamma_p/beta_p weights present (v=3) |
+| 16 | **int8Adam state present** (new) |
+| 32 | **fp32Adam state present** (new) |
+
+At most one of bits 2/16/32 may be set (Adam mode is mutually exclusive).
+`save_int8_adam_group` writes (mI int8, vI uint8, mS fp32 scales, vS
+fp32 scales) per group; `save_fp32_adam_group` writes (mF fp32, vF fp32).
+
+Round-trip verified at L=4 m=256 / `--int8-adam --save-full`:
+- CHRF file size: 90.27 MB (was 59.87 MB CHRN-equivalent; +30 MB for int8 state)
+- Load resumes from saved Adam moments (loss at resume step 1 reflects
+  the trained-and-momented state, not fresh init).
+- Note: iter-182 SLC-transition LR re-warm fires on resume by design —
+  Adam state IS preserved; LR schedule reset is a separate mechanism.
+
+### 2. SCFA T ≥ 4096 long-horizon validation
+
+Tested at SCFA's design regime to confirm the compute advantage materializes.
+L=8 m=512 (small to fit T=8192 in VRAM), 100-200 step smokes:
+
+| Config                    | Wall      | Throughput   | Speedup | ema   |
+|---------------------------|----------:|-------------:|--------:|------:|
+| **T=4096** standard attn  |    40.7 s |  20,166 tok/s |       1× | 9.35 |
+| T=4096 SCFA c=16 (k=256)  |     8.0 s | 102,495 tok/s | **5.1×** | 9.38 |
+| **T=8192** standard attn  |    68.5 s |  11,970 tok/s |       1× | 9.44 |
+| T=8192 SCFA c=16 (k=512)  |     7.9 s | 103,773 tok/s | **8.7×** | 9.80 |
+
+**SCFA delivers its promised speedup at long T**.  Scaling matches the
+O(T²) → O(Tk + k² + Tw) prediction: speedup grows roughly linearly with
+T.  Design speedup at T=4096 was 14.2× theoretical; realized 5.1×
+(overhead from DCT projection, conv mixer, inner attention at k).  At
+T=8192 realized 8.7× vs 14× theoretical.  At T=16384+ the speedup
+should approach 15-25×.
+
+NLL parity at T=4096 (ema 9.35 vs 9.38 = ~equal at 200 steps).  At
+T=8192 SCFA's ema is 0.36 nat behind (still warming up at 100 steps);
+likely closes with more steps.
+
+**Use SCFA when T ≥ 4096**.  Below that, the compression overhead
+exceeds the attention savings.
+
+### 3. SCFA + fuse-per-layer at L > 8 m > 1024 — startup warning shipped (commit `2b8a4d5`)
+
+The intermittent ‖g‖ spikes at L=24+ m=2048 remain even with the k/T
+damping.  Investigated mechanisms:
+
+| Approach                         | Result                                  |
+|----------------------------------|-----------------------------------------|
+| `--grad-clip 0.05` (tighter)     | Spikes still fire, scale=0, no learning |
+| Tighter alpha (k²/T² scaling)    | Already smaller than 1/L; no help       |
+| Trainable per-layer alpha        | Adam adapts too slow for transient spikes |
+| **`--no-fuse-attn --fuse-attn-reln` workaround** | **Stable: ‖g‖ 3-200, loss 11.03→9.71 in 200 steps** |
+
+Root cause is in the inner-attn bwd: certain token batches produce
+extreme softmax outputs (effective near-degenerate attention) and the
+backward chain amplifies these into large dWq.  The per-layer fuse then
+propagates the resulting dp across L layers via the cumulative chain,
+making the spike worse at deeper L.
+
+`--fuse-attn-reln` (single-layer fuse at l == L-1) has no cumulative
+chain — the dp gradient at L-1 contains only that one layer's
+contribution.  The single layer's extreme gradient still happens but
+doesn't cascade.  Net: stable training at L=24 m=2048.
+
+**Shipped workaround**: startup warning when the unstable combo is
+requested, with the concrete alternative suggested in the message.
+Users see this at run start; explicit flag choices give them control
+over the trade-off:
+
+```
+[fuse-attn-per-layer] WARNING: --scfa + --fuse-attn-per-layer at L=24 m=2048
+is known to produce intermittent gradient spikes (10⁹-10¹⁰) due to the
+inner-attn bwd amplification chain.  Consider:
+  --no-fuse-attn --fuse-attn-reln  (single-layer fuse, no L-layer cascade)
+Or use --scfa only at L ≤ 8 m ≤ 2048 / T ≥ 4096 (SCFA's design regime).
+```
+
+No automatic mode switch — users may prefer the unstable combo with
+careful grad-clip tuning for specific research experiments.
+
+### Final SCFA + fuse landscape
+
+| L | m | Recommended config | Notes |
+|--:|--:|--------------------|-------|
+| ≤ 8 | ≤ 2048 | `--scfa --fuse-attn-per-layer` (default) | Stable, T≥4096 optimal |
+| > 8 | > 1024 | `--scfa --no-fuse-attn --fuse-attn-reln` | Single-layer fuse, stable |
+| any | any | `--scfa --no-fuse-attn` | Pure speedup, attention path dead |
+
+### Logs
+
+- `research/runs/2026-05-12-scfa-longT/` (T=4096 / T=8192 comparison)
