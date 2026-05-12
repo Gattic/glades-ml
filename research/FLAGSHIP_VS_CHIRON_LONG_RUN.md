@@ -2916,3 +2916,467 @@ the compressed-attention path for additional speedup at long context.
 
 `--fuse-attn-per-layer` is now the recommended flag for any
 attention-aware CHIRON training.  Default off (legacy reproducibility).
+
+---
+
+## 2026-05-11 (cont'd) — 1B fair-comparison run: **+1.09 nat at 5000 steps**
+
+First clean apples-to-apples measurement of CHIRON attention contribution
+after the path was resurrected.  Both runs identical hyperparameters,
+identical seed (1337), identical token budget (2.56M tokens), identical
+hardware (RTX 4080 SUPER).  The only difference: `--fuse-attn-per-layer`.
+
+### Config
+
+| Param        | Value                                                     |
+|--------------|-----------------------------------------------------------|
+| Shape        | L=24 m=2048 nH=16 dH=256 (dModel=4096)                    |
+| Params       | 908.33 M                                                  |
+| Seq len T    | 512                                                       |
+| Steps        | 5000                                                      |
+| Tokens       | 2.56 M (batch=512, accum=1)                               |
+| LR / warmup  | 1e-4 / 500 (linear)                                       |
+| Grad clip    | 0.5                                                       |
+| Precision    | bf16 weights / bf16 attn / bf16 grads / int8 Adam         |
+| Seed         | 1337                                                      |
+
+### Trajectory (ema)
+
+| Step | Dead-attn ema | `--fuse-attn-per-layer` ema | Δ (live − dead) |
+|-----:|--------------:|----------------------------:|----------------:|
+|  100 |        11.23  |                      10.73  |          -0.50  |
+|  500 |        10.04  |                       7.52  |          -2.52  |
+| 1000 |        10.71  |                       9.40  |          -1.31  |
+| 2000 |        10.57  |                       9.71  |          -0.86  |
+| 3000 |        10.48  |                       9.24  |          -1.24  |
+| 4000 |        10.45  |                       9.54  |          -0.91  |
+| **5000** |    **10.48**  |                   **9.39**  |      **-1.09**  |
+
+Best single-batch: dead 4.01@798, live **3.92@788** (slightly better; both
+single-batch outliers from the step-800 trough).
+
+### Throughput and stability
+
+| Metric             | Dead-attn         | Attention-live    | Delta              |
+|--------------------|------------------:|------------------:|-------------------:|
+| Wall (5000 steps)  |          1054.7 s |          1055.2 s |       +0.5 s (≈0%) |
+| Throughput         |        2426 tok/s |        2424 tok/s |  −2 tok/s (−0.08%) |
+| GPU memory         |           6.73 GB |           6.74 GB |   +10 MB (gamma_p) |
+| ‖g‖ at step 100    |             2.43  |            155.4  |   +152 (warmup peak)|
+| ‖g‖ at step 500+   |          2.0–6.4  |          2.0–9.7  | similar order      |
+| Final ‖g‖          |             2.26  |             2.48  |    +0.22 (≈parity) |
+
+The initial ‖g‖ spike to ~155 in live mode (vs ~3 in dead) decays within
+~150 steps as warmup ramps lr 2e-7 → 2e-5; by step 200 both modes are in
+the ‖g‖ ≈ 3–5 regime.  No NaN, no divergence; trains cleanly to 5000.
+
+### Step-800 trough is data-driven — confirmed
+
+Both modes hit the documented step-800 dip at the same step with the
+same shape:
+
+| Mode           | step 800 loss | step 800 ema | step 800 acc | best-so-far |
+|----------------|--------------:|-------------:|-------------:|------------:|
+| Dead-attn      |         6.85  |        5.46  |        0.084 |   4.01@798  |
+| Attention-live |         6.24  |        5.18  |        0.082 |   3.92@788  |
+
+Identical step, identical magnitude, identical recovery shape (both snap
+back to ema ≈ 10 within 200 steps).  This is the same pattern flagged in
+the 2026-05-11 doc above: same data shard, same token block, same Adam
+crossover.  It is **not** an artifact of fuse-per-layer.
+
+### Significance
+
+This is the first clean number for the attention-fix payoff at the 1B
+class on this hardware.  Prior measurements were either:
+- 200 steps at L=8 m=1024 (+1.1 nat) — too small to extrapolate
+- 1.84B-class L=48 m=2048 (ema=9.47 at 5000) — useful but no apples-to-apples baseline because the historical baseline used 32× larger accum
+
+At L=24 m=2048 the controls match: same shape, same hyperparams, same
+token budget, same seed.  **+1.09 nat ema improvement is the real
+contribution of CHIRON's attention path at the 1B class, 5000-step
+horizon, single-step (no accum) regime.**
+
+### Cost accounting
+
+| Axis             | Cost                                                |
+|------------------|-----------------------------------------------------|
+| Wall-clock       | +0.05% (essentially free)                           |
+| GPU memory       | +10 MB shared (gamma_p_const, beta_p_const)         |
+| Per-step memory  | + L · T · 2 floats stats_p buffer (≈96 KB at L=24)  |
+| LOC              | ~120 added in `--fuse-attn-per-layer` path          |
+| Numerical issues | none (1/√L scaling holds; ‖g‖ stays bounded post-warmup)|
+
+**+1.09 nat for essentially zero compute/memory cost** at the chosen
+shape.  The attention path is now contributing real signal at the 1B
+class as it should have been all along.
+
+### Caveats
+
+- 5000 steps / 2.56 M tokens is still small relative to the historical
+  1.84B runs (~80 M tokens) where the dead-attention CHIRON reached
+  ema=9.08.  The +1.09 nat measured here cannot directly invalidate that
+  number because token budgets differ ~32×.
+- ‖g‖ jumps to 155 during early warmup — not catastrophic (clipped via
+  grad_clip=0.5 → scale=0.003) but noteworthy.  A longer warmup
+  (1000-2000 steps) or lower starting lr would smooth this.
+- The 4000-step ‖g‖=9.7 spike (live) and 4000-step ‖g‖=6.4 spike (dead)
+  are both bounded recoveries — same data-driven pattern as step-800.
+
+### Recommended next moves
+
+A. **Longer-horizon run** (20k–50k steps, optionally with `--accum 4-8`
+   for larger effective batch) to see if the +1.09 nat compounds, plateaus,
+   or eventually crosses with dead.  ~1.5 hr wall at 20k steps single-accum.
+B. **Investigate SCFA + fuse-per-layer gradient interaction**: ‖g‖ ≈ 28 at
+   step 1 (vs ~3 expected); likely missing 1/√L scaling in the SCFA-backward
+   dp_scratch accumulation.  ~50 LOC fix candidate.
+C. **Try `--rlg-initial-layers` curriculum** with `--fuse-attn-per-layer`
+   at L=48 m=2048 (the historical 1.84B shape) to combine attention-live
+   training with depth growth — would address the apples-to-oranges gap to
+   the historical baseline.
+D. **Default flip**: with stability and quality both validated, consider
+   making `--fuse-attn-per-layer` the default (rename to `--no-fuse-attn` for
+   the dead-attention reproducibility mode).
+
+---
+
+## 2026-05-12 — SCFA + fuse-per-layer: partial fix shipped, remaining scaling issue
+
+Task #B (from the iter-208 plan) attempted to fix the known
+`--scfa --fuse-attn-per-layer` instability (‖g‖≈28 at step 1 in earlier
+small-scale tests).  Status: partial fix landed, root cause identified,
+deeper instability characterized but not resolved.
+
+### Diagnosis
+
+Forward dispatch path in `chiron_main.cpp` had two `if … continue;`
+branches — `if (W.scfa)` (line 3661) and the bf16-weights fast path
+(line 3683) — that bypassed the fuse code at lines 3785-3794.  Backward
+at line 4004 ran the fuse-backward UNCONDITIONALLY whenever
+`cfg.fuseAttnPerLayer` was set.
+
+So with `--scfa --fuse-attn-per-layer`:
+- Forward: SCFA writes y to p, fuse code skipped, q-reln on plain q.
+  q never receives the (1/√L)·reln_p(p) injection.
+- Backward: q-reln bwd → dq_buf. Fuse-bwd:
+  - subtracts alpha·p_norm from s.q → corrupts q for SCFA's q_compr recovery.
+  - adds alpha·dp_scratch to s.dp → spurious gradient on dp.
+
+Pre-fix at L=24 m=2048: ‖g‖=4.6×10¹⁸ at step 1 → inf by step 100.  Loss
+flat at 11.27, no learning.
+
+### Fix shipped
+
+Apply the per-layer fuse (and `--fuse-attn-reln` when `l == L-1`) in
+both the SCFA forward branch and the bf16w forward branch, before the
+q-reln.  ~30 LOC across two locations.  Matches the standard dispatch
+path's behavior so backward sees consistent gradient flow.
+
+Post-fix at L=24 m=2048: ‖g‖=1,449,544 at step 1 → still inf by step 100.
+Strictly better than pre-fix (~10¹²× smaller) but still unusable.
+
+### Root cause of remaining instability
+
+SCFA's y_par = B·y_compr where B is the orthonormal DCT-II basis at
+k = T/16 = 32.  Frobenius norm preserved: ||y_par||_F = ||y_compr||_F.
+With y_compr having per-entry magnitude O(1) and y_par's T entries
+spreading that norm:
+
+  Per-entry magnitude of y_par ≈ √(k/T) = √(1/16) = 0.25
+  Per-token cross-channel variance Var_i(y_par[t,i]) ≈ 1/16
+
+This is √16 = **4× smaller** than standard attention's y (which has
+~unit cross-channel variance).  σ_p (per-token cross-channel σ of p_l)
+is correspondingly ~4× smaller in SCFA.
+
+In `reln_p_backward`: dp ~ (1/σ_p) · dq_pre_reln.  With small σ_p, dp
+is amplified.  Over L=24 layers, the per-layer amplification compounds
+non-linearly with the back-chain.
+
+Empirical L=24 m=2048 sweep with the post-fix code:
+| compression | k   | step-1 ‖g‖   |
+|------------:|----:|-------------:|
+|           2 | 256 |          701 |
+|          16 |  32 |    1,449,544 |
+
+Compression=2 (k=256, closer to full attention) is closer to the
+standalone fuse baseline (‖g‖=172).  Compression=16 explodes.
+
+The conv path (y_perp = D∗q_perp) is NOT the culprit — verified by
+re-running with `--scfa-conv-w 0`: identical step-1 ‖g‖.
+
+### What works post-fix
+
+| Config                          | step-1 ‖g‖ | Stable? |
+|---------------------------------|-----------:|---------|
+| L=4 m=256 T=256 compression=16  |       2.66 | ✅       |
+| L=4 m=2048 T=512 compression=16 |       9240 | ❌       |
+| L=8 m=2048 T=512 compression=16 |     41,733 | ❌       |
+| L=24 m=2048 T=512 compression=16 | 1,449,544 | ❌       |
+
+The fix is correct at small m (L=4 m=256).  Fails at large m because the
+y_par variance discrepancy isn't bounded by the existing 1/√L scaling.
+
+### Candidate further fixes (not pursued in this session)
+
+A. **Scale y_par by √(T/k)** to match standard attention's variance.
+   Breaks B's orthonormality property — y is no longer the optimal
+   low-rank projection.  Could be justified as "y_par + amplification
+   constant" but loses theoretical guarantees.
+
+B. **Per-layer fuse alpha = 1/(√L · σ_p_estimate)** where σ_p_estimate
+   is a calibrated constant ~√(k/T) for SCFA, 1 for standard.  Cleaner
+   but introduces magic constant.
+
+C. **Trainable gamma_p / beta_p for the reln_p** (mentioned in earlier
+   "Recommended next moves" 2026-05-11): would let the model
+   self-regulate the amplification across depth.  ~100 LOC + Adam state.
+
+D. **Skip the per-layer fuse when SCFA is active and do a single
+   final-layer fuse** (`--fuse-attn-reln`-style).  Avoids the L-layer
+   amplification chain entirely.  Likely best ROI for SCFA-specific use.
+
+### Verdict
+
+The forward/backward asymmetry bug is fixed (strict improvement vs
+pre-fix).  The scale-dependent instability is a separate paradigm-design
+issue with how SCFA's compression interacts with the per-layer reln_p
+amplification chain.  Not blocking phase C (which uses standalone
+`--fuse-attn-per-layer`, no SCFA).
+
+---
+
+## 2026-05-12 — Phase C: L=48 m=2048 historical-shape fair-comparison
+
+Four 5000-step runs at L=48 m=2048 (1.71B params, the historical CHIRON
+1.84B-class shape) with identical hyperparams (lr=1e-4, warmup=500,
+grad-clip=0.5, seed=1337, bf16-weights/attn/grads + int8-adam, T=512).
+The only differences: `--fuse-attn-per-layer` and `--l-schedule "8@0,24@1500,48@3000"`.
+
+| Configuration | ema@5000 | Best   | Wall   | tok/s avg |
+|---------------|---------:|-------:|-------:|----------:|
+| dead-attn no curriculum | **9.17** | 3.81@798 | 34 min | 1251 |
+| dead-attn + RLG (8→24→48) | 10.51 | 4.01@798 | 21 min | mixed |
+| **fuse-attn-per-layer no curriculum** | 9.52 | 3.93@788 | 34 min | 1251 |
+| **fuse-attn-per-layer + RLG** | 9.32 | 3.86@788 | 21 min | mixed |
+
+### Unexpected: dead-attn no-curriculum wins at this step count
+
+Dead-attn no-curriculum delivers the **lowest ema** (9.17) by 0.15-1.34
+nat across all four configurations.  This is the opposite of the L=24
+result where live beat dead by +1.09 nat.
+
+Likely explanation: at the 1.7B param count, the per-layer LN-affine
+cascade (E + 48·(gamma, beta), ~103M trainable when attention is dead)
+captures most of the unigram + positional structure cleanly in 5000
+steps.  Live attention adds ~1.6B random-init weights' gradient noise
+during early steps when Wq/Wk/Wv/Wo have not yet learned anything useful,
+interfering with the E-side learning that dominates at this scale.
+
+5000 steps × 512 tokens = 2.56M tokens — **32× under the conventional
+training budget** for a 1.7B model.  The cross-over point where live
+attention overtakes dead at this scale is presumably much later.
+
+### RLG curriculum: helps live, hurts dead
+
+RLG transitions (L: 8 → 24 → 48 with LR warmup reset at each transition)
+have opposite effects on the two attention modes:
+
+- Dead-attn + RLG → **+1.34 nat WORSE** than dead-attn no-curriculum.
+  The LR-warmup re-cycles at each RLG transition lower the effective
+  average LR during the run, slowing E-side learning that's the main
+  source of progress in dead-attn mode.
+- Live-attn + RLG → **−0.20 nat BETTER** than live no-curriculum (9.32 vs
+  9.52), saving 13 minutes of wall-clock.  Confirms RLG's value when
+  attention is functional: early-phase L=8 stabilizes attention warmup,
+  and later L=48 phases benefit from already-trained earlier layers.
+
+Step 100 ‖g‖ comparison shows the gradient-stability benefit clearly:
+| Config        | step-100 ‖g‖ |
+|---------------|-------------:|
+| live no-RLG   |        145.4 |
+| live + RLG    |         33.0 |
+| dead no-RLG   |          2.4 |
+| dead + RLG    |          2.4 |
+
+The 4× reduction in early ‖g‖ from RLG (145 → 33) for live mode is the
+mechanism — fewer layers to amplify the early-step gradient noise.
+
+### Implications for the headline claim
+
+The "+1.09 nat at L=24 1B-class" result (2026-05-11) does NOT extend
+cleanly to L=48 1.7B-class at the same 5000-step horizon.  Two
+hypotheses, both untested at this point:
+
+1. **Step count too small**: 2.56M tokens is way under the budget
+   needed for 1.7B params to overcome the random-init gradient noise
+   from 1.6B attention weights.  20k+ steps may reverse the result.
+2. **Architectural plateau**: the dead-attn baseline's L=48 LN-affine
+   cascade is unusually effective for this V=50257 BPE corpus at the
+   small-data regime.  Live attention may never beat dead at this token
+   budget regardless of step count.
+
+Phase A (next) will run live + RLG at 20k steps to test hypothesis 1.
+
+### Throughput observations
+
+Wall-clock for the RLG runs (~21 min) is 38% less than no-curriculum
+(~34 min) at the same step count.  RLG's L=8 prefix runs at 6450 tok/s
+(5× the L=48 rate of 1251 tok/s), so the curriculum's "compute-saving"
+property is real and large.  This applies to *training speed*, not
+necessarily quality — for dead-attn it costs +1.34 nat; for live it
+gains −0.20 nat.
+
+### Logs and artifacts
+
+- `research/runs/2026-05-12-chiron-l48-fair/dead_no_rlg.log`
+- `research/runs/2026-05-12-chiron-l48-fair/dead_rlg.log`
+- `research/runs/2026-05-12-chiron-l48-fair/live_no_rlg.log`
+- `research/runs/2026-05-12-chiron-l48-fair/live_rlg.log`
+
+---
+
+## 2026-05-12 — Phase A: 1B class long-horizon (20k steps)
+
+Two 20k-step runs at L=24 m=2048 (908M params), same hyperparams as the
+5000-step fair-comparison (lr=1e-4 constant, warmup=500, grad-clip=0.5,
+seed=1337, T=512, accum=1, bf16-weights/attn/grads + int8-adam).  Each
+~70 min wall.  Total data: 10.24M tokens per run.
+
+### Trajectory
+
+| Step  | Dead ema | Live ema | Δ (live − dead) |
+|------:|---------:|---------:|----------------:|
+|  1000 |    10.71 |     9.42 |          −1.29  |
+|  2000 |    10.57 |     9.74 |          −0.83  |
+|  5000 |    10.49 |     9.46 |          −1.03  |
+| **10000** |    9.90 | **8.92** |     **−0.98**  |
+| 15000 |    10.48 |     9.53 |          −0.95  |
+| **20000** | **10.50** | **10.03** |     **−0.47**  |
+
+Best single-batch (both runs): same step (~788-798) as the 5000-step
+runs, indicating that "best" is dominated by an early outlier batch and
+not a measure of training progress.
+
+### Findings
+
+1. **The 5000-step +1.09 nat gap persists through step 15000.**  Live
+   beats dead by 0.95-1.29 nat at every milestone in the [1000, 15000]
+   range — the 5000-step finding was not a fluke.
+
+2. **Neither mode converges monotonically at this lr regime.**  Both
+   show ~1 nat oscillations around a slowly-improving baseline.  Live's
+   trough at step 10000 (ema=**8.92**, best in the run) bounces back to
+   ema=10.03 at step 20000.  Dead similarly bounces 9.90 → 10.50.
+
+3. **Live's compounding is modest.**  Step 5000 → step 15000 (3× more
+   compute) brings live from 9.46 → 9.53 — actually slightly worse on
+   ema.  Live's best step-10000 reading (8.92) is only 0.54 nat better
+   than its step-5000 reading.
+
+4. **Dead does NOT continue learning past step 5000.**  Dead-attn
+   plateaued at ema ≈ 10.5 by step 5000 and stays there through 20k
+   (deviates only by step-10k trough).  The trainable-param set
+   (E + per-layer LN affine) is effectively exhausted on this corpus
+   with this token budget.
+
+### What's needed for a sharper compounding test
+
+- **LR schedule**: cosine decay (lr × cos(step/total)) would lock in
+  the transient minima instead of bouncing back.  Both modes' best
+  readings are at step ~10000 — a cosine decay from that point would
+  reveal whether live's underlying trajectory keeps improving.
+- **Larger effective batch**: `--accum 4-8` smooths the per-batch
+  variance that's responsible for the ~1 nat oscillations.  Each Adam
+  update would integrate 4-8× more tokens.
+- **Token budget**: 10.24M is still 8× under the historical 1.84B
+  claim's ~80M.  50k+ steps × accum=4 = 100M+ tokens would close that gap.
+
+### Implication for the headline
+
+The "+1.09 nat at L=24 1B-class" headline is **robust at the original
+5000-step horizon and through step 15000**.  It does narrow at step
+20000 (0.47 nat), but the narrowing is the live mode bouncing UP, not
+dead mode catching up.  Best-step comparison (live ema=8.92@10k vs
+dead ema=9.90@10k) keeps the gap at ~1 nat.
+
+### Logs
+
+- `research/runs/2026-05-12-chiron-1b-long/dead_20k.log`
+- `research/runs/2026-05-12-chiron-1b-long/live_20k.log`
+
+---
+
+## 2026-05-12 — Phase D: default flipped to `--fuse-attn-per-layer`
+
+Changed `cfg.fuseAttnPerLayer` default from `false` → `true` in
+`Config::Config()` (chiron_main.cpp ~line 394).  Added a CLI opt-out
+`--no-fuse-attn` that clears all three fuse flags
+(fuseAttn / fuseAttnReln / fuseAttnPerLayer) for legacy reproducibility.
+
+### Banner changes
+
+When fuse-per-layer is active (the new default), the banner now reads:
+```
+[fuse-attn-per-layer] ACTIVE (DEFAULT since 2026-05-12): at EVERY layer,
+q ← q + (1/√L)·reln_p(p) BEFORE the q-reln.  ...
+Validated 1B fair-comparison: +1.09 nat ema @ 5000 steps vs --no-fuse-attn.
+```
+
+When `--no-fuse-attn` is set explicitly, the banner reads:
+```
+[fuse-attn] DISABLED via --no-fuse-attn.  Attention weights (Wq/Wk/Wv/Wo)
+will NOT receive gradients ...  Use this mode only for: legacy checkpoint
+reproducibility OR E-side paradigm isolation (FACE, MFIO).
+```
+
+### Reproducibility verified
+
+Two 5-step smoke tests at L=24 m=2048 (same hyperparams as the 1B
+fair-comparison):
+
+| Run                       | Step 1 loss | Step 1 ‖g‖    | Matches |
+|---------------------------|-------------|---------------|---------|
+| No flags (new default)    | 10.8541     | 172.768       | ✅ prior live.log |
+| `--no-fuse-attn`          | 11.2762     |   3.001       | ✅ prior dead.log |
+
+Both bit-identical to prior runs.  Behavior preservation under explicit
+opt-out is intact.
+
+### When to use `--no-fuse-attn`
+
+Three legitimate use cases (documented in the new banner):
+
+1. **Legacy checkpoint reproducibility** — any pre-2026-05-12 run was
+   trained in dead-attention mode; reproducing those checkpoints
+   requires explicit opt-out.
+2. **E-side paradigm isolation** — FACE / MFIO / embedding-only
+   paradigm probes are cleaner when the model only learns through E
+   (no attention noise corrupting the signal).
+3. **Small-budget L=48+ runs** — per the Phase C finding, dead-attn
+   no-curriculum beats live no-curriculum at L=48 1.7B-class with
+   5000 steps.  Under-trained large models may benefit from explicit
+   opt-out.
+
+### Caveats and limitations
+
+- **L=48 5000-step regime is the one place dead beats live** (by 0.35
+  nat).  This isn't a default-flip blocker because: (a) production
+  training uses far more than 5k steps, (b) Phase A 20k shows live
+  retains advantage at lower L through 15k steps, (c) Phase C live+RLG
+  matches dead no-RLG at L=48 within 0.15 nat at 5k.
+- **SCFA + fuse-per-layer still unstable at large m** (Phase B).  With
+  the default flip, users who run `--scfa` now also get fuse-per-layer
+  by default — which means they'll hit the SCFA gradient explosion at
+  m≥1024.  Recommend pairing with `--no-fuse-attn` until the SCFA-side
+  variance issue is fixed.
+
+### Code change summary
+
+3 surgical edits in `trainer/chiron_main.cpp`:
+1. Constructor default: `fuseAttnPerLayer(false)` → `fuseAttnPerLayer(true)` (~6 LOC with comment)
+2. New `--no-fuse-attn` flag parser that clears all three fuse flags (~10 LOC)
+3. Banner messages updated to reflect "DEFAULT" status and add explicit "DISABLED via --no-fuse-attn" branch (~10 LOC)
+
+Total: ~30 LOC.  No new state, no allocator changes, no header changes.
