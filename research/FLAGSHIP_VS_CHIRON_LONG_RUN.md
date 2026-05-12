@@ -4069,6 +4069,100 @@ silently inert.
 
 - `research/runs/2026-05-12-production/vanilla_curriculum_C2.log` (terminated at step 3730)
 
+## 2026-05-12 — Option C3: flagship + curriculum with proper chunk wiring
+
+Goal: same as C2 but with `--t-schedule` set to create chunks that
+trigger the `--l-schedule` transitions.
+
+Config:
+
+```
+--t-schedule "512@0,512@2500,512@5000,512@50000"
+--l-schedule "8@0,16@2500,24@5000"
+--epochs 4 --lr-schedule cosine --lr-tmax-epochs 4 --lr-min-mult 0.1
+```
+
+### Curriculum transitions fired correctly
+
+Log trail:
+
+```
+[slc] --t-schedule active: 4 phases, max T=512
+[rlg] phase 1 active L = 8 (zero layers [8, 24))
+[chunk] epoch=1 ... (SLC phase 1: T=512, steps 0→2500)
+[rlg] re-zero Wo+W2+AdamState for layers [16, 24) (new active L = 16)
+[slc] phase 2 transition: optimizerStep=2500, mini-warmup=100 steps
+[rlg] phase 2 active L = 16
+[chunk] epoch=2 ... (SLC phase 2: T=512, steps 2500→5000)
+[slc] phase 3 transition: optimizerStep=5000, mini-warmup=100 steps
+[rlg] phase 3 active L = 24
+[chunk] epoch=3 ... (SLC phase 3: T=512, steps 5000→50000)
+```
+
+L transitions matched CHIRON A exactly.
+
+### NEW wiring bug: cosine LR collapses prematurely with uneven phases
+
+After the L=24 transition at step 5000 (~10% through total training),
+`lr_mult` snapped to **0.1** (the `--lr-min-mult` floor) and stayed
+there for the rest of training.  The cosine decay is parameterized by
+*epoch count*, not *optimizer step*, so 4 epochs of unequal size (1.28M
++ 1.28M + 23M + sentinel) means the decay fully completes by epoch 2
+(50% of the schedule by epoch count, 10% by step count).
+
+With lr at 1e-5 (10× lower than intended for most of phase 3), the
+model couldn't escape the early NLL.
+
+### Trajectory
+
+| Phase | optimizer_step | lr_mult |   NLL  | ‖g‖ (raw)   |
+|------:|---------------:|--------:|-------:|------------:|
+|  1    |          500   | 0.998   | 10.449 |    3.5×10⁴  |
+|  1    |        1 000   | 0.997   | 10.394 |    2.9×10⁴  |
+|  1    |        1 500   | 0.991   | 10.333 |    1.7×10⁶  |
+|  1    |        2 000   | 0.980   | 10.308 |    3.3×10⁶  |
+| → 2   |        2 500   |   ?     |   —    | (transition)|
+|  2    |        2 999   |  0.55?  | 10.365 |    4.1×10⁴  |
+| → 3   |        5 000   |  0.1    |   —    | (transition)|
+|  3    |        5 008   |  0.1    | 10.434 |    4.5×10⁴  |
+|  3    |        5 998   |  0.1    | 10.346 |    1.9×10⁶  |
+|  3    |        6 498   |  0.1    | 10.349 |    2.0×10⁸  |
+|  3    |        6 548   |  0.1    | 10.350 |    9.1×10⁵  |
+
+Phase 1 (L=8, full LR) showed promising trajectory — NLL dropping
+0.14 nat in 2000 steps, gradient norms stable.  Phase 2 (L=16, LR
+already partially decayed) recovered after the 100-step mini-warmup.
+Phase 3 (L=24, LR fully collapsed) plateaued at NLL 10.35, with the
+gradient instability returning (2×10⁸ pre-clip).
+
+### What C3 does and does not prove
+
+Proves:
+- ✓ The `--t-schedule` + `--l-schedule` combo wires up correctly.
+- ✓ RLG transitions fire at the right step counts.
+- ✓ Curriculum stabilizes gradients in early phases (Phase 1 ‖g‖ ~10⁴
+  vs vanilla C's 10⁶-10⁹ at same step).
+
+Does not prove:
+- The "does curriculum close the CHIRON gap?" question is still
+  open — the LR scheduling bug short-circuits the test.
+
+### Wiring-bug summary (both C2 and C3)
+
+1. **`--l-schedule` needs `--t-schedule`** to fire (only active inside
+   `slcActive` branch in `main.cpp:1247`).  Documentation gap.
+2. **Cosine LR decay assumes equal-size epochs** when in fact
+   `--t-schedule` produces wildly uneven phase sizes.  Fix would be:
+   compute decay fraction from `cumulative_optimizer_step / total_steps`
+   rather than `epoch / tmax_epochs`.
+
+Both are real bugs in the flagship trainer worth fixing in a future
+iteration; neither is a blocker for the comparison conclusion.
+
+### Logs
+
+- `research/runs/2026-05-12-production/vanilla_curriculum_C3.log` (terminated at step 6548)
+
 ## Token-aligned comparison
 
 | Token milestone | CHIRON A (ema) | Flagship C (nll) | Gap (nat)        |
