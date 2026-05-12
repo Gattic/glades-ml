@@ -4009,7 +4009,67 @@ optimizer.  The OPTION B DISTILL-FORWARD validation (above) is a sound
 implementation that could in principle be applied to either architecture
 to improve sample efficiency further.
 
-### Token-aligned comparison
+## 2026-05-12 — Option C2: flagship + curriculum (WIRING BUG — re-run as C3)
+
+Goal: re-run Option C with the same RLG schedule CHIRON Option A used
+(L=8→16@2500→24@5000), to test whether the 1.1-nat gap is closed by adding
+the curriculum paradigm.
+
+Config diff from C: added `--rlg-initial-layers 8`,
+`--l-schedule "8@0,16@2500,24@5000"`, `--lr-tmax-epochs 1`.  Run terminated
+early at step 3730.
+
+### Wiring bug discovered
+
+`--l-schedule` only fires at trainer CHUNK boundaries, not at arbitrary
+optimizer steps.  The chunking is driven by `--t-schedule` (slcActive
+branch in `trainer/main.cpp:1247`).  Without `--t-schedule`, the L
+transitions never trigger — only the one-shot `--rlg-initial-layers 8`
+zero-init fires at startup.
+
+The run effectively trained at frozen L=8 effective (16 layers permanently
+in zero state), worse than the L=24 vanilla C baseline:
+
+| Step | C2 NLL | C2 ‖g‖   | C NLL  | Δ (C2 − C)        |
+|-----:|-------:|---------:|-------:|------------------:|
+| 2500 | 10.292 | 2.6×10¹⁰ | 10.290 | +0.002            |
+| 3000 | 10.298 | 5.1×10¹⁰ | 10.275 | +0.023 (C2 worse) |
+| 3500 | 10.304 | 1.0×10¹¹ | 10.263 | +0.041 (C2 worse) |
+| 3730 | 10.307 | 1.3×10¹¹ |      — | terminated        |
+
+Pre-clip gradient norms are *larger* than vanilla C (1e11 vs 1e9) — RLG
+zero-init on its own (without staged growth) increases gradient variance
+because deep zero layers receive non-trivial gradients but nothing softens
+the depth-amplified signal as they begin to drift.
+
+### Wiring fix for C3
+
+Use a constant-T schedule purely to create chunk boundaries:
+
+```
+--t-schedule "512@0,512@2500,512@5000,512@50000"
+--l-schedule "8@0,16@2500,24@5000"
+--epochs 4
+--lr-tmax-epochs 4
+```
+
+This produces 4 chunks (phases 1-4 = 0-2500, 2500-5000, 5000-50000,
+sentinel) at T=512 throughout.  The l-schedule transitions fire at each
+phase boundary, matching CHIRON Option A's growth profile.  Token totals:
+1.28M + 1.28M + 23.04M = 25.6M (matching budget).
+
+### Help text gap
+
+The `--l-schedule` help text says "At each chunk boundary..." but does
+not mention that chunks are produced ONLY when `--t-schedule` is also
+set.  This is a documentation bug worth fixing — `--l-schedule` alone is
+silently inert.
+
+### Logs
+
+- `research/runs/2026-05-12-production/vanilla_curriculum_C2.log` (terminated at step 3730)
+
+## Token-aligned comparison
 
 | Token milestone | CHIRON A (ema) | Flagship C (nll) | Gap (nat)        |
 |----------------:|---------------:|-----------------:|-----------------:|
