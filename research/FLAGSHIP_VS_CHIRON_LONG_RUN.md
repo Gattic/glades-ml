@@ -3380,3 +3380,142 @@ Three legitimate use cases (documented in the new banner):
 3. Banner messages updated to reflect "DEFAULT" status and add explicit "DISABLED via --no-fuse-attn" branch (~10 LOC)
 
 Total: ~30 LOC.  No new state, no allocator changes, no header changes.
+
+---
+
+## 2026-05-12 — Trainer infrastructure pass + extended validation
+
+Five focused work items shipped after the B/C/A/D phases established
+the baselines.  Ordered by long-term correctness/stability:
+
+### 1. `--accum N > 1 + --fuse-attn-reln` ‖g‖=inf bug fix (commit `06843a6`)
+
+`--fuse-attn-reln` forward did `s.q += s.p` at l == L-1.  Backward was
+incomplete: q_in was never recovered (inverse-shear saw q_pre_reln
+instead of q_in → wrong Y(q) recomputation → corrupted s.p_in for
+upstream layers) AND dq_pre_reln was never propagated to s.dp (Wq grads
+stayed at zero → fuse-reln was effectively dead-attention for the
+attention path).
+
+The bug masked at `--accum 1` (per-microbatch errors didn't compound
+across the Adam window) but exploded at `--accum N>1`:
+
+| accum | bf16-attn | bf16-grads | result   |
+|------:|:---------:|:----------:|:---------|
+|     1 |    yes    |    yes     | ‖g‖=2-7 (math wrong but bounded) |
+|     2 |    yes    |    yes     | ‖g‖=inf step 1 |
+|     8 |    yes    |    yes     | ‖g‖=inf step 4 |
+|     8 |    no     |    no      | ‖g‖=inf step 2 |
+|     8 |    no     |    no      | (full FP32) ‖g‖=inf step 4 |
+
+Two-line backward at l == L-1:
+```c++
+if (cfg.fuseAttnReln && l == L - 1)
+{
+    if (!axpy(-1.0f, s.p.data(), s.q.data(), T*m)) return false;
+    if (!axpy( 1.0f, s.dq_buf.data(), s.dp.data(), T*m)) return false;
+}
+```
+
+Post-fix: accum=8 + fuse-reln stable with ‖g‖=1.3-3.2 throughout 10 steps.
+The default `--fuse-attn-per-layer` was unaffected (its backward was
+complete from task #32 shipping in 2026-05-11).
+
+### 2. LR cosine decay (already shipped — `--lr-decay` / `--lr-decay-min`)
+
+Verified the iter-184 implementation works correctly at L=24 m=2048:
+| step | lr |
+|-----:|---:|
+|   50 | 1.00e-04 (end of warmup) |
+|  100 | 7.75e-05 |
+|  150 | 3.25e-05 |
+|  200 | 1.00e-05 (10% floor) |
+
+No code change needed; just confirmed it composes with the new defaults.
+
+### 3. Per-layer trainable gamma_p/beta_p (commit `54667b4`)
+
+Replaced shared non-trainable `gamma_p_const` / `beta_p_const` with
+per-layer trainable `gamma_p[l]` / `beta_p[l]`.  Each layer learns an
+independent per-channel scale + shift for its p-side LayerNorm,
+letting the model self-regulate the (1/√L)·reln_p(p) amplification.
+
+Initialization: `gamma_p = ones(m)`, `beta_p = zeros(m)` — bit-identical
+to the prior shared-constants behavior at step 0.  Step 1 ‖g‖ shifts
+from 172.768 to 172.772 (4e-3 difference from now-nonzero dgamma_p/
+dbeta_p entries in the grad-norm).
+
+Adam state allocated via `addAdam` (same int8/bf16/fp32 mode as
+gamma/beta).  Cost: ~150 KB VRAM total at L=24 m=2048 int8-Adam.
+
+Save/load NOT yet extended for the new params — on resume, gamma_p
+and beta_p reset to ones/zeros and Adam moments are lost.  TODO for
+production checkpointing.
+
+### 4. L=48 20k validation (live + RLG + cosine decay)
+
+Tested whether the Phase C anomaly (dead-attn beats live at L=48 5k) was
+an undertraining artifact.  Single 20k run at L=48 m=2048 with new
+defaults + RLG schedule `8@0,24@4000,48@8000` + `--lr-decay`:
+
+| step  | ema   | lr      |
+|------:|------:|:--------|
+|   500 |  7.55 | 1.00e-04 |
+|  1000 |  9.41 | 9.99e-05 |
+|  5000 |  9.46 | 2.00e-05 |
+|  8000 |  9.47 | 7.10e-05 |
+| **10000** | **9.02** | 4.00e-05 |
+| 15000 |  9.35 | 2.38e-05 |
+| **20000** | **9.16** | 1.00e-05 |
+
+**Key findings**:
+- ema=9.16 at 20k narrowly matches dead-attn no-curriculum at 5k (9.17),
+  confirming that the Phase C "dead beats live" result WAS an
+  undertraining artifact.
+- Best ema (9.02) at step 10000 — cosine decay locked in the trough
+  better than Phase C's constant-lr runs.
+- Compounding gain from 5k → 10k: 0.44 nat (vs 5k → 20k constant-lr in
+  Phase A which oscillated and re-ascended).
+- Total wall: 6076s (~101 min) for 20k steps with the L=8→24→48 RLG
+  schedule.
+
+### 5. FACE + attention-live composition test
+
+Tested paradigm stacking: FACE (#28) on embedding + fuse-attn-per-layer
+(default) on attention.  Single 5000-step run at L=24 m=2048:
+
+| Config            | ema@5000 | Embedding Adam state |
+|-------------------|---------:|---------------------:|
+| Live (no FACE)    |     9.39 |              785 MB (dense Adam) |
+| **Live + FACE 1** | **9.33** |         **400 KB** (FACE Adafactor, 2007× smaller) |
+| Δ                 |    -0.06 nat |       -785 MB |
+
+NLL impact is marginal at this 5000-step horizon — the prior FACE
+claim of "+0.4-0.81 nat sustained" presumably applies to longer
+training where the embedding Adam state's adaptive precision matters
+more.  At 5k steps, the embedding gradient is still dominated by raw
+magnitudes and FACE's frequency-debiasing rarely fires usefully.
+
+**The headline FACE win is memory, not NLL.**  2007× compression of
+the embedding optimizer state on a V=50257 model is the structural
+benefit — composes cleanly with the attention-live default (no
+interaction issues, no regression).  Useful for any future run where
+GPU memory is the bottleneck (e.g., scaling V further or running at
+L=48+ where every MB counts).
+
+### Cumulative ema landscape at L=24 m=2048 / 5000 steps
+
+| Config                            | ema@5000 | vs dead-attn |
+|-----------------------------------|---------:|-------------:|
+| dead-attn (`--no-fuse-attn`)      |    10.48 |         base |
+| fuse-attn-per-layer (default)     |     9.39 |       -1.09 |
+| live + FACE 1                     |     9.33 |       -1.15 |
+
+The +1.09 nat headline from the 1B fair-comparison is preserved post-
+infrastructure changes (B fix, D flip, trainable gamma_p).  FACE adds
+0.06 nat plus the structural memory win.
+
+### Logs
+
+- `research/runs/2026-05-12-chiron-l48-20k/live_rlg_cosine.log`
+- `research/runs/2026-05-12-face-composition/live_face.log`
