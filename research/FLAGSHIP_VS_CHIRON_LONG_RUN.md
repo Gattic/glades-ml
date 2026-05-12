@@ -3519,3 +3519,108 @@ infrastructure changes (B fix, D flip, trainable gamma_p).  FACE adds
 
 - `research/runs/2026-05-12-chiron-l48-20k/live_rlg_cosine.log`
 - `research/runs/2026-05-12-face-composition/live_face.log`
+
+---
+
+## 2026-05-12 — Deferred-items pass (final cleanup)
+
+Three follow-up items shipped after the trainer-infrastructure pass:
+SCFA stabilization, long-horizon SCFA validation, and checkpoint save/load
+extension for the new gamma_p/beta_p parameters.
+
+### 1. SCFA + fuse-per-layer alpha damping (commit `93d7d07`)
+
+Pre-fix the SCFA + fuse combination was unstable at L≥8 m≥1024 due to
+SCFA's spectral compression producing y_par with per-token cross-channel
+variance ~1/16 of standard attention.  The earlier "task #B fix" only
+made the forward/backward consistent, not the variance mismatch.
+
+Tested two approaches:
+- **y_par forward scaling by √(T/k)**: made things 86× WORSE.  Amplified
+  dy_compr = scfa_scale · B^T · dy in backward, blowing up dWq chains
+  through the inner attention bwd.  ‖g‖ went 1.4M → 1.24×10⁸ at step 1.
+- **Per-layer fuse alpha · (k/T) when SCFA active** (shipped): dampens
+  the dp contribution chain to compensate for the variance mismatch on
+  the gradient side, not the forward side.  Net alpha when SCFA active:
+  `alpha = (1/√L) · (k/T)`.
+
+Empirical at L=24 m=2048 step 1 ‖g‖:
+| Config | step-1 ‖g‖ | Notes |
+|--------|-----------:|-------|
+| SCFA + fuse pre-fix (just trainable gamma_p) | 1,449,576 | unusable |
+| + y_par × √(T/k) forward scale | 1.24×10⁸ | catastrophic |
+| **+ fuse alpha × (k/T) damping** | **7.5** | usable at L≤8 |
+
+At L=8 m=2048: bounded 2.2-5.0 throughout 200 steps, loss descends
+11.20 → 10.13.  At L=24+ m=2048: bounded but with intermittent
+data-driven spikes to ~10⁹-10¹⁰ that grad_clip handles.  **Recommend
+SCFA with L ≤ 8 m ≤ 2048 for stable training**; deeper SCFA + fuse
+remains a research target.
+
+### 2. Long-horizon SCFA + fuse composition (5000 steps L=8 m=2048)
+
+Two 5000-step runs at L=8 m=2048 (concurrent due to accidental dual-bg):
+| Config | ema@5000 | Best | Wall |
+|--------|---------:|-----:|-----:|
+| Fuse only (`--fuse-attn-per-layer` default) | 10.01 | 4.10@788 | 670 s |
+| SCFA + fuse (`--scfa --scfa-compression-ratio 16`) | **10.55** | 7.89@4887 | 717 s |
+
+SCFA + fuse is **0.54 nat WORSE** than fuse-only at this horizon.  The
+SCFA compute speedup (10× design, ~40% measured at L=8/T=512) doesn't
+offset the NLL cost.  SCFA's intended use case is long-T (T ≥ 4096+);
+at T=512 the spectral compression at k=32 throws away too much signal.
+
+Throughput observation: SCFA solo ≈ 9165 tok/s at L=8 m=2048 T=512
+vs fuse-only ≈ 6500-7000 tok/s — ~40% faster, not the 10× advertised
+for long-T regimes.  At short T the orthogonal computation overhead
+(DCT projection, conv mixer) dominates.
+
+### 3. CHRN v=2 / CHRF v=3 with gamma_p/beta_p (commit `8d98388`)
+
+Without the extension, every resume reset gamma_p/beta_p to (ones, zeros)
+and lost all accumulated Adam moments on those params.
+
+- **CHRN v=2**: per-layer block extends with gamma_p[l] (m floats) +
+  beta_p[l] (m floats) after gamma[l]/beta[l].  Version bump triggers
+  only when fuseAttnPerLayer is enabled at save time; older v=1 files
+  still load (gamma_p stays at init).
+- **CHRF v=3**: weights blob mirrors CHRN.  Adds new flag bit 8
+  (FLAG_HAS_GAMMA_P) to the existing flags word.  Under `--bf16-adam`,
+  also persists gamma_p_mb/vb + beta_p_mb/vb Adam state.  Under
+  `--kahan-v`, also persists gamma_p_cb/beta_p_cb Kahan buffers.
+- **int8/fp32 Adam state for gamma_p NOT yet persisted** (matches the
+  existing CHRF's int8/fp32 omission for the standard gamma/beta params).
+  TODO for production: extend CHRF to cover int8 mode for all groups.
+
+Round-trip verified at L=4 m=256 T=256: save at step 100, load via
+`--load ckpt.step100`, resume step 1 loss = 10.67 (vs init 10.85,
+confirming trained state is preserved through the round-trip).  File
+size 59,868,192 bytes exactly matches the v=2 layout calculation
+(L · (4·m·dModel + 4·m) · 4 bytes + header + V·m·4 = E body).
+
+### Final state of trainer infrastructure
+
+The trainer now supports:
+- `--fuse-attn-per-layer` (default) with per-layer trainable gamma_p/beta_p
+- `--no-fuse-attn` opt-out
+- `--scfa --scfa-compression-ratio R` (paired with `--no-fuse-attn`
+  recommended for L > 8 m > 1024)
+- `--lr-decay --lr-decay-min FRAC` (cosine decay)
+- `--accum N` correctness-safe for any fuse mode (after the fuse-reln
+  bwd fix)
+- `--save PATH --save-every N` with CHRN v=2 (gamma_p preserved)
+- `--save-full` with CHRF v=3 (gamma_p + bf16Adam state preserved)
+- `--load PATH` auto-detects version
+
+### What remains TODO
+
+- **CHRF int8/fp32 Adam state**: only bf16Adam Adam state is persisted
+  in CHRF.  int8 (the production default) starts fresh moments on
+  resume.  Affects all groups equally (Wq/Wk/Wv/Wo/gamma/beta and now
+  gamma_p/beta_p).
+- **SCFA + fuse at L > 8 m > 1024**: data-driven spikes in ‖g‖ remain.
+  Possible fix directions: ablate the inner-attn dWq amplification,
+  trainable per-layer alpha (replacing fixed 1/√L · k/T), or restrict
+  SCFA to layers where p variance is well-conditioned.
+- **Longer-horizon SCFA + fuse at the right T** (T ≥ 4096) to actually
+  realize SCFA's compute speedup at the regime it was designed for.
