@@ -4211,3 +4211,64 @@ Gap **widens** with budget: at 1 M tokens CHIRON is 0.59 nat ahead; by
 
 - `research/runs/2026-05-12-production/vanilla_935M_C.log`
 - Comparison script: `research/runs/2026-05-12-production/compare_A_vs_C.sh`
+
+## 2026-05-13 — CHIRON 1B + save: production checkpoint captured
+
+After the CHIRON-as-flagship pivot, re-ran CHIRON 1B 50k with `--save-full`
+to capture the 870.94M parameter model for downstream use.
+
+### Config (vs Option A reference)
+
+| Setting       | Option A (2026-05-12) | Save run (2026-05-13) |
+|---------------|----------------------:|----------------------:|
+| T, m, L, nH   | 512, 2048, 24, 16     | 512, 2048, 24, 16     |
+| V             | 50 257                | **32 000** (data match) |
+| Params        | 908 M                 | 870.94 M              |
+| RLG schedule  | 8→16@2500→24@5000     | same                  |
+| lr / wd / clip| 1e-4 / 1e-2 / 0.5     | same                  |
+| Save cadence  | (none)                | every 5000 steps + final|
+
+### Trajectory comparison
+
+| Step  | Save run ema | Option A ema | Δ                  |
+|------:|-------------:|-------------:|-------------------:|
+|  1000 |        9.370 |        9.469 | −0.10              |
+|  5000 |        9.343 |        9.385 | −0.04              |
+| 10000 |        8.642 |        8.668 | −0.03 (best stable)|
+| 15000 |        9.482 |        9.502 | −0.02              |
+| 20000 |        9.496 |        9.466 | +0.03              |
+| 25000 |        9.477 |        9.168 | +0.31              |
+| 30000 |        9.211 |        9.048 | +0.16              |
+| 50000 |       11.624 |        9.135 | +2.49 (end-of-run spike)|
+
+Save run tracks Option A within ±0.3 nat through step 30000, then both
+hit the characteristic CHIRON oscillation.  The save run's `.final`
+landed in a bad oscillation peak (ema=11.62) — **the best USABLE
+checkpoint is `chiron_1B.step10000` at ema=8.64**.
+
+### Saved checkpoints
+
+Location: `research/runs/2026-05-13-chiron-1B-save/`
+
+11 × 4.9 GB CHRF full-state (weights + Adam + step counter):
+
+| File              | ema NLL | Use case                                |
+|-------------------|--------:|-----------------------------------------|
+| step5000          |    9.34 | Right after RLG L=24 ramp completes     |
+| **step10000**     | **8.64**| **Recommended default — best stable**   |
+| step15000-step25000|   ~9.49| Mid-run oscillation                     |
+| step30000         |    9.21 | Secondary stable point                  |
+| step35000-step45000|   ~10.0| Late-run drift                          |
+| step50000 / .final|   11.62 | **AVOID — oscillation peak**            |
+
+Total disk: 54 GB.  See
+`memory/reference_chiron_1B_checkpoints.md` for the full inventory
+with usage guidance.
+
+### Run stats
+
+- Wall: 9897 sec ≈ 2.75 hr (vs Option A's 2.8 hr — parity)
+- Throughput: 2475 tok/s steady
+- All 3 RLG transitions fired cleanly (L=8→16→24)
+- 11 checkpoints saved (cadence 5000 steps + final)
+- Log: `research/runs/2026-05-13-chiron-1B-save/train.log`
