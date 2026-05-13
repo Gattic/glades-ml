@@ -9100,6 +9100,12 @@ void glades::NNetwork::transformerCpuBackwardPass(const TransformerEpochCfg& cfg
 // Extracted GPU training epoch (previously inlined in SGDHelper_TRANSFORMER).
 // Runs the complete forward/backward/optimizer loop on GPU for all sequences
 // in the epoch.
+//
+// 2026-05-13: also supports eval mode (cfg.isTrain == false).  In that mode
+// the function runs forward + loss accumulation + logging for each sequence,
+// then `continue;`s past the backward/optimizer block (early skip at line
+// ~10878, just before "=== GPU Backward pass ===").  This eliminates the
+// historical CPU fallback that made `net.test()` take ~1 hour at 1B class.
 // ---------------------------------------------------------------------------
 #ifdef GLADES_HAVE_CUDA
 bool glades::NNetwork::tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg, unsigned int seqCount,
@@ -9112,7 +9118,7 @@ bool glades::NNetwork::tryRunTransformerGpuEpoch(const TransformerEpochCfg& cfg,
                                                  unsigned long long& clsTotal,
                                                  shmea::GLogger* logger)
 {
-	if (!trainingConfig.gpu.enable || !cfg.isTrain)
+	if (!trainingConfig.gpu.enable)
 		return false;
 	if (trainingConfig.optimizer.type == glades::OptimizerConfig::ATLAS
 	    && (trainingConfig.atlas.helmEnabled
@@ -10826,7 +10832,8 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				std::ostringstream oss;
 				oss << "event=nn_epoch_progress";
 				append_logfmt_kv(oss, "net_type", netType);
-				append_logfmt_kv(oss, "run_type", std::string("train"));
+				// 2026-05-13: GPU eval support — log "eval" when isTrain=false.
+				append_logfmt_kv(oss, "run_type", std::string(cfg.isTrain ? "train" : "eval"));
 				append_logfmt_kv(oss, "gpu", true);
 				append_logfmt_kv(oss, "epoch", epochIdx);
 				append_logfmt_kv(oss, "seq_done", s + 1u);
@@ -10874,6 +10881,16 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 				logger->info("NNetwork", shmea::GString(oss.str().c_str()));
 			}
 		}
+
+		// 2026-05-13 fix: GPU eval-during-training.  When !cfg.isTrain,
+		// we've already done forward + loss accumulation + logging above
+		// (lines ~10210-10876).  Skip the entire backward + optimizer
+		// section below — eval doesn't need gradients, just the loss.
+		// This makes `net.test(diPtr)` use the GPU end-to-end and unlocks
+		// test-set NLL tracking during training without falling back to
+		// the 1000× slower CPU path.
+		if (!cfg.isTrain)
+			continue;
 
 		// === GPU Backward pass ===
 		if (seqInBatch == 0u)
