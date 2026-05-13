@@ -14,6 +14,8 @@ set(GLADES_CUDA_SOURCES
 	gpu_vesta.cu
 	gpu_helios.cu
 	gpu_chiron.cu
+	gpu_graph.cu
+	gpu_blas_fp8.cu
 	gpu_stiefel.cu
 	gpu_hrtc.cu
 	gpu_ovfg.cu
@@ -57,6 +59,14 @@ if(CUBLAS_LIB)
 	target_link_libraries(GladesCUDA ${CUBLAS_LIB})
 else()
 	target_link_libraries(GladesCUDA cublas)
+endif()
+
+# Link cuBLASLt (FP8 GEMM path, paradigm #50 HELIUM).
+find_library(CUBLASLT_LIB cublasLt HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+if(CUBLASLT_LIB)
+	target_link_libraries(GladesCUDA ${CUBLASLT_LIB})
+else()
+	target_link_libraries(GladesCUDA cublasLt)
 endif()
 
 # Link cuSOLVER for batched factorizations.

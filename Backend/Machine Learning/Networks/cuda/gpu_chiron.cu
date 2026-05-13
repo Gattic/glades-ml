@@ -549,8 +549,16 @@ bool chiron_attention_shear_backward_bf16w_tiled(
 	if (!sgemm_rowmajor_abt_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wo_bf, m, 0.0f, sdO, dModel))
 		return false;
 
-	// 4. dWo += sO^T · dp_new (FP32 × FP32 -> FP32; sO and dp_new are FP32).
-	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
+	// 4. dWo += sO^T · dp_new.  2026-05-13: switched to BF16 tensor cores —
+	// scratch_qbf currently holds bf16(dp_new) from step 3 above; cast sO to
+	// bf16 in scratch_sdbf and run atb_bf16.  ~2× faster than the previous
+	// FP32 sgemm_rowmajor_atb on Ada.
+	if (!cast_f32_to_bf16(sO, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16(dModel, m, T, 1.0f,
+	        scratch_sdbf, dModel,  // sO^T   (BF16)
+	        scratch_qbf, m,        // dp_new (BF16, from step 3)
+	        1.0f, dWo, m))
 		return false;
 
 	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
@@ -563,27 +571,38 @@ bool chiron_attention_shear_backward_bf16w_tiled(
 	        sdQ, sdK, sdV, scratch_P, scratch_dP))
 		return false;
 
-	// 6. dq += sdQ · Wq^T (and for sdK, sdV).  Use abt_bf16 — cast each sdX
-	//    to BF16 one at a time into scratch_sdbf, then BF16 × BF16 -> FP32.
+	// 2026-05-13 (paradigm-stack fix #1): weight gradients now also use BF16
+	// tensor cores.  Pattern per X in {Q, K, V}: recast bf16(q) → scratch_qbf
+	// only once (between steps 5 and 6), then for each X cast sdX → scratch_sdbf
+	// and do both the activation grad (step 6) AND the weight grad (step 7) in
+	// BF16 before moving to the next X.  This avoids needing extra scratches.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 6+7 fused per direction.
+	// Q:
 	if (!cast_f32_to_bf16(sdQ, scratch_sdbf, static_cast<size_t>(T) * dModel))
 		return false;
 	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wq_bf, dModel, 1.0f, dq, m))
 		return false;
+	if (!sgemm_rowmajor_atb_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWq, dModel))
+		return false;
+	// K:
 	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
 		return false;
 	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
 		return false;
+	if (!sgemm_rowmajor_atb_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWk, dModel))
+		return false;
+	// V:
 	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
 		return false;
 	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
 		return false;
-
-	// 7. Weight gradients: dWq += q^T · sdQ etc.  FP32 throughout.
-	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdQ, dModel, 1.0f, dWq, dModel))
-		return false;
-	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdK, dModel, 1.0f, dWk, dModel))
-		return false;
-	if (!sgemm_rowmajor_atb(m, dModel, T, 1.0f, q, m, sdV, dModel, 1.0f, dWv, dModel))
+	if (!sgemm_rowmajor_atb_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWv, dModel))
 		return false;
 	return true;
 }
