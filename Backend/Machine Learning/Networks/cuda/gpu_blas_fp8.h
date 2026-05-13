@@ -61,6 +61,26 @@ bool sgemm_rowmajor_fp8_e4m3(int M, int N, int K,
                               const float* d_scaleA,
                               const float* d_scaleB);
 
+// BF16-input variant of the FP8 GEMM.  A and B are BF16 (uint16_t); the
+// wrapper casts each to E4M3 with the per-tensor scales then runs the
+// FP8 cuBLASLt matmul.  Output is FP32 (cuBLASLt produces BF16, which
+// is unscaled back to FP32 inside the wrapper).
+//
+// This is the path used by --bf16-weights + --fp8-attn since CHIRON
+// stores attention weights as BF16 on the hot path.
+bool sgemm_rowmajor_fp8_e4m3_bf16(int M, int N, int K,
+                                   float alpha,
+                                   const unsigned short* A_bf, int lda,
+                                   const unsigned short* B_bf, int ldb,
+                                   float beta,
+                                   float* C, int ldc,
+                                   const float* d_scaleA,
+                                   const float* d_scaleB);
+
+// Compute amax over a BF16 array and write `448.0f / amax` into `*d_scale`.
+// Counterpart to fp8_calibrate_amax_e4m3 for the BF16 path.
+bool fp8_calibrate_amax_e4m3_bf16(const unsigned short* d_x_bf, size_t n, float* d_scale);
+
 } // namespace gpu
 } // namespace glades
 
@@ -75,6 +95,10 @@ inline bool fp8_calibrate_amax_e4m3(const float*, size_t, float*) { return false
 inline bool sgemm_rowmajor_fp8_e4m3(int, int, int, float, const float*, int,
                                      const float*, int, float, float*, int,
                                      const float*, const float*) { return false; }
+inline bool sgemm_rowmajor_fp8_e4m3_bf16(int, int, int, float, const unsigned short*, int,
+                                          const unsigned short*, int, float, float*, int,
+                                          const float*, const float*) { return false; }
+inline bool fp8_calibrate_amax_e4m3_bf16(const unsigned short*, size_t, float*) { return false; }
 
 } // namespace gpu
 } // namespace glades

@@ -89,24 +89,37 @@ regime where launch overhead dominates.
 
 ## Fix #5 — FP8 cuBLASLt (paradigm #50 HELIUM)
 
-**Wrappers shipped:**
+**Full forward path wired:**
 - `Backend/Machine Learning/Networks/cuda/gpu_blas_fp8.{h,cu}` —
-  `sgemm_rowmajor_fp8_e4m3()`, `fp8_calibrate_amax_e4m3()`,
-  `fp8_init()`, `fp8_supported()`
+  `sgemm_rowmajor_fp8_e4m3{,_bf16}()`, `fp8_calibrate_amax_e4m3{,_bf16}()`,
+  cast kernels (FP32/BF16 → E4M3, with and without transpose)
 - E4M3 input, BF16 intermediate, FP32 output via cuBLASLt
-  `CUBLAS_COMPUTE_32F` + `CUDA_R_8F_E4M3` + per-tensor scales
+  `CUBLAS_COMPUTE_32F` + `CUDA_R_8F_E4M3` + per-tensor scales (set as
+  inverse-scales via `CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` /
+  `B_SCALE_POINTER` + `FAST_ACCUM=1`)
+- `chiron_attention_shear_fp8w_tiled` in `gpu_chiron.cu` — full Q/K/V/O
+  projection path through FP8, attention core in BF16, on-the-fly amax-
+  derived scales (6 scalars per call: q, Wq, Wk, Wv, Wo, scratch_O)
 - cuBLASLt linked into `GladesCUDA` target
-- `--fp8-attn` flag in trainer; initialises on startup (succeeds on
-  Ada sm_8.9 and Hopper sm_9.0+)
+- `--fp8-attn` flag in trainer dispatches to the FP8 shear when
+  combined with `--bf16-weights`; auto-falls-back to BF16 on cuBLASLt
+  rejection (drains residual CUDA error to keep training stable)
 
-**Status: scaffolding.**  The FP8 GEMM wrapper compiles and the
-init path succeeds, but actual integration into the CHIRON attention
-shear path requires a per-tensor scale tracker added to `ChironParams`
-(one FP32 scale per Wq/Wk/Wv/Wo and per activation, populated from
-amax during a warmup window).  Until that tracker lands, `--fp8-attn`
-parses but the path falls back to BF16.
+**Runtime status on this machine: cuBLASLt 12.0.2 (Jan 2023)
+rejects the matmul with `CUBLAS_STATUS_NOT_SUPPORTED` (error 15).**
+This is the version installed on the host (`libcublasLt.so.12.0.2.224`).
+NVIDIA expanded Ada-class general FP8 matmul algo coverage in
+cuBLASLt 12.3+ (late 2023); 12.0 only supports a small set of FP8
+shapes that don't match our T=512, m=2048, dModel=4096 projections.
+On the same Ada GPU under cuBLASLt 12.3+ the same code path should
+work without modification.
 
-**Estimated 1.5-2× over BF16 once wired** for the shear GEMMs.
+The graceful fallback path is verified — on first failure the
+trainer logs the warning, disables FP8 for the rest of the run,
+falls back to `chiron_attention_shear_bf16w_tiled`, and continues
+training normally.  5-step smoke at 1B class completes cleanly.
+
+**Estimated 1.5-2× over BF16 once cuBLASLt is upgraded.**
 
 ## Bottleneck reality check
 

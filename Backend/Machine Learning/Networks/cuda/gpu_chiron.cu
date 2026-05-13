@@ -15,6 +15,7 @@
 #include "gpu_chiron.h"
 #include "gpu_device.h"
 #include "gpu_blas.h"
+#include "gpu_blas_fp8.h"
 #include "gpu_kernels.h"
 
 #ifdef GLADES_HAVE_CUDA
@@ -490,6 +491,98 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
 	// Output projection: p += sign * scratch_Obf @ Wo_bf (BF16 TC, FP32 accum).
 	const float sign = invert ? -1.0f : 1.0f;
 	if (!sgemm_rowmajor_bf16(T, m, dModel, sign, scratch_Obf, dModel, Wo_bf, m, 1.0f, p, m))
+		return false;
+	return true;
+}
+
+// FP8 (E4M3) projection variant of chiron_attention_shear_bf16w_tiled.
+// See gpu_chiron.h for the full contract.  All 4 projection GEMMs run
+// through cuBLASLt's FP8 path with per-tensor scales computed on the fly
+// via amax reductions.  Attention core stays BF16-TC (the tiled
+// flash_attention path needs BF16 inputs, not FP8).  Each projection
+// scale is computed once per call; in steady state weights change
+// slowly enough that this is fine, and the amax kernels are tiny
+// (T·m bytes total, sub-ms).
+//
+// Math (per projection):
+//   stored_x = clamp(real_x * scale, ±448)  in E4M3
+//   stored_w = clamp(real_w * scale_w, ±448)  in E4M3
+//   real_out = (1 / (scale * scale_w)) · sum(stored_x · stored_w)
+//
+// The unscale is done in kernel_cast_bf16_to_fp32_scaled inside the
+// sgemm_rowmajor_fp8_e4m3_bf16 wrapper.
+bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
+                                         const unsigned short* Wq_bf,
+                                         const unsigned short* Wk_bf,
+                                         const unsigned short* Wv_bf,
+                                         const unsigned short* Wo_bf,
+                                         int T, int m, int nHeads, int dHead,
+                                         bool causal, bool invert,
+                                         unsigned short* scratch_qbf,
+                                         unsigned short* scratch_Obf,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16,
+                                         float* d_scale_q,
+                                         float* d_scale_Wq, float* d_scale_Wk,
+                                         float* d_scale_Wv, float* d_scale_Wo,
+                                         float* d_scale_O)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	// Cast q FP32 → BF16 once per layer (same as the BF16 path; the FP8
+	// wrapper takes BF16 inputs and re-casts to E4M3 internally).
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// Calibrate per-tensor scales from amax.  These are tiny reductions
+	// (≤ 4 KB output per kernel) and pipeline on the same stream as the
+	// GEMMs, so they don't add measurable latency vs. the projections.
+	if (!fp8_calibrate_amax_e4m3_bf16(scratch_qbf, (size_t)T * m, d_scale_q)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wq_bf, (size_t)m * dModel, d_scale_Wq)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wk_bf, (size_t)m * dModel, d_scale_Wk)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wv_bf, (size_t)m * dModel, d_scale_Wv)) return false;
+	if (!fp8_calibrate_amax_e4m3_bf16(Wo_bf, (size_t)dModel * m, d_scale_Wo)) return false;
+
+	// FP8 Q/K/V projections (BF16 inputs, FP8 GEMM core, FP32 output).
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModel, m, 1.0f,
+	        scratch_qbf, m, Wq_bf, dModel, 0.0f, scratch_Q, dModel,
+	        d_scale_q, d_scale_Wq))
+		return false;
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModel, m, 1.0f,
+	        scratch_qbf, m, Wk_bf, dModel, 0.0f, scratch_K, dModel,
+	        d_scale_q, d_scale_Wk))
+		return false;
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, dModel, m, 1.0f,
+	        scratch_qbf, m, Wv_bf, dModel, 0.0f, scratch_V, dModel,
+	        d_scale_q, d_scale_Wv))
+		return false;
+
+	// Attention core stays BF16 (cuBLAS sgemm_batched_strided_bf16 + custom softmax).
+	if (!flash_attention_cublas_tiled_bf16(
+	        scratch_Q, scratch_K, scratch_V,
+	        T, nHeads, dHead, dModel, causal,
+	        scratch_O, scratch_S,
+	        scratch_Qbf16, scratch_Kbf16, scratch_Vbf16, scratch_Pbf16))
+		return false;
+
+	// Cast scratch_O → BF16 for the output projection.
+	if (!cast_f32_to_bf16(scratch_O, scratch_Obf, static_cast<size_t>(T) * dModel))
+		return false;
+	// Calibrate scratch_O scale (attention output magnitude is config-
+	// dependent so we recalibrate per layer).
+	if (!fp8_calibrate_amax_e4m3_bf16(scratch_Obf, (size_t)T * dModel, d_scale_O)) return false;
+
+	// FP8 output projection: p += sign · scratch_Obf @ Wo_bf.
+	const float sign = invert ? -1.0f : 1.0f;
+	if (!sgemm_rowmajor_fp8_e4m3_bf16(T, m, dModel, sign,
+	        scratch_Obf, dModel, Wo_bf, m, 1.0f, p, m,
+	        d_scale_O, d_scale_Wo))
 		return false;
 	return true;
 }

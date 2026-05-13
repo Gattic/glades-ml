@@ -219,6 +219,41 @@ bool chiron_attention_shear_bf16w_tiled(const float* q, float* p,
                                           unsigned short* scratch_Vbf16,
                                           unsigned short* scratch_Pbf16);
 
+// FP8 (E4M3) projection variant of `chiron_attention_shear_bf16w_tiled`
+// (paradigm #50 HELIUM).  Projections Q/K/V/O run via
+// `sgemm_rowmajor_fp8_e4m3_bf16` (BF16 weights cast to E4M3 internally,
+// FP8 tensor-core matmul, FP32 accumulate); the attention core stays in
+// BF16-TC.  Backward is unchanged — use the existing bf16w backward.
+//
+// Per-tensor scales are computed inside the function from amax of the
+// inputs (q, Wq_bf, Wk_bf, Wv_bf, scratch_O, Wo_bf).  Caller provides
+// 6 FP32 device scalars as scratch (scale_q, scale_Wq, scale_Wk,
+// scale_Wv, scale_O, scale_Wo).
+//
+// At L=24 m=2048 T=512 we expect ~1.5-2× over BF16-TC for the projection
+// GEMMs since Ada has 2× FP8 throughput vs BF16; net step speedup likely
+// 10-20% since the inner attention (still BF16) doesn't change.
+bool chiron_attention_shear_fp8w_tiled(const float* q, float* p,
+                                         const unsigned short* Wq_bf,
+                                         const unsigned short* Wk_bf,
+                                         const unsigned short* Wv_bf,
+                                         const unsigned short* Wo_bf,
+                                         int T, int m, int nHeads, int dHead,
+                                         bool causal, bool invert,
+                                         unsigned short* scratch_qbf,
+                                         unsigned short* scratch_Obf,
+                                         float* scratch_Q, float* scratch_K,
+                                         float* scratch_V, float* scratch_O,
+                                         float* scratch_S,
+                                         unsigned short* scratch_Qbf16,
+                                         unsigned short* scratch_Kbf16,
+                                         unsigned short* scratch_Vbf16,
+                                         unsigned short* scratch_Pbf16,
+                                         float* d_scale_q,
+                                         float* d_scale_Wq, float* d_scale_Wk,
+                                         float* d_scale_Wv, float* d_scale_Wo,
+                                         float* d_scale_O);
+
 // BF16-weight backward counterpart.  Takes BF16 weight pointers directly
 // and uses BF16-TC GEMMs throughout the projection, dO, and dq-projection
 // paths.  Weight-grad GEMMs (dWq += q^T · sdQ etc.) stay FP32 — caller may
@@ -456,6 +491,15 @@ inline bool chiron_attention_shear_bf16w_tiled(const float*, float*,
                                                  float*, float*, float*, float*, float*,
                                                  unsigned short*, unsigned short*,
                                                  unsigned short*, unsigned short*) { return false; }
+inline bool chiron_attention_shear_fp8w_tiled(const float*, float*,
+                                                const unsigned short*, const unsigned short*,
+                                                const unsigned short*, const unsigned short*,
+                                                int, int, int, int, bool, bool,
+                                                unsigned short*, unsigned short*,
+                                                float*, float*, float*, float*, float*,
+                                                unsigned short*, unsigned short*,
+                                                unsigned short*, unsigned short*,
+                                                float*, float*, float*, float*, float*, float*) { return false; }
 inline bool chiron_attention_shear_backward_bf16w_tiled(
     const float*, const float*,
     const unsigned short*, const unsigned short*,
