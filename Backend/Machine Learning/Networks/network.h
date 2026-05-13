@@ -1885,6 +1885,13 @@ private:
 	float lrScheduleMultiplier; // computed each epoch by the scheduler; starts at 1
 	int lrScheduleEpochOffset;  // added to epochFromStart in Trainer::run(); caller sets this
 	                            // when train() is called once per epoch in a loop
+	int runStartingEpochs;      // 2026-05-13 task #29 fix: Trainer::run sets this at run
+	                            // start so per-step LR computations in SGDHelper can
+	                            // subtract it (mirrors Trainer::run's starting_epochs
+	                            // local).  Without this subtraction, callers that set
+	                            // lrScheduleEpochOffset + iterate per-chunk see
+	                            // epochIdx + offset double-counted by 2× (epochIdx is
+	                            // cumulative net.epochs which already equals offset).
 	float lastGradNorm;
 	float lastGradNormScale;
 	int64_t lastStepLogTime;

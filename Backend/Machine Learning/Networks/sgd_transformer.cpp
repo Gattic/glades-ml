@@ -6773,6 +6773,9 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 			if (ddpEnabled)
 				ddpReduceGrads(batchTimeSteps);
 
+			// 2026-05-13 fix: epochIdx here is already LOCAL (constructor
+			// passed runStartingEpochs subtracted; see SGDHelper_TRANSFORMER
+			// construction site).  Don't subtract again.
 			lrScheduleMultiplier = transformer_schedule_multiplier(
 			    trainingConfig.lrSchedule,
 			    epochIdx + lrScheduleEpochOffset,
@@ -6789,11 +6792,15 @@ void glades::NNetwork::SGDHelper_TRANSFORMER(unsigned int inputRowCounter, int r
 		}
 	};
 
+	// 2026-05-13 fix: pass LOCAL epoch (subtracting runStartingEpochs) so
+	// MinibatchDriver's per-step LR computation doesn't double-count when
+	// caller sets lrScheduleEpochOffset on a one-train-per-chunk pattern.
+	const int localEpochForDriver = epochIdx - runStartingEpochs;
 	MinibatchDriver minibatchDriver(trainingConfig, tt,
 	                                clearGrads, applyBatch, ddpReduceGrads,
 	                                logger, ddpEnabled, mpEnable,
 	                                mpUseLossScaling, mpDynamicLossScaling,
-	                                optimizerStepsPerEpoch, epochIdx,
+	                                optimizerStepsPerEpoch, localEpochForDriver,
 	                                lrScheduleEpochOffset, lrScheduleMultiplier,
 	                                netType);
 
@@ -11758,9 +11765,16 @@ void glades::NNetwork::transformerGpuTrainEpoch(const TransformerEpochCfg& cfg, 
 			const float gpuExtraLRMult = warmupMult * ddpLRScale;
 
 			const unsigned int stepInEpoch = (s + 1u) / seqBatchMax;
+			// 2026-05-13 fix: subtract runStartingEpochs so epochIdx is local
+			// to this Trainer::run invocation, matching trainer.cpp:546's
+			// (net.epochs - starting_epochs + offset) semantic.  Without the
+			// subtraction, callers that set lrScheduleEpochOffset + iterate
+			// one-train-per-chunk see epochIdx + offset double-counted
+			// (flagship's --t-schedule pattern hits this).
+			const int localEpoch = epochIdx - runStartingEpochs;
 			lrScheduleMultiplier = transformer_schedule_multiplier(
 			    trainingConfig.lrSchedule,
-			    epochIdx + lrScheduleEpochOffset,
+			    localEpoch + lrScheduleEpochOffset,
 			    stepInEpoch,
 			    optimizerStepsPerEpoch);
 

@@ -488,6 +488,13 @@ glades::NNetworkStatus glades::Trainer::run(glades::NNetwork& net,
 	// For learning-rate schedules, treat this run's start epoch as the baseline.
 	// This makes schedules work sensibly for resumed training.
 	int starting_epochs = isTrainRun ? net.epochs : 0;
+	// 2026-05-13 task #29 fix: expose starting_epochs to SGDHelper_TRANSFORMER
+	// per-step LR computation so it can subtract this from cumulative epochIdx
+	// to get local epoch (matches the subtraction in line 546 below).  Without
+	// this, callers that set lrScheduleEpochOffset + call train()-per-chunk hit
+	// double-counting in the per-step LR override (flagship's --t-schedule
+	// pattern).
+	net.runStartingEpochs = starting_epochs;
 
 	// Ensure weights/parameters exist for this shape before any SGD steps run.
 	if (!net.ensureTensorParametersInitialized())

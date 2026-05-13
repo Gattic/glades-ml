@@ -422,6 +422,7 @@ glades::NNetwork::NNetwork(int newNetType)
 	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
@@ -471,6 +472,7 @@ glades::NNetwork::NNetwork(const NNInfo* newNNInfo, int newNetType)
 	// `trainingConfig` is default-constructed before entering the constructor body.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
@@ -2091,6 +2093,7 @@ void glades::NNetwork::clean()
 	// Schedule bookkeeping resets each run
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	lastGradNorm = 0.0f;
 	lastGradNormScale = 1.0f;
 	lastStepLogTime = 0;
@@ -4474,6 +4477,7 @@ void glades::NNetwork::setLearningRateScheduleNone()
 	trainingConfig.lrSchedule.setNone();
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setLearningRateScheduleStep(int stepSizeEpochs, float gamma)
@@ -4481,6 +4485,7 @@ void glades::NNetwork::setLearningRateScheduleStep(int stepSizeEpochs, float gam
 	trainingConfig.lrSchedule.setStep(stepSizeEpochs, gamma);
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setLearningRateScheduleExp(float gamma)
@@ -4488,6 +4493,7 @@ void glades::NNetwork::setLearningRateScheduleExp(float gamma)
 	trainingConfig.lrSchedule.setExp(gamma);
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setLearningRateScheduleCosine(int tMaxEpochs, float minMultiplier)
@@ -4495,6 +4501,7 @@ void glades::NNetwork::setLearningRateScheduleCosine(int tMaxEpochs, float minMu
 	trainingConfig.lrSchedule.setCosine(tMaxEpochs, minMultiplier);
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 }
 
 void glades::NNetwork::setGlobalGradClipNorm(float clipNorm)
@@ -4541,6 +4548,7 @@ glades::NNetworkStatus glades::NNetwork::setTrainingConfig(const glades::Trainin
 	// Reset schedule bookkeeping to avoid leaking stale multipliers into the next run.
 	lrScheduleMultiplier = 1.0f;
 	lrScheduleEpochOffset = 0;
+	runStartingEpochs = 0;
 	return NNetworkStatus(NNetworkStatus::OK, std::string());
 }
 
