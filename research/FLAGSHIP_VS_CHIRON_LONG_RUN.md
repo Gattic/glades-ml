@@ -4163,6 +4163,30 @@ iteration; neither is a blocker for the comparison conclusion.
 
 - `research/runs/2026-05-12-production/vanilla_curriculum_C3.log` (terminated at step 6548)
 
+## 2026-05-13 — Decision: CHIRON is the flagship; vanilla deprecated
+
+After C/C2/C3/C4 (the last with both wiring bugs fixed, then killed at the
+user's call), the conclusion is clear: vanilla `glades_pile_train` is not
+worth further investment as a production trainer.  Summary of what we
+learned across the C-series:
+
+| Run | Config                                  | Result                                              |
+|-----|-----------------------------------------|-----------------------------------------------------|
+| C   | vanilla, no curriculum                  | plateau NLL 10.24, grad spikes 1e9, terminated      |
+| C2  | + `--l-schedule` (silently inert)       | worse — frozen L=8 effective, NLL 10.31             |
+| C3  | + `--t-schedule` + `--l-schedule` (LR bug) | curriculum fired but LR collapsed to floor early   |
+| C4  | (both bugs fixed)                       | killed by user choice; pivot to CHIRON as flagship  |
+
+Both bugs were real and worth fixing (commits `77550865f` in glades-ml,
+`3ba1d61` in glades-trainer).  But the bigger lesson is that CHIRON is
+already the production-quality trainer: reversibility + fuse-attn-per-layer
++ RLG (which CHIRON's trainer wires correctly) get it to NLL 8.67 at step
+10k at 1B class — vanilla flagship has never matched that.
+
+Going forward: default to `glades_chiron_train` for new runs.  Vanilla
+`glades_pile_train` stays in the codebase for reference but is not the
+active development target.
+
 ## Token-aligned comparison
 
 | Token milestone | CHIRON A (ema) | Flagship C (nll) | Gap (nat)        |
