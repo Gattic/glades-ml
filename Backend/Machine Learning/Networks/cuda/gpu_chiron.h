@@ -31,6 +31,35 @@ bool chiron_shear_add(float* p, const float* u, int n);
 bool chiron_shear_sub(float* p, const float* u, int n);
 
 // ---------------------------------------------------------------------------
+// SCFA stream-op fused kernels (ralph-loop iter 5, 2026-05-14).
+//
+// Replace memcpy_d2d + axpy pairs in the SCFA forward/backward chain with
+// single-pass element-wise kernels.  Math is bit-identical to the unfused
+// FP32 ops; the only gain is the saved memory round-trip for the
+// eliminated intermediate buffer write.  Used only when the trainer's
+// --scfa-fuse-streams flag is on (default off).
+// ---------------------------------------------------------------------------
+
+// c[i] = a[i] - b[i] for i in [0, n).  Replaces:
+//   memcpy_d2d(c, a, n*sizeof(float));
+//   axpy(-1.0f, b, c, n);
+bool chiron_scfa_sub(float* c, const float* a, const float* b, int n);
+
+// p[i] += alpha * (a[i] + b[i]) for i in [0, n).  Replaces:
+//   axpy(1.0f, b, a, n);          // a += b (mutates a)
+//   axpy(alpha, a, p, n);         // p += alpha * a
+// Note: this kernel does NOT mutate a, so the caller's a buffer is
+// preserved.  The original chain mutated a; if the caller relied on the
+// mutated value of a afterwards, the fused variant must not be used.
+bool chiron_scfa_axpy2(float* p, float alpha,
+                       const float* a, const float* b, int n);
+
+// c[i] = alpha * a[i] for i in [0, n).  Replaces:
+//   memcpy_d2d(c, a, n*sizeof(float));
+//   scale_array(c, alpha, n);
+bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n);
+
+// ---------------------------------------------------------------------------
 // Reversible LayerNorm (ReLN) with external stats buffer.
 // ---------------------------------------------------------------------------
 

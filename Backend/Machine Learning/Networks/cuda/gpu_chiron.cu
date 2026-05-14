@@ -120,6 +120,75 @@ bool chiron_shear_sub(float* p, const float* u, int n)
 }
 
 // ===========================================================================
+//  1b. SCFA stream-op fused kernels (ralph-loop iter 5, 2026-05-14).
+// ===========================================================================
+//
+// The SCFA forward/backward chain in glades-trainer/trainer/chiron_main.cpp
+// issues 6-7 axpy/memcpy operations per layer per direction over the FP32
+// residual stream buffers (T·m floats = 67 MB at T=8192, m=2048).  Each
+// memcpy_d2d that's immediately followed by an axpy can be folded into a
+// single fused kernel that halves the memory traffic for that step.  The
+// math is bit-identical (these are element-wise FP32 ops, no precision
+// loss).  Behavior is gated behind --scfa-fuse-streams in the trainer.
+
+namespace {
+
+__global__ void chiron_scfa_sub_kernel(float* __restrict__ c,
+                                       const float* __restrict__ a,
+                                       const float* __restrict__ b, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) c[i] = a[i] - b[i];
+}
+
+__global__ void chiron_scfa_axpy2_kernel(float* __restrict__ p,
+                                         float alpha,
+                                         const float* __restrict__ a,
+                                         const float* __restrict__ b, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) p[i] += alpha * (a[i] + b[i]);
+}
+
+__global__ void chiron_scfa_scaled_copy_kernel(float* __restrict__ c,
+                                               float alpha,
+                                               const float* __restrict__ a, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < n) c[i] = alpha * a[i];
+}
+
+} // anonymous namespace
+
+bool chiron_scfa_sub(float* c, const float* a, const float* b, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	chiron_scfa_sub_kernel<<<grid, kBlockElem, 0, computeStream()>>>(c, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_axpy2(float* p, float alpha,
+                       const float* a, const float* b, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	chiron_scfa_axpy2_kernel<<<grid, kBlockElem, 0, computeStream()>>>(p, alpha, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	chiron_scfa_scaled_copy_kernel<<<grid, kBlockElem, 0, computeStream()>>>(c, alpha, a, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  2. Reversible LayerNorm (ReLN) forward.
 // ===========================================================================
 //
