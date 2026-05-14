@@ -972,6 +972,90 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
 	                        "cublasGemmEx(BF16,ABT)");
 }
 
+// === FAST_16BF GEMM (FP32 in/out, BF16 tensor-core compute) ===
+//
+// Same row-major→col-major transpose trick as sgemm_rowmajor.  Routes
+// through cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_16BF, which converts
+// FP32 inputs to BF16 on-chip (RNE rounding) and accumulates products in
+// FP32.  Throughput matches sgemm_rowmajor_bf16 (~2x TF32-TC) but avoids
+// the operand-cast plumbing required when the FP32 source isn't already
+// mirrored to a BF16 buffer (e.g. the SCFA shared DCT basis scfa_B and
+// the per-call FP32 intermediates q_compr/q_par/y_compr/y_par/dy).
+//
+// Numerical envelope is identical to sgemm_rowmajor_bf16 — the operands
+// pass through one BF16 round-trip before TC compute.  Match-mode is
+// independent of cublasSetMathMode (cublasGemmEx takes computeType
+// explicitly), so no math-mode toggle / restore.
+static bool sgemm_rowmajor_fast16bf_impl(cublasOperation_t transa,
+                                          cublasOperation_t transb,
+                                          int M, int N, int K,
+                                          float alpha,
+                                          const float* A, int lda,
+                                          const float* B, int ldb,
+                                          float beta,
+                                          float* C, int ldc,
+                                          const char* label)
+{
+	if (!g_initialized && !blasInit()) return false;
+
+	cublasStatus_t st = cublasGemmEx(g_handle,
+	                                 transa, transb,
+	                                 N, M, K,
+	                                 &alpha,
+	                                 B, CUDA_R_32F, ldb,
+	                                 A, CUDA_R_32F, lda,
+	                                 &beta,
+	                                 C, CUDA_R_32F, ldc,
+	                                 CUBLAS_COMPUTE_32F_FAST_16BF,
+	                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] %s failed: %d (M=%d N=%d K=%d)\n",
+		        label, static_cast<int>(st), M, N, K);
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_rowmajor_fast16bf(int M, int N, int K,
+                              float alpha,
+                              const float* A, int lda,
+                              const float* B, int ldb,
+                              float beta,
+                              float* C, int ldc)
+{
+	return sgemm_rowmajor_fast16bf_impl(CUBLAS_OP_N, CUBLAS_OP_N,
+	                                     M, N, K,
+	                                     alpha, A, lda, B, ldb, beta, C, ldc,
+	                                     "cublasGemmEx(FAST_16BF)");
+}
+
+bool sgemm_rowmajor_atb_fast16bf(int M, int N, int K,
+                                  float alpha,
+                                  const float* A, int lda,
+                                  const float* B, int ldb,
+                                  float beta,
+                                  float* C, int ldc)
+{
+	return sgemm_rowmajor_fast16bf_impl(CUBLAS_OP_N, CUBLAS_OP_T,
+	                                     M, N, K,
+	                                     alpha, A, lda, B, ldb, beta, C, ldc,
+	                                     "cublasGemmEx(FAST_16BF,ATB)");
+}
+
+bool sgemm_rowmajor_abt_fast16bf(int M, int N, int K,
+                                  float alpha,
+                                  const float* A, int lda,
+                                  const float* B, int ldb,
+                                  float beta,
+                                  float* C, int ldc)
+{
+	return sgemm_rowmajor_fast16bf_impl(CUBLAS_OP_T, CUBLAS_OP_N,
+	                                     M, N, K,
+	                                     alpha, A, lda, B, ldb, beta, C, ldc,
+	                                     "cublasGemmEx(FAST_16BF,ABT)");
+}
+
 // Phase 2f exploration: mixed-precision FP32×BF16 GEMM wrappers were
 // prototyped here but cublasGemmEx (through CUDA 12.x) does not accept
 // mismatched input dtypes for matrix multiply.  Silent correctness failures

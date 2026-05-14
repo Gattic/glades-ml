@@ -118,6 +118,37 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
                              float beta,
                              float* C, int ldc);
 
+// === FAST_16BF GEMM wrappers (FP32 in/out, BF16 tensor-core compute) ===
+//
+// Same signature as sgemm_rowmajor* (FP32 A, FP32 B, FP32 C) but routes
+// through cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_16BF. cuBLAS converts
+// the FP32 inputs to BF16 on-chip and accumulates products in FP32 on BF16
+// tensor cores (~2x TF32-tensor-core throughput on Ampere/Ada/Hopper).
+//
+// Useful when callers can tolerate BF16 precision (~7-bit mantissa) on the
+// inputs but already pass FP32 buffers (e.g. shared bases that aren't
+// stored in BF16 elsewhere).  No operand casting needed; no extra VRAM.
+bool sgemm_rowmajor_fast16bf(int M, int N, int K,
+                              float alpha,
+                              const float* A, int lda,
+                              const float* B, int ldb,
+                              float beta,
+                              float* C, int ldc);
+
+bool sgemm_rowmajor_atb_fast16bf(int M, int N, int K,
+                                  float alpha,
+                                  const float* A, int lda,
+                                  const float* B, int ldb,
+                                  float beta,
+                                  float* C, int ldc);
+
+bool sgemm_rowmajor_abt_fast16bf(int M, int N, int K,
+                                  float alpha,
+                                  const float* A, int lda,
+                                  const float* B, int ldb,
+                                  float beta,
+                                  float* C, int ldc);
+
 // NOTE: Mixed-precision FP32×BF16→FP32 wrappers were explored for Phase 2f
 // but cuBLAS (through at least CUDA 12.x) doesn't support mixed input types
 // to cublasGemmEx — both A and B must match.  Stiefel Phase 2f instead
@@ -303,6 +334,9 @@ inline bool sgemm_rowmajor_abt_exact(int, int, int, float, const float*, int, co
 inline bool sgemm_rowmajor_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_atb_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_abt_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline void set_tf32_enabled(bool) {}
 inline bool get_tf32_enabled() { return false; }
 inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, float, float*) { return false; }
