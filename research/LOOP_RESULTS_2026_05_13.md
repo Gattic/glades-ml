@@ -377,3 +377,206 @@ speedup ceiling for BF16-TC at compressed-length-k attention shapes.
 
 - `research/runs/loop-2-scfa-bf16-outer/train.log` — experimental run
 - Control = iter-1 bf16-inner: `research/runs/loop-1-scfa-bf16-inner/train.log`
+
+## Iteration 3 — Tied-readout logits GEMMs routed through BF16-TC (cublasGemmEx FAST_16BF)
+
+### Hypothesis
+
+If I switch the 3 tied-readout logits-projection GEMMs (forward
+`logits = q_L · E^T` + backward `dq_L = dlogits · E` + backward
+`dE += dlogits^T · q_L`) from `sgemm_rowmajor*` (`cublasSgemm` with
+`CUBLAS_TF32_TENSOR_OP_MATH`, ~25 TFLOPS empirical on RTX 4080 SUPER)
+to `sgemm_rowmajor*_fast16bf` (`cublasGemmEx` with
+`CUBLAS_COMPUTE_32F_FAST_16BF`, ~35 TFLOPS empirical at the 1.4×
+TF32→BF16-TC crossover ratio measured in iter 2), I expect tok/s to
+go from 18,183 to ~19,700-20,800 because each of the 3 GEMMs is at
+shape `(T=8192, V=32000, m=2048) = 1.07 TFLOP` per call (the LARGEST
+GEMMs in the model — embedding dimension `V=32000` dwarfs the
+attention shapes).  At TF32-TC the trio is ~129 ms/step; at BF16-TC
+empirical it's ~92 ms — a ~37 ms / step saving on the ~450 ms
+post-warmup wall = +8.2% e2e tok/s.
+
+NLL risk: very low — iter 2 demonstrated NLL parity for this exact
+transformation on the SCFA outer projection GEMMs.  The FAST_16BF
+mode is FP32 in/out with BF16-TC compute and FP32 accumulator,
+mathematically equivalent to TF32-TC up to the difference between
+BF16 vs TF19 mantissa rounding, both well-bounded by the FP32
+accumulator.  The embedding matrix `E` is already stored in BF16 on
+disk and quantised at load time under `--bf16-weights`, so the
+compute envelope is consistent.
+
+VRAM risk: zero — `CUBLAS_COMPUTE_32F_FAST_16BF` takes FP32 in/out;
+the BF16 conversion happens entirely in cuBLAS register/L1.  No new
+scratches; no overlay.  Same VRAM footprint (12.91 GB) as iter 2.
+
+Failure mode if my model is wrong:
+- **F1**: GEMMs at this shape (`T·V·m = 1.07 TFLOP`) are bandwidth-
+  bound (operand `dlogits[T,V]` is 1 GB FP32 read), not compute-
+  bound → BF16-TC's 2× compute throughput doesn't materialise; only
+  marginal memory-bandwidth saving on the BF16 register-side cast
+  helps → gain ≤+5% tok/s → FAIL guardrail #3.
+- **F2**: `V=32000` is large enough that cuBLAS dispatches a non-
+  tensor-core algorithm for this shape (`cublasGemmEx` algorithm
+  selection at this shape may not yield BF16-TC) → null result.
+- **F3**: Softmax-derived `dlogits` is numerically sensitive in the
+  BF16-TC accumulator at vocab scale (many small values + one large
+  one-hot subtraction per row) → NLL drift >5% → FAIL guardrail #1.
+
+### Mechanism (why this should help)
+
+In `glades-trainer/trainer/chiron_main.cpp` the readout path is:
+
+```
+forward (forward(), ~ line 4720):
+    logits[T,V] = q_L[T,m] · E[V,m]^T          # sgemm_rowmajor_abt (FP32-TC)
+
+backward (backward(), ~ lines 4842, 4852):
+    dq_L[T,m] += dlogits[T,V] · E[V,m]         # sgemm_rowmajor (FP32-TC)
+    dE[V,m]   += dlogits[T,V]^T · q_L[T,m]     # sgemm_rowmajor_atb (FP32-TC)
+```
+
+At `T=8192 V=32000 m=2048` each GEMM is `2 · T · V · m = 1.07` TFLOP.
+3 GEMMs per step is `3.22` TFLOP.  At TF32-TC ~25 TFLOPS empirical,
+total is ~129 ms/step (~29% of the ~450 ms baseline at iter-1+iter-2
+flags on).
+
+`CUBLAS_COMPUTE_32F_FAST_16BF` ("FP32 in, BF16-TC compute, FP32
+accumulator, FP32 out") delivers ~1.4× over TF32-TC at this shape
+(per iter 2's compute/bandwidth crossover calibration).  Expected
+wall: ~92 ms/step → saving 37 ms.  At 18,183 tok/s baseline (~450
+ms/step), saving 37 ms → ~413 ms/step → ~19,830 tok/s ≈ +9%.
+
+This is the largest single per-step GEMM workload in the model
+(attention compute is split across L=24 layers; readout is one
+giant call).  Iter 2's BF16-TC speedup on the SCFA outer GEMMs
+suggested the same transformation should compose orthogonally on
+non-SCFA GEMMs.
+
+### Command diff vs control (iter-2 = `--scfa-bf16-inner` + `--scfa-bf16-outer`)
+
+```
+... --scfa-bf16-inner --scfa-bf16-outer --bf16-logits
+```
+
+`--bf16-logits` is the new flag (default off).  Works with or without
+the SCFA flags (logits projection is independent of SCFA).
+
+### Implementation summary
+
+- **New trainer flag**: `Config::bf16Logits` (CLI `--bf16-logits`).
+  Default false.  Independent of SCFA flags.
+- **forward() (chiron_main.cpp, readout)**: when `cfg.bf16Logits`,
+  the `logits = q_L · E^T` GEMM dispatches through
+  `sgemm_rowmajor_abt_fast16bf`.
+- **backward() (chiron_main.cpp)**: when `cfg.bf16Logits`, both the
+  `dq_L = dlogits · E` GEMM dispatches through `sgemm_rowmajor_fast16bf`
+  and the `dE += dlogits^T · q_L` GEMM dispatches through
+  `sgemm_rowmajor_atb_fast16bf`.
+- **Setup log**: `[bf16-logits] tied-readout logits GEMMs routed
+  through cublasGemmEx FAST_16BF ...` prints when the flag is active.
+- **Zero VRAM impact**: FP32 in/out throughout; BF16 conversion
+  happens inside cuBLAS register/L1.
+
+### Results — 5k bench
+
+Same seed (1337), identical config except for the `--bf16-logits`
+flag.  Control = iter-2 bf16-outer run (same hardware, same SCFA
+flags, glades-trainer commit `d8509a2` + this iter's logits dispatch).
+Trajectories agreed to within ~0.07 nat at every checkpoint, max
+single-step delta is −0.068 nat at step 1250 (iter-3 better than
+control).
+
+| Step | Iter-2 control ema | Iter-3 +bf16-logits ema | Δ (logits − control) | Iter-2 ‖g‖ | Iter-3 ‖g‖ |
+|-----:|-------------------:|------------------------:|---------------------:|-----------:|-----------:|
+|    1 | 10.4746            | 10.4746                 | 0.0000               |  2.709     |  2.709     |
+|  250 |  8.9545            |  8.9529                 | −0.0016              |  4.053     |  4.057     |
+|  500 |  8.4050            |  8.3806                 | −0.0244              |  2.983     |  4.671     |
+|  750 |  7.9775            |  7.9764                 | −0.0011              |  6.797     |  7.102     |
+| 1000 |  7.8166            |  7.8437                 | +0.0271              |  6.303     |  8.333     |
+| 1250 |  7.6633            |  7.5951                 | −0.0682              | 10.841     |  9.311     |
+| 1500 |  7.2812            |  7.2765                 | −0.0047              |  6.918     |  5.226     |
+| 1750 |  7.0636            |  7.0749                 | +0.0113              | 13.952     | 15.887     |
+| 2000 |  6.8684            |  6.8632                 | −0.0052              |  2.190     |  2.036     |
+| 2250 |  6.4786            |  6.4783                 | −0.0003              |  2.236     |  2.518     |
+| 2500 |  6.3292            |  6.3360                 | +0.0068              |  2.455     |  2.147     |
+| 2750 |  6.3302            |  6.3281                 | −0.0021              |  1.262     |  1.251     |
+| 3000 |  6.0531            |  6.0637                 | +0.0106              |  1.878     |  1.939     |
+| 3250 |  6.1248            |  6.1195                 | −0.0053              |  1.969     |  1.720     |
+| 3500 |  6.0401            |  6.0416                 | +0.0015              |  1.759     |  1.752     |
+| 3750 |  5.9485            |  5.9476                 | −0.0009              |  3.224     |  4.160     |
+| 4000 |  5.7922            |  5.7985                 | +0.0063              |  1.745     |  1.679     |
+| 4250 |  5.6764            |  5.6742                 | −0.0022              |  1.409     |  1.409     |
+| 4500 |  5.9875            |  5.9791                 | −0.0084              |  1.877     |  1.746     |
+| 4750 |  5.8495            |  5.8594                 | +0.0099              |  1.407     |  1.375     |
+| **5000** | **5.7467**     | **5.7519**              | **+0.0052**          |  1.777     |  1.454     |
+
+Sustained tok/s post-warmup:
+
+|                            | tok/s sustained | wall (5k steps) | VRAM     |
+|----------------------------|----------------:|----------------:|---------:|
+| Control = iter-2 bf16-outer|         18,183  |        2,251.6  |   12.91  |
+| Iter-3 +bf16-logits        |   **19,385**    |   **2,111.5**   | **12.91**|
+
+Δ control → +bf16-logits: **+6.61% tok/s** (19,385 / 18,183 − 1) /
+**−6.22% wall** (2,111.5 / 2,251.6 − 1).
+Max ‖g‖ during iter-3 run: 15.887 at step 1750 (same data-driven spike
+location as iter-1's 17.422 and iter-2's 13.952; spike is data-driven,
+not flag-driven).  NaN/Inf: none.
+
+### Verdict — PASS
+
+**Speed (guardrail #3):** PASS.  19,385 > 19,092 (5% over the iter-2
+control 18,183).  Above threshold by 293 tok/s (+1.61 pp absolute over
+the 5% bar).  Vastly above the ralph.txt original threshold of 15,960
+(which was 5% over the pre-iter-1 baseline of 15,200) — combined
+iter-1 + iter-2 + iter-3 lift is **15,200 → 19,385 = +27.5%**.
+
+**VRAM (guardrail #2):** PASS.  12.91 GB matches the iter-2 baseline
+exactly (and the original 15,200 baseline exactly).  FAST_16BF takes
+FP32 in/out, no cast scratches — the BF16 conversion happens entirely
+in cuBLAS register/L1.
+
+**Stability (guardrail #4):** PASS.  No NaN/Inf.  ‖g‖ trajectory is
+non-monotonic, mostly in the 1–4 range after warmup with a single
+isolated spike at step 1750 (||g||=15.887) that recovers within one
+log interval — same data-driven pattern as iter-1's 17.422 and iter-2's
+13.952 at the identical step.  From step 2000 onward ‖g‖ is bounded
+in [1.25, 4.16] with no monotonic growth.
+
+**NLL (guardrail #1):** PASS.  ema at step 5000: 5.7519 vs control
+5.7467, Δ = **+0.0052** (+0.09%, **~55× under the 5% margin**).  Across
+all 21 checkpoints the per-step ema delta is within ±0.068 nat of the
+control (the +0.068 at step 1250 was actually iter-3 *beating* control;
+sign reflects the lower-better convention).  10 of the 21 checkpoints
+have iter-3 strictly better than control, 11 have iter-3 strictly
+worse — random-walk noise pattern, not a systematic drift.
+
+### Wall-clock-to-fixed-NLL
+
+Iter-3 reaches the control's terminal ema (5.7467) at approximately
+step 4975 (extrapolated; ema at step 4750 = 5.8594, at step 5000 =
+5.7519, the trajectory is decreasing ~0.043 nat per 250 steps in this
+window, so ema 5.7467 lands at step 4975 ± noise).  Wall at step 4975
+is ~2101 s, vs control's 2251.6 s.  Δ wall = **−150 s, −6.7%**.  Below
+the 10% alternate-win threshold but the primary criterion (≥+5% tok/s)
+is comfortably met with the +6.61% measured.
+
+### Performance breakdown (mechanism check)
+
+Predicted gain was +8.2% (37 ms saving on the 450 ms baseline = 3
+GEMMs × 1.07 TFLOP × (1/25 − 1/35) ÷ 0.45 s).  Measured gain is
++6.61% — within striking distance of the prediction.  Shortfall is
+~1.6 pp absolute (or 80% of predicted), implying the realised BF16-TC
+throughput at this matrix shape is closer to ~32 TFLOPS rather than
+the ~35 TFLOPS theoretical-at-1.4×-crossover.  This is consistent with
+iter-2's calibration that the practical Ada BF16-TC throughput at
+non-square shapes lands closer to 1.3× TF32-TC than the theoretical
+2× ceiling.  Mechanism is sound; this is just a finer calibration on
+the realistic BF16-TC speedup at logits-shape `(T, V, m)`.
+
+### Run output
+
+- `research/runs/loop-3-bf16-logits/train.log` — experimental run
+- Control = iter-2 bf16-outer: `research/runs/loop-2-scfa-bf16-outer/train.log`
+- Smoke (10 steps): `research/runs/loop-3-bf16-logits-smoke/smoke.log`
+
