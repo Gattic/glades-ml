@@ -74,6 +74,30 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
                                 int T, int vocabSize, int padToken,
                                 int* correct_count, int* valid_count);
 
+// 2026-05-14 live-eval suite — position-bucketed NLL + top-k accuracy.
+// Both operate on BF16 probs (the storage type used at runtime when
+// --bf16-logits-storage is active).
+//
+// Position-bucketed NLL: bucket b ∈ [0, numBuckets) covers positions
+// [b*T/numBuckets, (b+1)*T/numBuckets).  Reports loss_sum[b] and
+// valid_count[b] per bucket.  Used by --val-every to track NLL as a
+// function of position-in-context (directly tests SCFA long-context).
+bool cross_entropy_nll_bucketed_bf16(const unsigned short* probs,
+                                      const int* targets,
+                                      int T, int vocabSize, int padToken,
+                                      int numBuckets,
+                                      float* loss_sum, int* valid_count);
+
+// Top-k accuracy: for each row, target is "correct" at k iff it's among
+// the top-k highest-probability tokens.  k_values is a device buffer of
+// numK ints (sorted ascending for clarity).  correct_counts is parallel
+// device array; valid_count is shared across all k (target validity is
+// k-independent).
+bool topk_accuracy_bf16(const unsigned short* probs, const int* targets,
+                         int T, int vocabSize, int padToken,
+                         int numK, const int* k_values,
+                         int* correct_counts, int* valid_count);
+
 // Paradigm shift #56 DISTILL-FORWARD — combined KL + CE backward:
 //   dlogits = probs_student - alpha · probs_teacher - (1 - alpha) · one_hot(targets)
 // Teacher distribution is frozen (no grad).
@@ -865,6 +889,8 @@ inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, in
 inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
 inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }
+inline bool cross_entropy_nll_bucketed_bf16(const unsigned short*, const int*, int, int, int, int, float*, int*) { return false; }
+inline bool topk_accuracy_bf16(const unsigned short*, const int*, int, int, int, int, const int*, int*, int*) { return false; }
 inline bool distill_combined_bwd(const float*, const float*, const int*, int, int, float, float*) { return false; }
 inline bool distill_combined_loss(const float*, const float*, const int*, int, int, int, float, float*, int*) { return false; }
 inline bool orion_proj_left(const void*, const float*, int, int, float*) { return false; }

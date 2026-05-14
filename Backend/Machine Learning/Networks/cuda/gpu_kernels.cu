@@ -2897,6 +2897,141 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
 }
 
 // ===========================================================================
+//  15e3. Live-eval metrics — position-bucketed NLL + top-k accuracy
+// ===========================================================================
+//
+// Backs the eval suite added 2026-05-14:
+//   #1 position-stratified val NLL (cross_entropy_nll_bucketed_bf16)
+//   #6 top-k accuracy at k ∈ {1, 5, 10} (topk_accuracy_bf16)
+//
+// Both operate on BF16 probs and respect padToken; both zero their outputs
+// internally for caller convenience.
+
+namespace {
+
+// Per-position-bucket NLL accumulation.  Buckets are evenly sized partitions
+// of the [0, T) range — bucket b covers positions [b*T/B, (b+1)*T/B).  Each
+// row contributes its CE = -log p[target] (with the 1e-12 floor matching
+// cross_entropy_nll_loss_bf16) to its bucket's loss_sum, and increments the
+// bucket's valid_count.  Pad/OOR tokens are skipped.
+//
+// Grid: 1-D over T (one thread per row).  Bucket atomics keep contention low
+// because B is small (typically 8) and each thread targets exactly one bucket.
+__global__ void cross_entropy_nll_bucketed_bf16_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    int T, int vocabSize, int padToken,
+    int numBuckets,
+    float* __restrict__ loss_sum,   // [numBuckets]
+    int*   __restrict__ valid_count) // [numBuckets]
+{
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T) return;
+	int tgt = targets[t];
+	if (padToken >= 0 && tgt == padToken) return;
+	if (tgt < 0 || tgt >= vocabSize) return;
+
+	float p = bf16_load(probs[(size_t)t * vocabSize + tgt]);
+	if (p < 1e-12f) p = 1e-12f;
+	float ce = -logf(p);
+
+	// Compute bucket: bucket = t * numBuckets / T (integer division).
+	// Equivalent to floor(t / (T/numBuckets)) but avoids float division.
+	int bucket = (int)((long long)t * numBuckets / T);
+	if (bucket >= numBuckets) bucket = numBuckets - 1;
+
+	atomicAdd(&loss_sum[bucket], ce);
+	atomicAdd(&valid_count[bucket], 1);
+}
+
+// Top-k accuracy: for each row, find whether the target is among the top-k
+// highest-probability tokens.  Uses a single-thread partial sort with an
+// in-register top-K buffer of size K_MAX (compile-time bound).
+//
+// The kernel takes an array of K values (sorted ascending) so callers can
+// query multiple K simultaneously: e.g. k_values = {1, 5, 10}.  For each
+// row, the kernel computes "rank of target token among all vocab", then for
+// each requested k, increments correct_count[i] if rank < k_values[i].
+//
+// Implementation: scan vocab once, count tokens with prob >= prob[target].
+// Rank = number of tokens with strictly greater probability.  This handles
+// ties by counting the target as one of the equal-prob tokens.
+//
+// Grid: 1-D over T rows.  Per-row inner loop is O(V) which is fine at V=32k.
+__global__ void topk_accuracy_bf16_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    int T, int vocabSize, int padToken,
+    int numK,
+    const int* __restrict__ k_values,    // [numK], sorted ascending
+    int* __restrict__ correct_counts,    // [numK]
+    int* __restrict__ valid_count)       // [1]
+{
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= T) return;
+	int tgt = targets[t];
+	if (padToken >= 0 && tgt == padToken) return;
+	if (tgt < 0 || tgt >= vocabSize) return;
+
+	const unsigned short* row = probs + (size_t)t * vocabSize;
+	float p_target = bf16_load(row[tgt]);
+
+	// Rank = number of strictly-greater-probability tokens.  Target is at
+	// rank 0 iff it's the unique max (or tied for max with no strictly
+	// greater token).  Top-k acc = (rank < k).
+	int rank = 0;
+	for (int v = 0; v < vocabSize; ++v)
+	{
+		if (v == tgt) continue;
+		float pv = bf16_load(row[v]);
+		if (pv > p_target) ++rank;
+	}
+
+	atomicAdd(valid_count, 1);
+	for (int i = 0; i < numK; ++i)
+	{
+		if (rank < k_values[i])
+			atomicAdd(&correct_counts[i], 1);
+	}
+}
+
+} // anonymous namespace
+
+bool cross_entropy_nll_bucketed_bf16(const unsigned short* probs,
+                                      const int* targets,
+                                      int T, int vocabSize, int padToken,
+                                      int numBuckets,
+                                      float* loss_sum, int* valid_count)
+{
+	if (T <= 0 || vocabSize <= 0 || numBuckets <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, numBuckets * sizeof(float)));
+	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, numBuckets * sizeof(int)));
+	int block = 256;
+	int grid = (T + block - 1) / block;
+	cross_entropy_nll_bucketed_bf16_kernel<<<grid, block, 0, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, numBuckets, loss_sum, valid_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool topk_accuracy_bf16(const unsigned short* probs, const int* targets,
+                         int T, int vocabSize, int padToken,
+                         int numK, const int* k_values,
+                         int* correct_counts, int* valid_count)
+{
+	if (T <= 0 || vocabSize <= 0 || numK <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemset(correct_counts, 0, numK * sizeof(int)));
+	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	int block = 128;
+	int grid = (T + block - 1) / block;
+	topk_accuracy_bf16_kernel<<<grid, block, 0, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, numK, k_values,
+	    correct_counts, valid_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  15f. Chunked cross-entropy loss (large-vocab unlock, no T × V scratch)
 // ===========================================================================
 //
