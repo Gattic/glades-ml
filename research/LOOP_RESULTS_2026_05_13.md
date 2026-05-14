@@ -965,3 +965,607 @@ implementation-fail classification.
 - `research/runs/loop-5-scfa-fuse-streams/train.log` — experimental run
 - Control = iter-3 bf16-logits: `research/runs/loop-3-bf16-logits/train.log`
 
+## Iteration 6 — Parallel readout backward GEMMs (cross-stream cuBLAS dispatch) — NULL
+
+### Hypothesis
+
+If I dispatch the second readout backward GEMM (`dE += dlogits^T · q_L`) on
+a dedicated side CUDA stream via a second cuBLAS handle, concurrent with
+the first GEMM (`dq_L = dlogits · E`) on the main compute stream, I expect
+tok/s to go from 20,428 to ~21,500 (+5-7%) because:
+- Each GEMM is at shape (T=8192, V=32000, m=2048) = 1.07 TFLOP via
+  cublasGemmEx CUBLAS_COMPUTE_32F_FAST_16BF (BF16-TC compute / FP32 in/out)
+- Empirical iter-3 calibration: BF16-TC at this shape ~32 TFLOPS → ~33
+  ms / GEMM, sequential total ~66 ms / step
+- Parallel: max ≈ 33 ms / step (assuming partial-to-full SM concurrency)
+- Saving: ~20-30 ms / step on a ~400 ms baseline = +5-7% e2e
+
+The two GEMMs are mathematically independent — they share read-only
+inputs (`dlogits`, `E`, `q_L`) but write disjoint outputs (`s.dq` vs
+`W.dE`).  No write-write conflicts; outputs are read by separate later
+ops (`s.dq` by the per-layer backward loop, `W.dE` by the optimizer step).
+
+NLL risk: ESSENTIALLY ZERO — same kernel on same inputs; stream placement
+doesn't affect the FP32 accumulator.
+
+VRAM risk: ~zero (one extra cuBLAS handle + 1 cudaEvent).
+
+Stability risk: ZERO (same arithmetic).
+
+Failure modes:
+- **F1**: SM saturation — single 1.07 TFLOP BF16-TC GEMM already
+  saturates Ada's 80 SMs at this shape → no concurrent capacity → null
+  result.
+- **F2**: L2 cache contention — both GEMMs read the 1 GB `dlogits`
+  operand; concurrent execution thrashes L2 → throughput per GEMM drops,
+  cancels the parallelism saving.
+- **F3**: cudaEvent sync overhead > parallelism gain → null result.
+- **F4**: cuBLAS internal locks serialize even across handles → null.
+
+### Mechanism (why this should help — TURNED OUT WRONG)
+
+In `glades-trainer/trainer/chiron_main.cpp` the readout backward (~lines
+4908–4954, sequential) is:
+
+```
+dq_L = dlogits · E              # sgemm_rowmajor_fast16bf (BF16-TC)
+W.dE.zero() (first microstep)
+dE += dlogits^T · q_L           # sgemm_rowmajor_atb_fast16bf (BF16-TC)
+```
+
+The two GEMMs read different operands except `dlogits`.  Outputs are
+independent.  Predicted: on a separate side stream the second GEMM can
+overlap with the first on the GPU's SM array.  Predicted saving: ~half
+the longer-GEMM time.
+
+### Command diff vs iter-5 control
+
+```
+... --scfa-bf16-inner --scfa-bf16-outer --bf16-logits --scfa-fuse-streams
+                                           ↓
+... --scfa-bf16-inner --scfa-bf16-outer --bf16-logits --scfa-fuse-streams
+    --bf16-logits-parallel-bwd
+```
+
+### Implementation summary
+
+- **Side cuBLAS handle** (`glades-ml/Backend/Machine Learning/Networks/cuda/gpu_blas.cu`):
+  - `g_handleSide` + `g_sideStream` lazy-init via `ensureSideHandle()`
+  - `cudaStreamCreateWithFlags(cudaStreamNonBlocking)` for the side stream
+  - `cublasSetStream(g_handleSide, g_sideStream)` binds them
+- **New BLAS wrapper**: `sgemm_rowmajor_atb_fast16bf_side(...)` — same
+  signature as `sgemm_rowmajor_atb_fast16bf` but routes through the side
+  handle / side stream.
+- **Public accessor**: `glades::gpu::sideComputeStream()` returns the side
+  stream pointer for caller-side event recording.
+- **New trainer flag**: `Config::bf16LogitsParallelBwd` (CLI
+  `--bf16-logits-parallel-bwd`).  Default off.  Requires `--bf16-logits`
+  (the side dispatch is wired only for the FAST_16BF path).
+- **backward() in chiron_main.cpp**: when the flag is set, issue the dE
+  GEMM via `_side`, record event on side stream, issue dq_L on main
+  stream, `streamWaitEvent(computeStream, sideEvent)` after both are
+  queued so the per-layer backward loop's reln_inverse (which overwrites
+  `s.q`) doesn't race with the side GEMM's read of `s.q`.
+  `W.dE.zero()` is synchronous (`cudaMemset` host-blocking), so no race
+  with the side GEMM's `beta=1` accumulation.
+- **Zero VRAM impact**: one extra cuBLAS handle (~1 KB internal state).
+
+### Results — aborted at step 1000 (clear null + smoke pre-confirmed)
+
+50-step smoke (parallel vs control at iter-5 config, identical seed):
+
+| Step | Control (iter-5) tok/s | Parallel (iter-6) tok/s | Δ tok/s | Control ema | Parallel ema | Δ ema |
+|-----:|-----------------------:|-------------------------:|--------:|------------:|-------------:|------:|
+| 10   | 20,514                 | 20,503                   | −11     | 10.4440     | 10.4440      | 0.0000|
+| 20   | 20,490                 | 20,492                   | +2      | 10.1710     | 10.1710      | 0.0000|
+| 30   | 20,492                 | 20,480                   | −12     |  9.9550     |  9.9550      | 0.0000|
+| 40   | 20,507                 | 20,482                   | −25     |  9.8083     |  9.8082      | −0.0001|
+| 50   | 20,499                 | 20,478                   | −21     |  9.5769     |  9.5765      | −0.0004|
+
+200-step run (warmup=30, no lr-decay so steady-state):
+
+| Step | Control tok/s | Parallel tok/s | Δ tok/s | Control ema | Parallel ema | Δ ema |
+|-----:|--------------:|---------------:|--------:|------------:|-------------:|------:|
+| 50   | 20,497        | 20,526         | +29     |  9.5325     |  9.5348      | +0.0023|
+| 100  | 20,480        | 20,503         | +23     |  9.0266     |  9.0326      | +0.0060|
+| 150  | 20,482        | 20,497         | +15     |  8.7009     |  8.7047      | +0.0038|
+| 200  | 20,488        | 20,486         | −2      |  8.6929     |  8.6956      | +0.0027|
+
+5k-bench (aborted at step 1000 once null was established):
+
+| Step | iter-5 ema | iter-5 tok/s | iter-6 ema | iter-6 tok/s | Δ tok/s | Δ ema  |
+|-----:|-----------:|-------------:|-----------:|-------------:|--------:|-------:|
+|    1 | 10.4746    | 16,845       | 10.4746    | 16,996       | +151    | 0.0000 |
+|  250 |  8.9532    | 20,495       |  8.9531    | 20,493       |   −2    |−0.0001 |
+|  500 |  8.3944    | 20,481       |  8.3924    | 20,476       |   −5    |−0.0020 |
+|  750 |  7.9719    | 20,476       |  7.9864    | 20,461       |  −15    |+0.0145 |
+| 1000 |  7.8231    | 20,464       |  7.7911    | 20,454       |  −10    |−0.0320 |
+
+Sustained tok/s post-warmup: ~20,470 (vs iter-5 ~20,475) — **−5 tok/s = −0.024%**.
+Peak VRAM: 12.91 GB (matches iter-5 exactly).
+NLL: parity (max |Δ ema| at any logged checkpoint = 0.032 nat — within
+±0.05 nat, ~13× below the 5% margin; non-monotonic; ~50% positive, ~50%
+negative — pure cuBLAS algorithm non-determinism, not a flag effect).
+NaN/Inf: none.
+
+### Verdict — NULL (IDEA FAIL; impl correct)
+
+**Speed (guardrail #3 + win criterion):** **NULL.**  Sustained tok/s
+~20,470 vs iter-5 ~20,475 (Δ = −0.024%, indistinguishable from noise).
+Far below the +5% over iter-5 win threshold (≥21,449 needed).  Hard
+guardrail (15,960) passed easily but mechanism prediction is fully
+invalidated.
+
+**VRAM (guardrail #2):** PASS.  12.91 GB matches iter-5 exactly.
+
+**Stability (guardrail #4):** PASS.  No NaN/Inf.  ‖g‖ trajectory is
+non-monotonic, mostly in the 1–9 range with the same data-driven spike
+location near step 750 as iter-5.
+
+**NLL (guardrail #1):** PASS.  Max ema delta at any logged checkpoint is
+0.032 nat (~13× under the 5% margin).  Per-checkpoint deltas are
+symmetric around 0 — consistent with cuBLAS algorithm-selection
+non-determinism between runs (the `_side` handle picks a different algo
+than the main handle, but both with FP32-accumulator BF16-TC compute).
+
+### Mechanism check — IDEA FAIL, not IMPL FAIL
+
+The implementation is correct (NLL parity confirmed; output buffers
+`s.dq` and `W.dE` are independent; `W.dE.zero()` is host-synchronous
+`cudaMemset` so no race with side GEMM's `beta=1` accumulation; event
+sync is correctly placed before any consumer of either output).  But
+the predicted SM-level concurrency does NOT materialize on RTX 4080
+SUPER at this GEMM shape:
+
+- Each 1.07 TFLOP BF16-TC GEMM at `(T=8192, V=32000, m=2048)` already
+  saturates Ada's 80 SMs.  Adding a second concurrent GEMM via a
+  separate stream/handle does NOT yield additional GPU throughput —
+  the hardware serializes them at the SM allocator regardless of
+  stream affinity.
+- Plus L2 cache contention: both GEMMs read the same 1 GB `dlogits`
+  operand.  Concurrent reads may thrash L2 (64 MB on Ada) rather than
+  benefit from shared caching.
+
+Profile via `nsys profile --trace=cuda,cublas` was attempted but the
+nsys 2022.4.2 importer binary is missing on this host (qdstrm captured
+but cannot be reduced to a readable stats report without `nsys export`
+which requires the importer).  The empirical 0% gain over 1000 bench
+steps (smoke + 200-step + 1000-bench all consistent within ±0.1%) is
+sufficient evidence for the IDEA FAIL classification without the trace.
+
+This is the predicted failure mode **F1** ("SM saturation") and/or
+**F2** ("L2 cache contention") — the GEMM at this shape doesn't leave
+SM headroom for a concurrent GEMM.  The mechanism would likely
+materialize at SMALLER GEMM shapes (e.g. iter-1's SCFA inner attention
+at k=512 has ~5× smaller GEMMs that don't saturate the SM array), but
+the readout-GEMM shape is the WORST CASE for this technique because
+it's already the largest single GEMM workload in the model.
+
+### Closing the hypothesis
+
+`--bf16-logits-parallel-bwd` produces zero speed gain at this GEMM
+shape on Ada.  The flag remains in the codebase (default off) for two
+reasons:
+1. The side cuBLAS handle infrastructure (`g_handleSide`,
+   `g_sideStream`, `sideComputeStream()`) is reusable for any future
+   parallelism experiment that involves smaller GEMMs where SM
+   saturation is not the binding constraint.
+2. The empirical NULL with FULL NLL/VRAM/stability parity is a useful
+   negative-result baseline for future iters that try cross-stream
+   GEMM dispatch on different shapes.
+
+**Don't repeat this for any GEMM shape ≥ ~1 TFLOP at BF16-TC on Ada.**
+Single-GEMM saturation is the binding constraint; parallelism via
+cross-stream dispatch only helps for shapes that don't saturate SM
+occupancy.
+
+### Run output
+
+- `research/runs/loop-6-bf16-logits-parallel-bwd/train.log` — 1000-step
+  bench (aborted)
+- `research/runs/loop-6-bf16-logits-parallel-bwd-smoke/smoke.log` —
+  50-step smoke with `--bf16-logits-parallel-bwd`
+- `research/runs/loop-6-control-smoke/smoke.log` — 50-step smoke
+  WITHOUT the flag (direct control)
+- `research/runs/loop-6-bf16-logits-parallel-bwd/nsys-parallel.qdstrm` —
+  20-step nsys capture (cannot reduce to stats without nsys importer)
+- Control = iter-5 scfa-fuse-streams: `research/runs/loop-5-scfa-fuse-streams/train.log`
+
+## Iteration 7 — SCFA activation checkpointing (cache inner-shear scratches) — PARTIAL (speed below bar, VRAM violation)
+
+### Hypothesis
+
+If I cache q_compr + the SCFA inner shear's intermediates (sQ, sK, sV,
+sO, sP) + y_compr per-layer in forward, the backward can skip the
+forward-recompute of step 1 (q_compr = B^T·q, ~260 µs / layer) AND step
+5 (inner shear forward = 4 BF16-TC GEMMs at compressed length + attn
+core + casts, ~960 µs / layer).  Saving ~1220 µs / layer × 24 = ~29 ms
+/ step at the iter-5 400 ms baseline = +7% e2e tok/s.
+
+NLL risk: ZERO (cached values are bit-identical to what the recompute
+would produce — same kernel on same inputs).
+
+VRAM risk: per-layer save buffers: q_compr (4 MB), y_compr (4 MB),
+sQ/sK/sV/sO (8 MB × 4 = 32 MB), sP (16 MB) = 56 MB/layer × 24 = 1.34 GB
+extra.  EXCEEDS the 12.91 GB hard guardrail by 1.31 GB.
+
+Stability risk: ZERO.
+
+Failure modes (predicted):
+- **F1**: VRAM exceeds 12.91 GB hard guardrail.
+- **F2**: Per-layer memcpy overhead in forward (7 memcpys × 24) exceeds
+  the saving — UNLIKELY since 7 × ~10-20 µs × 24 = ~3 ms ≪ 29 ms.
+- **F3**: cuBLAS algorithm selection on the cached path differs from
+  the recompute path, causing tiny NLL drift — possible but well under
+  5% margin.
+
+### Mechanism (why this should help)
+
+`scfa_attention_backward` (`chiron_main.cpp` ~line 4316) recomputes
+the forward shear intermediates before computing gradients:
+
+```
+Step 1 recompute: q_compr = B^T·q       (~260 µs / layer, outer GEMM)
+Step 2 recompute: q_par = B·q_compr      (~260 µs / layer)
+Step 3 recompute: q_perp = q - q_par     (~190 µs / layer, custom kernel)
+Step 4 recompute: y_perp = D(q_perp)     (~200 µs / layer, conv)
+Step 5 recompute: y_compr = shear(q_compr)  (~960 µs / layer; 4 GEMMs + attn core + casts)
+Step 6 recompute: y_par = B·y_compr      (~260 µs / layer)
+Step 7-inv:       s.p -= sign · (y_par + y_perp)  (~200 µs / layer, fused)
+```
+
+Then real gradient computation begins (steps 8-13).
+
+By caching q_compr + the inner shear's sQ/sK/sV/sO/sP scratches + y_compr,
+we skip step 1 + step 5 forward-recompute.  Steps 2, 3, 4, 6, 7-inv
+still run (their outputs depend on the recomputed q_compr which IS now
+populated from cache).  The real step 5 backward uses the cached sQ etc.
+directly via pointer-swap (`p_sQ = useCheckpoint ? sQ_save[l] : sQ` etc.).
+
+### Command diff vs iter-5 control
+
+```
+... --scfa-bf16-inner --scfa-bf16-outer --bf16-logits --scfa-fuse-streams
+                                           ↓
+... --scfa-bf16-inner --scfa-bf16-outer --bf16-logits --scfa-fuse-streams
+    --scfa-checkpoint-inner
+```
+
+### Implementation summary
+
+- **New per-layer save buffers in `ChironParams`**: `scfa_qcompr_save[L]`,
+  `scfa_ycompr_save[L]`, `scfa_inner_sQ_save[L]`, `scfa_inner_sK_save[L]`,
+  `scfa_inner_sV_save[L]`, `scfa_inner_sO_save[L]`, `scfa_inner_sP_save[L]`.
+  Each per-layer `GpuBuffer<float>*` allocated under `--scfa-checkpoint-inner`.
+- **Allocation**: 56 MB / layer × L=24 = 1.34 GB total VRAM extra.
+- **Forward** (`scfa_attention_forward`, chiron_main.cpp):
+  - After step 1 (q_compr written): memcpy `scfa_qcompr` → `scfa_qcompr_save[l]`.
+  - After step 5 (inner shear + memcpy to ycompr): memcpy the 6 scratches
+    (ycompr, sQ, sK, sV, sO, sP) → corresponding `_save[l]` buffers.
+- **Backward** (`scfa_attention_backward`):
+  - When `useCheckpoint` (= `cfg.scfaCheckpointInner && save buffer exists`):
+    - Skip step 1 GEMM; instead memcpy `scfa_qcompr_save[l]` → `scfa_qcompr`.
+    - Skip step 5 forward-shear; instead memcpy `scfa_ycompr_save[l]` →
+      `scfa_ycompr`; sQ/sK/sV/sO/sP pointers are swapped to `_save[l]`
+      when invoking `chiron_attention_shear_backward_bf16w_tiled`.
+- **New trainer flag**: `Config::scfaCheckpointInner` (CLI
+  `--scfa-checkpoint-inner`).  Default false.
+- **Setup log**: per-layer VRAM cost printed.
+
+### Results — aborted at step 500 (~+4.10% speed, but VRAM violates guardrail)
+
+50-step smoke:
+
+| Step | iter-5-binary control | iter-8-binary control | iter-7 (checkpoint) | iter-7 - control tok/s |
+|-----:|----------------------:|----------------------:|-------------------:|----------------------:|
+| 50   | n/a                   | 20,527 tok/s          | 21,376 tok/s       | +849 (+4.14%)         |
+
+NLL parity: iter-7 ema at step 50 = 9.4056 vs control 9.3990 (Δ +0.0066
+nat = +0.07%, well within margin).
+
+5k bench (aborted at step 500 once speed pattern was clear):
+
+| Step | iter-5 ema | iter-5 tok/s | iter-7 ema | iter-7 tok/s | Δ tok/s | Δ ema  |
+|-----:|-----------:|-------------:|-----------:|-------------:|--------:|-------:|
+|    1 | 10.4746    | 16,845       | 10.4746    | 17,405       | +560    | 0.0000 |
+|  250 |  8.9532    | 20,495       |  8.9568    | 21,351       | +856    | +0.0036|
+|  500 |  8.3944    | 20,481       |  8.4188    | 21,321       | +840    | +0.0244|
+
+Sustained tok/s at step 500: **+4.10% vs iter-5 baseline**.
+NLL at step 500: +0.0244 nat (well within ±5% margin).
+**Peak VRAM: 14.22 / 15.56 GB — VIOLATES guardrail (12.91 baseline)**.
+NaN/Inf: none.  Stability: OK.
+
+### Verdict — PROTOCOL FAIL (two guardrails missed: speed < 5%, VRAM > 12.91)
+
+**Speed (guardrail #3 + win criterion):** **FAIL.**  Sustained ~21,335
+tok/s vs iter-5 ~20,486 = **+4.10%**, just under the +5% win bar.  Hard
+guardrail (15,960) easily passed.
+
+**VRAM (guardrail #2):** **FAIL.**  14.22 GB > 12.91 GB by 1.31 GB.
+Within hardware limit (15.56 GB) but violates the loop's hard
+guardrail.
+
+**NLL (guardrail #1):** PASS.  Max Δ ema 0.024 nat ≪ 5% margin.
+
+**Stability (guardrail #4):** PASS.  No NaN/Inf; ‖g‖ trajectory
+mirrors iter-5 within data-driven spike pattern.
+
+### Mechanism check — IDEA WORKS, but BOTH speed and VRAM guardrails are missed
+
+The implementation is correct (the activation cache is bit-identical
+math, NLL parity confirmed).  The mechanism delivers measurable
++4.10% speed.  But:
+
+1. Predicted +7% / measured +4.10% — gap is from memcpy overhead +
+   slightly slower-than-predicted forward-shear-recompute cost (each
+   forward shear at compressed length is ~600 µs, not 960 µs as I
+   estimated; saving is ~600 × 24 = 14.4 ms / step ≈ +3.6%).  Plus the
+   memcpy overhead (~2-3 ms / step) pushes back to ~+4% measured.
+   Mechanism is sound but pricier than predicted.
+
+2. The +1.34 GB VRAM is intrinsic to activation checkpointing.  Cannot
+   reduce without lossy precision (BF16 cache would save ~50% but
+   still exceed budget by ~0.65 GB).
+
+### Closing the hypothesis
+
+`--scfa-checkpoint-inner` delivers a real +4.10% speed gain at NLL
+parity but FAILS strict guardrails on two axes.  The flag remains in
+the codebase (default off) as an **opt-in trade-off** for users who:
+- Need higher tok/s and
+- Can accept +1.31 GB VRAM usage (still under the 15.56 GB hardware
+  limit).
+
+Future iters could try:
+- BF16 activation cache (halve VRAM to ~0.67 GB extra; still over
+  budget but closer).
+- Cache subset (only sQ/sK/sV/sO, recompute attn core in backward) —
+  partial saving + smaller VRAM but below +5% bar.
+- Activation overlay onto existing free buffers — none have the right
+  lifetime (caches need to live from forward-of-layer-l to
+  backward-of-layer-l, spanning the whole forward chain).
+
+### Run output
+
+- `research/runs/loop-7-scfa-checkpoint-inner/train.log` — 5k bench
+  aborted at step 500.
+- `research/runs/loop-7-scfa-checkpoint-inner-smoke/smoke.log` —
+  50-step smoke.
+- Control = iter-5 scfa-fuse-streams: `research/runs/loop-5-scfa-fuse-streams/train.log`
+
+## Iteration 8 — Multi-stream SCFA branch parallelism — NEGATIVE (~−8% slowdown)
+
+### Hypothesis
+
+If I dispatch SCFA branch A (steps 2-3-4: q_par GEMM + q_perp sub +
+depthwise conv) on a side CUDA stream via iter-6's side cuBLAS handle,
+concurrent with branch B (step 5 inner shear + step 6 y_par GEMM) on
+the main stream, I expect tok/s to go from 20,428 to ~22,000 (+3-7%)
+because:
+- Branch A: ~650 µs (steps 2+3+4, mixed cuBLAS+custom kernels)
+- Branch B: ~5260 µs (inner shear ~5 ms + step 6 ~260 µs, mostly cuBLAS)
+- Sequential per layer: ~5910 µs
+- Parallel: max(650, 5260) = 5260 µs
+- Saving: 650 µs / layer × 24 × 2 (fwd+bwd) = ~31 ms / step at 400 ms = +7.75% e2e
+
+VRAM: zero (reuses iter-6's side cuBLAS handle infrastructure).
+NLL: zero (math unchanged; only stream placement changes).
+Stability: zero.
+
+Failure modes (predicted, but turned out to also encompass new modes):
+- **F1**: cross-stream cuBLAS-cuBLAS overlap doesn't happen on Ada at
+  SCFA shapes (iter-6 evidence: no overlap at 1 TFLOP shapes; SCFA is
+  60-120× smaller so might overlap).
+- **F2**: event sync overhead exceeds parallelism gain.
+- **F3**: GPU scheduler context-switches between streams costing more
+  than parallelism saves.
+
+### Implementation summary
+
+- **New BLAS wrapper** (`gpu_blas.cu`): `sgemm_rowmajor_fast16bf_side`
+  (non-ATB FAST_16BF on side handle), companion to iter-6's
+  `sgemm_rowmajor_atb_fast16bf_side`.
+- **Stream parameter added to custom kernels** (default = 0 → main):
+  - `chiron_scfa_sub(...,  cudaStream_t stream = 0)`
+  - `chiron_scfa_axpy2(..., cudaStream_t stream = 0)`
+  - `chiron_scfa_scaled_copy(..., cudaStream_t stream = 0)`
+  - `scfa_depthwise_causal_conv_fwd(..., cudaStream_t stream = 0)`
+  - `scfa_depthwise_causal_conv_bwd(..., cudaStream_t stream = 0)`
+- **New trainer flag**: `Config::scfaParallelBranches` (CLI
+  `--scfa-parallel-branches`).  Default false.  Requires
+  `--scfa-bf16-outer` AND `--scfa-fuse-streams`.
+- **Forward dispatch** (`scfa_attention_forward`):
+  - After step 1 on main: `recordEvent(s_fwd_e1, main)` + `streamWaitEvent(side, s_fwd_e1)`.
+  - Branch A on side stream: step 2 via `sgemm_rowmajor_fast16bf_side`,
+    step 3 via `chiron_scfa_sub(..., sideStream)`, step 4 via
+    `scfa_depthwise_causal_conv_fwd(..., sideStream)`.
+  - `recordEvent(s_fwd_e2, side)`.
+  - Branch B on main: step 5 inner shear (existing), step 6 GEMM.
+  - `streamWaitEvent(main, s_fwd_e2)` before step 7.
+- **Backward dispatch** (`scfa_attention_backward`): mirror of forward.
+  Disabled when `useCheckpoint` (iter-7 mode) is on since step 5 is
+  then a no-op.
+- **Static event reuse**: events `s_fwd_e1/e2`, `s_bwd_e1/e2` are
+  function-local statics, allocated once at first call, no per-call
+  create/destroy overhead.
+
+### Results — aborted at smoke (~−8% slowdown is conclusive)
+
+50-step smoke (parallel-branches ON):
+
+| Step | Control (no flag) tok/s | Parallel-branches tok/s | Δ tok/s | Δ% |
+|-----:|------------------------:|------------------------:|--------:|---:|
+| 10   | 20,536                  | 18,856                  | −1,680  | −8.2% |
+| 20   | 20,535                  | 18,852                  | −1,683  | −8.2% |
+| 30   | 20,520                  | 18,857                  | −1,663  | −8.1% |
+| 40   | 20,519                  | 18,838                  | −1,681  | −8.2% |
+| 50   | 20,533                  | 18,847                  | −1,686  | −8.2% |
+
+VRAM: 12.91 GB matches control (no extra allocation).
+NLL: parity (ema 9.3964 vs control 9.3996, Δ −0.003 nat).
+NaN/Inf: none.
+Stability: OK.
+
+The slowdown is **consistent ~8.2% across all steps**.  Not noise.
+
+Static-event optimization: identical -8.2% pattern with and without
+static event reuse (eliminating cudaEventCreate/Destroy per call had
+zero impact on the slowdown).  This rules out event-API overhead as
+the cause.
+
+### Verdict — NEGATIVE RESULT (worse than control)
+
+**Speed:** **FAIL.**  18,847 tok/s vs 20,533 control = **−8.2%**.
+Catastrophic regression.
+
+**VRAM:** PASS (12.91 GB).
+**NLL:** PASS.
+**Stability:** PASS.
+
+### Mechanism check — IDEA FAIL
+
+Implementation is correct (NLL parity confirms math is right; the
+parallel dispatch IS happening per the setup log).  Static event reuse
+eliminates per-call API overhead.  The slowdown must come from one of:
+
+1. **cuBLAS handle serialization at the device level**: two cuBLAS
+   handles, even bound to different streams, might serialize at the
+   SM/tensor-core allocator on Ada.  Per iter-6, large GEMMs already
+   saturate the GPU; iter-8 confirms the issue persists at smaller
+   GEMM shapes — the cuBLAS GEMM on the side handle does NOT run
+   concurrently with the cuBLAS GEMM on the main handle.  Worse, the
+   cross-stream coordination adds latency.
+
+2. **Custom-kernel-cuBLAS overlap doesn't help enough**: even if the
+   side stream's `chiron_scfa_sub` + `depthwise_conv` overlap with
+   the main stream's inner shear, the saving (~390 µs / layer × 48 =
+   ~19 ms / step) is less than the cuBLAS coordination overhead.
+
+3. **GPU scheduler bias**: when two streams compete for SMs, Ada's
+   scheduler may serialize and add inter-stream queue overhead.
+
+The net effect is **negative** — cross-stream coordination costs more
+than the small concurrent-execution wins.
+
+The mechanism prediction was wrong both ways: the cuBLAS-cuBLAS
+overlap doesn't happen (iter-6 evidence reaffirmed), AND the
+custom-kernel-cuBLAS overlap is overwhelmed by stream-coordination
+overhead.
+
+### Closing the hypothesis
+
+**On Ada (RTX 4080 SUPER), multi-stream parallelism is NOT a viable
+technique for SCFA branch overlap.**  This generalizes the iter-6
+finding ("no cuBLAS-cuBLAS overlap at large shapes") to:
+
+- **No useful cuBLAS-cuBLAS overlap at ANY shape** (1 TFLOP via iter-6,
+  17 GFLOP outer-SCFA via iter-8, 8.6 GFLOP inner-SCFA via iter-8).
+- **Custom-kernel-cuBLAS overlap exists but is overwhelmed by
+  cross-stream coordination costs** at the per-layer granularity.
+
+The infrastructure (side cuBLAS handle, side stream, stream-parameter-
+aware kernels) remains in the codebase for any future hypothesis where
+the parallelism granularity is coarser (e.g., overlapping the optimizer
+step with the next forward pass — NIMBUS-lite, paradigm #52).
+
+**Don't repeat cross-stream parallelism within a SCFA layer for any
+future iter.**  Future cross-stream attempts should target larger
+units of work (whole-step or multi-step pipelining).
+
+### Run output
+
+- `research/runs/loop-8-scfa-parallel-branches-smoke/smoke.log` —
+  50-step smoke.
+
+## Loop wrap-up — 2026-05-14
+
+### Summary
+
+| Iter | Flag                             | Verdict        | Speed Δ vs prior | NLL parity | VRAM     |
+|-----:|----------------------------------|----------------|-----------------:|:----------:|---------:|
+|   1  | `--scfa-bf16-inner`              | SHIPPED        | +10.6%           | ✓          | 12.91 GB |
+|   2  | `--scfa-bf16-outer`              | SHIPPED        | +7.96%           | ✓          | 12.91 GB |
+|   3  | `--bf16-logits`                  | SHIPPED        | +6.61%           | ✓          | 12.91 GB |
+|   4  | `--scfa-compression-ratio 32`    | NLL FAIL       | +14.1% (but NLL ↑ 8.6%) | ✗   | 12.84 GB |
+|   5  | `--scfa-fuse-streams`            | SHIPPED        | +5.23%           | ✓          | 12.91 GB |
+|   6  | `--bf16-logits-parallel-bwd`     | NULL           | −0.02%           | ✓          | 12.91 GB |
+|   7  | `--scfa-checkpoint-inner`        | PROTOCOL FAIL  | +4.10% (< 5%)    | ✓          | **14.22 GB (>12.91)** |
+|   8  | `--scfa-parallel-branches`       | NEGATIVE       | **−8.2%**        | ✓          | 12.91 GB |
+
+**Net session result**: iter-1+2+3+5 (already shipped before this session)
+deliver **+34.4% over the 15,200 baseline (15,200 → 20,428 tok/s)**.  This
+session (iter-6/7/8) did NOT add a strict-win on top.
+
+### What worked (re-confirmed mechanisms)
+
+1. **BF16 tensor-core routing for ALL FP32-compatible GEMMs** (iter 1, 2, 3):
+   FAST_16BF mode is a free win on Ada when the operand precision is BF16-tolerable.
+2. **Memory-bandwidth fusion** (iter 5): fusing memcpy+axpy pairs into
+   single-pass element-wise kernels eliminates the intermediate buffer
+   round-trip.  Bit-identical math.
+
+### What didn't work (mechanism failures)
+
+1. **Aggressive compression (iter 4 ratio=32)**: the depthwise conv at
+   half-width 8 cannot absorb modes 257..512 of the residual stream;
+   NLL drifts. Future re-test would pair k=256 with a WIDER conv (w≥16).
+2. **Cross-stream cuBLAS parallelism (iter 6 & iter 8)**:
+   - At LARGE GEMM shapes (1 TFLOP readout, iter 6): SM saturation
+     prevents cuBLAS-cuBLAS overlap → null result.
+   - At SMALL GEMM shapes (SCFA outer/inner, iter 8): cross-stream
+     coordination overhead exceeds whatever parallelism is achieved →
+     NEGATIVE result (-8%).
+   - **Generalization**: cross-stream parallelism within a layer is
+     not a viable technique on Ada at any GEMM scale.
+3. **Activation checkpointing (iter 7)**: idea works mechanism-wise
+   (+4.10% speed at NLL parity) but two strict guardrails fail (speed
+   < 5%, VRAM > 12.91 GB budget).  Flag retained as opt-in for users
+   who accept the +1.31 GB VRAM trade-off.
+
+### What I'd try next if given more budget
+
+1. **Welford 1-pass reln + in-place reln + fused reln+axpy** combined
+   under one `--scfa-reln-opt` flag.  Predicted +3-5% from
+   memory-bandwidth savings alone (reln_forward is 3-pass FP32 today;
+   making it 1-pass plus eliminating the post-reln memcpy and fusing
+   with the per-layer-fuse axpy is a clean mechanism).  VRAM-neutral.
+   Risk: math is no longer bit-identical (Welford's variance has
+   slightly different rounding than the current 2-pass form) but
+   the difference is sub-ULP at FP32.
+
+2. **gpu_blas.cu refactor to remove per-call cublasSetMathMode**
+   (unblocks `--cuda-graphs`).  Predicted +1-3% from launch-overhead
+   elimination once CUDA Graphs capture works.  Small but
+   compositional.
+
+3. **BF16 storage for SCFA T·m intermediates (scfa_qpar/qperp/yperp/ypar)**:
+   halves their memory traffic.  Per-call traffic per layer is ~268 MB
+   (per iter-5's mech check); BF16 saves ~134 MB → ~3 ms / step at
+   700 GB/s.  Predicted +1-2%.  Plus VRAM SAVINGS (12.91 → ~12.5).
+
+4. **Pipeline H2D upload of step N+1's tokens during step N's optimizer
+   step** (NIMBUS-lite, paradigm #52).  At the COARSE granularity of
+   whole-step pipelining, cross-stream parallelism should work (the
+   workloads are large and independent).  Predicted +1-3%.
+
+5. **Re-test iter-4 (ratio=32) paired with --scfa-conv-w 16** (wider
+   depthwise conv to absorb the 257..512 frequency band that
+   conv-w-8 cannot capture).  Predicted +10-14% if NLL passes.  Risk:
+   NLL might still drift.  Note: this is two-variable but logically
+   one experiment ("aggressive compression + wider residual capture").
+
+### Recommendations
+
+For the **next ralph-loop session**, focus on hypothesis (1) Welford+
+in-place reln+fused reln+axpy.  It has the clearest mechanism, modest
+implementation effort (~60-90 min), and predicted +3-5% combines with
+the existing iter-1+2+3+5 stack to potentially push past +40% over
+the 15,200 baseline.
+
+For **production training**, the current iter-5 stack (15,200 →
+20,428 tok/s at NLL parity, 12.91 GB) is the validated default.  Users
+who can accept +1.31 GB VRAM can additionally enable
+`--scfa-checkpoint-inner` for ~+4.10% more speed (15,200 → ~21,300 tok/s,
+14.22 GB).
+

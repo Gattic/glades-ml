@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <stdint.h>
+#include "gpu_device.h"  // cudaStream_t (iter 8)
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -43,7 +44,11 @@ bool chiron_shear_sub(float* p, const float* u, int n);
 // c[i] = a[i] - b[i] for i in [0, n).  Replaces:
 //   memcpy_d2d(c, a, n*sizeof(float));
 //   axpy(-1.0f, b, c, n);
-bool chiron_scfa_sub(float* c, const float* a, const float* b, int n);
+// iter 8 (2026-05-14): optional `stream` parameter for multi-stream branch
+// parallelism (--scfa-parallel-branches).  Default = 0 means use
+// computeStream() (backwards compatible).
+bool chiron_scfa_sub(float* c, const float* a, const float* b, int n,
+                     cudaStream_t stream = 0);
 
 // p[i] += alpha * (a[i] + b[i]) for i in [0, n).  Replaces:
 //   axpy(1.0f, b, a, n);          // a += b (mutates a)
@@ -52,12 +57,14 @@ bool chiron_scfa_sub(float* c, const float* a, const float* b, int n);
 // preserved.  The original chain mutated a; if the caller relied on the
 // mutated value of a afterwards, the fused variant must not be used.
 bool chiron_scfa_axpy2(float* p, float alpha,
-                       const float* a, const float* b, int n);
+                       const float* a, const float* b, int n,
+                       cudaStream_t stream = 0);
 
 // c[i] = alpha * a[i] for i in [0, n).  Replaces:
 //   memcpy_d2d(c, a, n*sizeof(float));
 //   scale_array(c, alpha, n);
-bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n);
+bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n,
+                              cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
 // Reversible LayerNorm (ReLN) with external stats buffer.

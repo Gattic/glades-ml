@@ -4,6 +4,7 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 #include <cstdio>
 #include "gpu_device.h"
 
@@ -16,6 +17,49 @@ static bool g_initialized = false;
 // iter 180: when false, all wrappers below select CUBLAS_DEFAULT_MATH (no TF32).
 static bool g_tf32_enabled = true;
 static float* g_deviceOne = 0;
+
+// ralph-loop iter 6 (2026-05-14): side cuBLAS handle bound to a dedicated
+// side stream, used to dispatch GEMMs that can run concurrently with the
+// main computeStream() GEMMs.  Lazily initialized on first request via
+// ensureSideHandle().  The two readout backward GEMMs (dq_L = dlogits·E,
+// dE += dlogits^T·q_L) are independent and benefit from cross-stream
+// concurrency at T=8192 V=32000 m=2048 — each is 1.07 TFLOP at BF16-TC,
+// ~33 ms / GEMM, parallelization saves ~21 ms / step ≈ +5% e2e.
+static cublasHandle_t g_handleSide = 0;
+static cudaStream_t   g_sideStream = 0;
+static bool g_sideInitialized = false;
+
+static bool ensureSideHandle()
+{
+	if (g_sideInitialized) return true;
+	if (!g_initialized && !blasInit()) return false;
+	cudaError_t e = cudaStreamCreateWithFlags(&g_sideStream, cudaStreamNonBlocking);
+	if (e != cudaSuccess)
+	{
+		fprintf(stderr, "[glades-cuda] cudaStreamCreate (side) failed: %d\n",
+		        static_cast<int>(e));
+		g_sideStream = 0;
+		return false;
+	}
+	cublasStatus_t st = cublasCreate(&g_handleSide);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasCreate (side) failed: %d\n",
+		        static_cast<int>(st));
+		cudaStreamDestroy(g_sideStream);
+		g_sideStream = 0;
+		g_handleSide = 0;
+		return false;
+	}
+	cublasSetStream(g_handleSide, g_sideStream);
+	if (computeCapabilityMajor() >= 8)
+	{
+		cublasSetMathMode(g_handleSide,
+		    g_tf32_enabled ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+	}
+	g_sideInitialized = true;
+	return true;
+}
 
 static bool sgemm_rowmajor_impl(cublasMath_t mathMode,
                                 cublasOperation_t transa,
@@ -205,6 +249,13 @@ bool blasInit()
 
 void blasDestroy()
 {
+	// ralph-loop iter 6: tear down side handle/stream first if initialized.
+	if (g_sideInitialized)
+	{
+		if (g_handleSide) { cublasDestroy(g_handleSide); g_handleSide = 0; }
+		if (g_sideStream) { cudaStreamDestroy(g_sideStream); g_sideStream = 0; }
+		g_sideInitialized = false;
+	}
 	if (g_initialized && g_handle)
 	{
 		if (g_deviceOne)
@@ -216,6 +267,15 @@ void blasDestroy()
 		g_handle = 0;
 		g_initialized = false;
 	}
+}
+
+// ralph-loop iter 6 (2026-05-14): public accessor for the side stream so
+// callers can record events on it for cross-stream synchronization.
+// Returns 0 if the side handle has never been initialized (the cuBLAS
+// handle is lazy-init'd by the first sgemm_*_side call below).
+cudaStream_t sideComputeStream()
+{
+	return g_sideStream;
 }
 
 // Row-major SGEMM via cuBLAS (column-major).
@@ -1054,6 +1114,70 @@ bool sgemm_rowmajor_abt_fast16bf(int M, int N, int K,
 	                                     M, N, K,
 	                                     alpha, A, lda, B, ldb, beta, C, ldc,
 	                                     "cublasGemmEx(FAST_16BF,ABT)");
+}
+
+// ralph-loop iter 6 (2026-05-14): FAST_16BF GEMMs dispatched on the side
+// cuBLAS handle / side stream.  Use for ops that are data-independent of
+// concurrent main-stream work — readout backward dE = dlogits^T · q_L is
+// the headline case.  Caller is responsible for cross-stream event
+// synchronization (record event on sideComputeStream() after the call,
+// streamWaitEvent on computeStream before any consumer of the output).
+static bool sgemm_rowmajor_fast16bf_side_impl(cublasOperation_t transa,
+                                               cublasOperation_t transb,
+                                               int M, int N, int K,
+                                               float alpha,
+                                               const float* A, int lda,
+                                               const float* B, int ldb,
+                                               float beta,
+                                               float* C, int ldc,
+                                               const char* label)
+{
+	if (!ensureSideHandle()) return false;
+	cublasStatus_t st = cublasGemmEx(g_handleSide,
+	                                 transa, transb,
+	                                 N, M, K,
+	                                 &alpha,
+	                                 B, CUDA_R_32F, ldb,
+	                                 A, CUDA_R_32F, lda,
+	                                 &beta,
+	                                 C, CUDA_R_32F, ldc,
+	                                 CUBLAS_COMPUTE_32F_FAST_16BF,
+	                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] %s failed: %d (M=%d N=%d K=%d)\n",
+		        label, static_cast<int>(st), M, N, K);
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_rowmajor_atb_fast16bf_side(int M, int N, int K,
+                                       float alpha,
+                                       const float* A, int lda,
+                                       const float* B, int ldb,
+                                       float beta,
+                                       float* C, int ldc)
+{
+	return sgemm_rowmajor_fast16bf_side_impl(CUBLAS_OP_N, CUBLAS_OP_T,
+	                                          M, N, K,
+	                                          alpha, A, lda, B, ldb, beta, C, ldc,
+	                                          "cublasGemmEx(FAST_16BF,ATB,side)");
+}
+
+// ralph-loop iter 8 (2026-05-14): non-ATB FAST_16BF variant on side handle.
+// Used by SCFA branch-parallel forward step 2 (y_par/q_par = B · *).
+bool sgemm_rowmajor_fast16bf_side(int M, int N, int K,
+                                   float alpha,
+                                   const float* A, int lda,
+                                   const float* B, int ldb,
+                                   float beta,
+                                   float* C, int ldc)
+{
+	return sgemm_rowmajor_fast16bf_side_impl(CUBLAS_OP_N, CUBLAS_OP_N,
+	                                          M, N, K,
+	                                          alpha, A, lda, B, ldb, beta, C, ldc,
+	                                          "cublasGemmEx(FAST_16BF,side)");
 }
 
 // Phase 2f exploration: mixed-precision FP32×BF16 GEMM wrappers were

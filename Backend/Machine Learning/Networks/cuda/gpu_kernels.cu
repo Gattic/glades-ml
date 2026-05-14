@@ -6449,12 +6449,14 @@ __global__ void scfa_depthwise_causal_conv_fwd_kernel(
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
-                                     int T, int m, int w, float* y)
+                                     int T, int m, int w, float* y,
+                                     cudaStream_t stream)
 {
 	if (T <= 0 || m <= 0 || w < 0) return true;
 	int block = 256;
 	dim3 grid((m + block - 1) / block, T);
-	scfa_depthwise_causal_conv_fwd_kernel<<<grid, block, 0, computeStream()>>>(
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	scfa_depthwise_causal_conv_fwd_kernel<<<grid, block, 0, s>>>(
 	    x, K, T, m, w, y);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -6511,14 +6513,16 @@ __global__ void scfa_dwconv_dK_kernel(const float* __restrict__ x,
 bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
                                      const float* dy,
                                      int T, int m, int w,
-                                     float* dx, float* dK)
+                                     float* dx, float* dK,
+                                     cudaStream_t stream)
 {
 	if (T <= 0 || m <= 0 || w < 0) return true;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
 	// dx kernel: zero-initialize is the caller's responsibility (kernel +=).
 	{
 		int block = 256;
 		dim3 grid((m + block - 1) / block, T);
-		scfa_dwconv_dx_kernel<<<grid, block, 0, computeStream()>>>(
+		scfa_dwconv_dx_kernel<<<grid, block, 0, s>>>(
 		    dy, K, T, m, w, dx);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
@@ -6527,7 +6531,7 @@ bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
 		int wp1 = w + 1;
 		int block = (wp1 < 32) ? wp1 : 32;
 		dim3 grid((wp1 + block - 1) / block, m);
-		scfa_dwconv_dK_kernel<<<grid, block, 0, computeStream()>>>(
+		scfa_dwconv_dK_kernel<<<grid, block, 0, s>>>(
 		    x, dy, T, m, w, dK);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}

@@ -6,6 +6,8 @@
 
 #include <cstddef>
 
+#include "gpu_device.h"
+
 #ifdef GLADES_HAVE_CUDA
 
 namespace glades {
@@ -17,6 +19,13 @@ bool blasInit();
 
 // Destroy the cuBLAS handle.
 void blasDestroy();
+
+// ralph-loop iter 6 (2026-05-14): accessor for the lazy-initialized side
+// stream that the *_fast16bf_side wrappers dispatch on.  Returns 0 if no
+// _side call has yet been made.  Callers use this with recordEvent /
+// streamWaitEvent to synchronize the side stream's results back into the
+// main computeStream() before any consumer reads them.
+cudaStream_t sideComputeStream();
 
 // Row-major SGEMM: C[M,N] = alpha * A[M,K] * B[K,N] + beta * C[M,N]
 // All pointers are device pointers.
@@ -148,6 +157,32 @@ bool sgemm_rowmajor_abt_fast16bf(int M, int N, int K,
                                   const float* B, int ldb,
                                   float beta,
                                   float* C, int ldc);
+
+// ralph-loop iter 6 (2026-05-14): FAST_16BF ATB variant dispatched on a
+// dedicated side cuBLAS handle bound to its own CUDA stream
+// (sideComputeStream()).  Used for GEMMs that can run concurrently with
+// main-stream work (e.g. the two readout backward GEMMs are data-
+// independent).  Caller must:
+//   1. Issue this call.
+//   2. recordEvent(sideEvent, sideComputeStream()) afterward.
+//   3. streamWaitEvent(computeStream(), sideEvent) before any main-stream
+//      op that reads the output buffer C.
+bool sgemm_rowmajor_atb_fast16bf_side(int M, int N, int K,
+                                       float alpha,
+                                       const float* A, int lda,
+                                       const float* B, int ldb,
+                                       float beta,
+                                       float* C, int ldc);
+
+// ralph-loop iter 8 (2026-05-14): non-ATB FAST_16BF variant on side handle.
+// Used by SCFA branch-parallel forward/backward for B · q_compr / B · y_compr
+// GEMMs that should run concurrently with the inner shear on the main stream.
+bool sgemm_rowmajor_fast16bf_side(int M, int N, int K,
+                                   float alpha,
+                                   const float* A, int lda,
+                                   const float* B, int ldb,
+                                   float beta,
+                                   float* C, int ldc);
 
 // NOTE: Mixed-precision FP32×BF16→FP32 wrappers were explored for Phase 2f
 // but cuBLAS (through at least CUDA 12.x) doesn't support mixed input types
@@ -320,6 +355,7 @@ namespace gpu {
 
 inline bool blasInit() { return false; }
 inline void blasDestroy() {}
+inline cudaStream_t sideComputeStream() { return 0; }
 
 inline bool strsm_rowmajor_right_upper(int, int, float, const float*, int, float*, int) { return false; }
 inline bool strsm_rowmajor_left_upper_transpose(int, int, float, const float*, int, float*, int) { return false; }
@@ -337,6 +373,8 @@ inline bool sgemm_rowmajor_abt_bf16(int, int, int, float, const unsigned short*,
 inline bool sgemm_rowmajor_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_abt_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_atb_fast16bf_side(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_fast16bf_side(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline void set_tf32_enabled(bool) {}
 inline bool get_tf32_enabled() { return false; }
 inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, float, float*) { return false; }

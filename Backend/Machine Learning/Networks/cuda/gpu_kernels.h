@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <stdint.h>
+#include "gpu_device.h"  // cudaStream_t (iter 8)
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -109,8 +110,12 @@ bool orion_gram_schmidt(uint16_t* V, int n, int r,
 // y[t, c] = Σ_{i=0..w} K[c, i] · x[t-i, c]    (causal depthwise 1-D conv).
 // One filter per channel; m channels, T positions, half-width w (kernel size
 // w+1 since we only use the causal half + center tap).  Out-of-bounds is 0.
+// iter 8 (2026-05-14): optional `stream` parameter for multi-stream branch
+// parallelism (--scfa-parallel-branches).  Default = 0 means use
+// computeStream() (backwards compatible).
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
-                                     int T, int m, int w, float* y);
+                                     int T, int m, int w, float* y,
+                                     cudaStream_t stream = 0);
 
 // Backward through depthwise causal conv.
 //   dx[t, c] += Σ_{i=0..w, t+i<T} K[c, i] · dy[t+i, c]
@@ -119,7 +124,8 @@ bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
 bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
                                      const float* dy,
                                      int T, int m, int w,
-                                     float* dx, float* dK);
+                                     float* dx, float* dK,
+                                     cudaStream_t stream = 0);
 
 // Fill B[T × k] (row-major) with the orthonormal DCT-II basis truncated
 // to k columns.  Used as the sequence-spectral basis in SCFA.
@@ -840,8 +846,8 @@ inline bool orion_lift_add(float*, const void*, const float*, int, int) { return
 inline bool orion_perturb_col(float*, const float*, const void*, int, int, float) { return false; }
 inline bool orion_oja_tilt(void*, const float*, const float*, int, int, float) { return false; }
 inline bool orion_gram_schmidt(void*, int, int, float*, float*) { return false; }
-inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*) { return false; }
-inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*) { return false; }
+inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
 inline bool gelu_forward(const float*, int, float*) { return false; }

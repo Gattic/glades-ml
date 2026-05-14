@@ -160,30 +160,36 @@ __global__ void chiron_scfa_scaled_copy_kernel(float* __restrict__ c,
 
 } // anonymous namespace
 
-bool chiron_scfa_sub(float* c, const float* a, const float* b, int n)
+bool chiron_scfa_sub(float* c, const float* a, const float* b, int n,
+                     cudaStream_t stream)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	chiron_scfa_sub_kernel<<<grid, kBlockElem, 0, computeStream()>>>(c, a, b, n);
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_sub_kernel<<<grid, kBlockElem, 0, s>>>(c, a, b, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
 
 bool chiron_scfa_axpy2(float* p, float alpha,
-                       const float* a, const float* b, int n)
+                       const float* a, const float* b, int n,
+                       cudaStream_t stream)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	chiron_scfa_axpy2_kernel<<<grid, kBlockElem, 0, computeStream()>>>(p, alpha, a, b, n);
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_kernel<<<grid, kBlockElem, 0, s>>>(p, alpha, a, b, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
 
-bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n)
+bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n,
+                              cudaStream_t stream)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	chiron_scfa_scaled_copy_kernel<<<grid, kBlockElem, 0, computeStream()>>>(c, alpha, a, n);
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_scaled_copy_kernel<<<grid, kBlockElem, 0, s>>>(c, alpha, a, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
