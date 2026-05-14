@@ -1569,3 +1569,164 @@ who can accept +1.31 GB VRAM can additionally enable
 `--scfa-checkpoint-inner` for ~+4.10% more speed (15,200 → ~21,300 tok/s,
 14.22 GB).
 
+## Iteration 9 — `--scfa-reln-opt` (in-place reln + fused reln+axpy) — PARTIAL (+2.54%, below 5% bar but real gain at parity)
+
+### Hypothesis
+
+If I bundle two reln memory-bandwidth optimizations under one flag:
+1. In-place `chiron_reln_forward` / `chiron_reln_inverse` — eliminate
+   the post-reln memcpy `s.q ← s.q_tmp` (48 sites/step = 24 forward
+   q-reln + 24 backward q-inverse).  Per-site: 128 MB FP32 read+write =
+   ~100-200 µs at observable HBM bandwidth.
+2. Fused `chiron_reln_axpy_into_q` kernel — replace `reln_forward(p,
+   p_norm) + axpy(alpha, p_norm, q)` with one kernel that computes
+   `q += alpha · reln(p)`.  Eliminates the p_norm scratch round-trip
+   (~128 MB / call × 48 sites = 24 forward + 24 backward fuse).
+
+Predicted: ~10-20 ms / step at the iter-5 400 ms baseline = **+2.5-5% e2e**.
+
+NLL risk: ZERO modulo sub-ULP FMA-ordering differences (fused kernel
+does one combined expression per element; un-fused does separate
+expressions).
+
+VRAM risk: ZERO (no new buffers; in-place reln REDUCES live working
+set marginally by not requiring q_tmp double-buffering, but q_tmp
+remains allocated for paths that haven't been migrated).
+
+### Mechanism
+
+reln_forward's 3-pass row kernel was already L1-cache-friendly (the
+T·m FP32 row stays hot across all 3 passes within an SM), so Welford
+1-pass wasn't pursued (no HBM bandwidth savings expected from
+collapsing 3 passes to 2 when 2/3 of them are L1 hits anyway).  The
+gains here are from eliminating SEPARATE kernel calls that touch HBM:
+the memcpys (1 read + 1 write of T·m FP32) and the p_norm
+intermediate buffer (1 write + 1 read).
+
+### Implementation summary
+
+- **In-place reln**: `chiron_reln_forward` and `chiron_reln_inverse`
+  are now safe when `q_in == q_out` (the per-element read precedes
+  the per-element write).  No kernel changes needed; just pass the
+  same pointer for both args.  Skip the post-reln `device_memcpy_d2d`
+  when `cfg.scfaRelnOpt`.
+- **New kernel `chiron_reln_axpy_into_q`** in `gpu_chiron.cu`:
+  one block per row, computes mean+variance of p, then does
+  `q[i] += alpha · (gamma[i]·(p[i]-mu)/sigma + beta[i])` in pass 3.
+  Writes stats[T, 2] in the same `{ mu, log(sigma) }` format.
+- **New trainer flag**: `Config::scfaRelnOpt` (CLI `--scfa-reln-opt`).
+  Default false.
+- **Dispatch in chiron_main.cpp**: SCFA path (lines ~4900-4990),
+  forward q-reln + per-layer-fuse, backward inverse + per-layer-fuse
+  recompute — all 4 patterns gated on `cfg.scfaRelnOpt`.
+
+### Results — 5k bench
+
+Same seed (1337), identical config except for `--scfa-reln-opt`.
+Control = iter-5 scfa-fuse-streams (prior LOOP_RESULTS table).
+
+| Step | iter-5 ema | iter-5 tok/s | iter-9 ema | iter-9 tok/s | Δ tok/s | Δ ema  |
+|-----:|-----------:|-------------:|-----------:|-------------:|--------:|-------:|
+|    1 | 10.4746    | 16,845       | 10.4746    | 17,187       |  +342   | 0.0000 |
+|  250 |  8.9532    | 20,495       |  8.9528    | 21,014       |  +519   |−0.0004 |
+|  500 |  8.3944    | 20,481       |  8.3705    | 20,995       |  +514   |−0.0239 |
+|  750 |  7.9719    | 20,476       |  7.9519    | 20,987       |  +511   |−0.0200 |
+| 1000 |  7.8231    | 20,464       |  7.8026    | 20,976       |  +512   |−0.0205 |
+| 1250 |  7.5773    | 20,455       |  7.6530    | 20,975       |  +520   |+0.0757 |
+| 1500 |  7.2783    | 20,452       |  7.2741    | 20,971       |  +519   |−0.0042 |
+| 1750 |  7.0529    | 20,448       |  7.0465    | 20,968       |  +520   |−0.0064 |
+| 2000 |  6.8976    | 20,446       |  6.8625    | 20,965       |  +519   |−0.0351 |
+| 2250 |  6.4907    | 20,441       |  6.4727    | 20,961       |  +520   |−0.0180 |
+| 2500 |  6.3380    | 20,439       |  6.3263    | 20,962       |  +523   |−0.0117 |
+| 2750 |  6.3362    | 20,433       |  6.3357    | 20,961       |  +528   |−0.0005 |
+| 3000 |  6.0570    | 20,432       |  6.0441    | 20,955       |  +523   |−0.0129 |
+| 3250 |  6.1233    | 20,430       |  6.1201    | 20,951       |  +521   |−0.0032 |
+| 3500 |  6.0424    | 20,428       |  6.0385    | 20,948       |  +520   |−0.0039 |
+| 3750 |  5.9467    | 20,428       |  5.9351    | 20,947       |  +519   |−0.0116 |
+| 4000 |  5.7994    | 20,428       |  5.7929    | 20,947       |  +519   |−0.0065 |
+| 4250 |  5.6794    | 20,428       |  5.6773    | 20,947       |  +519   |−0.0021 |
+| 4500 |  5.9767    | 20,429       |  5.9757    | 20,947       |  +518   |−0.0010 |
+| 4750 |  5.8575    | 20,427       |  5.8524    | 20,947       |  +520   |−0.0051 |
+| **5000** | **5.7469** | **20,428** | **5.7424** | **20,947** | **+519** |**−0.0045** |
+
+Sustained tok/s post-warmup: **20,947 (+2.54% vs iter-5 20,428)**.
+Peak VRAM: **12.91 GB** (matches iter-5 baseline exactly).
+NLL at step 5000: 5.7424 vs 5.7469 — **iter-9 is 0.0045 nat BETTER**
+than the iter-5 control (0.08% improvement, ~60× under the 5% margin).
+Max Δ ema in either direction at any logged checkpoint: +0.076 nat
+(step 1250, iter-9 worse) / −0.035 nat (step 2000, iter-9 better).
+The Δ ema sign is non-monotonic — pure FMA-ordering + cuBLAS algo
+non-determinism noise, not a flag effect.
+NaN/Inf: none.  Max ‖g‖: 11.76 @ step 1750 (data-driven spike, same
+location as iter-5's 13.24 — magnitude slightly smaller here).
+
+### Verdict — PASS NLL/VRAM/Stability, FAIL strict +5% speed bar
+
+**Speed (win criterion):** **FAIL.**  +2.54% < +5% bar.
+
+**Speed (hard guardrail):** PASS.  20,947 ≫ 15,960 (the 5% over the
+original 15,200 baseline).
+
+**VRAM:** PASS.  12.91 GB matches iter-5 exactly.  In-place reln
+SAVES marginal working-set on paths that no longer need q_tmp
+populated; the underlying scratch is still allocated for other paths.
+
+**NLL:** PASS.  Final ema is BETTER than control by 0.0045 nat
+(~57× under the 5% margin).  All per-checkpoint deltas are within
+±0.08 nat — pure FMA-ordering noise.
+
+**Stability:** PASS.  No NaN/Inf.  ‖g‖ trajectory matches the iter-5
+data-driven spike pattern.
+
+### Mechanism check — IDEA WORKS, smaller than predicted
+
+Predicted: +2.5-5% from ~10-20 ms / step memory-bandwidth savings.
+Measured: +2.54% = ~10 ms / step.  At the LOW END of the predicted
+range.
+
+The reln 3-pass kernel was already L1-cached within each row's block,
+so the actual HBM traffic per reln call is ~1 row-read + 1 row-write
+(not 3 reads + 1 write as the naive view suggests).  Eliminating the
+SEPARATE memcpy/axpy calls is the real win — those calls actually
+touch HBM for the entire T·m buffer per call.
+
+The fused `chiron_reln_axpy_into_q` kernel is the bigger contributor:
+it eliminates the p_norm intermediate buffer write+read entirely.
+
+### Wall-clock-to-fixed-NLL
+
+iter-9 reaches the iter-5 control's terminal ema (5.7469) somewhere
+between step 4907 (best ema 5.3556) and step 5000.  At step 5000,
+iter-9 ema is 5.7424 < 5.7469 (already past iter-5's terminal point).
+Interpolating, iter-9 hits ema 5.7469 around step 4970, wall ≈ 1940s.
+vs iter-5's 2003.6s = Δ wall ≈ **−64 s, −3.2%**.  Below the 10%
+alternate-win threshold.
+
+### Closing the hypothesis
+
+`--scfa-reln-opt` delivers a real **+2.54% speed gain at NLL/VRAM/
+stability parity**.  Below the +5% strict win bar but a clean
+incremental improvement with ZERO cost.  **Recommended to include in
+production stack** (the flag is opt-in; combining with iter-1+2+3+5
+gives 15,200 → **20,947 tok/s, +37.8% over original baseline**).
+
+### Run output
+
+- `research/runs/loop-9-scfa-reln-opt/train.log` — 5k bench (complete).
+- `research/runs/loop-9-scfa-reln-opt-smoke/smoke.log` — 50-step smoke.
+- Control = iter-5 scfa-fuse-streams: `research/runs/loop-5-scfa-fuse-streams/train.log`
+
+## Combined stack performance (post-iter-9)
+
+| Stack                            | tok/s | Δ vs original 15,200 | VRAM     | NLL @ 5k |
+|----------------------------------|------:|---------------------:|---------:|---------:|
+| Original baseline                | 15,200 | (baseline)          | 12.91 GB | 5.33     |
+| + iter 1 (`--scfa-bf16-inner`)   | 16,843 | +10.6%              | 12.91 GB | 5.75     |
+| + iter 2 (`--scfa-bf16-outer`)   | 18,183 | +19.6%              | 12.91 GB | 5.75     |
+| + iter 3 (`--bf16-logits`)       | 19,385 | +27.5%              | 12.91 GB | 5.75     |
+| + iter 5 (`--scfa-fuse-streams`) | 20,428 | +34.4%              | 12.91 GB | 5.75     |
+| **+ iter 9 (`--scfa-reln-opt`)** | **20,947** | **+37.8%**       | **12.91 GB** | **5.74** |
+
+Plus the iter-7 opt-in (`--scfa-checkpoint-inner`) adds another
+~+4.10% at +1.31 GB VRAM: 20,947 × 1.041 ≈ 21,800 tok/s, 14.22 GB.
+

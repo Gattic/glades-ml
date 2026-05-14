@@ -79,6 +79,19 @@ bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
                           const float* gamma, const float* beta,
                           int T, int m, float eps);
 
+// ralph-loop iter 9 (2026-05-14): fused reln-forward + axpy-into-q for
+// CHIRON's per-layer-fuse path.  Replaces:
+//   chiron_reln_forward(p, p_norm, stats, gamma, beta, T, m, eps);
+//   axpy(alpha, p_norm, q, T*m);
+// with a single kernel that computes normalized p AND accumulates it into
+// q[i] += alpha · (gamma[i]·(p[i]-mu)/sigma + beta[i]).  Eliminates the
+// p_norm scratch round-trip (~128 MB per call at T=8192 m=2048).  Math is
+// bit-identical FP32 modulo sub-ULP FMA-ordering.  stats[T, 2] is written
+// in the same { mu, log(sigma) } format as chiron_reln_forward.
+bool chiron_reln_axpy_into_q(const float* p, float* q, float* stats,
+                              const float* gamma, const float* beta,
+                              float alpha, int T, int m, float eps);
+
 // Inverse: given q_out and the stats produced by the forward, recovers q_in.
 //   q_in[i] = sigma * (q_out[i] - beta[i]) / gamma[i] + mu
 // where sigma = exp(stats[t, 1]) and mu = stats[t, 0].
@@ -476,6 +489,9 @@ inline bool chiron_shear_sub(float*, const float*, int) { return false; }
 inline bool chiron_reln_forward(const float*, float*, float*,
                                  const float*, const float*,
                                  int, int, float) { return false; }
+inline bool chiron_reln_axpy_into_q(const float*, float*, float*,
+                                     const float*, const float*,
+                                     float, int, int, float) { return false; }
 inline bool chiron_reln_inverse(const float*, float*, const float*,
                                  const float*, const float*,
                                  int, int) { return false; }

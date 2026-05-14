@@ -267,8 +267,108 @@ bool chiron_reln_forward(const float* q_in, float* q_out, float* stats,
 	if (T <= 0 || m <= 0) return true;
 	int block = rowBlockSize(m);
 	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	// iter 9 (2026-05-14): in-place safe — kernel reads xRow then writes oRow
+	// per-element within a single thread iteration; if q_in == q_out the read
+	// precedes the write per address.  __syncthreads between passes ensures
+	// reductions complete before the normalize pass starts.  The 3-pass row
+	// pattern (mean → variance → normalize+affine) is bit-identical whether
+	// q_in == q_out or not.
 	chiron_reln_forward_rows<<<T, block, smemBytes, computeStream()>>>(
 		q_in, gamma, beta, eps, m, q_out, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
+//  2b. Fused reln-forward + axpy-into-q (ralph-loop iter 9, 2026-05-14).
+// ===========================================================================
+//
+// Replaces the 2-call pattern in CHIRON's per-layer-fuse path:
+//     chiron_reln_forward(p, p_norm, stats, gamma_p, beta_p, T, m, eps);
+//     axpy(alpha, p_norm, q, T*m);  // q += alpha · p_norm
+// with a single kernel that computes normalized p AND accumulates it into q
+// in one pass.  Eliminates the p_norm round-trip (1 write + 1 read of a
+// T·m FP32 buffer = ~128 MB per call at T=8192 m=2048).
+//
+// Math is bit-identical FP32 modulo associativity of the inner FMA
+// (alpha·(γ·(p-μ)/σ + β) is computed as one expression per element, so
+// the rounding may differ by 1 ULP from the two-call form — sub-ULP at
+// FP32 mantissa).
+//
+// Caller responsibility: alpha can be positive (forward q += α·reln(p))
+// or negative (backward step 2: q -= α·reln(p) ≡ q += (-α)·reln(p)).
+// stats[T, 2] is written exactly as chiron_reln_forward writes them.
+
+namespace {
+
+__global__ void chiron_reln_axpy_into_q_rows(const float* __restrict__ p,
+                                              const float* __restrict__ gamma,
+                                              const float* __restrict__ beta,
+                                              float alpha, float eps, int cols,
+                                              float* __restrict__ q,
+                                              float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	const float* xRow = p + (size_t)row * cols;
+	float*       qRow = q + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 1: mean of p.
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += xRow[i];
+	s = blockReduceSum(s, sSumA);
+	if (threadIdx.x == 0) sMean = s / (float)cols;
+	__syncthreads();
+
+	const float mu = sMean;
+
+	// Pass 2: variance of p.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = xRow[i] - mu;
+		v += d * d;
+	}
+	v = blockReduceSum(v, sSumB);
+
+	if (threadIdx.x == 0) {
+		float var = v / (float)cols + eps;
+		sSigma = sqrtf(var);
+	}
+	__syncthreads();
+
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+
+	// Pass 3: q[i] += alpha · (gamma[i] · (p[i] - mu) / sigma + beta[i]).
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p_norm_i = gamma[i] * (xRow[i] - mu) * inv_sigma + beta[i];
+		qRow[i] += alpha * p_norm_i;
+	}
+
+	// Stats: { mu, log(sigma) } for this row (same format as chiron_reln_forward).
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = logf(sigma);
+	}
+}
+
+} // anonymous namespace
+
+bool chiron_reln_axpy_into_q(const float* p, float* q, float* stats,
+                              const float* gamma, const float* beta,
+                              float alpha, int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	int block = rowBlockSize(m);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	chiron_reln_axpy_into_q_rows<<<T, block, smemBytes, computeStream()>>>(
+		p, gamma, beta, alpha, eps, m, q, stats);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
