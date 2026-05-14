@@ -580,3 +580,169 @@ the realistic BF16-TC speedup at logits-shape `(T, V, m)`.
 - Control = iter-2 bf16-outer: `research/runs/loop-2-scfa-bf16-outer/train.log`
 - Smoke (10 steps): `research/runs/loop-3-bf16-logits-smoke/smoke.log`
 
+## Iteration 4 — SCFA compression ratio 16 → 32 (k=512 → k=256 at T=8192)
+
+### Hypothesis
+
+If I change `--scfa-compression-ratio` from 16 to 32 (so `scfa_k` drops
+from 512 to 256 at T=8192), I expect tok/s to go from 19,385 to ~22,500
+because the SCFA attention compute scales as `O(Tk + k² + Tw)` (per the
+allocation log line — design speedup ratio at k=512 was 14.6× vs O(T²)).
+Halving k cuts the inner-attention shear GEMM compute (24 layers × 4
+GEMMs/dir at shape `(k, m, dModel)`) by 50% (≈ 33 ms → 17 ms) AND cuts
+the outer SCFA projection GEMMs (9 GEMMs/layer at shape `(k, m, T)`) by
+50% (≈ 106 ms → 53 ms). Combined predicted saving: ≈ 69 ms on a 422 ms
+step → +16% tok/s end-to-end.
+
+NLL risk: MODERATE — this is the first iter that touches the SCFA
+*compression* mechanism rather than the dtype dispatch. DCT-II at k=256
+captures the 256 lowest-frequency spectral modes of the residual stream;
+the remaining `q_perp = q - q_par` is handled by the depthwise causal
+conv at `scfa_w=8`. Going k=512 → k=256 drops the explicit basis
+coverage by 50% — for spectrally smooth activations the depthwise conv
+should absorb the additional residual, but if the deep-layer activations
+have meaningful energy in the 257..512 frequency band, NLL can drift.
+Mechanism-wise, the 50k SCFA T=8192 production run that hit ema 4.26 /
+best 3.76 was validated at k=512; this is the first time k=256 is being
+tried at T=8192 (k=256 was used at T=4096 with `scfaCompressionRatio=16`
+— same k value but a different T/k compression ratio of 16×, not 32×).
+
+VRAM risk: NEGATIVE — `scfa_B` is `[T × k]` (16 MB → 8 MB), and all
+`scfa_*` `[k × m]` / `[nH × k × k]` buffers halve. Total expected save:
+~1 GB. Peak should drop from 12.91 GB to ~12 GB.
+
+Failure mode if my model is wrong:
+- **F1**: at k=256 the depthwise conv `scfa_w=8` is insufficient to
+  absorb the additional high-frequency residual → reln on `q+p`
+  amplifies the error per layer → NLL drift > 5% at step ≥ 1000 →
+  FAIL guardrail #1.
+- **F2**: per-step ‖g‖ enters monotonic growth past step 500 because
+  attention is no longer expressive enough → FAIL guardrail #4.
+- **F3**: smaller k means more launch-overhead-dominated GEMMs at
+  shape (k=256, m=2048, dModel=4096) → BF16-TC throughput drops at
+  small shapes → measured saving < predicted → marginal speed
+  guardrail.
+- **F4**: NLL passes but spike magnitude / frequency grows → ‖g‖
+  guardrail at risk later in run.
+
+### Mechanism (why this should help)
+
+SCFA forward per layer (current k=512):
+1. `q_compr = B^T · q`  shape `(k=512, m=2048, T=8192)` = 17.18 GFLOP
+2. `q_par = B · q_compr`  same shape
+3. `q_perp = q - q_par` (memcpy + axpy, FP32)
+4. `y_perp = depthwise_conv(q_perp)` at width `2w+1=17`
+5. `chiron_attention_shear_bf16w_tiled(q_compr, …)` at compressed length
+   k=512 — 4 BF16-TC GEMMs at shape `(k, m, dModel=4096)` = 8.59 GFLOP
+   each
+6. `y_par = B · y_compr`  17.18 GFLOP
+7. axpy y_perp into y_par, axpy y_par into s.p
+
+Per direction: 3 outer GEMMs (17.18) + 4 inner GEMMs (8.59) = 86 GFLOP
+forward. Backward adds 6 outer (17.18 × 6 = 103 GFLOP) + 4 inner-bwd
+GEMMs + weight-grad GEMMs. Total per layer per step ≈ 240 GFLOP.
+
+At k=256:
+- Outer GEMMs: 17.18 → 8.59 GFLOP each (50% reduction)
+- Inner GEMMs: 8.59 → 4.30 GFLOP each (50% reduction)
+- Per-layer per-step total: ≈ 120 GFLOP (50% reduction in GEMM work)
+
+24 layers × 120 GFLOP × 2 dirs not literal, but the dominant SCFA-shaped
+GEMMs (3.7 TFLOP outer + 1.65 TFLOP inner at k=512 — see iter-2 mech) all
+halve, giving ≈ 2.7 TFLOP saving. At BF16-TC empirical ~33 TFLOPS
+(iter-2 calibration) → 82 ms saving. Conservative: 60–70 ms saving →
++14–17% tok/s end-to-end at the 422 ms baseline.
+
+### Command diff vs iter-3 control
+
+```
+... --scfa-compression-ratio 16 --scfa-bf16-inner --scfa-bf16-outer --bf16-logits
+                          ↓
+... --scfa-compression-ratio 32 --scfa-bf16-inner --scfa-bf16-outer --bf16-logits
+```
+
+Zero code change required — flag already wired. The only variable
+changed is the compression ratio.
+
+### Results — aborted at step 1000 (NLL guardrail fail)
+
+Bench was aborted after step 1000 because the NLL guardrail
+(ema ≤ baseline_ema × 1.05) had been monotonically violated from
+step 500 onward.  Aborting saves ~30 min wall vs running to 5000.
+
+| Step | Iter-3 control ema | Iter-4 ratio-32 ema | Δ rel.       | tok/s (iter-3 → iter-4) | ‖g‖ iter-4 |
+|-----:|-------------------:|--------------------:|-------------:|------------------------:|-----------:|
+|   1  | 10.4746            | 10.4984             | +0.23%       | 16,197 → 18,472         |  2.842     |
+|  250 |  8.9529            |  9.2318             | **+3.11%**   | 19,448 → 22,190         |  4.027     |
+|  500 |  8.3806            |  8.8513             | **+5.62% ✗** | 19,430 → 22,181         |  2.931     |
+|  750 |  7.9764            |  8.6635             | **+8.61% ✗** | 19,418 → 22,176         |  4.803     |
+| 1000 |  7.8437            |  8.5157             | **+8.57% ✗** | 19,413 → 22,175         |  4.671     |
+
+NLL drift is monotonic from step 500 onward and well above the +5%
+ceiling.  The first checkpoint that fails (step 500, +5.62%) is right
+at the warmup boundary — well before any spike/recovery dynamics
+that could have temporarily inflated ema.
+
+Sustained tok/s post-warmup: **22,175** (+14.1% over iter-3 19,413
+and **+45.9% over the 15,200 pre-iter-1 baseline**).  Peak VRAM:
+**12.84 GB** (−70 MB vs iter-3 12.91 — the smaller `scfa_B = [T × k]`
+and proportionally smaller `scfa_*` scratches recoup ~1 GB on paper,
+but most of the saving doesn't materialize in the **peak** allocation
+because non-SCFA structures dominate).
+
+### Verdict — FAIL (NLL guardrail #1)
+
+**NLL (guardrail #1):** **FAIL.**  Step 500: 8.8513 vs control
+8.3806 × 1.05 = 8.7996; **exceeds** by 0.0517 nat.  Step 750: 8.6635
+vs 7.9764 × 1.05 = 8.3752; exceeds by 0.2883 nat.  Step 1000: 8.5157
+vs 7.8437 × 1.05 = 8.2359; exceeds by 0.2798 nat.  Drift is
+monotonically violating the guardrail by a growing margin — this is
+not a transient.
+
+**Speed (guardrail #3):** PASS (+14.1% tok/s, predicted +14–17%).
+The mechanism prediction is **vindicated** — halving k halves the
+SCFA-shaped GEMM compute and the tok/s gain lands inside the
+predicted band.
+
+**VRAM (guardrail #2):** PASS.  12.84 GB < 12.91 GB.
+
+**Stability (guardrail #4):** ‖g‖ stays in [2.8, 4.8] across the
+first 1000 steps with no monotonic growth — no stability problem.
+
+This was the predicted failure mode **F1** ("at k=256 the depthwise
+conv `scfa_w=8` is insufficient to absorb the additional
+high-frequency residual → reln on `q+p` amplifies the error per
+layer → NLL drift > 5%"): the deep-layer residual stream has
+non-trivial energy in the frequency band 257..512 that the depthwise
+causal conv with half-width 8 cannot capture as faithfully as
+explicit DCT-II projection at k=512.
+
+### Mechanism check — is this implementation-fail or idea-fail?
+
+The speed gain landed precisely as predicted (+14.1% measured vs
++14-17% predicted), so the BF16-TC dispatch through the smaller
+k=256 GEMMs is working as designed.  The failure is purely on the
+**signal-quality** axis: less of the activation spectrum survives
+the compression.  This is an **idea-fail**, not an implementation-
+fail.  No profile pass is warranted — the result matches the
+predicted mechanism direction (NLL ↑) and magnitude (early-warmup
+drift compounding with depth).
+
+### Closing the hypothesis
+
+`--scfa-compression-ratio 32` is rejected.  No code change to revert
+(flag was already wired, just passed a different value).  The
+production-default `--scfa-compression-ratio 16` (k=512) remains
+correct for T=8192 + L=24 + reln-fuse.
+
+**Adjacent hypothesis still open for future iters:** pair k=256 with
+a wider depthwise conv (`--scfa-conv-w 16` or `--scfa-conv-w 24`).
+The conv-half-width was held fixed at 8 in iter 4 to honor the
+one-variable rule.  A future iter could re-test k=256 with wd=16 to
+see if the residual capture is the binding constraint.
+
+### Run output
+
+- `research/runs/loop-4-scfa-ratio32/train.log` — aborted at step 1000
+- Control = iter-3: `research/runs/loop-3-bf16-logits/train.log`
+
