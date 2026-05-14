@@ -12,3 +12,15 @@ alpaca.key
 .codex
 logs/
 artifacts/
+
+# Training run output: large logs and model checkpoints.  Specific
+# benches we want in git (e.g. the ralph-loop iter dirs referenced in
+# research/LOOP_RESULTS_2026_05_13.md) are committed explicitly with
+# `git add -f research/runs/loop-N-…/train.log`; gitignore only affects
+# files that are not already tracked.
+research/runs/
+
+# Session-local prompts and handoff notes (user working state, not
+# project artifacts).
+ralph.txt
+handoffs/
