@@ -13,6 +13,7 @@
 #ifdef GLADES_HAVE_CUDA
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cstdio>
 #include <cfloat>
 #include <cmath>
@@ -2653,6 +2654,246 @@ bool argmax_count_matches(const float* probs, const int* targets,
         probs, targets, T, vocabSize, padToken, correct_count, valid_count);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+// ===========================================================================
+//  15e2. BF16-storage variants for the readout loss path (ralph-loop iter 10)
+// ===========================================================================
+//
+// --bf16-logits-storage routes the three T·V buffers (logits, probs, dlogits)
+// as BF16 (uint16_t) rather than FP32.  At T=16384 V=32000 this saves
+// 3 × 2 GB = 6 GB → 3 × 1 GB = 3 GB, unlocking T=16384 on 16 GB hardware.
+//
+// All BF16 storage kernels cast to FP32 on load, do math in FP32, cast back
+// on store (RNE rounding via __float2bfloat16).  Probs precision is the
+// concern — softmax outputs sum to 1.0f, so each prob is in [0, 1] and the
+// BF16 mantissa floor at ~3.9e-3 means values below that round to 0.  NLL
+// loss already floors at 1e-12 (CE_KERNEL above) — the BF16 path applies
+// the same floor AFTER cast, so the masking is identical.
+
+namespace {
+
+__device__ __forceinline__ float bf16_load(unsigned short bits)
+{
+	return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&bits));
+}
+
+__device__ __forceinline__ unsigned short bf16_store(float val)
+{
+	__nv_bfloat16 b = __float2bfloat16(val);
+	return *reinterpret_cast<unsigned short*>(&b);
+}
+
+// BF16-in / BF16-out softmax.  3 passes per row: (1) max over BF16-loaded
+// values, (2) sum of exp(x - max), (3) store exp(x - max) / sum as BF16.
+// Pass 3 recomputes exp (vs the FP32 path's "store intermediate exp" trick)
+// to avoid a BF16 round-trip on the intermediate exp.  Bandwidth identical
+// because the BF16 output is half the bytes of FP32 output.
+__global__ void softmax_stable_rows_bf16(const unsigned short* __restrict__ xb,
+                                          int cols,
+                                          unsigned short* __restrict__ ob)
+{
+	int row = blockIdx.x;
+	const unsigned short* xRow = xb + (size_t)row * cols;
+	unsigned short*       oRow = ob + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sMax = smem;
+	float* sSum = smem + (blockDim.x / 32 + 1);
+
+	float localMax = -FLT_MAX;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localMax = fmaxf(localMax, bf16_load(xRow[i]));
+	localMax = blockReduceMax(localMax, sMax);
+
+	__shared__ float sRowMax;
+	if (threadIdx.x == 0) sRowMax = localMax;
+	__syncthreads();
+	float rowMax = sRowMax;
+
+	float localSum = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		localSum += expf(bf16_load(xRow[i]) - rowMax);
+	localSum = blockReduceSum(localSum, sSum);
+
+	__shared__ float sRowSum;
+	if (threadIdx.x == 0) sRowSum = localSum;
+	__syncthreads();
+	float invSum = 1.0f / sRowSum;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = bf16_store(expf(bf16_load(xRow[i]) - rowMax) * invSum);
+}
+
+__global__ void softmax_cross_entropy_backward_bf16(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    int cols,
+    unsigned short* __restrict__ dlogits)
+{
+	int row = blockIdx.x;
+	int target = targets[row];
+	const unsigned short* pRow = probs   + (size_t)row * cols;
+	unsigned short*       dRow = dlogits + (size_t)row * cols;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+	{
+		float p = bf16_load(pRow[i]);
+		float v = (i == target) ? (p - 1.0f) : p;
+		dRow[i] = bf16_store(v);
+	}
+}
+
+__global__ void scale_array_bf16_kernel(unsigned short* __restrict__ x,
+                                         float scale, int n)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < n) x[idx] = bf16_store(bf16_load(x[idx]) * scale);
+}
+
+__global__ void cross_entropy_nll_bf16_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    int T, int vocabSize, int padToken,
+    float* __restrict__ loss_sum,
+    int* __restrict__ valid_count)
+{
+	extern __shared__ float smem[];
+	float* sLoss = smem;
+
+	float localLoss = 0.0f;
+	int localCount = 0;
+	for (int t = threadIdx.x; t < T; t += blockDim.x)
+	{
+		int tgt = targets[t];
+		if (padToken >= 0 && tgt == padToken) continue;
+		if (tgt < 0 || tgt >= vocabSize) continue;
+		float p = bf16_load(probs[(size_t)t * vocabSize + tgt]);
+		if (p < 1e-12f) p = 1e-12f;
+		localLoss += -logf(p);
+		++localCount;
+	}
+
+	localLoss = blockReduceSum(localLoss, sLoss);
+	if (threadIdx.x == 0)
+		atomicAdd(loss_sum, localLoss);
+
+	__syncthreads();
+	float countF = (float)localCount;
+	countF = blockReduceSum(countF, sLoss);
+	if (threadIdx.x == 0)
+		atomicAdd(valid_count, (int)countF);
+}
+
+__global__ void argmax_count_bf16_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    int T, int vocabSize, int padToken,
+    int* __restrict__ correct_count,
+    int* __restrict__ valid_count)
+{
+	extern __shared__ float smem[];
+
+	int localCorrect = 0;
+	int localValid = 0;
+	for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < T;
+	     t += blockDim.x * gridDim.x)
+	{
+		int tgt = targets[t];
+		if (padToken >= 0 && tgt == padToken) continue;
+		if (tgt < 0 || tgt >= vocabSize) continue;
+		++localValid;
+
+		const unsigned short* row = probs + (size_t)t * vocabSize;
+		int bestIdx = 0;
+		float bestVal = bf16_load(row[0]);
+		for (int v = 1; v < vocabSize; ++v)
+		{
+			float pv = bf16_load(row[v]);
+			if (pv > bestVal) { bestVal = pv; bestIdx = v; }
+		}
+		if (bestIdx == tgt) ++localCorrect;
+	}
+
+	float correctF = (float)localCorrect;
+	correctF = blockReduceSum(correctF, smem);
+	if (threadIdx.x == 0) atomicAdd(correct_count, (int)correctF);
+
+	__syncthreads();
+	float validF = (float)localValid;
+	validF = blockReduceSum(validF, smem);
+	if (threadIdx.x == 0) atomicAdd(valid_count, (int)validF);
+}
+
+} // anonymous namespace
+
+bool softmax_forward_bf16(const unsigned short* x, int rows, int cols,
+                           unsigned short* out)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	softmax_stable_rows_bf16<<<rows, block, smemBytes, computeStream()>>>(x, cols, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool softmax_cross_entropy_bwd_bf16(const unsigned short* probs,
+                                     const int* targets,
+                                     int rows, int cols,
+                                     unsigned short* dlogits)
+{
+	if (rows <= 0 || cols <= 0) return true;
+	int block = rowBlockSize(cols);
+	softmax_cross_entropy_backward_bf16<<<rows, block, 0, computeStream()>>>(
+	    probs, targets, cols, dlogits);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool scale_array_bf16(unsigned short* x, float scale, int n)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	scale_array_bf16_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, scale, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
+                                  const int* targets,
+                                  int T, int vocabSize, int padToken,
+                                  float* loss_sum, int* valid_count)
+{
+	if (T <= 0 || vocabSize <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemset(loss_sum, 0, sizeof(float)));
+	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	int block = 256;
+	int grid = 1;
+	if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
+	int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
+	cross_entropy_nll_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, loss_sum, valid_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool argmax_count_matches_bf16(const unsigned short* probs,
+                                const int* targets,
+                                int T, int vocabSize, int padToken,
+                                int* correct_count, int* valid_count)
+{
+	if (T <= 0 || vocabSize <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemset(correct_count, 0, sizeof(int)));
+	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
+	int block = 128;
+	int grid = (T + block - 1) / block;
+	if (grid > 128) grid = 128;
+	int smemBytes = (block / 32 + 1) * sizeof(float);
+	argmax_count_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, correct_count, valid_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
 }
 
 // ===========================================================================

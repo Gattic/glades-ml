@@ -53,6 +53,27 @@ bool softmax_forward(const float* x, int rows, int cols, float* out);
 bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
                                int rows, int cols, float* dlogits);
 
+// ralph-loop iter 10 (2026-05-14) BF16-storage variants — backing the
+// --bf16-logits-storage flag.  Same math as the FP32 paths, BF16 on
+// load/store (uint16_t bit-pattern), FP32 in registers.  Used to
+// materialize (T × V) logits/probs/dlogits in BF16 so T=16384 fits on
+// 16 GB hardware (saves 3 × 2 GB = 3 GB net).
+bool softmax_forward_bf16(const unsigned short* x, int rows, int cols,
+                           unsigned short* out);
+bool softmax_cross_entropy_bwd_bf16(const unsigned short* probs,
+                                     const int* targets,
+                                     int rows, int cols,
+                                     unsigned short* dlogits);
+bool scale_array_bf16(unsigned short* x, float scale, int n);
+bool cross_entropy_nll_loss_bf16(const unsigned short* probs,
+                                  const int* targets,
+                                  int T, int vocabSize, int padToken,
+                                  float* loss_sum, int* valid_count);
+bool argmax_count_matches_bf16(const unsigned short* probs,
+                                const int* targets,
+                                int T, int vocabSize, int padToken,
+                                int* correct_count, int* valid_count);
+
 // Paradigm shift #56 DISTILL-FORWARD — combined KL + CE backward:
 //   dlogits = probs_student - alpha · probs_teacher - (1 - alpha) · one_hot(targets)
 // Teacher distribution is frozen (no grad).
@@ -839,6 +860,11 @@ inline bool rmsnorm_backward(const float*, const float*, const float*, const flo
 
 inline bool softmax_forward(const float*, int, int, float*) { return false; }
 inline bool softmax_cross_entropy_bwd(const float*, const int*, int, int, float*) { return false; }
+inline bool softmax_forward_bf16(const unsigned short*, int, int, unsigned short*) { return false; }
+inline bool softmax_cross_entropy_bwd_bf16(const unsigned short*, const int*, int, int, unsigned short*) { return false; }
+inline bool scale_array_bf16(unsigned short*, float, int) { return false; }
+inline bool cross_entropy_nll_loss_bf16(const unsigned short*, const int*, int, int, int, float*, int*) { return false; }
+inline bool argmax_count_matches_bf16(const unsigned short*, const int*, int, int, int, int*, int*) { return false; }
 inline bool distill_combined_bwd(const float*, const float*, const int*, int, int, float, float*) { return false; }
 inline bool distill_combined_loss(const float*, const float*, const int*, int, int, int, float, float*, int*) { return false; }
 inline bool orion_proj_left(const void*, const float*, int, int, float*) { return false; }

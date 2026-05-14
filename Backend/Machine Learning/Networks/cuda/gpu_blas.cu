@@ -1186,6 +1186,41 @@ bool sgemm_rowmajor_fast16bf_side(int M, int N, int K,
 // result — removed.  Stiefel Phase 2f uses a persistent FP32 cache on the
 // GpuStiefelWeight struct instead, refreshed once per Adam step.
 
+// ralph-loop iter 10 (2026-05-14): BF16-in / BF16-out ABT GEMM.  cuBLAS
+// rejects FP32-in / BF16-out with CUBLAS_COMPUTE_32F_FAST_16BF (returns
+// CUBLAS_STATUS_NOT_SUPPORTED = 15).  Workaround: pre-cast both inputs to
+// BF16 (the E_bf_cache and q_L_bf scratches that backward already needs are
+// reused so no new allocations).  FP32 accumulate via BF16-TC, BF16 store
+// with RNE rounding.  This is the linchpin of --bf16-logits-storage:
+// materializes the (T × V) readout logits tensor in BF16 from the start.
+bool sgemm_rowmajor_abt_bf16_bf16out(int M, int N, int K,
+                                      float alpha,
+                                      const unsigned short* A, int lda,
+                                      const unsigned short* B, int ldb,
+                                      float beta,
+                                      unsigned short* C, int ldc)
+{
+	if (!g_initialized && !blasInit()) return false;
+	cublasStatus_t st = cublasGemmEx(g_handle,
+	                                 CUBLAS_OP_T, CUBLAS_OP_N,
+	                                 N, M, K,
+	                                 &alpha,
+	                                 B, CUDA_R_16BF, ldb,
+	                                 A, CUDA_R_16BF, lda,
+	                                 &beta,
+	                                 C, CUDA_R_16BF, ldc,
+	                                 CUBLAS_COMPUTE_32F_FAST_16BF,
+	                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] cublasGemmEx(BF16,ABT,BF16out) "
+		                "failed: %d (M=%d N=%d K=%d)\n",
+		        static_cast<int>(st), M, N, K);
+		return false;
+	}
+	return true;
+}
+
 // === Batched-strided BF16 GEMMs (attention path) ===
 //
 // Mirrors the FP32 batched-strided variants but uses

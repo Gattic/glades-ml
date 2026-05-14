@@ -184,6 +184,23 @@ bool sgemm_rowmajor_fast16bf_side(int M, int N, int K,
                                    float beta,
                                    float* C, int ldc);
 
+// ralph-loop iter 10 (2026-05-14): BF16-in, BF16-out ABT GEMM.
+// cuBLAS does not support BF16 output with FP32 inputs through
+// CUBLAS_COMPUTE_32F_FAST_16BF (returns CUBLAS_STATUS_NOT_SUPPORTED).
+// Workaround: cast both inputs to BF16 upfront (reusing the E_bf_cache and
+// q_L_bf scratches that backward already needs), then call this wrapper
+// which uses CUDA_R_16BF in/out with CUBLAS_COMPUTE_32F_FAST_16BF compute.
+// FP32 accumulate, BF16 store with RNE rounding.  Numerical envelope
+// identical to the FP32-in / FP32-out FAST_16BF path plus the C-side BF16
+// cast.  Used by --bf16-logits-storage forward readout to write the
+// (T × V) logits tensor in BF16 directly.
+bool sgemm_rowmajor_abt_bf16_bf16out(int M, int N, int K,
+                                      float alpha,
+                                      const unsigned short* A, int lda,
+                                      const unsigned short* B, int ldb,
+                                      float beta,
+                                      unsigned short* C, int ldc);
+
 // NOTE: Mixed-precision FP32×BF16→FP32 wrappers were explored for Phase 2f
 // but cuBLAS (through at least CUDA 12.x) doesn't support mixed input types
 // to cublasGemmEx — both A and B must match.  Stiefel Phase 2f instead
@@ -375,6 +392,7 @@ inline bool sgemm_rowmajor_atb_fast16bf(int, int, int, float, const float*, int,
 inline bool sgemm_rowmajor_abt_fast16bf(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_atb_fast16bf_side(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
 inline bool sgemm_rowmajor_fast16bf_side(int, int, int, float, const float*, int, const float*, int, float, float*, int) { return false; }
+inline bool sgemm_rowmajor_abt_bf16_bf16out(int, int, int, float, const unsigned short*, int, const unsigned short*, int, float, unsigned short*, int) { return false; }
 inline void set_tf32_enabled(bool) {}
 inline bool get_tf32_enabled() { return false; }
 inline bool sgemv_rowmajor(int, int, float, const float*, int, const float*, float, float*) { return false; }
