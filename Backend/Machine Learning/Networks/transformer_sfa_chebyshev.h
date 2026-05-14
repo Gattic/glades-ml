@@ -1,0 +1,312 @@
+// SFA Chebyshev solver — applies (L_F + lambda*I)^{-1} or exp(-tau*L_F) to a
+// source vector via M-degree Chebyshev polynomial recurrence on the sheaf
+// Laplacian, with optional diagonal-Jacobi preconditioning.
+//
+// Paradigm #250 from research/PARADIGM_SHIFT_250_DESIGN.md §5.
+// Theoretical analysis in research/PARADIGM_SHIFT_250_PROOFS.md §3.
+//
+// Theorem 3 (info-loss bound, iter 2 §3) shows that without preconditioning,
+// L_F's condition number κ = (μ_max + λ) / λ = O(10^6) and Chebyshev M=8
+// gives ε ≈ 0.98 — insufficient. With diagonal-Jacobi preconditioning,
+// κ reduces to ~30, and M=8 gives ε ≈ 0.055 — borderline acceptable.
+// M=16 gives ε ≈ 3e-3 — solid.
+//
+// This is a CPU prototype. GPU port will use cuBLAS for the inner GEMV and
+// fuse the recurrence steps per ATLAS-COMPILE (paradigm #51).
+//
+// Conventions match transformer_sfa_ops.h.
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+#include "transformer_sfa_ops.h"
+
+namespace glades
+{
+namespace transformer_sfa_chebyshev
+{
+
+using transformer_sfa_ops::SFAParams;
+using transformer_sfa_ops::laplacianMatvec;
+
+// Compute the block-Jacobi preconditioner D_F (the block-diagonal of L_F).
+//
+// For SFA: [L_F]_{ii} = sum over edges incident to i of R^T R contributions.
+// We approximate D_F by its scalar trace per token: D_F_ii ≈ (deg_i + sum_j ||Sigma||^2).
+//
+// Returns inv_diag[T] where inv_diag[i] = 1 / D_F_ii (clamped to [1e-3, 1e3] for stability).
+inline void computeJacobiPreconditioner(const SFAParams& p,
+                                         std::vector<float>& inv_diag)
+{
+	const int T = p.T;
+	const int r = p.r;
+	const int E = static_cast<int>(p.edge_src.size());
+
+	std::vector<float> diag(T, 0.0f);
+	std::vector<int> deg_in(T, 0);
+	std::vector<int> deg_out(T, 0);
+
+	for (int e = 0; e < E; ++e)
+	{
+		const int i = p.edge_src[e];
+		const int j = p.edge_tgt[e];
+		deg_out[i]++;
+		deg_in[j]++;
+
+		// Sigma^2 contribution: each diagonal entry's square sums into D_F_ii.
+		const float* Sigma_e = &p.Sigma[static_cast<size_t>(e) * r];
+		float sigma_sq = 0.0f;
+		for (int beta = 0; beta < r; ++beta)
+		{
+			sigma_sq += Sigma_e[beta] * Sigma_e[beta];
+		}
+		diag[i] += sigma_sq;  // R_{j<-i}^T R_{j<-i} contributes to ii block
+	}
+
+	// Add deg-I contribution (each edge incident to i adds I_{d_s} ≈ scalar 1).
+	for (int i = 0; i < T; ++i)
+	{
+		diag[i] += static_cast<float>(deg_in[i] + deg_out[i]);
+	}
+
+	// Invert with stability clamping.
+	inv_diag.resize(T);
+	for (int i = 0; i < T; ++i)
+	{
+		const float d = std::max(diag[i] + 1e-3f, 1e-3f);
+		inv_diag[i] = 1.0f / std::min(d, 1e3f);
+	}
+}
+
+// Apply preconditioner D_F^{-1} to a section s (scalar-per-token).
+inline void applyPreconditioner(const SFAParams& p,
+                                 const std::vector<float>& inv_diag,
+                                 float* s)
+{
+	const int T = p.T;
+	const int d_s = p.d_s;
+	for (int i = 0; i < T; ++i)
+	{
+		const float scale = inv_diag[i];
+		float* s_i = &s[static_cast<size_t>(i) * d_s];
+		for (int a = 0; a < d_s; ++a)
+		{
+			s_i[a] *= scale;
+		}
+	}
+}
+
+// Estimate mu_max of the preconditioned operator D_F^{-1} L_F via power iteration.
+inline float estimatePreconditionedMuMax(const SFAParams& p,
+                                          const std::vector<float>& inv_diag,
+                                          int n_iters,
+                                          unsigned int seed)
+{
+	const int Tds = p.T * p.d_s;
+	std::vector<float> v(Tds);
+	std::vector<float> Lv(Tds);
+
+	unsigned int state = seed ? seed : 0xC0FFEEu;
+	for (int k = 0; k < Tds; ++k)
+	{
+		state = state * 1664525u + 1013904223u;
+		v[k] = ((state >> 16) & 0xFFFFu) / 65535.0f - 0.5f;
+	}
+
+	float norm = 0.0f;
+	for (int k = 0; k < Tds; ++k)
+		norm += v[k] * v[k];
+	norm = std::sqrt(norm);
+	const float inv_norm = 1.0f / std::max(norm, 1e-12f);
+	for (int k = 0; k < Tds; ++k)
+		v[k] *= inv_norm;
+
+	float lambda_est = 0.0f;
+	for (int it = 0; it < n_iters; ++it)
+	{
+		// Lv = L_F v, then Lv = D_F^{-1} Lv
+		laplacianMatvec(p, &v[0], &Lv[0]);
+		applyPreconditioner(p, inv_diag, &Lv[0]);
+
+		float dot = 0.0f;
+		float Lnorm = 0.0f;
+		for (int k = 0; k < Tds; ++k)
+		{
+			dot += v[k] * Lv[k];
+			Lnorm += Lv[k] * Lv[k];
+		}
+		Lnorm = std::sqrt(Lnorm);
+		lambda_est = dot;
+		const float inv2 = 1.0f / std::max(Lnorm, 1e-12f);
+		for (int k = 0; k < Tds; ++k)
+			v[k] = Lv[k] * inv2;
+	}
+
+	return lambda_est * 1.10f;
+}
+
+// Chebyshev coefficients for f(x) = 1 / (mu_max * 0.5*(x + 1) + lambda) on x in [-1, 1].
+// I.e., we map L_F → A = 2/mu_max * L_F - I so A has eigenvalues in [-1, 1] approximately
+// (assuming L_F's spectrum is in [0, mu_max] after preconditioning).
+//
+// Coefficients computed via the Chebyshev-T inner product:
+//   c_n = (2/π) ∫_{-1}^{1} f(x) T_n(x) / sqrt(1 - x^2) dx
+// approximated by Chebyshev nodes (Clenshaw-Curtis quadrature).
+inline void computeChebyshevCoeffs(float mu_max, float lambda,
+                                    int M,
+                                    std::vector<float>& coeffs)
+{
+	coeffs.assign(M, 0.0f);
+	const int N_quad = 4 * M;  // Quadrature points for accurate inner product.
+	const float pi = 3.14159265358979323846f;
+
+	// Chebyshev-T nodes: x_k = cos((2k+1) π / 2N), k=0..N-1.
+	for (int n = 0; n < M; ++n)
+	{
+		double sum = 0.0;
+		for (int k = 0; k < N_quad; ++k)
+		{
+			const double theta = (2 * k + 1) * pi / (2 * N_quad);
+			const double x = std::cos(theta);
+			const double T_n = std::cos(n * theta);
+			// Map x ∈ [-1, 1] back to the original L_F-spectrum: mu = mu_max * 0.5 * (x + 1).
+			const double mu = static_cast<double>(mu_max) * 0.5 * (x + 1.0);
+			const double f = 1.0 / (mu + static_cast<double>(lambda));
+			sum += f * T_n;
+		}
+		// Standard Chebyshev coefficient normalisation.
+		const double norm = (n == 0) ? 1.0 / static_cast<double>(N_quad)
+		                              : 2.0 / static_cast<double>(N_quad);
+		coeffs[n] = static_cast<float>(sum * norm);
+	}
+}
+
+// Solve (L_F + lambda*I) s = b using M-degree Chebyshev approximation of
+// the Tikhonov-regularised inverse, with optional diagonal-Jacobi preconditioning.
+//
+// Algorithm:
+//   1. Optionally precondition: solve (D_F^{-1} L_F + lambda*D_F^{-1}) s' = D_F^{-1} b.
+//      Approximate diag-only Jacobi: replace by (P^{-1/2} L_F P^{-1/2}) s'' = P^{-1/2} b,
+//      then s = P^{-1/2} s''. CPU prototype uses simpler asymmetric form:
+//      apply D_F^{-1} only to b.
+//   2. Map: A = 2/mu_max * L_F - I, so spec(A) ⊆ [-1, 1] approximately.
+//   3. Chebyshev recurrence:
+//      w_0 = b'
+//      w_1 = A w_0
+//      w_n = 2 A w_{n-1} - w_{n-2}    for n >= 2
+//      s = sum_n coeffs[n] * w_n
+//
+// Cost: M matvecs (each O(|E| * d_s * r)) + M axpy (each O(T * d_s)).
+//
+// Result placed in `result`.
+inline void solveTikhonov(const SFAParams& p,
+                           const float* b,
+                           int M,
+                           bool use_preconditioner,
+                           float* result)
+{
+	const int T = p.T;
+	const int d_s = p.d_s;
+	const int Tds = T * d_s;
+
+	// Step 1: preconditioning.
+	std::vector<float> inv_diag;
+	std::vector<float> b_precond(Tds);
+	if (use_preconditioner)
+	{
+		computeJacobiPreconditioner(p, inv_diag);
+		std::memcpy(&b_precond[0], b, sizeof(float) * Tds);
+		applyPreconditioner(p, inv_diag, &b_precond[0]);
+	}
+	const float* b_eff = use_preconditioner ? &b_precond[0] : b;
+
+	// Step 2: estimate mu_max (preconditioned spectrum).
+	float mu_max;
+	if (use_preconditioner)
+		mu_max = estimatePreconditionedMuMax(p, inv_diag, 2, 0xC0FFEEu);
+	else
+		mu_max = transformer_sfa_ops::estimateMuMax(p, 2, 0xC0FFEEu);
+	mu_max = std::max(mu_max, 1e-3f);
+
+	// Step 3: Chebyshev coefficients.
+	std::vector<float> coeffs;
+	computeChebyshevCoeffs(mu_max, p.lambda, M, coeffs);
+
+	// Step 4: recurrence.
+	std::vector<float> w_prev(Tds);   // w_{n-1}
+	std::vector<float> w_curr(Tds);   // w_n
+	std::vector<float> tmp(Tds);
+
+	std::memset(result, 0, sizeof(float) * Tds);
+
+	// w_0 = b_eff, accumulate coeffs[0] * w_0
+	std::memcpy(&w_prev[0], b_eff, sizeof(float) * Tds);
+	for (int k = 0; k < Tds; ++k)
+		result[k] += coeffs[0] * w_prev[k];
+
+	if (M >= 2)
+	{
+		// w_1 = A w_0
+		auto apply_A = [&](const float* in, float* out)
+		{
+			// out = L_F in
+			laplacianMatvec(p, in, &tmp[0]);
+			if (use_preconditioner)
+				applyPreconditioner(p, inv_diag, &tmp[0]);
+			// out = (2/mu_max) tmp - in
+			const float two_over_mu = 2.0f / mu_max;
+			for (int k = 0; k < Tds; ++k)
+				out[k] = two_over_mu * tmp[k] - in[k];
+		};
+
+		apply_A(&w_prev[0], &w_curr[0]);
+		for (int k = 0; k < Tds; ++k)
+			result[k] += coeffs[1] * w_curr[k];
+
+		// w_n = 2 A w_{n-1} - w_{n-2} for n=2..M-1
+		std::vector<float> w_next(Tds);
+		for (int n = 2; n < M; ++n)
+		{
+			apply_A(&w_curr[0], &w_next[0]);
+			for (int k = 0; k < Tds; ++k)
+				w_next[k] = 2.0f * w_next[k] - w_prev[k];
+			for (int k = 0; k < Tds; ++k)
+				result[k] += coeffs[n] * w_next[k];
+
+			// rotate buffers
+			std::swap(w_prev, w_curr);
+			std::swap(w_curr, w_next);
+		}
+	}
+}
+
+// Compute the residual ||r|| / ||b|| for diagnostic / Probe D purposes.
+//   r = (L_F + lambda * I) s - b
+inline float residualNorm(const SFAParams& p,
+                           const float* b,
+                           const float* s)
+{
+	const int T = p.T;
+	const int d_s = p.d_s;
+	const int Tds = T * d_s;
+
+	std::vector<float> Ls(Tds);
+	laplacianMatvec(p, s, &Ls[0]);
+
+	float r_norm = 0.0f;
+	float b_norm = 0.0f;
+	for (int k = 0; k < Tds; ++k)
+	{
+		const float r = Ls[k] + p.lambda * s[k] - b[k];
+		r_norm += r * r;
+		b_norm += b[k] * b[k];
+	}
+	r_norm = std::sqrt(r_norm);
+	b_norm = std::sqrt(b_norm);
+	return r_norm / std::max(b_norm, 1e-12f);
+}
+
+}  // namespace transformer_sfa_chebyshev
+}  // namespace glades
