@@ -19,6 +19,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <vector>
 
 namespace glades {
 namespace gpu {
@@ -296,6 +297,179 @@ bool sfa_readout_fp32(const float* P_o,
 	sfa_readout_kernel<<<T, block, 0, s_use>>>(P_o, s, y, T, d_s, d_h);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
+}
+
+// ===========================================================================
+//  CSR-format L_F matvec — deterministic, atomic-free, faster.
+// ===========================================================================
+namespace {
+
+// Per-vertex L_F kernel. One block per vertex; threads loop over the d_s
+// output components for that vertex.
+//
+// Each output entry out[i*d_s + a] accumulates:
+//   sum over INCOMING edges e=(j,i):  (s_i[a] - R_{i<-j} s_j)[a]
+//                                       = s_i[a] - (U_i (Sigma_e * (U_j^T s_j)))[a]
+//   sum over OUTGOING edges e=(i,j):  -(R_{j<-i}^T (s_j - R_{j<-i} s_i))[a]
+//
+// For determinism, we iterate edges in CSR order (fixed at build time).
+__global__ void sfa_laplacian_csr_kernel(const float* __restrict__ U,
+                                          const float* __restrict__ Sigma,
+                                          const int*   __restrict__ edge_src,
+                                          const int*   __restrict__ edge_tgt,
+                                          const int*   __restrict__ out_csr_off,
+                                          const int*   __restrict__ out_csr_edges,
+                                          const int*   __restrict__ in_csr_off,
+                                          const int*   __restrict__ in_csr_edges,
+                                          const float* __restrict__ s,
+                                          float*       __restrict__ out,
+                                          int T, int d_s, int r)
+{
+	const int i = blockIdx.x;          // one block per vertex i
+	if (i >= T) return;
+	const int a = threadIdx.x;         // one thread per stalk component
+	if (a >= d_s) return;
+
+	const float* Ui  = U + (size_t)i * d_s * r;
+	const float* s_i = s + (size_t)i * d_s;
+	float acc = 0.0f;
+
+	// ====== Incoming edges (i is tgt; e = (j, i)) ======
+	const int in_start = in_csr_off[i];
+	const int in_end   = in_csr_off[i + 1];
+	for (int k = in_start; k < in_end; ++k)
+	{
+		const int e = in_csr_edges[k];
+		const int j = edge_src[e];
+		const float* Uj    = U + (size_t)j * d_s * r;
+		const float* Sig_e = Sigma + (size_t)e * r;
+		const float* s_j   = s + (size_t)j * d_s;
+
+		// R_{i<-j} s_j = U_i (Sigma_e * (U_j^T s_j)).
+		// Compute U_j^T s_j once via shared memory? For now per-thread sum.
+		float Rs_a = 0.0f;
+		for (int beta = 0; beta < r; ++beta)
+		{
+			float inner = 0.0f;
+			for (int aa = 0; aa < d_s; ++aa)
+				inner += Uj[aa * r + beta] * s_j[aa];
+			Rs_a += Ui[a * r + beta] * Sig_e[beta] * inner;
+		}
+		// delta[a] = s_i[a] - Rs_a; contribution to out[i*d_s + a] is +delta[a].
+		acc += s_i[a] - Rs_a;
+	}
+
+	// ====== Outgoing edges (i is src; e = (i, j)) ======
+	const int out_start = out_csr_off[i];
+	const int out_end   = out_csr_off[i + 1];
+	for (int k = out_start; k < out_end; ++k)
+	{
+		const int e = out_csr_edges[k];
+		const int j = edge_tgt[e];
+		const float* Uj    = U + (size_t)j * d_s * r;
+		const float* Sig_e = Sigma + (size_t)e * r;
+		const float* s_j   = s + (size_t)j * d_s;
+
+		// delta[a] = s_j[a] - (R_{j<-i} s_i)[a]
+		// Compute U_i^T s_i  (length r)
+		float inner_arr[kMaxR];
+		for (int beta = 0; beta < r; ++beta)
+		{
+			float inner = 0.0f;
+			for (int aa = 0; aa < d_s; ++aa)
+				inner += Ui[aa * r + beta] * s_i[aa];
+			inner_arr[beta] = inner * Sig_e[beta];
+		}
+		// (R s_i)[a'] = sum_beta U_j[a',beta] inner_arr[beta], for all a'.
+		// We need delta[a'] = s_j[a'] - Rs[a'] for the WHOLE row (because the
+		// R^T delta computation needs all of delta).
+		float delta[kMaxDS];
+		for (int aa = 0; aa < d_s; ++aa)
+		{
+			float Rs = 0.0f;
+			for (int beta = 0; beta < r; ++beta)
+				Rs += Uj[aa * r + beta] * inner_arr[beta];
+			delta[aa] = s_j[aa] - Rs;
+		}
+		// tmp_delta[beta] = (sum_a U_j[a,beta] delta[a]) * Sigma_e[beta]
+		float tmp_delta[kMaxR];
+		for (int beta = 0; beta < r; ++beta)
+		{
+			float td = 0.0f;
+			for (int aa = 0; aa < d_s; ++aa)
+				td += Uj[aa * r + beta] * delta[aa];
+			tmp_delta[beta] = td * Sig_e[beta];
+		}
+		// (R^T delta)[a] = sum_beta U_i[a,beta] tmp_delta[beta]
+		float Rt = 0.0f;
+		for (int beta = 0; beta < r; ++beta)
+			Rt += Ui[a * r + beta] * tmp_delta[beta];
+
+		// Contribution to out[i*d_s + a] is -Rt.
+		acc -= Rt;
+	}
+
+	out[(size_t)i * d_s + a] = acc;
+}
+
+} // anonymous namespace
+
+bool sfa_laplacian_matvec_csr_fp32(const float* U,
+                                    const float* Sigma,
+                                    const int* edge_src,
+                                    const int* edge_tgt,
+                                    const int* out_csr_off,
+                                    const int* out_csr_edges,
+                                    const int* in_csr_off,
+                                    const int* in_csr_edges,
+                                    const float* s,
+                                    float* out,
+                                    int T, int E,
+                                    int d_s, int r,
+                                    cudaStream_t stream)
+{
+	if (T <= 0 || E <= 0 || d_s <= 0 || r <= 0) return true;
+	if (d_s > kMaxDS || r > kMaxR)
+	{
+		fprintf(stderr, "[sfa-cuda] csr: d_s=%d (max %d) or r=%d (max %d) exceeded\n",
+		        d_s, kMaxDS, r, kMaxR);
+		return false;
+	}
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+
+	// One block per vertex, d_s threads per block.
+	int block = d_s;
+	if (block < 32) block = 32;  // round up for warp utilization
+	sfa_laplacian_csr_kernel<<<T, block, 0, s_use>>>(
+	    U, Sigma, edge_src, edge_tgt,
+	    out_csr_off, out_csr_edges, in_csr_off, in_csr_edges,
+	    s, out, T, d_s, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Host-side CSR builder. Single-pass counting + filling.
+void sfa_build_csr_host(const int* edge_src, const int* edge_tgt, int E, int T,
+                        int* out_csr_off, int* out_csr_edges,
+                        int* in_csr_off, int* in_csr_edges)
+{
+	// Count edges per source vertex (outgoing) and per target (incoming).
+	for (int i = 0; i <= T; ++i) { out_csr_off[i] = 0; in_csr_off[i] = 0; }
+	for (int e = 0; e < E; ++e)
+	{
+		out_csr_off[edge_src[e] + 1]++;
+		in_csr_off[edge_tgt[e] + 1]++;
+	}
+	// Prefix sum.
+	for (int i = 1; i <= T; ++i) { out_csr_off[i] += out_csr_off[i-1]; in_csr_off[i] += in_csr_off[i-1]; }
+	// Fill (using a temp cursor array).
+	std::vector<int> out_cursor(T, 0), in_cursor(T, 0);
+	for (int e = 0; e < E; ++e)
+	{
+		int sv = edge_src[e]; int tv = edge_tgt[e];
+		out_csr_edges[out_csr_off[sv] + out_cursor[sv]++] = e;
+		in_csr_edges [in_csr_off [tv] + in_cursor [tv]++] = e;
+	}
 }
 
 } // namespace gpu

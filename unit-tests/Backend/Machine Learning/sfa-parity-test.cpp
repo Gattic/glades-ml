@@ -154,8 +154,29 @@ void SFAParityUnitTest()
 	dout.download(&out_gpu[0], out_cpu.size());
 
 	double maxre_lap = max_rel_err(out_gpu, out_cpu);
-	std::printf("  L_F matvec  max rel err = %.6e\n", maxre_lap);
-	ASSERT("L_F matvec parity (5e-3 tol)", maxre_lap < 5e-3);
+	std::printf("  L_F matvec (atomic) max rel err = %.6e\n", maxre_lap);
+	ASSERT("L_F matvec atomic parity (5e-3 tol)", maxre_lap < 5e-3);
+
+	// CSR variant — deterministic, no atomics.
+	std::vector<int> out_off(T+1), in_off(T+1), out_edges_l(E), in_edges_l(E);
+	glades::gpu::sfa_build_csr_host(&p.edge_src[0], &p.edge_tgt[0], E, T,
+	    &out_off[0], &out_edges_l[0], &in_off[0], &in_edges_l[0]);
+
+	glades::gpu::GpuBuffer<int> d_out_off, d_in_off, d_out_e, d_in_e;
+	d_out_off.allocate(out_off.size()); d_out_off.upload(&out_off[0], out_off.size());
+	d_in_off.allocate(in_off.size()); d_in_off.upload(&in_off[0], in_off.size());
+	d_out_e.allocate(out_edges_l.size()); d_out_e.upload(&out_edges_l[0], out_edges_l.size());
+	d_in_e.allocate(in_edges_l.size()); d_in_e.upload(&in_edges_l[0], in_edges_l.size());
+
+	std::vector<float> out_csr(Tds);
+	ASSERT("sfa_laplacian_matvec_csr_fp32 launch", glades::gpu::sfa_laplacian_matvec_csr_fp32(
+	    dU.data(), dSigma.data(), dE_src.data(), dE_tgt.data(),
+	    d_out_off.data(), d_out_e.data(), d_in_off.data(), d_in_e.data(),
+	    ds.data(), dout.data(), T, E, d_s, r));
+	dout.download(&out_csr[0], out_cpu.size());
+	double maxre_csr = max_rel_err(out_csr, out_cpu);
+	std::printf("  L_F matvec (CSR)    max rel err = %.6e\n", maxre_csr);
+	ASSERT("L_F matvec CSR parity (5e-3 tol)", maxre_csr < 5e-3);
 
 	// ====== Test 2: source assembly parity ======
 	std::vector<float> q(Tdh), v(Tdh), b_cpu(Tds), b_gpu(Tds);

@@ -50,8 +50,8 @@ namespace gpu {
 //
 // IMPLEMENTATION NOTE (iter 21): uses atomicAdd reductions per edge for
 // simplicity. This introduces non-determinism at the FP32-epsilon level.
-// Production version (iter 22+) will use CSR-style per-vertex reduction
-// to restore bit-exact determinism.
+// Production version (CSR variant below, iter 22+) uses per-vertex
+// reduction to restore bit-exact determinism.
 // ---------------------------------------------------------------------------
 bool sfa_laplacian_matvec_fp32(const float* U,         // [T * d_s * r]
                                 const float* Sigma,     // [|E| * r]
@@ -62,6 +62,50 @@ bool sfa_laplacian_matvec_fp32(const float* U,         // [T * d_s * r]
                                 int T, int E,
                                 int d_s, int r,
                                 cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
+// CSR-format L_F matvec — deterministic and faster than atomicAdd variant.
+//
+// CSR layout:
+//   out_csr_off[i]   = start index in out_csr_edges of OUTGOING edges from i
+//                       (where i is src and there's an edge i->j).
+//   out_csr_off[T]   = total count.
+//   out_csr_edges[k] = global edge index of the k-th outgoing edge.
+//
+//   in_csr_off[i]   = start index in in_csr_edges of INCOMING edges to i.
+//   in_csr_off[T]   = total count.
+//   in_csr_edges[k] = global edge index of the k-th incoming edge.
+//
+// Build CSR from edge_src/edge_tgt arrays via sfa_build_csr_host (host-side).
+//
+// Kernel: one block per vertex. Threads in the block cooperate to:
+//   (a) sum contributions FROM outgoing edges (vertex is src in edge e):
+//       contributes -R_{j<-i}^T delta_e to out_i
+//   (b) sum contributions FROM incoming edges (vertex is tgt in edge e):
+//       contributes +delta_e to out_j
+//
+// No atomicAdds. Bit-exact deterministic given fixed CSR ordering.
+// ---------------------------------------------------------------------------
+bool sfa_laplacian_matvec_csr_fp32(const float* U,           // [T * d_s * r]
+                                    const float* Sigma,       // [|E| * r]
+                                    const int* edge_src,      // [|E|]
+                                    const int* edge_tgt,      // [|E|]
+                                    const int* out_csr_off,   // [T + 1]
+                                    const int* out_csr_edges, // [|E|]
+                                    const int* in_csr_off,    // [T + 1]
+                                    const int* in_csr_edges,  // [|E|]
+                                    const float* s,           // [T * d_s]
+                                    float* out,               // [T * d_s]
+                                    int T, int E,
+                                    int d_s, int r,
+                                    cudaStream_t stream = 0);
+
+// Build CSR offsets/indices arrays on host from edge_src/edge_tgt.
+// Caller passes pre-allocated output vectors which are filled with size
+// [T+1] for offsets and [E] for edge indices.
+void sfa_build_csr_host(const int* edge_src, const int* edge_tgt, int E, int T,
+                         int* out_csr_off, int* out_csr_edges,
+                         int* in_csr_off, int* in_csr_edges);
 
 // ---------------------------------------------------------------------------
 // Source assembly: b_i = U_i U_i^T P_q q_i + gamma * P_v v_i
@@ -98,6 +142,11 @@ namespace gpu {
 inline bool sfa_laplacian_matvec_fp32(const float*, const float*, const int*, const int*,
                                        const float*, float*, int, int, int, int,
                                        cudaStream_t = 0) { return false; }
+inline bool sfa_laplacian_matvec_csr_fp32(const float*, const float*, const int*, const int*,
+                                           const int*, const int*, const int*, const int*,
+                                           const float*, float*, int, int, int, int,
+                                           cudaStream_t = 0) { return false; }
+inline void sfa_build_csr_host(const int*, const int*, int, int, int*, int*, int*, int*) {}
 inline bool sfa_source_assembly_fp32(const float*, const float*, const float*,
                                       const float*, const float*, float, float*,
                                       int, int, int, int, cudaStream_t = 0) { return false; }

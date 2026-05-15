@@ -37,6 +37,7 @@ chiron-test.cpp
 sfcka-test.cpp
 simd-parity-test.cpp
 sfa-parity-test.cpp
+sfa-bench-test.cpp
 sampling-test.cpp
 attention-backward-test.cpp
 transformer-ops-test.cpp
