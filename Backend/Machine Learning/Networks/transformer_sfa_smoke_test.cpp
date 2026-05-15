@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <ctime>
 #include <vector>
 #include <algorithm>
 
@@ -390,6 +391,52 @@ int testDirectSolveAgreement()
 	}
 }
 
+// Scale-up test: Lanczos at T=1024, d_s=8, r=4 — near-production size.
+// Reports wall-clock to demonstrate feasibility at the design-target scale.
+int testLanczosScaleUp()
+{
+	SFAParams p;
+	const int T = 1024, d_s = 8, d_h = 64, r = 4, W = 128, n_sinks = 8;
+	buildSyntheticSFAParams(p, T, d_s, d_h, r, W, n_sinks);
+	p.lambda = 1e-2f;
+
+	const int Tds = T * d_s;
+	std::vector<float> b(Tds), s_lanczos(Tds);
+	for (int k = 0; k < Tds; ++k)
+		b[k] = urand(-1.0f, 1.0f);
+
+	std::printf("  Scale-up: T=%d, d_s=%d, r=%d, W=%d, sinks=%d, |E|=%zu, lambda=%.2e\n",
+	            T, d_s, r, W, n_sinks, p.edge_src.size(), p.lambda);
+
+	const int m = 64;
+
+	// Wall-clock timer.
+	clock_t t_start = clock();
+	glades::transformer_sfa_chebyshev::lanczosSolve(p, &b[0], m, &s_lanczos[0]);
+	clock_t t_end = clock();
+	const double wall_sec = double(t_end - t_start) / CLOCKS_PER_SEC;
+
+	const float rel_residual = glades::transformer_sfa_chebyshev::residualNorm(p, &b[0], &s_lanczos[0]);
+
+	std::printf("    Lanczos m=%d: ||r||/||b|| = %.4e, wall-clock = %.3f sec\n",
+	            m, rel_residual, wall_sec);
+
+	// Pass: residual < 1e-2 AND wall-clock < 30 sec.
+	const bool pass = (rel_residual < 1e-2f) && (wall_sec < 30.0);
+	if (pass)
+	{
+		std::printf("[PASS] T=%d Lanczos converges to %.2e in %.2f sec.\n",
+		            T, rel_residual, wall_sec);
+		return 1;
+	}
+	else
+	{
+		std::printf("[FAIL] T=%d Lanczos: residual=%.2e, wall=%.2fs.\n",
+		            T, rel_residual, wall_sec);
+		return 0;
+	}
+}
+
 // Test Lanczos solver on the HARD regime (small lambda, ill-conditioned L_F).
 // Chebyshev fails this without proper preconditioning; Lanczos should succeed
 // by adapting to the spectrum.
@@ -447,6 +494,7 @@ int main(int /*argc*/, char** /*argv*/)
 	n_pass += testChebyshevSolve(p);   n_total++;
 	n_pass += testDirectSolveAgreement();   n_total++;
 	n_pass += testLanczosHardRegime();   n_total++;
+	n_pass += testLanczosScaleUp();   n_total++;
 
 	std::printf("\n");
 	std::printf("============================\n");
