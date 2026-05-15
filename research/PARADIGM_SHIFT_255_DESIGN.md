@@ -1,6 +1,7 @@
 # Paradigm Shift #255 — DSA: Dynamic Sheaf Activation
 
-**Status:** designed (Ralph-loop iter 11, 2026-05-15). Builds directly on paradigm #250 SFA and its Phase 8b empirical validation. Operationalises the "Dynamic Depth" sketch from `CELLULAR_SHEAF_ATTENTION_PROGRAM.md` §7 / §12.
+**Status:** PARTIALLY FALSIFIED (Ralph-loop iter 13, 2026-05-15). The Σ-based defect formula does NOT correlate with the Phase 8b per-position NLL pattern at flagship scale (Pearson r = −0.187, target was ≥ 0.5; late/early ratio = 1.00× vs target 2×). See `DSA_PROBE_O_FLAGSHIP_RESULT.md` for the empirical finding. The paradigm's *infrastructure* is shipped and working; the *gate-driver formula* needs replacement. Two candidates remain (U-frame divergence ε^U, residual-stream signal ε^q). DSA's overall claim (per-token gating of SFA) is still possible — the cocycle gain at Phase 8b is real — but its Σ-defect mechanism is wrong.
+**Original status:** designed (Ralph-loop iter 11, 2026-05-15). Builds directly on paradigm #250 SFA and its Phase 8b empirical validation. Operationalises the "Dynamic Depth" sketch from `CELLULAR_SHEAF_ATTENTION_PROGRAM.md` §7 / §12.
 **Date:** 2026-05-15.
 **Branch:** vesta5.
 **Predecessors:** #250 SFA (per-token cellular sheaf), #251 SRA (per-query focus), #252 PSA (multi-layer cohomology), #253 SLR (per-role layer specialisation), #254 CSR (composition operator for reasoning).
