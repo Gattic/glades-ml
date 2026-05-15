@@ -265,8 +265,8 @@ __global__ void sfa_readout_kernel(const float* __restrict__ P_o,
                                     float* __restrict__ y,
                                     int T, int d_s, int d_h)
 {
-	int i = blockIdx.x;
-	int h = threadIdx.x;
+	const int i = blockIdx.x;
+	const int h = blockIdx.y * blockDim.x + threadIdx.x;
 	if (i >= T || h >= d_h) return;
 
 	const float* si = s + (size_t)i * d_s;
@@ -287,14 +287,13 @@ bool sfa_readout_fp32(const float* P_o,
 	if (T <= 0 || d_s <= 0 || d_h <= 0) return true;
 
 	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
-	int block = d_h > 1024 ? 1024 : d_h;
-	if (d_h > 1024)
-	{
-		// Fallback: scale grid across d_h chunks.
-		fprintf(stderr, "[sfa-cuda] sfa_readout_fp32: d_h=%d > 1024 unsupported in v1\n", d_h);
-		return false;
-	}
-	sfa_readout_kernel<<<T, block, 0, s_use>>>(P_o, s, y, T, d_s, d_h);
+	// 2D grid: blockIdx.x = token, blockIdx.y = d_h chunk.  Block size 256
+	// (sweet spot for typical d_h ≥ 256; smaller d_h pays a partial-block
+	// occupancy cost but the kernel is fast either way).
+	const int block = 256;
+	const int blocks_h = (d_h + block - 1) / block;
+	dim3 grid(T, blocks_h, 1);
+	sfa_readout_kernel<<<grid, block, 0, s_use>>>(P_o, s, y, T, d_s, d_h);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
