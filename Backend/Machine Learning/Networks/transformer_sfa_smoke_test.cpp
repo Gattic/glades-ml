@@ -257,36 +257,35 @@ int testChebyshevSolve(const SFAParams& p)
 	for (int k = 0; k < Tds; ++k)
 		b[k] = urand(-1.0f, 1.0f);
 
-	float mu_max_est = glades::transformer_sfa_ops::estimateMuMax(p_easy, 4, 0xABCDEF12u);
-	std::printf("  mu_max estimate (4 power-iter) = %.4f, lambda = %.1f\n",
-	            mu_max_est, p_easy.lambda);
+	float mu_max_4 = glades::transformer_sfa_ops::estimateMuMax(p_easy, 4, 0xABCDEF12u);
+	float mu_max_20 = glades::transformer_sfa_ops::estimateMuMax(p_easy, 20, 0xABCDEF12u);
+	float mu_max_50 = glades::transformer_sfa_ops::estimateMuMax(p_easy, 50, 0xABCDEF12u);
+	std::printf("  mu_max estimates: 4-iter=%.4f, 20-iter=%.4f, 50-iter=%.4f (lambda=%.1f)\n",
+	            mu_max_4, mu_max_20, mu_max_50, p_easy.lambda);
 
-	// Diagnostic sweep: monitor convergence M=1..16.
-	std::printf("  Convergence sweep (forward Chebyshev recurrence, easy lambda=50):\n");
-	for (int M_try = 1; M_try <= 16; M_try *= 2)
+	// Diagnostic sweep: monitor convergence M=1..32 in easy regime.
+	std::printf("  Convergence sweep (Clenshaw backward recurrence, easy lambda=50):\n");
+	for (int M_try = 1; M_try <= 32; M_try *= 2)
 	{
 		solveTikhonov(p_easy, &b[0], M_try, /*use_preconditioner=*/false, &s[0]);
 		const float r = residualNorm(p_easy, &b[0], &s[0]);
-		std::printf("    M=%2d: ||r||/||b|| = %.6f\n", M_try, r);
+		std::printf("    M=%2d: ||r||/||b|| = %.6e\n", M_try, r);
 	}
 
-	// Use M=8 (sweet spot before forward-recurrence round-off explodes).
-	// Iter 15+: implement Clenshaw's backward recurrence for stable larger M.
-	const int M = 8;
+	// Use M=16 (Clenshaw is stable for any M; round-off no longer accumulates).
+	const int M = 16;
 	solveTikhonov(p_easy, &b[0], M, /*use_preconditioner=*/false, &s[0]);
 	const float rel_residual = residualNorm(p_easy, &b[0], &s[0]);
 
-	if (rel_residual < 0.01f)
+	if (rel_residual < 1e-4f)
 	{
-		std::printf("[PASS] Chebyshev M=%d converges in easy regime (residual %.6f < 0.01).\n",
+		std::printf("[PASS] Chebyshev M=%d converges (residual %.6e < 1e-4).\n",
 		            M, rel_residual);
-		std::printf("       Note: forward recurrence round-off limits M to ~8.\n");
-		std::printf("       Iter 15+ will add Clenshaw backward recurrence for stable larger M.\n");
 		return 1;
 	}
 	else
 	{
-		std::printf("[FAIL] Chebyshev M=%d residual %.6f >= 0.01.\n", M, rel_residual);
+		std::printf("[FAIL] Chebyshev M=%d residual %.6e >= 1e-4.\n", M, rel_residual);
 		return 0;
 	}
 }

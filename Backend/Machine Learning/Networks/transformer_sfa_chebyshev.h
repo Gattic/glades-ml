@@ -186,17 +186,23 @@ inline void computeChebyshevCoeffs(float mu_max, float lambda,
 // Solve (L_F + lambda*I) s = b using M-degree Chebyshev approximation of
 // the Tikhonov-regularised inverse, with optional diagonal-Jacobi preconditioning.
 //
+// CHEBYSHEV RECURRENCE: Clenshaw's BACKWARD recurrence (numerically stable).
+// The forward recurrence w_n = 2 A w_{n-1} - w_{n-2} amplifies round-off and
+// fails beyond M ~= 8 in FP32 (validated empirically iter 14).
+//
+// Clenshaw backward recurrence for p(A) v = sum_{n=0}^{N} c_n T_n(A) v:
+//   d_{N+1} = d_{N+2} = 0      (zero vectors)
+//   For k = N down to 1:
+//     d_k = 2 A d_{k+1} - d_{k+2} + c_k v
+//   p(A) v = A d_1 - d_2 + c_0 v
+//
+// This is stable because the c_k * v term is added at each step rather than
+// accumulating into the running w_n vector.
+//
 // Algorithm:
-//   1. Optionally precondition: solve (D_F^{-1} L_F + lambda*D_F^{-1}) s' = D_F^{-1} b.
-//      Approximate diag-only Jacobi: replace by (P^{-1/2} L_F P^{-1/2}) s'' = P^{-1/2} b,
-//      then s = P^{-1/2} s''. CPU prototype uses simpler asymmetric form:
-//      apply D_F^{-1} only to b.
-//   2. Map: A = 2/mu_max * L_F - I, so spec(A) ⊆ [-1, 1] approximately.
-//   3. Chebyshev recurrence:
-//      w_0 = b'
-//      w_1 = A w_0
-//      w_n = 2 A w_{n-1} - w_{n-2}    for n >= 2
-//      s = sum_n coeffs[n] * w_n
+//   1. Optionally apply diag-Jacobi preconditioner D_F^{-1} to b.
+//   2. Map: A = (2/mu_max) L_F - I, so spec(A) approx in [-1, 1].
+//   3. Clenshaw backward recurrence with coefficients c_n for f(mu) = 1/(mu + lambda).
 //
 // Cost: M matvecs (each O(|E| * d_s * r)) + M axpy (each O(T * d_s)).
 //
@@ -223,64 +229,68 @@ inline void solveTikhonov(const SFAParams& p,
 	const float* b_eff = use_preconditioner ? &b_precond[0] : b;
 
 	// Step 2: estimate mu_max (preconditioned spectrum).
+	// Use 20 power iterations (converges for typical L_F spectra) with 25%
+	// safety margin to ensure A = (2/mu_max) L_F - I has spectrum strictly
+	// in [-1, 1]. Underestimating mu_max causes Chebyshev/Clenshaw divergence
+	// since |T_n(x)| grows exponentially for |x| > 1.
 	float mu_max;
 	if (use_preconditioner)
-		mu_max = estimatePreconditionedMuMax(p, inv_diag, 2, 0xC0FFEEu);
+		mu_max = estimatePreconditionedMuMax(p, inv_diag, 20, 0xC0FFEEu);
 	else
-		mu_max = transformer_sfa_ops::estimateMuMax(p, 2, 0xC0FFEEu);
-	mu_max = std::max(mu_max, 1e-3f);
+		mu_max = transformer_sfa_ops::estimateMuMax(p, 20, 0xC0FFEEu);
+	mu_max = std::max(mu_max * 1.25f, 1e-3f);  // 25% safety margin on top of estimateMuMax's 10%
 
 	// Step 3: Chebyshev coefficients.
 	std::vector<float> coeffs;
 	computeChebyshevCoeffs(mu_max, p.lambda, M, coeffs);
 
-	// Step 4: recurrence.
-	std::vector<float> w_prev(Tds);   // w_{n-1}
-	std::vector<float> w_curr(Tds);   // w_n
+	// Step 4: Clenshaw backward recurrence (stable for arbitrary M).
+	// Compute p(A) v where p(A) = sum_{k=0}^{M-1} c_k T_k(A), v = b_eff.
+	//
+	// Backward recurrence:
+	//   d_M = d_{M+1} = 0
+	//   For k = M-1 down to 1:
+	//     d_k = 2 A d_{k+1} - d_{k+2} + c_k v
+	//   result = A d_1 - d_2 + c_0 v
+	//
+	// Each iter does one L_F matvec + axpy operations.
+	const float two_over_mu = 2.0f / mu_max;
+
+	std::vector<float> d_curr(Tds, 0.0f);      // d_{k+1}, initially 0 (d_M)
+	std::vector<float> d_next(Tds, 0.0f);      // d_{k+2}, initially 0 (d_{M+1})
+	std::vector<float> d_new(Tds);             // working d_k
 	std::vector<float> tmp(Tds);
 
-	std::memset(result, 0, sizeof(float) * Tds);
-
-	// w_0 = b_eff, accumulate coeffs[0] * w_0
-	std::memcpy(&w_prev[0], b_eff, sizeof(float) * Tds);
-	for (int k = 0; k < Tds; ++k)
-		result[k] += coeffs[0] * w_prev[k];
-
-	if (M >= 2)
+	// Loop k = M-1 down to 1.
+	for (int k = M - 1; k >= 1; --k)
 	{
-		// w_1 = A w_0  where A = (2/mu_max) D^{-1} L_F - I  (preconditioned)
-		// or A = (2/mu_max) L_F - I  (unpreconditioned).
-		const float two_over_mu = 2.0f / mu_max;
-
-		laplacianMatvec(p, &w_prev[0], &tmp[0]);
+		// d_new = 2 A d_curr - d_next + c_k * b_eff
+		// where A = (2/mu_max) L_F - I (preconditioned if requested).
+		//
+		// 2 A d_curr = (4/mu_max) L_F d_curr - 2 d_curr
+		laplacianMatvec(p, &d_curr[0], &tmp[0]);
 		if (use_preconditioner)
 			applyPreconditioner(p, inv_diag, &tmp[0]);
-		for (int k = 0; k < Tds; ++k)
-			w_curr[k] = two_over_mu * tmp[k] - w_prev[k];
-		for (int k = 0; k < Tds; ++k)
-			result[k] += coeffs[1] * w_curr[k];
+		const float four_over_mu = 4.0f / mu_max;
+		const float ck = coeffs[k];
+		for (int idx = 0; idx < Tds; ++idx)
+			d_new[idx] = four_over_mu * tmp[idx] - 2.0f * d_curr[idx]
+			             - d_next[idx] + ck * b_eff[idx];
 
-		// w_n = 2 A w_{n-1} - w_{n-2} for n=2..M-1
-		std::vector<float> w_next(Tds);
-		for (int n = 2; n < M; ++n)
-		{
-			// apply A to w_curr -> w_next
-			laplacianMatvec(p, &w_curr[0], &tmp[0]);
-			if (use_preconditioner)
-				applyPreconditioner(p, inv_diag, &tmp[0]);
-			for (int k = 0; k < Tds; ++k)
-				w_next[k] = two_over_mu * tmp[k] - w_curr[k];
-			// Chebyshev recurrence
-			for (int k = 0; k < Tds; ++k)
-				w_next[k] = 2.0f * w_next[k] - w_prev[k];
-			for (int k = 0; k < Tds; ++k)
-				result[k] += coeffs[n] * w_next[k];
-
-			// rotate buffers
-			std::swap(w_prev, w_curr);
-			std::swap(w_curr, w_next);
-		}
+		// rotate: d_{k+2} ← d_{k+1}, d_{k+1} ← d_k
+		std::swap(d_next, d_curr);
+		std::swap(d_curr, d_new);
 	}
+
+	// Final: result = A d_1 - d_2 + c_0 b_eff
+	//                = (2/mu_max) L_F d_1 - d_1 - d_2 + c_0 b_eff
+	laplacianMatvec(p, &d_curr[0], &tmp[0]);
+	if (use_preconditioner)
+		applyPreconditioner(p, inv_diag, &tmp[0]);
+	const float c0 = coeffs[0];
+	for (int idx = 0; idx < Tds; ++idx)
+		result[idx] = two_over_mu * tmp[idx] - d_curr[idx]
+		              - d_next[idx] + c0 * b_eff[idx];
 }
 
 // Compute the residual ||r|| / ||b|| for diagnostic / Probe D purposes.
