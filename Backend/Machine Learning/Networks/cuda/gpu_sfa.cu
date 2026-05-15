@@ -1127,6 +1127,99 @@ bool sfa_defect_step1_fp32(const float* Sigma,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Paradigm #255 DSA — Candidate 1 (iter-14): U-frame defect.
+//
+// After iter-13 Probe O at flagship scale FALSIFIED the Σ-based defect
+// formula (per-position ε flat at ~0.92 across all 8 buckets, Pearson r =
+// -0.187 vs Phase 8b NLL), the cocycle-relevant signal is hypothesised to
+// live in the stalk-frame structure U_i rather than in Σ.  Candidate 1
+// implements
+//
+//   eps^U_i  =  ‖ U_i^T U_{i-1}  −  I_r ‖_F                       (eq. 1')
+//
+// — the Frobenius distance between the adjacent-stalk Gram product and
+// the rank-r identity.  When U_{i-1} and U_i span the same r-dim
+// subspace (orthonormal frames aligned), U_i^T U_{i-1} = I_r and the
+// defect is 0.  When the subspaces rotate (e.g., adjacent positions
+// process different content), the off-diagonals fill in and the defect
+// grows.
+//
+// One block per token (i >= 1).  Block size = min(r*r, 32).  Each thread
+// computes one (beta1, beta2) entry of M = U_i^T U_{i-1} via an inner
+// loop over d_s, subtracts the identity, squares, and reduces with
+// __shfl_xor_sync.
+//
+// Cost: O(T * r * r * d_s) — for r=4, d_s=8 this is 16 * 8 = 128 ops/token,
+// total 0.13 K ops/token, negligible vs SFA Tikhonov solve.
+// ---------------------------------------------------------------------------
+namespace {
+
+__global__ void sfa_defect_frame_kernel(const float* __restrict__ U,
+                                         int T, int d_s, int r,
+                                         float* __restrict__ eps)
+{
+	int i = blockIdx.x;
+	if (i >= T) return;
+	if (i == 0)
+	{
+		if (threadIdx.x == 0) eps[i] = 0.0f;
+		return;
+	}
+
+	const float* Ui  = U + (size_t)i * d_s * r;
+	const float* Uim = U + (size_t)(i - 1) * d_s * r;
+
+	const int RR = r * r;
+	float acc = 0.0f;
+
+	// Each thread handles a stride of (beta1, beta2) pairs (column-major
+	// in the flat r*r index).
+	for (int k = threadIdx.x; k < RR; k += blockDim.x)
+	{
+		int beta1 = k / r;
+		int beta2 = k % r;
+		float m = 0.0f;
+		for (int a = 0; a < d_s; ++a)
+		{
+			float ui  = Ui [a * r + beta1];
+			float uim = Uim[a * r + beta2];
+			m += ui * uim;
+		}
+		float diff = m - (beta1 == beta2 ? 1.0f : 0.0f);
+		acc += diff * diff;
+	}
+
+	// Warp reduce (block = 32 threads).
+	unsigned mask = 0xFFFFFFFFu;
+	#pragma unroll
+	for (int offset = 16; offset > 0; offset >>= 1)
+		acc += __shfl_xor_sync(mask, acc, offset);
+
+	if (threadIdx.x == 0) eps[i] = sqrtf(acc);
+}
+
+}  // namespace
+
+bool sfa_defect_frame_step1_fp32(const float* U,
+                                  float*       eps,
+                                  int T, int d_s, int r,
+                                  cudaStream_t stream)
+{
+	if (T <= 0 || d_s <= 0 || r <= 0) return true;
+	if (r > kMaxR)
+	{
+		fprintf(stderr, "[sfa-cuda] defect_frame_step1: r=%d exceeds kMaxR=%d\n",
+		        r, kMaxR);
+		return false;
+	}
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+	const int block = 32;  // one warp
+	sfa_defect_frame_kernel<<<T, block, 0, s_use>>>(U, T, d_s, r, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

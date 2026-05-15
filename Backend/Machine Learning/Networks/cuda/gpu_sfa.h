@@ -242,6 +242,24 @@ bool sfa_defect_step1_fp32(const float* Sigma,        // [|E| · r]
                             cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
+// Paradigm #255 DSA — Candidate 1 (iter-14): U-frame defect.
+//
+//   eps^U_i  =  ‖ U_i^T U_{i-1}  −  I_r ‖_F
+//
+// Measures adjacent-stalk subspace divergence: the off-diagonal mass of
+// the (r × r) Gram product U_i^T U_{i-1} after subtracting the rank-r
+// identity.  Proposed gate-driver replacement for the Σ-based defect
+// after iter-13 Probe O falsified Conjecture 12.  See
+// research/DSA_PROBE_O_FLAGSHIP_RESULT.md for context.
+//
+// Cost: O(T · r² · d_s) — negligible (<<1% of SFA solve).
+// ---------------------------------------------------------------------------
+bool sfa_defect_frame_step1_fp32(const float* U,            // [T · d_s · r]
+                                  float*       eps,          // [T] output
+                                  int T, int d_s, int r,
+                                  cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
 // Source assembly: b_i = U_i U_i^T P_q q_i + gamma * P_v v_i
 //
 // Per-token GEMV-like computation. Cost: O(T · (d_h·d_s + d_s·r)).
@@ -305,6 +323,9 @@ inline bool sfa_defect_step1_fp32(const float*, const int*,
                                    const int*, const int*,
                                    float*, int, int,
                                    cudaStream_t = 0) { return false; }
+inline bool sfa_defect_frame_step1_fp32(const float*, float*,
+                                         int, int, int,
+                                         cudaStream_t = 0) { return false; }
 inline bool sfa_source_assembly_fp32(const float*, const float*, const float*,
                                       const float*, const float*, float, float*,
                                       int, int, int, int, cudaStream_t = 0) { return false; }

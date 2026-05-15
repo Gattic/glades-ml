@@ -277,6 +277,37 @@ double max_abs_err(const std::vector<float>& gpu, const std::vector<float>& cpu)
 
 }  // anonymous namespace
 
+namespace {
+
+// CPU reference for paradigm #255 DSA Candidate 1 — U-frame defect.
+//   eps^U_i = sqrt( sum_{beta1,beta2} ( <U_i[:,beta1], U_{i-1}[:,beta2]>
+//                                       - delta_{beta1,beta2} )^2 )
+// U is flattened [T * d_s * r] with element at offset i*d_s*r + a*r + beta.
+void compute_defect_frame_cpu(const std::vector<float>& U,
+                               int T, int d_s, int r,
+                               std::vector<float>&       eps_out)
+{
+	eps_out.assign(T, 0.0f);
+	for (int i = 1; i < T; ++i)
+	{
+		const float* Ui  = &U[(size_t)i * d_s * r];
+		const float* Uim = &U[(size_t)(i - 1) * d_s * r];
+		double acc = 0.0;
+		for (int b1 = 0; b1 < r; ++b1)
+			for (int b2 = 0; b2 < r; ++b2)
+			{
+				double m = 0.0;
+				for (int a = 0; a < d_s; ++a)
+					m += (double)Ui[a * r + b1] * (double)Uim[a * r + b2];
+				double diff = m - (b1 == b2 ? 1.0 : 0.0);
+				acc += diff * diff;
+			}
+		eps_out[i] = (float)std::sqrt(acc);
+	}
+}
+
+}  // anonymous namespace
+
 void SFADefectParityUnitTest()
 {
 	std::printf("=== SFA defect kernel (paradigm #255 DSA) CPU vs GPU parity test ===\n");
@@ -312,9 +343,10 @@ void SFADefectParityUnitTest()
 	glades::gpu::sfa_build_csr_host(&p.edge_src[0], &p.edge_tgt[0], E, T,
 	    &out_off[0], &out_edges_l[0], &in_off[0], &in_edges_l[0]);
 
-	glades::gpu::GpuBuffer<float> dSigma, deps;
+	glades::gpu::GpuBuffer<float> dU, dSigma, deps;
 	glades::gpu::GpuBuffer<int>   dE_src;
 	glades::gpu::GpuBuffer<int>   d_in_off, d_in_e;
+	dU.allocate(p.U.size());        dU.upload(&p.U[0], p.U.size());
 	dSigma.allocate(p.Sigma.size()); dSigma.upload(&p.Sigma[0], p.Sigma.size());
 	dE_src.allocate(p.edge_src.size()); dE_src.upload(&p.edge_src[0], p.edge_src.size());
 	d_in_off.allocate(in_off.size()); d_in_off.upload(&in_off[0], in_off.size());
@@ -335,7 +367,27 @@ void SFADefectParityUnitTest()
 		std::printf("    pos %d:  cpu=%.5f  gpu=%.5f\n", k, eps_cpu[k], eps_gpu[k]);
 	ASSERT("defect kernel parity (1e-5 tol)", maxe < 1e-5);
 
-	std::printf("=== SFA defect parity: PASS ===\n");
+	// ====== Candidate 1: U-frame defect parity ======
+	std::vector<float> epsF_cpu;
+	compute_defect_frame_cpu(p.U, T, d_s, r, epsF_cpu);
+
+	glades::gpu::GpuBuffer<float> depsF;
+	depsF.allocate(T);
+
+	ASSERT("sfa_defect_frame_step1_fp32 launch",
+	    glades::gpu::sfa_defect_frame_step1_fp32(
+	        dU.data(), depsF.data(), T, d_s, r));
+
+	std::vector<float> epsF_gpu(T);
+	depsF.download(&epsF_gpu[0], T);
+
+	double maxe_frame = max_abs_err(epsF_gpu, epsF_cpu);
+	std::printf("  defect frame   max abs err = %.6e\n", maxe_frame);
+	for (int k = 0; k < std::min(8, T); ++k)
+		std::printf("    pos %d:  cpu=%.5f  gpu=%.5f\n", k, epsF_cpu[k], epsF_gpu[k]);
+	ASSERT("frame defect kernel parity (1e-5 tol)", maxe_frame < 1e-5);
+
+	std::printf("=== SFA defect parity: PASS (both sigma and frame) ===\n");
 #else
 	std::printf("  CUDA not enabled — skipping SFA defect parity test.\n");
 #endif
