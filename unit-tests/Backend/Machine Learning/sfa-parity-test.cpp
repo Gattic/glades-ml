@@ -223,3 +223,120 @@ void SFAParityUnitTest()
 	std::printf("  CUDA not enabled — skipping SFA parity test.\n");
 #endif
 }
+
+// -------------------------------------------------------------------------
+// Paradigm #255 DSA — step-1 defect kernel parity test.
+//
+// CPU reference: for each token i, find the predecessor edge
+// (src = i-1, tgt = i).  If it exists, compute
+//
+//   eps_i = sqrt( sum_beta ( Sigma_e[beta]^2 - 1 )^2 )
+//
+// (the single-edge form derived from the round-trip
+//  R_{i<-i-1} R_{i-1<-i} = U_i diag(Sigma_e^2) U_i^T).
+// Otherwise eps_i = 0.  Compare against gpu_sfa.h::sfa_defect_step1_fp32.
+//
+// Tolerance: 1e-5 absolute (pure FP32 arithmetic, no atomic reductions).
+// -------------------------------------------------------------------------
+namespace {
+
+void compute_defect_step1_cpu(const std::vector<float>& Sigma,
+                               const std::vector<int>&   edge_src,
+                               const std::vector<int>&   edge_tgt,
+                               int T, int r,
+                               std::vector<float>&       eps_out)
+{
+	const int E = static_cast<int>(edge_src.size());
+	eps_out.assign(T, 0.0f);
+	for (int i = 0; i < T; ++i)
+	{
+		int pred = -1;
+		for (int e = 0; e < E; ++e)
+		{
+			if (edge_src[e] == i - 1 && edge_tgt[e] == i) { pred = e; break; }
+		}
+		if (pred < 0) continue;
+		double acc = 0.0;
+		for (int b = 0; b < r; ++b)
+		{
+			double s = Sigma[static_cast<size_t>(pred) * r + b];
+			double d = s * s - 1.0;
+			acc += d * d;
+		}
+		eps_out[i] = static_cast<float>(std::sqrt(acc));
+	}
+}
+
+double max_abs_err(const std::vector<float>& gpu, const std::vector<float>& cpu)
+{
+	double max_e = 0.0;
+	for (size_t k = 0; k < cpu.size(); ++k)
+		max_e = std::max(max_e, static_cast<double>(std::fabs(gpu[k] - cpu[k])));
+	return max_e;
+}
+
+}  // anonymous namespace
+
+void SFADefectParityUnitTest()
+{
+	std::printf("=== SFA defect kernel (paradigm #255 DSA) CPU vs GPU parity test ===\n");
+
+#ifdef GLADES_HAVE_CUDA
+	ASSERT("init CUDA device", glades::gpu::initDevice());
+
+	const int T = 64, d_s = 8, d_h = 8, r = 4, W = 16, n_sinks = 2;
+	SFAParams p;
+	buildSyntheticSFAParams(p, T, d_s, d_h, r, W, n_sinks);
+	const int E = static_cast<int>(p.edge_src.size());
+
+	// Overwrite Sigma with a more interesting pattern: positions 0,1 stay
+	// near 1.0 (low defect); positions 3-7 get larger divergence (high
+	// defect).  Matches the synthetic test in research/dsa_probe_o_prototype.cpp.
+	for (int e = 0; e < E; ++e)
+	{
+		int i = p.edge_tgt[e];   // destination vertex characterises the edge
+		float scale = (i <= 1) ? 0.0f : urand(0.2f, 0.8f);
+		for (int b = 0; b < r; ++b)
+			p.Sigma[static_cast<size_t>(e) * r + b] = 1.0f + urand(-scale, scale);
+	}
+
+	std::printf("  config: T=%d r=%d W=%d sinks=%d |E|=%d\n",
+	            T, r, W, n_sinks, E);
+
+	// CPU reference
+	std::vector<float> eps_cpu;
+	compute_defect_step1_cpu(p.Sigma, p.edge_src, p.edge_tgt, T, r, eps_cpu);
+
+	// GPU compute — defect kernel only needs the in-CSR (predecessor lookup).
+	std::vector<int> out_off(T + 1), in_off(T + 1), out_edges_l(E), in_edges_l(E);
+	glades::gpu::sfa_build_csr_host(&p.edge_src[0], &p.edge_tgt[0], E, T,
+	    &out_off[0], &out_edges_l[0], &in_off[0], &in_edges_l[0]);
+
+	glades::gpu::GpuBuffer<float> dSigma, deps;
+	glades::gpu::GpuBuffer<int>   dE_src;
+	glades::gpu::GpuBuffer<int>   d_in_off, d_in_e;
+	dSigma.allocate(p.Sigma.size()); dSigma.upload(&p.Sigma[0], p.Sigma.size());
+	dE_src.allocate(p.edge_src.size()); dE_src.upload(&p.edge_src[0], p.edge_src.size());
+	d_in_off.allocate(in_off.size()); d_in_off.upload(&in_off[0], in_off.size());
+	d_in_e.allocate(in_edges_l.size()); d_in_e.upload(&in_edges_l[0], in_edges_l.size());
+	deps.allocate(T);
+
+	ASSERT("sfa_defect_step1_fp32 launch", glades::gpu::sfa_defect_step1_fp32(
+	    dSigma.data(), dE_src.data(),
+	    d_in_off.data(), d_in_e.data(),
+	    deps.data(), T, r));
+
+	std::vector<float> eps_gpu(T);
+	deps.download(&eps_gpu[0], T);
+
+	double maxe = max_abs_err(eps_gpu, eps_cpu);
+	std::printf("  defect step-1  max abs err = %.6e\n", maxe);
+	for (int k = 0; k < std::min(8, T); ++k)
+		std::printf("    pos %d:  cpu=%.5f  gpu=%.5f\n", k, eps_cpu[k], eps_gpu[k]);
+	ASSERT("defect kernel parity (1e-5 tol)", maxe < 1e-5);
+
+	std::printf("=== SFA defect parity: PASS ===\n");
+#else
+	std::printf("  CUDA not enabled — skipping SFA defect parity test.\n");
+#endif
+}

@@ -72,22 +72,38 @@ The substantive difference from prior paradigms: DSA is the first paradigm in th
 
 ### 2.1 Local commutation defect
 
-For the per-layer sheaf `F_ℓ` with edge set E and restriction maps `R^{(ℓ)}_{j ← i} = U_j Σ(i,j) U_i^T` (rank-r factorisation, paradigm #250), define the round-trip commutator at vertex i:
+For the per-layer sheaf `F_ℓ` with edge set E and restriction maps `R^{(ℓ)}_{j ← i} = U_j diag(Σ_e) U_i^T` (rank-r factorisation with per-edge diagonal modulator, paradigm #250), define the round-trip commutator at vertex i:
 
 ```
-ε_i^{(ℓ)}  :=  ‖ R^{(ℓ)}_{i ← j_+(i)}  R^{(ℓ)}_{j_+(i) ← i}  −  I_{d_s} ‖_F                              (eq. 1)
+ε_i^{(ℓ)}  :=  ‖ R^{(ℓ)}_{i ← j_+(i)}  R^{(ℓ)}_{j_+(i) ← i}  −  I_{[r]} ‖_F  (eq. 1, abstract form)
 ```
 
-where `j_+(i)` is the most recent edge neighbour of i in E. For the standard sliding-window edge set, `j_+(i) = i-1` (or any chosen anchor; we standardise on the immediately preceding edge).
+where `j_+(i)` is the most recent edge neighbour of i (`j_+(i) = i-1` for the standard causal sliding-window edge set) and `I_{[r]}` denotes the identity restricted to the rank-r stalk subspace.
+
+**Corrected closed form (iter-12)**: in the SFA implementation, the edge set is causal-only — a single edge `e = (i-1, i)` carries one `Σ_e ∈ R^r` for both directions of traversal (the reverse map `R_{i-1 ← i}` is the conjugate transpose of `R_{i ← i-1}`, with the same diagonal `Σ_e`). The round-trip reduces to
+
+```
+R_{i ← i-1} R_{i-1 ← i}  =  U_i diag(Σ_e^2) U_i^T                                                  (eq. 1a)
+```
+
+and the rank-r-subspace Frobenius defect against the identity is the closed-form
+
+```
+ε_i^{(ℓ)}  =  sqrt( Σ_β ( Σ_e[β]^2  −  1 )^2 )       where e = the predecessor edge of i.          (eq. 1b)
+```
+
+If `i = 0` (no predecessor edge), `ε_0 = 0`.
 
 **Interpretation**:
-- ε_i = 0 ⟺ `R_{i ← j_+} R_{j_+ ← i} = I`, i.e., the round-trip preserves the stalk basis. The local sheaf is trivial in this direction.
-- ε_i > 0 ⟺ round-trip introduces a frame rotation/scaling. Local cocycle structure exists.
+- ε_i = 0 ⟺ Σ_e[β] = ±1 for all β, i.e., the predecessor edge's restriction map is "unitary" on the rank-r subspace. The local sheaf is trivial in this direction.
+- ε_i > 0 ⟺ Σ_e values diverge from unit magnitude → frame rotation/scaling under the round-trip. Local cocycle structure exists.
 - ε_i large ⟺ strong cocycle obstruction. SFA's spectral filter extracts informative content.
 
-**Computation cost**: each ε_i is one matrix-matrix product (d_s × d_s, with rank-r structure) plus a Frobenius norm. Total: O(T · d_s · r) — same order as the source-assembly cost of SFA. Negligible overhead.
+**Computation cost**: each ε_i is r elementwise multiplies + accumulation + sqrt — O(T · r) total. Cheaper than the abstract d_s × d_s formulation would suggest, because the diagonal `diag(Σ_e^2)` collapses the matrix Frobenius norm to a per-element sum.
 
-**Sparsity property**: empirically (predicted by Phase 8b), ε_i is concentrated on positions with rich prior context. Pos 0 has no edges (no defect); pos 1 has only the edge to pos 0 (trivial defect); pos 3+ have multiple edges and complex composition (high defect).
+**Sparsity property**: empirically (predicted by Phase 8b), `Σ_e^2 − 1` is concentrated on positions with rich prior context. Pos 0 has no predecessor edge; pos 1's predecessor edge connects to BOS, often near-trivial; pos 3+ have edges to context-bearing predecessors.
+
+**Production implementation**: `Backend/Machine Learning/Networks/cuda/gpu_sfa.h::sfa_defect_step1_fp32` is the CUDA kernel implementing eq. 1b. Discovered by an in-CSR scan for the predecessor edge of each vertex. CPU reference in `unit-tests/Backend/Machine Learning/sfa-parity-test.cpp::compute_defect_step1_cpu`. Parity verified to 2.4e-7 absolute (well below the 1e-5 tolerance) — see the `sfa-defect-parity` unit test. Standalone synthetic prototype: `research/dsa_probe_o_prototype.cpp`.
 
 ### 2.2 Gate function
 

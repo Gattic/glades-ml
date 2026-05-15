@@ -1015,6 +1015,118 @@ bool sfa_laplacian_backward_fp32(const float* U, const float* Sigma,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Paradigm #255 DSA: commutation-defect kernel.
+//
+// Computes per-token commutation defect for paradigm #255 (Dynamic Sheaf
+// Activation).  In the SFA construction the edge set is causal-only: a
+// single edge e = (i-1, i) carries one Sigma_e for both directions of
+// traversal (R_{j<-i} = U_j diag(Sigma_e) U_i^T and its conjugate-transpose
+// R_{i<-j} = U_i diag(Sigma_e) U_j^T).  The round-trip restriction map
+// therefore reduces to
+//
+//   R_{i<-j} R_{j<-i}  =  U_i diag(Sigma_e^2) U_i^T
+//
+// and, in the rank-r subspace (where U_i is orthonormal), the Frobenius
+// defect against the identity is
+//
+//   eps_i  =  sqrt( sum_beta ( Sigma_e[beta]^2 - 1.0 )^2 )
+//
+// where e is the immediate-predecessor edge into i (src = i-1, tgt = i).
+// If no such edge exists, eps[i] = 0.
+//
+// The predecessor edge is discovered via the existing in-CSR structure
+// (incoming edges to i); no new host setup is required.
+//
+// One block per token, 32 threads.  Thread 0 finds the predecessor edge
+// and writes its index to shared memory; the warp then cooperates on the
+// r-dim reduction with __shfl_xor_sync.
+//
+// Reference C++ implementation: research/dsa_probe_o_prototype.cpp
+// (compute_defect_per_token).
+// ---------------------------------------------------------------------------
+namespace {
+
+__global__ void sfa_defect_step1_kernel(const float* __restrict__ Sigma,
+                                         const int*   __restrict__ edge_src,
+                                         const int*   __restrict__ in_csr_off,
+                                         const int*   __restrict__ in_csr_edges,
+                                         int T, int r,
+                                         float* __restrict__ eps)
+{
+	int i = blockIdx.x;
+	if (i >= T) return;
+
+	__shared__ int s_pred_edge;
+
+	if (threadIdx.x == 0)
+	{
+		int pred = -1;
+		int in_start = in_csr_off[i];
+		int in_end   = in_csr_off[i + 1];
+		for (int k = in_start; k < in_end; ++k)
+		{
+			int e = in_csr_edges[k];
+			if (edge_src[e] == i - 1) { pred = e; break; }
+		}
+		s_pred_edge = pred;
+	}
+	__syncthreads();
+
+	int pred_edge = s_pred_edge;
+	if (pred_edge < 0)
+	{
+		if (threadIdx.x == 0) eps[i] = 0.0f;
+		return;
+	}
+
+	const float* Sig_e = Sigma + (size_t)pred_edge * r;
+
+	float acc = 0.0f;
+	for (int b = threadIdx.x; b < r; b += blockDim.x)
+	{
+		float s  = Sig_e[b];
+		float d  = s * s - 1.0f;
+		acc += d * d;
+	}
+
+	// Warp reduction.  Block size is one warp (32 threads).
+	unsigned mask = 0xFFFFFFFFu;
+	#pragma unroll
+	for (int offset = 16; offset > 0; offset >>= 1)
+	{
+		acc += __shfl_xor_sync(mask, acc, offset);
+	}
+
+	if (threadIdx.x == 0) eps[i] = sqrtf(acc);
+}
+
+}  // namespace
+
+bool sfa_defect_step1_fp32(const float* Sigma,
+                            const int*   edge_src,
+                            const int*   in_csr_off,
+                            const int*   in_csr_edges,
+                            float*       eps,
+                            int T, int r,
+                            cudaStream_t stream)
+{
+	if (T <= 0 || r <= 0) return true;
+	if (r > kMaxR)
+	{
+		fprintf(stderr, "[sfa-cuda] defect_step1: r=%d exceeds kMaxR=%d\n",
+		        r, kMaxR);
+		return false;
+	}
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+	const int block = 32;  // one warp
+	sfa_defect_step1_kernel<<<T, block, 0, s_use>>>(
+	    Sigma, edge_src, in_csr_off, in_csr_edges,
+	    T, r, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

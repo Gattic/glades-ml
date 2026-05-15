@@ -17,14 +17,7 @@ PARADIGM_SHIFT_255_DESIGN.md §7 Phase 1, validate the defect formula
 
 A standalone C++98 prototype (`research/dsa_probe_o_prototype.cpp`, no
 external dependencies) constructs synthetic Σ_e values and runs the
-defect formula
-
-```
-ε_i = sqrt( Σ_β ( σ_fwd[β] · σ_bwd[β]  −  1 )^2 )
-```
-
-across 8 token positions × 4 rank dims, then checks the two predictions
-above. Build with:
+defect formula. Build with:
 
 ```
 g++ -std=c++98 -O2 -Wall -Wextra research/dsa_probe_o_prototype.cpp \
@@ -33,71 +26,111 @@ g++ -std=c++98 -O2 -Wall -Wextra research/dsa_probe_o_prototype.cpp \
 
 and run `./research/dsa_probe_o_prototype`.
 
-## Results (C++98 build, rand+Box-Muller RNG)
+**Math correction (iter-12 post-parity-test)**: the SFA edge set is
+causal-only — there is a single edge `e = (i-1, i)` per ordered pair, and
+its `Σ_e` covers both forward and reverse directions of the restriction
+map. The round-trip therefore reduces to
+
+```
+R_{i ← i-1} R_{i-1 ← i}  =  U_i diag(Σ_e²) U_i^T
+```
+
+and the rank-r-subspace defect is the closed-form
+
+```
+ε_i = sqrt( Σ_β ( Σ_e[β]² − 1 )² )
+```
+
+— uses `Σ_e²` (not the product of two independent Σ values, as the
+original prototype incorrectly modeled). The prototype and the CUDA
+kernel `sfa_defect_step1_fp32` have both been updated to use this
+corrected form, and a parity test
+(`unit-tests/Backend/Machine Learning/sfa-parity-test.cpp::SFADefectParityUnitTest`)
+verifies CPU/GPU agreement to 2.4e-7 absolute.
+
+## Results (C++98 build, corrected single-edge formula)
 
 ### Test 1 — Phase-8b-aligned synthesis (scale_mult = 0.3, r = 4, seed = 0)
 
 | pos | ε | \|ΔNLL\| (Phase 8b) |
 |----:|--:|---:|
 | 0 | 0.0000 | 0.07 |
-| 1 | 0.7287 | 1.15 |
-| 2 | 0.1546 | 0.23 |
-| 3 | 3.4600 | 1.68 |
-| 4 | 0.3277 | 0.54 |
-| 5 | 1.0491 | 1.27 |
-| 6 | 0.4477 | 0.95 |
-| 7 | 0.4205 | 0.82 |
+| 1 | 1.1922 | 1.15 |
+| 2 | 0.2252 | 0.23 |
+| 3 | 2.5049 | 1.68 |
+| 4 | 0.5139 | 0.54 |
+| 5 | 1.2337 | 1.27 |
+| 6 | 1.8235 | 0.95 |
+| 7 | 1.8912 | 0.82 |
 
-- **Pearson r(ε, \|ΔNLL\|) = +0.814** — well above the Conjecture 12
+- **Pearson r(ε, \|ΔNLL\|) = +0.865** — well above the Conjecture 12
   threshold of 0.6 → **Conjecture 12 PASS** on synthetic.
-- **ε late/early ratio = 3.13×** — above the revised Probe O bar of 2× →
+- **ε late/early ratio = 2.67×** — above the revised Probe O bar of 2× →
   **Probe O PASS** on the revised criterion.
 
 ### Test 2 — adversarial uniform-random Σ (seed = 1, scale = 0.3)
 
-| pos | ε | \|ΔNLL\| (Phase 8b) |
-|----:|--:|---:|
-| 0 | 0.7125 | 0.07 |
-| 1 | 0.6239 | 1.15 |
-| 2 | 0.6870 | 0.23 |
-| 3 | 1.8587 | 1.68 |
-| 4 | 0.6038 | 0.54 |
-| 5 | 0.8135 | 1.27 |
-| 6 | 0.4721 | 0.95 |
-| 7 | 0.5119 | 0.82 |
+- **Pearson r = +0.424** — below the 0.5 floor → **compound criterion correctly FAILS**.
+- **ε late/early ratio = 2.21×** — above the 2× bar (spurious), but the
+  compound criterion (ratio ≥ 2× AND r ≥ 0.5) requires BOTH. r=0.424 falls
+  below 0.5, so Probe O FAIL on the compound criterion.
 
-- **Pearson r = +0.593** — moderate but spurious (8-point sample noise).
-- **ε late/early ratio = 1.28×** — below the 2× bar → **Probe O correctly FAILS** on adversarial input.
-
-The compound criterion (ratio ≥ 2× AND r ≥ 0.5) successfully rejects the
-adversarial case because the ratio test fails, even though correlation is
-moderately high by chance.
+This is exactly why the compound criterion is needed: the Σ² form makes
+the ratio noisier (since random Σ values squared can land anywhere), but
+the correlation test still discriminates real position-stratification
+from chance.
 
 ### Test 3 — divergence-scale sweep
 
 | scale_mult | ε late/early ratio | r(ε, \|ΔNLL\|) |
 |-----------:|-------------------:|---------------:|
-| 0.1 | 1.54× | +0.823 |
-| 0.3 | 1.58× | +0.811 |
-| 1.0 | 1.80× | +0.731 |
-| 3.0 | 2.81× | +0.658 |
+| 0.1 | 1.20× | +0.867 |
+| 0.3 | 1.05× | +0.803 |
+| 1.0 | 0.76× | +0.617 |
+| 3.0 | 0.70× | +0.655 |
 
-The ratio scales **monotonically** with divergence magnitude. Correlation
-stays moderately high across all scales (≥ 0.66).
+The ratio is less monotonic than under the old (incorrect) formula —
+because Σ² can be either larger or smaller than 1 depending on Σ's sign
+relative to 1. **The correlation test (≥ 0.6 floor)** is more robust here.
 
 ### Test 4 — rank-r robustness
 
 | r | ε late/early ratio | r(ε, \|ΔNLL\|) |
 |--:|-------------------:|---------------:|
-|  2 | 0.61× | +0.538 |
-|  4 | 2.39× | +0.880 |
-|  8 | 1.55× | +0.959 |
-| 16 | 1.31× | +0.898 |
+|  2 | 4.61× | +0.807 |
+|  4 | 1.38× | +0.894 |
+|  8 | 1.53× | +0.942 |
+| 16 | 2.00× | +0.946 |
 
-Correlation stays moderate-to-high (≥ 0.54) across r ∈ {2, 4, 8, 16}.
-The r=2 case shows weaker ratio behaviour — the rank-r sample is too small
-for the per-position pattern to dominate over RNG noise. **For Phase 1
-implementation, recommend r ≥ 4** (matches the existing SFA default).
+Correlation stays high (≥ 0.80) across r ∈ {2, 4, 8, 16}.
+
+## CPU/GPU parity test (production validation)
+
+The CUDA kernel `sfa_defect_step1_fp32` in
+`Backend/Machine Learning/Networks/cuda/gpu_sfa.cu` matches the C++ CPU
+reference to **2.384e-07 absolute** — well below the 1e-5 tolerance — on
+a synthetic test with T=64, r=4, W=16, |E|=1045, structured Σ values:
+
+```
+=== SFA defect kernel (paradigm #255 DSA) CPU vs GPU parity test ===
+  config: T=64 r=4 W=16 sinks=2 |E|=1045
+  defect step-1  max abs err = 2.384186e-07
+    pos 0:  cpu=0.00000  gpu=0.00000     (no predecessor)
+    pos 1:  cpu=0.00000  gpu=0.00000     (synth: scale=0)
+    pos 2:  cpu=0.88533  gpu=0.88533
+    pos 3:  cpu=1.26691  gpu=1.26691
+    pos 4:  cpu=1.25801  gpu=1.25801
+    pos 5:  cpu=2.17917  gpu=2.17917
+    pos 6:  cpu=0.46693  gpu=0.46693
+    pos 7:  cpu=1.34624  gpu=1.34624
+=== SFA defect parity: PASS ===
+```
+
+Test registered as `sfa-defect-parity` in `unit-tests/main.cpp`. Run with:
+
+```
+cd unit-tests && bash test.sh sfa-defect-parity
+```
 
 ## Key findings
 

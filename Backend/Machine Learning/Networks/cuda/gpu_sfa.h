@@ -211,6 +211,37 @@ bool sfa_laplacian_backward_fp32(const float* U,           // [T · d_s · r]
                                   cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
+// Paradigm #255 DSA (2026-05-15): commutation-defect kernel.
+//
+// Computes per-token commutation defect for the DSA gating mechanism.
+// In the SFA causal-edge construction, each edge e = (i-1, i) carries one
+// Sigma_e covering both forward (R_{i<-i-1} = U_i diag(Sigma_e) U_{i-1}^T)
+// and reverse (R_{i-1<-i} = U_{i-1} diag(Sigma_e) U_i^T) traversal.  The
+// round-trip restriction map therefore reduces to U_i diag(Sigma_e^2) U_i^T
+// and its rank-r-subspace Frobenius defect against the identity is
+//
+//   eps_i  =  sqrt( sum_beta ( Sigma_e[beta]^2 - 1.0 )^2 )
+//
+// where e is the immediate-predecessor edge of i (src = i-1, tgt = i).
+// If no such edge exists in E, eps[i] = 0.
+//
+// The predecessor edge is discovered via the existing in-CSR structure
+// (incoming edges to i); no new host setup is required.
+//
+// Cost: O(T · (avg_in_degree + r)) — negligible vs the SFA Tikhonov solve.
+//
+// Reference: research/PARADIGM_SHIFT_255_DESIGN.md §2.1 eq. 1 and
+// research/dsa_probe_o_prototype.cpp (compute_defect_per_token).
+// ---------------------------------------------------------------------------
+bool sfa_defect_step1_fp32(const float* Sigma,        // [|E| · r]
+                            const int*   edge_src,     // [|E|]
+                            const int*   in_csr_off,   // [T + 1]
+                            const int*   in_csr_edges, // [|E|]
+                            float*       eps,          // [T] output
+                            int T, int r,
+                            cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
 // Source assembly: b_i = U_i U_i^T P_q q_i + gamma * P_v v_i
 //
 // Per-token GEMV-like computation. Cost: O(T · (d_h·d_s + d_s·r)).
@@ -270,6 +301,10 @@ inline bool sfa_laplacian_backward_fp32(const float*, const float*, const int*, 
                                          const float*, const float*, float*, float*,
                                          int, int, int, int,
                                          cudaStream_t = 0) { return false; }
+inline bool sfa_defect_step1_fp32(const float*, const int*,
+                                   const int*, const int*,
+                                   float*, int, int,
+                                   cudaStream_t = 0) { return false; }
 inline bool sfa_source_assembly_fp32(const float*, const float*, const float*,
                                       const float*, const float*, float, float*,
                                       int, int, int, int, cudaStream_t = 0) { return false; }

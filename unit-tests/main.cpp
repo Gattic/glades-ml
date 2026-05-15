@@ -263,6 +263,8 @@ int main(int argc, char* argv[])
 		SIMDParityUnitTest();
 	    else if (strcmp(argv[1], "sfa-parity") == 0)
 		SFAParityUnitTest();
+	    else if (strcmp(argv[1], "sfa-defect-parity") == 0)
+		SFADefectParityUnitTest();
 	    else if (strcmp(argv[1], "sfa-bench") == 0)
 		SFABenchUnitTest();
 	    else if (strcmp(argv[1], "sampling") == 0)
