@@ -411,13 +411,19 @@ These are research-grade questions for follow-on work; none are blockers for the
 
 ## 12. The "next next step" beyond this program
 
-If the CSA stack (#250+#251+#252) validates at Gate-0 and delivers the 10× wall-clock speedup, the program opens several directions:
+**Update (Ralph-loop iter 11, 2026-05-15)**: Phase 8b empirically validated the SFA mechanism at flagship scale. Trained SFA at L=18 (single layer swap) reduces val NLL by -0.60 nat mean / -1.50 nat peak vs NO-OP control, with late-position gains (pos 3-7: -0.5 to -1.7 nat) confirming the cocycle expressivity prediction. The position-stratified pattern revealed a +1.15 nat regression at pos 1 — direct empirical evidence that SFA's value is position-dependent. This motivates DSA (#255 below). See `research/SFA_PHASE8B_LONG_TRAIN_RESULT.md`.
 
-1. **Paradigm #253 SLR** (sketched §6): per-role attention.
-2. **Paradigm #254 Dynamic Depth** (sketched §7): runtime layer-insertion.
-3. **Paradigm #255 candidate: Cohomology-guided weight sharing**. Bars in PD^0 that persist across many layers represent global content; the corresponding eigenvectors can be SHARED across layers (saving parameters).
-4. **Paradigm #256 candidate: Distributed sheaf-attention**. For multi-GPU training, partition E (the edge set) across GPUs; each GPU computes a slice of L_F's action. Inherits HYDRA (#45) pipeline parallelism.
-5. **Paradigm #257 candidate: Sheaf-of-Sheaves attention**. Hierarchical sheaves where each stalk is itself a sheaf (multi-scale token graphs).
+Currently designed paradigms:
+
+1. **Paradigm #253 SLR** (designed iter 6): per-role attention configuration.
+2. **Paradigm #254 CSR** (designed iter 7, displacing the original "Dynamic Depth" sketch to #255): composition-operator formulation of multi-step reasoning capacity.
+3. **Paradigm #255 DSA** (designed iter 11, this iter — `PARADIGM_SHIFT_255_DESIGN.md`): per-token, per-layer dynamic activation of the SFA primitive driven by local commutation defect ε_i^{(ℓ)}. Operationalises the "Dynamic Depth" theme from the original §7 sketch using empirical Phase 8b findings. Gate-0 = ~70 min, the cheapest in the program because Phase 8b already grounds the central conjecture.
+
+Currently candidate (sketched only):
+
+4. **Paradigm #256 candidate: Cohomology-guided weight sharing**. Bars in PD^0 that persist across many layers represent global content; the corresponding eigenvectors can be SHARED across layers (saving parameters).
+5. **Paradigm #257 candidate: Distributed sheaf-attention**. For multi-GPU training, partition E (the edge set) across GPUs; each GPU computes a slice of L_F's action. Inherits HYDRA (#45) pipeline parallelism.
+6. **Paradigm #258 candidate: Sheaf-of-Sheaves attention**. Hierarchical sheaves where each stalk is itself a sheaf (multi-scale token graphs).
 
 **The "next next step" beyond CSA** may be: replacing the *linear* sheaf-Laplacian framework with a *non-linear* one — e.g., **non-linear sheaf cohomology** where restriction maps are non-linear functions of stalks. This would step outside the linear-algebraic comfort zone of all current attention mechanisms (SDPA included). It is also potentially much harder to implement efficiently.
 
@@ -457,12 +463,18 @@ Each had been mature for decades; the contribution is *unifying* them with atten
 - `research/PARADIGM_SHIFT_250_CANDIDATE_{A_FBA,B_SFA,C_ORA}.md` — iter 1, three candidates
 - `research/PARADIGM_SHIFT_251_DESIGN.md` — iter 3, SRA design
 - `research/PARADIGM_SHIFT_252_DESIGN.md` — iter 4, PSA design
+- `research/PARADIGM_SHIFT_253_DESIGN.md` — iter 6, SLR design
+- `research/PARADIGM_SHIFT_254_DESIGN.md` — iter 7, CSR design
+- `research/PARADIGM_SHIFT_255_DESIGN.md` — iter 11, DSA design (post-Phase 8b empirical refinement)
+- `research/SFA_PHASE8B_LONG_TRAIN_RESULT.md` — Phase 8b empirical validation (held-out eval)
 
 **Memory index**:
 
 - `[[paradigm250_sfa]]` — SFA persistent memory
 - `[[paradigm251_sra]]` — SRA persistent memory
 - `[[paradigm252_psa]]` — PSA persistent memory
+- `[[sfa_phase8_positive_result]]` — Phase 8 + Phase 8b empirical validation
+- `[[paradigm255_dsa]]` — DSA persistent memory (to be created)
 - `MEMORY.md` — top-level index entries
 
-The program is complete as a *design* (5 iterations of Ralph-loop research-framework-design work). What remains is empirical: implement, gate-0, iterate. The math is ready; the engineering follows.
+The program is complete as a *design through paradigm #255* (11 iterations of Ralph-loop research-framework-design work) AND empirically validated at the SFA-mechanism level (Phase 8b, 2026-05-15). The mathematical foundation is ready; the engineering of the rest of the stack follows. Paradigm #255 DSA is the first empirically-motivated design — driven directly by Phase 8b's position-stratified evidence.
