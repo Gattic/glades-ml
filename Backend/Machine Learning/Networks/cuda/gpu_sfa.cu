@@ -127,6 +127,87 @@ __global__ void sfa_zero_out_kernel(float* __restrict__ out, int n)
 	if (idx < n) out[idx] = 0.0f;
 }
 
+// 2026-05-15 Phase 4b: per-vertex diagonal of L_F + λI for Jacobi
+// preconditioning of the Tikhonov solve.
+//
+// L_F = δ^T δ where δ is the sheaf coboundary.  For edge e=(i,j):
+//   δ x[e] = x_j - R_{j<-i} x_i  with  R_{j<-i} = U_j Σ_e U_i^T
+//
+// δ^T applied back: at vertex j contributes +(δ x[e]); at vertex i
+// contributes -(R_{j<-i})^T (δ x[e]).  Diagonal of L_F at (v, a, a):
+//   from each edge where v = tgt (incoming): +1  (identity term)
+//   from each edge where v = src (outgoing): +(R^T R)[a,a]
+//                                          = ‖R_{j<-i}^T[a,:]‖²
+// With orthonormal U:
+//   ‖R_{j<-i}^T[a,:]‖² = sum_β U_i[a,β]² Σ_e[β]²
+// Plus λ from regulariser (added separately).
+__global__ void sfa_diagonal_kernel(const float* __restrict__ U,
+                                     const float* __restrict__ Sigma,
+                                     const int*   __restrict__ edge_src,
+                                     const int*   __restrict__ edge_tgt,
+                                     float* __restrict__ diag,
+                                     int T, int E, int d_s, int r)
+{
+	int e = blockIdx.x * blockDim.x + threadIdx.x;
+	if (e >= E) return;
+
+	const int i = edge_src[e];
+	const int j = edge_tgt[e];
+	const float* Ui    = U + (size_t)i * d_s * r;
+	const float* Sig_e = Sigma + (size_t)e * r;
+
+	for (int a = 0; a < d_s; ++a)
+	{
+		// Vertex i (src): +sum_β U_i[a,β]² Σ_e[β]²
+		float v_i = 0.0f;
+		for (int beta = 0; beta < r; ++beta)
+		{
+			float u_ia = Ui[a * r + beta];
+			float sig = Sig_e[beta];
+			v_i += u_ia * u_ia * sig * sig;
+		}
+		atomicAdd(&diag[(size_t)i * d_s + a], v_i);
+		// Vertex j (tgt): +1 from the identity x_j term.
+		atomicAdd(&diag[(size_t)j * d_s + a], 1.0f);
+	}
+}
+
+__global__ void sfa_diag_add_lambda_kernel(float* __restrict__ diag, float lambda,
+                                            int Tds)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < Tds) diag[idx] += lambda;
+}
+
+// 2026-05-15 Phase 4b: Jacobi-preconditioned Richardson step.
+// Fused: s += α · D^{-1} · (b - L_F s - λ s)
+// where the parenthesized expression has already been computed into res.
+// Replaces a 4-axpy chain (memcpy, axpy×3) with one element-wise kernel.
+__global__ void sfa_jacobi_step_kernel(float* __restrict__ s,
+                                        const float* __restrict__ b,
+                                        const float* __restrict__ Ls,
+                                        const float* __restrict__ Dinv,
+                                        float lambda, float alpha,
+                                        int Tds)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= Tds) return;
+	const float si = s[idx];
+	const float res = b[idx] - Ls[idx] - lambda * si;
+	s[idx] = si + alpha * Dinv[idx] * res;
+}
+
+__global__ void sfa_reciprocal_clamped_kernel(float* __restrict__ Dinv,
+                                               const float* __restrict__ diag,
+                                               float eps, int Tds)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= Tds) return;
+	float d = diag[idx];
+	if (d < eps) d = eps;
+	Dinv[idx] = 1.0f / d;
+}
+
 } // anonymous namespace
 
 bool sfa_laplacian_matvec_fp32(const float* U,
@@ -483,6 +564,69 @@ bool sfa_laplacian_matvec_csr_fp32(const float* U,
 	    U, Sigma, edge_src, edge_tgt,
 	    out_csr_off, out_csr_edges, in_csr_off, in_csr_edges,
 	    s, out, T, d_s, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// 2026-05-15 Phase 4b: compute diag(L_F + λI) on device.  Output is
+// [T · d_s] FP32, ready to feed into a Jacobi-preconditioned solver.
+bool sfa_laplacian_diagonal_fp32(const float* U,
+                                  const float* Sigma,
+                                  const int* edge_src,
+                                  const int* edge_tgt,
+                                  float lambda,
+                                  float* diag,
+                                  int T, int E,
+                                  int d_s, int r,
+                                  cudaStream_t stream)
+{
+	if (T <= 0 || E <= 0 || d_s <= 0 || r <= 0) return true;
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+
+	const int Tds = T * d_s;
+	int zg = (Tds + kBlockElem - 1) / kBlockElem;
+	sfa_zero_out_kernel<<<zg, kBlockElem, 0, s_use>>>(diag, Tds);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	int eg = (E + kBlockElem - 1) / kBlockElem;
+	sfa_diagonal_kernel<<<eg, kBlockElem, 0, s_use>>>(
+	    U, Sigma, edge_src, edge_tgt, diag, T, E, d_s, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+
+	sfa_diag_add_lambda_kernel<<<zg, kBlockElem, 0, s_use>>>(diag, lambda, Tds);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Compute 1/diag with a floor at eps.
+bool sfa_jacobi_inverse_diagonal_fp32(const float* diag, float* Dinv,
+                                       float eps, int T, int d_s,
+                                       cudaStream_t stream)
+{
+	if (T <= 0 || d_s <= 0) return true;
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+	const int Tds = T * d_s;
+	int g = (Tds + kBlockElem - 1) / kBlockElem;
+	sfa_reciprocal_clamped_kernel<<<g, kBlockElem, 0, s_use>>>(
+	    Dinv, diag, eps, Tds);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Fused Jacobi step: s += α · D^{-1} · (b - L_F s - λ s).
+// Caller has already computed Ls = L_F · s; this kernel does the rest
+// in a single pass over [T · d_s] elements.
+bool sfa_jacobi_step_fp32(float* s, const float* b, const float* Ls,
+                           const float* Dinv, float lambda, float alpha,
+                           int T, int d_s,
+                           cudaStream_t stream)
+{
+	if (T <= 0 || d_s <= 0) return true;
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+	const int Tds = T * d_s;
+	int g = (Tds + kBlockElem - 1) / kBlockElem;
+	sfa_jacobi_step_kernel<<<g, kBlockElem, 0, s_use>>>(
+	    s, b, Ls, Dinv, lambda, alpha, Tds);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

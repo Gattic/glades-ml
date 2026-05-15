@@ -108,6 +108,55 @@ void sfa_build_csr_host(const int* edge_src, const int* edge_tgt, int E, int T,
                          int* in_csr_off, int* in_csr_edges);
 
 // ---------------------------------------------------------------------------
+// Phase 4b (2026-05-15): Jacobi-preconditioned Richardson primitives.
+//
+// Tikhonov solve (L_F + λI) σ = b has condition number κ = (‖L_F‖ + λ)/λ ≈
+// 14000 at W=128 + n_sinks=8, σ ∈ [0.5,1], λ=0.01.  Plain Richardson needs
+// O(κ) iters → impractical.  Jacobi preconditioning with D = diag(L_F + λI)
+// reduces κ' ≈ 14 → ~50 Richardson iters for 1e-3 residual.
+//
+// Usage at SFA init (once):
+//   1. sfa_laplacian_diagonal_fp32  → diag = diag(L_F + λI)
+//   2. sfa_jacobi_inverse_diagonal_fp32 → Dinv = 1/diag (with clamp)
+// Usage per Richardson iter:
+//   3. sfa_laplacian_matvec_fp32 → Ls = L_F · s
+//   4. sfa_jacobi_step_fp32       → s += α · Dinv · (b - Ls - λ·s)  (fused)
+// ---------------------------------------------------------------------------
+
+// Compute the per-element diagonal of (L_F + λI) into `diag` [T · d_s].
+// Output is FP32 row-major, same indexing as the s/b buffers.
+bool sfa_laplacian_diagonal_fp32(const float* U,         // [T · d_s · r]
+                                  const float* Sigma,     // [|E| · r]
+                                  const int* edge_src,    // [|E|]
+                                  const int* edge_tgt,    // [|E|]
+                                  float lambda,
+                                  float* diag,            // [T · d_s] output
+                                  int T, int E,
+                                  int d_s, int r,
+                                  cudaStream_t stream = 0);
+
+// Element-wise reciprocal with a floor at `eps` (avoids div-by-zero on
+// near-zero diagonal entries that could occur if Σ is small or λ is tiny).
+bool sfa_jacobi_inverse_diagonal_fp32(const float* diag,
+                                       float* Dinv,
+                                       float eps,
+                                       int T, int d_s,
+                                       cudaStream_t stream = 0);
+
+// One fused Jacobi-preconditioned Richardson step:
+//   s += α · Dinv · (b - Ls - λ · s)
+// where Ls = L_F · s has been precomputed by the caller.  Replaces a
+// 4-axpy chain (memcpy(res,b), axpy(-1,Ls,res), axpy(-λ,s,res), axpy(α,res,s))
+// with one element-wise kernel — both faster and easier to extend.
+bool sfa_jacobi_step_fp32(float* s,                  // [T · d_s] in/out
+                           const float* b,            // [T · d_s]
+                           const float* Ls,           // [T · d_s]
+                           const float* Dinv,         // [T · d_s]
+                           float lambda, float alpha,
+                           int T, int d_s,
+                           cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
 // Source assembly: b_i = U_i U_i^T P_q q_i + gamma * P_v v_i
 //
 // Per-token GEMV-like computation. Cost: O(T · (d_h·d_s + d_s·r)).
@@ -147,6 +196,14 @@ inline bool sfa_laplacian_matvec_csr_fp32(const float*, const float*, const int*
                                            const float*, float*, int, int, int, int,
                                            cudaStream_t = 0) { return false; }
 inline void sfa_build_csr_host(const int*, const int*, int, int, int*, int*, int*, int*) {}
+inline bool sfa_laplacian_diagonal_fp32(const float*, const float*, const int*, const int*,
+                                         float, float*, int, int, int, int,
+                                         cudaStream_t = 0) { return false; }
+inline bool sfa_jacobi_inverse_diagonal_fp32(const float*, float*, float, int, int,
+                                              cudaStream_t = 0) { return false; }
+inline bool sfa_jacobi_step_fp32(float*, const float*, const float*, const float*,
+                                  float, float, int, int,
+                                  cudaStream_t = 0) { return false; }
 inline bool sfa_source_assembly_fp32(const float*, const float*, const float*,
                                       const float*, const float*, float, float*,
                                       int, int, int, int, cudaStream_t = 0) { return false; }
