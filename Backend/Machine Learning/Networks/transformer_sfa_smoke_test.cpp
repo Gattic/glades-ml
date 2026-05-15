@@ -390,6 +390,43 @@ int testDirectSolveAgreement()
 	}
 }
 
+// Test Lanczos solver on the HARD regime (small lambda, ill-conditioned L_F).
+// Chebyshev fails this without proper preconditioning; Lanczos should succeed
+// by adapting to the spectrum.
+int testLanczosHardRegime()
+{
+	SFAParams p;
+	const int T = 64, d_s = 4, d_h = 4, r = 2, W = 8, n_sinks = 2;
+	buildSyntheticSFAParams(p, T, d_s, d_h, r, W, n_sinks);
+	p.lambda = 1e-2f;  // Hard regime: kappa = mu_max / lambda ~ 4000.
+
+	const int Tds = T * d_s;
+	std::vector<float> b(Tds), s_lanczos(Tds);
+	for (int k = 0; k < Tds; ++k)
+		b[k] = urand(-1.0f, 1.0f);
+
+	// Lanczos at m=32 with full re-orthogonalization.
+	const int m = 32;
+	glades::transformer_sfa_chebyshev::lanczosSolve(p, &b[0], m, &s_lanczos[0]);
+
+	const float rel_residual = glades::transformer_sfa_chebyshev::residualNorm(p, &b[0], &s_lanczos[0]);
+	std::printf("  Lanczos m=%d (HARD lambda=%.2e, kappa~%d):\n",
+	            m, p.lambda, static_cast<int>(43.5f / p.lambda));
+	std::printf("    ||r||/||b|| = %.6e\n", rel_residual);
+
+	if (rel_residual < 1e-3f)
+	{
+		std::printf("[PASS] Lanczos converges in hard regime (rel residual %.2e < 1e-3).\n",
+		            rel_residual);
+		return 1;
+	}
+	else
+	{
+		std::printf("[FAIL] Lanczos hard-regime residual %.2e >= 1e-3.\n", rel_residual);
+		return 0;
+	}
+}
+
 int main(int /*argc*/, char** /*argv*/)
 {
 	std::printf("SFA CPU prototype smoke test\n");
@@ -409,6 +446,7 @@ int main(int /*argc*/, char** /*argv*/)
 	n_pass += testLaplacianPSD(p);   n_total++;
 	n_pass += testChebyshevSolve(p);   n_total++;
 	n_pass += testDirectSolveAgreement();   n_total++;
+	n_pass += testLanczosHardRegime();   n_total++;
 
 	std::printf("\n");
 	std::printf("============================\n");

@@ -395,6 +395,164 @@ inline void solveTikhonov(const SFAParams& p,
 		              - d_next[idx] + c0 * b_eff[idx];
 }
 
+// Lanczos solver: m-step symmetric Lanczos iteration for solving (L_F + lambda*I) s = b.
+//
+// Robust alternative to Chebyshev for ill-conditioned L_F (small lambda). Adapts
+// to the actual spectrum without needing tight mu_max or preconditioning.
+//
+// Algorithm:
+//   1. v_1 = b / ||b||
+//   2. For j = 1, ..., m:
+//      w = L_F v_j
+//      alpha_j = <w, v_j>
+//      w = w - alpha_j v_j - beta_j v_{j-1}   (with beta_1 = 0, v_0 = 0)
+//      Re-orthogonalize w against v_1, ..., v_j (full reorthogonalization).
+//      beta_{j+1} = ||w||
+//      v_{j+1} = w / beta_{j+1}
+//   3. Build tridiagonal T_m: diag = alpha_1, ..., alpha_m;
+//                              off-diag = beta_2, ..., beta_m.
+//   4. Solve (T_m + lambda*I) y = ||b|| e_1 (small m x m system).
+//   5. Recover s = V_m y where V_m = [v_1, ..., v_m].
+//
+// Cost: m matvecs of L_F + O(m^2 T d_s) for full re-orthogonalization.
+//       For m = 16, T d_s = 256: m^2 * T d_s = 64 K ops (trivial).
+//       For T d_s = 10^6 (T=16384, d_s=64): m^2 * T d_s = 2.5e8 ops (small).
+//
+// The full re-orthogonalization makes Lanczos robust against round-off but
+// costs O(m^2). For larger m, selective re-orthogonalization (Parlett-Scott)
+// reduces this to O(m sqrt(m)) — iter 18+ work.
+//
+// Result placed in `s`.
+inline void lanczosSolve(const SFAParams& p,
+                          const float* b,
+                          int m,
+                          float* s)
+{
+	const int T = p.T;
+	const int d_s = p.d_s;
+	const int Tds = T * d_s;
+	const float lambda = p.lambda;
+
+	if (m < 1) m = 1;
+
+	// Compute ||b||
+	float b_norm = 0.0f;
+	for (int k = 0; k < Tds; ++k)
+		b_norm += b[k] * b[k];
+	b_norm = std::sqrt(b_norm);
+	if (b_norm < 1e-20f)
+	{
+		std::memset(s, 0, sizeof(float) * Tds);
+		return;
+	}
+
+	// V[j] = v_{j+1} as a contiguous row of size Tds.
+	// V is (m+1) rows tall (v_1, ..., v_{m+1}), where v_{m+1} terminates iter.
+	std::vector<float> V(static_cast<size_t>(m + 1) * Tds, 0.0f);
+	std::vector<float> w(Tds);
+	std::vector<float> alpha(m, 0.0f);
+	std::vector<float> beta(m + 1, 0.0f);  // beta[0] = 0; beta[j] is "beta_j" in algorithm
+
+	// v_1 = b / ||b||
+	for (int k = 0; k < Tds; ++k)
+		V[k] = b[k] / b_norm;
+
+	int j_actual = m;
+	for (int j = 0; j < m; ++j)
+	{
+		// w = L_F v_{j+1}
+		laplacianMatvec(p, &V[static_cast<size_t>(j) * Tds], &w[0]);
+
+		// alpha_{j+1} = <w, v_{j+1}>
+		float a = 0.0f;
+		for (int k = 0; k < Tds; ++k)
+			a += w[k] * V[static_cast<size_t>(j) * Tds + k];
+		alpha[j] = a;
+
+		// w = w - alpha_{j+1} v_{j+1} - beta_{j+1} v_j
+		for (int k = 0; k < Tds; ++k)
+			w[k] -= a * V[static_cast<size_t>(j) * Tds + k];
+		if (j > 0)
+		{
+			const float bj = beta[j];
+			for (int k = 0; k < Tds; ++k)
+				w[k] -= bj * V[static_cast<size_t>(j - 1) * Tds + k];
+		}
+
+		// Full re-orthogonalization for numerical stability.
+		for (int orth_iter = 0; orth_iter < 2; ++orth_iter)
+		{
+			for (int prev = 0; prev <= j; ++prev)
+			{
+				float dot = 0.0f;
+				for (int k = 0; k < Tds; ++k)
+					dot += w[k] * V[static_cast<size_t>(prev) * Tds + k];
+				for (int k = 0; k < Tds; ++k)
+					w[k] -= dot * V[static_cast<size_t>(prev) * Tds + k];
+			}
+		}
+
+		// beta_{j+2} = ||w||
+		float b_next = 0.0f;
+		for (int k = 0; k < Tds; ++k)
+			b_next += w[k] * w[k];
+		b_next = std::sqrt(b_next);
+		beta[j + 1] = b_next;
+
+		// Lanczos breakdown: w has zero norm => exact Krylov subspace found.
+		if (b_next < 1e-12f)
+		{
+			j_actual = j + 1;
+			break;
+		}
+
+		// v_{j+2} = w / beta_{j+2}
+		for (int k = 0; k < Tds; ++k)
+			V[static_cast<size_t>(j + 1) * Tds + k] = w[k] / b_next;
+	}
+
+	// Build tridiagonal T_m + lambda*I and solve (T_m + lambda*I) y = ||b|| e_1.
+	const int mj = j_actual;
+	std::vector<float> diag(mj), off(mj > 0 ? mj - 1 : 0);
+	for (int j = 0; j < mj; ++j)
+		diag[j] = alpha[j] + lambda;
+	for (int j = 0; j < mj - 1; ++j)
+		off[j] = beta[j + 1];
+
+	std::vector<float> rhs(mj, 0.0f);
+	rhs[0] = b_norm;
+
+	// Solve tridiagonal system via Thomas algorithm (LDL^T or direct elimination).
+	// For symmetric tridiagonal: use the simple form.
+	std::vector<float> c_prime(mj > 0 ? mj - 1 : 0);
+	std::vector<float> d_prime(mj);
+	if (mj > 0)
+	{
+		c_prime[0] = (mj > 1) ? off[0] / diag[0] : 0.0f;
+		d_prime[0] = rhs[0] / diag[0];
+		for (int j = 1; j < mj; ++j)
+		{
+			const float denom = diag[j] - off[j - 1] * c_prime[j - 1];
+			if (j < mj - 1)
+				c_prime[j] = off[j] / denom;
+			d_prime[j] = (rhs[j] - off[j - 1] * d_prime[j - 1]) / denom;
+		}
+		std::vector<float> y(mj);
+		y[mj - 1] = d_prime[mj - 1];
+		for (int j = mj - 2; j >= 0; --j)
+			y[j] = d_prime[j] - c_prime[j] * y[j + 1];
+
+		// Lift: s = V_m y
+		std::memset(s, 0, sizeof(float) * Tds);
+		for (int j = 0; j < mj; ++j)
+		{
+			const float yj = y[j];
+			for (int k = 0; k < Tds; ++k)
+				s[k] += yj * V[static_cast<size_t>(j) * Tds + k];
+		}
+	}
+}
+
 // Compute the residual ||r|| / ||b|| for diagnostic / Probe D purposes.
 //   r = (L_F + lambda * I) s - b
 inline float residualNorm(const SFAParams& p,
