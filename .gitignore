@@ -1,5 +1,6 @@
 *.o
 callgrind.*
+research/dsa_probe_o_prototype
 .DS_Store
 build/*
 database/*
