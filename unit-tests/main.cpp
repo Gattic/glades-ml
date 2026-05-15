@@ -48,6 +48,7 @@
 #include "Backend/Machine Learning/sfcka-test.h"
 #include "Backend/Machine Learning/transformer-gradient-test.h"
 #include "Backend/Machine Learning/simd-parity-test.h"
+#include "Backend/Machine Learning/sfa-parity-test.h"
 #include "Backend/Machine Learning/sampling-test.h"
 #include "Backend/Machine Learning/attention-backward-test.h"
 #include "Backend/Machine Learning/transformer-ops-test.h"
@@ -259,6 +260,8 @@ int main(int argc, char* argv[])
 		TransformerGradientUnitTest();
 	    else if (strcmp(argv[1], "simd-parity") == 0)
 		SIMDParityUnitTest();
+	    else if (strcmp(argv[1], "sfa-parity") == 0)
+		SFAParityUnitTest();
 	    else if (strcmp(argv[1], "sampling") == 0)
 		SamplingUnitTest();
 	    else if (strcmp(argv[1], "attention-bwd") == 0)
