@@ -248,20 +248,15 @@ inline void solveTikhonov(const SFAParams& p,
 
 	if (M >= 2)
 	{
-		// w_1 = A w_0
-		auto apply_A = [&](const float* in, float* out)
-		{
-			// out = L_F in
-			laplacianMatvec(p, in, &tmp[0]);
-			if (use_preconditioner)
-				applyPreconditioner(p, inv_diag, &tmp[0]);
-			// out = (2/mu_max) tmp - in
-			const float two_over_mu = 2.0f / mu_max;
-			for (int k = 0; k < Tds; ++k)
-				out[k] = two_over_mu * tmp[k] - in[k];
-		};
+		// w_1 = A w_0  where A = (2/mu_max) D^{-1} L_F - I  (preconditioned)
+		// or A = (2/mu_max) L_F - I  (unpreconditioned).
+		const float two_over_mu = 2.0f / mu_max;
 
-		apply_A(&w_prev[0], &w_curr[0]);
+		laplacianMatvec(p, &w_prev[0], &tmp[0]);
+		if (use_preconditioner)
+			applyPreconditioner(p, inv_diag, &tmp[0]);
+		for (int k = 0; k < Tds; ++k)
+			w_curr[k] = two_over_mu * tmp[k] - w_prev[k];
 		for (int k = 0; k < Tds; ++k)
 			result[k] += coeffs[1] * w_curr[k];
 
@@ -269,7 +264,13 @@ inline void solveTikhonov(const SFAParams& p,
 		std::vector<float> w_next(Tds);
 		for (int n = 2; n < M; ++n)
 		{
-			apply_A(&w_curr[0], &w_next[0]);
+			// apply A to w_curr -> w_next
+			laplacianMatvec(p, &w_curr[0], &tmp[0]);
+			if (use_preconditioner)
+				applyPreconditioner(p, inv_diag, &tmp[0]);
+			for (int k = 0; k < Tds; ++k)
+				w_next[k] = two_over_mu * tmp[k] - w_curr[k];
+			// Chebyshev recurrence
 			for (int k = 0; k < Tds; ++k)
 				w_next[k] = 2.0f * w_next[k] - w_prev[k];
 			for (int k = 0; k < Tds; ++k)

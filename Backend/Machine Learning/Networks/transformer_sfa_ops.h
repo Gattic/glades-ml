@@ -24,7 +24,8 @@
 #include <cstring>
 #include <vector>
 
-#include "transformer_kernels.h"
+// Note: the CPU prototype is scalar — no SIMD helpers needed.
+// GPU port (Phase 2) will pull in transformer_kernels.h for fused axpy / dot.
 
 namespace glades
 {
