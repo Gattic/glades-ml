@@ -391,6 +391,57 @@ int testDirectSolveAgreement()
 	}
 }
 
+// Production-scale test: T=16384 (actual flagship sequence length).
+// Validates the SFA CPU prototype scales to production size.
+int testLanczosProduction()
+{
+	SFAParams p;
+	const int T = 16384, d_s = 8, d_h = 64, r = 4, W = 128, n_sinks = 8;
+	std::printf("  Production-scale building params (T=%d, |E| ~ %d)...\n",
+	            T, T * (W + n_sinks));
+	clock_t t_build_s = clock();
+	buildSyntheticSFAParams(p, T, d_s, d_h, r, W, n_sinks);
+	clock_t t_build_e = clock();
+	const double build_sec = double(t_build_e - t_build_s) / CLOCKS_PER_SEC;
+	p.lambda = 1e-2f;
+
+	const int Tds = T * d_s;
+	std::vector<float> b(Tds), s_lanczos(Tds);
+	for (int k = 0; k < Tds; ++k)
+		b[k] = urand(-1.0f, 1.0f);
+
+	std::printf("  Production: T=%d, d_s=%d, r=%d, W=%d, sinks=%d, |E|=%zu, lambda=%.2e\n",
+	            T, d_s, r, W, n_sinks, p.edge_src.size(), p.lambda);
+	std::printf("    Build wall-clock: %.3f sec\n", build_sec);
+
+	const int m = 32;  // Lower m for production to keep wall-clock manageable
+
+	clock_t t_start = clock();
+	glades::transformer_sfa_chebyshev::lanczosSolve(p, &b[0], m, &s_lanczos[0]);
+	clock_t t_end = clock();
+	const double wall_sec = double(t_end - t_start) / CLOCKS_PER_SEC;
+
+	const float rel_residual = glades::transformer_sfa_chebyshev::residualNorm(p, &b[0], &s_lanczos[0]);
+
+	std::printf("    Lanczos m=%d: ||r||/||b|| = %.4e, wall-clock = %.3f sec\n",
+	            m, rel_residual, wall_sec);
+
+	// Pass: residual < 1e-1 (coarse for T=16384 with m=32) AND wall-clock < 60 sec.
+	const bool pass = (rel_residual < 1e-1f) && (wall_sec < 60.0);
+	if (pass)
+	{
+		std::printf("[PASS] T=%d production-scale Lanczos: %.2e residual, %.1f sec.\n",
+		            T, rel_residual, wall_sec);
+		return 1;
+	}
+	else
+	{
+		std::printf("[FAIL] T=%d Lanczos: residual=%.2e, wall=%.1fs.\n",
+		            T, rel_residual, wall_sec);
+		return 0;
+	}
+}
+
 // Scale-up test: Lanczos at T=1024, d_s=8, r=4 — near-production size.
 // Reports wall-clock to demonstrate feasibility at the design-target scale.
 int testLanczosScaleUp()
@@ -495,6 +546,7 @@ int main(int /*argc*/, char** /*argv*/)
 	n_pass += testDirectSolveAgreement();   n_total++;
 	n_pass += testLanczosHardRegime();   n_total++;
 	n_pass += testLanczosScaleUp();   n_total++;
+	n_pass += testLanczosProduction();   n_total++;
 
 	std::printf("\n");
 	std::printf("============================\n");
