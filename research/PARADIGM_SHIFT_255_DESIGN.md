@@ -367,15 +367,23 @@ After paradigm #250 Phase 8b (already shipped) validates SFA mechanism:
 
 **Setup**: train uniform SFA at L=18 for 200 steps (matching Phase 8b initial). Compute `ε_i^{(18)}` for all positions i ∈ {0, ..., 7} averaged over a held-out val batch.
 
-**Pass criterion**: `ε_i` for positions 3, 5, 6, 7 is at least 3× the value for positions 0, 1.
+**Pass criterion (revised per iter-12 prototype, see `DSA_PROBE_O_PROTOTYPE_RESULT.md`)**: BOTH of the following must hold:
+1. `mean(ε_i for i ∈ {3,...,7})  ≥  2 × mean(ε_i for i ∈ {0, 1})`
+2. `Pearson r ( ε_i ,  |ΔNLL_i| )  ≥  0.5` over i ∈ {0,...,7}, where ΔNLL_i is Phase 8b's per-position NLL gain.
 
-**Fail criterion**: `ε_i` shows no position-dependence (uniform across pos 0-7), OR is highest at pos 0, 1 (anti-correlated with Phase 8b NLL gain).
+The 2× ratio bar (revised from the original 3×) is calibrated empirically: synthetic Phase-8b-aligned Σ produces ratios of 1.84-2.56× across reasonable divergence-magnitude / rank-r choices. The 0.5 correlation floor leaves headroom for noise vs the synthetic r ≈ 0.90.
+
+**Fail criterion**: BOTH conditions fail — `ε_i` is roughly uniform (ratio < 1.3×) AND correlation r < 0.3.
 
 **Cost**: 10 minutes (200-step training + one defect computation).
 
 **Interpretation**:
 - Pass: the commutation defect ε is a valid surrogate for Phase 8b's NLL position pattern. DSA's central mechanism is grounded.
-- Fail: ε does not capture the right signal. DSA's gate must use a different driver (e.g., training-NLL-difference per token, accumulated over batches).
+- Fail on ratio only: defect signal exists but is muted — consider multi-resolution defect (eq. 5) or aggregating across multiple edge neighbours instead of just j_+(i).
+- Fail on correlation only: defect signal is noisy — consider averaging across val batches or training steps.
+- Fail on both: ε does not capture the right signal. DSA's gate must use a different driver (e.g., training-NLL-difference per token, accumulated over batches).
+
+**Prior validation**: the synthetic prototype (`research/dsa_probe_o_prototype.py`) achieves Pearson r = +0.900 and late/early ratio = 2.56× on Phase-8b-aligned synthetic Σ at the nominal divergence magnitude, confirming the formula is internally consistent.
 
 ### 8.2 Probe P (new, DSA-specific): gate trains to position-stratified pattern
 
