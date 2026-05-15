@@ -292,6 +292,104 @@ int testChebyshevSolve(const SFAParams& p)
 
 }  // anonymous namespace
 
+// Probe A: structural recovery check on TINY problem (T=8, d_s=1).
+// Builds L_F explicitly as a dense matrix, solves (L_F + λI) s = b by Gaussian
+// elimination, and compares to Chebyshev result. Validates that the iterative
+// solver produces the same answer as the direct solve.
+int testDirectSolveAgreement()
+{
+	SFAParams p;
+	const int T = 8, d_s = 1, d_h = 1, r = 1, W = 3, n_sinks = 1;
+	buildSyntheticSFAParams(p, T, d_s, d_h, r, W, n_sinks);
+	p.lambda = 10.0f;  // Moderate regulariser for well-conditioned direct solve.
+
+	const int Tds = T * d_s;
+	std::vector<float> b(Tds), s_iter(Tds), s_direct(Tds);
+	for (int k = 0; k < Tds; ++k)
+		b[k] = urand(-1.0f, 1.0f);
+
+	// Build L_F + lambda*I as dense matrix via repeated unit-vector matvecs.
+	std::vector<float> M_dense(Tds * Tds, 0.0f);
+	std::vector<float> e(Tds, 0.0f), Le(Tds);
+	for (int j = 0; j < Tds; ++j)
+	{
+		std::fill(e.begin(), e.end(), 0.0f);
+		e[j] = 1.0f;
+		glades::transformer_sfa_ops::laplacianMatvec(p, &e[0], &Le[0]);
+		for (int i = 0; i < Tds; ++i)
+			M_dense[i * Tds + j] = Le[i] + (i == j ? p.lambda : 0.0f);
+	}
+
+	// Direct Gaussian elimination on M_dense * s_direct = b.
+	std::vector<float> A(M_dense);
+	std::vector<float> rhs(b);
+	// Forward elimination with partial pivoting (deterministic).
+	for (int i = 0; i < Tds; ++i)
+	{
+		// Find pivot
+		int piv = i;
+		for (int k = i + 1; k < Tds; ++k)
+			if (std::fabs(A[k * Tds + i]) > std::fabs(A[piv * Tds + i]))
+				piv = k;
+		if (piv != i)
+		{
+			for (int k = 0; k < Tds; ++k)
+				std::swap(A[i * Tds + k], A[piv * Tds + k]);
+			std::swap(rhs[i], rhs[piv]);
+		}
+		const float diag = A[i * Tds + i];
+		if (std::fabs(diag) < 1e-12f)
+		{
+			std::printf("[FAIL] Probe A: matrix singular at row %d.\n", i);
+			return 0;
+		}
+		for (int k = i + 1; k < Tds; ++k)
+		{
+			const float factor = A[k * Tds + i] / diag;
+			for (int j = i; j < Tds; ++j)
+				A[k * Tds + j] -= factor * A[i * Tds + j];
+			rhs[k] -= factor * rhs[i];
+		}
+	}
+	// Back substitution.
+	for (int i = Tds - 1; i >= 0; --i)
+	{
+		float sum = rhs[i];
+		for (int j = i + 1; j < Tds; ++j)
+			sum -= A[i * Tds + j] * s_direct[j];
+		s_direct[i] = sum / A[i * Tds + i];
+	}
+
+	// Iterative Chebyshev solve at high M.
+	glades::transformer_sfa_chebyshev::solveTikhonov(p, &b[0], 32, false, &s_iter[0]);
+
+	// Compare.
+	float diff = 0.0f, norm = 0.0f;
+	for (int k = 0; k < Tds; ++k)
+	{
+		const float d = s_iter[k] - s_direct[k];
+		diff += d * d;
+		norm += s_direct[k] * s_direct[k];
+	}
+	diff = std::sqrt(diff);
+	norm = std::sqrt(norm);
+	const float rel_err = diff / std::max(norm, 1e-12f);
+
+	std::printf("  Probe A (T=8, d_s=1, lambda=%.1f, M=32):\n", p.lambda);
+	std::printf("    ||s_iter - s_direct||/||s_direct|| = %.6e\n", rel_err);
+
+	if (rel_err < 1e-3f)
+	{
+		std::printf("[PASS] Iterative solve agrees with direct (rel err %.2e < 1e-3).\n", rel_err);
+		return 1;
+	}
+	else
+	{
+		std::printf("[FAIL] Iterative solve disagrees with direct: rel err %.2e.\n", rel_err);
+		return 0;
+	}
+}
+
 int main(int /*argc*/, char** /*argv*/)
 {
 	std::printf("SFA CPU prototype smoke test\n");
@@ -310,6 +408,7 @@ int main(int /*argc*/, char** /*argv*/)
 	n_pass += testLaplacianSymmetric(p);   n_total++;
 	n_pass += testLaplacianPSD(p);   n_total++;
 	n_pass += testChebyshevSolve(p);   n_total++;
+	n_pass += testDirectSolveAgreement();   n_total++;
 
 	std::printf("\n");
 	std::printf("============================\n");

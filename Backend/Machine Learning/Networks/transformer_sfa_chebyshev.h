@@ -98,6 +98,108 @@ inline void applyPreconditioner(const SFAParams& p,
 	}
 }
 
+// Apply symmetric preconditioner D_F^{-1/2} to a section s (per-token sqrt scaling).
+// Used to symmetrise the preconditioned system: D^{-1/2} L_F D^{-1/2}.
+inline void applySymmetricPreconditioner(const SFAParams& p,
+                                          const std::vector<float>& inv_sqrt_diag,
+                                          float* s)
+{
+	const int T = p.T;
+	const int d_s = p.d_s;
+	for (int i = 0; i < T; ++i)
+	{
+		const float scale = inv_sqrt_diag[i];
+		float* s_i = &s[static_cast<size_t>(i) * d_s];
+		for (int a = 0; a < d_s; ++a)
+		{
+			s_i[a] *= scale;
+		}
+	}
+}
+
+// Compute inv_sqrt_diag[i] = 1 / sqrt(D_F_ii) for symmetric preconditioning.
+//
+// IMPLEMENTATION NOTE (iter 16): symmetric preconditioning of (L_F + lambda*I) is
+// subtler than asymmetric. Substituting s = D^{-1/2} y gives:
+//   (D^{-1/2} L_F D^{-1/2} + lambda * D^{-1}) y = D^{-1/2} b
+//
+// The operator is symmetric, but the lambda term becomes lambda * D^{-1} (NOT
+// lambda * I). For D close to uniform, lambda * D^{-1} ≈ lambda / mean(D) * I and
+// the approximation works. For our edge-set graph, D varies by ~10x (sink degree
+// vs non-sink), so the approximation introduces a constant-factor error in lambda.
+//
+// Production-quality fix: either (a) Lanczos solver that adapts to actual spectrum,
+// or (b) treat the full operator (D^{-1/2} L_F D^{-1/2} + lambda D^{-1}) and
+// approximate f(M) where M is the full symmetric operator. Both deferred to
+// iter 17+.
+//
+// For iter 16, these helpers exist as infrastructure but aren't yet wired into
+// solveTikhonov. The unpreconditioned path is used (works for lambda >> mu_max
+// at small T; will need symmetric precond for production T=16384 with small lambda).
+inline void computeSymmetricJacobi(const SFAParams& p,
+                                    std::vector<float>& inv_sqrt_diag)
+{
+	std::vector<float> inv_diag;
+	computeJacobiPreconditioner(p, inv_diag);
+	inv_sqrt_diag.resize(inv_diag.size());
+	for (size_t i = 0; i < inv_diag.size(); ++i)
+	{
+		inv_sqrt_diag[i] = std::sqrt(inv_diag[i]);
+	}
+}
+
+// Estimate mu_max of the SYMMETRIC preconditioned operator D^{-1/2} L_F D^{-1/2}.
+inline float estimateSymmetricPreconditionedMuMax(const SFAParams& p,
+                                                    const std::vector<float>& inv_sqrt_diag,
+                                                    int n_iters,
+                                                    unsigned int seed)
+{
+	const int Tds = p.T * p.d_s;
+	std::vector<float> v(Tds);
+	std::vector<float> Lv(Tds);
+
+	unsigned int state = seed ? seed : 0xC0FFEEu;
+	for (int k = 0; k < Tds; ++k)
+	{
+		state = state * 1664525u + 1013904223u;
+		v[k] = ((state >> 16) & 0xFFFFu) / 65535.0f - 0.5f;
+	}
+
+	float norm = 0.0f;
+	for (int k = 0; k < Tds; ++k)
+		norm += v[k] * v[k];
+	norm = std::sqrt(norm);
+	const float inv_norm = 1.0f / std::max(norm, 1e-12f);
+	for (int k = 0; k < Tds; ++k)
+		v[k] *= inv_norm;
+
+	float lambda_est = 0.0f;
+	for (int it = 0; it < n_iters; ++it)
+	{
+		// Apply D^{-1/2} L_F D^{-1/2}: scale v, matvec, scale Lv.
+		std::vector<float> tmp(Tds);
+		std::memcpy(&tmp[0], &v[0], sizeof(float) * Tds);
+		applySymmetricPreconditioner(p, inv_sqrt_diag, &tmp[0]);
+		laplacianMatvec(p, &tmp[0], &Lv[0]);
+		applySymmetricPreconditioner(p, inv_sqrt_diag, &Lv[0]);
+
+		float dot = 0.0f;
+		float Lnorm = 0.0f;
+		for (int k = 0; k < Tds; ++k)
+		{
+			dot += v[k] * Lv[k];
+			Lnorm += Lv[k] * Lv[k];
+		}
+		Lnorm = std::sqrt(Lnorm);
+		lambda_est = dot;
+		const float inv2 = 1.0f / std::max(Lnorm, 1e-12f);
+		for (int k = 0; k < Tds; ++k)
+			v[k] = Lv[k] * inv2;
+	}
+
+	return lambda_est * 1.25f;  // 25% safety margin
+}
+
 // Estimate mu_max of the preconditioned operator D_F^{-1} L_F via power iteration.
 inline float estimatePreconditionedMuMax(const SFAParams& p,
                                           const std::vector<float>& inv_diag,
