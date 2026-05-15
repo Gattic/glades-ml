@@ -655,6 +655,366 @@ void sfa_build_csr_host(const int* edge_src, const int* edge_tgt, int E, int T,
 	}
 }
 
+// ===========================================================================
+//  Phase 8 (2026-05-15): backward kernels for SFA training.
+//
+// Full backward chain (given dp_out at the SFA-swap layer):
+//   1. Shear:  dy = sign · dp_out;  dp_in = dp_out (pass-through)
+//   2. Readout backward:                                       (kernel below)
+//        dσ_i[a]   = sum_h P_o[h,a] · dy_i[h]
+//        dP_o[h,a] += sum_i σ_i[a] · dy_i[h]   (atomic accumulate)
+//   3. Tikhonov adjoint solve:  w = M^{-1} dσ  (reuses Jacobi solver)
+//      → db = w
+//   4. Source-assembly backward:                               (kernel below)
+//        Per token i:
+//          dP_q[c,h] += (U_i U_i^T db_i)[c] · q_i[h]
+//          dP_v[a,h] += γ · db_i[a] · v_i[h]
+//          dq_i[h]   += sum_a,c (U_i U_i^T)[a,c] · P_q[c,h] · db_i[a]
+//          dv_i[h]   += γ · sum_a P_v[a,h] · db_i[a]
+//          dU_i[c,β] += δ_{a,c} (U_i^T P_q q_i)[β] · db_i[a]
+//                     + U_i[a,β] · (P_q q_i)[c] · db_i[a]   (source path)
+//   5. Implicit diff through L_F:                              (kernel below)
+//        For each edge e=(i,j), compute "edge bilinear" gradients:
+//        Let u = U_i^T σ_i, ū = U_i^T w_i, v = U_j^T σ_j, v̄ = U_j^T w_j.
+//        Bilinear form from edge e:
+//          B_e = ū^T (Σ² ⊙ u)              (R^T R diagonal at i)
+//              + w_j · σ_j                  (identity at j; constant in Σ, U)
+//              - ū^T (Σ ⊙ v)                (off-diag at (i,j))
+//              - v̄^T (Σ ⊙ u)                (off-diag at (j,i))
+//        Gradients (per edge, accumulated atomically):
+//          dΣ_e[β]    += -∂B_e/∂Σ_e[β]
+//                      = ū[β] v[β] + v̄[β] u[β] - 2 Σ_e[β] ū[β] u[β]
+//          dU_i[a,β]  += -∂B_e/∂U_i[a,β]
+//                      = w_i[a] Σ_e[β] (v[β] - Σ_e[β] u[β])
+//                      + σ_i[a] Σ_e[β] (v̄[β] - Σ_e[β] ū[β])
+//          dU_j[a,β]  += -∂B_e/∂U_j[a,β]
+//                      = ū[β] Σ_e[β] σ_j[a] + w_j[a] Σ_e[β] u[β]
+//
+// All kernels write FP32 gradient buffers; trainer applies Adam updates.
+// ===========================================================================
+
+namespace {
+
+// Readout backward: dσ + dP_o accumulation.
+__global__ void sfa_readout_bwd_dsigma_kernel(const float* __restrict__ P_o,
+                                                const float* __restrict__ dy,
+                                                float* __restrict__ dsigma,
+                                                int T, int d_s, int d_h)
+{
+	const int i = blockIdx.x;
+	const int a = blockIdx.y * blockDim.x + threadIdx.x;
+	if (i >= T || a >= d_s) return;
+
+	const float* dyi = dy + (size_t)i * d_h;
+	float acc = 0.0f;
+	for (int h = 0; h < d_h; ++h)
+		acc += P_o[(size_t)h * d_s + a] * dyi[h];
+	dsigma[(size_t)i * d_s + a] = acc;
+}
+
+__global__ void sfa_readout_bwd_dPo_kernel(const float* __restrict__ sigma,
+                                            const float* __restrict__ dy,
+                                            float* __restrict__ dPo,
+                                            int T, int d_s, int d_h)
+{
+	const int h = blockIdx.x;
+	const int a = blockIdx.y * blockDim.x + threadIdx.x;
+	if (h >= d_h || a >= d_s) return;
+
+	float acc = 0.0f;
+	for (int i = 0; i < T; ++i)
+		acc += sigma[(size_t)i * d_s + a] * dy[(size_t)i * d_h + h];
+	atomicAdd(&dPo[(size_t)h * d_s + a], acc);
+}
+
+// Source-assembly backward: dq, dv, dP_q, dP_v, dU (source-path contribution).
+//
+// One block per token; threads cooperate on d_s and d_h ranges via shared mem.
+// For simplicity the kernel does scalar atomics; with T=16384 and d_s≤32 the
+// dP_q/dP_v atomics are concentrated on a [d_s × d_h] buffer of size ~64K
+// elements — manageable contention.
+__global__ void sfa_source_bwd_kernel(const float* __restrict__ U,
+                                       const float* __restrict__ P_q,
+                                       const float* __restrict__ P_v,
+                                       const float* __restrict__ q,
+                                       const float* __restrict__ v,
+                                       const float* __restrict__ db,
+                                       float gamma,
+                                       float* __restrict__ dP_q,
+                                       float* __restrict__ dP_v,
+                                       float* __restrict__ dU,
+                                       float* __restrict__ dq,
+                                       float* __restrict__ dv,
+                                       int T, int d_s, int d_h, int r)
+{
+	const int i = blockIdx.x;
+	if (i >= T) return;
+
+	const float* Ui  = U  + (size_t)i * d_s * r;
+	const float* qi  = q  + (size_t)i * d_h;
+	const float* vi  = v  + (size_t)i * d_h;
+	const float* dbi = db + (size_t)i * d_s;
+	float* dUi       = dU + (size_t)i * d_s * r;
+	float* dqi       = dq + (size_t)i * d_h;
+	float* dvi       = dv + (size_t)i * d_h;
+
+	// One thread per d_h component for q/v gradients & projection backwards.
+	const int h = threadIdx.x;
+	if (h >= d_h) return;
+
+	// Compute (P_q q_i)[c] for each c — reuse across threads via shared mem.
+	// But h here is the d_h index; we need (P_q q_i)[c] = sum_h P_q[c,h] q_i[h].
+	// To avoid quadratic-in-d_h shared work per token, we just loop.
+	//
+	// Step 1: compute (U_i^T db_i)[β]   for β = 0..r-1  (length r per token)
+	__shared__ float Udb[16];     // up to kMaxR
+	__shared__ float UUtdb[128];  // U_i U_i^T db_i  — length d_s
+	if (h < r)
+	{
+		float acc = 0.0f;
+		for (int a = 0; a < d_s; ++a)
+			acc += Ui[a * r + h] * dbi[a];
+		Udb[h] = acc;
+	}
+	__syncthreads();
+	if (h < d_s)
+	{
+		float acc = 0.0f;
+		for (int beta = 0; beta < r; ++beta)
+			acc += Ui[h * r + beta] * Udb[beta];
+		UUtdb[h] = acc;
+	}
+	__syncthreads();
+
+	// Step 2: dq_i[h] += sum_a (U_i U_i^T)[a, ???] · P_q[???, h] · db_i[a]
+	//      = (sum_a P_q[a, h] · UUtdb[a])  [identifying the projection structure]
+	// Recall b_i[a] = sum_{β,c,h} U_i[a,β] U_i[c,β] P_q[c,h] q_i[h] + γ P_v[a,h] v_i[h]
+	//              = sum_h P_q^proj_i[a, h] q_i[h] + γ P_v[a,h] v_i[h]
+	//   where P_q^proj_i = (U_i U_i^T) · P_q.
+	// dq_i[h] = sum_a db_i[a] · P_q^proj_i[a, h] = (UUtdb)^T · P_q[:, h]
+	{
+		float acc = 0.0f;
+		for (int a = 0; a < d_s; ++a)
+			acc += UUtdb[a] * P_q[(size_t)a * d_h + h];
+		dqi[h] = acc;
+	}
+	// dv_i[h] = γ · sum_a db_i[a] · P_v[a, h]
+	{
+		float acc = 0.0f;
+		for (int a = 0; a < d_s; ++a)
+			acc += dbi[a] * P_v[(size_t)a * d_h + h];
+		dvi[h] = gamma * acc;
+	}
+	// dP_q[c, h] += UUtdb[c] · q_i[h]   (atomic, per c)
+	for (int c = 0; c < d_s; ++c)
+		atomicAdd(&dP_q[(size_t)c * d_h + h], UUtdb[c] * qi[h]);
+	// dP_v[a, h] += γ · db_i[a] · v_i[h]   (atomic, per a)
+	for (int a = 0; a < d_s; ++a)
+		atomicAdd(&dP_v[(size_t)a * d_h + h], gamma * dbi[a] * vi[h]);
+
+	// dU_i contribution from source assembly (in addition to L_F implicit diff):
+	//   b_i[a] = sum_β U_i[a,β] · (U_i^T P_q q_i)[β] + γ P_v[a,h] v_i[h]
+	//   ∂b_i[a]/∂U_i[c,β] = δ_{a,c} (U_i^T P_q q_i)[β] + U_i[a,β] (P_q q_i)[c]
+	// dU_i[c, β] += db_i[a=c] · (U_i^T P_q q_i)[β] + sum_a db_i[a] · U_i[a,β] · (P_q q_i)[c]
+	//
+	// Need (P_q q_i)[c] — compute it from h-parallel reduction.  Reuse smem.
+	__shared__ float Pq_qi[128];  // length d_s; (P_q q_i)[c]
+	if (h < d_s)
+	{
+		float acc = 0.0f;
+		for (int hh = 0; hh < d_h; ++hh)
+			acc += P_q[(size_t)h * d_h + hh] * qi[hh];
+		Pq_qi[h] = acc;
+	}
+	__syncthreads();
+	// Also need (U_i^T P_q q_i)[β] (length r).
+	__shared__ float UTPqq[16];
+	if (h < r)
+	{
+		float acc = 0.0f;
+		for (int c = 0; c < d_s; ++c)
+			acc += Ui[c * r + h] * Pq_qi[c];
+		UTPqq[h] = acc;
+	}
+	__syncthreads();
+	// Now accumulate dU_i: h-parallel over (c, β) of size d_s * r.
+	// Use (c, β) indexed by single thread h if h < d_s * r.
+	if (h < d_s * r)
+	{
+		const int c    = h / r;
+		const int beta = h % r;
+		float grad = dbi[c] * UTPqq[beta];
+		// + sum_a db_i[a] · U_i[a, β] · Pq_qi[c]   (second term)
+		float second = 0.0f;
+		for (int a = 0; a < d_s; ++a)
+			second += dbi[a] * Ui[a * r + beta];
+		grad += second * Pq_qi[c];
+		// dU is shared with the L_F implicit-diff kernel; use atomic add.
+		atomicAdd(&dUi[c * r + beta], grad);
+	}
+}
+
+// Implicit-differentiation through L_F: edge-parallel gradient accumulation
+// for U and Σ.  Inputs are σ (forward solution) and w = M^{-1} dσ (adjoint).
+__global__ void sfa_laplacian_bwd_kernel(const float* __restrict__ U,
+                                          const float* __restrict__ Sigma,
+                                          const int*   __restrict__ edge_src,
+                                          const int*   __restrict__ edge_tgt,
+                                          const float* __restrict__ sigma,
+                                          const float* __restrict__ w,
+                                          float* __restrict__ dU,
+                                          float* __restrict__ dSigma,
+                                          int T, int E, int d_s, int r)
+{
+	int e = blockIdx.x * blockDim.x + threadIdx.x;
+	if (e >= E) return;
+
+	const int i = edge_src[e];
+	const int j = edge_tgt[e];
+	const float* Ui    = U + (size_t)i * d_s * r;
+	const float* Uj    = U + (size_t)j * d_s * r;
+	const float* Sig_e = Sigma + (size_t)e * r;
+	const float* si    = sigma + (size_t)i * d_s;
+	const float* sj    = sigma + (size_t)j * d_s;
+	const float* wi    = w + (size_t)i * d_s;
+	const float* wj    = w + (size_t)j * d_s;
+
+	// u = U_i^T σ_i,  ū = U_i^T w_i,  v = U_j^T σ_j,  v̄ = U_j^T w_j   (length r)
+	float u[kMaxR], ubar[kMaxR], v[kMaxR], vbar[kMaxR];
+	for (int beta = 0; beta < r; ++beta)
+	{
+		float u_b = 0.0f, ub_b = 0.0f, v_b = 0.0f, vb_b = 0.0f;
+		for (int a = 0; a < d_s; ++a)
+		{
+			u_b  += Ui[a * r + beta] * si[a];
+			ub_b += Ui[a * r + beta] * wi[a];
+			v_b  += Uj[a * r + beta] * sj[a];
+			vb_b += Uj[a * r + beta] * wj[a];
+		}
+		u[beta]    = u_b;
+		ubar[beta] = ub_b;
+		v[beta]    = v_b;
+		vbar[beta] = vb_b;
+	}
+
+	// dΣ_e[β] += ū[β] v[β] + v̄[β] u[β] - 2 Σ_e[β] ū[β] u[β]
+	for (int beta = 0; beta < r; ++beta)
+	{
+		float g = ubar[beta] * v[beta]
+		        + vbar[beta] * u[beta]
+		        - 2.0f * Sig_e[beta] * ubar[beta] * u[beta];
+		atomicAdd((float*)&dSigma[(size_t)e * r + beta], g);
+	}
+
+	// dU_i[a, β] += w_i[a] Σ_e[β] (v[β] - Σ_e[β] u[β])
+	//            + σ_i[a] Σ_e[β] (v̄[β] - Σ_e[β] ū[β])
+	float* dUi = dU + (size_t)i * d_s * r;
+	float* dUj = dU + (size_t)j * d_s * r;
+	for (int a = 0; a < d_s; ++a)
+	{
+		for (int beta = 0; beta < r; ++beta)
+		{
+			float t1 = wi[a] * Sig_e[beta] * (v[beta]    - Sig_e[beta] * u[beta]);
+			float t2 = si[a] * Sig_e[beta] * (vbar[beta] - Sig_e[beta] * ubar[beta]);
+			atomicAdd(&dUi[a * r + beta], t1 + t2);
+		}
+	}
+	// dU_j[a, β] += ū[β] Σ_e[β] σ_j[a] + w_j[a] Σ_e[β] u[β]
+	for (int a = 0; a < d_s; ++a)
+	{
+		for (int beta = 0; beta < r; ++beta)
+		{
+			float t = Sig_e[beta] * (ubar[beta] * sj[a] + wj[a] * u[beta]);
+			atomicAdd(&dUj[a * r + beta], t);
+		}
+	}
+}
+
+} // anonymous namespace
+
+bool sfa_readout_backward_fp32(const float* P_o, const float* sigma,
+                                const float* dy,
+                                float* dsigma, float* dPo,
+                                int T, int d_s, int d_h,
+                                cudaStream_t stream)
+{
+	if (T <= 0 || d_s <= 0 || d_h <= 0) return true;
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+
+	// dσ kernel: T blocks × ceil(d_s/256) blocks, 256 threads.
+	{
+		const int block = 256;
+		const int blocks_a = (d_s + block - 1) / block;
+		dim3 grid(T, blocks_a, 1);
+		sfa_readout_bwd_dsigma_kernel<<<grid, block, 0, s_use>>>(
+		    P_o, dy, dsigma, T, d_s, d_h);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	// dP_o kernel: d_h blocks × ceil(d_s/256) blocks.
+	{
+		const int block = 256;
+		const int blocks_a = (d_s + block - 1) / block;
+		dim3 grid(d_h, blocks_a, 1);
+		sfa_readout_bwd_dPo_kernel<<<grid, block, 0, s_use>>>(
+		    sigma, dy, dPo, T, d_s, d_h);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+	}
+	return true;
+}
+
+bool sfa_source_assembly_backward_fp32(const float* U, const float* P_q,
+                                        const float* P_v, const float* q,
+                                        const float* v, const float* db,
+                                        float gamma,
+                                        float* dP_q, float* dP_v, float* dU,
+                                        float* dq, float* dv,
+                                        int T, int d_s, int d_h, int r,
+                                        cudaStream_t stream)
+{
+	if (T <= 0 || d_s <= 0 || d_h <= 0 || r <= 0) return true;
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+
+	// Block size = d_h (capped at 1024).  For d_h > 1024 we'd need to split,
+	// but at d_h=2048 this kernel uses block=1024 with a striding loop inside
+	// — to keep code simple in this iter we require d_h ≤ 1024 and ask callers
+	// to chunk if needed.  At d_h = m = 2048 we exceed; fall back to scalar.
+	if (d_h > 1024 || d_s > 128 || r > 16)
+	{
+		fprintf(stderr, "[sfa-cuda] source_assembly_backward: d_h=%d d_s=%d r=%d "
+		                "exceeds kernel limits (1024/128/16); please chunk\n",
+		        d_h, d_s, r);
+		return false;
+	}
+	sfa_source_bwd_kernel<<<T, d_h, 0, s_use>>>(
+	    U, P_q, P_v, q, v, db, gamma,
+	    dP_q, dP_v, dU, dq, dv,
+	    T, d_s, d_h, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool sfa_laplacian_backward_fp32(const float* U, const float* Sigma,
+                                  const int* edge_src, const int* edge_tgt,
+                                  const float* sigma, const float* w,
+                                  float* dU, float* dSigma,
+                                  int T, int E, int d_s, int r,
+                                  cudaStream_t stream)
+{
+	if (T <= 0 || E <= 0 || d_s <= 0 || r <= 0) return true;
+	if (d_s > kMaxDS || r > kMaxR) {
+		fprintf(stderr, "[sfa-cuda] laplacian_backward: d_s=%d (max %d) r=%d (max %d)\n",
+		        d_s, kMaxDS, r, kMaxR);
+		return false;
+	}
+	cudaStream_t s_use = (stream != 0) ? stream : computeStream();
+	int grid = (E + kBlockElem - 1) / kBlockElem;
+	sfa_laplacian_bwd_kernel<<<grid, kBlockElem, 0, s_use>>>(
+	    U, Sigma, edge_src, edge_tgt, sigma, w, dU, dSigma,
+	    T, E, d_s, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 } // namespace gpu
 } // namespace glades
 

@@ -157,6 +157,60 @@ bool sfa_jacobi_step_fp32(float* s,                  // [T · d_s] in/out
                            cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
+// Phase 8 (2026-05-15): SFA backward kernels for training.
+//
+// Pipeline: at the SFA-swap layer, given dp_out:
+//   1. dy = sign · dp_out
+//   2. Readout backward:  dσ = P_o · dy,  dP_o += σ ⊗ dy
+//   3. Tikhonov adjoint:  reuse Jacobi solver on dσ → w (= db = M^{-1} dσ)
+//   4. Source assembly backward: db → dq, dv, dP_q, dP_v, dU (source path)
+//   5. L_F implicit diff: σ, w, U, Σ → dU (M path), dΣ
+//
+// All gradients are accumulated FP32; caller applies Adam updates separately.
+// ---------------------------------------------------------------------------
+
+// Step 2: readout backward.
+bool sfa_readout_backward_fp32(const float* P_o,    // [d_h · d_s]
+                                const float* sigma,  // [T · d_s]   (forward σ)
+                                const float* dy,     // [T · d_h]   (= sign · dp)
+                                float* dsigma,       // [T · d_s]   out
+                                float* dPo,          // [d_h · d_s] accumulated
+                                int T, int d_s, int d_h,
+                                cudaStream_t stream = 0);
+
+// Step 4: source-assembly backward.  Computes dq, dv, dP_q, dP_v, dU (source
+// path only — the L_F path adds to dU via sfa_laplacian_backward_fp32).
+// Constraint: d_h ≤ 1024 (block size); for larger d_h the trainer chunks.
+bool sfa_source_assembly_backward_fp32(const float* U,    // [T · d_s · r]
+                                        const float* P_q, // [d_s · d_h]
+                                        const float* P_v, // [d_s · d_h]
+                                        const float* q,   // [T · d_h]
+                                        const float* v,   // [T · d_h]
+                                        const float* db,  // [T · d_s]
+                                        float gamma,
+                                        float* dP_q,      // [d_s · d_h] accum
+                                        float* dP_v,      // [d_s · d_h] accum
+                                        float* dU,        // [T · d_s · r] accum
+                                        float* dq,        // [T · d_h] write
+                                        float* dv,        // [T · d_h] write
+                                        int T, int d_s, int d_h, int r,
+                                        cudaStream_t stream = 0);
+
+// Step 5: L_F implicit-differentiation backward.  Per edge, accumulates the
+// "edge bilinear gradient" contributions to dU (both endpoints) and dΣ.
+bool sfa_laplacian_backward_fp32(const float* U,           // [T · d_s · r]
+                                  const float* Sigma,       // [|E| · r]
+                                  const int* edge_src,      // [|E|]
+                                  const int* edge_tgt,      // [|E|]
+                                  const float* sigma,       // [T · d_s] forward σ
+                                  const float* w,           // [T · d_s] adjoint w
+                                  float* dU,                // [T · d_s · r] accum
+                                  float* dSigma,            // [|E| · r] accum
+                                  int T, int E,
+                                  int d_s, int r,
+                                  cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
 // Source assembly: b_i = U_i U_i^T P_q q_i + gamma * P_v v_i
 //
 // Per-token GEMV-like computation. Cost: O(T · (d_h·d_s + d_s·r)).
@@ -204,6 +258,18 @@ inline bool sfa_jacobi_inverse_diagonal_fp32(const float*, float*, float, int, i
 inline bool sfa_jacobi_step_fp32(float*, const float*, const float*, const float*,
                                   float, float, int, int,
                                   cudaStream_t = 0) { return false; }
+inline bool sfa_readout_backward_fp32(const float*, const float*, const float*,
+                                       float*, float*, int, int, int,
+                                       cudaStream_t = 0) { return false; }
+inline bool sfa_source_assembly_backward_fp32(const float*, const float*, const float*,
+                                               const float*, const float*, const float*,
+                                               float, float*, float*, float*, float*, float*,
+                                               int, int, int, int,
+                                               cudaStream_t = 0) { return false; }
+inline bool sfa_laplacian_backward_fp32(const float*, const float*, const int*, const int*,
+                                         const float*, const float*, float*, float*,
+                                         int, int, int, int,
+                                         cudaStream_t = 0) { return false; }
 inline bool sfa_source_assembly_fp32(const float*, const float*, const float*,
                                       const float*, const float*, float, float*,
                                       int, int, int, int, cudaStream_t = 0) { return false; }
