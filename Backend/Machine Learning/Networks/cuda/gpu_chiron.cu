@@ -158,6 +158,78 @@ __global__ void chiron_scfa_scaled_copy_kernel(float* __restrict__ c,
 	if (i < n) c[i] = alpha * a[i];
 }
 
+// iter 63 (Arc 2, BF16 residual-p — 2026-05-16): BF16-p storage variants.
+// Per PARADIGM_BF16_RESIDUAL_P_DESIGN.md §4.2:
+//   p̂ := round_RN( bf16_to_fp32(p̂) + α·(a + b) )           (axpy2)
+//   p̂ := round_RN( bf16_to_fp32(p̂) + α·x )                  (axpy)
+//   c  := round_RN( α·a )                                    (scaled-copy)
+// All accumulation is FP32-internal; only the final write rounds back to BF16.
+// RN-even (deterministic) for iter 63; stochastic-rounding (SR) variant in iter 64.
+
+__device__ __forceinline__ unsigned short fp32_to_bf16_rn_dev(float x)
+{
+	union { float f; unsigned int u; } v;
+	v.f = x;
+	if (isnan(x)) {
+		// Quiet NaN; preserve sign.
+		return (unsigned short)(((v.u & 0x80000000u) | 0x7FC00000u) >> 16);
+	}
+	// Round-to-nearest, ties-to-even.
+	const unsigned int lsb = (v.u >> 16) & 1u;
+	const unsigned int bias = 0x7FFFu + lsb;
+	return (unsigned short)((v.u + bias) >> 16);
+}
+
+__device__ __forceinline__ float bf16_to_fp32_dev(unsigned short b)
+{
+	union { unsigned int u; float f; } v;
+	v.u = ((unsigned int)b) << 16;
+	return v.f;
+}
+
+__global__ void chiron_scfa_axpy2_bf16p_rn_kernel(unsigned short* __restrict__ p_bf,
+                                                   float alpha,
+                                                   const float* __restrict__ a,
+                                                   const float* __restrict__ b, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * (a[i] + b[i]);
+	p_bf[i] = fp32_to_bf16_rn_dev(acc);
+}
+
+__global__ void chiron_axpy_bf16p_rn_kernel(unsigned short* __restrict__ p_bf,
+                                             float alpha,
+                                             const float* __restrict__ x, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * x[i];
+	p_bf[i] = fp32_to_bf16_rn_dev(acc);
+}
+
+__global__ void chiron_scfa_scaled_copy_bf16p_rn_kernel(unsigned short* __restrict__ c_bf,
+                                                         float alpha,
+                                                         const float* __restrict__ a, int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	c_bf[i] = fp32_to_bf16_rn_dev(alpha * a[i]);
+}
+
+// Read BF16 p, add to FP32 q: q[i] += alpha * bf16_to_fp32(p_bf[i]).
+// Used at the LN+axpy step (q += p) when --bf16-residual-p routes p to BF16
+// storage but q stays FP32.
+__global__ void chiron_bf16_to_fp32_axpy_kernel(float* __restrict__ q,
+                                                 float alpha,
+                                                 const unsigned short* __restrict__ p_bf,
+                                                 int n)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	q[i] += alpha * bf16_to_fp32_dev(p_bf[i]);
+}
+
 } // anonymous namespace
 
 bool chiron_scfa_sub(float* c, const float* a, const float* b, int n,
@@ -179,6 +251,55 @@ bool chiron_scfa_axpy2(float* p, float alpha,
 	int grid = (n + kBlockElem - 1) / kBlockElem;
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
 	chiron_scfa_axpy2_kernel<<<grid, kBlockElem, 0, s>>>(p, alpha, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 63 (Arc 2): BF16-p host wrappers.
+bool chiron_scfa_axpy2_bf16p_rn(unsigned short* p_bf, float alpha,
+                                 const float* a, const float* b, int n,
+                                 cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_bf16p_rn_kernel<<<grid, kBlockElem, 0, s>>>(p_bf, alpha, a, b, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_axpy_bf16p_rn(unsigned short* p_bf, float alpha,
+                           const float* x, int n,
+                           cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_axpy_bf16p_rn_kernel<<<grid, kBlockElem, 0, s>>>(p_bf, alpha, x, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_scaled_copy_bf16p_rn(unsigned short* c_bf, float alpha,
+                                       const float* a, int n,
+                                       cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_scaled_copy_bf16p_rn_kernel<<<grid, kBlockElem, 0, s>>>(c_bf, alpha, a, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_bf16_to_fp32_axpy(float* q, float alpha,
+                               const unsigned short* p_bf, int n,
+                               cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_bf16_to_fp32_axpy_kernel<<<grid, kBlockElem, 0, s>>>(q, alpha, p_bf, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

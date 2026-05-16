@@ -66,6 +66,27 @@ bool chiron_scfa_axpy2(float* p, float alpha,
 bool chiron_scfa_scaled_copy(float* c, float alpha, const float* a, int n,
                               cudaStream_t stream = 0);
 
+// iter 63 (Arc 2, BF16 residual-p — 2026-05-16): BF16-p storage variants.
+// Read BF16 p, accumulate FP32 in registers, RN-round on write.  Used when
+// --bf16-residual-p routes the residual stream to BF16 storage to halve
+// HBM traffic on the SCFA element-wise stack (Amdahl ceiling +4.8% wall at
+// iter-bench T=8192 L=12).  Stochastic-rounding variant lands in iter 64
+// once the framework is validated.
+bool chiron_scfa_axpy2_bf16p_rn(unsigned short* p_bf, float alpha,
+                                 const float* a, const float* b, int n,
+                                 cudaStream_t stream = 0);
+bool chiron_axpy_bf16p_rn(unsigned short* p_bf, float alpha,
+                           const float* x, int n,
+                           cudaStream_t stream = 0);
+bool chiron_scfa_scaled_copy_bf16p_rn(unsigned short* c_bf, float alpha,
+                                       const float* a, int n,
+                                       cudaStream_t stream = 0);
+// q[i] += alpha * bf16_to_fp32(p_bf[i]).  Used at "q += p" sites when p is
+// BF16 storage but q stays FP32.  FP32 result write.
+bool chiron_bf16_to_fp32_axpy(float* q, float alpha,
+                               const unsigned short* p_bf, int n,
+                               cudaStream_t stream = 0);
+
 // ---------------------------------------------------------------------------
 // Reversible LayerNorm (ReLN) with external stats buffer.
 // ---------------------------------------------------------------------------
