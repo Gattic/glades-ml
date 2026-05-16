@@ -16,6 +16,7 @@ set(GLADES_CUDA_SOURCES
 	gpu_chiron.cu
 	gpu_sfa.cu
 	gpu_igaa.cu
+	gpu_medal.cu
 	gpu_graph.cu
 	gpu_blas_fp8.cu
 	gpu_stiefel.cu
