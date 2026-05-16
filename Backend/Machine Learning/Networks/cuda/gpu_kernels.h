@@ -388,6 +388,17 @@ bool adam_update_int8_state_bf16grad_bf16w(uint16_t* param_bf16,
                                             int step, int n,
                                             uint32_t srBaseSeed, uint32_t srStepIdx);
 
+// Iter 49: fused int8 Adam with BF16-weight + BF16-grad inline I/O.  No FP32
+// scratch needed.  Replaces the cast+adam+cast 4-kernel chain with one kernel.
+bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t* param_bf16,
+                                               const uint16_t* grad_bf16,
+                                               int8_t* m_int8, uint8_t* v_uint8,
+                                               float* m_scale, float* v_scale,
+                                               float lr, float beta1, float beta2, float eps,
+                                               float weightDecay, float gradScale,
+                                               int step, int n,
+                                               uint32_t srBaseSeed, uint32_t srStepIdx);
+
 // Returns the number of FP32 scale entries required for int8 Adam state
 // given a parameter count n.
 int adam_int8_scale_count(int n);
@@ -999,6 +1010,10 @@ inline bool adam_update_int8_state_bf16grad_bf16w(uint16_t*, float*, const uint1
                                                    int8_t*, uint8_t*, float*, float*, float*,
                                                    float, float, float, float, float, float,
                                                    int, int, uint32_t, uint32_t) { return false; }
+inline bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t*, const uint16_t*,
+                                                      int8_t*, uint8_t*, float*, float*,
+                                                      float, float, float, float, float, float,
+                                                      int, int, uint32_t, uint32_t) { return false; }
 inline bool astra_update(float*, const float*, float*,
                           float, float, float, float, float,
                           int, int) { return false; }

@@ -1932,6 +1932,193 @@ __global__ void adam_update_int8_state_kernel(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Iter 49: fused adam-int8 with BF16-weight + BF16-grad inline I/O.
+// Replaces the 4-kernel chain `cast_bf16_to_f32(param) + cast_bf16_to_f32(grad)
+// + adam_update_int8_state + cast_f32_to_bf16_stochastic(param)` with one
+// kernel that decodes BF16 → FP32 on read, runs the same Adam math, and
+// encodes FP32 → BF16 (stochastic, same RNG as cast_f32_to_bf16_stochastic)
+// on write.  Eliminates 3 kernel launches and the param/grad/param FP32
+// scratch round-trips per param per step.
+//
+// Cast helper is in another anonymous namespace later in the file; we duplicate
+// the sr_hash32 device function here so this kernel can be inlined locally.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint32_t adam_int8_sr_hash32(uint32_t a,
+                                                         uint32_t b,
+                                                         uint32_t c)
+{
+	uint32_t x = a ^ (b * 0x9E3779B1u) ^ (c * 0x85EBCA6Bu);
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	return x;
+}
+
+__global__ void adam_update_int8_state_bf16w_bf16g_kernel(
+    uint16_t* __restrict__ param_bf16,
+    const uint16_t* __restrict__ grad_bf16,
+    int8_t*  __restrict__ m_int8,
+    uint8_t* __restrict__ v_uint8,
+    float* __restrict__ m_scale,
+    float* __restrict__ v_scale,
+    float lr, float beta1, float beta2,
+    float eps, float weightDecay,
+    float gradScale,
+    int step, int n, int numBlocks,
+    uint32_t srBaseSeed, uint32_t srStepIdx)
+{
+	const int blockId = blockIdx.x;
+	if (blockId >= numBlocks) return;
+
+	const int start = blockId * ADAM_INT8_BS;
+	const int end = min(start + ADAM_INT8_BS, n);
+	const int len = end - start;
+
+	const float oldMScale = m_scale[blockId];
+	const float oldVScale = v_scale[blockId];
+	const float qinvM = 1.0f / 127.0f;
+	const float qinvV = 1.0f / 255.0f;
+
+	__shared__ float sM[ADAM_INT8_BS];
+	__shared__ float sV[ADAM_INT8_BS];
+
+	float localMmax = 0.0f;
+	float localVmax = 0.0f;
+
+	// Pass 1: read bf16 grad, decode inline, compute m/v updates, find absmax.
+	for (int i = threadIdx.x; i < len; i += blockDim.x)
+	{
+		const int gi = start + i;
+		// Inline bf16 → fp32 cast for grad.
+		union { uint32_t u; float f; } gv;
+		gv.u = (uint32_t)grad_bf16[gi] << 16;
+		const float g = gv.f * gradScale;
+
+		const float mOld = (float)m_int8[gi]  * oldMScale * qinvM;
+		const float vOld = (float)v_uint8[gi] * oldVScale * qinvV;
+
+		const float mNew = beta1 * mOld + (1.0f - beta1) * g;
+		const float vNew = beta2 * vOld + (1.0f - beta2) * g * g;
+
+		sM[i] = mNew;
+		sV[i] = vNew;
+
+		const float am = fabsf(mNew);
+		if (am > localMmax) localMmax = am;
+		if (vNew > localVmax) localVmax = vNew;
+	}
+
+	// Block-reduce absmax via warp shuffle.
+	__shared__ float sWarpM[32], sWarpV[32];
+	float mMax = localMmax;
+	float vMax = localVmax;
+	for (int off = warpSize / 2; off > 0; off /= 2)
+	{
+		float o = __shfl_xor_sync(0xFFFFFFFF, mMax, off);
+		if (o > mMax) mMax = o;
+		o = __shfl_xor_sync(0xFFFFFFFF, vMax, off);
+		if (o > vMax) vMax = o;
+	}
+	const int warpId = threadIdx.x / warpSize;
+	const int lane = threadIdx.x % warpSize;
+	if (lane == 0)
+	{
+		sWarpM[warpId] = mMax;
+		sWarpV[warpId] = vMax;
+	}
+	__syncthreads();
+	if (warpId == 0)
+	{
+		const int numWarps = blockDim.x / warpSize;
+		float mm = (lane < numWarps) ? sWarpM[lane] : 0.0f;
+		float vv = (lane < numWarps) ? sWarpV[lane] : 0.0f;
+		for (int off = warpSize / 2; off > 0; off /= 2)
+		{
+			float o = __shfl_xor_sync(0xFFFFFFFF, mm, off);
+			if (o > mm) mm = o;
+			o = __shfl_xor_sync(0xFFFFFFFF, vv, off);
+			if (o > vv) vv = o;
+		}
+		if (lane == 0)
+		{
+			sWarpM[0] = mm;
+			sWarpV[0] = vv;
+		}
+	}
+	__syncthreads();
+
+	const float newMMax = fmaxf(sWarpM[0], 1e-20f);
+	const float newVMax = fmaxf(sWarpV[0], 1e-20f);
+
+	if (threadIdx.x == 0)
+	{
+		m_scale[blockId] = newMMax;
+		v_scale[blockId] = newVMax;
+	}
+
+	const float bc1 = 1.0f - powf(beta1, (float)step);
+	const float bc2 = 1.0f - powf(beta2, (float)step);
+	const float invNewM = 127.0f / newMMax;
+	const float invNewV = 255.0f / newVMax;
+
+	// Pass 2: requantize m/v, read bf16 param, update, stochastic encode bf16 param.
+	for (int i = threadIdx.x; i < len; i += blockDim.x)
+	{
+		const int gi = start + i;
+		const float mNew = sM[i];
+		const float vNew = sV[i];
+
+		// Requantize m → signed int8.
+		float mq = mNew * invNewM;
+		mq = fmaxf(-127.0f, fminf(127.0f, rintf(mq)));
+		m_int8[gi]  = (int8_t)mq;
+		// Requantize v → unsigned uint8.
+		if (vNew <= 0.0f)
+		{
+			v_uint8[gi] = 0;
+		}
+		else
+		{
+			float vq = rintf(vNew * invNewV);
+			if (vq < 1.0f) vq = 1.0f;
+			if (vq > 255.0f) vq = 255.0f;
+			v_uint8[gi] = (uint8_t)vq;
+		}
+
+		// Decode bf16 param inline.
+		union { uint32_t u; float f; } pv;
+		pv.u = (uint32_t)param_bf16[gi] << 16;
+		float pFp = pv.f;
+
+		// AdamW weight decay.
+		if (weightDecay != 0.0f)
+			pFp -= lr * weightDecay * pFp;
+
+		// Bias-corrected Adam update.
+		const float mHat = mNew / bc1;
+		const float vHat = vNew / bc2;
+		pFp -= lr * mHat / (sqrtf(vHat) + eps);
+
+		// Stochastic-rounded fp32 → bf16 encode (same RNG as cast_f32_to_bf16_stochastic).
+		union { float f; uint32_t u; } v;
+		v.f = pFp;
+		if (isnan(pFp))
+		{
+			const uint32_t sign = v.u & 0x80000000u;
+			param_bf16[gi] = (uint16_t)(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		}
+		else
+		{
+			const uint32_t low16 = v.u & 0xFFFFu;
+			const uint32_t rnd = adam_int8_sr_hash32((uint32_t)gi, srStepIdx, srBaseSeed) & 0xFFFFu;
+			uint32_t high16 = v.u >> 16;
+			if (rnd < low16) high16 += 1u;
+			param_bf16[gi] = (uint16_t)(high16 & 0xFFFFu);
+		}
+	}
+}
+
 } // anonymous namespace
 
 bool adam_update_int8_state(float* param, const float* grad,
@@ -1999,6 +2186,33 @@ bool adam_update_bf16_state_bf16grad_bf16w(uint16_t* param_bf16,
 		return false;
 	return cast_f32_to_bf16_stochastic(weight_scratch_fp32, param_bf16, (size_t)n,
 	                                    srBaseSeed, srStepIdx);
+}
+
+// Iter 49 fused: int8 Adam with BF16-weight + BF16-grad direct I/O.
+// Replaces the 4-kernel chain (cast bf16→fp32 param, cast bf16→fp32 grad,
+// adam_update_int8_state, cast fp32→bf16 stochastic param) with one kernel.
+// Bit-equivalent to the chain modulo fp32 reduction-order in the absmax
+// reduce; same stochastic rounding RNG (sr_hash32) keyed on (idx, srStepIdx,
+// srBaseSeed) so training trajectory is bit-identical to the unfused path
+// modulo sub-ULP FMA ordering.
+bool adam_update_int8_state_bf16w_bf16g_fused(uint16_t* param_bf16,
+                                               const uint16_t* grad_bf16,
+                                               int8_t* m_int8, uint8_t* v_uint8,
+                                               float* m_scale, float* v_scale,
+                                               float lr, float beta1, float beta2, float eps,
+                                               float weightDecay, float gradScale,
+                                               int step, int n,
+                                               uint32_t srBaseSeed, uint32_t srStepIdx)
+{
+	if (n <= 0) return true;
+	if (param_bf16 == 0 || grad_bf16 == 0) return false;
+	const int numBlocks = (n + ADAM_INT8_BS - 1) / ADAM_INT8_BS;
+	adam_update_int8_state_bf16w_bf16g_kernel<<<numBlocks, ADAM_INT8_BS, 0, computeStream()>>>(
+	    param_bf16, grad_bf16, m_int8, v_uint8, m_scale, v_scale,
+	    lr, beta1, beta2, eps, weightDecay, gradScale, step, n, numBlocks,
+	    srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
 }
 
 bool adam_update_int8_state_bf16grad_bf16w(uint16_t* param_bf16,
