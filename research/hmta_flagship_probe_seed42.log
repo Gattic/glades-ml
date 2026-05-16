@@ -1,0 +1,36 @@
+HMTA Flagship SV-Retention Probe — paradigm #261 iter 41
+=========================================================
+Checkpoint: research/runs/2026-05-15-flagship-postfix-T16384-30k/chiron_1B_T16384.step30000
+Seed: 42
+
+Format: CHRF v=4 (full-state)
+Dims: T=16384 m=2048 L=24 nH=16 dH=256 V=32000 dModel=4096
+CHRF flags: 0x50  (bf16=1, has_gamma_p=0, scfa=0)
+Skipped embedding (125.0 MB)
+Loaded Wq, Wk for layer 6
+Loaded Wq, Wk for layer 12
+Loaded Wq, Wk for layer 18
+
+=== Probe results (median across heads × seeds per layer) ===
+LayerNormed random Gaussian X, [s0=64, m=2048]
+Per-head:  Q = X·Wq_h, K = X·Wk_h, Lambda = Q K^T / sqrt(dH=256)
+
+  layer | p=8  | p=16 | p=24 | p=32 | p=48 |  (rank-p retention)
+  ------+------+------+------+------+------
+  L= 6  | 0.519| 0.720| 0.849| 0.927| 0.991
+  L=12  | 0.499| 0.704| 0.838| 0.921| 0.990
+  L=18  | 0.552| 0.733| 0.854| 0.929| 0.992
+  ------+------+------+------+------+------
+  pool  | 0.518| 0.719| 0.847| 0.925| 0.991
+
+=== Gate-0 verdict (C0-iter41) ===
+Threshold: median retention >= 0.85.
+
+  p= 8 : median retention = 0.518   FAIL
+  p=16 : median retention = 0.719   FAIL
+  p=24 : median retention = 0.847   FAIL
+  p=32 : median retention = 0.925   PASS
+  p=48 : median retention = 0.991   PASS
+
+VERDICT: PARTIAL — clears only at p=32.  Iter-40 design needs
+         revision: p_K must be raised to 32 to match real data.
