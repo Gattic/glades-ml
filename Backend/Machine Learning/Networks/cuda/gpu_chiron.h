@@ -324,6 +324,28 @@ bool chiron_attention_shear_backward_bf16w_tiled(
     float* sdO, float* sdQ, float* sdK, float* sdV,
     float* scratch_P, float* scratch_dP);
 
+// iter 61 (2026-05-16): BF16-grad variant of _bf16w_tiled.  Identical math
+// + identical scratch layout, but the 4 dW weight-grad GEMMs use
+// sgemm_rowmajor_atb_bf16_dst_bf16 (cuBLAS gemmEx with D=BF16) to write
+// directly into BF16 persistent grad buffers with beta=1.  Eliminates the
+// downstream bf16_accum_axpy commit kernel (3.1% of GPU time at iter60).
+// Caller must pre-zero the BF16 dW buffers at the start of the
+// accumulation window (same protocol as bf16_accum_axpy path).
+bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead,
+    bool causal,
+    float* dq,
+    unsigned short* dWq_bf, unsigned short* dWk_bf,
+    unsigned short* dWv_bf, unsigned short* dWo_bf,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP);
+
 // Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
 // scratch_dP, each [nHeads, T, T], caller-owned.
@@ -559,6 +581,17 @@ inline bool chiron_attention_shear_backward_bf16w_tiled(
     int, int, int, int, bool,
     float*,
     float*, float*, float*, float*,
+    unsigned short*, unsigned short*,
+    float*, float*, float*, float*,
+    float*, float*, float*, float*,
+    float*, float*) { return false; }
+inline bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
+    const float*, const float*,
+    const unsigned short*, const unsigned short*,
+    const unsigned short*, const unsigned short*,
+    int, int, int, int, bool,
+    float*,
+    unsigned short*, unsigned short*, unsigned short*, unsigned short*,
     unsigned short*, unsigned short*,
     float*, float*, float*, float*,
     float*, float*, float*, float*,

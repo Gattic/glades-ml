@@ -1032,6 +1032,57 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
 	                        "cublasGemmEx(BF16,ABT)");
 }
 
+// iter 61 (2026-05-16): BF16-out variant.  Same row-major→col-major transpose
+// trick as gemmex_bf16_impl but D type is CUDA_R_16BF.  cuBLAS reads C as
+// BF16 (sign-extended to FP32 internally for the beta*C term), accumulates
+// alpha*A*B in FP32 inside the tensor cores, then casts the FP32 result back
+// to BF16 (RN-even) on store.  Used by the weight-grad backward path to
+// commit dW directly into the BF16 persistent grad buffer, eliminating the
+// downstream bf16_accum_axpy commit kernel.
+static bool gemmex_bf16_impl_dst_bf16(cublasOperation_t transa, cublasOperation_t transb,
+                                       int M, int N, int K,
+                                       float alpha,
+                                       const unsigned short* A, int lda,
+                                       const unsigned short* B, int ldb,
+                                       float beta,
+                                       unsigned short* C, int ldc,
+                                       const char* label)
+{
+	if (!g_initialized && !blasInit())
+		return false;
+
+	cublasStatus_t st = cublasGemmEx(g_handle,
+	                                 transa, transb,
+	                                 N, M, K,
+	                                 &alpha,
+	                                 B, CUDA_R_16BF, ldb,
+	                                 A, CUDA_R_16BF, lda,
+	                                 &beta,
+	                                 C, CUDA_R_16BF, ldc,
+	                                 CUBLAS_COMPUTE_32F_FAST_16BF,
+	                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+	if (st != CUBLAS_STATUS_SUCCESS)
+	{
+		fprintf(stderr, "[glades-cuda] %s failed: %d (M=%d N=%d K=%d)\n",
+		        label, static_cast<int>(st), M, N, K);
+		return false;
+	}
+	return true;
+}
+
+bool sgemm_rowmajor_atb_bf16_dst_bf16(int M, int N, int K,
+                                       float alpha,
+                                       const unsigned short* A, int lda,
+                                       const unsigned short* B, int ldb,
+                                       float beta,
+                                       unsigned short* C, int ldc)
+{
+	return gemmex_bf16_impl_dst_bf16(CUBLAS_OP_N, CUBLAS_OP_T,
+	                                  M, N, K,
+	                                  alpha, A, lda, B, ldb, beta, C, ldc,
+	                                  "cublasGemmEx(BF16,ATB,dstBF16)");
+}
+
 // === FAST_16BF GEMM (FP32 in/out, BF16 tensor-core compute) ===
 //
 // Same row-major→col-major transpose trick as sgemm_rowmajor.  Routes

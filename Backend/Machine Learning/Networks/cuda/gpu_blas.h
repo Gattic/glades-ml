@@ -127,6 +127,19 @@ bool sgemm_rowmajor_abt_bf16(int M, int N, int K,
                              float beta,
                              float* C, int ldc);
 
+// iter 61 (2026-05-16): BF16-out variant of sgemm_rowmajor_atb_bf16.  Same
+// semantics (C = alpha * A^T · B + beta * C) but C is BF16 storage instead
+// of FP32.  cuBLAS gemmEx handles the FP32-internal-accumulator → BF16
+// rounding on the write.  Used by the weight-grad backward to write
+// directly into persistent BF16 dW buffers, eliminating the separate
+// bf16_accum_axpy commit kernel (3.1% of GPU time at iter60 baseline).
+bool sgemm_rowmajor_atb_bf16_dst_bf16(int M, int N, int K,
+                                       float alpha,
+                                       const unsigned short* A, int lda,
+                                       const unsigned short* B, int ldb,
+                                       float beta,
+                                       unsigned short* C, int ldc);
+
 // === FAST_16BF GEMM wrappers (FP32 in/out, BF16 tensor-core compute) ===
 //
 // Same signature as sgemm_rowmajor* (FP32 A, FP32 B, FP32 C) but routes

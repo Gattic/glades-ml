@@ -875,6 +875,109 @@ bool chiron_attention_shear_backward_bf16w_tiled(
 	return true;
 }
 
+// iter 61 (2026-05-16): BF16-grad variant.  Same math as the FP32-grad
+// _bf16w_tiled above, but the 4 dW weight-grad GEMMs route through
+// sgemm_rowmajor_atb_bf16_dst_bf16 (cuBLAS gemmEx with D=BF16, beta=1) to
+// write directly into the persistent BF16 dW buffers.  Eliminates the
+// downstream bf16_accum_axpy commit kernel and the FP32 grad scratch
+// traffic (~3.1% of GPU time, ~14 launches/step on the iter60 stack).
+//
+// Caller must pre-zero the BF16 dW buffers at the start of each
+// gradient-accumulation window (matches the bf16_accum_axpy protocol).
+// The FP32 internal accumulator inside cuBLAS gemmEx is identical to the
+// old FP32-out path; only the final BF16 rounding step is folded into
+// the GEMM rather than the standalone kernel.
+bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
+    const float* q, const float* dp_new,
+    const unsigned short* Wq_bf, const unsigned short* Wk_bf,
+    const unsigned short* Wv_bf, const unsigned short* Wo_bf,
+    int T, int m, int nHeads, int dHead,
+    bool causal,
+    float* dq,
+    unsigned short* dWq_bf, unsigned short* dWk_bf,
+    unsigned short* dWv_bf, unsigned short* dWo_bf,
+    unsigned short* scratch_qbf,
+    unsigned short* scratch_sdbf,
+    float* sQ, float* sK, float* sV, float* sO,
+    float* sdO, float* sdQ, float* sdK, float* sdV,
+    float* scratch_P, float* scratch_dP)
+{
+	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
+	const int dModel = nHeads * dHead;
+
+	// 1. Cast q -> BF16 for projections.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 2. Forward recompute: Q/K/V projections via BF16-TC GEMMs.
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wq_bf, dModel, 0.0f, sQ, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wk_bf, dModel, 0.0f, sK, dModel))
+		return false;
+	if (!sgemm_rowmajor_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wv_bf, dModel, 0.0f, sV, dModel))
+		return false;
+	if (!flash_attention_cublas_tiled(sQ, sK, sV, T, nHeads, dHead, dModel, causal,
+	                                    sO, scratch_P))
+		return false;
+
+	// 3. Output-projection backward.  dO = dp_new · Wo^T.
+	if (!cast_f32_to_bf16(dp_new, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wo_bf, m, 0.0f, sdO, dModel))
+		return false;
+
+	// 4. dWo += sO^T · dp_new.  BF16-out: commits to persistent dWo_bf with
+	// beta=1 (caller zeroes dWo_bf at start of accum window).
+	if (!cast_f32_to_bf16(sO, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(dModel, m, T, 1.0f,
+	        scratch_sdbf, dModel,
+	        scratch_qbf, m,
+	        1.0f, dWo_bf, m))
+		return false;
+
+	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModel, computeStream()));
+	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModel, computeStream()));
+	if (!flash_attention_backward_cublas_tiled(
+	        sQ, sK, sV, sO, sdO,
+	        T, nHeads, dHead, dModel, causal,
+	        sdQ, sdK, sdV, scratch_P, scratch_dP))
+		return false;
+
+	// Recast q to BF16 for the weight-grad GEMMs.
+	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
+		return false;
+
+	// 6+7 fused per direction.  dq accumulates FP32 (beta=1); dW_bf accumulates BF16 (beta=1).
+	// Q:
+	if (!cast_f32_to_bf16(sdQ, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wq_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWq_bf, dModel))
+		return false;
+	// K:
+	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWk_bf, dModel))
+		return false;
+	// V:
+	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
+		return false;
+	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
+		return false;
+	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
+	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWv_bf, dModel))
+		return false;
+	return true;
+}
+
 // Tiled variant of chiron_attention_shear.  Same math as chiron_attention_shear
 // but replaces the O(T²·dH) flash-attention core with flash_attention_cublas_tiled
 // (TF32 tensor cores via cuBLAS batched strided GEMM).  Typical 5-10× wall-clock
