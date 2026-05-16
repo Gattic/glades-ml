@@ -1,0 +1,40 @@
+HMTA v4 — paradigm #261 iter 40 (F1: separate p_K, p_V)
+=======================================================
+Config: T=512 d=64 s0=64 eta=2, basis = K-only + V-only single-level
+
+(A) Gaussian synthetic (r=8, noise=0.10)
+    p_K \ p_V |  pV=8  | pV=16  | pV=32  | pV=48  | pV=64
+    ----------+--------+--------+--------+--------+--------
+    p_K=4    | 0.2184 | 0.1738 | 0.1082 | 0.0407 | 0.0223 
+    p_K=8    | 0.2178 | 0.1763 | 0.0994 | 0.0406 | 0.0090 
+
+(B) Sink+local synthetic (4 sinks, sink_scale=10x bg, bg=1)
+    p_K \ p_V |  pV=8  | pV=16  | pV=32  | pV=48  | pV=64
+    ----------+--------+--------+--------+--------+--------
+    p_K=4    | 0.5154 | 0.4027 | 0.2159 | 0.0916 | 0.0440 
+    p_K=8    | 0.4996 | 0.4047 | 0.2301 | 0.0799 | 0.0383 
+
+(C) Production FLOP ratio at T=16384, d=64, s0=64, eta=2
+    p_K \ p_V |  pV=8  | pV=16  | pV=32  | pV=48  | pV=64
+    ----------+--------+--------+--------+--------+--------
+    p_K=4    | 315.1x | 113.8x |  33.0x |  15.3x |   8.8x 
+    p_K=8    | 212.8x |  96.9x |  31.4x |  14.9x |   8.6x 
+
+(D) Iter-40 C0 verdict (joint Gaussian+sink+local at threshold)
+    Target: forward L2 <= 0.15 on BOTH Gaussian AND sink+local
+            AND FLOP ratio >= 10x at T=16384.
+
+    p_K | p_V | L2_gauss | L2_sink | FLOP ratio | PASS
+    ----+-----+----------+---------+------------+------
+    4   |  8  |  0.2184  | 0.5154  |  315.1x   | fail
+    4   |  16  |  0.1738  | 0.4027  |  113.8x   | fail
+    4   |  32  |  0.1082  | 0.2159  |   33.0x   | fail
+    4   |  48  |  0.0407  | 0.0916  |   15.3x   | PASS
+    4   |  64  |  0.0223  | 0.0440  |    8.8x   | fail
+    8   |  8  |  0.2178  | 0.4996  |  212.8x   | fail
+    8   |  16  |  0.1763  | 0.4047  |   96.9x   | fail
+    8   |  32  |  0.0994  | 0.2301  |   31.4x   | fail
+    8   |  48  |  0.0406  | 0.0799  |   14.9x   | PASS
+    8   |  64  |  0.0090  | 0.0383  |    8.6x   | fail
+
+  Config(s) passing all 3 criteria: 2
