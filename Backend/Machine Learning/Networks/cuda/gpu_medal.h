@@ -104,6 +104,33 @@ bool medal_masked_nll_bf16(const uint16_t* d_probs_bf, const int* d_targets,
                            const unsigned char* d_mask, int T, int V,
                            float* d_nll_sum, int* d_n_masked);
 
+// Broadcast-add of sinusoidal time embedding phi(alpha) into the per-token
+// hidden state q[T, m].  Each row receives the SAME phi vector — the time
+// embedding is global (not position-dependent).
+//
+//   q[i, :] += phi[:]   for all i in [0, T)
+//
+// phi is an m-element FP32 vector on device.  See medal_compute_phi_host
+// for the host-side computation.
+bool medal_add_time_embedding(float* d_q, const float* d_phi, int T, int m);
+
+// Host-side: fill phi[m] with sinusoidal features of alpha.  This is a
+// standard transformer-style positional/time embedding adapted to a single
+// scalar input alpha ∈ [0, 1]:
+//
+//   phi[2k]   = sin(alpha * omega_k)
+//   phi[2k+1] = cos(alpha * omega_k)
+//
+// with omega_k = 10000^(-2k/m), k = 0, 1, ..., m/2 - 1.
+//
+// At alpha=0: phi = [0, 1, 0, 1, ...] — a fixed bias.
+// At alpha=1: phi has rich frequency content across all m dimensions.
+//
+// The denoiser sees this as a global conditioning signal at every layer's
+// input — in this iter, only at q_0 (the embedding output).  Per-layer
+// addition is a future extension.
+void medal_compute_phi_host(float alpha, int m, float* phi_out);
+
 } // namespace gpu
 } // namespace glades
 #else
@@ -117,5 +144,7 @@ inline bool medal_masked_nll(const float*, const int*, const unsigned char*,
                              int, int, float*, int*) { return false; }
 inline bool medal_masked_nll_bf16(const uint16_t*, const int*, const unsigned char*,
                                   int, int, float*, int*) { return false; }
+inline bool medal_add_time_embedding(float*, const float*, int, int) { return false; }
+inline void medal_compute_phi_host(float, int, float*) {}
 }}
 #endif

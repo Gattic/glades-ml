@@ -13,6 +13,7 @@
 #include <curand_kernel.h>
 #include <cstdio>
 #include <cstdint>
+#include <cmath>
 
 namespace glades {
 namespace gpu {
@@ -237,6 +238,69 @@ bool medal_masked_nll_bf16(const uint16_t* d_probs_bf, const int* d_targets,
         return false;
     }
     return true;
+}
+
+// -------------------------------------------------------------------- //
+// Kernel: medal_add_time_embedding
+//
+// Broadcast-adds phi[m] to every row of q[T, m].  One block per token row;
+// threads stride over m.  Memory-bandwidth-bound; phi is reused across all
+// T rows so it fits in L1/L2 cache after the first read.
+// -------------------------------------------------------------------- //
+__global__ void medal_add_time_embedding_kernel(float* __restrict__ q,
+                                                 const float* __restrict__ phi,
+                                                 int T, int m)
+{
+    int row = blockIdx.x;
+    if (row >= T) return;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    float* q_row = q + (size_t)row * m;
+    for (int j = tid; j < m; j += stride)
+    {
+        q_row[j] += phi[j];
+    }
+}
+
+bool medal_add_time_embedding(float* d_q, const float* d_phi, int T, int m)
+{
+    if (T <= 0 || m <= 0) return false;
+    int threads = (m < 256) ? m : 256;
+    medal_add_time_embedding_kernel<<<T, threads>>>(d_q, d_phi, T, m);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        std::fprintf(stderr, "[medal] add_time_embedding launch failed: %s\n",
+                     cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+// -------------------------------------------------------------------- //
+// Host: sinusoidal time embedding phi[m] of alpha ∈ [0, 1].
+// phi[2k]   = sin(alpha * omega_k)
+// phi[2k+1] = cos(alpha * omega_k)
+// omega_k = 10000^(-2k/m).
+//
+// Note: alpha is bounded in [0, 1], so the lowest frequency (k=0,
+// omega=1) gives phi[0,1] = (sin(alpha), cos(alpha)) — both in [-1, 1].
+// Higher k → omega → 0, so sin/cos → (0, 1) at alpha=0 and slowly grow.
+// The richness of the embedding is concentrated in the low-k dimensions
+// (which is fine — m=128+ leaves plenty of room).
+// -------------------------------------------------------------------- //
+void medal_compute_phi_host(float alpha, int m, float* phi_out)
+{
+    if (m <= 0 || phi_out == 0) return;
+    for (int k = 0; k < m / 2; ++k)
+    {
+        double omega = std::pow(10000.0, -2.0 * (double)k / (double)m);
+        double arg = (double)alpha * omega;
+        phi_out[2 * k]     = (float)std::sin(arg);
+        phi_out[2 * k + 1] = (float)std::cos(arg);
+    }
+    // If m is odd, leave the last entry at 0.
+    if (m & 1) phi_out[m - 1] = 0.0f;
 }
 
 } // namespace gpu
