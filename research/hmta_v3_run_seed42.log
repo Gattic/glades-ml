@@ -1,0 +1,32 @@
+HMTA v3 — paradigm #261 iter 39 (noise-floor + sink+local)
+==========================================================
+Config: T=512 d=64 s0=64 eta=2 p=8 (K-only/V-only single-level)
+
+(A) Noise-level sweep at rank r=8 (5-seed median)
+    noise_sd | forward L2 | rank-p retention
+    ---------+------------+------------------
+      0.001  |   0.2178   |     1.0000
+      0.010  |   0.2178   |     1.0000
+      0.030  |   0.2178   |     0.9996
+      0.100  |   0.2178   |     0.9833
+      0.300  |   0.2195   |     0.8096
+      1.000  |   0.3140   |     0.4866
+
+(B) Sink+local synthetic (n_sinks=4 per leaf, sink=10x bg, local-decay=0.1)
+    Mimics real LLM attention-sink behavior + local-attention decay.
+
+    p   | forward L2 | rank-p retention
+    ----+------------+------------------
+    p= 8|   0.4996   |     0.4801
+    p=16|   0.4350   |     0.7440
+    p=24|   0.3023   |     0.8915
+
+(C) C0a-iter-39 verdict
+    Target: forward L2 <= 0.15 at p=8 in BOTH:
+      (i)  Gaussian model at noise_sd <= 0.03  AND
+      (ii) Sink+local model.
+
+      Gaussian noise_sd=0.03, p=8 :  0.2178  FAIL
+      Sink+local, p=8             :  0.4996  FAIL
+
+      Joint verdict (both <= 0.15): FAIL
