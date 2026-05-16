@@ -249,7 +249,8 @@ __global__ void layernorm_backward_dx(const float* __restrict__ dout,
 	}
 }
 
-// dgamma/dbeta kernel: one block per column, threads reduce across rows.
+// Legacy dgamma/dbeta kernel: one block per column, threads reduce across rows.
+// Kept as dead code; iter 53/60 ships the 2-phase variant below.
 __global__ void layernorm_backward_dgamma_dbeta(
     const float* __restrict__ dout,
     const float* __restrict__ x,
@@ -287,6 +288,115 @@ __global__ void layernorm_backward_dgamma_dbeta(
 	}
 }
 
+// Iter 53 / Iter 60: deterministic 2-phase parallel reduction for dgamma_dbeta.
+// Phase 1 (this kernel): 2D-tiled coalesced access (BLOCK_C cols × BLOCK_T row-
+// partitions reduced via SMEM).  T_PARTS blocks per col-tile produce partial
+// sums in scratch[T_PARTS, cols] — no atomics needed (each (col, t_partition)
+// is uniquely owned by one block).
+template<int BLOCK_C, int BLOCK_T>
+__global__ void layernorm_backward_dgamma_dbeta_partial(
+    const float* __restrict__ dout,
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ invStd,
+    int rows, int cols,
+    int rowsPerBlock,
+    float* __restrict__ partial_dg,
+    float* __restrict__ partial_db)
+{
+	const int col            = blockIdx.x * BLOCK_C + threadIdx.x;
+	const int rowStart       = blockIdx.y * rowsPerBlock;
+	const int rowEnd         = rowStart + rowsPerBlock;
+	const int rowEndClamped  = (rowEnd > rows) ? rows : rowEnd;
+	const int ty             = threadIdx.y;
+
+	float dgAcc = 0.0f;
+	float dbAcc = 0.0f;
+	if (col < cols)
+	{
+		for (int r = rowStart + ty; r < rowEndClamped; r += BLOCK_T)
+		{
+			float mu   = mean[r];
+			float inv  = invStd[r];
+			float xhat = (x[(size_t)r * cols + col] - mu) * inv;
+			float d    = dout[(size_t)r * cols + col];
+			dgAcc += d * xhat;
+			dbAcc += d;
+		}
+	}
+
+	__shared__ float sDg[BLOCK_T][BLOCK_C];
+	__shared__ float sDb[BLOCK_T][BLOCK_C];
+	sDg[ty][threadIdx.x] = dgAcc;
+	sDb[ty][threadIdx.x] = dbAcc;
+	__syncthreads();
+
+	for (int s = BLOCK_T / 2; s > 0; s >>= 1)
+	{
+		if (ty < s)
+		{
+			sDg[ty][threadIdx.x] += sDg[ty + s][threadIdx.x];
+			sDb[ty][threadIdx.x] += sDb[ty + s][threadIdx.x];
+		}
+		__syncthreads();
+	}
+
+	if (ty == 0 && col < cols)
+	{
+		const size_t base = (size_t)blockIdx.y * (size_t)cols + (size_t)col;
+		partial_dg[base] = sDg[0][threadIdx.x];
+		partial_db[base] = sDb[0][threadIdx.x];
+	}
+}
+
+// Phase 2: deterministic per-col reduce of T_PARTS partials in fixed loop
+// order.  One thread per col; T_PARTS is small (≤8) so loop is cheap.
+__global__ void layernorm_backward_dgamma_dbeta_reduce(
+    const float* __restrict__ partial_dg,
+    const float* __restrict__ partial_db,
+    int t_parts, int cols,
+    float* __restrict__ dgamma,
+    float* __restrict__ dbeta)
+{
+	const int col = blockIdx.x * blockDim.x + threadIdx.x;
+	if (col >= cols) return;
+	float sumG = 0.0f;
+	float sumB = 0.0f;
+	for (int p = 0; p < t_parts; ++p)
+	{
+		sumG += partial_dg[(size_t)p * (size_t)cols + (size_t)col];
+		sumB += partial_db[(size_t)p * (size_t)cols + (size_t)col];
+	}
+	dgamma[col] += sumG;
+	dbeta[col]  += sumB;
+}
+
+} // anonymous namespace
+
+// Iter 53/60 lazy scratch pool for the 2-phase dgamma_dbeta path.  Sized for
+// the largest LN backward call we'll see (T_PARTS × cols floats × 2 for dg/db).
+// Allocated once; never freed (small).
+namespace {
+static float* s_ln_partial_dg = 0;
+static float* s_ln_partial_db = 0;
+static int    s_ln_partial_cols_max = 0;
+static int    s_ln_partial_t_parts_max = 0;
+
+static bool ensure_ln_partial_scratch(int t_parts, int cols)
+{
+	if (t_parts <= s_ln_partial_t_parts_max && cols <= s_ln_partial_cols_max)
+		return true;
+	if (s_ln_partial_dg) { cudaFree(s_ln_partial_dg); s_ln_partial_dg = 0; }
+	if (s_ln_partial_db) { cudaFree(s_ln_partial_db); s_ln_partial_db = 0; }
+	const size_t bytes = (size_t)t_parts * (size_t)cols * sizeof(float);
+	cudaError_t e = cudaMalloc(&s_ln_partial_dg, bytes);
+	if (e != cudaSuccess) return false;
+	e = cudaMalloc(&s_ln_partial_db, bytes);
+	if (e != cudaSuccess) return false;
+	s_ln_partial_cols_max = cols;
+	s_ln_partial_t_parts_max = t_parts;
+	return true;
+}
 } // anonymous namespace
 
 bool layernorm_backward(const float* dout, const float* x,
@@ -303,12 +413,35 @@ bool layernorm_backward(const float* dout, const float* x,
 		dout, x, gamma, mean, invStd, cols, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
-	// Kernel 2: dgamma/dbeta (one block per column, reduce across rows).
-	int block2 = rowBlockSize(rows);
-	int smemBytes2 = (block2 / 32 + 2) * 2 * sizeof(float);
-	layernorm_backward_dgamma_dbeta<<<cols, block2, smemBytes2, computeStream()>>>(
-		dout, x, mean, invStd, rows, cols, dgamma, dbeta);
-	GLADES_CUDA_CHECK(cudaGetLastError());
+	// Kernel 2: dgamma/dbeta — Iter 53/60 deterministic 2-phase parallel
+	// reduction.  Replaces the legacy "1 block per col, threads loop strided
+	// rows" kernel.  Coalesced access + parallel reduction + deterministic
+	// per-col reduce over T_PARTS partials.
+	{
+		const int BLOCK_C = 64;
+		const int BLOCK_T = 8;
+		const int T_PARTS = 4;
+		if (!ensure_ln_partial_scratch(T_PARTS, cols)) return false;
+		int rowsPerBlock = (rows + T_PARTS - 1) / T_PARTS;
+		// Phase 1.
+		{
+			dim3 grid((cols + BLOCK_C - 1) / BLOCK_C, T_PARTS);
+			dim3 block(BLOCK_C, BLOCK_T);
+			layernorm_backward_dgamma_dbeta_partial<64, 8>
+			    <<<grid, block, 0, computeStream()>>>(
+			        dout, x, mean, invStd, rows, cols, rowsPerBlock,
+			        s_ln_partial_dg, s_ln_partial_db);
+			GLADES_CUDA_CHECK(cudaGetLastError());
+		}
+		// Phase 2: deterministic per-col reduce.
+		{
+			const int RBLOCK = 256;
+			int rgrid = (cols + RBLOCK - 1) / RBLOCK;
+			layernorm_backward_dgamma_dbeta_reduce<<<rgrid, RBLOCK, 0, computeStream()>>>(
+			    s_ln_partial_dg, s_ln_partial_db, T_PARTS, cols, dgamma, dbeta);
+			GLADES_CUDA_CHECK(cudaGetLastError());
+		}
+	}
 
 	return true;
 }
@@ -2999,6 +3132,8 @@ __global__ void cross_entropy_nll_bf16_kernel(
 		atomicAdd(valid_count, (int)countF);
 }
 
+// Legacy 1-thread-per-row argmax — kept as dead code; iter 56/60 ships the
+// warp-parallel variant below.
 __global__ void argmax_count_bf16_kernel(
     const unsigned short* __restrict__ probs,
     const int* __restrict__ targets,
@@ -3037,6 +3172,56 @@ __global__ void argmax_count_bf16_kernel(
 	float validF = (float)localValid;
 	validF = blockReduceSum(validF, smem);
 	if (threadIdx.x == 0) atomicAdd(valid_count, (int)validF);
+}
+
+// Iter 56 / Iter 60: warp-parallel argmax — 1 warp per row.  Each warp's
+// 32 lanes do a strided scan over V (lane handles v=lane, lane+32, ...),
+// then a 5-step __shfl_down_sync reduction finds the global max+arg.
+// Block: 32 warps × 32 lanes = 1024 threads = 32 rows per block.  Replaces
+// the 1-thread-per-row V-loop pattern of the legacy kernel.  Train-accuracy
+// values bit-identical; the kernel is logging-only, no NLL impact.
+__global__ void argmax_count_bf16_warp_kernel(
+    const unsigned short* __restrict__ probs,
+    const int* __restrict__ targets,
+    int T, int vocabSize, int padToken,
+    int* __restrict__ correct_count,
+    int* __restrict__ valid_count)
+{
+	const int warpsPerBlock = blockDim.x / 32;
+	const int lane          = threadIdx.x & 31;
+	const int warpId        = threadIdx.x >> 5;
+	const int row           = blockIdx.x * warpsPerBlock + warpId;
+	if (row >= T) return;
+
+	int tgt = targets[row];
+	bool isValid = (padToken < 0 || tgt != padToken) && (tgt >= 0 && tgt < vocabSize);
+
+	int   bestIdx = -1;
+	float bestVal = -1e38f;
+	if (isValid)
+	{
+		const unsigned short* prow = probs + (size_t)row * vocabSize;
+		for (int v = lane; v < vocabSize; v += 32)
+		{
+			float pv = bf16_load(prow[v]);
+			if (pv > bestVal) { bestVal = pv; bestIdx = v; }
+		}
+		for (int off = 16; off > 0; off >>= 1)
+		{
+			float oVal = __shfl_down_sync(0xFFFFFFFF, bestVal, off);
+			int   oIdx = __shfl_down_sync(0xFFFFFFFF, bestIdx, off);
+			if (oVal > bestVal) { bestVal = oVal; bestIdx = oIdx; }
+		}
+	}
+
+	if (lane == 0)
+	{
+		if (isValid)
+		{
+			atomicAdd(valid_count, 1);
+			if (bestIdx == tgt) atomicAdd(correct_count, 1);
+		}
+	}
 }
 
 } // anonymous namespace
@@ -3100,11 +3285,13 @@ bool argmax_count_matches_bf16(const unsigned short* probs,
 	if (T <= 0 || vocabSize <= 0) return true;
 	GLADES_CUDA_CHECK(cudaMemset(correct_count, 0, sizeof(int)));
 	GLADES_CUDA_CHECK(cudaMemset(valid_count, 0, sizeof(int)));
-	int block = 128;
-	int grid = (T + block - 1) / block;
-	if (grid > 128) grid = 128;
-	int smemBytes = (block / 32 + 1) * sizeof(float);
-	argmax_count_bf16_kernel<<<grid, block, smemBytes, computeStream()>>>(
+	// Iter 56/60: warp-parallel argmax (1 warp per row).  Block = 1024 threads
+	// = 32 warps = 32 rows per block.  Replaces the legacy 1-thread-per-row
+	// V-loop pattern.
+	const int WARPS_PER_BLOCK = 32;
+	const int block = WARPS_PER_BLOCK * 32;        // 1024
+	int grid = (T + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+	argmax_count_bf16_warp_kernel<<<grid, block, 0, computeStream()>>>(
 	    probs, targets, T, vocabSize, padToken, correct_count, valid_count);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
