@@ -98,6 +98,12 @@ bool medal_masked_nll(const float* d_probs, const int* d_targets,
                       const unsigned char* d_mask, int T, int V,
                       float* d_nll_sum, int* d_n_masked);
 
+// Same as medal_masked_nll, but reads bf16 probabilities (uint16_t bit
+// pattern, like the rest of the bf16-logits pipeline).
+bool medal_masked_nll_bf16(const uint16_t* d_probs_bf, const int* d_targets,
+                           const unsigned char* d_mask, int T, int V,
+                           float* d_nll_sum, int* d_n_masked);
+
 } // namespace gpu
 } // namespace glades
 #else
@@ -109,5 +115,7 @@ inline bool medal_mask_dlogits(float*, const unsigned char*, int, int) { return 
 inline bool medal_mask_dlogits_bf16(uint16_t*, const unsigned char*, int, int) { return false; }
 inline bool medal_masked_nll(const float*, const int*, const unsigned char*,
                              int, int, float*, int*) { return false; }
+inline bool medal_masked_nll_bf16(const uint16_t*, const int*, const unsigned char*,
+                                  int, int, float*, int*) { return false; }
 }}
 #endif

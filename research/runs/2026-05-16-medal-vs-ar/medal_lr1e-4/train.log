@@ -1,0 +1,234 @@
+[glades-cuda] Using device 0: NVIDIA GeForce RTX 4080 SUPER (SM 8.9, 15936 MB, 80 SMs)
+[i]2026-05-16 07:51:14 [chiron]: [chiron-train] device: NVIDIA GeForce RTX 4080 SUPER (sm_8.9), 15.6 GB VRAM
+[i]2026-05-16 07:51:14 [chiron]: [val] enabled: every 200 steps, 8 batches (512 tokens/batch), buckets=8, bytes/tok=4.00
+[i]2026-05-16 07:51:14 [chiron]: [fuse-attn-per-layer] allocated trainable gamma_p/beta_p [L=4 × m=128 × 2 × 4 = 4.00 KB params] (init 1/0); Adam state mode=fp32 adds proportional VRAM.
+[i]2026-05-16 07:51:14 [chiron]: [chiron-train] VRAM usage after allocation: 0.74 / 15.56 GB (95.3% free)
+[i]2026-05-16 07:51:14 [chiron]: [chiron-train] T=512 m=128 dModel=256 L=4 nH=4 dH=64 V=32000  params=4.62M  (17.6 MB FP32)
+[i]2026-05-16 07:51:14 [chiron]: [chiron-train] lr=1.00e-04 wd=1.00e-02 seed=1337 max_steps=2000 adam=fp32 attn=tiled bf16_grads=0 bf16_weights=0 local_attn_W=0 warmup=100 grad_clip=0.50 accum=1 (effective batch=512 tokens)
+[i]2026-05-16 07:51:14 [chiron]: [bf16-logits] tied-readout logits GEMMs routed through cublasGemmEx FAST_16BF (BF16-TC, FP32 in/out); 3 GEMMs/step at shape (T=512, V=32000, m=128) = 4.19 GFLOP each
+[i]2026-05-16 07:51:14 [chiron]: [bf16-logits-storage] readout triple (logits, probs, dlogits) materialized as BF16 (T*V*2 = 0.03 GB each); FP32 triple would be 0.18 GB.  Added BF16 mirrors: W.E_bf cache (V*m = 8 MB, refreshed per step) and q_L_bf scratch (T*m = 0 MB, cast per step).  Net VRAM saved: 0.08 GB.  Math FP32 in registers, BF16 on load/store; NLL impact expected negligible (probs floor at 1e-12 after BF16→FP32 cast matches FP32 kernel).
+[i]2026-05-16 07:51:14 [chiron]: [fuse-attn-per-layer] ACTIVE (DEFAULT since 2026-05-12): at EVERY layer, q ← q + (1/√L)·reln_p(p) BEFORE the q-reln.  Couples attention into q at every depth; bounds p magnitude; enables L ≥ 48 with attention training.  Per-layer trainable gamma_p[l]/beta_p[l] (init 1/0, task #12 2026-05-12).  Validated 1B fair-comparison: +1.09 nat ema @ 5000 steps vs --no-fuse-attn.
+[i]2026-05-16 07:51:14 [chiron]: [step      1] loss=9.9691 ema=9.9691 best=9.9691@1 acc=0.2773 ||g||=6.236 scale=0.080 lr=1.00e-06 tok/s=5761 wall=0.1s
+[i]2026-05-16 07:51:14 [chiron]: [val val   ] nll=9.6600 bpb=3.4841 ppl=15677.60 acc1=0.4807 acc5=0.4810 acc10=0.4810 pos=[9.65/9.67/9.70/9.65/9.69/9.60/9.68/9.64] n_tok=8192 batches=8
+[i]2026-05-16 07:51:14 [chiron]: [val val   ] medal_elbo=10.4000 ppl=32859.22 n_masked=2127 alpha=0.573
+[i]2026-05-16 07:51:14 [chiron]: [step     10] loss=9.1164 ema=9.7277 best=8.9840@3 acc=0.8066 ||g||=13.767 scale=0.036 lr=1.00e-05 tok/s=81380 wall=0.1s
+[i]2026-05-16 07:51:14 [chiron]: [step     20] loss=9.6021 ema=9.6274 best=8.9653@18 acc=0.5195 ||g||=12.495 scale=0.040 lr=2.00e-05 tok/s=121484 wall=0.2s
+[i]2026-05-16 07:51:14 [chiron]: [step     30] loss=9.9769 ema=9.5940 best=8.9263@29 acc=0.2422 ||g||=11.939 scale=0.042 lr=3.00e-05 tok/s=121461 wall=0.2s
+[i]2026-05-16 07:51:14 [chiron]: [step     40] loss=8.9811 ema=9.5815 best=8.9263@29 acc=0.8906 ||g||=14.985 scale=0.033 lr=4.00e-05 tok/s=121610 wall=0.3s
+[i]2026-05-16 07:51:15 [chiron]: [step     50] loss=9.5234 ema=9.6207 best=8.9263@29 acc=0.5898 ||g||=7.420 scale=0.067 lr=5.00e-05 tok/s=126036 wall=0.3s
+[i]2026-05-16 07:51:15 [chiron]: [step     60] loss=9.8377 ema=9.6363 best=8.9263@29 acc=0.3008 ||g||=10.804 scale=0.046 lr=6.00e-05 tok/s=128510 wall=0.4s
+[i]2026-05-16 07:51:15 [chiron]: [step     70] loss=8.9494 ema=9.4902 best=8.8390@66 acc=0.9102 ||g||=15.911 scale=0.031 lr=7.00e-05 tok/s=128417 wall=0.4s
+[i]2026-05-16 07:51:15 [chiron]: [step     80] loss=9.3839 ema=9.5788 best=8.8390@66 acc=0.6152 ||g||=14.778 scale=0.034 lr=8.00e-05 tok/s=128552 wall=0.4s
+[i]2026-05-16 07:51:15 [chiron]: [step     90] loss=9.7433 ema=9.5658 best=8.8390@66 acc=0.3516 ||g||=14.558 scale=0.034 lr=9.00e-05 tok/s=128375 wall=0.5s
+[i]2026-05-16 07:51:15 [chiron]: [step    100] loss=10.2357 ema=9.5278 best=8.7775@96 acc=0.0625 ||g||=16.213 scale=0.031 lr=1.00e-04 tok/s=128599 wall=0.5s
+[i]2026-05-16 07:51:15 [chiron]: [step    110] loss=9.1114 ema=9.4663 best=8.7365@107 acc=0.6797 ||g||=14.389 scale=0.035 lr=1.00e-04 tok/s=128444 wall=0.6s
+[i]2026-05-16 07:51:15 [chiron]: [step    120] loss=9.4660 ema=9.4280 best=8.5416@111 acc=0.4297 ||g||=12.534 scale=0.040 lr=1.00e-04 tok/s=128537 wall=0.6s
+[i]2026-05-16 07:51:15 [chiron]: [step    130] loss=10.0302 ema=9.3734 best=8.5161@122 acc=0.1191 ||g||=13.901 scale=0.036 lr=1.00e-04 tok/s=128696 wall=0.6s
+[i]2026-05-16 07:51:15 [chiron]: [step    140] loss=8.6647 ema=9.1999 best=8.4240@133 acc=0.7383 ||g||=11.181 scale=0.045 lr=1.00e-04 tok/s=128279 wall=0.7s
+[i]2026-05-16 07:51:15 [chiron]: [step    150] loss=9.3313 ema=9.2210 best=8.3278@148 acc=0.4473 ||g||=14.820 scale=0.034 lr=1.00e-04 tok/s=128603 wall=0.7s
+[i]2026-05-16 07:51:15 [chiron]: [step    160] loss=9.7947 ema=9.2558 best=8.3278@148 acc=0.1953 ||g||=22.211 scale=0.023 lr=1.00e-04 tok/s=128784 wall=0.8s
+[i]2026-05-16 07:51:15 [chiron]: [step    170] loss=8.4045 ema=9.1182 best=8.3278@148 acc=0.8125 ||g||=9.793 scale=0.051 lr=1.00e-04 tok/s=128172 wall=0.8s
+[i]2026-05-16 07:51:15 [chiron]: [step    180] loss=8.8682 ema=9.0461 best=8.1635@174 acc=0.5625 ||g||=7.458 scale=0.067 lr=1.00e-04 tok/s=128086 wall=0.8s
+[i]2026-05-16 07:51:15 [chiron]: [step    190] loss=9.5764 ema=9.0212 best=8.1264@189 acc=0.2578 ||g||=6.509 scale=0.077 lr=1.00e-04 tok/s=128175 wall=0.9s
+[i]2026-05-16 07:51:15 [chiron]: [step    200] loss=8.0892 ema=8.9483 best=8.0892@200 acc=0.9062 ||g||=8.055 scale=0.062 lr=1.00e-04 tok/s=128207 wall=0.9s
+[i]2026-05-16 07:51:15 [chiron]: [val val   ] nll=8.9500 bpb=3.2280 ppl=7707.56 acc1=0.5090 acc5=0.5100 acc10=0.5117 pos=[8.98/9.03/8.97/8.89/8.92/8.88/8.99/8.94] n_tok=8192 batches=8
+[i]2026-05-16 07:51:15 [chiron]: [val val   ] medal_elbo=10.1696 ppl=26098.36 n_masked=2012 alpha=0.892
+[i]2026-05-16 07:51:15 [chiron]: [step    210] loss=8.4175 ema=8.8665 best=7.9784@207 acc=0.7227 ||g||=5.609 scale=0.089 lr=1.00e-04 tok/s=89205 wall=1.0s
+[i]2026-05-16 07:51:15 [chiron]: [step    220] loss=9.1813 ema=9.0278 best=7.9784@207 acc=0.4512 ||g||=6.315 scale=0.079 lr=1.00e-04 tok/s=128323 wall=1.0s
+[i]2026-05-16 07:51:15 [chiron]: [step    230] loss=9.8966 ema=9.0820 best=7.9784@207 acc=0.1484 ||g||=8.585 scale=0.058 lr=1.00e-04 tok/s=128299 wall=1.0s
+[i]2026-05-16 07:51:15 [chiron]: [step    240] loss=8.2129 ema=8.9526 best=7.9784@207 acc=0.7539 ||g||=3.757 scale=0.133 lr=1.00e-04 tok/s=128180 wall=1.1s
+[i]2026-05-16 07:51:15 [chiron]: [step    250] loss=8.7975 ema=8.8533 best=7.8571@248 acc=0.5156 ||g||=4.625 scale=0.108 lr=1.00e-04 tok/s=128249 wall=1.1s
+[i]2026-05-16 07:51:15 [chiron]: [step    260] loss=9.3921 ema=8.8559 best=7.8571@248 acc=0.2266 ||g||=6.588 scale=0.076 lr=1.00e-04 tok/s=128155 wall=1.2s
+[i]2026-05-16 07:51:15 [chiron]: [step    270] loss=8.0285 ema=8.7119 best=7.8571@248 acc=0.8145 ||g||=4.365 scale=0.115 lr=1.00e-04 tok/s=128021 wall=1.2s
+[i]2026-05-16 07:51:15 [chiron]: [step    280] loss=8.6767 ema=8.8589 best=7.8571@248 acc=0.5566 ||g||=4.067 scale=0.123 lr=1.00e-04 tok/s=128253 wall=1.2s
+[i]2026-05-16 07:51:15 [chiron]: [step    290] loss=9.3926 ema=8.7262 best=7.7189@289 acc=0.2559 ||g||=7.512 scale=0.067 lr=1.00e-04 tok/s=128166 wall=1.3s
+[i]2026-05-16 07:51:16 [chiron]: [step    300] loss=7.7268 ema=8.6336 best=7.7189@289 acc=0.9121 ||g||=5.227 scale=0.096 lr=1.00e-04 tok/s=128252 wall=1.3s
+[i]2026-05-16 07:51:16 [chiron]: [step    310] loss=8.3214 ema=8.7377 best=7.7189@289 acc=0.6719 ||g||=5.972 scale=0.084 lr=1.00e-04 tok/s=128420 wall=1.4s
+[i]2026-05-16 07:51:16 [chiron]: [step    320] loss=9.0545 ema=8.7118 best=7.7189@289 acc=0.3398 ||g||=6.237 scale=0.080 lr=1.00e-04 tok/s=128282 wall=1.4s
+[i]2026-05-16 07:51:16 [chiron]: [step    330] loss=9.6640 ema=8.6761 best=7.7189@289 acc=0.0684 ||g||=5.121 scale=0.098 lr=1.00e-04 tok/s=128456 wall=1.4s
+[i]2026-05-16 07:51:16 [chiron]: [step    340] loss=8.1335 ema=8.6534 best=7.7189@289 acc=0.6836 ||g||=3.001 scale=0.167 lr=1.00e-04 tok/s=128224 wall=1.5s
+[i]2026-05-16 07:51:16 [chiron]: [step    350] loss=8.7979 ema=8.6555 best=7.6077@341 acc=0.4102 ||g||=3.533 scale=0.142 lr=1.00e-04 tok/s=128392 wall=1.5s
+[i]2026-05-16 07:51:16 [chiron]: [step    360] loss=9.4664 ema=8.4835 best=7.3676@356 acc=0.1484 ||g||=7.272 scale=0.069 lr=1.00e-04 tok/s=128024 wall=1.6s
+[i]2026-05-16 07:51:16 [chiron]: [step    370] loss=8.0689 ema=8.4925 best=7.3676@356 acc=0.7227 ||g||=4.690 scale=0.107 lr=1.00e-04 tok/s=128172 wall=1.6s
+[i]2026-05-16 07:51:16 [chiron]: [step    380] loss=8.6733 ema=8.5660 best=7.3676@356 acc=0.4414 ||g||=3.111 scale=0.161 lr=1.00e-04 tok/s=128274 wall=1.6s
+[i]2026-05-16 07:51:16 [chiron]: [step    390] loss=9.2711 ema=8.4958 best=7.3676@356 acc=0.1895 ||g||=3.614 scale=0.138 lr=1.00e-04 tok/s=128215 wall=1.7s
+[i]2026-05-16 07:51:16 [chiron]: [step    400] loss=7.6516 ema=8.4227 best=7.3576@393 acc=0.8027 ||g||=3.445 scale=0.145 lr=1.00e-04 tok/s=128136 wall=1.7s
+[i]2026-05-16 07:51:16 [chiron]: [val val   ] nll=8.3020 bpb=2.9943 ppl=4032.06 acc1=0.5342 acc5=0.5398 acc10=0.5447 pos=[8.29/8.35/8.42/8.35/8.21/8.25/8.29/8.26] n_tok=8192 batches=8
+[i]2026-05-16 07:51:16 [chiron]: [val val   ] medal_elbo=9.6411 ppl=15384.98 n_masked=1911 alpha=0.070
+[i]2026-05-16 07:51:16 [chiron]: [step    410] loss=7.9717 ema=8.4365 best=7.3576@393 acc=0.6543 ||g||=3.186 scale=0.157 lr=1.00e-04 tok/s=89082 wall=1.8s
+[i]2026-05-16 07:51:16 [chiron]: [step    420] loss=8.6387 ema=8.5112 best=7.3576@393 acc=0.3633 ||g||=3.841 scale=0.130 lr=1.00e-04 tok/s=128572 wall=1.8s
+[i]2026-05-16 07:51:16 [chiron]: [step    430] loss=9.4719 ema=8.4243 best=7.3576@393 acc=0.1074 ||g||=4.299 scale=0.116 lr=1.00e-04 tok/s=128096 wall=1.9s
+[i]2026-05-16 07:51:16 [chiron]: [step    440] loss=7.9342 ema=8.3564 best=7.3576@393 acc=0.7188 ||g||=4.881 scale=0.102 lr=1.00e-04 tok/s=128088 wall=1.9s
+[i]2026-05-16 07:51:16 [chiron]: [step    450] loss=8.8008 ema=8.4878 best=7.3167@441 acc=0.4277 ||g||=3.273 scale=0.153 lr=1.00e-04 tok/s=128225 wall=1.9s
+[i]2026-05-16 07:51:16 [chiron]: [step    460] loss=9.5068 ema=8.5912 best=7.3167@441 acc=0.1328 ||g||=4.585 scale=0.109 lr=1.00e-04 tok/s=128345 wall=2.0s
+[i]2026-05-16 07:51:16 [chiron]: [step    470] loss=7.6964 ema=8.4242 best=7.3167@441 acc=0.7910 ||g||=4.477 scale=0.112 lr=1.00e-04 tok/s=127847 wall=2.0s
+[i]2026-05-16 07:51:16 [chiron]: [step    480] loss=8.4722 ema=8.4895 best=7.3167@441 acc=0.4746 ||g||=2.620 scale=0.191 lr=1.00e-04 tok/s=128149 wall=2.1s
+[i]2026-05-16 07:51:16 [chiron]: [step    490] loss=9.1226 ema=8.5110 best=7.3167@441 acc=0.2129 ||g||=3.894 scale=0.128 lr=1.00e-04 tok/s=128371 wall=2.1s
+[i]2026-05-16 07:51:16 [chiron]: [step    500] loss=7.5631 ema=8.3339 best=7.1963@493 acc=0.8203 ||g||=8.820 scale=0.057 lr=1.00e-04 tok/s=128254 wall=2.1s
+[i]2026-05-16 07:51:16 [chiron]: [step    510] loss=8.1975 ema=8.4056 best=7.1963@493 acc=0.5234 ||g||=4.855 scale=0.103 lr=1.00e-04 tok/s=128370 wall=2.2s
+[i]2026-05-16 07:51:16 [chiron]: [step    520] loss=8.5377 ema=8.1729 best=6.9730@519 acc=0.3066 ||g||=4.032 scale=0.124 lr=1.00e-04 tok/s=128023 wall=2.2s
+[i]2026-05-16 07:51:16 [chiron]: [step    530] loss=7.2930 ema=8.1267 best=6.9730@519 acc=0.8809 ||g||=7.309 scale=0.068 lr=1.00e-04 tok/s=128221 wall=2.3s
+[i]2026-05-16 07:51:16 [chiron]: [step    540] loss=7.9298 ema=8.2083 best=6.9730@519 acc=0.5840 ||g||=3.620 scale=0.138 lr=1.00e-04 tok/s=128211 wall=2.3s
+[i]2026-05-16 07:51:17 [chiron]: [step    550] loss=8.5905 ema=8.2630 best=6.9730@519 acc=0.3145 ||g||=3.584 scale=0.140 lr=1.00e-04 tok/s=128337 wall=2.3s
+[i]2026-05-16 07:51:17 [chiron]: [step    560] loss=7.1786 ema=8.0848 best=6.9730@519 acc=0.9102 ||g||=10.760 scale=0.046 lr=1.00e-04 tok/s=128116 wall=2.4s
+[i]2026-05-16 07:51:17 [chiron]: [step    570] loss=7.7109 ema=8.1222 best=6.9730@519 acc=0.6348 ||g||=5.387 scale=0.093 lr=1.00e-04 tok/s=128294 wall=2.4s
+[i]2026-05-16 07:51:17 [chiron]: [step    580] loss=8.3638 ema=8.2412 best=6.9730@519 acc=0.3848 ||g||=2.864 scale=0.175 lr=1.00e-04 tok/s=128418 wall=2.5s
+[i]2026-05-16 07:51:17 [chiron]: [step    590] loss=9.1177 ema=8.1257 best=6.8972@586 acc=0.1055 ||g||=4.096 scale=0.122 lr=1.00e-04 tok/s=127973 wall=2.5s
+[i]2026-05-16 07:51:17 [chiron]: [step    600] loss=7.4298 ema=7.9901 best=6.8399@597 acc=0.6973 ||g||=3.833 scale=0.130 lr=1.00e-04 tok/s=128037 wall=2.5s
+[i]2026-05-16 07:51:17 [chiron]: [val val   ] nll=8.1785 bpb=2.9498 ppl=3563.57 acc1=0.4570 acc5=0.4651 acc10=0.4707 pos=[8.26/8.03/8.19/8.24/8.20/8.21/8.15/8.15] n_tok=8192 batches=8
+[i]2026-05-16 07:51:17 [chiron]: [val val   ] medal_elbo=9.5078 ppl=13464.66 n_masked=2227 alpha=0.148
+[i]2026-05-16 07:51:17 [chiron]: [step    610] loss=7.6389 ema=8.0359 best=6.7686@604 acc=0.5879 ||g||=2.393 scale=0.209 lr=1.00e-04 tok/s=89240 wall=2.6s
+[i]2026-05-16 07:51:17 [chiron]: [step    620] loss=9.2012 ema=8.1099 best=6.7585@615 acc=0.3008 ||g||=6.645 scale=0.075 lr=1.00e-04 tok/s=128156 wall=2.6s
+[i]2026-05-16 07:51:17 [chiron]: [step    630] loss=6.5831 ema=7.9220 best=6.5831@630 acc=0.9238 ||g||=7.073 scale=0.071 lr=1.00e-04 tok/s=128051 wall=2.7s
+[i]2026-05-16 07:51:17 [chiron]: [step    640] loss=7.6946 ema=8.0742 best=6.5831@630 acc=0.6133 ||g||=3.897 scale=0.128 lr=1.00e-04 tok/s=128127 wall=2.7s
+[i]2026-05-16 07:51:17 [chiron]: [step    650] loss=8.5029 ema=8.0374 best=6.5831@630 acc=0.3477 ||g||=2.756 scale=0.181 lr=1.00e-04 tok/s=128077 wall=2.8s
+[i]2026-05-16 07:51:17 [chiron]: [step    660] loss=9.1815 ema=8.0288 best=6.5831@630 acc=0.0820 ||g||=3.862 scale=0.129 lr=1.00e-04 tok/s=127860 wall=2.8s
+[i]2026-05-16 07:51:17 [chiron]: [step    670] loss=7.5519 ema=7.8128 best=6.5831@630 acc=0.6445 ||g||=4.415 scale=0.113 lr=1.00e-04 tok/s=128148 wall=2.8s
+[i]2026-05-16 07:51:17 [chiron]: [step    680] loss=8.7030 ema=8.2439 best=6.5831@630 acc=0.3926 ||g||=4.542 scale=0.110 lr=1.00e-04 tok/s=128287 wall=2.9s
+[i]2026-05-16 07:51:17 [chiron]: [step    690] loss=8.8982 ema=8.1190 best=6.5831@630 acc=0.1387 ||g||=3.745 scale=0.134 lr=1.00e-04 tok/s=128346 wall=2.9s
+[i]2026-05-16 07:51:17 [chiron]: [step    700] loss=7.2112 ema=7.8257 best=6.4460@697 acc=0.7520 ||g||=9.466 scale=0.053 lr=1.00e-04 tok/s=128013 wall=3.0s
+[i]2026-05-16 07:51:17 [chiron]: [step    710] loss=7.8615 ema=7.8403 best=6.4460@697 acc=0.4570 ||g||=2.939 scale=0.170 lr=1.00e-04 tok/s=128306 wall=3.0s
+[i]2026-05-16 07:51:17 [chiron]: [step    720] loss=8.6469 ema=7.7242 best=6.2960@712 acc=0.1523 ||g||=5.073 scale=0.099 lr=1.00e-04 tok/s=127940 wall=3.0s
+[i]2026-05-16 07:51:17 [chiron]: [step    730] loss=7.0393 ema=7.6935 best=6.2960@712 acc=0.7910 ||g||=8.637 scale=0.058 lr=1.00e-04 tok/s=128233 wall=3.1s
+[i]2026-05-16 07:51:17 [chiron]: [step    740] loss=7.1401 ema=7.6279 best=6.2960@712 acc=0.5098 ||g||=7.576 scale=0.066 lr=1.00e-04 tok/s=128164 wall=3.1s
+[i]2026-05-16 07:51:17 [chiron]: [step    750] loss=8.1452 ema=7.4748 best=6.2960@712 acc=0.2461 ||g||=6.920 scale=0.072 lr=1.00e-04 tok/s=128138 wall=3.2s
+[i]2026-05-16 07:51:17 [chiron]: [step    760] loss=6.3318 ema=7.2624 best=6.2960@712 acc=0.8633 ||g||=9.295 scale=0.054 lr=1.00e-04 tok/s=128372 wall=3.2s
+[i]2026-05-16 07:51:17 [chiron]: [step    770] loss=6.8717 ema=7.2031 best=6.0072@764 acc=0.6191 ||g||=5.115 scale=0.098 lr=1.00e-04 tok/s=128304 wall=3.2s
+[i]2026-05-16 07:51:17 [chiron]: [step    780] loss=7.4549 ema=7.1658 best=5.8933@775 acc=0.2656 ||g||=10.370 scale=0.048 lr=1.00e-04 tok/s=128456 wall=3.3s
+[i]2026-05-16 07:51:18 [chiron]: [step    790] loss=5.5614 ema=6.7182 best=5.5614@790 acc=0.9082 ||g||=6.622 scale=0.076 lr=1.00e-04 tok/s=128101 wall=3.3s
+[i]2026-05-16 07:51:18 [chiron]: [step    800] loss=6.5072 ema=6.7739 best=5.5614@790 acc=0.6660 ||g||=4.600 scale=0.109 lr=1.00e-04 tok/s=128292 wall=3.4s
+[i]2026-05-16 07:51:18 [chiron]: [val val   ] nll=7.9377 bpb=2.8629 ppl=2800.89 acc1=0.3782 acc5=0.4292 acc10=0.4480 pos=[7.82/7.91/7.79/7.87/8.03/7.86/7.99/8.23] n_tok=8192 batches=8
+[i]2026-05-16 07:51:18 [chiron]: [val val   ] medal_elbo=9.7749 ppl=17586.64 n_masked=1605 alpha=0.225
+[i]2026-05-16 07:51:18 [chiron]: [step    810] loss=7.7137 ema=7.1090 best=5.5614@790 acc=0.4922 ||g||=11.484 scale=0.044 lr=1.00e-04 tok/s=89267 wall=3.4s
+[i]2026-05-16 07:51:18 [chiron]: [step    820] loss=8.5224 ema=7.4481 best=5.5614@790 acc=0.2578 ||g||=2.439 scale=0.205 lr=1.00e-04 tok/s=128361 wall=3.5s
+[i]2026-05-16 07:51:18 [chiron]: [step    830] loss=6.7775 ema=7.5797 best=5.5614@790 acc=0.8398 ||g||=17.745 scale=0.028 lr=1.00e-04 tok/s=128128 wall=3.5s
+[i]2026-05-16 07:51:18 [chiron]: [step    840] loss=7.9669 ema=7.9668 best=5.5614@790 acc=0.5332 ||g||=24.089 scale=0.021 lr=1.00e-04 tok/s=128193 wall=3.5s
+[i]2026-05-16 07:51:18 [chiron]: [step    850] loss=8.6203 ema=7.7555 best=5.5614@790 acc=0.2676 ||g||=2.629 scale=0.190 lr=1.00e-04 tok/s=128016 wall=3.6s
+[i]2026-05-16 07:51:18 [chiron]: [step    860] loss=6.4221 ema=7.5227 best=5.5614@790 acc=0.8477 ||g||=8.605 scale=0.058 lr=1.00e-04 tok/s=128200 wall=3.6s
+[i]2026-05-16 07:51:18 [chiron]: [step    870] loss=7.4314 ema=7.8197 best=5.5614@790 acc=0.6055 ||g||=9.217 scale=0.054 lr=1.00e-04 tok/s=128367 wall=3.7s
+[i]2026-05-16 07:51:18 [chiron]: [step    880] loss=8.2156 ema=7.7430 best=5.5614@790 acc=0.3672 ||g||=3.228 scale=0.155 lr=1.00e-04 tok/s=128061 wall=3.7s
+[i]2026-05-16 07:51:18 [chiron]: [step    890] loss=5.7429 ema=7.3496 best=5.5614@790 acc=0.9180 ||g||=7.800 scale=0.064 lr=1.00e-04 tok/s=127740 wall=3.7s
+[i]2026-05-16 07:51:18 [chiron]: [step    900] loss=7.0651 ema=7.5482 best=5.5614@790 acc=0.6406 ||g||=5.269 scale=0.095 lr=1.00e-04 tok/s=128086 wall=3.8s
+[i]2026-05-16 07:51:18 [chiron]: [step    910] loss=8.3374 ema=7.8520 best=5.5614@790 acc=0.3594 ||g||=4.729 scale=0.106 lr=1.00e-04 tok/s=127718 wall=3.8s
+[i]2026-05-16 07:51:18 [chiron]: [step    920] loss=9.0683 ema=7.6497 best=5.5614@790 acc=0.1074 ||g||=4.948 scale=0.101 lr=1.00e-04 tok/s=127968 wall=3.9s
+[i]2026-05-16 07:51:18 [chiron]: [step    930] loss=6.5860 ema=7.4935 best=5.5614@790 acc=0.7109 ||g||=4.312 scale=0.116 lr=1.00e-04 tok/s=127884 wall=3.9s
+[i]2026-05-16 07:51:18 [chiron]: [step    940] loss=7.5422 ema=7.5719 best=5.5614@790 acc=0.4688 ||g||=5.740 scale=0.087 lr=1.00e-04 tok/s=128309 wall=3.9s
+[i]2026-05-16 07:51:18 [chiron]: [step    950] loss=8.4538 ema=7.4587 best=5.5614@790 acc=0.1582 ||g||=5.353 scale=0.093 lr=1.00e-04 tok/s=128204 wall=4.0s
+[i]2026-05-16 07:51:18 [chiron]: [step    960] loss=6.4732 ema=7.3744 best=5.5614@790 acc=0.7832 ||g||=8.348 scale=0.060 lr=1.00e-04 tok/s=128291 wall=4.0s
+[i]2026-05-16 07:51:18 [chiron]: [step    970] loss=7.3583 ema=7.4355 best=5.5614@790 acc=0.5273 ||g||=4.031 scale=0.124 lr=1.00e-04 tok/s=128247 wall=4.1s
+[i]2026-05-16 07:51:18 [chiron]: [step    980] loss=8.5506 ema=7.4260 best=5.5614@790 acc=0.2207 ||g||=3.451 scale=0.145 lr=1.00e-04 tok/s=128272 wall=4.1s
+[i]2026-05-16 07:51:18 [chiron]: [step    990] loss=6.5707 ema=7.3081 best=5.5614@790 acc=0.8398 ||g||=12.950 scale=0.039 lr=1.00e-04 tok/s=128078 wall=4.1s
+[i]2026-05-16 07:51:18 [chiron]: [step   1000] loss=7.0644 ema=7.4110 best=5.4979@994 acc=0.5684 ||g||=4.807 scale=0.104 lr=1.00e-04 tok/s=128166 wall=4.2s
+[i]2026-05-16 07:51:18 [chiron]: [val val   ] nll=7.3768 bpb=2.6606 ppl=1598.39 acc1=0.4873 acc5=0.5310 acc10=0.5403 pos=[7.27/7.52/7.30/7.44/7.31/7.31/7.45/7.41] n_tok=8192 batches=8
+[i]2026-05-16 07:51:18 [chiron]: [val val   ] medal_elbo=9.4534 ppl=12751.00 n_masked=1925 alpha=0.303
+[i]2026-05-16 07:51:18 [chiron]: [step   1010] loss=7.7602 ema=7.4122 best=5.4979@994 acc=0.4102 ||g||=4.226 scale=0.118 lr=1.00e-04 tok/s=89279 wall=4.2s
+[i]2026-05-16 07:51:18 [chiron]: [step   1020] loss=8.7997 ema=7.5240 best=5.4979@994 acc=0.1504 ||g||=4.178 scale=0.120 lr=1.00e-04 tok/s=128339 wall=4.3s
+[i]2026-05-16 07:51:19 [chiron]: [step   1030] loss=6.3563 ema=7.3078 best=5.4979@994 acc=0.7754 ||g||=6.078 scale=0.082 lr=1.00e-04 tok/s=128212 wall=4.3s
+[i]2026-05-16 07:51:19 [chiron]: [step   1040] loss=7.4833 ema=7.3793 best=5.4979@994 acc=0.4629 ||g||=3.921 scale=0.128 lr=1.00e-04 tok/s=128315 wall=4.4s
+[i]2026-05-16 07:51:19 [chiron]: [step   1050] loss=8.5519 ema=7.5426 best=5.4979@994 acc=0.1855 ||g||=3.578 scale=0.140 lr=1.00e-04 tok/s=128565 wall=4.4s
+[i]2026-05-16 07:51:19 [chiron]: [step   1060] loss=6.6313 ema=7.3752 best=5.4979@994 acc=0.8008 ||g||=11.084 scale=0.045 lr=1.00e-04 tok/s=128104 wall=4.4s
+[i]2026-05-16 07:51:19 [chiron]: [step   1070] loss=7.3547 ema=7.3167 best=5.4979@994 acc=0.5039 ||g||=5.472 scale=0.091 lr=1.00e-04 tok/s=127973 wall=4.5s
+[i]2026-05-16 07:51:19 [chiron]: [step   1080] loss=8.2716 ema=7.2426 best=5.3811@1079 acc=0.2617 ||g||=3.912 scale=0.128 lr=1.00e-04 tok/s=128055 wall=4.5s
+[i]2026-05-16 07:51:19 [chiron]: [step   1090] loss=5.8919 ema=7.2842 best=5.3811@1079 acc=0.8887 ||g||=8.983 scale=0.056 lr=1.00e-04 tok/s=128147 wall=4.6s
+[i]2026-05-16 07:51:19 [chiron]: [step   1100] loss=7.2685 ema=7.3767 best=5.1589@1094 acc=0.5117 ||g||=4.382 scale=0.114 lr=1.00e-04 tok/s=128264 wall=4.6s
+[i]2026-05-16 07:51:19 [chiron]: [step   1110] loss=8.2778 ema=7.4328 best=5.1589@1094 acc=0.3027 ||g||=4.976 scale=0.100 lr=1.00e-04 tok/s=128428 wall=4.6s
+[i]2026-05-16 07:51:19 [chiron]: [step   1120] loss=5.6426 ema=7.0127 best=5.1589@1094 acc=0.9141 ||g||=11.035 scale=0.045 lr=1.00e-04 tok/s=128013 wall=4.7s
+[i]2026-05-16 07:51:19 [chiron]: [step   1130] loss=6.4200 ema=7.2666 best=5.1589@1094 acc=0.6445 ||g||=6.503 scale=0.077 lr=1.00e-04 tok/s=128193 wall=4.7s
+[i]2026-05-16 07:51:19 [chiron]: [step   1140] loss=8.0786 ema=7.3165 best=5.1589@1094 acc=0.3809 ||g||=4.892 scale=0.102 lr=1.00e-04 tok/s=128170 wall=4.8s
+[i]2026-05-16 07:51:19 [chiron]: [step   1150] loss=8.8998 ema=7.3257 best=5.1589@1094 acc=0.1094 ||g||=4.221 scale=0.118 lr=1.00e-04 tok/s=127645 wall=4.8s
+[i]2026-05-16 07:51:19 [chiron]: [step   1160] loss=6.2470 ema=7.2359 best=5.1589@1094 acc=0.6621 ||g||=4.931 scale=0.101 lr=1.00e-04 tok/s=128073 wall=4.8s
+[i]2026-05-16 07:51:19 [chiron]: [step   1170] loss=7.4973 ema=7.3431 best=5.1589@1094 acc=0.4199 ||g||=9.430 scale=0.053 lr=1.00e-04 tok/s=127950 wall=4.9s
+[i]2026-05-16 07:51:19 [chiron]: [step   1180] loss=8.5104 ema=7.2475 best=5.1589@1094 acc=0.1641 ||g||=3.425 scale=0.146 lr=1.00e-04 tok/s=128257 wall=4.9s
+[i]2026-05-16 07:51:19 [chiron]: [step   1190] loss=6.0607 ema=7.0079 best=5.1589@1094 acc=0.7676 ||g||=5.456 scale=0.092 lr=1.00e-04 tok/s=127848 wall=5.0s
+[i]2026-05-16 07:51:19 [chiron]: [step   1200] loss=7.2360 ema=7.0709 best=5.1589@1094 acc=0.4531 ||g||=3.308 scale=0.151 lr=1.00e-04 tok/s=128169 wall=5.0s
+[i]2026-05-16 07:51:19 [chiron]: [val val   ] nll=7.4287 bpb=2.6793 ppl=1683.55 acc1=0.4307 acc5=0.4551 acc10=0.4629 pos=[7.57/7.23/7.40/7.45/7.39/7.56/7.50/7.33] n_tok=8192 batches=8
+[i]2026-05-16 07:51:19 [chiron]: [val val   ] medal_elbo=9.4224 ppl=12361.83 n_masked=2270 alpha=0.381
+[i]2026-05-16 07:51:19 [chiron]: [step   1210] loss=7.7940 ema=7.2430 best=5.1589@1094 acc=0.3477 ||g||=4.581 scale=0.109 lr=1.00e-04 tok/s=89211 wall=5.0s
+[i]2026-05-16 07:51:19 [chiron]: [step   1220] loss=9.0277 ema=7.2880 best=5.1589@1094 acc=0.0762 ||g||=7.423 scale=0.067 lr=1.00e-04 tok/s=128028 wall=5.1s
+[i]2026-05-16 07:51:19 [chiron]: [step   1230] loss=5.7570 ema=6.9169 best=5.1431@1227 acc=0.7285 ||g||=5.993 scale=0.083 lr=1.00e-04 tok/s=127951 wall=5.1s
+[i]2026-05-16 07:51:19 [chiron]: [step   1240] loss=7.4818 ema=7.2163 best=5.1431@1227 acc=0.3887 ||g||=8.959 scale=0.056 lr=1.00e-04 tok/s=128210 wall=5.2s
+[i]2026-05-16 07:51:19 [chiron]: [step   1250] loss=8.7584 ema=7.1508 best=5.1431@1227 acc=0.1230 ||g||=6.746 scale=0.074 lr=1.00e-04 tok/s=127600 wall=5.2s
+[i]2026-05-16 07:51:19 [chiron]: [step   1260] loss=5.8858 ema=6.9700 best=5.1431@1227 acc=0.7285 ||g||=9.796 scale=0.051 lr=1.00e-04 tok/s=128095 wall=5.2s
+[i]2026-05-16 07:51:19 [chiron]: [step   1270] loss=7.6609 ema=7.2788 best=5.1431@1227 acc=0.4375 ||g||=14.787 scale=0.034 lr=1.00e-04 tok/s=128244 wall=5.3s
+[i]2026-05-16 07:51:20 [chiron]: [step   1280] loss=8.3590 ema=7.2718 best=5.1431@1227 acc=0.1543 ||g||=10.714 scale=0.047 lr=1.00e-04 tok/s=128116 wall=5.3s
+[i]2026-05-16 07:51:20 [chiron]: [step   1290] loss=6.0266 ema=7.1938 best=5.1431@1227 acc=0.8379 ||g||=16.546 scale=0.030 lr=1.00e-04 tok/s=128216 wall=5.4s
+[i]2026-05-16 07:51:20 [chiron]: [step   1300] loss=7.4006 ema=7.1390 best=5.1431@1227 acc=0.4512 ||g||=23.900 scale=0.021 lr=1.00e-04 tok/s=128252 wall=5.4s
+[i]2026-05-16 07:51:20 [chiron]: [step   1310] loss=8.4272 ema=7.1640 best=5.1431@1227 acc=0.1797 ||g||=4.981 scale=0.100 lr=1.00e-04 tok/s=128243 wall=5.4s
+[i]2026-05-16 07:51:20 [chiron]: [step   1320] loss=5.3440 ema=7.1087 best=5.1431@1227 acc=0.8301 ||g||=9.736 scale=0.051 lr=1.00e-04 tok/s=128392 wall=5.5s
+[i]2026-05-16 07:51:20 [chiron]: [step   1330] loss=6.7425 ema=7.2114 best=5.1431@1227 acc=0.5566 ||g||=13.613 scale=0.037 lr=1.00e-04 tok/s=128289 wall=5.5s
+[i]2026-05-16 07:51:20 [chiron]: [step   1340] loss=8.1499 ema=6.9576 best=4.9752@1335 acc=0.2812 ||g||=4.894 scale=0.102 lr=1.00e-04 tok/s=128122 wall=5.6s
+[i]2026-05-16 07:51:20 [chiron]: [step   1350] loss=6.6478 ema=7.1587 best=4.9752@1335 acc=0.9004 ||g||=34.872 scale=0.014 lr=1.00e-04 tok/s=128282 wall=5.6s
+[i]2026-05-16 07:51:20 [chiron]: [step   1360] loss=10.0755 ema=7.8525 best=4.9752@1335 acc=0.2852 ||g||=80.172 scale=0.006 lr=1.00e-04 tok/s=128507 wall=5.6s
+[i]2026-05-16 07:51:20 [chiron]: [step   1370] loss=11.8731 ema=10.0158 best=4.9752@1335 acc=0.1113 ||g||=20.073 scale=0.025 lr=1.00e-04 tok/s=128058 wall=5.7s
+[i]2026-05-16 07:51:20 [chiron]: [step   1380] loss=9.2297 ema=10.4696 best=4.9752@1335 acc=0.0840 ||g||=21.614 scale=0.023 lr=1.00e-04 tok/s=128177 wall=5.7s
+[i]2026-05-16 07:51:20 [chiron]: [step   1390] loss=7.7763 ema=9.6819 best=4.9752@1335 acc=0.3574 ||g||=13.620 scale=0.037 lr=1.00e-04 tok/s=128205 wall=5.8s
+[i]2026-05-16 07:51:20 [chiron]: [step   1400] loss=7.2164 ema=7.9365 best=4.9752@1335 acc=0.3555 ||g||=30.467 scale=0.016 lr=1.00e-04 tok/s=127849 wall=5.8s
+[i]2026-05-16 07:51:20 [chiron]: [val val   ] nll=7.5549 bpb=2.7248 ppl=1910.00 acc1=0.3154 acc5=0.4253 acc10=0.4712 pos=[7.43/7.83/7.68/7.54/7.50/7.54/7.45/7.45] n_tok=8192 batches=8
+[i]2026-05-16 07:51:20 [chiron]: [val val   ] medal_elbo=9.3316 ppl=11288.75 n_masked=2113 alpha=0.459
+[i]2026-05-16 07:51:20 [chiron]: [step   1410] loss=8.7451 ema=7.6376 best=4.9752@1335 acc=0.2617 ||g||=13.050 scale=0.038 lr=1.00e-04 tok/s=89219 wall=5.9s
+[i]2026-05-16 07:51:20 [chiron]: [step   1420] loss=6.0677 ema=7.4197 best=4.9752@1335 acc=0.6934 ||g||=16.055 scale=0.031 lr=1.00e-04 tok/s=128210 wall=5.9s
+[i]2026-05-16 07:51:20 [chiron]: [step   1430] loss=7.2859 ema=7.4465 best=4.9752@1335 acc=0.5938 ||g||=8.212 scale=0.061 lr=1.00e-04 tok/s=128193 wall=5.9s
+[i]2026-05-16 07:51:20 [chiron]: [step   1440] loss=8.0106 ema=7.5173 best=4.9752@1335 acc=0.2949 ||g||=6.102 scale=0.082 lr=1.00e-04 tok/s=128322 wall=6.0s
+[i]2026-05-16 07:51:20 [chiron]: [step   1450] loss=5.1999 ema=6.8369 best=4.9752@1335 acc=0.9395 ||g||=32.541 scale=0.015 lr=1.00e-04 tok/s=127641 wall=6.0s
+[i]2026-05-16 07:51:20 [chiron]: [step   1460] loss=6.7462 ema=7.0954 best=4.9752@1335 acc=0.5508 ||g||=5.745 scale=0.087 lr=1.00e-04 tok/s=128279 wall=6.1s
+[i]2026-05-16 07:51:20 [chiron]: [step   1470] loss=7.4155 ema=7.2508 best=4.9752@1335 acc=0.3047 ||g||=8.558 scale=0.058 lr=1.00e-04 tok/s=128410 wall=6.1s
+[i]2026-05-16 07:51:20 [chiron]: [step   1480] loss=8.7702 ema=7.0503 best=4.6605@1476 acc=0.1016 ||g||=6.039 scale=0.083 lr=1.00e-04 tok/s=128134 wall=6.1s
+[i]2026-05-16 07:51:20 [chiron]: [step   1490] loss=6.1860 ema=6.9415 best=4.6605@1476 acc=0.5000 ||g||=11.834 scale=0.042 lr=1.00e-04 tok/s=128060 wall=6.2s
+[i]2026-05-16 07:51:20 [chiron]: [step   1500] loss=7.8997 ema=7.4713 best=4.6605@1476 acc=0.3418 ||g||=17.478 scale=0.029 lr=1.00e-04 tok/s=128368 wall=6.2s
+[i]2026-05-16 07:51:20 [chiron]: [step   1510] loss=9.0481 ema=7.6480 best=4.6605@1476 acc=0.1406 ||g||=7.333 scale=0.068 lr=1.00e-04 tok/s=128190 wall=6.3s
+[i]2026-05-16 07:51:21 [chiron]: [step   1520] loss=6.7487 ema=7.5839 best=4.6605@1476 acc=0.5742 ||g||=15.876 scale=0.031 lr=1.00e-04 tok/s=127869 wall=6.3s
+[i]2026-05-16 07:51:21 [chiron]: [step   1530] loss=6.8743 ema=7.1477 best=4.6605@1476 acc=0.4766 ||g||=4.640 scale=0.108 lr=1.00e-04 tok/s=128123 wall=6.3s
+[i]2026-05-16 07:51:21 [chiron]: [step   1540] loss=9.4314 ema=7.5643 best=4.6605@1476 acc=0.1582 ||g||=10.800 scale=0.046 lr=1.00e-04 tok/s=128382 wall=6.4s
+[i]2026-05-16 07:51:21 [chiron]: [step   1550] loss=8.0033 ema=7.8027 best=4.6605@1476 acc=0.4688 ||g||=39.606 scale=0.013 lr=1.00e-04 tok/s=128195 wall=6.4s
+[i]2026-05-16 07:51:21 [chiron]: [step   1560] loss=7.4439 ema=8.0307 best=4.6605@1476 acc=0.5312 ||g||=69.962 scale=0.007 lr=1.00e-04 tok/s=128393 wall=6.5s
+[i]2026-05-16 07:51:21 [chiron]: [step   1570] loss=8.6062 ema=7.7600 best=4.6605@1476 acc=0.2812 ||g||=16.077 scale=0.031 lr=1.00e-04 tok/s=128073 wall=6.5s
+[i]2026-05-16 07:51:21 [chiron]: [step   1580] loss=8.0506 ema=7.8949 best=4.6605@1476 acc=0.5332 ||g||=125.166 scale=0.004 lr=1.00e-04 tok/s=128192 wall=6.5s
+[i]2026-05-16 07:51:21 [chiron]: [step   1590] loss=10.2992 ema=9.1747 best=4.6605@1476 acc=0.2148 ||g||=27.502 scale=0.018 lr=1.00e-04 tok/s=128382 wall=6.6s
+[i]2026-05-16 07:51:21 [chiron]: [step   1600] loss=8.2161 ema=9.1231 best=4.6605@1476 acc=0.3184 ||g||=18.712 scale=0.027 lr=1.00e-04 tok/s=128146 wall=6.6s
+[i]2026-05-16 07:51:21 [chiron]: [val val   ] nll=7.8265 bpb=2.8228 ppl=2506.24 acc1=0.2947 acc5=0.4302 acc10=0.4604 pos=[7.84/7.78/7.77/7.86/7.80/7.83/7.87/7.87] n_tok=8192 batches=8
+[i]2026-05-16 07:51:21 [chiron]: [val val   ] medal_elbo=9.3765 ppl=11807.51 n_masked=1995 alpha=0.536
+[i]2026-05-16 07:51:21 [chiron]: [step   1610] loss=8.5261 ema=8.1374 best=4.6605@1476 acc=0.2734 ||g||=133.910 scale=0.004 lr=1.00e-04 tok/s=89292 wall=6.7s
+[i]2026-05-16 07:51:21 [chiron]: [step   1620] loss=6.5645 ema=7.6874 best=4.6605@1476 acc=0.8105 ||g||=28.730 scale=0.017 lr=1.00e-04 tok/s=128123 wall=6.7s
+[i]2026-05-16 07:51:21 [chiron]: [step   1630] loss=7.8726 ema=7.8965 best=4.6605@1476 acc=0.5156 ||g||=115.323 scale=0.004 lr=1.00e-04 tok/s=128111 wall=6.8s
+[i]2026-05-16 07:51:21 [chiron]: [step   1640] loss=9.1555 ema=7.9763 best=4.6605@1476 acc=0.1973 ||g||=35.069 scale=0.014 lr=1.00e-04 tok/s=127711 wall=6.8s
+[i]2026-05-16 07:51:21 [chiron]: [step   1650] loss=7.3572 ema=8.2267 best=4.6605@1476 acc=0.6895 ||g||=15.516 scale=0.032 lr=1.00e-04 tok/s=128351 wall=6.8s
+[i]2026-05-16 07:51:21 [chiron]: [step   1660] loss=7.5632 ema=8.1060 best=4.6605@1476 acc=0.5938 ||g||=7.826 scale=0.064 lr=1.00e-04 tok/s=128138 wall=6.9s
+[i]2026-05-16 07:51:21 [chiron]: [step   1670] loss=8.5832 ema=7.9285 best=4.6605@1476 acc=0.2852 ||g||=29.039 scale=0.017 lr=1.00e-04 tok/s=128327 wall=6.9s
+[i]2026-05-16 07:51:21 [chiron]: [step   1680] loss=6.3692 ema=7.7300 best=4.6605@1476 acc=0.9023 ||g||=83.239 scale=0.006 lr=1.00e-04 tok/s=128115 wall=7.0s
+[i]2026-05-16 07:51:21 [chiron]: [step   1690] loss=7.6370 ema=7.8912 best=4.6605@1476 acc=0.5469 ||g||=13.913 scale=0.036 lr=1.00e-04 tok/s=128222 wall=7.0s
+[i]2026-05-16 07:51:21 [chiron]: [step   1700] loss=8.3234 ema=8.0968 best=4.6605@1476 acc=0.3086 ||g||=12.280 scale=0.041 lr=1.00e-04 tok/s=127984 wall=7.0s
+[i]2026-05-16 07:51:21 [chiron]: [step   1710] loss=9.1775 ema=7.7631 best=4.6605@1476 acc=0.0703 ||g||=206.360 scale=0.002 lr=1.00e-04 tok/s=128008 wall=7.1s
+[i]2026-05-16 07:51:21 [chiron]: [step   1720] loss=5.8909 ema=7.4903 best=4.6605@1476 acc=0.7129 ||g||=24.654 scale=0.020 lr=1.00e-04 tok/s=128077 wall=7.1s
+[i]2026-05-16 07:51:21 [chiron]: [step   1730] loss=7.4813 ema=7.3238 best=4.6605@1476 acc=0.3828 ||g||=100.829 scale=0.005 lr=1.00e-04 tok/s=128235 wall=7.2s
+[i]2026-05-16 07:51:21 [chiron]: [step   1740] loss=9.1103 ema=7.4751 best=4.6605@1476 acc=0.1270 ||g||=27.256 scale=0.018 lr=1.00e-04 tok/s=128372 wall=7.2s
+[i]2026-05-16 07:51:21 [chiron]: [step   1750] loss=5.7763 ema=7.0024 best=4.6605@1476 acc=0.7422 ||g||=23.435 scale=0.021 lr=1.00e-04 tok/s=128032 wall=7.2s
+[i]2026-05-16 07:51:21 [chiron]: [step   1760] loss=7.1593 ema=7.1042 best=4.6605@1476 acc=0.4863 ||g||=11.488 scale=0.044 lr=1.00e-04 tok/s=128182 wall=7.3s
+[i]2026-05-16 07:51:22 [chiron]: [step   1770] loss=8.4808 ema=7.2494 best=4.6605@1476 acc=0.1836 ||g||=9.468 scale=0.053 lr=1.00e-04 tok/s=128342 wall=7.3s
+[i]2026-05-16 07:51:22 [chiron]: [step   1780] loss=5.9025 ema=6.6986 best=3.6202@1773 acc=0.6055 ||g||=30.598 scale=0.016 lr=1.00e-04 tok/s=128079 wall=7.4s
+[i]2026-05-16 07:51:22 [chiron]: [step   1790] loss=6.8526 ema=6.7775 best=3.6202@1773 acc=0.5215 ||g||=8.060 scale=0.062 lr=1.00e-04 tok/s=128045 wall=7.4s
+[i]2026-05-16 07:51:22 [chiron]: [step   1800] loss=8.8787 ema=7.2822 best=3.6202@1773 acc=0.2598 ||g||=98.268 scale=0.005 lr=1.00e-04 tok/s=128090 wall=7.4s
+[i]2026-05-16 07:51:22 [chiron]: [val val   ] nll=8.0084 bpb=2.8884 ppl=3006.19 acc1=0.4346 acc5=0.4385 acc10=0.4397 pos=[8.05/8.26/8.01/7.94/7.85/7.84/8.00/8.10] n_tok=8192 batches=8
+[i]2026-05-16 07:51:22 [chiron]: [val val   ] medal_elbo=10.0586 ppl=23356.74 n_masked=2308 alpha=0.614
+[i]2026-05-16 07:51:22 [chiron]: [step   1810] loss=9.5239 ema=7.8227 best=3.6202@1773 acc=0.1074 ||g||=44.028 scale=0.011 lr=1.00e-04 tok/s=89291 wall=7.5s
+[i]2026-05-16 07:51:22 [chiron]: [step   1820] loss=6.5647 ema=7.5482 best=3.6202@1773 acc=0.7129 ||g||=11.641 scale=0.043 lr=1.00e-04 tok/s=128162 wall=7.5s
+[i]2026-05-16 07:51:22 [chiron]: [step   1830] loss=5.8608 ema=7.1485 best=3.6202@1773 acc=0.4766 ||g||=10.434 scale=0.048 lr=1.00e-04 tok/s=128269 wall=7.6s
+[i]2026-05-16 07:51:22 [chiron]: [step   1840] loss=8.6214 ema=7.0736 best=3.6202@1773 acc=0.2090 ||g||=21.420 scale=0.023 lr=1.00e-04 tok/s=128255 wall=7.6s
+[i]2026-05-16 07:51:22 [chiron]: [step   1850] loss=6.5997 ema=7.2479 best=3.6202@1773 acc=0.5703 ||g||=30.721 scale=0.016 lr=1.00e-04 tok/s=128290 wall=7.7s
+[i]2026-05-16 07:51:22 [chiron]: [step   1860] loss=7.3983 ema=7.3594 best=3.6202@1773 acc=0.5098 ||g||=51.785 scale=0.010 lr=1.00e-04 tok/s=128006 wall=7.7s
+[i]2026-05-16 07:51:22 [chiron]: [step   1870] loss=8.5749 ema=7.3420 best=3.6202@1773 acc=0.2031 ||g||=98.066 scale=0.005 lr=1.00e-04 tok/s=128127 wall=7.7s
+[i]2026-05-16 07:51:22 [chiron]: [step   1880] loss=5.4297 ema=6.9689 best=3.6202@1773 acc=0.8262 ||g||=15.268 scale=0.033 lr=1.00e-04 tok/s=128034 wall=7.8s
+[i]2026-05-16 07:51:22 [chiron]: [step   1890] loss=6.6965 ema=7.1641 best=3.6202@1773 acc=0.5918 ||g||=13.260 scale=0.038 lr=1.00e-04 tok/s=127767 wall=7.8s
+[i]2026-05-16 07:51:22 [chiron]: [step   1900] loss=8.1899 ema=6.9426 best=3.6202@1773 acc=0.2930 ||g||=23.611 scale=0.021 lr=1.00e-04 tok/s=128081 wall=7.9s
+[i]2026-05-16 07:51:22 [chiron]: [step   1910] loss=5.6915 ema=7.0976 best=3.6202@1773 acc=0.9141 ||g||=15.230 scale=0.033 lr=1.00e-04 tok/s=128041 wall=7.9s
+[i]2026-05-16 07:51:22 [chiron]: [step   1920] loss=6.6866 ema=7.1835 best=3.6202@1773 acc=0.5625 ||g||=12.668 scale=0.039 lr=1.00e-04 tok/s=128301 wall=7.9s
+[i]2026-05-16 07:51:22 [chiron]: [step   1930] loss=7.8857 ema=7.1703 best=3.6202@1773 acc=0.3516 ||g||=15.139 scale=0.033 lr=1.00e-04 tok/s=128321 wall=8.0s
+[i]2026-05-16 07:51:22 [chiron]: [step   1940] loss=9.4788 ema=7.1742 best=3.6202@1773 acc=0.0762 ||g||=28.141 scale=0.018 lr=1.00e-04 tok/s=128375 wall=8.0s
+[i]2026-05-16 07:51:22 [chiron]: [step   1950] loss=6.5868 ema=7.1894 best=3.6202@1773 acc=0.5996 ||g||=21.156 scale=0.024 lr=1.00e-04 tok/s=128314 wall=8.1s
+[i]2026-05-16 07:51:22 [chiron]: [step   1960] loss=8.0429 ema=7.3353 best=3.6202@1773 acc=0.3750 ||g||=59.174 scale=0.008 lr=1.00e-04 tok/s=128461 wall=8.1s
+[i]2026-05-16 07:51:22 [chiron]: [step   1970] loss=8.7931 ema=7.0127 best=3.6202@1773 acc=0.0918 ||g||=14.604 scale=0.034 lr=1.00e-04 tok/s=128038 wall=8.1s
+[i]2026-05-16 07:51:22 [chiron]: [step   1980] loss=5.7007 ema=6.7800 best=3.6202@1773 acc=0.6230 ||g||=23.468 scale=0.021 lr=1.00e-04 tok/s=128104 wall=8.2s
+[i]2026-05-16 07:51:22 [chiron]: [step   1990] loss=7.6253 ema=6.9950 best=3.6202@1773 acc=0.4043 ||g||=10.946 scale=0.046 lr=1.00e-04 tok/s=128406 wall=8.2s
+[i]2026-05-16 07:51:22 [chiron]: [step   2000] loss=8.3972 ema=7.1407 best=3.6202@1773 acc=0.2090 ||g||=12.896 scale=0.039 lr=1.00e-04 tok/s=128198 wall=8.3s
+[i]2026-05-16 07:51:22 [chiron]: [val val   ] nll=6.8994 bpb=2.4884 ppl=991.67 acc1=0.4783 acc5=0.4817 acc10=0.4844 pos=[6.64/7.04/6.86/6.97/6.84/7.03/6.92/6.88] n_tok=8192 batches=8
+[i]2026-05-16 07:51:22 [chiron]: [val val   ] medal_elbo=9.4241 ppl=12383.86 n_masked=2134 alpha=0.692
+[i]2026-05-16 07:51:22 [chiron]: [chiron-train] done: steps=2000 total_tokens=1024000 wall=8.3s

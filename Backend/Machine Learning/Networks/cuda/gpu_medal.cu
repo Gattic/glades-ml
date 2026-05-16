@@ -188,6 +188,57 @@ bool medal_masked_nll(const float* d_probs, const int* d_targets,
     return true;
 }
 
+// -------------------------------------------------------------------- //
+// Kernel: medal_masked_nll_bf16
+//
+// BF16-storage variant of medal_masked_nll for the bf16-logits-storage path.
+// One block per row; thread 0 looks up p[row, targets[row]] in BF16 storage,
+// promotes to FP32, takes -log, and atomicAdd's to the scalar accumulator.
+// -------------------------------------------------------------------- //
+__global__ void medal_masked_nll_bf16_kernel(const uint16_t* __restrict__ probs_bf,
+                                              const int* __restrict__ targets,
+                                              const unsigned char* __restrict__ mask,
+                                              int T, int V,
+                                              float* __restrict__ nll_sum,
+                                              int* __restrict__ n_masked)
+{
+    int row = blockIdx.x;
+    if (row >= T || threadIdx.x != 0) return;
+
+    if (mask[row] == 0) return;
+    int t = targets[row];
+    if (t < 0 || t >= V) return;
+    uint16_t bits = probs_bf[(size_t)row * V + t];
+    union { float f; uint32_t u; } v;
+    v.u = ((uint32_t)bits) << 16;
+    float p = v.f;
+    if (p < 1e-30f) p = 1e-30f;
+    float nll = -__logf(p);
+
+    atomicAdd(nll_sum, nll);
+    atomicAdd(n_masked, 1);
+}
+
+bool medal_masked_nll_bf16(const uint16_t* d_probs_bf, const int* d_targets,
+                           const unsigned char* d_mask, int T, int V,
+                           float* d_nll_sum, int* d_n_masked)
+{
+    if (T <= 0 || V <= 0) return false;
+    cudaMemset(d_nll_sum,  0, sizeof(float));
+    cudaMemset(d_n_masked, 0, sizeof(int));
+    int threads = 32;
+    medal_masked_nll_bf16_kernel<<<T, threads>>>(
+        d_probs_bf, d_targets, d_mask, T, V, d_nll_sum, d_n_masked);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        std::fprintf(stderr, "[medal] masked_nll_bf16 launch failed: %s\n",
+                     cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 } // namespace gpu
 } // namespace glades
 
