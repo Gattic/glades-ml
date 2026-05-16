@@ -543,6 +543,118 @@ cleanup:
 	return ok;
 }
 
+// iter 62 (2026-05-16): ABT FP8 GEMM with BF16 inputs and BF16 output direct.
+//
+// Math (row-major):  C[M, N] = alpha * A[M, K] * B^T[K, N] + beta * C
+// where B is stored row-major [N, K].
+//
+// Same cuBLASLt TN canonical form as the NN variant — both A_row[M, K] and
+// B_row[N, K] are naturally K-major (fast-changing index = K), so neither
+// input needs the transpose-cast step.  Output BF16 is written DIRECTLY
+// into the caller's C_bf buffer (col-major [N, M] ld=N has identical byte
+// layout to row-major [M, N] ld=N when ldc=N), eliminating the post-cast
+// FP32 round-trip used by sgemm_rowmajor_fp8_e4m3_bf16.
+bool sgemm_rowmajor_abt_fp8_e4m3_bf16_bf16out(
+    int M, int N, int K, float alpha,
+    const unsigned short* A_bf, int /*lda*/,
+    const unsigned short* B_bf, int /*ldb*/,
+    float beta,
+    unsigned short* C_bf, int ldc,
+    const float* d_scaleA, const float* d_scaleB)
+{
+	if (M <= 0 || N <= 0 || K <= 0) return true;
+	if (!fp8_init()) return false;
+
+	const size_t bytesA = (size_t)M * (size_t)K * sizeof(__nv_fp8_e4m3);
+	const size_t bytesB = (size_t)K * (size_t)N * sizeof(__nv_fp8_e4m3);
+	if (!grow_buf((void**)&g_scratch_A, &g_scratch_A_cap, bytesA)) return false;
+	if (!grow_buf((void**)&g_scratch_B, &g_scratch_B_cap, bytesB)) return false;
+
+	cudaStream_t stream = computeStream();
+
+	// Cast A without transpose: A_bf row-major [M, K] is K-major.
+	{
+		const int blk = 256;
+		const int grid = (int)(((size_t)M * (size_t)K + blk - 1) / blk);
+		kernel_cast_bf16_to_e4m3<<<grid, blk, 0, stream>>>(
+		    A_bf, d_scaleA, g_scratch_A, (size_t)M * (size_t)K);
+	}
+	// Cast B WITHOUT transpose: B_bf row-major [N, K] is already K-major
+	// (this is the only structural diff vs sgemm_rowmajor_fp8_e4m3_bf16,
+	// which transposes B row-major [K, N] -> K-major).
+	{
+		const int blk = 256;
+		const int grid = (int)(((size_t)K * (size_t)N + blk - 1) / blk);
+		kernel_cast_bf16_to_e4m3<<<grid, blk, 0, stream>>>(
+		    B_bf, d_scaleB, g_scratch_B, (size_t)K * (size_t)N);
+	}
+
+	cublasLtMatmulDesc_t opDesc = 0;
+	cublasLtMatrixLayout_t Adesc = 0, Bdesc = 0, Cdesc = 0;
+	bool ok = true;
+
+	// cuBLASLt FP8 internal multiplier: stored_x · inv_scale_x = real_x.
+	// We pre-scaled stored = real · scale_x; reciprocal recovers real.
+	// A_in = B's memory in this op, so its inv_scale is 1/scaleB.
+	kernel_reciprocal_one<<<1, 1, 0, stream>>>(d_scaleB, g_dev_inv_scaleA);
+	kernel_reciprocal_one<<<1, 1, 0, stream>>>(d_scaleA, g_dev_inv_scaleB);
+
+	cublasStatus_t st;
+	st = cublasLtMatmulDescCreate(&opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+	if (st != CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr,"[fp8] MatmulDescCreate failed: %d\n",(int)st); ok = false; goto cleanup; }
+
+	{
+		cublasOperation_t opT = CUBLAS_OP_T;
+		cublasOperation_t opN = CUBLAS_OP_N;
+		cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+		cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+		cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+		                                &g_dev_inv_scaleA, sizeof(g_dev_inv_scaleA));
+		cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+		                                &g_dev_inv_scaleB, sizeof(g_dev_inv_scaleB));
+		int8_t fastAccum = 1;
+		cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAccum, sizeof(fastAccum));
+	}
+
+	// Adesc covers g_scratch_B (FP8-cast B without transpose), col-major [K, N] ld=K.
+	st = cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8F_E4M3, K, N, K);
+	if (st != CUBLAS_STATUS_SUCCESS) { ok = false; goto cleanup; }
+	// Bdesc covers g_scratch_A (FP8-cast A), col-major [K, M] ld=K.
+	st = cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8F_E4M3, K, M, K);
+	if (st != CUBLAS_STATUS_SUCCESS) { ok = false; goto cleanup; }
+	// Output BF16 directly into caller's buffer.  col-major [N, M] ld=N is
+	// byte-equivalent to row-major [M, N] ld=N when ldc=N.
+	st = cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16BF, N, M, N);
+	if (st != CUBLAS_STATUS_SUCCESS) { ok = false; goto cleanup; }
+
+	{
+		const float matAlpha = alpha;
+		const float matBeta = beta;  // cuBLASLt does BF16 C in + BF16 D out, FP32 internal accum
+		st = cublasLtMatmul(g_lt_handle, opDesc,
+		                     &matAlpha,
+		                     g_scratch_B, Adesc,
+		                     g_scratch_A, Bdesc,
+		                     &matBeta,
+		                     C_bf, Cdesc,
+		                     C_bf, Cdesc,
+		                     0, 0, 0, stream);
+		if (st != CUBLAS_STATUS_SUCCESS) {
+			std::fprintf(stderr, "[fp8] cublasLtMatmul(abt,bf16-out) failed: %d  M=%d N=%d K=%d\n", (int)st, M, N, K);
+			ok = false; goto cleanup;
+		}
+	}
+
+	(void)ldc;
+
+cleanup:
+	if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+	if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+	if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+	if (opDesc) cublasLtMatmulDescDestroy(opDesc);
+	if (!ok) (void)cudaGetLastError();
+	return ok;
+}
+
 } // namespace gpu
 } // namespace glades
 

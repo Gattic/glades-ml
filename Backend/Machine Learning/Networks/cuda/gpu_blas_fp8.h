@@ -81,6 +81,27 @@ bool sgemm_rowmajor_fp8_e4m3_bf16(int M, int N, int K,
 // Counterpart to fp8_calibrate_amax_e4m3 for the BF16 path.
 bool fp8_calibrate_amax_e4m3_bf16(const unsigned short* d_x_bf, size_t n, float* d_scale);
 
+// iter 62 (2026-05-16): FP8 ABT GEMM with BF16 inputs and BF16 output.
+// C[M, N] = alpha · A[M, K] · B^T[K, N] + beta · C   (row-major).
+// B is stored as row-major [N, K] (so B^T is what cuBLAS sees as [K, N]).
+//
+// Same per-tensor scale convention as sgemm_rowmajor_fp8_e4m3_bf16: caller
+// supplies d_scaleA, d_scaleB derived from amax (typically via
+// fp8_calibrate_amax_e4m3_bf16).  cuBLASLt applies the inverse scales
+// internally and emits BF16 output directly — no FP32 round-trip.
+//
+// Used by the --fp8-readout-fwd path: logits_bf = q_L_bf · W_E_bf^T at
+// shape (M=T, N=V, K=m) ≈ 1 TFLOP on Ada sm_8.9, where FP8 tensor cores
+// give ~2× BF16 throughput.  Compatible with the existing
+// softmax_forward_bf16 downstream consumer (no probs-cast required).
+bool sgemm_rowmajor_abt_fp8_e4m3_bf16_bf16out(
+    int M, int N, int K, float alpha,
+    const unsigned short* A_bf, int lda,
+    const unsigned short* B_bf, int ldb,
+    float beta,
+    unsigned short* C_bf, int ldc,
+    const float* d_scaleA, const float* d_scaleB);
+
 } // namespace gpu
 } // namespace glades
 
@@ -99,6 +120,9 @@ inline bool sgemm_rowmajor_fp8_e4m3_bf16(int, int, int, float, const unsigned sh
                                           const unsigned short*, int, float, float*, int,
                                           const float*, const float*) { return false; }
 inline bool fp8_calibrate_amax_e4m3_bf16(const unsigned short*, size_t, float*) { return false; }
+inline bool sgemm_rowmajor_abt_fp8_e4m3_bf16_bf16out(
+    int, int, int, float, const unsigned short*, int, const unsigned short*, int,
+    float, unsigned short*, int, const float*, const float*) { return false; }
 
 } // namespace gpu
 } // namespace glades
