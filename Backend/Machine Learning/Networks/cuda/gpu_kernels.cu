@@ -6884,6 +6884,54 @@ __global__ void scfa_dwconv_dK_kernel(const float* __restrict__ x,
 	::atomicAdd(&dK[(size_t)c * (size_t)(w + 1) + (size_t)i], acc);
 }
 
+// 2D-tiled parallel variant: BLOCK_M consecutive channels (coalesced memory)
+// and BLOCK_T parallel T-partitions per block, reduced via shared memory.
+// Replaces the legacy "1 thread per (c,i), loop t" pattern which was both
+// non-coalesced (threads in a block shared c, strided rows) and severely
+// under-parallel at production scale.
+template<int BLOCK_M, int BLOCK_T>
+__global__ void scfa_dwconv_dK_kernel_par(const float* __restrict__ x,
+                                          const float* __restrict__ dy,
+                                          int T, int m, int w,
+                                          float* __restrict__ dK)
+{
+	const int i = blockIdx.y;                              // tap in [0, w]
+	const int c = blockIdx.x * BLOCK_M + threadIdx.x;      // channel (coalesced)
+	const int ty = threadIdx.y;                            // T-partition
+	if (i > w) return;
+
+	float acc = 0.0f;
+	// Strided sum over T: each ty handles t = i+ty, i+ty+BLOCK_T, ...
+	if (c < m)
+	{
+		for (int t = i + ty; t < T; t += BLOCK_T)
+		{
+			acc += x[(size_t)(t - i) * (size_t)m + (size_t)c] *
+			       dy[(size_t)t * (size_t)m + (size_t)c];
+		}
+	}
+
+	// Reduction across the ty dimension via shared memory.
+	__shared__ float sdata[BLOCK_T][BLOCK_M];
+	sdata[ty][threadIdx.x] = acc;
+	__syncthreads();
+
+	for (int s = BLOCK_T / 2; s > 0; s >>= 1)
+	{
+		if (ty < s)
+		{
+			sdata[ty][threadIdx.x] += sdata[ty + s][threadIdx.x];
+		}
+		__syncthreads();
+	}
+
+	if (ty == 0 && c < m)
+	{
+		// Exactly one block-row writes to each (c, i); += for accumulate semantics.
+		dK[(size_t)c * (size_t)(w + 1) + (size_t)i] += sdata[0][threadIdx.x];
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
@@ -6902,12 +6950,17 @@ bool scfa_depthwise_causal_conv_bwd(const float* x, const float* K,
 		    dy, K, T, m, w, dx);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
-	// dK kernel: one thread per (c, i) pair.
+	// dK kernel: 2D-tiled parallel reduction.  BLOCK_M consecutive channels per
+	// block (coalesced memory) × BLOCK_T parallel T-partitions, reduced via SMEM.
+	// Replaces the legacy "1 thread per (c,i), loop t" kernel which was both
+	// non-coalesced and severely under-parallel at production scale.
 	{
+		const int BLOCK_M = 64;
+		const int BLOCK_T = 8;
 		int wp1 = w + 1;
-		int block = (wp1 < 32) ? wp1 : 32;
-		dim3 grid((wp1 + block - 1) / block, m);
-		scfa_dwconv_dK_kernel<<<grid, block, 0, s>>>(
+		dim3 grid((m + BLOCK_M - 1) / BLOCK_M, wp1);
+		dim3 block(BLOCK_M, BLOCK_T);
+		scfa_dwconv_dK_kernel_par<64, 8><<<grid, block, 0, s>>>(
 		    x, dy, T, m, w, dK);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
