@@ -87,6 +87,38 @@ bool chiron_bf16_to_fp32_axpy(float* q, float alpha,
                                const unsigned short* p_bf, int n,
                                cudaStream_t stream = 0);
 
+// iter 64 (Arc 2): Stochastic-rounding variants.  Same FP32-internal accum
+// as RN; final BF16 encode uses xorshift-mixed hash of (idx, step, seed)
+// for mean-zero rounding.  Caller passes srBaseSeed (W.bf16WeightsSeed) +
+// srStepIdx (training step counter).
+bool chiron_scfa_axpy2_bf16p_sr(unsigned short* p_bf, float alpha,
+                                 const float* a, const float* b, int n,
+                                 unsigned int srBaseSeed,
+                                 unsigned int srStepIdx,
+                                 cudaStream_t stream = 0);
+bool chiron_axpy_bf16p_sr(unsigned short* p_bf, float alpha,
+                           const float* x, int n,
+                           unsigned int srBaseSeed,
+                           unsigned int srStepIdx,
+                           cudaStream_t stream = 0);
+bool chiron_scfa_scaled_copy_bf16p_sr(unsigned short* c_bf, float alpha,
+                                       const float* a, int n,
+                                       unsigned int srBaseSeed,
+                                       unsigned int srStepIdx,
+                                       cudaStream_t stream = 0);
+// Reln forward reading BF16 p (decode inline), writes FP32 q_out + stats.
+bool chiron_reln_forward_rows_bf16p(const unsigned short* p_bf_in,
+                                     float* q_out, float* stats,
+                                     const float* gamma, const float* beta,
+                                     int T, int m, float eps);
+// Reln inverse reading FP32 q + stats, SR-writes BF16 p.
+bool chiron_reln_inverse_rows_bf16p_sr(const float* q_out, const float* stats,
+                                        const float* gamma, const float* beta,
+                                        int T, int m,
+                                        unsigned short* p_bf_out,
+                                        unsigned int srBaseSeed,
+                                        unsigned int srStepIdx);
+
 // ---------------------------------------------------------------------------
 // Reversible LayerNorm (ReLN) with external stats buffer.
 // ---------------------------------------------------------------------------

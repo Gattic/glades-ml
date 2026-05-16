@@ -230,6 +230,183 @@ __global__ void chiron_bf16_to_fp32_axpy_kernel(float* __restrict__ q,
 	q[i] += alpha * bf16_to_fp32_dev(p_bf[i]);
 }
 
+// iter 64 (Arc 2): stochastic-rounding variants.  Same FP32-internal accum
+// as RN, but final BF16 encode uses xorshift-mixed hash of (idx, step, seed)
+// to decide round-up vs round-down — making per-element error mean-zero by
+// construction.  Drift over L=12 reversible writes becomes random walk
+// O(sqrt(L) * ULP_BF16) instead of biased O(L * ULP_BF16).  Same RNG infra
+// as iter 49's cast_f32_to_bf16_stochastic.
+__device__ __forceinline__ uint32_t sr_hash32_dev(uint32_t a, uint32_t b, uint32_t c)
+{
+	uint32_t x = a ^ (b * 0x9E3779B1u) ^ (c * 0x85EBCA6Bu);
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	return x;
+}
+
+__device__ __forceinline__ unsigned short fp32_to_bf16_sr_dev(float x,
+                                                               uint32_t idx,
+                                                               uint32_t stepIdx,
+                                                               uint32_t baseSeed)
+{
+	union { float f; uint32_t u; } v;
+	v.f = x;
+	if (isnan(x)) {
+		return (unsigned short)(((v.u & 0x80000000u) | 0x7FC00000u) >> 16);
+	}
+	const uint32_t low16 = v.u & 0xFFFFu;
+	const uint32_t rnd = sr_hash32_dev(idx, stepIdx, baseSeed) & 0xFFFFu;
+	uint32_t high16 = v.u >> 16;
+	if (rnd < low16) high16 += 1u;
+	return (unsigned short)(high16 & 0xFFFFu);
+}
+
+__global__ void chiron_scfa_axpy2_bf16p_sr_kernel(unsigned short* __restrict__ p_bf,
+                                                   float alpha,
+                                                   const float* __restrict__ a,
+                                                   const float* __restrict__ b,
+                                                   int n,
+                                                   uint32_t srBaseSeed,
+                                                   uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * (a[i] + b[i]);
+	p_bf[i] = fp32_to_bf16_sr_dev(acc, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+__global__ void chiron_axpy_bf16p_sr_kernel(unsigned short* __restrict__ p_bf,
+                                             float alpha,
+                                             const float* __restrict__ x,
+                                             int n,
+                                             uint32_t srBaseSeed,
+                                             uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const float acc = bf16_to_fp32_dev(p_bf[i]) + alpha * x[i];
+	p_bf[i] = fp32_to_bf16_sr_dev(acc, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+__global__ void chiron_scfa_scaled_copy_bf16p_sr_kernel(unsigned short* __restrict__ c_bf,
+                                                         float alpha,
+                                                         const float* __restrict__ a,
+                                                         int n,
+                                                         uint32_t srBaseSeed,
+                                                         uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	c_bf[i] = fp32_to_bf16_sr_dev(alpha * a[i], (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
+// Reln forward: reads BF16 p row by row, computes FP32-internal mean / var /
+// normalize, writes FP32 q_out.  Stats stay FP32.  Identical math to
+// chiron_reln_forward_rows but with BF16-decoded reads.
+__global__ void chiron_reln_forward_rows_bf16p_kernel(
+    const unsigned short* __restrict__ p_bf_in,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float eps, int cols,
+    float* __restrict__ q_out,
+    float* __restrict__ stats)
+{
+	int row = blockIdx.x;
+	const unsigned short* xRow = p_bf_in + (size_t)row * cols;
+	float*       oRow = q_out + (size_t)row * cols;
+
+	extern __shared__ float smem[];
+	float* sSumA = smem;
+	float* sSumB = smem + (blockDim.x / 32 + 1);
+
+	__shared__ float sMean, sSigma;
+
+	// Pass 1: mean (decode BF16 inline).
+	float s = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) s += bf16_to_fp32_dev(xRow[i]);
+	// reuse the blockReduceSum from gpu_chiron.cu by manual reduction:
+	// SMEM tree-reduce over blockDim.x threads → warp tail.
+	{
+		// Single-block warp reduce; simpler form since the existing
+		// blockReduceSum lives in anon namespace of this file.
+		__shared__ float sShared[33];
+		const int lane = threadIdx.x & 31;
+		const int warpId = threadIdx.x >> 5;
+		for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFFu, s, o);
+		if (lane == 0) sShared[warpId] = s;
+		__syncthreads();
+		if (warpId == 0) {
+			s = (threadIdx.x < (blockDim.x + 31) / 32) ? sShared[lane] : 0.0f;
+			for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xFFFFFFFFu, s, o);
+		}
+		if (threadIdx.x == 0) sMean = s / (float)cols;
+	}
+	__syncthreads();
+	const float mu = sMean;
+	(void)sSumA;
+
+	// Pass 2: variance.
+	float v = 0.0f;
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		float d = bf16_to_fp32_dev(xRow[i]) - mu;
+		v += d * d;
+	}
+	{
+		__shared__ float vShared[33];
+		const int lane = threadIdx.x & 31;
+		const int warpId = threadIdx.x >> 5;
+		for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, o);
+		if (lane == 0) vShared[warpId] = v;
+		__syncthreads();
+		if (warpId == 0) {
+			v = (threadIdx.x < (blockDim.x + 31) / 32) ? vShared[lane] : 0.0f;
+			for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, o);
+		}
+		if (threadIdx.x == 0) {
+			float var = v / (float)cols + eps;
+			sSigma = sqrtf(var);
+		}
+	}
+	__syncthreads();
+	const float sigma = sSigma;
+	const float inv_sigma = 1.0f / sigma;
+	(void)sSumB;
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x)
+		oRow[i] = gamma[i] * (bf16_to_fp32_dev(xRow[i]) - mu) * inv_sigma + beta[i];
+
+	if (threadIdx.x == 0) {
+		stats[(size_t)row * 2 + 0] = mu;
+		stats[(size_t)row * 2 + 1] = logf(sigma);
+	}
+}
+
+// Reln inverse: reads FP32 q_out + stats, undoes affine + LN, SR-writes BF16 p.
+// p = ((q_out - beta) / gamma) * sigma + mu, then BF16 SR encode.
+__global__ void chiron_reln_inverse_rows_bf16p_sr_kernel(
+    const float* __restrict__ q_out,
+    const float* __restrict__ stats,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    int cols,
+    unsigned short* __restrict__ p_bf_out,
+    uint32_t srBaseSeed,
+    uint32_t srStepIdx)
+{
+	int row = blockIdx.x;
+	const float* oRow = q_out + (size_t)row * cols;
+	unsigned short* pRow = p_bf_out + (size_t)row * cols;
+	const float mu    = stats[(size_t)row * 2 + 0];
+	const float sigma = expf(stats[(size_t)row * 2 + 1]);
+
+	for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+		const float v = ((oRow[i] - beta[i]) / gamma[i]) * sigma + mu;
+		pRow[i] = fp32_to_bf16_sr_dev(v, (uint32_t)((size_t)row * cols + i),
+		                              srStepIdx, srBaseSeed);
+	}
+}
+
 } // anonymous namespace
 
 bool chiron_scfa_sub(float* c, const float* a, const float* b, int n,
@@ -300,6 +477,84 @@ bool chiron_bf16_to_fp32_axpy(float* q, float alpha,
 	int grid = (n + kBlockElem - 1) / kBlockElem;
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
 	chiron_bf16_to_fp32_axpy_kernel<<<grid, kBlockElem, 0, s>>>(q, alpha, p_bf, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 64: SR variants of the BF16-p kernels.  Same FP32 accum semantics as
+// the RN variants but with mean-zero rounding.  Caller supplies a per-tensor
+// seed + step counter (typically W.bf16WeightsSeed + step) so per-(model,
+// step, element) randomness is reproducible across runs with the same seed.
+bool chiron_scfa_axpy2_bf16p_sr(unsigned short* p_bf, float alpha,
+                                 const float* a, const float* b, int n,
+                                 unsigned int srBaseSeed,
+                                 unsigned int srStepIdx,
+                                 cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_bf16p_sr_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_bf, alpha, a, b, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_axpy_bf16p_sr(unsigned short* p_bf, float alpha,
+                           const float* x, int n,
+                           unsigned int srBaseSeed,
+                           unsigned int srStepIdx,
+                           cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_axpy_bf16p_sr_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_bf, alpha, x, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_scfa_scaled_copy_bf16p_sr(unsigned short* c_bf, float alpha,
+                                       const float* a, int n,
+                                       unsigned int srBaseSeed,
+                                       unsigned int srStepIdx,
+                                       cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_scaled_copy_bf16p_sr_kernel<<<grid, kBlockElem, 0, s>>>(
+	    c_bf, alpha, a, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_reln_forward_rows_bf16p(const unsigned short* p_bf_in,
+                                     float* q_out, float* stats,
+                                     const float* gamma, const float* beta,
+                                     int T, int m, float eps)
+{
+	if (T <= 0 || m <= 0) return true;
+	const int block = rowBlockSize(m);
+	const int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+	chiron_reln_forward_rows_bf16p_kernel<<<T, block, smemBytes, computeStream()>>>(
+	    p_bf_in, gamma, beta, eps, m, q_out, stats);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool chiron_reln_inverse_rows_bf16p_sr(const float* q_out, const float* stats,
+                                        const float* gamma, const float* beta,
+                                        int T, int m,
+                                        unsigned short* p_bf_out,
+                                        unsigned int srBaseSeed,
+                                        unsigned int srStepIdx)
+{
+	if (T <= 0 || m <= 0) return true;
+	const int block = rowBlockSize(m);
+	chiron_reln_inverse_rows_bf16p_sr_kernel<<<T, block, 0, computeStream()>>>(
+	    q_out, stats, gamma, beta, m, p_bf_out, srBaseSeed, srStepIdx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
