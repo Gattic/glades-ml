@@ -130,9 +130,18 @@ bool orion_proj_left(const uint16_t* V, const float* g,
 bool orion_lift_add(float* theta, const uint16_t* V,
                     const float* alpha, int n, int r);
 
+// BF16-weights variant: θ_bf16[i] = bf16(θ_anchor_fp32[i] + Σ_k V[i, k] · α[k])
+bool orion_lift_add_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                          const uint16_t* V,
+                          const float* alpha, int n, int r);
+
 // θ_pert[i] = θ[i] + eps · V[i, col]   (for FD-HVP).
 bool orion_perturb_col(float* theta_pert, const float* theta,
                        const uint16_t* V, int n, int col, float eps);
+
+// BF16-weights variant: θ_bf16[i] = bf16(θ_anchor_fp32[i] + eps · V[i, col]).
+bool orion_perturb_col_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                             const uint16_t* V, int n, int col, float eps);
 
 // Oja's tilt: V += η · g_⊥ · (V^⊤g)^⊤  (subspace tilt toward gradient
 // direction not yet in span(V)).  g_proj = V^⊤ g must be pre-computed.
@@ -906,7 +915,9 @@ inline bool distill_combined_bwd(const float*, const float*, const int*, int, in
 inline bool distill_combined_loss(const float*, const float*, const int*, int, int, int, float, float*, int*) { return false; }
 inline bool orion_proj_left(const void*, const float*, int, int, float*) { return false; }
 inline bool orion_lift_add(float*, const void*, const float*, int, int) { return false; }
+inline bool orion_lift_add_bf16w(void*, const float*, const void*, const float*, int, int) { return false; }
 inline bool orion_perturb_col(float*, const float*, const void*, int, int, float) { return false; }
+inline bool orion_perturb_col_bf16w(void*, const float*, const void*, int, int, float) { return false; }
 inline bool orion_oja_tilt(void*, const float*, const float*, int, int, float) { return false; }
 inline bool orion_gram_schmidt(void*, int, int, float*, float*) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }

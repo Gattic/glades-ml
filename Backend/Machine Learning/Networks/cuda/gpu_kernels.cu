@@ -6981,6 +6981,25 @@ __global__ void orion_lift_add_bf16_kernel(float*               __restrict__ the
 	theta[i] += acc;
 }
 
+// ORION BF16-weights variant: writes BF16 master from FP32 anchor + V·α
+// in a single fused kernel.  RN-even cast.  Used for the lift-back step
+// when ORION tracks BF16-weight per-layer tensors.
+//   θ_bf16[i] = bf16(θ_anchor_fp32[i] + Σ_k V[i, k] * α[k])
+__global__ void orion_lift_add_bf16w_kernel(__nv_bfloat16*       __restrict__ theta_bf16,
+                                             const float*         __restrict__ theta_anchor,
+                                             const __nv_bfloat16* __restrict__ V,
+                                             const float*         __restrict__ alpha,
+                                             int n, int r)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	float acc = theta_anchor[i];
+	for (int k = 0; k < r; ++k) {
+		acc += __bfloat162float(V[(size_t)k * n + i]) * alpha[k];
+	}
+	theta_bf16[i] = __float2bfloat16(acc);
+}
+
 // θ_pert[i] = θ[i] + eps · V[i, col]
 __global__ void orion_perturb_col_bf16_kernel(float*               __restrict__ theta_pert,
                                               const float*         __restrict__ theta,
@@ -6991,6 +7010,22 @@ __global__ void orion_perturb_col_bf16_kernel(float*               __restrict__ 
 	if (i >= n) return;
 	const __nv_bfloat16* V_col = V + (size_t)col * n;
 	theta_pert[i] = theta[i] + eps * __bfloat162float(V_col[i]);
+}
+
+// ORION BF16-weights variant: writes the BF16 master directly using the
+// FP32 anchor as the base.  Used when ORION tracks per-layer Wq/Wk/Wv/Wo
+// whose master is BF16.  RN-even cast via __float2bfloat16 (cvt.rn.bf16.f32).
+//   θ_bf16[i] = bf16(θ_anchor_fp32[i] + eps · V[i, col])
+__global__ void orion_perturb_col_bf16w_kernel(__nv_bfloat16*       __restrict__ theta_bf16,
+                                                const float*         __restrict__ theta_anchor,
+                                                const __nv_bfloat16* __restrict__ V,
+                                                int n, int col, float eps)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const __nv_bfloat16* V_col = V + (size_t)col * n;
+	float v = theta_anchor[i] + eps * __bfloat162float(V_col[i]);
+	theta_bf16[i] = __float2bfloat16(v);
 }
 
 // V[i, dst_col] -= alpha * V[i, src_col]   (Gram-Schmidt subtraction).
@@ -7099,6 +7134,22 @@ bool orion_lift_add(float* theta, const uint16_t* V,
 	return true;
 }
 
+// BF16-weights variant: writes θ_bf16[i] = bf16(θ_anchor_fp32[i] + Σ_k V[i,k]·α[k]).
+bool orion_lift_add_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                          const uint16_t* V,
+                          const float* alpha, int n, int r)
+{
+	if (n <= 0 || r <= 0) return true;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_lift_add_bf16w_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    theta_anchor,
+	    reinterpret_cast<const __nv_bfloat16*>(V), alpha, n, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool orion_perturb_col(float* theta_pert, const float* theta,
                        const uint16_t* V, int n, int col, float eps)
 {
@@ -7107,6 +7158,22 @@ bool orion_perturb_col(float* theta_pert, const float* theta,
 	int grid  = (n + block - 1) / block;
 	orion_perturb_col_bf16_kernel<<<grid, block, 0, computeStream()>>>(
 	    theta_pert, theta, reinterpret_cast<const __nv_bfloat16*>(V), n, col, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// BF16-weights variant: writes the perturbed weight back to the BF16
+// master directly.  θ_bf16[i] = bf16(θ_anchor_fp32[i] + eps · V[i, col]).
+bool orion_perturb_col_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                             const uint16_t* V, int n, int col, float eps)
+{
+	if (n <= 0) return true;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_perturb_col_bf16w_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    theta_anchor,
+	    reinterpret_cast<const __nv_bfloat16*>(V), n, col, eps);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
