@@ -155,6 +155,55 @@ bool orion_oja_tilt(uint16_t* V, const float* g, const float* g_proj,
 bool orion_gram_schmidt(uint16_t* V, int n, int r,
                         float* scratch_dot, float* scratch_normsq);
 
+// Phase-4 BF16-anchor variants: anchor is BF16-stored, master is BF16.
+// θ_bf16[i] = bf16(__bfloat162float(anchor_bf16[i]) + eps · V[i, col])
+bool orion_perturb_col_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                        const uint16_t* theta_anchor_bf16,
+                                        const uint16_t* V,
+                                        int n, int col, float eps);
+// θ_bf16[i] = bf16(__bfloat162float(anchor_bf16[i]) + Σ_k V[i,k] · α[k])
+bool orion_lift_add_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                     const uint16_t* theta_anchor_bf16,
+                                     const uint16_t* V,
+                                     const float* alpha, int n, int r);
+// α[k] += Σ_i V[i, k] · __bfloat162float(g_bf16[i])
+bool orion_proj_left_bf16_src(const uint16_t* V, const uint16_t* g_bf16,
+                              int n, int r, float* alpha_out);
+
+// Phase-3 INT8 V kernels.  V is stored column-major as int8_t with per-block
+// FP32 scales (block size 256).  Total VRAM ≈ 0.508 × BF16 V at all r ≤ 8.
+int  orion_v_scale_count(int n);
+bool orion_v_quantize_int8_column(const float* src, int8_t* dst_q,
+                                   float* scales, int n);
+bool orion_v_dequantize_int8_column(const int8_t* src_q, const float* scales,
+                                     float* dst, int n);
+bool orion_proj_left_int8(const int8_t* V_q, const float* V_scales,
+                           const float* g, int n, int r, float* alpha_out);
+bool orion_proj_left_int8_bf16src(const int8_t* V_q, const float* V_scales,
+                                   const uint16_t* g_bf16,
+                                   int n, int r, float* alpha_out);
+bool orion_lift_add_int8(float* theta, const int8_t* V_q, const float* V_scales,
+                          const float* alpha, int n, int r);
+bool orion_lift_add_int8_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                                const int8_t* V_q, const float* V_scales,
+                                const float* alpha, int n, int r);
+bool orion_lift_add_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                           const uint16_t* theta_anchor_bf16,
+                                           const int8_t* V_q,
+                                           const float* V_scales,
+                                           const float* alpha, int n, int r);
+bool orion_perturb_col_int8(float* theta_pert, const float* theta,
+                             const int8_t* V_q, const float* V_scales,
+                             int n, int col, float eps);
+bool orion_perturb_col_int8_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                                   const int8_t* V_q, const float* V_scales,
+                                   int n, int col, float eps);
+bool orion_perturb_col_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                              const uint16_t* theta_anchor_bf16,
+                                              const int8_t* V_q,
+                                              const float* V_scales,
+                                              int n, int col, float eps);
+
 // ---------------------------------------------------------------------------
 // Paradigm shift #42 SCFA — Spectral Compressed Flow Attention primitives.
 // Compression/lift use existing sgemm_rowmajor (q_compr = B^T q  and
@@ -920,6 +969,20 @@ inline bool orion_perturb_col(float*, const float*, const void*, int, int, float
 inline bool orion_perturb_col_bf16w(void*, const float*, const void*, int, int, float) { return false; }
 inline bool orion_oja_tilt(void*, const float*, const float*, int, int, float) { return false; }
 inline bool orion_gram_schmidt(void*, int, int, float*, float*) { return false; }
+inline bool orion_perturb_col_bf16w_bf16anchor(void*, const void*, const void*, int, int, float) { return false; }
+inline bool orion_lift_add_bf16w_bf16anchor(void*, const void*, const void*, const float*, int, int) { return false; }
+inline bool orion_proj_left_bf16_src(const void*, const void*, int, int, float*) { return false; }
+inline int  orion_v_scale_count(int) { return 0; }
+inline bool orion_v_quantize_int8_column(const float*, void*, float*, int) { return false; }
+inline bool orion_v_dequantize_int8_column(const void*, const float*, float*, int) { return false; }
+inline bool orion_proj_left_int8(const void*, const float*, const float*, int, int, float*) { return false; }
+inline bool orion_proj_left_int8_bf16src(const void*, const float*, const void*, int, int, float*) { return false; }
+inline bool orion_lift_add_int8(float*, const void*, const float*, const float*, int, int) { return false; }
+inline bool orion_lift_add_int8_bf16w(void*, const float*, const void*, const float*, const float*, int, int) { return false; }
+inline bool orion_lift_add_int8_bf16w_bf16anchor(void*, const void*, const void*, const float*, const float*, int, int) { return false; }
+inline bool orion_perturb_col_int8(float*, const float*, const void*, const float*, int, int, float) { return false; }
+inline bool orion_perturb_col_int8_bf16w(void*, const float*, const void*, const float*, int, int, float) { return false; }
+inline bool orion_perturb_col_int8_bf16w_bf16anchor(void*, const void*, const void*, const float*, int, int, float) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }

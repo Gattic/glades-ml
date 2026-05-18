@@ -7028,6 +7028,62 @@ __global__ void orion_perturb_col_bf16w_kernel(__nv_bfloat16*       __restrict__
 	theta_bf16[i] = __float2bfloat16(v);
 }
 
+// Phase-4 BF16-anchor variants: read θ_anchor from BF16 storage directly.
+// Avoids the cast_bf16_to_f32 scratch pass when --orion-bf16-anchor is set
+// AND the master is BF16 (per-layer Wq/Wk/Wv/Wo under --bf16-weights).
+//   θ_bf16[i] = bf16(__bfloat162float(θ_anchor_bf16[i]) + eps · V[i, col])
+__global__ void orion_perturb_col_bf16w_bf16anchor_kernel(
+    __nv_bfloat16*       __restrict__ theta_bf16,
+    const __nv_bfloat16* __restrict__ theta_anchor_bf16,
+    const __nv_bfloat16* __restrict__ V,
+    int n, int col, float eps)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const __nv_bfloat16* V_col = V + (size_t)col * n;
+	float v = __bfloat162float(theta_anchor_bf16[i])
+	        + eps * __bfloat162float(V_col[i]);
+	theta_bf16[i] = __float2bfloat16(v);
+}
+
+// Phase-4: lift_back reading BF16 anchor directly.
+//   θ_bf16[i] = bf16(__bfloat162float(θ_anchor_bf16[i]) + Σ_k V[i, k] · α[k])
+__global__ void orion_lift_add_bf16w_bf16anchor_kernel(
+    __nv_bfloat16*       __restrict__ theta_bf16,
+    const __nv_bfloat16* __restrict__ theta_anchor_bf16,
+    const __nv_bfloat16* __restrict__ V,
+    const float*         __restrict__ alpha,
+    int n, int r)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	float acc = __bfloat162float(theta_anchor_bf16[i]);
+	for (int k = 0; k < r; ++k) {
+		acc += __bfloat162float(V[(size_t)k * n + i]) * alpha[k];
+	}
+	theta_bf16[i] = __float2bfloat16(acc);
+}
+
+// Phase-4: projection of BF16 anchor onto V (for α_anchor computation).
+//   α[k] += Σ_i V[i, k] · __bfloat162float(theta_anchor_bf16[i])
+__global__ void orion_proj_left_bf16_src_bf16_kernel(
+    const __nv_bfloat16* __restrict__ V,
+    const __nv_bfloat16* __restrict__ g_bf16,
+    int n, int r,
+    float* __restrict__ alpha)
+{
+	extern __shared__ float smem[];
+	int col = blockIdx.x;
+	if (col >= r) return;
+	const __nv_bfloat16* V_col = V + (size_t)col * n;
+	float acc = 0.0f;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		acc += __bfloat162float(V_col[i]) * __bfloat162float(g_bf16[i]);
+	}
+	float total = blockReduceSum(acc, smem);
+	if (threadIdx.x == 0) ::atomicAdd(&alpha[col], total);
+}
+
 // V[i, dst_col] -= alpha * V[i, src_col]   (Gram-Schmidt subtraction).
 __global__ void orion_gs_subtract_bf16_kernel(__nv_bfloat16* __restrict__ V,
                                               int n, int src_col, int dst_col,
@@ -7178,6 +7234,56 @@ bool orion_perturb_col_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
 	return true;
 }
 
+// Phase-4 BF16-anchor variant: anchor is BF16-stored, master is BF16.
+bool orion_perturb_col_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                        const uint16_t* theta_anchor_bf16,
+                                        const uint16_t* V,
+                                        int n, int col, float eps)
+{
+	if (n <= 0) return true;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_perturb_col_bf16w_bf16anchor_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    reinterpret_cast<const __nv_bfloat16*>(theta_anchor_bf16),
+	    reinterpret_cast<const __nv_bfloat16*>(V), n, col, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Phase-4 BF16-anchor variant of lift_add.  Anchor read from BF16 storage.
+bool orion_lift_add_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                     const uint16_t* theta_anchor_bf16,
+                                     const uint16_t* V,
+                                     const float* alpha, int n, int r)
+{
+	if (n <= 0 || r <= 0) return true;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_lift_add_bf16w_bf16anchor_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    reinterpret_cast<const __nv_bfloat16*>(theta_anchor_bf16),
+	    reinterpret_cast<const __nv_bfloat16*>(V), alpha, n, r);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// Phase-4 BF16-anchor variant of proj_left.  Source vector is BF16.
+bool orion_proj_left_bf16_src(const uint16_t* V, const uint16_t* g_bf16,
+                              int n, int r, float* alpha_out)
+{
+	if (n <= 0 || r <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(alpha_out, 0, r * sizeof(float), computeStream()));
+	int block = rowBlockSize(n);
+	int smemBytes = (block / 32 + 2) * sizeof(float);
+	orion_proj_left_bf16_src_bf16_kernel<<<r, block, smemBytes, computeStream()>>>(
+	    reinterpret_cast<const __nv_bfloat16*>(V),
+	    reinterpret_cast<const __nv_bfloat16*>(g_bf16),
+	    n, r, alpha_out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
 bool orion_oja_tilt(uint16_t* V, const float* g, const float* g_proj,
                     int n, int r, float eta)
 {
@@ -7239,6 +7345,427 @@ bool orion_gram_schmidt(uint16_t* V, int n, int r,
 		                                computeStream()>>>(V_bf16, n, k, scale);
 		GLADES_CUDA_CHECK(cudaGetLastError());
 	}
+	return true;
+}
+
+// ===========================================================================
+//  ORION Phase-3: INT8 V buffer kernels.
+// ===========================================================================
+//
+// V is stored column-major as int8_t with per-block FP32 scales (block size
+// ORION_V_BS=256, matching ADAM_INT8_BS).  Each column has its own
+// scale_count = ceil(n / ORION_V_BS) FP32 scales.  Total VRAM per V buffer:
+//   data:    n*r bytes
+//   scales:  scale_count*r*4 bytes ≈ n*r*0.0156 bytes
+//   ratio vs BF16: 0.508
+//
+// Quantization is per-block absmax → symmetric INT8 range [-127, +127]
+// (we leave -128 unused so dequantize = q * (scale/127) is symmetric).
+// Round-to-nearest, no stochastic rounding (V refresh frequency is low —
+// every M_subspace anchors — so deterministic rounding suffices).
+
+#ifndef ORION_V_BS
+#define ORION_V_BS 256
+#endif
+#ifndef ORION_V_TPB
+#define ORION_V_TPB 256
+#endif
+
+namespace {
+
+static __device__ __forceinline__ int orion_v_scale_count_dev(int n) {
+	return (n + ORION_V_BS - 1) / ORION_V_BS;
+}
+
+// 1. Quantize one FP32 column → INT8 + per-block FP32 scales.  Launch grid:
+//    <<<scale_count, ORION_V_TPB>>>.  Block scale = absmax(block).
+__global__ void orion_v_quantize_int8_column_kernel(
+    const float* __restrict__ src,
+    int8_t*      __restrict__ dst_q,
+    float*       __restrict__ scales,
+    int n)
+{
+	const int blockId     = blockIdx.x;
+	const int scale_count = orion_v_scale_count_dev(n);
+	if (blockId >= scale_count) return;
+	const int start = blockId * ORION_V_BS;
+	const int end   = (start + ORION_V_BS < n) ? (start + ORION_V_BS) : n;
+	const int len   = end - start;
+	// Pass 1: absmax via warp shuffle then shared-mem cross-warp reduce.
+	float localMax = 0.0f;
+	for (int i = threadIdx.x; i < len; i += blockDim.x) {
+		const float a = fabsf(src[start + i]);
+		if (a > localMax) localMax = a;
+	}
+	for (int off = 16; off > 0; off /= 2) {
+		const float o = __shfl_xor_sync(0xFFFFFFFFu, localMax, off);
+		if (o > localMax) localMax = o;
+	}
+	__shared__ float sWarpMax[32];
+	const int warpId = threadIdx.x / 32;
+	const int lane   = threadIdx.x % 32;
+	if (lane == 0) sWarpMax[warpId] = localMax;
+	__syncthreads();
+	if (warpId == 0) {
+		float v = (lane < (blockDim.x / 32)) ? sWarpMax[lane] : 0.0f;
+		for (int off = 16; off > 0; off /= 2) {
+			const float o = __shfl_xor_sync(0xFFFFFFFFu, v, off);
+			if (o > v) v = o;
+		}
+		if (lane == 0) scales[blockId] = v;
+	}
+	__syncthreads();
+	const float blockMax = scales[blockId];
+	const float invScale = (blockMax > 1e-30f) ? (127.0f / blockMax) : 0.0f;
+	for (int i = threadIdx.x; i < len; i += blockDim.x) {
+		int q = (int)__float2int_rn(src[start + i] * invScale);
+		if (q < -127) q = -127;
+		if (q >  127) q =  127;
+		dst_q[start + i] = (int8_t)q;
+	}
+}
+
+// 2. Dequantize one INT8 column → FP32.
+__global__ void orion_v_dequantize_int8_column_kernel(
+    const int8_t* __restrict__ src_q,
+    const float*  __restrict__ scales,
+    float*        __restrict__ dst,
+    int n)
+{
+	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= n) return;
+	const int blockId = tid / ORION_V_BS;
+	const float scale = scales[blockId];
+	const float qinv  = scale * (1.0f / 127.0f);
+	dst[tid] = (float)src_q[tid] * qinv;
+}
+
+// 3. proj_left INT8: α[k] += Σ_i V_int8[i, k] · scale_k(i)/127 · g[i].
+__global__ void orion_proj_left_int8_kernel(
+    const int8_t* __restrict__ V_q,
+    const float*  __restrict__ V_scales,
+    const float*  __restrict__ g,
+    int n, int scale_count,
+    float* __restrict__ alpha)
+{
+	extern __shared__ float smem[];
+	const int col = blockIdx.x;
+	const size_t base_q     = (size_t)col * (size_t)n;
+	const size_t base_scale = (size_t)col * (size_t)scale_count;
+	float acc = 0.0f;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		const int   blockId = i / ORION_V_BS;
+		const float scale   = V_scales[base_scale + blockId];
+		const float qinv    = scale * (1.0f / 127.0f);
+		acc += (float)V_q[base_q + i] * qinv * g[i];
+	}
+	float total = blockReduceSum(acc, smem);
+	if (threadIdx.x == 0) ::atomicAdd(&alpha[col], total);
+}
+
+// 3b. proj_left INT8 with BF16 source vector (anchor under --orion-bf16-anchor).
+__global__ void orion_proj_left_int8_bf16src_kernel(
+    const int8_t*        __restrict__ V_q,
+    const float*         __restrict__ V_scales,
+    const __nv_bfloat16* __restrict__ g_bf16,
+    int n, int scale_count,
+    float* __restrict__ alpha)
+{
+	extern __shared__ float smem[];
+	const int col = blockIdx.x;
+	const size_t base_q     = (size_t)col * (size_t)n;
+	const size_t base_scale = (size_t)col * (size_t)scale_count;
+	float acc = 0.0f;
+	for (int i = threadIdx.x; i < n; i += blockDim.x) {
+		const int   blockId = i / ORION_V_BS;
+		const float scale   = V_scales[base_scale + blockId];
+		const float qinv    = scale * (1.0f / 127.0f);
+		acc += (float)V_q[base_q + i] * qinv * __bfloat162float(g_bf16[i]);
+	}
+	float total = blockReduceSum(acc, smem);
+	if (threadIdx.x == 0) ::atomicAdd(&alpha[col], total);
+}
+
+// 4. lift_add INT8 FP32 master: θ[i] += Σ_k V_int8[i,k] · scale_k(i)/127 · α[k].
+__global__ void orion_lift_add_int8_kernel(
+    float*        __restrict__ theta,
+    const int8_t* __restrict__ V_q,
+    const float*  __restrict__ V_scales,
+    const float*  __restrict__ alpha,
+    int n, int r, int scale_count)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const int blockId = i / ORION_V_BS;
+	float acc = 0.0f;
+	for (int k = 0; k < r; ++k) {
+		const size_t base_q     = (size_t)k * (size_t)n;
+		const size_t base_scale = (size_t)k * (size_t)scale_count;
+		const float scale = V_scales[base_scale + blockId];
+		const float qinv  = scale * (1.0f / 127.0f);
+		acc += (float)V_q[base_q + i] * qinv * alpha[k];
+	}
+	theta[i] += acc;
+}
+
+// 4b. lift_add INT8 BF16 master + FP32 anchor.
+__global__ void orion_lift_add_int8_bf16w_kernel(
+    __nv_bfloat16* __restrict__ theta_bf16,
+    const float*   __restrict__ theta_anchor,
+    const int8_t*  __restrict__ V_q,
+    const float*   __restrict__ V_scales,
+    const float*   __restrict__ alpha,
+    int n, int r, int scale_count)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const int blockId = i / ORION_V_BS;
+	float acc = theta_anchor[i];
+	for (int k = 0; k < r; ++k) {
+		const size_t base_q     = (size_t)k * (size_t)n;
+		const size_t base_scale = (size_t)k * (size_t)scale_count;
+		const float scale = V_scales[base_scale + blockId];
+		const float qinv  = scale * (1.0f / 127.0f);
+		acc += (float)V_q[base_q + i] * qinv * alpha[k];
+	}
+	theta_bf16[i] = __float2bfloat16(acc);
+}
+
+// 4c. lift_add INT8 BF16 master + BF16 anchor.
+__global__ void orion_lift_add_int8_bf16w_bf16anchor_kernel(
+    __nv_bfloat16*       __restrict__ theta_bf16,
+    const __nv_bfloat16* __restrict__ theta_anchor_bf16,
+    const int8_t*        __restrict__ V_q,
+    const float*         __restrict__ V_scales,
+    const float*         __restrict__ alpha,
+    int n, int r, int scale_count)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const int blockId = i / ORION_V_BS;
+	float acc = __bfloat162float(theta_anchor_bf16[i]);
+	for (int k = 0; k < r; ++k) {
+		const size_t base_q     = (size_t)k * (size_t)n;
+		const size_t base_scale = (size_t)k * (size_t)scale_count;
+		const float scale = V_scales[base_scale + blockId];
+		const float qinv  = scale * (1.0f / 127.0f);
+		acc += (float)V_q[base_q + i] * qinv * alpha[k];
+	}
+	theta_bf16[i] = __float2bfloat16(acc);
+}
+
+// 5. perturb_col INT8 FP32 master: θ_pert[i] = θ[i] + ε · V_int8[i, col] · scale/127.
+__global__ void orion_perturb_col_int8_kernel(
+    float*        __restrict__ theta_pert,
+    const float*  __restrict__ theta,
+    const int8_t* __restrict__ V_q,
+    const float*  __restrict__ V_scales,
+    int n, int col, int scale_count, float eps)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const int blockId = i / ORION_V_BS;
+	const size_t base_q     = (size_t)col * (size_t)n;
+	const size_t base_scale = (size_t)col * (size_t)scale_count;
+	const float scale = V_scales[base_scale + blockId];
+	const float qinv  = scale * (1.0f / 127.0f);
+	theta_pert[i] = theta[i] + eps * ((float)V_q[base_q + i] * qinv);
+}
+
+// 5b. perturb_col INT8 BF16 master + FP32 anchor.
+__global__ void orion_perturb_col_int8_bf16w_kernel(
+    __nv_bfloat16* __restrict__ theta_bf16,
+    const float*   __restrict__ theta_anchor,
+    const int8_t*  __restrict__ V_q,
+    const float*   __restrict__ V_scales,
+    int n, int col, int scale_count, float eps)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const int blockId = i / ORION_V_BS;
+	const size_t base_q     = (size_t)col * (size_t)n;
+	const size_t base_scale = (size_t)col * (size_t)scale_count;
+	const float scale = V_scales[base_scale + blockId];
+	const float qinv  = scale * (1.0f / 127.0f);
+	float v = theta_anchor[i] + eps * ((float)V_q[base_q + i] * qinv);
+	theta_bf16[i] = __float2bfloat16(v);
+}
+
+// 5c. perturb_col INT8 BF16 master + BF16 anchor.
+__global__ void orion_perturb_col_int8_bf16w_bf16anchor_kernel(
+    __nv_bfloat16*       __restrict__ theta_bf16,
+    const __nv_bfloat16* __restrict__ theta_anchor_bf16,
+    const int8_t*        __restrict__ V_q,
+    const float*         __restrict__ V_scales,
+    int n, int col, int scale_count, float eps)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const int blockId = i / ORION_V_BS;
+	const size_t base_q     = (size_t)col * (size_t)n;
+	const size_t base_scale = (size_t)col * (size_t)scale_count;
+	const float scale = V_scales[base_scale + blockId];
+	const float qinv  = scale * (1.0f / 127.0f);
+	float v = __bfloat162float(theta_anchor_bf16[i])
+	        + eps * ((float)V_q[base_q + i] * qinv);
+	theta_bf16[i] = __float2bfloat16(v);
+}
+
+// 6. Oja tilt + Gram-Schmidt for INT8 V are implemented via dequant-FP32-requant
+//    using a shared FP32 column scratch.  These ops are infrequent
+//    (every M_subspace anchors) so the dequant/requant overhead is negligible.
+
+} // anonymous namespace
+
+bool orion_v_quantize_int8_column(const float* src, int8_t* dst_q,
+                                   float* scales, int n)
+{
+	if (n <= 0) return true;
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	orion_v_quantize_int8_column_kernel<<<scale_count, ORION_V_TPB, 0, computeStream()>>>(
+	    src, dst_q, scales, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_v_dequantize_int8_column(const int8_t* src_q, const float* scales,
+                                     float* dst, int n)
+{
+	if (n <= 0) return true;
+	const int grid = (n + ORION_V_TPB - 1) / ORION_V_TPB;
+	orion_v_dequantize_int8_column_kernel<<<grid, ORION_V_TPB, 0, computeStream()>>>(
+	    src_q, scales, dst, n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+int orion_v_scale_count(int n) {
+	return (n + ORION_V_BS - 1) / ORION_V_BS;
+}
+
+bool orion_proj_left_int8(const int8_t* V_q, const float* V_scales,
+                           const float* g, int n, int r, float* alpha_out)
+{
+	if (n <= 0 || r <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(alpha_out, 0, r * sizeof(float),
+	                                   computeStream()));
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = rowBlockSize(n);
+	int smemBytes = (block / 32 + 2) * sizeof(float);
+	orion_proj_left_int8_kernel<<<r, block, smemBytes, computeStream()>>>(
+	    V_q, V_scales, g, n, scale_count, alpha_out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_proj_left_int8_bf16src(const int8_t* V_q, const float* V_scales,
+                                   const uint16_t* g_bf16,
+                                   int n, int r, float* alpha_out)
+{
+	if (n <= 0 || r <= 0) return true;
+	GLADES_CUDA_CHECK(cudaMemsetAsync(alpha_out, 0, r * sizeof(float),
+	                                   computeStream()));
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = rowBlockSize(n);
+	int smemBytes = (block / 32 + 2) * sizeof(float);
+	orion_proj_left_int8_bf16src_kernel<<<r, block, smemBytes, computeStream()>>>(
+	    V_q, V_scales,
+	    reinterpret_cast<const __nv_bfloat16*>(g_bf16),
+	    n, scale_count, alpha_out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_lift_add_int8(float* theta, const int8_t* V_q, const float* V_scales,
+                          const float* alpha, int n, int r)
+{
+	if (n <= 0 || r <= 0) return true;
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_lift_add_int8_kernel<<<grid, block, 0, computeStream()>>>(
+	    theta, V_q, V_scales, alpha, n, r, scale_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_lift_add_int8_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                                const int8_t* V_q, const float* V_scales,
+                                const float* alpha, int n, int r)
+{
+	if (n <= 0 || r <= 0) return true;
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_lift_add_int8_bf16w_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    theta_anchor, V_q, V_scales, alpha, n, r, scale_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_lift_add_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                           const uint16_t* theta_anchor_bf16,
+                                           const int8_t* V_q,
+                                           const float* V_scales,
+                                           const float* alpha, int n, int r)
+{
+	if (n <= 0 || r <= 0) return true;
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_lift_add_int8_bf16w_bf16anchor_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    reinterpret_cast<const __nv_bfloat16*>(theta_anchor_bf16),
+	    V_q, V_scales, alpha, n, r, scale_count);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_perturb_col_int8(float* theta_pert, const float* theta,
+                             const int8_t* V_q, const float* V_scales,
+                             int n, int col, float eps)
+{
+	if (n <= 0) return true;
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_perturb_col_int8_kernel<<<grid, block, 0, computeStream()>>>(
+	    theta_pert, theta, V_q, V_scales, n, col, scale_count, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_perturb_col_int8_bf16w(uint16_t* theta_bf16, const float* theta_anchor,
+                                   const int8_t* V_q, const float* V_scales,
+                                   int n, int col, float eps)
+{
+	if (n <= 0) return true;
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_perturb_col_int8_bf16w_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    theta_anchor, V_q, V_scales, n, col, scale_count, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool orion_perturb_col_int8_bf16w_bf16anchor(uint16_t* theta_bf16,
+                                              const uint16_t* theta_anchor_bf16,
+                                              const int8_t* V_q,
+                                              const float* V_scales,
+                                              int n, int col, float eps)
+{
+	if (n <= 0) return true;
+	const int scale_count = (n + ORION_V_BS - 1) / ORION_V_BS;
+	int block = kBlockElem;
+	int grid  = (n + block - 1) / block;
+	orion_perturb_col_int8_bf16w_bf16anchor_kernel<<<grid, block, 0, computeStream()>>>(
+	    reinterpret_cast<__nv_bfloat16*>(theta_bf16),
+	    reinterpret_cast<const __nv_bfloat16*>(theta_anchor_bf16),
+	    V_q, V_scales, n, col, scale_count, eps);
+	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
 
