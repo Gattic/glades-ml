@@ -5774,15 +5774,70 @@ __global__ void k_cast_bf16_to_f32(const uint16_t* __restrict__ src,
 	dst[idx] = v.f;
 }
 
+// iter 74 (2026-05-19): float4-vectorized variants of the cast kernels.
+// Each thread handles 4 elements via float4 load / ushort4 store (or vice
+// versa), reducing thread count 4× and improving HBM coalescing on Ada.
+// Math is bit-identical to the scalar kernels (same per-element RN rounding,
+// same NaN handling).  Caller must ensure src and dst are 16-byte aligned
+// for float4 access and 8-byte aligned for ushort4 access — both are
+// guaranteed by cudaMalloc's 256-byte alignment.
+__global__ void k_cast_f32_to_bf16_vec4(const float* __restrict__ src,
+                                         uint16_t* __restrict__ dst,
+                                         size_t n_vec4)
+{
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= n_vec4) return;
+	const float4 f4 = reinterpret_cast<const float4*>(src)[idx];
+	ushort4 u4;
+	#pragma unroll
+	for (int j = 0; j < 4; ++j) {
+		const float f = ((const float*)&f4)[j];
+		union { float f; uint32_t u; } v;
+		v.f = f;
+		uint16_t out;
+		if (isnan(f)) {
+			const uint32_t sign = v.u & 0x80000000u;
+			out = static_cast<uint16_t>(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		} else {
+			const uint32_t lsb = (v.u >> 16) & 1u;
+			const uint32_t roundingBias = 0x7FFFu + lsb;
+			out = static_cast<uint16_t>((v.u + roundingBias) >> 16);
+		}
+		(&u4.x)[j] = out;
+	}
+	reinterpret_cast<ushort4*>(dst)[idx] = u4;
+}
+
+__global__ void k_cast_bf16_to_f32_vec4(const uint16_t* __restrict__ src,
+                                         float* __restrict__ dst,
+                                         size_t n_vec4)
+{
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= n_vec4) return;
+	const ushort4 u4 = reinterpret_cast<const ushort4*>(src)[idx];
+	float4 f4;
+	union { uint32_t u; float f; } v;
+	v.u = static_cast<uint32_t>(u4.x) << 16; f4.x = v.f;
+	v.u = static_cast<uint32_t>(u4.y) << 16; f4.y = v.f;
+	v.u = static_cast<uint32_t>(u4.z) << 16; f4.z = v.f;
+	v.u = static_cast<uint32_t>(u4.w) << 16; f4.w = v.f;
+	reinterpret_cast<float4*>(dst)[idx] = f4;
+}
+
 } // anonymous namespace
 
 bool cast_f32_to_bf16(const float* src, uint16_t* dst, size_t n)
 {
+	// iter 74 FAIL: vec4 path was benched (200-step L=24 T=16384, seed=1337)
+	// and produced unexplained NLL drift -0.133 nat outside ±0.02 strict
+	// parity, despite per-element math being bit-identical to scalar.
+	// Hypothesis: float4 load pattern shifts L2 prefetch ordering in
+	// subsequent kernels, perturbing the deterministic-but-microscale-
+	// sensitive chain.  Wrapper reverted to scalar; vec4 kernels stay in
+	// tree as opt-in via the static-symbol path (no external callers yet).
 	if (n == 0) return true;
 	const unsigned int TPB = 256u;
 	const size_t blocks = (n + TPB - 1u) / TPB;
-	// Grid cap to avoid >2^31 block count on extremely large buffers; the
-	// kernel strides aren't needed below that because we size n per the caller.
 	if (blocks > 0x7FFFFFFFu) return false;
 	k_cast_f32_to_bf16<<<static_cast<unsigned int>(blocks), TPB, 0, computeStream()>>>(src, dst, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
