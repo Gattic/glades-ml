@@ -2,6 +2,32 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current Production Flagship — CHIRON 1B @ T=16384
+
+The current production LLM flagship is **CHIRON 1B** (checkpoint
+`chiron_1B_T16384.step30000`):
+
+- **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context.
+- **Params**: 870.94M (~"1B").
+- **Stack**: SCFA (spectral-compressed flash attention, ratio=16, k=1024) +
+  BF16 weights/grads/attn/logits-storage + int8-Adam + fuse-attn-reln. The
+  exact training flags are in `glades-trainer/research/run_postfix_experiments.sh`.
+- **Perf**: 20,108 tok/s @ T=16384, 13.22/15.56 GB VRAM (RTX 4080 SUPER 16 GB),
+  best val NLL 3.77 @ step 29341 / 30k steps / 491.5 M tokens trained.
+- **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship`.
+- **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`.
+- **Full spec**: `research/FLAGSHIP_T16384_2026_05_14.md`.
+- **Phase-3 program** (improving CHIRON 1B via novel research, no external
+  libs / no external baselines): pre-registration in
+  `research/PHASE3_GATE3A_PREREG.md`. Any new architecture work should
+  anchor on this flagship as the baseline.
+
+The repository also contains a separate **CHIRON-stack research line** under
+`run.sh chiron --scale {66M..1.84B}` using FACE + MFIO + WIP + SAS + RLG +
+SLC. That is NOT the production flagship — it's the FACE-optimizer +
+curriculum-scaling research program. When in doubt, default to the
+`flagship` recipe above for new training runs.
+
 ## Build Commands
 
 **Build the library** (from project root):

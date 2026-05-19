@@ -7,6 +7,16 @@ See `research/CHIRON_framework.md` for the selected framework; the alternate
 candidates (SPECTRA, CASCADE) live in `research/candidate_B_sketch.md` and
 `research/candidate_C_local.md`.
 
+> **NOTE — Current Production Flagship is CHIRON 1B @ T=16384, not the
+> FACE-stack runs in this journal.** The flagship checkpoint is
+> `chiron_1B_T16384.step30000` (m=2048 L=24 nH=16 dH=256, 870.94M params,
+> SCFA + BF16-everywhere + int8-Adam + fuse-attn-reln; val NLL 3.77 @ step
+> 29341). Full spec: `research/FLAGSHIP_T16384_2026_05_14.md`. Reproduce
+> via `cd ~/dev/glades-trainer && sh run.sh flagship`. The journal below
+> tracks a different research line (FACE + MFIO + WIP + SAS + RLG + SLC
+> at --scale {66M..1.84B}); both share the `glades_chiron_train` binary
+> but use disjoint flag sets.
+
 ---
 
 ## STATUS AT A GLANCE (2026-04-23, Ralph-loop iteration 102)
