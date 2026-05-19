@@ -1,0 +1,145 @@
+Sweep 'iso_params_more' starting at Tue May 19 05:08:01 AM EDT 2026, output: results/sweep_iso_params_more.jsonl
+GPU: NVIDIA GeForce RTX 4080 SUPER, 16376 MiB
+[05:08:01] BEGIN ealrmn_attmem/needle m=1024 T=2048 seed=3 steps=800 lr=1e-4 gc=1.0
+[ealrmn_attmem/needle m=1024 T=2048 s=3] step   480 train_loss=0.0446 lr=0.000049 tok/s=38714.5
+  EVAL step   480 val_loss=0.0387 val_acc=1.0000 wall_s=101.6
+[ealrmn_attmem/needle m=1024 T=2048 s=3] step   560 train_loss=0.0187 lr=0.000034 tok/s=38807.3
+[ealrmn_attmem/needle m=1024 T=2048 s=3] step   640 train_loss=0.0123 lr=0.000021 tok/s=38895.8
+  EVAL step   640 val_loss=0.0108 val_acc=1.0000 wall_s=134.9
+[ealrmn_attmem/needle m=1024 T=2048 s=3] step   720 train_loss=0.0058 lr=0.000013 tok/s=38945.3
+[ealrmn_attmem/needle m=1024 T=2048 s=3] step   800 train_loss=0.0053 lr=0.000010 tok/s=39001.2
+  EVAL step   800 val_loss=0.0047 val_acc=1.0000 wall_s=168.1
+[05:10:50] END   ealrmn_attmem/needle m=1024 T=2048 seed=3 steps=800 lr=1e-4 gc=1.0  wall=169s
+[05:10:50] BEGIN rnn/needle m=1448 T=2048 seed=3 steps=800 lr=1e-4 gc=1.0
+[rnn/needle m=1448 T=2048 s=3] step   480 train_loss=0.2952 lr=0.000049 tok/s=45477.2
+  EVAL step   480 val_loss=0.3084 val_acc=1.0000 wall_s=86.5
+[rnn/needle m=1448 T=2048 s=3] step   560 train_loss=0.1183 lr=0.000034 tok/s=45445.2
+[rnn/needle m=1448 T=2048 s=3] step   640 train_loss=0.0786 lr=0.000021 tok/s=45446.8
+  EVAL step   640 val_loss=0.0955 val_acc=1.0000 wall_s=115.4
+[rnn/needle m=1448 T=2048 s=3] step   720 train_loss=0.0511 lr=0.000013 tok/s=45428.1
+[rnn/needle m=1448 T=2048 s=3] step   800 train_loss=0.0388 lr=0.000010 tok/s=45434.4
+  EVAL step   800 val_loss=0.0294 val_acc=1.0000 wall_s=144.3
+[05:13:16] END   rnn/needle m=1448 T=2048 seed=3 steps=800 lr=1e-4 gc=1.0  wall=146s
+[05:13:16] BEGIN ealrmn_attmem/needle m=1024 T=2048 seed=4 steps=800 lr=1e-4 gc=1.0
+[ealrmn_attmem/needle m=1024 T=2048 s=4] step   480 train_loss=0.0607 lr=0.000049 tok/s=39071.7
+  EVAL step   480 val_loss=0.0624 val_acc=1.0000 wall_s=100.7
+[ealrmn_attmem/needle m=1024 T=2048 s=4] step   560 train_loss=0.0203 lr=0.000034 tok/s=39036.1
+[ealrmn_attmem/needle m=1024 T=2048 s=4] step   640 train_loss=0.0140 lr=0.000021 tok/s=39031.2
+  EVAL step   640 val_loss=0.0126 val_acc=1.0000 wall_s=134.4
+[ealrmn_attmem/needle m=1024 T=2048 s=4] step   720 train_loss=0.0072 lr=0.000013 tok/s=39016.9
+[ealrmn_attmem/needle m=1024 T=2048 s=4] step   800 train_loss=0.0062 lr=0.000010 tok/s=39024.5
+  EVAL step   800 val_loss=0.0059 val_acc=1.0000 wall_s=168.0
+[05:16:04] END   ealrmn_attmem/needle m=1024 T=2048 seed=4 steps=800 lr=1e-4 gc=1.0  wall=168s
+[05:16:04] BEGIN rnn/needle m=1448 T=2048 seed=4 steps=800 lr=1e-4 gc=1.0
+[rnn/needle m=1448 T=2048 s=4] step   480 train_loss=0.2195 lr=0.000049 tok/s=45373.6
+  EVAL step   480 val_loss=0.2332 val_acc=1.0000 wall_s=86.7
+[rnn/needle m=1448 T=2048 s=4] step   560 train_loss=0.1045 lr=0.000034 tok/s=45347.7
+[rnn/needle m=1448 T=2048 s=4] step   640 train_loss=0.0351 lr=0.000021 tok/s=45355.0
+  EVAL step   640 val_loss=0.0509 val_acc=1.0000 wall_s=115.7
+[rnn/needle m=1448 T=2048 s=4] step   720 train_loss=0.0208 lr=0.000013 tok/s=45340.0
+[rnn/needle m=1448 T=2048 s=4] step   800 train_loss=0.0177 lr=0.000010 tok/s=45352.2
+  EVAL step   800 val_loss=0.0152 val_acc=1.0000 wall_s=144.6
+[05:18:31] END   rnn/needle m=1448 T=2048 seed=4 steps=800 lr=1e-4 gc=1.0  wall=147s
+[05:18:31] BEGIN ealrmn_attmem/needle m=1024 T=2048 seed=5 steps=800 lr=1e-4 gc=1.0
+[ealrmn_attmem/needle m=1024 T=2048 s=5] step   480 train_loss=0.0493 lr=0.000049 tok/s=38551.7
+  EVAL step   480 val_loss=0.0492 val_acc=1.0000 wall_s=102.1
+[ealrmn_attmem/needle m=1024 T=2048 s=5] step   560 train_loss=0.0206 lr=0.000034 tok/s=38521.5
+[ealrmn_attmem/needle m=1024 T=2048 s=5] step   640 train_loss=0.0112 lr=0.000021 tok/s=38519.8
+  EVAL step   640 val_loss=0.0111 val_acc=1.0000 wall_s=136.2
+[ealrmn_attmem/needle m=1024 T=2048 s=5] step   720 train_loss=0.0075 lr=0.000013 tok/s=38495.5
+[ealrmn_attmem/needle m=1024 T=2048 s=5] step   800 train_loss=0.0053 lr=0.000010 tok/s=38499.8
+  EVAL step   800 val_loss=0.0052 val_acc=1.0000 wall_s=170.3
+[05:21:22] END   ealrmn_attmem/needle m=1024 T=2048 seed=5 steps=800 lr=1e-4 gc=1.0  wall=171s
+[05:21:22] BEGIN rnn/needle m=1448 T=2048 seed=5 steps=800 lr=1e-4 gc=1.0
+[rnn/needle m=1448 T=2048 s=5] step   480 train_loss=0.7741 lr=0.000049 tok/s=45197.4
+  EVAL step   480 val_loss=0.7211 val_acc=1.0000 wall_s=87.1
+[rnn/needle m=1448 T=2048 s=5] step   560 train_loss=0.4988 lr=0.000034 tok/s=45173.5
+[rnn/needle m=1448 T=2048 s=5] step   640 train_loss=0.4321 lr=0.000021 tok/s=45194.4
+  EVAL step   640 val_loss=0.4215 val_acc=1.0000 wall_s=116.1
+[rnn/needle m=1448 T=2048 s=5] step   720 train_loss=0.2498 lr=0.000013 tok/s=45191.6
+[rnn/needle m=1448 T=2048 s=5] step   800 train_loss=0.2707 lr=0.000010 tok/s=45214.4
+  EVAL step   800 val_loss=0.2186 val_acc=1.0000 wall_s=145.0
+[05:23:48] END   rnn/needle m=1448 T=2048 seed=5 steps=800 lr=1e-4 gc=1.0  wall=146s
+[05:23:48] BEGIN ealrmn_attmem/needle m=1024 T=2048 seed=6 steps=800 lr=1e-4 gc=1.0
+[ealrmn_attmem/needle m=1024 T=2048 s=6] step   480 train_loss=0.0656 lr=0.000049 tok/s=37807.0
+  EVAL step   480 val_loss=0.0550 val_acc=1.0000 wall_s=104.1
+[ealrmn_attmem/needle m=1024 T=2048 s=6] step   560 train_loss=0.0271 lr=0.000034 tok/s=37960.0
+[ealrmn_attmem/needle m=1024 T=2048 s=6] step   640 train_loss=0.0138 lr=0.000021 tok/s=38093.2
+  EVAL step   640 val_loss=0.0137 val_acc=1.0000 wall_s=137.7
+[ealrmn_attmem/needle m=1024 T=2048 s=6] step   720 train_loss=0.0083 lr=0.000013 tok/s=38083.9
+[ealrmn_attmem/needle m=1024 T=2048 s=6] step   800 train_loss=0.0060 lr=0.000010 tok/s=38143.9
+  EVAL step   800 val_loss=0.0061 val_acc=1.0000 wall_s=171.9
+[05:26:41] END   ealrmn_attmem/needle m=1024 T=2048 seed=6 steps=800 lr=1e-4 gc=1.0  wall=173s
+[05:26:41] BEGIN rnn/needle m=1448 T=2048 seed=6 steps=800 lr=1e-4 gc=1.0
+[rnn/needle m=1448 T=2048 s=6] step   480 train_loss=1.1337 lr=0.000049 tok/s=45289.8
+  EVAL step   480 val_loss=1.3672 val_acc=0.7500 wall_s=86.9
+[rnn/needle m=1448 T=2048 s=6] step   560 train_loss=1.1227 lr=0.000034 tok/s=45274.0
+[rnn/needle m=1448 T=2048 s=6] step   640 train_loss=1.0121 lr=0.000021 tok/s=45285.3
+  EVAL step   640 val_loss=0.9984 val_acc=0.9375 wall_s=115.8
+[rnn/needle m=1448 T=2048 s=6] step   720 train_loss=0.9598 lr=0.000013 tok/s=45273.1
+[rnn/needle m=1448 T=2048 s=6] step   800 train_loss=0.8269 lr=0.000010 tok/s=45286.1
+  EVAL step   800 val_loss=0.8586 val_acc=1.0000 wall_s=144.8
+[05:29:07] END   rnn/needle m=1448 T=2048 seed=6 steps=800 lr=1e-4 gc=1.0  wall=146s
+[05:29:07] BEGIN ealrmn_attmem/needle m=1024 T=2048 seed=7 steps=800 lr=1e-4 gc=1.0
+[ealrmn_attmem/needle m=1024 T=2048 s=7] step   480 train_loss=0.0502 lr=0.000049 tok/s=37878.3
+  EVAL step   480 val_loss=0.0543 val_acc=1.0000 wall_s=103.9
+[ealrmn_attmem/needle m=1024 T=2048 s=7] step   560 train_loss=0.0229 lr=0.000034 tok/s=37881.3
+[ealrmn_attmem/needle m=1024 T=2048 s=7] step   640 train_loss=0.0100 lr=0.000021 tok/s=37904.5
+  EVAL step   640 val_loss=0.0120 val_acc=1.0000 wall_s=138.4
+[ealrmn_attmem/needle m=1024 T=2048 s=7] step   720 train_loss=0.0087 lr=0.000013 tok/s=37850.3
+[ealrmn_attmem/needle m=1024 T=2048 s=7] step   800 train_loss=0.0062 lr=0.000010 tok/s=37828.8
+  EVAL step   800 val_loss=0.0055 val_acc=1.0000 wall_s=173.3
+[05:32:01] END   ealrmn_attmem/needle m=1024 T=2048 seed=7 steps=800 lr=1e-4 gc=1.0  wall=174s
+[05:32:01] BEGIN rnn/needle m=1448 T=2048 seed=7 steps=800 lr=1e-4 gc=1.0
+[rnn/needle m=1448 T=2048 s=7] step   480 train_loss=0.7302 lr=0.000049 tok/s=45121.7
+  EVAL step   480 val_loss=0.8060 val_acc=1.0000 wall_s=87.2
+[rnn/needle m=1448 T=2048 s=7] step   560 train_loss=0.5776 lr=0.000034 tok/s=45094.7
+[rnn/needle m=1448 T=2048 s=7] step   640 train_loss=0.4712 lr=0.000021 tok/s=45110.5
+  EVAL step   640 val_loss=0.5533 val_acc=1.0000 wall_s=116.3
+[rnn/needle m=1448 T=2048 s=7] step   720 train_loss=0.3228 lr=0.000013 tok/s=45102.8
+[rnn/needle m=1448 T=2048 s=7] step   800 train_loss=0.2765 lr=0.000010 tok/s=45100.2
+  EVAL step   800 val_loss=0.3105 val_acc=1.0000 wall_s=145.4
+[05:34:28] END   rnn/needle m=1448 T=2048 seed=7 steps=800 lr=1e-4 gc=1.0  wall=147s
+[05:34:29] BEGIN ealrmn_attmem/needle m=1024 T=2048 seed=8 steps=800 lr=1e-4 gc=1.0
+[ealrmn_attmem/needle m=1024 T=2048 s=8] step   480 train_loss=0.0490 lr=0.000049 tok/s=37595.8
+  EVAL step   480 val_loss=0.0514 val_acc=1.0000 wall_s=104.7
+[ealrmn_attmem/needle m=1024 T=2048 s=8] step   560 train_loss=0.0158 lr=0.000034 tok/s=37541.3
+[ealrmn_attmem/needle m=1024 T=2048 s=8] step   640 train_loss=0.0096 lr=0.000021 tok/s=37520.1
+  EVAL step   640 val_loss=0.0112 val_acc=1.0000 wall_s=139.8
+[ealrmn_attmem/needle m=1024 T=2048 s=8] step   720 train_loss=0.0073 lr=0.000013 tok/s=37482.1
+[ealrmn_attmem/needle m=1024 T=2048 s=8] step   800 train_loss=0.0059 lr=0.000010 tok/s=37471.6
+  EVAL step   800 val_loss=0.0056 val_acc=1.0000 wall_s=175.0
+[05:37:24] END   ealrmn_attmem/needle m=1024 T=2048 seed=8 steps=800 lr=1e-4 gc=1.0  wall=175s
+[05:37:24] BEGIN rnn/needle m=1448 T=2048 seed=8 steps=800 lr=1e-4 gc=1.0
+[rnn/needle m=1448 T=2048 s=8] step   480 train_loss=0.1258 lr=0.000049 tok/s=45142.9
+  EVAL step   480 val_loss=0.2007 val_acc=1.0000 wall_s=87.2
+[rnn/needle m=1448 T=2048 s=8] step   560 train_loss=0.0663 lr=0.000034 tok/s=45113.8
+[rnn/needle m=1448 T=2048 s=8] step   640 train_loss=0.0384 lr=0.000021 tok/s=45118.8
+  EVAL step   640 val_loss=0.0502 val_acc=1.0000 wall_s=116.3
+[rnn/needle m=1448 T=2048 s=8] step   720 train_loss=0.0276 lr=0.000013 tok/s=45101.6
+[rnn/needle m=1448 T=2048 s=8] step   800 train_loss=0.0201 lr=0.000010 tok/s=45111.6
+  EVAL step   800 val_loss=0.0161 val_acc=1.0000 wall_s=145.3
+[05:39:51] END   rnn/needle m=1448 T=2048 seed=8 steps=800 lr=1e-4 gc=1.0  wall=147s
+[05:39:51] BEGIN ealrmn_attmem/needle m=1024 T=2048 seed=9 steps=800 lr=1e-4 gc=1.0
+[ealrmn_attmem/needle m=1024 T=2048 s=9] step   480 train_loss=0.0342 lr=0.000049 tok/s=37419.2
+  EVAL step   480 val_loss=0.0471 val_acc=1.0000 wall_s=105.2
+[ealrmn_attmem/needle m=1024 T=2048 s=9] step   560 train_loss=0.0170 lr=0.000034 tok/s=37405.8
+[ealrmn_attmem/needle m=1024 T=2048 s=9] step   640 train_loss=0.0098 lr=0.000021 tok/s=37416.3
+  EVAL step   640 val_loss=0.0095 val_acc=1.0000 wall_s=140.2
+[ealrmn_attmem/needle m=1024 T=2048 s=9] step   720 train_loss=0.0061 lr=0.000013 tok/s=37403.4
+[ealrmn_attmem/needle m=1024 T=2048 s=9] step   800 train_loss=0.0044 lr=0.000010 tok/s=37410.3
+  EVAL step   800 val_loss=0.0047 val_acc=1.0000 wall_s=175.3
+[05:42:47] END   ealrmn_attmem/needle m=1024 T=2048 seed=9 steps=800 lr=1e-4 gc=1.0  wall=176s
+[05:42:47] BEGIN rnn/needle m=1448 T=2048 seed=9 steps=800 lr=1e-4 gc=1.0
+[rnn/needle m=1448 T=2048 s=9] step   480 train_loss=0.1930 lr=0.000049 tok/s=45130.3
+  EVAL step   480 val_loss=0.2513 val_acc=1.0000 wall_s=87.2
+[rnn/needle m=1448 T=2048 s=9] step   560 train_loss=0.1178 lr=0.000034 tok/s=45100.6
+[rnn/needle m=1448 T=2048 s=9] step   640 train_loss=0.0235 lr=0.000021 tok/s=45106.4
+  EVAL step   640 val_loss=0.0239 val_acc=1.0000 wall_s=116.3
+[rnn/needle m=1448 T=2048 s=9] step   720 train_loss=0.0189 lr=0.000013 tok/s=45090.8
+[rnn/needle m=1448 T=2048 s=9] step   800 train_loss=0.0068 lr=0.000010 tok/s=45099.7
+  EVAL step   800 val_loss=0.0093 val_acc=1.0000 wall_s=145.4
+[05:45:14] END   rnn/needle m=1448 T=2048 seed=9 steps=800 lr=1e-4 gc=1.0  wall=147s
+Sweep 'iso_params_more' finished at Tue May 19 05:45:14 AM EDT 2026
+Output: results/sweep_iso_params_more.jsonl
+-rw-rw-r-- 1 robert robert 14836 May 19 05:45 results/sweep_iso_params_more.jsonl
