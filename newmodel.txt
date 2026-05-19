@@ -1,0 +1,394 @@
+The repositories already exist and contain the relevant C++ AI/ML infrastructure:
+
+- ~/dev/glades-ml/
+- ~/dev/glades-trainer/
+
+Do not spend effort restating generic repository layout, logging conventions,
+build conventions, or workflow mechanics unless they are directly relevant to
+the research design. CLAUDE.md and AGENTS.md provide that context.
+
+================================================================================
+GOAL
+================================================================================
+
+Build a sequence-modeling architecture that is
+
+  (i)  at least as capable as a modern Transformer LLM on real language-modeling
+       and reasoning benchmarks at iso-FLOPs, AND
+
+  (ii) more efficient — strictly lower training and/or inference cost at iso-
+       quality, on real hardware.
+
+A "win" requires both (i) and (ii) on real benchmarks. Toy synthetic results
+(needle, A_5 word-recognition, HMM hidden-state, MQAR-synthetic) are *gates*
+that show a candidate mechanism is not architecturally broken. They are NOT
+the goal. The goal is to ship something that could replace Mamba-2 / Llama /
+Mixtral in a real deployment.
+
+================================================================================
+WHAT WE ALREADY HAVE (Phase 1)
+================================================================================
+
+Phase 1 (VESTA, May 2026) produced a structurally novel mechanism and a
+positive synthetic-task result. Treat it as a PASSED GATE, not as the goal.
+
+  - Selected framework: GRP-RNN (Group-Rotation Product Recurrent Network).
+    Per-step transition: R_t = ∏_{k=1..K} G_k(θ_k(x_t)) ∈ SO(m). With K=m
+    interlocking-plane Givens rotations and input-dependent angles, the
+    reachable transition group is non-abelian and contains A_5, escaping the
+    Merrill/Petty/Sabharwal 2024 diagonal-SSM expressivity bound.
+    See `research/VESTA_FRAMEWORK.md`.
+
+  - Empirical gate-pass on A_5 word recognition (synthetic, single-layer m=256
+    K=256): val_acc 1.00 across multi-seed at T ∈ {8, 32, 64, 128} and 0.99
+    at T=256, with the LRU-equivalent baseline (diagonal SSM, with or without
+    input-dep phase, with LayerNorm) stuck at random across all T.
+    See `research/VESTA_REPORT.md` and `research/vesta/MITIGATIONS_RESULTS.md`.
+
+  - Required mitigations: per-step LayerNorm + multi-phase curriculum for
+    T ≥ 64. LayerNorm alone is sufficient at T ≤ 32.
+
+  - C++ implementation: `research/ealrmn_gpu/model_grp_rnn.cuh` (~440 LOC) +
+    `main.cu` extensions + `tasks.cuh::A5WordTask`. Gradcheck PASS.
+
+What Phase 1 did NOT do:
+  - Did not test on natural-language data.
+  - Did not test multi-layer stacking.
+  - Did not benchmark throughput against Mamba-2.
+  - Did not measure perplexity at any scale.
+  - Did not run the framework on any standard LM eval suite.
+
+The Phase 1 result is "a single-layer linear-recurrence architecture has
+expressivity Mamba-class diagonal SSMs provably lack on a synthetic task."
+This is an interesting building block. It is not LLM replacement.
+
+================================================================================
+PHASE 2 — WHAT IT TAKES TO MOVE TOWARD THE GOAL
+================================================================================
+
+Phase 2 is the program that decides whether the Phase 1 architecture matters
+for natural language. Pass-criteria are graded; the gates must be cleared in
+sequence.
+
+GATE-2A  Per-token LM readout (infrastructure, not a research result)
+GATE-2B  Multi-layer stacking on a real corpus
+GATE-2C  Match Mamba-2-equivalent at small scale (~10M-100M params)
+GATE-2D  Beat Mamba-2-equivalent on at least one axis (recall, reasoning,
+         or efficiency) at the same small scale
+GATE-2E  Demonstrate the advantage holds at a 4-10× param scale-up
+GATE-2F  Demonstrate inference-time efficiency vs a production Transformer
+
+Each gate has a pre-committed pass/fail threshold (see §Falsifiable claims).
+Failing a gate kills the program at that gate and the result is published as
+negative. Skipping ahead is forbidden.
+
+================================================================================
+HARD PROHIBITIONS (lessons from prior programs)
+================================================================================
+
+P1. Do not propose new mechanisms before a literature audit of the closest
+    existing methods. Phase 1's failure mode was that EALRMN invented
+    KOSM+RDPC+SSVIB before checking that linear recurrence + orthogonal init
+    already gave most of the win. Audit-first is non-negotiable.
+
+P2. Do not test on synthetic-only tasks and call it an LM result. Synthetic
+    tasks are gates. The decisive evals are: (a) pretraining perplexity on a
+    real corpus slice, (b) downstream-eval accuracy (LAMBADA, HellaSwag,
+    PIQA, ARC, etc.), (c) reasoning benchmarks (GSM8K subset, MMLU subset),
+    (d) recall benchmarks (Zoology MQAR variants on real Pile slices).
+    Anything reported without (a) or (b) is a *gate result*, not a *goal
+    result*.
+
+P3. Do not stack new mechanisms without iso-flag ablation. Every component
+    must be ablatable in code (single flag) and tested in isolation against
+    the strongest existing baseline for the axis it improves. Phase 1's
+    architecture has six flags; preserve this discipline.
+
+P4. Do not report wall-clock results without a same-hardware Mamba-2 (or
+    Llama / Mixtral) baseline measured under identical conditions. Brief-
+    cited Mamba-2 throughput numbers are from H100 / specific PyTorch
+    versions and are not directly comparable to RTX 4080 SUPER runs.
+
+P5. Do not pass a gate on a single seed. Multi-seed (>= 3 minimum; >= 5
+    preferred) is required for any claimed win. Report per-seed numbers,
+    median, and worst case. A 4/5-seed pass with one seed failing is itself
+    informative; report it.
+
+P6. Do not silently drop a falsified claim. If Phase 2 falsifies the Phase 1
+    expressivity advantage at scale, write that down and publish it.
+    Phase 1's tanh-vs-linear ablation that retroactively invalidated EALRMN's
+    "magnitudes" claim is the precedent.
+
+P7. Do not pursue Phase-1-style architecture inventions until Phase 2 has
+    cleared Gate-2C or higher. Phase 2's job is to validate or kill the
+    *existing* Phase-1 architecture before any new mechanism is added.
+
+================================================================================
+PHASE 2 PROGRAM (gates, in order)
+================================================================================
+
+GATE-2A — Per-token LM readout
+------------------------------
+
+Currently `model_grp_rnn.cuh` produces a single classification head reading
+`s_T → logits`. To do LM, the readout must produce `logits_t = W_out @ s_t`
+for every t, and the loss must be the sum of per-token cross-entropies.
+
+Implementation (~150 LOC):
+  - Extend `GRPRNNModelCache` with `logits_all: (T, B, V)` tensor.
+  - Extend `forward()` to compute logits at each step.
+  - New `compute_lm_loss()` summing per-token cross-entropies.
+  - New `backward_lm()` propagating per-token gradients into the recurrence
+    at every step (not just at t=T).
+  - Gradcheck the LM forward+backward at small scale (B=2, T=8, m=8).
+
+Gate-2A is PASSED when:
+  - LM forward+backward gradcheck 30+/30+ PASS on the existing infrastructure.
+  - Plain tanh-RNN trained with `--task=syntheticlm` for small steps shows
+    measurable val_loss reduction below random (log V) — sanity that the
+    LM training loop works.
+
+Failing Gate-2A means the LM infrastructure is broken; debug before continuing.
+
+GATE-2B — Multi-layer stacking
+------------------------------
+
+A single-layer GRP-RNN+LN cannot beat Transformer LMs even on small corpora.
+LLMs are deep. Implementation:
+
+  - Stack L ∈ {2, 4, 8} GRP-RNN+LN blocks with residual connections.
+  - Add a tokenizer or use byte-level inputs (V=256).
+  - Standard pre-norm-residual structure: x_l = x_{l-1} + GRP-RNN-Block(x_{l-1}).
+  - FFN / SwiGLU MLP between recurrence blocks if it helps (ablate explicitly).
+
+Gate-2B is PASSED when:
+  - Multi-layer GRP-RNN+LN trains to lower val_loss than a same-flop
+    single-layer GRP-RNN+LN on a real-corpus slice. Specifically: train on
+    ~50M-100M tokens of byte-level WikiText or OpenWebText slice with
+    AdamW, m ∈ {128, 256, 512}, L ∈ {2, 4}, batch=8 T=2048 for ~10K steps.
+    Multi-layer should beat single-layer by ≥0.1 nat val_loss.
+  - Multi-seed (≥3) confirms.
+
+Failing Gate-2B means the GRP-RNN+LN block does not benefit from stacking on
+real data; the architecture is research-grade only.
+
+GATE-2C — Match Mamba-2-equivalent at small scale
+-------------------------------------------------
+
+The strong baseline. Two options:
+
+  Option C1 (preferred, cleaner): Reproduce a small Mamba-2 (or a published
+  reproducer) on the same hardware and same data slice, at iso-FLOPs and
+  iso-params (~10M-100M total params, ~1-4B training tokens). Measure
+  perplexity, throughput, and one downstream eval (LAMBADA accuracy).
+
+  Option C2 (cheaper fallback): Use the published Mamba-2 throughput +
+  perplexity numbers at the same param/token budget, adjusted for hardware
+  ratio. This is weaker — direct same-hardware comparison is preferred.
+
+Gate-2C is PASSED when:
+  - GRP-RNN+LN multi-layer val_loss / perplexity within ±10% of Mamba-2-
+    equivalent at iso-FLOPs and iso-params.
+  - LAMBADA-style downstream eval within ±10% of the Mamba-2 baseline.
+
+Failing Gate-2C means the Phase-1 expressivity advantage does not survive
+real-LM training, and the program publishes a negative result and stops
+(unless an explicit pre-committed mitigation is tried). This is the most
+likely program-killing gate.
+
+GATE-2D — Beat Mamba-2-equivalent on at least one axis
+-----------------------------------------------------
+
+If Gate-2C passes (we MATCH Mamba-2), Gate-2D asks: do we BEAT it on any
+axis? Three candidate axes, each with a pre-committed measurable threshold:
+
+  (D-recall)  On a Zoology MQAR-real evaluation slice from Pile or similar,
+              GRP-RNN+LN beats Mamba-2 by ≥0.05 accuracy at iso-params.
+              Hypothesis: the non-diagonal expressivity helps multi-key
+              recall.
+
+  (D-reason)  On a small algebraic / reasoning eval (modular arithmetic,
+              chain composition, dyck grammar), GRP-RNN+LN beats Mamba-2
+              by ≥0.10 accuracy. Hypothesis: the A_5 expressivity advantage
+              transfers to other state-tracking-like reasoning.
+
+  (D-efficiency)  Training tok/s OR inference tok/s ≥1.5× Mamba-2 at iso-
+                  quality. Hypothesis: simpler kernels + fewer parameters
+                  yield wall-clock wins.
+
+Gate-2D is PASSED when at least one of (D-recall, D-reason, D-efficiency)
+clears its threshold with ≥3 seeds and 95% CI not crossing zero.
+
+Failing Gate-2D means GRP-RNN+LN matches Mamba-2 but doesn't beat it; this
+is publishable as a tie-result but not as LLM replacement progress.
+
+GATE-2E — Scale-up demonstration
+-------------------------------
+
+Whatever axis won at Gate-2D, demonstrate it holds at 4-10× the param
+budget. Specifically:
+
+  - Train the winning configuration at 4× and 10× the Gate-2C params/tokens.
+  - Report val_loss, throughput, and the winning-axis metric.
+  - The advantage at Gate-2D must hold (within 20% relative) at both 4× and
+    10× scale.
+
+Failing Gate-2E means the advantage was small-scale-specific; report and
+stop.
+
+GATE-2F — Inference-time efficiency
+----------------------------------
+
+Final practical gate. The architecture must be deployable as a runtime
+generator with competitive throughput.
+
+  - Implement KV-cache-free generation (linear-recurrence is inherently this).
+  - Benchmark tokens-per-second at batch=1 generation against a same-quality
+    Transformer (Llama-3-1B or similar) on the same hardware.
+  - Target: ≥2× faster than Transformer at iso-quality, ≥0.5× of Mamba-2.
+
+Failing Gate-2F means the architecture is a research artifact, not a
+deployment-grade LLM.
+
+================================================================================
+MANDATORY BASELINE MATRIX (per gate)
+================================================================================
+
+Every gate report MUST include numbers from these baselines on the same
+data, same hardware, same training budget:
+
+  B1. GRP-RNN+LN (the proposal under test)
+  B2. LRU + LN, multi-layer (the diagonal-SSM control)
+  B3. Mamba-2 reference (when available; the audit's strongest pure
+      recurrence)
+  B4. Small causal Transformer at iso-params (the gold-standard reference)
+  B5. Vanilla linear-RNN + orthogonal init (the Phase-1 B0 floor)
+
+Reports without B2 and B4 are not gate-passable. B3 is preferred for any
+gate ≥ 2C.
+
+================================================================================
+WHAT WE ARE NOT DOING IN PHASE 2
+================================================================================
+
+Out of scope unless GRP-RNN+LN clears Gate-2C:
+  - New architectural mechanisms beyond GRP-RNN+LN (the parked Candidates B
+    and C remain parked).
+  - R5 (mixture-of-experts), R6 (memory-write regularization), R8 (optional
+    decoding) explorations.
+  - Multi-modal extensions.
+  - Tokenizer research.
+  - The 7-term Lagrangian that EALRMN tried (forbidden).
+
+Out of scope unless GRP-RNN+LN clears Gate-2E:
+  - Production deployment infrastructure.
+  - Distributed training.
+  - Custom hardware kernels beyond what existing glades-trainer already has.
+
+================================================================================
+HONEST FAILURE MODES PRE-REGISTERED
+================================================================================
+
+F-Phase2-1. Per-token LM gradients destabilize the K-Givens chain. Symptom:
+            multi-layer GRP-RNN+LN diverges or stalls in LM training.
+            Mitigation: gradient checkpoint at layer boundaries, smaller
+            learning rate, or reduce K from m to m/4. If unfixable in
+            2 days, declare Gate-2A fail and stop.
+
+F-Phase2-2. GRP-RNN+LN matches but does not beat Mamba-2. Most likely
+            outcome (median expectation). The architecture's expressivity
+            advantage is real but doesn't manifest in natural-language
+            perplexity. Report as a tie-result. The program then has two
+            paths: (a) declare done and publish, (b) re-target to D-reason
+            or D-efficiency where the gap might be larger.
+
+F-Phase2-3. The advantage holds at small scale but vanishes at 4-10× param
+            scale-up. Phase-0k of EALRMN observed this pattern; treat as
+            the prior probability for any small-scale win. If realized,
+            report and stop.
+
+F-Phase2-4. Throughput is too slow due to sequential Givens application.
+            The current K=m chain costs O(K·T) sequential ops per layer.
+            At K=512 T=2048, that's 1M sequential ops per layer per
+            forward — likely uncompetitive without kernel fusion.
+            Mitigation: smaller K (m/4 or m/8), kernel fusion with input
+            GEMV, or accept the slowdown and target D-recall / D-reason
+            instead of D-efficiency.
+
+F-Phase2-5. Multi-phase curriculum doesn't transfer to natural-language
+            pretraining. The A_5 result needed curriculum at T ≥ 64.
+            Natural-language pretraining at long T may need analogous
+            curriculum; we don't yet know how to design it. Mitigation:
+            start with short context (T=512), grow gradually, document
+            the schedule that works (if any).
+
+================================================================================
+ITERATION DISCIPLINE
+================================================================================
+
+Each gate report includes:
+  - Pre-registration (claim, threshold, baselines, seeds, budget).
+  - The results table, all variants, all seeds.
+  - The pre-commit interpretation table (SUPPORTED / FALSIFIED /
+    INCONCLUSIVE).
+  - The honest narrative: what we expected, what we observed, what changed.
+
+Memory is updated after each gate:
+  - Mark the gate as PASSED / FAILED / INCONCLUSIVE.
+  - Save the regime in which the result holds.
+  - Save the failure mode if applicable.
+
+Between gates, the framework document (`research/VESTA_FRAMEWORK.md`) and
+the program report (`research/VESTA_REPORT.md`) are updated. The brief
+itself (this file) is updated only at major program inflections.
+
+================================================================================
+STYLE
+================================================================================
+
+- The goal is LLM replacement. Synthetic-task wins are evidence, not the
+  product.
+- Be mathematically precise on architecture; be empirically honest on
+  evaluation.
+- Pre-commit baselines and thresholds before running.
+- Multi-seed every claimed win.
+- Compare against Mamba-2 / Transformer at iso-FLOPs and iso-params on real
+  data. Anything else is a synthetic-task gate.
+- When a gate fails, write it down and publish the negative. Do not silently
+  re-target.
+
+================================================================================
+USE THE EXISTING `research-framework-design` AND `claude-api` SKILLS
+================================================================================
+
+Phase 1 used the `research-framework-design` skill for the inventive step.
+Phase 2 is mostly EXECUTION (per-token readout, multi-layer stacking, real
+training, baseline comparisons) — not invention. The `research-framework-
+design` skill is appropriate ONLY for designing the per-token-LM-loss term,
+the multi-layer stacking pattern, and the eval suite. For the rest, prefer
+straightforward engineering.
+
+If a Phase 2 gate fails AND the program has explicit pre-committed
+permission to extend the architecture, then `research-framework-design`
+applies for designing the targeted extension. Otherwise stick to execution.
+
+================================================================================
+APPENDIX: WHY PHASE 1's A_5 RESULT IS NOT ENOUGH ON ITS OWN
+================================================================================
+
+The A_5 word-recognition result demonstrates a *theoretical expressivity
+gap* empirically. It does NOT demonstrate:
+  - That the gap matters for natural language. Most natural-language tokens
+    are not produced by non-solvable-group state-tracking; they are produced
+    by approximately-Markov surface processes that diagonal SSMs already
+    handle well.
+  - That GRP-RNN scales. We have only single-layer m=256 results.
+  - That GRP-RNN is efficient. We have only synthetic-task throughput
+    numbers, and at K=m it is 5× slower than vanilla linear RNN.
+  - That GRP-RNN's multi-phase curriculum has a natural-language analogue.
+
+Phase 2 exists to convert the Phase-1 expressivity-gap demonstration into
+either (a) a deployable LLM-replacement architecture or (b) a clean
+negative result that says "the A_5 advantage does not transfer to natural
+language at the scales tested." Both outcomes are publishable. Only one is
+LLM replacement.

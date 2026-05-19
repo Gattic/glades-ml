@@ -5,6 +5,10 @@
 #define EALRMN_TASKS_CUH
 
 #include "common.cuh"
+#include <algorithm>
+#include <cstdio>
+#include <cstdint>
+#include <stdexcept>
 
 // ===== needle-in-haystack =====
 // Vocab: [0, V):
@@ -184,6 +188,159 @@ struct SynthLMTask {
                 }
                 labels[b] = next;
             }
+        }
+    }
+};
+
+// ===== A_5 word recognition (state-tracking expressivity, VESTA Claim N1) =====
+// Two generators of A_5 ⊂ S_5:
+//   g_0 = (1 2 3)   in 0-indexed array form [1, 2, 0, 3, 4]
+//   g_1 = (3 4 5)   in 0-indexed array form [0, 1, 3, 4, 2]
+// Both are 3-cycles, both even, and together they generate the full A_5.
+//
+// For each batch element b:
+//   - Sample T tokens uniformly from {0, 1}
+//   - Compose the corresponding permutations to get final product π in A_5
+//   - Label = lex rank of π among the 60 even-parity permutations of {0..4}
+//
+// Random baseline on this task is 1/60 ≈ 0.0167 accuracy.
+
+struct A5WordTask {
+    int T;
+    std::vector<int> a5_lookup;  // S_5 lex rank (0..119) -> A_5 rank (0..59) or -1 if odd
+
+    A5WordTask(int T_ = 64) : T(T_) {
+        build_a5_lookup();
+    }
+    int n_classes() const { return 60; }
+    int vocab_size() const { return 2; }
+
+    static void compose(const int* a, const int* b, int* out) {
+        // out = a then b: apply a first, then b. out[i] = b[a[i]].
+        for (int i = 0; i < 5; ++i) out[i] = b[a[i]];
+    }
+    static int parity(const int* p) {
+        int inv = 0;
+        for (int i = 0; i < 5; ++i)
+            for (int j = i + 1; j < 5; ++j)
+                if (p[i] > p[j]) inv++;
+        return inv & 1;
+    }
+    static int lex_rank(const int* p) {
+        int rank = 0;
+        int fact[5] = {24, 6, 2, 1, 1};  // 4!, 3!, 2!, 1!, 0!
+        bool used[5] = {false, false, false, false, false};
+        for (int i = 0; i < 5; ++i) {
+            int count_smaller = 0;
+            for (int j = 0; j < p[i]; ++j) if (!used[j]) count_smaller++;
+            rank += count_smaller * fact[i];
+            used[p[i]] = true;
+        }
+        return rank;
+    }
+    void build_a5_lookup() {
+        a5_lookup.assign(120, -1);
+        int p[5] = {0, 1, 2, 3, 4};
+        int idx = 0;
+        do {
+            if (parity(p) == 0) {
+                a5_lookup[lex_rank(p)] = idx;
+                idx++;
+            }
+        } while (std::next_permutation(p, p + 5));
+    }
+
+    void generate(std::vector<int>& ids, std::vector<int>& labels,
+                  int B, HostRng& rng) const {
+        const int g0[5] = {1, 2, 0, 3, 4};
+        const int g1[5] = {0, 1, 3, 4, 2};
+        ids.assign(B * T, 0);
+        labels.assign(B, 0);
+        for (int b = 0; b < B; ++b) {
+            int p[5] = {0, 1, 2, 3, 4};
+            int tmp[5];
+            for (int t = 0; t < T; ++t) {
+                int tok = rng.next_int(2);
+                ids[b * T + t] = tok;
+                const int* g = (tok == 0) ? g0 : g1;
+                compose(p, g, tmp);
+                for (int i = 0; i < 5; ++i) p[i] = tmp[i];
+            }
+            int lr = lex_rank(p);
+            int a5 = a5_lookup[lr];
+            // a5 should always be >= 0 since A_5 is closed under composition.
+            labels[b] = (a5 >= 0) ? a5 : 0;
+        }
+    }
+};
+
+// ===== Pretokenized real corpus =====
+// Reads a .tok.bin file (Glades trainer format):
+//   24-byte header: magic(4)=0x544F4B42 | version(4)=1 | vocab_size(4) | reserved(4)=0 | token_count(8)
+//   payload: uint16_le[token_count]
+//
+// For each batch element we sample a random offset into the corpus and read
+// T consecutive tokens. The LM task predicts the next token at each position,
+// so caller should set up labels_lm via k_build_lm_labels as usual; the per-batch
+// `labels` vector (single-label) is set to a dummy value here.
+
+struct CorpusTask {
+    int T;
+    int V_vocab;
+    std::vector<uint16_t> tokens;  // entire file in memory, payload only
+    explicit CorpusTask(const std::string& path, int T_) : T(T_), V_vocab(0) {
+        FILE* fp = std::fopen(path.c_str(), "rb");
+        if (!fp) {
+            std::fprintf(stderr, "CorpusTask: could not open %s\n", path.c_str());
+            std::exit(1);
+        }
+        uint32_t magic = 0, version = 0, vsz = 0, reserved = 0;
+        uint64_t tok_count = 0;
+        std::fread(&magic, 4, 1, fp);
+        std::fread(&version, 4, 1, fp);
+        std::fread(&vsz, 4, 1, fp);
+        std::fread(&reserved, 4, 1, fp);
+        std::fread(&tok_count, 8, 1, fp);
+        if (magic != 0x544F4B42u) {
+            std::fprintf(stderr, "CorpusTask: bad magic 0x%08x in %s\n", magic, path.c_str());
+            std::exit(1);
+        }
+        V_vocab = (int)vsz;
+        tokens.resize((size_t)tok_count);
+        size_t got = std::fread(tokens.data(), sizeof(uint16_t), (size_t)tok_count, fp);
+        if (got != (size_t)tok_count) {
+            std::fprintf(stderr, "CorpusTask: short read %zu < %llu in %s\n",
+                         got, (unsigned long long)tok_count, path.c_str());
+            std::exit(1);
+        }
+        std::fclose(fp);
+        std::fprintf(stderr, "CorpusTask: loaded %llu tokens, vocab=%d from %s\n",
+                     (unsigned long long)tok_count, V_vocab, path.c_str());
+    }
+    int n_classes() const { return V_vocab; }
+    int vocab_size() const { return V_vocab; }
+
+    void generate(std::vector<int>& ids, std::vector<int>& labels,
+                  int B, HostRng& rng) const {
+        ids.assign(B * T, 0);
+        labels.assign(B, 0);
+        size_t N = tokens.size();
+        if (N < (size_t)T + 1) {
+            std::fprintf(stderr, "CorpusTask: corpus has only %zu tokens < T+1=%d\n", N, T + 1);
+            std::exit(1);
+        }
+        size_t max_off = N - (size_t)T;
+        for (int b = 0; b < B; ++b) {
+            // Uniform offset in [0, max_off]
+            uint32_t r1 = (uint32_t)rng.next_int(1 << 30);
+            uint32_t r2 = (uint32_t)rng.next_int(1 << 30);
+            uint64_t r = ((uint64_t)r1 << 30) | (uint64_t)r2;
+            size_t off = (size_t)(r % (uint64_t)(max_off + 1));
+            for (int t = 0; t < T; ++t) {
+                ids[b * T + t] = (int)tokens[off + (size_t)t];
+            }
+            // Single-label fallback: last-token's next (for back-compat with non-LM heads).
+            labels[b] = (off + (size_t)T < N) ? (int)tokens[off + (size_t)T] : 0;
         }
     }
 };
