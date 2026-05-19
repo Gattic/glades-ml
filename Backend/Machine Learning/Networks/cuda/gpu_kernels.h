@@ -915,6 +915,18 @@ bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n);
 bool cast_f32_to_bf16_stochastic(const float* src, uint16_t* dst, size_t n,
                                   uint32_t baseSeed, uint32_t stepIdx);
 
+// iter 72 (2026-05-19): batched multi-buffer FP32 -> BF16 RN-even cast.
+// Accepts up to 8 (src, dst, count) tuples per launch.  Saves kernel
+// launch overhead when many short-pipeline cast calls must run in
+// sequence on the same stream (e.g., the iter 69 BF16-checkpoint-inner
+// cache writes 7 buffers per layer per direction at L=24).  Math is
+// bit-identical to N sequential cast_f32_to_bf16 calls.  Constraint:
+// num_jobs <= 8.
+bool cast_f32_to_bf16_batched(int num_jobs,
+                               const float* const* srcs,
+                               uint16_t* const* dsts,
+                               const size_t* counts);
+
 // BF16 gradient accumulation helper.  Computes in FP32:
 //   dst_bf16[i] = bf16( alpha * src_f32[i] + beta * fp32(dst_bf16[i]) )
 // with round-to-nearest-even on the output cast.  Used to accumulate FP32
@@ -1058,6 +1070,7 @@ inline bool sum_squared_accumulate_bf16(const uint16_t*, int, float*) { return f
 inline bool cast_f32_to_bf16(const float*, uint16_t*, size_t) { return false; }
 inline bool cast_bf16_to_f32(const uint16_t*, float*, size_t) { return false; }
 inline bool cast_f32_to_bf16_stochastic(const float*, uint16_t*, size_t, uint32_t, uint32_t) { return false; }
+inline bool cast_f32_to_bf16_batched(int, const float* const*, uint16_t* const*, const size_t*) { return false; }
 inline bool bf16_accum_axpy(uint16_t*, const float*, float, float, size_t) { return false; }
 inline bool adam_update_int8_state(float*, const float*, int8_t*, uint8_t*,
                                     float*, float*, float, float, float, float,

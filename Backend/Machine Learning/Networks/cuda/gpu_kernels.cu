@@ -5801,6 +5801,80 @@ bool cast_bf16_to_f32(const uint16_t* src, float* dst, size_t n)
 }
 
 // ===========================================================================
+//  iter 70 (2026-05-19): batched multi-buffer cast for iter 69 BF16 cache
+// ===========================================================================
+// The iter 69 --scfa-checkpoint-inner-bf16 mechanism writes the 7-buffer SCFA
+// inner cache through 7 sequential cast_f32_to_bf16 calls per layer per
+// direction (chiron_main.cpp lines ~6192, ~6360-6371, ~6823, ~6957-6971).
+// At L=24 that's 336 cast launches per step — measurable CPU launch overhead.
+// This batched variant accepts up to 8 (src, dst, count) tuples in a single
+// kernel launch.  Grid Y axis selects the job; grid X axis covers max(count).
+// Threads outside their job's count exit early.  Math is bit-identical to N
+// sequential cast_f32_to_bf16 calls.
+
+namespace {
+
+// Constant memory job table — up to 8 jobs per launch.  Kept in __constant__
+// rather than passed by-value to avoid kernel arg ABI struct size limits
+// (CUDA kernel args are limited to 4 KB total).
+struct CastJob {
+	const float* src;
+	uint16_t* dst;
+	size_t n;
+};
+__constant__ CastJob c_cast_jobs[8];
+
+__global__ void k_cast_f32_to_bf16_batched(int num_jobs, size_t max_n)
+{
+	const int job_id = blockIdx.y;
+	if (job_id >= num_jobs) return;
+	const CastJob job = c_cast_jobs[job_id];
+	const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (idx >= job.n) return;
+	const float f = job.src[idx];
+	union { float f; uint32_t u; } v;
+	v.f = f;
+	if (isnan(f)) {
+		const uint32_t sign = v.u & 0x80000000u;
+		job.dst[idx] = static_cast<uint16_t>(((sign | 0x7FC00000u) >> 16) & 0xFFFFu);
+		return;
+	}
+	const uint32_t lsb = (v.u >> 16) & 1u;
+	const uint32_t roundingBias = 0x7FFFu + lsb;
+	job.dst[idx] = static_cast<uint16_t>((v.u + roundingBias) >> 16);
+}
+
+} // anonymous namespace
+
+bool cast_f32_to_bf16_batched(int num_jobs,
+                               const float* const* srcs,
+                               uint16_t* const* dsts,
+                               const size_t* counts)
+{
+	if (num_jobs <= 0) return true;
+	if (num_jobs > 8) return false; // exceeds c_cast_jobs capacity
+	CastJob host_jobs[8];
+	size_t max_n = 0;
+	for (int i = 0; i < num_jobs; ++i) {
+		host_jobs[i].src = srcs[i];
+		host_jobs[i].dst = dsts[i];
+		host_jobs[i].n = counts[i];
+		if (counts[i] > max_n) max_n = counts[i];
+	}
+	if (max_n == 0) return true;
+	GLADES_CUDA_CHECK(cudaMemcpyToSymbolAsync(c_cast_jobs, host_jobs,
+	    sizeof(CastJob) * (size_t)num_jobs, 0, cudaMemcpyHostToDevice,
+	    computeStream()));
+	const unsigned int TPB = 256u;
+	const size_t grid_x = (max_n + TPB - 1u) / TPB;
+	if (grid_x > 0x7FFFFFFFu) return false;
+	dim3 grid(static_cast<unsigned int>(grid_x), static_cast<unsigned int>(num_jobs), 1);
+	k_cast_f32_to_bf16_batched<<<grid, TPB, 0, computeStream()>>>(num_jobs, max_n);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// ===========================================================================
 //  Stochastic-rounded FP32 -> BF16 cast
 // ===========================================================================
 // Deterministic RN-even rounding quantizes away updates smaller than one ULP
