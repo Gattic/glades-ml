@@ -33,6 +33,9 @@ struct RNNModelCache {
 struct RNNModel {
     cublasHandle_t cublas;
     int V = 0, m = 0, n_classes = 0;
+    // Ablation knobs.
+    std::string init_Wh_method = "orthogonal"; // "orthogonal" (default) | "xavier"
+    bool use_tanh = true;                      // false → linear recurrence (matches EALRMN's K-recurrence)
 
     Tensor E;       // (V, m)
     Tensor W_h;     // (m, m)
@@ -88,7 +91,11 @@ struct RNNModel {
         vb_out = make_tensor({n_classes}); vb_out.zero_();
 
         init_normal(E, 0.0f, 1.0f / std::sqrt((float)m), rng);
-        init_orthogonal_scale(W_h, m, 0.95f, rng);
+        if (init_Wh_method == "xavier") {
+            init_xavier_uniform(W_h, m, m, rng);
+        } else {
+            init_orthogonal_scale(W_h, m, 0.95f, rng);
+        }
         init_xavier_uniform(W_in, m, m, rng);
         b_h.zero_();
         init_xavier_uniform(W_out, m, n_classes, rng);
@@ -136,12 +143,15 @@ struct RNNModel {
             gemm_nt(cublas, B, m, m, 1.0f, z_t.d, W_in.d, 1.0f, pre_s.d);
             launch_bias_add(pre_s.d, b_h.d, B, m);
 
-            // s_t = tanh(pre_s)
-            {
+            // s_t = tanh(pre_s)  [or s_t = pre_s when use_tanh=false (linear ablation)]
+            if (use_tanh) {
                 int n = B * m;
                 int block = 256;
                 int grid = (n + block - 1) / block;
                 k_tanh_fwd<<<grid, block>>>(pre_s.d, s_t.d, n);
+            } else {
+                CUDA_CHECK(cudaMemcpy(s_t.d, pre_s.d, B * m * sizeof(float),
+                                      cudaMemcpyDeviceToDevice));
             }
             CUDA_CHECK(cudaMemcpy(cache.s_all.d + (int64_t)(t + 1) * B * m, s_t.d,
                                   B * m * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -185,12 +195,16 @@ struct RNNModel {
 
         for (int t = T - 1; t >= 0; --t) {
             // d_pre_s = d_s * (1 - s_t^2). Use saved s_t = s_all[t+1].
+            // Linear ablation: d_pre_s = d_s (identity).
             const float* s_t_ptr = cache.s_all.d + (int64_t)(t + 1) * B * m;
-            {
+            if (use_tanh) {
                 int n = B * m;
                 int block = 256;
                 int grid = (n + block - 1) / block;
                 k_tanh_bwd<<<grid, block>>>(s_t_ptr, d_s.d, d_pre_s.d, n);
+            } else {
+                CUDA_CHECK(cudaMemcpy(d_pre_s.d, d_s.d, B * m * sizeof(float),
+                                      cudaMemcpyDeviceToDevice));
             }
             // db_h += sum d_pre_s
             launch_bias_bwd(d_pre_s.d, db_h.d, B, m);

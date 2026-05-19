@@ -58,6 +58,9 @@ struct EALRMNModel {
     cublasHandle_t cublas;
     int V = 0, m = 0, J = 4, n_classes = 0;
     float spectral_radius = 0.95f;
+    // Ablation knobs (set BEFORE init()).
+    std::string init_K_method = "orthogonal"; // "orthogonal" | "xavier"
+    bool use_attmem = true;                   // false → r forced to 0; attention dead
 
     // Parameters
     Tensor E;       // (V, m)
@@ -147,8 +150,12 @@ struct EALRMNModel {
         float e_scale = 1.0f / std::sqrt((float)m);
         init_normal(E, 0.0f, e_scale, rng);
 
-        // K: orthogonal scaled to spectral radius < 1
-        init_orthogonal_scale(K, m, spectral_radius, rng);
+        // K: orthogonal scaled to spectral radius < 1, OR Xavier (ablation).
+        if (init_K_method == "xavier") {
+            init_xavier_uniform(K, m, m, rng);
+        } else {
+            init_orthogonal_scale(K, m, spectral_radius, rng);
+        }
 
         // W_in: Xavier
         init_xavier_uniform(W_in, m, m, rng);
@@ -278,6 +285,11 @@ struct EALRMNModel {
         }
         att_readout_fwd(cache.q.d, cache.M_T.d, cache.scores.d, cache.alpha.d, cache.r.d, B, J, m);
 
+        // Ablation: force r=0 so the attention path is dead.
+        if (!use_attmem) {
+            CUDA_CHECK(cudaMemset(cache.r.d, 0, B * m * sizeof(float)));
+        }
+
         // feat = concat(s_T, r)
         launch_concat_2(s_prev.d, cache.r.d, cache.feat.d, B, m, m);
 
@@ -324,23 +336,26 @@ struct EALRMNModel {
         launch_split_2(d_feat.d, d_s_T.d, d_r.d, B, m, m);
 
         // Attention readout backward
+        // Ablation: when use_attmem=false, the attention output was zeroed in forward,
+        // so the whole attention block has no learning signal. Skip the backward to
+        // keep W_q, b_q frozen at init values and dM_attn = 0.
         Tensor d_q = make_tensor({B, m});
         d_q.zero_();
         Tensor d_M_attn = make_tensor({B, J, m});
         Tensor dalpha = make_tensor({B, J});
         Tensor dscore = make_tensor({B, J});
-        att_readout_bwd(d_r.d, cache.q.d, cache.M_T.d, cache.alpha.d,
-                        d_q.d, d_M_attn.d, dalpha.d, dscore.d, B, J, m);
-
-        // q = s_T @ W_q^T + b_q
-        // db_q += sum d_q; dW_q += d_q^T @ s_T; ds_T += d_q @ W_q
-        launch_bias_bwd(d_q.d, db_q.d, B, m);
-        // d_q (B, m), s_T (B, m): dW_q (m, m) += d_q^T @ s_T
-        // s_T is s_all[T] (last row)
         const float* s_T_ptr = cache.s_all.d + (int64_t)T * B * m;
-        gemm_tn(cublas, m, m, B, 1.0f, d_q.d, s_T_ptr, 1.0f, dW_q.d);
-        // ds_T += d_q @ W_q
-        gemm_nn(cublas, B, m, m, 1.0f, d_q.d, W_q.d, 1.0f, d_s_T.d);
+        if (use_attmem) {
+            att_readout_bwd(d_r.d, cache.q.d, cache.M_T.d, cache.alpha.d,
+                            d_q.d, d_M_attn.d, dalpha.d, dscore.d, B, J, m);
+            launch_bias_bwd(d_q.d, db_q.d, B, m);
+            gemm_tn(cublas, m, m, B, 1.0f, d_q.d, s_T_ptr, 1.0f, dW_q.d);
+            gemm_nn(cublas, B, m, m, 1.0f, d_q.d, W_q.d, 1.0f, d_s_T.d);
+        } else {
+            // Ablation: zero out d_M_attn so the memory backward chain receives no
+            // signal from the (dead) attention block.
+            CUDA_CHECK(cudaMemset(d_M_attn.d, 0, B * J * m * sizeof(float)));
+        }
 
         // BPTT loop. Initialize d_s as d_s_T, d_M as d_M_attn.
         Tensor d_s = make_tensor({B, m});

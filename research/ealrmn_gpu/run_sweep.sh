@@ -36,7 +36,11 @@ run_one () {
     else gc=0.5
     fi
   fi
-  local desc="${model}/${task} m=${m} T=${T} seed=${seed} steps=${steps} lr=${lr} gc=${gc}"
+  local extra=${EXTRA:-}
+  local tag_suffix=${TAG_SUFFIX:-}
+  local effective_tag="$TAG"
+  if [ -n "$tag_suffix" ]; then effective_tag="${TAG}_${tag_suffix}"; fi
+  local desc="${model}/${task} m=${m} T=${T} seed=${seed} steps=${steps} lr=${lr} gc=${gc} ${extra:+extra=$extra}"
   echo "[$(date +%H:%M:%S)] BEGIN $desc" | tee -a "$LOG"
   local start=$(date +%s)
   ./ealrmn_gpu --mode=train \
@@ -45,7 +49,7 @@ run_one () {
       --batch="$batch" --steps="$steps" --H="$H" \
       --warmup=$((steps / 8)) --grad-clip="$gc" \
       --eval-every=$((steps / 5)) --print-every=$((steps / 10)) \
-      --jsonl="$OUT" --tag="$TAG" 2>&1 | tail -8 | tee -a "$LOG"
+      --jsonl="$OUT" --tag="$effective_tag" $extra 2>&1 | tail -8 | tee -a "$LOG"
   local end=$(date +%s)
   echo "[$(date +%H:%M:%S)] END   $desc  wall=$((end-start))s" | tee -a "$LOG"
 }
@@ -122,6 +126,16 @@ iso_params_more)
   for seed in 3 4 5 6 7 8 9; do
     run_one ealrmn_attmem  needle 1024 2048 $seed 4 800 8
     run_one rnn            needle 1448 2048 $seed 4 800 8
+  done
+  ;;
+ablations)
+  # ~55 min: 4 ablations × 5 seeds at T=2048 to isolate the EALRMN training-robustness cause.
+  # Each ablation variant uses a sub-tag baked into the --tag for grouping.
+  for seed in 0 1 2 3 4; do
+    EXTRA="--init-K=xavier"     TAG_SUFFIX="ealrmn_xavierK" run_one ealrmn_attmem needle 1024 2048 $seed 4 800 8
+    EXTRA="--readout=s_only"    TAG_SUFFIX="ealrmn_no_readout" run_one ealrmn_attmem needle 1024 2048 $seed 4 800 8
+    EXTRA="--init-Wh=xavier"    TAG_SUFFIX="rnn_xavierWh" run_one rnn needle 1448 2048 $seed 4 800 8
+    EXTRA="--use-tanh=0"        TAG_SUFFIX="rnn_linear" run_one rnn needle 1448 2048 $seed 4 800 8
   done
   ;;
 smoke)

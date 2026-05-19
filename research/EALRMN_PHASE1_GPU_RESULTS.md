@@ -212,6 +212,41 @@ Plausible causes for EALRMN's basin-widening effect (not separable in Phase-1):
 
 The Phase-1 reading thus refines to: **the architectural value of EALRMN-attmem at production scale is in trainability, not raw capacity.** The cross-T pattern (lose at T=4096, gap shrinks at T=16384) reflects the same training-robustness mechanism failing to scale to longer horizons.
 
+### Ablation study (T=2048, 5 seeds per variant, 800 steps)
+
+To isolate WHICH component drives the training-robustness signal, we ran four ablations. Results vs the 10-seed full-model baselines:
+
+| Variant | val_loss (mean ± sd) | vs full-EALRMN |
+|---------|---------------------:|---------------:|
+| EALRMN (full, 10 seeds) | 5.61e-3 ± 6.6e-4 | 1× (baseline) |
+| EALRMN + Xavier-K (no orthogonal init) | **DIVERGES** (4/5 seeds → NaN or 10^19+) | × (fails) |
+| EALRMN + r forced to 0 (no attention readout) | 6.35e-3 ± 1.0e-3 | 1.13× worse (essentially unchanged) |
+| RNN (full, 10 seeds) | 1.89e-1 ± 2.7e-1 | 34× worse |
+| RNN + Xavier-W_h | 4.65e-1 ± 6.1e-1 | 83× worse (more bimodal than orthogonal-W_h RNN) |
+| **RNN + linear recurrence (no tanh)** | **4.27e-5 ± 8.2e-6** | **131× BETTER than EALRMN** |
+
+**Decisive finding: the architectural value attributed to EALRMN is almost entirely about linear-vs-tanh recurrence, NOT bounded memory, NOT attention readout.**
+
+#### What each ablation says
+
+1. **EALRMN + Xavier-K → diverges (4/5 seeds NaN-out by step ~60).** Orthogonal initialization of the K matrix is necessary for EALRMN's stability. This is a known property of linear recurrent networks: spectral radius < 1 needs to be initialized carefully, and Xavier (which scales as sqrt(6/(2m))) sometimes overshoots.
+2. **EALRMN + r=0 → essentially identical to full EALRMN (6.35e-3 vs 5.61e-3).** The attention readout over the 4-slot bounded memory contributes ~0 to the training outcome. The "K, W_in, W_out + s_T pooling" component does all the work; the W_q, W_g, b_g, b_q, and the 4-slot memory updates are dead weight.
+3. **RNN + Xavier-W_h → worse than RNN-orthogonal (0.465 vs 0.189).** Confirms orthogonal-W_h init was already helping RNN; replacing with Xavier makes the bimodality wider.
+4. **RNN + no tanh (linear recurrence) → val_loss = 4.27e-5, 131× better than EALRMN.** Tanh saturates and squashes the marker→value association signal across the long context of fillers; linear recurrence preserves it. Inter-seed sd is also 100× tighter than EALRMN's (8e-6 vs 7e-4), so the linear RNN trains more reliably AND more accurately.
+
+#### Revised Phase-1 verdict
+
+**The Phase A "EALRMN beats RNN by 6.6×" finding was correct but misattributed.** The actual cause: EALRMN has linear recurrence (s_t = K·s_{t-1} + W_in·z_t, no non-linearity), while the RNN baseline uses tanh (s_t = tanh(W_h·s_{t-1} + W_in·z_t + b_h)). At T=2048 with the marker→value retrieval task, linear-recurrence is the dominant architectural choice.
+
+Once we remove tanh from the RNN, the simplest possible linear recurrent model (no memory, no attention, no gate, just W_h, W_in, W_out + s_T readout) crushes EALRMN by 131×. The EALRMN-specific machinery — bounded EMA memory, gated slot updates, attention readout over slots — provides **zero benefit** in this setting.
+
+This is consistent with the modern linear-RNN literature (S4, S5, Mamba, RWKV): linear recurrence with carefully initialized state matrices is sufficient and often dominant for long-context retrieval tasks. The EALRMN design's bounded-memory + attention-readout is solving a problem (capacity for storing past observations) that the linear recurrence already solves better, more simply.
+
+#### Implications for the writeup
+- The Phase-0 writeup's "architecture not flagship-ready" conclusion stands, but for a different reason than originally hypothesized. The bounded-memory/attention-readout mechanisms are not just incomplete — they are largely unnecessary given linear recurrence with orthogonal initialization.
+- The CPU Phase-0g/0k finding that "attmem advantage exists in a small (m, T) window" is now explainable: the small advantage at small (m, T) was the linear-recurrence-vs-tanh advantage being partially obscured by the small-scale optimization landscape; at larger T the tanh-RNN's saturation hurt and the linear-EALRMN won; at very long T both EALRMN's machinery and RNN's tanh failed for different reasons.
+- The next research direction that would actually be productive: **drop EALRMN, study linear-RNN training dynamics directly**. Mamba/S4-style models with selective gating already do most of what EALRMN was trying to achieve, with better-understood theory.
+
 ## How to reproduce
 
 ```bash

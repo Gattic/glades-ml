@@ -52,6 +52,11 @@ struct Args {
     int n_keys = 8;        // for needle: number of distinct keys
     int n_states = 8;      // for hmm
     int lm_vocab = 64;     // for syntheticlm (must be small for order-2 to fit)
+    // Ablation knobs
+    std::string init_K = "orthogonal";   // EALRMN K init: "orthogonal" | "xavier"
+    std::string init_Wh = "orthogonal";  // RNN W_h init: "orthogonal" | "xavier"
+    std::string readout = "attmem";      // EALRMN readout: "attmem" (default) | "s_only"
+    int use_tanh = 1;                    // RNN: 1 = tanh recurrence (default), 0 = linear
 };
 
 static bool parse_int(const std::string& v, int& out) {
@@ -94,6 +99,10 @@ Args parse_args(int argc, char** argv) {
         else if (key == "--n-keys") parse_int(val, a.n_keys);
         else if (key == "--n-states") parse_int(val, a.n_states);
         else if (key == "--lm-vocab") parse_int(val, a.lm_vocab);
+        else if (key == "--init-K") a.init_K = val;
+        else if (key == "--init-Wh") a.init_Wh = val;
+        else if (key == "--readout") a.readout = val;
+        else if (key == "--use-tanh") parse_int(val, a.use_tanh);
         else {
             std::cerr << "Unknown arg: " << key << "\n";
         }
@@ -191,6 +200,8 @@ static int train_ealrmn(Args& a, TaskWrapper& tw, std::ofstream* jsonl) {
     cublasHandle_t cublas;
     CUBLAS_CHECK(cublasCreate(&cublas));
     EALRMNModel model;
+    model.init_K_method = a.init_K;
+    model.use_attmem = (a.readout != "s_only");
     model.init(cublas, tw.V, a.m, a.J, tw.n_classes, a.seed);
 
     HostRng rng(a.seed);
@@ -270,6 +281,8 @@ static int train_rnn(Args& a, TaskWrapper& tw, std::ofstream* jsonl) {
     cublasHandle_t cublas;
     CUBLAS_CHECK(cublasCreate(&cublas));
     RNNModel model;
+    model.init_Wh_method = a.init_Wh;
+    model.use_tanh = (a.use_tanh != 0);
     model.init(cublas, tw.V, a.m, tw.n_classes, a.seed);
 
     HostRng rng(a.seed);
