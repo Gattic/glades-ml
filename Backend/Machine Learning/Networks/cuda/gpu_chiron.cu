@@ -276,6 +276,35 @@ __global__ void chiron_scfa_axpy2_bf16p_sr_kernel(unsigned short* __restrict__ p
 	p_bf[i] = fp32_to_bf16_sr_dev(acc, (uint32_t)i, srStepIdx, srBaseSeed);
 }
 
+// iter 70 (2026-05-19): Fused dual-output axpy2 for the iter 65 BF16-residual-p
+// mirror.  Computes new FP32 p = p_fp32 + alpha*(a+b) in an FP32 register and
+// writes BOTH the FP32 canonical (s.p) AND a BF16 SR-rounded mirror (s.p_bf16)
+// in a single pass.  Replaces the two-kernel sequence at chiron_main.cpp:6439+
+// (chiron_scfa_axpy2 then cast_f32_to_bf16_stochastic) used at every SCFA shear
+// commit under --bf16-residual-p.  SR hash matches k_cast_f32_to_bf16_stochastic
+// for bit-identical NLL when (srBaseSeed, srStepIdx) is preserved across calls.
+// Saves: 1 launch + 1 HBM read of p (Tm × 4 B) per layer per direction.
+__global__ void chiron_scfa_axpy2_dual_p_kernel(float* __restrict__ p_fp32,
+                                                 unsigned short* __restrict__ p_bf16,
+                                                 float alpha,
+                                                 const float* __restrict__ a,
+                                                 const float* __restrict__ b,
+                                                 int n,
+                                                 uint32_t srBaseSeed,
+                                                 uint32_t srStepIdx)
+{
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	// Match chiron_scfa_axpy2_kernel's exact arithmetic form (p[i] += alpha *
+	// (a[i] + b[i])) so NVCC contracts to the same FMA emit — otherwise the
+	// register-pressure delta from the added BF16-SR computation can shift
+	// FMA decisions, producing ULP-scale FP32 drift (iter 50 pattern).
+	float p_val = p_fp32[i];
+	p_val += alpha * (a[i] + b[i]);
+	p_fp32[i] = p_val;
+	p_bf16[i] = fp32_to_bf16_sr_dev(p_val, (uint32_t)i, srStepIdx, srBaseSeed);
+}
+
 __global__ void chiron_axpy_bf16p_sr_kernel(unsigned short* __restrict__ p_bf,
                                              float alpha,
                                              const float* __restrict__ x,
@@ -511,6 +540,23 @@ bool chiron_axpy_bf16p_sr(unsigned short* p_bf, float alpha,
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
 	chiron_axpy_bf16p_sr_kernel<<<grid, kBlockElem, 0, s>>>(
 	    p_bf, alpha, x, n, srBaseSeed, srStepIdx);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 70 host wrapper for the fused dual-output axpy2 kernel.
+bool chiron_scfa_axpy2_dual_p(float* p_fp32, unsigned short* p_bf16,
+                               float alpha,
+                               const float* a, const float* b, int n,
+                               unsigned int srBaseSeed,
+                               unsigned int srStepIdx,
+                               cudaStream_t stream)
+{
+	if (n <= 0) return true;
+	int grid = (n + kBlockElem - 1) / kBlockElem;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	chiron_scfa_axpy2_dual_p_kernel<<<grid, kBlockElem, 0, s>>>(
+	    p_fp32, p_bf16, alpha, a, b, n, srBaseSeed, srStepIdx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

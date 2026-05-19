@@ -106,6 +106,21 @@ bool chiron_scfa_scaled_copy_bf16p_sr(unsigned short* c_bf, float alpha,
                                        unsigned int srBaseSeed,
                                        unsigned int srStepIdx,
                                        cudaStream_t stream = 0);
+
+// iter 70 (2026-05-19): Fused dual-output variant for the iter 65 BF16-p
+// mirror.  Computes p_fp32 += alpha*(a+b) in FP32 and writes BOTH p_fp32
+// (canonical) and p_bf16 (SR-rounded mirror) in a single pass.  Replaces:
+//   chiron_scfa_axpy2(p_fp32, alpha, a, b, n);
+//   cast_f32_to_bf16_stochastic(p_fp32, p_bf16, n, baseSeed, stepIdx);
+// with one kernel launch.  SR hash arg order matches
+// k_cast_f32_to_bf16_stochastic so output is bit-identical when (srBaseSeed,
+// srStepIdx) is preserved across calls.
+bool chiron_scfa_axpy2_dual_p(float* p_fp32, unsigned short* p_bf16,
+                               float alpha,
+                               const float* a, const float* b, int n,
+                               unsigned int srBaseSeed,
+                               unsigned int srStepIdx,
+                               cudaStream_t stream = 0);
 // Reln forward reading BF16 p (decode inline), writes FP32 q_out + stats.
 bool chiron_reln_forward_rows_bf16p(const unsigned short* p_bf_in,
                                      float* q_out, float* stats,
