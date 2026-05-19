@@ -1,0 +1,20 @@
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 4 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+============================================================
+ATLAS Alternate Benchmark Harness
+============================================================
+------------------------------------------------------------
+Case: token-lm-corpus-large
+Description: larger checked-in corpus autoregressive next-token prediction with more public-domain prose documents, longer windows, and a shared train/test vocabulary.
+Config: vocab=769 dModel=56 dFF=224 layers=4 heads=8 seqLen=112 trainSeqs=64 testSeqs=16 epochs=4 repeats=5
+Optimizers: AdamW(lr=0.0010) ATLAS-BSRP(lr=0.0200 cRank=0) ATLAS-SPARROW(lr=0.0200 cRank=4 modeRankCap=1 autoGate=0) ATLAS-HELM(lr=0.0200 modeRank=2 hiddenStack=2) ATLAS-ASTER(lr=0.0200 stateRank=2 hiddenStack=2) ATLAS-AEGIS(lr=0.0200 cRank=4) ATLAS-CITADEL(lr=0.0200 cRank=4) ATLAS-RAMPART(lr=0.0200 cRank=4) ATLAS-MERIT(lr=0.0200 cRank=4) ATLAS-STRATA(lr=0.0200 cRank=4) ATLAS-AURORA(lr=0.0010 cRank=4) ATLAS-SEAM(lr=0.0200 cRank=4) ATLAS-QUASAR(lr=0.0200 cRank=4) ATLAS-GEODE(lr=0.0010 cRank=4) ATLAS-BIMAP(lr=0.0010 lowRank=1 cadence=8)
+ATLAS: rank=8 tSub=64 kappaMax=10.000 sparrow(modeRankCap=1 autoGate=0 memoryScale=0.050 edge=0.100 secondEdge=0.100 secondFrac=0.500 poleMax=0.950) helm(modeRank=2 hiddenStack=2 memoryScale=0.050 edge=0.100 poleMax=0.950) aster(stateRank=2 hiddenStack=2 memoryScale=0.050 edge=0.100 poleMax=0.950) kappa(enabled=0 heads=1 lags=4 rank=2) aurora(adamwBackbone=1 headGain=3.000 bodyTrust=0.600) geode(geom=1.000 pred=0.250) bimap(lowRank=1 geom=1.000 pred=0.150 cadence=8)
+
+Optimizer        Train(s)               Tok/s             TrainNLL            TrainPPL             TestNLL             TestPPL         Status
+ATLAS-BIMAP         4.45 +/- 0.02         6438.4 +/- 33.6          3.27628 +/- 0.10952       26.634 +/- 2.844        6.48482 +/- 0.22977      674.319 +/- 176.959    ok
+  XFORM proxy:  in=0.000 +/- 0.000  blk=[6.456 5.878 6.057 6.412]  final=2.348 +/- 0.057  head=14.876 +/- 0.295  hShare=0.581 +/- 0.012  applyMs=11.164 +/- 0.114
+                trainMargin=-0.405 +/- 0.128  trainHardNeg=3.663 +/- 0.089  testMargin=-4.245 +/- 0.401  testHardNeg=4.358 +/- 0.374
+
+============================================================
+========================
+| Unit Tests Completed |
+========================

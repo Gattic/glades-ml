@@ -14,8 +14,10 @@
 #include "../../../Backend/Machine Learning/Networks/network.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_kernels.h"
 #include "../../../Backend/Machine Learning/Networks/transformer_ops.h"
+#include "../../../Backend/Machine Learning/Networks/transformer_train_detail.h"
 #include "../../../Backend/Machine Learning/Networks/training_config.h"
 #include "../../../Backend/Machine Learning/DataObjects/NumberInput.h"
+#include "../../../Backend/Machine Learning/DataObjects/TokenInput.h"
 #include "../../../Backend/Machine Learning/GMath/gmath.h"
 #include "../../../Backend/Machine Learning/Structure/nninfo.h"
 #include "../../../Backend/Machine Learning/Structure/inputlayerinfo.h"
@@ -27,6 +29,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <vector>
 
@@ -148,6 +151,9 @@ public:
 		outTokenId = testNextTok[index]; return true;
 	}
 
+	virtual bool hasTokenIdInput() const { return true; }
+	virtual bool hasTokenIdExpectedOutput() const { return true; }
+
 	virtual unsigned int getTrainSize() const { return static_cast<unsigned int>(trainTok.size()); }
 	virtual unsigned int getTestSize() const { return static_cast<unsigned int>(testTok.size()); }
 	virtual unsigned int getFeatureCount() const { return 1u; }
@@ -233,6 +239,42 @@ struct SmallTransformerSetup
 		delete di;
 	}
 };
+
+static void assert_transformer_model_save_load_logits_roundtrip(SmallTransformerSetup& saved,
+                                                                SmallTransformerSetup& loaded,
+                                                                const std::string& modelName,
+                                                                const std::vector<unsigned int>& prefix,
+                                                                double tolerance)
+{
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: save failed==============",
+	         saved.net->saveModel(modelName).ok());
+
+	std::vector<float> logitsSaved;
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: forward1 failed==============",
+	         saved.net->transformerLmForwardLastLogits(prefix, logitsSaved).ok());
+
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: load init failed==============",
+	         loaded.net->test(loaded.di).ok());
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: load failed==============",
+	         loaded.net->loadModel(modelName, loaded.di).ok());
+
+	std::vector<float> logitsLoaded;
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: forward2 failed==============",
+	         loaded.net->transformerLmForwardLastLogits(prefix, logitsLoaded).ok());
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: logits size mismatch==============",
+	         logitsSaved.size() == logitsLoaded.size());
+	double maxErr = 0.0;
+	for (size_t i = 0; i < logitsSaved.size(); ++i)
+	{
+		G_assert(__FILE__, __LINE__, "==============Checkpoint: non-finite logit==============",
+		         std::isfinite(logitsSaved[i]) && std::isfinite(logitsLoaded[i]));
+		const double e = fabs(static_cast<double>(logitsSaved[i]) - static_cast<double>(logitsLoaded[i]));
+		if (e > maxErr)
+			maxErr = e;
+	}
+	G_assert(__FILE__, __LINE__, "==============Checkpoint: logits differ after save/load==============",
+	         maxErr < tolerance);
+}
 
 } // anonymous namespace
 
@@ -748,43 +790,13 @@ void TransformerImprovementsUnitTest()
 		G_assert(__FILE__, __LINE__, "==============Checkpoint: init failed==============", s.net->test(s.di).ok());
 		G_assert(__FILE__, __LINE__, "==============Checkpoint: train failed==============", s.net->train(s.di).ok());
 
-		// Save model
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: save failed==============",
-		         s.net->saveModel("ut_transformer_improvements_ckpt").ok());
-
-		// Record logits from trained network
 		std::vector<unsigned int> prefix;
 		prefix.push_back(1u);
 		prefix.push_back(2u);
 		prefix.push_back(3u);
-		std::vector<float> logits1;
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: forward1 failed==============",
-		         s.net->transformerLmForwardLastLogits(prefix, logits1).ok());
 
-		// Create a new network and load the checkpoint
 		SmallTransformerSetup s2(vocab, dModel, 4u, 32u, 9999u); // different seed
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: load init failed==============", s2.net->test(s2.di).ok());
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: load failed==============",
-		         s2.net->loadModel("ut_transformer_improvements_ckpt", s2.di).ok());
-
-		// Verify logits match between saved and loaded networks
-		// (this implicitly verifies all weights including final LN gamma/beta were restored)
-		std::vector<float> logits2;
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: forward2 failed==============",
-		         s2.net->transformerLmForwardLastLogits(prefix, logits2).ok());
-		G_assert(__FILE__, __LINE__, "==============Checkpoint: logits size mismatch==============",
-		         logits1.size() == logits2.size());
-		{
-			double maxErr = 0.0;
-			for (size_t i = 0; i < logits1.size(); ++i)
-			{
-				G_assert(__FILE__, __LINE__, "==============Checkpoint: non-finite logit==============",
-				         std::isfinite(logits1[i]) && std::isfinite(logits2[i]));
-				const double e = fabs(static_cast<double>(logits1[i]) - static_cast<double>(logits2[i]));
-				if (e > maxErr) maxErr = e;
-			}
-			G_assert(__FILE__, __LINE__, "==============Checkpoint: logits differ after save/load==============", maxErr < 1e-4);
-		}
+		assert_transformer_model_save_load_logits_roundtrip(s, s2, "ut_transformer_improvements_ckpt", prefix, 1e-4);
 	}
 
 	// ===== 11. Multi-layer transformer with GELU + LayerNorm + dropout =====
@@ -832,6 +844,120 @@ void TransformerImprovementsUnitTest()
 		for (size_t i = 0; i < logitsA.size(); ++i)
 			G_assert(__FILE__, __LINE__, "==============Determinism: logits differ==============",
 			         fabs(static_cast<double>(logitsA[i]) - static_cast<double>(logitsB[i])) < 1e-7);
+	}
+
+	// ===== 13. TokenInput file import works on the real token LM path =====
+	printf("-----------------------------------\n");
+	printf("TokenInput: file import feeds transformer training/inference\n");
+	printf("-----------------------------------\n");
+	{
+		const char* path = "/tmp/ut_transformer_improvements_tokeninput.txt";
+		std::ofstream out(path);
+		out << "1 2 3 4 5\n";
+		out << "2 3 4 5 6\n";
+		out.close();
+
+		glades::TokenInput di;
+		di.setPadTokenId(16);
+		di.setMirrorTrainToTestOnImplicitSplit(true);
+		di.import(shmea::GString(path));
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: import failed==============", di.loadedOk());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: expected output contract failed==============", di.hasTokenIdExpectedOutput());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: train split empty==============", di.getTrainSize() > 0u);
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: test split empty==============", di.getTestSize() > 0u);
+
+		glades::InputLayerInfo* in = new glades::InputLayerInfo(1, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f);
+		std::vector<glades::HiddenLayerInfo*> hidden;
+		hidden.push_back(new glades::HiddenLayerInfo(16, 0.01f, 0.0f, 0.0f, 0.0f, 0.0f, glades::GMath::LINEAR, 1.0f));
+		glades::OutputLayerInfo* outInfo = new glades::OutputLayerInfo(17, glades::OutputLayerInfo::CLASSIFICATION);
+
+		glades::NNInfo* info = new glades::NNInfo("ut_transformer_improvements_tokeninput", in, hidden, outInfo);
+		glades::NNetwork* net = new glades::NNetwork(info, glades::NNetwork::TYPE_TRANSFORMER_DECODER);
+		net->setSeed(31337u);
+		net->getTerminatorMutable().setEpoch(1);
+		net->getTerminatorMutable().setAccuracy(0);
+
+		glades::TrainingConfig& cfg = net->getTrainingConfigMutable();
+		cfg.transformer.enableTokenEmbedding = true;
+		cfg.transformer.vocabSizeOverride = 17;
+		cfg.transformer.tieEmbeddings = true;
+		cfg.transformer.padTokenId = 16;
+		cfg.transformer.nHeadsOverride = 4;
+		cfg.transformer.nKVHeadsOverride = 4;
+		cfg.transformer.dFFOverride = 32;
+		cfg.transformer.ffnKind = glades::TransformerRunConfig::FFN_SWIGLU;
+		cfg.transformer.normType = glades::TransformerRunConfig::NORM_RMSNORM;
+		cfg.transformer.positionalEncoding = glades::TransformerRunConfig::POSENC_ROPE;
+		cfg.transformer.ropeTheta = 10000.0f;
+		cfg.optimizer.type = glades::OptimizerConfig::ADAMW;
+
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: init failed==============", net->test(&di).ok());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: train failed==============", net->train(&di).ok());
+
+		std::vector<unsigned int> probe;
+		probe.push_back(1u);
+		probe.push_back(2u);
+		probe.push_back(3u);
+		std::vector<float> logits;
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: forward failed==============",
+		         net->transformerLmForwardLastLogits(probe, logits).ok());
+		G_assert(__FILE__, __LINE__, "==============TokenInput improvements: logits size mismatch==============", logits.size() == 17u);
+
+		delete net;
+		delete info;
+	}
+
+	// ===== 14. Cosine LR schedule uses fractional intra-epoch progress =====
+	printf("-----------------------------------\n");
+	printf("Cosine LR schedule: fractional intra-epoch progress\n");
+	printf("-----------------------------------\n");
+	{
+		glades::LearningRateScheduleConfig schedule;
+		schedule.setCosine(2, 0.1f);
+
+		const unsigned int totalStepsInEpoch = 8u;
+		double previous = 0.0;
+		for (unsigned int stepInEpoch = 0u; stepInEpoch <= totalStepsInEpoch; ++stepInEpoch)
+		{
+			const double epochProgress =
+			    static_cast<double>(stepInEpoch) / static_cast<double>(totalStepsInEpoch);
+			const double expected = static_cast<double>(schedule.multiplierFractionalEpoch(epochProgress));
+			const double actual = static_cast<double>(glades::transformer_train_detail::transformer_schedule_multiplier(
+			    schedule, 0, stepInEpoch, totalStepsInEpoch));
+			G_assert(__FILE__, __LINE__, "==============Cosine schedule: finite multiplier expected==============",
+			         std::isfinite(actual));
+			G_assert(__FILE__, __LINE__, "==============Cosine schedule: fractional multiplier mismatch==============",
+			         fabs(actual - expected) < 1e-7);
+			if (stepInEpoch > 0u)
+				G_assert(__FILE__, __LINE__, "==============Cosine schedule: intra-epoch multiplier must not increase==============",
+				         actual <= previous + 1e-7);
+			previous = actual;
+		}
+
+		const double start = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(schedule, 0, 0u, totalStepsInEpoch));
+		const double firstStep = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(schedule, 0, 1u, totalStepsInEpoch));
+		const double endOfEpoch = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(
+		        schedule, 0, totalStepsInEpoch, totalStepsInEpoch));
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: epoch should start at multiplier 1==============",
+		         fabs(start - 1.0) < 1e-7);
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: first step must decay below epoch start==============",
+		         firstStep < start - 1e-4);
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: epoch end mismatch==============",
+		         fabs(endOfEpoch - static_cast<double>(schedule.multiplier(1))) < 1e-7);
+
+		const double clamped = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(
+		        schedule, 0, totalStepsInEpoch + 5u, totalStepsInEpoch));
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: step clamp mismatch==============",
+		         fabs(clamped - endOfEpoch) < 1e-7);
+
+		const double zeroStepsFallback = static_cast<double>(
+		    glades::transformer_train_detail::transformer_schedule_multiplier(schedule, 1, 0u, 0u));
+		G_assert(__FILE__, __LINE__, "==============Cosine schedule: zero-step fallback mismatch==============",
+		         fabs(zeroStepsFallback - static_cast<double>(schedule.multiplier(1))) < 1e-7);
 	}
 
 	printf("\n============================================================\n");

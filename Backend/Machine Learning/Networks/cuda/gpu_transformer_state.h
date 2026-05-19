@@ -13,6 +13,83 @@
 namespace glades {
 namespace gpu {
 
+struct HostFloatBufferView
+{
+	float* data;
+	size_t size;
+
+	HostFloatBufferView()
+	    : data(0), size(0)
+	{
+	}
+};
+
+struct TransformerHostBlockWeightsView
+{
+	HostFloatBufferView ln1Gamma;
+	HostFloatBufferView ln1Beta;
+	HostFloatBufferView Wq;
+	HostFloatBufferView Wk;
+	HostFloatBufferView Wv;
+	HostFloatBufferView Wo;
+	HostFloatBufferView bq;
+	HostFloatBufferView bk;
+	HostFloatBufferView bv;
+	HostFloatBufferView bo;
+	HostFloatBufferView ln2Gamma;
+	HostFloatBufferView ln2Beta;
+	HostFloatBufferView W1;
+	HostFloatBufferView W2;
+	HostFloatBufferView b1;
+	HostFloatBufferView b2;
+};
+
+struct TransformerHostWeightsView
+{
+	HostFloatBufferView tokE;
+	HostFloatBufferView WIn;
+	HostFloatBufferView bIn;
+	HostFloatBufferView WOut;
+	HostFloatBufferView bOut;
+	HostFloatBufferView lmBias;
+	HostFloatBufferView lnFinalGamma;
+	HostFloatBufferView lnFinalBeta;
+	TransformerHostBlockWeightsView* blocks;
+	unsigned int blockCount;
+
+	TransformerHostWeightsView()
+	    : blocks(0),
+	      blockCount(0u)
+	{
+	}
+};
+
+struct TransformerGpuScratchConfig
+{
+	unsigned int T;
+	unsigned int inputSize;
+	unsigned int outSize;
+	unsigned int dModel;
+	unsigned int dFF;
+	unsigned int dModelKV;
+	unsigned int nHeads;
+	unsigned int nLayers;
+	unsigned int ff1Width;
+
+	TransformerGpuScratchConfig()
+	    : T(0u),
+	      inputSize(0u),
+	      outSize(0u),
+	      dModel(0u),
+	      dFF(0u),
+	      dModelKV(0u),
+	      nHeads(0u),
+	      nLayers(0u),
+	      ff1Width(0u)
+	{
+	}
+};
+
 // GPU-resident copy of all transformer weights + optimizer state.
 // Layout mirrors NNetwork::TensorTransformerState.
 struct GpuTransformerWeights
@@ -120,6 +197,20 @@ struct GpuTransformerWeights
 		// ATLAS optimizer state (one per weight matrix)
 		GpuAtlasWeightState atlasWq, atlasWk, atlasWv, atlasWo;
 		GpuAtlasWeightState atlasW1, atlasW2;
+		GpuEchoWeightState echoWq, echoWk, echoWv, echoWo;
+		GpuEchoWeightState echoW1, echoW2;
+		GpuBiMAPWeightState bimapWq, bimapWk, bimapWv, bimapWo;
+		GpuBiMAPWeightState bimapW1, bimapW2;
+		GpuPactWeightState pactWq, pactWk, pactWv, pactWo;
+		GpuPactWeightState pactW1, pactW2;
+		GpuRacerWeightState racerWq, racerWk, racerWv, racerWo;
+		GpuRacerWeightState racerW1, racerW2;
+		GpuMatraWeightState matraWq, matraWk, matraWv, matraWo;
+		GpuMatraWeightState matraW1, matraW2;
+		GpuArgosWeightState argosWq, argosWk, argosWv, argosWo;
+		GpuArgosWeightState argosW1, argosW2;
+		GpuMuonWeightState muonWq, muonWk, muonWv, muonWo;
+		GpuMuonWeightState muonW1, muonW2;
 	};
 
 	Block* blocks;  // array of nLayers blocks
@@ -130,19 +221,76 @@ struct GpuTransformerWeights
 	float** d_adamGrads;
 	float** d_adamM;
 	float** d_adamV;
-	// Per-group scalars (device arrays of float): lr, wd.
-	float* d_adamLr;
+	float** d_adamRowSecond;
+	float** d_adamColSecond;
+	float** d_adamRowMetric;
+	float** d_adamColMetric;
+	float** d_adamRowStructMetric;
+	float** d_adamColStructMetric;
+	float** d_adamPrevMhat;
+	float** d_adamMetricScratch;
+	GpuEchoObserveEntry* d_echoObserveEntries;
+	GpuMatraBatchItem* d_matraBatchItems; // device scratch array of MATRA batch descriptors
+	float* d_matraStatsBatch; // device scratch array of packed MATRA scalar stats [batch, 20]
+	float** d_matraCoreBatchPtrs; // device scratch array of MATRA coreScratch pointers for batched factorization
+	float** d_matraStepBatchPtrs; // device scratch array of MATRA orthStep pointers for batched triangular solves
+	int* d_matraInfoBatch; // device scratch array of batched MATRA Cholesky status codes
+	GpuMuonBatchItem* d_muonBatchItems; // device scratch array of MUON batch descriptors
+	float** d_muonCoreBatchPtrs; // device scratch array of coreScratch pointers for batched MUON factorization
+	float** d_muonStepBatchPtrs; // device scratch array of muonStep pointers for batched MUON triangular solves
+	int* d_muonInfoBatch; // device scratch array of batched MUON Cholesky status codes
+	// Per-group scalars (device arrays of float): static base lr and wd.
+	float* d_adamBaseLr;
 	float* d_adamWd;
+	float* d_adamGroupScales;
+	float* d_adamGroupPrevStepRms;
 	// Per-group element counts (device array of int).
 	int* d_adamSizes;
+	int* d_adamMetricRows;
+	int* d_adamMetricCols;
 	int adamGroupCount;   // number of parameter groups
 	int adamMaxSize;      // largest element count across groups
+	int echoObserveCapacity; // capacity of the batched ECHO observe descriptor buffer
+	int matraCoreBatchCapacity; // capacity of the batched MATRA core pointer scratch array
+	int muonCoreBatchCapacity; // capacity of the batched MUON core pointer scratch array
+	int echoObserveEntryCount; // cached descriptor count for the current scratch shape
+	int echoObserveTotalFeatures; // total row+col features across cached observe descriptors
+	unsigned int echoObserveSeqLen; // sequence length used to build cached descriptors
+	unsigned int echoObserveScope; // ECHO scope used to build cached descriptors
+	bool echoObserveTokenModel; // token-lm vs projection mode for cached descriptors
+	bool echoObserveMetaUploaded; // true after cached observe descriptors uploaded
+	bool matraBatchDescriptorsUploaded; // true after MATRA static batch descriptors uploaded
 	bool adamPtrsUploaded; // true after pointer arrays uploaded once
+	bool adamMetricMetaUploaded; // true after static ECHO metric metadata uploaded
+	unsigned int adamMetricScope; // ECHO scope for the uploaded static metric metadata
+	int matraBatchDescriptorCount; // cached MATRA descriptor count
+	unsigned long long matraBatchDescriptorHash; // cached hash of uploaded MATRA descriptor layout
 
 	// ATLAS optimizer state (one per weight matrix, biases use Adam).
 	GpuAtlasWeightState atlasTokE;
 	GpuAtlasWeightState atlasWIn;
 	GpuAtlasWeightState atlasWOut;
+	GpuEchoWeightState echoTokE;
+	GpuEchoWeightState echoWIn;
+	GpuEchoWeightState echoWOut;
+	GpuBiMAPWeightState bimapTokE;
+	GpuBiMAPWeightState bimapWIn;
+	GpuBiMAPWeightState bimapWOut;
+	GpuPactWeightState pactTokE;
+	GpuPactWeightState pactWIn;
+	GpuPactWeightState pactWOut;
+	GpuRacerWeightState racerTokE;
+	GpuRacerWeightState racerWIn;
+	GpuRacerWeightState racerWOut;
+	GpuMatraWeightState matraTokE;
+	GpuMatraWeightState matraWIn;
+	GpuMatraWeightState matraWOut;
+	GpuArgosWeightState argosTokE;
+	GpuArgosWeightState argosWIn;
+	GpuArgosWeightState argosWOut;
+	GpuMuonWeightState muonTokE;
+	GpuMuonWeightState muonWIn;
+	GpuMuonWeightState muonWOut;
 
 	GpuTransformerWeights();
 	~GpuTransformerWeights();
@@ -159,6 +307,10 @@ struct GpuTransformerWeights
 
 	// Free all GPU memory.
 	void free();
+
+	// Allocate ECHO-specific batched observe / metric metadata buffers on demand.
+	// Plain AdamW and non-ECHO ATLAS variants do not need these arrays.
+	bool ensureEchoBuffers();
 };
 
 // GPU-resident forward/backward scratch buffers for transformer training.
@@ -222,10 +374,6 @@ struct GpuTransformerScratch
 	// Token IDs (for embedding gather/scatter)
 	GpuBuffer<int> tokenIds;     // [T]
 
-	// Attention scores/probs (materialized for batched GEMM attention path)
-	GpuBuffer<float> attnScores; // [nHeads * T * T]
-	GpuBuffer<float> attnProbs;  // [nHeads * T * T]
-
 	// Persistent buffers to avoid per-step allocations
 	GpuBuffer<float> gpuInvFreq; // [dHead/2]  (RoPE inverse frequencies)
 	GpuBuffer<int> gpuTargetsT;  // [T]        (target token IDs for loss/backward)
@@ -250,6 +398,9 @@ struct GpuTransformerScratch
 	              unsigned int nHeads, unsigned int nLayers, unsigned int ff1Width);
 	void free();
 };
+
+bool ensureTransformerScratch(GpuTransformerScratch*& scratch,
+                              const TransformerGpuScratchConfig& cfg);
 
 // Upload CPU TensorTransformerState weights -> GPU.
 // Assumes gpu weights are already allocated with matching dimensions.
@@ -286,6 +437,15 @@ bool uploadTransformerBlockWeights(GpuTransformerWeights::Block& gpuBlock,
                                     const float* ln2Gamma, const float* ln2Beta,
                                     const float* W1, const float* W2,
                                     const float* b1, const float* b2);
+
+bool uploadTransformerTokenIds(GpuTransformerScratch& scratch,
+                               const int* tokenIds, size_t count);
+bool uploadTransformerDenseInputs(GpuTransformerScratch& scratch,
+                                  const float* hostInputs, size_t count);
+bool uploadTransformerRopeInvFreq(GpuTransformerScratch& scratch,
+                                  const float* invFreq, size_t count);
+bool downloadTransformerWeightsToHost(const GpuTransformerWeights& gpu,
+                                      const TransformerHostWeightsView& host);
 
 // Zero all gradient buffers on GPU.
 bool zeroTransformerGradients(GpuTransformerWeights& gpu);

@@ -134,15 +134,32 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
                  float lr, float beta1, float beta2, float eps,
                  float weightDecay, float gradScale, int step, int n);
 
+bool adam_group_scale_batch(float** d_params, float** d_grads,
+                            float** d_ms, float** d_vs,
+                            float* d_groupScales, float* d_groupPrevStepRms,
+                            const int* d_sizes,
+                            float beta1, float beta2, float eps,
+                            float gradScale, int step, int groupCount,
+                            unsigned int minGroupSize,
+                            float stabilityScale, float snrScale, float ratioScale,
+                            float minScale, float maxScale);
+
 // Batched Adam: process all parameter groups in a single kernel launch.
 // d_params/d_grads/d_ms/d_vs are device arrays of groupCount pointers.
-// d_lrs/d_wds are device arrays of groupCount floats (per-group lr/wd).
+// d_baseLrs/d_wds are device arrays of groupCount floats (static per-group
+// base lr and weight decay). lrScale is multiplied into each base lr in-kernel.
 // d_sizes is a device array of groupCount ints (element counts).
 // maxSize is the largest element count across all groups.
 bool adam_update_batch(float** d_params, float** d_grads,
                        float** d_ms, float** d_vs,
-                       const float* d_lrs, const float* d_wds,
+                       const float* d_baseLrs, const float* d_wds,
+                       float lrScale,
+                       const float* d_stepScales,
                        const int* d_sizes, int maxSize,
+                       float** d_rowMetrics, float** d_colMetrics,
+                       float** d_rowStructMetrics, float** d_colStructMetrics,
+                       float** d_prevMhats, float** d_metricScratch,
+                       const int* d_metricRows, const int* d_metricCols,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount);
 
@@ -160,6 +177,23 @@ bool flash_attention_backward(const float* Q, const float* K, const float* V,
                               const float* O, const float* dO,
                               int T, int dK, int dV, bool causal,
                               float* dQ, float* dK_out, float* dV_out);
+
+// Packed multi-head/GQA flash-style attention for training.
+// Q[T, dModel], K/V[T, dModelKV], O[T, dModel] are row-major with heads packed
+// contiguously inside the model dimension.
+bool flash_attention_multihead_forward(const float* Q, const float* K, const float* V,
+                                       int T, int nHeads, int nKVHeads,
+                                       int dHead, int dModel, int dModelKV,
+                                       bool causal, float* O);
+
+// Backward for packed multi-head/GQA flash-style attention.
+// dQ is written per query head; dK/dV are accumulated per KV head.
+bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
+                                        const float* O, const float* dO,
+                                        int T, int nHeads, int nKVHeads,
+                                        int dHead, int dModel, int dModelKV,
+                                        bool causal,
+                                        float* dQ, float* dK_out, float* dV_out);
 
 // ---------------------------------------------------------------------------
 // Incremental KV-cache attention (single-query, multi-head)
@@ -245,6 +279,13 @@ bool pack_loss_scalars(const float* lossSum, const int* lossCount,
                        const int* correctCount, const int* validCount,
                        int* out);
 
+// Fused token-LM metrics reducer.
+// Computes cross-entropy NLL sum, valid-token count, argmax-correct count,
+// and writes the packed 4-scalar payload directly to out[4].
+bool collect_token_lm_metrics(const float* probs, const int* targets,
+                              int T, int vocabSize, int padToken,
+                              int* out);
+
 // ---------------------------------------------------------------------------
 // Gradient norm computation
 // ---------------------------------------------------------------------------
@@ -260,6 +301,7 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator);
 
 void device_memcpy_d2d(void* dst, const void* src, size_t bytes);
 void device_memcpy_h2d(void* dst, const void* src, size_t bytes);
+void device_memcpy_d2h(void* dst, const void* src, size_t bytes);
 void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spitch,
                            size_t width, size_t height);
 void device_memset_bytes(void* ptr, int value, size_t bytes);
@@ -306,10 +348,16 @@ inline bool embedding_gather(const float*, const int*, int, int, int, float*) { 
 inline bool embedding_scatter_add(float*, const int*, const float*, int, int, int) { return false; }
 
 inline bool adam_update(float*, const float*, float*, float*, float, float, float, float, float, float, int, int) { return false; }
-inline bool adam_update_batch(float**, float**, float**, float**, const float*, const float*, const int*, int, float, float, float, float, int, int) { return false; }
+inline bool adam_update_batch(float**, float**, float**, float**,
+                              const float*, const float*, float, const float*,
+                              const int*, int,
+                              float**, float**, float**, float**, float**, float**, const int*, const int*,
+                              float, float, float, float, int, int) { return false; }
 
 inline bool flash_attention_forward(const float*, const float*, const float*, int, int, int, bool, float*) { return false; }
 inline bool flash_attention_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, bool, float*, float*, float*) { return false; }
+inline bool flash_attention_multihead_forward(const float*, const float*, const float*, int, int, int, int, int, int, bool, float*) { return false; }
+inline bool flash_attention_multihead_backward(const float*, const float*, const float*, const float*, const float*, int, int, int, int, int, int, bool, float*, float*, float*) { return false; }
 
 inline bool reduce_rows_sum(const float*, int, int, float, float*) { return false; }
 inline bool causal_mask_softmax_inplace(float*, int, int) { return false; }
@@ -326,6 +374,7 @@ inline bool sum_squared_accumulate(const float*, int, float*) { return false; }
 
 inline void device_memcpy_d2d(void*, const void*, size_t) {}
 inline void device_memcpy_h2d(void*, const void*, size_t) {}
+inline void device_memcpy_d2h(void*, const void*, size_t) {}
 inline void device_memcpy_2d_d2d(void*, size_t, const void*, size_t, size_t, size_t) {}
 inline void device_memset_bytes(void*, int, size_t) {}
 

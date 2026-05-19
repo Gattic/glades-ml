@@ -1,14 +1,14 @@
 // TokenInput: minimal token-id sequence DataInput for language modeling.
 //
 // Format:
-// - import(path) reads a text file where each line is a sequence of integer token ids.
-// - Tokens are whitespace-separated.
-// - Each line becomes one sequence span in DataInput.
+// - import(path) accepts either a token file or a directory containing train.tok/test.tok.
+// - Tokens are whitespace-separated integer token ids.
+// - Each imported line or table row becomes one sequence span in DataInput.
 //
 // Semantics:
 // - Token IDs are stored as first-class signed integers (int).
-// - Feature rows are exposed as a single float containing the token id (derived view for API compatibility).
-// - Expected rows are exposed as a single float containing the next-token id (derived view).
+// - Legacy float-row APIs are unsupported; token callers must use the token-id accessors below.
+// - Expected outputs are token ids, not dense probability vectors.
 // - For each sequence, targets are the next token in-sequence.
 //   - If padTokenId >= 0: the final timestep's expected token is padTokenId (so LM loss can ignore it).
 //   - If padTokenId < 0: the final timestep is not emitted (avoids negative expected token ids).
@@ -32,7 +32,13 @@ public:
 	void setPadTokenId(int id) { padTokenId = id; }
 	int getPadTokenId() const { return padTokenId; }
 
+	// Optional compatibility knob for callers that explicitly want a single imported split
+	// to be mirrored into the test split. Disabled by default so train/test semantics stay honest.
+	void setMirrorTrainToTestOnImplicitSplit(bool enabled) { mirrorTrainToTestOnImplicitSplit = enabled; }
+	bool getMirrorTrainToTestOnImplicitSplit() const { return mirrorTrainToTestOnImplicitSplit; }
+
 	// DataInput API
+	// Import replaces any previously loaded token data.
 	virtual void import(shmea::GString, int = 0);
 	virtual void import(const shmea::GTable&, int = 0);
 
@@ -41,17 +47,16 @@ public:
 	virtual shmea::GVector<float> getTestRow(unsigned int) const;
 	virtual shmea::GVector<float> getTestExpectedRow(unsigned int) const;
 
-	// View APIs:
-	// - For compatibility with the legacy float-based DataInput contract, token ids are exposed
-	//   as a single float.
-	// - `outData` points to thread-local scratch storage and is valid until the next call to
-	//   *any* TokenInput row-view method on the same thread.
+	// Legacy float-row compatibility APIs. TokenInput does not materialize float feature rows;
+	// callers must use the token-id accessors below instead.
 	virtual bool getTrainRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
 	virtual bool getTrainExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
 	virtual bool getTestRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
 	virtual bool getTestExpectedRowView(unsigned int index, const float*& outData, unsigned int& outSize) const;
 
 	// Token-id accessors (first-class integers for token LMs).
+	virtual bool hasTokenIdInput() const { return true; }
+	virtual bool hasTokenIdExpectedOutput() const { return true; }
 	virtual bool getTrainTokenId(unsigned int index, int& outTokenId) const;
 	virtual bool getTrainExpectedTokenId(unsigned int index, int& outTokenId) const;
 	virtual bool getTestTokenId(unsigned int index, int& outTokenId) const;
@@ -76,6 +81,7 @@ public:
 private:
 	bool loaded;
 	int padTokenId;
+	bool mirrorTrainToTestOnImplicitSplit;
 
 	// Most recent import/load status. When loaded==false, this SHOULD describe why.
 	NNetworkStatus lastImportStatus;
@@ -92,7 +98,7 @@ private:
 	                             std::vector<int>& outNext,
 	                             std::vector<SequenceSpan>& outSeq,
 	                             unsigned int* outLineCount = NULL);
+	void clearLoadedData();
 };
 
 } // namespace glades
-

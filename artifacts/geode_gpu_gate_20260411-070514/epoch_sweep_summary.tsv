@@ -1,0 +1,17 @@
+benchmark	optimizer	epochs	train_s_mean	train_s_pm	tok_s_mean	tok_s_pm	train_nll_mean	train_nll_pm	test_nll_mean	test_nll_pm	status	logfile
+token-lm-document	adamw	1	0.07	0.06	91382.0	34132.2	5.29334	0.01359	5.10018	0.01226	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_adamw_e1.log
+token-lm-document	geode	1	0.15	0.06	35245.7	9309.0	5.27832	0.01617	5.09577	0.01746	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_geode_e1.log
+token-lm-document	adamw	2	0.11	0.06	96573.5	28925.4	4.86964	0.04319	4.84477	0.06242	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_adamw_e2.log
+token-lm-document	geode	2	0.28	0.07	34983.8	6197.8	4.86425	0.03005	4.87719	0.04156	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_geode_e2.log
+token-lm-document	adamw	3	0.16	0.06	98140.7	24902.5	4.47091	0.11728	4.70233	0.04246	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_adamw_e3.log
+token-lm-document	geode	3	0.39	0.06	36349.1	4763.1	4.47644	0.05736	4.73864	0.12209	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_geode_e3.log
+token-lm-document	adamw	4	0.20	0.06	100215.9	21309.5	3.89753	0.21123	4.60355	0.10246	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_adamw_e4.log
+token-lm-document	geode	4	0.52	0.06	35857.2	3550.3	3.90103	0.11424	4.69755	0.20119	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-document_geode_e4.log
+token-lm-corpus-large	adamw	1	0.12	0.07	74581.9	23559.1	5.82136	0.02439	6.34263	0.00611	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_adamw_e1.log
+token-lm-corpus-large	geode	1	0.26	0.07	29010.1	5703.3	5.82837	0.02641	6.34056	0.01631	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_geode_e1.log
+token-lm-corpus-large	adamw	2	0.20	0.07	77706.7	17834.4	5.00443	0.04802	6.23969	0.08227	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_adamw_e2.log
+token-lm-corpus-large	geode	2	0.48	0.07	30623.6	3769.7	5.03468	0.03840	6.33758	0.07722	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_geode_e2.log
+token-lm-corpus-large	adamw	3	0.28	0.07	80122.6	14763.1	4.25376	0.11039	6.31878	0.03415	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_adamw_e3.log
+token-lm-corpus-large	geode	3	0.70	0.07	31203.1	2832.9	4.30309	0.07677	6.39339	0.09490	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_geode_e3.log
+token-lm-corpus-large	adamw	4	0.36	0.07	81424.9	12380.9	3.38110	0.09179	6.46459	0.06767	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_adamw_e4.log
+token-lm-corpus-large	geode	4	0.90	0.07	32029.4	2220.3	3.49302	0.08030	6.53190	0.08914	ok	/home/robert/dev/glades-ml/artifacts/geode_gpu_gate_20260411-070514/raw/sweep_token-lm-corpus-large_geode_e4.log

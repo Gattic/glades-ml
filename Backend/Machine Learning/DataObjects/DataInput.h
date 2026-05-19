@@ -130,6 +130,7 @@ public:
 	// Semantics:
 	// - Return true and write outTokenId on success.
 	// - Return false if not supported or index out of range.
+	virtual bool hasTokenIdInput() const { return false; }
 	virtual bool getTrainTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
 	virtual bool getTrainExpectedTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
 	virtual bool getTestTokenId(unsigned int /*index*/, int& /*outTokenId*/) const { return false; }
@@ -637,7 +638,8 @@ inline bool DataInput::validateTrainRowShapes(unsigned int expectedFeatureCount,
                                               std::string* errMsg,
                                               unsigned int maxRowsToCheck) const
 {
-	if (expectedFeatureCount == 0u)
+	const bool tokenIdInput = hasTokenIdInput();
+	if (expectedFeatureCount == 0u && !tokenIdInput)
 	{
 		if (errMsg) *errMsg = "expectedFeatureCount is 0";
 		return false;
@@ -656,7 +658,7 @@ inline bool DataInput::validateTrainRowShapes(unsigned int expectedFeatureCount,
 	}
 
 	// O(1) validation for fixed-shape inputs.
-	if (hasFixedTrainRowSize())
+	if (!tokenIdInput && hasFixedTrainRowSize())
 	{
 		const unsigned int n = getFixedTrainRowSize();
 		if (n < expectedFeatureCount)
@@ -691,7 +693,7 @@ inline bool DataInput::validateTrainRowShapes(unsigned int expectedFeatureCount,
 
 	// If either fixed-size contract is missing, do a bounded materialization check.
 	// Skip expected-output checks for token-ID datasets (training loop uses token-ID accessors).
-	if (!(hasFixedTrainRowSize() && (hasFixedTrainExpectedRowSize() || hasTokenIdExpectedOutput())))
+	if (!tokenIdInput && !(hasFixedTrainRowSize() && (hasFixedTrainExpectedRowSize() || hasTokenIdExpectedOutput())))
 	{
 		const unsigned int wantChecks = (maxRowsToCheck == 0u ? 1u : maxRowsToCheck);
 		const unsigned int checks = (trainSize < wantChecks ? trainSize : wantChecks);
@@ -746,7 +748,8 @@ inline bool DataInput::validateTestRowShapes(unsigned int expectedFeatureCount,
                                              std::string* errMsg,
                                              unsigned int maxRowsToCheck) const
 {
-	if (expectedFeatureCount == 0u)
+	const bool tokenIdInput = hasTokenIdInput();
+	if (expectedFeatureCount == 0u && !tokenIdInput)
 	{
 		if (errMsg) *errMsg = "expectedFeatureCount is 0";
 		return false;
@@ -765,7 +768,7 @@ inline bool DataInput::validateTestRowShapes(unsigned int expectedFeatureCount,
 	}
 
 	// O(1) validation for fixed-shape inputs.
-	if (hasFixedTestRowSize())
+	if (!tokenIdInput && hasFixedTestRowSize())
 	{
 		const unsigned int n = getFixedTestRowSize();
 		if (n < expectedFeatureCount)
@@ -800,7 +803,7 @@ inline bool DataInput::validateTestRowShapes(unsigned int expectedFeatureCount,
 
 	// If either fixed-size contract is missing, do a bounded materialization check.
 	// Skip expected-output checks for token-ID datasets (training loop uses token-ID accessors).
-	if (!(hasFixedTestRowSize() && (hasFixedTestExpectedRowSize() || hasTokenIdExpectedOutput())))
+	if (!tokenIdInput && !(hasFixedTestRowSize() && (hasFixedTestExpectedRowSize() || hasTokenIdExpectedOutput())))
 	{
 		const unsigned int wantChecks = (maxRowsToCheck == 0u ? 1u : maxRowsToCheck);
 		const unsigned int checks = (testSize < wantChecks ? testSize : wantChecks);

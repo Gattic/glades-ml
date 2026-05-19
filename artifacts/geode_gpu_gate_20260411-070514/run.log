@@ -1,0 +1,42 @@
+[run] 00_nvidia_smi
+$ nvidia-smi
+[run] 01_build_main
+$ cmake --build /home/robert/dev/glades-ml/build -j4
+[run] 02_build_tests
+$ cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests
+[run] 03_atlas_controller
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-controller
+[run] 04_smoke_geode_gpu
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_geode_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 2 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_geode_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 2 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 3 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_geode_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 3 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 4 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_geode_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 4 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_geode_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 2 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_geode_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 2 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 3 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_geode_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 3 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 4 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_geode_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 4 --repeats 5 --variant geode --rank 8 --gpu-enable 1 --gpu-device 0

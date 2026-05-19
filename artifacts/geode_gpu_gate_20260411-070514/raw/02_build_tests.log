@@ -1,0 +1,11 @@
+$ cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests
+[ 90%] Built target PCATests
+[ 93%] Linking CUDA device code CMakeFiles/glades-unit-tests.dir/cmake_device_link.o
+nvlink warning : Skipping incompatible '/lib/x86_64-linux-gnu/libpthread.a' when searching for -lpthread
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/libpthread.a' when searching for -lpthread
+nvlink warning : Skipping incompatible '/lib/x86_64-linux-gnu/librt.a' when searching for -lrt
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/librt.a' when searching for -lrt
+nvlink warning : Skipping incompatible '/lib/x86_64-linux-gnu/libdl.a' when searching for -ldl
+nvlink warning : Skipping incompatible '/usr/lib/x86_64-linux-gnu/libdl.a' when searching for -ldl
+[ 95%] Linking CXX executable glades-unit-tests
+[100%] Built target glades-unit-tests

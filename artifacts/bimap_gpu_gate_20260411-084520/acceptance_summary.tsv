@@ -1,0 +1,9 @@
+benchmark	optimizer	train_s_mean	train_s_pm	tok_s_mean	tok_s_pm	train_nll_mean	train_nll_pm	test_nll_mean	test_nll_pm	status	logfile
+token-lm-document	adamw	0.10	0.06	101418.5	23191.3	4.86877	0.03113	4.87531	0.05549	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-document_adamw.log
+token-lm-document	bimap_lite	0.69	0.01	13336.5	206.6	4.87084	0.02345	4.73995	0.03700	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-document_bimap_lite.log
+token-lm-document	bimap_v2_0	0.72	0.00	12829.1	86.2	4.87418	0.02329	4.74647	0.03648	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-document_bimap_v2_0.log
+token-lm-document	bimap_v2	0.76	0.00	12197.0	26.2	4.87084	0.02345	4.73995	0.03700	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-document_bimap_v2.log
+token-lm-corpus-large	adamw	0.19	0.07	81710.1	15524.3	5.01692	0.04060	6.29585	0.07842	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-corpus-large_adamw.log
+token-lm-corpus-large	bimap_lite	2.05	0.02	7003.2	75.1	4.97700	0.04345	6.27656	0.08591	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-corpus-large_bimap_lite.log
+token-lm-corpus-large	bimap_v2_0	2.06	0.01	6970.7	44.4	4.98299	0.04284	6.28066	0.08327	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-corpus-large_bimap_v2_0.log
+token-lm-corpus-large	bimap_v2	2.21	0.01	6493.6	37.8	4.97700	0.04345	6.27656	0.08591	ok	/home/robert/dev/glades-ml/artifacts/bimap_gpu_gate_20260411-084520/raw/accept_token-lm-corpus-large_bimap_v2.log

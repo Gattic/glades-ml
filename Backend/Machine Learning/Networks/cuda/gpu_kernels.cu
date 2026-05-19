@@ -7,6 +7,7 @@
 // Requirements: CUDA 11+, SM 6.0+.
 
 #include "gpu_kernels.h"
+#include "gpu_device.h"
 
 #ifdef GLADES_HAVE_CUDA
 
@@ -182,7 +183,7 @@ bool layernorm_forward(const float* x, const float* gamma, const float* beta,
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
-	layernorm_forward_rows<<<rows, block, smemBytes>>>(
+	layernorm_forward_rows<<<rows, block, smemBytes, computeStream()>>>(
 		x, gamma, beta, eps, cols, out, mean, invStd);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -296,14 +297,14 @@ bool layernorm_backward(const float* dout, const float* x,
 	// Kernel 1: dx (one block per row).
 	int block1 = rowBlockSize(cols);
 	int smemBytes1 = (block1 / 32 + 2) * 2 * sizeof(float);
-	layernorm_backward_dx<<<rows, block1, smemBytes1>>>(
+	layernorm_backward_dx<<<rows, block1, smemBytes1, computeStream()>>>(
 		dout, x, gamma, mean, invStd, cols, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
 	// Kernel 2: dgamma/dbeta (one block per column, reduce across rows).
 	int block2 = rowBlockSize(rows);
 	int smemBytes2 = (block2 / 32 + 2) * 2 * sizeof(float);
-	layernorm_backward_dgamma_dbeta<<<cols, block2, smemBytes2>>>(
+	layernorm_backward_dgamma_dbeta<<<cols, block2, smemBytes2, computeStream()>>>(
 		dout, x, mean, invStd, rows, cols, dgamma, dbeta);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
@@ -354,7 +355,7 @@ bool rmsnorm_forward(const float* x, const float* gamma, float eps,
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 1) * sizeof(float);
-	rmsnorm_forward_rows<<<rows, block, smemBytes>>>(
+	rmsnorm_forward_rows<<<rows, block, smemBytes, computeStream()>>>(
 		x, gamma, eps, cols, out, invRms);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -436,14 +437,14 @@ bool rmsnorm_backward(const float* dout, const float* x,
 	// Kernel 1: dx (one block per row).
 	int block1 = rowBlockSize(cols);
 	int smemBytes1 = (block1 / 32 + 1) * sizeof(float);
-	rmsnorm_backward_dx<<<rows, block1, smemBytes1>>>(
+	rmsnorm_backward_dx<<<rows, block1, smemBytes1, computeStream()>>>(
 		dout, x, gamma, invRms, cols, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
 	// Kernel 2: dgamma (one block per column, reduce across rows).
 	int block2 = rowBlockSize(rows);
 	int smemBytes2 = (block2 / 32 + 1) * sizeof(float);
-	rmsnorm_backward_dgamma<<<cols, block2, smemBytes2>>>(
+	rmsnorm_backward_dgamma<<<cols, block2, smemBytes2, computeStream()>>>(
 		dout, x, invRms, rows, cols, dgamma);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 
@@ -505,7 +506,7 @@ bool softmax_forward(const float* x, int rows, int cols, float* out)
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
 	int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
-	softmax_stable_rows<<<rows, block, smemBytes>>>(x, cols, out);
+	softmax_stable_rows<<<rows, block, smemBytes, computeStream()>>>(x, cols, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -540,7 +541,7 @@ bool softmax_cross_entropy_bwd(const float* probs, const int* targets,
 {
 	if (rows <= 0 || cols <= 0) return true;
 	int block = rowBlockSize(cols);
-	softmax_cross_entropy_backward<<<rows, block>>>(probs, targets, cols, dlogits);
+	softmax_cross_entropy_backward<<<rows, block, 0, computeStream()>>>(probs, targets, cols, dlogits);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -596,7 +597,7 @@ bool gelu_forward(const float* x, int n, float* out)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	gelu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	gelu_forward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -605,7 +606,7 @@ bool gelu_backward(const float* dout, const float* x, int n, float* dx)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	gelu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	gelu_backward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dout, x, n, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -650,7 +651,7 @@ bool silu_forward(const float* x, int n, float* out)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	silu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	silu_forward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -659,7 +660,7 @@ bool silu_backward(const float* dout, const float* x, int n, float* dx)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	silu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	silu_backward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dout, x, n, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -693,7 +694,7 @@ bool relu_forward(const float* x, int n, float* out)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	relu_forward_kernel<<<grid, kBlockElem>>>(x, n, out);
+	relu_forward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -702,7 +703,7 @@ bool relu_backward(const float* dout, const float* x, int n, float* dx)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	relu_backward_kernel<<<grid, kBlockElem>>>(dout, x, n, dx);
+	relu_backward_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dout, x, n, dx);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -770,7 +771,7 @@ bool swiglu_forward(const float* gate_up, int n, int dFF, float* out)
 	if (n <= 0 || dFF <= 0) return true;
 	int total = n * dFF;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	swiglu_fwd<<<grid, kBlockElem>>>(gate_up, n, dFF, out);
+	swiglu_fwd<<<grid, kBlockElem, 0, computeStream()>>>(gate_up, n, dFF, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -781,7 +782,7 @@ bool swiglu_backward(const float* dout, const float* gate_up,
 	if (n <= 0 || dFF <= 0) return true;
 	int total = n * dFF;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	swiglu_bwd<<<grid, kBlockElem>>>(dout, gate_up, n, dFF, d_gate_up);
+	swiglu_bwd<<<grid, kBlockElem, 0, computeStream()>>>(dout, gate_up, n, dFF, d_gate_up);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -830,7 +831,7 @@ bool rope_apply(float* x, const float* invFreq,
 	int hd = (halfDim > 0 && halfDim <= dHead / 2) ? halfDim : (dHead / 2);
 	int total = T * nHeads * hd;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	rope_apply_inplace<<<grid, kBlockElem>>>(x, invFreq, T, nHeads, dHead, hd, inverse);
+	rope_apply_inplace<<<grid, kBlockElem, 0, computeStream()>>>(x, invFreq, T, nHeads, dHead, hd, inverse);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -889,7 +890,7 @@ bool rope_apply_qk(float* Q, float* K, const float* invFreq,
 	int maxTotal = (totalQ > totalK) ? totalQ : totalK;
 	int gridX = (maxTotal + kBlockElem - 1) / kBlockElem;
 	dim3 grid(gridX, 2);
-	rope_apply_qk_kernel<<<grid, kBlockElem>>>(Q, K, invFreq, T, nQHeads, nKVHeads,
+	rope_apply_qk_kernel<<<grid, kBlockElem, 0, computeStream()>>>(Q, K, invFreq, T, nQHeads, nKVHeads,
 	                                            dHead, hd, inverse, totalQ, totalK);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -937,7 +938,7 @@ bool add_bias(float* out, const float* bias, int rows, int cols)
 	if (rows <= 0 || cols <= 0) return true;
 	int total = rows * cols;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	add_bias_kernel<<<grid, kBlockElem>>>(out, bias, rows, cols);
+	add_bias_kernel<<<grid, kBlockElem, 0, computeStream()>>>(out, bias, rows, cols);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -946,7 +947,7 @@ bool add_residual(float* out, const float* residual, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	add_residual_kernel<<<grid, kBlockElem>>>(out, residual, n);
+	add_residual_kernel<<<grid, kBlockElem, 0, computeStream()>>>(out, residual, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -955,7 +956,7 @@ bool axpy(float alpha, const float* x, float* y, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	axpy_kernel<<<grid, kBlockElem>>>(alpha, x, y, n);
+	axpy_kernel<<<grid, kBlockElem, 0, computeStream()>>>(alpha, x, y, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -978,7 +979,7 @@ bool add_two(float* out, const float* a, const float* b, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	add_two_kernel<<<grid, kBlockElem>>>(a, b, n, out);
+	add_two_kernel<<<grid, kBlockElem, 0, computeStream()>>>(a, b, n, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -995,7 +996,7 @@ bool scale_array(float* x, float scale, int n)
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	scale_array_kernel<<<grid, kBlockElem>>>(x, scale, n);
+	scale_array_kernel<<<grid, kBlockElem, 0, computeStream()>>>(x, scale, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1047,7 +1048,7 @@ bool embedding_gather(const float* E, const int* tokenIds,
 
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	embedding_gather_kernel<<<grid, kBlockElem>>>(E, tokenIds, T, vocabSize, dModel, out);
+	embedding_gather_kernel<<<grid, kBlockElem, 0, computeStream()>>>(E, tokenIds, T, vocabSize, dModel, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1059,7 +1060,7 @@ bool embedding_scatter_add(float* dE, const int* tokenIds,
 	if (T <= 0 || dModel <= 0) return true;
 	int total = T * dModel;
 	int grid = (total + kBlockElem - 1) / kBlockElem;
-	embedding_scatter_add_kernel<<<grid, kBlockElem>>>(dE, tokenIds, dout, T, vocabSize, dModel);
+	embedding_scatter_add_kernel<<<grid, kBlockElem, 0, computeStream()>>>(dE, tokenIds, dout, T, vocabSize, dModel);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1111,7 +1112,7 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 {
 	if (n <= 0) return true;
 	int grid = (n + kBlockElem - 1) / kBlockElem;
-	adam_update_kernel<<<grid, kBlockElem>>>(
+	adam_update_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
 		param, grad, m, v, lr, beta1, beta2, eps, weightDecay, gradScale, step, n);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -1121,14 +1122,136 @@ bool adam_update(float* param, const float* grad, float* m, float* v,
 // Each block handles one element range within one parameter group.
 namespace {
 
+__global__ void adam_group_scale_batch_kernel(
+    float** __restrict__ params,
+    float** __restrict__ grads,
+    float** __restrict__ ms,
+    float** __restrict__ vs,
+    float* __restrict__ groupScales,
+    float* __restrict__ prevStepRms,
+    const int* __restrict__ sizes,
+    float beta1, float beta2, float eps,
+    float gradScale, int step, int groupCount,
+    unsigned int minGroupSize,
+    float stabilityScale, float snrScale, float ratioScale,
+    float minScale, float maxScale)
+{
+	int grp = blockIdx.x;
+	if (grp >= groupCount)
+		return;
+
+	const int n = sizes[grp];
+	if (n <= 0)
+		return;
+	if (static_cast<unsigned int>(n) < minGroupSize)
+	{
+		if (threadIdx.x == 0)
+			groupScales[grp] = 1.0f;
+		return;
+	}
+
+	float* param = params[grp];
+	float* grad = grads[grp];
+	float* m_arr = ms[grp];
+	float* v_arr = vs[grp];
+
+	__shared__ float sharedStepSq[8];
+	__shared__ float sharedWeightSq[8];
+	__shared__ float sharedMHatSq[8];
+	__shared__ float sharedVHat[8];
+
+	float stepSq = 0.0f;
+	float weightSq = 0.0f;
+	float mHatSq = 0.0f;
+	float vHatSum = 0.0f;
+
+	const float bc1 = 1.0f - powf(beta1, (float)step);
+	const float bc2 = 1.0f - powf(beta2, (float)step);
+	for (int idx = threadIdx.x; idx < n; idx += blockDim.x)
+	{
+		const float g = grad[idx] * gradScale;
+		const float m_new = beta1 * m_arr[idx] + (1.0f - beta1) * g;
+		const float v_new = beta2 * v_arr[idx] + (1.0f - beta2) * g * g;
+		const float m_hat = m_new / bc1;
+		const float v_hat = v_new / bc2;
+		const float denom = sqrtf(v_hat) + eps;
+		const float stepVal = m_hat / denom;
+		stepSq += stepVal * stepVal;
+		const float w = param[idx];
+		weightSq += w * w;
+		mHatSq += m_hat * m_hat;
+		vHatSum += v_hat;
+	}
+
+	stepSq = blockReduceSum(stepSq, sharedStepSq);
+	weightSq = blockReduceSum(weightSq, sharedWeightSq);
+	mHatSq = blockReduceSum(mHatSq, sharedMHatSq);
+	vHatSum = blockReduceSum(vHatSum, sharedVHat);
+
+	if (threadIdx.x == 0)
+	{
+		const float invN = 1.0f / static_cast<float>(n);
+		const float stepRms = sqrtf(fmaxf(stepSq * invN, 0.0f));
+		const float weightRms = sqrtf(fmaxf(weightSq * invN, 0.0f));
+		const float snr = (mHatSq * invN) / ((vHatSum * invN) + eps);
+		const float prev = prevStepRms[grp];
+		const float stability = (prev > 0.0f)
+		    ? (fminf(stepRms, prev) / (fmaxf(stepRms, prev) + eps))
+		    : 1.0f;
+		const float updateRatio = stepRms / (weightRms + eps);
+		float scale = 1.0f
+		    + stabilityScale * stability
+		    + snrScale * log1pf(fmaxf(snr, 0.0f))
+		    - ratioScale * updateRatio;
+		scale = fminf(maxScale, fmaxf(minScale, scale));
+		groupScales[grp] = scale;
+		prevStepRms[grp] = stepRms;
+	}
+}
+
+} // anonymous namespace
+
+bool adam_group_scale_batch(float** d_params, float** d_grads,
+                            float** d_ms, float** d_vs,
+                            float* d_groupScales, float* d_groupPrevStepRms,
+                            const int* d_sizes,
+                            float beta1, float beta2, float eps,
+                            float gradScale, int step, int groupCount,
+                            unsigned int minGroupSize,
+                            float stabilityScale, float snrScale, float ratioScale,
+                            float minScale, float maxScale)
+{
+	if (groupCount <= 0)
+		return true;
+	adam_group_scale_batch_kernel<<<groupCount, kBlockElem, 0, computeStream()>>>(
+	    d_params, d_grads, d_ms, d_vs,
+	    d_groupScales, d_groupPrevStepRms, d_sizes,
+	    beta1, beta2, eps, gradScale, step, groupCount,
+	    minGroupSize, stabilityScale, snrScale, ratioScale, minScale, maxScale);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
+
 __global__ void adam_update_batch_kernel(
     float** __restrict__ params,
     float** __restrict__ grads,
     float** __restrict__ ms,
     float** __restrict__ vs,
-    const float* __restrict__ lrs,
+    const float* __restrict__ baseLrs,
     const float* __restrict__ wds,
+    float lrScale,
+    const float* __restrict__ stepScales,
     const int* __restrict__ sizes,
+    float** __restrict__ rowMetrics,
+    float** __restrict__ colMetrics,
+    float** __restrict__ rowStructMetrics,
+    float** __restrict__ colStructMetrics,
+    float** __restrict__ prevMhats,
+    float** __restrict__ metricScratch,
+    const int* __restrict__ metricRows,
+    const int* __restrict__ metricCols,
     float beta1, float beta2, float eps,
     float gradScale, int step, int groupCount)
 {
@@ -1143,8 +1266,27 @@ __global__ void adam_update_batch_kernel(
 	float* grad = grads[grp];
 	float* m_arr = ms[grp];
 	float* v_arr = vs[grp];
-	float lr = lrs[grp];
+	const float baseLr = baseLrs[grp] * lrScale;
+	float lr = baseLr * (stepScales ? stepScales[grp] : 1.0f);
 	float weightDecay = wds[grp];
+	float* rowMetric = rowMetrics ? rowMetrics[grp] : NULL;
+	float* colMetric = colMetrics ? colMetrics[grp] : NULL;
+	float* rowStructMetric = rowStructMetrics ? rowStructMetrics[grp] : NULL;
+	float* colStructMetric = colStructMetrics ? colStructMetrics[grp] : NULL;
+	float* prevMhat = prevMhats ? prevMhats[grp] : NULL;
+	float* metricStats = metricScratch ? metricScratch[grp] : NULL;
+	const int rows = metricRows ? metricRows[grp] : 0;
+	const int cols = metricCols ? metricCols[grp] : 0;
+	const bool useMatrixMetric =
+	    rowMetric && colMetric && rows > 0 && cols > 0 && (rows * cols) == n;
+	const float predictiveWeight =
+	    (useMatrixMetric && prevMhat && metricStats && step > 1)
+	        ? fmaxf(metricStats[9], 0.0f)
+	        : 0.0f;
+	const float structuralWeight =
+	    (useMatrixMetric && metricStats) ? fmaxf(metricStats[10], 0.0f) : 0.0f;
+	const float baseWeight =
+	    useMatrixMetric ? fmaxf(0.0f, 1.0f - predictiveWeight - structuralWeight) : 1.0f;
 
 	float g = grad[idx] * gradScale;
 
@@ -1160,24 +1302,68 @@ __global__ void adam_update_batch_kernel(
 	float bc2 = 1.0f - powf(beta2, (float)step);
 	float m_hat = m_new / bc1;
 	float v_hat = v_new / bc2;
-
-	param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+	float predictiveMhat = m_hat;
+	if (predictiveWeight > 0.0f)
+	{
+		float delta = m_hat - prevMhat[idx];
+		const float deltaCap = 0.5f * (fabsf(m_hat) + eps);
+		if (delta > deltaCap)
+			delta = deltaCap;
+		else if (delta < -deltaCap)
+			delta = -deltaCap;
+		predictiveMhat += delta;
+	}
+	const float diagInv = 1.0f / (sqrtf(v_hat) + eps);
+	if (prevMhat)
+		prevMhat[idx] = m_hat;
+	if (useMatrixMetric)
+	{
+		const int row = idx / cols;
+		const int col = idx - row * cols;
+		const float baseMetric = rowMetric[row] * colMetric[col];
+		const float structMetric =
+		    (rowStructMetric && colStructMetric)
+		        ? (rowStructMetric[row] * colStructMetric[col])
+		        : baseMetric;
+		const float baseStep = m_hat * diagInv * baseMetric;
+		const float predictiveStep = predictiveMhat * diagInv * baseMetric;
+		const float structuralStep = m_hat * diagInv * structMetric;
+		const float stepVal =
+		    baseWeight * baseStep
+		    + predictiveWeight * predictiveStep
+		    + structuralWeight * structuralStep;
+		param[idx] -= lr * stepVal;
+		grad[idx] = 0.0f;
+		return;
+	}
+	const float stepVal = m_hat * diagInv;
+	param[idx] -= lr * stepVal;
 }
 
 } // anonymous namespace
 
 bool adam_update_batch(float** d_params, float** d_grads,
                        float** d_ms, float** d_vs,
-                       const float* d_lrs, const float* d_wds,
+                       const float* d_baseLrs, const float* d_wds,
+                       float lrScale,
+                       const float* d_stepScales,
                        const int* d_sizes, int maxSize,
+                       float** d_rowMetrics, float** d_colMetrics,
+                       float** d_rowStructMetrics, float** d_colStructMetrics,
+                       float** d_prevMhats, float** d_metricScratch,
+                       const int* d_metricRows, const int* d_metricCols,
                        float beta1, float beta2, float eps,
                        float gradScale, int step, int groupCount)
 {
 	if (groupCount <= 0) return true;
 	int gridX = (maxSize + kBlockElem - 1) / kBlockElem;
 	dim3 grid(gridX, groupCount);
-	adam_update_batch_kernel<<<grid, kBlockElem>>>(
-		d_params, d_grads, d_ms, d_vs, d_lrs, d_wds, d_sizes,
+	adam_update_batch_kernel<<<grid, kBlockElem, 0, computeStream()>>>(
+		d_params, d_grads, d_ms, d_vs,
+		d_baseLrs, d_wds, lrScale, d_stepScales, d_sizes,
+		d_rowMetrics, d_colMetrics, d_rowStructMetrics, d_colStructMetrics,
+		d_prevMhats, d_metricScratch,
+		d_metricRows, d_metricCols,
 		beta1, beta2, eps, gradScale, step, groupCount);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -1222,7 +1408,7 @@ bool reduce_rows_sum(const float* input, int rows, int cols,
     if (rows <= 0 || cols <= 0) return true;
     int block = rowBlockSize(rows);
     int smemBytes = (block / 32 + 1) * sizeof(float);
-    reduce_rows_sum_kernel<<<cols, block, smemBytes>>>(input, rows, cols, beta, out);
+    reduce_rows_sum_kernel<<<cols, block, smemBytes, computeStream()>>>(input, rows, cols, beta, out);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1292,7 +1478,7 @@ bool causal_mask_softmax_inplace(float* S, int batchSize, int T)
     int totalRows = batchSize * T;
     int block = rowBlockSize(T);
     int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
-    causal_mask_softmax_kernel<<<totalRows, block, smemBytes>>>(S, T);
+    causal_mask_softmax_kernel<<<totalRows, block, smemBytes, computeStream()>>>(S, T);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1349,7 +1535,7 @@ bool softmax_backward_attn(const float* P, const float* dP,
     int totalRows = batchSize * T;
     int block = rowBlockSize(T);
     int smemBytes = (block / 32 + 1) * sizeof(float);
-    softmax_backward_attn_kernel<<<totalRows, block, smemBytes>>>(P, dP, T, outputScale, dS);
+    softmax_backward_attn_kernel<<<totalRows, block, smemBytes, computeStream()>>>(P, dP, T, outputScale, dS);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1409,7 +1595,7 @@ bool cross_entropy_nll_loss(const float* probs, const int* targets,
     int grid = 1;
     if (T > 256) { grid = (T + block - 1) / block; if (grid > 128) grid = 128; }
     int smemBytes = (block / 32 + 2) * sizeof(float) + (block / 32 + 2) * sizeof(int);
-    cross_entropy_nll_kernel<<<grid, block, smemBytes>>>(
+    cross_entropy_nll_kernel<<<grid, block, smemBytes, computeStream()>>>(
         probs, targets, T, vocabSize, padToken, loss_sum, valid_count);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
@@ -1473,193 +1659,178 @@ bool argmax_count_matches(const float* probs, const int* targets,
     int grid = (T + block - 1) / block;
     if (grid > 128) grid = 128;
     int smemBytes = (block / 32 + 1) * sizeof(float);
-    argmax_count_kernel<<<grid, block, smemBytes>>>(
+    argmax_count_kernel<<<grid, block, smemBytes, computeStream()>>>(
         probs, targets, T, vocabSize, padToken, correct_count, valid_count);
     GLADES_CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
 // ===========================================================================
-//  16. Flash attention (simplified, single-head)
+//  16. Flash attention (packed multi-head / GQA)
 // ===========================================================================
 //
-// Forward:
-//   O[T, dV] = softmax(Q K^T / sqrt(dK)) * V,  with optional causal mask.
+// Training path:
+// - Q[T, dModel]
+// - K[T, dModelKV]
+// - V[T, dModelKV]
+// - O[T, dModel]
 //
-// Strategy: one block per query row q.  Iterate over key/value blocks (tiles)
-// in shared memory.  For each tile we load a [Bc, dK] chunk of K and a
-// [Bc, dV] chunk of V into shared memory, compute the local attention scores,
-// and use the online softmax trick to accumulate O without materialising the
-// full T*T attention matrix.
+// Heads are packed contiguously inside the feature dimension. For GQA,
+// multiple query heads map to the same KV head.
 //
-// Bc (key tile size) = blockDim.x (threads in the block also serve as the
-// tile width -- each thread owns one key row inside the tile).
+// Strategy: one block per (query row, query head). Iterate over K/V tiles
+// held in shared memory, update the output row with online softmax, and never
+// materialize a [T,T] score/probability matrix.
 
 namespace {
 
 // Tile size for keys/values loaded into shared memory.
 static constexpr int kFlashTile = 64;
 
-// Forward kernel.  One block per query row.
+// Forward kernel. One block per (query row, query head).
 // Shared memory layout:
 //   float sK[kFlashTile * dK]   -- tile of keys
 //   float sV[kFlashTile * dV]   -- tile of values
 // Passed as dynamic shared memory.
-__global__ void flash_attention_fwd_kernel(const float* __restrict__ Q,
-                                           const float* __restrict__ K,
-                                           const float* __restrict__ V,
-                                           int T, int dK, int dV,
-                                           int causal,
-                                           float* __restrict__ O)
+__global__ void flash_attention_fwd_multihead_kernel(const float* __restrict__ Q,
+                                                     const float* __restrict__ K,
+                                                     const float* __restrict__ V,
+                                                     int T, int nHeads, int nKVHeads,
+                                                     int dHead, int dModel, int dModelKV,
+                                                     int causal,
+                                                     float* __restrict__ O)
 {
-	int q = blockIdx.x;  // query row index
-	if (q >= T) return;
+	const int q = static_cast<int>(blockIdx.x);
+	const int h = static_cast<int>(blockIdx.y);
+	if (q >= T || h >= nHeads) return;
 
 	extern __shared__ float smem[];
-	float* sK = smem;                          // [kFlashTile, dK]
-	float* sV = smem + kFlashTile * dK;        // [kFlashTile, dV]
+	float* sK = smem;                             // [kFlashTile, dHead]
+	float* sV = smem + kFlashTile * dHead;        // [kFlashTile, dHead]
 
-	const float* qRow = Q + (size_t)q * dK;
+	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
+	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
+
+	const float* qRow = Q + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	float* oRow = O + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 
 	// Online softmax state.
 	float runMax = -FLT_MAX;
 	float runSum = 0.0f;
 
-	// Accumulator for output row (in registers, length dV).
-	// We store the accumulator in global memory via O at the end.
-	// For moderate dV we keep it in a local array; for large dV we iterate.
-	// Here we use a loop that reads/writes to O directly (initialized to 0).
-	float* oRow = O + (size_t)q * dV;
-	for (int d = threadIdx.x; d < dV; d += blockDim.x)
+	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
 		oRow[d] = 0.0f;
 	__syncthreads();
 
-	float scale = rsqrtf((float)dK);
+	const float scale = rsqrtf(static_cast<float>(dHead));
 
-	int numTiles = (T + kFlashTile - 1) / kFlashTile;
+	const int numTiles = (T + kFlashTile - 1) / kFlashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		int kStart = tile * kFlashTile;
+		const int kStart = tile * kFlashTile;
 		int tileLen = kFlashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
-		// Cooperatively load sK[tileLen, dK] and sV[tileLen, dV].
-		int loadCount = tileLen * dK;
+		// Cooperatively load sK[tileLen, dHead] and sV[tileLen, dHead].
+		const int loadCount = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
-			int kr = i / dK;
-			int kd = i % dK;
-			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
-		int loadCountV = tileLen * dV;
+		const int loadCountV = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
-			int vr = i / dV;
-			int vd = i % dV;
-			sV[i] = V[(size_t)(kStart + vr) * dV + vd];
+			const int vr = i / dHead;
+			const int vd = i % dHead;
+			sV[i] = V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd];
 		}
 		__syncthreads();
 
-		// Compute attention scores for this tile and update online softmax.
-		// Because dK can be large (64-128) we let thread 0 do the serial work
-		// for clarity.  A production kernel would parallelise this differently
-		// (e.g. one warp per query).
-
-		// Each thread handles a subset of keys in the tile.
-		// Accumulate partial max / sum / weighted V over the tile.
 		for (int j = 0; j < tileLen; ++j) {
-			int kIdx = kStart + j;
+			const int kIdx = kStart + j;
 
-			// Causal mask: skip keys with index > query index.
 			if (causal && kIdx > q) break;
 
-			// Dot product Q[q,:] . K[kIdx,:].
 			float dot = 0.0f;
-			for (int d = 0; d < dK; ++d)
-				dot += qRow[d] * sK[j * dK + d];
+			for (int d = 0; d < dHead; ++d)
+				dot += qRow[d] * sK[j * dHead + d];
 			dot *= scale;
 
-			// Online softmax update (single-threaded per block on thread 0).
-			// We serialise this loop per key within the tile; the loop body
-			// is O(dV) work, parallelised across threads below.
-			// To keep the code simple and correct, we let all threads
-			// compute the same dot above but only thread 0 decides the max/sum.
-			// Then we broadcast.
-
-			// All threads see dot (same value because they all read qRow and sK).
-			float prevMax = runMax;
+			const float prevMax = runMax;
 			if (dot > runMax) runMax = dot;
-			float exp_prev = expf(prevMax - runMax);
-			float exp_cur  = expf(dot - runMax);
+			const float exp_prev = expf(prevMax - runMax);
+			const float exp_cur  = expf(dot - runMax);
 
-			// Rescale running sum and accumulator.
 			runSum = runSum * exp_prev + exp_cur;
 
-			// Update oRow: oRow = oRow * exp_prev + exp_cur * V[j,:]
-			for (int d = threadIdx.x; d < dV; d += blockDim.x)
-				oRow[d] = oRow[d] * exp_prev + exp_cur * sV[j * dV + d];
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				oRow[d] = oRow[d] * exp_prev + exp_cur * sV[j * dHead + d];
 		}
 
 		__syncthreads();
 	}
 
-	// Final normalisation: oRow /= runSum.
-	float invSum = (runSum > 0.0f) ? (1.0f / runSum) : 0.0f;
-	for (int d = threadIdx.x; d < dV; d += blockDim.x)
+	const float invSum = (runSum > 0.0f) ? (1.0f / runSum) : 0.0f;
+	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
 		oRow[d] *= invSum;
 }
 
-// Backward kernel.  One block per query row.
+// Backward kernel. One block per (query row, query head).
 // Recomputes attention on the fly (flash-style) to avoid storing the T*T matrix.
-__global__ void flash_attention_bwd_kernel(const float* __restrict__ Q,
-                                           const float* __restrict__ K,
-                                           const float* __restrict__ V,
-                                           const float* __restrict__ O,
-                                           const float* __restrict__ dO,
-                                           int T, int dK, int dV,
-                                           int causal,
-                                           float* __restrict__ dQ,
-                                           float* __restrict__ dK_out,
-                                           float* __restrict__ dV_out)
+__global__ void flash_attention_bwd_multihead_kernel(const float* __restrict__ Q,
+                                                     const float* __restrict__ K,
+                                                     const float* __restrict__ V,
+                                                     const float* __restrict__ O,
+                                                     const float* __restrict__ dO,
+                                                     int T, int nHeads, int nKVHeads,
+                                                     int dHead, int dModel, int dModelKV,
+                                                     int causal,
+                                                     float* __restrict__ dQ,
+                                                     float* __restrict__ dK_out,
+                                                     float* __restrict__ dV_out)
 {
-	int q = blockIdx.x;
-	if (q >= T) return;
+	const int q = static_cast<int>(blockIdx.x);
+	const int h = static_cast<int>(blockIdx.y);
+	if (q >= T || h >= nHeads) return;
 
 	extern __shared__ float smem[];
-	float* sK = smem;                        // [kFlashTile, dK]
-	float* sV = smem + kFlashTile * dK;      // [kFlashTile, dV]
+	float* sK = smem;                           // [kFlashTile, dHead]
+	float* sV = smem + kFlashTile * dHead;      // [kFlashTile, dHead]
 
-	const float* qRow  = Q  + (size_t)q * dK;
-	const float* oRow  = O  + (size_t)q * dV;
-	const float* doRow = dO + (size_t)q * dV;
-	float* dqRow       = dQ + (size_t)q * dK;
+	const int groupSize = (nKVHeads > 0) ? (nHeads / nKVHeads) : 1;
+	const int kvHead = (nKVHeads == nHeads) ? h : (groupSize > 0 ? (h / groupSize) : 0);
 
-	float scale = rsqrtf((float)dK);
+	const float* qRow  = Q  + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	const float* oRow  = O  + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	const float* doRow = dO + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
+	float* dqRow       = dQ + static_cast<size_t>(q) * dModel + static_cast<size_t>(h) * dHead;
 
-	// First pass: recompute softmax statistics (online max, sum).
+	const float scale = rsqrtf(static_cast<float>(dHead));
+
 	float runMax = -FLT_MAX;
 	float runSum = 0.0f;
 
-	int numTiles = (T + kFlashTile - 1) / kFlashTile;
+	const int numTiles = (T + kFlashTile - 1) / kFlashTile;
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		int kStart = tile * kFlashTile;
+		const int kStart = tile * kFlashTile;
 		int tileLen = kFlashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
-		// Load K tile into shared memory.
-		int loadCount = tileLen * dK;
+		const int loadCount = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
-			int kr = i / dK;
-			int kd = i % dK;
-			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
 		__syncthreads();
 
 		for (int j = 0; j < tileLen; ++j) {
-			int kIdx = kStart + j;
+			const int kIdx = kStart + j;
 			if (causal && kIdx > q) break;
 			float dot = 0.0f;
-			for (int d = 0; d < dK; ++d)
-				dot += qRow[d] * sK[j * dK + d];
+			for (int d = 0; d < dHead; ++d)
+				dot += qRow[d] * sK[j * dHead + d];
 			dot *= scale;
 			if (dot > runMax) {
 				runSum = runSum * expf(runMax - dot);
@@ -1670,67 +1841,60 @@ __global__ void flash_attention_bwd_kernel(const float* __restrict__ Q,
 		__syncthreads();
 	}
 
-	float logSumExp = runMax + logf(runSum + 1e-20f);
+	const float logSumExp = runMax + logf(runSum + 1e-20f);
 
-	// Compute D = sum_d  dO[q,d] * O[q,d]  (needed for backward formula).
 	float D = 0.0f;
-	for (int d = 0; d < dV; ++d)
+	for (int d = 0; d < dHead; ++d)
 		D += doRow[d] * oRow[d];
 
-	// Second pass: compute gradients.
-	// Initialise dQ row to zero.
-	for (int d = threadIdx.x; d < dK; d += blockDim.x)
+	for (int d = threadIdx.x; d < dHead; d += blockDim.x)
 		dqRow[d] = 0.0f;
 	__syncthreads();
 
 	for (int tile = 0; tile < numTiles; ++tile) {
-		int kStart = tile * kFlashTile;
+		const int kStart = tile * kFlashTile;
 		int tileLen = kFlashTile;
 		if (kStart + tileLen > T) tileLen = T - kStart;
 
-		// Load K and V tiles.
-		int loadCount = tileLen * dK;
+		const int loadCount = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCount; i += blockDim.x) {
-			int kr = i / dK;
-			int kd = i % dK;
-			sK[i] = K[(size_t)(kStart + kr) * dK + kd];
+			const int kr = i / dHead;
+			const int kd = i % dHead;
+			sK[i] = K[static_cast<size_t>(kStart + kr) * dModelKV + static_cast<size_t>(kvHead) * dHead + kd];
 		}
-		int loadCountV = tileLen * dV;
+		const int loadCountV = tileLen * dHead;
 		for (int i = threadIdx.x; i < loadCountV; i += blockDim.x) {
-			int vr = i / dV;
-			int vd = i % dV;
-			sV[i] = V[(size_t)(kStart + vr) * dV + vd];
+			const int vr = i / dHead;
+			const int vd = i % dHead;
+			sV[i] = V[static_cast<size_t>(kStart + vr) * dModelKV + static_cast<size_t>(kvHead) * dHead + vd];
 		}
 		__syncthreads();
 
 		for (int j = 0; j < tileLen; ++j) {
-			int kIdx = kStart + j;
+			const int kIdx = kStart + j;
 			if (causal && kIdx > q) break;
 
-			// Recompute attention weight p = softmax score.
 			float dot = 0.0f;
-			for (int d = 0; d < dK; ++d)
-				dot += qRow[d] * sK[j * dK + d];
+			for (int d = 0; d < dHead; ++d)
+				dot += qRow[d] * sK[j * dHead + d];
 			dot *= scale;
-			float p = expf(dot - logSumExp);
+			const float p = expf(dot - logSumExp);
 
-			// ds = p * (dO . V[kIdx] - D)
 			float doV = 0.0f;
-			for (int d = 0; d < dV; ++d)
-				doV += doRow[d] * sV[j * dV + d];
-			float ds = p * (doV - D);
+			for (int d = 0; d < dHead; ++d)
+				doV += doRow[d] * sV[j * dHead + d];
+			const float ds = p * (doV - D);
 
-			// dQ[q,:] += ds * scale * K[kIdx,:]
-			for (int d = threadIdx.x; d < dK; d += blockDim.x)
-				dqRow[d] += ds * scale * sK[j * dK + d];
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				dqRow[d] += ds * scale * sK[j * dHead + d];
 
-			// dK[kIdx,:] += ds * scale * Q[q,:]  (atomic across query blocks)
-			for (int d = threadIdx.x; d < dK; d += blockDim.x)
-				atomicAdd(&dK_out[(size_t)kIdx * dK + d], ds * scale * qRow[d]);
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				atomicAdd(&dK_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
+				          ds * scale * qRow[d]);
 
-			// dV[kIdx,:] += p * dO[q,:]  (atomic across query blocks)
-			for (int d = threadIdx.x; d < dV; d += blockDim.x)
-				atomicAdd(&dV_out[(size_t)kIdx * dV + d], p * doRow[d]);
+			for (int d = threadIdx.x; d < dHead; d += blockDim.x)
+				atomicAdd(&dV_out[static_cast<size_t>(kIdx) * dModelKV + static_cast<size_t>(kvHead) * dHead + d],
+				          p * doRow[d]);
 		}
 		__syncthreads();
 	}
@@ -1742,18 +1906,8 @@ bool flash_attention_forward(const float* Q, const float* K, const float* V,
                              int T, int dK, int dV, bool causal,
                              float* O)
 {
-	if (T <= 0 || dK <= 0 || dV <= 0) return true;
-
-	int block = kFlashTile;  // threads per block
-	if (block > kMaxBlockRow) block = kMaxBlockRow;
-
-	// Shared memory: sK[kFlashTile * dK] + sV[kFlashTile * dV].
-	size_t smemBytes = (size_t)kFlashTile * (dK + dV) * sizeof(float);
-
-	flash_attention_fwd_kernel<<<T, block, smemBytes>>>(
-		Q, K, V, T, dK, dV, causal ? 1 : 0, O);
-	GLADES_CUDA_CHECK(cudaGetLastError());
-	return true;
+	if (dK != dV) return false;
+	return flash_attention_multihead_forward(Q, K, V, T, 1, 1, dK, dK, dK, causal, O);
 }
 
 bool flash_attention_backward(const float* Q, const float* K, const float* V,
@@ -1761,19 +1915,52 @@ bool flash_attention_backward(const float* Q, const float* K, const float* V,
                               int T, int dK, int dV, bool causal,
                               float* dQ, float* dK_out, float* dV_out)
 {
-	if (T <= 0 || dK <= 0 || dV <= 0) return true;
+	if (dK != dV) return false;
+	return flash_attention_multihead_backward(Q, K, V, O, dO, T, 1, 1, dK, dK, dK, causal,
+	                                          dQ, dK_out, dV_out);
+}
 
-	// Zero dK_out and dV_out because the kernel accumulates with atomicAdd.
-	GLADES_CUDA_CHECK(cudaMemset(dK_out, 0, (size_t)T * dK * sizeof(float)));
-	GLADES_CUDA_CHECK(cudaMemset(dV_out, 0, (size_t)T * dV * sizeof(float)));
+bool flash_attention_multihead_forward(const float* Q, const float* K, const float* V,
+                                       int T, int nHeads, int nKVHeads,
+                                       int dHead, int dModel, int dModelKV,
+                                       bool causal, float* O)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
+		return true;
 
 	int block = kFlashTile;
 	if (block > kMaxBlockRow) block = kMaxBlockRow;
 
-	size_t smemBytes = (size_t)kFlashTile * (dK + dV) * sizeof(float);
+	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
+	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
 
-	flash_attention_bwd_kernel<<<T, block, smemBytes>>>(
-		Q, K, V, O, dO, T, dK, dV, causal ? 1 : 0,
+	flash_attention_fwd_multihead_kernel<<<grid, block, smemBytes, computeStream()>>>(
+		Q, K, V, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0, O);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+bool flash_attention_multihead_backward(const float* Q, const float* K, const float* V,
+                                        const float* O, const float* dO,
+                                        int T, int nHeads, int nKVHeads,
+                                        int dHead, int dModel, int dModelKV,
+                                        bool causal,
+                                        float* dQ, float* dK_out, float* dV_out)
+{
+	if (T <= 0 || nHeads <= 0 || nKVHeads <= 0 || dHead <= 0 || dModel <= 0 || dModelKV <= 0)
+		return true;
+
+	GLADES_CUDA_CHECK(cudaMemset(dK_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
+	GLADES_CUDA_CHECK(cudaMemset(dV_out, 0, static_cast<size_t>(T) * static_cast<size_t>(dModelKV) * sizeof(float)));
+
+	int block = kFlashTile;
+	if (block > kMaxBlockRow) block = kMaxBlockRow;
+
+	const dim3 grid(static_cast<unsigned int>(T), static_cast<unsigned int>(nHeads), 1u);
+	const size_t smemBytes = static_cast<size_t>(kFlashTile) * static_cast<size_t>(2 * dHead) * sizeof(float);
+
+	flash_attention_bwd_multihead_kernel<<<grid, block, smemBytes, computeStream()>>>(
+		Q, K, V, O, dO, T, nHeads, nKVHeads, dHead, dModel, dModelKV, causal ? 1 : 0,
 		dQ, dK_out, dV_out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
@@ -1897,7 +2084,7 @@ bool kv_attention_incremental(const float* Q,
 	if (block > kMaxBlockRow) block = kMaxBlockRow;
 	size_t smemBytes = (size_t)block * sizeof(float);
 
-	kv_attn_incremental_kernel<<<nHeads, block, smemBytes>>>(
+	kv_attn_incremental_kernel<<<nHeads, block, smemBytes, computeStream()>>>(
 		Q, K_cache, V_cache, scores_scratch, keyValid,
 		nHeads, nKVHeads, dHead, dModelKV, maxLen, pos,
 		invSqrt, out);
@@ -1911,23 +2098,28 @@ bool kv_attention_incremental(const float* Q,
 
 void device_memcpy_d2d(void* dst, const void* src, size_t bytes)
 {
-	cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+	cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, computeStream());
 }
 
 void device_memcpy_h2d(void* dst, const void* src, size_t bytes)
 {
-	cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+	cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, transferStream());
+}
+
+void device_memcpy_d2h(void* dst, const void* src, size_t bytes)
+{
+	cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, transferStream());
 }
 
 void device_memcpy_2d_d2d(void* dst, size_t dpitch, const void* src, size_t spitch,
                            size_t width, size_t height)
 {
-	cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
+	cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, computeStream());
 }
 
 void device_memset_bytes(void* ptr, int value, size_t bytes)
 {
-	cudaMemset(ptr, value, bytes);
+	cudaMemsetAsync(ptr, value, bytes, computeStream());
 }
 
 // ===========================================================================
@@ -1952,7 +2144,7 @@ __global__ void zero_multi_buffers_kernel(float** __restrict__ ptrs,
 bool zero_buffers_batch(float** d_ptrs, const int* d_sizes, int count)
 {
 	if (count <= 0) return true;
-	zero_multi_buffers_kernel<<<count, 256>>>(d_ptrs, d_sizes);
+	zero_multi_buffers_kernel<<<count, 256, 0, computeStream()>>>(d_ptrs, d_sizes);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -1986,7 +2178,99 @@ bool pack_loss_scalars(const float* lossSum, const int* lossCount,
                        const int* correctCount, const int* validCount,
                        int* out)
 {
-	pack_loss_scalars_kernel<<<1, 1>>>(lossSum, lossCount, correctCount, validCount, out);
+	pack_loss_scalars_kernel<<<1, 1, 0, computeStream()>>>(lossSum, lossCount, correctCount, validCount, out);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+namespace {
+
+__global__ void collect_token_lm_metrics_kernel(const float* __restrict__ probs,
+                                                const int* __restrict__ targets,
+                                                int T, int vocabSize, int padToken,
+                                                int* __restrict__ out)
+{
+	extern __shared__ float smem[];
+	float* sLoss = smem;
+	float* sValid = sLoss + blockDim.x;
+	float* sCorrect = sValid + blockDim.x;
+
+	float localLoss = 0.0f;
+	float localValid = 0.0f;
+	float localCorrect = 0.0f;
+
+	for (int t = threadIdx.x; t < T; t += blockDim.x)
+	{
+		const int tgt = targets[t];
+		if (padToken >= 0 && tgt == padToken)
+			continue;
+		if (tgt < 0 || tgt >= vocabSize)
+			continue;
+
+		const float* row = probs + static_cast<size_t>(t) * vocabSize;
+		float p = row[tgt];
+		if (p < 1e-12f)
+			p = 1e-12f;
+		localLoss += -logf(p);
+		localValid += 1.0f;
+
+		int bestIdx = 0;
+		float bestVal = row[0];
+		for (int v = 1; v < vocabSize; ++v)
+		{
+			if (row[v] > bestVal)
+			{
+				bestVal = row[v];
+				bestIdx = v;
+			}
+		}
+		if (bestIdx == tgt)
+			localCorrect += 1.0f;
+	}
+
+	sLoss[threadIdx.x] = localLoss;
+	sValid[threadIdx.x] = localValid;
+	sCorrect[threadIdx.x] = localCorrect;
+	__syncthreads();
+
+	for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+	{
+		if (threadIdx.x < stride)
+		{
+			sLoss[threadIdx.x] += sLoss[threadIdx.x + stride];
+			sValid[threadIdx.x] += sValid[threadIdx.x + stride];
+			sCorrect[threadIdx.x] += sCorrect[threadIdx.x + stride];
+		}
+		__syncthreads();
+	}
+
+	if (threadIdx.x == 0)
+	{
+		union
+		{
+			float f;
+			int i;
+		} lossBits;
+		lossBits.f = sLoss[0];
+		out[0] = lossBits.i;
+		out[1] = static_cast<int>(sValid[0]);
+		out[2] = static_cast<int>(sCorrect[0]);
+		out[3] = static_cast<int>(sValid[0]);
+	}
+}
+
+} // anonymous namespace
+
+bool collect_token_lm_metrics(const float* probs, const int* targets,
+                              int T, int vocabSize, int padToken,
+                              int* out)
+{
+	if (T <= 0 || vocabSize <= 0)
+		return true;
+	const int block = 256;
+	const int smemBytes = 3 * block * static_cast<int>(sizeof(float));
+	collect_token_lm_metrics_kernel<<<1, block, smemBytes, computeStream()>>>(
+	    probs, targets, T, vocabSize, padToken, out);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }
@@ -2022,7 +2306,7 @@ bool sum_squared_accumulate(const float* data, int n, float* d_accumulator)
 	int grid = (n + block - 1) / block;
 	if (grid > 256) grid = 256;
 	int smemBytes = ((block / 32) + 1) * sizeof(float);
-	sum_sq_kernel<<<grid, block, smemBytes>>>(data, n, d_accumulator);
+	sum_sq_kernel<<<grid, block, smemBytes, computeStream()>>>(data, n, d_accumulator);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
 }

@@ -1,0 +1,3 @@
+$ cmake --build /home/robert/dev/glades-ml/unit-tests/build -j4 --target glades-unit-tests
+[ 90%] Built target PCATests
+[100%] Built target glades-unit-tests

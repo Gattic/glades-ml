@@ -10,3 +10,6 @@ alpaca.key
 .claude/
 include/
 .worktrees/
+.codex
+logs/
+artifacts/

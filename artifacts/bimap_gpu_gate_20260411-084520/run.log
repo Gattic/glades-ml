@@ -1,0 +1,82 @@
+[run] 04_smoke_bimap_gpu
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm --token-epochs 1 --repeats 1 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_lite_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_0_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 1 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 2 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_lite_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 2 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_0_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 2 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 2 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 3 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_lite_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 3 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_0_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 3 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 3 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_adamw_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 4 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_lite_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 4 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_0_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 4 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-document_bimap_v2_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --token-epochs 4 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_lite_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_0_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_e1
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 1 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 2 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_lite_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 2 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_0_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 2 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_e2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 2 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 3 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_lite_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 3 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_0_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 3 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_e3
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 3 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_adamw_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 4 --repeats 5 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_lite_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 4 --repeats 5 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_0_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 4 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] sweep_token-lm-corpus-large_bimap_v2_e4
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --token-epochs 4 --repeats 5 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-document_adamw
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-document_bimap_lite
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-document_bimap_v2_0
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-document_bimap_v2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-document --repeats 10 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-corpus-large_adamw
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant adamw --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-corpus-large_bimap_lite
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant bimap --atlas-bimap-low-rank 0 --atlas-bimap-factor-cadence 1 --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-corpus-large_bimap_v2_0
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-predictive-scale 0 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
+[run] accept_token-lm-corpus-large_bimap_v2
+$ /home/robert/dev/glades-ml/unit-tests/build/glades-unit-tests atlas-alt-bench --mode token-lm-corpus-large --repeats 10 --variant bimap --atlas-bimap-low-rank 1 --rank 8 --atlas-bimap-factor-cadence 8 --gpu-enable 1 --gpu-device 0
