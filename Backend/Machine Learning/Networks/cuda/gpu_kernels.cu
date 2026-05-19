@@ -7891,6 +7891,83 @@ __global__ void scfa_depthwise_causal_conv_fwd_kernel(
 	y[(size_t)t * (size_t)m + (size_t)c] = acc;
 }
 
+// iter 73 (2026-05-19): shared-memory tiled variant.  Each block processes
+// N_OUT consecutive output rows × COLS_PER_BLOCK columns.  Cooperatively
+// loads (N_OUT + w) input rows + the column-local filter slice into shared
+// memory, eliminating L2 thrashing on x reads (current 1-thread-per-output
+// kernel has ~81% L2 hit but still wastes ~600 µs / call on misses).
+// Math: bit-identical to the row-major kernel above — same K*x accumulation
+// order with the same break-on-negative-src termination.
+// Template params: COLS_PER_BLOCK=256, N_OUT=16, W_FILTER=w+1 (=9 at w=8).
+// Static shared mem at N_OUT=16: x_smem 24 rows × 256 × 4 = 24 KB +
+//   K_smem 256 × 9 × 4 = 9 KB = 33 KB total — fits in the 48 KB default
+//   per-block static shared mem limit on Ada (sm_8.9).
+template<int COLS_PER_BLOCK, int N_OUT, int W_FILTER>
+__global__ void scfa_depthwise_causal_conv_fwd_tiled_kernel(
+    const float* __restrict__ x,    // [T, m]
+    const float* __restrict__ K,    // [m, W_FILTER]
+    int T, int m,
+    float* __restrict__ y)          // [T, m]
+{
+	const int t_base = blockIdx.y * N_OUT;
+	const int c = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+	const int w = W_FILTER - 1;
+	const int X_ROWS = N_OUT + W_FILTER - 1;   // = N_OUT + w
+
+	__shared__ float x_smem[N_OUT + W_FILTER - 1][COLS_PER_BLOCK];
+	__shared__ float K_smem[COLS_PER_BLOCK][W_FILTER];
+
+	// Load filter: each thread loads its own column's W_FILTER weights.
+	if (c < m) {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = K[(size_t)c * (size_t)W_FILTER + (size_t)i];
+		}
+	} else {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = 0.0f;
+		}
+	}
+
+	// Load x rows: each thread loads X_ROWS rows for its column.
+	// Row k in smem corresponds to global row t_base - w + k.
+	if (c < m) {
+		#pragma unroll
+		for (int k = 0; k < X_ROWS; ++k) {
+			const int t_in = t_base - w + k;
+			x_smem[k][threadIdx.x] = (t_in >= 0 && t_in < T)
+			    ? x[(size_t)t_in * (size_t)m + (size_t)c]
+			    : 0.0f;
+		}
+	} else {
+		#pragma unroll
+		for (int k = 0; k < X_ROWS; ++k) {
+			x_smem[k][threadIdx.x] = 0.0f;
+		}
+	}
+	__syncthreads();
+
+	if (c >= m) return;
+
+	// Compute N_OUT outputs for this column.
+	#pragma unroll
+	for (int dt = 0; dt < N_OUT; ++dt) {
+		const int t_out = t_base + dt;
+		if (t_out >= T) return;
+
+		float acc = 0.0f;
+		// Loop unroll w/ break semantics matching the legacy kernel:
+		// for (i = 0; i <= w; ++i) if (t_out - i < 0) break; else acc += K*x
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			if (t_out - i < 0) break;
+			acc += K_smem[threadIdx.x][i] * x_smem[w + dt - i][threadIdx.x];
+		}
+		y[(size_t)t_out * (size_t)m + (size_t)c] = acc;
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
@@ -7901,6 +7978,34 @@ bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
 	int block = 256;
 	dim3 grid((m + block - 1) / block, T);
 	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	scfa_depthwise_causal_conv_fwd_kernel<<<grid, block, 0, s>>>(
+	    x, K, T, m, w, y);
+	GLADES_CUDA_CHECK(cudaGetLastError());
+	return true;
+}
+
+// iter 73 (2026-05-19): tiled-kernel dispatch.  Falls back to the row-major
+// kernel above when w differs from the templated W_FILTER-1.  Default w=8
+// in CHIRON's --scfa-conv-half-width is the templated path.
+bool scfa_depthwise_causal_conv_fwd_tiled(const float* x, const float* K,
+                                            int T, int m, int w, float* y,
+                                            cudaStream_t stream)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	if (w == 8) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_depthwise_causal_conv_fwd_tiled_kernel<COLS, N_OUT, 9>
+		    <<<grid, block, 0, s>>>(x, K, T, m, y);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
+	// Fallback to row-major kernel for non-default w.
+	int block = 256;
+	dim3 grid((m + block - 1) / block, T);
 	scfa_depthwise_causal_conv_fwd_kernel<<<grid, block, 0, s>>>(
 	    x, K, T, m, w, y);
 	GLADES_CUDA_CHECK(cudaGetLastError());

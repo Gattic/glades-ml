@@ -220,6 +220,16 @@ bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
                                      int T, int m, int w, float* y,
                                      cudaStream_t stream = 0);
 
+// iter 73 (2026-05-19): shared-memory tiled variant of conv fwd.  Each block
+// processes N_OUT=32 output rows × COLS_PER_BLOCK=256 columns; loads x rows
+// + filter slice into smem once and reuses across N_OUT outputs.  Eliminates
+// L2 thrashing on x reads.  Bit-identical math to the row-major kernel
+// (same K*x accumulation order, same break-on-negative-src termination).
+// Falls back to the row-major kernel when w != 8 (templated W_FILTER=9).
+bool scfa_depthwise_causal_conv_fwd_tiled(const float* x, const float* K,
+                                            int T, int m, int w, float* y,
+                                            cudaStream_t stream = 0);
+
 // Backward through depthwise causal conv.
 //   dx[t, c] += Σ_{i=0..w, t+i<T} K[c, i] · dy[t+i, c]
 //   dK[c, i] += Σ_{t=i..T-1}     x[t-i, c]    · dy[t, c]
@@ -996,6 +1006,7 @@ inline bool orion_perturb_col_int8(float*, const float*, const void*, const floa
 inline bool orion_perturb_col_int8_bf16w(void*, const float*, const void*, const float*, int, int, float) { return false; }
 inline bool orion_perturb_col_int8_bf16w_bf16anchor(void*, const void*, const void*, const float*, int, int, float) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }
 
