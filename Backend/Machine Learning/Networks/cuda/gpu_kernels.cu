@@ -2769,6 +2769,13 @@ __global__ void causal_mask_softmax_kernel(float* __restrict__ S,
     float* sMax = smem;
     float* sSum = smem + (blockDim.x / 32 + 1);
 
+    // iter 83 (2026-05-20) NEGATIVE: tried to merge the mask-write pass with
+    // the row-max-find pass.  Benched at +0.15% wall (no improvement) AND
+    // NLL drift +0.147 nat with mid-train gradient explosion at step 91
+    // (||g||=11.275 vs baseline ~2-4).  Despite the math appearing identical,
+    // the merged-pass kernel produces unstable training trajectories — same
+    // FMA-emit/scheduler pattern as iter 70/73/74 but amplified.  Reverted.
+
     // Apply causal mask: set j > row to -FLT_MAX.
     for (int j = threadIdx.x; j < T; j += blockDim.x)
     {
