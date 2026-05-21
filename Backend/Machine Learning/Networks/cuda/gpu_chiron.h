@@ -481,6 +481,11 @@ bool flash_attention_cublas_tiled_bf16(
 // casts.  Caller sets this once at startup (e.g. trainer based on a CLI flag).
 // Default OFF.
 void set_iter118_fa_inner_fwd(bool on);
+// iter 119 (2026-05-21): BF16-input variant.  Casts Q/K/V to BF16 (using the
+// same scratch buffers as the cuBLAS pipeline) and runs the BF16 FA kernel
+// (still FP32 compute inside — no tensor cores).  Halves input memory
+// bandwidth via BF16 loads.  Default OFF.
+void set_iter119_fa_inner_bf16(bool on);
 
 // cuBLAS-tiled backward counterpart.  Given Q, K, V, O (unused, kept for
 // API symmetry), and the upstream gradient dO, produces dQ, dK, dV.
@@ -635,6 +640,7 @@ inline bool flash_attention_cublas_tiled_bf16(
     float*, float*,
     unsigned short*, unsigned short*, unsigned short*, unsigned short*) { return false; }
 inline void set_iter118_fa_inner_fwd(bool) {}
+inline void set_iter119_fa_inner_bf16(bool) {}
 inline bool chiron_attention_shear_bf16w_tiled(const float*, float*,
                                                  const unsigned short*, const unsigned short*,
                                                  const unsigned short*, const unsigned short*,

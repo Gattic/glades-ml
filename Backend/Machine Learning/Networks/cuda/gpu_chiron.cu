@@ -1585,11 +1585,23 @@ bool flash_attention_cublas_tiled(const float* Q, const float* K, const float* V
 
 namespace {
 static bool g_iter118_fa_inner_fwd = false;
+static bool g_iter119_fa_inner_bf16 = false;
 }
 
 void set_iter118_fa_inner_fwd(bool on)
 {
 	g_iter118_fa_inner_fwd = on;
+}
+
+// iter 119 (2026-05-21): BF16-input FA kernel.  Q/K/V are pre-cast to BF16
+// by the cuBLAS pipeline already (scratch_Qbf16/Kbf16/Vbf16); when this
+// toggle is on, we use those BF16 buffers directly with the BF16 FA kernel
+// (flash_attention_multihead_forward_bf16) instead of the cuBLAS+softmax+PV
+// pipeline.  Still FP32 compute inside the kernel (no tensor cores yet —
+// iter 120+ for MMA wmma path).
+void set_iter119_fa_inner_bf16(bool on)
+{
+	g_iter119_fa_inner_bf16 = on;
 }
 
 bool flash_attention_cublas_tiled_bf16(
@@ -1602,10 +1614,9 @@ bool flash_attention_cublas_tiled_bf16(
     unsigned short* scratch_Vbf16, unsigned short* scratch_Pbf16)
 {
 	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
-	// iter 118: drop-in FA kernel replaces cuBLAS+softmax+PV pipeline.
-	// FP32 compute, no BF16 casts (saves 3 cast launches + intermediate
-	// buffers).  Skips materializing scratch_S, scratch_*bf16 — but they
-	// remain allocated by the caller.
+	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
+	const size_t nPacked = static_cast<size_t>(T) * dModel;
+	// iter 118: drop-in FP32 FA kernel.  No BF16 casts; FP32 compute throughout.
 	if (g_iter118_fa_inner_fwd)
 	{
 		return flash_attention_multihead_forward(
@@ -1614,8 +1625,20 @@ bool flash_attention_cublas_tiled_bf16(
 		    dHead, dModel, /*dModelKV=*/dModel,
 		    causal, O);
 	}
-	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
-	const size_t nPacked = static_cast<size_t>(T) * dModel;
+	// iter 119: cast Q/K/V to BF16 (same as cuBLAS pipeline), then use the
+	// BF16-input FA kernel (still FP32 compute inside — no tensor cores yet).
+	// Compared to iter 118: halves input memory bandwidth via BF16 loads.
+	if (g_iter119_fa_inner_bf16)
+	{
+		if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPacked)) return false;
+		if (!cast_f32_to_bf16(K, scratch_Kbf16, nPacked)) return false;
+		if (!cast_f32_to_bf16(V, scratch_Vbf16, nPacked)) return false;
+		return flash_attention_multihead_forward_bf16(
+		    scratch_Qbf16, scratch_Kbf16, scratch_Vbf16,
+		    T, nHeads, /*nKVHeads=*/nHeads,
+		    dHead, dModel, /*dModelKV=*/dModel,
+		    causal, O);
+	}
 
 	// Cast Q/K/V once.
 	if (!cast_f32_to_bf16(Q, scratch_Qbf16, nPacked)) return false;
