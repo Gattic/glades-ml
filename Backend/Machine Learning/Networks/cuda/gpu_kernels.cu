@@ -8115,6 +8115,99 @@ __global__ void scfa_depthwise_causal_conv_fwd_sub_fused_tiled_kernel(
 	}
 }
 
+// iter 101 (2026-05-21): dual-output variant of the iter 97 fused-sub fwd
+// tiled kernel.  Reads (q, q_par), computes q_perp = q - q_par AT SMEM-LOAD
+// TIME, runs the tiled conv, and writes BOTH y_perp (main output) AND
+// q_perp (side output to a separate buffer).  Enables fusion at the BWD
+// recompute path (line ~7066 in scfa_attention_backward) where q_perp IS
+// needed downstream by the bwd_dwconv kernel (line ~7440) as forward input
+// for dK computation.
+// Math: q_perp_out[idx] = q[idx] - q_par[idx] (single FP32 sub, bit-identical
+// to chiron_scfa_sub_kernel).  y_perp output same as iter 97 fused kernel
+// (bit-identical FMA accumulation).  Eliminates BOTH the scfa_sub call AND
+// the conv kernel launch — savings concentrated in eliminated scfa_sub
+// (~650 µs per layer × 24 = ~16 ms/step ≈ 2.5% wall at production).
+// Cost: 1 extra global write per element (132 MB/layer × 24 = 3.2 GB/step
+// at ~700 GB/s = ~4.5 ms = 0.7% wall).  Net predicted: +1.5-2% wall.
+// Specialization match iter 97 kernel.
+template<int COLS_PER_BLOCK, int N_OUT, int W_FILTER>
+__global__ void scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ q_par,
+    const float* __restrict__ K,
+    int T, int m,
+    float* __restrict__ y,            // main output: y_perp = D(q - q_par)
+    float* __restrict__ q_perp_out)   // side output: q_perp = q - q_par
+{
+	const int t_base = blockIdx.y * N_OUT;
+	const int c = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+	const int w = W_FILTER - 1;
+	const int X_ROWS = N_OUT + W_FILTER - 1;
+
+	__shared__ float x_smem[N_OUT + W_FILTER - 1][COLS_PER_BLOCK];
+	__shared__ float K_smem[COLS_PER_BLOCK][W_FILTER];
+
+	if (c < m) {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = K[(size_t)c * (size_t)W_FILTER + (size_t)i];
+		}
+	} else {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = 0.0f;
+		}
+	}
+
+	// Fused smem load + q_perp materialization side write.
+	// Each (t_in, c) row is loaded by adjacent blocks for their tap-window,
+	// but only the block that "owns" the output at row t_in writes q_perp_out
+	// to global memory — avoiding double-write race.  Ownership: block at
+	// t_base owns rows [t_base, t_base + N_OUT - 1], which correspond to
+	// smem indices k in [w, w + N_OUT - 1].  Condition `k >= w` selects
+	// exactly the owned range; rows below (k < w) are halo loads written by
+	// the prior block.  Block 0 has no prior block but its k < w halo has
+	// t_in < 0 (filtered by t_in >= 0), so no special case needed.
+	if (c < m) {
+		#pragma unroll
+		for (int k = 0; k < X_ROWS; ++k) {
+			const int t_in = t_base - w + k;
+			if (t_in >= 0 && t_in < T) {
+				const size_t idx = (size_t)t_in * (size_t)m + (size_t)c;
+				const float q_perp_val = q[idx] - q_par[idx];
+				x_smem[k][threadIdx.x] = q_perp_val;
+				if (k >= w) {
+					q_perp_out[idx] = q_perp_val;
+				}
+			} else {
+				x_smem[k][threadIdx.x] = 0.0f;
+			}
+		}
+	} else {
+		#pragma unroll
+		for (int k = 0; k < X_ROWS; ++k) {
+			x_smem[k][threadIdx.x] = 0.0f;
+		}
+	}
+	__syncthreads();
+
+	if (c >= m) return;
+
+	#pragma unroll
+	for (int dt = 0; dt < N_OUT; ++dt) {
+		const int t_out = t_base + dt;
+		if (t_out >= T) return;
+
+		float acc = 0.0f;
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			if (t_out - i < 0) break;
+			acc += K_smem[threadIdx.x][i] * x_smem[w + dt - i][threadIdx.x];
+		}
+		y[(size_t)t_out * (size_t)m + (size_t)c] = acc;
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
@@ -8208,6 +8301,44 @@ bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(
 		return true;
 	}
 	// No fallback — caller must check w before dispatching here.
+	return false;
+}
+
+// iter 101 (2026-05-21): dual-output variant of iter 97 fused-sub fwd tile.
+// Same fused subtraction + tiled conv, but ALSO writes q_perp (= q - q_par)
+// to a separate global buffer as a side output.  Enables the bwd recompute
+// path to skip the explicit scfa_sub kernel while still materializing
+// scfa_qperp for the downstream bwd_dwconv (which reads it as forward input
+// for dK computation).  Specializes W_FILTER=5 (w=4) and W_FILTER=9 (w=8).
+bool scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled(
+    const float* q, const float* q_par, const float* K,
+    int T, int m, int w,
+    float* y,                // main output: y_perp = D(q - q_par)
+    float* q_perp_out,       // side output: q_perp = q - q_par
+    cudaStream_t stream)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	if (w == 4) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled_kernel<COLS, N_OUT, 5>
+		    <<<grid, block, 0, s>>>(q, q_par, K, T, m, y, q_perp_out);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
+	if (w == 8) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled_kernel<COLS, N_OUT, 9>
+		    <<<grid, block, 0, s>>>(q, q_par, K, T, m, y, q_perp_out);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
 	return false;
 }
 

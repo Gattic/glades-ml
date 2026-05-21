@@ -246,6 +246,18 @@ bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(
     const float* q, const float* q_par, const float* K,
     int T, int m, int w, float* y, cudaStream_t stream = 0);
 
+// iter 101 (2026-05-21): dual-output variant of iter 97 fused-sub fwd tile.
+// Same fused-sub conv but ALSO writes q_perp = q - q_par to a side output
+// buffer.  Enables fusion at the bwd recompute path (line ~7066 in
+// scfa_attention_backward) where q_perp materialization is needed for the
+// downstream bwd_dwconv (line ~7440) dK computation.  Specializes W_FILTER=5
+// (w=4) and W_FILTER=9 (w=8); returns false for other w.
+bool scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled(
+    const float* q, const float* q_par, const float* K,
+    int T, int m, int w,
+    float* y, float* q_perp_out,
+    cudaStream_t stream = 0);
+
 // Backward through depthwise causal conv.
 //   dx[t, c] += Σ_{i=0..w, t+i<T} K[c, i] · dy[t+i, c]
 //   dK[c, i] += Σ_{t=i..T-1}     x[t-i, c]    · dy[t, c]
@@ -1053,6 +1065,7 @@ inline bool orion_perturb_col_int8_bf16w_bf16anchor(void*, const void*, const vo
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(const float*, const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_fwd_sub_fused_dual_out_tiled(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_tiled(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_dual_out(const float*, const float*, const float*, int, int, int, float*, float*, float*, cudaStream_t = 0) { return false; }
