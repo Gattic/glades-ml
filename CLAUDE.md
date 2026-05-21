@@ -2,25 +2,42 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current Production Flagship — CHIRON 1B @ T=16384
+## Current Production Flagship — CHIRON 1B @ T=16384 (iter 94 triple-stack ship 2026-05-20)
 
-The current production LLM flagship is **CHIRON 1B** (checkpoint
-`chiron_1B_T16384.step30000`):
+The current production LLM flagship is **CHIRON 1B triple-stack**
+(checkpoint `chiron_1B_T16384_triple_phase2.final`):
 
 - **Shape**: m=2048, L=24, nH=16, dH=256, V=32000 BPE, T=16384 context.
 - **Params**: 870.94M (~"1B").
-- **Stack**: SCFA (spectral-compressed flash attention, ratio=16, k=1024) +
-  BF16 weights/grads/attn/logits-storage + int8-Adam + fuse-attn-reln. The
-  exact training flags are in `glades-trainer/research/run_postfix_experiments.sh`.
-- **Perf**: 20,108 tok/s @ T=16384, 13.22/15.56 GB VRAM (RTX 4080 SUPER 16 GB),
-  best val NLL 3.77 @ step 29341 / 30k steps / 491.5 M tokens trained.
-- **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship`.
+- **Stack**: SCFA (spectral-compressed flash attention, ratio=16, k=1024,
+  **conv-w=4** ← was 8 prior to iter 94) +
+  BF16 weights/grads/attn/logits-storage + int8-Adam + fuse-attn-reln +
+  **iter70-fused-axpy2-dual-p** (fused SCFA shear + BF16-p mirror cast) +
+  **iter73-dwconv-fwd-tiled** (shared-mem tiled depthwise backward) +
+  **scfa-checkpoint-inner-bf16** (BF16 7-tensor cache, 1.69 GB). The
+  exact training flags are in `glades-trainer/research/run_postfix_experiments.sh`;
+  these four are now code defaults in `chiron_main.cpp`.
+- **Perf**: **25,103 tok/s** @ T=16384 (was 20,108 pre-iter94, **+24.8%**),
+  13.22/15.56 GB VRAM (RTX 4080 SUPER 16 GB),
+  **final val NLL 4.20 @ step 30000** (apples-to-apples baseline at same
+  recipe gives 4.22; best EMA train loss ~3.80, comparable to prior 3.77).
+- **Reproduce training**: `cd ~/dev/glades-trainer && sh run.sh flagship`
+  (no extra flags needed — triple-stack is the default).
 - **Run inference**: `cd ~/dev/glades-trainer && sh runner.sh --flagship`.
-- **Full spec**: `research/FLAGSHIP_T16384_2026_05_14.md`.
+- **Full spec**: `research/FLAGSHIP_T16384_2026_05_14.md` (see "iter 94 ship"
+  section at bottom for triple-stack details).
+- **Phase 2 evidence**: `research/ITER94_30K_PHASE2_PASS.md` (apples-to-apples
+  30k retrain at production recipe; ship-clean PASS).
 - **Phase-3 program** (improving CHIRON 1B via novel research, no external
   libs / no external baselines): pre-registration in
   `research/PHASE3_GATE3A_PREREG.md`. Any new architecture work should
-  anchor on this flagship as the baseline.
+  anchor on the triple-stack flagship as the baseline.
+
+**Prior w=8 flagship** (`chiron_1B_T16384.step30000`, 20,108 tok/s, best EMA
+3.77) is documented in the same FLAGSHIP doc and archived as the Phase 2
+baseline at `database/checkpoints/chiron_1B_T16384_baseline_phase2/`. It is
+NOT loadable into the new flagship (filter dimensions differ at conv_w=4 vs
+prior 8 — math change requires retrain, which Phase 2 IS).
 
 The repository also contains a separate **CHIRON-stack research line** under
 `run.sh chiron --scale {66M..1.84B}` using FACE + MFIO + WIP + SAS + RLG +
