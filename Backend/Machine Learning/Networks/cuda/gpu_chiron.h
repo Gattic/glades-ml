@@ -412,7 +412,9 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     unsigned short* scratch_sdbf,
     float* sQ, float* sK, float* sV, float* sO,
     float* sdO, float* sdQ, float* sdK, float* sdV,
-    float* scratch_P, float* scratch_dP);
+    float* scratch_P, float* scratch_dP,
+    bool dw_beta_zero = false);  // iter 108: dW_bf cuBLAS beta (0=overwrite for
+                                  // single micro-batch; 1=accumulate for grad accum).
 
 // Tensor-core-backed shear backward.  Replaces flash_attention_multihead_backward
 // with flash_attention_backward_cublas_tiled.  Extra scratch: scratch_P and
@@ -663,7 +665,7 @@ inline bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     unsigned short*, unsigned short*,
     float*, float*, float*, float*,
     float*, float*, float*, float*,
-    float*, float*) { return false; }
+    float*, float*, bool = false) { return false; }
 inline bool flash_attention_backward_cublas_tiled(
     const float*, const float*, const float*,
     const float*, const float*,

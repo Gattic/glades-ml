@@ -1322,8 +1322,15 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
     unsigned short* scratch_sdbf,
     float* sQ, float* sK, float* sV, float* sO,
     float* sdO, float* sdQ, float* sdK, float* sdV,
-    float* scratch_P, float* scratch_dP)
+    float* scratch_P, float* scratch_dP,
+    bool dw_beta_zero)  // iter 108 FAIL: when true, dW_bf cuBLAS would use
+                          // beta=0 (overwrite).  Math was non-bit-identical at
+                          // production — NLL +0.5 nat drift.  Param retained
+                          // for API stability but dw_beta forced to 1.0f
+                          // (legacy behavior) regardless.
 {
+	(void)dw_beta_zero;  // iter 108 FAIL — param ignored, beta stays at 1.0f.
+	const float dw_beta = 1.0f;
 	if (T <= 0 || m <= 0 || dHead <= 0 || nHeads <= 0) return true;
 	const int dModel = nHeads * dHead;
 
@@ -1348,14 +1355,15 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	if (!sgemm_rowmajor_abt_bf16(T, dModel, m, 1.0f, scratch_qbf, m, Wo_bf, m, 0.0f, sdO, dModel))
 		return false;
 
-	// 4. dWo += sO^T · dp_new.  BF16-out: commits to persistent dWo_bf with
-	// beta=1 (caller zeroes dWo_bf at start of accum window).
+	// 4. dWo += sO^T · dp_new.  BF16-out: commits to persistent dWo_bf.
+	// iter 108: beta is dw_beta (0=overwrite when caller skips pre-zero
+	// for accumSteps==1, 1=accumulate for multi-micro-batch grad accum).
 	if (!cast_f32_to_bf16(sO, scratch_sdbf, static_cast<size_t>(T) * dModel))
 		return false;
 	if (!sgemm_rowmajor_atb_bf16_dst_bf16(dModel, m, T, 1.0f,
 	        scratch_sdbf, dModel,
 	        scratch_qbf, m,
-	        1.0f, dWo_bf, m))
+	        dw_beta, dWo_bf, m))
 		return false;
 
 	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
@@ -1371,14 +1379,16 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	if (!cast_f32_to_bf16(q, scratch_qbf, static_cast<size_t>(T) * m))
 		return false;
 
-	// 6+7 fused per direction.  dq accumulates FP32 (beta=1); dW_bf accumulates BF16 (beta=1).
+	// 6+7 fused per direction.  dq accumulates FP32 (beta=1 — cross-Q/K/V dq
+	// contributions sum into single dq buffer).  dW_bf uses dw_beta (iter 108:
+	// 0=overwrite for single micro-batch, 1=accumulate for grad accum).
 	// Q:
 	if (!cast_f32_to_bf16(sdQ, scratch_sdbf, static_cast<size_t>(T) * dModel))
 		return false;
 	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wq_bf, dModel, 1.0f, dq, m))
 		return false;
 	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
-	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWq_bf, dModel))
+	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWq_bf, dModel))
 		return false;
 	// K:
 	if (!cast_f32_to_bf16(sdK, scratch_sdbf, static_cast<size_t>(T) * dModel))
@@ -1386,7 +1396,7 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wk_bf, dModel, 1.0f, dq, m))
 		return false;
 	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
-	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWk_bf, dModel))
+	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWk_bf, dModel))
 		return false;
 	// V:
 	if (!cast_f32_to_bf16(sdV, scratch_sdbf, static_cast<size_t>(T) * dModel))
@@ -1394,7 +1404,7 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 	if (!sgemm_rowmajor_abt_bf16(T, m, dModel, 1.0f, scratch_sdbf, dModel, Wv_bf, dModel, 1.0f, dq, m))
 		return false;
 	if (!sgemm_rowmajor_atb_bf16_dst_bf16(m, dModel, T, 1.0f,
-	        scratch_qbf, m, scratch_sdbf, dModel, 1.0f, dWv_bf, dModel))
+	        scratch_qbf, m, scratch_sdbf, dModel, dw_beta, dWv_bf, dModel))
 		return false;
 	return true;
 }
