@@ -1252,9 +1252,9 @@ bool chiron_attention_shear_backward_bf16w_tiled(
 		return false;
 
 	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel, computeStream()));
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModel, computeStream()));
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModel, computeStream()));
+	// iter 107 (2026-05-21): flash_attention_backward_cublas_tiled now uses
+	// beta=0 (overwrite) for dV/dQ/dK — caller pre-zero is redundant.  Skipping
+	// the 3 cudaMemsetAsync calls saves ~3 × 16 MB / layer (production scale).
 	if (!flash_attention_backward_cublas_tiled(
 	        sQ, sK, sV, sO, sdO,
 	        T, nHeads, dHead, dModel, causal,
@@ -1359,9 +1359,8 @@ bool chiron_attention_shear_backward_bf16w_bf16g_tiled(
 		return false;
 
 	// 5. Attention backward: FP32 throughout; writes sdQ/sdK/sdV as FP32.
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel, computeStream()));
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModel, computeStream()));
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModel, computeStream()));
+	// iter 107 (2026-05-21): caller-side memsets eliminated — beta=0 in
+	// flash_attention_backward_cublas_tiled makes them redundant.
 	if (!flash_attention_backward_cublas_tiled(
 	        sQ, sK, sV, sO, sdO,
 	        T, nHeads, dHead, dModel, causal,
@@ -1474,10 +1473,10 @@ bool chiron_attention_shear_backward_tiled(
 	if (!sgemm_rowmajor_atb(dModel, m, T, 1.0f, sO, dModel, dp_new, m, 1.0f, dWo, m))
 		return false;
 
-	// Tiled attention backward: writes dQ, accumulates dK+=, dV+=.
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdQ, 0, sizeof(float) * T * dModel, computeStream()));
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdK, 0, sizeof(float) * T * dModel, computeStream()));
-	GLADES_CUDA_CHECK(cudaMemsetAsync(sdV, 0, sizeof(float) * T * dModel, computeStream()));
+	// Tiled attention backward: writes dQ/dK/dV via beta=0 overwrite (iter 107).
+	// iter 107 (2026-05-21): pre-zero memsets eliminated — flash_attention_backward
+	// _cublas_tiled now writes with beta=0 (overwrite) for all 3 grads, making
+	// the caller pre-zero redundant.
 	if (!flash_attention_backward_cublas_tiled(
 	        sQ, sK, sV, sO, sdO,
 	        T, nHeads, dHead, dModel, causal,
@@ -1668,12 +1667,16 @@ bool flash_attention_backward_cublas_tiled(
 		if (!softmax_forward(scratch_P, nHeads * T, T, scratch_P)) return false;
 	}
 
-	// dV += P^T · dO.
+	// iter 107 (2026-05-21): dV = P^T · dO (overwrite, was += accumulate).
+	// All callers (chiron_attention_shear_backward variants) zero sdV before
+	// this call and don't depend on prior content.  Switching beta=1 → beta=0
+	// eliminates the need for the caller pre-zero.  Math bit-identical when
+	// dV starts at zero (since 0*garbage = 0; result = P^T·dO either way).
 	if (!sgemm_batched_strided_atb(
 	        T, dHead, T, 1.0f,
 	        scratch_P, T, (long long)T * T,
 	        dO, dModel, (long long)dHead,
-	        1.0f,
+	        0.0f,
 	        dV, dModel, (long long)dHead,
 	        nHeads))
 		return false;
@@ -1702,12 +1705,14 @@ bool flash_attention_backward_cublas_tiled(
 	        nHeads))
 		return false;
 
-	// dK += (1/sqrt(dH)) · dS^T · Q.
+	// iter 107 (2026-05-21): dK = (1/sqrt(dH)) · dS^T · Q (overwrite, was +=).
+	// Same rationale as dV above — all callers pre-zero sdK and don't depend
+	// on prior content.  Math bit-identical when dK starts at zero.
 	if (!sgemm_batched_strided_atb(
 	        T, dHead, T, invSqrtDH,
 	        scratch_dP, T, (long long)T * T,
 	        Q, dModel, (long long)dHead,
-	        1.0f,
+	        0.0f,
 	        dK, dModel, (long long)dHead,
 	        nHeads))
 		return false;
