@@ -832,6 +832,16 @@ bool causal_mask_softmax_bf16_out(float* S, uint16_t* P_bf,
 bool softmax_backward_attn(const float* P, const float* dP,
                            int batchSize, int T, float outputScale, float* dS);
 
+// iter 115 (2026-05-21): fused causal-masked softmax + softmax_backward_attn.
+// Math bit-identical to (causal_mask_softmax_inplace THEN softmax_backward_attn).
+// S is FP32 input/output (in-place: S → P after pass 3, then dS computation
+// reads P from same buffer in passes A-B).  dP and dS may alias (in-place
+// dP → dS overwrite).
+// Caller MUST issue cuBLAS dP = dO · V^T BEFORE this call (reorder vs legacy).
+bool causal_softmax_with_bwd_attn(float* S, const float* dP,
+                                   int batchSize, int T,
+                                   float outputScale, float* dS);
+
 // ---------------------------------------------------------------------------
 // Loss computation
 // ---------------------------------------------------------------------------
@@ -1135,6 +1145,7 @@ inline bool reduce_rows_sum(const float*, int, int, float, float*) { return fals
 inline bool causal_mask_softmax_inplace(float*, int, int) { return false; }
 inline bool causal_mask_softmax_bf16_out(float*, uint16_t*, int, int) { return false; }
 inline bool softmax_backward_attn(const float*, const float*, int, int, float, float*) { return false; }
+inline bool causal_softmax_with_bwd_attn(float*, const float*, int, int, float, float*) { return false; }
 inline bool cross_entropy_nll_loss(const float*, const int*, int, int, int, float*, int*) { return false; }
 inline bool argmax_count_matches(const float*, const int*, int, int, int, int*, int*) { return false; }
 inline bool chunked_cross_entropy_loss(const float*, const float*, const int*,

@@ -1659,7 +1659,7 @@ bool flash_attention_backward_cublas_tiled(
 	if (T <= 0 || nHeads <= 0 || dHead <= 0) return true;
 	const float invSqrtDH = 1.0f / sqrtf(static_cast<float>(dHead));
 
-	// Recompute P.
+	// Recompute S = (1/sqrt(dH)) · Q · K^T into scratch_P.
 	if (!sgemm_batched_strided_abt(
 	        T, T, dHead, invSqrtDH,
 	        Q, dModel, (long long)dHead,
@@ -1668,30 +1668,14 @@ bool flash_attention_backward_cublas_tiled(
 	        scratch_P, T, (long long)T * T,
 	        nHeads))
 		return false;
-	if (causal)
-	{
-		if (!causal_mask_softmax_inplace(scratch_P, nHeads, T)) return false;
-	}
-	else
-	{
-		if (!softmax_forward(scratch_P, nHeads * T, T, scratch_P)) return false;
-	}
 
-	// iter 107 (2026-05-21): dV = P^T · dO (overwrite, was += accumulate).
-	// All callers (chiron_attention_shear_backward variants) zero sdV before
-	// this call and don't depend on prior content.  Switching beta=1 → beta=0
-	// eliminates the need for the caller pre-zero.  Math bit-identical when
-	// dV starts at zero (since 0*garbage = 0; result = P^T·dO either way).
-	if (!sgemm_batched_strided_atb(
-	        T, dHead, T, 1.0f,
-	        scratch_P, T, (long long)T * T,
-	        dO, dModel, (long long)dHead,
-	        0.0f,
-	        dV, dModel, (long long)dHead,
-	        nHeads))
-		return false;
-
-	// dP = dO · V^T.
+	// iter 115 (2026-05-21): reorder cuBLAS dP = dO · V^T to BEFORE the softmax
+	// pass, so both inputs (S in scratch_P, dP in scratch_dP) are available for
+	// the fused softmax+bwd_attn kernel.  cuBLAS is sequential on compute stream
+	// — this is just a code-order reorder.  Saves 1 kernel launch per call
+	// (24 calls/step at production) plus L2 cache benefit (P stays warm between
+	// fused kernel's pass 3 write and pass A read, vs cross-kernel eviction
+	// risk in the legacy split-kernel path).
 	if (!sgemm_batched_strided_abt(
 	        T, T, dHead, 1.0f,
 	        dO, dModel, (long long)dHead,
@@ -1701,8 +1685,35 @@ bool flash_attention_backward_cublas_tiled(
 	        nHeads))
 		return false;
 
-	// dS = softmax_backward(P, dP) in place on scratch_dP.
-	if (!softmax_backward_attn(scratch_P, scratch_dP, nHeads, T, 1.0f, scratch_dP))
+	if (causal)
+	{
+		// iter 115: fused softmax (in-place S → P in scratch_P) + bwd_attn
+		// (dP → dS in-place in scratch_dP).  Literal concatenation of the
+		// two prior kernels' passes — math bit-identical at single-element
+		// FP32 precision (no merged-pass FMA reorder, unlike iter 83 NEGATIVE
+		// which merged the mask+max passes).
+		if (!causal_softmax_with_bwd_attn(scratch_P, scratch_dP, nHeads, T, 1.0f, scratch_dP))
+			return false;
+	}
+	else
+	{
+		// Non-causal: keep legacy split kernels (fused kernel only implements
+		// the causal-mask path).
+		if (!softmax_forward(scratch_P, nHeads * T, T, scratch_P)) return false;
+		if (!softmax_backward_attn(scratch_P, scratch_dP, nHeads, T, 1.0f, scratch_dP))
+			return false;
+	}
+
+	// iter 107 (2026-05-21): dV = P^T · dO (overwrite, was += accumulate).
+	// All callers zero sdV before this call and don't depend on prior content.
+	// Math bit-identical when dV starts at zero.
+	if (!sgemm_batched_strided_atb(
+	        T, dHead, T, 1.0f,
+	        scratch_P, T, (long long)T * T,
+	        dO, dModel, (long long)dHead,
+	        0.0f,
+	        dV, dModel, (long long)dHead,
+	        nHeads))
 		return false;
 
 	// dQ = (1/sqrt(dH)) · dS · K.

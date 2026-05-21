@@ -2985,6 +2985,125 @@ bool softmax_backward_attn(const float* P, const float* dP,
 }
 
 // ===========================================================================
+//  15c-fused. iter 115: causal softmax + softmax_backward_attn — one kernel
+// ===========================================================================
+//
+// Literal concatenation of (causal_mask_softmax_kernel passes 0-3) +
+// (softmax_backward_attn_kernel passes A-B).  No merged-pass FMA reorder,
+// so math is bit-identical to (softmax_inplace THEN softmax_backward_attn)
+// at single-element FP32 precision.
+//
+// Savings per call: 1 kernel launch eliminated + L2 cache benefit (P stays
+// in L2 cache between writes in pass 3 and reads in pass A — was separate
+// kernels with possible cache eviction between).
+//
+// Per-step at production (T=16384, L=24): 24 calls × 1 launch saved ~24 × 20µs
+// = 0.5 ms (~0.08% wall) + L2/memory traffic benefit on P read between passes.
+//
+// Used by flash_attention_backward_cublas_tiled at gpu_chiron.cu:~1664.
+// The cuBLAS dP = dO · V^T must be issued BEFORE this fused kernel call
+// (reorder per iter 115 design — cuBLAS is sequential on compute stream).
+namespace {
+
+__global__ void causal_softmax_with_bwd_attn_kernel(
+    float* __restrict__ S,            // input/output: S → P (in-place, same as causal_mask_softmax_kernel)
+    const float* __restrict__ dP,     // input dP (= dO · V^T pre-computed)
+    int T,
+    float outputScale,
+    float* __restrict__ dS)           // output dS (can alias dP for in-place dP → dS)
+{
+    int idx = blockIdx.x;
+    int row = idx % T;
+    float* sRow  = S  + (size_t)idx * T;
+    const float* dpRow = dP + (size_t)idx * T;
+    float* dsRow = dS + (size_t)idx * T;
+
+    extern __shared__ float smem[];
+    float* sMax = smem;
+    float* sSum = smem + (blockDim.x / 32 + 1);
+
+    // === SOFTMAX PART (identical to causal_mask_softmax_kernel) ===
+
+    // Apply causal mask: set j > row to -FLT_MAX.
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        if (j > row)
+            sRow[j] = -FLT_MAX;
+    }
+    __syncthreads();
+
+    // Pass 1: row max.
+    float localMax = -FLT_MAX;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+        localMax = fmaxf(localMax, sRow[j]);
+    localMax = blockReduceMax(localMax, sMax);
+
+    __shared__ float sRowMax;
+    if (threadIdx.x == 0) sRowMax = localMax;
+    __syncthreads();
+    float rowMax = sRowMax;
+
+    // Pass 2: sum of exp(x - max).
+    float localSum = 0.0f;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        float e = expf(sRow[j] - rowMax);
+        sRow[j] = e;
+        localSum += e;
+    }
+    localSum = blockReduceSum(localSum, sSum);
+
+    __shared__ float sRowSum;
+    if (threadIdx.x == 0) sRowSum = localSum;
+    __syncthreads();
+    float invSum = 1.0f / sRowSum;
+
+    // Pass 3: normalize.  sRow[j] now contains P[j].
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+        sRow[j] *= invSum;
+    __syncthreads();
+
+    // === BWD_ATTN PART (identical to softmax_backward_attn_kernel) ===
+
+    // Pass A: compute dot = sum_j(dP[j] * P[j]) for j ≤ row.
+    // (Reuses sMax smem region for the reduction.)
+    float localDot = 0.0f;
+    for (int j = threadIdx.x; j <= row; j += blockDim.x)
+        localDot += dpRow[j] * sRow[j];
+    localDot = blockReduceSum(localDot, sMax);
+
+    __shared__ float sDot;
+    if (threadIdx.x == 0) sDot = localDot;
+    __syncthreads();
+    float dot = sDot;
+
+    // Pass B: dS[j] = outputScale * P[j] * (dP[j] - dot) for j ≤ row, 0 otherwise.
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+    {
+        if (j <= row)
+            dsRow[j] = outputScale * sRow[j] * (dpRow[j] - dot);
+        else
+            dsRow[j] = 0.0f;
+    }
+}
+
+} // anonymous namespace
+
+bool causal_softmax_with_bwd_attn(float* S, const float* dP,
+                                   int batchSize, int T,
+                                   float outputScale, float* dS)
+{
+    if (batchSize <= 0 || T <= 0) return true;
+    int totalRows = batchSize * T;
+    int block = rowBlockSize(T);
+    int smemBytes = (block / 32 + 2) * 2 * sizeof(float);
+    causal_softmax_with_bwd_attn_kernel<<<totalRows, block, smemBytes, computeStream()>>>(
+        S, dP, T, outputScale, dS);
+    GLADES_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ===========================================================================
 //  15d. Cross-entropy NLL loss
 // ===========================================================================
 
