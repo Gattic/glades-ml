@@ -226,9 +226,25 @@ bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
 // L2 thrashing on x reads.  Bit-identical math to the row-major kernel
 // (same K*x accumulation order, same break-on-negative-src termination).
 // Falls back to the row-major kernel when w != 8 (templated W_FILTER=9).
+// iter 96 (2026-05-21): added W_FILTER=5 specialization for w=4 (production
+// triple-stack flagship); bit-identical sub-ULP NULL on wall (per iter 96
+// bench) but kept for clean code path.
 bool scfa_depthwise_causal_conv_fwd_tiled(const float* x, const float* K,
                                             int T, int m, int w, float* y,
                                             cudaStream_t stream = 0);
+
+// iter 97 (2026-05-21): fused-sub variant of conv fwd tile.  Reads (q, q_par)
+// inputs and computes q_perp = q - q_par AT SMEM-LOAD TIME (single FP32 sub
+// per element, in registers, before smem store).  Eliminates the explicit
+// chiron_scfa_sub kernel launch + q_perp materialization round-trip through
+// global memory (5.1% of step wall per iter 96 nsys; fwd half = ~2.5%).
+// Math: bit-identical to (chiron_scfa_sub THEN scfa_depthwise_causal_conv_fwd_tiled)
+// chain — same FP32 q - q_par sub, same K * q_perp FMA accumulation order.
+// Specializes W_FILTER=5 (w=4 prod) and W_FILTER=9 (w=8 prior); returns false
+// for other w (caller must check before dispatching).
+bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(
+    const float* q, const float* q_par, const float* K,
+    int T, int m, int w, float* y, cudaStream_t stream = 0);
 
 // Backward through depthwise causal conv.
 //   dx[t, c] += Σ_{i=0..w, t+i<T} K[c, i] · dy[t+i, c]
@@ -1020,6 +1036,7 @@ inline bool orion_perturb_col_int8_bf16w(void*, const float*, const void*, const
 inline bool orion_perturb_col_int8_bf16w_bf16anchor(void*, const void*, const void*, const float*, int, int, float) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_fwd_tiled(const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
+inline bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(const float*, const float*, const float*, int, int, int, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_depthwise_causal_conv_bwd_tiled(const float*, const float*, const float*, int, int, int, float*, float*, cudaStream_t = 0) { return false; }
 inline bool scfa_dct_basis_init(float*, int, int) { return false; }

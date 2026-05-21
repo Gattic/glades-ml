@@ -8030,6 +8030,91 @@ __global__ void scfa_depthwise_causal_conv_fwd_tiled_kernel(
 	}
 }
 
+// iter 97 (2026-05-21): fused-sub variant of scfa_depthwise_causal_conv_fwd_tiled.
+// Reads (q, q_par) instead of pre-computed q_perp; computes
+// q_perp = q - q_par AT SMEM-LOAD TIME (single FP32 sub per element, in
+// registers, before storing in smem).  Eliminates the explicit
+// chiron_scfa_sub kernel launch + the q_perp materialization round-trip
+// through global memory.
+// Math: bit-identical to (chiron_scfa_sub_kernel THEN scfa_depthwise_causal_conv_fwd_tiled_kernel)
+// chain — same q[idx] - q_par[idx] FP32 subtraction, same K * q_perp FMA
+// accumulation order, same break-on-negative-src.
+// Profile (iter 96 nsys): chiron_scfa_sub_kernel is 5.1% of step wall at
+// production (already at 87% memory BW); fwd half (~24 of 50 total calls)
+// runnable on main stream sequentially before conv → fusable here.  Bwd
+// path's scfa_sub recompute is independent and unchanged.
+// Template params: COLS_PER_BLOCK=256, N_OUT=16, W_FILTER=w+1 (=5 at w=4
+// production triple-stack, =9 at w=8 prior flagship).
+// Static smem: x_smem (N_OUT+w)×COLS×4 + K_smem COLS×W_FILTER×4.  At
+// (16, 256, 5) → 20 KB + 5 KB = 25 KB (same as iter 73 fwd tile).
+template<int COLS_PER_BLOCK, int N_OUT, int W_FILTER>
+__global__ void scfa_depthwise_causal_conv_fwd_sub_fused_tiled_kernel(
+    const float* __restrict__ q,       // [T, m]
+    const float* __restrict__ q_par,   // [T, m]
+    const float* __restrict__ K,       // [m, W_FILTER]
+    int T, int m,
+    float* __restrict__ y)             // [T, m]
+{
+	const int t_base = blockIdx.y * N_OUT;
+	const int c = blockIdx.x * COLS_PER_BLOCK + threadIdx.x;
+	const int w = W_FILTER - 1;
+	const int X_ROWS = N_OUT + W_FILTER - 1;
+
+	__shared__ float x_smem[N_OUT + W_FILTER - 1][COLS_PER_BLOCK];
+	__shared__ float K_smem[COLS_PER_BLOCK][W_FILTER];
+
+	// Load filter: each thread loads its own column's W_FILTER weights.
+	if (c < m) {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = K[(size_t)c * (size_t)W_FILTER + (size_t)i];
+		}
+	} else {
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			K_smem[threadIdx.x][i] = 0.0f;
+		}
+	}
+
+	// Fused smem load: compute q - q_par at load time, store result in
+	// x_smem.  Bit-identical to chiron_scfa_sub_kernel's per-element sub.
+	if (c < m) {
+		#pragma unroll
+		for (int k = 0; k < X_ROWS; ++k) {
+			const int t_in = t_base - w + k;
+			if (t_in >= 0 && t_in < T) {
+				const size_t idx = (size_t)t_in * (size_t)m + (size_t)c;
+				x_smem[k][threadIdx.x] = q[idx] - q_par[idx];
+			} else {
+				x_smem[k][threadIdx.x] = 0.0f;
+			}
+		}
+	} else {
+		#pragma unroll
+		for (int k = 0; k < X_ROWS; ++k) {
+			x_smem[k][threadIdx.x] = 0.0f;
+		}
+	}
+	__syncthreads();
+
+	if (c >= m) return;
+
+	// Compute N_OUT outputs (identical to iter 73 fwd tile loop body).
+	#pragma unroll
+	for (int dt = 0; dt < N_OUT; ++dt) {
+		const int t_out = t_base + dt;
+		if (t_out >= T) return;
+
+		float acc = 0.0f;
+		#pragma unroll
+		for (int i = 0; i < W_FILTER; ++i) {
+			if (t_out - i < 0) break;
+			acc += K_smem[threadIdx.x][i] * x_smem[w + dt - i][threadIdx.x];
+		}
+		y[(size_t)t_out * (size_t)m + (size_t)c] = acc;
+	}
+}
+
 } // anonymous namespace
 
 bool scfa_depthwise_causal_conv_fwd(const float* x, const float* K,
@@ -8090,6 +8175,40 @@ bool scfa_depthwise_causal_conv_fwd_tiled(const float* x, const float* K,
 	    x, K, T, m, w, y);
 	GLADES_CUDA_CHECK(cudaGetLastError());
 	return true;
+}
+
+// iter 97 (2026-05-21): fused-sub variant — reads (q, q_par) instead of
+// pre-computed q_perp; subtracts at smem-load.  Specializes W_FILTER=5
+// (w=4 production triple-stack) and W_FILTER=9 (w=8 prior flagship).
+// Returns false for other w (caller checks before dispatch).
+bool scfa_depthwise_causal_conv_fwd_sub_fused_tiled(
+    const float* q, const float* q_par, const float* K,
+    int T, int m, int w, float* y, cudaStream_t stream)
+{
+	if (T <= 0 || m <= 0 || w < 0) return true;
+	cudaStream_t s = (stream != 0) ? stream : computeStream();
+	if (w == 4) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_depthwise_causal_conv_fwd_sub_fused_tiled_kernel<COLS, N_OUT, 5>
+		    <<<grid, block, 0, s>>>(q, q_par, K, T, m, y);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
+	if (w == 8) {
+		const int COLS = 256;
+		const int N_OUT = 16;
+		dim3 grid((m + COLS - 1) / COLS, (T + N_OUT - 1) / N_OUT);
+		dim3 block(COLS, 1, 1);
+		scfa_depthwise_causal_conv_fwd_sub_fused_tiled_kernel<COLS, N_OUT, 9>
+		    <<<grid, block, 0, s>>>(q, q_par, K, T, m, y);
+		GLADES_CUDA_CHECK(cudaGetLastError());
+		return true;
+	}
+	// No fallback — caller must check w before dispatching here.
+	return false;
 }
 
 namespace {
